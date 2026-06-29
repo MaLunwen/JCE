@@ -47,6 +47,7 @@ typedef struct JceRenderPipelineDesc {
     bool enable_gpu_particles;
     bool enable_motion_blur;
     bool enable_cloth;          /* P3-C.4: soft-body / cloth sim */
+    bool enable_stylized_sky;   /* stylized sky dome (mode 3); LOW tier off */
 
     /* Quality knobs */
     uint16_t shadow_resolution; /* 512 / 1024 / 2048 / 4096    */

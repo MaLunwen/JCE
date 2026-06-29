@@ -70,6 +70,7 @@ static ECS_COMPONENT_DECLARE(JceScriptComponent);
 static ECS_COMPONENT_DECLARE(JceEditorMeta);
 static ECS_COMPONENT_DECLARE(JceTerrainComponent);
 static ECS_COMPONENT_DECLARE(JceVegetationScatterComponent);
+static ECS_COMPONENT_DECLARE(JceGrassFieldComponent);
 static ECS_COMPONENT_DECLARE(JceWaterComponent);
 static ECS_COMPONENT_DECLARE(JceBuoyancyComponent);
 static ECS_COMPONENT_DECLARE(JceLodGroupComponent);
@@ -134,6 +135,7 @@ static ECS_COMPONENT_DECLARE(JceAnimCmdRelay);
 static ECS_COMPONENT_DECLARE(JceFractureComponent);
 static ECS_COMPONENT_DECLARE(JceVehicleComponent);
 static ECS_COMPONENT_DECLARE(JceSoftBodyComponent);
+static ECS_COMPONENT_DECLARE(JceSimLodComponent);
 
 /* ── Internal world-matrix cache (side table) ──────────────────────────
  *
@@ -183,6 +185,17 @@ struct JceScene {
                                  * EVERY call, 4-5x/frame in Play → unbounded) */
     uint64_t      world_epoch;  /* bumped per frame to invalidate the world-matrix cache */
     JceWorldCache world_cache;  /* per-entity world matrix memo (side table) */
+    /* Structural epoch: bumped ONLY on real structural edits (a set_transform /
+     * set_pivot / reparent / component add-remove that changes a world matrix),
+     * NOT on the per-frame world-cache drops in jce_scene_update / the renderer /
+     * the pick pass.  Lets a cross-frame consumer (the scene renderer's persistent
+     * static world-matrix + AABB cache, large-world-opt M1 #2) keep its cached
+     * value for a STATIC entity across frames and recompute only when this changes.
+     * In-place transform mutation that bypasses jce_scene_set_transform (the
+     * runtime physics write-back rt_sync_transforms) does NOT bump this — those
+     * entities are excluded from the persistent cache by a per-entity dynamic
+     * predicate instead, so the epoch staying put for them is intentional. */
+    uint64_t      structural_epoch;
     void         *particles;    /* JceParticleSystem* (lazy; owned by jce_scene_particles.c) */
 };
 
@@ -263,13 +276,25 @@ static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
     if (r->weather_intensity > 1.0f)
         r->weather_intensity = 1.0f;
 
-    /* Sky clamps (analytic Preetham). */
-    if (r->sky_mode < 0 || r->sky_mode > 2)
+    /* Sky clamps (analytic Preetham / stylized dome). */
+    if (r->sky_mode < 0 || r->sky_mode > 3)
         r->sky_mode = 0;
     if (r->sky_turbidity < 1.0f)
         r->sky_turbidity = 1.0f;
     if (r->sky_turbidity > 10.0f)
         r->sky_turbidity = 10.0f;
+
+    /* Look Profile clamps. */
+    if (r->tonemap_op < 0 || r->tonemap_op > 2)
+        r->tonemap_op = JCE_TONEMAP_ACES;
+    if (r->wrap_factor   < 0.0f) r->wrap_factor   = 0.0f;
+    if (r->wrap_factor   > 1.0f) r->wrap_factor   = 1.0f;
+    if (r->rim_intensity < 0.0f) r->rim_intensity = 0.0f;
+    if (r->rim_power      < 0.1f) r->rim_power     = 0.1f;
+    if (r->lut_strength  < 0.0f) r->lut_strength  = 0.0f;
+    if (r->lut_strength  > 1.0f) r->lut_strength  = 1.0f;
+    if (r->bloom_knee    < 0.0f) r->bloom_knee    = 0.0f;
+    r->lut_path[sizeof(r->lut_path) - 1] = '\0';
 }
 
 JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
@@ -325,6 +350,22 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     r.sky_mode      = JCE_SCENE_SKY_GRADIENT;
     r.sky_turbidity = 2.5f;      /* clear temperate day (Preetham default) */
 
+    /* Stylized sky dome (golden-hour preset).  Unused unless sky_mode==3
+     * AND the "stylized_sky" gate is on; absent in old scenes → these
+     * values seed but never render → baseline byte-identical. */
+    r.sky_dome_zenith[0]  = 0.16f; r.sky_dome_zenith[1]  = 0.33f; r.sky_dome_zenith[2]  = 0.62f;
+    r.sky_dome_mid[0]     = 0.55f; r.sky_dome_mid[1]     = 0.55f; r.sky_dome_mid[2]     = 0.68f;
+    r.sky_dome_mid_pos    = 0.45f;
+    r.sky_dome_horizon[0] = 0.95f; r.sky_dome_horizon[1] = 0.78f; r.sky_dome_horizon[2] = 0.55f;
+    r.sky_dome_ground[0]  = 0.30f; r.sky_dome_ground[1]  = 0.26f; r.sky_dome_ground[2]  = 0.22f;
+    r.sky_dome_glow[0]    = 0.90f; r.sky_dome_glow[1]    = 0.55f; r.sky_dome_glow[2]    = 0.28f;
+    r.sky_dome_glow_falloff   = 7.0f;
+    r.sky_dome_sun_color[0]   = 1.0f; r.sky_dome_sun_color[1] = 0.92f; r.sky_dome_sun_color[2] = 0.70f;
+    r.sky_dome_sun_size       = 0.9985f;  /* cos threshold: small bright core */
+    r.sky_dome_sun_softness   = 0.0010f;
+    r.sky_dome_halo_power     = 48.0f;
+    r.sky_dome_halo_strength  = 0.35f;
+
     /* Floating origin (off by default → runtime never rebases → byte-id). */
     r.floating_origin_enabled   = false;
     r.floating_origin_threshold = 4096.0f;
@@ -337,6 +378,26 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     r.ssr_enabled      = false;
     r.ssr_intensity    = 0.6f;
     r.ssr_max_distance = 8.0f;
+    /* TAA tuning: 0 = engine defaults (feedback 0.9, clamps 1.0) → byte-id.
+     * (MUST init — this default() does not zero the struct.) */
+    r.taa_feedback     = 0.0f;
+    r.taa_luma_clamp   = 0.0f;
+    r.taa_motion_clamp = 0.0f;
+
+    /* Look Profile — all NEUTRAL (algebraic no-op; byte-identical baseline). */
+    r.wrap_factor         = 0.0f;       /* hard Lambert */
+    r.ambient_hemisphere  = false;      /* flat ambient only */
+    r.ambient_ground_color[0] = 0.0f;
+    r.ambient_ground_color[1] = 0.0f;
+    r.ambient_ground_color[2] = 0.0f;
+    r.rim_color[0] = 1.0f; r.rim_color[1] = 1.0f; r.rim_color[2] = 1.0f;
+    r.rim_power      = 4.0f;            /* harmless: rim_intensity=0 masks it */
+    r.rim_intensity  = 0.0f;           /* off */
+    r.tonemap_op     = JCE_TONEMAP_ACES;
+    r.lut_path[0]    = '\0';
+    r.lut_strength   = 0.0f;           /* off */
+    r.toon_character = false;
+    r.bloom_knee     = 0.0f;           /* hard cutoff = current bloom */
     return r;
 }
 
@@ -495,6 +556,9 @@ JceScene *jce_scene_create(void)
     /* Start at 1 so a freshly zeroed cache slot (epoch 0) is always seen as
        stale on first access. world_cache stays zero-init until first use. */
     s->world_epoch = 1;
+    /* Start at 1 so a freshly zeroed persistent-cache slot (epoch 0) is always
+       seen as stale on first access. */
+    s->structural_epoch = 1;
 
     /* Register components. */
     ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
@@ -526,6 +590,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVegetationScatterComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceGrassFieldComponent);
     ECS_COMPONENT_DEFINE(s->world, JceWaterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceBuoyancyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceLodGroupComponent);
@@ -593,6 +658,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceFractureComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVehicleComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSoftBodyComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSimLodComponent);
 
     /* VideoPlayer owns a live decoder handle + a GPU texture; install
      * lifecycle hooks so those resources follow correct ownership across
@@ -872,20 +938,48 @@ static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
     wc->slots[i].epoch = epoch;
 }
 
-/* Begin a new cache generation. Keeps the allocated table (avoids realloc
-   churn on static scenes) but empties it, which both invalidates last
-   frame's matrices and reclaims slots of since-destroyed entities so the
-   table cannot grow without bound. Cheap: one memset of `cap` slots, far
-   less than the O(N) world-matrix composition it guards. */
-void jce_scene_invalidate_world_cache(JceScene *s)
+/* Drop the intra-frame world-matrix memo (begin a new generation).  Keeps the
+   allocated table (avoids realloc churn on static scenes) but empties it, which
+   both invalidates last frame's matrices and reclaims slots of since-destroyed
+   entities so the table cannot grow without bound.  Does NOT touch
+   structural_epoch — this is the per-frame drop used by jce_scene_update / the
+   renderer / the pick pass, none of which represent a structural edit. */
+static void scene_drop_world_cache_frame(JceScene *s)
 {
-    if (!s) return;
     s->world_epoch++;
     if (s->world_cache.slots && s->world_cache.live) {
         memset(s->world_cache.slots, 0,
                (size_t)s->world_cache.cap * sizeof(JceWorldCacheSlot));
         s->world_cache.live = 0;
     }
+}
+
+/* Public invalidate: a real structural edit (set_transform / set_pivot /
+   reparent / component add-remove / clear / floating-origin shift) changed at
+   least one entity's world matrix.  Bumps structural_epoch (invalidating the
+   renderer's cross-frame persistent static cache) AND drops the intra-frame
+   memo.  See scene_drop_world_cache_frame for the per-frame, non-structural
+   counterpart. */
+void jce_scene_invalidate_world_cache(JceScene *s)
+{
+    if (!s) return;
+    s->structural_epoch++;
+    scene_drop_world_cache_frame(s);
+}
+
+/* Public, non-structural per-frame drop for hosts that render without
+   jce_scene_update (the editor scene renderer + pick pass). */
+void jce_scene_begin_render_world_cache(JceScene *s)
+{
+    if (!s) return;
+    scene_drop_world_cache_frame(s);
+}
+
+/* Cross-frame structural epoch accessor for the scene renderer's persistent
+   static world-matrix + AABB cache (large-world-opt M1 #2). */
+uint64_t jce_scene_get_structural_epoch(const JceScene *s)
+{
+    return s ? s->structural_epoch : 0;
 }
 
 /* Floating-origin rebase: shift the LOCAL position of every ROOT entity (no
@@ -1222,6 +1316,7 @@ JCE_COMP_IMPL(JceBehaviorTree,                behavior_tree)
 JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
 JCE_COMP_IMPL(JceTerrainComponent,            terrain)
 JCE_COMP_IMPL(JceVegetationScatterComponent,  vegetation_scatter)
+JCE_COMP_IMPL(JceGrassFieldComponent,         grass_field)
 JCE_COMP_IMPL(JceWaterComponent,              water)
 JCE_COMP_IMPL(JceBuoyancyComponent,           buoyancy)
 JCE_COMP_IMPL(JceLodGroupComponent,           lod_group)
@@ -1284,6 +1379,7 @@ JCE_COMP_IMPL(JceRagdollComponent,            ragdoll)
 JCE_COMP_IMPL(JceFractureComponent,           fracture)
 JCE_COMP_IMPL(JceVehicleComponent,            vehicle)
 JCE_COMP_IMPL(JceSoftBodyComponent,           soft_body)
+JCE_COMP_IMPL(JceSimLodComponent,             sim_lod)
 
 #undef JCE_COMP_IMPL_WORLD
 #undef JCE_COMP_IMPL
@@ -1595,15 +1691,88 @@ void *jce_scene_get_world(JceScene *s)
     return s ? s->world : NULL;
 }
 
+/* ── Scene-graph queries (Unity Find / OverlapSphere, Godot groups) ─────
+ * Collect matching entities into a caller buffer; return the count written
+ * (<= max).  All iterate transform-bearing entities via jce_scene_each_entity.
+ * (Query-by-component awaits a public generic comp-presence-by-id accessor.) */
+typedef struct {
+    JceEntity  *out;
+    int         max;
+    int         n;
+    const char *str;     /* tag / name to match (by_tag, by_name) */
+    jce_vec3    center;   /* sphere centre (query_sphere) */
+    float       r2;       /* sphere radius squared */
+} SceneQueryCtx;
+
+static void scene_q_tag_cb(JceScene *s, JceEntity e, void *ud)
+{
+    SceneQueryCtx *q = (SceneQueryCtx *)ud;
+    if (q->n >= q->max) return;
+    const char *t = jce_scene_get_entity_tag_name(s, e);
+    if (t && q->str && t[0] && strcmp(t, q->str) == 0) q->out[q->n++] = e;
+}
+
+static void scene_q_name_cb(JceScene *s, JceEntity e, void *ud)
+{
+    SceneQueryCtx *q = (SceneQueryCtx *)ud;
+    if (q->n >= q->max) return;
+    const char *nm = jce_scene_entity_name(s, e);
+    if (nm && q->str && strcmp(nm, q->str) == 0) q->out[q->n++] = e;
+}
+
+static void scene_q_sphere_cb(JceScene *s, JceEntity e, void *ud)
+{
+    SceneQueryCtx *q = (SceneQueryCtx *)ud;
+    if (q->n >= q->max) return;
+    JceTransform *t = jce_scene_get_transform(s, e);
+    if (!t) return;
+    float dx = t->position.x - q->center.x;
+    float dy = t->position.y - q->center.y;
+    float dz = t->position.z - q->center.z;
+    if (dx*dx + dy*dy + dz*dz <= q->r2) q->out[q->n++] = e;
+}
+
+int jce_scene_query_by_tag(JceScene *s, const char *tag,
+                           JceEntity *out, int max)
+{
+    if (!s || !tag || !out || max <= 0) return 0;
+    SceneQueryCtx q; memset(&q, 0, sizeof(q));
+    q.out = out; q.max = max; q.str = tag;
+    jce_scene_each_entity(s, scene_q_tag_cb, &q);
+    return q.n;
+}
+
+int jce_scene_query_by_name(JceScene *s, const char *name,
+                            JceEntity *out, int max)
+{
+    if (!s || !name || !out || max <= 0) return 0;
+    SceneQueryCtx q; memset(&q, 0, sizeof(q));
+    q.out = out; q.max = max; q.str = name;
+    jce_scene_each_entity(s, scene_q_name_cb, &q);
+    return q.n;
+}
+
+int jce_scene_query_sphere(JceScene *s, jce_vec3 center, float radius,
+                           JceEntity *out, int max)
+{
+    if (!s || !out || max <= 0 || radius < 0.0f) return 0;
+    SceneQueryCtx q; memset(&q, 0, sizeof(q));
+    q.out = out; q.max = max; q.center = center; q.r2 = radius * radius;
+    jce_scene_each_entity(s, scene_q_sphere_cb, &q);
+    return q.n;
+}
+
 void jce_scene_update(JceScene *s, float dt)
 {
     JCE_PROFILE_ZONE_N("Scene::Update");
     if (!s) { JCE_PROFILE_ZONE_END; return; }
 
-    /* New frame → invalidate last frame's world-matrix cache. Done before
+    /* New frame → drop last frame's intra-frame world-matrix memo. Done before
        ecs_progress so any system that reads world matrices this frame builds
-       a fresh, consistent cache against transforms as they are at read time. */
-    jce_scene_invalidate_world_cache(s);
+       a fresh, consistent cache against transforms as they are at read time.
+       Per-frame, NOT a structural edit → use the non-structural drop so the
+       renderer's cross-frame persistent static cache survives a quiet frame. */
+    scene_drop_world_cache_frame(s);
 
     ecs_progress(s->world, dt);
 

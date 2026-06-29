@@ -336,6 +336,16 @@ _jce_add_layer(jce_renderer
 		cgltf::cgltf
 	CXX)
 
+# RenderDoc capture: compile-time gate (PRIVATE — only jce_gpu_capture.c reads
+# it). No link: the in-app API is resolved at runtime from the injected module
+# via the jce_library shared-object wrapper. Forced OFF for dist (root
+# CMakeLists), so shipped games carry zero RenderDoc code.
+if(JCE_RENDERDOC_ENABLED)
+	target_compile_definitions(jce_renderer PRIVATE JCE_RENDERDOC_ENABLED=1)
+else()
+	target_compile_definitions(jce_renderer PRIVATE JCE_RENDERDOC_ENABLED=0)
+endif()
+
 # Late-bound dependency: jce_scene_renderer.c lives in middleware/scene
 # but consumes the renderer low-level API.  Declared here (after both
 # targets exist) to keep the link order valid.

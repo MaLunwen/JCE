@@ -150,12 +150,84 @@ JCE_API void jce_world_streamer_set_chunk_callback(
     void                    *user);
 
 /* ================================================================== */
+/* Real residency reporting (VRAM ceiling)                             */
+/* ================================================================== */
+
+/* Optional callback: given the entity ids a chunk spawned, return the REAL GPU
+ * footprint (bytes) of the resources they reference — typically the sum of each
+ * entity's resolved model VB+IB+texture bytes (jce_scene_renderer_model_path_
+ * vram_bytes).  The streamer feeds THIS to jce_streaming_set_chunk_residency so
+ * the memory budget + LRU evict against real VRAM instead of a flat per-entity
+ * estimate (so a 256 MiB budget actually bounds VRAM).  When unset, or when it
+ * returns 0 (e.g. a chunk's async model decodes haven't landed yet), the
+ * streamer falls back to its per-entity estimate; it re-reports each update as
+ * models finish loading so the number converges to real bytes.  Fired per chunk
+ * load, never per frame.  Set NULL to clear. */
+typedef uint64_t (*JceWorldStreamerResidencyFn)(const uint64_t *entity_ids,
+                                                uint32_t count, void *user);
+
+JCE_API void jce_world_streamer_set_residency_query(
+    JceWorldStreamer            *ws,
+    JceWorldStreamerResidencyFn  query,
+    void                        *user);
+
+/* ================================================================== */
+/* HLOD far-skyline proxy coordination                                 */
+/* ================================================================== */
+
+/* Wire the always-resident per-chunk HLOD "massing" proxies to the streamer so
+ * a chunk's cheap far-proxy is HIDDEN once its detailed geometry streams in and
+ * SHOWN again the moment the chunk unloads — eliminating the double-draw /
+ * z-fight of the proxy box over the real streamed buildings.
+ *
+ * The proxies are baked (build/gen_hlod.py) into the MASTER scene as always-
+ * resident entities named "HLOD_<gx>_<gz>", one per streamable cell.  This
+ * builds the chunk-id -> proxy-entity map from the scene's authored streaming
+ * table (chunk fragment path "…/cell_<gx>_<gz>.scene.json" -> proxy name
+ * "HLOD_<gx>_<gz>", resolved against each entity's EditorMeta name, which the
+ * shared scene loader populates in BOTH the editor and the cooked runtime
+ * scene) and installs the streamer chunk callback to toggle the proxy's
+ * MeshRenderer.  It then chains to `extra_cb` (with `extra_ud`) if non-NULL, so
+ * a caller can layer extra per-chunk work on the same single callback slot
+ * (the editor uses this for its hierarchy chunk-grouping).
+ *
+ * This is the ONE implementation shared by the editor (scene-view preview +
+ * Play) and the standalone runtime (default_main): both call this so the
+ * shipped exe hides proxies exactly like the editor does.  All proxies are
+ * reset to VISIBLE at attach (baseline before any chunk is resident).  Safe
+ * no-op when no HLOD proxies were baked (the map ends up empty; the chunk
+ * callback is still installed so `extra_cb` keeps firing).  Call after creating
+ * + registering the streamer. */
+JCE_API void jce_world_streamer_attach_hlod(JceWorldStreamer        *ws,
+                                            JceScene                *scene,
+                                            JceWorldStreamerChunkCb  extra_cb,
+                                            void                    *extra_ud);
+
+/* ================================================================== */
 /* Per-frame update                                                    */
 /* ================================================================== */
 
 /* Drive streaming decisions and apply any pending chunk loads/unloads
    to the scene.  Call once per frame from the main thread. */
 JCE_API void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos);
+
+/* ================================================================== */
+/* Preview / authoring load-override                                   */
+/* ================================================================== */
+
+/* Forward a preview load-override to the wrapped streaming system
+ * (jce_streaming_set_preview): RADIUS = current distance-ring behaviour
+ * (default, exact existing behaviour); ALL = every registered chunk stays
+ * resident (the editor's "Full World" preview — zooming/orbiting out no
+ * longer pops far chunks); FILTER = only the supplied chunk ids stay
+ * resident (debug a subset, synced with the hierarchy).  filter_ids is
+ * COPIED and only consulted in FILTER mode (pass NULL/0 otherwise).
+ * The per-frame load budget + async ordering are unchanged, so a large
+ * world streams in over a few seconds.  Safe with NULL ws. */
+JCE_API void jce_world_streamer_set_preview_load(JceWorldStreamer    *ws,
+                                                 JceStreamPreviewMode mode,
+                                                 const uint32_t      *filter_ids,
+                                                 uint32_t             count);
 
 /* ================================================================== */
 /* Stats / queries                                                     */

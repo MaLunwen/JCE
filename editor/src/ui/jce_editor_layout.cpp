@@ -527,13 +527,20 @@ static void handle_global_edit_shortcuts(void)
     if (io.WantTextInput)
         return;
 
-    /* Suppress editor shortcuts ONLY while actively controlling a RUNNING game
-       in the Game View — i.e. play is live AND the Game View has grabbed input
-       (the user clicked in to drive it). Only then do in-game keys (Ctrl+A /
-       Ctrl+S / …) risk firing editor commands. In edit mode, and in every other
-       panel (Hierarchy Ctrl+A / Ctrl+Z, …), shortcuts work normally. The UI
-       keys above (F9/F11/F12) stay live so you can screenshot/record during play. */
-    if (jce_state_get_play_state() != JCE_PLAY_STOPPED &&
+    /* Suppress editor shortcuts whenever the Game View is actively DRIVING input
+       — i.e. the user clicked into it to control its free-fly / WASD free-cam (or
+       the player / CharacterController), OR the OS mouse is captured. This holds
+       REGARDLESS of Play state: the Game View free-cam can be driven in plain
+       EDIT mode (play STOPPED) too, and there a WASD-driving user pressing
+       Ctrl+S used to silently save / Ctrl+N reset the scene because the gate
+       only fired during Play. jce_editor_game_view_is_input_active() is the
+       persistent "user wants to drive the Game View" intent (set only on a
+       click-into the hovered viewport, cleared on ESC / Stop / Alt), so it is
+       true exactly when the user is driving the Game View — never on mere hover.
+       In edit mode NOT driving the Game View, in the Scene View, and in every
+       other panel (Hierarchy Ctrl+A / Ctrl+Z, …), shortcuts work normally. The
+       UI keys above (F9/F11/F12) are handled earlier so they stay live. */
+    if (jce_editor_game_view_is_input_active() ||
         jce_editor_game_render_is_mouse_captured())
         return;
 
@@ -722,7 +729,13 @@ static void cmd_screenshot_(void)
     snprintf(path, sizeof(path),
              "%s/jce_screenshot_%s.png", dir, stamp);
 
-    if (jce_screenshot_save(path, JCE_SCREENSHOT_PNG))
+    /* WHOLE editor window (incl. UI) via the backbuffer — the v-0.9.x behaviour
+     * the user confirmed correct.  Interactive F12 presents in the foreground, so
+     * bgfx_request_screen_shot completes and captures the FULL window, not just
+     * the scene viewport.  (The scene-FBO variant that replaced this was meant for
+     * headless capture but regressed the user-facing F12 into a viewport-only shot.) */
+    bool ok = jce_screenshot_save(path, JCE_SCREENSHOT_PNG);
+    if (ok)
         jce_toast_info(jce_editor_i18n("toast.screenshot"), path);
     else
         jce_toast_error("%s", jce_editor_i18n("toast.screenshotFailed"));

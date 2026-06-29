@@ -35,6 +35,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_thread.h>           /* async chunk-load thread pool */
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_window.h>
@@ -42,6 +43,7 @@
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_lowlevel.h>        /* jce_gfx_caps (homogeneous depth) */
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_occlusion_culler.h> /* GPU-query occlusion culling (M5) */
 #include <jce/renderer/jce_offscreen_target.h> /* offscreen scene target (postfx, Top 1) */
 #include <jce/renderer/jce_render_settings.h>  /* project quality settings (Top 5) */
 #include <jce/renderer/jce_renderer.h>
@@ -76,6 +78,14 @@ static JceSceneRenderer *s_scene_renderer = NULL;
  * scenes without postfx stay on the zero-overhead direct-to-backbuffer path. */
 static JceOffscreenTarget *s_post_target  = NULL;
 static JceUICanvas      *s_ui_canvas      = NULL;
+/* GPU-query occlusion culler (M5): activates two-pass coherence culling in the
+ * shipped runtime so a dense world skips fully-hidden geometry (previously this
+ * ran ONLY in the editor scene-view).  Created in app_init after the renderer +
+ * scene renderer exist, set into every per-frame scene render config
+ * (s_default_scene_cfg), destroyed in app_exit.  NULL when JCE_DISABLE_OCCLUSION
+ * is set (A/B + safety hatch) or hardware queries are unsupported (silent
+ * always-visible fallback). */
+static JceOcclusionCuller *s_occlusion_culler = NULL;
 /* Project-wide quality settings (Top 5): loaded once in app_init from the
  * cooked render_settings.json (build-exported from Project Settings > Quality),
  * folded into the scene render config as the project DEFAULT.  Per-scene
@@ -100,6 +110,11 @@ static bool              s_cursor_captured = true;
  * authored streaming settings are enabled (World Streaming panel). */
 static JceWorldStreamer *s_world_streamer = NULL;
 static JceFileSystem    *s_stream_fs      = NULL;   /* owned only when not bundle-backed */
+/* Background worker pool for async chunk loads (disk read + JSON-byte staging
+ * off-thread; scene apply/spawn stays on the main thread).  Owned here for the
+ * app lifetime; destroyed at shutdown AFTER the streamer (whose destroy joins
+ * all in-flight chunk tasks first) so no worker dereferences a freed fs/scene. */
+static JceThreadPool    *s_stream_pool    = NULL;
 
 /* Runtime mesh cache (path → JceMesh*).
  *
@@ -233,6 +248,40 @@ static bool jce_default_load_startup_scene(const JceProject *proj)
     return true;
 }
 
+/* World-streamer entity callbacks (streaming M3): wire a freshly-streamed
+ * chunk's entities into the live runtime gameplay (scripts + on_start, triggers,
+ * NPCs, runtime bodies) and release them again on cell unload, so gameplay lives
+ * in streamed cells instead of just rendering.  `user` is the JceRuntime*.  The
+ * despawn fires while the ids are still valid (BEFORE the streamer destroys the
+ * scene entities), so the runtime can drop every per-entity reference first. */
+static void s_default_streamer_spawn_cb(const uint64_t *ids, uint32_t count,
+                                        void *user)
+{
+    jce_runtime_spawn_gameplay_for_ids((JceRuntime *)user, ids, count);
+}
+
+static void s_default_streamer_despawn_cb(const uint64_t *ids, uint32_t count,
+                                          void *user)
+{
+    jce_runtime_despawn_gameplay_for_ids((JceRuntime *)user, ids, count);
+}
+
+/* VRAM ceiling: report a streamed chunk's REAL GPU footprint to the streaming
+ * budget by summing its entities' resolved model VB+IB+texture bytes from the
+ * scene renderer's cache (jce_scene_renderer_entities_vram_bytes).  `user` is
+ * unused (the renderer + scene are file-statics).  Returns 0 before the scene
+ * renderer / scene exist or while a chunk's async model decodes are still in
+ * flight; the streamer then keeps its per-entity estimate and re-queries over a
+ * short window so the figure converges to real bytes. */
+static uint64_t s_default_streamer_residency_cb(const uint64_t *ids,
+                                                uint32_t count, void *user)
+{
+    (void)user;
+    if (!s_scene_renderer || !s_scene) return 0;
+    return jce_scene_renderer_entities_vram_bytes(s_scene_renderer, s_scene,
+                                                  ids, count);
+}
+
 /* Build the world streamer from the startup scene's authored streaming
  * settings.  FS source: when bundles are mounted, chunk fragments stream
  * out of the bundle VFS (s_bundle_fs); otherwise a private fs mounting
@@ -273,20 +322,88 @@ static void jce_default_init_world_streaming(const JceProject *proj)
     wsc.max_pending     = st->max_pending;
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
-    /* Cooperative mode: chunk apply spawns entities + GPU resources, which
-     * must happen on the main/render thread (no thread pool is passed). */
-    wsc.single_thread   = true;
 
-    s_world_streamer = jce_world_streamer_create(&wsc, s_scene, fs, NULL);
+    /* Chunk disk-read + JSON-byte staging run on a small worker pool; the
+     * scene apply (entity + GPU-resource spawn) stays time-sliced on the
+     * main/render thread inside jce_world_streamer_update.  This removes the
+     * per-cell synchronous-read frame hitch.  Web has no real threads, so keep
+     * the cooperative single-thread path there. */
+    JceThreadPool *pool = NULL;
+#if !JCE_PLATFORM_WEB
+    pool = jce_thread_pool_create(3);
+#endif
+    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
+
+    s_world_streamer = jce_world_streamer_create(&wsc, s_scene, fs, pool);
     if (!s_world_streamer) {
         LOG_WARN("app", "%s", "world streamer creation failed — streaming disabled");
+        if (pool) jce_thread_pool_destroy(pool);
         if (s_stream_fs) { jce_fs_destroy(s_stream_fs); s_stream_fs = NULL; }
         return;
     }
+    s_stream_pool = pool;
     jce_world_streamer_register_from_scene_settings(s_world_streamer, st);
+    /* Wire streamed-cell entities into the live runtime gameplay (streaming M3):
+     * a script / trigger / NPC authored in a streamed chunk comes alive (on_start
+     * / on_update, trigger observer, body) instead of only rendering, and is
+     * released cleanly on cell unload.  No-op when no runtime (physics disabled). */
+    if (s_runtime)
+        jce_world_streamer_set_entity_callbacks(s_world_streamer,
+                                                s_default_streamer_spawn_cb,
+                                                s_default_streamer_despawn_cb,
+                                                s_runtime);
+
+    /* VRAM ceiling: report real per-chunk GPU residency to the budget AND arm
+     * the renderer's model-cache eviction so freeing ECS entities on cell
+     * unload actually frees their GPU mesh/texture.  The model cache is the
+     * dominant streamed-VRAM consumer, so give it the streaming budget as its
+     * ceiling (bytes).  Both no-ops when budget_mb == 0 (unlimited) or there is
+     * no scene renderer. */
+    if (s_scene_renderer) {
+        jce_world_streamer_set_residency_query(
+            s_world_streamer, s_default_streamer_residency_cb, NULL);
+        if (st->budget_mb > 0)
+            jce_scene_renderer_set_model_vram_budget(
+                s_scene_renderer,
+                (uint64_t)st->budget_mb * 1024ULL * 1024ULL);
+    }
+    /* HLOD far-skyline proxy swap: hide a cell's cheap always-resident proxy
+     * box ("HLOD_<gx>_<gz>") once its detailed geometry streams in, show it
+     * again on unload.  Shared engine impl (jce_world_streamer_attach_hlod) —
+     * the SAME code the editor uses — so the standalone exe no longer
+     * double-draws / z-fights the proxy over the real streamed buildings.  The
+     * runtime has no extra per-chunk concern, so no chained callback. */
+    jce_world_streamer_attach_hlod(s_world_streamer, s_scene, NULL, NULL);
     LOG_INFO("app", "world streaming active (%u chunks, r=%.0f/%.0f)",
              jce_world_streamer_chunk_count(s_world_streamer),
              wsc.load_radius, wsc.unload_radius);
+}
+
+/* Resolve an asset-relative path (as written in scene JSON) to an absolute
+ * path jce_fs_host_read_all can open, by anchoring it under the staged cooked
+ * tree (<exe_dir>/<cooked_assets>/).  The shipped exe runs with CWD == exe dir
+ * (or any other dir), never the cooked-tree root, so engine-side file loads
+ * that bypass the PAK (anim state machines, terrain meta/bin, HDR, etc.) would
+ * otherwise be opened relative to the process CWD and fail — the same class of
+ * bug the editor avoids by installing its own resolver.  Returns false (leave
+ * the path as-is) for already-absolute inputs or when the anchored file does
+ * not exist, so PAK-backed and embedded-bundle projects are unaffected. */
+static bool s_default_resolve_path(const char *in, char *out, int outsz, void *ud)
+{
+    (void)ud;
+    if (!in || !in[0] || !out || outsz <= 0) return false;
+    /* Already absolute (drive letter, UNC, or POSIX root) → use as-is. */
+    if (in[0] == '/' || in[0] == '\\' ||
+        (in[0] && in[1] == ':')) return false;
+
+    char base[1024] = {0};
+    if (!jce_fs_host_get_base_path(base, sizeof(base))) return false;
+    const char *cooked = (s_project && s_project->cooked_assets &&
+                          s_project->cooked_assets[0])
+                         ? s_project->cooked_assets : "resources/_cooked";
+    int n = snprintf(out, (size_t)outsz, "%s%s/%s", base, cooked, in);
+    if (n <= 0 || n >= outsz) return false;
+    return jce_fs_host_exists_file(out);
 }
 
 static JceMesh *s_default_load_mesh(const char *path, void *ud)
@@ -404,7 +521,13 @@ static bool app_init(const JceServices *svc, void *ud)
 
     if (svc && svc->renderer) {
         JceSceneRendererCallbacks cbs = {0};
-        cbs.load_mesh = s_default_load_mesh;
+        cbs.load_mesh    = s_default_load_mesh;
+        /* Anchor engine-side relative file loads (anim state machines, terrain
+         * meta/bin, HDR, ...) under the staged cooked tree so they resolve in a
+         * shipped exe whose CWD is not the cooked-tree root.  Mirrors the
+         * editor's own resolver; harmless for PAK/bundle-only projects (returns
+         * false → path used as-is). */
+        cbs.resolve_path = s_default_resolve_path;
         s_scene_renderer = jce_scene_renderer_create(
                                svc->renderer, s_engine_pak, &cbs);
         /* A shipped game is always "playing": enable the animation
@@ -416,6 +539,31 @@ static bool app_init(const JceServices *svc, void *ud)
     }
     if (!s_scene_renderer)
         LOG_WARN("app", "%s", "jce_scene_renderer_create failed — scene will not render");
+
+    /* Occlusion culler (M5): activate GPU-query two-pass coherence culling in
+     * the shipped runtime, mirroring the editor scene-view.  Only the engine's
+     * embedded 'color' program is needed for the depth-only proxy draws, so this
+     * works in a shipped exe (engine shaders are embedded; see JCE_EMBED_ENGINE
+     * _SHADERS).  Opt-OUT via JCE_DISABLE_OCCLUSION=1 (A/B + safety hatch, mirrors
+     * JCE_DISABLE_WCACHE).  Uses the default proxy view (254); the runtime has a
+     * single scene-render path per frame so no second culler shares the view. */
+    if (svc && svc->renderer) {
+        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
+        if (dis && dis[0] && dis[0] != '0') {
+            LOG_INFO("app", "%s",
+                     "JCE_DISABLE_OCCLUSION set — runtime occlusion culling OFF");
+        } else {
+            JceShaderSet oc_shaders;
+            memset(&oc_shaders, 0, sizeof(oc_shaders));
+            JceShaderHandle ch = jce_renderer_get_program_color(svc->renderer);
+            oc_shaders.color.idx = ch.idx;
+            JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+            s_occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
+            if (!s_occlusion_culler)
+                LOG_WARN("app", "%s",
+                         "occlusion culler creation failed (runtime culling disabled)");
+        }
+    }
 
     /* ECS-UI (Canvas/UIImage/UIText/UIButton) overlay renderer.  Authored UI
      * components in the scene render in the deployed game exactly as they
@@ -473,6 +621,10 @@ static bool app_init(const JceServices *svc, void *ud)
                     jce_renderer_set_vsync(svc->renderer, s_render_settings.vsync != 0);
                     jce_renderer_set_msaa(svc->renderer, s_render_settings.msaa);
                 }
+                /* Grass rendering project gate (Stage 1b.6). */
+                if (s_scene_renderer)
+                    jce_scene_renderer_set_grass_enabled(s_scene_renderer,
+                        s_render_settings.grass_enabled != 0);
                 LOG_INFO("app", "render settings loaded: %s (vsync=%d msaa=%d)",
                          rpath, s_render_settings.vsync, s_render_settings.msaa);
             }
@@ -672,16 +824,24 @@ static void app_update(float dt, void *ud)
         }
     }
 
+    /* Detach-cam toggle (default_main only): F flips first-person player-follow
+     * <-> free-fly.  Editor viewports have their own cameras and are unaffected.
+     * Manual rising-edge guard (down && !prev) — no key_pressed helper assumed.
+     * JCE_KEY_F == 9 (jce_keys.h:29). */
+    static bool s_free_cam      = false;
+    static bool s_free_cam_prev = false;
+    bool f_now = jce_input_key_down(in, JCE_KEY_F);
+    if (f_now && !s_free_cam_prev) s_free_cam = !s_free_cam;
+    s_free_cam_prev = f_now;
+
     jce_vec3 player_pos;
-    if (s_runtime && jce_runtime_get_player_position(s_runtime, &player_pos)) {
-        /* First-person: snap camera to the player's eye position each
-         * frame.  We do NOT call set_target — camera_rotate already
-         * owns the look direction; set_target would call look_at and
-         * stomp the yaw/pitch every frame. */
-        jce_vec3 eye = jce_v3(player_pos.x,
-                              player_pos.y + 1.6f,
-                              player_pos.z);
-        jce_camera_set_position(s_camera, eye);
+    if (!s_free_cam && s_runtime && jce_runtime_get_player_position(s_runtime, &player_pos)) {
+        /* Third-person follow: orbit the camera behind+above the player and
+         * look past them, so the playable character stays visible (showcase /
+         * Genshin-style).  Mouse yaw orbits the rig; F toggles to free-fly.
+         * Shared with the editor Game View (jce_camera_third_person_follow) so
+         * editor-Play and the runtime frame the scene identically (WYSIWYG). */
+        jce_camera_third_person_follow(s_camera, player_pos);
     } else {
         float speed = 20.0f;
         if (jce_input_key_down(in, JCE_KEY_LSHIFT) ||
@@ -711,6 +871,10 @@ static JceSceneRenderConfig s_default_scene_cfg(void)
         if (s_render_settings.shadow_cascades > 0)    c.csm_cascades    = (uint8_t)s_render_settings.shadow_cascades;
         if (s_render_settings.shadow_distance > 0.0f) c.shadow_distance = s_render_settings.shadow_distance;
     }
+    /* Two-pass GPU-query occlusion culling (M5): the renderer drives begin_frame
+     * / entity_visible / submit_query internally from this pointer.  NULL (when
+     * disabled / unsupported) keeps the old always-visible behaviour. */
+    c.occlusion_culler = s_occlusion_culler;
     return c;
 }
 
@@ -735,9 +899,11 @@ static void app_draw(const JceServices *svc, void *ud)
         if (!s_post_target) {
             s_post_target = jce_offscreen_target_create(svc->renderer,
                                                         JCE_VIEW_RUNTIME_GAME);
-            /* Re-base the post views high so present (base+12) never collides
-             * with the offscreen target's shadow/fog sub-views (30..46).  Safe
-             * in a shipped exe: no editor preview/pick shares the pipeline. */
+            /* Re-base the post views high so present (base+20, Stage-1a.5
+             * worst case with 6-mip bloom pyramid) never collides with the
+             * offscreen target's shadow/fog sub-views (30..46).  100+20=120
+             * stays well below ImGui (250).  Safe in shipped exe: no editor
+             * preview/pick shares the pipeline. */
             if (s_post_target) jce_postfx_set_view_base(pfx, 100);
         }
         if (s_post_target) {
@@ -754,6 +920,16 @@ static void app_draw(const JceServices *svc, void *ud)
                                              0x000000FFu, "RuntimeScene")) {
                 JceSceneRenderConfig pcfg = s_default_scene_cfg();
                 uint16_t base = jce_offscreen_target_get_view_id(s_post_target);
+                /* Postfx path renders into the offscreen target — bind the
+                 * occlusion proxy view to its FBO so the proxy depth test reads
+                 * the depth the color pass wrote (not the backbuffer → would
+                 * make occlusion inert or false-cull visible geometry).  The
+                 * no-postfx path below keeps the default UINT16_MAX (backbuffer),
+                 * which is exactly where it draws. */
+                pcfg.scene_frame_buffer =
+                    jce_offscreen_target_get_frame_buffer(s_post_target);
+                pcfg.viewport_width  = sw;
+                pcfg.viewport_height = sh;
                 jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                           base, s_last_dt, &pcfg);
                 bool any_effect = false;
@@ -782,6 +958,11 @@ static void app_draw(const JceServices *svc, void *ud)
         jce_renderer_begin_frame_3d(svc->renderer, svc->window,
                                     s_camera, JCE_VIEW_MAIN_3D);
         JceSceneRenderConfig cfg = s_default_scene_cfg();
+        /* Direct-to-backbuffer: scene_frame_buffer stays UINT16_MAX (backbuffer),
+         * which is exactly where the color pass draws — the occlusion proxy view
+         * binds to the same backbuffer.  Give it the window rect so the proxy
+         * raster matches. */
+        if (sw > 0 && sh > 0) { cfg.viewport_width = sw; cfg.viewport_height = sh; }
         jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                   JCE_VIEW_MAIN_3D, s_last_dt, &cfg);
     }
@@ -903,11 +1084,17 @@ static void app_exit(void *ud)
 {
     (void)ud;
     /* Streamer first: destroying it removes its streamed entities from
-     * s_scene and detaches from the fs before either is torn down. */
+     * s_scene and joins all in-flight chunk tasks (jce_task_wait) before
+     * detaching from the fs.  Only then destroy the worker pool (also
+     * waits-for-all on shutdown) and the fs the workers were reading from. */
     if (s_world_streamer) { jce_world_streamer_destroy(s_world_streamer);  s_world_streamer = NULL; }
+    if (s_stream_pool)    { jce_thread_pool_destroy(s_stream_pool);        s_stream_pool    = NULL; }
     if (s_stream_fs)      { jce_fs_destroy(s_stream_fs);                   s_stream_fs      = NULL; }
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
+    /* Occlusion culler holds bgfx resources (proxy geom + query handles) —
+     * destroy before the renderer/bgfx shut down. */
+    if (s_occlusion_culler) { jce_occlusion_culler_destroy(s_occlusion_culler); s_occlusion_culler = NULL; }
     /* Offscreen postfx target borrows the renderer — destroy before it. */
     if (s_post_target)    { jce_offscreen_target_destroy(s_post_target);  s_post_target    = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }

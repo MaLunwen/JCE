@@ -181,7 +181,11 @@ static void sr_bind_local_shadow_state(JceSceneRenderer *sr)
 
     float inv_atlas = sr->shadow_map_size > 0
         ? 1.0f / (float)sr->shadow_map_size : 0.0f;
-    float params[4] = { (float)JCE_LOCAL_SHADOW_TILES, inv_atlas,
+    /* tiles/side follows the active grid (2 default, 6 when point cube shadows
+       are on) so the shader's tile-rect math matches the producer. */
+    float tiles_side = (float)(sr->local_tiles ? sr->local_tiles
+                                               : JCE_LOCAL_SHADOW_TILES);
+    float params[4] = { tiles_side, inv_atlas,
                         sr->frame_local_bias, inv_atlas };
     bgfx_set_uniform(sr->u_local_shadow_params, params, 1);
 
@@ -189,6 +193,20 @@ static void sr_bind_local_shadow_state(JceSceneRenderer *sr)
        shadow-casting light use its authored shadowBias instead of one global. */
     if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_bias))
         bgfx_set_uniform(sr->u_local_shadow_bias, sr->frame_local_bias_slot, 1);
+
+    /* #7 omnidirectional point cube shadows: per-point face-0 slot table + the
+       6-face VPs. Off / no-cube => lanes all -1, so the shader takes the legacy
+       single-tile u_pointShadowSlot path (byte-identical default). */
+    if (BGFX_HANDLE_IS_VALID(sr->u_point_cube_base_slot)) {
+        float cbslots[16];
+        for (int i = 0; i < JCE_MAX_POINT_LIGHTS && i < 16; i++)
+            cbslots[i] = (sr->frame_local_active && sr->point_cube_shadows)
+                       ? sr->frame_point_cube_base_slot[i] : -1.0f;
+        bgfx_set_uniform(sr->u_point_cube_base_slot, cbslots, 4);
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->u_point_cube_vp))
+        bgfx_set_uniform(sr->u_point_cube_vp, sr->frame_point_cube_vp[0].raw[0],
+                         JCE_POINT_SHADOW_MAX * JCE_POINT_CUBE_FACES);
 }
 
 void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
@@ -239,6 +257,19 @@ void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
     sr_bind_shadow_uniforms_disabled(sr);
 }
 
+/* #7: omnidirectional point-shadow view-band gate. Mirrors the producer gate in
+   sr_draw_local_shadow_pass — r.point_shadows cvar (idempotent re-register
+   returns the existing handle, so no `sr` needed here) OR the
+   JCE_POINT_CUBE_SHADOWS env, AND shadows enabled. */
+static bool point_cube_views_on(const JceSceneRenderConfig *cfg)
+{
+    if (!cfg || !cfg->draw_shadows) return false;
+    JceCvar *cv = jce_cvar_register_bool("r.point_shadows", false,
+                                         JCE_CVAR_FLAG_NONE, "");
+    return (cv && jce_cvar_get_bool(cv))
+        || (getenv("JCE_POINT_CUBE_SHADOWS") != NULL);
+}
+
 void sr_apply_view_order(uint16_t view_id_base,
                                 const JceSceneRenderConfig *cfg,
                                 uint32_t csm_cascade_count,
@@ -256,6 +287,10 @@ void sr_apply_view_order(uint16_t view_id_base,
             include_fog_views,
             jce_render_pipeline_is_feature_enabled("gpu_particles"),
             gpu_cull_view,          /* GPU-cull compute view (shares base+9) */
+            /* #7: cube point-shadow tile band (base+100..) — SAME gate as the
+               producer (r.point_shadows cvar [idempotent re-register returns the
+               existing handle] OR the JCE_POINT_CUBE_SHADOWS env). */
+            point_cube_views_on(cfg),
             &order))
         return;
 
@@ -530,6 +565,11 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 {
     sr->shadow_use_csm = false; sr->last_csm_valid = false;
     sr->frame_shadow_active = false; sr->frame_shadow_vp_valid = false;
+    /* GPU-driven shadow context invalid until the CSM cascade planes are set
+     * below; sr_sh_flush keys off this to know which (if any) cascade a shadow
+     * view belongs to.  Cleared here so the non-CSM / early-return paths never
+     * leave a stale per-cascade plane set behind. */
+    sr->gpu_shadow_planes_valid = false;
     sr_bind_shadow_uniforms_disabled(sr);
 
     if (!sr->shadow_valid) return;
@@ -585,6 +625,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
                 if (!sr->ecull[i].casts_shadow) continue;
+                if (sr->ecull[i].lod_culled) continue;  /* LODGroup far-cull (P1 #6) */
                 if (sr_try_submit_skinned_shadow(sr, scene, e, i, shadow_view_0))
                     continue;
                 if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, i, shadow_view_0))
@@ -622,6 +663,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             JceEntity e = list->entities[i];
             if (!entity_enabled(scene, e)) continue;
             if (!sr->ecull[i].casts_shadow) continue;
+            if (sr->ecull[i].lod_culled) continue;  /* LODGroup far-cull (P1 #6) */
             if (sr_try_submit_skinned_shadow(sr, scene, e, i, shadow_view_0))
                 continue;
             if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, i, shadow_view_0))
@@ -664,18 +706,16 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     (void)cam_near;
     float shadow_near = JCE_CSM_SHADOW_NEAR;
 
-    /* Shadow distance is a STABLE, camera-independent quality setting — it must
-     * NOT be capped by the camera's far plane.  The editor orbit camera's far
-     * plane scales with zoom (orbit_distance*100 in orbit_apply), so the old
-     * min(cam_far, shadow_distance) made the shadow cutoff SHRINK as the user
-     * zoomed in: normal models only a bit far stopped casting/receiving shadows
-     * ("远处没有/远一点就不投影").  Standard engines fix the shadow distance
-     * independent of the view frustum — the cascades cover [near, shadow_far]
-     * and the visible sub-range simply samples whichever cascades fall in it
-     * (a far plane > the view far is harmless: out-of-view cascade range is
-     * unused, and the caster cull already keeps only casters whose light-space
-     * XY lands inside a cascade).  cam_far is no longer an input here. */
-    (void)cam_far;
+    /* Shadow distance must never be CAPPED by the camera's far plane.  The
+     * editor orbit camera's far plane scales with zoom (orbit_distance*100 in
+     * orbit_apply), so an old min(cam_far, shadow_distance) made the shadow
+     * cutoff SHRINK as the user zoomed in: normal models only a bit far stopped
+     * casting/receiving shadows ("远处没有/远一点就不投影").  The cascades cover
+     * [near, shadow_far] and the visible sub-range simply samples whichever
+     * cascades fall in it (a far plane > the view far is harmless: out-of-view
+     * cascade range is unused, and the caster cull keeps only casters whose
+     * light-space XY lands inside a cascade).  So shadow_far may only be GROWN
+     * by the view (for aerial reach, below), never shrunk by it. */
     float shadow_far_target;
     if (shadow_distance > 0.0f) {
         shadow_far_target = fmaxf(shadow_distance, shadow_near + 1.0f);
@@ -683,6 +723,45 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         shadow_far_target = fmaxf(shadow_near * CSM_DIST_SCALE, CSM_DIST_MAX);
         shadow_far_target = fmaxf(shadow_far_target,
                                   shadow_near + CSM_DIST_MIN);
+    }
+
+    /* ZOOM-OUT SHADOW REACH: the authored shadow distance is tuned for
+     * gameplay / street-level framing.  At an extreme zoomed-out (aerial)
+     * view the visible ground extends FAR past that distance, so the bulk of
+     * the frame falls beyond [shadow_near, shadow_far] and renders fully lit:
+     * the terrain washes out and the boundary between the shadowed near-region
+     * and the unshadowed far-region (and the unshadowed dark building walls)
+     * reads as a curved dark/bright band sweeping the ground.  This only shows
+     * at extreme aerial zoom — at gameplay zoom the whole view is already
+     * inside the authored distance.
+     *
+     * Fix: let the shadow distance GROW with how far the camera can see, but
+     * never SHRINK below the authored distance (so street-level keeps its crisp
+     * tuned range) and only in COARSE power-of-two buckets (so it changes in a
+     * few discrete jumps across a full zoom sweep instead of wobbling every
+     * frame — preserving the texel-snap stability the fixed distance was
+     * protecting).  cam_far is the camera's own view reach (the editor orbit
+     * camera sets it to orbit_distance*100); a small fraction of it is a clean,
+     * camera-pose-independent proxy for the visible ground extent.  The coarse
+     * bucketing below + the existing deadband tracking keep it shimmer-free. */
+    {
+        float view_reach = cam_far * 0.25f;   /* visible-ground extent proxy */
+        /* Never reach past the scene itself — shadowing empty space beyond the
+         * casters is wasted precision and needlessly inflates cascade 3. */
+        if (sr->scene_world_valid) {
+            jce_vec3 d = jce_v3_sub(sr->scene_world_max, sr->scene_world_min);
+            float scene_diag = jce_v3_len(d);
+            if (scene_diag > 1.0f && view_reach > scene_diag)
+                view_reach = scene_diag;
+        }
+        if (view_reach > shadow_far_target) {
+            /* Snap up to the next power-of-two multiple of the authored distance
+             * so the value only takes a handful of discrete steps across a full
+             * zoom sweep (no per-frame wobble => texel-snap stability holds). */
+            float bucket = shadow_far_target > 1.0f ? shadow_far_target : 1.0f;
+            while (bucket < view_reach) bucket *= 2.0f;
+            shadow_far_target = bucket;
+        }
     }
 
     if (!sr->shadow_far_valid) {
@@ -773,6 +852,23 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     sr->last_csm_valid = true;
     sr->frame_shadow_active = true;
 
+    /* GPU-driven shadow cull (roadmap #18, shadow extension): when the GPU path
+     * is live this frame, extract each cascade's 6 frustum planes from its light
+     * view-proj (Gribb-Hartmann, same extractor the color cull uses) and publish
+     * the cascade-view→slot mapping so sr_sh_flush routes each cascade's static
+     * instanced casters through that cascade's GPUScene compute cull + indirect
+     * draw instead of the CPU per-instance instanced submit.  Skinned / terrain /
+     * no-AABB casters stay on their existing CPU paths. */
+    if (sr->gpu_driven_frame) {
+        uint32_t nc = csm.cascade_count < JCE_CSM_MAX_CASCADES
+                    ? csm.cascade_count : JCE_CSM_MAX_CASCADES;
+        for (uint32_t c = 0; c < nc; c++)
+            sr_extract_frustum_planes(&csm.vp[c], sr->gpu_shadow_planes[c]);
+        sr->gpu_shadow_view0    = (uint16_t)(view_id_base + 11);
+        sr->gpu_shadow_cascades = nc;
+        sr->gpu_shadow_planes_valid = (nc > 0);
+    }
+
     /* World-anchored light-space basis (mirrors jce_csm.c) used by the
      * per-cascade shadow-caster culling in the loops below. */
     jce_vec3 scull_ld = jce_v3_normalize(light_dir);
@@ -834,6 +930,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
                 if (!sr->ecull[i].casts_shadow) continue;
+                if (sr->ecull[i].lod_culled) continue;  /* LODGroup far-cull (P1 #6) */
                 if (sr->ecull[i].has_aabb &&
                     sr_caster_culled_for_cascade(&sr->ecull[i].wmin, &sr->ecull[i].wmax,
                                                  scull_right, scull_up,
@@ -889,6 +986,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
                 if (!sr->ecull[i].casts_shadow) continue;
+                if (sr->ecull[i].lod_culled) continue;  /* LODGroup far-cull (P1 #6) */
                 if (sr->ecull[i].has_aabb &&
                     sr_caster_culled_for_cascade(&sr->ecull[i].wmin, &sr->ecull[i].wmax,
                                                  scull_right, scull_up,
@@ -922,16 +1020,16 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
                                         EntityList *list, uint16_t view_id_base,
                                         const jce_mat4 *vp, uint32_t slot,
-                                        const float *ident, bool *cleared)
+                                        const float *ident, bool *cleared,
+                                        uint32_t tiles, uint16_t view_off)
 {
     uint16_t tx, ty, tsz;
     if (!jce_local_shadow_atlas_tile(slot, sr->shadow_map_size,
-                                     JCE_LOCAL_SHADOW_TILES, &tx, &ty, &tsz))
+                                     tiles, &tx, &ty, &tsz))
         return;
 
     if (!*cleared) {
-        const uint16_t clear_view =
-            (uint16_t)(view_id_base + JCE_VIEW_LOCAL_SHADOW_OFFSET);
+        const uint16_t clear_view = (uint16_t)(view_id_base + view_off);
         bgfx_set_view_rect(clear_view, 0, 0,
                            sr->shadow_map_size, sr->shadow_map_size);
         bgfx_set_view_frame_buffer(clear_view, sr->local_atlas_fbo);
@@ -941,8 +1039,7 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
         *cleared = true;
     }
 
-    const uint16_t lv = (uint16_t)(view_id_base
-                          + JCE_VIEW_LOCAL_SHADOW_OFFSET + 1 + slot);
+    const uint16_t lv = (uint16_t)(view_id_base + view_off + 1 + slot);
     bgfx_set_view_rect(lv, tx, ty, tsz, tsz);
     bgfx_set_view_frame_buffer(lv, sr->local_atlas_fbo);
     bgfx_set_view_clear(lv, 0, 0, 1.0f, 0);   /* cleared once above */
@@ -964,7 +1061,10 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
         jce_mesh_submit_shadow(mesh, sr->renderer, lv);
     }
 
-    sr->frame_local_vp[slot] = *vp;
+    /* Spot/legacy slots (0..3) feed u_localShadowVP; cube slots (>=4) store
+       their VP in frame_point_cube_vp via the caller, so guard the OOB write. */
+    if (slot < JCE_MAX_LOCAL_SHADOWS)
+        sr->frame_local_vp[slot] = *vp;
 }
 
 /* P1 — local (spot + point) shadow producer pass. Renders up to
@@ -989,6 +1089,18 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     for (uint32_t i = 0; i < JCE_MAX_LOCAL_SHADOWS; i++)
         sr->frame_local_bias_slot[i] = 0.0015f;   /* per-slot default */
 
+    /* #7 omnidirectional point shadows (opt-in). Env gate for now; an editor
+       feature flag / cvar sets it later. When on, the atlas subdivides 6x6 so a
+       point light can claim 6 contiguous cube-face tiles. Default => 2x2, the
+       legacy single-downward point tile, byte-identical. */
+    sr->point_cube_shadows =
+        (sr->cv_point_shadows && jce_cvar_get_bool(sr->cv_point_shadows))
+        || (getenv("JCE_POINT_CUBE_SHADOWS") != NULL);
+    sr->local_tiles = sr->point_cube_shadows
+                    ? JCE_LOCAL_SHADOW_TILES_CUBE : JCE_LOCAL_SHADOW_TILES;
+    for (uint32_t i = 0; i < JCE_MAX_POINT_LIGHTS; i++)
+        sr->frame_point_cube_base_slot[i] = -1.0f;
+
     if (!sr->local_atlas_valid || !list) return;
     if (jce_renderer_get_program_shadow(sr->renderer).idx == UINT16_MAX) return;
 
@@ -996,6 +1108,17 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
     uint32_t slot    = 0;   /* shared spot+point atlas slot pool */
     bool     cleared = false;
+    /* When cube shadows are on, all local tiles relocate to a free view band
+       (base+100..) because 16 tiles would overrun base+4..+19 into post/fog. */
+    const uint16_t loff = sr->point_cube_shadows
+                        ? (uint16_t)JCE_VIEW_LOCAL_SHADOW_CUBE_OFFSET
+                        : (uint16_t)JCE_VIEW_LOCAL_SHADOW_OFFSET;
+    /* 6 cardinal cube-face directions. ORDER MUST MATCH the shader major-axis
+       face pick in fs_pbr_body.sh samplePointCubeShadow: {+X,-X,+Y,-Y,+Z,-Z}. */
+    static const float CUBE_DIRS[6][3] = {
+        { 1.0f, 0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f},
+        { 0.0f, 1.0f, 0.0f}, { 0.0f,-1.0f, 0.0f},
+        { 0.0f, 0.0f, 1.0f}, { 0.0f, 0.0f,-1.0f} };
 
     /* Spots — index aligns with u_spotLights[]. */
     uint32_t spot_idx = 0;
@@ -1026,17 +1149,24 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         jce_mat4 vp = jce_local_shadow_vp(pos, dir, fov,
                                           0.05f * radius, radius, homog);
         sr_local_shadow_render_tile(sr, scene, list, view_id_base,
-                                    &vp, slot, ident, &cleared);
+                                    &vp, slot, ident, &cleared,
+                                    sr->local_tiles, loff);
         sr->frame_local_bias_slot[slot] =
             (sl->shadow_bias > 0.0f) ? sl->shadow_bias : 0.0015f;
         sr->frame_spot_slot[my_spot] = (float)slot;
         slot++;
     }
 
-    /* Points — index aligns with u_pointLights[]; share the slot pool. v1 aims
-       a single wide-FOV frustum straight down (hemisphere approximation). */
-    uint32_t point_idx = 0;
-    for (int li = 0; li < list->count && slot < JCE_MAX_LOCAL_SHADOWS; li++) {
+    /* Points — index aligns with u_pointLights[]; share the slot pool. When
+       point_cube_shadows is ON a budgeted point claims 6 contiguous cube-face
+       tiles (true omni); otherwise (default) a single wide-FOV downward tile
+       (v1 hemisphere approximation) — byte-identical to the legacy path. */
+    uint32_t point_idx   = 0;
+    uint32_t cube_budget = 0;
+    const uint32_t max_slot = sr->point_cube_shadows
+        ? (uint32_t)(JCE_LOCAL_SHADOW_TILES_CUBE * JCE_LOCAL_SHADOW_TILES_CUBE)
+        : (uint32_t)JCE_MAX_LOCAL_SHADOWS;
+    for (int li = 0; li < list->count && slot < max_slot; li++) {
         JceEntity e = list->entities[li];
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_point_light(scene, e)) continue;
@@ -1055,18 +1185,55 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         JceTransform *xf = jce_scene_get_transform(scene, e);
         jce_vec3 pos    = xf ? xf->position : pl->position;
         float    radius = pl->radius > 0.0f ? pl->radius : 10.0f;
-        jce_mat4 vp = jce_local_shadow_vp(pos, jce_v3(0.0f, -1.0f, 0.0f),
-                                          JCE_POINT_SHADOW_FOV,
-                                          0.05f * radius, radius, homog);
-        sr_local_shadow_render_tile(sr, scene, list, view_id_base,
-                                    &vp, slot, ident, &cleared);
-        sr->frame_local_bias_slot[slot] =
-            (pl->shadow_bias > 0.0f) ? pl->shadow_bias : 0.0015f;
-        sr->frame_point_slot[my_point] = (float)slot;
-        slot++;
+
+        if (sr->point_cube_shadows) {
+            /* Omni: 6 perspective cube faces (FOV=PI/2). FIXED reserved layout so
+               the shader can map base_slot -> the 6-VP block in u_pointCubeVP:
+               slots 0-3 = spots/legacy, 4-9 = cube point 0, 10-15 = cube point 1.
+               (Reserving 0-3 even with fewer spots keeps base = 4 + budget*6, so
+               vp_index = (base-4) + face is stable.) */
+            if (cube_budget >= (uint32_t)JCE_POINT_SHADOW_MAX)
+                continue;   /* shadow-casting point budget exhausted -> unshadowed */
+            const uint32_t base = (uint32_t)JCE_MAX_LOCAL_SHADOWS
+                                + cube_budget * (uint32_t)JCE_POINT_CUBE_FACES;
+            if (base + (uint32_t)JCE_POINT_CUBE_FACES > max_slot)
+                continue;   /* atlas full */
+            for (uint32_t f = 0; f < (uint32_t)JCE_POINT_CUBE_FACES; f++) {
+                jce_vec3 d = jce_v3(CUBE_DIRS[f][0], CUBE_DIRS[f][1], CUBE_DIRS[f][2]);
+                jce_mat4 vp = jce_local_shadow_vp(pos, d, JCE_POINT_CUBE_FOV,
+                                                  0.05f * radius, radius, homog);
+                sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                            &vp, base + f, ident, &cleared,
+                                            sr->local_tiles, loff);
+                sr->frame_point_cube_vp[cube_budget * (uint32_t)JCE_POINT_CUBE_FACES + f] = vp;
+            }
+            sr->frame_point_cube_base_slot[my_point] = (float)base;
+            cube_budget++;
+        } else {
+            /* Legacy single wide-FOV downward tile (default path; slot < 4). */
+            jce_mat4 vp = jce_local_shadow_vp(pos, jce_v3(0.0f, -1.0f, 0.0f),
+                                              JCE_POINT_SHADOW_FOV,
+                                              0.05f * radius, radius, homog);
+            sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                        &vp, slot, ident, &cleared,
+                                        sr->local_tiles, loff);
+            sr->frame_local_bias_slot[slot] =
+                (pl->shadow_bias > 0.0f) ? pl->shadow_bias : 0.0015f;
+            sr->frame_point_slot[my_point] = (float)slot;
+            slot++;
+        }
     }
 
-    sr->frame_local_count  = slot;
-    sr->frame_local_active = slot > 0;
+    /* Active if any spot/legacy slot OR any cube point rendered (cube uses a
+       fixed reserved region independent of `slot`, so a cube-only frame still
+       has slot==0). frame_local_count = highest used slot+1 for consumers. */
+    uint32_t used = slot;
+    if (cube_budget > 0) {
+        uint32_t cube_end = (uint32_t)JCE_MAX_LOCAL_SHADOWS
+                          + cube_budget * (uint32_t)JCE_POINT_CUBE_FACES;
+        if (cube_end > used) used = cube_end;
+    }
+    sr->frame_local_count  = used;
+    sr->frame_local_active = used > 0;
     sr->frame_local_bias   = 0.0015f;   /* default depth bias; tune by eye */
 }

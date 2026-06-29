@@ -14,19 +14,56 @@
  */
 
 #include "jce_sr_internal.h"   /* JceSceneRenderer struct + Sr* types (split foundation) */
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_perf_phase.h>
 
 /* ── Entity collection ────────────────────────────────────────────── */
 
 /* EntityList is defined in jce_sr_internal.h so the split jce_sr_*.c modules
  * share one definition. */
 
+/* Forward decl: the persistent (cross-frame) focus-cull world-AABB cache lookup,
+ * defined later in this TU.  collect_entity_cb consults it so a world-spanning
+ * entity (e.g. the big ground terrain at the origin) is kept when its cached
+ * WORLD-AABB overlaps the focus region, not merely when its centre is within
+ * cull_radius — see SrCollectCtx below.  Unlike the static wcache this cache
+ * covers EVERY collected entity (incl. rigidbody-bearing static terrain). */
+static struct SrFocusAabbEntry *sr_focus_aabb_find(JceSceneRenderer *sr,
+                                                   uint32_t entity);
+
+/* Grow the per-frame entity list to hold at least `need` elements.  Initial
+ * capacity is SR_MAX_ENTITIES (allocated lazily on first reserve), then 2× on
+ * demand — so a scene with <= SR_MAX_ENTITIES entities reallocs at most once
+ * (the first frame) and never again, matching the old fixed-array performance.
+ * Grow-BEFORE-write: callers reserve before writing list->entities[count], so no
+ * captured pointer is invalidated by the realloc.  Returns false (leaving the
+ * old buffer + cap intact) only on allocation failure. */
+bool sr_entity_list_reserve(EntityList *list, int need)
+{
+    if (need <= list->cap) return true;
+    int new_cap = list->cap > 0 ? list->cap : SR_MAX_ENTITIES;
+    while (new_cap < need) {
+        /* Guard against int overflow on absurd entity counts (INT_MAX/2
+         * without pulling in <limits.h>; matches SR_SM_STATE_SEED style). */
+        if (new_cap > 1073741823) { new_cap = need; break; }
+        new_cap *= 2;
+    }
+    JceEntity *grown = (JceEntity *)JCE_REALLOC(list->entities,
+                                                (size_t)new_cap * sizeof(JceEntity));
+    if (!grown) return false;   /* keep old buffer/cap; caller drops overflow */
+    list->entities = grown;
+    list->cap      = new_cap;
+    return true;
+}
+
 /* User-data for collect_entity_cb. Carries the focus-bounded ("draw distance")
  * cull state in addition to the output list. When `enabled` is false (the
  * default — see jce_scene_render_config_default / memset'd configs), the
  * collect is byte-identical to the original "collect all" behaviour. */
 typedef struct {
-    EntityList *list;
-    JceScene   *scene;
+    EntityList       *list;
+    JceScene         *scene;
+    JceSceneRenderer *sr;     /* for the persistent focus-cull AABB lookup */
     float       fx, fz;   /* focus point (XZ); y is intentionally ignored */
     float       r2;       /* (radius + margin) squared; horizontal cull */
     bool        enabled;
@@ -37,19 +74,83 @@ static void collect_entity_cb(JceScene *s, JceEntity e, void *ud)
     (void)s;
     SrCollectCtx *ctx = (SrCollectCtx *)ud;
     EntityList   *list = ctx->list;
-    if (list->count >= SR_MAX_ENTITIES) return;
+    /* Large-world capacity: GROW the list instead of silently dropping at the
+     * cap (the legacy `>= SR_MAX_ENTITIES return` capped a 53k-entity world at
+     * 32k, so ~20k entities never rendered).  Grow BEFORE writing the new
+     * element below.  On allocation failure, drop gracefully with a one-time
+     * warning (preserve the old behaviour of not crashing). */
+    if (list->count + 1 > list->cap) {
+        if (!sr_entity_list_reserve(list, list->count + 1)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARN(LOG_TAG, "entity list grow failed at %d entities; "
+                                  "dropping the remainder this frame", list->count);
+            }
+            return;
+        }
+    }
 
     if (ctx->enabled && jce_scene_has_transform(ctx->scene, e)) {
-        /* Horizontal (XZ) squared distance from the focus point. A high
-         * survey camera looking at the ground must still collect the ground
-         * area, so Y differences must NOT cull. Entities with no transform
-         * fall through and are always collected. */
-        JceTransform *t = jce_scene_get_transform(ctx->scene, e);
-        if (t) {
-            float dx = t->position.x - ctx->fx;
-            float dz = t->position.z - ctx->fz;
-            if (dx * dx + dz * dz > ctx->r2)
-                return; /* outside draw distance — skip */
+        /* Focus-bounded ("draw distance") cull.  The CORRECT test is whether the
+         * entity's WORLD-AABB overlaps the focus disc — NOT whether its transform
+         * ORIGIN is within the radius.  A world-spanning entity (e.g. the single
+         * large ground/terrain mesh authored at the origin) has its origin at
+         * (0,0,0); once the focus moves >cull_radius from the origin the legacy
+         * origin test culled it, so ALL ground vanished off-centre.  Its world
+         * AABB, however, still covers the focus, so the overlap test keeps it
+         * while small streamed props far from focus (whose AABB does not overlap)
+         * are still culled.
+         *
+         * The world AABB is read from the PERSISTENT cross-frame static cache
+         * (sr_wcache), which already tracks each static entity's world bounds and
+         * survives across frames.  An entity is collected at least once via the
+         * origin fallback below, the ecull build then stores its AABB, and every
+         * subsequent frame this overlap test sees it — so a world-spanning entity
+         * stays resident.  No model loads happen here (cache read only).
+         *
+         * NOTE the AABB is read from the PERSISTENT focus-cull cache
+         * (sr_focus_aabb), populated at the END of the ecull build for EVERY
+         * collected entity (static OR dynamic — a rigidbody-bearing static terrain
+         * must survive too, which is exactly the off-centre ground case).  A/B +
+         * safety hatch: JCE_DISABLE_FOCUS_AABB=1 reverts to the pure origin test. */
+        static int s_focus_aabb_disabled = -1;
+        if (s_focus_aabb_disabled < 0) {
+            const char *dv = getenv("JCE_DISABLE_FOCUS_AABB");
+            s_focus_aabb_disabled = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
+        }
+        bool kept = false;
+        if (ctx->sr && !s_focus_aabb_disabled) {
+            struct SrFocusAabbEntry *fa =
+                sr_focus_aabb_find(ctx->sr, (uint32_t)e);
+            if (fa) {
+                /* Closest point on the AABB (XZ) to the focus, squared distance:
+                 * inside the box on an axis contributes 0 to that axis. */
+                float cx = ctx->fx, cz = ctx->fz;
+                float qx = cx < fa->wmin.x ? fa->wmin.x
+                         : (cx > fa->wmax.x ? fa->wmax.x : cx);
+                float qz = cz < fa->wmin.z ? fa->wmin.z
+                         : (cz > fa->wmax.z ? fa->wmax.z : cz);
+                float dx = qx - cx, dz = qz - cz;
+                if (dx * dx + dz * dz > ctx->r2)
+                    return; /* AABB does not reach the focus disc — cull */
+                kept = true;  /* overlaps → keep regardless of origin distance */
+            }
+        }
+        if (!kept) {
+            /* No cached AABB yet (first sight of this entity, or a non-static
+             * entity that never enters the cache): fall back to the cheap
+             * origin distance test.  Y differences must NOT cull (a high survey
+             * camera looking at the ground keeps the ground area).  This collects
+             * the entity once; the ecull build then caches its AABB for the
+             * overlap test on subsequent frames. */
+            JceTransform *t = jce_scene_get_transform(ctx->scene, e);
+            if (t) {
+                float dx = t->position.x - ctx->fx;
+                float dz = t->position.z - ctx->fz;
+                if (dx * dx + dz * dz > ctx->r2)
+                    return; /* outside draw distance — skip */
+            }
         }
     }
 
@@ -324,6 +425,10 @@ static void sr_model_poll(JceSceneRenderer *sr)
         e->failed  = (model == NULL);
         e->pending = false;
         e->job     = NULL;
+        e->vram_bytes = model ? jce_model_gpu_bytes(model) : 0;
+        /* A pending slot was already touched the frame it was requested; keep
+         * it alive long enough for the requesting entity to re-resolve it. */
+        e->last_used_frame = sr->model_frame;
         jce_atomic_i32_destroy(j->done);
         JCE_FREE(j);
         if (sr->model_inflight > 0) sr->model_inflight--;
@@ -357,6 +462,12 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
         SrModelCache *e = &sr->model_cache[i];
         if (!e->used) { free_slot = i; break; }   /* empty → not cached; insert here */
         if (e->path_hash == h && strcmp(e->path, path) == 0) {
+            /* Touch: this path is referenced THIS frame (per-frame refcount for
+             * the VRAM-ceiling eviction).  Done for pending + failed too so a
+             * slot is never reaped out from under an entity still asking for it
+             * (a failed slot caches the negative; keeping it touched preserves
+             * the existing "don't retry" semantics until a real scene switch). */
+            e->last_used_frame = sr->model_frame;
             /* Pending: model is still NULL → callers skip until sr_model_poll
              * uploads it.  Failed: never retry. */
             return e->failed ? NULL : e;
@@ -374,6 +485,10 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
         e->model  = model;
         e->used   = true;
         e->failed = (model == NULL);
+        e->last_used_frame = sr->model_frame;
+        /* Editor mode: the asset cache OWNS this model — SR must never free it,
+         * so vram_bytes stays 0 (eviction is gated on runtime ownership). */
+        e->vram_bytes = 0;
         if (!model)
             LOG_WARN(LOG_TAG, "model cache: cannot load %s (will not retry)", path);
         return model ? e : NULL;
@@ -400,6 +515,8 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
     e->failed  = false;
     e->pending = true;
     e->job     = j;
+    e->vram_bytes      = 0;
+    e->last_used_frame = sr->model_frame;   /* requested this frame */
     e->thr     = jce_thread_create(sr_model_worker, j, "jce_sr_model");
     if (!e->thr) {
         /* No worker thread: decode + upload inline this frame. */
@@ -408,6 +525,7 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
         e->failed  = (e->model == NULL);
         e->pending = false;
         e->job     = NULL;
+        e->vram_bytes = e->model ? jce_model_gpu_bytes(e->model) : 0;
         jce_atomic_i32_destroy(j->done);
         JCE_FREE(j);
         return e->model ? e : NULL;
@@ -676,6 +794,22 @@ uint32_t sr_register_material(JceSceneRenderer *sr,
     return key;
 }
 
+/* Upload the per-frame aerial-fog uniforms. ALWAYS-SET (even when inactive,
+ * params.x == 0) because bgfx zero-clears uniforms between draws, so a draw
+ * that never set them would read stale/garbage; and it MUST be called from
+ * BOTH bind paths (sr_bind_material_cb queue path + sr_inline_bind_pbr_global
+ * non-queue path) or only the first sorted draw would receive fog (the known
+ * light-replay gotcha). Mirrors the u_iblParams always-set discipline. */
+static void sr_apply_fog_uniforms(JceSceneRenderer *sr)
+{
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_params))
+        bgfx_set_uniform(sr->u_fog_params,    sr->fog_frame.params,    1);
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_color))
+        bgfx_set_uniform(sr->u_fog_color,     sr->fog_frame.color,     1);
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_color_sun))
+        bgfx_set_uniform(sr->u_fog_color_sun, sr->fog_frame.color_sun, 1);
+}
+
 /* Render-queue binder callback. Invoked once per SUBMIT during
  * jce_rq_flush (bind-per-submit — see the rationale in jce_rq_flush).
  * Re-binds all textures / uniforms that jce_mesh_submit_pbr USED to bind
@@ -748,6 +882,8 @@ void sr_bind_material_cb(uint32_t material_key, void *user)
      * u_iblParams upload since it can force IBL on. */
     sr_bind_baked_gi(sr, ibl_params);
     bgfx_set_uniform(sr->u_ibl_params, ibl_params, 1);
+    /* Aerial-perspective fog (always-set; see sr_apply_fog_uniforms). */
+    sr_apply_fog_uniforms(sr);
 
     /* Terrain texture overrides + params (replaces stages 0/4 + adds 13/14/15). */
     if (e->is_terrain && e->terrain_slot >= 0 && e->terrain_slot < 16) {
@@ -773,6 +909,10 @@ void sr_bind_material_cb(uint32_t material_key, void *user)
             0.0f, 0.0f
         };
         bgfx_set_uniform(sr->u_terrain_params, tparams, 1);
+        /* Monolithic splat UV (identity remap); the chunked tiled path
+         * (sr_draw_terrain_chunks) overrides this per-tile. */
+        float tile_uv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+        bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
     }
 
     /* Forward+ per-submit cluster bind: stage 14 = s_cluster + the 3 cluster
@@ -824,6 +964,8 @@ void sr_inline_bind_pbr_global(JceSceneRenderer *sr,
     /* Baked GI override (see sr_bind_material_cb). */
     sr_bind_baked_gi(sr, ibl_params);
     bgfx_set_uniform(sr->u_ibl_params, ibl_params, 1);
+    /* Aerial-perspective fog (always-set; see sr_apply_fog_uniforms). */
+    sr_apply_fog_uniforms(sr);
 }
 
 JceSceneRenderConfig jce_scene_render_config_default(void)
@@ -852,6 +994,11 @@ JceSceneRenderConfig jce_scene_render_config_default(void)
     c.fog                    = jce_volumetric_fog_default_params();
     c.fog_depth_tex_handle   = UINT16_MAX;
     c.ssr_color_tex_handle   = UINT16_MAX;   /* SSR off unless caller sets it */
+    /* Backbuffer by default.  MUST be UINT16_MAX (BGFX_INVALID_HANDLE), not the
+     * memset'd 0 — fbo idx 0 is a REAL framebuffer, so leaving it zero would
+     * bind the occlusion proxy view to whatever fb owns slot 0.  Offscreen
+     * callers (editor bridge / runtime postfx) overwrite this with their FBO. */
+    c.scene_frame_buffer     = UINT16_MAX;
     return c;
 }
 
@@ -868,11 +1015,14 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->pak = pak;
     if (cbs) { sr->cbs = *cbs; sr->has_cbs = true; }
 
-    /* Per-frame per-entity cull cache (SrEntityCull).  Heap-allocated once here
+    /* Per-frame per-entity cull cache (SrEntityCull).  Heap-allocated here
      * (32768 entries ≈ 1 MB — too big for the stack) and rebuilt each frame; the
-     * shadow/prepass cull sites read it instead of recomputing the world AABB. */
+     * shadow/prepass cull sites read it instead of recomputing the world AABB.
+     * GROWN on demand in the render path (large-world capacity) so it always has
+     * >= list.count entries; SR_MAX_ENTITIES is just the initial size. */
     sr->ecull = (SrEntityCull *)JCE_CALLOC(SR_MAX_ENTITIES, sizeof(SrEntityCull));
     if (!sr->ecull) { JCE_FREE(sr); return NULL; }
+    sr->ecull_cap = SR_MAX_ENTITIES;
 
     /* Invalidate handles. */
     sr->white_tex.idx       = UINT16_MAX;
@@ -884,6 +1034,10 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_sky_perez.idx     = UINT16_MAX;
     sr->u_sky_zenith.idx    = UINT16_MAX;
     sr->u_sky_sun_dir.idx   = UINT16_MAX;
+    sr->u_sky_dome_mid.idx     = UINT16_MAX;
+    sr->u_sky_dome_glow.idx    = UINT16_MAX;
+    sr->u_sky_dome_sun.idx     = UINT16_MAX;
+    sr->u_sky_dome_sun_col.idx = UINT16_MAX;
     sr->u_light_dir.idx     = UINT16_MAX;
     sr->u_light_color.idx   = UINT16_MAX;
     sr->shadow_tex.idx      = UINT16_MAX;
@@ -898,6 +1052,8 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_local_shadow_bias.idx   = UINT16_MAX;
     sr->u_spot_shadow_slot.idx    = UINT16_MAX;
     sr->u_point_shadow_slot.idx   = UINT16_MAX;
+    sr->u_point_cube_vp.idx       = UINT16_MAX;
+    sr->u_point_cube_base_slot.idx = UINT16_MAX;
     sr->u_csm_vp.idx        = UINT16_MAX;
     sr->u_csm_splits.idx    = UINT16_MAX;
     sr->u_csm_params.idx    = UINT16_MAX;
@@ -910,6 +1066,12 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_ibl_params.idx     = UINT16_MAX;
     sr->u_sh9.idx            = UINT16_MAX;
     sr->u_gi_params.idx      = UINT16_MAX;
+    sr->u_look_wrap.idx      = UINT16_MAX;
+    sr->u_look_rim.idx       = UINT16_MAX;
+    sr->u_look_hemi_ground.idx = UINT16_MAX;
+    sr->u_fog_params.idx     = UINT16_MAX;
+    sr->u_fog_color.idx      = UINT16_MAX;
+    sr->u_fog_color_sun.idx  = UINT16_MAX;
     sr->gi_probe_spec.idx    = UINT16_MAX;
     sr->gi_probe_irr.idx     = UINT16_MAX;
     sr->tilemap_shared_ib.idx = UINT16_MAX;
@@ -945,6 +1107,24 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->s_water_disp.idx          = UINT16_MAX;
     for (int i = 0; i < SR_WATER_SLOT_MAX; i++)
         sr->water_cache[i].fft_tex.idx = UINT16_MAX;
+    /* Grass program + uniforms are created lazily on first grass submit;
+     * invalidate here because JCE_CALLOC zeros to idx 0 (a VALID bgfx
+     * handle), which would make BGFX_HANDLE_IS_VALID falsely true.
+     * grass_cache[16] is zero-initialised by JCE_CALLOC (struct is trivial). */
+    sr->grass_blade        = NULL;
+    sr->prog_grass.idx     = UINT16_MAX;
+    sr->grass_prog_tried   = false;
+    sr->grass_time         = 0.0f;
+    sr->u_grass_time.idx   = UINT16_MAX;
+    sr->u_grass_wind.idx   = UINT16_MAX;
+    sr->u_grass_color.idx  = UINT16_MAX;
+    sr->u_grass_fade.idx   = UINT16_MAX;
+    sr->grass_enabled      = false;  /* set via jce_scene_renderer_set_grass_enabled */
+    /* Streaming LOD cross-fade (Direction B): the per-draw u_lodFade uniform is
+     * created lazily at the start of the first color pass; invalidate the handle
+     * here because JCE_CALLOC zeros to idx 0 (a VALID bgfx handle).  fade_state
+     * (ptr/caps/count) and fade_time are correctly zero-initialised by CALLOC. */
+    sr->u_lod_fade.idx     = UINT16_MAX;
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
         sr->csm_tex[i].idx = UINT16_MAX;
         sr->csm_fbo[i].idx = UINT16_MAX;
@@ -1024,6 +1204,10 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                                              BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_sky_sun_dir  = bgfx_create_uniform("u_sky_sun_dir",
                                              BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_sky_dome_mid     = bgfx_create_uniform("u_sky_dome_mid",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_sky_dome_glow    = bgfx_create_uniform("u_sky_dome_glow",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_sky_dome_sun     = bgfx_create_uniform("u_sky_dome_sun",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_sky_dome_sun_col = bgfx_create_uniform("u_sky_dome_sun_col", BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_light_dir   = bgfx_create_uniform("u_lightDir",
                                             BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_light_color = bgfx_create_uniform("u_lightColor",
@@ -1139,6 +1323,12 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_point_shadow_slot = bgfx_create_uniform("u_pointShadowSlot",
         BGFX_UNIFORM_TYPE_VEC4, 4);   /* 16 point lanes */
+    /* #7 omnidirectional point shadows (opt-in): 6 cube-face VPs per budgeted
+       point light + per-point face-0 atlas slot table. */
+    sr->u_point_cube_vp = bgfx_create_uniform("u_pointCubeVP",
+        BGFX_UNIFORM_TYPE_MAT4, JCE_POINT_SHADOW_MAX * JCE_POINT_CUBE_FACES);
+    sr->u_point_cube_base_slot = bgfx_create_uniform("u_pointCubeBaseSlot",
+        BGFX_UNIFORM_TYPE_VEC4, 4);   /* 16 point lanes -> face-0 slot (-1=none) */
     /* Shadow filter tier — unconditional (gates local shadows even when
        the CSM resource block above was skipped). Default tier matches the
        full-quality shaders until the first frame caches the pipeline knob. */
@@ -1172,6 +1362,14 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         "Forward+ clustered lighting (opt-in; lifts the 16-point-light cap, "
         "drops per-spot IES). Default off = brute-force path.");
 
+    /* r.point_shadows console cvar — OPT-IN omnidirectional point-light cube
+     * shadows (#7). Default OFF = legacy single-downward point tile. Read each
+     * frame so the console toggles it live. */
+    sr->cv_point_shadows = jce_cvar_register_bool(
+        "r.point_shadows", false, JCE_CVAR_FLAG_NONE,
+        "Omnidirectional point-light shadows (opt-in; atlas-packed 6-face cube, "
+        "budget 2 nearest casters). Default off = single-downward approximation.");
+
     /* r.taa console cvar — temporal anti-aliasing, ON by default.  Read each
      * frame by the caller's TAA begin/end driver.  r.taa 0 falls back to the
      * FXAA path (byte-identical to the pre-TAA chain).  Idempotent across
@@ -1204,11 +1402,30 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         "frustum cull, roadmap #18).  Default off = CPU instancing path "
         "(byte-identical).  On engages the GPU cull for opaque instanced meshes; "
         "shadow/prepass stay on the CPU.");
+    /* JCE_GPU_SCENE=1 env toggle: flips the r.gpu_driven cvar on at startup so the
+     * GPU-driven (compute cull + stream-compaction + indirect) color path can be
+     * exercised headlessly without a console.  Mirrors the JCE_DISABLE_* toggles.
+     * Any non-empty, non-"0" value enables it. */
+    if (sr->cv_gpu_driven) {
+        const char *gpu_env = getenv("JCE_GPU_SCENE");
+        if (gpu_env && gpu_env[0] && gpu_env[0] != '0') {
+            jce_cvar_set_bool(sr->cv_gpu_driven, true);
+            LOG_INFO(LOG_TAG, "[init] JCE_GPU_SCENE set -> r.gpu_driven ON "
+                              "(GPU-driven color-pass cull/compaction/indirect)");
+        }
+    }
     /* GPUScene helper: loads cs_cull_frustum from the engine shader pak (with
      * the embedded-engine-pak fallback).  Returns a no-op handle on devices
      * without compute — is_supported() then gates the GPU path off. */
     sr->gpu_scene = jce_gpu_scene_create(sr->pak, jce_allocator_default());
     sr->gpu_driven_frame = false;
+    /* One dedicated GPUScene per CSM cascade for GPU-driven shadow culling — each
+     * needs its own cull buffers (separate light frustum + deferred-submit
+     * aliasing; see jce_sr_internal.h).  All share the color pass's compute
+     * views (base+3 reset / base+9 cull). */
+    for (uint32_t _c = 0; _c < JCE_CSM_MAX_CASCADES; _c++)
+        sr->gpu_shadow_scene[_c] =
+            jce_gpu_scene_create(sr->pak, jce_allocator_default());
 
     LOG_INFO(LOG_TAG, "[init] IBL uniforms + BRDF LUT");
     /* IBL uniforms + BRDF LUT. */
@@ -1227,6 +1444,24 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_ssao_params = bgfx_create_uniform("u_ssaoParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_gbuffer_mat = bgfx_create_uniform("u_gbufferMat", BGFX_UNIFORM_TYPE_VEC4, 1);
 
+    /* Look Profile uniforms (plan 02). Created up front so the funnel
+     * (sr_bind_baked_gi) always has valid handles; neutral snapshot when off. */
+    sr->u_look_wrap        = bgfx_create_uniform("u_lookWrap",       BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_look_rim         = bgfx_create_uniform("u_lookRim",        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_look_hemi_ground = bgfx_create_uniform("u_lookHemiGround", BGFX_UNIFORM_TYPE_VEC4, 1);
+
+    /* Toon character uniforms (stylized-slice §5.6). Created up front so the
+     * pre-submit cb always has valid handles; zero-set when the gate is off. */
+    sr->u_toon_params    = bgfx_create_uniform("u_toonParams",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_toon_rim_color = bgfx_create_uniform("u_toonRimColor",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_outline_params = bgfx_create_uniform("u_outlineParams", BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_outline_color  = bgfx_create_uniform("u_outlineColor",  BGFX_UNIFORM_TYPE_VEC4, 1);
+
+    /* Per-fragment aerial-perspective fog uniforms (fog_apply.sh). */
+    sr->u_fog_params    = bgfx_create_uniform("u_fogParams",   BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_fog_color     = bgfx_create_uniform("u_fogColor",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_fog_color_sun = bgfx_create_uniform("u_fogColorSun", BGFX_UNIFORM_TYPE_VEC4, 1);
+
     /* TAA motion-vector pass uniforms (mat4s): prev/cur un-jittered view*proj +
      * the static prev-frame world matrix and the previous skinned bone palette.
      * Created up front so submit-time always has valid handles even when TAA
@@ -1239,6 +1474,8 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     /* Terrain shader bindings (lazy: created here so submit-time has
      * valid handles even when no terrain is bound). */
     sr->u_terrain_params = bgfx_create_uniform("u_terrainParams",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_terrain_tile_uv = bgfx_create_uniform("u_terrainTileUV",
         BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->s_terrain_splat  = bgfx_create_uniform("s_splatMap",
         BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -1366,21 +1603,63 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     for (int i = 0; i < (int)(sizeof sr->foliage_cache / sizeof sr->foliage_cache[0]); i++) {
         JCE_FREE(sr->foliage_cache[i].insts);
         sr->foliage_cache[i].insts = NULL;
+        JCE_FREE(sr->foliage_cache[i].roots);
+        sr->foliage_cache[i].roots = NULL;
+        sr->foliage_cache[i].roots_cap = 0;
     }
 
     /* Per-frame per-entity cull cache. */
-    JCE_FREE(sr->ecull);        sr->ecull = NULL;
+    JCE_FREE(sr->ecull);        sr->ecull = NULL; sr->ecull_cap = 0;
+
+    /* Per-frame frustum-visibility scratch (large-world heap buffer). */
+    JCE_FREE(sr->visible_buf);  sr->visible_buf = NULL; sr->visible_buf_cap = 0;
+
+    /* Cross-frame persistent static world cache. */
+    JCE_FREE(sr->wcache);       sr->wcache = NULL;
+    sr->wcache_cap = 0; sr->wcache_count = 0;
+
+    /* Persistent focus-cull world-AABB cache. */
+    JCE_FREE(sr->focus_aabb);   sr->focus_aabb = NULL;
+    sr->focus_aabb_cap = 0; sr->focus_aabb_count = 0;
+
+    /* Per-entity LOD hysteresis state (P1 #6). */
+    JCE_FREE(sr->lod_state);    sr->lod_state = NULL;
+    sr->lod_state_cap = 0; sr->lod_state_count = 0;
+
+    /* Per-entity streaming cross-fade state (Direction B). */
+    JCE_FREE(sr->fade_state);   sr->fade_state = NULL;
+    sr->fade_state_cap = 0; sr->fade_state_count = 0;
 
     /* Color-pass GPU-instancing batch buffers. */
     JCE_FREE(sr->inst_batch);   sr->inst_batch = NULL;   sr->inst_batch_cap = 0;
     JCE_FREE(sr->sh_batch);     sr->sh_batch = NULL;     sr->sh_batch_cap = 0;
     JCE_FREE(sr->inst_gather);  sr->inst_gather = NULL;  sr->inst_gather_cap = 0;
+    JCE_FREE(sr->inst_tint_gather); sr->inst_tint_gather = NULL; sr->inst_tint_gather_cap = 0;
+
+    /* Octahedral impostor per-atlas card accumulators (P2 #10).  The atlas
+     * textures themselves are owned by the texture cache / editor callback. */
+    for (int i = 0; i < SR_IMPOSTOR_CACHE_MAX; i++) {
+        if (sr->impostor_batch[i].insts) {
+            JCE_FREE(sr->impostor_batch[i].insts);
+            sr->impostor_batch[i].insts = NULL;
+            sr->impostor_batch[i].cap = 0;
+        }
+    }
+    sr->impostor_batch_count = 0;
+    sr->impostor_cache_count = 0;
 
     /* GPU-driven rendering (roadmap #18): destroy the GPUScene helper (owns its
      * compute program + persistent GPU buffers) + the per-flush record scratch. */
     if (sr->gpu_scene) { jce_gpu_scene_destroy(sr->gpu_scene); sr->gpu_scene = NULL; }
+    for (uint32_t _c = 0; _c < JCE_CSM_MAX_CASCADES; _c++) {
+        if (sr->gpu_shadow_scene[_c]) {
+            jce_gpu_scene_destroy(sr->gpu_shadow_scene[_c]);
+            sr->gpu_shadow_scene[_c] = NULL;
+        }
+    }
     JCE_FREE(sr->gpu_rec);      sr->gpu_rec = NULL;      sr->gpu_rec_cap = 0;
     JCE_FREE(sr->gpu_draw);     sr->gpu_draw = NULL;     sr->gpu_draw_cap = 0;
+    JCE_FREE(sr->gpu_sh_draw);  sr->gpu_sh_draw = NULL;  sr->gpu_sh_draw_cap = 0;
 
     /* 2D sprite-animator instances (own their sheet + player). */
     for (int i = 0; i < SR_SPRITE_ANIM_MAX; i++) {
@@ -1472,7 +1751,26 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_water_mode))          bgfx_destroy_uniform(sr->u_water_mode);
     if (BGFX_HANDLE_IS_VALID(sr->s_water_disp))          bgfx_destroy_uniform(sr->s_water_disp);
 
+    /* Toon character uniforms (stylized-slice §5.6). */
+    if (BGFX_HANDLE_IS_VALID(sr->u_toon_params))    bgfx_destroy_uniform(sr->u_toon_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_toon_rim_color)) bgfx_destroy_uniform(sr->u_toon_rim_color);
+    if (BGFX_HANDLE_IS_VALID(sr->u_outline_params)) bgfx_destroy_uniform(sr->u_outline_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_outline_color))  bgfx_destroy_uniform(sr->u_outline_color);
+
+    /* Grass Field cache + program + uniforms. */
+    for (int i = 0; i < 16; ++i) sr_grass_slot_free(sr, i);
+    if (sr->grass_blade) jce_mesh_destroy(sr->grass_blade);
+    if (BGFX_HANDLE_IS_VALID(sr->prog_grass))      bgfx_destroy_program(sr->prog_grass);
+    if (BGFX_HANDLE_IS_VALID(sr->u_grass_time))    bgfx_destroy_uniform(sr->u_grass_time);
+    if (BGFX_HANDLE_IS_VALID(sr->u_grass_wind))    bgfx_destroy_uniform(sr->u_grass_wind);
+    if (BGFX_HANDLE_IS_VALID(sr->u_grass_color))   bgfx_destroy_uniform(sr->u_grass_color);
+    if (BGFX_HANDLE_IS_VALID(sr->u_grass_fade))    bgfx_destroy_uniform(sr->u_grass_fade);
+
+    /* Streaming LOD cross-fade uniform (Direction B; created lazily). */
+    if (BGFX_HANDLE_IS_VALID(sr->u_lod_fade))      bgfx_destroy_uniform(sr->u_lod_fade);
+
     if (BGFX_HANDLE_IS_VALID(sr->u_terrain_params)) bgfx_destroy_uniform(sr->u_terrain_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_terrain_tile_uv)) bgfx_destroy_uniform(sr->u_terrain_tile_uv);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_splat))  bgfx_destroy_uniform(sr->s_terrain_splat);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer1)) bgfx_destroy_uniform(sr->s_terrain_layer1);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer2)) bgfx_destroy_uniform(sr->s_terrain_layer2);
@@ -1488,6 +1786,10 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_sky_perez))    bgfx_destroy_uniform(sr->u_sky_perez);
     if (BGFX_HANDLE_IS_VALID(sr->u_sky_zenith))   bgfx_destroy_uniform(sr->u_sky_zenith);
     if (BGFX_HANDLE_IS_VALID(sr->u_sky_sun_dir))  bgfx_destroy_uniform(sr->u_sky_sun_dir);
+    if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_mid))     bgfx_destroy_uniform(sr->u_sky_dome_mid);
+    if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_glow))    bgfx_destroy_uniform(sr->u_sky_dome_glow);
+    if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_sun))     bgfx_destroy_uniform(sr->u_sky_dome_sun);
+    if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_sun_col)) bgfx_destroy_uniform(sr->u_sky_dome_sun_col);
     if (BGFX_HANDLE_IS_VALID(sr->u_light_dir))    bgfx_destroy_uniform(sr->u_light_dir);
     if (BGFX_HANDLE_IS_VALID(sr->u_light_color))  bgfx_destroy_uniform(sr->u_light_color);
 
@@ -1500,6 +1802,8 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_bias))   bgfx_destroy_uniform(sr->u_local_shadow_bias);
     if (BGFX_HANDLE_IS_VALID(sr->u_spot_shadow_slot))    bgfx_destroy_uniform(sr->u_spot_shadow_slot);
     if (BGFX_HANDLE_IS_VALID(sr->u_point_shadow_slot))   bgfx_destroy_uniform(sr->u_point_shadow_slot);
+    if (BGFX_HANDLE_IS_VALID(sr->u_point_cube_vp))       bgfx_destroy_uniform(sr->u_point_cube_vp);
+    if (BGFX_HANDLE_IS_VALID(sr->u_point_cube_base_slot)) bgfx_destroy_uniform(sr->u_point_cube_base_slot);
 
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
         if (BGFX_HANDLE_IS_VALID(sr->u_csm_samplers[i]))
@@ -1560,6 +1864,12 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_ibl_params))     bgfx_destroy_uniform(sr->u_ibl_params);
     if (BGFX_HANDLE_IS_VALID(sr->u_sh9))            bgfx_destroy_uniform(sr->u_sh9);
     if (BGFX_HANDLE_IS_VALID(sr->u_gi_params))      bgfx_destroy_uniform(sr->u_gi_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_wrap))        bgfx_destroy_uniform(sr->u_look_wrap);
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_rim))         bgfx_destroy_uniform(sr->u_look_rim);
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_hemi_ground)) bgfx_destroy_uniform(sr->u_look_hemi_ground);
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_params))    bgfx_destroy_uniform(sr->u_fog_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_color))     bgfx_destroy_uniform(sr->u_fog_color);
+    if (BGFX_HANDLE_IS_VALID(sr->u_fog_color_sun)) bgfx_destroy_uniform(sr->u_fog_color_sun);
 
     /* Release baked reflection-probe cubemaps loaded this session. */
     for (int i = 0; i < sr->rprobe_cache_count; i++) {
@@ -1570,11 +1880,20 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     }
 
     if (sr->sprite_batch)    jce_sprite_batch_destroy(sr->sprite_batch);
+    /* Destroy the held 3D LUT texture before tearing down the pipeline. */
+    if (sr->postfx_pipeline) {
+        JceTexture lut; int ln; float ls;
+        jce_postfx_get_lut(sr->postfx_pipeline, &lut, &ln, &ls);
+        if (jce_texture_valid(lut))
+            jce_texture_destroy(lut);
+    }
     if (sr->postfx_pipeline) jce_postfx_destroy(sr->postfx_pipeline);
 
     if (sr->cull_space) jce_space_destroy(sr->cull_space);
     if (sr->cull_aabbs) JCE_FREE(sr->cull_aabbs);
     if (sr->cull_prep)  JCE_FREE(sr->cull_prep);
+    if (sr->cull_map)     JCE_FREE(sr->cull_map);
+    if (sr->cull_hit_buf) JCE_FREE(sr->cull_hit_buf);
     if (sr->shadow_space) jce_space_destroy(sr->shadow_space);
     if (sr->shadow_noaabb) JCE_FREE(sr->shadow_noaabb);
     if (sr->shadow_query)  JCE_FREE(sr->shadow_query);
@@ -1582,6 +1901,234 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->transparent_queue) jce_rq_destroy(sr->transparent_queue);
 
     JCE_FREE(sr);
+}
+
+/* ── Cross-frame persistent static world cache (large-world-opt M1 #2) ──────
+ *
+ * The ecull build loop composes each entity's world matrix + world AABB every
+ * frame.  In a streaming city the overwhelming majority of entities are STATIC
+ * (buildings, roads, trees, lamps) and never move, yet the per-frame
+ * jce_scene_begin_render_world_cache drop forced a full recompose every frame.
+ * This table caches the composed (world, wmin, wmax, has_aabb, casts_shadow)
+ * across frames, keyed by entity id, and reuses it while the scene's structural
+ * epoch is unchanged AND the entity is statically determinable as non-moving.
+ *
+ * Conservative by construction: an entity is cached ONLY when neither it nor any
+ * ancestor carries a component the runtime mutates in place (rigidbody, 2D body,
+ * character controller, skeletal animator, vehicle, wheel collider, soft body) —
+ * those write the scene Transform directly in rt_sync_transforms WITHOUT bumping
+ * the structural epoch, so they must always recompute.  Script-driven motion
+ * goes through jce_scene_set_transform, which DOES bump the epoch, so it is
+ * caught.  When in any doubt (ancestor walk hits the depth guard) the entity is
+ * treated as dynamic and recomputed. */
+
+/* True when this entity OR any ancestor carries a runtime-moved component, so it
+ * must NOT be put in the persistent static cache. */
+static bool sr_entity_is_dynamic(JceScene *scene, JceEntity e)
+{
+    JceEntity cur = e;
+    for (int depth = 0; depth < 32 && cur != JCE_ENTITY_INVALID; depth++) {
+        if (jce_scene_has_rigidbody(scene, cur)            ||
+            jce_scene_has_rigidbody2d(scene, cur)          ||
+            jce_scene_has_character_controller(scene, cur) ||
+            jce_scene_has_skeletal_animator(scene, cur)    ||
+            jce_scene_has_vehicle(scene, cur)              ||
+            jce_scene_has_wheel_collider(scene, cur)       ||
+            jce_scene_has_soft_body(scene, cur))
+            return true;
+        JceEntity p = jce_scene_get_parent(scene, cur);
+        if (p == cur) break;          /* cycle guard */
+        cur = p;
+    }
+    /* depth-limit reached without resolving a root → be conservative. */
+    if (cur != JCE_ENTITY_INVALID) return true;
+    return false;
+}
+
+static uint32_t sr_wcache_hash(uint32_t e) { return e * 2654435761u; }
+
+/* Look up a live, epoch-current cache entry for `entity`.  Returns NULL on miss
+   or stale.  Never grows. */
+static SrWorldCacheEntry *sr_wcache_find(JceSceneRenderer *sr, uint32_t entity,
+                                         uint64_t epoch)
+{
+    if (!sr->wcache || sr->wcache_cap == 0 || entity == 0) return NULL;
+    uint32_t mask = sr->wcache_cap - 1;
+    uint32_t h = sr_wcache_hash(entity) & mask;
+    for (uint32_t i = 0; i < sr->wcache_cap; i++) {
+        uint32_t s = (h + i) & mask;
+        SrWorldCacheEntry *en = &sr->wcache[s];
+        if (!en->used) return NULL;                 /* open slot ends the probe */
+        if (en->entity == entity)
+            return en->structural_epoch == epoch ? en : NULL;
+    }
+    return NULL;
+}
+
+/* Grow + rehash the table to `new_cap` (power of two).  Drops untouched-style
+   bookkeeping; pure capacity grow.  No-op on OOM (caller then skips caching). */
+static bool sr_wcache_grow(JceSceneRenderer *sr, uint32_t need)
+{
+    uint32_t new_cap = sr->wcache_cap ? sr->wcache_cap : 1024;
+    while (new_cap < need * 2u) new_cap *= 2u;   /* keep load factor < 0.5 */
+    SrWorldCacheEntry *ns =
+        (SrWorldCacheEntry *)JCE_CALLOC(new_cap, sizeof(SrWorldCacheEntry));
+    if (!ns) return false;
+    if (sr->wcache) {
+        uint32_t nmask = new_cap - 1;
+        for (uint32_t i = 0; i < sr->wcache_cap; i++) {
+            SrWorldCacheEntry *o = &sr->wcache[i];
+            if (!o->used) continue;
+            uint32_t h = sr_wcache_hash(o->entity) & nmask;
+            while (ns[h].used) h = (h + 1) & nmask;
+            ns[h] = *o;
+        }
+        JCE_FREE(sr->wcache);
+    }
+    sr->wcache = ns;
+    sr->wcache_cap = new_cap;
+    return true;
+}
+
+/* Insert/overwrite the cached value for `entity`. */
+static void sr_wcache_store(JceSceneRenderer *sr, uint32_t entity,
+                            const SrEntityCull *src, uint64_t epoch)
+{
+    if (entity == 0) return;
+    if (sr->wcache_cap == 0 || (sr->wcache_count + 1) * 2u >= sr->wcache_cap) {
+        if (!sr_wcache_grow(sr, sr->wcache_count + 1)) return;
+    }
+    uint32_t mask = sr->wcache_cap - 1;
+    uint32_t h = sr_wcache_hash(entity) & mask;
+    while (sr->wcache[h].used && sr->wcache[h].entity != entity)
+        h = (h + 1) & mask;
+    SrWorldCacheEntry *en = &sr->wcache[h];
+    if (!en->used) { en->used = true; en->entity = entity; sr->wcache_count++; }
+    en->structural_epoch = epoch;
+    en->world        = src->world;
+    en->world_valid  = src->world_valid;
+    en->wmin         = src->wmin;
+    en->wmax         = src->wmax;
+    en->has_aabb     = src->has_aabb;
+    en->casts_shadow = src->casts_shadow;
+    en->touched      = true;
+}
+
+/* Drop stale entries so the table tracks the active streamed set and can't grow
+   without bound.  Called from the build loop; AMORTIZED — runs only when the
+   structural epoch changed (a real edit invalidated everything) OR the table is
+   getting full (>=75% of capacity).  Two reasons it is NOT an every-render
+   sweep: (1) sr_wcache_find is epoch-gated, so a stale entry already returns a
+   safe miss without a sweep; (2) the editor renders >1 viewport per bgfx frame
+   on a SHARED renderer with DIFFERENT focus-bounded entity subsets, so a
+   per-render "evict untouched" sweep would ping-pong entries that one viewport
+   sees and the other doesn't.  Amortized pruning keeps both viewports' static
+   entries resident.  Drops: epoch-stale entries always; touched==false (streamed
+   out / not seen this prune cycle) only on a full-table sweep. */
+static void sr_wcache_maybe_prune(JceSceneRenderer *sr, uint64_t epoch,
+                                  bool full_sweep)
+{
+    if (!sr->wcache) return;
+    for (uint32_t i = 0; i < sr->wcache_cap; i++) {
+        SrWorldCacheEntry *en = &sr->wcache[i];
+        if (!en->used) continue;
+        bool drop = (en->structural_epoch != epoch) ||
+                    (full_sweep && !en->touched);
+        if (drop) {
+            *en = (SrWorldCacheEntry){0};
+            sr->wcache_count--;
+        } else if (full_sweep) {
+            en->touched = false;   /* reset the touched window */
+        }
+    }
+}
+
+/* ── Persistent focus-cull world-AABB cache ───────────────────────────────
+ * Open-addressed table (mirrors wcache) keyed by entity id, holding each
+ * collected entity's world AABB so the NEXT frame's focus-bounded COLLECT can
+ * keep an entity whose AABB OVERLAPS the focus disc (vs the legacy transform-
+ * origin distance test that dropped a world-spanning terrain authored at the
+ * origin once the focus moved off-centre).  Unlike wcache this is NOT gated on
+ * the static predicate — it must cover a rigidbody-bearing static terrain too. */
+static struct SrFocusAabbEntry *sr_focus_aabb_find(JceSceneRenderer *sr,
+                                                   uint32_t entity)
+{
+    if (!sr->focus_aabb || sr->focus_aabb_cap == 0 || entity == 0) return NULL;
+    uint32_t mask = sr->focus_aabb_cap - 1;
+    uint32_t h = sr_wcache_hash(entity) & mask;
+    for (uint32_t i = 0; i < sr->focus_aabb_cap; i++) {
+        uint32_t s = (h + i) & mask;
+        struct SrFocusAabbEntry *en = &sr->focus_aabb[s];
+        if (!en->used) return NULL;                 /* open slot ends the probe */
+        if (en->entity == entity) return en;
+    }
+    return NULL;
+}
+
+static bool sr_focus_aabb_grow(JceSceneRenderer *sr, uint32_t need)
+{
+    uint32_t new_cap = sr->focus_aabb_cap ? sr->focus_aabb_cap : 1024;
+    while (new_cap < need * 2u) new_cap *= 2u;   /* load factor < 0.5 */
+    struct SrFocusAabbEntry *ns = (struct SrFocusAabbEntry *)
+        JCE_CALLOC(new_cap, sizeof(struct SrFocusAabbEntry));
+    if (!ns) return false;
+    if (sr->focus_aabb) {
+        uint32_t nmask = new_cap - 1;
+        for (uint32_t i = 0; i < sr->focus_aabb_cap; i++) {
+            struct SrFocusAabbEntry *o = &sr->focus_aabb[i];
+            if (!o->used) continue;
+            uint32_t h = sr_wcache_hash(o->entity) & nmask;
+            while (ns[h].used) h = (h + 1) & nmask;
+            ns[h] = *o;
+        }
+        JCE_FREE(sr->focus_aabb);
+    }
+    sr->focus_aabb = ns;
+    sr->focus_aabb_cap = new_cap;
+    return true;
+}
+
+/* Store/refresh an entity's world AABB for next frame's collect. */
+static void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
+                               jce_vec3 wmin, jce_vec3 wmax)
+{
+    if (entity == 0) return;
+    if (sr->focus_aabb_cap == 0 ||
+        (sr->focus_aabb_count + 1) * 2u >= sr->focus_aabb_cap) {
+        if (!sr_focus_aabb_grow(sr, sr->focus_aabb_count + 1)) return;
+    }
+    uint32_t mask = sr->focus_aabb_cap - 1;
+    uint32_t h = sr_wcache_hash(entity) & mask;
+    while (sr->focus_aabb[h].used && sr->focus_aabb[h].entity != entity)
+        h = (h + 1) & mask;
+    struct SrFocusAabbEntry *en = &sr->focus_aabb[h];
+    if (!en->used) { en->used = true; en->entity = entity; sr->focus_aabb_count++; }
+    en->wmin = wmin; en->wmax = wmax;
+    en->touched = true;
+}
+
+/* Prune entries not stored this frame so the table tracks the active set.
+ * AMORTIZED: like the wcache prune, runs only when the table crosses 75% load,
+ * because the editor renders >1 viewport per frame on a SHARED renderer with
+ * DIFFERENT focus subsets — a per-render evict would ping-pong entries one
+ * viewport sees and the other doesn't.  A stale entry is harmless (its AABB is
+ * still its real world bounds; a despawned-then-reused id would simply be re-
+ * stored with fresh bounds when next collected), so amortized pruning is safe. */
+static void sr_focus_aabb_maybe_prune(JceSceneRenderer *sr)
+{
+    if (!sr->focus_aabb || sr->focus_aabb_cap == 0) return;
+    if (sr->focus_aabb_count * 4u < sr->focus_aabb_cap * 3u) {
+        /* Below 75% load: just reset the touched window for the next cycle. */
+        for (uint32_t i = 0; i < sr->focus_aabb_cap; i++)
+            sr->focus_aabb[i].touched = false;
+        return;
+    }
+    for (uint32_t i = 0; i < sr->focus_aabb_cap; i++) {
+        struct SrFocusAabbEntry *en = &sr->focus_aabb[i];
+        if (!en->used) continue;
+        if (!en->touched) { *en = (struct SrFocusAabbEntry){0}; sr->focus_aabb_count--; }
+        else en->touched = false;
+    }
 }
 
 
@@ -1593,9 +2140,34 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (!sr || !scene) return view_id_base;
     JCE_PROFILE_ZONE_N("SceneRenderer::Render");
 
-    /* Upload any textures / models whose async decode finished last frame. */
+    uint64_t _t0_sr = jce_time_perf_counter();
+
+    /* Advance the per-frame model "refcount" clock BEFORE any resolve this
+     * frame.  sr_get_model stamps each resolved slot with this value, so a slot
+     * still showing an OLDER value after the frame was never referenced this
+     * frame (VRAM-ceiling eviction reads this). */
+    sr->model_frame++;
+
+    /* Upload any textures / models whose async decode finished last frame.
+     * VRAM ceiling: in runtime mode (SR owns its textures), arm streaming
+     * uploads so these RGBA8 textures retain a CPU mip-0 + opt into
+     * streaming_tracked — that is what lets the streaming-pressure mip-bias
+     * hook physically reclaim texture VRAM under budget.  Editor mode (asset
+     * cache owns textures) never arms it. */
+    const bool sr_runtime_owns = !(sr->has_cbs && sr->cbs.load_model);
+    if (sr_runtime_owns) jce_texture_set_streaming_uploads(true);
     sr_tex_poll(sr);
     sr_model_poll(sr);
+    if (sr_runtime_owns) jce_texture_set_streaming_uploads(false);
+
+    /* VRAM ceiling: free models whose owning chunks have all unloaded.  Run
+     * here — after the async upload poll, BEFORE this frame's cull/draw passes
+     * resolve any model — so no in-flight draw on THIS frame's view list can
+     * reference a handle we destroy (bgfx also defers the real buffer/texture
+     * release safely across frames).  No-op in editor mode (asset cache owns
+     * models) and when no budget is set. */
+    if (sr->model_evict_budget != 0 && !(sr->has_cbs && sr->cbs.load_model))
+        jce_scene_renderer_evict_models(sr, sr->model_evict_budget);
 
     /* Start a fresh world-matrix cache generation for this render. The
        multiple sub-passes below (shadow producers + color + terrain) each
@@ -1604,7 +2176,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
        here (not only in jce_scene_update) keeps edit-mode renders — which
        never call jce_scene_update — reading transforms as edited this frame
        rather than a stale cached pose. */
-    jce_scene_invalidate_world_cache(scene);
+    jce_scene_begin_render_world_cache(scene);
 
     /* Label views for GPU profilers (RenderDoc / bgfx debug overlay).
      * bgfx accepts repeat sets; names persist for the lifetime of the
@@ -1650,7 +2222,8 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             sr->gpu_scene_frame = gpu_fi;
             sr->gpu_scene_frame_valid = true;
         }
-        sr->gpu_cull_view = (uint16_t)(view_id_base + JCE_VIEW_GPU_PARTICLE_OFFSET);
+        sr->gpu_cull_view  = (uint16_t)(view_id_base + JCE_VIEW_GPU_PARTICLE_OFFSET);
+        sr->gpu_reset_view = (uint16_t)(view_id_base + JCE_VIEW_GPU_CULL_RESET_OFFSET);
     }
 
     sr->frame_shadow_active = false; sr->frame_shadow_vp_valid = false;
@@ -1693,7 +2266,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * identical to SHADED. */
     int sm = (int)cfg->view_mode;
     if (sm < 0) sm = 0;
-    if (sm > 3) sm = 0;
+    if (sm > JCE_SCENE_VIEW_AO) sm = 0;   /* allow debug channel views 4..7 */
     jce_pbr_material_set_view_mode(sm);
 
     /* Scene rendering settings own PostFX defaults; render config remains
@@ -1717,6 +2290,19 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         active_postfx.chromatic_strength =
             scene_rendering->chromatic_strength;
 
+        /* Look Profile → postfx data hand-off (plan 06 consumes tonemap_op /
+         * bloom_knee / lut_path / lut_strength).  Carried here so the postfx
+         * stomp has a single authoritative source; no behavioral change yet
+         * (plan 06 wires jce_postfx_set_* against these).
+         * NOTE: active_postfx.tonemap_op / .bloom_knee are NOT yet assigned here
+         * because JcePostFXParams does not yet have those fields (plan 06 adds
+         * them).  Plan 06 should uncomment the two lines below after extending
+         * JcePostFXParams:
+         *   active_postfx.tonemap_op  = scene_rendering->tonemap_op;
+         *   active_postfx.bloom_knee  = scene_rendering->bloom_knee;
+         * The authoritative source remains scene_rendering->tonemap_op which
+         * plan 06 reads directly. */
+
         if (sr->postfx_pipeline) {
             for (int i = 0; i < JCE_POSTFX_COUNT &&
                  i < JCE_SCENE_RENDERING_POSTFX_COUNT; i++) {
@@ -1731,6 +2317,66 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             jce_postfx_set_custom_params(sr->postfx_pipeline,
                                          scene_rendering->custom_post_params,
                                          scene_rendering->custom_post_param_count);
+
+            /* Stage-1a.5 postfx finish: push tonemap-op, bloom-knee, bloom
+             * quality (quality-gated), and resolve the 3D LUT on path change. */
+            jce_postfx_set_tonemap_op(sr->postfx_pipeline, scene_rendering->tonemap_op);
+            jce_postfx_set_bloom_knee(sr->postfx_pipeline, scene_rendering->bloom_knee);
+            {
+                JceRenderPipelineDesc _rp; jce_render_pipeline_get(&_rp);
+                /* HIGH/ULTRA → 5-mip pyramid; LOW/MID → 0 (legacy single-mip). */
+                int mips = (_rp.post_quality >= 2 /* JCE_RP_QUALITY_HIGH */) ? 5 : 0;
+                jce_postfx_set_bloom_quality(sr->postfx_pipeline, mips);
+            }
+            /* Resolve LUT path on change only (avoid per-frame GPU texture loads). */
+            if (strncmp(sr->last_lut_path, scene_rendering->lut_path,
+                        sizeof(sr->last_lut_path)) != 0) {
+                /* Destroy the old LUT texture before replacing it. */
+                if (sr->postfx_pipeline) {
+                    JceTexture old_lut; int old_n; float old_s;
+                    jce_postfx_get_lut(sr->postfx_pipeline, &old_lut, &old_n, &old_s);
+                    if (jce_texture_valid(old_lut))
+                        jce_texture_destroy(old_lut);
+                }
+                snprintf(sr->last_lut_path, sizeof(sr->last_lut_path), "%s",
+                         scene_rendering->lut_path);
+                JceTexture lut = JCE_TEXTURE_INVALID; int ln = 0;
+                if (scene_rendering->lut_path[0]) {
+                    /* Editor path: cbs.resolve_path converts the project-relative LUT
+                     * path to an absolute host path that jce_texture_load_lut_3d_host
+                     * can read directly.  This is needed because sr->pak in the editor
+                     * is the engine/editor assets PAK (shaders etc.), NOT the project's
+                     * cooked PAK — so jce_texture_load_lut_3d(sr->pak, ...) would fail
+                     * to find any project asset, silently returning INVALID.
+                     * Runtime (standalone exe): sr->pak IS the cooked project PAK,
+                     * so the pak-based loader works correctly there. */
+                    if (lut.idx == UINT16_MAX && sr->has_cbs && sr->cbs.resolve_path) {
+                        char host_path[512];
+                        if (sr->cbs.resolve_path(scene_rendering->lut_path,
+                                                  host_path, (int)sizeof(host_path),
+                                                  sr->cbs.userdata)) {
+                            lut = jce_texture_load_lut_3d_host(host_path);
+                        }
+                    }
+                    /* Runtime fallback: load from the cooked project PAK (standalone exe,
+                     * or editor with a cooked PAK — sr->pak is the project pak there). */
+                    if (lut.idx == UINT16_MAX && sr->pak)
+                        lut = jce_texture_load_lut_3d(sr->pak, scene_rendering->lut_path);
+                    /* Derive N from the 3D texture: loader builds N×N×N, so depth==N==h. */
+                    if (lut.idx != UINT16_MAX) {
+                        uint32_t w = 0, h = 0;
+                        jce_texture_get_size(lut, &w, &h);
+                        ln = (int)h;  /* h == N for our square-slice cubic LUT */
+                    }
+                }
+                jce_postfx_set_lut(sr->postfx_pipeline, lut, ln,
+                                   scene_rendering->lut_strength);
+            } else {
+                /* Path unchanged but strength can be edited live — keep it current. */
+                JceTexture cur; int cn; float cs;
+                jce_postfx_get_lut(sr->postfx_pipeline, &cur, &cn, &cs);
+                jce_postfx_set_lut(sr->postfx_pipeline, cur, cn, scene_rendering->lut_strength);
+            }
         }
     }
 
@@ -1749,13 +2395,19 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         sr->postfx_tonemap_active =
             jce_postfx_is_enabled(sr->postfx_pipeline, JCE_POSTFX_TONEMAP);
 
-    /* Shadow filter tier — read the render-pipeline quality knob once per
-       frame; sr_bind_frame_shadow_state uploads it with every material
+    /* Shadow filter tier + toon gate — read the render-pipeline quality knob
+       once per frame; sr_bind_frame_shadow_state uploads it with every material
        bind. (jce_render_pipeline_get is a struct copy, not a lookup.) */
     {
         JceRenderPipelineDesc rp_desc;
         jce_render_pipeline_get(&rp_desc);
         sr->shadow_filter_tier = (float)rp_desc.shadow_filter_quality;
+        /* Toon gate (CANON sr_toon_allowed): quality>=HIGH AND the pbr_toon
+         * program loaded.  LOW/MID or an old pak => standard skinned PBR. */
+        JceShaderHandle toon_prog = jce_renderer_get_program_pbr_skinned_toon(sr->renderer);
+        sr->toon_allowed_frame =
+            (rp_desc.post_quality >= JCE_RP_QUALITY_HIGH) &&
+            (toon_prog.idx != UINT16_MAX);
     }
 
     /* Time-of-day driver (P2-weather-decals-tod): advance the day clock and
@@ -1769,15 +2421,83 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (scene_rendering) {
         sr->sky_mode      = scene_rendering->sky_mode;
         sr->sky_turbidity = scene_rendering->sky_turbidity;
+
+        /* Stylized dome capture + gate.  When the authored mode is STYLIZED
+         * but the "stylized_sky" feature is off (LOW tier / old project),
+         * downgrade to PREETHAM so the slice still renders a sane sky. */
+        if (sr->sky_mode == JCE_SCENE_SKY_STYLIZED &&
+            !jce_render_pipeline_is_feature_enabled("stylized_sky")) {
+            sr->sky_mode = JCE_SCENE_SKY_PREETHAM;
+        }
+
+        /* Pack dome mirrors for upload (used only by the mode-3 branch,
+         * but always uploaded with safe values — see sr_draw_sky_gradient). */
+        sr->dome_zenith[0]  = scene_rendering->sky_dome_zenith[0];
+        sr->dome_zenith[1]  = scene_rendering->sky_dome_zenith[1];
+        sr->dome_zenith[2]  = scene_rendering->sky_dome_zenith[2];
+        sr->dome_mid[0]     = scene_rendering->sky_dome_mid[0];
+        sr->dome_mid[1]     = scene_rendering->sky_dome_mid[1];
+        sr->dome_mid[2]     = scene_rendering->sky_dome_mid[2];
+        sr->dome_mid[3]     = scene_rendering->sky_dome_mid_pos;
+        sr->dome_horizon[0] = scene_rendering->sky_dome_horizon[0];
+        sr->dome_horizon[1] = scene_rendering->sky_dome_horizon[1];
+        sr->dome_horizon[2] = scene_rendering->sky_dome_horizon[2];
+        sr->dome_ground[0]  = scene_rendering->sky_dome_ground[0];
+        sr->dome_ground[1]  = scene_rendering->sky_dome_ground[1];
+        sr->dome_ground[2]  = scene_rendering->sky_dome_ground[2];
+        sr->dome_glow[0]    = scene_rendering->sky_dome_glow[0];
+        sr->dome_glow[1]    = scene_rendering->sky_dome_glow[1];
+        sr->dome_glow[2]    = scene_rendering->sky_dome_glow[2];
+        sr->dome_glow[3]    = scene_rendering->sky_dome_glow_falloff;
+        sr->dome_sun[0]     = scene_rendering->sky_dome_sun_size;
+        sr->dome_sun[1]     = scene_rendering->sky_dome_sun_softness;
+        sr->dome_sun[2]     = scene_rendering->sky_dome_halo_power;
+        sr->dome_sun[3]     = scene_rendering->sky_dome_halo_strength;
+        sr->dome_sun_col[0] = scene_rendering->sky_dome_sun_color[0];
+        sr->dome_sun_col[1] = scene_rendering->sky_dome_sun_color[1];
+        sr->dome_sun_col[2] = scene_rendering->sky_dome_sun_color[2];
     } else {
         sr->sky_mode      = JCE_SCENE_SKY_GRADIENT;
         sr->sky_turbidity = 2.5f;
     }
 
-    /* Collect entities.  STATIC (BSS, not stack): the 32768-entry list is 256KB,
-     * which must not live on the stack; rendering is single-threaded/sequential
-     * (scene + game viewports render one after another, never concurrently), so
-     * a function-static is safe and reused across frames. */
+    /* Capture per-fragment aerial-fog state for this frame. Source = the
+     * scene's EXISTING fog_* settings (CANON aerial = fog_*). Default (no
+     * settings, or fog_mode NONE) => params.x = 0 => shader no-op (byte-
+     * identical baseline). Uploaded in both bind paths via sr_apply_fog_uniforms. */
+    {
+        memset(&sr->fog_frame, 0, sizeof(sr->fog_frame));
+        if (scene_rendering && scene_rendering->fog_mode != JCE_SCENE_FOG_NONE) {
+            sr->fog_frame.params[0] = (float)scene_rendering->fog_mode;
+            sr->fog_frame.params[1] = scene_rendering->fog_density;
+            sr->fog_frame.params[2] = scene_rendering->fog_start;
+            sr->fog_frame.params[3] = scene_rendering->fog_end;
+            /* horizon color + strength (strength reuses ambient_intensity-style
+             * authored weight; default to 1.0 so authored fog_color reads fully). */
+            sr->fog_frame.color[0] = scene_rendering->fog_color[0];
+            sr->fog_frame.color[1] = scene_rendering->fog_color[1];
+            sr->fog_frame.color[2] = scene_rendering->fog_color[2];
+            sr->fog_frame.color[3] = 1.0f;
+            /* warm sun-side tint: nudge the horizon color toward warm; v1 reuses
+             * the authored horizon color shifted, keeping the data carrier to the
+             * existing fog_* fields (no new fields per CANON). height_falloff
+             * drives the Wronski height integral (0 => classic distance fog). */
+            sr->fog_frame.color_sun[0] = scene_rendering->fog_color[0] * 1.15f;
+            sr->fog_frame.color_sun[1] = scene_rendering->fog_color[1] * 1.05f;
+            sr->fog_frame.color_sun[2] = scene_rendering->fog_color[2] * 0.85f;
+            sr->fog_frame.color_sun[3] = scene_rendering->fog_height_falloff;
+        }
+        /* else: zeroed => params.x == 0 => apply_aerial_fog early-returns. */
+    }
+
+    /* Collect entities.  STATIC (not stack): the list is large and must not live
+     * on the stack; rendering is single-threaded/sequential (scene + game
+     * viewports render one after another, never concurrently), so a function-
+     * static is safe and reused across frames.  `entities` is now a HEAP buffer
+     * (EntityList.entities), allocated lazily on the first collect and grown on
+     * demand to the scene's entity count (large-world capacity) — no fixed cap.
+     * It is a process-lifetime, grow-only buffer (the same lifetime the old BSS
+     * fixed array had); reused every frame, count reset below. */
     static EntityList list;
     list.count = 0;
     /* Focus-bounded collect ("draw distance"): when enabled with a positive
@@ -1787,6 +2507,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     SrCollectCtx collect_ctx = {
         .list    = &list,
         .scene   = scene,
+        .sr      = sr,
         .fx      = cfg->cull_focus_x,
         .fz      = cfg->cull_focus_z,
         .r2      = 0.0f,
@@ -1797,7 +2518,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         collect_ctx.r2      = eff * eff;
         collect_ctx.enabled = true;
     }
-    jce_scene_each_entity(scene, collect_entity_cb, &collect_ctx);
+    {
+        uint64_t _t0_collect = jce_time_perf_counter();
+        jce_scene_each_entity(scene, collect_entity_cb, &collect_ctx);
+        jce_perf_phase_add("collect", jce_time_perf_to_ms(_t0_collect, jce_time_perf_counter()));
+    }
 
     /* Skybox scan + IBL refresh. */
     sr_scan_skybox(sr, scene, &list);
@@ -1828,7 +2553,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     /* Skinned animation: advance every skeletal pose ONCE here, before the
        shadow pass records draws, caching each world-bone palette so the
        shadow and color passes share the identical pose (no double-advance). */
-    sr_update_skinned_anims(sr, scene, &list, dt_sec);
+    sr_update_skinned_anims(sr, scene, &list, dt_sec, camera);
 
     /* 2D sprite animation: advance every SpriteAnimator frame time ONCE here;
        the entity draw loop consumes the cached player's current frame. */
@@ -1839,15 +2564,81 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
        the light gather, so both consume the SAME selected set (index-aligned). */
     sr_select_lights(sr, scene, &list, camera);
 
+    uint64_t _t0_ecull = jce_time_perf_counter();
     /* Build the per-frame per-entity cull cache ONCE here (after the collect,
      * before the shadow pass).  Every shadow caster loop + the depth/velocity
      * prepass cull would otherwise recompute the SAME world AABB + model resolve
      * (sr_shadow_caster_aabb) ~6×/frame; caching it once and reading sr->ecull[i]
      * at each cull site removes that redundancy (the measured full-load hot path).
-     * Indexed identically to list.entities[i].  list.count <= SR_MAX_ENTITIES
-     * (collect_entity_cb clamps), so ecull (sized SR_MAX_ENTITIES) never overruns. */
+     * Indexed identically to list.entities[i].
+     *
+     * Large-world capacity: GROW ecull to hold >= list.count entries (the entity
+     * list itself is now unbounded).  Every downstream sr->ecull[i] access is
+     * inside a loop bounded by list.count, so growing here keeps them all in
+     * range.  Grown buffer is zeroed (fresh tail) and kept across frames; a scene
+     * with <= SR_MAX_ENTITIES entities never grows (initial cap already covers
+     * it).  On allocation failure, clamp the build/draw to ecull_cap so we still
+     * render the first ecull_cap entities rather than crash. */
+    if ((uint32_t)list.count > sr->ecull_cap && sr->ecull) {
+        uint32_t new_cap = sr->ecull_cap ? sr->ecull_cap : SR_MAX_ENTITIES;
+        while (new_cap < (uint32_t)list.count) {
+            if (new_cap > 0x7FFFFFFFu / 2u) { new_cap = (uint32_t)list.count; break; }
+            new_cap *= 2u;
+        }
+        SrEntityCull *grown = (SrEntityCull *)JCE_REALLOC(
+            sr->ecull, (size_t)new_cap * sizeof(SrEntityCull));
+        if (grown) {
+            /* Zero the freshly-grown tail (REALLOC leaves it uninitialised). */
+            memset(grown + sr->ecull_cap, 0,
+                   (size_t)(new_cap - sr->ecull_cap) * sizeof(SrEntityCull));
+            sr->ecull     = grown;
+            sr->ecull_cap = new_cap;
+        } else {
+            static bool ecull_warned = false;
+            if (!ecull_warned) {
+                ecull_warned = true;
+                LOG_WARN(LOG_TAG, "ecull grow failed at %d entities; "
+                                  "clamping render to %u", list.count, sr->ecull_cap);
+            }
+            /* Clamp the collected list to what ecull can index — every ecull[i]
+             * site loops to list.count, so capping the count keeps them safe. */
+            if ((uint32_t)list.count > sr->ecull_cap)
+                list.count = (int)sr->ecull_cap;
+        }
+    }
+
+    /* Cross-frame persistent static world cache (M1 #2): reuse a STATIC
+     * entity's composed world matrix + world AABB across frames while the scene
+     * structural epoch is unchanged.  Disabled (always recompute, old behaviour)
+     * by JCE_DISABLE_WCACHE for A/B + as a global safety hatch. */
+    static int s_wcache_disabled = -1;
+    if (s_wcache_disabled < 0) {
+        const char *dv = getenv("JCE_DISABLE_WCACHE");
+        s_wcache_disabled = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
+    }
+    const uint64_t struct_epoch = jce_scene_get_structural_epoch(scene);
+    const bool wcache_on = !s_wcache_disabled;
     for (int eci = 0; eci < list.count; eci++) {
         JceEntity e = list.entities[eci];
+
+        /* Fast path: a live, epoch-current cache entry for a static entity.
+         * Copy it straight into ecull[eci] — no parent-chain walk, no AABB
+         * transform.  (The cache only ever holds static entities, so a hit is
+         * guaranteed safe; dynamics never reach sr_wcache_store.) */
+        if (wcache_on) {
+            SrWorldCacheEntry *hit = sr_wcache_find(sr, (uint32_t)e, struct_epoch);
+            if (hit) {
+                sr->ecull[eci].world        = hit->world;
+                sr->ecull[eci].world_valid  = hit->world_valid;
+                sr->ecull[eci].wmin         = hit->wmin;
+                sr->ecull[eci].wmax         = hit->wmax;
+                sr->ecull[eci].has_aabb     = hit->has_aabb;
+                sr->ecull[eci].casts_shadow = hit->casts_shadow;
+                hit->touched = true;       /* keep it alive through the prune */
+                continue;
+            }
+        }
+
         jce_vec3 mn, mx;
         /* #8 — compose the world matrix ONCE here (identical source to every
          * later jce_scene_get_world_matrix call) and cache it.  The shadow
@@ -1865,26 +2656,83 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         sr->ecull[eci].wmin         = mn;
         sr->ecull[eci].wmax         = mx;
         sr->ecull[eci].casts_shadow = sr_entity_casts_shadow(scene, e);
+
+        /* Store STATIC entities for cross-frame reuse.  Dynamics (rigidbody /
+         * character / skeletal / vehicle / wheel / softbody on the entity or any
+         * ancestor) are mutated in place by the runtime without an epoch bump, so
+         * they are never cached and always take the recompute path above. */
+        if (wcache_on && !sr_entity_is_dynamic(scene, e))
+            sr_wcache_store(sr, (uint32_t)e, &sr->ecull[eci], struct_epoch);
     }
 
+    /* Persist EVERY collected entity's world AABB (static OR dynamic) for next
+     * frame's focus-bounded collect — that is what keeps a world-spanning entity
+     * (e.g. a rigidbody-bearing static ground terrain authored at the origin)
+     * resident when the focus moves off-centre (its AABB still overlaps the
+     * focus disc).  Entities whose AABB couldn't be resolved (has_aabb==false)
+     * are intentionally NOT stored: with no bounds the collect can only fall back
+     * to the origin distance test for them (their AABB would be unknown anyway).
+     * (Hit-cached entries above also carry has_aabb/wmin/wmax, so a wcache fast-
+     * path entity is stored here too.) */
+    for (int eci = 0; eci < list.count; eci++) {
+        if (sr->ecull[eci].has_aabb)
+            sr_focus_aabb_store(sr, (uint32_t)list.entities[eci],
+                                sr->ecull[eci].wmin, sr->ecull[eci].wmax);
+    }
+    sr_focus_aabb_maybe_prune(sr);
+    if (wcache_on) {
+        /* Amortized prune: full sweep when the structural epoch changed (mass
+         * invalidation) or the table crossed 75% load; otherwise leave stale
+         * entries for the epoch-gated find to skip (avoids cross-viewport
+         * ping-pong — see sr_wcache_maybe_prune). */
+        bool epoch_changed = (sr->wcache_epoch != struct_epoch);
+        bool full = sr->wcache_cap &&
+                    (sr->wcache_count * 4u >= sr->wcache_cap * 3u);
+        if (epoch_changed || full)
+            sr_wcache_maybe_prune(sr, struct_epoch, true);
+        sr->wcache_epoch = struct_epoch;
+    }
+
+    /* In-asset auto-LOD (P1 #6): compute each entity's LOD level ONCE here —
+     * AFTER ecull[*].world is populated (used for the camera distance), BEFORE
+     * both the shadow and color passes — so they bind the SAME level and the
+     * cast silhouette matches the rendered LOD.  Always runs (camera-dependent;
+     * a wcache world hit does not memo the LOD).  No LODGroup => level 0 =>
+     * byte-identical to the pre-LOD path. */
+    for (int eci = 0; eci < list.count; eci++) {
+        sr_compute_entity_lod(sr, scene, camera, list.entities[eci], eci);
+        /* Touch the streaming fade-in entry for EVERY resident entity here (not
+         * only those that survive frustum/occlusion culling to the draw call),
+         * so a momentarily-culled entity keeps its first-seen stamp instead of
+         * being pruned and re-dithering when it reappears.  No-op while
+         * fade_time==0 (non-streaming / still scene → byte-identical). */
+        sr_fade_factor_for_entity(sr, (uint32_t)list.entities[eci]);
+    }
+    sr_lod_state_prune(sr);
+    jce_perf_phase_add("ecull", jce_time_perf_to_ms(_t0_ecull, jce_time_perf_counter()));
+
     /* Shadow passes (do them BEFORE entity pass so PBR can sample). */
-    if (cfg->draw_shadows) {
-        /* Determine viewport from camera bounds — if absent, assume 16:9. */
-        uint32_t vp_w = cfg->viewport_width ? cfg->viewport_width : 1920, vp_h = cfg->viewport_height ? cfg->viewport_height : 1080;
-        float shadow_distance = cfg->shadow_distance;
-        float split_lambda = cfg->csm_split_lambda;
-        if (shadow_distance <= 0.0f && scene_rendering)
-            shadow_distance = scene_rendering->shadow_distance;
-        if (split_lambda < 0.0f)
-            split_lambda = scene_rendering ? scene_rendering->split_lambda : 0.5f;
-        sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base,
-                            vp_w, vp_h, shadow_distance, split_lambda);
-        /* P1 — local (spot) shadow atlas producer, after the directional/CSM
-           pass and before the entity/color pass that samples it. */
-        sr_draw_local_shadow_pass(sr, scene, &list, view_id_base);
-    } else {
-        sr->shadow_use_csm = false; sr->last_csm_valid = false;
-        sr->frame_local_active = false;
+    {
+        uint64_t _t0_shadow = jce_time_perf_counter();
+        if (cfg->draw_shadows) {
+            /* Determine viewport from camera bounds — if absent, assume 16:9. */
+            uint32_t vp_w = cfg->viewport_width ? cfg->viewport_width : 1920, vp_h = cfg->viewport_height ? cfg->viewport_height : 1080;
+            float shadow_distance = cfg->shadow_distance;
+            float split_lambda = cfg->csm_split_lambda;
+            if (shadow_distance <= 0.0f && scene_rendering)
+                shadow_distance = scene_rendering->shadow_distance;
+            if (split_lambda < 0.0f)
+                split_lambda = scene_rendering ? scene_rendering->split_lambda : 0.5f;
+            sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base,
+                                vp_w, vp_h, shadow_distance, split_lambda);
+            /* P1 — local (spot) shadow atlas producer, after the directional/CSM
+               pass and before the entity/color pass that samples it. */
+            sr_draw_local_shadow_pass(sr, scene, &list, view_id_base);
+        } else {
+            sr->shadow_use_csm = false; sr->last_csm_valid = false;
+            sr->frame_local_active = false;
+        }
+        jce_perf_phase_add("shadow_gather", jce_time_perf_to_ms(_t0_shadow, jce_time_perf_counter()));
     }
 
     /* SSAO: camera depth pre-pass + screen-space AO (gated on the scene's
@@ -2042,8 +2890,48 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         bgfx_set_uniform(sr->u_ssao_params, ssaoP, 1);
     }
 
+    /* ── Look Profile snapshot (plan 02) ───────────────────────────────
+     * Gate: stylized_look (LOW tier → forced neutral).  Pack once; the
+     * funnel (sr_bind_baked_gi) uploads it per lit submit.  Neutral packing
+     * (wrap=0, rim_intensity=0, hemi_enabled=0) is an algebraic no-op so the
+     * baseline frame is byte-identical (verified by render_parity).
+     * NOTE: neutral path sets rim_power=4.0 (non-zero) but that is
+     * irrelevant because rim_intensity=0 gates the product to zero. */
+    {
+        bool gate = jce_render_pipeline_is_feature_enabled("stylized_look");
+        const JceSceneRenderingSettings *lr = scene_rendering;
+        if (gate && lr) {
+            sr->look_gpu.wrap[0] = lr->wrap_factor;
+            sr->look_gpu.wrap[1] = lr->rim_power;
+            sr->look_gpu.wrap[2] = lr->rim_intensity;
+            sr->look_gpu.wrap[3] = lr->toon_character ? 1.0f : 0.0f;
+            sr->look_gpu.rim[0]  = lr->rim_color[0];
+            sr->look_gpu.rim[1]  = lr->rim_color[1];
+            sr->look_gpu.rim[2]  = lr->rim_color[2];
+            sr->look_gpu.rim[3]  = 0.0f;
+            sr->look_gpu.hemi[0] = lr->ambient_ground_color[0];
+            sr->look_gpu.hemi[1] = lr->ambient_ground_color[1];
+            sr->look_gpu.hemi[2] = lr->ambient_ground_color[2];
+            sr->look_gpu.hemi[3] = lr->ambient_hemisphere ? 1.0f : 0.0f;
+            sr->look_gpu_active  = true;
+        } else {
+            /* Neutral identity packing (no-op in shader). */
+            sr->look_gpu.wrap[0] = 0.0f; sr->look_gpu.wrap[1] = 4.0f;
+            sr->look_gpu.wrap[2] = 0.0f; sr->look_gpu.wrap[3] = 0.0f;
+            sr->look_gpu.rim[0]  = 1.0f; sr->look_gpu.rim[1]  = 1.0f;
+            sr->look_gpu.rim[2]  = 1.0f; sr->look_gpu.rim[3]  = 0.0f;
+            sr->look_gpu.hemi[0] = 0.0f; sr->look_gpu.hemi[1] = 0.0f;
+            sr->look_gpu.hemi[2] = 0.0f; sr->look_gpu.hemi[3] = 0.0f;
+            sr->look_gpu_active  = false;
+        }
+    }
+
     /* Entity rendering. */
-    sr_draw_entities(sr, scene, camera, &list, view_id_base, dt_sec, cfg);
+    {
+        uint64_t _t0_draw = jce_time_perf_counter();
+        sr_draw_entities(sr, scene, camera, &list, view_id_base, dt_sec, cfg);
+        jce_perf_phase_add("draw_submit", jce_time_perf_to_ms(_t0_draw, jce_time_perf_counter()));
+    }
 
     /* Cloth/soft-body grids (after entities so lighting uniforms are live). */
     sr_draw_cloth(sr, scene, view_id_base);
@@ -2058,7 +2946,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     /* Particle emitters: draw alive particles from the scene-owned
      * JceParticleSystem (simulated each runtime step by
      * jce_scene_particles_update) as depth-tested debug billboards. */
-    sr_draw_particles(sr, scene, view_id_base);
+    sr_draw_particles(sr, scene, camera, view_id_base);
 
     /* GPU-flagged emitters: compute simulate/emit on base+9 (ordered before
      * the color view) + one instanced billboard draw per pool, at the same
@@ -2125,6 +3013,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         }
     }
 
+    jce_perf_phase_add("scene_render", jce_time_perf_to_ms(_t0_sr, jce_time_perf_counter()));
     JCE_PROFILE_ZONE_END;
     return view_id_base;
 }
@@ -2260,23 +3149,34 @@ void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
                                         JceSceneCullStats *out)
 {
     if (!out) return;
-    if (!sr) {
-        out->total = out->visible = out->culled = 0;
-        out->enabled = false;
-        return;
-    }
+    memset(out, 0, sizeof(*out));
+    if (!sr) return;
     out->total   = sr->stat_total_entities;
     out->visible = sr->stat_visible_entities;
     out->culled  = sr->stat_culled_entities;
     out->enabled = sr->stat_culling_enabled;
+    out->inserted = sr->stat_cull_inserted;
+    out->updated  = sr->stat_cull_updated;
+    out->removed  = sr->stat_cull_removed;
+    if (sr->cull_space) {
+        jce_space_resolution(sr->cull_space, out->grid_res);
+        out->grid_cells    = jce_space_cell_count(sr->cull_space);
+        out->grid_occupied = jce_space_occupied_cell_count(sr->cull_space);
+        out->grid_objects  = jce_space_object_count(sr->cull_space);
+    }
 }
 
 void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
                                         const JceLodGroup *group)
 {
     if (!sr) return;
-    if (sr->global_lod != group)
-        memset(sr->lod_prev, 0, sizeof(sr->lod_prev));
+    if (sr->global_lod != group && sr->lod_state) {
+        /* Reset the per-entity LOD hysteresis memory so a new global LOD group
+         * re-classifies cleanly (P1 #6 open-addressed table). */
+        memset(sr->lod_state, 0,
+               (size_t)sr->lod_state_cap * sizeof(*sr->lod_state));
+        sr->lod_state_count = 0;
+    }
     sr->global_lod = group;
 }
 
@@ -2357,6 +3257,225 @@ void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
     }
 }
 
+/* ── VRAM ceiling: model-cache eviction (large-world-opt) ─────────────────── */
+
+uint64_t jce_scene_renderer_model_vram_bytes(const JceSceneRenderer *sr)
+{
+    if (!sr) return 0;
+    uint64_t total = 0;
+    for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
+        const SrModelCache *e = &sr->model_cache[i];
+        if (e->used && e->model) total += e->vram_bytes;
+    }
+    return total;
+}
+
+uint64_t jce_scene_renderer_model_path_vram_bytes(const JceSceneRenderer *sr,
+                                                  const char *path)
+{
+    if (!sr || !path || !path[0]) return 0;
+    uint32_t h = sr_path_hash(path);
+    for (int probe = 0; probe < SR_MODEL_CACHE_MAX; probe++) {
+        int i = (int)((h + (uint32_t)probe) % (uint32_t)SR_MODEL_CACHE_MAX);
+        const SrModelCache *e = &sr->model_cache[i];
+        if (!e->used) break;   /* empty slot ends the probe chain */
+        if (e->path_hash == h && strcmp(e->path, path) == 0)
+            return e->model ? e->vram_bytes : 0;
+    }
+    return 0;
+}
+
+uint32_t jce_scene_renderer_model_evicted_count(const JceSceneRenderer *sr)
+{
+    return sr ? sr->model_evicted_count : 0;
+}
+
+uint32_t jce_scene_renderer_model_cache_count(const JceSceneRenderer *sr)
+{
+    if (!sr) return 0;
+    uint32_t n = 0;
+    for (int i = 0; i < SR_MODEL_CACHE_MAX; i++)
+        if (sr->model_cache[i].used && sr->model_cache[i].model) n++;
+    return n;
+}
+
+/* Find the cache slot index for `path` (or -1).  Mirrors sr_get_model's probe
+ * (break-on-empty) without inserting — used to dedup shared models when summing
+ * a roster's residency. */
+static int sr_model_cache_slot_of(const JceSceneRenderer *sr, const char *path)
+{
+    if (!path || !path[0]) return -1;
+    uint32_t h = sr_path_hash(path);
+    for (int probe = 0; probe < SR_MODEL_CACHE_MAX; probe++) {
+        int i = (int)((h + (uint32_t)probe) % (uint32_t)SR_MODEL_CACHE_MAX);
+        const SrModelCache *e = &sr->model_cache[i];
+        if (!e->used) break;
+        if (e->path_hash == h && strcmp(e->path, path) == 0) return i;
+    }
+    return -1;
+}
+
+uint64_t jce_scene_renderer_entities_vram_bytes(JceSceneRenderer *sr,
+                                                JceScene *scene,
+                                                const uint64_t *entity_ids,
+                                                uint32_t count)
+{
+    if (!sr || !scene || !entity_ids || count == 0) return 0;
+    /* Editor mode: the asset cache owns/sizes models — nothing to report. */
+    if (sr->has_cbs && sr->cbs.load_model) return 0;
+
+    /* Dedup: a model shared by several of the entities is counted once.  Bitset
+     * over the fixed cache slot count (32 bytes for 256 slots) — stack-cheap. */
+    unsigned char counted[(SR_MODEL_CACHE_MAX + 7) / 8];
+    memset(counted, 0, sizeof(counted));
+
+    uint64_t total = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        JceEntity e = (JceEntity)entity_ids[k];
+
+        /* Resolve the entity's model path: static MeshRenderer glTF first, then
+         * a skeletal animator's skeleton model. */
+        const char *path = sr_mesh_renderer_model_path(scene, e);
+        if ((!path || !path[0]) && jce_scene_has_skeletal_animator(scene, e)) {
+            JceSkeletalAnimatorComponent *sa =
+                jce_scene_get_skeletal_animator(scene, e);
+            if (sa && sa->skeleton_path[0]) path = sa->skeleton_path;
+        }
+        if (!path || !path[0]) continue;
+
+        int slot = sr_model_cache_slot_of(sr, path);
+        if (slot < 0) continue;                       /* not resident / pending */
+        if (counted[slot >> 3] & (1u << (slot & 7))) continue;  /* already added */
+        counted[slot >> 3] |= (unsigned char)(1u << (slot & 7));
+
+        const SrModelCache *mc = &sr->model_cache[slot];
+        if (mc->model) total += mc->vram_bytes;
+    }
+    return total;
+}
+
+void jce_scene_renderer_set_model_vram_budget(JceSceneRenderer *sr,
+                                              uint64_t budget_bytes)
+{
+    if (!sr) return;
+    sr->model_evict_budget = budget_bytes;
+}
+
+/* Is any LIVE skeletal-animation instance still bound to this model?  Such an
+ * instance holds the JceModel* (and retarget skeletons) across frames, so the
+ * model must NOT be freed while one references it — even if the slot itself went
+ * untouched (defence in depth: in practice an animating entity re-resolves the
+ * model every frame so the slot would be touched, but a paused/off-screen one
+ * might not). */
+static bool sr_model_referenced_by_anim(const JceSceneRenderer *sr,
+                                        const JceModel *model)
+{
+    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
+        const SrAnimInstance *a = &sr->anim_inst[i];
+        if (!a->used) continue;
+        if (a->model == model) return true;
+        /* retarget map borrows src/dst skeletons owned by this model. */
+        if (model && (a->retarget_dst_skel == jce_model_get_skeleton((JceModel *)model) ||
+                      a->retarget_src_skel == jce_model_get_skeleton((JceModel *)model)))
+            return true;
+    }
+    return false;
+}
+
+/* Free one model-cache slot's GPU resources and clear the slot, then repair the
+ * open-addressing probe chain with a backward-shift delete so no later key in
+ * the same cluster becomes unreachable (the cache relies on break-on-empty;
+ * leaving a hole would orphan colliding keys).  `slot` MUST hold a loaded,
+ * non-pending model that is provably unreferenced.  Returns the freed bytes. */
+static uint64_t sr_model_cache_free_slot(JceSceneRenderer *sr, int slot)
+{
+    SrModelCache *e = &sr->model_cache[slot];
+    uint64_t freed = e->vram_bytes;
+
+    if (e->model) jce_model_destroy(e->model);   /* destroys meshes + textures */
+    memset(e, 0, sizeof(*e));                     /* slot now empty (used=false) */
+
+    /* Backward-shift delete (canonical linear-probing deletion): scan forward
+     * from the hole; for each occupied entry whose home would make it
+     * unreachable across the hole, slide it back into the hole and follow.  `j`
+     * advances every iteration; `hole` advances only on a move.  Stops at the
+     * first empty slot, which bounds the cluster (the lookup relies on
+     * break-on-empty, so the cluster must stay gapless). */
+    const int N = SR_MODEL_CACHE_MAX;
+    int hole = slot;
+    int j = (hole + 1) % N;
+    for (int step = 1; step < N; step++) {
+        SrModelCache *cj = &sr->model_cache[j];
+        if (!cj->used) break;   /* end of cluster — chain repaired */
+
+        int k = (int)(cj->path_hash % (uint32_t)N);   /* cj's home (ideal) slot */
+        /* Canonical Knuth backward-shift (Algorithm R): move cj into the hole
+         * iff its home k is NOT cyclically within (hole, j] — i.e. cj is no
+         * longer reachable from k unless it slides back past the hole.  When k
+         * IS in (hole, j], cj sits on/after the hole on its own probe path and
+         * must stay so a lookup starting at k still finds it.  k_in = k ∈
+         * (hole, j] forward. */
+        bool k_in;
+        if (hole <= j) k_in = (k > hole && k <= j);
+        else           k_in = (k > hole || k <= j);
+        if (!k_in) {
+            sr->model_cache[hole] = *cj;
+            memset(cj, 0, sizeof(*cj));
+            hole = j;
+        }
+        j = (j + 1) % N;
+    }
+    sr->model_evicted_count++;
+    return freed;
+}
+
+uint32_t jce_scene_renderer_evict_models(JceSceneRenderer *sr,
+                                         uint64_t budget_bytes)
+{
+    if (!sr) return 0;
+    /* RUNTIME ONLY: in editor mode the asset-cache callback owns the models, so
+     * the renderer must never free them (it holds only borrowed pointers). */
+    if (sr->has_cbs && sr->cbs.load_model) return 0;
+    if (budget_bytes == 0) return 0;
+
+    uint32_t freed_count = 0;
+    uint64_t resident = jce_scene_renderer_model_vram_bytes(sr);
+
+    /* Free the least-recently-used eligible model, recompute, repeat.  A
+     * backward-shift delete can relocate other slots, so we re-scan from
+     * scratch each iteration (the cache is small: SR_MODEL_CACHE_MAX slots). */
+    while (resident > budget_bytes) {
+        int      victim = -1;
+        uint64_t oldest = UINT64_MAX;
+
+        for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
+            SrModelCache *e = &sr->model_cache[i];
+            if (!e->used || !e->model) continue;   /* empty / pending / failed */
+            if (e->pending) continue;
+            if (e->vram_bytes == 0) continue;      /* nothing to reclaim */
+            /* Must have gone unreferenced for the whole grace window. */
+            uint64_t age = sr->model_frame - e->last_used_frame;
+            if (age < SR_MODEL_EVICT_GRACE) continue;
+            /* Never free a model a live animation instance still points at. */
+            if (sr_model_referenced_by_anim(sr, e->model)) continue;
+            if (e->last_used_frame < oldest) {
+                oldest = e->last_used_frame;
+                victim = i;
+            }
+        }
+        if (victim < 0) break;   /* nothing eligible — bounded best-effort */
+
+        uint64_t freed = sr_model_cache_free_slot(sr, victim);
+        freed_count++;
+        resident = (freed >= resident) ? 0 : (resident - freed);
+        LOG_DEBUG(LOG_TAG,
+                  "VRAM evict: freed model (%llu bytes), resident now %llu / budget %llu",
+                  (unsigned long long)freed, (unsigned long long)resident,
+                  (unsigned long long)budget_bytes);
+    }
+    return freed_count;
+}
+
 void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr)
 {
     if (!sr) return;
@@ -2417,11 +3536,12 @@ void jce_scene_renderer_get_occlusion_stats(const JceSceneRenderer *sr,
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (!sr) return;
-    out->total    = sr->stat_occlusion.total_entities;
-    out->visible  = sr->stat_occlusion.visible;
-    out->occluded = sr->stat_occlusion.occluded;
-    out->warm_up  = sr->stat_occlusion.warm_up;
-    out->enabled  = sr->stat_occlusion_enabled;
+    out->total     = sr->stat_occlusion.total_entities;
+    out->visible   = sr->stat_occlusion.visible;
+    out->occluded  = sr->stat_occlusion.occluded;
+    out->warm_up   = sr->stat_occlusion.warm_up;
+    out->no_result = sr->stat_occlusion.no_result;
+    out->enabled   = sr->stat_occlusion_enabled;
 }
 
 void jce_scene_renderer_set_time_of_day(JceSceneRenderer        *sr,
@@ -2467,4 +3587,14 @@ bool jce_scene_renderer_spawn_decal(JceSceneRenderer    *sr,
         if (!sr->decals) return false;   /* shader missing — fail soft */
     }
     return jce_decals_spawn(sr->decals, spawn);
+}
+
+/* ── Grass rendering project gate (Stage 1b.6) ─────────────────────── */
+/* Mirror of JceRenderSettings.grass_enabled; default false (off at create).
+ * The actual draw gate also requires JCE_CAP_INSTANCING + GPU tier >= HIGH
+ * (checked each frame in sr_draw_entities).  This setter is the project
+ * enable — call it once after loading render_settings.json. */
+void jce_scene_renderer_set_grass_enabled(JceSceneRenderer *sr, bool on)
+{
+    if (sr) sr->grass_enabled = on;
 }

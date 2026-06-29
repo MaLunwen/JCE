@@ -105,6 +105,11 @@ void jce_model_set_pre_submit_cb(JceModelPreSubmitCb cb, void *user);
  * default NULL => use embedded materials (byte-identical to before). */
 JCE_API void jce_model_set_material_override(const JcePbrMaterial *mat);
 
+/* Current per-draw material override (NULL when none).  Render-thread only;
+ * used by the tinted instanced solo fallback to compose a per-instance tint
+ * over the effective material. */
+JCE_API const JcePbrMaterial *jce_model_get_material_override(void);
+
 /* Editor missing-albedo checker fallback.  When `on`, the NEXT jce_model_draw
  * renders any primitive whose effective material has no valid albedo texture
  * with the pink-black checker (the editor's missing-asset hint), matching the
@@ -112,6 +117,32 @@ JCE_API void jce_model_set_material_override(const JcePbrMaterial *mat);
  * modes.  Scene renderer arms it for editor model draws and clears it (false)
  * after.  Default off => no checker (runtime never shows it). */
 JCE_API void jce_model_set_albedo_checker(bool on);
+
+/* In-asset auto-LOD selector for the NEXT model draw (large-world-opt P1 #6).
+ * level 0 = base geometry (LOD0, the default).  level >= 1 binds the (level-1)'th
+ * reduced index buffer on each non-skinned primitive's mesh (cooked into the GLB
+ * via the JCE_lod extension); a primitive without that many LODs falls through to
+ * its base index buffer, and skinned rigs always keep full detail.  Applies to
+ * jce_model_draw / _draw_instanced / _draw_shadow / _draw_shadow_instanced (so a
+ * mid-distance object's shadow casts the SAME LOD it renders).  Render-thread
+ * only (mirrors jce_model_set_material_override); the scene renderer arms it from
+ * jce_lod_pick, draws, and resets to 0.  level 0 => byte-identical to pre-LOD. */
+JCE_API void jce_model_set_draw_lod(uint32_t level);
+
+/* Largest in-asset reduced-LOD count across the model's non-skinned primitives
+ * (0 = no in-asset LODs).  Lets the renderer clamp a LODGroup level to the
+ * geometry actually shipped, and the inspector report the cooked chain depth. */
+JCE_API uint32_t jce_model_max_lod(const JceModel *model);
+
+/* Index counts of the model's first drawable non-skinned primitive: out_base
+ * receives the LOD0 index count, out_lods[i] (0-based, up to max_levels) the
+ * i'th reduced level's index count.  Returns the number of reduced levels
+ * written.  For the inspector's per-level triangle readout (tris = count / 3).
+ * Any out pointer may be NULL. */
+JCE_API uint32_t jce_model_lod_index_counts(const JceModel *model,
+                                            uint32_t *out_base,
+                                            uint32_t *out_lods,
+                                            uint32_t max_levels);
 
 /* Draw all mesh primitives with their PBR materials.
  *
@@ -123,6 +154,20 @@ void jce_model_draw(const JceModel *model,
                     const jce_mat4 *transform,
                     const jce_mat4 *joint_matrices,
                     uint32_t num_joints);
+
+/* KEYSTONE (stylized-slice §5.6): jce_model_draw with a per-call override for
+ * the TRULY-SKINNED color program only.  When skinned_color_override is valid
+ * (.idx != UINT16_MAX) it replaces jce_renderer_get_program_pbr_skinned for
+ * every fully-skinned primitive; the non-skinned (PBR-static) branch and every
+ * other behaviour are UNCHANGED.  Passing JCE_INVALID_SHADER is BYTE-IDENTICAL
+ * to jce_model_draw (which is now a thin caller of this).  Used by the scene
+ * renderer to draw a toon character with the pbr_toon program. */
+void jce_model_draw_program(const JceModel *model,
+                            const JceRenderer *r, uint16_t view_id,
+                            const jce_mat4 *transform,
+                            const jce_mat4 *joint_matrices,
+                            uint32_t num_joints,
+                            JceShaderHandle skinned_color_override);
 
 /* True when the model has no truly-skinned primitives, so it can be drawn with
  * jce_model_draw_instanced (a skinned primitive needs per-instance bone
@@ -139,6 +184,21 @@ JCE_API bool jce_model_is_instanceable(const JceModel *model);
 JCE_API void jce_model_draw_instanced(const JceModel *model,
                                       const JceRenderer *r, uint16_t view_id,
                                       const jce_mat4 *roots, uint32_t count);
+
+/* Tint-aware sibling of jce_model_draw_instanced (large-world-opt P1 #7): each
+ * instance i additionally carries tints[i] (RGBA, linear) packed as a 5th
+ * per-instance vec4 (i_data4) and modulating albedo in fs_pbr_tint exactly like
+ * a solo draw's u_baseColorFactor.  This lets baseColor-only copies of one mesh
+ * COLLAPSE into a single instanced submit instead of falling back to solo draws.
+ * tints == NULL is byte-identical to jce_model_draw_instanced (stride-64 buffer,
+ * plain vs_pbr_inst).  When tints != NULL but the tint program is unavailable
+ * (older pak) it falls back to the no-tint program (tint dropped, no crash). */
+JCE_API void jce_model_draw_instanced_tinted(const JceModel *model,
+                                             const JceRenderer *r,
+                                             uint16_t view_id,
+                                             const jce_mat4 *roots,
+                                             const jce_vec4 *tints,
+                                             uint32_t count);
 
 /* GPU-driven instancing helper (roadmap #18, Phase 0+1).  Returns true when the
  * model has EXACTLY ONE drawable, non-skinned, non-joint-parented primitive — the
@@ -165,6 +225,25 @@ JCE_API void jce_model_draw_instanced_from_buffer(const JceModel *model,
                                                   uint32_t start,
                                                   uint32_t count);
 
+/* Index count of the single drawable primitive (the one jce_model_gpu_instanceable
+ * accepts).  Used to fill the GPU indirect draw args (numIndices).  Returns 0
+ * when the model is not GPU-instanceable. */
+JCE_API uint32_t jce_model_gpu_index_count(const JceModel *model);
+
+/* GPU-driven INDIRECT instanced color draw (roadmap #18, Direction C).  Binds the
+ * single drawable primitive's VB/IB + material and the compute-compacted visible
+ * instance buffer `visible_vb` (from slot 0), then issues ONE bgfx_submit_indirect
+ * reading this run's draw args from `indirect_buf` element `indirect_el`.  The GPU
+ * filled numInstances = survivor count and startInstance = the run's partition
+ * base, so only survivors rasterise (no degenerate instances) and no CPU per-run
+ * fixed count is needed.  No-op unless jce_model_gpu_instanceable(model, NULL). */
+JCE_API void jce_model_draw_indirect_from_buffer(const JceModel *model,
+                                                 const JceRenderer *r,
+                                                 uint16_t view_id,
+                                                 uint16_t visible_vb,
+                                                 uint16_t indirect_buf,
+                                                 uint32_t indirect_el);
+
 /* Draw all primitives into a shadow/depth pass (depth-only, no materials).
  *
  * Skinned primitives reuse the same world-space bone palette the color
@@ -187,6 +266,30 @@ void jce_model_draw_shadow(const JceModel *model,
 JCE_API void jce_model_draw_shadow_instanced(const JceModel *model,
                                              const JceRenderer *r, uint16_t view_id,
                                              const jce_mat4 *roots, uint32_t count);
+
+/* GPU-driven DEPTH-ONLY siblings of jce_model_draw_*_from_buffer (roadmap #18
+ * extended to the CSM cascades): submit the single drawable static primitive once
+ * with the SHADOW instanced program (`program_idx`, from
+ * jce_renderer_get_program_shadow_inst) and depth-only state, sourcing per-instance
+ * matrices from the compute-written visible dynamic vertex buffer `visible_vb`.
+ * The instanced variant uses a CPU start/count over the run's partition; the
+ * indirect variant reads count/start from the GPU-built `indirect_buf` element
+ * `indirect_el`.  No material bind, no Forward+ pre-submit.  No-op unless
+ * jce_model_gpu_instanceable(model, NULL) would return true. */
+JCE_API void jce_model_draw_shadow_instanced_from_buffer(const JceModel *model,
+                                                         const JceRenderer *r,
+                                                         uint16_t view_id,
+                                                         uint16_t program_idx,
+                                                         uint16_t visible_vb,
+                                                         uint32_t start,
+                                                         uint32_t count);
+JCE_API void jce_model_draw_shadow_indirect_from_buffer(const JceModel *model,
+                                                        const JceRenderer *r,
+                                                        uint16_t view_id,
+                                                        uint16_t program_idx,
+                                                        uint16_t visible_vb,
+                                                        uint16_t indirect_buf,
+                                                        uint32_t indirect_el);
 
 /* Morph-aware sibling of jce_model_draw / jce_model_draw_shadow (FEATURE 3.1
  * GPU vertex-deform).  Identical to the base entrypoints EXCEPT that, for each
@@ -298,6 +401,16 @@ JCE_API JceSkeleton  *jce_model_get_skeleton(const JceModel *model);
  * extent rather than a point at the origin. */
 JCE_API bool          jce_model_get_aabb(const JceModel *model,
                                          float out_min[3], float out_max[3]);
+
+/* Approximate resident GPU footprint of the model in bytes: the sum of every
+ * primitive's vertex + index buffer bytes (estimated from vertex/index counts
+ * and a representative PBR stride) plus the byte size of each bound material
+ * texture (width*height*4, the registry-reported resident size).  Used by the
+ * streaming budget so a chunk's residency reflects real VRAM rather than a flat
+ * per-entity estimate (large-world VRAM ceiling).  Returns 0 for NULL.  This is
+ * a scale-correct estimate, not an exact GPU allocation query (block-compressed
+ * textures and exact vertex strides are approximated conservatively). */
+JCE_API uint64_t      jce_model_gpu_bytes(const JceModel *model);
 
 /* Number of animation clips embedded in the model. */
 JCE_API uint32_t      jce_model_anim_count(const JceModel *model);

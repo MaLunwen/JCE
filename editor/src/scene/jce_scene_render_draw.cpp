@@ -109,7 +109,10 @@ void draw_grid(void)
 
     jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
     float fade_near = fmaxf(16.0f, s_sr.orbit_distance * 3.0f);
-    float fade_far  = fmaxf(fade_near + 40.0f, s_sr.orbit_distance * 24.0f);
+    /* Pull the far extent in (was 24x): the far grid is sub-pixel anyway and the
+       shader's grid-LOD fade now dissolves it, so a tighter fade avoids a vast
+       shimmer-prone band while keeping plenty of visible grid. */
+    float fade_far  = fmaxf(fade_near + 40.0f, s_sr.orbit_distance * 12.0f);
     float grid_camera[4] = { cam_pos.x, cam_pos.y, cam_pos.z, 0.0f };
     float grid_fade[4] = { fade_near, fade_far, 10.0f, 1.0f };
 
@@ -978,6 +981,27 @@ void draw_selection_outlines(void)
             }
         }
 
+        /* --- Simulation-LOD tier rings (distance-tiered gameplay tick).
+         *     Mirrors the runtime classification (rt_sim_lod_period): NEAR
+         *     within near_radius (full / near_hz), MID out to mid_radius, FAR
+         *     beyond.  Two concentric spheres at the entity position mark the
+         *     near/mid band boundaries — the same world-anchored radius gizmo
+         *     idiom as the reverb-zone / audio-source range rings above. */
+        if (jce_scene_has_sim_lod(scene, e)) {
+            JceSimLodComponent *sl = jce_scene_get_sim_lod(scene, e);
+            if (sl && sl->enabled) {
+                /* ABGR. Cyan = near band edge, dimmer cyan = mid band edge —
+                 * distinct from the amber colliders and violet BT senses. */
+                const uint32_t col_near = 0xFFFFD040u; /* near radius */
+                const uint32_t col_mid  = 0x66FFD040u; /* mid radius (alpha-dim) */
+                float nr = (sl->near_radius > 0.0f) ? sl->near_radius : 25.0f;
+                float mr = (sl->mid_radius  > nr)   ? sl->mid_radius  : (nr + 55.0f);
+                jce_debug_draw_sphere(t->position, nr, col_near);
+                jce_debug_draw_sphere(t->position, mr, col_mid);
+                drew_shape = true;
+            }
+        }
+
         /* --- Rendering / audio volume gizmos.  Each mirrors its CONSUMER's
          *     interpretation: the post-FX Volume box is AXIS-ALIGNED around
          *     the entity position (jce_volume_system.c ignores rotation),
@@ -1039,20 +1063,18 @@ void draw_selection_outlines(void)
                 drew_shape = true;
             }
         }
-        /* --- Audio source hearing range.  Mirrors the runtime gate exactly
-         *     (rt_finish_audio_source, jce_runtime.c): a voice goes 3D only
-         *     when spatial_blend > 0.5, and the component has NO distance
-         *     fields — the runtime hardcodes INVERSE attenuation with
-         *     min 1 / max 25 / rolloff 1, so those constants ARE the truth.
-         *     Inner sphere = full-volume radius; dimmed outer sphere = the
-         *     distance clamp of the inverse falloff (gain stops decreasing
-         *     past it).  2D sources keep the generic fallback box.  Olive
-         *     keeps it in the reverb zone's warm family yet distinct. */
+        /* --- Audio source hearing range.  Mirrors the runtime gate
+         *     (rt_finish_audio_source): a voice goes 3D when spatial_blend > 0.5.
+         *     The min/max distances are now AUTHORABLE on the component (0 =
+         *     engine defaults 1 / 25), so the overlay reflects the same values
+         *     the runtime feeds jce_audio_voice_set_attenuation.  Inner sphere =
+         *     full-volume radius; dimmed outer sphere = the falloff distance
+         *     clamp.  2D sources keep the generic fallback box. */
         if (jce_scene_has_audio_source(scene, e)) {
             JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
             if (as && as->spatial_blend > 0.5f) {
-                const float min_d = 1.0f;   /* keep in sync with          */
-                const float max_d = 25.0f;  /* rt_finish_audio_source     */
+                float min_d = as->min_distance > 0.0f ? as->min_distance : 1.0f;
+                float max_d = as->max_distance > 0.0f ? as->max_distance : 25.0f;
                 const uint32_t col_as_min = 0xCC00C5CCu; /* olive */
                 const uint32_t col_as_max = 0x6600C5CCu; /* olive, dimmed */
                 jce_debug_draw_sphere(t->position, min_d, col_as_min);
@@ -1106,6 +1128,43 @@ void draw_selection_outlines(void)
                 jce_vec3 face = jce_v3_add(bc2,
                                            jce_v3_scale(down, 0.5f * depth));
                 jce_debug_draw_line(bc2, face, col_dc);
+                drew_shape = true;
+            }
+        }
+
+        /* --- IK constraint targets / poles: a cross + small sphere at each
+         *     ENABLED constraint's target (and pole), plus a link from the
+         *     rigged entity, so the authored IK goals are visible.  IK is
+         *     already solved by the renderer; this is the authoring gizmo. */
+        if (jce_scene_has_ik_constraints(scene, e)) {
+            JceIkConstraintComponent *ik = jce_scene_get_ik_constraints(scene, e);
+            if (ik) {
+                const uint32_t col_ik   = 0x66FFC000u; /* cyan target */
+                const uint32_t col_pole = 0x6600D0FFu; /* gold pole   */
+                for (int ci = 0; ci < 16; ++ci) {
+                    JceIkConstraint *c = &ik->constraints[ci];
+                    if (!c->enabled) continue;
+                    if (c->target_entity) {
+                        jce_mat4 tm = jce_scene_get_world_matrix(scene, (JceEntity)c->target_entity);
+                        jce_vec3 tp = jce_v3(tm.col[3].x, tm.col[3].y, tm.col[3].z);
+                        float cr = 0.25f;
+                        jce_debug_draw_line(jce_v3(tp.x-cr,tp.y,tp.z), jce_v3(tp.x+cr,tp.y,tp.z), col_ik);
+                        jce_debug_draw_line(jce_v3(tp.x,tp.y-cr,tp.z), jce_v3(tp.x,tp.y+cr,tp.z), col_ik);
+                        jce_debug_draw_line(jce_v3(tp.x,tp.y,tp.z-cr), jce_v3(tp.x,tp.y,tp.z+cr), col_ik);
+                        jce_debug_draw_sphere(tp, 0.12f, col_ik);
+                        jce_debug_draw_line(t->position, tp, col_ik);
+                    }
+                    bool have_pole = false; jce_vec3 pp = jce_v3(0,0,0);
+                    if (c->pole_entity) {
+                        jce_mat4 pm = jce_scene_get_world_matrix(scene, (JceEntity)c->pole_entity);
+                        pp = jce_v3(pm.col[3].x, pm.col[3].y, pm.col[3].z); have_pole = true;
+                    } else if (c->pole_offset[0]!=0.0f || c->pole_offset[1]!=0.0f || c->pole_offset[2]!=0.0f) {
+                        pp = jce_v3(t->position.x+c->pole_offset[0],
+                                    t->position.y+c->pole_offset[1],
+                                    t->position.z+c->pole_offset[2]); have_pole = true;
+                    }
+                    if (have_pole) jce_debug_draw_sphere(pp, 0.1f, col_pole);
+                }
                 drew_shape = true;
             }
         }

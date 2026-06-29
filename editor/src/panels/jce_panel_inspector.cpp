@@ -944,12 +944,13 @@ INSP_DRAWFN(sprite_animator, draw_comp_sprite_animator(jce_scene_get_sprite_anim
 INSP_DRAWFN(constraint, draw_comp_constraint(jce_scene_get_constraint(scene, e)))
 INSP_DRAWFN(terrain, draw_comp_terrain(jce_scene_get_terrain(scene, e)))
 INSP_DRAWFN(vegetation_scatter, draw_comp_vegetation_scatter(jce_scene_get_vegetation_scatter(scene, e)))
+INSP_DRAWFN(grass_field, draw_comp_grass_field(jce_scene_get_grass_field(scene, e)))
 INSP_DRAWFN(water, draw_comp_water(jce_scene_get_water(scene, e)))
 INSP_DRAWFN(buoyancy, draw_comp_buoyancy(jce_scene_get_buoyancy(scene, e)))
 INSP_DRAWFN(rigidbody2d, draw_comp_rigidbody2d(jce_scene_get_rigidbody2d(scene, e)))
 INSP_DRAWFN(particle_emitter, draw_comp_particle_emitter(jce_scene_get_particle_emitter(scene, e)))
 INSP_DRAWFN(behavior_tree, draw_comp_behavior_tree(jce_scene_get_behavior_tree(scene, e)))
-INSP_DRAWFN(lod_group, draw_comp_lod_group(jce_scene_get_lod_group(scene, e)))
+INSP_DRAWFN(lod_group, draw_comp_lod_group(jce_scene_get_lod_group(scene, e), scene, e))
 INSP_DRAWFN(virtual_camera, draw_comp_virtual_camera(jce_scene_get_virtual_camera(scene, e)))
 INSP_DRAWFN(trigger_volume, draw_comp_trigger_volume(jce_scene_get_trigger_volume(scene, e)))
 INSP_DRAWFN(capsule_collider, draw_comp_capsule_collider(jce_scene_get_capsule_collider(scene, e)))
@@ -1004,6 +1005,7 @@ INSP_DRAWFN(volume, draw_comp_volume(jce_scene_get_volume(scene, e)))
 INSP_DRAWFN(occlusion_portal, draw_comp_occlusion_portal(jce_scene_get_occlusion_portal(scene, e)))
 INSP_DRAWFN(video_player, draw_comp_video_player(jce_scene_get_video_player(scene, e)))
 INSP_DRAWFN(nav_agent, draw_comp_nav_agent(jce_scene_get_nav_agent(scene, e)))
+INSP_DRAWFN(sim_lod, draw_comp_sim_lod(jce_scene_get_sim_lod(scene, e)))
 INSP_DRAWFN(ik_constraints, draw_comp_ik_constraints(jce_scene_get_ik_constraints(scene, e)))
 INSP_DRAWFN(foot_ik, draw_comp_foot_ik(jce_scene_get_foot_ik(scene, e)))
 INSP_DRAWFN(full_body_ik, draw_comp_full_body_ik(jce_scene_get_full_body_ik(scene, e)))
@@ -1041,6 +1043,7 @@ static void insp_register_draw_fns(void)
         { "Constraint", drawfn_constraint },
         { "Terrain", drawfn_terrain },
         { "VegetationScatter", drawfn_vegetation_scatter },
+        { "GrassField", drawfn_grass_field },
         { "Water", drawfn_water },
         { "Buoyancy", drawfn_buoyancy },
         { "Rigidbody2D", drawfn_rigidbody2d },
@@ -1095,6 +1098,7 @@ static void insp_register_draw_fns(void)
         { "OcclusionPortal", drawfn_occlusion_portal },
         { "VideoPlayer", drawfn_video_player },
         { "NavAgent", drawfn_nav_agent },
+        { "SimLod", drawfn_sim_lod },
         { "IkConstraints", drawfn_ik_constraints },
         { "FootIk", drawfn_foot_ik },
         { "FullBodyIk", drawfn_full_body_ik },

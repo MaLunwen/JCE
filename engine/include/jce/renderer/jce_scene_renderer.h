@@ -71,6 +71,11 @@ typedef enum {
     JCE_SCENE_VIEW_WIREFRAME,            /* lines only, unlit */
     JCE_SCENE_VIEW_TEXTURED,             /* textured but UNLIT (raw albedo) */
     JCE_SCENE_VIEW_WIREFRAME_TEXTURED,   /* unlit textured + line overlay */
+    /* Debug channel views (unlit; fs_pbr emits the raw material channel). */
+    JCE_SCENE_VIEW_NORMALS,              /* 4: world normal as RGB (N*0.5+0.5) */
+    JCE_SCENE_VIEW_ROUGHNESS,            /* 5: roughness grayscale */
+    JCE_SCENE_VIEW_METALLIC,             /* 6: metallic grayscale */
+    JCE_SCENE_VIEW_AO,                   /* 7: ambient-occlusion grayscale */
 } JceSceneViewModeKind;
 
 /* Callback invoked between sky pass and entity pass. Editor uses this
@@ -115,6 +120,20 @@ typedef struct {
      * Falls back to always-visible if hardware queries are unsupported.
      * The caller owns the culler lifetime. */
     JceOcclusionCuller  *occlusion_culler;
+
+    /* The bgfx framebuffer the SCENE COLOR + DEPTH pass renders into, as a raw
+     * bgfx_frame_buffer_handle_t .idx.  The engine binds the occlusion culler's
+     * depth-only proxy view to THIS framebuffer each frame so the proxy boxes'
+     * depth test runs against the depth the color pass actually wrote.  Set it
+     * to the SAME FBO you bound the color view to:
+     *   - editor scene/game view : jce_offscreen_target_get_frame_buffer(bridge)
+     *   - runtime with postfx     : jce_offscreen_target_get_frame_buffer(target)
+     *   - runtime no postfx       : UINT16_MAX (backbuffer)
+     * Default UINT16_MAX (set by jce_scene_render_config_default) = backbuffer,
+     * which is correct for the direct-to-backbuffer path and harmless when no
+     * occlusion culler is present.  Without this, offscreen paths' proxies test
+     * a stale/empty backbuffer depth → occlusion inert or false-culling. */
+    uint16_t             scene_frame_buffer;
 
     /* Overlay hook (editor-only). NULL in runtime games. */
     JceSceneOnAfterSkyFn on_after_sky;
@@ -364,6 +383,14 @@ typedef struct {
     uint32_t visible;   /* entities that passed frustum culling */
     uint32_t culled;    /* entities removed by culling (== total - visible) */
     bool     enabled;   /* whether culling was active this frame */
+    /* Persistent extent-sized broad-phase (large-world-opt P1 #4). */
+    uint32_t grid_res[3];     /* cells per axis of the cull grid */
+    uint32_t grid_cells;      /* total cells (res.x*res.y*res.z) */
+    uint32_t grid_occupied;   /* non-empty cells (what the full scan iterates) */
+    uint32_t grid_objects;    /* objects resident in the persistent grid */
+    uint32_t inserted;        /* entities inserted into the grid this frame */
+    uint32_t updated;         /* entities re-bucketed (moved) this frame */
+    uint32_t removed;         /* entities removed (despawned) this frame */
 } JceSceneCullStats;
 
 JCE_API void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
@@ -492,6 +519,66 @@ JCE_API void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
  * and destroys each GPU model; safe to call between frames. */
 JCE_API void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr);
 
+/* ── VRAM ceiling (large-world-opt: free GPU resources on cell unload) ──────
+ *
+ * The path-keyed model cache is shared across entities/chunks and historically
+ * never evicted, so a streaming world's VRAM only climbed.  These calls bound
+ * it.  The renderer treats "resolved this frame via sr_get_model" as a per-frame
+ * reference count; a model not resolved for a grace window of frames is provably
+ * referenced by NO live entity (a streamed chunk's entities are destroyed on
+ * unload and stop resolving their model) and can be freed.
+ *
+ * SAFETY: a model is freed ONLY when (a) it was not used for the grace window,
+ * AND (b) no live skeletal-animation instance still references it.  Eviction is
+ * driven at the START of jce_scene_renderer_render (after the async upload poll,
+ * before any draw resolves a model), so no in-flight draw on this frame's view
+ * list can reference a destroyed handle.  RUNTIME MODE ONLY: in editor mode the
+ * asset-cache callback owns the models, so the renderer never frees them and
+ * these calls are no-ops for eviction (the budget setter still records intent).
+ */
+
+/* Set the model-VRAM ceiling in bytes (0 = unlimited / no eviction, the
+ * default).  When the resident model VRAM exceeds this, the next render frees
+ * the least-recently-used unreferenced models down toward the budget. */
+JCE_API void jce_scene_renderer_set_model_vram_budget(JceSceneRenderer *sr,
+                                                      uint64_t budget_bytes);
+
+/* Free unreferenced models until resident model VRAM <= budget_bytes (or no
+ * eligible victim remains).  Normally driven automatically by the render loop;
+ * exposed for tools / tests.  No-op in editor mode.  Returns the number of
+ * models freed. */
+JCE_API uint32_t jce_scene_renderer_evict_models(JceSceneRenderer *sr,
+                                                 uint64_t budget_bytes);
+
+/* Total resident model VRAM (sum of jce_model_gpu_bytes over every loaded model
+ * cache slot) — the real GPU bytes the streaming budget should account for.
+ * 0 in editor mode (models are owned/sized by the asset cache, not here). */
+JCE_API uint64_t jce_scene_renderer_model_vram_bytes(const JceSceneRenderer *sr);
+
+/* Resident GPU bytes of ONE model path (0 if not resident / still decoding /
+ * editor mode).  The world streamer sums this across a chunk's entities to
+ * report real per-chunk residency to the streaming budget. */
+JCE_API uint64_t jce_scene_renderer_model_path_vram_bytes(
+    const JceSceneRenderer *sr, const char *path);
+
+/* Sum the resident GPU bytes of the models referenced by a set of entities (a
+ * chunk's roster): for each entity, resolve its MeshRenderer / skeletal model
+ * path and add jce_scene_renderer_model_path_vram_bytes.  A model shared by
+ * several of the entities is counted once.  This is exactly the
+ * JceWorldStreamerResidencyFn shape the world streamer wants — wire it as the
+ * residency query so per-chunk residency reflects real VRAM.  Returns 0 in
+ * editor mode (the renderer doesn't own/size models there). */
+JCE_API uint64_t jce_scene_renderer_entities_vram_bytes(
+    JceSceneRenderer *sr, JceScene *scene,
+    const uint64_t *entity_ids, uint32_t count);
+
+/* Lifetime count of models freed by VRAM-ceiling eviction (editor surfacing). */
+JCE_API uint32_t jce_scene_renderer_model_evicted_count(const JceSceneRenderer *sr);
+
+/* Number of LOADED models currently in the path-keyed cache (editor surfacing).
+ * Counts only resident models (not pending decodes or cached failures). */
+JCE_API uint32_t jce_scene_renderer_model_cache_count(const JceSceneRenderer *sr);
+
 /* Forward decls for accessors below — full headers may not be in this TU. */
 struct JceAnimPlayer;
 struct JceModel;
@@ -547,6 +634,7 @@ typedef struct {
     uint32_t visible;   /* passed (query returned > min_pixels) */
     uint32_t occluded;  /* skipped (fully occluded last frame) */
     uint32_t warm_up;   /* first frame for entity, always drawn */
+    uint32_t no_result; /* query still in flight (GPU latency), drawn */
     bool     enabled;
 } JceSceneOcclusionStats;
 
@@ -590,6 +678,12 @@ JCE_API void jce_scene_renderer_set_ambient_override(JceSceneRenderer *sr,
  * created — e.g. the decal shaders are missing — or the spawn was invalid). */
 JCE_API bool jce_scene_renderer_spawn_decal(JceSceneRenderer    *sr,
                                             const JceDecalSpawn *spawn);
+
+/* Project-level grass rendering gate (Stage 1b.6).
+ * Mirrors JceRenderSettings.grass_enabled; default false (off).
+ * Call once after loading the project render settings.  Only takes effect
+ * when hardware instancing is available AND GPU tier >= HIGH. */
+JCE_API void jce_scene_renderer_set_grass_enabled(JceSceneRenderer *sr, bool on);
 
 JCE_EXTERN_C_END
 

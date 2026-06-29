@@ -14,6 +14,7 @@
 #include "core/jce_editor_i18n.h"
 
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_render_pipeline.h>
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
@@ -85,18 +86,29 @@ static void draw_gpu_tier_segment(void)
     jce_editor::help_tip(jce_editor_i18n("statusBar.gpuTier.tooltip"));
 
     if (ImGui::BeginPopup("##jce_gpu_tier_menu")) {
+        bool tier_changed = false;
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setLow")))
-            jce_renderer_set_tier_override(JCE_GPU_TIER_LOW);
+            { jce_renderer_set_tier_override(JCE_GPU_TIER_LOW);    tier_changed = true; }
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setMid")))
-            jce_renderer_set_tier_override(JCE_GPU_TIER_MEDIUM);
+            { jce_renderer_set_tier_override(JCE_GPU_TIER_MEDIUM); tier_changed = true; }
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setHigh")))
-            jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
+            { jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);   tier_changed = true; }
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setUltra")))
-            jce_renderer_set_tier_override(JCE_GPU_TIER_ULTRA);
+            { jce_renderer_set_tier_override(JCE_GPU_TIER_ULTRA);  tier_changed = true; }
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.clearOverride"),
                             nullptr, false, overridden))
-            jce_renderer_clear_tier_override();
+            { jce_renderer_clear_tier_override(); tier_changed = true; }
+        if (tier_changed) {
+            /* The override changes the EFFECTIVE tier, but the active render
+             * pipeline (s_active) is only set once at engine boot — re-derive +
+             * apply it now so the new tier's feature gates (toon / bloom / stylized
+             * look + sky) actually take effect this session.  Without this re-apply
+             * the menu changed the reported tier but nothing visible happened. */
+            JceRenderPipelineDesc d;
+            jce_render_pipeline_preset_for_current_tier(&d);
+            jce_render_pipeline_apply(&d);
+        }
         ImGui::EndPopup();
     }
 }

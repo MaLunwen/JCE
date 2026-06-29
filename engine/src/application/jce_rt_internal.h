@@ -28,6 +28,7 @@
 #include <jce/middleware/physics/jce_fracture.h>   /* Voronoi shatter geometry core */
 #include <jce/middleware/physics/jce_softbody.h>    /* volumetric / pressure soft body */
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_lod.h>     /* distance-tier hysteresis (sim-LOD) */
 #include <jce/middleware/scene/jce_water.h>   /* buoyancy force + surface sampling */
 #include <jce/middleware/scene/jce_component_registry.h>  /* comp-id enable gate */
 #include <jce/middleware/scene/jce_terrain.h>
@@ -77,8 +78,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv (sim-LOD KPI toggle) */
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <ctype.h>
 
 #define LOG_TAG "runtime"
@@ -189,6 +192,11 @@ typedef struct {
 	JceNavAgentHandle handle;
 	bool              has_dest;
 	float             last_goal_x, last_goal_z;
+	/* Simulation-LOD cadence (consulted only when the entity carries a
+	 * JceSimLodComponent gating NavAgent): accumulate dt and advance steering
+	 * by the folded accumulated dt at the tier's rate. */
+	float             simlod_accum;
+	int               simlod_prev_tier;
 } NavAgentEntry;
 
 /* Authored SavePoint mirrored as a sphere trigger in rt->trigger_world.
@@ -220,6 +228,11 @@ struct BtEntry {
 	float            tick_period;   /* seconds between ticks (0 = every frame) */
 	float            tick_accum;
 	bool             active;
+	/* Simulation-LOD cadence (consulted only when the entity carries a
+	 * JceSimLodComponent gating BehaviorTree): a separate accumulator + tier so
+	 * the tier rate can REPLACE the authored tick_hz cadence when present. */
+	float            simlod_accum;
+	int              simlod_prev_tier;
 };
 
 /* One gameplay-script instance bound to an entity (Phase 0 scripting
@@ -231,6 +244,13 @@ struct ScriptEntry {
 	JceScriptInstance inst;
 	bool              active;
 	char              script_path[256];  /* for hot-reload path matching */
+	/* Simulation-LOD cadence (only consulted when the entity carries a
+	 * JceSimLodComponent gating Script): accumulate real dt, fire on_update
+	 * only once the active tier's period elapses, folding the accumulated dt
+	 * so the script sees time-correct deltas at any rate.  prev_tier is fed
+	 * back to jce_lod_pick for boundary hysteresis. */
+	float             simlod_accum;
+	int               simlod_prev_tier;
 };
 
 /* One live Gameplay Ability System bound to an entity (GAS consumption
@@ -485,6 +505,15 @@ struct JceRuntime {
 	int              spawn_cap;
 	uint64_t         spawn_cookie_seq; /* monotonic cursor (ped-sampler RNG) */
 	JceEntity        cur_spawn_mgr;    /* transient: manager being updated (for spawn cb) */
+
+	/* Global actor budget (large-world #2): caps total live spawn-manager actors
+	 * (peds/vehicles) across ALL managers + the per-frame spawn rate, so a crowded
+	 * world can't instantiate unbounded actors regardless of per-manager caps.
+	 * budget==0 ⇒ unlimited (byte-identical to legacy); quota==0 ⇒ unlimited rate. */
+	uint32_t         actor_budget;        /* max live actors (0 = unlimited)      */
+	uint32_t         actor_count;         /* current live spawn-manager actors    */
+	uint32_t         actor_spawn_quota;   /* max spawns per frame (0 = unlimited) */
+	uint32_t         actor_spawned_frame; /* spawns committed this frame (reset)  */
 
 	WeaponEntry     *weapons;
 	int              weapon_count;
@@ -836,6 +865,21 @@ void        rt_bt_register_default_actions(JceRuntime *rt);
  * jce_runtime.c). */
 jce_vec3 rt_world_position(JceScene *scene, JceEntity e);
 void     rt_pick_primary_cam(JceScene *s, JceEntity e, void *ud);
+
+/* ── Simulation-LOD tick gating (own: core jce_runtime.c) ─────────────
+ * Resolve the per-frame cadence for one gameplay subsystem of one entity from
+ * its (optional) JceSimLodComponent.  Classifies the entity by distance to the
+ * viewer into NEAR/MID/FAR with jce_lod hysteresis (prev_tier in/out), then
+ * returns the tier's tick PERIOD in seconds for the given gate bit:
+ *   period  < 0  -> tier is PAUSED (skip the subsystem entirely this frame),
+ *   period == 0  -> tick every frame (no component, disabled, untiered gate,
+ *                   or near_hz==0),
+ *   period  > 0  -> tick once that many seconds have accumulated.
+ * `gate_bit` is one of JCE_SIMLOD_GATE_*.  When the entity has no SimLod
+ * component, or it is disabled, or this gate bit is clear, returns 0 (full
+ * rate) so untiered entities are byte-identical to before. */
+float rt_sim_lod_period(JceRuntime *rt, JceEntity e, jce_vec3 viewer,
+                        uint32_t gate_bit, int *prev_tier);
 
 /* Audio module (own: jce_rt_audio.c): mixer bus setup, reverb zones, navmesh
  * load, and the per-frame spatial-voice / listener 3D-audio update.  The

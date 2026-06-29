@@ -377,6 +377,13 @@ std::string build_clipboard_snapshot(float dt_ms,
             float p = 100.0f * (float)cs.culled / (float)cs.total;
             append_fmt(s, "  Cull ratio     : %.1f%%\n", p);
         }
+        /* Persistent extent-sized broad-phase (large-world-opt P1 #4). */
+        append_fmt(s, "  Grid res       : %ux%ux%u (%u cells, %u occupied)\n",
+                   cs.grid_res[0], cs.grid_res[1], cs.grid_res[2],
+                   cs.grid_cells, cs.grid_occupied);
+        append_fmt(s, "  Grid objects   : %u\n", cs.grid_objects);
+        append_fmt(s, "  Churn (ins/upd/rem): %u / %u / %u\n",
+                   cs.inserted, cs.updated, cs.removed);
 
         JceSceneLodStats ls = {};
         jce_scene_renderer_get_lod_stats(sr, &ls);
@@ -702,6 +709,19 @@ void draw_content(void)
                                 : 0.0f;
             snprintf(buf, sizeof(buf), "%.1f %%", pct);
             row(jce_editor_i18n("profiler.row.cullRatio"), buf);
+            /* Persistent extent-sized broad-phase (large-world-opt P1 #4).
+             * Developer diagnostics — kept as literal labels (not i18n keys) so
+             * they don't fan out across the 13 shipped locales. */
+            snprintf(buf, sizeof(buf), "%ux%ux%u",
+                     cs.grid_res[0], cs.grid_res[1], cs.grid_res[2]);
+            row("Grid res", buf);
+            snprintf(buf, sizeof(buf), "%u / %u", cs.grid_occupied, cs.grid_cells);
+            row("Grid occupied / total", buf);
+            snprintf(buf, sizeof(buf), "%u", cs.grid_objects);
+            row("Grid objects", buf);
+            snprintf(buf, sizeof(buf), "%u / %u / %u",
+                     cs.inserted, cs.updated, cs.removed);
+            row("Churn ins/upd/rem", buf);
             ImGui::EndTable();
         }
         if (cs.enabled && cs.total > 0) {

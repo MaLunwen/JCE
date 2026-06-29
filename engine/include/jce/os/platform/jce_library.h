@@ -30,6 +30,25 @@ JCE_API bool JCE_CALL jce_library_exists(const char *name);
 JCE_API bool JCE_CALL jce_library_has_symbol(const char *name,
                                              const char *symbol);
 
+/* Opaque handle to a shared library kept resident (see jce_library_open). */
+typedef void *JceLibrary;
+
+/* Loads a shared library and keeps it mapped (unlike jce_library_exists() /
+ * _has_symbol(), which unload immediately). On Windows this attaches to an
+ * already-resident module of the same name rather than loading a second copy —
+ * the behaviour an injected in-application debug API (e.g. RenderDoc) needs.
+ * Returns NULL if the library cannot be loaded. Resolve exports with
+ * jce_library_symbol(); release with jce_library_close(). `name` is a
+ * platform-native library name. */
+JCE_API JceLibrary JCE_CALL jce_library_open(const char *name);
+
+/* Resolves an exported symbol from a library opened with jce_library_open().
+ * Returns NULL if `lib` is NULL or the symbol is not exported. */
+JCE_API void *JCE_CALL jce_library_symbol(JceLibrary lib, const char *symbol);
+
+/* Releases a library opened with jce_library_open(). NULL is ignored. */
+JCE_API void JCE_CALL jce_library_close(JceLibrary lib);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_LIBRARY_H */

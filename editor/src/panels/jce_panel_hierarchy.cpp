@@ -103,7 +103,8 @@ void jce_editor_panel_hierarchy_content(void)
         if (s_hier.reveal_pending && s_hier.reveal_target != 0) {
             int reveal_idx = -1;
             for (int i = 0; i < s_hier.flat_count; i++) {
-                if (s_hier.flat[i].id == s_hier.reveal_target) {
+                if (!s_hier.flat[i].chunk_header &&
+                    s_hier.flat[i].id == s_hier.reveal_target) {
                     reveal_idx = i;
                     break;
                 }
@@ -115,8 +116,12 @@ void jce_editor_panel_hierarchy_content(void)
         }
 
         while (clip.Step()) {
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++)
-                draw_entity_row(s_hier.flat[i].id, s_hier.flat[i].depth);
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                if (s_hier.flat[i].chunk_header)
+                    draw_chunk_group_row(s_hier.flat[i].id, s_hier.flat[i].depth);
+                else
+                    draw_entity_row(s_hier.flat[i].id, s_hier.flat[i].depth);
+            }
         }
         clip.End();
 

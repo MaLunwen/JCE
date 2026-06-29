@@ -37,7 +37,7 @@ extern "C" {
 
 namespace {
 
-enum class ToolMode { Sculpt, Splat };
+enum class ToolMode { Sculpt, Splat, Holes };
 
 struct PanelState {
     JceTerrain *terrain = nullptr;
@@ -46,6 +46,7 @@ struct PanelState {
     ToolMode tool         = ToolMode::Sculpt;
     int      sculpt_mode  = JCE_TERRAIN_SCULPT_RAISE;
     int      splat_layer  = 0;
+    bool     hole_erase   = false;   /* Holes tool: false = cut cells, true = fill back */
     float    brush_radius = 4.0f;
     float    brush_strength = 4.0f;
 
@@ -399,14 +400,19 @@ void draw_brush_section()
     }
     if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.brush.header"), ImGuiTreeNodeFlags_DefaultOpen)) {
         int tool = (int)s.tool;
-        if (ImGui::Combo(jce_editor_i18n("terrain.brush.tool"), &tool, "Sculpt\0Splat\0\0"))
+        if (ImGui::Combo(jce_editor_i18n("terrain.brush.tool"), &tool, "Sculpt\0Splat\0Holes\0\0"))
             s.tool = (ToolMode)tool;
         if (s.tool == ToolMode::Sculpt) {
             ImGui::Combo(jce_editor_i18n("terrain.brush.mode"), &s.sculpt_mode,
                          "Raise\0Lower\0Smooth\0Flatten\0\0");
-        } else {
+        } else if (s.tool == ToolMode::Splat) {
             ImGui::Combo(jce_editor_i18n("terrain.brush.layer"), &s.splat_layer,
                          "Layer 0\0Layer 1\0Layer 2\0Layer 3\0\0");
+        } else {
+            ImGui::Checkbox(jce_editor_i18n_id("terrain.brush.holeErase", "Erase (fill holes back)"),
+                            &s.hole_erase);
+            ImGui::TextDisabled("%s", jce_editor_i18n_id("terrain.brush.holeHint",
+                "Cuts cells from render + collision (caves, tunnels, interiors)"));
         }
         ImGui::SliderFloat(jce_editor_i18n("terrain.brush.radius"),   &s.brush_radius,   0.5f, 64.0f);
         ImGui::SliderFloat(jce_editor_i18n("terrain.brush.strength"), &s.brush_strength, 0.1f, 64.0f);
@@ -422,10 +428,13 @@ void draw_brush_section()
                                          (JceTerrainSculptMode)s.sculpt_mode,
                                          s.cursor_x, s.cursor_z,
                                          s.brush_radius, s.brush_strength, dt);
-            } else {
+            } else if (s.tool == ToolMode::Splat) {
                 jce_terrain_splat_paint(s.terrain, s.splat_layer,
                                         s.cursor_x, s.cursor_z,
                                         s.brush_radius, s.brush_strength, dt);
+            } else {
+                jce_terrain_hole_apply(s.terrain, s.cursor_x, s.cursor_z,
+                                       s.brush_radius, s.hole_erase);
             }
             s.preview_dirty = true;
         }
@@ -583,10 +592,12 @@ extern "C" void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt
                                  (JceTerrainSculptMode)s.sculpt_mode,
                                  wx, wz,
                                  s.brush_radius, s.brush_strength, dt);
-    } else {
+    } else if (s.tool == ToolMode::Splat) {
         jce_terrain_splat_paint(s.terrain, s.splat_layer,
                                 wx, wz,
                                 s.brush_radius, s.brush_strength, dt);
+    } else {
+        jce_terrain_hole_apply(s.terrain, wx, wz, s.brush_radius, s.hole_erase);
     }
     s.preview_dirty = true;
 }

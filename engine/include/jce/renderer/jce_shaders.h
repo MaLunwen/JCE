@@ -51,6 +51,13 @@ typedef struct JceShaderSet {
     JceShaderHandle mesh;
     JceShaderHandle pbr;              /* static PBR */
     JceShaderHandle pbr_inst;         /* static PBR — GPU-instanced variant */
+    /* Per-instance-tint instanced PBR (large-world-opt P1 #7): vs_pbr_inst_tint
+     * + fs_pbr_tint.  The instance buffer carries a 5th vec4 (i_data4 = the
+     * per-entity baseColor tint) so baseColor-only copies of one mesh batch into
+     * one instanced submit instead of falling back to solo draws.  Optional: a
+     * pak built before the variant existed leaves the handle invalid and the
+     * renderer simply keeps tinted entities on the solo path. */
+    JceShaderHandle pbr_inst_tint;    /* instanced PBR — per-instance tint */
     JceShaderHandle pbr_skinned;      /* skinned PBR */
     /* Forward+ clustered fragment variant (fs_pbr_fwdplus): same vertex
      * shaders, IES dropped + clustered point/spot loop.  Selected only when
@@ -58,6 +65,13 @@ typedef struct JceShaderSet {
     JceShaderHandle pbr_fwdplus;          /* static PBR — Forward+ fragment */
     JceShaderHandle pbr_inst_fwdplus;     /* instanced PBR — Forward+ fragment */
     JceShaderHandle pbr_skinned_fwdplus;  /* skinned PBR — Forward+ fragment */
+    /* Per-character toon (stylized-slice §5.6): vs_pbr_skinned + fs_pbr_toon
+     * (cel ramp + rim).  Optional: a pak built before the variant existed
+     * leaves the handle invalid → renderer degrades to standard skinned PBR. */
+    JceShaderHandle pbr_toon;
+    /* Inverted-hull silhouette outline: vs_pbr_skinned_outline + fs_outline
+     * (FRONT-cull, flat linear).  Optional; invalid => no outline. */
+    JceShaderHandle outline_skinned;
     JceShaderHandle shadow;           /* shadow depth */
     JceShaderHandle shadow_inst;      /* shadow depth — GPU-instanced variant */
     JceShaderHandle shadow_skinned;   /* skinned shadow */

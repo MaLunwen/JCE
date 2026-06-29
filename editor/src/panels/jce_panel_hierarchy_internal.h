@@ -54,10 +54,19 @@ struct HierarchyState {
     /* Flattened visible-tree row list, rebuilt every frame by
      * jce_hierarchy_flatten().  Parallel to display_order (same ids/order)
      * but also carries the per-row indent depth so draw_entity_row() can
-     * indent manually (the clipper renders rows out of recursion context). */
+     * indent manually (the clipper renders rows out of recursion context).
+     *
+     * `chunk_header` rows are SYNTHETIC group nodes (one per loaded streamed
+     * chunk) — `id` then holds the chunk id, not an entity id.  They are
+     * NEVER ECS entities: the streamed entities they group are real rows
+     * emitted (indented) right after.  This keeps the hierarchy usable when
+     * Full-World loads tens of thousands of entities (collapsible chunk
+     * nodes, expand on demand) and makes the hierarchy the chunk view —
+     * without mutating the ECS scene graph or transforms. */
     struct {
-        uint32_t id;
+        uint32_t id;            /* entity id, OR chunk id when chunk_header */
         int      depth;
+        bool     chunk_header;
     }        flat[HIERARCHY_MAX_DISPLAY];
     int      flat_count;
 
@@ -100,6 +109,17 @@ void jce_hierarchy_flatten(const uint32_t *root_ids, int root_count);
  * NOT recurse into children and never pushes an ImGui tree level — the flatten
  * pass owns the tree structure.  Called per visible row by the clipper. */
 void draw_entity_row(uint32_t entity_id, int depth);
+
+/* Render a SYNTHETIC streamed-chunk group header row (collapsible label +
+ * eye toggle that drives the preview FILTER set).  chunk_id is the streaming
+ * chunk id; depth is the indent.  Not an ECS entity. */
+void draw_chunk_group_row(uint32_t chunk_id, int depth);
+
+/* True while the hierarchy is showing streamed chunks as group nodes (the
+ * streaming preview is active and at least one chunk has spawned entities).
+ * When true the flatten pass routes streamed entities under chunk headers
+ * instead of listing them flat among the scene roots. */
+bool jce_hierarchy_chunk_grouping_active(void);
 
 /* ── Functions from jce_panel_hierarchy_menu.cpp ──────────────────── */
 

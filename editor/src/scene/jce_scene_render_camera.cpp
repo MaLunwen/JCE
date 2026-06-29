@@ -4,6 +4,8 @@
 
 #include "jce_scene_render_internal.h"
 
+#include <cstdlib>   /* getenv/atof — headless vista camera env overrides */
+
 /* ── Orbit constants ──────────────────────────────────────────────── */
 
 #define ORBIT_PITCH_MAX  (89.0f * JCE_DEG2RAD)
@@ -256,6 +258,37 @@ void jce_editor_scene_camera_set_target(float x, float y, float z)
     if (s_sr.initialized) orbit_apply();
 }
 
+/* ── Full orbit-state capture / restore (camera bookmarks) ──────────── */
+
+void jce_editor_scene_camera_get_state(float out_target3[3], float *out_yaw,
+                                       float *out_pitch, float *out_distance)
+{
+    if (out_target3) {
+        out_target3[0] = s_sr.orbit_target.x;
+        out_target3[1] = s_sr.orbit_target.y;
+        out_target3[2] = s_sr.orbit_target.z;
+    }
+    if (out_yaw)      *out_yaw      = s_sr.orbit_yaw;
+    if (out_pitch)    *out_pitch    = s_sr.orbit_pitch;
+    if (out_distance) *out_distance = s_sr.orbit_distance;
+}
+
+void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
+                                       float pitch, float distance)
+{
+    if (!s_sr.initialized) return;
+    orbit_cancel_focus_anim();
+    if (target3) s_sr.orbit_target = jce_v3(target3[0], target3[1], target3[2]);
+    s_sr.orbit_yaw = yaw;
+    if (pitch >  ORBIT_PITCH_MAX) pitch =  ORBIT_PITCH_MAX;
+    if (pitch < -ORBIT_PITCH_MAX) pitch = -ORBIT_PITCH_MAX;
+    s_sr.orbit_pitch = pitch;
+    if (distance < ORBIT_DIST_MIN) distance = ORBIT_DIST_MIN;
+    if (distance > ORBIT_DIST_MAX) distance = ORBIT_DIST_MAX;
+    s_sr.orbit_distance = distance;
+    orbit_apply();
+}
+
 void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 {
     if (!s_sr.initialized) return;
@@ -313,6 +346,104 @@ void jce_editor_scene_camera_focus_aabb(const float min3[3], const float max3[3]
     memcpy(s_sr.focus_last_max, max3, sizeof(s_sr.focus_last_max));
     s_sr.focus_last_bounds_valid = true;
     s_sr.focus_zoom_step = focus.zoom_step;
+}
+
+/* ── Bird's-eye overview: frame the WHOLE streamed world from above ─── */
+
+void jce_editor_scene_frame_overview(void)
+{
+    if (!s_sr.initialized || !s_sr.camera) return;
+
+    /* World AABB: union of all authored streaming chunks (center ± radius).
+     * This covers the FULL world, not just the chunks currently loaded.
+     * Fall back to the known ±2757 m world span when no streaming settings
+     * exist (non-streaming scenes), with a sensible vertical range. */
+    float wmin[3];
+    float wmax[3];
+    bool  have_bounds = false;
+
+    JceScene *scene = jce_state_get_scene();
+    if (scene) {
+        const JceSceneStreamingSettings *ss =
+            jce_scene_get_streaming_settings(scene);
+        if (ss && ss->chunk_count > 0) {
+            wmin[0] = wmin[1] = wmin[2] =  1e30f;
+            wmax[0] = wmax[1] = wmax[2] = -1e30f;
+            for (uint32_t i = 0; i < ss->chunk_count; i++) {
+                const JceSceneStreamChunk *c = &ss->chunks[i];
+                float r = c->radius > 0.0f ? c->radius : 1.0f;
+                for (int k = 0; k < 3; k++) {
+                    float lo = c->center[k] - r;
+                    float hi = c->center[k] + r;
+                    if (lo < wmin[k]) wmin[k] = lo;
+                    if (hi > wmax[k]) wmax[k] = hi;
+                }
+            }
+            /* Chunk centres often share one ground plane (flat radius in Y),
+             * so widen the vertical span to include tall buildings + sky. */
+            if (wmax[1] - wmin[1] < 100.0f) {
+                wmin[1] -= 50.0f;
+                wmax[1] += 400.0f;
+            }
+            have_bounds = true;
+        }
+    }
+
+    if (!have_bounds) {
+        wmin[0] = -2757.0f; wmin[1] = -50.0f;  wmin[2] = -2757.0f;
+        wmax[0] =  2757.0f; wmax[1] =  400.0f; wmax[2] =  2757.0f;
+    }
+
+    /* Steep bird's-eye angle, anchored regardless of the current orbit.
+     * Animating target/distance (below) while the pitch is pre-set gives a
+     * smooth swing up to the overview. */
+    /* +pitch = bird's-eye looking DOWN (pos.y = target.y + d*sin(pitch); matches
+     * CAM_VIEW_TOP = +PITCH_MAX).  -65 put the camera BELOW the world looking UP
+     * (a worm's-eye view) — that was the "overview direction reversed" bug. */
+    s_sr.orbit_pitch = 65.0f * JCE_DEG2RAD;
+    s_sr.orbit_yaw   = 0.6f;
+
+    float fov_deg = jce_camera_get_fov(s_sr.camera);
+    JceEditorSceneFocusTarget focus =
+        jce_editor_scene_focus_make_target(wmin, wmax, fov_deg, 0);
+
+    jce_editor_scene_focus_anim_start(&s_sr.focus_anim,
+                                      s_sr.orbit_target,
+                                      s_sr.orbit_distance,
+                                      focus.center,
+                                      focus.distance,
+                                      0.60f);
+
+    /* Distinct enough from a normal focus that the next F won't think the
+     * bounds are unchanged (avoids the zoom-step toggle). */
+    s_sr.focus_last_bounds_valid = false;
+    s_sr.focus_zoom_step = 0;
+}
+
+void jce_editor_scene_frame_vista(void)
+{
+    if (!s_sr.initialized || !s_sr.camera) return;
+    /* Fixed eye-level-ish vista for headless visual QA (JCE_DBG_VISTA): a few
+     * metres above the meadow centre, looking across the grass toward the
+     * backdrop + sky.  Set directly (no focus anim) so a one-shot capture is
+     * deterministic and comparable across tuning passes. */
+    s_sr.orbit_target   = jce_v3(0.0f, 10.0f, 0.0f);
+    s_sr.orbit_pitch    = 3.0f * JCE_DEG2RAD;   /* near-horizontal: ground+horizon+sky */
+    s_sr.orbit_yaw      = 0.4f;
+    s_sr.orbit_distance = 50.0f;
+    /* Optional env overrides so a headless capture can aim at a specific test
+       subject (e.g. a top-down look at a point light to see its omni shadows).
+       JCE_DBG_VISTA_TX/TY/TZ = target, _DIST = distance, _PITCH/_YAW = degrees. */
+    { const char *e;
+      if ((e = getenv("JCE_DBG_VISTA_TX"))) s_sr.orbit_target.x = (float)atof(e);
+      if ((e = getenv("JCE_DBG_VISTA_TY"))) s_sr.orbit_target.y = (float)atof(e);
+      if ((e = getenv("JCE_DBG_VISTA_TZ"))) s_sr.orbit_target.z = (float)atof(e);
+      if ((e = getenv("JCE_DBG_VISTA_DIST")))  s_sr.orbit_distance = (float)atof(e);
+      if ((e = getenv("JCE_DBG_VISTA_PITCH"))) s_sr.orbit_pitch = (float)atof(e) * JCE_DEG2RAD;
+      if ((e = getenv("JCE_DBG_VISTA_YAW")))   s_sr.orbit_yaw   = (float)atof(e) * JCE_DEG2RAD; }
+    s_sr.focus_last_bounds_valid = false;
+    s_sr.focus_zoom_step = 0;
+    orbit_apply();
 }
 
 void jce_editor_scene_camera_focus_transform(const JceTransform *transform)

@@ -78,6 +78,13 @@ void sr_terrain_free_chunks(JceSceneRenderer *sr, int slot)
         JCE_FREE(sr->terrain_cache[slot].chunk_max);
         sr->terrain_cache[slot].chunk_max = NULL;
     }
+    if (sr->terrain_cache[slot].chunk_splat_tex) {
+        for (int i = 0; i < sr->terrain_cache[slot].chunk_count; i++)
+            if (BGFX_HANDLE_IS_VALID(sr->terrain_cache[slot].chunk_splat_tex[i]))
+                bgfx_destroy_texture(sr->terrain_cache[slot].chunk_splat_tex[i]);
+        JCE_FREE(sr->terrain_cache[slot].chunk_splat_tex);
+        sr->terrain_cache[slot].chunk_splat_tex = NULL;
+    }
     sr->terrain_cache[slot].chunk_count = 0;
 }
 
@@ -95,11 +102,18 @@ static bool sr_terrain_init_chunks(JceSceneRenderer *sr, int slot)
     int8_t    *lods   = (int8_t  *)JCE_MALLOC(sizeof(int8_t)    * (size_t)n);
     jce_vec3  *mins   = (jce_vec3 *)JCE_MALLOC(sizeof(jce_vec3) * (size_t)n);
     jce_vec3  *maxs   = (jce_vec3 *)JCE_MALLOC(sizeof(jce_vec3) * (size_t)n);
-    if (!meshes || !lods || !mins || !maxs) {
+    /* Per-chunk splat textures only for a tiled terrain (else NULL → the
+     * monolithic splat_tex path is used). */
+    bgfx_texture_handle_t *splats = jce_terrain_is_tiled(terr)
+        ? (bgfx_texture_handle_t *)JCE_MALLOC(sizeof(bgfx_texture_handle_t) * (size_t)n)
+        : NULL;
+    if (!meshes || !lods || !mins || !maxs ||
+        (jce_terrain_is_tiled(terr) && !splats)) {
         if (meshes) JCE_FREE(meshes);
         if (lods)   JCE_FREE(lods);
         if (mins)   JCE_FREE(mins);
         if (maxs)   JCE_FREE(maxs);
+        if (splats) JCE_FREE(splats);
         return false;
     }
     for (int cz = 0; cz < ncz; cz++)
@@ -107,12 +121,14 @@ static bool sr_terrain_init_chunks(JceSceneRenderer *sr, int slot)
         int idx = cz * ncx + cx;
         meshes[idx] = NULL;
         lods[idx]   = -1;
+        if (splats) splats[idx].idx = UINT16_MAX;
         sr_terrain_chunk_local_aabb(terr, cx, cz, &mins[idx], &maxs[idx]);
     }
-    sr->terrain_cache[slot].chunk_meshes = meshes;
-    sr->terrain_cache[slot].chunk_lod    = lods;
-    sr->terrain_cache[slot].chunk_min    = mins;
-    sr->terrain_cache[slot].chunk_max    = maxs;
+    sr->terrain_cache[slot].chunk_meshes    = meshes;
+    sr->terrain_cache[slot].chunk_lod       = lods;
+    sr->terrain_cache[slot].chunk_min       = mins;
+    sr->terrain_cache[slot].chunk_max       = maxs;
+    sr->terrain_cache[slot].chunk_splat_tex = splats;
     sr->terrain_cache[slot].chunk_count  = n;
     sr->terrain_cache[slot].chunk_nx     = ncx;
     sr->terrain_cache[slot].chunk_nz     = ncz;
@@ -312,6 +328,78 @@ int sr_terrain_find_or_load_slot(JceSceneRenderer *sr, const char *path)
  * Step 5 is repeated per chunk because jce_mesh_submit_terrain discards all
  * bound state (BGFX_DISCARD_ALL) after each submit. */
 
+/* Build a box-filtered RGBA8 mip chain for the splat map into ONE bgfx memory
+ * block (mip0..mipN, sequential, as bgfx expects for a hasMips upload).
+ * Large-world #4: an un-mipped W×H splat (~64 MB at 4097²) aliases badly on
+ * distant terrain and can never be dropped under VRAM pressure; a real mip chain
+ * lets trilinear sampling pick the right level and the mip-bias hook evict the
+ * top mips.  Averages the 4 packed layer weights per 2×2 (weights stay ~summed). */
+static const bgfx_memory_t *sr_splat_build_mips(const uint32_t *splat, int w, int h)
+{
+    int    mw = w, mh = h, levels = 1;
+    size_t total = (size_t)w * h * 4u;
+    while (mw > 1 || mh > 1) {
+        mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
+        total += (size_t)mw * mh * 4u; ++levels;
+    }
+    const bgfx_memory_t *mem = bgfx_alloc((uint32_t)total);
+    if (!mem) return NULL;
+    uint8_t *dst = mem->data;
+    memcpy(dst, splat, (size_t)w * h * 4u);            /* mip 0 = source */
+    const uint8_t *prev = dst; int pw = w, ph = h;
+    uint8_t *cur = dst + (size_t)w * h * 4u;
+    mw = w > 1 ? w >> 1 : 1; mh = h > 1 ? h >> 1 : 1;
+    for (int l = 1; l < levels; ++l) {
+        for (int y = 0; y < mh; ++y)
+            for (int x = 0; x < mw; ++x) {
+                int x0 = x * 2, y0 = y * 2;
+                int x1 = (x0 + 1 < pw) ? x0 + 1 : x0;
+                int y1 = (y0 + 1 < ph) ? y0 + 1 : y0;
+                for (int c = 0; c < 4; ++c) {
+                    int s = prev[(y0 * pw + x0) * 4 + c] + prev[(y0 * pw + x1) * 4 + c]
+                          + prev[(y1 * pw + x0) * 4 + c] + prev[(y1 * pw + x1) * 4 + c];
+                    cur[(y * mw + x) * 4 + c] = (uint8_t)(s >> 2);
+                }
+            }
+        prev = cur; pw = mw; ph = mh; cur += (size_t)mw * mh * 4u;
+        mw = mw > 1 ? mw >> 1 : 1; mh = mh > 1 ? mh >> 1 : 1;
+    }
+    return mem;
+}
+
+/* Lazily build + cache chunk (cx,cz)'s per-tile splat texture (with the same
+ * box-filtered mip chain as the monolithic path) for a TILED terrain. Assumes
+ * chunk_size == tile_dim so chunk index == tile (cx,cz). Returns an invalid
+ * handle on failure (caller falls back to white). */
+static bgfx_texture_handle_t sr_terrain_tile_splat_tex(JceSceneRenderer *sr,
+                                                       int slot, int cx, int cz,
+                                                       int tile_dim)
+{
+    bgfx_texture_handle_t inv = { UINT16_MAX };
+    bgfx_texture_handle_t *cache = sr->terrain_cache[slot].chunk_splat_tex;
+    if (!cache) return inv;
+    int ncx = sr->terrain_cache[slot].chunk_nx;
+    int idx = cz * ncx + cx;
+    if (idx < 0 || idx >= sr->terrain_cache[slot].chunk_count) return inv;
+    if (BGFX_HANDLE_IS_VALID(cache[idx])) return cache[idx];
+
+    int    span = tile_dim + 1;
+    size_t n    = (size_t)span * (size_t)span;
+    uint32_t *sp = (uint32_t *)JCE_MALLOC(n * sizeof(uint32_t));
+    bgfx_texture_handle_t st = inv;
+    if (sp && jce_terrain_tile_copy(sr->terrain_cache[slot].terrain,
+                                    cx, cz, NULL, sp)) {
+        const bgfx_memory_t *mem = sr_splat_build_mips(sp, span, span);
+        if (mem)
+            st = bgfx_create_texture_2d((uint16_t)span, (uint16_t)span, true, 1,
+                    BGFX_TEXTURE_FORMAT_RGBA8,
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem);
+    }
+    if (sp) JCE_FREE(sp);
+    cache[idx] = st;
+    return st;
+}
+
 void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
                             EntityList *list,
                             const JceCamera *camera, uint16_t view_id,
@@ -330,11 +418,15 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         int th = jce_terrain_height(terr);
         const uint32_t *splat = jce_terrain_splat(terr);
         if (splat && tw > 0 && th > 0) {
-            const bgfx_memory_t *mem = bgfx_copy(splat, (uint32_t)(tw * th * 4));
-            sr->terrain_cache[slot].splat_tex =
-                bgfx_create_texture_2d((uint16_t)tw, (uint16_t)th, false, 1,
-                    BGFX_TEXTURE_FORMAT_RGBA8,
-                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem);
+            /* hasMips=true + a full CPU-built mip chain: trilinear sampling then
+             * picks the right level for distant chunks (no shimmer) and the mips
+             * are droppable under VRAM pressure. */
+            const bgfx_memory_t *mem = sr_splat_build_mips(splat, tw, th);
+            if (mem)
+                sr->terrain_cache[slot].splat_tex =
+                    bgfx_create_texture_2d((uint16_t)tw, (uint16_t)th, true, 1,
+                        BGFX_TEXTURE_FORMAT_RGBA8,
+                        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem);
         }
         sr->terrain_cache[slot].splat_uploaded = true;
     }
@@ -346,6 +438,18 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         (tc && tc->splat_enabled) ? 1.0f : 0.0f,
         0.0f, 0.0f
     };
+    /* large-world #4 per-tile splat: a tiled terrain has no monolithic splat
+     * map. When its tile grid aligns with the chunk grid (tile_dim==chunk_size,
+     * so chunk i ↔ tile i) we bind a per-tile splat texture per chunk (in the
+     * loop below) and remap the global UV into that tile via u_terrainTileUV.
+     * Otherwise chunks can't be mapped to tiles, so fall back to a clean base
+     * layer instead of blending an all-white (equal-weight) splat into mud. */
+    int tg_x = 0, tg_z = 0, tg_dim = 0;
+    jce_terrain_tile_grid(terr, &tg_x, &tg_z, &tg_dim);
+    bool per_tile_splat = jce_terrain_is_tiled(terr) && tg_dim > 0 &&
+                          tg_dim == jce_terrain_chunk_size(terr) &&
+                          tc && tc->splat_enabled;
+    if (jce_terrain_is_tiled(terr) && !per_tile_splat) tparams[1] = 0.0f;
 
     /* Frustum planes from the camera (independent of the entity-level cull
      * toggle so terrain always benefits from per-chunk culling). */
@@ -361,6 +465,22 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
     }
     jce_vec3 cam_pos = camera ? jce_camera_get_position(camera)
                               : jce_v3(0, 0, 0);
+
+    /* Streaming prefetch (large-world #4): page in the tiles around the camera
+     * before the chunk loop samples them, so crossing a tile boundary doesn't
+     * first-touch-stall.  Camera → terrain-local via the model translation (exact
+     * for placed-by-translation terrains, the common case; the lazy load in
+     * terrain_h is the safety net for scaled/rotated ones).  Radius ≈ 2 tiles. */
+    if (camera && jce_terrain_is_tiled(terr)) {
+        int   ptx = 0, ptz = 0, ptd = 0;
+        jce_terrain_tile_grid(terr, &ptx, &ptz, &ptd);
+        float wsx = jce_terrain_world_size_x(terr);
+        if (ptx > 0 && wsx > 0.0f) {
+            float local_x = cam_pos.x - model->col[3].x;
+            float local_z = cam_pos.z - model->col[3].z;
+            jce_terrain_prefetch(terr, local_x, local_z, 2.0f * (wsx / (float)ptx));
+        }
+    }
 
     int ncx = sr->terrain_cache[slot].chunk_nx;
     int ncz = sr->terrain_cache[slot].chunk_nz;
@@ -405,10 +525,26 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         bgfx_set_transform(model->raw[0], 1);
         bgfx_set_texture(0,  sr->s_terrain_layer0, layer_tex[0], UINT32_MAX);
         bgfx_set_texture(4,  sr->s_terrain_layer3, layer_tex[3], UINT32_MAX);
-        bgfx_set_texture(13, sr->s_terrain_splat,  splat_h,      UINT32_MAX);
         bgfx_set_texture(14, sr->s_terrain_layer1, layer_tex[1], UINT32_MAX);
         bgfx_set_texture(15, sr->s_terrain_layer2, layer_tex[2], UINT32_MAX);
         bgfx_set_uniform(sr->u_terrain_params, tparams, 1);
+
+        if (per_tile_splat) {
+            /* Bind this chunk's tile splat texture + remap the global terrain UV
+             * into the tile's local [0..1]. */
+            bgfx_texture_handle_t st =
+                sr_terrain_tile_splat_tex(sr, slot, cx, cz, tg_dim);
+            bgfx_set_texture(13, sr->s_terrain_splat,
+                BGFX_HANDLE_IS_VALID(st) ? st : sr->white_tex, UINT32_MAX);
+            float tile_uv[4] = { (float)cx / (float)tg_x,
+                                 (float)cz / (float)tg_z,
+                                 (float)tg_x, (float)tg_z };
+            bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
+        } else {
+            bgfx_set_texture(13, sr->s_terrain_splat, splat_h, UINT32_MAX);
+            float tile_uv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };  /* identity remap */
+            bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
+        }
 
         jce_mesh_submit_terrain(cm, sr->renderer, view_id);
         sr->stat_terrain_chunks_drawn++;

@@ -5,7 +5,8 @@
 #include "jce_panel_hierarchy_internal.h"
 #include "ui/jce_editor_dnd.h"
 
-#include <algorithm>   /* std::sort — O(n log n) root sort at full-load */
+#include <algorithm>     /* std::sort — O(n log n) root sort at full-load */
+#include <unordered_set> /* streamed-id set for chunk grouping */
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -283,8 +284,9 @@ static void hierarchy_flatten_recurse(uint32_t id, int depth)
     /* Record into both the flat row list and the full display order (used by
      * shift-range select and alpha-jump — must reflect EVERY visible row, not
      * just the clipper-visible subset). */
-    s_hier.flat[s_hier.flat_count].id    = id;
-    s_hier.flat[s_hier.flat_count].depth = depth;
+    s_hier.flat[s_hier.flat_count].id           = id;
+    s_hier.flat[s_hier.flat_count].depth        = depth;
+    s_hier.flat[s_hier.flat_count].chunk_header = false;
     s_hier.flat_count++;
     record_display_order(id);
 
@@ -298,12 +300,189 @@ static void hierarchy_flatten_recurse(uint32_t id, int depth)
     }
 }
 
+/* ── Streamed-chunk grouping ─────────────────────────────────────────
+ * When the streaming preview is active we present each loaded chunk as a
+ * synthetic collapsible header with the chunk's spawned ROOT entities nested
+ * underneath (their descendants recurse normally).  This keeps the hierarchy
+ * usable when Full-World loads tens of thousands of entities and makes the
+ * hierarchy the chunk view.  Base-scene (non-streamed) entities are listed
+ * exactly as before — streamed roots are simply rerouted out of the flat
+ * root list and under their chunk header. */
+
+bool jce_hierarchy_chunk_grouping_active(void)
+{
+    return jce_state_get_streaming_preview() &&
+           jce_state_streaming_group_count() > 0;
+}
+
+/* Is this open?  Synthetic chunk headers default OPEN only on the reveal path
+ * (full-world would otherwise expand 200+ chunks × thousands of rows); the
+ * persisted bit drives normal expand/collapse.  Keyed disjoint from entity ids
+ * via a salt so a chunk id never collides with an entity-node ImGui id. */
+static const uintptr_t kChunkHeaderSalt = 0x6368756Bu; /* 'chuk' */
+static bool chunk_header_is_open(uint32_t chunk_id)
+{
+    ImGuiStorage *storage = ImGui::GetStateStorage();
+    ImGuiID hid = ImGui::GetID((void *)(kChunkHeaderSalt ^ (uintptr_t)chunk_id));
+    return storage->GetInt(hid, /*default*/0) != 0;
+}
+
+/* Collect every streamed entity id (across all chunk groups) into a set so the
+ * root pass can skip them — they appear under their chunk header instead. */
+static void collect_streamed_ids(std::unordered_set<uint32_t> &out)
+{
+    uint32_t chunk_ids[JCE_SCENE_MAX_STREAM_CHUNKS];
+    uint32_t nc = jce_state_streaming_group_chunk_ids(chunk_ids,
+                                                      JCE_SCENE_MAX_STREAM_CHUNKS);
+    for (uint32_t i = 0; i < nc; ++i) {
+        uint32_t cnt = 0;
+        const uint32_t *ents =
+            jce_state_streaming_chunk_entities(chunk_ids[i], &cnt);
+        for (uint32_t j = 0; j < cnt; ++j) out.insert(ents[j]);
+    }
+}
+
+static void flatten_chunk_groups(void)
+{
+    uint32_t chunk_ids[JCE_SCENE_MAX_STREAM_CHUNKS];
+    uint32_t nc = jce_state_streaming_group_chunk_ids(chunk_ids,
+                                                      JCE_SCENE_MAX_STREAM_CHUNKS);
+    for (uint32_t i = 0; i < nc; ++i) {
+        uint32_t chunk_id = chunk_ids[i];
+        uint32_t cnt = 0;
+        const uint32_t *ents = jce_state_streaming_chunk_entities(chunk_id, &cnt);
+        if (!ents || cnt == 0) continue;
+
+        if (s_hier.flat_count >= HIERARCHY_MAX_DISPLAY) break;
+
+        /* Synthetic header row. */
+        s_hier.flat[s_hier.flat_count].id           = chunk_id;
+        s_hier.flat[s_hier.flat_count].depth        = 0;
+        s_hier.flat[s_hier.flat_count].chunk_header = true;
+        s_hier.flat_count++;
+        /* NOTE: not recorded into display_order (alpha-jump / range-select
+         * operate on real entities only). */
+
+        if (!chunk_header_is_open(chunk_id)) continue;
+
+        /* Emit the chunk's ROOT entities (parent == none) at depth 1; their
+         * descendants recurse normally.  Children of streamed roots have a
+         * real ECS parent so they are not themselves roots. */
+        for (uint32_t j = 0; j < cnt; ++j) {
+            uint32_t e = ents[j];
+            if (!jce_state_entity_exists(e)) continue;
+            if (jce_state_entity_parent(e) != 0) continue;   /* not a root */
+            hierarchy_flatten_recurse(e, 1);
+        }
+    }
+}
+
 void jce_hierarchy_flatten(const uint32_t *root_ids, int root_count)
 {
     s_hier.flat_count    = 0;
     s_hier.display_count = 0;
-    for (int i = 0; i < root_count; i++)
+
+    const bool grouping = jce_hierarchy_chunk_grouping_active();
+    std::unordered_set<uint32_t> streamed;
+    if (grouping) collect_streamed_ids(streamed);
+
+    /* Base-scene roots first (skip streamed roots when grouping — they go under
+     * their chunk header). */
+    for (int i = 0; i < root_count; i++) {
+        if (grouping && streamed.find(root_ids[i]) != streamed.end())
+            continue;
         hierarchy_flatten_recurse(root_ids[i], 0);
+    }
+
+    /* Then one collapsible node per loaded chunk. */
+    if (grouping) flatten_chunk_groups();
+}
+
+/* ── Streamed-chunk group header row (synthetic, clipper-friendly) ─── */
+
+/* Switch the preview into FILTER mode, seeding the filter from the chunks that
+ * are currently loaded (so flipping one chunk off doesn't unload everything),
+ * then toggle `chunk_id`.  Used by the chunk-header eye when not already in
+ * FILTER mode so the eye is a one-click "isolate / hide this chunk". */
+static void chunk_eye_toggle(uint32_t chunk_id, bool want_shown)
+{
+    if (jce_state_streaming_get_preview_mode() != JCE_STREAM_PREVIEW_FILTER) {
+        uint32_t loaded_ids[JCE_SCENE_MAX_STREAM_CHUNKS];
+        uint32_t n = jce_state_streaming_group_chunk_ids(
+            loaded_ids, JCE_SCENE_MAX_STREAM_CHUNKS);
+        jce_state_streaming_filter_set_all(loaded_ids, n);  /* current = loaded */
+        jce_state_streaming_set_preview_mode(JCE_STREAM_PREVIEW_FILTER);
+    }
+    jce_state_streaming_filter_set(chunk_id, want_shown);
+}
+
+void draw_chunk_group_row(uint32_t chunk_id, int depth)
+{
+    uint32_t ent_count = 0;
+    (void)jce_state_streaming_chunk_entities(chunk_id, &ent_count);
+
+    float indent_w = depth * ImGui::GetTreeNodeToLabelSpacing();
+    if (indent_w > 0.0f) ImGui::Indent(indent_w);
+
+    /* In FILTER mode the eye reflects membership; otherwise the chunk is
+     * loaded (shown) by definition of being grouped here. */
+    bool in_filter_mode =
+        jce_state_streaming_get_preview_mode() == JCE_STREAM_PREVIEW_FILTER;
+    bool shown = in_filter_mode
+               ? jce_state_streaming_filter_contains(chunk_id)
+               : true;
+
+    /* Collapsible header — keyed by the same salted id the flatten pass uses so
+     * the persisted open bit matches.  Use a distinct void* key. */
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                                ImGuiTreeNodeFlags_SpanAvailWidth |
+                                ImGuiTreeNodeFlags_AllowOverlap |
+                                ImGuiTreeNodeFlags_NoTreePushOnOpen;
+
+    ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_HIER_PREFAB);
+    ImGui::TreeNodeEx((void *)(kChunkHeaderSalt ^ (uintptr_t)chunk_id), flags,
+                      "%s %u  (%u)",
+                      jce_editor_i18n_or("hierarchy.chunk", "Chunk"),
+                      chunk_id, ent_count);
+    ImGui::PopStyleColor();
+
+    /* Right-aligned eye: filled = shown, hollow = hidden.  Drives the FILTER. */
+    {
+        float h = ImGui::GetTextLineHeight();
+        float btn_w = h;
+        float row_right = ImGui::GetWindowContentRegionMax().x;
+        float btn_x = row_right - btn_w - 4.0f;
+        ImGui::SameLine(btn_x);
+        ImGui::PushID((int)(chunk_id ^ 0x5000u));
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.10f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.20f));
+
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemAllowOverlap();
+        bool clicked = ImGui::InvisibleButton("##chunk_eye", ImVec2(btn_w, h));
+        bool hovered = ImGui::IsItemHovered();
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        float cx = p.x + btn_w * 0.5f;
+        float cy = p.y + h * 0.5f;
+        float r  = h * 0.32f;
+        ImU32 col = shown ? IM_COL32(220, 220, 220, 255)
+                          : IM_COL32(140, 140, 140, 200);
+        if (hovered) col = IM_COL32(255, 255, 255, 255);
+        if (shown) dl->AddCircleFilled(ImVec2(cx, cy), r, col, 16);
+        else       dl->AddCircle(ImVec2(cx, cy), r, col, 16, 1.5f);
+
+        if (clicked) chunk_eye_toggle(chunk_id, !shown);
+        if (hovered)
+            ImGui::SetTooltip("%s", jce_editor_i18n_or(
+                shown ? "hierarchy.chunk.hide" : "hierarchy.chunk.show",
+                shown ? "Hide this chunk (filter)" : "Show this chunk (filter)"));
+        ImGui::PopStyleColor(3);
+        ImGui::PopID();
+    }
+
+    if (indent_w > 0.0f) ImGui::Unindent(indent_w);
 }
 
 /* ── Entity tree row (single, clipper-friendly) ──────────────────── */

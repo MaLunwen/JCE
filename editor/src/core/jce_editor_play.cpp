@@ -25,6 +25,7 @@ extern "C" {
 #include <jce/renderer/jce_scene_renderer.h>   /* set_anim_sm_active */
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_thread.h>            /* async chunk-load thread pool */
 #include <jce/os/core/jce_alloc.h>
 }
 
@@ -34,6 +35,7 @@ extern "C" {
 #include "scene/jce_editor_game_render.h"  /* hand Play runtime to UI dispatch */
 
 #include <string>
+#include <cstdlib>   /* getenv/atof for streaming bench toggles (M2) */
 
 /* ── Play mode: runtime-driven ───────────────────────────────────── */
 
@@ -54,6 +56,11 @@ static JceAudio   *s_play_audio   = NULL;   /* owned alongside the runtime */
  * byte-identical to before. */
 static JceWorldStreamer *s_play_streamer        = NULL;
 static JceFileSystem    *s_play_stream_fs       = NULL;
+/* Background worker pool for async chunk loads (off-thread disk read + private
+ * buffer; the scene APPLY/spawn stays on the main thread).  Owned alongside the
+ * streamer for the Play session: destroyed AFTER the streamer (whose destroy
+ * joins all in-flight chunk tasks first) so no worker can touch a freed fs. */
+static JceThreadPool    *s_play_stream_pool      = NULL;
 static jce_vec3          s_play_stream_pos       = { 0.0f, 0.0f, 0.0f };
 static bool              s_play_stream_pos_valid = false;
 
@@ -189,6 +196,28 @@ static bool editor_ground_query_cb(uint64_t entity, const float origin[3],
 
 /* ── Play mode API ───────────────────────────────────────────────── */
 
+/* World-streamer entity callbacks for editor Play (streaming M3).  A streamed
+ * chunk's entities must (a) appear in the editor hierarchy/selection mirror AND
+ * (b) be wired into the live Play runtime so a script / trigger / NPC authored
+ * in the cell actually runs (on_start / on_update, trigger observer, body) — the
+ * plain attach helper only does (a).  These combined callbacks run BOTH; `user`
+ * is the Play runtime.  Spawn: wire runtime gameplay first, then mirror.  Despawn
+ * (fired BEFORE the streamer destroys the entities): release runtime gameplay
+ * first (so no body/script/trigger dangles), then mirror-remove. */
+static void play_streamer_spawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    JceRuntime *rt = (JceRuntime *)user;
+    if (rt) jce_runtime_spawn_gameplay_for_ids(rt, ids, count);
+    jce_state_streamer_mirror_spawn(ids, count);
+}
+
+static void play_streamer_despawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    JceRuntime *rt = (JceRuntime *)user;
+    if (rt) jce_runtime_despawn_gameplay_for_ids(rt, ids, count);
+    jce_state_streamer_mirror_despawn(ids, count);
+}
+
 /* ── World streaming (editor Play) ───────────────────────────────────
  * Mirrors jce_default_init_world_streaming (jce_default_main.inc.h) so the
  * editor Play button streams chunks exactly like the shipped game. */
@@ -196,6 +225,7 @@ static void play_streaming_begin(void)
 {
     s_play_streamer = NULL;
     s_play_stream_fs = NULL;
+    s_play_stream_pool = NULL;
     s_play_stream_pos_valid = false;
     if (!s.scene) return;
 
@@ -226,18 +256,45 @@ static void play_streaming_begin(void)
     wsc.max_pending     = st->max_pending;
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
-    wsc.single_thread   = true;   /* cooperative: chunk apply spawns on main thread */
 
-    s_play_streamer = jce_world_streamer_create(&wsc, s.scene, fs, NULL);
+    /* Hand the streamer a small worker pool so chunk disk-read + JSON-byte
+     * staging run OFF the main thread (the apply/spawn stays time-sliced on
+     * main); this kills the per-cell frame hitch.  Web has no real threads, so
+     * keep the cooperative single-thread path there. */
+    JceThreadPool *pool = NULL;
+#if !JCE_PLATFORM_WEB
+    /* Bench/diagnostic toggle (M2 A/B): JCE_STREAM_SYNC=1 forces the synchronous
+     * single-thread chunk-load path (no worker pool) so the async chunk-load
+     * benefit can be measured, and as a safety hatch if the pool ever misbehaves.
+     * Mirrors JCE_DISABLE_WCACHE for the render-cache A/B. */
+    const char *stream_sync = getenv("JCE_STREAM_SYNC");
+    const bool force_sync = (stream_sync && stream_sync[0] && stream_sync[0] != '0');
+    if (!force_sync)
+        pool = jce_thread_pool_create(3);
+    else
+        LOG_INFO(LOG_TAG, "JCE_STREAM_SYNC=1: forcing synchronous chunk loads (no pool)");
+#endif
+    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
+
+    s_play_streamer = jce_world_streamer_create(&wsc, s.scene, fs, pool);
     if (!s_play_streamer) {
+        if (pool) jce_thread_pool_destroy(pool);
         jce_fs_destroy(fs);
         LOG_WARN(LOG_TAG, "play world streamer creation failed — streaming disabled");
         return;
     }
+    s_play_stream_pool = pool;
     s_play_stream_fs = fs;
     jce_world_streamer_register_from_scene_settings(s_play_streamer, st);
-    /* Mirror Play-streamed entities into the editor hierarchy/selection too. */
-    jce_state_attach_streamer_hierarchy(s_play_streamer);
+    /* Mirror Play-streamed entities into the editor hierarchy/selection AND wire
+     * them into the live Play runtime gameplay (streaming M3) — a script /
+     * trigger / NPC authored in a streamed cell must actually run, not just
+     * render.  These combined callbacks do both; the plain attach helper (used by
+     * the scene-view preview, which has no runtime) does only the mirror. */
+    jce_world_streamer_set_entity_callbacks(s_play_streamer,
+                                            play_streamer_spawn_cb,
+                                            play_streamer_despawn_cb,
+                                            s_play_runtime);
     /* Toggle the always-resident HLOD far-skyline proxies as chunks (un)load. */
     jce_state_attach_streamer_hlod(s_play_streamer);
     LOG_INFO(LOG_TAG,
@@ -254,6 +311,33 @@ static void play_streaming_tick(void)
         s_play_stream_pos = pos;
         s_play_stream_pos_valid = true;
     }
+    /* KPI bench driver (M2 traversal): JCE_KPI_TRAVERSE=1 advances the streaming
+     * center deterministically along +X so cells continuously load/unload while
+     * the autoplay player stays stationary — the only way to exercise the
+     * streamer's load/unload churn under the headless KPI harness. Overrides the
+     * streamer center directly (the runtime player never moves under autoplay).
+     *   JCE_KPI_TRAVERSE_STEP   world units advanced per tick (default 2.0)
+     *   JCE_KPI_TRAVERSE_START  starting X (default 0.0; e.g. -2700 to sweep
+     *                           from the world's -X edge through the populated band) */
+    static int s_traverse = -1;
+    if (s_traverse < 0) {
+        const char *tv = getenv("JCE_KPI_TRAVERSE");
+        s_traverse = (tv && tv[0] && tv[0] != '0') ? 1 : 0;
+    }
+    if (s_traverse) {
+        static int s_trav_init = 0;
+        static float s_trav_x = 0.0f;
+        const char *step_env  = getenv("JCE_KPI_TRAVERSE_STEP");
+        const char *start_env = getenv("JCE_KPI_TRAVERSE_START");
+        const float step = (step_env && step_env[0]) ? (float)atof(step_env) : 2.0f;
+        if (!s_trav_init) {
+            s_trav_x = (start_env && start_env[0]) ? (float)atof(start_env) : 0.0f;
+            s_trav_init = 1;
+        }
+        s_trav_x += step;             /* +X each tick → continuous load/unload churn */
+        s_play_stream_pos.x = s_trav_x;
+        s_play_stream_pos_valid = true;
+    }
     /* Until a CharacterController exists, hold last-known (or origin) so the
      * inner ring around spawn still streams in on frame 0. */
     jce_world_streamer_update(s_play_streamer, s_play_stream_pos);
@@ -261,8 +345,14 @@ static void play_streaming_tick(void)
 
 static void play_streaming_end(void)
 {
-    if (s_play_streamer)  { jce_world_streamer_destroy(s_play_streamer); s_play_streamer = NULL; }
-    if (s_play_stream_fs) { jce_fs_destroy(s_play_stream_fs);            s_play_stream_fs = NULL; }
+    /* Order matters: jce_world_streamer_destroy → jce_streaming_destroy joins
+     * (jce_task_wait) every in-flight chunk task before freeing, so once the
+     * streamer is gone no worker is still touching the fs/scene.  Only then is
+     * it safe to destroy the pool (which also waits-for-all on shutdown) and
+     * the fs the workers were reading from. */
+    if (s_play_streamer)   { jce_world_streamer_destroy(s_play_streamer); s_play_streamer = NULL; }
+    if (s_play_stream_pool){ jce_thread_pool_destroy(s_play_stream_pool); s_play_stream_pool = NULL; }
+    if (s_play_stream_fs)  { jce_fs_destroy(s_play_stream_fs);            s_play_stream_fs = NULL; }
     s_play_stream_pos_valid = false;
     /* Re-show all HLOD proxies so the master skyline is whole again after Play. */
     jce_state_detach_streamer_hlod();
@@ -566,6 +656,9 @@ JceRuntime *jce_editor_play_get_runtime(void)
 struct ClipEntry {
     uint32_t    id;
     char        name[JCE_MAX_ENTITY_NAME];
+    /* Source entity's prefab path (captured at copy time so Paste As Instance
+     * works even after the source is deleted). "" = not a prefab instance. */
+    char        prefab_path[256];
     /* Full subtree snapshot (entity tree node JSON: name/components/children).
      * Captured via serialize_entity_tree_json() so copy/paste preserves the
      * entire child hierarchy and every component type, not just a flat
@@ -590,6 +683,8 @@ static bool clip_capture(uint32_t id, ClipEntry *out)
     const char *name = jce_state_entity_name(id);
     out->id = id;
     snprintf(out->name, sizeof(out->name), "%s", name ? name : "Entity");
+    const char *pp = jce_state_entity_prefab_path(id);
+    snprintf(out->prefab_path, sizeof(out->prefab_path), "%s", pp ? pp : "");
     out->tree_json.clear();
 
     if (s.scene) {
@@ -754,5 +849,28 @@ int jce_state_paste_entities(uint32_t parent_id,
         s_clipboard.id = 0;
     }
     LOG_INFO(LOG_TAG, "pasted %d entities under %u", n, parent_id);
+    return n;
+}
+
+/* Paste As Instance: for each clipboard entry whose source was a prefab
+ * instance, instantiate a fresh LINKED instance of that prefab (so it tracks
+ * the prefab asset); non-prefab entries fall back to a normal subtree paste.
+ * Never consumes a cut clipboard (instancing is a copy-like op). */
+int jce_state_paste_entities_as_instance(uint32_t parent_id,
+                                         uint32_t *out_ids, int max_out)
+{
+    if (s_clip_entries.empty()) return 0;
+    int n = 0;
+    jce_state_begin_batch_edit();
+    for (const auto &e : s_clip_entries) {
+        uint32_t new_id = (e.prefab_path[0] != '\0')
+            ? jce_state_instantiate_prefab(e.prefab_path, parent_id)
+            : clip_paste_one(e, parent_id, " (Paste)");
+        if (new_id == 0) continue;
+        if (out_ids && n < max_out) out_ids[n] = new_id;
+        ++n;
+    }
+    jce_state_end_batch_edit();
+    LOG_INFO(LOG_TAG, "pasted %d entities as instances under %u", n, parent_id);
     return n;
 }

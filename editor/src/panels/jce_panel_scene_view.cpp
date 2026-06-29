@@ -27,6 +27,11 @@ bool jce_terrain_panel_brush_armed(void);
 struct JceTerrain *jce_terrain_panel_get_terrain(void);
 void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt);
 void jce_terrain_panel_end_brush_stroke(void);
+
+/* Foliage density paint brush (large-world #8a) — same scene-view raycast path. */
+bool jce_foliage_brush_armed(void);
+void jce_foliage_brush_apply_world(float wx, float wz, float dt);
+void jce_foliage_brush_end_stroke(void);
 }
 
 #include <ctype.h>
@@ -88,6 +93,11 @@ static void draw_scene_view_toolbar(void)
     if (ImGui::BeginPopup("##SnapSettings")) {
         ImGui::TextUnformatted(jce_editor_i18n("sceneView.snap.title"));
         ImGui::Separator();
+        /* Persistent toggle: snap without holding Ctrl (Ctrl still forces it). */
+        bool snap_on = jce_state_get_gizmo_snap_enabled();
+        if (ImGui::Checkbox(jce_editor_i18n_id("sceneView.snap.enabled",
+                            "Snap enabled (no Ctrl needed)"), &snap_on))
+            jce_state_set_gizmo_snap_enabled(snap_on);
         ImGui::PushItemWidth(120.0f);
 
         float snap_t = jce_state_get_gizmo_snap_translate();
@@ -138,6 +148,15 @@ static void draw_scene_view_toolbar(void)
 
     ImGui::SameLine();
 
+    if (ImGui::Button(jce_editor_i18n_or("sceneView.overview", "Overview"))) {
+        jce_editor_scene_frame_overview();
+    }
+    jce_editor::help_tip(
+        jce_editor_i18n_or("sceneView.overview.tooltip",
+                           "Frame the whole world from above"));
+
+    ImGui::SameLine();
+
     if (ImGui::Button(jce_editor_i18n("menu.view"))) {
         ImGui::OpenPopup("##SceneViewMenu");
     }
@@ -156,6 +175,16 @@ static void draw_scene_view_toolbar(void)
                 jce_state_set_view_mode(JCE_VIEW_SHADED);
             if (ImGui::MenuItem(jce_editor_i18n("sceneView.textured"), NULL, vm == JCE_VIEW_TEXTURED))
                 jce_state_set_view_mode(JCE_VIEW_TEXTURED);
+            ImGui::Separator();
+            /* Debug channel views (unlit material channels via fs_pbr). */
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.normals", "Normals"), NULL, vm == JCE_VIEW_NORMALS))
+                jce_state_set_view_mode(JCE_VIEW_NORMALS);
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.roughness", "Roughness"), NULL, vm == JCE_VIEW_ROUGHNESS))
+                jce_state_set_view_mode(JCE_VIEW_ROUGHNESS);
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.metallic", "Metallic"), NULL, vm == JCE_VIEW_METALLIC))
+                jce_state_set_view_mode(JCE_VIEW_METALLIC);
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.ao", "Ambient Occlusion"), NULL, vm == JCE_VIEW_AO))
+                jce_state_set_view_mode(JCE_VIEW_AO);
             ImGui::EndMenu();
         }
 
@@ -209,6 +238,34 @@ static void draw_scene_view_toolbar(void)
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.topView")))      { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_TOP); }
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.frontView")))    { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_FRONT); }
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.sideView")))     { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_RIGHT); }
+
+        /* Camera bookmarks: capture/restore exact viewpoints — invaluable for
+         * navigating a large world (jump between work areas). Session-scoped;
+         * cross-restart persistence is a follow-up. */
+        static struct { bool valid; float target[3], yaw, pitch, dist; } s_cam_bm[9];
+        if (ImGui::BeginMenu(jce_editor_i18n_id("sceneView.bookmarks", "Camera Bookmarks"))) {
+            for (int i = 0; i < 9; i++) {
+                char lbl[80];
+                snprintf(lbl, sizeof lbl, "%s %d%s",
+                         jce_editor_i18n_id("sceneView.goToBookmark", "Go to bookmark"),
+                         i + 1, s_cam_bm[i].valid ? "" : " (empty)");
+                if (ImGui::MenuItem(lbl, NULL, false, s_cam_bm[i].valid))
+                    jce_editor_scene_camera_set_state(s_cam_bm[i].target,
+                        s_cam_bm[i].yaw, s_cam_bm[i].pitch, s_cam_bm[i].dist);
+            }
+            ImGui::Separator();
+            for (int i = 0; i < 9; i++) {
+                char lbl[80];
+                snprintf(lbl, sizeof lbl, "%s %d",
+                         jce_editor_i18n_id("sceneView.setBookmark", "Set bookmark"), i + 1);
+                if (ImGui::MenuItem(lbl)) {
+                    jce_editor_scene_camera_get_state(s_cam_bm[i].target,
+                        &s_cam_bm[i].yaw, &s_cam_bm[i].pitch, &s_cam_bm[i].dist);
+                    s_cam_bm[i].valid = true;
+                }
+            }
+            ImGui::EndMenu();
+        }
 
         ImGui::EndPopup();
     }
@@ -1853,7 +1910,7 @@ void jce_editor_panel_scene_view_content(void)
             ctx.viewport_left_clicked,
             ctx.viewport_active,
             ImGui::IsMouseDown(ImGuiMouseButton_Left)) &&
-        jce_terrain_panel_brush_armed() &&
+        (jce_terrain_panel_brush_armed() || jce_foliage_brush_armed()) &&
         !ImGui::GetIO().KeyAlt &&
         !jce_gizmo_is_active())
     {
@@ -1888,16 +1945,21 @@ void jce_editor_panel_scene_view_content(void)
                 }
             }
             if (got) {
-                jce_terrain_panel_apply_brush_world(hit[0], hit[2],
-                                                     ImGui::GetIO().DeltaTime);
+                float dt = ImGui::GetIO().DeltaTime;
+                if (jce_terrain_panel_brush_armed())
+                    jce_terrain_panel_apply_brush_world(hit[0], hit[2], dt);
+                else if (jce_foliage_brush_armed())
+                    jce_foliage_brush_apply_world(hit[0], hit[2], dt);
                 brush_consumed = true;
             }
         }
     }
     /* End the brush stroke when LMB is released so the next drag becomes a
      * fresh undo entry (no-op if no stroke is in progress). */
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         jce_terrain_panel_end_brush_stroke();
+        jce_foliage_brush_end_stroke();
+    }
 
     if (!brush_consumed)
         handle_scene_selection_box(&ctx);

@@ -111,6 +111,13 @@ void  jce_editor_panel_inspector(void);
 void  jce_editor_panel_console(void);
 void  jce_editor_panel_scene_view(void);
 void  jce_editor_panel_game_view(void);
+/* True while the Game View is actively driving game input (the user clicked in
+ * to control the FPS fly-cam / WASD free-fly / player, OR the mouse is
+ * captured) — stays true during a transient LeftAlt free-look release.  The
+ * editor shortcut gate consults this (gated by Play state) so editor hotkeys
+ * (Ctrl+S / Ctrl+A / …) never mis-fire while the user is playing in the Game
+ * View.  Play-consistent: broader than the strict mouse-captured check. */
+bool  jce_editor_game_view_is_input_active(void);
 void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
 void  jce_editor_panel_file_viewer(void);

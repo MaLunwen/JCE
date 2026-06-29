@@ -371,6 +371,9 @@ static cJSON *ser_scene_rendering_settings(
     cJSON_AddBoolToObject(postfx, "ssr", r->ssr_enabled);
     cJSON_AddNumberToObject(postfx, "ssrIntensity", r->ssr_intensity);
     cJSON_AddNumberToObject(postfx, "ssrMaxDistance", r->ssr_max_distance);
+    cJSON_AddNumberToObject(postfx, "taaFeedback",    r->taa_feedback);
+    cJSON_AddNumberToObject(postfx, "taaLumaClamp",   r->taa_luma_clamp);
+    cJSON_AddNumberToObject(postfx, "taaMotionClamp", r->taa_motion_clamp);
 
     cJSON_AddItemToObject(root, "postfx", postfx);
 
@@ -397,6 +400,23 @@ static cJSON *ser_scene_rendering_settings(
         if (sky) {
             cJSON_AddNumberToObject(sky, "mode", r->sky_mode);
             cJSON_AddNumberToObject(sky, "turbidity", r->sky_turbidity);
+            /* Stylized dome (absent in old scenes → parse fills defaults). */
+            cJSON *dome = cJSON_CreateObject();
+            if (dome) {
+                cJSON_AddItemToObject(dome, "zenith",  json_float3(r->sky_dome_zenith));
+                cJSON_AddItemToObject(dome, "mid",     json_float3(r->sky_dome_mid));
+                cJSON_AddNumberToObject(dome, "midPos", r->sky_dome_mid_pos);
+                cJSON_AddItemToObject(dome, "horizon", json_float3(r->sky_dome_horizon));
+                cJSON_AddItemToObject(dome, "ground",  json_float3(r->sky_dome_ground));
+                cJSON_AddItemToObject(dome, "glow",    json_float3(r->sky_dome_glow));
+                cJSON_AddNumberToObject(dome, "glowFalloff",  r->sky_dome_glow_falloff);
+                cJSON_AddItemToObject(dome, "sunColor", json_float3(r->sky_dome_sun_color));
+                cJSON_AddNumberToObject(dome, "sunSize",      r->sky_dome_sun_size);
+                cJSON_AddNumberToObject(dome, "sunSoftness",  r->sky_dome_sun_softness);
+                cJSON_AddNumberToObject(dome, "haloPower",    r->sky_dome_halo_power);
+                cJSON_AddNumberToObject(dome, "haloStrength", r->sky_dome_halo_strength);
+                cJSON_AddItemToObject(sky, "dome", dome);
+            }
             cJSON_AddItemToObject(env, "sky", sky);
         }
         /* Floating origin (opt-in; absent → disabled, old scenes byte-id). */
@@ -408,6 +428,26 @@ static cJSON *ser_scene_rendering_settings(
             cJSON_AddItemToObject(env, "floatingOrigin", fo);
         }
         cJSON_AddItemToObject(root, "environment", env);
+    }
+
+    /* ── Look Profile (stylized slice plan 02) ─────────────────────────
+     * Nested object; absent in old files → parse keeps neutral defaults. */
+    cJSON *look = cJSON_CreateObject();
+    if (look) {
+        cJSON_AddNumberToObject(look, "wrap", r->wrap_factor);
+        cJSON_AddBoolToObject(look, "hemisphere", r->ambient_hemisphere);
+        cJSON_AddItemToObject(look, "groundColor",
+                              json_float3(r->ambient_ground_color));
+        cJSON_AddItemToObject(look, "rimColor", json_float3(r->rim_color));
+        cJSON_AddNumberToObject(look, "rimPower", r->rim_power);
+        cJSON_AddNumberToObject(look, "rimIntensity", r->rim_intensity);
+        cJSON_AddNumberToObject(look, "tonemapOp", r->tonemap_op);
+        if (r->lut_path[0])
+            cJSON_AddStringToObject(look, "lutPath", r->lut_path);
+        cJSON_AddNumberToObject(look, "lutStrength", r->lut_strength);
+        cJSON_AddBoolToObject(look, "toonCharacter", r->toon_character);
+        cJSON_AddNumberToObject(look, "bloomKnee", r->bloom_knee);
+        cJSON_AddItemToObject(root, "look", look);
     }
 
     return root;
@@ -515,18 +555,31 @@ static bool parse_scene_streaming_settings(JceScene *scene,
     return true;
 }
 
-static bool parse_scene_rendering_settings(JceScene *scene,
-                                           const cJSON *root)
+/* Parse all sky-dome sub-keys from a "dome" cJSON object into `r`.
+ * Called from both the "environment.sky.dome" and top-level "sky.dome" paths
+ * so that adding a new dome field only requires one edit site. */
+static void parse_dome_into(const cJSON *dome, JceSceneRenderingSettings *r)
 {
-    const cJSON *scene_obj = scene_root_object(root);
-    if (!scene_obj) return false;
+    j_float3(dome, "zenith",  r->sky_dome_zenith,  r->sky_dome_zenith);
+    j_float3(dome, "mid",     r->sky_dome_mid,     r->sky_dome_mid);
+    r->sky_dome_mid_pos      = (float)j_num(dome, "midPos",      r->sky_dome_mid_pos);
+    j_float3(dome, "horizon", r->sky_dome_horizon, r->sky_dome_horizon);
+    j_float3(dome, "ground",  r->sky_dome_ground,  r->sky_dome_ground);
+    j_float3(dome, "glow",    r->sky_dome_glow,    r->sky_dome_glow);
+    r->sky_dome_glow_falloff = (float)j_num(dome, "glowFalloff", r->sky_dome_glow_falloff);
+    j_float3(dome, "sunColor", r->sky_dome_sun_color, r->sky_dome_sun_color);
+    r->sky_dome_sun_size     = (float)j_num(dome, "sunSize",     r->sky_dome_sun_size);
+    r->sky_dome_sun_softness = (float)j_num(dome, "sunSoftness", r->sky_dome_sun_softness);
+    r->sky_dome_halo_power   = (float)j_num(dome, "haloPower",   r->sky_dome_halo_power);
+    r->sky_dome_halo_strength= (float)j_num(dome, "haloStrength",r->sky_dome_halo_strength);
+}
 
-    const cJSON *src = cJSON_GetObjectItemCaseSensitive(scene_obj, "rendering");
-    if (!cJSON_IsObject(src))
-        src = cJSON_GetObjectItemCaseSensitive(scene_obj, "lighting");
-    if (!cJSON_IsObject(src))
-        return false;
-
+/* Extract all rendering settings from a "rendering" (or "lighting") cJSON
+ * object.  Seeds from defaults so absent keys keep the golden-hour/neutral
+ * values.  Shared by the full scene parse and the public wrapper below. */
+static JceSceneRenderingSettings extract_rendering_settings_from_obj(
+    const cJSON *src)
+{
     JceSceneRenderingSettings r = jce_scene_rendering_settings_default();
     r.version = (uint32_t)j_num(src, "version", 1.0);
 
@@ -600,6 +653,9 @@ static bool parse_scene_rendering_settings(JceScene *scene,
         r.ssr_enabled      = j_bool(postfx, "ssr", r.ssr_enabled);
         r.ssr_intensity    = (float)j_num(postfx, "ssrIntensity", r.ssr_intensity);
         r.ssr_max_distance = (float)j_num(postfx, "ssrMaxDistance", r.ssr_max_distance);
+        r.taa_feedback     = (float)j_num(postfx, "taaFeedback",    r.taa_feedback);
+        r.taa_luma_clamp   = (float)j_num(postfx, "taaLumaClamp",   r.taa_luma_clamp);
+        r.taa_motion_clamp = (float)j_num(postfx, "taaMotionClamp", r.taa_motion_clamp);
 
         /* Generic custom post pass (engine style-agnostic). */
         r.postfx_enabled[6] = j_bool(postfx, "custom", r.postfx_enabled[6]);
@@ -651,6 +707,8 @@ static bool parse_scene_rendering_settings(JceScene *scene,
         if (cJSON_IsObject(sky)) {
             r.sky_mode      = (int)j_num(sky, "mode", r.sky_mode);
             r.sky_turbidity = (float)j_num(sky, "turbidity", r.sky_turbidity);
+            const cJSON *dome = cJSON_GetObjectItemCaseSensitive(sky, "dome");
+            if (cJSON_IsObject(dome)) parse_dome_into(dome, &r);
         }
         /* Floating origin (opt-in; absent key → disabled default, no change). */
         const cJSON *fo = cJSON_GetObjectItemCaseSensitive(env, "floatingOrigin");
@@ -662,6 +720,59 @@ static bool parse_scene_rendering_settings(JceScene *scene,
         }
     }
 
+    /* Top-level "sky" shortcut: allows partial JSON like {"sky":{"mode":2}}
+     * as input to the public _from_json wrapper without needing the full
+     * "environment" wrapper.  The inner-env path above takes precedence when
+     * the "environment" block is present. */
+    {
+        const cJSON *sky_top = cJSON_GetObjectItemCaseSensitive(src, "sky");
+        if (cJSON_IsObject(sky_top) && !cJSON_GetObjectItemCaseSensitive(src, "environment")) {
+            r.sky_mode      = (int)j_num(sky_top, "mode", r.sky_mode);
+            r.sky_turbidity = (float)j_num(sky_top, "turbidity", r.sky_turbidity);
+            const cJSON *dome = cJSON_GetObjectItemCaseSensitive(sky_top, "dome");
+            if (cJSON_IsObject(dome)) parse_dome_into(dome, &r);
+        }
+    }
+
+    /* ── Look Profile (absent key → r already holds neutral defaults) ─── */
+    const cJSON *look = cJSON_GetObjectItemCaseSensitive(src, "look");
+    if (cJSON_IsObject(look)) {
+        r.wrap_factor        = (float)j_num(look, "wrap", r.wrap_factor);
+        r.ambient_hemisphere = j_bool(look, "hemisphere", r.ambient_hemisphere);
+        j_float3(look, "groundColor", r.ambient_ground_color,
+                 r.ambient_ground_color);
+        j_float3(look, "rimColor", r.rim_color, r.rim_color);
+        r.rim_power     = (float)j_num(look, "rimPower", r.rim_power);
+        r.rim_intensity = (float)j_num(look, "rimIntensity", r.rim_intensity);
+        r.tonemap_op    = (int)j_num(look, "tonemapOp", r.tonemap_op);
+        const cJSON *lp = cJSON_GetObjectItemCaseSensitive(look, "lutPath");
+        if (cJSON_IsString(lp) && lp->valuestring) {
+            size_t i = 0;
+            for (; lp->valuestring[i] && i + 1 < sizeof(r.lut_path); i++)
+                r.lut_path[i] = lp->valuestring[i];
+            r.lut_path[i] = '\0';
+        }
+        r.lut_strength   = (float)j_num(look, "lutStrength", r.lut_strength);
+        r.toon_character = j_bool(look, "toonCharacter", r.toon_character);
+        r.bloom_knee     = (float)j_num(look, "bloomKnee", r.bloom_knee);
+    }
+
+    return r;
+}
+
+static bool parse_scene_rendering_settings(JceScene *scene,
+                                           const cJSON *root)
+{
+    const cJSON *scene_obj = scene_root_object(root);
+    if (!scene_obj) return false;
+
+    const cJSON *src = cJSON_GetObjectItemCaseSensitive(scene_obj, "rendering");
+    if (!cJSON_IsObject(src))
+        src = cJSON_GetObjectItemCaseSensitive(scene_obj, "lighting");
+    if (!cJSON_IsObject(src))
+        return false;
+
+    JceSceneRenderingSettings r = extract_rendering_settings_from_obj(src);
     jce_scene_set_rendering_settings(scene, &r);
     return true;
 }
@@ -761,6 +872,34 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     const char *mp = j_str_any(c, mk, 3);
     const char *mt = j_str_any(c, matk, 3);
     if (mp) copy_str(mr.mesh_path, sizeof(mr.mesh_path), mp);
+    /* Normalize absolute mesh paths saved by the editor
+     * (e.g. "D:/.../resources/assets\models\...") to the PAK-relative
+     * forward-slash key so jce_pak_find can look them up at runtime. */
+    if (jce_path_is_absolute(mr.mesh_path)) {
+        char norm[sizeof(mr.mesh_path)];
+        jce_path_to_canonical(norm, sizeof(norm), mr.mesh_path);
+        static const char *const s_markers[] = {
+            "resources/assets/", "resources/_cooked/", NULL
+        };
+        static const char *const s_tops[] = {
+            "/models/", "/scenes/", "/shaders/", "/fonts/",
+            "/i18n/", "/audio/", "/prefabs/", "/anim/",
+            "/textures/", NULL
+        };
+        const char *rel = NULL;
+        for (int mi = 0; s_markers[mi] && !rel; mi++) {
+            const char *p = strstr(norm, s_markers[mi]);
+            if (p) rel = p + strlen(s_markers[mi]);
+        }
+        if (!rel) {
+            for (int ti = 0; s_tops[ti] && !rel; ti++) {
+                const char *p = strstr(norm, s_tops[ti]);
+                if (p) rel = p + 1;   /* skip the leading '/' */
+            }
+        }
+        if (rel && rel[0])
+            copy_str(mr.mesh_path, sizeof(mr.mesh_path), rel);
+    }
     if (mt) copy_str(mr.material_path, sizeof(mr.material_path), mt);
     mr.mesh_shape       = (int)j_num(c, "meshShape", 0);
     mr.base_color[0]    = (float)j_num(c, "baseColorR", 1.0);
@@ -786,6 +925,17 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     copy_str(mr.normal_tex,   sizeof(mr.normal_tex),   j_str(c, "normalTex",   ""));
     copy_str(mr.ao_tex,       sizeof(mr.ao_tex),       j_str(c, "aoTex",       ""));
     copy_str(mr.emissive_tex, sizeof(mr.emissive_tex), j_str(c, "emissiveTex", ""));
+    mr.toon           = j_bool(c, "toon", false);
+    mr.toon_bands     = (int)j_num(c, "toonBands", 0);
+    mr.rim_power      = (float)j_num(c, "toonRimPower", 0.0);
+    mr.rim_intensity  = (float)j_num(c, "toonRimIntensity", 0.0);
+    mr.rim_color[0]   = (float)j_num(c, "toonRimColorR", 0.0);
+    mr.rim_color[1]   = (float)j_num(c, "toonRimColorG", 0.0);
+    mr.rim_color[2]   = (float)j_num(c, "toonRimColorB", 0.0);
+    mr.outline_width  = (float)j_num(c, "toonOutlineWidth", 0.0);
+    mr.outline_color[0] = (float)j_num(c, "toonOutlineColorR", 0.0);
+    mr.outline_color[1] = (float)j_num(c, "toonOutlineColorG", 0.0);
+    mr.outline_color[2] = (float)j_num(c, "toonOutlineColorB", 0.0);
 
     /* If a .mat.json material is referenced and no per-entity texture
      * overrides exist, backfill texture paths from the material file.
@@ -2133,6 +2283,33 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     return arr;
 }
 
+/* ── Public rendering-settings JSON wrappers ───────────────────────
+ * Thin TDD seam used by unit tests and offline tools.  The to_json
+ * output is the "rendering" object (same as what the scene serializer
+ * embeds under scene.rendering).  from_json seeds from defaults so
+ * absent dome / sky keys land on the golden-hour values. */
+
+char *jce_scene_rendering_settings_to_json(const JceSceneRenderingSettings *r)
+{
+    if (!r) return NULL;
+    cJSON *obj = ser_scene_rendering_settings(r);
+    if (!obj) return NULL;
+    char *s = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    return s;
+}
+
+bool jce_scene_rendering_settings_from_json(const char *json,
+                                            JceSceneRenderingSettings *out)
+{
+    if (!json || !out) return false;
+    cJSON *obj = cJSON_Parse(json);
+    if (!obj) return false;
+    *out = extract_rendering_settings_from_obj(obj);
+    cJSON_Delete(obj);
+    return true;
+}
+
 /* ── Component registry registration (the single site) ─────────────
  *
  * Every engine component gets a registry row: canonical JSON "type"
@@ -2208,6 +2385,7 @@ REG_ACCESSORS(ragdoll, JceRagdollComponent)
 REG_ACCESSORS(fracture, JceFractureComponent)
 REG_ACCESSORS(vehicle, JceVehicleComponent)
 REG_ACCESSORS(soft_body, JceSoftBodyComponent)
+REG_ACCESSORS(sim_lod, JceSimLodComponent)
 REG_ACCESSORS(network_variable, JceNetworkVariableComponent)
 REG_ACCESSORS(gas, JceGameplayAbilitySystemComponent)
 REG_ACCESSORS(script, JceScriptComponent)
@@ -2215,6 +2393,7 @@ REG_ACCESSORS(constraint, JceConstraintComponent)
 REG_ACCESSORS(terrain, JceTerrainComponent)
 REG_ACCESSORS(vegetation_scatter, JceVegetationScatterComponent)
 REG_ACCESSORS(water, JceWaterComponent)
+REG_ACCESSORS(grass_field, JceGrassFieldComponent)
 REG_ACCESSORS(buoyancy, JceBuoyancyComponent)
 REG_ACCESSORS(lod_group, JceLodGroupComponent)
 REG_ACCESSORS(virtual_camera, JceVirtualCameraComponent)
@@ -2486,6 +2665,12 @@ void jce_scene_components_register_all(void)
         parse_soft_body, serw_soft_body,
         reg_get_soft_body, reg_set_soft_body, sizeof(JceSoftBodyComponent));
 
+    REG("SimLod", "simLod", "Simulation LOD", "sim_lod",
+        0,
+        jce_scene_has_sim_lod, jce_scene_remove_sim_lod,
+        parse_sim_lod, serw_sim_lod,
+        reg_get_sim_lod, reg_set_sim_lod, sizeof(JceSimLodComponent));
+
     REG("NetworkVariable", "networkVariable", "Network Variable", "network_variable",
         0,
         jce_scene_has_network_variable, jce_scene_remove_network_variable,
@@ -2530,6 +2715,14 @@ void jce_scene_components_register_all(void)
         parse_water, serw_water,
         reg_get_water, reg_set_water,
         sizeof(JceWaterComponent));
+
+    /* Post-64 row (no legacy flag bit): id/name addressing only. */
+    REG("GrassField", "grassField", NULL, NULL,
+        0,
+        jce_scene_has_grass_field, jce_scene_remove_grass_field,
+        parse_grass_field, serw_grass_field,
+        reg_get_grass_field, reg_set_grass_field,
+        sizeof(JceGrassFieldComponent));
 
     /* Post-64 row (no legacy flag bit): id/name addressing only. */
     REG("Buoyancy", "buoyancy", NULL, NULL,

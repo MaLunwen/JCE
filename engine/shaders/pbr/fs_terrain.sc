@@ -2,6 +2,7 @@ $input v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v
 
 #include <bgfx_shader.sh>
 #include "pbr_common.sh"
+#include "fog_apply.sh"
 
 // Material uniforms
 uniform vec4 u_baseColorFactor;
@@ -10,6 +11,14 @@ uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 
 uniform vec4 u_cameraPos;       // xyz=world-space camera position
 uniform vec4 u_normalScale;     // x=normal map scale (x<0 => checker fallback), y=doubleSided flag
 uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
+
+// ── Stylized Look Profile (consumed; uploaded by renderer, plan-02).
+//   u_lookWrap = {wrap_factor, rim_power, rim_intensity, toonFlag}
+//   u_lookRim  = {rim_color.rgb, pad}
+//   u_lookHemiGround = {ambient_ground_color.rgb, hemi_enabled}
+uniform vec4 u_lookWrap;
+uniform vec4 u_lookRim;
+uniform vec4 u_lookHemiGround;
 
 // Light uniforms
 // Directional lights: 2 vec4 per light, max 2 lights = 4 vec4
@@ -93,6 +102,14 @@ SAMPLER2D(s_layer2,   15);
 // u_terrainParams.x = layer tile scale (UV multiplier for per-layer albedo)
 // u_terrainParams.y = splat enabled (1 = sample splat, 0 = layer0 only)
 uniform vec4 u_terrainParams;
+
+// Per-tile splat UV remap (large-world #4): for a streamed/tiled terrain the
+// splat map is a PER-TILE texture, so the global terrain UV (v_texcoord0, 0..1
+// over the whole extent) must be mapped into the bound tile's local [0..1].
+//   splatUV = (v_texcoord0 - u_terrainTileUV.xy) * u_terrainTileUV.zw
+// xy = tile UV origin, zw = tile UV scale.  Monolithic terrains set {0,0,1,1}
+// so the remap is identity (byte-identical sampling).
+uniform vec4 u_terrainTileUV;
 
 // Convert NDC depth to [0,1] range for shadow comparison.
 // OpenGL (GLSL): NDC z is in [-1,1], needs remap.
@@ -388,7 +405,8 @@ void main()
 
     vec4 splat = vec4(1.0, 0.0, 0.0, 0.0);
     if (u_terrainParams.y > 0.5) {
-        splat = texture2D(s_splatMap, v_texcoord0);
+        vec2 splatUV = (v_texcoord0 - u_terrainTileUV.xy) * u_terrainTileUV.zw;
+        splat = texture2D(s_splatMap, splatUV);
         // Re-normalize (guard against unweighted authoring or all-zero pixels).
         float wsum = splat.r + splat.g + splat.b + splat.a;
         if (wsum > 0.0001) splat /= wsum;
@@ -460,7 +478,7 @@ void main()
 
         vec3 radiance = lightColor * intensity;
         float lightShadow = (abs(float(i) - float(shadowDirIndex)) < 0.5) ? shadow : 1.0;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * lightShadow;
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance * lightShadow;
     }
 
     // --- Point lights ---
@@ -483,7 +501,7 @@ void main()
         attenuation *= attenuation;
 
         vec3 radiance = lightColor * intensity * attenuation;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
     }
 
     // --- Spot lights ---
@@ -514,7 +532,7 @@ void main()
         float cone = clamp((theta - outerCos) / max(epsilon, 0.0001), 0.0, 1.0);
 
         vec3 radiance = lightColor * intensity * attenuation * cone;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
     }
 
     // --- Ambient (IBL or flat) ---
@@ -544,7 +562,21 @@ void main()
     }
     else
     {
-        ambient = u_ambientColor.xyz * u_ambientColor.w * albedo * ao;
+        // Two-color hemisphere (sky=u_ambientColor top, ground=u_lookHemiGround
+        // bottom) by world N.y. hemi_enabled==0 => collapses to flat ambient.
+        vec3 skyAmbient = u_ambientColor.xyz * u_ambientColor.w;
+        float h = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+        vec3 hemiColor = mix(u_lookHemiGround.xyz, skyAmbient, h);
+        vec3 ambientColor = mix(skyAmbient, hemiColor, u_lookHemiGround.w);
+        ambient = ambientColor * albedo * ao;
+    }
+
+    // --- World-space rim / fresnel (stylized silhouette separation) ---
+    {
+        float NdotV_r = clamp(dot(N, V), 0.0, 1.0);
+        float rim = pow(1.0 - NdotV_r, u_lookWrap.y);
+        rim *= smoothstep(0.0, 0.25, max(dot(N, toLightDir), 0.0));
+        ambient += u_lookRim.xyz * (u_lookWrap.z * rim);
     }
 
     // --- Emissive (terrain: none; slot 4 is reused as layer3 albedo) ---
@@ -552,6 +584,10 @@ void main()
 
     // --- Final color ---
     vec3 color = ambient + Lo + emissive;
+
+    // --- Aerial-perspective fog (linear, before gamma) ---
+    color = apply_aerial_fog(color, v_viewdepth, v_worldpos,
+                             u_cameraPos.xyz, toLightDir);
 
     // --- Gamma correction (linear -> sRGB) ---
     // When postfx tonemap is enabled, keep linear output for post-processing.

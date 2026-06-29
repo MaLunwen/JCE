@@ -14,9 +14,11 @@
 extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_renderer.h>   /* jce_renderer_readback_capture_submit */
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_views.h>
 }
+#include <stdio.h>   /* snprintf */
 
 #define LOG_TAG "imgui_renderer"
 
@@ -31,6 +33,44 @@ static struct {
 } s_ctx;
 
 /* Ortho projection now delegates to engine API (jce_m4_ortho). */
+
+/* ── Whole-window capture (F12 screenshot / F9 recording) ────────────────────
+ * The D3D flip-model swap chain cannot be screen-shot reliably: bgfx presents
+ * one buffer but bgfx_request_screen_shot resolves the discarded one, so the
+ * backbuffer capture comes back BLACK (reproduced: avg_lum=0).  Instead, on a
+ * capture frame we render the ImGui view into an offscreen RGBA16F FBO and read
+ * THAT back on the next frame via the proven jce_renderer_readback path (a pure
+ * GPU->CPU copy, immune to flip-model / focus).  Cost: the captured frame shows
+ * one black backbuffer (the UI went to the FBO) — imperceptible for a snapshot. */
+static struct {
+    bool                       request;          /* a capture was asked for         */
+    bool                       readback_pending; /* FBO rendered; read it next frame */
+    char                       path[512];
+    bgfx_frame_buffer_handle_t fb;
+    bgfx_texture_handle_t      tex;              /* fb colour attachment (blit src) */
+    uint16_t                   w, h;
+} s_cap = { false, false, { 0 }, { UINT16_MAX }, { UINT16_MAX }, 0, 0 };
+
+extern "C" void jce_imgui_renderer_request_capture(const char *path)
+{
+    if (!path || !path[0] || s_cap.request || s_cap.readback_pending)
+        return;
+    snprintf(s_cap.path, sizeof s_cap.path, "%s", path);
+    s_cap.request = true;
+}
+
+/* ── Whole-window video recording (F9) ───────────────────────────────────────
+ * While active, the UI is rendered a SECOND time into an offscreen FBO (view+1),
+ * which is read back each frame into the video sink as BGRA8.  The normal
+ * backbuffer pass (view) is untouched, so the editor display stays live. */
+static struct {
+    bool                       active;
+    bgfx_frame_buffer_handle_t fb;
+    bgfx_texture_handle_t      tex;
+    uint16_t                   w, h;
+} s_rec = { false, { UINT16_MAX }, { UINT16_MAX }, 0, 0 };
+
+extern "C" void jce_imgui_renderer_set_recording(bool on) { s_rec.active = on; }
 
 /* ── Dynamic textures (ImGui 1.92 RendererHasTextures) ──────────────────
  * ImGui 1.92 owns the font atlas as one or more ImTextureData objects and
@@ -205,7 +245,45 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
 {
     if (!s_ctx.initialized) return;
 
-    bgfx_set_view_clear(s_ctx.view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    /* ── Whole-window capture state machine (see s_cap) ──────────────────
+     * Default: render ImGui to the backbuffer (display path, unchanged).
+     * Capture frame: render to an offscreen FBO instead, then read it back
+     * the following frame (the FBO holds the fully-composited UI). */
+    bgfx_frame_buffer_handle_t target     = { UINT16_MAX };   /* backbuffer */
+    uint16_t                   clear_flags = BGFX_CLEAR_NONE;
+    uint32_t                   clear_rgba  = 0;
+
+    if (s_cap.readback_pending) {
+        /* Last frame rendered the UI into s_cap.fb; it is complete now. Blit it
+         * into a READ_BACK staging texture and read it back to a PNG.  The blit
+         * is ordered on the imgui view; the FBO is not written this frame, so
+         * there is no read/write hazard.  This frame renders to the backbuffer. */
+        jce_renderer_readback_capture_submit(s_cap.tex.idx, s_ctx.view_id,
+                                             s_cap.w, s_cap.h, s_cap.path);
+        s_cap.readback_pending = false;
+    } else if (s_cap.request) {
+        if (s_cap.fb.idx == UINT16_MAX || s_cap.w != width || s_cap.h != height) {
+            if (s_cap.fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s_cap.fb);
+            /* RGBA16F so the existing readback (RGBA16F staging -> RGBA8) applies. */
+            s_cap.tex = bgfx_create_texture_2d(width, height, false, 1,
+                BGFX_TEXTURE_FORMAT_RGBA16F,
+                BGFX_TEXTURE_RT |
+                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+            bgfx_texture_handle_t ths[1] = { s_cap.tex };
+            s_cap.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
+            s_cap.w = width; s_cap.h = height;
+        }
+        if (BGFX_HANDLE_IS_VALID(s_cap.fb)) {
+            target                 = s_cap.fb;
+            clear_flags            = BGFX_CLEAR_COLOR;
+            clear_rgba             = 0x1e1e1effu;  /* editor bg behind any UI gaps */
+            s_cap.readback_pending = true;         /* read it back next frame      */
+        }
+        s_cap.request = false;
+    }
+
+    bgfx_set_view_frame_buffer(s_ctx.view_id, target);
+    bgfx_set_view_clear(s_ctx.view_id, clear_flags, clear_rgba, 1.0f, 0);
     bgfx_set_view_rect(s_ctx.view_id, 0, 0, width, height);
     bgfx_set_view_mode(s_ctx.view_id, BGFX_VIEW_MODE_SEQUENTIAL);
 
@@ -218,6 +296,27 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
         caps->homogeneousDepth);
 
     bgfx_set_view_transform(s_ctx.view_id, NULL, &ortho);
+
+    /* Recording: set up the parallel offscreen pass (view+1 -> s_rec.fb).  The
+     * draws are double-submitted there in jce_imgui_renderer_draw, and the FBO is
+     * read back into the video sink.  Display path (view, above) is unchanged. */
+    if (s_rec.active) {
+        if (s_rec.fb.idx == UINT16_MAX || s_rec.w != width || s_rec.h != height) {
+            if (s_rec.fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s_rec.fb);
+            s_rec.tex = bgfx_create_texture_2d(width, height, false, 1,
+                BGFX_TEXTURE_FORMAT_RGBA16F,
+                BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+            bgfx_texture_handle_t ths[1] = { s_rec.tex };
+            s_rec.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
+            s_rec.w = width; s_rec.h = height;
+        }
+        const uint16_t rv = (uint16_t)(s_ctx.view_id + 1);
+        bgfx_set_view_frame_buffer(rv, s_rec.fb);
+        bgfx_set_view_clear(rv, BGFX_CLEAR_COLOR, 0x1e1e1effu, 1.0f, 0);
+        bgfx_set_view_rect(rv, 0, 0, width, height);
+        bgfx_set_view_mode(rv, BGFX_VIEW_MODE_SEQUENTIAL);
+        bgfx_set_view_transform(rv, NULL, &ortho);
+    }
 }
 
 void jce_imgui_renderer_draw(void)
@@ -248,23 +347,39 @@ void jce_imgui_renderer_draw(void)
         uint32_t num_vertices = (uint32_t)cmd_list->VtxBuffer.Size;
         uint32_t num_indices  = (uint32_t)cmd_list->IdxBuffer.Size;
 
-        /* Check transient buffer availability. */
-        uint32_t avail_vtx =
-            bgfx_get_avail_transient_vertex_buffer(
-                num_vertices, &s_ctx.vertex_layout);
-        uint32_t avail_idx =
-            bgfx_get_avail_transient_index_buffer(
-                num_indices, sizeof(ImDrawIdx) == 4);
-
-        if (avail_vtx < num_vertices || avail_idx < num_indices)
-            break;
-
+        /* Allocate BOTH transient buffers via bgfx's combined atomic helper.
+         *
+         * Root cause of the streaming-churn crash (ACCESS_VIOLATION surfacing in
+         * cJSON_malloc = heap corruption from a write elsewhere): the previous
+         * code checked vertex + index availability with two SEPARATE
+         * bgfx_get_avail_transient_*_buffer calls, then issued two SEPARATE
+         * bgfx_alloc_transient_*_buffer calls.  The per-frame transient buffers
+         * are a single fixed-size pool (bgfx default 6 MiB, shared by the scene
+         * renderer's instancing/debug-draw AND ImGui).  When a large editor UI
+         * (the World-Streaming hierarchy with 200+ chunk groups, churning as
+         * cells load/unload) drove the ImGui geometry near that limit, the avail
+         * check could report a full fit while the subsequent alloc, after the
+         * intervening index alloc advanced the SHARED offset and stride-alignment
+         * rounded it up, granted a buffer that ended right at the pool boundary —
+         * and the memcpy of the full requested size then wrote a few hundred
+         * bytes (ASAN: a 4880-byte / 244-vertex WRITE) past the 6 MiB transient
+         * vertex buffer, corrupting the heap.  The corruption only faulted on the
+         * NEXT allocator call (often the streamer's cJSON parse), which is why the
+         * crash top was misleadingly cJSON_malloc.
+         *
+         * bgfx_alloc_transient_buffers (the same helper bgfx's own ImGui example
+         * uses) takes the resource lock ONCE and only allocates if the FULL vertex
+         * AND index counts both fit exactly; otherwise it returns false and
+         * touches nothing.  So the memcpy below can never exceed the granted
+         * buffers.  When it can't satisfy this cmd-list we stop (a partial copy
+         * would index past the grant anyway) — a few dropped UI tris for one
+         * frame under extreme load, never a heap overwrite. */
         bgfx_transient_vertex_buffer_t tvb;
         bgfx_transient_index_buffer_t  tib;
-        bgfx_alloc_transient_vertex_buffer(
-            &tvb, num_vertices, &s_ctx.vertex_layout);
-        bgfx_alloc_transient_index_buffer(
-            &tib, num_indices, sizeof(ImDrawIdx) == 4);
+        if (!bgfx_alloc_transient_buffers(
+                &tvb, &s_ctx.vertex_layout, num_vertices,
+                &tib, num_indices, sizeof(ImDrawIdx) == 4))
+            break;   /* transient pool exhausted this frame — stop cleanly */
 
         memcpy(tvb.data, cmd_list->VtxBuffer.Data,
                num_vertices * sizeof(ImDrawVert));
@@ -321,11 +436,23 @@ void jce_imgui_renderer_draw(void)
                 num_vertices - pcmd->VtxOffset);
             bgfx_set_transient_index_buffer(
                 &tib, pcmd->IdxOffset, pcmd->ElemCount);
-            bgfx_submit(
-                s_ctx.view_id, s_ctx.program,
-                0, BGFX_DISCARD_ALL);
+            if (s_rec.active) {
+                /* Display pass (keep bound state) + recording pass into the FBO. */
+                bgfx_submit(s_ctx.view_id, s_ctx.program, 0, BGFX_DISCARD_NONE);
+                bgfx_submit((uint16_t)(s_ctx.view_id + 1), s_ctx.program,
+                            0, BGFX_DISCARD_ALL);
+            } else {
+                bgfx_submit(s_ctx.view_id, s_ctx.program, 0, BGFX_DISCARD_ALL);
+            }
         }
     }
+
+    /* Recording: read the offscreen UI FBO back into the video sink (BGRA8).
+       One read-back in flight; if busy this frame is skipped (the encoder
+       reorders by timestamp, so a dropped frame just lowers the capture rate). */
+    if (s_rec.active && BGFX_HANDLE_IS_VALID(s_rec.fb))
+        jce_renderer_readback_capture_submit_sink(
+            s_rec.tex.idx, (uint16_t)(s_ctx.view_id + 2), s_rec.w, s_rec.h);
 }
 
 void jce_imgui_renderer_rebuild_fonts(void)

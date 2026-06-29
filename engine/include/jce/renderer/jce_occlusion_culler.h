@@ -130,11 +130,23 @@ JCE_API bool jce_occlusion_culler_entity_visible(JceOcclusionCuller *oc,
 /* Submit the AABB proxy draw + occlusion query for the current frame.
    Call this after (or instead of) submitting the real entity draw.
    ALWAYS call this — even for occluded entities — so visibility can
-   recover when the entity becomes unoccluded. */
+   recover when the entity becomes unoccluded.
+
+   center       — WORLD-space centre of the entity's AABB (model-local AABB
+                  centre transformed by the entity world matrix).  NOT the
+                  entity origin: a mesh whose geometry is offset from its
+                  pivot (e.g. a building modelled +Y up from its base) would
+                  otherwise get a proxy box floating off the real geometry.
+   half_extents — WORLD-space AABB half-extents (per axis).  Derived from the
+                  model's LOCAL AABB scaled by the entity scale, so the proxy
+                  cube matches the real silhouette.  A flat cube sized off a
+                  single scale value both misses tall/flat geometry (under-
+                  covers → false occlusion of things peeking past it) and over-
+                  covers thin geometry (the box pokes out → never occluded). */
 JCE_API void jce_occlusion_culler_submit_query(JceOcclusionCuller *oc,
                                                 uint64_t            entity_id,
                                                 jce_vec3            center,
-                                                float               radius);
+                                                jce_vec3            half_extents);
 
 /* Retrieve per-frame stats (call after entity loop). */
 JCE_API JceOcclusionStats jce_occlusion_culler_get_stats(
@@ -143,6 +155,39 @@ JCE_API JceOcclusionStats jce_occlusion_culler_get_stats(
 /* Returns true if this culler is operational (hardware queries supported).
    When false, entity_visible() always returns true. */
 JCE_API bool jce_occlusion_culler_is_active(const JceOcclusionCuller *oc);
+
+/* The bgfx view ID this culler submits its depth-only proxy queries to.
+   The scene renderer must drive (set_view_transform) THIS view so the proxy
+   draws share the main camera.  Lets two cullers (e.g. editor scene-view +
+   game-view, which share one engine renderer and one bgfx frame) use distinct
+   views and never clobber each other's proxy pass.  Returns 254 (the default)
+   when oc is NULL. */
+JCE_API uint16_t jce_occlusion_culler_get_view_id(const JceOcclusionCuller *oc);
+
+/* Bind the depth-only proxy view to the SAME framebuffer the scene's color +
+   depth pass renders into, and give it the matching viewport rect.  This is THE
+   correctness seam for offscreen render paths: the proxy boxes' depth test
+   (DEPTH_TEST_LEQUAL, WRITE_Z) must run against the depth buffer the color pass
+   actually filled.  When the scene draws into an offscreen target (editor
+   scene-/game-view bridge FBO, or the runtime postfx offscreen target), the
+   proxy view defaulting to the backbuffer tests a STALE/empty depth buffer →
+   the queries either pass everything (occlusion inert) or drop visible geometry
+   (false-culling).
+
+   fbo_idx : bgfx_frame_buffer_handle_t .idx of the scene FBO.  Pass UINT16_MAX
+             (BGFX_INVALID_HANDLE) for the direct-to-backbuffer path (runtime
+             without postfx) — the proxy then tests the backbuffer depth, which
+             is exactly where that path's color pass wrote.
+   x,y,w,h : the proxy view rect, matching the color pass's viewport.  w/h of 0
+             leaves the rect untouched (caller already set it).
+
+   Call once per frame, BEFORE submit_query (which only encodes draws).  The
+   proxy view id is > the color view id, so bgfx orders it AFTER the color pass
+   and the depth it reads is the current frame's. */
+JCE_API void jce_occlusion_culler_bind_target(JceOcclusionCuller *oc,
+                                              uint16_t fbo_idx,
+                                              uint16_t x, uint16_t y,
+                                              uint16_t w, uint16_t h);
 
 JCE_EXTERN_C_END
 

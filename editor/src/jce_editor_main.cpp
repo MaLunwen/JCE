@@ -28,6 +28,8 @@ extern "C" {
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_scene_renderer.h>
 }
 
@@ -129,6 +131,22 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
+
+    /* Editor authoring default: float the render pipeline to at least HIGH so the
+     * stylized look (toon shading, 5-mip bloom, stylized sky dome, wrap/rim look
+     * profile) is actually visible while authoring.  GPU-tier auto-detection is
+     * conservative — it lands on MEDIUM for many D3D11 desktop GPUs, and MEDIUM/LOW
+     * gate toon OFF, degrade bloom to 0 mips, and (at LOW) collapse the look profile
+     * + sky to neutral/PREETHAM UPSTREAM of the postfx grade, so scenes render
+     * grey/dim regardless of their authored look/postfx.  An ULTRA detection is left
+     * untouched; the user can still pick any tier from the status bar (it re-applies). */
+    if (jce_renderer_get_tier() < JCE_GPU_TIER_HIGH)
+        jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
+    {
+        JceRenderPipelineDesc rpd;
+        jce_render_pipeline_preset_for_current_tier(&rpd);
+        jce_render_pipeline_apply(&rpd);
+    }
 
     /* ── Splash frame (G) ─────────────────────────────────────────────
        Submit a single themed-colour frame BEFORE the heavy init work

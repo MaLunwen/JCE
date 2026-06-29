@@ -784,8 +784,10 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
 
     /* Fresh world-matrix cache generation for the pick pass so picking reads
        transforms as they are now (the pick pass may be invoked independently
-       of the main scene render that normally bumps the cache). */
-    jce_scene_invalidate_world_cache(scene);
+       of the main scene render that normally bumps the cache).  Per-frame, not
+       a structural edit → non-structural drop so the renderer's persistent
+       static cache is not invalidated merely because the user clicked. */
+    jce_scene_begin_render_world_cache(scene);
 
     const float aspect = pass->height > 0
         ? (float)pass->width / (float)pass->height

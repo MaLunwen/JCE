@@ -155,6 +155,10 @@ JCE_API void JCE_CALL jce_physics_body_set_transform(JcePhysicsWorld *world, Jce
 JCE_API bool     jce_physics_body_is_dynamic(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API void     jce_physics_body_set_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
+/* Sleep (active=false: DISABLE_SIMULATION + zero velocity) or wake (active=true)
+ * a body — used by the runtime's sim-LOD physics gating to stop the solver from
+ * integrating far-tier actors.  Forced: a slept body stays asleep until woken. */
+JCE_API void     jce_physics_body_set_active(JcePhysicsWorld *world, JceBodyHandle body, bool active);
 
 JCE_API jce_vec3 jce_physics_body_get_angular_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API void     jce_physics_body_set_angular_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);

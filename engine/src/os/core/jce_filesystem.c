@@ -11,6 +11,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>   /* JceMutex — PhysFS is process-global + NOT thread-safe */
 
 #include "jce_memory.h"
 
@@ -22,6 +23,20 @@
 /* PAK read provider, registered by the resource layer at boot (dependency
  * inversion — os/core no longer includes resource/jce_pak_loader.h). */
 static const JceFsPakProvider *s_pak_provider = NULL;
+
+/* PhysFS has process-global state (mount search path, open-handle list, error
+ * code) and is explicitly NOT thread-safe.  The async world streamer + asset
+ * loaders call jce_fs_open/read/close from worker threads concurrently, which
+ * races PhysFS internals and corrupts the heap — manifesting as a wild-pointer
+ * ACCESS_VIOLATION at the next allocation (e.g. inside cJSON during a chunk
+ * parse).  Serialize ALL VFS access through one global lock, created on the
+ * first jce_fs_create (main thread, before any worker runs) and intentionally
+ * never destroyed (avoids a teardown use-after-free; a single leaked mutex).
+ * Each PhysFS call is fully atomic under the lock; distinct JceFile handles are
+ * independent, so interleaving open/read/close across threads is safe. */
+static JceMutex *s_fs_mutex = NULL;
+static inline void fs_lock(void)   { if (s_fs_mutex) jce_mutex_lock(s_fs_mutex); }
+static inline void fs_unlock(void) { if (s_fs_mutex) jce_mutex_unlock(s_fs_mutex); }
 
 void JCE_CALL jce_fs_set_pak_provider(const JceFsPakProvider *provider)
 {
@@ -90,6 +105,10 @@ JceFileSystem *jce_fs_create(void)
 {
     JceFileSystem *fs = JCE_NEW(JceFileSystem);
     if (!fs) return NULL;
+
+    /* Create the global VFS lock once, here on the main thread, before any
+     * streamer/asset worker can call into PhysFS. */
+    if (!s_fs_mutex) s_fs_mutex = jce_mutex_create();
 
     if (!PHYSFS_isInit()) {
         if (!PHYSFS_init(NULL)) {
@@ -294,20 +313,26 @@ JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return NULL;
 
-    /* PhysFS first (developer override via mounted dirs/archives). */
+    /* PhysFS first (developer override via mounted dirs/archives), then PAKs.
+     * The whole lookup runs under the VFS lock: PHYSFS_openRead and the PAK
+     * decompress path are both non-thread-safe and are called concurrently from
+     * streamer/asset worker threads. */
+    fs_lock();
     JceFile *f = try_open_physfs(virtual_path);
-    if (f) return f;
-
-    return try_open_pak(fs, virtual_path);
+    if (!f) f = try_open_pak(fs, virtual_path);
+    fs_unlock();
+    return f;
 }
 
 void jce_fs_close(JceFile *file)
 {
     if (!file) return;
     if (file->kind == JCE_FILE_PHYSFS) {
+        fs_lock();
         PHYSFS_close(file->u.physfs.handle);
+        fs_unlock();
     } else {
-        JCE_FREE(file->u.pak.data);
+        JCE_FREE(file->u.pak.data);   /* PAK file owns a private buffer — no lock */
     }
     JCE_FREE(file);
 }
@@ -317,8 +342,10 @@ uint64_t jce_fs_read(JceFile *file, void *buf, uint64_t buf_size)
     if (!file || !buf || buf_size == 0) return 0;
 
     if (file->kind == JCE_FILE_PHYSFS) {
+        fs_lock();
         PHYSFS_sint64 n = PHYSFS_readBytes(file->u.physfs.handle,
                                            buf, (PHYSFS_uint64)buf_size);
+        fs_unlock();
         return (n > 0) ? (uint64_t)n : 0;
     }
 
@@ -371,20 +398,23 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return false;
 
-    /* Check PhysFS search path. */
-    if (PHYSFS_exists(virtual_path))
-        return true;
-
-    /* Check every mounted PAK (via the registered provider). */
-    const JceFsPakProvider *prov = s_pak_provider;
-    if (prov && prov->find) {
-        for (uint32_t i = 0; i < fs->pak_count; ++i) {
-            if (fs->paks[i].pak &&
-                prov->find(fs->paks[i].pak, virtual_path) != NULL)
-                return true;
+    fs_lock();
+    /* Check PhysFS search path, then every mounted PAK (via the provider). */
+    bool found = PHYSFS_exists(virtual_path) ? true : false;
+    if (!found) {
+        const JceFsPakProvider *prov = s_pak_provider;
+        if (prov && prov->find) {
+            for (uint32_t i = 0; i < fs->pak_count; ++i) {
+                if (fs->paks[i].pak &&
+                    prov->find(fs->paks[i].pak, virtual_path) != NULL) {
+                    found = true;
+                    break;
+                }
+            }
         }
     }
-    return false;
+    fs_unlock();
+    return found;
 }
 
 /* ================================================================== */

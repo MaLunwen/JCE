@@ -233,3 +233,22 @@ void jce_camera_look_at(JceCamera *cam, jce_vec3 target)
     if (cam->pitch >  MAX_PITCH) cam->pitch =  MAX_PITCH;
     if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
 }
+
+void jce_camera_third_person_follow(JceCamera *cam, jce_vec3 target)
+{
+    if (!cam) return;
+    /* Orbit direction = the camera's current horizontal forward, so mouse-look
+     * (which changes yaw) rotates the rig around the character. */
+    jce_vec3 fwd  = jce_camera_get_forward(cam);
+    float    hlen = sqrtf(fwd.x * fwd.x + fwd.z * fwd.z);
+    jce_vec3 hf   = (hlen > 1e-4f) ? jce_v3(fwd.x / hlen, 0.0f, fwd.z / hlen)
+                                   : jce_v3(0.0f, 0.0f, -1.0f);
+    jce_vec3 cam_pos  = jce_v3(target.x - hf.x * 7.0f,
+                              target.y + 3.0f,
+                              target.z - hf.z * 7.0f);
+    jce_vec3 look_tgt = jce_v3(target.x + hf.x * 14.0f,
+                              target.y + 1.6f,
+                              target.z + hf.z * 14.0f);
+    jce_camera_set_position(cam, cam_pos);
+    jce_camera_look_at(cam, look_tgt);
+}

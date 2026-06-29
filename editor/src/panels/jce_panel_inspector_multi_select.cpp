@@ -17,6 +17,10 @@
 
 #include "jce_panel_inspector_common.h"
 
+#include <algorithm>   /* std::sort (align/distribute) */
+#include <utility>     /* std::pair */
+#include <vector>
+
 bool insp_draw_multi_select_view(JceScene *scene)
 {
     int             sel_count = 0;
@@ -188,6 +192,86 @@ bool insp_draw_multi_select_view(JceScene *scene)
                     if (t) { t->scale.x = t->scale.y = t->scale.z = 1.0f; }
                 }
                 jce_state_end_batch_edit();
+            }
+
+            /* ── Align & Distribute (scene-design coverage) ──────────────────
+             * Standard-engine snap-to-axis: align selected entities' position on
+             * an axis to the selection's Min / Mid / Max, or distribute them
+             * evenly between the extremes.  Operates on local position (matches
+             * the bulk editors above); for unparented entities local == world. */
+            ImGui::Separator();
+            ImGui::TextDisabled("%s", jce_editor_i18n_id("inspector.bulk.align",
+                                                         "Align / Distribute"));
+            {
+                auto getp = [](JceTransform *t, int a) -> float {
+                    return a == 0 ? t->position.x : (a == 1 ? t->position.y
+                                                            : t->position.z);
+                };
+                auto setp = [](JceTransform *t, int a, float v) {
+                    if (a == 0) t->position.x = v;
+                    else if (a == 1) t->position.y = v;
+                    else t->position.z = v;
+                };
+                const char *axis_lbl[3] = { "X", "Y", "Z" };
+                const char *mode_lbl[3] = { "Min", "Mid", "Max" };
+                for (int a = 0; a < 3; ++a) {
+                    ImGui::PushID(a);
+                    float mn = 1e30f, mx = -1e30f;
+                    for (int i = 0; i < sel_count; i++) {
+                        JceTransform *t = jce_scene_get_transform(
+                            scene, jce_state_to_ecs_entity(sel_ids[i]));
+                        if (!t) continue;
+                        float v = getp(t, a);
+                        if (v < mn) mn = v;
+                        if (v > mx) mx = v;
+                    }
+                    float targets[3] = { mn, (mn + mx) * 0.5f, mx };
+                    ImGui::TextUnformatted(axis_lbl[a]);
+                    for (int m = 0; m < 3; ++m) {
+                        ImGui::SameLine();
+                        ImGui::PushID(m);
+                        if (ImGui::SmallButton(mode_lbl[m])) {
+                            jce_state_begin_batch_edit();
+                            for (int i = 0; i < sel_count; i++) {
+                                JceTransform *t = jce_scene_get_transform(
+                                    scene, jce_state_to_ecs_entity(sel_ids[i]));
+                                if (t) setp(t, a, targets[m]);
+                            }
+                            jce_state_end_batch_edit();
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(jce_editor_i18n_id("inspector.bulk.distribute",
+                                                              "Dist")) &&
+                        sel_count >= 3) {
+                        std::vector<std::pair<float, uint32_t>> items;
+                        items.reserve((size_t)sel_count);
+                        for (int i = 0; i < sel_count; i++) {
+                            JceTransform *t = jce_scene_get_transform(
+                                scene, jce_state_to_ecs_entity(sel_ids[i]));
+                            if (t) items.push_back({ getp(t, a), sel_ids[i] });
+                        }
+                        if (items.size() >= 3) {
+                            std::sort(items.begin(), items.end(),
+                                      [](const std::pair<float, uint32_t> &x,
+                                         const std::pair<float, uint32_t> &y) {
+                                          return x.first < y.first;
+                                      });
+                            float lo = items.front().first;
+                            float hi = items.back().first;
+                            float step = (hi - lo) / (float)(items.size() - 1);
+                            jce_state_begin_batch_edit();
+                            for (size_t k = 0; k < items.size(); ++k) {
+                                JceTransform *t = jce_scene_get_transform(
+                                    scene, jce_state_to_ecs_entity(items[k].second));
+                                if (t) setp(t, a, lo + step * (float)k);
+                            }
+                            jce_state_end_batch_edit();
+                        }
+                    }
+                    ImGui::PopID();
+                }
             }
             ImGui::PopID();
         }

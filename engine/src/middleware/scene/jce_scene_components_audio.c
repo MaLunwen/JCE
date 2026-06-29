@@ -20,6 +20,12 @@ void parse_audio_source(JceScene *s, JceEntity e, const cJSON *c)
     as.spatial_blend  = (float)j_num(c, "spatialBlend", 0.0);
     as.loop          = j_bool(c, "loop", false);
     as.play_on_awake = j_bool(c, "playOnAwake", true);
+    /* 3D attenuation (large-world audio); absent keys -> 0 => legacy defaults. */
+    as.attenuation_model = j_num(c, "attenuationModel", 0.0);
+    as.min_distance      = (float)j_num(c, "minDistance",   0.0);
+    as.max_distance      = (float)j_num(c, "maxDistance",   0.0);
+    as.rolloff_factor    = (float)j_num(c, "rolloffFactor", 0.0);
+    copy_str(as.mixer_bus, sizeof(as.mixer_bus), j_str(c, "mixerBus", ""));
     jce_scene_set_audio_source(s, e, &as);
 }
 
@@ -90,6 +96,11 @@ static void ser_audio_source(const JceAudioSourceComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "spatialBlend", c->spatial_blend);
     cJSON_AddBoolToObject(o, "loop", c->loop);
     cJSON_AddBoolToObject(o, "playOnAwake", c->play_on_awake);
+    cJSON_AddNumberToObject(o, "attenuationModel", c->attenuation_model);
+    cJSON_AddNumberToObject(o, "minDistance",   c->min_distance);
+    cJSON_AddNumberToObject(o, "maxDistance",   c->max_distance);
+    cJSON_AddNumberToObject(o, "rolloffFactor", c->rolloff_factor);
+    cJSON_AddStringToObject(o, "mixerBus", c->mixer_bus);
     cJSON_AddItemToArray(arr, o);
 }
 

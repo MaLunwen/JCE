@@ -7,6 +7,11 @@
 
 #include "jce_editor_scene_rendering_defaults.h"
 #include "jce_project_settings.h"
+#include "jce_editor_project.h"
+#include <jce/renderer/jce_render_settings.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_log.h>
+#include <cstdio>
 
 static int quality_shadow_resolution_pixels(int value)
 {
@@ -81,6 +86,60 @@ void jce_editor_scene_rendering_settings_from_project(
             ? JCE_SCENE_SOFT_SHADOW_PCF
             : JCE_SCENE_SOFT_SHADOW_OFF;
     }
+
+    /* Look Profile project defaults (plan 02) — field-by-field copy.
+     * MISSING a line here = the look field is silently dropped for new
+     * scenes. ps->rendering does NOT carry these; the project-wide source
+     * is jce_render_settings.json, so seed from jce_render_settings_default
+     * unless the project provides them. */
+    JceRenderSettings rs = jce_render_settings_default();
+    /* Resolve render_settings.json RELATIVE TO THE OPEN PROJECT ROOT (NOT the
+     * editor exe base dir — that returns the editor install, not the project, so
+     * the load always failed and project look/grass defaults were never picked
+     * up).  Try source-authored copy first, then cooked. */
+    {
+        bool rs_loaded = false;
+        const JceProject *proj = jce_editor_project_get();
+        if (proj && proj->project_root && proj->project_root[0]) {
+            const char *src = (proj->source_assets && proj->source_assets[0])
+                              ? proj->source_assets : "resources/assets";
+            const char *cooked = (proj->cooked_assets && proj->cooked_assets[0])
+                                 ? proj->cooked_assets : "resources/_cooked";
+            char rpath[1024];
+            int n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
+                             proj->project_root, src);
+            if (n > 0 && n < (int)sizeof(rpath))
+                rs_loaded = jce_render_settings_load_json(rpath, &rs);
+            if (!rs_loaded) {
+                n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
+                             proj->project_root, cooked);
+                if (n > 0 && n < (int)sizeof(rpath))
+                    rs_loaded = jce_render_settings_load_json(rpath, &rs);
+            }
+        }
+        if (!rs_loaded)
+            LOG_WARN("scene_defaults", "render_settings.json not found under project root — look profile defaults");
+    }
+    out->wrap_factor        = rs.wrap_factor;
+    out->ambient_hemisphere = rs.ambient_hemisphere;
+    out->ambient_ground_color[0] = rs.ambient_ground_color[0];
+    out->ambient_ground_color[1] = rs.ambient_ground_color[1];
+    out->ambient_ground_color[2] = rs.ambient_ground_color[2];
+    out->rim_color[0] = rs.rim_color[0];
+    out->rim_color[1] = rs.rim_color[1];
+    out->rim_color[2] = rs.rim_color[2];
+    out->rim_power     = rs.rim_power;
+    out->rim_intensity = rs.rim_intensity;
+    out->tonemap_op    = rs.tonemap_op;
+    {
+        size_t i = 0;
+        for (; rs.lut_path[i] && i + 1 < sizeof(out->lut_path); i++)
+            out->lut_path[i] = rs.lut_path[i];
+        out->lut_path[i] = '\0';
+    }
+    out->lut_strength   = rs.lut_strength;
+    out->toon_character = rs.toon_character;
+    out->bloom_knee     = rs.bloom_knee;
 }
 
 void jce_editor_scene_ensure_rendering_settings(JceScene *scene)

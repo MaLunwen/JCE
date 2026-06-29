@@ -29,6 +29,18 @@ uniform vec4 u_sky_perez[4];
 uniform vec4 u_sky_zenith;
 uniform vec4 u_sky_sun_dir;
 
+/* ── Stylized sky dome (mode 3, u_sky_params.x > 2.5) ─────────────────
+ * Reuses u_sky_colors[0]=zenith, [1]=horizon, [2]=ground and
+ * u_sky_sun_dir (toward the sun).  All-linear; no pow here.
+ *   u_sky_dome_mid     = (mid.rgb, mid_pos)
+ *   u_sky_dome_glow    = (glow.rgb, glow_falloff)
+ *   u_sky_dome_sun     = (sun_size, sun_softness, halo_power, halo_strength)
+ *   u_sky_dome_sun_col = (sun_color.rgb, pad) */
+uniform vec4 u_sky_dome_mid;
+uniform vec4 u_sky_dome_glow;
+uniform vec4 u_sky_dome_sun;
+uniform vec4 u_sky_dome_sun_col;
+
 SAMPLER2D(s_equirect, 0);
 
 /* Perez F(theta,gamma): abcde = (A,B,C,D,E). Identical to sky_perez(). */
@@ -41,12 +53,57 @@ float sky_perez(vec4 abcd, float E, float cos_theta, float gamma)
 
 void main()
 {
-    /* Reconstruct world-space view ray direction. */
-    vec4 nearH = mul(u_invViewProj, vec4(v_texcoord0, -1.0, 1.0));
-    vec4 farH  = mul(u_invViewProj, vec4(v_texcoord0,  1.0, 1.0));
+    /* Reconstruct world-space view ray direction.  The NDC near-plane z is
+     * backend-dependent: OpenGL clip space is [-1,1] (near = -1) while
+     * D3D/Vulkan/Metal are [0,1] (near = 0).  Unprojecting z = -1 on a [0,1]
+     * backend yields a point OUTSIDE the frustum (negative w after the
+     * homogeneous divide) → a garbage ray → the dome gradient samples the
+     * wrong band → dark sky on D3D/VK (OpenGL stayed correct). */
+#if BGFX_SHADER_LANGUAGE_GLSL
+    float ndcNearZ = -1.0;
+#else
+    float ndcNearZ =  0.0;
+#endif
+    vec4 nearH = mul(u_invViewProj, vec4(v_texcoord0, ndcNearZ, 1.0));
+    vec4 farH  = mul(u_invViewProj, vec4(v_texcoord0,      1.0, 1.0));
     vec3 dir   = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
 
-    if (u_sky_params.x > 1.5) {
+    if (u_sky_params.x > 2.5) {
+        /* ── Stylized dome (mode 3) ──────────────────────────────────
+         * (1) multi-stop vertical ramp zenith→mid→horizon→ground
+         * (2) additive horizon glow band
+         * (3) sun disk + halo aligned to u_sky_sun_dir.
+         * All linear; tonemap downstream applies gamma. */
+        float y    = clamp(dir.y, -1.0, 1.0);
+        float midP = clamp(u_sky_dome_mid.w, 0.0, 1.0);
+
+        /* Above horizon: horizon → mid → zenith via two smoothsteps. */
+        float tLow  = smoothstep(0.0,  midP, max(y, 0.0));          /* horizon→mid */
+        float tHigh = smoothstep(midP, 1.0,  max(y, 0.0));          /* mid→zenith  */
+        vec3 above  = mix(u_sky_colors[1].rgb, u_sky_dome_mid.rgb, tLow);
+        above       = mix(above, u_sky_colors[0].rgb, tHigh);
+
+        /* Below horizon: horizon → ground. */
+        vec3 below  = mix(u_sky_colors[1].rgb, u_sky_colors[2].rgb, smoothstep(0.0, 1.0, -y));
+
+        float aboveSel = step(0.0, y);
+        vec3 col = mix(below, above, aboveSel);
+
+        /* (2) Horizon glow band: brightest at the horizon, exp falloff. */
+        float band = exp(-abs(y) * u_sky_dome_glow.w);
+        col += u_sky_dome_glow.rgb * band;
+
+        /* (3) Sun disk + halo (u_sky_sun_dir points toward the sun). */
+        float cg   = clamp(dot(dir, u_sky_sun_dir.xyz), -1.0, 1.0);
+        float disk = smoothstep(u_sky_dome_sun.x - u_sky_dome_sun.y,
+                                u_sky_dome_sun.x + u_sky_dome_sun.y, cg);
+        float halo = pow(max(cg, 0.0), u_sky_dome_sun.z);
+        col += u_sky_dome_sun_col.rgb * (disk + halo * u_sky_dome_sun.w);
+
+        col *= u_sky_params.y;                /* exposure */
+        col  = max(col, vec3_splat(0.0));
+        gl_FragColor = vec4(col, 1.0);
+    } else if (u_sky_params.x > 1.5) {
         /* ── Preetham analytic daylight (mode 2) ──────────────────── */
         /* theta = view-zenith angle; clamp cos just above 0 (sky hemi). */
         float cos_theta = clamp(dir.y, 0.01, 1.0);

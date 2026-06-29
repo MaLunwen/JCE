@@ -143,7 +143,7 @@ void draw_comp_billboard_renderer(JceBillboardRendererComponent *b);
 void draw_comp_trail_renderer(JceTrailRendererComponent *t);
 void draw_comp_line_renderer(JceLineRendererComponent *l);
 void draw_comp_decal(JceDecalComponent *d);
-void draw_comp_lod_group(JceLodGroupComponent *lg);
+void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e);
 void draw_comp_volume(JceVolumeComponent *v);
 void draw_comp_occlusion_portal(JceOcclusionPortalComponent *op);
 
@@ -208,11 +208,13 @@ void draw_comp_save_point(JceSavePointComponent *sp);
 void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv);
 void draw_comp_terrain(JceTerrainComponent *tc);
 void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs);
+void draw_comp_grass_field(JceGrassFieldComponent *g);
 void draw_comp_water(JceWaterComponent *w);
 void draw_comp_buoyancy(JceBuoyancyComponent *b);
 void draw_comp_particle_emitter(JceParticleEmitterComponent *pe);
 void draw_comp_script(JceScriptComponent *scr);
 void draw_comp_nav_agent(JceNavAgentComponent *na);
+void draw_comp_sim_lod(JceSimLodComponent *sl);
 void draw_comp_sequence_player(JceSequencePlayerComponent *sp);
 void draw_comp_gas(JceGameplayAbilitySystemComponent *gas);
 

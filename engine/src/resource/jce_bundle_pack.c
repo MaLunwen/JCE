@@ -691,6 +691,15 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
     CookClass cls = classify_cook(vpath);
     if (cls == COOK_CLASS_NONE) return raw;
 
+    /* LUT strip PNGs must ship as raw PNG bytes — jce_texture_load_lut_3d
+     * calls jce_texture_decode_cpu which decodes the PNG directly; a
+     * .jceasset wrapper (even RGBA8) is opaque to that loader.  Any block
+     * compression (BC3/ASTC) is also lossy-corrupted for a precision LUT.
+     * Return the raw bytes untouched so the PAK contains a plain PNG. */
+    if (cls == COOK_CLASS_TEXTURE && jce_cook_path_is_lut(vpath)) {
+        return raw;   /* passthrough — keep exact PNG bytes */
+    }
+
     cJSON *imp = cook_read_import_json(vpath, resource_root, resolve_fn,
                                        resolve_user, emap);
 

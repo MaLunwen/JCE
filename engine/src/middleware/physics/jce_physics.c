@@ -547,6 +547,13 @@ void jce_physics_body_set_velocity(JcePhysicsWorld *world,
     jce_bullet_body_set_velocity(world->bullet, body.idx, vel);
 }
 
+void jce_physics_body_set_active(JcePhysicsWorld *world,
+                                 JceBodyHandle body, bool active)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_active(world->bullet, body.idx, active);
+}
+
 jce_vec3 jce_physics_body_get_angular_velocity(const JcePhysicsWorld *world,
                                                JceBodyHandle body)
 {

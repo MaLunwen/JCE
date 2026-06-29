@@ -25,11 +25,16 @@
 #include "jce_project_settings.h"
 #include <jce/ui/jce_imgui_renderer.h>
 #include <jce/application/jce_screenshot.h>
+#include <bgfx/c99/bgfx.h>   /* bgfx_get_stats: draw-call KPI column */
 #include "jce_build_manager.h"
 #include "jce_cook_manager.h"
+#include "jce_editor_recorder.h"
 #include "jce_run_manager.h"
 #include "panels/jce_panel_assets_thumb.h"
 #include "scene/jce_editor_game_render.h"
+#include "scene/jce_editor_scene_render.h"   /* renderer/model accessors for impostor bake */
+#include <jce/renderer/jce_impostor.h>
+#include <jce/renderer/jce_scene_renderer.h>
 
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
@@ -260,6 +265,15 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     io.IniFilename = s_imgui_ini;
     io.IniSavingRate = 1.0f;
 
+    /* Optional log-file sink for headless diagnosis (the editor is a windowed
+     * app — stdout is detached). JCE_LOG_FILE=<path> mirrors all engine logs to
+     * a file so automated capture runs can inspect scene-load / terrain / asset
+     * warnings after the fact. */
+    {
+        const char *log_file = getenv("JCE_LOG_FILE");
+        if (log_file && log_file[0]) jce_log_set_file(log_file);
+    }
+
     /* Clipboard. */
     io.SetClipboardTextFn = clipboard_set;
     io.GetClipboardTextFn = clipboard_get;
@@ -369,7 +383,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
         /* Truncate then write CSV header. */
-        static const char hdr[] = "frame_index,frame_ms\n";
+        static const char hdr[] = "frame_index,frame_ms,num_draw\n";
         if (jce_fs_host_write_all(frame_kpi_path, hdr, sizeof(hdr) - 1)) {
             jce_strlcpy(s_editor.frame_kpi_path, frame_kpi_path,
                         sizeof(s_editor.frame_kpi_path));
@@ -590,13 +604,32 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
+    /* Headless overview-capture hook (JCE_DBG_OVERVIEW=1): bring the Scene View
+     * tab to the front for the first few frames so its content (and thus the
+     * bird's-eye overview camera armed in jce_editor_scene_render_frame) is what
+     * the KPI screenshot captures — a docked background tab never runs its body.
+     * Inert when unset; only affects which tab is foregrounded at startup. */
+    if (getenv("JCE_DBG_OVERVIEW")) {
+        static int s_overview_focus_frames = 0;
+        if (s_overview_focus_frames < 10) {
+            jce_editor_layout_request_focus_scene_view();
+            s_overview_focus_frames++;
+        }
+    }
+
     if (s_editor.frame_kpi_path[0]) {
         if (s_editor.frame_kpi_limit == 0 ||
             s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
             const double frame_ms = (double)dt * 1000.0;
-            char kpi_line[64];
-            int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f\n",
-                                   s_editor.frame_kpi_index, frame_ms);
+            /* Draw-call KPI: bgfx aggregates the PREVIOUS frame's submits in
+             * its stats block (numDraw) — the headline metric for batching
+             * wins (e.g. per-instance-tint collapsing solo draws into one
+             * instanced submit).  Appended as a third CSV column. */
+            const bgfx_stats_t *st = bgfx_get_stats();
+            uint32_t num_draw = st ? st->numDraw : 0u;
+            char kpi_line[80];
+            int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f,%u\n",
+                                   s_editor.frame_kpi_index, frame_ms, num_draw);
             if (kpi_len > 0)
                 jce_fs_host_append(s_editor.frame_kpi_path, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
@@ -606,9 +639,81 @@ void jce_editor_update(JceWindow *window)
              * frame's bgfx submit; the editor keeps running so the async
              * screenshot callback has frames to write the PNG. */
             const char *shot = getenv("JCE_KPI_SHOT");
-            if (shot && shot[0])
-                jce_screenshot_save(shot, JCE_SCREENSHOT_PNG);
+            if (shot && shot[0]) {
+                /* Self-capture path: grab the OFFSCREEN scene FBO (no swap-chain
+                   present needed, so it works headless), fall back to backbuffer. */
+                if (!jce_editor_scene_render_screenshot(shot))
+                    jce_screenshot_save(shot, JCE_SCREENSHOT_PNG);
+            }
             s_editor.frame_kpi_shot_done = true;
+        }
+    }
+
+    /* Pump any in-flight headless self-capture readback (started by F12 / the
+       JCE_KPI_SHOT path via jce_editor_scene_render_screenshot); no-op when idle. */
+    jce_editor_scene_render_capture_poll();
+
+    /* Headless octahedral-impostor bake (JCE_IMPOSTOR_BAKE): reproducible,
+     * window-driven GPU bake for tooling / dogfood / verification.  Format:
+     *   <modelRel>;<grid>;<atlasHost>;<metaHost>;<atlasRel>
+     * Once the scene has settled (the model is resolved into the renderer cache)
+     * submit the bake, poll it each frame, and quit when DONE/FAILED. */
+    {
+        static int  s_imp_state = 0;   /* 0=idle 1=submitted 2=done */
+        static char s_imp_spec[1024] = {0};
+        if (s_imp_state == 0) {
+            const char *spec = getenv("JCE_IMPOSTOR_BAKE");
+            if (spec && spec[0] && s_editor.frame_kpi_index >= 20) {
+                snprintf(s_imp_spec, sizeof s_imp_spec, "%s", spec);
+                char modelRel[256] = {0}, atlasHost[512] = {0},
+                     metaHost[512] = {0}, atlasRel[256] = {0};
+                int grid = 8;
+                /* Parse ';'-separated fields. */
+                char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", s_imp_spec);
+                char *t = strtok(tmp, ";");
+                int fi = 0;
+                while (t) {
+                    switch (fi) {
+                    case 0: snprintf(modelRel, sizeof modelRel, "%s", t); break;
+                    case 1: grid = atoi(t); break;
+                    case 2: snprintf(atlasHost, sizeof atlasHost, "%s", t); break;
+                    case 3: snprintf(metaHost, sizeof metaHost, "%s", t); break;
+                    case 4: snprintf(atlasRel, sizeof atlasRel, "%s", t); break;
+                    default: break;
+                    }
+                    t = strtok(NULL, ";"); fi++;
+                }
+                JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+                JceRenderer      *r  = jce_editor_get_renderer();
+                JceModel *model = (sr && modelRel[0])
+                    ? jce_scene_renderer_get_model(sr, modelRel) : NULL;
+                if (sr && r && model) {
+                    JceImpostorBakeDesc d; memset(&d, 0, sizeof d);
+                    d.model = model; d.renderer = r;
+                    d.grid_n = grid > 0 ? grid : 8; d.cell_px = 256;
+                    snprintf(d.atlas_path_host, sizeof d.atlas_path_host, "%s", atlasHost);
+                    snprintf(d.meta_path_host,  sizeof d.meta_path_host,  "%s", metaHost);
+                    snprintf(d.atlas_path_rel,  sizeof d.atlas_path_rel,  "%s", atlasRel);
+                    if (jce_impostor_bake_submit(&d)) {
+                        LOG_INFO("editor", "JCE_IMPOSTOR_BAKE: submitted %s -> %s",
+                                 modelRel, metaHost);
+                        s_imp_state = 1;
+                    }
+                } else if (s_editor.frame_kpi_index > 900) {
+                    LOG_WARN("editor", "JCE_IMPOSTOR_BAKE: model '%s' not resident "
+                             "after 900 frames; aborting", modelRel);
+                    s_imp_state = 2;
+                    jce_editor_layout_request_quit();
+                }
+            }
+        } else if (s_imp_state == 1) {
+            JceImpostorBakeStatus st = jce_impostor_bake_poll();
+            if (st == JCE_IMPOSTOR_BAKE_DONE || st == JCE_IMPOSTOR_BAKE_FAILED) {
+                LOG_INFO("editor", "JCE_IMPOSTOR_BAKE: %s",
+                         st == JCE_IMPOSTOR_BAKE_DONE ? "DONE" : "FAILED");
+                s_imp_state = 2;
+                jce_editor_layout_request_quit();
+            }
         }
     }
 
@@ -618,6 +723,67 @@ void jce_editor_update(JceWindow *window)
     if (s_editor.frame_kpi_index == 30 && getenv("JCE_KPI_AUTOPLAY") &&
         jce_state_get_play_state() == JCE_PLAY_STOPPED) {
         jce_state_play();
+    }
+
+    /* Headless whole-window capture hook (JCE_WINCAP_FRAME=N + JCE_WINCAP_PATH):
+       request the offscreen ImGui-FBO capture once the frame index reaches N.
+       Same role as JCE_CAPTURE_FRAME but for the reliable whole-window path —
+       used by tooling / autonomous visual QA (F12 uses the same request API). */
+    {
+        static int  s_wincap_frame = -2;   /* -2 unparsed, -1 disabled */
+        static char s_wincap_path[512];
+        static bool s_wincap_done = false;
+        static uint32_t s_wincap_tick = 0;
+        ++s_wincap_tick;
+        if (s_wincap_frame == -2) {
+            const char *f = getenv("JCE_WINCAP_FRAME");
+            const char *p = getenv("JCE_WINCAP_PATH");
+            if (f && f[0] && p && p[0]) {
+                s_wincap_frame = atoi(f);
+                snprintf(s_wincap_path, sizeof s_wincap_path, "%s", p);
+            } else {
+                s_wincap_frame = -1;
+            }
+        }
+        if (s_wincap_frame >= 0 && !s_wincap_done &&
+            s_wincap_tick >= (uint32_t)s_wincap_frame) {
+            jce_imgui_renderer_request_capture(s_wincap_path);
+            s_wincap_done = true;
+        }
+    }
+
+    /* RenderDoc GPU capture (JCE_RDOC_FRAME=N) now lives in the engine renderer
+       (jce_gpu_capture_tick in jce_renderer_end_frame), so it works for every
+       consumer + headless, not just the editor. See jce/renderer/jce_gpu_capture.h. */
+
+    /* Headless recording hook (JCE_REC_FRAMES=N + JCE_REC_PATH): record N frames
+       starting at frame 60 then stop — F9 whole-window recording verification. */
+    {
+        static int      s_rec_n    = -2;   /* -2 unparsed, -1 disabled */
+        static char     s_rec_path[512];
+        static int      s_rec_stop = -1;
+        static uint32_t s_rec_tick = 0;
+        ++s_rec_tick;
+        if (s_rec_n == -2) {
+            const char *n = getenv("JCE_REC_FRAMES");
+            const char *p = getenv("JCE_REC_PATH");
+            if (n && n[0] && p && p[0]) {
+                s_rec_n = atoi(n);
+                snprintf(s_rec_path, sizeof s_rec_path, "%s", p);
+            } else {
+                s_rec_n = -1;
+            }
+        }
+        if (s_rec_n >= 0) {
+            if (s_rec_tick == 60) {
+                JceRenderer *r = jce_editor_get_renderer();
+                if (r && jce_editor_recorder_start(r, s_rec_path))
+                    s_rec_stop = 60 + s_rec_n;
+            } else if (s_rec_stop > 0 && (int)s_rec_tick == s_rec_stop) {
+                jce_editor_recorder_stop();
+                s_rec_n = -1;
+            }
+        }
     }
 
     /* Setup bgfx view. */

@@ -41,6 +41,33 @@ typedef enum {
 } JceStreamMode;
 
 /* ================================================================== */
+/* Preview / authoring load-override mode                              */
+/* ================================================================== */
+/* Overrides which chunks the per-frame update considers "wanted":
+ *
+ *   RADIUS (default, zero-init) : exact distance-ring behaviour — load
+ *                                 in-radius chunks, unload beyond
+ *                                 unload-radius.  Runtime gameplay path.
+ *   ALL                         : EVERY registered chunk is wanted —
+ *                                 nothing unloads by distance.  Lets the
+ *                                 editor render the whole streamed world
+ *                                 (zoom/orbit out shows all chunks instead
+ *                                 of far cells popping out).  Authoring
+ *                                 mode: the memory budget LRU is NOT
+ *                                 allowed to evict a wanted chunk.
+ *   FILTER                      : only chunks whose id is in the supplied
+ *                                 set are wanted; loaded chunks not in the
+ *                                 set are unloaded.  Debug a chosen subset.
+ *
+ * Loads always keep the per-frame budget + async pool + nearest-first
+ * ordering so ALL/FILTER stream in over several frames without stalling. */
+typedef enum {
+    JCE_STREAM_PREVIEW_RADIUS = 0,
+    JCE_STREAM_PREVIEW_ALL    = 1,
+    JCE_STREAM_PREVIEW_FILTER = 2,
+} JceStreamPreviewMode;
+
+/* ================================================================== */
 /* Configuration                                                       */
 /* ================================================================== */
 
@@ -59,6 +86,18 @@ typedef struct {
     /* Per-frame time budget for single-thread mode, in milliseconds.
        Default: 2.0 ms (leaves headroom in a 16ms/60fps frame). */
     float         frame_budget_ms;
+
+    /* Anticipatory ("heading") prefetch lead distance, in world units
+       (M6a).  Each update derives a velocity from the camera's per-call
+       motion; cells are tested for LOADING against a probe point shifted
+       this far ahead along the heading, so cells in the direction of
+       travel enter the load set before the player arrives (eliminating
+       pop-in on fast traversal).  The UNLOAD test and LRU touch still use
+       the ACTUAL camera position, so cells just behind are not prematurely
+       evicted.  When stationary the offset is zero → identical to reactive
+       streaming.  Default (when <= 0): 0.5 * load_radius, applied in
+       jce_streaming_create().  Disabled wholesale by JCE_DISABLE_PREFETCH=1. */
+    float         prefetch_lead;
 } JceStreamingConfig;
 
 /* ================================================================== */
@@ -148,6 +187,33 @@ void jce_streaming_set_chunk_residency(JceStreamingSystem *sys,
  * In single-thread mode, this processes pending loads within
  * the configured frame_budget_ms time budget. */
 JCE_API void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos);
+
+/* ================================================================== */
+/* Preview / authoring load-override                                   */
+/* ================================================================== */
+
+/* Override which chunks jce_streaming_update() treats as "wanted":
+ *
+ *   RADIUS (default) — current distance-ring behaviour. filter args ignored.
+ *   ALL              — every registered chunk is wanted; never unloads by
+ *                      distance and the memory-budget LRU will not evict.
+ *   FILTER           — only chunks whose id is in [filter_chunk_ids,
+ *                      filter_count) are wanted; loaded chunks NOT in the
+ *                      set are unloaded.  The id set is COPIED (bounded to
+ *                      the internal MAX_CHUNKS); pass NULL/0 to clear it
+ *                      (FILTER with an empty set => nothing wanted =>
+ *                      everything unloads).
+ *
+ * In ALL/FILTER the per-budget LRU eviction and the HARD-pressure load
+ * refusal are bypassed for WANTED chunks: preview is an opt-in authoring
+ * mode, so the caller has accepted the heavier residency.  The per-frame
+ * load budget + async pool + nearest-first ordering are unchanged, so a
+ * large world streams in over a few seconds rather than stalling a frame.
+ * Safe to call with NULL sys (no-op).  Main-thread only. */
+JCE_API void jce_streaming_set_preview(JceStreamingSystem *sys,
+                                       JceStreamPreviewMode mode,
+                                       const uint32_t *filter_chunk_ids,
+                                       uint32_t filter_count);
 
 /* ================================================================== */
 /* Queries                                                             */

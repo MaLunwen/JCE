@@ -154,6 +154,14 @@ void jce_editor_panel_postfx_content(void)
                                     0.01f, 0.0f, 10.0f);
         changed |= ImGui::DragFloat(jce_editor_i18n("postfx.gamma"), &params.gamma,
                                     0.01f, 1.0f, 4.0f);
+        const char *kTonemapOps[] = { "ACES", "Neutral", "AgX" };
+        int top = settings->tonemap_op;
+        if (top < 0 || top > 2) top = 0;
+        if (ImGui::Combo(jce_editor_i18n("postfx.tonemapOp"), &top,
+                         kTonemapOps, 3)) {
+            settings->tonemap_op = top;
+            changed = true;
+        }
         ImGui::EndDisabled();
     }
     ImGui::PopStyleColor();
@@ -169,7 +177,22 @@ void jce_editor_panel_postfx_content(void)
         snprintf(lbl, sizeof(lbl), "%s##bloom", jce_editor_i18n("light.intensity"));
         changed |= ImGui::DragFloat(lbl, &params.bloom_intensity,
                                      0.01f, 0.0f, 5.0f);
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.bloomKnee"),
+                                    &settings->bloom_knee, 0.01f, 0.0f, 1.0f);
         ImGui::EndDisabled();
+    }
+    ImGui::PopStyleColor();
+
+    /* Color Grade (3D-LUT). */
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.colorGrade"))) {
+        if (ImGui::InputText(jce_editor_i18n("postfx.lutPath"),
+                             settings->lut_path, sizeof(settings->lut_path),
+                             ImGuiInputTextFlags_EnterReturnsTrue))
+            changed = true;
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.lutStrength"),
+                                    &settings->lut_strength, 0.01f, 0.0f, 1.0f);
+        ImGui::TextDisabled("%s", jce_editor_i18n("postfx.lutHint"));  /* "horizontal NxN strip PNG" */
     }
     ImGui::PopStyleColor();
 
@@ -297,6 +320,10 @@ void jce_editor_panel_postfx_content(void)
         settings->custom_post_shader[0] = '\0';
         settings->custom_post_needs_depth = defaults.custom_post_needs_depth;
         settings->custom_post_param_count = defaults.custom_post_param_count;
+        settings->tonemap_op   = defaults.tonemap_op;
+        settings->lut_path[0]  = '\0';
+        settings->lut_strength = defaults.lut_strength;
+        settings->bloom_knee   = defaults.bloom_knee;
         sync_to_pipeline(settings);
         jce_state_mark_scene_modified();
     }

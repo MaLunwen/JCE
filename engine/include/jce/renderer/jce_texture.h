@@ -25,6 +25,22 @@ JCE_API JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_
 JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
                                 int sampler_mode);
 
+/* Load a 3D colour-grading LUT from a horizontal PNG strip: N tiles of NxN
+   laid left-to-right (image = N*N wide, N tall), tile z holding blue index z.
+   Reordered into an N x N x N RGBA8 3D texture (CLAMP sampling). Returns
+   JCE_TEXTURE_INVALID if the backend lacks TEXTURE_3D support or on decode
+   failure. */
+JCE_API JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
+                                           const char *asset_path);
+
+/* Load a 3D LUT from a loose host-filesystem path (absolute or CWD-relative).
+   Same PNG-strip format and N×N×N output as jce_texture_load_lut_3d; uses
+   jce_fs_host_read_all instead of a PAK archive.  Intended for editor mode
+   where assets are loose files on disk rather than cooked into a PAK.
+   Returns JCE_TEXTURE_INVALID if the file cannot be read, the backend lacks
+   TEXTURE_3D support, or the image is not the expected N*N x N shape. */
+JCE_API JceTexture jce_texture_load_lut_3d_host(const char *host_path);
+
 /* Create a GPU texture from a pre-decoded RGBA8 surface (SDL_Surface*).
    The opaque pointer must be a valid SDL_Surface*.
    Caller retains ownership of the surface. */
@@ -176,6 +192,18 @@ JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
  */
 JCE_API void   jce_texture_set_global_mip_bias(int8_t bias);
 JCE_API int8_t jce_texture_get_global_mip_bias(void);
+
+/*
+ * Arm/disarm "streaming uploads".  While armed, NEW uncompressed-RGBA8 texture
+ * uploads (the streamed-texture path: PAK PNG/JPG and cooked RGBA8) retain a CPU
+ * mip-0 copy AND opt into streaming_tracked, so the streaming-pressure global
+ * mip-bias hook can PHYSICALLY shrink them under memory pressure (without a
+ * retained source the demote is a truthful no-op — see the CONTRACT above).
+ * Off by default so editor/UI/one-off textures pay zero extra RAM.  The runtime
+ * scene renderer arms it around streamed model/texture uploads.  Render-thread
+ * only (uploads run there).
+ */
+JCE_API void   jce_texture_set_streaming_uploads(bool on);
 
 JCE_EXTERN_C_END
 

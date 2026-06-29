@@ -34,6 +34,7 @@
 extern "C" void jce_editor_scene_set_scene_dir(const char *dir);
 extern "C" void jce_editor_scene_render_streaming_teardown(void);
 extern "C" void jce_editor_scene_render_streaming_rebuild(void);
+extern "C" struct JceWorldStreamer *jce_editor_get_world_streamer(void);
 
 /* ── Global State Definitions ─────────────────────────────────────── */
 
@@ -58,6 +59,9 @@ EditorTransaction s_transaction;
 static float s_gizmo_snap_translate = 0.5f;
 static float s_gizmo_snap_rotate    = 15.0f;
 static float s_gizmo_snap_scale     = 0.25f;
+/* Persistent snap toggle: when on, gizmo drags snap WITHOUT holding Ctrl
+ * (Ctrl still forces snap momentarily). Session-scoped for now. */
+static bool  s_gizmo_snap_enabled   = false;
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -278,7 +282,7 @@ void jce_editor_state_init(bool with_demo_scene)
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
             int vm = ecfg.view_mode;
-            if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_TEXTURED)
+            if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_AO)
                 s.view_mode = (JceSceneViewMode)vm;
             else
                 s.view_mode = JCE_VIEW_SHADED;
@@ -551,18 +555,47 @@ void jce_state_prune_dead(void)
  * The world streamer fires these (per chunk load/unload, main thread) — the
  * spawn callback appends the chunk's freshly-spawned ids; the despawn callback
  * removes them (and clears any selection) before they are destroyed. */
-static void streamer_spawn_cb(const uint64_t *ids, uint32_t count, void *user)
+/* ── Streamed-chunk grouping + preview-filter SSOT ───────────────────
+ * Single source of truth shared by the World Streaming panel and the
+ * Hierarchy panel (both read/write through these accessors), all session-
+ * local (never serialized into the scene):
+ *
+ *   g_chunk_entities  : chunk id -> the entity ids the streamer spawned for
+ *                       that chunk.  Built from the spawn callback (entity
+ *                       ids) + the chunk-state callback (the chunk id),
+ *                       which fire back-to-back per chunk load.  The
+ *                       Hierarchy panel uses it to group streamed entities
+ *                       under one collapsible node per chunk.
+ *   g_preview_mode    : RADIUS / ALL / FILTER preview mode.
+ *   g_preview_filter  : the set of chunk ids wanted in FILTER mode (the
+ *                       per-chunk eye toggles in the panel + hierarchy
+ *                       drive this).
+ *
+ * jce_state_streaming_apply_preview() pushes the current mode + filter into
+ * the live preview streamer (jce_world_streamer_set_preview_load). */
+static std::unordered_map<uint32_t, std::vector<uint32_t>> g_chunk_entities;
+static std::vector<uint32_t>          g_pending_spawn_ids;   /* awaiting chunk id */
+static JceStreamPreviewMode           g_preview_mode = JCE_STREAM_PREVIEW_RADIUS;
+static std::unordered_set<uint32_t>   g_preview_filter;
+
+void jce_state_streamer_mirror_spawn(const uint64_t *ids, uint32_t count)
 {
-    (void)user;
+    if (!ids || count == 0) return;
     g_entity_order.reserve(g_entity_order.size() + count);
-    for (uint32_t i = 0; i < count; i++)
-        if (ids[i]) g_entity_order.push_back((uint32_t)ids[i]);
+    g_pending_spawn_ids.reserve(g_pending_spawn_ids.size() + count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!ids[i]) continue;
+        g_entity_order.push_back((uint32_t)ids[i]);
+        /* Stage these ids; the chunk-state callback (fired right after the
+         * spawn callback, carrying the chunk id) claims them into the
+         * chunk->entities group map. */
+        g_pending_spawn_ids.push_back((uint32_t)ids[i]);
+    }
 }
 
-static void streamer_despawn_cb(const uint64_t *ids, uint32_t count, void *user)
+void jce_state_streamer_mirror_despawn(const uint64_t *ids, uint32_t count)
 {
-    (void)user;
-    if (count == 0) return;
+    if (!ids || count == 0) return;
     std::unordered_set<uint32_t> dead;
     dead.reserve(count * 2u);
     for (uint32_t i = 0; i < count; i++) {
@@ -576,6 +609,38 @@ static void streamer_despawn_cb(const uint64_t *ids, uint32_t count, void *user)
         g_entity_order.end());
 }
 
+/* Chunk (un)loaded: maintain the chunk->entities group map.  Fired per chunk
+ * load/unload on the main thread:
+ *   loaded == true  : claim the ids the spawn callback just staged for THIS
+ *                     chunk (spawn fires immediately before chunk-state in
+ *                     roster_finalize_apply).
+ *   loaded == false : forget this chunk's group (chunk-state false fires
+ *                     before the despawn callback removes the ids from
+ *                     g_entity_order). */
+void jce_state_streamer_chunk_state(uint32_t chunk_id, bool loaded)
+{
+    if (loaded) {
+        if (!g_pending_spawn_ids.empty()) {
+            g_chunk_entities[chunk_id] = g_pending_spawn_ids;
+            g_pending_spawn_ids.clear();
+        }
+    } else {
+        g_chunk_entities.erase(chunk_id);
+    }
+}
+
+static void streamer_spawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    (void)user;
+    jce_state_streamer_mirror_spawn(ids, count);
+}
+
+static void streamer_despawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    (void)user;
+    jce_state_streamer_mirror_despawn(ids, count);
+}
+
 /* Install the spawn/despawn hierarchy hooks on a streamer (editor preview +
  * Play call this after creating their streamer; the runtime never does). */
 void jce_state_attach_streamer_hierarchy(JceWorldStreamer *ws)
@@ -585,106 +650,151 @@ void jce_state_attach_streamer_hierarchy(JceWorldStreamer *ws)
                                             streamer_despawn_cb, NULL);
 }
 
+/* ── Preview mode + filter SSOT accessors ─────────────────────────────
+ * Both the World Streaming panel and the Hierarchy panel read/write through
+ * these so the per-chunk eye toggles in either place stay consistent. */
+
+JceStreamPreviewMode jce_state_streaming_get_preview_mode(void)
+{
+    return g_preview_mode;
+}
+
+void jce_state_streaming_set_preview_mode(JceStreamPreviewMode mode)
+{
+    g_preview_mode = mode;
+    jce_state_streaming_apply_preview();
+}
+
+bool jce_state_streaming_filter_contains(uint32_t chunk_id)
+{
+    return g_preview_filter.find(chunk_id) != g_preview_filter.end();
+}
+
+void jce_state_streaming_filter_set(uint32_t chunk_id, bool on)
+{
+    if (on) g_preview_filter.insert(chunk_id);
+    else    g_preview_filter.erase(chunk_id);
+    if (g_preview_mode == JCE_STREAM_PREVIEW_FILTER)
+        jce_state_streaming_apply_preview();
+}
+
+void jce_state_streaming_filter_clear(void)
+{
+    g_preview_filter.clear();
+    if (g_preview_mode == JCE_STREAM_PREVIEW_FILTER)
+        jce_state_streaming_apply_preview();
+}
+
+/* Replace the whole filter set in one shot (Select-All / In-View helpers). */
+void jce_state_streaming_filter_set_all(const uint32_t *ids, uint32_t count)
+{
+    g_preview_filter.clear();
+    if (ids)
+        for (uint32_t i = 0; i < count; i++) g_preview_filter.insert(ids[i]);
+    if (g_preview_mode == JCE_STREAM_PREVIEW_FILTER)
+        jce_state_streaming_apply_preview();
+}
+
+uint32_t jce_state_streaming_filter_count(void)
+{
+    return (uint32_t)g_preview_filter.size();
+}
+
+/* Push the current mode + filter into the live preview streamer.  Called on
+ * every mode/filter mutation and after a streamer rebuild (so the session
+ * intent survives the streamer recreation that each settings edit triggers). */
+void jce_state_streaming_apply_preview(void)
+{
+    JceWorldStreamer *ws = jce_editor_get_world_streamer();
+    if (!ws) return;
+
+    if (g_preview_mode == JCE_STREAM_PREVIEW_FILTER) {
+        std::vector<uint32_t> ids(g_preview_filter.begin(), g_preview_filter.end());
+        jce_world_streamer_set_preview_load(
+            ws, JCE_STREAM_PREVIEW_FILTER,
+            ids.empty() ? NULL : ids.data(), (uint32_t)ids.size());
+    } else {
+        jce_world_streamer_set_preview_load(ws, g_preview_mode, NULL, 0);
+    }
+}
+
+/* ── Chunk-group queries (hierarchy chunk view) ──────────────────────── */
+
+/* Collect the ids of all chunks that currently have spawned entities, into
+ * `out` (up to max), ascending.  Returns the count. */
+uint32_t jce_state_streaming_group_chunk_ids(uint32_t *out, uint32_t max)
+{
+    if (!out || max == 0) return 0;
+    uint32_t n = 0;
+    for (const auto &kv : g_chunk_entities) {
+        if (n >= max) break;
+        out[n++] = kv.first;
+    }
+    std::sort(out, out + n);
+    return n;
+}
+
+/* Number of distinct chunks with at least one spawned entity. */
+uint32_t jce_state_streaming_group_count(void)
+{
+    return (uint32_t)g_chunk_entities.size();
+}
+
+/* The entity ids spawned for a chunk (NULL/0 if the chunk has none).  The
+ * returned pointer is owned by the state and valid until the next streamer
+ * (un)load — copy if you need to retain it. */
+const uint32_t *jce_state_streaming_chunk_entities(uint32_t chunk_id,
+                                                   uint32_t *out_count)
+{
+    auto it = g_chunk_entities.find(chunk_id);
+    if (it == g_chunk_entities.end() || it->second.empty()) {
+        if (out_count) *out_count = 0;
+        return NULL;
+    }
+    if (out_count) *out_count = (uint32_t)it->second.size();
+    return it->second.data();
+}
+
 /* ── HLOD far-skyline proxy coordination ─────────────────────────────
- * The streaming radial city ships a cheap per-chunk box "massing" proxy
- * (entity HLOD_<gx>_<gz>, baked by build/gen_hlod.py into the MASTER scene so
- * it is always resident).  These proxies render the whole skyline as grey
- * blocks; when a chunk's *detailed* buildings stream in we HIDE its proxy
- * (disable the MeshRenderer component) so the real geometry shows, and we SHOW
- * it again the moment the chunk unloads — so the far view is never empty
- * beyond the resident window.  The chunk-level streamer callback carries the
- * chunk id; we map id -> proxy entity once at attach time from the scene's
- * streaming chunk table (chunk path "scenes/chunks/cell_<gx>_<gz>.scene.json"
- * -> proxy name "HLOD_<gx>_<gz>").  No reverse entity-id mapping needed. */
-static std::unordered_map<uint32_t, uint32_t> g_hlod_proxy_by_chunk; /* chunk id -> proxy entity id */
+ * The proxy show/hide swap now lives in the ENGINE
+ * (jce_world_streamer_attach_hlod), so the editor (scene-view preview + Play)
+ * and the standalone runtime (default_main) share ONE implementation — the
+ * shipped exe hides a chunk's cheap far-proxy on cell load exactly like the
+ * editor does (no double-draw / z-fight).  The editor keeps ONLY its own extra
+ * per-chunk concern here: maintaining the hierarchy chunk->entities group map
+ * so streamed cells appear grouped in the Hierarchy panel.  That runs even when
+ * no HLOD proxies were baked. */
 
-/* Parse "<dir>/cell_<gx>_<gz>.scene.json" -> the proxy name "HLOD_<gx>_<gz>".
- * Returns false if the path is not a chunk fragment of that form. */
-static bool hlod_proxy_name_from_chunk_path(const char *path,
-                                            char *out, size_t out_sz)
-{
-    if (!path || !out || out_sz == 0) return false;
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    if (strncmp(base, "cell_", 5) != 0) return false;
-    const char *coords = base + 5;
-    /* Strip a trailing ".scene.json" (or any extension) so only "<gx>_<gz>"
-     * remains; the two integers can each be negative. */
-    char buf[64];
-    size_t n = 0;
-    for (const char *p = coords; *p && *p != '.' && n + 1 < sizeof(buf); ++p)
-        buf[n++] = *p;
-    buf[n] = '\0';
-    int gx = 0, gz = 0;
-    if (sscanf(buf, "%d_%d", &gx, &gz) != 2) return false;
-    snprintf(out, out_sz, "HLOD_%d_%d", gx, gz);
-    return true;
-}
-
-static void hlod_set_proxy_visible(uint32_t proxy_id, bool visible)
-{
-    if (!s.scene || proxy_id == 0) return;
-    if (!jce_scene_has_editor_meta(s.scene, (JceEntity)proxy_id)) return; /* dead */
-    /* Toggle the MeshRenderer component: the scene renderer skips drawing a
-     * mesh whose MeshRenderer is disabled (both scene-view and game-view share
-     * that path), and the data persists either way. */
-    jce_scene_set_component_enabled(s.scene, (JceEntity)proxy_id,
-                                    JCE_COMP_FLAG_MESH_RENDERER, visible);
-}
-
-/* Streamer chunk-state hook: chunk resident -> hide its proxy; chunk gone ->
- * show it.  Fired per chunk load/unload on the main thread (never per frame). */
-static void hlod_chunk_state_cb(uint32_t chunk_id, bool loaded, void *user)
+/* Editor-specific extra chunk callback chained by the engine HLOD coordinator:
+ * keep the hierarchy chunk grouping in sync (the engine handles the proxy
+ * MeshRenderer toggle itself).  Fired per chunk load/unload, main thread. */
+static void hlod_editor_grouping_cb(uint32_t chunk_id, bool loaded, void *user)
 {
     (void)user;
-    auto it = g_hlod_proxy_by_chunk.find(chunk_id);
-    if (it == g_hlod_proxy_by_chunk.end()) return;   /* no proxy for this chunk */
-    hlod_set_proxy_visible(it->second, /*visible=*/!loaded);
+    jce_state_streamer_chunk_state(chunk_id, loaded);
 }
 
-/* Reset every known proxy to VISIBLE — the baseline before any chunk is
- * resident.  Called at attach (in case a prior session left some hidden) and
- * on teardown (so the master scene's proxies are all shown again). */
-static void hlod_show_all_proxies(void)
-{
-    for (auto &kv : g_hlod_proxy_by_chunk)
-        hlod_set_proxy_visible(kv.second, true);
-}
-
-/* Build the chunk-id -> proxy-entity map from the scene's streaming table and
- * install the chunk-state callback so streamed chunks toggle their HLOD proxy.
- * Safe no-op when no HLOD proxies were baked (map ends up empty). */
+/* Install the engine HLOD coordinator on the streamer, chaining the editor's
+ * hierarchy grouping onto the same chunk-state slot.  The engine builds the
+ * chunk-id -> proxy-entity map (by EditorMeta name) and toggles each proxy's
+ * MeshRenderer on (un)load; safe no-op when no proxies were baked. */
 void jce_state_attach_streamer_hlod(JceWorldStreamer *ws)
 {
     if (!ws || !s.scene) return;
-    g_hlod_proxy_by_chunk.clear();
-
-    const JceSceneStreamingSettings *st =
-        jce_scene_get_streaming_settings(s.scene);
-    if (st) {
-        for (uint32_t i = 0; i < st->chunk_count; ++i) {
-            const JceSceneStreamChunk *c = &st->chunks[i];
-            if (c->path[0] == '\0') continue;
-            char proxy_name[64];
-            if (!hlod_proxy_name_from_chunk_path(c->path, proxy_name,
-                                                 sizeof proxy_name))
-                continue;
-            uint32_t pid = jce_state_find_by_name(proxy_name);
-            if (pid) g_hlod_proxy_by_chunk[c->id] = pid;
-        }
-    }
-
-    /* Baseline: all proxies visible (resident chunks will hide theirs on load). */
-    hlod_show_all_proxies();
-    jce_world_streamer_set_chunk_callback(ws, hlod_chunk_state_cb, NULL);
+    jce_world_streamer_attach_hlod(ws, s.scene, hlod_editor_grouping_cb, NULL);
 }
 
-/* Re-show every proxy and forget the map (call when a streamer is torn down so
- * the always-resident master proxies don't stay hidden after streaming ends). */
+/* Forget the editor's chunk groupings (the engine re-shows the proxies itself
+ * when the streamer is destroyed, which happens just before this is called). */
 void jce_state_detach_streamer_hlod(void)
 {
-    hlod_show_all_proxies();
-    g_hlod_proxy_by_chunk.clear();
+    /* Streamer is going away: forget all chunk groupings + staged spawn ids so
+     * the hierarchy chunk view starts clean on the next rebuild.  The preview
+     * MODE + FILTER set are intentionally KEPT (session-local user intent) so a
+     * rebuild re-applies them — jce_state_streaming_apply_preview() pushes them
+     * back into the fresh streamer. */
+    g_chunk_entities.clear();
+    g_pending_spawn_ids.clear();
 }
 
 /* ── Entity property queries (read-through to ECS) ───────────────── */
@@ -1314,6 +1424,8 @@ void  jce_state_set_show_grid(bool show)     { s.show_grid = show; persist_rende
 float jce_state_get_gizmo_snap_translate(void) { return s_gizmo_snap_translate; }
 float jce_state_get_gizmo_snap_rotate(void)    { return s_gizmo_snap_rotate; }
 float jce_state_get_gizmo_snap_scale(void)     { return s_gizmo_snap_scale; }
+bool  jce_state_get_gizmo_snap_enabled(void)   { return s_gizmo_snap_enabled; }
+void  jce_state_set_gizmo_snap_enabled(bool v) { s_gizmo_snap_enabled = v; }
 
 void  jce_state_set_gizmo_snap_translate(float v)
 {

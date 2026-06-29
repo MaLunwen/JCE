@@ -11,18 +11,31 @@
 
 /* ── Particle visualisation (P2-particle-vfx-runtime) ─────────────────
  *
- * The CPU particle backend (jce_particles.c) has no dedicated GPU
- * billboard pass yet, so alive particles from the scene-owned
- * JceParticleSystem are submitted through the debug-line pipeline as small
- * axis crosses (camera-agnostic, depth-tested) and flushed with the
- * renderer's color program.  This is the single render path used by both
- * the editor and the shipping runtime, so it owns the flush — no reliance
- * on an external debug-draw flush, and the buffer is always cleared. */
+ * Alive particles from the scene-owned JceParticleSystem are drawn as
+ * camera-facing colour QUADS (batched into one transient buffer + the color
+ * program, alpha-blended, depth-tested but no Z-write) — proper billboards,
+ * not the old axis-cross debug lines.  Honours per-particle size + colour.
+ * (Texture / flipbook UVs + soft-circle falloff need an unlit-textured shader
+ * — a follow-up; this path is solid-colour.)  Single render path for the editor
+ * + shipping runtime. */
+typedef struct {
+    struct SrPVtx { float x, y, z; uint32_t abgr; } *v;
+    uint16_t *idx;
+    uint32_t  cap;   /* max quads the transient buffer holds */
+    uint32_t  n;     /* quads written so far */
+    jce_vec3  right; /* camera basis, unit */
+    jce_vec3  up;
+} SrParticleBatch;
+
 static void sr_particle_visit(const JceParticleView *p, void *ud)
 {
-    (void)ud;
-    float r = p->size * 0.5f;
-    if (r < 0.02f) r = 0.02f;
+    SrParticleBatch *b = (SrParticleBatch *)ud;
+    if (b->n >= b->cap) return;
+
+    float hr = p->size * 0.5f;
+    if (hr < 0.02f) hr = 0.02f;
+    jce_vec3 rx = jce_v3_scale(b->right, hr);
+    jce_vec3 uy = jce_v3_scale(b->up,    hr);
 
     int rr = (int)(p->color.x * 255.0f); rr = rr < 0 ? 0 : (rr > 255 ? 255 : rr);
     int gg = (int)(p->color.y * 255.0f); gg = gg < 0 ? 0 : (gg > 255 ? 255 : gg);
@@ -31,15 +44,26 @@ static void sr_particle_visit(const JceParticleView *p, void *ud)
     uint32_t abgr = ((uint32_t)aa << 24) | ((uint32_t)bb << 16) |
                     ((uint32_t)gg << 8)  |  (uint32_t)rr;
 
-    jce_vec3 c = p->position;
-    jce_debug_draw_line(jce_v3(c.x - r, c.y, c.z), jce_v3(c.x + r, c.y, c.z), abgr);
-    jce_debug_draw_line(jce_v3(c.x, c.y - r, c.z), jce_v3(c.x, c.y + r, c.z), abgr);
-    jce_debug_draw_line(jce_v3(c.x, c.y, c.z - r), jce_v3(c.x, c.y, c.z + r), abgr);
+    jce_vec3 c  = p->position;
+    jce_vec3 p0 = jce_v3_sub(jce_v3_sub(c, rx), uy);
+    jce_vec3 p1 = jce_v3_sub(jce_v3_add(c, rx), uy);
+    jce_vec3 p2 = jce_v3_add(jce_v3_add(c, rx), uy);
+    jce_vec3 p3 = jce_v3_add(jce_v3_sub(c, rx), uy);
+
+    uint32_t vb = b->n * 4u, ib = b->n * 6u;
+    b->v[vb+0].x=p0.x; b->v[vb+0].y=p0.y; b->v[vb+0].z=p0.z; b->v[vb+0].abgr=abgr;
+    b->v[vb+1].x=p1.x; b->v[vb+1].y=p1.y; b->v[vb+1].z=p1.z; b->v[vb+1].abgr=abgr;
+    b->v[vb+2].x=p2.x; b->v[vb+2].y=p2.y; b->v[vb+2].z=p2.z; b->v[vb+2].abgr=abgr;
+    b->v[vb+3].x=p3.x; b->v[vb+3].y=p3.y; b->v[vb+3].z=p3.z; b->v[vb+3].abgr=abgr;
+    b->idx[ib+0]=(uint16_t)vb;     b->idx[ib+1]=(uint16_t)(vb+1); b->idx[ib+2]=(uint16_t)(vb+2);
+    b->idx[ib+3]=(uint16_t)vb;     b->idx[ib+4]=(uint16_t)(vb+2); b->idx[ib+5]=(uint16_t)(vb+3);
+    b->n++;
 }
 
 typedef struct {
     const JceParticleSystem *sys;
     JceScene                *scene;
+    SrParticleBatch         *batch;
 } SrParticleEachCtx;
 
 static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
@@ -49,22 +73,64 @@ static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
     if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
     /* GPU-routed emitters render through sr_drive_gpu_particles (instanced
-     * billboards), not the CPU debug-cross path. */
+     * billboards), not this CPU path. */
     if (jce_scene_particle_emitter_uses_gpu(c)) return;
     JceEmitterHandle h = { c->emitter_handle_idx };
-    jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit, NULL);
+    jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit, ctx->batch);
 }
 
 void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
-                       uint16_t view_id)
+                       const JceCamera *camera, uint16_t view_id)
 {
     const JceParticleSystem *sys =
         (const JceParticleSystem *)jce_scene_internal_particles_get(scene);
-    if (!sys || jce_particles_alive_count(sys) == 0) return;
+    if (!sys) return;
+    uint32_t alive = jce_particles_alive_count(sys);
+    if (alive == 0) return;
 
-    SrParticleEachCtx ctx = { sys, scene };
+    bgfx_vertex_layout_t layout;
+    bgfx_vertex_layout_begin(&layout, bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_COLOR0,   4, BGFX_ATTRIB_TYPE_UINT8, true, false);
+    bgfx_vertex_layout_end(&layout);
+
+    /* Cap to what the transient ring can serve this frame (whole quads). */
+    uint32_t quads = alive;
+    uint32_t av = bgfx_get_avail_transient_vertex_buffer(quads * 4u, &layout) / 4u;
+    uint32_t ai = bgfx_get_avail_transient_index_buffer(quads * 6u, false) / 6u;
+    if (av < quads) quads = av;
+    if (ai < quads) quads = ai;
+    if (quads == 0) return;
+
+    bgfx_transient_vertex_buffer_t tvb;
+    bgfx_transient_index_buffer_t  tib;
+    if (!bgfx_alloc_transient_buffers(&tvb, &layout, quads * 4u, &tib, quads * 6u, false))
+        return;
+
+    SrParticleBatch batch;
+    batch.v     = (struct SrPVtx *)tvb.data;
+    batch.idx   = (uint16_t *)tib.data;
+    batch.cap   = quads;
+    batch.n     = 0;
+    batch.right = camera ? jce_camera_get_right(camera) : jce_v3(1.0f, 0.0f, 0.0f);
+    batch.up    = camera ? jce_camera_get_up(camera)    : jce_v3(0.0f, 1.0f, 0.0f);
+
+    SrParticleEachCtx ctx = { sys, scene, &batch };
     jce_scene_each_entity(scene, sr_particle_each_entity, &ctx);
-    jce_debug_draw_flush(view_id, sr->renderer);
+    if (batch.n == 0) return;
+
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, batch.n * 4u);
+    bgfx_set_transient_index_buffer(&tib, 0, batch.n * 6u);
+    jce_mat4 ident = jce_m4_identity();
+    bgfx_set_transform(ident.raw[0], 1);
+    /* Unlit, alpha-blended, depth-tested, no Z-write (particles don't occlude). */
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                   BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_BLEND_ALPHA, 0);
+    JceShaderHandle sh = jce_renderer_get_program_color(sr->renderer);
+    bgfx_program_handle_t prog;
+    prog.idx = sh.idx;
+    if (BGFX_HANDLE_IS_VALID(prog))
+        bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 /* ── GPU particles (compute-driven; P3-E wiring) ──────────────────────

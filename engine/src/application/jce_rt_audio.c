@@ -122,6 +122,11 @@ const char *rt_bus_for_source(const JceRuntime *rt,
                                      const JceAudioSourceComponent *as,
                                      bool spatial)
 {
+	/* Explicit per-source bus override (large-world audio) wins when it names
+	 * a bus the project actually defined; else fall back to the role heuristic. */
+	if (as->mixer_bus[0] && rt->mixer &&
+	    jce_audio_mixer_find_bus(rt->mixer, as->mixer_bus) != JCE_AUDIO_BUS_INVALID)
+		return as->mixer_bus;
 	const char *want = (!spatial && as->loop) ? "Music" : "SFX";
 	if (rt->mixer && jce_audio_mixer_find_bus(rt->mixer, want)
 	        != JCE_AUDIO_BUS_INVALID)
@@ -508,9 +513,17 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
         jce_audio_voice_set_3d(rt->audio, v, true);
         jce_vec3 wp = rt_world_position(scene, e);
         jce_audio_voice_set_position(rt->audio, v, wp.x, wp.y, wp.z);
-        jce_audio_voice_set_attenuation(rt->audio, v,
-                                        JCE_AUDIO_ATTEN_INVERSE,
-                                        1.0f, 25.0f, 1.0f);
+        /* 3D attenuation: authorable per-source (large-world audio); a 0 model
+         * / 0 distances fall back to the legacy defaults so pre-existing scenes
+         * are unchanged. */
+        JceAudioAttenuation atten = JCE_AUDIO_ATTEN_INVERSE;
+        if (as->attenuation_model > 0)
+            atten = (JceAudioAttenuation)(as->attenuation_model - 1);
+        float a_min  = as->min_distance   > 0.0f ? as->min_distance   : 1.0f;
+        float a_max  = as->max_distance   > 0.0f ? as->max_distance   : 25.0f;
+        float a_roll = as->rolloff_factor > 0.0f ? as->rolloff_factor : 1.0f;
+        jce_audio_voice_set_attenuation(rt->audio, v, atten,
+                                        a_min, a_max, a_roll);
     } else {
         jce_audio_voice_set_3d(rt->audio, v, false);
     }

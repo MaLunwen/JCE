@@ -20,6 +20,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
+#include <jce/renderer/jce_texture_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -146,6 +147,34 @@ JCE_API void jce_postfx_get_custom_shader(const JcePostFXPipeline *pipeline,
                                           bool *out_needs_depth);
 JCE_API int  jce_postfx_get_custom_params(const JcePostFXPipeline *pipeline,
                                           float *out_vec4s, int max_count);
+
+/* ── Tonemap operator (selectable; same 0/1/2 as JceSceneTonemapOp) ── */
+typedef enum {
+    JCE_POSTFX_TONEMAP_ACES    = 0,
+    JCE_POSTFX_TONEMAP_NEUTRAL = 1,
+    JCE_POSTFX_TONEMAP_AGX     = 2,
+} JcePostFXTonemap;
+
+JCE_API void jce_postfx_set_tonemap_op(JcePostFXPipeline *pipeline, int op);
+JCE_API int  jce_postfx_get_tonemap_op(const JcePostFXPipeline *pipeline);
+
+/* 3D-LUT colour grade applied inside the composite pass (after tonemap).
+ * lut_size = N (edge length). strength 0 = neutral. Invalid lut handle or
+ * strength 0 => the composite's grade branch is an algebraic no-op. */
+JCE_API void jce_postfx_set_lut(JcePostFXPipeline *pipeline, JceTexture lut,
+                                int lut_size, float strength);
+JCE_API void jce_postfx_get_lut(const JcePostFXPipeline *pipeline,
+                                JceTexture *out_lut, int *out_size,
+                                float *out_strength);
+
+/* Soft-knee bloom: knee 0 = current hard cutoff (byte-identical). */
+JCE_API void  jce_postfx_set_bloom_knee(JcePostFXPipeline *pipeline, float knee);
+JCE_API float jce_postfx_get_bloom_knee(const JcePostFXPipeline *pipeline);
+
+/* Bloom quality: 0 = legacy single-mip path (LOW/MID, byte-identical);
+ * >0 = number of downsample mips for the HIGH/ULTRA dual-filter pyramid. */
+JCE_API void jce_postfx_set_bloom_quality(JcePostFXPipeline *pipeline, int mip_count);
+JCE_API int  jce_postfx_get_bloom_quality(const JcePostFXPipeline *pipeline);
 
 /* ================================================================== */
 /* Temporal Anti-Aliasing (TAA)                                        */

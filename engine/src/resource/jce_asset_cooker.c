@@ -669,6 +669,19 @@ JceCookResult jce_cook_file(const char *input_path,
     /* Dispatch by type. */
     int type = jce_cook_detect_type(input_path);
 
+    /* LUT strip PNGs must ship as verbatim PNG bytes.  jce_texture_load_lut_3d
+     * calls jce_texture_decode_cpu which runs SDL3_image on the raw bytes; a
+     * .jceasset wrapper (any chunk layout) is opaque to that loader's raw path,
+     * and block-compression destroys the LUT's per-channel precision.
+     * Synthesise a successful result pointing at the original file bytes so
+     * the cooked output is exactly the source PNG. */
+    if (type == JCEASSET_TYPE_TEXTURE && jce_cook_path_is_lut(input_path)) {
+        result.data    = (uint8_t *)data;   /* transfer ownership */
+        result.size    = (size_t)nread;
+        result.success = true;
+        return result;   /* caller owns data; skip the JCE_FREE below */
+    }
+
     /* Resolve auto texture format (by platform + normal-map name) when the
        caller didn't force a specific format. cook_texture honors the result. */
     JceCookOptions local;

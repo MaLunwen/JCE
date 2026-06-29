@@ -32,6 +32,12 @@ typedef struct JceRenderer    JceRenderer;
 
 #define JCE_MAX_BONE_INFLUENCES 4
 
+/* Max in-asset auto-LOD index buffers a single mesh may carry (large-world-opt
+ * P1 #6).  The cook emits up to JCE_MESH_LOD_DEFAULT_LEVEL_COUNT (3) reduced
+ * levels; this is the renderer-side ceiling (matches the LODGroup component's
+ * per-level cap so a level index is always bindable). */
+#define JCE_SM_MAX_LOD 8
+
 /* GPU bone-palette ceiling. The skinned vertex shaders address bones through
  * the bgfx u_model[] predefined-uniform array, whose size is fixed at compile
  * time by BGFX_CONFIG_MAX_BONES (see tools/compile_shaders.cmake). This define
@@ -103,6 +109,13 @@ JCE_API void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh);
 JCE_API void JCE_CALL jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
                                               const JceRenderer *r, uint16_t view_id);
 
+/* Set the per-submit double-sided override consumed by the NEXT
+ * jce_skinned_mesh_submit (and its morph variant): true drops back-face culling
+ * so a two-sided material draws both winding orders.  Render-thread only;
+ * jce_model_draw* sets it from each primitive's material->double_sided and
+ * resets it to false afterwards.  Default false = legacy single-sided (CULL_CW). */
+JCE_API void JCE_CALL jce_skinned_mesh_set_submit_double_sided(bool on);
+
 /* Submit a wireframe overlay (line topology, LEQUAL depth) of the
  * mesh's geometry. For skinned meshes the bone palette must already
  * have been uploaded via jce_skinned_mesh_set_bones() (or
@@ -159,6 +172,48 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
 JCE_API bool     jce_skinned_mesh_is_skinned(const JceSkinnedMesh *mesh);
 JCE_API uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh);
 JCE_API uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh);
+
+/* ================================================================== */
+/* In-asset auto-LOD (large-world-opt P1 #6)                            */
+/* ================================================================== */
+
+/* Append one reduced-index LOD level (1-based external naming; stored 0-based).
+ * The level shares this mesh's vertex buffer — `indices` must address [0,
+ * vertex_count).  Copies the data; caller retains ownership.  Returns the new
+ * level count, or the unchanged count on bad input / capacity.  Called by the
+ * model loader right after create; not thread-safe with submits. */
+JCE_API uint32_t jce_skinned_mesh_add_lod(JceSkinnedMesh *mesh,
+                                          const uint32_t *indices,
+                                          uint32_t num_indices);
+
+/* Number of in-asset reduced LOD levels (0 = base mesh only). */
+JCE_API uint32_t jce_skinned_mesh_lod_count(const JceSkinnedMesh *mesh);
+
+/* Index count of reduced LOD `level` (0-based: level 0 = first reduced level).
+ * Returns the base index_count when level is out of range, so a caller can
+ * always quote a triangle figure. */
+JCE_API uint32_t jce_skinned_mesh_lod_index_count(const JceSkinnedMesh *mesh,
+                                                  uint32_t level);
+
+/* Submit the mesh bound to reduced LOD `level` (0-based) instead of the base
+ * index buffer.  level >= lod_count (or no LODs) falls through to
+ * jce_skinned_mesh_submit (base geometry).  Wireframe + render state are
+ * identical to the base submit; only the index buffer differs.  Caller binds
+ * material/program before, and submits the program after, exactly as for the
+ * base submit. */
+JCE_API void JCE_CALL jce_skinned_mesh_submit_lod(const JceSkinnedMesh *mesh,
+                                                  const JceRenderer *r,
+                                                  uint16_t view_id,
+                                                  uint32_t level);
+
+/* Depth-only mirror of jce_skinned_mesh_submit_lod for the shadow pass: binds
+ * reduced LOD `level`'s index buffer so the cast silhouette matches the LOD the
+ * color pass drew.  level out of range => jce_skinned_mesh_submit_shadow. */
+JCE_API void JCE_CALL jce_skinned_mesh_submit_shadow_lod(const JceSkinnedMesh *mesh,
+                                                         const JceRenderer *r,
+                                                         uint16_t view_id,
+                                                         JceShaderHandle program,
+                                                         uint32_t level);
 
 /* ================================================================== */
 /* Morph deform support (FEATURE 3.1, opt-in via retain_cpu)            */

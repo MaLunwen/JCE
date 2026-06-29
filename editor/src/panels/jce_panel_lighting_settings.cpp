@@ -201,17 +201,18 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
         changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
                                      rendering->ambient_color);
 
-        /* ── Sky pass (gradient / equirect / analytic Preetham) ──────── */
-        const char *sky_modes[3] = {
+        /* ── Sky pass (gradient / equirect / analytic Preetham / stylized dome) */
+        const char *sky_modes[4] = {
             jce_editor_i18n("panel.lighting.env.sky_mode.gradient"),
             jce_editor_i18n("panel.lighting.env.sky_mode.equirect"),
             jce_editor_i18n("panel.lighting.env.sky_mode.preetham"),
+            jce_editor_i18n("panel.lighting.env.sky_mode.stylized"),
         };
         int sky_mode = rendering->sky_mode;
         if (sky_mode < JCE_SCENE_SKY_GRADIENT) sky_mode = JCE_SCENE_SKY_GRADIENT;
-        if (sky_mode > JCE_SCENE_SKY_PREETHAM) sky_mode = JCE_SCENE_SKY_PREETHAM;
+        if (sky_mode > JCE_SCENE_SKY_STYLIZED) sky_mode = JCE_SCENE_SKY_STYLIZED;
         if (ImGui::Combo(jce_editor_i18n("panel.lighting.env.sky_mode"),
-                         &sky_mode, sky_modes, 3)) {
+                         &sky_mode, sky_modes, 4)) {
             rendering->sky_mode = sky_mode;
             changed = true;
         }
@@ -219,6 +220,21 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
             changed |= ImGui::DragFloat(
                 jce_editor_i18n("panel.lighting.env.turbidity"),
                 &rendering->sky_turbidity, 0.05f, 1.0f, 10.0f, "%.2f");
+        }
+        if (rendering->sky_mode == JCE_SCENE_SKY_STYLIZED) {
+            ImGui::SeparatorText(jce_editor_i18n("panel.lighting.env.sky_mode.stylized"));
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.zenith"),      rendering->sky_dome_zenith);
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.mid"),         rendering->sky_dome_mid);
+            changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.env.dome.midPos"),    &rendering->sky_dome_mid_pos,      0.0f,    1.0f,   "%.2f");
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.horizon"),     rendering->sky_dome_horizon);
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.ground"),      rendering->sky_dome_ground);
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.glow"),        rendering->sky_dome_glow);
+            changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.env.dome.glowFalloff"), &rendering->sky_dome_glow_falloff,  0.1f,  0.1f,  64.0f,  "%.2f");
+            changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.sunColor"),    rendering->sky_dome_sun_color);
+            changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.env.dome.sunSize"),   &rendering->sky_dome_sun_size,      0.90f, 1.0f,   "%.4f");
+            changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.env.dome.sunSoftness"),&rendering->sky_dome_sun_softness, 0.0001f, 0.05f, "%.4f");
+            changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.env.dome.haloPower"),   &rendering->sky_dome_halo_power,    1.0f,  1.0f,  512.0f, "%.1f");
+            changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.env.dome.haloStrength"),&rendering->sky_dome_halo_strength, 0.01f, 0.0f,  4.0f,   "%.2f");
         }
     }
     ImGui::EndDisabled();
@@ -432,6 +448,74 @@ void draw_ibl(JceScene *scene, const LightCollect &c)
                 g_lit.ibl_spec_mips);
 }
 
+/* Screen-space effects authoring (large-world editor coverage): the renderer
+ * consumes per-scene SSAO + SSR intensity/radius/distance (jce_scene_renderer.c)
+ * but the editor had no UI to set them — only a global render-pipeline feature
+ * flag.  Wire the per-scene knobs here, next to the other rendering-settings. */
+bool draw_screen_space_effects(JceSceneRenderingSettings *rendering)
+{
+    if (!ImGui::CollapsingHeader(
+            jce_editor_i18n_id("panel.lighting.section.sse",
+                               "Screen-Space Effects")))
+        return false;
+
+    ImGui::BeginDisabled(!rendering);
+    bool changed = false;
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        ImGui::EndDisabled();
+        return false;
+    }
+
+    /* SSAO — ambient occlusion. */
+    changed |= ImGui::Checkbox(
+        jce_editor_i18n_id("panel.lighting.sse.ssao", "SSAO (Ambient Occlusion)"),
+        &rendering->ssao_enabled);
+    ImGui::BeginDisabled(!rendering->ssao_enabled);
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssaoIntensity", "SSAO Intensity"),
+        &rendering->ssao_intensity, 0.0f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssaoRadius", "SSAO Radius"),
+        &rendering->ssao_radius, 0.05f, 5.0f, "%.2f");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+
+    /* SSR — screen-space reflections. */
+    changed |= ImGui::Checkbox(
+        jce_editor_i18n_id("panel.lighting.sse.ssr", "SSR (Screen-Space Reflections)"),
+        &rendering->ssr_enabled);
+    ImGui::BeginDisabled(!rendering->ssr_enabled);
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssrIntensity", "SSR Intensity"),
+        &rendering->ssr_intensity, 0.0f, 2.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssrMaxDistance", "SSR Max Distance"),
+        &rendering->ssr_max_distance, 0.5f, 100.0f, "%.1f");
+    ImGui::EndDisabled();
+
+    ImGui::TextDisabled("(%s)", jce_editor_i18n_id("panel.lighting.sse.note",
+        "Needs the render-pipeline SSAO/SSR feature tier enabled."));
+
+    /* TAA tuning — active when r.taa is on; 0 = engine defaults. */
+    ImGui::SeparatorText(jce_editor_i18n_id("panel.lighting.sse.taa", "Temporal AA (TAA)"));
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.taaFeedback", "TAA Feedback"),
+        &rendering->taa_feedback, 0.0f, 0.98f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.taaLumaClamp", "TAA Luma Clamp"),
+        &rendering->taa_luma_clamp, 0.0f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.taaMotionClamp", "TAA Motion Clamp"),
+        &rendering->taa_motion_clamp, 0.0f, 4.0f, "%.2f");
+    ImGui::TextDisabled("(%s)", jce_editor_i18n_id("panel.lighting.sse.taaNote",
+        "0 = engine default (feedback 0.9, clamps 1.0). Needs r.taa enabled."));
+
+    ImGui::EndDisabled();
+    return changed;
+}
+
 bool draw_fog(JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
@@ -482,6 +566,63 @@ bool draw_fog(JceSceneRenderingSettings *rendering)
                                 &rendering->fog_height_origin, 0.1f);
     ImGui::EndDisabled();
     ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.fog.note"));
+    ImGui::EndDisabled();
+    return changed;
+}
+
+bool draw_look_profile(JceSceneRenderingSettings *rendering)
+{
+    if (!ImGui::CollapsingHeader(
+            jce_editor_i18n("panel.lighting.section.look"),
+            ImGuiTreeNodeFlags_DefaultOpen))
+        return false;
+
+    ImGui::BeginDisabled(!rendering);
+    bool changed = false;
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        ImGui::EndDisabled();
+        return false;
+    }
+
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.look.wrap"),
+                                  &rendering->wrap_factor, 0.0f, 1.0f, "%.2f");
+
+    changed |= ImGui::Checkbox(jce_editor_i18n("panel.lighting.look.hemisphere"),
+                               &rendering->ambient_hemisphere);
+    ImGui::BeginDisabled(!rendering->ambient_hemisphere);
+    changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.look.groundColor"),
+                                 rendering->ambient_ground_color);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("(%s)", jce_editor_i18n("panel.lighting.look.hemiNote"));
+
+    ImGui::Separator();
+    changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.look.rimColor"),
+                                 rendering->rim_color);
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.look.rimPower"),
+                                &rendering->rim_power, 0.05f, 0.1f, 16.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.look.rimIntensity"),
+                                  &rendering->rim_intensity, 0.0f, 4.0f, "%.2f");
+
+    ImGui::Separator();
+    const char *tm_items[3] = {
+        jce_editor_i18n("panel.lighting.look.tonemap.aces"),
+        jce_editor_i18n("panel.lighting.look.tonemap.neutral"),
+        jce_editor_i18n("panel.lighting.look.tonemap.agx"),
+    };
+    changed |= ImGui::Combo(jce_editor_i18n("panel.lighting.look.tonemap"),
+                            &rendering->tonemap_op, tm_items, 3);
+    changed |= ImGui::InputText(jce_editor_i18n("panel.lighting.look.lutPath"),
+                                rendering->lut_path, sizeof(rendering->lut_path));
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.look.lutStrength"),
+                                  &rendering->lut_strength, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.look.bloomKnee"),
+                                  &rendering->bloom_knee, 0.0f, 1.0f, "%.2f");
+
+    changed |= ImGui::Checkbox(jce_editor_i18n("panel.lighting.look.toonCharacter"),
+                               &rendering->toon_character);
+
+    ImGui::TextDisabled("(%s)", jce_editor_i18n("panel.lighting.look.note"));
     ImGui::EndDisabled();
     return changed;
 }
@@ -759,6 +900,8 @@ static void lit_draw_settings_tab(void)
     dirty |= draw_shadows(rendering);
     draw_ibl(scene, c);
     dirty |= draw_fog(rendering);
+    dirty |= draw_screen_space_effects(rendering);
+    dirty |= draw_look_profile(rendering);
 
     /* Cross-cut convenience: surface "Bake All Probes" here so users
      * don't have to open the Reflection Probes panel first. The actual

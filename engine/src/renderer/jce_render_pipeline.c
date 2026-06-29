@@ -75,6 +75,7 @@ void jce_render_pipeline_preset_low(JceRenderPipelineDesc *out)
     out->hdr_color             = false;
     out->depth_prepass         = false;
     out->enable_cloth          = false; /* P3-C.4: baseline cannot afford cloth */
+    out->enable_stylized_sky   = false; /* baseline: legacy sky only */
 }
 
 void jce_render_pipeline_preset_mid(JceRenderPipelineDesc *out)
@@ -98,6 +99,7 @@ void jce_render_pipeline_preset_mid(JceRenderPipelineDesc *out)
     out->hdr_color             = false;
     out->depth_prepass         = false;
     out->enable_cloth          = false; /* P3-C.4: opt-in for MID (advanced) */
+    out->enable_stylized_sky   = true;
 }
 
 void jce_render_pipeline_preset_high(JceRenderPipelineDesc *out)
@@ -121,6 +123,7 @@ void jce_render_pipeline_preset_high(JceRenderPipelineDesc *out)
     out->hdr_color             = true;
     out->depth_prepass         = true;
     out->enable_cloth          = true; /* P3-C.4: ON for HIGH */
+    out->enable_stylized_sky   = true;
 }
 
 void jce_render_pipeline_preset_ultra(JceRenderPipelineDesc *out)
@@ -144,6 +147,7 @@ void jce_render_pipeline_preset_ultra(JceRenderPipelineDesc *out)
     out->hdr_color             = true;
     out->depth_prepass         = true;
     out->enable_cloth          = true; /* P3-C.4: ON for ULTRA */
+    out->enable_stylized_sky   = true;
 }
 
 void jce_render_pipeline_preset_for_current_tier(JceRenderPipelineDesc *out)
@@ -249,6 +253,13 @@ bool jce_render_pipeline_is_feature_enabled(const char *feature)
     if (strcmp(feature, "hdr_color")      == 0) return s_active.hdr_color;
     if (strcmp(feature, "cloth")          == 0) return s_active.enable_cloth;
     if (strcmp(feature, "soft_body")      == 0) return s_active.enable_cloth;
+    if (strcmp(feature, "stylized_sky")   == 0) return s_active.enable_stylized_sky;
+    /* Stylized look profile (plan 02): no dedicated feature bool — gated by
+     * the render quality profile.  LOW tier force-OFF (decision #4) collapses
+     * the whole Look Profile back to the neutral baseline regardless of the
+     * authored values.  HIGH/ULTRA (and MID) honor the authored look. */
+    if (strcmp(feature, "stylized_look") == 0)
+        return s_active.post_quality != JCE_RP_QUALITY_LOW;
     return false;
 }
 
@@ -272,6 +283,7 @@ void jce_render_pipeline_set_feature_enabled(const char *feature, bool enabled)
     if (strcmp(feature, "motion_blur")    == 0) { s_pending.enable_motion_blur  = enabled; return; }
     if (strcmp(feature, "cloth")          == 0) { s_pending.enable_cloth        = enabled; return; }
     if (strcmp(feature, "soft_body")      == 0) { s_pending.enable_cloth        = enabled; return; }
+    if (strcmp(feature, "stylized_sky")   == 0) { s_pending.enable_stylized_sky = enabled; return; }
     if (strcmp(feature, "depth_prepass")  == 0) { s_pending.depth_prepass       = enabled; return; }
     if (strcmp(feature, "hdr_color")      == 0) { s_pending.hdr_color           = enabled; return; }
 }
@@ -326,6 +338,7 @@ bool jce_render_pipeline_load(const char *host_path,
     out->enable_gpu_particles  = jce_json_get_bool(root, "enable_gpu_particles",  out->enable_gpu_particles);
     out->enable_motion_blur    = jce_json_get_bool(root, "enable_motion_blur",    out->enable_motion_blur);
     out->enable_cloth          = jce_json_get_bool(root, "enable_cloth",          out->enable_cloth);
+    out->enable_stylized_sky   = jce_json_get_bool(root, "enable_stylized_sky",   out->enable_stylized_sky);
 
     int sr = jce_json_get_int(root, "shadow_resolution",
                               (int)out->shadow_resolution);
@@ -385,6 +398,7 @@ bool jce_render_pipeline_save(const char *host_path,
     jce_json_set_bool  (root, "enable_gpu_particles",  desc->enable_gpu_particles);
     jce_json_set_bool  (root, "enable_motion_blur",    desc->enable_motion_blur);
     jce_json_set_bool  (root, "enable_cloth",          desc->enable_cloth);
+    jce_json_set_bool  (root, "enable_stylized_sky",   desc->enable_stylized_sky);
 
     jce_json_set_int   (root, "shadow_resolution",  (int)desc->shadow_resolution);
     jce_json_set_int   (root, "csm_cascade_count",  (int)desc->csm_cascade_count);

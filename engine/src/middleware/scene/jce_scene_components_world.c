@@ -155,6 +155,20 @@ void parse_gas(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_gas(s, e, &gas);
 }
 
+void parse_sim_lod(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceSimLodComponent sl; memset(&sl, 0, sizeof sl);
+    sl.enabled       = j_bool(c, "enabled", true);
+    sl.near_radius   = (float)j_num(c, "nearRadius", 25.0);
+    sl.mid_radius    = (float)j_num(c, "midRadius", 80.0);
+    sl.near_hz       = (float)j_num(c, "nearHz", 0.0);   /* 0 = every frame */
+    sl.mid_hz        = (float)j_num(c, "midHz", 10.0);
+    sl.far_hz        = (float)j_num(c, "farHz", 1.0);
+    sl.gate_mask     = (uint32_t)j_num(c, "gateMask", (double)JCE_SIMLOD_GATE_ALL);
+    sl.gate_anim_far = j_bool(c, "gateAnimFar", true);
+    jce_scene_set_sim_lod(s, e, &sl);
+}
+
 static void ser_behavior_tree(const JceBehaviorTree *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -316,6 +330,27 @@ void serw_gas(JceScene *s, JceEntity e, cJSON *arr)
 {
     JceGameplayAbilitySystemComponent *c = jce_scene_get_gas(s, e);
     if (c) ser_gas(c, arr);
+}
+
+static void ser_sim_lod(const JceSimLodComponent *sl, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "SimLod");
+    cJSON_AddBoolToObject  (o, "enabled",     sl->enabled);
+    cJSON_AddNumberToObject(o, "nearRadius",  sl->near_radius);
+    cJSON_AddNumberToObject(o, "midRadius",   sl->mid_radius);
+    cJSON_AddNumberToObject(o, "nearHz",      sl->near_hz);
+    cJSON_AddNumberToObject(o, "midHz",       sl->mid_hz);
+    cJSON_AddNumberToObject(o, "farHz",       sl->far_hz);
+    cJSON_AddNumberToObject(o, "gateMask",    (double)sl->gate_mask);
+    cJSON_AddBoolToObject  (o, "gateAnimFar", sl->gate_anim_far);
+    cJSON_AddItemToArray(arr, o);
+}
+
+void serw_sim_lod(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceSimLodComponent *c = jce_scene_get_sim_lod(s, e);
+    if (c) ser_sim_lod(c, arr);
 }
 
 void serw_script(JceScene *s, JceEntity e, cJSON *arr)

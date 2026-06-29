@@ -968,6 +968,24 @@ void adddef_nav_agent(JceScene *scene, JceEntity e)
     jce_scene_set_nav_agent(scene, e, &def);
 }
 
+void adddef_sim_lod(JceScene *scene, JceEntity e)
+{
+    /* Open-world sensible defaults: full rate within 25 m, ~10 Hz out to 80 m,
+     * 1 Hz beyond — gating script + nav + behavior tree.  ENABLED by default
+     * (the component is opt-in by its mere presence). */
+    JceSimLodComponent def;
+    memset(&def, 0, sizeof(def));
+    def.enabled       = true;
+    def.near_radius   = 25.0f;
+    def.mid_radius    = 80.0f;
+    def.near_hz       = 0.0f;   /* every frame */
+    def.mid_hz        = 10.0f;
+    def.far_hz        = 1.0f;
+    def.gate_mask     = (uint32_t)JCE_SIMLOD_GATE_ALL;
+    def.gate_anim_far = true;
+    jce_scene_set_sim_lod(scene, e, &def);
+}
+
 void adddef_ik_constraints(JceScene *scene, JceEntity e)
 {
     JceIkConstraintComponent def;
@@ -1286,6 +1304,7 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "OcclusionPortal",     adddef_occlusion_portal },
         { "VideoPlayer",         adddef_video_player },
         { "NavAgent",            adddef_nav_agent },
+        { "SimLod",              adddef_sim_lod },
         { "IkConstraints",       adddef_ik_constraints },
         { "FootIk",              adddef_foot_ik },
         { "FullBodyIk",          adddef_full_body_ik },

@@ -11,6 +11,7 @@
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_lifecycle.h>
 #include <jce/os/core/jce_fixed_clock.h>
+#include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_jobs.h>
@@ -214,6 +215,14 @@ struct JceEngine {
     SDL_IOStream                *kpi_asset_log;
     uint64_t                    kpi_asset_frame_index;
     uint32_t                    kpi_asset_frame_limit;
+
+    /* Headless / CI auto-quit: when JCE_MAX_FRAMES is set, the engine emits
+     * WILL_QUIT and exits cleanly after that many rendered frames.  0 (the
+     * default) disables it.  Used by autonomous validation harnesses to run a
+     * deterministic number of frames (e.g. long enough for world streaming to
+     * apply chunks) without depending on window focus or an interactive quit. */
+    uint32_t                    max_frames;
+    uint32_t                    frame_index;
 
     /* DEBUG TOGGLE: deterministic input record / replay (JIRC).
      * Opened from JCE_INPUT_RECORD / JCE_INPUT_REPLAY env vars at create;
@@ -537,9 +546,15 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     if (!jce_renderer_is_fallback(e->renderer)) {
         /* Load and attach shaders (graphics layer no
-           longer depends on resource/pak_loader). */
-        JceShaderSet shaders =
-            jce_shaders_load_all(e->pak);
+           longer depends on resource/pak_loader).
+           JCE_SHADER_DEV_DIR overlays freshly-compiled <dev_dir>/shaders/*.bin
+           over the baked pak (per-shader fallback to pak), so a recompiled
+           shader is picked up at startup without repacking — a dev/CI loop
+           affordance.  Unset => byte-identical to the pak-only load. */
+        const char *shader_dev_dir = getenv("JCE_SHADER_DEV_DIR");
+        JceShaderSet shaders = (shader_dev_dir && shader_dev_dir[0])
+            ? jce_shaders_load_all_fs(shader_dev_dir, e->pak)
+            : jce_shaders_load_all(e->pak);
         jce_renderer_set_shaders(e->renderer, &shaders);
     }
 
@@ -649,6 +664,13 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         if (!e->assets)
             LOG_WARN(LOG_TAG, "asset manager init failed — direct loading only");
     }
+
+    /* Headless / CI auto-quit after N frames (0 = disabled). */
+    e->max_frames  = read_positive_u32_env("JCE_MAX_FRAMES", 0u);
+    e->frame_index = 0u;
+    if (e->max_frames)
+        LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES=%u: will auto-quit after %u frames",
+                 e->max_frames, e->max_frames);
 
     {
         const char *asset_kpi_path = SDL_getenv("JCE_KPI_ASSET_LOG");
@@ -1279,6 +1301,72 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
     JCE_PROFILE_FRAME_MARK;
     JCE_PROFILE_ZONE_END;
+
+    /* Perf telemetry (JCE_PERF_LOG): rolling frame-time / FPS over a 120-frame
+     * window, logged to the engine log.  Env-gated so it is ZERO cost when
+     * unset.  Engine-wide (any app/world, runtime or headless) so perf is
+     * measurable without per-game instrumentation — the standalone had no
+     * built-in frame telemetry, which made "is the big world fast?" unanswerable
+     * without a profiler.  worst = the spike frame in the window (hitches). */
+    {
+        static int s_perf_on = -1;
+        if (s_perf_on < 0) {
+            s_perf_on = (SDL_getenv("JCE_PERF_LOG") != NULL) ? 1 : 0;
+            jce_perf_phase_set_enabled(s_perf_on);
+        }
+        if (s_perf_on) {
+            static double   s_acc_ms = 0.0;
+            static double   s_worst_ms = 0.0;
+            static uint32_t s_n = 0u;
+            const double    ms = (double)dt * 1000.0;
+            s_acc_ms += ms;
+            if (ms > s_worst_ms) s_worst_ms = ms;
+            if (++s_n >= 120u) {
+                const double avg = s_acc_ms / (double)s_n;
+                /* Pull the last frame's CPU/GPU split + draw count so the log
+                 * tells you WHICH way it is bound (GPU+high draws → LOD/overdraw;
+                 * CPU high → cull/entity).  One representative sample at steady
+                 * state; the avg/worst are the windowed wall-clock. */
+                JceGpuStats gs;
+                if (jce_renderer_get_gpu_stats(&gs) && gs.valid) {
+                    LOG_INFO(LOG_TAG,
+                             "perf: %.2f ms avg (%.0f FPS) | cpu %.1f / gpu %.1f ms | %u draws | gpu-mem %lld MB | worst %.2f ms / %u",
+                             avg, (avg > 0.0) ? (1000.0 / avg) : 0.0,
+                             gs.cpu_frame_ms, gs.gpu_ms, gs.num_draw,
+                             (long long)(gs.gpu_memory_used > 0 ? gs.gpu_memory_used >> 20 : 0),
+                             s_worst_ms, s_n);
+                } else {
+                    LOG_INFO(LOG_TAG,
+                             "perf: %.2f ms/frame avg (%.0f FPS), worst %.2f ms, over %u frames",
+                             avg, (avg > 0.0) ? (1000.0 / avg) : 0.0, s_worst_ms, s_n);
+                }
+                {
+                    char phase_buf[512];
+                    jce_perf_phase_report(phase_buf, (int)sizeof(phase_buf));
+                    if (phase_buf[0])
+                        LOG_INFO(LOG_TAG, "perf-phases: %s", phase_buf);
+                }
+                s_acc_ms = 0.0;
+                s_worst_ms = 0.0;
+                s_n = 0u;
+            }
+        }
+    }
+
+    /* Headless / CI auto-quit: stop cleanly once we've rendered the requested
+     * number of frames.  Counts AFTER a full frame so frame N's work (and any
+     * END_OF_FRAME screenshot hook) has run.  Mirrors the SDL_EVENT_QUIT path:
+     * emit WILL_QUIT, then return SUCCESS to end the loop. */
+    if (e->max_frames) {
+        e->frame_index++;
+        if (e->frame_index >= e->max_frames) {
+            LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES reached (%u) — quitting",
+                     e->max_frames);
+            jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
+            return JCE_APP_SUCCESS;
+        }
+    }
+
     return JCE_APP_CONTINUE;
 }
 

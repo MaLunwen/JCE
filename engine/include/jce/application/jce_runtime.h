@@ -194,6 +194,53 @@ JCE_API float       JCE_CALL jce_runtime_get_time_scale(const JceRuntime *rt);
 JCE_API void        JCE_CALL jce_runtime_set_paused(JceRuntime *rt, bool paused);
 JCE_API bool        JCE_CALL jce_runtime_is_paused(const JceRuntime *rt);
 
+/* Global actor budget (large-world): cap the TOTAL live spawn-manager actors
+ * (peds/vehicles) across all managers at `max_actors`, and the spawns committed
+ * per frame at `per_frame_quota` (rate-limits pop-in bursts).  Either 0 = no
+ * limit (default; behaviour identical to before).  Spawns are refused once the
+ * pool/quota is hit; the manager simply retries on later frames as actors despawn. */
+JCE_API void        JCE_CALL jce_runtime_set_actor_budget(JceRuntime *rt,
+                                                          uint32_t max_actors,
+                                                          uint32_t per_frame_quota);
+/* Live actor count + configured budget (either out-param may be NULL). */
+JCE_API void        JCE_CALL jce_runtime_get_actor_stats(const JceRuntime *rt,
+                                                         uint32_t *out_count,
+                                                         uint32_t *out_budget);
+
+/* ── Streamed-cell gameplay wiring (streaming M3) ─────────────────────
+ *
+ * The world streamer spawns/destroys the SCENE entities of a chunk as the
+ * camera moves, but the runtime's gameplay subsystems (physics bodies,
+ * triggers, Lua scripts + on_start, behavior trees, nav agents, GAS,
+ * ragdolls, …) are otherwise materialised ONLY by the one-shot scene walk at
+ * create()/scene-load.  These two calls let the host wire a freshly-streamed
+ * cell's entities into — and release them from — the live runtime, so a script
+ * / trigger / NPC authored in a streamed cell actually comes alive (on_start /
+ * on_update, trigger observer, runtime body) instead of just rendering.
+ *
+ * spawn: for each id, runs the SAME per-entity wiring the create() walk and
+ *   jce.spawn use (body/character/audio + trigger/spawner/weapon/save-point/
+ *   BT/script+on_start/GAS/ragdoll/nav).  Re-wiring an id that already has live
+ *   gameplay would double it, so pass ONLY the freshly-spawned cell ids (the
+ *   streamer's on_spawn roster) — base-scene entities are already wired.
+ *
+ * despawn: for each id, RELEASES every runtime-side handle that references the
+ *   entity (destroys its physics body/collider, removes its trigger observer,
+ *   releases its script instance firing on_destroy, halts+frees its BT agent,
+ *   removes its nav agent, drops its GAS/ragdoll/vehicle/etc.) so the streamer
+ *   can then destroy the scene entity with NO dangling runtime reference.  Call
+ *   this from the streamer's on_despawn (which fires while the ids are still
+ *   valid, BEFORE the scene entities are destroyed).
+ *
+ * Both are safe with a NULL runtime / NULL ids / count 0, and silently skip an
+ * id that has no tracked gameplay state.  `ids` are JceEntity values. */
+JCE_API void JCE_CALL jce_runtime_spawn_gameplay_for_ids(JceRuntime *rt,
+                                                         const uint64_t *ids,
+                                                         uint32_t count);
+JCE_API void JCE_CALL jce_runtime_despawn_gameplay_for_ids(JceRuntime *rt,
+                                                           const uint64_t *ids,
+                                                           uint32_t count);
+
 /* ── Floating-origin large-world coordinates ─────────────────────────
  *
  * Returns the runtime's mutable JceWorldOrigin so gameplay/streaming code can

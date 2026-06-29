@@ -43,6 +43,15 @@ static bool s_show_stats  = false;
 static int  s_run_mode_idx = 0;
 static bool s_run_mode_loaded = false;
 static bool s_third_person = false;   /* play camera: false=first-person, true=behind-player */
+/* Whether the user has clicked into the Game View to drive its camera (FPS
+ * fly-cam / WASD free-fly / player-controller).  Persists across frames and
+ * stays true even while LeftAlt momentarily frees the cursor (ALT-free-look),
+ * so it — not the transient mouse-capture flag — is the authoritative "the
+ * Game View owns keyboard input right now" signal.  The editor shortcut gate
+ * (jce_editor_layout.cpp) reads it via jce_editor_game_view_is_input_active()
+ * so in-game keys (WASD, Ctrl+S, …) never leak into editor commands during
+ * Play.  Set on click-in, cleared on ESC / Stop. */
+static bool s_user_wants_capture = false;
 static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
 static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
 static char s_pending_game_exe_path[512] = {0};
@@ -170,6 +179,21 @@ static void forward_text_input_to_canvas(void)
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i)
         if (ImGui::IsKeyPressed(map[i].ik, /*repeat*/true))
             jce_editor_game_render_key_edit(map[i].jk, mod);
+}
+
+/* Whether the Game View is actively driving game input this frame: the user
+ * has clicked into the viewport to take control of the camera / player (FPS
+ * fly-cam, WASD free-fly, or CharacterController), OR the OS mouse is currently
+ * captured.  True even during a momentary LeftAlt free-look release, where the
+ * cursor is freed but the user is still mid-session driving the Game View.
+ *
+ * The editor shortcut gate consults this (gated by Play state) so editor
+ * hotkeys (Ctrl+S / Ctrl+A / …) do not mis-fire while the user is playing in
+ * the Game View — Play-consistent, not just the strict mouse-captured case. */
+bool jce_editor_game_view_is_input_active(void)
+{
+    return s_user_wants_capture ||
+           jce_editor_game_render_is_mouse_captured();
 }
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -453,7 +477,8 @@ void jce_editor_panel_game_view_content(void)
      *   Space / LeftShift         → move up / down
      *   LeftCtrl                  → x5 boost
      */
-    static bool s_user_wants_capture = false;
+    /* s_user_wants_capture is file-scoped (top of this TU) so the editor
+       shortcut gate can query it via jce_editor_game_view_is_input_active(). */
 
     JceCamera *cam = jce_editor_game_render_get_camera();
     JcePlayState play_state = jce_state_get_play_state();

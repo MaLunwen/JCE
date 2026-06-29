@@ -1137,6 +1137,29 @@ void jce_bullet_body_set_velocity(JceBulletWorld *bw, uint32_t idx,
     bw->bodies[slot]->activate();
 }
 
+/* Sim-LOD physics gating: force a body to sleep (far tier) or wake (near tier).
+ * Inactive => DISABLE_SIMULATION (the solver/island manager skips it entirely)
+ * with velocities zeroed so it freezes in place; active => ACTIVE_TAG + activate
+ * so it resumes normal integration.  forceActivationState (not setActivationState)
+ * so Bullet does not auto-wake a deliberately-slept far body on contact. */
+void jce_bullet_body_set_active(JceBulletWorld *bw, uint32_t idx, bool active)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *b = bw->bodies[slot];
+    if (active) {
+        if (b->getActivationState() == DISABLE_SIMULATION)
+            b->forceActivationState(ACTIVE_TAG);
+        b->activate(true);
+    } else {
+        if (b->getActivationState() != DISABLE_SIMULATION) {
+            b->setLinearVelocity(btVector3(0, 0, 0));
+            b->setAngularVelocity(btVector3(0, 0, 0));
+            b->forceActivationState(DISABLE_SIMULATION);
+        }
+    }
+}
+
 /* ================================================================== */
 /* Angular velocity                                                    */
 /* ================================================================== */

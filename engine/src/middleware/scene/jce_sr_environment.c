@@ -11,6 +11,9 @@
 
 #include "jce_sr_internal.h"
 
+#include <jce/resource/jce_image_decode.h>  /* density-mask load (large-world #8a) */
+#include <string.h>
+
 /* ── Vegetation scatter draw (P0 foliage, roadmap 2.2) ─────────────────
  *
  * Deterministically scatters a referenced mesh over the bound terrain
@@ -33,6 +36,12 @@ static uint32_t sr_foliage_param_hash(const JceVegetationScatterComponent *vs)
     h = jce_fnv1a32_append(h, &vs->max_slope_deg, sizeof vs->max_slope_deg);
     h = jce_fnv1a32_append(h, &vs->scale_min,     sizeof vs->scale_min);
     h = jce_fnv1a32_append(h, &vs->scale_max,     sizeof vs->scale_max);
+    /* density mask path — a change re-scatters (large-world #8a). */
+    h = jce_fnv1a32_append(h, vs->density_mask_path, (uint32_t)strlen(vs->density_mask_path));
+    /* painted density grid — each brush stroke changes it -> re-scatter. */
+    h = jce_fnv1a32_append(h, &vs->density_paint_active, sizeof vs->density_paint_active);
+    if (vs->density_paint_active)
+        h = jce_fnv1a32_append(h, vs->density_paint, (uint32_t)sizeof vs->density_paint);
     return h;
 }
 
@@ -66,6 +75,170 @@ static jce_mat4 sr_foliage_instance_matrix(const JceFoliageInstance *fi)
     m.col[3].x = fi->pos[0]; m.col[3].y = fi->pos[1]; m.col[3].z = fi->pos[2];
     m.col[3].w = 1.0f;
     return m;
+}
+
+/* Pack a float rgba [0..1] into bgfx 0xAABBGGRR. */
+static uint32_t sr_line_abgr(const float c[4])
+{
+    float r = c[0] < 0.0f ? 0.0f : (c[0] > 1.0f ? 1.0f : c[0]);
+    float g = c[1] < 0.0f ? 0.0f : (c[1] > 1.0f ? 1.0f : c[1]);
+    float b = c[2] < 0.0f ? 0.0f : (c[2] > 1.0f ? 1.0f : c[2]);
+    float a = c[3] < 0.0f ? 0.0f : (c[3] > 1.0f ? 1.0f : c[3]);
+    uint32_t ri = (uint32_t)(r * 255.0f + 0.5f);
+    uint32_t gi = (uint32_t)(g * 255.0f + 0.5f);
+    uint32_t bi = (uint32_t)(b * 255.0f + 0.5f);
+    uint32_t ai = (uint32_t)(a * 255.0f + 0.5f);
+    return (ai << 24) | (bi << 16) | (gi << 8) | ri;
+}
+
+/* Transform a point by a column-major jce_mat4 (w = 1). */
+static jce_vec3 sr_line_xf(const jce_mat4 *m, float x, float y, float z)
+{
+    jce_vec3 r;
+    r.x = m->col[0].x*x + m->col[1].x*y + m->col[2].x*z + m->col[3].x;
+    r.y = m->col[0].y*x + m->col[1].y*y + m->col[2].y*z + m->col[3].y;
+    r.z = m->col[0].z*x + m->col[1].z*y + m->col[2].z*z + m->col[3].z;
+    return r;
+}
+
+/* Shared camera-facing TRIANGLE RIBBON (PT_LINES produces nothing in the editor
+ * pre-postfx offscreen; triangles via the color program DO render).  Width-
+ * expanded quads, colour + width lerped along the polyline, optionally looped.
+ * Points are transformed by `model` (identity => already world).  No new shader.
+ * Shared by the Line renderer (loopable, local/world) and the Trail renderer
+ * (open, world-space captured points). */
+static void sr_draw_ribbon(JceSceneRenderer *sr, const JceCamera *camera,
+                           uint16_t view_id, const jce_mat4 *model,
+                           const float (*points)[3], int count, bool loop,
+                           float w0, float w1,
+                           const float c0[4], const float c1[4])
+{
+    if (count < 2) return;
+    int pts = count;
+    if (pts > JCE_LINE_MAX_POINTS) pts = JCE_LINE_MAX_POINTS;
+    int segs = loop ? pts : (pts - 1);
+    if (segs < 1) return;
+
+    uint32_t vcount = (uint32_t)segs * 4u;   /* quad per segment */
+    uint32_t icount = (uint32_t)segs * 6u;
+
+    bgfx_vertex_layout_t layout;
+    bgfx_vertex_layout_begin(&layout, bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_COLOR0,   4, BGFX_ATTRIB_TYPE_UINT8, true, false);
+    bgfx_vertex_layout_end(&layout);
+
+    bgfx_transient_vertex_buffer_t tvb;
+    bgfx_transient_index_buffer_t  tib;
+    if (!bgfx_alloc_transient_buffers(&tvb, &layout, vcount, &tib, icount, false))
+        return;
+
+    struct SrLineVtx { float x, y, z; uint32_t abgr; };
+    struct SrLineVtx *v = (struct SrLineVtx *)tvb.data;
+    uint16_t *idx = (uint16_t *)tib.data;
+
+    jce_vec3 eye = camera ? jce_camera_get_position(camera)
+                          : jce_v3(0.0f, 0.0f, 1.0e4f);
+
+    uint32_t vi = 0, ii = 0;
+    for (int s = 0; s < segs; ++s) {
+        int   ia = s;
+        int   ib = (s + 1) % pts;
+        float ta = (pts > 1) ? (float)ia / (float)(pts - 1) : 0.0f;
+        float tb = (loop && s == segs - 1)
+                     ? 1.0f
+                     : ((pts > 1) ? (float)ib / (float)(pts - 1) : 0.0f);
+
+        jce_vec3 wa = sr_line_xf(model, points[ia][0], points[ia][1], points[ia][2]);
+        jce_vec3 wb = sr_line_xf(model, points[ib][0], points[ib][1], points[ib][2]);
+
+        jce_vec3 dir = jce_v3_sub(wb, wa);
+        float    dl  = jce_v3_len(dir);
+        if (dl < 1e-6f) continue;
+        dir = jce_v3_scale(dir, 1.0f / dl);
+        jce_vec3 mid = jce_v3_scale(jce_v3_add(wa, wb), 0.5f);
+        jce_vec3 vdir = jce_v3_sub(mid, eye);
+        float    vl = jce_v3_len(vdir);
+        vdir = (vl > 1e-6f) ? jce_v3_scale(vdir, 1.0f / vl) : jce_v3(0,0,1);
+        jce_vec3 side = jce_v3_cross(dir, vdir);
+        float    sl = jce_v3_len(side);
+        if (sl < 1e-6f) { side = jce_v3(0,1,0); sl = 1.0f; }
+        side = jce_v3_scale(side, 1.0f / sl);
+
+        float wda = w0 + (w1 - w0) * ta;
+        float wdb = w0 + (w1 - w0) * tb;
+        if (wda < 0.05f) wda = 0.05f;
+        if (wdb < 0.05f) wdb = 0.05f;
+        jce_vec3 sa = jce_v3_scale(side, wda * 0.5f);
+        jce_vec3 sb = jce_v3_scale(side, wdb * 0.5f);
+
+        float ca[4], cb[4];
+        for (int c = 0; c < 4; ++c) {
+            float d = c1[c] - c0[c];
+            ca[c] = c0[c] + d * ta;
+            cb[c] = c0[c] + d * tb;
+        }
+        uint32_t col_a = sr_line_abgr(ca), col_b = sr_line_abgr(cb);
+
+        jce_vec3 p0 = jce_v3_add(wa, sa), p1 = jce_v3_sub(wa, sa);
+        jce_vec3 p2 = jce_v3_add(wb, sb), p3 = jce_v3_sub(wb, sb);
+        uint32_t base = vi;
+        v[vi].x=p0.x; v[vi].y=p0.y; v[vi].z=p0.z; v[vi].abgr=col_a; ++vi;
+        v[vi].x=p1.x; v[vi].y=p1.y; v[vi].z=p1.z; v[vi].abgr=col_a; ++vi;
+        v[vi].x=p2.x; v[vi].y=p2.y; v[vi].z=p2.z; v[vi].abgr=col_b; ++vi;
+        v[vi].x=p3.x; v[vi].y=p3.y; v[vi].z=p3.z; v[vi].abgr=col_b; ++vi;
+        idx[ii++]=(uint16_t)base;     idx[ii++]=(uint16_t)(base+1); idx[ii++]=(uint16_t)(base+2);
+        idx[ii++]=(uint16_t)(base+1); idx[ii++]=(uint16_t)(base+3); idx[ii++]=(uint16_t)(base+2);
+    }
+    if (ii == 0) return;
+
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, vcount);
+    bgfx_set_transient_index_buffer(&tib, 0, ii);
+    jce_mat4 ident = jce_m4_identity();
+    bgfx_set_transform(ident.raw[0], 1);   /* positions are already world */
+
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z
+                   | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA | BGFX_STATE_BLEND_ALPHA;
+    bgfx_set_state(state, 0);   /* no cull: ribbon is double-sided */
+
+    JceShaderHandle sh = jce_renderer_get_program_color(sr->renderer);
+    bgfx_program_handle_t prog;
+    prog.idx = sh.idx;
+    if (BGFX_HANDLE_IS_VALID(prog))
+        bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
+/* Line Renderer — colour/width-lerped ribbon, loopable; local points ride the
+ * entity transform, world-space points draw directly. */
+void sr_draw_line_renderer(JceSceneRenderer *sr, JceScene *scene,
+                           EntityList *list, JceEntity e,
+                           const JceCamera *camera, uint16_t view_id)
+{
+    (void)list;
+    JceLineRendererComponent *lr = jce_scene_get_line_renderer(scene, e);
+    if (!lr || lr->position_count < 2) return;
+    jce_mat4 model = lr->use_world_space ? jce_m4_identity()
+                                         : jce_scene_get_world_matrix(scene, e);
+    sr_draw_ribbon(sr, camera, view_id, &model, lr->positions, lr->position_count,
+                   lr->loop, lr->width_start, lr->width_end,
+                   lr->color_start, lr->color_end);
+}
+
+/* Trail Renderer — the runtime-captured world-space point trail drawn as an open
+ * ribbon.  Capture/growth happens in the runtime (rt_update_trails); here we
+ * just draw whatever points the buffer currently holds (also previews a scene's
+ * serialized trail in the editor). */
+void sr_draw_trail_renderer(JceSceneRenderer *sr, JceScene *scene,
+                            EntityList *list, JceEntity e,
+                            const JceCamera *camera, uint16_t view_id)
+{
+    (void)list;
+    JceTrailRendererComponent *tr = jce_scene_get_trail_renderer(scene, e);
+    if (!tr || tr->point_count < 2) return;
+    jce_mat4 ident = jce_m4_identity();   /* trail points are already world */
+    sr_draw_ribbon(sr, camera, view_id, &ident, tr->points, tr->point_count,
+                   false, tr->width_start, tr->width_end,
+                   tr->color_start, tr->color_end);
 }
 
 void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
@@ -107,6 +280,54 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
         p.max_slope_deg = vs->max_slope_deg;
         p.scale_min     = vs->scale_min;
         p.scale_max     = vs->scale_max;
+        p.density_mask  = NULL;
+        p.mask_dim      = 0;
+
+        /* Density mask (large-world #8a): decode the grayscale mask asset into a
+         * square float grid and feed the scatter so painted/sparse regions thin
+         * out. Loaded only on rebuild (param-hash gated); freed after scatter. */
+        float *mask_grid = NULL;
+        if (vs->density_paint_active) {
+            /* In-editor painted grid (large-world #8a brush) supersedes the
+             * external mask asset. */
+            int dim = JCE_VEG_PAINT_DIM;
+            mask_grid = (float *)JCE_MALLOC((size_t)dim * (size_t)dim * sizeof(float));
+            if (mask_grid) {
+                for (int i = 0; i < dim * dim; ++i)
+                    mask_grid[i] = (float)vs->density_paint[i] / 255.0f;
+                p.density_mask = mask_grid;
+                p.mask_dim     = dim;
+            }
+        } else if (vs->density_mask_path[0]) {
+            char        resolved[1024];
+            const char *mp = vs->density_mask_path;
+            if (sr->has_cbs && sr->cbs.resolve_path &&
+                sr->cbs.resolve_path(vs->density_mask_path, resolved,
+                                     (int)sizeof resolved, sr->cbs.userdata))
+                mp = resolved;
+            JceImage img;
+            memset(&img, 0, sizeof img);
+            if (jce_image_decode_file(mp, &img) && img.pixels &&
+                img.width > 0 && img.height > 0) {
+                int dim = (int)img.width;
+                if (dim > 256) dim = 256;
+                mask_grid = (float *)JCE_MALLOC((size_t)dim * (size_t)dim * sizeof(float));
+                if (mask_grid) {
+                    for (int y = 0; y < dim; ++y)
+                        for (int x = 0; x < dim; ++x) {
+                            int sx = (int)((int64_t)x * (int64_t)img.width  / dim);
+                            int sy = (int)((int64_t)y * (int64_t)img.height / dim);
+                            if (sx >= (int)img.width)  sx = (int)img.width  - 1;
+                            if (sy >= (int)img.height) sy = (int)img.height - 1;
+                            mask_grid[(size_t)y * dim + x] =
+                                img.pixels[((size_t)sy * img.width + sx) * 4u] / 255.0f;
+                        }
+                    p.density_mask = mask_grid;
+                    p.mask_dim     = dim;
+                }
+            }
+            jce_image_free(&img);
+        }
 
         uint32_t want = (uint32_t)((double)p.density * (double)p.area_x * (double)p.area_z);
         if (want > JCE_FOLIAGE_MAX_INSTANCES) want = JCE_FOLIAGE_MAX_INSTANCES;
@@ -121,23 +342,334 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
         sr->foliage_cache[slot].inst_count = jce_foliage_scatter(
             &p, terr, &origin, sr->foliage_cache[slot].insts,
             sr->foliage_cache[slot].inst_cap);
+        if (mask_grid) JCE_FREE(mask_grid);
         sr->foliage_cache[slot].param_hash = ph;
         sr->foliage_cache[slot].entity     = e;
         sr->foliage_cache[slot].used       = true;
         snprintf(sr->foliage_cache[slot].mesh_path,
                  sizeof sr->foliage_cache[slot].mesh_path, "%s", vs->mesh_path);
+
+        /* Pre-build per-instance world matrices once (placement is static after
+         * scatter) so the per-frame draw is a single GPU-instanced submit instead
+         * of N CPU draws.  Rebuilt only when the scatter rebuilds. */
+        uint32_t nc = sr->foliage_cache[slot].inst_count;
+        if (sr->foliage_cache[slot].roots_cap < nc) {
+            jce_mat4 *nr = (jce_mat4 *)JCE_REALLOC(
+                sr->foliage_cache[slot].roots, (size_t)nc * sizeof(jce_mat4));
+            if (!nr) return;
+            sr->foliage_cache[slot].roots     = nr;
+            sr->foliage_cache[slot].roots_cap = nc;
+        }
+        for (uint32_t i = 0; i < nc; ++i)
+            sr->foliage_cache[slot].roots[i] =
+                sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i]);
+        LOG_INFO(LOG_TAG, "foliage '%s': %u instances scattered "
+                 "(single GPU-instanced submit; 4096 draw cap removed)",
+                 vs->mesh_path, nc);
     }
 
     SrModelCache *mc = sr_get_model(sr, vs->mesh_path, (uint32_t)e);
     if (!mc || !mc->model) return;
 
-    /* Per-instance draw (capped for per-frame cost; instancing is follow-up). */
+    /* One GPU-instanced submit for all scattered copies (the model's real PBR
+     * materials + in-asset LOD are bound once per primitive, shared across every
+     * instance).  No 4096 cap on the instanced path — that ceiling silently
+     * killed any forest/meadow past 4k.  When the instanced PBR program is
+     * unavailable (low-GPU fallback), jce_model_draw_instanced_tinted degrades to
+     * solo draws, so cap THAT path to bound per-frame cost. */
     uint32_t n = sr->foliage_cache[slot].inst_count;
-    const uint32_t kDrawCap = 4096u;
-    if (n > kDrawCap) n = kDrawCap;
-    for (uint32_t i = 0; i < n; ++i) {
-        jce_mat4 m = sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i]);
-        jce_model_draw(mc->model, sr->renderer, view_id, &m, NULL, 0);
+    if (!sr->foliage_cache[slot].roots || n == 0) return;
+    const bool instanced =
+        jce_renderer_get_program_pbr_inst(sr->renderer).idx != UINT16_MAX;
+    if (!instanced && n > 4096u) n = 4096u;
+    jce_model_draw_instanced_tinted(mc->model, sr->renderer, view_id,
+                                    sr->foliage_cache[slot].roots, NULL, n);
+}
+
+
+/* ── Grass Field (GPU-instanced procedural blades + wind, Stage 1b.6) ──────
+ *
+ * One dedicated module separate from the foliage loop above:
+ *  - ONE instanced submit per field (stride-80 tinted layout)
+ *  - Standalone vs_grass + fs_grass (NOT fs_pbr_body)
+ *  - Placement via jce_foliage_scatter (same deterministic scatter as foliage)
+ *  - Shared blade mesh built once with default look; per-field look is uniforms
+ * Gated to instancing-capable HIGH/ULTRA GPUs + JceRenderSettings.grass_enabled.
+ */
+
+/* Pure-CPU blade vertex fill: fills pre-allocated `v` (nverts = cards*4) and
+ * `idx` (nindices = cards*6) arrays with the crossed-quad blade geometry.
+ * Exposed non-static so the unit test can call it without bgfx.
+ * Returns the number of vertices written (cards*4). */
+uint32_t sr_grass_fill_blade(float blade_height, float blade_width, int cards,
+                             JceMeshVertex *v, uint32_t *idx)
+{
+    const float h  = blade_height > 0.0f ? blade_height : 0.4f;
+    const float hw = (blade_width > 0.0f ? blade_width : 0.05f) * 0.5f;
+    uint32_t vi = 0, ii = 0;
+    for (int c = 0; c < cards; ++c) {
+        float ang = (cards > 1) ? (3.14159265f * (float)c / (float)cards) : 0.0f;
+        float dx = cosf(ang), dz = sinf(ang);
+        float nx = -dz, nz = dx;
+        uint32_t base = vi;
+        /* root-left, root-right, tip-right, tip-left */
+        v[vi].pos[0]=-dx*hw; v[vi].pos[1]=0.0f; v[vi].pos[2]=-dz*hw;
+        v[vi].normal[0]=nx; v[vi].normal[1]=0.5f; v[vi].normal[2]=nz; v[vi].uv[0]=0.0f; v[vi].uv[1]=0.0f; vi++;
+        v[vi].pos[0]= dx*hw; v[vi].pos[1]=0.0f; v[vi].pos[2]= dz*hw;
+        v[vi].normal[0]=nx; v[vi].normal[1]=0.5f; v[vi].normal[2]=nz; v[vi].uv[0]=1.0f; v[vi].uv[1]=0.0f; vi++;
+        v[vi].pos[0]= dx*hw; v[vi].pos[1]=h;    v[vi].pos[2]= dz*hw;
+        v[vi].normal[0]=nx; v[vi].normal[1]=0.5f; v[vi].normal[2]=nz; v[vi].uv[0]=1.0f; v[vi].uv[1]=1.0f; vi++;
+        v[vi].pos[0]=-dx*hw; v[vi].pos[1]=h;    v[vi].pos[2]=-dz*hw;
+        v[vi].normal[0]=nx; v[vi].normal[1]=0.5f; v[vi].normal[2]=nz; v[vi].uv[0]=0.0f; v[vi].uv[1]=1.0f; vi++;
+        /* CCW-from-the-card-front (double-sided state is set at draw). */
+        idx[ii++]=base+0; idx[ii++]=base+1; idx[ii++]=base+2;
+        idx[ii++]=base+0; idx[ii++]=base+2; idx[ii++]=base+3;
+    }
+    return vi;
+}
+
+/* Build the shared procedural grass-blade mesh: `cards` crossed alpha quads,
+ * world-unit `blade_height` tall x `blade_width` wide, root at local y=0.
+ * a_texcoord0.y carries the 0(root)->1(tip) bend/gradient parameter; .x is
+ * the 0->1 horizontal card UV.  CCW-from-above / front-facing winding (engine
+ * convention).  Pure CPU mesh -- vs_grass bends it; the result is shared across
+ * all fields (per-field look is uniforms, not geometry). */
+JceMesh *sr_grass_build_blade(float blade_height, float blade_width, int cards)
+{
+    if (cards < 1) cards = 1;
+    if (cards > 6) cards = 6;
+
+    const uint32_t nverts   = (uint32_t)cards * 4u;
+    const uint32_t nindices = (uint32_t)cards * 6u;
+    JceMeshVertex *v = (JceMeshVertex *)JCE_MALLOC(nverts * sizeof(JceMeshVertex));
+    if (!v) return NULL;
+    uint32_t *idx = (uint32_t *)JCE_MALLOC(nindices * sizeof(uint32_t));
+    if (!idx) { JCE_FREE(v); return NULL; }
+
+    sr_grass_fill_blade(blade_height, blade_width, cards, v, idx);
+
+    JceMesh *m = jce_mesh_create(v, nverts, idx, nindices);
+    JCE_FREE(v); JCE_FREE(idx);
+    return m;
+}
+
+/* Lazily create the grass program + its uniforms (once per renderer). */
+static void sr_grass_lazy_init(JceSceneRenderer *sr)
+{
+    if (!sr->grass_prog_tried) {
+        sr->grass_prog_tried = true;
+        JceShaderHandle gh = shader_load_program(sr->pak, "grass");
+        sr->prog_grass.idx = gh.idx;
+        if (gh.idx == UINT16_MAX)
+            LOG_WARN(LOG_TAG, "grass shader not found in PAK "
+                              "(grass fields will not render)");
+    }
+    if (!BGFX_HANDLE_IS_VALID(sr->u_grass_time))
+        sr->u_grass_time = bgfx_create_uniform("u_grass_time", BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_grass_wind))
+        sr->u_grass_wind = bgfx_create_uniform("u_grass_wind", BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_grass_color))
+        sr->u_grass_color = bgfx_create_uniform("u_grass_color", BGFX_UNIFORM_TYPE_VEC4, 2);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_grass_fade))
+        sr->u_grass_fade = bgfx_create_uniform("u_grass_fade", BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!sr->grass_blade)
+        sr->grass_blade = sr_grass_build_blade(0.4f, 0.05f, 4);
+}
+
+/* FNV-1a over the grass scatter-shaping fields (density/seed/area/slope/scale)
+ * AND the look fields that affect blade geometry (blade_height/blade_width/cards).
+ * Task 6 compares this hash to detect per-entity changes that require a re-scatter.
+ * All nine fields must be included so that changing any one of them invalidates the
+ * cached placement, matching the spec: density/seed/area_x/area_z/max_slope_deg/
+ * scale_min/scale_max/blade_height/blade_width/cards. */
+static uint32_t sr_grass_param_hash(const JceGrassFieldComponent *g)
+{
+    uint32_t h = jce_fnv1a32_append(JCE_FNV1A32_INIT, &g->seed, sizeof g->seed);
+    h = jce_fnv1a32_append(h, &g->density,       sizeof g->density);
+    h = jce_fnv1a32_append(h, &g->area_x,        sizeof g->area_x);
+    h = jce_fnv1a32_append(h, &g->area_z,        sizeof g->area_z);
+    h = jce_fnv1a32_append(h, &g->max_slope_deg, sizeof g->max_slope_deg);
+    h = jce_fnv1a32_append(h, &g->scale_min,     sizeof g->scale_min);
+    h = jce_fnv1a32_append(h, &g->scale_max,     sizeof g->scale_max);
+    /* Look fields that affect placement geometry — include so cache is invalidated
+     * when blade_height/width/cards change (Task 6 uses this hash for change detection). */
+    h = jce_fnv1a32_append(h, &g->blade_height,  sizeof g->blade_height);
+    h = jce_fnv1a32_append(h, &g->blade_width,   sizeof g->blade_width);
+    h = jce_fnv1a32_append(h, &g->cards,         sizeof g->cards);
+    return h;
+}
+
+/* Free the instance buffer in a single grass cache slot and reset it.
+ * Non-static: called by jce_scene_renderer.c destroy loop and Task 6 cache
+ * invalidation (mirrors sr_water_slot_free declared in jce_sr_internal.h). */
+void sr_grass_slot_free(JceSceneRenderer *sr, int slot)
+{
+    JCE_FREE(sr->grass_cache[slot].insts);
+    memset(&sr->grass_cache[slot], 0, sizeof sr->grass_cache[slot]);
+}
+
+/* Find (or evict into) a grass cache slot for entity `e`. */
+static int sr_grass_find_slot(JceSceneRenderer *sr, JceEntity e)
+{
+    int n = (int)(sizeof sr->grass_cache / sizeof sr->grass_cache[0]);
+    int free_slot = -1;
+    for (int i = 0; i < n; ++i) {
+        if (sr->grass_cache[i].used && sr->grass_cache[i].entity == e) return i;
+        if (free_slot < 0 && !sr->grass_cache[i].used) free_slot = i;
+    }
+    if (free_slot >= 0) return free_slot;
+    int victim = (int)((uint32_t)e % (uint32_t)n);
+    sr_grass_slot_free(sr, victim);
+    return victim;
+}
+
+/* sr_draw_grass — ONE instanced bgfx submit per grass field.
+ *
+ * Resolves the terrain (for height-snapped placement), scatters blades into
+ * the per-entity grass_cache slot (rebuilt only when the param hash changes),
+ * then issues ONE instanced draw (partial-fill loop, mirrors
+ * jce_model_draw_instanced_tinted at jce_model.c:655-712) with the shared
+ * vs_grass+fs_grass program.  Instance buffer = stride-80 tinted layout:
+ *   offset 0  = mat4 (per-blade TRS from sr_foliage_instance_matrix)
+ *   offset 64 = vec4 tint (green↔blue-green hue jitter, index-derived)
+ * No shadow submission (cast_shadow is reserved for v1; would need vs_shadow_inst). */
+void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
+                   EntityList *list, JceEntity e, uint16_t view_id)
+{
+    JceGrassFieldComponent *g = jce_scene_get_grass_field(scene, e);
+    if (!g || !g->visible) return;
+    if (!jce_scene_has_transform(scene, e)) return;
+
+    sr_grass_lazy_init(sr);
+    if (!BGFX_HANDLE_IS_VALID(sr->prog_grass) || !sr->grass_blade) return;
+
+    /* ── Scatter cache (rebuild only on param change) ─────────────── */
+    int slot = sr_grass_find_slot(sr, e);
+    if (slot < 0) return;
+
+    const uint32_t ph    = sr_grass_param_hash(g);
+    const bool     rebuild = !sr->grass_cache[slot].used ||
+                              sr->grass_cache[slot].entity != e ||
+                              sr->grass_cache[slot].param_hash != ph;
+    if (rebuild) {
+        /* Resolve the first available terrain for height-snap. */
+        JceTerrain *terr = NULL;
+        for (int i = 0; i < list->count; ++i) {
+            JceEntity te = list->entities[i];
+            if (!jce_scene_has_terrain(scene, te)) continue;
+            JceTerrainComponent *tc = jce_scene_get_terrain(scene, te);
+            if (!tc || !tc->terrain_path[0]) continue;
+            int tslot = sr_terrain_find_or_load_slot(sr, tc->terrain_path);
+            if (tslot >= 0) { terr = sr->terrain_cache[tslot].terrain; break; }
+        }
+
+        jce_mat4 wm     = jce_scene_get_world_matrix(scene, e);
+        jce_vec3 origin = { wm.col[3].x, wm.col[3].y, wm.col[3].z };
+
+        JceFoliageScatterParams p;
+        p.seed          = g->seed;
+        p.density       = g->density;
+        p.area_x        = g->area_x;
+        p.area_z        = g->area_z;
+        p.max_slope_deg = g->max_slope_deg;
+        p.scale_min     = g->scale_min;
+        p.scale_max     = g->scale_max;
+        p.density_mask  = NULL;   /* grass has no density mask (crash fix) */
+        p.mask_dim      = 0;
+
+        uint32_t want = (uint32_t)((double)p.density *
+                                   (double)p.area_x * (double)p.area_z);
+        if (want > JCE_FOLIAGE_MAX_INSTANCES) want = JCE_FOLIAGE_MAX_INSTANCES;
+        if (want == 0) want = 1;
+
+        if (sr->grass_cache[slot].inst_cap < want) {
+            JceFoliageInstance *nb = (JceFoliageInstance *)JCE_REALLOC(
+                sr->grass_cache[slot].insts,
+                (size_t)want * sizeof(JceFoliageInstance));
+            if (!nb) return;
+            sr->grass_cache[slot].insts    = nb;
+            sr->grass_cache[slot].inst_cap = want;
+        }
+
+        sr->grass_cache[slot].inst_count = jce_foliage_scatter(
+            &p, terr, &origin,
+            sr->grass_cache[slot].insts, sr->grass_cache[slot].inst_cap);
+        sr->grass_cache[slot].param_hash = ph;
+        sr->grass_cache[slot].entity     = e;
+        sr->grass_cache[slot].used       = true;
+    }
+
+    uint32_t count = sr->grass_cache[slot].inst_count;
+    if (count == 0) return;
+    JceFoliageInstance *insts = sr->grass_cache[slot].insts;
+
+    /* ── Global PBR bind (lights/camera/ambient) ──────────────────── */
+    JcePbrMaterial gpbr = jce_pbr_material_default();
+    sr_inline_bind_pbr_global(sr, &gpbr, view_id, scene, list);
+
+    /* ── Grass-specific uniforms ──────────────────────────────────── */
+    float utime[4]  = { sr->grass_time, 0.0f, 0.0f, 0.0f };
+    float uwind[4]  = { g->wind_dir[0], g->wind_dir[1],
+                        g->wind_speed, g->wind_amplitude };
+    float ucolor[8] = {
+        g->root_color[0], g->root_color[1], g->root_color[2], 1.0f,
+        g->tip_color[0],  g->tip_color[1],  g->tip_color[2],  1.0f
+    };
+    float ufade[4]  = { g->fade_start, g->fade_end, g->hue_jitter, 0.0f };
+    bgfx_set_uniform(sr->u_grass_time,  utime,  1);
+    bgfx_set_uniform(sr->u_grass_wind,  uwind,  1);
+    bgfx_set_uniform(sr->u_grass_color, ucolor, 2);
+    bgfx_set_uniform(sr->u_grass_fade,  ufade,  1);
+
+    /* ── Instanced submit loop (partial-fill, mirrors model instancing) ── */
+    const bgfx_program_handle_t prog   = sr->prog_grass;
+    const uint16_t              stride = (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4));
+    /* stride = 64 (mat4) + 16 (tint vec4) = 80 bytes */
+
+    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(sr->grass_blade) };
+    bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(sr->grass_blade) };
+    if (!BGFX_HANDLE_IS_VALID(vbh) || !BGFX_HANDLE_IS_VALID(ibh)) return;
+
+    /* Opaque, depth-tested, depth-write, no back-face cull (double-sided
+     * cards visible from both faces), MSAA.  No alpha-blending (v1 cards are
+     * solid; an alpha-atlas path is a Phase-2 option). */
+    const uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                         | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
+                         | BGFX_STATE_MSAA;   /* no BGFX_STATE_CULL_* = double-sided */
+
+    uint32_t start = 0;
+    while (start < count) {
+        uint32_t want_n = count - start;
+        uint32_t avail  = bgfx_get_avail_instance_data_buffer(want_n, stride);
+        uint32_t nb     = (want_n < avail) ? want_n : avail;
+        if (nb == 0) break;
+
+        bgfx_instance_data_buffer_t idb;
+        bgfx_alloc_instance_data_buffer(&idb, nb, stride);
+        uint8_t *dst = (uint8_t *)idb.data;
+
+        for (uint32_t i = 0; i < nb; ++i) {
+            const JceFoliageInstance *fi = &insts[start + i];
+            jce_mat4 m = sr_foliage_instance_matrix(fi);
+
+            /* Per-blade tint: index-derived green↔blue-green hue jitter.
+             * hue_jitter in [0..1]; half the blades shift slightly greener,
+             * half slightly blue-green.  Clamped so tint stays [0.5..1.5]. */
+            float t   = (float)((start + i) & 7u) / 7.0f;       /* 0..1 over 8 */
+            float h   = (t - 0.5f) * 2.0f * g->hue_jitter;      /* -hj..+hj   */
+            jce_vec4 tint = { 1.0f - h, 1.0f, 1.0f + h, 1.0f };
+
+            uint8_t *p = dst + (size_t)i * stride;
+            memcpy(p,                   JCE_M4_PTR(m), sizeof(jce_mat4));
+            memcpy(p + sizeof(jce_mat4), &tint,        sizeof(jce_vec4));
+        }
+
+        bgfx_set_vertex_buffer(0, vbh, 0, jce_mesh_vertex_count(sr->grass_blade));
+        bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(sr->grass_blade));
+        bgfx_set_instance_data_buffer(&idb, 0, nb);
+        bgfx_set_state(state, 0);
+        bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+        start += nb;
     }
 }
 
@@ -868,7 +1400,33 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
         sky_colors[8]  = t->sky_ground.x;  sky_colors[9]  = t->sky_ground.y;
         sky_colors[10] = t->sky_ground.z;  sky_colors[11] = 1.0f;
     }
+    /* Stylized dome: overwrite sky_colors with authored dome zenith/horizon/ground
+     * so the ramp uses the scene-authored stops even when ToD is inactive.
+     * sky_mode is already the (possibly downgraded) capture value; this block
+     * only executes when mode 3 survived the gate (Task 6 downgrade). */
+    if (sr->sky_mode == JCE_SCENE_SKY_STYLIZED) {
+        sky_colors[0]  = sr->dome_zenith[0];  sky_colors[1]  = sr->dome_zenith[1];
+        sky_colors[2]  = sr->dome_zenith[2];  sky_colors[3]  = 1.0f;
+        sky_colors[4]  = sr->dome_horizon[0]; sky_colors[5]  = sr->dome_horizon[1];
+        sky_colors[6]  = sr->dome_horizon[2]; sky_colors[7]  = 1.0f;
+        sky_colors[8]  = sr->dome_ground[0];  sky_colors[9]  = sr->dome_ground[1];
+        sky_colors[10] = sr->dome_ground[2];  sky_colors[11] = 1.0f;
+    }
     bgfx_set_uniform(sr->u_sky_colors, sky_colors, 3);
+
+    /* Stylized dome uniforms: always uploaded with the captured (or
+     * neutral) values so the shader never samples stale data, regardless
+     * of the active sky mode (mirrors the Preetham safe-default rule). */
+    {
+        float dmid[4]  = { sr->dome_mid[0], sr->dome_mid[1], sr->dome_mid[2], sr->dome_mid[3] };
+        float dglow[4] = { sr->dome_glow[0], sr->dome_glow[1], sr->dome_glow[2], sr->dome_glow[3] };
+        float dsun[4]  = { sr->dome_sun[0], sr->dome_sun[1], sr->dome_sun[2], sr->dome_sun[3] };
+        float dscol[4] = { sr->dome_sun_col[0], sr->dome_sun_col[1], sr->dome_sun_col[2], 0.0f };
+        if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_mid))     bgfx_set_uniform(sr->u_sky_dome_mid,     dmid,  1);
+        if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_glow))    bgfx_set_uniform(sr->u_sky_dome_glow,    dglow, 1);
+        if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_sun))     bgfx_set_uniform(sr->u_sky_dome_sun,     dsun,  1);
+        if (BGFX_HANDLE_IS_VALID(sr->u_sky_dome_sun_col)) bgfx_set_uniform(sr->u_sky_dome_sun_col, dscol, 1);
+    }
 
     /* Preetham uniforms always carry safe defaults so the shader never
      * reads stale/unset values regardless of the active mode.  The actual
@@ -881,7 +1439,23 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
     bgfx_texture_handle_t equirect_tex = { UINT16_MAX };
     float sky_params[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
 
-    if (sr->sky_mode == JCE_SCENE_SKY_PREETHAM) {
+    if (sr->sky_mode == JCE_SCENE_SKY_STYLIZED) {
+        /* Stylized dome: sun-dir mirrors Preetham's selection (ToD sun
+         * when active, else a default high sun) so the sun disk aligns
+         * with the directional light. */
+        float sun_dir[3];
+        if (sr->tod_active) {
+            sun_dir[0] = sr->tod_state.sun_direction.x;
+            sun_dir[1] = sr->tod_state.sun_direction.y;
+            sun_dir[2] = sr->tod_state.sun_direction.z;
+        } else {
+            sun_dir[0] = 0.0f; sun_dir[1] = 0.9f; sun_dir[2] = 0.4359f;
+        }
+        sun4[0] = sun_dir[0]; sun4[1] = sun_dir[1];
+        sun4[2] = sun_dir[2]; sun4[3] = 0.0f;
+        sky_params[0] = 3.0f;   /* mode = stylized */
+        sky_params[1] = 1.0f;   /* exposure (dome is authored in linear)  */
+    } else if (sr->sky_mode == JCE_SCENE_SKY_PREETHAM) {
         /* Analytic daylight: use the ToD sun direction when active, else a
          * default high sun.  Evaluate the SAME math as jce_sky_radiance(),
          * which fs_sky.sc mode 2 mirrors. */

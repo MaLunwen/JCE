@@ -13,9 +13,11 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_scene_render_internal.h"
 #include "core/jce_assetdb.h"
+#include "core/jce_editor_project.h"
 #include "ui/jce_editor_panels.h"
 
 #include <cstdio>
+#include <cstdlib>   /* getenv for JCE_STREAM_SYNC bench toggle (M2) */
 
 extern "C" {
 #include <jce/middleware/animation/jce_animation.h>
@@ -23,6 +25,8 @@ extern "C" {
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_renderer.h>   /* jce_renderer_request_screenshot_fbo */
+#include <jce/renderer/jce_render_settings.h>   /* grass_enabled project gate (Stage 1b.6) */
 #include <jce/renderer/jce_volumetric_fog.h>
 
 bool jce_editor_lighting_get_fog_enabled(void);
@@ -227,6 +231,41 @@ struct EdQueryCacheEntry {
 };
 static EdQueryCacheEntry s_query_cache[ED_QUERY_CACHE_MAX];
 
+/* Resolve the OPEN PROJECT's render_settings.json (relative to the project root
+ * — NOT the editor exe dir) and apply the grass project gate to the scene
+ * renderer.  Re-runnable: the project is opened by a dialog AFTER scene-render
+ * init, so the gate must re-apply on project change (see render_frame), or the
+ * editor would never see grass even though the standalone does. Tries the
+ * source-authored render_settings.json first, then the cooked copy. */
+static void sr_apply_project_grass_gate(void)
+{
+    if (!s_sr.scene_renderer) return;
+    JceRenderSettings rs = jce_render_settings_default();
+    const JceProject *proj = jce_editor_project_get();
+    bool loaded = false;
+    char rpath[1024] = {0};
+    if (proj && proj->project_root && proj->project_root[0]) {
+        const char *src = (proj->source_assets && proj->source_assets[0])
+                          ? proj->source_assets : "resources/assets";
+        const char *cooked = (proj->cooked_assets && proj->cooked_assets[0])
+                             ? proj->cooked_assets : "resources/_cooked";
+        int n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
+                         proj->project_root, src);
+        if (n > 0 && n < (int)sizeof(rpath))
+            loaded = jce_render_settings_load_json(rpath, &rs);
+        if (!loaded) {
+            n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
+                         proj->project_root, cooked);
+            if (n > 0 && n < (int)sizeof(rpath))
+                loaded = jce_render_settings_load_json(rpath, &rs);
+        }
+    }
+    LOG_INFO("scene_render", "GRASS GATE: root='%s' path='%s' loaded=%d grass_enabled=%d",
+             (proj && proj->project_root) ? proj->project_root : "(none)",
+             rpath, (int)loaded, (int)rs.grass_enabled);
+    jce_scene_renderer_set_grass_enabled(s_sr.scene_renderer, rs.grass_enabled != 0);
+}
+
 /* ── Init ─────────────────────────────────────────────────────────── */
 
 bool jce_editor_scene_render_init(JceRenderer *renderer,
@@ -339,6 +378,13 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         return false;
     }
 
+    /* Grass project gate (Stage 1b.6): applied from the open project's
+     * render_settings.json (grassEnabled).  No project is open yet at editor
+     * init (it is opened by a dialog later), so this also RE-APPLIES per-frame
+     * on project change — see sr_apply_project_grass_gate() called from
+     * jce_editor_scene_render_frame(). */
+    sr_apply_project_grass_gate();
+
     JceScenePickDesc pick_desc;
     memset(&pick_desc, 0, sizeof(pick_desc));
     pick_desc.renderer  = renderer;
@@ -358,17 +404,28 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     /* Occlusion culler: GPU-query two-pass coherence culling.
      * Only the 'color' program is needed for the depth-only proxy draw.
      * The culler silently degrades to always-visible when hardware
-     * occlusion queries are unsupported (ES2 / WebGL1). */
+     * occlusion queries are unsupported (ES2 / WebGL1).
+     * Opt-OUT via JCE_DISABLE_OCCLUSION=1 (A/B measurement + safety toggle) —
+     * mirrors the game-view path so the documented toggle disables BOTH editor
+     * viewports, not just Play. */
     {
-        JceShaderSet oc_shaders;
-        memset(&oc_shaders, 0, sizeof(oc_shaders));
-        JceShaderHandle ch = jce_renderer_get_program_color(renderer);
-        oc_shaders.color.idx = ch.idx;
+        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
+        const bool occlusion_off = (dis && dis[0] && dis[0] != '0');
+        if (occlusion_off) {
+            s_sr.occlusion_culler = NULL;
+            LOG_INFO(LOG_TAG,
+                "JCE_DISABLE_OCCLUSION set — scene-view occlusion culling OFF");
+        } else {
+            JceShaderSet oc_shaders;
+            memset(&oc_shaders, 0, sizeof(oc_shaders));
+            JceShaderHandle ch = jce_renderer_get_program_color(renderer);
+            oc_shaders.color.idx = ch.idx;
 
-        JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
-        s_sr.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
-        if (!s_sr.occlusion_culler)
-            LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
+            JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+            s_sr.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
+            if (!s_sr.occlusion_culler)
+                LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
+        }
     }
 
     /* World streamer: built from the scene's authored streaming settings
@@ -435,6 +492,11 @@ void jce_editor_scene_render_shutdown(void)
         jce_world_streamer_destroy(s_sr.world_streamer);
         s_sr.world_streamer = NULL;
     }
+    /* After the streamer (which joins in-flight chunk tasks) — never before. */
+    if (s_sr.stream_pool) {
+        jce_thread_pool_destroy(s_sr.stream_pool);
+        s_sr.stream_pool = NULL;
+    }
     if (s_sr.stream_fs) {
         jce_fs_destroy(s_sr.stream_fs);
         s_sr.stream_fs = NULL;
@@ -475,6 +537,12 @@ void jce_editor_scene_render_streaming_teardown(void)
         /* Re-show all HLOD proxies so the master skyline is whole again once
          * the preview streamer is gone (no chunk is resident to hide them). */
         jce_state_detach_streamer_hlod();
+    }
+    /* Destroy the worker pool only AFTER the streamer has joined its in-flight
+     * chunk tasks, so no worker can still be reading the fs we free below. */
+    if (s_sr.stream_pool) {
+        jce_thread_pool_destroy(s_sr.stream_pool);
+        s_sr.stream_pool = NULL;
     }
     if (s_sr.stream_fs) {
         jce_fs_destroy(s_sr.stream_fs);
@@ -535,10 +603,26 @@ void jce_editor_scene_render_streaming_rebuild(void)
     wsc.max_pending     = st->max_pending;
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
-    wsc.single_thread   = true; /* editor: cooperative, main-thread only */
 
-    JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, NULL);
+    /* Async chunk loads: disk read + JSON staging off-thread; the apply/spawn
+     * stays time-sliced on the main thread (jce_world_streamer_update).  Web
+     * has no real threads, so keep the cooperative single-thread path there. */
+    JceThreadPool *pool = NULL;
+#if !JCE_PLATFORM_WEB
+    /* Bench/diagnostic toggle (M2 A/B): mirror the editor-Play JCE_STREAM_SYNC
+     * gate so the scene-view preview streamer uses the same sync/async path as
+     * the Play streamer (see jce_editor_play.cpp). */
+    {
+        const char *ss = getenv("JCE_STREAM_SYNC");
+        if (!(ss && ss[0] && ss[0] != '0'))
+            pool = jce_thread_pool_create(3);
+    }
+#endif
+    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
+
+    JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, pool);
     if (!ws) {
+        if (pool) jce_thread_pool_destroy(pool);
         jce_fs_destroy(fs);
         LOG_WARN(LOG_TAG, "world streamer creation failed (preview disabled)");
         return;
@@ -547,12 +631,17 @@ void jce_editor_scene_render_streaming_rebuild(void)
 
     s_sr.world_streamer = ws;
     s_sr.stream_fs      = fs;
+    s_sr.stream_pool    = pool;
     /* Mirror streamed chunk entities into the editor hierarchy/selection so
      * they are first-class (listed in the Hierarchy panel, selectable). */
     jce_state_attach_streamer_hierarchy(ws);
     /* Toggle the always-resident HLOD far-skyline proxies as chunks (un)load so
      * the scene-view far skyline isn't empty beyond the resident window. */
     jce_state_attach_streamer_hlod(ws);
+    /* Re-apply the session preview mode + filter (Full-World / Filtered) to the
+     * fresh streamer — each settings edit recreates it, so the user's intent
+     * must be pushed back in or it would silently revert to RADIUS. */
+    jce_state_streaming_apply_preview();
     LOG_INFO(LOG_TAG, "world-streaming preview active (%u chunks, root=%s)",
              jce_world_streamer_chunk_count(ws), base[0] ? base : ".");
 }
@@ -574,10 +663,30 @@ void jce_editor_scene_render_streaming_autostart(void)
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
 
+/* Last scene-view render dimensions, captured for headless self-capture
+ * (jce_editor_scene_render_screenshot sizes its read-back staging to match). */
+static uint16_t s_cap_w = 0, s_cap_h = 0;
+
 void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 {
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
+    s_cap_w = (uint16_t)width;
+    s_cap_h = (uint16_t)height;
+
+    /* Re-apply the grass project gate when the open project changes.  The
+     * project is opened by a dialog AFTER scene-render init, so an init-only
+     * apply never sees it (the editor would show no grass while the standalone
+     * does).  Cheap: only re-reads render_settings.json when the root changes. */
+    {
+        static char s_grass_gate_root[1024] = {0};
+        const JceProject *gp = jce_editor_project_get();
+        const char *groot = (gp && gp->project_root) ? gp->project_root : "";
+        if (strcmp(groot, s_grass_gate_root) != 0) {
+            snprintf(s_grass_gate_root, sizeof(s_grass_gate_root), "%s", groot);
+            sr_apply_project_grass_gate();
+        }
+    }
 
     s_sr.viewport_width = width;
     s_sr.viewport_height = height;
@@ -592,6 +701,38 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         if (dt_sec > 0.1f) dt_sec = 0.1f;
     }
     s_sr.anim_last_ticks = now_ticks;
+
+    /* Headless overview-capture hook: env JCE_DBG_OVERVIEW=1 frames the whole
+     * world from a bird's-eye angle once, on the first scene-render frame, so a
+     * KPI screenshot can verify the HLOD overview. Inert when unset; the camera
+     * only moves on this one armed call (then the focus-anim runs to completion
+     * over ~0.6s — give the KPI capture enough frames before the shot). The
+     * editor frame loop separately foregrounds the Scene View tab (a docked
+     * background tab never runs its body, so this hook would otherwise sit
+     * dormant). */
+    {
+        static bool s_overview_dbg_done = false;
+        if (!s_overview_dbg_done) {
+            const char *ov = getenv("JCE_DBG_OVERVIEW");
+            if (ov && ov[0] == '1') {
+                jce_editor_scene_frame_overview();
+            }
+            s_overview_dbg_done = true;
+        }
+    }
+
+    /* Headless eye-level vista hook (env JCE_DBG_VISTA=1): one-shot camera move
+     * to a fixed vista over the meadow so a JCE_KPI_SHOT readback captures the
+     * look (grass + backdrop + sky) for autonomous color QA. */
+    {
+        static bool s_vista_dbg_done = false;
+        if (!s_vista_dbg_done) {
+            const char *vs = getenv("JCE_DBG_VISTA");
+            if (vs && vs[0] == '1')
+                jce_editor_scene_frame_vista();
+            s_vista_dbg_done = true;
+        }
+    }
 
     jce_editor_scene_camera_update(dt_sec);
 
@@ -661,6 +802,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.view_mode = JCE_SCENE_VIEW_TEXTURED; break;
     case JCE_VIEW_WIREFRAME_TEXTURED:
         cfg.view_mode = JCE_SCENE_VIEW_WIREFRAME_TEXTURED; break;
+    case JCE_VIEW_NORMALS:
+        cfg.view_mode = JCE_SCENE_VIEW_NORMALS; break;
+    case JCE_VIEW_ROUGHNESS:
+        cfg.view_mode = JCE_SCENE_VIEW_ROUGHNESS; break;
+    case JCE_VIEW_METALLIC:
+        cfg.view_mode = JCE_SCENE_VIEW_METALLIC; break;
+    case JCE_VIEW_AO:
+        cfg.view_mode = JCE_SCENE_VIEW_AO; break;
     case JCE_VIEW_SHADED:
     default:
         cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
@@ -696,6 +845,11 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     /* Two-pass GPU-query occlusion culling. Falls back to always-visible
      * when hardware queries are unsupported (ES2/WebGL1). */
     cfg.occlusion_culler = s_sr.occlusion_culler;
+    /* The scene-view renders into the offscreen bridge FBO; the engine binds the
+     * occlusion proxy view to THIS framebuffer so its depth test runs against the
+     * depth the color pass actually wrote (not the backbuffer → would make the
+     * culler inert or false-cull visible geometry in the offscreen path). */
+    cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
 
     /* Volumetric fog (Stage 1: render only — composite pass deferred).
      * Lighting panel writes; renderer consumes here. */
@@ -730,7 +884,15 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     cfg.cull_focus_x = s_sr.orbit_target.x;
     cfg.cull_focus_y = s_sr.orbit_target.y;
     cfg.cull_focus_z = s_sr.orbit_target.z;
-    cfg.cull_radius  = 900.0f;
+    /* Draw distance GROWS with zoom-out: at street level the orbit distance is
+     * small so this stays 900 m (full-load worlds stay playable), but a
+     * bird's-eye Overview pulls the camera kilometres back — the focus radius
+     * must then reach the whole world so the cheap always-resident HLOD proxies
+     * render instead of being culled to bare ground (frustum + occlusion
+     * culling still trim the off-screen set).  Mirrors the shadow_far
+     * grow-with-view fix.  Only ever grown, never shrunk below 900 m. */
+    cfg.cull_radius  = s_sr.orbit_distance * 1.25f;
+    if (cfg.cull_radius < 900.0f) cfg.cull_radius = 900.0f;
 
     /* HDR bridge → keep the tonemap pass always-on. This MUST be set BEFORE
        jce_scene_renderer_render: the PBR shader's linear-output flag
@@ -764,6 +926,26 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                                  amb_color, amb_intensity);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
+
+        /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1): log the scene-view
+         * culler stats every 60 frames so a headless A/B run can confirm the
+         * occluded count is now >0 (occlusion no longer inert in the offscreen
+         * bridge path) and compare ON vs OFF (JCE_DISABLE_OCCLUSION). */
+        static int s_occ_log = -1;
+        if (s_occ_log < 0)
+            s_occ_log = (getenv("JCE_KPI_OCCLUSION_LOG") != nullptr) ? 1 : 0;
+        if (s_occ_log) {
+            static unsigned s_occ_frame = 0;
+            if ((s_occ_frame++ % 60u) == 0u) {
+                JceSceneOcclusionStats ocs = {};
+                jce_scene_renderer_get_occlusion_stats(s_sr.scene_renderer, &ocs);
+                LOG_INFO(LOG_TAG,
+                    "[occ-kpi scene] mode=%s tested=%u visible=%u occluded=%u "
+                    "warm_up=%u no_result=%u", ocs.enabled ? "ON" : "OFF",
+                    ocs.total, ocs.visible, ocs.occluded, ocs.warm_up,
+                    ocs.no_result);
+            }
+        }
     }
 
     /* GPU pick pass — on-demand inside jce_scene_pick_render: it early-outs
@@ -907,6 +1089,32 @@ uint16_t jce_editor_scene_render_get_texture(void)
         return s_sr.postfx_output_tex;
 
     return jce_offscreen_target_get_color_texture(s_sr.bridge);
+}
+
+bool jce_editor_scene_render_screenshot(const char *path)
+{
+    if (!s_sr.initialized || !path || !path[0] || !s_sr.scene_renderer)
+        return false;
+    /* Headless-capable capture: read back the LDR postfx OUTPUT texture (the exact
+     * image the Scene View displays) via blit + bgfx_read_texture.  This needs NO
+     * foreground present (unlike bgfx_request_screen_shot, which never fires for a
+     * background window), so it works for autonomous/headless capture.  The blit
+     * view sorts after the postfx pass so it reads this frame's composited pixels.
+     * Poll jce_editor_scene_render_capture_poll() each frame until it completes. */
+    JcePostFXPipeline *pf = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
+    if (!pf) return false;
+    JceTextureHandle out = jce_postfx_get_output(pf);
+    if (out.idx == UINT16_MAX || s_cap_w == 0 || s_cap_h == 0)
+        return false;
+    uint16_t blit_view = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 8);
+    return jce_renderer_readback_capture_submit(out.idx, blit_view,
+                                                s_cap_w, s_cap_h, path);
+}
+
+/* Pump the in-flight read-back capture (no-op when idle).  Call once per frame. */
+int jce_editor_scene_render_capture_poll(void)
+{
+    return jce_renderer_readback_capture_poll();
 }
 
 bool jce_editor_scene_pick_supported(void)

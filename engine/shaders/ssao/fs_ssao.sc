@@ -24,8 +24,18 @@ float linearize_depth(float d)
 	 * [0,1] using a fixed near/far range encoded in params1. */
 	float near = u_ssao_params1.x;
 	float far  = u_ssao_params1.y;
+	/* Depth-buffer NDC z convention is backend-dependent: OpenGL is [-1,1]
+	 * (needs the *2-1 remap); D3D/Vulkan/Metal are already [0,1].  Using the
+	 * GL remap unconditionally made AO depths wrong on D3D/VK → over-occlusion
+	 * → the scene rendered dimmer than OpenGL.  Mirrors fs_ssr.sc. */
+#if BGFX_SHADER_LANGUAGE_GLSL
 	float z_n  = d * 2.0 - 1.0;
 	float z_e  = (2.0 * near * far) / (far + near - z_n * (far - near));
+#else
+	/* D3D/Vulkan/Metal depth buffer is the [0,1] NDC z directly; the GL eye-z
+	 * formula above algebraically reduces to this for that range. */
+	float z_e  = (near * far) / (far - d * (far - near));
+#endif
 	return z_e / far;
 }
 

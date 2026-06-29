@@ -29,6 +29,7 @@
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL_atomic.h>
+#include <stdio.h>          /* sscanf / snprintf — HLOD proxy name parse */
 #include <string.h>
 #include <stdlib.h>
 
@@ -37,6 +38,15 @@
  * scene's authored chunk table and this roster pool are sized as one. */
 #define MAX_WORLD_CHUNKS    256
 #define MAX_ENTITY_SLOTS    2048   /* per-chunk entity roster capacity */
+
+/* HLOD cross-fade hand-off (Direction B): how long (ms) a freshly-loaded
+ * chunk's resident HLOD proxy STAYS visible after the chunk loads, so the
+ * detail entities dither in (screen-door) OVER the proxy before it disappears
+ * — eliminating the see-through gap / pop.  Matches the renderer's per-entity
+ * fade duration (JCE_SR_FADE_DURATION = 0.4s) so the proxy is hidden exactly
+ * as the detail finishes fading in.  On UNLOAD the proxy is shown immediately
+ * (no delay), so the skyline is never missing. */
+#define JCE_WS_PROXY_HIDE_DELAY_MS  400.0
 
 /* Conservative per-spawned-entity residency estimate (ECS components +
  * transform + a share of per-entity asset/runtime overhead).  Used to report
@@ -53,6 +63,12 @@
  * comes first.  Reading the chunk bytes is already bounded separately by the
  * streaming I/O layer's frame_budget_ms (jce_streaming_update). */
 #define JCE_WS_APPLY_ENTITIES_PER_SLICE  64
+
+/* VRAM ceiling: re-query a freshly-applied chunk's real residency for this many
+ * updates after finalize so async model/texture decodes that land late are
+ * reflected in the budget.  Bounded so it never costs more than a brief window
+ * of O(resident-entities) queries per chunk. */
+#define JCE_WS_RESIDENCY_CONVERGE_FRAMES  90
 
 static double ws_now_ms(void)
 {
@@ -117,6 +133,15 @@ typedef struct {
     JceEntity *entities;
     uint32_t   entity_count;
     uint32_t   entity_cap;
+
+    /* VRAM ceiling: last residency value reported to the streaming budget for
+     * this chunk + a small convergence window.  A chunk's async model decodes
+     * may land several frames AFTER its entities spawn, so the real GPU bytes
+     * grow over the next few frames; we re-query for a bounded window and
+     * re-report only when the value changes (so the budget tracks real VRAM
+     * without per-frame churn).  converge_left counts the remaining re-queries. */
+    uint64_t   reported_bytes;
+    int        converge_left;
 } ChunkRoster;
 
 /* ── World streamer struct ───────────────────────────────────────── */
@@ -145,6 +170,33 @@ struct JceWorldStreamer {
      * proxy.  Separate user pointer from the entity callbacks above. */
     JceWorldStreamerChunkCb  on_chunk_state;
     void                    *chunk_cb_user;
+
+    /* Real-residency query (VRAM ceiling): maps a chunk's entities to their real
+     * GPU footprint so the streaming budget accounts for actual VRAM, not a flat
+     * per-entity estimate.  NULL => estimate-only (legacy behaviour). */
+    JceWorldStreamerResidencyFn residency_query;
+    void                       *residency_user;
+
+    /* ── HLOD far-skyline proxy coordination (jce_world_streamer_attach_hlod) ─
+     * Chunk-id -> always-resident proxy entity ("HLOD_<gx>_<gz>"), resolved
+     * once at attach.  When attached, on_chunk_state above points at the
+     * internal hlod_chunk_state_cb, which hides/shows the proxy then chains to
+     * hlod_extra_cb/hlod_extra_ud below (e.g. the editor's hierarchy grouping).
+     * MAX_WORLD_CHUNKS-sized parallel arrays keep this allocation-free and in
+     * lockstep with the roster pool. */
+    bool      hlod_attached;
+    uint32_t  hlod_count;
+    uint32_t  hlod_chunk_ids[MAX_WORLD_CHUNKS];
+    JceEntity hlod_proxies  [MAX_WORLD_CHUNKS];
+    /* Cross-fade hand-off (Direction B): per-proxy wall-clock deadline (ms, from
+     * ws_now_ms()) at which a freshly-loaded chunk's still-visible proxy is to be
+     * hidden — i.e. once the detail entities have dithered in over it.  0 = no
+     * pending hide (steady state / proxy already hidden or shown).  Advanced +
+     * fired in jce_world_streamer_update.  In lockstep with hlod_proxies[]. */
+    double    hlod_hide_at_ms[MAX_WORLD_CHUNKS];
+    JceScene *hlod_scene;                 /* scene the proxies live in */
+    JceWorldStreamerChunkCb hlod_extra_cb;
+    void                   *hlod_extra_ud;
 };
 
 /* ── Roster helpers ──────────────────────────────────────────────── */
@@ -320,9 +372,200 @@ void jce_world_streamer_set_chunk_callback(
     ws->chunk_cb_user  = user;
 }
 
+void jce_world_streamer_set_residency_query(
+    JceWorldStreamer            *ws,
+    JceWorldStreamerResidencyFn  query,
+    void                        *user)
+{
+    if (!ws) return;
+    ws->residency_query = query;
+    ws->residency_user  = user;
+}
+
+/* Compute a roster's residency bytes to report to the streaming budget: the real
+ * GPU footprint via the residency_query when available + non-zero, else the
+ * per-entity estimate (source JSON bytes + 8 KiB/entity).  The estimate is the
+ * floor so a chunk is never accounted as zero while its async model decodes are
+ * still in flight (which would let the budget over-admit). */
+static uint64_t roster_residency_bytes(JceWorldStreamer *ws, ChunkRoster *r)
+{
+    uint64_t estimate = (uint64_t)r->apply_size +
+                        (uint64_t)r->entity_count * JCE_WS_BYTES_PER_ENTITY;
+    if (!ws->residency_query || r->entity_count == 0)
+        return estimate;
+    uint64_t real = ws->residency_query(r->entities, r->entity_count,
+                                        ws->residency_user);
+    /* Real bytes once models have uploaded; keep the lightweight estimate as a
+     * floor for ECS/runtime overhead the GPU figure doesn't capture. */
+    return real > estimate ? real : estimate;
+}
+
+/* ── HLOD far-skyline proxy coordination ─────────────────────────────
+ * Moved here from the editor so BOTH the editor (scene-view preview + Play)
+ * and the standalone runtime (default_main) hide a chunk's cheap far-proxy
+ * once its detailed geometry streams in — the shipped exe no longer
+ * double-draws / z-fights the proxy box over the real buildings.  The proxies
+ * are always-resident entities named "HLOD_<gx>_<gz>" baked into the master
+ * scene (build/gen_hlod.py); we map chunk id -> proxy entity once at attach
+ * from the scene's authored streaming table.  See the header for the rationale
+ * behind matching by the proxy's EditorMeta name (survives cook in both
+ * builds — verified against the cooked street_demo master scene). */
+
+/* Parse "<dir>/cell_<gx>_<gz>.scene.json" -> the proxy name "HLOD_<gx>_<gz>".
+ * Returns false when the path is not a chunk fragment of that form. */
+static bool hlod_proxy_name_from_chunk_path(const char *path,
+                                            char *out, size_t out_sz)
+{
+    if (!path || !out || out_sz == 0) return false;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (strncmp(base, "cell_", 5) != 0) return false;
+    const char *coords = base + 5;
+    /* Strip a trailing ".scene.json" (or any extension) so only "<gx>_<gz>"
+     * remains; the two integers can each be negative. */
+    char buf[64];
+    size_t n = 0;
+    for (const char *p = coords; *p && *p != '.' && n + 1 < sizeof(buf); ++p)
+        buf[n++] = *p;
+    buf[n] = '\0';
+    int gx = 0, gz = 0;
+    if (sscanf(buf, "%d_%d", &gx, &gz) != 2) return false;
+    snprintf(out, out_sz, "HLOD_%d_%d", gx, gz);
+    return true;
+}
+
+/* jce_scene_each_entity callback context: find the entity whose EditorMeta name
+ * matches `want`.  The shared scene loader stamps the authored "name" onto
+ * EditorMeta in both the editor and the cooked runtime scene, so this resolves
+ * the proxy engine-side without any editor-only state. */
+typedef struct {
+    const char *want;
+    JceEntity   found;
+} HlodNameFind;
+
+static void hlod_name_find_cb(JceScene *s, JceEntity e, void *ud)
+{
+    HlodNameFind *f = (HlodNameFind *)ud;
+    if (f->found != JCE_ENTITY_INVALID) return;   /* first match wins */
+    JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
+    if (m && strcmp(m->name, f->want) == 0) f->found = e;
+}
+
+static JceEntity hlod_find_proxy(JceScene *scene, const char *name)
+{
+    HlodNameFind f;
+    f.want  = name;
+    f.found = JCE_ENTITY_INVALID;
+    jce_scene_each_entity(scene, hlod_name_find_cb, &f);
+    return f.found;
+}
+
+static void hlod_set_proxy_visible(JceScene *scene, JceEntity proxy, bool visible)
+{
+    if (!scene || proxy == JCE_ENTITY_INVALID) return;
+    if (!jce_scene_has_editor_meta(scene, proxy)) return;   /* gone */
+    /* Toggle the MeshRenderer: the renderer skips a mesh whose MeshRenderer is
+     * disabled (scene-view + game-view + runtime share that path), and the
+     * data persists either way. */
+    jce_scene_set_component_enabled(scene, proxy,
+                                    JCE_COMP_FLAG_MESH_RENDERER, visible);
+}
+
+/* Reset every mapped proxy to VISIBLE — the baseline before any chunk is
+ * resident (resident chunks hide theirs on load). */
+static void hlod_show_all(JceWorldStreamer *ws)
+{
+    for (uint32_t i = 0; i < ws->hlod_count; ++i)
+        hlod_set_proxy_visible(ws->hlod_scene, ws->hlod_proxies[i], true);
+}
+
+
+/* Streamer chunk-state hook installed by attach (Direction B cross-fade):
+ *  • chunk RESIDENT (loaded): KEEP the proxy visible for now and schedule it to
+ *    be hidden JCE_WS_PROXY_HIDE_DELAY_MS later (jce_world_streamer_update fires
+ *    it).  The detail entities dither in (renderer screen-door) over the still-
+ *    visible proxy during that window, so the cell never pops / shows through.
+ *  • chunk GONE (unloaded): SHOW the proxy immediately and cancel any pending
+ *    hide, so the far skyline is never missing while the detail is torn down.
+ * Then chain to any extra caller callback (the editor's hierarchy chunk-
+ * grouping).  Fired per chunk load/unload on the main thread (never per frame). */
+static void hlod_chunk_state_cb(uint32_t chunk_id, bool loaded, void *user)
+{
+    JceWorldStreamer *ws = (JceWorldStreamer *)user;
+    for (uint32_t i = 0; i < ws->hlod_count; ++i) {
+        if (ws->hlod_chunk_ids[i] != chunk_id) continue;
+        JceEntity proxy = ws->hlod_proxies[i];
+        if (loaded) {
+            /* Detail just became resident: hold the proxy and arm the delayed
+             * hide so the detail can fade in underneath it first. */
+            hlod_set_proxy_visible(ws->hlod_scene, proxy, /*visible=*/true);
+            ws->hlod_hide_at_ms[i] = ws_now_ms() + JCE_WS_PROXY_HIDE_DELAY_MS;
+        } else {
+            /* Detail gone: bring the proxy back at once, drop any pending hide. */
+            ws->hlod_hide_at_ms[i] = 0.0;
+            hlod_set_proxy_visible(ws->hlod_scene, proxy, /*visible=*/true);
+        }
+        break;
+    }
+    if (ws->hlod_extra_cb)
+        ws->hlod_extra_cb(chunk_id, loaded, ws->hlod_extra_ud);
+}
+
+void jce_world_streamer_attach_hlod(JceWorldStreamer        *ws,
+                                    JceScene                *scene,
+                                    JceWorldStreamerChunkCb  extra_cb,
+                                    void                    *extra_ud)
+{
+    if (!ws) return;
+    if (!scene) scene = ws->scene;
+
+    ws->hlod_count    = 0;
+    ws->hlod_scene    = scene;
+    ws->hlod_extra_cb = extra_cb;
+    ws->hlod_extra_ud = extra_ud;
+    ws->hlod_attached = true;
+
+    const JceSceneStreamingSettings *st =
+        scene ? jce_scene_get_streaming_settings(scene) : NULL;
+    if (st) {
+        for (uint32_t i = 0;
+             i < st->chunk_count && ws->hlod_count < MAX_WORLD_CHUNKS; ++i) {
+            const JceSceneStreamChunk *c = &st->chunks[i];
+            if (c->path[0] == '\0') continue;
+            char proxy_name[64];
+            if (!hlod_proxy_name_from_chunk_path(c->path, proxy_name,
+                                                 sizeof proxy_name))
+                continue;
+            JceEntity proxy = hlod_find_proxy(scene, proxy_name);
+            if (proxy != JCE_ENTITY_INVALID) {
+                ws->hlod_chunk_ids[ws->hlod_count] = c->id;
+                ws->hlod_proxies  [ws->hlod_count] = proxy;
+                ws->hlod_hide_at_ms[ws->hlod_count] = 0.0; /* no pending hide */
+                ws->hlod_count++;
+            }
+        }
+    }
+
+    /* Baseline: all proxies visible (already-resident chunks hide theirs as the
+     * streamer fires load events).  Then route chunk state through the internal
+     * HLOD callback (which chains to extra_cb). */
+    hlod_show_all(ws);
+    jce_world_streamer_set_chunk_callback(ws, hlod_chunk_state_cb, ws);
+
+    LOG_INFO(LOG_TAG, "HLOD proxy coordination attached (%u proxy/chunk)",
+             ws->hlod_count);
+}
+
 void jce_world_streamer_destroy(JceWorldStreamer *ws)
 {
     if (!ws) return;
+
+    /* Re-show every HLOD proxy so the always-resident master skyline is whole
+     * again once this streamer is gone (no chunk is resident to hide them).
+     * Matters for the editor, where the master scene outlives the streamer
+     * (Play/preview end); harmless in the runtime, where the scene is torn down
+     * with the app. */
+    if (ws->hlod_attached) hlod_show_all(ws);
 
     /* Destroy all streamed entities. */
     for (uint32_t i = 0; i < ws->roster_count; ++i) {
@@ -464,14 +707,19 @@ static void roster_finalize_apply(JceWorldStreamer *ws, ChunkRoster *r)
     if (ws->on_chunk_state)
         ws->on_chunk_state(r->chunk_id, true, ws->chunk_cb_user);
 
-    jce_streaming_set_chunk_residency(
-        ws->ss, r->chunk_id,
-        (uint64_t)r->apply_size +
-            (uint64_t)new_count * JCE_WS_BYTES_PER_ENTITY);
+    /* Report REAL VRAM residency (via the residency query) when available so the
+     * streaming budget + LRU evict against actual GPU bytes, not a flat estimate
+     * (audit F3 / VRAM ceiling).  At this instant a chunk's async model decodes
+     * may still be in flight, so the query can read low; the per-update
+     * convergence pass below re-reports until the real bytes settle. */
+    r->reported_bytes = roster_residency_bytes(ws, r);
+    r->converge_left  = ws->residency_query ? JCE_WS_RESIDENCY_CONVERGE_FRAMES : 0;
+    jce_streaming_set_chunk_residency(ws->ss, r->chunk_id, r->reported_bytes);
 
     LOG_INFO(LOG_TAG, "chunk %u applied: %u entities spawned",
              r->chunk_id, new_count);
-    r->apply_size = 0;
+    /* Keep apply_size for the convergence re-report (cleared when the chunk
+     * unloads / its roster is recycled). */
 }
 
 void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos)
@@ -481,6 +729,22 @@ void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos)
 
     /* Drive I/O loads/unloads. */
     jce_streaming_update(ws->ss, camera_pos);
+
+    /* HLOD cross-fade hand-off (Direction B): hide each freshly-loaded chunk's
+     * proxy once its delay has elapsed — by now the detail entities have
+     * dithered in over it (renderer screen-door), so the swap is seamless.
+     * 0 = no pending hide.  Only when HLOD is attached; otherwise inert. */
+    if (ws->hlod_attached) {
+        const double now_ms = ws_now_ms();
+        for (uint32_t i = 0; i < ws->hlod_count; ++i) {
+            if (ws->hlod_hide_at_ms[i] != 0.0 &&
+                now_ms >= ws->hlod_hide_at_ms[i]) {
+                hlod_set_proxy_visible(ws->hlod_scene, ws->hlod_proxies[i],
+                                       /*visible=*/false);
+                ws->hlod_hide_at_ms[i] = 0.0;   /* fired */
+            }
+        }
+    }
 
     /* Chunk APPLY (JSON parse + entity spawn) runs on the main/render thread
      * and cannot be offloaded, only spread.  Spawn at most a few entities per
@@ -560,7 +824,39 @@ void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos)
         if (ws_now_ms() - start_ms >= budget_ms)
             break;
     }
+
+    /* ── VRAM ceiling: residency convergence ────────────────────────────
+     * A chunk's async model/texture decodes can land several frames after its
+     * entities spawn, so the real GPU bytes grow over the next few frames.  For
+     * a bounded window after finalize, re-query each applied chunk's real
+     * residency and re-report it to the streaming budget only when it changed
+     * (so the budget tracks actual VRAM without per-frame churn).  Skipped
+     * entirely when no residency query is installed (estimate-only legacy). */
+    if (ws->residency_query) {
+        for (uint32_t i = 0; i < ws->roster_count; ++i) {
+            ChunkRoster *r = &ws->rosters[i];
+            if (!r->active || r->converge_left <= 0) continue;
+            if (r->apply_stream) continue;   /* still applying — not finalized */
+            r->converge_left--;
+            uint64_t now = roster_residency_bytes(ws, r);
+            if (now != r->reported_bytes) {
+                r->reported_bytes = now;
+                jce_streaming_set_chunk_residency(ws->ss, r->chunk_id, now);
+            }
+        }
+    }
     JCE_PROFILE_ZONE_END;
+}
+
+/* ── Preview / authoring load-override ────────────────────────────── */
+
+void jce_world_streamer_set_preview_load(JceWorldStreamer    *ws,
+                                         JceStreamPreviewMode mode,
+                                         const uint32_t      *filter_ids,
+                                         uint32_t             count)
+{
+    if (!ws) return;
+    jce_streaming_set_preview(ws->ss, mode, filter_ids, count);
 }
 
 /* ── Stats ───────────────────────────────────────────────────────── */

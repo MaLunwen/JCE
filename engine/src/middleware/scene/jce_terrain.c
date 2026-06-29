@@ -30,6 +30,16 @@
 
 #define TERRAIN_MAGIC 0x52544A43u  /* 'JCTR' little-endian */
 #define TERRAIN_BIN_VERSION 1u
+#define TERRAIN_BIN_VERSION_HOLES 2u  /* v1 + appended per-cell hole mask (uint8 w*h) */
+
+/* One on-demand tile (large-world #4).  Owns (span*span) heights+splat where
+ * span = tile_dim+1 (1-vertex overlap with right/bottom neighbours). */
+typedef struct JceTerrainTile {
+    float    *heights;          /* span*span, NULL until resident */
+    uint32_t *splat;            /* span*span, NULL until resident */
+    uint64_t  lru_stamp;        /* last-touch clock value (for LRU eviction) */
+    bool      resident;
+} JceTerrainTile;
 
 struct JceTerrain {
     int       w;
@@ -38,8 +48,26 @@ struct JceTerrain {
     float     world_size_x;
     float     world_size_z;
     float     max_height;
-    float    *heights;          /* w*h, normalized 0..1 */
-    uint32_t *splat;            /* w*h, packed RGBA8 layer weights */
+    float    *heights;          /* w*h, normalized 0..1 (NULL when tiled) */
+    uint32_t *splat;            /* w*h, packed RGBA8 layer weights (NULL when tiled) */
+    uint8_t  *holes;            /* w*h per-cell hole mask (1=cut, cell ij=holes[z*w+x]);
+                                   NULL = no holes. Monolithic terrain only. */
+
+    /* --- tiled mode (large-world #4); tile_dim == 0 => monolithic --- */
+    int                  tile_dim;        /* cells per tile side */
+    int                  tile_span;       /* tile_dim + 1 verts per tile side */
+    int                  tiles_x;
+    int                  tiles_z;
+    int                  resident_budget; /* max resident tiles (<=0 => no cap) */
+    int                  resident_count;
+    uint64_t             lru_clock;
+    JceTerrainTile      *tiles;           /* tiles_x * tiles_z, or NULL */
+    JceTerrainTileLoadFn load_fn;
+    void                *load_ud;
+
+    /* --- procedural tiled source (load_fn == terrain_proc_load, load_ud == t) --- */
+    uint32_t             proc_seed;
+    float                proc_freq;       /* world-space noise frequency */
 };
 
 /* ───── Internal helpers ──────────────────────────────────────── */
@@ -57,6 +85,102 @@ static void world_to_uv(const JceTerrain *t, float wx, float wz,
     *out_fz = v * (float)(t->h - 1);
 }
 
+/* ── Read-path tiling chokepoint (large-world #4) ───────────────────────────
+ * EVERY height/splat READ goes through these accessors so a future tile cache
+ * can transparently serve streamed tiles for a multi-km terrain (the heights are
+ * a monolithic float[W*H] today — ~1 GB at 10 km).  Currently they index the
+ * resident arrays (byte-identical); the tile cache slots in behind them with no
+ * caller changes.  WRITES (sculpt brush, heightmap import) deliberately stay on
+ * the resident arrays and require a fully-loaded terrain (per the read-path-first
+ * decision: authoring loads the whole terrain; streaming is a runtime concern). */
+/* Evict the least-recently-used resident tile, freeing its arrays. */
+static void terrain_evict_lru(JceTerrain *t)
+{
+    int      best = -1;
+    uint64_t best_stamp = UINT64_MAX;
+    int      n = t->tiles_x * t->tiles_z;
+    for (int i = 0; i < n; ++i)
+        if (t->tiles[i].resident && t->tiles[i].lru_stamp < best_stamp) {
+            best_stamp = t->tiles[i].lru_stamp;
+            best = i;
+        }
+    if (best >= 0) {
+        JCE_FREE(t->tiles[best].heights);
+        JCE_FREE(t->tiles[best].splat);
+        t->tiles[best].heights  = NULL;
+        t->tiles[best].splat    = NULL;
+        t->tiles[best].resident = false;
+        t->resident_count--;
+    }
+}
+
+/* Page tile (tx,tz) in (load on demand, evicting the LRU tile when over budget)
+ * and touch its LRU stamp.  The tile cache is mutable impl state behind the const
+ * logical terrain — which tiles are resident is not part of the sampled height —
+ * so the const is cast away here.  Returns NULL if the load failed. */
+static JceTerrainTile *terrain_tile_acquire(const JceTerrain *ct, int tx, int tz)
+{
+    JceTerrain     *t    = (JceTerrain *)ct;
+    JceTerrainTile *tile = &t->tiles[(size_t)tz * t->tiles_x + tx];
+    if (!tile->resident) {
+        if (t->resident_budget > 0 && t->resident_count >= t->resident_budget)
+            terrain_evict_lru(t);
+        size_t n = (size_t)t->tile_span * (size_t)t->tile_span;
+        tile->heights = (float *)JCE_MALLOC(n * sizeof(float));
+        tile->splat   = (uint32_t *)JCE_MALLOC(n * sizeof(uint32_t));
+        bool ok = tile->heights && tile->splat && t->load_fn &&
+                  t->load_fn(t->load_ud, tx, tz, tile->heights, tile->splat,
+                             t->tile_span);
+        if (ok) {
+            tile->resident = true;
+            t->resident_count++;
+        } else {
+            JCE_FREE(tile->heights);
+            JCE_FREE(tile->splat);
+            tile->heights = NULL;
+            tile->splat   = NULL;
+            return NULL;
+        }
+    }
+    tile->lru_stamp = ++t->lru_clock;
+    return tile;
+}
+
+/* Map a global vertex (x,z) to its owning tile + local index.  tile_dim divides
+ * (w-1) so the only out-of-range case is the very last row/col vertex, which is a
+ * neighbour tile's overlap row — clamp it back into the last tile. */
+static inline float terrain_h(const JceTerrain *t, int x, int z)
+{
+    if (t->tile_dim == 0)
+        return t->heights[(size_t)z * (size_t)t->w + (size_t)x];
+    int tx = x / t->tile_dim; if (tx >= t->tiles_x) tx = t->tiles_x - 1;
+    int tz = z / t->tile_dim; if (tz >= t->tiles_z) tz = t->tiles_z - 1;
+    JceTerrainTile *tile = terrain_tile_acquire(t, tx, tz);
+    if (!tile) return 0.0f;
+    int lx = x - tx * t->tile_dim, lz = z - tz * t->tile_dim;
+    return tile->heights[(size_t)lz * t->tile_span + lx];
+}
+/* Per-cell hole test.  A cell (cx,cz) — the quad whose top-left vertex is
+ * (cx,cz) — is "cut" when its mask byte is non-zero.  No holes array => never a
+ * hole.  Out-of-range cells are treated as solid. Monolithic terrain only. */
+static inline bool terrain_cell_hole(const JceTerrain *t, int cx, int cz)
+{
+    if (!t->holes || cx < 0 || cz < 0 || cx >= t->w - 1 || cz >= t->h - 1)
+        return false;
+    return t->holes[(size_t)cz * (size_t)t->w + (size_t)cx] != 0;
+}
+static inline uint32_t terrain_sp(const JceTerrain *t, int x, int z)
+{
+    if (t->tile_dim == 0)
+        return t->splat[(size_t)z * (size_t)t->w + (size_t)x];
+    int tx = x / t->tile_dim; if (tx >= t->tiles_x) tx = t->tiles_x - 1;
+    int tz = z / t->tile_dim; if (tz >= t->tiles_z) tz = t->tiles_z - 1;
+    JceTerrainTile *tile = terrain_tile_acquire(t, tx, tz);
+    if (!tile) return 0x000000FFu;
+    int lx = x - tx * t->tile_dim, lz = z - tz * t->tile_dim;
+    return tile->splat[(size_t)lz * t->tile_span + lx];
+}
+
 static float sample_h_norm(const JceTerrain *t, float wx, float wz)
 {
     float fx, fz;
@@ -68,10 +192,10 @@ static float sample_h_norm(const JceTerrain *t, float wx, float wz)
     int z1 = clampi(z0 + 1, 0, t->h - 1);
     float u = fx - (float)x0;
     float v = fz - (float)z0;
-    float h00 = t->heights[(size_t)z0 * t->w + x0];
-    float h10 = t->heights[(size_t)z0 * t->w + x1];
-    float h01 = t->heights[(size_t)z1 * t->w + x0];
-    float h11 = t->heights[(size_t)z1 * t->w + x1];
+    float h00 = terrain_h(t, x0, z0);
+    float h10 = terrain_h(t, x1, z0);
+    float h01 = terrain_h(t, x0, z1);
+    float h11 = terrain_h(t, x1, z1);
     float a = h00 * (1.0f - u) + h10 * u;
     float b = h01 * (1.0f - u) + h11 * u;
     return a * (1.0f - v) + b * v;
@@ -111,13 +235,14 @@ bool jce_terrain_build_collision_mesh(const JceTerrain *t,
         for (int i = 0; i < W; ++i) {
             const uint32_t vi = (uint32_t)(j * W + i);
             verts[vi * 3u + 0u] = (float)i * inv_w * t->world_size_x;
-            verts[vi * 3u + 1u] = t->heights[vi] * t->max_height;
+            verts[vi * 3u + 1u] = terrain_h(t, i, j) * t->max_height;
             verts[vi * 3u + 2u] = (float)j * inv_h * t->world_size_z;
         }
     }
     uint32_t k = 0;
     for (int j = 0; j < H - 1; ++j) {
         for (int i = 0; i < W - 1; ++i) {
+            if (terrain_cell_hole(t, i, j)) continue;   /* cut cell: no collision */
             const uint32_t v00 = (uint32_t)(j * W + i);
             const uint32_t v10 = v00 + 1u;
             const uint32_t v01 = v00 + (uint32_t)W;
@@ -127,7 +252,7 @@ bool jce_terrain_build_collision_mesh(const JceTerrain *t,
         }
     }
     *out_verts   = verts;  *out_vcount = vcount;
-    *out_indices = idx;    *out_icount = icount;
+    *out_indices = idx;    *out_icount = k;   /* k <= icount when holes cut cells */
     return true;
 }
 
@@ -159,11 +284,187 @@ JceTerrain *jce_terrain_create(int width, int height,
     return t;
 }
 
+JceTerrain *jce_terrain_create_tiled(int width, int height,
+                                     float world_size_x, float world_size_z,
+                                     float max_height, int chunk_size,
+                                     int tile_dim, int resident_budget,
+                                     JceTerrainTileLoadFn load_fn, void *load_ud)
+{
+    if (width < 2 || height < 2 || world_size_x <= 0.0f || world_size_z <= 0.0f)
+        return NULL;
+    if (tile_dim < 1 || !load_fn) return NULL;
+    /* tile_dim must divide (w-1)/(h-1) so the overlapped tile grid (tiles of
+     * tile_dim cells = tile_dim+1 verts) tiles the terrain exactly. */
+    if ((width - 1) % tile_dim != 0 || (height - 1) % tile_dim != 0) return NULL;
+    if (chunk_size < 2) chunk_size = 32;
+
+    JceTerrain *t = JCE_NEW(JceTerrain);
+    if (!t) return NULL;
+    t->w = width;
+    t->h = height;
+    t->chunk_size      = chunk_size;
+    t->world_size_x    = world_size_x;
+    t->world_size_z    = world_size_z;
+    t->max_height      = max_height;
+    t->heights         = NULL;   /* tiled: no monolithic backing */
+    t->splat           = NULL;
+    t->tile_dim        = tile_dim;
+    t->tile_span       = tile_dim + 1;
+    t->tiles_x         = (width  - 1) / tile_dim;
+    t->tiles_z         = (height - 1) / tile_dim;
+    t->resident_budget = resident_budget;
+    t->load_fn         = load_fn;
+    t->load_ud         = load_ud;
+    t->tiles = JCE_NEW_ARRAY(JceTerrainTile,
+                             (size_t)t->tiles_x * (size_t)t->tiles_z);
+    if (!t->tiles) { JCE_FREE(t); return NULL; }
+    return t;
+}
+
+/* ── Procedural tiled terrain (large-world #4) ──────────────────────────────
+ * A built-in value-noise fBm source so a scene can reference a streamed,
+ * effectively-unbounded terrain without baking/shipping a heightmap.  load_ud is
+ * the terrain itself (proc params live in the struct). */
+static float proc_hash(int x, int z, uint32_t seed)
+{
+    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)z * 668265263u
+               + seed * 362437u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return (float)((h ^ (h >> 16)) & 0xFFFFFFu) / (float)0xFFFFFF;
+}
+static float proc_vnoise(float x, float z, uint32_t seed)
+{
+    int   x0 = (int)floorf(x), z0 = (int)floorf(z);
+    float fx = x - (float)x0, fz = z - (float)z0;
+    float a = proc_hash(x0,     z0,     seed);
+    float b = proc_hash(x0 + 1, z0,     seed);
+    float c = proc_hash(x0,     z0 + 1, seed);
+    float d = proc_hash(x0 + 1, z0 + 1, seed);
+    float u = fx * fx * (3.0f - 2.0f * fx);
+    float v = fz * fz * (3.0f - 2.0f * fz);
+    return (a * (1.0f - u) + b * u) * (1.0f - v)
+         + (c * (1.0f - u) + d * u) * v;
+}
+static float proc_fbm(float x, float z, uint32_t seed)
+{
+    float sum = 0.0f, amp = 0.5f, freq = 1.0f;
+    for (int o = 0; o < 4; ++o) {
+        sum  += amp * proc_vnoise(x * freq, z * freq, seed + (uint32_t)o * 101u);
+        freq *= 2.0f;
+        amp  *= 0.5f;
+    }
+    return sum;   /* ~0..1 */
+}
+static bool terrain_proc_load(void *ud, int tx, int tz,
+                              float *h_out, uint32_t *s_out, int span)
+{
+    const JceTerrain *t = (const JceTerrain *)ud;
+    if (!t) return false;
+    int   td   = span - 1;
+    float freq = t->proc_freq > 0.0f ? t->proc_freq : 0.01f;
+    for (int lz = 0; lz < span; ++lz)
+        for (int lx = 0; lx < span; ++lx) {
+            int   gx = tx * td + lx, gz = tz * td + lz;
+            float hN = proc_fbm((float)gx * freq, (float)gz * freq, t->proc_seed);
+            if (hN < 0.0f) hN = 0.0f; else if (hN > 1.0f) hN = 1.0f;
+            h_out[lz * span + lx] = hN;
+            /* height-banded splat: layer0 low → layer1 mid → layer2 high. */
+            int layer = hN < 0.45f ? 0 : (hN < 0.75f ? 1 : 2);
+            s_out[lz * span + lx] = (uint32_t)0xFFu << (layer * 8);
+        }
+    return true;
+}
+
+JceTerrain *jce_terrain_create_procedural(int width, int height,
+                                          float world_size_x, float world_size_z,
+                                          float max_height, int tile_dim,
+                                          int resident_budget,
+                                          uint32_t seed, float frequency)
+{
+    /* chunk_size == tile_dim so the renderer maps chunk i ↔ tile i. */
+    JceTerrain *t = jce_terrain_create_tiled(width, height, world_size_x,
+                                             world_size_z, max_height, tile_dim,
+                                             tile_dim, resident_budget,
+                                             terrain_proc_load, NULL);
+    if (!t) return NULL;
+    t->proc_seed = seed;
+    t->proc_freq = frequency > 0.0f ? frequency : 0.01f;
+    t->load_ud   = t;     /* LoadFn reads proc params from the terrain */
+    return t;
+}
+
+int jce_terrain_resident_tiles(const JceTerrain *t)
+{
+    return t ? t->resident_count : 0;
+}
+
+bool jce_terrain_is_tiled(const JceTerrain *t)
+{
+    return t && t->tile_dim > 0;
+}
+
+void jce_terrain_tile_grid(const JceTerrain *t, int *out_tiles_x,
+                           int *out_tiles_z, int *out_tile_dim)
+{
+    if (out_tiles_x)  *out_tiles_x  = t ? t->tiles_x  : 0;
+    if (out_tiles_z)  *out_tiles_z  = t ? t->tiles_z  : 0;
+    if (out_tile_dim) *out_tile_dim = t ? t->tile_dim : 0;
+}
+
+bool jce_terrain_tile_copy(const JceTerrain *t, int tile_x, int tile_z,
+                           float *heights_out, uint32_t *splat_out)
+{
+    if (!t || t->tile_dim <= 0) return false;
+    if (tile_x < 0 || tile_z < 0 || tile_x >= t->tiles_x || tile_z >= t->tiles_z)
+        return false;
+    JceTerrainTile *tile = terrain_tile_acquire(t, tile_x, tile_z);
+    if (!tile) return false;
+    size_t n = (size_t)t->tile_span * (size_t)t->tile_span;
+    if (heights_out) memcpy(heights_out, tile->heights, n * sizeof(float));
+    if (splat_out)   memcpy(splat_out,   tile->splat,   n * sizeof(uint32_t));
+    return true;
+}
+
+void jce_terrain_prefetch(JceTerrain *t, float world_x, float world_z,
+                          float radius)
+{
+    if (!t || t->tile_dim <= 0 || radius <= 0.0f) return;
+
+    /* camera world XZ -> grid coords -> centre tile */
+    float fx, fz;
+    world_to_uv(t, world_x, world_z, &fx, &fz);
+    int ctx = (int)(fx / (float)t->tile_dim);
+    int ctz = (int)(fz / (float)t->tile_dim);
+
+    /* radius (world) -> radius in tiles via the grid-units-per-world scale. */
+    float grid_per_world = (t->world_size_x > 0.0f)
+                         ? (float)(t->w - 1) / t->world_size_x : 1.0f;
+    int rt = (int)ceilf(radius * grid_per_world / (float)t->tile_dim);
+    if (rt < 0) rt = 0;
+
+    for (int tz = ctz - rt; tz <= ctz + rt; ++tz) {
+        if (tz < 0 || tz >= t->tiles_z) continue;
+        for (int tx = ctx - rt; tx <= ctx + rt; ++tx) {
+            if (tx < 0 || tx >= t->tiles_x) continue;
+            (void)terrain_tile_acquire(t, tx, tz);   /* load if absent + touch LRU */
+        }
+    }
+}
+
 void jce_terrain_free(JceTerrain *t)
 {
     if (!t) return;
+    if (t->tiles) {
+        int n = t->tiles_x * t->tiles_z;
+        for (int i = 0; i < n; ++i) {
+            JCE_FREE(t->tiles[i].heights);
+            JCE_FREE(t->tiles[i].splat);
+        }
+        JCE_FREE(t->tiles);
+    }
     JCE_FREE(t->heights);
     JCE_FREE(t->splat);
+    JCE_FREE(t->holes);
     JCE_FREE(t);
 }
 
@@ -195,8 +496,10 @@ bool jce_terrain_save_file(const JceTerrain *t, const char *meta_json_path)
 
     /* Binary blob first: serialise to one buffer, then write atomically. */
     size_t   n          = (size_t)t->w * (size_t)t->h;
+    bool     has_holes  = jce_terrain_has_holes(t);  /* v2 only when cells are cut */
     size_t   header_sz  = sizeof(uint32_t) * 2 + sizeof(int32_t) * 2;
-    size_t   payload_sz = n * (sizeof(float) + sizeof(uint32_t));
+    size_t   payload_sz = n * (sizeof(float) + sizeof(uint32_t))
+                          + (has_holes ? n * sizeof(uint8_t) : 0);
     size_t   total      = header_sz + payload_sz;
     uint8_t *buf        = (uint8_t *)JCE_MALLOC(total);
     if (!buf) {
@@ -204,7 +507,7 @@ bool jce_terrain_save_file(const JceTerrain *t, const char *meta_json_path)
         return false;
     }
     uint32_t magic   = TERRAIN_MAGIC;
-    uint32_t version = TERRAIN_BIN_VERSION;
+    uint32_t version = has_holes ? TERRAIN_BIN_VERSION_HOLES : TERRAIN_BIN_VERSION;
     int32_t  iw      = (int32_t)t->w;
     int32_t  ih      = (int32_t)t->h;
     size_t   off     = 0;
@@ -214,6 +517,7 @@ bool jce_terrain_save_file(const JceTerrain *t, const char *meta_json_path)
     memcpy(buf + off, &ih,      sizeof(ih));      off += sizeof(ih);
     memcpy(buf + off, t->heights, sizeof(float)    * n); off += sizeof(float)    * n;
     memcpy(buf + off, t->splat,   sizeof(uint32_t) * n); off += sizeof(uint32_t) * n;
+    if (has_holes) { memcpy(buf + off, t->holes, n); off += n; }
 
     bool wrote = jce_fs_host_write_all(bin_path, buf, total);
     JCE_FREE(buf);
@@ -263,6 +567,16 @@ static JceTerrain *terrain_from_meta_json(JceJson *root, char *out_bin_leaf,
         LOG_WARN("terrain", "invalid dims %dx%d", w, h);
         return NULL;
     }
+    /* large-world #4: a "procedural": true meta makes a streamed tiled terrain
+     * from built-in noise (no .bin side-car). */
+    if (jce_json_get_bool(root, "procedural", false)) {
+        int      td   = jce_json_get_int   (root, "tile_dim",         64);
+        int      bud  = jce_json_get_int   (root, "resident_budget",  64);
+        uint32_t seed = (uint32_t)jce_json_get_int(root, "proc_seed", 1337);
+        float    frq  = (float)jce_json_get_number(root, "proc_frequency", 0.01);
+        if (out_bin_leaf && out_bin_cap) out_bin_leaf[0] = '\0';  /* no .bin */
+        return jce_terrain_create_procedural(w, h, wx, wz, mh, td, bud, seed, frq);
+    }
     return jce_terrain_create(w, h, wx, wz, mh, cs);
 }
 
@@ -288,7 +602,8 @@ static bool terrain_decode_bin(JceTerrain *t, const uint8_t *buf, size_t got,
     memcpy(&version, buf + off, sizeof(version)); off += sizeof(version);
     memcpy(&iw,      buf + off, sizeof(iw));      off += sizeof(iw);
     memcpy(&ih,      buf + off, sizeof(ih));      off += sizeof(ih);
-    if (magic != TERRAIN_MAGIC || version != TERRAIN_BIN_VERSION
+    if (magic != TERRAIN_MAGIC
+        || (version != TERRAIN_BIN_VERSION && version != TERRAIN_BIN_VERSION_HOLES)
         || iw != w || ih != h) {
         LOG_WARN("terrain", "bin header mismatch: %s",
                  diag_path ? diag_path : "<pak>");
@@ -296,7 +611,12 @@ static bool terrain_decode_bin(JceTerrain *t, const uint8_t *buf, size_t got,
     }
     size_t n = (size_t)w * (size_t)h;
     memcpy(t->heights, buf + off, sizeof(float)    * n); off += sizeof(float)    * n;
-    memcpy(t->splat,   buf + off, sizeof(uint32_t) * n);
+    memcpy(t->splat,   buf + off, sizeof(uint32_t) * n); off += sizeof(uint32_t) * n;
+    /* v2 appends a per-cell hole mask after the splat block. */
+    if (version == TERRAIN_BIN_VERSION_HOLES && got >= off + n) {
+        if (!t->holes) t->holes = (uint8_t *)JCE_CALLOC(n, sizeof(uint8_t));
+        if (t->holes) memcpy(t->holes, buf + off, n);
+    }
     return true;
 }
 
@@ -312,6 +632,8 @@ JceTerrain *jce_terrain_load_file(const char *meta_json_path)
     JceTerrain *t = terrain_from_meta_json(root, bin_leaf, sizeof bin_leaf);
     jce_json_free(root);
     if (!t) return NULL;
+    /* Tiled / procedural terrains stream their data (no monolithic .bin). */
+    if (jce_terrain_is_tiled(t)) return t;
 
     char bin_path[1024];
     if (bin_leaf[0]) {
@@ -367,6 +689,8 @@ JceTerrain *jce_terrain_load_from_pak(const struct JcePakArchive *pak,
     JceTerrain *t = terrain_from_meta_json(root, bin_leaf, sizeof bin_leaf);
     jce_json_free(root);
     if (!t) return NULL;
+    /* Tiled / procedural terrains stream their data (no monolithic .bin). */
+    if (jce_terrain_is_tiled(t)) return t;
 
     /* Resolve the .bin sibling inside the PAK. */
     char bin_vpath[1024];
@@ -448,10 +772,10 @@ void jce_terrain_sample_splat(const JceTerrain *t, float wx, float wz,
     int z1 = clampi(z0 + 1, 0, t->h - 1);
     float u = fx - (float)x0;
     float v = fz - (float)z0;
-    uint32_t s00 = t->splat[(size_t)z0 * t->w + x0];
-    uint32_t s10 = t->splat[(size_t)z0 * t->w + x1];
-    uint32_t s01 = t->splat[(size_t)z1 * t->w + x0];
-    uint32_t s11 = t->splat[(size_t)z1 * t->w + x1];
+    uint32_t s00 = terrain_sp(t, x0, z0);
+    uint32_t s10 = terrain_sp(t, x1, z0);
+    uint32_t s01 = terrain_sp(t, x0, z1);
+    uint32_t s11 = terrain_sp(t, x1, z1);
     float total = 0.0f;
     for (int c = 0; c < 4; ++c) {
         float a = (float)((s00 >> (c * 8)) & 0xFFu);
@@ -556,10 +880,10 @@ static void compute_normal(const JceTerrain *t, int x, int z,
     int zp = clampi(z + 1, 0, t->h - 1);
     float dx_world = (float)(xp - xm) * (t->world_size_x / (float)(t->w - 1));
     float dz_world = (float)(zp - zm) * (t->world_size_z / (float)(t->h - 1));
-    float hL = t->heights[(size_t)z * t->w + xm] * t->max_height;
-    float hR = t->heights[(size_t)z * t->w + xp] * t->max_height;
-    float hD = t->heights[(size_t)zm * t->w + x] * t->max_height;
-    float hU = t->heights[(size_t)zp * t->w + x] * t->max_height;
+    float hL = terrain_h(t, xm, z) * t->max_height;
+    float hR = terrain_h(t, xp, z) * t->max_height;
+    float hD = terrain_h(t, x, zm) * t->max_height;
+    float hU = terrain_h(t, x, zp) * t->max_height;
     float dHdx = (hR - hL) / (dx_world > 0.001f ? dx_world : 1.0f);
     float dHdz = (hU - hD) / (dz_world > 0.001f ? dz_world : 1.0f);
     float nxv = -dHdx, nyv = 1.0f, nzv = -dHdz;
@@ -595,7 +919,7 @@ void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
             int zi = clampi(z0 + j * step, 0, t->h - 1);
             float wx = (float)xi * dx_world;
             float wz = (float)zi * dz_world;
-            float wy = t->heights[(size_t)zi * t->w + xi] * t->max_height;
+            float wy = terrain_h(t, xi, zi) * t->max_height;
             float nx_, ny_, nz_;
             compute_normal(t, xi, zi, &nx_, &ny_, &nz_);
             JceTerrainVertex *V = &out_verts[v++];
@@ -608,6 +932,17 @@ void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
     int idx = 0;
     for (int j = 0; j < nz - 1; ++j) {
         for (int i = 0; i < nx - 1; ++i) {
+            /* Drop the render cell if ANY terrain cell it spans is cut, so a
+             * hole stays visible at every LOD (conservative at step > 1). */
+            if (t->holes) {
+                bool hole = false;
+                int tx0 = x0 + i * step, tx1 = x0 + (i + 1) * step;
+                int tz0 = z0 + j * step, tz1 = z0 + (j + 1) * step;
+                for (int hz = tz0; hz < tz1 && !hole; ++hz)
+                    for (int hx = tx0; hx < tx1 && !hole; ++hx)
+                        if (terrain_cell_hole(t, hx, hz)) hole = true;
+                if (hole) continue;
+            }
             uint32_t a = (uint32_t)( j      * nx + i);
             uint32_t b = (uint32_t)( j      * nx + i + 1);
             uint32_t c = (uint32_t)((j + 1) * nx + i);
@@ -646,6 +981,56 @@ static void brush_grid_extents(const JceTerrain *t, float wx, float wz,
     *z0 = clampi(iz - rz, 0, t->h - 1);
     *x1 = clampi(ix + rx, 0, t->w - 1);
     *z1 = clampi(iz + rz, 0, t->h - 1);
+}
+
+/* ── Holes (cut cells for caves / tunnels / building interiors) ─────── */
+
+bool jce_terrain_has_holes(const JceTerrain *t)
+{
+    if (!t || !t->holes) return false;
+    size_t n = (size_t)t->w * (size_t)t->h;
+    for (size_t i = 0; i < n; ++i) if (t->holes[i]) return true;
+    return false;
+}
+
+bool jce_terrain_cell_is_hole(const JceTerrain *t, int cx, int cz)
+{
+    return t ? terrain_cell_hole(t, cx, cz) : false;
+}
+
+void jce_terrain_set_hole(JceTerrain *t, int cx, int cz, bool hole)
+{
+    if (!t || t->tile_dim != 0) return;   /* monolithic terrain only */
+    if (cx < 0 || cz < 0 || cx >= t->w - 1 || cz >= t->h - 1) return;
+    if (!t->holes) {
+        if (!hole) return;                /* nothing to clear yet */
+        size_t n = (size_t)t->w * (size_t)t->h;
+        t->holes = (uint8_t *)JCE_CALLOC(n, sizeof(uint8_t));
+        if (!t->holes) return;
+    }
+    t->holes[(size_t)cz * (size_t)t->w + (size_t)cx] = hole ? 1u : 0u;
+}
+
+/* Paint (erase=false) or fill (erase=true) holes under a world-space circular
+ * brush — the mesh-gen + collision-mesh paths drop the cut cells. */
+void jce_terrain_hole_apply(JceTerrain *t, float wx, float wz,
+                            float radius_world, bool erase)
+{
+    if (!t || t->tile_dim != 0 || radius_world <= 0.0f) return;
+    int x0, z0, x1, z1;
+    brush_grid_extents(t, wx, wz, radius_world, &x0, &z0, &x1, &z1);
+    float dx_world = t->world_size_x / (float)(t->w - 1);
+    float dz_world = t->world_size_z / (float)(t->h - 1);
+    float r2 = radius_world * radius_world;
+    for (int j = z0; j <= z1; ++j) {
+        for (int i = x0; i <= x1; ++i) {
+            float cellx = ((float)i + 0.5f) * dx_world;
+            float cellz = ((float)j + 0.5f) * dz_world;
+            float ddx = cellx - wx, ddz = cellz - wz;
+            if (ddx * ddx + ddz * ddz <= r2)
+                jce_terrain_set_hole(t, i, j, !erase);
+        }
+    }
 }
 
 void jce_terrain_sculpt_apply(JceTerrain *t,

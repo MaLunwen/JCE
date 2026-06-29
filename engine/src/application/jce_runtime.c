@@ -23,6 +23,8 @@
  */
 
 #include "jce_rt_internal.h"
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_perf_phase.h>
 
 
 
@@ -180,8 +182,13 @@ static uint64_t rt_spawn_create(const JceSpawnRequest *req, void *user)
 	const JceSpawnManagerComponent *smc =
 		jce_scene_get_spawn_manager(rt->scene, rt->cur_spawn_mgr);
 	if (!smc || !smc->ped_prefab_path[0]) return 0;   /* nothing authored to spawn */
+	/* Global actor budget: refuse the spawn (return 0 ⇒ manager aborts the slot)
+	 * once the world-level pool or per-frame quota is reached.  Both 0 = unlimited. */
+	if (rt->actor_budget      && rt->actor_count        >= rt->actor_budget)      return 0;
+	if (rt->actor_spawn_quota && rt->actor_spawned_frame >= rt->actor_spawn_quota) return 0;
 	JceEntity e = rt_spawn_prefab_at(rt, smc->ped_prefab_path,
 	                                 req->position.x, req->position.y, req->position.z);
+	if (e) { rt->actor_count++; rt->actor_spawned_frame++; }
 	return (uint64_t)e;   /* cookie = spawned entity id (0 ⇒ slot aborted) */
 }
 
@@ -190,6 +197,7 @@ static void rt_spawn_destroy(uint64_t cookie, void *user)
 	JceRuntime *rt = (JceRuntime *)user;
 	if (!rt || !rt->scene || cookie == 0) return;
 	jce_scene_destroy_entity(rt->scene, (JceEntity)cookie);
+	if (rt->actor_count) rt->actor_count--;   /* mirror the budget counter */
 }
 
 /* Default ped sampler: a random point in the [min_r, max_r] ring around the
@@ -524,6 +532,8 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 			be->hearing_range    = (btc->hearing_range    > 0.0f) ? btc->hearing_range    : 15.0f;
 			be->tick_period      = (btc->tick_hz > 0.0f) ? (1.0f / btc->tick_hz) : 0.0f;
 			be->tick_accum       = 0.0f;
+			be->simlod_accum     = 0.0f;   /* sim-LOD cadence state */
+			be->simlod_prev_tier = -1;     /* -1 = nominal first classification */
 			be->active           = true;
 			/* Mirror the assigned handle back onto the component so the
 			 * inspector / save reflects the loaded tree. */
@@ -549,6 +559,8 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 			se->entity = e;
 			se->inst   = inst;
 			se->active = true;
+			se->simlod_accum     = 0.0f;   /* sim-LOD cadence state */
+			se->simlod_prev_tier = -1;
 			snprintf(se->script_path, sizeof se->script_path, "%s",
 			         sc->script_path);
 			/* Watch the source for hot-reload (no-op in shipped: PAK-resident
@@ -684,6 +696,8 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 				NavAgentEntry *ne = &rt->nav_entries[rt->nav_entry_count];
 				ne->entity = e;
 				ne->handle = h;
+				ne->simlod_accum     = 0.0f;   /* sim-LOD cadence state */
+				ne->simlod_prev_tier = -1;
 				/* Initial destination: a referenced target entity's world
 				 * position when set, otherwise the authored target point. */
 				float gx, gz;
@@ -2207,6 +2221,119 @@ static jce_vec3 rt_viewer_position(JceRuntime *rt)
 	return ctx.pos;
 }
 
+/* ── Simulation LOD (distance-tiered gameplay tick) ──────────────────
+ *
+ * Per-frame KPI: how many tiered entities resolved into each tier, sampled the
+ * last time rt_tick_gameplay ran.  Logged ~1/s when JCE_KPI_SIMLOD is set
+ * (A/B + quantify the gameplay-tick CPU reduction; mirrors JCE_KPI_TRAVERSE).
+ * Plain process-globals — single sim thread, diagnostic only. */
+static int  g_simlod_near = 0, g_simlod_mid = 0, g_simlod_far = 0;
+static int  g_simlod_paused = 0;   /* tiered subsystem skipped this frame (pause) */
+static int  g_simlod_kpi_on = -1;  /* -1 unread, 0 off, 1 on */
+
+/* Build the three-level distance group for a SimLod component (cached per
+ * call; the radii are cheap to recompute).  near=[0,near_radius],
+ * mid=(near,mid_radius], far=(mid,inf). */
+static void rt_sim_lod_group(const JceSimLodComponent *sl, JceLodGroup *g)
+{
+	float nr = (sl->near_radius > 0.0f) ? sl->near_radius : 25.0f;
+	float mr = (sl->mid_radius  > nr)   ? sl->mid_radius  : (nr + 55.0f);
+	jce_lod_init(g);
+	g->levels[0].mesh = NULL; g->levels[0].distance = nr;      /* tier 0 NEAR */
+	g->levels[1].mesh = NULL; g->levels[1].distance = mr;      /* tier 1 MID  */
+	g->levels[2].mesh = NULL; g->levels[2].distance = FLT_MAX; /* tier 2 FAR  */
+	g->count = 3;
+}
+
+/* Hz -> tick period in seconds, with the sim-LOD sign convention:
+ *   hz  > 0 -> 1/hz seconds, hz == 0 -> 0 (every frame), hz < 0 -> -1 (pause). */
+static float rt_sim_lod_hz_to_period(float hz)
+{
+	if (hz < 0.0f) return -1.0f;       /* paused */
+	if (hz <= 0.0f) return 0.0f;       /* every frame */
+	return 1.0f / hz;
+}
+
+float rt_sim_lod_period(JceRuntime *rt, JceEntity e, jce_vec3 viewer,
+                        uint32_t gate_bit, int *prev_tier)
+{
+	/* Read the previous tier (hysteresis state) BEFORE any early-out, then
+	 * stamp the -1 "untiered" sentinel on every "full rate" exit so the KPI
+	 * census in rt_sim_lod_gate can tell a genuinely tiered entity (tier
+	 * 0/1/2) from one that is simply not opted in. */
+	int pv = prev_tier ? *prev_tier : -1;
+	if (prev_tier) *prev_tier = -1;
+
+	if (!rt || !rt->scene) return 0.0f;
+	JceSimLodComponent *sl = jce_scene_get_sim_lod(rt->scene, e);
+	if (!sl || !sl->enabled) return 0.0f;          /* untiered -> full rate */
+
+	/* Per-component disable (live editor toggle) acts like !enabled. */
+	{ static int sl_cid = -2;
+	  if (sl_cid == -2) sl_cid = jce_component_find("SimLod");
+	  if (sl_cid >= 0 && !jce_scene_comp_enabled(rt->scene, e, sl_cid))
+	      return 0.0f; }
+
+	/* Gate bit clear -> this subsystem is never throttled for this entity. */
+	uint32_t mask = sl->gate_mask ? sl->gate_mask : (uint32_t)JCE_SIMLOD_GATE_ALL;
+	if (!(mask & gate_bit)) return 0.0f;
+
+	/* Distance (XZ + Y, full 3D) entity -> viewer; classify with hysteresis. */
+	jce_vec3 p = rt_world_position(rt->scene, e);
+	jce_vec3 d = jce_v3(p.x - viewer.x, p.y - viewer.y, p.z - viewer.z);
+	float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+
+	JceLodGroup g;
+	rt_sim_lod_group(sl, &g);
+	int tier = jce_lod_pick(&g, dist, pv);
+	if (tier < 0) tier = 2;            /* past last threshold -> FAR */
+	if (prev_tier) *prev_tier = tier;
+
+	float hz = (tier == 0) ? sl->near_hz
+	         : (tier == 1) ? sl->mid_hz
+	                       : sl->far_hz;
+	return rt_sim_lod_hz_to_period(hz);
+}
+
+/* One-stop gate used by each tiered subsystem.  Advances `*accum` by the real
+ * frame dt, then decides whether to fire this frame at the entity's tier rate
+ * for `gate_bit`.  On a firing frame returns true and writes the dt to FOLD
+ * into the subsystem update (the accumulated time since its last tick, so the
+ * logic stays time-correct at any rate) into *out_dt.  Also accumulates the
+ * per-tier KPI counters the first time an entity is classified this frame
+ * (driven by `count_kpi`, set only on the script pass so each entity counts
+ * once).  Untiered entities (period 0) always fire with the plain frame dt. */
+static bool rt_sim_lod_gate(JceRuntime *rt, JceEntity e, jce_vec3 viewer,
+                            uint32_t gate_bit, float dt,
+                            float *accum, int *prev_tier,
+                            bool count_kpi, float *out_dt)
+{
+	float period = rt_sim_lod_period(rt, e, viewer, gate_bit, prev_tier);
+
+	/* Census only genuinely tiered entities (tier 0/1/2); untiered entities
+	 * carry the -1 sentinel set by rt_sim_lod_period and are not counted. */
+	if (count_kpi && prev_tier) {
+		int t = *prev_tier;
+		if (t == 0) g_simlod_near++;
+		else if (t == 1) g_simlod_mid++;
+		else if (t == 2) g_simlod_far++;
+	}
+
+	if (period < 0.0f) {                /* tier paused */
+		if (count_kpi) g_simlod_paused++;
+		return false;
+	}
+	if (period == 0.0f) {              /* full rate */
+		*out_dt = dt;
+		return true;
+	}
+	*accum += dt;
+	if (*accum < period) return false;
+	*out_dt = *accum;                 /* fold the whole accumulated interval */
+	*accum  = 0.0f;
+	return true;
+}
+
 /* Advance trigger volumes, spawn managers, and weapons once per variable
  * frame.  Triggers re-test overlap against a single observer tracking the
  * viewer; spawn managers run their density/cadence state machine; weapons
@@ -2235,6 +2362,7 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 	}
 
 	/* Spawn managers: viewer-relative density pop-in. */
+	rt->actor_spawned_frame = 0;   /* reset per-frame spawn quota (actor budget) */
 	for (int i = 0; i < rt->spawn_count; ++i) {
 		if (!rt->spawns[i].mgr) continue;
 		jce_spawn_manager_set_viewer(rt->spawns[i].mgr, viewer);
@@ -2286,6 +2414,20 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 				}
 				continue;
 			}
+			/* Simulation-LOD: throttle the per-agent goal-tracking + repath
+			 * decision (the expensive per-entity nav work: target world-pos
+			 * lookups, distance math, path re-find) to this agent's tier rate.
+			 * The shared crowd integrator (jce_nav_agent_set_update) and the
+			 * write-back still run every frame, so a FAR agent keeps gliding
+			 * toward its last destination instead of freezing mid-stride — it
+			 * just re-targets a moving player less often.  Untiered agents fold
+			 * dt==frame and behave exactly as before. */
+			float na_dt;
+			if (!rt_sim_lod_gate(rt, ne->entity, viewer,
+			                     JCE_SIMLOD_GATE_NAV, dt,
+			                     &ne->simlod_accum, &ne->simlod_prev_tier,
+			                     false, &na_dt))
+				continue;   /* not this agent's turn to re-plan this frame */
 			float gx, gz;
 			if (nac->target_entity != 0) {
 				jce_vec3 tp = rt_world_position(rt->scene,
@@ -2379,12 +2521,33 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			struct BtEntry *be = &rt->bts[i];
 			if (!be->active || !jce_bt_tree_valid(be->tree)) continue;
 
-			/* Cadence gate: accumulate dt, only proceed once a tick period
-			 * elapsed (period 0 = every frame). */
-			if (be->tick_period > 0.0f) {
-				be->tick_accum += dt;
-				if (be->tick_accum < be->tick_period) continue;
-				be->tick_accum -= be->tick_period;
+			/* Effective tick dt fed to the tree's env (Wait/Cooldown timers).
+			 * Defaults to the authored cadence (or dt). */
+			float bt_eff_dt = (be->tick_period > 0.0f) ? be->tick_period : dt;
+
+			/* Simulation-LOD gate (takes precedence over the authored tick_hz
+			 * when the entity carries a SimLod component gating BehaviorTree):
+			 * skip this frame unless the tier rate fires; fold the accumulated
+			 * dt so perception/timers stay time-correct.  Returns 0 (full rate)
+			 * for untiered agents, leaving the authored cadence gate below in
+			 * charge — byte-identical to before for anything without SimLod. */
+			float bt_sl_period =
+				rt_sim_lod_period(rt, be->entity, viewer,
+				                  JCE_SIMLOD_GATE_BT, &be->simlod_prev_tier);
+			if (bt_sl_period < 0.0f) continue;          /* tier paused */
+			if (bt_sl_period > 0.0f) {
+				be->simlod_accum += dt;
+				if (be->simlod_accum < bt_sl_period) continue;
+				bt_eff_dt = be->simlod_accum;           /* fold whole interval */
+				be->simlod_accum = 0.0f;
+			} else {
+				/* Untiered (or near tier @ every-frame): keep the authored
+				 * cadence gate exactly as before. */
+				if (be->tick_period > 0.0f) {
+					be->tick_accum += dt;
+					if (be->tick_accum < be->tick_period) continue;
+					be->tick_accum -= be->tick_period;
+				}
 			}
 
 			/* Agent eye = its entity world position; forward = its -Z basis. */
@@ -2420,10 +2583,10 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			{
 				JceBtTickEnv env;
 				env.bb            = be->bb;
-				/* Advance library timers by this agent's tick period (or dt
-				 * when it ticks every frame) so Wait/Cooldown stay consistent
-				 * with the cadence the tree is actually ticked at. */
-				env.dt            = (be->tick_period > 0.0f) ? be->tick_period : dt;
+				/* Advance library timers by the EFFECTIVE tick dt (folded sim-LOD
+				 * interval, authored tick period, or frame dt) so Wait/Cooldown
+				 * stay consistent with the cadence the tree is actually ticked at. */
+				env.dt            = bt_eff_dt;
 				env.move_to       = rt_bt_move_to;
 				env.move_userdata = rt;
 				jce_bt_set_env(rt->bt_ctx, &env);
@@ -2497,13 +2660,54 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			}
 		}
 		for (int i = 0; i < rt->script_count; ++i) {
-			if (rt->scripts[i].active)
-				jce_script_call_update(rt->script_vm, rt->scripts[i].inst, dt);
+			if (!rt->scripts[i].active) continue;
+			/* Simulation-LOD gate: a tiered entity's on_update fires only at its
+			 * active tier's Hz, folding the accumulated dt so the script sees a
+			 * time-correct delta (movement/cooldowns stay right at any rate).
+			 * This is also the per-frame entity census: count_kpi=true tallies
+			 * each tiered entity into its tier exactly once.  Untiered entities
+			 * (no SimLod / disabled / Script gate clear) get period 0 -> fire
+			 * every frame with the plain dt — byte-identical to before. */
+			float s_dt;
+			if (!rt_sim_lod_gate(rt, rt->scripts[i].entity, viewer,
+			                     JCE_SIMLOD_GATE_SCRIPT, dt,
+			                     &rt->scripts[i].simlod_accum,
+			                     &rt->scripts[i].simlod_prev_tier,
+			                     true, &s_dt))
+				continue;
+			jce_script_call_update(rt->script_vm, rt->scripts[i].inst, s_dt);
 		}
 		/* Advance cooperative coroutines (jce.start_coroutine / wait_seconds)
-		 * with the same time-scaled dt the per-instance updates saw. */
+		 * with the same time-scaled dt the per-instance updates saw.  These are
+		 * shared cooperative timers, not per-entity, so they stay every-frame. */
 		jce_script_update_coroutines(rt->script_vm, dt);
 	}
+
+	/* ── Simulation-LOD KPI (diagnostic) ─────────────────────────────
+	 * When JCE_KPI_SIMLOD is set, log the per-tier entity census ~1/s so an
+	 * A/B traverse can quantify the gameplay-tick reduction (most far entities
+	 * at 1 Hz instead of 60).  Counters were accumulated by the script pass
+	 * above (each tiered entity counted once); reset for the next frame. */
+	if (g_simlod_kpi_on < 0) {
+		const char *kv = getenv("JCE_KPI_SIMLOD");
+		g_simlod_kpi_on = (kv && kv[0] && kv[0] != '0') ? 1 : 0;
+	}
+	if (g_simlod_kpi_on) {
+		static double accT = 0.0;
+		accT += (double)dt;
+		if (accT >= 1.0) {
+			accT = 0.0;
+			int tiered = g_simlod_near + g_simlod_mid + g_simlod_far;
+			LOG_INFO(LOG_TAG,
+			    "sim-LOD census: tiered=%d near(full)=%d mid=%d far=%d paused=%d "
+			    "scripts=%d bts=%d navs=%d",
+			    tiered, g_simlod_near, g_simlod_mid, g_simlod_far,
+			    g_simlod_paused, rt->script_count, rt->bt_count,
+			    rt->nav_entry_count);
+		}
+	}
+	g_simlod_near = g_simlod_mid = g_simlod_far = 0;
+	g_simlod_paused = 0;
 }
 
 
@@ -2527,6 +2731,259 @@ static void rt_flush_pending_spawns(JceRuntime *rt)
 		memmove(rt->pending_spawns, rt->pending_spawns + n,
 		        (size_t)remain * sizeof(JceEntity));
 	rt->pending_spawn_count = (remain > 0) ? remain : 0;
+}
+
+/* ── Streamed-cell gameplay wiring (streaming M3) ─────────────────────
+ *
+ * Wire / unwire ONE entity's gameplay into / out of the live runtime, so a
+ * world-streamer chunk's freshly-spawned entities come alive (scripts, triggers,
+ * NPCs, bodies) and an unloaded chunk's entities release every runtime-side
+ * reference before the streamer destroys the scene entity.
+ *
+ * SPAWN reuses the EXACT per-entity wiring rt_spawn_gameplay / the jce.spawn
+ * flush path run for a single id (rt_spawn_entity → body/character/audio;
+ * rt_spawn_gameplay → trigger/spawner/weapon/save-point/BT/script+on_start/GAS/
+ * ragdoll/nav).  No parallel logic — just the two existing walk callbacks fed
+ * one id at a time, exactly as rt_flush_pending_spawns does.
+ *
+ * DESPAWN is the inverse: it RELEASES each tracked per-entity handle, mirroring
+ * what rt_teardown_scene_state does in bulk but for ONE id, using swap-remove on
+ * every per-scene array.  Order matches teardown's double-free contract: the
+ * ragdoll / vehicle / cfg-joint / 2D-joint handles that live inside a physics
+ * world are destroyed via their own API; the plain rigid body is destroyed via
+ * jce_physics_body_destroy.  Releasing a script instance fires its on_destroy. */
+
+/* Wire ONE streamed entity's gameplay into the live runtime. */
+static void rt_wire_entity_gameplay(JceRuntime *rt, JceEntity e)
+{
+	if (!rt || !rt->scene || e == 0) return;
+	/* Bodies / character / voices, then triggers / spawners / scripts+on_start /
+	 * BT / nav / GAS / ragdoll — the same two passes the create() walk runs, but
+	 * for this single id.  in_scene_walk stays false (set by the caller) so a
+	 * script's on_start may legally jce.spawn. */
+	rt_spawn_entity(rt->scene, e, rt);
+	rt_spawn_gameplay(rt->scene, e, rt);
+}
+
+/* Release ONE entity's gameplay from the live runtime (cell unload / pre-destroy).
+ * Every block is presence-gated by a linear scan + swap-remove, so an id with no
+ * tracked state of a given kind is a no-op.  Must run while `e` is still a valid
+ * scene entity (the streamer fires on_despawn BEFORE destroying it). */
+static void rt_unwire_entity_gameplay(JceRuntime *rt, JceEntity e)
+{
+	if (!rt || e == 0) return;
+
+	/* Gameplay-script instance — release fires on_destroy (per-instance self
+	 * state freed), same as the bulk teardown.  Removing it from scripts[] stops
+	 * on_update / on_collision / broadcast from ever touching the dead id. */
+	if (rt->script_vm) {
+		for (int i = 0; i < rt->script_count; ++i) {
+			if (rt->scripts[i].entity != e) continue;
+			if (rt->scripts[i].active)
+				jce_script_release(rt->script_vm, rt->scripts[i].inst);
+			rt->scripts[i] = rt->scripts[--rt->script_count];
+			break;   /* one instance per entity */
+		}
+	}
+
+	/* Behavior-tree agent — halt the tree on the (reusable) context + free the
+	 * per-agent blackboard, mirroring teardown. */
+	for (int i = 0; i < rt->bt_count; ++i) {
+		if (rt->bts[i].entity != e) continue;
+		if (rt->bt_ctx && jce_bt_tree_valid(rt->bts[i].tree))
+			jce_bt_halt(rt->bt_ctx, rt->bts[i].tree);
+		if (rt->bts[i].bb)
+			jce_blackboard_destroy(rt->bts[i].bb);
+		rt->bts[i] = rt->bts[--rt->bt_count];
+		break;
+	}
+
+	/* Nav agent — remove from the agent set. */
+	if (rt->nav_agents) {
+		for (int i = 0; i < rt->nav_entry_count; ++i) {
+			if (rt->nav_entries[i].entity != e) continue;
+			if (jce_nav_agent_valid(rt->nav_entries[i].handle))
+				jce_nav_agent_remove(rt->nav_agents, rt->nav_entries[i].handle);
+			rt->nav_entries[i] = rt->nav_entries[--rt->nav_entry_count];
+			break;
+		}
+	}
+
+	/* Trigger volume observer — remove from the trigger world. */
+	if (rt->trigger_world) {
+		for (int i = 0; i < rt->trigger_count; ++i) {
+			if (rt->triggers[i].entity != e) continue;
+			if (jce_trigger_valid(rt->triggers[i].handle))
+				jce_trigger_remove(rt->trigger_world, rt->triggers[i].handle);
+			rt->triggers[i] = rt->triggers[--rt->trigger_count];
+			break;
+		}
+		/* Save-point trigger (also in trigger_world). */
+		for (int i = 0; i < rt->save_point_count; ++i) {
+			if (rt->save_points[i].entity != e) continue;
+			if (jce_trigger_valid(rt->save_points[i].handle))
+				jce_trigger_remove(rt->trigger_world, rt->save_points[i].handle);
+			rt->save_points[i] = rt->save_points[--rt->save_point_count];
+			break;
+		}
+	}
+
+	/* Spawn manager — owned, destroy it. */
+	for (int i = 0; i < rt->spawn_count; ++i) {
+		if (rt->spawns[i].entity != e) continue;
+		if (rt->spawns[i].mgr) jce_spawn_manager_destroy(rt->spawns[i].mgr);
+		rt->spawns[i] = rt->spawns[--rt->spawn_count];
+		break;
+	}
+
+	/* Weapon — POD fire-control state, just drop it. */
+	for (int i = 0; i < rt->weapon_count; ++i) {
+		if (rt->weapons[i].entity != e) continue;
+		rt->weapons[i] = rt->weapons[--rt->weapon_count];
+		break;
+	}
+
+	/* Live ability system — embedded POD, just drop it. */
+	for (int i = 0; i < rt->gas_count; ++i) {
+		if (rt->gas_entries[i].entity != e) continue;
+		rt->gas_entries[i] = rt->gas_entries[--rt->gas_count];
+		break;
+	}
+
+	/* Ragdoll — destroy the body chain (in rt->physics) BEFORE the owned model,
+	 * same ordering contract as teardown.  Must precede the rigid-body destroy
+	 * below only in the sense that both happen before jce_physics_destroy; here
+	 * we destroy individual handles so order between them is irrelevant. */
+	for (int i = 0; i < rt->ragdoll_count; ++i) {
+		if (rt->ragdoll_entries[i].entity != e) continue;
+		if (rt->ragdoll_entries[i].rd)    jce_ragdoll_destroy(rt->ragdoll_entries[i].rd);
+		if (rt->ragdoll_entries[i].model) jce_model_destroy(rt->ragdoll_entries[i].model);
+		rt->ragdoll_entries[i] = rt->ragdoll_entries[--rt->ragdoll_count];
+		break;
+	}
+
+	/* Raycast vehicle — owns a chassis body in rt->physics. */
+	if (rt->physics) {
+		for (int i = 0; i < rt->vehicle_count; ++i) {
+			if (rt->vehicles[i].entity != e) continue;
+			if (jce_vehicle_valid(rt->vehicles[i].veh))
+				jce_physics_vehicle_destroy(rt->physics, rt->vehicles[i].veh);
+			rt->vehicles[i] = rt->vehicles[--rt->vehicle_count];
+			break;
+		}
+		/* Configurable joint — constraint in rt->physics. */
+		for (int i = 0; i < rt->cfg_joint_count; ++i) {
+			if (rt->cfg_joints[i].entity != e) continue;
+			if (jce_constraint_valid(rt->cfg_joints[i].handle))
+				jce_physics_constraint_destroy(rt->physics,
+				                               rt->cfg_joints[i].handle);
+			rt->cfg_joints[i] = rt->cfg_joints[--rt->cfg_joint_count];
+			break;
+		}
+	}
+
+	/* Soft body — lives in the SHARED soft world (independent of rt->physics). */
+	for (int i = 0; i < rt->softbody_count; ++i) {
+		if (rt->softbodies[i].entity != e) continue;
+		jce_softbody_destroy(rt->softbodies[i].handle);
+		rt->softbodies[i] = rt->softbodies[--rt->softbody_count];
+		break;
+	}
+
+	/* 2D joint — joint in rt->physics2d (destroy before the 2D body below). */
+	if (rt->physics2d) {
+		for (int i = 0; i < rt->joint2d_count; ++i) {
+			if (rt->joints2d[i].entity != e) continue;
+			if (jce_constraint_valid(rt->joints2d[i].handle))
+				jce_physics2d_joint_destroy(rt->physics2d,
+				                            rt->joints2d[i].handle);
+			rt->joints2d[i] = rt->joints2d[--rt->joint2d_count];
+			break;
+		}
+		/* 2D rigid body. */
+		for (int i = 0; i < rt->body2d_count; ++i) {
+			if (rt->bodies2d[i].entity != e) continue;
+			if (jce_body_valid(rt->bodies2d[i].body))
+				jce_physics2d_body_destroy(rt->physics2d, rt->bodies2d[i].body);
+			rt->bodies2d[i] = rt->bodies2d[--rt->body2d_count];
+			break;
+		}
+	}
+
+	/* 3D rigid body / collider (compound / mesh / terrain / plain box). */
+	if (rt->physics) {
+		for (int i = 0; i < rt->body_count; ++i) {
+			if (rt->bodies[i].entity != e) continue;
+			if (jce_body_valid(rt->bodies[i].body))
+				jce_physics_body_destroy(rt->physics, rt->bodies[i].body);
+			rt->bodies[i] = rt->bodies[--rt->body_count];
+			break;
+		}
+		/* Character controller — only one per scene, but a streamed cell could in
+		 * principle carry one; release it so it does not dangle on the dead id. */
+		if (rt->character_entity == e && jce_character_valid(rt->character)) {
+			jce_physics_character_destroy(rt->physics, rt->character);
+			rt->character        = JCE_CHARACTER_INVALID;
+			rt->character_entity = 0;
+			rt->char_yaw_valid   = false;
+		}
+	}
+
+	/* Draw-distance deferred static collider record (its body, if any, was just
+	 * destroyed above as a normal body; drop the bookkeeping entry). */
+	for (int i = 0; i < rt->dd_count; ++i) {
+		if (rt->dd[i].entity != e) continue;
+		rt->dd[i] = rt->dd[--rt->dd_count];
+		break;
+	}
+
+	/* Audio voices belonging to this entity's AudioSource(s). */
+	if (rt->audio) {
+		for (int i = 0; i < rt->voice_count; ) {
+			if (rt->voices[i].entity != e) { ++i; continue; }
+			jce_audio_stop(rt->audio, rt->voices[i].voice);
+			jce_audio_unload(rt->audio, rt->voices[i].sound);
+			rt->voices[i] = rt->voices[--rt->voice_count];
+			/* no ++i: re-test the swapped-in entry (an entity may own >1 voice) */
+		}
+	}
+
+	/* Drop any not-yet-flushed pending spawn for this id (a cell entity queued by
+	 * an in-cell script's jce.spawn but not yet wired) so the flush never wires a
+	 * dead id. */
+	for (int i = 0; i < rt->pending_spawn_count; ) {
+		if (rt->pending_spawns[i] != e) { ++i; continue; }
+		rt->pending_spawns[i] =
+			rt->pending_spawns[--rt->pending_spawn_count];
+	}
+	/* Drop any queued fracture for this id. */
+	for (int i = 0; i < rt->pending_fracture_count; ) {
+		if (rt->pending_fractures[i] != e) { ++i; continue; }
+		rt->pending_fractures[i] =
+			rt->pending_fractures[--rt->pending_fracture_count];
+	}
+}
+
+JCE_API void JCE_CALL jce_runtime_spawn_gameplay_for_ids(JceRuntime *rt,
+                                                         const uint64_t *ids,
+                                                         uint32_t count)
+{
+	if (!rt || !ids || count == 0) return;
+	/* Not the initial create() walk: a wired script's on_start may jce.spawn. */
+	bool prev_walk = rt->in_scene_walk;
+	rt->in_scene_walk = false;
+	for (uint32_t i = 0; i < count; ++i)
+		rt_wire_entity_gameplay(rt, (JceEntity)ids[i]);
+	rt->in_scene_walk = prev_walk;
+}
+
+JCE_API void JCE_CALL jce_runtime_despawn_gameplay_for_ids(JceRuntime *rt,
+                                                           const uint64_t *ids,
+                                                           uint32_t count)
+{
+	if (!rt || !ids || count == 0) return;
+	for (uint32_t i = 0; i < count; ++i)
+		rt_unwire_entity_gameplay(rt, (JceEntity)ids[i]);
 }
 
 /* ── Per-scene state lifecycle (FEATURE 9.4) ──────────────────────────
@@ -3404,10 +3861,48 @@ JCE_API bool JCE_CALL jce_runtime_is_transitioning(const JceRuntime *rt)
 	return rt && rt->trans_state != JCE_RT_TRANSITION_IDLE;
 }
 
+/* Trail Renderer capture: append the entity's world position to its trail point
+ * buffer when it has moved past min_vertex_distance, FIFO-dropping the oldest
+ * sample when the buffer is full.  (Length is bounded by JCE_TRAIL_MAX_POINTS
+ * rather than the `time` field — a per-point age buffer is a follow-up.) */
+static void rt_trail_capture_cb(JceScene *scene, JceEntity e, void *ud)
+{
+	(void)ud;
+	if (!jce_scene_has_trail_renderer(scene, e)) return;
+	JceTrailRendererComponent *tr = jce_scene_get_trail_renderer(scene, e);
+	if (!tr || !tr->emitting) return;
+
+	jce_vec3 wp = rt_world_position(scene, e);
+	if (tr->point_count <= 0) {
+		tr->points[0][0] = wp.x; tr->points[0][1] = wp.y; tr->points[0][2] = wp.z;
+		tr->point_count = 1;
+		return;
+	}
+	int   last = tr->point_count - 1;
+	float dx = wp.x - tr->points[last][0];
+	float dy = wp.y - tr->points[last][1];
+	float dz = wp.z - tr->points[last][2];
+	float mind = tr->min_vertex_distance > 0.0f ? tr->min_vertex_distance : 0.1f;
+	if (dx*dx + dy*dy + dz*dz < mind*mind) return;   /* not moved enough */
+
+	if (tr->point_count < JCE_TRAIL_MAX_POINTS) {
+		int n = tr->point_count++;
+		tr->points[n][0] = wp.x; tr->points[n][1] = wp.y; tr->points[n][2] = wp.z;
+	} else {
+		memmove(&tr->points[0][0], &tr->points[1][0],
+		        (size_t)(JCE_TRAIL_MAX_POINTS - 1) * 3u * sizeof(float));
+		tr->points[JCE_TRAIL_MAX_POINTS - 1][0] = wp.x;
+		tr->points[JCE_TRAIL_MAX_POINTS - 1][1] = wp.y;
+		tr->points[JCE_TRAIL_MAX_POINTS - 1][2] = wp.z;
+	}
+}
+
 JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 {
 	if (!rt) return;
 	if (dt <= 0.0f) dt = 1.0f / 60.0f;
+
+	uint64_t _t0_tick = jce_time_perf_counter();
 
 	/* Console cvar bridge (gap 9.1): pull any console-changed cvars
 	 * (time_scale / paused / audio.master_volume) into runtime state BEFORE
@@ -3429,6 +3924,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * (rt_audio_poll/_3d, no dt) stays real-time. */
 	const float sim_dt = rt->paused ? 0.0f : dt * rt->time_scale;
 
+	uint64_t _t0_physics = jce_time_perf_counter();
 	if (rt->physics) {
 		/* Keep the physics cadence locked to the engine-wide clock so a
 		 * jce_engine_set_fixed_hz() (or the FIXED_UPDATE phase rate) and the
@@ -3496,6 +3992,22 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 			 * the byte-identical step path. */
 			if (rt->ragdoll_count)
 				rt_ragdoll_sync_from(rt, fixed_dt);
+			/* Sim-LOD physics gating (large-world #3): sleep far-tier dynamic
+			 * bodies that opt in (SimLod gate_mask & PHYSICS) so Bullet's solver
+			 * skips them, and wake near/mid ones.  Bodies without the opt-in
+			 * return tier -1 and are never touched — byte-identical otherwise. */
+			{
+				jce_vec3 sv = rt_viewer_position(rt);
+				for (int bi = 0; bi < rt->body_count; ++bi) {
+					BodyEntry *be = &rt->bodies[bi];
+					if (be->kind == (uint8_t)JCE_BODY_STATIC) continue;
+					int tier = -1;
+					(void)rt_sim_lod_period(rt, be->entity, sv,
+					                        JCE_SIMLOD_GATE_PHYSICS, &tier);
+					if (tier < 0) continue;          /* not opted in -> untouched */
+					jce_physics_body_set_active(rt->physics, be->body, tier != 2);
+				}
+			}
 			jce_physics_step(rt->physics, fixed_dt);
 			/* Configurable-joint break monitor: compare each tracked joint's
 			 * last-step applied impulse against break_force * fixed_dt (impulse =
@@ -3545,14 +4057,20 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 		jce_net_transform_fixed_step(ntick);
 		jce_net_replication_tick((JceNetTick)ntick);
 	}
+	jce_perf_phase_add("physics", jce_time_perf_to_ms(_t0_physics, jce_time_perf_counter()));
+
 	/* Floating-origin large-world rebase (opt-in, default OFF).  Runs after the
 	 * physics sync above (so camera + entities + bodies are at their final
 	 * frame poses) and BEFORE scene_update / rendering, so the whole frame
 	 * downstream observes the rebased coordinates atomically.  A scene without
 	 * floating_origin_enabled returns immediately → byte-identical frame path. */
 	rt_apply_floating_origin(rt);
-	if (rt->scene)
-		jce_scene_update(rt->scene, sim_dt);
+	{
+		uint64_t _t0_su = jce_time_perf_counter();
+		if (rt->scene)
+			jce_scene_update(rt->scene, sim_dt);
+		jce_perf_phase_add("scene_update", jce_time_perf_to_ms(_t0_su, jce_time_perf_counter()));
+	}
 	/* Root motion (FEATURE 3.2): apply the root-joint delta the renderer
 	 * extracted last frame to entities whose avatar has apply_root_motion set.
 	 * Runs after scene_update so it adds on top of the freshest gameplay
@@ -3561,6 +4079,13 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * produced) and for every entity without apply_root_motion. */
 	if (rt->scene && !rt->paused)
 		jce_scene_each_entity(rt->scene, rt_apply_root_motion, rt);
+	/* Trail Renderer point capture (large-world #E): append each emitting
+	 * trail's entity world position to its point buffer once it has moved past
+	 * min_vertex_distance (FIFO when the buffer is full).  Runs after the final
+	 * frame transforms, only during Play (jce_runtime_step) and never paused, so
+	 * trails grow as entities move; sr_draw_trail_renderer draws the buffer. */
+	if (rt->scene && !rt->paused)
+		jce_scene_each_entity(rt->scene, rt_trail_capture_cb, rt);
 	/* Networking render-step: write interpolated poses for non-owned
 	 * networked objects + apply owned-object snap corrections.  Runs after
 	 * scene_update (so gameplay-owned transforms are final) and before the
@@ -3592,16 +4117,28 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * shared JceParticleSystem, sync emitter origins to entity world
 	 * positions, step the sim, and debug-draw alive particles.  Runs after
 	 * scene_update for the freshest transforms (mirrors video-as-texture). */
-	if (rt->scene)
-		jce_scene_particles_update(rt->scene, sim_dt);
+	{
+		uint64_t _t0_par = jce_time_perf_counter();
+		if (rt->scene)
+			jce_scene_particles_update(rt->scene, sim_dt);
+		jce_perf_phase_add("particles", jce_time_perf_to_ms(_t0_par, jce_time_perf_counter()));
+	}
 	/* Variable-rate gameplay bridge: trigger overlap, spawn density, weapon
 	 * timers.  Runs after scene_update so it reads the freshest transforms. */
-	rt_tick_gameplay(rt, sim_dt);
+	{
+		uint64_t _t0_game = jce_time_perf_counter();
+		rt_tick_gameplay(rt, sim_dt);
+		jce_perf_phase_add("gameplay", jce_time_perf_to_ms(_t0_game, jce_time_perf_counter()));
+	}
 	/* Physics draw-distance (big-world spawn): spawn deferred small static
 	 * colliders within radius of the player, despawn far ones.  Runs after
 	 * the physics sync above so it reads the player's final frame pose; a
 	 * no-op when nothing was deferred (dd_count == 0). */
-	rt_drive_draw_distance(rt);
+	{
+		uint64_t _t0_dd = jce_time_perf_counter();
+		rt_drive_draw_distance(rt);
+		jce_perf_phase_add("draw_dist", jce_time_perf_to_ms(_t0_dd, jce_time_perf_counter()));
+	}
 	/* Wire any entities spawned this frame (jce.spawn) now that the script
 	 * update loop has finished iterating scripts[]. */
 	rt_flush_pending_spawns(rt);
@@ -3616,6 +4153,8 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * bar playhead tracks wall-clock like the rest of audio (no-op when the
 	 * scene authored no MusicTrack). */
 	rt_tick_music(rt, dt);
+
+	jce_perf_phase_add("runtime_tick", jce_time_perf_to_ms(_t0_tick, jce_time_perf_counter()));
 }
 
 /* ── Time control (Phase 0.2) ─────────────────────────────────────── */
@@ -3835,6 +4374,23 @@ JCE_API void JCE_CALL jce_runtime_set_paused(JceRuntime *rt, bool paused)
 JCE_API bool JCE_CALL jce_runtime_is_paused(const JceRuntime *rt)
 {
 	return rt ? rt->paused : false;
+}
+
+JCE_API void JCE_CALL jce_runtime_set_actor_budget(JceRuntime *rt,
+                                                   uint32_t max_actors,
+                                                   uint32_t per_frame_quota)
+{
+	if (!rt) return;
+	rt->actor_budget      = max_actors;
+	rt->actor_spawn_quota = per_frame_quota;
+}
+
+JCE_API void JCE_CALL jce_runtime_get_actor_stats(const JceRuntime *rt,
+                                                  uint32_t *out_count,
+                                                  uint32_t *out_budget)
+{
+	if (out_count)  *out_count  = rt ? rt->actor_count  : 0u;
+	if (out_budget) *out_budget = rt ? rt->actor_budget : 0u;
 }
 
 JCE_API JceWorldOrigin *JCE_CALL jce_runtime_world_origin(JceRuntime *rt)

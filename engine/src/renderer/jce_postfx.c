@@ -14,6 +14,7 @@
 #include <jce/renderer/jce_views.h>
 
 #include <bgfx/c99/bgfx.h>
+#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "postfx"
@@ -37,8 +38,9 @@ struct JcePostFXPipeline {
     bgfx_frame_buffer_handle_t fbo[POSTFX_MAX_FBOS];
     bool                     fbos_valid;
 
-    /* Shader programs. */
-    bgfx_program_handle_t prog_tonemap;
+    /* Shader programs.
+     * NOTE: prog_tonemap was removed — fs_composite.sc now handles all
+     * tonemapping; the standalone fs_tonemap program is no longer submitted. */
     bgfx_program_handle_t prog_bloom_extract;
     bgfx_program_handle_t prog_bloom_blur;
     bgfx_program_handle_t prog_bloom_combine;
@@ -116,6 +118,26 @@ struct JcePostFXPipeline {
      * THIS texture as s_texMotion instead — so animated/skinned geometry stops
      * ghosting.  Reset to invalid every apply() (one-shot per frame). */
     bgfx_texture_handle_t      taa_ext_motion_tex;
+
+    /* Selectable tonemap + 3D-LUT grade + soft bloom (Stage 1a.5). */
+    int                    tonemap_op;     /* JcePostFXTonemap; 0=ACES default */
+    bgfx_texture_handle_t  lut_tex;        /* 3D LUT (invalid = no grade) */
+    int                    lut_size;       /* N */
+    float                  lut_strength;   /* 0 = neutral */
+    float                  bloom_knee;     /* 0 = hard cutoff (legacy) */
+    int                    bloom_quality;  /* 0 = single-mip; >0 = pyramid mips */
+    bgfx_uniform_handle_t  u_gradeParams;  /* x=enabled y=strength z=N w=0 */
+    bgfx_uniform_handle_t  s_texLUT;       /* SAMPLER (stage 2) */
+    bgfx_program_handle_t  prog_bloom_down;
+    bgfx_program_handle_t  prog_bloom_up;
+    /* Bloom mip pyramid (HIGH/ULTRA). Up to 6 half-res-chain mips. */
+    #define POSTFX_BLOOM_MAX_MIPS 6
+    bgfx_texture_handle_t      bloom_mip_tex[POSTFX_BLOOM_MAX_MIPS];
+    bgfx_frame_buffer_handle_t bloom_mip_fb[POSTFX_BLOOM_MAX_MIPS];
+    int                        bloom_mip_count;   /* allocated */
+    uint32_t                   bloom_mip_w[POSTFX_BLOOM_MAX_MIPS];
+    uint32_t                   bloom_mip_h[POSTFX_BLOOM_MAX_MIPS];
+    bool                       bloom_mips_valid;
 };
 
 static void reset_output_state(JcePostFXPipeline *pipeline)
@@ -224,6 +246,61 @@ static void destroy_fbos(JcePostFXPipeline *p)
     p->fbos_valid = false;
 }
 
+/* ── Bloom mip pyramid FBO helpers ──────────────────────────────────── */
+
+static void destroy_bloom_mips(JcePostFXPipeline *p)
+{
+    if (!p->bloom_mips_valid) return;
+    for (int i = 0; i < POSTFX_BLOOM_MAX_MIPS; i++) {
+        if (p->bloom_mip_fb[i].idx != UINT16_MAX)
+            bgfx_destroy_frame_buffer(p->bloom_mip_fb[i]);  /* destroyTextures=true */
+        p->bloom_mip_fb[i].idx  = UINT16_MAX;
+        p->bloom_mip_tex[i].idx = UINT16_MAX;  /* owned by the FB */
+    }
+    p->bloom_mip_count = 0;
+    p->bloom_mips_valid = false;
+}
+
+/* Lazily allocate (or reallocate if count changed) the bloom mip pyramid
+ * FBOs.  Each mip is half the resolution of the previous level, so mip 0
+ * is width/2 x height/2, mip 1 is width/4 x height/4, etc.
+ * Uses RGBA16F to keep the full HDR range through the pyramid.
+ * destroyTextures=true so the texture is freed with the frame buffer. */
+static void ensure_bloom_mips(JcePostFXPipeline *p, int mip_count)
+{
+    if (mip_count < 0) mip_count = 0;
+    if (mip_count > POSTFX_BLOOM_MAX_MIPS) mip_count = POSTFX_BLOOM_MAX_MIPS;
+
+    /* If already allocated with the same count and valid, nothing to do. */
+    if (p->bloom_mips_valid && p->bloom_mip_count == mip_count) return;
+
+    /* Free existing pyramid (resize or count change). */
+    destroy_bloom_mips(p);
+    if (mip_count == 0) return;
+
+    for (int i = 0; i < mip_count; i++) {
+        uint32_t w = p->width  >> (i + 1);
+        uint32_t h = p->height >> (i + 1);
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        p->bloom_mip_w[i] = w;
+        p->bloom_mip_h[i] = h;
+
+        p->bloom_mip_tex[i] = bgfx_create_texture_2d(
+            (uint16_t)w, (uint16_t)h, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA16F,
+            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+
+        bgfx_attachment_t at;
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, p->bloom_mip_tex[i], BGFX_ACCESS_WRITE,
+                             0, 1, 0, BGFX_RESOLVE_NONE);
+        p->bloom_mip_fb[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    }
+    p->bloom_mip_count  = mip_count;
+    p->bloom_mips_valid = true;
+}
+
 /* ── TAA persistent FBO helpers ─────────────────────────────────────── */
 
 /* Allocate the persistent TAA history (RGBA16F, HDR like the scene colour)
@@ -313,7 +390,6 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
         p->fbo[i].idx     = UINT16_MAX;
         p->fbo_tex[i].idx = UINT16_MAX;
     }
-    p->prog_tonemap.idx       = UINT16_MAX;
     p->prog_bloom_extract.idx = UINT16_MAX;
     p->prog_bloom_blur.idx    = UINT16_MAX;
     p->prog_bloom_combine.idx = UINT16_MAX;
@@ -348,6 +424,24 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->custom_param_count     = 0;
     reset_output_state(p);
     p->view_base = JCE_VIEW_POST_BASE;
+
+    /* Stage-1a.5: tonemap-op / 3D-LUT / soft bloom init. */
+    p->tonemap_op    = 0;
+    p->lut_tex.idx   = UINT16_MAX;
+    p->lut_size      = 0;
+    p->lut_strength  = 0.0f;
+    p->bloom_knee    = 0.0f;
+    p->bloom_quality = 0;
+    p->u_gradeParams.idx = UINT16_MAX;
+    p->s_texLUT.idx      = UINT16_MAX;
+    p->prog_bloom_down.idx = UINT16_MAX;
+    p->prog_bloom_up.idx   = UINT16_MAX;
+    for (int i = 0; i < POSTFX_BLOOM_MAX_MIPS; i++) {
+        p->bloom_mip_tex[i].idx = UINT16_MAX;
+        p->bloom_mip_fb[i].idx  = UINT16_MAX;
+    }
+    p->bloom_mip_count = 0;
+    p->bloom_mips_valid = false;
 
     /* Create full-screen quad geometry. */
     bgfx_vertex_layout_begin(&p->quad_layout, bgfx_get_renderer_type());
@@ -390,6 +484,10 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_texHistory      = bgfx_create_uniform("s_texHistory",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
     p->u_texMotion       = bgfx_create_uniform("s_texMotion",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
+    /* Stage-1a.5 grade/LUT uniforms. */
+    p->u_gradeParams = bgfx_create_uniform("u_gradeParams", BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->s_texLUT      = bgfx_create_uniform("s_texLUT",      BGFX_UNIFORM_TYPE_SAMPLER, 1);
+
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
 }
@@ -400,6 +498,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
 
     destroy_fbos(pipeline);
     destroy_taa_fbos(pipeline);
+    destroy_bloom_mips(pipeline);
 
     if (pipeline->quad_vb.idx != UINT16_MAX)
         bgfx_destroy_vertex_buffer(pipeline->quad_vb);
@@ -426,9 +525,11 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_taaPrevViewProj);
     bgfx_destroy_uniform(pipeline->u_texHistory);
     bgfx_destroy_uniform(pipeline->u_texMotion);
+    /* Stage-1a.5 grade uniforms. */
+    if (pipeline->u_gradeParams.idx != UINT16_MAX) bgfx_destroy_uniform(pipeline->u_gradeParams);
+    if (pipeline->s_texLUT.idx      != UINT16_MAX) bgfx_destroy_uniform(pipeline->s_texLUT);
 
     /* Destroy shader programs. */
-    if (pipeline->prog_tonemap.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tonemap);
     if (pipeline->prog_bloom_extract.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_extract);
     if (pipeline->prog_bloom_blur.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_blur);
     if (pipeline->prog_bloom_combine.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_combine);
@@ -441,6 +542,9 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_motion_vec.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_motion_vec);
     if (pipeline->prog_taa.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_taa);
     if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
+    /* Stage-1a.5 bloom pyramid programs. */
+    if (pipeline->prog_bloom_down.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_down);
+    if (pipeline->prog_bloom_up.idx      != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_up);
 
     jce_allocator_t a = pipeline->alloc;
     a.free(pipeline, a.ctx);
@@ -463,6 +567,8 @@ void jce_postfx_resize(JcePostFXPipeline *pipeline,
      * apply lazily reallocates at the new size; history_valid resets so the
      * first post-resize resolve treats the (empty) history as invalid. */
     destroy_taa_fbos(pipeline);
+    /* Bloom mip pyramid is size-locked — free so it reallocates at the new size. */
+    destroy_bloom_mips(pipeline);
     reset_output_state(pipeline);
 
     LOG_DEBUG(LOG_TAG, "post-fx resized to %ux%u", width, height);
@@ -496,6 +602,33 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
     if (!pipeline || !out) return;
     *out = pipeline->params;
 }
+
+/* ── Stage-1a.5: tonemap-op / 3D-LUT / soft-knee bloom setters/getters ── */
+
+void jce_postfx_set_tonemap_op(JcePostFXPipeline *p, int op) {
+    if (!p) return; if (op < 0) op = 0; if (op > 2) op = 0; p->tonemap_op = op;
+}
+int jce_postfx_get_tonemap_op(const JcePostFXPipeline *p) { return p ? p->tonemap_op : 0; }
+
+void jce_postfx_set_lut(JcePostFXPipeline *p, JceTexture lut, int n, float s) {
+    if (!p) return;
+    p->lut_tex.idx = lut.idx; p->lut_size = n;
+    if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f; p->lut_strength = s;
+}
+void jce_postfx_get_lut(const JcePostFXPipeline *p, JceTexture *ol, int *on, float *os) {
+    if (ol) ol->idx = p ? p->lut_tex.idx : UINT16_MAX;
+    if (on) *on = p ? p->lut_size : 0;
+    if (os) *os = p ? p->lut_strength : 0.0f;
+}
+void  jce_postfx_set_bloom_knee(JcePostFXPipeline *p, float k) {
+    if (!p) return; if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f; p->bloom_knee = k;
+}
+float jce_postfx_get_bloom_knee(const JcePostFXPipeline *p) { return p ? p->bloom_knee : 0.0f; }
+void jce_postfx_set_bloom_quality(JcePostFXPipeline *p, int m) {
+    if (!p) return; if (m < 0) m = 0; if (m > POSTFX_BLOOM_MAX_MIPS) m = POSTFX_BLOOM_MAX_MIPS;
+    p->bloom_quality = m;
+}
+int jce_postfx_get_bloom_quality(const JcePostFXPipeline *p) { return p ? p->bloom_quality : 0; }
 
 /* ── TAA configuration ─────────────────────────────────────────────── */
 
@@ -619,7 +752,6 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
      * shader at apply() time. The shader PAK lives for the app's lifetime. */
     pipeline->shader_pak = pak;
 
-    pipeline->prog_tonemap       = load_postfx_prog(pak, "tonemap");
     pipeline->prog_bloom_extract = load_postfx_prog(pak, "bloom_extract");
     pipeline->prog_bloom_blur    = load_postfx_prog(pak, "bloom_blur");
     pipeline->prog_bloom_combine = load_postfx_prog(pak, "bloom_combine");
@@ -633,9 +765,12 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     pipeline->prog_motion_vec    = load_postfx_prog(pak, "motion_vec");
     pipeline->prog_taa           = load_postfx_prog(pak, "taa");
 
+    /* Stage-1a.5 bloom pyramid (optional: absence -> single-mip legacy path). */
+    pipeline->prog_bloom_down = load_postfx_prog(pak, "bloom_down");
+    pipeline->prog_bloom_up   = load_postfx_prog(pak, "bloom_up");
+
     /* Count how many loaded successfully. */
     int loaded = 0;
-    if (pipeline->prog_tonemap.idx       != UINT16_MAX) loaded++;
     if (pipeline->prog_bloom_extract.idx != UINT16_MAX) loaded++;
     if (pipeline->prog_bloom_blur.idx    != UINT16_MAX) loaded++;
     if (pipeline->prog_bloom_combine.idx != UINT16_MAX) loaded++;
@@ -646,7 +781,7 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     if (pipeline->prog_composite.idx     != UINT16_MAX) loaded++;
 
     pipeline->shaders_loaded = (loaded > 0);
-    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/9", loaded);
+    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/8", loaded);
     return pipeline->shaders_loaded;
 }
 
@@ -828,11 +963,14 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     if (pipeline->enabled[JCE_POSTFX_BLOOM] &&
         pipeline->prog_bloom_extract.idx != UINT16_MAX)
     {
-        /* Bloom extract pass → FBO 2. */
+        /* Bloom extract pass → FBO 2.
+         * z=knee (Stage-1a.5 soft-knee; 0 = hard cutoff byte-identical).
+         * w=Karis-avg flag for bloom_down (mip0 uses weighted avg; here unused). */
         float bloom_params[4] = {
             pipeline->params.bloom_threshold,
             pipeline->params.bloom_intensity,
-            0.0f, 0.0f
+            pipeline->bloom_knee,   /* z = soft knee (0 = legacy hard cutoff) */
+            0.0f                    /* w = mip0 Karis flag (only used by bloom_down) */
         };
         bgfx_set_uniform(pipeline->u_bloomParams, bloom_params, 1);
 
@@ -842,24 +980,104 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_extract);
         view_id++;
 
-        /* Horizontal blur → FBO 3. */
-        if (pipeline->prog_bloom_blur.idx != UINT16_MAX) {
-            float blur_h[4] = { texel_size[0], 0.0f, 0.0f, 0.0f };
-            bgfx_set_uniform(pipeline->u_blurDir, blur_h, 1);
-            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[3]);
-            bgfx_set_view_name(view_id, "PostFX/BloomBlurH", INT32_MAX);
-            bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[2], UINT32_MAX);
-            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
-            view_id++;
+        /* ── HIGH/ULTRA: dual-filter pyramid (downsample + upsample) ─── */
+        const bool use_pyramid =
+            pipeline->bloom_quality > 0 &&
+            pipeline->prog_bloom_down.idx != UINT16_MAX &&
+            pipeline->prog_bloom_up.idx   != UINT16_MAX;
 
-            /* Vertical blur → FBO 2. */
-            float blur_v[4] = { 0.0f, texel_size[1], 0.0f, 0.0f };
-            bgfx_set_uniform(pipeline->u_blurDir, blur_v, 1);
-            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
-            bgfx_set_view_name(view_id, "PostFX/BloomBlurV", INT32_MAX);
-            bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[3], UINT32_MAX);
-            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
-            view_id++;
+        if (use_pyramid) {
+            ensure_bloom_mips(pipeline, pipeline->bloom_quality);
+
+            if (pipeline->bloom_mips_valid) {
+                int n = pipeline->bloom_mip_count;
+                char view_label[64];
+
+                /* Downsample chain: extract result → mip[0] → mip[1] → ... → mip[n-1]. */
+                bgfx_texture_handle_t down_src = pipeline->fbo_tex[2]; /* extract result */
+                for (int mi = 0; mi < n; mi++) {
+                    uint32_t src_w = (mi == 0) ? pipeline->width  : pipeline->bloom_mip_w[mi - 1];
+                    uint32_t src_h = (mi == 0) ? pipeline->height : pipeline->bloom_mip_h[mi - 1];
+                    float ts[4] = { 1.0f / (float)src_w, 1.0f / (float)src_h, 0.0f, 0.0f };
+                    bgfx_set_uniform(pipeline->u_texelSize, ts, 1);
+
+                    /* mip0 uses Karis luma-weighted average to kill fireflies. */
+                    float bp[4] = { 0.0f, 0.0f, 0.0f, (mi == 0) ? 1.0f : 0.0f };
+                    bgfx_set_uniform(pipeline->u_bloomParams, bp, 1);
+
+                    bgfx_set_view_rect(view_id, 0, 0,
+                        (uint16_t)pipeline->bloom_mip_w[mi],
+                        (uint16_t)pipeline->bloom_mip_h[mi]);
+                    bgfx_set_view_frame_buffer(view_id, pipeline->bloom_mip_fb[mi]);
+                    bgfx_set_view_clear(view_id, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
+                    snprintf(view_label, sizeof(view_label), "PostFX/BloomDown%d", mi);
+                    bgfx_set_view_name(view_id, view_label, INT32_MAX);
+                    bgfx_set_texture(0, pipeline->u_texColor, down_src, UINT32_MAX);
+                    bgfx_set_vertex_buffer(0, pipeline->quad_vb, 0, 4);
+                    bgfx_set_index_buffer(pipeline->quad_ib, 0, 6);
+                    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+                    bgfx_submit(view_id, pipeline->prog_bloom_down, 0, BGFX_DISCARD_ALL);
+                    down_src = pipeline->bloom_mip_tex[mi];
+                    view_id++;
+                }
+
+                /* Upsample chain: mip[n-1] → mip[n-2] → ... → mip[0] → fbo[2].
+                 * Each step adds onto the higher-res target (BGFX_STATE_BLEND_ADD). */
+                for (int mi = n - 1; mi >= 0; mi--) {
+                    bgfx_texture_handle_t up_src = pipeline->bloom_mip_tex[mi];
+                    bgfx_frame_buffer_handle_t up_dst;
+                    uint32_t dst_w, dst_h;
+                    if (mi == 0) {
+                        /* Final upsample: write into fbo[2] (the composite's bloom input). */
+                        up_dst = pipeline->fbo[2];
+                        dst_w  = pipeline->width;
+                        dst_h  = pipeline->height;
+                    } else {
+                        up_dst = pipeline->bloom_mip_fb[mi - 1];
+                        dst_w  = pipeline->bloom_mip_w[mi - 1];
+                        dst_h  = pipeline->bloom_mip_h[mi - 1];
+                    }
+
+                    float ts[4] = { 1.0f / (float)dst_w, 1.0f / (float)dst_h, 0.0f, 0.0f };
+                    bgfx_set_uniform(pipeline->u_texelSize, ts, 1);
+
+                    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)dst_w, (uint16_t)dst_h);
+                    bgfx_set_view_frame_buffer(view_id, up_dst);
+                    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+                    snprintf(view_label, sizeof(view_label), "PostFX/BloomUp%d", mi);
+                    bgfx_set_view_name(view_id, view_label, INT32_MAX);
+                    bgfx_set_texture(0, pipeline->u_texColor, up_src, UINT32_MAX);
+                    bgfx_set_vertex_buffer(0, pipeline->quad_vb, 0, 4);
+                    bgfx_set_index_buffer(pipeline->quad_ib, 0, 6);
+                    /* Additive blend: accumulate mip layers onto the higher-res target. */
+                    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                                   BGFX_STATE_BLEND_ADD, 0);
+                    bgfx_submit(view_id, pipeline->prog_bloom_up, 0, BGFX_DISCARD_ALL);
+                    view_id++;
+                }
+
+                /* Restore texel_size for downstream passes. */
+                bgfx_set_uniform(pipeline->u_texelSize, texel_size, 1);
+            }
+        } else {
+            /* ── LOW/MID: legacy single-mip Gaussian blur (byte-identical) ── */
+            if (pipeline->prog_bloom_blur.idx != UINT16_MAX) {
+                float blur_h[4] = { texel_size[0], 0.0f, 0.0f, 0.0f };
+                bgfx_set_uniform(pipeline->u_blurDir, blur_h, 1);
+                POSTFX_SETUP_VIEW(view_id, pipeline->fbo[3]);
+                bgfx_set_view_name(view_id, "PostFX/BloomBlurH", INT32_MAX);
+                bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[2], UINT32_MAX);
+                draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
+                view_id++;
+
+                float blur_v[4] = { 0.0f, texel_size[1], 0.0f, 0.0f };
+                bgfx_set_uniform(pipeline->u_blurDir, blur_v, 1);
+                POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
+                bgfx_set_view_name(view_id, "PostFX/BloomBlurV", INT32_MAX);
+                bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[3], UINT32_MAX);
+                draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
+                view_id++;
+            }
         }
 
         /* Bloom is COMBINED in the uber composite pass below (fbo_tex[2]
@@ -883,9 +1101,13 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                                  c_chroma ? 1.0f : 0.0f, c_vig ? 1.0f : 0.0f };
             float flags2[4]  = { c_gray ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
             float bloom_p[4] = { pipeline->params.bloom_threshold,
-                                 pipeline->params.bloom_intensity, 0.0f, 0.0f };
+                                 pipeline->params.bloom_intensity,
+                                 pipeline->bloom_knee, 0.0f };
+            /* tonemap_p.z = selectable op id (0=ACES, 1=Neutral, 2=AgX).
+             * The shader dispatches on this via step() comparisons (no ==). */
             float tonemap_p[4] = { pipeline->params.exposure,
-                                   pipeline->params.gamma, 0.0f, 0.0f };
+                                   pipeline->params.gamma,
+                                   (float)pipeline->tonemap_op, 0.0f };
             float chrom_p[4] = { pipeline->params.chromatic_strength, 0.0f, 0.0f, 0.0f };
             float vig_p[4]   = { pipeline->params.vignette_intensity,
                                  pipeline->params.vignette_smoothness, 0.0f, 0.0f };
@@ -895,6 +1117,20 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_uniform(pipeline->u_tonemapParams,   tonemap_p, 1);
             bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
             bgfx_set_uniform(pipeline->u_vignetteParams,  vig_p, 1);
+
+            /* Stage-1a.5: 3D-LUT grade + tonemap-op (gated: needs valid handle +
+             * strength > 0 + tonemap on — grade is in LDR space after tonemap). */
+            const bool grade_on = (pipeline->lut_tex.idx != UINT16_MAX) &&
+                                   pipeline->lut_strength > 0.0f && c_tonemap;
+            float grade_p[4] = { grade_on ? 1.0f : 0.0f,
+                                  pipeline->lut_strength,
+                                  (float)(pipeline->lut_size > 0 ? pipeline->lut_size : 1),
+                                  0.0f };
+            bgfx_set_uniform(pipeline->u_gradeParams, grade_p, 1);
+            if (grade_on)
+                bgfx_set_texture(2, pipeline->s_texLUT, pipeline->lut_tex, UINT32_MAX);
+            /* When grade is off, u_gradeParams.x < 0.5 so the shader never
+             * samples s_texLUT — leaving stage 2 unbound is safe on all backends. */
 
             ensure_composite_fbo(pipeline, ping);
             POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
@@ -1026,10 +1262,12 @@ void jce_postfx_present(JcePostFXPipeline *pipeline,
     if (pipeline->output_tex.idx == UINT16_MAX)
         return;
     /* One view past the chain's worst case so submission order is preserved.
-     * Worst case = TAA (3 views: motion/resolve/history-copy from view_base)
-     * + bloom 3 + composite + fxaa + custom (6 views from view_base+3) =
-     * ends at view_base+9, so +12 stays clear and below JCE_VIEW_EDITOR_OVERLAY. */
-    view_id = (uint16_t)(pipeline->view_base + 12);
+     * Worst case = TAA (3 views: motion/resolve/history-copy from view_base+0..2)
+     * + bloom extract (1) + pyramid 2*N (up to 12 at quality=6)
+     * + composite (1) + fxaa (1) + custom (1) = ends at view_base+18,
+     * so +20 stays clear and below JCE_VIEW_EDITOR_OVERLAY (= 50 for scene base 3).
+     * LOW/MID (bloom_quality=0): ends at view_base+8, still safely below +20. */
+    view_id = (uint16_t)(pipeline->view_base + 20);
     bgfx_set_view_rect(view_id, 0, 0, (uint16_t)width, (uint16_t)height);
     bgfx_set_view_frame_buffer(view_id, backbuffer);
     bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);

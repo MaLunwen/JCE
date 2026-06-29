@@ -90,6 +90,32 @@ struct JceStreamingSystem {
     uint64_t           tick_counter;   /* monotonically increases each update */
     uint32_t           evicted_count;  /* total LRU evictions across lifetime */
 
+    /* Heading-prefetch tracking (M6a).  prev_center is the camera position
+       at the previous update; the per-call delta yields a heading used to
+       shift the LOAD probe point ahead by config.prefetch_lead. */
+    jce_vec3           prev_center;
+    bool               prev_valid;
+
+    /* Cached JCE_DISABLE_PREFETCH env toggle (-1 = unread, mirrors the
+       JCE_DISABLE_WCACHE / JCE_STREAM_SYNC / JCE_DISABLE_OCCLUSION A/B
+       hatches).  When set, both the heading offset and nearest-first
+       ordering are skipped → exact reactive-isotropic behaviour. */
+    int                prefetch_disabled;
+
+    /* Preview / authoring load-override (default RADIUS = zero-init = exact
+       current behaviour).  In ALL every registered chunk is wanted; in
+       FILTER only ids in preview_filter[] are wanted.  Set via
+       jce_streaming_set_preview(). */
+    JceStreamPreviewMode preview_mode;
+    uint32_t             preview_filter[MAX_CHUNKS];
+    uint32_t             preview_filter_count;
+
+    /* Cached JCE_DBG_PREVIEW headless hook (-1 = unread).  Reads
+       "all" / "filter:1,2,3" once at first update so verification runs can
+       drive the preview mode without the panel.  Only applied while the
+       caller has not itself set a non-RADIUS mode (the env is a default). */
+    int                  dbg_preview_read;
+
     /* External dependencies. */
     JceFileSystem     *fs;
     JceThreadPool     *thread_pool;
@@ -370,6 +396,17 @@ JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
     if (sys->config.frame_budget_ms <= 0.0f)
         sys->config.frame_budget_ms = DEFAULT_BUDGET_MS;
 
+    /* Heading-prefetch default (M6a): probe half a load-radius ahead.  This
+       keeps the prefetch within the [load_radius, unload_radius] hysteresis
+       band for the typical street_demo config (load 400 / unload 560 →
+       lead 200), so a cell that prefetches in while approaching does not
+       immediately fall back outside unload_radius on the next tick. */
+    if (sys->config.prefetch_lead <= 0.0f)
+        sys->config.prefetch_lead = 0.5f * sys->config.load_radius;
+
+    sys->prefetch_disabled = -1;   /* read lazily on first update */
+    sys->dbg_preview_read  = -1;   /* JCE_DBG_PREVIEW read lazily on first update */
+
     /* Auto-detect single-thread mode on WebAssembly. */
 #if JCE_PLATFORM_WEB
     sys->config.single_thread = true;
@@ -540,6 +577,90 @@ void jce_streaming_set_chunk_residency(JceStreamingSystem *sys,
     c->estimated_size = bytes;
 }
 
+/* ── Preview / authoring load-override ────────────────────────────── */
+
+void jce_streaming_set_preview(JceStreamingSystem *sys,
+                               JceStreamPreviewMode mode,
+                               const uint32_t *filter_chunk_ids,
+                               uint32_t filter_count)
+{
+    if (!sys) return;
+
+    sys->preview_mode = mode;
+    sys->preview_filter_count = 0;
+
+    if (mode == JCE_STREAM_PREVIEW_FILTER && filter_chunk_ids && filter_count) {
+        uint32_t n = filter_count;
+        if (n > MAX_CHUNKS) n = MAX_CHUNKS;
+        memcpy(sys->preview_filter, filter_chunk_ids, (size_t)n * sizeof(uint32_t));
+        sys->preview_filter_count = n;
+    }
+
+    LOG_INFO(LOG_TAG, "preview mode = %s (filter=%u)",
+             mode == JCE_STREAM_PREVIEW_ALL    ? "ALL"    :
+             mode == JCE_STREAM_PREVIEW_FILTER ? "FILTER" : "RADIUS",
+             sys->preview_filter_count);
+}
+
+/* Is chunk_id in the preview filter set?  Linear scan — the set is small
+   (one entry per chunk the user ticked) and only consulted in FILTER mode. */
+static bool preview_filter_has(const JceStreamingSystem *sys, uint32_t chunk_id)
+{
+    for (uint32_t i = 0; i < sys->preview_filter_count; i++)
+        if (sys->preview_filter[i] == chunk_id) return true;
+    return false;
+}
+
+/* "Wanted" decision for a chunk under the active preview mode.  RADIUS uses
+   the (possibly heading-shifted) load probe distance; ALL wants everything;
+   FILTER wants only ids in the set. */
+static bool chunk_is_wanted(const JceStreamingSystem *sys,
+                            const ChunkRecord *c,
+                            jce_vec3 load_center, float load_r2)
+{
+    switch (sys->preview_mode) {
+    case JCE_STREAM_PREVIEW_ALL:
+        return true;
+    case JCE_STREAM_PREVIEW_FILTER:
+        return preview_filter_has(sys, c->chunk_id);
+    case JCE_STREAM_PREVIEW_RADIUS:
+    default:
+        return dist_sq(load_center, c->center) <= load_r2;
+    }
+}
+
+/* Optional JCE_DBG_PREVIEW headless hook: "all" or "filter:1,2,3".  Applied
+   once, only when the caller hasn't already set a non-RADIUS mode — so the
+   env is a default for verification, never an override of explicit UI calls. */
+static void apply_dbg_preview_env(JceStreamingSystem *sys)
+{
+    if (sys->dbg_preview_read >= 0) return;
+    sys->dbg_preview_read = 1;
+
+    const char *v = getenv("JCE_DBG_PREVIEW");
+    if (!v || !v[0]) return;
+    if (sys->preview_mode != JCE_STREAM_PREVIEW_RADIUS) return; /* UI wins */
+
+    if (strncmp(v, "all", 3) == 0) {
+        jce_streaming_set_preview(sys, JCE_STREAM_PREVIEW_ALL, NULL, 0);
+        LOG_INFO(LOG_TAG, "JCE_DBG_PREVIEW=all -> preview ALL");
+    } else if (strncmp(v, "filter:", 7) == 0) {
+        uint32_t ids[MAX_CHUNKS];
+        uint32_t n = 0;
+        const char *p = v + 7;
+        while (*p && n < MAX_CHUNKS) {
+            char *end = NULL;
+            unsigned long id = strtoul(p, &end, 10);
+            if (end == p) break;            /* no digits consumed */
+            ids[n++] = (uint32_t)id;
+            p = end;
+            while (*p == ',' || *p == ' ') p++;
+        }
+        jce_streaming_set_preview(sys, JCE_STREAM_PREVIEW_FILTER, ids, n);
+        LOG_INFO(LOG_TAG, "JCE_DBG_PREVIEW=filter -> %u chunk(s)", n);
+    }
+}
+
 /* ── Per-frame update ─────────────────────────────────────────────── */
 
 void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
@@ -547,77 +668,159 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
     JCE_PROFILE_ZONE_N("Streaming::Update");
     if (!sys) { JCE_PROFILE_ZONE_END; return; }
 
+    apply_dbg_preview_env(sys);   /* one-shot JCE_DBG_PREVIEW headless hook */
+
     double start = now_ms();
     float load_r2   = sys->config.load_radius   * sys->config.load_radius;
     float unload_r2 = sys->config.unload_radius * sys->config.unload_radius;
     uint64_t budget_bytes = (uint64_t)sys->config.budget_mb * 1024ULL * 1024ULL;
 
+    /* In ALL/FILTER (preview/authoring) the user opted in to the full
+       residency, so the memory-budget LRU + HARD-pressure refusal must not
+       evict / refuse a WANTED chunk.  We bypass both by treating the budget
+       as unlimited for the load pass while not in RADIUS.  Pressure is still
+       computed at end-of-tick so the panel can warn, but it no longer gates
+       loads.  RADIUS (runtime gameplay) keeps the exact budget behaviour. */
+    const bool preview_active = (sys->preview_mode != JCE_STREAM_PREVIEW_RADIUS);
+    const uint64_t load_budget_bytes = preview_active ? 0ULL : budget_bytes;
+
     sys->tick_counter++;
+
+    /* ── Heading prefetch (M6a) ─────────────────────────────────────────
+     * Derive a per-call velocity from the camera's motion since the last
+     * update.  When moving, shift the LOAD probe point `prefetch_lead`
+     * units along the heading so cells ahead enter the load set earlier;
+     * the UNLOAD test + LRU touch keep using the ACTUAL camera position so
+     * cells just behind are not prematurely evicted.  Stationary → zero
+     * offset → identical to reactive streaming.  Reversing → heading flips
+     * → prefetches the new direction.  Wholly disabled by
+     * JCE_DISABLE_PREFETCH=1 (A/B + safety hatch; mirrors JCE_DISABLE_WCACHE
+     * / JCE_STREAM_SYNC / JCE_DISABLE_OCCLUSION). */
+    if (sys->prefetch_disabled < 0) {
+        const char *dv = getenv("JCE_DISABLE_PREFETCH");
+        sys->prefetch_disabled = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
+        if (sys->prefetch_disabled)
+            LOG_INFO(LOG_TAG, "JCE_DISABLE_PREFETCH set — heading prefetch + "
+                              "nearest-first ordering OFF (reactive-isotropic)");
+    }
+    const bool prefetch_on = (sys->prefetch_disabled == 0);
+
+    jce_vec3 load_center = camera_pos;   /* default = no offset */
+    if (prefetch_on && sys->prev_valid) {
+        float dx = camera_pos.x - sys->prev_center.x;
+        float dy = camera_pos.y - sys->prev_center.y;
+        float dz = camera_pos.z - sys->prev_center.z;
+        float len2 = dx * dx + dy * dy + dz * dz;
+        /* Tiny-motion epsilon: ignore sub-millimetre jitter so a perfectly
+         * stationary camera produces no offset (bit-identical to reactive). */
+        if (len2 > 1.0e-6f) {
+            float len = sqrtf(len2);
+            float lead = sys->config.prefetch_lead;
+
+            /* Clamp the lead to half the hysteresis band (unload_radius -
+             * load_radius): a prefetched cell must never sit past where the cell
+             * behind it unloads, or sustained high-velocity travel loads far
+             * cells that evict before their spawn finishes (thrash).  band<=0 =>
+             * no lead offset.  (large-world #7) */
+            {
+                float band = sys->config.unload_radius - sys->config.load_radius;
+                float max_lead = band > 0.0f ? 0.5f * band : 0.0f;
+                if (lead > max_lead) lead = max_lead;
+            }
+
+            /* Speed-ramp the lead by how far the camera actually moved this
+             * tick, saturating at the full lead.  A bare normalize-then-scale
+             * would throw the probe a FULL `lead` units in the direction of
+             * even sub-unit physics drift / settle jitter (a player standing
+             * still still slides ~0.1 u/tick as the body grounds), spuriously
+             * prefetching cells off to the side.  Ramping over a reference
+             * distance keeps micro-drift → micro-offset and only sustained
+             * travel reaches the full lead — and it is frame-rate independent
+             * (slower per-tick deltas at higher FPS still ramp by accumulated
+             * displacement).  Reference = 1/16 of the lead: at street_demo's
+             * lead=200 that is ~12.5 u/tick to saturate, well above settle
+             * jitter yet reached within a couple of frames of real walking. */
+            const float ramp_ref = lead * (1.0f / 16.0f);
+            float gain = (ramp_ref > 0.0f) ? (len / ramp_ref) : 1.0f;
+            if (gain > 1.0f) gain = 1.0f;
+
+            float scale = (lead * gain) / len;   /* offset_len = lead*gain */
+            load_center.x = camera_pos.x + dx * scale;
+            load_center.y = camera_pos.y + dy * scale;
+            load_center.z = camera_pos.z + dz * scale;
+        }
+    }
+    sys->prev_center = camera_pos;
+    sys->prev_valid  = true;
 
     uint32_t loads_this_frame   = 0;
     uint32_t pending_count      = 0;
+    /* Cap async-completion finalizes per frame: finalizing many chunks at once
+     * batches their entity-spawn into a hitch.  A completed-but-not-finalized
+     * chunk stays LOADING and finalizes a later frame (its slot is held, which
+     * naturally throttles new loads).  (large-world #7) */
+    uint32_t finalized_this_frame = 0;
+    const uint32_t kMaxFinalizePerFrame = 2u;
 
+    /* ── Pass 1: order-independent housekeeping (LRU touch, async-completion
+     * finalize, unload, unloading-transition) + count in-flight loads.  The
+     * LOAD decision is pulled out into a separate nearest-first pre-pass
+     * (pass 2) below.  Everything here is unaffected by iteration order. */
     for (uint32_t k = 0; k < sys->active_count; k++) {
         ChunkRecord *c = &sys->chunks[sys->active_idx[k]];
         if (!c->registered) continue;   /* defensive; active list should be live-only */
 
-        float d2 = dist_sq(camera_pos, c->center);
+        float d2 = dist_sq(camera_pos, c->center);   /* ACTUAL pos for unload/LRU */
 
-        /* Touch in-radius loaded chunks so LRU keeps them resident. */
-        if (c->state == JCE_CHUNK_LOADED && d2 <= load_r2)
+        /* Whether this chunk is wanted under the active preview mode.  RADIUS
+         * uses the in-radius test (load probe); ALL wants everything; FILTER
+         * wants only ids in the set.  Drives both the LRU touch (keep wanted
+         * chunks resident) and the unload decision below. */
+        const bool wanted = chunk_is_wanted(sys, c, camera_pos, load_r2);
+
+        /* Touch wanted loaded chunks so LRU keeps them resident. */
+        if (c->state == JCE_CHUNK_LOADED && wanted)
             c->last_touch_tick = sys->tick_counter;
 
         switch (c->state) {
-        case JCE_CHUNK_UNLOADED:
-            /* Should we load this chunk? */
-            if (d2 <= load_r2 &&
-                pending_count + loads_this_frame < sys->config.max_pending) {
-
-                /* Try to make room via LRU before refusing. */
-                if (budget_bytes != 0 && sys->memory_used >= budget_bytes)
-                    evict_lru_for_budget(sys, camera_pos, budget_bytes, load_r2);
-
-                if (budget_bytes != 0 && sys->memory_used >= budget_bytes) {
-                    sys->refused_loads++;
-                    break;  /* still over budget — defer to next frame */
-                }
-
-                c->state = JCE_CHUNK_LOADING;
-
-                if (sys->config.single_thread) {
-                    /* Synchronous load within frame budget. */
-                    if (load_chunk_sync(sys, c)) {
-                        sys->memory_used += c->estimated_size;
-                    }
-                    loads_this_frame++;
-                } else {
-                    /* Async load via thread pool. */
-                    start_chunk_load_async(sys, c);
-                }
-
-                LOG_TRACE(LOG_TAG, "started loading chunk %u", c->chunk_id);
-            }
-            break;
-
         case JCE_CHUNK_LOADING:
             pending_count++;
 
-            /* Check for async completion. */
-            if (!sys->config.single_thread && SDL_GetAtomicInt(&c->load_complete)) {
+            /* Check for async completion (rate-limited; see kMaxFinalizePerFrame). */
+            if (!sys->config.single_thread && SDL_GetAtomicInt(&c->load_complete) &&
+                finalized_this_frame < kMaxFinalizePerFrame) {
                 finalize_chunk_load(sys, c);
                 if (c->state == JCE_CHUNK_LOADED) {
                     sys->memory_used += c->estimated_size;
+                    finalized_this_frame++;
                 }
             }
             break;
 
         case JCE_CHUNK_LOADED:
-            /* Should we unload this chunk? */
-            if (d2 > unload_r2) {
-                c->state = JCE_CHUNK_UNLOADING;
-                sys->memory_used -= c->estimated_size;
-                unload_chunk(sys, c);
-                LOG_TRACE(LOG_TAG, "unloaded chunk %u", c->chunk_id);
+            /* Should we unload this chunk?
+             *   RADIUS : ACTUAL-camera distance beyond unload_radius (so we
+             *            never unload cells just behind the player while
+             *            prefetching ahead).
+             *   ALL    : never unload by distance (whole world stays resident).
+             *   FILTER : unload chunks that are loaded but no longer wanted
+             *            (user unticked them).  No distance hysteresis — the
+             *            user's tick is the authority. */
+            {
+                bool should_unload;
+                if (sys->preview_mode == JCE_STREAM_PREVIEW_ALL)
+                    should_unload = false;
+                else if (sys->preview_mode == JCE_STREAM_PREVIEW_FILTER)
+                    should_unload = !wanted;
+                else
+                    should_unload = (d2 > unload_r2);
+
+                if (should_unload) {
+                    c->state = JCE_CHUNK_UNLOADING;
+                    sys->memory_used -= c->estimated_size;
+                    unload_chunk(sys, c);
+                    LOG_TRACE(LOG_TAG, "unloaded chunk %u", c->chunk_id);
+                }
             }
             break;
 
@@ -625,6 +828,114 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
             /* Unload is synchronous — immediately transition. */
             c->state = JCE_CHUNK_UNLOADED;
             break;
+
+        case JCE_CHUNK_UNLOADED:
+        default:
+            break;   /* loads handled in pass 2 */
+        }
+    }
+
+    /* ── Pass 2: nearest-first LOAD pre-pass (M6a) ──────────────────────
+     * Collect UNLOADED candidates that are within load_radius of the
+     * (possibly heading-shifted) load_center, sort them nearest-first by
+     * distance to load_center, then consume the per-frame load slots in that
+     * order so the most-urgent (closest / most-in-front) cells load first.
+     * Temp arrays are bounded by active_count (already capped at MAX_CHUNKS).
+     * When prefetch is OFF this still loads nearest-first relative to the
+     * camera, which is order-independent vs. the old registration order for
+     * the resident SET (only the within-frame slot priority differs) — so
+     * the A/B difference attributable to prefetch is the heading offset. */
+    uint32_t cand_idx[MAX_CHUNKS];
+    float    cand_d2 [MAX_CHUNKS];
+    uint32_t cand_count = 0;
+
+    for (uint32_t k = 0; k < sys->active_count; k++) {
+        uint32_t slot = sys->active_idx[k];
+        ChunkRecord *c = &sys->chunks[slot];
+        if (!c->registered || c->state != JCE_CHUNK_UNLOADED) continue;
+
+        /* WANTED gate (preview-aware).  In RADIUS this is the in-radius test;
+         * in ALL/FILTER it is the all/filter test.  The nearest-first sort key
+         * below still uses the load-probe distance so the closest wanted cells
+         * stream in first even when ALL/FILTER wants far ones too. */
+        if (!chunk_is_wanted(sys, c, load_center, load_r2)) continue;
+
+        float ld2 = dist_sq(load_center, c->center);
+        cand_idx[cand_count] = slot;
+        cand_d2 [cand_count] = ld2;
+        cand_count++;
+    }
+
+    /* Insertion sort: candidate counts in-radius are small per frame (bounded
+     * by the ring area / chunk size) and this preserves stability cheaply. */
+    for (uint32_t i = 1; i < cand_count; i++) {
+        float    kd = cand_d2[i];
+        uint32_t ki = cand_idx[i];
+        uint32_t j  = i;
+        while (j > 0 && cand_d2[j - 1] > kd) {
+            cand_d2[j]  = cand_d2[j - 1];
+            cand_idx[j] = cand_idx[j - 1];
+            j--;
+        }
+        cand_d2[j]  = kd;
+        cand_idx[j] = ki;
+    }
+
+    for (uint32_t i = 0; i < cand_count; i++) {
+        if (pending_count + loads_this_frame >= sys->config.max_pending)
+            break;
+
+        ChunkRecord *c = &sys->chunks[cand_idx[i]];
+
+        /* Try to make room via LRU before refusing.  Eviction protects cells
+         * inside load_radius of the ACTUAL camera (camera_pos), not the
+         * shifted probe — so prefetched-ahead cells stay evictable but cells
+         * around the player do not.  load_budget_bytes is 0 (unlimited) in
+         * ALL/FILTER preview so a wanted chunk is never evicted/refused — the
+         * user opted in to the heavier residency (see preview_active above). */
+        if (load_budget_bytes != 0 && sys->memory_used >= load_budget_bytes)
+            evict_lru_for_budget(sys, camera_pos, load_budget_bytes, load_r2);
+
+        if (load_budget_bytes != 0 && sys->memory_used >= load_budget_bytes) {
+            sys->refused_loads++;
+            break;  /* still over budget — defer to next frame */
+        }
+
+        c->state = JCE_CHUNK_LOADING;
+
+        if (sys->config.single_thread) {
+            /* Synchronous load within frame budget. */
+            if (load_chunk_sync(sys, c)) {
+                sys->memory_used += c->estimated_size;
+            }
+            loads_this_frame++;
+        } else {
+            /* Async load via thread pool. */
+            start_chunk_load_async(sys, c);
+        }
+
+        LOG_TRACE(LOG_TAG, "started loading chunk %u", c->chunk_id);
+
+        /* M6a A/B instrumentation: at the moment a chunk STARTS loading, log
+         * the ACTUAL camera→chunk-center distance (the "lead distance").  With
+         * prefetch ON cells start loading at a greater lead distance than OFF.
+         * Gated behind JCE_STREAM_LOADLOG=1 so normal runs are quiet. */
+        {
+            static int s_loadlog = -1;
+            if (s_loadlog < 0) {
+                const char *lv = getenv("JCE_STREAM_LOADLOG");
+                s_loadlog = (lv && lv[0] && lv[0] != '0') ? 1 : 0;
+            }
+            if (s_loadlog) {
+                float lead = sqrtf(dist_sq(camera_pos, c->center));
+                LOG_INFO(LOG_TAG,
+                         "LOADSTART chunk=%u lead=%.1f cam=(%.1f,%.1f,%.1f) "
+                         "ctr=(%.1f,%.1f,%.1f) prefetch=%d",
+                         c->chunk_id, (double)lead,
+                         (double)camera_pos.x, (double)camera_pos.y, (double)camera_pos.z,
+                         (double)c->center.x, (double)c->center.y, (double)c->center.z,
+                         prefetch_on ? 1 : 0);
+            }
         }
 
         /* In single-thread mode, respect the frame time budget. */

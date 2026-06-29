@@ -174,7 +174,11 @@ function(jce_compile_shaders)
             vs_grid fs_grid
             vs_sky  fs_sky
             vs_imgui fs_imgui
-            vs_postfx fs_chromatic fs_grayscale fs_vignette fs_tonemap fs_composite)
+            vs_postfx fs_chromatic fs_grayscale fs_vignette fs_tonemap)
+            # fs_composite is NOT in the essl1 allowlist: it uses SAMPLER3D /
+            # texture3D for the 3D-LUT colour grade, which are absent from
+            # GLSL ES 1.00 (essl1/100_es).  The LUT grade is a non-trivial
+            # feature that cannot be expressed in GLES2 anyway.
     endif()
 
     # Ensure output directory exists.

@@ -62,6 +62,15 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
                               JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(skel->sm_path, sizeof(skel->sm_path));
+
+    /* Auto-locomotion: when set, the runtime computes movement speed and feeds
+     * it into the SM "Speed" param / blend-tree blend_param each frame. The
+     * field, serialization, and runtime opt-in all existed; this exposes the
+     * previously editor-less toggle (jce_sr_anim.c gates on sa->auto_speed). */
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.anim.autoSpeed",
+                        "Auto-feed locomotion Speed"), &skel->auto_speed))
+        insp_track_edit();
+
     if (skel->sm_path[0]) {
         ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.smDrivesClip"));
         uint32_t ent = jce_state_get_focused();

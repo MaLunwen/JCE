@@ -73,6 +73,23 @@ void draw_comp_rigidbody(JceRigidBodyComponent *rb)
             rb->physics_layer = (uint32_t)layer;
             insp_track_edit();
         }
+        /* Collides-with feedback from the project Layer Collision Matrix, so a
+         * misconfigured layer (collisions disabled) is visible at edit-time. */
+        if (ps) {
+            uint32_t mask = ps->physics.layer_collision_matrix[layer];
+            char with[256]; size_t off = 0; int any = 0;
+            with[0] = '\0';
+            for (int i = 0; i < JCE_PS_LAYER_COUNT && off < sizeof(with) - 1; ++i)
+                if (mask & (1u << i)) {
+                    int w = snprintf(with + off, sizeof(with) - off,
+                                     "%s%s", any ? ", " : "", names[i]);
+                    if (w > 0) off += (size_t)w;
+                    any = 1;
+                }
+            ImGui::TextDisabled("%s: %s",
+                jce_editor_i18n_id("rigidbody.collidesWith", "Collides with"),
+                any ? with : "(none)");
+        }
     }
 
     /* ── Physics material override (.physmat.json) ── */
@@ -111,6 +128,12 @@ void draw_comp_rigidbody(JceRigidBodyComponent *rb)
         ImGui::DragFloat(lbl, &rb->ccd_sphere_radius, 0.01f, 0.0f, 2.0f, "%.3f");
         insp_track_edit();
     }
+
+    /* Physics handle (read-only diagnostic): 0 = not yet materialized in the
+     * physics world (e.g. missing collider) — surfaces silent init failures. */
+    ImGui::TextDisabled("%s: %u%s",
+        jce_editor_i18n_id("rigidbody.handle", "Physics handle"),
+        rb->body_handle_idx, rb->body_handle_idx ? "" : " (inactive in editor)");
 }
 
 void draw_comp_box_collider(JceBoxColliderComponent *bc)
@@ -333,7 +356,8 @@ void draw_comp_constraint(JceConstraintComponent *con)
 
 void draw_comp_wheel_collider(JceWheelColliderComponent *w)
 {
-    insp_unwired_badge();
+    /* Wired: rt_physics builds a vehicle from WheelCollider components and
+     * drives wheels each tick (stale unwired badge removed). */
     if (!w) return;
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.radius", "wc"),               &w->radius,                0.01f, 0.01f, 100.0f,   "%.3f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionDistance", "wc"),  &w->suspension_distance,   0.01f, 0.0f, 10.0f,     "%.3f"); insp_track_edit();
@@ -429,7 +453,8 @@ void draw_comp_fracture(JceFractureComponent *fr)
 
 void draw_comp_constant_force(JceConstantForceComponent *cf)
 {
-    insp_unwired_badge();
+    /* Wired: the runtime applies the authored force/torque to the body each
+     * tick (rt_count_constant_force; stale unwired badge removed). */
     if (!cf) return;
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cf.enabled", "cf"), &cf->enabled)) insp_undo_bool(&cf->enabled);
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.force", "cf"),          cf->force,           0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
@@ -440,7 +465,8 @@ void draw_comp_constant_force(JceConstantForceComponent *cf)
 
 void draw_comp_configurable_joint(JceConfigurableJointComponent *cj)
 {
-    insp_unwired_badge();
+    /* Wired: rt_spawn_configurable_joint creates the joint via
+     * jce_physics_configurable_joint_create (stale unwired badge removed). */
     if (!cj) return;
     int connected = (int)cj->connected_body;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.cjj.connectedBody", "cjj"), &connected, 1.0f, 0, 1<<30)) {

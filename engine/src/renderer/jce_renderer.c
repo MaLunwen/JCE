@@ -11,6 +11,8 @@
 #include <jce/os/platform/jce_library.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_gpu_capture.h>
+#include <jce/renderer/jce_impostor.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -153,11 +155,14 @@ struct JceRenderer {
     /* PBR programs */
     bgfx_program_handle_t program_pbr;
     bgfx_program_handle_t program_pbr_inst;     /* GPU-instanced PBR */
+    bgfx_program_handle_t program_pbr_inst_tint;/* instanced PBR + per-instance tint */
     bgfx_program_handle_t program_pbr_skinned;
     /* Forward+ clustered fragment variants (fs_pbr_fwdplus). */
     bgfx_program_handle_t program_pbr_fwdplus;
     bgfx_program_handle_t program_pbr_inst_fwdplus;
     bgfx_program_handle_t program_pbr_skinned_fwdplus;
+    bgfx_program_handle_t program_pbr_toon;       /* skinned cel/rim (stylized §5.6) */
+    bgfx_program_handle_t program_outline_skinned;/* inverted-hull silhouette */
     /* When true, jce_renderer_get_program_pbr* return the fwdplus variant
      * (if it loaded).  Set per-frame by the scene renderer from the
      * r.forwardplus cvar; default false => unchanged non-variant programs. */
@@ -174,6 +179,25 @@ struct JceRenderer {
 };
 
 static bool s_dbg_text_enabled = false;
+
+/* Raise bgfx's per-frame TRANSIENT buffer pool above the game-tuned default
+ * (6 MiB VB / 2 MiB IB).  The pool is a single fixed-size ring SHARED every
+ * frame by the scene renderer (GPU-driven instancing, debug-draw, primitives),
+ * the sprite/decal batchers AND ImGui.  The editor's worst case is far heavier
+ * than a shipped game's HUD: the World-Streaming Hierarchy can list 200+ chunk
+ * groups with thousands of streamed-entity rows, and as cells churn (load /
+ * unload while the camera traverses) that ImGui geometry — plus the streamed
+ * scene's instancing records — momentarily blows past 6 MiB.  When the ring is
+ * exhausted mid-frame bgfx's transient allocator clamps unevenly across its
+ * consumers and a downstream copy overruns the ring, corrupting the heap (the
+ * churn crash; ASAN caught a WRITE past the 6 MiB transient VB).  Sizing the
+ * ring for the editor's peak removes the exhaustion that triggers it.  Headroom
+ * only — unused capacity costs nothing at runtime. */
+static void apply_transient_limits(bgfx_init_t *init)
+{
+    init->limits.transientVbSize = 32u * 1024u * 1024u;  /* 32 MiB (default 6) */
+    init->limits.transientIbSize =  8u * 1024u * 1024u;  /*  8 MiB (default 2) */
+}
 
 /* ── Per-backend availability probe ──────────────────────────────── *
  *                                                                    *
@@ -391,12 +415,58 @@ static struct {
 } s_capture_sink;
 static bool s_capture_active       = false;
 static bool s_capture_shot_pending = false;
+/* When set, recording is driven by the ImGui renderer reading its offscreen FBO
+   back into the sink (whole-window video) instead of the backbuffer screen_shot
+   path below (which is black on D3D flip-model swap chains). */
+static bool s_capture_imgui_mode   = false;
+
+void jce_renderer_set_capture_imgui_mode(bool on) { s_capture_imgui_mode = on; }
+
+/* One-shot offscreen-FBO RGBA readback (impostor bake).  The sentinel path
+   below routes a requested screenshot's raw pixels (RGBA8, alpha preserved) to
+   this sink instead of writing a file.  One in flight at a time. */
+#define JCE_FBO_CAPTURE_SENTINEL "\x02__jce_fbo_capture__"
+static struct {
+    JceFboCaptureFn fn;
+    void           *ud;
+} s_fbo_capture_sink;
+static bool s_fbo_capture_pending = false;
 
 static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint32_t _width, uint32_t _height, uint32_t _pitch,
                                  const void *_data, uint32_t _size, bool _yflip)
 {
     (void)_this;
+
+    /* Impostor-bake FBO readback: deliver raw RGBA8 (alpha preserved) to the
+       one-shot sink instead of writing a file.  bgfx delivers BGRA8 with a row
+       pitch; convert to tightly-packed RGBA8 for the consumer. */
+    if (_filePath && strcmp(_filePath, JCE_FBO_CAPTURE_SENTINEL) == 0) {
+        if (s_fbo_capture_sink.fn && _data && _width && _height) {
+            uint8_t *rgba = (uint8_t *)JCE_MALLOC((size_t)_width * _height * 4u);
+            if (rgba) {
+                const uint8_t *src = (const uint8_t *)_data;
+                for (uint32_t y = 0; y < _height; ++y) {
+                    const uint8_t *srow = src + (size_t)y * _pitch;
+                    uint8_t       *drow = rgba + (size_t)y * _width * 4u;
+                    for (uint32_t x = 0; x < _width; ++x) {
+                        /* BGRA8 -> RGBA8 */
+                        drow[x * 4 + 0] = srow[x * 4 + 2];
+                        drow[x * 4 + 1] = srow[x * 4 + 1];
+                        drow[x * 4 + 2] = srow[x * 4 + 0];
+                        drow[x * 4 + 3] = srow[x * 4 + 3];
+                    }
+                }
+                s_fbo_capture_sink.fn(s_fbo_capture_sink.ud, rgba, _width,
+                                      _height, _yflip ? 1 : 0);
+                JCE_FREE(rgba);
+            }
+        }
+        s_fbo_capture_pending = false;
+        s_fbo_capture_sink.fn = NULL;
+        s_fbo_capture_sink.ud = NULL;
+        return;
+    }
 
     /* Recording frame: route pixels to the capture sink, write no file. */
     if (_filePath && strcmp(_filePath, JCE_CAPTURE_SENTINEL) == 0) {
@@ -412,6 +482,27 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
     }
 
     (void)_size;
+
+    /* DIAG (root-cause hunt for "F12/F9 black"): sample a 32x32 grid of the raw
+       capture and log its average luminance.  avg_lum ~0 => the backbuffer itself
+       was black at capture time (not rendered / occluded / wrong buffer), i.e. the
+       problem is the DATA, not the write path.  Pitch-correct sampling. */
+    if (_data && _width && _height) {
+        const uint8_t *base = (const uint8_t *)_data;
+        double sum = 0.0; uint32_t n = 0;
+        uint32_t sy = _height / 32u ? _height / 32u : 1u;
+        uint32_t sx = _width  / 32u ? _width  / 32u : 1u;
+        for (uint32_t y = 0; y < _height; y += sy) {
+            const uint8_t *row = base + (size_t)y * _pitch;
+            for (uint32_t x = 0; x < _width; x += sx) {
+                const uint8_t *px = row + (size_t)x * 4u;
+                sum += px[0] + px[1] + px[2]; ++n;
+            }
+        }
+        LOG_INFO(LOG_TAG, "screenshot DIAG: %ux%u avg_lum=%.1f (n=%u) %s",
+                 _width, _height, n ? sum / (n * 3.0) : 0.0, n,
+                 (n && sum / (n * 3.0) < 1.0) ? "<-- BLACK backbuffer (data, not write)" : "");
+    }
 
     bool ok = false;
     if (_data && _filePath && _width && _height) {
@@ -462,9 +553,211 @@ bool jce_renderer_request_screenshot(const char *path)
     return true;
 }
 
+bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    if (fbo_idx == UINT16_MAX)          /* caller wants the backbuffer */
+        return jce_renderer_request_screenshot(path);
+    if (s_screenshot_pending)
+        return false;
+    s_screenshot_pending = true;
+    bgfx_frame_buffer_handle_t fbh = { fbo_idx };
+    /* A REAL path (not a capture sentinel) => the screen_shot callback writes the
+       file, exactly as for the backbuffer path — but reading an offscreen FBO
+       sidesteps the flip-model "black backbuffer after Present" problem. */
+    bgfx_request_screen_shot(fbh, path);
+    return true;
+}
+
 bool jce_renderer_screenshot_pending(void)
 {
     return s_screenshot_pending;
+}
+
+bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
+                                      JceFboCaptureFn sink, void *ud)
+{
+    if (!sink || fbo_idx == UINT16_MAX)
+        return false;
+    if (s_fbo_capture_pending)
+        return false;
+    s_fbo_capture_sink.fn = sink;
+    s_fbo_capture_sink.ud = ud;
+    s_fbo_capture_pending = true;
+    bgfx_frame_buffer_handle_t fbh = { fbo_idx };
+    /* The sentinel path in jce_bgfx_screen_shot routes the pixels to the sink. */
+    bgfx_request_screen_shot(fbh, JCE_FBO_CAPTURE_SENTINEL);
+    return true;
+}
+
+/* ── Headless offscreen capture (blit + bgfx_read_texture) ───────────────────
+ * bgfx_request_screen_shot only completes on a foreground PRESENT, so it never
+ * fires for a background/headless window.  This path instead blits an LDR source
+ * texture into a READ_BACK staging texture and reads it back to CPU — a pure
+ * GPU->CPU copy that completes during normal frame processing, with no window
+ * focus required.  Same proven pattern as the impostor bake / pick pass.  The
+ * editor postfx output is RGBA16F (HDR-format, holding tonemapped 0..1), so we
+ * stage RGBA16F and convert the half-floats to RGBA8 on read.  One in flight. */
+static float rb_half_to_float(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0u) {
+        if (mant == 0u) { f = sign << 31; }
+        else {
+            exp = 127u - 15u + 1u;
+            while ((mant & 0x400u) == 0u) { mant <<= 1; exp--; }
+            mant &= 0x3FFu;
+            f = (sign << 31) | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp - 15u + 127u) << 23) | (mant << 13);
+    }
+    float out; memcpy(&out, &f, sizeof out); return out;
+}
+
+static struct {
+    int                    state;       /* 0 idle, 1 awaiting readback */
+    int                    mode;        /* 0 = write PNG (path), 1 = feed capture sink */
+    bgfx_texture_handle_t  staging;
+    uint8_t               *pixels;
+    uint32_t               ready_frame;
+    uint16_t               w, h;
+    char                   path[512];
+} s_rb = { 0, 0, { UINT16_MAX }, NULL, 0, 0, 0, { 0 } };
+
+/* Shared submit: blit src (RGBA16F) -> READ_BACK staging and kick the read.
+   mode 0 -> the poll writes `path` as a PNG; mode 1 -> the poll converts to BGRA8
+   and feeds the capture sink (video recording). One in flight. */
+static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
+                      uint16_t w, uint16_t h, int mode, const char *path)
+{
+    if (s_rb.state != 0 || src_tex_idx == UINT16_MAX || w == 0 || h == 0)
+        return false;
+    if (mode == 0 && (!path || !path[0]))
+        return false;
+    /* Match the editor postfx/UI output's RGBA16F format (blit requires equal
+       formats); convert half-floats -> 8-bit in the poll. */
+    s_rb.staging = bgfx_create_texture_2d(w, h, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+    if (!BGFX_HANDLE_IS_VALID(s_rb.staging))
+        return false;
+    s_rb.pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u);  /* RGBA16F = 8 B/px */
+    if (!s_rb.pixels) {
+        bgfx_destroy_texture(s_rb.staging);
+        s_rb.staging.idx = UINT16_MAX;
+        return false;
+    }
+    bgfx_texture_handle_t src = { src_tex_idx };
+    /* blit_view must sort AFTER the source's render pass so the blit reads this
+       frame's fully-composited pixels. */
+    bgfx_blit(blit_view, s_rb.staging, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
+    s_rb.mode = mode;
+    s_rb.path[0] = '\0';
+    if (mode == 0) snprintf(s_rb.path, sizeof s_rb.path, "%s", path);
+    s_rb.ready_frame = bgfx_read_texture(s_rb.staging, s_rb.pixels, 0);
+    s_rb.w = w; s_rb.h = h;
+    s_rb.state = 1;
+    return true;
+}
+
+bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
+                                          uint16_t w, uint16_t h, const char *path)
+{
+    return rb_submit(src_tex_idx, blit_view, w, h, 0, path);
+}
+
+/* Recording variant: read the source back and feed it to the capture sink as
+   BGRA8 (the WebM encoder's input format). One in flight; returns false if busy
+   so the caller simply skips this frame (the next frame submits again). */
+bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx, uint16_t blit_view,
+                                               uint16_t w, uint16_t h)
+{
+    return rb_submit(src_tex_idx, blit_view, w, h, 1, NULL);
+}
+
+int jce_renderer_readback_capture_poll(void)
+{
+    if (s_rb.state != 1)
+        return -1;
+    if (s_bgfx_frame_index < s_rb.ready_frame)
+        return 0;
+    int result = 2;
+    size_t npx = (size_t)s_rb.w * (size_t)s_rb.h;
+    const uint16_t *src = (const uint16_t *)s_rb.pixels;
+
+    if (s_rb.mode == 1) {
+        /* Recording: RGBA16F -> BGRA8 (encoder reads B,G,R,A) and feed the sink.
+           The read-back is bottom-up, so flag yflip=1 (the encoder flips rows). */
+        uint8_t *bgra = (uint8_t *)JCE_MALLOC(npx * 4u);
+        if (bgra && s_capture_active) {
+            for (size_t i = 0; i < npx; ++i) {
+                float r = rb_half_to_float(src[i * 4 + 0]);
+                float g = rb_half_to_float(src[i * 4 + 1]);
+                float b = rb_half_to_float(src[i * 4 + 2]);
+                r = r < 0 ? 0 : (r > 1 ? 1 : r);
+                g = g < 0 ? 0 : (g > 1 ? 1 : g);
+                b = b < 0 ? 0 : (b > 1 ? 1 : b);
+                bgra[i * 4 + 0] = (uint8_t)(b * 255.0f + 0.5f);
+                bgra[i * 4 + 1] = (uint8_t)(g * 255.0f + 0.5f);
+                bgra[i * 4 + 2] = (uint8_t)(r * 255.0f + 0.5f);
+                bgra[i * 4 + 3] = 255;
+            }
+            if (s_capture_sink.begin)
+                s_capture_sink.begin(s_capture_sink.ud, s_rb.w, s_rb.h,
+                                     (uint32_t)s_rb.w * 4u, 1 /*yflip*/);
+            if (s_capture_sink.frame)
+                s_capture_sink.frame(s_capture_sink.ud, bgra,
+                                     (uint32_t)(npx * 4u));
+            result = 1;
+        }
+        if (bgra) JCE_FREE(bgra);
+        JCE_FREE(s_rb.pixels); s_rb.pixels = NULL;
+        bgfx_destroy_texture(s_rb.staging); s_rb.staging.idx = UINT16_MAX;
+        s_rb.state = 0;
+        return result;
+    }
+
+    /* mode 0: convert the RGBA16F half-float readback (tonemapped 0..1) to RGBA8 PNG. */
+    uint8_t *rgba8 = (uint8_t *)JCE_MALLOC(npx * 4u);
+    if (rgba8) {
+        for (size_t i = 0; i < npx * 4u; ++i) {
+            float f = rb_half_to_float(src[i]);
+            f = (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
+            rgba8[i] = (uint8_t)(f * 255.0f + 0.5f);
+        }
+        SDL_Surface *surf = SDL_CreateSurfaceFrom((int)s_rb.w, (int)s_rb.h,
+            SDL_PIXELFORMAT_RGBA32, rgba8, (int)(s_rb.w * 4u));
+        if (surf) {
+            SDL_FlipSurface(surf, SDL_FLIP_VERTICAL); /* bgfx FBO readback is bottom-up */
+            if (IMG_SavePNG(surf, s_rb.path)) {
+                LOG_SUCCESS(LOG_TAG, "readback capture saved: %s (%ux%u)",
+                            s_rb.path, s_rb.w, s_rb.h);
+                result = 1;
+            } else {
+                LOG_ERROR(LOG_TAG, "readback capture PNG write failed: %s (%s)",
+                          s_rb.path, SDL_GetError());
+            }
+            SDL_DestroySurface(surf);
+        }
+        JCE_FREE(rgba8);
+    }
+    JCE_FREE(s_rb.pixels); s_rb.pixels = NULL;
+    bgfx_destroy_texture(s_rb.staging); s_rb.staging.idx = UINT16_MAX;
+    s_rb.state = 0;
+    return result;
+}
+
+bool jce_renderer_fbo_capture_pending(void)
+{
+    return s_fbo_capture_pending;
 }
 
 /* Register the capture sink (s_capture_sink is defined near the screenshot
@@ -702,6 +995,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                      bgfx_get_renderer_name(requested_type));
         } else {
             bgfx_init_ctor(&init);
+            apply_transient_limits(&init);
             init.type              = requested_type;
             init.resolution.width  = w;
             init.resolution.height = h;
@@ -728,6 +1022,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             LOG_INFO(LOG_TAG, "trying backend: %s",
                      bgfx_get_renderer_name(chain[i]));
             bgfx_init_ctor(&init);
+            apply_transient_limits(&init);
             init.type              = chain[i];
             init.resolution.width  = w;
             init.resolution.height = h;
@@ -836,10 +1131,13 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_mesh.idx         = UINT16_MAX;
     r->program_pbr.idx          = UINT16_MAX;
     r->program_pbr_inst.idx     = UINT16_MAX;
+    r->program_pbr_inst_tint.idx = UINT16_MAX;
     r->program_pbr_skinned.idx  = UINT16_MAX;
     r->program_pbr_fwdplus.idx         = UINT16_MAX;
     r->program_pbr_inst_fwdplus.idx    = UINT16_MAX;
     r->program_pbr_skinned_fwdplus.idx = UINT16_MAX;
+    r->program_pbr_toon.idx        = UINT16_MAX;
+    r->program_outline_skinned.idx = UINT16_MAX;
     r->program_shadow.idx       = UINT16_MAX;
     r->program_shadow_inst.idx  = UINT16_MAX;
     r->program_shadow_skinned.idx = UINT16_MAX;
@@ -879,10 +1177,13 @@ void jce_renderer_set_shaders(JceRenderer *r,
         shaders->mesh.idx };
     r->program_pbr = (bgfx_program_handle_t){ shaders->pbr.idx };
     r->program_pbr_inst = (bgfx_program_handle_t){ shaders->pbr_inst.idx };
+    r->program_pbr_inst_tint = (bgfx_program_handle_t){ shaders->pbr_inst_tint.idx };
     r->program_pbr_skinned = (bgfx_program_handle_t){ shaders->pbr_skinned.idx };
     r->program_pbr_fwdplus = (bgfx_program_handle_t){ shaders->pbr_fwdplus.idx };
     r->program_pbr_inst_fwdplus = (bgfx_program_handle_t){ shaders->pbr_inst_fwdplus.idx };
     r->program_pbr_skinned_fwdplus = (bgfx_program_handle_t){ shaders->pbr_skinned_fwdplus.idx };
+    r->program_pbr_toon        = (bgfx_program_handle_t){ shaders->pbr_toon.idx };
+    r->program_outline_skinned = (bgfx_program_handle_t){ shaders->outline_skinned.idx };
     r->program_shadow = (bgfx_program_handle_t){ shaders->shadow.idx };
     r->program_shadow_inst = (bgfx_program_handle_t){ shaders->shadow_inst.idx };
     r->program_shadow_skinned = (bgfx_program_handle_t){ shaders->shadow_skinned.idx };
@@ -903,9 +1204,11 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
        which keeps any in-flight draws safe. */
     bgfx_program_handle_t old[] = {
         r->program, r->program_textured, r->program_mesh,
-        r->program_pbr, r->program_pbr_inst, r->program_pbr_skinned,
+        r->program_pbr, r->program_pbr_inst, r->program_pbr_inst_tint,
+        r->program_pbr_skinned,
         r->program_pbr_fwdplus, r->program_pbr_inst_fwdplus,
         r->program_pbr_skinned_fwdplus,
+        r->program_pbr_toon, r->program_outline_skinned,
         r->program_shadow, r->program_shadow_inst, r->program_shadow_skinned,
         r->program_terrain,
     };
@@ -916,9 +1219,11 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
         /* Destroy any partially-loaded handles to avoid leaking. */
         bgfx_program_handle_t parts[] = {
             { ns.color.idx }, { ns.textured.idx }, { ns.mesh.idx },
-            { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_skinned.idx },
+            { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_inst_tint.idx },
+            { ns.pbr_skinned.idx },
             { ns.pbr_fwdplus.idx }, { ns.pbr_inst_fwdplus.idx },
             { ns.pbr_skinned_fwdplus.idx },
+            { ns.pbr_toon.idx }, { ns.outline_skinned.idx },
             { ns.shadow.idx }, { ns.shadow_inst.idx }, { ns.shadow_skinned.idx },
             { ns.terrain.idx },
         };
@@ -1150,6 +1455,8 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_pbr);
     if (r->program_pbr_inst.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_inst);
+    if (r->program_pbr_inst_tint.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_inst_tint);
     if (r->program_pbr_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_skinned);
     if (r->program_pbr_fwdplus.idx != UINT16_MAX)
@@ -1180,6 +1487,10 @@ void jce_renderer_destroy(JceRenderer *r)
     /* Free graph-generated custom programs cached by jce_pbr_material_load_json
      * while bgfx is still alive. */
     jce_pbr_material_shutdown();
+
+    /* Free the octahedral-impostor shared GPU resources (program, quad VB,
+     * uniforms, any in-flight bake FBO) while bgfx is still alive. */
+    jce_impostor_shutdown();
 
     bgfx_shutdown();
     JCE_FREE(r);
@@ -1375,11 +1686,18 @@ void jce_renderer_end_frame(const JceRenderer *r)
     /* Recording: request a backbuffer capture for this frame (one in flight;
        the screen_shot callback routes it to the capture sink). Reuses the
        proven screenshot path since BGFX_RESET_CAPTURE is inert here. */
-    if (s_capture_active && !s_capture_shot_pending && !s_screenshot_pending) {
+    if (s_capture_active && !s_capture_imgui_mode &&
+        !s_capture_shot_pending && !s_screenshot_pending) {
         bgfx_frame_buffer_handle_t bb = { UINT16_MAX };  /* backbuffer */
         s_capture_shot_pending = true;
         bgfx_request_screen_shot(bb, JCE_CAPTURE_SENTINEL);
     }
+
+    /* Arm a RenderDoc GPU capture for this frame if JCE_RDOC_FRAME targets it
+     * (no-op unless the build enables RenderDoc + a capture is injected). Must
+     * precede bgfx_frame() — the backend API calls the capture wraps happen as
+     * bgfx flushes the command buffer there. */
+    jce_gpu_capture_tick();
 
     s_bgfx_frame_index = bgfx_frame(false);
 
@@ -1585,6 +1903,17 @@ JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
     return (JceShaderHandle){ r->program_pbr_inst.idx };
 }
 
+/* Per-instance-tint instanced PBR program (large-world-opt P1 #7).  Returns
+ * invalid when the variant didn't load (older pak): callers fall back to solo
+ * draws for tinted entities, so the feature degrades gracefully.  No Forward+
+ * counterpart yet — tinted runs use the brute-force lighting path. */
+JceShaderHandle jce_renderer_get_program_pbr_inst_tint(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_inst_tint.idx };
+}
+
 JceShaderHandle jce_renderer_get_program_pbr_skinned(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
@@ -1624,6 +1953,20 @@ JceShaderHandle jce_renderer_get_program_pbr_skinned_fwdplus(const JceRenderer *
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
     return (JceShaderHandle){ r->program_pbr_skinned_fwdplus.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_skinned_toon(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_toon.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_outline_skinned(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_outline_skinned.idx };
 }
 
 JceShaderHandle jce_renderer_get_program_shadow(const JceRenderer *r)

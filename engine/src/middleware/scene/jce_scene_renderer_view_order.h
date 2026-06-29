@@ -8,7 +8,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define JCE_SCENE_RENDERER_VIEW_ORDER_MAX 32u
+/* 64 (was 32): omnidirectional point shadows (#7) add a sparse cube-tile view
+ * band (base+100..) on top of the contiguous color/shadow/fog range. */
+#define JCE_SCENE_RENDERER_VIEW_ORDER_MAX 64u
 
 typedef struct {
     uint16_t first;
@@ -22,6 +24,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_fog_views,
                                          bool include_gpu_particle_view,
                                          bool include_gpu_cull_view,
+                                         bool include_point_cube_views,
                                          JceSceneRendererViewOrder *out);
 
 #endif /* JCE_SCENE_RENDERER_VIEW_ORDER_H */

@@ -46,6 +46,17 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height);
  *   ImGui::Image((ImTextureID)(uintptr_t)((uint32_t)handle + 1u), size); */
 uint16_t jce_editor_scene_render_get_texture(void);
 
+/* Capture the Scene View's final (post-graded) image to a PNG at `path`
+ * (async — written next frame by the renderer's screen_shot callback).  Used by
+ * F12 screenshot / F9 recording: the D3D flip-model BACKBUFFER capture returns
+ * all-black even when focused, so this grabs the offscreen postfx-output FBO
+ * instead.  Returns false if the Scene View isn't ready. */
+bool jce_editor_scene_render_screenshot(const char *path);
+
+/* Pump an in-flight read-back capture started by jce_editor_scene_render_screenshot;
+ * call once per frame.  Returns -1 idle, 0 pending, 1 wrote PNG, 2 write failed. */
+int jce_editor_scene_render_capture_poll(void);
+
 /* GPU object-ID picking for the Scene View.  Coordinates are render-target
  * pixels, not absolute ImGui screen coordinates.  Requests are asynchronous:
  * call request() after jce_editor_scene_render_frame(), then poll on later
@@ -87,6 +98,13 @@ void jce_editor_scene_camera_zoom(float delta);
 void jce_editor_scene_camera_get_target(float *out3);
 void jce_editor_scene_camera_set_target(float x, float y, float z);
 
+/* Capture / restore the full orbit camera state (camera bookmarks):
+ * target point + yaw + pitch + distance. set_state restores an exact view. */
+void jce_editor_scene_camera_get_state(float out_target3[3], float *out_yaw,
+                                       float *out_pitch, float *out_distance);
+void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
+                                       float pitch, float distance);
+
 /* Snap camera to a preset view direction around current target. */
 typedef enum {
     JCE_CAM_VIEW_FRONT,
@@ -100,6 +118,18 @@ void jce_editor_scene_camera_snap_view(JceCamPresetView preset);
 
 /* Reset camera to the default position and target (Persp 45°, pos 8,6,8 → 0,0,0). */
 void jce_editor_scene_camera_reset(void);
+
+/* Bird's-eye "Overview": frame the WHOLE streamed world from a high angle.
+ * World AABB = union of the scene's streaming chunk table (center ± radius over
+ * all authored chunks, not just loaded ones); falls back to the ±2757 m world
+ * span when the scene has no streaming settings. Sets a steep pitch (~ -65°)
+ * and animates the orbit target/distance there so the camera swings up smoothly
+ * (driven by jce_editor_scene_camera_update). */
+void jce_editor_scene_frame_overview(void);
+
+/* Position the scene camera at a fixed eye-level vista over the meadow centre
+ * (headless visual-QA aid; armed by env JCE_DBG_VISTA=1). */
+void jce_editor_scene_frame_vista(void);
 
 /* Frame the camera onto a world-space AABB so the box is fully in view.
  * Sets target to the centre and orbit_distance to fit at the current FOV.

@@ -25,6 +25,16 @@ struct JceSkinnedMesh {
     uint32_t num_wf_indices;
     bool     is_skinned;  /* true = JceSkinnedVertex, false = JcePbrVertex */
 
+    /* In-asset auto-LOD index buffers (large-world-opt P1 #6).  Each level
+     * shares THIS mesh's vertex buffer (vbh) and binds a reduced index set so a
+     * distant entity draws fewer triangles without a separate VB or model file.
+     * lod_count == 0 (the default) keeps the legacy single-IBO behaviour with
+     * zero extra GPU memory.  Levels are stored 0-based here (lod_ibh[0] is the
+     * FIRST reduced level, i.e. glTF JCE_lod indices[0] / "LOD1"). */
+    bgfx_index_buffer_handle_t  lod_ibh[JCE_SM_MAX_LOD];
+    uint32_t                    lod_num_indices[JCE_SM_MAX_LOD];
+    uint32_t                    lod_count;
+
     /* Morph deform support (FEATURE 3.1, opt-in via retain_cpu).  When
      * non-NULL, holds an undeformed CPU copy of the source vertex array
      * (num_verts * stride bytes) so a per-instance morph can produce a
@@ -235,6 +245,9 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
         bgfx_destroy_index_buffer(mesh->ibh);
     if (mesh->wf_ibh.idx != UINT16_MAX)
         bgfx_destroy_index_buffer(mesh->wf_ibh);
+    for (uint32_t l = 0; l < mesh->lod_count; ++l)
+        if (mesh->lod_ibh[l].idx != UINT16_MAX)
+            bgfx_destroy_index_buffer(mesh->lod_ibh[l]);
     if (mesh->base_cpu)
         JCE_FREE(mesh->base_cpu);   /* retained morph base (NULL unless retained) */
     JCE_FREE(mesh);
@@ -243,6 +256,22 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
 /* ================================================================== */
 /* Submission                                                          */
 /* ================================================================== */
+
+/* Per-submit double-sided override (render-thread only, mirrors jce_model.c's
+ * s_material_override pattern).  jce_model_draw* sets it from the bound
+ * material's double_sided flag before each color submit so a two-sided material
+ * actually disables back-face culling here — without it, this path hard-coded
+ * BGFX_STATE_DEFAULT (CULL_CW) and silently ignored double_sided, so any model
+ * whose visible faces are wound as back-faces (e.g. the gen_hlod far-proxy
+ * boxes) rendered only ambient-lit underside/back-faces => a flat, dark,
+ * colourless mass.  Default false => byte-identical to the legacy single-sided
+ * behaviour for every model that doesn't author double_sided. */
+static bool s_submit_double_sided = false;
+
+void jce_skinned_mesh_set_submit_double_sided(bool on)
+{
+    s_submit_double_sided = on;
+}
 
 void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
                               const JceRenderer *r, uint16_t view_id)
@@ -262,7 +291,10 @@ void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
             bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+        /* Two-sided materials drop the CULL_CW bit so both winding orders draw. */
+        uint64_t state = BGFX_STATE_DEFAULT;
+        if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
+        bgfx_set_state(state, 0);
     }
     /* Caller must call bgfx_submit after binding program via material. */
     JCE_PROFILE_ZONE_END;
@@ -295,7 +327,9 @@ void jce_skinned_mesh_submit_morphed(const JceSkinnedMesh *mesh,
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
             bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+        uint64_t state = BGFX_STATE_DEFAULT;
+        if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
+        bgfx_set_state(state, 0);
     }
     /* Caller submits the program (matches jce_skinned_mesh_submit contract). */
     JCE_PROFILE_ZONE_END;
@@ -447,6 +481,97 @@ uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh)
 uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh)
 {
     return mesh ? mesh->num_indices : 0;
+}
+
+/* ================================================================== */
+/* In-asset auto-LOD (large-world-opt P1 #6)                            */
+/* ================================================================== */
+
+uint32_t jce_skinned_mesh_add_lod(JceSkinnedMesh *mesh,
+                                  const uint32_t *indices,
+                                  uint32_t num_indices)
+{
+    if (!mesh) return 0;
+    if (!indices || num_indices < 3 || (num_indices % 3) != 0)
+        return mesh->lod_count;
+    if (mesh->lod_count >= JCE_SM_MAX_LOD)
+        return mesh->lod_count;
+    /* Every LOD index must address the shared base vertex buffer. */
+    for (uint32_t i = 0; i < num_indices; ++i)
+        if (indices[i] >= mesh->num_verts)
+            return mesh->lod_count;
+
+    const bgfx_memory_t *imem =
+        bgfx_copy(indices, num_indices * (uint32_t)sizeof(uint32_t));
+    bgfx_index_buffer_handle_t ibh =
+        bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+    if (ibh.idx == UINT16_MAX) return mesh->lod_count;  /* pool exhausted: skip */
+
+    uint32_t l = mesh->lod_count;
+    mesh->lod_ibh[l]         = ibh;
+    mesh->lod_num_indices[l] = num_indices;
+    mesh->lod_count          = l + 1;
+    return mesh->lod_count;
+}
+
+uint32_t jce_skinned_mesh_lod_count(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->lod_count : 0;
+}
+
+uint32_t jce_skinned_mesh_lod_index_count(const JceSkinnedMesh *mesh,
+                                          uint32_t level)
+{
+    if (!mesh) return 0;
+    if (level < mesh->lod_count) return mesh->lod_num_indices[level];
+    return mesh->num_indices;   /* out of range → quote the base count */
+}
+
+void jce_skinned_mesh_submit_lod(const JceSkinnedMesh *mesh,
+                                 const JceRenderer *r, uint16_t view_id,
+                                 uint32_t level)
+{
+    if (!mesh) return;
+    /* No LOD for this level, or wireframe view (must keep its base wf_ibh):
+     * fall through to the base submit so behaviour is byte-identical. */
+    if (level >= mesh->lod_count || mesh->lod_ibh[level].idx == UINT16_MAX ||
+        (r && jce_renderer_get_wireframe(r))) {
+        jce_skinned_mesh_submit(mesh, r, view_id);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitLod");
+    (void)view_id;
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    bgfx_set_index_buffer(mesh->lod_ibh[level], 0, mesh->lod_num_indices[level]);
+    uint64_t state = BGFX_STATE_DEFAULT;
+    if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
+    bgfx_set_state(state, 0);
+    /* Caller submits the program after binding the material (same contract as
+     * jce_skinned_mesh_submit). */
+    JCE_PROFILE_ZONE_END;
+}
+
+void jce_skinned_mesh_submit_shadow_lod(const JceSkinnedMesh *mesh,
+                                        const JceRenderer *r, uint16_t view_id,
+                                        JceShaderHandle program, uint32_t level)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX) return;
+    if (level >= mesh->lod_count || mesh->lod_ibh[level].idx == UINT16_MAX) {
+        jce_skinned_mesh_submit_shadow(mesh, r, view_id, program);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitShadowLod");
+    (void)view_id;
+
+    /* Caller uploaded the bone palette / transform before this call. */
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    bgfx_set_index_buffer(mesh->lod_ibh[level], 0, mesh->lod_num_indices[level]);
+    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    bgfx_program_handle_t prog = { program.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
 }
 
 /* ================================================================== */

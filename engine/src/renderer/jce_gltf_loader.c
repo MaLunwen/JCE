@@ -38,6 +38,10 @@
 /* CPU staging types (worker decode → main-thread upload)              */
 /* ================================================================== */
 
+/* In-asset auto-LOD ceiling on the CPU stage (large-world-opt P1 #6).  Matches
+ * the renderer-side JCE_SM_MAX_LOD so a parsed level is always uploadable. */
+#define JCE_GLTF_MAX_LOD 8
+
 /* One primitive's geometry as CPU arrays (no GPU buffers yet). */
 typedef struct {
     int           kind;        /* 0 = static PBR (JcePbrVertex), 1 = skinned */
@@ -47,6 +51,13 @@ typedef struct {
     uint32_t      num_indices;
     uint32_t      material_index;
     JceMorphData *morph;       /* morph-target deltas (FEATURE 3.1), or NULL */
+    /* In-asset auto-LOD index buffers parsed from the JCE_lod primitive
+     * extension (one reduced index set per level; all share `verts`).  Empty
+     * (lod_count==0) for any mesh cooked without LODs.  Owned; freed in
+     * jce_gltf_model_cpu_free; uploaded as alternate IBOs at create time. */
+    uint32_t     *lod_indices[JCE_GLTF_MAX_LOD];
+    uint32_t      lod_num_indices[JCE_GLTF_MAX_LOD];
+    uint32_t      lod_count;
 } JceModelPrimCpu;
 
 typedef struct {
@@ -373,6 +384,69 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
 /* Extract mesh primitives                                             */
 /* ================================================================== */
 
+/* ── In-asset auto-LOD: parse the JCE_lod primitive extension (P1 #6) ──────
+ * The cook emits, on a primitive's "extensions", a JCE_lod object whose raw
+ * JSON cgltf stores verbatim in cgltf_extension.data, e.g.
+ *     {"indices":[7,9,11]}
+ * where each value is a glTF accessor index for a reduced SCALAR uint32 index
+ * buffer sharing the primitive's POSITION vertex buffer.  cgltf parses ALL
+ * accessors into data->accessors[] regardless of references, so we resolve each
+ * listed index there.  A tiny hand-parser (no JSON dep in the renderer layer)
+ * extracts the integers from the "indices":[ ... ] array of this small,
+ * cook-controlled object.  Reads each accessor into a fresh uint32_t buffer on
+ * `out`; sets out->lod_count.  No-op when the primitive has no JCE_lod. */
+static void build_primitive_lods(const cgltf_primitive *prim,
+                                 const cgltf_data *data,
+                                 uint32_t num_verts,
+                                 JceModelPrimCpu *out)
+{
+    if (!prim || !data || !out) return;
+    const char *json = NULL;
+    for (cgltf_size i = 0; i < prim->extensions_count; ++i) {
+        if (prim->extensions[i].name &&
+            strcmp(prim->extensions[i].name, "JCE_lod") == 0) {
+            json = prim->extensions[i].data;
+            break;
+        }
+    }
+    if (!json) return;
+
+    const char *arr = strstr(json, "\"indices\"");
+    if (!arr) return;
+    arr = strchr(arr, '[');
+    if (!arr) return;
+    ++arr;
+
+    /* Walk the array, reading each accessor index, resolving it against
+     * data->accessors[], and copying the indices into a CPU buffer. */
+    while (*arr && *arr != ']' && out->lod_count < JCE_GLTF_MAX_LOD) {
+        while (*arr == ' ' || *arr == ',' || *arr == '\t' ||
+               *arr == '\n' || *arr == '\r') ++arr;
+        if (*arr < '0' || *arr > '9') break;
+        char *end = NULL;
+        long acc = strtol(arr, &end, 10);
+        if (end == arr) break;
+        arr = end;
+        if (acc < 0 || (cgltf_size)acc >= data->accessors_count) continue;
+
+        const cgltf_accessor *a = &data->accessors[acc];
+        uint32_t nidx = (uint32_t)a->count;
+        if (nidx < 3 || (nidx % 3) != 0) continue;
+        uint32_t *idx = (uint32_t *)JCE_MALLOC((size_t)nidx * sizeof(uint32_t));
+        if (!idx) continue;
+        bool ok = true;
+        for (uint32_t ii = 0; ii < nidx; ++ii) {
+            uint32_t v = (uint32_t)cgltf_accessor_read_index(a, ii);
+            if (v >= num_verts) { ok = false; break; }   /* must address base VB */
+            idx[ii] = v;
+        }
+        if (!ok) { JCE_FREE(idx); continue; }
+        out->lod_indices[out->lod_count]     = idx;
+        out->lod_num_indices[out->lod_count] = nidx;
+        out->lod_count++;
+    }
+}
+
 /* Find an attribute accessor by type within a primitive. */
 static const cgltf_accessor *find_attribute(const cgltf_primitive *prim,
                                              cgltf_attribute_type type,
@@ -513,6 +587,10 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
 
     /* Material index. */
     out->material_index = find_material_index(data, prim->material);
+
+    /* In-asset auto-LOD (P1 #6): parse the JCE_lod extension's reduced index
+     * accessors.  No-op for meshes cooked without LODs. */
+    build_primitive_lods(prim, data, num_verts, out);
 
     /* Morph targets / blendshapes (FEATURE 3.1): read POSITION (+NORMAL) deltas
      * per target and seed the base weights.  No-op when the primitive has no
@@ -1106,15 +1184,61 @@ static JceModelCpu *build_model_cpu(const JcePakArchive *pak,
 /* Worker: decode (no bgfx)                                            */
 /* ================================================================== */
 
+/* Derive a PAK-relative forward-slash key from an absolute or mixed-separator
+ * path (e.g. "D:/.../resources/assets\models\city\building-b.glb").
+ * Writes a normalised copy to buf, then returns a pointer into buf at the
+ * start of the relative remainder, or NULL if no safe key can be derived.
+ * Only call on the PAK-miss path — cheap string scan, no allocation. */
+static const char *pak_derive_relative_key(const char *path,
+                                           char *buf, size_t buf_sz)
+{
+    if (!path || !buf || buf_sz == 0) return NULL;
+    size_t L = strlen(path);
+    if (L >= buf_sz) return NULL;
+    for (size_t i = 0; i <= L; i++)
+        buf[i] = (path[i] == '\\') ? '/' : path[i];
+
+    static const char *const s_markers[] = {
+        "resources/assets/", "resources/_cooked/", NULL
+    };
+    static const char *const s_tops[] = {
+        "/models/", "/scenes/", "/shaders/", "/fonts/",
+        "/i18n/", "/audio/", "/prefabs/", "/anim/",
+        "/textures/", NULL
+    };
+    for (int mi = 0; s_markers[mi]; mi++) {
+        const char *p = strstr(buf, s_markers[mi]);
+        if (p) { const char *r = p + strlen(s_markers[mi]); return r[0] ? r : NULL; }
+    }
+    for (int ti = 0; s_tops[ti]; ti++) {
+        const char *p = strstr(buf, s_tops[ti]);
+        if (p) { const char *r = p + 1; return r[0] ? r : NULL; }
+    }
+    return NULL;
+}
+
 JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return NULL;
 
     /* ---- Decompress from PAK ---- */
-    const JcePakAsset *asset = jce_pak_find(pak, asset_path);
+    /* pak_path is asset_path or (on absolute-path miss) the derived relative key. */
+    const char *pak_path = asset_path;
+    char norm_buf[1280];
+    const JcePakAsset *asset = jce_pak_find(pak, pak_path);
     if (!asset) {
-        LOG_ERROR(LOG_TAG, "model not found in PAK: %s", asset_path);
-        return NULL;
+        /* Belt-and-suspenders: if the exact key missed (e.g. absolute+backslash
+         * path saved by the editor), derive a PAK-relative key and retry.
+         * Only on the miss path — zero cost for well-formed relative keys. */
+        const char *rel = pak_derive_relative_key(asset_path, norm_buf,
+                                                  sizeof(norm_buf));
+        if (rel) asset = jce_pak_find(pak, rel);
+        if (asset)
+            pak_path = rel;
+        else {
+            LOG_ERROR(LOG_TAG, "model not found in PAK: %s", asset_path);
+            return NULL;
+        }
     }
 
     void *buf = JCE_MALLOC((size_t)asset->original_size);
@@ -1122,7 +1246,7 @@ JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_pat
 
     size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
-        LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
+        LOG_ERROR(LOG_TAG, "decompression failed: %s", pak_path);
         JCE_FREE(buf);
         return NULL;
     }
@@ -1138,17 +1262,17 @@ JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_pat
     cgltf_data *data = NULL;
     cgltf_result result = cgltf_parse(&options, buf, (cgltf_size)n, &data);
     if (result != cgltf_result_success) {
-        LOG_ERROR(LOG_TAG, "cgltf_parse failed (%d): %s", (int)result, asset_path);
+        LOG_ERROR(LOG_TAG, "cgltf_parse failed (%d): %s", (int)result, pak_path);
         JCE_FREE(buf);
         return NULL;
     }
 
     /* For GLB, binary data is inline; for glTF, cgltf resolves external
-     * buffers relative to asset_path and reads them through the PAK callback. */
-    result = cgltf_load_buffers(&options, data, asset_path);
+     * buffers relative to pak_path and reads them through the PAK callback. */
+    result = cgltf_load_buffers(&options, data, pak_path);
     if (result != cgltf_result_success) {
         LOG_ERROR(LOG_TAG, "cgltf_load_buffers failed (%d): %s",
-                  (int)result, asset_path);
+                  (int)result, pak_path);
         cgltf_free(data);
         JCE_FREE(buf);
         return NULL;
@@ -1171,16 +1295,16 @@ JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_pat
     result = cgltf_validate(data);
     if (result != cgltf_result_success) {
         LOG_ERROR(LOG_TAG, "cgltf_validate failed (%d): %s — refusing malformed glTF",
-                  (int)result, asset_path);
+                  (int)result, pak_path);
         cgltf_free(data);
         JCE_FREE(buf);
         return NULL;
     }
 
-    JceModelCpu *cpu = build_model_cpu(pak, asset_path, data);
+    JceModelCpu *cpu = build_model_cpu(pak, pak_path, data);
     if (cpu) {
         LOG_DEBUG(LOG_TAG, "decoded %s: %u nodes, %u materials, %u anims%s",
-                  asset_path, cpu->num_nodes, cpu->num_materials,
+                  pak_path, cpu->num_nodes, cpu->num_materials,
                   cpu->num_anims, cpu->skeleton ? " (skinned)" : "");
     }
 
@@ -1378,6 +1502,19 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                                 dp->skinned_mesh = jce_pbr_mesh_create(
                                     (const JcePbrVertex *)sp->verts, sp->num_verts,
                                     sp->indices, sp->num_indices, retain_morph);
+                            /* In-asset auto-LOD (P1 #6): upload each parsed
+                             * reduced index set as an alternate IBO sharing this
+                             * mesh's vertex buffer.  Only the static (non-
+                             * skinned) path carries LODs — skinned rigs keep full
+                             * detail (sp->kind == 0 prims are the only ones whose
+                             * JCE_lod the cook emits).  No-op when lod_count==0. */
+                            if (dp->skinned_mesh && sp->kind == 0) {
+                                for (uint32_t li = 0; li < sp->lod_count; ++li)
+                                    jce_skinned_mesh_add_lod(
+                                        dp->skinned_mesh,
+                                        sp->lod_indices[li],
+                                        sp->lod_num_indices[li]);
+                            }
                         }
                     }
                 }
@@ -1424,6 +1561,9 @@ void jce_gltf_model_cpu_free(JceModelCpu *cpu)
                 for (uint32_t p = 0; p < nd->num_prims; ++p) {
                     if (nd->prims[p].verts)   JCE_FREE(nd->prims[p].verts);
                     if (nd->prims[p].indices) JCE_FREE(nd->prims[p].indices);
+                    for (uint32_t li = 0; li < nd->prims[p].lod_count; ++li)
+                        if (nd->prims[p].lod_indices[li])
+                            JCE_FREE(nd->prims[p].lod_indices[li]);
                     if (nd->prims[p].morph)
                         jce_morph_data_destroy(nd->prims[p].morph);
                 }

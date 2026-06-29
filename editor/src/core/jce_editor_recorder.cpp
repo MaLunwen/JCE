@@ -13,6 +13,7 @@
 
 extern "C" {
 #include <jce/renderer/jce_renderer.h>
+#include <jce/ui/jce_imgui_renderer.h>
 #include <jce/middleware/video/jce_webm_encoder.h>
 #include <jce/middleware/audio/jce_audio_loopback.h>
 #include <jce/os/core/jce_log.h>
@@ -237,6 +238,11 @@ extern "C" bool jce_editor_recorder_start(JceRenderer *r, const char *out_path) 
 
     jce_renderer_set_capture_sink(rec_begin, rec_frame, rec_end, nullptr);
     jce_renderer_set_backbuffer_capture(r, true);
+    /* Whole-window capture: the ImGui renderer re-renders the UI into an offscreen
+       FBO and reads it back into the sink each frame.  The backbuffer screen_shot
+       path is black on D3D flip-model swap chains, so route around it. */
+    jce_renderer_set_capture_imgui_mode(true);
+    jce_imgui_renderer_set_recording(true);
     g.active = true;
     LOG_SUCCESS(LOG_TAG, "recording -> %s (audio=%d)", g.path, (int)g.have_audio);
     return true;
@@ -245,6 +251,8 @@ extern "C" bool jce_editor_recorder_start(JceRenderer *r, const char *out_path) 
 extern "C" void jce_editor_recorder_stop(void) {
     if (!g.active) return;
 
+    jce_imgui_renderer_set_recording(false);
+    jce_renderer_set_capture_imgui_mode(false);
     jce_renderer_set_backbuffer_capture(g.renderer, false);
     jce_renderer_set_capture_sink(nullptr, nullptr, nullptr, nullptr);
     if (g.have_audio) jce_audio_loopback_stop();

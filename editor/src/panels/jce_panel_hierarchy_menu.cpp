@@ -198,6 +198,37 @@ void draw_hierarchy_context_menu(void)
                 jce_editor_layout_request_focus_inspector();
             }
         }
+
+        /* Group Selection (Ctrl+G): wrap the selected entities in a new empty
+         * parent at their level — a standard-engine scene-org tool. Only the
+         * TOP-LEVEL selected entities are reparented so nested hierarchy is
+         * preserved (children follow their already-selected parent). */
+        if (ctx_in_selection && sel_count >= 1 &&
+            ImGui::MenuItem(jce_editor_i18n_id("hierarchy.group", "Group Selection"), "Ctrl+G")) {
+            uint32_t ids[JCE_MAX_SELECTED];
+            int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+            for (int si = 0; si < n; si++) ids[si] = sel[si];
+            uint32_t group_parent = jce_state_entity_parent(ctx_id);
+            jce_state_begin_batch_edit();
+            uint32_t group = jce_state_create_entity("Group", group_parent);
+            if (group) {
+                for (int si = 0; si < n; si++) {
+                    uint32_t p = jce_state_entity_parent(ids[si]);
+                    bool parent_selected = false;
+                    for (int sj = 0; sj < n; sj++)
+                        if (ids[sj] == p) { parent_selected = true; break; }
+                    if (!parent_selected && ids[si] != group)
+                        jce_state_reparent_entity(ids[si], group);
+                }
+            }
+            jce_state_end_batch_edit();
+            if (group) {
+                jce_state_select_entity(group, false);
+                s_hier.shift_anchor = group;
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
+            }
+        }
         ImGui::Separator();
     }
 
@@ -315,6 +346,22 @@ void draw_hierarchy_context_menu(void)
         uint32_t pasted_ids[JCE_MAX_SELECTED];
         int pasted_n = jce_state_paste_entities(target, pasted_ids,
                                                 JCE_MAX_SELECTED);
+        if (pasted_n > 0) {
+            jce_state_select_entity(pasted_ids[0], false);
+            for (int i = 1; i < pasted_n; i++)
+                jce_state_select_entity(pasted_ids[i], true);
+            jce_editor_inspector_request_sync();
+            jce_editor_layout_request_focus_inspector();
+        }
+    }
+
+    /* Paste As Instance: prefab-sourced clipboard entries become fresh linked
+     * prefab instances (standard-engine scene-design workflow). */
+    if (ImGui::MenuItem(jce_editor_i18n_id("hierarchy.pasteAsInstance", "Paste As Instance"),
+                        NULL, false, jce_state_has_copied())) {
+        uint32_t pasted_ids[JCE_MAX_SELECTED];
+        int pasted_n = jce_state_paste_entities_as_instance(target, pasted_ids,
+                                                            JCE_MAX_SELECTED);
         if (pasted_n > 0) {
             jce_state_select_entity(pasted_ids[0], false);
             for (int i = 1; i < pasted_n; i++)

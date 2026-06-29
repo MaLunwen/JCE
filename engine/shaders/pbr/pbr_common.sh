@@ -73,6 +73,40 @@ vec3 cookTorranceBRDF(vec3 N, vec3 V, vec3 L, vec3 F0, vec3 albedo, float metall
     return (diffuse + specular) * NdotL;
 }
 
+// Cook-Torrance BRDF with WRAP / half-Lambert diffuse softening.
+// `wrap` in [0,1]: 0 = hard Lambert (algebraically identical to
+// cookTorranceBRDF since clamp((d+0)/(1+0),0,1) == max(d,0) for d in
+// [-1,1]); ~0.35 softens the terminator; 1.0 = full half-Lambert.
+// Only the FINAL energy term uses the wrapped NdotL; the specular
+// denominator keeps the un-wrapped max(dot(N,L),0) so this collapses
+// exactly to cookTorranceBRDF at wrap==0 (no specular divergence).
+vec3 cookTorranceBRDFWrap(vec3 N, vec3 V, vec3 L, vec3 F0, vec3 albedo, float metallic, float roughness, float wrap)
+{
+    vec3 H = normalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);          // un-wrapped (specular denom)
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL_w = clamp((dot(N, L) + wrap) / (1.0 + wrap), 0.0, 1.0); // wrapped energy term
+
+    // Specular terms (UNCHANGED — uses un-wrapped NdotL in the denom).
+    float D = distributionGGX(N, H, roughness);
+    float G = geometrySmith(N, V, L, roughness);
+    vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3 numerator    = D * G * F;
+    float denominator = 4.0 * NdotV * NdotL;
+    vec3 specular     = numerator / max(denominator, 0.001);
+
+    // Energy conservation: diffuse portion.
+    vec3 kS = F;
+    vec3 kD = vec3_splat(1.0) - kS;
+    kD *= (1.0 - metallic);
+
+    vec3 diffuse = kD * albedo / PI;
+
+    return (diffuse + specular) * NdotL_w;       // <- wrapped final multiply
+}
+
 // Fresnel-Schlick with roughness for IBL ambient specular
 vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
 {

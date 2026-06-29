@@ -188,19 +188,38 @@ static void remap_mesh_vertices(aiMesh *mesh) {
  *
  * After the dedup/cache-optimise pass the mesh's positions + index buffer are
  * final.  Drive the meshoptimizer-backed core (jce_mesh_generate_lod_chain)
- * over the mesh's position stream to produce K simplified index buffers, then
- * log the per-level triangle reduction (mirroring the existing pre/post-meshopt
- * logging).  Returns the number of LOD levels generated for this mesh.
+ * over the mesh's position stream to produce K simplified index buffers.
  *
- * The generated index buffers are validated and accounted for here; persisting
- * them into the shipped asset is the documented storage followup (the bundle
- * mesh path exports a single .glb blob via Assimp, which has no .jceasset chunk
- * slot — the JCEASSET_CHUNK_MESH_LOD_INDICES chunk type + JceAssetMeshLodHeader
- * are registered so the sidecar/.jceasset store and runtime consumption can be
- * wired without a format change).  Generation is additive: it never mutates the
- * mesh, so the exported base (LOD0) GLB is byte-identical to today. */
-static size_t generate_mesh_lods(const aiMesh *mesh)
+ * PERSISTENCE: the generated index buffers are CAPTURED into a MeshLods record
+ * (one per scene mesh) so write_indexed_glb can serialise them INTO the shipped
+ * .glb (the cooked mesh asset).  They are stored as additional SCALAR index
+ * accessors that share the base mesh's POSITION vertex buffer, referenced from
+ * a primitive-level `JCE_lod` glTF extension ({"indices":[acc,acc,...]}).  The
+ * runtime loader (jce_gltf_loader.c) reads that extension and uploads one
+ * alternate index buffer per LOD level (distant entities bind the reduced index
+ * set, the high-detail vertex buffer is shared).  Embedding in the .glb keeps
+ * the asset self-contained (one PAK entry, no sidecar lookup) — the .glb IS the
+ * cooked asset, so this is the documented "persist into the cooked asset" path
+ * (the registered JCEASSET_CHUNK_MESH_LOD_INDICES chunk targets the separate
+ * .jceasset container, which the bundle mesh path does not produce).
+ *
+ * Determinism: meshopt_simplify / simplifySloppy are deterministic for a fixed
+ * input, so the captured chain is byte-stable across re-cooks of the same source
+ * (the per-asset XXH3 content hash therefore stays stable when the source does).
+ *
+ * Generation is additive: it never mutates the base mesh, so LOD0 geometry in
+ * the exported GLB is byte-identical to before — only extra accessors/buffer
+ * views + a primitive extension are appended (ignored by readers that don't
+ * know JCE_lod). */
+
+/* Captured LOD chain for one aiMesh (owns each level's index buffer). */
+struct MeshLods {
+    std::vector<std::vector<uint32_t>> levels;   /* levels[l] = LOD(l+1) indices */
+};
+
+static size_t generate_mesh_lods(const aiMesh *mesh, MeshLods *out)
 {
+    if (out) out->levels.clear();
     if (!mesh || !mesh->HasPositions()) return 0;
     if (mesh->mNumVertices == 0 || mesh->mNumFaces == 0) return 0;
 
@@ -240,6 +259,13 @@ static size_t generate_mesh_lods(const aiMesh *mesh)
         LOG_INFO(LOG_TAG, "meshopt LOD '%s' level %zu: %zu -> %zu tris (%.0f%%)",
                  mesh->mName.C_Str(), l + 1, base_tris, tris,
                  base_tris ? (100.0 * (double)tris / (double)base_tris) : 0.0);
+        /* Capture this level into the per-mesh record (skip degenerate / a level
+         * that did not actually reduce — a passthrough copy would just bloat the
+         * asset and force a needless re-bind to identical geometry). */
+        if (out && lod_indices[l] && lod_counts[l] >= 3 &&
+            (lod_counts[l] % 3) == 0 && lod_counts[l] < in) {
+            out->levels.emplace_back(lod_indices[l], lod_indices[l] + lod_counts[l]);
+        }
         JCE_FREE(lod_indices[l]);   /* caller owns each level; freed here */
     }
 
@@ -273,7 +299,8 @@ static void jw_put_bytes(std::vector<uint8_t> &b, const void *p, size_t n)
     b.insert(b.end(), u, u + n);
 }
 
-static bool write_indexed_glb(const aiScene *scene, uint8_t **out_buf, size_t *out_size)
+static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
+                              uint8_t **out_buf, size_t *out_size)
 {
     if (!scene || scene->mNumMeshes == 0) return false;
     if (scene->mNumTextures > 0) return false;          /* embedded images: keep assimp path */
@@ -287,6 +314,7 @@ static bool write_indexed_glb(const aiScene *scene, uint8_t **out_buf, size_t *o
     std::vector<uint8_t> bin;
     std::string jbv, jacc, jmesh, jnode, jscene;
     int bv = 0, ac = 0, node = 0;
+    bool any_lod = false;   /* set when any JCE_lod extension is emitted */
 
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh *me = scene->mMeshes[mi];
@@ -341,18 +369,48 @@ static bool write_indexed_glb(const aiScene *scene, uint8_t **out_buf, size_t *o
             uv_ac = ac++;
         }
 
-        /* indices */
+        /* indices (LOD0 / base) */
         jw_align4(bin); size_t ioff = bin.size();
         jw_put_bytes(bin, idx.data(), idx.size() * 4);
         jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"target\":34963}", ioff, idx.size() * 4);
         int idx_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5125,\"count\":%zu,\"type\":\"SCALAR\"}", idx_bv, idx.size());
         int idx_ac = ac++;
 
+        /* LOD index accessors (additive — share this primitive's POSITION VB).
+         * Each captured level becomes a SCALAR uint32 index accessor; the
+         * accessor ids are listed in the primitive's JCE_lod extension so the
+         * runtime can bind the reduced index set at distance.  Validity: every
+         * LOD index references [0, V) (simplification only removes triangles /
+         * reuses surviving vertices), so they are valid against the base VB. */
+        std::string jlod;          /* "acc,acc,..." for this primitive */
+        if (mesh_lods) {
+            const MeshLods &ml = mesh_lods[mi];
+            for (size_t l = 0; l < ml.levels.size(); ++l) {
+                const std::vector<uint32_t> &li = ml.levels[l];
+                if (li.size() < 3 || (li.size() % 3) != 0) continue;
+                /* Defensive: all indices must address the base vertex range. */
+                bool in_range = true;
+                for (uint32_t v : li) { if (v >= V) { in_range = false; break; } }
+                if (!in_range) continue;
+                jw_align4(bin); size_t loff = bin.size();
+                jw_put_bytes(bin, li.data(), li.size() * 4);
+                jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"target\":34963}", loff, li.size() * 4);
+                int l_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5125,\"count\":%zu,\"type\":\"SCALAR\"}", l_bv, li.size());
+                int l_ac = ac++;
+                if (!jlod.empty()) jlod += ',';
+                jw_appendf(jlod, "%d", l_ac);
+                any_lod = true;
+            }
+        }
+
         if (!jmesh.empty()) jmesh += ',';
         jw_appendf(jmesh, "{\"primitives\":[{\"attributes\":{\"POSITION\":%d", pos_ac);
         if (nrm_ac >= 0) jw_appendf(jmesh, ",\"NORMAL\":%d", nrm_ac);
         if (uv_ac  >= 0) jw_appendf(jmesh, ",\"TEXCOORD_0\":%d", uv_ac);
-        jw_appendf(jmesh, "},\"indices\":%d,\"material\":%u,\"mode\":4}]}", idx_ac, me->mMaterialIndex);
+        jw_appendf(jmesh, "},\"indices\":%d,\"material\":%u,\"mode\":4", idx_ac, me->mMaterialIndex);
+        if (!jlod.empty())
+            jw_appendf(jmesh, ",\"extensions\":{\"JCE_lod\":{\"indices\":[%s]}}", jlod.c_str());
+        jmesh += "}]}";
 
         if (!jnode.empty())  jnode  += ',';
         if (!jscene.empty()) jscene += ',';
@@ -372,6 +430,10 @@ static bool write_indexed_glb(const aiScene *scene, uint8_t **out_buf, size_t *o
     }
 
     std::string json = "{\"asset\":{\"version\":\"2.0\",\"generator\":\"jce-indexed-glb\"},";
+    /* Declare the vendor extension so spec-compliant readers (and our loader)
+     * know JCE_lod is OPTIONAL — it appears in extensionsUsed but NOT
+     * extensionsRequired, so a reader that ignores it still loads LOD0. */
+    if (any_lod) json += "\"extensionsUsed\":[\"JCE_lod\"],";
     jw_appendf(json, "\"buffers\":[{\"byteLength\":%zu}],", bin.size());
     json += "\"bufferViews\":[" + jbv + "],";
     json += "\"accessors\":[" + jacc + "],";
@@ -472,12 +534,14 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
     }
 
     /* AUTO-LOD GENERATION (additive): drive the meshopt simplify core over
-     * each finalised mesh.  Generation does not mutate the scene, so the
-     * exported base GLB is byte-identical to before. */
+     * each finalised mesh and CAPTURE the chain per-mesh so the indexed-glb
+     * writer can persist it.  Generation does not mutate the scene, so the
+     * exported base GLB geometry is byte-identical to before. */
+    std::vector<MeshLods> mesh_lods(scene->mNumMeshes);
     {
         size_t total_lods = 0;
         for (unsigned i = 0; i < scene->mNumMeshes; ++i)
-            total_lods += generate_mesh_lods(scene->mMeshes[i]);
+            total_lods += generate_mesh_lods(scene->mMeshes[i], &mesh_lods[i]);
         if (total_lods > 0)
             LOG_INFO(LOG_TAG, "auto-LOD: generated %zu LOD level(s) across %u mesh(es)",
                      total_lods, scene->mNumMeshes);
@@ -485,8 +549,9 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
 
     /* Preferred path: write an INDEXED glb ourselves (Assimp's glTF2 exporter
      * un-indexes to triangle soup, inflating the bundle 2-6x).  Falls back to
-     * the Assimp exporter for textured / embedded-image scenes. */
-    if (write_indexed_glb(scene, out_buf, out_size))
+     * the Assimp exporter for textured / embedded-image scenes.  The captured
+     * LOD chains are persisted into the glb (JCE_lod primitive extension). */
+    if (write_indexed_glb(scene, mesh_lods.data(), out_buf, out_size))
         return 1;
 
     /* Fallback: Assimp's validated glb2 exporter (binary glTF 2.0). */

@@ -135,6 +135,15 @@ JCE_API void         jce_renderer_set_msaa(JceRenderer *r, int samples);
  * if a capture is already pending or `path` is invalid.  Prefer the
  * application-layer jce_screenshot_save() wrapper. */
 JCE_API bool jce_renderer_request_screenshot(const char *path);
+
+/* Like jce_renderer_request_screenshot, but captures a specific offscreen
+ * framebuffer (by bgfx handle index) to `path` instead of the backbuffer.
+ * On a D3D flip-model swap chain the BACKBUFFER cannot be copied after Present
+ * (the shot returns all-black even when the window is focused); capturing an
+ * offscreen FBO — e.g. the editor scene-view "bridge" — is reliable.
+ * fbo_idx == UINT16_MAX falls back to the backbuffer path. */
+JCE_API bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *path);
+
 JCE_API bool jce_renderer_screenshot_pending(void);
 
 /* -- Continuous backbuffer capture (video recording) -------------- */
@@ -155,6 +164,45 @@ JCE_API void jce_renderer_set_capture_sink(JceCaptureBeginFn begin,
  * Triggers a device reset; the registered sink then receives every frame. */
 JCE_API void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable);
 
+/* -- One-shot offscreen-FBO RGBA readback (impostor bake) ----------- */
+/* Request an async capture of a specific framebuffer's color attachment,
+ * delivered as RAW RGBA8 (alpha preserved — unlike the screenshot path which
+ * drops alpha to RGB24).  Pass the bgfx framebuffer handle index (e.g. from
+ * jce_offscreen_target_get_frame_buffer or a bake FBO).  `sink` fires once on
+ * the render thread at the next frame with the captured pixels (BGRA8 source is
+ * converted to RGBA8 by the renderer; `yflip` reported so the caller can flip).
+ * Used by the octahedral-impostor bake to read the rendered atlas back to CPU.
+ * Returns false if a capture is already pending. One capture in flight. */
+typedef void (*JceFboCaptureFn)(void *ud, const void *rgba, uint32_t width,
+                                uint32_t height, int yflip);
+JCE_API bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
+                                              JceFboCaptureFn sink, void *ud);
+JCE_API bool jce_renderer_fbo_capture_pending(void);
+
+/* Headless offscreen capture: blit `src_tex_idx` (an LDR/RGBA8 texture, e.g. the
+ * editor scene-view's postfx output) into a read-back staging texture on
+ * `blit_view`, read it back to CPU, and write a PNG to `path`.  Unlike
+ * jce_renderer_request_screenshot (which only completes on a foreground present),
+ * this is a pure GPU->CPU copy that finishes during normal frame processing, so
+ * it works with NO window focus (headless).  Poll _poll() each frame until != 0.
+ * One capture in flight; returns false if busy or args are invalid. */
+JCE_API bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
+                                                  uint16_t w, uint16_t h, const char *path);
+/* -1 = idle, 0 = pending (call again next frame), 1 = wrote PNG, 2 = write failed. */
+JCE_API int  jce_renderer_readback_capture_poll(void);
+
+/* Recording variant of _submit: instead of writing a PNG, the poll converts the
+ * read-back to BGRA8 and feeds it to the capture sink (video encoder).  Shares
+ * the single in-flight slot with _submit; returns false if busy (skip the frame). */
+JCE_API bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx,
+                                                       uint16_t blit_view,
+                                                       uint16_t w, uint16_t h);
+
+/* While true, video recording is fed by the ImGui renderer reading its offscreen
+ * FBO back into the sink (whole editor window), not the backbuffer screen_shot
+ * (which is black on D3D flip-model swap chains). */
+JCE_API void jce_renderer_set_capture_imgui_mode(bool on);
+
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 
 #include <jce/renderer/jce_gfx_types.h>
@@ -169,6 +217,10 @@ JCE_API JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 /* PBR shader programs. */
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst(const JceRenderer *r);
+/* Per-instance-tint instanced PBR (large-world-opt P1 #7): vs_pbr_inst_tint +
+ * fs_pbr_tint, reading a 5th per-instance vec4 (i_data4 = baseColor tint).
+ * INVALID when the variant didn't load → caller draws tinted entities solo. */
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_tint(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned(const JceRenderer *r);
 /* Forward+ clustered fragment variants (fs_pbr_fwdplus).  Return an INVALID
  * handle when the variant program failed to load (e.g. an older pak) so the
@@ -176,6 +228,11 @@ JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned(const JceRenderer 
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_fwdplus(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_fwdplus(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned_fwdplus(const JceRenderer *r);
+/* Toon (cel/rim) skinned program (stylized-slice §5.6).  INVALID when the
+ * variant didn't load (older pak) → caller falls back to standard skinned PBR. */
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned_toon(const JceRenderer *r);
+/* Inverted-hull skinned silhouette outline program.  INVALID => no outline. */
+JCE_API JceShaderHandle  jce_renderer_get_program_outline_skinned(const JceRenderer *r);
 /* When active, the pbr/pbr_inst/pbr_skinned getters above return the Forward+
  * fragment variant (if it loaded), so every existing PBR submit path picks it
  * up.  Set per-frame by the scene renderer from the r.forwardplus cvar.  The

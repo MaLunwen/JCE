@@ -10,7 +10,15 @@ float grid_line(vec2 world_xz, float spacing)
     vec2 scaled = world_xz / max(spacing, 1e-5);
     vec2 deriv = max(fwidth(scaled), vec2(1e-4, 1e-4));
     vec2 cell = abs(fract(scaled - 0.5) - 0.5) / deriv;
-    return 1.0 - clamp(min(cell.x, cell.y), 0.0, 1.0);
+    float cov = 1.0 - clamp(min(cell.x, cell.y), 0.0, 1.0);
+    /* Grid-LOD fade: once a cell shrinks below ~1px (deriv >= ~1) the lines are
+       sub-pixel and alias/shimmer under camera motion (the far-grid "屏闪").
+       Fade each level out as it becomes too dense to resolve, so the grid stays
+       crisp up close and dissolves cleanly with distance instead of shimmering
+       (the coarser major level survives further out).  ('line' is reserved in
+       HLSL, so this local is 'cov'.) */
+    float lod = 1.0 - smoothstep(0.5, 2.0, max(deriv.x, deriv.y));
+    return cov * lod;
 }
 
 float axis_line(float coord)
@@ -50,7 +58,10 @@ void main()
 
     float dist = length(world - u_grid_camera.xyz);
     float fade = 1.0 - smoothstep(u_grid_fade.x, u_grid_fade.y, dist);
-    float angleFade = clamp(abs(dir.y) * 8.0 + 0.05, 0.0, 1.0);
+    /* Fade fully to 0 toward the horizon (no +floor): at grazing angles world
+       coords explode and fract() precision dies, so any residual grid there is
+       pure shimmer. */
+    float angleFade = clamp(abs(dir.y) * 6.0, 0.0, 1.0);
     float alpha = max(max(minor * 0.42, major * 0.95), max(axisX, axisZ));
     alpha *= fade * angleFade;
 

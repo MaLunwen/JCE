@@ -61,6 +61,11 @@ void jce_model_set_material_override(const JcePbrMaterial *mat)
     s_material_override = mat;
 }
 
+const JcePbrMaterial *jce_model_get_material_override(void)
+{
+    return s_material_override;
+}
+
 /* Editor "missing albedo → pink-black checker" fallback (TEXTURED/SHADED view
  * modes).  When armed, jce_model_draw renders any primitive whose effective
  * material has no valid albedo texture with the checker shader path — mirroring
@@ -74,6 +79,21 @@ static bool s_albedo_checker = false;
 void jce_model_set_albedo_checker(bool on)
 {
     s_albedo_checker = on;
+}
+
+/* In-asset auto-LOD level for the NEXT model draw (large-world-opt P1 #6).
+ * 0 = base geometry (LOD0, the legacy default).  A value >= 1 selects the
+ * (level-1)'th reduced index buffer on each static primitive's mesh
+ * (jce_skinned_mesh_submit_lod / _shadow_lod); primitives without that many
+ * LODs fall through to their base index buffer.  Render-thread only (mirrors
+ * s_material_override).  The scene renderer arms it from jce_lod_pick, draws,
+ * and resets to 0 — so every draw that does NOT set it is byte-identical to
+ * the pre-LOD path.  Skinned primitives ignore it (rigs keep full detail). */
+static uint32_t s_draw_lod_level = 0;
+
+void jce_model_set_draw_lod(uint32_t level)
+{
+    s_draw_lod_level = level;
 }
 
 static jce_mat4 compute_static_node_world(const JceModel *model,
@@ -239,6 +259,59 @@ bool jce_model_get_aabb(const JceModel *model, float out_min[3], float out_max[3
     return true;
 }
 
+/* Sum a single texture handle's resident bytes (RGBA8-equivalent w*h*4) using
+ * the registry-reported resident size.  Invalid handles contribute 0. */
+static uint64_t model_tex_bytes(JceTexture t)
+{
+    if (!jce_texture_valid(t)) return 0;
+    uint32_t w = 0, h = 0;
+    jce_texture_get_size(t, &w, &h);
+    return (uint64_t)w * (uint64_t)h * 4u;
+}
+
+uint64_t jce_model_gpu_bytes(const JceModel *model)
+{
+    if (!model) return 0;
+
+    /* Representative interleaved PBR vertex strides (pos/normal/tangent/uv,
+     * plus joints+weights for skinned).  Exact strides aren't exposed for the
+     * static path, so these are scale-correct estimates — the goal is a
+     * residency number that tracks real VRAM, not an exact allocator query. */
+    const uint64_t STATIC_STRIDE  = 32u;   /* pos(12)+nrm(8 oct? )+uv(8)+pad */
+    const uint64_t SKINNED_STRIDE = 48u;   /* + joints(8)+weights(8) */
+    const uint64_t INDEX_STRIDE   = 4u;    /* 32-bit indices (conservative) */
+
+    uint64_t bytes = 0;
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+            if (prim->static_mesh) {
+                uint64_t vc = jce_mesh_vertex_count(prim->static_mesh);
+                uint64_t ic = jce_mesh_index_count(prim->static_mesh);
+                bytes += vc * STATIC_STRIDE + ic * INDEX_STRIDE;
+            }
+            if (prim->skinned_mesh) {
+                uint64_t vc = jce_skinned_mesh_vertex_count(prim->skinned_mesh);
+                uint64_t ic = jce_skinned_mesh_index_count(prim->skinned_mesh);
+                bytes += vc * SKINNED_STRIDE + ic * INDEX_STRIDE;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < model->num_materials; i++) {
+        const JcePbrMaterial *m = &model->materials[i];
+        bytes += model_tex_bytes(m->albedo_map);
+        bytes += model_tex_bytes(m->metallic_roughness_map);
+        bytes += model_tex_bytes(m->normal_map);
+        bytes += model_tex_bytes(m->ao_map);
+        bytes += model_tex_bytes(m->emissive_map);
+    }
+
+    return bytes;
+}
+
 uint32_t jce_model_anim_count(const JceModel *model)
 {
     return model ? model->num_anims : 0;
@@ -312,11 +385,12 @@ const JceMorphWeightTrack *jce_model_morph_anim_track(
 /* Rendering                                                           */
 /* ================================================================== */
 
-void jce_model_draw(const JceModel *model,
-                     const JceRenderer *r, uint16_t view_id,
-                     const jce_mat4 *transform,
-                     const jce_mat4 *joint_matrices,
-                     uint32_t num_joints)
+void jce_model_draw_program(const JceModel *model,
+                            const JceRenderer *r, uint16_t view_id,
+                            const jce_mat4 *transform,
+                            const jce_mat4 *joint_matrices,
+                            uint32_t num_joints,
+                            JceShaderHandle skinned_color_override)
 {
     if (!model || !r) return;
 
@@ -354,6 +428,10 @@ void jce_model_draw(const JceModel *model,
             }
             if (mat)
                 jce_pbr_material_bind(mat, r, view_id);
+            /* Honour the material's two-sided flag in the color submit (the
+             * mesh submit hard-codes CULL_CW otherwise — see
+             * jce_skinned_mesh_submit).  Cleared after the loop. */
+            jce_skinned_mesh_set_submit_double_sided(mat && mat->double_sided);
 
             if (prim->skinned_mesh) {
                 JceShaderHandle prog_handle;
@@ -378,7 +456,11 @@ void jce_model_draw(const JceModel *model,
                     } else {
                         bgfx_set_transform(world.raw[0], 1);
                     }
-                    prog_handle = jce_renderer_get_program_pbr_skinned(r);
+                    /* Override only the truly-skinned color program (e.g. pbr_toon);
+                     * INVALID sentinel => unchanged default => byte-identical. */
+                    prog_handle = (skinned_color_override.idx != UINT16_MAX)
+                                ? skinned_color_override
+                                : jce_renderer_get_program_pbr_skinned(r);
                 } else {
                     /* PBR static (has tangent, no joints): still respect
                        joint-parent attachment for props under bones. */
@@ -388,7 +470,15 @@ void jce_model_draw(const JceModel *model,
                     prog_handle = jce_renderer_get_program_pbr(r);
                 }
 
-                jce_skinned_mesh_submit(prim->skinned_mesh, r, view_id);
+                /* In-asset auto-LOD: a non-skinned (PBR static) primitive binds
+                 * the armed reduced index set; skinned rigs keep full detail.
+                 * Level 0 / no LOD => byte-identical to the base submit. */
+                if (s_draw_lod_level > 0 &&
+                    !jce_skinned_mesh_is_skinned(prim->skinned_mesh))
+                    jce_skinned_mesh_submit_lod(prim->skinned_mesh, r, view_id,
+                                                s_draw_lod_level - 1);
+                else
+                    jce_skinned_mesh_submit(prim->skinned_mesh, r, view_id);
 
                 /* Per-submit bind hook (e.g. Forward+ cluster bind on stage
                  * 14): bgfx clears stage/uniform state between submits, so the
@@ -411,6 +501,61 @@ void jce_model_draw(const JceModel *model,
             }
         }
     }
+    /* Never leak the per-submit two-sided override into later draws. */
+    jce_skinned_mesh_set_submit_double_sided(false);
+}
+
+void jce_model_draw(const JceModel *model,
+                     const JceRenderer *r, uint16_t view_id,
+                     const jce_mat4 *transform,
+                     const jce_mat4 *joint_matrices,
+                     uint32_t num_joints)
+{
+    /* Thin caller: INVALID override => byte-identical to the historical draw. */
+    jce_model_draw_program(model, r, view_id, transform, joint_matrices,
+                           num_joints, JCE_INVALID_SHADER);
+}
+
+/* Largest in-asset reduced-LOD count across the model's non-skinned primitives. */
+uint32_t jce_model_max_lod(const JceModel *model)
+{
+    if (!model) return 0;
+    uint32_t mx = 0;
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceSkinnedMesh *sm = node->primitives[p].skinned_mesh;
+            if (sm && !jce_skinned_mesh_is_skinned(sm)) {
+                uint32_t c = jce_skinned_mesh_lod_count(sm);
+                if (c > mx) mx = c;
+            }
+        }
+    }
+    return mx;
+}
+
+/* Index counts of the first drawable non-skinned primitive (for the inspector). */
+uint32_t jce_model_lod_index_counts(const JceModel *model,
+                                    uint32_t *out_base,
+                                    uint32_t *out_lods,
+                                    uint32_t max_levels)
+{
+    if (out_base) *out_base = 0;
+    if (!model) return 0;
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceSkinnedMesh *sm = node->primitives[p].skinned_mesh;
+            if (!sm || jce_skinned_mesh_is_skinned(sm)) continue;
+            if (out_base) *out_base = jce_skinned_mesh_index_count(sm);
+            uint32_t lc = jce_skinned_mesh_lod_count(sm);
+            uint32_t w = (lc < max_levels) ? lc : max_levels;
+            for (uint32_t i = 0; i < w && out_lods; i++)
+                out_lods[i] = jce_skinned_mesh_lod_index_count(sm, i);
+            return w;
+        }
+    }
+    return 0;
 }
 
 /* True when every primitive is non-skinned (static or PBR-static) so the model
@@ -441,16 +586,59 @@ void jce_model_draw_instanced(const JceModel *model,
                               const JceRenderer *r, uint16_t view_id,
                               const jce_mat4 *roots, uint32_t count)
 {
+    jce_model_draw_instanced_tinted(model, r, view_id, roots, NULL, count);
+}
+
+/* Tint-aware sibling: each instance i additionally carries tints[i] (RGBA), fed
+ * to the per-instance i_data4 attribute of vs_pbr_inst_tint and modulating
+ * albedo in fs_pbr_tint exactly like a solo draw's u_baseColorFactor.  tints ==
+ * NULL is the legacy no-tint path: stride-64 instance buffer + the plain
+ * vs_pbr_inst program, byte-identical to before.  When tints != NULL but the
+ * tint program is unavailable (older pak), it falls back to the no-tint program
+ * (the per-entity colour is simply dropped — graceful degradation, not a crash).
+ * (large-world-opt P1 #7) */
+void jce_model_draw_instanced_tinted(const JceModel *model,
+                                     const JceRenderer *r, uint16_t view_id,
+                                     const jce_mat4 *roots,
+                                     const jce_vec4 *tints, uint32_t count)
+{
     if (!model || !r || !roots || count == 0) return;
 
-    JceShaderHandle prog_inst = jce_renderer_get_program_pbr_inst(r);
+    /* Tinted runs need the tint program (5-vec4 instance stride).  If it didn't
+     * load, fall back to the plain instanced program with a 4-vec4 stride and no
+     * tint (degrade gracefully rather than break batching). */
+    JceShaderHandle prog_tint = jce_renderer_get_program_pbr_inst_tint(r);
+    const bool use_tint = (tints != NULL) && (prog_tint.idx != UINT16_MAX);
+    JceShaderHandle prog_inst = use_tint ? prog_tint
+                                         : jce_renderer_get_program_pbr_inst(r);
     if (count == 1 || prog_inst.idx == UINT16_MAX) {
-        for (uint32_t i = 0; i < count; i++)
+        /* Single instance / no instanced program: draw solo.  A tint is honoured
+         * by binding it as the material's base-color factor on a copy of the
+         * effective material so the solo result matches the instanced result. */
+        for (uint32_t i = 0; i < count; i++) {
+            const JcePbrMaterial *prev_ov = NULL;
+            JcePbrMaterial tinted_ov;
+            if (tints) {
+                prev_ov = jce_model_get_material_override();
+                /* Compose tint over the would-be effective material so a single
+                 * tinted copy looks identical to a batched one. */
+                tinted_ov = prev_ov ? *prev_ov : jce_pbr_material_default();
+                tinted_ov.base_color_factor[0] = (prev_ov ? prev_ov->base_color_factor[0] : 1.0f) * tints[i].x;
+                tinted_ov.base_color_factor[1] = (prev_ov ? prev_ov->base_color_factor[1] : 1.0f) * tints[i].y;
+                tinted_ov.base_color_factor[2] = (prev_ov ? prev_ov->base_color_factor[2] : 1.0f) * tints[i].z;
+                tinted_ov.base_color_factor[3] = (prev_ov ? prev_ov->base_color_factor[3] : 1.0f) * tints[i].w;
+                jce_model_set_material_override(&tinted_ov);
+            }
             jce_model_draw(model, r, view_id, &roots[i], NULL, 0);
+            if (tints) jce_model_set_material_override(prev_ov);
+        }
         return;
     }
     const bgfx_program_handle_t bgfx_prog = { (uint16_t)prog_inst.idx };
-    const uint16_t stride = (uint16_t)sizeof(jce_mat4);   /* 64 bytes (4 vec4) */
+    /* 64 B (4 vec4 = mat4) for the legacy path; 80 B (mat4 + tint vec4) when the
+     * per-instance tint stream is active. */
+    const uint16_t stride = use_tint ? (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4))
+                                     : (uint16_t)sizeof(jce_mat4);
 
     for (uint32_t n = 0; n < model->num_nodes; n++) {
         const JceModelNode *node = &model->nodes[n];
@@ -495,21 +683,40 @@ void jce_model_draw_instanced(const JceModel *model,
                     jce_mat4 sw = compute_static_node_world(model, node,
                                                             &roots[start + i],
                                                             &world, NULL, 0);
-                    memcpy(dst + (size_t)i * stride, sw.raw[0], sizeof(jce_mat4));
+                    uint8_t *slot = dst + (size_t)i * stride;
+                    memcpy(slot, sw.raw[0], sizeof(jce_mat4));
+                    if (use_tint) {
+                        /* Pack the tint immediately after the mat4 (i_data4). */
+                        memcpy(slot + sizeof(jce_mat4), &tints[start + i],
+                               sizeof(jce_vec4));
+                    }
                 }
 
                 if (mat)
                     jce_pbr_material_bind(mat, r, view_id);
+                const bool two_sided = (mat && mat->double_sided);
+                jce_skinned_mesh_set_submit_double_sided(two_sided);
 
                 if (sm) {
-                    jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB/state, no submit */
+                    /* In-asset auto-LOD: bind the armed reduced index set so an
+                     * instanced run of distant meshes draws fewer triangles
+                     * while STILL sharing one instanced submit (the batch is
+                     * keyed by (model, lod) upstream, so every instance in this
+                     * run resolves to the same level).  Level 0 / no LOD =>
+                     * identical to the base bind. */
+                    if (s_draw_lod_level > 0)
+                        jce_skinned_mesh_submit_lod(sm, r, view_id, s_draw_lod_level - 1);
+                    else
+                        jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB/state, no submit */
                 } else {
                     bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(st) };
                     bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(st) };
                     bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
                     if (ibh.idx != UINT16_MAX)
                         bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(st));
-                    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+                    uint64_t st_state = BGFX_STATE_DEFAULT;
+                    if (two_sided) st_state &= ~BGFX_STATE_CULL_MASK;
+                    bgfx_set_state(st_state, 0);
                 }
 
                 bgfx_set_instance_data_buffer(&idb, 0, nb);
@@ -521,6 +728,7 @@ void jce_model_draw_instanced(const JceModel *model,
             }
         }
     }
+    jce_skinned_mesh_set_submit_double_sided(false);
 }
 
 /* ── GPU-driven instancing (roadmap #18, Phase 0+1) ──────────────────────
@@ -628,6 +836,177 @@ void jce_model_draw_instanced_from_buffer(const JceModel *model,
     }
 }
 
+uint32_t jce_model_gpu_index_count(const JceModel *model)
+{
+    if (!model) return 0;
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+            const JceSkinnedMesh *sm = prim->skinned_mesh;
+            JceMesh              *st = prim->static_mesh;
+            if (sm && jce_skinned_mesh_is_skinned(sm)) continue;
+            if (sm) return jce_skinned_mesh_index_count(sm);
+            if (st) return jce_mesh_index_count(st);
+        }
+    }
+    return 0;
+}
+
+/* GPU-driven INDIRECT instanced color draw: identical primitive/material binding
+ * to jce_model_draw_instanced_from_buffer, but the per-instance count + start
+ * come from the GPU-written indirect args instead of CPU values.  The visible
+ * buffer is bound as the instance source from slot 0 (UINT32_MAX count = whole
+ * buffer); the indirect arg's startInstance selects this run's partition.  bgfx
+ * IGNORES the index/vertex counts set via set_index/vertex_buffer when submitting
+ * indirect — the counts come from the indirect element — so the bound counts here
+ * only matter for binding the handles. */
+void jce_model_draw_indirect_from_buffer(const JceModel *model,
+                                         const JceRenderer *r, uint16_t view_id,
+                                         uint16_t visible_vb,
+                                         uint16_t indirect_buf,
+                                         uint32_t indirect_el)
+{
+    if (!model || !r || visible_vb == UINT16_MAX || indirect_buf == UINT16_MAX)
+        return;
+    JceShaderHandle prog_inst = jce_renderer_get_program_pbr_inst(r);
+    if (prog_inst.idx == UINT16_MAX) return;
+    const bgfx_program_handle_t bgfx_prog = { (uint16_t)prog_inst.idx };
+    const bgfx_dynamic_vertex_buffer_handle_t vis = { visible_vb };
+    const bgfx_indirect_buffer_handle_t ind = { indirect_buf };
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+            const JceSkinnedMesh *sm = prim->skinned_mesh;
+            JceMesh              *st = prim->static_mesh;
+            if (sm && jce_skinned_mesh_is_skinned(sm)) continue;
+            if (!sm && !st) continue;
+
+            const JcePbrMaterial *mat = NULL;
+            if (prim->material_index < model->num_materials)
+                mat = &model->materials[prim->material_index];
+            if (s_material_override)
+                mat = s_material_override;
+            JcePbrMaterial checker_mat;
+            if (s_albedo_checker && mat && !jce_texture_valid(mat->albedo_map)) {
+                checker_mat = *mat;
+                checker_mat.normal_scale =
+                    -fmaxf(fabsf(checker_mat.normal_scale), 0.0001f);
+                mat = &checker_mat;
+            }
+            if (mat)
+                jce_pbr_material_bind(mat, r, view_id);
+
+            if (sm) {
+                jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB/state */
+            } else {
+                bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(st) };
+                bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(st) };
+                bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
+                if (ibh.idx != UINT16_MAX)
+                    bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(st));
+                bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+            }
+
+            /* Bind the compacted instance stream from slot 0; the indirect arg's
+             * startInstance picks this run's partition. */
+            bgfx_set_instance_data_from_dynamic_vertex_buffer(vis, 0, UINT32_MAX);
+            if (s_pre_submit_cb)
+                s_pre_submit_cb(s_pre_submit_user, view_id);
+            /* One indirect draw element (this run), starting at indirect_el. */
+            bgfx_submit_indirect(view_id, bgfx_prog, ind, indirect_el, 1, 0,
+                                 BGFX_DISCARD_ALL);
+            return;   /* single drawable primitive only */
+        }
+    }
+}
+
+/* GPU-driven DEPTH-ONLY siblings of jce_model_draw_*_from_buffer (roadmap #18
+ * extended to the CSM shadow cascades).  Identical primitive binding to the
+ * color versions, but: depth-only state (no material bind, no Forward+ cluster
+ * pre-submit), and the SHADOW instanced program (`program_idx`, from
+ * jce_renderer_get_program_shadow_inst) instead of the PBR program.  The visible
+ * buffer holds one mat4 per surviving instance (TEXCOORD7..4), which vs_shadow_inst
+ * reads as i_data0..3.  No-op unless jce_model_gpu_instanceable(model, NULL). */
+static const uint64_t JCE_SHADOW_DRAW_STATE =
+    BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+    | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA;
+
+void jce_model_draw_shadow_instanced_from_buffer(const JceModel *model,
+                                                 const JceRenderer *r,
+                                                 uint16_t view_id,
+                                                 uint16_t program_idx,
+                                                 uint16_t visible_vb,
+                                                 uint32_t start, uint32_t count)
+{
+    if (!model || !r || count == 0
+        || visible_vb == UINT16_MAX || program_idx == UINT16_MAX) return;
+    const bgfx_program_handle_t bgfx_prog = { program_idx };
+    const bgfx_dynamic_vertex_buffer_handle_t vis = { visible_vb };
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+            const JceSkinnedMesh *sm = prim->skinned_mesh;
+            JceMesh              *st = prim->static_mesh;
+            if (sm && jce_skinned_mesh_is_skinned(sm)) continue;
+            if (!st) continue;   /* GPU shadow path: static primitives only */
+
+            bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(st) };
+            bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(st) };
+            bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
+            if (ibh.idx != UINT16_MAX)
+                bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(st));
+            bgfx_set_state(JCE_SHADOW_DRAW_STATE, 0);
+            bgfx_set_instance_data_from_dynamic_vertex_buffer(vis, start, count);
+            bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
+            return;   /* single drawable primitive only */
+        }
+    }
+}
+
+void jce_model_draw_shadow_indirect_from_buffer(const JceModel *model,
+                                                const JceRenderer *r,
+                                                uint16_t view_id,
+                                                uint16_t program_idx,
+                                                uint16_t visible_vb,
+                                                uint16_t indirect_buf,
+                                                uint32_t indirect_el)
+{
+    if (!model || !r || visible_vb == UINT16_MAX
+        || indirect_buf == UINT16_MAX || program_idx == UINT16_MAX) return;
+    const bgfx_program_handle_t bgfx_prog = { program_idx };
+    const bgfx_dynamic_vertex_buffer_handle_t vis = { visible_vb };
+    const bgfx_indirect_buffer_handle_t ind = { indirect_buf };
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+            const JceSkinnedMesh *sm = prim->skinned_mesh;
+            JceMesh              *st = prim->static_mesh;
+            if (sm && jce_skinned_mesh_is_skinned(sm)) continue;
+            if (!st) continue;   /* GPU shadow path: static primitives only */
+
+            bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(st) };
+            bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(st) };
+            bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
+            if (ibh.idx != UINT16_MAX)
+                bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(st));
+            bgfx_set_state(JCE_SHADOW_DRAW_STATE, 0);
+            /* Instance source from slot 0; the indirect arg's startInstance picks
+             * this run's compacted partition. */
+            bgfx_set_instance_data_from_dynamic_vertex_buffer(vis, 0, UINT32_MAX);
+            bgfx_submit_indirect(view_id, bgfx_prog, ind, indirect_el, 1, 0,
+                                 BGFX_DISCARD_ALL);
+            return;   /* single drawable primitive only */
+        }
+    }
+}
+
 void jce_model_draw_shadow(const JceModel *model,
                            const JceRenderer *r, uint16_t view_id,
                            const jce_mat4 *transform,
@@ -681,8 +1060,16 @@ void jce_model_draw_shadow(const JceModel *model,
                     jce_mat4 static_world = compute_static_node_world(
                         model, node, root, &world, joint_matrices, num_joints);
                     bgfx_set_transform(static_world.raw[0], 1);
-                    jce_skinned_mesh_submit_shadow(prim->skinned_mesh, r,
-                                                   view_id, prog_static);
+                    /* In-asset auto-LOD: cast the SAME reduced silhouette the
+                     * color pass drew so shadows match the rendered LOD.  Level
+                     * 0 / no LOD => identical to the base shadow submit. */
+                    if (s_draw_lod_level > 0)
+                        jce_skinned_mesh_submit_shadow_lod(prim->skinned_mesh, r,
+                                                           view_id, prog_static,
+                                                           s_draw_lod_level - 1);
+                    else
+                        jce_skinned_mesh_submit_shadow(prim->skinned_mesh, r,
+                                                       view_id, prog_static);
                 }
             } else if (prim->static_mesh) {
                 jce_mat4 static_world = compute_static_node_world(
@@ -749,7 +1136,15 @@ void jce_model_draw_shadow_instanced(const JceModel *model,
                 }
 
                 if (sm) {
-                    jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB, no submit */
+                    /* In-asset auto-LOD: an instanced shadow run binds the same
+                     * reduced index set as the color run (batch keyed by
+                     * (model, lod) upstream) so the cast silhouette matches.
+                     * submit_lod binds VB+IB and a color state; the depth-only
+                     * bgfx_set_state below overrides it (same as the base path). */
+                    if (s_draw_lod_level > 0)
+                        jce_skinned_mesh_submit_lod(sm, r, view_id, s_draw_lod_level - 1);
+                    else
+                        jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB, no submit */
                 } else {
                     bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(st) };
                     bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(st) };
@@ -931,6 +1326,7 @@ void jce_model_draw_morphed(const JceModel *model,
                 mat = &model->materials[prim->material_index];
             if (mat)
                 jce_pbr_material_bind(mat, r, view_id);
+            jce_skinned_mesh_set_submit_double_sided(mat && mat->double_sided);
 
             if (prim->skinned_mesh) {
                 JceShaderHandle prog_handle;
@@ -981,6 +1377,7 @@ void jce_model_draw_morphed(const JceModel *model,
             }
         }
     }
+    jce_skinned_mesh_set_submit_double_sided(false);
 }
 
 void jce_model_draw_morphed_shadow(const JceModel *model,

@@ -20,9 +20,11 @@ extern "C" {
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lowlevel.h>
+#include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_shaders.h>  /* JceShaderSet for the occlusion proxy */
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_taa.h>
 #include <jce/renderer/jce_views.h>
@@ -41,6 +43,7 @@ void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensit
 
 #include <cstring>
 #include <cmath>
+#include <cstdlib>   /* getenv — JCE_DISABLE_OCCLUSION A/B + safety toggle */
 
 #define LOG_TAG "game_render"
 
@@ -56,6 +59,16 @@ struct GameRenderState {
     JceCamera             *camera            = nullptr;
     JcePostFXPipeline     *postfx            = nullptr;  /* game-view own pipeline */
     uint16_t               postfx_output_tex = UINT16_MAX;
+
+    /* GPU-query occlusion culler (Play / game-view).  The game view shares the
+     * ENGINE scene renderer with the scene view but renders in its own pass with
+     * its own camera, so it needs its OWN culler instance (per-entity visibility
+     * history must not be shared with the scene-view camera).  Uses a DISTINCT
+     * proxy view id (253) from the scene-view culler (254) so the two never
+     * clobber each other's depth-only proxy pass when both panels render in the
+     * same bgfx frame.  NULL when JCE_DISABLE_OCCLUSION is set or hardware
+     * queries are unsupported (silent always-visible fallback). */
+    JceOcclusionCuller    *occlusion_culler  = nullptr;
 
     /* TAA (game view): own jitter/history state so the first-person view also
      * benefits from temporal AA with per-object motion-vector de-ghosting.
@@ -163,6 +176,36 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
         LOG_WARN(LOG_TAG, "[init] failed to create game view PostFX pipeline");
     }
 
+    /* Occlusion culler (Play / game-view): GPU-query two-pass coherence culling,
+     * mirroring the scene-view (jce_editor_scene_render.cpp).  Activating it here
+     * is what makes Play / shipped-equivalent rendering skip fully-hidden
+     * geometry in a dense world (previously occlusion ran ONLY in the editor
+     * scene-view).  Opt-OUT via JCE_DISABLE_OCCLUSION=1 for A/B measurement and
+     * as a safety hatch (mirrors JCE_DISABLE_WCACHE / JCE_STREAM_SYNC).  Degrades
+     * silently to always-visible when hardware queries are unsupported. */
+    {
+        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
+        bool occlusion_off = (dis && dis[0] && dis[0] != '0');
+        if (occlusion_off) {
+            LOG_INFO(LOG_TAG,
+                     "[init] JCE_DISABLE_OCCLUSION set — game-view occlusion culling OFF");
+        } else {
+            JceShaderSet oc_shaders;
+            memset(&oc_shaders, 0, sizeof(oc_shaders));
+            JceShaderHandle ch = jce_renderer_get_program_color(renderer);
+            oc_shaders.color.idx = ch.idx;
+
+            JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+            /* Distinct proxy view from the scene-view culler (254) so both can
+             * run in the same bgfx frame without clobbering each other. */
+            oc_cfg.view_id = 253;
+            g.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
+            if (!g.occlusion_culler)
+                LOG_WARN(LOG_TAG,
+                         "[init] occlusion culler creation failed (game-view culling disabled)");
+        }
+    }
+
     return true;
 }
 
@@ -175,6 +218,10 @@ void jce_editor_game_render_shutdown(void)
         jce_window_set_relative_mouse_mode(g.window, false);
         jce_window_set_mouse_grab(g.window, false);
         g.mouse_captured = false;
+    }
+    if (g.occlusion_culler) {
+        jce_occlusion_culler_destroy(g.occlusion_culler);
+        g.occlusion_culler = nullptr;
     }
     if (g.ui_canvas) { jce_ui_canvas_destroy(g.ui_canvas); g.ui_canvas = nullptr; }
     if (g.bridge) { jce_offscreen_target_destroy(g.bridge); g.bridge = nullptr; }
@@ -381,6 +428,18 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         if (mod->draw)   mod->draw(&g.svc, mod->user_data);
     }
 
+    /* WYSIWYG with the standalone runtime: during Play, if the scene has a
+     * playable character (CharacterController → runtime player position), drive
+     * the Game View camera with the SAME third-person follow as jce_default_main
+     * (jce_camera_third_person_follow) instead of the free-fly debug camera, so
+     * editor-Play and the shipped runtime frame the scene identically.  Falls
+     * back to free-fly when not playing or the scene has no character. */
+    if (play_active && g.play_runtime) {
+        jce_vec3 player_pos;
+        if (jce_runtime_get_player_position(g.play_runtime, &player_pos))
+            jce_camera_third_person_follow(g.camera, player_pos);
+    }
+
     float aspect = (float)width / (float)height;
     jce_mat4 view = jce_camera_view(g.camera);
     jce_mat4 proj = jce_camera_proj(g.camera, aspect, g.homogeneous_depth);
@@ -403,7 +462,17 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             ? jce_m4_multiply(&g.taa_prev_proj, &g.taa_prev_view)
             : view_proj;
         jce_postfx_set_taa_matrices(g.postfx, &inv_vp, &prev_vp);
-        jce_postfx_set_taa(g.postfx, true, 0.9f, 1.0f, 1.0f);
+        /* Authorable TAA tuning (0 = engine defaults: feedback 0.9, clamps 1.0). */
+        float taa_fb = 0.9f, taa_lc = 1.0f, taa_mc = 1.0f;
+        if (scene) {
+            const JceSceneRenderingSettings *rs = jce_scene_get_rendering_settings(scene);
+            if (rs) {
+                if (rs->taa_feedback     > 0.0f) taa_fb = rs->taa_feedback;
+                if (rs->taa_luma_clamp   > 0.0f) taa_lc = rs->taa_luma_clamp;
+                if (rs->taa_motion_clamp > 0.0f) taa_mc = rs->taa_motion_clamp;
+            }
+        }
+        jce_postfx_set_taa(g.postfx, true, taa_fb, taa_lc, taa_mc);
         /* Request the shared renderer write a per-object/per-bone velocity
          * buffer this frame (the game view is the sole renderer when the Scene
          * tab is hidden; when both are visible the scene path's prev-state is
@@ -455,6 +524,16 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
     cfg.frustum_culling = true;
 
+    /* Two-pass GPU-query occlusion culling (Play / game-view).  Mirrors the
+     * scene-view: the renderer drives begin_frame / entity_visible / submit_query
+     * internally from this pointer.  NULL when JCE_DISABLE_OCCLUSION is set or
+     * hardware queries are unsupported (always-visible fallback). */
+    cfg.occlusion_culler = g.occlusion_culler;
+    /* Game-view also renders into the offscreen bridge FBO — bind the occlusion
+     * proxy view to it so its depth test reads the depth the color pass wrote
+     * (else the offscreen path's queries hit the backbuffer → inert/false-cull). */
+    cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(g.bridge);
+
     /* ── Lighting settings from the editor Lighting panel ──────────
      * Apply the same ambient override and volumetric fog that the scene
      * viewport uses so both viewports reflect lighting panel changes. */
@@ -501,6 +580,27 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     float render_dt = (play_state == 1) ? frame_dt : 0.0f;
     jce_scene_renderer_render(engine_sr, scene, g.camera, base,
                               render_dt, &cfg);
+
+    /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1) for the GAME-view
+     * offscreen path — parity with the scene-view log so a headless run can
+     * confirm occlusion is live (occluded>0) in the game-view bridge FBO too. */
+    {
+        static int s_occ_log = -1;
+        if (s_occ_log < 0)
+            s_occ_log = (getenv("JCE_KPI_OCCLUSION_LOG") != nullptr) ? 1 : 0;
+        if (s_occ_log) {
+            static unsigned s_gocc_frame = 0;
+            if ((s_gocc_frame++ % 60u) == 0u) {
+                JceSceneOcclusionStats ocs = {};
+                jce_scene_renderer_get_occlusion_stats(engine_sr, &ocs);
+                LOG_INFO(LOG_TAG,
+                    "[occ-kpi game] mode=%s tested=%u visible=%u occluded=%u "
+                    "warm_up=%u no_result=%u", ocs.enabled ? "ON" : "OFF",
+                    ocs.total, ocs.visible, ocs.occluded, ocs.warm_up,
+                    ocs.no_result);
+            }
+        }
+    }
 
     /* Composite volumetric fog (mirrors scene view path). */
     if (cfg.fog_enabled) {
@@ -550,6 +650,16 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                 shared_pfx, cust_params, JCE_POSTFX_CUSTOM_PARAMS);
             jce_postfx_set_custom_shader(g.postfx, cust_name, cust_depth);
             jce_postfx_set_custom_params(g.postfx, cust_params, cust_count);
+
+            /* Mirror Stage-1a.5 postfx finish (tonemap-op / LUT / bloom). */
+            jce_postfx_set_tonemap_op(g.postfx, jce_postfx_get_tonemap_op(shared_pfx));
+            jce_postfx_set_bloom_knee(g.postfx, jce_postfx_get_bloom_knee(shared_pfx));
+            jce_postfx_set_bloom_quality(g.postfx, jce_postfx_get_bloom_quality(shared_pfx));
+            {
+                JceTexture lut; int ln; float ls;
+                jce_postfx_get_lut(shared_pfx, &lut, &ln, &ls);
+                jce_postfx_set_lut(g.postfx, lut, ln, ls);  /* shares the 3D handle */
+            }
 
             /* TAA (game view): bind the shared renderer's per-object velocity
              * buffer as the motion source so animated/skinned geometry stops

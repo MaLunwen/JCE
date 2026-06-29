@@ -176,6 +176,11 @@ void parse_lod_group(JceScene *s, JceEntity e, const cJSON *c)
     if (lg.level_count > JCE_LOD_COMP_MAX_LEVELS) lg.level_count = JCE_LOD_COMP_MAX_LEVELS;
     lg.hysteresis        = (float)j_num(c, "hysteresis", 0.05);
     lg.cull_when_too_far = j_bool(c, "cullWhenTooFar", false);
+    lg.fade_width        = (float)j_num(c, "fadeWidth", 0.0);  /* P1 #6 */
+    /* Octahedral impostor terminal LOD (P2 #10). */
+    copy_str(lg.impostor_meta_path, sizeof(lg.impostor_meta_path),
+             j_str(c, "impostorMetaPath", ""));
+    lg.impostor_distance = (float)j_num(c, "impostorDistance", 0.0);
     char key[32];
     for (int i = 0; i < JCE_LOD_COMP_MAX_LEVELS; ++i) {
         snprintf(key, sizeof(key), "distance%d", i);
@@ -407,6 +412,20 @@ static void ser_mesh_renderer(const JceMeshRenderer *mr, cJSON *arr)
     if (mr->normal_tex[0])   cJSON_AddStringToObject(o, "normalTex",   mr->normal_tex);
     if (mr->ao_tex[0])       cJSON_AddStringToObject(o, "aoTex",       mr->ao_tex);
     if (mr->emissive_tex[0]) cJSON_AddStringToObject(o, "emissiveTex", mr->emissive_tex);
+    /* Toon keys are absent when toon=false; parser defaults all knobs to 0/off. */
+    if (mr->toon) {
+        cJSON_AddBoolToObject  (o, "toon",             mr->toon);
+        cJSON_AddNumberToObject(o, "toonBands",        mr->toon_bands);
+        cJSON_AddNumberToObject(o, "toonRimPower",     mr->rim_power);
+        cJSON_AddNumberToObject(o, "toonRimIntensity", mr->rim_intensity);
+        cJSON_AddNumberToObject(o, "toonRimColorR",    mr->rim_color[0]);
+        cJSON_AddNumberToObject(o, "toonRimColorG",    mr->rim_color[1]);
+        cJSON_AddNumberToObject(o, "toonRimColorB",    mr->rim_color[2]);
+        cJSON_AddNumberToObject(o, "toonOutlineWidth", mr->outline_width);
+        cJSON_AddNumberToObject(o, "toonOutlineColorR", mr->outline_color[0]);
+        cJSON_AddNumberToObject(o, "toonOutlineColorG", mr->outline_color[1]);
+        cJSON_AddNumberToObject(o, "toonOutlineColorB", mr->outline_color[2]);
+    }
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -529,6 +548,10 @@ static void ser_lod_group(const JceLodGroupComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "levelCount", c->level_count);
     cJSON_AddNumberToObject(o, "hysteresis", c->hysteresis);
     cJSON_AddBoolToObject  (o, "cullWhenTooFar", c->cull_when_too_far);
+    cJSON_AddNumberToObject(o, "fadeWidth", c->fade_width);  /* P1 #6 */
+    /* Octahedral impostor terminal LOD (P2 #10). */
+    cJSON_AddStringToObject(o, "impostorMetaPath", c->impostor_meta_path);
+    cJSON_AddNumberToObject(o, "impostorDistance", c->impostor_distance);
     char key[32];
     for (int i = 0; i < JCE_LOD_COMP_MAX_LEVELS; ++i) {
         snprintf(key, sizeof(key), "distance%d", i);

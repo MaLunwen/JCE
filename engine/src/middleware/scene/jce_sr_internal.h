@@ -52,6 +52,7 @@
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_impostor.h>   /* octahedral impostor terminal LOD */
 #include <jce/renderer/jce_skinned_mesh.h>
 #include <jce/renderer/jce_local_shadow.h>
 #include <jce/renderer/jce_pbr_material.h>
@@ -130,6 +131,19 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
  * an open-addressing path hash (sr_get_model). */
 #define SR_MODEL_CACHE_MAX     256
 #define SR_MODEL_MAX_INFLIGHT  3    /* concurrent async model decodes */
+/* VRAM ceiling: a model must go UNreferenced (not resolved via sr_get_model)
+ * for this many full frames before it is eligible for eviction.  A generous
+ * window so a model that briefly leaves the view (or a one-frame cull gap) is
+ * never freed then immediately reloaded; only a chunk that has genuinely
+ * unloaded (its entities destroyed) stays untouched this long.  Compared as
+ * (model_frame - last_used_frame) >= grace, where model_frame was bumped at
+ * the start of THIS render — so a model used LAST frame has delta 1. */
+#define SR_MODEL_EVICT_GRACE   30u
+/* Streaming LOD cross-fade (Direction B): seconds a freshly streamed detail
+ * entity dithers in (screen-door) while the resident HLOD proxy stays visible.
+ * Matches the streamer's proxy-hide delay (JCE_WS_PROXY_HIDE_DELAY) so the
+ * proxy is hidden exactly as the detail finishes fading in. */
+#define JCE_SR_FADE_DURATION   0.4f
 #define SR_ANIM_INSTANCE_MAX   64   /* per-entity skinned-anim playback state */
 #define SR_SPRITE_ANIM_MAX     64   /* per-entity 2D sprite-animator playback state */
 /* Seed sentinel for SrAnimInstance.sm_prev_state: a value that can never be a
@@ -145,12 +159,14 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 #define SR_MORPH_PRIM_MAX      8
 #define SR_TEX_CACHE_MAX       512
 #define SR_TEX_MAX_INFLIGHT    6    /* concurrent async texture decodes */
-/* Render-list cap = max entities considered per frame.  Sized to cover a
- * full-load (non-streamed) big world so pulling the camera back surveys the
- * WHOLE world instead of an arbitrary first-N subset.  The list lives in BSS
- * (static in jce_scene_renderer_render), not on the stack, so this size is
- * free of stack-overflow risk; the per-frame cost is the O(n) collect + cull,
- * which the instanced passes keep cheap. */
+/* INITIAL per-frame render-list / cull-cache capacity (large-world capacity,
+ * Direction C).  This is NO LONGER a hard cap: the per-frame entity list and the
+ * per-entity cull cache GROW on demand to the scene's actual entity count, so a
+ * world of any size renders fully (no silent first-N drop).  Sized to cover a
+ * typical full-load big world so the common case allocates once and never
+ * reallocs (a scene with <= this many entities behaves exactly as the old fixed
+ * array did).  Buffers are heap, reused across frames; the per-frame cost is the
+ * O(n) collect + cull, which the instanced passes keep cheap. */
 #define SR_MAX_ENTITIES        32768
 #define SR_MAT_CACHE_MAX       512
 #define SR_MAT_PROG_CACHE_MAX  64   /* per-path Shader Graph custom programs */
@@ -217,12 +233,30 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 #define JCE_MAX_LOCAL_SHADOWS  4
 #define JCE_LOCAL_SHADOW_TILES 2   /* 2x2 grid -> 4 tiles */
 #define JCE_VIEW_LOCAL_SHADOW_OFFSET 4 /* base+4..base+8, free for base 0/3/80 */
+/* Omnidirectional point shadows (parity #7) — OPT-IN via the point_cube_shadows
+ * gate; default OFF keeps the 2x2/4-tile layout byte-identical. When on, the same
+ * single 2D atlas (stage 15) subdivides 6x6 (36 tiles): up to JCE_POINT_SHADOW_MAX
+ * point lights get 6 contiguous cube-face tiles each (FOV=PI/2), the first 4 slots
+ * still serve spots/legacy. The 6 per-face tile views relocate to a FREE view band
+ * base+100.. (base+50/60/70 are EDITOR_OVERLAY/PREVIEW/PICK; 72..231 is free). */
+#define JCE_POINT_CUBE_FACES   6
+#define JCE_POINT_SHADOW_MAX    2   /* nearest shadow-casting point lights with cube */
+#define JCE_LOCAL_SHADOW_TILES_CUBE 6   /* 6x6 = 36 tiles when cube shadows on */
+#define JCE_VIEW_LOCAL_SHADOW_CUBE_OFFSET 100 /* base+100..+115 (free band 72..231) */
+#define JCE_POINT_CUBE_FOV     1.5708f  /* PI/2 per cube face */
 /* GPU particle COMPUTE view (simulate + emit dispatches; no draws).  base+9
  * is the last free slot below the shadow band; the view-order builder pushes
  * it ahead of base+0 so dispatches execute before the draw that consumes the
  * pool. One JceGpuParticleSystem per GPU-flagged emitter (size/color lerp
  * comes from global uniforms per update call, so a pool cannot be shared). */
 #define JCE_VIEW_GPU_PARTICLE_OFFSET 9
+/* GPU-driven cull counter-RESET compute view (roadmap #18 Direction C).  Uses
+ * the free pre-color slot base+3 (base+1=velocity, base+2=SSAO, base+3 free).
+ * MUST be ordered before the cull/compact view (base+9) so bgfx inserts a
+ * cross-view compute barrier between the counter reset and the compact atomics
+ * (D3D12 gets no same-view barrier because both keep the counter in UAV state).
+ * The view-order builder pushes it ahead of base+9 when the GPU-cull view is on. */
+#define JCE_VIEW_GPU_CULL_RESET_OFFSET 3
 #define SR_GPU_PARTICLE_MAX          64
 /* Point lights are omnidirectional; v1 approximates with a single wide-FOV
  * perspective frustum aimed straight down (good for elevated point lights,
@@ -291,6 +325,20 @@ typedef struct {
     bool            pending;  /* async decode in flight */
     JceThread      *thr;      /* decode worker */
     struct SrModelJob *job;   /* worker job (owns done flag + cpu result) */
+
+    /* VRAM ceiling (large-world-opt): refcount-by-frame-reachability eviction.
+     * `last_used_frame` is stamped with sr->model_frame every time any draw /
+     * cull / shadow / anim path resolves this path via sr_get_model — i.e. a
+     * per-frame reference count.  When a streamed chunk unloads, its entities
+     * are destroyed and stop resolving their model, so the slot goes untouched;
+     * after a grace window of frames with NO touch it is provably unreferenced
+     * by any LIVE entity and can be freed (jce_scene_renderer_evict_models).
+     * vram_bytes caches jce_model_gpu_bytes(model) at upload so the budget +
+     * LRU victim selection read real GPU bytes, not a flat estimate.  Both are
+     * meaningful ONLY in runtime mode (SR owns the model); in editor mode the
+     * asset-cache callback owns models and SR never frees them. */
+    uint64_t        last_used_frame;
+    uint64_t        vram_bytes;
 } SrModelCache;
 
 /* Per-ENTITY skeletal-animation instance. The model above is shared by path;
@@ -463,7 +511,45 @@ typedef struct {
 typedef struct {
     JceModel *model;
     jce_mat4  world;
+    /* In-asset auto-LOD level for this instance (large-world-opt P1 #6).  0 =
+     * base (LOD0).  The batch is sorted+run-split by (model, lod) so every copy
+     * in a run shares one index set and STILL collapses into a single instanced
+     * submit — distant batched meshes drop triangles without exploding the draw
+     * count.  Almost always 0 (the common case) => one run per model, identical
+     * to the pre-LOD batching. */
+    uint16_t  lod;
+    /* Per-instance baseColor tint (large-world-opt P1 #7).  RGBA, linear.  A
+     * MeshRenderer that authored only a non-white baseColor (no divergent
+     * texture/material) STAYS in the instanced batch carrying its colour here
+     * instead of being kicked to a solo draw — the tint is fed to i_data4 of
+     * vs_pbr_inst_tint and modulates albedo exactly like u_baseColorFactor on a
+     * solo draw.  [1,1,1,1] = no tint (the common case → the run uses the plain
+     * stride-64 vs_pbr_inst program, byte-identical to before). */
+    float     tint[4];
 } SrInstEntry;
+
+/* ── Octahedral impostor terminal LOD (roadmap P2 #10) ──────────────────
+ * Per-PATH atlas cache: a baked octahedral atlas (+ metadata) loaded once and
+ * shared by every entity whose LODGroup references the same .impostor.json.
+ * Keyed by the meta path; the texture is resolved via sr_resolve_texture so it
+ * rides the normal (editor callback / runtime PAK) texture cache. */
+#define SR_IMPOSTOR_CACHE_MAX 64
+typedef struct {
+    char             meta_path[256];
+    JceImpostorAtlas atlas;     /* atlas texture + metadata          */
+    bool             used;
+    bool             failed;    /* load attempted + failed; don't retry per frame */
+} SrImpostorCache;
+
+/* Per-frame per-atlas instance accumulator: far-cards sharing one atlas are
+ * collected during the entity walk and submitted as ONE instanced draw at
+ * flush (sr_impostor_flush), so a forest = a handful of draws. */
+typedef struct {
+    int                   cache_slot;  /* index into sr->impostor_cache         */
+    JceImpostorInstance  *insts;       /* grown on demand                        */
+    uint32_t              count;
+    uint32_t              cap;
+} SrImpostorBatch;
 
 /* Per-frame per-entity cull cache.  Built ONCE per frame (after the entity
  * collect, before the shadow pass) and reused by every cull site that would
@@ -483,7 +569,67 @@ typedef struct {
      * fall back to jce_scene_get_world_matrix; e.g. transform-less specials). */
     jce_mat4 world;
     bool     world_valid;
+    /* In-asset auto-LOD level for THIS entity this frame (large-world-opt P1 #6).
+     * 0 = base (LOD0); >=1 selects the (lod_level-1)'th reduced index set on the
+     * entity's own model.  Computed ONCE in the ecull build loop (camera-
+     * dependent, so recomputed every frame even on a wcache hit) so the color
+     * pass and the shadow caster loop read the SAME level — the cast silhouette
+     * always matches the rendered LOD.  lod_culled => the LODGroup's far cull
+     * fired (skip the entity entirely in both passes). */
+    uint8_t  lod_level;
+    bool     lod_culled;
+    /* LOD cross-fade (large-world #6): fraction [0,1] of the OUTGOING level
+     * (lod_level) to keep while transitioning to lod_level+1; 1.0 = steady (no
+     * transition, byte-identical). When <1 the draw dithers lod_level out and
+     * fills the holes with lod_level+1 drawn full underneath — a pop-free fade. */
+    float    lod_fade;
 } SrEntityCull;
+
+/* Cross-frame persistent world-matrix + AABB cache for STATIC entities
+ * (large-world-opt M1 #2).  Keyed by entity id (open-addressed linear probe);
+ * an entry survives across frames so a static building/road/tree/lamp keeps its
+ * composed world matrix + world AABB instead of recomposing the parent chain +
+ * re-transforming 8 corners every frame.  Validity is gated on the scene's
+ * structural epoch (bumped on any set_transform / reparent / component edit) AND
+ * a per-entity "static" predicate (no rigidbody / character / skeletal / vehicle
+ * / wheel / softbody in the entity or its ancestor chain — those are mutated
+ * in-place by the runtime physics sync without an epoch bump, so they are never
+ * cached here and always recomputed).  Entries untouched for a frame are pruned
+ * so the table can't grow without bound in a streaming world. */
+typedef struct {
+    uint32_t entity;          /* 0 = empty slot */
+    uint64_t structural_epoch;/* scene structural epoch this entry was valid for */
+    jce_mat4 world;
+    jce_vec3 wmin, wmax;
+    bool     world_valid;
+    bool     has_aabb;
+    bool     casts_shadow;
+    bool     used;
+    bool     touched;         /* set when hit/stored this frame; prune untouched */
+} SrWorldCacheEntry;
+
+/* Per-entity LOD hysteresis state (large-world-opt P1 #6).  Open-addressed
+ * table entry: `value` is (selected_level + 1), 0 == empty/no record.  See
+ * JceSceneRenderer::lod_state for the rationale (replaces a colliding fixed
+ * 1024-mask). */
+typedef struct SrLodStateEntry {
+    uint32_t entity;   /* 0 = empty slot */
+    uint8_t  value;    /* (level + 1); 0 = no record */
+    bool     touched;  /* referenced this frame; untouched entries are pruned */
+} SrLodStateEntry;
+
+/* Per-entity streaming-fade state (Direction B; dithered detail fade-in).
+ * Mirrors SrLodStateEntry's open-addressed-table pattern: records the renderer
+ * phase-clock time (sr->fade_time) at which the entity was FIRST seen in the
+ * color pass, so the dithered cross-fade can ramp fade = (now-first_seen)/dur.
+ * Pruned to the live touched set each render so it tracks the streamed set and
+ * a despawned-then-respawned cell re-fades.  Untouched until a draw records a
+ * first-seen time => zero overhead when nothing is streaming in. */
+typedef struct SrFadeStateEntry {
+    uint32_t entity;     /* 0 = empty slot */
+    float    first_seen; /* sr->fade_time when first drawn (seconds) */
+    bool     touched;    /* referenced this frame; untouched entries are pruned */
+} SrFadeStateEntry;
 
 struct JceSceneRenderer {
     JceRenderer            *renderer;
@@ -506,6 +652,19 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t   u_sky_perez;     /* vec4[4]: Y/x/y A..D + E pack */
     bgfx_uniform_handle_t   u_sky_zenith;    /* vec4: Yz,xz,yz,normalize     */
     bgfx_uniform_handle_t   u_sky_sun_dir;   /* vec4: sun dir (toward sun)   */
+    /* Stylized sky dome (fs_sky.sc mode 3). */
+    bgfx_uniform_handle_t   u_sky_dome_mid;     /* (mid.rgb, mid_pos)                    */
+    bgfx_uniform_handle_t   u_sky_dome_glow;    /* (glow.rgb, glow_falloff)              */
+    bgfx_uniform_handle_t   u_sky_dome_sun;     /* (sun_size, softness, halo_pow, halo_s)*/
+    bgfx_uniform_handle_t   u_sky_dome_sun_col; /* (sun_color.rgb, pad)                  */
+    /* Captured each frame from scene_rendering (renderer settings-capture). */
+    float                   dome_zenith[3];
+    float                   dome_mid[4];        /* rgb + mid_pos    */
+    float                   dome_horizon[3];
+    float                   dome_ground[3];
+    float                   dome_glow[4];       /* rgb + falloff    */
+    float                   dome_sun[4];        /* size,soft,hpow,hstr */
+    float                   dome_sun_col[3];
 
     /* Procedural meshes. */
     JceMesh                *cube_mesh;
@@ -642,6 +801,7 @@ struct JceSceneRenderer {
        genuinely skipped on SM3+ hardware. */
     bgfx_uniform_handle_t      u_shadow_quality;
     float                      shadow_filter_tier; /* cached per frame */
+    bool                       toon_allowed_frame; /* quality>=HIGH + valid pbr_toon */
     bool                       csm_valid;
     float                      csm_blend_ratio;
     float                      csm_normal_bias;
@@ -670,6 +830,8 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t      u_local_shadow_bias;   /* VEC4: per-slot depth bias (lane=slot) */
     bgfx_uniform_handle_t      u_spot_shadow_slot;    /* VEC4: lane i = slot for spot i (-1=none) */
     bgfx_uniform_handle_t      u_point_shadow_slot;   /* VEC4[2]: 8 point lanes (-1=none) */
+    bgfx_uniform_handle_t      u_point_cube_vp;       /* #7: MAT4[JCE_POINT_SHADOW_MAX*6] cube-face VPs */
+    bgfx_uniform_handle_t      u_point_cube_base_slot;/* #7: VEC4[4]: 16 point lanes -> face-0 slot (-1) */
     bool                       local_atlas_valid;
     /* Per-frame local-shadow state, filled by sr_draw_local_shadow_pass.
        Spot + point lights share ONE atlas slot pool (max JCE_MAX_LOCAL_SHADOWS). */
@@ -680,6 +842,14 @@ struct JceSceneRenderer {
     uint32_t                   frame_local_count;
     float                      frame_local_bias;
     bool                       frame_local_active;
+    /* #7 omnidirectional point shadows (opt-in). local_tiles = active atlas grid
+       (2 default, 6 when point_cube_shadows on). frame_point_cube_vp = 6 face VPs
+       per budgeted point light; frame_point_cube_base_slot[i] = face-0 atlas slot
+       for point light i (-1 = no cube shadow -> shader falls back to legacy slot). */
+    uint32_t                   local_tiles;
+    bool                       point_cube_shadows;
+    jce_mat4                   frame_point_cube_vp[JCE_POINT_SHADOW_MAX * JCE_POINT_CUBE_FACES];
+    float                      frame_point_cube_base_slot[JCE_MAX_POINT_LIGHTS];
 
     /* Distance/importance light selection (Unity-style): the most important
        point/spot lights for the current view. Both the light gather AND the
@@ -734,12 +904,38 @@ struct JceSceneRenderer {
      * MVP — per-entity LOD attachment lands when the ECS schema gains
      * a LodGroup component. */
     const JceLodGroup         *global_lod;
-    /* Hash-bucketed previous-level memory for hysteresis. Aliases on
-     * collision (harmless: at worst one frame of slightly-wrong level). */
-    int8_t                     lod_prev[1024];
+    /* Per-entity previous-LOD-level memory for hysteresis (large-world-opt
+     * P1 #6).  Open-addressed (linear-probe) table keyed by entity id, grown on
+     * demand — REPLACES the former fixed int8_t[1024] mask that aliased ~50×
+     * over at 53k entities (so distant buildings sharing a bucket thrashed each
+     * other's LOD level every frame).  Stored value is (level+1) so 0 means
+     * "no record" (first selection takes the nominal, hysteresis-free pick);
+     * a value of count+1 parks a culled entity at the last level for a clean
+     * return swing.  Pruned to the live set so it can't grow without bound. */
+    struct SrLodStateEntry    *lod_state;     /* {entity, value, touched} table */
+    uint32_t                   lod_state_cap;  /* power of two; 0 until first use */
+    uint32_t                   lod_state_count;
+    /* ── Streaming LOD cross-fade (Direction B; dithered detail fade-in) ──
+     * Parallel open-addressed table (same hashing/growth/prune as lod_state)
+     * recording the first-seen phase-clock time per entity, so a freshly
+     * streamed detail entity dithers in over JCE_SR_FADE_DURATION while the
+     * resident HLOD proxy stays up.  fade_time is a renderer-owned phase clock
+     * advanced by dt_sec (mirrors water_time/grass_time): 0 in still editor
+     * previews so the fade is dormant there.  u_lod_fade is the per-draw
+     * uniform; DEFAULT-set to inactive {1,0,0,0} each color pass so non-fading
+     * draws are byte-identical.  All inert until something streams in. */
+    struct SrFadeStateEntry   *fade_state;    /* {entity, first_seen, touched} */
+    uint32_t                   fade_state_cap; /* power of two; 0 until first use */
+    uint32_t                   fade_state_count;
+    float                      fade_time;      /* accumulated phase seconds */
+    bgfx_uniform_handle_t      u_lod_fade;     /* vec4 {fade, 0, 0, active} */
     uint32_t                   stat_lod_picks[JCE_LOD_MAX_LEVELS];
     uint32_t                   stat_lod_culled;
     bool                       stat_lod_enabled;
+    /* Octahedral impostor terminal-LOD stats (P2 #10), reset each scene render:
+     * how many far-cards were drawn and in how many instanced draws. */
+    uint32_t                   stat_impostor_cards;
+    uint32_t                   stat_impostor_draws;
 
     /* Terrain per-chunk draw stats (P1-terrain-lod), reset each scene render. */
     uint32_t                   stat_terrain_chunks_total;
@@ -772,6 +968,10 @@ struct JceSceneRenderer {
      * jce_renderer_set_forwardplus_program_active so the console toggles the
      * clustered path live.  NULL if registration failed. */
     JceCvar                  *cv_forwardplus;
+    /* r.point_shadows — OPT-IN omnidirectional point-light cube shadows (#7).
+     * Read each frame so the console toggles it live; OR'd with the
+     * JCE_POINT_CUBE_SHADOWS env for headless. NULL if registration failed. */
+    JceCvar                  *cv_point_shadows;
     /* True for the current frame when the clustered path is BOTH enabled AND
      * the fs_pbr_fwdplus variant program loaded — gates the per-submit
      * jce_forwardplus_bind in the material bind callbacks. */
@@ -800,6 +1000,9 @@ struct JceSceneRenderer {
     float                    skybox_exposure;
     float                    skybox_rotation;
     bool                     postfx_tonemap_active;
+    /* Stage-1a.5: track the last resolved LUT path to avoid per-frame
+     * texture loads (the 3D texture is re-resolved only on path change). */
+    char                     last_lut_path[256];
     /* ── Async IBL bake ───────────────────────────────────────────────
      * The irradiance+prefilter convolution runs on a worker thread so a
      * cache-miss does not freeze the main thread for several seconds. The
@@ -840,6 +1043,37 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t    u_sh9;       /* 9 vec4: SH9 RGB coeffs */
     bgfx_uniform_handle_t    u_gi_params; /* x=sh9 on, y=probe intensity */
 
+    /* ── Per-fragment aerial-perspective fog (Stage 1a.3) ──────────────
+     * Pure-ALU fog composited in the lit body / terrain shader (fog_apply.sh).
+     * Captured once per frame from the scene's existing fog_* settings + the
+     * sun direction, then uploaded in BOTH per-submit bind paths (always-set,
+     * mirroring u_iblParams) so every sorted draw — not just the first —
+     * receives it. NONE mode (fog_mode 0) => params.x=0 => shader no-op. */
+    bgfx_uniform_handle_t    u_fog_params;     /* vec4: x=mode,y=density,z=start,w=end */
+    bgfx_uniform_handle_t    u_fog_color;      /* vec4: xyz=horizon, w=strength        */
+    bgfx_uniform_handle_t    u_fog_color_sun;  /* vec4: xyz=warm,   w=height_falloff   */
+    struct {
+        float params[4];     /* mode, density, start, end */
+        float color[4];      /* horizon.rgb, strength      */
+        float color_sun[4];  /* warm.rgb, height_falloff   */
+    } fog_frame;
+
+    /* ── Look Profile GPU snapshot (stylized slice plan 02) ────────────
+     * Built once per frame in jce_scene_renderer_render from the scene's
+     * JceSceneRenderingSettings, gated by stylized_look.  When the gate is
+     * off or values are neutral, look_gpu is the algebraic-identity packing
+     * and the shaders no-op.  Uploaded by sr_bind_baked_gi (the single lit
+     * submit funnel) so all three driver paths inherit it for free. */
+    bgfx_uniform_handle_t    u_look_wrap;        /* {wrap, rimPow, rimInt, toonFlag} */
+    bgfx_uniform_handle_t    u_look_rim;         /* {rimColor.rgb, pad} */
+    bgfx_uniform_handle_t    u_look_hemi_ground; /* {groundColor.rgb, hemiEnabled} */
+    struct {
+        float wrap[4];   /* {wrap_factor, rim_power, rim_intensity, toon_flag} */
+        float rim[4];    /* {rim_color.rgb, 0} */
+        float hemi[4];   /* {ground_color.rgb, hemi_enabled} */
+    }                        look_gpu;
+    bool                     look_gpu_active;     /* gate latch for this frame */
+
     /* Sprite batch for 2D sprite entities. */
     JceSpriteBatch          *sprite_batch;
 
@@ -847,6 +1081,16 @@ struct JceSceneRenderer {
     SrModelCache             model_cache[SR_MODEL_CACHE_MAX];
     int                      model_inflight;   /* concurrent async model decodes */
     SrAnimInstance           anim_inst[SR_ANIM_INSTANCE_MAX];
+    /* VRAM ceiling (large-world-opt): monotonically-increasing frame counter
+     * bumped once per render; sr_get_model stamps the resolved slot's
+     * last_used_frame with this so eviction can tell a model not referenced
+     * for N frames from one in active use this frame.  model_evict_budget is
+     * the per-renderer model-VRAM ceiling in bytes (0 = no eviction); when the
+     * resident model VRAM exceeds it, jce_scene_renderer_evict_models frees the
+     * oldest unreferenced models (runtime mode only). */
+    uint64_t                 model_frame;
+    uint64_t                 model_evict_budget;
+    uint32_t                 model_evicted_count;  /* lifetime model evictions */
 
     /* Per-entity 2D sprite-animator playback state (sheet + player). Created
      * lazily when a SpriteAnimator entity is first ticked; rebuilt when its
@@ -917,6 +1161,11 @@ struct JceSceneRenderer {
         int8_t               *chunk_lod;     /* [chunk_count], -1 = unbuilt */
         jce_vec3             *chunk_min;      /* [chunk_count] local AABB min*/
         jce_vec3             *chunk_max;      /* [chunk_count] local AABB max*/
+        /* large-world #4: per-chunk splat GPU texture for a TILED terrain (the
+         * monolithic splat_tex above is invalid then).  Built lazily from the
+         * terrain's tile splat block when chunk_size == tile_dim (chunk i ↔ tile
+         * i).  idx==UINT16_MAX until built. */
+        bgfx_texture_handle_t *chunk_splat_tex; /* [chunk_count] or NULL    */
     } terrain_cache[16];
 
     /* Vegetation scatter cache (P0 foliage): per-entity deterministic scatter
@@ -931,10 +1180,13 @@ struct JceSceneRenderer {
         JceFoliageInstance *insts;
         uint32_t            inst_count;
         uint32_t            inst_cap;
+        jce_mat4           *roots;          /* per-instance world matrices (built */
+        uint32_t            roots_cap;      /* at rebuild) for one instanced submit */
     } foliage_cache[16];
 
     /* Terrain shader uniforms (created lazily on first terrain submit). */
     bgfx_uniform_handle_t u_terrain_params;
+    bgfx_uniform_handle_t u_terrain_tile_uv;  /* large-world #4: per-tile splat UV remap */
     bgfx_uniform_handle_t s_terrain_splat;
     bgfx_uniform_handle_t s_terrain_layer0;
     bgfx_uniform_handle_t s_terrain_layer1;
@@ -982,6 +1234,41 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t u_water_shading;    /* x=transparency y=sun_specular    */
     bgfx_uniform_handle_t u_water_mode;       /* x=0 Gerstner / 1 FFT, y=patch_size */
     bgfx_uniform_handle_t s_water_disp;       /* FFT displacement texture (VS fetch) */
+    /* ── Toon character (stylized-slice §5.6) ──────────────────────────
+     * Four uniforms + two per-frame scratch arrays for the pre-submit cb.
+     * All created eagerly in jce_scene_renderer_create; destroyed in destroy. */
+    bgfx_uniform_handle_t u_toon_params;     /* vec4 bands,thresh,rim_power,rim_int */
+    bgfx_uniform_handle_t u_toon_rim_color;  /* vec4 rgb,pad                        */
+    bgfx_uniform_handle_t u_outline_params;  /* vec4 width,_,_,_                    */
+    bgfx_uniform_handle_t u_outline_color;   /* vec4 rgb,1                          */
+    /* Per-frame scratch: stashed by the skinned-draw site, read by the
+     * pre-submit cb (sr_model_toon_presubmit_cb) for EVERY primitive submit. */
+    float                 toon_params_frame[4];     /* bands,thresh,rim_pow,rim_int  */
+    float                 toon_rim_color_frame[4];  /* rgb,pad                       */
+
+    /* ── Grass Field (GPU-instanced procedural blades + wind, Stage 1b.6) ──
+     * Dedicated module (NOT the 4096-cap foliage loop, NOT fs_pbr_body).  One
+     * SHARED blade mesh (grass_blade) is instanced once per field via the
+     * stride-80 tinted instance layout; placement reuses jce_foliage_scatter
+     * cached per entity.  Program + uniforms load lazily on first grass submit.
+     * grass_time is a per-renderer phase clock advanced each render. */
+    struct {
+        bool                used;
+        JceEntity           entity;
+        uint32_t            param_hash;     /* scatter-shaping fields */
+        JceFoliageInstance *insts;
+        uint32_t            inst_count;
+        uint32_t            inst_cap;
+    } grass_cache[16];
+    JceMesh              *grass_blade;       /* shared procedural blade mesh */
+    bgfx_program_handle_t prog_grass;
+    bool                  grass_prog_tried;  /* load attempted (success or not) */
+    float                 grass_time;        /* accumulated phase seconds */
+    bgfx_uniform_handle_t u_grass_time;      /* x=time */
+    bgfx_uniform_handle_t u_grass_wind;      /* xy=dir, z=speed, w=amplitude */
+    bgfx_uniform_handle_t u_grass_color;     /* root.rgb (vec4[0]) + tip.rgb (vec4[1]) */
+    bgfx_uniform_handle_t u_grass_fade;      /* x=fade_start, y=fade_end, z=hue_jitter */
+    bool                  grass_enabled;     /* project gate: JceRenderSettings.grass_enabled */
 
     /* Tilemap cache (path -> JceTilemapAsset + tileset + chunked static VBs).
      * Mirrors terrain_cache: loaded lazily on first draw, PAK-first, failed
@@ -1025,11 +1312,81 @@ struct JceSceneRenderer {
      * composites over the solid scene in correct depth order. */
     JceRenderQueue   *transparent_queue;
 
-    /* Per-frame per-entity cull cache (see SrEntityCull).  Heap-allocated once
-     * (SR_MAX_ENTITIES entries) in create; rebuilt every frame (the scene is
-     * editable so entities can move) in one O(n) pass that replaces ~6× redundant
-     * per-entity world-AABB + model recomputes across the shadow/prepass cull sites. */
+    /* Per-frame per-entity cull cache (see SrEntityCull).  Heap-allocated in
+     * create (SR_MAX_ENTITIES entries initially) and rebuilt every frame (the
+     * scene is editable so entities can move) in one O(n) pass that replaces ~6×
+     * redundant per-entity world-AABB + model recomputes across the shadow/
+     * prepass cull sites.  GROWN on demand (large-world capacity) so it always
+     * has >= list.count entries — every ecull[i] access is bounded by list.count,
+     * so growing to list.count keeps all the cull sites in range. */
     SrEntityCull     *ecull;
+    uint32_t          ecull_cap;     /* allocated SrEntityCull entries */
+
+    /* Per-frame frustum-visibility scratch (one bool per collected entity).
+     * Heap-grown to list.count so a large world does not put a 100KB+ array on
+     * the stack (was `bool visible_buf[SR_MAX_ENTITIES]` — a stack overflow risk
+     * once the cap is removed).  Grown lazily in the draw; freed on destroy. */
+    bool             *visible_buf;
+    uint32_t          visible_buf_cap;
+
+    /* Cross-frame persistent static world-matrix + AABB cache (see
+     * SrWorldCacheEntry).  Open-addressed table keyed by entity id; grown on
+     * demand.  Lets the ecull build loop skip recomposing a static entity's
+     * world matrix + re-transforming its AABB when the scene's structural epoch
+     * is unchanged.  NULL until first use; sized a power of two. */
+    SrWorldCacheEntry *wcache;
+    uint32_t           wcache_cap;     /* power of two; 0 until first alloc */
+    uint32_t           wcache_count;   /* occupied (used) slots */
+    uint64_t           wcache_epoch;   /* scene structural epoch the table was built against */
+
+    /* ── Persistent focus-cull world-AABB cache (off-centre ground fix) ───────
+     * The focus-bounded entity COLLECT runs before the per-frame ecull build, so
+     * it has no AABB to test the focus disc against on the entity it is deciding.
+     * This open-addressed table (keyed by entity id, mirrors wcache) caches every
+     * collected entity's world AABB at the END of the ecull build, so the NEXT
+     * frame's collect can keep an entity whose world AABB OVERLAPS the focus
+     * region instead of culling by transform-ORIGIN distance.  Unlike wcache it is
+     * NOT gated on the static predicate — a world-spanning STATIC-but-rigidbody
+     * terrain (treated as "dynamic" by the wcache's conservative predicate) is the
+     * exact entity that must survive an off-centre focus.  Entries untouched for a
+     * frame are pruned so the table tracks the active streamed set. */
+    struct SrFocusAabbEntry {
+        uint32_t entity;          /* 0 = empty slot */
+        jce_vec3 wmin, wmax;
+        bool     used;
+        bool     touched;         /* set when stored this frame; prune untouched */
+    }                 *focus_aabb;
+    uint32_t           focus_aabb_cap;     /* power of two; 0 until first alloc */
+    uint32_t           focus_aabb_count;   /* occupied (used) slots */
+
+        /* ── Persistent cull broad-phase (large-world-opt P1 #4) ──────────────
+     * The cull grid (cull_space) is now PERSISTENT across frames: an entity is
+     * inserted ONCE and kept, jce_space_update re-buckets only the entities
+     * whose world AABB changed this frame (static city = ~0/frame), and despawned
+     * entities are removed.  This map keys a stable per-entity space handle by
+     * entity id (open-addressed linear probe, mirrors wcache), plus the AABB the
+     * object was last (re)bucketed with (to skip no-op updates) and a per-cull
+     * "seen" generation so entities absent this frame are removed.  Rebuilt from
+     * scratch (all handles dropped + reinserted) only when the grid's world
+     * bounds/resolution must change — rare once the streamed set is stable. */
+    struct SrCullSpaceEntry {
+        uint32_t entity;     /* 0 = empty slot */
+        uint32_t handle;     /* jce_space handle (1-based; 0 = none) */
+        jce_vec3 last_min, last_max;  /* AABB last (re)bucketed with */
+        uint32_t seen_gen;   /* cull generation this entity was last seen */
+        bool     used;
+    }                 *cull_map;
+    uint32_t           cull_map_cap;     /* power of two; 0 until first alloc */
+    uint32_t           cull_map_count;   /* occupied (used) slots */
+    uint32_t           cull_gen;         /* bumped each sr_compute_visible call */
+    JceAABB            cull_space_world;  /* bounds the persistent grid was built for */
+    bool               cull_space_built;  /* false => (re)insert everything */
+    uint32_t           stat_cull_updated; /* entities re-bucketed this frame */
+    uint32_t           stat_cull_inserted;/* entities inserted this frame */
+    uint32_t           stat_cull_removed; /* entities removed this frame */
+    /* Heap hit buffer for the frustum query result (was a 128 KB stack array). */
+    uint32_t          *cull_hit_buf;
+    uint32_t           cull_hit_cap;
 
     /* Color-pass GPU-instancing batch (see SrInstEntry).  Grown on demand;
      * reset at the start of each color entity walk, flushed at its end. */
@@ -1038,6 +1395,12 @@ struct JceSceneRenderer {
     uint32_t          inst_batch_cap;
     jce_mat4         *inst_gather;       /* contiguous per-model matrices for the instanced submit */
     uint32_t          inst_gather_cap;
+    /* Parallel per-instance tint scratch for a tinted run (large-world-opt P1
+     * #7): grown in lockstep with inst_gather, filled only for runs that carry
+     * a non-white baseColor tint, and passed to jce_model_draw_instanced_tinted
+     * as the i_data4 stream.  NULL/zero until the first tinted run. */
+    jce_vec4         *inst_tint_gather;
+    uint32_t          inst_tint_gather_cap;
 
     /* ── GPU-driven rendering (roadmap #18, Phase 0+1) ─────────────────
      * gpu_scene owns the persistent GPUScene buffer + compute cull program.
@@ -1051,16 +1414,21 @@ struct JceSceneRenderer {
     bool              gpu_driven_frame;
     JceGpuSceneRecord *gpu_rec;
     uint32_t          gpu_rec_cap;
-    uint16_t          gpu_cull_view;     /* compute view for the cull dispatch */
+    uint16_t          gpu_cull_view;     /* compute view for the cull/compact + build-indirect dispatches */
+    uint16_t          gpu_reset_view;    /* SEPARATE earlier compute view for the counter-reset pass
+                                          * (D3D12 cross-view barrier so reset's zero precedes compact's atomics) */
     jce_vec4          gpu_frame_planes[6]; /* color-pass frustum planes (this frame) */
     bool              gpu_frame_planes_valid;
     uint32_t          gpu_scene_frame;       /* bgfx frame idx that claimed the GPU path */
     bool              gpu_scene_frame_valid;
     /* Per-flush GPU-driven run draw list: each eligible model-run's model, the
      * GPU visible-buffer partition base, the inst_batch source index (for the
-     * CPU fallback if the dispatch fails), and the instance count.  Filled in
-     * pass 1 (record build + cull batch), drawn in pass 2 after one dispatch. */
-    struct { JceModel *model; uint32_t base; uint32_t src; uint32_t count; } *gpu_draw;
+     * CPU fallback if the dispatch fails), the instance count, and the indirect
+     * element index (UINT32_MAX when the 1:1 fixed-count fallback is in use).
+     * Filled in pass 1 (record build + cull batch), drawn in pass 2 after one
+     * dispatch. */
+    struct { JceModel *model; uint32_t base; uint32_t src; uint32_t count;
+             uint32_t indirect_el; } *gpu_draw;
     uint32_t          gpu_draw_count;
     uint32_t          gpu_draw_cap;
     /* Shadow-pass GPU-instancing batch (separate from the color batch: the
@@ -1071,6 +1439,42 @@ struct JceSceneRenderer {
     uint32_t          sh_batch_count;
     uint32_t          sh_batch_cap;
     uint16_t          sh_batch_view;     /* shadow view the pending batch targets */
+
+    /* ── GPU-driven CSM shadow cascades (roadmap #18, shadow extension) ──
+     * One DEDICATED GPUScene instance per cascade.  The color pass dispatches
+     * its cull ONCE against the camera frustum into the color gpu_scene; each
+     * CSM cascade needs a SEPARATE cull against its own light frustum, and bgfx
+     * defers all submits to frame() — so reusing ONE set of cull buffers across
+     * cascades would let a later cascade's compute overwrite the visible/indirect
+     * args an earlier cascade's already-queued submit_indirect reads at frame()
+     * (aliased/garbage shadows).  Giving each cascade its OWN GPUScene = its own
+     * visible/counter/indirect buffers means no buffer is overwritten before its
+     * draw is consumed.  All instances SHARE the color pass's compute views —
+     * base+3 (reset) and base+9 (cull/compact/build) — which is safe because they
+     * write disjoint buffers and the view-order builder orders base+3 < base+9 <
+     * color(base+0) < cascade draws(base+11+c): the cross-view barrier makes all
+     * resets precede all compacts, and each cascade's compute (base+9) precedes
+     * its draw (base+11+c).  Lazily created with the color gpu_scene. */
+    JceGpuScene      *gpu_shadow_scene[JCE_CSM_MAX_CASCADES];
+    jce_vec4          gpu_shadow_planes[JCE_CSM_MAX_CASCADES][6];
+    bool              gpu_shadow_planes_valid;  /* per-frame: cascade planes set */
+    uint16_t          gpu_shadow_view0;         /* first cascade view (base+11)  */
+    uint32_t          gpu_shadow_cascades;      /* valid cascades this frame      */
+    /* Per-shadow-flush GPU run draw list (mirrors gpu_draw shape; shadow flushes
+     * complete before the color flush, so the two never overlap). */
+    struct { JceModel *model; uint32_t base; uint32_t src; uint32_t count;
+             uint32_t indirect_el; } *gpu_sh_draw;
+    uint32_t          gpu_sh_draw_count;
+    uint32_t          gpu_sh_draw_cap;
+
+    /* Octahedral impostor terminal LOD (P2 #10).  Per-path atlas cache + the
+     * per-frame per-atlas card accumulators (collected during the color entity
+     * walk, flushed as one instanced draw each in sr_impostor_flush). */
+    SrImpostorCache   impostor_cache[SR_IMPOSTOR_CACHE_MAX];
+    int               impostor_cache_count;
+    SrImpostorBatch   impostor_batch[SR_IMPOSTOR_CACHE_MAX];
+    int               impostor_batch_count;
+
     SrMaterialEntry   mat_cache[SR_MAT_CACHE_MAX];
     uint32_t          mat_count;
     /* 1-entry memo for sr_bind_material_cb's linear mat_cache search. The
@@ -1146,11 +1550,27 @@ struct JceSceneRenderer {
 
 /* The per-frame entity list collected from the scene.  Defined here (instead of
  * privately in jce_scene_renderer.c) so the extracted jce_sr_*.c modules can
- * receive it across the module boundary with one shared definition. */
+ * receive it across the module boundary with one shared definition.
+ *
+ * Large-world capacity (Direction C): `entities` is a HEAP buffer that grows on
+ * demand to the scene's entity count, so worlds of any size render fully (no
+ * arbitrary SR_MAX_ENTITIES cap that silently drops entities beyond it).
+ * SR_MAX_ENTITIES is the INITIAL capacity — a scene with <= that many entities
+ * never reallocs, so the common case is byte-identical to the fixed-array path.
+ * Indexing is by [i] exactly as before (pointer vs array is transparent). */
 typedef struct {
-    JceEntity entities[SR_MAX_ENTITIES];
-    int       count;
+    JceEntity *entities;   /* heap; NULL until first sr_entity_list_reserve */
+    int        count;
+    int        cap;        /* allocated capacity (>= count) */
 } EntityList;
+
+/* Ensure `list->entities` has room for at least `need` elements, growing (2×,
+ * floor SR_MAX_ENTITIES) on demand.  Returns true on success; on allocation
+ * failure leaves the existing buffer/cap intact and returns false (the caller
+ * then drops the overflow element gracefully).  Grow-BEFORE-write: callers must
+ * call this before writing list->entities[count].  Defined in
+ * jce_scene_renderer.c. */
+bool sr_entity_list_reserve(EntityList *list, int need);
 
 /* ── Shared internal renderer helpers (cross-module) ──────────────────
  * Helpers that were file-static in the monolithic jce_scene_renderer.c but are
@@ -1186,7 +1606,7 @@ bool      sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
 
 /* Particles (own: jce_sr_particles.c). */
 void      sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
-                            uint16_t view_id);
+                            const JceCamera *camera, uint16_t view_id);
 void      sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
                                  uint16_t view_id_base, float dt_sec);
 
@@ -1203,9 +1623,24 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
  * cloth, async IBL bake + skybox scan, time-of-day / weather / decals. */
 void  sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
                       EntityList *list, JceEntity e, uint16_t view_id);
+void  sr_draw_line_renderer(JceSceneRenderer *sr, JceScene *scene,
+                            EntityList *list, JceEntity e,
+                            const JceCamera *camera, uint16_t view_id);
+void  sr_draw_trail_renderer(JceSceneRenderer *sr, JceScene *scene,
+                             EntityList *list, JceEntity e,
+                             const JceCamera *camera, uint16_t view_id);
 void  sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
                     EntityList *list, JceEntity e, uint16_t view_id);
 void  sr_water_slot_free(JceSceneRenderer *sr, int slot);
+/* Grass Field (own: jce_sr_environment.c): blade-mesh builder (also used by
+ * the unit test), lazy program/uniform lifecycle, per-field scatter cache. */
+/* Pure-CPU fill (no bgfx) — testable headlessly; called by sr_grass_build_blade. */
+uint32_t sr_grass_fill_blade(float blade_height, float blade_width, int cards,
+                             JceMeshVertex *v, uint32_t *idx);
+JceMesh *sr_grass_build_blade(float blade_height, float blade_width, int cards);
+void  sr_grass_slot_free(JceSceneRenderer *sr, int slot);
+void  sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
+                    EntityList *list, JceEntity e, uint16_t view_id);
 int   sr_tilemap_find_or_load_slot(JceSceneRenderer *sr,
                                    const JceTilemapComponent *tmc);
 void  sr_tilemap_free_slot(JceSceneRenderer *sr, int i);
@@ -1235,7 +1670,8 @@ uint16_t  sr_morph_vb_cb(void *user, uint32_t node, uint32_t prim);
 void      sr_update_sprite_anims(JceSceneRenderer *sr, JceScene *scene,
                                  EntityList *list, float dt_sec);
 void      sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
-                                  EntityList *list, float dt_sec);
+                                  EntityList *list, float dt_sec,
+                                  const JceCamera *camera);
 
 /* Cross-module helpers shared with the shadow / draw / cull modules
  * (own: core jce_scene_renderer.c, except where noted). */
@@ -1250,9 +1686,11 @@ bool  sr_resolve_primary_dir_light(JceSceneRenderer *sr, JceScene *scene,
                                    EntityList *list, bool shadow_only,
                                    jce_vec3 *out_to_light, jce_vec3 *out_color,
                                    float *out_intensity);
-/* Shadow-pass GPU-instancing batch (own: core/draw instancing). */
+/* Shadow-pass GPU-instancing batch (own: core/draw instancing).  `lod` is the
+ * in-asset auto-LOD level for the caster (0 = base); the batch is keyed by
+ * (model, lod) so LOD'd casters still instance (P1 #6). */
 bool  sr_sh_batch_add(JceSceneRenderer *sr, JceModel *model,
-                      const jce_mat4 *world);
+                      const jce_mat4 *world, uint16_t lod);
 void  sr_sh_flush(JceSceneRenderer *sr, uint16_t view_id);
 /* Shadow-submit helpers (own: core; route skinned / model casters). */
 bool  sr_try_submit_skinned_shadow(JceSceneRenderer *sr, JceScene *scene,
@@ -1331,5 +1769,21 @@ void  sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                        const JceCamera *camera, EntityList *list,
                        uint16_t view_id, float dt_sec,
                        const JceSceneRenderConfig *cfg);
+
+/* In-asset auto-LOD (large-world-opt P1 #6): compute + cache one entity's LOD
+ * level for the frame into ecull[cull_idx] (camera-dependent; called from the
+ * ecull build loop before both passes), and prune the per-entity LOD state to
+ * the live set once per render. */
+void  sr_compute_entity_lod(JceSceneRenderer *sr, JceScene *scene,
+                            const JceCamera *camera, JceEntity e, int cull_idx);
+void  sr_lod_state_prune(JceSceneRenderer *sr);
+
+/* Streaming LOD cross-fade (Direction B): record/return an entity's normalized
+ * fade-in factor [0,1] (1 = fully present) keyed off its first-seen time in the
+ * color pass, and prune the per-entity fade state to the live set each render.
+ * Returns 1.0 (no fade) whenever the phase clock is not advancing (dt<=0 still
+ * editor preview) so static previews are byte-identical. */
+float sr_fade_factor_for_entity(JceSceneRenderer *sr, uint32_t entity);
+void  sr_fade_state_prune(JceSceneRenderer *sr);
 
 #endif /* JCE_SR_INTERNAL_H */

@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/resource/jce_streaming.h>   /* JceStreamPreviewMode */
 
 /* ── Edit Mode ─────────────────────────────────────────────────────── */
 
@@ -57,6 +58,12 @@ typedef enum {
     JCE_VIEW_WIREFRAME,
     JCE_VIEW_TEXTURED,
     JCE_VIEW_WIREFRAME_TEXTURED,
+    /* Debug channel views (values mirror JceSceneViewModeKind, passed through
+     * to cfg->view_mode → fs_pbr's debug-channel branch). */
+    JCE_VIEW_NORMALS,
+    JCE_VIEW_ROUGHNESS,
+    JCE_VIEW_METALLIC,
+    JCE_VIEW_AO,
 } JceSceneViewMode;
 
 /* ── Play State ────────────────────────────────────────────────────── */
@@ -125,6 +132,39 @@ void              jce_state_prune_dead(void);                   /* drop runtime-
  * call this on their streamer after creating it. */
 struct JceWorldStreamer;
 void              jce_state_attach_streamer_hierarchy(struct JceWorldStreamer *ws);
+/* The editor-hierarchy mirror logic behind the streamer spawn/despawn callbacks,
+ * exposed so editor Play can install a combined callback that mirrors into the
+ * hierarchy AND wires the same ids into the live Play runtime gameplay (the
+ * attach helper above installs ONLY the mirror).  Spawn appends ids to
+ * g_entity_order; despawn removes them + clears selection. */
+void              jce_state_streamer_mirror_spawn(const uint64_t *ids, uint32_t count);
+void              jce_state_streamer_mirror_despawn(const uint64_t *ids, uint32_t count);
+/* Maintain the chunk->entities group map as chunks (un)load (called from the
+ * streamer chunk-state callback): loaded==true claims the just-staged spawn
+ * ids for this chunk; loaded==false forgets the chunk's group. */
+void              jce_state_streamer_chunk_state(uint32_t chunk_id, bool loaded);
+
+/* ── Streaming preview (Full-World / Filter) — session-local SSOT ──────
+ * Shared by the World Streaming panel and the Hierarchy panel.  The preview
+ * MODE selects which chunks the live preview streamer keeps resident:
+ *   RADIUS — distance ring around the orbit target (default; current).
+ *   ALL    — every authored chunk (Full-World preview; nothing pops out).
+ *   FILTER — only chunks in the filter set (debug a subset).
+ * jce_state_streaming_apply_preview() pushes mode+filter into the live
+ * streamer; the setters call it for you.  All session-local (not serialized). */
+JceStreamPreviewMode jce_state_streaming_get_preview_mode(void);
+void                 jce_state_streaming_set_preview_mode(JceStreamPreviewMode mode);
+bool                 jce_state_streaming_filter_contains(uint32_t chunk_id);
+void                 jce_state_streaming_filter_set(uint32_t chunk_id, bool on);
+void                 jce_state_streaming_filter_clear(void);
+void                 jce_state_streaming_filter_set_all(const uint32_t *ids, uint32_t count);
+uint32_t             jce_state_streaming_filter_count(void);
+void                 jce_state_streaming_apply_preview(void);
+/* Chunk-group queries for the hierarchy chunk view. */
+uint32_t             jce_state_streaming_group_chunk_ids(uint32_t *out, uint32_t max);
+uint32_t             jce_state_streaming_group_count(void);
+const uint32_t      *jce_state_streaming_chunk_entities(uint32_t chunk_id,
+                                                        uint32_t *out_count);
 /* Install the HLOD far-skyline coordination: map each streaming chunk to its
  * always-resident HLOD_<gx>_<gz> proxy (baked by build/gen_hlod.py) and hide
  * the proxy while the chunk is resident / show it when it unloads.  No-op when
@@ -203,6 +243,9 @@ float jce_state_get_gizmo_snap_scale(void);
 void  jce_state_set_gizmo_snap_translate(float v);
 void  jce_state_set_gizmo_snap_rotate(float v);
 void  jce_state_set_gizmo_snap_scale(float v);
+/* Persistent snap toggle: when true, gizmo drags snap without holding Ctrl. */
+bool  jce_state_get_gizmo_snap_enabled(void);
+void  jce_state_set_gizmo_snap_enabled(bool v);
 
 /* Scene view */
 void              jce_state_set_view_mode(JceSceneViewMode mode);
@@ -423,6 +466,12 @@ const uint32_t *jce_state_clipboard_source_ids(int *out_count);
  * is cleared. */
 int      jce_state_paste_entities(uint32_t parent_id,
                                   uint32_t *out_ids, int max_out);
+
+/* Paste As Instance: prefab-sourced clipboard entries become fresh LINKED
+ * prefab instances; non-prefab entries paste as normal copies. Never consumes
+ * a cut clipboard. */
+int      jce_state_paste_entities_as_instance(uint32_t parent_id,
+                                              uint32_t *out_ids, int max_out);
 
 /* Engine scene backing store. */
 void       jce_state_set_scene(JceScene *scene);

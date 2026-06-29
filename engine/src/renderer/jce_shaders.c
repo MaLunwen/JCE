@@ -257,6 +257,9 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     set.pbr            = shader_load_program(pak, "pbr");
     /* Instanced PBR variant: vs_pbr_inst + fs_pbr (fragment unchanged). */
     set.pbr_inst       = load_program_named(pak, "pbr_inst",       "pbr");
+    /* Per-instance-tint instanced variant (large-world-opt P1 #7):
+       vs_pbr_inst_tint + fs_pbr_tint.  Optional; absent in older paks. */
+    set.pbr_inst_tint  = load_program_named(pak, "pbr_inst_tint",  "pbr_tint");
     /* Skinned variants share the fragment shader with their non-skinned
        counterpart: vs_pbr_skinned + fs_pbr, vs_shadow_skinned + fs_shadow. */
     set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
@@ -267,6 +270,10 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     set.pbr_fwdplus         = load_program_named(pak, "pbr",         "pbr_fwdplus");
     set.pbr_inst_fwdplus    = load_program_named(pak, "pbr_inst",    "pbr_fwdplus");
     set.pbr_skinned_fwdplus = load_program_named(pak, "pbr_skinned", "pbr_fwdplus");
+    /* Toon character (stylized-slice §5.6): vs_pbr_skinned + fs_pbr_toon. */
+    set.pbr_toon       = load_program_named(pak, "pbr_skinned", "pbr_toon");
+    /* Inverted-hull skinned outline: vs_pbr_skinned_outline + fs_outline. */
+    set.outline_skinned = load_program_named(pak, "pbr_skinned_outline", "outline");
     set.shadow         = shader_load_program(pak, "shadow");
     /* Instanced shadow variant: vs_shadow_inst + fs_shadow (fragment unchanged). */
     set.shadow_inst    = load_program_named(pak, "shadow_inst",    "shadow");
@@ -285,10 +292,16 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'pbr' shader unavailable");
     if (!jce_shader_valid(set.pbr_inst))
         LOG_WARN(LOG_TAG, "'pbr_inst' shader unavailable (GPU instancing disabled)");
+    if (!jce_shader_valid(set.pbr_inst_tint))
+        LOG_WARN(LOG_TAG, "'pbr_inst_tint' shader unavailable (per-instance tint batching disabled)");
     if (!jce_shader_valid(set.pbr_skinned))
         LOG_WARN(LOG_TAG, "'pbr_skinned' shader unavailable");
     if (!jce_shader_valid(set.pbr_fwdplus))
         LOG_WARN(LOG_TAG, "'pbr_fwdplus' shader unavailable (Forward+ disabled)");
+    if (!jce_shader_valid(set.pbr_toon))
+        LOG_WARN(LOG_TAG, "'pbr_toon' shader unavailable (toon character disabled)");
+    if (!jce_shader_valid(set.outline_skinned))
+        LOG_WARN(LOG_TAG, "'outline_skinned' shader unavailable (character outline disabled)");
     if (!jce_shader_valid(set.shadow))
         LOG_WARN(LOG_TAG, "'shadow' shader unavailable");
     if (!jce_shader_valid(set.shadow_inst))
@@ -331,10 +344,13 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
     set.mesh           = load_overlay(dev_dir, pak, "mesh",           "mesh");
     set.pbr            = load_overlay(dev_dir, pak, "pbr",            "pbr");
     set.pbr_inst       = load_overlay(dev_dir, pak, "pbr_inst",       "pbr");
+    set.pbr_inst_tint  = load_overlay(dev_dir, pak, "pbr_inst_tint",  "pbr_tint");
     set.pbr_skinned    = load_overlay(dev_dir, pak, "pbr_skinned",    "pbr");
     set.pbr_fwdplus         = load_overlay(dev_dir, pak, "pbr",         "pbr_fwdplus");
     set.pbr_inst_fwdplus    = load_overlay(dev_dir, pak, "pbr_inst",    "pbr_fwdplus");
     set.pbr_skinned_fwdplus = load_overlay(dev_dir, pak, "pbr_skinned", "pbr_fwdplus");
+    set.pbr_toon        = load_overlay(dev_dir, pak, "pbr_skinned",         "pbr_toon");
+    set.outline_skinned = load_overlay(dev_dir, pak, "pbr_skinned_outline", "outline");
     set.shadow         = load_overlay(dev_dir, pak, "shadow",         "shadow");
     set.shadow_inst    = load_overlay(dev_dir, pak, "shadow_inst",    "shadow");
     set.shadow_skinned = load_overlay(dev_dir, pak, "shadow_skinned", "shadow");

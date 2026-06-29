@@ -35,3 +35,26 @@ bool JCE_CALL jce_library_has_symbol(const char *name, const char *symbol)
     SDL_UnloadObject(h);
     return fn != NULL;
 }
+
+JceLibrary JCE_CALL jce_library_open(const char *name)
+{
+    if (!name || !name[0])
+        return NULL;
+    return (JceLibrary)SDL_LoadObject(name);
+}
+
+void *JCE_CALL jce_library_symbol(JceLibrary lib, const char *symbol)
+{
+    if (!lib || !symbol || !symbol[0])
+        return NULL;
+    /* SDL_FunctionPointer -> void*: a function/object pointer round-trip the
+     * host loader (dlsym / GetProcAddress) guarantees in practice; callers cast
+     * back to the concrete function-pointer type. */
+    return (void *)SDL_LoadFunction((SDL_SharedObject *)lib, symbol);
+}
+
+void JCE_CALL jce_library_close(JceLibrary lib)
+{
+    if (lib)
+        SDL_UnloadObject((SDL_SharedObject *)lib);
+}

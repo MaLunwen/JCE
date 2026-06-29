@@ -44,6 +44,15 @@ typedef struct {
     float    max_slope_deg; /* skip terrain steeper than this; >=90 disables */
     float    scale_min;     /* per-instance uniform scale range (min<=max)   */
     float    scale_max;
+
+    /* Optional density mask (large-world #8a foliage brush): a mask_dim×mask_dim
+     * row-major grid of [0,1] values over the area rect (origin±area/2 mapped to
+     * [0,1]²).  Each candidate is kept with probability = its mask cell value, so
+     * brush-painted sparse regions thin out and dense regions stay full.  NULL /
+     * mask_dim<=0 means uniform full density (byte-identical to the maskless
+     * scatter — no extra RNG draw). */
+    const float *density_mask;
+    int          mask_dim;
 } JceFoliageScatterParams;
 
 /* Upper bound on instances produced by one scatter call (≈4 MB of mat4). */

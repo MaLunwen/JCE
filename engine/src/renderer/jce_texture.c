@@ -13,6 +13,7 @@
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_filesystem.h> /* jce_fs_host_read_all (LUT host loader) */
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
@@ -54,6 +55,21 @@ static bool     s_registry_warned_full;
 /* Global mip bias state — driven by streaming pressure or tools. */
 static int8_t   s_global_mip_bias;
 static bool     s_global_mip_bias_set;
+
+/* VRAM ceiling (large-world-opt): when set, NEW raw-RGBA8 texture uploads
+ * (the streamed-texture path: PAK PNG/JPG → SDL_Surface, and cooked RGBA8)
+ * retain a CPU mip-0 copy AND opt into streaming_tracked, so the existing
+ * streaming-pressure → global-mip-bias hook can PHYSICALLY drop their top mips
+ * under memory pressure (without a retained source the demote is a truthful
+ * no-op — audit F29).  Off by default so editor/UI/one-off textures pay zero
+ * extra RAM; the runtime renderer arms it around streamed uploads.  Process-
+ * wide + render-thread-set (uploads happen on the render thread). */
+static bool     s_streaming_uploads;
+
+void jce_texture_set_streaming_uploads(bool on)
+{
+    s_streaming_uploads = on;
+}
 
 /* Compute mip-tail floor: highest top_mip such that the resulting top
  * level is still >= 4x4.  The smallest 4x4 mip-tail is always resident. */
@@ -115,6 +131,26 @@ static void registry_remove(uint16_t idx)
             return;
         }
     }
+}
+
+/* VRAM ceiling: opt a freshly-registered texture into streaming + retain a CPU
+ * RGBA8 mip-0 copy so the streaming-pressure mip-bias hook can physically shrink
+ * it.  Called only when s_streaming_uploads is armed (runtime streamed uploads).
+ * `rgba8` is the tightly-packed (w*h*4) mip-0; a private copy is taken. */
+static void registry_opt_in_streaming(uint16_t idx, uint32_t w, uint32_t h,
+                                      const void *rgba8, int sampler_mode)
+{
+    if (!s_streaming_uploads || !rgba8 || w == 0 || h == 0) return;
+    TexEntry *e = registry_find(idx);
+    if (!e || e->has_source_pixels) return;
+    size_t bytes = (size_t)w * (size_t)h * 4u;
+    uint8_t *copy = (uint8_t *)JCE_MALLOC(bytes);
+    if (!copy) return;   /* best-effort; without it the demote stays a no-op */
+    memcpy(copy, rgba8, bytes);
+    e->source_pixels     = copy;
+    e->has_source_pixels = true;
+    e->streaming_tracked = true;
+    e->sampler_mode      = sampler_mode;
 }
 
 /* -- Helpers -------------------------------------------------------- */
@@ -205,6 +241,11 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
     }
 
     registry_add(handle.idx, w, h);
+    /* VRAM ceiling: streamed RGBA8 uploads retain a CPU mip-0 + opt into
+     * streaming so mip-bias under pressure physically reclaims VRAM.  mem->data
+     * is the tightly-packed RGBA8 we just filled (valid this frame, same
+     * thread).  No-op unless streaming uploads are armed. */
+    registry_opt_in_streaming(handle.idx, w, h, mem->data, mode);
 
     JceTexture tex;
     tex.idx = handle.idx;
@@ -492,6 +533,148 @@ JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
     return result;
 }
 
+/* ================================================================== */
+/* 3D-LUT loader (horizontal PNG strip → N×N×N RGBA8 3D texture)       */
+/* ================================================================== */
+
+/* Reorder a horizontal strip (N tiles of NxN laid left-to-right) to a
+ * z-major N×N×N volume.  Tile z holds the slice where blue index == z.
+ * strip_w = N*N texels per row.  Volume layout: out[(z*N + y)*N + x].
+ * This is the authoritative implementation; tests/test_jce_postfx_lut.c
+ * compiles its own identical copy to lock the contract. */
+static void jce_lut_strip_to_volume(const uint8_t *strip, int N, uint8_t *out)
+{
+    int strip_w = N * N;
+    for (int z = 0; z < N; z++)
+        for (int y = 0; y < N; y++)
+            for (int x = 0; x < N; x++) {
+                int sx = z * N + x;  /* tile z, column x */
+                int sy = y;
+                const uint8_t *src = strip + ((size_t)sy * strip_w + sx) * 4;
+                uint8_t *dst = out + (((size_t)z * N + y) * N + x) * 4;
+                dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
+            }
+}
+
+/* File-scope accessor: returns the raw surface pointer and writes dims.
+ * Only valid when !c->is_cooked; returns NULL otherwise. */
+static SDL_Surface *texture_cpu_surface(const JceTextureCpu *c,
+                                        int *out_w, int *out_h)
+{
+    if (!c || c->is_cooked || !c->surface) return NULL;
+    if (out_w) *out_w = c->surface->w;
+    if (out_h) *out_h = c->surface->h;
+    return c->surface;
+}
+
+JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
+                                   const char *asset_path)
+{
+    JceTexture invalid = JCE_TEXTURE_INVALID;
+    if (!(jce_renderer_get_caps() & JCE_CAP_TEXTURE_3D)) {
+        LOG_DEBUG(LOG_TAG, "LUT: TEXTURE_3D unsupported; skipping %s", asset_path);
+        return invalid;
+    }
+    /* Decode the strip to a CPU surface (reuses the worker decode path). */
+    JceTextureCpu *c = jce_texture_decode_cpu(pak, asset_path, JCE_TEX_CLAMP);
+    if (!c) return invalid;
+    /* Pull RGBA8 + dims out of the decoded result.  For raw surfaces this is
+     * c->surface.  V1 LUTs are plain PNGs, so handle the surface case;
+     * fall through to abort on cooked (which v1 LUTs never are). */
+    int img_w = 0, img_h = 0;
+    SDL_Surface *surf = texture_cpu_surface(c, &img_w, &img_h);
+    const uint8_t *pixels = surf ? (const uint8_t *)surf->pixels : NULL;
+    if (!pixels || img_h <= 0 || img_w != img_h * img_h) {
+        LOG_WARN(LOG_TAG, "LUT strip %s wrong shape (%dx%d; need N*N x N)",
+                 asset_path, img_w, img_h);
+        jce_texture_cpu_free(c);
+        return invalid;
+    }
+    int N = img_h;
+    uint8_t *vol = (uint8_t *)JCE_MALLOC((size_t)N * N * N * 4);
+    if (!vol) { jce_texture_cpu_free(c); return invalid; }
+    jce_lut_strip_to_volume(pixels, N, vol);
+    const bgfx_memory_t *mem = bgfx_copy(vol, (uint32_t)((size_t)N * N * N * 4));
+    bgfx_texture_handle_t h = bgfx_create_texture_3d(
+        (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
+        BGFX_TEXTURE_FORMAT_RGBA8,
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem);
+    JCE_FREE(vol);
+    jce_texture_cpu_free(c);
+    if (h.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "bgfx_create_texture_3d failed for LUT: %s", asset_path);
+        return invalid;
+    }
+    LOG_DEBUG(LOG_TAG, "loaded 3D LUT %s (N=%d)", asset_path, N);
+    /* Register N×N so jce_texture_get_size(lut, &w, &h) returns h==N,
+     * letting the stomp derive ln=N and pass the correct lut_size to
+     * jce_postfx_set_lut.  Without this the registry misses the 3D handle
+     * and returns h=0, collapsing the shader UV to a uniform tint. */
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N);
+    JceTexture t = JCE_TEXTURE_INVALID;
+    t.idx = h.idx;
+    return t;
+}
+
+/* Load a 3D LUT from a loose host-filesystem file (editor loose-asset path).
+ * Identical strip-decode + volume-reorder logic as jce_texture_load_lut_3d,
+ * but reads via jce_fs_host_read_all instead of a PAK archive, so it works
+ * in the editor where the project pak is NOT the one passed to sr_create. */
+JceTexture jce_texture_load_lut_3d_host(const char *host_path)
+{
+    JceTexture invalid = JCE_TEXTURE_INVALID;
+    if (!host_path || !host_path[0]) return invalid;
+    if (!(jce_renderer_get_caps() & JCE_CAP_TEXTURE_3D)) {
+        LOG_DEBUG(LOG_TAG, "LUT host: TEXTURE_3D unsupported; skipping %s", host_path);
+        return invalid;
+    }
+    /* Read the raw file bytes from the host filesystem. */
+    uint64_t file_size = 0;
+    void *file_buf = jce_fs_host_read_all(host_path, &file_size);
+    if (!file_buf || file_size == 0) {
+        LOG_WARN(LOG_TAG, "LUT host: cannot read '%s'", host_path);
+        if (file_buf) jce_fs_buffer_free(file_buf);
+        return invalid;
+    }
+    /* Decode the in-memory PNG to an RGBA8 CPU surface. */
+    JceTextureCpu *c = jce_texture_decode_cpu_mem(file_buf, (size_t)file_size,
+                                                  JCE_TEX_CLAMP);
+    jce_fs_buffer_free(file_buf);
+    if (!c) {
+        LOG_WARN(LOG_TAG, "LUT host: decode failed for '%s'", host_path);
+        return invalid;
+    }
+    int img_w = 0, img_h = 0;
+    SDL_Surface *surf = texture_cpu_surface(c, &img_w, &img_h);
+    const uint8_t *pixels = surf ? (const uint8_t *)surf->pixels : NULL;
+    if (!pixels || img_h <= 0 || img_w != img_h * img_h) {
+        LOG_WARN(LOG_TAG, "LUT host strip %s wrong shape (%dx%d; need N*N x N)",
+                 host_path, img_w, img_h);
+        jce_texture_cpu_free(c);
+        return invalid;
+    }
+    int N = img_h;
+    uint8_t *vol = (uint8_t *)JCE_MALLOC((size_t)N * N * N * 4);
+    if (!vol) { jce_texture_cpu_free(c); return invalid; }
+    jce_lut_strip_to_volume(pixels, N, vol);
+    const bgfx_memory_t *mem = bgfx_copy(vol, (uint32_t)((size_t)N * N * N * 4));
+    bgfx_texture_handle_t h = bgfx_create_texture_3d(
+        (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
+        BGFX_TEXTURE_FORMAT_RGBA8,
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem);
+    JCE_FREE(vol);
+    jce_texture_cpu_free(c);
+    if (h.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "bgfx_create_texture_3d failed for LUT host: %s", host_path);
+        return invalid;
+    }
+    LOG_DEBUG(LOG_TAG, "loaded 3D LUT (host) %s (N=%d)", host_path, N);
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N);
+    JceTexture t = JCE_TEXTURE_INVALID;
+    t.idx = h.idx;
+    return t;
+}
+
 JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height)
 {
@@ -566,6 +749,14 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
         return JCE_TEXTURE_INVALID;
 
     registry_add(handle.idx, info->width, info->height);
+    /* VRAM ceiling: only the uncompressed RGBA8 cooked format keeps a CPU
+     * source for streaming demote — its mip-0 lives at offset 0 of the chunk as
+     * plain RGBA8 (the box-filter downsample is RGBA8-only).  Block-compressed
+     * (BC/ASTC/ETC2) and RGB8 are NOT opted in (no RGBA8 source to downsample;
+     * the demote would be a truthful no-op anyway). */
+    if (info->format == JCEASSET_TEXFMT_RGBA8)
+        registry_opt_in_streaming(handle.idx, info->width, info->height,
+                                  pixels, sampler_mode);
 
     JceTexture tex;
     tex.idx = handle.idx;

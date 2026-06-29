@@ -11,6 +11,7 @@
  */
 
 #include "jce_sr_internal.h"
+#include <jce/os/core/jce_timer.h>   /* JCE_CULL_KPI broad-phase timing */
 
 /* ── TAA per-object previous-world-matrix table ─────────────────────────
  * Look up an entity's previous-frame world matrix before drawing it into the
@@ -176,15 +177,30 @@ static void sr_submit_mesh_velocity(JceSceneRenderer *sr,
  * Skinned entities are dispatched before this is reached in both pre-pass
  * branches, so only static models hit it.  Returns true => cull (skip). */
 static bool sr_prepass_model_culled(JceSceneRenderer *sr, JceScene *scene,
-                                    JceEntity e)
+                                    JceEntity e, int cull_idx)
 {
+    /* Reuse the per-frame cull cache: sr->ecull[cull_idx] already holds this
+     * static model's world AABB (sr_shadow_caster_aabb resolves the
+     * mesh-renderer path identically to the recompute below).  has_aabb==true
+     * => same wmin/wmax => identical cull decision, no second model resolve +
+     * AABB transform.  Fall back to the recompute only when the cache doesn't
+     * cover this index (defensive cull_idx<0/!ecull, or has_aabb==false for an
+     * entity ecull couldn't bound). */
+    if (cull_idx >= 0 && sr->ecull && sr->ecull[cull_idx].has_aabb)
+        return !sr_aabb_in_frustum(sr->prepass_cull_planes,
+                                   sr->ecull[cull_idx].wmin,
+                                   sr->ecull[cull_idx].wmax);
+
     const char *path = sr_mesh_renderer_model_path(scene, e);
     if (!path || !jce_scene_has_transform(scene, e)) return false;
     SrModelCache *mc = sr_get_model(sr, path, (uint32_t)e);
     if (!mc || !mc->model) return false;
     float lmn[3], lmx[3];
     if (!jce_model_get_aabb(mc->model, lmn, lmx)) return false;
-    jce_mat4 model = jce_scene_get_world_matrix(scene, e);
+    jce_mat4 model = (cull_idx >= 0 && sr->ecull &&
+                      sr->ecull[cull_idx].world_valid)
+                         ? sr->ecull[cull_idx].world
+                         : jce_scene_get_world_matrix(scene, e);
     jce_vec3 wmn, wmx;
     sr_transform_aabb(&model, jce_v3(lmn[0], lmn[1], lmn[2]),
                       jce_v3(lmx[0], lmx[1], lmx[2]), &wmn, &wmx);
@@ -236,7 +252,8 @@ static bool sr_try_submit_skinned_velocity(JceSceneRenderer *sr, JceScene *scene
 
 /* glTF MODEL (MeshRenderer, non-skinned) velocity submit. */
 static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
-                                         JceEntity e, uint16_t view_id,
+                                         JceEntity e, int cull_idx,
+                                         uint16_t view_id,
                                          const JceModelVelocityCtx *ctx)
 {
     const char *path = sr_mesh_renderer_model_path(scene, e);
@@ -245,8 +262,13 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
     if (!mc || !mc->model) return false;
 
     /* Screen-space pre-pass: cull off-screen models (uniform-scratch safety). */
-    if (sr_prepass_model_culled(sr, scene, e)) return true;
-    jce_mat4 model = jce_scene_get_world_matrix(scene, e);
+    if (sr_prepass_model_culled(sr, scene, e, cull_idx)) return true;
+    /* Reuse the per-frame composed world matrix (ecull build) instead of
+     * re-walking the parent chain; byte-identical source. */
+    jce_mat4 model = (cull_idx >= 0 && sr->ecull &&
+                      sr->ecull[cull_idx].world_valid)
+                         ? sr->ecull[cull_idx].world
+                         : jce_scene_get_world_matrix(scene, e);
     float rough = 0.8f;
     JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
     if (mr) rough = mr->roughness;
@@ -341,7 +363,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
             /* Skinned + model: write per-object/per-bone velocity (+ real
              * normals for SSR).  Terrain: depth + matte (rarely moves). */
             if (sr_try_submit_skinned_velocity(sr, scene, e, v, &vctx)) continue;
-            if (sr_try_submit_model_velocity(sr, scene, e, v, &vctx))   continue;
+            if (sr_try_submit_model_velocity(sr, scene, e, i, v, &vctx))   continue;
             if (sr_try_submit_terrain_shadow(sr, scene, e, v))          continue;
             jce_mat4 model;
             JceMesh *mesh = NULL;
@@ -502,11 +524,14 @@ void sr_extract_frustum_planes(const jce_mat4 *m, jce_vec4 planes[6])
 /* Pass-A scratch: per-entity world matrix + local AABB resolved on the
  * main thread, consumed by the parallel corner-transform pass.  `mode`
  * 0 = keep (no transform/model — always visible, skip transform),
- * 1 = transform the local AABB by `model`. */
+ * 1 = transform the local AABB by `model`,
+ * 2 = world AABB already resolved (reused from the per-frame ecull cache):
+ *     `wmn`/`wmx` hold the world bounds, no corner transform needed. */
 struct SrCullPrep {
     jce_mat4 model;
     float    lmn[3];
     float    lmx[3];
+    jce_vec3 wmn, wmx;
     uint8_t  mode;
 };
 
@@ -526,6 +551,14 @@ static void sr_cull_xform_range(int begin, int end, void *user)
         if (c->prep[i].mode == 0) {
             c->aabbs[i].min = c->aabbs[i].max = jce_v3(0, 0, 0);
             c->visible[i] = true;   /* no transform/model → always kept */
+            continue;
+        }
+        if (c->prep[i].mode == 2) {
+            /* World AABB reused from the per-frame ecull cache — no corner
+             * transform needed (identical result, just resolved once). */
+            c->aabbs[i].min = c->prep[i].wmn;
+            c->aabbs[i].max = c->prep[i].wmx;
+            c->visible[i]   = false;   /* flipped to true by the frustum query */
             continue;
         }
         float lmn[3], lmx[3];
@@ -554,6 +587,79 @@ static void sr_cull_xform_range(int begin, int end, void *user)
     }
 }
 
+/* ── Persistent cull broad-phase: per-entity space-handle map ─────────────
+ * The cull grid is kept across frames (insert once, update only moved, remove
+ * despawned).  This open-addressed table maps a STABLE entity id to its space
+ * handle + the AABB it was last bucketed with, so the per-frame maintenance is
+ * proportional to entities that actually moved/appeared/vanished — a static
+ * city pays ~0/frame.  Mirrors the wcache hashing. */
+static uint32_t sr_cull_map_hash(uint32_t e) { return e * 2654435761u; }
+
+static struct SrCullSpaceEntry *sr_cull_map_find(JceSceneRenderer *sr,
+                                                 uint32_t entity)
+{
+    if (!sr->cull_map || sr->cull_map_cap == 0 || entity == 0) return NULL;
+    uint32_t mask = sr->cull_map_cap - 1;
+    uint32_t h = sr_cull_map_hash(entity) & mask;
+    for (uint32_t i = 0; i < sr->cull_map_cap; i++) {
+        uint32_t s = (h + i) & mask;
+        struct SrCullSpaceEntry *en = &sr->cull_map[s];
+        if (!en->used) return NULL;                  /* open slot ends probe */
+        if (en->entity == entity) return en;
+    }
+    return NULL;
+}
+
+static bool sr_cull_map_grow(JceSceneRenderer *sr, uint32_t need)
+{
+    uint32_t new_cap = sr->cull_map_cap ? sr->cull_map_cap : 1024;
+    while (new_cap < need * 2u) new_cap *= 2u;       /* load factor < 0.5 */
+    struct SrCullSpaceEntry *ns = (struct SrCullSpaceEntry *)
+        JCE_CALLOC(new_cap, sizeof(struct SrCullSpaceEntry));
+    if (!ns) return false;
+    if (sr->cull_map) {
+        uint32_t nmask = new_cap - 1;
+        for (uint32_t i = 0; i < sr->cull_map_cap; i++) {
+            struct SrCullSpaceEntry *o = &sr->cull_map[i];
+            if (!o->used) continue;
+            uint32_t h = sr_cull_map_hash(o->entity) & nmask;
+            while (ns[h].used) h = (h + 1) & nmask;
+            ns[h] = *o;
+        }
+        JCE_FREE(sr->cull_map);
+    }
+    sr->cull_map = ns;
+    sr->cull_map_cap = new_cap;
+    return true;
+}
+
+static struct SrCullSpaceEntry *sr_cull_map_insert_slot(JceSceneRenderer *sr,
+                                                        uint32_t entity)
+{
+    if (sr->cull_map_cap == 0 || (sr->cull_map_count + 1) * 2u >= sr->cull_map_cap) {
+        if (!sr_cull_map_grow(sr, sr->cull_map_count + 1)) return NULL;
+    }
+    uint32_t mask = sr->cull_map_cap - 1;
+    uint32_t h = sr_cull_map_hash(entity) & mask;
+    while (sr->cull_map[h].used && sr->cull_map[h].entity != entity)
+        h = (h + 1) & mask;
+    struct SrCullSpaceEntry *en = &sr->cull_map[h];
+    if (!en->used) { en->used = true; en->entity = entity; sr->cull_map_count++; }
+    return en;
+}
+
+/* Drop EVERY persistent handle + the map (used when the grid must be rebuilt
+ * because its world bounds/resolution changed).  The grid itself is reset by
+ * the caller; here we just forget the handle bookkeeping so everything is
+ * reinserted fresh. */
+static void sr_cull_map_clear(JceSceneRenderer *sr)
+{
+    if (sr->cull_map)
+        memset(sr->cull_map, 0,
+               sr->cull_map_cap * sizeof(struct SrCullSpaceEntry));
+    sr->cull_map_count = 0;
+}
+
 /* Build a transient grid from the entity list and frustum-cull it.
  * Output: visible[i] = true if entity list->entities[i] passes culling.
  * Returns the visible entity count.
@@ -562,8 +668,8 @@ static void sr_cull_xform_range(int begin, int end, void *user)
  * the main thread — this touches the shared model/mesh/world-matrix
  * caches and so cannot run concurrently; (B) transform the corners into
  * world AABBs, fanned out across the shared job system (pure math,
- * disjoint per-index writes); (C) reduce the world bounds + run the grid
- * query serially. */
+ * disjoint per-index writes); (C) maintain the PERSISTENT broad-phase
+ * (insert/update/remove only what changed) + run the grid query serially. */
 uint32_t sr_compute_visible(JceSceneRenderer *sr,
                                     JceScene *scene,
                                     const EntityList *list,
@@ -595,6 +701,20 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
      * sr_build_entity_model / sr_resolve_mesh touch shared caches, so this
      * must NOT be parallelised. */
     for (int i = 0; i < list->count; i++) {
+        /* Reuse the per-frame ecull cache for entities it covers (resolvable
+         * glTF models — skeletal-animator skeleton or mesh-renderer model).
+         * sr_shadow_caster_aabb computed the SAME world AABB the model-resolve
+         * branch below would recompute, so reading it here avoids a second
+         * model resolve + 8-corner transform with an identical cull decision.
+         * Entities ecull doesn't bound (has_aabb==false: primitives, .obj
+         * meshes, transform-less specials) fall through to the recompute. */
+        if (sr->ecull && sr->ecull[i].has_aabb) {
+            prep[i].wmn  = sr->ecull[i].wmin;
+            prep[i].wmx  = sr->ecull[i].wmax;
+            prep[i].mode = 2;
+            continue;
+        }
+
         jce_mat4 model;
         JceMesh *mesh = NULL;
         if (!sr_build_entity_model(sr, scene, list->entities[i], i, &model, &mesh)) {
@@ -679,14 +799,135 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
 
     JceAABB world = { wmin, wmax };
 
-    if (!sr->cull_space) {
-        JceSpaceConfig cfg = { 0 };
-        cfg.type             = JCE_SPACE_GRID;
-        cfg.world_bounds     = world;
-        cfg.max_objects      = (uint32_t)list->count;
-        sr->cull_space = jce_space_create(&cfg);
-    } else {
-        jce_space_reset(sr->cull_space, &world);
+    /* ── Correctness self-check (JCE_CULL_VERIFY=1) ────────────────────────
+     * Ground-truth the visible set with a brute-force per-entity frustum test
+     * (exactly what the grid is accelerating), so any divergence — a grid bug, a
+     * stale persistent handle, a wrong remap — is caught + logged the frame it
+     * happens.  Off by default (zero overhead).  ref_vis[i] holds the truth;
+     * compared against `visible[]` at the end of the function. */
+    static int s_cull_verify = -1;
+    if (s_cull_verify < 0) {
+        const char *vv = getenv("JCE_CULL_VERIFY");
+        s_cull_verify = (vv && vv[0] && vv[0] != '0') ? 1 : 0;
+    }
+    bool *ref_vis = NULL;
+    if (s_cull_verify) {
+        ref_vis = (bool *)JCE_MALLOC((size_t)list->count * sizeof(bool));
+        if (ref_vis) {
+            for (int i = 0; i < list->count; i++) {
+                if (prep[i].mode == 0) { ref_vis[i] = true; continue; } /* always kept */
+                ref_vis[i] = sr_aabb_in_frustum(planes, aabbs[i].min, aabbs[i].max);
+            }
+        }
+    }
+
+    /* ── Persistent broad-phase maintenance ───────────────────────────────
+     * Keep the grid + its objects across frames.  We must (re)build it only
+     * when its world bounds no longer contain this frame's union (so the cell
+     * mapping covers every entity).  When building we inflate the bounds by a
+     * generous margin so ordinary streaming wobble (an entity sliding in/out at
+     * the edge) doesn't trigger a rebuild every frame.  In steady state the grid
+     * is built once and only moved/new/despawned entities touch it. */
+    sr->stat_cull_updated = sr->stat_cull_inserted = sr->stat_cull_removed = 0;
+
+    /* Optional broad-phase KPI (JCE_CULL_KPI=1): time ONLY the grid
+     * maintenance + frustum query (the part this change targets) and log it
+     * every 120 calls with the churn counts.  Off by default. */
+    static int s_cull_kpi = -1;
+    if (s_cull_kpi < 0) {
+        const char *kv = getenv("JCE_CULL_KPI");
+        s_cull_kpi = (kv && kv[0] && kv[0] != '0') ? 1 : 0;
+    }
+    const uint64_t kpi_t0 = s_cull_kpi ? jce_time_perf_counter() : 0;
+
+    /* A/B + safety hatch: JCE_DISABLE_PERSIST_CULL=1 reverts to the legacy
+     * reset+reinsert-ALL-every-frame path (still benefits from extent sizing +
+     * occupied-cell iteration, just not the persistent insert/update/remove). */
+    static int s_persist_disabled = -1;
+    if (s_persist_disabled < 0) {
+        const char *dv = getenv("JCE_DISABLE_PERSIST_CULL");
+        s_persist_disabled = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
+    }
+    if (s_persist_disabled) {
+        if (!sr->cull_space) {
+            JceSpaceConfig cfg = { 0 };
+            cfg.type         = JCE_SPACE_GRID;
+            cfg.world_bounds = world;
+            cfg.max_objects  = (uint32_t)list->count;
+            sr->cull_space = jce_space_create(&cfg);
+        } else {
+            jce_space_reset(sr->cull_space, &world);
+        }
+        sr->cull_space_built = false;   /* persistent path must rebuild on re-enable */
+        sr_cull_map_clear(sr);
+        if (!sr->cull_space) {
+            for (int i = 0; i < list->count; i++) visible[i] = true;
+            return (uint32_t)list->count;
+        }
+        for (int i = 0; i < list->count; i++) {
+            if (visible[i]) continue;
+            jce_space_insert(sr->cull_space, aabbs[i], (uint32_t)i);
+        }
+        if (sr->cull_hit_cap < (uint32_t)list->count) {
+            uint32_t nc = sr->cull_hit_cap ? sr->cull_hit_cap : 256u;
+            while (nc < (uint32_t)list->count) nc *= 2u;
+            uint32_t *g = (uint32_t *)JCE_REALLOC(sr->cull_hit_buf,
+                                                  nc * sizeof(uint32_t));
+            if (g) { sr->cull_hit_buf = g; sr->cull_hit_cap = nc; }
+        }
+        if (!sr->cull_hit_buf) {
+            for (int i = 0; i < list->count; i++) visible[i] = true;
+            return (uint32_t)list->count;
+        }
+        const uint32_t lh = jce_space_query_frustum(sr->cull_space, planes,
+                                                    sr->cull_hit_buf,
+                                                    sr->cull_hit_cap);
+        for (uint32_t k = 0; k < lh; k++)
+            if (sr->cull_hit_buf[k] < (uint32_t)list->count)
+                visible[sr->cull_hit_buf[k]] = true;
+        uint32_t lv = 0;
+        for (int i = 0; i < list->count; i++) if (visible[i]) lv++;
+        if (s_cull_kpi) {
+            static uint32_t s_kc = 0;
+            if ((s_kc++ % 120u) == 0)
+                LOG_INFO(LOG_TAG, "CULL_KPI[legacy] %.3f ms (rebuild-all): %d ent, %u vis, %u occ cells",
+                         jce_time_perf_to_ms(kpi_t0, jce_time_perf_counter()),
+                         list->count, lv,
+                         sr->cull_space ? jce_space_occupied_cell_count(sr->cull_space) : 0);
+        }
+        return lv;
+    }
+
+    bool need_build = !sr->cull_space || !sr->cull_space_built;
+    if (sr->cull_space && sr->cull_space_built) {
+        const JceAABB *bw = &sr->cull_space_world;
+        if (wmin.x < bw->min.x || wmin.y < bw->min.y || wmin.z < bw->min.z ||
+            wmax.x > bw->max.x || wmax.y > bw->max.y || wmax.z > bw->max.z)
+            need_build = true;
+    }
+
+    if (need_build) {
+        /* Inflate the union by 25% per axis (min 64 units) so a streamed world
+         * that grows a little doesn't rebuild the grid every frame. */
+        JceAABB gw = world;
+        float mx_ = (gw.max.x - gw.min.x) * 0.25f; if (mx_ < 64.0f) mx_ = 64.0f;
+        float my_ = (gw.max.y - gw.min.y) * 0.25f; if (my_ < 64.0f) my_ = 64.0f;
+        float mz_ = (gw.max.z - gw.min.z) * 0.25f; if (mz_ < 64.0f) mz_ = 64.0f;
+        gw.min.x -= mx_; gw.min.y -= my_; gw.min.z -= mz_;
+        gw.max.x += mx_; gw.max.y += my_; gw.max.z += mz_;
+
+        if (!sr->cull_space) {
+            JceSpaceConfig cfg = { 0 };
+            cfg.type         = JCE_SPACE_GRID;
+            cfg.world_bounds = gw;
+            cfg.max_objects  = (uint32_t)list->count;
+            sr->cull_space = jce_space_create(&cfg);
+        } else {
+            jce_space_reset(sr->cull_space, &gw);  /* drops all objects */
+        }
+        sr_cull_map_clear(sr);                      /* forget all handles */
+        sr->cull_space_world = gw;
+        sr->cull_space_built = (sr->cull_space != NULL);
     }
 
     if (!sr->cull_space) {
@@ -694,19 +935,157 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
         return (uint32_t)list->count;
     }
 
+    /* New cull generation: entities seen this call are stamped with it; any map
+     * entry NOT stamped is despawned (or off-list) and removed below. */
+    const uint32_t gen = ++sr->cull_gen;
+
     for (int i = 0; i < list->count; i++) {
-        if (visible[i]) continue;     /* transform-less; already kept */
-        jce_space_insert(sr->cull_space, aabbs[i], (uint32_t)i);
+        if (visible[i]) continue;     /* transform-less; already kept, not gridded */
+        uint32_t e = (uint32_t)list->entities[i];
+        struct SrCullSpaceEntry *en = sr_cull_map_find(sr, e);
+        if (!en) {
+            en = sr_cull_map_insert_slot(sr, e);
+            if (!en) { /* OOM: fall back to keeping it visible (never wrongly cull) */
+                visible[i] = true;
+                continue;
+            }
+            en->handle = jce_space_insert(sr->cull_space, aabbs[i], (uint32_t)i);
+            en->last_min = aabbs[i].min;
+            en->last_max = aabbs[i].max;
+            sr->stat_cull_inserted++;
+        } else {
+            /* Re-bucket only when the AABB actually changed (moved/animated);
+             * the cell-range guard inside jce_space_update makes a sub-cell move
+             * free too, but skipping the call entirely keeps static entities at
+             * literally zero work. */
+            const jce_vec3 nmn = aabbs[i].min, nmx = aabbs[i].max;
+            if (nmn.x != en->last_min.x || nmn.y != en->last_min.y ||
+                nmn.z != en->last_min.z || nmx.x != en->last_max.x ||
+                nmx.y != en->last_max.y || nmx.z != en->last_max.z) {
+                jce_space_update(sr->cull_space, en->handle, aabbs[i]);
+                en->last_min = nmn;
+                en->last_max = nmx;
+                sr->stat_cull_updated++;
+            }
+            /* Remap the stable handle to THIS frame's render-list index for the
+             * query (cheap; no cell touch). */
+            jce_space_set_user_id(sr->cull_space, en->handle, (uint32_t)i);
+        }
+        en->seen_gen = gen;
     }
 
-    uint32_t hit_buf[SR_MAX_ENTITIES];
+    /* Sweep: remove entities that were in the map but are absent this frame
+     * (despawned / unloaded / now off-list).  Two passes: (1) remove the dead
+     * from the broad-phase + mark their slots empty; (2) if ANY died, rehash the
+     * survivors into a clean table so the open-addressed probe chains have no
+     * holes (no tombstones, no stale-handle UAF, no fragile backward-shift). */
+    if (sr->cull_map && sr->cull_map_count > 0) {
+        uint32_t dead = 0;
+        for (uint32_t s = 0; s < sr->cull_map_cap; s++) {
+            struct SrCullSpaceEntry *en = &sr->cull_map[s];
+            if (!en->used || en->seen_gen == gen) continue;
+            jce_space_remove(sr->cull_space, en->handle);
+            *en = (struct SrCullSpaceEntry){0};   /* mark empty */
+            dead++;
+        }
+        if (dead) {
+            sr->stat_cull_removed = dead;
+            sr->cull_map_count   -= dead;
+            /* Compact-rehash survivors into a fresh same-capacity table. */
+            struct SrCullSpaceEntry *clean = (struct SrCullSpaceEntry *)
+                JCE_CALLOC(sr->cull_map_cap, sizeof(struct SrCullSpaceEntry));
+            if (clean) {
+                uint32_t mask = sr->cull_map_cap - 1;
+                for (uint32_t s = 0; s < sr->cull_map_cap; s++) {
+                    struct SrCullSpaceEntry *o = &sr->cull_map[s];
+                    if (!o->used) continue;
+                    uint32_t h = sr_cull_map_hash(o->entity) & mask;
+                    while (clean[h].used) h = (h + 1) & mask;
+                    clean[h] = *o;
+                }
+                JCE_FREE(sr->cull_map);
+                sr->cull_map = clean;
+            }
+            /* On OOM keep the holey table; sr_cull_map_find stops at the first
+             * empty slot, so a hole can cause a MISS (then re-insert as new = a
+             * duplicate broad-phase object).  To stay correct under that rare
+             * path, force a full rebuild next frame. */
+            else {
+                sr->cull_space_built = false;
+            }
+        }
+    }
+
+    /* Frustum query: heap hit buffer, grown to cover the worst case (every
+     * entity visible).  Was a 128 KB stack array. */
+    if (sr->cull_hit_cap < (uint32_t)list->count) {
+        uint32_t nc = sr->cull_hit_cap ? sr->cull_hit_cap : 256u;
+        while (nc < (uint32_t)list->count) nc *= 2u;
+        uint32_t *g = (uint32_t *)JCE_REALLOC(sr->cull_hit_buf,
+                                              nc * sizeof(uint32_t));
+        if (g) { sr->cull_hit_buf = g; sr->cull_hit_cap = nc; }
+    }
+    if (!sr->cull_hit_buf || sr->cull_hit_cap == 0) {
+        for (int i = 0; i < list->count; i++) visible[i] = true;
+        return (uint32_t)list->count;
+    }
+
     const uint32_t hits = jce_space_query_frustum(sr->cull_space, planes,
-                                                   hit_buf, SR_MAX_ENTITIES);
+                                                   sr->cull_hit_buf,
+                                                   sr->cull_hit_cap);
     for (uint32_t k = 0; k < hits; k++) {
-        if (hit_buf[k] < (uint32_t)list->count) visible[hit_buf[k]] = true;
+        if (sr->cull_hit_buf[k] < (uint32_t)list->count)
+            visible[sr->cull_hit_buf[k]] = true;
     }
 
-    return hits;
+    /* Visible count: hits from the grid + the always-kept transform-less set
+     * (mode 0 entities never entered the grid).  Recount `visible` to report the
+     * true total (matches the pre-change return, which counted only grid hits;
+     * but the caller derives culled = total - visible, so an accurate visible
+     * count keeps the stat correct now that transform-less entities aren't
+     * gridded). */
+    uint32_t vis = 0;
+    for (int i = 0; i < list->count; i++) if (visible[i]) vis++;
+
+    if (s_cull_kpi) {
+        static uint32_t s_kc = 0;
+        if ((s_kc++ % 120u) == 0)
+            LOG_INFO(LOG_TAG, "CULL_KPI[persist] %.3f ms: %d ent, %u vis, "
+                     "ins=%u upd=%u rem=%u, %u/%u occ cells, %u objs",
+                     jce_time_perf_to_ms(kpi_t0, jce_time_perf_counter()),
+                     list->count, vis, sr->stat_cull_inserted,
+                     sr->stat_cull_updated, sr->stat_cull_removed,
+                     jce_space_occupied_cell_count(sr->cull_space),
+                     jce_space_cell_count(sr->cull_space),
+                     jce_space_object_count(sr->cull_space));
+    }
+
+    /* Self-check: the persistent-grid visible set must EXACTLY equal the
+     * brute-force frustum truth.  Logs (loudly) the first few divergences. */
+    if (ref_vis) {
+        uint32_t mism = 0;
+        for (int i = 0; i < list->count; i++) {
+            if (visible[i] != ref_vis[i]) {
+                if (mism < 8)
+                    LOG_ERROR(LOG_TAG,
+                        "CULL_VERIFY mismatch entity[%d] id=%u grid=%d truth=%d "
+                        "(aabb [%.2f,%.2f,%.2f]..[%.2f,%.2f,%.2f])",
+                        i, (uint32_t)list->entities[i], (int)visible[i],
+                        (int)ref_vis[i], aabbs[i].min.x, aabbs[i].min.y,
+                        aabbs[i].min.z, aabbs[i].max.x, aabbs[i].max.y,
+                        aabbs[i].max.z);
+                mism++;
+            }
+        }
+        if (mism == 0)
+            LOG_INFO(LOG_TAG, "CULL_VERIFY ok: %d entities, %u visible (grid==truth)",
+                     list->count, vis);
+        else
+            LOG_ERROR(LOG_TAG, "CULL_VERIFY FAILED: %u/%d entities diverged",
+                      mism, list->count);
+        JCE_FREE(ref_vis);
+    }
+    return vis;
 }
 
 /* ── Baked GI consumption (P1-baked-gi-consume) ───────────────────────
@@ -886,5 +1265,15 @@ void sr_bind_baked_gi(JceSceneRenderer *sr, float ibl_params[4])
         }
         bgfx_set_uniform(sr->u_sh9, sh9, 9);
     }
+
+    /* Look Profile uniforms (plan 02). This is the SINGLE lit-submit funnel
+     * (queue + inline both pass through here) → zero new call sites, three
+     * driver paths inherit automatically.  Neutral packing when inactive. */
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_wrap))
+        bgfx_set_uniform(sr->u_look_wrap, sr->look_gpu.wrap, 1);
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_rim))
+        bgfx_set_uniform(sr->u_look_rim, sr->look_gpu.rim, 1);
+    if (BGFX_HANDLE_IS_VALID(sr->u_look_hemi_ground))
+        bgfx_set_uniform(sr->u_look_hemi_ground, sr->look_gpu.hemi, 1);
 }
 

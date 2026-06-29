@@ -58,6 +58,11 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
     float smin = (p->scale_min > 0.0f) ? p->scale_min : 1.0f;
     float smax = (p->scale_max >= smin) ? p->scale_max : smin;
 
+    /* Density mask (large-world #8a): when present, each candidate is kept with
+     * probability = its mask cell, so brush-painted regions modulate density. */
+    const bool have_mask = (p->density_mask != NULL) && (p->mask_dim > 0);
+    const float inv_ax = 1.0f / ax, inv_az = 1.0f / az;
+
     /* A placement is kept when the terrain normal's Y >= cos(max_slope); a
      * limit of >=90° (or no terrain) disables the test. */
     const bool slope_limit =
@@ -72,6 +77,20 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
         const float rz  = (randf01(&state) - 0.5f) * az;
         const float yaw = randf01(&state) * FOLIAGE_TWO_PI;
         const float sc  = smin + (smax - smin) * randf01(&state);
+
+        /* Density-mask rejection (5th RNG draw, only in mask mode so the
+         * maskless sequence is unchanged): keep with probability = mask cell. */
+        if (have_mask) {
+            const float mr = randf01(&state);
+            float u = rx * inv_ax + 0.5f;          /* candidate UV in the rect */
+            float v = rz * inv_az + 0.5f;
+            int mx = (int)(u * (float)p->mask_dim);
+            int mz = (int)(v * (float)p->mask_dim);
+            if (mx < 0) mx = 0; else if (mx >= p->mask_dim) mx = p->mask_dim - 1;
+            if (mz < 0) mz = 0; else if (mz >= p->mask_dim) mz = p->mask_dim - 1;
+            if (mr >= p->density_mask[(size_t)mz * (size_t)p->mask_dim + (size_t)mx])
+                continue;                          /* painted-sparse — reject */
+        }
 
         const float wx = ox + rx;
         const float wz = oz + rz;

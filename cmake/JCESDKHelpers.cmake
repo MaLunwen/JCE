@@ -531,18 +531,32 @@ function(jce_add_pak TARGET)
 	endforeach()
 
 	# One jce_cook --batch per source dir, all merged into _cooked_dir.
+	#
+	# Each batch gets its OWN incremental catalog (--catalog) kept in the build
+	# dir, NOT the default <out>/.jce_cook_catalog.  jce_cook runs a per-run
+	# stale-GC that deletes any output file whose source wasn't seen in THIS
+	# batch; with a single shared catalog in the merged output dir, the 2nd…Nth
+	# batch would delete the 1st batch's files (their sources live in a different
+	# source dir), so a multi-dir merged cook kept only the LAST batch's output
+	# (e.g. dropping every scenes/chunks/*.scene.json fragment).  A per-dir
+	# catalog scopes the GC to that dir's own outputs, so the merge is additive.
 	set(_cook_cmds
 		COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_cooked_dir}"
 		COMMAND "${CMAKE_COMMAND}" -E make_directory "${_cooked_dir}")
+	set(_cook_idx 0)
 	foreach(_d IN LISTS _src_dirs)
+		set(_cook_catalog
+			"${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_cook_catalog_${_cook_idx}.bin")
 		list(APPEND _cook_cmds
 			COMMAND "${JCE_COOK_EXECUTABLE}"
 				--batch "${_d}" "${_cooked_dir}"
+				--catalog "${_cook_catalog}"
 				--preserve-names
 				--level "${AP_COOK_LEVEL}"
 				--max-texture-size "${AP_MAX_TEXTURE_SIZE}"
 				${_cook_platform_args}
 				${AP_EXTRA_COOK_ARGS})
+		math(EXPR _cook_idx "${_cook_idx}+1")
 	endforeach()
 
 	add_custom_command(

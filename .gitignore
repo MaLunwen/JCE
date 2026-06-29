@@ -44,8 +44,10 @@ sync_*.py
 
 agents.*
 tests/
+
 science_lab/
 street_demo/
+meadow_valley/
 
 
 # Android APK build

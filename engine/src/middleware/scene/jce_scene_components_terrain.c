@@ -36,6 +36,8 @@ void parse_vegetation_scatter(JceScene *s, JceEntity e, const cJSON *c)
     memset(&vs, 0, sizeof(vs));
     copy_str(vs.mesh_path,   sizeof(vs.mesh_path),   j_str(c, "meshPath", ""));
     copy_str(vs.albedo_path, sizeof(vs.albedo_path), j_str(c, "albedoPath", ""));
+    copy_str(vs.density_mask_path, sizeof(vs.density_mask_path),
+             j_str(c, "densityMaskPath", ""));
     vs.density         = (float)j_num(c, "density", 1.0);
     vs.seed            = (uint32_t)j_num(c, "seed", 12345.0);
     vs.area_x          = (float)j_num(c, "areaX", 10.0);
@@ -49,7 +51,52 @@ void parse_vegetation_scatter(JceScene *s, JceEntity e, const cJSON *c)
     vs.align_to_normal = j_bool(c, "alignToNormal", false);
     vs.cast_shadow     = j_bool(c, "castShadow", true);
     vs.visible         = j_bool(c, "visible", true);
+    /* In-editor painted density grid (large-world #8a). */
+    vs.density_paint_active = j_bool(c, "densityPaintActive", false);
+    if (vs.density_paint_active) {
+        memset(vs.density_paint, 255, sizeof vs.density_paint);  /* default full */
+        const cJSON *arr = cJSON_GetObjectItemCaseSensitive(c, "densityPaintData");
+        if (arr && cJSON_IsArray(arr)) {
+            int n = cJSON_GetArraySize(arr);
+            if (n > (int)sizeof vs.density_paint) n = (int)sizeof vs.density_paint;
+            for (int i = 0; i < n; ++i) {
+                int iv = (int)cJSON_GetNumberValue(cJSON_GetArrayItem(arr, i));
+                vs.density_paint[i] = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+            }
+        }
+    }
     jce_scene_set_vegetation_scatter(s, e, &vs);
+}
+
+void parse_grass_field(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceGrassFieldComponent g; memset(&g, 0, sizeof g);
+    g.density       = (float)j_num(c, "density", 8.0);
+    g.seed          = (uint32_t)j_num(c, "seed", 1337.0);
+    g.area_x        = (float)j_num(c, "areaX", 40.0);
+    g.area_z        = (float)j_num(c, "areaZ", 40.0);
+    g.max_slope_deg = (float)j_num(c, "maxSlopeDeg", 35.0);
+    g.scale_min     = (float)j_num(c, "scaleMin", 0.8);
+    g.scale_max     = (float)j_num(c, "scaleMax", 1.3);
+    g.blade_height  = (float)j_num(c, "bladeHeight", 0.4);
+    g.blade_width   = (float)j_num(c, "bladeWidth", 0.05);
+    g.cards         = (int)j_num(c, "cards", 4);
+    g.root_color[0] = (float)j_num(c, "rootR", 0.10);
+    g.root_color[1] = (float)j_num(c, "rootG", 0.22);
+    g.root_color[2] = (float)j_num(c, "rootB", 0.05);
+    g.tip_color[0]  = (float)j_num(c, "tipR", 0.55);
+    g.tip_color[1]  = (float)j_num(c, "tipG", 0.78);
+    g.tip_color[2]  = (float)j_num(c, "tipB", 0.25);
+    g.wind_dir[0]   = (float)j_num(c, "windDirX", 1.0);
+    g.wind_dir[1]   = (float)j_num(c, "windDirZ", 0.0);
+    g.wind_speed    = (float)j_num(c, "windSpeed", 1.5);
+    g.wind_amplitude= (float)j_num(c, "windAmplitude", 0.10);
+    g.fade_start    = (float)j_num(c, "fadeStart", 50.0);
+    g.fade_end      = (float)j_num(c, "fadeEnd", 110.0);
+    g.hue_jitter    = (float)j_num(c, "hueJitter", 0.2);
+    g.cast_shadow   = j_bool(c, "castShadow", false);
+    g.visible       = j_bool(c, "visible", true);
+    jce_scene_set_grass_field(s, e, &g);
 }
 
 void parse_water(JceScene *s, JceEntity e, const cJSON *c)
@@ -179,6 +226,7 @@ static void ser_vegetation_scatter(const JceVegetationScatterComponent *c, cJSON
     cJSON_AddStringToObject(o, "type", "VegetationScatter");
     cJSON_AddStringToObject(o, "meshPath", c->mesh_path);
     cJSON_AddStringToObject(o, "albedoPath", c->albedo_path);
+    cJSON_AddStringToObject(o, "densityMaskPath", c->density_mask_path);
     cJSON_AddNumberToObject(o, "density", c->density);
     cJSON_AddNumberToObject(o, "seed", (double)c->seed);
     cJSON_AddNumberToObject(o, "areaX", c->area_x);
@@ -190,6 +238,46 @@ static void ser_vegetation_scatter(const JceVegetationScatterComponent *c, cJSON
     cJSON_AddNumberToObject(o, "tintG", c->tint[1]);
     cJSON_AddNumberToObject(o, "tintB", c->tint[2]);
     cJSON_AddBoolToObject  (o, "alignToNormal", c->align_to_normal);
+    cJSON_AddBoolToObject  (o, "castShadow", c->cast_shadow);
+    cJSON_AddBoolToObject  (o, "visible", c->visible);
+    cJSON_AddBoolToObject  (o, "densityPaintActive", c->density_paint_active);
+    if (c->density_paint_active) {
+        int tmp[JCE_VEG_PAINT_DIM * JCE_VEG_PAINT_DIM];
+        for (int i = 0; i < (int)sizeof c->density_paint; ++i)
+            tmp[i] = (int)c->density_paint[i];
+        cJSON_AddItemToObject(o, "densityPaintData",
+                              cJSON_CreateIntArray(tmp, (int)sizeof c->density_paint));
+    }
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_grass_field(const JceGrassFieldComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "GrassField");
+    cJSON_AddNumberToObject(o, "density", c->density);
+    cJSON_AddNumberToObject(o, "seed", (double)c->seed);
+    cJSON_AddNumberToObject(o, "areaX", c->area_x);
+    cJSON_AddNumberToObject(o, "areaZ", c->area_z);
+    cJSON_AddNumberToObject(o, "maxSlopeDeg", c->max_slope_deg);
+    cJSON_AddNumberToObject(o, "scaleMin", c->scale_min);
+    cJSON_AddNumberToObject(o, "scaleMax", c->scale_max);
+    cJSON_AddNumberToObject(o, "bladeHeight", c->blade_height);
+    cJSON_AddNumberToObject(o, "bladeWidth", c->blade_width);
+    cJSON_AddNumberToObject(o, "cards", c->cards);
+    cJSON_AddNumberToObject(o, "rootR", c->root_color[0]);
+    cJSON_AddNumberToObject(o, "rootG", c->root_color[1]);
+    cJSON_AddNumberToObject(o, "rootB", c->root_color[2]);
+    cJSON_AddNumberToObject(o, "tipR", c->tip_color[0]);
+    cJSON_AddNumberToObject(o, "tipG", c->tip_color[1]);
+    cJSON_AddNumberToObject(o, "tipB", c->tip_color[2]);
+    cJSON_AddNumberToObject(o, "windDirX", c->wind_dir[0]);
+    cJSON_AddNumberToObject(o, "windDirZ", c->wind_dir[1]);
+    cJSON_AddNumberToObject(o, "windSpeed", c->wind_speed);
+    cJSON_AddNumberToObject(o, "windAmplitude", c->wind_amplitude);
+    cJSON_AddNumberToObject(o, "fadeStart", c->fade_start);
+    cJSON_AddNumberToObject(o, "fadeEnd", c->fade_end);
+    cJSON_AddNumberToObject(o, "hueJitter", c->hue_jitter);
     cJSON_AddBoolToObject  (o, "castShadow", c->cast_shadow);
     cJSON_AddBoolToObject  (o, "visible", c->visible);
     cJSON_AddItemToArray(arr, o);
@@ -272,6 +360,12 @@ void serw_vegetation_scatter(JceScene *s, JceEntity e, cJSON *arr)
 {
     JceVegetationScatterComponent *c = jce_scene_get_vegetation_scatter(s, e);
     if (c) ser_vegetation_scatter(c, arr);
+}
+
+void serw_grass_field(JceScene *s, JceEntity e, cJSON *arr)
+{
+    const JceGrassFieldComponent *c = jce_scene_get_grass_field(s, e);
+    if (c) ser_grass_field(c, arr);
 }
 
 void serw_water(JceScene *s, JceEntity e, cJSON *arr)

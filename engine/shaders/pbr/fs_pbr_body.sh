@@ -26,6 +26,7 @@
 
 #include <bgfx_shader.sh>
 #include "pbr_common.sh"
+#include "fog_apply.sh"
 
 // Material uniforms
 uniform vec4 u_baseColorFactor;
@@ -34,6 +35,26 @@ uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 
 uniform vec4 u_cameraPos;       // xyz=world-space camera position
 uniform vec4 u_normalScale;     // x=normal map scale (x<0 => checker fallback), y=doubleSided flag
 uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
+
+// Toon (cel) material uniforms — only declared/consumed under #ifdef JCE_TOON.
+// Default (fs_pbr.sc / fs_pbr_fwdplus.sc) leaves JCE_TOON undefined so these
+// are NOT compiled in and the default programs are byte-identical.
+#ifdef JCE_TOON
+uniform vec4 u_toonParams;    // x=bands(2..4), y=ramp threshold/softness, z=rim power, w=rim intensity
+uniform vec4 u_toonRimColor;  // xyz=rim color (linear), w=pad
+#endif
+
+// ── Look Profile uniforms (stylized slice plan 02; consumed by plan 03/04) ──
+// u_lookWrap      = {wrap_factor, rim_power, rim_intensity, toonFlag}
+// u_lookRim       = {rim_color.rgb, pad}
+// u_lookHemiGround= {ambient_ground_color.rgb, hemi_enabled}
+// Hemisphere TOP color = u_ambientColor.  Neutral packing (wrap=0,
+// rim_intensity=0, hemi_enabled=0) => the plan 03/04 math is an algebraic
+// no-op.  Declared here so this plan ships the uniforms without altering
+// any backend output (verified byte-identical via render_parity).
+uniform vec4 u_lookWrap;
+uniform vec4 u_lookRim;
+uniform vec4 u_lookHemiGround;
 
 // Light uniforms
 // Directional lights: 2 vec4 per light, max 2 lights = 4 vec4
@@ -184,6 +205,13 @@ uniform vec4 u_pointShadowSlot[4]; // 16 point lanes -> atlas slot (-1 = none)
 uniform vec4 u_localShadowParams;
 // Per-slot depth bias: lane i = atlas slot i's authored shadowBias (4 slots).
 uniform vec4 u_localShadowBias;
+// #7 omnidirectional point cube shadows: 6 face VPs per budgeted point light
+// (12 = JCE_POINT_SHADOW_MAX*6) + per-point face-0 atlas slot (16 lanes -> 4 vec4).
+// base < 0 => this point has no cube shadow (shader takes the legacy single-tile
+// u_pointShadowSlot path). Fixed layout: slots 0-3 spots/legacy, 4-9 cube point 0,
+// 10-15 cube point 1, so vp index = (base-4) + face.
+uniform mat4 u_pointCubeVP[12];
+uniform vec4 u_pointCubeBaseSlot[4];
 
 // Shadow FILTER quality tier (frame-constant; set by the scene renderer from
 // the render-pipeline asset's shadow_filter_quality knob):
@@ -194,10 +222,12 @@ uniform vec4 u_localShadowBias;
 // so the untaken side's texture fetches are genuinely skipped on SM3+.
 uniform vec4 u_shadowQuality;
 
-// Returns 1.0 (lit) when the light casts no shadow, the fragment is outside the
-// light frustum, or it is the nearest occluder; 0.0 when occluded.
-float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
-                        vec3 lightPos, float ndotl)
+// Core atlas-tile shadow test: project worldPos through `vp`, sample atlas tile
+// `slot` (in the active tiles x tiles grid) with normal-offset bias + 3x3 PCF.
+// Returns 1.0 (lit) when out of frustum / nearest occluder; 0.0 when occluded.
+// Shared by spot/legacy-point (sampleLocalShadow) and omni cube (samplePointCubeShadow).
+float sampleAtlasTile(int slotIndex, mat4 vp, vec3 worldPos, vec3 N,
+                      vec3 lightPos, float ndotl, float bias)
 {
     if (slotIndex < 0) return 1.0;
 
@@ -213,7 +243,7 @@ float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
     float nOff = texelWorld * (1.5 + (1.0 - clamp(ndotl, 0.0, 1.0)) * 3.0);
     vec3 sp = worldPos + N * nOff;
 
-    vec4 clip = mul(u_localShadowVP[slotIndex], vec4(sp, 1.0));
+    vec4 clip = mul(vp, vec4(sp, 1.0));
     if (clip.w <= 0.0) return 1.0;
     vec3 ndc = clip.xyz / clip.w;
     vec2 uv  = ndc.xy * 0.5 + vec2_splat(0.5);
@@ -246,12 +276,9 @@ float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
 #endif
     vec2 tileOrigin = vec2(col, row) * tileUV;
 
-    // Small constant depth bias on top of the normal offset — per-slot, so each
-    // shadow-casting light's authored shadowBias applies (ES-safe selection).
-    float perSlotBias = (slotIndex == 0) ? u_localShadowBias.x :
-                        (slotIndex == 1) ? u_localShadowBias.y :
-                        (slotIndex == 2) ? u_localShadowBias.z : u_localShadowBias.w;
-    float bias = max(perSlotBias, 0.0005);
+    // Small constant depth bias on top of the normal offset (caller supplies the
+    // authored shadowBias; cube faces pass a fixed default).
+    float b = max(bias, 0.0005);
 
     // 3x3 PCF, clamped inside this light's atlas tile so taps never bleed into
     // a neighbouring light's tile (soft edges).
@@ -265,7 +292,7 @@ float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
     if (u_shadowQuality.x < 0.5) {
         vec2 t0 = clamp(inTile, vec2_splat(lo), vec2_splat(hi));
         float d0 = texture2D(s_localShadowMap, tileOrigin + t0).r;
-        return ((curDepth - bias) <= d0) ? 1.0 : 0.0;
+        return ((curDepth - b) <= d0) ? 1.0 : 0.0;
     }
 
     float sum = 0.0;
@@ -274,10 +301,43 @@ float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
             vec2 t = clamp(inTile + vec2(float(ox), float(oy)) * texel,
                            vec2_splat(lo), vec2_splat(hi));
             float d = texture2D(s_localShadowMap, tileOrigin + t).r;
-            sum += ((curDepth - bias) <= d) ? 1.0 : 0.0;
+            sum += ((curDepth - b) <= d) ? 1.0 : 0.0;
         }
     }
     return sum * (1.0 / 9.0);
+}
+
+// Spot/legacy-point single-tile shadow: slot 0..3, VP in u_localShadowVP, with
+// the per-slot authored bias. (Same signature as before — callers unchanged.)
+float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
+                        vec3 lightPos, float ndotl)
+{
+    if (slotIndex < 0) return 1.0;
+    float perSlotBias = (slotIndex == 0) ? u_localShadowBias.x :
+                        (slotIndex == 1) ? u_localShadowBias.y :
+                        (slotIndex == 2) ? u_localShadowBias.z : u_localShadowBias.w;
+    return sampleAtlasTile(slotIndex, u_localShadowVP[slotIndex],
+                           worldPos, N, lightPos, ndotl, perSlotBias);
+}
+
+// #7 omnidirectional point cube shadow. Pick the cube face by the major axis of
+// (worldPos - lightPos); the face ORDER MUST MATCH jce_sr_shadow.c CUBE_DIRS:
+// {+X,-X,+Y,-Y,+Z,-Z}. Tile = base+face; VP = u_pointCubeVP[(base-4)+face] (base
+// is 4 or 10 by the fixed reserved layout, so the index is 0..11).
+float samplePointCubeShadow(int baseSlot, vec3 worldPos, vec3 N,
+                            vec3 lightPos, float ndotl)
+{
+    if (baseSlot < 0) return 1.0;
+    vec3 dir = worldPos - lightPos;
+    vec3 ad  = abs(dir);
+    int face;
+    if (ad.x >= ad.y && ad.x >= ad.z) face = (dir.x >= 0.0) ? 0 : 1;
+    else if (ad.y >= ad.z)            face = (dir.y >= 0.0) ? 2 : 3;
+    else                              face = (dir.z >= 0.0) ? 4 : 5;
+    int slot  = baseSlot + face;
+    int vpIdx = (baseSlot - 4) + face;   // base 4/10 -> 0..11 (dynamic, ES3-ok)
+    return sampleAtlasTile(slot, u_pointCubeVP[vpIdx],
+                           worldPos, N, lightPos, ndotl, 0.0015);
 }
 
 // u_cookieParams.x = has_cookie_spot   (1.0 / 0.0)
@@ -298,6 +358,16 @@ uniform mat4 u_cookieSpotVP;
 // u_cookieDirParams.w = 0
 uniform vec4 u_cookieDirParams;
 uniform mat4 u_cookieDirVP;
+
+// ── Streaming LOD cross-fade (Direction B; dithered detail fade-in) ─────
+// u_lodFade.x = fade factor in [0,1] (0 = fully dithered out / invisible,
+//               1 = fully present); .w = active flag (>0.5 enables the
+//               screen-door discard).  DEFAULT is {1,0,0,0} (active=0), so
+//               the discard block below is skipped entirely and every
+//               normal draw is byte-identical to the pre-feature shader.
+//               Only the static-mesh draw path that is actively fading a
+//               freshly-streamed entity sets active=1.
+uniform vec4 u_lodFade;
 
 // Convert NDC depth to [0,1] range for shadow comparison.
 // OpenGL (GLSL): NDC z is in [-1,1], needs remap.
@@ -505,6 +575,50 @@ float fp_slice_for_view_z(float vz)
 /* Missing-texture checker lives in pbr_common.sh (missing_texture_checker):
    UV-space pattern with a dominant-axis local-space fallback. */
 
+// ── Streaming LOD cross-fade dither test (Direction B) ──────────────────
+// Returns true when the current fragment should be DISCARDED for the
+// dithered fade-in.  The 4x4 Bayer ordered-dither threshold is computed
+// arithmetically (NO GLSL array literals like `float t[16]=float[](...)`,
+// which break some bgfx shaderc backends).  The full block is gated so it
+// is a strict no-op unless u_lodFade is explicitly activated AND the fade
+// is still in progress (< ~1.0):
+//   * u_lodFade.w <= 0.5  -> inactive (default {1,0,0,0}) -> never discard
+//   * u_lodFade.x >= 0.999 -> fully faded in              -> never discard
+// fade.x = 0 discards every fragment; fade.x ramping 0->1 dissolves it in.
+// fragCoord MUST be passed in (gl_FragCoord.xy from the caller in main()):
+// bgfx/shaderc only exposes gl_FragCoord inside main() — referencing it in a
+// free function fails to compile on the HLSL (dx11) backend ("unknown variable
+// gl_FragCoord").  Taking it as a parameter keeps this helper portable.
+bool jce_lod_fade_discard(vec2 fragCoord)
+{
+    if (u_lodFade.w <= 0.5)   return false; // inactive (default)
+    if (u_lodFade.x >= 0.999) return false; // fully present -> keep all
+
+    // 4x4 Bayer matrix, value in [0,1), built without array literals.
+    // Standard recursive Bayer(4): index = 16*B4[y][x] mapped to threshold
+    // (B + 0.5)/16 to center the levels.  We reconstruct B4 arithmetically.
+    int bx = int(mod(fragCoord.x, 4.0));
+    int by = int(mod(fragCoord.y, 4.0));
+
+    // Bayer-4 matrix values (0..15):
+    //   row0:  0  8  2 10
+    //   row1: 12  4 14  6
+    //   row2:  3 11  1  9
+    //   row3: 15  7 13  5
+    float b = 0.0;
+    if (by == 0) {
+        b = (bx == 0) ? 0.0  : (bx == 1) ?  8.0 : (bx == 2) ?  2.0 : 10.0;
+    } else if (by == 1) {
+        b = (bx == 0) ? 12.0 : (bx == 1) ?  4.0 : (bx == 2) ? 14.0 :  6.0;
+    } else if (by == 2) {
+        b = (bx == 0) ? 3.0  : (bx == 1) ? 11.0 : (bx == 2) ?  1.0 :  9.0;
+    } else {
+        b = (bx == 0) ? 15.0 : (bx == 1) ?  7.0 : (bx == 2) ? 13.0 :  5.0;
+    }
+    float bayer = (b + 0.5) * (1.0 / 16.0); // (0.5..15.5)/16 -> (0,1)
+    return (u_lodFade.x < bayer);
+}
+
 void main()
 {
     // --- Shadow calculation ---
@@ -670,6 +784,17 @@ void main()
     }
     float alpha = texColor.a * u_baseColorFactor.a;
 
+#ifdef JCE_INST_TINT
+    /* Per-instance tint (large-world-opt P1 #7).  v_tint carries the entity's
+     * baseColor RGBA; multiplying here is the SAME operation a solo draw applies
+     * via u_baseColorFactor (the bound material for a batched run is the model's
+     * embedded material, so albedo = model_base * entity_tint == the solo
+     * override material's base color when that override only diverges in color).
+     * Tints are authored linear (like base_color_factor), so no gamma applied. */
+    albedo *= v_tint.rgb;
+    alpha  *= v_tint.a;
+#endif
+
     // --- View-mode dispatch ---------------------------------------------
     // u_normalScale.z carries JceSceneViewModeKind:
     //   0 SHADED              → fall through to full PBR lighting below
@@ -685,13 +810,18 @@ void main()
     // UV-space pink/black checker via useCheckerFallback above (never
     // a flat white loading surface).
     float viewMode = u_normalScale.z;
-    if (viewMode > 1.5)
+    if (viewMode > 1.5 && viewMode < 3.5)
     {
+        // Modes 2/3 (TEXTURED / WIREFRAME_TEXTURED): unlit albedo only.
         // Output albedo without lighting (gamma-correct for display).
+        // Streaming LOD cross-fade screen-door (no-op unless activated).
+        if (jce_lod_fade_discard(gl_FragCoord.xy)) discard;
         vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
         gl_FragColor = vec4(outRgb, alpha);
         return;
     }
+    // Debug channel views (4+) fall through to after the material values
+    // (normal/metallic/roughness/ao) are computed, then emit one channel.
 
     // --- Alpha mode ---
     float alphaMode = u_emissiveFactor.w;
@@ -758,6 +888,20 @@ void main()
         ao = mix(1.0, ao, u_pbrParams.z); // aoStrength blend
     }
 
+    // --- Debug channel views (mode 4+): emit one raw material channel, unlit,
+    //     after normal/metallic/roughness/ao are resolved. ---
+    if (viewMode > 3.5)
+    {
+        if (jce_lod_fade_discard(gl_FragCoord.xy)) discard;
+        vec3 dbg;
+        if      (viewMode < 4.5) dbg = N * 0.5 + vec3_splat(0.5);  // 4 normals
+        else if (viewMode < 5.5) dbg = vec3_splat(roughness);      // 5 roughness
+        else if (viewMode < 6.5) dbg = vec3_splat(metallic);       // 6 metallic
+        else                     dbg = vec3_splat(ao);             // 7 AO
+        gl_FragColor = vec4(dbg, 1.0);
+        return;
+    }
+
     // --- View direction ---
     vec3 V = normalize(u_cameraPos.xyz - v_worldpos);
 
@@ -816,8 +960,35 @@ void main()
         }
 
         float lightShadow = (abs(float(i) - float(shadowDirIndex)) < 0.5) ? shadow : 1.0;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * lightShadow;
+#ifdef JCE_TOON
+        // Soft-cel: quantize N·L into u_toonParams.x bands with a smoothstep
+        // edge of width u_toonParams.y, then add a small spec glint step.
+        {
+            float ndl   = max(dot(N, lightDir), 0.0);
+            float bands = max(u_toonParams.x, 2.0);
+            float soft  = max(u_toonParams.y, 0.001);
+            // stepped ramp: floor(ndl*bands)/bands, softened across each edge
+            float scaled = ndl * bands;
+            float lower  = floor(scaled) / bands;
+            float frac   = scaled - floor(scaled);
+            float celNdL = lower + smoothstep(0.5 - soft, 0.5 + soft, frac) / bands;
+            celNdL = clamp(celNdL, 0.0, 1.0);
+            Lo += albedo * radiance * celNdL * lightShadow;
+        }
+#else
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance * lightShadow;
+#endif
     }
+
+#ifdef JCE_TOON
+    // World-space rim added once (not per light): bright on the silhouette
+    // facing away from the camera.  Additive in linear; default path skips it.
+    {
+        float NdotV_rim = clamp(dot(N, V), 0.0, 1.0);
+        float rim = pow(1.0 - NdotV_rim, max(u_toonParams.z, 0.01));
+        Lo += u_toonRimColor.xyz * (rim * u_toonParams.w);
+    }
+#endif
 
 #ifdef JCE_FORWARDPLUS
     // ── Point + spot lights — Forward+ CLUSTERED path ───────────────────
@@ -916,7 +1087,7 @@ void main()
             // — shadowed lights still come through the directional/CSM path).
             // (Shadow-slot threading into the cluster params is a v2 follow-up.)
 
-            Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+            Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
         }
     }
 #else
@@ -950,11 +1121,23 @@ void main()
         float _pslotF = (_pl == 0) ? _pslotV.x :
                         (_pl == 1) ? _pslotV.y :
                         (_pl == 2) ? _pslotV.z : _pslotV.w;
-        if (u_normalScale.w < 0.5)   /* per-renderer Receive Shadows */
-            radiance *= sampleLocalShadow(int(_pslotF), v_worldpos, N, lightPos,
-                                          max(dot(N, lightDir), 0.0));
+        if (u_normalScale.w < 0.5) {  /* per-renderer Receive Shadows */
+            // #7: prefer the omni cube shadow when this point has a cube base
+            // slot (>=0); else the legacy single-downward tile.
+            vec4 _cbV = (_grp == 0) ? u_pointCubeBaseSlot[0] :
+                        (_grp == 1) ? u_pointCubeBaseSlot[1] :
+                        (_grp == 2) ? u_pointCubeBaseSlot[2] : u_pointCubeBaseSlot[3];
+            float _cbF = (_pl == 0) ? _cbV.x :
+                         (_pl == 1) ? _cbV.y :
+                         (_pl == 2) ? _cbV.z : _cbV.w;
+            float _nd = max(dot(N, lightDir), 0.0);
+            if (_cbF >= 0.0)
+                radiance *= samplePointCubeShadow(int(_cbF), v_worldpos, N, lightPos, _nd);
+            else
+                radiance *= sampleLocalShadow(int(_pslotF), v_worldpos, N, lightPos, _nd);
+        }
 
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
     }
 
     // --- Spot lights ---
@@ -1043,7 +1226,7 @@ void main()
             radiance *= sampleLocalShadow(int(_spotSlotF), v_worldpos, N, lightPos,
                                           max(dot(N, lightDir), 0.0));
 
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+        Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
     }
 #endif // JCE_FORWARDPLUS
 
@@ -1099,7 +1282,31 @@ void main()
     }
     else
     {
-        ambient = u_ambientColor.xyz * u_ambientColor.w * albedo * ao;
+        // Flat ambient (default) ── optionally blended into a two-color
+        // hemisphere: sky color (existing u_ambientColor) at the top,
+        // ground bounce (u_lookHemiGround.rgb) at the bottom, by world N.y.
+        // hemi_enabled==0 => h-blend collapses to pure sky color =>
+        // ambient == u_ambientColor.xyz * w * albedo * ao (unchanged).
+        // Only reached when NEITHER IBL nor SH9 is active (no double-count).
+        vec3 skyAmbient = u_ambientColor.xyz * u_ambientColor.w;
+        float h = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+        vec3 hemiColor = mix(u_lookHemiGround.xyz, skyAmbient, h);
+        vec3 ambientColor = mix(skyAmbient, hemiColor, u_lookHemiGround.w);
+        ambient = ambientColor * albedo * ao;
+    }
+
+    // --- World-space rim / fresnel (stylized silhouette separation) ---
+    // Additive in LINEAR space, into `color` downstream (here folded into
+    // `ambient` since `color = ambient + Lo + emissive` follows). Gated on
+    // the LIT side (toLightDir) so the rim only appears on the sun/sky-
+    // facing silhouette (BOTW separation). rim_intensity==0 => zero add.
+    {
+        float NdotV_r = clamp(dot(N, V), 0.0, 1.0);
+        float rim = pow(1.0 - NdotV_r, u_lookWrap.y);          // u_lookWrap.y = rim_power
+        rim *= smoothstep(0.0, 0.25, max(dot(N, toLightDir), 0.0));
+        // Suppress look-profile rim for toon entities (u_lookWrap.w=toonFlag=1)
+        // so the per-character toon rim (Lo+=u_toonRimColor*rim above) isn't doubled.
+        ambient += u_lookRim.xyz * (u_lookWrap.z * rim * (1.0 - u_lookWrap.w)); // u_lookWrap.z = rim_intensity
     }
 
     // --- Emissive ---
@@ -1110,6 +1317,13 @@ void main()
 
     // --- Final color ---
     vec3 color = ambient + Lo + emissive;
+
+    // --- Aerial-perspective fog (linear, before gamma) ---
+    // toLightDir is the unit dir from surface toward the shadow-casting sun
+    // (computed at the top of main, line ~514). v_viewdepth is positive
+    // view-space distance. No-op when u_fogParams.x < 0.5 (default).
+    color = apply_aerial_fog(color, v_viewdepth, v_worldpos,
+                             u_cameraPos.xyz, toLightDir);
 
     // --- Gamma correction (linear -> sRGB) ---
     // When postfx tonemap is enabled, keep linear output for post-processing.
@@ -1129,6 +1343,11 @@ void main()
                               * 43758.5453);
         color += vec3_splat((_dither - 0.5) / 255.0);
     }
+
+    // --- Streaming LOD cross-fade screen-door (no-op unless activated) ---
+    // Placed once before the final output so it covers both the blend
+    // (alphaMode==2.0) and the opaque output branches below.
+    if (jce_lod_fade_discard(gl_FragCoord.xy)) discard;
 
     // --- Output ---
     if (alphaMode == 2.0)

@@ -71,6 +71,17 @@ typedef struct {
     char            normal_tex[256];
     char            ao_tex[256];
     char            emissive_tex[256];
+    /* Per-character toon (stylized-slice §5.6).  Zero-default = OFF: legacy
+     * scenes without these keys round-trip byte-identical and render as plain
+     * PBR.  The scene renderer only honours `toon` when sr_toon_allowed
+     * (quality>=HIGH + valid pbr_toon program). */
+    bool            toon;
+    int             toon_bands;        /* cel bands (2..4); 0 => treated as 3 */
+    float           rim_power;         /* fresnel rim exponent */
+    float           rim_intensity;     /* 0 = no rim */
+    float           rim_color[3];      /* linear */
+    float           outline_width;     /* world-units hull extrusion; 0 = no outline */
+    float           outline_color[3];  /* linear */
 } JceMeshRenderer;
 
 typedef enum {
@@ -154,6 +165,15 @@ typedef enum {
     JCE_SCENE_SOFT_SHADOW_VSM = 2,
 } JceSceneSoftShadowMode;
 
+/* Tonemap operator for the postfx finish.  ACES is the legacy hardcoded
+ * curve (neutral default).  The postfx layer (plan 06) consumes the SAME
+ * 0/1/2 values — there is NO separate divergent enum. */
+typedef enum {
+    JCE_TONEMAP_ACES    = 0,
+    JCE_TONEMAP_NEUTRAL = 1,
+    JCE_TONEMAP_AGX     = 2,
+} JceSceneTonemapOp;
+
 /* Sky-rendering mode for the scene's sky pass.
  *   GRADIENT = the legacy 3-colour procedural gradient (default; also the
  *              target the time-of-day driver overrides each frame).
@@ -164,6 +184,7 @@ typedef enum {
     JCE_SCENE_SKY_GRADIENT = 0,
     JCE_SCENE_SKY_EQUIRECT = 1,
     JCE_SCENE_SKY_PREETHAM = 2,
+    JCE_SCENE_SKY_STYLIZED = 3,   /* multi-stop dome + horizon glow + sun disk/halo (golden-hour) */
 } JceSceneSkyMode;
 
 typedef struct {
@@ -262,6 +283,53 @@ typedef struct {
     bool  ssr_enabled;
     float ssr_intensity;     /* reflection strength, default 0.6 */
     float ssr_max_distance;  /* ray-march world distance, default 8.0 */
+
+    /* ── TAA tuning (temporal AA).  0 = engine defaults so scenes saved before
+     * these existed are byte-identical (feedback 0.9, clamps 1.0). Consumed in
+     * the editor game-render TAA setup (jce_postfx_set_taa). */
+    float taa_feedback;      /* 0 => 0.9 (higher = softer/more accumulation) */
+    float taa_luma_clamp;    /* 0 => 1.0 (variance-box softening) */
+    float taa_motion_clamp;  /* 0 => 1.0 (high-motion feedback drop) */
+
+    /* ── Look Profile (stylized vertical slice; foundation plan 02) ─────
+     * Continuous APPENDED block.  EVERY field is a neutral / algebraic
+     * no-op default so an old scene (block absent → defaults-first parse)
+     * and a LOW-tier render are BYTE-IDENTICAL to before this feature.
+     * Consumed by: plan 03 (wrap/hemisphere/rim in fs_pbr_body.sh),
+     * plan 04 (sky/fog reuse the EXISTING fog_* fields), plan 06 (tonemap/
+     * LUT/bloom_knee in the postfx layer).  AERIAL PERSPECTIVE reuses the
+     * existing fog_* fields above — do NOT add aerial_* fields here. */
+    float wrap_factor;             /* 0 = hard Lambert (neutral), ~0.35 soft */
+    bool  ambient_hemisphere;      /* false = neutral (flat u_ambientColor only) */
+    float ambient_ground_color[3]; /* bottom hemisphere bounce; TOP=u_ambientColor */
+    float rim_color[3];
+    float rim_power;
+    float rim_intensity;           /* 0 = neutral */
+    int   tonemap_op;              /* JceSceneTonemapOp (default ACES=0) */
+    char  lut_path[256];           /* "" = no LUT */
+    float lut_strength;            /* 0 = neutral */
+    bool  toon_character;          /* per-scene default; per-entity MeshRenderer.toon overrides */
+    float bloom_knee;              /* 0 = current hard cutoff (neutral) */
+
+    /* ── Stylized sky dome (sky_mode == JCE_SCENE_SKY_STYLIZED == 3) ───
+     * A multi-stop vertical color ramp + a horizon glow band + a sun
+     * disk/halo aligned to the directional sun (u_sky_sun_dir).  Absent
+     * in older scenes → loaded to the golden-hour defaults below but
+     * UNUSED unless sky_mode == 3 AND the "stylized_sky" feature gate is
+     * enabled (else the renderer downgrades mode 3 → Preetham/Gradient).
+     * Pure ALU in the fragment shader: no new view, RT, sampler or pass. */
+    float sky_dome_zenith[3];     /* top color (dir.y = +1)                 */
+    float sky_dome_mid[3];        /* mid-sky color                          */
+    float sky_dome_mid_pos;       /* dir.y where mid sits, [0,1] (def 0.45) */
+    float sky_dome_horizon[3];    /* horizon color (dir.y = 0)              */
+    float sky_dome_ground[3];     /* below-horizon color (dir.y < 0)        */
+    float sky_dome_glow[3];       /* horizon glow band color (additive)     */
+    float sky_dome_glow_falloff;  /* exp falloff: band=exp(-|dir.y|*this)   */
+    float sky_dome_sun_color[3];  /* sun disk + halo tint                   */
+    float sky_dome_sun_size;      /* cos-threshold for the disk core        */
+    float sky_dome_sun_softness;  /* smoothstep softness around the disk    */
+    float sky_dome_halo_power;    /* halo = pow(max(dot,0), this)           */
+    float sky_dome_halo_strength; /* halo additive strength                 */
 } JceSceneRenderingSettings;
 
 /* ── Scene-level world-streaming settings ───────────────────────────
@@ -658,6 +726,15 @@ typedef struct {
     float spatial_blend;
     bool  loop;
     bool  play_on_awake;
+    /* 3D attenuation authoring (large-world audio).  0 = legacy defaults
+     * (INVERSE, 1..25m, rolloff 1) so scenes saved before these existed are
+     * byte-identical.  attenuation_model: 0=default(INVERSE),1=NONE,2=INVERSE,
+     * 3=LINEAR,4=EXPONENTIAL.  mixer_bus "" = auto-derive by role. */
+    int   attenuation_model;
+    float min_distance;     /* 0 => 1.0 default */
+    float max_distance;     /* 0 => 25.0 default */
+    float rolloff_factor;   /* 0 => 1.0 default */
+    char  mixer_bus[64];
 } JceAudioSourceComponent;
 
 /* ── Music track component (adaptive / interactive music director) ────
@@ -837,9 +914,13 @@ typedef struct {
  * heightfield within an `area` rectangle centered on the entity, drawn with
  * GPU instancing.  Scatter math lives in jce_foliage.h; the renderer caches
  * the instance buffer and rebuilds it only when a parameter changes. */
+#define JCE_VEG_PAINT_DIM 64    /* in-editor density-paint grid resolution */
 typedef struct {
     char     mesh_path[256];     /* instanced mesh (.glb/.obj/model)              */
     char     albedo_path[256];   /* optional albedo override ("" = mesh material) */
+    char     density_mask_path[256]; /* optional grayscale density mask (large-world
+                                      * #8a): R channel over the area rect modulates
+                                      * per-instance keep-probability ("" = uniform) */
     float    density;            /* instances per square world unit (>0)          */
     uint32_t seed;               /* deterministic scatter seed                    */
     float    area_x;             /* scatter rectangle X size (world units)        */
@@ -851,7 +932,47 @@ typedef struct {
     bool     align_to_normal;    /* orient up-axis to terrain normal (else upright) */
     bool     cast_shadow;        /* submit instances to the shadow pass           */
     bool     visible;
+
+    /* In-editor painted density grid (large-world #8a foliage brush): a
+     * JCE_VEG_PAINT_DIM² grid of 0(sparse)..255(full) over the area rect.  When
+     * density_paint_active it SUPERSEDES density_mask_path; the brush carves it,
+     * the renderer feeds it to the scatter, and it serializes inline.  Default
+     * all-255 (full density = no change) when first enabled. */
+    bool     density_paint_active;
+    uint8_t  density_paint[JCE_VEG_PAINT_DIM * JCE_VEG_PAINT_DIM];
 } JceVegetationScatterComponent;
+
+/* ── Grass Field (GPU-instanced procedural blades + wind, Stage 1b.6) ──
+ * Showcase-tier grass: a dedicated component drawn by sr_draw_grass with ONE
+ * GPU-instanced submit per field (NOT the 4096-cap foliage loop, NOT the shared
+ * fs_pbr_body lit path).  Scatter fields mirror JceVegetationScatterComponent
+ * (deterministic jce_foliage_scatter over the bound terrain); the look fields
+ * drive the standalone vs_grass/fs_grass blade shaders.  Gated to
+ * instancing-capable HIGH/ULTRA GPUs + JceRenderSettings.grass_enabled. */
+typedef struct {
+    /* Scatter (mirrors JceVegetationScatterComponent's authorable scatter set). */
+    float    density;            /* blades per square world unit (>0)             */
+    uint32_t seed;               /* deterministic scatter seed                    */
+    float    area_x;             /* scatter rectangle X size (world units)        */
+    float    area_z;             /* scatter rectangle Z size                      */
+    float    max_slope_deg;      /* skip terrain steeper than this (>=90 = off)   */
+    float    scale_min;          /* per-blade uniform scale range (min<=max)      */
+    float    scale_max;
+    /* Look. */
+    float    blade_height;       /* world-unit blade height (mesh + per-blade scale base) */
+    float    blade_width;        /* world-unit blade base width                   */
+    int      cards;              /* crossed alpha cards per blade (3..6)          */
+    float    root_color[3];      /* darker root color (uv.y=0)                    */
+    float    tip_color[3];       /* lighter tip color (uv.y=1)                    */
+    float    wind_dir[2];        /* wind XZ direction (normalized in shader)      */
+    float    wind_speed;         /* wind temporal frequency                       */
+    float    wind_amplitude;     /* tip-sway world-unit amplitude                 */
+    float    fade_start;         /* distance (m) where height-collapse begins     */
+    float    fade_end;           /* distance (m) where blades fully collapse      */
+    float    hue_jitter;         /* per-blade green<->blue-green tint jitter [0..1] */
+    bool     cast_shadow;        /* v1: ignored (grass non-casting); reserved     */
+    bool     visible;
+} JceGrassFieldComponent;
 
 /* ── Water (Gerstner surface, P0 roadmap 2.3) ─────────────────────
  * A flat `size_x` × `size_z` water plane centered on the entity whose surface
@@ -922,6 +1043,25 @@ typedef struct {
     int   level_count;
     float hysteresis;          /* fraction (0..1) of distance overlap */
     bool  cull_when_too_far;   /* hide instead of pinning to last LOD */
+    /* Cross-fade band width (world meters) around each switch distance over
+     * which the LOD transition is blended (large-world-opt P1 #6).  0 = hard
+     * switch (the legacy behaviour, with hysteresis only).  Authoring hint
+     * consumed by the LOD selection (wider band = softer pop); serialized so a
+     * project can tune popping per LODGroup. */
+    float fade_width;
+
+    /* ── Octahedral impostor terminal LOD (roadmap P2 #10) ─────────────
+     * Beyond the last mesh LOD, render a single camera-facing card sampling a
+     * pre-baked octahedral atlas (RDR2 / Genshin / UE technique).  A whole
+     * forest of far trees collapses to a handful of instanced quads.
+     *
+     * impostor_meta_path: project-relative .impostor.json (atlas + grid + bounds
+     *   metadata produced by the editor "Bake Impostor" button).  Empty =>
+     *   no impostor (byte-identical to the pre-impostor LODGroup).
+     * impostor_distance: camera distance (world meters) at/beyond which the
+     *   impostor card replaces the mesh.  Should be >= the last LOD distance. */
+    char  impostor_meta_path[256];
+    float impostor_distance;
 } JceLodGroupComponent;
 
 /* ── Virtual Camera (Cinemachine-style cinematic camera) ───────── */
@@ -1997,6 +2137,59 @@ typedef struct {
     uint32_t reserved;         /* forward-compat padding (=0)                   */
 } JceSoftBodyComponent;
 
+/* ── Simulation LOD (distance-tiered gameplay tick, opt-in) ──────────
+ *
+ * Closes the open-world gameplay-CPU gap: M3 streams gameplay binary in/out
+ * with a cell, but every RESIDENT NPC/script/AI ticks at full frame rate.
+ * This component opts an entity into distance-tiered simulation: the runtime
+ * (rt_tick_gameplay) classifies it each frame by distance(entity, viewer)
+ * into NEAR / MID / FAR (with jce_lod hysteresis so a tier doesn't thrash on
+ * a boundary), and gates that entity's gameplay subsystems — its script
+ * on_update, nav-agent steering, and behavior-tree tick — to the tier's Hz
+ * via a per-entity accumulator (generalising the BehaviorTree tick cadence).
+ * When a gated update fires it is fed the ACCUMULATED dt since its last tick
+ * (not a fixed step), so time-based logic stays correct at any rate.
+ *
+ * NEAR (within near_radius) runs at near_hz (0 == every frame, the default —
+ * identical to no component); MID (near..mid radius) at mid_hz; FAR (beyond
+ * mid_radius) at far_hz.  An Hz of 0 means "every frame"; a NEGATIVE Hz means
+ * "pause this tier" (skip the gated subsystems entirely for that tier).
+ *
+ * `flags` selects WHICH subsystems the tier rate gates (a clear bit means the
+ * subsystem always runs full-rate even on a tiered entity).  Animation is
+ * gated separately via gate_anim_far (only far entities ever reduce anim
+ * sample rate; near/mid stay smooth).
+ *
+ * Presence-gated like Vehicle/Fracture/Ragdoll/SoftBody — there is NO
+ * JCE_COMP_FLAG bit (the 64-bit flag field is full).  No component present ->
+ * the entity ticks full-rate exactly as before (zero regression). */
+#define JCE_SIMLOD_GATE_SCRIPT  (1u << 0)  /* gate the Script on_update          */
+#define JCE_SIMLOD_GATE_NAV     (1u << 1)  /* gate the NavAgent steering         */
+#define JCE_SIMLOD_GATE_BT      (1u << 2)  /* gate the BehaviorTree tick         */
+/* Cost-tier gates (large-world #3): far tier sleeps the rigid body / freezes the
+ * skinned pose, bounding per-actor CPU in crowds.  OPT-IN — deliberately NOT in
+ * _ALL, so an entity with gate_mask 0 (=> _ALL) keeps full-rate physics+anim
+ * exactly as before.  Author gate_mask |= these bits to enable. */
+#define JCE_SIMLOD_GATE_PHYSICS (1u << 3)  /* far tier -> sleep the rigid body   */
+#define JCE_SIMLOD_GATE_ANIM    (1u << 4)  /* far tier -> freeze the skinned pose*/
+#define JCE_SIMLOD_GATE_ALL    (JCE_SIMLOD_GATE_SCRIPT | \
+                                JCE_SIMLOD_GATE_NAV | JCE_SIMLOD_GATE_BT)
+typedef struct {
+    bool     enabled;        /* designer toggle (default ON; OFF -> full-rate)  */
+    float    near_radius;    /* m; <=0 -> default 25                            */
+    float    mid_radius;     /* m; <=0 -> default 80 (>= near_radius)           */
+    float    near_hz;        /* tick Hz inside near_radius (0 = every frame)    */
+    float    mid_hz;         /* tick Hz in the mid band   (~10; 0 = every frame)*/
+    float    far_hz;         /* tick Hz beyond mid_radius (~1; <0 = pause)      */
+    uint32_t gate_mask;      /* JCE_SIMLOD_GATE_* bits (0 -> default = ALL)     */
+    bool     gate_anim_far;  /* authoring hint: reduce FAR-tier anim sample rate.
+                              * Read via jce_scene_get_sim_lod by a renderer that
+                              * opts in; the runtime gameplay tick does not own
+                              * the animation sample path, so this is a forward
+                              * authoring field (the script/nav/BT gating above is
+                              * the active CPU win). */
+} JceSimLodComponent;
+
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
 typedef uint64_t JceComponentFlag;
@@ -2094,6 +2287,18 @@ JCE_API JceSceneRenderingSettings *
                   jce_scene_get_rendering_settings_mut(JceScene *scene);
 JCE_API void      jce_scene_clear_rendering_settings(JceScene *scene);
 
+/* Thin JSON round-trip wrappers for rendering settings — useful for tests
+ * and tooling that operates on settings in isolation (without a full scene).
+ * to_json: serializes to a JSON string (caller must jce_json_free_string() the result).
+ * from_json: parses from that same JSON string; seeds from defaults so
+ *   absent keys land on golden-hour/neutral values (old-scene compat).
+ * Both accept a minimal flat format, e.g. {"sky":{"mode":2}}, as well as
+ * the full nested format produced by to_json. */
+JCE_API char *jce_scene_rendering_settings_to_json(
+                  const JceSceneRenderingSettings *r);
+JCE_API bool  jce_scene_rendering_settings_from_json(
+                  const char *json, JceSceneRenderingSettings *out);
+
 /* Scene-level world-streaming settings.  Same lifecycle contract as the
  * rendering settings (has/set/get/get_mut/clear), but the ~70 KB block is
  * heap-allocated lazily — scenes that never author streaming pay one
@@ -2160,6 +2365,21 @@ JCE_API jce_mat4  jce_scene_get_world_matrix(const JceScene *s, JceEntity e);
  * call this once at the top of its render frame to avoid reading a stale
  * cached matrix. Cheap and idempotent. */
 JCE_API void      jce_scene_invalidate_world_cache(JceScene *s);
+
+/* Per-frame world-matrix memo drop WITHOUT marking a structural edit.  Same
+ * intra-frame effect as jce_scene_invalidate_world_cache (drops the memoized
+ * matrices so a re-render reads transforms as they are now), but does NOT bump
+ * the structural epoch — so a host that renders WITHOUT jce_scene_update (the
+ * editor scene renderer + pick pass) can begin each render frame here and the
+ * renderer's cross-frame persistent static world-matrix/AABB cache survives a
+ * frame in which nothing was actually edited.  Use jce_scene_invalidate_world_
+ * cache (not this) after a real transform/parent/component edit. */
+JCE_API void      jce_scene_begin_render_world_cache(JceScene *s);
+
+/* Monotonic counter bumped only by jce_scene_invalidate_world_cache (i.e. by a
+ * real structural edit), never by the per-frame drops.  The scene renderer keys
+ * its cross-frame persistent static world-matrix + AABB cache on this. */
+JCE_API uint64_t  jce_scene_get_structural_epoch(const JceScene *s);
 
 /* Floating-origin rebase: add `shift` (metres, float[3]) to the LOCAL position
  * of every ROOT entity (one with no parent) that carries a JceTransform, then
@@ -2396,6 +2616,12 @@ JCE_API void                          jce_scene_set_vegetation_scatter(JceScene 
 JCE_API JceVegetationScatterComponent *jce_scene_get_vegetation_scatter(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_vegetation_scatter(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_vegetation_scatter(JceScene *s, JceEntity e);
+
+/* Component access — Grass Field (GPU-instanced procedural blades + wind). */
+JCE_API void                    jce_scene_set_grass_field(JceScene *s, JceEntity e, const JceGrassFieldComponent *c);
+JCE_API JceGrassFieldComponent *jce_scene_get_grass_field(JceScene *s, JceEntity e);
+JCE_API bool                    jce_scene_has_grass_field(const JceScene *s, JceEntity e);
+JCE_API void                    jce_scene_remove_grass_field(JceScene *s, JceEntity e);
 
 /* Component access — Water (Gerstner surface). */
 JCE_API void                          jce_scene_set_water(JceScene *s, JceEntity e, const JceWaterComponent *c);
@@ -2809,6 +3035,16 @@ JCE_API JceSoftBodyComponent         *jce_scene_get_soft_body(JceScene *s, JceEn
 JCE_API bool                          jce_scene_has_soft_body(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_soft_body(JceScene *s, JceEntity e);
 
+/* ── Simulation LOD authoring (presence-gated, no flag) ──────────────
+ * Designer-authored distance tiers (near/mid radius + per-tier Hz); the
+ * runtime (rt_tick_gameplay) gates this entity's script/nav/AI updates to the
+ * active tier's rate, folding the accumulated dt so logic stays time-correct.
+ * Presence-gated like SoftBody/Vehicle/Ragdoll (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_sim_lod(JceScene *s, JceEntity e, const JceSimLodComponent *c);
+JCE_API JceSimLodComponent           *jce_scene_get_sim_lod(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_sim_lod(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_sim_lod(JceScene *s, JceEntity e);
+
 /* ── Ragdoll pose relay (TRANSIENT, NOT serialized) ──────────────────
  * The runtime publishes the ragdoll's resolved per-bone LOCAL pose here each
  * physics step; the scene renderer reads it and evaluates it into the skin
@@ -2871,6 +3107,16 @@ JCE_API void     jce_scene_set_disabled_components(JceScene *s, JceEntity e, uin
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);
 JCE_API void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data);
+
+/* Scene-graph queries (Unity Find / OverlapSphere, Godot groups).  Each writes
+ * up to `max` matching entities into `out` and returns the count.  Iterate
+ * transform-bearing entities.  query_sphere tests transform-origin distance. */
+JCE_API int jce_scene_query_by_tag(JceScene *s, const char *tag,
+                                   JceEntity *out, int max);
+JCE_API int jce_scene_query_by_name(JceScene *s, const char *name,
+                                    JceEntity *out, int max);
+JCE_API int jce_scene_query_sphere(JceScene *s, jce_vec3 center, float radius,
+                                   JceEntity *out, int max);
 
 /* Get the flecs world (for advanced queries). */
 JCE_API void *jce_scene_get_world(JceScene *s);

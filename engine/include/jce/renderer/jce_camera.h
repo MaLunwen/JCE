@@ -81,6 +81,14 @@ JCE_API void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad);
 /* Look at a specific target from the current position. */
 JCE_API void jce_camera_look_at(JceCamera *cam, jce_vec3 target);
 
+/* Third-person orbit follow: place the camera behind + above `target` and look
+ * past it, using the camera's CURRENT horizontal forward as the orbit direction
+ * (so mouse-look orbits around the target).  Shared by the standalone runtime
+ * (jce_default_main) and the editor Game View so both frame a character-driven
+ * scene identically (WYSIWYG).  Offsets match the showcase default
+ * (7m back, 3m up, look 14m ahead at 1.6m height). */
+JCE_API void jce_camera_third_person_follow(JceCamera *cam, jce_vec3 target);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_CAMERA_H */

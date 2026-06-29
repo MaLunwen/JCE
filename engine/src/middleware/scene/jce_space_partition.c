@@ -2,13 +2,23 @@
  * jce_space_partition.c  Spatial partitioning — uniform-grid backend.
  *
  * Strategy
- *   - 3-D fixed-resolution grid (default 64×64×64 cells inside the
- *     configured world bounds; degenerate axes collapse to 1).
+ *   - 3-D uniform grid whose per-axis resolution is derived from the
+ *     configured world bounds extent / a target cell size (~24 m),
+ *     clamped to [1, JCE_GRID_MAX_CELLS]; degenerate axes collapse to 1.
+ *     A small world allocates few cells; a multi-km world gets a fine
+ *     grid so dense regions don't collapse into a handful of cells.
  *   - Each cell holds a small dynamic list of object handles.
  *   - Objects are rasterised across every cell their AABB overlaps,
  *     so a query needs no per-cell linked traversal.
+ *   - A persistent list of OCCUPIED cell indices is maintained so a full
+ *     scan (frustum query) visits only non-empty cells instead of res³.
  *   - Queries deduplicate visited objects with a per-call epoch stamp
  *     so an object touching N cells is reported once.
+ *   - The broad-phase is PERSISTENT: an object is inserted once and kept
+ *     across frames; jce_space_update re-buckets only when its cell range
+ *     actually changes (static objects then cost ~0/frame), and
+ *     jce_space_remove drops it on despawn.  user_id may be refreshed
+ *     in place (jce_space_set_user_id) without touching the cell lists.
  *   - JCE_SPACE_BVH and JCE_SPACE_OCTREE silently fall back to the
  *     grid for now (logged once, behaviour identical).
  *
@@ -28,7 +38,15 @@
 
 #define LOG_TAG "space_partition"
 
-#define JCE_GRID_DEFAULT_CELLS   32u   /* cells per axis (32^3 = 32k cells) */
+/* Extent-sized resolution: res_axis = clamp(extent_axis / target_cell, 1, MAX).
+ * The target cell size trades grid memory for per-cell occupancy: ~24 m keeps a
+ * downtown block's worth of objects per cell while a 5 km world still stays
+ * under the per-axis cap (5000/24 ≈ 208 < 256).  MIN_CELLS keeps a tiny world
+ * from degenerating to a 1×1×1 grid (which would linear-scan every object). */
+#define JCE_GRID_TARGET_CELL     24.0f /* world units per cell (per axis)     */
+#define JCE_GRID_MIN_CELLS       4u    /* floor per axis (small worlds)       */
+#define JCE_GRID_MAX_CELLS       256u  /* ceiling per axis (5 km @ 24 m/cell) */
+#define JCE_GRID_MAX_TOTAL_CELLS (1u << 21) /* 2,097,152 — total-cell safety cap */
 #define JCE_GRID_INITIAL_OBJ_CAP 256u
 #define JCE_GRID_INITIAL_CELL    4u    /* per-cell list capacity */
 
@@ -48,6 +66,7 @@ typedef struct {
     uint32_t *items;
     uint32_t  count;
     uint32_t  cap;
+    int32_t   occ_slot;   /* index into occupied[] when count>0, else -1 */
 } JceCell;
 
 struct JceSpaceIndex {
@@ -58,6 +77,13 @@ struct JceSpaceIndex {
     uint32_t      cell_count;     /* res[0]*res[1]*res[2] */
 
     JceCell      *cells;
+
+    /* Dense list of currently non-empty cell indices, so a full scan visits
+     * only occupied cells instead of all res³.  Maintained incrementally: a
+     * cell joins on its first push and leaves (swap-pop) on its last remove. */
+    uint32_t     *occupied;
+    uint32_t      occupied_count;
+    uint32_t      occupied_cap;
 
     JceSpaceObj  *objs;
     uint32_t      obj_cap;
@@ -109,9 +135,41 @@ static void jce__cell_range_for_aabb(const JceSpaceIndex *g, JceAABB b,
     jce__cell_for_point(g, b.max, mx);
 }
 
-/* Append a handle to a cell's item list. */
-static void jce__cell_push(JceCell *c, uint32_t handle)
+/* Mark a cell occupied (append to the occupied list) on its first item. */
+static void jce__cell_mark_occupied(JceSpaceIndex *g, uint32_t cell_idx)
 {
+    JceCell *c = &g->cells[cell_idx];
+    if (c->occ_slot >= 0) return;          /* already listed */
+    if (g->occupied_count == g->occupied_cap) {
+        const uint32_t new_cap = g->occupied_cap ? g->occupied_cap * 2u : 64u;
+        g->occupied = (uint32_t *)JCE_REALLOC(g->occupied,
+                                              new_cap * sizeof(uint32_t));
+        g->occupied_cap = new_cap;
+    }
+    c->occ_slot = (int32_t)g->occupied_count;
+    g->occupied[g->occupied_count++] = cell_idx;
+}
+
+/* Drop a cell from the occupied list (swap-pop) when its last item leaves. */
+static void jce__cell_mark_empty(JceSpaceIndex *g, uint32_t cell_idx)
+{
+    JceCell *c = &g->cells[cell_idx];
+    if (c->occ_slot < 0) return;
+    const uint32_t slot = (uint32_t)c->occ_slot;
+    const uint32_t last = --g->occupied_count;
+    if (slot != last) {
+        const uint32_t moved = g->occupied[last];
+        g->occupied[slot] = moved;
+        g->cells[moved].occ_slot = (int32_t)slot;
+    }
+    c->occ_slot = -1;
+}
+
+/* Append a handle to a cell's item list. */
+static void jce__cell_push(JceSpaceIndex *g, uint32_t cell_idx, uint32_t handle)
+{
+    JceCell *c = &g->cells[cell_idx];
+    if (c->count == 0) jce__cell_mark_occupied(g, cell_idx);
     if (c->count == c->cap) {
         const uint32_t new_cap = c->cap ? c->cap * 2u : JCE_GRID_INITIAL_CELL;
         c->items = (uint32_t *)JCE_REALLOC(c->items, new_cap * sizeof(uint32_t));
@@ -121,11 +179,13 @@ static void jce__cell_push(JceCell *c, uint32_t handle)
 }
 
 /* Swap-pop a handle from a cell. */
-static void jce__cell_remove(JceCell *c, uint32_t handle)
+static void jce__cell_remove(JceSpaceIndex *g, uint32_t cell_idx, uint32_t handle)
 {
+    JceCell *c = &g->cells[cell_idx];
     for (uint32_t i = 0; i < c->count; i++) {
         if (c->items[i] == handle) {
             c->items[i] = c->items[--c->count];
+            if (c->count == 0) jce__cell_mark_empty(g, cell_idx);
             return;
         }
     }
@@ -137,7 +197,7 @@ static void jce__add_to_cells(JceSpaceIndex *g, uint32_t handle,
     for (int32_t z = mn[2]; z <= mx[2]; z++)
     for (int32_t y = mn[1]; y <= mx[1]; y++)
     for (int32_t x = mn[0]; x <= mx[0]; x++) {
-        jce__cell_push(&g->cells[jce__cell_index(g, x, y, z)], handle);
+        jce__cell_push(g, jce__cell_index(g, x, y, z), handle);
     }
 }
 
@@ -147,7 +207,7 @@ static void jce__remove_from_cells(JceSpaceIndex *g, uint32_t handle,
     for (int32_t z = mn[2]; z <= mx[2]; z++)
     for (int32_t y = mn[1]; y <= mx[1]; y++)
     for (int32_t x = mn[0]; x <= mx[0]; x++) {
-        jce__cell_remove(&g->cells[jce__cell_index(g, x, y, z)], handle);
+        jce__cell_remove(g, jce__cell_index(g, x, y, z), handle);
     }
 }
 
@@ -203,6 +263,39 @@ static float jce__ray_aabb(jce_vec3 o, jce_vec3 d, float max_dist, JceAABB b)
 }
 
 /* ================================================================== */
+/* Resolution sizing                                                   */
+/* ================================================================== */
+
+/* Derive the per-axis cell count from the world extent / target cell size,
+ * clamped to [MIN, MAX].  Degenerate (<= 0) axes collapse to 1.  A final pass
+ * shrinks the largest axes proportionally if the total cell count would blow
+ * past JCE_GRID_MAX_TOTAL_CELLS (a thin, very long world could otherwise hit
+ * 256×256×N).  Pure function of `world`; called by create + reset. */
+static void jce__derive_resolution(const JceAABB *world, int32_t res[3])
+{
+    const float ext[3] = {
+        world->max.x - world->min.x,
+        world->max.y - world->min.y,
+        world->max.z - world->min.z,
+    };
+    for (int a = 0; a < 3; a++) {
+        if (ext[a] <= 0.0f) { res[a] = 1; continue; }
+        int32_t r = (int32_t)(ext[a] / JCE_GRID_TARGET_CELL);
+        if (r < (int32_t)JCE_GRID_MIN_CELLS) r = (int32_t)JCE_GRID_MIN_CELLS;
+        if (r > (int32_t)JCE_GRID_MAX_CELLS) r = (int32_t)JCE_GRID_MAX_CELLS;
+        res[a] = r;
+    }
+    /* Total-cell safety cap: halve the largest axis until under the ceiling. */
+    while ((uint64_t)res[0] * (uint64_t)res[1] * (uint64_t)res[2]
+           > (uint64_t)JCE_GRID_MAX_TOTAL_CELLS) {
+        int amax = (res[0] >= res[1] && res[0] >= res[2]) ? 0
+                 : (res[1] >= res[2] ? 1 : 2);
+        if (res[amax] <= 1) break;          /* cannot shrink further */
+        res[amax] = (res[amax] + 1) / 2;    /* round up so it never hits 0 */
+    }
+}
+
+/* ================================================================== */
 /* Lifecycle                                                           */
 /* ================================================================== */
 
@@ -237,9 +330,14 @@ JceSpaceIndex *jce_space_create(const JceSpaceConfig *config)
     g->inv_extent.y = 1.0f / (g->world.max.y - g->world.min.y);
     g->inv_extent.z = 1.0f / (g->world.max.z - g->world.min.z);
 
-    g->res[0] = g->res[1] = g->res[2] = (int32_t)JCE_GRID_DEFAULT_CELLS;
+    jce__derive_resolution(&g->world, g->res);
     g->cell_count = (uint32_t)g->res[0] * (uint32_t)g->res[1] * (uint32_t)g->res[2];
     g->cells = (JceCell *)JCE_CALLOC(g->cell_count, sizeof(JceCell));
+    /* CALLOC zeroes occ_slot; an empty cell must read -1 ("not listed"). */
+    for (uint32_t i = 0; i < g->cell_count; i++) g->cells[i].occ_slot = -1;
+    g->occupied      = NULL;
+    g->occupied_cap  = 0;
+    g->occupied_count = 0;
 
     const uint32_t hint = config->max_objects ? config->max_objects
                                               : JCE_GRID_INITIAL_OBJ_CAP;
@@ -251,8 +349,8 @@ JceSpaceIndex *jce_space_create(const JceSpaceConfig *config)
     /* Mark every slot unused. */
     for (uint32_t i = 0; i < g->obj_cap; i++) g->objs[i].cmin[0] = -1;
 
-    LOG_INFO(LOG_TAG, "uniform grid: %dx%dx%d cells, world [%.1f..%.1f]^3, hint=%u objs",
-             g->res[0], g->res[1], g->res[2],
+    LOG_INFO(LOG_TAG, "uniform grid: %dx%dx%d (%u) cells, world [%.1f..%.1f]^3, hint=%u objs",
+             g->res[0], g->res[1], g->res[2], g->cell_count,
              g->world.min.x, g->world.max.x, hint);
     return g;
 }
@@ -264,6 +362,7 @@ void jce_space_destroy(JceSpaceIndex *g)
         for (uint32_t i = 0; i < g->cell_count; i++) JCE_FREE(g->cells[i].items);
         JCE_FREE(g->cells);
     }
+    JCE_FREE(g->occupied);
     JCE_FREE(g->objs);
     JCE_FREE(g->free_list);
     JCE_FREE(g);
@@ -273,11 +372,19 @@ void jce_space_reset(JceSpaceIndex *g, const JceAABB *new_bounds)
 {
     if (!g) return;
 
-    /* Drop every object: zero each cell's count (keep its capacity), wipe
-     * the free-list, and mark every slot unused. */
+    /* Drop every object: only the OCCUPIED cells hold items, so zero just those
+     * (was: scan all res³ cells every reset — the per-frame rebuild cost the
+     * persistent path now avoids; the occupied list keeps even the legacy reset
+     * proportional to live occupancy).  Then clear the occupied list, wipe the
+     * free-list, and mark every object slot unused. */
     if (g->cells) {
-        for (uint32_t i = 0; i < g->cell_count; i++) g->cells[i].count = 0;
+        for (uint32_t i = 0; i < g->occupied_count; i++) {
+            JceCell *c = &g->cells[g->occupied[i]];
+            c->count    = 0;
+            c->occ_slot = -1;
+        }
     }
+    g->occupied_count = 0;
     for (uint32_t i = 0; i < g->obj_cap; i++) g->objs[i].cmin[0] = -1;
     g->obj_count   = 0;
     g->free_count  = 0;
@@ -299,6 +406,31 @@ void jce_space_reset(JceSpaceIndex *g, const JceAABB *new_bounds)
         g->inv_extent.x  = 1.0f / (nb.max.x - nb.min.x);
         g->inv_extent.y  = 1.0f / (nb.max.y - nb.min.y);
         g->inv_extent.z  = 1.0f / (nb.max.z - nb.min.z);
+
+        /* Re-derive the resolution from the new extent; reallocate the cell
+         * grid only when the cell count actually changes (a small bounds wobble
+         * frame-to-frame keeps the same grid → no realloc churn). */
+        int32_t nres[3];
+        jce__derive_resolution(&g->world, nres);
+        if (nres[0] != g->res[0] || nres[1] != g->res[1] || nres[2] != g->res[2]) {
+            const uint32_t ncount = (uint32_t)nres[0] * (uint32_t)nres[1]
+                                  * (uint32_t)nres[2];
+            JceCell *ncells = (JceCell *)JCE_CALLOC(ncount, sizeof(JceCell));
+            if (ncells) {
+                /* Free the old per-cell item lists (objects were already
+                 * dropped above, so nothing is lost). */
+                if (g->cells) {
+                    for (uint32_t i = 0; i < g->cell_count; i++)
+                        JCE_FREE(g->cells[i].items);
+                    JCE_FREE(g->cells);
+                }
+                for (uint32_t i = 0; i < ncount; i++) ncells[i].occ_slot = -1;
+                g->cells      = ncells;
+                g->cell_count = ncount;
+                g->res[0] = nres[0]; g->res[1] = nres[1]; g->res[2] = nres[2];
+            }
+            /* On OOM keep the old grid (still correct, just coarser). */
+        }
     }
 }
 
@@ -357,6 +489,14 @@ void jce_space_update(JceSpaceIndex *g, uint32_t handle, JceAABB new_bounds)
         jce__add_to_cells(g, handle - 1u, mn, mx);
     }
     o->bounds = new_bounds;
+}
+
+void jce_space_set_user_id(JceSpaceIndex *g, uint32_t handle, uint32_t user_id)
+{
+    if (!g || handle == 0 || handle > g->obj_cap) return;
+    JceSpaceObj *o = &g->objs[handle - 1u];
+    if (o->cmin[0] < 0) return;            /* freed slot */
+    o->user_id = user_id;
 }
 
 void jce_space_remove(JceSpaceIndex *g, uint32_t handle)
@@ -424,15 +564,27 @@ uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
     const float cell_dx = (g->world.max.x - g->world.min.x) / (float)g->res[0];
     const float cell_dy = (g->world.max.y - g->world.min.y) / (float)g->res[1];
     const float cell_dz = (g->world.max.z - g->world.min.z) / (float)g->res[2];
+    const int32_t res0 = g->res[0], res1 = g->res[1];
+    const int32_t plane = res0 * res1;
 
     const uint32_t epoch = ++g->query_epoch;
     uint32_t found = 0;
 
-    for (int32_t z = 0; z < g->res[2]; z++)
-    for (int32_t y = 0; y < g->res[1]; y++)
-    for (int32_t x = 0; x < g->res[0]; x++) {
-        /* Cell-coarse reject: skip the whole cell if its AABB sits
-         * outside any frustum plane. */
+    /* Iterate only the OCCUPIED cells (a dense list maintained on push/remove)
+     * instead of all res³ — on a sparse streamed world the empty-space scan is
+     * what made a fine grid expensive, and it produced ZERO extra candidates.
+     * Same per-cell coarse frustum reject + per-object dedup as before, so the
+     * result set is byte-identical to the full scan. */
+    for (uint32_t oc = 0; oc < g->occupied_count; oc++) {
+        const uint32_t ci = g->occupied[oc];
+        /* Decompose the linear cell index back to (x,y,z) for its world AABB. */
+        const int32_t z = (int32_t)(ci / (uint32_t)plane);
+        const int32_t rem = (int32_t)(ci - (uint32_t)z * (uint32_t)plane);
+        const int32_t y = rem / res0;
+        const int32_t x = rem - y * res0;
+
+        /* Cell-coarse reject: skip the whole cell if its AABB sits outside
+         * any frustum plane. */
         JceAABB cell_aabb;
         cell_aabb.min.x = g->world.min.x + (float)x * cell_dx;
         cell_aabb.min.y = g->world.min.y + (float)y * cell_dy;
@@ -442,7 +594,7 @@ uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
         cell_aabb.max.z = cell_aabb.min.z + cell_dz;
         if (!jce__aabb_inside_frustum(cell_aabb, planes)) continue;
 
-        const JceCell *c = &g->cells[jce__cell_index(g, x, y, z)];
+        const JceCell *c = &g->cells[ci];
         for (uint32_t i = 0; i < c->count; i++) {
             const uint32_t slot = c->items[i];
             JceSpaceObj *o = &g->objs[slot];
@@ -570,4 +722,23 @@ uint32_t jce_space_object_count(const JceSpaceIndex *g)
 {
     if (!g) return 0;
     return g->obj_count - g->free_count;
+}
+
+uint32_t jce_space_cell_count(const JceSpaceIndex *g)
+{
+    return g ? g->cell_count : 0;
+}
+
+uint32_t jce_space_occupied_cell_count(const JceSpaceIndex *g)
+{
+    return g ? g->occupied_count : 0;
+}
+
+void jce_space_resolution(const JceSpaceIndex *g, uint32_t out_res[3])
+{
+    if (!out_res) return;
+    if (!g) { out_res[0] = out_res[1] = out_res[2] = 0; return; }
+    out_res[0] = (uint32_t)g->res[0];
+    out_res[1] = (uint32_t)g->res[1];
+    out_res[2] = (uint32_t)g->res[2];
 }

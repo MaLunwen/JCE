@@ -248,6 +248,78 @@ void draw_comp_terrain(JceTerrainComponent *tc)
     }
 }
 
+/* ── Foliage density paint brush (large-world #8a) ───────────────────────────
+ * Armed from the VegetationScatter inspector; the scene view raycasts the terrain
+ * (reusing the terrain-brush plumbing) and calls jce_foliage_brush_apply_world,
+ * which carves the FOCUSED entity's density_paint grid with a radial falloff.
+ * The grid feeds the scatter (sr_draw_foliage) so painted-sparse areas thin out. */
+static struct {
+    bool  armed;
+    float radius;       /* world units */
+    float strength;     /* 0..1 per stroke-frame */
+    bool  erase;        /* lower density (true) vs raise (false) */
+    bool  stroke_open;
+} g_veg_brush = { false, 8.0f, 0.5f, true, false };
+
+extern "C" bool jce_foliage_brush_armed(void) { return g_veg_brush.armed; }
+
+extern "C" void jce_foliage_brush_end_stroke(void)
+{
+    if (g_veg_brush.stroke_open) {
+        jce_state_end_batch_edit();
+        g_veg_brush.stroke_open = false;
+    }
+}
+
+extern "C" void jce_foliage_brush_apply_world(float wx, float wz, float dt)
+{
+    JceScene *scene = jce_state_get_scene();
+    uint32_t  fid   = jce_state_get_focused();
+    if (!scene || !fid) return;
+    JceEntity e = jce_state_to_ecs_entity(fid);
+    JceVegetationScatterComponent *vs = jce_scene_get_vegetation_scatter(scene, e);
+    if (!vs || !vs->density_paint_active) return;
+
+    jce_mat4 wm = jce_scene_get_world_matrix(scene, e);
+    float ox = wm.col[3].x, oz = wm.col[3].z;
+    float ax = vs->area_x > 0.01f ? vs->area_x : 1.0f;
+    float az = vs->area_z > 0.01f ? vs->area_z : 1.0f;
+    const int DIM = JCE_VEG_PAINT_DIM;
+    float cu  = ((wx - ox) / ax + 0.5f) * (float)DIM;   /* brush centre in cells */
+    float cv  = ((wz - oz) / az + 0.5f) * (float)DIM;
+    float rcx = (g_veg_brush.radius / ax) * (float)DIM;
+    float rcz = (g_veg_brush.radius / az) * (float)DIM;
+    float rc  = rcx > rcz ? rcx : rcz;
+    if (rc < 0.5f) rc = 0.5f;
+
+    if (!g_veg_brush.stroke_open) {
+        jce_state_begin_batch_edit();
+        g_veg_brush.stroke_open = true;
+    }
+
+    float per = g_veg_brush.strength * 255.0f *
+                (dt > 0.0f ? (dt * 6.0f < 1.0f ? dt * 6.0f : 1.0f) : 1.0f);
+    int x0 = (int)floorf(cu - rc), x1 = (int)ceilf(cu + rc);
+    int z0 = (int)floorf(cv - rc), z1 = (int)ceilf(cv + rc);
+    if (x0 < 0) x0 = 0;
+    if (z0 < 0) z0 = 0;
+    if (x1 > DIM - 1) x1 = DIM - 1;
+    if (z1 > DIM - 1) z1 = DIM - 1;
+    for (int z = z0; z <= z1; ++z)
+        for (int x = x0; x <= x1; ++x) {
+            float du = (x + 0.5f) - cu, dv = (z + 0.5f) - cv;
+            float d  = sqrtf(du * du + dv * dv);
+            if (d > rc) continue;
+            int delta = (int)(per * (1.0f - d / rc));   /* linear falloff */
+            int v = (int)vs->density_paint[z * DIM + x] +
+                    (g_veg_brush.erase ? -delta : delta);
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            vs->density_paint[z * DIM + x] = (uint8_t)v;
+        }
+    jce_state_mark_scene_modified();
+}
+
 void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
 {
     if (!vs) return;
@@ -264,6 +336,49 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
                                   sizeof vs->albedo_path, JCE_ASSET_KIND_TEXTURE))
         ch = true;
     accept_asset_drop(vs->albedo_path, sizeof vs->albedo_path);
+
+    /* Density mask (large-world #8a): a grayscale texture whose R channel over
+     * the area rect modulates per-instance keep-probability — sparse where dark,
+     * dense where bright.  Empty = uniform density. */
+    ImGui::TextUnformatted(jce_editor_i18n_id("inspector.vegetationScatter.densityMask",
+                                              "Density Mask (grayscale)"));
+    if (jce_draw_path_input_asset("##veg_density_mask", vs->density_mask_path,
+                                  sizeof vs->density_mask_path, JCE_ASSET_KIND_TEXTURE))
+        ch = true;
+    accept_asset_drop(vs->density_mask_path, sizeof vs->density_mask_path);
+
+    /* In-editor density paint brush (large-world #8a): paint the density grid
+     * directly on the terrain in Scene View (supersedes the mask asset). */
+    ImGui::Separator();
+    bool was_paint = vs->density_paint_active;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.densityPaint",
+                                           "Density Paint (in-editor)"),
+                        &vs->density_paint_active)) {
+        ch = true;
+        if (vs->density_paint_active && !was_paint)
+            memset(vs->density_paint, 255, sizeof vs->density_paint);  /* full on enable */
+    }
+    if (vs->density_paint_active) {
+        ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.paintInScene",
+                                           "Paint in Scene"), &g_veg_brush.armed);
+        ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushRadius",
+                                              "Brush Radius"),
+                           &g_veg_brush.radius, 0.5f, 128.0f, "%.1f");
+        ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushStrength",
+                                              "Brush Strength"),
+                           &g_veg_brush.strength, 0.0f, 1.0f, "%.2f");
+        ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.brushErase",
+                                           "Erase (lower density)"), &g_veg_brush.erase);
+        if (ImGui::Button(jce_editor_i18n_id("inspector.vegetationScatter.fillFull", "Fill Full"))) {
+            memset(vs->density_paint, 255, sizeof vs->density_paint); ch = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(jce_editor_i18n_id("inspector.vegetationScatter.clearEmpty", "Clear"))) {
+            memset(vs->density_paint, 0, sizeof vs->density_paint); ch = true;
+        }
+        ImGui::TextDisabled("(%s)", jce_editor_i18n_id("inspector.vegetationScatter.paintNote",
+            "Arm 'Paint in Scene' + drag on the terrain to carve density."));
+    }
 
     ch |= ImGui::DragFloat(jce_editor_i18n("inspector.vegetationScatter.density"),
                            &vs->density, 0.05f, 0.0f, 1000.0f, "%.2f");
@@ -299,6 +414,88 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
     long est = (long)((double)vs->density * (double)vs->area_x * (double)vs->area_z);
     ImGui::TextDisabled("%s: %ld",
                         jce_editor_i18n("inspector.vegetationScatter.estimate"), est);
+
+    if (ch) insp_track_edit();
+}
+
+void draw_comp_grass_field(JceGrassFieldComponent *g)
+{
+    if (!g) return;
+    bool ch = false;
+
+    /* --- Scatter --- */
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.density"),
+                           &g->density, 0.05f, 0.001f, 10000.0f, "%.3f");
+
+    uint32_t seed_step = 1;
+    uint32_t seed_min  = 0;
+    uint32_t seed_max  = 0xFFFFFFFFu;
+    if (ImGui::DragScalar(jce_editor_i18n("inspector.grassField.seed"),
+                          ImGuiDataType_U32, &g->seed, 1.0f, &seed_min, &seed_max))
+        ch = true;
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n("inspector.grassField.reseed"))) {
+        g->seed = g->seed * 1664525u + 1013904223u;
+        ch = true;
+    }
+
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaX"),
+                           &g->area_x, 0.5f, 0.0f, 100000.0f, "%.1f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaZ"),
+                           &g->area_z, 0.5f, 0.0f, 100000.0f, "%.1f");
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.maxSlope"),
+                             &g->max_slope_deg, 0.0f, 90.0f, "%.1f");
+
+    /* --- Blade geometry --- */
+    ImGui::Separator();
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMin"),
+                           &g->scale_min, 0.01f, 0.0f, 100.0f, "%.3f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMax"),
+                           &g->scale_max, 0.01f, 0.0f, 100.0f, "%.3f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeHeight"),
+                           &g->blade_height, 0.01f, 0.0f, 100.0f, "%.3f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeWidth"),
+                           &g->blade_width, 0.001f, 0.0f, 10.0f, "%.4f");
+    ch |= ImGui::SliderInt(jce_editor_i18n("inspector.grassField.cards"),
+                           &g->cards, 3, 6);
+
+    /* --- Color --- */
+    ImGui::Separator();
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.rootColor"), g->root_color);
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.tipColor"),  g->tip_color);
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.hueJitter"),
+                             &g->hue_jitter, 0.0f, 1.0f, "%.3f");
+
+    /* --- Wind --- */
+    ImGui::Separator();
+    ch |= ImGui::DragFloat2(jce_editor_i18n("inspector.grassField.windDir"),
+                            g->wind_dir, 0.01f, -1.0f, 1.0f, "%.3f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windSpeed"),
+                           &g->wind_speed, 0.01f, 0.0f, 100.0f, "%.3f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windAmplitude"),
+                           &g->wind_amplitude, 0.005f, 0.0f, 10.0f, "%.4f");
+
+    /* --- Fade --- */
+    ImGui::Separator();
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeStart"),
+                           &g->fade_start, 1.0f, 0.0f, 100000.0f, "%.1f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeEnd"),
+                           &g->fade_end, 1.0f, 0.0f, 100000.0f, "%.1f");
+
+    /* --- Flags --- */
+    ImGui::Separator();
+    {
+        ImGui::BeginDisabled(true);
+        ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.castShadow"), &g->cast_shadow);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.grassField.reserved"));
+    }
+    ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.visible"), &g->visible);
+
+    /* Estimate blade count */
+    long est = (long)((double)g->density * (double)g->area_x * (double)g->area_z);
+    ImGui::TextDisabled("%s: %ld", jce_editor_i18n("inspector.grassField.estimate"), est);
 
     if (ch) insp_track_edit();
 }
@@ -493,6 +690,58 @@ void draw_comp_nav_agent(JceNavAgentComponent *na)
     }
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.nav.autoRepath", "nav"), &na->auto_repath))
         insp_undo_bool(&na->auto_repath);
+}
+
+void draw_comp_sim_lod(JceSimLodComponent *sl)
+{
+    if (!sl) return;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.simlod.enabled", "simlod"),
+                        &sl->enabled))
+        insp_undo_bool(&sl->enabled);
+    if (!sl->enabled) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.simlod.disabledNote"));
+        return;
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.simlod.nearRadius", "simlod"),
+                     &sl->near_radius, 0.5f, 0.0f, 100000.0f, "%.1f m");
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.simlod.midRadius", "simlod"),
+                     &sl->mid_radius, 0.5f, 0.0f, 100000.0f, "%.1f m");
+    insp_track_edit();
+    /* Keep mid >= near so the bands never invert. */
+    if (sl->mid_radius < sl->near_radius) sl->mid_radius = sl->near_radius;
+    ImGui::Separator();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.simlod.nearHz", "simlod"),
+                     &sl->near_hz, 0.5f, 0.0f, 240.0f, "%.1f Hz");
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.simlod.midHz", "simlod"),
+                     &sl->mid_hz, 0.5f, 0.0f, 240.0f, "%.1f Hz");
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.simlod.farHz", "simlod"),
+                     &sl->far_hz, 0.25f, -1.0f, 240.0f, "%.2f Hz");
+    insp_track_edit();
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.simlod.hzNote"));
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.simlod.gates"));
+    uint32_t mask = sl->gate_mask ? sl->gate_mask : (uint32_t)JCE_SIMLOD_GATE_ALL;
+    bool g_script = (mask & JCE_SIMLOD_GATE_SCRIPT) != 0;
+    bool g_nav    = (mask & JCE_SIMLOD_GATE_NAV)    != 0;
+    bool g_bt     = (mask & JCE_SIMLOD_GATE_BT)     != 0;
+    bool changed = false;
+    changed |= ImGui::Checkbox(jce_editor_i18n_id("inspector.simlod.gateScript", "simlod"), &g_script);
+    changed |= ImGui::Checkbox(jce_editor_i18n_id("inspector.simlod.gateNav", "simlod"),    &g_nav);
+    changed |= ImGui::Checkbox(jce_editor_i18n_id("inspector.simlod.gateBt", "simlod"),     &g_bt);
+    if (changed) {
+        mask = (g_script ? JCE_SIMLOD_GATE_SCRIPT : 0u)
+             | (g_nav    ? JCE_SIMLOD_GATE_NAV    : 0u)
+             | (g_bt     ? JCE_SIMLOD_GATE_BT     : 0u);
+        sl->gate_mask = mask;
+        insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.simlod.gateAnimFar", "simlod"),
+                        &sl->gate_anim_far))
+        insp_undo_bool(&sl->gate_anim_far);
 }
 
 void draw_comp_sequence_player(JceSequencePlayerComponent *sp)

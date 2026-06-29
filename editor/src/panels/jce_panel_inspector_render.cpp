@@ -7,6 +7,11 @@
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_dnd.h"
 
+#include <jce/renderer/jce_impostor.h>
+#include <jce/renderer/jce_scene_renderer.h>
+#include <jce/os/core/jce_filesystem.h>
+#include "scene/jce_editor_scene_asset_cache.h"
+
 static bool is_mat_json(const char *path)
 {
     if (!path) return false;
@@ -279,6 +284,28 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
         accept_asset_drop(mr->emissive_tex, 128);
         ImGui::TreePop();
     }
+
+    snprintf(lbl, sizeof(lbl), "%s###toon_section", jce_editor_i18n("inspector.meshRenderer.toon.section"));
+    if (ImGui::TreeNodeEx(lbl, ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::Checkbox(jce_editor_i18n("inspector.meshRenderer.toon.enable"), &mr->toon))
+            insp_undo_bool(&mr->toon);
+        ImGui::BeginDisabled(!mr->toon);
+        ImGui::SliderInt(jce_editor_i18n("inspector.meshRenderer.toon.bands"), &mr->toon_bands, 2, 4);
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n("inspector.meshRenderer.toon.rimPower"), &mr->rim_power, 0.05f, 0.0f, 16.0f);
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n("inspector.meshRenderer.toon.rimIntensity"), &mr->rim_intensity, 0.01f, 0.0f, 4.0f);
+        insp_track_edit();
+        ImGui::ColorEdit3(jce_editor_i18n("inspector.meshRenderer.toon.rimColor"), mr->rim_color);
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n("inspector.meshRenderer.toon.outlineWidth"), &mr->outline_width, 0.001f, 0.0f, 0.2f, "%.3f");
+        insp_track_edit();
+        ImGui::ColorEdit3(jce_editor_i18n("inspector.meshRenderer.toon.outlineColor"), mr->outline_color);
+        insp_track_edit();
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.meshRenderer.toon.note"));
+        ImGui::TreePop();
+    }
 }
 
 void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
@@ -314,7 +341,215 @@ void draw_comp_skybox(JceSkyboxComponent *sky)
         insp_undo_bool(&sky->use_as_ibl);
 }
 
-void draw_comp_lod_group(JceLodGroupComponent *lg)
+/* The cook auto-LOD core (engine resource layer, INTERNAL header not in the
+ * public include tree).  Declared here so the inspector can PREVIEW the exact
+ * chain the cook will persist into the .glb (per-level triangle counts), driven
+ * over the same loose mesh the editor already loads.  Symbols are linked from
+ * the engine; signature mirrors jce_mesh_lod_cook.h. */
+extern "C" {
+extern const float JCE_MESH_LOD_DEFAULT_RATIOS[];
+size_t jce_mesh_generate_lod_chain(const float *positions, size_t vertex_count,
+                                   size_t position_stride_bytes,
+                                   const unsigned int *base_indices,
+                                   size_t base_index_count,
+                                   const float *target_ratios, size_t level_count,
+                                   unsigned int **out_level_indices,
+                                   size_t *out_level_index_counts);
+void jce_mesh_lod_chain_free(unsigned int **level_indices, size_t level_count);
+}
+
+/* Cached LOD preview for the last "Generate LODs" press (one slot; the inspector
+ * shows a single LODGroup at a time).  base_tris/lod_tris hold the meshopt chain
+ * the cook would bake; valid is set once a preview has been computed. */
+static struct {
+    char     mesh_path[256];
+    bool     valid;
+    uint32_t base_tris;
+    uint32_t lod_tris[4];
+    uint32_t lod_count;
+} s_lod_preview = {};
+
+/* Run the cook's LOD chain over the entity's loose LOD0 mesh and cache per-level
+ * triangle counts for display.  Uses the SAME core the bundle cook calls, so the
+ * preview matches the persisted in-asset LODs. */
+static void lod_preview_generate(JceScene *scene, JceEntity e,
+                                 const JceLodGroupComponent *lg)
+{
+    s_lod_preview.valid = false;
+    s_lod_preview.lod_count = 0;
+
+    /* LOD0 source: a LOD0 override mesh path if authored, else the entity's
+     * MeshRenderer mesh (the empty-meshPath auto-bind base). */
+    const char *src = NULL;
+    if (lg && lg->level_mesh_paths[0][0]) src = lg->level_mesh_paths[0];
+    if (!src && jce_scene_has_mesh_renderer(scene, e)) {
+        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        if (mr && mr->mesh_path[0]) src = mr->mesh_path;
+    }
+    if (!src) return;
+
+    char host[1024];
+    JceEditorCpuMeshData cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    if (!jce_editor_resolve_asset_path(src, host, (int)sizeof(host)) ||
+        !jce_editor_model_load_cpu_file(host, &cpu) ||
+        !cpu.vertices || cpu.vertex_count < 3 ||
+        !cpu.indices || cpu.index_count < 3) {
+        jce_editor_model_free_cpu_data(&cpu);
+        return;
+    }
+
+    /* Tightly packed float[3] position stream (pos@0 in JceMeshVertex). */
+    std::vector<float> pos((size_t)cpu.vertex_count * 3);
+    for (uint32_t v = 0; v < cpu.vertex_count; ++v) {
+        pos[v * 3 + 0] = cpu.vertices[v].pos[0];
+        pos[v * 3 + 1] = cpu.vertices[v].pos[1];
+        pos[v * 3 + 2] = cpu.vertices[v].pos[2];
+    }
+
+    unsigned int *lvl_idx[8] = {};
+    size_t        lvl_cnt[8] = {};
+    size_t levels = jce_mesh_generate_lod_chain(
+        pos.data(), cpu.vertex_count, 3 * sizeof(float),
+        cpu.indices, cpu.index_count,
+        JCE_MESH_LOD_DEFAULT_RATIOS, 3u, lvl_idx, lvl_cnt);
+
+    s_lod_preview.base_tris = cpu.index_count / 3;
+    s_lod_preview.lod_count = 0;
+    for (size_t l = 0; l < levels && l < 4; ++l) {
+        if (lvl_cnt[l] >= 3 && (lvl_cnt[l] % 3) == 0 && lvl_cnt[l] < cpu.index_count)
+            s_lod_preview.lod_tris[s_lod_preview.lod_count++] = (uint32_t)(lvl_cnt[l] / 3);
+    }
+    jce_mesh_lod_chain_free(lvl_idx, levels);
+    jce_editor_model_free_cpu_data(&cpu);
+
+    snprintf(s_lod_preview.mesh_path, sizeof s_lod_preview.mesh_path, "%s", src);
+    s_lod_preview.valid = true;
+}
+
+/* ── Octahedral impostor bake (roadmap P2 #10) ──────────────────────────
+ * A one-shot GPU bake driven from the LODGroup inspector: render the entity's
+ * mesh from grid_n x grid_n octahedral viewpoints into an atlas, read it back,
+ * and write <model>.impostor.png + <model>.impostor.json next to the source so
+ * the cook picks them up.  The bake is frame-driven (jce_impostor_bake_poll);
+ * we poll it here each draw and, on DONE, point the LODGroup's impostor slot at
+ * the produced metadata.  One bake at a time across the whole inspector. */
+static struct {
+    bool        active;
+    int         grid_n;
+    JceEntity   entity;
+    char        meta_rel[256];   /* project-relative .impostor.json to assign */
+    float       distance;        /* impostor distance to write on completion  */
+} s_impostor_bake = { false, 8, 0, "", 200.0f };
+
+/* Derive "<dir>/<stem>.impostor.<ext>" from a model path (host or rel). */
+static void impostor_sidecar_path(const char *model_path, const char *ext,
+                                  char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", model_path ? model_path : "");
+    /* strip extension */
+    size_t n = strlen(out);
+    for (size_t i = n; i-- > 0; ) {
+        char c = out[i];
+        if (c == '/' || c == '\\') break;
+        if (c == '.') { out[i] = '\0'; break; }
+    }
+    size_t len = strlen(out);
+    snprintf(out + len, cap - len, ".impostor.%s", ext);
+}
+
+static void impostor_bake_begin(JceScene *scene, JceEntity e,
+                                JceLodGroupComponent *lg, int grid_n)
+{
+    /* Source model = LOD0 override or the entity's MeshRenderer mesh. */
+    const char *src = NULL;
+    if (lg->level_mesh_paths[0][0]) src = lg->level_mesh_paths[0];
+    if (!src && jce_scene_has_mesh_renderer(scene, e)) {
+        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        if (mr && mr->mesh_path[0]) src = mr->mesh_path;
+    }
+    if (!src) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Impostor bake: entity has no mesh to bake");
+        return;
+    }
+
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    JceRenderer      *r  = jce_editor_get_renderer();
+    if (!sr || !r) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Impostor bake: renderer not ready");
+        return;
+    }
+    JceModel *model = jce_scene_renderer_get_model(sr, src);
+    if (!model) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Impostor bake: model '%s' not loaded — make it visible in the "
+            "viewport first, then retry", src);
+        return;
+    }
+
+    /* Output: <model dir>/<stem>.impostor.png + .json on the host filesystem
+     * (so the cook scans them), with project-relative paths in metadata. */
+    char host_dir_model[1024];
+    if (!jce_editor_resolve_asset_path(src, host_dir_model, sizeof host_dir_model)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Impostor bake: cannot resolve host path for '%s'", src);
+        return;
+    }
+    JceImpostorBakeDesc d;
+    memset(&d, 0, sizeof d);
+    d.model    = model;
+    d.renderer = r;
+    d.grid_n   = grid_n;
+    d.cell_px  = 256;
+    impostor_sidecar_path(host_dir_model, "png", d.atlas_path_host, sizeof d.atlas_path_host);
+    impostor_sidecar_path(host_dir_model, "json", d.meta_path_host, sizeof d.meta_path_host);
+    impostor_sidecar_path(src, "png", d.atlas_path_rel, sizeof d.atlas_path_rel);
+
+    char meta_rel[256];
+    impostor_sidecar_path(src, "json", meta_rel, sizeof meta_rel);
+
+    if (!jce_impostor_bake_submit(&d)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Impostor bake: submit failed (one already running?)");
+        return;
+    }
+    s_impostor_bake.active   = true;
+    s_impostor_bake.grid_n   = grid_n;
+    s_impostor_bake.entity   = e;
+    s_impostor_bake.distance = lg->impostor_distance > 0.0f ? lg->impostor_distance : 200.0f;
+    snprintf(s_impostor_bake.meta_rel, sizeof s_impostor_bake.meta_rel, "%s", meta_rel);
+    jce_editor_console_log("Impostor bake started: %s (%dx%d views)",
+                           src, grid_n, grid_n);
+}
+
+/* Drive the in-flight bake; on completion assign the LODGroup's impostor slot. */
+static void impostor_bake_tick(JceScene *scene, JceLodGroupComponent *lg)
+{
+    if (!s_impostor_bake.active) return;
+    JceImpostorBakeStatus st = jce_impostor_bake_poll();
+    if (st == JCE_IMPOSTOR_BAKE_DONE) {
+        s_impostor_bake.active = false;
+        if (scene && lg && jce_scene_has_lod_group(scene, s_impostor_bake.entity)) {
+            JceLodGroupComponent *tgt =
+                jce_scene_get_lod_group(scene, s_impostor_bake.entity);
+            if (tgt) {
+                snprintf(tgt->impostor_meta_path, sizeof tgt->impostor_meta_path,
+                         "%s", s_impostor_bake.meta_rel);
+                if (tgt->impostor_distance <= 0.0f)
+                    tgt->impostor_distance = s_impostor_bake.distance;
+            }
+        }
+        jce_editor_console_log("Impostor bake complete → %s",
+                               s_impostor_bake.meta_rel);
+    } else if (st == JCE_IMPOSTOR_BAKE_FAILED) {
+        s_impostor_bake.active = false;
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "Impostor bake failed");
+    }
+}
+
+void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e)
 {
     if (!lg) return;
     if (lg->level_count < 0) lg->level_count = 0;
@@ -326,8 +561,35 @@ void draw_comp_lod_group(JceLodGroupComponent *lg)
     }
     ImGui::DragFloat(jce_editor_i18n_id("inspector.lod.hysteresis", "lod"), &lg->hysteresis, 0.01f, 0.0f, 0.5f, "%.2f");
     insp_track_edit();
+    /* Cross-fade band width (world meters) — softer LOD pop (P1 #6). */
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.lod.fadeWidth", "lod"), &lg->fade_width, 0.1f, 0.0f, 1000.0f, "%.1f");
+    insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lod.cullWhenTooFar", "lod"), &lg->cull_when_too_far))
         insp_undo_bool(&lg->cull_when_too_far);
+
+    /* ── In-asset auto-LOD (P1 #6) ─────────────────────────────────────
+     * The cook auto-generates a reduced LOD chain from any cooked mesh and
+     * persists it inside the .glb (JCE_lod extension); a level with an empty
+     * mesh override AUTO-BINDS that cooked chain at runtime.  "Generate LODs"
+     * previews the exact chain the cook will bake (per-level triangle counts)
+     * from the entity's loose LOD0 mesh. */
+    ImGui::Separator();
+    if (ImGui::Button(jce_editor_i18n_id("inspector.lod.generate", "lod")))
+        lod_preview_generate(scene, e, lg);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.lod.generateHint"));
+    if (s_lod_preview.valid && s_lod_preview.base_tris > 0) {
+        ImGui::Text(jce_editor_i18n("inspector.lod.baseTrisFmt"), s_lod_preview.base_tris);
+        for (uint32_t l = 0; l < s_lod_preview.lod_count; ++l) {
+            float pct = 100.0f * (float)s_lod_preview.lod_tris[l] /
+                        (float)s_lod_preview.base_tris;
+            ImGui::Text(jce_editor_i18n("inspector.lod.lodTrisFmt"), l + 1,
+                        s_lod_preview.lod_tris[l], pct);
+        }
+        if (s_lod_preview.lod_count == 0)
+            ImGui::TextDisabled("%s", jce_editor_i18n("inspector.lod.noReduce"));
+    }
+
     ImGui::Separator();
     for (int i = 0; i < lg->level_count; ++i) {
         ImGui::PushID(i);
@@ -344,11 +606,73 @@ void draw_comp_lod_group(JceLodGroupComponent *lg)
         ImGui::PopID();
     }
     ImGui::TextDisabled(jce_editor_i18n("inspector.lod.emptyMeshNote"));
+
+    /* ── Octahedral impostor terminal LOD (roadmap P2 #10) ─────────────
+     * Beyond the last mesh LOD, far props render as a single camera-facing card
+     * sampling a pre-baked octahedral atlas (a whole forest = a few instanced
+     * quads).  "Bake Impostor" GPU-renders the mesh from grid_n x grid_n angles,
+     * writes <model>.impostor.png + .json, and points this slot at them. */
+    ImGui::Separator();
+    ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s",
+                       jce_editor_i18n_or("inspector.lod.impostorHeader",
+                                          "Impostor (terminal LOD)"));
+
+    impostor_bake_tick(scene, lg);
+
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.lod.impostorDistance", "lod.impostorDistance"),
+                     &lg->impostor_distance, 1.0f, 0.0f, 100000.0f, "%.1f m");
+    insp_track_edit();
+
+    ImGui::SliderInt(jce_editor_i18n_id("inspector.lod.impostorGrid", "lod.impostorGrid"),
+                     &s_impostor_bake.grid_n, 4, 10);
+
+    if (s_impostor_bake.active) {
+        ImGui::ProgressBar(jce_impostor_bake_progress(), ImVec2(-1, 0), jce_editor_i18n("inspector.lod.baking"));
+    } else {
+        if (ImGui::Button(jce_editor_i18n_id("inspector.lod.impostorBake", "lod.impostorBake"))) {
+            int gn = s_impostor_bake.grid_n;
+            if (gn < 4) gn = 8;
+            impostor_bake_begin(scene, e, lg, gn);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("inspector.lod.impostorBakeTip"));
+    }
+
+    /* Bound impostor metadata path + atlas preview. */
+    jce_draw_path_input_asset("Impostor Meta###lod.impostorMeta",
+                     lg->impostor_meta_path, sizeof lg->impostor_meta_path,
+                     JCE_ASSET_KIND_MODEL);
+    insp_track_edit();
+    accept_asset_drop(lg->impostor_meta_path, sizeof lg->impostor_meta_path);
+
+    if (lg->impostor_meta_path[0]) {
+        JceImpostorMeta meta;
+        char host_meta[1024];
+        if (jce_editor_resolve_asset_path(lg->impostor_meta_path, host_meta,
+                                          sizeof host_meta) &&
+            jce_impostor_meta_read(host_meta, &meta)) {
+            ImGui::Text(jce_editor_i18n("inspector.lod.atlasFmt"), meta.grid_n, meta.grid_n,
+                        meta.radius);
+            /* Resolve the atlas PNG through the editor asset cache (same path the
+             * scene renderer uses) and preview it. */
+            JceTexture at = jce_editor_scene_asset_cache_get_texture(
+                                meta.atlas_path, NULL);
+            if (jce_texture_valid(at)) {
+                ImGui::Image((ImTextureID)(uintptr_t)((uint32_t)at.idx + 1u),
+                             ImVec2(128, 128));
+            }
+        } else {
+            ImGui::TextDisabled("%s", jce_editor_i18n("inspector.lod.impostorMetaMissing"));
+        }
+    }
 }
 
 void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 {
-    insp_unwired_badge();
+    /* Wired (large-world #E): sr_draw_trail_renderer draws the captured point
+     * buffer as a ribbon; the runtime grows it (rt_update_trails). */
     if (!t) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
@@ -366,7 +690,8 @@ void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 
 void draw_comp_line_renderer(JceLineRendererComponent *l)
 {
-    insp_unwired_badge();
+    /* Wired (large-world #E): sr_draw_line_renderer draws the polyline in the
+     * color pass (reuses the color program + PT_LINES). No longer unwired. */
     if (!l) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
@@ -412,7 +737,8 @@ void draw_comp_decal(JceDecalComponent *d)
 
 void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
 {
-    insp_unwired_badge();
+    /* Wired (large-world #E): the scene renderer draws a camera-facing textured
+     * quad via the sprite batch (FULL / Y-axis). No longer unwired. */
     if (!b) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path, JCE_ASSET_KIND_TEXTURE); insp_track_edit();
     const char *modes[] = { jce_editor_i18n("inspector.br.mode.full"), jce_editor_i18n("inspector.br.mode.yAxisOnly") };

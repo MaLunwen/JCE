@@ -398,12 +398,14 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     memcpy(gizmo_rot,   gizmo_raw_rot,   sizeof(gizmo_rot));
     memcpy(gizmo_scale, gizmo_raw_scale, sizeof(gizmo_scale));
 
-    /* Ctrl + TRS snapping.
+    /* TRS snapping: active when the persistent snap toggle is ON, OR while Ctrl
+     * is held (momentary override, the legacy behaviour).
      * Use gizmo_dragging_before || gizmo_dragging_after so that snapping
      * also applies on the release frame (before=true, after=false),
      * preventing the final value from drifting to the un-snapped raw
      * position. */
-    if (ImGui::GetIO().KeyCtrl && (gizmo_dragging_before || gizmo_dragging_after)) {
+    bool snap_active = jce_state_get_gizmo_snap_enabled() || ImGui::GetIO().KeyCtrl;
+    if (snap_active && (gizmo_dragging_before || gizmo_dragging_after)) {
         const float snap_translate = jce_state_get_gizmo_snap_translate();
         const float snap_angle     = jce_state_get_gizmo_snap_rotate();
         const float snap_scale     = jce_state_get_gizmo_snap_scale();

@@ -1814,7 +1814,8 @@ static bool sr_anim_try_retarget(JceSceneRenderer *sr,
 }
 
 void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
-                                    EntityList *list, float dt_sec)
+                                    EntityList *list, float dt_sec,
+                                    const JceCamera *camera)
 {
     /* Pass 1 (this loop, serial): resolve models/instances, drive SM/blend
      * lifecycle, select clips — all shared/lazy state.  The actual pose
@@ -1856,6 +1857,28 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
 
         SrAnimInstance *ai = sr_get_anim_instance(sr, (uint32_t)e, mc->model);
         if (!ai) continue;
+
+        /* Sim-LOD animation gating (large-world #3, Play-only): freeze a far-tier
+         * actor's skinned pose — keep the already-evaluated palette and skip the
+         * reset + re-sample below, so the renderer draws the frozen pose at zero
+         * pose-eval cost.  Opt-in via the SimLod ANIM gate bit or the gate_anim_far
+         * hint; skip the first frame (no palette yet) so the bind pose is replaced.
+         * Gated to anim_sm_active (Play) so the editor viewport keeps full-fidelity
+         * animation for authoring. */
+        if (sr->anim_sm_active && camera && ai->skin_palette_count > 0) {
+            JceSimLodComponent *sl = jce_scene_get_sim_lod(scene, e);
+            if (sl && sl->enabled &&
+                ((sl->gate_mask & JCE_SIMLOD_GATE_ANIM) || sl->gate_anim_far)) {
+                float mid = sl->mid_radius > 0.0f ? sl->mid_radius : 80.0f;
+                jce_mat4 wm = jce_scene_get_world_matrix(scene, e);
+                jce_vec3 eye = jce_camera_get_position(camera);
+                float dx = wm.col[3].x - eye.x;
+                float dy = wm.col[3].y - eye.y;
+                float dz = wm.col[3].z - eye.z;
+                if (dx * dx + dy * dy + dz * dz > mid * mid)
+                    continue;                 /* FAR tier -> freeze pose */
+            }
+        }
         /* TAA per-bone motion: snapshot the PRIOR (last-frame) skin palette into
            prev_skin_palette BEFORE this frame overwrites it.  The contents of
            skin_palette still hold last frame's pose here (the sample pass

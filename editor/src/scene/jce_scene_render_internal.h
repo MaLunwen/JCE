@@ -22,6 +22,7 @@ extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_thread.h>           /* async chunk-load thread pool */
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lighting.h>
@@ -130,6 +131,9 @@ struct SceneRenderState {
     /* World streamer — optional open-world chunk streaming. */
     JceWorldStreamer   *world_streamer;
     JceFileSystem      *stream_fs;
+    /* Worker pool for async chunk loads (disk read off-thread; apply on main).
+     * Destroyed AFTER world_streamer (whose destroy joins in-flight tasks). */
+    JceThreadPool      *stream_pool;
 
     /* GPU-query occlusion culler — optional two-pass coherence culling. */
     JceOcclusionCuller *occlusion_culler;
@@ -160,5 +164,7 @@ void draw_compound_collider_gizmos(void);
 
 void orbit_apply(void);
 void jce_editor_scene_camera_update(float dt_sec);
+/* jce_editor_scene_frame_overview() is declared in jce_editor_scene_render.h
+ * (public editor camera API) so the Scene View toolbar panel can call it. */
 
 #endif /* JCE_SCENE_RENDER_INTERNAL_H */

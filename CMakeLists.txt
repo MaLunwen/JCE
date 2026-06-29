@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.9.16 LANGUAGES C)
+project(JCE VERSION 0.10.3 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -355,6 +355,19 @@ endif()
 
 if(JCE_TRACY_ENABLED)
 	find_package(Tracy REQUIRED)
+endif()
+
+# RenderDoc in-application GPU-capture trigger (debug aid). Mirror the Tracy
+# pattern: the user-facing option records preference; the effective switch is
+# forced OFF for dist so shipped games carry zero RenderDoc code. No find_package
+# — the in-app API is resolved at runtime from the injected module.
+option(JCE_ENABLE_RENDERDOC "Enable the RenderDoc in-app GPU-capture trigger (debug)" ON)
+set(JCE_RENDERDOC_ENABLED ${JCE_ENABLE_RENDERDOC})
+if(JCE_BUILD_VARIANT STREQUAL "dist")
+	if(JCE_ENABLE_RENDERDOC)
+		message(STATUS "JCE_BUILD_VARIANT=dist forces RenderDoc capture OFF.")
+	endif()
+	set(JCE_RENDERDOC_ENABLED OFF)
 endif()
 
 # Dist builds must never ship patent-encumbered codecs (AAC/H.264/H.265).
@@ -712,6 +725,9 @@ option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)"
 # path external users take, and the only way the SDK contract is dogfooded.
 # Flip ON only for in-tree dev iteration on the sample itself.
 option(JCE_BUILD_INTREE_SAMPLE "Build the in-tree Caged Kingdom sample (dev only)" OFF)
+# Meadow Valley is the stylized-world dogfood project.  Default OFF; enabled
+# independently of caged_kingdom so CI can gate each project separately.
+option(JCE_BUILD_INTREE_MEADOW  "Build the in-tree Meadow Valley project (dev only)" OFF)
 # Science Lab is a fully engine-isolated SDK consumer: it builds ONLY via
 # standalone find_package(JCE) (see science_lab/CMakeLists.txt). It has no
 # in-tree build path — no option, no add_subdirectory, no shared game PAK.
@@ -1144,6 +1160,16 @@ if(MSVC)
 	# linking, which Release already uses).  Release config covers the release
 	# AND dist variants (both build_type=Release); Debug is left incremental.
 	add_link_options("$<$<CONFIG:Release>:/Brepro>" "$<$<CONFIG:Release>:/INCREMENTAL:NO>")
+	# Release debug symbols: emit a .pdb so the in-process crash handler
+	# (DbgHelp SymFromAddr/SymGetLineFromAddr64 in jce_crash_handler.c) resolves
+	# STATIC functions + file:line instead of nearest-export noise.  /DEBUG turns
+	# off /OPT:REF,ICF by default, so restore them to keep the release binary
+	# optimized + small.  (Diagnostic aid for the streaming rapid-zoom crash;
+	# the .pdb ships beside the .exe and is only read at crash time.)
+	add_compile_options("$<$<CONFIG:Release>:/Zi>")
+	add_link_options("$<$<CONFIG:Release>:/DEBUG>"
+	                 "$<$<CONFIG:Release>:/OPT:REF>"
+	                 "$<$<CONFIG:Release>:/OPT:ICF>")
 	# Trim the absolute repo prefix from __FILE__ so embedded paths are stable
 	# across machines/checkout locations.  Harmless no-op when the prefix is
 	# absent.  (/d1trimfile is the practical MSVC equivalent of -ffile-prefix-map.)
@@ -1214,6 +1240,11 @@ add_subdirectory(editor)
 if(JCE_BUILD_INTREE_SAMPLE)
 	add_subdirectory(caged_kingdom)
 endif()
+# Meadow Valley is gated independently so CI can enable it without also
+# enabling caged_kingdom (JCE_BUILD_INTREE_SAMPLE).
+if(JCE_BUILD_INTREE_MEADOW)
+	add_subdirectory(meadow_valley)
+endif()
 # science_lab is intentionally NOT add_subdirectory()'d: it is a standalone
 # find_package(JCE) consumer built out-of-tree (see science_lab/CMakeLists.txt).
 
@@ -1281,7 +1312,8 @@ endif()
 # i18n JSON normalization                                             #
 #                                                                     #
 # `i18n-sort`  — rewrite editor/resources/assets/i18n/*.json in place #
-# `i18n-check` — CI gate, fails if any file would be reformatted      #
+# `i18n-check` — CI gate: fails on formatting drift, a UTF-8 BOM, OR  #
+#               any locale missing a key en.json defines (--strict).  #
 #                                                                     #
 # Automation: a stamp-driven custom command runs sort_i18n.py on      #
 # every build whose JSON inputs have changed, so the in-tree files    #
@@ -1303,9 +1335,9 @@ if(Python3_FOUND)
 		VERBATIM)
 
 	add_custom_target(i18n-check
-		COMMAND ${Python3_EXECUTABLE} "${_JCE_I18N_SCRIPT}" --check
+		COMMAND ${Python3_EXECUTABLE} "${_JCE_I18N_SCRIPT}" --check --report --strict
 		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-		COMMENT "Checking editor i18n JSON normalization"
+		COMMENT "Checking editor i18n JSON normalization + en-based completeness"
 		VERBATIM)
 
 	if(_JCE_I18N_FILES)

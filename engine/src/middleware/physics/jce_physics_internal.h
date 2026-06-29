@@ -128,6 +128,7 @@ void jce_bullet_body_get_velocity(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 *vel);
 void jce_bullet_body_set_velocity(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 vel);
+void jce_bullet_body_set_active(JceBulletWorld *bw, uint32_t idx, bool active);
 void jce_bullet_body_get_angular_velocity(JceBulletWorld *bw, uint32_t idx,
                                           jce_vec3 *vel);
 void jce_bullet_body_set_angular_velocity(JceBulletWorld *bw, uint32_t idx,

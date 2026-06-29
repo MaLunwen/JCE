@@ -50,6 +50,10 @@ static const char *const kAssetKeys[] = {
     "tilemapPath",     "spritesPath",
     /* ReflectionProbe baked cubemap (hdrPath already covers custom). */
     "bakedCubemapPath",
+    /* Octahedral impostor terminal LOD (P2 #10): the .impostor.json sidecar.
+     * The packer's descriptor recursion re-scans it for its "atlasPath" (a
+     * recognised key above) so the baked atlas .png is pulled in too. */
+    "impostorMetaPath",
     /* Nested-descriptor keys: .mat.json texture maps (primary keys +
      * loader-accepted aliases — see jce_pbr_material_load_json and the
      * editor's try_resolve_texture_from_material_json).  These appear

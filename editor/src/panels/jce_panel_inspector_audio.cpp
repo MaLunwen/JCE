@@ -23,6 +23,30 @@ void draw_comp_audio_source(JceAudioSourceComponent *as)
         insp_undo_bool(&as->loop);
     if (ImGui::Checkbox(jce_editor_i18n("audioSource.playOnAwake"), &as->play_on_awake))
         insp_undo_bool(&as->play_on_awake);
+
+    /* 3D attenuation authoring (large-world audio) — only meaningful for
+     * spatial sources.  attenuation_model 0 = engine default (Inverse). */
+    if (as->spatial_blend > 0.0f) {
+        ImGui::SeparatorText(jce_editor_i18n_id("audioSource.attenuation", "3D Attenuation"));
+        const char *models = "Default (Inverse)\0None\0Inverse\0Linear\0Exponential\0\0";
+        if (ImGui::Combo(jce_editor_i18n_id("audioSource.attenModel", "Model"),
+                         &as->attenuation_model, models))
+            insp_track_edit();
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioSource.minDistance", "Min Distance"),
+                             &as->min_distance, 0.1f, 0.0f, 10000.0f, "%.1f"))
+            insp_track_edit();
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioSource.maxDistance", "Max Distance"),
+                             &as->max_distance, 0.5f, 0.0f, 100000.0f, "%.1f"))
+            insp_track_edit();
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioSource.rolloff", "Rolloff Factor"),
+                             &as->rolloff_factor, 0.01f, 0.0f, 4.0f, "%.2f"))
+            insp_track_edit();
+        if (ImGui::InputText(jce_editor_i18n_id("audioSource.mixerBus", "Mixer Bus"),
+                             as->mixer_bus, sizeof as->mixer_bus))
+            insp_track_edit();
+        ImGui::TextDisabled("(%s)", jce_editor_i18n_id("audioSource.attenNote",
+            "0 / blank = engine defaults (Inverse, 1..25m, rolloff 1, auto bus)"));
+    }
 }
 
 void draw_comp_music_track(JceMusicTrackComponent *m)

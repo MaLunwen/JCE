@@ -60,6 +60,72 @@ JceTerrain *jce_terrain_create(int width, int height,
                                float world_size_x, float world_size_z,
                                float max_height, int chunk_size);
 
+/* -- Tiled / streamed terrain (large-world #4) ------------------------------ *
+ * A tiled terrain keeps its height/splat data in tile_dim×tile_dim-cell tiles
+ * loaded on demand through `load_fn`, capped to `resident_budget` simultaneously-
+ * resident tiles (LRU eviction of the rest) — so a multi-km terrain never holds
+ * the whole ~1 GB grid in RAM.  Only the RUNTIME READ path (sample / raycast /
+ * collision / chunk-mesh build) is tile-aware; authoring (sculpt / import /
+ * export) requires a monolithic terrain (jce_terrain_create / _load_file).
+ *
+ * `tile_dim` must divide (width-1) and (height-1) evenly for full coverage.
+ * Each tile owns (tile_dim+1)² vertices: a 1-vertex overlap with its right/bottom
+ * neighbours so a bilinear sample inside a tile's cell range never straddles two
+ * tiles.  load_fn fills heights_out/splat_out (each tile_span² = (tile_dim+1)²
+ * elements, row-major) for tile (tile_x,tile_z) and returns false on failure
+ * (the sample then reads 0).  resident_budget <= 0 means "no cap" (all resident).*/
+typedef bool (*JceTerrainTileLoadFn)(void *ud, int tile_x, int tile_z,
+                                     float *heights_out, uint32_t *splat_out,
+                                     int tile_span);
+
+JCE_API JceTerrain *jce_terrain_create_tiled(int width, int height,
+                                             float world_size_x,
+                                             float world_size_z,
+                                             float max_height, int chunk_size,
+                                             int tile_dim, int resident_budget,
+                                             JceTerrainTileLoadFn load_fn,
+                                             void *load_ud);
+
+/* Procedural tiled terrain: a streamed, effectively-unbounded heightfield from a
+ * built-in value-noise fBm source (no baked heightmap).  chunk_size is set to
+ * tile_dim so the renderer maps chunk i ↔ tile i.  `frequency` is the world-space
+ * noise frequency (smaller = broader hills); `seed` varies the field.  Authored
+ * in a .terrain.json via a "procedural" object. */
+JCE_API JceTerrain *jce_terrain_create_procedural(int width, int height,
+                                                  float world_size_x,
+                                                  float world_size_z,
+                                                  float max_height, int tile_dim,
+                                                  int resident_budget,
+                                                  uint32_t seed, float frequency);
+
+/* Number of tiles currently resident (0 for a monolithic terrain). */
+JCE_API int jce_terrain_resident_tiles(const JceTerrain *t);
+
+/* True if this is a tiled terrain (jce_terrain_create_tiled). */
+JCE_API bool jce_terrain_is_tiled(const JceTerrain *t);
+
+/* Tile grid dimensions.  Any out-pointer may be NULL.  All zero for a
+ * monolithic terrain.  tile_dim cells per tile side => (tile_dim+1)² verts. */
+JCE_API void jce_terrain_tile_grid(const JceTerrain *t,
+                                   int *out_tiles_x, int *out_tiles_z,
+                                   int *out_tile_dim);
+
+/* Page tile (tile_x,tile_z) resident and copy its (tile_dim+1)² height and/or
+ * splat block (row-major; pass NULL to skip either).  The renderer uses this to
+ * build per-tile splat GPU textures without reaching into the cache internals.
+ * Returns false for a monolithic terrain, out-of-range tile, or load failure. */
+JCE_API bool jce_terrain_tile_copy(const JceTerrain *t, int tile_x, int tile_z,
+                                   float *heights_out, uint32_t *splat_out);
+
+/* Streaming prefetch (large-world #4): proactively page in every tile within
+ * `radius` world units of (world_x,world_z) and refresh their LRU stamps, so the
+ * working set near the camera is resident BEFORE it is sampled (no first-touch
+ * hitch); LRU eviction reclaims tiles that fall out of range.  No-op on a
+ * monolithic terrain.  Call once per frame with the camera XZ.  For no thrash,
+ * resident_budget should be >= the in-range tile count ((2*ceil(radius/tile)+1)²). */
+JCE_API void jce_terrain_prefetch(JceTerrain *t, float world_x, float world_z,
+                                  float radius);
+
 JCE_API JceTerrain *jce_terrain_load_file(const char *meta_json_path);
 
 /* Same as jce_terrain_load_file but reads the meta JSON and its side-car .bin
@@ -157,6 +223,22 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
                              float wx, float wz,
                              float radius_world, float strength,
                              float dt);
+
+/* -- Holes (cut cells for caves / tunnels / building interiors) ------
+ * A "hole" drops a grid cell from both the render mesh and the collision
+ * mesh, so geometry and physics agree.  Monolithic (non-tiled) terrain
+ * only; the per-cell mask is serialized in the .bin side-car (v2). */
+
+/* Whether ANY cell is currently cut (also gates v2 serialization). */
+bool jce_terrain_has_holes(const JceTerrain *t);
+
+/* Test / set a single cell (cx in 0..W-2, cz in 0..H-2). */
+bool jce_terrain_cell_is_hole(const JceTerrain *t, int cx, int cz);
+void jce_terrain_set_hole(JceTerrain *t, int cx, int cz, bool hole);
+
+/* Paint (erase=false) / fill (erase=true) holes under a circular world brush. */
+void jce_terrain_hole_apply(JceTerrain *t, float wx, float wz,
+                            float radius_world, bool erase);
 
 /* -- Heightmap image import / export --------------------------- */
 
