@@ -3,6 +3,8 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "io/jce_editor_json_reveal.h"
+#include "viewers/jce_json_classify.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -89,6 +91,47 @@ static void draw_create_entities(uint32_t parent)
         create_entity_select("Camera", parent, JCE_COMP_FLAG_CAMERA, 0);
     if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createLight")))
         create_entity_select("Light", parent, JCE_COMP_FLAG_DIR_LIGHT, 0);
+}
+
+/* Submenu listing the entity's components that reference an external
+ * JSON/script source (anim state machine, particle system, material...) —
+ * each jumps straight into the referenced file. */
+static void draw_view_referenced_json(uint32_t ctx_id)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+    JceEntity e = jce_state_to_ecs_entity(ctx_id);
+
+    struct { const char *kind; const char *path; } refs[4];
+    int n = 0;
+
+    JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
+    if (sa && sa->sm_path[0] && n < 4)
+        refs[n++] = { jce_json_kind_label(JCE_JSONK_ANIM_SM), sa->sm_path };
+
+    JceParticleEmitterComponent *pe = jce_scene_get_particle_emitter(scene, e);
+    if (pe && pe->asset_path[0] && n < 4)
+        refs[n++] = { jce_json_kind_label(JCE_JSONK_PARTICLES), pe->asset_path };
+
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+    if (mr && mr->material_path[0] && n < 4)
+        refs[n++] = { jce_json_kind_label(JCE_JSONK_MATERIAL), mr->material_path };
+
+    if (n == 0) return;
+
+    if (ImGui::BeginMenu(jce_editor_i18n_id("hierarchy.viewReferencedJson",
+                                            "View Referenced JSON"))) {
+        for (int i = 0; i < n; i++) {
+            const char *fname = refs[i].path;
+            for (const char *q = refs[i].path; *q; q++)
+                if (*q == '/' || *q == '\\') fname = q + 1;
+            char label[352];
+            snprintf(label, sizeof label, "%s: %s", refs[i].kind, fname);
+            if (ImGui::MenuItem(label))
+                jce_editor_reveal_json_source(refs[i].path, 0);
+        }
+        ImGui::EndMenu();
+    }
 }
 
 /* ── Tag color picker row ────────────────────────────────────────── */
@@ -228,6 +271,32 @@ void draw_hierarchy_context_menu(void)
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
             }
+        }
+
+        /* ── View in JSON source (code viewer) ─────────────────────────
+         * Jumps to this entity's block in the scene file; the submenu
+         * jumps into JSONs its components reference (anim SM, particles,
+         * material). */
+        ImGui::Separator();
+        {
+            const char *sp = jce_state_get_current_scene_path();
+            bool has_file = sp && sp[0] && strncmp(sp, "bundle://", 9) != 0;
+            if (ImGui::MenuItem(jce_editor_i18n_id("hierarchy.viewInSceneJson",
+                                                   "View in Scene JSON"),
+                                NULL, false, has_file)) {
+                jce_editor_reveal_entity_in_scene_json(ctx_id);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (!has_file)
+                    ImGui::SetTooltip("%s",
+                        jce_editor_i18n_or("hierarchy.viewInSceneJson.noFile",
+                            "Save the scene first to view its JSON source."));
+                else if (jce_state_is_scene_modified())
+                    ImGui::SetTooltip("%s",
+                        jce_editor_i18n_or("hierarchy.viewInSceneJson.unsaved",
+                            "Scene has unsaved changes — the file shows the last save."));
+            }
+            draw_view_referenced_json(ctx_id);
         }
         ImGui::Separator();
     }

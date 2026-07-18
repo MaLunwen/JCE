@@ -11,6 +11,7 @@
  */
 
 #include "jce_fv_common.h"
+#include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/resource/jce_model_importer.h>
@@ -93,9 +94,12 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
     ms->rotX = 30.0f; ms->rotY = -45.0f;
     ms->zoom = 1.0f;
     ms->panX = 0.0f; ms->panY = 0.0f;
-    ms->auto_rotate = false;
-    ms->show_wireframe = true;
-    ms->show_grid = true;
+    /* View toggles follow the persisted user-global preference (last
+     * state chosen in any model tab) instead of hardcoded defaults, so
+     * they carry across file opens and editor restarts. */
+    ms->auto_rotate    = jce_editor_ui_state_load_int("fv.model.autorotate", 0, 0, 1) != 0;
+    ms->show_wireframe = jce_editor_ui_state_load_int("fv.model.wireframe",  1, 0, 1) != 0;
+    ms->show_grid      = jce_editor_ui_state_load_int("fv.model.grid",       1, 0, 1) != 0;
     ms->mesh_count = 0;
     ms->vert_count = 0; ms->face_count = 0; ms->mat_count = 0;
     ms->load_ok = false;
@@ -353,11 +357,14 @@ void fv_render_model(FvTab *tab)
                           ImGuiChildFlags_Borders);
         {
             /* Controls bar */
-            ImGui::Checkbox(jce_editor_i18n("viewer.wireframe"), &ms->show_wireframe);
+            if (ImGui::Checkbox(jce_editor_i18n("viewer.wireframe"), &ms->show_wireframe))
+                jce_editor_ui_state_save_int("fv.model.wireframe", ms->show_wireframe ? 1 : 0);
             ImGui::SameLine();
-            ImGui::Checkbox(jce_editor_i18n("viewer.showGrid"), &ms->show_grid);
+            if (ImGui::Checkbox(jce_editor_i18n("viewer.showGrid"), &ms->show_grid))
+                jce_editor_ui_state_save_int("fv.model.grid", ms->show_grid ? 1 : 0);
             ImGui::SameLine();
-            ImGui::Checkbox(jce_editor_i18n("viewer.autoRotate"), &ms->auto_rotate);
+            if (ImGui::Checkbox(jce_editor_i18n("viewer.autoRotate"), &ms->auto_rotate))
+                jce_editor_ui_state_save_int("fv.model.autorotate", ms->auto_rotate ? 1 : 0);
             ImGui::SameLine();
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s: %.1fx", jce_editor_i18n("viewer.zoom"), ms->zoom);
             ImGui::SameLine();

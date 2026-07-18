@@ -24,6 +24,7 @@
 #include "core/jce_hotkeys.h"
 #include "core/jce_pak_key.h"
 #include "core/jce_project_settings.h"
+#include "core/jce_editor_project_state.h"
 #include "dialogs/jce_path_input.h"
 #include "ui/jce_editor_tip.h"
 
@@ -394,6 +395,21 @@ void draw_tags_layers(void)
     }
 }
 
+/* Quality tier selection (TAB_QUALITY).  The chosen tier is persisted
+ * per-project ("graphics.tier" in <root>/.jce/editor-state.json) when the
+ * user presses Apply and re-applied at editor boot by
+ * jce_editor_quality_tier_boot_apply() — after the boot .rp.json /
+ * tier-preset resolution (settings-persistence audit, gap #14). */
+const char *k_tier_ids[4] = { "low", "medium", "high", "ultra" };
+int s_tier_idx = 2;  /* default: High */
+
+int tier_idx_from_id(const char *id)
+{
+    for (int i = 0; i < 4; ++i)
+        if (std::strcmp(id, k_tier_ids[i]) == 0) return i;
+    return -1;
+}
+
 void draw_quality(void)
 {
     const char *k_tier_names[] = {
@@ -405,7 +421,19 @@ void draw_quality(void)
     static const JceQualityTier k_tiers[] = {
         JCE_QUALITY_LOW, JCE_QUALITY_MED, JCE_QUALITY_HIGH, JCE_QUALITY_ULTRA
     };
-    static int s_tier_idx = 2;  /* default: High */
+
+    /* One-time restore of the persisted tier choice (per-project; the store
+     * is inert until a project root is known, so the first draw can be too
+     * early to read from it). */
+    static bool s_tier_restored = false;
+    if (!s_tier_restored && jce_editor_pstate_active()) {
+        s_tier_restored = true;
+        char id[16];
+        if (jce_editor_pstate_get_str("graphics.tier", id, sizeof(id))) {
+            int idx = tier_idx_from_id(id);
+            if (idx >= 0) s_tier_idx = idx;
+        }
+    }
 
     ImGui::TextUnformatted(
         jce_editor_i18n_or(PS_KEY "quality_presets", "Quality Presets"));
@@ -546,6 +574,9 @@ void draw_quality(void)
         JceQualityPreset p;
         jce_quality_preset_get(k_tiers[s_tier_idx], &p);
         jce_quality_preset_apply(&p);
+        /* Persist the explicit choice per-project (machine-local
+         * .jce/editor-state.json); re-applied at editor boot. */
+        jce_editor_pstate_set_str("graphics.tier", k_tier_ids[s_tier_idx]);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(%s)", k_tier_names[s_tier_idx]);
@@ -554,7 +585,8 @@ void draw_quality(void)
     ImGui::SameLine();
     ImGui::TextDisabled("%s",
         jce_editor_i18n_or(PS_KEY "quality.note",
-            "applies to the running session; saved in .rp.json per-project"));
+            "applies to the running session; remembered per-project and "
+            "re-applied at editor startup"));
 }
 
 void draw_graphics(void)
@@ -1486,9 +1518,10 @@ void draw_packaging(void)
 
     ImGui::TextWrapped("%s", jce_editor_i18n_or(
         "projectSettings.packaging.hint",
-        "Encrypt the embedded asset PAK and bundle payloads (ChaCha20). "
-        "This deters casual extraction; the key ships inside the game "
-        "binary, so it is obfuscation, not secrecy."));
+        "Protect embedded assets with keyed IDs, ChaCha20 encryption, and "
+        "HMAC-SHA-256 integrity. Dist builds always enable this; the key "
+        "ships inside the client, so it raises extraction cost rather than "
+        "creating secrecy."));
     ImGui::Spacing();
 
     if (ImGui::Checkbox(jce_editor_i18n_or(
@@ -1507,7 +1540,7 @@ void draw_packaging(void)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", jce_editor_i18n_or(
             "projectSettings.packaging.encryptAssets.tip",
-            "Deters casual extraction; the key ships inside the game binary."));
+            "Enable secure assets for release builds. Dist always enables it."));
 
     ImGui::BeginDisabled(!pk.encrypt_assets);
     if (ImGui::Checkbox(jce_editor_i18n_or(
@@ -1621,8 +1654,9 @@ void draw_packaging(void)
     ImGui::Spacing();
     ImGui::TextDisabled("%s", jce_editor_i18n_or(
         "projectSettings.packaging.honesty",
-        "Note: no integrity protection (MAC). Keep .jce/pak_key.hex out of "
-        "version control; losing it makes encrypted archives unreadable."));
+        "Archive bytes are authenticated before use. Keep .jce/pak_key.hex "
+        "out of version control; losing it makes protected archives "
+        "unreadable."));
 }
 
 void draw_tab_content(int t)
@@ -1776,4 +1810,33 @@ extern "C" void jce_editor_panel_project_settings(void)
 extern "C" void jce_editor_project_settings_focus_tab_physics(void)
 {
     g_st.tab = TAB_PHYSICS;
+}
+
+/* One-shot boot re-apply of the per-project quality tier (settings-
+ * persistence audit, gap #14).  Called every editor frame from
+ * jce_editor_update right after jce_editor_pstate_flush_tick; no-ops until
+ * the per-project store is live (project root known — i.e. strictly after
+ * editor_app_init's boot .rp.json / tier-preset resolution), then applies
+ * the tier the user last hit Apply on and latches off.  Projects that never
+ * applied a tier carry no "graphics.tier" key and keep the boot pipeline. */
+void jce_editor_quality_tier_boot_apply(void)
+{
+    static bool s_applied = false;
+    if (s_applied || !jce_editor_pstate_active()) return;
+    s_applied = true;
+
+    char id[16];
+    if (!jce_editor_pstate_get_str("graphics.tier", id, sizeof(id))) return;
+    int idx = tier_idx_from_id(id);
+    if (idx < 0) return;
+
+    static const JceQualityTier k_tiers[4] = {
+        JCE_QUALITY_LOW, JCE_QUALITY_MED, JCE_QUALITY_HIGH, JCE_QUALITY_ULTRA
+    };
+    JceQualityPreset p;
+    jce_quality_preset_get(k_tiers[idx], &p);
+    jce_quality_preset_apply(&p);
+    s_tier_idx = idx;   /* keep the panel combo in sync */
+    jce_editor_console_log_level(JCE_CONSOLE_INFO,
+        "[quality] re-applied per-project tier '%s'", k_tier_ids[idx]);
 }

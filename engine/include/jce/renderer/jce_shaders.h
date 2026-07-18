@@ -58,6 +58,14 @@ typedef struct JceShaderSet {
      * pak built before the variant existed leaves the handle invalid and the
      * renderer simply keeps tinted entities on the solo path. */
     JceShaderHandle pbr_inst_tint;    /* instanced PBR — per-instance tint */
+    /* Texture-diverse instanced PBR: vs_pbr_inst_tex_array + fs_pbr_inst_tex_array.
+     * The instance buffer carries a 6th vec4 (i_data5.x = albedo 2D-array LAYER),
+     * and s_albedo is a SAMPLER2DARRAY, so copies of one mesh that differ by their
+     * albedo TEXTURE (not just a baseColor factor) batch into one instanced submit.
+     * Optional (essl1/GLES2-excluded, older pak): invalid handle → texture-diverse
+     * entities stay on the solo path. */
+    JceShaderHandle pbr_inst_tex_array; /* instanced PBR — per-instance albedo array layer */
+    JceShaderHandle pbr_inst_fade;      /* instanced PBR — LOD cross-fade dither (千万 ②) */
     JceShaderHandle pbr_skinned;      /* skinned PBR */
     /* Forward+ clustered fragment variant (fs_pbr_fwdplus): same vertex
      * shaders, IES dropped + clustered point/spot loop.  Selected only when

@@ -8,6 +8,7 @@
 #include <jce/os/core/jce_allocator.h>
 
 #include <mimalloc.h>
+#include <SDL3/SDL_stdinc.h>   /* SDL_SetMemoryFunctions (allocator bridge) */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -59,6 +60,24 @@ static void track_on_free(void *p)   /* call BEFORE mi_free, while p is valid */
 #  define track_on_free(p)  ((void)(p))
 #endif
 
+/* Always-on per-frame allocation counters (rank-9): two native-word increments
+ * per allocation, compiled into RELEASE too (unlike the NDEBUG-only tracker
+ * above), so JCE_PERF_LOG can surface allocs/frame + KB/frame in a profiling
+ * build — making per-frame heap churn measurable (verify-before-fix) instead of
+ * reasoned-from-code.  Unlocked ⇒ approximate under concurrent allocation, which
+ * is all a per-frame trend needs. */
+static size_t s_pf_allocs, s_pf_alloc_bytes;        /* monotonic since start */
+static size_t s_pf_last_allocs, s_pf_last_bytes;    /* sampled by frame_delta */
+
+void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes)
+{
+    size_t a = s_pf_allocs, b = s_pf_alloc_bytes;
+    if (out_allocs) *out_allocs = (uint64_t)(a - s_pf_last_allocs);
+    if (out_bytes)  *out_bytes  = (uint64_t)(b - s_pf_last_bytes);
+    s_pf_last_allocs = a;
+    s_pf_last_bytes  = b;
+}
+
 /* ================================================================== */
 /* Default allocator (mimalloc)                                        */
 /* ================================================================== */
@@ -68,6 +87,7 @@ static void *default_alloc(size_t size, void *ctx)
     (void)ctx;
     void *p = mi_malloc(size);
     track_on_alloc(p);
+    if (p) { s_pf_allocs++; s_pf_alloc_bytes += size; }   /* rank-9 always-on */
     return p;
 }
 
@@ -77,6 +97,7 @@ static void *default_realloc(void *ptr, size_t new_size, void *ctx)
     track_on_free(ptr);                 /* drop old accounting (NULL ⇒ no-op) */
     void *p = mi_realloc(ptr, new_size);
     track_on_alloc(p);                  /* add new accounting (NULL ⇒ no-op)  */
+    if (p) { s_pf_allocs++; s_pf_alloc_bytes += new_size; }   /* rank-9 */
     return p;
 }
 
@@ -211,6 +232,59 @@ bool jce_mem_stats(JceMemStats *out)
     out->page_faults    = page_faults;
     out->elapsed_ms     = elapsed;
     return true;
+}
+
+void jce_alloc_low_mem_mode(bool on)
+{
+    /* Immediate purge: freed segments decommit right away instead of on the
+     * default 10ms(+10x arena multiplier) lazy schedule.  Measured on the
+     * editor's startup transient (asset decode/cook burst): the default
+     * retained ~1.3GB committed at idle; purge_delay=0 returned it
+     * (2431 -> 1103MB private).  Costs decommit syscalls on free-heavy
+     * paths, so it is the 512MB-charter mode, not the default. */
+    mi_option_set(mi_option_purge_delay, on ? 0 : 10);
+}
+
+void jce_alloc_trim(bool aggressive)
+{
+    /* mimalloc's purge is opportunistic (piggybacks on allocation activity):
+     * an IDLE process — the editor at rest renders with 0 allocs/frame —
+     * never returns its startup-peak commit.  mi_collect walks the heaps and
+     * purges retained segments on demand; `aggressive` additionally frees
+     * every candidate page (low-memory machines / explicit trim points). */
+    mi_collect(aggressive);
+}
+
+/* ================================================================== */
+/* Third-party allocator bridge                                        */
+/* ================================================================== */
+
+void *jce_realloc_aligned(void *ptr, size_t size, size_t align)
+{
+    if (size == 0) {           /* full malloc contract: size 0 == free */
+        mi_free(ptr);
+        return NULL;
+    }
+    if (align <= sizeof(void *))
+        return ptr ? mi_realloc(ptr, size) : mi_malloc(size);
+    return ptr ? mi_realloc_aligned(ptr, size, align)
+               : mi_malloc_aligned(size, align);
+}
+
+void jce_free_raw(void *ptr)
+{
+    mi_free(ptr);              /* mi_free handles plain AND aligned blocks */
+}
+
+bool jce_alloc_hook_sdl(void)
+{
+    /* SDL's malloc/calloc/realloc/free signatures match mimalloc's exactly,
+     * so the functions install directly.  The outstanding-allocation guard is
+     * load-bearing: anything SDL allocated through the PREVIOUS functions
+     * would be freed through OURS after the swap — refuse instead (the
+     * caller logs; the process simply keeps SDL on its own heap). */
+    if (SDL_GetNumAllocations() != 0) return false;
+    return SDL_SetMemoryFunctions(mi_malloc, mi_calloc, mi_realloc, mi_free);
 }
 
 /* ================================================================== */

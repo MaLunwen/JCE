@@ -7,13 +7,21 @@
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_perf_phase.h>   /* #4 ECS stress: ecs_move phase timing */
+#include <jce/os/core/jce_timer.h>
 #include "jce_component_registry_internal.h"
 #include "os/core/jce_memory.h"
 
 #include <flecs.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv — JCE_DISABLE_XGEN kill-switch */
 
 #define LOG_TAG "scene"
+
+/* #4 ECS benchmark: set to 1 by the editor Performance Benchmark panel to enable
+ * the per-frame JceTransform integrate in jce_scene_update without a relaunch
+ * (the JCE_STRESS_SPIN env is the headless equivalent). */
+int jce_scene_stress_spin_runtime = 0;
 
 /* Implemented in jce_scene_video.c — installs flecs lifecycle hooks
  * (ctor/dtor/copy/move) on the VideoPlayer component so its decoder handle
@@ -71,6 +79,7 @@ static ECS_COMPONENT_DECLARE(JceEditorMeta);
 static ECS_COMPONENT_DECLARE(JceTerrainComponent);
 static ECS_COMPONENT_DECLARE(JceVegetationScatterComponent);
 static ECS_COMPONENT_DECLARE(JceGrassFieldComponent);
+static ECS_COMPONENT_DECLARE(JceFoliageClusterComponent);
 static ECS_COMPONENT_DECLARE(JceWaterComponent);
 static ECS_COMPONENT_DECLARE(JceBuoyancyComponent);
 static ECS_COMPONENT_DECLARE(JceLodGroupComponent);
@@ -196,6 +205,32 @@ struct JceScene {
      * entities are excluded from the persistent cache by a per-entity dynamic
      * predicate instead, so the epoch staying put for them is intentional. */
     uint64_t      structural_epoch;
+    /* Per-entity transform generation (dynamic-scene opt): set_transform /
+     * set_pivot bump ONLY the moved entity's gen + its subtree instead of the
+     * global structural_epoch, so a moving camera / script-animated entity no
+     * longer invalidates the renderer's persistent static world-cache for the
+     * WHOLE scene (measured ~+27% cpu/frame at 10k entities when it did).  Open-
+     * addressing hash (entity→gen), grown on demand.  xgen_active gates the
+     * renderer's per-entity check, so a scene that never set_transforms an entity
+     * stays on the cheap epoch-only fast path (zero per-entity lookup cost). */
+    struct JceXGenSlot { uint64_t entity; uint64_t gen; uint64_t mat_gen; } *xgen; /* entity==0: empty */
+    uint32_t      xgen_cap, xgen_count;
+    bool          xgen_active;
+    /* Frame-invariance counters (DOTS-floor slice 1) — see jce_scene.h docs.
+     * roster_epoch: create/destroy; enable_gen: EditorMeta.enabled flips;
+     * xform_counter: every per-entity world invalidation + physics write-back. */
+    uint64_t      roster_epoch;
+    uint64_t      enable_gen;
+    uint64_t      xform_counter;
+    /* Dirty ring (DOTS-floor L2): every entity whose world matrix was
+     * invalidated since the last take — appended by the
+     * invalidate_entity_world subtree walk (the only per-entity xform bump
+     * source).  The physics write-back mutates an UNKNOWN entity set in
+     * place, so it sets dirty_overflow instead; overflow (or a ring past
+     * capacity) tells the consumer to fall back to a full rebuild. */
+    JceEntity     dirty_ring[1024];
+    uint32_t      dirty_count;
+    bool          dirty_overflow;
     void         *particles;    /* JceParticleSystem* (lazy; owned by jce_scene_particles.c) */
 };
 
@@ -365,6 +400,18 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     r.sky_dome_sun_softness   = 0.0010f;
     r.sky_dome_halo_power     = 48.0f;
     r.sky_dome_halo_strength  = 0.35f;
+    /* Sun rays OFF by default (count 0 gates the shader block bit-exact);
+     * length/sharpness carry the reference animeSun values so turning the
+     * feature on needs only a count + strength. */
+    r.sky_dome_anchor_radius  = 0.0f;   /* 0 = legacy view dome */
+    r.gi_dynamic              = 0.0f;   /* dynamic probe GI off  */
+    r.sky_dome_ray_count      = 0.0f;
+    r.sky_dome_ray_length     = 0.0352f;
+    r.sky_dome_ray_sharpness  = 8.0f;
+    r.sky_dome_ray_strength   = 0.8f;
+
+    /* Sky IBL on by default (byte-identical for existing scenes). */
+    r.ibl_enabled = true;
 
     /* Floating origin (off by default → runtime never rebases → byte-id). */
     r.floating_origin_enabled   = false;
@@ -559,6 +606,9 @@ JceScene *jce_scene_create(void)
     /* Start at 1 so a freshly zeroed persistent-cache slot (epoch 0) is always
        seen as stale on first access. */
     s->structural_epoch = 1;
+    s->roster_epoch     = 1;
+    s->enable_gen       = 1;
+    s->xform_counter    = 1;
 
     /* Register components. */
     ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
@@ -591,6 +641,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVegetationScatterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceGrassFieldComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceFoliageClusterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceWaterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceBuoyancyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceLodGroupComponent);
@@ -682,6 +733,7 @@ void jce_scene_destroy(JceScene *s)
     if (s->each_query)  ecs_query_fini(s->each_query);  /* before world fini */
     if (s->world) ecs_fini(s->world);
     if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
+    if (s->xgen) JCE_FREE(s->xgen);
     jce_scene_clear_streaming_settings(s);   /* frees the lazy heap block */
     JCE_FREE(s);
     LOG_INFO(LOG_TAG, "scene destroyed");
@@ -794,6 +846,7 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
     /* Active by default. */
     ecs_add(s->world, e, JceTagActive);
 
+    s->roster_epoch++;
     return (JceEntity)e;
 }
 
@@ -801,6 +854,7 @@ void jce_scene_destroy_entity(JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return;
     ecs_delete(s->world, (ecs_entity_t)e);
+    s->roster_epoch++;
 }
 
 const char *jce_scene_entity_name(const JceScene *s, JceEntity e)
@@ -845,6 +899,10 @@ void jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent)
 JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return JCE_ENTITY_INVALID;
+    /* Defense-in-depth: ecs_get_parent ACCESS_VIOLATEs on a non-alive id.
+     * Editor mirrors (e.g. g_entity_order) can briefly hold ids that a flecs
+     * cascade-delete already freed, so never dereference a dead entity. */
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return JCE_ENTITY_INVALID;
     ecs_entity_t p = ecs_get_parent(s->world, (ecs_entity_t)e);
     return (JceEntity)p;
 }
@@ -938,16 +996,27 @@ static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
     wc->slots[i].epoch = epoch;
 }
 
-/* Drop the intra-frame world-matrix memo (begin a new generation).  Keeps the
-   allocated table (avoids realloc churn on static scenes) but empties it, which
-   both invalidates last frame's matrices and reclaims slots of since-destroyed
-   entities so the table cannot grow without bound.  Does NOT touch
-   structural_epoch — this is the per-frame drop used by jce_scene_update / the
-   renderer / the pick pass, none of which represent a structural edit. */
+/* Drop the intra-frame world-matrix memo (begin a new generation).  Does NOT
+   touch structural_epoch — this is the per-frame drop used by
+   jce_scene_update / the renderer / the pick pass, none of which represent a
+   structural edit.
+
+   O(1): bumping world_epoch alone invalidates every cached matrix, because
+   the lookup (scene_world_matrix_memo) only trusts a slot whose epoch equals
+   the CURRENT world_epoch — stale entries simply miss and get overwritten in
+   place by the next put.  This used to also memset the whole table every
+   call, which was called 2-3x per frame and cost O(cap): multi-MB of pure
+   memory traffic per frame at large entity counts (150k entities => ~4MB
+   table => ~60MB/s of memset at 60fps x 2-3 calls), dwarfing the work it
+   "saved".  The ONLY thing the wipe provided beyond the epoch bump was
+   reclaiming slots of since-destroyed entities so a streaming world cannot
+   grow the table without bound — that is now done on a slow cadence instead
+   (every 512 generations, amortized ~O(cap/512) per frame ~= zero). */
 static void scene_drop_world_cache_frame(JceScene *s)
 {
     s->world_epoch++;
-    if (s->world_cache.slots && s->world_cache.live) {
+    if ((s->world_epoch & 511u) == 0u &&
+        s->world_cache.slots && s->world_cache.live) {
         memset(s->world_cache.slots, 0,
                (size_t)s->world_cache.cap * sizeof(JceWorldCacheSlot));
         s->world_cache.live = 0;
@@ -980,6 +1049,225 @@ void jce_scene_begin_render_world_cache(JceScene *s)
 uint64_t jce_scene_get_structural_epoch(const JceScene *s)
 {
     return s ? s->structural_epoch : 0;
+}
+
+/* Frame-invariance counters (DOTS-floor slice 1) — see jce_scene.h. */
+uint64_t jce_scene_get_roster_epoch(const JceScene *s)
+{
+    return s ? s->roster_epoch : 0;
+}
+
+uint64_t jce_scene_get_enable_gen(const JceScene *s)
+{
+    return s ? s->enable_gen : 0;
+}
+
+uint64_t jce_scene_get_xform_counter(const JceScene *s)
+{
+    return s ? s->xform_counter : 0;
+}
+
+void jce_scene_bump_enable_gen(JceScene *s)
+{
+    if (s) s->enable_gen++;
+}
+
+void jce_scene_notify_physics_writeback(JceScene *s)
+{
+    /* Physics wrote Transforms in place (no set_transform, no xgen bump) —
+     * fold it into the same "some world matrix changed" counter.  The mutated
+     * entity set is unknown, so incremental repair is off the table for this
+     * frame: mark the dirty ring overflowed. */
+    if (s) { s->xform_counter++; s->dirty_overflow = true; }
+}
+
+/* Ring-push a subtree WITHOUT bumping per-entity xgen or the structural
+ * epoch: the in-place physics/nav/net write-back mutates Transforms of
+ * KNOWN entities, so name them (plus descendants, whose worlds inherit the
+ * change) for the renderer's L2 incremental repair instead of overflowing.
+ * Any bound hit degrades to dirty_overflow ONLY — never a structural bump,
+ * which would evict the whole persistent static world cache every frame. */
+static void scene_dirty_push_subtree(JceScene *s, JceEntity e)
+{
+    JceEntity stack[256];
+    int sp = 0;
+    stack[sp++] = e;
+    int processed = 0;
+    while (sp > 0) {
+        JceEntity cur = stack[--sp];
+        if (s->dirty_count < (uint32_t)(sizeof s->dirty_ring / sizeof s->dirty_ring[0]))
+            s->dirty_ring[s->dirty_count++] = cur;
+        else { s->dirty_overflow = true; return; }
+        if (++processed > 4096) { s->dirty_overflow = true; return; }
+        JceEntity kids[64];
+        int n = jce_scene_get_children(s, cur, kids, 64);
+        if (n >= 64) { s->dirty_overflow = true; return; }
+        for (int i = 0; i < n; i++) {
+            if (sp >= 256) { s->dirty_overflow = true; return; }
+            stack[sp++] = kids[i];
+        }
+    }
+}
+
+void jce_scene_notify_physics_writeback_entity(JceScene *s, JceEntity e)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+    s->xform_counter++;
+    scene_dirty_push_subtree(s, e);
+}
+
+uint32_t jce_scene_peek_dirty_entities(const JceScene *s, JceEntity *out,
+                                       uint32_t cap, bool *out_overflow)
+{
+    if (!s) { if (out_overflow) *out_overflow = true; return 0; }
+    uint32_t n = s->dirty_count;
+    bool ovf = s->dirty_overflow;
+    if (out && n > 0) {
+        if (n > cap) { n = cap; ovf = true; }
+        memcpy(out, s->dirty_ring, (size_t)n * sizeof(JceEntity));
+    }
+    if (out_overflow) *out_overflow = ovf;
+    return n;
+}
+
+uint32_t jce_scene_take_dirty_entities(JceScene *s, JceEntity *out,
+                                       uint32_t cap, bool *out_overflow)
+{
+    if (!s) { if (out_overflow) *out_overflow = true; return 0; }
+    uint32_t n = s->dirty_count;
+    bool ovf = s->dirty_overflow;
+    if (out && n > 0) {
+        if (n > cap) { n = cap; ovf = true; }
+        memcpy(out, s->dirty_ring, (size_t)n * sizeof(JceEntity));
+    }
+    if (out_overflow) *out_overflow = ovf;
+    s->dirty_count    = 0;
+    s->dirty_overflow = false;
+    return n;
+}
+
+/* ── Per-entity transform generation (dynamic-scene world-cache) ─────────── */
+
+static struct JceXGenSlot *xgen_find_slot(JceScene *s, uint64_t entity, bool insert)
+{
+    if (insert && (!s->xgen ||
+        (uint64_t)(s->xgen_count + 1u) * 10u >= (uint64_t)s->xgen_cap * 7u)) {
+        uint32_t newcap = s->xgen_cap ? s->xgen_cap * 2u : 256u;
+        struct JceXGenSlot *nw =
+            (struct JceXGenSlot *)JCE_CALLOC(newcap, sizeof(*nw));
+        if (!nw) return NULL;
+        /* newcap is always a power of two (256 << k), so index with a mask
+         * instead of a runtime modulo (a real 32-bit DIV the compiler can't
+         * strength-reduce on a runtime cap). */
+        uint32_t nmask = newcap - 1u;
+        for (uint32_t i = 0; i < s->xgen_cap; i++) {
+            if (!s->xgen[i].entity) continue;
+            uint32_t h = (uint32_t)(s->xgen[i].entity * 2654435761u) & nmask;
+            for (uint32_t j = 0; j < newcap; j++) {
+                uint32_t sl = (h + j) & nmask;
+                if (!nw[sl].entity) { nw[sl] = s->xgen[i]; break; }
+            }
+        }
+        if (s->xgen) JCE_FREE(s->xgen);
+        s->xgen = nw; s->xgen_cap = newcap;
+    }
+    if (!s->xgen) return NULL;
+    uint32_t cap = s->xgen_cap;
+    uint32_t mask = cap - 1u;  /* cap is pow2 → mask instead of per-entity DIV */
+    uint32_t h = (uint32_t)(entity * 2654435761u) & mask;
+    for (uint32_t i = 0; i < cap; i++) {
+        uint32_t sl = (h + i) & mask;
+        struct JceXGenSlot *e = &s->xgen[sl];
+        if (e->entity == entity) return e;
+        if (!e->entity) {
+            if (!insert) return NULL;
+            e->entity = entity; e->gen = 0; s->xgen_count++;
+            return e;
+        }
+    }
+    return NULL; /* full (load<0.7 keeps this unreachable after a successful grow) */
+}
+
+uint64_t jce_scene_entity_xform_gen(const JceScene *s, JceEntity e)
+{
+    if (!s || !s->xgen_active) return 0;
+    struct JceXGenSlot *slot = xgen_find_slot((JceScene *)s, (uint64_t)e, false);
+    return slot ? slot->gen : 0;
+}
+
+bool jce_scene_xgen_active(const JceScene *s) { return s && s->xgen_active; }
+
+/* Per-entity MATERIAL generation (lever ③ persistent draw-cmd cache). Mirrors
+ * xform_gen but for material/mesh content: bumped by jce_scene_invalidate_entity_
+ * material on a MeshRenderer set + async texture/model pop-in. A draw-cmd cache
+ * stores the mat_gen it saw and re-builds when it differs. Reuses the xgen slot
+ * table (one slot per entity holds both gen + mat_gen). */
+uint64_t jce_scene_entity_material_gen(const JceScene *s, JceEntity e)
+{
+    if (!s || !s->xgen_active) return 0;
+    struct JceXGenSlot *slot = xgen_find_slot((JceScene *)s, (uint64_t)e, false);
+    return slot ? slot->mat_gen : 0;
+}
+
+/* Invalidate ONLY entity e's cached draw command (lever ③): bump its per-entity
+ * material generation. Single-entity (unlike the world cache) — a material edit
+ * does not propagate to children. Safe to call every frame; a persistent
+ * draw-cmd cache observes the bump and rebuilds that entity. OOM (no slot) is
+ * benign: mat_gen stays 0 so the entity simply never scores a cache hit. */
+void jce_scene_invalidate_entity_material(JceScene *s, JceEntity e)
+{
+    if (!s) return;
+    s->xgen_active = true;
+    struct JceXGenSlot *slot = xgen_find_slot(s, (uint64_t)e, true);
+    if (slot) slot->mat_gen++;
+}
+
+/* Invalidate ONLY entity e's subtree in the renderer's cross-frame static world
+ * cache (bump the per-entity gen of e + every descendant, since a parent move
+ * changes its children's world), plus drop the intra-frame memo.  set_transform
+ * / set_pivot use this instead of the global structural_epoch bump so a moving
+ * entity no longer drops the whole scene's static cache.  Bounded: a
+ * pathologically wide/deep/huge subtree falls back to the global invalidate
+ * (correct, just less granular). */
+void jce_scene_invalidate_entity_world(JceScene *s, JceEntity e)
+{
+    if (!s) return;
+    s->xform_counter++;   /* frame-invariance key: "some world matrix changed" */
+    /* Kill-switch: fall back to the old whole-scene invalidate for A/B + safety. */
+    static int s_xgen_disabled = -1;
+    if (s_xgen_disabled < 0) {
+        const char *v = getenv("JCE_DISABLE_XGEN");
+        s_xgen_disabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (s_xgen_disabled) { jce_scene_invalidate_world_cache(s); return; }
+    scene_drop_world_cache_frame(s);   /* intra-frame memo: same as the global path */
+    s->xgen_active = true;
+    JceEntity stack[256];
+    int sp = 0;
+    stack[sp++] = e;
+    int processed = 0;
+    while (sp > 0) {
+        JceEntity cur = stack[--sp];
+        struct JceXGenSlot *slot = xgen_find_slot(s, (uint64_t)cur, true);
+        if (!slot) { jce_scene_invalidate_world_cache(s); return; }     /* OOM */
+        slot->gen++;
+        /* L2 dirty ring: record the invalidated entity for incremental ecull
+         * repair.  Past capacity => overflow (consumer falls back to a full
+         * rebuild; the fallback paths below bump structural_epoch which
+         * already forces one). */
+        if (s->dirty_count < (uint32_t)(sizeof s->dirty_ring / sizeof s->dirty_ring[0]))
+            s->dirty_ring[s->dirty_count++] = cur;
+        else
+            s->dirty_overflow = true;
+        if (++processed > 4096) { jce_scene_invalidate_world_cache(s); return; }
+        JceEntity kids[64];
+        int n = jce_scene_get_children(s, cur, kids, 64);
+        if (n >= 64) { jce_scene_invalidate_world_cache(s); return; }   /* too wide */
+        for (int i = 0; i < n; i++) {
+            if (sp >= 256) { jce_scene_invalidate_world_cache(s); return; } /* too deep */
+            stack[sp++] = kids[i];
+        }
+    }
 }
 
 /* Floating-origin rebase: shift the LOCAL position of every ROOT entity (no
@@ -1254,6 +1542,46 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
     ecs_remove(s->world, re, TYPE);                                    \
 }
 
+/* Like JCE_COMP_IMPL but the runtime set path bumps the per-entity material_gen
+ * (lever ③): a gameplay/script SetMeshRenderer must invalidate any cached draw
+ * command for that entity. (The editor inspector mutates via get_mut with no set
+ * call; the runtime-only draw-cmd cache does not run in-editor, so that seam is
+ * covered separately when/if the cache is extended to the editor.) */
+#define JCE_COMP_IMPL_MATERIAL(TYPE, NAME)                              \
+void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
+{                                                                       \
+    if (!s || !v) return;                                               \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    jce_scene_invalidate_entity_material(s, e);                         \
+}                                                                       \
+                                                                        \
+TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
+{                                                                       \
+    if (!s) return NULL;                                                \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
+}                                                                       \
+                                                                        \
+bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
+{                                                                       \
+    if (!s) return false;                                               \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    return ecs_has(s->world, re, TYPE);                                \
+}                                                                       \
+                                                                        \
+void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
+{                                                                       \
+    if (!s) return;                                                     \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_remove(s->world, re, TYPE);                                    \
+    jce_scene_invalidate_entity_material(s, e);                         \
+}
+
 #define JCE_COMP_IMPL_WORLD(TYPE, NAME)                                 \
 void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
 {                                                                       \
@@ -1261,7 +1589,11 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
     ecs_set_ptr(s->world, re, TYPE, v);                                 \
-    jce_scene_invalidate_world_cache(s);                                \
+    /* Per-entity world-cache invalidation: a transform/pivot edit changes only \
+     * this entity's subtree, so bump its gen instead of the global epoch (a     \
+     * moving camera/script entity no longer drops the whole static cache).      \
+     * Component add/remove keep the global bump (render-kind etc. may change). */\
+    jce_scene_invalidate_entity_world(s, e);                            \
 }                                                                       \
                                                                         \
 TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
@@ -1291,7 +1623,257 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
 
 JCE_COMP_IMPL_WORLD(JceTransform,          transform)
 JCE_COMP_IMPL_WORLD(JcePivotComponent,     pivot)
-JCE_COMP_IMPL(JceMeshRenderer,                mesh_renderer)
+JCE_COMP_IMPL_MATERIAL(JceMeshRenderer,       mesh_renderer)
+
+/* Read-only ecs_get_id variant for CONCURRENT worker-thread reads under
+ * multi-threaded readonly mode. jce_scene_get_mesh_renderer uses ecs_get_mut
+ * (write-intent → trips the exclusive-access assert, disallowed in readonly
+ * mode); this is a verified pure read (flecs.c:9147) safe from many threads. */
+const JceMeshRenderer *jce_scene_get_mesh_renderer_const(const JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    ecs_entity_t re = jce_scene_resolve_entity((JceScene *)s, e);
+    if (!re || !ecs_is_alive(s->world, re)) return NULL;
+    return (const JceMeshRenderer *)ecs_get_id(s->world, re, ecs_id(JceMeshRenderer));
+}
+
+/* Multi-threaded readonly-mode wrappers — call from the single coordinator
+ * thread, bracketing a parallel ecs_get_*_const fan-out. Makes the world fully
+ * immutable so concurrent reads are flecs-sanctioned. Not thread-safe themselves. */
+void jce_scene_parallel_read_begin(JceScene *s) { if (s && s->world) ecs_readonly_begin(s->world, true); }
+void jce_scene_parallel_read_end(JceScene *s)   { if (s && s->world) ecs_readonly_end(s->world); }
+
+/* O(1) scene-wide component counts (flecs table counts).  Per-frame renderer
+ * loops that PROBE every collected entity for a rare component can skip
+ * entirely when the scene holds none — a 150k-static-primitive world paid
+ * ~0.5 µs/entity/frame in animator probes that could never hit. */
+int jce_scene_count_skeletal_animators(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceSkeletalAnimatorComponent));
+}
+
+int jce_scene_count_sprite_animators(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceSpriteAnimatorComponent));
+}
+
+/* Component-filtered entity walks (flecs ecs_each: uncached, O(#matches)) —
+ * lets the renderer's light selection visit ONLY the light entities instead of
+ * probing every collected entity (150k probes/frame on a large static world). */
+void jce_scene_each_point_light(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JcePointLight));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+/* O(#water) — the runtime buoyancy pass previously found its water surface
+ * with a FULL-scene jce_scene_each_entity walk every fixed tick. */
+void jce_scene_each_water(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceWaterComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+/* O(#cameras) — the runtime viewer-position fallback (no character
+ * controller) previously scanned the FULL scene for the primary camera every
+ * fixed tick and every frame. */
+void jce_scene_each_camera(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceCameraComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+/* O(#emitters) — the editor's scene-view gizmo-icon system needs to visit ONLY
+ * the particle-emitter entities: they carry no MeshRenderer and so have no GPU
+ * id-buffer footprint, meaning they can't be clicked from the id readback.  A
+ * screen-space source icon (drawn + hit-tested like the light/camera icons)
+ * makes them selectable, which in turn lets the inspector edit them. */
+void jce_scene_each_particle_emitter(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceParticleEmitterComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+/* O(1) (flecs table-count aggregate) — lets per-tick physics passes bail on
+ * "no such component anywhere" without a per-body pre-walk. */
+int jce_scene_count_constant_force(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceConstantForceComponent));
+}
+
+/* O(#holders) walks + O(1) counts for the per-frame renderer/system gates.
+ * Each of these systems used a FULL jce_scene_each_entity probe walk every
+ * frame (twice with both editor viewports) — on a 150k-entity static world
+ * that was ~10ms/frame of has_component() misses across the family. */
+void jce_scene_each_skybox(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceSkyboxComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+void jce_scene_each_skeletal_animator(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceSkeletalAnimatorComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+void jce_scene_each_video_player(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceVideoPlayerComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_volume(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceVolumeComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_decal(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceDecalComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_cloth(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceClothComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+int jce_scene_count_particle_emitters(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceParticleEmitterComponent));
+}
+
+int jce_scene_count_video_players(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceVideoPlayerComponent));
+}
+
+int jce_scene_count_volumes(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceVolumeComponent));
+}
+
+int jce_scene_count_decals(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceDecalComponent));
+}
+
+int jce_scene_count_cloth(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceClothComponent));
+}
+
+void jce_scene_each_spot_light(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceSpotLight));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+int jce_scene_count_point_lights(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JcePointLight));
+}
+
+int jce_scene_count_spot_lights(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceSpotLight));
+}
+
+int jce_scene_count_dir_lights(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceDirectionalLight));
+}
+
+int jce_scene_count_reflection_probes(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceReflectionProbeComponent));
+}
+
+int jce_scene_count_light_probe_groups(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceLightProbeGroupComponent));
+}
+
+int jce_scene_count_lod_groups(JceScene *s)
+{
+    if (!s || !s->world) return 0;
+    return (int)ecs_count_id(s->world, ecs_id(JceLodGroupComponent));
+}
+
+void jce_scene_each_dir_light(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceDirectionalLight));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_reflection_probe(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceReflectionProbeComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_light_probe_group(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceLightProbeGroupComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
 JCE_COMP_IMPL(JceCameraComponent,             camera)
 JCE_COMP_IMPL(JceDirectionalLight,            dir_light)
 JCE_COMP_IMPL(JcePointLight,                  point_light)
@@ -1317,6 +1899,7 @@ JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
 JCE_COMP_IMPL(JceTerrainComponent,            terrain)
 JCE_COMP_IMPL(JceVegetationScatterComponent,  vegetation_scatter)
 JCE_COMP_IMPL(JceGrassFieldComponent,         grass_field)
+JCE_COMP_IMPL(JceFoliageClusterComponent,     foliage_cluster)
 JCE_COMP_IMPL(JceWaterComponent,              water)
 JCE_COMP_IMPL(JceBuoyancyComponent,           buoyancy)
 JCE_COMP_IMPL(JceLodGroupComponent,           lod_group)
@@ -1491,6 +2074,11 @@ bool jce_scene_comp_enabled(const JceScene *s, JceEntity e, int comp_id)
     if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return true;
     ecs_entity_t ent = (ecs_entity_t)e;
     if (!ecs_is_alive(s->world, ent)) return false;
+    /* O(1) all-clear: no entity in the world carries an enable-state row
+     * (the row is removed when fully re-enabled, see set_comp_enabled), so
+     * every component is enabled — skip the per-entity ecs_get.  This gate
+     * runs AFTER is_alive so dead entities still report disabled. */
+    if (ecs_count_id(s->world, ecs_id(JceCompEnableState)) == 0) return true;
     const JceCompEnableState *st = ecs_get(s->world, ent, JceCompEnableState);
     if (!st) return true;   /* default enabled */
     return (st->disabled[comp_id >> 6] & (UINT64_C(1) << (comp_id & 63))) == 0;
@@ -1775,6 +2363,39 @@ void jce_scene_update(JceScene *s, float dt)
     scene_drop_world_cache_frame(s);
 
     ecs_progress(s->world, dt);
+
+    /* JCE_STRESS_SPIN (#4 ECS entity-count benchmark): each frame iterate every
+     * entity with a JceTransform and integrate it (the standard flecs N-entity
+     * Transform/Velocity throughput test) — pure component read+write over the
+     * flecs storage, measured via the "ecs_move" perf-phase.  Off by default
+     * (env unset) → zero cost.  Does not invalidate the world cache: the metric
+     * is raw ECS iteration throughput, not the rendered result. */
+    {
+        static int s_spin = -1;
+        if (s_spin < 0) { const char *e = getenv("JCE_STRESS_SPIN");
+                          s_spin = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        if (s_spin || jce_scene_stress_spin_runtime) {
+            uint64_t _t0 = jce_time_perf_counter();
+            if (!s->each_query) {
+                s->each_query = ecs_query(s->world, {
+                    .terms = {{ .id = ecs_id(JceTransform) }}
+                });
+            }
+            if (s->each_query) {
+                ecs_iter_t it = ecs_query_iter(s->world, s->each_query);
+                while (ecs_query_next(&it)) {
+                    JceTransform *xf = ecs_field(&it, JceTransform, 0);
+                    for (int i = 0; i < it.count; i++) {
+                        xf[i].position.x += dt;          /* velocity integrate */
+                        xf[i].position.y += dt * 0.5f;
+                        xf[i].rotation.y += dt;          /* angular integrate  */
+                    }
+                }
+            }
+            jce_perf_phase_add("ecs_move",
+                               jce_time_perf_to_ms(_t0, jce_time_perf_counter()));
+        }
+    }
 
     /* ── Cloth reconciliation (P3-C.4 follow-up) ─────────────────────
      * For every entity with a JceClothComponent whose runtime handle is

@@ -50,6 +50,13 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
                            float pt_size,
                            const uint32_t *extra_cps, int extra_count);
 
+/* Open a font from a host-filesystem file (project-loose asset).  Same
+   contract as jce_font_open_ex but reads via jce_fs_host_read_all instead
+   of a PAK — the editor uses this so canvas UI resolves project-authored
+   fonts that are not baked into its embedded pak. */
+JceFont *jce_font_open_file_ex(const char *host_path, float pt_size,
+                               const uint32_t *extra_cps, int extra_count);
+
 /* Close a font and free its atlas texture. */
 JCE_API void jce_font_close(JceFont *font);
 
@@ -79,6 +86,20 @@ JCE_API int jce_font_line_height(const JceFont *font);
 /* Measure a string's bounding box in pixels (at native pt_size). */
 void jce_text_measure(const JceFont *font, const char *text,
                       float *out_w, float *out_h);
+
+/* ── Math markup ───────────────────────────────────────────────────────
+ * Render a compact LaTeX-flavoured inline notation for formulas:
+ *   \<name> symbol substitution (\mu \pi \Delta \sqrt \int \sum \times
+ *           \approx \leq \geq \to \infty ...); ^x/^{..} superscript;
+ *   _x/_{..} subscript; {..} grouping; any other UTF-8 is literal (so
+ *   Unicode math such as √ μ ² also passes through).  Single line.
+ * Backed by the on-demand glyph atlas, so Greek/symbol glyphs render even
+ * when they were never pre-baked into the font. */
+void jce_text_measure_math(const JceFont *font, const char *markup,
+                           float *out_w, float *out_h);
+void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
+                             uint16_t view_id, float x, float y, float scale,
+                             const char *markup, uint32_t color);
 
 JCE_EXTERN_C_END
 

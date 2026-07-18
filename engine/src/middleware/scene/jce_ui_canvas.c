@@ -94,6 +94,8 @@ struct JceUICanvas {
 
     UCFontSlot    fonts[UC_MAX_FONTS];
     int           font_count;
+    uint32_t      font_root_gen;   /* asset-root generation the cache was
+                                    * built against (0 = never validated) */
 
     UCTexSlot     textures[UC_MAX_TEXTURES];
     int           texture_count;
@@ -120,17 +122,57 @@ struct JceUICanvas {
 
 /* ── Resource caches ───────────────────────────────────────────────── */
 
+/* Process-global content root for canvas assets (mirrors the particle
+ * system's asset-root anchor).  When set — the editor points it at the open
+ * project's source-assets dir — fonts referenced by UIText resolve from the
+ * project tree FIRST, then fall back to the canvas pak.  Runtime PAK-only
+ * boots (shipped exe, web) never set it and keep the pak path.  A generation
+ * counter invalidates per-canvas font caches when the root changes (project
+ * switch), so a stale font never outlives its project. */
+static char     s_uc_asset_root[512];
+static uint32_t s_uc_asset_root_gen = 1u;
+
+/* App-scoped override for the fallback font used by any UIText that leaves its
+ * font_path empty.  Empty (the default) keeps UC_DEFAULT_FONT so the editor and
+ * every other app are unchanged.  Bumps the same generation counter as the
+ * asset root so cached fonts rebuild when it changes. */
+static char     s_uc_default_font[256];
+
+void jce_ui_canvas_set_asset_root(const char *root_dir)
+{
+    const char *next = (root_dir && root_dir[0]) ? root_dir : "";
+    if (strcmp(s_uc_asset_root, next) == 0) return;
+    jce_strlcpy(s_uc_asset_root, next, sizeof s_uc_asset_root);
+    s_uc_asset_root_gen++;
+}
+
+void jce_ui_canvas_set_default_font(const char *font_path)
+{
+    const char *next = (font_path && font_path[0]) ? font_path : "";
+    if (strcmp(s_uc_default_font, next) == 0) return;
+    jce_strlcpy(s_uc_default_font, next, sizeof s_uc_default_font);
+    s_uc_asset_root_gen++;   /* invalidate font caches so the swap takes effect */
+}
+
 static JceFont *uc_get_font(JceUICanvas *uc, const char *path, int px)
 {
     if (px < 4)   px = 4;
     if (px > 256) px = 256;
-    const char *p = (path && path[0]) ? path : UC_DEFAULT_FONT;
+    const char *fallback = s_uc_default_font[0] ? s_uc_default_font : UC_DEFAULT_FONT;
+    const char *p = (path && path[0]) ? path : fallback;
+
+    if (uc->font_root_gen != s_uc_asset_root_gen) {
+        for (int i = 0; i < uc->font_count; i++)
+            if (uc->fonts[i].font) jce_font_close(uc->fonts[i].font);
+        uc->font_count = 0;
+        uc->font_root_gen = s_uc_asset_root_gen;
+    }
 
     for (int i = 0; i < uc->font_count; i++) {
         if (uc->fonts[i].px == px && strcmp(uc->fonts[i].path, p) == 0)
             return uc->fonts[i].font;   /* may be NULL = cached failure */
     }
-    if (uc->font_count >= UC_MAX_FONTS || !uc->pak)
+    if (uc->font_count >= UC_MAX_FONTS)
         return NULL;
 
     /* Pre-render the engine's curated CJK/Latin-extended codepoints so UI
@@ -139,9 +181,15 @@ static JceFont *uc_get_font(JceUICanvas *uc, const char *path, int px)
     {
         uint32_t cps[256];
         int n = jce_i18n_collect_codepoints(cps, 256);
-        f = jce_font_open_ex(uc->pak, p, (float)px, cps, n);
+        if (s_uc_asset_root[0]) {
+            char full[768];
+            snprintf(full, sizeof full, "%s/%s", s_uc_asset_root, p);
+            f = jce_font_open_file_ex(full, (float)px, cps, n);
+        }
+        if (!f && uc->pak)
+            f = jce_font_open_ex(uc->pak, p, (float)px, cps, n);
     }
-    if (!f && strcmp(p, UC_DEFAULT_FONT) != 0) {
+    if (!f && strcmp(p, UC_DEFAULT_FONT) != 0 && uc->pak) {
         /* Fall back to the default engine font. */
         uint32_t cps[256];
         int n = jce_i18n_collect_codepoints(cps, 256);
@@ -668,12 +716,15 @@ static void uc_draw_text(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
     for (int i = 0; i < nlines; ++i, oy += lh) {
         if (!vis[i][0]) continue;                /* visibly-blank line: advance */
         float lw = 0.0f, lhh = 0.0f;
-        if (tx->rich_text) lw = uc_rich_line_width(font, lines[i]); /* match run-split render */
+        if (tx->math_text)     jce_text_measure_math(font, vis[i], &lw, &lhh);
+        else if (tx->rich_text) lw = uc_rich_line_width(font, lines[i]); /* match run-split render */
         else jce_text_measure(font, vis[i], &lw, &lhh);
         float ox = r->x;                         /* horizontal alignment per line */
         if (tx->alignment == JCE_UI_TEXT_ALIGN_CENTER) ox = r->x + (r->w - lw) * 0.5f;
         else if (tx->alignment == JCE_UI_TEXT_ALIGN_RIGHT) ox = r->x + (r->w - lw);
-        if (tx->rich_text)
+        if (tx->math_text)
+            jce_text_draw_math_view(uc->renderer, font, view_id, ox, oy, 1.0f, vis[i], col);
+        else if (tx->rich_text)
             uc_draw_rich_line(uc, font, view_id, ox, oy, lines[i], tx->color, alpha_mul);
         else
             jce_text_draw_scaled_view(uc->renderer, font, view_id, ox, oy, 1.0f, vis[i], col);

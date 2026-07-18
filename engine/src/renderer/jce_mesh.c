@@ -12,6 +12,7 @@
 #include <bgfx/c99/bgfx.h>
 #include <stdlib.h>
 #include <string.h>
+#include "renderer/jce_render_encoder.h"
 
 #define LOG_TAG "jce_mesh"
 
@@ -228,23 +229,23 @@ void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
         /* Wireframe: use line index buffer, no face culling. */
-        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+        jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+        jce_enc_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                      | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
                      | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
-            bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+            jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
     }
 
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
     bgfx_program_handle_t prog = { sh.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
@@ -252,12 +253,12 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->wf_ibh.idx != UINT16_MAX) {
-        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+        jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
     } else if (mesh->ibh.idx != UINT16_MAX) {
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
     }
 
     uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
@@ -270,11 +271,11 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
 
     /* LEQUAL depth test so wireframe overlay renders on top of solid geometry
      * at the same depth.  LINEAA for smooth anti-aliased lines. */
-    bgfx_set_state(state, 0);
+    jce_enc_set_state(state, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
     bgfx_program_handle_t prog = { sh.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
@@ -287,19 +288,19 @@ void jce_mesh_submit_pbr_state(const JceMesh *mesh, const JceRenderer *r,
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
     /* state==0 keeps the historical opaque behaviour.  A non-zero state
      * carries the material's blend / cull (double_sided drops CULL_CW) /
      * depth-write flags, built by jce_pbr_material_render_state(). */
-    bgfx_set_state(state ? state : BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(state ? state : BGFX_STATE_DEFAULT, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_pbr(r);
     bgfx_program_handle_t prog = { sh.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
@@ -309,12 +310,12 @@ void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
 
     /* Fall back to the renderer's default PBR program when the
      * override handle is invalid — keeps callers simple (they can
@@ -324,7 +325,7 @@ void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
         idx = jce_renderer_get_program_pbr(r).idx;
 
     bgfx_program_handle_t prog = { idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_pick_id(const JceMesh        *mesh,
@@ -336,32 +337,32 @@ void jce_mesh_submit_pick_id(const JceMesh        *mesh,
     if (!mesh || !r || program.idx == UINT16_MAX)
         return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
     uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
                      BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS |
                      BGFX_STATE_MSAA;
     if (!double_sided)
         state |= BGFX_STATE_CULL_CW;
-    bgfx_set_state(state, 0);
+    jce_enc_set_state(state, 0);
 
     bgfx_program_handle_t prog = { program.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_terrain(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_terrain(r);
     bgfx_program_handle_t prog = { sh.idx };
@@ -370,40 +371,40 @@ void jce_mesh_submit_terrain(const JceMesh *mesh, const JceRenderer *r, uint16_t
         sh = jce_renderer_get_program_pbr(r);
         prog.idx = sh.idx;
     }
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
     /* Depth-only: write Z, cull front faces to reduce peter-panning. */
-    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+    jce_enc_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
                  | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_shadow(r);
     bgfx_program_handle_t prog = { sh.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_mesh_submit_overlay(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
 {
     if (!mesh || !r) return;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
     /* State is NOT set here — caller controls blend mode etc. */
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
     bgfx_program_handle_t prog = { sh.idx };
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
 uint32_t jce_mesh_vertex_count(const JceMesh *mesh)

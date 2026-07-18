@@ -264,8 +264,12 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
      * route the actual read through jce_fs_host_read_all → active VFS. */
     {
         JceFileSystem *afs = jce_fs_get_active();
-        if (afs && jce_fs_exists(afs, mesh_path))
-            return copy_found_path(mesh_path, out_path, out_size);
+        if (afs) {
+            if (jce_fs_exists(afs, mesh_path))
+                return copy_found_path(mesh_path, out_path, out_size);
+            if (jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED)
+                return false;
+        }
     }
 
     /* If the path already points to an existing file (e.g. absolute), use it. */

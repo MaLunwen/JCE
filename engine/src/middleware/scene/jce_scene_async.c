@@ -31,6 +31,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_mem_profile.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/resource/jce_scene_serial.h>
 #include <jce/runtime/jce_player_loop.h>
 
 #include "os/core/jce_memory.h"
@@ -285,7 +286,10 @@ static void apply_one_locked(AsyncSlot *s)
     uint32_t after  = 0;
     jce_scene_each_entity(g_target_scene, count_cb_main, &before);
 
-    int n = jce_scene_load_json(g_target_scene, s->parsed_root);
+    int n = g_target_fs
+        ? jce_scene_serial_apply_json_vfs(g_target_scene, g_target_fs,
+                                          s->vfs_path, s->parsed_root)
+        : jce_scene_load_json(g_target_scene, s->parsed_root);
     if (n < 0) {
         LOG_ERROR(LOG_TAG, "scene apply failed for '%s'",
                   s->vfs_path ? s->vfs_path : "(null)");

@@ -83,7 +83,8 @@ def _pick_entry(directory, requested):
             sys.exit(1)
         return entry
 
-    for candidate in ("caged_kingdom.html", "science_lab.html"):
+    for candidate in ("caged_kingdom.html", "science_lab.html",
+                      "space_demo.html"):
         if os.path.isfile(os.path.join(directory, candidate)):
             return candidate
 

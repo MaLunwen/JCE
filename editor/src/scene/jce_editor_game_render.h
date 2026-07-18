@@ -76,6 +76,10 @@ bool jce_editor_game_render_init(JceRenderer *renderer, struct JceWindow *window
 /* Tear down. Safe to call even if init failed. */
 void jce_editor_game_render_shutdown(void);
 
+/* Drop the game-view occlusion culler's per-entity slots.  Call when the
+ * ECS world is destroyed+recreated (Play-stop snapshot restore). */
+void jce_editor_game_render_reset_occlusion(void);
+
 /* Feed the ECS-UI (Canvas) graphic raycaster the pointer state for the next
  * jce_editor_game_render_frame() call.  Coordinates are in panel/viewport-
  * local pixels (top-left origin), matching the rendered size.  `valid` should
@@ -117,6 +121,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height);
 /* bgfx texture handle index of the colour attachment, or UINT16_MAX
  * before the first frame. Use with ImGui::Image. */
 uint16_t jce_editor_game_render_get_texture(void);
+
+/* Capture the exact LDR texture displayed by Game View.  Submission is
+ * asynchronous and shares the renderer's single readback queue; poll once per
+ * editor frame until the return value is non-zero (-1 idle, 0 pending,
+ * 1 written, 2 failed). */
+bool jce_editor_game_render_screenshot(const char *path);
+int jce_editor_game_render_capture_poll(void);
 
 /* Access the FPS fly-camera so the panel can drive movement / look. */
 JceCamera *jce_editor_game_render_get_camera(void);

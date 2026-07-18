@@ -5,6 +5,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_ui_state.h"
 
 extern "C" {
 #include <jce/renderer/jce_renderer_caps.h>    /* compute caps gate (GPU particles) */
@@ -331,6 +332,20 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
         ch = true;
     accept_asset_drop(vs->mesh_path, sizeof vs->mesh_path);
 
+    /* No mesh asset => scatter a built-in PRIMITIVE (the instanced-primitive ISM
+     * path: one GPU-instanced submit for N shapes, Unity-ISM / UE-HISM level).
+     * Pick the shape here; order matches JceVegetationScatterComponent.mesh_shape
+     * (0=cube,1=sphere,2=plane,3=capsule,4=cylinder). */
+    if (vs->mesh_path[0] == '\0') {
+        static const char *const kShapes[] = { "Cube", "Sphere", "Plane", "Capsule", "Cylinder" };
+        int shp = (vs->mesh_shape < 0 || vs->mesh_shape > 4) ? 0 : vs->mesh_shape;
+        ImGui::TextUnformatted(jce_editor_i18n_id("inspector.vegetationScatter.primitive",
+                                                  "Primitive (no mesh)"));
+        if (ImGui::Combo("##veg_primitive", &shp, kShapes, 5)) {
+            vs->mesh_shape = shp; ch = true;
+        }
+    }
+
     ImGui::TextUnformatted(jce_editor_i18n("inspector.vegetationScatter.albedo"));
     if (jce_draw_path_input_asset("##veg_albedo", vs->albedo_path,
                                   sizeof vs->albedo_path, JCE_ASSET_KIND_TEXTURE))
@@ -359,16 +374,32 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
             memset(vs->density_paint, 255, sizeof vs->density_paint);  /* full on enable */
     }
     if (vs->density_paint_active) {
+        /* One-time restore of the persisted brush knobs (user-global, so
+         * the brush feel carries across projects and restarts). */
+        static bool s_brush_loaded = false;
+        if (!s_brush_loaded) {
+            s_brush_loaded = true;
+            g_veg_brush.radius   = jce_editor_ui_state_load_float(
+                "brush.foliage.radius", g_veg_brush.radius, 0.5f, 128.0f);
+            g_veg_brush.strength = jce_editor_ui_state_load_float(
+                "brush.foliage.strength", g_veg_brush.strength, 0.0f, 1.0f);
+            g_veg_brush.erase    = jce_editor_ui_state_load_int(
+                "brush.foliage.erase", g_veg_brush.erase ? 1 : 0, 0, 1) != 0;
+        }
+
         ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.paintInScene",
                                            "Paint in Scene"), &g_veg_brush.armed);
-        ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushRadius",
-                                              "Brush Radius"),
-                           &g_veg_brush.radius, 0.5f, 128.0f, "%.1f");
-        ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushStrength",
-                                              "Brush Strength"),
-                           &g_veg_brush.strength, 0.0f, 1.0f, "%.2f");
-        ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.brushErase",
-                                           "Erase (lower density)"), &g_veg_brush.erase);
+        if (ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushRadius",
+                                                  "Brush Radius"),
+                               &g_veg_brush.radius, 0.5f, 128.0f, "%.1f"))
+            jce_editor_ui_state_save_float("brush.foliage.radius", g_veg_brush.radius);
+        if (ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushStrength",
+                                                  "Brush Strength"),
+                               &g_veg_brush.strength, 0.0f, 1.0f, "%.2f"))
+            jce_editor_ui_state_save_float("brush.foliage.strength", g_veg_brush.strength);
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.brushErase",
+                                               "Erase (lower density)"), &g_veg_brush.erase))
+            jce_editor_ui_state_save_int("brush.foliage.erase", g_veg_brush.erase ? 1 : 0);
         if (ImGui::Button(jce_editor_i18n_id("inspector.vegetationScatter.fillFull", "Fill Full"))) {
             memset(vs->density_paint, 255, sizeof vs->density_paint); ch = true;
         }
@@ -414,6 +445,43 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
     long est = (long)((double)vs->density * (double)vs->area_x * (double)vs->area_z);
     ImGui::TextDisabled("%s: %ld",
                         jce_editor_i18n("inspector.vegetationScatter.estimate"), est);
+
+    if (ch) insp_track_edit();
+}
+
+void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc)
+{
+    if (!fc) return;
+    bool ch = false;
+
+    ch |= ImGui::DragInt(jce_editor_i18n("inspector.foliageCluster.leafCount"),
+                         &fc->leaf_count, 1, 1, 256);
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.foliageCluster.radius"),
+                           &fc->radius, 0.05f, 0.05f, 50.0f, "%.2f");
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.foliageCluster.squashY"),
+                             &fc->squash_y, 0.1f, 1.5f, "%.2f");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.foliageCluster.leafScale"),
+                           &fc->leaf_scale, 0.02f, 0.05f, 20.0f, "%.2f");
+    uint32_t seed_min = 0, seed_max = 0xFFFFFFFFu;
+    ch |= ImGui::DragScalar(jce_editor_i18n("inspector.foliageCluster.seed"),
+                            ImGuiDataType_U32, &fc->seed, 1.0f, &seed_min, &seed_max);
+
+    ImGui::Separator();
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.foliageCluster.shadow"),    fc->shadow_color);
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.foliageCluster.mid"),       fc->mid_color);
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.foliageCluster.highlight"), fc->highlight_color);
+    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.foliageCluster.multiplier"), fc->color_multiplier);
+
+    ImGui::Separator();
+    /* Leaf alpha map: full asset input (browse dialog + drag-drop from the
+     * Asset Browser), matching every other texture-path field — this was a
+     * bare InputText, the ES bush workflow's only hand-typed path. */
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.foliageCluster.alphaTex"));
+    if (jce_draw_path_input_asset("##fc_alpha_tex", fc->alpha_tex,
+                                  sizeof fc->alpha_tex, JCE_ASSET_KIND_TEXTURE))
+        ch = true;
+    accept_asset_drop(fc->alpha_tex, sizeof fc->alpha_tex);
+    ch |= ImGui::Checkbox(jce_editor_i18n("inspector.visible"), &fc->visible);
 
     if (ch) insp_track_edit();
 }
@@ -482,6 +550,29 @@ void draw_comp_grass_field(JceGrassFieldComponent *g)
     ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeEnd"),
                            &g->fade_end, 1.0f, 0.0f, 100000.0f, "%.1f");
 
+    /* --- Density mask (paths / ponds read through the grass) ---
+     * Serialized + consumed by the renderer (the ES pond scene carves its
+     * walkways with it) but previously had no inspector UI — the only way
+     * to author it was hand-editing the scene JSON. */
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n_or("inspector.grassField.densityMask",
+                                              "Density Mask (G channel gates blades)"));
+    if (jce_draw_path_input_asset("##gf_density_mask", g->density_mask_path,
+                                  sizeof g->density_mask_path,
+                                  JCE_ASSET_KIND_TEXTURE))
+        ch = true;
+    accept_asset_drop(g->density_mask_path, sizeof g->density_mask_path);
+    if (g->density_mask_path[0]) {
+        ch |= ImGui::SliderFloat(jce_editor_i18n_id("inspector.grassField.densityThreshold",
+                                                    "Mask Threshold"),
+                                 &g->density_threshold, 0.0f, 1.0f, "%.2f");
+        ch |= ImGui::DragFloat(jce_editor_i18n_id("inspector.grassField.maskWorldSize",
+                                                  "Mask World Size"),
+                               &g->mask_world_size, 0.5f, 0.0f, 100000.0f, "%.1f");
+        ImGui::TextDisabled("%s", jce_editor_i18n_or("inspector.grassField.maskHint",
+            "Blades survive where mask.g >= threshold; 0 world size = area rect."));
+    }
+
     /* --- Flags --- */
     ImGui::Separator();
     {
@@ -512,11 +603,12 @@ void draw_comp_water(JceWaterComponent *w)
     const char *mode_names[] = {
         jce_editor_i18n("inspector.water.mode.gerstner"),
         jce_editor_i18n("inspector.water.mode.fft"),
+        jce_editor_i18n("inspector.water.mode.stylized"),
     };
     if (ImGui::Combo(jce_editor_i18n("inspector.water.mode"),
-                     &w->water_mode, mode_names, 2)) {
+                     &w->water_mode, mode_names, 3)) {
         if (w->water_mode < JCE_WATER_MODE_GERSTNER) w->water_mode = JCE_WATER_MODE_GERSTNER;
-        if (w->water_mode > JCE_WATER_MODE_FFT)      w->water_mode = JCE_WATER_MODE_FFT;
+        if (w->water_mode > JCE_WATER_MODE_STYLIZED) w->water_mode = JCE_WATER_MODE_STYLIZED;
         ch = true;
     }
 
@@ -557,6 +649,15 @@ void draw_comp_water(JceWaterComponent *w)
             }
             ImGui::PopID();
         }
+    } else if (w->water_mode == JCE_WATER_MODE_STYLIZED) {
+        /* Hand-painted ripple overlay: the body color is in the ground, this
+         * plane draws only shore strokes / splashes / ice from a data map. */
+        ImGui::SeparatorText(jce_editor_i18n("inspector.water.stylized.header"));
+        ch |= jce_draw_path_input_asset(jce_editor_i18n("inspector.water.dataTex"),
+                  w->data_tex, sizeof w->data_tex, JCE_ASSET_KIND_TEXTURE);
+        accept_asset_drop(w->data_tex, sizeof w->data_tex);
+        ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.splashRatio"),
+                                 &w->splash_ratio, 0.0f, 1.0f, "%.2f");
     } else { /* JCE_WATER_MODE_FFT */
         ImGui::SeparatorText(jce_editor_i18n("inspector.water.fft.header"));
         ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.patchSize"),
@@ -588,6 +689,10 @@ void draw_comp_water(JceWaterComponent *w)
                              &w->transparency, 0.0f, 1.0f, "%.2f");
     ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.sunSpecular"),
                            &w->sun_specular, 0.02f, 0.0f, 100.0f, "%.2f");
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.shoreRipple"),
+                             &w->shore_ripple, 0.0f, 1.0f, "%.2f");
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.iceRatio"),
+                             &w->ice_ratio, 0.0f, 1.0f, "%.2f");
     ch |= ImGui::Checkbox(jce_editor_i18n("inspector.water.visible"), &w->visible);
 
     if (ch) insp_track_edit();

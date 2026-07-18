@@ -58,6 +58,26 @@ JceAnimSmBinding *jce_anim_sm_binding_create(const char *definition_path)
     return b;
 }
 
+JceAnimSmBinding *jce_anim_sm_binding_create_mem(const char *text, size_t len)
+{
+    if (!text) return NULL;
+
+    JceAnimSm *sm = jce_anim_sm_load_text(text, len);
+    if (!sm) return NULL;
+
+    JceAnimSmBinding *b = (JceAnimSmBinding *)JCE_CALLOC(1, sizeof(*b));
+    if (!b) {
+        jce_anim_sm_free(sm);
+        return NULL;
+    }
+
+    b->sm = sm;
+    /* b->path stays empty: a mem-loaded (single-exe PAK) binding has no host
+     * path.  The caller tracks the logical key (SkeletalAnimator.sm_path). */
+    jce_anim_sm_eval(sm, &b->cached);
+    return b;
+}
+
 void jce_anim_sm_binding_destroy(JceAnimSmBinding *b)
 {
     if (!b) return;

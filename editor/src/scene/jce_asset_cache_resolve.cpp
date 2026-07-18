@@ -56,7 +56,11 @@ bool path_is_file(const char *path)
      * mounted-bundle entries as "first-class" files without any other
      * call site having to special-case bundles. */
     JceFileSystem *afs = jce_fs_get_active();
-    if (afs && jce_fs_exists(afs, path)) return true;
+    if (afs) {
+        if (jce_fs_exists(afs, path)) return true;
+        if (jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED)
+            return false;
+    }
     return jce_fs_host_exists_file(path);
 }
 

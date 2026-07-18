@@ -71,6 +71,31 @@ bool jce_scene_serial_save_file(const JceScene *scene, const char *path)
 
 /* ── Load ─────────────────────────────────────────────────────────── */
 
+static void scene_serial_set_asset_context(const JceFileSystem *fs,
+                                           const char *path)
+{
+    const char *sep = path ? strrchr(path, '/') : NULL;
+    const char *backslash = path ? strrchr(path, '\\') : NULL;
+    if (backslash > sep) sep = backslash;
+    if (sep) {
+        char dir[1024];
+        size_t len = (size_t)(sep - path);
+        if (len >= sizeof(dir)) len = sizeof(dir) - 1;
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+        jce_scene_serial_set_base_dir(dir);
+    } else {
+        jce_scene_serial_set_base_dir(NULL);
+    }
+    jce_scene_serial_set_asset_vfs(fs);
+}
+
+static void scene_serial_clear_asset_context(void)
+{
+    jce_scene_serial_set_asset_vfs(NULL);
+    jce_scene_serial_set_base_dir(NULL);
+}
+
 bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
 {
     if (!scene || !json || len == 0) return false;
@@ -109,34 +134,20 @@ bool jce_scene_serial_load_file(JceScene *scene, const char *path)
 {
     if (!scene || !path) return false;
 
-    /* Derive base directory from the path and inform the parser, so
-       sibling material backfill (Unity-style) can resolve. */
-    {
-        const char *sep = strrchr(path, '/');
-        const char *bs  = strrchr(path, '\\');
-        if (bs > sep) sep = bs;
-        if (sep) {
-            char dir[1024];
-            size_t L = (size_t)(sep - path);
-            if (L >= sizeof(dir)) L = sizeof(dir) - 1;
-            memcpy(dir, path, L);
-            dir[L] = '\0';
-            jce_scene_serial_set_base_dir(dir);
-        } else {
-            jce_scene_serial_set_base_dir(NULL);
-        }
-    }
+    scene_serial_set_asset_context(NULL, path);
 
     /* Scene file dialogs operate on real OS paths -> host filesystem. */
     uint64_t size = 0;
     char *buf = (char *)jce_fs_host_read_all(path, &size);
     if (!buf) {
         LOG_ERROR(LOG_TAG, "cannot open '%s' for reading", path);
+        scene_serial_clear_asset_context();
         return false;
     }
 
     bool ok = jce_scene_serial_load(scene, buf, size);
     JCE_FREE(buf);
+    scene_serial_clear_asset_context();
     return ok;
 }
 
@@ -146,22 +157,43 @@ bool jce_scene_serial_load_vfs(JceScene *scene,
 {
     if (!scene || !fs || !virtual_path) return false;
 
+    scene_serial_set_asset_context(fs, virtual_path);
+
     uint64_t size = 0;
     void *data = jce_fs_read_all(fs, virtual_path, &size);
     if (!data) {
         LOG_ERROR(LOG_TAG, "cannot open '%s' via VFS", virtual_path);
+        scene_serial_clear_asset_context();
         return false;
     }
 
     char *buf = (char *)JCE_MALLOC(size + 1);
-    if (!buf) { JCE_FREE(data); return false; }
+    if (!buf) {
+        JCE_FREE(data);
+        scene_serial_clear_asset_context();
+        return false;
+    }
     memcpy(buf, data, size);
     buf[size] = '\0';
     JCE_FREE(data);
 
     bool ok = jce_scene_serial_load(scene, buf, size);
     JCE_FREE(buf);
+    scene_serial_clear_asset_context();
     return ok;
+}
+
+int jce_scene_serial_apply_json_vfs(JceScene *scene,
+                                    const JceFileSystem *fs,
+                                    const char *virtual_path,
+                                    const JceJson *root)
+{
+    if (!scene || !fs || !virtual_path || !root) return -1;
+
+    scene_serial_set_asset_context(fs, virtual_path);
+    int count = jce_scene_load_json(scene, root);
+    scene_serial_clear_asset_context();
+    return count;
 }
 
 /* ── Memory ───────────────────────────────────────────────────────── */
@@ -265,6 +297,32 @@ bool jce_scene_serial_load_additive(JceScene *scene,
     JCE_FREE(snap.ids);
     LOG_INFO(LOG_TAG, "additive chunk loaded: %d entities added", n);
     return true;
+}
+
+bool jce_scene_serial_load_additive_vfs(JceScene *scene,
+                                        const JceFileSystem *fs,
+                                        const char *virtual_path,
+                                        JceEntity **out_entities,
+                                        uint32_t   *out_count)
+{
+    if (!scene || !fs || !virtual_path) return false;
+
+    scene_serial_set_asset_context(fs, virtual_path);
+    uint64_t size = 0;
+    void *data = jce_fs_read_all(fs, virtual_path, &size);
+    if (!data) {
+        LOG_ERROR(LOG_TAG, "cannot open additive scene '%s' via VFS",
+                  virtual_path);
+        scene_serial_clear_asset_context();
+        return false;
+    }
+
+    bool ok = jce_scene_serial_load_additive(scene, (const char *)data,
+                                              (size_t)size, out_entities,
+                                              out_count);
+    JCE_FREE(data);
+    scene_serial_clear_asset_context();
+    return ok;
 }
 
 void jce_scene_serial_free_entities(JceEntity *entities)

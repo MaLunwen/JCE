@@ -14,9 +14,11 @@
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>   /* jce_free for the import GLB buffer */
+#include <jce/os/core/jce_log.h>     /* JCE_DBG_PICK QA hook logging */
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
@@ -202,6 +204,7 @@ static void draw_scene_view_toolbar(void)
                 { "sceneView.flag.gizmos",        JCE_SHOW_FLAG_GIZMOS         },
                 { "sceneView.flag.lightIcons",    JCE_SHOW_FLAG_LIGHT_ICONS    },
                 { "sceneView.flag.cameraIcons",   JCE_SHOW_FLAG_CAMERA_ICONS   },
+                { "sceneView.flag.particleIcons", JCE_SHOW_FLAG_PARTICLE_ICONS },
                 { "sceneView.flag.colliders",     JCE_SHOW_FLAG_COLLIDERS      },
                 { "sceneView.flag.skybox",        JCE_SHOW_FLAG_SKYBOX         },
                 { "sceneView.flag.boundingBoxes", JCE_SHOW_FLAG_BOUNDING_BOXES },
@@ -209,6 +212,7 @@ static void draw_scene_view_toolbar(void)
                 { "sceneView.flag.statsOverlay",  JCE_SHOW_FLAG_STATS_OVERLAY  },
                 { "sceneView.flag.navMesh",       JCE_SHOW_FLAG_NAVMESH        },
                 { "sceneView.flag.streaming",     JCE_SHOW_FLAG_STREAMING     },
+                { "sceneView.flag.ui",            JCE_SHOW_FLAG_UI             },
             };
             for (auto &it : items) {
                 bool on = (f & it.bit) != 0;
@@ -221,7 +225,8 @@ static void draw_scene_view_toolbar(void)
             if (ImGui::MenuItem(jce_editor_i18n("sceneView.menu.defaults"))) jce_state_set_show_flags(
                 JCE_SHOW_FLAG_GIZMOS | JCE_SHOW_FLAG_LIGHT_ICONS
               | JCE_SHOW_FLAG_CAMERA_ICONS | JCE_SHOW_FLAG_SKYBOX
-              | JCE_SHOW_FLAG_WORLD_AXIS);
+              | JCE_SHOW_FLAG_WORLD_AXIS | JCE_SHOW_FLAG_PARTICLE_ICONS
+              | JCE_SHOW_FLAG_UI);
             ImGui::EndMenu();
         }
 
@@ -240,28 +245,44 @@ static void draw_scene_view_toolbar(void)
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.sideView")))     { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_RIGHT); }
 
         /* Camera bookmarks: capture/restore exact viewpoints — invaluable for
-         * navigating a large world (jump between work areas). Session-scoped;
-         * cross-restart persistence is a follow-up. */
-        static struct { bool valid; float target[3], yaw, pitch, dist; } s_cam_bm[9];
+         * navigating a large world (jump between work areas).  Stored per
+         * scene in the project state ("bookmark.<n>" = "x,y,z,yaw,pitch,dist")
+         * so a bookmark set in one scene never teleports the camera in
+         * another, and survives restarts.  Inert without an open project. */
         if (ImGui::BeginMenu(jce_editor_i18n_id("sceneView.bookmarks", "Camera Bookmarks"))) {
+            const char *bm_scene = jce_state_get_current_scene_path();
+            const bool  bm_live  = jce_editor_pstate_active() &&
+                                   bm_scene && bm_scene[0];
+            char bm_key[16];
+            char bm_val[128];
             for (int i = 0; i < 9; i++) {
+                snprintf(bm_key, sizeof bm_key, "bookmark.%d", i + 1);
+                bool valid = bm_live && jce_editor_pstate_scene_get_str(
+                    bm_scene, bm_key, bm_val, sizeof bm_val);
                 char lbl[80];
                 snprintf(lbl, sizeof lbl, "%s %d%s",
                          jce_editor_i18n_id("sceneView.goToBookmark", "Go to bookmark"),
-                         i + 1, s_cam_bm[i].valid ? "" : " (empty)");
-                if (ImGui::MenuItem(lbl, NULL, false, s_cam_bm[i].valid))
-                    jce_editor_scene_camera_set_state(s_cam_bm[i].target,
-                        s_cam_bm[i].yaw, s_cam_bm[i].pitch, s_cam_bm[i].dist);
+                         i + 1, valid ? "" : " (empty)");
+                if (ImGui::MenuItem(lbl, NULL, false, valid)) {
+                    float t[3], yaw, pitch, dist;
+                    if (sscanf(bm_val, "%f,%f,%f,%f,%f,%f",
+                               &t[0], &t[1], &t[2], &yaw, &pitch, &dist) == 6)
+                        jce_editor_scene_camera_set_state(t, yaw, pitch, dist);
+                }
             }
             ImGui::Separator();
             for (int i = 0; i < 9; i++) {
                 char lbl[80];
                 snprintf(lbl, sizeof lbl, "%s %d",
                          jce_editor_i18n_id("sceneView.setBookmark", "Set bookmark"), i + 1);
-                if (ImGui::MenuItem(lbl)) {
-                    jce_editor_scene_camera_get_state(s_cam_bm[i].target,
-                        &s_cam_bm[i].yaw, &s_cam_bm[i].pitch, &s_cam_bm[i].dist);
-                    s_cam_bm[i].valid = true;
+                if (ImGui::MenuItem(lbl, NULL, false, bm_live)) {
+                    float t[3], yaw, pitch, dist;
+                    jce_editor_scene_camera_get_state(t, &yaw, &pitch, &dist);
+                    snprintf(bm_key, sizeof bm_key, "bookmark.%d", i + 1);
+                    snprintf(bm_val, sizeof bm_val,
+                             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
+                             t[0], t[1], t[2], yaw, pitch, dist);
+                    jce_editor_pstate_scene_set_str(bm_scene, bm_key, bm_val);
                 }
             }
             ImGui::EndMenu();
@@ -1702,8 +1723,34 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
             if (!s_gpu_marquee_add) jce_state_clear_selection();
             for (uint32_t i = 0; i < mn; i++)
                 if (marq_ids[i]) jce_state_select_entity(marq_ids[i], true);
+
+            /* Union in the screen-space helper icons (camera/light entities
+             * have no id-buffer footprint).  Done at POLL time, after the
+             * conditional clear above — selecting them at request time would
+             * be wiped one frame later.  s_sel_rect_min/max persist. */
+            uint32_t icon_total = 0;
+            if (jce_state_show_flag(JCE_SHOW_FLAG_LIGHT_ICONS) ||
+                jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS) ||
+                jce_state_show_flag(JCE_SHOW_FLAG_PARTICLE_ICONS)) {
+                JceGizmoCamera marq_cam;
+                memcpy(marq_cam.view, view_mat, sizeof(float) * 16);
+                memcpy(marq_cam.proj, proj_mat, sizeof(float) * 16);
+                memcpy(marq_cam.eye,  eye,      sizeof(float) * 3);
+                marq_cam.viewport_size[0]   = ctx->avail.x;
+                marq_cam.viewport_size[1]   = ctx->avail.y;
+                marq_cam.viewport_origin[0] = ctx->screen_pos.x;
+                marq_cam.viewport_origin[1] = ctx->screen_pos.y;
+                uint32_t icon_ids[256];
+                int icn = scene_helper_icons_in_rect(&marq_cam,
+                                                     s_sel_rect_min, s_sel_rect_max,
+                                                     icon_ids, 256);
+                for (int ii = 0; ii < icn; ii++)
+                    jce_state_select_entity(icon_ids[ii], true);
+                icon_total = (uint32_t)icn;
+            }
+
             jce_editor_inspector_request_sync();
-            if (mn > 0) jce_editor_layout_request_focus_inspector();
+            if (mn + icon_total > 0) jce_editor_layout_request_focus_inspector();
             s_gpu_marquee_pending = false;
         }
     }
@@ -1724,8 +1771,6 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     s_sel_click_pending = false;
 
     bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
-    if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
-        return;
 
     JceGizmoCamera pick_cam;
     memcpy(pick_cam.view, view_mat, sizeof(float) * 16);
@@ -1735,6 +1780,23 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     pick_cam.viewport_size[1]   = ctx->avail.y;
     pick_cam.viewport_origin[0] = ctx->screen_pos.x;
     pick_cam.viewport_origin[1] = ctx->screen_pos.y;
+
+    /* Screen-space icon pick FIRST: camera/light icons draw ON TOP of the
+     * scene and never reach the GPU id-buffer — before this, clicking an
+     * icon fell through to the id readback, decoded 0, and CLEARED the
+     * selection.  Same visibility gate as the icon draw call. */
+    if (jce_state_show_flag(JCE_SHOW_FLAG_LIGHT_ICONS) ||
+        jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS) ||
+        jce_state_show_flag(JCE_SHOW_FLAG_PARTICLE_ICONS)) {
+        uint32_t icon_hit = scene_helper_icon_hit_test(&pick_cam, s_sel_click_pos);
+        if (icon_hit) {
+            apply_single_pick_selection(icon_hit, add_mode);
+            return;
+        }
+    }
+
+    if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
+        return;
 
     float ray_o[3], ray_d[3];
     gm_screen_to_ray(&pick_cam, s_sel_click_pos.x,
@@ -1848,7 +1910,8 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
     overlay_cam.viewport_origin[1] = ctx->screen_pos.y;
 
     if (jce_state_show_flag(JCE_SHOW_FLAG_LIGHT_ICONS) ||
-        jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS))
+        jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS) ||
+        jce_state_show_flag(JCE_SHOW_FLAG_PARTICLE_ICONS))
         draw_scene_helper_icons(ctx->dl, &overlay_cam);
 
     int axis_click = -1;
@@ -1875,6 +1938,70 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
         jce_editor_scene_camera_snap_view(cube_presets[cube_click]);
     }
 
+    /* Headless click-pick hook (JCE_DBG_PICK="<entity>@<frame>"): projects
+     * the named entity's position to viewport pixels and injects it as a
+     * REAL click (s_sel_click_*), so the full selection path runs — icon
+     * hit-test, GPU id-buffer pick, poll, selection apply.  Result is
+     * logged a second later.  Pairs with JCE_WINCAP_* for visual QA. */
+    {
+        static int  s_pk_frame = -2;   /* -2 unparsed, -1 disabled/fired */
+        static char s_pk_name[64];
+        static uint32_t s_pk_tick = 0;
+        static int  s_pk_report = -1;  /* frame to report the outcome */
+        static uint32_t s_pk_target = 0;
+        ++s_pk_tick;
+        if (s_pk_frame == -2) {
+            s_pk_frame = -1;
+            const char *v = getenv("JCE_DBG_PICK");
+            const char *at = v ? strrchr(v, '@') : NULL;
+            if (at && at > v) {
+                size_t n = (size_t)(at - v);
+                if (n >= sizeof(s_pk_name)) n = sizeof(s_pk_name) - 1;
+                memcpy(s_pk_name, v, n);
+                s_pk_name[n] = '\0';
+                s_pk_frame = atoi(at + 1);
+            }
+        }
+        if (s_pk_frame >= 0 && s_pk_tick >= (uint32_t)s_pk_frame) {
+            s_pk_frame = -1;
+            JceScene *scene = jce_state_get_scene();
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count && scene; i++) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *nm = jce_state_entity_name(id);
+                if (!nm || strcmp(nm, s_pk_name) != 0) continue;
+                JceTransform *tf = jce_scene_get_transform(scene, (JceEntity)id);
+                if (!tf) break;
+                JceGizmoCamera cam;
+                memcpy(cam.view, view_mat, sizeof(float) * 16);
+                memcpy(cam.proj, proj_mat, sizeof(float) * 16);
+                memcpy(cam.eye,  eye,      sizeof(float) * 3);
+                cam.viewport_size[0]   = ctx->avail.x;
+                cam.viewport_size[1]   = ctx->avail.y;
+                cam.viewport_origin[0] = ctx->screen_pos.x;
+                cam.viewport_origin[1] = ctx->screen_pos.y;
+                float world[3] = { tf->position.x, tf->position.y, tf->position.z };
+                float screen[2];
+                if (gm_world_to_screen(&cam, world, screen)) {
+                    s_sel_click_pos     = ImVec2(screen[0], screen[1]);
+                    s_sel_click_pending = true;
+                    s_pk_target = id;
+                    s_pk_report = (int)s_pk_tick + 60;
+                    LOG_INFO("scene_view", "[dbg-pick] click at %.0f,%.0f for '%s' (id=%u)",
+                             screen[0], screen[1], s_pk_name, id);
+                } else {
+                    LOG_WARN("scene_view", "[dbg-pick] '%s' projects off-screen", s_pk_name);
+                }
+                break;
+            }
+        }
+        if (s_pk_report > 0 && s_pk_tick >= (uint32_t)s_pk_report) {
+            s_pk_report = -1;
+            LOG_INFO("scene_view", "[dbg-pick] result: '%s' selected=%d",
+                     s_pk_name, jce_state_is_selected(s_pk_target) ? 1 : 0);
+        }
+    }
+
     handle_marquee_selection(ctx, view_mat, proj_mat);
     handle_ray_pick(ctx, view_mat, proj_mat, eye);
     draw_selection_outlines(ctx, view_mat, proj_mat);
@@ -1882,17 +2009,37 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
 
 /* ── Content (embeddable in tabs) ────────────────────────────────── */
 
+#include <jce/os/core/jce_perf_phase.h>
+#include <jce/os/core/jce_timer.h>
+
+/* Rolling sub-phase sampler (mirrors panel_phase in jce_editor_layout.cpp). */
+static inline void panel_phase_sv(const char *name, uint64_t *t)
+{
+    uint64_t now = jce_time_perf_counter();
+    jce_perf_phase_add(name, jce_time_perf_to_ms(*t, now));
+    *t = now;
+}
+
 void jce_editor_panel_scene_view_content(void)
 {
+    /* Rolling sub-phases: the Scene View panel owns ~8ms/frame of
+     * NON-render work at 150k (ed_p_scene_view minus scene_render) —
+     * these locate which stage. */
+    uint64_t sv_t = jce_time_perf_counter();
     flush_async_drop_material_extracts();
     draw_scene_view_toolbar();
+    panel_phase_sv("ed_sv_toolbar", &sv_t);
 
     SceneViewCtx ctx;
-    if (!setup_scene_viewport(&ctx))
+    if (!setup_scene_viewport(&ctx)) {
+        panel_phase_sv("ed_sv_vp", &sv_t);
         return;
+    }
+    panel_phase_sv("ed_sv_vp", &sv_t);
 
     draw_scene_context_menu(&ctx);
     handle_scene_camera_controls(ctx.viewport_hovered);
+    panel_phase_sv("ed_sv_cam", &sv_t);
 
     if (jce_scene_view_should_cancel_deferred_pick(
             ImGui::IsMouseClicked(ImGuiMouseButton_Left),
@@ -1974,7 +2121,9 @@ void jce_editor_panel_scene_view_content(void)
     }
 
     handle_scene_view_shortcuts();
+    panel_phase_sv("ed_sv_mid", &sv_t);
     draw_scene_overlays_and_pick(&ctx);
+    panel_phase_sv("ed_sv_overlay", &sv_t);
 }
 
 /* ── Standalone wrapper ──────────────────────────────────────────── */

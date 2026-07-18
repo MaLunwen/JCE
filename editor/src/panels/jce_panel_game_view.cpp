@@ -4,8 +4,12 @@
  */
 
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_game_input_bridge.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_kpi_game_capture.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
 #include "dialogs/jce_editor_dialogs.h"
@@ -52,19 +56,45 @@ static bool s_third_person = false;   /* play camera: false=first-person, true=b
  * so in-game keys (WASD, Ctrl+S, …) never leak into editor commands during
  * Play.  Set on click-in, cleared on ESC / Stop. */
 static bool s_user_wants_capture = false;
+static bool s_runtime_pointer_camera = false;
 static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
 static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
 static char s_pending_game_exe_path[512] = {0};
 static bool s_pending_game_exe_ready = false;
+
+static bool game_view_has_active_vcam(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return false;
+
+    const int count = jce_state_get_entity_count();
+    for (int i = 0; i < count; ++i) {
+        const uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (!jce_state_entity_enabled(id)) continue;
+        const JceEntity entity = jce_state_to_ecs_entity(id);
+        if (!entity || !jce_scene_has_virtual_camera(scene, entity)) continue;
+        const JceVirtualCameraComponent *vc =
+            jce_scene_get_virtual_camera(scene, entity);
+        if (vc && vc->active) return true;
+    }
+    return false;
+}
 
 enum {
     JCE_GAME_VIEW_RUN_EDITOR_SIMULATION = 0,
     JCE_GAME_VIEW_RUN_EXTERNAL_GAME = 1,
 };
 
+static uint64_t s_run_mode_cfg_gen = 0;
+
 static void ensure_run_mode_loaded(void)
 {
-    if (s_run_mode_loaded) return;
+    /* Re-read whenever the config generation changes: other writers (the
+     * Preferences panel, project profile loads) can rewrite run_mode after
+     * startup, and a once-per-session cache would serve the stale value for
+     * the rest of the run. */
+    uint64_t gen = jce_editor_config_generation();
+    if (s_run_mode_loaded && gen == s_run_mode_cfg_gen) return;
 
     JceEditorConfig cfg;
     jce_editor_config_load(&cfg);
@@ -72,6 +102,7 @@ static void ensure_run_mode_loaded(void)
                          ? JCE_GAME_VIEW_RUN_EXTERNAL_GAME
                          : JCE_GAME_VIEW_RUN_EDITOR_SIMULATION;
     s_run_mode_loaded = true;
+    s_run_mode_cfg_gen = gen;
 }
 
 static void persist_run_mode(void)
@@ -193,7 +224,9 @@ static void forward_text_input_to_canvas(void)
 bool jce_editor_game_view_is_input_active(void)
 {
     return s_user_wants_capture ||
-           jce_editor_game_render_is_mouse_captured();
+           jce_editor_game_render_is_mouse_captured() ||
+           (s_runtime_pointer_camera &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left));
 }
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -204,10 +237,45 @@ void jce_editor_panel_game_view_content(void)
     jce_run_manager_poll();
     apply_pending_game_exe_pick();
 
+    /* One-time user-global restore (the session store is always live). */
+    static bool s_ui_state_loaded = false;
+    if (!s_ui_state_loaded) {
+        s_ui_state_loaded = true;
+        s_show_stats = jce_editor_ui_state_load_int("gameview.stats", 0, 0, 1) != 0;
+    }
+
+    /* Restore per-project view state once the project store is live — it is
+     * inert until a project root is known, so the first draw can be too
+     * early to read from it. */
+    static bool s_pstate_restored = false;
+    if (!s_pstate_restored && jce_editor_pstate_active()) {
+        s_pstate_restored = true;
+        s_aspect_idx = jce_editor_pstate_get_int("gameview.aspect", s_aspect_idx);
+        if (s_aspect_idx < 0 || s_aspect_idx > 5) s_aspect_idx = 0;
+        s_third_person = jce_editor_pstate_get_int("gameview.third_person",
+                                                   s_third_person ? 1 : 0) != 0;
+        char mod_name[128];
+        if (jce_editor_pstate_get_str("gameview.module", mod_name,
+                                      sizeof(mod_name))) {
+            /* Re-select the persisted game module by NAME in the same
+             * registry the combo lists; an unknown name keeps the default
+             * (module sets can differ between builds). */
+            int n = jce_game_module_count();
+            for (int i = 0; i < n; ++i) {
+                const char *mn = jce_game_module_name_at(i);
+                if (mn && strcmp(mn, mod_name) == 0) {
+                    jce_editor_game_render_set_module(jce_game_module_at(i));
+                    break;
+                }
+            }
+        }
+    }
+
     /* Toolbar row */
     const char *aspects[] = { jce_editor_i18n("gameView.aspect.free"), "16:9", "16:10", "4:3", "21:9", "1:1" };
     ImGui::PushItemWidth(80);
-    ImGui::Combo("##aspect", &s_aspect_idx, aspects, 6);
+    if (ImGui::Combo("##aspect", &s_aspect_idx, aspects, 6))
+        jce_editor_pstate_set_int("gameview.aspect", s_aspect_idx);
     ImGui::PopItemWidth();
 
     ImGui::SameLine();
@@ -269,7 +337,8 @@ void jce_editor_panel_game_view_content(void)
     {
         char _lbl[64];
         snprintf(_lbl, sizeof(_lbl), "%s###stats", jce_editor_i18n("game.stats"));
-        ImGui::Checkbox(_lbl, &s_show_stats);
+        if (ImGui::Checkbox(_lbl, &s_show_stats))
+            jce_editor_ui_state_save_int("gameview.stats", s_show_stats ? 1 : 0);
     }
 
     ImGui::SameLine();
@@ -302,8 +371,12 @@ void jce_editor_panel_game_view_content(void)
                 const char *n = jce_game_module_name_at(i);
                 if (!n) continue;
                 bool sel = (i == cur_idx);
-                if (ImGui::Selectable(n, sel))
+                if (ImGui::Selectable(n, sel)) {
                     jce_editor_game_render_set_module(jce_game_module_at(i));
+                    /* Persist by NAME — module pointers/indices are not
+                     * stable across editor runs. */
+                    jce_editor_pstate_set_str("gameview.module", n);
+                }
                 if (sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
@@ -419,6 +492,15 @@ void jce_editor_panel_game_view_content(void)
     uint32_t vh = (uint32_t)fmaxf(1.0f, view_size.y);
     if (vw < 16u) vw = 16u;
     if (vh < 16u) vh = 16u;
+    uint32_t render_vw = vw;
+    uint32_t render_vh = vh;
+    uint16_t qa_width = 0;
+    uint16_t qa_height = 0;
+    if (jce_editor_kpi_game_capture_global_render_size(
+            &qa_width, &qa_height)) {
+        render_vw = qa_width;
+        render_vh = qa_height;
+    }
 
     /* Feed the ECS-UI (Canvas) graphic raycaster the panel-local pointer,
      * mapped from the displayed image rect into rendered (FBO) pixels.  Only
@@ -432,8 +514,8 @@ void jce_editor_panel_game_view_content(void)
         bool inside = !fps && view_size.x > 0 && view_size.y > 0 &&
                       lx >= 0 && ly >= 0 &&
                       lx < view_size.x && ly < view_size.y;
-        float ui_x = inside ? lx / view_size.x * (float)vw : 0.0f;
-        float ui_y = inside ? ly / view_size.y * (float)vh : 0.0f;
+        float ui_x = inside ? lx / view_size.x * (float)render_vw : 0.0f;
+        float ui_y = inside ? ly / view_size.y * (float)render_vh : 0.0f;
         bool down = inside && ImGui::IsMouseDown(ImGuiMouseButton_Left);
         jce_editor_game_render_set_ui_pointer(ui_x, ui_y, down, inside);
 
@@ -446,10 +528,19 @@ void jce_editor_panel_game_view_content(void)
             forward_text_input_to_canvas();
     }
 
-    jce_editor_game_render_frame(vw, vh);
+    jce_editor_game_render_frame(render_vw, render_vh);
 
     uint16_t tex_idx = jce_editor_game_render_get_texture();
     if (tex_idx != UINT16_MAX) {
+        jce_editor_kpi_game_capture_global_note_rendered();
+        if (const char *capture_path =
+                jce_editor_kpi_game_capture_global_due_path()) {
+            if (jce_editor_game_render_screenshot(capture_path)) {
+                (void)jce_editor_kpi_game_capture_global_mark_submitted();
+                LOG_INFO("editor.game_view",
+                         "Game View capture submitted: %s", capture_path);
+            }
+        }
         /* +1: encode bgfx idx so a valid idx 0 != ImTextureID_Invalid(0)
          * (audit Round-3 P2-B; the imgui_renderer backend decodes -1). */
         ImTextureID tid = (ImTextureID)(uintptr_t)((uint32_t)tex_idx + 1u);
@@ -484,6 +575,13 @@ void jce_editor_panel_game_view_content(void)
     JcePlayState play_state = jce_state_get_play_state();
     bool play_active = (play_state == JCE_PLAY_PLAYING ||
                         play_state == JCE_PLAY_PAUSED);
+
+    float player_x = 0.0f, player_y = 0.0f, player_z = 0.0f;
+    const bool has_player_controller =
+        play_active &&
+        jce_editor_play_get_player_position(&player_x, &player_y, &player_z);
+    s_runtime_pointer_camera =
+        play_active && !has_player_controller && game_view_has_active_vcam();
 
     /* ── ScrollView wheel channel ───────────────────────────────────────
      * Forward ImGui's mouse-wheel (vertical io.MouseWheel = +up, horizontal
@@ -542,7 +640,12 @@ void jce_editor_panel_game_view_content(void)
          * (CryEngine-style). When Play is active and a CharacterController
          * exists, capture also drives the player; otherwise it's a pure
          * free-fly camera. */
-        if (hovered &&
+        /* A scene-owned VCam receives pointer data through JceRuntime.  It
+         * must not also acquire the editor's free-fly/FPS camera capture. */
+        if (s_runtime_pointer_camera)
+            s_user_wants_capture = false;
+
+        if (!s_runtime_pointer_camera && hovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             !alt_held) {
             s_user_wants_capture = true;
@@ -558,15 +661,12 @@ void jce_editor_panel_game_view_content(void)
         jce_editor_game_render_set_mouse_capture(effective_capture);
 
         if (effective_capture) {
-            /* Top 6: feed the live editor action map into the Play runtime so
-             * gameplay scripts can read authored actions by name (jce.is_action_
-             * down / get_axis) in editor Play, like a shipped game.  Once per
-             * captured frame, before the player-input gather + runtime step. */
-            if (play_active)
-                jce_editor_play_set_actions(jce_editor_input_actions_live());
             /* V toggles first/third-person follow camera (Play mode). */
-            if (play_active && ImGui::IsKeyPressed(ImGuiKey_V, false))
+            if (play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
                 s_third_person = !s_third_person;
+                jce_editor_pstate_set_int("gameview.third_person",
+                                          s_third_person ? 1 : 0);
+            }
             /* Use SDL relative-motion accumulator (xrel/yrel) instead of
              * ImGui::IO::MouseDelta — the latter is always zero in
              * relative-mouse-mode because the absolute cursor is pinned. */
@@ -748,28 +848,30 @@ void jce_editor_panel_game_view_content(void)
             }
         }
 
-        /* Cinemachine-style VCam override: if any active VCam exists in
-         * the scene, it wins over both player-snap and free-fly. Active
-         * only in Play mode so designers can keep editing freely. */
-        if (play_active) {
-            JceScene *scene = jce_state_get_scene();
-            if (scene) {
-                JceVcamOutput vout;
-                bool has_vcam = false;
-                jce_vcam_system_evaluate(scene, dt, &vout, &has_vcam);
-                if (has_vcam) {
-                    jce_camera_set_position(cam,
-                        jce_v3(vout.position[0], vout.position[1], vout.position[2]));
-                    jce_camera_look_at(cam,
-                        jce_v3(vout.target[0], vout.target[1], vout.target[2]));
-                    jce_camera_set_fov(cam, vout.fov_deg);
-                }
-            }
-        } else {
-            /* Reset damping when not playing so the next Play snaps. */
-            jce_vcam_system_reset();
-        }
     }
+
+    /* Publish ownership for the next platform-event/update phase.  Runtime
+     * camera/player input and the editor free-fly camera are exclusive; the
+     * core bridge clears held state whenever ownership or hover is lost. */
+    JceEditorGameInputViewport input_viewport{};
+    input_viewport.x = image_min.x;
+    input_viewport.y = image_min.y;
+    input_viewport.width = view_size.x;
+    input_viewport.height = view_size.y;
+    input_viewport.visible = true;
+    input_viewport.hovered = hovered;
+    input_viewport.captured =
+        jce_editor_game_render_is_mouse_captured();
+    if (play_active &&
+        (s_runtime_pointer_camera || has_player_controller)) {
+        input_viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
+    } else if (play_active) {
+        input_viewport.owner = JCE_EDITOR_GAME_INPUT_FREE_FLY;
+    } else {
+        input_viewport.owner = JCE_EDITOR_GAME_INPUT_NONE;
+    }
+    jce_editor_game_input_bridge_publish(
+        jce_editor_game_input_bridge_shared(), &input_viewport);
 
     /* HUD overlay: capture state + hint. */
     ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -781,7 +883,7 @@ void jce_editor_panel_game_view_content(void)
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(255, 220, 120, 230),
                     jce_editor_i18n("gameView.hud.altFree"));
-    } else if (hovered) {
+    } else if (hovered && !s_runtime_pointer_camera) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(220, 220, 220, 200),
                     jce_editor_i18n("gameView.hud.clickToFly"));
@@ -793,7 +895,7 @@ void jce_editor_panel_game_view_content(void)
         char buf[128];
         snprintf(buf, sizeof(buf), "%s: %s | %.1f fps  %ux%u",
                  jce_editor_i18n("game.renderer"), current,
-                 ImGui::GetIO().Framerate, vw, vh);
+                 ImGui::GetIO().Framerate, render_vw, render_vh);
         dl->AddText(ImVec2(image_min.x + 6.0f, image_max.y - 18.0f),
                     IM_COL32(160, 255, 160, 220), buf);
     }

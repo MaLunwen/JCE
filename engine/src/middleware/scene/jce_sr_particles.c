@@ -9,55 +9,47 @@
 
 #include "jce_sr_internal.h"
 
-/* ── Particle visualisation (P2-particle-vfx-runtime) ─────────────────
+/* ── CPU particle billboard sprite (shares the GPU pool's shaders) ─────
  *
- * Alive particles from the scene-owned JceParticleSystem are drawn as
- * camera-facing colour QUADS (batched into one transient buffer + the color
- * program, alpha-blended, depth-tested but no Z-write) — proper billboards,
- * not the old axis-cross debug lines.  Honours per-particle size + colour.
- * (Texture / flipbook UVs + soft-circle falloff need an unlit-textured shader
- * — a follow-up; this path is solid-colour.)  Single render path for the editor
- * + shipping runtime. */
+ * ALL particle emitters render through this CPU path.  The GPU compute path
+ * (sr_drive_gpu_particles) is unreliable on Vulkan/D3D12 (bgfx compute-buffer
+ * barrier — an over-bright blob), so CPU is the one backend-consistent path.
+ * Alive particles from the scene-owned JceParticleSystem are packed into a
+ * transient INSTANCE buffer (4x vec4 per particle — the exact layout the GPU
+ * pool / cs_particle_update uses) and submitted with the SAME
+ * vs_particle+fs_particle program, so the on-screen result is IDENTICAL on
+ * every backend: a view-aligned soft-circle sprite (billboarded in the vertex
+ * shader off u_invView, additive glow).  Single render path for the editor +
+ * shipping runtime.  (Set JCE_GPU_PARTICLES_FORCE=1 to route to the GPU pool.) */
+
+/* One instance = 4 vec4 (16 floats): i_data0=(pos,age) i_data2=colour
+ * i_data3=(size,..); i_data1 unused (vel/life).  Matches vs_particle. */
+#define SR_PARTICLE_INST_STRIDE 64u
+
 typedef struct {
-    struct SrPVtx { float x, y, z; uint32_t abgr; } *v;
-    uint16_t *idx;
-    uint32_t  cap;   /* max quads the transient buffer holds */
-    uint32_t  n;     /* quads written so far */
-    jce_vec3  right; /* camera basis, unit */
-    jce_vec3  up;
+    float   *data;   /* transient instance buffer (16 floats per particle) */
+    uint32_t count;
+    uint32_t cap;
 } SrParticleBatch;
 
 static void sr_particle_visit(const JceParticleView *p, void *ud)
 {
     SrParticleBatch *b = (SrParticleBatch *)ud;
-    if (b->n >= b->cap) return;
-
-    float hr = p->size * 0.5f;
-    if (hr < 0.02f) hr = 0.02f;
-    jce_vec3 rx = jce_v3_scale(b->right, hr);
-    jce_vec3 uy = jce_v3_scale(b->up,    hr);
-
-    int rr = (int)(p->color.x * 255.0f); rr = rr < 0 ? 0 : (rr > 255 ? 255 : rr);
-    int gg = (int)(p->color.y * 255.0f); gg = gg < 0 ? 0 : (gg > 255 ? 255 : gg);
-    int bb = (int)(p->color.z * 255.0f); bb = bb < 0 ? 0 : (bb > 255 ? 255 : bb);
-    int aa = (int)(p->color.w * 255.0f); aa = aa < 0 ? 0 : (aa > 255 ? 255 : aa);
-    uint32_t abgr = ((uint32_t)aa << 24) | ((uint32_t)bb << 16) |
-                    ((uint32_t)gg << 8)  |  (uint32_t)rr;
-
-    jce_vec3 c  = p->position;
-    jce_vec3 p0 = jce_v3_sub(jce_v3_sub(c, rx), uy);
-    jce_vec3 p1 = jce_v3_sub(jce_v3_add(c, rx), uy);
-    jce_vec3 p2 = jce_v3_add(jce_v3_add(c, rx), uy);
-    jce_vec3 p3 = jce_v3_add(jce_v3_sub(c, rx), uy);
-
-    uint32_t vb = b->n * 4u, ib = b->n * 6u;
-    b->v[vb+0].x=p0.x; b->v[vb+0].y=p0.y; b->v[vb+0].z=p0.z; b->v[vb+0].abgr=abgr;
-    b->v[vb+1].x=p1.x; b->v[vb+1].y=p1.y; b->v[vb+1].z=p1.z; b->v[vb+1].abgr=abgr;
-    b->v[vb+2].x=p2.x; b->v[vb+2].y=p2.y; b->v[vb+2].z=p2.z; b->v[vb+2].abgr=abgr;
-    b->v[vb+3].x=p3.x; b->v[vb+3].y=p3.y; b->v[vb+3].z=p3.z; b->v[vb+3].abgr=abgr;
-    b->idx[ib+0]=(uint16_t)vb;     b->idx[ib+1]=(uint16_t)(vb+1); b->idx[ib+2]=(uint16_t)(vb+2);
-    b->idx[ib+3]=(uint16_t)vb;     b->idx[ib+4]=(uint16_t)(vb+2); b->idx[ib+5]=(uint16_t)(vb+3);
-    b->n++;
+    if (b->count >= b->cap) return;
+    float *d = b->data + (size_t)b->count * 16u;
+    d[0]  = p->position.x; d[1] = p->position.y; d[2] = p->position.z; d[3] = 0.0f;
+    /* i_data1.xyz = velocity * stretch (world) → vs_particle elongates the
+     * billboard along it (rain/spark streaks).  stretch == 0 (the default for
+     * every non-streak emitter) leaves this at zero, so the shader keeps the
+     * classic round view-aligned sprite. */
+    d[4]  = p->velocity.x * p->stretch;
+    d[5]  = p->velocity.y * p->stretch;
+    d[6]  = p->velocity.z * p->stretch;
+    d[7]  = 0.0f;
+    d[8]  = p->color.x; d[9] = p->color.y; d[10] = p->color.z; d[11] = p->color.w;
+    float sz = p->size; if (sz < 0.0001f) sz = 0.0001f;
+    d[12] = sz; d[13] = 0.0f; d[14] = 0.0f; d[15] = 0.0f;
+    b->count++;
 }
 
 typedef struct {
@@ -72,65 +64,97 @@ static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
     JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
     if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
-    /* GPU-routed emitters render through sr_drive_gpu_particles (instanced
-     * billboards), not this CPU path. */
+    /* GPU-forced emitters (JCE_GPU_PARTICLES_FORCE=1) draw on the GPU pool. */
     if (jce_scene_particle_emitter_uses_gpu(c)) return;
     JceEmitterHandle h = { c->emitter_handle_idx };
     jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit, ctx->batch);
 }
 
+/* Lazily build the sprite program (vs_particle+fs_particle), the shared unit
+ * quad and the textured-flag uniform — mirrors jce_gpu_particles' render
+ * resources so the CPU and GPU paths draw byte-identically. */
+static void sr_particle_sprite_lazy_init(JceSceneRenderer *sr)
+{
+    if (sr->particle_sprite_tried) return;
+    sr->particle_sprite_tried    = true;
+    sr->prog_particle_sprite.idx = UINT16_MAX;
+
+    JceShaderHandle h = shader_load_program(sr->pak, "particle");
+    sr->prog_particle_sprite.idx = h.idx;
+    if (h.idx == UINT16_MAX) {
+        LOG_WARN(LOG_TAG, "particle sprite shader (vs/fs_particle) not in PAK; "
+                          "CPU particles will not render");
+        return;
+    }
+
+    bgfx_vertex_layout_t ql;
+    bgfx_vertex_layout_begin(&ql, bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&ql, BGFX_ATTRIB_POSITION,  3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&ql, BGFX_ATTRIB_TEXCOORD0, 2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&ql);
+    static const float qv[] = {
+        -0.5f,-0.5f, 0.0f,  0.0f, 0.0f,
+         0.5f,-0.5f, 0.0f,  1.0f, 0.0f,
+         0.5f, 0.5f, 0.0f,  1.0f, 1.0f,
+        -0.5f, 0.5f, 0.0f,  0.0f, 1.0f,
+    };
+    static const uint16_t qi[] = { 0, 1, 2, 0, 2, 3 };
+    sr->particle_quad_vb = bgfx_create_vertex_buffer(
+        bgfx_copy(qv, sizeof qv), &ql, BGFX_BUFFER_NONE);
+    sr->particle_quad_ib = bgfx_create_index_buffer(
+        bgfx_copy(qi, sizeof qi), BGFX_BUFFER_NONE);
+    sr->u_particle_misc = bgfx_create_uniform("u_particle_misc",
+                                              BGFX_UNIFORM_TYPE_VEC4, 1);
+}
+
 void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
                        const JceCamera *camera, uint16_t view_id)
 {
+    (void)camera;   /* billboard basis is u_invView (set by the view transform) */
     const JceParticleSystem *sys =
         (const JceParticleSystem *)jce_scene_internal_particles_get(scene);
     if (!sys) return;
     uint32_t alive = jce_particles_alive_count(sys);
     if (alive == 0) return;
 
-    bgfx_vertex_layout_t layout;
-    bgfx_vertex_layout_begin(&layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_COLOR0,   4, BGFX_ATTRIB_TYPE_UINT8, true, false);
-    bgfx_vertex_layout_end(&layout);
+    sr_particle_sprite_lazy_init(sr);
+    if (!BGFX_HANDLE_IS_VALID(sr->prog_particle_sprite)) return;
 
-    /* Cap to what the transient ring can serve this frame (whole quads). */
-    uint32_t quads = alive;
-    uint32_t av = bgfx_get_avail_transient_vertex_buffer(quads * 4u, &layout) / 4u;
-    uint32_t ai = bgfx_get_avail_transient_index_buffer(quads * 6u, false) / 6u;
-    if (av < quads) quads = av;
-    if (ai < quads) quads = ai;
-    if (quads == 0) return;
+    uint32_t avail = bgfx_get_avail_instance_data_buffer(
+        alive, (uint16_t)SR_PARTICLE_INST_STRIDE);
+    uint32_t n = alive < avail ? alive : avail;
+    if (n == 0) return;
 
-    bgfx_transient_vertex_buffer_t tvb;
-    bgfx_transient_index_buffer_t  tib;
-    if (!bgfx_alloc_transient_buffers(&tvb, &layout, quads * 4u, &tib, quads * 6u, false))
-        return;
+    bgfx_instance_data_buffer_t idb;
+    bgfx_alloc_instance_data_buffer(&idb, n, (uint16_t)SR_PARTICLE_INST_STRIDE);
 
-    SrParticleBatch batch;
-    batch.v     = (struct SrPVtx *)tvb.data;
-    batch.idx   = (uint16_t *)tib.data;
-    batch.cap   = quads;
-    batch.n     = 0;
-    batch.right = camera ? jce_camera_get_right(camera) : jce_v3(1.0f, 0.0f, 0.0f);
-    batch.up    = camera ? jce_camera_get_up(camera)    : jce_v3(0.0f, 1.0f, 0.0f);
-
+    SrParticleBatch batch = { (float *)idb.data, 0u, n };
     SrParticleEachCtx ctx = { sys, scene, &batch };
-    jce_scene_each_entity(scene, sr_particle_each_entity, &ctx);
-    if (batch.n == 0) return;
+    /* Component-filtered walk (O(#emitters)); O(1) all-clear gate. */
+    if (jce_scene_count_particle_emitters(scene) > 0)
+        jce_scene_each_particle_emitter(scene, sr_particle_each_entity, &ctx);
+    if (batch.count == 0) return;
 
-    bgfx_set_transient_vertex_buffer(0, &tvb, 0, batch.n * 4u);
-    bgfx_set_transient_index_buffer(&tib, 0, batch.n * 6u);
-    jce_mat4 ident = jce_m4_identity();
-    bgfx_set_transform(ident.raw[0], 1);
-    /* Unlit, alpha-blended, depth-tested, no Z-write (particles don't occlude). */
-    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
-                   BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_BLEND_ALPHA, 0);
-    JceShaderHandle sh = jce_renderer_get_program_color(sr->renderer);
-    bgfx_program_handle_t prog;
-    prog.idx = sh.idx;
-    if (BGFX_HANDLE_IS_VALID(prog))
-        bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    bgfx_set_vertex_buffer(0, sr->particle_quad_vb, 0, 4);
+    bgfx_set_index_buffer(sr->particle_quad_ib, 0, 6);
+    bgfx_set_instance_data_buffer(&idb, 0, batch.count);
+
+    /* .x=0 → procedural soft circle.  .y=1 → allow motion-stretch: vs_particle
+     * elongates only the instances whose baked i_data1 (velocity*stretch) is
+     * non-zero, so round emitters are unaffected while rain reads as streaks.
+     * The GPU pool draw leaves .y=0, so its i_data1 (raw vel/life) never
+     * accidentally stretches. */
+    float misc[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+    bgfx_set_uniform(sr->u_particle_misc, misc, 1);
+
+    /* Match the GPU pool draw: additive soft-glow, depth-tested, no Z-write,
+     * cull-CW (the billboard winds the same as the GPU pool's quad). */
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                  | BGFX_STATE_DEPTH_TEST_LESS
+                  | BGFX_STATE_CULL_CW
+                  | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
+                                          BGFX_STATE_BLEND_ONE), 0);
+    bgfx_submit(view_id, sr->prog_particle_sprite, 0, BGFX_DISCARD_ALL);
 }
 
 /* ── GPU particles (compute-driven; P3-E wiring) ──────────────────────
@@ -152,6 +176,7 @@ typedef struct {
     uint16_t          color_view;    /* base+0: instanced billboard draw   */
     float             dt;
     bool              dispatch;      /* false on 2nd+ render of a bgfx frame */
+    int              *creates_left;  /* per-frame create budget (stagger)  */
 } SrGpuParticleCtx;
 
 static SrGpuParticleRec *sr_gpu_particle_find_or_add(JceSceneRenderer *sr,
@@ -195,7 +220,21 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
     }
 
     if (!rec->sys) {
-        jce_scene_particle_emitter_desc(c, &rec->desc);
+        /* Stagger creation: building a GPU particle system allocates a pool
+         * VB + 4 programs (8 shaders) + uniforms and issues its first
+         * compute dispatches.  A scene switch that brings up MANY emitters in
+         * ONE frame (elemental_serenity = 8) spikes D3D12 resource creation
+         * hard enough that a later graphics PSO create fails ("Failed to
+         * create PSO!", device-removed) and the render thread crashes.  Cap
+         * new systems per frame; the rest are created over the next frames
+         * (a few frames' delay before those emitters appear — imperceptible). */
+        if (ctx->creates_left && *ctx->creates_left <= 0) {
+            rec->referenced = true;   /* keep the slot reserved for next frame */
+            return;
+        }
+        if (ctx->creates_left) (*ctx->creates_left)--;
+        jce_scene_particle_emitter_desc_tex(c, &rec->desc,
+                                            rec->tex_path, sizeof rec->tex_path);
         /* GPU path consumes only scalar fields; drop any loader-owned CPU
          * sub-emitter child so rec->desc never holds a dangling/leaked ptr. */
         jce_particles_desc_free(&rec->desc);
@@ -213,6 +252,12 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
             return;
         }
         rec->epoch = epoch;
+        /* Zero-fill the pool NOW, regardless of the dispatch gate: a system
+         * created on a non-dispatch pass (scene switch lands mid-frame, the
+         * second viewport creates it) would otherwise render an uninitialized
+         * pool — garbage instances on VK, NaN geometry that TDRs the device
+         * on D3D12 (the scene-switch crash chain). */
+        jce_gpu_particles_reset(rec->sys, ctx->compute_view);
     }
 
     rec->referenced = true;
@@ -249,7 +294,16 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
         jce_gpu_particles_update(rec->sys, ctx->compute_view, ctx->dt, &cfg);
     }
 
-    jce_gpu_particles_render(rec->sys, ctx->color_view);
+    /* Authored billboard texture resolves through the renderer's async
+     * texture cache (INVALID while decoding — the draw falls back to the
+     * procedural sprite for those first frames, then upgrades). */
+    uint16_t tex_idx = UINT16_MAX;
+    if (rec->tex_path[0]) {
+        JceTexture t = sr_resolve_texture(sr, rec->tex_path);
+        tex_idx = t.idx;
+    }
+    jce_gpu_particles_render_ex(rec->sys, ctx->color_view,
+                                tex_idx, rec->desc.blend_alpha);
 }
 
 void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
@@ -278,7 +332,15 @@ void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
         ctx.color_view   = view_id_base;
         ctx.dt           = dt_sec;
         ctx.dispatch     = dispatch;
-        jce_scene_each_entity(scene, sr_gpu_particle_each, &ctx);
+        /* At most 2 NEW GPU particle systems created per bgfx frame (see the
+         * stagger note in sr_gpu_particle_each) — only meter on the dispatch
+         * pass so the two viewports don't double-count.  Steady state (no new
+         * emitters) never touches this. */
+        int creates_left = dispatch ? 2 : 0;
+        ctx.creates_left = &creates_left;
+        /* Component-filtered walk (O(#emitters)); O(1) all-clear gate. */
+        if (jce_scene_count_particle_emitters(scene) > 0)
+            jce_scene_each_particle_emitter(scene, sr_gpu_particle_each, &ctx);
 
         if (dispatch) {
             sr->gpu_particle_frame       = fi;

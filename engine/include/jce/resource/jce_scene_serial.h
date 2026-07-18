@@ -17,6 +17,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_json.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -58,9 +59,17 @@ JCE_API bool jce_scene_serial_load_file(JceScene *scene, const char *path);
 
 /* Load the scene from a virtual path through the VFS.
    Supports reading from PAK archives and mounted directories. */
-bool jce_scene_serial_load_vfs(JceScene *scene,
-                               const JceFileSystem *fs,
-                               const char *virtual_path);
+JCE_API bool jce_scene_serial_load_vfs(JceScene *scene,
+                                       const JceFileSystem *fs,
+                                       const char *virtual_path);
+
+/* Apply an already-parsed scene document from a virtual path. This is for
+ * asynchronous loaders that parse off-thread and must retain VFS-relative
+ * material and texture resolution when they commit on the main thread. */
+JCE_API int jce_scene_serial_apply_json_vfs(JceScene *scene,
+                                             const JceFileSystem *fs,
+                                             const char *virtual_path,
+                                             const JceJson *root);
 
 /* ================================================================== */
 /* Additive (streaming) load                                           */
@@ -76,6 +85,15 @@ JCE_API bool jce_scene_serial_load_additive(JceScene *scene,
                                              const char *json, size_t len,
                                              JceEntity **out_entities,
                                              uint32_t   *out_count);
+
+/* VFS counterpart to jce_scene_serial_load_additive(). The prefab/scene
+ * document and all relative material assets resolve through the same mounted
+ * filesystem for the duration of the append. */
+JCE_API bool jce_scene_serial_load_additive_vfs(JceScene *scene,
+                                                 const JceFileSystem *fs,
+                                                 const char *virtual_path,
+                                                 JceEntity **out_entities,
+                                                 uint32_t   *out_count);
 
 /* Free an entity array returned by jce_scene_serial_load_additive(). */
 JCE_API void jce_scene_serial_free_entities(JceEntity *entities);

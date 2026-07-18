@@ -185,18 +185,26 @@ JCE_API bool jce_renderer_fbo_capture_pending(void);
  * jce_renderer_request_screenshot (which only completes on a foreground present),
  * this is a pure GPU->CPU copy that finishes during normal frame processing, so
  * it works with NO window focus (headless).  Poll _poll() each frame until != 0.
- * One capture in flight; returns false if busy or args are invalid. */
+ * One capture in flight; returns false if busy or args are invalid.
+ * `yflip`: 1 when the SOURCE's readback rows are bottom-up — same contract as
+ * _submit_sink: pass 1 for the engine postfx RT, `bgfx caps originBottomLeft`
+ * for plain FBO passes (top-down on D3D/VK/Metal, bottom-up only on GL). */
 JCE_API bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
-                                                  uint16_t w, uint16_t h, const char *path);
+                                                  uint16_t w, uint16_t h, const char *path,
+                                                  int yflip);
 /* -1 = idle, 0 = pending (call again next frame), 1 = wrote PNG, 2 = write failed. */
 JCE_API int  jce_renderer_readback_capture_poll(void);
 
 /* Recording variant of _submit: instead of writing a PNG, the poll converts the
  * read-back to BGRA8 and feeds it to the capture sink (video encoder).  Shares
- * the single in-flight slot with _submit; returns false if busy (skip the frame). */
+ * the single in-flight slot with _submit; returns false if busy (skip the frame).
+ * `yflip`: 1 when the source's readback rows are bottom-up.  This is a property
+ * of how the source texture was rendered: pass 1 for the engine postfx RT,
+ * `bgfx caps originBottomLeft` for plain FBO passes (the ImGui recording FBO). */
 JCE_API bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx,
                                                        uint16_t blit_view,
-                                                       uint16_t w, uint16_t h);
+                                                       uint16_t w, uint16_t h,
+                                                       int yflip);
 
 /* While true, video recording is fed by the ImGui renderer reading its offscreen
  * FBO back into the sink (whole editor window), not the backbuffer screen_shot
@@ -221,6 +229,16 @@ JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst(const JceRenderer *r)
  * fs_pbr_tint, reading a 5th per-instance vec4 (i_data4 = baseColor tint).
  * INVALID when the variant didn't load → caller draws tinted entities solo. */
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_tint(const JceRenderer *r);
+/* Texture-diverse instanced variant: vs_pbr_inst_tex_array + fs_pbr_inst_tex_array,
+ * reading a 6th per-instance vec4 (i_data5.x = albedo 2D-array layer) with a
+ * SAMPLER2DARRAY albedo. INVALID when the variant didn't load (older pak /
+ * essl1) → caller keeps texture-diverse entities solo. */
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_tex_array(const JceRenderer *r);
+/* LOD cross-fade instanced PBR (千万 ②): vs_pbr_inst_fade + fs_pbr_fade —
+ * i_data3.w carries the band-transition coverage, the fragment screen-door
+ * dithers.  Invalid when the pak predates the variant (fall back to
+ * jce_renderer_get_program_pbr_inst = hard band switches). */
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_fade(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned(const JceRenderer *r);
 /* Forward+ clustered fragment variants (fs_pbr_fwdplus).  Return an INVALID
  * handle when the variant program failed to load (e.g. an older pak) so the

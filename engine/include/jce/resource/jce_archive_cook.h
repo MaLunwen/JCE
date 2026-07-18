@@ -44,19 +44,22 @@ typedef struct JceCookConfig {
     bool    mmap_friendly;    /* page-align uncompressed entries (spec §8)  */
     bool    emit_debug_paths; /* embed the debug path table (names)         */
     bool    compress_index;   /* zstd-compress the index region            */
-    bool    use_dict;         /* train + use JSON/TEXT/SHADER dictionaries  */
+    bool    use_dict;         /* train dictionaries for plain archives;
+                               * ignored in secure mode (dictionary bytes in
+                               * archive v1 have no encrypted representation) */
     bool    dedup_content;    /* coalesce byte-identical payloads (one copy *
                                * on disk; entries share data_offset)        */
 
     /* ── Optional payload encryption (spec §9.2) ─────────────────────────
      * When `encrypt` is true and `encryption_key` is non-NULL, EVERY input
-     * (including any manifest entry) is compressed-then-ChaCha20-encrypted.
+     * (including any manifest entry) is compressed-then-ChaCha20-encrypted
+     * under a keyed anonymous index and the whole archive receives an
+     * HMAC-SHA-256. Dictionary training is disabled so protected source text
+     * cannot leak through archive v1's plaintext dictionary region.
      * `encrypt_label` (bundle id / "project_assets") seeds the per-archive
      * nonce salt so the same path in two archives never shares a keystream;
-     * NULL/empty selects the legacy zero salt.  Encryption is keyed
-     * obfuscation, NOT tamper-proofing: there is no MAC, and the key ships
-     * inside the game binary.  Note: dedup_content is effectively disabled
-     * for encrypted entries (their per-path nonce makes ciphertext unique). */
+     * NULL/empty selects the zero salt.  The key necessarily ships inside the
+     * client, so this raises extraction cost rather than creating secrecy. */
     bool           encrypt;
     const uint8_t *encryption_key;  /* 32 bytes, borrowed                  */
     const char    *encrypt_label;   /* nonce-salt label, borrowed          */

@@ -398,17 +398,48 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
 
 # ── shaderc + host tools (cross prerequisites) ────────────────────────────
 def find_host_shaderc() -> Path | None:
+    exe_name = "shaderc.exe" if HOST == "windows" else "shaderc"
+    # 1) The host-conan bgfx package's bin/ (present when bgfx built tools=True).
     gen = ROOT / "build" / "host-conan" / "build" / "Release" / "generators"
     for data in gen.glob("bgfx-release-*-data.cmake"):
         try:
             for line in data.read_text(encoding="utf-8", errors="ignore").splitlines():
                 if line.startswith("set(bgfx_PACKAGE_FOLDER_RELEASE"):
-                    folder = line.split('"')[1]
-                    exe = Path(folder) / "bin" / ("shaderc.exe" if HOST == "windows" else "shaderc")
-                    if exe.exists():
-                        return exe
+                    folder = Path(line.split('"')[1])
+                    # bin/shaderc (packaged) OR the recipe build-tree location
+                    # (mirrors tools/compile_shaders.cmake's candidate probe).
+                    for cand in (folder / "bin" / exe_name,
+                                 folder.parent / "b" / "build" / "Release"
+                                       / "cmake" / "bgfx" / exe_name,
+                                 folder.parent / "b" / "build" / "Debug"
+                                       / "cmake" / "bgfx" / exe_name):
+                        if cand.exists():
+                            return cand
         except Exception:
             pass
+    # 2) Cross builds (wasm/android/ios) deliberately build bgfx tools=False, so
+    #    the host-conan package above has NO shaderc.  Fall back to ANY tools=True
+    #    bgfx shaderc already in the conan cache (a desktop build populates one).
+    #    Without this the wasm SDK compiled ZERO engine shaders → empty shader PAK
+    #    → "not found in PAK: vs_color_essl.bin" → black WebGL canvas.
+    try:
+        import os as _os
+        home = _os.environ.get("CONAN_HOME") or str(Path.home() / ".conan2")
+        cache = Path(home) / "p" / "b"
+        if cache.is_dir():
+            cands: list[Path] = []
+            for pkg in cache.glob("bgfx*"):
+                for sub in (pkg / "p" / "bin" / exe_name,
+                            pkg / "b" / "build" / "Release" / "cmake" / "bgfx" / exe_name):
+                    if sub.exists():
+                        cands.append(sub)
+            if cands:
+                # newest first — most likely to match the current bgfx version
+                cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                log(f"host shaderc from conan cache fallback: {cands[0]}")
+                return cands[0]
+    except Exception:
+        pass
     return None
 
 
@@ -673,6 +704,9 @@ def _smoke_one(t: dict, sdk: Path, variant: str) -> None:
     bdir = ROOT / "build" / "desktop" / f"sdk-smoke-{t['key']}-{variant}"
     cfg = ["cmake", "-S", str(ROOT / "tests" / "sdk_smoke"), "-B", str(bdir),
            "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+           "-U", "JCE_PAK_EXECUTABLE",
+           "-U", "JCE_COOK_EXECUTABLE",
+           "-U", "JCE_BIN2OBJ_EXECUTABLE",
            f"-DJCE_DIR={jce_cmake}"]
     if HOST == "windows" and not t.get("emscripten"):
         cfg += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
@@ -981,7 +1015,15 @@ def cmd_app(args) -> None:
         if not DRY_RUN:
             shutil.rmtree(bdir, ignore_errors=True)
     cfg = ["cmake", "-S", str(project), "-B", str(bdir), "-G", "Ninja",
-           f"-DCMAKE_BUILD_TYPE={config}", f"-DJCE_DIR={jce_cmake}"]
+           f"-DCMAKE_BUILD_TYPE={config}",
+           # Tool paths are find_program cache entries. A build directory may
+           # be reused with --sdk pointing at a different installation, so
+           # make the selected SDK authoritative while preserving all other
+           # project cache state.
+           "-U", "JCE_PAK_EXECUTABLE",
+           "-U", "JCE_COOK_EXECUTABLE",
+           "-U", "JCE_BIN2OBJ_EXECUTABLE",
+           f"-DJCE_DIR={jce_cmake}"]
     if t.get("emscripten"):
         cfg.append(f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}")
     elif HOST == "windows":
@@ -1132,6 +1174,19 @@ def cmd_package_game(args) -> None:
                                 dirs_exist_ok=True)
             else:
                 log(f"WARN: cooked assets dir missing: {cooked_src} (game ships without assets)")
+            # The runtime reads jce_project.json from the CWD to find
+            # startup_scene; without it the game boots to an empty default
+            # scene.  Loose deployments therefore always need the manifest.
+            proj_json = project / "jce_project.json"
+            if proj_json.is_file():
+                shutil.copy2(proj_json, out / "jce_project.json")
+            # Mirror extra loose runtime dirs the project's POST_BUILD staged
+            # beside the exe (e.g. particles/ — emitter descs are read
+            # CWD-relative by jce_particles_desc_load_json, not from the PAK).
+            for extra in ("particles",):
+                extra_src = built.parent / extra
+                if extra_src.is_dir():
+                    shutil.copytree(extra_src, out / extra, dirs_exist_ok=True)
         else:
             log("single-file: loose cooked tree NOT staged (assets embedded in "
                 "exe; pass --with-loose for dev / non-embedded projects)")

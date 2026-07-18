@@ -25,11 +25,16 @@
 #include <jce/renderer/jce_particles.h>
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/resource/jce_pak_loader.h>   /* PAK-first .particles.json (single-exe) */
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_log.h>
 
+#include "os/core/jce_memory.h"
+
+#include <stdio.h>    /* snprintf (asset-root anchor) */
 #include <string.h>
+#include <stdlib.h>   /* getenv (JCE_GPU_PARTICLES_FORCE) */
 
 #define LOG_TAG "scene_particles"
 
@@ -64,6 +69,24 @@ bool jce_scene_particle_emitter_uses_gpu(const JceParticleEmitterComponent *c)
     if (!jce_render_pipeline_is_feature_enabled("gpu_particles")) return false;
     /* jce_renderer_get_caps() is NULL-safe pre-bgfx-init (returns 0). */
     if ((jce_renderer_get_caps() & JCE_CAP_COMPUTE) == 0) return false;
+    /* Routing: default to the CPU particle path on EVERY backend.  The GPU
+     * compute pool is a dynamic VB used as both a compute UAV and instance
+     * data — bgfx 1.129 mis-renders that dual use on Vulkan/D3D12 (over-bright
+     * blob / device-removed; exhaustively investigated — even the official
+     * nbody same-view pattern didn't fix it, and Conan Center has no newer
+     * bgfx).  Rather than keep two divergent-looking paths, the CPU path now
+     * renders with the SAME vs/fs_particle sprite shaders (sr_draw_particles),
+     * so a single, backend-consistent soft-circle billboard covers all four
+     * backends.  JCE_GPU_PARTICLES_FORCE=1 opts an emitter back onto the GPU
+     * compute pool (for A/B / large-count testing on D3D11/GL). */
+    {
+        static int s_force = -1;
+        if (s_force < 0) {
+            const char *v = getenv("JCE_GPU_PARTICLES_FORCE");
+            s_force = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (!s_force) return false;   /* CPU path everywhere */
+    }
     return true;
 }
 
@@ -90,12 +113,66 @@ uint64_t jce_scene_particle_emitter_epoch(const JceParticleEmitterComponent *c)
 
 /* ── Authored desc resolution (shared with the GPU driver) ───────────── */
 
-void jce_scene_particle_emitter_desc(const JceParticleEmitterComponent *c,
-                                     JceParticleEmitterDesc *out)
+/* Optional asset-root anchor for the *.particles.json reads.  The component
+ * stores a project-relative path (e.g. "particles/flame.particles.json") but
+ * jce_particles_desc_load_json reads CWD-relative, which only works when the
+ * process happens to run beside the assets.  The editor anchors this at the
+ * project's source_assets dir; default_main anchors it at <exe>/cooked_assets.
+ * Process-global (like the GPU-particles fallback latch): one project is
+ * active per process. */
+static char s_sp_asset_root[512];
+
+/* Embedded PAK for the single-exe path: the *.particles.json is packed into the
+ * game's PAK (assetPath is a bundle dep key), but the host-fs reads below miss
+ * in a single-exe build (no loose cooked tree).  default_main publishes the
+ * overlaid engine PAK here so the desc loads straight from the PAK.  NULL in
+ * the editor (which anchors on the source-assets root instead). */
+static const JcePakArchive *s_sp_pak = NULL;
+
+void jce_scene_particles_set_asset_root(const char *root)
+{
+    if (!root) { s_sp_asset_root[0] = '\0'; return; }
+    snprintf(s_sp_asset_root, sizeof s_sp_asset_root, "%s", root);
+}
+
+void jce_scene_particles_set_pak(const struct JcePakArchive *pak)
+{
+    s_sp_pak = (const JcePakArchive *)pak;
+}
+
+void jce_scene_particle_emitter_desc_tex(const JceParticleEmitterComponent *c,
+                                         JceParticleEmitterDesc *out,
+                                         char *tex_path, int tex_cap)
 {
     if (!out) return;
+    if (tex_path && tex_cap > 0) tex_path[0] = '\0';
     if (c && c->asset_path[0]) {
-        jce_particles_desc_load_json(c->asset_path, out, NULL, 0);
+        /* PAK-first (single-exe: the .particles.json is in the embedded PAK). */
+        if (s_sp_pak) {
+            const JcePakAsset *a =
+                jce_pak_find((JcePakArchive *)s_sp_pak, c->asset_path);
+            if (a && a->original_size && a->original_size <= (1u << 20)) {
+        char *buf = (char *)JCE_MALLOC((size_t)a->original_size);
+                if (buf) {
+                    bool ok =
+                        jce_pak_decompress(a, buf, (size_t)a->original_size) ==
+                            (size_t)a->original_size &&
+                        jce_particles_desc_load_json_mem(
+                            buf, (size_t)a->original_size, out, tex_path, tex_cap);
+        JCE_FREE(buf);
+                    if (ok) return;
+                }
+            }
+        }
+        /* Anchored host read next (quiet when the root is authoritative), then
+         * the raw path (absolute paths / CWD-staged layouts keep working). */
+        if (s_sp_asset_root[0]) {
+            char full[768];
+            snprintf(full, sizeof full, "%s/%s", s_sp_asset_root, c->asset_path);
+            if (jce_particles_desc_load_json(full, out, tex_path, tex_cap))
+                return;
+        }
+        jce_particles_desc_load_json(c->asset_path, out, tex_path, tex_cap);
         return;
     }
     /* No asset: synthesize from the legacy quick-tune fields. */
@@ -106,6 +183,12 @@ void jce_scene_particle_emitter_desc(const JceParticleEmitterComponent *c,
     if (c->lifetime_max > 0.0f) out->lifetime_max = c->lifetime_max;
     if (out->lifetime_max < out->lifetime_min)
         out->lifetime_max = out->lifetime_min;
+}
+
+void jce_scene_particle_emitter_desc(const JceParticleEmitterComponent *c,
+                                     JceParticleEmitterDesc *out)
+{
+    jce_scene_particle_emitter_desc_tex(c, out, NULL, 0);
 }
 
 /* ── Per-frame context ─────────────────────────────────────────────── */
@@ -188,11 +271,6 @@ static void sp_each(JceScene *s, JceEntity e, void *ud)
 
 /* Detect whether the scene has any particle component (so we don't create an
  * empty system — and step debug-draw — for scenes that have none). */
-static void sp_probe(JceScene *s, JceEntity e, void *ud)
-{
-    if (jce_scene_has_particle_emitter(s, e)) *(bool *)ud = true;
-}
-
 void jce_scene_particles_update(JceScene *s, float dt)
 {
     if (!s) return;
@@ -201,9 +279,11 @@ void jce_scene_particles_update(JceScene *s, float dt)
         (JceParticleSystem *)jce_scene_internal_particles_get(s);
 
     if (!sys) {
-        bool any = false;
-        jce_scene_each_entity(s, sp_probe, &any);
-        if (!any) return;   /* nothing to do; stay allocation-free */
+        /* O(1) holder count instead of a full-entity probe walk: on a
+         * particle-free 150k-entity world the old walk burned a full scan
+         * EVERY frame just to conclude "nothing to do". */
+        if (jce_scene_count_particle_emitters(s) == 0)
+            return;         /* nothing to do; stay allocation-free */
         sys = jce_particles_create(jce_allocator_default());
         if (!sys) return;
         jce_scene_internal_particles_set(s, sys);
@@ -214,8 +294,9 @@ void jce_scene_particles_update(JceScene *s, float dt)
     ctx.scene = s;
     ctx.sys   = sys;
 
-    /* Per-entity: build/sync/draw, marking referenced emitters. */
-    jce_scene_each_entity(s, sp_each, &ctx);
+    /* Per-emitter: build/sync/draw, marking referenced emitters.
+     * Component-filtered walk (O(#emitters), not O(#entities)). */
+    jce_scene_each_particle_emitter(s, sp_each, &ctx);
 
     /* Step the whole simulation once (clamp long frames). */
     if (dt > 0.1f) dt = 0.1f;
@@ -269,6 +350,16 @@ void jce_scene_particle_set_emitting(JceScene *s, JceEntity e, bool on)
     if (!sys) return;
     if (on) jce_particles_emitter_start(sys, h);
     else    jce_particles_emitter_stop(sys, h);
+}
+
+void jce_scene_particle_set_color(JceScene *s, JceEntity e,
+                                  float r, float g, float b)
+{
+    JceEmitterHandle h;
+    JceParticleSystem *sys = sp_resolve(s, e, &h);
+    if (!sys) return;
+    jce_vec3 rgb = { r, g, b };
+    jce_particles_emitter_set_color(sys, h, rgb);
 }
 
 void jce_scene_particles_shutdown(JceScene *s)

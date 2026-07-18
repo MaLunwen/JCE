@@ -7,6 +7,7 @@
 
 #include "io/jce_editor_file_util.h"
 #include "jce_fv_common.h"
+#include "jce_json_classify.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
 
@@ -25,6 +26,12 @@ static const ImVec4 SYN_STRING  = ImVec4(0.80f, 0.56f, 0.33f, 1.0f);
 static const ImVec4 SYN_NUMBER  = ImVec4(0.70f, 0.85f, 0.55f, 1.0f);
 static const ImVec4 SYN_PREPROC = ImVec4(0.60f, 0.50f, 0.80f, 1.0f);
 static const ImVec4 SYN_DEFAULT = ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
+
+/* JSON palette (VS Code Dark+ inspired: keys pop, punctuation recedes —
+ * the old path painted whole JSON lines in one flat yellow). */
+static const ImVec4 SYN_JSON_KEY   = ImVec4(0.61f, 0.86f, 1.00f, 1.0f);
+static const ImVec4 SYN_JSON_LIT   = ImVec4(0.34f, 0.61f, 0.84f, 1.0f);  /* true/false/null */
+static const ImVec4 SYN_JSON_PUNCT = ImVec4(0.55f, 0.55f, 0.58f, 1.0f);
 
 static const char *s_c_keywords[] = {
     "auto","break","case","char","const","continue","default","do","double",
@@ -197,6 +204,124 @@ static void fv_render_syntax_line(const char *start, const char *end,
     }
 }
 
+/* ── Render a single JSON line: keys / strings / numbers / literals ──── */
+
+static void fv_render_json_line(const char *start, const char *end)
+{
+    if (start >= end) { ImGui::TextUnformatted(""); return; }
+
+    const char *p = start;
+    bool first_token = true;
+
+    auto emit = [&](const char *a, const char *b, const ImVec4 &col) {
+        if (!first_token) ImGui::SameLine(0, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(a, b);
+        ImGui::PopStyleColor();
+        first_token = false;
+    };
+
+    while (p < end) {
+        if (*p == ' ' || *p == '\t') {
+            const char *ws = p;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            if (!first_token) ImGui::SameLine(0, 0);
+            ImGui::TextUnformatted(ws, p);
+            first_token = false;
+            continue;
+        }
+
+        if (*p == '"') {
+            const char *str_start = p++;
+            while (p < end && *p != '"') {
+                if (*p == '\\' && (p + 1) < end) p++;
+                p++;
+            }
+            if (p < end) p++;
+            /* Key iff the next non-space char is ':' (JSON property name). */
+            const char *q = p;
+            while (q < end && (*q == ' ' || *q == '\t')) q++;
+            bool is_key = (q < end && *q == ':');
+            emit(str_start, p, is_key ? SYN_JSON_KEY : SYN_STRING);
+            continue;
+        }
+
+        if (isdigit((unsigned char)*p)
+            || (*p == '-' && (p + 1) < end && isdigit((unsigned char)p[1]))) {
+            const char *num = p;
+            if (*p == '-') p++;
+            while (p < end && (isdigit((unsigned char)*p) || *p == '.'
+                               || *p == 'e' || *p == 'E' || *p == '+' || *p == '-'))
+                p++;
+            emit(num, p, SYN_NUMBER);
+            continue;
+        }
+
+        if (isalpha((unsigned char)*p)) {
+            const char *id = p;
+            while (p < end && isalpha((unsigned char)*p)) p++;
+            int idl = (int)(p - id);
+            bool lit = (idl == 4 && memcmp(id, "true", 4) == 0)
+                    || (idl == 5 && memcmp(id, "false", 5) == 0)
+                    || (idl == 4 && memcmp(id, "null", 4) == 0);
+            emit(id, p, lit ? SYN_JSON_LIT : SYN_DEFAULT);
+            continue;
+        }
+
+        /* Punctuation run: {}[],: etc — dim so the data pops. */
+        {
+            const char *punc = p;
+            while (p < end && !isalnum((unsigned char)*p)
+                   && *p != '"' && *p != ' ' && *p != '\t' && *p != '-')
+                p++;
+            if (p == punc) p++;   /* lone '-' not starting a number */
+            emit(punc, p, SYN_JSON_PUNCT);
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  LINE INDEX (offset of each line start; enables clipped rendering and
+ *  O(log n) offset->line lookups for find / goto)
+ * ══════════════════════════════════════════════════════════════════════ */
+
+void fv_code_invalidate_index(FvTab *tab)
+{
+    if (tab->line_offs) { ED_FREE(tab->line_offs); tab->line_offs = NULL; }
+    tab->line_count      = 0;
+    tab->json_classified = false;
+}
+
+static void fv_code_build_line_index(FvTab *tab)
+{
+    int lines = 1;
+    for (int c = 0; c < tab->content_len; c++)
+        if (tab->content[c] == '\n') lines++;
+
+    tab->line_offs = (int *)ED_MALLOC(sizeof(int) * (size_t)(lines + 1));
+    if (!tab->line_offs) { tab->line_count = 0; return; }
+
+    int li = 0;
+    tab->line_offs[li++] = 0;
+    for (int c = 0; c < tab->content_len; c++)
+        if (tab->content[c] == '\n') tab->line_offs[li++] = c + 1;
+    tab->line_offs[li] = tab->content_len;   /* sentinel: end of last line */
+    tab->line_count = lines;
+}
+
+/* 0-based line containing byte `offset` (binary search over line starts). */
+static int fv_code_line_of_offset(const FvTab *tab, int offset)
+{
+    if (!tab->line_offs || tab->line_count <= 0) return 0;
+    int lo = 0, hi = tab->line_count - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (tab->line_offs[mid] <= offset) lo = mid;
+        else                               hi = mid - 1;
+    }
+    return lo;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  *  FIND / REPLACE HELPERS
  * ══════════════════════════════════════════════════════════════════════ */
@@ -257,6 +382,7 @@ void fv_code_close_tab(FvTab *tab)
         ED_FREE(tab->edit_buf);
         tab->edit_buf = NULL;
     }
+    fv_code_invalidate_index(tab);
     tab->edit_mode = false;
     tab->modified  = false;
 }
@@ -325,6 +451,7 @@ void fv_render_code(FvTab *tab)
                             tab->content[new_len] = '\0';
                             tab->content_len = new_len;
                         }
+                        fv_code_invalidate_index(tab);
                     }
                     LOG_INFO(LOG_TAG, "saved '%s'", tab->display_name);
                 }
@@ -344,6 +471,7 @@ void fv_render_code(FvTab *tab)
                 tab->content = buf;
                 tab->content_len = n;
                 tab->file_size = (long)total;
+                fv_code_invalidate_index(tab);
                 /* Refresh edit buffer too */
                 if (tab->edit_buf) {
                     int cap = (n + 1 > FV_EDIT_BUF_CAP) ? n + 1 : FV_EDIT_BUF_CAP;
@@ -370,6 +498,35 @@ void fv_render_code(FvTab *tab)
                 jce_host_open_in_text_editor(tab->path);
         }
 
+        /* JSON type badge: classify once per content change and show a
+         * rounded chip so the user always knows WHAT kind of JSON this is
+         * (scene / anim state machine / particles / ...). */
+        if (strcmp(tab->ext, ".json") == 0 || tab->type == JCE_FV_SCENE) {
+            if (!tab->json_classified) {
+                tab->json_kind = (int)jce_json_classify(tab->content,
+                                                        tab->content_len,
+                                                        tab->path);
+                tab->json_classified = true;
+            }
+            if (tab->json_kind > (int)JCE_JSONK_NOT_JSON) {
+                const char *badge = jce_json_kind_label((JceJsonKind)tab->json_kind);
+                if (badge && badge[0]) {
+                    ImGui::SameLine(0, 10.0f);
+                    ImVec2 ts = ImGui::CalcTextSize(badge);
+                    const float pad_x = 7.0f, pad_y = 2.0f;
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    float h = ts.y + pad_y * 2.0f;
+                    ImDrawList *dl = ImGui::GetWindowDrawList();
+                    dl->AddRectFilled(p, ImVec2(p.x + ts.x + pad_x * 2.0f, p.y + h),
+                                      jce_json_kind_color((JceJsonKind)tab->json_kind),
+                                      h * 0.5f);
+                    dl->AddText(ImVec2(p.x + pad_x, p.y + pad_y),
+                                IM_COL32(235, 235, 235, 255), badge);
+                    ImGui::Dummy(ImVec2(ts.x + pad_x * 2.0f, h));
+                }
+            }
+        }
+
         /* File info (right side) */
         ImGui::SameLine();
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", tab->ext + 1);
@@ -381,6 +538,11 @@ void fv_render_code(FvTab *tab)
         else
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
                 jce_editor_i18n_or("viewer.code.sizeBytes", "  %ld bytes"), tab->file_size);
+        if ((long)tab->content_len < tab->file_size && !tab->edit_mode) {
+            ImGui::SameLine();
+            ImGui::TextColored(JCE_COLOR_TEXT_WARNING, "%s",
+                jce_editor_i18n_or("viewer.code.truncated", "(truncated preview)"));
+        }
         if (tab->modified) {
             ImGui::SameLine();
             ImGui::TextColored(JCE_COLOR_TEXT_WARNING, "%s", jce_editor_i18n("codeViewer.modified"));
@@ -404,6 +566,7 @@ void fv_render_code(FvTab *tab)
                     int total = fv_count_matches(src, tab->find_buf);
                     if (total > 0) {
                         tab->find_index = (tab->find_index + 1) % total;
+                        tab->scroll_to_find = true;
                     }
                 }
             }
@@ -411,10 +574,12 @@ void fv_render_code(FvTab *tab)
             int match_count = (tab->find_buf[0]) ? fv_count_matches(src, tab->find_buf) : 0;
             if (ImGui::Button(jce_editor_i18n("codeViewer.findNext")) && match_count > 0) {
                 tab->find_index = (tab->find_index + 1) % match_count;
+                tab->scroll_to_find = true;
             }
             ImGui::SameLine();
             if (ImGui::Button(jce_editor_i18n("codeViewer.findPrev")) && match_count > 0) {
                 tab->find_index = (tab->find_index - 1 + match_count) % match_count;
+                tab->scroll_to_find = true;
             }
             ImGui::SameLine();
             if (match_count > 0)
@@ -505,14 +670,17 @@ void fv_render_code(FvTab *tab)
         ImGui::PopFont();
         ImGui::PopStyleColor();
     } else {
-        /* Read-only view with line numbers + syntax highlighting */
+        /* Read-only view: line numbers + syntax highlighting, rendered
+         * through an ImGuiListClipper over a prebuilt line index so large
+         * files (multi-MB scene JSONs) only pay for the visible rows.  The
+         * index also gives O(log n) offset→line for find/goto scrolling. */
+        if (!tab->line_offs)
+            fv_code_build_line_index(tab);
+
         ImGui::BeginChild("##code", ImVec2(0, 0), false,
                           ImGuiWindowFlags_HorizontalScrollbar);
 
-        int line_count = 1;
-        for (int c = 0; c < tab->content_len; c++)
-            if (tab->content[c] == '\n') line_count++;
-
+        const int line_count = (tab->line_count > 0) ? tab->line_count : 1;
         int digits = 1;
         { int tmp = line_count; while (tmp >= 10) { digits++; tmp /= 10; } }
         char num_fmt[16];
@@ -520,24 +688,74 @@ void fv_render_code(FvTab *tab)
 
         ImVec4 code_col = fv_code_keyword_color(tab->ext);
         const char **kw_list = fv_keyword_list(tab->ext);
+        const bool is_json = (strcmp(tab->ext, ".json") == 0)
+                          || tab->type == JCE_FV_SCENE;
 
         /* Precompute find highlight offset (if searching) */
         int hl_offset = -1;
         int hl_len = 0;
-        if (tab->find_buf[0] && !tab->edit_mode) {
+        if (tab->find_buf[0]) {
             hl_offset = fv_find_nth(tab->content, tab->find_buf, tab->find_index);
             hl_len = (int)strlen(tab->find_buf);
         }
 
-        const char *line_start = tab->content;
-        int line_num = 1;
-        int char_offset = 0;
-        for (;;) {
-            const char *line_end = line_start;
-            while (*line_end && *line_end != '\n') line_end++;
+        const float line_h = ImGui::GetTextLineHeightWithSpacing();
+
+        /* Deferred scrolls: jump-to-line (hierarchy "View in JSON") and
+         * find navigation both center the target ~1/3 down the view. */
+        if (tab->goto_scroll_pending && tab->goto_line > 0) {
+            float y = (float)(tab->goto_line - 1) * line_h
+                    - ImGui::GetWindowHeight() * 0.35f;
+            ImGui::SetScrollY(y < 0.0f ? 0.0f : y);
+            tab->goto_scroll_pending = false;
+        }
+        if (tab->scroll_to_find) {
+            if (hl_offset >= 0 && tab->line_offs) {
+                int fl = fv_code_line_of_offset(tab, hl_offset);
+                float y = (float)fl * line_h - ImGui::GetWindowHeight() * 0.35f;
+                ImGui::SetScrollY(y < 0.0f ? 0.0f : y);
+            }
+            tab->scroll_to_find = false;
+        }
+
+        if (tab->goto_flash > 0.0f)
+            tab->goto_flash -= ImGui::GetIO().DeltaTime;
+
+        ImGuiListClipper clipper;
+        clipper.Begin(line_count, line_h);
+        while (clipper.Step())
+        for (int li = clipper.DisplayStart; li < clipper.DisplayEnd; li++) {
+            int char_offset = tab->line_offs ? tab->line_offs[li] : 0;
+            const char *line_start = tab->content + char_offset;
+            const char *line_end;
+            if (tab->line_offs) {
+                line_end = tab->content + tab->line_offs[li + 1];
+                /* Strip the newline (and a CR) from the rendered span. */
+                if (line_end > line_start && line_end[-1] == '\n') line_end--;
+                if (line_end > line_start && line_end[-1] == '\r') line_end--;
+            } else {
+                line_end = line_start;
+            }
+
+            /* Jump-target row: pulsing wash + steady left accent bar. */
+            if (tab->goto_line - 1 == li) {
+                ImVec2 rp = ImGui::GetCursorScreenPos();
+                float x0 = ImGui::GetWindowPos().x;
+                float x1 = x0 + ImGui::GetWindowWidth();
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                float pulse = (tab->goto_flash > 0.0f)
+                            ? 0.5f + 0.5f * sinf(tab->goto_flash * 6.0f)
+                            : 0.0f;
+                int alpha = (int)(40.0f + 90.0f * pulse);
+                dl->AddRectFilled(ImVec2(x0, rp.y), ImVec2(x1, rp.y + line_h),
+                                  IM_COL32(90, 140, 200, alpha));
+                dl->AddRectFilled(ImVec2(x0, rp.y),
+                                  ImVec2(x0 + 3.0f, rp.y + line_h),
+                                  IM_COL32(110, 170, 240, 220));
+            }
 
             char num_buf[16];
-            snprintf(num_buf, sizeof(num_buf), num_fmt, line_num);
+            snprintf(num_buf, sizeof(num_buf), num_fmt, li + 1);
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", num_buf);
             ImGui::SameLine();
 
@@ -576,7 +794,9 @@ void fv_render_code(FvTab *tab)
                     ImGui::PopStyleColor();
                 }
             } else if (line_end > line_start) {
-                if (kw_list) {
+                if (is_json) {
+                    fv_render_json_line(line_start, line_end);
+                } else if (kw_list) {
                     fv_render_syntax_line(line_start, line_end, kw_list, code_col);
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Text, code_col);
@@ -586,12 +806,8 @@ void fv_render_code(FvTab *tab)
             } else {
                 ImGui::TextUnformatted("");
             }
-
-            if (*line_end == '\0') break;
-            char_offset += line_len + 1;
-            line_start = line_end + 1;
-            line_num++;
         }
+        clipper.End();
 
         ImGui::EndChild();
     }

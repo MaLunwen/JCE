@@ -814,6 +814,9 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
     }
     if (key) jce_archive_set_decryption_key(ar, key);
     int      header_ok = jce_archive_verify_header(ar);
+    int      secure_index = jce_archive_is_secure(ar);
+    int      authenticated = jce_archive_is_authenticated(ar);
+    JceArchiveAuthStatus auth_status = jce_archive_auth_status(ar);
     uint32_t n         = jce_archive_count(ar);
 
     /* ── Duplicate detection (always) + optional deep verify ──────────── */
@@ -913,17 +916,25 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
         printf("  alignment           : %u bytes (log2=%u)\n",
                1u << align_log2, (unsigned)align_log2);
         printf("  default_compression : %s\n", jarc_comp_name(def_comp));
-        printf("  flags               : 0x%08x%s%s%s%s\n", (unsigned)flags,
+        printf("  flags               : 0x%08x%s%s%s%s%s%s\n", (unsigned)flags,
                (flags & JARC_FLAG_INDEX_COMPRESSED) ? " INDEX_COMPRESSED" : "",
                (flags & JARC_FLAG_HAS_DEBUG_PATHS)  ? " HAS_DEBUG_PATHS"  : "",
                (flags & JARC_FLAG_ENCRYPTED)        ? " ENCRYPTED"        : "",
-               (flags & JARC_FLAG_MMAP_FRIENDLY)    ? " MMAP_FRIENDLY"    : "");
+               (flags & JARC_FLAG_MMAP_FRIENDLY)    ? " MMAP_FRIENDLY"    : "",
+               (flags & JARC_FLAG_SECURE_INDEX)     ? " SECURE_INDEX"     : "",
+               (flags & JARC_FLAG_AUTHENTICATED)    ? " AUTHENTICATED"    : "");
         printf("  data_content_hash   : 0x%016llx\n", (unsigned long long)data_hash);
         printf("  index_content_hash  : 0x%016llx\n", (unsigned long long)index_hash);
         printf("  index region        : offset %llu, stored %llu, original %llu\n",
                (unsigned long long)index_offset, (unsigned long long)index_stored,
                (unsigned long long)index_orig);
         printf("  header integrity    : %s\n", header_ok ? "OK" : "MISMATCH");
+        if (authenticated) {
+            const char *auth = auth_status == JCE_ARCHIVE_AUTH_VALID ? "OK" :
+                (auth_status == JCE_ARCHIVE_AUTH_INVALID ? "INVALID" :
+                                                            "KEY REQUIRED");
+            printf("  authentication      : %s\n", auth);
+        }
         if (dict_count) {
             printf("\n  dictionaries:\n");
             for (uint16_t d = 0; d < dict_count; d++) {
@@ -940,7 +951,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
     }
 
     uint64_t tot_orig = 0, tot_stored = 0;
-    uint32_t stored_cnt = 0, comp_cnt = 0, enc_cnt = 0;
+    uint32_t stored_cnt = 0, comp_cnt = 0, enc_cnt = 0, auth_cnt = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         const JceArchiveEntry *e = jce_archive_get(ar, i);
@@ -950,6 +961,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
         tot_stored += e->stored_size;
         if (e->compression == JARC_COMP_NONE) stored_cnt++; else comp_cnt++;
         if (e->entry_flags & JARC_ENTRY_ENCRYPTED) enc_cnt++;
+        if (e->entry_flags & JARC_ENTRY_AUTHENTICATED) auth_cnt++;
 
         if (!quiet) {
             const char *p = jce_archive_debug_path(ar, i);
@@ -967,6 +979,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
             size_t fi = 0;
             if (e->entry_flags & JARC_ENTRY_PAGE_ALIGNED) fl[fi++] = 'P';
             if (e->entry_flags & JARC_ENTRY_ENCRYPTED)    fl[fi++] = 'E';
+            if (e->entry_flags & JARC_ENTRY_AUTHENTICATED) fl[fi++] = 'A';
             if (dup_flag && dup_flag[i])                  fl[fi++] = 'D';
             if (vstate) fl[fi++] = (vstate[i] == 1 ? 'v' : (vstate[i] == 0 ? 'X' : 's'));
             if (fi == 0) fl[fi++] = '-';
@@ -1018,6 +1031,12 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
                   (flags & JARC_FLAG_HAS_DEBUG_PATHS) ? "true" : "false");
         bb_printf(&b, "    \"encrypted\": %s,\n",
                   (flags & JARC_FLAG_ENCRYPTED) ? "true" : "false");
+        bb_printf(&b, "    \"secure_index\": %s,\n",
+                  secure_index ? "true" : "false");
+        bb_printf(&b, "    \"authenticated\": %s,\n",
+                  authenticated ? "true" : "false");
+        bb_printf(&b, "    \"auth_verified\": %s,\n",
+                  auth_status == JCE_ARCHIVE_AUTH_VALID ? "true" : "false");
         bb_printf(&b, "    \"mmap_friendly\": %s,\n",
                   (flags & JARC_FLAG_MMAP_FRIENDLY) ? "true" : "false");
         bb_printf(&b, "    \"entry_count\": %u,\n", (unsigned)entry_count);
@@ -1059,6 +1078,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
         bb_printf(&b, "  \"totals\": {\"entries\": %u, \"original_size\": %llu, "
                       "\"stored_size\": %llu, \"ratio\": %.6f, \"stored_count\": %u, "
                       "\"compressed_count\": %u, \"encrypted_count\": %u, "
+                      "\"authenticated_count\": %u, \"plain_count\": %u, "
                       "\"duplicate_groups\": %u, \"duplicate_entries\": %u, "
                       "\"duplicate_wasted_bytes\": %llu, "
                       "\"duplicate_reclaimed_bytes\": %llu, \"verify_ran\": %s, "
@@ -1067,6 +1087,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
                   (unsigned)n, (unsigned long long)tot_orig,
                   (unsigned long long)tot_stored, tratio,
                   (unsigned)stored_cnt, (unsigned)comp_cnt, (unsigned)enc_cnt,
+                  (unsigned)auth_cnt, (unsigned)(n - enc_cnt),
                   (unsigned)dup_groups, (unsigned)dup_entries,
                   (unsigned long long)dup_wasted,
                   (unsigned long long)dup_reclaimed, verify ? "true" : "false",
@@ -1102,6 +1123,9 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
                       (e->entry_flags & JARC_ENTRY_PAGE_ALIGNED) ? "true" : "false");
             bb_printf(&b, ", \"encrypted\": %s",
                       (e->entry_flags & JARC_ENTRY_ENCRYPTED) ? "true" : "false");
+            bb_printf(&b, ", \"authenticated\": %s",
+                      (e->entry_flags & JARC_ENTRY_AUTHENTICATED)
+                          ? "true" : "false");
             bb_printf(&b, ", \"duplicate\": %s",
                       (dup_flag && dup_flag[i]) ? "true" : "false");
             if (vstate && vstate[i] >= 0)
@@ -1121,6 +1145,10 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
     free(dtbl);
     free(dup_flag);
     free(vstate);
+    if (!header_ok) return 1;
+    if (authenticated && key && auth_status != JCE_ARCHIVE_AUTH_VALID)
+        return 1;
+    if (verify && (corrupt_cnt != 0 || skipped_cnt != 0)) return 1;
     return 0;
 }
 
@@ -1148,6 +1176,7 @@ typedef struct {
                             generator uses the same names. */
     int zstd_level;    /* 1..22; default 3                                */
     int no_store_opt;  /* 1 to disable STORED auto-detection             */
+    int emit_debug_paths; /* 1 to retain virtual paths in the archive    */
     char inspect_file[1024]; /* if set: inspect this archive, skip packing */
     char json_file[1024];    /* optional BOM JSON output path             */
     int  quiet;              /* suppress the console bill-of-materials     */
@@ -1172,11 +1201,11 @@ static void usage(void) {
             "              [--symbol-prefix <ident>]    C/COFF symbol base (default: assets_pak_data)\n"
             "              [--level         <1..22>]    ZSTD level (default: 3)\n"
             "              [--no-store-opt]             disable already-compressed bypass\n"
-            "              [--encrypt-key-file <key.hex>]  ChaCha20-encrypt EVERY entry with the\n"
-            "                                           32-byte key (64 hex chars, e.g. the\n"
-            "                                           project's .jce/pak_key.hex).  Deters\n"
-            "                                           casual extraction only — the key must\n"
-            "                                           ship with the game (no MAC).\n"
+            "              [--strip-debug-paths]        omit virtual-path strings from the archive\n"
+            "              [--encrypt-key-file <key.hex>]  Secure EVERY entry with keyed IDs,\n"
+            "                                           ChaCha20, and HMAC-SHA-256 using the\n"
+            "                                           32-byte project key (64 hex chars).\n"
+            "                                           The key still ships with the client.\n"
             "\n"
             "  Inspect mode (read an existing archive, emit a bill-of-materials):\n"
             "    jce_pak --inspect <archive.pak> [--json <out.json>] [--quiet] [--verify]\n"
@@ -1184,7 +1213,8 @@ static void usage(void) {
             "  --verify decompresses every entry and checks its content CRC (deep audit).\n"
             "  --key-file supplies the decryption key so ENCRYPTED entries verify too\n"
             "  (otherwise they are skipped).\n"
-            "  In pack mode, --json <out.json> also writes a BOM of the produced .pak.\n"
+            "  In pack mode, --json <out.json> also writes and deep-verifies a BOM\n"
+            "  of the produced .pak; a failed integrity check fails the pack.\n"
             "\n"
             "  --exclude-suffix skips any file whose path ends with the suffix\n"
             "  (case-sensitive).  Used to drop platform-irrelevant shader binaries\n"
@@ -1231,6 +1261,7 @@ static Args parse_args(int argc, char *const argv[]) {
     strcpy(a.sym_prefix, "assets_pak_data");
     a.zstd_level = 3;
     a.no_store_opt = 0;
+    a.emit_debug_paths = 1;
 
     /* Safety default: raw_assets is source-only and must never be packed. */
     snprintf(a.exclude_segments[a.exclude_segment_count],
@@ -1295,6 +1326,8 @@ static Args parse_args(int argc, char *const argv[]) {
             ++i;
         } else if (strcmp(arg, "--no-store-opt") == 0) {
             a.no_store_opt = 1;
+        } else if (strcmp(arg, "--strip-debug-paths") == 0) {
+            a.emit_debug_paths = 0;
         } else if (strcmp(arg, "--inspect") == 0 && val) {
             snprintf(a.inspect_file, sizeof(a.inspect_file), "%s", val);
             ++i;
@@ -1438,22 +1471,22 @@ int main(int argc, char *argv[]) {
     cfg.zstd_level       = args.zstd_level;
     cfg.alignment_log2   = 4;
     cfg.mmap_friendly    = false;
-    cfg.emit_debug_paths = true;  /* populate JcePakAsset.path at runtime */
+    cfg.emit_debug_paths = args.emit_debug_paths;
     cfg.compress_index   = true;
     cfg.use_dict         = true;  /* train JSON/TEXT/SHADER dictionaries  */
     cfg.dedup_content    = true;  /* coalesce byte-identical payloads      */
 
-    /* --encrypt-key-file: compress-then-ChaCha20 every entry; the label
-     * matches the engine's embedded-PAK convention so the same path in a
-     * bundle never shares a keystream with the PAK copy. */
+    /* --encrypt-key-file: secure every entry and omit the recoverable path
+     * table.  The label matches the embedded project-PAK convention. */
     uint8_t pack_key[32];
     if (args.encrypt_key_file[0]) {
         load_key_file(args.encrypt_key_file, pack_key);
         cfg.encrypt        = true;
         cfg.encryption_key = pack_key;
         cfg.encrypt_label  = "project_assets";
-        printf("[jce_pak] payload encryption: ENABLED (deters casual "
-               "extraction; key ships with the game)\n");
+        cfg.emit_debug_paths = false;
+        printf("[jce_pak] secure assets: ENABLED (keyed index + ChaCha20 + "
+               "HMAC-SHA-256; key ships with the client)\n");
     }
 
     void    *pak_blob   = NULL;
@@ -1472,6 +1505,8 @@ int main(int argc, char *argv[]) {
     {
         JceArchive *ar = jce_archive_open(pak_blob, pak_size);
         if (ar) {
+            if (args.encrypt_key_file[0])
+                jce_archive_set_decryption_key(ar, pack_key);
             for (size_t i = 0; i < num_entries; i++) {
                 const JceArchiveEntry *ae = jce_archive_find(ar, entries[i].rel_path);
                 if (ae) {
@@ -1508,10 +1543,17 @@ int main(int argc, char *argv[]) {
         bb_free(&mf);
     }
 
-    /* Optional bill-of-materials JSON for the just-produced archive. */
-    if (args.json_file[0])
-        cmd_inspect(args.pak_file, args.json_file, 1, 0,
-                    args.encrypt_key_file[0] ? pack_key : inspect_key_p);
+    /* A build report is also a full integrity gate: it walks every entry,
+     * decompresses it and checks its recorded checksum before the wrapper is
+     * emitted. This is build-time only, never a runtime startup cost. */
+    int bom_status = 0;
+    if (args.json_file[0]) {
+        bom_status = cmd_inspect(args.pak_file, args.json_file, 1, 1,
+                                 args.encrypt_key_file[0] ? pack_key
+                                                                : inspect_key_p);
+        if (bom_status != 0)
+            fprintf(stderr, "[jce_pak] generated archive failed BOM integrity audit\n");
+    }
 
     /* COFF .obj */
     if (strcmp(args.obj_format, "coff") == 0 && args.obj_file[0]) {
@@ -1563,5 +1605,5 @@ int main(int argc, char *argv[]) {
     }
     free(entries);
 
-    return 0;
+    return bom_status;
 }

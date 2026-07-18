@@ -107,8 +107,17 @@ void jce_ozz_skeleton_evaluate(JceOzzSkeleton  *s,
 
     const uint32_t count = s->num_joints < max_joints ? s->num_joints : max_joints;
 
-    /* Temporary buffer for ozz-format globals. */
-    std::vector<ozz::math::Float4x4> globals(count);
+    /* Temporary buffer for ozz-format globals.  Render callers stay
+     * <=128 joints and call this per instance per frame from the parallel
+     * sample workers — use the stack there (8KB, 16B-aligned for SIMD);
+     * heap only for oversized tool paths. */
+    alignas(16) ozz::math::Float4x4 stack_globals[128];
+    std::vector<ozz::math::Float4x4> heap_globals;
+    ozz::math::Float4x4 *globals = stack_globals;
+    if (count > 128) {
+        heap_globals.resize(count);
+        globals = heap_globals.data();
+    }
 
     for (uint32_t i = 0; i < count; ++i) {
         ozz::math::Float4x4 local = to_ozz(local_transforms[i]);

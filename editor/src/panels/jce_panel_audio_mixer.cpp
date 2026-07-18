@@ -2,9 +2,10 @@
  * jce_panel_audio_mixer.cpp  Audio Mixer window (Sprint 2 / 0.8.17)
  *
  * Editor-side authoring surface for the engine's hierarchical audio
- * mixer (jce_audio_mixer.h). Owns one JceAudioMixer instance per editor
- * session, persisted to .jce/audio_mixer.json, that the play-mode audio
- * engine can later consume to drive bus gains at runtime.
+ * mixer (jce_audio_mixer.h). Owns one JceAudioMixer instance per open
+ * project, persisted to <root>/Settings/audio_mixer.json (game content —
+ * ships with the game, version-controllable), that the play-mode audio
+ * engine and the standalone runtime consume to drive bus gains.
  *
  * UI mirrors Unity's "Audio Mixer" window:
  *   - Tree of buses (Master + arbitrary children) with name, volume,
@@ -43,12 +44,26 @@ extern "C" {
 }
 
 #include "core/jce_editor_state.h"
-#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (legacy ~/.jce) */
 
-/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+/* Open-project root — owned by dialog_project.cpp (same explicit-root
+ * pattern as jce_project_settings / jce_pak_key).  Declared at global
+ * scope: inside an anonymous namespace the extern would acquire internal
+ * linkage and never bind to the definition. */
+extern char s_current_project_root[512];
+
+/* Mixer routing is game CONTENT: it belongs to the project (version control,
+ * shipped builds), so it lives beside Settings/RenderPipeline.rp.json under
+ * the OPEN project's root, resolved through the explicit root — the editor
+ * never chdirs.  Without a project we fall back to the legacy per-user
+ * ~/.jce copy so behaviour there is unchanged. */
 static const char *mixer_path(void) {
-    static char p[1024]; static bool init = false;
-    if (!init) { jce_editor_dotjce_path("audio_mixer.json", p, sizeof(p)); init = true; }
+    static char p[1024];
+    if (s_current_project_root[0])
+        std::snprintf(p, sizeof(p), "%s/Settings/audio_mixer.json",
+                      s_current_project_root);
+    else
+        jce_editor_dotjce_path("audio_mixer.json", p, sizeof(p));
     return p;
 }
 #define MIXER_PATH mixer_path()
@@ -146,7 +161,10 @@ static void mixer_save(void)
      * per-bus effects / snapshots) has no fixed-size buffer ceiling. */
     std::string out;
     out.reserve(1024 + n * 256);
-    out += "{\n  \"buses\": [\n";
+    /* "version" gives future breaking schema changes something to gate on;
+     * both readers (mixer_load + engine jce_audio_mixer_config.c) are
+     * key-scanning and tolerate files with or without it. */
+    out += "{\n  \"version\": 1,\n  \"buses\": [\n";
 
     char row[512];
     for (uint32_t i = 0; i < n; ++i) {
@@ -163,16 +181,19 @@ static void mixer_save(void)
             jce_audio_mixer_is_solo(s_mixer, id)  ? 1 : 0);
         out += row;
 
-        /* Aux sends from this bus. */
+        /* Aux sends from this bus.  Enumerated (send_at), not probed via
+         * get_send: get_send returns 0 for both "no send" and "registered
+         * but silent", so probing silently dropped amount-0 sends on save. */
         std::string sends;
-        for (uint32_t j = 0; j < n; ++j) {
-            if (ids[j] == id) continue;
-            float amt = jce_audio_mixer_get_send(s_mixer, id, ids[j]);
-            if (amt <= 0.0f) continue;
+        uint32_t send_n = jce_audio_mixer_send_count(s_mixer, id);
+        for (uint32_t j = 0; j < send_n; ++j) {
+            JceAudioBusId dest = JCE_AUDIO_BUS_INVALID;
+            float amt = 0.0f;
+            if (!jce_audio_mixer_send_at(s_mixer, id, j, &dest, &amt)) break;
             std::snprintf(row, sizeof(row),
                 "%s{ \"dest\": %u, \"amount\": %.4f }",
                 sends.empty() ? "" : ", ",
-                (unsigned)ids[j], (double)amt);
+                (unsigned)dest, (double)amt);
             sends += row;
         }
         if (!sends.empty()) {
@@ -236,7 +257,32 @@ static void mixer_save(void)
     }
     out += "\n}\n";
 
-    ed_write_file(MIXER_PATH, out.data(), out.size());
+    /* Project Settings/ dir may not exist yet (fresh project). */
+    if (s_current_project_root[0]) {
+        char dir[1024];
+        std::snprintf(dir, sizeof(dir), "%s/Settings", s_current_project_root);
+        jce_fs_host_create_directory(dir);
+    }
+    /* Atomic (temp+rename): a mid-write crash must not corrupt the mixer
+     * file — it seeds the runtime mixer at Play start and bundle builds. */
+    jce_fs_host_write_all_atomic(MIXER_PATH, out.data(), out.size());
+}
+
+/* Deferred-save latch: FX-insert and sidechain DragFloats report a change on
+ * EVERY drag frame; saving per change frame rewrote Settings/audio_mixer.json
+ * continuously during a drag (full serialize + disk write per frame).  Latch
+ * instead and flush ONCE when the drag releases (no active item).  Structural
+ * edits (add/remove/reorder/enable) keep their immediate saves.  Live audio
+ * behaviour is unchanged — engine-side jce_audio_mixer_set_* still runs per
+ * change frame; only the disk write is deferred. */
+static bool s_param_save_pending = false;
+
+static void mixer_flush_param_saves(void)
+{
+    if (s_param_save_pending && !ImGui::IsAnyItemActive()) {
+        s_param_save_pending = false;
+        mixer_save();
+    }
 }
 
 static void mixer_seed_default(void)
@@ -369,7 +415,9 @@ static bool mixer_load(void)
     s_bus_effects.clear();
 
     /* Locate the buses array; bound bus parsing to it so snapshot/volume
-     * "id" keys are never mistaken for bus rows. */
+     * "id" keys are never mistaken for bus rows.  A top-level "version" key
+     * may precede it (absent in pre-version files) — the scanners key on
+     * names, so both forms parse identically. */
     const char *buses_key = std::strstr(raw, "\"buses\"");
     const char *buses_beg = buses_key ? std::strchr(buses_key, '[') : nullptr;
     if (!buses_beg) { ED_FREE(raw); return true; }
@@ -461,7 +509,9 @@ static bool mixer_load(void)
                     scan_uint (so, sc, "\"dest\"",   &dest);
                     scan_float(so, sc, "\"amount\"", &amt);
                     auto dit = id_map.find(dest);
-                    if (dit != id_map.end() && amt > 0.0f)
+                    /* amount 0 = registered-but-silent (valid authored
+                     * state); reject only negative garbage. */
+                    if (dit != id_map.end() && amt >= 0.0f)
                         jce_audio_mixer_set_send(s_mixer, b.live, dit->second, amt);
                     q = sc + 1;
                 }
@@ -531,12 +581,50 @@ static bool mixer_load(void)
     return true;
 }
 
+/* One-time forward-migration: older editors stored the mixer per-user in
+ * ~/.jce/audio_mixer.json, where two projects clobbered each other.  If the
+ * open project has no copy yet but the legacy one exists, copy it forward,
+ * then rename the old file *.migrated so it can never shadow project copies
+ * (a second project migrating later starts from its own defaults instead of
+ * inheriting the first project's routing). */
+static void migrate_legacy_mixer(void)
+{
+    if (!s_current_project_root[0]) return;   /* no project: legacy IS the store */
+    if (jce_fs_host_exists_file(MIXER_PATH)) return;   /* project copy wins */
+    char legacy[1024];
+    jce_editor_dotjce_path("audio_mixer.json", legacy, sizeof(legacy));
+    if (!legacy[0] || !jce_fs_host_exists_file(legacy)) return;
+    char dir[1024];
+    std::snprintf(dir, sizeof(dir), "%s/Settings", s_current_project_root);
+    jce_fs_host_create_directory(dir);
+    if (!jce_fs_host_copy_file(legacy, MIXER_PATH)) return;
+    char moved[1040];
+    std::snprintf(moved, sizeof(moved), "%s.migrated", legacy);
+    jce_fs_host_rename(legacy, moved);
+}
+
+/* Project root the current mixer tree was loaded for. */
+static char s_mixer_root[512] = {0};
+
 static void ensure_mixer(void)
 {
+    /* The store is project-scoped: follow the open project so a project
+     * switch drops the previous project's tree instead of writing it into
+     * the new project's file. */
+    if (s_initialized &&
+        std::strcmp(s_mixer_root, s_current_project_root) != 0) {
+        s_initialized = false;
+        if (s_mixer) { jce_audio_mixer_destroy(s_mixer); s_mixer = nullptr; }
+        s_bus_effects.clear();
+        s_selected_bus = JCE_AUDIO_BUS_MASTER;
+    }
     if (s_initialized) return;
     s_initialized = true;
+    std::snprintf(s_mixer_root, sizeof(s_mixer_root), "%s",
+                  s_current_project_root);
     if (!s_mixer) s_mixer = jce_audio_mixer_create();
     if (!s_mixer) return;
+    migrate_legacy_mixer();
     if (!mixer_load()) {
         mixer_seed_default();
         mixer_save();
@@ -699,7 +787,9 @@ static void draw_inserts_section(JceAudioBusId bus)
         char hdr[64];
         std::snprintf(hdr, sizeof(hdr), "%u. %s", (unsigned)i, tn);
         if (ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
-            draw_effect_params(chain[i], dirty);
+            bool param_edit = false;
+            draw_effect_params(chain[i], param_edit);
+            if (param_edit) s_param_save_pending = true;
             ImGui::BeginDisabled(i == 0);
             if (ImGui::SmallButton(jce_editor_i18n("audioMixer.fx.up"))) {
                 std::swap(chain[i], chain[i - 1]); dirty = true;
@@ -744,6 +834,19 @@ static void draw_inserts_section(JceAudioBusId bus)
     if (dirty) mixer_save();
 }
 
+/* True when `src` has a REGISTERED send to `dest`.  get_send can't answer
+ * this: it returns 0 for both "no send" and "registered but silent". */
+static bool bus_has_send(JceAudioBusId src, JceAudioBusId dest)
+{
+    uint32_t sn = jce_audio_mixer_send_count(s_mixer, src);
+    for (uint32_t i = 0; i < sn; ++i) {
+        JceAudioBusId d = JCE_AUDIO_BUS_INVALID;
+        if (jce_audio_mixer_send_at(s_mixer, src, i, &d, nullptr) && d == dest)
+            return true;
+    }
+    return false;
+}
+
 /* Aux sends originating from the selected bus. */
 static void draw_sends_section(JceAudioBusId bus,
                                const JceAudioBusId *all, uint32_t n)
@@ -754,8 +857,10 @@ static void draw_sends_section(JceAudioBusId bus,
     for (uint32_t i = 0; i < n; ++i) {
         JceAudioBusId dest = all[i];
         if (dest == bus) continue;
+        /* Registration, not amount, decides visibility: a send dialled to 0
+         * stays editable instead of vanishing (and being lost on save). */
+        if (!bus_has_send(bus, dest)) continue;
         float amt = jce_audio_mixer_get_send(s_mixer, bus, dest);
-        if (amt <= 0.0f) continue;
         ImGui::PushID((int)dest);
         const char *dn = jce_audio_mixer_get_name(s_mixer, dest);
         ImGui::TextUnformatted(dn ? dn : "?");
@@ -779,7 +884,7 @@ static void draw_sends_section(JceAudioBusId bus,
     std::vector<const char *>  target_names;
     for (uint32_t i = 0; i < n; ++i) {
         if (all[i] == bus) continue;
-        if (jce_audio_mixer_get_send(s_mixer, bus, all[i]) > 0.0f) continue;
+        if (bus_has_send(bus, all[i])) continue;
         targets.push_back(all[i]);
         const char *tn = jce_audio_mixer_get_name(s_mixer, all[i]);
         target_names.push_back(tn ? tn : "?");
@@ -856,10 +961,10 @@ static void draw_sidechain_section(JceAudioBusId bus,
         if (ImGui::DragFloat(jce_editor_i18n("audioMixer.sc.floor"),
                              &dp.max_attenuation_db, 0.1f, -60.0f, 0.0f, "%.1f dB")) ch = true;
         if (ch) {
-            /* Re-install with the edited params.  Live edits persist on every
-             * change frame; cheap because the sidechain table is per-bus. */
+            /* Re-install with the edited params every change frame (cheap,
+             * in-memory) but defer the disk write to the drag-release latch. */
             jce_audio_mixer_set_sidechain(s_mixer, bus, &dp, 48000u);
-            dirty = true;
+            s_param_save_pending = true;
         }
     }
 
@@ -1169,6 +1274,9 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
         }
         ImGui::EndTabBar();
     }
+
+    /* Flush any parameter-drag save once the drag has released. */
+    mixer_flush_param_saves();
 }
 
 extern "C" void jce_editor_audio_mixer_focus_reverb_tab(void)

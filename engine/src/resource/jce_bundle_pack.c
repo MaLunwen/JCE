@@ -15,9 +15,11 @@
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_cook.h>
 
 #include "jce_cook_policy.h"
+#include "jce_bundle_contract_internal.h"
 #include "os/core/jce_memory.h"
 
 #include <limits.h>
@@ -27,7 +29,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_bundle_deps.h>
@@ -177,7 +178,6 @@ static char *pack_cjson_print_owned(const cJSON *item, size_t *out_len,
 /* Small dynamic vectors                                                */
 /* ================================================================== */
 
-typedef struct { char **items; size_t n, c; } StrVec;
 static void sv_push(StrVec *v, const char *s) {
     if (v->n == v->c) {
         v->c = v->c ? v->c * 2 : 16;
@@ -604,31 +604,6 @@ static int can_read_asset(const char *vpath, const char *resource_root,
 /* P0-build-bundles-cook: in-process asset cooking                     */
 /* ================================================================== */
 
-typedef enum {
-    COOK_CLASS_NONE = 0,
-    COOK_CLASS_TEXTURE,
-    COOK_CLASS_MODEL,
-    COOK_CLASS_AUDIO
-} CookClass;
-
-static CookClass classify_cook(const char *vpath)
-{
-    if (!vpath) return COOK_CLASS_NONE;
-    if (ends_with_ci(vpath, ".png")  || ends_with_ci(vpath, ".jpg") ||
-        ends_with_ci(vpath, ".jpeg") || ends_with_ci(vpath, ".tga") ||
-        ends_with_ci(vpath, ".bmp"))
-        return COOK_CLASS_TEXTURE;
-    if (ends_with_ci(vpath, ".obj")  || ends_with_ci(vpath, ".fbx") ||
-        ends_with_ci(vpath, ".dae")  || ends_with_ci(vpath, ".gltf") ||
-        ends_with_ci(vpath, ".glb"))
-        return COOK_CLASS_MODEL;
-    if (ends_with_ci(vpath, ".wav")  || ends_with_ci(vpath, ".ogg") ||
-        ends_with_ci(vpath, ".flac") || ends_with_ci(vpath, ".opus") ||
-        ends_with_ci(vpath, ".mp3"))
-        return COOK_CLASS_AUDIO;
-    return COOK_CLASS_NONE;
-}
-
 /* Map an import.json target_format string to a JCEASSET_TEXFMT_* value.
  * Returns -1 for "auto"/unknown so the caller falls back to platform auto. */
 static int cook_parse_texfmt(const char *s)
@@ -688,7 +663,7 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
     if (st) { st->failed = false; st->err[0] = '\0'; }
     if (!raw || raw_size == 0) return raw;
 
-    CookClass cls = classify_cook(vpath);
+    CookClass cls = jce_bundle_classify_cook(vpath);
     if (cls == COOK_CLASS_NONE) return raw;
 
     /* LUT strip PNGs must ship as raw PNG bytes — jce_texture_load_lut_3d
@@ -840,7 +815,7 @@ static void cook_jobs_range(int begin, int end, void *user)
 }
 
 static int write_file(const char *path, const void *data, size_t size) {
-    return jce_fs_host_write_all(path, data, (uint64_t)size) ? 1 : 0;
+    return jce_fs_host_write_all_atomic(path, data, (uint64_t)size) ? 1 : 0;
 }
 
 static void mkdir_p(const char *path) {
@@ -942,15 +917,6 @@ static void am_free(AssetMap *m) {
     JCE_FREE(m->items); m->items = NULL; m->n = m->c = 0;
 }
 
-typedef struct {
-    char  *id;
-    char  *kind;
-    char  *scene_path;     /* vpath inside the bundle (where the engine loads it) */
-    char  *scene_src_path; /* absolute host path of the scene file (NULL for shared) */
-    StrVec assets;
-    StrVec deps;
-} Bundle;
-
 typedef struct { Bundle *items; size_t n, c; } BundleVec;
 
 static Bundle *bv_get(BundleVec *v, const char *id) {
@@ -1000,7 +966,10 @@ static void bundle_add_dep(Bundle *b, const char *dep) {
 typedef struct DepStage {
     JceBundleDepList *deps;
     AssetMap         *am;
+    JceBundleDependencyEdges *edges;
     const char       *scene_id;
+    const char       *parent;
+    const char       *origin;
 } DepStage;
 
 /* Push `vpath` if not already present.  Returns true when newly
@@ -1010,6 +979,8 @@ static bool stage_push_dep(DepStage *st, const char *vpath,
                            const char *bundle_tag)
 {
     if (!vpath || !vpath[0]) return false;
+    if (!jce_bundle_edges_add(st->edges, st->parent, vpath, st->origin))
+        die("oom");
     JceBundleDepList *deps = st->deps;
     for (uint32_t e = 0; e < deps->count; ++e) {
         if (deps->items[e].path &&
@@ -1034,6 +1005,28 @@ static bool stage_push_dep(DepStage *st, const char *vpath,
     if (bundle_tag && !r->override)
         r->override = pack_strdup(bundle_tag);
     return true;
+}
+
+static void stage_dependency_document(
+    DepStage *stage, const JceBundleDependencyDocument *document,
+    const char *source, const char *resource_root,
+    PackResolveFn resolve_fn, void *resolve_user)
+{
+    for (uint32_t i = 0; i < document->assets.count; ++i) {
+        const JceBundleDep *dep = &document->assets.items[i];
+        (void)stage_push_dep(stage, dep->path, dep->bundle);
+    }
+
+    for (uint32_t i = 0; i < document->optional_assets.count; ++i) {
+        const JceBundleDep *dep = &document->optional_assets.items[i];
+        if (can_read_asset(dep->path, resource_root, resolve_fn,
+                           resolve_user, NULL)) {
+            (void)stage_push_dep(stage, dep->path, dep->bundle);
+        } else {
+            pack_log_warn("optional dependency missing: %s (declared by %s)",
+                          dep->path, source);
+        }
+    }
 }
 
 /* Game-content localization: jce_loc_set_source_pak() expects locale
@@ -1145,12 +1138,90 @@ static char *make_scene_vpath(const char *full_path, const char *resource_root) 
 /* JPAK v1 builder                                                      */
 /* ================================================================== */
 
+#define JCE_BUNDLE_CANONICAL_PATH_CAP 2048u
+
 typedef struct {
-    char    *vpath;
-    uint8_t *raw;
-    size_t   raw_size;
-    uint64_t content_hash;
-} PakEntry;
+    char    *path;
+    uint64_t id;
+} CanonicalAddress;
+
+static size_t canonical_entry_path(const char *path, char *out, size_t out_cap)
+{
+    if (!path || !path[0])
+        return 0;
+    return jce_archive_normalize_path(path, out, out_cap);
+}
+
+static bool bundle_owns_address(const Bundle *bundle, const char *address)
+{
+    char canonical[JCE_BUNDLE_CANONICAL_PATH_CAP];
+    if (bundle->scene_path &&
+        canonical_entry_path(bundle->scene_path, canonical,
+                             sizeof(canonical)) > 0 &&
+        strcmp(canonical, address) == 0)
+        return true;
+    for (size_t i = 0; i < bundle->assets.n; ++i) {
+        if (canonical_entry_path(bundle->assets.items[i], canonical,
+                                 sizeof(canonical)) > 0 &&
+            strcmp(canonical, address) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool validate_entry_addresses(const PakEntry *entries, size_t count)
+{
+    CanonicalAddress *addresses = (CanonicalAddress *)JCE_CALLOC(
+        count ? count : 1, sizeof(*addresses));
+    if (!addresses)
+        die("oom");
+
+    bool valid = true;
+    for (size_t i = 0; i < count; ++i) {
+        char canonical[JCE_BUNDLE_CANONICAL_PATH_CAP];
+        size_t len = canonical_entry_path(entries[i].vpath, canonical,
+                                          sizeof(canonical));
+        if (len == 0) {
+            ERR("invalid virtual asset address: '%s'",
+                entries[i].vpath ? entries[i].vpath : "(null)");
+            valid = false;
+            break;
+        }
+        if (strcmp(canonical, JCE_BUNDLE_MANIFEST_VPATH) == 0) {
+            ERR("asset address is reserved by the bundle contract: '%s'",
+                entries[i].vpath);
+            valid = false;
+            break;
+        }
+
+        addresses[i].path = pack_strdup(canonical);
+        addresses[i].id = jce_archive_hash_normalized(canonical, len);
+        if (!addresses[i].path || addresses[i].id == 0)
+            die("oom");
+
+        for (size_t j = 0; j < i; ++j) {
+            if (strcmp(addresses[j].path, canonical) == 0) {
+                ERR("canonical address collision: '%s' and '%s' -> '%s'",
+                    entries[j].vpath, entries[i].vpath, canonical);
+                valid = false;
+                break;
+            }
+            if (addresses[j].id == addresses[i].id) {
+                ERR("asset id hash collision: '%s' and '%s'",
+                    addresses[j].path, canonical);
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+            break;
+    }
+
+    for (size_t i = 0; i < count; ++i)
+        JCE_FREE(addresses[i].path);
+    JCE_FREE(addresses);
+    return valid;
+}
 
 static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
                               bool encrypt, const uint8_t *encryption_key,
@@ -1171,7 +1242,10 @@ static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
     JceCookConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.zstd_level       = zstd_level;
-    cfg.emit_debug_paths = true;
+    /* Shipping encryption also keys the index.  A recoverable debug-path
+     * table would defeat that protection and is rejected by the archive
+     * writer, so retain paths only for plain development bundles. */
+    cfg.emit_debug_paths = !encrypt;
     cfg.compress_index   = true;
     cfg.use_dict         = true;
     cfg.dedup_content    = true;
@@ -1213,175 +1287,6 @@ static char *short_hash(uint64_t h) {
     return r;
 }
 
-static cJSON *build_contract(const char *name, uint32_t major, uint32_t minor) {
-    cJSON *c = cJSON_CreateObject();
-    cJSON_AddStringToObject(c, JCE_BUNDLE_KEY_CONTRACT_NAME, name);
-    cJSON_AddNumberToObject(c, JCE_BUNDLE_KEY_CONTRACT_MAJOR, major);
-    cJSON_AddNumberToObject(c, JCE_BUNDLE_KEY_CONTRACT_MINOR, minor);
-    return c;
-}
-
-static char *build_manifest(const Bundle *b, const PakEntry *entries,
-                            size_t entry_count, uint64_t content_hash,
-                            uint32_t version, bool encrypted, size_t *out_len) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, JCE_BUNDLE_KEY_CONTRACT,
-        build_contract(JCE_BUNDLE_MANIFEST_CONTRACT_NAME,
-                       JCE_BUNDLE_MANIFEST_CONTRACT_MAJOR,
-                       JCE_BUNDLE_MANIFEST_CONTRACT_MINOR));
-    cJSON_AddStringToObject(root, JCE_BUNDLE_KEY_ID, b->id);
-    cJSON_AddNumberToObject(root, JCE_BUNDLE_KEY_VERSION, version);
-    char *hex = hex16(content_hash);
-    cJSON_AddStringToObject(root, JCE_BUNDLE_KEY_CONTENT_HASH, hex);
-    JCE_FREE(hex);
-    cJSON_AddStringToObject(root, JCE_BUNDLE_KIND_KEY, b->kind);
-    cJSON_AddBoolToObject(root, JCE_BUNDLE_KEY_ENCRYPTED, encrypted);
-    if (b->scene_path)
-        cJSON_AddStringToObject(root, JCE_BUNDLE_KEY_SCENE_PATH, b->scene_path);
-
-    cJSON *deps = cJSON_AddArrayToObject(root, JCE_BUNDLE_KEY_DEPENDS_ON);
-    for (size_t i = 0; i < b->deps.n; ++i)
-        cJSON_AddItemToArray(deps, cJSON_CreateString(b->deps.items[i]));
-
-    cJSON *assets = cJSON_AddArrayToObject(root, JCE_BUNDLE_KEY_ASSETS);
-    for (size_t i = 0; i < entry_count; ++i) {
-        const PakEntry *e = &entries[i];
-        if (strcmp(e->vpath, JCE_BUNDLE_MANIFEST_VPATH) == 0) continue;
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, JCE_BUNDLE_KEY_ASSET_PATH, e->vpath);
-        cJSON_AddNumberToObject(o, JCE_BUNDLE_KEY_ASSET_SIZE, (double)e->raw_size);
-        char *eh = hex16(e->content_hash);
-        cJSON_AddStringToObject(o, JCE_BUNDLE_KEY_ASSET_HASH, eh);
-        JCE_FREE(eh);
-        cJSON_AddItemToArray(assets, o);
-    }
-    char *s = pack_cjson_print_owned(root, out_len, false);
-    cJSON_Delete(root);
-    if (!s)
-        die("cJSON_Print manifest failed");
-    return s;
-}
-
-/* Per-asset record captured for the editor build report.  Kept on the
- * CatalogEntry so the post-build report writer can walk one structure
- * regardless of whether the bundle was freshly built or reused from
- * the incremental cache (in which case we rehydrate from the sidecar). */
-typedef struct {
-    char    *path;
-    char    *hash;
-    uint64_t size;
-} ReportEntry;
-
-typedef struct { ReportEntry *items; size_t n, c; } ReportEntryVec;
-
-static ReportEntry *rv_create(ReportEntryVec *v) {
-    if (v->n == v->c) {
-        v->c = v->c ? v->c * 2 : 16;
-        v->items = (ReportEntry *)JCE_REALLOC(v->items, v->c * sizeof(ReportEntry));
-        if (!v->items) die("oom");
-    }
-    ReportEntry *e = &v->items[v->n++];
-    memset(e, 0, sizeof(*e));
-    return e;
-}
-static void rv_free(ReportEntryVec *v) {
-    for (size_t i = 0; i < v->n; ++i) {
-        JCE_FREE(v->items[i].path);
-        JCE_FREE(v->items[i].hash);
-    }
-    JCE_FREE(v->items); v->items = NULL; v->n = v->c = 0;
-}
-
-typedef struct {
-    char *id;
-    char *file;
-    char *kind;
-    char *scene_path;
-    char *content_hash;
-    uint64_t size;
-    bool encrypted;
-    StrVec deps;
-    ReportEntryVec entries;
-} CatalogEntry;
-
-typedef struct { CatalogEntry *items; size_t n, c; } CatalogVec;
-
-static CatalogEntry *cv_create(CatalogVec *v) {
-    if (v->n == v->c) {
-        v->c = v->c ? v->c * 2 : 16;
-        v->items = (CatalogEntry *)JCE_REALLOC(v->items, v->c * sizeof(CatalogEntry));
-        if (!v->items) die("oom");
-    }
-    CatalogEntry *e = &v->items[v->n++];
-    memset(e, 0, sizeof(*e));
-    return e;
-}
-static void cv_free(CatalogVec *v) {
-    for (size_t i = 0; i < v->n; ++i) {
-        JCE_FREE(v->items[i].id);
-        JCE_FREE(v->items[i].file);
-        JCE_FREE(v->items[i].kind);
-        JCE_FREE(v->items[i].scene_path);
-        JCE_FREE(v->items[i].content_hash);
-        sv_free(&v->items[i].deps);
-        rv_free(&v->items[i].entries);
-    }
-    JCE_FREE(v->items); v->items = NULL; v->n = v->c = 0;
-}
-
-static char *build_catalog_json(const CatalogVec *cat, uint32_t version,
-                                size_t *out_len) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, JCE_BUNDLE_KEY_CONTRACT,
-        build_contract(JCE_BUNDLE_CATALOG_CONTRACT_NAME,
-                       JCE_BUNDLE_CATALOG_CONTRACT_MAJOR,
-                       JCE_BUNDLE_CATALOG_CONTRACT_MINOR));
-    cJSON_AddNumberToObject(root, JCE_BUNDLE_CATALOG_KEY_VERSION, version);
-    cJSON *bundles = cJSON_AddObjectToObject(root, JCE_BUNDLE_CATALOG_KEY_BUNDLES);
-    for (size_t i = 0; i < cat->n; ++i) {
-        const CatalogEntry *e = &cat->items[i];
-        cJSON *o = cJSON_AddObjectToObject(bundles, e->id);
-        cJSON_AddStringToObject(o, JCE_BUNDLE_CATALOG_KEY_FILE, e->file);
-        cJSON_AddStringToObject(o, JCE_BUNDLE_CATALOG_KEY_KIND, e->kind);
-        if (e->scene_path)
-            cJSON_AddStringToObject(o, JCE_BUNDLE_CATALOG_KEY_SCENE,
-                                    e->scene_path);
-        cJSON_AddStringToObject(o, JCE_BUNDLE_CATALOG_KEY_HASH, e->content_hash);
-        cJSON_AddNumberToObject(o, JCE_BUNDLE_CATALOG_KEY_SIZE, (double)e->size);
-        cJSON *deps = cJSON_AddArrayToObject(o, JCE_BUNDLE_CATALOG_KEY_DEPS);
-        for (size_t j = 0; j < e->deps.n; ++j)
-            cJSON_AddItemToArray(deps, cJSON_CreateString(e->deps.items[j]));
-    }
-    char *s = pack_cjson_print_owned(root, out_len, false);
-    cJSON_Delete(root);
-    if (!s)
-        die("cJSON_Print catalog failed");
-    return s;
-}
-
-static const char *prev_hash_lookup(const cJSON *prev_catalog, const char *id) {
-    if (!prev_catalog) return NULL;
-    const cJSON *bundles = cJSON_GetObjectItemCaseSensitive(prev_catalog,
-                                JCE_BUNDLE_CATALOG_KEY_BUNDLES);
-    if (!bundles) return NULL;
-    const cJSON *e = cJSON_GetObjectItemCaseSensitive(bundles, id);
-    if (!e) return NULL;
-    const cJSON *h = cJSON_GetObjectItemCaseSensitive(e,
-                                JCE_BUNDLE_CATALOG_KEY_HASH);
-    return (h && cJSON_IsString(h)) ? h->valuestring : NULL;
-}
-static const char *prev_file_lookup(const cJSON *prev_catalog, const char *id) {
-    if (!prev_catalog) return NULL;
-    const cJSON *bundles = cJSON_GetObjectItemCaseSensitive(prev_catalog,
-                                JCE_BUNDLE_CATALOG_KEY_BUNDLES);
-    if (!bundles) return NULL;
-    const cJSON *e = cJSON_GetObjectItemCaseSensitive(bundles, id);
-    if (!e) return NULL;
-    const cJSON *f = cJSON_GetObjectItemCaseSensitive(e,
-                                JCE_BUNDLE_CATALOG_KEY_FILE);
-    return (f && cJSON_IsString(f)) ? f->valuestring : NULL;
-}
-
 static char *load_text_file(const char *path, size_t *out_len) {
     size_t sz = 0;
     uint8_t *b = read_file(path, &sz);
@@ -1391,151 +1296,6 @@ static char *load_text_file(const char *path, size_t *out_len) {
     memcpy(s, b, sz); s[sz] = '\0';
     JCE_FREE(b);
     if (out_len) *out_len = sz;
-    return s;
-}
-
-/* ================================================================== */
-/* Build report (P3-A.4)                                                */
-/* ================================================================== */
-
-/* Filename written next to bundle_catalog.json after a full build.
- * Consumed by editor "Build Report" panel.  Schema version is encoded
- * in the `$schema` field; bump when changing keys. */
-#define JCE_BUILD_REPORT_NAME    "build_report.json"
-#define JCE_BUILD_REPORT_SCHEMA  "jce.buildreport.v1"
-
-/* Best-effort asset-type classification from extension.  Used purely for
- * the editor's filter/grouping affordances — runtime never reads this. */
-static const char *report_guess_type(const char *path) {
-    const char *dot = NULL;
-    for (const char *p = path; *p; ++p) if (*p == '.') dot = p;
-    if (!dot) return "other";
-    char ext[16]; size_t n = 0;
-    for (const char *p = dot + 1; *p && n + 1 < sizeof(ext); ++p) {
-        char c = *p;
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        ext[n++] = c;
-    }
-    ext[n] = '\0';
-    if (is_scene_file_path(path))
-        return "scene";
-    if (strcmp(ext, "gltf") == 0 || strcmp(ext, "glb")  == 0 ||
-        strcmp(ext, "fbx")  == 0 || strcmp(ext, "obj")  == 0 ||
-        strcmp(ext, "mesh") == 0)                          return "mesh";
-    if (strcmp(ext, "png")  == 0 || strcmp(ext, "jpg")  == 0 ||
-        strcmp(ext, "jpeg") == 0 || strcmp(ext, "tga")  == 0 ||
-        strcmp(ext, "bmp")  == 0 || strcmp(ext, "hdr")  == 0 ||
-        strcmp(ext, "ktx")  == 0 || strcmp(ext, "ktx2") == 0 ||
-        strcmp(ext, "basis")== 0 || strcmp(ext, "dds")  == 0 ||
-        strcmp(ext, "webp") == 0)                          return "texture";
-    if (strcmp(ext, "wav")  == 0 || strcmp(ext, "ogg")  == 0 ||
-        strcmp(ext, "mp3")  == 0 || strcmp(ext, "opus") == 0 ||
-        strcmp(ext, "flac") == 0)                          return "audio";
-    if (strcmp(ext, "mp4")  == 0 || strcmp(ext, "webm") == 0 ||
-        strcmp(ext, "mkv")  == 0 || strcmp(ext, "ivf")  == 0)
-        return "video";
-    if (strcmp(ext, "ttf")  == 0 || strcmp(ext, "otf")  == 0)
-        return "font";
-    if (strcmp(ext, "bin")  == 0 || strcmp(ext, "sc")   == 0)
-        return "shader";
-    if (strcmp(ext, "json") == 0)                          return "json";
-    return ext[0] ? ext : "other";
-}
-
-static void iso8601_utc_now(char *buf, size_t n) {
-    time_t t = time(NULL);
-    struct tm tm;
-    struct tm *utc = gmtime(&t);
-    if (utc) tm = *utc;
-    else memset(&tm, 0, sizeof(tm));
-    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &tm);
-}
-
-/* Build the build_report.json document.  Returns malloc'd string;
- * caller frees with JCE_FREE().  *out_len receives strlen. */
-static char *build_report_json(const CatalogVec *cat, size_t *out_len) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "$schema", JCE_BUILD_REPORT_SCHEMA);
-    char ts[32]; iso8601_utc_now(ts, sizeof(ts));
-    cJSON_AddStringToObject(root, "timestamp", ts);
-
-    uint64_t total_bytes = 0;
-    size_t   unique_assets = 0;
-
-    /* Duplicate detection: hash -> { size, bundle ids[] }.  cJSON
-     * map of `hash -> object` is the most compact representation
-     * here; flattened to an array at the end. */
-    cJSON *hash_map = cJSON_CreateObject();
-
-    cJSON *bundles = cJSON_AddArrayToObject(root, "bundles");
-    for (size_t i = 0; i < cat->n; ++i) {
-        const CatalogEntry *e = &cat->items[i];
-        cJSON *bo = cJSON_CreateObject();
-        cJSON_AddStringToObject(bo, "name", e->id);
-        cJSON_AddStringToObject(bo, "file", e->file);
-        cJSON_AddNumberToObject(bo, "size_bytes", (double)e->size);
-        cJSON_AddNumberToObject(bo, "entry_count", (double)e->entries.n);
-        cJSON_AddBoolToObject(bo, "encrypted", e->encrypted);
-        total_bytes += e->size;
-
-        cJSON *deps = cJSON_AddArrayToObject(bo, "dependencies");
-        for (size_t d = 0; d < e->deps.n; ++d)
-            cJSON_AddItemToArray(deps, cJSON_CreateString(e->deps.items[d]));
-
-        cJSON *ents = cJSON_AddArrayToObject(bo, "entries");
-        for (size_t k = 0; k < e->entries.n; ++k) {
-            const ReportEntry *re = &e->entries.items[k];
-            cJSON *eo = cJSON_CreateObject();
-            cJSON_AddStringToObject(eo, "path", re->path ? re->path : "");
-            cJSON_AddNumberToObject(eo, "size_bytes", (double)re->size);
-            cJSON_AddStringToObject(eo, "hash", re->hash ? re->hash : "");
-            cJSON_AddStringToObject(eo, "type",
-                report_guess_type(re->path ? re->path : ""));
-            cJSON_AddBoolToObject(eo, "encrypted", e->encrypted);
-            cJSON_AddItemToArray(ents, eo);
-
-            if (re->hash && re->hash[0]) {
-                cJSON *slot = cJSON_GetObjectItemCaseSensitive(hash_map, re->hash);
-                if (!slot) {
-                    slot = cJSON_CreateObject();
-                    cJSON_AddNumberToObject(slot, "size_bytes", (double)re->size);
-                    cJSON_AddArrayToObject(slot, "in_bundles");
-                    cJSON_AddItemToObject(hash_map, re->hash, slot);
-                    ++unique_assets;
-                }
-                cJSON *arr = cJSON_GetObjectItemCaseSensitive(slot, "in_bundles");
-                cJSON_AddItemToArray(arr, cJSON_CreateString(e->id));
-            }
-        }
-        cJSON_AddItemToArray(bundles, bo);
-    }
-
-    cJSON *dups = cJSON_AddArrayToObject(root, "duplicates");
-    cJSON *slot = NULL;
-    cJSON_ArrayForEach(slot, hash_map) {
-        const cJSON *arr = cJSON_GetObjectItemCaseSensitive(slot, "in_bundles");
-        if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) < 2) continue;
-        cJSON *d = cJSON_CreateObject();
-        cJSON_AddStringToObject(d, "hash", slot->string);
-        const cJSON *sz = cJSON_GetObjectItemCaseSensitive(slot, "size_bytes");
-        cJSON_AddNumberToObject(d, "size_bytes",
-                                sz ? sz->valuedouble : 0.0);
-        cJSON *dub = cJSON_AddArrayToObject(d, "in_bundles");
-        const cJSON *bid;
-        cJSON_ArrayForEach(bid, arr)
-            cJSON_AddItemToArray(dub, cJSON_Duplicate(bid, 1));
-        cJSON_AddItemToArray(dups, d);
-    }
-    cJSON_Delete(hash_map);
-
-    cJSON *totals = cJSON_AddObjectToObject(root, "totals");
-    cJSON_AddNumberToObject(totals, "bundle_count", (double)cat->n);
-    cJSON_AddNumberToObject(totals, "total_size_bytes", (double)total_bytes);
-    cJSON_AddNumberToObject(totals, "unique_asset_count",
-                            (double)unique_assets);
-
-    char *s = pack_cjson_print_owned(root, out_len, false);
-    cJSON_Delete(root);
     return s;
 }
 
@@ -1569,10 +1329,14 @@ static int run_diff_impl(const char *old_path, const char *new_path,
                                     JCE_BUNDLE_CATALOG_KEY_BUNDLES);
 
     cJSON *diff = cJSON_CreateObject();
-    cJSON_AddItemToObject(diff, JCE_BUNDLE_KEY_CONTRACT,
-        build_contract(JCE_BUNDLE_DIFF_CONTRACT_NAME,
-                       JCE_BUNDLE_DIFF_CONTRACT_MAJOR,
-                       JCE_BUNDLE_DIFF_CONTRACT_MINOR));
+    cJSON *contract = cJSON_CreateObject();
+    cJSON_AddStringToObject(contract, JCE_BUNDLE_KEY_CONTRACT_NAME,
+                            JCE_BUNDLE_DIFF_CONTRACT_NAME);
+    cJSON_AddNumberToObject(contract, JCE_BUNDLE_KEY_CONTRACT_MAJOR,
+                            JCE_BUNDLE_DIFF_CONTRACT_MAJOR);
+    cJSON_AddNumberToObject(contract, JCE_BUNDLE_KEY_CONTRACT_MINOR,
+                            JCE_BUNDLE_DIFF_CONTRACT_MINOR);
+    cJSON_AddItemToObject(diff, JCE_BUNDLE_KEY_CONTRACT, contract);
     const cJSON *ov = cJSON_GetObjectItemCaseSensitive(oj,
                                 JCE_BUNDLE_CATALOG_KEY_VERSION);
     const cJSON *nv = cJSON_GetObjectItemCaseSensitive(nj,
@@ -1589,7 +1353,7 @@ static int run_diff_impl(const char *old_path, const char *new_path,
         const cJSON *e = NULL;
         cJSON_ArrayForEach(e, nb_bundles) {
             const char *id = e->string;
-            const char *old_hash = prev_hash_lookup(oj, id);
+            const char *old_hash = jce_bundle_previous_content_hash(oj, id);
             const cJSON *new_hash = cJSON_GetObjectItemCaseSensitive(e,
                                         JCE_BUNDLE_CATALOG_KEY_HASH);
             if (!old_hash) {
@@ -1768,6 +1532,12 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     for (char *p = out_dir       + strlen(out_dir);       p > out_dir       && p[-1] == '/'; --p) p[-1] = '\0';
 
     mkdir_p(out_dir);
+    {
+        char stale_graph[1280];
+        snprintf(stale_graph, sizeof(stale_graph), "%s/%s",
+                 out_dir, JCE_BUNDLE_GRAPH_NAME);
+        (void)jce_fs_host_remove_file(stale_graph);
+    }
 
     /* Ensure `.bundles/` is git-ignored.  Self-tracked .gitignore so
      * the file itself is preserved in commits but every artifact below
@@ -1868,6 +1638,34 @@ static int run_build_impl(const JceBundlePackOptions *opts)
 
     StrVec   scene_ids = {0};
     AssetMap am        = {0};
+    JceBundleDependencyEdges dependency_edges = {0};
+    int      dependency_errors = 0;
+
+    /* Project-level runtime roots cover assets that are not reachable from a
+     * specific scene (boot descriptors, dynamically selected content, and
+     * similar application-owned roots).  The file is optional, but once
+     * present its contract is strict. */
+    JceBundleDependencyDocument project_roots = {0};
+    bool have_project_roots = false;
+    {
+        size_t roots_size = 0;
+        uint8_t *roots_json = read_asset("bundle_roots.json", resource_root,
+                                         opts->resolve_fn, opts->resolve_user,
+                                         NULL, &roots_size);
+        if (roots_json) {
+            have_project_roots = jce_bundle_deps_parse_document(
+                (const char *)roots_json, roots_size, &project_roots);
+            if (!have_project_roots) {
+                ERR("invalid dependency contract: bundle_roots.json");
+                dependency_errors = 1;
+            } else {
+                LOG("dependency roots: %u required, %u optional",
+                    project_roots.assets.count,
+                    project_roots.optional_assets.count);
+            }
+            JCE_FREE(roots_json);
+        }
+    }
 
     for (size_t i = 0; i < scene_paths.n; ++i) {
         char *sid = NULL;
@@ -1888,11 +1686,16 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             ERR("cannot parse scene %s", scene_paths.items[i]);
             continue;
         }
+        char *scene_address = make_scene_vpath(scene_paths.items[i],
+                                               resource_root);
         for (uint32_t k = 0; k < deps.count; ++k) {
             AssetRef *r = am_get_or_create(&am, deps.items[k].path);
             if (!sv_contains(&r->refs, id_now)) sv_push(&r->refs, id_now);
             if (deps.items[k].bundle && !r->override)
                 r->override = pack_strdup(deps.items[k].bundle);
+            if (!jce_bundle_edges_add(&dependency_edges, scene_address,
+                                      deps.items[k].path, "scene"))
+                die("oom");
         }
 
         /* Depth-1..N recursion: a scene's first-level deps are usually
@@ -1919,17 +1722,70 @@ static int run_build_impl(const JceBundlePackOptions *opts)
          * names them — we resolve them against that file's directory so
          * the bundle stores vpaths the runtime VFS can actually open. */
         {
-            const int kMaxDepth = 8;
             size_t    start_idx = 0;
-            DepStage  st = { &deps, &am, id_now };
+            DepStage st = {
+                .deps = &deps,
+                .am = &am,
+                .edges = &dependency_edges,
+                .scene_id = id_now,
+                .parent = scene_address,
+                .origin = "scene"
+            };
 
-            for (int depth = 0; depth < kMaxDepth; ++depth) {
+            if (have_project_roots) {
+                st.parent = scene_address;
+                st.origin = "project_root";
+                stage_dependency_document(&st, &project_roots,
+                    "bundle_roots.json", resource_root,
+                    opts->resolve_fn, opts->resolve_user);
+            }
+
+            /* The dep list is also the visited set, so this computes the full
+             * fixed-point closure without an arbitrary depth limit. */
+            while (start_idx < deps.count) {
                 uint32_t expand_until = deps.count;
-                if (start_idx >= expand_until) break;
                 bool grew = false;
                 for (uint32_t k = (uint32_t)start_idx; k < expand_until; ++k) {
                     const char *dp = deps.items[k].path;
                     if (!dp) continue;
+                    st.parent = dp;
+                    st.origin = "dependency_document";
+
+                    /* Every asset may declare runtime-only references in a
+                     * sibling `<asset>.deps.json`.  This descriptor is a cook
+                     * input and is deliberately not staged into the output. */
+                    {
+                        char deps_path[1536];
+                        int written = snprintf(deps_path, sizeof(deps_path),
+                                               "%s.deps.json", dp);
+                        if (written > 0 &&
+                            (size_t)written < sizeof(deps_path)) {
+                            size_t deps_size = 0;
+                            uint8_t *deps_json = read_asset(
+                                deps_path, resource_root, opts->resolve_fn,
+                                opts->resolve_user, NULL, &deps_size);
+                            if (deps_json) {
+                                JceBundleDependencyDocument document = {0};
+                                if (!jce_bundle_deps_parse_document(
+                                        (const char *)deps_json, deps_size,
+                                        &document)) {
+                                    ERR("invalid dependency contract: %s",
+                                        deps_path);
+                                    dependency_errors = 1;
+                                } else {
+                                    uint32_t before = deps.count;
+                                    stage_dependency_document(
+                                        &st, &document, deps_path,
+                                        resource_root, opts->resolve_fn,
+                                        opts->resolve_user);
+                                    grew = deps.count > before || grew;
+                                }
+                                jce_bundle_deps_document_free(&document);
+                                JCE_FREE(deps_json);
+                            }
+                        }
+                    }
+
                     size_t dn = strlen(dp);
                     if (dn < 4) continue;
 
@@ -1957,6 +1813,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     }
 
                     if (is_json) {
+                        st.parent = dp;
+                        st.origin = "descriptor";
                         JceBundleDepList sub = {0};
                         bool parsed = jce_bundle_deps_scan((const char *)child_buf,
                                                            child_sz, &sub);
@@ -2006,6 +1864,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                         }
                         jce_bundle_deps_free(&sub);
                     } else {
+                        st.parent = dp;
+                        st.origin = "descriptor";
                         /* OBJ / MTL — text scan line by line. */
                         const char *cur = (const char *)child_buf;
                         const char *end = cur + child_sz;
@@ -2133,7 +1993,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     JCE_FREE(child_buf);
                 }
                 start_idx = expand_until;
-                if (!grew) break;
+                (void)grew;
             }
 
             /* ── Convention sidecars ────────────────────────────────
@@ -2156,7 +2016,10 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 for (uint32_t k = 0; k < snap; ++k) {
                     const char *dp = deps.items[k].path;
                     if (!dp || !dp[0]) continue;
-                    if (classify_cook(dp) != COOK_CLASS_MODEL) continue;
+                    if (jce_bundle_classify_cook(dp) != COOK_CLASS_MODEL)
+                        continue;
+                    st.parent = dp;
+                    st.origin = "model_sidecar";
                     snprintf(side, sizeof(side), "%s.anim.json", dp);
                     if (can_read_asset(side, resource_root, opts->resolve_fn,
                                        opts->resolve_user, NULL))
@@ -2203,6 +2066,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 char *svp = make_scene_vpath(scene_paths.items[i],
                                              resource_root);
                 if (svp) {
+                    st.parent = scene_address;
+                    st.origin = "scene_sidecar";
                     size_t ext = scene_suffix_len(svp);
                     size_t sl  = strlen(svp);
                     if (ext && sl > ext &&
@@ -2220,11 +2085,25 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             }
 
             /* ── Localization tables (i18n/<locale>.json) ──────────── */
+            st.parent = scene_address;
+            st.origin = "localization";
             for (size_t li = 0; li < i18n_files.n; ++li)
                 (void)stage_push_dep(&st, i18n_files.items[li], NULL);
         }
 
         jce_bundle_deps_free(&deps);
+        JCE_FREE(scene_address);
+    }
+
+    jce_bundle_deps_document_free(&project_roots);
+    if (dependency_errors) {
+        sv_free(&scene_paths);
+        sv_free(&scene_ids);
+        sv_free(&i18n_files);
+        am_free(&am);
+        jce_bundle_edges_free(&dependency_edges);
+        if (prev_catalog_j) cJSON_Delete(prev_catalog_j);
+        return 1;
     }
 
     ExternalMap emap = {0};
@@ -2242,8 +2121,21 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             continue;
 
         LOG("external asset virtualised: %s -> %s", r->asset, vp);
+        if (!jce_bundle_edges_replace_path(&dependency_edges, r->asset, vp))
+            die("oom");
         JCE_FREE(r->asset);
         r->asset = pack_strdup(vp);
+    }
+
+    if (!jce_bundle_edges_normalize_and_sort(&dependency_edges)) {
+        sv_free(&scene_paths);
+        sv_free(&scene_ids);
+        sv_free(&i18n_files);
+        am_free(&am);
+        jce_bundle_edges_free(&dependency_edges);
+        ext_free(&emap);
+        if (prev_catalog_j) cJSON_Delete(prev_catalog_j);
+        return 1;
     }
 
     BundleVec bundles = {0};
@@ -2259,6 +2151,15 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     for (size_t i = 0; i < am.n; ++i) {
         AssetRef *r = &am.items[i];
         const char *target_id = NULL;
+
+        /* A standalone bundle is a closed deployment unit.  Partitioning
+         * tags remain useful metadata in catalog builds, but they must never
+         * split assets out of the one requested file. */
+        if (single_file) {
+            Bundle *only = bv_get(&bundles, scene_ids.items[0]);
+            if (only) bundle_add_asset(only, r->asset);
+            continue;
+        }
 
         if (r->override) {
             if (strcmp(r->override, JCE_BUNDLE_TAG_FORCE_LOCAL) == 0) {
@@ -2309,8 +2210,11 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         {
             uint8_t cook_flag = opts->cook_assets ? 1u : 0u;
             int     cook_plat = opts->target_platform;
+            uint32_t writer_revision = 2u;
             XXH3_64bits_update(xs, &cook_flag, sizeof(cook_flag));
             XXH3_64bits_update(xs, &cook_plat, sizeof(cook_plat));
+            XXH3_64bits_update(xs, &writer_revision,
+                               sizeof(writer_revision));
         }
         /* Encryption state busts the incremental cache: fold the encrypt
          * flag and a key FINGERPRINT (never the key itself) into the input
@@ -2357,8 +2261,24 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 XXH3_64bits_update(xs, &ch, sizeof(ch));
                 JCE_FREE(raw);
             } else {
-                ERR("missing asset %s (referenced by bundle %s)",
-                    b->assets.items[i], b->id);
+                char missing[JCE_BUNDLE_CANONICAL_PATH_CAP];
+                char root[JCE_BUNDLE_CANONICAL_PATH_CAP];
+                char chain[1536];
+                const char *missing_address = b->assets.items[i];
+                const char *root_address = b->scene_path;
+                if (canonical_entry_path(b->assets.items[i], missing,
+                                         sizeof(missing)) > 0)
+                    missing_address = missing;
+                if (b->scene_path &&
+                    canonical_entry_path(b->scene_path, root,
+                                         sizeof(root)) > 0)
+                    root_address = root;
+                jce_bundle_edges_format_chain(&dependency_edges, root_address,
+                                              missing_address, chain,
+                                              sizeof(chain));
+                ERR("missing asset %s (dependency chain: %s; bundle %s)",
+                    b->assets.items[i], chain[0] ? chain : missing_address,
+                    b->id);
                 bundle_errors = 1;
                 had_errors = 1;
             }
@@ -2378,11 +2298,21 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 }
             }
         }
+        for (size_t i = 0; i < dependency_edges.n; ++i) {
+            const JceBundleDependencyEdge *edge =
+                &dependency_edges.items[i];
+            if (!bundle_owns_address(b, edge->from))
+                continue;
+            XXH3_64bits_update(xs, edge->from, strlen(edge->from));
+            XXH3_64bits_update(xs, edge->to, strlen(edge->to));
+            XXH3_64bits_update(xs, edge->origin, strlen(edge->origin));
+        }
         uint64_t input_hash = XXH3_64bits_digest(xs);
         XXH3_freeState(xs);
 
-        const char *prev_h = prev_hash_lookup(prev_catalog_j, b->id);
-        const char *prev_f = prev_file_lookup(prev_catalog_j, b->id);
+        const char *prev_h = jce_bundle_previous_build_hash(prev_catalog_j,
+                                                            b->id);
+        const char *prev_f = jce_bundle_previous_file(prev_catalog_j, b->id);
         char prev_h_str[17] = {0};
         snprintf(prev_h_str, sizeof(prev_h_str), "%016llx",
                  (unsigned long long)input_hash);
@@ -2391,8 +2321,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         char fname[256];
         if (single_file) {
             /* Stable, predictable filename so callers can re-deploy
-             * without consulting a catalog.  Hash is still embedded in
-             * the manifest content_hash for verification. */
+             * without consulting a catalog. */
             snprintf(fname, sizeof(fname), "%s%s",
                      b->id, JCE_BUNDLE_FILE_EXT);
         } else {
@@ -2428,12 +2357,14 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     if (sblob) {
                         write_file(sidecar_path, sblob, ssz);
                     }
-                    CatalogEntry *ce = cv_create(&catalog);
+                    CatalogEntry *ce = jce_bundle_catalog_entry_create(&catalog);
+                    if (!ce) die("oom");
                     ce->id   = pack_strdup(b->id);
                     ce->file = pack_strdup(fname);
                     ce->kind = pack_strdup(b->kind);
                     if (b->scene_path) ce->scene_path = pack_strdup(b->scene_path);
-                    ce->content_hash = pack_strdup(prev_h_str);
+                    ce->content_hash = hex16(XXH3_64bits(blob, sz));
+                    ce->build_hash = pack_strdup(prev_h_str);
                     ce->size = sz;
                     for (size_t d = 0; d < b->deps.n; ++d)
                         sv_push(&ce->deps, b->deps.items[d]);
@@ -2457,7 +2388,10 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                     const cJSON *az = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_SIZE);
                                     const cJSON *ah = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_HASH);
                                     if (!(ap && cJSON_IsString(ap))) continue;
-                                    ReportEntry *re = rv_create(&ce->entries);
+                                    ReportEntry *re =
+                                        jce_bundle_report_entry_create(
+                                            &ce->entries);
+                                    if (!re) die("oom");
                                     re->path = pack_strdup(ap->valuestring);
                                     re->size = (az && cJSON_IsNumber(az)) ? (uint64_t)az->valuedouble : 0;
                                     re->hash = (ah && cJSON_IsString(ah)) ? pack_strdup(ah->valuestring) : pack_strdup("");
@@ -2543,7 +2477,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             entries[slot].raw_size = asz;
 
             if (opts->cook_assets &&
-                classify_cook(b->assets.items[i]) != COOK_CLASS_NONE) {
+                jce_bundle_classify_cook(b->assets.items[i]) !=
+                    COOK_CLASS_NONE) {
                 cook_jobs[njobs].slot     = slot;
                 cook_jobs[njobs].vpath    = b->assets.items[i];
                 cook_jobs[njobs].buf      = abuf;
@@ -2603,7 +2538,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 CookJob *j = &cook_jobs[k];
                 entries[j->slot].raw      = j->buf;
                 entries[j->slot].raw_size = j->out_size;
-                CookClass cls = classify_cook(j->vpath);
+                CookClass cls = jce_bundle_classify_cook(j->vpath);
                 const char *kind = (cls == COOK_CLASS_TEXTURE) ? "texture"
                                  : (cls == COOK_CLASS_AUDIO)   ? "audio"
                                  : "model";
@@ -2628,12 +2563,27 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             entries[i].content_hash = XXH3_64bits(entries[i].raw,
                                                   entries[i].raw_size);
 
+        if (!validate_entry_addresses(entries + 1, actual - 1)) {
+            had_errors = 1;
+            for (size_t i = 0; i < actual; ++i) {
+                JCE_FREE(entries[i].vpath);
+                JCE_FREE(entries[i].raw);
+            }
+            JCE_FREE(entries);
+            (void)jce_fs_host_remove_file(out_path);
+            (void)jce_fs_host_remove_file(sidecar_path);
+            continue;
+        }
+
         const bool enc_now = opts->encrypt && opts->encryption_key != NULL;
 
         size_t mlen = 0;
-        char *mtext = build_manifest(b, entries + 1, actual - 1,
-                                     input_hash, catalog_version, enc_now,
-                                     &mlen);
+        char *mtext = jce_bundle_build_manifest(
+            b, entries + 1, actual - 1, input_hash, catalog_version,
+            enc_now, opts->cook_assets, opts->target_platform,
+            &dependency_edges, &mlen);
+        if (!mtext)
+            die("cannot build bundle manifest");
         entries[manifest_slot].vpath    = pack_strdup(JCE_BUNDLE_MANIFEST_VPATH);
         entries[manifest_slot].raw      = (uint8_t *)mtext;
         entries[manifest_slot].raw_size = mlen;
@@ -2642,6 +2592,12 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         uint8_t *pak = build_jbundle(entries, actual, zstd_level,
                                      enc_now, opts->encryption_key, b->id,
                                      &pak_size);
+        uint64_t archive_hash = XXH3_64bits(pak, pak_size);
+        size_t sidecar_len = 0;
+        char *sidecar_text = jce_bundle_build_sidecar(
+            mtext, mlen, archive_hash, pak_size, &sidecar_len);
+        if (!sidecar_text)
+            die("cannot build bundle sidecar");
 
         if (!write_file(out_path, pak, pak_size)) {
             ERR("cannot write %s", out_path);
@@ -2654,12 +2610,13 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             }
             JCE_FREE(entries);
             JCE_FREE(pak);
+            JCE_FREE(sidecar_text);
             continue;
         } else {
             LOG("built %s (%zu B, %zu asset%s)", fname, pak_size,
                 actual - 1, (actual - 1) == 1 ? "" : "s");
         }
-        if (!write_file(sidecar_path, mtext, mlen)) {
+        if (!write_file(sidecar_path, sidecar_text, sidecar_len)) {
             ERR("cannot write %s", sidecar_path);
             had_errors = 1;
             (void)jce_fs_host_remove_file(out_path);
@@ -2670,15 +2627,18 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             }
             JCE_FREE(entries);
             JCE_FREE(pak);
+            JCE_FREE(sidecar_text);
             continue;
         }
 
-        CatalogEntry *ce = cv_create(&catalog);
+        CatalogEntry *ce = jce_bundle_catalog_entry_create(&catalog);
+        if (!ce) die("oom");
         ce->id   = pack_strdup(b->id);
         ce->file = pack_strdup(fname);
         ce->kind = pack_strdup(b->kind);
         if (b->scene_path) ce->scene_path = pack_strdup(b->scene_path);
-        ce->content_hash = pack_strdup(prev_h_str);
+        ce->content_hash = hex16(archive_hash);
+        ce->build_hash = pack_strdup(prev_h_str);
         ce->size = pak_size;
         ce->encrypted = enc_now;
         for (size_t d = 0; d < b->deps.n; ++d)
@@ -2689,8 +2649,13 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         for (size_t i = 0; i < actual; ++i) {
             const PakEntry *pe = &entries[i];
             if (strcmp(pe->vpath, JCE_BUNDLE_MANIFEST_VPATH) == 0) continue;
-            ReportEntry *re = rv_create(&ce->entries);
-            re->path = pack_strdup(pe->vpath);
+            ReportEntry *re = jce_bundle_report_entry_create(&ce->entries);
+            if (!re) die("oom");
+            char canonical[JCE_BUNDLE_CANONICAL_PATH_CAP];
+            if (canonical_entry_path(pe->vpath, canonical,
+                                     sizeof(canonical)) == 0)
+                die("invalid report asset address");
+            re->path = pack_strdup(canonical);
             re->size = (uint64_t)pe->raw_size;
             re->hash = hex16(pe->content_hash);
         }
@@ -2702,6 +2667,36 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         }
         JCE_FREE(entries);
         JCE_FREE(pak);
+        JCE_FREE(sidecar_text);
+    }
+
+    int graph_ok = 1;
+    if (!had_errors && catalog.n > 0) {
+        size_t graph_len = 0;
+        char *graph_json = jce_bundle_build_graph_json(
+            &catalog, opts->cook_assets, opts->target_platform,
+            &dependency_edges, &graph_len);
+        char graph_path[1280];
+        snprintf(graph_path, sizeof(graph_path), "%s/%s",
+                 out_dir, JCE_BUNDLE_GRAPH_NAME);
+        graph_ok = graph_json && write_file(graph_path, graph_json, graph_len);
+        if (!graph_ok)
+            ERR("cannot write %s", graph_path);
+        else
+            LOG("content graph written: %s", graph_path);
+        JCE_FREE(graph_json);
+        if (!graph_ok) {
+            for (size_t i = 0; i < catalog.n; ++i) {
+                char bundle_path[1280];
+                char sidecar_path[1280];
+                snprintf(bundle_path, sizeof(bundle_path), "%s/%s",
+                         out_dir, catalog.items[i].file);
+                snprintf(sidecar_path, sizeof(sidecar_path), "%s%s",
+                         bundle_path, ".json");
+                (void)jce_fs_host_remove_file(bundle_path);
+                (void)jce_fs_host_remove_file(sidecar_path);
+            }
+        }
     }
 
     int cat_ok = 1;
@@ -2712,13 +2707,17 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                         catalog.items[0].id, catalog.items[0].file,
                         (double)total_bytes / 1024.0);
         } else if (catalog.n == 0) {
-            ERR("single-file mode: no bundle produced");
+            if (!had_errors)
+                ERR("single-file mode: no bundle produced");
             cat_ok = 0;
         }
     } else {
         size_t cjson_len = 0;
-        char *cat_json = build_catalog_json(&catalog, catalog_version,
-                                            &cjson_len);
+        char *cat_json = jce_bundle_build_catalog_json(
+            &catalog, catalog_version, opts->cook_assets,
+            opts->target_platform, &cjson_len);
+        if (!cat_json)
+            die("cannot build bundle catalog");
         char cat_path[1280];
         snprintf(cat_path, sizeof(cat_path), "%s/%s",
                  out_dir, JCE_BUNDLE_CATALOG_NAME);
@@ -2739,7 +2738,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
          * to the build itself; just log a warning. */
         {
             size_t rlen = 0;
-            char *rjson = build_report_json(&catalog, &rlen);
+            char *rjson = jce_bundle_build_report_json(&catalog, &rlen);
             if (rjson) {
                 char rpath[1280];
                 snprintf(rpath, sizeof(rpath), "%s/%s",
@@ -2759,11 +2758,12 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     sv_free(&scene_ids);
     sv_free(&i18n_files);
     am_free(&am);
+    jce_bundle_edges_free(&dependency_edges);
     bv_free(&bundles);
-    cv_free(&catalog);
+    jce_bundle_catalog_entries_free(&catalog);
     ext_free(&emap);
     if (prev_catalog_j) cJSON_Delete(prev_catalog_j);
-    return (cat_ok && !had_errors) ? 0 : 1;
+    return (cat_ok && graph_ok && !had_errors) ? 0 : 1;
 }
 
 /* ================================================================== */

@@ -111,13 +111,27 @@ JceFileSystem *jce_fs_create(void)
     if (!s_fs_mutex) s_fs_mutex = jce_mutex_create();
 
     if (!PHYSFS_isInit()) {
-        if (!PHYSFS_init(NULL)) {
-            LOG_ERROR(LOG_TAG, "PHYSFS_init failed: %s",
-                      PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
-            JCE_FREE(fs);
-            return NULL;
+        if (PHYSFS_init(NULL)) {
+            fs->physfs_owned = true;
+        } else {
+            /* Non-fatal: PHYSFS_init(NULL) resolves the base dir from the
+             * executable path, which does not exist under Emscripten MEMFS
+             * (no /proc/self/exe, argv0 NULL) — base-dir resolution fails and
+             * PhysFS's own deinit wipes the error code (hence the misleading
+             * "no error").  Rather than abort the whole app, degrade to
+             * PAK-only: every PhysFS entry point below already BAILs with
+             * NOT_INITIALIZED (openRead → NULL → the PAK path runs; mount_dir
+             * → warns and returns), and jce_fs_destroy guards PHYSFS_deinit on
+             * physfs_owned.  The embedded PAK carries every asset on web, so
+             * the app boots; only loose-dir overrides (a dev convenience) are
+             * unavailable where PhysFS cannot initialise. */
+            LOG_WARN(LOG_TAG,
+                     "PHYSFS_init failed (%s) — PAK-only mode "
+                     "(loose-dir overrides disabled)",
+                     PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+            /* physfs_owned stays false: we did not init it, so we must not
+             * deinit it, and PHYSFS_isInit() remains false for the no-op BAILs. */
         }
-        fs->physfs_owned = true;
     }
 
     return fs;
@@ -515,10 +529,20 @@ bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
 /* (so consumers that link only that TU still get a working stub).      */
 /* ================================================================== */
 
+void jce__fs_store_active(JceFileSystem *fs);
+void jce__fs_store_active_policy(JceFsActivePolicy policy);
+
 void jce_fs_set_active(JceFileSystem *fs)
 {
+    jce_fs_set_active_policy(fs, JCE_FS_ACTIVE_OVERLAY);
+}
+
+void jce_fs_set_active_policy(JceFileSystem *fs, JceFsActivePolicy policy)
+{
+    if (policy != JCE_FS_ACTIVE_ISOLATED)
+        policy = JCE_FS_ACTIVE_OVERLAY;
     jce_fs_set_active_reader(fs ? jce_fs_read_all : NULL);
-    /* Store the handle through the host-side setter via a small helper. */
-    extern void jce__fs_store_active(JceFileSystem *fs);
+    /* Store the handle and fallback policy through host-side helpers. */
     jce__fs_store_active(fs);
+    jce__fs_store_active_policy(fs ? policy : JCE_FS_ACTIVE_OVERLAY);
 }

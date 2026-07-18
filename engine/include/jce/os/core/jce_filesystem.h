@@ -262,8 +262,21 @@ JCE_API void JCE_CALL jce_fs_buffer_free(void *buf);
  * see bundle-resident files first, with host-file fallback on miss. */
 typedef void *(*JceFsReadFn)(const JceFileSystem *fs, const char *path,
                              uint64_t *out_size);
+
+typedef enum JceFsActivePolicy {
+    /* Mounted content overrides a matching relative path, then development
+     * files on the host remain available. */
+    JCE_FS_ACTIVE_OVERLAY = 0,
+    /* Relative content addresses must resolve inside the active VFS.  Absolute
+     * host paths remain available to editor/tooling infrastructure. */
+    JCE_FS_ACTIVE_ISOLATED = 1
+} JceFsActivePolicy;
+
 JCE_API void              JCE_CALL jce_fs_set_active(JceFileSystem *fs);
 JCE_API JceFileSystem *   JCE_CALL jce_fs_get_active(void);
+JCE_API void              JCE_CALL jce_fs_set_active_policy(
+    JceFileSystem *fs, JceFsActivePolicy policy);
+JCE_API JceFsActivePolicy JCE_CALL jce_fs_get_active_policy(void);
 /* Low-level: install a custom reader paired with the active fs handle.
  * Default reader is set to jce_fs_read_all when you call
  * jce_fs_set_active(); use this only for tests or alternate backends. */

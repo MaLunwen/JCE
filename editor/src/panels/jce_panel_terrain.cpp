@@ -16,7 +16,9 @@
 #include "io/jce_editor_file_util.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -232,6 +234,17 @@ void ensure_terrain()
 
 void draw_toolbar()
 {
+    /* One-time prefill of the last successfully loaded terrain document
+     * (per-project) so one click on Load reopens it.  Never auto-loads,
+     * and never clobbers a path the user already typed. */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (std::strcmp(s.io_path, "scenes/terrain.terrain.json") == 0)
+            jce_editor_pstate_get_str("doc.terrain.last", s.io_path,
+                                      sizeof(s.io_path));
+    }
+
     if (ImGui::BeginTable("terrain_io", 4, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
@@ -254,6 +267,8 @@ void draw_toolbar()
             s.status = s.terrain
                 ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
                 : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
+            if (s.terrain)   /* remember the last document that loaded OK */
+                jce_editor_pstate_set_str("doc.terrain.last", s.io_path);
         }
         ImGui::TableNextColumn();
         ImGui::BeginDisabled(s.terrain == nullptr);
@@ -313,6 +328,8 @@ void draw_toolbar()
                 s.status = s.terrain
                     ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
                     : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
+                if (s.terrain)   /* remember the last document that loaded OK */
+                    jce_editor_pstate_set_str("doc.terrain.last", s.io_path);
             }
         }
         ImGui::EndDragDropTarget();
@@ -394,28 +411,48 @@ void draw_heightmap_io_section()
 
 void draw_brush_section()
 {
+    /* One-time restore of the persisted brush knobs (user-global, so the
+     * brush feel carries across projects and restarts). */
+    static bool s_brush_loaded = false;
+    if (!s_brush_loaded) {
+        s_brush_loaded = true;
+        s.tool           = (ToolMode)jce_editor_ui_state_load_int(
+                               "brush.terrain.tool", (int)s.tool, 0, 2);
+        s.splat_layer    = jce_editor_ui_state_load_int(
+                               "brush.terrain.layer", s.splat_layer, 0, 3);
+        s.brush_radius   = jce_editor_ui_state_load_float(
+                               "brush.terrain.radius", s.brush_radius, 0.5f, 64.0f);
+        s.brush_strength = jce_editor_ui_state_load_float(
+                               "brush.terrain.strength", s.brush_strength, 0.1f, 64.0f);
+    }
+
     if (!s.terrain) {
         ImGui::TextDisabled("%s", jce_editor_i18n("terrain.brush.needTerrain"));
         return;
     }
     if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.brush.header"), ImGuiTreeNodeFlags_DefaultOpen)) {
         int tool = (int)s.tool;
-        if (ImGui::Combo(jce_editor_i18n("terrain.brush.tool"), &tool, "Sculpt\0Splat\0Holes\0\0"))
+        if (ImGui::Combo(jce_editor_i18n("terrain.brush.tool"), &tool, "Sculpt\0Splat\0Holes\0\0")) {
             s.tool = (ToolMode)tool;
+            jce_editor_ui_state_save_int("brush.terrain.tool", tool);
+        }
         if (s.tool == ToolMode::Sculpt) {
             ImGui::Combo(jce_editor_i18n("terrain.brush.mode"), &s.sculpt_mode,
                          "Raise\0Lower\0Smooth\0Flatten\0\0");
         } else if (s.tool == ToolMode::Splat) {
-            ImGui::Combo(jce_editor_i18n("terrain.brush.layer"), &s.splat_layer,
-                         "Layer 0\0Layer 1\0Layer 2\0Layer 3\0\0");
+            if (ImGui::Combo(jce_editor_i18n("terrain.brush.layer"), &s.splat_layer,
+                             "Layer 0\0Layer 1\0Layer 2\0Layer 3\0\0"))
+                jce_editor_ui_state_save_int("brush.terrain.layer", s.splat_layer);
         } else {
             ImGui::Checkbox(jce_editor_i18n_id("terrain.brush.holeErase", "Erase (fill holes back)"),
                             &s.hole_erase);
             ImGui::TextDisabled("%s", jce_editor_i18n_id("terrain.brush.holeHint",
                 "Cuts cells from render + collision (caves, tunnels, interiors)"));
         }
-        ImGui::SliderFloat(jce_editor_i18n("terrain.brush.radius"),   &s.brush_radius,   0.5f, 64.0f);
-        ImGui::SliderFloat(jce_editor_i18n("terrain.brush.strength"), &s.brush_strength, 0.1f, 64.0f);
+        if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.radius"),   &s.brush_radius,   0.5f, 64.0f))
+            jce_editor_ui_state_save_float("brush.terrain.radius", s.brush_radius);
+        if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.strength"), &s.brush_strength, 0.1f, 64.0f))
+            jce_editor_ui_state_save_float("brush.terrain.strength", s.brush_strength);
         ImGui::Checkbox(jce_editor_i18n("terrain.brush.paintInScene"), &s.paint_in_scene);
         ImGui::DragFloat(jce_editor_i18n("terrain.brush.cursorX"), &s.cursor_x, 0.5f);
         ImGui::DragFloat(jce_editor_i18n("terrain.brush.cursorZ"), &s.cursor_z, 0.5f);

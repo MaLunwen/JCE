@@ -14,9 +14,9 @@ set(_jce_bin_dir     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@")
 set(_jce_share_dir   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce")
 
 # ---- Engine-side runtime resources shipped with the SDK. ----------- #
-# jce_target_embed_pak() prepends these to every consumer PAK so the
-# engine can find its built-in RML documents (HUD/settings/pause), the
-# fallback font, default shaders, etc.
+# jce_target_embed_pak() prepends optional engine resources and the built-in
+# RML documents. Stock shaders are already embedded in JCE::JCE and are not
+# duplicated in consumer PAKs.
 if(IS_DIRECTORY "${_jce_share_dir}/engine_resources")
 	set(JCE_ENGINE_RESOURCES_DIR "${_jce_share_dir}/engine_resources")
 endif()
@@ -74,7 +74,10 @@ endif()
 
 # JCE::JCE points at the *core* (first-party) fat lib; the dependency
 # fat lib is exposed as INTERFACE_LINK_LIBRARIES so the linker sees
-# them on the command line WITHOUT /WHOLEARCHIVE.
+# them on the command line WITHOUT /WHOLEARCHIVE. JCE::Core is declared
+# after platform dependencies are assembled and exposes the same archives
+# without force-loading application entry points. It is for native tools and
+# unit tests only; shipping applications must use JCE::JCE.
 add_library(JCE::JCE STATIC IMPORTED)
 
 set_target_properties(JCE::JCE PROPERTIES
@@ -253,6 +256,37 @@ elseif(UNIX)
 	set_property(TARGET JCE::JCE APPEND PROPERTY
 		INTERFACE_LINK_LIBRARIES Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
+
+# ---- Selective-link core for native tools and unit tests ---------- #
+# The complete application target intentionally force-loads first-party TUs,
+# including SDL_main and embedded-PAK bootstrap references. A conventional
+# test executable supplies its own main(), so it must link the same archive
+# normally and let the linker extract only referenced members.
+add_library(JCE::Core STATIC IMPORTED)
+set_target_properties(JCE::Core PROPERTIES
+	INTERFACE_INCLUDE_DIRECTORIES "${_jce_include_dir}")
+if(EXISTS "${_jce_core_release}")
+	set_property(TARGET JCE::Core APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+	set_target_properties(JCE::Core PROPERTIES
+		IMPORTED_LOCATION_RELEASE "${_jce_core_release}"
+		IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+		MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+		MAP_IMPORTED_CONFIG_MINSIZEREL RELEASE)
+endif()
+if(EXISTS "${_jce_core_debug}")
+	set_property(TARGET JCE::Core APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
+	set_target_properties(JCE::Core PROPERTIES
+		IMPORTED_LOCATION_DEBUG "${_jce_core_debug}"
+		IMPORTED_LINK_INTERFACE_LANGUAGES_DEBUG "CXX")
+elseif(EMSCRIPTEN AND EXISTS "${_jce_core_release}")
+	set_target_properties(JCE::Core PROPERTIES MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+endif()
+get_target_property(_jce_selective_links JCE::JCE INTERFACE_LINK_LIBRARIES)
+if(_jce_selective_links)
+	set_target_properties(JCE::Core PROPERTIES
+		INTERFACE_LINK_LIBRARIES "${_jce_selective_links}")
+endif()
+unset(_jce_selective_links)
 
 set(JCE_INCLUDE_DIRS "${_jce_include_dir}")
 set(JCE_LIBRARIES    JCE::JCE)

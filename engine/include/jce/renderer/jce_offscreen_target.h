@@ -54,6 +54,21 @@ JCE_API uint16_t jce_offscreen_target_get_frame_buffer(const JceOffscreenTarget 
  * before display). False when the RGBA8 fallback was used. */
 JCE_API bool jce_offscreen_target_is_hdr(const JceOffscreenTarget *bridge);
 
+/* Composite an arbitrary color texture over the bridge's framebuffer as an
+ * opaque fullscreen quad on `view_id` (pick a view that executes AFTER the
+ * pass that produced the texture).  Used by the editor Game View to fold the
+ * post-fx output back into the bridge so overlay passes (canvas UI) land
+ * after tone mapping — the shipped runtime's scene→postfx→UI order.
+ * `flip_v` mirrors the source vertically: pass
+ * jce_renderer_origin_bottom_left() when the source is a post-fx style RT —
+ * on bottom-left-origin backends (OpenGL) its sampling orientation is
+ * inverted relative to the bridge/canvas convention, and an unflipped copy
+ * lands the 3D scene upside-down under the panel's display flip (empirically
+ * verified: GL editor Game View, scene inverted while the UI stayed upright). */
+JCE_API void jce_offscreen_target_composite_texture(
+    JceOffscreenTarget *bridge, uint16_t view_id, uint16_t texture_idx,
+    uint16_t width, uint16_t height, bool flip_v);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_OFFSCREEN_TARGET_H */

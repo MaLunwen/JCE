@@ -115,6 +115,7 @@ void parse_ui_text(JceScene *s, JceEntity e, const cJSON *c)
     t.color[3] = (float)j_num(c, "colorA", 1.0);
     t.line_spacing = (float)j_num(c, "lineSpacing", 1.0);
     t.rich_text    = j_bool(c, "richText", false);
+    t.math_text    = j_bool(c, "mathText", false);
     t.best_fit     = j_bool(c, "bestFit", false);
     t.min_size = (int)j_num(c, "minSize", 10);
     t.max_size = (int)j_num(c, "maxSize", 40);
@@ -412,6 +413,7 @@ static void ser_ui_text(const JceUITextComponent *t, cJSON *arr)
     cJSON_AddNumberToObject(o, "colorA", t->color[3]);
     cJSON_AddNumberToObject(o, "lineSpacing", t->line_spacing);
     cJSON_AddBoolToObject  (o, "richText", t->rich_text);
+    cJSON_AddBoolToObject  (o, "mathText", t->math_text);
     cJSON_AddBoolToObject  (o, "bestFit",  t->best_fit);
     cJSON_AddNumberToObject(o, "minSize", t->min_size);
     cJSON_AddNumberToObject(o, "maxSize", t->max_size);

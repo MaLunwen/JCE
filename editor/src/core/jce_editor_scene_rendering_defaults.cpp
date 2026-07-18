@@ -100,7 +100,9 @@ void jce_editor_scene_rendering_settings_from_project(
     {
         bool rs_loaded = false;
         const JceProject *proj = jce_editor_project_get();
-        if (proj && proj->project_root && proj->project_root[0]) {
+        const bool has_project =
+            proj && proj->project_root && proj->project_root[0];
+        if (has_project) {
             const char *src = (proj->source_assets && proj->source_assets[0])
                               ? proj->source_assets : "resources/assets";
             const char *cooked = (proj->cooked_assets && proj->cooked_assets[0])
@@ -117,7 +119,7 @@ void jce_editor_scene_rendering_settings_from_project(
                     rs_loaded = jce_render_settings_load_json(rpath, &rs);
             }
         }
-        if (!rs_loaded)
+        if (has_project && !rs_loaded)
             LOG_WARN("scene_defaults", "render_settings.json not found under project root — look profile defaults");
     }
     out->wrap_factor        = rs.wrap_factor;

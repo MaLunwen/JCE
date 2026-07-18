@@ -40,6 +40,7 @@ typedef struct {
 /* ================================================================== */
 
 typedef struct JceSpriteSheet JceSpriteSheet;
+typedef struct JcePakArchive JcePakArchive;
 
 /*
  * Load a sprite sheet from an Aseprite JSON atlas.
@@ -50,6 +51,11 @@ typedef struct JceSpriteSheet JceSpriteSheet;
  */
 JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
                                             const char *image_path);
+
+/* Load an Aseprite atlas stored at a virtual path in a JPAK archive. */
+JCE_API JceSpriteSheet *jce_sprite_sheet_load_json_pak(
+    const JcePakArchive *pak, const char *virtual_path,
+    const char *image_path);
 
 /*
  * Create a sprite sheet from a grid layout (uniform frame size).

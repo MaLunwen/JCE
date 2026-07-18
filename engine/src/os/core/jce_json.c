@@ -7,6 +7,7 @@
 
 #include "jce/os/core/jce_json.h"
 #include "jce/os/core/jce_filesystem.h"
+#include "jce/os/core/jce_path.h"
 
 #include <cjson/cJSON.h>
 #include <SDL3/SDL.h>
@@ -28,6 +29,11 @@ JceJson *jce_json_parse_file(const char *path)
 {
     if (!path) return NULL;
 
+    const bool isolated_relative =
+        jce_fs_get_active() != NULL &&
+        jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED &&
+        !jce_path_is_absolute(path);
+
     /* Prefer the unified host_read_all path so an active VFS override
      * (e.g. editor scene preview from a .jbundle) can intercept reads
      * for project-relative JSON files like terrain/material metadata. */
@@ -38,9 +44,13 @@ JceJson *jce_json_parse_file(const char *path)
             JceJson *j = cJSON_ParseWithLength((const char *)vbuf, (size_t)sz);
             jce_fs_buffer_free(vbuf);
             if (j) return j;
-            /* fall through to host attempt if parse failed (defensive) */
+            /* An isolated mount is authoritative, including malformed data. */
         }
     }
+
+    /* Bundle Preview must expose missing dependencies instead of silently
+     * borrowing a same-named development file from the process directory. */
+    if (isolated_relative) return NULL;
 
     SDL_IOStream *io = SDL_IOFromFile(path, "rb");
     if (!io) return NULL;
@@ -85,14 +95,15 @@ bool jce_json_write_file(const char *path, JceJson *root,
     if (take_ownership) cJSON_Delete(root);
     if (!txt) return false;
 
-    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
-    if (!io) { cJSON_free(txt); return false; }
-
+    /* Atomic (temp + rename): every jce_json_write_file consumer is user
+     * data (editor config, project settings, audio mixer, input actions,
+     * package lists) — a crash or full disk mid-write must never leave a
+     * truncated file, because loaders treat unparseable JSON as absent and
+     * silently fall back to defaults (= total silent settings loss). */
     size_t len = strlen(txt);
-    size_t wrote = SDL_WriteIO(io, txt, len);
-    SDL_CloseIO(io);
+    bool ok = jce_fs_host_write_all_atomic(path, txt, (uint64_t)len);
     cJSON_free(txt);
-    return wrote == len;
+    return ok;
 }
 
 void jce_json_free(JceJson *root)        { cJSON_Delete(root); }

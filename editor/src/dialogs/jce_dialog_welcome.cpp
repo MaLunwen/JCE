@@ -19,6 +19,7 @@
 #include "core/jce_editor_project.h"
 #include "core/jce_editor_config.h"
 #include "panels/jce_panel_preferences.h"
+#include "ui/jce_editor_ui_state.h"
 
 #include <string.h>
 
@@ -203,9 +204,24 @@ void jce_editor_dialog_welcome(bool *p_open)
         jce_editor_prefs_startup_behavior() == JCE_EDITOR_STARTUP_PICKER;
     if (ImGui::Checkbox(jce_editor_i18n("welcome.showOnStartup"),
                         &show_on_startup)) {
-        jce_editor_prefs_set_startup_behavior(
-            show_on_startup ? JCE_EDITOR_STARTUP_PICKER
-                            : JCE_EDITOR_STARTUP_EMPTY);
+        /* Lossless round-trip with the 3-state Preferences combo: checking
+         * remembers the current mode, unchecking restores it.  The old
+         * mapping forced uncheck -> EMPTY, silently discarding a user's
+         * "Last scene" choice. */
+        if (show_on_startup) {
+            jce_editor_ui_state_save_int(
+                "welcome.prev_startup",
+                (int)jce_editor_prefs_startup_behavior());
+            jce_editor_prefs_set_startup_behavior(JCE_EDITOR_STARTUP_PICKER);
+        } else {
+            int prev = jce_editor_ui_state_load_int(
+                "welcome.prev_startup", (int)JCE_EDITOR_STARTUP_LAST,
+                0, JCE_EDITOR_STARTUP_COUNT - 1);
+            if (prev == (int)JCE_EDITOR_STARTUP_PICKER)
+                prev = (int)JCE_EDITOR_STARTUP_LAST;
+            jce_editor_prefs_set_startup_behavior(
+                (JceEditorStartupBehavior)prev);
+        }
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%s", jce_editor_i18n("welcome.hint"));

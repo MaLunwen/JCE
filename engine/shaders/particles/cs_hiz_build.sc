@@ -9,7 +9,10 @@
  * source is read through a SAMPLER (works for both the depth texture and the
  * Hi-Z r32f mips); the destination mip is bound as a write image.
  *
- * The cull shader (hiz_occlusion.sh) consumes the resulting pyramid.
+ * The cull shaders consume the resulting pyramid via their INLINED Hi-Z test
+ * (cs_cull_frustum / cs_cull_compact / cs_foliage_cull — a shared helper taking
+ * s_hiz as an argument crashed the GL driver, revert d7d785c4).  The scalar
+ * math mirrors tests/renderer/test_jce_hiz_occlusion.c; keep them in sync.
  *
  * u_hiz_build = { dst_width, dst_height, src_lod, 0 }
  */

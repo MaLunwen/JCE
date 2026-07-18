@@ -192,6 +192,46 @@ void jce_draw_textured_rect_view(const JceRenderer *r, uint16_t view_id,
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+void jce_draw_textured_rect_view_opaque(const JceRenderer *r, uint16_t view_id,
+                                        float x, float y, float w, float h,
+                                        JceTexture tex, uint32_t tint,
+                                        const float *uv)
+{
+    const bgfx_vertex_layout_t *layout = jce_renderer_get_layout_textured(r);
+    bgfx_program_handle_t prog = jce_renderer_get_program_textured(r);
+    JceUniformHandle uh = jce_renderer_get_tex_uniform(r);
+    bgfx_uniform_handle_t sampler = { uh.idx };
+    if (!layout || prog.idx == UINT16_MAX) return;
+
+    float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+    if (uv) { u0 = uv[0]; v0 = uv[1]; u1 = uv[2]; v1 = uv[3]; }
+
+    bgfx_transient_vertex_buffer_t tvb;
+    bgfx_transient_index_buffer_t  tib;
+
+    if (!bgfx_alloc_transient_buffers(&tvb, layout, 4, &tib, 6, false))
+        return;
+
+    PosColorTexVertex *v = (PosColorTexVertex *)tvb.data;
+    v[0] = (PosColorTexVertex){ x,     y,     0, tint, u0, v0 };
+    v[1] = (PosColorTexVertex){ x + w, y,     0, tint, u1, v0 };
+    v[2] = (PosColorTexVertex){ x + w, y + h, 0, tint, u1, v1 };
+    v[3] = (PosColorTexVertex){ x,     y + h, 0, tint, u0, v1 };
+
+    uint16_t *idx = (uint16_t *)tib.data;
+    idx[0] = 0; idx[1] = 1; idx[2] = 2;
+    idx[3] = 0; idx[4] = 2; idx[5] = 3;
+
+    bgfx_texture_handle_t bgfx_tex;
+    bgfx_tex.idx = tex.idx;
+
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
+    bgfx_set_transient_index_buffer(&tib, 0, 6);
+    bgfx_set_texture(0, sampler, bgfx_tex, UINT32_MAX);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
 void jce_draw_textured_rect(const JceRenderer *r,
                             float x, float y, float w, float h,
                             JceTexture tex, uint32_t tint,

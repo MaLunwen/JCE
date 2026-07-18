@@ -21,10 +21,13 @@
 extern "C" {
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
+#include <jce/application/jce_runtime.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/platform/jce_host_dialog.h>
+#include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
@@ -35,6 +38,7 @@ extern "C" {
 
 #include "core/jce_editor.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_game_input_bridge.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
 #include "core/jce_build_manager.h"
@@ -58,6 +62,28 @@ static EditorState g_state;
 static uint64_t g_startup_t0;
 static bool g_startup_reported;
 static uint64_t g_last_update_counter;
+
+static void play_commit_pointer(void *, float dx, float dy, float wheel,
+                                uint32_t buttons)
+{
+    jce_editor_play_set_pointer_input(dx, dy, wheel, buttons);
+}
+
+static void play_commit_touches(void *, const JceRuntimeTouch *touches,
+                                int count)
+{
+    jce_editor_play_set_touch_input(touches, count);
+}
+
+static void play_commit_actions(void *, const JceInputActions *actions)
+{
+    jce_editor_play_set_actions(actions);
+}
+
+static void play_commit_step(void *, float dt)
+{
+    jce_state_play_mode_tick(dt);
+}
 
 /* ── KPI: startup latency ──────────────────────────────────────────── */
 
@@ -86,7 +112,9 @@ static void maybe_log_startup_kpi(void)
     g_startup_reported = true;
 }
 
-/* ── Renderer backend override from editor-config.json ─────────────── */
+/* ── Renderer backend override from ~/.jce/editor-preferences.json ───
+   (legacy ~/.jce/editor-config.json is a read-only fallback until it is
+   retired to *.migrated — see jce_editor_config.cpp). */
 
 static std::string to_lower_copy(const char *s)
 {
@@ -139,13 +167,41 @@ static bool editor_app_init(const JceServices *svc, void *ud)
      * gate toon OFF, degrade bloom to 0 mips, and (at LOW) collapse the look profile
      * + sky to neutral/PREETHAM UPSTREAM of the postfx grade, so scenes render
      * grey/dim regardless of their authored look/postfx.  An ULTRA detection is left
-     * untouched; the user can still pick any tier from the status bar (it re-applies). */
-    if (jce_renderer_get_tier() < JCE_GPU_TIER_HIGH)
-        jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
+     * untouched; the user can still pick any tier from the status bar (it re-applies).
+     *
+     * EXCEPT on a charter-baseline machine (512MB / single-core class): floating
+     * to HIGH there would re-enable the full-res RGBA16F postfx family + 2048
+     * shadow targets + the TAA RT chain that the whole-machine tier downgrade
+     * exists to avoid — the editor must RUN on the weak box before it can look
+     * pretty.  The status-bar tier picker still lets the user force HIGH
+     * explicitly (and JCE_LOW_MEM=0/1 is the QA escape hatch). */
+    {
+        JceSysInfo si;
+        jce_sysinfo_init(&si);
+        bool charter_low = (si.ram_total_mb > 0 && si.ram_total_mb < 2048)
+                        || si.cpu_cores <= 1;
+        const char *lm = getenv("JCE_LOW_MEM");
+        if (lm && lm[0]) charter_low = (lm[0] != '0');
+        if (!charter_low && jce_renderer_get_tier() < JCE_GPU_TIER_HIGH)
+            jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
+    }
+    /* Re-apply the tier preset ONLY when engine boot fell back to it.
+     * jce_render_pipeline_apply_boot (engine init) already honored the
+     * project's Settings/RenderPipeline.rp.json when present; unconditionally
+     * re-applying a tier preset here stomped that layer-3 asset and made the
+     * editor preview diverge from the shipped game's layering.  There is no
+     * "boot applied an asset" getter, so mirror apply_boot's own resolution:
+     * host file exists AND parses. */
     {
         JceRenderPipelineDesc rpd;
-        jce_render_pipeline_preset_for_current_tier(&rpd);
-        jce_render_pipeline_apply(&rpd);
+        const char *rp_boot_path = "Settings/RenderPipeline.rp.json";
+        const bool project_rp_applied =
+            jce_fs_host_exists_file(rp_boot_path) &&
+            jce_render_pipeline_load(rp_boot_path, &rpd);
+        if (!project_rp_applied) {
+            jce_render_pipeline_preset_for_current_tier(&rpd);
+            jce_render_pipeline_apply(&rpd);
+        }
     }
 
     /* ── Splash frame (G) ─────────────────────────────────────────────
@@ -218,7 +274,48 @@ static void editor_app_update(float dt, void *ud)
      * run against a scene that is still being populated. */
     jce_state_scene_load_poll();
 
-    jce_state_play_mode_tick(real_dt);
+    if (jce_state_get_play_state() == JCE_PLAY_PLAYING) {
+        JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES] = {};
+        int kept = 0;
+        if (g_state.svc && g_state.svc->input) {
+            int count = jce_input_touch_count(g_state.svc->input);
+            if (count > JCE_RUNTIME_MAX_TOUCHES)
+                count = JCE_RUNTIME_MAX_TOUCHES;
+            for (int i = 0; i < count; ++i) {
+                JceFingerID id = 0;
+                float x = 0.0f;
+                float y = 0.0f;
+                float pressure = 0.0f;
+                if (!jce_input_touch_get(g_state.svc->input, i, &id,
+                                         &x, &y, &pressure)) {
+                    continue;
+                }
+                touches[kept].id = static_cast<uint64_t>(id);
+                touches[kept].x = x;
+                touches[kept].y = y;
+                touches[kept].pressure = pressure;
+                ++kept;
+            }
+        }
+
+        static const JceEditorGameInputCommitOps input_ops = {
+            play_commit_pointer,
+            play_commit_touches,
+            play_commit_actions,
+            play_commit_step,
+        };
+        (void)jce_editor_game_input_bridge_commit(
+            jce_editor_game_input_bridge_shared(), touches, kept,
+            g_state.svc ? g_state.svc->actions : nullptr,
+            real_dt, &input_ops, nullptr);
+    } else {
+        if (jce_state_get_play_state() == JCE_PLAY_STOPPED) {
+            jce_editor_game_input_bridge_reset(
+                jce_editor_game_input_bridge_shared());
+        }
+        jce_state_play_mode_tick(real_dt);
+    }
+    jce_state_stress_move_tick(real_dt);   /* JCE_STRESS_MOVERS L2 soak (inert unless set) */
 
     /* VideoPlayer-as-texture and ParticleEmitter previews in Scene View while
      * editing.  In play mode the runtime (jce_runtime_step) drives these on the

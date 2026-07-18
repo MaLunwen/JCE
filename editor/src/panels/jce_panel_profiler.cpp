@@ -29,6 +29,7 @@
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/resource/jce_world_streamer.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_perf_phase.h>
 #include <jce/tools/jce_imgui.hpp>
 #include <algorithm>
 #include <cstdarg>
@@ -90,12 +91,6 @@ struct ProfilerState {
 
 ProfilerState s_prof;
 
-template <typename T>
-void push_ring(T *ring, T v)
-{
-    ring[s_prof.head] = v;
-}
-
 /* Rebuild the per-view row snapshot from a fresh stats capture.  Shared
  * by the CPU tab's sampler and the Frame Debugger tab (whose own copy of
  * this table was removed — single implementation, see
@@ -147,7 +142,15 @@ void push_sample(float dt_ms)
         s_prof.bb_w           = st->backbuffer_width;
         s_prof.bb_h           = st->backbuffer_height;
 
-        cpu_ms = (float)((double)s_prof.cpu_submit * 1000.0 / (double)s_prof.cpu_freq);
+        /* True CPU work: bgfx cpuTimeFrame is WALL time between frames
+         * (includes GPU waits) — subtracting the waits is what lets the
+         * panel distinguish CPU-bound from GPU-bound. */
+        {
+            int64_t cpu_work = s_prof.cpu_time_frame
+                             - s_prof.wait_render - s_prof.wait_submit;
+            if (cpu_work < 0) cpu_work = 0;
+            cpu_ms = (float)((double)cpu_work * 1000.0 / (double)s_prof.cpu_freq);
+        }
         gpu_ms = (float)((double)s_prof.gpu_time_total * 1000.0 / (double)s_prof.gpu_freq);
         wait_ms = (float)((double)(s_prof.wait_render + s_prof.wait_submit) * 1000.0
                           / (double)s_prof.cpu_freq);
@@ -239,10 +242,101 @@ void draw_bars_block(const char *id, float cpu, float gpu, float wait, float fra
     ImGui::PopID();
 }
 
+/* Modern sparkline: a rounded panel with a gradient-filled area under the line,
+ * an optional dashed budget guide, a live end-point dot, and inline
+ * label / current / avg·max stats.  The clean replacement for the flat
+ * ImGui::PlotLines look (no axis chrome, no boxed overlay).  `get` walks the
+ * history ring chronologically (same callbacks PlotLines used). */
+void draw_area_chart(const char *label, float (*get)(void *, int), int count,
+                     float cur, float avg, float peak, float scale_max,
+                     const char *unit, ImU32 line_col, float budget, float height)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    if (w < 80.0f) w = 80.0f;
+    ImVec2 p1 = ImVec2(p0.x + w, p0.y + height);
+    if (scale_max < 1e-3f) scale_max = 1.0f;
+
+    const float pad  = 5.0f;
+    const float lblH = ImGui::GetTextLineHeight();
+    dl->AddRectFilled(p0, p1, jce_theme::canvas_bg(), 5.0f);
+    dl->AddRect(p0, p1, jce_theme::grid_minor(), 5.0f);
+
+    float gx0 = p0.x + pad, gx1 = p1.x - pad;
+    float gy0 = p0.y + pad + lblH;
+    float gy1 = p1.y - pad;
+    float gh = (gy1 - gy0) < 6.0f ? 6.0f : (gy1 - gy0);
+    float gw = (gx1 - gx0) < 6.0f ? 6.0f : (gx1 - gx0);
+    (void)gy0;
+    auto yof = [&](float v) {
+        float t = v / scale_max; t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        return gy1 - t * gh;
+    };
+
+    /* budget guide (dashed) — e.g. the 16.6 ms / 60 FPS frame line. */
+    if (budget > 0.0f && budget < scale_max) {
+        float by = yof(budget);
+        for (float x = gx0; x < gx1; x += 7.0f) {
+            float xe = (x + 3.5f < gx1) ? x + 3.5f : gx1;
+            dl->AddLine(ImVec2(x, by), ImVec2(xe, by), jce_theme::grid_minor(), 1.0f);
+        }
+    }
+
+    if (count >= 2) {
+        ImU32 fill = (line_col & IM_COL32(255, 255, 255, 0)) | IM_COL32(0, 0, 0, 46);
+        float step = gw / (float)(count - 1);
+        for (int i = 0; i < count - 1; ++i) {
+            float x0 = gx0 + step * i, x1 = gx0 + step * (i + 1);
+            float y0 = yof(get(nullptr, i)), y1 = yof(get(nullptr, i + 1));
+            ImVec2 quad[4] = { ImVec2(x0, y0), ImVec2(x1, y1),
+                               ImVec2(x1, gy1), ImVec2(x0, gy1) };
+            dl->AddConvexPolyFilled(quad, 4, fill);
+        }
+        for (int i = 0; i < count - 1; ++i) {
+            float x0 = gx0 + step * i, x1 = gx0 + step * (i + 1);
+            dl->AddLine(ImVec2(x0, yof(get(nullptr, i))),
+                        ImVec2(x1, yof(get(nullptr, i + 1))), line_col, 1.7f);
+        }
+        dl->AddCircleFilled(ImVec2(gx1, yof(get(nullptr, count - 1))), 2.6f, line_col);
+    }
+
+    /* label + current (left), avg·max (right) */
+    char buf[80];
+    ImVec2 lp = ImVec2(p0.x + 7.0f, p0.y + 3.0f);
+    dl->AddText(lp, jce_theme::text_secondary(), label);
+    float lw = ImGui::CalcTextSize(label).x;
+    std::snprintf(buf, sizeof buf, "%.2f%s", cur, unit);
+    dl->AddText(ImVec2(lp.x + lw + 8.0f, lp.y), line_col, buf);
+    std::snprintf(buf, sizeof buf, "%s %.1f  \xC2\xB7  %s %.1f",
+                  jce_editor_i18n("profiler.stat.avg"), avg,
+                  jce_editor_i18n("profiler.stat.max"), peak);
+    float rw = ImGui::CalcTextSize(buf).x;
+    dl->AddText(ImVec2(p1.x - rw - 7.0f, lp.y), jce_theme::text_secondary(), buf);
+
+    ImGui::Dummy(ImVec2(w, height));
+}
+
 void draw_view_table()
 {
+    /* One-time restore of the persisted hot-list sort (user-global —
+     * consistent with the imgui.ini-persisted memory-tab table). */
+    static bool s_sort_loaded = false;
+    if (!s_sort_loaded) {
+        s_sort_loaded = true;
+        s_prof.sort_col  = jce_editor_ui_state_load_int(
+                               "profiler.viewsort.col", s_prof.sort_col, 0, 4);
+        s_prof.sort_desc = jce_editor_ui_state_load_int(
+                               "profiler.viewsort.desc",
+                               s_prof.sort_desc ? 1 : 0, 0, 1) != 0;
+    }
+
     if (s_prof.view_rows.empty()) {
         ImGui::TextDisabled("%s", jce_editor_i18n("profiler.empty.bgfxStats"));
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(
+            "profiler.empty.bgfxStatsHint",
+            "per-view GPU timing needs the bgfx profiler: start with "
+            "JCE_PERF_LOG=1 (enables BGFX_DEBUG_PROFILER)"));
         return;
     }
     /* Sort rows by current sort column. */
@@ -279,12 +373,19 @@ void draw_view_table()
             ImGui::TableSetupColumn(cols[c]);
         ImGui::TableHeadersRow();
 
-        /* Click headers → toggle sort. */
+        /* Click headers → toggle sort.  TableSetColumnIndex submits no item,
+         * so IsItemClicked() tested the LAST header for every column (only
+         * the last header worked, and it fired for all four).  Use the
+         * column hover flag + mouse click instead. */
         for (int c = 0; c < 4; ++c) {
-            ImGui::TableSetColumnIndex(c);
-            if (ImGui::IsItemClicked()) {
+            if ((ImGui::TableGetColumnFlags(c) & ImGuiTableColumnFlags_IsHovered) &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (s_prof.sort_col == c) s_prof.sort_desc = !s_prof.sort_desc;
                 else { s_prof.sort_col = c; s_prof.sort_desc = (c >= 2); }
+                jce_editor_ui_state_save_int("profiler.viewsort.col",
+                                             s_prof.sort_col);
+                jce_editor_ui_state_save_int("profiler.viewsort.desc",
+                                             s_prof.sort_desc ? 1 : 0);
             }
         }
 
@@ -341,6 +442,24 @@ std::string build_clipboard_snapshot(float dt_ms,
     append_fmt(s, "  GPU avg        : %.2f ms\n", gpu_avg);
     append_fmt(s, "  Wait avg       : %.2f ms\n", w_avg);
     append_fmt(s, "  ImGui FPS      : %.1f\n", io.Framerate);
+
+    /* Engine CPU-phase breakdown — the panel's headline table, so it must ride
+     * along in the copied snapshot too (was missing). */
+    s += "\n[CPU phases (engine)]\n";
+    {
+        struct PR { const char *n; double ms; } pr[64]; int prn = 0;
+        int pc = jce_perf_phase_count();
+        for (int i = 0; i < pc && prn < 64; ++i) {
+            const char *nm = NULL; double ms = 0.0;
+            if (jce_perf_phase_peek_frame(i, &nm, &ms) && nm && ms >= 0.01) {
+                pr[prn].n = nm; pr[prn].ms = ms; prn++;
+            }
+        }
+        std::sort(pr, pr + prn, [](const PR &a, const PR &b) { return a.ms > b.ms; });
+        if (prn == 0) s += "  (accumulating)\n";
+        for (int i = 0; i < prn; ++i)
+            append_fmt(s, "  %-16s : %.2f ms\n", pr[i].n, pr[i].ms);
+    }
 
     s += "\n[Renderer (bgfx)]\n";
     append_fmt(s, "  Draw calls     : %u\n", s_prof.num_draw);
@@ -474,6 +593,21 @@ void draw_content(void)
 {
     ImGuiIO &io = ImGui::GetIO();
 
+    /* Keep engine CPU-phase capture live while the panel is open so the
+     * phase table below has data (no-op cost when idle). */
+    jce_perf_phase_set_enabled(1);
+
+    /* History epoch guard: if the tab was hidden for a while, the rings
+     * hold stale frames — mixing them into min/avg/max lies.  Reset. */
+    {
+        static double s_last_draw = -1.0;
+        double t_now = ImGui::GetTime();
+        if (s_last_draw >= 0.0 && (t_now - s_last_draw) > 2.0) {
+            s_prof.head = 0; s_prof.filled = 0; s_prof.uptime_s = 0.0;
+        }
+        s_last_draw = t_now;
+    }
+
     /* Sample current frame. */
     float dt_ms = io.DeltaTime * 1000.0f;
     push_sample(dt_ms);
@@ -494,30 +628,65 @@ void draw_content(void)
 
     float plot_max = std::max(33.4f, mx * 1.2f);
 
-    /* ── Top toolbar: status chip + Copy / Reset ───────────────── */
+    /* ── Summary header: FPS · frame time · bottleneck verdict · actions ── */
     {
         float fps_now = (dt_ms > 0.0f) ? 1000.0f / dt_ms : 0.0f;
-        ImU32 chip_col;
-        if (fps_now >= 55.0f)      chip_col = JCE_COL32_STATUS_OK;
-        else if (fps_now >= 30.0f) chip_col = JCE_COL32_STATUS_WARN;
-        else                       chip_col = IM_COL32(230,  90,  90, 255);
+        ImU32 fps_col;
+        if (fps_now >= 55.0f)      fps_col = JCE_COL32_STATUS_OK;
+        else if (fps_now >= 30.0f) fps_col = JCE_COL32_STATUS_WARN;
+        else                       fps_col = IM_COL32(230, 90, 90, 255);
 
-        ImGui::PushStyleColor(ImGuiCol_Text, chip_col);
-        ImGui::Text(jce_editor_i18n("profiler.fpsChipFmt"), fps_now);   /* ● %.1f FPS */
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-        ImGui::Text("%.2f ms (avg %.2f / max %.2f)", dt_ms, avg, mx);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        float py = ImGui::GetStyle().FramePadding.y;   /* pills = frame height → align with buttons */
+        auto pill = [&](const char *txt, ImU32 bg) {
+            ImVec2 sz = ImGui::CalcTextSize(txt);
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float px = 8.0f;
+            ImVec2 p1 = ImVec2(p0.x + sz.x + px * 2, p0.y + sz.y + py * 2);
+            dl->AddRectFilled(p0, p1, bg, (p1.y - p0.y) * 0.5f);
+            dl->AddText(ImVec2(p0.x + px, p0.y + py), IM_COL32(255, 255, 255, 255), txt);
+            ImGui::Dummy(ImVec2(sz.x + px * 2, sz.y + py * 2));
+        };
 
+        char b[48];
+        std::snprintf(b, sizeof b, "%.0f FPS", fps_now);
+        pill(b, fps_col);
         ImGui::SameLine();
-        float region = ImGui::GetContentRegionAvail().x;
+        ImGui::AlignTextToFramePadding();
+        std::snprintf(b, sizeof b, "%.2f ms", dt_ms);
+        ImGui::TextUnformatted(b);
+        ImGui::SameLine();
+        std::snprintf(b, sizeof b, "%s %.1f  \xC2\xB7  %s %.1f",
+                      jce_editor_i18n("profiler.stat.avg"), avg,
+                      jce_editor_i18n("profiler.stat.max"), mx);
+        ImGui::TextDisabled("%s", b);
+
+        /* Bottleneck verdict — the panel's headline answer (CPU vs GPU work,
+         * waits excluded).  Amber = balanced, green = CPU-bound, blue = GPU. */
+        ImGui::SameLine();
+        const char *verdict; ImU32 vcol;
+        if (cpu_avg + gpu_avg < 0.05f) {
+            verdict = jce_editor_i18n("profiler.verdict.measuring"); vcol = jce_theme::track_even();
+        } else if (cpu_avg > gpu_avg * 1.25f) {
+            verdict = jce_editor_i18n("profiler.verdict.cpuBound");  vcol = IM_COL32(70, 130, 72, 255);
+        } else if (gpu_avg > cpu_avg * 1.25f) {
+            verdict = jce_editor_i18n("profiler.verdict.gpuBound");  vcol = IM_COL32(58, 112, 168, 255);
+        } else {
+            verdict = jce_editor_i18n("profiler.verdict.balanced");  vcol = IM_COL32(150, 122, 52, 255);
+        }
+        pill(verdict, vcol);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.verdict.tip"));
+
+        /* right-aligned actions */
         const char *copy_lbl  = jce_editor_i18n("profiler.action.copyAll");
         const char *reset_lbl = jce_editor_i18n("profiler.action.resetHistory");
         float copy_w  = ImGui::CalcTextSize(copy_lbl).x  + ImGui::GetStyle().FramePadding.x * 2;
         float reset_w = ImGui::CalcTextSize(reset_lbl).x + ImGui::GetStyle().FramePadding.x * 2;
         float gap = ImGui::GetStyle().ItemSpacing.x;
-        ImGui::Dummy(ImVec2(std::max(0.0f, region - copy_w - reset_w - gap * 2), 1));
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(std::max(0.0f, ImGui::GetContentRegionAvail().x
+                                          - copy_w - reset_w - gap), 1));
         ImGui::SameLine();
         if (ImGui::Button(reset_lbl)) {
             reset_history();
@@ -534,18 +703,16 @@ void draw_content(void)
                               snap.size());
         }
         jce_editor::help_tip(jce_editor_i18n("profiler.tooltip.copyAll"));
-        ImGui::Separator();
+        ImGui::Spacing();
     }
 
-    /* ── Frame-time graph ──────────────────────────────────────── */
-    char overlay[64];
-    std::snprintf(overlay, sizeof(overlay), "%.2f ms (%.1f FPS)", avg, fps_avg);
-    ImGui::PlotLines("##frame_ms", &ring_frame, nullptr,
-                     s_prof.filled > 0 ? s_prof.filled : 1,
-                     0, overlay, 0.0f, plot_max,
-                     ImVec2(-1.0f, 80.0f));
+    /* ── Frame-time graph (modern sparkline) ───────────────────── */
+    (void)fps_avg;
+    draw_area_chart(jce_editor_i18n("profiler.bar.frame"), ring_frame,
+                    s_prof.filled, dt_ms, avg, mx, plot_max, " ms",
+                    jce_theme::text_primary(), 16.6f, 84.0f);
 
-    /* ── Stacked bars ──────────────────────────────────────────── */
+    /* ── Frame budget (avg cpu/gpu/wait/frame over the window) ─── */
     ImGui::Spacing();
     ImGui::SeparatorText(jce_editor_i18n("profiler.section.frameBudget"));
     draw_bars_block("avg_bars", cpu_avg, gpu_avg, w_avg, avg);
@@ -553,37 +720,92 @@ void draw_content(void)
     /* ── Per-series mini-plots ─────────────────────────────────── */
     ImGui::Spacing();
     ImGui::SeparatorText(jce_editor_i18n("profiler.section.series"));
-    if (ImGui::BeginTable("prof_series", 2,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_BordersInnerV))
     {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        std::snprintf(overlay, sizeof(overlay), "%s %.2f ms",
-                      jce_editor_i18n("profiler.bar.cpu"), cpu_avg);
-        ImGui::PlotLines("##cpu", &ring_cpu, nullptr, s_prof.filled,
-                         0, overlay, 0.0f, std::max(8.0f, cpu_mx * 1.2f),
-                         ImVec2(-1, 60));
-        ImGui::TableNextColumn();
-        std::snprintf(overlay, sizeof(overlay), "%s %.2f ms",
-                      jce_editor_i18n("profiler.bar.gpu"), gpu_avg);
-        ImGui::PlotLines("##gpu", &ring_gpu, nullptr, s_prof.filled,
-                         0, overlay, 0.0f, std::max(8.0f, gpu_mx * 1.2f),
-                         ImVec2(-1, 60));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        std::snprintf(overlay, sizeof(overlay), "%s %.2f ms",
-                      jce_editor_i18n("profiler.bar.wait"), w_avg);
-        ImGui::PlotLines("##wait", &ring_wait, nullptr, s_prof.filled,
-                         0, overlay, 0.0f, std::max(4.0f, w_mx * 1.2f),
-                         ImVec2(-1, 60));
-        ImGui::TableNextColumn();
-        std::snprintf(overlay, sizeof(overlay), "%s %.1f MB",
-                      jce_editor_i18n("profiler.label.vram"), v_avg);
-        ImGui::PlotLines("##vram", &ring_vram, nullptr, s_prof.filled,
-                         0, overlay, 0.0f, std::max(64.0f, v_mx * 1.1f),
-                         ImVec2(-1, 60));
-        ImGui::EndTable();
+        float cur_cpu  = s_prof.filled > 0 ? ring_cpu (nullptr, s_prof.filled - 1) : 0.0f;
+        float cur_gpu  = s_prof.filled > 0 ? ring_gpu (nullptr, s_prof.filled - 1) : 0.0f;
+        float cur_wait = s_prof.filled > 0 ? ring_wait(nullptr, s_prof.filled - 1) : 0.0f;
+        float cur_vram = s_prof.filled > 0 ? ring_vram(nullptr, s_prof.filled - 1) : 0.0f;
+        const ImU32 c_cpu  = JCE_COL32_STATUS_OK;
+        const ImU32 c_gpu  = IM_COL32( 80, 160, 230, 255);
+        const ImU32 c_wait = IM_COL32(220, 160,  60, 255);
+        const ImU32 c_vram = IM_COL32(170, 130, 230, 255);
+        if (ImGui::BeginTable("prof_series", 2,
+                              ImGuiTableFlags_SizingStretchSame))
+        {
+            ImGui::TableNextRow(); ImGui::TableNextColumn();
+            draw_area_chart(jce_editor_i18n("profiler.bar.cpu"), ring_cpu, s_prof.filled,
+                            cur_cpu, cpu_avg, cpu_mx, std::max(8.0f, cpu_mx * 1.2f),
+                            " ms", c_cpu, 16.6f, 64.0f);
+            ImGui::TableNextColumn();
+            draw_area_chart(jce_editor_i18n("profiler.bar.gpu"), ring_gpu, s_prof.filled,
+                            cur_gpu, gpu_avg, gpu_mx, std::max(8.0f, gpu_mx * 1.2f),
+                            " ms", c_gpu, 16.6f, 64.0f);
+            ImGui::TableNextRow(); ImGui::TableNextColumn();
+            draw_area_chart(jce_editor_i18n("profiler.bar.wait"), ring_wait, s_prof.filled,
+                            cur_wait, w_avg, w_mx, std::max(4.0f, w_mx * 1.2f),
+                            " ms", c_wait, 0.0f, 64.0f);
+            ImGui::TableNextColumn();
+            draw_area_chart(jce_editor_i18n("profiler.label.vram"), ring_vram, s_prof.filled,
+                            cur_vram, v_avg, v_mx, std::max(64.0f, v_mx * 1.1f),
+                            " MB", c_vram, 0.0f, 64.0f);
+            ImGui::EndTable();
+        }
+    }
+
+    /* ── Engine CPU phases (per frame, from jce_perf_phase) — a plain
+     * always-visible breakdown below the charts + budget (NOT collapsed). */
+    ImGui::Spacing();
+    ImGui::SeparatorText(jce_editor_i18n("profiler.section.cpuPhases"));
+    {
+        struct PhaseRow { const char *name; double ms; };
+        PhaseRow rows[64]; int rn = 0;
+        int pc = jce_perf_phase_count();
+        for (int i = 0; i < pc && rn < 64; ++i) {
+            const char *nm = NULL; double ms = 0.0;
+            if (!jce_perf_phase_peek_frame(i, &nm, &ms) || !nm) continue;
+            if (ms < 0.01) continue;
+            rows[rn].name = nm; rows[rn].ms = ms; rn++;
+        }
+        std::sort(rows, rows + rn,
+                  [](const PhaseRow &a, const PhaseRow &b) { return a.ms > b.ms; });
+        if (rn == 0) {
+            ImGui::TextDisabled("%s", jce_editor_i18n("profiler.phases.accumulating"));
+        } else {
+            /* Clean horizontal bar-list: each phase a rounded bar whose LENGTH is
+             * its share of the biggest phase, name inset left, "ms · %" right.
+             * Top row (the bottleneck) amber, the rest CPU-green — one coherent
+             * breakdown, cohesive with the series charts. */
+            const int shown = rn < 14 ? rn : 14;
+            double total = 0.0;
+            for (int i = 0; i < rn; ++i) total += rows[i].ms;
+            double maxms = rows[0].ms > 0.0 ? rows[0].ms : 1.0;
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            float rowh = ImGui::GetTextLineHeight() + 7.0f;
+            const ImU32 top_col = IM_COL32(232, 156, 68, 160);
+            const ImU32 col     = (JCE_COL32_STATUS_OK & IM_COL32(255, 255, 255, 0))
+                                | IM_COL32(0, 0, 0, 150);
+            for (int i = 0; i < shown; ++i) {
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                float w = ImGui::GetContentRegionAvail().x;
+                if (w < 80.0f) w = 80.0f;
+                ImVec2 p1 = ImVec2(p0.x + w, p0.y + rowh);
+                dl->AddRectFilled(p0, p1, jce_theme::track_even(), 3.0f);
+                float fw = w * (float)(rows[i].ms / maxms);
+                if (fw < 2.0f) fw = 2.0f;
+                dl->AddRectFilled(p0, ImVec2(p0.x + fw, p1.y),
+                                  i == 0 ? top_col : col, 3.0f);
+                dl->AddText(ImVec2(p0.x + 7.0f, p0.y + 3.5f),
+                            jce_theme::text_primary(), rows[i].name);
+                char b[64];
+                std::snprintf(b, sizeof b, "%.2f ms  \xC2\xB7  %.0f%%",
+                              rows[i].ms,
+                              total > 0.0 ? 100.0 * rows[i].ms / total : 0.0);
+                float tw = ImGui::CalcTextSize(b).x;
+                dl->AddText(ImVec2(p1.x - tw - 7.0f, p0.y + 3.5f),
+                            jce_theme::text_secondary(), b);
+                ImGui::Dummy(ImVec2(w, rowh));
+            }
+        }
     }
 
     /* ── Numeric stats ─────────────────────────────────────────── */
@@ -697,7 +919,7 @@ void draw_content(void)
 
             row(jce_editor_i18n("profiler.row.cullMode"),
                 cs.enabled ? jce_editor_i18n("profiler.value.cullModeOn")
-                           : jce_editor_i18n("profiler.value.cullModeOff"));
+                        : jce_editor_i18n("profiler.value.cullModeOff"));
             snprintf(buf, sizeof(buf), "%u", cs.total);
             row(jce_editor_i18n("profiler.row.cullTotal"), buf);
             snprintf(buf, sizeof(buf), "%u", cs.visible);
@@ -710,24 +932,24 @@ void draw_content(void)
             snprintf(buf, sizeof(buf), "%.1f %%", pct);
             row(jce_editor_i18n("profiler.row.cullRatio"), buf);
             /* Persistent extent-sized broad-phase (large-world-opt P1 #4).
-             * Developer diagnostics — kept as literal labels (not i18n keys) so
-             * they don't fan out across the 13 shipped locales. */
+            * Developer diagnostics — kept as literal labels (not i18n keys) so
+            * they don't fan out across the 13 shipped locales. */
             snprintf(buf, sizeof(buf), "%ux%ux%u",
-                     cs.grid_res[0], cs.grid_res[1], cs.grid_res[2]);
+                    cs.grid_res[0], cs.grid_res[1], cs.grid_res[2]);
             row("Grid res", buf);
             snprintf(buf, sizeof(buf), "%u / %u", cs.grid_occupied, cs.grid_cells);
             row("Grid occupied / total", buf);
             snprintf(buf, sizeof(buf), "%u", cs.grid_objects);
             row("Grid objects", buf);
             snprintf(buf, sizeof(buf), "%u / %u / %u",
-                     cs.inserted, cs.updated, cs.removed);
+                    cs.inserted, cs.updated, cs.removed);
             row("Churn ins/upd/rem", buf);
             ImGui::EndTable();
         }
         if (cs.enabled && cs.total > 0) {
             float frac = (float)cs.culled / (float)cs.total;
             ImU32 c = (frac >= 0.5f) ? JCE_COL32_STATUS_OK
-                                     : IM_COL32(160, 200, 240, 255);
+                                    : IM_COL32(160, 200, 240, 255);
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
             ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
             ImGui::PopStyleColor();
@@ -816,8 +1038,8 @@ void draw_content(void)
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.wsBudget"));
         if (ImGui::BeginTable("prof_ws", 2,
-                              ImGuiTableFlags_SizingStretchProp |
-                              ImGuiTableFlags_RowBg)) {
+                            ImGuiTableFlags_SizingStretchProp |
+                            ImGuiTableFlags_RowBg)) {
             auto row = [](const char *k, const char *v) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
@@ -836,12 +1058,12 @@ void draw_content(void)
                 }
             };
             auto row_pressure = [&pressure_color](const char *k,
-                                                  JceStreamingPressure p) {
+                                                JceStreamingPressure p) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
                 ImGui::TableNextColumn();
                 ImGui::TextColored(pressure_color(p), "%s",
-                                   jce_streaming_pressure_name(p));
+                                jce_streaming_pressure_name(p));
             };
             char buf[96];
             if (!ws) {
@@ -862,19 +1084,19 @@ void draw_content(void)
                 snprintf(buf, sizeof(buf), "%u", pending);
                 row(jce_editor_i18n("profiler.row.wsPending"), buf);
                 snprintf(buf, sizeof(buf), "%.2f MB",
-                         (double)mem / (1024.0 * 1024.0));
+                        (double)mem / (1024.0 * 1024.0));
                 row(jce_editor_i18n("profiler.row.wsMemory"), buf);
                 snprintf(buf, sizeof(buf), "%u", ents);
                 row(jce_editor_i18n("profiler.row.wsEntities"), buf);
 
                 row_pressure(jce_editor_i18n("profiler.row.wsPressure"),
-                             jce_world_streamer_pressure(ws));
+                            jce_world_streamer_pressure(ws));
                 row_pressure(jce_editor_i18n("profiler.row.wsPressureHighWater"),
-                             jce_world_streamer_pressure_high_water(ws));
+                            jce_world_streamer_pressure_high_water(ws));
 
                 /* Budget counts raw chunk-file bytes (see section tooltip). */
                 snprintf(buf, sizeof(buf), "%.2f / %u MB",
-                         (double)mem / (1024.0 * 1024.0), cfg.budget_mb);
+                        (double)mem / (1024.0 * 1024.0), cfg.budget_mb);
                 row(jce_editor_i18n("profiler.row.wsBudget"), buf);
                 snprintf(buf, sizeof(buf), "%u", evicted);
                 row(jce_editor_i18n("profiler.row.wsEvicted"), buf);
@@ -925,7 +1147,7 @@ void draw_content(void)
         if (ocs.enabled && ocs.total > 0) {
             float frac = (float)ocs.occluded / (float)ocs.total;
             ImU32 c = (frac >= 0.3f) ? JCE_COL32_STATUS_OK
-                                     : IM_COL32(160, 200, 240, 255);
+                                    : IM_COL32(160, 200, 240, 255);
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
             ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
             ImGui::PopStyleColor();
@@ -990,6 +1212,7 @@ void draw_content(void)
 extern "C" void jce_editor_panel_memory_profiler_content(void);
 extern "C" void jce_editor_panel_profile_analyzer_content(void);
 extern "C" void jce_editor_panel_frame_debugger_content(void);
+extern "C" void jce_editor_panel_benchmark_content(void);
 
 namespace {
 
@@ -1001,14 +1224,16 @@ static const char *k_tab_state_key = "panel.profiler.current_tab";
 
 bool valid_tab(int idx)
 {
-    return idx >= 0 && idx <= 3;
+    return idx >= 0 && idx <= 4;
 }
 
 void ensure_tab_state_loaded(void)
 {
     if (g_tab_state_loaded)
         return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 3);
+    /* Clamp must span all 5 tabs (0..4, see valid_tab) — a tighter max
+     * silently remaps a persisted Benchmark tab onto Frame Debugger. */
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 4);
     g_request_tab = g_current_tab;
     g_tab_state_loaded = true;
 }
@@ -1032,11 +1257,13 @@ void draw_workbench(void)
     ImGuiTabItemFlags mem_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
     ImGuiTabItemFlags ana_flags = (g_request_tab == 2) ? ImGuiTabItemFlags_SetSelected : 0;
     ImGuiTabItemFlags fd_flags  = (g_request_tab == 3) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags bm_flags  = (g_request_tab == 4) ? ImGuiTabItemFlags_SetSelected : 0;
 
     char cpu_label[96];
     char mem_label[96];
     char ana_label[96];
     char fd_label [96];
+    char bm_label [96];
     std::snprintf(cpu_label, sizeof(cpu_label), "%s###pf_tab_cpu",
                   jce_editor_i18n("profiler.title"));
     std::snprintf(mem_label, sizeof(mem_label), "%s###pf_tab_memory",
@@ -1045,6 +1272,8 @@ void draw_workbench(void)
                   jce_editor_i18n("profileAnalyzer.title"));
     std::snprintf(fd_label,  sizeof(fd_label),  "%s###pf_tab_framedbg",
                   jce_editor_i18n("frameDebugger.title"));
+    std::snprintf(bm_label,  sizeof(bm_label),  "%s###pf_tab_benchmark",
+                  jce_editor_i18n("benchmark.title"));
 
     if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
         set_current_tab(0);
@@ -1064,6 +1293,11 @@ void draw_workbench(void)
     if (ImGui::BeginTabItem(fd_label, nullptr, fd_flags)) {
         set_current_tab(3);
         jce_editor_panel_frame_debugger_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(bm_label, nullptr, bm_flags)) {
+        set_current_tab(4);
+        jce_editor_panel_benchmark_content();
         ImGui::EndTabItem();
     }
 

@@ -208,6 +208,7 @@ void draw_comp_save_point(JceSavePointComponent *sp);
 void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv);
 void draw_comp_terrain(JceTerrainComponent *tc);
 void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs);
+void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc);
 void draw_comp_grass_field(JceGrassFieldComponent *g);
 void draw_comp_water(JceWaterComponent *w);
 void draw_comp_buoyancy(JceBuoyancyComponent *b);

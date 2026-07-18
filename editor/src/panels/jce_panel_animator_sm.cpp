@@ -23,7 +23,9 @@
 #include "io/jce_editor_file_util.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -426,6 +428,8 @@ void load_from(const char *path)
     g.undo.clear();
     g.redo.clear();
     g.field_edit_open = false;
+    /* Remember the last document that loaded OK (per-project). */
+    jce_editor_pstate_set_str("doc.animsm.last", path);
     jce_editor_console_log("animator-sm loaded: %s (states=%d trans=%d)",
                            path, (int)g.states.size(), (int)g.trans.size());
 }
@@ -513,6 +517,19 @@ void draw_arrow(ImDrawList *dl, ImVec2 a, ImVec2 b, ImU32 col, float thickness)
 
 void draw_canvas(void)
 {
+    /* One-time restore of the persisted canvas view (user-global),
+     * clamped to the same ranges the interactive controls enforce. */
+    static bool s_view_loaded = false;
+    if (!s_view_loaded) {
+        s_view_loaded = true;
+        g.pan.x = jce_editor_ui_state_load_float("animsm.pan_x", g.pan.x,
+                                                 -100000.0f, 100000.0f);
+        g.pan.y = jce_editor_ui_state_load_float("animsm.pan_y", g.pan.y,
+                                                 -100000.0f, 100000.0f);
+        g.zoom  = jce_editor_ui_state_load_float("animsm.zoom", g.zoom,
+                                                 0.25f, 3.0f);
+    }
+
     ImGui::BeginChild("##sm_canvas", ImVec2(0, 0), true,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
@@ -534,6 +551,8 @@ void draw_canvas(void)
         ImVec2 d = ImGui::GetIO().MouseDelta;
         g.pan.x += d.x / g.zoom;
         g.pan.y += d.y / g.zoom;
+        jce_editor_ui_state_save_float("animsm.pan_x", g.pan.x);
+        jce_editor_ui_state_save_float("animsm.pan_y", g.pan.y);
     }
     /* Zoom with Ctrl+wheel. */
     if (hovered && ImGui::GetIO().KeyCtrl) {
@@ -546,6 +565,9 @@ void draw_canvas(void)
             ImVec2 wp_after  = to_world(origin, mp);
             g.pan.x += (wp_after.x - wp_before.x);
             g.pan.y += (wp_after.y - wp_before.y);
+            jce_editor_ui_state_save_float("animsm.pan_x", g.pan.x);
+            jce_editor_ui_state_save_float("animsm.pan_y", g.pan.y);
+            jce_editor_ui_state_save_float("animsm.zoom",  g.zoom);
         }
     }
 
@@ -879,6 +901,16 @@ void draw_toolbar(void)
 
 void draw_content(void)
 {
+    /* One-time prefill of the last successfully loaded document
+     * (per-project) so one click on Load reopens it.  Never auto-loads,
+     * and never clobbers a path already set (typed / programmatic open). */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (!g.path[0])
+            jce_editor_pstate_get_str("doc.animsm.last", g.path, sizeof(g.path));
+    }
+
     seed_default();
     draw_toolbar();
     ImGui::Separator();
@@ -926,6 +958,24 @@ void draw_content(void)
 extern "C" void animator_sm_draw_content(void)
 {
     draw_content();
+}
+
+/* Programmatic open-with-file: load `path` into the State Machine editor and
+ * bring its workbench tab forward.  Used by the inspector path fields'
+ * double-click preview (mirrors the jce_editor_panel_animator_sm shim). */
+extern "C" void jce_panel_animator_sm_open_path(const char *path)
+{
+    if (!path || !path[0]) return;
+    std::snprintf(g.path, sizeof(g.path), "%s", path);
+    load_from(path);   /* has its own asset-path resolver retry */
+
+    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
+    if (ae_vis) *ae_vis = true;
+    char title[128];
+    snprintf(title, sizeof(title), "%s###jce_anim_editor",
+             jce_editor_i18n("animationEditor.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_animation_editor_request_tab(1);   /* 1 = State Machine */
 }
 
 extern "C" void jce_editor_panel_animator_sm(void)

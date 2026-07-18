@@ -32,6 +32,10 @@ typedef struct JceAnimSmBinding JceAnimSmBinding;
 /* Load the .anim_sm.json at `definition_path` and create a per-entity
  * binding owning a fresh runtime instance.  Returns NULL on failure. */
 JCE_API JceAnimSmBinding *jce_anim_sm_binding_create(const char *definition_path);
+/* Create from an in-memory .anim_sm.json buffer (single-exe: bytes
+ * decompressed from the embedded PAK).  `len` may be 0 to strlen(text). */
+JCE_API JceAnimSmBinding *jce_anim_sm_binding_create_mem(const char *text,
+                                                         size_t len);
 
 JCE_API void              jce_anim_sm_binding_destroy(JceAnimSmBinding *b);
 

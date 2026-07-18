@@ -25,7 +25,8 @@ typedef struct JceGpuCaps {
     bool  supports_texture_2d_array;
     bool  supports_texture_cube_array;
     bool  supports_msaa;
-    bool  homogeneous_ndc;           /* true = [-1,1] (GL/Vulkan), false = [0,1] (D3D) */
+    bool  homogeneous_ndc;           /* NDC depth: true = [-1,1] (GL/GLES),
+                                        false = [0,1] (D3D/Vulkan/Metal) */
 
     /* Limits (bgfx reports these as uint32_t). */
     uint32_t  max_texture_size;

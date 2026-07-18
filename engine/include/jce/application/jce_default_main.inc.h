@@ -24,11 +24,14 @@
 #define JCE_DEFAULT_MAIN_INC_H
 
 #include <jce/api_app.h>
+#include <jce/application/jce_engine.h>        /* jce_engine_request_quit (ESC preset) */
 #include <jce/application/jce_main.h>
 #include <jce/application/jce_project.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/middleware/video/jce_webm_encoder.h> /* F9 recording preset */
 #include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix load (Top 4) */
+#include <jce/renderer/jce_render_pipeline.h>   /* settings S2: post-mount re-resolve */
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
@@ -60,6 +63,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>   /* screenshot/recording preset file names */
 
 #ifndef JCE_PROJECT_EMBEDDED_BUNDLE_COUNT
 #  define JCE_PROJECT_EMBEDDED_BUNDLE_COUNT 0
@@ -86,6 +90,83 @@ static JceUICanvas      *s_ui_canvas      = NULL;
  * is set (A/B + safety hatch) or hardware queries are unsupported (silent
  * always-visible fallback). */
 static JceOcclusionCuller *s_occlusion_culler = NULL;
+
+/* ── Runtime UX presets (every default_main app) ──────────────────────
+ * ALT (hold) releases the mouse cursor, ESC held 2s quits cleanly, F11
+ * toggles fullscreen, F12 saves a screenshot and F9 toggles a WebM
+ * recording — both stored under <exe_dir>/screenshots|recordings/. */
+static float  s_preset_esc_hold      = 0.0f;
+static bool   s_preset_alt_active    = false;
+static bool   s_preset_alt_saved_cap = false;  /* cursor-capture state to restore */
+static JceWebmEncoder *s_preset_rec  = NULL;
+static bool   s_preset_rec_active    = false;
+static double s_preset_rec_time      = 0.0;    /* seconds since recording start */
+static char   s_preset_media_dir[512];         /* <exe_dir> (cached at init) */
+static uint32_t s_preset_rec_w, s_preset_rec_h, s_preset_rec_pitch;
+static int      s_preset_rec_yflip;
+static JceScreenshotSchedule s_kpi_game_shots;
+static bool                  s_kpi_game_shots_active = false;
+
+/* Capture-sink callbacks: frames arrive from the renderer's backbuffer
+ * screenshot path (interactive present).  The encoder is created lazily at
+ * the first frame (dimensions unknown until then). */
+static void preset_rec_begin(void *ud, uint32_t w, uint32_t h,
+                             uint32_t pitch, int yflip)
+{
+    (void)ud;
+    s_preset_rec_w = w; s_preset_rec_h = h;
+    s_preset_rec_pitch = pitch; s_preset_rec_yflip = yflip;
+}
+
+static void preset_rec_frame(void *ud, const void *bgra, uint32_t size)
+{
+    (void)ud; (void)size;
+    if (!s_preset_rec_active || !s_preset_rec_w) return;
+    if (!s_preset_rec) {
+        char path[640];
+        snprintf(path, sizeof path, "%srecordings/rec_%lld.webm",
+                 s_preset_media_dir, (long long)time(NULL));
+        char dir[640];
+        snprintf(dir, sizeof dir, "%srecordings", s_preset_media_dir);
+        jce_fs_host_create_directory(dir);
+        s_preset_rec = jce_webm_encoder_create(path, s_preset_rec_w,
+                                               s_preset_rec_h, 60, 8000, 0, 0);
+        if (s_preset_rec)
+            LOG_SUCCESS("app", "recording -> %s", path);
+        else {
+            LOG_ERROR("app", "%s", "recording encoder create failed");
+            s_preset_rec_active = false;
+            return;
+        }
+    }
+    jce_webm_encoder_push_bgra(s_preset_rec, bgra, s_preset_rec_pitch,
+                               s_preset_rec_yflip,
+                               (uint64_t)(s_preset_rec_time * 1000.0));
+}
+
+static void preset_rec_end(void *ud) { (void)ud; }
+
+/* Presence probe: does any entity carry a CharacterController?  Used by
+ * app_init to pick the boot cursor mode (captured FPS-look vs free). */
+static void dm_char_probe_cb(JceScene *s, JceEntity e, void *ud)
+{
+    if (jce_scene_has_character_controller(s, e)) *(bool *)ud = true;
+}
+
+/* Count entities (occlusion-culler gate: skip it on small scenes). */
+static void dm_count_entities_cb(JceScene *s, JceEntity e, void *ud)
+{
+    (void)s; (void)e;
+    ++*(uint32_t *)ud;
+}
+static bool dm_scene_has_any_character(JceScene *s, JceEntity *unused)
+{
+    (void)unused;
+    bool found = false;
+    jce_scene_each_entity(s, dm_char_probe_cb, &found);
+    return found;
+}
+
 /* Project-wide quality settings (Top 5): loaded once in app_init from the
  * cooked render_settings.json (build-exported from Project Settings > Quality),
  * folded into the scene render config as the project DEFAULT.  Per-scene
@@ -104,12 +185,18 @@ static bool              s_jump_edge      = false;
  * camera look and authored UI is presentational.  Tab toggles capture off so
  * the cursor is freed and in-game UIButtons become clickable (FEATURE 4.1):
  * while uncaptured we feed a real pointer into the canvas and dispatch clicks
- * to the gameplay script VM.  Starts captured to preserve the FPS feel. */
+ * to the gameplay script VM.  The BOOT state is scene-driven (app_init):
+ * captured only when the scene has a CharacterController (an FPS/TPS game);
+ * diorama / orbit / UI-first scenes start with a FREE, visible cursor so
+ * drag-orbit and authored HUD buttons work out of the box. */
 static bool              s_cursor_captured = true;
 /* Open-world chunk streamer — created only when the startup scene's
  * authored streaming settings are enabled (World Streaming panel). */
 static JceWorldStreamer *s_world_streamer = NULL;
-static JceFileSystem    *s_stream_fs      = NULL;   /* owned only when not bundle-backed */
+/* One runtime asset view for startup scenes, streamed chunks, and loose
+ * developer overrides. It mounts the embedded PAK plus an optional cooked
+ * directory, with the VFS's documented loose-over-PAK precedence. */
+static JceFileSystem    *s_runtime_fs     = NULL;
 /* Background worker pool for async chunk loads (disk read + JSON-byte staging
  * off-thread; scene apply/spawn stays on the main thread).  Owned here for the
  * app lifetime; destroyed at shutdown AFTER the streamer (whose destroy joins
@@ -130,14 +217,67 @@ static JceThreadPool    *s_stream_pool    = NULL;
  * never hits this because its load_mesh callback is backed by the editor
  * asset cache; the standalone runtime must provide its own.  Meshes are
  * owned here and destroyed in app_exit. */
-#define JCE_DEFAULT_MESH_CACHE_MAX 256
-static struct {
-    char     path[256];
-    JceMesh *mesh;
-    bool     used;
-    bool     failed;
-} s_mesh_cache[JCE_DEFAULT_MESH_CACHE_MAX];
-static int s_mesh_cache_count = 0;
+/* Grows on demand — never a fixed cap.  A large streamed world can reference
+ * thousands of DISTINCT meshes; an overflowing fixed cache would silently stop
+ * caching the excess and re-import it every pass every frame (the exact
+ * per-frame cliff this cache exists to prevent).  Lookup is O(1) via an
+ * open-addressing hash index (linear probe over a power-of-two table keyed by
+ * an FNV-1a hash of the path) so the per-entity-per-pass hot path never
+ * linear-scans.  Failed imports are cached (mesh == NULL) so a missing asset
+ * is not re-attempted every frame either. */
+typedef struct {
+    char    *path;   /* owned copy                     */
+    JceMesh *mesh;   /* NULL == cached failed import    */
+    uint64_t hash;   /* FNV-1a of path                  */
+} JceDefaultMeshEntry;
+static JceDefaultMeshEntry *s_mesh_cache       = NULL;  /* s_mesh_cache_count entries */
+static int32_t             *s_mesh_index       = NULL;  /* slot -> entry idx, -1 empty */
+static uint32_t             s_mesh_index_cap   = 0;     /* power of two, or 0 */
+static uint32_t             s_mesh_cache_count = 0;
+static uint32_t             s_mesh_cache_cap   = 0;
+
+/* FNV-1a 64-bit — small, deterministic, avoids pulling xxhash into this TU. */
+static uint64_t dm_path_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; ++s) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Entry index for hash/path, or -1 if absent (open-addressing linear probe). */
+static int dm_mesh_cache_find(uint64_t hash, const char *path) {
+    if (!s_mesh_index_cap) return -1;
+    uint32_t mask = s_mesh_index_cap - 1;
+    for (uint32_t slot = (uint32_t)hash & mask; ; slot = (slot + 1) & mask) {
+        int32_t ei = s_mesh_index[slot];
+        if (ei < 0) return -1;
+        if (s_mesh_cache[ei].hash == hash &&
+            strcmp(s_mesh_cache[ei].path, path) == 0) return ei;
+    }
+}
+
+/* Place entry `ei` into the index (caller guarantees a free slot exists). */
+static void dm_mesh_index_put(int32_t ei) {
+    uint32_t mask = s_mesh_index_cap - 1;
+    uint32_t slot = (uint32_t)s_mesh_cache[ei].hash & mask;
+    while (s_mesh_index[slot] >= 0) slot = (slot + 1) & mask;
+    s_mesh_index[slot] = ei;
+}
+
+/* Keep the index under a 0.75 load factor; rebuild on growth.  Returns false
+ * only on allocation failure (caller then skips caching this mesh). */
+static bool dm_mesh_index_reserve(uint32_t want) {
+    if (s_mesh_index_cap && want * 4u < s_mesh_index_cap * 3u) return true;
+    uint32_t ncap = s_mesh_index_cap ? s_mesh_index_cap : 64u;
+    while (want * 4u >= ncap * 3u) ncap *= 2u;
+    int32_t *ni = (int32_t *)malloc(sizeof(int32_t) * ncap);
+    if (!ni) return false;
+    for (uint32_t i = 0; i < ncap; ++i) ni[i] = -1;
+    free(s_mesh_index);
+    s_mesh_index     = ni;
+    s_mesh_index_cap = ncap;
+    for (uint32_t i = 0; i < s_mesh_cache_count; ++i) dm_mesh_index_put((int32_t)i);
+    return true;
+}
 /* s_yaw / s_pitch removed: camera owns its own yaw/pitch now and
  * we stopped using the third-person orbit math that depended on them. */
 
@@ -196,13 +336,83 @@ static void jce_default_unmount_project_bundles(void)
     if (s_bundle_fs) { jce_fs_destroy(s_bundle_fs); s_bundle_fs = NULL; }
 }
 
-/* Resolve <startup_scene> from any mounted bundle first; fall back to
- * the cooked tree on disk (`<exe_dir>/<cooked_assets>/<startup_scene>`).
- * cooked_assets defaults to "resources/_cooked" when omitted. */
-static bool jce_default_load_startup_scene(const JceProject *proj)
+static JceProject *jce_default_load_project_manifest(void)
 {
-    const char *scene_path = (proj && proj->startup_scene && proj->startup_scene[0])
-                             ? proj->startup_scene : NULL;
+    char base[1024] = {0};
+    JceProject *project = NULL;
+
+    if (jce_fs_host_get_base_path(base, sizeof(base)))
+        project = jce_project_load(base);
+    if (!project)
+        project = jce_project_load(".");
+    return project;
+}
+
+static bool jce_default_mount_runtime_assets(const JceProject *proj)
+{
+    bool has_pak = false;
+    bool has_loose = false;
+    char base[1024] = {0};
+
+    s_runtime_fs = jce_fs_create();
+    if (!s_runtime_fs) {
+        LOG_ERROR("app", "%s", "could not create runtime asset filesystem");
+        return false;
+    }
+
+    if (s_engine_pak) {
+        jce_fs_mount_pak(s_runtime_fs, s_engine_pak);
+        has_pak = true;
+    }
+
+    if (jce_fs_host_get_base_path(base, sizeof(base))) {
+        const char *cooked = (proj && proj->cooked_assets &&
+                              proj->cooked_assets[0])
+                             ? proj->cooked_assets : "resources/_cooked";
+        char root[1200];
+        int n = snprintf(root, sizeof(root), "%s%s", base, cooked);
+        if (n > 0 && n < (int)sizeof(root) &&
+            jce_fs_host_exists_dir(root)) {
+            jce_fs_mount_dir(s_runtime_fs, "", root);
+            has_loose = true;
+        }
+    }
+
+    if (!has_pak && !has_loose) {
+        LOG_ERROR("app", "%s", "no runtime asset source is available");
+        jce_fs_destroy(s_runtime_fs);
+        s_runtime_fs = NULL;
+        return false;
+    }
+
+    /* Make the mounted runtime view visible to legacy loaders which consume
+     * project-relative paths through jce_fs_host_read_all(). Without this,
+     * a copied single-executable app could load the startup scene explicitly
+     * from its PAK yet later CPU-side assets silently fell back to the host
+     * filesystem and disappeared outside the build directory. */
+    jce_fs_set_active(s_runtime_fs);
+
+    LOG_INFO("app", "runtime assets mounted: pak=%s loose=%s",
+             has_pak ? "yes" : "no", has_loose ? "yes" : "no");
+    return true;
+}
+
+/* Resolve the startup scene through the unified runtime asset view.  A loose
+ * project manifest is an explicit developer override; otherwise the packed
+ * boot manifest determines the shipping scene. */
+static bool jce_default_load_startup_scene(
+    const JceProject *proj, const JceRuntimeBootManifest *boot)
+{
+    const char *scene_path = (proj && proj->startup_scene &&
+                              proj->startup_scene[0])
+                                 ? proj->startup_scene : NULL;
+    if (!scene_path) {
+        if (boot && boot->startup_scene[0]) {
+            scene_path = boot->startup_scene;
+            LOG_INFO("app", "startup scene selected from runtime boot: %s",
+                     scene_path);
+        }
+    }
     if (!scene_path) {
         for (int i = 0; i < s_bundle_count; ++i) {
             const char *sp = jce_bundle_file_scene_path(s_bundle_files[i]);
@@ -213,38 +423,23 @@ static bool jce_default_load_startup_scene(const JceProject *proj)
             }
         }
     }
-    if (!scene_path) return false;
+    if (!scene_path) return true; /* Intentional empty-project boot. */
+
+    if (!s_runtime_fs) {
+        LOG_ERROR("app", "%s", "startup scene requested without runtime assets");
+        return false;
+    }
 
     s_scene = jce_scene_create();
     if (!s_scene) { LOG_ERROR("app", "%s", "jce_scene_create failed"); return false; }
 
-    if (s_bundle_fs &&
-        jce_scene_serial_load_vfs(s_scene, s_bundle_fs, scene_path)) {
-        LOG_INFO("app", "startup scene loaded (bundle): %s", scene_path);
-        return true;
-    }
-
-    char base[1024] = {0};
-    if (!jce_fs_host_get_base_path(base, sizeof(base))) {
-        LOG_WARN("app", "%s", "could not determine executable directory");
+    if (!jce_scene_serial_load_vfs(s_scene, s_runtime_fs, scene_path)) {
+        LOG_ERROR("app", "failed to load startup scene from runtime assets: %s",
+                  scene_path);
         jce_scene_destroy(s_scene); s_scene = NULL;
         return false;
     }
-    const char *cooked = (proj && proj->cooked_assets && proj->cooked_assets[0])
-                         ? proj->cooked_assets : "resources/_cooked";
-    char path[1024];
-    int n = snprintf(path, sizeof(path), "%s%s/%s", base, cooked, scene_path);
-    if (n <= 0 || n >= (int)sizeof(path)) {
-        LOG_WARN("app", "%s", "startup scene path too long");
-        jce_scene_destroy(s_scene); s_scene = NULL;
-        return false;
-    }
-    if (!jce_scene_serial_load_file(s_scene, path)) {
-        LOG_ERROR("app", "failed to load startup scene: %s", path);
-        jce_scene_destroy(s_scene); s_scene = NULL;
-        return false;
-    }
-    LOG_INFO("app", "startup scene loaded: %s", path);
+    LOG_INFO("app", "startup scene loaded (runtime assets): %s", scene_path);
     return true;
 }
 
@@ -283,35 +478,21 @@ static uint64_t s_default_streamer_residency_cb(const uint64_t *ids,
 }
 
 /* Build the world streamer from the startup scene's authored streaming
- * settings.  FS source: when bundles are mounted, chunk fragments stream
- * out of the bundle VFS (s_bundle_fs); otherwise a private fs mounting
- * <exe_dir>/<cooked_assets> is created (same base the startup scene
- * loaded from), so fragment paths stay project-relative either way. */
+ * settings. Chunks share the startup scene's unified runtime asset view,
+ * preserving loose-over-PAK precedence for the complete scene. */
 static void jce_default_init_world_streaming(const JceProject *proj)
 {
+    (void)proj;
     if (!s_scene) return;
 
     const JceSceneStreamingSettings *st =
         jce_scene_get_streaming_settings(s_scene);
     if (!st || !st->enabled || st->chunk_count == 0) return;
 
-    JceFileSystem *fs = s_bundle_fs;
+    JceFileSystem *fs = s_runtime_fs;
     if (!fs) {
-        char base[1024] = {0};
-        if (!jce_fs_host_get_base_path(base, sizeof(base))) {
-            LOG_WARN("app", "%s", "world streaming: no base path — disabled");
-            return;
-        }
-        const char *cooked = (proj && proj->cooked_assets && proj->cooked_assets[0])
-                             ? proj->cooked_assets : "resources/_cooked";
-        char root[1024];
-        int n = snprintf(root, sizeof(root), "%s%s", base, cooked);
-        if (n <= 0 || n >= (int)sizeof(root)) return;
-
-        s_stream_fs = jce_fs_create();
-        if (!s_stream_fs) return;
-        jce_fs_mount_dir(s_stream_fs, "", root);
-        fs = s_stream_fs;
+        LOG_WARN("app", "%s", "world streaming: runtime assets unavailable");
+        return;
     }
 
     JceWorldStreamConfig wsc = jce_world_stream_config_default();
@@ -338,7 +519,6 @@ static void jce_default_init_world_streaming(const JceProject *proj)
     if (!s_world_streamer) {
         LOG_WARN("app", "%s", "world streamer creation failed — streaming disabled");
         if (pool) jce_thread_pool_destroy(pool);
-        if (s_stream_fs) { jce_fs_destroy(s_stream_fs); s_stream_fs = NULL; }
         return;
     }
     s_stream_pool = pool;
@@ -406,6 +586,15 @@ static bool s_default_resolve_path(const char *in, char *out, int outsz, void *u
     return jce_fs_host_exists_file(out);
 }
 
+/* JceRuntimeDesc.resolve_path_fn adapter: same cooked-tree anchoring as
+ * s_default_resolve_path, with the runtime's (user_data, in, out, size)
+ * argument order. */
+static bool s_runtime_resolve_path(void *user_data, const char *in_path,
+                                   char *out_path, int out_size)
+{
+    return s_default_resolve_path(in_path, out_path, out_size, user_data);
+}
+
 static JceMesh *s_default_load_mesh(const char *path, void *ud)
 {
     (void)ud;
@@ -419,22 +608,31 @@ static JceMesh *s_default_load_mesh(const char *path, void *ud)
      * each import is expensive (decompress + Assimp + GPU upload). */
     if (!s_engine_pak || !path || path[0] == '\0') return NULL;
 
-    for (int i = 0; i < s_mesh_cache_count; ++i) {
-        if (s_mesh_cache[i].used &&
-            strncmp(s_mesh_cache[i].path, path,
-                    sizeof s_mesh_cache[i].path) == 0)
-            return s_mesh_cache[i].failed ? NULL : s_mesh_cache[i].mesh;
-    }
+    uint64_t h  = dm_path_hash(path);
+    int      ei = dm_mesh_cache_find(h, path);
+    if (ei >= 0) return s_mesh_cache[ei].mesh;   /* NULL == cached failure */
 
     JceMesh *mesh = jce_model_importer_load_pak(s_engine_pak, path);
 
-    if (s_mesh_cache_count < JCE_DEFAULT_MESH_CACHE_MAX) {
-        int idx = s_mesh_cache_count++;
-        snprintf(s_mesh_cache[idx].path, sizeof s_mesh_cache[idx].path,
-                 "%s", path);
-        s_mesh_cache[idx].mesh   = mesh;
-        s_mesh_cache[idx].used   = true;
-        s_mesh_cache[idx].failed = (mesh == NULL);
+    /* Cache the result (including a NULL failure) — grow on demand so a large
+     * world never overflows the cache and re-imports the excess every frame. */
+    if (s_mesh_cache_count == s_mesh_cache_cap) {
+        uint32_t ncap = s_mesh_cache_cap ? s_mesh_cache_cap * 2u : 64u;
+        JceDefaultMeshEntry *ne = (JceDefaultMeshEntry *)realloc(
+            s_mesh_cache, sizeof(JceDefaultMeshEntry) * ncap);
+        if (ne) { s_mesh_cache = ne; s_mesh_cache_cap = ncap; }
+    }
+    if (s_mesh_cache_count < s_mesh_cache_cap &&
+        dm_mesh_index_reserve(s_mesh_cache_count + 1u)) {
+        char *pc = (char *)malloc(strlen(path) + 1);
+        if (pc) {
+            strcpy(pc, path);
+            uint32_t idx = s_mesh_cache_count++;
+            s_mesh_cache[idx].path = pc;
+            s_mesh_cache[idx].mesh = mesh;
+            s_mesh_cache[idx].hash = h;
+            dm_mesh_index_put((int32_t)idx);
+        }
     }
     return mesh;
 }
@@ -473,10 +671,55 @@ static bool s_default_ground_query_cb(uint64_t entity, const float origin[3],
                                       out_hit_y, out_normal);
 }
 
+/* Single-exe fallback for the host-fs-anchored cooked config loaders
+ * (physics_layers.json / render_settings.json): decompress a small cooked
+ * config file straight out of the embedded PAK into a heap buffer.  Returns
+ * malloc'd bytes (caller frees) + *out_len, or NULL on miss / oversize.  This
+ * mirrors the render-pipeline PAK fallback (jce_render_pipeline_load_pak) so a
+ * true single self-contained exe (no loose cooked tree) still applies its
+ * authored settings instead of silently reverting to engine defaults. */
+static char *dm_pak_read_config(const char *pak_key, size_t *out_len)
+{
+    if (!s_engine_pak || !pak_key || !pak_key[0] || !out_len) return NULL;
+    const JcePakAsset *a = jce_pak_find(s_engine_pak, pak_key);
+    if (!a || a->original_size == 0 || a->original_size > (1u << 20)) return NULL;
+    char *buf = (char *)malloc((size_t)a->original_size);
+    if (!buf) return NULL;
+    if (jce_pak_decompress(a, buf, (size_t)a->original_size) !=
+        (size_t)a->original_size) { free(buf); return NULL; }
+    *out_len = (size_t)a->original_size;
+    return buf;
+}
+
 static bool app_init(const JceServices *svc, void *ud)
 {
     (void)ud;
     s_svc = svc;
+
+    memset(&s_kpi_game_shots, 0, sizeof(s_kpi_game_shots));
+    s_kpi_game_shots_active = false;
+    {
+        const char *spec = getenv("JCE_KPI_GAME_SHOTS");
+        if (spec && spec[0]) {
+            char error[192];
+            if (jce_screenshot_schedule_parse(
+                    spec, &s_kpi_game_shots, error, sizeof(error))) {
+                s_kpi_game_shots_active = true;
+                LOG_INFO("app", "deterministic game capture enabled (%d shot%s)",
+                         s_kpi_game_shots.count,
+                         s_kpi_game_shots.count == 1 ? "" : "s");
+            } else {
+                LOG_ERROR("app", "invalid JCE_KPI_GAME_SHOTS: %s", error);
+            }
+        }
+    }
+
+    /* Media dir for the F12/F9 presets = the exe's directory (screenshots/
+     * and recordings/ are created lazily on first use). */
+    if (!jce_fs_host_get_base_path(s_preset_media_dir,
+                                   sizeof s_preset_media_dir))
+        s_preset_media_dir[0] = '\0';
+
     jce_default_mount_project_bundles();
 
     /* Promote bundle[0] as base render PAK when project ships no
@@ -504,10 +747,64 @@ static bool app_init(const JceServices *svc, void *ud)
                      jce_bundle_file_id(s_bundle_files[0]));
     }
 
-    s_project = jce_project_load(".");
-    if (!s_project)
-        LOG_WARN("app", "%s", "jce_project.json not found — running with defaults");
-    jce_default_load_startup_scene(s_project);
+    /* Settings S2: the engine-init boot ran BEFORE any game PAK was mounted,
+     * so a packaged single-exe game always fell back to the tier preset and
+     * silently lost its authored render-pipeline asset.  Re-resolve now that
+     * bundles are overlaid: host file (CWD, exe dir) first, then the packed
+     * key.  Strict no-op when nothing resolves. */
+    jce_render_pipeline_apply_boot_mounted(
+        (const struct JcePakArchive *)s_engine_pak,
+        "Settings/RenderPipeline.rp.json",
+        "settings/render_pipeline.rp.json");
+
+    /* Settings S7 follow-up: re-layer the player's saved in-game graphics
+     * choices (jce.ini [graphics]) — the re-resolve above may have replaced
+     * the pipeline with the packed .rp.json, and the player's own choices
+     * (layer 4, USER CONFIG) outrank the asset (layer 3).  Strict no-op when
+     * the config carries no [graphics] section. */
+    if (svc)
+        jce_engine_apply_graphics_config(svc->config, svc->renderer);
+
+    s_project = jce_default_load_project_manifest();
+    JceRuntimeBootManifest runtime_boot = {0};
+    const bool boot_entry_present = s_engine_pak &&
+        jce_pak_find(s_engine_pak, JCE_RUNTIME_BOOT_MANIFEST_PATH);
+    const bool boot_loaded = s_engine_pak &&
+        jce_runtime_boot_manifest_load_pak(s_engine_pak, &runtime_boot);
+    if (boot_entry_present && !boot_loaded) {
+        LOG_ERROR("app", "%s", "runtime boot manifest is invalid");
+        return false;
+    }
+    if (!s_project && !boot_loaded) {
+        LOG_ERROR("app", "%s",
+                  "jce_project.json and packed runtime boot manifest are both missing");
+        return false;
+    }
+    if (!jce_default_mount_runtime_assets(s_project))
+        return false;
+    if (!jce_default_load_startup_scene(s_project,
+                                        boot_loaded ? &runtime_boot : NULL)) {
+        return false;
+    }
+
+    /* Anchor component-relative *.particles.json reads under the staged
+     * cooked tree (same class of fix as s_default_resolve_path below: those
+     * reads are otherwise CWD-relative and fail when CWD != cooked root). */
+    {
+        char base[1024] = {0};
+        if (jce_fs_host_get_base_path(base, sizeof(base))) {
+            const char *cooked = (s_project && s_project->cooked_assets &&
+                                  s_project->cooked_assets[0])
+                                 ? s_project->cooked_assets : "resources/_cooked";
+            char root[1200];
+            snprintf(root, sizeof root, "%s%s", base, cooked);
+            jce_scene_particles_set_asset_root(root);
+        }
+    }
+    /* Single-exe: publish the overlaid game PAK so *.particles.json descriptors
+     * load straight from the embedded PAK when no loose cooked tree ships beside
+     * the exe (the host-fs anchor above then just serves loose dev builds). */
+    jce_scene_particles_set_pak((const struct JcePakArchive *)s_engine_pak);
 
     JceCameraDesc cam_desc = {0};
     cam_desc.mode       = JCE_CAMERA_PERSPECTIVE;
@@ -549,9 +846,20 @@ static bool app_init(const JceServices *svc, void *ud)
      * single scene-render path per frame so no second culler shares the view. */
     if (svc && svc->renderer) {
         const char *dis = getenv("JCE_DISABLE_OCCLUSION");
+        /* GPU-query occlusion is a NET LOSS on small scenes: its multi-frame
+         * result latency (bgfx keeps several frames in flight) exceeds any
+         * hysteresis window, so entities flicker under camera rotation, and a
+         * ~hundred-entity diorama occludes nothing anyway.  Skip it below a
+         * threshold; large streamed worlds still get it. */
+        uint32_t ent_count = 0;
+        if (s_scene) jce_scene_each_entity(s_scene, dm_count_entities_cb, &ent_count);
         if (dis && dis[0] && dis[0] != '0') {
             LOG_INFO("app", "%s",
                      "JCE_DISABLE_OCCLUSION set — runtime occlusion culling OFF");
+        } else if (ent_count > 0 && ent_count < 512) {
+            LOG_INFO("app", "scene has %u entities (<512) — runtime occlusion "
+                            "culling OFF (no benefit; avoids query-latency flicker)",
+                     ent_count);
         } else {
             JceShaderSet oc_shaders;
             memset(&oc_shaders, 0, sizeof(oc_shaders));
@@ -579,9 +887,12 @@ static bool app_init(const JceServices *svc, void *ud)
      * bodies spawn with the correct (group,mask) collision filter, exactly like
      * the editor pushes it before its own runtime create.  The build exports it
      * into the cooked tree as `physics_layers.json` (jce.physlayers.v1); absent
-     * ⇒ engine default (all layers collide).  Host-fs only (loose cooked tree —
-     * the default stage_loose package layout). */
+     * ⇒ engine default (all layers collide).  Loose cooked tree first (a dev
+     * build can hot-tweak it), then the embedded PAK — so a single
+     * self-contained exe (no loose tree) still spawns with the authored
+     * collision filter instead of the all-collide default. */
     {
+        bool matrix_loaded = false;
         char base[1024] = {0};
         if (jce_fs_host_get_base_path(base, sizeof(base))) {
             const char *cooked = (s_project && s_project->cooked_assets &&
@@ -591,8 +902,20 @@ static bool app_init(const JceServices *svc, void *ud)
             int n = snprintf(lpath, sizeof(lpath), "%s%s/physics_layers.json",
                              base, cooked);
             if (n > 0 && n < (int)sizeof(lpath) &&
-                jce_physics_layer_matrix_load_json(lpath))
+                jce_physics_layer_matrix_load_json(lpath)) {
                 LOG_INFO("app", "physics layer matrix loaded: %s", lpath);
+                matrix_loaded = true;
+            }
+        }
+        if (!matrix_loaded) {
+            size_t clen = 0;
+            char *cbuf = dm_pak_read_config("physics_layers.json", &clen);
+            if (cbuf) {
+                if (jce_physics_layer_matrix_load_json_mem(cbuf, clen))
+                    LOG_INFO("app", "%s",
+                             "physics layer matrix loaded: pak:physics_layers.json");
+                free(cbuf);
+            }
         }
     }
 
@@ -601,6 +924,10 @@ static bool app_init(const JceServices *svc, void *ud)
      * now; the shadow tier folds into the scene render config each frame via
      * s_default_scene_cfg().  Missing file ⇒ engine defaults. */
     {
+        /* Loose cooked tree first (dev hot-tweak), then the embedded PAK, so a
+         * single self-contained exe still applies the authored shadow tier /
+         * MSAA / vsync / LOD bias / grass toggle instead of engine defaults. */
+        bool rs_loaded = false;
         char base[1024] = {0};
         if (jce_fs_host_get_base_path(base, sizeof(base))) {
             const char *cooked = (s_project && s_project->cooked_assets &&
@@ -611,23 +938,39 @@ static bool app_init(const JceServices *svc, void *ud)
                              base, cooked);
             if (n > 0 && n < (int)sizeof(rpath) &&
                 jce_render_settings_load_json(rpath, &s_render_settings)) {
-                s_render_settings_loaded = true;
-                jce_texture_set_global_mip_bias((int8_t)s_render_settings.lod_bias);
-                /* Window-period graphics: vsync + MSAA are swapchain reset
-                 * flags, applied here via a GPU reset (the renderer is already
-                 * created).  HDR is handled by the pipeline's internal HDR
-                 * offscreen target + tonemap, not a backbuffer flag. */
-                if (svc && svc->renderer) {
-                    jce_renderer_set_vsync(svc->renderer, s_render_settings.vsync != 0);
-                    jce_renderer_set_msaa(svc->renderer, s_render_settings.msaa);
-                }
-                /* Grass rendering project gate (Stage 1b.6). */
-                if (s_scene_renderer)
-                    jce_scene_renderer_set_grass_enabled(s_scene_renderer,
-                        s_render_settings.grass_enabled != 0);
-                LOG_INFO("app", "render settings loaded: %s (vsync=%d msaa=%d)",
-                         rpath, s_render_settings.vsync, s_render_settings.msaa);
+                LOG_INFO("app", "render settings loaded: %s", rpath);
+                rs_loaded = true;
             }
+        }
+        if (!rs_loaded) {
+            size_t clen = 0;
+            char *cbuf = dm_pak_read_config("render_settings.json", &clen);
+            if (cbuf) {
+                if (jce_render_settings_load_json_mem(cbuf, clen, &s_render_settings)) {
+                    LOG_INFO("app", "%s",
+                             "render settings loaded: pak:render_settings.json");
+                    rs_loaded = true;
+                }
+                free(cbuf);
+            }
+        }
+        if (rs_loaded) {
+            s_render_settings_loaded = true;
+            jce_texture_set_global_mip_bias((int8_t)s_render_settings.lod_bias);
+            /* Window-period graphics: vsync + MSAA are swapchain reset flags,
+             * applied here via a GPU reset (the renderer is already created).
+             * HDR is handled by the pipeline's internal HDR offscreen target +
+             * tonemap, not a backbuffer flag. */
+            if (svc && svc->renderer) {
+                jce_renderer_set_vsync(svc->renderer, s_render_settings.vsync != 0);
+                jce_renderer_set_msaa(svc->renderer, s_render_settings.msaa);
+            }
+            /* Grass rendering project gate (Stage 1b.6). */
+            if (s_scene_renderer)
+                jce_scene_renderer_set_grass_enabled(s_scene_renderer,
+                    s_render_settings.grass_enabled != 0);
+            LOG_INFO("app", "render settings applied (vsync=%d msaa=%d)",
+                     s_render_settings.vsync, s_render_settings.msaa);
         }
     }
 
@@ -637,6 +980,13 @@ static bool app_init(const JceServices *svc, void *ud)
         rd.pak            = s_engine_pak;
         rd.audio          = svc ? svc->audio : NULL;
         rd.enable_physics = true;
+        /* Anchor runtime host-fs reads (scripts, BT trees, .seq, terrain
+         * meta) to the cooked tree, mirroring the renderer's resolver.
+         * Without this the runtime's host-first read resolves relative to
+         * the process CWD, silently misses the loose cooked tree and falls
+         * through to the PAK — loose-tree script edits beside a shipped exe
+         * never load (PAK-only), unlike every other asset class. */
+        rd.resolve_path_fn = s_runtime_resolve_path;
 
         /* Game L10n: prefer the on-disk cooked tree's i18n dir
          * (<exe_dir>/<cooked_assets>/i18n) so shipped games hot-load
@@ -661,6 +1011,29 @@ static bool app_init(const JceServices *svc, void *ud)
         }
         rd.locale = (svc && svc->config && svc->config->locale[0])
                     ? svc->config->locale : NULL;
+
+        /* Authored audio-mixer routing (Settings/audio_mixer.json, beside
+         * Settings/RenderPipeline.rp.json).  Host-first like the render
+         * pipeline: CWD (dev run from the project root), then the exe dir
+         * (shipped layout).  Absent => rt_init_mixer seeds the default
+         * Music/SFX/Voice/UI tree.  Static: the runtime keeps the pointer. */
+        static char s_mixer_cfg_path[1200];
+        {
+            const char *rel = "Settings/audio_mixer.json";
+            char base[1024] = {0};
+            if (jce_fs_host_exists_file(rel)) {
+                snprintf(s_mixer_cfg_path, sizeof(s_mixer_cfg_path), "%s", rel);
+                rd.mixer_config_path = s_mixer_cfg_path;
+            } else if (jce_fs_host_get_base_path(base, sizeof(base))) {
+                int n = snprintf(s_mixer_cfg_path, sizeof(s_mixer_cfg_path),
+                                 "%s%s", base, rel);
+                if (n > 0 && n < (int)sizeof(s_mixer_cfg_path) &&
+                    jce_fs_host_exists_file(s_mixer_cfg_path))
+                    rd.mixer_config_path = s_mixer_cfg_path;
+            }
+            if (rd.mixer_config_path)
+                LOG_INFO("app", "audio mixer config: %s", rd.mixer_config_path);
+        }
 
         s_runtime = jce_runtime_create(&rd);
         if (!s_runtime)
@@ -693,10 +1066,25 @@ static bool app_init(const JceServices *svc, void *ud)
      * are enabled and carry registered chunks). */
     jce_default_init_world_streaming(s_project);
 
-    /* Unconditional cursor capture so FPS-look feels like editor Play. */
-    if (svc && svc->window) {
-        jce_window_set_relative_mouse_mode(svc->window, true);
-        jce_window_set_mouse_grab        (svc->window, true);
+    /* Scene-driven boot cursor mode: capture (FPS-look) only when the scene
+     * actually has a player character to drive.  Diorama / orbit / UI-first
+     * scenes start with a FREE cursor so drag-orbit and authored HUD buttons
+     * work immediately (Tab still toggles either way). */
+    {
+        bool has_character = false;
+        if (s_scene) {
+            JceEntity out[1];
+            /* Cheap presence probe: any entity with a CharacterController. */
+            has_character = dm_scene_has_any_character(s_scene, out);
+        }
+        s_cursor_captured = has_character;
+        if (svc && svc->window) {
+            jce_window_set_relative_mouse_mode(svc->window, s_cursor_captured);
+            jce_window_set_mouse_grab        (svc->window, s_cursor_captured);
+        }
+        LOG_INFO("app", "boot cursor: %s (scene %s a CharacterController)",
+                 s_cursor_captured ? "captured (FPS-look)" : "free (orbit/UI)",
+                 has_character ? "has" : "has no");
     }
     return true;
 }
@@ -720,6 +1108,9 @@ static void app_update(float dt, void *ud)
 {
     (void)ud;
     s_last_dt = dt;
+    if (s_kpi_game_shots_active)
+        jce_screenshot_schedule_tick(
+            &s_kpi_game_shots, JCE_SCREENSHOT_CLOCK_PLAYING, (double)dt);
     if (!s_svc || !s_svc->input) return;
     const JceInput *in = s_svc->input;
     const JceInputActions *acts = s_svc->actions;
@@ -734,6 +1125,79 @@ static void app_update(float dt, void *ud)
             jce_window_set_mouse_grab        (s_svc->window, s_cursor_captured);
         }
     }
+
+    /* ── Runtime UX presets (every default_main app) ────────────────── */
+
+    /* Hold ALT: temporarily release the captured cursor (inspect / reach
+     * in-game UI); releasing ALT restores the game's capture state. */
+    {
+        bool alt = jce_input_key_down(in, JCE_KEY_LALT) ||
+                   jce_input_key_down(in, JCE_KEY_RALT);
+        if (alt && !s_preset_alt_active) {
+            s_preset_alt_active    = true;
+            s_preset_alt_saved_cap = s_cursor_captured;
+            if (s_cursor_captured && s_svc->window) {
+                jce_window_set_relative_mouse_mode(s_svc->window, false);
+                jce_window_set_mouse_grab        (s_svc->window, false);
+            }
+        } else if (!alt && s_preset_alt_active) {
+            s_preset_alt_active = false;
+            if (s_preset_alt_saved_cap && s_cursor_captured && s_svc->window) {
+                jce_window_set_relative_mouse_mode(s_svc->window, true);
+                jce_window_set_mouse_grab        (s_svc->window, true);
+            }
+        }
+    }
+
+    /* Hold ESC 2s: clean quit (same path as the window close button). */
+    if (jce_input_key_down(in, JCE_KEY_ESCAPE)) {
+        s_preset_esc_hold += dt;
+        if (s_preset_esc_hold >= 2.0f) {
+            LOG_INFO("app", "%s", "ESC held 2s — quitting");
+            jce_engine_request_quit();
+        }
+    } else {
+        s_preset_esc_hold = 0.0f;
+    }
+
+    /* F11: fullscreen toggle. */
+    if (jce_input_key_pressed(in, JCE_KEY_F11) && s_svc->window)
+        jce_window_toggle_fullscreen(s_svc->window);
+
+    /* F12: screenshot -> <exe_dir>/screenshots/shot_<unix>.png. */
+    if (jce_input_key_pressed(in, JCE_KEY_F12)) {
+        char dir[640], path[720];
+        snprintf(dir, sizeof dir, "%sscreenshots", s_preset_media_dir);
+        jce_fs_host_create_directory(dir);
+        snprintf(path, sizeof path, "%s/shot_%lld.png",
+                 dir, (long long)time(NULL));
+        if (jce_renderer_request_screenshot(path))
+            LOG_INFO("app", "screenshot -> %s", path);
+    }
+
+    /* F9: toggle WebM recording -> <exe_dir>/recordings/rec_<unix>.webm.
+     * Frames arrive via the renderer's backbuffer capture (interactive
+     * present); encoding is synchronous VP9-realtime — fine at 720-1080p. */
+    if (jce_input_key_pressed(in, JCE_KEY_F9) && s_svc->renderer) {
+        if (!s_preset_rec_active) {
+            s_preset_rec_active = true;
+            s_preset_rec_time   = 0.0;
+            s_preset_rec_w      = 0;
+            jce_renderer_set_capture_sink(preset_rec_begin, preset_rec_frame,
+                                          preset_rec_end, NULL);
+            jce_renderer_set_backbuffer_capture(s_svc->renderer, true);
+        } else {
+            jce_renderer_set_backbuffer_capture(s_svc->renderer, false);
+            jce_renderer_set_capture_sink(NULL, NULL, NULL, NULL);
+            if (s_preset_rec) {
+                jce_webm_encoder_finish(s_preset_rec);
+                s_preset_rec = NULL;
+                LOG_SUCCESS("app", "%s", "recording stopped");
+            }
+            s_preset_rec_active = false;
+        }
+    }
+    if (s_preset_rec_active) s_preset_rec_time += (double)dt;
 
     /* Movement is camera-relative (W = into-the-screen) just like the
      * editor's Play view, so look direction defines move direction.
@@ -773,12 +1237,52 @@ static void app_update(float dt, void *ud)
         ri.attack_pressed = dm_act_down(in, acts, "attack", JCE_KEY_J);
         if (jce_input_key_down(in, JCE_KEY_LCTRL)  ||
             jce_input_key_down(in, JCE_KEY_RCTRL))  ri.speed_mult = 0.25f;
+
+        /* Raw pointer gameplay is runtime-owned too.  Diorama/orbit projects
+         * consume this through scene scripts, while FPS projects can ignore it
+         * and keep using the default camera path below. */
+        jce_input_mouse_delta(in, &ri.pointer_dx, &ri.pointer_dy);
+        ri.pointer_wheel = jce_input_mouse_wheel(in);
+        for (int button = 1; button <= 5; ++button) {
+            if (jce_input_mouse_button(in, button))
+                ri.pointer_buttons |= UINT32_C(1) << (button - 1);
+        }
         jce_runtime_set_input(s_runtime, &ri);
+        {
+            JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES];
+            int touch_count = jce_input_touch_count(in);
+            int kept = 0;
+            if (touch_count > JCE_RUNTIME_MAX_TOUCHES)
+                touch_count = JCE_RUNTIME_MAX_TOUCHES;
+            for (int i = 0; i < touch_count; ++i) {
+                JceFingerID id = 0;
+                float x = 0.0f, y = 0.0f, pressure = 0.0f;
+                if (!jce_input_touch_get(in, i, &id, &x, &y, &pressure))
+                    continue;
+                touches[kept].id = (uint64_t)id;
+                touches[kept].x = x;
+                touches[kept].y = y;
+                touches[kept].pressure = pressure;
+                ++kept;
+            }
+            jce_runtime_set_touch_input(s_runtime, touches, kept);
+        }
         /* Bind the live action map so gameplay scripts can read authored verbs
          * and axes by name (jce.is_action_down / get_axis), beyond the fixed
          * walk/jump/sprint/attack fields above. */
         jce_runtime_set_actions(s_runtime, acts);
         jce_runtime_step(s_runtime, dt);
+
+        /* Scene transitions clear + reload the SAME ECS world, so recycled
+         * entity ids come back with bumped generation bits and every
+         * entity-keyed renderer cache slot (foliage/grass/water/canopies)
+         * goes stale.  Drop them once per completed transition — content
+         * rebuilds lazily on the next draw. */
+        static bool s_was_transitioning = false;
+        bool transitioning = jce_runtime_is_transitioning(s_runtime);
+        if (s_was_transitioning && !transitioning && s_scene_renderer)
+            jce_scene_renderer_reset_entity_caches(s_scene_renderer);
+        s_was_transitioning = transitioning;
     }
 
     /* Drive chunk streaming from the live camera position (cooperative
@@ -857,6 +1361,7 @@ static void app_update(float dt, void *ud)
             jce_input_key_down(in, JCE_KEY_SPACE)) jce_camera_move_up(s_camera,  step);
         if (jce_input_key_down(in, JCE_KEY_Q)) jce_camera_move_up     (s_camera, -step);
     }
+
 }
 
 /* Build the scene render config from defaults, folding in the project-wide
@@ -895,7 +1400,20 @@ static void app_draw(const JceServices *svc, void *ud)
     uint32_t sw = 0, sh = 0;
     if (svc->window) jce_window_get_size(svc->window, &sw, &sh);
     JcePostFXPipeline *pfx = jce_scene_renderer_get_postfx(s_scene_renderer);
-    if (pfx && sw > 0 && sh > 0) {
+    /* NOTE(WebGL2): this bridge briefly had a GLES skip because the whole 3D
+     * scene came out black on web.  The ACTUAL root causes were dangling
+     * non-2D samplers that WebGL2 rejects draws over — the IBL samplerCUBEs
+     * (fixed with sr->dummy_cube) and fs_composite's SAMPLER3D LUT (fixed
+     * with dummy_lut3d in jce_postfx.c).  With every sampler parked, the
+     * full offscreen-HDR + ACES + bloom chain runs on WebGL2 too, keeping
+     * web colors identical to desktop. */
+    /* JCE_NO_POSTFX: perf-bisect kill switch — skip the offscreen-HDR bridge
+     * entirely and render direct-to-backbuffer LDR (the scene renderer's
+     * STOMP honours the same env so shaders take the in-shader-gamma path). */
+    static int s_no_postfx = -1;
+    if (s_no_postfx < 0)
+        s_no_postfx = (getenv("JCE_NO_POSTFX") != NULL) ? 1 : 0;
+    if (!s_no_postfx && pfx && sw > 0 && sh > 0) {
         if (!s_post_target) {
             s_post_target = jce_offscreen_target_create(svc->renderer,
                                                         JCE_VIEW_RUNTIME_GAME);
@@ -907,6 +1425,39 @@ static void app_draw(const JceServices *svc, void *ud)
             if (s_post_target) jce_postfx_set_view_base(pfx, 100);
         }
         if (s_post_target) {
+            /* LOW-tier floor (engine guarantee): on iGPU-class hardware
+             * (GPU tier LOW — includes every WebGL2 browser, where ANGLE
+             * masks the adapter) render the 3D offscreen chain at 0.65x and
+             * let the present quad upsample.  Pixel cost drops ~58% while the
+             * ECS-UI, drawn directly to the backbuffer, stays at NATIVE
+             * resolution (crisp text).  Part of the "hold 60 on integrated
+             * graphics" bundle with the grass/bloom/cascade floors — single
+             * knobs measured too small alone on a 50ms iGPU frame; the
+             * bundle is what moves it.  HIGH/ULTRA render 1:1 as before. */
+            uint32_t rw = sw, rh = sh;
+            if (jce_renderer_get_tier() <= JCE_GPU_TIER_LOW) {
+                /* Pixel-BUDGET dynamic resolution (replaces the old flat 0.65x,
+                 * which blurred even small windows).  The 3D offscreen chain
+                 * renders 1:1 — fully crisp — as long as the surface is within
+                 * a pixel budget, and only a large/fullscreen surface scales
+                 * down (by area) to hold framerate on iGPU / WebGL.  So the
+                 * default window stays sharp while fullscreen still gets relief.
+                 * JCE_DYNRES_BUDGET (megapixels) overrides the default. */
+                uint64_t budget = 1600000ull;   /* ~1.6 Mpx (≈1440x1111) */
+                {
+                    const char *b = getenv("JCE_DYNRES_BUDGET");
+                    if (b && b[0]) {
+                        double mpx = atof(b);
+                        if (mpx > 0.05) budget = (uint64_t)(mpx * 1000000.0);
+                    }
+                }
+                uint64_t px = (uint64_t)sw * (uint64_t)sh;
+                if (px > budget) {
+                    float s = sqrtf((float)budget / (float)px);
+                    rw = (uint32_t)((float)sw * s);  if (rw < 16u) rw = sw;
+                    rh = (uint32_t)((float)sh * s);  if (rh < 16u) rh = sh;
+                }
+            }
             float aspect = (float)sw / (float)sh;
             jce_mat4 view = jce_camera_view(s_camera);
             jce_mat4 proj = jce_camera_proj(s_camera, aspect,
@@ -915,7 +1466,7 @@ static void app_draw(const JceServices *svc, void *ud)
              * display range (else washed out).  No-op on the RGBA8 fallback. */
             if (jce_offscreen_target_is_hdr(s_post_target))
                 jce_postfx_enable(pfx, JCE_POSTFX_TONEMAP, true);
-            if (jce_offscreen_target_prepare(s_post_target, sw, sh,
+            if (jce_offscreen_target_prepare(s_post_target, rw, rh,
                                              view.raw[0], proj.raw[0],
                                              0x000000FFu, "RuntimeScene")) {
                 JceSceneRenderConfig pcfg = s_default_scene_cfg();
@@ -928,8 +1479,12 @@ static void app_draw(const JceServices *svc, void *ud)
                  * which is exactly where it draws. */
                 pcfg.scene_frame_buffer =
                     jce_offscreen_target_get_frame_buffer(s_post_target);
-                pcfg.viewport_width  = sw;
-                pcfg.viewport_height = sh;
+                pcfg.viewport_width  = rw;
+                pcfg.viewport_height = rh;
+                /* GI L1: hand the lit RT to the dynamic probe gather (read
+                 * on the pre-color compute view = last frame's content). */
+                pcfg.gi_color_tex_handle =
+                    jce_offscreen_target_get_color_texture(s_post_target);
                 jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                           base, s_last_dt, &pcfg);
                 bool any_effect = false;
@@ -938,7 +1493,7 @@ static void app_draw(const JceServices *svc, void *ud)
                         any_effect = true; break;
                     }
                 if (any_effect) {
-                    jce_postfx_resize(pfx, sw, sh);
+                    jce_postfx_resize(pfx, rw, rh);
                     JceTextureHandle color = {
                         jce_offscreen_target_get_color_texture(s_post_target) };
                     JceTextureHandle depth = {
@@ -983,7 +1538,9 @@ static void app_draw(const JceServices *svc, void *ud)
         if (sw > 0 && sh > 0) {
             JceUIPointer ptr;
             const JceUIPointer *ptr_arg = NULL;
-            if (!s_cursor_captured && svc->input) {
+            /* Feed the pointer whenever the OS cursor is actually visible:
+             * uncaptured, or temporarily released by the hold-ALT preset. */
+            if ((!s_cursor_captured || s_preset_alt_active) && svc->input) {
                 float mx = 0.0f, my = 0.0f;
                 jce_input_mouse_pos(svc->input, &mx, &my);
                 ptr.x     = mx;
@@ -1078,18 +1635,57 @@ static void app_draw(const JceServices *svc, void *ud)
             }
         }
     }
+
+    /* Host-independent QA capture.  Submit only after the scene, post-fx, and
+     * UI overlay have all populated this frame's backbuffer.  Completion is
+     * observed through the renderer's one-in-flight screenshot contract, so
+     * ordered schedules cannot overwrite or reorder files. */
+    if (s_kpi_game_shots_active) {
+        if (s_kpi_game_shots.in_flight && !jce_screenshot_pending()) {
+            jce_screenshot_schedule_mark_complete(&s_kpi_game_shots, true);
+            LOG_INFO("app", "%s", "deterministic game capture completed");
+        }
+        {
+            const JceScreenshotScheduleEntry *due =
+                jce_screenshot_schedule_due(&s_kpi_game_shots);
+            if (due && !jce_screenshot_pending()) {
+                if (jce_screenshot_save(due->path, JCE_SCREENSHOT_PNG) &&
+                    jce_screenshot_schedule_mark_submitted(
+                        &s_kpi_game_shots)) {
+                    LOG_INFO("app", "deterministic game capture submitted: %s",
+                             due->path);
+                } else {
+                    (void)jce_screenshot_schedule_mark_submitted(
+                        &s_kpi_game_shots);
+                    jce_screenshot_schedule_mark_complete(
+                        &s_kpi_game_shots, false);
+                    LOG_ERROR("app", "deterministic game capture failed: %s",
+                              due->path);
+                }
+            }
+        }
+    }
 }
 
 static void app_exit(void *ud)
 {
     (void)ud;
+    s_kpi_game_shots_active = false;
+    memset(&s_kpi_game_shots, 0, sizeof(s_kpi_game_shots));
+    /* Finalize a still-running F9 recording so the container is playable. */
+    if (s_preset_rec_active) {
+        if (s_svc && s_svc->renderer)
+            jce_renderer_set_backbuffer_capture(s_svc->renderer, false);
+        jce_renderer_set_capture_sink(NULL, NULL, NULL, NULL);
+        if (s_preset_rec) { jce_webm_encoder_finish(s_preset_rec); s_preset_rec = NULL; }
+        s_preset_rec_active = false;
+    }
     /* Streamer first: destroying it removes its streamed entities from
      * s_scene and joins all in-flight chunk tasks (jce_task_wait) before
      * detaching from the fs.  Only then destroy the worker pool (also
      * waits-for-all on shutdown) and the fs the workers were reading from. */
     if (s_world_streamer) { jce_world_streamer_destroy(s_world_streamer);  s_world_streamer = NULL; }
     if (s_stream_pool)    { jce_thread_pool_destroy(s_stream_pool);        s_stream_pool    = NULL; }
-    if (s_stream_fs)      { jce_fs_destroy(s_stream_fs);                   s_stream_fs      = NULL; }
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     /* Occlusion culler holds bgfx resources (proxy geom + query handles) —
@@ -1098,14 +1694,23 @@ static void app_exit(void *ud)
     /* Offscreen postfx target borrows the renderer — destroy before it. */
     if (s_post_target)    { jce_offscreen_target_destroy(s_post_target);  s_post_target    = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }
-    /* Destroy cached meshes (owned here) before tearing the rest down. */
-    for (int i = 0; i < s_mesh_cache_count; ++i) {
-        if (s_mesh_cache[i].used && s_mesh_cache[i].mesh)
-            jce_mesh_destroy(s_mesh_cache[i].mesh);
+    /* Destroy cached meshes (owned here) before tearing the rest down, then
+     * free the growable cache + its hash index. */
+    for (uint32_t i = 0; i < s_mesh_cache_count; ++i) {
+        if (s_mesh_cache[i].mesh) jce_mesh_destroy(s_mesh_cache[i].mesh);
+        free(s_mesh_cache[i].path);
     }
-    s_mesh_cache_count = 0;
+    free(s_mesh_cache);  s_mesh_cache = NULL;
+    free(s_mesh_index);  s_mesh_index = NULL;
+    s_mesh_cache_count = 0; s_mesh_cache_cap = 0; s_mesh_index_cap = 0;
     if (s_camera)         { jce_camera_destroy(s_camera);                 s_camera         = NULL; }
     if (s_scene)          { jce_scene_destroy(s_scene);                   s_scene          = NULL; }
+    if (s_runtime_fs) {
+        if (jce_fs_get_active() == s_runtime_fs)
+            jce_fs_set_active(NULL);
+        jce_fs_destroy(s_runtime_fs);
+        s_runtime_fs = NULL;
+    }
     jce_default_unmount_project_bundles();
     if (s_project)        { jce_project_free(s_project);                  s_project        = NULL; }
     s_svc = NULL;

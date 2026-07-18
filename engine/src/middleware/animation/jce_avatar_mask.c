@@ -14,6 +14,7 @@
 #include "os/core/jce_memory.h"
 
 #include <stddef.h>
+#include <string.h>   /* strlen — mask_load_impl_mem len==0 path */
 
 #define LOG_TAG "jce_avatar_mask"
 
@@ -84,12 +85,10 @@ void JCE_CALL jce_avatar_mask_set_weight(JceAvatarMask *m, uint32_t bone_index,
     m->weights[bone_index] = clamp01(w);
 }
 
-/* Shared parse: `skel` may be NULL (name entries are then skipped). */
-static JceAvatarMask *mask_load_impl(const char *path, const JceSkeleton *skel)
+/* Build a mask from an already-parsed JSON root (does NOT free `root`).
+ * `skel` may be NULL (name entries are then skipped). */
+static JceAvatarMask *mask_from_root(JceJson *root, const JceSkeleton *skel)
 {
-    if (!path || !path[0]) return NULL;
-
-    JceJson *root = jce_json_parse_file(path);
     if (!root) return NULL;
 
     uint32_t skel_joints = skel ? jce_skeleton_joint_count(skel) : 0u;
@@ -119,9 +118,32 @@ static JceAvatarMask *mask_load_impl(const char *path, const JceSkeleton *skel)
         }
     }
 
+    LOG_DEBUG(LOG_TAG, "loaded mask: %u bones (default %.3f)",
+              m->count, (double)m->def);
+    return m;
+}
+
+/* Host-file entry (editor / loose cooked tree). */
+static JceAvatarMask *mask_load_impl(const char *path, const JceSkeleton *skel)
+{
+    if (!path || !path[0]) return NULL;
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) return NULL;
+    JceAvatarMask *m = mask_from_root(root, skel);
     jce_json_free(root);
-    LOG_DEBUG(LOG_TAG, "loaded mask '%s': %u bones (default %.3f)",
-              path, m->count, (double)m->def);
+    return m;
+}
+
+/* In-memory entry (single-exe: bytes decompressed from the embedded PAK). */
+static JceAvatarMask *mask_load_impl_mem(const char *text, size_t len,
+                                         const JceSkeleton *skel)
+{
+    if (!text) return NULL;
+    if (len == 0) len = strlen(text);
+    JceJson *root = jce_json_parse(text, len);
+    if (!root) return NULL;
+    JceAvatarMask *m = mask_from_root(root, skel);
+    jce_json_free(root);
     return m;
 }
 
@@ -134,4 +156,10 @@ JceAvatarMask *JCE_CALL jce_avatar_mask_load_for_skeleton(const char *path,
                                                           const JceSkeleton *skel)
 {
     return mask_load_impl(path, skel);
+}
+
+JceAvatarMask *JCE_CALL jce_avatar_mask_load_for_skeleton_mem(
+    const char *text, size_t len, const JceSkeleton *skel)
+{
+    return mask_load_impl_mem(text, len, skel);
 }

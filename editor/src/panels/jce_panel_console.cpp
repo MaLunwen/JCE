@@ -10,6 +10,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "ui/jce_editor_ui_state.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -115,6 +116,14 @@ static void ensure_init(void)
 {
     if (s_ui.initialized) return;
     s_ui = ConsoleUiState{};
+    /* Toolbar toggles persist per user (editor-session.json), bools as 0/1. */
+    s_ui.show_info     = jce_editor_ui_state_load_int("console.filter.info",    1, 0, 1) != 0;
+    s_ui.show_warning  = jce_editor_ui_state_load_int("console.filter.warning", 1, 0, 1) != 0;
+    s_ui.show_error    = jce_editor_ui_state_load_int("console.filter.error",   1, 0, 1) != 0;
+    s_ui.show_debug    = jce_editor_ui_state_load_int("console.show_debug",     0, 0, 1) != 0;
+    s_ui.clear_on_play = jce_editor_ui_state_load_int("console.clear_on_play",  0, 0, 1) != 0;
+    s_ui.collapse      = jce_editor_ui_state_load_int("console.collapse",       0, 0, 1) != 0;
+    s_ui.auto_scroll   = jce_editor_ui_state_load_int("console.autoscroll",     1, 0, 1) != 0;
     s_ui.initialized = true;
     jce_console_set_output(console_sink, nullptr);
 }
@@ -263,14 +272,16 @@ void jce_editor_panel_console_content(void)
     {
         char _lbl[64];
         snprintf(_lbl, sizeof(_lbl), "%s###filter_info", jce_editor_i18n("console.showLog"));
-        ImGui::Checkbox(_lbl, &s_ui.show_info);
+        if (ImGui::Checkbox(_lbl, &s_ui.show_info))
+            jce_editor_ui_state_save_int("console.filter.info", s_ui.show_info ? 1 : 0);
     }
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_CONSOLE_WARN);
     {
         char _lbl[64];
         snprintf(_lbl, sizeof(_lbl), "%s###filter_warn", jce_editor_i18n("console.showWarning"));
-        ImGui::Checkbox(_lbl, &s_ui.show_warning);
+        if (ImGui::Checkbox(_lbl, &s_ui.show_warning))
+            jce_editor_ui_state_save_int("console.filter.warning", s_ui.show_warning ? 1 : 0);
     }
     ImGui::PopStyleColor();
     ImGui::SameLine();
@@ -278,21 +289,26 @@ void jce_editor_panel_console_content(void)
     {
         char _lbl[64];
         snprintf(_lbl, sizeof(_lbl), "%s###filter_error", jce_editor_i18n("console.showError"));
-        ImGui::Checkbox(_lbl, &s_ui.show_error);
+        if (ImGui::Checkbox(_lbl, &s_ui.show_error))
+            jce_editor_ui_state_save_int("console.filter.error", s_ui.show_error ? 1 : 0);
     }
     ImGui::PopStyleColor();
     ImGui::SameLine();
     {
         char _lbl[64];
         snprintf(_lbl, sizeof(_lbl), "%s###filter_debug", jce_editor_i18n("console.showDebug"));
-        ImGui::Checkbox(_lbl, &s_ui.show_debug);
+        if (ImGui::Checkbox(_lbl, &s_ui.show_debug))
+            jce_editor_ui_state_save_int("console.show_debug", s_ui.show_debug ? 1 : 0);
     }
     ImGui::SameLine();
-    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.collapse", "collapse"), &s_ui.collapse);
+    if (ImGui::Checkbox(jce_editor_i18n_id("console.toggle.collapse", "collapse"), &s_ui.collapse))
+        jce_editor_ui_state_save_int("console.collapse", s_ui.collapse ? 1 : 0);
     ImGui::SameLine();
-    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.clearOnPlay", "cop"), &s_ui.clear_on_play);
+    if (ImGui::Checkbox(jce_editor_i18n_id("console.toggle.clearOnPlay", "cop"), &s_ui.clear_on_play))
+        jce_editor_ui_state_save_int("console.clear_on_play", s_ui.clear_on_play ? 1 : 0);
     ImGui::SameLine();
-    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.autoScroll", "auto_scroll"), &s_ui.auto_scroll);
+    if (ImGui::Checkbox(jce_editor_i18n_id("console.toggle.autoScroll", "auto_scroll"), &s_ui.auto_scroll))
+        jce_editor_ui_state_save_int("console.autoscroll", s_ui.auto_scroll ? 1 : 0);
 
     /* Search row */
     ImGui::SetNextItemWidth(-1);

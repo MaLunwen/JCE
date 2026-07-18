@@ -9,6 +9,13 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_game_render.h"
+
+extern "C" {
+#include <jce/os/core/jce_sysinfo.h>   /* machine-class undo budget */
+}
+#include <cstdlib>
 
 /* ── History begin/end edit ───────────────────────────────────────── */
 
@@ -97,9 +104,30 @@ static size_t history_total_bytes(void)
     return total;
 }
 
+/* Undo budget by machine class (512MB charter): full-scene JSON snapshots at
+ * 64MB are cheap insurance on a developer box but real money on a 512MB
+ * machine — quarter the budget there (shorter undo depth on big scenes; the
+ * count cap still applies first for typical scenes).  JCE_LOW_MEM=1/0
+ * overrides, mirroring the renderer/allocator machine-class gates. */
+static size_t history_budget_bytes(void)
+{
+    static size_t s_budget = 0;
+    if (s_budget == 0) {
+        bool lm = false;
+        JceSysInfo si;
+        jce_sysinfo_init(&si);
+        lm = (si.ram_total_mb > 0 && si.ram_total_mb < 2048) || si.cpu_cores <= 1;
+        const char *ev = getenv("JCE_LOW_MEM");
+        if (ev && ev[0]) lm = (ev[0] != '0');
+        s_budget = lm ? (JCE_UNDO_HISTORY_BYTES_BUDGET / 4u)
+                      : JCE_UNDO_HISTORY_BYTES_BUDGET;
+    }
+    return s_budget;
+}
+
 static void history_enforce_budget(void)
 {
-    while (history_total_bytes() > JCE_UNDO_HISTORY_BYTES_BUDGET) {
+    while (history_total_bytes() > history_budget_bytes()) {
         /* Drop oldest from whichever side is bigger; prefer redo first
          * since redo is rarely consulted compared to undo. */
         if (!s_redo_history.empty()
@@ -151,6 +179,18 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
     /* Clear existing scene (destroys/recreates ECS world). */
     clear_scene_entities();
+
+    /* The fresh flecs world restarts entity-id numbering, so the occlusion
+     * cullers' id-keyed slots now describe DEAD objects: a recreated entity
+     * landing on a stale slot inherits its cull verdict (objects vanish
+     * right after undo), and non-colliding ids allocate new bgfx queries
+     * the dead slots never return (pool cap 256 -> exhausted on the first
+     * undo in a dense scene).  Reset both viewport cullers.  Deliberately
+     * NOT the full model-cache invalidation: model caches are path-keyed,
+     * still valid across undo, and dropping them would add reload hitching
+     * to every Ctrl+Z. */
+    jce_editor_scene_render_reset_occlusion();
+    jce_editor_game_render_reset_occlusion();
 
     /* Load via engine serializer → ECS. */
     bool ok = jce_scene_serial_load(s.scene,

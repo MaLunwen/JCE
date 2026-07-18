@@ -188,6 +188,10 @@ bool JCE_CALL jce_audio_mixer_apply_config(JceAudioMixer *m,
 	if (!m || !json || len == 0) return false;
 	const char *file_end = json + len;
 
+	/* An optional top-level "version" key (written 1 by current editors) may
+	 * precede "buses".  The scanners key on names and skip everything else,
+	 * so both versioned and pre-version files parse identically; the key
+	 * exists so a future breaking schema change has something to gate on. */
 	const char *buses_beg = NULL, *buses_end = NULL;
 	if (!cfg_find_buses(json, file_end, &buses_beg, &buses_end))
 		return false;
@@ -268,7 +272,10 @@ bool JCE_CALL jce_audio_mixer_apply_config(JceAudioMixer *m,
 					cfg_scan_uint (so, sc, "\"dest\"",   &dest);
 					cfg_scan_float(so, sc, "\"amount\"", &amt);
 					JceAudioBusId dst = cfg_idmap_get(&map, dest);
-					if (dst != JCE_AUDIO_BUS_INVALID && amt > 0.0f)
+					/* amount 0 is a valid authored state (registered but
+					 * silent) — set_send registers it; reject only
+					 * negative garbage. */
+					if (dst != JCE_AUDIO_BUS_INVALID && amt >= 0.0f)
 						jce_audio_mixer_set_send(m, src, dst, amt);
 					q = sc + 1;
 				}

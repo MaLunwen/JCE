@@ -18,12 +18,19 @@
 #include "jce_editor_i18n.h"
 #include "jce_editor_scene_rendering_defaults.h"
 #include "jce_editor_state_internal.h"
+#include "core/jce_editor_project_state.h"   /* per-project view mode / grid */
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
+
+#include <jce/os/core/jce_perf_phase.h>   /* benchmark: capture CPU phases */
+#include <jce/renderer/jce_lowlevel.h>    /* stress: runtime albedo textures */
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
+#include <vector>
+#include <string>
 
 #include <jce/os/core/jce_str.h>
 #include <jce/middleware/physics/jce_cloth.h>
@@ -41,6 +48,7 @@ extern "C" struct JceWorldStreamer *jce_editor_get_world_streamer(void);
 EditorInternalState s;
 
 std::vector<uint32_t>                              g_entity_order;
+uint64_t                                           g_entity_order_gen;
 std::unordered_map<uint32_t, EditorEntitySidecar>  g_entity_sidecar;
 
 std::vector<EditorHistorySnapshot> s_undo_history;
@@ -60,7 +68,7 @@ static float s_gizmo_snap_translate = 0.5f;
 static float s_gizmo_snap_rotate    = 15.0f;
 static float s_gizmo_snap_scale     = 0.25f;
 /* Persistent snap toggle: when on, gizmo drags snap WITHOUT holding Ctrl
- * (Ctrl still forces snap momentarily). Session-scoped for now. */
+ * (Ctrl still forces snap momentarily). Persists per user. */
 static bool  s_gizmo_snap_enabled   = false;
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -69,7 +77,7 @@ static void erase_from_order(uint32_t id)
 {
     auto it = std::find(g_entity_order.begin(), g_entity_order.end(), id);
     if (it != g_entity_order.end())
-        g_entity_order.erase(it);
+        g_entity_order.erase(it); g_entity_order_gen++;
 }
 
 static void rebuild_order_cb(JceScene * /*scene*/, JceEntity e, void *user_data)
@@ -80,7 +88,7 @@ static void rebuild_order_cb(JceScene * /*scene*/, JceEntity e, void *user_data)
 
 void rebuild_entity_order_from_ecs(void)
 {
-    g_entity_order.clear();
+    g_entity_order.clear(); g_entity_order_gen++;
     if (!s.scene) return;
     jce_scene_each_entity(s.scene, rebuild_order_cb, &g_entity_order);
 }
@@ -116,7 +124,7 @@ void update_scene_dir_from_path(const char *scene_path)
 
 void clear_scene_entities(void)
 {
-    g_entity_order.clear();
+    g_entity_order.clear(); g_entity_order_gen++;
     g_entity_sidecar.clear();
 
     /* Destroy and recreate engine scene to clear all ECS entities. */
@@ -217,24 +225,256 @@ static void build_demo_scene(void)
     {
         const char *env = std::getenv("JCE_STRESS_CUBES");
         if (env) {
-            const long n = strtol(env, nullptr, 10);
-            if (n > 0 && n <= 200000) {
+            long n = strtol(env, nullptr, 10);
+            /* The 200k guard protects the per-ENTITY grid path (200k ECS
+             * entities); the SCATTER path is ONE entity with N instances and
+             * takes authored counts into the tens of millions (千万 S5 tiled
+             * streaming) — cap it at 100M instead. */
+            const long n_cap = std::getenv("JCE_STRESS_SCATTER") ? 100000000L
+                                                                 : 200000L;
+            if (n > n_cap) n = n_cap;
+            if (n > 0) {
+              /* JCE_STRESS_SCATTER + JCE_STRESS_MODEL_PATH: the Unity-ISM / UE-HISM
+               * path — ONE VegetationScatter entity holding N instances, drawn as a
+               * single GPU-instanced submit (sr_draw_foliage), instead of N ECS
+               * entities.  This is how a large scene's repeated objects reach
+               * near-zero per-instance CPU. */
+              const char *scatter_model = std::getenv("JCE_STRESS_MODEL_PATH");
+              if (std::getenv("JCE_STRESS_SCATTER")) {
+                /* JCE_STRESS_OCCLUDER: put the scatter field BEHIND a big opaque
+                 * wall (a MeshRenderer box → in the depth prepass) so the foliage
+                 * Hi-Z occlusion cull has a real occluder to test against — the
+                 * canonical heavy-occlusion repro (the default flat field has no
+                 * occluder, so only frustum cull ever engages).  The default
+                 * grazing vista camera (~eye z=-40 looking +z) sees the wall with
+                 * the field hidden behind it. */
+                const bool occ = (std::getenv("JCE_STRESS_OCCLUDER") != nullptr);
+                uint32_t sc = jce_state_create_entity("Instanced Scatter", root);
+                JceVegetationScatterComponent vs;
+                memset(&vs, 0, sizeof vs);
+                vs.visible = true;
+                vs.mesh_shape = 0;  /* cube primitive when no model path given */
+                if (scatter_model && scatter_model[0])
+                    snprintf(vs.mesh_path, sizeof vs.mesh_path, "%s", scatter_model);
+                float side_m = (float)sqrt((double)n) * 2.0f;  /* spread so cubes don't fully overlap */
+                if (occ) {
+                    /* Bounded corridor behind the wall (x∈[-40,40], z∈[10,~210]). */
+                    vs.area_x = 80.0f; vs.area_z = 200.0f;
+                    vs.density = (float)n / (vs.area_x * vs.area_z);
+                    demo_set_position(sc, 0.0f, 0.0f, 110.0f);   /* field centre z=110 → z∈[10,210] */
+                } else {
+                    vs.area_x = side_m; vs.area_z = side_m;
+                    vs.density = (float)n / (side_m * side_m);
+                    demo_set_position(sc, 0.0f, 0.0f, 0.0f);
+                }
+                vs.scale_min = 1.0f; vs.scale_max = 1.0f;
+                vs.max_slope_deg = 90.0f; vs.seed = 1u;
+                /* JCE_STRESS_SHADOW: the scatter field casts shadows (千万 ③ —
+                 * one instanced depth draw per cascade at reduced LOD). */
+                vs.cast_shadow = (std::getenv("JCE_STRESS_SHADOW") != nullptr);
+                jce_scene_set_vegetation_scatter(s.scene, (JceEntity)sc, &vs);
+                if (occ) {
+                    /* Opaque wall at z≈4 spanning the corridor's front, tall enough
+                     * to hide the field but leaving a strip of sky/edges so some
+                     * foliage stays visible (parity anchor). */
+                    uint32_t w = jce_state_create_entity("OccluderWall", root);
+                    jce_state_add_component(w, JCE_COMP_FLAG_MESH_RENDERER);
+                    demo_set_position(w, 0.0f, 18.0f, 4.0f);
+                    demo_set_scale(w, 90.0f, 36.0f, 2.0f);       /* x∈[-45,45] y∈[0,36] */
+                    LOG_INFO(LOG_TAG, "stress OCCLUDER: opaque wall in front of the "
+                             "scatter field (foliage Hi-Z occlusion A/B)");
+                }
+                LOG_INFO(LOG_TAG, "stress SCATTER: ~%ld instances of '%s' "
+                         "(1 entity, GPU-instanced)%s", n,
+                         (scatter_model && scatter_model[0]) ? scatter_model : "primitive cube",
+                         occ ? " [behind occluder wall]" : "");
+              } else {
+                if (const char *oc = std::getenv("JCE_STRESS_OCCLUDER")) {
+                    /* Same opaque wall as the scatter branch, for the MODEL
+                     * path (Nanite-lite meshlet Hi-Z A/B): the stress grid
+                     * sits at the origin behind it as seen from the vista
+                     * eye (~z=-40 looking +z); z=-30 clears a 20m-radius
+                     * hero mesh while hiding it.  A numeric value sets the
+                     * wall HEIGHT (metres): a half wall leaves the hero's
+                     * top visible, so the ENTITY-level Hi-Z keeps it and
+                     * only the CLUSTER-level cull can drop the hidden
+                     * clusters — the partial-occlusion A/B this feature is
+                     * for ("1" = legacy full 36m wall). */
+                    float wall_h = (float)atof(oc);
+                    if (wall_h <= 1.0f) wall_h = 36.0f;
+                    uint32_t w = jce_state_create_entity("OccluderWall", root);
+                    jce_state_add_component(w, JCE_COMP_FLAG_MESH_RENDERER);
+                    demo_set_position(w, 0.0f, wall_h * 0.5f, -30.0f);
+                    demo_set_scale(w, 90.0f, wall_h, 2.0f);
+                    LOG_INFO(LOG_TAG, "stress OCCLUDER: opaque wall (h=%.0fm) in "
+                             "front of the stress grid (meshlet Hi-Z A/B)", wall_h);
+                }
                 LOG_INFO(LOG_TAG, "stress test: spawning %ld cubes", n);
                 uint32_t stress_root = jce_state_create_entity("Stress Cubes", root);
 
                 /* Cube root of N rounded up so the side length covers all. */
                 int side = 1;
                 while ((long)side * side * side < n) side++;
-                const float spacing = 1.5f;
+                /* JCE_STRESS_SPACING overrides the grid spacing so the field can
+                 * spread beyond the SimLod mid-radius (80m) for the #5 sim-LOD
+                 * physics-gating demo (far bodies sleep). */
+                float spacing = 1.5f;
+                if (const char *sp = std::getenv("JCE_STRESS_SPACING")) {
+                    float v = (float)atof(sp); if (v > 0.01f) spacing = v;
+                }
+                /* JCE_STRESS_PHYS_SIMLOD: add a SimLod component (gate PHYSICS) so
+                 * the runtime sleeps far-tier (>mid_radius from the viewer) rigid
+                 * bodies — demonstrates sim-LOD cutting large-world physics cost. */
+                const bool phys_simlod = (std::getenv("JCE_STRESS_PHYS_SIMLOD") != NULL);
                 const float origin  = -0.5f * (side - 1) * spacing;
 
+                /* JCE_STRESS_MODEL_PATH=<glTF abs path> makes each stress entity a
+                 * real model instance instead of a primitive cube — lets us profile
+                 * the MODEL render path (the common real-game content) at scale. */
+                const char *stress_model = std::getenv("JCE_STRESS_MODEL_PATH");
+                /* JCE_STRESS_DIVERSE gives each cube a unique base colour =>
+                 * unique material key => the auto-instancer can't batch them =>
+                 * one draw per cube.  This is the CPU-bound HIGH-DRAW-COUNT
+                 * workload that multi-threaded command submission targets (the
+                 * default uniform stress collapses to a single instanced batch). */
+                const bool diverse = (std::getenv("JCE_STRESS_DIVERSE") != NULL);
+                /* JCE_STRESS_PHYSICS (#5 physics benchmark): give each stress cube a
+                 * DYNAMIC rigid body + box collider so Play (JCE_KPI_AUTOPLAY) free-
+                 * falls/collides N bodies — the standard Bullet broadphase + solver
+                 * stress.  Measured via the runtime "physics" perf-phase. */
+                const bool phys = (std::getenv("JCE_STRESS_PHYSICS") != NULL);
                 s_suppress_add_component_log = true;
+
+                /* JCE_STRESS_TEXTURES=D: create D distinct 4x4 RGBA8 runtime
+                 * albedo textures and assign them round-robin as per-entity
+                 * runtime albedos — the texture-diverse instancing workload
+                 * (same mesh, distinct albedo TEXTURE each → distinct material
+                 * key → solo, unless JCE_TEX_INSTANCE packs them into a 2D-array).
+                 * Capped at 64 (the array's layer limit). */
+                int  n_tex = 0;
+                uint16_t tex_ids[256];
+                if (const char *te = std::getenv("JCE_STRESS_TEXTURES")) {
+                    n_tex = atoi(te);
+                    if (n_tex < 0) n_tex = 0;
+                    if (n_tex > 256) n_tex = 256;   /* >64 exercises the multi-array split */
+                    const int TS = 32;   /* 32x32 with a full mip chain so distant
+                                          * instances sample real mips — verifies the
+                                          * array's per-mip blit (high-freq checker so
+                                          * a no-mip array would visibly alias). */
+                    for (int t = 0; t < n_tex; t++) {
+                        uint8_t r = (uint8_t)(30 + (t * 53)  % 220);
+                        uint8_t g = (uint8_t)(30 + (t * 97)  % 220);
+                        uint8_t b = (uint8_t)(30 + (t * 151) % 220);
+                        /* Build the concatenated mip pyramid (bgfx expects all
+                         * levels when has_mips=true). L0 = distinct-colour checker
+                         * vs white; each level box-downsamples the previous. */
+                        std::vector<uint8_t> prev, cur;
+                        std::vector<uint8_t> buf;
+                        int dim = TS;
+                        prev.resize((size_t)dim * dim * 4);
+                        for (int y = 0; y < dim; y++)
+                            for (int x = 0; x < dim; x++) {
+                                bool white = (((x >> 2) + (y >> 2)) & 1) != 0;
+                                uint8_t *p = &prev[((size_t)y * dim + x) * 4];
+                                p[0] = white ? 255 : r; p[1] = white ? 255 : g;
+                                p[2] = white ? 255 : b; p[3] = 255;
+                            }
+                        buf.insert(buf.end(), prev.begin(), prev.end());
+                        while (dim > 1) {
+                            int nd = dim >> 1; if (nd < 1) nd = 1;
+                            cur.assign((size_t)nd * nd * 4, 0);
+                            for (int y = 0; y < nd; y++)
+                                for (int x = 0; x < nd; x++)
+                                    for (int c = 0; c < 4; c++) {
+                                        int s = 0;
+                                        s += prev[(((size_t)(2*y)  * dim + (2*x)  ) * 4) + c];
+                                        s += prev[(((size_t)(2*y)  * dim + (2*x+1)) * 4) + c];
+                                        s += prev[(((size_t)(2*y+1)* dim + (2*x)  ) * 4) + c];
+                                        s += prev[(((size_t)(2*y+1)* dim + (2*x+1)) * 4) + c];
+                                        cur[((size_t)y * nd + x) * 4 + c] = (uint8_t)(s / 4);
+                                    }
+                            buf.insert(buf.end(), cur.begin(), cur.end());
+                            prev.swap(cur);
+                            dim = nd;
+                        }
+                        const JceGfxMemory *mem = jce_gfx_memory_copy(buf.data(), (uint32_t)buf.size());
+                        JceTextureHandle h = jce_texture_create_2d(
+                            (uint16_t)TS, (uint16_t)TS, true, 1, JCE_TEXTURE_FORMAT_RGBA8, 0, mem);
+                        tex_ids[t] = (uint16_t)h.idx;
+                    }
+                    LOG_INFO(LOG_TAG, "stress TEXTURES: created %d distinct runtime albedos", n_tex);
+                }
+
+                /* JCE_STRESS_TEX_PATHS=p1,p2,...: point each cube's albedo at a
+                 * real texture FILE (round-robin) — exercises the batcher's
+                 * PATH-albedo branch (sr_resolve_texture + jce_texture_get_size /
+                 * _mips on registry-loaded textures) with genuine cooked content,
+                 * vs the runtime-handle path JCE_STRESS_TEXTURES uses. */
+                std::vector<std::string> tex_paths;
+                if (const char *tp = std::getenv("JCE_STRESS_TEX_PATHS")) {
+                    const char *s = tp;
+                    while (*s) {
+                        const char *e = std::strchr(s, ',');
+                        size_t len = e ? (size_t)(e - s) : std::strlen(s);
+                        if (len > 0) tex_paths.emplace_back(s, len);
+                        if (!e) break;
+                        s = e + 1;
+                    }
+                    LOG_INFO(LOG_TAG, "stress TEX_PATHS: %zu real albedo files", tex_paths.size());
+                }
+
                 long spawned = 0;
                 for (int x = 0; x < side && spawned < n; x++) {
                     for (int y = 0; y < side && spawned < n; y++) {
                         for (int z = 0; z < side && spawned < n; z++) {
                             uint32_t c = jce_state_create_entity("c", stress_root);
+                            jce_state_stress_record_mover(c);
                             jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
+                            JceMeshRenderer *mm =
+                                jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
+                            if (mm && stress_model && stress_model[0])
+                                snprintf(mm->mesh_path, sizeof mm->mesh_path,
+                                         "%s", stress_model);
+                            if (mm && diverse) {
+                                mm->base_color[0] = 0.15f + 0.7f * (float)((spawned * 13) % 101) / 101.0f;
+                                mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
+                                mm->base_color[2] = 0.15f + 0.7f * (float)((spawned * 71) % 107) / 107.0f;
+                                mm->base_color[3] = 1.0f;   /* authored marker */
+                            }
+                            if (mm && n_tex > 0) {
+                                mm->has_albedo_runtime = true;
+                                mm->albedo_runtime_idx = tex_ids[(int)(spawned % n_tex)];
+                                mm->albedo_runtime_w = 32;
+                                mm->albedo_runtime_h = 32;
+                                mm->albedo_runtime_mips = 6;   /* 32x32 full chain */
+                            }
+                            if (mm && !tex_paths.empty()) {
+                                const std::string &p = tex_paths[(size_t)(spawned % (long)tex_paths.size())];
+                                snprintf(mm->albedo_tex, sizeof mm->albedo_tex, "%s", p.c_str());
+                            }
+                            if (phys) {
+                                jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
+                                jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
+                                if (JceRigidBodyComponent *rb =
+                                        jce_scene_get_rigidbody(s.scene, (JceEntity)c)) {
+                                    rb->body_type = 1;   /* JCE_BODY_DYNAMIC */
+                                    rb->mass      = 1.0f;
+                                }
+                                if (JceBoxColliderComponent *bc =
+                                        jce_scene_get_box_collider(s.scene, (JceEntity)c)) {
+                                    bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
+                                }
+                                if (phys_simlod) {
+                                    JceSimLodComponent sl;
+                                    memset(&sl, 0, sizeof sl);
+                                    sl.enabled     = true;
+                                    sl.near_radius = 25.0f;
+                                    sl.mid_radius  = 80.0f;
+                                    sl.far_hz      = -1.0f;   /* pause far tier */
+                                    sl.gate_mask   = JCE_SIMLOD_GATE_PHYSICS;
+                                    jce_scene_set_sim_lod(s.scene, (JceEntity)c, &sl);
+                                }
+                            }
                             demo_set_position(c,
                                               origin + x * spacing,
                                               origin + y * spacing,
@@ -244,8 +484,100 @@ static void build_demo_scene(void)
                     }
                 }
                 s_suppress_add_component_log = false;
-                LOG_INFO(LOG_TAG, "stress test: spawned %ld cubes (%dx%dx%d grid)",
-                         spawned, side, side, side);
+                LOG_INFO(LOG_TAG, "stress test: spawned %ld %s (%dx%dx%d grid)",
+                         spawned, (stress_model && stress_model[0]) ? "models" : "cubes",
+                         side, side, side);
+              } /* end else (N-entity path) */
+            }
+        }
+    }
+
+    /* ── Optional many-light stress (JCE_STRESS_LIGHTS=N) ──────────────
+     * Spawns N point lights scattered over the stress field so the many-light
+     * path is measurable: Forward+ (r.forwardplus / JCE_FORWARDPLUS) clusters
+     * them via the s_cluster data texture, vs the brute-force per-draw
+     * u_pointLights uniform arrays — the SRP-Batcher-equivalent A/B for lights. */
+    {
+        const char *lenv = std::getenv("JCE_STRESS_LIGHTS");
+        if (lenv) {
+            long nl = strtol(lenv, nullptr, 10);
+            if (nl > 0 && nl <= 4096) {
+                long ncubes = 0;
+                if (const char *ce = std::getenv("JCE_STRESS_CUBES"))
+                    ncubes = strtol(ce, nullptr, 10);
+                float span = (float)sqrt((double)(ncubes > 0 ? ncubes : 4096)) * 1.5f;
+                uint32_t lroot = jce_state_create_entity("Stress Lights", root);
+                s_suppress_add_component_log = true;
+                for (long li = 0; li < nl; li++) {
+                    uint32_t le = jce_state_create_entity("pl", lroot);
+                    jce_state_add_component(le, JCE_COMP_FLAG_POINT_LIGHT);
+                    float fx = ((float)((li * 131) % 997) / 997.0f - 0.5f) * span;
+                    float fz = ((float)((li * 271) % 991) / 991.0f - 0.5f) * span;
+                    JcePointLight pl; memset(&pl, 0, sizeof pl);
+                    pl.position.x = fx; pl.position.y = 3.0f; pl.position.z = fz;
+                    pl.color.x = 1.0f; pl.color.y = 0.85f; pl.color.z = 0.7f;
+                    pl.intensity = 4.0f; pl.radius = 10.0f;
+                    jce_scene_set_point_light(s.scene, (JceEntity)le, &pl);
+                    demo_set_position(le, fx, 3.0f, fz);
+                }
+                s_suppress_add_component_log = false;
+                LOG_INFO(LOG_TAG, "stress LIGHTS: spawned %ld point lights", nl);
+            }
+        }
+    }
+
+    /* ── Optional skinned-crowd stress (rank 5b) ──────────────────────
+     * JCE_STRESS_SKINNED=N + JCE_STRESS_SKIN_PATH=<animated glb abs path>
+     * spawns N skinned characters (MeshRenderer + SkeletalAnimator playing a
+     * looping clip) on a 2D grid, so the skinning CPU path (pose sample +
+     * skeleton eval + world-palette build) is measurable — the cube harness
+     * only exercises static meshes.  Pairs with the rank-9 alloc counter to
+     * expose per-frame heap churn in jce_skeleton_evaluate.  Optional:
+     * JCE_STRESS_SKIN_CLIP (default "Run"), JCE_STRESS_SKIN_SCALE (default 0.02
+     * so the model isn't huge/GPU-bound). */
+    {
+        const char *skenv  = std::getenv("JCE_STRESS_SKINNED");
+        const char *skpath = std::getenv("JCE_STRESS_SKIN_PATH");
+        if (skenv) {
+            const long n = strtol(skenv, nullptr, 10);
+            if (n > 0 && n <= 50000 && skpath && skpath[0]) {
+                LOG_INFO(LOG_TAG, "stress SKINNED: spawning %ld animated '%s'", n, skpath);
+                uint32_t sroot = jce_state_create_entity("Stress Skinned", root);
+                int side = 1; while ((long)side * side < n) side++;
+                const float spacing = 2.0f;
+                const float org = -0.5f * (float)(side - 1) * spacing;
+                const char *clip = std::getenv("JCE_STRESS_SKIN_CLIP");
+                float scl = 0.02f;
+                if (const char *se = std::getenv("JCE_STRESS_SKIN_SCALE")) {
+                    float v = (float)atof(se); if (v > 0.0f) scl = v;
+                }
+                s_suppress_add_component_log = true;
+                long spawned = 0;
+                for (int x = 0; x < side && spawned < n; x++)
+                for (int z = 0; z < side && spawned < n; z++) {
+                    uint32_t c = jce_state_create_entity("sk", sroot);
+                    jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
+                    if (JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c))
+                        snprintf(mm->mesh_path, sizeof mm->mesh_path, "%s", skpath);
+                    jce_state_add_component(c, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
+                    if (JceSkeletalAnimatorComponent *sa =
+                            jce_scene_get_skeletal_animator(s.scene, (JceEntity)c)) {
+                        snprintf(sa->skeleton_path, sizeof sa->skeleton_path, "%s", skpath);
+                        snprintf(sa->clip_names[0], sizeof sa->clip_names[0], "%s",
+                                 (clip && clip[0]) ? clip : "Run");
+                        sa->clip_count = 1;
+                        sa->active_clip = 0;
+                        sa->speed = 1.0f; sa->loop = true; sa->playing = true;
+                    }
+                    demo_set_position(c, org + (float)x * spacing, 0.0f, org + (float)z * spacing);
+                    demo_set_scale(c, scl, scl, scl);
+                    spawned++;
+                }
+                s_suppress_add_component_log = false;
+                LOG_INFO(LOG_TAG, "stress SKINNED: spawned %ld (%dx%d grid, clip '%s')",
+                         spawned, side, side, (clip && clip[0]) ? clip : "Run");
+            } else if (n > 0) {
+                LOG_WARN(LOG_TAG, "JCE_STRESS_SKINNED needs JCE_STRESS_SKIN_PATH=<animated glb absolute path>");
             }
         }
     }
@@ -253,10 +585,13 @@ static void build_demo_scene(void)
 
 /* ── Init / Shutdown ─────────────────────────────────────────────── */
 
+/* Defined with the view/gizmo toggles near the bottom of this file. */
+static void load_persisted_view_toggles(void);
+
 void jce_editor_state_init(bool with_demo_scene)
 {
     memset(&s, 0, sizeof(s));
-    g_entity_order.clear();
+    g_entity_order.clear(); g_entity_order_gen++;
     g_entity_sidecar.clear();
     s_undo_history.clear();
     s_redo_history.clear();
@@ -277,7 +612,9 @@ void jce_editor_state_init(bool with_demo_scene)
     s.play_state  = JCE_PLAY_STOPPED;
     s.current_scene_path[0] = '\0';
 
-    /* Load persisted render settings from .jce/editor-config.json. */
+    /* Load persisted render settings from the split per-user config
+     * (~/.jce/editor-session.json: view_mode/show_grid;
+     *  ~/.jce/editor-preferences.json: gizmo snap increments). */
     {
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
@@ -295,6 +632,10 @@ void jce_editor_state_init(bool with_demo_scene)
             s.show_grid = true;
         }
     }
+
+    /* Restore the user-global view/gizmo toggles (show flags, gizmo
+     * mode/space/pivot, snap toggle, 2D mode) saved by their setters. */
+    load_persisted_view_toggles();
 
     s.scene = jce_scene_create();
     if (!s.scene) {
@@ -334,6 +675,10 @@ bool jce_state_new_default_scene(void)
     /* The streaming-preview streamer holds entity handles into the old
      * scene — destroy it BEFORE the entities go away. */
     jce_editor_scene_render_streaming_teardown();
+
+    /* New Scene is not a file load, so explicitly leave read-only Bundle
+     * Preview before constructing project-backed default content. */
+    jce_state_close_bundle_preview();
 
     if (!s.scene)
         s.scene = jce_scene_create();
@@ -378,7 +723,8 @@ bool jce_state_new_default_scene(void)
 
 void jce_editor_state_shutdown(void)
 {
-    g_entity_order.clear();
+    jce_state_close_bundle_preview();
+    g_entity_order.clear(); g_entity_order_gen++;
     g_entity_sidecar.clear();
     s_undo_history.clear();
     s_redo_history.clear();
@@ -529,15 +875,23 @@ uint32_t jce_state_find_by_name(const char *name)
 void jce_state_prune_dead(void)
 {
     if (!s.scene) return;
-    for (size_t i = 0; i < g_entity_order.size(); ) {
+    /* Single-pass compaction: the old per-dead-entity vector::erase shifted
+     * the whole tail each time — O(N x D) on a wave-unload frame (a 2048-
+     * entity chunk despawn against a 20k-entry order list = tens of millions
+     * of u32 moves).  Two-pointer compact keeps the relative order, moves
+     * each survivor at most once, and resizes once: O(N) regardless of how
+     * many died this frame. */
+    size_t keep = 0;
+    for (size_t i = 0; i < g_entity_order.size(); ++i) {
         uint32_t id = g_entity_order[i];
         if (id != 0 && jce_scene_has_editor_meta(s.scene, (JceEntity)id)) {
-            ++i;                              /* still alive */
+            if (keep != i) g_entity_order[keep] = id;
+            ++keep;                           /* still alive */
         } else {
             jce_state_deselect_entity(id);   /* drop from selection/focus too */
-            g_entity_order.erase(g_entity_order.begin() + (long)i);
         }
     }
+    g_entity_order.resize(keep); g_entity_order_gen++;
     /* Also drop any SELECTED entity that is no longer alive even if it was never
      * in g_entity_order — e.g. a STREAMED chunk entity the user picked in the
      * viewport whose chunk then unloaded.  Without this the gizmo / inspector
@@ -585,7 +939,7 @@ void jce_state_streamer_mirror_spawn(const uint64_t *ids, uint32_t count)
     g_pending_spawn_ids.reserve(g_pending_spawn_ids.size() + count);
     for (uint32_t i = 0; i < count; i++) {
         if (!ids[i]) continue;
-        g_entity_order.push_back((uint32_t)ids[i]);
+        g_entity_order.push_back((uint32_t)ids[i]); g_entity_order_gen++;
         /* Stage these ids; the chunk-state callback (fired right after the
          * spawn callback, carrying the chunk id) claims them into the
          * chunk->entities group map. */
@@ -605,7 +959,7 @@ void jce_state_streamer_mirror_despawn(const uint64_t *ids, uint32_t count)
     }
     g_entity_order.erase(
         std::remove_if(g_entity_order.begin(), g_entity_order.end(),
-                       [&](uint32_t e) { return dead.find(e) != dead.end(); }),
+                       [&](uint32_t e) { return dead.find(e) != dead.end(); g_entity_order_gen++; }),
         g_entity_order.end());
 }
 
@@ -937,7 +1291,7 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
     jce_scene_set_transform(s.scene, e, &t);
 
     uint32_t id = (uint32_t)e;
-    g_entity_order.push_back(id);
+    g_entity_order.push_back(id); g_entity_order_gen++;
     g_entity_sidecar[id] = EditorEntitySidecar{};
     return id;
 }
@@ -975,6 +1329,163 @@ void jce_state_delete_entity(uint32_t id)
 
     /* Single ecs_delete at the root — flecs cascades to ChildOf descendants. */
     jce_scene_destroy_entity(s.scene, (JceEntity)id);
+
+    /* scrub_editor_state_recursive only walks JCE_MAX_CHILDREN (64) children per
+     * node, so a node wider than that (e.g. a benchmark's tens-of-thousands of
+     * cubes under one root) leaves the overflow as freed ids in g_entity_order.
+     * Prune them, else jce_state_get_roots dereferences a dead id next frame
+     * (ecs_get_parent AV). Cheap no-op when nothing leaked. */
+    jce_state_prune_dead();
+}
+
+/* ── In-editor Performance Benchmark spawn (Profiler "Benchmark" tab) ───────
+ * Shares the bulk-spawn machinery the JCE_STRESS_* env path uses (undo-history
+ * suspend + per-component log suppression) so a 50k-entity workload spawns fast
+ * and without flooding the undo stack.  Kinds mirror the panel enum:
+ *   0 Draw Call (grid, unique colour)  1 Instancing (scatter cube)
+ *   2 Triangle (scatter sphere)        3 Entity Count (grid + ECS spin)
+ *   4 Physics (grid + dynamic rigid body). */
+extern "C" int jce_scene_stress_spin_runtime;
+static uint32_t s_bench_root    = 0;
+static uint32_t s_bench_spawned = 0;
+static int      s_bench_kind    = -1;
+
+static void bench_set_pos(uint32_t e, float x, float y, float z)
+{
+    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)e);
+    if (t) { t->position.x = x; t->position.y = y; t->position.z = z; }
+}
+
+extern "C" void jce_state_benchmark_clear(void)
+{
+    jce_state_benchmark_isolate(0);   /* restore any scene we hid for isolation */
+    /* jce_state_delete_entity cascades + prunes the mirror (the benchmark's
+     * tens-of-thousands of children exceed scrub's JCE_MAX_CHILDREN walk). */
+    if (s_bench_root) { jce_state_delete_entity(s_bench_root); s_bench_root = 0; }
+    s_bench_spawned = 0;
+    s_bench_kind    = -1;
+    jce_scene_stress_spin_runtime = 0;
+    /* Restore the JCE_PERF_LOG latch instead of hard-off: a plain 0 here
+     * permanently silenced the log's phase line for the rest of the session
+     * (the env latch never re-arms). */
+    jce_perf_phase_set_enabled(std::getenv("JCE_PERF_LOG") != NULL);
+}
+
+extern "C" uint32_t jce_state_benchmark_spawned(void) { return s_bench_spawned; }
+extern "C" int      jce_state_benchmark_kind(void)    { return s_bench_kind; }
+
+/* Isolated-scene benchmarking: hide everything that is NOT part of the active
+ * benchmark so the live stats measure only the workload (the current scene's
+ * own meshes/terrain otherwise contaminate the numbers — e.g. meadow's ground
+ * collider inflates the physics figure).  Reversible: remembers exactly which
+ * components it disabled and re-enables only those. */
+struct BenchHidden { uint32_t id; uint64_t mask; };
+static std::vector<BenchHidden> s_bench_isolated;   /* exactly what we disabled */
+
+static uint32_t bench_root_of(uint32_t id)
+{
+    uint32_t r = id, p;
+    while ((p = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)r)) != 0 &&
+           p != (uint32_t)JCE_ENTITY_INVALID)
+        r = p;
+    return r;
+}
+
+extern "C" void jce_state_benchmark_isolate(int on)
+{
+    if (!s.scene) return;
+    const uint64_t kHideMask = JCE_COMP_FLAG_MESH_RENDERER | JCE_COMP_FLAG_TERRAIN;
+    if (on) {
+        if (!s_bench_isolated.empty()) return;            /* already isolated */
+        std::vector<uint32_t> ids(g_entity_order);        /* order-independent */
+        for (uint32_t id : ids) {
+            if (id == 0 || id == s_bench_root) continue;
+            if (s_bench_root && bench_root_of(id) == s_bench_root) continue;  /* a benchmark entity */
+            const uint64_t f = jce_scene_get_component_flags(s.scene, (JceEntity)id) & kHideMask;
+            if (!f) continue;
+            jce_scene_set_component_enabled(s.scene, (JceEntity)id, f, false);
+            s_bench_isolated.push_back(BenchHidden{ id, f });
+        }
+    } else {
+        for (const BenchHidden &h : s_bench_isolated) {
+            if (!jce_scene_has_editor_meta(s.scene, (JceEntity)h.id)) continue;  /* gone */
+            jce_scene_set_component_enabled(s.scene, (JceEntity)h.id, h.mask, true);
+        }
+        s_bench_isolated.clear();
+    }
+}
+
+extern "C" int jce_state_benchmark_is_isolated(void) { return !s_bench_isolated.empty() ? 1 : 0; }
+
+extern "C" void jce_state_benchmark_spawn(int kind, int count)
+{
+    jce_state_benchmark_clear();
+    if (!s.scene || count <= 0) return;
+
+    HistorySuspendScope suspend;                 /* no per-cube undo entries   */
+    const bool prev_suppress = s_suppress_add_component_log;
+    s_suppress_add_component_log = true;         /* no per-component log spam   */
+
+    s_bench_root = jce_state_create_entity("Benchmark", 0);
+    if (s_bench_root) {
+        if (kind == 1 || kind == 2) {            /* Instancing / Triangle: 1 scatter */
+            uint32_t sc = jce_state_create_entity("BenchScatter", s_bench_root);
+            bench_set_pos(sc, 0.0f, 0.0f, 0.0f);
+            JceVegetationScatterComponent vs;
+            memset(&vs, 0, sizeof vs);
+            vs.visible       = true;
+            vs.mesh_shape    = (kind == 2) ? 1u : 0u;   /* sphere : cube */
+            float side_m     = (float)sqrt((double)count) * 2.0f;
+            vs.area_x        = side_m;
+            vs.area_z        = side_m;
+            vs.density       = (float)count / (side_m * side_m);
+            vs.scale_min     = 1.0f;
+            vs.scale_max     = 1.0f;
+            vs.max_slope_deg = 90.0f;
+            vs.seed          = 1u;
+            jce_scene_set_vegetation_scatter(s.scene, (JceEntity)sc, &vs);
+            s_bench_spawned  = (uint32_t)count;
+        } else {                                 /* Draw Call / Entity / Physics: grid */
+            const bool unique = (kind == 0);
+            const bool phys   = (kind == 4);
+            int side = 1;
+            while ((long)side * side * side < count) side++;
+            const float spacing = phys ? 1.6f : 1.5f;
+            const float origin  = -0.5f * (float)(side - 1) * spacing;
+            int spawned = 0;
+            for (int x = 0; x < side && spawned < count; ++x)
+            for (int y = 0; y < side && spawned < count; ++y)
+            for (int z = 0; z < side && spawned < count; ++z) {
+                uint32_t c = jce_state_create_entity("b", s_bench_root);
+                jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
+                JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
+                if (mm && unique) {
+                    mm->base_color[0] = 0.15f + 0.7f * (float)((spawned * 13) % 101) / 101.0f;
+                    mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
+                    mm->base_color[2] = 0.15f + 0.7f * (float)((spawned * 71) % 107) / 107.0f;
+                    mm->base_color[3] = 1.0f;
+                }
+                if (phys) {
+                    jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
+                    jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
+                    if (JceRigidBodyComponent *rb = jce_scene_get_rigidbody(s.scene, (JceEntity)c)) {
+                        rb->body_type = 1; rb->mass = 1.0f;
+                    }
+                    if (JceBoxColliderComponent *bc = jce_scene_get_box_collider(s.scene, (JceEntity)c)) {
+                        bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
+                    }
+                }
+                bench_set_pos(c, origin + x * spacing, origin + y * spacing, origin + z * spacing);
+                ++spawned;
+            }
+            s_bench_spawned = (uint32_t)spawned;
+        }
+    }
+
+    s_suppress_add_component_log = prev_suppress;
+    s_bench_kind = kind;
+    if (kind == 3) jce_scene_stress_spin_runtime = 1;   /* Entity Count = per-frame spin */
+    jce_perf_phase_set_enabled(1);   /* capture CPU phases for the live readout */
 }
 
 void jce_state_rename_entity(uint32_t id, const char *name)
@@ -987,6 +1498,47 @@ void jce_state_rename_entity(uint32_t id, const char *name)
     snprintf(m->name, sizeof(m->name), "%s", name ? name : "");
 }
 
+/* ── JCE_STRESS_MOVERS=N harness (DOTS-floor L2 soak) ─────────────────
+ * Wiggle the first N stress cubes through the REAL jce_scene_set_transform
+ * path every frame — exercising invalidate_entity_world (dirty ring +
+ * xform_counter) exactly like gizmo/script movers.  Inert unless both the
+ * env and a stress spawn are present. */
+static uint32_t s_stress_mover_ids[1024];
+static float    s_stress_mover_base_y[1024];
+static uint32_t s_stress_mover_count = 0;
+
+void jce_state_stress_record_mover(uint32_t id)
+{
+    static int s_movers_env = -2;
+    if (s_movers_env == -2) {
+        const char *mv = std::getenv("JCE_STRESS_MOVERS");
+        s_movers_env = (mv && mv[0]) ? atoi(mv) : 0;
+        if (s_movers_env > 1024) s_movers_env = 1024;
+    }
+    if (s_movers_env <= 0) return;
+    if (s_stress_mover_count < (uint32_t)s_movers_env)
+        s_stress_mover_ids[s_stress_mover_count++] = id;
+}
+
+void jce_state_stress_move_tick(float dt)
+{
+    if (s_stress_mover_count == 0 || !s.scene) return;
+    static float s_phase = 0.0f;
+    static bool  s_base_taken = false;
+    s_phase += dt;
+    for (uint32_t i = 0; i < s_stress_mover_count; i++) {
+        JceEntity e = (JceEntity)s_stress_mover_ids[i];
+        JceTransform *tc = jce_scene_get_transform(s.scene, e);
+        if (!tc) continue;
+        if (!s_base_taken) s_stress_mover_base_y[i] = tc->position.y;
+        JceTransform t = *tc;
+        t.position.y = s_stress_mover_base_y[i] +
+                       0.5f * sinf(s_phase * 2.0f + (float)i * 0.37f);
+        jce_scene_set_transform(s.scene, e, &t);
+    }
+    s_base_taken = true;
+}
+
 void jce_state_set_entity_enabled(uint32_t id, bool enabled)
 {
     HistoryEditScope edit_scope;
@@ -995,6 +1547,9 @@ void jce_state_set_entity_enabled(uint32_t id, bool enabled)
     JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
     if (!m) return;
     m->enabled = enabled;
+    /* The flag is mutated in place (no set_ call), so signal the frame-
+     * invariance counter for cross-frame render caches (DOTS slice 1). */
+    jce_scene_bump_enable_gen(s.scene);
 
     /* Cascade to children. */
     JceEntity children[JCE_MAX_CHILDREN];
@@ -1079,11 +1634,11 @@ void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
 
     auto it_e = std::find(g_entity_order.begin(), g_entity_order.end(), entity_id);
     if (it_e == g_entity_order.end()) return;
-    g_entity_order.erase(it_e);
+    g_entity_order.erase(it_e); g_entity_order_gen++;
 
     auto it_r = std::find(g_entity_order.begin(), g_entity_order.end(), ref_id);
     if (it_r == g_entity_order.end()) {
-        g_entity_order.push_back(entity_id);
+        g_entity_order.push_back(entity_id); g_entity_order_gen++;
         return;
     }
     if (insert_after) ++it_r;
@@ -1390,19 +1945,25 @@ const char *jce_comp_flag_i18n_key(uint64_t comp_flag)
 void          jce_state_set_edit_mode(JceEditMode m)       { s.edit_mode = m; }
 JceEditMode   jce_state_get_edit_mode(void)                { return s.edit_mode; }
 
-void          jce_state_set_gizmo_mode(JceGizmoMode m)     { s.gizmo_mode = m; }
+/* Gizmo mode/space/pivot persist per user (editor-session.json) — the
+ * save-on-set / load-on-init pair keeps the tool selection across runs. */
+void          jce_state_set_gizmo_mode(JceGizmoMode m)     { s.gizmo_mode = m; jce_editor_ui_state_save_int("gizmo.mode", (int)m); }
 JceGizmoMode  jce_state_get_gizmo_mode(void)               { return s.gizmo_mode; }
 
-void          jce_state_set_gizmo_space(JceGizmoSpace sp)  { s.gizmo_space = sp; }
+void          jce_state_set_gizmo_space(JceGizmoSpace sp)  { s.gizmo_space = sp; jce_editor_ui_state_save_int("gizmo.space", (int)sp); }
 JceGizmoSpace jce_state_get_gizmo_space(void)              { return s.gizmo_space; }
 
-void          jce_state_set_gizmo_pivot(JceGizmoPivot p)   { s.gizmo_pivot = p; }
+void          jce_state_set_gizmo_pivot(JceGizmoPivot p)   { s.gizmo_pivot = p; jce_editor_ui_state_save_int("gizmo.pivot", (int)p); }
 JceGizmoPivot jce_state_get_gizmo_pivot(void)              { return s.gizmo_pivot; }
 void          jce_state_set_pivot_edit_mode(bool enabled)  { s.pivot_edit_mode = enabled; }
 bool          jce_state_get_pivot_edit_mode(void)          { return s.pivot_edit_mode; }
 
-/* Persist view_mode, show_grid and gizmo snap increments to
- * editor-config.json. */
+/* Persist view_mode, show_grid and gizmo snap increments via the config
+ * singleton (snap increments -> ~/.jce/editor-preferences.json).  view_mode
+ * and show_grid are per-PROJECT view state (a debug view left on in project
+ * A must not greet project B), so they ALSO mirror into the project store
+ * when one is open; the global copy is kept as the pre-project-open fallback
+ * (cold boot, or working with no project). */
 static void persist_render_settings(void)
 {
     JceEditorConfig ecfg;
@@ -1412,6 +1973,39 @@ static void persist_render_settings(void)
     ecfg.gizmo_snap_translate = s_gizmo_snap_translate;
     ecfg.gizmo_snap_rotate    = s_gizmo_snap_rotate;
     ecfg.gizmo_snap_scale     = s_gizmo_snap_scale;
+    jce_editor_config_save(&ecfg);
+
+    if (jce_editor_pstate_active()) {
+        jce_editor_pstate_set_int("view.mode", (int)s.view_mode);
+        jce_editor_pstate_set_int("view.show_grid", s.show_grid ? 1 : 0);
+    }
+}
+
+/* Apply the opened project's view mode / grid toggle over the global
+ * fallback.  Called from the project-open seam (set_current_project_root)
+ * after the project store follows the new root.  Absent keys leave the
+ * current (global-loaded) values untouched, and seed the project store so
+ * the next switch is authoritative. */
+void jce_state_apply_project_view_settings(void)
+{
+    if (!jce_editor_pstate_active()) return;
+    int vm = jce_editor_pstate_get_int("view.mode", -1);
+    int sg = jce_editor_pstate_get_int("view.show_grid", -1);
+    if (vm < 0 && sg < 0) {
+        /* First time this project is seen: seed from the current values. */
+        jce_editor_pstate_set_int("view.mode", (int)s.view_mode);
+        jce_editor_pstate_set_int("view.show_grid", s.show_grid ? 1 : 0);
+        return;
+    }
+    if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_AO)
+        s.view_mode = (JceSceneViewMode)vm;
+    if (sg >= 0)
+        s.show_grid = (sg != 0);
+    /* Mirror into the global fallback so a later no-project window matches. */
+    JceEditorConfig ecfg;
+    jce_editor_config_load(&ecfg);
+    ecfg.view_mode = (int)s.view_mode;
+    ecfg.show_grid = s.show_grid;
     jce_editor_config_save(&ecfg);
 }
 
@@ -1425,7 +2019,11 @@ float jce_state_get_gizmo_snap_translate(void) { return s_gizmo_snap_translate; 
 float jce_state_get_gizmo_snap_rotate(void)    { return s_gizmo_snap_rotate; }
 float jce_state_get_gizmo_snap_scale(void)     { return s_gizmo_snap_scale; }
 bool  jce_state_get_gizmo_snap_enabled(void)   { return s_gizmo_snap_enabled; }
-void  jce_state_set_gizmo_snap_enabled(bool v) { s_gizmo_snap_enabled = v; }
+void  jce_state_set_gizmo_snap_enabled(bool v)
+{
+    s_gizmo_snap_enabled = v;
+    jce_editor_ui_state_save_int("gizmo.snap_enabled", v ? 1 : 0);
+}
 
 void  jce_state_set_gizmo_snap_translate(float v)
 {
@@ -1446,17 +2044,31 @@ void  jce_state_set_gizmo_snap_scale(float v)
     persist_render_settings();
 }
 
+/* Standalone overlay toggles (not part of the show-flags bitmask) —
+ * persisted per user under the same "sceneview.show.*" namespace. */
 static bool s_show_physics_debug = false;
 bool  jce_state_get_show_physics_debug(void)  { return s_show_physics_debug; }
-void  jce_state_set_show_physics_debug(bool v){ s_show_physics_debug = v; }
+void  jce_state_set_show_physics_debug(bool v)
+{
+    s_show_physics_debug = v;
+    jce_editor_ui_state_save_int("sceneview.show.physics_debug", v ? 1 : 0);
+}
 
 static bool s_show_joint_gizmos = true;
 bool  jce_state_get_show_joint_gizmos(void)   { return s_show_joint_gizmos; }
-void  jce_state_set_show_joint_gizmos(bool v) { s_show_joint_gizmos = v; }
+void  jce_state_set_show_joint_gizmos(bool v)
+{
+    s_show_joint_gizmos = v;
+    jce_editor_ui_state_save_int("sceneview.show.joints", v ? 1 : 0);
+}
 
 static bool s_show_cloth_gizmos = true;
 bool  jce_state_get_show_cloth_gizmos(void)   { return s_show_cloth_gizmos; }
-void  jce_state_set_show_cloth_gizmos(bool v) { s_show_cloth_gizmos = v; }
+void  jce_state_set_show_cloth_gizmos(bool v)
+{
+    s_show_cloth_gizmos = v;
+    jce_editor_ui_state_save_int("sceneview.show.cloth", v ? 1 : 0);
+}
 
 /* World-streaming preview (session-local; never persisted — a freshly
  * opened editor must not mutate the hierarchy until the user opts in). */
@@ -1471,19 +2083,85 @@ static uint32_t s_show_flags =
     | JCE_SHOW_FLAG_LIGHT_ICONS
     | JCE_SHOW_FLAG_CAMERA_ICONS
     | JCE_SHOW_FLAG_SKYBOX
-    | JCE_SHOW_FLAG_WORLD_AXIS;
+    | JCE_SHOW_FLAG_WORLD_AXIS
+    | JCE_SHOW_FLAG_PARTICLE_ICONS   /* particle source gizmos ON so emitters are selectable */
+    | JCE_SHOW_FLAG_UI;   /* scene-view Canvas overlay ON like Unity */
+
+/* Persisted show flags, keyed by NAME rather than bit position so the
+ * mask can be renumbered without scrambling saved sessions.  Flags with
+ * no renderer/overlay consumer yet (colliders, bounding boxes, stats
+ * overlay) are deliberately absent: persisting a bit nothing draws
+ * would only freeze dead state into every session file. */
+static const struct { uint32_t bit; const char *key; } k_show_flag_keys[] = {
+    { JCE_SHOW_FLAG_GIZMOS,       "sceneview.show.gizmos"       },
+    { JCE_SHOW_FLAG_LIGHT_ICONS,  "sceneview.show.light_icons"  },
+    { JCE_SHOW_FLAG_CAMERA_ICONS, "sceneview.show.camera_icons" },
+    { JCE_SHOW_FLAG_SKYBOX,       "sceneview.show.skybox"       },
+    { JCE_SHOW_FLAG_WORLD_AXIS,   "sceneview.show.world_axis"   },
+    { JCE_SHOW_FLAG_NAVMESH,      "sceneview.show.navmesh"      },
+    { JCE_SHOW_FLAG_STREAMING,    "sceneview.show.streaming"    },
+    { JCE_SHOW_FLAG_UI,           "sceneview.show.ui"           },
+    { JCE_SHOW_FLAG_PARTICLE_ICONS, "sceneview.show.particle_icons" },
+};
+
+static void save_named_show_flags(uint32_t affected_mask)
+{
+    for (const auto &e : k_show_flag_keys)
+        if (affected_mask & e.bit)
+            jce_editor_ui_state_save_int(e.key,
+                                         (s_show_flags & e.bit) ? 1 : 0);
+}
 
 uint32_t jce_state_get_show_flags(void)            { return s_show_flags; }
-void     jce_state_set_show_flags(uint32_t flags)  { s_show_flags = flags; }
+void     jce_state_set_show_flags(uint32_t flags)
+{
+    s_show_flags = flags;
+    save_named_show_flags(0xFFFFFFFFu);   /* bulk set (All On/Off/Defaults) */
+}
 bool     jce_state_show_flag(JceShowFlag f)        { return (s_show_flags & (uint32_t)f) != 0; }
 void     jce_state_set_show_flag(JceShowFlag f, bool on)
 {
     if (on) s_show_flags |=  (uint32_t)f;
     else    s_show_flags &= ~(uint32_t)f;
+    save_named_show_flags((uint32_t)f);
 }
 
 bool  jce_state_get_2d_mode(void)            { return s.is_2d_mode; }
-void  jce_state_set_2d_mode(bool is_2d)      { s.is_2d_mode = is_2d; }
+void  jce_state_set_2d_mode(bool is_2d)
+{
+    s.is_2d_mode = is_2d;
+    jce_editor_ui_state_save_int("sceneview.mode_2d", is_2d ? 1 : 0);
+}
+
+/* Load-once counterpart of the save-on-set persistence above.  Fallbacks
+ * are the code defaults so a fresh session file changes nothing. */
+static void load_persisted_view_toggles(void)
+{
+    s.gizmo_mode  = (JceGizmoMode)jce_editor_ui_state_load_int(
+        "gizmo.mode",  (int)s.gizmo_mode,  JCE_GIZMO_TRANSLATE, JCE_GIZMO_SCALE);
+    s.gizmo_space = (JceGizmoSpace)jce_editor_ui_state_load_int(
+        "gizmo.space", (int)s.gizmo_space, JCE_GIZMO_LOCAL, JCE_GIZMO_WORLD);
+    s.gizmo_pivot = (JceGizmoPivot)jce_editor_ui_state_load_int(
+        "gizmo.pivot", (int)s.gizmo_pivot, JCE_GIZMO_PIVOT, JCE_GIZMO_CENTER);
+    s_gizmo_snap_enabled = jce_editor_ui_state_load_int(
+        "gizmo.snap_enabled", s_gizmo_snap_enabled ? 1 : 0, 0, 1) != 0;
+    s.is_2d_mode = jce_editor_ui_state_load_int(
+        "sceneview.mode_2d", s.is_2d_mode ? 1 : 0, 0, 1) != 0;
+
+    s_show_physics_debug = jce_editor_ui_state_load_int(
+        "sceneview.show.physics_debug", s_show_physics_debug ? 1 : 0, 0, 1) != 0;
+    s_show_joint_gizmos = jce_editor_ui_state_load_int(
+        "sceneview.show.joints", s_show_joint_gizmos ? 1 : 0, 0, 1) != 0;
+    s_show_cloth_gizmos = jce_editor_ui_state_load_int(
+        "sceneview.show.cloth", s_show_cloth_gizmos ? 1 : 0, 0, 1) != 0;
+
+    for (const auto &e : k_show_flag_keys) {
+        bool on = jce_editor_ui_state_load_int(
+            e.key, (s_show_flags & e.bit) ? 1 : 0, 0, 1) != 0;
+        if (on) s_show_flags |=  e.bit;
+        else    s_show_flags &= ~e.bit;
+    }
+}
 
 bool  jce_state_get_live_preview(void)       { return s.live_preview; }
 void  jce_state_set_live_preview(bool on)    { s.live_preview = on; }

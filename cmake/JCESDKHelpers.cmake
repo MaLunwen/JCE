@@ -10,7 +10,8 @@
 #       RESOURCE_DIRS  <dir> [<dir>...]
 #       [PAK_FILE      <path>]                  # default: <bin>/<target>_assets.pak
 #       [SYMBOL_PREFIX <symbol>]                # default: assets_pak_data
-#       [EXCLUDE_SEGMENTS <seg> [<seg>...]])
+#       [EXCLUDE_SEGMENTS <seg> [<seg>...]]
+#       [STRIP_DEBUG_PATHS])
 #
 # Links editor-prebuilt assets into <target> when
 # `JCE_PROJECT_PREBUILT_ASSETS_OBJ`, `JCE_PROJECT_PREBUILT_ASSETS_ASM`, or
@@ -28,16 +29,83 @@
 include_guard(GLOBAL)
 
 # ------------------------------------------------------------------ #
+# jce_configure_application_target(<target>)                           #
+#                                                                     #
+# Apply the portable shipping policy to an SDK-consumer executable.   #
+# `dist` is a JCE variant layered on top of CMake Release, so checking #
+# CMAKE_BUILD_TYPE for "Dist" is incorrect.                           #
+# ------------------------------------------------------------------ #
+function(jce_configure_application_target TARGET)
+	if(NOT TARGET ${TARGET})
+		message(FATAL_ERROR
+			"jce_configure_application_target: '${TARGET}' is not a target.")
+	endif()
+	if(NOT JCE_BUILD_VARIANT STREQUAL "dist")
+		return()
+	endif()
+
+	target_compile_definitions(${TARGET} PRIVATE JCE_DIST=1)
+	set_target_properties(${TARGET} PROPERTIES
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN YES)
+
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT _jce_ipo_ok OUTPUT _jce_ipo_error)
+	if(_jce_ipo_ok)
+		set_target_properties(${TARGET} PROPERTIES
+			INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
+			INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
+	else()
+		message(WARNING
+			"JCE dist: IPO/LTO unavailable for ${TARGET}: ${_jce_ipo_error}")
+	endif()
+
+	if(WIN32)
+		# GUI subsystem: the shipped application opens no terminal window.
+		set_target_properties(${TARGET} PROPERTIES WIN32_EXECUTABLE TRUE)
+	endif()
+
+	if(MSVC)
+		target_compile_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:/GS>
+			$<$<CONFIG:Release>:/guard:cf>
+			$<$<CONFIG:Release>:/Gy>
+			$<$<CONFIG:Release>:/Gw>)
+		target_link_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:/DYNAMICBASE>
+			$<$<CONFIG:Release>:/NXCOMPAT>
+			$<$<CONFIG:Release>:/HIGHENTROPYVA>
+			$<$<CONFIG:Release>:/GUARD:CF>
+			$<$<CONFIG:Release>:/OPT:REF>
+			$<$<CONFIG:Release>:/OPT:ICF>
+			$<$<CONFIG:Release>:/INCREMENTAL:NO>)
+	elseif(APPLE)
+		target_compile_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:-fstack-protector-strong>)
+		target_link_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:LINKER:-dead_strip>)
+	elseif(UNIX AND NOT EMSCRIPTEN)
+		target_compile_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:-fstack-protector-strong>)
+		target_link_options(${TARGET} PRIVATE
+			$<$<CONFIG:Release>:LINKER:-z,relro>
+			$<$<CONFIG:Release>:LINKER:-z,now>
+			$<$<CONFIG:Release>:LINKER:-z,noexecstack>)
+	endif()
+endfunction()
+
+# ------------------------------------------------------------------ #
 # _jce_embed_pak_key(<target>)                                        #
 #                                                                     #
 # Links the embedded asset-decryption key TU into <target> when the   #
 # editor-driven build provides one through                            #
 # JCE_PROJECT_PREBUILT_PAK_KEY_C (jce_generated/jce_pak_key.c, two    #
-# XOR shares regenerated per build).  No stub is linked otherwise:    #
-# the engine library carries WEAK zeroed defaults                     #
-# (jce_pak_key_default.c), which the strong generated TU overrides    #
-# cleanly even under /WHOLEARCHIVE — a per-target stub here would     #
-# itself collide with the whole-archived library member (LNK2005).    #
+# XOR shares regenerated per build).  No target-local stub is linked   #
+# otherwise: the SDK dependency archive carries a zero fallback member #
+# that is linked normally, outside the force-loaded engine core.  A     #
+# generated target object resolves the symbols first, so the fallback   #
+# member is not extracted.                                              #
 # Idempotent per target.                                              #
 # ------------------------------------------------------------------ #
 function(_jce_embed_pak_key TARGET)
@@ -55,6 +123,60 @@ function(_jce_embed_pak_key TARGET)
 	endif()
 endfunction()
 
+# ------------------------------------------------------------------ #
+# _jce_prepare_runtime_boot_manifest(<target> <project-json> <out-dir>
+#                                    <out-file>)                     #
+#                                                                     #
+# Shipping applications boot from their embedded PAK, not from the   #
+# authoring-only jce_project.json staged beside an executable.  Emit  #
+# the narrow runtime contract under the reserved JPAK key             #
+# jce/runtime_boot.json; it contains only the selected scene path.    #
+# ------------------------------------------------------------------ #
+function(_jce_prepare_runtime_boot_manifest TARGET PROJECT_FILE OUT_DIR OUT_FILE)
+
+	set(${OUT_DIR} "" PARENT_SCOPE)
+	set(${OUT_FILE} "" PARENT_SCOPE)
+	if(NOT EXISTS "${PROJECT_FILE}")
+		return()
+	endif()
+
+	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+		"${PROJECT_FILE}")
+	file(READ "${PROJECT_FILE}" _project_json)
+	string(JSON _startup_scene ERROR_VARIABLE _boot_error
+		GET "${_project_json}" startup_scene)
+	if(_boot_error)
+		if(_boot_error MATCHES "member.*not found")
+			set(_startup_scene "")
+		else()
+			message(FATAL_ERROR
+				"jce_add_pak: cannot read startup_scene from ${PROJECT_FILE}: "
+				"${_boot_error}")
+		endif()
+	endif()
+
+	# Escape JSON syntax here; the runtime parser remains the authority for
+	# virtual-path validity when it reads the packed manifest at boot.
+	set(_scene_json "${_startup_scene}")
+	string(REPLACE "\\" "\\\\" _scene_json "${_scene_json}")
+	string(REPLACE "\"" "\\\"" _scene_json "${_scene_json}")
+	string(REPLACE "\r" "\\r" _scene_json "${_scene_json}")
+	string(REPLACE "\n" "\\n" _scene_json "${_scene_json}")
+
+	set(_boot_dir "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_runtime_boot")
+	set(_boot_file "${_boot_dir}/jce/runtime_boot.json")
+	file(MAKE_DIRECTORY "${_boot_dir}/jce")
+	file(WRITE "${_boot_file}"
+		"{\n"
+		"  \"contract\": \"jce.runtime_boot\",\n"
+		"  \"schema\": 1,\n"
+		"  \"startup_scene\": \"${_scene_json}\"\n"
+		"}\n")
+
+	set(${OUT_DIR} "${_boot_dir}" PARENT_SCOPE)
+	set(${OUT_FILE} "${_boot_file}" PARENT_SCOPE)
+endfunction()
+
 function(jce_target_embed_pak TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_pak: '${TARGET}' is not a target.")
@@ -64,7 +186,7 @@ function(jce_target_embed_pak TARGET)
 	# regardless of which assets path below is taken.
 	_jce_embed_pak_key(${TARGET})
 
-	set(_opts NO_ENGINE_RESOURCES)
+	set(_opts NO_ENGINE_RESOURCES STRIP_DEBUG_PATHS)
 	set(_one  PAK_FILE SYMBOL_PREFIX)
 	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_DEPENDS)
 	cmake_parse_arguments(EP "${_opts}" "${_one}" "${_multi}" ${ARGN})
@@ -128,6 +250,14 @@ function(jce_target_embed_pak TARGET)
 		return()
 	endif()
 
+	if(JCE_BUILD_VARIANT STREQUAL "dist")
+		message(FATAL_ERROR
+			"jce_target_embed_pak: dist requires the editor's authenticated "
+			"prebuilt PAK and key-share source. Build/package the project "
+			"through JCE Editor; manual raw-resource packing is available for "
+			"debug/release only.")
+	endif()
+
 	if(NOT JCE_PAK_EXECUTABLE)
 		message(FATAL_ERROR
 			"jce_target_embed_pak: no prebuilt assets were provided "
@@ -178,6 +308,44 @@ function(jce_target_embed_pak TARGET)
 		list(APPEND _excl_flags --exclude-segment "${_s}")
 	endforeach()
 
+	# Shader bytecode is backend-specific. Mirror the engine build's profile
+	# selection so an SDK consumer does not embed unreachable ESSL/Metal/etc.
+	# binaries merely because the SDK resource tree contains every platform's
+	# precompiled variant. Callers may override the selected set with
+	# JCE_PAK_SHADER_PROFILES (for example "dx11;spv" on a D3D/Vulkan-only app).
+	set(_all_shader_profiles dx11 spv glsl essl essl1 mtl)
+	if(DEFINED JCE_PAK_SHADER_PROFILES)
+		set(_shader_profiles ${JCE_PAK_SHADER_PROFILES})
+	elseif(WIN32)
+		set(_shader_profiles dx11 spv glsl)
+	elseif(APPLE)
+		set(_shader_profiles mtl spv)
+	elseif(ANDROID)
+		set(_shader_profiles essl spv)
+	elseif(EMSCRIPTEN)
+		set(_shader_profiles essl)
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		set(_shader_profiles spv glsl)
+	else()
+		set(_shader_profiles ${_all_shader_profiles})
+	endif()
+	jce_configure_application_target(${TARGET})
+	set(_shader_exclude_flags)
+	foreach(_profile IN LISTS _all_shader_profiles)
+		if(NOT _profile IN_LIST _shader_profiles)
+			list(APPEND _shader_exclude_flags
+				--exclude-suffix "_${_profile}.bin")
+		endif()
+	endforeach()
+
+	# Release packages use hash-only archive indices. Keep debug strings for
+	# Debug builds unless the caller explicitly requests stripping them.
+	set(_debug_path_flags)
+	if(EP_STRIP_DEBUG_PATHS OR
+	   CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+		list(APPEND _debug_path_flags --strip-debug-paths)
+	endif()
+
 	# Repack when any packed FILE changes — not just when the packer exe
 	# does. Without these deps an edited texture re-cooked by jce_add_pak()
 	# (or an edited raw resource) never dirtied the .pak: the only recorded
@@ -206,6 +374,9 @@ function(jce_target_embed_pak TARGET)
 	set(_obj_file      "${EP_PAK_FILE}${_obj_ext}")
 	set(_header_file   "${EP_PAK_FILE}.h")
 	set(_manifest_file "${EP_PAK_FILE}.manifest.json")
+	set(_reports_dir   "${CMAKE_CURRENT_BINARY_DIR}/reports")
+	set(_bom_file      "${_reports_dir}/${TARGET}_assets.pak.bom.json")
+	file(MAKE_DIRECTORY "${_reports_dir}")
 
 	# Emscripten: do NOT embed the PAK as an object.  Pack it (obj-format
 	# defaults to "none" when --obj-file/--obj-format are omitted), preload it
@@ -214,19 +385,22 @@ function(jce_target_embed_pak TARGET)
 	# (JCE_PLATFORM_WEB is a CMake var, never a -D macro).
 	if(EMSCRIPTEN)
 		add_custom_command(
-			OUTPUT  "${EP_PAK_FILE}"
+			OUTPUT  "${EP_PAK_FILE}" "${_bom_file}"
 			COMMAND "${JCE_PAK_EXECUTABLE}"
 				${_res_flags}
 				${_excl_flags}
+				${_shader_exclude_flags}
+				${_debug_path_flags}
 				--pak-file       "${EP_PAK_FILE}"
 				--header-file    "${_header_file}"
 				--manifest-file  "${_manifest_file}"
+				--json           "${_bom_file}"
 				--symbol-prefix  "${EP_SYMBOL_PREFIX}"
 			DEPENDS "${JCE_PAK_EXECUTABLE}" ${_pak_deps}
 			COMMENT "Packing ${TARGET} assets (wasm) -> ${EP_PAK_FILE}"
 			VERBATIM)
 
-		add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}")
+		add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_bom_file}")
 		add_dependencies(${TARGET} ${TARGET}_pak)
 
 		target_link_options(${TARGET} PRIVATE
@@ -258,14 +432,17 @@ function(jce_target_embed_pak TARGET)
 	endif()
 
 	add_custom_command(
-		OUTPUT  "${EP_PAK_FILE}" "${_obj_file}" "${_header_file}" "${_manifest_file}"
+		OUTPUT  "${EP_PAK_FILE}" "${_obj_file}" "${_header_file}" "${_manifest_file}" "${_bom_file}"
 		COMMAND "${JCE_PAK_EXECUTABLE}"
 			${_res_flags}
 			${_excl_flags}
+			${_shader_exclude_flags}
+			${_debug_path_flags}
 			--pak-file       "${EP_PAK_FILE}"
 			--obj-file       "${_obj_file}"
 			--header-file    "${_header_file}"
 			--manifest-file  "${_manifest_file}"
+			--json           "${_bom_file}"
 			--obj-format     "${_obj_format}"
 			--symbol-prefix  "${EP_SYMBOL_PREFIX}"
 			${_obj_arch_flags}
@@ -285,7 +462,7 @@ function(jce_target_embed_pak TARGET)
 	endif()
 
 	# Force the custom command to run as a dependency of the target.
-	add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_obj_file}")
+	add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_obj_file}" "${_bom_file}")
 	add_dependencies(${TARGET} ${TARGET}_pak)
 endfunction()
 
@@ -436,6 +613,7 @@ endfunction()
 #     [SYMBOL_PREFIX <symbol>]          # default: assets_pak_data    #
 #     [EXCLUDE_SEGMENTS <seg> [...]]                                  #
 #     [NO_ENGINE_RESOURCES]             # don't prepend SDK engine res#
+#     [STRIP_DEBUG_PATHS]                # omit virtual-path table      #
 #     [NO_COOK]                         # pack raw, skip cooking      #
 #     [COOK_LEVEL <0-22>]               # per-asset zstd (default 0)  #
 #     [MAX_TEXTURE_SIZE <N>]            # default 2048                #
@@ -460,7 +638,7 @@ function(jce_add_pak TARGET)
 		message(FATAL_ERROR "jce_add_pak: '${TARGET}' is not a target.")
 	endif()
 
-	set(_opts  NO_ENGINE_RESOURCES NO_COOK)
+	set(_opts  NO_ENGINE_RESOURCES NO_COOK STRIP_DEBUG_PATHS)
 	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE COOK_PLATFORM)
 	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_COOK_ARGS)
 	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
@@ -477,6 +655,16 @@ function(jce_add_pak TARGET)
 		message(FATAL_ERROR "jce_add_pak: RESOURCE_DIRS is required.")
 	endif()
 
+	# Authoring manifests are not runtime assets: produce the compact boot
+	# manifest in a separate resource root so both raw and cooked SDK builds
+	# pack it under its reserved virtual path without leaking SDK metadata.
+	_jce_prepare_runtime_boot_manifest(${TARGET}
+		"${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json"
+		_runtime_boot_dir _runtime_boot_file)
+	if(_runtime_boot_dir)
+		list(APPEND AP_RESOURCE_DIRS "${_runtime_boot_dir}")
+	endif()
+
 	# ---- 3. No cooker (or NO_COOK): pack raw, warn. ----------------- #
 	if(AP_NO_COOK OR NOT JCE_COOK_EXECUTABLE)
 		if(NOT AP_NO_COOK AND NOT JCE_COOK_EXECUTABLE)
@@ -485,7 +673,26 @@ function(jce_add_pak TARGET)
 				"assets (textures/audio will NOT be pre-decoded).  Install "
 				"the SDK with JCE_ENABLE_SDK_INSTALL=ON to ship jce_cook.")
 		endif()
-		jce_target_embed_pak(${TARGET} ${ARGN})
+		set(_raw_embed_args RESOURCE_DIRS ${AP_RESOURCE_DIRS})
+		if(AP_PAK_FILE)
+			list(APPEND _raw_embed_args PAK_FILE "${AP_PAK_FILE}")
+		endif()
+		if(AP_SYMBOL_PREFIX)
+			list(APPEND _raw_embed_args SYMBOL_PREFIX "${AP_SYMBOL_PREFIX}")
+		endif()
+		if(AP_EXCLUDE_SEGMENTS)
+			list(APPEND _raw_embed_args EXCLUDE_SEGMENTS ${AP_EXCLUDE_SEGMENTS})
+		endif()
+		if(AP_NO_ENGINE_RESOURCES)
+			list(APPEND _raw_embed_args NO_ENGINE_RESOURCES)
+		endif()
+		if(AP_STRIP_DEBUG_PATHS)
+			list(APPEND _raw_embed_args STRIP_DEBUG_PATHS)
+		endif()
+		if(_runtime_boot_file)
+			list(APPEND _raw_embed_args EXTRA_DEPENDS "${_runtime_boot_file}")
+		endif()
+		jce_target_embed_pak(${TARGET} ${_raw_embed_args})
 		return()
 	endif()
 
@@ -501,8 +708,8 @@ function(jce_add_pak TARGET)
 		set(_cook_platform_args --platform "${AP_COOK_PLATFORM}")
 	endif()
 
-	# Resolve resource dirs to absolute; prepend the SDK engine resource
-	# trees (RML HUDs, fallback font, …) unless opted out, so they are
+	# Resolve resource dirs to absolute; prepend optional SDK engine resources
+	# and the RML UI tree unless opted out, so they are
 	# cooked into the same tree (matches the in-tree pipeline).
 	set(_src_dirs "")
 	if(NOT AP_NO_ENGINE_RESOURCES)
@@ -559,6 +766,20 @@ function(jce_add_pak TARGET)
 		math(EXPR _cook_idx "${_cook_idx}+1")
 	endforeach()
 
+	# Settings S2: stage the authored render-pipeline asset into the cooked
+	# tree (PAK key settings/render_pipeline.rp.json) so shipped single-exe
+	# games get their authored quality settings — the runtime re-resolves it
+	# after bundle mount (jce_render_pipeline_apply_boot_mounted).
+	set(_rp_asset "${CMAKE_CURRENT_SOURCE_DIR}/Settings/RenderPipeline.rp.json")
+	if(EXISTS "${_rp_asset}")
+		list(APPEND _cook_cmds
+			COMMAND "${CMAKE_COMMAND}" -E make_directory
+				"${_cooked_dir}/settings"
+			COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+				"${_rp_asset}" "${_cooked_dir}/settings/render_pipeline.rp.json")
+		list(APPEND _cook_inputs "${_rp_asset}")
+	endif()
+
 	add_custom_command(
 		OUTPUT  "${_cook_stamp}"
 		${_cook_cmds}
@@ -584,6 +805,9 @@ function(jce_add_pak TARGET)
 	endif()
 	if(AP_EXCLUDE_SEGMENTS)
 		list(APPEND _embed_args EXCLUDE_SEGMENTS ${AP_EXCLUDE_SEGMENTS})
+	endif()
+	if(AP_STRIP_DEBUG_PATHS)
+		list(APPEND _embed_args STRIP_DEBUG_PATHS)
 	endif()
 	jce_target_embed_pak(${TARGET} ${_embed_args})
 

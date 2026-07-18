@@ -30,10 +30,18 @@ typedef struct {
     char renderer[16];         /* "OpenGL", "Vulkan" */
     char last_project[512];
     char last_scene_path[512];
-    char recent_projects[10][512];
+    char recent_projects[20][512];
     int  recent_count;
-    char recent_scene_paths[10][512];
+    char recent_scene_paths[20][512];
     int  recent_scene_count;
+
+    /* General preferences — merged in from the retired ~/.jce/prefs.json
+     * (fourth store).  autosave_interval: 0=off 1=1min 2=5min 3=15min.
+     * startup_mode: JCE_EDITOR_STARTUP_* (0=last 1=empty 2=picker).
+     * recent_max: cap on both recent lists, 1..20. */
+    int  autosave_interval;
+    int  startup_mode;
+    int  recent_max;
 
     /* Scene view render settings (persisted across sessions). */
     int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
@@ -144,11 +152,28 @@ typedef struct {
  * false only when NO source file exists (pure defaults). */
 bool jce_editor_config_load(JceEditorConfig *cfg);
 
-/* Save the per-user editor config, split by industry-standard category:
- * PREFERENCES -> ~/.jce/editor-preferences.json, SESSION/last-state ->
- * ~/.jce/editor-session.json.  The legacy editor-config.json is left
- * untouched (orphaned after the first split save). */
+/* Save the per-user editor config.  Writes are COALESCED: this updates the
+ * in-memory singleton and marks it dirty; the two category files
+ * (~/.jce/editor-preferences.json + editor-session.json) are flushed to
+ * disk atomically after ~0.5s of quiet (jce_editor_config_flush_tick) and
+ * on shutdown (jce_editor_config_flush_now).  After the first successful
+ * flush the retired stores (legacy editor-config.json, prefs.json) are
+ * renamed *.migrated so hand-edits can never be silently inert again. */
 bool jce_editor_config_save(const JceEditorConfig *cfg);
+
+/* Debounce pump — call once per editor frame.  Flushes the dirty singleton
+ * to disk after a quiet period so a burst of edits (slider drag, snap
+ * keystrokes) costs one write instead of one per change. */
+void jce_editor_config_flush_tick(float dt_sec);
+
+/* Force any pending changes to disk immediately (shutdown, pre-spawn). */
+void jce_editor_config_flush_now(void);
+
+/* Monotonic change counter, bumped by every save / KV set.  Long-lived
+ * struct mirrors (Preferences panel) compare it to detect EXTERNAL writes
+ * and re-sync — instead of either re-loading every frame (fights in-flight
+ * widget edits) or never (whole-struct saves then revert other writers). */
+uint64_t jce_editor_config_generation(void);
 
 /* Ensure the .jce config directory exists (idempotent). */
 void jce_editor_config_ensure_dir(void);
@@ -190,6 +215,17 @@ int  jce_editor_config_get_ui_int_or(const JceEditorConfig *cfg,
 bool jce_editor_config_set_ui_int(JceEditorConfig *cfg,
                                   const char *key,
                                   int value);
+
+/* Generic UI float / string state — module-level (they live on the config
+ * singleton, not in JceEditorConfig struct copies) and dynamically grown,
+ * persisted to editor-session.json beside ui_state_int.  Use for panel
+ * chrome that is not an integer: last-browse folders, tool radii, etc.
+ * Setters mark the singleton dirty (same debounced flush as the struct). */
+bool  jce_editor_config_get_ui_float(const char *key, float *out_value);
+float jce_editor_config_get_ui_float_or(const char *key, float fallback);
+void  jce_editor_config_set_ui_float(const char *key, float value);
+bool  jce_editor_config_get_ui_str(const char *key, char *out, size_t cap);
+void  jce_editor_config_set_ui_str(const char *key, const char *value);
 
 /* Cached input preference flags — kept in sync by load/save.
    Read directly by scene/particle viewport input handlers (avoids

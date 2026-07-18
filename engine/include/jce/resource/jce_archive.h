@@ -3,9 +3,9 @@
  * Runtime C API for reading the JCE Archive format (JPAK, format_version 1)
  * — the richer parallel archive format (dictionaries, alignment, mmap, …
  * reserved for later phases).  Phase 1 implements: explicit-offset binary
- * I/O, path normalization + XXH3-64 hashing, a hash-sorted index with
- * binary-search lookup, plain zstd decompression (and stored entries), and
- * layered integrity verification.
+ * I/O, normalized-path lookup, a hash-sorted index, zstd decompression, and
+ * layered integrity verification.  Secure archives replace public path
+ * hashes with keyed anonymous ids and authenticate the complete archive.
  *
  * This format coexists with the legacy PAK v2 loader (<jce/resource/
  * jce_pak_loader.h>) and the bundle system; pick the API matching the file
@@ -51,13 +51,20 @@ enum {
 /* Per-entry flag bits stored in JceArchiveEntry.entry_flags (spec §4.7). */
 enum {
     JCE_ARCHIVE_ENTRY_PAGE_ALIGNED = 1u << 0, /* 4096-aligned; mmap eligible  */
-    JCE_ARCHIVE_ENTRY_ENCRYPTED    = 1u << 1  /* this entry is encrypted      */
+    JCE_ARCHIVE_ENTRY_ENCRYPTED    = 1u << 1, /* this entry is encrypted      */
+    JCE_ARCHIVE_ENTRY_AUTHENTICATED = 1u << 2 /* covered by archive HMAC      */
 };
+
+typedef enum JceArchiveAuthStatus {
+    JCE_ARCHIVE_AUTH_INVALID     = -1,
+    JCE_ARCHIVE_AUTH_UNAVAILABLE = 0,
+    JCE_ARCHIVE_AUTH_VALID       = 1
+} JceArchiveAuthStatus;
 
 /* Public view of one index entry.  The pointer returned by find/get stays
  * valid until jce_archive_close().  Mirrors the on-disk record (spec §4.5). */
 typedef struct JceArchiveEntry {
-    uint64_t path_hash;     /* XXH3-64 of the normalized virtual path     */
+    uint64_t path_hash;     /* public path hash, or keyed secure index id */
     uint64_t data_offset;   /* byte offset of the resource within the file*/
     uint32_t stored_size;   /* bytes on disk (compressed, or original)    */
     uint32_t original_size; /* bytes after decompression (caller receives)*/
@@ -80,6 +87,10 @@ JCE_API size_t jce_archive_normalize_path(const char *in, char *out, size_t out_
 
 /* Hash the UTF-8 bytes of an already-normalized virtual path. */
 JCE_API uint64_t jce_archive_hash_normalized(const char *norm, size_t len);
+
+/* Stable XXH3-64 identity of payload bytes.  Bundle manifests, graph
+ * snapshots, and Dist audits use this exact function for `content_id`. */
+JCE_API uint64_t jce_archive_content_hash(const void *data, size_t size);
 
 /* Normalize `path` then hash it (the lookup key).  Returns 0 on error. */
 JCE_API uint64_t jce_archive_hash_path(const char *path);
@@ -116,23 +127,36 @@ JCE_API const JceArchiveEntry *jce_archive_get(const JceArchive *ar, uint32_t in
  * Returns the entry or NULL when absent (absence is not an error). */
 JCE_API const JceArchiveEntry *jce_archive_find(const JceArchive *ar, const char *path);
 
+/* Return the archive-specific index id for `path`.  Plain archives return the
+ * public XXH3 path hash.  Secure archives return a keyed id only after their
+ * HMAC has been validated; 0 means invalid path, missing key, or failed auth. */
+JCE_API uint64_t jce_archive_path_id(const JceArchive *ar, const char *path);
+
 /* ── Read ────────────────────────────────────────────────────────────── */
 
 /* Read and decompress `entry` into `buf` (capacity buf_size >= original_size).
  * Returns the number of bytes produced (== original_size) on success, 0 on
  * error.  Supports JARC_COMP_NONE, JARC_COMP_ZSTD, and JARC_COMP_ZSTD_DICT
- * (dictionary resolved from the archive's dictionary table); encrypted entries
- * are rejected (return 0). */
+ * (dictionary resolved from the archive's dictionary table).  Encrypted
+ * entries are authenticated, decrypted, then decompressed when a valid key
+ * has been installed. */
 JCE_API size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
                                 void *buf, size_t buf_size);
 
 /* ── Optional decryption (spec §9.2) ─────────────────────────────────── */
 
-/* Provide the 32-byte ChaCha20 key needed to read encrypted entries.  The key
- * is copied.  Reads of entries flagged ENCRYPTED fail until a key is set;
- * unencrypted entries are unaffected.  Client-side encryption only deters
- * casual extraction since the key necessarily ships with the game. */
+/* Provide the 32-byte master key needed to validate and read secure entries.
+ * Domain-separated path, encryption, nonce, and authentication subkeys are
+ * derived internally.  The key is copied; authenticated lookup/read remains
+ * disabled until validation succeeds.  Client-side protection raises
+ * extraction cost but cannot create secrecy because the key ships in-game. */
 JCE_API void jce_archive_set_decryption_key(JceArchive *ar, const uint8_t key[32]);
+
+/* Security metadata.  Authenticated archives fail reads and keyed lookup
+ * unless auth_status is VALID. */
+JCE_API int jce_archive_is_secure(const JceArchive *ar);
+JCE_API int jce_archive_is_authenticated(const JceArchive *ar);
+JCE_API JceArchiveAuthStatus jce_archive_auth_status(const JceArchive *ar);
 
 /* Install a process-wide decryption key that is auto-applied to every archive
  * opened afterwards whose header carries the ENCRYPTED flag — so the engine

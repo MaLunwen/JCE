@@ -11,6 +11,7 @@
 #include "jce_asset_cooker.h"
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/resource/jce_image_decode.h>  /* gray16-PNG bypass (see below) */
 
 #include "jce_cook_policy.h"
 #include "jce_tex_compress.h"
@@ -226,23 +227,62 @@ static JceCookResult build_asset(uint32_t asset_type,
 /* Cook: Texture (with optional mipmaps)                               */
 /* ================================================================== */
 
+/* 16-bit GRAYSCALE PNG (IHDR bitdepth=16, colortype=0): the bundled
+ * SDL3_image/libpng path heap-overruns on this class (STATUS_HEAP_CORRUPTION
+ * in jce_cook — found cooking a DCC-exported height map).  Detect it from
+ * the raw header and decode via the engine's stb_image path instead, which
+ * down-converts 16->8 with correct 2-byte stride. */
+static bool cook_is_gray16_png(const void *data, size_t size)
+{
+    const uint8_t *b = (const uint8_t *)data;
+    static const uint8_t sig[8] = { 0x89,'P','N','G','\r','\n',0x1A,'\n' };
+    return size >= 26 &&
+           memcmp(b, sig, 8) == 0 &&
+           memcmp(b + 12, "IHDR", 4) == 0 &&
+           b[24] == 16 /* bit depth */ &&
+           b[25] == 0  /* colortype gray */;
+}
+
 JceCookResult jce_cook_texture(const void *input, size_t input_size,
                                const JceCookOptions *opts)
 {
     JceCookResult result = {0};
+    SDL_Surface *surf = NULL;
 
-    /* Decode image via SDL3_image. */
-    SDL_IOStream *io = SDL_IOFromConstMem(input, input_size);
-    if (!io) {
-        snprintf(result.error, sizeof(result.error), "SDL_IOFromConstMem failed");
-        return result;
-    }
+    if (cook_is_gray16_png(input, input_size)) {
+        JceImage img;
+        if (!jce_image_decode(input, input_size, &img) || !img.pixels) {
+            snprintf(result.error, sizeof(result.error),
+                     "16-bit gray PNG decode failed");
+            return result;
+        }
+        surf = SDL_CreateSurface((int)img.width, (int)img.height,
+                                 SDL_PIXELFORMAT_RGBA32);
+        if (!surf) {
+            jce_image_free(&img);
+            snprintf(result.error, sizeof(result.error),
+                     "SDL_CreateSurface failed");
+            return result;
+        }
+        for (uint32_t y = 0; y < img.height; y++)
+            memcpy((uint8_t *)surf->pixels + (size_t)y * surf->pitch,
+                   img.pixels + (size_t)y * img.width * 4u,
+                   (size_t)img.width * 4u);
+        jce_image_free(&img);
+    } else {
+        /* Decode image via SDL3_image. */
+        SDL_IOStream *io = SDL_IOFromConstMem(input, input_size);
+        if (!io) {
+            snprintf(result.error, sizeof(result.error), "SDL_IOFromConstMem failed");
+            return result;
+        }
 
-    SDL_Surface *surf = IMG_Load_IO(io, true);
-    if (!surf) {
-        snprintf(result.error, sizeof(result.error), "IMG_Load_IO failed: %s",
-                 SDL_GetError());
-        return result;
+        surf = IMG_Load_IO(io, true);
+        if (!surf) {
+            snprintf(result.error, sizeof(result.error), "IMG_Load_IO failed: %s",
+                     SDL_GetError());
+            return result;
+        }
     }
 
     /* Ensure RGBA8. */

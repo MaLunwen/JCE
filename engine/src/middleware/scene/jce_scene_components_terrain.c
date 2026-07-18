@@ -35,6 +35,7 @@ void parse_vegetation_scatter(JceScene *s, JceEntity e, const cJSON *c)
     JceVegetationScatterComponent vs;
     memset(&vs, 0, sizeof(vs));
     copy_str(vs.mesh_path,   sizeof(vs.mesh_path),   j_str(c, "meshPath", ""));
+    vs.mesh_shape    = (int)j_num(c, "meshShape", 0); /* primitive when meshPath empty */
     copy_str(vs.albedo_path, sizeof(vs.albedo_path), j_str(c, "albedoPath", ""));
     copy_str(vs.density_mask_path, sizeof(vs.density_mask_path),
              j_str(c, "densityMaskPath", ""));
@@ -96,7 +97,70 @@ void parse_grass_field(JceScene *s, JceEntity e, const cJSON *c)
     g.hue_jitter    = (float)j_num(c, "hueJitter", 0.2);
     g.cast_shadow   = j_bool(c, "castShadow", false);
     g.visible       = j_bool(c, "visible", true);
+    copy_str(g.density_mask_path, sizeof(g.density_mask_path),
+             j_str(c, "densityMaskPath", ""));
+    g.density_threshold = (float)j_num(c, "densityThreshold", 0.0);
+    g.mask_world_size   = (float)j_num(c, "maskWorldSize", 33.0);
     jce_scene_set_grass_field(s, e, &g);
+}
+
+void parse_foliage_cluster(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceFoliageClusterComponent fc; memset(&fc, 0, sizeof fc);
+    fc.leaf_count = (int)j_num(c, "leafCount", 45.0);
+    fc.radius     = (float)j_num(c, "radius", 1.2);
+    fc.squash_y   = (float)j_num(c, "squashY", 0.8);
+    fc.leaf_scale = (float)j_num(c, "leafScale", 1.0);
+    fc.seed       = (uint32_t)j_num(c, "seed", 12345.0);
+    fc.shadow_color[0] = (float)j_num(c, "shadowR", 0.003);
+    fc.shadow_color[1] = (float)j_num(c, "shadowG", 0.074);
+    fc.shadow_color[2] = (float)j_num(c, "shadowB", 0.003);
+    fc.mid_color[0] = (float)j_num(c, "midR", 0.06);
+    fc.mid_color[1] = (float)j_num(c, "midG", 0.23);
+    fc.mid_color[2] = (float)j_num(c, "midB", 0.0);
+    fc.highlight_color[0] = (float)j_num(c, "highR", 0.44);
+    fc.highlight_color[1] = (float)j_num(c, "highG", 0.5);
+    fc.highlight_color[2] = (float)j_num(c, "highB", 0.0);
+    fc.color_multiplier[0] = (float)j_num(c, "multR", 0.46);
+    fc.color_multiplier[1] = (float)j_num(c, "multG", 0.65);
+    fc.color_multiplier[2] = (float)j_num(c, "multB", 0.3);
+    copy_str(fc.alpha_tex, sizeof fc.alpha_tex, j_str(c, "alphaTex", ""));
+    fc.visible = j_bool(c, "visible", true);
+    jce_scene_set_foliage_cluster(s, e, &fc);
+}
+
+static void ser_foliage_cluster(const JceFoliageClusterComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return;
+    cJSON_AddStringToObject(o, "type", "FoliageCluster");
+    cJSON_AddNumberToObject(o, "leafCount", c->leaf_count);
+    cJSON_AddNumberToObject(o, "radius", c->radius);
+    cJSON_AddNumberToObject(o, "squashY", c->squash_y);
+    cJSON_AddNumberToObject(o, "leafScale", c->leaf_scale);
+    cJSON_AddNumberToObject(o, "seed", (double)c->seed);
+    cJSON_AddNumberToObject(o, "shadowR", c->shadow_color[0]);
+    cJSON_AddNumberToObject(o, "shadowG", c->shadow_color[1]);
+    cJSON_AddNumberToObject(o, "shadowB", c->shadow_color[2]);
+    cJSON_AddNumberToObject(o, "midR", c->mid_color[0]);
+    cJSON_AddNumberToObject(o, "midG", c->mid_color[1]);
+    cJSON_AddNumberToObject(o, "midB", c->mid_color[2]);
+    cJSON_AddNumberToObject(o, "highR", c->highlight_color[0]);
+    cJSON_AddNumberToObject(o, "highG", c->highlight_color[1]);
+    cJSON_AddNumberToObject(o, "highB", c->highlight_color[2]);
+    cJSON_AddNumberToObject(o, "multR", c->color_multiplier[0]);
+    cJSON_AddNumberToObject(o, "multG", c->color_multiplier[1]);
+    cJSON_AddNumberToObject(o, "multB", c->color_multiplier[2]);
+    if (c->alpha_tex[0])
+        cJSON_AddStringToObject(o, "alphaTex", c->alpha_tex);
+    cJSON_AddBoolToObject(o, "visible", c->visible);
+    cJSON_AddItemToArray(arr, o);
+}
+
+void serw_foliage_cluster(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceFoliageClusterComponent *c = jce_scene_get_foliage_cluster(s, e);
+    if (c) ser_foliage_cluster(c, arr);
 }
 
 void parse_water(JceScene *s, JceEntity e, const cJSON *c)
@@ -132,13 +196,21 @@ void parse_water(JceScene *s, JceEntity e, const cJSON *c)
     w.color_deep[2]    = (float)j_num(c, "deepB", 0.2);
     w.transparency     = (float)j_num(c, "transparency", 0.5);
     w.sun_specular     = (float)j_num(c, "sunSpecular", 1.0);
+    /* Stylized extras default to 0 (off) so pre-existing scenes render and
+     * round-trip byte-identically. */
+    w.shore_ripple     = (float)j_num(c, "shoreRipple", 0.0);
+    w.ice_ratio        = (float)j_num(c, "iceRatio", 0.0);
+    w.splash_ratio     = (float)j_num(c, "splashRatio", 0.0);
+    copy_str(w.data_tex, sizeof(w.data_tex), j_str(c, "dataTex", ""));
     w.visible          = j_bool(c, "visible", true);
 
     /* ── FFT ocean (additive) ───────────────────────────────────────────
      * Absent keys default to GERSTNER + sane FFT params, so scenes authored
      * before this feature round-trip byte-identically. */
     w.water_mode = (int)j_num(c, "waterMode", (double)JCE_WATER_MODE_GERSTNER);
-    if (w.water_mode != JCE_WATER_MODE_FFT) w.water_mode = JCE_WATER_MODE_GERSTNER;
+    if (w.water_mode != JCE_WATER_MODE_FFT &&
+        w.water_mode != JCE_WATER_MODE_STYLIZED)
+        w.water_mode = JCE_WATER_MODE_GERSTNER;
     w.fft_patch_size = (float)j_num(c, "fftPatchSize", 100.0);
     w.fft_wind_speed = (float)j_num(c, "fftWindSpeed", 8.0);
     w.fft_wind_dir_x = (float)j_num(c, "fftWindDirX", 1.0);
@@ -225,6 +297,7 @@ static void ser_vegetation_scatter(const JceVegetationScatterComponent *c, cJSON
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "VegetationScatter");
     cJSON_AddStringToObject(o, "meshPath", c->mesh_path);
+    cJSON_AddNumberToObject(o, "meshShape", c->mesh_shape);
     cJSON_AddStringToObject(o, "albedoPath", c->albedo_path);
     cJSON_AddStringToObject(o, "densityMaskPath", c->density_mask_path);
     cJSON_AddNumberToObject(o, "density", c->density);
@@ -280,6 +353,9 @@ static void ser_grass_field(const JceGrassFieldComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "hueJitter", c->hue_jitter);
     cJSON_AddBoolToObject  (o, "castShadow", c->cast_shadow);
     cJSON_AddBoolToObject  (o, "visible", c->visible);
+    cJSON_AddStringToObject(o, "densityMaskPath", c->density_mask_path);
+    cJSON_AddNumberToObject(o, "densityThreshold", c->density_threshold);
+    cJSON_AddNumberToObject(o, "maskWorldSize", c->mask_world_size);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -314,6 +390,11 @@ static void ser_water(const JceWaterComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "deepB", c->color_deep[2]);
     cJSON_AddNumberToObject(o, "transparency", c->transparency);
     cJSON_AddNumberToObject(o, "sunSpecular", c->sun_specular);
+    cJSON_AddNumberToObject(o, "shoreRipple", c->shore_ripple);
+    cJSON_AddNumberToObject(o, "iceRatio", c->ice_ratio);
+    cJSON_AddNumberToObject(o, "splashRatio", c->splash_ratio);
+    if (c->data_tex[0])
+        cJSON_AddStringToObject(o, "dataTex", c->data_tex);
     cJSON_AddBoolToObject  (o, "visible", c->visible);
     /* FFT ocean (additive) — see parse_water for the matching keys. */
     cJSON_AddNumberToObject(o, "waterMode", c->water_mode);

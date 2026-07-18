@@ -42,9 +42,10 @@ typedef struct {
 
 /* ── Editor ────────────────────────────────────────────────────────── */
 /* Auto-save is intentionally absent here: it is a per-user editor
- * preference (Preferences > General, prefs.json) that never travels with
- * the project, matching Unity/Unreal where auto-save lives in editor
- * preferences rather than project settings. */
+ * preference (Preferences > General, JceEditorConfig.autosave_interval in
+ * ~/.jce/editor-preferences.json) that never travels with the project,
+ * matching Unity/Unreal where auto-save lives in editor preferences
+ * rather than project settings. */
 typedef struct {
     int   default_behavior_mode;  /* 0 = 3D, 1 = 2D */
     int   version_control_mode;   /* 0 = Hidden Meta, 1 = Visible Meta */
@@ -201,10 +202,10 @@ typedef struct {
 
 /* ── Packaging ─────────────────────────────────────────────────────── */
 typedef struct {
-    /* Encrypt the embedded asset PAK (and suppress loose plaintext
-     * staging) for project builds.  Deters casual extraction only: the
-     * key ships inside the game binary and there is no MAC.  The key
-     * itself lives in <project>/.jce/pak_key.hex (git-ignored). */
+    /* Use the authenticated secure-PAK profile for non-dist project builds.
+     * Dist always enables it.  The key ships inside the client, so this
+     * raises extraction cost rather than creating secrecy.  The project key
+     * lives in <project>/.jce/pak_key.hex (git-ignored). */
     bool  encrypt_assets;
     /* Also encrypt debug-variant builds (default off so debug builds
      * keep the loose, inspectable asset tree). */
@@ -231,6 +232,9 @@ typedef struct {
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
 void jce_project_settings_defaults(JceProjectSettings *s);
+/* Select the project-scoped persistence root. NULL/empty restores the
+ * no-project fallback; call before loading settings after a project switch. */
+void jce_project_settings_set_root(const char *project_root);
 bool jce_project_settings_load    (JceProjectSettings *out);
 bool jce_project_settings_save    (const JceProjectSettings *s);
 

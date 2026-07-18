@@ -188,9 +188,20 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
      * its global, so pre-multiplying root_transform here fixes both. Without it,
      * skin matrices collapse to root_transform^-1 at bind pose and the character
      * renders rotated onto its face. */
+    /* Render callers evaluate <=JCE_MAX_BONES(128) joints and this runs per
+     * instance per frame inside the parallel sample workers — a per-call
+     * heap alloc/free pair here was up to 2x256 mallocs/frame in a crowd.
+     * Stack for the common case (8KB), heap only for oversized tool paths. */
+    jce_mat4 stack_adjusted[128];
     jce_mat4 *adjusted = NULL;
+    bool adjusted_on_heap = false;
     if (skel->has_root_transform) {
-        adjusted = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
+        if (count <= 128) {
+            adjusted = stack_adjusted;
+        } else {
+            adjusted = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
+            adjusted_on_heap = (adjusted != NULL);
+        }
         if (adjusted) {
             for (uint32_t i = 0; i < count; i++) {
                 if (skel->joints[i].parent < 0)
@@ -213,15 +224,19 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
         for (uint32_t i = 0; i < count; i++)
             out_matrices[i] = jce_m4_multiply(&out_matrices[i],
                                               &skel->joints[i].inverse_bind_matrix);
-        if (adjusted) JCE_FREE(adjusted);
+        if (adjusted_on_heap) JCE_FREE(adjusted);
         return;
     }
 
     /* Fallback: software path (no ozz). */
-    jce_mat4 *globals = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
+    jce_mat4 stack_globals[128];
+    jce_mat4 *globals = (count <= 128)
+        ? stack_globals
+        : (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
+    const bool globals_on_heap = (count > 128) && (globals != NULL);
     if (!globals) {
         LOG_ERROR(LOG_TAG, "failed to allocate globals buffer for %u joints", count);
-        if (adjusted) JCE_FREE(adjusted);
+        if (adjusted_on_heap) JCE_FREE(adjusted);
         return;
     }
 
@@ -236,8 +251,8 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
     for (uint32_t i = 0; i < count; i++)
         out_matrices[i] = jce_m4_multiply(&globals[i], &skel->joints[i].inverse_bind_matrix);
 
-    JCE_FREE(globals);
-    if (adjusted) JCE_FREE(adjusted);
+    if (globals_on_heap) JCE_FREE(globals);
+    if (adjusted_on_heap) JCE_FREE(adjusted);
 }
 
 jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx)

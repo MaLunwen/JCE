@@ -61,11 +61,16 @@ void main()
     float px, py, pz;
     float nx, nz, ny;
 
-    if (u_water_mode.x > 0.5)
+    // FFT ONLY at mode 1 — mode 2 (STYLIZED overlay) is a flat plane and
+    // must fall through to the Gerstner branch with wave_count 0.
+    if (u_water_mode.x > 0.5 && u_water_mode.x < 1.5)
     {
         // ── FFT ocean: sample the tiling displacement texture. ──────────
-        float patch = u_water_mode.y;
-        float invPatch = (patch > 0.0) ? (1.0 / patch) : 0.0;
+        // NB: `patch` is a RESERVED word in GLSL ES 3.0 (essl/WebGL2
+        // tessellation keyword) — using it as an identifier compiles on
+        // dx11/glsl/spv but hard-errors under 300_es.  Name it patchSize.
+        float patchSize = u_water_mode.y;
+        float invPatch = (patchSize > 0.0) ? (1.0 / patchSize) : 0.0;
 
         // Wrap world XZ into the patch -> [0,1] UV (fract handles the tiling).
         vec2 uv = fract(vec2(x, z) * invPatch);

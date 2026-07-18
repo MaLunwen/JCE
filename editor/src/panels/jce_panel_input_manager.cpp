@@ -3,10 +3,11 @@
  *
  * Project-wide editor surface for authoring action bindings consumed by
  * jce_input_actions (engine layer). Actions are PROJECT-scoped: stored in
- * the project-relative .jce/input_actions.json so they travel with the
- * project (version control) and the shipped game loads them at start.
- * Older builds wrote a per-user ~/.jce copy; it is migrated forward on
- * first run when the project has no copy yet.
+ * the open project's <root>/.jce/input_actions.json so they travel with
+ * the project (version control) and the shipped game loads them at start.
+ * Older builds wrote a per-user ~/.jce copy (and, before the explicit-root
+ * fix, a CWD-relative one); both are migrated forward on first run when
+ * the project has no copy yet.
  *
  * Each action has a unique name and 0..JCE_ACTION_MAX_BINDS bindings.
  * A binding is (type, code, scale, deadzone) — the same struct the
@@ -42,15 +43,39 @@ extern "C" {
 
 #include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (legacy ~/.jce) */
 
+/* Open-project root — owned by dialog_project.cpp (same explicit-root
+ * pattern as jce_project_settings / jce_pak_key).  Declared at global
+ * scope: inside an anonymous namespace the extern would acquire internal
+ * linkage and never bind to the definition. */
+extern char s_current_project_root[512];
+
 /* Action bindings are PROJECT-scoped: they travel with the project and the
- * shipped game reads them, so they persist to the project-relative
- * `.jce/input_actions.json` — the same convention as
- * jce_project_settings.cpp, and the location the engine's
- * jce_select_input_actions_path() prefers (CWD-relative copy first). The
- * editor runs with its CWD at the project root, so this resolves into the
- * open project's `.jce` directory. */
-#define INPUT_PATH ".jce/input_actions.json"
-#define INPUT_DIR  ".jce"
+ * shipped game reads them, so they persist under the OPEN project's root
+ * (<root>/.jce/input_actions.json), resolved through the explicit root —
+ * the editor never chdirs, so a bare CWD-relative path only hit the project
+ * by luck and wrote into the LAUNCH dir after a project switch.  When no
+ * project is open we keep the CWD-relative location (the engine's
+ * jce_select_input_actions_path() reads that first) so behaviour there is
+ * unchanged. */
+static const char *input_dir(void) {
+    static char d[1024];
+    if (s_current_project_root[0])
+        std::snprintf(d, sizeof(d), "%s/.jce", s_current_project_root);
+    else
+        std::snprintf(d, sizeof(d), ".jce");
+    return d;
+}
+static const char *input_path(void) {
+    static char p[1024];
+    if (s_current_project_root[0])
+        std::snprintf(p, sizeof(p), "%s/.jce/input_actions.json",
+                      s_current_project_root);
+    else
+        std::snprintf(p, sizeof(p), ".jce/input_actions.json");
+    return p;
+}
+#define INPUT_PATH input_path()
+#define INPUT_DIR  input_dir()
 
 /* Legacy per-user location (~/.jce/input_actions.json) — read once by
  * migrate_legacy_actions() to carry older authored bindings forward. */
@@ -225,16 +250,26 @@ static void input_save(void)
     jce_actions_destroy(a);
 }
 
-/* One-time forward-migration: older editors authored the per-user
- * ~/.jce/input_actions.json.  If the open project has no copy yet but a
- * legacy one exists, load it and write it into the project so the
- * bindings travel with the project (and the runtime finds them). */
+/* One-time forward-migration into <root>/.jce/input_actions.json.  Two
+ * legacy sources, newest store generation first:
+ *   1. CWD-relative .jce/ — the pre-explicit-root path; after a project
+ *      switch it pointed at the LAUNCH dir, so bindings authored then live
+ *      there.  (With no project open INPUT_PATH IS the CWD copy, so the
+ *      early return below makes this self-copy-safe.)
+ *   2. per-user ~/.jce/ — the original store. */
 static void migrate_legacy_actions(void)
 {
     if (jce_fs_host_exists_file(INPUT_PATH)) return;        /* project copy wins */
-    const char *legacy = legacy_input_path();
-    if (!legacy[0] || !jce_fs_host_exists_file(legacy)) return;
-    JceInputActions *a = jce_actions_load_file(legacy);
+    const char *src = nullptr;
+    if (s_current_project_root[0] &&
+        jce_fs_host_exists_file(".jce/input_actions.json"))
+        src = ".jce/input_actions.json";
+    if (!src) {
+        const char *legacy = legacy_input_path();
+        if (legacy[0] && jce_fs_host_exists_file(legacy)) src = legacy;
+    }
+    if (!src) return;
+    JceInputActions *a = jce_actions_load_file(src);
     if (!a) return;
     jce_fs_host_create_directory(INPUT_DIR);
     jce_actions_save_file(a, INPUT_PATH);
@@ -261,10 +296,22 @@ static bool input_load(void)
     return true;
 }
 
+/* Project root the current action table was loaded for. */
+static char s_actions_root[512] = {0};
+
 static void ensure_init(void)
 {
+    /* Follow the open project (the store is project-scoped): a project
+     * switch reloads from the new root instead of saving the previous
+     * project's table into it. */
+    if (s_initialized &&
+        strcmp(s_actions_root, s_current_project_root) != 0)
+        s_initialized = false;
     if (s_initialized) return;
     s_initialized = true;
+    std::snprintf(s_actions_root, sizeof(s_actions_root), "%s",
+                  s_current_project_root);
+    s_selected = -1;
     migrate_legacy_actions();
     if (!input_load() || s_actions.empty()) {
         seed_default_actions();

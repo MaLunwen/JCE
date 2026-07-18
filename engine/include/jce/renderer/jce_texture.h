@@ -125,6 +125,9 @@ bool       jce_texture_update_rgba(JceTexture tex, const void *data,
 bool       jce_texture_update_rgba_ref(JceTexture tex, const void *data,
                                        uint32_t width, uint32_t height);
 JCE_API void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h);
+/* Source mip count (>=1) of a registry-loaded texture; 1 if not tracked. Used by
+ * the texture-array batcher to build the albedo array with a matching mip chain. */
+JCE_API uint32_t   jce_texture_get_mips(JceTexture tex);
 
 /* Destroy a texture. */
 JCE_API void       jce_texture_destroy(JceTexture tex);

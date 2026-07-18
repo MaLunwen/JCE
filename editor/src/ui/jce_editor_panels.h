@@ -140,6 +140,10 @@ void  jce_panel_animation_editor_request_tab(int idx);
  * inspector's "Open in Sequencer" so selecting an entity binds the panel to its
  * SequencePlayer's sequence. */
 void  jce_panel_sequencer_load_path(const char *path);
+/* Open a .anim_sm.json in the State Machine tab / a .particles.json in the
+ * particle editor tab — the inspector path fields' double-click preview. */
+void  jce_panel_animator_sm_open_path(const char *path);
+void  jce_panel_particle_editor_open_path(const char *path);
 /* 0=Editor 1=StateMachine 2=Curves 3=Sequencer 4=Timeline 5=Rigging */
 int   jce_panel_animation_editor_current_tab(void);
 void  jce_editor_panel_animator_sm(void);

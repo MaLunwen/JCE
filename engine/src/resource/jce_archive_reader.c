@@ -34,7 +34,7 @@ typedef struct {
 
 struct JceArchive {
     const uint8_t   *blob;
-    size_t           blob_size;
+    size_t           blob_size; /* authenticated bytes, excludes final tag */
     int              owns_blob;
     JceMmap         *map;       /* set when opened via jce_archive_open_file */
 
@@ -55,6 +55,9 @@ struct JceArchive {
 
     ZSTD_DCtx       *dctx;
     uint8_t          dec_key[JCE_ARCHIVE_KEY_BYTES];
+    JceArchiveSecureKeys secure_keys;
+    const uint8_t   *auth_tag;
+    JceArchiveAuthStatus auth_status;
     int              has_key;    /* 1 once a decryption key has been set */
 };
 
@@ -72,7 +75,7 @@ static int     g_verify_on_open = 0;
 
 void jce_archive_set_process_key(const uint8_t key[32]) {
     if (!key) {
-        memset(g_process_key, 0, sizeof(g_process_key));
+        jce_archive_crypto_zero(g_process_key, sizeof(g_process_key));
         g_has_process_key = 0;
         return;
     }
@@ -82,6 +85,27 @@ void jce_archive_set_process_key(const uint8_t key[32]) {
 
 void jce_archive_set_verify_on_open(int enable) {
     g_verify_on_open = enable ? 1 : 0;
+}
+
+static int archive_apply_key(JceArchive *ar, const uint8_t key[32]) {
+    if (!ar || !key) return 0;
+    ar->has_key = 1;
+    if (ar->flags & JARC_FLAG_AUTHENTICATED) {
+        uint8_t tag[JCE_ARCHIVE_AUTH_BYTES];
+        jce_archive_secure_keys_derive(key, ar->nonce_salt,
+                                       &ar->secure_keys);
+        jce_archive_hmac_sha256(ar->secure_keys.auth,
+                                sizeof(ar->secure_keys.auth),
+                                ar->blob, ar->blob_size, tag);
+        ar->auth_status = jce_archive_crypto_equal(
+            tag, ar->auth_tag, JCE_ARCHIVE_AUTH_BYTES)
+            ? JCE_ARCHIVE_AUTH_VALID : JCE_ARCHIVE_AUTH_INVALID;
+        jce_archive_crypto_zero(tag, sizeof(tag));
+        return ar->auth_status == JCE_ARCHIVE_AUTH_VALID;
+    }
+    memcpy(ar->dec_key, key, JCE_ARCHIVE_KEY_BYTES);
+    ar->auth_status = JCE_ARCHIVE_AUTH_UNAVAILABLE;
+    return 1;
 }
 
 /* Parse the dictionary table (immediately after the header) into a resident
@@ -176,6 +200,8 @@ fail:
 }
 
 static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
+    const uint8_t *index_raw = NULL;
+    uint8_t       *index_tmp = NULL;
     if (!blob || size < JARC_HEADER_SIZE) return NULL;
 
     if (blob[JARC_OFF_MAGIC + 0] != JARC_MAGIC_0 ||
@@ -194,20 +220,37 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
     uint64_t index_orig_size    = jarc_rd64(blob + JARC_OFF_INDEX_ORIGINAL_SIZE);
     uint32_t flags              = jarc_rd32(blob + JARC_OFF_FLAGS);
     uint16_t dict_count         = jarc_rd16(blob + JARC_OFF_DICT_COUNT);
+    size_t logical_size         = size;
+
+    if (flags & JARC_FLAG_AUTHENTICATED) {
+        const uint32_t required = JARC_FLAG_ENCRYPTED |
+                                  JARC_FLAG_SECURE_INDEX;
+        if ((flags & required) != required ||
+            (flags & JARC_FLAG_HAS_DEBUG_PATHS) ||
+            size < JARC_HEADER_SIZE + JARC_AUTH_TAG_SIZE) {
+            LOG_WARN(JARC_TAG, "reject: invalid secure archive flags");
+            return NULL;
+        }
+        logical_size -= JARC_AUTH_TAG_SIZE;
+    } else if (flags & JARC_FLAG_SECURE_INDEX) {
+        LOG_WARN(JARC_TAG, "reject: unauthenticated keyed index");
+        return NULL;
+    }
 
     /* Region bounds. */
     uint64_t dict_table_end = (uint64_t)JARC_HEADER_SIZE +
                               (uint64_t)dict_count * JARC_DICT_ENTRY_SIZE;
-    if (dict_table_end > size) return NULL;
-    if (index_offset < dict_table_end || index_offset > size) return NULL;
-    if (!jce_region_in_bounds(index_offset, index_stored_size, size)) return NULL;
+    if (dict_table_end > logical_size) return NULL;
+    if (index_offset < dict_table_end || index_offset > logical_size) return NULL;
+    if (!jce_region_in_bounds(index_offset, index_stored_size,
+                              logical_size)) return NULL;
     if (index_orig_size != (uint64_t)entry_count * JARC_INDEX_ENTRY_SIZE) return NULL;
 
     JceArchive *ar = (JceArchive *)jce_malloc(sizeof(JceArchive));
     if (!ar) return NULL;
     memset(ar, 0, sizeof(*ar));
     ar->blob               = blob;
-    ar->blob_size          = size;
+    ar->blob_size          = logical_size;
     ar->owns_blob          = owns;
     ar->flags              = flags;
     ar->dict_count         = dict_count;
@@ -216,6 +259,9 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
     ar->data_content_hash  = jarc_rd64(blob + JARC_OFF_DATA_CONTENT_HASH);
     ar->index_content_hash = jarc_rd64(blob + JARC_OFF_INDEX_CONTENT_HASH);
     ar->entry_count        = entry_count;
+    ar->auth_status        = JCE_ARCHIVE_AUTH_UNAVAILABLE;
+    if (flags & JARC_FLAG_AUTHENTICATED)
+        ar->auth_tag = blob + logical_size;
     /* nonce_salt32 (ex-RESERVED, spec §4.2): meaningful iff ENCRYPTED. */
     ar->nonce_salt         = (flags & JARC_FLAG_ENCRYPTED)
                                  ? jarc_rd32(blob + JARC_OFF_NONCE_SALT32) : 0;
@@ -223,14 +269,13 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
     /* Auto-apply the process-wide key to encrypted archives so PAKs and
      * bundle mounts opened after boot decrypt without per-call wiring. */
     if ((flags & JARC_FLAG_ENCRYPTED) && g_has_process_key) {
-        memcpy(ar->dec_key, g_process_key, JCE_ARCHIVE_KEY_BYTES);
-        ar->has_key = 1;
+        if (!archive_apply_key(ar, g_process_key)) {
+            LOG_WARN(JARC_TAG, "reject: archive authentication failed");
+            goto fail;
+        }
     }
 
     /* Materialize the (possibly compressed) index region. */
-    const uint8_t *index_raw = NULL;
-    uint8_t       *index_tmp = NULL;
-
     if (!decode_dict_table(ar)) goto fail;
 
     if (flags & JARC_FLAG_INDEX_COMPRESSED) {
@@ -254,6 +299,17 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
         ar->entries = (JceArchiveEntry *)jce_malloc(sizeof(JceArchiveEntry) * entry_count);
         if (!ar->entries) goto fail;
         if (!decode_index(ar, index_raw, entry_count)) goto fail;
+        if (flags & JARC_FLAG_AUTHENTICATED) {
+            for (uint32_t i = 0; i < entry_count; ++i) {
+                const uint8_t required = JARC_ENTRY_ENCRYPTED |
+                                         JARC_ENTRY_AUTHENTICATED;
+                if ((ar->entries[i].entry_flags & required) != required) {
+                    LOG_WARN(JARC_TAG,
+                             "reject: secure archive contains plain entry");
+                    goto fail;
+                }
+            }
+        }
     }
 
     if (index_tmp) { jce_free(index_tmp); index_tmp = NULL; }
@@ -284,6 +340,8 @@ fail:
         }
         jce_free(ar->dicts);
         jce_free(ar->entries);
+        jce_archive_crypto_zero(ar->dec_key, sizeof(ar->dec_key));
+        jce_archive_crypto_zero(&ar->secure_keys, sizeof(ar->secure_keys));
         jce_free(ar);
     }
     return NULL;
@@ -323,6 +381,8 @@ void jce_archive_close(JceArchive *ar) {
     jce_free(ar->dicts);
     if (ar->dctx) ZSTD_freeDCtx(ar->dctx);
     jce_free(ar->entries);
+    jce_archive_crypto_zero(ar->dec_key, sizeof(ar->dec_key));
+    jce_archive_crypto_zero(&ar->secure_keys, sizeof(ar->secure_keys));
     if (ar->map) jce_mmap_close(ar->map);
     else if (ar->owns_blob) jce_free((void *)ar->blob);
     jce_free(ar);
@@ -337,10 +397,29 @@ const JceArchiveEntry *jce_archive_get(const JceArchive *ar, uint32_t index) {
     return &ar->entries[index];
 }
 
+uint64_t jce_archive_path_id(const JceArchive *ar, const char *path) {
+    if (!ar || !path) return 0;
+    if (!(ar->flags & JARC_FLAG_SECURE_INDEX))
+        return jce_archive_hash_path(path);
+    if (!ar->has_key || ar->auth_status != JCE_ARCHIVE_AUTH_VALID)
+        return 0;
+
+    size_t cap = strlen(path) + 1u;
+    char *normalized = (char *)jce_malloc(cap);
+    uint64_t id = 0;
+    if (!normalized) return 0;
+    size_t len = jce_archive_normalize_path(path, normalized, cap);
+    if (len > 0) {
+        id = jce_archive_secure_path_hash(&ar->secure_keys, normalized, len);
+    }
+    jce_free(normalized);
+    return id;
+}
+
 const JceArchiveEntry *jce_archive_find(const JceArchive *ar, const char *path) {
     if (!ar || !path || ar->entry_count == 0) return NULL;
 
-    uint64_t key = jce_archive_hash_path(path);
+    uint64_t key = jce_archive_path_id(ar, path);
     if (key == 0) return NULL;
 
     uint32_t lo = 0, hi = ar->entry_count; /* [lo, hi) */
@@ -362,6 +441,13 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
 
     const uint8_t *src = ar->blob + entry->data_offset;
     uint8_t *decrypted = NULL;
+    size_t stored_payload_size = entry->stored_size;
+
+    if ((ar->flags & JARC_FLAG_AUTHENTICATED) &&
+        ar->auth_status != JCE_ARCHIVE_AUTH_VALID) {
+        LOG_WARN(JARC_TAG, "read: archive authentication is not valid");
+        return 0;
+    }
 
     /* Decrypt first (spec §9.2): encrypted bytes were produced by compressing
      * then encrypting, so we reverse that order — decrypt, then decompress. */
@@ -370,7 +456,22 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
             LOG_WARN(JARC_TAG, "read: encrypted entry requires a decryption key");
             return 0;
         }
-        if (entry->stored_size > 0) {
+        if ((entry->entry_flags & JARC_ENTRY_AUTHENTICATED) != 0) {
+            if (entry->stored_size < JCE_ARCHIVE_NONCE_BYTES) return 0;
+            const uint8_t *nonce = src;
+            src += JCE_ARCHIVE_NONCE_BYTES;
+            stored_payload_size -= JCE_ARCHIVE_NONCE_BYTES;
+            if (stored_payload_size == 0) {
+                src = NULL;
+            } else {
+                decrypted = (uint8_t *)jce_malloc(stored_payload_size);
+                if (!decrypted) return 0;
+                jce_archive_chacha20_xor(
+                    ar->secure_keys.enc, nonce, 1, src, decrypted,
+                    stored_payload_size);
+                src = decrypted;
+            }
+        } else if (entry->stored_size > 0) {
             decrypted = (uint8_t *)jce_malloc(entry->stored_size);
             if (!decrypted) return 0;
             uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES];
@@ -384,14 +485,14 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
     size_t result = 0;
     switch (entry->compression) {
     case JARC_COMP_NONE:
-        if (entry->stored_size != entry->original_size) break;
-        memcpy(buf, src, entry->original_size);
+        if (stored_payload_size != entry->original_size) break;
+        if (entry->original_size > 0) memcpy(buf, src, entry->original_size);
         result = entry->original_size;
         break;
 
     case JARC_COMP_ZSTD: {
         size_t got = ZSTD_decompressDCtx(ar->dctx, buf, buf_size,
-                                         src, entry->stored_size);
+                                         src, stored_payload_size);
         if (!ZSTD_isError(got) && got == entry->original_size) result = got;
         break;
     }
@@ -410,7 +511,7 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
             if (!ar->ddicts[id]) break;
         }
         size_t got = ZSTD_decompress_usingDDict(ar->dctx, buf, buf_size,
-                                                src, entry->stored_size,
+                                                src, stored_payload_size,
                                                 ar->ddicts[id]);
         if (!ZSTD_isError(got) && got == entry->original_size) result = got;
         break;
@@ -429,8 +530,19 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
 
 void jce_archive_set_decryption_key(JceArchive *ar, const uint8_t key[32]) {
     if (!ar || !key) return;
-    memcpy(ar->dec_key, key, JCE_ARCHIVE_KEY_BYTES);
-    ar->has_key = 1;
+    archive_apply_key(ar, key);
+}
+
+int jce_archive_is_secure(const JceArchive *ar) {
+    return ar && (ar->flags & JARC_FLAG_SECURE_INDEX) != 0;
+}
+
+int jce_archive_is_authenticated(const JceArchive *ar) {
+    return ar && (ar->flags & JARC_FLAG_AUTHENTICATED) != 0;
+}
+
+JceArchiveAuthStatus jce_archive_auth_status(const JceArchive *ar) {
+    return ar ? ar->auth_status : JCE_ARCHIVE_AUTH_INVALID;
 }
 
 int jce_archive_map_entry(const JceArchive *ar, const JceArchiveEntry *entry,

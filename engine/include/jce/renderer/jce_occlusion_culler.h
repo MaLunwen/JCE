@@ -55,10 +55,14 @@ typedef struct JceOcclusionCuller JceOcclusionCuller;
 /* ================================================================== */
 
 typedef struct {
-    /* Maximum number of entities tracked simultaneously.
-       Each entity needs one bgfx OcclusionQueryHandle.
-       bgfx's hard cap is BGFX_CONFIG_MAX_OCCLUSION_QUERIES (default 4096). */
+    /* Maximum number of entities tracked simultaneously.  The query budget
+       may be lower; overflow entities stay visible rather than false-culling. */
     uint32_t max_entities;
+
+    /* Number of independent cullers sharing bgfx's global query pool.
+       Each culler owns floor(hardware_cap / share_count) handles.  Use 2 for
+       an editor with simultaneous Scene and Game views; default: 1. */
+    uint32_t query_pool_share_count;
 
     /* bgfx view ID for the depth-only proxy pre-pass.
        Must not conflict with other engine views.  Default: 254. */
@@ -75,7 +79,13 @@ static inline JceOcclusionConfig jce_occlusion_config_default(void)
 {
     JceOcclusionConfig c;
     c.max_entities = 2048;
-    c.view_id      = 254;
+    c.query_pool_share_count = 1;
+    /* Dedicated proxy view (JCE_VIEW_OCCLUSION, jce_views.h). Never share a
+     * view id with another pass: bgfx view state is last-write-wins, and
+     * the previous default (254 == JCE_VIEW_UI) let the UI canvas's pixel
+     * ortho clobber the culler's camera transform, permanently false-culling
+     * any entity whose proxy clipped to zero samples. */
+    c.view_id      = 252;
     c.min_pixels   = 0;
     return c;
 }
@@ -90,6 +100,7 @@ typedef struct {
     uint32_t occluded;          /* query result: occluded     */
     uint32_t warm_up;           /* first frame for new entity */
     uint32_t no_result;         /* query in flight / pending  */
+    uint32_t unqueried;         /* outside this view's query budget */
 } JceOcclusionStats;
 
 /* ================================================================== */
@@ -105,6 +116,15 @@ JCE_API JceOcclusionCuller *jce_occlusion_culler_create(
     const JceShaderSet       *shaders);
 
 JCE_API void jce_occlusion_culler_destroy(JceOcclusionCuller *oc);
+
+/* Drop every tracked entity and return query handles to this culler's reusable
+ * pool (no bgfx destroy/recreate churn).
+ * MUST be called whenever the scene the culler observes is destroyed and
+ * recreated (undo/redo snapshot restore, scene open/switch, Play stop):
+ * entity ids restart in the fresh world, so stale slots would both leak the
+ * hard-capped query pool AND hand recreated entities a dead entity's cull
+ * verdict.  Safe mid-frame (bgfx defers handle destruction). */
+JCE_API void jce_occlusion_culler_reset(JceOcclusionCuller *oc);
 
 /* ================================================================== */
 /* Per-frame API                                                       */

@@ -41,8 +41,13 @@
 BUFFER_RO(b_scene,   vec4, 0);
 BUFFER_RW(b_visible, vec4, 1);
 
+/* Hi-Z occlusion inputs (large-world #5) — see cs_cull_compact.sc. s_hiz at
+ * stage 2 (this 1:1 path has no counter buffer). Gated by u_cull_params.w. */
+SAMPLER2D(s_hiz, 2);
 uniform vec4 u_cull_planes[6];
 uniform vec4 u_cull_params;
+uniform mat4 u_cull_viewproj;
+uniform vec4 u_hiz_params;
 
 #define CULL_RECORD_VEC4 7u
 
@@ -75,6 +80,49 @@ void main()
         if (dist + r < 0.0) {
             visible = false;
             break;
+        }
+    }
+
+    /* Hi-Z occlusion (large-world #5, opt-in via u_cull_params.w > 0.5). INLINED
+     * — NOT a helper taking s_hiz as an argument (that GLSL crashed the GL driver
+     * at editor startup, revert d7d785c4). Window-space depth [0,1] on every
+     * backend; only NDC-z reconstruction differs (mirrors fs_volfog.sc). */
+    if (visible && u_cull_params.w > 0.5) {
+        vec2  mn_uv = vec2(1.0e9, 1.0e9);
+        vec2  mx_uv = vec2(-1.0e9, -1.0e9);
+        float mn_z  = 1.0e9;
+        bool  keep_visible = false;
+        for (int cc = 0; cc < 8; ++cc) {
+            vec3 corner = center + vec3(
+                (cc & 1) != 0 ?  e.x : -e.x,
+                (cc & 2) != 0 ?  e.y : -e.y,
+                (cc & 4) != 0 ?  e.z : -e.z);
+            vec4 clip = mul(u_cull_viewproj, vec4(corner, 1.0));
+            if (clip.w <= 1.0e-6) { keep_visible = true; break; }
+            vec3 ndc = clip.xyz / clip.w;
+#if BGFX_SHADER_LANGUAGE_GLSL
+            float win_z = ndc.z * 0.5 + 0.5;
+#else
+            float win_z = ndc.z;
+#endif
+            if (win_z < 0.0) { keep_visible = true; break; }
+            vec2 uv = ndc.xy * 0.5 + 0.5;
+            mn_uv = min(mn_uv, uv);
+            mx_uv = max(mx_uv, uv);
+            mn_z  = min(mn_z, win_z);
+        }
+        if (!keep_visible &&
+            !(mx_uv.x < 0.0 || mn_uv.x > 1.0 || mx_uv.y < 0.0 || mn_uv.y > 1.0)) {
+            float span = max((mx_uv.x - mn_uv.x) * u_hiz_params.x,
+                             (mx_uv.y - mn_uv.y) * u_hiz_params.y);
+            float mip  = ceil(log2(max(span, 1.0)));
+            if (mip < u_hiz_params.z) {
+                float occ = texture2DLod(s_hiz, vec2(mn_uv.x, mn_uv.y), mip).r;
+                occ = max(occ, texture2DLod(s_hiz, vec2(mx_uv.x, mn_uv.y), mip).r);
+                occ = max(occ, texture2DLod(s_hiz, vec2(mn_uv.x, mx_uv.y), mip).r);
+                occ = max(occ, texture2DLod(s_hiz, vec2(mx_uv.x, mx_uv.y), mip).r);
+                if (mn_z > occ) visible = false;
+            }
         }
     }
 

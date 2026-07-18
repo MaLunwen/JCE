@@ -26,6 +26,16 @@ JCE_API void jce_perf_phase_report(char *out, int out_sz);
 
 /* Gate: when off, jce_perf_phase_add is a no-op (zero overhead). */
 JCE_API void jce_perf_phase_set_enabled(int on);
+JCE_API int  jce_perf_phase_enabled(void);
+
+/* Non-destructive access (editor profiler UI).  frame_tick() rotates the
+ * window accumulators into a per-frame snapshot (delta since the previous
+ * tick); peek_frame() reads that snapshot without touching the window that
+ * jce_perf_phase_report() owns.  Call frame_tick once per frame. */
+JCE_API void jce_perf_phase_frame_tick(void);
+JCE_API int  jce_perf_phase_count(void);
+JCE_API int  jce_perf_phase_peek_frame(int idx, const char **out_name,
+                                       double *out_ms);
 
 JCE_EXTERN_C_END
 

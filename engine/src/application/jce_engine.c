@@ -23,6 +23,7 @@
 #include <SDL3/SDL.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>   /* qsort — perf percentile (1% / 0.1% low) summary */
 #include <string.h>
 
 /* Platform branching below goes through the JCE_PLATFORM_* constants from
@@ -51,10 +52,14 @@
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_input_record.h>
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+#include <jce/middleware/ai_dispatch/jce_ai_dispatch.h>
+#endif
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_modal_loop.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_lowlevel.h>   /* jce_gfx_stats_capture — per-view GPU timing */
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/resource/jce_asset.h>
@@ -69,11 +74,43 @@
 #define JCE_DEFAULT_FRAME_DT (1.0f / 60.0f)
 #define JCE_MAX_FRAME_DT 0.1f
 
+static void jce_engine_secure_zero(void *data, size_t size)
+{
+    volatile uint8_t *p = (volatile uint8_t *)data;
+    while (size-- > 0)
+        *p++ = 0;
+}
+
+/* ── Frame-time percentiles (standard-engine benchmark metric) ───────────
+ * UE (stat unit / CsvProfiler) and Unity (Performance Testing) report the
+ * 1%-low and 0.1%-low frame times — the p99 / p99.9 of the frame-time
+ * distribution — because the average hides the hitches players actually feel.
+ * We keep a fixed ring of the last N frame times (no alloc) and, in the
+ * JCE_PERF_LOG window report, sort a copy to emit those percentiles. */
+#define JCE_PERF_RING 2048   /* enough samples for a meaningful 0.1%-low */
+
+static int jce_perf_cmp_d(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+/* q in [0,1]; nearest-rank on an ascending-sorted array. */
+static double jce_perf_pct(const double *asc, uint32_t n, double q) {
+    if (n == 0) return 0.0;
+    long r = (long)(q * (double)n + 0.5) - 1;   /* nearest-rank, 0-based */
+    if (r < 0) r = 0;
+    if (r >= (long)n) r = (long)n - 1;
+    return asc[r];
+}
+
 static JceAppDesc  g_app_desc;
 static bool        g_app_desc_set;
+static bool        g_quit_requested;   /* jce_engine_request_quit() latch */
 static char        g_config_path_override[512];
 static char        g_pak_path_override[512];
 static char        g_bundle_catalog_path[512];
+
+void JCE_CALL jce_engine_request_quit(void)  { g_quit_requested = true; }
+bool JCE_CALL jce_engine_quit_requested(void) { return g_quit_requested; }
 static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
 void jce_engine_set_app_desc(const JceAppDesc *desc)
@@ -118,6 +155,52 @@ void jce_engine_set_bundle_catalog_path(const char *path)
         return;
     }
     snprintf(g_bundle_catalog_path, sizeof(g_bundle_catalog_path), "%s", path);
+}
+
+/* Settings S7 follow-up: layer the jce.ini [graphics] section (written by
+ * the in-game settings screen) onto the live render pipeline.  Mirrors the
+ * screen's own Apply precedence: a named quality preset fills the whole
+ * descriptor, then the individual toggles override on top.  "custom" keeps
+ * whatever the boot resolution (.rp.json or tier preset) produced and only
+ * layers the toggles.  No-op when no [graphics] section was loaded. */
+void JCE_CALL jce_engine_apply_graphics_config(const struct JceConfig *cfg,
+                                               struct JceRenderer *renderer)
+{
+    if (!cfg || !cfg->gfx_valid) return;
+
+    JceRenderPipelineDesc desc;
+    jce_render_pipeline_get(&desc);
+
+    switch (cfg->gfx_quality) {
+    case -1: jce_render_pipeline_preset_for_current_tier(&desc); break;
+    case 0:  jce_render_pipeline_preset_low(&desc);              break;
+    case 1:  jce_render_pipeline_preset_mid(&desc);              break;
+    case 2:  jce_render_pipeline_preset_high(&desc);             break;
+    case 3:  jce_render_pipeline_preset_ultra(&desc);            break;
+    default: break;   /* 4 = custom: keep the boot-resolved descriptor */
+    }
+
+    desc.enable_csm            = cfg->gfx_shadows;
+    desc.enable_ssao           = cfg->gfx_ssao;
+    desc.enable_bloom          = cfg->gfx_bloom;
+    desc.enable_volumetric_fog = cfg->gfx_fog;
+    {
+        int sq = cfg->gfx_shadow_quality;
+        if (sq < 0) sq = 0;
+        if (sq > 2) sq = 2;
+        desc.shadow_filter_quality = (uint8_t)sq;
+    }
+    {
+        int ms = cfg->gfx_msaa;
+        if (ms != 1 && ms != 2 && ms != 4 && ms != 8) ms = 1;
+        desc.msaa_samples = (uint8_t)ms;
+    }
+
+    jce_render_pipeline_apply(&desc);
+    if (renderer)
+        jce_renderer_set_msaa(renderer, (int)desc.msaa_samples);
+    LOG_INFO(LOG_TAG, "applied [graphics] overrides from user config "
+             "(quality=%d)", cfg->gfx_quality);
 }
 
 static bool jce_path_exists(const char *path)
@@ -349,6 +432,10 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         jce_select_config_path(cfg_path, sizeof(cfg_path));
         jce_config_load(&e->config, cfg_path);
     }
+    /* Settings S5: publish the boot-only perf knobs so the renderer (bgfx
+     * pool sizing) and jobs layers — which never receive the JceConfig — can
+     * read them.  Done before bgfx_init / any jce_jobs_default. */
+    jce_config_publish_perf(e->config.machine_class, e->config.job_workers);
 
     /* Apply renderer backend override from editor (or other host). */
     if (g_renderer_backend_override >= 0)
@@ -370,12 +457,15 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     }
 
     if (!jce_single_instance_lock(e->config.window_title)) {
-        char msg[256];
-        const char *title = (e->config.window_title[0] != '\0')
-            ? e->config.window_title
-            : "JCE";
-        snprintf(msg, sizeof(msg), "%s is already running.", title);
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, title, msg, NULL);
+        /* Second instance: activate the first instance's window instead
+         * of interrupting the user with a modal — restore it if
+         * minimized, best-effort foreground, and flash its taskbar
+         * button until it gains focus (the VS Code / Chrome behavior).
+         * Then exit silently. */
+        if (!jce_single_instance_activate_existing())
+            LOG_WARN(LOG_TAG, "another instance of '%s' is already running "
+                     "(no window published to activate) — exiting",
+                     e->config.window_title[0] ? e->config.window_title : "JCE");
         SDL_Quit();
         JCE_FREE(e);
         return NULL;
@@ -399,14 +489,16 @@ JceEngine *jce_engine_create(int argc, char *argv[])
      * opened from here on — embedded PAK, file-loaded PAK (web/Android/JNI)
      * and later bundle mounts — decrypts transparently.  When no key was
      * embedded (present == 0) this is a no-op and plain assets work as
-     * before.  Obfuscation only: the key necessarily ships with the game. */
+     * before.  The archive is authenticated, but the key necessarily ships
+     * with the game, so this raises extraction cost rather than creating
+     * client-side secrecy. */
     if (jce_embedded_pak_key_present) {
         uint8_t pak_key[32];
         for (int ki = 0; ki < 32; ++ki)
             pak_key[ki] = (uint8_t)(jce_embedded_pak_key_shares[ki] ^
                                     jce_embedded_pak_key_shares[32 + ki]);
         jce_archive_set_process_key(pak_key);
-        memset(pak_key, 0, sizeof(pak_key)); /* scrub the stack copy */
+        jce_engine_secure_zero(pak_key, sizeof(pak_key));
     }
 
     /* Open PAK archive. */
@@ -524,6 +616,15 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         goto fail;
     }
 
+    /* Publish the native handle so a later second instance can activate
+     * this window (restore + foreground + taskbar flash) instead of
+     * showing a modal. */
+    {
+        JceNativeWindow nw;
+        jce_window_get_native(e->window, &nw);
+        jce_single_instance_publish_window(nw.nwh);
+    }
+
     /* -- Renderer ------------------------------------------------- */
 
     JceRendererConfig ren_cfg = {
@@ -580,6 +681,12 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* Render Pipeline Asset (P3-E.4): pick `<cwd>/Settings/RenderPipeline.rp.json`
      * if present, otherwise fall back to the preset matching the GPU tier. */
     jce_render_pipeline_apply_boot("Settings/RenderPipeline.rp.json");
+
+    /* Settings S7 follow-up: layer the player's saved in-game graphics
+     * choices (jce.ini [graphics]) on top of the boot resolution above —
+     * the same seam where the other jce.ini sections (window/audio) apply.
+     * No-op for configs without the section. */
+    jce_engine_apply_graphics_config(&e->config, e->renderer);
 
     e->input = jce_input_create();
     if (!e->input) {
@@ -647,7 +754,17 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         }
     }
 
-    e->audio = jce_audio_create();
+    /* JCE_AUDIO_DISABLE: skip audio entirely (diagnostic A/B — on wasm the
+     * miniaudio callback runs on the MAIN thread via ScriptProcessorNode,
+     * so this isolates "is the frame-time hole the audio path?").  The
+     * NULL-audio path below is the same one an init failure takes, which
+     * every consumer already tolerates. */
+    if (getenv("JCE_AUDIO_DISABLE") != NULL) {
+        e->audio = NULL;
+        LOG_WARN(LOG_TAG, "JCE_AUDIO_DISABLE set — audio OFF (diagnostic)");
+    } else {
+        e->audio = jce_audio_create();
+    }
     if (!e->audio)
         LOG_WARN(LOG_TAG, "audio init failed, continuing without sound");
 
@@ -798,9 +915,19 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
     const Uint32 t = event->type;
 
     /* Pause/resume on minimize so we don't keep resetting to a 0-sized
-     * backbuffer (which leaves bgfx in a broken state on restore). */
+     * backbuffer (which leaves bgfx in a broken state on restore).
+     * EXCEPTION: benchmark/CI runs (JCE_MAX_FRAMES set) keep iterating to
+     * their auto-quit frame even when minimized — minimizing the popup IS the
+     * user's "run it in the background" gesture, and pausing silently starves
+     * the JCE_PERF_LOG window forever.  The 0-size hazard stays covered: the
+     * minimize event is not a size event, and the size-refresh path below
+     * already rejects pw/ph <= 0, so bgfx never resets to 0x0 — rendering
+     * continues at the last good backbuffer size (present goes occluded). */
     if (t == SDL_EVENT_WINDOW_MINIMIZED) {
-        SDL_SetAtomicInt(&s_render_paused, 1);
+        static int s_bench = -1;
+        if (s_bench < 0) s_bench = (SDL_getenv("JCE_MAX_FRAMES") != NULL) ? 1 : 0;
+        if (!s_bench)
+            SDL_SetAtomicInt(&s_render_paused, 1);
         return true;
     }
     if (t == SDL_EVENT_WINDOW_RESTORED ||
@@ -1063,6 +1190,42 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     if (e->perf_freq == 0)
         e->perf_freq = jce_time_perf_freq();
 
+    /* Periodic allocator trim (512MB charter): mimalloc's purge is
+     * OPPORTUNISTIC — it only runs during allocation activity, so an idle
+     * process (steady-state rendering is 0 allocs/frame) retains its
+     * startup-peak commit forever (measured: ~1.3GB of the editor's asset
+     * decode/cook transient stayed committed at idle).  A slow tick returns
+     * freed-but-retained segments to the OS on every machine; charter-class
+     * boxes (low RAM / single core, or JCE_LOW_MEM=1) additionally switch
+     * the allocator to immediate-purge and trim aggressively. */
+    {
+        static uint64_t s_trim_last = 0;
+        static int      s_low_mem   = -1;
+        if (s_low_mem < 0) {
+            const int ram_mb = SDL_GetSystemRAM();
+            const int cores  = SDL_GetNumLogicalCPUCores();
+            bool lm = (ram_mb > 0 && ram_mb < 2048) || cores <= 1;
+            /* Settings S5: jce.ini machine_class overrides the auto-detect
+             * (same precedence as apply_transient_limits); env still wins. */
+            switch (jce_config_machine_class()) {
+            case JCE_MACHINE_CLASS_LOW:  lm = true;  break;
+            case JCE_MACHINE_CLASS_FULL: lm = false; break;
+            default: break;
+            }
+            const char *ev = getenv("JCE_LOW_MEM");
+            if (ev && ev[0]) lm = (ev[0] != '0');
+            s_low_mem = lm ? 1 : 0;
+            if (lm) jce_alloc_low_mem_mode(true);
+        }
+        const uint64_t trim_every =
+            e->perf_freq * (uint64_t)(s_low_mem ? 10u : 30u);
+        if (e->perf_freq > 0 && now - s_trim_last >= trim_every) {
+            if (s_trim_last != 0)   /* skip the boot window (startup allocs) */
+                jce_alloc_trim(s_low_mem != 0);
+            s_trim_last = now;
+        }
+    }
+
     if (e->perf_freq > 0 &&
         e->frame_counter_prev > 0 &&
         now >= e->frame_counter_prev) {
@@ -1074,6 +1237,11 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
     if (dt < 0.0f) dt = 0.0f;
     if (dt > JCE_MAX_FRAME_DT) dt = JCE_MAX_FRAME_DT;
+
+    if (jce_engine_quit_requested()) {
+        jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
+        return JCE_APP_SUCCESS;
+    }
 
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
@@ -1187,6 +1355,16 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         }
     }
 
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+    /* ai_dispatch: constraint records enter the frame at input parity —
+     * this sits beside the input record/replay hook on purpose.  Replay
+     * pumps the .jarc stream gated by the canonical tick; live results
+     * pump within the frame budget (spec H/J).  No-op until the host
+     * calls jce_aid_init(). */
+    if (jce_aid_initialised())
+        jce_aid_engine_tick(jce_fixed_clock_default()->tick_count, 0);
+#endif
+
     /* QW-input-actions — evaluate the action map against the current
      * input snapshot so FIXED_UPDATE / UPDATE consumers (games, camera
      * controller) read fresh action values this frame.  Raw-input queries
@@ -1269,9 +1447,12 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
     if (g_app_desc.update) {
         JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
+        uint64_t _t0_app = jce_time_perf_counter();
         g_app_desc.update(dt, g_app_desc.user_data);
         if (g_app_desc.draw)
             g_app_desc.draw(&e->svc, g_app_desc.user_data);
+        jce_perf_phase_add("app_update",
+                           jce_time_perf_to_ms(_t0_app, jce_time_perf_counter()));
         JCE_PROFILE_ZONE_END;
     }
 
@@ -1279,12 +1460,26 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * Post-gameplay: cameras, IK, anim post-processing. */
     jce_player_loop_run_phase(JCE_PHASE_LATE_UPDATE, dt);
 
-    jce_renderer_end_frame(e->renderer);
+    {
+        /* end_frame = bgfx_frame kick + any API-thread wait: the gap between
+         * app_update (all JCE-side submit work incl. scene_render) and the
+         * bgfx-reported cpu_frame_ms lives here. */
+        uint64_t _t0_ef = jce_time_perf_counter();
+        jce_renderer_end_frame(e->renderer);
+        jce_perf_phase_add("end_frame",
+                           jce_time_perf_to_ms(_t0_ef, jce_time_perf_counter()));
+    }
 
     /* ── PlayerLoop: POST_RENDER ────────────────────────────────────
      * After the renderer submits but before we release the in-frame
      * guard, so hooks can still touch frame-local resources. */
     jce_player_loop_run_phase(JCE_PHASE_POST_RENDER, dt);
+
+    /* Promote deferred render-pipeline toggles (settings slice S1): the
+     * per-feature setters write a pending descriptor; landing it here —
+     * after every submit of the frame — keeps mid-frame draws consistent.
+     * No-op when nothing called a setter this frame. */
+    jce_render_pipeline_end_frame();
 
     SDL_SetAtomicInt(&s_in_render_frame, 0);
 
@@ -1311,40 +1506,146 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     {
         static int s_perf_on = -1;
         if (s_perf_on < 0) {
-            s_perf_on = (SDL_getenv("JCE_PERF_LOG") != NULL) ? 1 : 0;
+            /* libc getenv, NOT SDL_getenv: on Emscripten SDL keeps its own
+             * env table and never sees Module.ENV entries, so the web
+             * `?perflog` hook silently failed to arm the profiler. */
+            s_perf_on = (getenv("JCE_PERF_LOG") != NULL) ? 1 : 0;
             jce_perf_phase_set_enabled(s_perf_on);
         }
         if (s_perf_on) {
             static double   s_acc_ms = 0.0;
             static double   s_worst_ms = 0.0;
             static uint32_t s_n = 0u;
+            /* Ring of the last N frame times for the 1%/0.1%-low percentiles.
+             * The first window is warmup (shader/PSO compile, asset upload, the
+             * one-time load spike) — excluded from the ring so the percentiles
+             * report STEADY-STATE hitches, not the startup frame (mirrors how UE
+             * stat unit / a benchmark's warmup phase discards early frames). */
+            static double   s_ring[JCE_PERF_RING];
+            static uint32_t s_ring_head = 0u, s_ring_count = 0u;
+            static uint32_t s_warm = 0u;
             const double    ms = (double)dt * 1000.0;
             s_acc_ms += ms;
             if (ms > s_worst_ms) s_worst_ms = ms;
+            if (s_warm < 120u) {
+                s_warm++;
+            } else {
+                s_ring[s_ring_head] = ms;
+                s_ring_head = (s_ring_head + 1u) & (JCE_PERF_RING - 1u);
+                if (s_ring_count < JCE_PERF_RING) s_ring_count++;
+            }
             if (++s_n >= 120u) {
                 const double avg = s_acc_ms / (double)s_n;
                 /* Pull the last frame's CPU/GPU split + draw count so the log
                  * tells you WHICH way it is bound (GPU+high draws → LOD/overdraw;
                  * CPU high → cull/entity).  One representative sample at steady
                  * state; the avg/worst are the windowed wall-clock. */
+                /* Process RSS SELF-REPORTED in the perf line: external samplers
+                 * (PowerShell WorkingSet polls) race short profiling runs and
+                 * can attribute another editor instance's memory to this one —
+                 * the in-process readout is always attributable and catches
+                 * the steady state exactly at the report window. */
+                long long rss_mb = 0, commit_mb = 0;
+                {
+                    JceMemStats mstat;
+                    if (jce_mem_stats(&mstat)) {
+                        rss_mb    = (long long)(mstat.current_rss    >> 20);
+                        commit_mb = (long long)(mstat.current_commit >> 20);
+                    }
+                }
                 JceGpuStats gs;
                 if (jce_renderer_get_gpu_stats(&gs) && gs.valid) {
+                    /* rss = OS working set (sticky: Windows does not trim an
+                     * unpressured process, so it reflects the PEAK more than
+                     * the present); commit = committed private bytes — the
+                     * truthful steady-state figure for the 512MB budget. */
                     LOG_INFO(LOG_TAG,
-                             "perf: %.2f ms avg (%.0f FPS) | cpu %.1f / gpu %.1f ms | %u draws | gpu-mem %lld MB | worst %.2f ms / %u",
+                             "perf: %.2f ms avg (%.0f FPS) | cpu %.1f / gpu %.1f ms | %u draws | gpu-mem %lld MB | rss %lld MB | commit %lld MB | worst %.2f ms / %u",
                              avg, (avg > 0.0) ? (1000.0 / avg) : 0.0,
                              gs.cpu_frame_ms, gs.gpu_ms, gs.num_draw,
                              (long long)(gs.gpu_memory_used > 0 ? gs.gpu_memory_used >> 20 : 0),
-                             s_worst_ms, s_n);
+                             rss_mb, commit_mb, s_worst_ms, s_n);
                 } else {
                     LOG_INFO(LOG_TAG,
                              "perf: %.2f ms/frame avg (%.0f FPS), worst %.2f ms, over %u frames",
                              avg, (avg > 0.0) ? (1000.0 / avg) : 0.0, s_worst_ms, s_n);
                 }
                 {
+                    /* Standard-engine hitch metric: 1%-low (p99) / 0.1%-low
+                     * (p99.9) frame times over the ring, plus p50/p95.  Sort a
+                     * copy of the resident samples (no per-frame cost). */
+                    static double srt[JCE_PERF_RING];
+                    uint32_t rc = s_ring_count;
+                    if (rc > 0) {
+                    memcpy(srt, s_ring, (size_t)rc * sizeof(double));
+                    qsort(srt, rc, sizeof(double), jce_perf_cmp_d);
+                    const double p50  = jce_perf_pct(srt, rc, 0.50);
+                    const double p95  = jce_perf_pct(srt, rc, 0.95);
+                    const double p99  = jce_perf_pct(srt, rc, 0.99);
+                    const double p999 = jce_perf_pct(srt, rc, 0.999);
+                    LOG_INFO(LOG_TAG,
+                        "perf-lows: p50 %.2f | p95 %.2f | 1%%low(p99) %.2f ms (%.0f FPS) | 0.1%%low(p99.9) %.2f ms (%.0f FPS) | over %u frames",
+                        p50, p95, p99, (p99 > 0.0) ? 1000.0 / p99 : 0.0,
+                        p999, (p999 > 0.0) ? 1000.0 / p999 : 0.0, rc);
+                    }
+                }
+                {
                     char phase_buf[512];
                     jce_perf_phase_report(phase_buf, (int)sizeof(phase_buf));
                     if (phase_buf[0])
                         LOG_INFO(LOG_TAG, "perf-phases: %s", phase_buf);
+                }
+                {
+                    /* Per-VIEW GPU breakdown — WHICH pass costs the GPU (shadow
+                     * cascades vs gbuffer/foliage raster vs SSAO vs lighting vs
+                     * postfx).  bgfx per-view GPU timers are enabled by the
+                     * profiler flag we set under JCE_PERF_LOG.  One representative
+                     * frame's slice; ranks the top views by GPU ms so the log
+                     * answers "which pass is the GPU wall". */
+                    const JceFrameStats *fs = jce_gfx_stats_capture();
+                    if (fs && fs->gpu_timer_freq > 0 && fs->view_stats_count > 0) {
+                        int idx[64];
+                        int nv = fs->view_stats_count < 64 ? fs->view_stats_count : 64;
+                        for (int i = 0; i < nv; i++) idx[i] = i;
+                        /* insertion sort by GPU span, descending (nv is small) */
+                        for (int i = 1; i < nv; i++) {
+                            int k = idx[i];
+                            int64_t kg = fs->view_stats[k].gpu_time_end - fs->view_stats[k].gpu_time_begin;
+                            int j = i - 1;
+                            while (j >= 0) {
+                                int64_t jg = fs->view_stats[idx[j]].gpu_time_end - fs->view_stats[idx[j]].gpu_time_begin;
+                                if (jg >= kg) break;
+                                idx[j + 1] = idx[j]; j--;
+                            }
+                            idx[j + 1] = k;
+                        }
+                        char vbuf[512];
+                        int off = 0;
+                        double inv = 1000.0 / (double)fs->gpu_timer_freq;
+                        for (int i = 0; i < nv && i < 8; i++) {
+                            const JceViewStats *v = &fs->view_stats[idx[i]];
+                            double g = (double)(v->gpu_time_end - v->gpu_time_begin) * inv;
+                            if (g < 0.01) break;   /* stop at negligible views */
+                            int n = snprintf(vbuf + off, sizeof(vbuf) - (size_t)off,
+                                             "%s%s#%u=%.2f", (off ? " " : ""),
+                                             v->name[0] ? v->name : "?",
+                                             (unsigned)v->view_id, g);
+                            if (n < 0 || off + n >= (int)sizeof(vbuf)) break;
+                            off += n;
+                        }
+                        if (off > 0)
+                            LOG_INFO(LOG_TAG, "perf-gpu-views: %s", vbuf);
+                    }
+                }
+                {
+                    /* rank-9: per-frame heap churn over this window (the first
+                     * window includes one-time startup allocs; later windows are
+                     * steady-state — watch those for per-frame churn regressions). */
+                    uint64_t af = 0, ab = 0;
+                    jce_alloc_frame_delta(&af, &ab);
+                    LOG_INFO(LOG_TAG, "perf-alloc: %.1f allocs/frame, %.1f KB/frame",
+                             (double)af / (double)s_n,
+                             (double)ab / 1024.0 / (double)s_n);
                 }
                 s_acc_ms = 0.0;
                 s_worst_ms = 0.0;

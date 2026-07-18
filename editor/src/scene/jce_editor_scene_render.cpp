@@ -11,6 +11,7 @@
 #include <jce/os/core/jce_filesystem.h>
 
 #include "io/jce_editor_file_util.h"
+#include "jce_scene_content_context.h"
 #include "jce_scene_render_internal.h"
 #include "core/jce_assetdb.h"
 #include "core/jce_editor_project.h"
@@ -231,39 +232,67 @@ struct EdQueryCacheEntry {
 };
 static EdQueryCacheEntry s_query_cache[ED_QUERY_CACHE_MAX];
 
-/* Resolve the OPEN PROJECT's render_settings.json (relative to the project root
- * — NOT the editor exe dir) and apply the grass project gate to the scene
- * renderer.  Re-runnable: the project is opened by a dialog AFTER scene-render
- * init, so the gate must re-apply on project change (see render_frame), or the
- * editor would never see grass even though the standalone does. Tries the
- * source-authored render_settings.json first, then the cooked copy. */
-static void sr_apply_project_grass_gate(void)
+static JceFileSystem *s_content_context_fs = nullptr;
+static JceFsActivePolicy s_content_context_policy = JCE_FS_ACTIVE_OVERLAY;
+static char s_content_context_project_root[1024] = {0};
+
+/* Apply the complete content-addressing context before scene components begin
+ * resolving assets.  Source scenes use project-root paths; Bundle Preview is
+ * hermetic and reads project settings/components only through its isolated VFS.
+ * Keeping grass and particle addressing together prevents the editor from
+ * rendering a hybrid of the selected bundle and the previously open project. */
+static void sr_apply_content_context(void)
 {
-    if (!s_sr.scene_renderer) return;
-    JceRenderSettings rs = jce_render_settings_default();
+    JceFileSystem *active_fs = jce_fs_get_active();
+    JceFsActivePolicy active_policy = jce_fs_get_active_policy();
+    const bool isolated = active_fs != nullptr &&
+                          active_policy == JCE_FS_ACTIVE_ISOLATED;
     const JceProject *proj = jce_editor_project_get();
+    const JceEditorSceneContentPaths paths = jce_editor_scene_content_paths(
+        isolated,
+        proj ? proj->project_root : nullptr,
+        proj ? proj->source_assets : nullptr,
+        proj ? proj->cooked_assets : nullptr);
+
+    s_content_context_fs = active_fs;
+    s_content_context_policy = active_policy;
+    snprintf(s_content_context_project_root,
+             sizeof(s_content_context_project_root), "%s",
+             (proj && proj->project_root) ? proj->project_root : "");
+
+    jce_scene_particles_set_asset_root(
+        paths.particle_asset_root.empty()
+            ? nullptr : paths.particle_asset_root.c_str());
+
+    /* Canvas UI fonts follow the same project content root, so UIText
+     * resolves project-authored fonts (e.g. space's SegoeUI.ttf) instead of
+     * relying on a key collision with the editor's embedded pak. */
+    jce_ui_canvas_set_asset_root(
+        paths.particle_asset_root.empty()
+            ? nullptr : paths.particle_asset_root.c_str());
+
+    if (!s_sr.scene_renderer) return;
+
+    JceRenderSettings rs = jce_render_settings_default();
     bool loaded = false;
-    char rpath[1024] = {0};
-    if (proj && proj->project_root && proj->project_root[0]) {
-        const char *src = (proj->source_assets && proj->source_assets[0])
-                          ? proj->source_assets : "resources/assets";
-        const char *cooked = (proj->cooked_assets && proj->cooked_assets[0])
-                             ? proj->cooked_assets : "resources/_cooked";
-        int n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
-                         proj->project_root, src);
-        if (n > 0 && n < (int)sizeof(rpath))
-            loaded = jce_render_settings_load_json(rpath, &rs);
-        if (!loaded) {
-            n = snprintf(rpath, sizeof(rpath), "%s/%s/render_settings.json",
-                         proj->project_root, cooked);
-            if (n > 0 && n < (int)sizeof(rpath))
-                loaded = jce_render_settings_load_json(rpath, &rs);
-        }
+    std::string settings_path = paths.render_settings_primary;
+    if (!settings_path.empty())
+        loaded = jce_render_settings_load_json(settings_path.c_str(), &rs);
+    if (!loaded && !paths.render_settings_fallback.empty()) {
+        settings_path = paths.render_settings_fallback;
+        loaded = jce_render_settings_load_json(settings_path.c_str(), &rs);
     }
+
     LOG_INFO("scene_render", "GRASS GATE: root='%s' path='%s' loaded=%d grass_enabled=%d",
-             (proj && proj->project_root) ? proj->project_root : "(none)",
-             rpath, (int)loaded, (int)rs.grass_enabled);
+             isolated ? "(bundle-vfs)" :
+                 ((proj && proj->project_root) ? proj->project_root : "(none)"),
+             settings_path.c_str(), (int)loaded, (int)rs.grass_enabled);
     jce_scene_renderer_set_grass_enabled(s_sr.scene_renderer, rs.grass_enabled != 0);
+}
+
+void jce_editor_scene_render_refresh_content_context(void)
+{
+    sr_apply_content_context();
 }
 
 /* ── Init ─────────────────────────────────────────────────────────── */
@@ -279,6 +308,12 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.white_tex.idx = UINT16_MAX;
     s_sr.postfx_output_tex = UINT16_MAX;
     s_sr.renderer = renderer;
+    /* ECS-UI Canvas overlay for the Scene View (mirrors the game view's
+     * instance; draw-only — the Game View owns pointer interaction). */
+    s_sr.ui_canvas = jce_ui_canvas_create(renderer, pak);
+    if (!s_sr.ui_canvas)
+        LOG_WARN(LOG_TAG, "failed to create scene-view UI canvas renderer");
+
     s_sr.bridge = jce_offscreen_target_create(renderer,
                                                   (uint16_t)JCE_VIEW_EDITOR_SCENE);
     if (!s_sr.bridge) {
@@ -381,9 +416,9 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     /* Grass project gate (Stage 1b.6): applied from the open project's
      * render_settings.json (grassEnabled).  No project is open yet at editor
      * init (it is opened by a dialog later), so this also RE-APPLIES per-frame
-     * on project change — see sr_apply_project_grass_gate() called from
+     * on project change — see sr_apply_content_context() called from
      * jce_editor_scene_render_frame(). */
-    sr_apply_project_grass_gate();
+    sr_apply_content_context();
 
     JceScenePickDesc pick_desc;
     memset(&pick_desc, 0, sizeof(pick_desc));
@@ -422,6 +457,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
             oc_shaders.color.idx = ch.idx;
 
             JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+            oc_cfg.query_pool_share_count = 2;
             s_sr.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
             if (!s_sr.occlusion_culler)
                 LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
@@ -444,6 +480,10 @@ void jce_editor_scene_render_shutdown(void)
 {
     if (!s_sr.initialized) return;
 
+    if (s_sr.ui_canvas) {
+        jce_ui_canvas_destroy(s_sr.ui_canvas);
+        s_sr.ui_canvas = NULL;
+    }
     if (s_sr.pick_pass) {
         jce_scene_pick_destroy(s_sr.pick_pass);
         s_sr.pick_pass = NULL;
@@ -563,6 +603,25 @@ void jce_editor_scene_render_invalidate_model_caches(void)
         jce_scene_renderer_invalidate_model_cache(s_sr.scene_renderer);
     if (s_sr.pick_pass)
         jce_scene_pick_invalidate_model_cache(s_sr.pick_pass);
+    /* The occlusion culler is keyed by entity id; the fresh world reuses
+     * those ids, so stale slots hand recreated entities dead cull verdicts
+     * and leak the hard-capped bgfx query pool. */
+    jce_editor_scene_render_reset_occlusion();
+}
+
+void jce_editor_scene_render_reset_occlusion(void)
+{
+    if (s_sr.occlusion_culler)
+        jce_occlusion_culler_reset(s_sr.occlusion_culler);
+    /* The engine scene renderer keeps entity-keyed environment caches
+     * (vegetation scatter / grass / water / foliage-cluster canopies).
+     * The recreated ECS world hands recycled ids back with bumped
+     * generation bits, stranding every slot; a full fcluster table then
+     * silently skips drawing new clusters (leaves + grass vanishing after
+     * undo).  Drop them on the same trigger as the occlusion slots —
+     * content rebuilds lazily on the next draw. */
+    if (s_sr.scene_renderer)
+        jce_scene_renderer_reset_entity_caches(s_sr.scene_renderer);
 }
 
 void jce_editor_scene_render_streaming_rebuild(void)
@@ -674,17 +733,18 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     s_cap_w = (uint16_t)width;
     s_cap_h = (uint16_t)height;
 
-    /* Re-apply the grass project gate when the open project changes.  The
-     * project is opened by a dialog AFTER scene-render init, so an init-only
-     * apply never sees it (the editor would show no grass while the standalone
-     * does).  Cheap: only re-reads render_settings.json when the root changes. */
+    /* Re-apply content policy when either the project or active VFS changes.
+     * Explicit scene-load hooks normally do this before entity creation; this
+     * check is a cheap guard for project dialogs and future mount call sites. */
     {
-        static char s_grass_gate_root[1024] = {0};
         const JceProject *gp = jce_editor_project_get();
         const char *groot = (gp && gp->project_root) ? gp->project_root : "";
-        if (strcmp(groot, s_grass_gate_root) != 0) {
-            snprintf(s_grass_gate_root, sizeof(s_grass_gate_root), "%s", groot);
-            sr_apply_project_grass_gate();
+        JceFileSystem *active_fs = jce_fs_get_active();
+        JceFsActivePolicy active_policy = jce_fs_get_active_policy();
+        if (active_fs != s_content_context_fs ||
+            active_policy != s_content_context_policy ||
+            strcmp(groot, s_content_context_project_root) != 0) {
+            sr_apply_content_context();
         }
     }
 
@@ -815,6 +875,15 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
     }
 
+    /* Headless test hook: JCE_DBG_VIEW_MODE=shaded forces the SHADED view. The
+     * default editor scene view is TEXTURED, whose missing-albedo checker routes
+     * every model through a SOLO draw (instancing is skipped) — so a headless
+     * stress in the default view never exercises the gpu-scene instanced-model /
+     * Hi-Z path. Forcing SHADED engages instancing exactly as runtime does. */
+    if (const char *vm = std::getenv("JCE_DBG_VIEW_MODE")) {
+        if (vm[0] == 's') cfg.view_mode = JCE_SCENE_VIEW_SHADED;
+    }
+
     /* Wire the editor's Show menu flags into engine config so toggles
        actually take effect. */
     if (!jce_state_show_flag(JCE_SHOW_FLAG_SKYBOX))
@@ -871,6 +940,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * pass, so it samples the current frame's clean (pre-composite) color. */
     cfg.ssr_color_tex_handle =
         jce_offscreen_target_get_color_texture(s_sr.bridge);
+    /* GI L1: the dynamic probe gather samples the same lit RT (it reads it
+     * on the pre-color compute view = last frame's content). */
+    cfg.gi_color_tex_handle = cfg.ssr_color_tex_handle;
 
     /* Focus-bounded entity collection ("draw distance"): only entities within
      * cull_radius (horizontal) of the orbit target are collected, so every
@@ -1070,6 +1142,44 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         }
     }
 
+    /* Fold the tone-mapped PostFX output back into the bridge so the canvas
+     * UI (below) lands AFTER post-fx — same scene→postfx→UI compositing the
+     * Game View and the shipped runtime use.  Editor gizmo overlays stay
+     * pre-postfx above (they need the bridge depth buffer).  flip_v: the
+     * postfx RT's sampling orientation is inverted vs the bridge/canvas
+     * convention on bottom-left-origin backends (GL). */
+    bool postfx_composited = false;
+    if (s_sr.postfx_output_tex != UINT16_MAX) {
+        const uint16_t comp_view =
+            (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 21);
+        jce_offscreen_target_composite_texture(
+            s_sr.bridge, comp_view, s_sr.postfx_output_tex,
+            (uint16_t)width, (uint16_t)height,
+            jce_renderer_origin_bottom_left());
+        s_sr.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
+        postfx_composited = true;
+    }
+
+    /* ── ECS-UI (Canvas) overlay — scene-view parity with the game view ──
+     * Unity renders scene-space UI in the Scene View too; gate on the
+     * UI show flag (View > Show Flags > UI, default ON).  Draw-only:
+     * pointer=NULL so no button/input state machines run — the Game View
+     * owns interaction.  With PostFX active the overlay draws after the
+     * composite pass above (crisp, un-tonemapped UI, matching the Game
+     * View and the runtime); without PostFX it draws right after the scene
+     * on the mirror of the game view's base+17 slot. */
+    if (s_sr.ui_canvas && jce_state_show_flag(JCE_SHOW_FLAG_UI)) {
+        JceScene *ui_scene = jce_state_get_scene();
+        if (ui_scene) {
+            uint16_t ui_view = postfx_composited
+                ? (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 22)
+                : (uint16_t)(scene_view_id() + 17);
+            uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
+            jce_ui_canvas_render(s_sr.ui_canvas, ui_scene, ui_view, ui_fb,
+                                 (float)width, (float)height, NULL, dt_sec);
+        }
+    }
+
     /* TAA end-of-frame: record the UN-JITTERED camera for next frame's
        reproject and DISABLE TAA on the shared pipeline so it never leaks into
        the pick / preview / thumbnail postfx invocations.  Self-no-ops when
@@ -1095,20 +1205,30 @@ bool jce_editor_scene_render_screenshot(const char *path)
 {
     if (!s_sr.initialized || !path || !path[0] || !s_sr.scene_renderer)
         return false;
-    /* Headless-capable capture: read back the LDR postfx OUTPUT texture (the exact
-     * image the Scene View displays) via blit + bgfx_read_texture.  This needs NO
-     * foreground present (unlike bgfx_request_screen_shot, which never fires for a
-     * background window), so it works for autonomous/headless capture.  The blit
-     * view sorts after the postfx pass so it reads this frame's composited pixels.
-     * Poll jce_editor_scene_render_capture_poll() each frame until it completes. */
-    JcePostFXPipeline *pf = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
-    if (!pf) return false;
-    JceTextureHandle out = jce_postfx_get_output(pf);
-    if (out.idx == UINT16_MAX || s_cap_w == 0 || s_cap_h == 0)
+    /* Headless-capable capture: read back the texture the Scene View displays
+     * via blit + bgfx_read_texture.  This needs NO foreground present (unlike
+     * bgfx_request_screen_shot, which never fires for a background window), so
+     * it works for autonomous/headless capture.  With PostFX active the final
+     * frame lives in the BRIDGE (postfx output + canvas UI composited back,
+     * see the render loop); without PostFX the bridge holds it directly —
+     * either way the bridge is the display source.  Poll
+     * jce_editor_scene_render_capture_poll() each frame until it completes. */
+    if (s_cap_w == 0 || s_cap_h == 0)
         return false;
-    uint16_t blit_view = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 8);
-    return jce_renderer_readback_capture_submit(out.idx, blit_view,
-                                                s_cap_w, s_cap_h, path);
+    uint16_t source = s_sr.postfx_output_tex;
+    int yflip = 1;   /* postfx RT reads back bottom-up on every backend */
+    if (source == UINT16_MAX) {
+        source = jce_offscreen_target_get_color_texture(s_sr.bridge);
+        yflip = jce_renderer_origin_bottom_left() ? 1 : 0;
+    }
+    if (source == UINT16_MAX)
+        return false;
+    /* +24: after the postfx chain (+18 worst case), the postfx→bridge
+     * composite (+21) and the canvas-UI overlay (+22), so the readback sees
+     * the fully composited frame of the SAME bgfx frame. */
+    uint16_t blit_view = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 24);
+    return jce_renderer_readback_capture_submit(source, blit_view,
+                                                s_cap_w, s_cap_h, path, yflip);
 }
 
 /* Pump the in-flight read-back capture (no-op when idle).  Call once per frame. */

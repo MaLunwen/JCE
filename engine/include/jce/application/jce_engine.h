@@ -24,6 +24,8 @@ typedef enum JceAppResult {
 typedef struct JceEngine       JceEngine;
 typedef struct JceAppDesc      JceAppDesc;
 typedef struct JceInputActions JceInputActions;
+struct JceConfig;
+struct JceRenderer;
 
 /* Register the application descriptor (IApp callbacks).
    Must be called before jce_engine_create().
@@ -96,6 +98,29 @@ JCE_API void *JCE_CALL jce_engine_get_bundle_catalog(JceEngine *e);
  * <jce/os/platform/jce_input_actions.h> instead of raw scancodes.  The
  * same handle is also exposed through JceServices.actions. */
 JCE_API JceInputActions *JCE_CALL jce_engine_get_actions(JceEngine *e);
+
+/* ---- In-game graphics persistence (settings S7 follow-up) ------- */
+
+/* Layer the jce.ini [graphics] section onto the live render pipeline:
+ * named quality preset first, then the individual toggles — the same
+ * precedence as the in-game settings screen's Apply.  Strict no-op when
+ * the config carries no [graphics] section (cfg->gfx_valid false).  The
+ * engine calls this right after the boot render-pipeline resolution;
+ * jce_default_main calls it again after apply_boot_mounted re-resolves a
+ * packed .rp.json, so the player's saved choices (layer 4, USER CONFIG)
+ * stay on top of the asset (layer 3).  `renderer` may be NULL (skips the
+ * live MSAA reset). */
+JCE_API void JCE_CALL jce_engine_apply_graphics_config(
+        const struct JceConfig *cfg, struct JceRenderer *renderer);
+
+/* ---- Programmatic quit ------------------------------------------ */
+
+/* Ask the main loop to exit cleanly on the next frame (same path as the
+ * window close button, including the WILL_QUIT lifecycle event).  Safe to
+ * call from anywhere on the main thread; used by the default_main runtime
+ * presets (hold ESC 2s) and available to any app/driver code. */
+JCE_API void JCE_CALL jce_engine_request_quit(void);
+JCE_API bool JCE_CALL jce_engine_quit_requested(void);
 
 JCE_EXTERN_C_END
 

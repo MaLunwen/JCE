@@ -58,6 +58,20 @@ typedef struct {
     uint32_t     *lod_indices[JCE_GLTF_MAX_LOD];
     uint32_t      lod_num_indices[JCE_GLTF_MAX_LOD];
     uint32_t      lod_count;
+    /* Nanite-lite V1: meshlet sidecar parsed from the JCE_meshlets primitive
+     * extension — a meshlet-GROUPED index buffer (each cluster's triangles
+     * contiguous, global vertex ids → standard vertex fetch) + per-meshlet
+     * {index_offset, index_count} descriptors and {sphere xyzr, cone axis+
+     * cutoff} bounds for the GPU cluster cull.  Empty (ml_count==0) for
+     * meshes cooked without meshlets.  Owned; freed in model_cpu_free. */
+    uint32_t     *ml_indices;      /* meshlet-grouped IB (global vertex ids) */
+    uint32_t      ml_num_indices;
+    uint32_t     *ml_desc;         /* 2 u32 per meshlet: index_offset, count */
+    float        *ml_bounds;       /* 8 f32 per meshlet: cx,cy,cz,r, ax,ay,az,cutoff */
+    float        *ml_errors;       /* 10 f32 per meshlet {own,parent, own-group
+                                    * sphere xyzr, parent-group sphere xyzr}
+                                    * or NULL (V3 cluster-LOD DAG)          */
+    uint32_t      ml_count;
 } JceModelPrimCpu;
 
 typedef struct {
@@ -447,6 +461,112 @@ static void build_primitive_lods(const cgltf_primitive *prim,
     }
 }
 
+/* ── Nanite-lite V1: parse the JCE_meshlets primitive extension ────────────
+ * The cook (or a hand-authored asset) emits on a primitive's "extensions":
+ *     {"JCE_meshlets":{"indices":A,"meshlets":B,"bounds":C}}
+ * where A = SCALAR u32 accessor holding the meshlet-GROUPED index buffer
+ * (every cluster's triangles contiguous, GLOBAL vertex ids so the standard
+ * vertex pipeline consumes it), B = SCALAR u32 accessor with 2 values per
+ * meshlet {index_offset, index_count}, C = SCALAR f32 accessor with 8 values
+ * per meshlet {sphere cx,cy,cz,r, cone ax,ay,az,cutoff} (meshopt cone
+ * convention: cullable when dot(center-cam, axis) >= cutoff*|center-cam|+r).
+ * Same tiny hand-parser as JCE_lod (cook-controlled object; no JSON dep). */
+static bool ml_read_key_int(const char *json, const char *key, long *out)
+{
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    p = strchr(p + strlen(key), ':');
+    if (!p) return false;
+    char *end = NULL;
+    long v = strtol(p + 1, &end, 10);
+    if (end == p + 1) return false;
+    *out = v;
+    return true;
+}
+
+static void build_primitive_meshlets(const cgltf_primitive *prim,
+                                     const cgltf_data *data,
+                                     uint32_t num_verts,
+                                     JceModelPrimCpu *out)
+{
+    if (!prim || !data || !out) return;
+    const char *json = NULL;
+    for (cgltf_size i = 0; i < prim->extensions_count; ++i) {
+        if (prim->extensions[i].name &&
+            strcmp(prim->extensions[i].name, "JCE_meshlets") == 0) {
+            json = prim->extensions[i].data;
+            break;
+        }
+    }
+    if (!json) return;
+
+    long ai = -1, bi = -1, ci = -1, ei = -1;
+    if (!ml_read_key_int(json, "\"indices\"", &ai) ||
+        !ml_read_key_int(json, "\"meshlets\"", &bi) ||
+        !ml_read_key_int(json, "\"bounds\"", &ci))
+        return;
+    if (ai < 0 || (cgltf_size)ai >= data->accessors_count ||
+        bi < 0 || (cgltf_size)bi >= data->accessors_count ||
+        ci < 0 || (cgltf_size)ci >= data->accessors_count)
+        return;
+    /* Optional V3 cluster-LOD-DAG errors accessor ({own,parent} pairs). */
+    if (!ml_read_key_int(json, "\"errors\"", &ei) ||
+        ei < 0 || (cgltf_size)ei >= data->accessors_count)
+        ei = -1;
+
+    const cgltf_accessor *A = &data->accessors[ai];
+    const cgltf_accessor *B = &data->accessors[bi];
+    const cgltf_accessor *C = &data->accessors[ci];
+    const cgltf_accessor *E = (ei >= 0) ? &data->accessors[ei] : NULL;
+    uint32_t nidx = (uint32_t)A->count;
+    uint32_t mcnt = (uint32_t)(B->count / 2u);
+    if (nidx < 3u || mcnt == 0u || (uint32_t)C->count != mcnt * 8u) return;
+    if (E && (uint32_t)E->count != mcnt * 10u) E = NULL;
+
+    uint32_t *idx    = (uint32_t *)JCE_MALLOC((size_t)nidx * sizeof(uint32_t));
+    uint32_t *desc   = (uint32_t *)JCE_MALLOC((size_t)mcnt * 2u * sizeof(uint32_t));
+    float    *bounds = (float *)JCE_MALLOC((size_t)mcnt * 8u * sizeof(float));
+    float    *errs   = E ? (float *)JCE_MALLOC((size_t)mcnt * 10u * sizeof(float))
+                         : NULL;
+    if (!idx || !desc || !bounds || (E && !errs)) goto fail;
+
+    for (uint32_t i = 0; i < nidx; ++i) {
+        uint32_t v = (uint32_t)cgltf_accessor_read_index(A, i);
+        if (v >= num_verts) goto fail;   /* must address the base VB */
+        idx[i] = v;
+    }
+    for (uint32_t i = 0; i < mcnt * 2u; ++i)
+        desc[i] = (uint32_t)cgltf_accessor_read_index(B, i);
+    for (uint32_t i = 0; i < mcnt * 8u; ++i) {
+        cgltf_float f = 0.0f;
+        cgltf_accessor_read_float(C, i, &f, 1);
+        bounds[i] = (float)f;
+    }
+    if (errs) {
+        for (uint32_t i = 0; i < mcnt * 10u; ++i) {
+            cgltf_float f = 0.0f;
+            cgltf_accessor_read_float(E, i, &f, 1);
+            errs[i] = (float)f;
+        }
+    }
+    /* Descriptor sanity: every cluster range inside the meshlet IB. */
+    for (uint32_t m = 0; m < mcnt; ++m)
+        if ((uint64_t)desc[m * 2u] + desc[m * 2u + 1u] > nidx) goto fail;
+
+    out->ml_indices     = idx;
+    out->ml_num_indices = nidx;
+    out->ml_desc        = desc;
+    out->ml_bounds      = bounds;
+    out->ml_errors      = errs;
+    out->ml_count       = mcnt;
+    return;
+fail:
+    if (idx)    JCE_FREE(idx);
+    if (desc)   JCE_FREE(desc);
+    if (bounds) JCE_FREE(bounds);
+    if (errs)   JCE_FREE(errs);
+}
+
 /* Find an attribute accessor by type within a primitive. */
 static const cgltf_accessor *find_attribute(const cgltf_primitive *prim,
                                              cgltf_attribute_type type,
@@ -591,6 +711,7 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
     /* In-asset auto-LOD (P1 #6): parse the JCE_lod extension's reduced index
      * accessors.  No-op for meshes cooked without LODs. */
     build_primitive_lods(prim, data, num_verts, out);
+    build_primitive_meshlets(prim, data, num_verts, out);   /* Nanite-lite V1 */
 
     /* Morph targets / blendshapes (FEATURE 3.1): read POSITION (+NORMAL) deltas
      * per target and seed the base weights.  No-op when the primitive has no
@@ -1514,6 +1635,14 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                                         dp->skinned_mesh,
                                         sp->lod_indices[li],
                                         sp->lod_num_indices[li]);
+                                /* Nanite-lite V1: meshlet sidecar (static
+                                 * prims only, mirrors the LOD upload). */
+                                if (sp->ml_count)
+                                    jce_skinned_mesh_set_meshlets(
+                                        dp->skinned_mesh,
+                                        sp->ml_indices, sp->ml_num_indices,
+                                        sp->ml_desc, sp->ml_bounds,
+                                        sp->ml_errors, sp->ml_count);
                             }
                         }
                     }
@@ -1564,6 +1693,10 @@ void jce_gltf_model_cpu_free(JceModelCpu *cpu)
                     for (uint32_t li = 0; li < nd->prims[p].lod_count; ++li)
                         if (nd->prims[p].lod_indices[li])
                             JCE_FREE(nd->prims[p].lod_indices[li]);
+                    if (nd->prims[p].ml_indices) JCE_FREE(nd->prims[p].ml_indices);
+                    if (nd->prims[p].ml_desc)    JCE_FREE(nd->prims[p].ml_desc);
+                    if (nd->prims[p].ml_bounds)  JCE_FREE(nd->prims[p].ml_bounds);
+                    if (nd->prims[p].ml_errors)  JCE_FREE(nd->prims[p].ml_errors);
                     if (nd->prims[p].morph)
                         jce_morph_data_destroy(nd->prims[p].morph);
                 }

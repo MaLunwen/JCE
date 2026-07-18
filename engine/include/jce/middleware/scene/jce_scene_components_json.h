@@ -17,6 +17,8 @@
 
 JCE_EXTERN_C_BEGIN
 
+typedef struct JceFileSystem JceFileSystem;
+
 /* Public API uses the JceJson facade to avoid leaking <cjson/cJSON.h>
  * from this header.  JceJson is binary-compatible with cJSON, so existing
  * .c TUs that still include cjson directly keep compiling unchanged. */
@@ -112,9 +114,14 @@ JCE_API JceJson *jce_scene_save_subtree_json(const JceScene *scene, JceEntity ro
 
 /* Set the base directory used to resolve sibling material references
  * during the next jce_scene_load_json() call.
- * Pass NULL to clear. The resource-layer wrapper sets this around its
- * VFS loads; runtime PAK loads typically leave it empty. */
+ * Pass NULL to clear. The resource-layer wrapper sets this around both
+ * host-file and VFS loads. */
 JCE_API void jce_scene_serial_set_base_dir(const char *dir);
+
+/* Set the asset filesystem used while the current thread parses scene JSON.
+ * Pass NULL for host-file parsing. The context is thread-local so async scene
+ * work cannot overwrite another scene's relative asset resolution. */
+JCE_API void jce_scene_serial_set_asset_vfs(const JceFileSystem *fs);
 
 JCE_EXTERN_C_END
 

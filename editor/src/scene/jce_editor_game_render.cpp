@@ -30,6 +30,7 @@ extern "C" {
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/application/jce_runtime.h>  /* UI widget → script dispatch in Play */
@@ -59,6 +60,8 @@ struct GameRenderState {
     JceCamera             *camera            = nullptr;
     JcePostFXPipeline     *postfx            = nullptr;  /* game-view own pipeline */
     uint16_t               postfx_output_tex = UINT16_MAX;
+    uint16_t               render_width      = 0;
+    uint16_t               render_height     = 0;
 
     /* GPU-query occlusion culler (Play / game-view).  The game view shares the
      * ENGINE scene renderer with the scene view but renders in its own pass with
@@ -196,6 +199,7 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
             oc_shaders.color.idx = ch.idx;
 
             JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+            oc_cfg.query_pool_share_count = 2;
             /* Distinct proxy view from the scene-view culler (254) so both can
              * run in the same bgfx frame without clobbering each other. */
             oc_cfg.view_id = 253;
@@ -207,6 +211,21 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
     }
 
     return true;
+}
+
+void jce_editor_game_render_reset_occlusion(void)
+{
+    /* See jce_editor_scene_render_reset_occlusion: the game-view culler is
+     * keyed by entity id and must drop its slots whenever the ECS world is
+     * recreated (Play-stop snapshot restore), or recreated entities inherit
+     * dead cull verdicts and the query pool leaks across Play sessions. */
+    if (g.occlusion_culler)
+        jce_occlusion_culler_reset(g.occlusion_culler);
+    /* The shared engine scene renderer's entity-keyed environment caches
+     * (foliage/grass/water/canopies) go stale on the same trigger — see
+     * jce_editor_scene_render_reset_occlusion.  Idempotent when the
+     * scene-view reset already ran. */
+    jce_scene_renderer_reset_entity_caches(jce_editor_get_scene_renderer());
 }
 
 void jce_editor_game_render_shutdown(void)
@@ -370,6 +389,36 @@ uint16_t jce_editor_game_render_get_texture(void)
     return jce_offscreen_target_get_color_texture(g.bridge);
 }
 
+bool jce_editor_game_render_screenshot(const char *path)
+{
+    if (!g.initialized || !g.bridge || !path || !path[0] ||
+        g.render_width == 0 || g.render_height == 0) {
+        return false;
+    }
+
+    uint16_t source = g.postfx_output_tex;
+    int yflip = 1;
+    if (source == UINT16_MAX) {
+        source = jce_offscreen_target_get_color_texture(g.bridge);
+        yflip = jce_renderer_origin_bottom_left() ? 1 : 0;
+    }
+    if (source == UINT16_MAX)
+        return false;
+
+    /* +24: after the postfx chain (+18 worst case), the postfx→bridge
+     * composite (+21) and the canvas-UI overlay (+22), so the readback sees
+     * the fully composited frame of the SAME bgfx frame. */
+    const uint16_t blit_view = static_cast<uint16_t>(
+        jce_offscreen_target_get_view_id(g.bridge) + JCE_VIEW_POST_BASE + 24u);
+    return jce_renderer_readback_capture_submit(
+        source, blit_view, g.render_width, g.render_height, path, yflip);
+}
+
+int jce_editor_game_render_capture_poll(void)
+{
+    return jce_renderer_readback_capture_poll();
+}
+
 void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 {
     if (!g.initialized || !g.renderer) return;
@@ -440,6 +489,26 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             jce_camera_third_person_follow(g.camera, player_pos);
     }
 
+    /* Resolve the authored scene camera after the Play runtime has stepped and
+     * before matrices are built.  The panel used to evaluate it after this
+     * render call, which made editor Play exactly one visual frame late. */
+    if (play_active) {
+        JceVcamOutput output;
+        bool has_vcam = false;
+        jce_vcam_system_evaluate(scene, frame_dt, &output, &has_vcam);
+        if (has_vcam) {
+            jce_camera_set_position(
+                g.camera, jce_v3(output.position[0], output.position[1],
+                                 output.position[2]));
+            jce_camera_look_at(
+                g.camera, jce_v3(output.target[0], output.target[1],
+                                 output.target[2]));
+            jce_camera_set_fov(g.camera, output.fov_deg);
+        }
+    } else {
+        jce_vcam_system_reset();
+    }
+
     float aspect = (float)width / (float)height;
     jce_mat4 view = jce_camera_view(g.camera);
     jce_mat4 proj = jce_camera_proj(g.camera, aspect, g.homogeneous_depth);
@@ -489,6 +558,8 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             "EditorGame")) {
         return;
     }
+    g.render_width = static_cast<uint16_t>(width);
+    g.render_height = static_cast<uint16_t>(height);
 
     /* GPU-upload any completed async mesh/texture loads before the engine
      * renderer queries them this frame. Previously only the Scene View did
@@ -559,6 +630,9 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
     /* SSR: reflect the bridge's lit color RT (gated on the scene's ssr_enabled). */
     cfg.ssr_color_tex_handle = jce_offscreen_target_get_color_texture(g.bridge);
+    /* GI L1: same lit RT feeds the dynamic probe gather (SSR-twin lesson —
+     * every cfg-dependent effect must be wired on BOTH editor render paths). */
+    cfg.gi_color_tex_handle = cfg.ssr_color_tex_handle;
 
     /* Focus-bounded entity collection ("draw distance"): only entities within
      * cull_radius (horizontal) of the play camera are collected, so every
@@ -688,16 +762,34 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         }
     }
 
+    /* Fold the tone-mapped PostFX output back into the bridge so the canvas
+     * UI (drawn next) lands AFTER post-fx — the shipped runtime's
+     * scene→postfx→UI compositing order.  The bridge then holds the final
+     * LDR frame, so display and deterministic captures read the bridge and
+     * match the standalone game pixel-for-pixel (modulo content).  The
+     * composite view sits past the postfx chain's worst case (+18). */
+    bool postfx_composited = false;
+    if (g.postfx_output_tex != UINT16_MAX) {
+        const uint16_t comp_view =
+            (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE + 21);
+        jce_offscreen_target_composite_texture(
+            g.bridge, comp_view, g.postfx_output_tex,
+            (uint16_t)width, (uint16_t)height,
+            jce_renderer_origin_bottom_left());
+        g.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
+        postfx_composited = true;
+    }
+
     /* ── ECS-UI (Canvas) overlay ────────────────────────────────────
      * Draw Canvas/UIImage/UIText/UIButton on top of the rendered game
-     * view, into the offscreen target's framebuffer.  Uses a dedicated
-     * view id (base+17) that sits after the scene color (base) and fog
-     * composite (base+16) but before the game-view PostFX range
-     * (base+JCE_VIEW_POST_BASE), so when PostFX is active the overlay is
-     * tone-mapped with the scene (a documented Overlay-mode limitation;
-     * an after-PostFX UI pass is future work). */
+     * view, into the offscreen target's framebuffer.  With PostFX active
+     * the overlay draws after the composite pass above (crisp, un-tonemapped
+     * UI, matching the runtime); without PostFX it draws right after the
+     * scene color (base) and fog composite (base+16). */
     if (g.ui_canvas && scene) {
-        uint16_t ui_view = (uint16_t)(GAME_VIEW_BASE + 17);
+        uint16_t ui_view = postfx_composited
+            ? (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE + 22)
+            : (uint16_t)(GAME_VIEW_BASE + 17);
         uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(g.bridge);
         const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,

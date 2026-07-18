@@ -166,6 +166,49 @@ static float heuristic(int ax, int az, int bx, int bz)
     return sqrtf(dx * dx + dz * dz);
 }
 
+/* rank-6: persistent A* scratch (Recast/Detour dtNodePool model).  The old path
+ * did 4 CALLOC (gscore/parent/closed/open) + an O(cells) memset + a 5th CALLOC
+ * (trail) per query, then freed all five — ~1.3 MB malloc+memset+free for a
+ * 256x256 grid PER FindPath, thrashing the allocator under crowd replanning.
+ * Instead keep the buffers resident (grown once to the largest grid seen) and
+ * reset per query with a generation token: a cell is "unseen" iff its stamp !=
+ * the current token, so the per-query reset is O(1) (a token bump) instead of
+ * O(cells) memset.  Single-threaded: the sole caller (jce_nav_agent) updates
+ * agents serially; parallel pathfinding would need one scratch per thread. */
+static float     *s_as_gscore;
+static int       *s_as_parent;
+static AStarOpen *s_as_open;
+static int       *s_as_trail;
+static uint32_t  *s_as_seen;     /* gscore/parent valid this query iff == s_as_token */
+static uint32_t  *s_as_closed;   /* closed this query iff == s_as_token            */
+static size_t     s_as_cap;      /* capacity in cells                              */
+static uint32_t   s_as_token;    /* per-query generation                           */
+
+static bool astar_scratch_ensure(size_t cells)
+{
+    if (cells <= s_as_cap && s_as_gscore) return true;
+    float     *ng = (float *)JCE_REALLOC(s_as_gscore, cells * sizeof(float));
+    int       *np = (int   *)JCE_REALLOC(s_as_parent, cells * sizeof(int));
+    AStarOpen *no = (AStarOpen *)JCE_REALLOC(s_as_open, cells * sizeof(AStarOpen));
+    int       *nt = (int   *)JCE_REALLOC(s_as_trail, cells * sizeof(int));
+    uint32_t  *ns = (uint32_t *)JCE_REALLOC(s_as_seen,   cells * sizeof(uint32_t));
+    uint32_t  *nc = (uint32_t *)JCE_REALLOC(s_as_closed, cells * sizeof(uint32_t));
+    if (ng) s_as_gscore = ng;
+    if (np) s_as_parent = np;
+    if (no) s_as_open   = no;
+    if (nt) s_as_trail  = nt;
+    if (ns) s_as_seen   = ns;
+    if (nc) s_as_closed = nc;
+    if (!ng || !np || !no || !nt || !ns || !nc) return false;
+    /* The grown stamp region must read as "older than any live token" — zero
+     * both stamp arrays and reset the token so no stale value aliases a mark. */
+    memset(s_as_seen,   0, cells * sizeof(uint32_t));
+    memset(s_as_closed, 0, cells * sizeof(uint32_t));
+    s_as_token = 0;
+    s_as_cap   = cells;
+    return true;
+}
+
 int jce_navmesh_find_path(const JceNavMesh *nm,
                           float sx, float sz, float gx, float gz,
                           float *out_xz, int max_points)
@@ -184,21 +227,23 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
     JCE_PROFILE_ZONE_N("NavMesh::FindPath");
 
     size_t cells = (size_t)nm->gx * (size_t)nm->gz;
-    float    *gscore  = (float *)JCE_CALLOC(cells, sizeof(float));
-    int      *parent  = (int   *)JCE_CALLOC(cells, sizeof(int));
-    uint8_t  *closed  = (uint8_t *)JCE_CALLOC(cells, 1);
-    AStarOpen *open    = (AStarOpen *)JCE_CALLOC(cells, sizeof(AStarOpen));
-    if (!gscore || !parent || !closed || !open) {
-        JCE_FREE(gscore); JCE_FREE(parent); JCE_FREE(closed); JCE_FREE(open);
-        JCE_PROFILE_ZONE_END;
-        return 0;
+    if (!astar_scratch_ensure(cells)) { JCE_PROFILE_ZONE_END; return 0; }
+    /* New query generation = O(1) reset of gscore/parent/closed.  On token wrap,
+     * clear the stamps once so a stale mark can't alias the fresh token. */
+    if (++s_as_token == 0) {
+        memset(s_as_seen,   0, s_as_cap * sizeof(uint32_t));
+        memset(s_as_closed, 0, s_as_cap * sizeof(uint32_t));
+        s_as_token = 1;
     }
-    for (size_t i = 0; i < cells; ++i) { gscore[i] = 1e30f; parent[i] = -1; }
+    const uint32_t tok = s_as_token;
+    float     *gscore = s_as_gscore;
+    int       *parent = s_as_parent;
+    AStarOpen *open   = s_as_open;
     int open_count = 0;
 
     int s_idx = s_cz * nm->gx + s_cx;
     int g_idx = g_cz * nm->gx + g_cx;
-    gscore[s_idx] = 0.0f;
+    gscore[s_idx] = 0.0f; parent[s_idx] = -1; s_as_seen[s_idx] = tok;
     AStarOpen start = { s_cx, s_cz, heuristic(s_cx, s_cz, g_cx, g_cz) };
     heap_push(open, &open_count, start);
 
@@ -208,19 +253,23 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
     while (open_count > 0) {
         AStarOpen cur = heap_pop(open, &open_count);
         int idx = cur.z * nm->gx + cur.x;
-        if (closed[idx]) continue;
-        closed[idx] = 1;
+        if (s_as_closed[idx] == tok) continue;        /* already expanded */
+        s_as_closed[idx] = tok;
         if (idx == g_idx) { found = true; break; }
         for (int k = 0; k < 8; ++k) {
             int nx = cur.x + dx[k], nz = cur.z + dz[k];
             if (nx < 0 || nz < 0 || nx >= nm->gx || nz >= nm->gz) continue;
             int nidx = nz * nm->gx + nx;
-            if (!nm->walkable[nidx] || closed[nidx]) continue;
+            if (!nm->walkable[nidx] || s_as_closed[nidx] == tok) continue;
             float step = (k < 4) ? 1.0f : 1.41421356f;
-            float tentative = gscore[idx] + step;
-            if (tentative < gscore[nidx]) {
+            float tentative = gscore[idx] + step;     /* idx is closed => seen => valid */
+            /* Unseen cells read as 1e30 (the old explicit init); seen ones use the
+             * stored gscore — identical A* relaxation, no per-query memset. */
+            float ngs = (s_as_seen[nidx] == tok) ? gscore[nidx] : 1e30f;
+            if (tentative < ngs) {
                 gscore[nidx] = tentative;
                 parent[nidx] = idx;
+                s_as_seen[nidx] = tok;
                 AStarOpen nxt = { nx, nz, tentative + heuristic(nx, nz, g_cx, g_cz) };
                 heap_push(open, &open_count, nxt);
             }
@@ -229,8 +278,10 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
 
     int written = 0;
     if (found) {
-        /* Reconstruct (in reverse) into a temp buffer, then emit forwards. */
-        int *trail = (int *)JCE_CALLOC(cells, sizeof(int));
+        /* Reconstruct (in reverse) into the persistent trail, then emit forwards.
+         * Every cell on the chain was stamped during the search, so parent[] is
+         * valid along it; the start's parent is -1 and terminates the walk. */
+        int *trail = s_as_trail;
         int  trail_n = 0;
         int  idx = g_idx;
         while (idx >= 0 && trail_n < (int)cells) {
@@ -252,10 +303,8 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
             out_xz[(written - 1) * 2 + 0] = gx;
             out_xz[(written - 1) * 2 + 1] = gz;
         }
-        JCE_FREE(trail);
     }
 
-    JCE_FREE(gscore); JCE_FREE(parent); JCE_FREE(closed); JCE_FREE(open);
     JCE_PROFILE_ZONE_END;
     return written;
 }

@@ -31,9 +31,10 @@ static const JceGuideBlock b_src[] = {
 
 /* ── Topic 2: Audio Mixer ───────────────────────────────────────────
  * Verified: editor/src/panels/jce_panel_audio_mixer.cpp (bus tree, volume
- * 0..1.5, M/S, add/remove group, save/reload, ~/.jce/audio_mixer.json,
- * rename popup is a stub), editor/src/core/jce_editor_play.cpp (config
- * consumed at Play start), jce_runtime.c rt_init_mixer/rt_apply_mixer. */
+ * 0..1.5, M/S, add/remove group, save/reload,
+ * <project>/Settings/audio_mixer.json, rename popup is a stub),
+ * editor/src/core/jce_editor_play.cpp (config consumed at Play start),
+ * jce_runtime.c rt_init_mixer/rt_apply_mixer. */
 static const JceGuideBlock b_mixer[] = {
     { JCE_GB_P,          "guide.audio.mixer.p1", 0, nullptr },
     { JCE_GB_OPEN_PANEL, "audioMixer.title",     JCE_PANEL_AUDIO_MIXER, "###audio_mixer" },

@@ -404,6 +404,24 @@ uint32_t jce_audio_mixer_send_count(const JceAudioMixer *m, JceAudioBusId src)
     return n;
 }
 
+bool jce_audio_mixer_send_at(const JceAudioMixer *m, JceAudioBusId src,
+                             uint32_t index, JceAudioBusId *out_dest,
+                             float *out_amount)
+{
+    if (!bus_valid(m, src)) return false;
+    const Bus *b = &m->buses[src];
+    uint32_t n = 0;
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i) {
+        if (b->sends[i].dest == JCE_AUDIO_BUS_INVALID) continue;
+        if (n++ == index) {
+            if (out_dest)   *out_dest   = b->sends[i].dest;
+            if (out_amount) *out_amount = b->sends[i].amount;
+            return true;
+        }
+    }
+    return false;
+}
+
 float jce_audio_mixer_resolve_send(const JceAudioMixer *m, JceAudioBusId src,
                                    JceAudioBusId dest)
 {

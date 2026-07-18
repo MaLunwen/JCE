@@ -260,6 +260,15 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     /* Per-instance-tint instanced variant (large-world-opt P1 #7):
        vs_pbr_inst_tint + fs_pbr_tint.  Optional; absent in older paks. */
     set.pbr_inst_tint  = load_program_named(pak, "pbr_inst_tint",  "pbr_tint");
+    /* Texture-diverse instanced variant (texture-array batcher):
+       vs_pbr_inst_tex_array + fs_pbr_inst_tex_array.  Optional; absent in older
+       paks and on essl1/GLES2 (excluded from the array-sampler allowlist). */
+    set.pbr_inst_tex_array = load_program_named(pak, "pbr_inst_tex_array", "pbr_inst_tex_array");
+    /* LOD cross-fade instanced variant (千万 ②): vs_pbr_inst_fade smuggles the
+       band-transition coverage in i_data3.w → fs_pbr_fade screen-door dithers.
+       Optional; absent → the LOD-in-cull draw falls back to pbr_inst (hard
+       band switches, still correct). */
+    set.pbr_inst_fade  = load_program_named(pak, "pbr_inst_fade",  "pbr_fade");
     /* Skinned variants share the fragment shader with their non-skinned
        counterpart: vs_pbr_skinned + fs_pbr, vs_shadow_skinned + fs_shadow. */
     set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
@@ -294,6 +303,10 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'pbr_inst' shader unavailable (GPU instancing disabled)");
     if (!jce_shader_valid(set.pbr_inst_tint))
         LOG_WARN(LOG_TAG, "'pbr_inst_tint' shader unavailable (per-instance tint batching disabled)");
+    if (!jce_shader_valid(set.pbr_inst_tex_array))
+        LOG_WARN(LOG_TAG, "'pbr_inst_tex_array' shader unavailable (texture-diverse instancing disabled)");
+    if (!jce_shader_valid(set.pbr_inst_fade))
+        LOG_WARN(LOG_TAG, "'pbr_inst_fade' shader unavailable (LOD cross-fade dither disabled)");
     if (!jce_shader_valid(set.pbr_skinned))
         LOG_WARN(LOG_TAG, "'pbr_skinned' shader unavailable");
     if (!jce_shader_valid(set.pbr_fwdplus))
@@ -345,6 +358,8 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
     set.pbr            = load_overlay(dev_dir, pak, "pbr",            "pbr");
     set.pbr_inst       = load_overlay(dev_dir, pak, "pbr_inst",       "pbr");
     set.pbr_inst_tint  = load_overlay(dev_dir, pak, "pbr_inst_tint",  "pbr_tint");
+    set.pbr_inst_tex_array = load_overlay(dev_dir, pak, "pbr_inst_tex_array", "pbr_inst_tex_array");
+    set.pbr_inst_fade  = load_overlay(dev_dir, pak, "pbr_inst_fade",  "pbr_fade");
     set.pbr_skinned    = load_overlay(dev_dir, pak, "pbr_skinned",    "pbr");
     set.pbr_fwdplus         = load_overlay(dev_dir, pak, "pbr",         "pbr_fwdplus");
     set.pbr_inst_fwdplus    = load_overlay(dev_dir, pak, "pbr_inst",    "pbr_fwdplus");

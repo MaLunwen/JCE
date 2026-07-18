@@ -652,6 +652,11 @@ JceInputActions *jce_actions_load_file(const char *path)
         int act = jce_json_get_int(root, "active_scheme", -1);
         if (act >= 0)
             jce_action_scheme_set_active(a, act);
+        /* Last-used-device auto-switch.  Applied AFTER set_active (which pins
+         * auto off); absent key keeps that pre-scheme_auto behavior so older
+         * files load unchanged. */
+        jce_action_scheme_set_auto(a,
+            jce_json_get_bool(root, "scheme_auto", jce_action_scheme_auto(a)));
     }
 
     jce_json_free(root);
@@ -732,6 +737,9 @@ bool jce_actions_save_file(const JceInputActions *a, const char *path)
         }
         if (a->active_scheme >= 0)
             jce_json_set_int(root, "active_scheme", a->active_scheme);
+        /* Auto-switch toggle: previously round-tripped through the live
+         * table only and silently reset on reload. */
+        jce_json_set_bool(root, "scheme_auto", a->auto_switch);
     }
 
     /* take_ownership=true: root is freed regardless of write success. */

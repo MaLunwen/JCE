@@ -168,10 +168,23 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
                                                      uint16_t view_id,
                                                      JceShaderHandle program);
 
+/* Bind-only (no submit) for an INSTANCED shadow draw: binds the mesh's VB +
+ * TRIANGLE index buffer + depth-only state; the caller then sets the
+ * per-instance data buffer and submits the instanced shadow program.  Triangle-
+ * only (no wireframe branch), matching jce_skinned_mesh_submit_shadow. */
+JCE_API void JCE_CALL jce_skinned_mesh_bind_shadow(const JceSkinnedMesh *mesh);
+
 /* Query whether this mesh has skinning data. */
 JCE_API bool     jce_skinned_mesh_is_skinned(const JceSkinnedMesh *mesh);
 JCE_API uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh);
 JCE_API uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh);
+
+/* Raw buffer handle idxs (mirror of jce_mesh_get_vbh/ibh) — lets a BIND-POSE
+ * skinned mesh ride the render-queue instancing paths as if static: its
+ * vertices are model-space, and the extra bone attributes in the VB are
+ * ignored by programs that don't read them.  UINT16_MAX when mesh is NULL. */
+JCE_API uint32_t jce_skinned_mesh_get_vbh(const JceSkinnedMesh *mesh);
+JCE_API uint32_t jce_skinned_mesh_get_ibh(const JceSkinnedMesh *mesh);
 
 /* ================================================================== */
 /* In-asset auto-LOD (large-world-opt P1 #6)                            */
@@ -194,6 +207,42 @@ JCE_API uint32_t jce_skinned_mesh_lod_count(const JceSkinnedMesh *mesh);
  * always quote a triangle figure. */
 JCE_API uint32_t jce_skinned_mesh_lod_index_count(const JceSkinnedMesh *mesh,
                                                   uint32_t level);
+
+/* Raw INDEX buffer handle idx of reduced LOD `level` (0-based: level 0 = first
+ * reduced level).  Shares the base VERTEX buffer (jce_skinned_mesh_get_vbh) —
+ * LODs differ only in the index set.  Returns the base ibh idx when `level` is
+ * out of range (or no LODs).  Pairs with jce_skinned_mesh_lod_index_count to
+ * drive a GPU-indirect per-LOD draw (千万 S4 LOD-in-cull) that binds the LOD
+ * index buffer without the per-instance submit path. */
+JCE_API uint32_t jce_skinned_mesh_lod_ibh(const JceSkinnedMesh *mesh,
+                                          uint32_t level);
+
+/* Nanite-lite V1/V3 meshlet sidecar: install/query the meshlet-grouped
+ * alternate index buffer (each cluster's triangles contiguous; shares the
+ * base VB) plus per-meshlet GPU cull records (6 vec4 each: {offset bits,
+ * count bits, 0, 0}, {sphere cx,cy,cz,r}, {cone axis xyz, cutoff — meshopt
+ * convention}, {own_error, parent_error, 0, 0}, {own-group sphere xyzr},
+ * {parent-group sphere xyzr}) uploaded as a static COMPUTE_READ buffer for
+ * the cluster-cull compute.  desc = 2 u32 per meshlet {index_offset,
+ * index_count}; bounds = 8 f32 per meshlet; errors = 10 f32 per meshlet
+ * {own_error, parent_error, own-group sphere xyzr, parent-group sphere
+ * xyzr} — errors in OBJECT units (V3 cluster-LOD DAG cut; the shared group
+ * spheres make a child's parent-test and its parent's own-test evaluate the
+ * identical (error, sphere) pair, so the cut is exactly complementary — no
+ * holes, no double-draw) or NULL — NULL marks every cluster {0, +BIG} =
+ * "leaf with no parent", which the cut always draws (plain V1 behaviour).
+ * Returns the installed count (0 = rejected).  Raw bgfx idx getters return
+ * UINT16_MAX when no sidecar. */
+JCE_API uint32_t jce_skinned_mesh_set_meshlets(JceSkinnedMesh *mesh,
+                                               const uint32_t *indices,
+                                               uint32_t num_indices,
+                                               const uint32_t *desc,
+                                               const float *bounds,
+                                               const float *errors,
+                                               uint32_t count);
+JCE_API uint32_t jce_skinned_mesh_meshlet_count(const JceSkinnedMesh *mesh);
+JCE_API uint32_t jce_skinned_mesh_meshlet_ibh(const JceSkinnedMesh *mesh);
+JCE_API uint32_t jce_skinned_mesh_meshlet_data_vb(const JceSkinnedMesh *mesh);
 
 /* Submit the mesh bound to reduced LOD `level` (0-based) instead of the base
  * index buffer.  level >= lod_count (or no LODs) falls through to

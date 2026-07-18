@@ -82,8 +82,21 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
          * maskless sequence is unchanged): keep with probability = mask cell. */
         if (have_mask) {
             const float mr = randf01(&state);
-            float u = rx * inv_ax + 0.5f;          /* candidate UV in the rect */
-            float v = rz * inv_az + 0.5f;
+            float u, v;
+            if (p->mask_world_size > 0.0f) {
+                /* World-space UV: (origin + candidate) mapped over the shared
+                 * mask square, so strips ringing a feature stay aligned.  The V
+                 * axis is FLIPPED to match the reference density read
+                 * (BiomeManager.getGrassDensity: pixelY = (1 - v) * height) so
+                 * the grass clearings line up with the paths/pond/models rather
+                 * than being Z-mirrored. */
+                const float inv_ws = 1.0f / p->mask_world_size;
+                u = (ox + rx) * inv_ws + 0.5f;
+                v = 1.0f - ((oz + rz) * inv_ws + 0.5f);
+            } else {
+                u = rx * inv_ax + 0.5f;            /* candidate UV in the rect */
+                v = rz * inv_az + 0.5f;
+            }
             int mx = (int)(u * (float)p->mask_dim);
             int mz = (int)(v * (float)p->mask_dim);
             if (mx < 0) mx = 0; else if (mx >= p->mask_dim) mx = p->mask_dim - 1;

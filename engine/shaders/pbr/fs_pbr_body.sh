@@ -78,7 +78,15 @@ uniform vec4 u_spotLights[16];
 uniform vec4 u_lightCounts;
 
 // Texture samplers
+#ifdef JCE_TEX_ARRAY
+// Texture-diverse instancing: the albedo slot is a 2D-array; each instance
+// samples its own layer via v_layer (mirrors the JCE_RENDER_COOKIE_2D_ARRAY
+// pattern). essl1/GLES2 is excluded from this program (no sampler2DArray), so
+// LOW/WebGL1 falls back to the non-array PBR path.
+SAMPLER2DARRAY(s_albedo, 0);
+#else
 SAMPLER2D(s_albedo,     0);
+#endif
 SAMPLER2D(s_metalRough, 1);
 SAMPLER2D(s_normalMap,  2);
 SAMPLER2D(s_aoMap,      3);
@@ -115,8 +123,12 @@ uniform vec4 u_iblParams;
 // the nearest baked LightProbeGroup. Reconstructed per-fragment and added
 // to the diffuse ambient when u_giParams.x > 0.5.
 uniform vec4 u_sh9[9];
-// u_giParams.x = SH9 ambient enabled (0/1)
+// u_giParams.x = SH9 ambient enabled (0/1) — REPLACES the irradiance source
+//                (baked LightProbeGroup semantics: the bake IS the ambient)
 // u_giParams.y = reflection-probe intensity (scales probe specular/diffuse)
+// u_giParams.z = dynamic-GI additive SH9 (GI L1): u_sh9 holds a runtime
+//                single-bounce estimate that ADDS to the normal ambient
+//                instead of replacing it.  0 (every legacy path) = inert.
 uniform vec4 u_giParams;
 
 // Screen-space AO (SSAO).  x = enabled (>0.5), yz = 1/screenWidth, 1/screenHeight
@@ -621,6 +633,24 @@ bool jce_lod_fade_discard(vec2 fragCoord)
 
 void main()
 {
+#ifdef JCE_FADE_DITHER
+    /* LOD cross-fade screen-door (千万 ②): v_tint.a = +f (primary band copy,
+     * keep where ign < f) / -f (next-band complement, keep where ign >= f) /
+     * 1.0 (solid — the common fast path, no discard).  Interleaved gradient
+     * noise gives the two copies EXACTLY complementary pixel subsets, so a
+     * band transition dissolves instead of popping.  Compiled ONLY into
+     * fs_pbr_fade (vs_pbr_inst_fade pair); every other pbr program is
+     * byte-identical. */
+    {
+        float _fade = v_tint.a;
+        if (_fade < 0.999) {
+            float _ign = fract(52.9829189 * fract(0.06711056 * gl_FragCoord.x
+                                                + 0.00583715 * gl_FragCoord.y));
+            bool _keep = (_fade >= 0.0) ? (_ign < _fade) : (_ign >= -_fade);
+            if (!_keep) discard;
+        }
+    }
+#endif
     // --- Shadow calculation ---
     float shadow = 1.0;
     float shadowDirSlot = u_lightCounts.w;
@@ -629,9 +659,18 @@ void main()
                                           vec3(0.0, 1.0, 0.0));
     vec3 baseNormal = normalize(v_normal);
 
-    if (u_normalScale.y > 0.0 && !gl_FrontFacing)
+    if (u_normalScale.y > 0.0)
     {
-        baseNormal = -baseNormal;
+        // Two-sided: orient the shading normal toward the viewer with a
+        // half-space test against the view ray.  gl_FrontFacing here is
+        // winding- AND backend-dependent (bgfx's default front face + D3D
+        // SV_IsFrontFace disagree with GL for identical content): an
+        // up-facing double-sided quad passed !gl_FrontFacing on its VISIBLE
+        // side, shaded as its back face (N flipped away from the sun) and
+        // rendered dark regardless of texture or lights.
+        vec3 dsToCam = u_cameraPos.xyz - v_worldpos;
+        if (dot(baseNormal, dsToCam) < 0.0)
+            baseNormal = -baseNormal;
     }
 
     bool shadowEnabled = (shadowDirSlot > 0.5) &&
@@ -696,6 +735,31 @@ void main()
                     if (next_shadow >= 0.0)
                         shadow = mix(shadow, next_shadow, blend);
                 }
+            }
+        }
+
+        // Cascade SQUARE-EDGE blend (complements the depth-split blend above,
+        // which only helps along the view-depth axis): with a coplanar
+        // mega-caster (e.g. a flat ground plane toggled to cast shadows),
+        // each cascade's bias balances its own texel size, but that balance
+        // is DISCONTINUOUS across the light-space square's XY edge — a
+        // straight knife-line step across receivers at every cascade seam.
+        // Cross-fade to the next cascade over the outer 8% of the square.
+        if (shadow >= 0.0 && cascade < 3)
+        {
+            vec4 edgeClip = csm_clip_for_cascade(cascade, v_worldpos);
+            vec2 edgeUv   = edgeClip.xy / edgeClip.w * 0.5 + 0.5;
+            float sqEdge  = min(min(edgeUv.x, 1.0 - edgeUv.x),
+                                min(edgeUv.y, 1.0 - edgeUv.y));
+            if (sqEdge < 0.08)
+            {
+                float edge_shadow = sample_csm_shadow(cascade + 1,
+                                                      v_worldpos,
+                                                      baseNormal,
+                                                      toLightDir);
+                if (edge_shadow >= 0.0)
+                    shadow = mix(edge_shadow, shadow,
+                                 clamp(sqEdge / 0.08, 0.0, 1.0));
             }
         }
 
@@ -764,7 +828,13 @@ void main()
     // --- Base color ---
     // Base color texture is sRGB-encoded (glTF spec §5.19). Convert texture
     // to linear space FIRST, then multiply by the linear baseColorFactor.
+#ifdef JCE_TEX_ARRAY
+    // Texture-diverse instancing: the vertex shader packs this instance's albedo
+    // 2D-array layer into v_tint.x (the array variant carries no colour tint).
+    vec4 texColor = texture2DArray(s_albedo, vec3(v_texcoord0, v_tint.x));
+#else
     vec4 texColor = texture2D(s_albedo, v_texcoord0);
+#endif
     bool useCheckerFallback = (u_normalScale.x < 0.0);
     if (useCheckerFallback)
     {
@@ -1293,6 +1363,16 @@ void main()
         vec3 hemiColor = mix(u_lookHemiGround.xyz, skyAmbient, h);
         vec3 ambientColor = mix(skyAmbient, hemiColor, u_lookHemiGround.w);
         ambient = ambientColor * albedo * ao;
+    }
+
+    /* GI L1 (dynamic probes, u_giParams.z): ADD the runtime bounce estimate
+     * on top of whichever ambient path ran above — the dynamic SH is a
+     * single-bounce term, not a full ambient bake, so it must not replace
+     * the sky/IBL contribution.  Gated: every legacy caller uploads z=0. */
+    if (u_giParams.z > 0.5)
+    {
+        vec3 kD_dyn = vec3_splat(1.0 - metallic);
+        ambient += kD_dyn * sh9_irradiance(N) * albedo * ao;
     }
 
     // --- World-space rim / fresnel (stylized silhouette separation) ---

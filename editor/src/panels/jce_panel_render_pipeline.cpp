@@ -13,6 +13,7 @@
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -49,6 +50,17 @@ void jce_editor_panel_render_pipeline_content(void)
 {
     ensure_init();
 
+    /* One-time prefill of the last-used asset path (per-project; the store
+     * is inert until a project root is known, so the first draw can be too
+     * early to read from it). */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (!s_rp.asset_path[0])
+            jce_editor_pstate_get_str("rp.asset_path", s_rp.asset_path,
+                                      sizeof(s_rp.asset_path));
+    }
+
     char lbl[128];
     bool changed = false;
 
@@ -63,6 +75,7 @@ void jce_editor_panel_render_pipeline_content(void)
             if (jce_render_pipeline_save(s_rp.asset_path, &s_rp.desc)) {
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg),
                          jce_editor_i18n("panel.render_pipeline.status.saved"), s_rp.asset_path);
+                jce_editor_pstate_set_str("rp.asset_path", s_rp.asset_path);
             } else {
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "%s", jce_editor_i18n("panel.render_pipeline.status.saveFailed"));
             }
@@ -74,6 +87,7 @@ void jce_editor_panel_render_pipeline_content(void)
                 jce_render_pipeline_apply(&s_rp.desc);
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg),
                          jce_editor_i18n("panel.render_pipeline.status.loaded"), s_rp.asset_path);
+                jce_editor_pstate_set_str("rp.asset_path", s_rp.asset_path);
             } else {
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "%s", jce_editor_i18n("panel.render_pipeline.status.loadFailed"));
             }
@@ -253,6 +267,57 @@ void jce_editor_panel_render_pipeline_content(void)
         changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.format.depth_prepass"),
             &s_rp.desc.depth_prepass);
+    }
+    ImGui::PopStyleColor();
+
+    /* ── Performance (settings S3/S4) ────────────────────────────────
+     * Each engine perf path is a tri-state: Auto (the tier preset's built-in
+     * default), On (force), Off (force).  Serialized into the .rp.json 'perf'
+     * object; a shipped game consumes the same field.  Human-readable feature
+     * descriptions live here (dev-facing panel; not localized). */
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (ImGui::CollapsingHeader(
+            jce_editor_i18n("panel.render_pipeline.section.performance"))) {
+        static const char *kTri[] = { "Auto", "On", "Off" };
+        struct PerfRow { JceRpPerfFeature f; const char *label; const char *tip; };
+        static const PerfRow kRows[] = {
+            { JCE_RP_PERF_PRIM_INSTANCE,   "Primitive instancing",
+              "Batch factor-only shape primitives into instanced draws." },
+            { JCE_RP_PERF_TEX_INSTANCE,    "Texture-array instancing",
+              "Batch same-mesh entities with per-instance albedo textures." },
+            { JCE_RP_PERF_DRAWCMD_CACHE,   "Draw-command cache",
+              "Persist built draw commands across frames for static entities." },
+            { JCE_RP_PERF_PARALLEL_GATHER, "Parallel color gather",
+              "Build materials on worker threads (mutually exclusive with the "
+              "instancing batchers; helps non-instanceable content)." },
+            { JCE_RP_PERF_PARALLEL_SUBMIT, "Parallel submit",
+              "Record draw calls across multiple bgfx encoders (multi-core)." },
+            { JCE_RP_PERF_HIZ_OCCLUSION,   "Hi-Z occlusion",
+              "GPU depth-pyramid occlusion cull (wins only in heavy occlusion)." },
+            { JCE_RP_PERF_GPU_SCENE,       "GPU-driven scene",
+              "Compute-shader frustum cull + indirect draw for instanced meshes." },
+            { JCE_RP_PERF_FOLIAGE_GPU_CULL,"Foliage GPU cull",
+              "Compute cull for the vegetation-scatter path (HIGH tier)." },
+            { JCE_RP_PERF_CROWD_INSTANCE,  "Crowd instancing",
+              "GPU skinning of animated crowds (color/shadow/velocity)." },
+        };
+        for (const PerfRow &row : kRows) {
+            int8_t v = s_rp.desc.perf[row.f];
+            int idx = (v < 0) ? 0 : (v ? 1 : 2);   /* auto/on/off */
+            char id[64];
+            snprintf(id, sizeof(id), "##perf_%s",
+                     jce_render_pipeline_perf_name(row.f));
+            ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::Combo(id, &idx, kTri, 3)) {
+                s_rp.desc.perf[row.f] =
+                    (idx == 0) ? JCE_RP_AUTO : (int8_t)(idx == 1 ? 1 : 0);
+                changed = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(row.label);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", row.tip);
+        }
     }
     ImGui::PopStyleColor();
 

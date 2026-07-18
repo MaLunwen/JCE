@@ -13,6 +13,8 @@ extern "C" {
 #endif
 
 #include <jce/runtime/jce_coroutine.h>
+#include <jce/runtime/jce_ai_scene_director.h>
+#include <jce/runtime/jce_scene_generation.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/runtime/jce_player_loop.h>
 

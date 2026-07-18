@@ -27,7 +27,14 @@ extern "C" {
 
 #define LOG_TAG       "jce_editor_rec"
 #define VID_QUEUE_MAX 12
-#define AUD_QUEUE_MAX 96
+/* Audio chunks are tiny (~4 KB each, ~100/s from WASAPI loopback); a deep
+   queue costs little and absorbs any encoder stall (a heavy VP9 keyframe)
+   without dropping ~5 s of audio. */
+#define AUD_QUEUE_MAX 512
+/* Cap on audio held before the encoder exists (see rec_worker): bounds the
+   pre-first-video-frame hold so a video stream that never starts can't grow
+   it without bound.  ~5 s at 100 chunks/s. */
+#define AUD_PREROLL_MAX 512
 
 namespace {
 
@@ -52,7 +59,7 @@ struct RecState {
     JceThread   *worker;
     uint64_t     start_ms;
 
-    uint32_t     vcaptured, vwritten, vdropped, adropped;
+    uint32_t     vcaptured, vwritten, vdropped, adropped, awritten;
 };
 
 RecState g;
@@ -138,6 +145,20 @@ void rec_worker(void *arg) {
        can measure the real capture fps from the timestamp delta before the
        encoder (which bakes fps into its keyframe interval) is created. */
     VidFrame *pending = nullptr;
+    /* Audio that arrives before the encoder exists (the encoder is created
+       lazily on the 2nd video frame so its fps is known) is HELD here, not
+       dropped, then flushed once the encoder is up — the muxer reorders by
+       timestamp, so pre-first-frame audio still lands correctly.  This is
+       what eliminates the "N audio dropped" at the start of every clip. */
+    AudChunk *pa_head = nullptr, *pa_tail = nullptr; uint32_t pa_n = 0;
+    auto flush_preroll_audio = [&](JceWebmEncoder *e) {
+        while (pa_head) {
+            AudChunk *c = pa_head; pa_head = c->next;
+            if (e) { jce_webm_encoder_push_audio(e, c->pcm, c->frames, c->ts_ms); g.awritten++; }
+            ED_FREE(c->pcm); ED_FREE(c);
+        }
+        pa_tail = nullptr; pa_n = 0;
+    };
     for (;;) {
         jce_mutex_lock(g.mtx);
         while (g.worker_run && !g.vhead && !g.ahead)
@@ -164,18 +185,29 @@ void rec_worker(void *arg) {
                                                       g.yflip, pending->ts_ms))
                     g.vwritten++;
                 ED_FREE(pending->bgra); ED_FREE(pending); pending = nullptr;
+                flush_preroll_audio(enc);   /* release audio held before enc */
             }
             if (enc && jce_webm_encoder_push_bgra(enc, vf->bgra, g.pitch, g.yflip, vf->ts_ms))
                 g.vwritten++;
             ED_FREE(vf->bgra); ED_FREE(vf);
         }
-        /* Audio (encoder now exists if any video has been seen; drop the few
-           audio chunks that precede the very first video frame). */
+        /* Audio: push once the encoder exists; before that, HOLD (not drop)
+           so the leading audio isn't lost — flushed by flush_preroll_audio
+           the moment the encoder is created above. */
         while (alist) {
             AudChunk *ac = alist; alist = ac->next;
-            if (enc) jce_webm_encoder_push_audio(enc, ac->pcm, ac->frames, ac->ts_ms);
-            else     g.adropped++;
-            ED_FREE(ac->pcm); ED_FREE(ac);
+            if (enc) {
+                jce_webm_encoder_push_audio(enc, ac->pcm, ac->frames, ac->ts_ms);
+                g.awritten++;
+                ED_FREE(ac->pcm); ED_FREE(ac);
+            } else if (pa_n < AUD_PREROLL_MAX) {
+                ac->next = nullptr;
+                if (pa_tail) pa_tail->next = ac; else pa_head = ac;
+                pa_tail = ac; pa_n++;
+            } else {
+                g.adropped++;   /* video never started: bounded safety drop */
+                ED_FREE(ac->pcm); ED_FREE(ac);
+            }
         }
 
         if (!run) {
@@ -198,6 +230,10 @@ void rec_worker(void *arg) {
             g.vwritten++;
         ED_FREE(pending->bgra); ED_FREE(pending); pending = nullptr;
     }
+    /* Flush any audio still held (single-frame clip, or a stream that ended
+       before its 2nd video frame).  Drops only when the encoder truly never
+       came up (no video at all). */
+    flush_preroll_audio(enc);
     if (enc) jce_webm_encoder_finish(enc);
 }
 
@@ -265,8 +301,8 @@ extern "C" void jce_editor_recorder_stop(void) {
 
     jce_cond_destroy(g.cond);
     jce_mutex_destroy(g.mtx);
-    LOG_SUCCESS(LOG_TAG, "stopped: %u video (%u dropped), %u audio dropped -> %s",
-                g.vwritten, g.vdropped, g.adropped, g.path);
+    LOG_SUCCESS(LOG_TAG, "stopped: %u video (%u dropped), %u audio (%u dropped) -> %s",
+                g.vwritten, g.vdropped, g.awritten, g.adropped, g.path);
 
     g.active = false;
     g.worker = nullptr; g.mtx = nullptr; g.cond = nullptr;

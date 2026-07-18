@@ -72,6 +72,11 @@ JCE_API bool JCE_CALL jce_render_settings_save_json(const char *vfs_path,
                                                     const JceRenderSettings *s);
 JCE_API bool JCE_CALL jce_render_settings_load_json(const char *vfs_path,
                                                     JceRenderSettings *out);
+/* Parse from an in-memory JSON buffer (single-exe: bytes decompressed from the
+ * embedded PAK).  `len` may be 0 to strlen(json).  Fills `out` defaults-first. */
+JCE_API bool JCE_CALL jce_render_settings_load_json_mem(const char *json,
+                                                        size_t len,
+                                                        JceRenderSettings *out);
 
 JCE_EXTERN_C_END
 

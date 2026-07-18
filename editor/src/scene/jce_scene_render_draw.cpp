@@ -1169,6 +1169,34 @@ void draw_selection_outlines(void)
             }
         }
 
+        /* --- Foliage clusters + grass fields: custom-drawn (no MeshRenderer),
+         *     so outline their ACTUAL spatial extent (shell sphere / area box)
+         *     instead of the tiny generic fallback box. Lets the artist select
+         *     and see the real bounds of leaves/grass in the viewport. */
+        if (!drew_shape && scene && jce_scene_has_foliage_cluster(scene, e)) {
+            JceFoliageClusterComponent *fc = jce_scene_get_foliage_cluster(scene, e);
+            if (fc) {
+                float r = fc->radius > 0.0f ? fc->radius : 1.0f;
+                /* Squashed shell: box half-extents (r, r*squashY, r). */
+                float sy = fc->squash_y > 0.0f ? fc->squash_y : 1.0f;
+                jce_debug_draw_box(t->position, jce_v3(r, r * sy, r),
+                                   t->rotation, col_outline);
+                jce_debug_draw_sphere(t->position, r * 0.5f, col_outline);
+                drew_shape = true;
+            }
+        }
+        if (!drew_shape && scene && jce_scene_has_grass_field(scene, e)) {
+            JceGrassFieldComponent *g = jce_scene_get_grass_field(scene, e);
+            if (g) {
+                float hx = 0.5f * (g->area_x > 0.0f ? g->area_x : 1.0f);
+                float hz = 0.5f * (g->area_z > 0.0f ? g->area_z : 1.0f);
+                float hy = 0.5f * (g->blade_height > 0.0f ? g->blade_height : 0.5f);
+                jce_debug_draw_box(t->position, jce_v3(hx, hy, hz),
+                                   t->rotation, col_outline);
+                drew_shape = true;
+            }
+        }
+
         /* --- Generic fallback for transform-only entities (empties,
          *     non-spatial audio sources, particle emitters, prefab
          *     roots …). */

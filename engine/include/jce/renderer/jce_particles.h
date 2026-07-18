@@ -66,6 +66,14 @@ typedef struct JceParticleEmitterDesc {
     float    emit_rate;           /* particles per second */
     float    emit_burst;          /* one-shot burst count (0 = disabled) */
 
+    /* Full-extent spawn box (metres) centred on the emitter origin: each
+     * new particle is born at origin + a uniform-random offset in
+     * [-spawn_box/2, +spawn_box/2] per axis.  Default {0,0,0} = point
+     * emitter (legacy behaviour, byte-identical).  Used for area effects
+     * such as rain / snow that fall uniformly across a region instead of
+     * fountaining out of a single point. */
+    jce_vec3 spawn_box;
+
     /* -- Lifetime ------------------------------------------------- */
     float    lifetime_min;        /* seconds (default: 1.0) */
     float    lifetime_max;        /* seconds (default: 2.0) */
@@ -103,6 +111,14 @@ typedef struct JceParticleEmitterDesc {
     float       velocity_scale_start; /* multiplier at birth  (default 1.0) */
     float       velocity_scale_end;   /* multiplier at death  (default 1.0) */
 
+    /* -- Velocity stretch (motion-aligned billboards) ------------- *
+     * Elongates each billboard ALONG its world velocity by roughly
+     * `velocity_stretch` seconds of travel (streak length ~= speed *
+     * velocity_stretch, in world units), giving rain / spark streaks
+     * instead of round dots.  0 (the default) keeps the classic
+     * view-aligned round sprite — byte-identical to before. */
+    float       velocity_stretch;
+
     /* -- Texture -------------------------------------------------- */
     JceTextureHandle texture;     /* billboard texture (INVALID = white) */
 
@@ -129,6 +145,11 @@ typedef struct JceParticleEmitterDesc {
 
     /* -- World / local space -------------------------------------- */
     bool     world_space;         /* true = particles ignore emitter movement */
+
+    /* -- Blending --------------------------------------------------
+     * true  = classic alpha blend (smoke / dust reads dark over bright);
+     * false = additive (fire / sparks / glows; the GPU path's default). */
+    bool     blend_alpha;
 
     /* -- Sub-emitters (FEATURE 8.2) -------------------------------- *
      * A child emitter description spawned at a parent particle's
@@ -182,6 +203,10 @@ JCE_API void jce_particles_emitter_stop(JceParticleSystem *sys, JceEmitterHandle
 void jce_particles_emitter_set_position(JceParticleSystem *sys,
                                         JceEmitterHandle emitter, jce_vec3 pos);
 
+/* Retint newly-spawned particles (RGB of start+end colors; alphas preserved). */
+JCE_API void jce_particles_emitter_set_color(JceParticleSystem *sys,
+                                             JceEmitterHandle emitter, jce_vec3 rgb);
+
 /* Fire a one-shot burst of count particles. */
 void jce_particles_emitter_burst(JceParticleSystem *sys,
                                  JceEmitterHandle emitter, uint32_t count);
@@ -227,6 +252,8 @@ typedef struct {
     jce_vec3 position;   /* world-space when emitter world_space, else local */
     jce_vec4 color;      /* current interpolated RGBA */
     float    size;       /* current interpolated billboard size */
+    jce_vec3 velocity;   /* current world (or local) linear velocity */
+    float    stretch;    /* emitter's velocity_stretch (motion-aligned streak) */
 
     /* Flipbook UV sub-rect (FEATURE 8.3).  The renderer remaps a quad's
      * [0,1] texcoords into this rect: uv' = uv_offset + uv * uv_scale.
@@ -271,6 +298,11 @@ JCE_API void jce_particles_desc_default(JceParticleEmitterDesc *out);
 JCE_API bool jce_particles_desc_load_json(const char *path,
                                           JceParticleEmitterDesc *out,
                                           char *texture_out, int texture_cap);
+/* Parse from an in-memory JSON buffer (single-exe: bytes decompressed from the
+ * embedded PAK).  `len` may be 0 to strlen(text).  Same defaults-first fill. */
+JCE_API bool jce_particles_desc_load_json_mem(const char *text, size_t len,
+                                              JceParticleEmitterDesc *out,
+                                              char *texture_out, int texture_cap);
 
 /* Release any loader-owned heap data attached to a desc by
  * jce_particles_desc_load_json — currently the nested sub-emitter child desc

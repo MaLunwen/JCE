@@ -13,11 +13,15 @@
 
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_perf_phase.h>
 
 #include "gizmo/jce_gizmo.h"
 #include "jce_editor_alloc.h"
 #include "jce_editor_config.h"
+#include "jce_editor_game_input_bridge.h"
+#include "jce_editor_project_state.h"
 #include "jce_editor_i18n.h"
+#include "jce_editor_kpi_game_capture.h"
 #include "ui/jce_editor_layout.h"
 #include "ui/jce_editor_panels.h"
 #include "jce_editor_state.h"
@@ -25,11 +29,15 @@
 #include "jce_project_settings.h"
 #include <jce/ui/jce_imgui_renderer.h>
 #include <jce/application/jce_screenshot.h>
-#include <bgfx/c99/bgfx.h>   /* bgfx_get_stats: draw-call KPI column */
+#include <jce/renderer/jce_renderer.h>
 #include "jce_build_manager.h"
 #include "jce_cook_manager.h"
 #include "jce_editor_recorder.h"
 #include "jce_run_manager.h"
+#include "io/jce_editor_json_reveal.h"   /* JCE_DBG_VIEWJSON QA hook */
+extern "C" {
+#include <jce/middleware/scene/jce_scene.h>   /* JCE_DBG_MOVE QA hook */
+}
 #include "panels/jce_panel_assets_thumb.h"
 #include "scene/jce_editor_game_render.h"
 #include "scene/jce_editor_scene_render.h"   /* renderer/model accessors for impostor bake */
@@ -38,9 +46,13 @@
 
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
+extern "C" void jce_editor_benchmark_run(int kind, int count);  /* Benchmark panel */
 extern "C" void jce_workspace_init(void);
 extern "C" void jce_editor_prefs_load_and_apply(void);
 extern "C" int  jce_editor_prefs_autosave_interval_sec(void);
+/* jce_panel_project_settings.cpp — per-project quality tier boot re-apply
+ * (settings-persistence audit, gap #14). */
+void jce_editor_quality_tier_boot_apply(void);
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -75,6 +87,7 @@ static struct {
     uint32_t    frame_kpi_index;
     uint32_t    frame_kpi_limit;
     bool        frame_kpi_shot_done; /* JCE_KPI_SHOT one-shot guard */
+    uint32_t    autoplay_frame;
 
     float       autosave_accum;   /* seconds since last autosave tick */
 } s_editor;
@@ -256,9 +269,11 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     io.ConfigDragClickToInputText = true;  /* single-click on DragFloat enters text-input mode */
 
     /* Ensure .jce config dir exists, then let ImGui persist layout/docking
-     * state there.  Anchor imgui.ini to the executable's .jce (launch dir),
-     * NOT CWD ($HOME on a Finder double-click).  Static buffer: ImGui keeps
-     * the IniFilename pointer for the program lifetime. */
+     * state there.  imgui.ini lives in the per-user config dir resolved by
+     * jce_editor_dotjce_path (~/.jce via SDL HOME; CWD-relative .jce only
+     * if HOME is unresolvable) alongside editor-preferences.json /
+     * editor-session.json.  Static buffer: ImGui keeps the IniFilename
+     * pointer for the program lifetime. */
     jce_editor_config_ensure_dir();
     static char s_imgui_ini[1024];
     jce_editor_dotjce_path("imgui.ini", s_imgui_ini, sizeof(s_imgui_ini));
@@ -295,11 +310,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
        default dark theme; this overrides if the user previously chose
        Light/SSMS so the saved preference takes effect at startup. */
     if (have_ecfg) {
-        int t = JCE_THEME_DARK;
-        if      (jce_strcasecmp(ecfg.theme, "Light") == 0) t = JCE_THEME_LIGHT;
-        else if (jce_strcasecmp(ecfg.theme, "SSMS")  == 0) t = JCE_THEME_SSMS;
-        else if (jce_strcasecmp(ecfg.theme, "Blue")  == 0) t = JCE_THEME_SSMS;
-        jce_editor_apply_theme(t);
+        jce_editor_apply_theme(jce_editor_theme_from_string(ecfg.theme));
     }
 
     /* Cursors. */
@@ -311,10 +322,13 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         return false;
     }
 
-    /* Load custom font (after bgfx backend is ready). */
+    /* Load custom font (after bgfx backend is ready).  Bounds match the
+     * canonical schema everywhere else: default 24 (jce_editor_config
+     * defaults) and the Preferences UI range 12..32 — boot used to accept
+     * 12..48 with a 14.0 fallback, silently disagreeing with both. */
     {
-        float fs = (ecfg.font_size >= 12 && ecfg.font_size <= 48)
-                       ? (float)ecfg.font_size : 14.0f;
+        float fs = (ecfg.font_size >= 12 && ecfg.font_size <= 32)
+                       ? (float)ecfg.font_size : 24.0f;
         jce_editor_load_fonts(pak, fs,
                               ecfg.font_en_path, ecfg.font_zh_path);
         /* Use ImGui 1.92 FontScaleMain (not legacy FontGlobalScale)
@@ -332,9 +346,30 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
      * restored just below, skip building the throwaway demo scene (it would
      * be destroyed milliseconds later) — keeps that churn off the
      * time-to-first-frame path. */
-    const bool will_restore =
-        have_ecfg && ecfg.last_scene_path[0] != '\0' &&
-        jce_fs_host_exists_file(ecfg.last_scene_path);
+    /* JCE_SCENE=<path> forces loading a specific scene headless, bypassing the
+     * last-scene restore — lets QA / profiling open any scene (e.g. a heavy
+     * streaming world) without touching the user's editor config.  Falls back to
+     * the normal last-scene restore when unset or the file is missing. */
+    const char *env_scene = getenv("JCE_SCENE");
+    /* Last-scene auto-restore honors Preferences > General > startup:
+     * only "Last scene" (0) reopens it.  "Empty" and "Show picker" used
+     * to reopen the last scene anyway — the pref only gated the Welcome
+     * dialog, never this restore.  JCE_SCENE (QA/profiling) always wins. */
+    const bool restore_last = have_ecfg && ecfg.startup_mode == 0;
+    const char *restore_path =
+        (env_scene && env_scene[0] && jce_fs_host_exists_file(env_scene))
+            ? env_scene
+        : (restore_last && ecfg.last_scene_path[0] != '\0' &&
+           jce_fs_host_exists_file(ecfg.last_scene_path))
+            ? ecfg.last_scene_path
+            : NULL;
+    /* JCE_STRESS_CUBES / JCE_STRESS_SKINNED force the built-in demo scene (which
+     * spawns the stress grid) for headless performance/limits testing, bypassing
+     * scene restore (otherwise the editor restores the last scene and the stress
+     * entities are never rendered — e.g. it silently falls back to meadow). */
+    const bool force_demo = (getenv("JCE_STRESS_CUBES") != NULL)
+                         || (getenv("JCE_STRESS_SKINNED") != NULL);
+    const bool will_restore = !force_demo && (restore_path != NULL);
     jce_editor_state_init(/*with_demo_scene=*/!will_restore);
     jce_editor_panels_init();
     jce_run_manager_init();
@@ -379,6 +414,29 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.frame_kpi_index = 0;
     s_editor.frame_kpi_limit = 0;
     s_editor.frame_kpi_shot_done = false;
+    s_editor.autoplay_frame = 0;
+
+    jce_editor_game_input_bridge_reset(
+        jce_editor_game_input_bridge_shared());
+    jce_editor_kpi_game_capture_global_disable();
+    {
+        const char *shots = getenv("JCE_KPI_GAME_SHOTS");
+        const char *size = getenv("JCE_KPI_GAME_CAPTURE_SIZE");
+        if ((shots && shots[0]) || (size && size[0])) {
+            char error[192] = {};
+            if (!shots || !shots[0] ||
+                !jce_editor_kpi_game_capture_global_configure(
+                    shots, size, error, sizeof(error))) {
+                LOG_ERROR(LOG_TAG, "Game View capture disabled: %s",
+                          error[0] ? error :
+                          "JCE_KPI_GAME_SHOTS is required");
+                jce_editor_kpi_game_capture_global_disable();
+            } else {
+                LOG_INFO(LOG_TAG,
+                         "deterministic Game View capture enabled");
+            }
+        }
+    }
 
     const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
@@ -411,7 +469,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
      * a "Loading scene…" overlay keeps the window responsive.  Small scenes
      * complete synchronously inside this call (no overlay). */
     if (will_restore) {
-        if (!jce_state_load_scene_file_async(ecfg.last_scene_path))
+        if (!jce_state_load_scene_file_async(restore_path))
             jce_state_new_default_scene();
     }
 
@@ -435,6 +493,10 @@ void jce_editor_shutdown(void)
             ImGui::SaveIniSettingsToDisk(io.IniFilename);
     }
 
+    /* Flush any config changes still inside the debounce window. */
+    jce_editor_config_flush_now();
+    jce_editor_pstate_flush_now();
+
     jce_gizmo_shutdown();
     jce_cook_manager_shutdown();
     jce_build_manager_shutdown();
@@ -444,6 +506,10 @@ void jce_editor_shutdown(void)
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
     jce_imgui_renderer_shutdown();
+
+    jce_editor_game_input_bridge_reset(
+        jce_editor_game_input_bridge_shared());
+    jce_editor_kpi_game_capture_global_disable();
 
     s_editor.frame_kpi_path[0] = '\0';
 
@@ -467,6 +533,9 @@ bool jce_editor_process_event(const JceEvent *event)
     ImGuiIO &io = ImGui::GetIO();
 
     if (!s_editor.active) return false;
+
+    jce_editor_game_input_bridge_handle_event(
+        jce_editor_game_input_bridge_shared(), event);
 
     /* When the Game View has captured the cursor (FPS-look mode using SDL
      * relative-mouse-mode), the OS still emits absolute MOUSE_MOTION events
@@ -586,6 +655,9 @@ void jce_editor_update(JceWindow *window)
      * Only when not in Play (don't bake play-time mutations into the file)
      * and the active scene is dirty + has a path.  The interval accumulates
      * regardless so a save fires every N seconds of edit-mode wall time. */
+    /* Rotate the perf-phase accumulators into the per-frame snapshot the
+     * Profiler panel reads (no-op while phase capture is disabled). */
+    jce_perf_phase_frame_tick();
     {
         const int interval = jce_editor_prefs_autosave_interval_sec();
         if (interval > 0 &&
@@ -595,13 +667,38 @@ void jce_editor_update(JceWindow *window)
                 s_editor.autosave_accum = 0.0f;
                 const char *sp = jce_state_get_current_scene_path();
                 if (sp && sp[0] && jce_state_is_scene_modified()) {
-                    if (jce_state_save_scene_file(sp))
+                    if (jce_state_save_scene_file_ex(sp, JCE_SAVE_AUTOSAVE))
                         LOG_INFO(LOG_TAG, "autosaved scene %s", sp);
                 }
             }
         } else {
             s_editor.autosave_accum = 0.0f;
         }
+    }
+
+    /* Debounced config flush: coalesces the ~30 load-modify-save sites'
+     * whole-file rewrites into one atomic write pair per quiet period. */
+    jce_editor_config_flush_tick(dt);
+    /* Same pump for the per-project editor state (<root>/.jce/
+     * editor-state.json); also follows project-root switches. */
+    jce_editor_pstate_flush_tick(dt);
+
+    /* One-shot: re-apply the quality tier the user last applied in Project
+     * Settings > Quality once the per-project store is live — strictly after
+     * editor_app_init's boot .rp.json / tier-preset resolution, so the
+     * persisted choice layers on top (settings-persistence audit, gap #14). */
+    jce_editor_quality_tier_boot_apply();
+
+    {
+        JceEditorKpiPlayState capture_play = JCE_EDITOR_KPI_PLAY_STOPPED;
+        const JcePlayState play = jce_state_get_play_state();
+        if (play == JCE_PLAY_PLAYING)
+            capture_play = JCE_EDITOR_KPI_PLAY_PLAYING;
+        else if (play == JCE_PLAY_PAUSED)
+            capture_play = JCE_EDITOR_KPI_PLAY_PAUSED;
+        jce_editor_kpi_game_capture_global_tick(capture_play, dt);
+        if (jce_editor_kpi_game_capture_global_needs_focus())
+            jce_editor_layout_request_focus_game_view();
     }
 
     /* Headless overview-capture hook (JCE_DBG_OVERVIEW=1): bring the Scene View
@@ -625,8 +722,9 @@ void jce_editor_update(JceWindow *window)
              * its stats block (numDraw) — the headline metric for batching
              * wins (e.g. per-instance-tint collapsing solo draws into one
              * instanced submit).  Appended as a third CSV column. */
-            const bgfx_stats_t *st = bgfx_get_stats();
-            uint32_t num_draw = st ? st->numDraw : 0u;
+            JceGpuStats gpu_stats{};
+            const uint32_t num_draw =
+                jce_renderer_get_gpu_stats(&gpu_stats) ? gpu_stats.num_draw : 0u;
             char kpi_line[80];
             int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f,%u\n",
                                    s_editor.frame_kpi_index, frame_ms, num_draw);
@@ -649,9 +747,21 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
-    /* Pump any in-flight headless self-capture readback (started by F12 / the
-       JCE_KPI_SHOT path via jce_editor_scene_render_screenshot); no-op when idle. */
-    jce_editor_scene_render_capture_poll();
+    /* The renderer owns one asynchronous readback slot.  Route completion to
+     * the submitting viewport so a Game View result cannot be consumed by the
+     * legacy Scene View poller. */
+    if (jce_editor_kpi_game_capture_global_in_flight()) {
+        const int result = jce_editor_game_render_capture_poll();
+        if (result == 1 || result == 2) {
+            jce_editor_kpi_game_capture_global_mark_complete(result == 1);
+            if (result == 1)
+                LOG_INFO(LOG_TAG, "Game View capture completed");
+            else
+                LOG_ERROR(LOG_TAG, "Game View capture write failed");
+        }
+    } else {
+        jce_editor_scene_render_capture_poll();
+    }
 
     /* Headless octahedral-impostor bake (JCE_IMPOSTOR_BAKE): reproducible,
      * window-driven GPU bake for tooling / dogfood / verification.  Format:
@@ -720,9 +830,72 @@ void jce_editor_update(JceWindow *window)
     /* Autonomous Play for gameplay verification (JCE_KPI_AUTOPLAY): enter Play
      * once the scene has settled (frame 30) so a later JCE_KPI_SHOT captures
      * live gameplay (scripts running, AI, HUD updating). */
-    if (s_editor.frame_kpi_index == 30 && getenv("JCE_KPI_AUTOPLAY") &&
+    if (getenv("JCE_KPI_AUTOPLAY") &&
         jce_state_get_play_state() == JCE_PLAY_STOPPED) {
-        jce_state_play();
+        if (++s_editor.autoplay_frame == 30u)
+            jce_state_play();
+    }
+
+    /* JCE_DBG_PLAY_STOP_AT=N — headless Play STOP at frame N (pairs with
+     * JCE_KPI_AUTOPLAY): reproduces the user flow "benchmark spawn -> Play ->
+     * stop -> quit" that the plain run-to-MAX_FRAMES exit path skips. */
+    {
+        static int s_stop_at = -2;
+        if (s_stop_at == -2) {
+            const char *v = getenv("JCE_DBG_PLAY_STOP_AT");
+            s_stop_at = v ? atoi(v) : -1;
+        }
+        static uint32_t s_stop_frame = 0;
+        if (s_stop_at > 0 &&
+            jce_state_get_play_state() == JCE_PLAY_PLAYING &&
+            (int)++s_stop_frame == s_stop_at)
+            jce_state_stop();
+    }
+
+    /* JCE_BENCH_AUTOSPAWN="kind,count" — headless trigger for the Performance
+     * Benchmark panel's spawn (same code path as the UI button), so the
+     * benchmark is runnable from the CLI for CI / QA.  One-shot after a few
+     * frames so the scene has loaded. */
+    {
+        static int  bench_frame = 0;
+        static bool bench_done  = false;
+        if (!bench_done) {
+            const char *e = getenv("JCE_BENCH_AUTOSPAWN");
+            if (!e) { bench_done = true; }
+            else if (++bench_frame >= 5) {
+                int k = 0, n = 0;
+                if (sscanf(e, "%d,%d", &k, &n) == 2 && n > 0) {
+                    jce_editor_benchmark_run(k, n);
+                    if (getenv("JCE_BENCH_ISOLATE")) jce_state_benchmark_isolate(1);
+                }
+                bench_done = true;
+            }
+        }
+    }
+
+    /* JCE_BENCH_AUTOCYCLE="kind,count" — headless stress of the benchmark
+     * spawn/clear path (a QA repro for the entity-mirror leak that crashed the
+     * hierarchy panel): every 25 frames, alternately spawn then clear, a few
+     * times.  With the hierarchy panel enumerating roots each frame, a leaked
+     * freed id surfaces immediately. */
+    {
+        static int cyc_frame = 0;
+        static int cyc_left  = -1;   /* spawn+clear half-steps remaining */
+        const char *e = getenv("JCE_BENCH_AUTOCYCLE");
+        if (e && cyc_left != 0) {
+            if (cyc_left < 0) cyc_left = 8;          /* 4 spawn/clear pairs */
+            if (++cyc_frame >= 25) {
+                cyc_frame = 0;
+                if (cyc_left & 1) {                  /* spawn on odd step */
+                    int k = 0, n = 0;
+                    if (sscanf(e, "%d,%d", &k, &n) == 2 && n > 0)
+                        jce_state_benchmark_spawn(k, n);
+                } else {
+                    jce_state_benchmark_clear();
+                }
+                --cyc_left;
+            }
+        }
     }
 
     /* Headless whole-window capture hook (JCE_WINCAP_FRAME=N + JCE_WINCAP_PATH):
@@ -749,6 +922,266 @@ void jce_editor_update(JceWindow *window)
             s_wincap_tick >= (uint32_t)s_wincap_frame) {
             jce_imgui_renderer_request_capture(s_wincap_path);
             s_wincap_done = true;
+        }
+    }
+
+    /* Headless "View in Scene JSON" hook (JCE_DBG_VIEWJSON="<entity>@<frame>"):
+       drives the hierarchy right-click reveal action without input — locates
+       the named entity's block in the scene file and opens the Code Viewer
+       there.  Pairs with JCE_WINCAP_* for autonomous visual QA of the code
+       viewer (jump highlight, JSON syntax colors, type badge). */
+    {
+        static int  s_vj_frame = -2;   /* -2 unparsed, -1 disabled/fired */
+        static char s_vj_name[JCE_MAX_ENTITY_NAME];
+        static uint32_t s_vj_tick = 0;
+        ++s_vj_tick;
+        if (s_vj_frame == -2) {
+            s_vj_frame = -1;
+            const char *v = getenv("JCE_DBG_VIEWJSON");
+            const char *at = v ? strrchr(v, '@') : NULL;
+            if (at && at > v) {
+                size_t n = (size_t)(at - v);
+                if (n >= sizeof(s_vj_name)) n = sizeof(s_vj_name) - 1;
+                memcpy(s_vj_name, v, n);
+                s_vj_name[n] = '\0';
+                s_vj_frame = atoi(at + 1);
+            }
+        }
+        if (s_vj_frame >= 0 && s_vj_tick >= (uint32_t)s_vj_frame) {
+            s_vj_frame = -1;
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count; i++) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *nm = jce_state_entity_name(id);
+                if (nm && strcmp(nm, s_vj_name) == 0) {
+                    jce_editor_reveal_entity_in_scene_json(id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Headless entity-select hook (JCE_DBG_SELECT="<entity>@<frame>"):
+       selects the named entity and focuses the Inspector — pairs with
+       JCE_WINCAP_* for autonomous visual QA of inspector sections. */
+    {
+        static int  s_sel_frame = -2;  /* -2 unparsed, -1 disabled/fired */
+        static char s_sel_name[JCE_MAX_ENTITY_NAME];
+        static uint32_t s_sel_tick = 0;
+        ++s_sel_tick;
+        if (s_sel_frame == -2) {
+            s_sel_frame = -1;
+            const char *v = getenv("JCE_DBG_SELECT");
+            const char *at = v ? strrchr(v, '@') : NULL;
+            if (at && at > v) {
+                size_t n = (size_t)(at - v);
+                if (n >= sizeof(s_sel_name)) n = sizeof(s_sel_name) - 1;
+                memcpy(s_sel_name, v, n);
+                s_sel_name[n] = '\0';
+                s_sel_frame = atoi(at + 1);
+            }
+        }
+        if (s_sel_frame >= 0 && s_sel_tick >= (uint32_t)s_sel_frame) {
+            s_sel_frame = -1;
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count; i++) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *nm = jce_state_entity_name(id);
+                if (nm && strcmp(nm, s_sel_name) == 0) {
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                    jce_editor_layout_request_focus_inspector();
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Headless undo hook (JCE_DBG_UNDO="<frame>"): fires jce_state_undo()
+       once at frame N — pairs with JCE_DBG_MOVE (which records an undo
+       snapshot) to reproduce edit→undo sequences without input. */
+    {
+        static int s_ud_frames[8];
+        static int s_ud_n = -1;        /* -1 unparsed */
+        static int s_ud_next = 0;
+        static uint32_t s_ud_tick = 0;
+        ++s_ud_tick;
+        if (s_ud_n == -1) {
+            s_ud_n = 0;
+            const char *v = getenv("JCE_DBG_UNDO");
+            while (v && *v && s_ud_n < 8) {
+                s_ud_frames[s_ud_n++] = atoi(v);
+                const char *c = strchr(v, ',');
+                v = c ? c + 1 : NULL;
+            }
+        }
+        if (s_ud_next < s_ud_n && s_ud_tick >= (uint32_t)s_ud_frames[s_ud_next]) {
+            s_ud_next++;
+            /* Probe: does the world recreate renumber ECS ids?  Track one
+             * known entity's u64 id across the undo (generation bits shift
+             * = every entity-keyed renderer cache slot goes stale). */
+            auto probe_ecs_id = [](const char *name) -> uint64_t {
+                int count = jce_state_get_entity_count();
+                for (int i = 0; i < count; i++) {
+                    uint32_t id = jce_state_get_entity_id_by_index(i);
+                    const char *nm = jce_state_entity_name(id);
+                    if (nm && strcmp(nm, name) == 0)
+                        return (uint64_t)jce_state_to_ecs_entity(id);
+                }
+                return 0;
+            };
+            uint64_t ecs_before = probe_ecs_id("GrassNW");
+            int before = jce_state_get_entity_count();
+            LOG_INFO(LOG_TAG, "[dbg-undo] firing jce_state_undo() (entities=%d)",
+                     before);
+            jce_state_undo();
+            uint64_t ecs_after = probe_ecs_id("GrassNW");
+            LOG_INFO(LOG_TAG, "[dbg-undo] done (entities=%d -> %d) "
+                     "GrassNW ecs id %llu -> %llu%s",
+                     before, jce_state_get_entity_count(),
+                     (unsigned long long)ecs_before,
+                     (unsigned long long)ecs_after,
+                     (ecs_before && ecs_before != ecs_after) ? " [SHIFTED]" : "");
+        }
+    }
+
+    /* Headless redo hook (JCE_DBG_REDO="<f1>,<f2>,..."): fires
+       jce_state_redo() at each listed frame — pairs with JCE_DBG_UNDO to
+       reproduce undo->redo sequences without input. */
+    {
+        static int s_rd_frames[8];
+        static int s_rd_n = -1;        /* -1 unparsed */
+        static int s_rd_next = 0;
+        static uint32_t s_rd_tick = 0;
+        ++s_rd_tick;
+        if (s_rd_n == -1) {
+            s_rd_n = 0;
+            const char *v = getenv("JCE_DBG_REDO");
+            while (v && *v && s_rd_n < 8) {
+                s_rd_frames[s_rd_n++] = atoi(v);
+                const char *c = strchr(v, ',');
+                v = c ? c + 1 : NULL;
+            }
+        }
+        if (s_rd_next < s_rd_n && s_rd_tick >= (uint32_t)s_rd_frames[s_rd_next]) {
+            s_rd_next++;
+            int before = jce_state_get_entity_count();
+            LOG_INFO(LOG_TAG, "[dbg-redo] firing jce_state_redo() (entities=%d)",
+                     before);
+            jce_state_redo();
+            LOG_INFO(LOG_TAG, "[dbg-redo] done (entities=%d -> %d)",
+                     before, jce_state_get_entity_count());
+        }
+    }
+
+    /* Headless delete hook (JCE_DBG_DELETE="<entity>@<frame>"): deletes the
+       named entity — repro tool for delete->undo sequences. */
+    {
+        static int  s_dl_frame = -2;
+        static char s_dl_name[JCE_MAX_ENTITY_NAME];
+        static uint32_t s_dl_tick = 0;
+        ++s_dl_tick;
+        if (s_dl_frame == -2) {
+            s_dl_frame = -1;
+            const char *v = getenv("JCE_DBG_DELETE");
+            const char *at = v ? strrchr(v, '@') : NULL;
+            if (at && at > v) {
+                size_t n = (size_t)(at - v);
+                if (n >= sizeof(s_dl_name)) n = sizeof(s_dl_name) - 1;
+                memcpy(s_dl_name, v, n);
+                s_dl_name[n] = 0;
+                s_dl_frame = atoi(at + 1);
+            }
+        }
+        if (s_dl_frame >= 0 && s_dl_tick >= (uint32_t)s_dl_frame) {
+            s_dl_frame = -1;
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count; i++) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *nm = jce_state_entity_name(id);
+                if (nm && strcmp(nm, s_dl_name) == 0) {
+                    LOG_INFO(LOG_TAG, "[dbg-delete] deleting '%s' (id=%u)",
+                             s_dl_name, id);
+                    jce_state_delete_entity(id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Headless transform-nudge hook
+       (JCE_DBG_MOVE="<entity>@<frame>:<dx>,<dy>,<dz>[;<entity>@<frame>:...]"):
+       translates the named entity's transform at frame N, exactly like an
+       inspector edit — for visual QA of transform-follow behavior
+       (grass/foliage/water caches).  Multiple ';'-separated specs allow
+       repeated edit→undo cycles in one run (paired with JCE_DBG_UNDO). */
+    {
+        enum { MV_MAX = 16 };
+        static int   s_mv_frame[MV_MAX];
+        static char  s_mv_name[MV_MAX][JCE_MAX_ENTITY_NAME];
+        static float s_mv_d[MV_MAX][3];
+        static int   s_mv_n = -1;      /* -1 unparsed */
+        static int   s_mv_next = 0;
+        static uint32_t s_mv_tick = 0;
+        ++s_mv_tick;
+        if (s_mv_n == -1) {
+            s_mv_n = 0;
+            const char *v = getenv("JCE_DBG_MOVE");
+            while (v && *v && s_mv_n < MV_MAX) {
+                const char *end = strchr(v, ';');
+                size_t len = end ? (size_t)(end - v) : strlen(v);
+                const char *at  = NULL, *col = NULL;
+                for (size_t k = 0; k < len; k++) {
+                    if (v[k] == '@') at = v + k;
+                    else if (at && v[k] == ':' && !col) col = v + k;
+                }
+                if (at && at > v && col) {
+                    size_t n = (size_t)(at - v);
+                    if (n >= sizeof(s_mv_name[0])) n = sizeof(s_mv_name[0]) - 1;
+                    memcpy(s_mv_name[s_mv_n], v, n);
+                    s_mv_name[s_mv_n][n] = '\0';
+                    s_mv_frame[s_mv_n] = atoi(at + 1);
+                    s_mv_d[s_mv_n][0] = s_mv_d[s_mv_n][1] = s_mv_d[s_mv_n][2] = 0.0f;
+                    sscanf(col + 1, "%f,%f,%f", &s_mv_d[s_mv_n][0],
+                           &s_mv_d[s_mv_n][1], &s_mv_d[s_mv_n][2]);
+                    s_mv_n++;
+                }
+                v = end ? end + 1 : NULL;
+            }
+        }
+        if (s_mv_next < s_mv_n && s_mv_tick >= (uint32_t)s_mv_frame[s_mv_next]) {
+            const int mi = s_mv_next++;
+            JceScene *scene = jce_state_get_scene();
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count && scene; i++) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *nm = jce_state_entity_name(id);
+                if (!nm || strcmp(nm, s_mv_name[mi]) != 0) continue;
+                JceTransform *t = jce_scene_get_transform(scene,
+                                                          jce_state_to_ecs_entity(id));
+                if (t) {
+                    /* Batch-edit brackets record an undo snapshot, so the
+                     * nudge behaves exactly like an inspector edit (and
+                     * JCE_DBG_UNDO below can revert it).  Write through
+                     * jce_scene_set_transform — the gizmo's path — so the
+                     * per-entity xform generation bumps exactly like a real
+                     * user edit (a direct field write would skip the
+                     * renderer's persistent world-matrix invalidation). */
+                    jce_state_begin_batch_edit();
+                    JceTransform nt = *t;
+                    nt.position.x += s_mv_d[mi][0];
+                    nt.position.y += s_mv_d[mi][1];
+                    nt.position.z += s_mv_d[mi][2];
+                    jce_scene_set_transform(scene,
+                                            jce_state_to_ecs_entity(id), &nt);
+                    jce_state_mark_scene_modified();
+                    jce_state_end_batch_edit();
+                    LOG_INFO(LOG_TAG, "[dbg-move] '%s' += (%.1f,%.1f,%.1f)",
+                             s_mv_name[mi], s_mv_d[mi][0], s_mv_d[mi][1],
+                             s_mv_d[mi][2]);
+                }
+                break;
+            }
         }
     }
 
@@ -815,6 +1248,37 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
+    /* Headless scene-SWITCH repro hook (JCE_DBG_SWITCH_SCENE="<path>@<frame>"):
+     * loads a second scene mid-session to reproduce switch-specific state
+     * bugs (a direct JCE_SCENE load misses everything that survives a scene
+     * swap — renderer caches, anim slots, wcache).  Inert when unset. */
+    {
+        static int  s_sw_frame = -2;   /* -2 unread, -1 disabled/fired */
+        static char s_sw_path[1024];
+        static int  s_sw_tick = 0;
+        if (s_sw_frame == -2) {
+            s_sw_frame = -1;
+            const char *sw = getenv("JCE_DBG_SWITCH_SCENE");
+            if (sw && sw[0]) {
+                const char *at = strrchr(sw, '@');
+                if (at && at[1]) {
+                    size_t n = (size_t)(at - sw);
+                    if (n < sizeof(s_sw_path)) {
+                        memcpy(s_sw_path, sw, n);
+                        s_sw_path[n] = '\0';
+                        s_sw_frame = atoi(at + 1);
+                    }
+                }
+            }
+        }
+        if (s_sw_frame >= 0 && s_sw_tick++ == s_sw_frame) {
+            LOG_INFO(LOG_TAG, "DBG_SWITCH_SCENE: loading '%s' at frame %d",
+                     s_sw_path, s_sw_frame);
+            jce_state_load_scene_file(s_sw_path);
+            s_sw_frame = -1;
+        }
+    }
+
     /* Apply any pending font reload BEFORE starting the next frame. */
     jce_editor_apply_pending_font_reload();
 
@@ -825,12 +1289,20 @@ void jce_editor_update(JceWindow *window)
        handler above based on touchpad vs mouse-wheel detection
        (jce_editor_pref_touchpad_h_invert). No global flip here. */
 
-    /* Draw editor panels. */
+    /* Draw editor panels.  ed_layout spans the whole UI build INCLUDING the
+     * Scene/Game view panels (which run the scene_render inside); subtract
+     * the scene_render phase to get the pure-UI share.  ed_submit is the
+     * ImGui draw-data encode + bgfx submit. */
+    uint64_t _t0_layout = jce_time_perf_counter();
     jce_editor_layout_draw();
+    uint64_t _t0_submit = jce_time_perf_counter();
+    jce_perf_phase_add("ed_layout", jce_time_perf_to_ms(_t0_layout, _t0_submit));
 
     /* Render and submit to bgfx. */
     ImGui::Render();
     jce_imgui_renderer_draw();
+    jce_perf_phase_add("ed_submit", jce_time_perf_to_ms(_t0_submit,
+                                                        jce_time_perf_counter()));
 
     /* Decode a small slice of pending asset thumbnails this frame.
        Budget chosen so a folder of ~100 images warms in ~2 s without a
@@ -888,14 +1360,6 @@ void jce_editor_toggle_fullscreen(void)
 float jce_editor_get_font_size(void)
 {
     return s_editor.font_size;
-}
-
-bool jce_editor_set_font_size(float size)
-{
-    if (size < 12.0f) size = 12.0f;
-    if (size > 48.0f) size = 48.0f;
-    s_editor.font_size = size;
-    return true;
 }
 
 const JcePakArchive *jce_editor_get_pak(void)

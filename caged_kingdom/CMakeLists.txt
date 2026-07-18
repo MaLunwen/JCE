@@ -22,9 +22,13 @@
 # Standalone branch                                                   #
 # ------------------------------------------------------------------ #
 
-if(NOT DEFINED JCE_BUILD_VARIANT)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	cmake_minimum_required(VERSION 3.20)
 	project(CagedKingdom C)
+	if(NOT DEFINED JCE_BUILD_VARIANT)
+		set(JCE_BUILD_VARIANT release CACHE STRING
+			"JCE build variant (debug|release|dist)")
+	endif()
 
 	find_package(JCE REQUIRED)
 
@@ -33,6 +37,7 @@ if(NOT DEFINED JCE_BUILD_VARIANT)
 
 	add_executable(CagedKingdom ${CK_SOURCES})
 	set_target_properties(CagedKingdom PROPERTIES OUTPUT_NAME caged_kingdom)
+	jce_configure_application_target(CagedKingdom)
 
 	target_compile_definitions(CagedKingdom PRIVATE SDL_MAIN_USE_CALLBACKS=1)
 	target_include_directories(CagedKingdom PRIVATE
@@ -79,10 +84,6 @@ if(NOT DEFINED JCE_BUILD_VARIANT)
 "const unsigned char assets_pak_data[1] = {0};\n"
 "const size_t        assets_pak_data_size = 0;\n")
 		target_sources(CagedKingdom PRIVATE "${_stub}")
-	endif()
-
-	if(WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Dist")
-		set_target_properties(CagedKingdom PROPERTIES WIN32_EXECUTABLE TRUE)
 	endif()
 
 	install(TARGETS CagedKingdom DESTINATION bin)

@@ -3,6 +3,8 @@
  */
 
 #include <jce/os/core/jce_jobs.h>
+#include <jce/os/core/jce_config.h>   /* settings S5: job_workers override */
+#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_thread.h>
 
 #include "jce_memory.h"
@@ -273,6 +275,23 @@ jce_jobs_default(void)
     if (workers < 1) workers = 1;
     if (workers > 8) workers = 8;   /* our per-frame loops saturate well under this */
 
+    /* Settings S5: jce.ini [performance] job_workers > 0 pins the count
+     * (still clamped to a sane 1..16), overriding the cores-1 auto formula —
+     * lets a user cap threads on a shared box or force serial (job_workers=1
+     * makes every parallel consumer degrade to its serial path). */
+    bool pinned = false;
+    {
+        int cfg_w = jce_config_job_workers();
+        if (cfg_w > 0) {
+            workers = cfg_w;
+            if (workers < 1)  workers = 1;
+            if (workers > 16) workers = 16;
+            pinned = true;
+        }
+    }
+
+    LOG_INFO("jce_jobs", "default job system: %d worker(s)%s", workers,
+             pinned ? " (pinned via [performance] job_workers)" : " (auto)");
     g_default_jobs = jce_jobs_create(workers);
     return g_default_jobs;
 }

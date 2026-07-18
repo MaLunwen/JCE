@@ -172,6 +172,11 @@ typedef enum JceRendererBackend {
 /* Return a stable human-readable name for a backend.  Never NULL. */
 JCE_API const char *jce_renderer_backend_name(JceRendererBackend b);
 
+/* Active bgfx backend as a JceRendererBackend (no-arg; JCE_BACKEND_AUTO
+ * before bgfx init).  For middleware that must branch per backend without
+ * depending on the renderer instance or bgfx headers. */
+JCE_API JceRendererBackend jce_renderer_get_active_backend(void);
+
 /* Fill `out` with the list of renderer backends supported by the
    compiled-in bgfx build (queried via bgfx::getSupportedRenderers).
    The first slot is always JCE_BACKEND_AUTO.  Returns the number of

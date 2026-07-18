@@ -13,12 +13,15 @@
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_timer.h>  /* jce_time_ticks_ms: capture pacing */
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_renderer.h>   /* jce_renderer_readback_capture_submit */
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_views.h>
 }
 #include <stdio.h>   /* snprintf */
+#include <stdlib.h>  /* getenv: JCE_REC_FPS capture-rate cap */
+
 
 #define LOG_TAG "imgui_renderer"
 
@@ -258,8 +261,12 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
          * into a READ_BACK staging texture and read it back to a PNG.  The blit
          * is ordered on the imgui view; the FBO is not written this frame, so
          * there is no read/write hazard.  This frame renders to the backbuffer. */
+        /* Plain FBO source: rows come back per the backend's texture origin —
+         * bottom-up only on GL (same contract as the F9 recording path below;
+         * hardcoded bottom-up inverted D3D11 F12/WINCAP PNGs). */
         jce_renderer_readback_capture_submit(s_cap.tex.idx, s_ctx.view_id,
-                                             s_cap.w, s_cap.h, s_cap.path);
+                                             s_cap.w, s_cap.h, s_cap.path,
+                                             bgfx_get_caps()->originBottomLeft ? 1 : 0);
         s_cap.readback_pending = false;
     } else if (s_cap.request) {
         if (s_cap.fb.idx == UINT16_MAX || s_cap.w != width || s_cap.h != height) {
@@ -448,11 +455,40 @@ void jce_imgui_renderer_draw(void)
     }
 
     /* Recording: read the offscreen UI FBO back into the video sink (BGRA8).
-       One read-back in flight; if busy this frame is skipped (the encoder
-       reorders by timestamp, so a dropped frame just lowers the capture rate). */
-    if (s_rec.active && BGFX_HANDLE_IS_VALID(s_rec.fb))
-        jce_renderer_readback_capture_submit_sink(
-            s_rec.tex.idx, (uint16_t)(s_ctx.view_id + 2), s_rec.w, s_rec.h);
+       The renderer keeps a small FIFO ring of readbacks in flight; if all
+       slots are busy this frame is skipped (the encoder reorders by
+       timestamp, so a dropped frame just lowers the capture rate).
+
+       Capture-rate cap (default 30 fps, env JCE_REC_FPS 5..120): every
+       captured frame costs a GPU blit + 30 MB readback + a main-thread
+       LUT convert + a VP9 software encode — pacing to the target output
+       rate skips all of that for frames the encoder would only spend
+       bitrate on anyway (a 144 Hz editor does not need a 144 fps clip). */
+    if (s_rec.active && BGFX_HANDLE_IS_VALID(s_rec.fb)) {
+        static uint32_t s_interval_ms = 0;
+        if (s_interval_ms == 0) {
+            int fps = 30;
+            const char *v = getenv("JCE_REC_FPS");
+            if (v && v[0]) {
+                fps = atoi(v);
+                if (fps < 5)   fps = 5;
+                if (fps > 120) fps = 120;
+            }
+            s_interval_ms = 1000u / (uint32_t)fps;
+        }
+        static uint64_t s_last_cap_ms = 0;
+        const uint64_t now = (uint64_t)jce_time_ticks_ms();
+        if (now - s_last_cap_ms >= s_interval_ms) {
+            /* Plain FBO pass: rows come back per the backend's texture origin —
+             * bottom-up only on GL. (Hardcoded bottom-up here is what turned
+             * D3D12 recordings upside-down.) */
+            if (jce_renderer_readback_capture_submit_sink(
+                    s_rec.tex.idx, (uint16_t)(s_ctx.view_id + 2),
+                    s_rec.w, s_rec.h,
+                    bgfx_get_caps()->originBottomLeft ? 1 : 0))
+                s_last_cap_ms = now;
+        }
+    }
 }
 
 void jce_imgui_renderer_rebuild_fonts(void)

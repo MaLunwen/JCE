@@ -18,6 +18,8 @@
 
 JCE_EXTERN_C_BEGIN
 
+typedef struct JcePakArchive JcePakArchive;
+
 typedef struct JceImage {
     uint8_t *pixels;   /* RGBA8, width * height * 4 bytes; may be NULL on blank */
     uint32_t width;
@@ -32,6 +34,13 @@ JCE_API bool JCE_CALL jce_image_decode(const void *data, size_t size,
 
 /* Decode an image from a host-path file.  Equivalent to read-then-decode. */
 JCE_API bool JCE_CALL jce_image_decode_file(const char *path, JceImage *out);
+
+/* Decode an image stored at a virtual path in a JPAK archive. The archive may
+ * compress the asset; the payload is decompressed into transient engine-owned
+ * memory before the normal in-memory decoder runs. */
+JCE_API bool JCE_CALL jce_image_decode_pak(const JcePakArchive *pak,
+                                           const char *virtual_path,
+                                           JceImage *out);
 
 /* Allocate a blank RGBA8 image of the given size, zero-filled.
    Returns false on OOM or invalid dimensions. */

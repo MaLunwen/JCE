@@ -45,9 +45,13 @@ sync_*.py
 agents.*
 tests/
 
+# sample projects (local-only, deliberately unversioned)
 science_lab/
 street_demo/
 meadow_valley/
+# sample projects
+elemental_serenity/
+space/
 
 
 # Android APK build

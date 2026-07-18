@@ -451,6 +451,8 @@ static void hlod_name_find_cb(JceScene *s, JceEntity e, void *ud)
     if (m && strcmp(m->name, f->want) == 0) f->found = e;
 }
 
+/* Single-name lookup — the chunk load/unload event path (one name per
+ * transition; a full-scene walk there is an acceptable, event-rate cost). */
 static JceEntity hlod_find_proxy(JceScene *scene, const char *name)
 {
     HlodNameFind f;
@@ -458,6 +460,46 @@ static JceEntity hlod_find_proxy(JceScene *scene, const char *name)
     f.found = JCE_ENTITY_INVALID;
     jce_scene_each_entity(scene, hlod_name_find_cb, &f);
     return f.found;
+}
+
+/* ── Batch proxy resolution (attach) ─────────────────────────────────
+ * Resolving every chunk's proxy with hlod_find_proxy was O(chunks x scene):
+ * street_demo = 196 chunks x 53k entities ~= 10M strcmp+meta lookups on every
+ * attach (scene load / Play start).  Invert the loop: hash all wanted names
+ * once (chunks <= 1024, open addressing, 2x capacity), then ONE scene pass
+ * matches each entity's name against the table — O(scene + chunks). */
+typedef struct {
+    const char (*names)[64];     /* wanted proxy names, parallel to slots */
+    JceEntity   *out;            /* resolved entity per wanted name       */
+    uint16_t    *idx;            /* name-hash -> want+1 (0 = empty)       */
+    uint32_t     cap;            /* index capacity (power of two)         */
+    uint32_t     want_count;
+} HlodBatchFind;
+
+static uint32_t hlod_name_hash(const char *s)
+{
+    uint32_t h = 2166136261u;                     /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        h = (h ^ *p) * 16777619u;
+    return h;
+}
+
+static void hlod_batch_find_cb(JceScene *s, JceEntity e, void *ud)
+{
+    HlodBatchFind *b = (HlodBatchFind *)ud;
+    JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
+    if (!m || !m->name[0]) return;
+    uint32_t mask = b->cap - 1u;
+    uint32_t h = hlod_name_hash(m->name) & mask;
+    while (b->idx[h]) {
+        uint32_t w = (uint32_t)b->idx[h] - 1u;
+        if (strcmp(b->names[w], m->name) == 0) {
+            if (b->out[w] == JCE_ENTITY_INVALID)  /* first match wins */
+                b->out[w] = e;
+            return;
+        }
+        h = (h + 1u) & mask;
+    }
 }
 
 static void hlod_set_proxy_visible(JceScene *scene, JceEntity proxy, bool visible)
@@ -527,21 +569,68 @@ void jce_world_streamer_attach_hlod(JceWorldStreamer        *ws,
 
     const JceSceneStreamingSettings *st =
         scene ? jce_scene_get_streaming_settings(scene) : NULL;
-    if (st) {
+    if (st && st->chunk_count > 0) {
+        /* Pass 1: derive every chunk's wanted proxy name + hash it (O(chunks)).
+         * Pass 2: ONE scene walk resolves all of them (O(scene)).  This
+         * replaced a per-chunk full-scene walk — O(chunks x scene), ~10M
+         * strcmp on a 196-chunk / 53k-entity streamed city — per attach. */
+        enum { HLOD_IDX_CAP = MAX_WORLD_CHUNKS * 2 };  /* pow2, 2x load */
+        /* static: ~70KB of attach-time scratch off the stack; attach runs on
+         * the main thread only (scene load / Play start), never reentrant. */
+        static char      s_names[MAX_WORLD_CHUNKS][64];
+        static JceEntity s_found[MAX_WORLD_CHUNKS];
+        static uint32_t  s_want_chunk[MAX_WORLD_CHUNKS];
+        static uint16_t  s_idx[HLOD_IDX_CAP];
+        memset(s_idx, 0, sizeof(s_idx));
+        uint32_t want = 0;
         for (uint32_t i = 0;
-             i < st->chunk_count && ws->hlod_count < MAX_WORLD_CHUNKS; ++i) {
+             i < st->chunk_count && want < MAX_WORLD_CHUNKS; ++i) {
             const JceSceneStreamChunk *c = &st->chunks[i];
             if (c->path[0] == '\0') continue;
-            char proxy_name[64];
-            if (!hlod_proxy_name_from_chunk_path(c->path, proxy_name,
-                                                 sizeof proxy_name))
+            if (!hlod_proxy_name_from_chunk_path(c->path, s_names[want],
+                                                 sizeof s_names[want]))
                 continue;
-            JceEntity proxy = hlod_find_proxy(scene, proxy_name);
-            if (proxy != JCE_ENTITY_INVALID) {
-                ws->hlod_chunk_ids[ws->hlod_count] = c->id;
-                ws->hlod_proxies  [ws->hlod_count] = proxy;
-                ws->hlod_hide_at_ms[ws->hlod_count] = 0.0; /* no pending hide */
-                ws->hlod_count++;
+            s_found[want]      = JCE_ENTITY_INVALID;
+            s_want_chunk[want] = c->id;
+            uint32_t h = hlod_name_hash(s_names[want]) & (HLOD_IDX_CAP - 1u);
+            while (s_idx[h] &&
+                   strcmp(s_names[s_idx[h] - 1u], s_names[want]) != 0)
+                h = (h + 1u) & (HLOD_IDX_CAP - 1u);
+            if (!s_idx[h]) s_idx[h] = (uint16_t)(want + 1u);
+            /* duplicate name: first want wins the index; the duplicate simply
+             * resolves to the same entity below via its own linear check. */
+            want++;
+        }
+        if (want > 0) {
+            HlodBatchFind b;
+            b.names      = (const char (*)[64])s_names;
+            b.out        = s_found;
+            b.idx        = s_idx;
+            b.cap        = HLOD_IDX_CAP;
+            b.want_count = want;
+            jce_scene_each_entity(scene, hlod_batch_find_cb, &b);
+            for (uint32_t w = 0;
+                 w < want && ws->hlod_count < MAX_WORLD_CHUNKS; ++w) {
+                JceEntity proxy = s_found[w];
+                /* Duplicate names share the index cell; resolve them off the
+                 * winning cell's result. */
+                if (proxy == JCE_ENTITY_INVALID) {
+                    uint32_t h = hlod_name_hash(s_names[w]) & (HLOD_IDX_CAP - 1u);
+                    while (s_idx[h]) {
+                        uint32_t o = (uint32_t)s_idx[h] - 1u;
+                        if (strcmp(s_names[o], s_names[w]) == 0) {
+                            proxy = s_found[o];
+                            break;
+                        }
+                        h = (h + 1u) & (HLOD_IDX_CAP - 1u);
+                    }
+                }
+                if (proxy != JCE_ENTITY_INVALID) {
+                    ws->hlod_chunk_ids [ws->hlod_count] = s_want_chunk[w];
+                    ws->hlod_proxies   [ws->hlod_count] = proxy;
+                    ws->hlod_hide_at_ms[ws->hlod_count] = 0.0;
+                    ws->hlod_count++;
+                }
             }
         }
     }

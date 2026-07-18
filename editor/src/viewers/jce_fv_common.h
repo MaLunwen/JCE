@@ -39,8 +39,12 @@ extern "C" {
 #define FV_MAX_ASSET_BYTES (128 * 1024 * 1024)  /* 128 MB per asset — bounded
     for the 512 MB device baseline; larger files show an info tab instead of
     being read whole into RAM (audit F96) */
-#define FV_MAX_CONTENT    (1024 * 256)   /* 256 KB per file */
-#define FV_EDIT_BUF_CAP   (1024 * 64)   /* 64 KB edit buffer */
+#define FV_MAX_CONTENT    (1024 * 1024 * 4) /* 4 MB text cap — must hold real
+    scene JSONs (elemental_serenity is 316 KB / 11.3k lines); the read-only
+    view renders through an ImGuiListClipper so size only costs memory, and
+    the 512 MB charter absorbs a 4 MB view buffer */
+#define FV_EDIT_BUF_CAP   (1024 * 64)   /* 64 KB edit buffer MINIMUM (grows
+    to content size for larger files) */
 
 /* ══════════════════════════════════════════════════════════════════════
  *  TAB DATA
@@ -73,6 +77,23 @@ struct FvTab {
     char  replace_buf[256];
     bool  show_find_replace;
     int   find_index;       /* current match index (-1 = none) */
+    bool  scroll_to_find;   /* scroll the view to the current match */
+
+    /* Code viewer: line index (offset of each line start into content;
+     * built lazily, freed/invalidated whenever content changes). */
+    int  *line_offs;
+    int   line_count;
+
+    /* Jump-to-line (hierarchy "View in JSON", search results, ...):
+     * goto_line is 1-based; goto_flash is a seconds countdown driving the
+     * highlight pulse on the target line. */
+    int   goto_line;
+    float goto_flash;
+    bool  goto_scroll_pending;
+
+    /* JSON type badge (classified once per content change). */
+    bool  json_classified;
+    int   json_kind;        /* JceJsonKind */
 };
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -120,6 +141,9 @@ void fv_render_hex(FvTab *tab);
 /* ── Per-viewer cleanup (called when closing a tab) ──────────────── */
 
 void fv_code_close_tab(FvTab *tab);
+/* Drop the code viewer's derived state (line index + JSON badge) — call
+ * whenever tab->content is replaced. */
+void fv_code_invalidate_index(FvTab *tab);
 void fv_audio_close_tab(FvTab *tab);
 void fv_audio_update_focus(const char *active_tab_path, bool allow_playback);
 void fv_audio_request_play(const char *path);

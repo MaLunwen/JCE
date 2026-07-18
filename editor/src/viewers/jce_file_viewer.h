@@ -31,6 +31,14 @@ typedef enum {
 /* Open a file in a new tab (or focus existing tab). */
 void  jce_file_viewer_open(const char *path);
 
+/* Open a file as PLAIN TEXT in the code viewer and jump to a 1-based line
+ * (highlighted + scrolled into view).  Unlike jce_file_viewer_open this
+ * never redirects to a specialized viewer and never side-loads a scene —
+ * it is the "view the real JSON source" path (hierarchy right-click,
+ * search results).  line <= 0 opens at the top.  An already-open tab is
+ * refreshed from disk so the text reflects the latest save. */
+void  jce_file_viewer_open_text_at(const char *path, int line);
+
 /* Draw the tabbed file viewer content (for panel embedding). */
 void  jce_file_viewer_draw_content(void);
 

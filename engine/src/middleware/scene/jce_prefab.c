@@ -106,24 +106,30 @@ JceEntity jce_prefab_instantiate(JceScene             *scene,
 {
     if (!scene || !virtual_path) return 0;
 
-    uint64_t size = 0;
-    void  *buf  = NULL;
-
     if (fs) {
-        buf = jce_fs_read_all(fs, virtual_path, &size);
-    } else {
-        buf = jce_fs_host_read_all(virtual_path, &size);
+        JceEntity *new_ents = NULL;
+        uint32_t new_count = 0;
+        bool ok = jce_scene_serial_load_additive_vfs(scene, fs, virtual_path,
+                                                      &new_ents, &new_count);
+        if (!ok) {
+            LOG_ERROR(LOG_TAG, "additive load failed for '%s'", virtual_path);
+            return 0;
+        }
+        return finalize_instance(scene, new_ents, new_count,
+                                 virtual_path, position_offset);
     }
+
+    uint64_t size = 0;
+    void *buf = jce_fs_host_read_all(virtual_path, &size);
     if (!buf || size == 0) {
         if (buf) JCE_FREE(buf);
         LOG_ERROR(LOG_TAG, "cannot read prefab '%s'", virtual_path);
         return 0;
     }
 
-    JceEntity *new_ents  = NULL;
-    uint32_t   new_count = 0;
-    bool ok = jce_scene_serial_load_additive(scene,
-                                              (const char *)buf, size,
+    JceEntity *new_ents = NULL;
+    uint32_t new_count = 0;
+    bool ok = jce_scene_serial_load_additive(scene, (const char *)buf, size,
                                               &new_ents, &new_count);
     JCE_FREE(buf);
 

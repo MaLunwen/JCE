@@ -177,9 +177,12 @@ bool jce_pak_key_generate(const std::string &project_root, bool overwrite,
 
     uint8_t key[32];
     if (!csprng_fill(key, sizeof(key))) {
-        LOG_WARN(LOG_TAG,
-                 "OS CSPRNG unavailable — generated a DEV-ONLY low-entropy "
-                 "key; do not ship it");
+        std::memset(key, 0, sizeof(key));
+        if (err) *err = "OS CSPRNG unavailable; refusing to create an "
+                        "asset key";
+        LOG_ERROR(LOG_TAG, "%s", err ? err->c_str() :
+                  "OS CSPRNG unavailable");
+        return false;
     }
     bool ok = write_key_file(project_root, key, err);
     if (ok)
@@ -258,9 +261,13 @@ bool jce_pak_key_write_shares_c(const std::string &project_root,
     }
 
     uint8_t share_a[32];
-    if (!csprng_fill(share_a, sizeof(share_a)))
-        LOG_WARN(LOG_TAG, "OS CSPRNG unavailable — key shares use a "
-                          "dev-only mask");
+    if (!csprng_fill(share_a, sizeof(share_a))) {
+        std::memset(key, 0, sizeof(key));
+        std::memset(share_a, 0, sizeof(share_a));
+        if (err) *err = "OS CSPRNG unavailable; refusing to emit weak key "
+                        "shares";
+        return false;
+    }
 
     uint8_t shares[64];
     for (int i = 0; i < 32; ++i) {
@@ -276,9 +283,9 @@ bool jce_pak_key_write_shares_c(const std::string &project_root,
            " * Two XOR shares of the project asset key (share_a ^ share_b =\n"
            " * key) so the raw key never appears as a contiguous 32-byte\n"
            " * constant in the binary.  Regenerated with a fresh mask every\n"
-           " * build (NOTE: this is what makes encrypted builds non-bit-\n"
-           " * reproducible).  Deters casual extraction only — the key still\n"
-           " * ships inside the game binary, and there is no MAC. */\n"
+           " * build (NOTE: this is what makes encrypted executables non-bit-\n"
+           " * reproducible).  The authenticated archive still cannot make\n"
+           " * client-delivered data secret from a determined attacker. */\n"
            "const unsigned char jce_embedded_pak_key_shares[64] = {\n";
     char buf[16];
     for (int i = 0; i < 64; ++i) {

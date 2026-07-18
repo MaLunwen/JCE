@@ -74,11 +74,11 @@
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
-  #include <SDL3/SDL.h>
-
   #include <windows.h>
+  #include <shellapi.h>   /* ShellExecuteA: open the crash folder */
   #include <dbghelp.h>
   #pragma comment(lib, "dbghelp.lib")
+  #pragma comment(lib, "shell32.lib")
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -438,8 +438,10 @@ static void crash_signal_handler(int sig)
     } else {
         snprintf(dialog_msg, sizeof(dialog_msg), "%s", msg);
     }
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                             "JCE Native Crash", dialog_msg, NULL);
+    /* Raw user32 box (not SDL): safe in a crashed process, and
+     * system-modal so it can't hide behind a frozen fullscreen frame. */
+    MessageBoxA(NULL, dialog_msg, "JCE Native Crash",
+                MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND);
 #else
     /* On other Unix, just write to stderr as a last resort. */
     fprintf(stderr, "%s\n", msg);
@@ -588,10 +590,43 @@ static const char *write_minidump(EXCEPTION_POINTERS *ep)
     return ok ? dmp_path : NULL;
 }
 
+/* Watchdog: if the crash dialog (or anything after it) wedges — e.g. the
+ * fault corrupted user32 state, or a broken hook swallows the message
+ * pump — the process still dies within the timeout instead of lingering
+ * as a half-dead zombie that holds file locks and the single-instance
+ * mutex.  The dialog itself never takes this long to SHOW; the timer
+ * only fires when the process is genuinely stuck or abandoned. */
+static DWORD WINAPI crash_watchdog_thread(LPVOID param)
+{
+    (void)param;
+    Sleep(120 * 1000);
+    TerminateProcess(GetCurrentProcess(), 0xC0DEDEADu);
+    return 0;
+}
+
 static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
 {
+    /* Under a debugger, hand the exception straight to it — a developer
+     * wants the live break, not our dialog. */
+    if (IsDebuggerPresent())
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Re-entrancy / cross-thread guard: only the FIRST crashing thread
+     * reports.  A crash inside the handler, or a second thread crashing
+     * while the dialog is up, terminates hard instead of cascading
+     * dialogs or deadlocking on DbgHelp (which is not reentrant). */
+    static volatile LONG s_in_crash = 0;
+    if (InterlockedCompareExchange(&s_in_crash, 1, 0) != 0) {
+        TerminateProcess(GetCurrentProcess(),
+                         ep->ExceptionRecord->ExceptionCode);
+        return EXCEPTION_EXECUTE_HANDLER;   /* not reached */
+    }
+
+    const DWORD exc_code = ep->ExceptionRecord->ExceptionCode;
+    const bool  stack_overflow = (exc_code == EXCEPTION_STACK_OVERFLOW);
+
     const char *exc_name = "Unknown exception";
-    switch (ep->ExceptionRecord->ExceptionCode) {
+    switch (exc_code) {
         case EXCEPTION_ACCESS_VIOLATION:    exc_name = "ACCESS_VIOLATION"; break;
         case EXCEPTION_STACK_OVERFLOW:      exc_name = "STACK_OVERFLOW"; break;
         case EXCEPTION_FLT_DIVIDE_BY_ZERO:  exc_name = "FLT_DIVIDE_BY_ZERO"; break;
@@ -599,19 +634,25 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
         case EXCEPTION_ILLEGAL_INSTRUCTION: exc_name = "ILLEGAL_INSTRUCTION"; break;
     }
 
-    /* ── Capture symbolic backtrace via DbgHelp ───────────────────── */
+    /* ── Capture symbolic backtrace via DbgHelp ─────────────────────
+     * Skipped on STACK_OVERFLOW: the handler runs on the exhausted
+     * stack, and the SymFromAddr recursion would immediately re-fault
+     * before anything gets reported. */
     HANDLE process = GetCurrentProcess();
     static volatile LONG sym_initialized = 0;
-    if (InterlockedCompareExchange(&sym_initialized, 1, 0) == 0) {
+    if (!stack_overflow &&
+        InterlockedCompareExchange(&sym_initialized, 1, 0) == 0) {
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS |
                       SYMOPT_UNDNAME);
         SymInitialize(process, NULL, TRUE);
     }
 
     void   *frames[64];
-    USHORT  frame_count = CaptureStackBackTrace(0, 64, frames, NULL);
+    USHORT  frame_count = stack_overflow
+                        ? 0
+                        : CaptureStackBackTrace(0, 64, frames, NULL);
 
-    SYMBOL_INFO *sym = (SYMBOL_INFO *)calloc(
+    SYMBOL_INFO *sym = stack_overflow ? NULL : (SYMBOL_INFO *)calloc(
         sizeof(SYMBOL_INFO) + 256 * sizeof(char), 1);
     if (sym) {
         sym->MaxNameLen   = 255;
@@ -684,9 +725,12 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
         }
         free(sym);
     } else {
-        LOG_ERROR(LOG_TAG, "  (failed to allocate symbol buffer)");
+        const char *why = stack_overflow
+            ? "  (backtrace skipped: stack overflow — see the minidump)"
+            : "  (failed to allocate symbol buffer)";
+        LOG_ERROR(LOG_TAG, "%s", why);
         dump_len += snprintf(dump_msg + dump_len, sizeof(dump_msg) - dump_len,
-                            "  (failed to allocate symbol buffer)\n");
+                             "%s\n", why);
     }
 
     jce_log_flush();
@@ -708,9 +752,10 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
                  "Exception: 0x%08lX (%s)\n"
                  "Address:   0x%p\n"
                  "%s\n\n"
-                 "Dump: %s\n"
-                 "Please report this crash.",
-                 ep->ExceptionRecord->ExceptionCode, exc_name,
+                 "Dump: %s\n\n"
+                 "Please report this crash.\n"
+                 "OK closes the application; Cancel also opens the crash folder.",
+                 exc_code, exc_name,
                  ep->ExceptionRecord->ExceptionAddress, thread_label,
                  dump_path);
     } else {
@@ -721,13 +766,43 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
                  "%s\n\n"
                  "See log file for full backtrace.\n"
                  "Please report this crash.",
-                 ep->ExceptionRecord->ExceptionCode, exc_name,
+                 exc_code, exc_name,
                  ep->ExceptionRecord->ExceptionAddress, thread_label);
     }
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                             "JCE Native Crash", box_msg, NULL);
 
-    return EXCEPTION_CONTINUE_SEARCH;
+    /* Arm the anti-hang watchdog BEFORE any UI: whatever happens next,
+     * the process is gone within the timeout. */
+    {
+        HANDLE wd = CreateThread(NULL, 64 * 1024, crash_watchdog_thread,
+                                 NULL, 0, NULL);
+        if (wd) CloseHandle(wd);
+    }
+
+    /* Raw user32 MessageBoxA, NOT SDL: SDL's message box routes through
+     * the (possibly crashed) video subsystem and can deadlock when the
+     * fault happened off the main thread.  MessageBox pumps its own loop
+     * on the calling thread and needs no live heap.
+     *   MB_SYSTEMMODAL   -> WS_EX_TOPMOST: the dialog sits above every
+     *                       window (incl. our own fullscreen one) instead
+     *                       of hiding behind a frozen frame;
+     *   MB_SETFOREGROUND -> steal focus so it is SEEN immediately. */
+    int choice = MessageBoxA(NULL, box_msg, "JCE Native Crash",
+                             MB_OKCANCEL | MB_ICONERROR |
+                             MB_SYSTEMMODAL | MB_SETFOREGROUND |
+                             MB_DEFBUTTON1);
+    if (choice == IDCANCEL) {
+        /* Reveal the crash folder so "please report" is one click, then
+         * fall through to the deterministic exit. */
+        ShellExecuteA(NULL, "open", ".jce\\crashes", NULL, NULL, SW_SHOWNORMAL);
+    }
+
+    /* Deterministic exit INSTEAD of EXCEPTION_CONTINUE_SEARCH: continuing
+     * the search hands the (already-reported) fault to Windows Error
+     * Reporting, which shows a SECOND dialog / spins collecting its own
+     * dump while our half-dead process lingers.  We already wrote the
+     * text dump + minidump; die cleanly with the exception code. */
+    TerminateProcess(GetCurrentProcess(), exc_code);
+    return EXCEPTION_EXECUTE_HANDLER;   /* not reached */
 }
 
 #endif /* _WIN32 */

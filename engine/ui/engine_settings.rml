@@ -330,6 +330,7 @@ input.checkbox:checked {
       <p id="settings-title">Settings</p>
       <div class="tab-bar" id="engine-tab-bar">
         <span class="tab-btn" id="tab-video">Video</span>
+        <span class="tab-btn" id="tab-graphics">Graphics</span>
         <span class="tab-btn" id="tab-audio">Audio</span>
       </div>
     </div>
@@ -361,6 +362,78 @@ input.checkbox:checked {
             <div class="setting-label" id="lbl-vsync">VSync</div>
             <div class="setting-control">
               <input type="checkbox" id="chk-vsync"/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="panel-graphics">
+        <div class="section">
+          <p class="section-title">Quality</p>
+          <div class="section-rule"></div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-quality">Preset</div>
+            <div class="setting-control">
+              <select id="sel-quality">
+                <option value="auto">Auto (detect)</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="ultra">Ultra</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-shadows">Shadows</div>
+            <div class="setting-control">
+              <input type="checkbox" id="chk-shadows"/>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-ssao">Ambient Occlusion</div>
+            <div class="setting-control">
+              <input type="checkbox" id="chk-ssao"/>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-bloom">Bloom</div>
+            <div class="setting-control">
+              <input type="checkbox" id="chk-bloom"/>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-fog">Volumetric Fog</div>
+            <div class="setting-control">
+              <input type="checkbox" id="chk-fog"/>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-shadowq">Shadow Quality</div>
+            <div class="setting-control">
+              <select id="sel-shadowq">
+                <option value="0">Hard</option>
+                <option value="1">Soft</option>
+                <option value="2">Softest</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-msaa">Anti-aliasing</div>
+            <div class="setting-control">
+              <select id="sel-msaa">
+                <option value="1">Off</option>
+                <option value="2">MSAA 2x</option>
+                <option value="4">MSAA 4x</option>
+                <option value="8">MSAA 8x</option>
+              </select>
             </div>
           </div>
         </div>

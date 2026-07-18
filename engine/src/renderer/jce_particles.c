@@ -313,6 +313,24 @@ void jce_particles_emitter_stop(JceParticleSystem *sys, JceEmitterHandle emitter
     if (em->alive) em->emitting = false;
 }
 
+void jce_particles_emitter_set_color(JceParticleSystem *sys,
+                                     JceEmitterHandle emitter,
+                                     jce_vec3 rgb)
+{
+    if (!sys || !jce_emitter_valid(emitter) || emitter.idx >= MAX_EMITTERS) return;
+    Emitter *em = &sys->emitters[emitter.idx];
+    if (!em->alive) return;
+    /* Retint newly-spawned particles: set the RGB of both start/end colors,
+     * preserving each keyframe's alpha (the fade curve). Live particles keep
+     * their birth color; the new tint takes over as the pool cycles. */
+    em->desc.color_start.x = rgb.x;
+    em->desc.color_start.y = rgb.y;
+    em->desc.color_start.z = rgb.z;
+    em->desc.color_end.x   = rgb.x;
+    em->desc.color_end.y   = rgb.y;
+    em->desc.color_end.z   = rgb.z;
+}
+
 void jce_particles_emitter_set_position(JceParticleSystem *sys,
                                         JceEmitterHandle emitter, jce_vec3 pos)
 {
@@ -370,6 +388,18 @@ static void spawn_particle(JceParticleSystem *sys, Emitter *em, uint32_t *rng)
 
     Particle *p = &em->pool[em->alive_count];
     p->position = em->origin;
+
+    /* Area spawn: scatter the birth position uniformly inside the emitter's
+     * spawn box (full extent, centred on the origin).  Zero box (the default)
+     * leaves every particle at the origin — a point emitter, byte-identical to
+     * the legacy behaviour. */
+    if (em->desc.spawn_box.x != 0.0f ||
+        em->desc.spawn_box.y != 0.0f ||
+        em->desc.spawn_box.z != 0.0f) {
+        p->position.x += randf_range(rng, -0.5f, 0.5f) * em->desc.spawn_box.x;
+        p->position.y += randf_range(rng, -0.5f, 0.5f) * em->desc.spawn_box.y;
+        p->position.z += randf_range(rng, -0.5f, 0.5f) * em->desc.spawn_box.z;
+    }
 
     p->velocity.x = randf_range(rng, em->desc.velocity_min.x, em->desc.velocity_max.x);
     p->velocity.y = randf_range(rng, em->desc.velocity_min.y, em->desc.velocity_max.y);
@@ -635,6 +665,8 @@ void jce_particles_emitter_for_each(const JceParticleSystem *sys,
         v.position  = p->position;
         v.color     = p->color;
         v.size      = p->size;
+        v.velocity  = p->velocity;
+        v.stretch   = em->desc.velocity_stretch;
         v.uv_offset = p->uv_offset;
         v.uv_scale  = p->uv_scale;
         v.frame     = p->frame;
@@ -694,20 +726,12 @@ static JceEaseType resolve_ease(const JceJson *root, const char *key,
     return def;
 }
 
-bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
-                                  char *texture_out, int texture_cap)
+/* Populate `out` from an already-parsed particle-emitter JSON root (does NOT
+ * free `root`).  Shared by the file loader and the in-memory (single-exe PAK)
+ * loader so both parse an identical descriptor. */
+static void desc_parse_root(JceJson *root, JceParticleEmitterDesc *out,
+                            char *texture_out, int texture_cap)
 {
-    if (!out) return false;
-    jce_particles_desc_default(out);
-    if (texture_out && texture_cap > 0) texture_out[0] = '\0';
-    if (!path || !path[0]) return false;
-
-    JceJson *root = jce_json_parse_file(path);
-    if (!root) {
-        LOG_WARN(LOG_TAG, "particle asset not loadable: %s", path);
-        return false;
-    }
-
     out->max_particles = (uint32_t)jce_json_get_int(root, "maxParticles",
                                                     (int)out->max_particles);
     out->emit_rate     = (float)jce_json_get_number(root, "emitRate",    out->emit_rate);
@@ -717,6 +741,13 @@ bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
     out->size_start    = (float)jce_json_get_number(root, "sizeStart",   out->size_start);
     out->size_end      = (float)jce_json_get_number(root, "sizeEnd",     out->size_end);
     out->world_space   = jce_json_get_bool(root, "worldSpace", out->world_space);
+    /* "blend": "alpha" | "additive" (alias "blendMode"; absent = additive). */
+    {
+        const char *bm = jce_json_get_string(root, "blend", NULL);
+        if (!bm || !bm[0]) bm = jce_json_get_string(root, "blendMode", NULL);
+        if (bm && bm[0]) out->blend_alpha = (bm[0] == 'a' && bm[1] == 'l');
+    }
+    jce_json_get_floats(root, "spawnBox",    &out->spawn_box.x,    3, &out->spawn_box.x);
     jce_json_get_floats(root, "velocityMin", &out->velocity_min.x, 3, &out->velocity_min.x);
     jce_json_get_floats(root, "velocityMax", &out->velocity_max.x, 3, &out->velocity_max.x);
     jce_json_get_floats(root, "gravity",     &out->gravity.x,      3, &out->gravity.x);
@@ -732,6 +763,8 @@ bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
         (float)jce_json_get_number(root, "velocityScaleStart", out->velocity_scale_start);
     out->velocity_scale_end =
         (float)jce_json_get_number(root, "velocityScaleEnd",   out->velocity_scale_end);
+    out->velocity_stretch =
+        (float)jce_json_get_number(root, "velocityStretch",    out->velocity_stretch);
 
     /* FEATURE 8.3 — flipbook / texture-sheet animation. */
     out->flipbook_rows = (uint32_t)jce_json_get_int(root, "flipbookRows", (int)out->flipbook_rows);
@@ -759,6 +792,7 @@ bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
             kid->size_start    = (float)jce_json_get_number(child, "sizeStart",   kid->size_start);
             kid->size_end      = (float)jce_json_get_number(child, "sizeEnd",     kid->size_end);
             kid->world_space   = jce_json_get_bool(child, "worldSpace", kid->world_space);
+            jce_json_get_floats(child, "spawnBox",    &kid->spawn_box.x,    3, &kid->spawn_box.x);
             jce_json_get_floats(child, "velocityMin", &kid->velocity_min.x, 3, &kid->velocity_min.x);
             jce_json_get_floats(child, "velocityMax", &kid->velocity_max.x, 3, &kid->velocity_max.x);
             jce_json_get_floats(child, "gravity",     &kid->gravity.x,      3, &kid->gravity.x);
@@ -769,6 +803,7 @@ bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
             kid->velocity_curve = resolve_ease(child, "velocityCurve", kid->velocity_curve);
             kid->velocity_scale_start = (float)jce_json_get_number(child, "velocityScaleStart", kid->velocity_scale_start);
             kid->velocity_scale_end   = (float)jce_json_get_number(child, "velocityScaleEnd",   kid->velocity_scale_end);
+            kid->velocity_stretch     = (float)jce_json_get_number(child, "velocityStretch",     kid->velocity_stretch);
             kid->flipbook_rows = (uint32_t)jce_json_get_int(child, "flipbookRows", (int)kid->flipbook_rows);
             kid->flipbook_cols = (uint32_t)jce_json_get_int(child, "flipbookCols", (int)kid->flipbook_cols);
             kid->flipbook_fps  = (float)jce_json_get_number(child, "flipbookFps",  kid->flipbook_fps);
@@ -793,7 +828,45 @@ bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
 
     if (out->lifetime_max < out->lifetime_min)
         out->lifetime_max = out->lifetime_min;
+}
 
+bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
+                                  char *texture_out, int texture_cap)
+{
+    if (!out) return false;
+    jce_particles_desc_default(out);
+    if (texture_out && texture_cap > 0) texture_out[0] = '\0';
+    if (!path || !path[0]) return false;
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "particle asset not loadable: %s", path);
+        return false;
+    }
+    desc_parse_root(root, out, texture_out, texture_cap);
+    jce_json_free(root);
+    return true;
+}
+
+/* Parse a particle-emitter descriptor from an in-memory JSON buffer (single-
+ * exe: bytes decompressed from the embedded PAK).  `len` may be 0 to
+ * strlen(text). */
+bool jce_particles_desc_load_json_mem(const char *text, size_t len,
+                                      JceParticleEmitterDesc *out,
+                                      char *texture_out, int texture_cap)
+{
+    if (!out) return false;
+    jce_particles_desc_default(out);
+    if (texture_out && texture_cap > 0) texture_out[0] = '\0';
+    if (!text) return false;
+    if (len == 0) len = strlen(text);
+
+    JceJson *root = jce_json_parse(text, len);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "%s", "particle asset not loadable (mem)");
+        return false;
+    }
+    desc_parse_root(root, out, texture_out, texture_cap);
     jce_json_free(root);
     return true;
 }

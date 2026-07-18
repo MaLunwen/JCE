@@ -38,6 +38,13 @@ endif()
 
 file(WRITE "${_full_rsp}" "${_content}")
 
+# lib.exe updates an existing archive in place and keeps members that are no
+# longer present in the input libraries.  A fat SDK archive must be a snapshot
+# of the current link closure, so rebuild it from an empty destination every
+# time.  This also prevents removed or renamed engine TUs from surviving an
+# incremental SDK build.
+file(REMOVE "${OUT_LIB}")
+
 execute_process(
 	COMMAND "${LIB_EXE}" "@${_full_rsp}"
 	RESULT_VARIABLE _rc)

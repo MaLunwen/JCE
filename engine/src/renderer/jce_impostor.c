@@ -550,14 +550,28 @@ float jce_impostor_bake_progress(void)
 
 void jce_impostor_shutdown(void)
 {
-    bake_destroy_fbo();
-    if (g_bake.pixels) { JCE_FREE(g_bake.pixels); g_bake.pixels = NULL; }
-    if (BGFX_HANDLE_IS_VALID(g_gfx.quad_vb)) bgfx_destroy_vertex_buffer(g_gfx.quad_vb);
-    if (BGFX_HANDLE_IS_VALID(g_gfx.quad_ib)) bgfx_destroy_index_buffer(g_gfx.quad_ib);
-    if (BGFX_HANDLE_IS_VALID(g_gfx.prog))    bgfx_destroy_program(g_gfx.prog);
-    if (BGFX_HANDLE_IS_VALID(g_gfx.u_atlas)) bgfx_destroy_uniform(g_gfx.u_atlas);
-    if (BGFX_HANDLE_IS_VALID(g_gfx.u_lightDir)) bgfx_destroy_uniform(g_gfx.u_lightDir);
-    if (BGFX_HANDLE_IS_VALID(g_gfx.u_lightColor)) bgfx_destroy_uniform(g_gfx.u_lightColor);
+    /* NEVER trust zero-initialized bgfx handles: idx==0 is a VALID handle
+     * (someone ELSE's resource).  In a session that never ran an impostor
+     * bake, g_bake's statics were all-zero, so this shutdown destroyed frame
+     * buffer 0 + texture 0; likewise an un-inited g_gfx destroyed vertex/
+     * index buffer 0, program 0 and THREE uniform 0s — silently corrupting
+     * bgfx's handle refcounts in release ("Destroying already destroyed
+     * uniform" with debug asserts) and, layout-dependent, the heap next to
+     * bgfx's internal allocations (the benchmark exit-crash: ShaderRef name
+     * freed with a stomped pointer inside bgfx::shutdown).  Gate every
+     * destroy on the module's lazy-init latches. */
+    if (g_bake.fbo.idx != 0 || g_bake.staging.idx != 0 || g_bake.pixels) {
+        bake_destroy_fbo();
+        if (g_bake.pixels) { JCE_FREE(g_bake.pixels); g_bake.pixels = NULL; }
+    }
+    if (g_gfx.init_tried) {
+        if (BGFX_HANDLE_IS_VALID(g_gfx.quad_vb)) bgfx_destroy_vertex_buffer(g_gfx.quad_vb);
+        if (BGFX_HANDLE_IS_VALID(g_gfx.quad_ib)) bgfx_destroy_index_buffer(g_gfx.quad_ib);
+        if (BGFX_HANDLE_IS_VALID(g_gfx.prog))    bgfx_destroy_program(g_gfx.prog);
+        if (BGFX_HANDLE_IS_VALID(g_gfx.u_atlas)) bgfx_destroy_uniform(g_gfx.u_atlas);
+        if (BGFX_HANDLE_IS_VALID(g_gfx.u_lightDir)) bgfx_destroy_uniform(g_gfx.u_lightDir);
+        if (BGFX_HANDLE_IS_VALID(g_gfx.u_lightColor)) bgfx_destroy_uniform(g_gfx.u_lightColor);
+    }
     memset(&g_gfx, 0, sizeof g_gfx);
     g_gfx.prog.idx = UINT16_MAX;
 }

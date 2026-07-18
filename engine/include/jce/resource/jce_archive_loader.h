@@ -50,7 +50,7 @@ typedef struct JceArchiveLoader JceArchiveLoader;
  * into the mapped archive (zero-copy, spec §8.2 / §13); otherwise it points at
  * a decompressed buffer the loader owns. */
 typedef struct JceArchiveResource {
-    uint64_t    hash; /* XXH3-64 of the normalized virtual path */
+    uint64_t    hash; /* archive index id (XXH3 plain, keyed in secure PAKs) */
     const void *data; /* resource bytes (decompressed or mapped)  */
     uint32_t    size; /* number of bytes at `data`                */
 } JceArchiveResource;
@@ -97,7 +97,9 @@ JCE_API void jce_archive_loader_destroy(JceArchiveLoader *loader);
 JCE_API const JceArchiveResource *jce_archive_loader_acquire(JceArchiveLoader *loader,
                                                              const char *path);
 
-/* As above, keyed by a precomputed XXH3-64 path hash (jce_archive_hash_path). */
+/* As above, keyed by an archive-specific id.  For plain archives this is
+ * jce_archive_hash_path(); for secure archives obtain it from
+ * jce_archive_path_id() only after authentication succeeds. */
 JCE_API const JceArchiveResource *jce_archive_loader_acquire_hash(JceArchiveLoader *loader,
                                                                   uint64_t hash);
 

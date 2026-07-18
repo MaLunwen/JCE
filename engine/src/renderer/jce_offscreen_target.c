@@ -3,7 +3,9 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
@@ -302,4 +304,30 @@ uint16_t jce_offscreen_target_get_frame_buffer(const JceOffscreenTarget *bridge)
 bool jce_offscreen_target_is_hdr(const JceOffscreenTarget *bridge)
 {
     return bridge && bridge->color_format == BGFX_TEXTURE_FORMAT_RGBA16F;
+}
+
+void jce_offscreen_target_composite_texture(
+    JceOffscreenTarget *bridge, uint16_t view_id, uint16_t texture_idx,
+    uint16_t width, uint16_t height, bool flip_v)
+{
+    if (!bridge || !bridge->renderer || texture_idx == UINT16_MAX ||
+        !BGFX_HANDLE_IS_VALID(bridge->target_fbo) ||
+        width == 0 || height == 0) {
+        return;
+    }
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    bgfx_set_view_frame_buffer(view_id, bridge->target_fbo);
+    bgfx_set_view_rect(view_id, 0, 0, width, height);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    jce_mat4 view = jce_m4_identity();
+    jce_mat4 proj = jce_m4_ortho(0.0f, (float)width, (float)height, 0.0f,
+                                 0.0f, 100.0f, caps->homogeneousDepth);
+    bgfx_set_view_transform(view_id, view.raw[0], proj.raw[0]);
+    JceTexture tex; tex.idx = texture_idx;
+    const float uv_flip[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+    jce_draw_textured_rect_view_opaque(bridge->renderer, view_id,
+                                       0.0f, 0.0f,
+                                       (float)width, (float)height,
+                                       tex, 0xFFFFFFFFu,
+                                       flip_v ? uv_flip : NULL);
 }

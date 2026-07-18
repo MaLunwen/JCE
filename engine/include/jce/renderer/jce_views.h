@@ -55,6 +55,16 @@
 /* ImGui editor overlay (renders before UI overlay so HUD sits on top). */
 #define JCE_VIEW_IMGUI       250
 
+/* GPU occlusion-query proxy pass (runtime).  MUST be a view nothing else
+ * writes: bgfx view state is last-write-wins, and when this shared
+ * JCE_VIEW_UI (254) the UI canvas's identity + pixel-ortho transform
+ * clobbered the culler's camera transform — every world-space proxy box
+ * outside the pixel ortho volume clipped to 0 samples and its entity was
+ * PERMANENTLY false-culled (bridge/campfire in the elemental_serenity
+ * repro).  Runs after the scene color views so queries test against the
+ * final depth.  (253 stays the editor game-view culler's explicit id.) */
+#define JCE_VIEW_OCCLUSION   252
+
 /* 2D UI / RmlUi overlay (orthographic, no depth test — sprites, text,
  * debug HUD). Placed AFTER ImGui so the engine HUD is visible on top
  * of editor panels. */

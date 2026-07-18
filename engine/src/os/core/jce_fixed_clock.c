@@ -44,16 +44,38 @@ uint32_t jce_fixed_clock_advance(JceFixedClock *c, double frame_dt)
     if (frame_dt < 0.0) frame_dt = 0.0;
 
     /* Spiral-of-death guard.  Rate-limited warning so a long stall does
-     * not flood the log ring (1 message / second of wall time). */
+     * not flood the log ring (1 message / second of wall time).  The
+     * suppressed-count makes the message diagnostic: "+0 more" = one
+     * isolated hitch (focus change, async-load GPU upload, first-use PSO
+     * compile — benign), a large count = the frame loop is genuinely
+     * slower than max_frame_dt and simulation time is being lost
+     * continuously (worth profiling). */
     if (frame_dt > c->max_frame_dt) {
         static uint64_t s_last_warn_ms = 0;
+        static uint32_t s_suppressed   = 0;
+        static double   s_worst_dt     = 0.0;
         const uint64_t now_ms = jce_time_ticks_ms();
         if (now_ms - s_last_warn_ms >= 1000u) {
+            if (s_suppressed > 0u) {
+                LOG_WARN(LOG_TAG,
+                    "frame_dt=%.3fs exceeded max_frame_dt=%.3fs; clamping "
+                    "(+%u more clamped frames in the last second, worst "
+                    "%.3fs — sustained overload, some simulated time lost)",
+                    frame_dt, c->max_frame_dt, s_suppressed, s_worst_dt);
+            } else {
+                LOG_WARN(LOG_TAG,
+                    "frame_dt=%.3fs exceeded max_frame_dt=%.3fs; clamping to "
+                    "avoid spiral of death (isolated hitch; ~%.0f ms of "
+                    "simulated time skipped)",
+                    frame_dt, c->max_frame_dt,
+                    (frame_dt - c->max_frame_dt) * 1000.0);
+            }
             s_last_warn_ms = now_ms;
-            LOG_WARN(LOG_TAG,
-                "frame_dt=%.3fs exceeded max_frame_dt=%.3fs; clamping to avoid "
-                "spiral of death (some simulated time will be lost)",
-                frame_dt, c->max_frame_dt);
+            s_suppressed   = 0u;
+            s_worst_dt     = 0.0;
+        } else {
+            s_suppressed++;
+            if (frame_dt > s_worst_dt) s_worst_dt = frame_dt;
         }
         frame_dt = c->max_frame_dt;
     }

@@ -301,6 +301,49 @@ void adddef_water(JceScene *scene, JceEntity e)
     jce_scene_set_water(scene, e, &c);
 }
 
+void adddef_grass_field(JceScene *scene, JceEntity e)
+{
+    JceGrassFieldComponent c;
+    memset(&c, 0, sizeof(c));
+    c.density       = 8.0f;
+    c.seed          = 1337u;
+    c.area_x        = 20.0f;
+    c.area_z        = 20.0f;
+    c.max_slope_deg = 35.0f;
+    c.scale_min     = 0.8f;
+    c.scale_max     = 1.4f;
+    c.blade_height  = 0.5f;
+    c.blade_width   = 0.08f;
+    c.cards         = 3;
+    c.root_color[0] = 0.05f; c.root_color[1] = 0.20f; c.root_color[2] = 0.02f;
+    c.tip_color[0]  = 0.45f; c.tip_color[1]  = 0.68f; c.tip_color[2]  = 0.10f;
+    c.wind_dir[0]   = 1.0f;  c.wind_dir[1]   = 0.0f;
+    c.wind_speed    = 1.5f;
+    c.wind_amplitude= 0.12f;
+    c.fade_start    = 50.0f;
+    c.fade_end      = 110.0f;
+    c.hue_jitter    = 0.2f;
+    c.visible       = true;
+    jce_scene_set_grass_field(scene, e, &c);
+}
+
+void adddef_foliage_cluster(JceScene *scene, JceEntity e)
+{
+    JceFoliageClusterComponent c;
+    memset(&c, 0, sizeof(c));
+    c.leaf_count = 45;
+    c.radius     = 1.2f;
+    c.squash_y   = 0.8f;
+    c.leaf_scale = 1.0f;
+    c.seed       = 12345u;
+    c.shadow_color[0] = 0.003f; c.shadow_color[1] = 0.074f; c.shadow_color[2] = 0.003f;
+    c.mid_color[0]    = 0.06f;  c.mid_color[1]    = 0.23f;  c.mid_color[2]    = 0.0f;
+    c.highlight_color[0] = 0.44f; c.highlight_color[1] = 0.5f; c.highlight_color[2] = 0.0f;
+    c.color_multiplier[0] = 0.46f; c.color_multiplier[1] = 0.65f; c.color_multiplier[2] = 0.3f;
+    c.visible = true;
+    jce_scene_set_foliage_cluster(scene, e, &c);
+}
+
 void adddef_buoyancy(JceScene *scene, JceEntity e)
 {
     JceBuoyancyComponent c;
@@ -1252,6 +1295,8 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "Script",              adddef_script },
         { "Terrain",             adddef_terrain },
         { "VegetationScatter",   adddef_vegetation_scatter },
+        { "GrassField",          adddef_grass_field },
+        { "FoliageCluster",      adddef_foliage_cluster },
         { "Water",               adddef_water },
         { "Buoyancy",            adddef_buoyancy },
         { "Rigidbody2D",         adddef_rigidbody2d },

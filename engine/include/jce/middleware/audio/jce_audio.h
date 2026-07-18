@@ -13,6 +13,7 @@
 #include <jce/os/core/jce_defs.h>
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -61,13 +62,18 @@ JCE_API void      jce_audio_unload(JceAudio *audio, JceSound snd);
  * jce_audio_load_pcm and frees `c`. */
 typedef struct JceAudioCpu JceAudioCpu;
 JCE_API JceAudioCpu *jce_audio_decode_cpu(const JcePakArchive *pak, const char *path);
+/* Decode encoded audio or a cooked JCEA sound from borrowed memory.  The
+ * returned CPU object owns its PCM copy and is independent of `data` after the
+ * call.  This is the canonical entry point for VFS/bundle-backed bytes. */
+JCE_API JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
+                                                 const char *hint_path);
 JCE_API JceSound     jce_audio_upload_cpu(JceAudio *audio, JceAudioCpu *cpu);
 JCE_API void         jce_audio_cpu_free(JceAudioCpu *cpu);
 
-/* Load a sound from raw file bytes in memory (WAV/OGG/MP3).
-   hint_path is used for format detection only; may be NULL. */
-JceSound  jce_audio_load_memory(JceAudio *audio, const void *data,
-                                 uint32_t size, const char *hint_path);
+/* Load encoded audio or a cooked JCEA sound from memory. `hint_path` is used
+ * only for diagnostics and encoded-format hints; payload representation wins. */
+JCE_API JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
+                                       uint32_t size, const char *hint_path);
 
 /* -- Queries -------------------------------------------------------- */
 

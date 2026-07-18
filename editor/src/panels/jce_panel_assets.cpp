@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_project_state.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_assetdb.h"
 #include "ui/jce_editor_modals.h"
@@ -384,6 +385,11 @@ void navigate_asset_directory(const std::string &path, bool clear_search)
     s_assets.pending_navigation_path = normalized_path_string(path);
     s_assets.pending_navigation_clear_search = clear_search;
     s_assets.next_auto_refresh_time = ImGui::GetTime() + 0.35;
+
+    /* Remember the last-visited folder per project (restored on the next
+     * open, where it is re-validated against the then-current root). */
+    jce_editor_pstate_set_str("assets.last_folder",
+                              s_assets.pending_navigation_path.c_str());
 }
 
 void collect_search_results(const std::string &query)
@@ -845,6 +851,35 @@ static void draw_asset_delete_dialog(void)
 void jce_editor_panel_assets_content(void)
 {
     ensure_assets_init();
+
+    /* Restore per-project view state once the project store is live — it is
+     * inert until a project root is known, so the first draw can be too
+     * early to read from it. */
+    static bool s_pstate_restored = false;
+    if (!s_pstate_restored && jce_editor_pstate_active()) {
+        s_pstate_restored = true;
+        /* 0=all .. 5=archives — must match the search-bar kind combo. */
+        int kf = jce_editor_pstate_get_int("assets.kind_filter",
+                                           s_assets.kind_filter);
+        if (kf >= 0 && kf <= 5) s_assets.kind_filter = kf;
+        char folder[1024];
+        if (jce_editor_pstate_get_str("assets.last_folder", folder,
+                                      sizeof(folder)) && folder[0]) {
+            std::string want = normalized_path_string(folder);
+            std::string root = normalized_path_string(s_assets.project_root);
+            /* Apply only when the folder still exists AND is still under the
+             * browser root — a stale or moved path must not escape the
+             * project; anything else keeps the root view. */
+            bool under_root =
+                !want.empty() && !root.empty() &&
+                want.size() >= root.size() &&
+                want.compare(0, root.size(), root) == 0 &&
+                (want.size() == root.size() ||
+                 want[root.size()] == '/' || want[root.size()] == '\\');
+            if (under_root && jce_fs_host_exists_dir(want.c_str()))
+                navigate_asset_directory(want, false);
+        }
+    }
 
     /* Decay clipboard / paste flash effects. */
     {

@@ -25,6 +25,9 @@
 #include "jce_rt_internal.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+#include <jce/middleware/ai_dispatch/jce_ai_dispatch.h>
+#endif
 
 
 
@@ -1340,6 +1343,8 @@ static void rt_sync_vehicles(JceRuntime *rt)
 		if (ctf) {
 			ctf->position = cpos;
 			ctf->rotation = crot;
+			/* Subtree push covers the wheel child entities written below. */
+			jce_scene_notify_physics_writeback_entity(rt->scene, ve->entity);
 		}
 
 		if (ve->wheel_count == 0) continue;
@@ -1421,7 +1426,10 @@ static void rt_sync_softbodies(JceRuntime *rt)
 		jce_vec3 c = jce_v3(0.0f, 0.0f, 0.0f);
 		if (!jce_softbody_get_center(se->handle, &c)) continue;
 		JceTransform *tf = jce_scene_get_transform(rt->scene, se->entity);
-		if (tf) tf->position = c;
+		if (tf) {
+			tf->position = c;
+			jce_scene_notify_physics_writeback_entity(rt->scene, se->entity);
+		}
 	}
 }
 
@@ -1723,12 +1731,13 @@ static void rt_apply_buoyancy(JceRuntime *rt)
 	if (s_buoyancy_id == -2) s_buoyancy_id = jce_component_find("Buoyancy");
 
 	/* Find the active water surface (first enabled+visible).  No water ⇒
-	 * nothing floats; bail before touching any body. */
+	 * nothing floats; bail before touching any body.  O(#water) — this was a
+	 * FULL-scene walk every fixed tick (the no-water bail itself cost O(E)). */
 	BuoyWaterScan scan;
 	memset(&scan, 0, sizeof scan);
 	scan.scene         = rt->scene;
 	scan.water_comp_id = s_water_id;
-	jce_scene_each_entity(rt->scene, rt_buoy_find_water, &scan);
+	jce_scene_each_water(rt->scene, rt_buoy_find_water, &scan);
 	if (!scan.water) return;
 
 	const float t = (float)rt->buoyancy_time;
@@ -1801,21 +1810,6 @@ static void rt_apply_buoyancy(JceRuntime *rt)
  * a cached count; when it is 0 (the overwhelming common case) the per-body loop
  * is never entered, so a scene that authored no ConstantForce keeps the
  * byte-identical step path. */
-static int rt_count_constant_force(JceRuntime *rt, int comp_id)
-{
-	int n = 0;
-	for (int i = 0; i < rt->body_count; ++i) {
-		JceEntity e = rt->bodies[i].entity;
-		if (!jce_scene_has_constant_force(rt->scene, e)) continue;
-		if (comp_id >= 0 && !jce_scene_comp_enabled(rt->scene, e, comp_id))
-			continue;
-		JceConstantForceComponent *cf =
-		    jce_scene_get_constant_force(rt->scene, e);
-		if (cf && cf->enabled) ++n;
-	}
-	return n;
-}
-
 static void rt_apply_constant_force(JceRuntime *rt)
 {
 	if (!rt->physics || !rt->scene || rt->body_count <= 0) return;
@@ -1824,9 +1818,13 @@ static void rt_apply_constant_force(JceRuntime *rt)
 	static int s_cf_id = -2;   /* -2 = not yet resolved */
 	if (s_cf_id == -2) s_cf_id = jce_component_find("ConstantForce");
 
-	/* Cheap pre-walk: no enabled constant-force component anywhere -> bail
-	 * before touching any body, keeping the byte-identical step path. */
-	if (rt_count_constant_force(rt, s_cf_id) == 0) return;
+	/* O(1) bail: no ConstantForce component anywhere in the scene (flecs
+	 * table-count aggregate).  The previous "cheap pre-walk" was itself an
+	 * O(bodies) scan with ~3 hash probes per body EVERY fixed tick just to
+	 * discover there was nothing to do.  Enabled-state filtering still
+	 * happens in the main loop below (count > 0 only means "some entity
+	 * holds the component", which is exactly the bail condition). */
+	if (jce_scene_count_constant_force(rt->scene) == 0) return;
 
 	for (int i = 0; i < rt->body_count; ++i) {
 		BodyEntry *be = &rt->bodies[i];
@@ -1996,6 +1994,7 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 	if (alpha < 0.0f) alpha = 0.0f;
 	if (alpha > 1.0f) alpha = 1.0f;
 
+	bool wrote_any = false;
 	for (int i = 0; i < rt->body_count; ++i) {
 		/* Static bodies never move during the step — skip the per-frame
 		 * write. They are still repositioned through
@@ -2030,6 +2029,8 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 			 * mistaken for an external edit next frame. */
 			be->last_pos = origin;
 			be->last_rot = freeze ? tc->rotation : q;
+			jce_scene_notify_physics_writeback_entity(rt->scene, be->entity);
+			wrote_any = true;
 		}
 	}
 
@@ -2043,6 +2044,9 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 		if (tc) {
 			tc->position = cp;
 			rt->char_last_pos = cp;          /* next frame's edit-detect no-op */
+			jce_scene_notify_physics_writeback_entity(rt->scene,
+			                                          rt->character_entity);
+			wrote_any = true;
 		}
 	}
 
@@ -2066,6 +2070,19 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 	 * -> no-op otherwise. */
 	if (rt->softbody_count)
 		rt_sync_softbodies(rt);
+
+	/* All of the above mutate Transforms in place (no set_transform, no per-
+	 * entity xgen bump) — signal the scene's frame-invariance counter once per
+	 * sync so cross-frame render caches know a world matrix may have changed.
+	 * Gated on an ACTUAL write (all-static / body-less scenes stay quiet so a
+	 * frozen-frame consumer can still latch; ragdoll/vehicle/softbody publish
+	 * writes when their counts are non-zero) — DOTS slice 1. */
+	/* Bodies/character/vehicles/softbodies notified per entity above (L2
+	 * incremental repair).  Ragdoll bone relay mutates an UNKNOWN set of
+	 * skinned poses — keep the conservative blanket for it. */
+	if (rt->ragdoll_count > 0)
+		jce_scene_notify_physics_writeback(rt->scene);
+	(void)wrote_any;
 }
 
 /* Write each 2D body's simulated pose into its scene Transform: position x/y
@@ -2074,6 +2091,7 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 static void rt_sync_transforms2d(JceRuntime *rt)
 {
 	if (!rt->physics2d || !rt->scene) return;
+	bool wrote_any = false;
 	for (int i = 0; i < rt->body2d_count; ++i) {
 		if (rt->bodies2d[i].kind == (uint8_t)JCE_BODY_STATIC) continue;
 		Body2DEntry *be = &rt->bodies2d[i];
@@ -2085,7 +2103,10 @@ static void rt_sync_transforms2d(JceRuntime *rt)
 		tc->position.y = p.y;
 		/* z preserved (2D bodies live in the XY plane). */
 		tc->rotation = jce_q_from_axis_angle(jce_v3(0.0f, 0.0f, 1.0f), angle);
+		jce_scene_notify_physics_writeback_entity(rt->scene, be->entity);
+		wrote_any = true;
 	}
+	(void)wrote_any;
 }
 
 void rt_pick_primary_cam(JceScene *s, JceEntity e, void *ud)
@@ -2216,8 +2237,10 @@ static jce_vec3 rt_viewer_position(JceRuntime *rt)
 		jce_physics_character_get_position(rt->physics, rt->character, &cp);
 		return cp;
 	}
+	/* O(#cameras) — this fallback ran a FULL-scene walk per fixed tick AND
+	 * per frame in scenes without a character controller (plain editor Play). */
 	CamScanCtx ctx = { rt->scene, { 0.0f, 0.0f, 0.0f }, false };
-	if (rt->scene) jce_scene_each_entity(rt->scene, rt_pick_primary_cam, &ctx);
+	if (rt->scene) jce_scene_each_camera(rt->scene, rt_pick_primary_cam, &ctx);
 	return ctx.pos;
 }
 
@@ -2482,6 +2505,10 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			if (rt->nav_recast &&
 			    jce_recast_snap_to_navmesh(rt->nav_recast, x, z, &sx, &sy, &sz))
 				tc->position.y = sy;
+			/* In-place write with no set_transform: name the entity for the
+			 * renderer's incremental repair (was covered only by the physics
+			 * blanket overflow). */
+			jce_scene_notify_physics_writeback_entity(rt->scene, ne->entity);
 		}
 	} else if (rt->nav_agents && jce_nav_agent_set_count(rt->nav_agents) > 0) {
 		/* Agents added directly through the API (no scene entries). */
@@ -3260,6 +3287,17 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 		wd.gravity.z      = 0.0f;
 		wd.fixed_timestep = fixed_dt;
 		wd.split_impulse  = -1; /* leave Bullet default (ON) */
+		/* JCE_PHYSICS_MAX_BODIES: raise the Bullet body pool past the 4096
+		 * default for large-scale physics stress benchmarks (#5). */
+		{ const char *mb = getenv("JCE_PHYSICS_MAX_BODIES");
+		  if (mb && atoi(mb) > 0) wd.max_bodies = (uint32_t)atoi(mb); }
+		/* JCE_PHYSICS_MT: opt-in multithreaded Bullet solver (parallel island
+		 * solving via btDiscreteDynamicsWorldMt). Compiled in via
+		 * JCE_PHYSICS_MT/BT_THREADSAFE; default OFF because the single-threaded
+		 * path is deterministic (fixed-timestep reproducibility). On a
+		 * single-core host Bullet's scheduler runs one worker, so it degrades
+		 * gracefully to the charter baseline. */
+		if (getenv("JCE_PHYSICS_MT")) wd.multithreaded = true;
 		rt->physics = jce_physics_create(&wd);
 		if (!rt->physics)
 			jce_log_write(JCE_LOG_LEVEL_ERROR, LOG_TAG, __FILE__, __LINE__,
@@ -3441,6 +3479,60 @@ static void rt_apply_cvars(JceRuntime *rt)
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
+static bool rt_locale_asset_exists(const JceRuntimeDesc *desc,
+                                   const char *locale)
+{
+	if (!desc || !locale || !locale[0]) return false;
+
+	char relative_path[96];
+	int n = snprintf(relative_path, sizeof(relative_path), "i18n/%s.json",
+	                 locale);
+	if (n <= 0 || n >= (int)sizeof(relative_path)) return false;
+
+	if (desc->locales_dir && desc->locales_dir[0]) {
+		char host_path[512];
+		n = snprintf(host_path, sizeof(host_path), "%s/%s.json",
+		             desc->locales_dir, locale);
+		if (n > 0 && n < (int)sizeof(host_path) &&
+		    jce_fs_host_exists_file(host_path))
+			return true;
+	}
+
+	return desc->pak && jce_pak_find(desc->pak, relative_path) != NULL;
+}
+
+/* Normalize OS locale spelling for JCE's file convention, then select a
+ * concrete table. Projects may intentionally ship no i18n assets; in that
+ * case the runtime must leave localization uninitialized instead of issuing a
+ * misleading missing-file warning. */
+static bool rt_select_locale_asset(const JceRuntimeDesc *desc, char out[32])
+{
+	if (!desc || !out) return false;
+	memset(out, 0, 32);
+	char preferred[32] = {0};
+	const char *source = (desc->locale && desc->locale[0])
+	                   ? desc->locale : NULL;
+	if (!source && !jce_host_preferred_locale(preferred, sizeof(preferred)))
+		source = "en";
+	else if (!source)
+		source = preferred;
+
+	if (!source || !source[0]) return false;
+	for (size_t i = 0; i + 1 < 32 && source[i]; ++i) {
+		char c = source[i];
+		out[i] = (c == '-') ? '_' : (char)tolower((unsigned char)c);
+	}
+	out[31] = '\0';
+	if (rt_locale_asset_exists(desc, out)) return true;
+
+	char *separator = strchr(out, '_');
+	if (separator) {
+		*separator = '\0';
+		if (rt_locale_asset_exists(desc, out)) return true;
+	}
+	return false;
+}
+
 JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 {
 	if (!desc || !desc->scene) return NULL;
@@ -3496,24 +3588,17 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	}
 	rt->trans_state = JCE_RT_TRANSITION_IDLE;
 
-	/* Game-content localization (L10n): initialise the process-global
-	 * jce_loc table ONLY when the caller hands us a source — a host dir of
-	 * <locale>.json files and/or a PAK carrying "i18n/<locale>.json".
-	 * Editor Play passes neither (pak=NULL, locales_dir=NULL), so the
-	 * editor-owned jce_loc state (preview locale) is left untouched. */
+	/* Game-content localization (L10n): initialise only after finding a real
+	 * locale table. An application PAK is not by itself proof that the project
+	 * ships translations; empty/no-i18n projects keep key passthrough quietly. */
 	{
-		bool has_loc_dir = desc->locales_dir && desc->locales_dir[0];
-		if (has_loc_dir || desc->pak) {
+		char locale[32] = {0};
+		if (rt_select_locale_asset(desc, locale)) {
+			bool has_loc_dir = desc->locales_dir && desc->locales_dir[0];
 			jce_loc_init(has_loc_dir ? desc->locales_dir : NULL);
 			if (desc->pak)
 				jce_loc_set_source_pak(desc->pak, "i18n");
-			char auto_tag[32];
-			const char *tag = (desc->locale && desc->locale[0])
-			                  ? desc->locale : NULL;
-			if (!tag &&
-			    jce_host_preferred_locale(auto_tag, sizeof auto_tag))
-				tag = auto_tag;
-			jce_loc_set_locale(tag ? tag : "en");
+			jce_loc_set_locale(locale);
 		}
 	}
 
@@ -3812,6 +3897,14 @@ static void rt_transition_advance(JceRuntime *rt, float real_dt)
 	case JCE_RT_TRANSITION_LOAD:
 		rt->trans_alpha = 1.0f;                          /* hide the swap */
 		rt_transition_do_load(rt);
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+		/* ai_dispatch generation token (spec H): the scene swap is the
+		 * staleness boundary — async constraint results requested for the
+		 * OLD scene must be discarded at pump time, never applied to the
+		 * new one. */
+		if (jce_aid_initialised())
+			jce_aid_bump_generation();
+#endif
 		rt->trans_timer = 0.0f;
 		rt->trans_state = JCE_RT_TRANSITION_FADE_IN;
 		break;
@@ -4155,6 +4248,17 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	rt_tick_music(rt, dt);
 
 	jce_perf_phase_add("runtime_tick", jce_time_perf_to_ms(_t0_tick, jce_time_perf_counter()));
+
+	/* Pointer input is sampled once per host frame.  Clearing the complete
+	 * sample prevents a hidden/unfocused host view from leaving a button stuck
+	 * down, while movement input intentionally keeps its existing latched
+	 * semantics. */
+	rt->input.pointer_dx      = 0.0f;
+	rt->input.pointer_dy      = 0.0f;
+	rt->input.pointer_wheel   = 0.0f;
+	rt->input.pointer_buttons = 0u;
+	rt->input.touch_count     = 0;
+	memset(rt->input.touches, 0, sizeof(rt->input.touches));
 }
 
 /* ── Time control (Phase 0.2) ─────────────────────────────────────── */
@@ -4438,6 +4542,38 @@ JCE_API void JCE_CALL jce_runtime_set_input(JceRuntime *rt,
 	rt->input = *in;
 	if (sticky_jump) rt->input.jump_pressed = true;
 	if (rt->input.speed_mult <= 0.0f) rt->input.speed_mult = 1.0f;
+}
+
+JCE_API void JCE_CALL jce_runtime_set_pointer_input(JceRuntime *rt,
+                                                     float dx, float dy,
+                                                     float wheel,
+                                                     uint32_t buttons)
+{
+	if (!rt) return;
+	rt->input.pointer_dx      = dx;
+	rt->input.pointer_dy      = dy;
+	rt->input.pointer_wheel   = wheel;
+	rt->input.pointer_buttons = buttons;
+}
+
+JCE_API void JCE_CALL jce_runtime_set_touch_input(
+	JceRuntime *rt, const JceRuntimeTouch *touches, int count)
+{
+	int kept = 0;
+
+	if (!rt) return;
+	rt->input.touch_count = 0;
+	memset(rt->input.touches, 0, sizeof(rt->input.touches));
+	if (!touches || count <= 0) return;
+
+	for (int i = 0; i < count && kept < JCE_RUNTIME_MAX_TOUCHES; ++i) {
+		const JceRuntimeTouch *touch = &touches[i];
+		if (!isfinite(touch->x) || !isfinite(touch->y) ||
+		    !isfinite(touch->pressure))
+			continue;
+		rt->input.touches[kept++] = *touch;
+	}
+	rt->input.touch_count = kept;
 }
 
 JCE_API void JCE_CALL jce_runtime_set_actions(JceRuntime *rt,

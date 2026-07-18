@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+JceFsReadFn jce__fs_active_reader(void);
+
 static bool s_empty(const char *p) { return !p || p[0] == '\0'; }
 
 bool jce_fs_host_exists_file(const char *path)
@@ -393,18 +395,21 @@ void *jce_fs_host_read_all(const char *path, uint64_t *out_size)
      * (which call this function with project-relative paths) without
      * touching every loader's read path. */
     {
-        extern JceFileSystem *jce_fs_get_active(void);
-        typedef void *(*JceFsReadFn)(const JceFileSystem *, const char *, uint64_t *);
-        extern JceFsReadFn jce__fs_active_reader(void);
         JceFileSystem *afs = jce_fs_get_active();
         JceFsReadFn    fn  = jce__fs_active_reader();
-        if (afs && fn) {
+        bool absolute = path[0] == '/' || path[0] == '\\' ||
+            (((path[0] >= 'A' && path[0] <= 'Z') ||
+              (path[0] >= 'a' && path[0] <= 'z')) &&
+             path[1] == ':' && (path[2] == '/' || path[2] == '\\'));
+        if (!absolute && afs && fn) {
             uint64_t vsz = 0;
             void    *vbuf = fn(afs, path, &vsz);
             if (vbuf) {
                 if (out_size) *out_size = vsz;
                 return vbuf;
             }
+            if (jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED)
+                return NULL;
         }
     }
 
@@ -571,13 +576,16 @@ bool jce_fs_host_get_current_dir(char *out, uint32_t out_size)
 /* slots; cooker tools that only link this TU get inert defaults.       */
 /* ================================================================== */
 
-typedef void *(*JceFsReadFn)(const JceFileSystem *fs, const char *path,
-                             uint64_t *out_size);
-
 static JceFileSystem *s_active_fs     = NULL;
 static JceFsReadFn    s_active_reader = NULL;
+static JceFsActivePolicy s_active_policy = JCE_FS_ACTIVE_OVERLAY;
 
 JceFileSystem *jce_fs_get_active(void)         { return s_active_fs; }
 JceFsReadFn    jce__fs_active_reader(void)     { return s_active_reader; }
 void           jce__fs_store_active(JceFileSystem *fs) { s_active_fs = fs; }
+void jce__fs_store_active_policy(JceFsActivePolicy policy)
+{
+    s_active_policy = policy;
+}
+JceFsActivePolicy jce_fs_get_active_policy(void) { return s_active_policy; }
 void           jce_fs_set_active_reader(JceFsReadFn fn){ s_active_reader = fn; }

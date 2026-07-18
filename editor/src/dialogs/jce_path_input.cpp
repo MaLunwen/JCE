@@ -14,9 +14,15 @@
 #include "ui/jce_editor_panels.h"  /* jce_editor_path_to_relative */
 
 #include <imgui.h>
+#include <imgui_internal.h>   /* ClearActiveID: cancel the edit-activation a
+                                 double-click's first click started */
+#include "viewers/jce_file_viewer.h"
+#include "io/jce_editor_json_reveal.h"
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 #include "core/jce_assetdb.h"
 
 #include <cstdio>
+#include <cstdlib>   /* getenv: JCE_DBG_FLASH_PATHS QA hook */
 #include <cstring>
 #include <unordered_map>
 
@@ -26,6 +32,12 @@ struct Slot {
     bool   browse_ready    = false;
     bool   browse_cancel   = false;
     char   last_seen[1024] = {0};
+    double activated_at    = -1.0;  /* GetTime() when the field last entered
+                                       edit mode (caret appeared) */
+    double flash_at        = -1.0;  /* GetTime() of the last suppressed
+                                       double-click (word-select while
+                                       editing) — drives the edit-mode
+                                       highlight pulse */
 };
 
 std::unordered_map<ImGuiID, Slot> g_slots;
@@ -86,6 +98,48 @@ const char *tooltip_for(JcePathKind kind)
     case JcePathKind::AssetVfs:    return jce_editor_i18n_or("pathInput.tip.asset",  "Pick from project assets...");
     }
     return "Browse...";
+}
+
+
+/* ---- Double-click preview router ------------------------------------
+ * Double-clicking a path field opens the referenced asset in the right
+ * previewer: .anim_sm.json -> State Machine editor, .particles.json ->
+ * particle editor, scenes -> raw JSON source (opening them normally would
+ * SIDE-LOAD the scene), everything else -> the File Viewer, whose own
+ * extension routing picks the image/model/audio/material/code sub-viewer. */
+static bool path_ends_with_ci(const char *path, const char *suffix)
+{
+    size_t pl = strlen(path), sl = strlen(suffix);
+    if (pl < sl) return false;
+    for (size_t i = 0; i < sl; i++) {
+        char a = (char)tolower((unsigned char)path[pl - sl + i]);
+        char b = (char)tolower((unsigned char)suffix[i]);
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static void open_asset_preview(const char *raw_path)
+{
+    char abs[1024];
+    const char *p = jce_editor_resolve_asset_path(raw_path, abs, (int)sizeof abs)
+                  ? abs : raw_path;
+
+    if (path_ends_with_ci(p, ".anim_sm.json")) {
+        jce_panel_animator_sm_open_path(p);
+        return;
+    }
+    if (path_ends_with_ci(p, ".particles.json")) {
+        jce_panel_particle_editor_open_path(p);
+        return;
+    }
+    if (path_ends_with_ci(p, ".scene.json") || path_ends_with_ci(p, ".scene")) {
+        jce_editor_reveal_json_source(raw_path, 0);
+        return;
+    }
+    jce_file_viewer_open(p);
+    jce_file_viewer_request_focus();
+    jce_editor_layout_request_focus_file_viewer();
 }
 
 } /* namespace */
@@ -176,9 +230,59 @@ bool jce_draw_path_input(const char *label,
     ImGui::PushItemWidth(input_w);
     const char *hint = placeholder_for(kind, opts->asset_kind);
     if (ImGui::InputTextWithHint(label, hint, buf, buf_size)) changed = true;
+    if (ImGui::IsItemActivated()) slot.activated_at = ImGui::GetTime();
+    /* Double-click -> open the referenced asset in its previewer — but only
+     * when the field was idle before this click sequence.  If the caret was
+     * already in the field (edit mode predates the double-click window), the
+     * double-click is ImGui's word-select and must not hijack the edit.
+     * Standard engines sidestep the conflict by making asset references
+     * non-editable object pickers (Unity's object field); for an editable
+     * text field the equivalent is this was-idle gate. */
+    if (buf[0] != '\0' && ImGui::IsItemHovered()
+        && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const bool was_editing = ImGui::IsItemActive()
+            && (ImGui::GetTime() - slot.activated_at)
+                   > (double)ImGui::GetIO().MouseDoubleClickTime + 0.05;
+        if (!was_editing) {
+            ImGui::ClearActiveID();   /* cancel the edit the first click began */
+            open_asset_preview(buf);
+        } else {
+            /* Word-select landed instead of the previewer: pulse the field
+             * so the user sees WHY — it is in text-edit mode.  (Preview
+             * still opens from an idle field, or via the ... browse.) */
+            slot.flash_at = ImGui::GetTime();
+        }
+    }
+    /* Headless QA hook (JCE_DBG_FLASH_PATHS=1): hold every visible path
+     * field mid-pulse so JCE_WINCAP_* can capture the highlight style. */
+    static int s_dbg_flash = -1;
+    if (s_dbg_flash < 0) {
+        const char *v = getenv("JCE_DBG_FLASH_PATHS");
+        s_dbg_flash = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (s_dbg_flash) slot.flash_at = ImGui::GetTime() - 0.10;
+    /* Edit-mode highlight pulse: a border in the drag-drop accent color
+     * fading out over half a second, drawn over the field on top of the
+     * frame border. */
+    if (slot.flash_at >= 0.0) {
+        const float kFlashSecs = 0.55f;
+        float t = (float)(ImGui::GetTime() - slot.flash_at);
+        if (t < kFlashSecs) {
+            float a = 1.0f - t / kFlashSecs;   /* linear fade-out */
+            ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_DragDropTarget);
+            c.w *= a;
+            ImGui::GetWindowDrawList()->AddRect(
+                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                ImGui::GetColorU32(c), st.FrameRounding, 0, 2.0f);
+        } else {
+            slot.flash_at = -1.0;
+        }
+    }
     /* Hover tooltip: full path (useful when truncated in narrow panels). */
     if (buf[0] != '\0' && ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", buf);
+        ImGui::SetTooltip("%s\n%s", buf,
+            jce_editor_i18n_or("pathInput.doubleClick.tooltip",
+                               "Double-click: open preview"));
     /* Drag-drop target: accept asset paths from the asset browser (and any
      * other source that publishes JCE_DND_ASSET_PATH).  For AssetVfs kind
      * we relativize against the project root so the saved value stays

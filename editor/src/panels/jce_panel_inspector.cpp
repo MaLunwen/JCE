@@ -567,6 +567,21 @@ static void sync_component_order(EditorEntitySidecar &sidecar,
         if (std::find(v.begin(), v.end(), def) == v.end())
             v.push_back(def);
     }
+
+    /* Fallback: a component the entity HAS whose descriptor exists but is
+     * missing from kDefaultOrderNames still gets a section (appended last).
+     * A forgotten order entry must never silently hide a component — that
+     * is exactly how FoliageCluster rendered as "Transform only" for every
+     * ES bush/leaf entity. */
+    int n_desc = jce_editor_component_descriptor_count();
+    for (int i = 0; i < n_desc; i++) {
+        const JceEditorComponentDescriptor *d =
+            jce_editor_component_descriptor_at(i);
+        if (!d || d->comp_id == JCE_COMP_ID_INVALID) continue;
+        if (!wanted(d->comp_id)) continue;
+        if (std::find(v.begin(), v.end(), d->comp_id) == v.end())
+            v.push_back(d->comp_id);
+    }
 }
 
 static void draw_one_component_section(uint32_t focused,
@@ -926,7 +941,13 @@ static void apply_pending_reorder(uint32_t focused_entity,
 INSP_DRAWFN(transform, draw_comp_transform(entity_id, jce_scene_get_transform(scene, e)))
 INSP_DRAWFN(pivot, draw_comp_pivot(scene, e, jce_scene_get_pivot(scene, e)))
 INSP_DRAWFN(camera, draw_comp_camera(jce_scene_get_camera(scene, e)))
-INSP_DRAWFN(mesh_renderer, draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, e)))
+/* draw + invalidate this entity's material_gen (lever ③ draw-cmd cache): the
+ * inspector mutates the MeshRenderer in place via get_mut with no set-call, so
+ * unconditionally bumping the inspected entity's material each frame it is shown
+ * robustly picks up ANY edit path (widgets, drag-drop, material-file load). Cost
+ * = the one selected entity rebuilds its cached cmd while inspected; harmless. */
+INSP_DRAWFN(mesh_renderer, (draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, e)),
+                            jce_scene_invalidate_entity_material(scene, e)))
 INSP_DRAWFN(sprite_renderer, draw_comp_sprite_renderer(jce_scene_get_sprite_renderer(scene, e)))
 INSP_DRAWFN(animator, draw_comp_animator(jce_scene_get_animator(scene, e)))
 INSP_DRAWFN(skeletal_animator,
@@ -945,6 +966,7 @@ INSP_DRAWFN(constraint, draw_comp_constraint(jce_scene_get_constraint(scene, e))
 INSP_DRAWFN(terrain, draw_comp_terrain(jce_scene_get_terrain(scene, e)))
 INSP_DRAWFN(vegetation_scatter, draw_comp_vegetation_scatter(jce_scene_get_vegetation_scatter(scene, e)))
 INSP_DRAWFN(grass_field, draw_comp_grass_field(jce_scene_get_grass_field(scene, e)))
+INSP_DRAWFN(foliage_cluster, draw_comp_foliage_cluster(jce_scene_get_foliage_cluster(scene, e)))
 INSP_DRAWFN(water, draw_comp_water(jce_scene_get_water(scene, e)))
 INSP_DRAWFN(buoyancy, draw_comp_buoyancy(jce_scene_get_buoyancy(scene, e)))
 INSP_DRAWFN(rigidbody2d, draw_comp_rigidbody2d(jce_scene_get_rigidbody2d(scene, e)))
@@ -1044,6 +1066,7 @@ static void insp_register_draw_fns(void)
         { "Terrain", drawfn_terrain },
         { "VegetationScatter", drawfn_vegetation_scatter },
         { "GrassField", drawfn_grass_field },
+        { "FoliageCluster", drawfn_foliage_cluster },
         { "Water", drawfn_water },
         { "Buoyancy", drawfn_buoyancy },
         { "Rigidbody2D", drawfn_rigidbody2d },

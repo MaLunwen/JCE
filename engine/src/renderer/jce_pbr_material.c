@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
+#include "renderer/jce_render_encoder.h"
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -163,7 +164,7 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     ensure_uniforms();
 
     /* Set uniform vec4s. */
-    bgfx_set_uniform(s_u_base_color, mat->base_color_factor, 1);
+    jce_enc_set_uniform(s_u_base_color, mat->base_color_factor, 1);
 
     /* u_pbrParams: x=metallic, y=roughness, z=aoStrength, w=alphaCutoff
        (matches fs_pbr.sc uniform declaration) */
@@ -173,7 +174,7 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
         mat->ao_strength,
         mat->alpha_cutoff
     };
-    bgfx_set_uniform(s_u_pbr_params, pbr_params, 1);
+    jce_enc_set_uniform(s_u_pbr_params, pbr_params, 1);
 
     /* u_emissiveFactor: xyz=emissive, w=alphaMode (0=opaque,1=mask,2=blend) */
     float emissive[4] = {
@@ -182,7 +183,7 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
         mat->emissive_factor[2],
         (float)mat->alpha_mode
     };
-    bgfx_set_uniform(s_u_emissive, emissive, 1);
+    jce_enc_set_uniform(s_u_emissive, emissive, 1);
 
     /* u_normalScale: x=normalScale (x<0 => checker fallback),
      *                y=doubleSided flag,
@@ -195,28 +196,28 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
         s_view_mode,
         mat->receive_shadows_off ? 1.0f : 0.0f
     };
-    bgfx_set_uniform(s_u_normal_scale, normal_scale, 1);
+    jce_enc_set_uniform(s_u_normal_scale, normal_scale, 1);
 
     /* Bind textures to sampler stages, using fallbacks for missing maps. */
     bgfx_texture_handle_t albedo_h = jce_texture_valid(mat->albedo_map)
         ? (bgfx_texture_handle_t){ mat->albedo_map.idx } : s_white_tex;
-    bgfx_set_texture(0, s_albedo, albedo_h, UINT32_MAX);
+    jce_enc_set_texture(0, s_albedo, albedo_h, UINT32_MAX);
 
     bgfx_texture_handle_t mr_h = jce_texture_valid(mat->metallic_roughness_map)
         ? (bgfx_texture_handle_t){ mat->metallic_roughness_map.idx } : s_white_tex;
-    bgfx_set_texture(1, s_metal_rough, mr_h, UINT32_MAX);
+    jce_enc_set_texture(1, s_metal_rough, mr_h, UINT32_MAX);
 
     bgfx_texture_handle_t norm_h = jce_texture_valid(mat->normal_map)
         ? (bgfx_texture_handle_t){ mat->normal_map.idx } : s_flat_normal_tex;
-    bgfx_set_texture(2, s_normal_map, norm_h, UINT32_MAX);
+    jce_enc_set_texture(2, s_normal_map, norm_h, UINT32_MAX);
 
     bgfx_texture_handle_t ao_h = jce_texture_valid(mat->ao_map)
         ? (bgfx_texture_handle_t){ mat->ao_map.idx } : s_white_tex;
-    bgfx_set_texture(3, s_ao_map, ao_h, UINT32_MAX);
+    jce_enc_set_texture(3, s_ao_map, ao_h, UINT32_MAX);
 
     bgfx_texture_handle_t em_h = jce_texture_valid(mat->emissive_map)
         ? (bgfx_texture_handle_t){ mat->emissive_map.idx } : s_white_tex;
-    bgfx_set_texture(4, s_emissive_map, em_h, UINT32_MAX);
+    jce_enc_set_texture(4, s_emissive_map, em_h, UINT32_MAX);
 }
 
 /* ================================================================== */
@@ -253,13 +254,19 @@ static void safe_copy(char *dst, size_t dst_sz, const char *src)
  * pass through unchanged.  Mirrors the texture-resolution logic in
  * jce_scene_components_json.c so custom-shader .bin blobs load regardless
  * of the runtime cwd. */
-static void resolve_sibling_path(const char *base_path, char *io,
+static bool material_path_exists(const JceFileSystem *fs, const char *path)
+{
+    return fs ? jce_fs_exists(fs, path) : jce_fs_host_exists_file(path);
+}
+
+static void resolve_sibling_path(const JceFileSystem *fs,
+                                 const char *base_path, char *io,
                                  size_t io_sz)
 {
     if (!io[0]) return;
     /* Absolute path or already-existing relative path: keep as-is. */
     if (io[0] == '/' || io[0] == '\\' ||
-        (io[0] && io[1] == ':') || jce_fs_host_exists_file(io))
+        (io[0] && io[1] == ':') || material_path_exists(fs, io))
         return;
 
     const char *slash = strrchr(base_path, '/');
@@ -272,7 +279,7 @@ static void resolve_sibling_path(const char *base_path, char *io,
     if (dir_len >= sizeof(joined)) return;
     memcpy(joined, base_path, dir_len);
     snprintf(joined + dir_len, sizeof(joined) - dir_len, "%s", io);
-    if (jce_fs_host_exists_file(joined))
+    if (material_path_exists(fs, joined))
         safe_copy(io, io_sz, joined);
 }
 
@@ -299,7 +306,8 @@ static int s_prog_cache_count = 0;
  * Returns UINT16_MAX on any failure (missing files, bad blobs, renderer
  * not ready).  Both paths are resolved relative to `mat_path` and the
  * result is cached by (mat_path, vs, fs) so repeat loads never leak. */
-static uint16_t load_custom_program(const char *mat_path,
+static uint16_t load_custom_program(const JceFileSystem *fs,
+                                    const char *mat_path,
                                     const char *vs_rel, const char *fs_rel)
 {
     if (!vs_rel || !vs_rel[0] || !fs_rel || !fs_rel[0])
@@ -320,12 +328,14 @@ static uint16_t load_custom_program(const char *mat_path,
     char vs_path[512], fs_path[512];
     safe_copy(vs_path, sizeof(vs_path), vs_rel);
     safe_copy(fs_path, sizeof(fs_path), fs_rel);
-    resolve_sibling_path(mat_path, vs_path, sizeof(vs_path));
-    resolve_sibling_path(mat_path, fs_path, sizeof(fs_path));
+    resolve_sibling_path(fs, mat_path, vs_path, sizeof(vs_path));
+    resolve_sibling_path(fs, mat_path, fs_path, sizeof(fs_path));
 
     uint64_t vs_sz = 0, fs_sz = 0;
-    void *vs_blob = jce_fs_host_read_all(vs_path, &vs_sz);
-    void *fs_blob = jce_fs_host_read_all(fs_path, &fs_sz);
+    void *vs_blob = fs ? jce_fs_read_all(fs, vs_path, &vs_sz)
+                       : jce_fs_host_read_all(vs_path, &vs_sz);
+    void *fs_blob = fs ? jce_fs_read_all(fs, fs_path, &fs_sz)
+                       : jce_fs_host_read_all(fs_path, &fs_sz);
     uint16_t prog = UINT16_MAX;
     if (vs_blob && fs_blob && vs_sz > 0 && fs_sz > 0) {
         JceShaderHandle h = jce_renderer_create_program_from_blobs(
@@ -336,8 +346,8 @@ static uint16_t load_custom_program(const char *mat_path,
     } else {
         LOG_WARN(LOG_TAG, "custom shader blob(s) missing for %s", mat_path);
     }
-    jce_fs_buffer_free(vs_blob);
-    jce_fs_buffer_free(fs_blob);
+    JCE_FREE(vs_blob);
+    JCE_FREE(fs_blob);
 
     /* Cache the result (including failures, so we don't retry a broken blob
      * every frame).  When the table is full, fall through uncached. */
@@ -371,13 +381,15 @@ void jce_pbr_material_shutdown(void)
 /* Load .mat.json                                                      */
 /* ================================================================== */
 
-bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
-                                 char out_tex_paths[5][256])
+static bool pbr_material_load_json(const JceFileSystem *fs, const char *path,
+                                   JcePbrMaterial *out,
+                                   char out_tex_paths[5][256])
 {
     if (!path || !out || !out_tex_paths) return false;
 
     uint64_t sz = 0;
-    char *buf = (char *)jce_fs_host_read_all(path, &sz);
+    char *buf = (char *)(fs ? jce_fs_read_all(fs, path, &sz)
+                            : jce_fs_host_read_all(path, &sz));
     if (!buf) {
         LOG_WARN(LOG_TAG, "cannot open material file: %s", path);
         return false;
@@ -481,12 +493,25 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
             if (!fs_bin) fs_bin = json_string(root, "customProgramFs");
         }
         if (vs_bin && fs_bin)
-            out->custom_program = load_custom_program(path, vs_bin, fs_bin);
+            out->custom_program = load_custom_program(fs, path, vs_bin, fs_bin);
     }
 
     jce_json_free(root);
     LOG_DEBUG(LOG_TAG, "loaded material: %s", path);
     return true;
+}
+
+bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
+                                 char out_tex_paths[5][256])
+{
+    return pbr_material_load_json(NULL, path, out, out_tex_paths);
+}
+
+bool jce_pbr_material_load_json_vfs(const JceFileSystem *fs,
+                                    const char *path, JcePbrMaterial *out,
+                                    char out_tex_paths[5][256])
+{
+    return fs && pbr_material_load_json(fs, path, out, out_tex_paths);
 }
 
 /* ================================================================== */

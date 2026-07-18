@@ -3,7 +3,10 @@
  *
  * Individual panel implementations are in jce_panel_*.cpp files.
  * This file keeps: visibility array, console ring buffer + API,
- * about dialog, preferences (temporary until Settings dialog replaces it).
+ * about dialog, renderer backend list, and the boot restore of the
+ * persisted locale/theme.  (Settings editing lives in the Preferences
+ * panel, jce_panel_preferences.cpp — the old duplicate Settings dialog
+ * was retired.)
  */
 
 #include "jce_editor_panels.h"
@@ -43,8 +46,8 @@ extern "C" {
 
 #define LOG_TAG "editor_panels"
 
-/* Forward declaration for settings persistence. */
-static void settings_ensure_init(void);
+/* Forward declaration: boot restore of persisted locale/theme. */
+static void settings_restore_locale_and_theme(void);
 
 /* ══════════════════════════════════════════════════════════════════════
  *  PANEL VISIBILITY
@@ -79,6 +82,13 @@ void jce_editor_panels_persist_visibility(void)
     }
     _cfg.panels_visible_mask    = (uint32_t)(mask & 0xFFFFFFFFu);
     _cfg.panels_visible_mask_hi = (uint32_t)(mask >> 32);
+    /* Record how many panels the mask was built against.  Bit i maps to
+     * enum value i, so a build with MORE panels (appended entries) must
+     * apply only the low saved-count bits and keep code defaults for the
+     * new ones — without this the load treated absent high bits as
+     * "hidden", turning every newly added default-on panel off. */
+    jce_editor_config_set_ui_int(&_cfg, "panels.visible_count",
+                                 (int)JCE_PANEL_COUNT);
     if (jce_editor_config_save(&_cfg)) {
         s_last_saved_mask = mask;
     }
@@ -240,8 +250,9 @@ void jce_editor_panels_init(void)
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
 
-    /* Load persisted editor settings (language, theme, font, renderer). */
-    settings_ensure_init();
+    /* Restore persisted locale + theme (locale restore is load-bearing:
+     * skipping it boots the editor in the default language). */
+    settings_restore_locale_and_theme();
 
     /* Restore window panel visibility from editor-config (overrides defaults
        set above). Sentinel JCE_EDITOR_PANELS_MASK_UNSET means "never saved",
@@ -252,7 +263,15 @@ void jce_editor_panels_init(void)
             _ecfg.panels_visible_mask != JCE_EDITOR_PANELS_MASK_UNSET) {
             uint64_t mask = ((uint64_t)_ecfg.panels_visible_mask_hi << 32) |
                             (uint64_t)_ecfg.panels_visible_mask;
-            for (int i = 0; i < JCE_PANEL_COUNT && i < 64; i++) {
+            /* Apply only the bits the saving build actually wrote (see
+             * persist_visibility): panels appended since then keep their
+             * code defaults instead of inheriting "hidden".  Legacy configs
+             * without the count key behave as before (full width). */
+            int saved_count = jce_editor_config_get_ui_int_or(
+                &_ecfg, "panels.visible_count", 64);
+            if (saved_count < 1)  saved_count = 1;
+            if (saved_count > 64) saved_count = 64;
+            for (int i = 0; i < JCE_PANEL_COUNT && i < saved_count; i++) {
                 s_visible[i] = (mask >> i) & 1u;
             }
         }
@@ -283,13 +302,13 @@ void jce_editor_panel_file_viewer(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  SETTINGS DIALOG (full implementation)
+ *  RENDERER BACKEND LIST + BOOT SETTINGS RESTORE
  * ══════════════════════════════════════════════════════════════════════ */
 
 /* Renderer backend list — populated at runtime from compiled-in
    bgfx backends via jce_renderer_caps_list_backends().  Falls back
    to a single "Auto" entry if the renderer has not been initialized
-   yet (e.g. settings panel opened before first frame). */
+   yet (e.g. queried before the first frame). */
 #define JCE_EDITOR_MAX_BACKENDS 8
 static JceRendererBackend s_renderer_values[JCE_EDITOR_MAX_BACKENDS] = {
     JCE_BACKEND_AUTO
@@ -320,386 +339,26 @@ extern "C" int jce_editor_renderer_backends(const char *const **out_names)
     return s_renderer_count;
 }
 
-static struct {
-    int   language_idx;
-    int   theme_idx;
-    int   renderer_idx;
-    float font_size;
-    char  font_en_path[512];
-    char  font_zh_path[512];
-    /* Saved originals for Cancel. */
-    int   orig_language_idx;
-    int   orig_theme_idx;
-    int   orig_renderer_idx;
-    float orig_font_size;
-    char  orig_font_en_path[512];
-    char  orig_font_zh_path[512];
-    bool  needs_restart;
-    bool  initialized;
-} s_settings;
-
-static int renderer_backend_to_idx(JceRendererBackend b)
+/* ── Boot restore of persisted locale / theme ─────────────────────────
+ *
+ * Historically this was the lazy init (settings_ensure_init) of a
+ * duplicate Settings dialog that had zero callers; the dialog is retired
+ * (the Preferences panel is the single settings surface), but the restore
+ * itself is load-bearing: without it the editor boots in the default
+ * locale regardless of the persisted language.  Called once from
+ * jce_editor_panels_init(). */
+static void settings_restore_locale_and_theme(void)
 {
-    for (int i = 0; i < s_renderer_count; i++)
-        if (s_renderer_values[i] == b) return i;
-    return 0;
-}
-
-static void settings_ensure_init(void)
-{
-    if (s_settings.initialized) return;
-    memset(&s_settings, 0, sizeof(s_settings));
-
-    /* Load persisted editor config. */
     JceEditorConfig ecfg;
-        if (jce_editor_config_load(&ecfg)) {
-            /* Language — derived from the persisted stable code (handles
-               any number of locales without index-magic). */
-            JceLocale _persisted = jce_editor_i18n_locale_from_code(ecfg.language);
-            s_settings.language_idx = (int)_persisted;
-            jce_editor_i18n_set_locale(_persisted);
-
-        /* Theme — accept Blue (preferred) and SSMS (legacy) for the SSMS engine theme. */
-        if (strcmp(ecfg.theme, "Light") == 0) s_settings.theme_idx = JCE_THEME_LIGHT;
-        else if (strcmp(ecfg.theme, "Blue") == 0) s_settings.theme_idx = JCE_THEME_SSMS;
-        else if (strcmp(ecfg.theme, "SSMS") == 0) s_settings.theme_idx = JCE_THEME_SSMS;
-        else s_settings.theme_idx = JCE_THEME_DARK;
-        jce_editor_apply_theme(s_settings.theme_idx);
-
-        /* Font size */
-        if (ecfg.font_size >= 12 && ecfg.font_size <= 48)
-            s_settings.font_size = (float)ecfg.font_size;
-        else
-            s_settings.font_size = jce_editor_get_font_size();
-
-        /* Renderer */
-        build_renderer_list_if_needed();
-        s_settings.renderer_idx = 0;
-        for (int i = 0; i < s_renderer_count; i++) {
-            if (strcmp(s_renderer_names[i], ecfg.renderer) == 0) {
-                s_settings.renderer_idx = i;
-                break;
-            }
-        }
-
-        /* Font path overrides (applied on next restart). */
-        snprintf(s_settings.font_en_path, sizeof(s_settings.font_en_path),
-                 "%s", ecfg.font_en_path);
-        snprintf(s_settings.font_zh_path, sizeof(s_settings.font_zh_path),
-                 "%s", ecfg.font_zh_path);
-    } else {
-        s_settings.language_idx  = (int)jce_editor_i18n_get_locale();
-        s_settings.theme_idx     = jce_editor_get_theme();
-        s_settings.renderer_idx  = 0;
-        s_settings.font_size     = jce_editor_get_font_size();
-    }
-
-    s_settings.initialized   = true;
-}
-
-static void settings_snapshot(void)
-{
-    s_settings.orig_language_idx = s_settings.language_idx;
-    s_settings.orig_theme_idx    = s_settings.theme_idx;
-    s_settings.orig_renderer_idx = s_settings.renderer_idx;
-    s_settings.orig_font_size    = s_settings.font_size;
-    snprintf(s_settings.orig_font_en_path, sizeof(s_settings.orig_font_en_path),
-             "%s", s_settings.font_en_path);
-    snprintf(s_settings.orig_font_zh_path, sizeof(s_settings.orig_font_zh_path),
-             "%s", s_settings.font_zh_path);
-}
-
-static void settings_apply(void)
-{
-    /* Language — already applied immediately via Combo callback. */
-
-    /* Theme — already applied immediately via Combo callback. */
-
-    /* Font size — saved to config; requires restart. */
-
-    /* Renderer — requires restart; also sync to engine .config/jce.ini. */
-    if (s_settings.renderer_idx != s_settings.orig_renderer_idx)
-        s_settings.needs_restart = true;
-
-    /* Persist to editor config file. */
-    {
-        JceEditorConfig ecfg;
-        jce_editor_config_load(&ecfg);
-
-        snprintf(ecfg.language, sizeof(ecfg.language), "%s",
-                 jce_editor_i18n_locale_code((JceLocale)s_settings.language_idx));
-        ecfg.font_size = (int)s_settings.font_size;
-
-        const char *theme_names[] = { "Dark", "Light", "Blue" };
-        snprintf(ecfg.theme, sizeof(ecfg.theme), "%s",
-                 theme_names[s_settings.theme_idx]);
-
-        if (s_settings.renderer_idx >= 0 && s_settings.renderer_idx < s_renderer_count)
-            snprintf(ecfg.renderer, sizeof(ecfg.renderer), "%s",
-                     s_renderer_names[s_settings.renderer_idx]);
-
-        snprintf(ecfg.font_en_path, sizeof(ecfg.font_en_path),
-                 "%s", s_settings.font_en_path);
-        snprintf(ecfg.font_zh_path, sizeof(ecfg.font_zh_path),
-                 "%s", s_settings.font_zh_path);
-
-        jce_editor_config_save(&ecfg);
-    }
-
-    /* Renderer backend change is picked up on next editor startup via
-       configure_engine_renderer_from_editor_config() in editor_main.cpp,
-       which writes a temporary .jce/editor-engine.ini for the engine.
-       No need to touch .config/jce.ini. */
-
-    /* Update snapshot so Cancel won't revert applied changes. */
-    settings_snapshot();
-
-    jce_editor_console_log("Settings applied and saved");
-}
-
-static void settings_cancel(void)
-{
-    /* Revert language. */
-    if (s_settings.language_idx != s_settings.orig_language_idx) {
-        s_settings.language_idx = s_settings.orig_language_idx;
-        jce_editor_i18n_set_locale((JceLocale)s_settings.language_idx);
-    }
-    /* Revert theme. */
-    if (s_settings.theme_idx != s_settings.orig_theme_idx) {
-        s_settings.theme_idx = s_settings.orig_theme_idx;
-        jce_editor_apply_theme(s_settings.theme_idx);
-    }
-    /* Revert font size (restart-only, no live revert needed). */
-    s_settings.font_size = s_settings.orig_font_size;
-    /* Revert renderer. */
-    s_settings.renderer_idx = s_settings.orig_renderer_idx;
-    /* Revert font path overrides. */
-    snprintf(s_settings.font_en_path, sizeof(s_settings.font_en_path),
-             "%s", s_settings.orig_font_en_path);
-    snprintf(s_settings.font_zh_path, sizeof(s_settings.font_zh_path),
-             "%s", s_settings.orig_font_zh_path);
-    s_settings.needs_restart = false;
-}
-
-void jce_editor_settings_dialog(bool *p_open)
-{
-    if (!p_open) return;
-    settings_ensure_init();
-
-    static bool was_open = false;
-    if (*p_open && !was_open) {
-        settings_snapshot();
-        was_open = true;
-    }
-    if (!*p_open && was_open) {
-        settings_cancel();
-        was_open = false;
-    }
-    if (!*p_open) return;
-
-    const char *popup_id = "###SettingsDialog";
-    if (*p_open && !ImGui::IsPopupOpen(popup_id))
-        ImGui::OpenPopup(popup_id);
-
-    char _title[256];
-    snprintf(_title, sizeof(_title), "%s%s",
-             jce_editor_i18n("settings.title"), popup_id);
-
-    const ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(550, 500), ImGuiCond_Appearing);
-    ImGui::SetNextWindowViewport(vp->ID);
-
-    if (!ImGui::BeginPopupModal(_title, p_open,
-                      ImGuiWindowFlags_NoCollapse
-                    | ImGuiWindowFlags_NoDocking)) {
+    if (!jce_editor_config_load(&ecfg))
         return;
-    }
 
-    ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
-                       jce_editor_i18n("settings.description"));
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    /* Language — derived from the persisted stable code (handles any
+       number of locales without index-magic). */
+    jce_editor_i18n_set_locale(jce_editor_i18n_locale_from_code(ecfg.language));
 
-    char _lbl[256];
-
-    /* Language — built from the live locale registry so adding a locale
-       only requires updating the enum + JSON file. */
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_lang", jce_editor_i18n("settings.language"));
-    const int   n_loc = jce_editor_i18n_locale_count();
-    const char *languages[JCE_MAX_LOCALES];
-    for (int i = 0; i < n_loc; i++)
-        languages[i] = jce_editor_i18n_locale_native_name((JceLocale)i);
-    ImGui::PushItemWidth(200);
-    if (ImGui::Combo(_lbl, &s_settings.language_idx, languages, n_loc)) {
-        jce_editor_i18n_set_locale((JceLocale)s_settings.language_idx);
-    }
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
-                       jce_editor_i18n("settings.appliesImmediately"));
-
-    /* Theme */
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_theme", jce_editor_i18n("settings.theme"));
-    const char *themes[] = { jce_editor_i18n("panel.preferences.theme.dark"), jce_editor_i18n("panel.preferences.theme.light"), jce_editor_i18n("panel.preferences.theme.blue") };
-    if (ImGui::Combo(_lbl, &s_settings.theme_idx, themes, 3))
-        jce_editor_apply_theme(s_settings.theme_idx);
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
-                       jce_editor_i18n("settings.appliesImmediately"));
-
-    /* Font Size — requires restart to take effect. */
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_fontsize", jce_editor_i18n("settings.fontSize"));
-    ImGui::SliderFloat(_lbl, &s_settings.font_size, 12.0f, 48.0f, "%.0f px");
-    if (s_settings.font_size != s_settings.orig_font_size)
-        s_settings.needs_restart = true;
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
-                       jce_editor_i18n("settings.requiresRestart"));
-
-    /* Renderer Backend (selector) */
-    build_renderer_list_if_needed();
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_renderer", jce_editor_i18n("settings.renderBackend"));
-    if (ImGui::Combo(_lbl, &s_settings.renderer_idx, s_renderer_names, s_renderer_count)) {
-        s_settings.needs_restart = true;
-    }
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
-                       jce_editor_i18n("settings.requiresRestart"));
-
-    /* Current active backend display. */
-    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "%s: %s",
-                       jce_editor_i18n("settings.activeBackend"),
-                       jce_renderer_get_backend_name(NULL));
-
-    ImGui::PopItemWidth();
-
-    /* Font picker — pick from fonts discovered on the host system.
-     * "(Auto)" => system font auto-detection at startup; if no system
-     * font matches, ImGui's built-in default is used.
-     * Changes take effect on next editor restart. */
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
-                       jce_editor_i18n("settings.fonts.title"));
-    ImGui::TextWrapped("%s", jce_editor_i18n("settings.fonts.help"));
-    ImGui::Spacing();
-
-    /* Lazy one-shot scan of available fonts on the host. */
-    enum { JCE_FONT_PICKER_MAX = 512 };
-    static JceFontEntry  s_font_entries[JCE_FONT_PICKER_MAX];
-    static const char   *s_font_labels[JCE_FONT_PICKER_MAX + 1]; /* +1 for Auto */
-    static int           s_font_count   = -1;   /* -1 => not scanned yet */
-    if (s_font_count < 0) {
-        s_font_count = jce_editor_enumerate_fonts(s_font_entries,
-                                                  JCE_FONT_PICKER_MAX);
-        s_font_labels[0] = jce_editor_i18n("settings.fonts.auto");
-        for (int i = 0; i < s_font_count; ++i)
-            s_font_labels[i + 1] = s_font_entries[i].display_name;
-    }
-    /* Refresh "Auto" label every frame so locale changes apply live. */
-    s_font_labels[0] = jce_editor_i18n("settings.fonts.auto");
-
-    /* Helper lambda to find the combo index that matches a stored path. */
-    auto find_idx_for_path = [](const char *path) -> int {
-        if (!path || !*path) return 0;          /* Auto */
-        for (int i = 0; i < s_font_count; ++i)
-            if (jce_strcasecmp(s_font_entries[i].path, path) == 0)
-                return i + 1;
-        return 0;                               /* unknown -> show Auto */
-    };
-
-    int en_idx = find_idx_for_path(s_settings.font_en_path);
-    int zh_idx = find_idx_for_path(s_settings.font_zh_path);
-
-    ImGui::PushItemWidth(-160);
-
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_font_en",
-             jce_editor_i18n("settings.fonts.latin"));
-    if (ImGui::Combo(_lbl, &en_idx, s_font_labels, s_font_count + 1)) {
-        if (en_idx <= 0)
-            s_settings.font_en_path[0] = '\0';
-        else
-            jce_strlcpy(s_settings.font_en_path,
-                        s_font_entries[en_idx - 1].path,
-                        sizeof(s_settings.font_en_path));
-        s_settings.needs_restart = true;
-    }
-
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_font_zh",
-             jce_editor_i18n("settings.fonts.cjk"));
-    if (ImGui::Combo(_lbl, &zh_idx, s_font_labels, s_font_count + 1)) {
-        if (zh_idx <= 0)
-            s_settings.font_zh_path[0] = '\0';
-        else
-            jce_strlcpy(s_settings.font_zh_path,
-                        s_font_entries[zh_idx - 1].path,
-                        sizeof(s_settings.font_zh_path));
-        s_settings.needs_restart = true;
-    }
-    ImGui::PopItemWidth();
-
-    /* Show the resolved absolute path of the current selection (helpful
-       when two installed fonts share a display name). */
-    if (en_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s: %s",
-                           jce_editor_i18n("fonts.latin"),
-                           s_font_entries[en_idx - 1].path);
-    if (zh_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s:   %s",
-                           jce_editor_i18n("fonts.cjk"),
-                           s_font_entries[zh_idx - 1].path);
-
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-                       "%s (%d %s)",
-                       jce_editor_i18n("settings.fonts.scanned"),
-                       s_font_count,
-                       jce_editor_i18n("settings.fonts.fontsFound"));
-
-    /* Restart warning */
-    if (s_settings.needs_restart) {
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%s",
-                           jce_editor_i18n("settings.restartNote"));
-    }
-
-    /* Buttons: Apply | OK | Cancel (right-aligned) */
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    float btn_w = 80.0f;
-    float spacing = ImGui::GetStyle().ItemSpacing.x;
-    float total_btn_w = btn_w * 3 + spacing * 2;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w + ImGui::GetCursorPosX());
-
-    if (ImGui::Button(jce_editor_i18n("dialog.apply"), ImVec2(btn_w, 0))) {
-        settings_apply();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.ok"), ImVec2(btn_w, 0))) {
-        settings_apply();
-        ImGui::CloseCurrentPopup();
-        *p_open = false;
-        was_open = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
-        settings_cancel();
-        ImGui::CloseCurrentPopup();
-        *p_open = false;
-        was_open = false;
-    }
-
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        settings_cancel();
-        ImGui::CloseCurrentPopup();
-        *p_open = false;
-        was_open = false;
-    }
-
-    ImGui::EndPopup();
+    /* Theme — shared canonical parser (accepts legacy "SSMS" for Blue). */
+    jce_editor_apply_theme(jce_editor_theme_from_string(ecfg.theme));
 }
 
 

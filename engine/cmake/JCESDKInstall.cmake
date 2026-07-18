@@ -121,6 +121,18 @@ function(jce_collect_static_libs ROOT_TARGET OUT_VAR)
 		endforeach()
 	endwhile()
 
+	# ai_dispatch links libcurl PRIVATE (engine/CMakeLists.txt) so the
+	# public-closure walk above never reaches it.  Merge its static lib
+	# explicitly, otherwise a private-SDK consumer cannot resolve curl_*.
+	if(JCE_ENABLE_AI_DISPATCH AND TARGET CURL::libcurl)
+		get_target_property(_curl_loc CURL::libcurl IMPORTED_LOCATION_RELEASE)
+		if(NOT _curl_loc)
+			get_target_property(_curl_loc CURL::libcurl IMPORTED_LOCATION)
+		endif()
+		if(_curl_loc AND EXISTS "${_curl_loc}")
+			list(APPEND _imported_files "${_curl_loc}")
+		endif()
+	endif()
 	list(REMOVE_DUPLICATES _static_targets)
 	list(REMOVE_DUPLICATES _imported_files)
 
@@ -151,6 +163,16 @@ function(jce_register_sdk_install)
 	endif()
 
 	jce_collect_static_libs(JCE _jce_sdk)
+
+	# Libraries in this set must retain ordinary archive extraction semantics.
+	# In particular, jce_pak_key_defaults provides zero-valued fallback symbols
+	# only when an application did not compile a generated protected-PAK key TU.
+	# Merging it into the force-loaded core archive would create duplicate strong
+	# definitions in protected Dist applications.
+	set(_deps_extra_targets jce_pak_key_defaults)
+	foreach(_t IN LISTS _deps_extra_targets)
+		list(REMOVE_ITEM _jce_sdk_TARGETS "${_t}")
+	endforeach()
 
 	# --- Belt-and-suspenders: capture sibling abseil libs (MSVC only) ---- #
 	# On MSVC, some absl libs ship vectorised STL helpers
@@ -206,12 +228,9 @@ function(jce_register_sdk_install)
 	set(_empty_rsp "${_merge_dir}/empty.rsp")
 	file(WRITE "${_empty_rsp}" "")
 
-	# ---- SDK shim libs (standalone, conditionally linked) ------------ #
-	# Keep ABI-compatibility shims out of the deps fat lib.  They must  #
-	# only be linked when the consuming toolchain actually needs them;   #
-	# otherwise a newer MSVC runtime that provides the same STL helper   #
-	# will report duplicate symbols.
-	set(_deps_extra_targets "")
+	# ---- Normally linked first-party fallback libs ------------------- #
+	# These targets are merged with dependencies, not the force-loaded core,
+	# so their members are extracted only to satisfy unresolved symbols.
 	set(_deps_extra_rsp "${_merge_dir}/$<CONFIG>/deps_extra.rsp")
 	set(_deps_extra_content "")
 	foreach(_t IN LISTS _deps_extra_targets)
@@ -338,12 +357,29 @@ function(jce_register_sdk_install)
 	include(GNUInstallDirs)
 	include(CMakePackageConfigHelpers)
 
+	# ai_dispatch is a PRIVATE module (spec C.8): its headers must never ride
+	# an SDK/editor package unless this build explicitly enabled the module.
+	# Without these excludes the directory GLOB below ships the full ABI
+	# surface (api_ai_dispatch.h + middleware/ai_dispatch/) in every SDK.
+	set(_jce_sdk_hdr_excludes "")
+	if(NOT JCE_ENABLE_AI_DISPATCH)
+		list(APPEND _jce_sdk_hdr_excludes
+			PATTERN "api_ai_dispatch.h" EXCLUDE
+			PATTERN "middleware/ai_dispatch" EXCLUDE)
+	endif()
+
 	install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/jce"
 		DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 		FILES_MATCHING
 			PATTERN "*.h"
 			PATTERN "*.hpp"
-			PATTERN "*.inl")
+			PATTERN "*.inl"
+			${_jce_sdk_hdr_excludes})
+
+	# install(DIRECTORY) does not prune headers removed from the source tree.
+	# Delete the old public copy now that the bgfx encoder shim is internal.
+	install(CODE
+		"file(REMOVE \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}/jce/renderer/jce_render_encoder.h\")")
 
 	install(FILES "${CMAKE_BINARY_DIR}/include/jce/jce_version.h"
 		DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/jce")
@@ -363,17 +399,13 @@ function(jce_register_sdk_install)
 	# The packaged editor still cooks/packs in-process and feeds
 	# JCE_PROJECT_PREBUILT_ASSETS_* for editor-driven builds.
 
-	# ---- Engine-side runtime resources that the engine *always* expects
-	# to find in the PAK at boot (HUD/settings RML, fallback fonts,
-	# default shaders, …).  Consumer projects rarely override these so
-	# we ship them with the SDK and have jce_target_embed_pak() add them
-	# to every consumer PAK automatically.
+	# Engine shaders are already authenticated and embedded in JCE::JCE.  Do not
+	# install a second loose copy: it bloats every consumer PAK and can preserve
+	# stale backend profiles across incremental SDK installs.  Remove only this
+	# SDK-managed legacy directory; engine UI remains a normal consumer asset.
 	set(_engine_share_root "${CMAKE_INSTALL_DATAROOTDIR}/jce")
-	if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/engine/resources/assets")
-		install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/resources/assets/"
-			DESTINATION "${_engine_share_root}/engine_resources"
-			PATTERN "raw_assets" EXCLUDE)
-	endif()
+	install(CODE
+		"file(REMOVE_RECURSE \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${_engine_share_root}/engine_resources\")")
 	if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/engine/ui")
 		install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/ui/"
 			DESTINATION "${_engine_share_root}/engine_ui")

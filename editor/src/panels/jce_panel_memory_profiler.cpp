@@ -14,6 +14,7 @@
 
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_ui_state.h"
 
 #include <jce/tools/jce_imgui.hpp>
 
@@ -154,7 +155,8 @@ void write_snapshot(PanelState &st)
 
     for (int i = 0; i < st.row_count && off < sizeof(body) - 256; ++i) {
         const TagRow &r = st.rows[i];
-        n = std::snprintf(body + off, sizeof(body) - off,
+        size_t rem = sizeof(body) - off;
+        n = std::snprintf(body + off, rem,
                           "    {\"name\":\"%s\",\"current\":%llu,"
                           "\"peak\":%llu,\"live\":%u,"
                           "\"total_alloc\":%llu,\"total_count\":%u}%s\n",
@@ -165,10 +167,14 @@ void write_snapshot(PanelState &st)
                           (unsigned long long)r.s.total_bytes_allocated,
                           r.s.total_alloc_count,
                           (i + 1 < st.row_count) ? "," : "");
-        if (n > 0) off += (size_t)n;
+        /* Clamp on truncation: blindly adding the would-have length walked
+         * off past the stack buffer (then sizeof-off underflowed). */
+        if (n <= 0 || (size_t)n >= rem) break;
+        off += (size_t)n;
     }
+    if (off >= sizeof(body)) off = sizeof(body) - 1;
     n = std::snprintf(body + off, sizeof(body) - off, "  ]\n}\n");
-    if (n > 0) off += (size_t)n;
+    if (n > 0 && (size_t)n < sizeof(body) - off) off += (size_t)n;
 
     bool ok = jce_fs_host_write_all(path, body, (uint64_t)off);
     if (ok) {
@@ -199,14 +205,26 @@ extern "C" void jce_editor_panel_memory_profiler_content(void)
     {
         const char *labels[] = { "0.1 s", "0.5 s", "1 s", "5 s" };
         const float rates[]  = { 0.1f,    0.5f,    1.0f,  5.0f };
+
+        /* One-time restore of the persisted rate (user-global; stored as
+         * the combo index so it always maps to a valid rate). */
+        static bool s_rate_loaded = false;
+        if (!s_rate_loaded) {
+            s_rate_loaded = true;
+            st.refresh_rate = rates[jce_editor_ui_state_load_int(
+                                        "memprof.refresh_idx", 1, 0, 3)];
+        }
+
         int sel = 1;
         for (int i = 0; i < 4; ++i)
             if (st.refresh_rate == rates[i]) sel = i;
         ImGui::TextUnformatted(jce_editor_i18n("memoryProfiler.refreshRate"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(96.0f);
-        if (ImGui::Combo("##memprof_rate", &sel, labels, 4))
+        if (ImGui::Combo("##memprof_rate", &sel, labels, 4)) {
             st.refresh_rate = rates[sel];
+            jce_editor_ui_state_save_int("memprof.refresh_idx", sel);
+        }
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("memoryProfiler.resetPeaks")))
             jce_mem_profile_reset_peaks();
@@ -296,10 +314,10 @@ extern "C" void jce_editor_panel_memory_profiler_content(void)
         ImGui::TableHeadersRow();
 
         if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
-            if (specs->SpecsDirty) {
-                apply_sort(st, specs);
-                specs->SpecsDirty = false;
-            }
+            /* Re-apply EVERY frame: refresh() rebuilds rows in tag order on
+             * its 0.5s cadence, silently reverting a dirty-only sort. */
+            apply_sort(st, specs);
+            specs->SpecsDirty = false;
         }
 
         for (int i = 0; i < st.row_count; ++i) {

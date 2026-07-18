@@ -122,6 +122,15 @@ JCE_API bool           jce_audio_mixer_remove_send(JceAudioMixer *m,
                                                    JceAudioBusId src, JceAudioBusId dest);
 /* Number of aux sends originating from `src`. */
 JCE_API uint32_t       jce_audio_mixer_send_count(const JceAudioMixer *m, JceAudioBusId src);
+/* Enumerate the aux sends originating from `src` by dense index
+ * 0..send_count-1.  Needed by serializers: get_send() returns 0 both for "no
+ * send" and "registered but silent (amount 0)", so only enumeration can
+ * round-trip zero-amount sends.  Returns true and fills out_dest/out_amount
+ * (either may be NULL) when `index` names a live send. */
+JCE_API bool           jce_audio_mixer_send_at(const JceAudioMixer *m,
+                                               JceAudioBusId src, uint32_t index,
+                                               JceAudioBusId *out_dest,
+                                               float *out_amount);
 
 /* Effective gain delivered from `src` into `dest` along the aux send:
  *   resolve_volume(src) * send_amount.

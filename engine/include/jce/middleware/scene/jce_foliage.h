@@ -53,6 +53,12 @@ typedef struct {
      * scatter — no extra RNG draw). */
     const float *density_mask;
     int          mask_dim;
+    /* When > 0, the mask is sampled in WORLD space: the mask's [0,1]² UV spans
+     * a mask_world_size × mask_world_size world square centred on the origin,
+     * so a mask shared by several scatter rects (e.g. grass strips ringing a
+     * pond) stays aligned to the same world texture.  0 = legacy local-rect UV
+     * (candidate position within its own area rect). */
+    float        mask_world_size;
 } JceFoliageScatterParams;
 
 /* Upper bound on instances produced by one scatter call (≈4 MB of mat4). */

@@ -23,6 +23,7 @@
  */
 
 #include <jce/os/core/jce_profiler.h>
+#include <jce/resource/jce_image_decode.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_archive.h>
 
@@ -190,6 +191,25 @@ const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
     if (pak->overlay_next)
         return jce_pak_find(pak->overlay_next, path);
     return NULL;
+}
+
+bool jce_image_decode_pak(const JcePakArchive *pak,
+                          const char *virtual_path, JceImage *out)
+{
+    if (!pak || !virtual_path || !virtual_path[0] || !out) return false;
+
+    const JcePakAsset *asset = jce_pak_find(pak, virtual_path);
+    if (!asset || asset->original_size == 0) return false;
+
+    void *data = JCE_MALLOC((size_t)asset->original_size);
+    if (!data) return false;
+
+    size_t got = jce_pak_decompress_ex(pak, asset, data,
+                                       (size_t)asset->original_size);
+    bool ok = got == (size_t)asset->original_size &&
+              jce_image_decode(data, got, out);
+    JCE_FREE(data);
+    return ok;
 }
 
 /* ================================================================== */

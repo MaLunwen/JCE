@@ -15,6 +15,44 @@
 
 #define JCE_ARCHIVE_KEY_BYTES   32u
 #define JCE_ARCHIVE_NONCE_BYTES 12u
+#define JCE_ARCHIVE_AUTH_BYTES  32u
+
+typedef struct JceArchiveSecureKeys {
+    uint8_t path[JCE_ARCHIVE_KEY_BYTES];
+    uint8_t enc[JCE_ARCHIVE_KEY_BYTES];
+    uint8_t nonce[JCE_ARCHIVE_KEY_BYTES];
+    uint8_t auth[JCE_ARCHIVE_KEY_BYTES];
+} JceArchiveSecureKeys;
+
+/* SHA-256 based message authentication used by secure archives.  Kept in the
+ * resource-private header so the archive writer/reader share one audited
+ * implementation without expanding the public engine API. */
+void jce_archive_hmac_sha256(const uint8_t *key, size_t key_len,
+                             const uint8_t *data, size_t data_len,
+                             uint8_t out[JCE_ARCHIVE_AUTH_BYTES]);
+
+/* Derive independent archive subkeys from one project master key.  salt32 is
+ * the existing per-archive label salt stored in the JPAK header. */
+void jce_archive_secure_keys_derive(
+    const uint8_t master[JCE_ARCHIVE_KEY_BYTES], uint32_t salt32,
+    JceArchiveSecureKeys *out);
+
+/* Keyed, dictionary-resistant replacement for the plain XXH3 path index. */
+uint64_t jce_archive_secure_path_hash(
+    const JceArchiveSecureKeys *keys, const char *normalized_path,
+    size_t path_len);
+
+/* Deterministic content nonce.  Exact duplicate compressed payloads produce
+ * the same nonce/ciphertext and may share one archive data offset; any changed
+ * payload or codec metadata produces a different nonce. */
+void jce_archive_secure_nonce(
+    const JceArchiveSecureKeys *keys, uint8_t compression, uint16_t dict_id,
+    const uint8_t *stored_plaintext, size_t stored_size,
+    uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES]);
+
+/* Constant-time authentication-tag comparison and key erasure helpers. */
+int  jce_archive_crypto_equal(const uint8_t *a, const uint8_t *b, size_t size);
+void jce_archive_crypto_zero(void *ptr, size_t size);
 
 /* XOR `len` bytes of `in` with the ChaCha20 keystream for (key, nonce,
  * initial block counter) into `out`.  `in` and `out` may alias.  This is its

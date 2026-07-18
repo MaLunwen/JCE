@@ -46,9 +46,10 @@ void jce_editor_toggle(void);
 /* Toggle the host editor window between windowed and fullscreen. */
 void jce_editor_toggle_fullscreen(void);
 
-/* Get/set the current font size in pixels (range 12-48). */
+/* Get the font size in pixels the editor booted with (range 12-32).
+   Font-size changes go through the Preferences panel, which persists to
+   JceEditorConfig and re-bakes the atlas via jce_editor_request_font_reload. */
 float jce_editor_get_font_size(void);
-bool  jce_editor_set_font_size(float size);
 
 /* Access the editor PAK archive (for panels needing baked-in resources). */
 const JcePakArchive *jce_editor_get_pak(void);

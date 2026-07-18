@@ -92,6 +92,15 @@ JCE_API void jce_light_env_destroy(JceLightEnv *env);
 /* Set ambient light color and intensity. */
 JCE_API void jce_light_env_set_ambient(JceLightEnv *env, jce_vec3 color, float intensity);
 
+/* Read back the ambient (GI L2 feeds the probe grid's sky floor from it). */
+JCE_API void jce_light_env_get_ambient(const JceLightEnv *env, jce_vec3 *color,
+                                       float *intensity);
+
+/* Read back a directional light (GI L3 feeds the probes' sun-bounce term
+ * from light 0).  Returns false when `index` has no light. */
+JCE_API bool jce_light_env_get_dir_light(const JceLightEnv *env, uint32_t index,
+                                         JceDirLightDesc *out);
+
 /* Add lights. Returns the light index, or -1 if at capacity. */
 JCE_API int jce_light_env_add_dir_light(JceLightEnv *env, const JceDirLightDesc *light);
 JCE_API int jce_light_env_add_point_light(JceLightEnv *env, const JcePointLightDesc *light);

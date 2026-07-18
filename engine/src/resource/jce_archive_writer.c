@@ -61,7 +61,7 @@ struct JceArchiveWriter {
     size_t     dict_count;
     size_t     dict_cap;
     ZSTD_CCtx *cctx;
-    uint8_t    enc_key[JCE_ARCHIVE_KEY_BYTES];
+    JceArchiveSecureKeys secure_keys;
     int        has_key;     /* 1 once a key has been set */
     int        any_encrypted;
 };
@@ -133,6 +133,7 @@ void jce_archive_writer_destroy(JceArchiveWriter *w) {
     }
     jce_free(w->dicts);
     if (w->cctx) ZSTD_freeCCtx(w->cctx);
+    jce_archive_crypto_zero(&w->secure_keys, sizeof(w->secure_keys));
     jce_free(w);
 }
 
@@ -254,7 +255,9 @@ static bool writer_add_impl(JceArchiveWriter *w, const char *path,
         jce_free(norm);
         return false;
     }
-    uint64_t hash = jce_archive_hash_normalized(norm, nlen);
+    uint64_t hash = w->has_key
+        ? jce_archive_secure_path_hash(&w->secure_keys, norm, nlen)
+        : jce_archive_hash_normalized(norm, nlen);
 
     /* Collision / duplicate detection (spec §12.3). */
     for (size_t i = 0; i < w->count; i++) {
@@ -283,13 +286,37 @@ static bool writer_add_impl(JceArchiveWriter *w, const char *path,
         return false;
     }
 
-    /* Encrypt last, after compression (spec §9.2 ordering): encrypted bytes
-     * are incompressible, so compression must precede encryption.  The
-     * keystream is keyed by the entry's unique path hash. */
-    if (encrypt && stored_size > 0 && stored) {
+    /* Encrypt last, after compression.  The nonce is stored in front of the
+     * ciphertext and derived from the compressed plaintext + codec metadata,
+     * so changed bytes never reuse a stream while exact duplicate payloads
+     * remain deduplicable. */
+    if (encrypt) {
         uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES];
-        jce_archive_derive_nonce(hash, w->cfg.encryption_salt, nonce);
-        jce_archive_chacha20_xor(w->enc_key, nonce, 1, stored, stored, stored_size);
+        uint8_t *secured;
+        if ((uint64_t)stored_size + JCE_ARCHIVE_NONCE_BYTES > UINT32_MAX) {
+            jce_free(norm);
+            jce_free(stored);
+            return false;
+        }
+        secured = (uint8_t *)jce_malloc((size_t)stored_size +
+                                        JCE_ARCHIVE_NONCE_BYTES);
+        if (!secured) {
+            jce_free(norm);
+            jce_free(stored);
+            return false;
+        }
+        jce_archive_secure_nonce(&w->secure_keys, comp, entry_dict, stored,
+                                 stored_size, nonce);
+        memcpy(secured, nonce, sizeof(nonce));
+        if (stored_size > 0) {
+            jce_archive_chacha20_xor(
+                w->secure_keys.enc, nonce, 1, stored,
+                secured + JCE_ARCHIVE_NONCE_BYTES, stored_size);
+        }
+        jce_free(stored);
+        stored = secured;
+        stored_size += JCE_ARCHIVE_NONCE_BYTES;
+        jce_archive_crypto_zero(nonce, sizeof(nonce));
         w->any_encrypted = 1;
     }
 
@@ -312,14 +339,15 @@ static bool writer_add_impl(JceArchiveWriter *w, const char *path,
     e->content_crc   = crc;
     e->compression   = comp;
     e->dict_id       = entry_dict;
-    e->encrypted     = (uint8_t)((encrypt && stored_size > 0) ? 1 : 0);
+    e->encrypted     = (uint8_t)(encrypt ? 1 : 0);
     return true;
 }
 
 void jce_archive_writer_set_encryption_key(JceArchiveWriter *w,
                                            const uint8_t key[32]) {
     if (!w || !key) return;
-    memcpy(w->enc_key, key, JCE_ARCHIVE_KEY_BYTES);
+    jce_archive_secure_keys_derive(key, w->cfg.encryption_salt,
+                                   &w->secure_keys);
     w->has_key = 1;
 }
 
@@ -388,7 +416,9 @@ bool jce_archive_writer_add_precompressed(JceArchiveWriter *w, const char *path,
         jce_free(norm);
         return false;
     }
-    uint64_t hash = jce_archive_hash_normalized(norm, nlen);
+    uint64_t hash = w->has_key
+        ? jce_archive_secure_path_hash(&w->secure_keys, norm, nlen)
+        : jce_archive_hash_normalized(norm, nlen);
 
     for (size_t i = 0; i < w->count; i++) {
         if (w->entries[i].path_hash == hash) {
@@ -463,10 +493,9 @@ static int dup_key_cmp(const void *a, const void *b) {
 }
 
 /* Compute dup_of[i] = canonical entry index whose stored bytes entry i shares,
- * or -1 when entry i is itself canonical (or dedup is disabled).  Canonical is
- * always the smallest emit index of a byte-identical set, so it is emitted
- * before any entry referencing it.  Encrypted entries never dedup because their
- * per-path nonce makes each ciphertext unique.  Returns false on OOM. */
+ * or -1 when entry i is itself canonical (or dedup is disabled).  Secure
+ * ciphertext uses a content-derived nonce, so exact duplicate payloads remain
+ * byte-identical and can share storage.  Returns false on OOM. */
 static bool compute_dedup(const WEntry *entries, size_t count, int64_t *dup_of) {
     for (size_t i = 0; i < count; i++) dup_of[i] = -1;
     if (count < 2) return true;
@@ -475,7 +504,6 @@ static bool compute_dedup(const WEntry *entries, size_t count, int64_t *dup_of) 
     if (!keys) return false;
     size_t m = 0;
     for (size_t i = 0; i < count; i++) {
-        if (entries[i].encrypted) continue; /* never coalesce ciphertext */
         keys[m].crc         = entries[i].content_crc;
         keys[m].stored_size = entries[i].stored_size;
         keys[m].idx         = i;
@@ -514,6 +542,23 @@ static bool compute_dedup(const WEntry *entries, size_t count, int64_t *dup_of) 
 
 bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_size) {
     if (!w || !out_buf || !out_size) return false;
+
+    if (w->any_encrypted) {
+        if (!w->has_key) return false;
+        if (w->cfg.emit_debug_paths) {
+            LOG_ERROR(JARC_TAG,
+                      "finish: secure archives cannot contain debug paths");
+            return false;
+        }
+        for (size_t i = 0; i < w->count; ++i) {
+            if (!w->entries[i].encrypted) {
+                LOG_ERROR(JARC_TAG,
+                          "finish: secure archive contains plain entry '%s'",
+                          w->entries[i].norm_path);
+                return false;
+            }
+        }
+    }
 
     /* Deterministic total order: hashes are unique (dups rejected on add). */
     if (w->count > 1) qsort(w->entries, w->count, sizeof(WEntry), cmp_entry);
@@ -574,7 +619,12 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
              * canonical (smaller index) was laid out earlier this loop. */
             size_t c = (size_t)dup_of[i];
             data_offsets[i] = data_offsets[c];
-            entry_flags[i]  = (uint8_t)(entry_flags[c] & JARC_ENTRY_PAGE_ALIGNED);
+            entry_flags[i]  = (uint8_t)(entry_flags[c] &
+                                        JARC_ENTRY_PAGE_ALIGNED);
+            if (w->entries[i].encrypted) {
+                entry_flags[i] |= JARC_ENTRY_ENCRYPTED |
+                                  JARC_ENTRY_AUTHENTICATED;
+            }
             continue;
         }
         /* mmap zero-copy (spec §8.2) requires page alignment, and only
@@ -591,7 +641,9 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
         uint8_t ef = (uint8_t)(((want_page || global_page_aligned) &&
                                 (buf.size % 4096) == 0)
                                    ? JARC_ENTRY_PAGE_ALIGNED : 0);
-        if (w->entries[i].encrypted) ef |= JARC_ENTRY_ENCRYPTED;
+        if (w->entries[i].encrypted) {
+            ef |= JARC_ENTRY_ENCRYPTED | JARC_ENTRY_AUTHENTICATED;
+        }
         entry_flags[i] = ef;
         bb_append(&buf, w->entries[i].stored, w->entries[i].stored_size);
     }
@@ -621,7 +673,10 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
 
     /* Optionally zstd-compress the index, keeping raw if it doesn't shrink. */
     uint32_t hdr_flags = w->cfg.mmap_friendly ? JARC_FLAG_MMAP_FRIENDLY : 0;
-    if (w->any_encrypted) hdr_flags |= JARC_FLAG_ENCRYPTED;
+    if (w->any_encrypted) {
+        hdr_flags |= JARC_FLAG_ENCRYPTED | JARC_FLAG_SECURE_INDEX |
+                     JARC_FLAG_AUTHENTICATED;
+    }
     const uint8_t *index_stored = index_raw;
     size_t index_stored_size = index_orig_size;
     uint8_t *index_comp = NULL;
@@ -699,6 +754,19 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
      * encrypted; kept 0 otherwise for byte-compat with pre-salt archives. */
     jarc_wr32(h + JARC_OFF_NONCE_SALT32,
               w->any_encrypted ? w->cfg.encryption_salt : 0);
+
+    if (w->any_encrypted) {
+        uint8_t tag[JCE_ARCHIVE_AUTH_BYTES];
+        jce_archive_hmac_sha256(w->secure_keys.auth,
+                                sizeof(w->secure_keys.auth),
+                                buf.data, buf.size, tag);
+        bb_append(&buf, tag, sizeof(tag));
+        jce_archive_crypto_zero(tag, sizeof(tag));
+        if (buf.oom) {
+            jce_free(buf.data);
+            return false;
+        }
+    }
 
     *out_buf = buf.data;
     *out_size = buf.size;

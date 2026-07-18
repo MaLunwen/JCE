@@ -88,6 +88,8 @@
 #define JARC_FLAG_HAS_DEBUG_PATHS  (1u << 1)
 #define JARC_FLAG_ENCRYPTED        (1u << 2)
 #define JARC_FLAG_MMAP_FRIENDLY    (1u << 3)
+#define JARC_FLAG_SECURE_INDEX     (1u << 4)
+#define JARC_FLAG_AUTHENTICATED    (1u << 5)
 
 /* -- Compression algorithm ids (spec §4.6) -------------------------- */
 
@@ -100,6 +102,10 @@
 
 #define JARC_ENTRY_PAGE_ALIGNED (1u << 0)
 #define JARC_ENTRY_ENCRYPTED    (1u << 1)
+#define JARC_ENTRY_AUTHENTICATED (1u << 2)
+
+/* Secure archives append one HMAC-SHA-256 after all ordinary JPAK bytes. */
+#define JARC_AUTH_TAG_SIZE 32u
 
 /* Sentinel meaning "no dictionary" in an entry's dict_id. */
 #define JARC_DICT_ID_NONE 0xFFFFu

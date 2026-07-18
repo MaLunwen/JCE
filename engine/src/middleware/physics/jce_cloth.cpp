@@ -254,6 +254,21 @@ extern "C" JceClothHandle jce_cloth_create(const JceClothDesc *desc)
         }
     }
 
+    /* Our Bullet build is compiled BT_THREADSAFE (bullet3:bt2_thread_locks,
+     * see conanfile.py).  In that configuration the sequential-impulse
+     * solver's getOrInitSolverBody() carries a debug-only
+     * btAssert(isStaticOrKinematicObject()) for every non-rigid collision
+     * object it meets in an island — and then maps it to the static fixed
+     * body regardless.  Soft bodies default to collisionFlags==0, so the
+     * first stepSimulation() of this world __debugbreak()s in Debug while
+     * Release runs fine.  Marking the soft body kinematic simply makes the
+     * flags agree with how the solver already treats it; soft-body dynamics
+     * are unaffected (btSoftBody integrates itself), and this secondary
+     * world only ever contains soft bodies + static box proxies, so there
+     * is no island-sleeping interplay to disturb. */
+    sb->setCollisionFlags(sb->getCollisionFlags() |
+                          btCollisionObject::CF_KINEMATIC_OBJECT);
+
     g_ctx.world->addSoftBody(sb);
 
     g_ctx.slots[slot].body  = sb;
@@ -539,6 +554,11 @@ extern "C" JceSoftBodyHandle jce_softbody_create_ellipsoid(
     }
 
     sb->setTotalMass(desc->mass > 0.0f ? desc->mass : 1.0f, /*fromfaces=*/true);
+
+    /* Kinematic flag for the BT_THREADSAFE solver assert — see the
+     * detailed rationale at the jce_cloth_create addSoftBody site. */
+    sb->setCollisionFlags(sb->getCollisionFlags() |
+                          btCollisionObject::CF_KINEMATIC_OBJECT);
 
     g_ctx.world->addSoftBody(sb);
 

@@ -55,6 +55,22 @@ JCE_API JceUICanvas *jce_ui_canvas_create(JceRenderer         *renderer,
 
 JCE_API void jce_ui_canvas_destroy(JceUICanvas *uc);
 
+/* Process-global content root for canvas assets (project source-assets dir).
+ * When set, UIText fonts resolve from `<root>/<fontPath>` on the host
+ * filesystem FIRST, then fall back to the canvas pak — the editor points
+ * this at the open project so project-authored fonts render without being
+ * baked into the editor's embedded pak.  Pass NULL/"" to clear.  Changing
+ * the root invalidates every canvas's font cache. */
+JCE_API void jce_ui_canvas_set_asset_root(const char *root_dir);
+
+/* App-scoped override for the fallback font used when a UIText leaves its
+ * font_path empty.  Pass a canvas-relative path (e.g. "fonts/MyFont.ttf") to
+ * override; pass NULL/"" to restore the built-in engine default.  Resolves via
+ * the same asset-root / pak lookup as any explicit fontPath and invalidates
+ * cached fonts so the change takes effect immediately.  Leaving it unset keeps
+ * the editor and every other app on the built-in default. */
+JCE_API void jce_ui_canvas_set_default_font(const char *font_path);
+
 /* Render every Screen-Space-Overlay Canvas in `scene` into bgfx `view_id`.
  *
  * This function fully configures `view_id`: it binds the given framebuffer,

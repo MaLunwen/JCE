@@ -34,12 +34,30 @@ extern "C" {
 #include <jce/jce_version.h>
 }
 
-#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (legacy ~/.jce) */
 
-/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+/* Open-project root — owned by dialog_project.cpp (same explicit-root
+ * pattern as jce_project_settings / jce_pak_key).  Declared at global
+ * scope: inside an anonymous namespace the extern would acquire internal
+ * linkage and never bind to the definition. */
+extern char s_current_project_root[512];
+
+/* The enable list is PER-PROJECT (the header always said so — disabling
+ * jce.physics for a 2D project must not disable it everywhere), so it lives
+ * under the OPEN project's root (<root>/.jce/packages.json).  Without a
+ * project we fall back to the legacy per-user ~/.jce copy. */
+static const char *packages_dir(void) {
+    static char d[1024];
+    std::snprintf(d, sizeof(d), "%s/.jce", s_current_project_root);
+    return d;
+}
 static const char *packages_path(void) {
-    static char p[1024]; static bool init = false;
-    if (!init) { jce_editor_dotjce_path("packages.json", p, sizeof(p)); init = true; }
+    static char p[1024];
+    if (s_current_project_root[0])
+        std::snprintf(p, sizeof(p), "%s/.jce/packages.json",
+                      s_current_project_root);
+    else
+        jce_editor_dotjce_path("packages.json", p, sizeof(p));
     return p;
 }
 #define PACKAGES_PATH packages_path()
@@ -132,6 +150,9 @@ static void pkgs_save(void)
     w = std::snprintf(buf + off, cap - off, "\n  ]\n}\n");
     if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
+    /* Project .jce/ dir may not exist yet (fresh project). */
+    if (s_current_project_root[0])
+        jce_fs_host_create_directory(packages_dir());
     ed_write_file(PACKAGES_PATH, buf, off);
     ED_FREE(buf);
 }
@@ -207,12 +228,41 @@ static void pkgs_load_overlay(void)
     ED_FREE(raw);
 }
 
+/* One-time forward-migration: older editors stored the enable list per-user
+ * in ~/.jce/packages.json.  If the open project has no copy yet but the
+ * global one exists, copy it forward so authored enables/user entries carry
+ * over.  The global file is kept: it stays the fallback when no project is
+ * open, and it seeds other not-yet-migrated projects. */
+static void migrate_legacy_packages(void)
+{
+    if (!s_current_project_root[0]) return;   /* no project: global IS the store */
+    if (jce_fs_host_exists_file(PACKAGES_PATH)) return;   /* project copy wins */
+    char legacy[1024];
+    jce_editor_dotjce_path("packages.json", legacy, sizeof(legacy));
+    if (!legacy[0] || !jce_fs_host_exists_file(legacy)) return;
+    jce_fs_host_create_directory(packages_dir());
+    jce_fs_host_copy_file(legacy, PACKAGES_PATH);
+}
+
+/* Project root the current list was loaded for. */
+static char s_pkgs_root[512] = {0};
+
 static void ensure_init(void)
 {
+    /* Follow the open project (the store is project-scoped): a project
+     * switch reloads from the new root instead of saving the previous
+     * project's list into it. */
+    if (s_initialized &&
+        std::strcmp(s_pkgs_root, s_current_project_root) != 0)
+        s_initialized = false;
     if (s_initialized) return;
     s_initialized = true;
+    std::snprintf(s_pkgs_root, sizeof(s_pkgs_root), "%s",
+                  s_current_project_root);
+    s_selected = -1;
     s_pkgs.clear();
     seed_builtin();
+    migrate_legacy_packages();
     pkgs_load_overlay();
 }
 

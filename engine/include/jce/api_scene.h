@@ -14,7 +14,10 @@ extern "C" {
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_async.h>
+#include <jce/middleware/scene/jce_scene_compiler.h>
+#include <jce/middleware/scene/jce_scene_recipe.h>
 #include <jce/middleware/scene/jce_scene_systems.h>
+#include <jce/middleware/scene/jce_scene_transaction.h>
 #include <jce/middleware/scene/jce_space_partition.h>
 
 

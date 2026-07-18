@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.10.3 LANGUAGES C)
+project(JCE VERSION 0.10.14 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -218,6 +218,12 @@ find_package(mimalloc     REQUIRED)
 find_package(enkits       REQUIRED)
 find_package(PhysFS       REQUIRED)
 find_package(cJSON        REQUIRED)
+if(JCE_ENABLE_AI_DISPATCH)
+	# ai_dispatch T1 HTTPS transport.  QUIET on purpose: build trees whose
+	# conan state predates the libcurl requirement still configure -- the
+	# module falls back to its plaintext socket transport when absent.
+	find_package(CURL QUIET)
+endif()
 find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
 find_package(v-hacd       REQUIRED)
@@ -369,6 +375,15 @@ if(JCE_BUILD_VARIANT STREQUAL "dist")
 	endif()
 	set(JCE_RENDERDOC_ENABLED OFF)
 endif()
+# RenderDoc is a native-desktop-only debug aid (injected module + native GPU
+# capture API); its third-party header does not compile under Emscripten, and
+# the Web has no RenderDoc.  Force it OFF for wasm regardless of the option.
+if(EMSCRIPTEN)
+	if(JCE_ENABLE_RENDERDOC)
+		message(STATUS "EMSCRIPTEN/wasm forces RenderDoc capture OFF.")
+	endif()
+	set(JCE_RENDERDOC_ENABLED OFF)
+endif()
 
 # Dist builds must never ship patent-encumbered codecs (AAC/H.264/H.265).
 # Mirror the Tracy pattern with an intermediate variable: the user-facing
@@ -412,7 +427,13 @@ set(JCE_IOS_DIR        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/macos/ios")
 
 include("${JCE_TOOLS_DIR}/compile_shaders.cmake")
 
-set(JCE_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine/resources/assets/shaders")
+# Generated shader binaries are build artifacts.  Keep them per build tree so
+# Release/Dist, architectures, parallel CI jobs, and sandbox users never race
+# over one source-tree output or accidentally package another build's stale
+# backend profile.
+set(JCE_ENGINE_ASSET_BUILD_DIR
+	"${CMAKE_CURRENT_BINARY_DIR}/generated/engine_assets")
+set(JCE_SHADER_OUTPUT_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}/shaders")
 
 # ── Per-platform shader profile selection ───────────────────────────
 # Compile (and pak) only the bgfx renderer back-ends that the target
@@ -429,15 +450,19 @@ if(NOT JCE_SHADER_PROFILES)
 		# profile would only bloat the .pak with unreachable binaries.
 		set(JCE_SHADER_PROFILES mtl spv)
 	elseif(JCE_PLATFORM_ANDROID)
-		# essl1 = GLES2 fallback (P3-34) for legacy mobile.
-		set(JCE_SHADER_PROFILES essl essl1 spv)
+		# NOTE: no essl1 — the runtime shader loader (jce_shaders.c
+		# shader_suffix) maps BGFX_RENDERER_TYPE_OPENGLES to "essl"
+		# unconditionally, so essl1 binaries were built + PAKed but
+		# never loadable (dead .pak weight).  If a real GLES2 tier is
+		# ever wanted, add a caps-based suffix pick there first.
+		set(JCE_SHADER_PROFILES essl spv)
 	elseif(JCE_PLATFORM_WEB)
-		# essl1 = WebGL1 fallback (P3-34).
-		set(JCE_SHADER_PROFILES essl essl1)
+		# NOTE: no essl1 — see the Android note above (never loaded).
+		set(JCE_SHADER_PROFILES essl)
 	elseif(JCE_PLATFORM_LINUX)
 		set(JCE_SHADER_PROFILES spv glsl)
 	else()
-		set(JCE_SHADER_PROFILES dx11 spv glsl essl essl1 mtl)
+		set(JCE_SHADER_PROFILES dx11 spv glsl essl mtl)
 	endif()
 endif()
 message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
@@ -642,7 +667,11 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		# coercion the bundle packer uses, so every deployment path can normalise
 		# .obj/.fbx/.dae to a single runtime mesh format (binary glTF).
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_mesh_convert.cpp"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_mesh_lod_cook.c")
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_mesh_lod_cook.c"
+		# stb-backed decode for the gray16-PNG bypass in jce_cook_texture
+		# (SDL3_image's libpng path heap-overruns on 16-bit grayscale PNGs).
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_image_decode.c"
+		"${JCE_ENGINE_SRC_DIR}/renderer/jce_stb_image_impl.c")
 	# When the SDK install is enabled, jce_cook ships in <sdk>/bin/ so
 	# end-user projects can cook raw assets (textures/audio) without the
 	# editor or a JCE source tree.  Otherwise keep it out of the default
@@ -741,7 +770,10 @@ endif()
 # Asset embedding (per-module PAK files)                              #
 # ------------------------------------------------------------------ #
 
-set(ENGINE_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine/resources/assets")
+# Engine-owned runtime assets are generated into this build-local root.  At
+# present these are the compiled shaders; applications/editor resources retain
+# their normal source roots below.
+set(ENGINE_RESOURCE_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}")
 set(GAME_RESOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/assets")
 set(EDITOR_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/editor/resources/assets")
 set(GAME_ICON_FILE      "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/CK_icon.png")

@@ -159,6 +159,13 @@ typedef struct {
      * frame's color.  UINT16_MAX = no SSR this frame. */
     uint16_t                 ssr_color_tex_handle;
 
+    /* GI L1 (dynamic irradiance probes): the PREVIOUS frame's lit color RT
+     * the probe gather samples (same texture as SSR's).  The gather runs on
+     * the pre-color compute view, so by then the texture still holds LAST
+     * frame's color — paired with last frame's depth + VP like the Hi-Z
+     * cull.  UINT16_MAX = no dynamic GI this frame. */
+    uint16_t                 gi_color_tex_handle;
+
     /* ── Focus-bounded entity collection ("draw distance") ────────────
      * When cull_focus_enabled is true AND cull_radius > 0, the per-frame
      * entity collect skips any entity whose transform origin is farther
@@ -265,6 +272,14 @@ JceSceneRenderer *jce_scene_renderer_create(
     const JceSceneRendererCallbacks *cbs);
 
 JCE_API void jce_scene_renderer_destroy(JceSceneRenderer *sr);
+
+/* Drop every entity-keyed environment cache (vegetation scatter, grass,
+ * water, foliage-cluster canopies).  Call after any operation that
+ * renumbers entity ids while this renderer stays alive — e.g. an editor
+ * undo/redo or scene switch that destroys + recreates the ECS world, which
+ * hands recycled ids back with bumped generation bits and strands every
+ * cached slot.  Content rebuilds lazily on the next draw. */
+JCE_API void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr);
 
 /* ── Per-frame rendering ──────────────────────────────────────────── */
 

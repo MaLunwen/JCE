@@ -653,7 +653,10 @@ void fv_render_video(FvTab *tab)
 
     /* ── Perf overlay (S1 — debug) ───────────────────────────────── */
     ImGui::SameLine();
-    ImGui::Checkbox("perf", &st->show_perf_overlay);
+    char _perf_lbl[64];
+    snprintf(_perf_lbl, sizeof(_perf_lbl), "%s###fv_perf",
+             jce_editor_i18n_or("fileViewer.video.perfOverlay", "perf"));
+    ImGui::Checkbox(_perf_lbl, &st->show_perf_overlay);
     if (st->show_perf_overlay && has_video) {
         JceVideoPerfStats ps;
         if (jce_video_get_perf_stats(st->video, &ps)) {

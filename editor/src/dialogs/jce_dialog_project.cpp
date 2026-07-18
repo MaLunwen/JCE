@@ -16,11 +16,16 @@
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
 #include "ui/jce_editor_tip.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
+#include "core/jce_editor_project_render_pipeline.h"
+#include "core/jce_editor_project_state.h"
+#include "core/jce_editor_state.h"
 #include "core/jce_pak_key.h"
 #include "core/jce_project_settings.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_build_profile.h"
 
 #include <vector>
 
@@ -29,14 +34,41 @@
 char s_current_project_root[512] = {0};
 static char s_last_browse_folder[512] = {0};
 
+/* Lazy one-time restore of the persisted last-browse folder (user-global
+ * editor-session.json) so native dialogs reopen where the user last picked,
+ * across editor restarts.  Kept as a single shared folder for all dialog
+ * purposes on purpose. */
+static void last_browse_folder_load_once(void)
+{
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    jce_editor_ui_state_load_str("dialog.last_browse_folder",
+                                 s_last_browse_folder,
+                                 sizeof(s_last_browse_folder), "");
+}
+
 void set_current_project_root(const char *path)
 {
+    /* Snapshot the OUTGOING project's machine-local overlays (build/run
+     * profile + favourites) while s_current_project_root still names it (the
+     * project store follows the root lazily, so this must run before we
+     * overwrite the root below). */
+    if (s_current_project_root[0]) {
+        jce_editor_build_profile_snapshot();
+        jce_editor_favorites_snapshot();
+    }
+
     if (!path || path[0] == '\0') {
         s_current_project_root[0] = '\0';
+        jce_project_settings_set_root(nullptr);
         jce_assetdb_set_root("");
         jce_editor_project_set_root(nullptr);
         jce_editor_gl10n_unload();
         jce_pak_key_install_process("");  /* clear the process key */
+        JceRenderPipelineDesc pipeline{};
+        jce_render_pipeline_preset_for_current_tier(&pipeline);
+        jce_render_pipeline_apply(&pipeline);
         return;
     }
 
@@ -65,8 +97,21 @@ void set_current_project_root(const char *path)
         buf[--L] = '\0';
 
     snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", buf);
+    jce_project_settings_set_root(s_current_project_root);
     jce_assetdb_set_root(s_current_project_root);
     jce_editor_project_set_root(s_current_project_root);
+
+    /* Render-pipeline assets are project-owned.  Resolve the new root before
+     * touching live renderer state, and use the current hardware-tier preset
+     * when the project has no valid RP asset.  This prevents project B from
+     * inheriting the descriptor last applied by project A. */
+    {
+        JceRenderPipelineDesc pipeline{};
+        if (!jce_editor_project_render_pipeline_load(s_current_project_root,
+                                                     &pipeline))
+            jce_render_pipeline_preset_for_current_tier(&pipeline);
+        jce_render_pipeline_apply(&pipeline);
+    }
 
     /* Install the project's asset-decryption key (if any) process-wide so
      * encrypted PAKs / bundles of this project open transparently in the
@@ -116,6 +161,14 @@ void set_current_project_root(const char *path)
             if (changed) jce_editor_config_save(&cfg);
         }
     }
+
+    /* Overlay this project's own machine-local state now that the project
+     * store follows the new root: build/run profile and scene-view mode /
+     * grid.  Each seeds itself from the current values on first sight, so
+     * nothing is lost migrating from the pre-per-project layout. */
+    jce_editor_build_profile_restore();
+    jce_editor_favorites_restore();
+    jce_state_apply_project_view_settings();
 }
 
 bool is_valid_project_dir(const char *path)
@@ -338,6 +391,7 @@ void pick_folder_dialog_async(const char *title,
     req->completed      = false;
     req->cancelled      = false;
 
+    last_browse_folder_load_once();
     const char *initial = NULL;
     if (default_path && default_path[0] != '\0')
         initial = default_path;
@@ -375,6 +429,7 @@ void save_file_dialog_async(const char *title,
     req->completed      = false;
     req->cancelled      = false;
 
+    last_browse_folder_load_once();
     const char *initial = NULL;
     if (default_path && default_path[0] != '\0')
         initial = default_path;
@@ -406,6 +461,7 @@ void open_file_dialog_async(const char *title,
     req->completed      = false;
     req->cancelled      = false;
 
+    last_browse_folder_load_once();
     const char *initial = NULL;
     if (default_path && default_path[0] != '\0')
         initial = default_path;
@@ -439,8 +495,11 @@ void jce_editor_dialogs_pump_pending(void)
                 snprintf(req->primary, req->primary_size, "%s", p);
             if (req->secondary && req->secondary_size > 0)
                 snprintf(req->secondary, req->secondary_size, "%s", p);
+            last_browse_folder_load_once();  /* mark loaded before overwrite */
             snprintf(s_last_browse_folder, sizeof(s_last_browse_folder),
                      "%s", p);
+            jce_editor_ui_state_save_str("dialog.last_browse_folder",
+                                         s_last_browse_folder);
             if (req->ready_flag)     *req->ready_flag     = true;
         } else {
             if (req->cancelled_flag) *req->cancelled_flag = true;
@@ -641,11 +700,14 @@ void jce_editor_dialog_new_project(bool *p_open)
                         jce_render_pipeline_save(rp_path, &rp_desc);
                     }
 
-                    /* Add to recent projects. */
+                    /* Add to recent projects and record it as the last
+                     * opened project (consumed by has_known_startup_project
+                     * and the asset-browser root resolution at next boot). */
                     JceEditorConfig ecfg;
                     jce_editor_config_load(&ecfg);
                     jce_editor_config_add_recent(&ecfg, project_dir);
-                    ecfg.last_project[0] = '\0';
+                    snprintf(ecfg.last_project, sizeof(ecfg.last_project),
+                             "%s", project_dir);
                     jce_editor_config_save(&ecfg);
 
                     /* Set the asset browser root to the new project. */
@@ -978,7 +1040,12 @@ void jce_editor_dialog_open_project(bool *p_open)
                     if (!s_open_project.cfg_loaded)
                         jce_editor_config_load(&s_open_project.cfg);
                     jce_editor_config_add_recent(&s_open_project.cfg, project_root.c_str());
-                    s_open_project.cfg.last_project[0] = '\0';
+                    /* Record as last opened project (consumed by
+                     * has_known_startup_project and the asset-browser root
+                     * resolution at next boot). */
+                    snprintf(s_open_project.cfg.last_project,
+                             sizeof(s_open_project.cfg.last_project),
+                             "%s", project_root.c_str());
                     jce_editor_config_save(&s_open_project.cfg);
 
                     /* Set the asset browser root to the project directory. */
@@ -988,6 +1055,19 @@ void jce_editor_dialog_open_project(bool *p_open)
                              sizeof(s_open_project.manual_path), "%s",
                              project_root.c_str());
                     jce_editor_layout_request_focus_scene_view();
+
+                    /* Resume THIS project's last-open scene (each project
+                     * remembers its own; the global last_scene only drives
+                     * cold-boot restore).  Skip when absent or the file is
+                     * gone — the user lands on whatever is already open. */
+                    {
+                        char last_scene[512];
+                        if (jce_editor_pstate_get_str("last_scene", last_scene,
+                                                      sizeof(last_scene)) &&
+                            last_scene[0] &&
+                            jce_fs_host_exists_file(last_scene))
+                            jce_state_load_scene_file_async(last_scene);
+                    }
 
                     jce_editor_console_log("Opened project: %s", project_root.c_str());
                     *p_open = false;

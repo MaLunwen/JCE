@@ -88,19 +88,19 @@ bool jce_render_settings_save_json(const char *vfs_path, const JceRenderSettings
     return ok;
 }
 
-bool jce_render_settings_load_json(const char *vfs_path, JceRenderSettings *out)
+/* Parse render settings from an already-loaded JSON buffer.  The single-exe
+ * runtime uses this to read render_settings.json straight from the embedded
+ * PAK (jce_pak_decompress bytes) when no loose cooked tree is on disk. */
+bool jce_render_settings_load_json_mem(const char *json, size_t len,
+                                       JceRenderSettings *out)
 {
-    if (!vfs_path || !out) return false;
+    if (!json || !out) return false;
+    if (len == 0) len = strlen(json);
+    if (len > (1u << 20)) return false;
 
-    uint64_t sz = 0;
-    char *buf = (char *)jce_fs_host_read_all(vfs_path, &sz);
-    if (!buf) return false;
-    if (sz == 0 || sz > (1u << 20)) { JCE_FREE(buf); return false; }
-
-    JceJson *root = jce_json_parse(buf, (size_t)sz);
-    JCE_FREE(buf);
+    JceJson *root = jce_json_parse(json, len);
     if (!root) {
-        LOG_WARN(LOG_TAG, "invalid render settings JSON: %s", vfs_path);
+        LOG_WARN(LOG_TAG, "%s", "invalid render settings JSON (mem)");
         return false;
     }
 
@@ -167,4 +167,19 @@ bool jce_render_settings_load_json(const char *vfs_path, JceRenderSettings *out)
 
     jce_json_free(root);
     return true;
+}
+
+bool jce_render_settings_load_json(const char *vfs_path, JceRenderSettings *out)
+{
+    if (!vfs_path || !out) return false;
+
+    uint64_t sz = 0;
+    char *buf = (char *)jce_fs_host_read_all(vfs_path, &sz);
+    if (!buf) return false;
+    if (sz == 0 || sz > (1u << 20)) { JCE_FREE(buf); return false; }
+
+    bool ok = jce_render_settings_load_json_mem(buf, (size_t)sz, out);
+    if (!ok) LOG_WARN(LOG_TAG, "invalid render settings JSON: %s", vfs_path);
+    JCE_FREE(buf);
+    return ok;
 }

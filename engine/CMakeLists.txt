@@ -128,6 +128,10 @@ _jce_add_layer(jce_platform
 		jce_core
 	LINK_PRIVATE
 		SDL3_image::SDL3_image)
+if(WIN32)
+	# jce_tcp.c (minimal TCP client for the ai_dispatch HTTP transport)
+	target_link_libraries(jce_platform PRIVATE ws2_32)
+endif()
 
 # ================================================================== #
 # L3 — Independent subsystems (depend only on L0)                     #
@@ -241,6 +245,14 @@ _jce_add_layer(jce_physics
 	LINK_PRIVATE box2d::box2d Bullet::Bullet v-hacd::v-hacd
 	CXX)
 
+# Compile in the OPT-IN multithreaded Bullet pipeline (btDiscreteDynamicsWorldMt
+# + Mt dispatcher/solver-pool). JCE_PHYSICS_MT only ARMS the path; it stays
+# single-threaded at runtime unless a world is created with multithreaded=true
+# (env JCE_PHYSICS_MT, gated to >1 core). BT_THREADSAFE must match how Bullet
+# was built (conanfile bullet3:bt2_thread_locks=True) — the recipe does not
+# propagate it to consumers, and the Mt classes' locks are no-ops without it.
+target_compile_definitions(jce_physics PRIVATE JCE_PHYSICS_MT=1 BT_THREADSAFE=1)
+
 # VHACD is a heavy single-header library; silence its warnings on the one
 # TU that pulls in its implementation.
 set_source_files_properties(
@@ -316,6 +328,40 @@ _jce_add_layer(jce_save
 	# save layer links the scene layer.  jce_scene is declared above and does
 	# not link jce_save, so there is no dependency cycle.
 	LINK_PRIVATE jce_scene)
+
+option(JCE_ENABLE_AI_DISPATCH
+	"Compile the ai_dispatch middleware (constraint-record scene parameter \
+generation).  Private module: excluded from public source packages.  Keep \
+OFF for any distributable build." OFF)
+
+if(JCE_ENABLE_AI_DISPATCH)
+	_jce_add_layer(jce_ai_dispatch
+		DIRS      middleware/ai_dispatch
+		LINK_PUBLIC  jce_core
+		# jce_aid_save.c persists the session record log through the generic
+		# snapshot registry.  jce_save links only jce_core/jce_scene and never
+		# jce_ai_dispatch, so this private edge introduces no cycle.
+		# cjson: JSON boundary of the network tiers (jce_aid_json.c);
+		# jce_platform: jce_tcp for the plaintext HTTP transport.
+		LINK_PRIVATE xxHash::xxhash jce_save cjson::cjson jce_platform)
+	target_compile_definitions(jce_ai_dispatch PUBLIC JCE_ENABLE_AI_DISPATCH=1)
+	if(CURL_FOUND)
+		# Production T1 HTTPS transport (jce_aid_transport_curl.c compiles
+		# to a stub without this define).
+		# PRIVATE: curl must NOT propagate its INTERFACE definitions to
+		# downstream C++ TUs (they macroize types and break xkeycheck /
+		# SDL static asserts).  The SDK fat-lib collector picks curl up
+		# explicitly instead (see JCESDKInstall.cmake) so private-SDK
+		# consumers still resolve curl_*.
+		target_link_libraries(jce_ai_dispatch PRIVATE CURL::libcurl)
+		# CURL_STATICLIB is MANDATORY for static libcurl: without it curl.h
+		# declares every entry point __declspec(dllimport) (__imp_curl_*),
+		# which no static archive provides.  The conan recipe propagates it
+		# inconsistently across configs, so pin it ourselves.
+		target_compile_definitions(jce_ai_dispatch PRIVATE
+			JCE_AID_HAVE_CURL=1 CURL_STATICLIB=1)
+	endif()
+endif()
 
 # ================================================================== #
 # L3 — Graphics + Render (depends on L0, L1, animation)              #
@@ -457,6 +503,27 @@ _jce_add_layer(jce_application
 	LINK_PRIVATE
 		bgfx::bgfx)
 
+# The embedded-PAK key fallback must not live in the application archive.
+# SDK consumers force-load every first-party member; keeping the fallback in
+# that archive would collide with a generated per-application key object.
+# A normal static archive gives the linker the intended override semantics:
+# it extracts the zero fallback only while the public key symbols are still
+# unresolved.
+set(_JCE_PAK_KEY_DEFAULT_SOURCE
+	"${_ENGINE_SRC}/application/jce_pak_key_default.c")
+get_target_property(_jce_application_sources jce_application SOURCES)
+list(REMOVE_ITEM _jce_application_sources "${_JCE_PAK_KEY_DEFAULT_SOURCE}")
+set_property(TARGET jce_application PROPERTY SOURCES
+	"${_jce_application_sources}")
+
+add_library(jce_pak_key_defaults STATIC "${_JCE_PAK_KEY_DEFAULT_SOURCE}")
+target_include_directories(jce_pak_key_defaults PRIVATE
+	"${_ENGINE_INC}"
+	"${CMAKE_BINARY_DIR}/include")
+target_compile_definitions(jce_pak_key_defaults PRIVATE
+	JCE_BUILDING_ENGINE=1)
+target_link_libraries(jce_application PUBLIC jce_pak_key_defaults)
+
 if(JCE_BUILD_JNI)
 	# jce_jni_bridge.c lives in jce_platform (os/platform/) and is guarded by
 	# JCE_BUILD_JNI — both the definition and JNI headers must be on that target.
@@ -496,6 +563,13 @@ target_link_libraries(JCE INTERFACE
 	jce_ui
 	jce_resource
 	jce_application)
+
+if(JCE_ENABLE_AI_DISPATCH)
+	target_link_libraries(JCE INTERFACE jce_ai_dispatch)
+	# jce_engine.c pumps ai_dispatch at input parity (guarded include);
+	# ai_dispatch links only jce_core/jce_save/jce_platform -- no cycle.
+	target_link_libraries(jce_application PUBLIC jce_ai_dispatch)
+endif()
 
 # ── Platform-specific link options (on the facade) ──
 if(JCE_PLATFORM_WEB)

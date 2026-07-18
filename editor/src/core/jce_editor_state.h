@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/application/jce_runtime.h>
 #include <jce/resource/jce_streaming.h>   /* JceStreamPreviewMode */
 
 /* ── Edit Mode ─────────────────────────────────────────────────────── */
@@ -174,6 +175,17 @@ void              jce_state_attach_streamer_hlod(struct JceWorldStreamer *ws);
 void              jce_state_detach_streamer_hlod(void);
 uint32_t          jce_state_create_entity(const char *name, uint32_t parent_id);
 void              jce_state_delete_entity(uint32_t id);
+/* In-editor Performance Benchmark (Profiler "Benchmark" tab): spawn/clear a
+ * standard stress workload (kind: 0 Draw Call / 1 Instancing / 2 Triangle /
+ * 3 Entity Count / 4 Physics) using the bulk-spawn machinery. */
+void              jce_state_benchmark_spawn(int kind, int count);
+void              jce_state_benchmark_clear(void);
+uint32_t          jce_state_benchmark_spawned(void);
+int               jce_state_benchmark_kind(void);
+/* Isolated-scene mode: hide/restore everything that is not the active benchmark
+ * (mesh renderers + terrain) so the live stats measure only the workload. */
+void              jce_state_benchmark_isolate(int on);
+int               jce_state_benchmark_is_isolated(void);
 void              jce_state_rename_entity(uint32_t id, const char *name);
 void              jce_state_set_entity_enabled(uint32_t id, bool enabled);
 void              jce_state_set_entity_tag(uint32_t id, const char *tag);
@@ -236,7 +248,7 @@ bool          jce_state_get_pivot_edit_mode(void);
 
 /* Gizmo Ctrl-snap increments (translate units / rotate degrees / scale
  * ratio).  Read by the gizmo snap path; edited via the Scene View "Snap"
- * popup.  Setters persist to .jce/editor-config.json. */
+ * popup.  Setters persist to ~/.jce/editor-preferences.json. */
 float jce_state_get_gizmo_snap_translate(void);
 float jce_state_get_gizmo_snap_rotate(void);
 float jce_state_get_gizmo_snap_scale(void);
@@ -252,6 +264,9 @@ void              jce_state_set_view_mode(JceSceneViewMode mode);
 JceSceneViewMode  jce_state_get_view_mode(void);
 bool              jce_state_get_show_grid(void);
 void              jce_state_set_show_grid(bool show);
+/* Apply the opened project's per-project view mode / grid over the global
+ * fallback.  Call after the project store follows a new project root. */
+void              jce_state_apply_project_view_settings(void);
 bool              jce_state_get_show_physics_debug(void);
 void              jce_state_set_show_physics_debug(bool show);
 bool              jce_state_get_show_joint_gizmos(void);
@@ -279,6 +294,8 @@ typedef enum {
     JCE_SHOW_FLAG_STATS_OVERLAY  = 1u <<  7,
     JCE_SHOW_FLAG_NAVMESH        = 1u <<  8,
     JCE_SHOW_FLAG_STREAMING      = 1u <<  9,
+    JCE_SHOW_FLAG_UI             = 1u << 10,  /* ECS-UI Canvas overlay in Scene View */
+    JCE_SHOW_FLAG_PARTICLE_ICONS = 1u << 11,  /* particle-emitter source gizmo icons */
 } JceShowFlag;
 
 uint32_t          jce_state_get_show_flags(void);
@@ -326,7 +343,17 @@ bool              jce_state_load_scene_from_jbundle(const char *jbundle_path);
  * and read-only semantics. */
 bool              jce_state_load_scene_from_catalog(const char *catalog_path,
                                                     const char *bundle_id_or_scene);
+/* Leave read-only Bundle Preview and restore source-project content routing.
+ * Idempotent; used by non-file scene transitions such as New Scene and editor
+ * shutdown.  Plain scene loaders call it internally. */
+void              jce_state_close_bundle_preview(void);
 bool              jce_state_save_scene_file(const char *scene_path);
+/* Flagged save: JCE_SAVE_AUTOSAVE skips the diagnostic synchronous
+ * round-trip re-load and the auto-repack hook (hitch-quality for the
+ * periodic timer save; manual saves keep full validation). */
+enum { JCE_SAVE_AUTOSAVE = 1u << 0 };
+bool              jce_state_save_scene_file_ex(const char *scene_path,
+                                               uint32_t flags);
 /* Per-frame pump for background scene-serial jobs (async post-save mesh
  * validation).  Call once per editor frame from the main loop. */
 void              jce_state_scene_serial_poll(void);
@@ -345,14 +372,24 @@ void          jce_state_step(float dt);
 JcePlayState  jce_state_get_play_state(void);
 void          jce_state_play_mode_tick(float dt);
 
+/* JCE_STRESS_MOVERS=N harness (DOTS-floor L2 soak): record stress-spawned
+ * entities and wiggle the first N through the real set_transform path every
+ * frame.  Both are inert when the env is unset. */
+void          jce_state_stress_record_mover(uint32_t id);
+void          jce_state_stress_move_tick(float dt);
+
 /* Player-character input bridge (Game View panel → Play tick).
  * Push the desired walk DIRECTION (world-space horizontal, unit length)
  * and button state each frame the panel is captured + Play is active —
  * speeds come from the authored CharacterController component.  Ignored
  * if no scene entity has a CharacterController. */
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
-                                       bool jump_pressed, bool jump_held,
-                                       bool sprint, bool attack);
+                                      bool jump_pressed, bool jump_held,
+                                      bool sprint, bool attack);
+void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
+                                       unsigned int buttons);
+void jce_editor_play_set_touch_input(
+    const JceRuntimeTouch *touches, int count);
 
 /* Returns true and writes the player character's world position if a
  * character is alive; false otherwise. */

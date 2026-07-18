@@ -1826,6 +1826,14 @@ uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
 
     if (!con) return UINT32_MAX;
 
+    /* Every joint is queryable through jce_bullet_constraint_applied_impulse
+     * (break monitors poll it each tick).  Bullet only accumulates
+     * m_appliedImpulse when feedback is enabled; without this the query
+     * btAsserts in Debug and silently returns 0 in Release — which made
+     * impulse-based joint breaking inert.  Cost is one scalar store per
+     * solver iteration. */
+    con->enableFeedback(true);
+
     bw->world->addConstraint(con, disable_collision);
     bw->constraints[idx] = con;
     bw->con_alive[idx] = true;
@@ -1967,6 +1975,11 @@ uint32_t jce_bullet_configurable_joint_create(JceBulletWorld *bw,
         btScalar al = angular_limit_rad ? btScalar(angular_limit_rad[a]) : btScalar(0);
         cfg_apply_axis(dof, 3 + a, ang_motion ? ang_motion[a] : 0, al);
     }
+
+    /* Feedback for applied-impulse queries — same rationale as the generic
+     * joint path: the configurable-joint break monitor reads
+     * getAppliedImpulse() every tick, which requires feedback enabled. */
+    dof->enableFeedback(true);
 
     bw->world->addConstraint(dof, disable_collision);
     bw->constraints[idx] = dof;

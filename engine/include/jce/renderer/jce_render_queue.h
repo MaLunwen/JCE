@@ -66,9 +66,17 @@ typedef struct {
  * model matrix = 4 vec4 = 64 bytes; callers may extend with extra
  * vec4 columns (e.g. tint colour) by widening `stride_vec4`. */
 typedef struct {
-    const void *data;          /* pointer to instance_count * stride bytes */
+    const void *data;          /* pointer to instance_count * stride bytes
+                                * (ignored when persist_vb != 0) */
     uint32_t    instance_count;/* must be >= 2 to actually instance */
     uint16_t    stride_vec4;   /* number of vec4 (16 B) per instance, >= 4 */
+    /* Persistent GPU instance source (千万 S1): a bgfx dynamic-vertex-buffer
+     * holding the instance attributes, stored as idx+1 (0 = none → upload `data`
+     * to a transient buffer per frame as before). When set, the flush binds it
+     * via set_instance_data_from_dynamic_vertex_buffer — NO per-frame CPU copy,
+     * so per-frame cost is O(1) regardless of instance_count. The VB layout must
+     * declare the 4 instance attributes (mat4) the instanced VS reads. */
+    uint16_t    persist_vb;
 } JceInstanceBatch;
 
 /* ================================================================== */

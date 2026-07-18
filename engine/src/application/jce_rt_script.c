@@ -11,6 +11,8 @@
 
 #include "jce_rt_internal.h"
 
+#include "middleware/scene/jce_scene_internal.h"  /* JSON bridges (comp/render get/set) */
+
 static void rt_script_log(void *user, const char *msg)
 {
 	(void)user;
@@ -394,6 +396,53 @@ static float rt_script_action_axis(void *user, const char *name)
 	return id >= 0 ? jce_action_value(rt->actions, id) : 0.0f;
 }
 
+static void rt_script_pointer_delta(void *user, float out_xy[2])
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!out_xy) return;
+	out_xy[0] = rt ? rt->input.pointer_dx : 0.0f;
+	out_xy[1] = rt ? rt->input.pointer_dy : 0.0f;
+}
+
+static float rt_script_pointer_wheel(void *user)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	return rt ? rt->input.pointer_wheel : 0.0f;
+}
+
+static bool rt_script_pointer_button(void *user, int button)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || button < 1 || button > 32) return false;
+	return (rt->input.pointer_buttons & (1u << (button - 1))) != 0;
+}
+
+static int rt_script_touch_count(void *user)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || rt->input.touch_count < 0) return 0;
+	if (rt->input.touch_count > JCE_RUNTIME_MAX_TOUCHES)
+		return JCE_RUNTIME_MAX_TOUCHES;
+	return rt->input.touch_count;
+}
+
+static bool rt_script_touch_get(void *user, int index, uint64_t *id,
+								float *x, float *y, float *pressure)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	const JceRuntimeTouch *touch;
+	int count = rt_script_touch_count(user);
+
+	if (!rt || index < 0 || index >= count)
+		return false;
+	touch = &rt->input.touches[index];
+	if (id) *id = touch->id;
+	if (x) *x = touch->x;
+	if (y) *y = touch->y;
+	if (pressure) *pressure = touch->pressure;
+	return true;
+}
+
 /* jce.get_velocity: read the entity body's linear velocity into out[3]. */
 static bool rt_script_get_velocity(void *user, JceScriptEntity e, float out[3])
 {
@@ -450,7 +499,7 @@ static void rt_script_play_sound(void *user, const char *path,
 {
 	JceRuntime *rt = (JceRuntime *)user;
 	if (!rt || !rt->audio || !path || !path[0]) return;
-	JceSound snd = jce_audio_load(rt->audio, rt->pak, path);
+	JceSound snd = rt_load_sound(rt, path);
 	if (snd == JCE_SOUND_INVALID) {
 		LOG_WARN(LOG_TAG, "jce.play_sound: cannot load '%s'", path);
 		return;
@@ -768,6 +817,115 @@ static void rt_script_particle_set_emitting(void *user, JceScriptEntity e, bool 
 	jce_scene_particle_set_emitting(rt->scene, (JceEntity)e, on);
 }
 
+/* jce.particle_set_color(entity, r, g, b): retint the entity emitter's newly
+ * spawned particles (no-op when the entity has no emitter). */
+static void rt_script_particle_set_color(void *user, JceScriptEntity e,
+                                         float r, float g, float b)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return;
+	jce_scene_particle_set_color(rt->scene, (JceEntity)e, r, g, b);
+}
+
+/* ── Scene-driver host (editor-Play/runtime logic parity) ─────────────────
+ * Thin passthroughs to the scene's query + JSON-reflection surfaces so a
+ * scene-bound script can own look/season/weather logic that used to need
+ * app exe code.  All are safe no-ops without a scene. */
+
+static int rt_script_find_by_name(void *user, const char *name,
+                                  JceScriptEntity *out, int max)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene || !name || !out || max <= 0) return 0;
+	/* JceScriptEntity is the raw entity id — query directly into a small
+	 * local then widen (the two types share representation but not size
+	 * guarantees). */
+	JceEntity tmp[64];
+	int want = max < 64 ? max : 64;
+	int n = jce_scene_query_by_name(rt->scene, name, tmp, want);
+	for (int i = 0; i < n; i++) out[i] = (JceScriptEntity)tmp[i];
+	return n;
+}
+
+typedef struct {
+	const char      *prefix;
+	size_t           plen;
+	JceScriptEntity *out;
+	int              max;
+	int              n;
+} RtFindPrefixCtx;
+
+static void rt_find_prefix_cb(JceScene *s, JceEntity e, void *ud)
+{
+	RtFindPrefixCtx *c = (RtFindPrefixCtx *)ud;
+	if (c->n >= c->max) return;
+	const char *nm = jce_scene_entity_name(s, e);
+	if (nm && strncmp(nm, c->prefix, c->plen) == 0)
+		c->out[c->n++] = (JceScriptEntity)e;
+}
+
+static int rt_script_find_by_prefix(void *user, const char *prefix,
+                                    JceScriptEntity *out, int max)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene || !prefix || !out || max <= 0) return 0;
+	RtFindPrefixCtx c = { prefix, strlen(prefix), out, max, 0 };
+	jce_scene_each_entity(rt->scene, rt_find_prefix_cb, &c);
+	return c.n;
+}
+
+static char *rt_script_comp_get_json(void *user, JceScriptEntity e,
+                                     const char *type)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return NULL;
+	return jce_scene_component_to_json(rt->scene, (JceEntity)e, type);
+}
+
+static bool rt_script_comp_set_json(void *user, JceScriptEntity e,
+                                    const char *type, const char *json)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return false;
+	return jce_scene_component_apply_json(rt->scene, (JceEntity)e, type, json);
+}
+
+static char *rt_script_render_get_json(void *user)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return NULL;
+	return jce_scene_rendering_to_json(rt->scene);
+}
+
+static bool rt_script_render_set_json(void *user, const char *json)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return false;
+	return jce_scene_rendering_apply_json(rt->scene, json);
+}
+
+static void rt_script_json_free(void *user, char *s)
+{
+	(void)user;
+	jce_scene_json_free(s);
+}
+
+/* jce.audio_set_volume(entity, vol): update the live voice AND its authored
+ * base (the occlusion pass rescales from base_volume each frame — see
+ * jce_rt_audio.c — so writing only the live voice would be overwritten). */
+static void rt_script_audio_set_volume(void *user, JceScriptEntity e, float vol)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->audio) return;
+	if (vol < 0.0f) vol = 0.0f;
+	for (int i = 0; i < rt->voice_count; ++i) {
+		VoiceEntry *ve = &rt->voices[i];
+		if (ve->entity != (JceEntity)e) continue;
+		ve->base_volume = vol;
+		jce_audio_set_volume(rt->audio, ve->voice, vol);
+	}
+}
+
 /* File-watcher callback: a script's source changed on disk → hot-reload it. */
 void rt_on_script_changed(const char *path, void *user)
 {
@@ -980,6 +1138,11 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.action_down    = rt_script_action_down;
 	host.action_pressed = rt_script_action_pressed;
 	host.action_axis    = rt_script_action_axis;
+	host.pointer_delta = rt_script_pointer_delta;
+	host.pointer_wheel = rt_script_pointer_wheel;
+	host.pointer_button = rt_script_pointer_button;
+	host.touch_count = rt_script_touch_count;
+	host.touch_get = rt_script_touch_get;
 	host.play_sound     = rt_script_play_sound;
 	host.ui_get_slider  = rt_script_ui_get_slider;
 	host.ui_set_slider  = rt_script_ui_set_slider;
@@ -997,6 +1160,15 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.rpc_send       = rt_script_rpc_send;
 	host.particle_burst = rt_script_particle_burst;
 	host.particle_set_emitting = rt_script_particle_set_emitting;
+	host.particle_set_color = rt_script_particle_set_color;
+	host.find_by_name     = rt_script_find_by_name;
+	host.find_by_prefix   = rt_script_find_by_prefix;
+	host.comp_get_json    = rt_script_comp_get_json;
+	host.comp_set_json    = rt_script_comp_set_json;
+	host.render_get_json  = rt_script_render_get_json;
+	host.render_set_json  = rt_script_render_set_json;
+	host.json_free        = rt_script_json_free;
+	host.audio_set_volume = rt_script_audio_set_volume;
 	rt->script_vm = jce_script_create(&host);
 	/* Script hot-reload watcher (editor dev; inert in shipped).  The
 	 * physics contact -> script on_collision bridge is wired per scene in

@@ -11,7 +11,10 @@
 #include <jce/renderer/jce_renderer_caps.h>
 
 #include <bgfx/c99/bgfx.h>
+#include <SDL3/SDL_cpuinfo.h>   /* SDL_GetNumLogicalCPUCores / SDL_GetSystemRAM */
 #include <stdbool.h>
+#include <stdlib.h>             /* getenv */
+#include <string.h>
 
 #define LOG_TAG "renderer_caps"
 
@@ -95,19 +98,62 @@ static JceGpuTier s_detect_tier(void)
     if (caps->limits.maxTextureSize >= 8192)
         score += 1;
 
-    /* Classify. */
-    if (score >= 7)
-        return JCE_GPU_TIER_HIGH;
-    if (score >= 4)
-        return JCE_GPU_TIER_MEDIUM;
-    return JCE_GPU_TIER_LOW;
+    /* Classify from the GPU score. */
+    JceGpuTier tier = (score >= 7) ? JCE_GPU_TIER_HIGH
+                    : (score >= 4) ? JCE_GPU_TIER_MEDIUM
+                                   : JCE_GPU_TIER_LOW;
+
+    /* Factor CPU cores + system RAM so the tier reflects the WHOLE device, not
+     * just the GPU (charter baseline = single-core / 512 MB / no discrete GPU).
+     * Only ever LOWERS the tier: a capable GPU starved by a weak CPU or little
+     * RAM must not be auto-driven at a high preset.  This is the auto-detect
+     * default; the user (or editor) can still force a tier via
+     * jce_renderer_set_tier_override(). */
+    {
+        int cores = SDL_GetNumLogicalCPUCores();   /* >= 1 */
+        int ram   = SDL_GetSystemRAM();            /* MB; 0 if unknown */
+        if (ram > 0 && ram < 1024 && tier > JCE_GPU_TIER_LOW)
+            tier = JCE_GPU_TIER_LOW;
+        else if (ram > 0 && ram < 2048 && tier > JCE_GPU_TIER_MEDIUM)
+            tier = JCE_GPU_TIER_MEDIUM;
+        if (cores > 0 && cores <= 1 && tier > JCE_GPU_TIER_LOW)
+            tier = JCE_GPU_TIER_LOW;
+        LOG_INFO(LOG_TAG,
+                 "capability auto-detect: gpu-score=%d cores=%d ram=%dMB -> tier=%s",
+                 score, cores, ram, jce_gpu_tier_name(tier));
+    }
+    return tier;
 }
 
 JceGpuTier jce_renderer_get_tier(void)
 {
+    /* Headless / QA force: JCE_GPU_TIER=low|medium|high|ultra (or 0..3) forces a
+     * tier above everything else (incl. the editor's HIGH pin), so any device
+     * class — notably the LOW charter baseline — can be profiled without UI.
+     * Parsed once. */
+    static int s_env_tier = -2;   /* -2 unparsed, -1 none, >=0 forced */
+    if (s_env_tier == -2) {
+        const char *e = getenv("JCE_GPU_TIER");
+        s_env_tier = -1;
+        if (e && e[0]) {
+            if      (!strcmp(e, "low")    || e[0] == '0') s_env_tier = (int)JCE_GPU_TIER_LOW;
+            else if (!strcmp(e, "medium") || !strcmp(e, "mid") || e[0] == '1') s_env_tier = (int)JCE_GPU_TIER_MEDIUM;
+            else if (!strcmp(e, "high")   || e[0] == '2') s_env_tier = (int)JCE_GPU_TIER_HIGH;
+            else if (!strcmp(e, "ultra")  || e[0] == '3') s_env_tier = (int)JCE_GPU_TIER_ULTRA;
+        }
+    }
+    if (s_env_tier >= 0)
+        return (JceGpuTier)s_env_tier;
+
     if (s_tier_override_active)
         return (JceGpuTier)s_tier_override_value;
-    return s_detect_tier();
+    /* Memoize: detection (bgfx caps + CPU/RAM probe) is process-invariant, and
+     * get_tier() is polled per frame (e.g. the grass-field gate), so re-running
+     * the bgfx_get_caps scan + SDL probes every frame was pure waste. */
+    static int s_cached_tier = -1;
+    if (s_cached_tier < 0)
+        s_cached_tier = (int)s_detect_tier();
+    return (JceGpuTier)s_cached_tier;
 }
 
 /* ── Capability flags ─────────────────────────────────────────────── */
@@ -143,11 +189,39 @@ uint32_t jce_renderer_get_caps(void)
     return flags;
 }
 
+/* Active bgfx backend as the canonical JceRendererBackend (no-arg global;
+ * lets middleware branch on the backend without touching bgfx directly). */
+JceRendererBackend jce_renderer_get_active_backend(void)
+{
+    switch (bgfx_get_renderer_type()) {
+    case BGFX_RENDERER_TYPE_DIRECT3D11: return JCE_BACKEND_D3D11;
+    case BGFX_RENDERER_TYPE_DIRECT3D12: return JCE_BACKEND_D3D12;
+    case BGFX_RENDERER_TYPE_VULKAN:     return JCE_BACKEND_VULKAN;
+    case BGFX_RENDERER_TYPE_OPENGL:     return JCE_BACKEND_OPENGL;
+    case BGFX_RENDERER_TYPE_OPENGLES:   return JCE_BACKEND_OPENGLES;
+    case BGFX_RENDERER_TYPE_METAL:      return JCE_BACKEND_METAL;
+    default:                            return JCE_BACKEND_AUTO;
+    }
+}
+
 /* ── Recommendations ──────────────────────────────────────────────── */
 
 JceRenderRecommendation jce_renderer_get_recommendation(void)
 {
     JceGpuTier tier = jce_renderer_get_tier();
+
+    /* MEMOIZED per tier: this is called from per-frame render paths (the
+     * scene shadow-resolution tier clamp), and rebuilding the struct — and
+     * especially LOGGING it — on every call flooded the log with thousands
+     * of identical "GPU tier: ..." lines per minute.  The recommendation
+     * only changes when the tier does (status-bar override / JCE_GPU_TIER),
+     * so recompute + log exactly then. */
+    static bool                    s_rec_valid = false;
+    static JceGpuTier              s_rec_tier;
+    static JceRenderRecommendation s_rec_cache;
+    if (s_rec_valid && s_rec_tier == tier)
+        return s_rec_cache;
+
     const bgfx_caps_t *caps = bgfx_get_caps();
     JceRenderRecommendation rec;
 
@@ -219,6 +293,7 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
         break;
     }
 
+    /* Logged once per tier value (see memoization above). */
     LOG_INFO(LOG_TAG,
         "GPU tier: %s  shadow=%u  postfx=%u  pbr=%s  ssr=%s ssao=%s taa=%s "
         "volfog=%s gpupart=%s discrete=%s",
@@ -232,6 +307,9 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
         rec.enable_gpu_particles  ? "on" : "off",
         rec.has_discrete_gpu      ? "yes" : "no");
 
+    s_rec_cache = rec;
+    s_rec_tier  = tier;
+    s_rec_valid = true;
     return rec;
 }
 
@@ -299,7 +377,7 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
      * CMakeLists.txt (we only list backends whose .bin shaders are
      * actually built on this platform):
      *
-     *   Windows : dx11 spv glsl  → D3D12 Vulkan D3D11 OpenGL
+     *   Windows : dx11 spv glsl  → D3D12 D3D11 Vulkan OpenGL
      *   macOS   : mtl  spv       → Metal Vulkan
      *   iOS/tvOS: mtl  spv       → Metal Vulkan
      *   Linux   : spv  glsl      → Vulkan OpenGL
@@ -312,10 +390,15 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
     static const enum JceRendererBackend chain[] = {
 #if JCE_PLATFORM_WINDOWS
         /* D3D12 (lowest overhead, modern PSO model) →
-         * Vulkan  (modern explicit API, good perf on NV/AMD) →
-         * D3D11  (mature, broadest driver compatibility) →
+         * D3D11  (mature, broadest driver compatibility — the industry
+         *         first fallback: UE5 and Unity both fall from D3D12 to
+         *         D3D11, never to Vulkan, because on Windows a machine
+         *         that fails D3D12 almost always still has a solid D3D11
+         *         path while Vulkan driver quality varies wildly) →
+         * Vulkan (modern explicit API; on Windows it is the exotic
+         *         option — kept ahead of GL but behind both D3D tiers) →
          * OpenGL (final compatibility fallback). */
-        JCE_BACKEND_D3D12, JCE_BACKEND_VULKAN, JCE_BACKEND_D3D11, JCE_BACKEND_OPENGL,
+        JCE_BACKEND_D3D12, JCE_BACKEND_D3D11, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
 #elif JCE_PLATFORM_APPLE
         /* Metal (native, best perf) → Vulkan via MoltenVK (compat).
          * Apple deprecated desktop OpenGL; bgfx ships with

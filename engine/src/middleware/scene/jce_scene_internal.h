@@ -49,6 +49,27 @@ uint64_t jce_scene_particle_emitter_epoch(const JceParticleEmitterComponent *c);
 void jce_scene_particle_emitter_desc(const JceParticleEmitterComponent *c,
                                      JceParticleEmitterDesc *out);
 
+/* As above, additionally returning the authored billboard-texture path
+ * (tex_path may be NULL; empty = untextured).  Lets the GPU driver carry
+ * `texture` from *.particles.json into the instanced billboard draw. */
+void jce_scene_particle_emitter_desc_tex(const JceParticleEmitterComponent *c,
+                                         JceParticleEmitterDesc *out,
+                                         char *tex_path, int tex_cap);
+
+/* ── Script-facing JSON bridges (jce.comp_get/comp_set, jce.render_*) ──
+ * Reuse the scene serializer's per-component parse/serialize rows and the
+ * rendering-settings ser/extract pair so Lua sees exactly the authored
+ * scene-JSON schema.  Returned strings are heap-owned — release with
+ * jce_scene_json_free.  Implemented in jce_scene_components_json.c. */
+char *jce_scene_component_to_json(JceScene *s, JceEntity e, const char *type);
+bool  jce_scene_component_apply_json(JceScene *s, JceEntity e,
+                                     const char *type, const char *json);
+char *jce_scene_rendering_to_json(JceScene *s);
+/* Get-merge-set: keys absent from `json` keep their CURRENT value (the raw
+ * extract would silently reset them to scene defaults). */
+bool  jce_scene_rendering_apply_json(JceScene *s, const char *json);
+void  jce_scene_json_free(char *s);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SCENE_INTERNAL_H */

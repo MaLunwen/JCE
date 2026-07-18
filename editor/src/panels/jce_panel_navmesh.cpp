@@ -18,6 +18,7 @@
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
 #include "ui/jce_editor_colors.h"
@@ -358,6 +359,8 @@ void load_from(const char *path)
     if (!root) return;
     from_json(root);
     jce_json_free(root);
+    /* Remember the last document that loaded OK (per-project). */
+    jce_editor_pstate_set_str("doc.navmesh.last", path);
     jce_editor_console_log("navmesh loaded: %s", path);
 }
 
@@ -431,6 +434,17 @@ void draw_preview(void)
 
 void draw_content(void)
 {
+    /* One-time prefill of the last successfully loaded document
+     * (per-project) so one click on Load reopens it.  Never auto-loads,
+     * and never clobbers a path the user already typed. */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (std::strcmp(s.path, "untitled.navmesh.json") == 0)
+            jce_editor_pstate_get_str("doc.navmesh.last", s.path,
+                                      sizeof(s.path));
+    }
+
     nav_bake_poll();   /* pick up a finished background bake */
     if (ImGui::CollapsingHeader(jce_editor_i18n("navmesh.section.settings"), ImGuiTreeNodeFlags_DefaultOpen))
         draw_settings();

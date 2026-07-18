@@ -68,6 +68,14 @@ void jce_draw_textured_rect_view(const JceRenderer *r, uint16_t view_id,
                                  JceTexture tex, uint32_t tint,
                                  const float *uv);
 
+/* Opaque variant: writes RGBA with blending disabled.  For full-frame
+   composite copies (e.g. folding a post-fx output back into an offscreen
+   target) where the source alpha channel must not modulate the copy. */
+void jce_draw_textured_rect_view_opaque(const JceRenderer *r, uint16_t view_id,
+                                        float x, float y, float w, float h,
+                                        JceTexture tex, uint32_t tint,
+                                        const float *uv);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PRIMITIVES_H */

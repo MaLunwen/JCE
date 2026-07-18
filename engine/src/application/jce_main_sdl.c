@@ -27,6 +27,7 @@
 
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
+#include <jce/os/core/jce_allocator.h>   /* jce_alloc_hook_sdl (heap bridge) */
 
 /* SDL3 callback contract.  Must precede SDL_main.h. */
 #define SDL_MAIN_USE_CALLBACKS 1
@@ -41,6 +42,18 @@ static JceEngine *s_engine;
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
     (void)appstate;
+    /* Route SDL's heap into the engine allocator FIRST — before any engine
+     * call gives SDL a chance to allocate — so SDL memory (surfaces, event
+     * queue, audio buffers) becomes visible to jce_mem_stats and reclaimable
+     * by the periodic jce_alloc_trim.  The hook refuses when SDL already
+     * holds allocations (the main-callbacks shim may allocate on some
+     * platforms) — SDL then simply stays on its own heap, never mixed.
+     * JCE_NO_ALLOC_HOOKS=1 opts out entirely. */
+    {
+        const char *no_hooks = SDL_getenv("JCE_NO_ALLOC_HOOKS");
+        if (!(no_hooks && no_hooks[0] && no_hooks[0] != '0'))
+            (void)jce_alloc_hook_sdl();
+    }
     JceAppDesc desc = jce_app_get_desc();
     jce_engine_set_app_desc(&desc);
     s_engine = jce_engine_create(argc, argv);

@@ -729,7 +729,7 @@ void draw_cook_options()
             "audio -> PCM. Reads <asset>.import.json presets."));
     }
 
-    /* ── Encryption (ChaCha20, keyed obfuscation) ───────────────────── */
+    /* ── Secure archive (keyed index + ChaCha20 + HMAC) ─────────────── */
     if (ImGui::Checkbox(BL("field.encrypt", "Encrypt bundles"),
                         &gb.encrypt)) {
         /* First enable: generate the project key on the spot so the user

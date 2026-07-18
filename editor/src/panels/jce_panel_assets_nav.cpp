@@ -6,6 +6,8 @@
 #include <jce/os/platform/jce_host_paths.h>
 
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_project_state.h"
+#include "core/jce_editor_build_profile.h"   /* jce_editor_favorites_snapshot */
 #include "dialogs/jce_editor_dialogs.h"
 #include "jce_panel_assets_internal.h"
 
@@ -216,8 +218,10 @@ static void draw_location_row(const char *icon_label,
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.removeFavorite"))) {
                 JceEditorConfig ec;
                 if (jce_editor_config_load(&ec)) {
-                    if (jce_editor_config_remove_favorite(&ec, path.c_str()))
+                    if (jce_editor_config_remove_favorite(&ec, path.c_str())) {
                         jce_editor_config_save(&ec);
+                        jce_editor_favorites_snapshot();  /* keep per-project in sync */
+                    }
                 }
             }
         }
@@ -230,9 +234,9 @@ static void draw_location_row(const char *icon_label,
  * one-click way out of the current sandbox. */
 static void draw_asset_locations_section(void)
 {
-    /* Locations root collapsing header */
-    ImGuiTreeNodeFlags hdr_flags = ImGuiTreeNodeFlags_DefaultOpen
-                                 | ImGuiTreeNodeFlags_SpanAvailWidth
+    /* Locations root collapsing header — collapsed by default (the tree +
+     * file area are the focus); ImGui persists the open state once toggled. */
+    ImGuiTreeNodeFlags hdr_flags = ImGuiTreeNodeFlags_SpanAvailWidth
                                  | ImGuiTreeNodeFlags_Framed;
     if (!ImGui::TreeNodeEx(jce_editor_i18n("assetBrowser.locations"), hdr_flags))
         return;
@@ -301,6 +305,7 @@ static void draw_asset_locations_section(void)
                 if (jce_editor_config_add_favorite(&ec,
                         s_assets.current_path.c_str())) {
                     jce_editor_config_save(&ec);
+                    jce_editor_favorites_snapshot();  /* keep per-project in sync */
                 }
             }
         }
@@ -681,8 +686,10 @@ void draw_asset_search_bar(void)
                               ImGuiComboFlags_HeightSmall)) {
             for (int i = 0; i < kind_count; i++) {
                 bool sel = (s_assets.kind_filter == i);
-                if (ImGui::Selectable(kind_labels[i], sel))
+                if (ImGui::Selectable(kind_labels[i], sel)) {
                     s_assets.kind_filter = i;
+                    jce_editor_pstate_set_int("assets.kind_filter", i);
+                }
                 if (sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();

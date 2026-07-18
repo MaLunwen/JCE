@@ -86,7 +86,27 @@ static uint8_t compute_max_top_mip(uint32_t w, uint32_t h)
     return top;
 }
 
-static void registry_add(uint16_t idx, uint32_t w, uint32_t h)
+/* Full mip-chain level count for a WxH texture (floor(log2(max))+1). */
+static uint8_t full_mip_count(uint32_t w, uint32_t h)
+{
+    uint32_t m = (w > h) ? w : h, n = 1u;
+    while (m > 1u) { m >>= 1; n++; }
+    return (uint8_t)(n > 255u ? 255u : n);
+}
+
+/* O(1) bgfx-handle-idx -> registry-slot map (value slot+1, 0 = none).
+ * bgfx texture handle indices are DENSE allocator values below
+ * BGFX_CONFIG_MAX_TEXTURES, so a flat array beats any hash: no probing,
+ * no deletion tombstones, and bgfx handle reuse after destroy is naturally
+ * correct (remove clears the cell, the next add rewrites it).
+ * registry_find was a linear scan over up to 4096 entries per call — it
+ * sits on the get_size / mip-bias / streaming-demote query paths.
+ * Indices beyond the flat cap (a raised bgfx config) fall back to the old
+ * linear scan — correctness never depends on the map. */
+#define REG_IDX_CAP 8192u   /* 2x bgfx default MAX_TEXTURES, 16KB static */
+static uint16_t s_reg_slot[REG_IDX_CAP];
+
+static void registry_add(uint16_t idx, uint32_t w, uint32_t h, uint8_t mip_count)
 {
     if (s_count < MAX_TEXTURES) {
         TexEntry *e = &s_registry[s_count++];
@@ -96,10 +116,12 @@ static void registry_add(uint16_t idx, uint32_t w, uint32_t h)
         e->height           = h;
         e->base_width       = w;
         e->base_height      = h;
-        e->mip_count        = 1;
+        e->mip_count        = mip_count < 1u ? 1u : mip_count;
         e->max_top_mip      = compute_max_top_mip(w, h);
         e->resident_top_mip = 0;
         e->desired_top_mip  = 0;
+        if (idx < REG_IDX_CAP)
+            s_reg_slot[idx] = (uint16_t)s_count;   /* slot+1 */
         return;
     }
     if (!s_registry_warned_full) {
@@ -113,7 +135,15 @@ static void registry_add(uint16_t idx, uint32_t w, uint32_t h)
 
 static TexEntry *registry_find(uint16_t idx)
 {
-    for (int i = 0; i < s_count; i++)
+    if (idx < REG_IDX_CAP) {
+        uint16_t s = s_reg_slot[idx];
+        if (!s) return NULL;
+        TexEntry *e = &s_registry[s - 1];
+        /* The slot record is the source of truth (paranoia against a stale
+         * cell); heals nothing — add/remove keep the map exact. */
+        return (e->idx == idx) ? e : NULL;
+    }
+    for (int i = 0; i < s_count; i++)                 /* flat-cap overflow */
         if (s_registry[i].idx == idx)
             return &s_registry[i];
     return NULL;
@@ -121,16 +151,19 @@ static TexEntry *registry_find(uint16_t idx)
 
 static void registry_remove(uint16_t idx)
 {
-    for (int i = 0; i < s_count; i++) {
-        if (s_registry[i].idx == idx) {
-            if (s_registry[i].source_pixels) {
-                JCE_FREE(s_registry[i].source_pixels);
-                s_registry[i].source_pixels = NULL;
-            }
-            s_registry[i] = s_registry[--s_count];
-            return;
-        }
+    TexEntry *e = registry_find(idx);
+    if (!e) return;
+    if (e->source_pixels) {
+        JCE_FREE(e->source_pixels);
+        e->source_pixels = NULL;
     }
+    if (idx < REG_IDX_CAP)
+        s_reg_slot[idx] = 0;
+    int i = (int)(e - s_registry);
+    s_registry[i] = s_registry[--s_count];            /* swap-remove */
+    /* The moved (former last) entry changed slots — remap it. */
+    if (i < s_count && s_registry[i].idx < REG_IDX_CAP)
+        s_reg_slot[s_registry[i].idx] = (uint16_t)(i + 1);
 }
 
 /* VRAM ceiling: opt a freshly-registered texture into streaming + retain a CPU
@@ -192,18 +225,30 @@ static bgfx_texture_format_t texfmt_to_bgfx(uint32_t fmt)
 /* Map sampler mode to bgfx flags. */
 static uint64_t sampler_flags(int mode)
 {
+    /* Anisotropic filtering on capable HW only (HIGH tier) — the Unity/UE norm
+     * for grazing-angle quality, and only meaningful now that runtime textures
+     * carry a mip chain.  The charter weak-GPU baseline (LOW/MED) stays plain
+     * trilinear (no per-sample aniso cost — multi-tap filtering is the kind of
+     * opt-in extra the charter reserves for capable devices).  UI/sprite (CLAMP)
+     * textures are sampled ~1:1 and never benefit, so they skip it. */
+    uint64_t aniso = 0;
+    if (jce_renderer_get_tier() >= JCE_GPU_TIER_HIGH)
+        aniso = BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
     switch (mode) {
     case JCE_TEX_WRAP:
-        return BGFX_TEXTURE_NONE; /* default wrap behavior */
+        return aniso; /* default wrap behavior */
     case JCE_TEX_MIRROR:
-        return BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR;
-    default: /* JCE_TEX_CLAMP */
+        return BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR | aniso;
+    default: /* JCE_TEX_CLAMP (UI/sprite — no aniso) */
         return BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
     }
 }
 
 
 /* Create a bgfx texture from an RGBA8 surface. */
+static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                 uint32_t *out_dw, uint32_t *out_dh); /* fwd (mip chain) */
+
 static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
 {
     if (!surf) return JCE_TEXTURE_INVALID;
@@ -213,10 +258,73 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
     uint32_t pitch = (uint32_t)surf->pitch;
     uint32_t expected_pitch = w * 4;
 
-    /* bgfx expects tightly packed rows. Copy row-by-row if pitch differs. */
-    const bgfx_memory_t *mem = bgfx_alloc(w * h * 4);
-    if (pitch == expected_pitch) {
-        memcpy(mem->data, surf->pixels, w * h * 4);
+    /* Charter tier cap (512MB / weak-GPU baseline): runtime-uploaded SCENE
+     * textures (WRAP/MIRROR) obey the tier's max_texture_size the same way
+     * cooked assets already do at cook time (jce_asset_cooker) — before this,
+     * a raw 4K PNG uploaded full-size + full mip chain on the LOW tier, where
+     * the recommendation is 1024.  UI/sprite/LUT textures (CLAMP) are sampled
+     * ~1:1 and are exempt (shrinking them visibly blurs the editor UI).  The
+     * box-filter shrink reuses the mip downsampler; HIGH/ULTRA recommend
+     * 2048/4096 so strong machines only ever clamp pathological sources.
+     * `shrunk` is tightly packed; the mip-0 copy below consumes it in place
+     * of the surface and frees it after the bgfx blob is filled. */
+    uint8_t *shrunk = NULL;
+    if (mode != JCE_TEX_CLAMP) {
+        JceRenderRecommendation lrec = jce_renderer_get_recommendation();
+        uint32_t cap = lrec.max_texture_size;
+        if (cap >= 256u && (w > cap || h > cap)) {
+            /* Tightly pack the source once (downsample_rgba8 expects packed). */
+            uint8_t *packed = (uint8_t *)JCE_MALLOC((size_t)w * h * 4u);
+            if (packed) {
+                if (pitch == expected_pitch) {
+                    memcpy(packed, surf->pixels, (size_t)w * h * 4u);
+                } else {
+                    const uint8_t *src = (const uint8_t *)surf->pixels;
+                    for (uint32_t y = 0; y < h; y++)
+                        memcpy(packed + (size_t)y * expected_pitch,
+                               src + (size_t)y * pitch, expected_pitch);
+                }
+                uint32_t cw = w, ch = h;
+                uint8_t *cur = packed;
+                while (cw > cap || ch > cap) {
+                    uint32_t dw = 0, dh = 0;
+                    uint8_t *ds = downsample_rgba8(cur, cw, ch, &dw, &dh);
+                    if (!ds) break;          /* OOM: upload what we have */
+                    JCE_FREE(cur);
+                    cur = ds; cw = dw; ch = dh;
+                }
+                shrunk = cur;
+                w = cw; h = ch;
+                pitch = expected_pitch = w * 4u;
+            }
+        }
+    }
+
+    /* Generate a full box-filtered mip chain so minified textures filter
+     * trilinearly instead of aliasing/shimmering — the Unity/UE norm, and exactly
+     * what the cooked-asset path (jce_texture_from_cooked) already does.  The raw
+     * runtime path used to upload mip-0 only.  Levels are concatenated into one
+     * blob the way bgfx expects for a mipped create; the existing
+     * downsample_rgba8 produces each 2x level.  +33% VRAM is reclaimable by the
+     * streaming-pressure mip-bias hook (registry_opt_in_streaming below). */
+    uint32_t mips = 1;
+    for (uint32_t mw = w, mh = h; mw > 1u || mh > 1u; ) {
+        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u; mips++;
+    }
+    size_t total = 0;
+    for (uint32_t i = 0, mw = w, mh = h; i < mips; i++) {
+        total += (size_t)mw * mh * 4u;
+        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u;
+    }
+    const bgfx_memory_t *mem = bgfx_alloc((uint32_t)total);
+    /* mip 0: tightly-packed copy (row-by-row if the surface pitch is padded).
+     * When the tier cap shrunk the source above, `shrunk` IS the packed mip-0. */
+    if (shrunk) {
+        memcpy(mem->data, shrunk, (size_t)w * h * 4u);
+        JCE_FREE(shrunk);
+        shrunk = NULL;
+    } else if (pitch == expected_pitch) {
+        memcpy(mem->data, surf->pixels, (size_t)w * h * 4u);
     } else {
         const uint8_t *src = (const uint8_t *)surf->pixels;
         uint8_t *dst = mem->data;
@@ -226,10 +334,23 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
             dst += expected_pitch;
         }
     }
+    /* mips 1..N-1: box-filter the previous level (in-blob) into the next slot. */
+    {
+        uint8_t *prev = mem->data; uint32_t pw = w, ph = h;
+        uint8_t *cur = mem->data + (size_t)w * h * 4u;
+        for (uint32_t i = 1; i < mips; i++) {
+            uint32_t nw = pw > 1u ? pw >> 1 : 1u, nh = ph > 1u ? ph >> 1 : 1u;
+            uint32_t gw = 0, gh = 0;
+            uint8_t *ds = downsample_rgba8(prev, pw, ph, &gw, &gh);
+            if (ds) { memcpy(cur, ds, (size_t)nw * nh * 4u); JCE_FREE(ds); }
+            else    { memset(cur, 0, (size_t)nw * nh * 4u); }
+            prev = cur; pw = nw; ph = nh; cur += (size_t)nw * nh * 4u;
+        }
+    }
 
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)w, (uint16_t)h,
-        false,  /* no mipmaps */
+        true,   /* mip chain (box-filtered above) → trilinear minification */
         1,      /* layers */
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(mode),
@@ -240,7 +361,7 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
         return JCE_TEXTURE_INVALID;
     }
 
-    registry_add(handle.idx, w, h);
+    registry_add(handle.idx, w, h, full_mip_count(w, h));
     /* VRAM ceiling: streamed RGBA8 uploads retain a CPU mip-0 + opt into
      * streaming so mip-bias under pressure physically reclaims VRAM.  mem->data
      * is the tightly-packed RGBA8 we just filled (valid this frame, same
@@ -610,7 +731,7 @@ JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
      * letting the stomp derive ln=N and pass the correct lut_size to
      * jce_postfx_set_lut.  Without this the registry misses the 3D handle
      * and returns h=0, collapsing the shader UV to a uniform tint. */
-    registry_add(h.idx, (uint32_t)N, (uint32_t)N);
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u);
     JceTexture t = JCE_TEXTURE_INVALID;
     t.idx = h.idx;
     return t;
@@ -669,7 +790,7 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
         return invalid;
     }
     LOG_DEBUG(LOG_TAG, "loaded 3D LUT (host) %s (N=%d)", host_path, N);
-    registry_add(h.idx, (uint32_t)N, (uint32_t)N);
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u);
     JceTexture t = JCE_TEXTURE_INVALID;
     t.idx = h.idx;
     return t;
@@ -691,7 +812,7 @@ JceTexture jce_texture_from_rgba(const void *data,
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
 
-    registry_add(handle.idx, width, height);
+    registry_add(handle.idx, width, height, 1u);
 
     const uint32_t bytes = width * height * 4u;
     const bgfx_memory_t *mem = bgfx_alloc(bytes);
@@ -748,7 +869,7 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
 
-    registry_add(handle.idx, info->width, info->height);
+    registry_add(handle.idx, info->width, info->height, (uint8_t)(info->mip_count > 0u ? info->mip_count : 1u));
     /* VRAM ceiling: only the uncompressed RGBA8 cooked format keeps a CPU
      * source for streaming demote — its mip-0 lives at offset 0 of the chunk as
      * plain RGBA8 (the box-filter downsample is RGBA8-only).  Block-compressed
@@ -832,6 +953,12 @@ void jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h)
     TexEntry *e = registry_find(tex.idx);
     if (w) *w = e ? e->width  : 0;
     if (h) *h = e ? e->height : 0;
+}
+
+uint32_t jce_texture_get_mips(JceTexture tex)
+{
+    TexEntry *e = registry_find(tex.idx);
+    return (e && e->mip_count > 0) ? e->mip_count : 1u;
 }
 
 
@@ -920,13 +1047,21 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
     uint32_t dh = sh >> 1; if (dh == 0) dh = 1;
     uint8_t *dst = (uint8_t *)JCE_MALLOC((size_t)dw * dh * 4u);
     if (!dst) return NULL;
+    /* Clamp the +1 taps to the source extents: for odd/1-px source levels
+     * the unclamped p10/p01/p11 read past the buffer (an intermittent-AV /
+     * garbage-average source on the mip tail). Even dimensions >= 2 are
+     * byte-identical to the unclamped version. */
     for (uint32_t y = 0; y < dh; y++) {
+        const uint32_t y0 = y * 2u;
+        const uint32_t y1 = (y0 + 1u < sh) ? y0 + 1u : y0;
         for (uint32_t x = 0; x < dw; x++) {
-            const uint8_t *p00 = src + (((y * 2u) * sw) + (x * 2u)) * 4u;
-            const uint8_t *p10 = p00 + 4u;
-            const uint8_t *p01 = p00 + sw * 4u;
-            const uint8_t *p11 = p01 + 4u;
-            uint8_t *o = dst + (y * dw + x) * 4u;
+            const uint32_t x0 = x * 2u;
+            const uint32_t x1 = (x0 + 1u < sw) ? x0 + 1u : x0;
+            const uint8_t *p00 = src + ((size_t)y0 * sw + x0) * 4u;
+            const uint8_t *p10 = src + ((size_t)y0 * sw + x1) * 4u;
+            const uint8_t *p01 = src + ((size_t)y1 * sw + x0) * 4u;
+            const uint8_t *p11 = src + ((size_t)y1 * sw + x1) * 4u;
+            uint8_t *o = dst + ((size_t)y * dw + x) * 4u;
             for (int c = 0; c < 4; c++)
                 o[c] = (uint8_t)(((unsigned)p00[c] + p10[c] + p01[c] + p11[c]) >> 2);
         }

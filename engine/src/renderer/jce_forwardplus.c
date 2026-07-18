@@ -17,6 +17,7 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
+#include "renderer/jce_render_encoder.h"
 
 #define LOG_TAG "forwardplus"
 
@@ -493,9 +494,9 @@ void jce_forwardplus_update(JceForwardPlus                 *fp,
                      (float)fp->combined.index_base_row,
                      (float)fp->combined.lights_base_row,
                      (float)fp->combined.total_rows };
-    bgfx_set_uniform(fp->u_clusterParams,  cp,  1);
-    bgfx_set_uniform(fp->u_clusterParams2, cp2, 1);
-    bgfx_set_uniform(fp->u_clusterRegions, cr,  1);
+    jce_enc_set_uniform(fp->u_clusterParams,  cp,  1);
+    jce_enc_set_uniform(fp->u_clusterParams2, cp2, 1);
+    jce_enc_set_uniform(fp->u_clusterRegions, cr,  1);
 
     /* Cache the uniform values so jce_forwardplus_bind can replay them on
      * every PBR submit this frame (bgfx clears uniform/texture-stage state
@@ -527,8 +528,8 @@ void jce_forwardplus_bind(JceForwardPlus *fp)
 
     /* Stage 14 = s_cluster (the forward+ variant freed it from s_iesLut).
      * Cookie (13) and local shadow (15) are untouched here. */
-    bgfx_set_texture(14, fp->s_cluster, fp->tex_cluster, UINT32_MAX);
-    bgfx_set_uniform(fp->u_clusterParams,  fp->last_cp,  1);
-    bgfx_set_uniform(fp->u_clusterParams2, fp->last_cp2, 1);
-    bgfx_set_uniform(fp->u_clusterRegions, fp->last_cr,  1);
+    jce_enc_set_texture(14, fp->s_cluster, fp->tex_cluster, UINT32_MAX);
+    jce_enc_set_uniform(fp->u_clusterParams,  fp->last_cp,  1);
+    jce_enc_set_uniform(fp->u_clusterParams2, fp->last_cp2, 1);
+    jce_enc_set_uniform(fp->u_clusterRegions, fp->last_cr,  1);
 }

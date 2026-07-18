@@ -16,7 +16,10 @@
 
 #include "jce_build_manager.h"
 
+#include "jce_binary_embed.h"
 #include "jce_editor_project.h"
+#include "jce_dist_content_graph.h"
+#include "jce_dist_audit.h"
 #include "jce_pak_key.h"
 #include "jce_project_settings.h"
 #include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix export (Top 4) */
@@ -32,8 +35,13 @@ extern "C" {
 #include <jce/os/core/jce_toolchain.h>
 #include <jce/os/platform/jce_host_shell.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_cook.h>
+#include <jce/resource/jce_bundle_format.h>
+#include <jce/resource/jce_bundle_pack.h>
+#include <jce/application/jce_project.h>
+#include <jce/application/jce_runtime_boot.h>
 }
 
 #include <algorithm>
@@ -44,6 +52,11 @@ extern "C" {
 #include <string>
 #include <utility>
 #include <vector>
+
+/* Defined in jce_dialog_project.cpp (global, external linkage).  Declared at
+ * file scope so references inside the anonymous namespace below bind to the
+ * external symbol rather than declaring an internal-linkage one (C7631). */
+extern char s_current_project_root[512];
 
 namespace {
 
@@ -93,6 +106,11 @@ struct QueuedStep {
 std::vector<QueuedStep> g_queue;   /* steps after the one in flight */
 size_t                  g_queue_pos = 0;
 
+struct ApprovedGraphAsset {
+    std::string address;
+    uint64_t content_id = 0;
+};
+
 struct FinishPlan {
     bool        verify = false;    /* confirm the artifact exists */
     std::string artifact_a;        /* <build>/<exe> */
@@ -109,6 +127,13 @@ struct FinishPlan {
     std::string warn_loose_dir;    /* encrypting: if this dir exists post-   *
                                     * build, an old template staged          *
                                     * plaintext next to the exe — warn       */
+    bool        dist = false;
+    std::string pak_path;
+    std::string audit_report;
+    std::vector<std::string> protected_paths;
+    std::vector<ApprovedGraphAsset> graph_assets;
+    std::string graph_snapshot;
+    uint8_t     pak_key[32] = {0};
 };
 FinishPlan g_finish;
 
@@ -116,6 +141,7 @@ void reset_pipeline()
 {
     g_queue.clear();
     g_queue_pos = 0;
+    std::memset(g_finish.pak_key, 0, sizeof(g_finish.pak_key));
     g_finish = FinishPlan{};
 }
 
@@ -164,6 +190,10 @@ struct PendingProjectBuild {
     /* prepare_project_generated_assets outputs (filled by the worker) */
     std::string out_assets_obj, out_assets_asm, out_assets_c;
     std::string out_assets_bom, out_bundle_dir, out_pak_key_c;
+    std::string out_pak_path;
+    std::vector<std::string> protected_paths;
+    std::vector<ApprovedGraphAsset> graph_assets;
+    std::string out_graph_snapshot;
 
     /* Context needed to build the cmake queue + finish plan on the main
      * thread once the cook succeeds. */
@@ -369,6 +399,55 @@ std::string resolve_artifact()
     return std::string();
 }
 
+bool run_dist_audit(const std::string &exe, const char *package_dir)
+{
+    std::vector<const char *> path_ptrs;
+    path_ptrs.reserve(g_finish.protected_paths.size());
+    for (const std::string &path : g_finish.protected_paths)
+        path_ptrs.push_back(path.c_str());
+    std::vector<JceDistGraphAsset> graph_assets;
+    graph_assets.reserve(g_finish.graph_assets.size());
+    for (const ApprovedGraphAsset &asset : g_finish.graph_assets)
+        graph_assets.push_back({asset.address.c_str(), asset.content_id});
+
+    JceDistAuditInput input{};
+    input.executable_path = exe.c_str();
+    input.pak_path = g_finish.pak_path.c_str();
+    input.report_path = g_finish.audit_report.c_str();
+    input.package_dir = package_dir;
+    input.expected_exe_name = g_finish.exe_name.c_str();
+    input.graph_snapshot_path = g_finish.graph_snapshot.c_str();
+    input.protected_paths = path_ptrs.empty() ? nullptr : path_ptrs.data();
+    input.protected_path_count = path_ptrs.size();
+    input.graph_assets = graph_assets.empty() ? nullptr : graph_assets.data();
+    input.graph_asset_count = graph_assets.size();
+    input.key = g_finish.pak_key;
+    input.require_secure = true;
+#if JCE_PLATFORM_WINDOWS
+    input.require_gui = true;
+#endif
+    input.require_single_file = package_dir && package_dir[0];
+    input.require_graph_parity = true;
+
+    JceDistAuditResult result{};
+    if (!jce_dist_audit_run(input, &result)) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error(std::string("dist audit failed: ") +
+                  (result.error[0] ? result.error : "unknown error") +
+                  " (report: " + g_finish.audit_report + ")");
+        return false;
+    }
+    log_line(JCE_CONSOLE_INFO,
+             "[build] dist audit passed: entries=" +
+             std::to_string(result.archive_entries) +
+             " verified=" + std::to_string(result.verified_entries) +
+             " graph=" + std::to_string(result.graph_verified) + "/" +
+             std::to_string(result.graph_expected) +
+             " path_leaks=" + std::to_string(result.leaked_path_count) +
+             " report=" + g_finish.audit_report);
+    return true;
+}
+
 /* Post-pipeline finish: verify the build artifact and, when requested,
  * stage a redistributable package directory (exe + cooked assets +
  * VERSION.txt).  Runs natively via jce_fs — no scripts.  On any hard
@@ -401,8 +480,11 @@ void run_finish_plan()
                  g_finish.warn_loose_dir);
     }
 
-    if (!g_finish.stage)
+    if (!g_finish.stage) {
+        if (g_finish.dist)
+            run_dist_audit(exe, nullptr);
         return;
+    }
 
     if (exe.empty()) {
         g_build.state = JCE_BUILD_FAILED;
@@ -424,6 +506,50 @@ void run_finish_plan()
         g_build.state = JCE_BUILD_FAILED;
         set_error("package: failed to copy exe to " + dst_exe);
         return;
+    }
+
+    /* Dist is a one-file public package.  Authoring configs, symbols, BOMs,
+     * and audit data remain under the private build/reports tree. */
+    if (g_finish.dist) {
+        if (run_dist_audit(dst_exe, out.c_str()))
+            log_line(JCE_CONSOLE_INFO, "[build] dist package staged at: " + out);
+        return;
+    }
+
+    /* Optional authored runtime config, staged beside the exe.  Copied only
+     * when the project authored it; silent when absent (the runtime seeds
+     * built-in defaults).
+     *  - Settings/audio_mixer.json — jce_default_main resolves it host-first
+     *    (CWD, then exe dir), so the packaged layout mirrors the project's
+     *    Settings/ next to the exe.
+     *  - .jce/input_actions.json — jce_select_input_actions_path probes
+     *    ".jce/input_actions.json" relative to the CWD (then HOME), so the
+     *    packaged layout mirrors the project's .jce/ next to the exe. */
+    {
+        std::string proj = s_current_project_root[0]
+                               ? std::string(s_current_project_root)
+                               : std::string(".");
+        static const struct { const char *dir; const char *file;
+                              const char *label; } kRuntimeCfg[] = {
+            { "Settings", "audio_mixer.json",   "audio mixer config" },
+            { ".jce",     "input_actions.json", "input actions"      },
+        };
+        for (const auto &c : kRuntimeCfg) {
+            std::string src = proj + PATH_SEP_CHR_LOCAL + c.dir +
+                              PATH_SEP_CHR_LOCAL + c.file;
+            if (!jce_fs_host_exists_file(src.c_str()))
+                continue;
+            std::string dst_dir = out + PATH_SEP_CHR_LOCAL + c.dir;
+            jce_fs_host_create_directory(dst_dir.c_str());
+            std::string dst = dst_dir + PATH_SEP_CHR_LOCAL + c.file;
+            if (jce_fs_host_copy_file(src.c_str(), dst.c_str()))
+                log_line(JCE_CONSOLE_INFO,
+                         std::string("[build] ") + c.label + " -> " + dst);
+            else
+                log_line(JCE_CONSOLE_WARNING,
+                         std::string("[build] failed to stage ") + c.label +
+                         ": " + src);
+        }
     }
 
     /* Top 4 — export the project's authored physics layer collision matrix into
@@ -481,6 +607,57 @@ void run_finish_plan()
         else
             log_line(JCE_CONSOLE_WARNING,
                      "[build] failed to write render settings: " + rp);
+
+        /* Settings S2 — export the authored render-pipeline asset into the
+         * cooked tree (PAK key settings/render_pipeline.rp.json); the runtime
+         * re-resolves it after bundle mount (apply_boot_mounted).  Without
+         * this, shipped single-exe games silently fell back to the tier
+         * auto-preset. */
+        {
+            std::string proj = s_current_project_root[0]
+                                   ? std::string(s_current_project_root)
+                                   : std::string(".");
+            std::string rp_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
+                                 PATH_SEP_CHR_LOCAL + "RenderPipeline.rp.json";
+            if (jce_fs_host_exists_file(rp_src.c_str())) {
+                std::string rp_dir = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
+                                     "settings";
+                jce_fs_host_create_directory(rp_dir.c_str());
+                std::string rp_dst = rp_dir + PATH_SEP_CHR_LOCAL +
+                                     "render_pipeline.rp.json";
+                if (jce_fs_host_copy_file(rp_src.c_str(), rp_dst.c_str()))
+                    log_line(JCE_CONSOLE_INFO,
+                             "[build] render pipeline asset -> " + rp_dst);
+                else
+                    log_line(JCE_CONSOLE_WARNING,
+                             "[build] failed to stage render pipeline asset: " +
+                             rp_src);
+            }
+
+            /* Mirror the authored audio-mixer routing into the same cooked
+             * settings/ channel (PAK key settings/audio_mixer.json).  NOTE:
+             * the runtime mixer read is still host-only (rt_mixer_read_config
+             * uses jce_fs_host_read_all; no apply_boot_mounted analogue for
+             * audio yet), so a pure single-exe build does not consume this
+             * copy — it travels with the cooked tree for parity with the
+             * render pipeline asset and for a future PAK-aware read. */
+            std::string mx_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
+                                 PATH_SEP_CHR_LOCAL + "audio_mixer.json";
+            if (jce_fs_host_exists_file(mx_src.c_str())) {
+                std::string mx_dir = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
+                                     "settings";
+                jce_fs_host_create_directory(mx_dir.c_str());
+                std::string mx_dst = mx_dir + PATH_SEP_CHR_LOCAL +
+                                     "audio_mixer.json";
+                if (jce_fs_host_copy_file(mx_src.c_str(), mx_dst.c_str()))
+                    log_line(JCE_CONSOLE_INFO,
+                             "[build] audio mixer config (cooked) -> " + mx_dst);
+                else
+                    log_line(JCE_CONSOLE_WARNING,
+                             "[build] failed to stage audio mixer config: " +
+                             mx_src);
+            }
+        }
     }
 
     /* Stage cooked assets so the packaged game has its PhysFS mount
@@ -1127,13 +1304,50 @@ struct ProjectAssetInput {
     std::string          abs_path;
     std::string          vpath;
     std::vector<uint8_t> bytes;
+    bool                 protect_path = false;
 };
 
 struct CollectAssetCtx {
     std::string root;
     std::vector<ProjectAssetInput> *items = nullptr;
     std::string error;
+    bool protect_paths = false;
 };
+
+bool ascii_ends_with(std::string value, const char *suffix)
+{
+    if (!suffix) return false;
+    for (char &c : value) {
+        if (c == '\\') c = '/';
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    }
+    const size_t suffix_len = std::strlen(suffix);
+    return value.size() >= suffix_len &&
+           value.compare(value.size() - suffix_len, suffix_len, suffix) == 0;
+}
+
+bool shader_profile_unreachable(const std::string &vpath)
+{
+    const bool dx11  = ascii_ends_with(vpath, "_dx11.bin");
+    const bool spv   = ascii_ends_with(vpath, "_spv.bin");
+    const bool glsl  = ascii_ends_with(vpath, "_glsl.bin");
+    const bool essl  = ascii_ends_with(vpath, "_essl.bin");
+    const bool essl1 = ascii_ends_with(vpath, "_essl1.bin");
+    const bool mtl   = ascii_ends_with(vpath, "_mtl.bin");
+    if (!(dx11 || spv || glsl || essl || essl1 || mtl))
+        return false;
+#if JCE_PLATFORM_WINDOWS
+    return essl || essl1 || mtl;
+#elif JCE_PLATFORM_MACOS
+    return dx11 || glsl || essl || essl1;
+#elif JCE_PLATFORM_WEB
+    return dx11 || spv || glsl || essl1 || mtl;
+#elif JCE_PLATFORM_ANDROID
+    return dx11 || glsl || essl1 || mtl;
+#else
+    return dx11 || essl || essl1 || mtl;
+#endif
+}
 
 bool collect_asset_walk_cb(const char *path, bool is_dir, void *user)
 {
@@ -1145,7 +1359,7 @@ bool collect_asset_walk_cb(const char *path, bool is_dir, void *user)
 
     std::string rel = make_relative_vpath(path, ctx->root);
     if (rel.empty() || path_has_segment(rel, "raw_assets") ||
-        path_has_hidden_segment(rel)) {
+        path_has_hidden_segment(rel) || shader_profile_unreachable(rel)) {
         return true;
     }
 
@@ -1160,6 +1374,7 @@ bool collect_asset_walk_cb(const char *path, bool is_dir, void *user)
     ProjectAssetInput item;
     item.abs_path = path;
     item.vpath = rel;
+    item.protect_path = ctx->protect_paths;
     item.bytes.resize((size_t)sz);
     if (sz)
         std::memcpy(item.bytes.data(), raw, (size_t)sz);
@@ -1170,7 +1385,8 @@ bool collect_asset_walk_cb(const char *path, bool is_dir, void *user)
 
 bool collect_assets_from_dir(const std::string &root,
                              std::vector<ProjectAssetInput> &items,
-                             std::string &error)
+                             std::string &error,
+                             bool protect_paths)
 {
     if (root.empty() || !jce_fs_host_exists_dir(root.c_str()))
         return true;
@@ -1178,6 +1394,7 @@ bool collect_assets_from_dir(const std::string &root,
     CollectAssetCtx ctx;
     ctx.root = root;
     ctx.items = &items;
+    ctx.protect_paths = protect_paths;
     if (!jce_fs_host_walk(root.c_str(), collect_asset_walk_cb, &ctx)) {
         error = ctx.error.empty() ? ("cannot walk asset dir: " + root)
                                   : ctx.error;
@@ -1186,239 +1403,176 @@ bool collect_assets_from_dir(const std::string &root,
     return true;
 }
 
-bool write_binary_c_source(const std::string &path, const std::string &symbol,
-                           const uint8_t *data, size_t size)
+bool append_runtime_boot_asset(const std::string &project,
+                               std::vector<ProjectAssetInput> &items,
+                               std::string &error)
 {
-    std::string head;
-    if (!data || size == 0) {
-        head = "#include <stddef.h>\n"
-               "const unsigned char " + symbol + "[1] = {0};\n"
-               "const size_t " + symbol + "_size = 0;\n";
-        return jce_fs_host_write_all(path.c_str(), head.data(),
-                                     (uint64_t)head.size());
-    }
-
-    head = "/* Auto-generated by JCE Editor -- DO NOT EDIT */\n"
-           "#include <stddef.h>\n"
-           "const unsigned char " + symbol + "[] = {\n";
-    if (!jce_fs_host_write_all(path.c_str(), head.data(),
-                               (uint64_t)head.size())) {
+    JceProject *manifest = jce_project_load(project.c_str());
+    if (!manifest) {
+        error = "cannot load project manifest: " + project;
         return false;
     }
 
-    std::string chunk;
-    chunk.reserve(65536);
-    for (size_t i = 0; i < size; ++i) {
-        char cell[8];
-        if (i % 12 == 0)
-            chunk += "    ";
-        std::snprintf(cell, sizeof(cell), "0x%02x", (unsigned)data[i]);
-        chunk += cell;
-        chunk += (i + 1 == size) ? "\n" : ", ";
-        if (i % 12 == 11)
-            chunk += "\n";
-        if (chunk.size() > 60000) {
-            if (!jce_fs_host_append(path.c_str(), chunk.data(),
-                                    (uint64_t)chunk.size())) {
-                return false;
-            }
-            chunk.clear();
-        }
-    }
-    chunk += "};\nconst size_t " + symbol + "_size = ";
-    chunk += std::to_string(size);
-    chunk += ";\n";
-    return jce_fs_host_append(path.c_str(), chunk.data(),
-                              (uint64_t)chunk.size());
-}
+    const char *startup_scene = manifest->startup_scene;
 
-void byte_push(std::vector<uint8_t> &out, uint8_t v)
-{
-    out.push_back(v);
-}
-
-void byte_append(std::vector<uint8_t> &out, const void *data, size_t size)
-{
-    if (!data || size == 0)
-        return;
-    const uint8_t *p = (const uint8_t *)data;
-    out.insert(out.end(), p, p + size);
-}
-
-void byte_le16(std::vector<uint8_t> &out, uint16_t v)
-{
-    byte_push(out, (uint8_t)v);
-    byte_push(out, (uint8_t)(v >> 8));
-}
-
-void byte_le32(std::vector<uint8_t> &out, uint32_t v)
-{
-    byte_push(out, (uint8_t)v);
-    byte_push(out, (uint8_t)(v >> 8));
-    byte_push(out, (uint8_t)(v >> 16));
-    byte_push(out, (uint8_t)(v >> 24));
-}
-
-uint16_t coff_machine_from_arch(const std::string &arch)
-{
-    if (arch == "x64" || arch == "x86_64" || arch == "amd64")
-        return 0x8664u;
-    if (arch == "x86" || arch == "i686")
-        return 0x014cu;
-    if (arch == "arm64" || arch == "aarch64")
-        return 0xaa64u;
-    if (arch == "arm")
-        return 0x01c4u;
-    return 0;
-}
-
-int coff_pointer_size(uint16_t machine)
-{
-    switch (machine) {
-        case 0x8664u:
-        case 0xaa64u:
-            return 8;
-        default:
-            return 4;
-    }
-}
-
-bool write_binary_coff_object(const std::string &path,
-                              const std::string &symbol,
-                              const uint8_t *data,
-                              size_t size,
-                              const std::string &arch)
-{
-    uint16_t machine = coff_machine_from_arch(arch);
-    if (!machine || (size && !data))
+    JceJson *boot_json = jce_json_object();
+    if (!boot_json) {
+        jce_project_free(manifest);
+        error = "cannot allocate runtime boot manifest";
         return false;
-
-    const int ptr_size = coff_pointer_size(machine);
-    const uint64_t size_offset =
-        ((uint64_t)size + (uint64_t)ptr_size - 1u) &
-        ~((uint64_t)ptr_size - 1u);
-    const uint64_t rdata_size = size_offset + (uint64_t)ptr_size;
-    const uint64_t rdata_aligned = (rdata_size + 3u) & ~(uint64_t)3;
-
-    const std::string sym_data = symbol;
-    const std::string sym_size = symbol + "_size";
-    const uint32_t strtab_off_data = 4;
-    const uint32_t strtab_off_size =
-        strtab_off_data + (uint32_t)sym_data.size() + 1u;
-    const uint32_t strtab_total =
-        strtab_off_size + (uint32_t)sym_size.size() + 1u;
-
-    const uint32_t coff_header_size = 20;
-    const uint32_t section_hdr_size = 40;
-    const uint32_t section_data_off = coff_header_size + section_hdr_size;
-    if (rdata_aligned > 0xffffffffull)
-        return false;
-    const uint64_t symtab_off64 = section_data_off + rdata_aligned;
-    if (symtab_off64 > 0xffffffffull || rdata_size > 0xffffffffull)
-        return false;
-    const uint32_t symtab_off = (uint32_t)symtab_off64;
-
-    std::vector<uint8_t> obj;
-    obj.reserve((size_t)symtab_off + 36u + strtab_total);
-
-    byte_le16(obj, machine);
-    byte_le16(obj, 1);
-    byte_le32(obj, 0);
-    byte_le32(obj, symtab_off);
-    byte_le32(obj, 2);
-    byte_le16(obj, 0);
-    byte_le16(obj, 0);
-
-    const char sec_name[8] = {'.', 'r', 'd', 'a', 't', 'a', 0, 0};
-    byte_append(obj, sec_name, sizeof(sec_name));
-    byte_le32(obj, 0);
-    byte_le32(obj, 0);
-    byte_le32(obj, (uint32_t)rdata_size);
-    byte_le32(obj, section_data_off);
-    byte_le32(obj, 0);
-    byte_le32(obj, 0);
-    byte_le16(obj, 0);
-    byte_le16(obj, 0);
-    byte_le32(obj, 0x40500040u);
-
-    byte_append(obj, data, size);
-    while (obj.size() < (size_t)(section_data_off + size_offset))
-        byte_push(obj, 0);
-    for (int i = 0; i < ptr_size; ++i)
-        byte_push(obj, (uint8_t)((uint64_t)size >> (i * 8)));
-    while (obj.size() < (size_t)symtab_off)
-        byte_push(obj, 0);
-
-    byte_le32(obj, 0);
-    byte_le32(obj, strtab_off_data);
-    byte_le32(obj, 0);
-    byte_le16(obj, 1);
-    byte_le16(obj, 0);
-    byte_push(obj, 2);
-    byte_push(obj, 0);
-
-    byte_le32(obj, 0);
-    byte_le32(obj, strtab_off_size);
-    byte_le32(obj, (uint32_t)size_offset);
-    byte_le16(obj, 1);
-    byte_le16(obj, 0);
-    byte_push(obj, 2);
-    byte_push(obj, 0);
-
-    byte_le32(obj, strtab_total);
-    byte_append(obj, sym_data.c_str(), sym_data.size() + 1u);
-    byte_append(obj, sym_size.c_str(), sym_size.size() + 1u);
-
-    return jce_fs_host_write_all(path.c_str(), obj.data(),
-                                 (uint64_t)obj.size());
-}
-
-std::string asm_escape_path(std::string path)
-{
-    path = slash_norm(path);
-    std::string out;
-    out.reserve(path.size() + 8);
-    for (char c : path) {
-        if (c == '\\' || c == '"')
-            out.push_back('\\');
-        out.push_back(c);
     }
-    return out;
+    jce_json_set_string(boot_json, "contract", JCE_RUNTIME_BOOT_CONTRACT);
+    jce_json_set_int(boot_json, "schema", JCE_RUNTIME_BOOT_SCHEMA_VERSION);
+    jce_json_set_string(boot_json, "startup_scene",
+                        startup_scene ? startup_scene : "");
+    char *text = jce_json_print(boot_json, false);
+    jce_json_free(boot_json);
+    jce_project_free(manifest);
+    if (!text) {
+        error = "cannot serialize runtime boot manifest";
+        return false;
+    }
+
+    JceRuntimeBootManifest parsed{};
+    const size_t text_size = std::strlen(text);
+    const bool valid = jce_runtime_boot_manifest_parse(text, text_size,
+                                                       &parsed);
+    if (!valid) {
+        jce_json_free_string(text);
+        error = "project startup_scene is not a valid runtime virtual path";
+        return false;
+    }
+
+    ProjectAssetInput item;
+    item.abs_path = project + PATH_SEP_CHR_LOCAL + "jce_project.json";
+    item.vpath = JCE_RUNTIME_BOOT_MANIFEST_PATH;
+    item.bytes.assign((const uint8_t *)text,
+                      (const uint8_t *)text + text_size);
+    jce_json_free_string(text);
+    items.push_back(std::move(item));
+    return true;
 }
 
-bool write_binary_asm_incbin(const std::string &path,
-                             const std::string &symbol,
-                             const std::string &input_path,
-                             size_t size)
+void dist_content_graph_log(int level, const char *message, void *)
 {
-    std::string text;
-    text += "/* Auto-generated by JCE Editor -- DO NOT EDIT */\n";
-    text += ".section .rodata\n";
-    text += ".global " + symbol + "\n";
-    text += ".global " + symbol + "_size\n";
-    text += ".p2align 4\n";
-    text += symbol + ":\n";
-    text += "    .incbin \"" + asm_escape_path(input_path) + "\"\n";
-    text += ".p2align 3\n";
-    text += symbol + "_size:\n";
-    text += "    .quad " + std::to_string(size) + "\n";
-    return jce_fs_host_write_all(path.c_str(), text.data(),
-                                 (uint64_t)text.size());
+    JceConsoleLevel console_level = JCE_CONSOLE_INFO;
+    if (level == JCE_BUNDLE_PACK_LOG_WARNING)
+        console_level = JCE_CONSOLE_WARNING;
+    else if (level == JCE_BUNDLE_PACK_LOG_ERROR)
+        console_level = JCE_CONSOLE_ERROR;
+    log_line(console_level,
+             std::string("[build] graph: ") + (message ? message : ""));
+}
+
+bool append_dist_bundle_graph(const std::string &project,
+                              const std::string &gen_dir,
+                              const std::string &reports_dir,
+                              std::vector<ProjectAssetInput> &items,
+                              std::vector<ApprovedGraphAsset> &graph_assets,
+                              std::string &graph_snapshot,
+                              std::string &error)
+{
+    JceDistContentGraph graph;
+    if (!jce_dist_content_graph_build(
+            project, gen_dir, reports_dir,
+            jce_dist_content_graph_host_platform(), dist_content_graph_log,
+            nullptr, &graph, &error)) {
+        return false;
+    }
+
+    graph_assets.clear();
+    for (JceDistContentGraphAsset &source : graph.assets) {
+        ProjectAssetInput item;
+        item.abs_path = std::move(source.source_label);
+        item.vpath = source.address;
+        item.bytes = std::move(source.bytes);
+        item.protect_path = true;
+        items.push_back(std::move(item));
+        graph_assets.push_back({std::move(source.address), source.content_id});
+    }
+    graph_snapshot = std::move(graph.snapshot_path);
+    log_line(JCE_CONSOLE_INFO,
+             "[build] Dist consumes Bundle graph: " +
+             std::to_string(graph_assets.size()) +
+             " cooked asset(s), snapshot=" + graph_snapshot);
+    return true;
 }
 
 bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
-                          const void *pak_blob, size_t pak_size)
+                          const void *pak_blob, size_t pak_size,
+                          const std::vector<ProjectAssetInput> &source_items,
+                          const uint8_t *verify_key)
 {
     JceArchive *ar = jce_archive_open(pak_blob, pak_size);
     if (!ar)
         return false;
 
+    if (verify_key)
+        jce_archive_set_decryption_key(ar, verify_key);
+    if (jce_archive_is_authenticated(ar) &&
+        jce_archive_auth_status(ar) != JCE_ARCHIVE_AUTH_VALID) {
+        jce_archive_close(ar);
+        return false;
+    }
+
     uint32_t count = jce_archive_count(ar);
+    std::vector<const char *> report_paths(count, nullptr);
+    for (const ProjectAssetInput &item : source_items) {
+        const JceArchiveEntry *entry = jce_archive_find(ar, item.vpath.c_str());
+        if (!entry)
+            continue;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (jce_archive_get(ar, i) == entry) {
+                report_paths[i] = item.vpath.c_str();
+                break;
+            }
+        }
+    }
+
+    const bool header_verified = jce_archive_verify_header(ar) != 0;
+    const bool secure_index = jce_archive_is_secure(ar) != 0;
+    const bool authenticated = jce_archive_is_authenticated(ar) != 0;
+    const bool auth_verified = !authenticated ||
+        jce_archive_auth_status(ar) == JCE_ARCHIVE_AUTH_VALID;
+    bool has_debug_paths = false;
+    std::vector<int8_t> entry_verified(count, -1);
+    std::vector<uint64_t> entry_content_ids(count, 0);
+    uint32_t verified_count = 0;
+    uint32_t corrupt_count = 0;
+    uint32_t skipped_count = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const JceArchiveEntry *entry = jce_archive_get(ar, i);
+        if (!entry || entry->original_size > (uint64_t)SIZE_MAX) {
+            entry_verified[i] = 0;
+            ++corrupt_count;
+            continue;
+        }
+        if ((entry->entry_flags & JCE_ARCHIVE_ENTRY_ENCRYPTED) &&
+            !verify_key) {
+            entry_verified[i] = -1;
+            ++skipped_count;
+            continue;
+        }
+        std::vector<uint8_t> decoded((size_t)entry->original_size);
+        const size_t got = jce_archive_read(ar, entry, decoded.data(),
+                                            decoded.size());
+        if (got == decoded.size() &&
+            jce_archive_verify_entry(entry, decoded.data(), got)) {
+            entry_verified[i] = 1;
+            entry_content_ids[i] = jce_archive_content_hash(decoded.data(),
+                                                            got);
+            ++verified_count;
+        } else {
+            entry_verified[i] = 0;
+            ++corrupt_count;
+        }
+    }
     uint64_t total_orig = 0;
     uint64_t total_stored = 0;
     uint32_t stored_count = 0;
     uint32_t compressed_count = 0;
     uint32_t encrypted_count = 0;
+    uint32_t authenticated_count = 0;
 
     for (uint32_t i = 0; i < count; ++i) {
         const JceArchiveEntry *e = jce_archive_get(ar, i);
@@ -1432,6 +1586,10 @@ bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
             ++compressed_count;
         if (e->entry_flags & JCE_ARCHIVE_ENTRY_ENCRYPTED)
             ++encrypted_count;
+        if (e->entry_flags & JCE_ARCHIVE_ENTRY_AUTHENTICATED)
+            ++authenticated_count;
+        if (jce_archive_debug_path(ar, i))
+            has_debug_paths = true;
     }
 
     std::string json;
@@ -1446,7 +1604,15 @@ bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
     json += "    \"dict_count\": " +
             std::to_string((unsigned)jce_archive_dict_count(ar)) + ",\n";
     json += "    \"header_verified\": ";
-    json += jce_archive_verify_header(ar) ? "true\n" : "false\n";
+    json += header_verified ? "true,\n" : "false,\n";
+    json += "    \"secure_index\": ";
+    json += secure_index ? "true,\n" : "false,\n";
+    json += "    \"authenticated\": ";
+    json += authenticated ? "true,\n" : "false,\n";
+    json += "    \"auth_verified\": ";
+    json += auth_verified ? "true,\n" : "false,\n";
+    json += "    \"has_debug_paths\": ";
+    json += has_debug_paths ? "true\n" : "false\n";
     json += "  },\n";
     uint16_t dict_count = jce_archive_dict_count(ar);
     json += "  \"dictionaries\": [";
@@ -1470,11 +1636,16 @@ bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
     json += ", \"stored_count\": " + std::to_string(stored_count);
     json += ", \"compressed_count\": " + std::to_string(compressed_count);
     json += ", \"encrypted_count\": " + std::to_string(encrypted_count);
+    json += ", \"authenticated_count\": " +
+            std::to_string(authenticated_count);
+    json += ", \"plain_count\": " +
+            std::to_string(count - encrypted_count);
     json += ", \"duplicate_groups\": 0, \"duplicate_entries\": 0";
     json += ", \"duplicate_wasted_bytes\": 0";
-    json += ", \"duplicate_reclaimed_bytes\": 0, \"verify_ran\": false";
-    json += ", \"verified_count\": 0, \"corrupt_count\": 0";
-    json += ", \"skipped_count\": 0},\n";
+    json += ", \"duplicate_reclaimed_bytes\": 0, \"verify_ran\": true";
+    json += ", \"verified_count\": " + std::to_string(verified_count);
+    json += ", \"corrupt_count\": " + std::to_string(corrupt_count);
+    json += ", \"skipped_count\": " + std::to_string(skipped_count) + "},\n";
     json += "  \"entries\": [";
 
     for (uint32_t i = 0; i < count; ++i) {
@@ -1485,13 +1656,18 @@ bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
             ? (double)e->stored_size / (double)e->original_size : 0.0;
         char hbuf[32];
         char cbuf[16];
+        char content_id_buf[17];
         char erbuf[64];
         std::snprintf(hbuf, sizeof(hbuf), "0x%016llx",
                       (unsigned long long)e->path_hash);
         std::snprintf(cbuf, sizeof(cbuf), "0x%08x",
                       (unsigned)e->content_crc);
+        std::snprintf(content_id_buf, sizeof(content_id_buf), "%016llx",
+                      (unsigned long long)entry_content_ids[i]);
         std::snprintf(erbuf, sizeof(erbuf), "%.6f", eratio);
         const char *p = jce_archive_debug_path(ar, i);
+        if (!p && i < report_paths.size())
+            p = report_paths[i];
 
         json += (i ? ",\n    {" : "\n    {");
         json += "\"index\": " + std::to_string(i);
@@ -1512,18 +1688,35 @@ bool write_asset_bom_json(const std::string &path, const std::string &pak_path,
         else
             json += ", \"dict_id\": " + std::to_string((unsigned)e->dict_id);
         json += ", \"content_crc\": \"" + std::string(cbuf) + "\"";
+        json += ", \"content_id\": \"" +
+                std::string(content_id_buf) + "\"";
         json += ", \"flags\": " + std::to_string((unsigned)e->entry_flags);
         json += ", \"page_aligned\": ";
         json += (e->entry_flags & JCE_ARCHIVE_ENTRY_PAGE_ALIGNED) ? "true" : "false";
         json += ", \"encrypted\": ";
         json += (e->entry_flags & JCE_ARCHIVE_ENTRY_ENCRYPTED) ? "true" : "false";
-        json += ", \"duplicate\": false, \"verified\": null}";
+        json += ", \"authenticated\": ";
+        json += (e->entry_flags & JCE_ARCHIVE_ENTRY_AUTHENTICATED)
+                    ? "true" : "false";
+        json += ", \"duplicate\": false, \"verified\": ";
+        if (entry_verified[i] > 0)
+            json += "true}";
+        else if (entry_verified[i] == 0)
+            json += "false}";
+        else
+            json += "null}";
     }
     json += count ? "\n  ]\n}\n" : "]\n}\n";
 
     jce_archive_close(ar);
-    return jce_fs_host_write_all(path.c_str(), json.data(),
-                                 (uint64_t)json.size());
+    const bool written = jce_fs_host_write_all(path.c_str(), json.data(),
+                                               (uint64_t)json.size());
+    const bool secure_verified = !verify_key ||
+        (secure_index && authenticated && auth_verified &&
+         encrypted_count == count && authenticated_count == count &&
+         !has_debug_paths);
+    return written && header_verified && secure_verified &&
+           corrupt_count == 0 && skipped_count == 0;
 }
 
 std::string sanitize_c_ident(const std::string &name)
@@ -1613,8 +1806,9 @@ bool write_project_assets_embed_artifact(const std::string &gen_dir,
 #if JCE_PLATFORM_WINDOWS
     (void)pak_path;
     out_obj = gen_dir + PATH_SEP_CHR_LOCAL + "project_assets.obj";
-    if (write_binary_coff_object(out_obj, "assets_pak_data",
-                                 (const uint8_t *)pak_blob, pak_size, arch)) {
+    if (jce_binary_embed_write_coff(out_obj, "assets_pak_data",
+                                    (const uint8_t *)pak_blob, pak_size,
+                                    arch)) {
         jce_fs_host_remove_file((gen_dir + PATH_SEP_CHR_LOCAL +
                                  "project_assets.c").c_str());
         jce_fs_host_remove_file((gen_dir + PATH_SEP_CHR_LOCAL +
@@ -1626,8 +1820,8 @@ bool write_project_assets_embed_artifact(const std::string &gen_dir,
     out_obj.clear();
 #else
     out_asm = gen_dir + PATH_SEP_CHR_LOCAL + "project_assets.S";
-    if (write_binary_asm_incbin(out_asm, "assets_pak_data",
-                                pak_path, pak_size)) {
+    if (jce_binary_embed_write_incbin(out_asm, "assets_pak_data",
+                                      pak_path, pak_size)) {
         jce_fs_host_remove_file((gen_dir + PATH_SEP_CHR_LOCAL +
                                  "project_assets.c").c_str());
         jce_fs_host_remove_file((gen_dir + PATH_SEP_CHR_LOCAL +
@@ -1640,8 +1834,8 @@ bool write_project_assets_embed_artifact(const std::string &gen_dir,
 #endif
 
     out_c = gen_dir + PATH_SEP_CHR_LOCAL + "project_assets.c";
-    return write_binary_c_source(out_c, "assets_pak_data",
-                                 (const uint8_t *)pak_blob, pak_size);
+    return jce_binary_embed_write_c_source(
+        out_c, "assets_pak_data", (const uint8_t *)pak_blob, pak_size);
 }
 
 bool prepare_project_generated_assets(const std::string &project,
@@ -1658,6 +1852,10 @@ bool prepare_project_generated_assets(const std::string &project,
                                       std::string &out_assets_asm,
                                       std::string &out_assets_c,
                                       std::string &out_bom,
+                                      std::string &out_pak_path,
+                                      std::vector<std::string> &out_protected_paths,
+                                      std::vector<ApprovedGraphAsset> &out_graph_assets,
+                                      std::string &out_graph_snapshot,
                                       std::string &out_bundle_dir,
                                       std::string &out_pak_key_c)
 {
@@ -1674,6 +1872,8 @@ bool prepare_project_generated_assets(const std::string &project,
 
     std::vector<ProjectAssetInput> items;
     std::string error;
+    out_graph_assets.clear();
+    out_graph_snapshot.clear();
     const std::string engine_res = sdk + PATH_SEP_CHR_LOCAL + "share" +
                                    PATH_SEP_CHR_LOCAL + "jce" +
                                    PATH_SEP_CHR_LOCAL + "engine_resources";
@@ -1684,9 +1884,23 @@ bool prepare_project_generated_assets(const std::string &project,
         ? std::string()
         : project + PATH_SEP_CHR_LOCAL + join_norm_sep(cooked_rel);
 
-    if (!collect_assets_from_dir(engine_res, items, error) ||
-        !collect_assets_from_dir(engine_ui, items, error) ||
-        !collect_assets_from_dir(cooked, items, error)) {
+    if (!collect_assets_from_dir(engine_res, items, error, false) ||
+        !collect_assets_from_dir(engine_ui, items, error, false)) {
+        set_error("assets: " + error);
+        return false;
+    }
+    if (variant == "dist") {
+        if (!append_dist_bundle_graph(project, gen_dir, reports_dir, items,
+                                      out_graph_assets,
+                                      out_graph_snapshot, error)) {
+            set_error("assets: " + error);
+            return false;
+        }
+    } else if (!collect_assets_from_dir(cooked, items, error, true)) {
+        set_error("assets: " + error);
+        return false;
+    }
+    if (!append_runtime_boot_asset(project, items, error)) {
         set_error("assets: " + error);
         return false;
     }
@@ -1711,6 +1925,12 @@ bool prepare_project_generated_assets(const std::string &project,
               variant + ".pak.bom.json";
     const std::string pak_path =
         gen_dir + PATH_SEP_CHR_LOCAL + "project_assets.pak";
+    out_pak_path = pak_path;
+    out_protected_paths.clear();
+    for (const ProjectAssetInput &item : items) {
+        if (item.protect_path)
+            out_protected_paths.push_back(item.vpath);
+    }
 
     std::vector<JceCookInput> inputs(items.size());
     for (size_t i = 0; i < items.size(); ++i) {
@@ -1726,7 +1946,10 @@ bool prepare_project_generated_assets(const std::string &project,
     JceCookConfig cfg{};
     cfg.zstd_level = asset_pack_zstd_level_for_variant(variant);
     cfg.alignment_log2 = 4;
-    cfg.emit_debug_paths = true;
+    /* Release PAKs retain only normalized XXH3 path hashes. The external
+     * BOM receives source paths directly, so auditability does not require
+     * shipping a recoverable directory table in the executable. */
+    cfg.emit_debug_paths = variant == "debug";
     cfg.compress_index = true;
     cfg.use_dict = true;
     cfg.dedup_content = true;
@@ -1756,7 +1979,8 @@ bool prepare_project_generated_assets(const std::string &project,
                                                   out_assets_obj,
                                                   out_assets_asm,
                                                   out_assets_c) &&
-              write_asset_bom_json(out_bom, pak_path, pak_blob, pak_size);
+              write_asset_bom_json(out_bom, pak_path, pak_blob, pak_size,
+                                   items, encrypt_assets ? pak_key : nullptr);
     jce_free(pak_blob);
     if (!ok) {
         set_error("assets: failed to write generated PAK/embed/BOM outputs");
@@ -1818,19 +2042,55 @@ bool prepare_project_generated_assets(const std::string &project,
             return false;
         }
 
+        if (encrypt_assets) {
+            JceArchive *archive = jce_archive_open(raw, (size_t)sz);
+            if (archive)
+                jce_archive_set_decryption_key(archive, pak_key);
+
+            bool secure = archive && jce_archive_is_secure(archive) &&
+                          jce_archive_is_authenticated(archive) &&
+                          jce_archive_auth_status(archive) ==
+                              JCE_ARCHIVE_AUTH_VALID &&
+                          jce_archive_verify_header(archive);
+            if (secure) {
+                const uint32_t count = jce_archive_count(archive);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const JceArchiveEntry *entry =
+                        jce_archive_get(archive, i);
+                    if (!entry ||
+                        !(entry->entry_flags & JCE_ARCHIVE_ENTRY_ENCRYPTED) ||
+                        !(entry->entry_flags &
+                          JCE_ARCHIVE_ENTRY_AUTHENTICATED) ||
+                        jce_archive_debug_path(archive, i)) {
+                        secure = false;
+                        break;
+                    }
+                }
+            }
+            if (archive)
+                jce_archive_close(archive);
+            if (!secure) {
+                jce_fs_buffer_free(raw);
+                set_error("bundles: Dist requires a keyed, authenticated "
+                          "bundle built with this project's current PAK key: " +
+                          bundle);
+                return false;
+            }
+        }
+
         std::string sym = "bundle_" + sanitize_c_ident(basename_no_ext(bundle));
 #if JCE_PLATFORM_WINDOWS
         std::string src = out_bundle_dir + PATH_SEP_CHR_LOCAL +
                           "_embed_bundle_" + sym + ".obj";
-        bool embed_ok = write_binary_coff_object(src, sym,
-                                                 (const uint8_t *)raw,
-                                                 (size_t)sz, arch);
+        bool embed_ok = jce_binary_embed_write_coff(
+            src, sym, (const uint8_t *)raw, (size_t)sz, arch);
         jce_fs_host_remove_file((out_bundle_dir + PATH_SEP_CHR_LOCAL +
                                  "_embed_bundle_" + sym + ".c").c_str());
 #else
         std::string src = out_bundle_dir + PATH_SEP_CHR_LOCAL +
                           "_embed_bundle_" + sym + ".S";
-        bool embed_ok = write_binary_asm_incbin(src, sym, bundle, (size_t)sz);
+        bool embed_ok = jce_binary_embed_write_incbin(
+            src, sym, bundle, (size_t)sz);
 #endif
         jce_fs_buffer_free(raw);
         if (!embed_ok) {
@@ -2076,7 +2336,9 @@ void asset_prep_worker(void *arg)
         p->intermediates_dir, p->reports_dir, p->arch,
         p->encrypt_assets, p->encrypt_assets ? p->pak_key : nullptr,
         p->out_assets_obj, p->out_assets_asm, p->out_assets_c,
-        p->out_assets_bom, p->out_bundle_dir, p->out_pak_key_c);
+        p->out_assets_bom, p->out_pak_path, p->protected_paths,
+        p->graph_assets, p->out_graph_snapshot,
+        p->out_bundle_dir, p->out_pak_key_c);
     t_log_sink = nullptr;
     jce_atomic_i32_store(p->done, 1);
 }
@@ -2093,6 +2355,7 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         a += " -B " + qtok(p.build_dir);
         a += " -G Ninja";
         a += " -DCMAKE_BUILD_TYPE=" + p.build_type;
+        a += " -DJCE_BUILD_VARIANT=" + p.variant;
         a += " -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
         a += " -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
         a += " -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=" + qtok(p.archive_dir);
@@ -2180,6 +2443,17 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
     g_finish.artifact_a    = p.output_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
     g_finish.artifact_b    = p.build_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
     g_finish.asset_bom_src = p.out_assets_bom;
+    g_finish.dist          = p.variant == "dist";
+    g_finish.pak_path      = p.out_pak_path;
+    g_finish.protected_paths = p.protected_paths;
+    g_finish.graph_assets = p.graph_assets;
+    g_finish.graph_snapshot = p.out_graph_snapshot;
+    if (p.encrypt_assets)
+        std::memcpy(g_finish.pak_key, p.pak_key, sizeof(g_finish.pak_key));
+    if (g_finish.dist) {
+        g_finish.audit_report = p.reports_dir + PATH_SEP_CHR_LOCAL +
+                                p.target + "_dist_audit.json";
+    }
     if (p.encrypt_assets && !p.cooked.empty())
         g_finish.warn_loose_dir = p.output_dir + PATH_SEP_CHR_LOCAL +
                                   join_norm_sep(p.cooked);
@@ -2264,6 +2538,7 @@ void poll_asset_prep()
         log_line(JCE_CONSOLE_WARNING,
                  "[build] cook/pack finished; build stopped before compile");
         reset_pipeline();
+        std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
         return;
     }
     if (!ok) {
@@ -2272,12 +2547,14 @@ void poll_asset_prep()
         g_build.last_error = sink_error.empty()
             ? std::string("asset cook/pack failed") : sink_error;
         reset_pipeline();
+        std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
         return;
     }
 
     /* Success: build the cmake queue + spawn it (state stays RUNNING). */
     g_pending.active = false;
     finalize_project_build_pipeline(g_pending);
+    std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
 }
 
 /* MAIN thread, on editor shutdown: join any in-flight worker so it does
@@ -2292,6 +2569,7 @@ void asset_prep_shutdown()
     if (g_pending.done)   { jce_atomic_i32_destroy(g_pending.done);   g_pending.done = nullptr; }
     if (g_pending.cancel) { jce_atomic_i32_destroy(g_pending.cancel); g_pending.cancel = nullptr; }
     g_pending.sink.entries.clear();
+    std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
     g_pending.active = false;
 }
 
@@ -2423,19 +2701,20 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     const std::string bundles = (cfg->bundles && cfg->bundles[0])
                                     ? std::string(cfg->bundles) : "";
 
-    /* Packaging > Encrypt Assets (Project Settings).  Debug variants stay
-     * plaintext unless encrypt_debug_builds is also set.  The key is loaded
-     * (or generated on first use — mirroring "generated on first enable")
-     * up-front on the main thread so the worker never touches the editor's
-     * key-management state. */
+    /* Dist is the fail-closed shipping profile: authenticated encryption is
+     * mandatory.  Project Settings may additionally enable it for release or
+     * debug; debug remains inspectable unless explicitly opted in.  Resolve
+     * the key on the main thread so the worker never touches editor state. */
     bool    encrypt_assets = false;
     uint8_t pak_key[32] = {0};
     {
         JceProjectSettings ps_local;
         const JceProjectSettings *ps = jce_project_settings_current();
         if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
-        if (ps->packaging.encrypt_assets &&
-            (variant != "debug" || ps->packaging.encrypt_debug_builds)) {
+        const bool protection_required = variant == "dist" ||
+            (ps->packaging.encrypt_assets &&
+             (variant != "debug" || ps->packaging.encrypt_debug_builds));
+        if (protection_required) {
             if (jce_pak_key_load(project, pak_key)) {
                 encrypt_assets = true;
             } else {
@@ -2447,7 +2726,7 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
                              "[build] no asset key found — generated " +
                              jce_pak_key_path(project));
                 } else {
-                    set_error("packaging: encrypt_assets is enabled but no "
+                    set_error("packaging: secure assets are required but no "
                               "key is available (" + kerr + ")");
                     return false;
                 }

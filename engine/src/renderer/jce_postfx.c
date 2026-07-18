@@ -122,6 +122,9 @@ struct JcePostFXPipeline {
     /* Selectable tonemap + 3D-LUT grade + soft bloom (Stage 1a.5). */
     int                    tonemap_op;     /* JcePostFXTonemap; 0=ACES default */
     bgfx_texture_handle_t  lut_tex;        /* 3D LUT (invalid = no grade) */
+    bgfx_texture_handle_t  dummy_lut3d;    /* 1x1x1 placeholder: parks the
+                                            * SAMPLER3D when no LUT is loaded
+                                            * (WebGL2 rejects dangling samplers) */
     int                    lut_size;       /* N */
     float                  lut_strength;   /* 0 = neutral */
     float                  bloom_knee;     /* 0 = hard cutoff (legacy) */
@@ -186,6 +189,33 @@ static const uint16_t s_quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
 
 /* ── FBO helpers ───────────────────────────────────────────────────── */
 
+/* Color format for every post-FX intermediate target (ping-pong chain, bloom
+ * pyramid, TAA history/motion).  RGBA16F keeps the HDR range through the
+ * chain, but not every backend can render to it (ES2/WebGL1-class devices,
+ * some ANGLE configs lack the FRAMEBUFFER cap bit) — creating the FBO anyway
+ * makes bgfx fail the frame-buffer, and the whole post chain silently goes
+ * black on just those backends.  Fall back to RGBA8 like the editor's
+ * offscreen bridge does (jce_offscreen_target.c): bloom/TAA still run,
+ * merely LDR-clamped (bloom extraction over threshold 1.0 mostly no-ops). */
+static bgfx_texture_format_t postfx_color_format(void)
+{
+    static bgfx_texture_format_t s_fmt = BGFX_TEXTURE_FORMAT_COUNT; /* unresolved */
+    if (s_fmt == BGFX_TEXTURE_FORMAT_COUNT) {
+        const bgfx_caps_t *caps = bgfx_get_caps();
+        if (!caps)
+            return BGFX_TEXTURE_FORMAT_RGBA16F; /* pre-init probe: don't cache */
+        if ((caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
+             & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) == 0) {
+            s_fmt = BGFX_TEXTURE_FORMAT_RGBA8;
+            LOG_WARN(LOG_TAG, "RGBA16F render target unsupported; post-FX "
+                              "chain falls back to RGBA8 (LDR bloom/TAA)");
+        } else {
+            s_fmt = BGFX_TEXTURE_FORMAT_RGBA16F;
+        }
+    }
+    return s_fmt;
+}
+
 /* Allocate one full-res RGBA16F intermediate FBO (color texture + framebuffer).
  * destroyTextures=true so destroying the FB also frees the attached texture —
  * otherwise destroy_fbos() leaks handles, which during ImGui drag-resize
@@ -194,7 +224,7 @@ static void alloc_one_fbo(JcePostFXPipeline *p, int i)
 {
     p->fbo_tex[i] = bgfx_create_texture_2d(
         (uint16_t)p->width, (uint16_t)p->height, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA16F,
+        postfx_color_format(),
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL);
     bgfx_attachment_t at;
@@ -224,13 +254,24 @@ static void ensure_composite_fbo(JcePostFXPipeline *p, int i)
     alloc_one_fbo(p, i);
 }
 
-/* Lazily allocate the bloom downsample/blur buffers (FBO 2/3); no-op once
- * present.  Freed together with the composite pair in destroy_fbos(). */
+/* Lazily allocate the bloom-input/accumulation buffer (FBO 2); no-op once
+ * present.  FBO 3 (the legacy single-mip horizontal-blur scratch) is allocated
+ * separately by ensure_bloom_blur_h_fbo() ONLY on the legacy bloom path — the
+ * HIGH/ULTRA dual-filter pyramid never touches it, so it stays unallocated
+ * there (saves a full-res RGBA16F, ~16.6 MB @1080p).  Freed together with the
+ * composite pair in destroy_fbos(). */
 static void ensure_bloom_fbos(JcePostFXPipeline *p)
 {
     if (p->fbo[2].idx != UINT16_MAX) return;
     alloc_one_fbo(p, 2);
-    alloc_one_fbo(p, 3);
+}
+
+/* Lazily allocate FBO 3 (legacy bloom horizontal-blur scratch); no-op once
+ * present.  Returns true when fbo[3] is valid for use this frame. */
+static bool ensure_bloom_blur_h_fbo(JcePostFXPipeline *p)
+{
+    if (p->fbo[3].idx == UINT16_MAX) alloc_one_fbo(p, 3);
+    return p->fbo[3].idx != UINT16_MAX;
 }
 
 static void destroy_fbos(JcePostFXPipeline *p)
@@ -288,7 +329,7 @@ static void ensure_bloom_mips(JcePostFXPipeline *p, int mip_count)
 
         p->bloom_mip_tex[i] = bgfx_create_texture_2d(
             (uint16_t)w, (uint16_t)h, false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA16F,
+            postfx_color_format(),
             BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
 
         bgfx_attachment_t at;
@@ -314,7 +355,7 @@ static void create_taa_fbos(JcePostFXPipeline *p)
 
     p->taa_history_tex = bgfx_create_texture_2d(
         (uint16_t)p->width, (uint16_t)p->height, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA16F,
+        postfx_color_format(),
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
     {
         bgfx_attachment_t at;
@@ -324,20 +365,32 @@ static void create_taa_fbos(JcePostFXPipeline *p)
         p->taa_history_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
     }
 
-    p->taa_motion_tex = bgfx_create_texture_2d(
-        (uint16_t)p->width, (uint16_t)p->height, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA16F,
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
-    {
-        bgfx_attachment_t at;
-        memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, p->taa_motion_tex, BGFX_ACCESS_WRITE,
-                             0, 1, 0, BGFX_RESOLVE_NONE);
-        p->taa_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
-    }
-
+    /* NOTE: the camera-only motion buffer (taa_motion_tex/fb) is NOT allocated
+     * here — it is DEAD whenever the renderer supplies an external per-object
+     * velocity G-buffer (jce_postfx_set_taa_motion_tex), which the editor and
+     * runtime always do when TAA is on.  It is allocated lazily by
+     * ensure_taa_motion_fbo() only when the camera-only fallback actually runs,
+     * saving a full-res RGBA16F (~16.6 MB @1080p) in the common path. */
     p->taa_fbos_valid = true;
     p->history_valid  = false;  /* fresh buffers → no usable history yet */
+}
+
+/* Lazily allocate the camera-only motion buffer (full-res RGBA16F) the first
+ * time the no-external-velocity TAA fallback needs it.  Returns true when
+ * taa_motion_fb is valid for use this frame. */
+static bool ensure_taa_motion_fbo(JcePostFXPipeline *p)
+{
+    if (p->taa_motion_fb.idx != UINT16_MAX) return true;
+    p->taa_motion_tex = bgfx_create_texture_2d(
+        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        postfx_color_format(),
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+    bgfx_attachment_t at;
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, p->taa_motion_tex, BGFX_ACCESS_WRITE,
+                         0, 1, 0, BGFX_RESOLVE_NONE);
+    p->taa_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    return p->taa_motion_fb.idx != UINT16_MAX;
 }
 
 static void destroy_taa_fbos(JcePostFXPipeline *p)
@@ -428,6 +481,12 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     /* Stage-1a.5: tonemap-op / 3D-LUT / soft bloom init. */
     p->tonemap_op    = 0;
     p->lut_tex.idx   = UINT16_MAX;
+    /* Sentinel-init the OWNED placeholder LUT too: it is the only destroyed
+     * handle omitted from this block (lut_tex above is borrowed, never
+     * destroyed).  bgfx idx==0 is a valid handle — a future early-return
+     * before its creation (line ~553) would make jce_postfx_destroy free
+     * foreign 3D-texture 0. */
+    p->dummy_lut3d.idx = UINT16_MAX;
     p->lut_size      = 0;
     p->lut_strength  = 0.0f;
     p->bloom_knee    = 0.0f;
@@ -488,6 +547,19 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_gradeParams = bgfx_create_uniform("u_gradeParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     p->s_texLUT      = bgfx_create_uniform("s_texLUT",      BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
+    /* 1x1x1 neutral placeholder for the 3D-LUT sampler.  When no grade LUT is
+     * loaded, stage 2 used to stay unbound — "safe on all backends" was wrong:
+     * on WebGL2 the dangling SAMPLER3D uniform defaults to texture unit 0,
+     * clashing with s_texColor (2D) there, and ANGLE rejects the ENTIRE
+     * composite draw ("Two textures of different types use the same sampler
+     * location") — the scene never reached the backbuffer (web black-screen). */
+    {
+        uint32_t texel = 0xFFFFFFFFu;
+        const bgfx_memory_t *mem = bgfx_copy(&texel, 4);
+        p->dummy_lut3d = bgfx_create_texture_3d(1, 1, 1, false,
+                                                BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+    }
+
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
 }
@@ -528,6 +600,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     /* Stage-1a.5 grade uniforms. */
     if (pipeline->u_gradeParams.idx != UINT16_MAX) bgfx_destroy_uniform(pipeline->u_gradeParams);
     if (pipeline->s_texLUT.idx      != UINT16_MAX) bgfx_destroy_uniform(pipeline->s_texLUT);
+    if (pipeline->dummy_lut3d.idx   != UINT16_MAX) bgfx_destroy_texture(pipeline->dummy_lut3d);
 
     /* Destroy shader programs. */
     if (pipeline->prog_bloom_extract.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_extract);
@@ -636,6 +709,14 @@ void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
                         float feedback, float luma_clamp, float motion_clamp)
 {
     if (!pipeline) return;
+    /* TAA needs the RGBA16F targets: the motion buffer stores SIGNED NDC
+     * deltas, which the RGBA8 fallback (see postfx_color_format) would clamp
+     * to [0,1] and smear the resolve.  On such backends TAA stays off. */
+    if (enabled && postfx_color_format() != BGFX_TEXTURE_FORMAT_RGBA16F) {
+        LOG_WARN(LOG_TAG, "TAA requested but RGBA16F targets are unavailable; "
+                          "keeping TAA off");
+        enabled = false;
+    }
     pipeline->taa_enabled    = enabled;
     pipeline->taa_params[0]  = feedback;
     pipeline->taa_params[1]  = luma_clamp;
@@ -911,10 +992,14 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * camera-reprojection fallback still works. */
         const bool use_ext_motion =
             (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
-        bgfx_texture_handle_t motion_tex = use_ext_motion
-            ? pipeline->taa_ext_motion_tex
-            : pipeline->taa_motion_tex;
-        if (!use_ext_motion) {
+        /* Camera-only fallback: lazily allocate taa_motion_fb here (the common
+         * external-velocity path never touches it, so it stays unallocated and
+         * saves a full-res RGBA16F). */
+        bgfx_texture_handle_t motion_tex;
+        if (use_ext_motion) {
+            motion_tex = pipeline->taa_ext_motion_tex;
+        } else if (ensure_taa_motion_fbo(pipeline)) {
+            motion_tex = pipeline->taa_motion_tex;
             /* We supply BOTH camera matrices as explicit uniforms (the postfx
              * fullscreen path can't use bgfx_set_view_transform without
              * corrupting vs_postfx's quad), so the view leaves u_modelViewProj
@@ -926,6 +1011,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_view_name(v_motion, "PostFX/TAA_Motion", INT32_MAX);
             bgfx_set_texture(0, pipeline->u_texDepth, depth_tex, UINT32_MAX);
             draw_fullscreen(pipeline, v_motion, pipeline->prog_motion_vec);
+        } else {
+            /* OOM: bind a valid handle so the resolve sampler is satisfied
+             * (TAA degrades to ~no reprojection rather than crashing). */
+            motion_tex = pipeline->taa_history_tex;
         }
 
         /* (b) resolve pass: current colour + history + motion → fbo[ping].
@@ -1061,7 +1150,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             }
         } else {
             /* ── LOW/MID: legacy single-mip Gaussian blur (byte-identical) ── */
-            if (pipeline->prog_bloom_blur.idx != UINT16_MAX) {
+            if (pipeline->prog_bloom_blur.idx != UINT16_MAX &&
+                ensure_bloom_blur_h_fbo(pipeline)) {
                 float blur_h[4] = { texel_size[0], 0.0f, 0.0f, 0.0f };
                 bgfx_set_uniform(pipeline->u_blurDir, blur_h, 1);
                 POSTFX_SETUP_VIEW(view_id, pipeline->fbo[3]);
@@ -1129,8 +1219,13 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_uniform(pipeline->u_gradeParams, grade_p, 1);
             if (grade_on)
                 bgfx_set_texture(2, pipeline->s_texLUT, pipeline->lut_tex, UINT32_MAX);
-            /* When grade is off, u_gradeParams.x < 0.5 so the shader never
-             * samples s_texLUT — leaving stage 2 unbound is safe on all backends. */
+            else
+                /* Grade off: u_gradeParams.x < 0.5 so the shader never SAMPLES
+                 * s_texLUT, but the SAMPLER3D uniform must still be parked on a
+                 * real 3D texture — unbound it dangles at unit 0 next to
+                 * s_texColor (2D) and WebGL2 rejects the whole composite draw. */
+                bgfx_set_texture(2, pipeline->s_texLUT, pipeline->dummy_lut3d,
+                                 UINT32_MAX);
 
             ensure_composite_fbo(pipeline, ping);
             POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);

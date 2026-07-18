@@ -11,6 +11,7 @@
 #include "jce_editor_file_util.h"
 #include "core/jce_editor_state_internal.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_project_state.h"   /* per-project last_scene */
 #include "core/jce_build_manager.h"
 #include "core/jce_editor_toast.h"
 #include "core/jce_editor_i18n.h"
@@ -22,6 +23,7 @@
 extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/middleware/scene/jce_component_registry.h>
+#include <jce/middleware/scene/jce_scene.h>   /* jce_scene_particles_set_asset_root */
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
@@ -47,6 +49,15 @@ extern "C" {
 /* Project-root switch (dialogs/jce_dialog_project.cpp) — reloads the
  * manifest, asset DB root, PAK key, and game string tables. */
 void set_current_project_root(const char *path);
+
+/* Remember the just-loaded/saved scene as this project's resume target
+ * (per-project store), alongside the global last_scene_path that drives
+ * cold-boot restore.  No-op when no project store is active. */
+static void mirror_last_scene_to_project(const char *scene_path)
+{
+    if (scene_path && scene_path[0] && jce_editor_pstate_active())
+        jce_editor_pstate_set_str("last_scene", scene_path);
+}
 
 /* ── Project-root follow on scene open ─────────────────────────────
  *
@@ -93,6 +104,10 @@ static void follow_scene_project_root(const char *scene_path)
             const char *cur = jce_editor_assets_get_project();
             if (!cur || jce_strcasecmp(cur, assets_base) != 0)
                 jce_editor_assets_set_project(assets_base);
+
+            /* Bind render settings and component-relative assets before the
+             * scene starts building lazy renderer/particle state. */
+            jce_editor_scene_render_refresh_content_context();
             return;
         }
         char parent[512];
@@ -707,6 +722,11 @@ static void normalize_all_scene_paths_to_relative(const char *scene_path)
 
 bool jce_state_save_scene_file(const char *scene_path)
 {
+    return jce_state_save_scene_file_ex(scene_path, 0);
+}
+
+bool jce_state_save_scene_file_ex(const char *scene_path, uint32_t flags)
+{
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
@@ -731,7 +751,13 @@ bool jce_state_save_scene_file(const char *scene_path)
         return false;
     }
 
-    validate_scene_round_trip(scene_path);
+    /* Autosave (JCE_SAVE_AUTOSAVE): skip the synchronous full-scene
+     * round-trip re-load — it is a purely diagnostic load-after-save (the
+     * return value is discarded) that roughly doubles the save hitch on a
+     * big scene, and the periodic timer save does not need it.  Explicit
+     * manual saves keep the full validation. */
+    if (!(flags & JCE_SAVE_AUTOSAVE))
+        validate_scene_round_trip(scene_path);
     validate_mesh_assets(scene_path);
 
     update_scene_dir_from_path(scene_path);
@@ -748,6 +774,7 @@ bool jce_state_save_scene_file(const char *scene_path)
         jce_editor_config_add_recent_scene(&_ecfg, scene_path);
         jce_editor_config_save(&_ecfg);
     }
+    mirror_last_scene_to_project(scene_path);
     LOG_INFO(LOG_TAG, "scene saved to %s (%d entities)",
              scene_path, (int)g_entity_order.size());
 
@@ -756,7 +783,8 @@ bool jce_state_save_scene_file(const char *scene_path)
      * Gated behind a Preferences toggle (default off) since the compile
      * can be slow on low-end machines.  CMake's mtime tracking makes the
      * cost near-zero when no inputs actually changed. */
-    if (_ecfg_loaded && _ecfg.auto_repack_on_save &&
+    if (!(flags & JCE_SAVE_AUTOSAVE) &&
+        _ecfg_loaded && _ecfg.auto_repack_on_save &&
         _ecfg.build_preset[0] != '\0') {
         if (jce_build_manager_repack_game_assets(_ecfg.build_preset)) {
             jce_toast_info("%s", jce_editor_i18n("save.autoRepack.started"));
@@ -843,6 +871,7 @@ bool jce_state_load_scene_file(const char *scene_path)
                         jce_editor_config_save(&_ecfg);
                 }
             }
+            mirror_last_scene_to_project(scene_path);
             LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
                      scene_path, (int)g_entity_order.size());
         } else {
@@ -860,6 +889,10 @@ bool jce_state_load_scene_file(const char *scene_path)
         s_transaction.label[0] = '\0';
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
+
+        /* Land the viewport camera where the user last left it in THIS
+         * scene (no stored pose = keep the current framing). */
+        jce_editor_scene_camera_restore_pose(scene_path);
 
         /* Show the streamed world in the editor scene view for streaming scenes
          * (auto-enables preview so the editor matches Play instead of looking
@@ -935,6 +968,7 @@ void finalize_deferred_scene_load()
                     jce_editor_config_save(&_ecfg);
             }
         }
+        mirror_last_scene_to_project(path.c_str());
         LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
                  path.c_str(), (int)g_entity_order.size());
     }
@@ -949,6 +983,9 @@ void finalize_deferred_scene_load()
     s_transaction.label[0] = '\0';
     s_transaction.before.scene_json.clear();
     s_transaction.before.scene_path.clear();
+
+    /* Same per-scene camera restore as the synchronous path. */
+    jce_editor_scene_camera_restore_pose(path.c_str());
 
     jce_editor_scene_render_streaming_autostart();
 }
@@ -994,6 +1031,7 @@ bool jce_state_load_scene_file_async(const char *scene_path)
     jce_panel_sequencer_preview_flush();
     stop_play_before_scene_swap();
     jce_editor_scene_render_streaming_teardown();
+    close_active_bundle_mount();
 
     /* Inform the engine parser of the scene's base directory so sibling
      * material backfill resolves (jce_scene_serial_load_file does this; we
@@ -1204,6 +1242,9 @@ bool bundle_path_from_sidecar(const char *sidecar, char *out, size_t outsz)
 
 void close_active_bundle_mount()
 {
+    const bool had_bundle = g_bm.fs != nullptr || g_bm.cat != nullptr ||
+                            g_bm.bf != nullptr;
+
     /* Clear global asset-loader fallback first so any in-flight read
      * doesn't hit a torn-down fs. */
     if (jce_fs_get_active() == g_bm.fs) jce_fs_set_active(nullptr);
@@ -1223,6 +1264,9 @@ void close_active_bundle_mount()
         g_bm.fs = nullptr;
     }
     g_bm.active_bundle_id.clear();
+
+    if (had_bundle)
+        jce_editor_scene_render_refresh_content_context();
 }
 
 bool apply_scene_bytes(const char *display_path,
@@ -1272,6 +1316,11 @@ bool apply_scene_bytes(const char *display_path,
 }
 } /* namespace */
 
+void jce_state_close_bundle_preview(void)
+{
+    close_active_bundle_mount();
+}
+
 bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
 {
     if (!jbundle_path || jbundle_path[0] == '\0') return false;
@@ -1316,7 +1365,8 @@ bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
     char display[1024];
     snprintf(display, sizeof(display), "bundle://%s!%s",
              jbundle_path, scene_vpath);
-    jce_fs_set_active(g_bm.fs);
+    jce_fs_set_active_policy(g_bm.fs, JCE_FS_ACTIVE_ISOLATED);
+    jce_editor_scene_render_refresh_content_context();
     bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
     jce_fs_buffer_free(raw);
     if (!ok) close_active_bundle_mount();
@@ -1389,7 +1439,8 @@ bool jce_state_load_scene_from_catalog(const char *catalog_path,
     char display[1024];
     snprintf(display, sizeof(display), "catalog://%s#%s",
              catalog_path, bundle_id);
-    jce_fs_set_active(g_bm.fs);
+    jce_fs_set_active_policy(g_bm.fs, JCE_FS_ACTIVE_ISOLATED);
+    jce_editor_scene_render_refresh_content_context();
     bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
     jce_fs_buffer_free(raw);
     if (!ok) close_active_bundle_mount();

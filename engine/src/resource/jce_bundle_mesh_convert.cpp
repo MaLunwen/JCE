@@ -32,6 +32,9 @@ extern "C" {
 
 #include <meshoptimizer.h>
 
+#include <algorithm>   /* std::sort / std::fill (DAG build) */
+#include <cmath>       /* sqrtf (group-sphere merge)        */
+
 #include <cstring>
 #include <cstdint>
 #include <cstddef>
@@ -272,6 +275,326 @@ static size_t generate_mesh_lods(const aiMesh *mesh, MeshLods *out)
     return levels;
 }
 
+/* MESHLET GENERATION (additive, cook-time — Nanite-lite V1 + V3 LOD DAG).
+ *
+ * For dense static meshes, split the index buffer into GPU-cullable clusters
+ * with meshopt_buildMeshlets, then build a cluster-LOD DAG above the leaves
+ * (group ~4 sibling clusters -> simplify the merged patch to ~50% with the
+ * group's BOUNDARY VERTICES LOCKED -> re-split into ~2 coarser clusters,
+ * recurse), and persist ALL levels as a `JCE_meshlets` primitive extension
+ * ({"indices":A,"meshlets":B,"bounds":C,"errors":E} accessor ids):
+ *   A = meshlet-grouped index buffer (GLOBAL vertex ids — flattened from the
+ *       meshlet-local vertex/triangle tables so the runtime binds it directly
+ *       against the base vertex buffer; leaves AND coarse clusters),
+ *   B = 2 x u32 per meshlet  {index_offset, index_count} into A,
+ *   C = 8 x f32 per meshlet  {sphere cx,cy,cz,r, cone axis xyz, cone cutoff}
+ *       from meshopt_computeMeshletBounds (cone axis derives from FACE
+ *       normals, so it is winding-consistent by construction — the runtime
+ *       cull's cone backface test depends on that sign),
+ *   E = 10 x f32 per meshlet {own_error, parent_error,
+ *                             own-group sphere cx,cy,cz,r,
+ *                             parent-group sphere cx,cy,cz,r} — errors in
+ *       OBJECT units, own_error = max(simplification error, children's
+ *       own_error) so it is MONOTONE up every DAG path; leaves carry
+ *       {0, +BIG}.  The runtime cut (cs_meshlet_cull) draws a cluster iff
+ *       own_error passes the screen-space tolerance measured at the OWN-
+ *       group sphere and parent_error does not at the PARENT-group sphere.
+ *       A child's parent-test and its parent's own-test therefore evaluate
+ *       the IDENTICAL (error, sphere) pair — the two decisions are exactly
+ *       complementary, so every surface region is drawn by exactly one
+ *       ancestor: no holes, no double-draw (near parts fine, far parts
+ *       coarse, within ONE mesh).  Boundary locking keeps group seams
+ *       watertight; group spheres nest by construction (parent sphere
+ *       bounds its members' spheres), keeping selection monotone in
+ *       distance.
+ * The runtime (jce_gltf_loader.c) uploads A as an alternate index buffer and
+ * B+C+E as a COMPUTE_READ sidecar; cs_meshlet_cull cut+frustum+cone-culls
+ * per CLUSTER and survivors draw via one submit_indirect (JCE_MESHLET_CULL).
+ *
+ * Like JCE_lod this is additive (base geometry byte-identical, unknown
+ * readers ignore it) and deterministic for a fixed input.  Only meshes worth
+ * a dispatch get one (>= JCE_MESHLET_COOK_MIN_TRIS); JCE_COOK_NO_MESHLETS=1
+ * disables emission entirely, JCE_COOK_MESHLET_FLAT=1 emits leaves only
+ * (V1 behaviour; the DAG roughly doubles the grouped-IB bytes). */
+
+#define JCE_MESHLET_COOK_MIN_TRIS   4096u   /* below this a plain draw wins */
+#define JCE_MESHLET_MAX_VERTS       64      /* meshopt-recommended defaults */
+#define JCE_MESHLET_MAX_TRIS        124     /* (multiple of 4)              */
+#define JCE_MESHLET_CONE_WEIGHT     0.5f    /* balance size vs cullability  */
+#define JCE_MESHLET_DAG_GROUP       4       /* clusters merged per parent    */
+#define JCE_MESHLET_DAG_MAX_LEVELS  14      /* safety cap on DAG depth       */
+#define JCE_MESHLET_ROOT_ERROR      1.0e30f /* "no parent" sentinel          */
+
+/* Captured meshlet set for one aiMesh (runtime-format arrays, see above). */
+struct MeshMeshlets {
+    std::vector<uint32_t> indices;   /* A: meshlet-grouped IB (global ids)    */
+    std::vector<uint32_t> desc;      /* B: {index_offset, index_count} x N    */
+    std::vector<float>    bounds;    /* C: {sphere xyzr, cone xyz cutoff} x N */
+    std::vector<float>    errors;    /* E: 10 x N {own_err, parent_err,
+                                      *   own-group sphere xyzr,
+                                      *   parent-group sphere xyzr} (V3) */
+};
+
+/* One in-flight cluster during DAG construction (its triangles as GLOBAL
+ * vertex ids, its accumulated object-space error, a centroid for spatial
+ * grouping, and the index of its emitted record so a later level can patch
+ * parent_error in). */
+struct DagCluster {
+    std::vector<uint32_t> tris;      /* 3N global vertex ids                */
+    float                 own_error; /* object units, monotone up the DAG   */
+    float                 c[3];      /* bounding-sphere centre (grouping)   */
+    float                 gs[4];     /* creation-group sphere (own-test)    */
+    size_t                slot;      /* index into out->desc/bounds/errors  */
+};
+
+/* Split `tris` (global-id triangle list) into <=124-tri meshlets and emit
+ * each into `out` (grouped IB + desc + bounds + errors {own, ROOT}); the
+ * created clusters are appended to `made` with their emit slots so parent
+ * links can be patched later.  Returns the number of clusters emitted. */
+static size_t dag_emit_clusters(const std::vector<uint32_t> &tris,
+                                const float *positions, size_t vn,
+                                float own_error,
+                                const float *group_sphere, /* xyzw or NULL:
+                                    leaves use each cluster's own sphere */
+                                MeshMeshlets *out,
+                                std::vector<DagCluster> *made)
+{
+    if (tris.size() < 3) return 0;
+    const size_t max_meshlets = meshopt_buildMeshletsBound(
+        tris.size(), JCE_MESHLET_MAX_VERTS, JCE_MESHLET_MAX_TRIS);
+    std::vector<meshopt_Meshlet> mls(max_meshlets);
+    std::vector<unsigned int>    mverts(max_meshlets * JCE_MESHLET_MAX_VERTS);
+    std::vector<unsigned char>   mtris(max_meshlets * JCE_MESHLET_MAX_TRIS * 3);
+    const size_t n = meshopt_buildMeshlets(
+        mls.data(), mverts.data(), mtris.data(), tris.data(), tris.size(),
+        positions, vn, 3 * sizeof(float),
+        JCE_MESHLET_MAX_VERTS, JCE_MESHLET_MAX_TRIS, JCE_MESHLET_CONE_WEIGHT);
+    for (size_t m = 0; m < n; ++m) {
+        const meshopt_Meshlet &ml = mls[m];
+        DagCluster dc;
+        dc.own_error = own_error;
+        dc.slot      = out->desc.size() / 2;
+        dc.tris.reserve((size_t)ml.triangle_count * 3u);
+        const uint32_t start = (uint32_t)out->indices.size();
+        for (unsigned t = 0; t < ml.triangle_count * 3u; ++t) {
+            uint32_t g = mverts[ml.vertex_offset + mtris[ml.triangle_offset + t]];
+            out->indices.push_back(g);
+            dc.tris.push_back(g);
+        }
+        out->desc.push_back(start);
+        out->desc.push_back(ml.triangle_count * 3u);
+        const meshopt_Bounds b = meshopt_computeMeshletBounds(
+            &mverts[ml.vertex_offset], &mtris[ml.triangle_offset],
+            ml.triangle_count, positions, vn, 3 * sizeof(float));
+        out->bounds.push_back(b.center[0]);
+        out->bounds.push_back(b.center[1]);
+        out->bounds.push_back(b.center[2]);
+        out->bounds.push_back(b.radius);
+        out->bounds.push_back(b.cone_axis[0]);
+        out->bounds.push_back(b.cone_axis[1]);
+        out->bounds.push_back(b.cone_axis[2]);
+        out->bounds.push_back(b.cone_cutoff);
+        const float own_gs[4] = {
+            group_sphere ? group_sphere[0] : b.center[0],
+            group_sphere ? group_sphere[1] : b.center[1],
+            group_sphere ? group_sphere[2] : b.center[2],
+            group_sphere ? group_sphere[3] : b.radius,
+        };
+        out->errors.push_back(own_error);
+        out->errors.push_back(JCE_MESHLET_ROOT_ERROR);  /* patched by parent */
+        for (int a = 0; a < 4; ++a) out->errors.push_back(own_gs[a]);
+        for (int a = 0; a < 4; ++a) out->errors.push_back(own_gs[a]);
+        /* ^ parent-group sphere: placeholder (patched when a parent links;
+         *   irrelevant for roots — parent_error stays +BIG). */
+        dc.c[0] = b.center[0]; dc.c[1] = b.center[1]; dc.c[2] = b.center[2];
+        for (int a = 0; a < 4; ++a) dc.gs[a] = own_gs[a];
+        made->push_back(std::move(dc));
+    }
+    return n;
+}
+
+/* 30-bit Morton code of a cluster centroid quantised to the mesh AABB —
+ * consecutive codes are spatial neighbours, so grouping consecutive runs of
+ * sorted clusters yields compact merge groups without a graph partitioner. */
+static uint32_t dag_morton(const float c[3], const float mn[3], const float inv[3])
+{
+    uint32_t out = 0;
+    for (int a = 0; a < 3; ++a) {
+        float f = (c[a] - mn[a]) * inv[a];
+        uint32_t v = (uint32_t)(f < 0.0f ? 0.0f : (f > 1023.0f ? 1023.0f : f));
+        for (int bit = 0; bit < 10; ++bit)
+            out |= ((v >> bit) & 1u) << (bit * 3 + a);
+    }
+    return out;
+}
+
+static size_t generate_mesh_meshlets(const aiMesh *mesh, MeshMeshlets *out)
+{
+    if (!out) return 0;
+    out->indices.clear(); out->desc.clear(); out->bounds.clear();
+    out->errors.clear();
+    if (!mesh || !mesh->HasPositions() || mesh->HasBones()) return 0;
+    if (mesh->mNumFaces < JCE_MESHLET_COOK_MIN_TRIS) return 0;
+    if (getenv("JCE_COOK_NO_MESHLETS") != NULL) return 0;
+
+    const size_t vn = mesh->mNumVertices;
+    std::vector<float> positions(vn * 3);
+    for (size_t i = 0; i < vn; ++i) {
+        positions[i * 3 + 0] = mesh->mVertices[i].x;
+        positions[i * 3 + 1] = mesh->mVertices[i].y;
+        positions[i * 3 + 2] = mesh->mVertices[i].z;
+    }
+    std::vector<uint32_t> base((size_t)mesh->mNumFaces * 3);
+    for (size_t f = 0; f < mesh->mNumFaces; ++f) {
+        const aiFace &face = mesh->mFaces[f];
+        if (face.mNumIndices != 3) return 0;    /* must be triangulated */
+        base[f * 3 + 0] = face.mIndices[0];
+        base[f * 3 + 1] = face.mIndices[1];
+        base[f * 3 + 2] = face.mIndices[2];
+    }
+
+    /* Level 0: leaf clusters (own_error 0). */
+    std::vector<DagCluster> cur;
+    const size_t leaves = dag_emit_clusters(base, positions.data(), vn,
+                                            0.0f, NULL, out, &cur);
+    /* The runtime only dispatches at >= 16 clusters; don't pay the bytes
+     * for a set it would never cull. */
+    if (leaves < 16) {
+        out->indices.clear(); out->desc.clear(); out->bounds.clear();
+        out->errors.clear();
+        return 0;
+    }
+
+    /* V3 cluster-LOD DAG: group -> boundary-locked simplify -> re-split. */
+    size_t total = leaves, levels = 0;
+    if (getenv("JCE_COOK_MESHLET_FLAT") == NULL) {
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (size_t i = 0; i < vn; ++i)
+            for (int a = 0; a < 3; ++a) {
+                float v = positions[i * 3 + a];
+                if (v < mn[a]) mn[a] = v;
+                if (v > mx[a]) mx[a] = v;
+            }
+        float inv[3];
+        for (int a = 0; a < 3; ++a)
+            inv[a] = 1023.0f / ((mx[a] - mn[a]) > 1e-9f ? (mx[a] - mn[a]) : 1.0f);
+
+        std::vector<uint32_t> group_of(vn);    /* per-vertex owner group id  */
+        std::vector<unsigned char> vlock(vn);
+        for (levels = 1; levels <= JCE_MESHLET_DAG_MAX_LEVELS; ++levels) {
+            if (cur.size() < 2) break;
+            std::sort(cur.begin(), cur.end(),
+                      [&](const DagCluster &a, const DagCluster &b) {
+                          uint32_t ma = dag_morton(a.c, mn, inv);
+                          uint32_t mb = dag_morton(b.c, mn, inv);
+                          /* slot tie-break: equal quantised centroids would
+                           * otherwise get STL-specific order, breaking
+                           * cross-toolchain cooked-byte determinism. */
+                          return ma != mb ? ma < mb : a.slot < b.slot;
+                      });
+            const size_t ngroups =
+                (cur.size() + JCE_MESHLET_DAG_GROUP - 1) / JCE_MESHLET_DAG_GROUP;
+
+            /* Boundary lock: a vertex referenced by two DIFFERENT groups of
+             * this level is a group-boundary vertex — the simplifier must
+             * not move it, so neighbouring groups (possibly selected at
+             * different LOD levels at runtime) keep bit-identical seams. */
+            const uint32_t NOG = 0xffffffffu;
+            std::fill(group_of.begin(), group_of.end(), NOG);
+            std::fill(vlock.begin(), vlock.end(), (unsigned char)0);
+            for (size_t ci = 0; ci < cur.size(); ++ci) {
+                const uint32_t g = (uint32_t)(ci / JCE_MESHLET_DAG_GROUP);
+                for (uint32_t v : cur[ci].tris) {
+                    if (group_of[v] == NOG)       group_of[v] = g;
+                    else if (group_of[v] != g)    vlock[v] = 1;
+                }
+            }
+
+            std::vector<DagCluster> next;
+            std::vector<uint32_t> merged, simplified;
+            for (size_t g = 0; g < ngroups; ++g) {
+                const size_t b0 = g * JCE_MESHLET_DAG_GROUP;
+                const size_t b1 = (b0 + JCE_MESHLET_DAG_GROUP < cur.size())
+                                      ? b0 + JCE_MESHLET_DAG_GROUP : cur.size();
+                if (b1 - b0 < 2) {
+                    /* Singleton: carries to the next level ungrouped. */
+                    next.push_back(std::move(cur[b0]));
+                    continue;
+                }
+                merged.clear();
+                float cmax = 0.0f;
+                for (size_t ci = b0; ci < b1; ++ci) {
+                    merged.insert(merged.end(), cur[ci].tris.begin(),
+                                  cur[ci].tris.end());
+                    if (cur[ci].own_error > cmax) cmax = cur[ci].own_error;
+                }
+                /* Group sphere = bound of the members' own-group spheres
+                 * (nesting by construction: it encloses every descendant's
+                 * test sphere, so coarser levels test at conservative,
+                 * monotone distances). */
+                float gsp[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (size_t ci = b0; ci < b1; ++ci)
+                    for (int a = 0; a < 3; ++a)
+                        gsp[a] += cur[ci].gs[a] / (float)(b1 - b0);
+                for (size_t ci = b0; ci < b1; ++ci) {
+                    float dx = cur[ci].gs[0] - gsp[0];
+                    float dy = cur[ci].gs[1] - gsp[1];
+                    float dz = cur[ci].gs[2] - gsp[2];
+                    float dr = sqrtf(dx * dx + dy * dy + dz * dz) + cur[ci].gs[3];
+                    if (dr > gsp[3]) gsp[3] = dr;
+                }
+                simplified.resize(merged.size());
+                /* Sparse: the patch is ~500 tris out of possibly millions of
+                 * mesh verts — without it every call pays O(vertex_count)
+                 * remap/classify/rescale passes and the DAG build blows the
+                 * bundle-cook budget on dense heroes.  Sparse changes the
+                 * error normalisation to the SUBSET extent, so ErrorAbsolute
+                 * keeps the errors lane in object units (no mscale). */
+                float abs_err = 0.0f;
+                size_t sn = meshopt_simplifyWithAttributes(
+                    simplified.data(), merged.data(), merged.size(),
+                    positions.data(), vn, 3 * sizeof(float),
+                    NULL, 0, NULL, 0, vlock.data(),
+                    (merged.size() / 6) * 3,      /* target: half the tris  */
+                    1e30f,
+                    meshopt_SimplifyLockBorder | meshopt_SimplifySparse |
+                        meshopt_SimplifyErrorAbsolute,
+                    &abs_err);
+                if (sn >= (size_t)((double)merged.size() * 0.85) || sn < 3) {
+                    /* Locked seams left nothing to collapse: the members
+                     * stay DAG roots (parent_error remains +BIG). */
+                    continue;
+                }
+                simplified.resize(sn);
+                /* Parent error: own simplification error in object units
+                 * (ErrorAbsolute — no rescale), forced monotone over the
+                 * children (cut correctness). */
+                const float perr = (abs_err > cmax ? abs_err : cmax) + 1e-7f;
+                std::vector<DagCluster> made;
+                if (dag_emit_clusters(simplified, positions.data(), vn,
+                                      perr, gsp, out, &made) == 0)
+                    continue;
+                for (size_t ci = b0; ci < b1; ++ci) {
+                    out->errors[cur[ci].slot * 10 + 1] = perr; /* link parent */
+                    for (int a = 0; a < 4; ++a)
+                        out->errors[cur[ci].slot * 10 + 6 + a] = gsp[a];
+                }
+                total += made.size();
+                for (size_t mi2 = 0; mi2 < made.size(); ++mi2)
+                    next.push_back(std::move(made[mi2]));
+            }
+            cur.swap(next);
+        }
+    }
+
+    LOG_INFO(LOG_TAG,
+             "meshlets '%s': %zu tris -> %zu leaf + %zu coarse clusters "
+             "(%zu DAG level(s))",
+             mesh->mName.C_Str(), base.size() / 3, leaves, total - leaves,
+             levels ? levels - 1 : 0);
+    return total;
+}
+
 /* ---- Indexed-GLB writer ---------------------------------------------------
  * Assimp 6's glTF2 exporter writes UN-INDEXED triangle soup (a clean 265K-vert
  * indexed mesh comes out as 1.5M verts == 1.5M identity indices), inflating the
@@ -300,21 +623,28 @@ static void jw_put_bytes(std::vector<uint8_t> &b, const void *p, size_t n)
 }
 
 static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
+                              const MeshMeshlets *mesh_meshlets,
                               uint8_t **out_buf, size_t *out_size)
 {
     if (!scene || scene->mNumMeshes == 0) return false;
-    if (scene->mNumTextures > 0) return false;          /* embedded images: keep assimp path */
-    for (unsigned i = 0; i < scene->mNumMaterials; ++i) {
-        const aiMaterial *m = scene->mMaterials[i];
-        if (m->GetTextureCount(aiTextureType_DIFFUSE) > 0 ||
-            m->GetTextureCount(aiTextureType_BASE_COLOR) > 0)
-            return false;                               /* textured: keep assimp path */
+    /* JCE_COOK_FORCE_INDEXED_LOD: take the indexed + LOD-generating writer even for
+     * textured/embedded-image scenes (textures are dropped — for GPU-vertex / LOD
+     * benchmarking where geometry, not shading, is the subject). */
+    if (getenv("JCE_COOK_FORCE_INDEXED_LOD") == NULL) {
+        if (scene->mNumTextures > 0) return false;          /* embedded images: keep assimp path */
+        for (unsigned i = 0; i < scene->mNumMaterials; ++i) {
+            const aiMaterial *m = scene->mMaterials[i];
+            if (m->GetTextureCount(aiTextureType_DIFFUSE) > 0 ||
+                m->GetTextureCount(aiTextureType_BASE_COLOR) > 0)
+                return false;                               /* textured: keep assimp path */
+        }
     }
 
     std::vector<uint8_t> bin;
     std::string jbv, jacc, jmesh, jnode, jscene;
     int bv = 0, ac = 0, node = 0;
-    bool any_lod = false;   /* set when any JCE_lod extension is emitted */
+    bool any_lod = false;   /* set when any JCE_lod extension is emitted      */
+    bool any_ml  = false;   /* set when any JCE_meshlets extension is emitted */
 
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh *me = scene->mMeshes[mi];
@@ -403,13 +733,64 @@ static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
             }
         }
 
+        /* JCE_meshlets accessors (additive — grouped IB shares the base VB;
+         * desc/bounds are raw little-endian SCALAR streams the loader reads
+         * verbatim).  Validity mirrors the LOD lane: grouped indices must
+         * address [0, V). */
+        std::string jml;   /* "\"indices\":A,\"meshlets\":B,\"bounds\":C[,\"errors\":E]" */
+        if (mesh_meshlets) {
+            const MeshMeshlets &mm = mesh_meshlets[mi];
+            bool ok = !mm.desc.empty() && !mm.indices.empty() &&
+                      (mm.desc.size() % 2) == 0 &&
+                      mm.bounds.size() == (mm.desc.size() / 2) * 8;
+            const bool have_err =
+                ok && mm.errors.size() == (mm.desc.size() / 2) * 10;
+            for (size_t k = 0; ok && k < mm.indices.size(); ++k)
+                if (mm.indices[k] >= V) ok = false;
+            if (ok) {
+                jw_align4(bin); size_t aoff = bin.size();
+                jw_put_bytes(bin, mm.indices.data(), mm.indices.size() * 4);
+                jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"target\":34963}", aoff, mm.indices.size() * 4);
+                int a_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5125,\"count\":%zu,\"type\":\"SCALAR\"}", a_bv, mm.indices.size());
+                int a_ac = ac++;
+                jw_align4(bin); size_t doff = bin.size();
+                jw_put_bytes(bin, mm.desc.data(), mm.desc.size() * 4);
+                jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu}", doff, mm.desc.size() * 4);
+                int d_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5125,\"count\":%zu,\"type\":\"SCALAR\"}", d_bv, mm.desc.size());
+                int d_ac = ac++;
+                jw_align4(bin); size_t boff = bin.size();
+                jw_put_bytes(bin, mm.bounds.data(), mm.bounds.size() * 4);
+                jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu}", boff, mm.bounds.size() * 4);
+                int b_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5126,\"count\":%zu,\"type\":\"SCALAR\"}", b_bv, mm.bounds.size());
+                int b_ac = ac++;
+                jw_appendf(jml, "\"indices\":%d,\"meshlets\":%d,\"bounds\":%d", a_ac, d_ac, b_ac);
+                if (have_err) {   /* V3 cluster-LOD DAG cut errors */
+                    jw_align4(bin); size_t eoff = bin.size();
+                    jw_put_bytes(bin, mm.errors.data(), mm.errors.size() * 4);
+                    jbv += ','; jw_appendf(jbv, "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu}", eoff, mm.errors.size() * 4);
+                    int e_bv = bv++; jacc += ','; jw_appendf(jacc, "{\"bufferView\":%d,\"componentType\":5126,\"count\":%zu,\"type\":\"SCALAR\"}", e_bv, mm.errors.size());
+                    int e_ac = ac++;
+                    jw_appendf(jml, ",\"errors\":%d", e_ac);
+                }
+                any_ml = true;
+            }
+        }
+
         if (!jmesh.empty()) jmesh += ',';
         jw_appendf(jmesh, "{\"primitives\":[{\"attributes\":{\"POSITION\":%d", pos_ac);
         if (nrm_ac >= 0) jw_appendf(jmesh, ",\"NORMAL\":%d", nrm_ac);
         if (uv_ac  >= 0) jw_appendf(jmesh, ",\"TEXCOORD_0\":%d", uv_ac);
         jw_appendf(jmesh, "},\"indices\":%d,\"material\":%u,\"mode\":4", idx_ac, me->mMaterialIndex);
-        if (!jlod.empty())
-            jw_appendf(jmesh, ",\"extensions\":{\"JCE_lod\":{\"indices\":[%s]}}", jlod.c_str());
+        if (!jlod.empty() || !jml.empty()) {
+            jmesh += ",\"extensions\":{";
+            if (!jlod.empty())
+                jw_appendf(jmesh, "\"JCE_lod\":{\"indices\":[%s]}", jlod.c_str());
+            if (!jml.empty()) {
+                if (!jlod.empty()) jmesh += ',';
+                jw_appendf(jmesh, "\"JCE_meshlets\":{%s}", jml.c_str());
+            }
+            jmesh += "}";
+        }
         jmesh += "}]}";
 
         if (!jnode.empty())  jnode  += ',';
@@ -424,16 +805,32 @@ static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
     for (unsigned i = 0; i < scene->mNumMaterials; ++i) {
         aiColor4D kd(1.f, 1.f, 1.f, 1.f);
         aiGetMaterialColor(scene->mMaterials[i], AI_MATKEY_COLOR_DIFFUSE, &kd);
+        /* Preserve two-sidedness: stylized content (tent canvas, foliage
+         * cards) authors doubleSided=true; dropping it back-face-culls open
+         * single-layer sheets into holes. */
+        int two_sided = 0;
+        {
+            unsigned mx = 1;
+            aiGetMaterialIntegerArray(scene->mMaterials[i], AI_MATKEY_TWOSIDED,
+                                      &two_sided, &mx);
+        }
         if (!jmat.empty()) jmat += ',';
         jw_appendf(jmat, "{\"pbrMetallicRoughness\":{\"baseColorFactor\":[%.6g,%.6g,%.6g,%.6g],"
-                   "\"metallicFactor\":0.0,\"roughnessFactor\":1.0}}", kd.r, kd.g, kd.b, kd.a);
+                   "\"metallicFactor\":0.0,\"roughnessFactor\":1.0}%s}",
+                   kd.r, kd.g, kd.b, kd.a,
+                   two_sided ? ",\"doubleSided\":true" : "");
     }
 
     std::string json = "{\"asset\":{\"version\":\"2.0\",\"generator\":\"jce-indexed-glb\"},";
-    /* Declare the vendor extension so spec-compliant readers (and our loader)
-     * know JCE_lod is OPTIONAL — it appears in extensionsUsed but NOT
-     * extensionsRequired, so a reader that ignores it still loads LOD0. */
-    if (any_lod) json += "\"extensionsUsed\":[\"JCE_lod\"],";
+    /* Declare the vendor extensions so spec-compliant readers (and our loader)
+     * know they are OPTIONAL — they appear in extensionsUsed but NOT
+     * extensionsRequired, so a reader that ignores them still loads LOD0. */
+    if (any_lod || any_ml) {
+        json += "\"extensionsUsed\":[";
+        if (any_lod) json += "\"JCE_lod\"";
+        if (any_ml)  { if (any_lod) json += ','; json += "\"JCE_meshlets\""; }
+        json += "],";
+    }
     jw_appendf(json, "\"buffers\":[{\"byteLength\":%zu}],", bin.size());
     json += "\"bufferViews\":[" + jbv + "],";
     json += "\"accessors\":[" + jacc + "],";
@@ -512,6 +909,31 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
         return 0;
     }
 
+    /* Bake per-node TRS into the vertices for STATIC scenes.  The indexed-glb
+     * writer below walks only scene->mMeshes and emits identity nodes
+     * ({"mesh":N}, no matrix/TRS), so any transform left on aiNodes — e.g.
+     * the Z-up→Y-up rotation node (quat -0.7071,0,0,0.7071) Draco/DCC-
+     * exported glTFs carry — would be silently dropped and the converted
+     * model would render displaced/lying flat.  NOTE: this flag cannot be
+     * OR'd into `flags` above: assimp rejects PreTransformVertices together
+     * with OptimizeGraph (whole import returns NULL); a second
+     * ApplyPostProcessing pass validates only its own flag.  Skinned or
+     * animated scenes are skipped (PreTransformVertices deletes bones and
+     * animations); those keep their hierarchy for the glb2 fallback path. */
+    {
+        bool animated = scene->mNumAnimations > 0;
+        for (unsigned i = 0; !animated && i < scene->mNumMeshes; ++i)
+            animated = scene->mMeshes[i]->HasBones();
+        if (!animated) {
+            scene = importer.ApplyPostProcessing(aiProcess_PreTransformVertices);
+            if (!scene) {
+                LOG_WARN(LOG_TAG, "assimp PreTransformVertices failed: %s",
+                         importer.GetErrorString());
+                return 0;
+            }
+        }
+    }
+
     /* meshopt dedup pass */
     {
         size_t total_verts = 0, total_faces = 0;
@@ -547,11 +969,25 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
                      total_lods, scene->mNumMeshes);
     }
 
+    /* AUTO-MESHLETS (additive, Nanite-lite V1): cluster-cull sidecars for
+     * dense static meshes, persisted as the JCE_meshlets primitive extension
+     * by the indexed writer below.  Never mutates the scene. */
+    std::vector<MeshMeshlets> mesh_meshlets(scene->mNumMeshes);
+    {
+        size_t total_ml = 0;
+        for (unsigned i = 0; i < scene->mNumMeshes; ++i)
+            total_ml += generate_mesh_meshlets(scene->mMeshes[i], &mesh_meshlets[i]);
+        if (total_ml > 0)
+            LOG_INFO(LOG_TAG, "auto-meshlets: %zu cluster(s) across %u mesh(es)",
+                     total_ml, scene->mNumMeshes);
+    }
+
     /* Preferred path: write an INDEXED glb ourselves (Assimp's glTF2 exporter
      * un-indexes to triangle soup, inflating the bundle 2-6x).  Falls back to
      * the Assimp exporter for textured / embedded-image scenes.  The captured
      * LOD chains are persisted into the glb (JCE_lod primitive extension). */
-    if (write_indexed_glb(scene, mesh_lods.data(), out_buf, out_size))
+    if (write_indexed_glb(scene, mesh_lods.data(), mesh_meshlets.data(),
+                          out_buf, out_size))
         return 1;
 
     /* Fallback: Assimp's validated glb2 exporter (binary glTF 2.0). */

@@ -172,6 +172,39 @@ static void draw_light_scene_icon(ImDrawList *dl, ImVec2 center,
     }
 }
 
+/* ── Particle-emitter scene icon ─────────────────────────────────────
+ * A little "fountain of sparks": a nozzle disc at the base with spark
+ * lines fanning upward.  Particle emitters carry no MeshRenderer, so like
+ * lights/cameras they have no GPU id-buffer footprint and are otherwise
+ * unclickable — this always-on icon is their selection handle. */
+static void draw_particle_scene_icon(ImDrawList *dl, ImVec2 center,
+                                     float radius, bool selected)
+{
+    ImU32 stroke = selected ? IM_COL32(255, 255, 255, 245)
+                            : IM_COL32(210, 150, 255, 245);
+    ImU32 fill   = IM_COL32(40, 20, 56, 215);
+    ImU32 spark  = selected ? IM_COL32(255, 255, 255, 235)
+                            : IM_COL32(224, 176, 255, 235);
+
+    dl->AddCircleFilled(ImVec2(center.x + 1.5f, center.y + 2.0f),
+                        radius + 2.0f, IM_COL32(0, 0, 0, 70), 20);
+
+    /* Nozzle: small filled disc at the base. */
+    ImVec2 base(center.x, center.y + radius * 0.55f);
+    dl->AddCircleFilled(base, radius * 0.28f, fill, 14);
+    dl->AddCircle(base, radius * 0.28f, stroke, 14, 1.8f);
+
+    /* Sparks fanning upward from the nozzle (screen up = -y). */
+    for (int i = 0; i < 5; i++) {
+        float t   = (float)i / 4.0f;              /* 0..1 across the fan */
+        float a   = -2.26893f + t * 1.38230f;     /* -130 deg .. -50 deg */
+        float len = radius * (0.85f + 0.35f * sinf(t * 3.14159265f));
+        ImVec2 tip(base.x + cosf(a) * len, base.y + sinf(a) * len);
+        dl->AddLine(base, tip, spark, 1.6f);
+        dl->AddCircleFilled(tip, radius * 0.13f, spark, 8);
+    }
+}
+
 /* ── Orientation helper basis from a transform's quaternion ──────── */
 
 static void build_helper_basis(const JceTransform *xform,
@@ -407,6 +440,28 @@ static void draw_light_helper_lines(ImDrawList *dl,
 
 /* ── Scene helper icons (cameras & lights) ───────────────────────── */
 
+/* Collect the icon-bearing entities by iterating the component HOLDERS
+ * (flecs each, O(#lights + #cameras)) instead of probing every entity: the
+ * old full walk cost ~7 component probes x 150k entities ~= 8ms/frame
+ * (measured via ed_sv_overlay) to find a handful of lights/cameras. */
+#define SCENE_ICON_MAX 256
+
+typedef struct {
+    uint32_t ids[SCENE_ICON_MAX];
+    int      count;
+} IconCollect;
+
+static void icon_collect_cb(JceScene *s, JceEntity e, void *ud)
+{
+    (void)s;
+    IconCollect *c = (IconCollect *)ud;
+    uint32_t id = (uint32_t)e;
+    for (int i = 0; i < c->count; i++)
+        if (c->ids[i] == id) return;          /* dedup (multi-component) */
+    if (c->count < SCENE_ICON_MAX)
+        c->ids[c->count++] = id;
+}
+
 void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
 {
     if (!dl || !cam) return;
@@ -414,9 +469,16 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
     JceScene *scene = jce_state_get_scene();
     if (!scene) return;
 
-    int total = jce_state_get_entity_count();
-    for (int i = 0; i < total; i++) {
-        uint32_t id = jce_state_get_entity_id_by_index(i);
+    IconCollect coll;
+    coll.count = 0;
+    jce_scene_each_camera(scene, icon_collect_cb, &coll);
+    jce_scene_each_dir_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_point_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_spot_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_particle_emitter(scene, icon_collect_cb, &coll);
+
+    for (int ci = 0; ci < coll.count; ci++) {
+        uint32_t id = coll.ids[ci];
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
@@ -424,12 +486,15 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
         JceTransform *xform = jce_scene_get_transform(scene, e);
         if (!xform) continue;
 
-        bool has_camera = jce_scene_has_camera(scene, e);
-        bool has_dir    = jce_scene_has_dir_light(scene, e);
-        bool has_point  = jce_scene_has_point_light(scene, e);
-        bool has_spot   = jce_scene_has_spot_light(scene, e);
-        bool has_light  = has_dir || has_point || has_spot;
-        if (!has_camera && !has_light) continue;
+        bool has_camera   = jce_scene_has_camera(scene, e);
+        bool has_dir      = jce_scene_has_dir_light(scene, e);
+        bool has_point    = jce_scene_has_point_light(scene, e);
+        bool has_spot     = jce_scene_has_spot_light(scene, e);
+        bool has_light    = has_dir || has_point || has_spot;
+        /* Particle emitters are standalone source entities in practice;
+         * the camera/light icon takes precedence if (rarely) combined. */
+        bool has_particle = jce_scene_has_particle_emitter(scene, e);
+        if (!has_camera && !has_light && !has_particle) continue;
 
         float world[3] = {
             xform->position.x, xform->position.y, xform->position.z
@@ -479,8 +544,116 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
             draw_camera_scene_icon(dl, center, 18.0f, selected);
         } else if (light_type >= 0) {
             draw_light_scene_icon(dl, center, 18.0f, light_type, selected);
+        } else if (has_particle) {
+            draw_particle_scene_icon(dl, center, 18.0f, selected);
         }
     }
+}
+
+/* ── Icon picking (screen-space) ──────────────────────────────────────
+ * Camera/light entities are drawn as constant-screen-size 2D icons ON TOP
+ * of the scene, so they can't be picked from the GPU id-buffer (and a
+ * world-space proxy would mispick at distance).  Mirror the enumeration +
+ * placement of draw_scene_helper_icons exactly — same entity set, same
+ * skip rules, same centers/radii — and hit-test in screen space, the
+ * standard editor approach. */
+
+/* Shared enumerator: invokes fn(id, center, radius) for every VISIBLE icon
+ * disc (two discs in the camera+light dual case).  Returns early when fn
+ * returns false. */
+template <typename Fn>
+static void scene_helper_icons_each(const JceGizmoCamera *cam, Fn fn)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !cam) return;
+
+    IconCollect coll;
+    coll.count = 0;
+    jce_scene_each_camera(scene, icon_collect_cb, &coll);
+    jce_scene_each_dir_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_point_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_spot_light(scene, icon_collect_cb, &coll);
+    jce_scene_each_particle_emitter(scene, icon_collect_cb, &coll);
+
+    for (int ci = 0; ci < coll.count; ci++) {
+        uint32_t id = coll.ids[ci];
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
+
+        JceEntity e = (JceEntity)id;
+        JceTransform *xform = jce_scene_get_transform(scene, e);
+        if (!xform) continue;
+
+        bool has_camera   = jce_scene_has_camera(scene, e);
+        bool has_dir      = jce_scene_has_dir_light(scene, e);
+        bool has_point    = jce_scene_has_point_light(scene, e);
+        bool has_spot     = jce_scene_has_spot_light(scene, e);
+        bool has_light    = has_dir || has_point || has_spot;
+        bool has_particle = jce_scene_has_particle_emitter(scene, e);
+        /* Mirror draw_scene_helper_icons: a particle-only entity falls into
+         * the single-disc branch below (has_camera && has_light == false), so
+         * its 18px source icon is hit-tested exactly where it is drawn. */
+        if (!has_camera && !has_light && !has_particle) continue;
+
+        float world[3] = {
+            xform->position.x, xform->position.y, xform->position.z
+        };
+        float screen[2];
+        if (!gm_world_to_screen(cam, world, screen))
+            continue;
+
+        const float pad = 24.0f;
+        if (screen[0] < cam->viewport_origin[0] - pad
+            || screen[0] > cam->viewport_origin[0] + cam->viewport_size[0] + pad
+            || screen[1] < cam->viewport_origin[1] - pad
+            || screen[1] > cam->viewport_origin[1] + cam->viewport_size[1] + pad)
+            continue;
+
+        bool selected  = jce_state_is_selected(id);
+        bool skip_icon = selected && id == jce_state_get_focused()
+                      && jce_editor_prefs_show_gizmos();
+        if (skip_icon) continue;   /* hidden icon must not eat clicks */
+
+        ImVec2 center(screen[0], screen[1]);
+        if (has_camera && has_light) {
+            if (!fn(id, ImVec2(center.x - 14.0f, center.y), 16.0f)) return;
+            if (!fn(id, ImVec2(center.x + 14.0f, center.y), 16.0f)) return;
+        } else {
+            if (!fn(id, center, 18.0f)) return;
+        }
+    }
+}
+
+uint32_t scene_helper_icon_hit_test(const JceGizmoCamera *cam, ImVec2 pt)
+{
+    /* Last hit wins: icons are drawn in enumeration order, so the LAST one
+     * under the cursor is the topmost pixel the user actually sees. */
+    uint32_t hit = 0;
+    scene_helper_icons_each(cam, [&](uint32_t id, ImVec2 c, float r) {
+        float dx = pt.x - c.x, dy = pt.y - c.y;
+        float rr = r + 4.0f;               /* small grace ring */
+        if (dx * dx + dy * dy <= rr * rr) hit = id;
+        return true;
+    });
+    return hit;
+}
+
+int scene_helper_icons_in_rect(const JceGizmoCamera *cam, ImVec2 mn, ImVec2 mx,
+                               uint32_t *out, int cap)
+{
+    /* Center-in-rect semantics (Unity): the icon is selected when its center
+     * lies inside the marquee. */
+    int n = 0;
+    scene_helper_icons_each(cam, [&](uint32_t id, ImVec2 c, float r) {
+        (void)r;
+        if (c.x >= mn.x && c.x <= mx.x && c.y >= mn.y && c.y <= mx.y) {
+            for (int i = 0; i < n; i++)
+                if (out[i] == id) return true;   /* dedup dual-icon entity */
+            if (n < cap) out[n++] = id;
+        }
+        return true;
+    });
+    return n;
 }
 
 /* ── Entity creation helpers ─────────────────────────────────────── */

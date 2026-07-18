@@ -70,6 +70,10 @@ JCE_API void JCE_CALL jce_physics_layer_matrix_reset_default(void);
  * Returns false on I/O or parse error. */
 JCE_API bool JCE_CALL jce_physics_layer_matrix_save_json(const char *vfs_path);
 JCE_API bool JCE_CALL jce_physics_layer_matrix_load_json(const char *vfs_path);
+/* Parse from an in-memory JSON buffer (single-exe: bytes decompressed from the
+ * embedded PAK).  `len` may be 0 to strlen(json). */
+JCE_API bool JCE_CALL jce_physics_layer_matrix_load_json_mem(const char *json,
+                                                             size_t len);
 
 /* ── Body integration helper ──────────────────────────────────────── *
  * Apply the current matrix row for `layer_index` to an existing body

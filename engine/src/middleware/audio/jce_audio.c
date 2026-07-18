@@ -128,6 +128,12 @@ typedef struct {
     bool            lpf_ok;
     float           lpf_cutoff; /* current cutoff Hz; avoids reinit churn when unchanged */
     DspNode         dsp;        /* insert chain spliced (sound/lpf)→dsp→target */
+    bool            vol_gated;  /* auto-stopped by the volume gate (see
+                                 * jce_audio_set_volume): a LOOPING voice at
+                                 * volume ~0 still decodes/mixes every audio
+                                 * callback — on wasm that work lands on the
+                                 * MAIN thread.  Gate stops it and restarts
+                                 * transparently when the volume rises. */
     /* Streaming voices: custom data source instead of ma_audio_buffer. */
     bool                  is_stream;
     ma_data_source_base   stream_ds;
@@ -829,6 +835,92 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     return (JceSound)(slot + 1);
 }
 
+struct JceAudioCpu {
+    void    *pcm;
+    uint32_t pcm_bytes;
+    uint16_t channels;
+    uint32_t sample_rate;
+    uint16_t bits;
+};
+
+JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
+                                         const char *hint_path)
+{
+    const char *path = hint_path ? hint_path : "<memory>";
+    if (!data || size == 0) return NULL;
+
+    JceAudioCpu *c = (JceAudioCpu *)JCE_CALLOC(1, sizeof(*c));
+    if (!c) return NULL;
+
+    if (jce_asset_is_cooked(data, size)) {
+        JceAssetView view;
+        if (!jce_asset_open(&view, data, size) ||
+            !view.header || view.header->asset_type != JCEASSET_TYPE_SOUND) {
+            LOG_ERROR("jce_audio",
+                      "cooked asset '%s' is not a valid sound representation",
+                      path);
+            JCE_FREE(c);
+            return NULL;
+        }
+
+        const JceAssetChunkEntry *info_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
+        const JceAssetChunkEntry *pcm_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
+        if (!info_c || !pcm_c || pcm_c->original_size > UINT32_MAX) {
+            LOG_ERROR("jce_audio", "cooked sound '%s' has invalid chunks", path);
+            JCE_FREE(c);
+            return NULL;
+        }
+
+        JceAssetAudioInfo ainfo;
+        if (jce_asset_chunk_data(&view, info_c, &ainfo, sizeof(ainfo)) == 0 ||
+            ainfo.channels == 0 ||
+            (ainfo.bits_per_sample != 8 && ainfo.bits_per_sample != 16)) {
+            LOG_ERROR("jce_audio", "cooked sound '%s' has invalid metadata", path);
+            JCE_FREE(c);
+            return NULL;
+        }
+
+        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
+        void *pcm_data = JCE_MALLOC(pcm_size ? pcm_size : 1u);
+        if (!pcm_data) {
+            JCE_FREE(c);
+            return NULL;
+        }
+        if (jce_asset_chunk_data(&view, pcm_c, pcm_data, pcm_size) == 0) {
+            JCE_FREE(pcm_data);
+            JCE_FREE(c);
+            return NULL;
+        }
+
+        c->pcm         = pcm_data;
+        c->pcm_bytes   = pcm_size;
+        c->channels    = ainfo.channels;
+        c->sample_rate = ainfo.sample_rate;
+        c->bits        = ainfo.bits_per_sample;
+        return c;
+    }
+
+    int16_t  *pcm = NULL;
+    ma_uint64 frames = 0;
+    ma_uint32 channels = 0, rate = 0;
+    if (!decode_pcm_mem((const uint8_t *)data, size, path, &pcm, &frames,
+                        &channels, &rate) ||
+        frames > UINT32_MAX / (channels ? channels * sizeof(int16_t) : 1u)) {
+        if (pcm) JCE_FREE(pcm);
+        JCE_FREE(c);
+        return NULL;
+    }
+
+    c->pcm         = pcm;
+    c->pcm_bytes   = (uint32_t)(frames * channels * sizeof(int16_t));
+    c->channels    = (uint16_t)channels;
+    c->sample_rate = rate;
+    c->bits        = 16;
+    return c;
+}
+
 static JceSound jce_audio_load_inner(JceAudio *audio, const JcePakArchive *pak,
                                      const char *path)
 {
@@ -851,62 +943,9 @@ static JceSound jce_audio_load_inner(JceAudio *audio, const JcePakArchive *pak,
         return JCE_SOUND_INVALID;
     }
 
-    /* ── Cooked path: .jceasset AUDIO_INFO + AUDIO_PCM → direct load ── */
-    if (jce_asset_is_cooked(raw, decoded)) {
-        JceAssetView view;
-        if (!jce_asset_open(&view, raw, decoded)) {
-            JCE_FREE(raw);
-            return JCE_SOUND_INVALID;
-        }
-
-        const JceAssetChunkEntry *info_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
-        const JceAssetChunkEntry *pcm_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
-
-        if (!info_c || !pcm_c) {
-            JCE_FREE(raw);
-            return JCE_SOUND_INVALID;
-        }
-
-        JceAssetAudioInfo ainfo;
-        if (jce_asset_chunk_data(&view, info_c,
-                                  &ainfo, sizeof(ainfo)) == 0) {
-            JCE_FREE(raw);
-            return JCE_SOUND_INVALID;
-        }
-
-        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
-        void *pcm_data = JCE_MALLOC(pcm_size);
-        if (!pcm_data) { JCE_FREE(raw); return JCE_SOUND_INVALID; }
-
-        if (jce_asset_chunk_data(&view, pcm_c, pcm_data, pcm_size) == 0) {
-            JCE_FREE(pcm_data);
-            JCE_FREE(raw);
-            return JCE_SOUND_INVALID;
-        }
-
-        JCE_FREE(raw);
-
-        JceSound result = jce_audio_load_pcm(audio, pcm_data, pcm_size,
-                                              ainfo.channels, ainfo.sample_rate,
-                                              ainfo.bits_per_sample);
-        JCE_FREE(pcm_data);
-        return result;
-    }
-
-    /* ── Raw path: OGG/WAV → miniaudio decode ── */
-    int slot = alloc_buffer_slot(audio);
-    if (slot < 0) {
-        LOG_WARN("jce_audio", "no free buffer slots");
-        JCE_FREE(raw);
-        return JCE_SOUND_INVALID;
-    }
-
-    JceSound result = load_from_memory(audio, slot,
-                                        (const uint8_t *)raw, decoded, path);
+    JceAudioCpu *cpu = jce_audio_decode_cpu_memory(raw, decoded, path);
     JCE_FREE(raw);
-    return result;
+    return jce_audio_upload_cpu(audio, cpu);
 }
 
 JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path)
@@ -918,14 +957,6 @@ JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *p
 }
 
 /* ── Worker-decode + main-thread-register split ───────────────────── */
-
-struct JceAudioCpu {
-    void    *pcm;          /* owned: s16 (or cooked-format) PCM bytes */
-    uint32_t pcm_bytes;
-    uint16_t channels;
-    uint32_t sample_rate;
-    uint16_t bits;         /* 8 or 16 */
-};
 
 JceAudioCpu *jce_audio_decode_cpu(const JcePakArchive *pak, const char *path)
 {
@@ -946,55 +977,8 @@ JceAudioCpu *jce_audio_decode_cpu(const JcePakArchive *pak, const char *path)
         return NULL;
     }
 
-    JceAudioCpu *c = (JceAudioCpu *)JCE_CALLOC(1, sizeof(*c));
-    if (!c) { JCE_FREE(raw); return NULL; }
-
-    /* ── Cooked path: .jceasset AUDIO_INFO + AUDIO_PCM ── */
-    if (jce_asset_is_cooked(raw, decoded)) {
-        JceAssetView view;
-        if (!jce_asset_open(&view, raw, decoded)) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
-
-        const JceAssetChunkEntry *info_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
-        const JceAssetChunkEntry *pcm_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
-        if (!info_c || !pcm_c) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
-
-        JceAssetAudioInfo ainfo;
-        if (jce_asset_chunk_data(&view, info_c, &ainfo, sizeof(ainfo)) == 0) {
-            JCE_FREE(c); JCE_FREE(raw); return NULL;
-        }
-
-        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
-        void *pcm_data = JCE_MALLOC(pcm_size);
-        if (!pcm_data) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
-        if (jce_asset_chunk_data(&view, pcm_c, pcm_data, pcm_size) == 0) {
-            JCE_FREE(pcm_data); JCE_FREE(c); JCE_FREE(raw); return NULL;
-        }
-        JCE_FREE(raw);
-
-        c->pcm         = pcm_data;
-        c->pcm_bytes   = pcm_size;
-        c->channels    = ainfo.channels;
-        c->sample_rate = ainfo.sample_rate;
-        c->bits        = ainfo.bits_per_sample;
-        return c;
-    }
-
-    /* ── Raw path: OGG/WAV/MP3/… → miniaudio decode → s16 PCM ── */
-    int16_t  *pcm = NULL;
-    ma_uint64 frames = 0;
-    ma_uint32 ch = 0, sr = 0;
-    bool ok = decode_pcm_mem((const uint8_t *)raw, decoded, path,
-                             &pcm, &frames, &ch, &sr);
+    JceAudioCpu *c = jce_audio_decode_cpu_memory(raw, decoded, path);
     JCE_FREE(raw);
-    if (!ok) { JCE_FREE(c); return NULL; }
-
-    c->pcm         = pcm;
-    c->pcm_bytes   = (uint32_t)(frames * ch * sizeof(int16_t));
-    c->channels    = (uint16_t)ch;
-    c->sample_rate = sr;
-    c->bits        = 16;
     return c;
 }
 
@@ -1190,7 +1174,18 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
     ma_sound_set_volume(&v->sound, volume);
     ma_sound_set_pitch(&v->sound, pitch);
     ma_sound_set_looping(&v->sound, loop ? MA_TRUE : MA_FALSE);
-    ma_sound_start(&v->sound);
+    v->vol_gated = false;   /* fresh voice: no stale gate from slot reuse */
+    if (loop && volume <= 0.001f) {
+        /* Born-silent looping voice (ambience bed / playlist track parked at
+         * 0): start it GATED instead of mixing silence forever.  Without
+         * this, voices whose volume never changes after play (so
+         * jce_audio_set_volume never runs) bypass the volume gate entirely —
+         * this scene ships 8 such beds.  jce_audio_set_volume un-gates the
+         * moment the mixer raises them. */
+        v->vol_gated = true;
+    } else {
+        ma_sound_start(&v->sound);
+    }
 
     v->inited = true;
     v->sound_slot = buf_slot;
@@ -1325,6 +1320,7 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
     ma_sound_start(&v->sound);
 
     v->inited     = true;
+    v->vol_gated  = false;  /* fresh voice: no stale gate from slot reuse */
     v->sound_slot = -1;
     voice_attach_lpf(audio, v);
     JCE_PROFILE_ZONE_END;
@@ -1365,6 +1361,7 @@ void jce_audio_pause(JceAudio *audio, JceVoice voice)
     int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
+    audio->voices[idx].vol_gated = false;   /* explicit pause supersedes the gate */
     ma_sound_stop(&audio->voices[idx].sound);
 }
 
@@ -1374,6 +1371,7 @@ void jce_audio_resume(JceAudio *audio, JceVoice voice)
     int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
+    audio->voices[idx].vol_gated = false;   /* explicit resume supersedes the gate */
     if (!ma_sound_is_playing(&audio->voices[idx].sound))
         ma_sound_start(&audio->voices[idx].sound);
 }
@@ -1384,7 +1382,28 @@ void jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume)
     int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
-    ma_sound_set_volume(&audio->voices[idx].sound, volume);
+    VoiceSlot *v = &audio->voices[idx];
+    ma_sound_set_volume(&v->sound, volume);
+
+    /* Volume gate (LOOPING voices only): a looping voice at volume ~0 still
+     * decodes + mixes every audio callback.  Crossfaded playlists / ambience
+     * beds commonly park many silent loops (this project: 3 streamed music
+     * tracks + ambience, all playing at 0) — cheap on desktop's audio thread,
+     * but on wasm the callback runs on the MAIN thread and the dead decode
+     * work becomes frame time.  Silent looping voices are transparently
+     * stopped and restarted the moment their volume rises; one-shots are
+     * left alone (stopping one would end it, not pause it). */
+    if (volume <= 0.001f) {
+        if (!v->vol_gated && ma_sound_is_looping(&v->sound)
+            && ma_sound_is_playing(&v->sound)) {
+            ma_sound_stop(&v->sound);
+            v->vol_gated = true;
+        }
+    } else if (v->vol_gated) {
+        v->vol_gated = false;
+        if (!ma_sound_is_playing(&v->sound))
+            ma_sound_start(&v->sound);
+    }
 }
 
 void jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch)
@@ -1631,11 +1650,9 @@ JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
                                 uint32_t size, const char *hint_path)
 {
     if (!audio || !data || size == 0) return JCE_SOUND_INVALID;
-    int slot = alloc_buffer_slot(audio);
-    if (slot < 0) return JCE_SOUND_INVALID;
-    return load_from_memory(audio, slot,
-                            (const uint8_t *)data, (size_t)size,
-                            hint_path ? hint_path : "<memory>");
+    JceAudioCpu *cpu = jce_audio_decode_cpu_memory(
+        data, (size_t)size, hint_path ? hint_path : "<memory>");
+    return jce_audio_upload_cpu(audio, cpu);
 }
 
 float jce_audio_get_duration(const JceAudio *audio, JceSound snd)
@@ -1863,6 +1880,10 @@ JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
     uint32_t size, const char *hint_path) {
     (void)audio; (void)data; (void)size; (void)hint_path;
     return JCE_SOUND_INVALID;
+}
+JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
+    const char *hint_path) {
+    (void)data; (void)size; (void)hint_path; return NULL;
 }
 float jce_audio_get_duration(const JceAudio *audio, JceSound snd) {
     (void)audio; (void)snd; return 0.0f;

@@ -52,6 +52,12 @@ JCE_API JceAvatarMask *jce_avatar_mask_load(const char *path);
 JCE_API JceAvatarMask *JCE_CALL jce_avatar_mask_load_for_skeleton(
     const char *path, const JceSkeleton *skel);
 
+/* Like jce_avatar_mask_load_for_skeleton but parses an in-memory .mask JSON
+ * buffer (single-exe: bytes decompressed from the embedded PAK).  `len` may be
+ * 0 to strlen(text). */
+JCE_API JceAvatarMask *JCE_CALL jce_avatar_mask_load_for_skeleton_mem(
+    const char *text, size_t len, const JceSkeleton *skel);
+
 JCE_API void JCE_CALL jce_avatar_mask_unload(JceAvatarMask *m);
 
 /* Number of bones the mask currently stores explicit weights for. */

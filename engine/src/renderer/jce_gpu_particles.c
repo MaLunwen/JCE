@@ -38,6 +38,15 @@
 
 struct JceGpuParticleSystem {
     bool      supported;
+    bool      needs_reset;          /* pool not yet GPU-zeroed (first tick) */
+    /* Frames to suppress the draw after creation.  The draw (color view,
+     * base+0) is sorted BEFORE the reset/update compute (base+9) within a
+     * bgfx frame, so on the creation frame the draw would read the
+     * uninitialized pool — garbage instances on Vulkan (a giant glowing
+     * blob), NaN geometry that TDRs the device on D3D12 (the scene-switch
+     * crash).  Draw only once a reset+update has executed in a PRIOR frame.
+     * Decremented once per update(); render skips while > 0. */
+    uint8_t   warmup;
     uint32_t  max_particles;        /* rounded to multiple of 64 */
     uint32_t  emit_cursor;          /* round-robin probe base */
 
@@ -59,6 +68,7 @@ struct JceGpuParticleSystem {
     bgfx_program_handle_t emit_program;
     bgfx_program_handle_t update_program;
     bgfx_program_handle_t render_program;
+    bgfx_program_handle_t reset_program;   /* one-shot pool zero-fill */
 
     /* Compute uniforms. */
     bgfx_uniform_handle_t u_emit_params;
@@ -67,6 +77,9 @@ struct JceGpuParticleSystem {
     bgfx_uniform_handle_t u_emit_v_max;
     bgfx_uniform_handle_t u_emit_life_size;
     bgfx_uniform_handle_t u_emit_color;
+
+    bgfx_uniform_handle_t u_particle_misc;  /* .x = textured flag (render) */
+    bgfx_uniform_handle_t s_particle_tex;   /* billboard texture sampler   */
 
     bgfx_uniform_handle_t u_update_params;
     bgfx_uniform_handle_t u_update_grav;
@@ -170,13 +183,54 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         return NULL;
     }
 
+    /* Uniforms FIRST — GL order contract: bgfx's GL backend resolves a
+     * program's user uniforms against the uniform registry at program-create
+     * time; uniforms registered after the program never reach it (the shader
+     * reads 0 — on GL the particle update saw count==0 and the pool never
+     * simulated).  D3D/Vulkan read the blob's own uniform table, masking this.
+     * See jce_gpu_scene.c (same fix, root-caused 2026-07-03). */
+    sys->u_emit_params    = bgfx_create_uniform("u_emit_params",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_origin    = bgfx_create_uniform("u_emit_origin",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_v_min     = bgfx_create_uniform("u_emit_v_min",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_v_max     = bgfx_create_uniform("u_emit_v_max",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_life_size = bgfx_create_uniform("u_emit_life_size", BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_color     = bgfx_create_uniform("u_emit_color",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_particle_misc  = bgfx_create_uniform("u_particle_misc",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->s_particle_tex   = bgfx_create_uniform("s_particleTex",    BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sys->u_update_params  = bgfx_create_uniform("u_update_params",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_update_grav    = bgfx_create_uniform("u_update_grav",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_size_lerp      = bgfx_create_uniform("u_size_lerp",      BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_color_start    = bgfx_create_uniform("u_color_start",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_color_end      = bgfx_create_uniform("u_color_end",      BGFX_UNIFORM_TYPE_VEC4, 1);
+
     sys->emit_program   = load_compute(desc->pak, "cs_particle_emit",   sfx);
     sys->update_program = load_compute(desc->pak, "cs_particle_update", sfx);
     sys->render_program = load_vsfs   (desc->pak, "vs_particle", "fs_particle", sfx);
+    sys->reset_program  = load_compute(desc->pak, "cs_particle_reset",  sfx);
     if (sys->emit_program.idx == UINT16_MAX ||
         sys->update_program.idx == UINT16_MAX ||
-        sys->render_program.idx == UINT16_MAX) {
+        sys->render_program.idx == UINT16_MAX ||
+        sys->reset_program.idx == UINT16_MAX) {
         LOG_ERROR(LOG_TAG, "shader load failed; particle system disabled");
+        /* Uniforms are created BEFORE the loads (GL order contract) — free
+         * them here since the !supported destroy path skips them. */
+        bgfx_destroy_uniform(sys->u_emit_params);
+        bgfx_destroy_uniform(sys->u_emit_origin);
+        bgfx_destroy_uniform(sys->u_emit_v_min);
+        bgfx_destroy_uniform(sys->u_emit_v_max);
+        bgfx_destroy_uniform(sys->u_emit_life_size);
+        bgfx_destroy_uniform(sys->u_emit_color);
+        bgfx_destroy_uniform(sys->u_particle_misc);
+        bgfx_destroy_uniform(sys->s_particle_tex);
+        bgfx_destroy_uniform(sys->u_update_params);
+        bgfx_destroy_uniform(sys->u_update_grav);
+        bgfx_destroy_uniform(sys->u_size_lerp);
+        bgfx_destroy_uniform(sys->u_color_start);
+        bgfx_destroy_uniform(sys->u_color_end);
+        if (sys->emit_program.idx   != UINT16_MAX) bgfx_destroy_program(sys->emit_program);
+        if (sys->update_program.idx != UINT16_MAX) bgfx_destroy_program(sys->update_program);
+        if (sys->render_program.idx != UINT16_MAX) bgfx_destroy_program(sys->render_program);
+        if (sys->reset_program.idx  != UINT16_MAX) bgfx_destroy_program(sys->reset_program);
         sys->supported = false;
         return sys;
     }
@@ -204,12 +258,14 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         BGFX_BUFFER_COMPUTE_READ_WRITE | BGFX_BUFFER_COMPUTE_FORMAT_32X4
         | BGFX_BUFFER_COMPUTE_TYPE_FLOAT);
 
-    /* Zero-fill so the emit pass sees lifetime <= 0 in every slot. */
-    {
-        const bgfx_memory_t *zero = bgfx_alloc(cap * PARTICLE_STRIDE_BYTES);
-        memset(zero->data, 0, zero->size);
-        bgfx_update_dynamic_vertex_buffer(sys->pool, 0, zero);
-    }
+    /* Zero-fill happens GPU-side (cs_particle_reset) on the first update
+     * dispatch: CPU-updating a COMPUTE_READ_WRITE dynamic VB crashes the
+     * D3D12 backend (BufferD3D12::update, renderer thread — the Upload-heap
+     * staging hazard documented in cs_cull_reset.sc / jce_gpu_scene.c). */
+    sys->needs_reset = true;
+    /* 2 frames: skip the create frame (draw-view precedes compute-view) AND
+     * the next, so the draw only reads a pool a full frame after its reset. */
+    sys->warmup = 2u;
 
     /* ------------------------------------------------------------- */
     /* Quad mesh (POSITION + TEXCOORD0).                             */
@@ -234,20 +290,7 @@ JceGpuParticleSystem *jce_gpu_particles_create(
     sys->quad_ib = bgfx_create_index_buffer(
         bgfx_copy(quad_idx, sizeof(quad_idx)), BGFX_BUFFER_NONE);
 
-    /* Uniforms. */
-    sys->u_emit_params    = bgfx_create_uniform("u_emit_params",    BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_emit_origin    = bgfx_create_uniform("u_emit_origin",    BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_emit_v_min     = bgfx_create_uniform("u_emit_v_min",     BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_emit_v_max     = bgfx_create_uniform("u_emit_v_max",     BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_emit_life_size = bgfx_create_uniform("u_emit_life_size", BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_emit_color     = bgfx_create_uniform("u_emit_color",     BGFX_UNIFORM_TYPE_VEC4, 1);
-
-    sys->u_update_params  = bgfx_create_uniform("u_update_params",  BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_update_grav    = bgfx_create_uniform("u_update_grav",    BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_size_lerp      = bgfx_create_uniform("u_size_lerp",      BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_color_start    = bgfx_create_uniform("u_color_start",    BGFX_UNIFORM_TYPE_VEC4, 1);
-    sys->u_color_end      = bgfx_create_uniform("u_color_end",      BGFX_UNIFORM_TYPE_VEC4, 1);
-
+    /* (uniforms created above, before the program loads — GL order contract.) */
     sys->supported = true;
     LOG_SUCCESS(LOG_TAG, "GPU particle system online (%u slots)", cap);
     return sys;
@@ -263,12 +306,15 @@ void jce_gpu_particles_destroy(JceGpuParticleSystem *sys)
         bgfx_destroy_program(sys->emit_program);
         bgfx_destroy_program(sys->update_program);
         bgfx_destroy_program(sys->render_program);
+        bgfx_destroy_program(sys->reset_program);
         bgfx_destroy_uniform(sys->u_emit_params);
         bgfx_destroy_uniform(sys->u_emit_origin);
         bgfx_destroy_uniform(sys->u_emit_v_min);
         bgfx_destroy_uniform(sys->u_emit_v_max);
         bgfx_destroy_uniform(sys->u_emit_life_size);
         bgfx_destroy_uniform(sys->u_emit_color);
+        bgfx_destroy_uniform(sys->u_particle_misc);
+        bgfx_destroy_uniform(sys->s_particle_tex);
         bgfx_destroy_uniform(sys->u_update_params);
         bgfx_destroy_uniform(sys->u_update_grav);
         bgfx_destroy_uniform(sys->u_size_lerp);
@@ -296,6 +342,11 @@ void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
 {
     if (!sys || !sys->supported || !cfg) return;
     JCE_PROFILE_ZONE_N("GpuParticles::Update");
+
+    /* ── One-shot pool zero-fill (GPU-side; see create()). bgfx inserts
+     * a UAV barrier between same-view compute dispatches, so the zeroes
+     * are visible to the update/emit passes below. ────────────────── */
+    jce_gpu_particles_reset(sys, view);
 
     /* ── Update dispatch (one workgroup per 64 slots). ───────────── */
     {
@@ -349,24 +400,76 @@ void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
         uint32_t groups = (cfg->emit_count + EMIT_THREADS_X - 1) / EMIT_THREADS_X;
         bgfx_dispatch(view, sys->emit_program, groups, 1, 1, BGFX_DISCARD_ALL);
     }
+
+    /* Count down the post-create draw suppression: one full frame's
+     * reset+update has now been submitted, so the pool a draw reads next
+     * frame is valid.  (render skips while warmup > 0.) */
+    if (sys->warmup > 0u) sys->warmup--;
     JCE_PROFILE_ZONE_END;
+}
+
+/* One-shot GPU pool zero-fill.  MUST run before the pool's first render:
+ * the dynamic VB is uninitialized GPU memory at creation, and drawing it
+ * produces garbage instances (VK: giant glowing blob) or NaN/huge triangles
+ * that TDR the device (D3D12: DEVICE_REMOVED -> every later Create* fails,
+ * the scene-switch crash).  Callers that create a system on a non-dispatch
+ * view pass invoke this immediately after creation; the update path calls
+ * it too (no-op once done). */
+void jce_gpu_particles_reset(JceGpuParticleSystem *sys, uint16_t view)
+{
+    if (!sys || !sys->supported || !sys->needs_reset) return;
+    float params[4] = { (float)sys->max_particles, 0.0f, 0.0f, 0.0f };
+    bgfx_set_uniform(sys->u_update_params, params, 1);
+    bgfx_set_compute_dynamic_vertex_buffer(0, sys->pool, BGFX_ACCESS_WRITE);
+    uint32_t groups = (sys->max_particles + UPDATE_THREADS_X - 1)
+                      / UPDATE_THREADS_X;
+    bgfx_dispatch(view, sys->reset_program, groups, 1, 1, BGFX_DISCARD_ALL);
+    sys->needs_reset = false;
 }
 
 void jce_gpu_particles_render(JceGpuParticleSystem *sys, uint16_t view)
 {
     if (!sys || !sys->supported) return;
     JCE_PROFILE_ZONE_N("GpuParticles::Render");
+    jce_gpu_particles_render_ex(sys, view, UINT16_MAX, false);
+    JCE_PROFILE_ZONE_END;
+}
+
+void jce_gpu_particles_render_ex(JceGpuParticleSystem *sys, uint16_t view,
+                                 uint16_t texture_idx, bool blend_alpha)
+{
+    if (!sys || !sys->supported) return;
+    /* Never draw an un-reset / not-yet-warmed pool: the instance buffer is
+     * uninitialized GPU memory until cs_particle_reset runs AND a full frame
+     * has passed (the draw view sorts before the compute view, so a
+     * same-frame reset is not yet visible to the draw).  Drawing garbage =
+     * a glowing blob on Vulkan / NaN geometry that TDRs D3D12 (the
+     * scene-switch crash). */
+    if (sys->needs_reset || sys->warmup > 0u) return;
 
     bgfx_set_vertex_buffer(0, sys->quad_vb, 0, 4);
     bgfx_set_index_buffer (sys->quad_ib, 0, 6);
     bgfx_set_instance_data_from_dynamic_vertex_buffer(
         sys->pool, 0, sys->max_particles);
 
+    /* Optional billboard texture: u_particle_misc.x flags the shader path
+     * (0 = the legacy procedural soft circle — byte-identical output). */
+    bgfx_texture_handle_t tex = { texture_idx };
+    const bool textured = (texture_idx != UINT16_MAX);
+    float misc[4] = { textured ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+    bgfx_set_uniform(sys->u_particle_misc, misc, 1);
+    if (textured)
+        bgfx_set_texture(0, sys->s_particle_tex, tex, UINT32_MAX);
+
+    /* Additive (fire/glow, legacy default) vs classic alpha (smoke/dust). */
+    const uint64_t blend = blend_alpha
+        ? BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
+                                BGFX_STATE_BLEND_INV_SRC_ALPHA)
+        : BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
+                                BGFX_STATE_BLEND_ONE);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                   | BGFX_STATE_DEPTH_TEST_LESS
                   | BGFX_STATE_CULL_CW
-                  | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
-                                          BGFX_STATE_BLEND_ONE), 0);
+                  | blend, 0);
     bgfx_submit(view, sys->render_program, 0, BGFX_DISCARD_ALL);
-    JCE_PROFILE_ZONE_END;
 }

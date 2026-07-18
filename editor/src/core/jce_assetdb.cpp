@@ -130,21 +130,28 @@ void scan_dir(const std::string &root)
             return false;
         if (is_dir) return true;
 
-        /* Skip files inside obvious build/cache/VCS/system dirs — they hold
-         * no authorable source assets and otherwise bloat the scan + the
-         * O(N^2) reverse-ref build. */
-        static const char *const skip_segments[] = {
-            "/build/", "\\build\\", "/dist/", "\\dist\\",
-            "/.git/", "\\.git\\", "/node_modules/", "\\node_modules\\",
-            "/CMakeFiles/", "\\CMakeFiles\\", "/.vs/", "\\.vs\\",
-            "/.jce/cache/", "\\.jce\\cache\\",
-        };
-        for (const char *seg : skip_segments) {
-            if (std::strstr(path, seg)) return true;
-        }
-
         std::string spath = path;
         std::string path_norm = norm(spath);
+
+        char rel_buf[1024] = {0};
+        if (jce_path_relative(rel_buf, sizeof(rel_buf), path,
+                              c->root.c_str())) {
+            jce_path_to_canonical(rel_buf, sizeof(rel_buf), rel_buf);
+        }
+
+        /* Filter project-relative directory segments.  Checking the host
+         * absolute path would reject every asset when the project itself is
+         * stored below an ancestor named "build" or "dist". */
+        std::string rel_guard = "/";
+        rel_guard += rel_buf[0] ? rel_buf : path_norm;
+        rel_guard += "/";
+        static const char *const skip_segments[] = {
+            "/build/", "/dist/", "/.git/", "/node_modules/",
+            "/CMakeFiles/", "/.vs/", "/.jce/cache/",
+        };
+        for (const char *seg : skip_segments) {
+            if (rel_guard.find(seg) != std::string::npos) return true;
+        }
         
         char ext_buf[64];
         jce_path_extension(ext_buf, sizeof(ext_buf), path);
@@ -164,9 +171,7 @@ void scan_dir(const std::string &root)
         Entry e;
         e.path = path_norm;
         
-        char rel_buf[1024];
-        if (jce_path_relative(rel_buf, sizeof(rel_buf), path, c->root.c_str())) {
-            jce_path_to_canonical(rel_buf, sizeof(rel_buf), rel_buf);
+        if (rel_buf[0]) {
             e.rel = rel_buf;
         }
         

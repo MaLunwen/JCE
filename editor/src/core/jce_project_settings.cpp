@@ -31,21 +31,21 @@ extern "C" {
  * which is why the absolute path resolves to the SAME existing file today).
  * When no project is open (e.g. the init pre-warm), we fall back to the
  * CWD-relative location so behaviour is unchanged in that window. */
+static char s_project_root[512] = {0};
+
 static const char *ps_dir(void) {
-    extern char s_current_project_root[512]; /* dialog_project.cpp */
     static char d[1024];
-    if (s_current_project_root[0])
-        snprintf(d, sizeof(d), "%s/.jce", s_current_project_root);
+    if (s_project_root[0])
+        snprintf(d, sizeof(d), "%s/.jce", s_project_root);
     else
         snprintf(d, sizeof(d), ".jce");
     return d;
 }
 static const char *ps_path(void) {
-    extern char s_current_project_root[512]; /* dialog_project.cpp */
     static char p[1024];
-    if (s_current_project_root[0])
+    if (s_project_root[0])
         snprintf(p, sizeof(p), "%s/.jce/project-settings.json",
-                 s_current_project_root);
+                 s_project_root);
     else
         snprintf(p, sizeof(p), ".jce/project-settings.json");
     return p;
@@ -61,6 +61,12 @@ static bool               s_ps_have = false;
 const JceProjectSettings *jce_project_settings_current(void)
 {
     return s_ps_have ? &s_ps_current : NULL;
+}
+
+void jce_project_settings_set_root(const char *project_root)
+{
+    snprintf(s_project_root, sizeof(s_project_root), "%s",
+             project_root ? project_root : "");
 }
 
 /* ── Defaults ─────────────────────────────────────────────────────── */
@@ -86,7 +92,8 @@ void jce_project_settings_defaults(JceProjectSettings *s)
     s->audio.sample_rate           = 48000;
     s->audio.pause_on_focus_loss   = true;
 
-    /* Editor (auto-save is a user preference — see prefs.json / Preferences) */
+    /* Editor (auto-save is a user preference — Preferences > General,
+     * persisted in ~/.jce/editor-preferences.json) */
     s->editor.default_behavior_mode   = 0;   /* 3D */
     s->editor.version_control_mode    = 1;   /* Visible Meta */
 

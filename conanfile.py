@@ -28,6 +28,14 @@ class JCEConan(ConanFile):
     # legally neutral: it never silently enables AAC/H.264/H.265.
     default_options = {
         "bgfx/*:tools": True,
+        # Build Bullet thread-safe (BULLET2_MULTITHREADING -> the Mt solver
+        # classes' internal locks are real, not no-ops). This is what lets the
+        # OPT-IN multithreaded physics path (JCE_PHYSICS_MT, default OFF at
+        # runtime) step the world in parallel. The default single-threaded,
+        # deterministic path is unchanged — it just links a lib that *can* be
+        # driven multithreaded. The recipe does not propagate -DBT_THREADSAFE to
+        # consumers, so engine/CMakeLists.txt defines it for jce_physics to match.
+        "bullet3/*:bt2_thread_locks": True,
         # Tracy in on-demand mode: it only collects/buffers profiling data
         # while a Tracy server is actually connected. Without this, a build with
         # JCE_ENABLE_PROFILING=ON buffers EVERY zone + alloc event in RAM forever
@@ -37,6 +45,11 @@ class JCEConan(ConanFile):
     }
 
     def configure(self):
+        if self.settings.os == "Windows":
+            # libcurl: native TLS (schannel) keeps the dependency closure
+            # small — no OpenSSL build for the ai_dispatch transport.
+            self.options["libcurl/*"].with_ssl = "schannel"
+
         if self.settings.os in ("Emscripten", "Android", "iOS"):
             # bgfx tools (shaderc) are host-only build tools; they can't run on
             # WASM/Android/iOS targets. The host shaderc.exe is passed via
@@ -76,6 +89,10 @@ class JCEConan(ConanFile):
         self.requires("imgui/1.92.6-docking")
         self.requires("flecs/4.1.1")
         self.requires("cjson/1.7.19")
+        # ai_dispatch T1 HTTPS transport (owner-approved 2026-07-17).  On
+        # Windows TLS rides the native schannel stack (no OpenSSL pull);
+        # elsewhere the recipe default (openssl) applies.
+        self.requires("libcurl/8.21.0")
         self.requires("assimp/6.0.2")
         self.requires("cgltf/1.15")
         self.requires("meshoptimizer/1.0")

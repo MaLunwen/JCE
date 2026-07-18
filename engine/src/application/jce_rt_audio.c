@@ -11,6 +11,15 @@
 
 #include "jce_rt_internal.h"
 
+JceSound rt_load_sound(JceRuntime *rt, const char *path)
+{
+	if (!rt || !rt->audio || !path || !path[0])
+		return JCE_SOUND_INVALID;
+	if (rt->audio_load_fn)
+		return (JceSound)rt->audio_load_fn(rt->user_data, rt->audio, path);
+	return jce_audio_load(rt->audio, rt->pak, path);
+}
+
 /* Occlusion raycast adapter: returns the segment fraction at first physics
  * hit (1.0 = unobstructed). No material DB → mid absorption. */
 static float rt_occlusion_raycast(void *ud, jce_vec3 origin, jce_vec3 dir,

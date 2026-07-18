@@ -16,6 +16,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_reflect.h"
@@ -31,6 +32,7 @@ extern "C" {
 }
 
 #include "io/jce_editor_file_util.h"
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 
 #include <algorithm>
 #include <cmath>
@@ -438,6 +440,17 @@ void draw_content(void)
 {
     ensure_init();
 
+    /* One-time prefill of the last successfully loaded document
+     * (per-project) so one click on Load reopens it.  Never auto-loads,
+     * and never clobbers a path already set (typed / programmatic open). */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (!s_pe.path[0])
+            jce_editor_pstate_get_str("doc.particles.last", s_pe.path,
+                                      sizeof(s_pe.path));
+    }
+
     /* Toolbar. */
     if (ImGui::Button(s_pe.playing ? jce_editor_i18n("particleEditor.button.pause") : jce_editor_i18n("particleEditor.button.play"))) {
         s_pe.playing = !s_pe.playing;
@@ -507,6 +520,8 @@ void draw_content(void)
     if (ImGui::Button(jce_editor_i18n("particleEditor.button.load")) && s_pe.path[0]) {
         if (load_from_json(s_pe.path, &s_pe.desc)) {
             jce_editor_console_log("particle preset loaded: %s", s_pe.path);
+            /* Remember the last document that loaded OK (per-project). */
+            jce_editor_pstate_set_str("doc.particles.last", s_pe.path);
             rebuild_preview();
         } else {
             jce_editor_console_log_level(JCE_CONSOLE_ERROR,
@@ -849,6 +864,37 @@ extern "C" void jce_editor_panel_particle_editor_content(void)
  * redirects to that workbench and requests the Particles tab.  Symbol
  * kept so menu/hotkey entries registered against JCE_PANEL_PARTICLE_EDITOR
  * keep working. */
+/* Programmatic open-with-file: load `path` into the particle editor preview
+ * and bring the Graph Authoring workbench's Particles tab forward.  Used by
+ * the inspector path fields' double-click preview. */
+extern "C" void jce_panel_particle_editor_open_path(const char *path)
+{
+    if (!path || !path[0]) return;
+    ensure_init();
+
+    char abs[1024];
+    const char *p = jce_editor_resolve_asset_path(path, abs, (int)sizeof abs)
+                  ? abs : path;   /* load_from_json does NOT resolve itself */
+    std::snprintf(s_pe.path, sizeof(s_pe.path), "%s", p);
+    if (load_from_json(p, &s_pe.desc)) {
+        rebuild_preview();
+        /* Remember the last document that loaded OK (per-project). */
+        jce_editor_pstate_set_str("doc.particles.last", s_pe.path);
+        jce_editor_console_log("particle preset loaded: %s", p);
+    } else {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                     "particle preset load failed: %s", p);
+    }
+
+    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
+    if (mg_vis) *mg_vis = true;
+    char title[96];
+    snprintf(title, sizeof(title), "%s###jce_material_graph",
+             jce_editor_i18n("materialGraph.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_material_graph_request_tab(3);   /* 3 = Particles */
+}
+
 extern "C" void jce_editor_panel_particle_editor(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PARTICLE_EDITOR);

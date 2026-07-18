@@ -62,7 +62,8 @@ static void draw_content(void)
         if (compiling) {
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("compiling…");
+            ImGui::TextDisabled("%s", jce_editor_i18n_or(
+                "materialGraph.compiling", "compiling…"));
         }
     }
     ImGui::SameLine();

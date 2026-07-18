@@ -26,6 +26,19 @@ JCE_API void jce_single_instance_unlock(void);
 /* Query whether this process currently owns the lock. */
 JCE_API bool jce_single_instance_is_locked(void);
 
+/* First instance: publish the main window's native handle (Win32 HWND)
+ * once it exists, so a later second instance can activate it.  No-op on
+ * platforms whose OS enforces the single-instance model itself. */
+JCE_API void jce_single_instance_publish_window(void *native_window_handle);
+
+/* Second instance (after jce_single_instance_lock returned false): bring
+ * the existing instance's window to the user — restore if minimized, try
+ * to foreground it, and flash its taskbar button until it gains focus
+ * (the no-modal industry behavior; Windows may deny the foreground
+ * switch to a background process, in which case the flash IS the
+ * attention signal).  Returns true when a live window was found. */
+JCE_API bool jce_single_instance_activate_existing(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SINGLE_INSTANCE_H */

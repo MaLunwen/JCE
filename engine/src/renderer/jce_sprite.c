@@ -8,6 +8,7 @@
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_sprite.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include "os/core/jce_memory.h"
 
@@ -92,22 +93,16 @@ static char *read_file_text(const char *path, uint64_t *out_size)
     return (char *)jce_fs_host_read_all(path, out_size);
 }
 
-JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
-                                            const char *image_path)
+static JceSpriteSheet *sprite_sheet_parse_json(const char *source_path,
+                                                const char *json_text,
+                                                size_t json_size,
+                                                const char *image_path)
 {
-    if (!json_path) return NULL;
+    if (!source_path || !json_text || json_size == 0) return NULL;
 
-    uint64_t json_size = 0;
-    char *json_text = read_file_text(json_path, &json_size);
-    if (!json_text) {
-        LOG_WARN(LOG_TAG, "cannot read atlas: %s", json_path);
-        return NULL;
-    }
-
-    JceJson *root = jce_json_parse(json_text, 0);
-    JCE_FREE(json_text);
+    JceJson *root = jce_json_parse(json_text, json_size);
     if (!root) {
-        LOG_WARN(LOG_TAG, "JSON parse failed: %s", json_path);
+        LOG_WARN(LOG_TAG, "JSON parse failed: %s", source_path);
         return NULL;
     }
 
@@ -182,8 +177,55 @@ JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
     jce_json_free(root);
 
     LOG_INFO(LOG_TAG, "atlas loaded: %s (%u frames, %u anims)",
-             json_path, sheet->frame_count, sheet->anim_count);
+             source_path, sheet->frame_count, sheet->anim_count);
 
+    return sheet;
+}
+
+JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
+                                            const char *image_path)
+{
+    if (!json_path) return NULL;
+
+    uint64_t json_size = 0;
+    char *json_text = read_file_text(json_path, &json_size);
+    if (!json_text) {
+        LOG_WARN(LOG_TAG, "cannot read atlas: %s", json_path);
+        return NULL;
+    }
+
+    JceSpriteSheet *sheet = sprite_sheet_parse_json(
+        json_path, json_text, (size_t)json_size, image_path);
+    JCE_FREE(json_text);
+    return sheet;
+}
+
+JceSpriteSheet *jce_sprite_sheet_load_json_pak(
+    const JcePakArchive *pak, const char *virtual_path,
+    const char *image_path)
+{
+    if (!pak || !virtual_path || !virtual_path[0]) return NULL;
+
+    const JcePakAsset *asset = jce_pak_find(pak, virtual_path);
+    if (!asset || asset->original_size == 0 ||
+        asset->original_size > (uint64_t)SIZE_MAX - 1u)
+        return NULL;
+
+    char *json_text = (char *)JCE_MALLOC((size_t)asset->original_size + 1u);
+    if (!json_text) return NULL;
+
+    size_t got = jce_pak_decompress_ex(pak, asset, json_text,
+                                       (size_t)asset->original_size);
+    if (got != (size_t)asset->original_size) {
+        JCE_FREE(json_text);
+        LOG_WARN(LOG_TAG, "cannot decompress atlas: %s", virtual_path);
+        return NULL;
+    }
+    json_text[got] = '\0';
+
+    JceSpriteSheet *sheet = sprite_sheet_parse_json(
+        virtual_path, json_text, got, image_path);
+    JCE_FREE(json_text);
     return sheet;
 }
 

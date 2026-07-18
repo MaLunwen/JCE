@@ -347,6 +347,122 @@ static int l_jce_get_axis(lua_State *L)
     return 1;
 }
 
+static bool script_virtual_asset_path_valid(const char *path)
+{
+    const char *segment;
+    const char *cursor;
+
+    if (!path || !path[0] || path[0] == '/' || path[0] == '\\')
+        return false;
+    if (path[1] == ':')
+        return false;
+
+    segment = path;
+    for (cursor = path; ; ++cursor) {
+        size_t segment_len;
+
+        if (*cursor == '\\' || *cursor == ':')
+            return false;
+        if (*cursor != '/' && *cursor != '\0')
+            continue;
+        segment_len = (size_t)(cursor - segment);
+        if (segment_len == 0u ||
+            (segment_len == 1u && segment[0] == '.') ||
+            (segment_len == 2u && segment[0] == '.' && segment[1] == '.'))
+            return false;
+        if (*cursor == '\0')
+            return true;
+        segment = cursor + 1;
+    }
+}
+
+static int l_jce_asset_read_text(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    const char *path = luaL_checkstring(L, 1);
+    uint64_t size = 0;
+    void *bytes;
+
+    if (!script_virtual_asset_path_valid(path) || !s->have_host ||
+        !s->host.read_file) {
+        lua_pushnil(L);
+        return 1;
+    }
+    bytes = s->host.read_file(s->host.user, path, &size);
+    if (!bytes || size == 0u || size > JCE_SCRIPT_TEXT_ASSET_MAX_BYTES) {
+        jce_free(bytes);
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, (const char *)bytes, (size_t)size);
+    jce_free(bytes);
+    return 1;
+}
+
+/* Raw pointer input.  Button numbering follows the platform API (1 = left). */
+static int l_jce_get_pointer_delta(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    float d[2] = { 0.0f, 0.0f };
+    if (s->have_host && s->host.pointer_delta)
+        s->host.pointer_delta(s->host.user, d);
+    lua_pushnumber(L, (lua_Number)d[0]);
+    lua_pushnumber(L, (lua_Number)d[1]);
+    return 2;
+}
+
+static int l_jce_get_pointer_wheel(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    float wheel = (s->have_host && s->host.pointer_wheel)
+                  ? s->host.pointer_wheel(s->host.user) : 0.0f;
+    lua_pushnumber(L, (lua_Number)wheel);
+    return 1;
+}
+
+static int l_jce_is_pointer_down(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    int button = (int)luaL_checkinteger(L, 1);
+    bool down = (s->have_host && s->host.pointer_button)
+                ? s->host.pointer_button(s->host.user, button) : false;
+    lua_pushboolean(L, down);
+    return 1;
+}
+
+static int l_jce_get_touch_count(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    int count = (s->have_host && s->host.touch_count)
+                ? s->host.touch_count(s->host.user) : 0;
+    if (count < 0)
+        count = 0;
+    lua_pushinteger(L, (lua_Integer)count);
+    return 1;
+}
+
+static int l_jce_get_touch(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    lua_Integer lua_index = luaL_checkinteger(L, 1);
+    uint64_t id = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float pressure = 0.0f;
+
+    if (lua_index < 1 || !s->have_host || !s->host.touch_get ||
+        !s->host.touch_get(s->host.user, (int)(lua_index - 1), &id,
+                           &x, &y, &pressure)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)id);
+    lua_pushnumber(L, (lua_Number)x);
+    lua_pushnumber(L, (lua_Number)y);
+    lua_pushnumber(L, (lua_Number)pressure);
+    return 4;
+}
+
 /* jce.get_velocity(entity) -> x,y,z | nil (nil when the entity has no body). */
 static int l_jce_get_velocity(lua_State *L)
 {
@@ -646,6 +762,132 @@ static int l_jce_particle_set_emitting(lua_State *L)
     return 0;
 }
 
+/* jce.particle_set_color(entity, r, g, b)
+ * Retint the entity emitter's newly-spawned particles; no-op with no host /
+ * callback / emitter. */
+static int l_jce_particle_set_color(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float r = (float)luaL_checknumber(L, 2);
+    float g = (float)luaL_checknumber(L, 3);
+    float b = (float)luaL_checknumber(L, 4);
+    if (s->have_host && s->host.particle_set_color)
+        s->host.particle_set_color(s->host.user, e, r, g, b);
+    return 0;
+}
+
+/* ── Scene-driver bindings (editor-Play/runtime logic parity) ──────────── */
+
+/* jce.find_by_name(name) -> entity | nil, match_count
+ * The second result lets strict scene directors reject duplicate authored
+ * names. Existing callers that consume only the first result remain valid. */
+static int l_jce_find_by_name(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    const char *name = luaL_checkstring(L, 1);
+    JceScriptEntity found[2] = {0, 0};
+    int count = 0;
+    if (s->have_host && s->host.find_by_name)
+        count = s->host.find_by_name(s->host.user, name, found, 2);
+    if (count > 0)
+        lua_pushinteger(L, (lua_Integer)found[0]);
+    else
+        lua_pushnil(L);
+    lua_pushinteger(L, (lua_Integer)count);
+    return 2;
+}
+
+/* jce.find_by_prefix(prefix) -> array of entities (may be empty) */
+static int l_jce_find_by_prefix(lua_State *L)
+{
+    enum { FBP_MAX = 1024 };
+    JceScript *s = self_from_upvalue(L);
+    const char *prefix = luaL_checkstring(L, 1);
+    JceScriptEntity found[FBP_MAX];
+    int n = 0;
+    if (s->have_host && s->host.find_by_prefix)
+        n = s->host.find_by_prefix(s->host.user, prefix, found, FBP_MAX);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)found[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* jce.comp_get(entity, "Water") -> json string | nil */
+static int l_jce_comp_get(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char *type = luaL_checkstring(L, 2);
+    char *json = NULL;
+    if (s->have_host && s->host.comp_get_json)
+        json = s->host.comp_get_json(s->host.user, e, type);
+    if (json) {
+        lua_pushstring(L, json);
+        if (s->host.json_free) s->host.json_free(s->host.user, json);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+/* jce.comp_set(entity, "Water", json_string) -> bool */
+static int l_jce_comp_set(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char *type = luaL_checkstring(L, 2);
+    const char *json = luaL_checkstring(L, 3);
+    bool ok = false;
+    if (s->have_host && s->host.comp_set_json)
+        ok = s->host.comp_set_json(s->host.user, e, type, json);
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+/* jce.render_get() -> json string | nil (scene rendering settings) */
+static int l_jce_render_get(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    char *json = NULL;
+    if (s->have_host && s->host.render_get_json)
+        json = s->host.render_get_json(s->host.user);
+    if (json) {
+        lua_pushstring(L, json);
+        if (s->host.json_free) s->host.json_free(s->host.user, json);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+/* jce.render_set(json_patch) -> bool (merge: absent keys keep current) */
+static int l_jce_render_set(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    const char *json = luaL_checkstring(L, 1);
+    bool ok = false;
+    if (s->have_host && s->host.render_set_json)
+        ok = s->host.render_set_json(s->host.user, json);
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+/* jce.audio_set_volume(entity, volume) — live AudioSource voice volume
+ * (looping soundscapes; also the base the occlusion pass attenuates). */
+static int l_jce_audio_set_volume(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float vol = (float)luaL_checknumber(L, 2);
+    if (s->have_host && s->host.audio_set_volume)
+        s->host.audio_set_volume(s->host.user, e, vol);
+    return 0;
+}
+
 static int l_jce_get_rotation(lua_State *L)
 {
     JceScript *s = self_from_upvalue(L);
@@ -860,6 +1102,7 @@ static void install_bindings(JceScript *s)
     lua_State *L = s->L;
     lua_newtable(L);                         /* the `jce` table */
     register_binding(L, s, "log",            l_jce_log);
+    register_binding(L, s, "asset_read_text", l_jce_asset_read_text);
     register_binding(L, s, "get_position",   l_jce_get_position);
     register_binding(L, s, "set_position",   l_jce_set_position);
     register_binding(L, s, "get_rotation",   l_jce_get_rotation);
@@ -893,6 +1136,11 @@ static void install_bindings(JceScript *s)
     register_binding(L, s, "is_action_down",    l_jce_is_action_down);
     register_binding(L, s, "is_action_pressed", l_jce_is_action_pressed);
     register_binding(L, s, "get_axis",          l_jce_get_axis);
+    register_binding(L, s, "get_pointer_delta", l_jce_get_pointer_delta);
+    register_binding(L, s, "get_pointer_wheel", l_jce_get_pointer_wheel);
+    register_binding(L, s, "is_pointer_down",   l_jce_is_pointer_down);
+    register_binding(L, s, "get_touch_count",   l_jce_get_touch_count);
+    register_binding(L, s, "get_touch",         l_jce_get_touch);
     register_binding(L, s, "get_velocity",   l_jce_get_velocity);
     register_binding(L, s, "vehicle_set_input", l_jce_vehicle_set_input);
     register_binding(L, s, "vehicle_get_speed", l_jce_vehicle_get_speed);
@@ -917,6 +1165,14 @@ static void install_bindings(JceScript *s)
     register_binding(L, s, "rpc_send",       l_jce_rpc_send);
     register_binding(L, s, "particle_burst", l_jce_particle_burst);
     register_binding(L, s, "particle_set_emitting", l_jce_particle_set_emitting);
+    register_binding(L, s, "particle_set_color", l_jce_particle_set_color);
+    register_binding(L, s, "find_by_name",     l_jce_find_by_name);
+    register_binding(L, s, "find_by_prefix",   l_jce_find_by_prefix);
+    register_binding(L, s, "comp_get",         l_jce_comp_get);
+    register_binding(L, s, "comp_set",         l_jce_comp_set);
+    register_binding(L, s, "render_get",       l_jce_render_get);
+    register_binding(L, s, "render_set",       l_jce_render_set);
+    register_binding(L, s, "audio_set_volume", l_jce_audio_set_volume);
     lua_setglobal(L, "jce");
 }
 

@@ -15,9 +15,10 @@
  *                         TU (two XOR shares, regenerated per build) that
  *                         ships the key inside the game binary.
  *
- * Honesty note: this deters casual extraction only.  The key necessarily
- * ships inside the game binary, there is no MAC (not tamper-proofing), and
- * deterministic builds now depend on the key file's content.
+ * Security boundary: archives are HMAC-authenticated and anonymously indexed,
+ * but the key necessarily ships inside the client.  This raises extraction
+ * cost rather than creating secrecy, and deterministic archive bytes depend
+ * on the key file's content.
  */
 
 #ifndef JCE_PAK_KEY_H

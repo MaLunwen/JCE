@@ -3,6 +3,7 @@
  */
 
 #include <jce/renderer/jce_skinned_mesh.h>
+#include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -34,6 +35,17 @@ struct JceSkinnedMesh {
     bgfx_index_buffer_handle_t  lod_ibh[JCE_SM_MAX_LOD];
     uint32_t                    lod_num_indices[JCE_SM_MAX_LOD];
     uint32_t                    lod_count;
+
+    /* Nanite-lite V1 meshlet sidecar: a meshlet-GROUPED alternate index buffer
+     * (each cluster's triangles contiguous; global vertex ids share vbh) plus
+     * the per-meshlet cull data as a static COMPUTE_READ buffer — 3 vec4 per
+     * meshlet: {index_offset(bits), index_count(bits), 0, 0},
+     * {sphere cx,cy,cz,r}, {cone ax,ay,az,cutoff}.  ml_count == 0 (default) =
+     * no sidecar, zero extra GPU memory. */
+    bgfx_index_buffer_handle_t  ml_ibh;
+    uint32_t                    ml_num_indices;
+    bgfx_vertex_buffer_handle_t ml_data;
+    uint32_t                    ml_count;
 
     /* Morph deform support (FEATURE 3.1, opt-in via retain_cpu).  When
      * non-NULL, holds an undeformed CPU copy of the source vertex array
@@ -248,6 +260,10 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
     for (uint32_t l = 0; l < mesh->lod_count; ++l)
         if (mesh->lod_ibh[l].idx != UINT16_MAX)
             bgfx_destroy_index_buffer(mesh->lod_ibh[l]);
+    if (mesh->ml_count) {   /* Nanite-lite V1 meshlet sidecar */
+        bgfx_destroy_index_buffer(mesh->ml_ibh);
+        bgfx_destroy_vertex_buffer(mesh->ml_data);
+    }
     if (mesh->base_cpu)
         JCE_FREE(mesh->base_cpu);   /* retained morph base (NULL unless retained) */
     JCE_FREE(mesh);
@@ -339,6 +355,10 @@ void jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
                                  uint32_t num_joints)
 {
     if (!joint_matrices || num_joints == 0) return;
+    /* Matrix-cache pressure: bone palettes are the whale consumer of bgfx's
+     * fixed per-frame matrix cache (~24-128 matrices per skinned draw); the
+     * counter feeds the silent-saturation warning in jce_renderer_end_frame. */
+    jce_dbg_xform_matrices += num_joints;
     bgfx_set_transform(joint_matrices->raw[0], (uint16_t)num_joints);
 }
 
@@ -365,6 +385,22 @@ void jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
     bgfx_program_handle_t prog = { program.idx };
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
     JCE_PROFILE_ZONE_END;
+}
+
+void jce_skinned_mesh_bind_shadow(const JceSkinnedMesh *mesh)
+{
+    if (!mesh) return;
+    /* Depth-only bind (no submit) for an INSTANCED shadow draw: the caller
+     * follows with bgfx_set_instance_data_buffer + bgfx_submit(shadow program).
+     * Unlike jce_skinned_mesh_submit (the color binder) this has NO wireframe
+     * branch, so an instanced depth submit never inherits the line index buffer
+     * + PT_LINES under the editor's wireframe view — it always binds the
+     * TRIANGLE index buffer, matching jce_skinned_mesh_submit_shadow. */
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
 }
 
 /* Morph shadow submit: mirror of jce_skinned_mesh_submit_shadow that binds the
@@ -483,6 +519,16 @@ uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh)
     return mesh ? mesh->num_indices : 0;
 }
 
+uint32_t jce_skinned_mesh_get_vbh(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->vbh.idx : UINT16_MAX;
+}
+
+uint32_t jce_skinned_mesh_get_ibh(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->ibh.idx : UINT16_MAX;
+}
+
 /* ================================================================== */
 /* In-asset auto-LOD (large-world-opt P1 #6)                            */
 /* ================================================================== */
@@ -514,6 +560,101 @@ uint32_t jce_skinned_mesh_add_lod(JceSkinnedMesh *mesh,
     return mesh->lod_count;
 }
 
+/* Nanite-lite V1/V3: install the meshlet sidecar — the meshlet-grouped
+ * alternate index buffer + the per-meshlet cull data packed as 6 vec4 per
+ * meshlet into a static COMPUTE_READ buffer the cluster-cull compute reads:
+ *   vec4[0] = {asfloat(index_offset), asfloat(index_count), 0, 0}
+ *   vec4[1] = {sphere cx, cy, cz, r}          (mesh-local space)
+ *   vec4[2] = {cone axis x, y, z, cutoff}     (meshopt convention)
+ *   vec4[3] = {own_error, parent_error, 0, 0} (V3 LOD DAG cut; object units)
+ *   vec4[4] = {own-group sphere cx,cy,cz,r}   (own-error test distance)
+ *   vec4[5] = {parent-group sphere cx,cy,cz,r}(parent-error test distance)
+ * `errors` (10 f32/meshlet: {own, parent, own-group xyzr, parent-group
+ * xyzr}) may be NULL: clusters then carry {0, +BIG, cluster sphere x2} —
+ * "leaf with no parent", which the cut test always draws (== V2 behaviour).
+ * A child's parent-test and its parent's own-test share the IDENTICAL
+ * (error, sphere) pair, making the runtime cut exactly complementary.
+ * Returns the installed meshlet count (0 = rejected/failed). */
+uint32_t jce_skinned_mesh_set_meshlets(JceSkinnedMesh *mesh,
+                                       const uint32_t *indices,
+                                       uint32_t num_indices,
+                                       const uint32_t *desc,
+                                       const float *bounds,
+                                       const float *errors,
+                                       uint32_t count)
+{
+    if (!mesh || !indices || !desc || !bounds || count == 0u ||
+        num_indices < 3u || mesh->ml_count != 0u)
+        return 0;
+    for (uint32_t i = 0; i < num_indices; ++i)
+        if (indices[i] >= mesh->num_verts) return 0;
+
+    const bgfx_memory_t *imem =
+        bgfx_copy(indices, num_indices * (uint32_t)sizeof(uint32_t));
+    bgfx_index_buffer_handle_t ibh =
+        bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+    if (ibh.idx == UINT16_MAX) return 0;
+
+    /* Pack the GPU cull records (24 floats per meshlet). */
+    float *rec = (float *)JCE_MALLOC((size_t)count * 24u * sizeof(float));
+    if (!rec) { bgfx_destroy_index_buffer(ibh); return 0; }
+    for (uint32_t m = 0; m < count; ++m) {
+        union { uint32_t u; float f; } off, cnt;
+        off.u = desc[m * 2u];
+        cnt.u = desc[m * 2u + 1u];
+        float *d = rec + (size_t)m * 24u;
+        d[0] = off.f; d[1] = cnt.f; d[2] = 0.0f; d[3] = 0.0f;
+        memcpy(d + 4, bounds + (size_t)m * 8u, 8u * sizeof(float));
+        if (errors) {
+            d[12] = errors[m * 10u];
+            d[13] = errors[m * 10u + 1u];
+            d[14] = 0.0f; d[15] = 0.0f;
+            memcpy(d + 16, errors + (size_t)m * 10u + 2u, 8u * sizeof(float));
+        } else {
+            d[12] = 0.0f; d[13] = 1.0e30f; d[14] = 0.0f; d[15] = 0.0f;
+            memcpy(d + 16, bounds + (size_t)m * 8u, 4u * sizeof(float));
+            memcpy(d + 20, bounds + (size_t)m * 8u, 4u * sizeof(float));
+        }
+    }
+    bgfx_vertex_layout_t vl;
+    bgfx_vertex_layout_begin(&vl, BGFX_RENDERER_TYPE_NOOP);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD0, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD1, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD2, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD3, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD4, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&vl, BGFX_ATTRIB_TEXCOORD5, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&vl);
+    const bgfx_memory_t *dmem =
+        bgfx_copy(rec, count * 24u * (uint32_t)sizeof(float));
+    JCE_FREE(rec);
+    bgfx_vertex_buffer_handle_t data = bgfx_create_vertex_buffer(dmem, &vl,
+        BGFX_BUFFER_COMPUTE_READ | BGFX_BUFFER_COMPUTE_FORMAT_32X4 |
+        BGFX_BUFFER_COMPUTE_TYPE_FLOAT);
+    if (data.idx == UINT16_MAX) { bgfx_destroy_index_buffer(ibh); return 0; }
+
+    mesh->ml_ibh         = ibh;
+    mesh->ml_num_indices = num_indices;
+    mesh->ml_data        = data;
+    mesh->ml_count       = count;
+    return count;
+}
+
+uint32_t jce_skinned_mesh_meshlet_count(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->ml_count : 0;
+}
+
+uint32_t jce_skinned_mesh_meshlet_ibh(const JceSkinnedMesh *mesh)
+{
+    return (mesh && mesh->ml_count) ? mesh->ml_ibh.idx : UINT16_MAX;
+}
+
+uint32_t jce_skinned_mesh_meshlet_data_vb(const JceSkinnedMesh *mesh)
+{
+    return (mesh && mesh->ml_count) ? mesh->ml_data.idx : UINT16_MAX;
+}
+
 uint32_t jce_skinned_mesh_lod_count(const JceSkinnedMesh *mesh)
 {
     return mesh ? mesh->lod_count : 0;
@@ -525,6 +666,13 @@ uint32_t jce_skinned_mesh_lod_index_count(const JceSkinnedMesh *mesh,
     if (!mesh) return 0;
     if (level < mesh->lod_count) return mesh->lod_num_indices[level];
     return mesh->num_indices;   /* out of range → quote the base count */
+}
+
+uint32_t jce_skinned_mesh_lod_ibh(const JceSkinnedMesh *mesh, uint32_t level)
+{
+    if (!mesh) return UINT16_MAX;
+    if (level < mesh->lod_count) return mesh->lod_ibh[level].idx;
+    return mesh->ibh.idx;       /* out of range → base index buffer (LOD0) */
 }
 
 void jce_skinned_mesh_submit_lod(const JceSkinnedMesh *mesh,

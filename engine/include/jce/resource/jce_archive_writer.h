@@ -40,9 +40,9 @@ typedef struct JceArchiveWriterConfig {
                                 * zero-copy (spec §8.2); sets MMAP_FRIENDLY  */
     bool     dedup_content;    /* coalesce byte-identical payloads: entries  *
                                 * with the same stored bytes share one       *
-                                * data_offset (one copy on disk). Encrypted  *
-                                * entries never dedup (per-path nonce makes   *
-                                * their ciphertext unique). Deterministic.    */
+                                * data_offset (one copy on disk). Secure      *
+                                * encryption uses content-derived nonces, so *
+                                * exact duplicate ciphertext may dedup.       */
     uint32_t encryption_salt;  /* per-archive nonce salt mixed into every    *
                                 * ChaCha20 nonce (bytes 8-11) and written to *
                                 * the header's nonce_salt32 field when any   *
@@ -90,18 +90,17 @@ JCE_API bool jce_archive_writer_add_with_dict(JceArchiveWriter *w, const char *p
 
 /* ── Optional encryption (spec §9.2) ─────────────────────────────────── */
 
-/* Set the 32-byte ChaCha20 key used to encrypt entries added via
- * jce_archive_writer_add_encrypted().  The key is copied.  Encryption only
- * raises the effort to extract assets; it cannot keep a shipped archive
- * secret because the key travels with the client. */
+/* Set the 32-byte project key used by secure entries.  The writer derives
+ * independent keyed-index, ChaCha20, nonce, and HMAC keys.  A secure archive
+ * rejects debug paths and any mixture of encrypted/plain entries, and appends
+ * a full-archive HMAC-SHA-256.  The key is copied and erased on destroy. */
 JCE_API void jce_archive_writer_set_encryption_key(JceArchiveWriter *w,
                                                    const uint8_t key[32]);
 
-/* Like jce_archive_writer_add_with_dict() but additionally encrypts the
- * resource.  Per spec §9.2 the bytes are compressed first and encrypted
- * second.  Requires a key set via jce_archive_writer_set_encryption_key();
- * pass dict_id < 0 for no dictionary.  Selective encryption (only some
- * entries) is fully supported — mix encrypted and plain adds freely. */
+/* Like jce_archive_writer_add_with_dict() but additionally secures the
+ * resource.  Bytes are compressed, prefixed with a content-derived nonce,
+ * then ChaCha20-encrypted.  Requires a key set first.  Once any secure entry
+ * is added, every entry in the archive must be secure. */
 JCE_API bool jce_archive_writer_add_encrypted(JceArchiveWriter *w, const char *path,
                                               const void *data, size_t size,
                                               int dict_id);

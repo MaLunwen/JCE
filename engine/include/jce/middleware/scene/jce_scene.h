@@ -71,6 +71,22 @@ typedef struct {
     char            normal_tex[256];
     char            ao_tex[256];
     char            emissive_tex[256];
+    /* Runtime albedo override (NOT serialized; zero-init = off).  When
+       has_albedo_runtime is set, the renderer uses albedo_runtime_idx (a bgfx
+       texture handle index) as the base-colour texture instead of resolving
+       albedo_tex.  Lets code assign a GPU texture directly — procedural content,
+       video textures, and the texture-diverse instancing benchmark (many
+       entities sharing a mesh but each with its own albedo). */
+    bool            has_albedo_runtime;
+    uint16_t        albedo_runtime_idx;
+    uint16_t        albedo_runtime_w, albedo_runtime_h; /* dims (raw handles aren't in the size registry) */
+    uint8_t         albedo_runtime_mips; /* source mip levels (0 ⇒ 1; avoids blitting non-resident mips) */
+    /* Runtime Shader Graph program resolved while the material is parsed.
+     * It is deliberately not serialized: the persisted source is the material
+     * file's customProgramVs/customProgramFs pair.  Carrying the resolved handle
+     * here preserves the VFS source (PAK or loose) through to the draw phase. */
+    bool            has_custom_program;
+    uint16_t        custom_program_idx;
     /* Per-character toon (stylized-slice §5.6).  Zero-default = OFF: legacy
      * scenes without these keys round-trip byte-identical and render as plain
      * PBR.  The scene renderer only honours `toon` when sr_toon_allowed
@@ -330,6 +346,36 @@ typedef struct {
     float sky_dome_sun_softness;  /* smoothstep softness around the disk    */
     float sky_dome_halo_power;    /* halo = pow(max(dot,0), this)           */
     float sky_dome_halo_strength; /* halo additive strength                 */
+    float sky_dome_sun_dir[3];    /* authored disk direction (sun by day /
+                                   * moon at night). Zero vector = unset →
+                                   * legacy behavior (ToD sun, else the
+                                   * default high sun), byte-identical.     */
+    /* Stylized sun rays (anime-style petal spokes around the disk; the
+     * Elemental-Serenity reference draws cos(angle*count)^sharpness rays
+     * between sunSize*0.8 and sunSize+length).  count 0 = OFF (bit-exact
+     * no-op — scenes authored before these fields are byte-identical).   */
+    float sky_dome_anchor_radius; /* > 0: dome anchored at the WORLD origin
+                                   * with this sphere radius (reference-style
+                                   * sky mesh: horizon + sun/moon parallax
+                                   * with the camera).  0 = legacy
+                                   * view-direction dome, byte-identical.  */
+    float gi_dynamic;             /* GI L1: dynamic irradiance-probe grid
+                                   * intensity (screen-gather SH9 through
+                                   * the baked-GI funnel).  0 = OFF
+                                   * (byte-identical); ~1 = reference.    */
+    float sky_dome_ray_count;     /* petal count (e.g. 12); < 0.5 = off    */
+    float sky_dome_ray_length;    /* angular length past the disk, RADIANS */
+    float sky_dome_ray_sharpness; /* petal pow() exponent (e.g. 8)         */
+    float sky_dome_ray_strength;  /* additive strength multiplier          */
+
+    /* Sky IBL toggle: when false, fs_pbr surfaces fall back to the FLAT
+     * authored ambient instead of the sky irradiance/prefilter (which fully
+     * REPLACES flat ambient when a skybox is active).  Stylized dioramas
+     * whose look is driven by an authored AmbientLight (e.g. hand-tuned
+     * three.js ports) need this off — otherwise up-facing surfaces take the
+     * dome zenith color as ambient and ignore the authored ambient entirely.
+     * Absent in older scenes → true (byte-identical).                      */
+    bool  ibl_enabled;
 } JceSceneRenderingSettings;
 
 /* ── Scene-level world-streaming settings ───────────────────────────
@@ -917,6 +963,9 @@ typedef struct {
 #define JCE_VEG_PAINT_DIM 64    /* in-editor density-paint grid resolution */
 typedef struct {
     char     mesh_path[256];     /* instanced mesh (.glb/.obj/model)              */
+    int      mesh_shape;         /* when mesh_path is empty, instance this primitive
+                                  * (0=cube,1=sphere,2=plane,3=capsule,4=cylinder) —
+                                  * a low-poly ISM path for huge counts of one shape */
     char     albedo_path[256];   /* optional albedo override ("" = mesh material) */
     char     density_mask_path[256]; /* optional grayscale density mask (large-world
                                       * #8a): R channel over the area rect modulates
@@ -972,6 +1021,13 @@ typedef struct {
     float    hue_jitter;         /* per-blade green<->blue-green tint jitter [0..1] */
     bool     cast_shadow;        /* v1: ignored (grass non-casting); reserved     */
     bool     visible;
+    /* Density mask (large-world/diorama path support): a texture whose GREEN
+     * channel gates blade placement — a blade survives only where the mask at
+     * its world XZ is >= density_threshold, so dirt paths / water read through
+     * the grass instead of being carpeted over.  Empty path = no masking. */
+    char     density_mask_path[256];
+    float    density_threshold;  /* keep blades where mask.g >= this (0 = off)    */
+    float    mask_world_size;    /* world extent the mask UV spans (matches ground) */
 } JceGrassFieldComponent;
 
 /* ── Water (Gerstner surface, P0 roadmap 2.3) ─────────────────────
@@ -990,7 +1046,13 @@ typedef struct {
  * so loading is byte-identical. */
 typedef enum {
     JCE_WATER_MODE_GERSTNER = 0,
-    JCE_WATER_MODE_FFT      = 1
+    JCE_WATER_MODE_FFT      = 1,
+    /* STYLIZED (value 2): a flat, discard-everywhere-but-strokes ripple
+     * OVERLAY in the hand-painted-diorama style — the water BODY color is
+     * painted in the ground beneath; this pass draws only thin shore-hugging
+     * ripple arcs (+ rain splash circles + winter ice plates) from a
+     * shore-distance data texture.  Requires data_tex. */
+    JCE_WATER_MODE_STYLIZED = 2
 } JceWaterMode;
 
 typedef struct {
@@ -1003,6 +1065,15 @@ typedef struct {
     float        color_deep[3];   /* color at steep / deep view               */
     float        transparency;    /* 0 = opaque, 1 = fully transparent        */
     float        sun_specular;    /* sun highlight intensity                  */
+    float        shore_ripple;    /* stylized shore ripple-ring strength
+                                   * (0 = off; old scenes render identically) */
+    float        ice_ratio;       /* frozen-surface crackle blend [0..1]
+                                   * (0 = off; drives the winter look)        */
+    float        splash_ratio;    /* STYLIZED mode: rain splash-circle density
+                                   * [0..1] (0 = off)                          */
+    char         data_tex[256];   /* STYLIZED mode: shore-distance data map —
+                                   * R = normalized distance from shore (0 at
+                                   * the waterline), G = in-water mask         */
     bool         visible;
 
     /* ── FFT ocean (Tessendorf) — additive; inert unless water_mode==FFT ──
@@ -1557,6 +1628,7 @@ typedef struct {
     float color[4];
     float line_spacing;
     bool  rich_text;
+    bool  math_text;          /* render `text` as math markup (\mu ^x _y) */
     bool  best_fit;
     int   min_size, max_size; /* best_fit range */
     /* Runtime localization: when non-empty, jce_loc_t(locale_key)
@@ -2381,6 +2453,63 @@ JCE_API void      jce_scene_begin_render_world_cache(JceScene *s);
  * its cross-frame persistent static world-matrix + AABB cache on this. */
 JCE_API uint64_t  jce_scene_get_structural_epoch(const JceScene *s);
 
+/* Per-entity transform generation (dynamic-scene world-cache, large-world opt).
+ * set_transform / set_pivot bump ONLY the moved entity's subtree's gen instead
+ * of the global structural epoch, so a moving camera / script-animated entity no
+ * longer drops the renderer's static world-cache for the whole scene.  The
+ * renderer keys a static entity's cache validity on BOTH the structural epoch
+ * (global edits) AND this per-entity gen (transform edits).  jce_scene_xgen_active
+ * is false until the first per-entity bump, so a never-moved scene stays on the
+ * cheap epoch-only fast path. */
+JCE_API uint64_t  jce_scene_entity_xform_gen(const JceScene *s, JceEntity e);
+JCE_API bool      jce_scene_xgen_active(const JceScene *s);
+JCE_API void      jce_scene_invalidate_entity_world(JceScene *s, JceEntity e);
+
+/* Frame-invariance generation counters (DOTS-floor slice 1).  Together with
+ * structural_epoch they form the frozen-frame key a cross-frame consumer can
+ * compare to prove "nothing observable changed since last frame":
+ *  - roster_epoch:  entity create/destroy (flecs swap-remove silently reorders
+ *    table rows, so ANY roster change invalidates positional index caches).
+ *  - enable_gen:    any EditorMeta.enabled flip (routed through the editor's
+ *    single jce_state_set_entity_enabled entry; bumped via
+ *    jce_scene_bump_enable_gen because the flag is mutated in place).
+ *  - xform_counter: bumped by every jce_scene_invalidate_entity_world call
+ *    (set_transform/set_pivot subtree bumps) AND by the runtime physics
+ *    write-back (jce_scene_notify_physics_writeback) which otherwise mutates
+ *    Transforms in place with no signal — one integer compare answers "did
+ *    ANY world matrix change" without probing 150k per-entity gens. */
+JCE_API uint64_t  jce_scene_get_roster_epoch(const JceScene *s);
+JCE_API uint64_t  jce_scene_get_enable_gen(const JceScene *s);
+JCE_API uint64_t  jce_scene_get_xform_counter(const JceScene *s);
+JCE_API void      jce_scene_bump_enable_gen(JceScene *s);
+JCE_API void      jce_scene_notify_physics_writeback(JceScene *s);
+/* Per-entity variant: the writer KNOWS which entity it mutated in place —
+ * ring-push it (plus descendants) so the renderer's L2 incremental repair
+ * rebuilds just those slots instead of the whole frame.  Falls back to
+ * dirty-overflow (== the blanket notify) when the ring/subtree bounds hit. */
+JCE_API void      jce_scene_notify_physics_writeback_entity(JceScene *s, JceEntity e);
+
+/* Drain the dirty-entity ring (DOTS-floor L2): every entity whose world was
+ * invalidated since the last take (subtree-expanded).  out may be NULL to
+ * discard.  *out_overflow is set when the ring overflowed OR an in-place
+ * mutation with an unknown entity set occurred (physics write-back) — the
+ * consumer must then treat the whole scene as dirty. */
+JCE_API uint32_t  jce_scene_take_dirty_entities(JceScene *s, JceEntity *out,
+                                                uint32_t cap, bool *out_overflow);
+/* Read-only variant (does not clear) — for consumers earlier in the frame
+ * than the taker (the collect membership check runs before the ecull
+ * repair, which owns the take). */
+JCE_API uint32_t  jce_scene_peek_dirty_entities(const JceScene *s, JceEntity *out,
+                                                uint32_t cap, bool *out_overflow);
+
+/* Per-entity MATERIAL generation (lever ③ persistent draw-cmd cache). Mirrors
+ * xform_gen for material/mesh content: bumped by the MeshRenderer set path and
+ * async texture/model pop-in via jce_scene_invalidate_entity_material. A cache
+ * stores the mat_gen it saw and rebuilds the entity's draw command when it
+ * differs. Shares the xgen slot table (jce_scene_xgen_active gates both). */
+JCE_API uint64_t  jce_scene_entity_material_gen(const JceScene *s, JceEntity e);
+JCE_API void      jce_scene_invalidate_entity_material(JceScene *s, JceEntity e);
+
 /* Floating-origin rebase: add `shift` (metres, float[3]) to the LOCAL position
  * of every ROOT entity (one with no parent) that carries a JceTransform, then
  * invalidate the world-matrix cache once.  Children are parent-relative and
@@ -2418,6 +2547,11 @@ JCE_API void               jce_scene_set_mesh_renderer(JceScene *s, JceEntity e,
 JCE_API JceMeshRenderer   *jce_scene_get_mesh_renderer(JceScene *s, JceEntity e);
 JCE_API bool               jce_scene_has_mesh_renderer(const JceScene *s, JceEntity e);
 JCE_API void               jce_scene_remove_mesh_renderer(JceScene *s, JceEntity e);
+/* Read-only accessor (ecs_get_id) for concurrent worker-thread reads, valid
+ * under jce_scene_parallel_read_begin/end (multi-threaded flecs readonly mode). */
+JCE_API const JceMeshRenderer *jce_scene_get_mesh_renderer_const(const JceScene *s, JceEntity e);
+JCE_API void               jce_scene_parallel_read_begin(JceScene *s);
+JCE_API void               jce_scene_parallel_read_end(JceScene *s);
 
 /* Component access — Camera. */
 JCE_API void                   jce_scene_set_camera(JceScene *s, JceEntity e, const JceCameraComponent *c);
@@ -2472,6 +2606,19 @@ JCE_API void                             jce_scene_set_skeletal_animator(JceScen
 JCE_API JceSkeletalAnimatorComponent    *jce_scene_get_skeletal_animator(JceScene *s, JceEntity e);
 JCE_API bool                             jce_scene_has_skeletal_animator(const JceScene *s, JceEntity e);
 JCE_API void                             jce_scene_remove_skeletal_animator(JceScene *s, JceEntity e);
+
+/* O(1) scene-wide component counts (flecs table counts) — lets per-frame loops
+ * that probe every collected entity for a rare component skip entirely when
+ * the scene holds none. */
+JCE_API int                              jce_scene_count_skeletal_animators(JceScene *s);
+JCE_API int                              jce_scene_count_sprite_animators(JceScene *s);
+JCE_API int                              jce_scene_count_point_lights(JceScene *s);
+JCE_API int                              jce_scene_count_spot_lights(JceScene *s);
+JCE_API int                              jce_scene_count_dir_lights(JceScene *s);
+JCE_API int                              jce_scene_count_reflection_probes(JceScene *s);
+JCE_API int                              jce_scene_count_light_probe_groups(JceScene *s);
+JCE_API int                              jce_scene_count_lod_groups(JceScene *s);
+
 
 /* Component access — Constraint. */
 JCE_API void                          jce_scene_set_constraint(JceScene *s, JceEntity e, const JceConstraintComponent *c);
@@ -2590,6 +2737,23 @@ JCE_API void jce_scene_particles_update(JceScene *s, float dt);
 JCE_API void jce_scene_particle_burst(JceScene *s, JceEntity e, int count);
 JCE_API void jce_scene_particle_set_emitting(JceScene *s, JceEntity e, bool on);
 
+/* jce_scene_particle_set_color : retint the entity emitter's newly-spawned
+ * particles (RGB of both color keyframes; alphas/fade preserved). */
+JCE_API void jce_scene_particle_set_color(JceScene *s, JceEntity e,
+                                          float r, float g, float b);
+
+/* Anchor for resolving component-relative `*.particles.json` paths (the
+ * component stores project-relative paths; reads are otherwise CWD-relative).
+ * The editor points this at the project's source_assets dir; default_main at
+ * <exe>/cooked_assets. NULL/empty clears. Process-global. */
+JCE_API void jce_scene_particles_set_asset_root(const char *root);
+
+/* Embedded PAK for the single-exe path: publishes the overlaid game PAK so
+ * component-relative `*.particles.json` descriptors load straight from the PAK
+ * (the host-fs anchor above misses when no loose cooked tree ships beside the
+ * exe).  default_main sets this to the engine PAK; NULL clears. Process-global. */
+JCE_API void jce_scene_particles_set_pak(const struct JcePakArchive *pak);
+
 /* Release the scene-owned particle system (called from jce_scene_destroy). */
 JCE_API void jce_scene_particles_shutdown(JceScene *s);
 
@@ -2618,6 +2782,35 @@ JCE_API bool                          jce_scene_has_vegetation_scatter(const Jce
 JCE_API void                          jce_scene_remove_vegetation_scatter(JceScene *s, JceEntity e);
 
 /* Component access — Grass Field (GPU-instanced procedural blades + wind). */
+
+/* ── Foliage Cluster (stylized billboard canopy / bush) ────────────────
+ * The hand-painted-diorama foliage model: `leaf_count` camera-facing
+ * billboard cards sampled on a (squashed) sphere shell of `radius` around
+ * the entity, each carrying its sample-point OUTWARD normal.  The dedicated
+ * shader shades every card with a 3-tone toon ramp (shadow/mid/highlight,
+ * scaled by color_multiplier) keyed on that normal vs the primary light —
+ * which is what reads as a shaded leafy BALL instead of flat cards.
+ * Unlit otherwise (the authored colors ARE the lighting per look). */
+typedef struct {
+    int      leaf_count;          /* billboard cards on the shell (<=256)   */
+    float    radius;              /* cluster shell radius (world units)     */
+    float    squash_y;            /* vertical squash of the shell (1=sphere)*/
+    float    leaf_scale;          /* base card size; each card jitters up   */
+    uint32_t seed;                /* deterministic sampling                 */
+    float    shadow_color[3];     /* toon ramp: shadow -> mid -> highlight  */
+    float    mid_color[3];
+    float    highlight_color[3];
+    float    color_multiplier[3]; /* final multiply (season/tod grade)      */
+    char     alpha_tex[256];      /* leaf alpha mask texture                */
+    bool     visible;
+} JceFoliageClusterComponent;
+
+/* Component access — FoliageCluster. */
+JCE_API void                        jce_scene_set_foliage_cluster(JceScene *s, JceEntity e, const JceFoliageClusterComponent *c);
+JCE_API JceFoliageClusterComponent *jce_scene_get_foliage_cluster(JceScene *s, JceEntity e);
+JCE_API bool                        jce_scene_has_foliage_cluster(const JceScene *s, JceEntity e);
+JCE_API void                        jce_scene_remove_foliage_cluster(JceScene *s, JceEntity e);
+
 JCE_API void                    jce_scene_set_grass_field(JceScene *s, JceEntity e, const JceGrassFieldComponent *c);
 JCE_API JceGrassFieldComponent *jce_scene_get_grass_field(JceScene *s, JceEntity e);
 JCE_API bool                    jce_scene_has_grass_field(const JceScene *s, JceEntity e);
@@ -3107,6 +3300,36 @@ JCE_API void     jce_scene_set_disabled_components(JceScene *s, JceEntity e, uin
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);
 JCE_API void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data);
+
+/* Component-filtered entity walks (flecs each, O(#matches)) — visit only the
+ * entities that HOLD the component instead of probing a full entity list. */
+JCE_API void jce_scene_each_point_light(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_spot_light(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_dir_light(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_reflection_probe(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_light_probe_group(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_water(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_camera(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_particle_emitter(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_skeletal_animator(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_skybox(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_video_player(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_volume(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_decal(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_cloth(JceScene *s, JceEntityCallback cb, void *user_data);
+
+/* O(1) count of entities holding a ConstantForce component (flecs table
+ * aggregate) — the per-tick pass bails on 0 without a per-body pre-walk. */
+JCE_API int  jce_scene_count_constant_force(JceScene *s);
+
+/* O(1) holder counts (flecs table aggregates) for the per-frame system
+ * gates: a scene with none of the component pays a counter read instead of
+ * a full-entity probe walk (150k probes/frame on a large static world). */
+JCE_API int  jce_scene_count_particle_emitters(JceScene *s);
+JCE_API int  jce_scene_count_video_players(JceScene *s);
+JCE_API int  jce_scene_count_volumes(JceScene *s);
+JCE_API int  jce_scene_count_decals(JceScene *s);
+JCE_API int  jce_scene_count_cloth(JceScene *s);
 
 /* Scene-graph queries (Unity Find / OverlapSphere, Godot groups).  Each writes
  * up to `max` matching entities into `out` and returns the count.  Iterate

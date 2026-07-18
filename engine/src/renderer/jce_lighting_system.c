@@ -12,6 +12,7 @@
 #include <bgfx/c99/bgfx.h>
 #include <math.h>
 #include <string.h>
+#include "renderer/jce_render_encoder.h"
 
 #define LOG_TAG "jce_lighting_system"
 
@@ -233,6 +234,21 @@ void jce_light_env_set_ambient(JceLightEnv *env, jce_vec3 color, float intensity
     env->ambient_color     = color;
     env->ambient_intensity = intensity;
     env->pack_dirty        = true;
+}
+
+void jce_light_env_get_ambient(const JceLightEnv *env, jce_vec3 *color,
+                               float *intensity)
+{
+    if (color)     *color     = env ? env->ambient_color : jce_v3(1, 1, 1);
+    if (intensity) *intensity = env ? env->ambient_intensity : 0.0f;
+}
+
+bool jce_light_env_get_dir_light(const JceLightEnv *env, uint32_t index,
+                                 JceDirLightDesc *out)
+{
+    if (!env || !out || index >= env->num_dir) return false;
+    *out = env->dir_lights[index];
+    return true;
 }
 
 int jce_light_env_add_dir_light(JceLightEnv *env, const JceDirLightDesc *light)
@@ -558,34 +574,42 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
        The light arrays upload only their used lanes: the shader loops break
        at u_lightCounts, lanes past the count are never read, so stale tail
        data in backend shadow storage is harmless. */
-    bgfx_set_uniform(s_u_ambient_color, mut->packed_ambient, 1);
+    jce_enc_set_uniform(s_u_ambient_color, mut->packed_ambient, 1);
     if (env->num_dir > 0)
-        bgfx_set_uniform(s_u_dir_lights, mut->packed_dir,
+        jce_enc_set_uniform(s_u_dir_lights, mut->packed_dir,
                          (uint16_t)(env->num_dir * 2));
     if (env->num_point > 0)
-        bgfx_set_uniform(s_u_point_lights, mut->packed_point,
+        jce_enc_set_uniform(s_u_point_lights, mut->packed_point,
                          (uint16_t)(env->num_point * 2));
     if (env->num_spot > 0)
-        bgfx_set_uniform(s_u_spot_lights, mut->packed_spot,
+        jce_enc_set_uniform(s_u_spot_lights, mut->packed_spot,
                          (uint16_t)(env->num_spot * 4));
-    bgfx_set_uniform(s_u_light_counts, mut->packed_counts, 1);
+    jce_enc_set_uniform(s_u_light_counts, mut->packed_counts, 1);
 
     /* Camera position for PBR specular — read live, not from the pack
        (set_camera_pos does not dirty the pack). */
     float cam[4] = { env->camera_pos.x, env->camera_pos.y,
                      env->camera_pos.z, 0.0f };
-    bgfx_set_uniform(s_u_camera_pos, cam, 1);
+    jce_enc_set_uniform(s_u_camera_pos, cam, 1);
 
-    bgfx_set_uniform(s_u_cookie_spot_vp,    mut->packed_spot_vp, 1);
-    bgfx_set_uniform(s_u_cookie_dir_vp,     mut->packed_dir_vp, 1);
-    bgfx_set_uniform(s_u_cookie_params,     mut->packed_cookie_params, 1);
-    bgfx_set_uniform(s_u_cookie_dir_params, mut->packed_cookie_dir_params, 1);
+    /* Cookie projection VPs are only read by the shader when the matching
+     * has-cookie flag (u_cookieParams.x / u_cookieDirParams.x = packed_cookie_
+     * params[0] / packed_cookie_dir_params[0]) is set — so skip the VP upload
+     * (a mat4 each) when no cookie is active. The tiny params vec4s must still
+     * upload (the shader reads .x to gate). Byte-identical; drops 2 dead mat4s
+     * per submit in the common no-cookie scene. */
+    if (mut->packed_cookie_params[0] > 0.5f)
+        jce_enc_set_uniform(s_u_cookie_spot_vp, mut->packed_spot_vp, 1);
+    if (mut->packed_cookie_dir_params[0] > 0.5f)
+        jce_enc_set_uniform(s_u_cookie_dir_vp,  mut->packed_dir_vp, 1);
+    jce_enc_set_uniform(s_u_cookie_params,     mut->packed_cookie_params, 1);
+    jce_enc_set_uniform(s_u_cookie_dir_params, mut->packed_cookie_dir_params, 1);
 
-    bgfx_set_texture(13, s_s_cookie,
+    jce_enc_set_texture(13, s_s_cookie,
                      s_cookie_array_supported ? s_cookie_atlas_array
                                               : mut->packed_cookie_tex,
                      UINT32_MAX);
-    bgfx_set_texture(14, s_s_ies_lut, mut->packed_ies_tex, UINT32_MAX);
+    jce_enc_set_texture(14, s_s_ies_lut, mut->packed_ies_tex, UINT32_MAX);
 }
 
 void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos)

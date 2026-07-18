@@ -2,6 +2,7 @@
  * jce_renderer.c  bgfx renderer implementation.
  */
 
+#include <jce/os/core/jce_config.h>   /* settings S5: machine_class */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
@@ -17,6 +18,7 @@
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_shaders.h>
+#include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices (frame reset) */
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_views.h>
 
@@ -156,6 +158,8 @@ struct JceRenderer {
     bgfx_program_handle_t program_pbr;
     bgfx_program_handle_t program_pbr_inst;     /* GPU-instanced PBR */
     bgfx_program_handle_t program_pbr_inst_tint;/* instanced PBR + per-instance tint */
+    bgfx_program_handle_t program_pbr_inst_tex_array;/* instanced PBR + per-instance albedo array layer */
+    bgfx_program_handle_t program_pbr_inst_fade;    /* instanced PBR + LOD cross-fade dither (千万 ②) */
     bgfx_program_handle_t program_pbr_skinned;
     /* Forward+ clustered fragment variants (fs_pbr_fwdplus). */
     bgfx_program_handle_t program_pbr_fwdplus;
@@ -176,6 +180,7 @@ struct JceRenderer {
     uint32_t reset_flags;
     uint32_t debug_flags;
     char gpu_name[128];
+    uint16_t max_encoders;   /* effective bgfx encoder-pool cap (parallel submit) */
 };
 
 static bool s_dbg_text_enabled = false;
@@ -193,10 +198,85 @@ static bool s_dbg_text_enabled = false;
  * churn crash; ASAN caught a WRITE past the 6 MiB transient VB).  Sizing the
  * ring for the editor's peak removes the exhaustion that triggers it.  Headroom
  * only — unused capacity costs nothing at runtime. */
+/* ── bgfx → engine allocator bridge ─────────────────────────────────
+ * Routes ALL bgfx heap traffic (frame buffers, transient pools, resource
+ * tables, bgfx_alloc blobs) through the engine allocator, so it is visible
+ * to jce_mem_stats and reclaimable by the periodic jce_alloc_trim — bgfx
+ * otherwise sits on the CRT heap, the largest unmanaged block in the
+ * editor's memory attribution.  bgfx requires the allocator to be thread
+ * safe (render thread + encoders); the engine allocator (mimalloc) is.
+ * The interface must outlive bgfx, hence static.  JCE_NO_ALLOC_HOOKS=1
+ * keeps bgfx on the CRT heap (escape hatch shared by all bridge users). */
+static void *bgfx_alloc_bridge(bgfx_allocator_interface_t *self, void *ptr,
+                               size_t size, size_t align,
+                               const char *file, uint32_t line)
+{
+    (void)self; (void)file; (void)line;
+    return jce_realloc_aligned(ptr, size, align);   /* size 0 => free */
+}
+static const bgfx_allocator_vtbl_t s_jce_alloc_vtbl = { bgfx_alloc_bridge };
+static bgfx_allocator_interface_t  s_jce_alloc_iface = { &s_jce_alloc_vtbl };
+
+static bgfx_allocator_interface_t *jce_bgfx_allocator(void)
+{
+    static int s_no_hooks = -1;
+    if (s_no_hooks < 0) {
+        const char *v = getenv("JCE_NO_ALLOC_HOOKS");
+        s_no_hooks = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return s_no_hooks ? NULL : &s_jce_alloc_iface;
+}
+
 static void apply_transient_limits(bgfx_init_t *init)
 {
-    init->limits.transientVbSize = 32u * 1024u * 1024u;  /* 32 MiB (default 6) */
-    init->limits.transientIbSize =  8u * 1024u * 1024u;  /*  8 MiB (default 2) */
+    init->allocator = jce_bgfx_allocator();   /* NULL => bgfx CRT default */
+    /* MACHINE-CLASS-SIZED pools (512MB charter): these limits are allocated
+     * up-front PER FRAME OBJECT, and multithreaded bgfx keeps TWO frames —
+     * so 32+8 MiB of transient pool costs 80MB resident and 16 encoders cost
+     * 32MB (1MB UniformBuffer each x 2 frames).  The full-size pools exist for
+     * the EDITOR's worst case on a developer box (200+ streamed chunk groups
+     * in the World-Streaming Hierarchy — the ImGui churn crash); a 512MB /
+     * low-core machine never renders that much transient geometry, and every
+     * consumer degrades cleanly today (rq re-reads idb.num after alloc; ImGui
+     * clamps).  GPU tier is not known before bgfx_init, so gate on physical
+     * RAM + core count — the same downgrade-only signals s_detect_tier uses. */
+    const int ram_mb = SDL_GetSystemRAM();            /* 0 if unknown */
+    const int cores  = SDL_GetNumLogicalCPUCores();   /* >= 1 */
+    bool low_mem = (ram_mb > 0 && ram_mb < 2048) || cores <= 1;
+    /* Settings S5: the user's jce.ini [performance] machine_class overrides the
+     * RAM+core auto-detect (low = force small pools, full = force big). */
+    switch (jce_config_machine_class()) {
+    case JCE_MACHINE_CLASS_LOW:  low_mem = true;  break;
+    case JCE_MACHINE_CLASS_FULL: low_mem = false; break;
+    default: break;   /* AUTO: keep the detected value */
+    }
+    /* JCE_LOW_MEM=1 forces the small pools on a strong box (charter QA /
+     * profiling); =0 forces the full pools on a weak one (escape hatch).
+     * The env keeps final precedence over the config. */
+    {
+        const char *lm = getenv("JCE_LOW_MEM");
+        if (lm && lm[0]) low_mem = (lm[0] != '0');
+    }
+
+    if (low_mem) {
+        /* 2x the bgfx defaults (6/2): headroom over a shipped game's HUD
+         * without the developer-box editor sizing.  Saves ~48MB vs 32/8. */
+        init->limits.transientVbSize = 12u * 1024u * 1024u;
+        init->limits.transientIbSize =  4u * 1024u * 1024u;
+    } else {
+        init->limits.transientVbSize = 32u * 1024u * 1024u;  /* (default 6) */
+        init->limits.transientIbSize =  8u * 1024u * 1024u;  /* (default 2) */
+    }
+
+    /* Encoder pool for multi-threaded command recording (JCE_PARALLEL_SUBMIT).
+     * bgfx defaults to 8; the occlusion culler uses 1, and the opt-in parallel
+     * shadow/color path uses up to worker_count(+main) concurrent encoders.
+     * Each encoder slot costs a 1MB UniformBuffer per frame object, so size
+     * the pool to the machine: a low-core box runs few/no workers (4 slots =
+     * main + culler + margin, -24MB vs 16); strong boxes keep 16 so ~15
+     * workers + main never exhaust the pool (bgfx_encoder_begin is
+     * null-checked with an inline-submit fallback either way). */
+    init->limits.maxEncoders = (low_mem || cores <= 2) ? 4u : 16u;  /* (default 8) */
 }
 
 /* ── Per-backend availability probe ──────────────────────────────── *
@@ -312,6 +392,18 @@ static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePa
     (void)_this;
     LOG_ERROR(LOG_TAG, "bgfx fatal: code=%d file=%s line=%u msg=%s", (int)_code,
               _filePath ? _filePath : "<null>", (unsigned)_line, _str ? _str : "<null>");
+    /* JCE_BGFX_TRAP=1: break on the FIRST fatal so the crash handler prints
+     * the fully symbolized stack of the offender (debug-bgfx bug hunts). */
+    {
+        static int s_trap = -1;
+        if (s_trap < 0) { const char *v = getenv("JCE_BGFX_TRAP");
+                          s_trap = (v && v[0] == '1') ? 1 : 0; }
+        if (s_trap) {
+#if defined(_MSC_VER)
+            __debugbreak();
+#endif
+        }
+    }
 }
 
 /* When JCE_GFX_DEBUG=1, mirror bgfx internal traces (including the
@@ -621,138 +713,251 @@ static float rb_half_to_float(uint16_t h)
     float out; memcpy(&out, &f, sizeof out); return out;
 }
 
-static struct {
+/* A small FIFO ring of readback slots.  With ONE slot in flight the capture
+   rate was framerate / (readback latency + 1) — bgfx completes a read
+   ~2 frames after submit, so a 66 fps editor recorded at ~22 fps.  Three
+   slots keep a readback in flight every frame; delivery stays strictly
+   FIFO (the recorder sink timestamps at delivery, so out-of-order delivery
+   would scramble frame times).  Staging textures and CPU buffers persist
+   across frames while recording (they were created + destroyed per frame:
+   30 MB of texture churn and 30 MB of malloc per capture at 2560x1494)
+   and are released once everything is idle again. */
+#define RB_SLOTS 3
+typedef struct {
     int                    state;       /* 0 idle, 1 awaiting readback */
     int                    mode;        /* 0 = write PNG (path), 1 = feed capture sink */
+    int                    yflip;       /* rows bottom-up? SOURCE-specific: the
+                                         * postfx RT reads back bottom-up on
+                                         * D3D, the ImGui recording FBO reads
+                                         * back per texture origin — callers
+                                         * pass what their source needs. */
     bgfx_texture_handle_t  staging;
+    uint16_t               staging_w, staging_h;  /* size staging+pixels hold */
     uint8_t               *pixels;
     uint32_t               ready_frame;
     uint16_t               w, h;
+    uint64_t               seq;         /* FIFO delivery order */
     char                   path[512];
-} s_rb = { 0, 0, { UINT16_MAX }, NULL, 0, 0, 0, { 0 } };
+} RbSlot;
+
+static RbSlot   s_rb_slots[RB_SLOTS];
+static uint64_t s_rb_seq_submit  = 1;   /* next sequence to hand out   */
+static uint64_t s_rb_seq_deliver = 1;   /* next sequence poll delivers */
+
+/* Half-float -> byte LUT for the tonemapped 0..1 capture sources: one table
+   lookup per channel instead of bit-twiddling + float math + clamp per
+   pixel.  The per-pixel conversion ran on the MAIN thread (poll) and cost
+   tens of ms per 2560x1494 frame — the single biggest "recording slows the
+   editor" contributor.  64 KB, built on first use. */
+static uint8_t *s_rb_half_lut = NULL;
+
+static const uint8_t *rb_lut(void)
+{
+    if (!s_rb_half_lut) {
+        uint8_t *lut = (uint8_t *)JCE_MALLOC(65536);
+        if (!lut) return NULL;
+        for (uint32_t hbits = 0; hbits < 65536u; ++hbits) {
+            float f = rb_half_to_float((uint16_t)hbits);
+            f = (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
+            lut[hbits] = (uint8_t)(f * 255.0f + 0.5f);
+        }
+        s_rb_half_lut = lut;
+    }
+    return s_rb_half_lut;
+}
+
+static void rb_slot_release(RbSlot *s)
+{
+    if (s->pixels) { JCE_FREE(s->pixels); s->pixels = NULL; }
+    /* staging_w gates validity: the slots are static-zero-initialized, and a
+       zeroed bgfx handle (idx 0) would otherwise LOOK valid and destroy a
+       live texture. */
+    if (s->staging_w && BGFX_HANDLE_IS_VALID(s->staging))
+        bgfx_destroy_texture(s->staging);
+    s->staging.idx = UINT16_MAX;
+    s->staging_w = s->staging_h = 0;
+    s->state = 0;
+}
 
 /* Shared submit: blit src (RGBA16F) -> READ_BACK staging and kick the read.
    mode 0 -> the poll writes `path` as a PNG; mode 1 -> the poll converts to BGRA8
-   and feeds the capture sink (video recording). One in flight. */
+   and feeds the capture sink (video recording).  Returns false when every
+   slot is busy — the caller skips this frame and submits again next frame. */
 static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
-                      uint16_t w, uint16_t h, int mode, const char *path)
+                      uint16_t w, uint16_t h, int mode, int yflip,
+                      const char *path)
 {
-    if (s_rb.state != 0 || src_tex_idx == UINT16_MAX || w == 0 || h == 0)
+    if (src_tex_idx == UINT16_MAX || w == 0 || h == 0)
         return false;
     if (mode == 0 && (!path || !path[0]))
         return false;
-    /* Match the editor postfx/UI output's RGBA16F format (blit requires equal
-       formats); convert half-floats -> 8-bit in the poll. */
-    s_rb.staging = bgfx_create_texture_2d(w, h, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA16F,
-        BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
-        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
-    if (!BGFX_HANDLE_IS_VALID(s_rb.staging))
+
+    RbSlot *slot = NULL;
+    for (int i = 0; i < RB_SLOTS; ++i)
+        if (s_rb_slots[i].state == 0) { slot = &s_rb_slots[i]; break; }
+    if (!slot)
         return false;
-    s_rb.pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u);  /* RGBA16F = 8 B/px */
-    if (!s_rb.pixels) {
-        bgfx_destroy_texture(s_rb.staging);
-        s_rb.staging.idx = UINT16_MAX;
-        return false;
+
+    /* (Re)create the staging texture + CPU buffer only when the size changed;
+       both persist across captures (released when everything is idle).
+       staging_w==0 covers the static-zero-init state (handle idx 0 would
+       otherwise look valid). */
+    if (slot->staging_w != w || slot->staging_h != h || !slot->pixels) {
+        rb_slot_release(slot);
+        /* Match the editor postfx/UI output's RGBA16F format (blit requires
+           equal formats); convert half-floats -> 8-bit in the poll. */
+        slot->staging = bgfx_create_texture_2d(w, h, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA16F,
+            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        if (!BGFX_HANDLE_IS_VALID(slot->staging))
+            return false;
+        slot->pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u); /* RGBA16F */
+        if (!slot->pixels) {
+            bgfx_destroy_texture(slot->staging);
+            slot->staging.idx = UINT16_MAX;
+            return false;
+        }
+        slot->staging_w = w;
+        slot->staging_h = h;
     }
+
     bgfx_texture_handle_t src = { src_tex_idx };
     /* blit_view must sort AFTER the source's render pass so the blit reads this
        frame's fully-composited pixels. */
-    bgfx_blit(blit_view, s_rb.staging, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
-    s_rb.mode = mode;
-    s_rb.path[0] = '\0';
-    if (mode == 0) snprintf(s_rb.path, sizeof s_rb.path, "%s", path);
-    s_rb.ready_frame = bgfx_read_texture(s_rb.staging, s_rb.pixels, 0);
-    s_rb.w = w; s_rb.h = h;
-    s_rb.state = 1;
+    bgfx_blit(blit_view, slot->staging, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
+    slot->mode  = mode;
+    slot->yflip = yflip;
+    slot->path[0] = '\0';
+    if (mode == 0) snprintf(slot->path, sizeof slot->path, "%s", path);
+    slot->ready_frame = bgfx_read_texture(slot->staging, slot->pixels, 0);
+    slot->w = w; slot->h = h;
+    slot->seq = s_rb_seq_submit++;
+    slot->state = 1;
     return true;
 }
 
 bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
-                                          uint16_t w, uint16_t h, const char *path)
+                                          uint16_t w, uint16_t h, const char *path,
+                                          int yflip)
 {
-    return rb_submit(src_tex_idx, blit_view, w, h, 0, path);
+    /* `yflip` is SOURCE-specific, same contract as _submit_sink below: 1 for
+     * the engine postfx RT (bottom-up rows, empirically verified on D3D11
+     * headless captures), bgfx caps originBottomLeft for plain FBO passes
+     * (the ImGui whole-window FBO reads back TOP-down on D3D — hardcoding 1
+     * here is what inverted D3D11/D3D12/VK F12+WINCAP PNGs). */
+    return rb_submit(src_tex_idx, blit_view, w, h, 0, yflip, path);
 }
 
 /* Recording variant: read the source back and feed it to the capture sink as
    BGRA8 (the WebM encoder's input format). One in flight; returns false if busy
-   so the caller simply skips this frame (the next frame submits again). */
+   so the caller simply skips this frame (the next frame submits again).
+   `yflip`: are the SOURCE texture's readback rows bottom-up? This is a
+   property of how the source was rendered, not just of the backend — pass
+   1 for the postfx RT, bgfx caps originBottomLeft for plain FBO passes
+   (hardcoding 1 here is what inverted D3D12 recordings). */
 bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx, uint16_t blit_view,
-                                               uint16_t w, uint16_t h)
+                                               uint16_t w, uint16_t h, int yflip)
 {
-    return rb_submit(src_tex_idx, blit_view, w, h, 1, NULL);
+    return rb_submit(src_tex_idx, blit_view, w, h, 1, yflip, NULL);
 }
 
-int jce_renderer_readback_capture_poll(void)
+/* Deliver one ready slot, strictly FIFO.  Returns the poll result code. */
+static int rb_deliver(RbSlot *slot)
 {
-    if (s_rb.state != 1)
-        return -1;
-    if (s_bgfx_frame_index < s_rb.ready_frame)
-        return 0;
     int result = 2;
-    size_t npx = (size_t)s_rb.w * (size_t)s_rb.h;
-    const uint16_t *src = (const uint16_t *)s_rb.pixels;
+    size_t npx = (size_t)slot->w * (size_t)slot->h;
+    const uint16_t *src = (const uint16_t *)slot->pixels;
+    const uint8_t  *lut = rb_lut();
 
-    if (s_rb.mode == 1) {
-        /* Recording: RGBA16F -> BGRA8 (encoder reads B,G,R,A) and feed the sink.
-           The read-back is bottom-up, so flag yflip=1 (the encoder flips rows). */
-        uint8_t *bgra = (uint8_t *)JCE_MALLOC(npx * 4u);
+    if (slot->mode == 1) {
+        /* Recording: RGBA16F -> BGRA8 (encoder reads B,G,R,A) via the LUT and
+           feed the sink with the row order the SUBMITTER declared. */
+        uint8_t *bgra = lut ? (uint8_t *)JCE_MALLOC(npx * 4u) : NULL;
         if (bgra && s_capture_active) {
             for (size_t i = 0; i < npx; ++i) {
-                float r = rb_half_to_float(src[i * 4 + 0]);
-                float g = rb_half_to_float(src[i * 4 + 1]);
-                float b = rb_half_to_float(src[i * 4 + 2]);
-                r = r < 0 ? 0 : (r > 1 ? 1 : r);
-                g = g < 0 ? 0 : (g > 1 ? 1 : g);
-                b = b < 0 ? 0 : (b > 1 ? 1 : b);
-                bgra[i * 4 + 0] = (uint8_t)(b * 255.0f + 0.5f);
-                bgra[i * 4 + 1] = (uint8_t)(g * 255.0f + 0.5f);
-                bgra[i * 4 + 2] = (uint8_t)(r * 255.0f + 0.5f);
+                bgra[i * 4 + 0] = lut[src[i * 4 + 2]];
+                bgra[i * 4 + 1] = lut[src[i * 4 + 1]];
+                bgra[i * 4 + 2] = lut[src[i * 4 + 0]];
                 bgra[i * 4 + 3] = 255;
             }
             if (s_capture_sink.begin)
-                s_capture_sink.begin(s_capture_sink.ud, s_rb.w, s_rb.h,
-                                     (uint32_t)s_rb.w * 4u, 1 /*yflip*/);
+                s_capture_sink.begin(s_capture_sink.ud, slot->w, slot->h,
+                                     (uint32_t)slot->w * 4u, slot->yflip);
             if (s_capture_sink.frame)
                 s_capture_sink.frame(s_capture_sink.ud, bgra,
                                      (uint32_t)(npx * 4u));
             result = 1;
         }
         if (bgra) JCE_FREE(bgra);
-        JCE_FREE(s_rb.pixels); s_rb.pixels = NULL;
-        bgfx_destroy_texture(s_rb.staging); s_rb.staging.idx = UINT16_MAX;
-        s_rb.state = 0;
+        slot->state = 0;   /* staging + pixels stay cached for the next frame */
         return result;
     }
 
     /* mode 0: convert the RGBA16F half-float readback (tonemapped 0..1) to RGBA8 PNG. */
-    uint8_t *rgba8 = (uint8_t *)JCE_MALLOC(npx * 4u);
+    uint8_t *rgba8 = lut ? (uint8_t *)JCE_MALLOC(npx * 4u) : NULL;
     if (rgba8) {
-        for (size_t i = 0; i < npx * 4u; ++i) {
-            float f = rb_half_to_float(src[i]);
-            f = (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
-            rgba8[i] = (uint8_t)(f * 255.0f + 0.5f);
-        }
-        SDL_Surface *surf = SDL_CreateSurfaceFrom((int)s_rb.w, (int)s_rb.h,
-            SDL_PIXELFORMAT_RGBA32, rgba8, (int)(s_rb.w * 4u));
+        for (size_t i = 0; i < npx * 4u; ++i)
+            rgba8[i] = lut[src[i]];
+        SDL_Surface *surf = SDL_CreateSurfaceFrom((int)slot->w, (int)slot->h,
+            SDL_PIXELFORMAT_RGBA32, rgba8, (int)(slot->w * 4u));
         if (surf) {
-            SDL_FlipSurface(surf, SDL_FLIP_VERTICAL); /* bgfx FBO readback is bottom-up */
-            if (IMG_SavePNG(surf, s_rb.path)) {
+            /* Flip only when the SUBMITTER declared bottom-up rows (postfx RT,
+             * or plain FBO on GL). Plain FBOs read back top-down on D3D/VK/
+             * Metal — an unconditional flip inverted those PNGs. */
+            if (slot->yflip)
+                SDL_FlipSurface(surf, SDL_FLIP_VERTICAL);
+            if (IMG_SavePNG(surf, slot->path)) {
                 LOG_SUCCESS(LOG_TAG, "readback capture saved: %s (%ux%u)",
-                            s_rb.path, s_rb.w, s_rb.h);
+                            slot->path, slot->w, slot->h);
                 result = 1;
             } else {
                 LOG_ERROR(LOG_TAG, "readback capture PNG write failed: %s (%s)",
-                          s_rb.path, SDL_GetError());
+                          slot->path, SDL_GetError());
             }
             SDL_DestroySurface(surf);
         }
         JCE_FREE(rgba8);
     }
-    JCE_FREE(s_rb.pixels); s_rb.pixels = NULL;
-    bgfx_destroy_texture(s_rb.staging); s_rb.staging.idx = UINT16_MAX;
-    s_rb.state = 0;
+    slot->state = 0;
     return result;
+}
+
+int jce_renderer_readback_capture_poll(void)
+{
+    int any_in_flight = 0;
+    int last_result = -1;
+
+    /* Deliver every slot that is ready, in strict submit order.  Stops at
+       the first not-yet-ready slot so a fast later readback can never
+       overtake an earlier one (the recorder timestamps at delivery). */
+    for (;;) {
+        RbSlot *next = NULL;
+        for (int i = 0; i < RB_SLOTS; ++i) {
+            if (s_rb_slots[i].state == 1) {
+                any_in_flight = 1;
+                if (s_rb_slots[i].seq == s_rb_seq_deliver)
+                    next = &s_rb_slots[i];
+            }
+        }
+        if (!next)
+            break;
+        if (s_bgfx_frame_index < next->ready_frame)
+            return 0;   /* oldest capture still on the GPU */
+        s_rb_seq_deliver++;
+        last_result = rb_deliver(next);
+        any_in_flight = 0;   /* recount on the next loop iteration */
+    }
+
+    /* Everything idle and no continuous capture running: release the cached
+       staging textures + CPU buffers (90 MB VRAM + 90 MB RAM at 2560x1494
+       across 3 slots — worth keeping only while recording). */
+    if (!any_in_flight && !s_capture_active) {
+        for (int i = 0; i < RB_SLOTS; ++i)
+            if (s_rb_slots[i].state == 0 && s_rb_slots[i].staging_w)
+                rb_slot_release(&s_rb_slots[i]);
+    }
+    return last_result != -1 ? last_result : (any_in_flight ? 0 : -1);
 }
 
 bool jce_renderer_fbo_capture_pending(void)
@@ -1060,6 +1265,14 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     debug_flags |= BGFX_DEBUG_PROFILER;
     LOG_INFO(LOG_TAG, "bgfx GPU profiler enabled (Tracy mode)");
 #endif
+    /* JCE_PERF_LOG headless profiling needs per-VIEW GPU timers, which bgfx only
+     * populates when BGFX_DEBUG_PROFILER is set (frame-level GPU time is always
+     * available; the per-view slice is not).  Env-gated so it costs nothing in a
+     * normal run — the extra per-view GPU timer queries only exist while profiling. */
+    if (getenv("JCE_PERF_LOG") != NULL) {
+        debug_flags |= BGFX_DEBUG_PROFILER;
+        LOG_INFO(LOG_TAG, "bgfx GPU profiler enabled (JCE_PERF_LOG per-view timing)");
+    }
     if (debug_flags)
         bgfx_set_debug(debug_flags);
 
@@ -1132,6 +1345,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_pbr.idx          = UINT16_MAX;
     r->program_pbr_inst.idx     = UINT16_MAX;
     r->program_pbr_inst_tint.idx = UINT16_MAX;
+    r->program_pbr_inst_tex_array.idx = UINT16_MAX;
+    r->program_pbr_inst_fade.idx      = UINT16_MAX;
     r->program_pbr_skinned.idx  = UINT16_MAX;
     r->program_pbr_fwdplus.idx         = UINT16_MAX;
     r->program_pbr_inst_fwdplus.idx    = UINT16_MAX;
@@ -1157,9 +1372,37 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         }
         snprintf(r->gpu_name, sizeof(r->gpu_name), "%s / %s",
                  vendor, bgfx_get_renderer_name(bgfx_get_renderer_type()));
+        /* Effective encoder-pool cap (after caps clamp) — the ceiling for the
+         * opt-in parallel command-submission path (JCE_PARALLEL_SUBMIT). */
+        r->max_encoders = caps->limits.maxEncoders;
+        LOG_INFO(LOG_TAG, "encoder pool: maxEncoders=%u (requested 16)",
+                 (unsigned)r->max_encoders);
     }
 
     LOG_SUCCESS(LOG_TAG, "initialized (%s)", r->gpu_name);
+    /* JCE_DBG_BGFX_REPRO=1: minimal standalone repro of the benchmark exit
+     * crash — create the exact GPU-cull buffer trio (big RW compute VB +
+     * tiny RW compute counter VB + indirect buffer), never use or destroy
+     * them, and exit.  Crash here == bgfx-internal, zero engine involvement. */
+    if (getenv("JCE_DBG_BGFX_REPRO") && getenv("JCE_DBG_BGFX_REPRO")[0] == '1') {
+        bgfx_vertex_layout_t vl4, vl1;
+        bgfx_vertex_layout_begin(&vl4, BGFX_RENDERER_TYPE_NOOP);
+        bgfx_vertex_layout_add(&vl4, BGFX_ATTRIB_TEXCOORD7, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_add(&vl4, BGFX_ATTRIB_TEXCOORD6, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_add(&vl4, BGFX_ATTRIB_TEXCOORD5, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_add(&vl4, BGFX_ATTRIB_TEXCOORD4, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_end(&vl4);
+        bgfx_vertex_layout_begin(&vl1, BGFX_RENDERER_TYPE_NOOP);
+        bgfx_vertex_layout_add(&vl1, BGFX_ATTRIB_TEXCOORD0, 1, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_end(&vl1);
+        bgfx_dynamic_vertex_buffer_handle_t vis = bgfx_create_dynamic_vertex_buffer(
+            2048, &vl4, BGFX_BUFFER_COMPUTE_READ_WRITE | BGFX_BUFFER_COMPUTE_FORMAT_32X4 | BGFX_BUFFER_COMPUTE_TYPE_FLOAT);
+        bgfx_dynamic_vertex_buffer_handle_t cnt = bgfx_create_dynamic_vertex_buffer(
+            64, &vl1, BGFX_BUFFER_COMPUTE_READ_WRITE | BGFX_BUFFER_COMPUTE_FORMAT_32X1 | BGFX_BUFFER_COMPUTE_TYPE_UINT);
+        bgfx_indirect_buffer_handle_t ind = bgfx_create_indirect_buffer(1);
+        LOG_INFO(LOG_TAG, "[bgfx-repro] trio created: vis=%u cnt=%u ind=%u",
+                 vis.idx, cnt.idx, ind.idx);
+    }
 
     return r;
 }
@@ -1178,6 +1421,8 @@ void jce_renderer_set_shaders(JceRenderer *r,
     r->program_pbr = (bgfx_program_handle_t){ shaders->pbr.idx };
     r->program_pbr_inst = (bgfx_program_handle_t){ shaders->pbr_inst.idx };
     r->program_pbr_inst_tint = (bgfx_program_handle_t){ shaders->pbr_inst_tint.idx };
+    r->program_pbr_inst_tex_array = (bgfx_program_handle_t){ shaders->pbr_inst_tex_array.idx };
+    r->program_pbr_inst_fade      = (bgfx_program_handle_t){ shaders->pbr_inst_fade.idx };
     r->program_pbr_skinned = (bgfx_program_handle_t){ shaders->pbr_skinned.idx };
     r->program_pbr_fwdplus = (bgfx_program_handle_t){ shaders->pbr_fwdplus.idx };
     r->program_pbr_inst_fwdplus = (bgfx_program_handle_t){ shaders->pbr_inst_fwdplus.idx };
@@ -1205,6 +1450,7 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
     bgfx_program_handle_t old[] = {
         r->program, r->program_textured, r->program_mesh,
         r->program_pbr, r->program_pbr_inst, r->program_pbr_inst_tint,
+        r->program_pbr_inst_tex_array, r->program_pbr_inst_fade,
         r->program_pbr_skinned,
         r->program_pbr_fwdplus, r->program_pbr_inst_fwdplus,
         r->program_pbr_skinned_fwdplus,
@@ -1220,6 +1466,7 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
         bgfx_program_handle_t parts[] = {
             { ns.color.idx }, { ns.textured.idx }, { ns.mesh.idx },
             { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_inst_tint.idx },
+            { ns.pbr_inst_tex_array.idx }, { ns.pbr_inst_fade.idx },
             { ns.pbr_skinned.idx },
             { ns.pbr_fwdplus.idx }, { ns.pbr_inst_fwdplus.idx },
             { ns.pbr_skinned_fwdplus.idx },
@@ -1457,6 +1704,10 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_pbr_inst);
     if (r->program_pbr_inst_tint.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_inst_tint);
+    if (r->program_pbr_inst_tex_array.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_inst_tex_array);
+    if (r->program_pbr_inst_fade.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_inst_fade);
     if (r->program_pbr_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_skinned);
     if (r->program_pbr_fwdplus.idx != UINT16_MAX)
@@ -1473,6 +1724,14 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_shadow_skinned);
     if (r->program_terrain.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_terrain);
+    /* Toon/outline stylized programs were sentinel-init'd + created but never
+     * destroyed — a small handle leak left for bgfx_shutdown to sweep.  They
+     * are distinct shader-set handles (not aliases), so destroy them here with
+     * the rest of the renderer's own programs. */
+    if (r->program_pbr_toon.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_toon);
+    if (r->program_outline_skinned.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_outline_skinned);
     if (r->u_light_dir.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_dir);
     if (r->u_light_color.idx != UINT16_MAX)
@@ -1491,6 +1750,23 @@ void jce_renderer_destroy(JceRenderer *r)
     /* Free the octahedral-impostor shared GPU resources (program, quad VB,
      * uniforms, any in-flight bake FBO) while bgfx is still alive. */
     jce_impostor_shutdown();
+
+    /* JCE_DBG_LEAKSTATS=1: dump bgfx's live resource counts right before
+     * shutdown.  After every engine destroy above, any non-zero count is a
+     * LEAK (a handle the engine created but never destroyed) — names the
+     * leaking resource TYPE, backend-agnostic. */
+    if (getenv("JCE_DBG_LEAKSTATS") && getenv("JCE_DBG_LEAKSTATS")[0] == '1') {
+        const bgfx_stats_t *st = bgfx_get_stats();
+        if (st)
+            LOG_INFO(LOG_TAG, "[leakstats] tex=%u fb=%u vb=%u ib=%u dvb=%u dib=%u "
+                     "prog=%u shader=%u uniform=%u occ=%u",
+                     (unsigned)st->numTextures, (unsigned)st->numFrameBuffers,
+                     (unsigned)st->numVertexBuffers, (unsigned)st->numIndexBuffers,
+                     (unsigned)st->numDynamicVertexBuffers,
+                     (unsigned)st->numDynamicIndexBuffers,
+                     (unsigned)st->numPrograms, (unsigned)st->numShaders,
+                     (unsigned)st->numUniforms, (unsigned)st->numOcclusionQueries);
+    }
 
     bgfx_shutdown();
     JCE_FREE(r);
@@ -1698,6 +1974,51 @@ void jce_renderer_end_frame(const JceRenderer *r)
      * precede bgfx_frame() — the backend API calls the capture wraps happen as
      * bgfx flushes the command buffer there. */
     jce_gpu_capture_tick();
+
+    /* Transform-matrix cache pressure check (frame boundary — the bgfx matrix
+     * cache resets inside bgfx_frame).  bgfx caches every set_transform matrix
+     * in a fixed BGFX_CONFIG_MAX_MATRIX_CACHE pool that saturates SILENTLY in
+     * release: once full, later draws in the same frame get clamped transforms
+     * and vanish — measured as per-char skinned crowds losing their color pass
+     * (bone palettes are ~24-128 matrices per draw; ~104k matrices demanded at
+     * 1000 chars).  The counter is a lower bound (shim + set_bones producers),
+     * so tripping the threshold is always real.  Fix at scale = the crowd
+     * instancing paths (JCE_CROWD_BINDPOSE/_INSTANCE), which upload no
+     * per-char matrices (~1.5k at 1000 chars). */
+    {
+        /* bgfx's compiled cap — kept in sync with conan/hooks/
+         * hook_bgfx_wasm_fix.py (which doubles the desktop default; Emscripten
+         * keeps bgfx's 65536 default for the wasm memory budget). */
+#if JCE_PLATFORM_WEB
+        static const uint32_t k_matrix_cache_cap = 65536u;
+#else
+        static const uint32_t k_matrix_cache_cap = 131072u;
+#endif
+        static uint32_t s_xform_peak = 0;
+        static bool     s_xform_warned = false;
+        if (jce_dbg_xform_matrices > s_xform_peak) {
+            s_xform_peak = jce_dbg_xform_matrices;
+            if (!s_xform_warned && s_xform_peak > (k_matrix_cache_cap / 5u * 4u)) {
+                s_xform_warned = true;
+                LOG_WARN(LOG_TAG,
+                    "transform matrices this frame: %u — near/over the bgfx "
+                    "matrix-cache cap (%u); later draws this frame will "
+                    "silently lose their transforms. Enable crowd instancing "
+                    "(JCE_CROWD_BINDPOSE / JCE_CROWD_INSTANCE) for large "
+                    "skinned crowds. (warned once; peak in JCE_PERF_LOG)",
+                    s_xform_peak, k_matrix_cache_cap);
+            }
+        }
+        static int s_perf_log = -1;
+        if (s_perf_log < 0) {
+            const char *v = getenv("JCE_PERF_LOG");
+            s_perf_log = (v && v[0] && v[0] != '0') ? 1 : 0;
+        }
+        if (s_perf_log && (s_bgfx_frame_index % 120u) == 0u && s_xform_peak > 0)
+            LOG_INFO(LOG_TAG, "perf-xform: peak %u matrices/frame (cache cap %u)",
+                     s_xform_peak, k_matrix_cache_cap);
+        jce_dbg_xform_matrices = 0;
+    }
 
     s_bgfx_frame_index = bgfx_frame(false);
 
@@ -1912,6 +2233,20 @@ JceShaderHandle jce_renderer_get_program_pbr_inst_tint(const JceRenderer *r)
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
     return (JceShaderHandle){ r->program_pbr_inst_tint.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_inst_tex_array(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_inst_tex_array.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_inst_fade(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_inst_fade.idx };
 }
 
 JceShaderHandle jce_renderer_get_program_pbr_skinned(const JceRenderer *r)

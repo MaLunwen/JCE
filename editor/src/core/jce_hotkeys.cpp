@@ -304,7 +304,9 @@ extern "C" bool jce_hotkeys_save(void)
     if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
     off += (size_t)n;
 
-    bool ok = ed_write_file(path, buf, off);
+    /* Atomic: a torn hotkeys.json parses as absent and silently resets
+     * every binding to defaults. */
+    bool ok = jce_fs_host_write_all_atomic(path, buf, off);
     ED_FREE(buf);
     return ok;
 }

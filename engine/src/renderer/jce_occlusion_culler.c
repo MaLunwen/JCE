@@ -20,6 +20,11 @@
 
 #include <bgfx/c99/bgfx.h>
 
+/* Consecutive INVISIBLE polls required to cull. MUST exceed bgfx frames-
+ * in-flight (~8 on D3D/VK) — a smaller window false-culls visible entities
+ * under camera rotation (their query result lags several frames). */
+#define OC_CULL_STREAK 8
+
 #include <string.h>
 #include <math.h>
 
@@ -59,6 +64,7 @@ typedef struct {
     uint64_t                       entity_id;     /* SLOT_EMPTY = free     */
     bgfx_occlusion_query_handle_t  query;
     int32_t                        last_result;   /* pixel count or sentinel */
+    uint8_t                        invis_streak;  /* consecutive INVISIBLE polls */
     bool                           submitted;     /* query submitted this frame */
 } OcclusionSlot;
 
@@ -75,9 +81,10 @@ struct JceOcclusionCuller {
      * jce_occlusion_culler_bind_target).  UINT16_MAX = backbuffer. */
     uint16_t  target_fbo;
 
-    /* bgfx hard cap on live occlusion queries (BGFX_CAPS limits) + a one-shot
-     * warning latch when the pool is exhausted. */
+    /* bgfx hard cap plus this culler's explicit share of that global pool. */
     uint32_t  query_cap;
+    uint32_t  query_budget;
+    uint32_t  query_count;
     bool      queries_exhausted_warned;
     bool      table_full_warned;   /* one-shot latch for the (now-rare) full-table warn */
 
@@ -85,6 +92,11 @@ struct JceOcclusionCuller {
     OcclusionSlot  *slots;
     uint32_t        cap;       /* power-of-two capacity */
     uint32_t        used;
+
+    /* Handles survive scene resets.  This avoids bgfx's deferred-destroy
+     * window temporarily consuming both the old and replacement pools. */
+    bgfx_occlusion_query_handle_t *free_queries;
+    uint32_t                        free_query_count;
 
     /* Shader for proxy draws (color program — position + color layout). */
     bgfx_program_handle_t  proxy_prog;
@@ -152,22 +164,29 @@ static OcclusionSlot *find_or_alloc(JceOcclusionCuller *oc, uint64_t id)
             s->entity_id  = id;
             s->last_result = RESULT_WARM_UP;
             s->submitted   = false;
-            /* Allocate a bgfx occlusion query for this slot.  bgfx has a HARD
-             * cap of BGFX_CONFIG_MAX_OCCLUSION_QUERIES live queries (256 by
-             * default!) — far below a dense view's entity count.  Past that,
-             * bgfx_create_occlusion_query() returns an INVALID handle.  Keep the
-             * slot (so we don't re-attempt allocation every frame and thrash) but
-             * flag it: an entity with no real query is ALWAYS treated visible —
-             * never false-culled.  Occlusion thus applies to the first ~256
-             * tracked entities; the rest render unconditionally (safe). */
-            s->query = bgfx_create_occlusion_query();
+            s->query.idx = UINT16_MAX;
+
+            if (oc->free_query_count > 0) {
+                s->query = oc->free_queries[--oc->free_query_count];
+            } else if (oc->query_count < oc->query_budget) {
+                s->query = bgfx_create_occlusion_query();
+                if (BGFX_HANDLE_IS_VALID(s->query))
+                    ++oc->query_count;
+            }
+
             if (!BGFX_HANDLE_IS_VALID(s->query)) {
                 s->last_result = RESULT_NO_QUERY;
-                if (!oc->queries_exhausted_warned) {
+                /* Reaching our software budget is expected.  Warn only when
+                 * bgfx rejects an allocation before that budget is owned. */
+                if (oc->query_count < oc->query_budget &&
+                    !oc->queries_exhausted_warned) {
                     oc->queries_exhausted_warned = true;
                     LOG_WARN(LOG_TAG,
-                        "bgfx occlusion-query pool exhausted (cap %u) — extra "
-                        "entities render unconditionally (no false-cull)",
+                        "bgfx rejected occlusion query before view budget "
+                        "(owned=%u budget=%u global=%u); remaining entities "
+                        "render unconditionally",
+                        (unsigned)oc->query_count,
+                        (unsigned)oc->query_budget,
                         (unsigned)oc->query_cap);
                 }
             }
@@ -214,17 +233,28 @@ JceOcclusionCuller *jce_occlusion_culler_create(
     uint32_t cap = 64;
     while (cap < config->max_entities) cap <<= 1;
 
-    /* bgfx's live occlusion-query pool is small (BGFX_CONFIG_MAX_OCCLUSION_
-     * QUERIES, 256 by default).  Record it so the first allocation past the cap
-     * warns once and those entities fall back to always-visible (see
-     * find_or_alloc).  0 (older bgfx) → use the documented default. */
+    /* bgfx owns one global query pool.  Reserve a deterministic share for this
+     * view so independent editor cullers cannot starve one another. */
     oc->query_cap = bgfx_caps->limits.maxOcclusionQueries;
     if (oc->query_cap == 0) oc->query_cap = 256;
+    uint32_t share_count = config->query_pool_share_count;
+    if (share_count == 0) share_count = 1;
+    oc->query_budget = oc->query_cap / share_count;
+    if (oc->query_budget == 0) oc->query_budget = 1;
 
     oc->slots = (OcclusionSlot *)JCE_CALLOC(cap, sizeof(OcclusionSlot));
     if (!oc->slots) { JCE_FREE(oc); return NULL; }
-    for (uint32_t i = 0; i < cap; ++i)
+    oc->free_queries = (bgfx_occlusion_query_handle_t *)JCE_CALLOC(
+        oc->query_budget, sizeof(bgfx_occlusion_query_handle_t));
+    if (!oc->free_queries) {
+        JCE_FREE(oc->slots);
+        JCE_FREE(oc);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < cap; ++i) {
         oc->slots[i].entity_id = SLOT_EMPTY;
+        oc->slots[i].query.idx = UINT16_MAX;
+    }
 
     oc->cap        = cap;
     oc->used       = 0;
@@ -247,7 +277,9 @@ JceOcclusionCuller *jce_occlusion_culler_create(
     oc->cube_ibh = bgfx_create_index_buffer(ibm, BGFX_BUFFER_NONE);
 
     LOG_INFO(LOG_TAG,
-        "occlusion culler created (cap=%u, view=%u)", cap, (unsigned)config->view_id);
+        "occlusion culler created (entities=%u, queries=%u/%u, share=%u, view=%u)",
+        cap, (unsigned)oc->query_budget, (unsigned)oc->query_cap,
+        (unsigned)share_count, (unsigned)config->view_id);
     return oc;
 }
 
@@ -263,11 +295,44 @@ void jce_occlusion_culler_destroy(JceOcclusionCuller *oc)
                 bgfx_destroy_occlusion_query(s->query);
             }
         }
+        for (uint32_t i = 0; i < oc->free_query_count; ++i) {
+            if (BGFX_HANDLE_IS_VALID(oc->free_queries[i]))
+                bgfx_destroy_occlusion_query(oc->free_queries[i]);
+        }
         if (BGFX_HANDLE_IS_VALID(oc->cube_ibh))
             bgfx_destroy_index_buffer(oc->cube_ibh);
         JCE_FREE(oc->slots);
+        JCE_FREE(oc->free_queries);
     }
     JCE_FREE(oc);
+}
+
+void jce_occlusion_culler_reset(JceOcclusionCuller *oc)
+{
+    if (!oc || !oc->active) return;
+
+    /* Recycle every live handle into this culler's private pool and empty the
+     * entity table.  bgfx destruction is deferred by several frames, so
+     * destroy-and-recreate here can temporarily double live handles and starve
+     * the other editor viewport. */
+    for (uint32_t i = 0; i < oc->cap; ++i) {
+        OcclusionSlot *s = &oc->slots[i];
+        if (s->entity_id != SLOT_EMPTY && BGFX_HANDLE_IS_VALID(s->query) &&
+            oc->free_query_count < oc->query_budget) {
+            oc->free_queries[oc->free_query_count++] = s->query;
+        }
+        s->entity_id    = SLOT_EMPTY;
+        s->query.idx    = UINT16_MAX;
+        s->last_result  = RESULT_WARM_UP;
+        s->invis_streak = 0;
+        s->submitted    = false;
+    }
+    oc->used = 0;
+    /* Handles are immediately reusable; re-arm only exceptional warnings. */
+    oc->queries_exhausted_warned = false;
+    oc->table_full_warned        = false;
+    memset(&oc->stats, 0, sizeof(oc->stats));
+    LOG_INFO(LOG_TAG, "occlusion culler reset (scene swap)");
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────────── */
@@ -309,9 +374,12 @@ void jce_occlusion_culler_begin_frame(JceOcclusionCuller *oc,
             s->last_result = (res == BGFX_OCCLUSION_QUERY_RESULT_NORESULT)
                                  ? RESULT_IN_FLIGHT
                                  : num_pixels;
+            if (res == BGFX_OCCLUSION_QUERY_RESULT_VISIBLE)
+                s->invis_streak = 0;
         } else {
             /* INVISIBLE */
             s->last_result = 0;
+            if (s->invis_streak < 255) s->invis_streak++;
         }
 
         s->submitted = false;
@@ -355,7 +423,7 @@ bool jce_occlusion_culler_entity_visible(JceOcclusionCuller *oc,
     if (s->last_result == RESULT_NO_QUERY) {
         /* No bgfx query handle for this entity (pool exhausted) — always draw,
          * never cull.  Counted as warm_up so it reads as "not occluded". */
-        ++oc->stats.warm_up;
+        ++oc->stats.unqueried;
         return true;
     }
     if (s->last_result == RESULT_WARM_UP) {
@@ -368,8 +436,17 @@ bool jce_occlusion_culler_entity_visible(JceOcclusionCuller *oc,
         return true;
     }
     if (s->last_result <= oc->min_pixels) {
-        ++oc->stats.occluded;
-        return false;
+        /* Hysteresis: a single zero-sample poll can be a transient (camera in
+         * motion, transient-buffer miss, quantization on thin proxies) — the
+         * one-frame pop reads as visible->gone->visible flicker.  Only cull
+         * after TWO consecutive invisible polls; the cost is culling kicking
+         * in one frame later, never a visible object popping for one frame. */
+        if (s->invis_streak >= OC_CULL_STREAK) {
+            ++oc->stats.occluded;
+            return false;
+        }
+        ++oc->stats.no_result;   /* transient miss — draw this frame */
+        return true;
     }
 
     ++oc->stats.visible;
@@ -421,9 +498,15 @@ void jce_occlusion_culler_submit_query(JceOcclusionCuller *oc,
     /* Full per-axis extents → non-uniform scale of the unit cube [-0.5,0.5].
      * Clamp to a tiny floor so a perfectly flat axis (e.g. a ground plane with
      * zero Y extent) still produces a rasterisable, queryable proxy. */
-    float ex = half_extents.x * 2.0f; if (ex < 0.002f) ex = 0.002f;
-    float ey = half_extents.y * 2.0f; if (ey < 0.002f) ey = 0.002f;
-    float ez = half_extents.z * 2.0f; if (ez < 0.002f) ez = 0.002f;
+    float ex = half_extents.x * 2.0f;
+    float ey = half_extents.y * 2.0f;
+    float ez = half_extents.z * 2.0f;
+    /* Inflate: the proxy must sit strictly OUTSIDE the object's own depth —
+     * a coplanar face (flat ground, thin cards) quantizes to LEQUAL-fail on
+     * some frames and the entity flickers.  4% + 5cm per axis. */
+    ex = ex * 1.04f + 0.05f;
+    ey = ey * 1.04f + 0.05f;
+    ez = ez * 1.04f + 0.05f;
 
     /* Build world transform: non-uniform scale by full extents, translate to
      * the AABB centre. */
@@ -438,14 +521,24 @@ void jce_occlusion_culler_submit_query(JceOcclusionCuller *oc,
     mtx[15] = 1.0f;
 
     /* Transient vertex buffer for the unit cube (position only). */
-    if (bgfx_get_avail_transient_vertex_buffer(8, &oc->vl) < 8)
+    if (bgfx_get_avail_transient_vertex_buffer(8, &oc->vl) < 8) {
+        /* No query issued this frame -- a stale OCCLUDED verdict must not
+         * keep culling without live evidence (post-undo bursts exhaust the
+         * transient pool and previously froze objects invisible). */
+        s->last_result  = RESULT_WARM_UP;
+        s->invis_streak = 0;
         return; /* transient buffer pool exhausted */
+    }
     bgfx_transient_vertex_buffer_t tvb;
     bgfx_alloc_transient_vertex_buffer(&tvb, 8, &oc->vl);
     memcpy(tvb.data, k_cube_verts, sizeof(k_cube_verts));
 
     bgfx_encoder_t *enc = bgfx_encoder_begin(false);
-    if (!enc) return;
+    if (!enc) {
+        s->last_result  = RESULT_WARM_UP;   /* same no-evidence rule as above */
+        s->invis_streak = 0;
+        return;
+    }
 
     bgfx_encoder_set_transform(enc, mtx, 1);
     bgfx_encoder_set_transient_vertex_buffer(enc, 0, &tvb, 0, 8);
@@ -489,7 +582,7 @@ bool jce_occlusion_culler_is_active(const JceOcclusionCuller *oc)
 
 uint16_t jce_occlusion_culler_get_view_id(const JceOcclusionCuller *oc)
 {
-    return oc ? oc->view_id : 254;
+    return oc ? oc->view_id : 252;   /* JCE_VIEW_OCCLUSION (jce_views.h) */
 }
 
 void jce_occlusion_culler_bind_target(JceOcclusionCuller *oc,

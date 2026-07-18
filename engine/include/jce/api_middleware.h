@@ -17,6 +17,9 @@ extern "C" {
 #endif
 
 #include <jce/api_ai.h>
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+#include <jce/api_ai_dispatch.h>
+#endif
 #include <jce/api_animation.h>
 #include <jce/api_audio.h>
 #include <jce/api_net.h>

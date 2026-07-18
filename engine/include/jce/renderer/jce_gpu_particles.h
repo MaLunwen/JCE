@@ -74,6 +74,15 @@ JCE_API void jce_gpu_particles_destroy(JceGpuParticleSystem *sys);
  * harmless no-op mode (every call below becomes a stub). */
 JCE_API bool jce_gpu_particles_is_supported(const JceGpuParticleSystem *sys);
 
+/* One-shot GPU pool zero-fill (no-op once done).  MUST run before the
+ * pool's first render: the buffer is uninitialized GPU memory at creation
+ * and drawing it produces garbage instances (VK) or NaN geometry that can
+ * TDR the device (D3D12).  update() calls this itself; call it directly
+ * when a system is created on a pass that will render WITHOUT updating
+ * (e.g. the editor's second viewport in the same bgfx frame). */
+JCE_API void jce_gpu_particles_reset(JceGpuParticleSystem *sys,
+                                      uint16_t              compute_view_id);
+
 /* Submit one frame's simulation work.
  *   compute_view_id : bgfx view bound to the compute dispatches
  *                     (use a dedicated view; no draws). */
@@ -87,6 +96,15 @@ JCE_API void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
  * the vertex shader, so cost is fragment-bound by the alive count. */
 JCE_API void jce_gpu_particles_render(JceGpuParticleSystem *sys,
                                        uint16_t              render_view_id);
+
+/* Render with an optional billboard texture + blend mode.
+ *   texture_idx : bgfx texture handle idx (UINT16_MAX = untextured — the
+ *                 legacy procedural soft-circle sprite, byte-identical).
+ *   blend_alpha : true = classic alpha blend (smoke); false = additive. */
+JCE_API void jce_gpu_particles_render_ex(JceGpuParticleSystem *sys,
+                                         uint16_t render_view_id,
+                                         uint16_t texture_idx,
+                                         bool     blend_alpha);
 
 /* Pool capacity (rounded). */
 JCE_API uint32_t jce_gpu_particles_capacity(const JceGpuParticleSystem *sys);

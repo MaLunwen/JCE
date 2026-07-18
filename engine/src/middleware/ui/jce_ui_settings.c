@@ -11,7 +11,9 @@
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/platform/jce_window.h>
+#include <jce/os/core/jce_filesystem.h>          /* settings S7: config save */
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_render_pipeline.h>   /* settings S7: graphics tab */
 
 #include "os/core/jce_memory.h"
 
@@ -46,6 +48,17 @@ struct JceSettingsPanel {
     JceUIElementHandle el_txt_resolution;
     JceUIElementHandle el_chk_vsync;
 
+    /* Element handles — graphics tab (settings S7). */
+    JceUIElementHandle el_tab_graphics;
+    JceUIElementHandle el_panel_graphics;
+    JceUIElementHandle el_sel_quality;
+    JceUIElementHandle el_chk_shadows;
+    JceUIElementHandle el_chk_ssao;
+    JceUIElementHandle el_chk_bloom;
+    JceUIElementHandle el_chk_fog;
+    JceUIElementHandle el_sel_shadowq;
+    JceUIElementHandle el_sel_msaa;
+
     /* Element handles — audio tab. */
     JceUIElementHandle el_lbl_master_vol;
     JceUIElementHandle el_lbl_music_vol;
@@ -53,6 +66,11 @@ struct JceSettingsPanel {
     JceUIElementHandle el_rng_master;
     JceUIElementHandle el_rng_music;
     JceUIElementHandle el_rng_sfx;
+
+    /* Pending render-pipeline descriptor (settings S7): edited by the graphics
+     * tab, applied on Apply/OK.  A snapshot of the live pipeline on populate. */
+    JceRenderPipelineDesc pending_rp;
+    int                   pending_quality;  /* -1 auto / 0..3 preset / 4 custom */
 
     /* Element handles — buttons. */
     JceUIElementHandle el_btn_cancel;
@@ -351,15 +369,46 @@ static void settings_move_button_focus(JceSettingsPanel *p, int delta)
 static void settings_update_tabs(JceSettingsPanel *p)
 {
     if (!p->ui) return;
-    bool vid = (p->active_tab == 0);
-
+    /* Tabs (settings S7): 0 = video, 1 = graphics, 2 = audio. */
     if (jce_ui_elem_valid(p->el_panel_video))
         jce_ui_elem_set_property(p->ui, p->el_panel_video,
-            "display", vid ? "block" : "none");
+            "display", (p->active_tab == 0) ? "block" : "none");
+    if (jce_ui_elem_valid(p->el_panel_graphics))
+        jce_ui_elem_set_property(p->ui, p->el_panel_graphics,
+            "display", (p->active_tab == 1) ? "block" : "none");
     if (jce_ui_elem_valid(p->el_panel_audio))
         jce_ui_elem_set_property(p->ui, p->el_panel_audio,
-            "display", vid ? "none" : "block");
+            "display", (p->active_tab == 2) ? "block" : "none");
     settings_refresh_navigation(p);
+}
+
+/* Resolve the per-user config path the in-game screen persists to (settings
+ * S7).  Uses ".config/jce.ini" (CWD-relative) — the same file the engine's
+ * jce_select_config_path prefers when present, so a save round-trips on the
+ * next launch.  Creates the .config directory if needed. */
+static bool jce_settings_user_config_path(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return false;
+    jce_fs_host_create_directory(".config");
+    snprintf(out, out_size, ".config/jce.ini");
+    return true;
+}
+
+/* Set/clear an RML checkbox's "checked" attribute (settings S7). */
+static void settings_set_checkbox(JceSettingsPanel *p, JceUIElementHandle el,
+                                  bool on)
+{
+    if (!jce_ui_elem_valid(el)) return;
+    if (on) jce_ui_elem_set_attribute(p->ui, el, "checked", "checked");
+    else    jce_ui_elem_remove_attribute(p->ui, el, "checked");
+}
+
+/* Read an RML checkbox's "checked" attribute (settings S7). */
+static bool settings_get_checkbox(JceSettingsPanel *p, JceUIElementHandle el)
+{
+    if (!jce_ui_elem_valid(el)) return false;
+    const char *c = jce_ui_elem_get_attribute(p->ui, el, "checked");
+    return (c && c[0] != '\0');
 }
 
 static void settings_populate(JceSettingsPanel *p)
@@ -389,6 +438,28 @@ static void settings_populate(JceSettingsPanel *p)
     p->pending_master_vol = p->volumes.master;
     p->pending_music_vol  = p->volumes.music;
     p->pending_sfx_vol    = p->volumes.sfx;
+
+    /* Graphics tab (settings S7): snapshot the live render pipeline into the
+     * controls.  Quality starts at "custom" (the controls mirror whatever is
+     * live); picking a named preset in the UI overwrites the fields. */
+    jce_render_pipeline_get(&p->pending_rp);
+    p->pending_quality = 4;   /* custom */
+    if (jce_ui_elem_valid(p->el_sel_quality))
+        jce_ui_elem_set_value(p->ui, p->el_sel_quality, "custom");
+    settings_set_checkbox(p, p->el_chk_shadows, p->pending_rp.enable_csm);
+    settings_set_checkbox(p, p->el_chk_ssao,    p->pending_rp.enable_ssao);
+    settings_set_checkbox(p, p->el_chk_bloom,   p->pending_rp.enable_bloom);
+    settings_set_checkbox(p, p->el_chk_fog,     p->pending_rp.enable_volumetric_fog);
+    if (jce_ui_elem_valid(p->el_sel_shadowq)) {
+        char sq[8]; snprintf(sq, sizeof(sq), "%u",
+                             (unsigned)p->pending_rp.shadow_filter_quality);
+        jce_ui_elem_set_value(p->ui, p->el_sel_shadowq, sq);
+    }
+    if (jce_ui_elem_valid(p->el_sel_msaa)) {
+        char ms[8]; snprintf(ms, sizeof(ms), "%u",
+                             (unsigned)p->pending_rp.msaa_samples);
+        jce_ui_elem_set_value(p->ui, p->el_sel_msaa, ms);
+    }
 
     settings_sync_pending_controls(p);
 }
@@ -421,6 +492,49 @@ static void settings_read_ui(JceSettingsPanel *p)
         const char *v = jce_ui_elem_get_value(p->ui, p->el_rng_sfx);
         if (v && v[0]) p->pending_sfx_vol = (float)atoi(v) / 100.0f;
     }
+
+    /* Graphics tab (settings S7).  A named quality preset fills the whole
+     * descriptor from the preset table; the individual controls then layer on
+     * top so a user can preset-then-tweak.  "auto" resolves to the current
+     * tier; "custom" keeps the snapshot and applies only the controls. */
+    if (jce_ui_elem_valid(p->el_sel_quality)) {
+        const char *q = jce_ui_elem_get_value(p->ui, p->el_sel_quality);
+        if (q) {
+            if      (strcmp(q, "auto")   == 0) {
+                jce_render_pipeline_preset_for_current_tier(&p->pending_rp);
+                p->pending_quality = -1;
+            } else if (strcmp(q, "low")    == 0) {
+                jce_render_pipeline_preset_low(&p->pending_rp);   p->pending_quality = 0;
+            } else if (strcmp(q, "medium") == 0) {
+                jce_render_pipeline_preset_mid(&p->pending_rp);   p->pending_quality = 1;
+            } else if (strcmp(q, "high")   == 0) {
+                jce_render_pipeline_preset_high(&p->pending_rp);  p->pending_quality = 2;
+            } else if (strcmp(q, "ultra")  == 0) {
+                jce_render_pipeline_preset_ultra(&p->pending_rp); p->pending_quality = 3;
+            } else {
+                p->pending_quality = 4;   /* custom */
+            }
+        }
+    }
+    p->pending_rp.enable_csm            = settings_get_checkbox(p, p->el_chk_shadows);
+    p->pending_rp.enable_ssao           = settings_get_checkbox(p, p->el_chk_ssao);
+    p->pending_rp.enable_bloom          = settings_get_checkbox(p, p->el_chk_bloom);
+    p->pending_rp.enable_volumetric_fog = settings_get_checkbox(p, p->el_chk_fog);
+    if (jce_ui_elem_valid(p->el_sel_shadowq)) {
+        const char *v = jce_ui_elem_get_value(p->ui, p->el_sel_shadowq);
+        if (v && v[0]) {
+            int sq = atoi(v); if (sq < 0) sq = 0; if (sq > 2) sq = 2;
+            p->pending_rp.shadow_filter_quality = (uint8_t)sq;
+        }
+    }
+    if (jce_ui_elem_valid(p->el_sel_msaa)) {
+        const char *v = jce_ui_elem_get_value(p->ui, p->el_sel_msaa);
+        if (v && v[0]) {
+            int ms = atoi(v);
+            if (ms != 1 && ms != 2 && ms != 4 && ms != 8) ms = 1;
+            p->pending_rp.msaa_samples = (uint8_t)ms;
+        }
+    }
 }
 
 /* ── Event callbacks ──────────────────────────────────────────────── */
@@ -433,8 +547,12 @@ static void on_tab_click(JceUIElementHandle elem, const char *event_type,
     if (elem.idx == p->el_tab_video.idx) {
         p->active_tab = 0;
         p->nav_focus = JCE_SETTINGS_FOCUS_TAB_VIDEO;
-    } else if (elem.idx == p->el_tab_audio.idx) {
+    } else if (jce_ui_elem_valid(p->el_tab_graphics) &&
+               elem.idx == p->el_tab_graphics.idx) {
         p->active_tab = 1;
+        p->nav_focus = JCE_SETTINGS_FOCUS_TAB_VIDEO;   /* nearest existing id */
+    } else if (elem.idx == p->el_tab_audio.idx) {
+        p->active_tab = 2;
         p->nav_focus = JCE_SETTINGS_FOCUS_TAB_AUDIO;
     }
     settings_update_tabs(p);
@@ -530,9 +648,19 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
     /* Cache element handles. */
     p->el_settings_title = jce_ui_find_element(p->ui, p->doc, "settings-title");
     p->el_tab_video      = jce_ui_find_element(p->ui, p->doc, "tab-video");
+    p->el_tab_graphics   = jce_ui_find_element(p->ui, p->doc, "tab-graphics");
     p->el_tab_audio      = jce_ui_find_element(p->ui, p->doc, "tab-audio");
     p->el_panel_video    = jce_ui_find_element(p->ui, p->doc, "panel-video");
+    p->el_panel_graphics = jce_ui_find_element(p->ui, p->doc, "panel-graphics");
     p->el_panel_audio    = jce_ui_find_element(p->ui, p->doc, "panel-audio");
+    /* Graphics controls (settings S7). */
+    p->el_sel_quality    = jce_ui_find_element(p->ui, p->doc, "sel-quality");
+    p->el_chk_shadows    = jce_ui_find_element(p->ui, p->doc, "chk-shadows");
+    p->el_chk_ssao       = jce_ui_find_element(p->ui, p->doc, "chk-ssao");
+    p->el_chk_bloom      = jce_ui_find_element(p->ui, p->doc, "chk-bloom");
+    p->el_chk_fog        = jce_ui_find_element(p->ui, p->doc, "chk-fog");
+    p->el_sel_shadowq    = jce_ui_find_element(p->ui, p->doc, "sel-shadowq");
+    p->el_sel_msaa       = jce_ui_find_element(p->ui, p->doc, "sel-msaa");
     p->el_lbl_fullscreen = jce_ui_find_element(p->ui, p->doc, "lbl-fullscreen");
     p->el_lbl_resolution = jce_ui_find_element(p->ui, p->doc, "lbl-resolution");
     p->el_lbl_vsync      = jce_ui_find_element(p->ui, p->doc, "lbl-vsync");
@@ -550,6 +678,8 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
 
     /* Register click event callbacks. */
     jce_ui_elem_on(p->ui, p->el_tab_video,  "click", on_tab_click,  p);
+    if (jce_ui_elem_valid(p->el_tab_graphics))
+        jce_ui_elem_on(p->ui, p->el_tab_graphics, "click", on_tab_click, p);
     jce_ui_elem_on(p->ui, p->el_tab_audio,  "click", on_tab_click,  p);
     jce_ui_elem_on(p->ui, p->el_sel_fullscreen, "click", on_control_focus, p);
     jce_ui_elem_on(p->ui, p->el_chk_vsync,      "click", on_control_focus, p);
@@ -566,6 +696,21 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
         jce_settings_set_font_family(p, desc->font_family);
 
     settings_refresh_navigation(p);
+
+    /* Headless/QA hook (settings S7): JCE_SETTINGS_AUTO_OPEN=<tab> opens the
+     * screen at creation on the named tab (video|graphics|audio) so a capture
+     * run can verify the UI without injecting input.  Unset = no-op. */
+    {
+        const char *ao = getenv("JCE_SETTINGS_AUTO_OPEN");
+        if (ao && ao[0]) {
+            jce_settings_open(p);
+            if      (strcmp(ao, "graphics") == 0) p->active_tab = 1;
+            else if (strcmp(ao, "audio")    == 0) p->active_tab = 2;
+            else                                  p->active_tab = 0;
+            settings_update_tabs(p);
+            LOG_INFO(LOG_TAG, "auto-opened settings on tab '%s'", ao);
+        }
+    }
 
     LOG_INFO(LOG_TAG, "settings panel created");
     return p;
@@ -637,6 +782,41 @@ void jce_settings_apply(JceSettingsPanel *panel)
        the game callback should handle per-voice adjustments. */
     panel->volumes.music = panel->pending_music_vol;
     panel->volumes.sfx   = panel->pending_sfx_vol;
+
+    /* Graphics tab (settings S7): apply the edited render pipeline (feature
+     * gates + shadow filter quality + post) and route MSAA to its live reset
+     * mechanism.  jce_render_pipeline_apply is idempotent + the scene renderer
+     * picks the new descriptor up next frame. */
+    jce_render_pipeline_apply(&panel->pending_rp);
+    jce_renderer_set_msaa(panel->renderer, (int)panel->pending_rp.msaa_samples);
+
+    /* Persist to jce.ini so the choices survive a restart (settings S7).  The
+     * panel holds a READ-ONLY view of the engine config, so copy it, layer the
+     * player-facing overrides the in-game screen owns (vsync / fullscreen /
+     * volumes), and write the copy — the engine's live config is untouched. */
+    if (panel->config) {
+        JceConfig saved = *panel->config;
+        saved.vsync         = panel->pending_vsync;
+        saved.fullscreen    = panel->pending_fullscreen;
+        saved.master_volume = panel->volumes.master;
+        saved.music_volume  = panel->volumes.music;
+        saved.sfx_volume    = panel->volumes.sfx;
+        /* Graphics tab: mirror the applied pipeline into the [graphics]
+         * section so the choices survive a restart (the engine layers them
+         * back right after the boot .rp.json / tier-preset resolution via
+         * jce_engine_apply_graphics_config). */
+        saved.gfx_valid          = true;
+        saved.gfx_quality        = panel->pending_quality;
+        saved.gfx_shadows        = panel->pending_rp.enable_csm;
+        saved.gfx_ssao           = panel->pending_rp.enable_ssao;
+        saved.gfx_bloom          = panel->pending_rp.enable_bloom;
+        saved.gfx_fog            = panel->pending_rp.enable_volumetric_fog;
+        saved.gfx_shadow_quality = (int)panel->pending_rp.shadow_filter_quality;
+        saved.gfx_msaa           = (int)panel->pending_rp.msaa_samples;
+        char cfg_path[512];
+        if (jce_settings_user_config_path(cfg_path, sizeof(cfg_path)))
+            jce_config_save(&saved, cfg_path);
+    }
 
     /* Re-sync visible controls against the live engine state. */
     settings_populate(panel);

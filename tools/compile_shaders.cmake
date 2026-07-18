@@ -21,7 +21,7 @@
 #   jce_compile_shaders(
 #       TARGET        CompileShaders
 #       SHADER_DIR    ${CMAKE_CURRENT_SOURCE_DIR}/main/native/shaders
-#       OUTPUT_DIR    ${CMAKE_CURRENT_SOURCE_DIR}/main/resources/assets/shaders
+#       OUTPUT_DIR    ${CMAKE_CURRENT_BINARY_DIR}/generated/assets/shaders
 #       OUT_FILES_VAR COMPILED_SHADER_FILES
 #   )
 
@@ -227,6 +227,23 @@ function(jce_compile_shaders)
                 # Compute shaders cannot exist on GLES2.
                 if(_type STREQUAL "compute")
                     continue()
+                endif()
+            endif()
+
+            # Compute shaders need compute-capable profile versions: GLSL 4.30
+            # (ARB_compute_shader) / ESSL 3.10.  The vertex/fragment baselines
+            # (120 / 300_es) predate compute; shaderc still EMITS a blob for
+            # them (`#version 120` + SSBO/barrier/local_size), which then
+            # silently fails glCompileShader at RUNTIME — bgfx's handle-level
+            # create still "succeeds", so every dispatch becomes a no-op and
+            # each GPU-driven feature (foliage cull, Hi-Z, GPU scene) reads
+            # back zeros on OpenGL while D3D/Vulkan work.  (Root-caused via
+            # RenderDoc + the compiled blob's `#version 120` header.)
+            if(_type STREQUAL "compute")
+                if(_suffix STREQUAL "glsl")
+                    set(_profile "430")
+                elseif(_suffix STREQUAL "essl")
+                    set(_profile "310_es")
                 endif()
             endif()
 

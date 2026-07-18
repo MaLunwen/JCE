@@ -72,6 +72,11 @@ extern EditorInternalState s;
 /* Maintains creation / load order for index-based iteration.
    Rebuilt from ECS on scene load / undo; updated on create/delete. */
 extern std::vector<uint32_t> g_entity_order;
+/* Bumped on EVERY g_entity_order mutation (spawn/despawn/prune/clear/
+ * streamed add-remove).  Consumers (hierarchy rebuild gate) fold it into
+ * their change keys; reparent/rename do NOT touch the order and are
+ * covered by the scene structural_epoch / their own signals instead. */
+extern uint64_t g_entity_order_gen;
 
 /* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
 struct EditorEntitySidecar {

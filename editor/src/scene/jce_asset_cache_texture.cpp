@@ -25,12 +25,22 @@ bool looks_like_texture_asset_path(const char *path)
 
 /* ── Texture cache entry management ─────────────────────────────── */
 
+static uint32_t texture_cache_key_hash(const char *key)
+{
+    uint32_t h = 2166136261u;               /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++)
+        h = (h ^ *p) * 16777619u;
+    return h;
+}
+
 int find_texture_cache_entry(const char *key)
 {
     if (!key || key[0] == '\0') return -1;
 
+    const uint32_t h = texture_cache_key_hash(key);
     for (int i = 0; i < s_cache.tex_cache_count; i++) {
-        if (strcmp(s_cache.tex_cache[i].path, key) == 0)
+        if (s_cache.tex_cache[i].path_hash == h
+            && strcmp(s_cache.tex_cache[i].path, key) == 0)
             return i;
     }
     return -1;
@@ -52,6 +62,7 @@ void reset_texture_cache_entry(TextureCacheEntry *entry)
     }
 
     entry->path[0] = '\0';
+    entry->path_hash = 0;
     entry->tex = tex_invalid();
     entry->asset_handle = asset_handle_invalid();
     entry->tex_from_asset_manager = false;
@@ -426,6 +437,8 @@ JceTexture asset_cache_get_texture(const char *material_path,
         reset_texture_cache_entry(&s_cache.tex_cache[idx]);
         snprintf(s_cache.tex_cache[idx].path,
                  sizeof(s_cache.tex_cache[0].path), "%s", key);
+        s_cache.tex_cache[idx].path_hash =
+            texture_cache_key_hash(s_cache.tex_cache[idx].path);
     }
 
     TextureCacheEntry *entry = &s_cache.tex_cache[idx];

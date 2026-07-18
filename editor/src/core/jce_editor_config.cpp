@@ -111,6 +111,9 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->last_scene_path[0] = '\0';
     cfg->recent_count = 0;
     cfg->recent_scene_count = 0;
+    cfg->autosave_interval = 0;   /* off by default (user preference) */
+    cfg->startup_mode      = 0;   /* JCE_EDITOR_STARTUP_LAST */
+    cfg->recent_max        = 10;
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
     cfg->gizmo_snap_translate = 0.5f;
@@ -212,6 +215,8 @@ static int ui_int_state_find(const JceEditorConfig *cfg, const char *key)
     return -1;
 }
 
+static void load_ui_float_str_state(const JceJson *root);   /* fwd */
+
 static void load_ui_int_state(JceEditorConfig *cfg, const JceJson *root)
 {
     const JceJson *ui = jce_json_get(root, "ui_state_int");
@@ -305,6 +310,13 @@ static void apply_pref_keys(JceEditorConfig *cfg, const JceJson *root) {
                                                  cfg->auto_repack_on_save);
     cfg->run_dev_mode = jce_json_get_bool(root, "run_dev_mode",
                                           cfg->run_dev_mode);
+    /* General prefs (merged from the retired prefs.json store). */
+    cfg->autosave_interval = cjson_read_int(root, "autosave_interval",
+                                            cfg->autosave_interval);
+    cfg->startup_mode = cjson_read_int(root, "startup_mode", cfg->startup_mode);
+    cfg->recent_max   = cjson_read_int(root, "recent_max",   cfg->recent_max);
+    if (cfg->recent_max < 1)  cfg->recent_max = 1;
+    if (cfg->recent_max > 20) cfg->recent_max = 20;
 }
 
 static void apply_session_keys(JceEditorConfig *cfg, const JceJson *root) {
@@ -345,35 +357,43 @@ static void apply_session_keys(JceEditorConfig *cfg, const JceJson *root) {
     cjson_read_str(root, "build_project_root",
                    cfg->build_project_root, sizeof(cfg->build_project_root));
 
-    /* recent_0 .. recent_9 */
+    /* recent_0 .. recent_N */
     cfg->recent_count = 0;
-    for (int i = 0; i < 10; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "recent_%d", i);
-        const char *s = jce_json_get_string(root, key, NULL);
-        if (s && s[0]) {
-            strncpy(cfg->recent_projects[i], s,
-                    sizeof(cfg->recent_projects[i]) - 1);
-            cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
-            cfg->recent_count = i + 1;
-        } else {
-            cfg->recent_projects[i][0] = '\0';
+    {
+        int rcap = (int)(sizeof(cfg->recent_projects) /
+                         sizeof(cfg->recent_projects[0]));
+        for (int i = 0; i < rcap; i++) {
+            char key[16];
+            snprintf(key, sizeof(key), "recent_%d", i);
+            const char *s = jce_json_get_string(root, key, NULL);
+            if (s && s[0]) {
+                strncpy(cfg->recent_projects[i], s,
+                        sizeof(cfg->recent_projects[i]) - 1);
+                cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
+                cfg->recent_count = i + 1;
+            } else {
+                cfg->recent_projects[i][0] = '\0';
+            }
         }
     }
 
-    /* recent_scene_0 .. recent_scene_9 */
+    /* recent_scene_0 .. recent_scene_N */
     cfg->recent_scene_count = 0;
-    for (int i = 0; i < 10; i++) {
-        char key[24];
-        snprintf(key, sizeof(key), "recent_scene_%d", i);
-        const char *s = jce_json_get_string(root, key, NULL);
-        if (s && s[0]) {
-            strncpy(cfg->recent_scene_paths[i], s,
-                    sizeof(cfg->recent_scene_paths[i]) - 1);
-            cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
-            cfg->recent_scene_count = i + 1;
-        } else {
-            cfg->recent_scene_paths[i][0] = '\0';
+    {
+        int rcap = (int)(sizeof(cfg->recent_scene_paths) /
+                         sizeof(cfg->recent_scene_paths[0]));
+        for (int i = 0; i < rcap; i++) {
+            char key[24];
+            snprintf(key, sizeof(key), "recent_scene_%d", i);
+            const char *s = jce_json_get_string(root, key, NULL);
+            if (s && s[0]) {
+                strncpy(cfg->recent_scene_paths[i], s,
+                        sizeof(cfg->recent_scene_paths[i]) - 1);
+                cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
+                cfg->recent_scene_count = i + 1;
+            } else {
+                cfg->recent_scene_paths[i][0] = '\0';
+            }
         }
     }
 
@@ -399,11 +419,76 @@ static void apply_session_keys(JceEditorConfig *cfg, const JceJson *root) {
     }
 
     load_ui_int_state(cfg, root);
+    load_ui_float_str_state(root);
 }
 
 /* --------------- load --------------- */
 
-bool jce_editor_config_load(JceEditorConfig *cfg) {
+/* ---------- singleton ----------
+ *
+ * ONE in-memory JceEditorConfig backs the whole editor.  load() hands out
+ * copies of it; save() replaces it and marks it dirty.  Disk I/O happens
+ * exactly twice per quiet-period (both category files) instead of twice per
+ * call across ~30 load-modify-save sites — killing the per-frame reads
+ * (File menu, favourites sidebar), the write amplification (snap-increment
+ * keystrokes, slider drags), and shrinking the torn-write window to the
+ * debounced flush. */
+static JceEditorConfig s_live;
+static bool  s_live_valid = false;
+static bool  s_live_found = false;   /* any source file existed at first load */
+static bool  s_dirty      = false;
+static float s_quiet      = 0.0f;    /* seconds since the last save() */
+static bool  s_had_legacy = false;   /* editor-config.json present at load */
+static bool  s_had_old_prefs = false;/* prefs.json (retired store) present  */
+static bool  s_schema_newer  = false;/* file written by a NEWER editor      */
+
+static uint64_t s_generation = 0;
+
+static void ui_state_mark_dirty(void) {
+    s_dirty = true;
+    s_quiet = 0.0f;
+    ++s_generation;
+}
+
+uint64_t jce_editor_config_generation(void) { return s_generation; }
+
+/* Migrate the retired ~/.jce/prefs.json (Preferences-panel store) into the
+ * canonical config: autosave/startup/recent_max become struct fields;
+ * per-kind toolchain path overrides become "toolchain.<kind>" string KV. */
+static void merge_old_prefs_json(JceEditorConfig *cfg)
+{
+    char path[1024];
+    jce_editor_dotjce_path("prefs.json", path, sizeof(path));
+    JceJson *root = read_config_json(path);
+    if (!root) return;
+    s_had_old_prefs = true;
+    /* autosave deliberately NOT migrated: the old panel default was 5min-ON,
+     * so nearly every prefs.json carries "2" without the user ever choosing
+     * it.  Policy is autosave OFF by default; users re-enable it in
+     * Preferences > General. */
+    cfg->startup_mode      = cjson_read_int(root, "startup",  cfg->startup_mode);
+    cfg->recent_max        = cjson_read_int(root, "recent_max", cfg->recent_max);
+    if (cfg->recent_max < 1)  cfg->recent_max = 1;
+    if (cfg->recent_max > 20) cfg->recent_max = 20;
+    const JceJson *tc = jce_json_get(root, "toolchain_overrides");
+    if (jce_json_is_object(tc)) {
+        for (JceJson *it = jce_json_first_child(tc); it;
+             it = jce_json_next_sibling(it)) {
+            const char *kind = jce_json_member_key(it);
+            if (!kind || !jce_json_is_string(it)) continue;
+            char key[JCE_EDITOR_UI_STATE_KEY_MAX];
+            snprintf(key, sizeof(key), "toolchain.%s", kind);
+            /* Existing KV wins: it means a post-migration edit. */
+            char cur[8];
+            if (!jce_editor_config_get_ui_str(key, cur, sizeof(cur)))
+                jce_editor_config_set_ui_str(key, jce_json_string_value(it, ""));
+        }
+    }
+    jce_json_free(root);
+    LOG_INFO(LOG_TAG, "merged retired prefs.json into editor-preferences");
+}
+
+static bool config_load_from_disk(JceEditorConfig *cfg) {
     jce_editor_config_defaults(cfg);
 
     /* Precedence: new category files win; the legacy single file fills any
@@ -411,7 +496,21 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
      * data loss).  Each category is applied from exactly ONE source. */
     JceJson *pj = read_config_json(PREFS_PATH);
     JceJson *sj = read_config_json(SESSION_PATH);
-    JceJson *lj = (!pj || !sj) ? read_config_json(CONFIG_PATH) : NULL;
+    JceJson *lj = read_config_json(CONFIG_PATH);
+    s_had_legacy = (lj != NULL);
+
+    /* Forward-compat guard: a config written by a NEWER editor keeps its
+     * unknown keys only until our next flush rewrites the file.  Detect it,
+     * warn once, and keep a one-time backup beside the file. */
+    int schema = 0;
+    if (pj) schema = cjson_read_int(pj, "_schema", 0);
+    if (sj) { int s2 = cjson_read_int(sj, "_schema", 0); if (s2 > schema) schema = s2; }
+    if (schema > JCE_EDITOR_CONFIG_SCHEMA) {
+        s_schema_newer = true;
+        LOG_WARN(LOG_TAG, "config _schema %d is newer than this editor (%d) — "
+                 "unknown keys will be dropped on next save", schema,
+                 JCE_EDITOR_CONFIG_SCHEMA);
+    }
 
     if (pj)      apply_pref_keys(cfg, pj);
     else if (lj) apply_pref_keys(cfg, lj);
@@ -419,12 +518,17 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     if (sj)      apply_session_keys(cfg, sj);
     else if (lj) apply_session_keys(cfg, lj);
 
+    /* Retired fourth store (Preferences panel's prefs.json): its keys now
+     * live in editor-preferences.json.  Merge only while the new file does
+     * not carry them yet (i.e. prefs.json still exists). */
+    merge_old_prefs_json(cfg);
+
     /* Cached input-pref globals (read every frame by viewport handlers). */
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
-    const bool found = (pj || sj || lj);
+    const bool found = (pj || sj || lj || s_had_old_prefs);
     if (pj) jce_json_free(pj);
     if (sj) jce_json_free(sj);
     if (lj) jce_json_free(lj);
@@ -456,6 +560,19 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     return true;
 }
 
+bool jce_editor_config_load(JceEditorConfig *cfg) {
+    if (!cfg) return false;
+    if (!s_live_valid) {
+        s_live_found = config_load_from_disk(&s_live);
+        s_live_valid = true;
+        /* The retired stores merged above must reach disk in the new
+         * format even if the user never changes a setting this session. */
+        if (s_had_legacy || s_had_old_prefs) ui_state_mark_dirty();
+    }
+    *cfg = s_live;
+    return s_live_found;
+}
+
 /* --------------- save --------------- */
 
 static void write_pref_keys(JceJson *root, const JceEditorConfig *cfg) {
@@ -480,6 +597,80 @@ static void write_pref_keys(JceJson *root, const JceEditorConfig *cfg) {
     jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
     jce_json_set_bool(root, "auto_repack_on_save", cfg->auto_repack_on_save);
     jce_json_set_bool(root, "run_dev_mode",        cfg->run_dev_mode);
+    jce_json_set_int (root, "autosave_interval",   cfg->autosave_interval);
+    jce_json_set_int (root, "startup_mode",        cfg->startup_mode);
+    jce_json_set_int (root, "recent_max",          cfg->recent_max);
+}
+
+/* ---------- module-level generic float / string UI state ----------
+ *
+ * These live on the config singleton rather than inside JceEditorConfig:
+ * the struct is copied by ~30 load/save call sites, and embedding dynamic
+ * tables in it would turn every copy into an ownership question.  Loaded
+ * from / written to editor-session.json beside ui_state_int. */
+
+typedef struct { char key[JCE_EDITOR_UI_STATE_KEY_MAX]; double value; } UiFloatKV;
+typedef struct { char key[JCE_EDITOR_UI_STATE_KEY_MAX]; char value[512]; } UiStrKV;
+
+static UiFloatKV *s_ui_floats = NULL;
+static int s_ui_float_count = 0, s_ui_float_cap = 0;
+static UiStrKV *s_ui_strs = NULL;
+static int s_ui_str_count = 0, s_ui_str_cap = 0;
+
+static void ui_state_mark_dirty(void);   /* fwd (defined with the singleton) */
+
+static int ui_float_find(const char *key) {
+    for (int i = 0; i < s_ui_float_count; i++)
+        if (strcmp(s_ui_floats[i].key, key) == 0) return i;
+    return -1;
+}
+static int ui_str_find(const char *key) {
+    for (int i = 0; i < s_ui_str_count; i++)
+        if (strcmp(s_ui_strs[i].key, key) == 0) return i;
+    return -1;
+}
+
+static void load_ui_float_str_state(const JceJson *root)
+{
+    const JceJson *uf = jce_json_get(root, "ui_state_float");
+    if (jce_json_is_object(uf)) {
+        for (JceJson *it = jce_json_first_child(uf); it;
+             it = jce_json_next_sibling(it)) {
+            const char *key = jce_json_member_key(it);
+            if (!ui_state_key_valid(key) || !jce_json_is_number(it)) continue;
+            jce_editor_config_set_ui_float(key,
+                (float)jce_json_number_value(it, 0.0));
+        }
+    }
+    const JceJson *us = jce_json_get(root, "ui_state_str");
+    if (jce_json_is_object(us)) {
+        for (JceJson *it = jce_json_first_child(us); it;
+             it = jce_json_next_sibling(it)) {
+            const char *key = jce_json_member_key(it);
+            if (!ui_state_key_valid(key) || !jce_json_is_string(it)) continue;
+            jce_editor_config_set_ui_str(key, jce_json_string_value(it, ""));
+        }
+    }
+}
+
+static void write_ui_float_str_state(JceJson *root)
+{
+    if (s_ui_float_count > 0) {
+        JceJson *uf = jce_json_object();
+        if (uf) {
+            for (int i = 0; i < s_ui_float_count; i++)
+                jce_json_set_number(uf, s_ui_floats[i].key, s_ui_floats[i].value);
+            jce_json_set_child(root, "ui_state_float", uf);
+        }
+    }
+    if (s_ui_str_count > 0) {
+        JceJson *us = jce_json_object();
+        if (us) {
+            for (int i = 0; i < s_ui_str_count; i++)
+                jce_json_set_string(us, s_ui_strs[i].key, s_ui_strs[i].value);
+            jce_json_set_child(root, "ui_state_str", us);
+        }
+    }
 }
 
 static void write_session_keys(JceJson *root, const JceEditorConfig *cfg) {
@@ -507,17 +698,25 @@ static void write_session_keys(JceJson *root, const JceEditorConfig *cfg) {
     jce_json_set_string(root, "workspace_id", cfg->workspace_id);
     jce_json_set_string(root, "build_project_root", cfg->build_project_root);
 
-    for (int i = 0; i < 10; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "recent_%d", i);
-        const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
-        jce_json_set_string(root, key, val);
+    {
+        int rcap = (int)(sizeof(cfg->recent_projects) /
+                         sizeof(cfg->recent_projects[0]));
+        for (int i = 0; i < rcap; i++) {
+            char key[16];
+            snprintf(key, sizeof(key), "recent_%d", i);
+            const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
+            jce_json_set_string(root, key, val);
+        }
     }
-    for (int i = 0; i < 10; i++) {
-        char key[24];
-        snprintf(key, sizeof(key), "recent_scene_%d", i);
-        const char *val = (i < cfg->recent_scene_count) ? cfg->recent_scene_paths[i] : "";
-        jce_json_set_string(root, key, val);
+    {
+        int rcap = (int)(sizeof(cfg->recent_scene_paths) /
+                         sizeof(cfg->recent_scene_paths[0]));
+        for (int i = 0; i < rcap; i++) {
+            char key[24];
+            snprintf(key, sizeof(key), "recent_scene_%d", i);
+            const char *val = (i < cfg->recent_scene_count) ? cfg->recent_scene_paths[i] : "";
+            jce_json_set_string(root, key, val);
+        }
     }
     {
         int cap = (int)(sizeof(cfg->asset_favorites) /
@@ -544,14 +743,34 @@ static void write_session_keys(JceJson *root, const JceEditorConfig *cfg) {
 }
 
 bool jce_editor_config_save(const JceEditorConfig *cfg) {
-    /* Ensure .jce directory exists */
-    ensure_directory(CONFIG_DIR);
+    if (!cfg) return false;
+    /* Adopt the caller's copy as the new live state; the actual disk write
+     * is coalesced into the debounced flush below. */
+    if (!s_live_valid) {
+        /* First touch is a save (possible during early boot): seed the
+         * singleton from disk first so unrelated categories are not lost. */
+        s_live_found = config_load_from_disk(&s_live);
+        s_live_valid = true;
+    }
+    s_live = *cfg;
+    s_live_found = true;
 
     /* Keep the cached input-pref globals in sync (read every frame). */
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
+    ui_state_mark_dirty();
+    return true;
+}
+
+/* Write both category files (atomic via the engine JSON writer), then —
+ * exactly once, after the first successful flush — retire the superseded
+ * stores by renaming them *.migrated: a hand-edit to a dead file can then
+ * never be silently inert, and deleting the new files can never resurrect
+ * years-old values. */
+static bool config_flush_to_disk(void) {
+    ensure_directory(CONFIG_DIR);
     bool ok = true;
 
     /* Preferences (per-user). */
@@ -559,7 +778,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         JceJson *root = jce_json_object();
         if (!root) return false;
         jce_json_set_int(root, "_schema", JCE_EDITOR_CONFIG_SCHEMA);
-        write_pref_keys(root, cfg);
+        write_pref_keys(root, &s_live);
         if (!ed_write_json_to_file(PREFS_PATH, root)) {
             LOG_ERROR(LOG_TAG, "Failed to write preferences: %s", PREFS_PATH);
             ok = false;
@@ -571,16 +790,55 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         JceJson *root = jce_json_object();
         if (!root) return false;
         jce_json_set_int(root, "_schema", JCE_EDITOR_CONFIG_SCHEMA);
-        write_session_keys(root, cfg);
+        write_session_keys(root, &s_live);
+        write_ui_float_str_state(root);
         if (!ed_write_json_to_file(SESSION_PATH, root)) {
             LOG_ERROR(LOG_TAG, "Failed to write session: %s", SESSION_PATH);
             ok = false;
         }
     }
 
-    if (ok)
+    if (ok) {
         LOG_INFO(LOG_TAG, "Config saved (%s + %s)", PREFS_PATH, SESSION_PATH);
+        /* Retire superseded stores (skip when a NEWER editor owns them —
+         * downgrade sessions must not eat the newer editor's files). */
+        if (!s_schema_newer) {
+            if (s_had_legacy) {
+                char dst[1024];
+                snprintf(dst, sizeof(dst), "%s.migrated", CONFIG_PATH);
+                jce_fs_host_remove_file(dst);
+                if (jce_fs_host_rename(CONFIG_PATH, dst))
+                    LOG_INFO(LOG_TAG, "legacy editor-config.json retired -> %s", dst);
+                s_had_legacy = false;
+            }
+            if (s_had_old_prefs) {
+                char src[1024], dst[1024];
+                jce_editor_dotjce_path("prefs.json", src, sizeof(src));
+                snprintf(dst, sizeof(dst), "%s.migrated", src);
+                jce_fs_host_remove_file(dst);
+                if (jce_fs_host_rename(src, dst))
+                    LOG_INFO(LOG_TAG, "retired prefs.json -> %s", dst);
+                s_had_old_prefs = false;
+            }
+        }
+    }
     return ok;
+}
+
+void jce_editor_config_flush_tick(float dt_sec) {
+    if (!s_dirty) return;
+    s_quiet += (dt_sec > 0.0f ? dt_sec : 0.0f);
+    if (s_quiet < 0.5f) return;
+    s_dirty = false;
+    s_quiet = 0.0f;
+    config_flush_to_disk();
+}
+
+void jce_editor_config_flush_now(void) {
+    if (!s_dirty) return;
+    s_dirty = false;
+    s_quiet = 0.0f;
+    config_flush_to_disk();
 }
 
 void jce_editor_config_ensure_dir(void) {
@@ -597,7 +855,7 @@ static int s_recent_cap = 10;
 
 void jce_editor_config_set_recent_cap(int n) {
     if (n < 1)  n = 1;
-    if (n > 10) n = 10;
+    if (n > 20) n = 20;   /* == array capacity; 11..20 used to silently act as 10 */
     s_recent_cap = n;
 }
 
@@ -797,8 +1055,17 @@ bool jce_editor_config_set_ui_int(JceEditorConfig *cfg,
         return true;
     }
 
-    if (cfg->ui_int_state_count >= JCE_EDITOR_UI_INT_STATE_MAX)
+    if (cfg->ui_int_state_count >= JCE_EDITOR_UI_INT_STATE_MAX) {
+        /* Never drop silently (fcluster lesson): callers void the result. */
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARN(LOG_TAG, "ui_state_int table full (%d slots) — '%s' and "
+                     "later keys will NOT persist", JCE_EDITOR_UI_INT_STATE_MAX,
+                     key);
+        }
         return false;
+    }
 
     JceEditorUiIntState *slot =
         &cfg->ui_int_states[cfg->ui_int_state_count++];
@@ -806,4 +1073,81 @@ bool jce_editor_config_set_ui_int(JceEditorConfig *cfg,
     slot->key[sizeof(slot->key) - 1] = '\0';
     slot->value = value;
     return true;
+}
+
+/* --------------- generic float / string UI state (module-level) ------- */
+
+bool jce_editor_config_get_ui_float(const char *key, float *out_value)
+{
+    if (!ui_state_key_valid(key)) return false;
+    int idx = ui_float_find(key);
+    if (idx < 0) return false;
+    if (out_value) *out_value = (float)s_ui_floats[idx].value;
+    return true;
+}
+
+float jce_editor_config_get_ui_float_or(const char *key, float fallback)
+{
+    float v = fallback;
+    return jce_editor_config_get_ui_float(key, &v) ? v : fallback;
+}
+
+void jce_editor_config_set_ui_float(const char *key, float value)
+{
+    if (!ui_state_key_valid(key)) return;
+    int idx = ui_float_find(key);
+    if (idx < 0) {
+        if (s_ui_float_count >= s_ui_float_cap) {
+            int ncap = s_ui_float_cap ? s_ui_float_cap * 2 : 32;
+            UiFloatKV *nt = (UiFloatKV *)ED_REALLOC(
+                s_ui_floats, (size_t)ncap * sizeof *nt);
+            if (!nt) return;
+            s_ui_floats = nt; s_ui_float_cap = ncap;
+        }
+        idx = s_ui_float_count++;
+        strncpy(s_ui_floats[idx].key, key, sizeof(s_ui_floats[idx].key) - 1);
+        s_ui_floats[idx].key[sizeof(s_ui_floats[idx].key) - 1] = '\0';
+        s_ui_floats[idx].value = value;
+        ui_state_mark_dirty();
+        return;
+    }
+    if (s_ui_floats[idx].value != (double)value) {
+        s_ui_floats[idx].value = value;
+        ui_state_mark_dirty();
+    }
+}
+
+bool jce_editor_config_get_ui_str(const char *key, char *out, size_t cap)
+{
+    if (!ui_state_key_valid(key) || !out || cap == 0) return false;
+    int idx = ui_str_find(key);
+    if (idx < 0) return false;
+    strncpy(out, s_ui_strs[idx].value, cap - 1);
+    out[cap - 1] = '\0';
+    return true;
+}
+
+void jce_editor_config_set_ui_str(const char *key, const char *value)
+{
+    if (!ui_state_key_valid(key)) return;
+    if (!value) value = "";
+    int idx = ui_str_find(key);
+    if (idx < 0) {
+        if (s_ui_str_count >= s_ui_str_cap) {
+            int ncap = s_ui_str_cap ? s_ui_str_cap * 2 : 16;
+            UiStrKV *nt = (UiStrKV *)ED_REALLOC(
+                s_ui_strs, (size_t)ncap * sizeof *nt);
+            if (!nt) return;
+            s_ui_strs = nt; s_ui_str_cap = ncap;
+        }
+        idx = s_ui_str_count++;
+        strncpy(s_ui_strs[idx].key, key, sizeof(s_ui_strs[idx].key) - 1);
+        s_ui_strs[idx].key[sizeof(s_ui_strs[idx].key) - 1] = '\0';
+        s_ui_strs[idx].value[0] = '\0';
+    }
+    if (strncmp(s_ui_strs[idx].value, value, sizeof(s_ui_strs[idx].value)) != 0) {
+        strncpy(s_ui_strs[idx].value, value, sizeof(s_ui_strs[idx].value) - 1);
+        s_ui_strs[idx].value[sizeof(s_ui_strs[idx].value) - 1] = '\0';
+        ui_state_mark_dirty();
+    }
 }

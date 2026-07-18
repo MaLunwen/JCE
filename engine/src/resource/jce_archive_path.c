@@ -32,9 +32,18 @@ size_t jce_archive_normalize_path(const char *in, char *out, size_t out_cap) {
     while (*p == '/' || *p == '\\') p++;
 
     size_t in_len = strlen(p);
-    /* Per-segment content start offsets in `out`, for ".." popping. */
-    size_t *seg = (size_t *)jce_malloc((in_len + 1) * sizeof(size_t));
-    if (!seg) return 0;
+    /* Per-segment content start offsets in `out`, for ".." popping.
+     * Stack-first (mirrors jce_archive_hash_path's stackbuf): a segment needs
+     * at least 2 input chars ("x/"), so 256 slots cover any path up to 511
+     * chars — every lookup in the engine.  Only a pathological longer path
+     * pays the heap round-trip; before this EVERY pak lookup paid a
+     * malloc+free pair (allocator contention on worker-thread decode paths). */
+    size_t  seg_stack[256];
+    size_t *seg = seg_stack;
+    if (in_len + 1 > sizeof(seg_stack) / sizeof(seg_stack[0])) {
+        seg = (size_t *)jce_malloc((in_len + 1) * sizeof(size_t));
+        if (!seg) return 0;
+    }
     size_t seg_count = 0;
     size_t out_len = 0;
 
@@ -55,11 +64,11 @@ size_t jce_archive_normalize_path(const char *in, char *out, size_t out_cap) {
         } else if (slen > 0) {
             /* Append a separator before all but the first kept segment. */
             if (seg_count > 0) {
-                if (out_len + 1 + 1 > out_cap) { jce_free(seg); return 0; }
+                if (out_len + 1 + 1 > out_cap) { if (seg != seg_stack) jce_free(seg); return 0; }
                 out[out_len++] = '/';
             }
             seg[seg_count] = out_len; /* content start */
-            if (out_len + slen + 1 > out_cap) { jce_free(seg); return 0; }
+            if (out_len + slen + 1 > out_cap) { if (seg != seg_stack) jce_free(seg); return 0; }
             for (size_t i = 0; i < slen; i++) {
                 char c = s[i];
                 /* (5) ASCII uppercase -> lowercase. */
@@ -75,13 +84,18 @@ size_t jce_archive_normalize_path(const char *in, char *out, size_t out_cap) {
 
     /* (7) no trailing slash is possible here (we never trail one). */
     out[out_len] = '\0';
-    jce_free(seg);
+    if (seg != seg_stack) jce_free(seg);
     return out_len;
 }
 
 uint64_t jce_archive_hash_normalized(const char *norm, size_t len) {
     if (!norm) return 0;
     return (uint64_t)XXH3_64bits(norm, len);
+}
+
+uint64_t jce_archive_content_hash(const void *data, size_t size) {
+    if (!data && size > 0) return 0;
+    return (uint64_t)XXH3_64bits(data ? data : "", size);
 }
 
 uint64_t jce_archive_hash_path(const char *path) {

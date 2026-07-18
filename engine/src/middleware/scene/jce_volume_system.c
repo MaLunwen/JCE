@@ -175,6 +175,8 @@ void jce_volume_system_tick(JceScene *scene,
     for (i = 0; i < (int)(sizeof(ctx.acc) / sizeof(float)); i++)
         raw[i] = 0.0f;
 
-    jce_scene_each_entity(scene, volume_entity_cb, &ctx);
+    /* Component-filtered walk (O(#volumes)); O(1) all-clear gate. */
+    if (jce_scene_count_volumes(scene) > 0)
+        jce_scene_each_volume(scene, volume_entity_cb, &ctx);
     accum_resolve(&ctx.acc, inout_params);
 }

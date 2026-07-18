@@ -5,6 +5,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/platform/jce_single_instance.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,6 +20,19 @@
 #include <windows.h>
 
 static HANDLE s_single_mutex = NULL;
+
+/* Window-handle rendezvous for second-instance activation: the first
+ * instance publishes its HWND into a named shared-memory section; a
+ * second instance reads it back to restore/foreground/flash the window
+ * instead of showing a modal.  Named alongside the mutex. */
+typedef struct SiWndPayload {
+    unsigned long long hwnd;   /* HWND widened for fixed layout */
+    unsigned long      pid;
+} SiWndPayload;
+
+static HANDLE        s_wnd_mapping = NULL;
+static SiWndPayload *s_wnd_view    = NULL;
+static char          s_safe_name[128];
 
 #else
 #include <errno.h>
@@ -70,10 +84,13 @@ bool jce_single_instance_lock(const char *app_name)
 #elif defined(_WIN32)
     if (s_single_mutex) return true;
 
-    char safe_name[128];
+    /* Local\ (per logon session), NOT Global\: two users / RDP sessions on
+     * one machine should each get their own instance, and a Global mutex
+     * owned by another user makes CreateMutex fail with ACCESS_DENIED —
+     * the per-user scope is the desktop-app industry norm. */
     char mutex_name[196];
-    sanitize_name(app_name, safe_name, sizeof(safe_name));
-    snprintf(mutex_name, sizeof(mutex_name), "Global\\JCE_ENGINE_SINGLE_INSTANCE_%s", safe_name);
+    sanitize_name(app_name, s_safe_name, sizeof(s_safe_name));
+    snprintf(mutex_name, sizeof(mutex_name), "Local\\JCE_ENGINE_SINGLE_INSTANCE_%s", s_safe_name);
 
     HANDLE mtx = CreateMutexA(NULL, TRUE, mutex_name);
     if (!mtx) {
@@ -130,6 +147,8 @@ void jce_single_instance_unlock(void)
     (defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS)
     return; /* no-op: lock was not acquired */
 #elif defined(_WIN32)
+    if (s_wnd_view)    { UnmapViewOfFile(s_wnd_view); s_wnd_view = NULL; }
+    if (s_wnd_mapping) { CloseHandle(s_wnd_mapping);  s_wnd_mapping = NULL; }
     if (!s_single_mutex) return;
 
     ReleaseMutex(s_single_mutex);
@@ -154,5 +173,102 @@ bool jce_single_instance_is_locked(void)
     return s_single_mutex != NULL;
 #else
     return s_lock_fd >= 0;
+#endif
+}
+
+#if defined(_WIN32)
+static void si_wnd_mapping_name(char *out, size_t out_size)
+{
+    snprintf(out, out_size, "Local\\JCE_SI_WND_%s",
+             s_safe_name[0] ? s_safe_name : "JCE");
+}
+#endif
+
+void jce_single_instance_publish_window(void *native_window_handle)
+{
+#if defined(_WIN32)
+    if (!s_single_mutex || !native_window_handle) return;
+
+    if (!s_wnd_mapping) {
+        char map_name[196];
+        si_wnd_mapping_name(map_name, sizeof(map_name));
+        s_wnd_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                           PAGE_READWRITE, 0,
+                                           (DWORD)sizeof(SiWndPayload),
+                                           map_name);
+        if (!s_wnd_mapping) {
+            LOG_WARN(LOG_TAG, "window mapping create failed (err=%lu)",
+                     (unsigned long)GetLastError());
+            return;
+        }
+        s_wnd_view = (SiWndPayload *)MapViewOfFile(
+            s_wnd_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SiWndPayload));
+        if (!s_wnd_view) {
+            CloseHandle(s_wnd_mapping);
+            s_wnd_mapping = NULL;
+            LOG_WARN(LOG_TAG, "window mapping map failed (err=%lu)",
+                     (unsigned long)GetLastError());
+            return;
+        }
+    }
+
+    s_wnd_view->pid  = GetCurrentProcessId();
+    s_wnd_view->hwnd = (unsigned long long)(uintptr_t)native_window_handle;
+    LOG_DEBUG(LOG_TAG, "published window handle %p for activation",
+              native_window_handle);
+#else
+    /* POSIX second-instance activation would need a per-display protocol
+     * (X11 _NET_ACTIVE_WINDOW / Wayland xdg-activation) — not wired yet;
+     * the lock alone still guarantees single instance. */
+    (void)native_window_handle;
+#endif
+}
+
+bool jce_single_instance_activate_existing(void)
+{
+#if defined(_WIN32)
+    char map_name[196];
+    si_wnd_mapping_name(map_name, sizeof(map_name));
+
+    HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, map_name);
+    if (!mapping) {
+        LOG_INFO(LOG_TAG, "no published window to activate (%s)", map_name);
+        return false;
+    }
+    SiWndPayload *view = (SiWndPayload *)MapViewOfFile(
+        mapping, FILE_MAP_READ, 0, 0, sizeof(SiWndPayload));
+    HWND hwnd = NULL;
+    if (view) {
+        hwnd = (HWND)(uintptr_t)view->hwnd;
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(mapping);
+
+    if (!hwnd || !IsWindow(hwnd)) {
+        LOG_INFO(LOG_TAG, "published window handle is stale");
+        return false;
+    }
+
+    /* Restore + best-effort foreground + flash-until-focused: Windows
+     * denies SetForegroundWindow to non-foreground processes by design;
+     * FLASHW_TIMERNOFG keeps the taskbar button flashing until the user
+     * brings the window forward, which is exactly the sanctioned
+     * "an instance is already running" attention pattern. */
+    if (IsIconic(hwnd))
+        ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+
+    FLASHWINFO fi;
+    fi.cbSize    = sizeof(fi);
+    fi.hwnd      = hwnd;
+    fi.dwFlags   = FLASHW_ALL | FLASHW_TIMERNOFG;
+    fi.uCount    = 0;
+    fi.dwTimeout = 0;
+    FlashWindowEx(&fi);
+
+    LOG_INFO(LOG_TAG, "activated existing instance window %p", (void *)hwnd);
+    return true;
+#else
+    return false;
 #endif
 }

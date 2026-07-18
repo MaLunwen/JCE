@@ -33,6 +33,12 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 /* Shut down and free all resources (camera, FBO, meshes). */
 void jce_editor_scene_render_shutdown(void);
 
+/* Rebind project-relative content after a source-project switch or VFS mount
+ * transition.  In isolated Bundle Preview this reads render settings and
+ * component assets only from the active bundle.  Call before scene entities
+ * are deserialized so particle descriptors resolve in the correct context. */
+void jce_editor_scene_render_refresh_content_context(void);
+
 /* Render one frame of the 3D scene to the internal FBO.
  * The FBO is resized automatically when width/height change.
  * Call this from inside the ImGui panel so the correct size is known.
@@ -104,6 +110,11 @@ void jce_editor_scene_camera_get_state(float out_target3[3], float *out_yaw,
                                        float *out_pitch, float *out_distance);
 void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
                                        float pitch, float distance);
+
+/* Restore the orbit pose saved per scene in the project state (written
+ * continuously as the camera moves).  Returns false — leaving the current
+ * framing untouched — when the scene has no stored pose. */
+bool jce_editor_scene_camera_restore_pose(const char *scene_path);
 
 /* Snap camera to a preset view direction around current target. */
 typedef enum {
@@ -215,6 +226,12 @@ void jce_editor_scene_render_streaming_teardown(void);
  * on every scene swap, after clear_scene_entities() and before loading the
  * new scene's entities. */
 void jce_editor_scene_render_invalidate_model_caches(void);
+
+/* Drop the scene-view occlusion culler's per-entity slots (returns the bgfx
+ * query pool).  Call whenever the ECS world is destroyed+recreated: entity
+ * ids restart, so stale slots would false-cull recreated entities (objects
+ * vanishing after undo) and exhaust the 256-query pool. */
+void jce_editor_scene_render_reset_occlusion(void);
 
 /* Recreate the preview streamer from the current scene's streaming
  * settings.  Tears down any existing streamer first; creates a new one

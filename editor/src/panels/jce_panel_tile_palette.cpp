@@ -18,6 +18,7 @@
  */
 
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
 #include "io/jce_editor_file_util.h"
@@ -139,6 +140,8 @@ void load_map(void)
     }
     ensure_cells();
     load_palette_count();
+    /* Remember the last document that loaded OK (per-project). */
+    jce_editor_pstate_set_str("doc.tilemap.last", s.tilemap_path);
     jce_editor_console_log("tilemap loaded: %s", s.tilemap_path);
 }
 
@@ -267,6 +270,17 @@ void draw_map_pane(void)
 
 extern "C" void jce_editor_panel_tile_palette_content(void)
 {
+    /* One-time prefill of the last successfully loaded document
+     * (per-project) so one click on Load reopens it.  Never auto-loads,
+     * and never clobbers a path already set (typed / programmatic edit). */
+    static bool s_path_prefilled = false;
+    if (!s_path_prefilled && jce_editor_pstate_active()) {
+        s_path_prefilled = true;
+        if (!s.tilemap_path[0])
+            jce_editor_pstate_get_str("doc.tilemap.last", s.tilemap_path,
+                                      sizeof(s.tilemap_path));
+    }
+
     ImGui::BeginChild("##tp_left", ImVec2(260.0f, 0), true);
     draw_palette_pane();
     ImGui::EndChild();

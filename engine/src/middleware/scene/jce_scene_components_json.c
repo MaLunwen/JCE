@@ -7,27 +7,66 @@
 
 #include "jce_scene_components_internal.h"
 
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_thread.h>
+
 #define LOG_TAG "scene_serial"
 
-/* Base directory of the currently-loading scene file; used to resolve
- * sibling .mat.json material references (e.g. "Materials/foo.mat.json").
- * Set by jce_scene_serial_set_base_dir() before parse, cleared after. */
-static char s_scene_base_dir[1024] = { 0 };
+/* Relative asset resolution is scoped to the parsing thread: async scene
+ * loading must never make another scene resolve materials against its path. */
+typedef struct SceneSerialContext {
+    char                 base_dir[1024];
+    const JceFileSystem *asset_fs;
+} SceneSerialContext;
+
+static JceTLS *s_scene_context_tls = NULL;
+static SceneSerialContext s_scene_context_fallback;
+
+static void sse_context_destroy(void *value)
+{
+    JCE_FREE(value);
+}
+
+static SceneSerialContext *sse_context_get(void)
+{
+    if (!s_scene_context_tls)
+        s_scene_context_tls = jce_tls_create(sse_context_destroy);
+    if (!s_scene_context_tls)
+        return &s_scene_context_fallback;
+
+    SceneSerialContext *context =
+        (SceneSerialContext *)jce_tls_get(s_scene_context_tls);
+    if (!context) {
+        context = (SceneSerialContext *)JCE_CALLOC(1, sizeof(*context));
+        if (!context)
+            return &s_scene_context_fallback;
+        jce_tls_set(s_scene_context_tls, context);
+    }
+    return context;
+}
+
+#define SSE_SCENE_BASE_DIR (sse_context_get()->base_dir)
 
 void jce_scene_serial_set_base_dir(const char *dir)
 {
+    char *base_dir = SSE_SCENE_BASE_DIR;
     if (!dir || !*dir) {
-        s_scene_base_dir[0] = '\0';
+        base_dir[0] = '\0';
         return;
     }
     size_t L = strlen(dir);
-    if (L >= sizeof(s_scene_base_dir)) L = sizeof(s_scene_base_dir) - 1;
-    memcpy(s_scene_base_dir, dir, L);
-    s_scene_base_dir[L] = '\0';
+    if (L >= sizeof(SSE_SCENE_BASE_DIR)) L = sizeof(SSE_SCENE_BASE_DIR) - 1;
+    memcpy(base_dir, dir, L);
+    base_dir[L] = '\0';
     /* Strip trailing slash for consistent join with snprintf("%s/%s"). */
-    while (L > 0 && (s_scene_base_dir[L-1] == '/' || s_scene_base_dir[L-1] == '\\')) {
-        s_scene_base_dir[--L] = '\0';
+    while (L > 0 && (base_dir[L-1] == '/' || base_dir[L-1] == '\\')) {
+        base_dir[--L] = '\0';
     }
+}
+
+void jce_scene_serial_set_asset_vfs(const JceFileSystem *fs)
+{
+    sse_context_get()->asset_fs = fs;
 }
 
 /* Absolute-path test: use the public jce_path_is_absolute() (jce_path.h is
@@ -36,6 +75,8 @@ void jce_scene_serial_set_base_dir(const char *dir)
 static bool sse_file_exists(const char *p)
 {
     if (!p || !*p) return false;
+    const JceFileSystem *fs = sse_context_get()->asset_fs;
+    if (fs) return jce_fs_exists(fs, p);
     SDL_PathInfo info;
     return SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_FILE;
 }
@@ -43,6 +84,7 @@ static bool sse_file_exists(const char *p)
 static bool sse_dir_exists(const char *p)
 {
     if (!p || !*p) return false;
+    if (sse_context_get()->asset_fs) return false;
     SDL_PathInfo info;
     return SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_DIRECTORY;
 }
@@ -228,7 +270,7 @@ static bool find_fallback_material(const char *mesh_hint,
                                    char *out_path, size_t out_size)
 {
     if (!out_path || out_size == 0) return false;
-    if (s_scene_base_dir[0] == '\0') return false;
+    if (SSE_SCENE_BASE_DIR[0] == '\0') return false;
 
     struct FallbackMatScan st;
     st.best[0] = '\0';
@@ -237,7 +279,7 @@ static bool find_fallback_material(const char *mesh_hint,
     st.mesh_hint = (mesh_hint && *mesh_hint) ? mesh_hint : NULL;
 
     char base[1024];
-    snprintf(base, sizeof(base), "%s", s_scene_base_dir);
+    snprintf(base, sizeof(base), "%s", SSE_SCENE_BASE_DIR);
 
     /* Try scene_dir, then walk up to 4 ancestors, scanning Materials/
      * and materials/ at each level. */
@@ -328,6 +370,8 @@ static cJSON *ser_scene_rendering_settings(
     cJSON_AddNumberToObject(fog, "heightFalloff", r->fog_height_falloff);
     cJSON_AddNumberToObject(fog, "heightOrigin", r->fog_height_origin);
     cJSON_AddItemToObject(root, "fog", fog);
+    cJSON_AddBoolToObject(root, "iblEnabled", r->ibl_enabled);
+    cJSON_AddNumberToObject(root, "dynamicGI", r->gi_dynamic);
 
     cJSON_AddNumberToObject(shadows, "distance", r->shadow_distance);
     cJSON_AddNumberToObject(shadows, "cascades", r->cascade_count);
@@ -415,6 +459,12 @@ static cJSON *ser_scene_rendering_settings(
                 cJSON_AddNumberToObject(dome, "sunSoftness",  r->sky_dome_sun_softness);
                 cJSON_AddNumberToObject(dome, "haloPower",    r->sky_dome_halo_power);
                 cJSON_AddNumberToObject(dome, "haloStrength", r->sky_dome_halo_strength);
+                cJSON_AddNumberToObject(dome, "anchorRadius",    r->sky_dome_anchor_radius);
+                cJSON_AddNumberToObject(dome, "sunRayCount",     r->sky_dome_ray_count);
+                cJSON_AddNumberToObject(dome, "sunRayLength",    r->sky_dome_ray_length);
+                cJSON_AddNumberToObject(dome, "sunRaySharpness", r->sky_dome_ray_sharpness);
+                cJSON_AddNumberToObject(dome, "sunRayStrength",  r->sky_dome_ray_strength);
+                cJSON_AddItemToObject(dome, "sunDir", json_float3(r->sky_dome_sun_dir));
                 cJSON_AddItemToObject(sky, "dome", dome);
             }
             cJSON_AddItemToObject(env, "sky", sky);
@@ -572,6 +622,14 @@ static void parse_dome_into(const cJSON *dome, JceSceneRenderingSettings *r)
     r->sky_dome_sun_softness = (float)j_num(dome, "sunSoftness", r->sky_dome_sun_softness);
     r->sky_dome_halo_power   = (float)j_num(dome, "haloPower",   r->sky_dome_halo_power);
     r->sky_dome_halo_strength= (float)j_num(dome, "haloStrength",r->sky_dome_halo_strength);
+    /* Stylized sun rays (absent = defaults: count 0 = feature off). */
+    r->sky_dome_anchor_radius= (float)j_num(dome, "anchorRadius",   r->sky_dome_anchor_radius);
+    r->sky_dome_ray_count    = (float)j_num(dome, "sunRayCount",    r->sky_dome_ray_count);
+    r->sky_dome_ray_length   = (float)j_num(dome, "sunRayLength",   r->sky_dome_ray_length);
+    r->sky_dome_ray_sharpness= (float)j_num(dome, "sunRaySharpness",r->sky_dome_ray_sharpness);
+    r->sky_dome_ray_strength = (float)j_num(dome, "sunRayStrength", r->sky_dome_ray_strength);
+    /* Optional authored disk direction (sun/moon). Absent = zero = legacy. */
+    j_float3(dome, "sunDir",  r->sky_dome_sun_dir, r->sky_dome_sun_dir);
 }
 
 /* Extract all rendering settings from a "rendering" (or "lighting") cJSON
@@ -589,6 +647,9 @@ static JceSceneRenderingSettings extract_rendering_settings_from_obj(
         r.ambient_intensity =
             (float)j_num(ambient, "intensity", r.ambient_intensity);
     }
+
+    r.ibl_enabled = j_bool(src, "iblEnabled", r.ibl_enabled);
+    r.gi_dynamic  = (float)j_num(src, "dynamicGI", r.gi_dynamic);
 
     const cJSON *fog = cJSON_GetObjectItemCaseSensitive(src, "fog");
     if (cJSON_IsObject(fog)) {
@@ -949,9 +1010,9 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
         if (jce_path_is_absolute(mr.material_path)) {
             try_paths[n_try++] = mr.material_path;
         } else {
-            if (s_scene_base_dir[0]) {
+            if (SSE_SCENE_BASE_DIR[0]) {
                 jce_path_join(mat_full, sizeof(mat_full),
-                         s_scene_base_dir, mr.material_path);
+                         SSE_SCENE_BASE_DIR, mr.material_path);
                 try_paths[n_try++] = mat_full;
             }
             try_paths[n_try++] = mr.material_path;
@@ -964,9 +1025,9 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
         /* Walk parent directories of the scene file to find the asset
          * root (Unity layout: scenes/ and Materials/ are siblings). */
         char parent_try[1280] = { 0 };
-        if (!resolved && s_scene_base_dir[0] && !jce_path_is_absolute(mr.material_path)) {
+        if (!resolved && SSE_SCENE_BASE_DIR[0] && !jce_path_is_absolute(mr.material_path)) {
             char base[1024];
-            snprintf(base, sizeof(base), "%s", s_scene_base_dir);
+            snprintf(base, sizeof(base), "%s", SSE_SCENE_BASE_DIR);
             for (int up = 0; up < 4 && !resolved; up++) {
                 /* trim last segment */
                 long L = (long)strlen(base);
@@ -1012,7 +1073,12 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 pbr = s_matcache[ci].pbr;          /* cache hit: skip read+parse */
                 memcpy(tex_paths, s_matcache[ci].tex, sizeof(tex_paths));
                 have_mat = true;
-            } else if (jce_pbr_material_load_json(resolved, &pbr, tex_paths)) {
+            } else if ((sse_context_get()->asset_fs
+                            ? jce_pbr_material_load_json_vfs(
+                                  sse_context_get()->asset_fs, resolved,
+                                  &pbr, tex_paths)
+                            : jce_pbr_material_load_json(
+                                  resolved, &pbr, tex_paths))) {
                 /* Resolve each texture relative to the material file
                  * (which may be in Materials/ while textures are in
                  * Textures/ at the project root) so the renderer can
@@ -1045,6 +1111,10 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 mr.emissive[2]  = pbr.emissive_factor[2];
                 mr.normal_scale = pbr.normal_scale;
                 mr.ao_strength  = pbr.ao_strength;
+                if (pbr.custom_program != UINT16_MAX) {
+                    mr.has_custom_program = true;
+                    mr.custom_program_idx = pbr.custom_program;
+                }
             }
         }
     }
@@ -2394,6 +2464,7 @@ REG_ACCESSORS(terrain, JceTerrainComponent)
 REG_ACCESSORS(vegetation_scatter, JceVegetationScatterComponent)
 REG_ACCESSORS(water, JceWaterComponent)
 REG_ACCESSORS(grass_field, JceGrassFieldComponent)
+REG_ACCESSORS(foliage_cluster, JceFoliageClusterComponent)
 REG_ACCESSORS(buoyancy, JceBuoyancyComponent)
 REG_ACCESSORS(lod_group, JceLodGroupComponent)
 REG_ACCESSORS(virtual_camera, JceVirtualCameraComponent)
@@ -2724,6 +2795,13 @@ void jce_scene_components_register_all(void)
         reg_get_grass_field, reg_set_grass_field,
         sizeof(JceGrassFieldComponent));
 
+    REG("FoliageCluster", "foliageCluster", NULL, NULL,
+        0,
+        jce_scene_has_foliage_cluster, jce_scene_remove_foliage_cluster,
+        parse_foliage_cluster, serw_foliage_cluster,
+        reg_get_foliage_cluster, reg_set_foliage_cluster,
+        sizeof(JceFoliageClusterComponent));
+
     /* Post-64 row (no legacy flag bit): id/name addressing only. */
     REG("Buoyancy", "buoyancy", NULL, NULL,
         0,
@@ -3032,4 +3110,99 @@ void jce_scene_components_register_all(void)
         NULL, NULL, 0);
 
 #undef REG
+}
+
+/* ================================================================== */
+/* Script-facing JSON bridges (jce_scene_internal.h)                   */
+/*                                                                     */
+/* jce.comp_get / jce.comp_set and jce.render_get / jce.render_set     */
+/* reuse the registry parse/serialize rows above, so scripts read and  */
+/* write exactly the authored scene-JSON schema — including epoch      */
+/* bumps and derived state, because parse routes through the typed     */
+/* jce_scene_set_* accessors.                                          */
+/* ================================================================== */
+
+char *jce_scene_component_to_json(JceScene *s, JceEntity e, const char *type)
+{
+    if (!s || !type) return NULL;
+    int comp_id = jce_component_find(type);
+    if (comp_id == JCE_COMP_ID_INVALID) return NULL;
+    const JceComponentDesc *d = jce_component_desc(comp_id);
+    if (!d || !d->serialize || !d->has || !d->has(s, e)) return NULL;
+
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    d->serialize(s, e, arr);
+    cJSON *first = cJSON_GetArrayItem(arr, 0);
+    char *out = first ? cJSON_PrintUnformatted(first) : NULL;
+    cJSON_Delete(arr);
+    return out;
+}
+
+bool jce_scene_component_apply_json(JceScene *s, JceEntity e,
+                                    const char *type, const char *json)
+{
+    if (!s || !type || !json) return false;
+    int comp_id = jce_component_find(type);
+    if (comp_id == JCE_COMP_ID_INVALID) return false;
+    const JceComponentDesc *d = jce_component_desc(comp_id);
+    if (!d || !d->parse) return false;
+
+    cJSON *props = cJSON_Parse(json);
+    if (!props) return false;
+    d->parse(s, e, props);
+    cJSON_Delete(props);
+    return true;
+}
+
+char *jce_scene_rendering_to_json(JceScene *s)
+{
+    if (!s) return NULL;
+    cJSON *obj = ser_scene_rendering_settings(
+        jce_scene_get_rendering_settings(s));
+    if (!obj) return NULL;
+    char *out = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    return out;
+}
+
+/* Shallow-recursive overlay: objects merge key-by-key, everything else
+ * (numbers, strings, bools, ARRAYS) replaces wholesale. */
+static void rs_json_merge(cJSON *dst, const cJSON *patch)
+{
+    for (const cJSON *it = patch->child; it; it = it->next) {
+        cJSON *cur = cJSON_GetObjectItemCaseSensitive(dst, it->string);
+        if (cur && cJSON_IsObject(cur) && cJSON_IsObject(it)) {
+            rs_json_merge(cur, it);
+        } else {
+            cJSON *dup = cJSON_Duplicate(it, 1);
+            if (!dup) continue;
+            if (cur) cJSON_ReplaceItemInObjectCaseSensitive(dst, it->string, dup);
+            else     cJSON_AddItemToObject(dst, it->string, dup);
+        }
+    }
+}
+
+bool jce_scene_rendering_apply_json(JceScene *s, const char *json)
+{
+    if (!s || !json) return false;
+    cJSON *patch = cJSON_Parse(json);
+    if (!patch) return false;
+
+    cJSON *cur = ser_scene_rendering_settings(
+        jce_scene_get_rendering_settings(s));
+    if (!cur) { cJSON_Delete(patch); return false; }
+
+    rs_json_merge(cur, patch);
+    JceSceneRenderingSettings merged = extract_rendering_settings_from_obj(cur);
+    jce_scene_set_rendering_settings(s, &merged);
+
+    cJSON_Delete(cur);
+    cJSON_Delete(patch);
+    return true;
+}
+
+void jce_scene_json_free(char *str)
+{
+    if (str) cJSON_free(str);
 }

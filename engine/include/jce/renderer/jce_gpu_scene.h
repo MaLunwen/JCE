@@ -159,6 +159,16 @@ JCE_API bool jce_gpu_scene_add_run(JceGpuScene *gs,
 JCE_API bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                                     uint16_t cull_view, const jce_vec4 planes[6]);
 
+/* Hi-Z occlusion (large-world #5, opt-in). Set the per-frame inputs BEFORE
+ * jce_gpu_scene_dispatch: `depth_tex` = the depth-prepass texture idx (the cull
+ * runs before this frame's prepass, so it is LAST frame's depth), `prev_vp` =
+ * the view-proj that produced it, `view_w/h` = the color viewport size. When
+ * enable is false (or Hi-Z unsupported) the cull stays frustum-only and this is
+ * a no-op. UINT16_MAX depth_tex disables. */
+JCE_API void jce_gpu_scene_set_hiz(JceGpuScene *gs, uint16_t depth_tex,
+                                   const jce_mat4 *prev_vp, uint16_t view_w,
+                                   uint16_t view_h, bool enable);
+
 /* The bgfx dynamic_vertex_buffer handle index of the compute-written visible
  * instance stream (mat4 per slot; byte-compatible with vs_pbr_inst i_data0..3).
  * UINT16_MAX before the first dispatch / when unsupported.  Pass to
@@ -177,6 +187,95 @@ JCE_API bool jce_gpu_scene_is_indirect(const JceGpuScene *gs);
  * bgfx_submit_indirect(view, prog, handle, run.indirect_el, 1, ...).  UINT16_MAX
  * when the indirect path is unavailable / before the first dispatch. */
 JCE_API uint16_t jce_gpu_scene_indirect_buffer(const JceGpuScene *gs);
+
+/* ── Foliage GPU-cull (千万 S2) ───────────────────────────────────────────
+ * GPU frustum-cull a foliage scatter's PERSISTENT roots VB (the S1 instance
+ * buffer: 4 vec4 = mat4 per instance) into a compacted visible buffer + a single
+ * drawIndexedIndirect arg, so the GPU rasterises only the in-frustum subset.
+ * Unlike jce_gpu_scene_dispatch (which reads the per-frame transient scene
+ * records), this reads the persistent roots buffer DIRECTLY and computes each
+ * instance's world-AABB on the GPU from the shared mesh's local AABB — no
+ * per-frame CPU work, no per-instance AABB storage.  The visible/counter/indirect
+ * buffers are OWNED by the caller (the foliage cache, one set per scatter) and
+ * passed in by handle index.  Dispatches reset (reset_view) → cull/compact →
+ * build-indirect (both cull_view).  Returns false when foliage cull is
+ * unavailable (caps/programs) or inputs are degenerate. */
+JCE_API bool jce_gpu_scene_foliage_supported(const JceGpuScene *gs);
+JCE_API bool jce_gpu_scene_foliage_dispatch(JceGpuScene *gs,
+                                            uint16_t reset_view, uint16_t cull_view,
+                                            uint16_t roots_vb, uint16_t visible_vb,
+                                            uint16_t counter_vb, uint16_t indirect_buf,
+                                            uint32_t inst_count, uint32_t capacity,
+                                            const jce_vec4 planes[6],
+                                            jce_vec3 local_center,
+                                            jce_vec3 local_extent,
+                                            uint32_t num_indices);
+
+/* 千万 S4 LOD-in-cull: run `band_count` distance-band cull passes over the same
+ * roots VB + Hi-Z pyramid, each keeping only instances whose camera distance is
+ * in [band_dmin[b], band_dmax[b]) and writing its own survivor/counter/indirect,
+ * so the caller issues one drawIndexedIndirect per band at that band's reduced
+ * LOD index buffer.  Arrays are indexed [0, band_count).  cam_pos feeds the
+ * per-instance distance.  Returns false on unsupported / bad handles. */
+/* 千万 S4/S5 banded LOD-in-cull, tile-aware.  begin resets the shared band
+ * counters (cross-view UAV barrier) + builds the Hi-Z pyramid once; each tile
+ * call culls + LOD-classifies one roots VB into the SHARED band partitions of
+ * `visible_vb` (atomics make cross-tile appends safe); end writes one
+ * drawIndexedIndirect element per band (startInstance = band * cap_band).
+ * A non-tiled scatter is begin + one tile + end.  fade_w > 0 enables the
+ * band-boundary cross-fade dual-write (千万 ②); far_dist > 0 culls beyond the
+ * draw distance (fading out over fade_w). */
+JCE_API bool jce_gpu_scene_foliage_lod_begin(JceGpuScene *gs, uint16_t reset_view,
+                                             uint16_t counter_vb,
+                                             uint32_t band_count,
+                                             bool *out_hiz_ready);
+JCE_API void jce_gpu_scene_foliage_lod_tile(JceGpuScene *gs, uint16_t cull_view,
+                                            uint16_t roots_vb, uint32_t inst_count,
+                                            uint16_t visible_vb, uint16_t counter_vb,
+                                            const jce_vec4 planes[6],
+                                            jce_vec3 local_center,
+                                            jce_vec3 local_extent,
+                                            jce_vec3 cam_pos, float far_dist,
+                                            float band_step, uint32_t band_count,
+                                            uint32_t cap_band, float fade_w,
+                                            bool hiz_ready);
+/* Nanite-lite V2: per-meshlet cluster cull for ONE hero mesh instance — one
+ * thread per meshlet transforms its bounding sphere/cone by the entity world
+ * matrix, frustum + cone-backface tests it, and writes drawIndexedIndirect
+ * element m (culled → zero-index degenerate).  No counters/atomics/reset; the
+ * caller then issues one bgfx_submit_indirect(view, prog, buf, 0, count) with
+ * the meshlet-grouped index buffer bound.  meshlet_vb = the static
+ * COMPUTE_READ records buffer from jce_skinned_mesh_set_meshlets (raw idx). */
+JCE_API bool jce_gpu_scene_meshlet_supported(const JceGpuScene *gs);
+/* V3.1: build the Hi-Z pyramid for this frame's meshlet cull dispatches
+ * (call once per color pass, before the first dispatch).  Returns readiness;
+ * pass it to every jce_gpu_scene_meshlet_dispatch as hiz_ready.
+ * JCE_MESHLET_HIZ=0 disables (meshlet path only; foliage unaffected). */
+JCE_API bool jce_gpu_scene_meshlet_hiz_prepare(JceGpuScene *gs, uint16_t view);
+JCE_API void jce_gpu_scene_meshlet_dispatch(JceGpuScene *gs, uint16_t cull_view,
+                                            uint16_t meshlet_vb, uint32_t count,
+                                            float max_scale,
+                                            const jce_mat4 *world,
+                                            const jce_vec4 planes[6],
+                                            jce_vec3 cam_pos,
+                                            /* V3 DAG cut: world error per
+                                             * unit distance; <= 0 = leaves */
+                                            float err_k,
+                                            /* V3.1: from meshlet_hiz_prepare
+                                             * (false = frustum/cone only)  */
+                                            bool hiz_ready,
+                                            /* V4: shadow-cascade cull — keep
+                                             * frustum, drop cone + Hi-Z (a
+                                             * light-backfacing cluster still
+                                             * casts).  planes = light VP.   */
+                                            bool shadow_mode,
+                                            uint16_t indirect_buf);
+
+JCE_API bool jce_gpu_scene_foliage_lod_end(JceGpuScene *gs, uint16_t cull_view,
+                                           uint16_t counter_vb,
+                                           uint16_t indirect_buf,
+                                           uint32_t band_count, uint32_t cap_band,
+                                           const uint32_t *band_num_indices);
 
 JCE_EXTERN_C_END
 

@@ -17,7 +17,9 @@
  */
 
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_alloc.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_project_state.h"
 #include "core/jce_assetdb.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h"
@@ -139,7 +141,8 @@ void partition_collect_cb(JceScene *s, JceEntity e, void *ud)
     if (c->count == c->cap) {
         uint32_t nc = c->cap ? c->cap * 2 : 256;
         JcePartitionEntity *nb =
-            (JcePartitionEntity *)realloc(c->ents, (size_t)nc * sizeof *nb);
+            (JcePartitionEntity *)ED_REALLOC(c->ents,
+                                              (size_t)nc * sizeof *nb);
         if (!nb) return;
         c->ents = nb; c->cap = nc;
     }
@@ -346,8 +349,8 @@ uint32_t bake_hlods(JceScene *scene, const JcePartitionEntity *ents, uint32_t en
 
             if (n == cap) {
                 uint32_t ncap = cap ? cap * 2 : 16;
-                void *ni = realloc(inputs, ncap * sizeof *inputs);
-                void *nm = realloc(mds,    ncap * sizeof *mds);
+                void *ni = ED_REALLOC(inputs, ncap * sizeof *inputs);
+                void *nm = ED_REALLOC(mds, ncap * sizeof *mds);
                 if (ni) inputs = (JceHlodMeshInput *)ni;     /* realloc may move */
                 if (nm) mds    = (JceModelCpuMeshData *)nm;
                 if (!ni || !nm) {   /* OOM: drop this mesh, bake what we have */
@@ -381,7 +384,7 @@ uint32_t bake_hlods(JceScene *scene, const JcePartitionEntity *ents, uint32_t en
             }
         }
         for (uint32_t i = 0; i < n; ++i) jce_model_importer_free_cpu(&mds[i]);
-        free(inputs); free(mds);
+        ED_FREE(inputs); ED_FREE(mds);
     }
     if (out_reused) *out_reused = reused;
     return baked + reused;
@@ -440,7 +443,7 @@ bool run_partition(JceScene *scene)
     JcePartitionResult res;
     bool ok = jce_world_partition_build(scene, col.ents, col.count, &cfg, &res);
     if (!ok) {
-        free(col.ents);
+        ED_FREE(col.ents);
         snprintf(s_part_status, sizeof s_part_status,
                  "Partition failed (too many cells? raise the cell size).");
         return false;
@@ -451,7 +454,7 @@ bool run_partition(JceScene *scene)
     uint32_t reused_hlods = 0;
     uint32_t hlods = bake_hlods(scene, col.ents, col.count, &cfg, &res, root_norm,
                                 &reused_hlods);
-    free(col.ents);
+    ED_FREE(col.ents);
 
     /* Ensure the fragment directory exists, then write fragments + master. */
     char chunks_dir[1400];
@@ -505,17 +508,46 @@ bool draw_partition_section(JceScene *scene)
         "as the master (residents + roster); streamed entities move into "
         "scenes/chunks/. Commit your work first so you can revert."));
 
-    ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.cellSize", "ws_pcell"), &s_part_cell_size, 1.0f,
+    /* One-time restore of the persisted partition params (per-project —
+     * re-partitioning after a restart must reproduce the same layout; the
+     * store is inert until a project root is known). */
+    static bool s_part_restored = false;
+    if (!s_part_restored && jce_editor_pstate_active()) {
+        s_part_restored = true;
+        s_part_cell_size     = jce_editor_pstate_get_float(
+                                   "stream.partition.cell_size", s_part_cell_size);
+        s_part_load_radius   = jce_editor_pstate_get_float(
+                                   "stream.partition.load_radius", s_part_load_radius);
+        s_part_unload_radius = jce_editor_pstate_get_float(
+                                   "stream.partition.unload_radius", s_part_unload_radius);
+        s_part_resident_max  = jce_editor_pstate_get_float(
+                                   "stream.partition.resident_max", s_part_resident_max);
+        if (s_part_cell_size < 8.0f) s_part_cell_size = 8.0f;
+        if (s_part_unload_radius < s_part_load_radius)
+            s_part_unload_radius = s_part_load_radius;
+    }
+
+    bool part_changed = false;
+    part_changed |= ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.cellSize", "ws_pcell"), &s_part_cell_size, 1.0f,
                      8.0f, 100000.0f, "cell %.0f m");
     if (s_part_cell_size < 8.0f) s_part_cell_size = 8.0f;
-    ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.loadRadius", "ws_pload"), &s_part_load_radius, 1.0f,
+    part_changed |= ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.loadRadius", "ws_pload"), &s_part_load_radius, 1.0f,
                      1.0f, 100000.0f, "load %.0f m");
-    ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.unloadRadius", "ws_punload"), &s_part_unload_radius, 1.0f,
+    part_changed |= ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.unloadRadius", "ws_punload"), &s_part_unload_radius, 1.0f,
                      1.0f, 100000.0f, "unload %.0f m");
     if (s_part_unload_radius < s_part_load_radius)
         s_part_unload_radius = s_part_load_radius;
-    ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.residentIfLarger", "ws_presmax"), &s_part_resident_max,
+    part_changed |= ImGui::DragFloat(jce_editor_i18n_id("panel.streaming.residentIfLarger", "ws_presmax"), &s_part_resident_max,
                      1.0f, 1.0f, 1000000.0f, "resident if > %.0f m");
+
+    /* Persist after the invariant fix-ups so the stored values match what
+     * the partitioner will actually use (writes are debounced). */
+    if (part_changed) {
+        jce_editor_pstate_set_float("stream.partition.cell_size",     s_part_cell_size);
+        jce_editor_pstate_set_float("stream.partition.load_radius",   s_part_load_radius);
+        jce_editor_pstate_set_float("stream.partition.unload_radius", s_part_unload_radius);
+        jce_editor_pstate_set_float("stream.partition.resident_max",  s_part_resident_max);
+    }
 
     if (ImGui::Button(jce_editor_i18n_id("panel.streaming.partitionWorld", "ws_part_run")))
         ImGui::OpenPopup("ws_partition_confirm");

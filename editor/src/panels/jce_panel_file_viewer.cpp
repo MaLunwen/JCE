@@ -10,6 +10,7 @@
 
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include "viewers/jce_fv_common.h"
 
@@ -74,6 +75,58 @@ static struct {
     bool  request_autoplay; /* one-shot: auto-play when re-selecting A/V tab */
 } s_fv;
 
+/* ── Per-project open-tab persistence ────────────────────────────────
+ * The list of open tab file paths is mirrored to the per-project state
+ * store ("fileviewer.tab.0".."fileviewer.tab.15"; an empty string
+ * terminates the list) on every open/close, and restored once on the
+ * first draw with a project open — files that no longer exist are
+ * silently skipped.  Inert while no project is open (pstate drops the
+ * writes). */
+static bool s_fv_restoring     = false; /* suppress focus/side-effects + re-saves */
+static bool s_fv_restored      = false; /* one-shot restore latch */
+static bool s_fv_shutting_down = false; /* don't wipe the saved list at exit */
+
+static void fv_open_internal(const char *path, bool force_text, int goto_line);
+
+static void fv_tabs_persist(void)
+{
+    if (s_fv_restoring || s_fv_shutting_down) return;
+    char key[32];
+    for (int i = 0; i < FV_MAX_TABS; i++) {
+        snprintf(key, sizeof(key), "fileviewer.tab.%d", i);
+        jce_editor_pstate_set_str(key, i < s_fv.tab_count ? s_fv.tabs[i].path
+                                                          : "");
+    }
+}
+
+static void fv_tabs_restore_once(void)
+{
+    if (s_fv_restored || !jce_editor_pstate_active()) return;
+    s_fv_restored = true;
+
+    /* Read the whole list first: re-opening tabs rewrites the keys. */
+    static char paths[FV_MAX_TABS][512];
+    int  count = 0;
+    char key[32];
+    for (int i = 0; i < FV_MAX_TABS; i++) {
+        snprintf(key, sizeof(key), "fileviewer.tab.%d", i);
+        if (!jce_editor_pstate_get_str(key, paths[count], sizeof(paths[count]))
+            || !paths[count][0])
+            break;   /* empty string terminates the list */
+        count++;
+    }
+    if (count == 0) return;
+
+    s_fv_restoring = true;
+    for (int i = 0; i < count && s_fv.tab_count < FV_MAX_TABS; i++) {
+        if (!jce_fs_host_exists_file(paths[i])) continue;  /* silently skip */
+        fv_open_internal(paths[i], false, 0);
+    }
+    s_fv_restoring = false;
+    s_fv.want_focus = false;   /* restore must never steal focus */
+    fv_tabs_persist();         /* re-sync after skipping stale entries */
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  *  INTERNAL HELPERS
  * ══════════════════════════════════════════════════════════════════════ */
@@ -106,6 +159,8 @@ static void fv_close_tab(int idx)
 
     if (s_fv.active_tab >= s_fv.tab_count)
         s_fv.active_tab = s_fv.tab_count - 1;
+
+    fv_tabs_persist();
 }
 
 /* ── Type detection ──────────────────────────────────────────────── */
@@ -222,8 +277,11 @@ static void fv_open_info_tab(const char *open_path,
 
     s_fv.active_tab = s_fv.tab_count;
     s_fv.tab_count++;
-    s_fv.want_focus = true;
-    *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+    fv_tabs_persist();
+    if (!s_fv_restoring) {
+        s_fv.want_focus = true;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -244,7 +302,10 @@ JceFileViewerType jce_file_viewer_detect_type(const char *path)
     return fv_detect_ext(ext);
 }
 
-void jce_file_viewer_open(const char *path)
+/* Shared open path.  `force_text` pins the tab to the plain-text code
+ * viewer (no specialized-viewer redirect, no scene side-load) — the
+ * "view the real JSON source" mode; `goto_line` > 0 jumps there. */
+static void fv_open_internal(const char *path, bool force_text, int goto_line)
 {
     if (!path || !path[0]) return;
 
@@ -252,8 +313,9 @@ void jce_file_viewer_open(const char *path)
     const char *open_path = normalized.empty() ? path : normalized.c_str();
 
     /* .matgraph.json belongs to the Material Graph panel, not a
-     * generic preview tab. */
-    {
+     * generic preview tab (unless the raw text was asked for).  Skipped
+     * during tab restore: it would pop a different panel at startup. */
+    if (!force_text && !s_fv_restoring) {
         const size_t pn = std::strlen(open_path);
         const char  *suf = ".matgraph.json";
         const size_t sn = std::strlen(suf);
@@ -276,12 +338,33 @@ void jce_file_viewer_open(const char *path)
         std::string tab_norm = normalize_path_string(s_fv.tabs[i].path);
         const char *tab_path = tab_norm.empty() ? s_fv.tabs[i].path : tab_norm.c_str();
         if (strcmp(tab_path, open_path) == 0) {
+            FvTab *tab = &s_fv.tabs[i];
             s_fv.select_tab_req = i;
             s_fv.want_focus = true;
             s_fv.request_autoplay = true;
             *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
-            if (is_scene_file_path(open_path))
+            if (force_text) {
+                /* Refresh from disk so a just-saved file shows its latest
+                 * text, then arm the jump.  Never side-load the scene. */
+                size_t got = 0, total = 0;
+                char *buf = (char *)ed_read_file_capped(open_path, FV_MAX_CONTENT,
+                                                        &got, &total);
+                if (buf) {
+                    ED_FREE(tab->content);
+                    tab->content     = buf;
+                    tab->content_len = (int)got;
+                    tab->file_size   = (long)total;
+                    fv_code_invalidate_index(tab);
+                    if (tab->edit_buf) { ED_FREE(tab->edit_buf); tab->edit_buf = NULL; }
+                    tab->edit_mode = false;
+                    tab->modified  = false;
+                }
+                tab->goto_line           = goto_line;
+                tab->goto_flash          = (goto_line > 0) ? 2.5f : 0.0f;
+                tab->goto_scroll_pending = (goto_line > 0);
+            } else if (!s_fv_restoring && is_scene_file_path(open_path)) {
                 jce_state_load_scene_file(open_path);
+            }
             return;
         }
     }
@@ -339,6 +422,8 @@ void jce_file_viewer_open(const char *path)
     }
 
     JceFileViewerType ftype = fv_detect_ext(ext);
+    if (force_text)
+        ftype = JCE_FV_TEXT;   /* raw source view: text cap + code renderer */
 
     int read_size;
     if (ftype == JCE_FV_IMAGE)
@@ -376,8 +461,9 @@ void jce_file_viewer_open(const char *path)
     }
     int actually_read = (int)got;
 
-    /* Refine type detection. */
-    if (ftype == JCE_FV_TEXT) {
+    /* Refine type detection (skipped in force_text mode: the caller asked
+     * for the raw source, not a specialized viewer). */
+    if (ftype == JCE_FV_TEXT && !force_text) {
         std::string lower_path(open_path);
         for (char &ch : lower_path)
             ch = (char)tolower((unsigned char)ch);
@@ -517,16 +603,39 @@ void jce_file_viewer_open(const char *path)
         }
     }
 
+    /* Arm the jump-to-line (raw-source mode). */
+    if (goto_line > 0) {
+        tab->goto_line           = goto_line;
+        tab->goto_flash          = 2.5f;
+        tab->goto_scroll_pending = true;
+    }
+
     s_fv.active_tab = s_fv.tab_count;
     s_fv.tab_count++;
-    s_fv.want_focus = true;
+    fv_tabs_persist();
 
-    *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+    /* Focus, panel raise and scene side-load are user-open behaviours;
+     * a startup tab restore must stay silent. */
+    if (!s_fv_restoring) {
+        s_fv.want_focus = true;
 
-    if (ftype == JCE_FV_SCENE)
-        jce_state_load_scene_file(open_path);
+        *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+
+        if (ftype == JCE_FV_SCENE && !force_text)
+            jce_state_load_scene_file(open_path);
+    }
 
     LOG_INFO(LOG_TAG, "opened '%s' (type %d)", name, (int)ftype);
+}
+
+void jce_file_viewer_open(const char *path)
+{
+    fv_open_internal(path, false, 0);
+}
+
+void jce_file_viewer_open_text_at(const char *path, int line)
+{
+    fv_open_internal(path, true, line);
 }
 
 void jce_file_viewer_request_focus(void)
@@ -538,6 +647,8 @@ void jce_file_viewer_draw_content(void)
 {
     const char *active_audio_path = NULL;
     const char *active_video_path = NULL;
+
+    fv_tabs_restore_once();   /* first draw with a project open */
 
     if (s_fv.want_focus) {
         ImGui::SetWindowFocus();
@@ -751,10 +862,12 @@ void jce_file_viewer_close_all(void)
     s_fv.tab_count      = 0;
     s_fv.active_tab     = -1;
     s_fv.select_tab_req = -1;
+    fv_tabs_persist();   /* no-op during shutdown (keep the saved list) */
 }
 
 void jce_file_viewer_shutdown(void)
 {
+    s_fv_shutting_down = true;   /* exit closes tabs; don't wipe persistence */
     jce_file_viewer_close_all();
     fv_model_shutdown();
 }

@@ -36,16 +36,23 @@ extern "C" {
 
 #include <string>
 #include <cstdlib>   /* getenv/atof for streaming bench toggles (M2) */
+#include <limits>
 
 /* ── Play mode: runtime-driven ───────────────────────────────────── */
 
 #include <jce/application/jce_runtime.h>
+
+/* Open-project root — owned by dialog_project.cpp (explicit-root pattern,
+ * see jce_project_settings.cpp). */
+extern char s_current_project_root[512];
 
 static EditorHistorySnapshot s_play_snapshot;
 static bool                  s_play_snapshot_valid = false;
 
 static JceRuntime *s_play_runtime = NULL;
 static JceAudio   *s_play_audio   = NULL;   /* owned alongside the runtime */
+static bool        s_play_resync_clock = false;
+static float       s_play_resync_dt = 1.0f / 60.0f;
 
 /* World streaming for editor Play.  The runtime itself never ticks a streamer
  * (engine gap — jce_runtime_step has no streaming), so the Play harness owns
@@ -84,6 +91,13 @@ static bool editor_play_resolve_path(void * /*ud*/, const char *in,
                                      char *out, int out_size)
 {
     if (!in || !in[0] || !out || out_size <= 0) return false;
+    JceFileSystem *active_fs = jce_fs_get_active();
+    if (active_fs &&
+        jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED) {
+        if (!jce_fs_exists(active_fs, in)) return false;
+        snprintf(out, (size_t)out_size, "%s", in);
+        return true;
+    }
     if (jce_editor_scene_asset_cache_resolve_mesh_path(in, out, out_size))
         return true;
     return jce_editor_resolve_asset_path(in, out, out_size);
@@ -94,10 +108,30 @@ static uint32_t editor_play_audio_load(void * /*ud*/, JceAudio *audio,
 {
     if (!audio || !clip_path || !clip_path[0]) return JCE_SOUND_INVALID;
 
+    JceFileSystem *active_fs = jce_fs_get_active();
+    if (active_fs) {
+        uint64_t size = 0;
+        void *data = jce_fs_read_all(active_fs, clip_path, &size);
+        if (data && size > 0 &&
+            size <= (uint64_t)std::numeric_limits<uint32_t>::max()) {
+            JceSound sound = jce_audio_load_memory(
+                audio, data, (uint32_t)size, clip_path);
+            jce_fs_buffer_free(data);
+            return sound;
+        }
+        if (data) jce_fs_buffer_free(data);
+
+        if (jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED) {
+            LOG_WARN(LOG_TAG,
+                "bundle preview missing audio dependency '%s'", clip_path);
+            return JCE_SOUND_INVALID;
+        }
+    }
+
     char candidates[8][1024];
     int  cand_n = 0;
 
-    /* VFS first (mounted bundle vpath). */
+    /* Direct host path first; an active overlay VFS was already attempted. */
     snprintf(candidates[cand_n++], sizeof(candidates[0]), "%s", clip_path);
 
     const char *project_root = jce_assetdb_get_root();
@@ -130,17 +164,23 @@ static uint32_t editor_play_audio_load(void * /*ud*/, JceAudio *audio,
     for (int i = 0; i < cand_n; ++i) {
         data = jce_fs_host_read_all(candidates[i], &fsize);
         if (data && fsize > 0) break;
-        if (data) { jce_free(data); data = NULL; fsize = 0; }
+        if (data) { jce_fs_buffer_free(data); data = NULL; fsize = 0; }
     }
     if (!data || fsize == 0) {
         LOG_WARN(LOG_TAG, "play audio: could not read '%s' (tried %d roots)",
                  clip_path, cand_n);
-        if (data) jce_free(data);
+        if (data) jce_fs_buffer_free(data);
+        return JCE_SOUND_INVALID;
+    }
+
+    if (fsize > (uint64_t)std::numeric_limits<uint32_t>::max()) {
+        LOG_WARN(LOG_TAG, "play audio: file too large '%s'", clip_path);
+        jce_fs_buffer_free(data);
         return JCE_SOUND_INVALID;
     }
 
     JceSound snd = jce_audio_load_memory(audio, data, (uint32_t)fsize, clip_path);
-    jce_free(data);
+    jce_fs_buffer_free(data);
     return snd;
 }
 
@@ -418,11 +458,19 @@ void jce_state_play(void)
         rd.gravity_y      = ps->physics.gravity[1];
     }
     /* Seed the runtime mixer from the same audio_mixer.json the Audio Mixer
-     * panel writes (~/.jce), so Music/SFX/Voice slider edits drive Play-mode
-     * bus volumes.  Missing file => runtime falls back to default buses. */
+     * panel writes (<root>/Settings/, project-scoped), so Music/SFX/Voice
+     * slider edits drive Play-mode bus volumes.  Sessions that predate the
+     * panel's one-time migration still read the legacy per-user ~/.jce copy.
+     * Missing file => runtime falls back to default buses. */
     static char s_mixer_cfg[1024];
-    if (jce_editor_dotjce_path("audio_mixer.json", s_mixer_cfg,
-                               sizeof(s_mixer_cfg)))
+    s_mixer_cfg[0] = '\0';
+    if (s_current_project_root[0])
+        snprintf(s_mixer_cfg, sizeof(s_mixer_cfg),
+                 "%s/Settings/audio_mixer.json", s_current_project_root);
+    if (!s_mixer_cfg[0] || !jce_fs_host_exists_file(s_mixer_cfg))
+        jce_editor_dotjce_path("audio_mixer.json", s_mixer_cfg,
+                               sizeof(s_mixer_cfg));
+    if (s_mixer_cfg[0])
         rd.mixer_config_path = s_mixer_cfg;
     /* Navmesh: hand the runtime the .navmesh.bin baked by the NavMesh panel
      * as a sibling of the current scene (same basename, .navmesh.bin).  The
@@ -461,6 +509,14 @@ void jce_state_play(void)
         if (s_play_audio) { jce_audio_destroy(s_play_audio); s_play_audio = NULL; }
         return;
     }
+
+    /* Runtime construction performs synchronous scene/script/resource setup.
+     * That wall-clock delay is not simulation time: consume one authored fixed
+     * tick on the first Play frame, then resume normal host dt sampling. */
+    s_play_resync_clock = true;
+    s_play_resync_dt = rd.fixed_timestep > 0.0f
+                           ? rd.fixed_timestep
+                           : (1.0f / 60.0f);
 
     /* Subscribe to contact events so the Physics Debugger can show live
      * active-contact counts (also activates engine manifold diffing). */
@@ -541,6 +597,7 @@ void jce_state_stop(void)
     if (s_play_runtime) { jce_runtime_destroy(s_play_runtime); s_play_runtime = NULL; }
     if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
     s_active_contacts = 0;
+    s_play_resync_clock = false;
 
     if (s_play_snapshot_valid) {
         history_restore_snapshot(s_play_snapshot, "play-stop-restore");
@@ -585,6 +642,10 @@ void jce_state_play_mode_tick(float dt)
 {
     if (s.play_state != JCE_PLAY_PLAYING) return;
     if (s_play_runtime) {
+        if (s_play_resync_clock) {
+            dt = s_play_resync_dt;
+            s_play_resync_clock = false;
+        }
         jce_runtime_step(s_play_runtime, dt);
         jce_state_prune_dead();   /* drop runtime-destroyed entities (jce.destroy)
                                    * so the hierarchy never touches a dead handle */
@@ -608,6 +669,19 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
     in.attack_pressed = attack;
     in.speed_mult     = 1.0f;   /* sprint scaling is authored on the component */
     jce_runtime_set_input(s_play_runtime, &in);
+}
+
+void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
+                                       unsigned int buttons)
+{
+    if (!s_play_runtime) return;
+    jce_runtime_set_pointer_input(s_play_runtime, dx, dy, wheel, buttons);
+}
+
+void jce_editor_play_set_touch_input(const JceRuntimeTouch *touches, int count)
+{
+    if (!s_play_runtime) return;
+    jce_runtime_set_touch_input(s_play_runtime, touches, count);
 }
 
 /* Top 6: bind the live editor action map so editor-Play scripts can query

@@ -58,6 +58,10 @@ struct TextureCacheEntry {
     /* See MeshCacheEntry::path comment — same truncation issue applies
      * to texture cache keys (resolved absolute paths can be long). */
     char           path[512];
+    /* FNV-1a of path, compared before strcmp: keys are resolved absolute
+     * paths sharing long directory prefixes, and the linear scan runs
+     * hundreds of times per frame from sr_resolve_texture. */
+    uint32_t       path_hash;
     JceTexture     tex;
     JceAssetHandle asset_handle;
     bool           tex_from_asset_manager;

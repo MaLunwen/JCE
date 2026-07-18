@@ -466,7 +466,7 @@ const JceArchiveResource *jce_archive_loader_acquire(JceArchiveLoader *loader,
                                                      const char *path)
 {
     if (!loader || !path) return NULL;
-    uint64_t hash = jce_archive_hash_path(path);
+    uint64_t hash = jce_archive_path_id(loader->archive, path);
     if (hash == 0) return NULL;
     return jce_archive_loader_acquire_hash(loader, hash);
 }
@@ -486,7 +486,7 @@ void jce_archive_loader_release(JceArchiveLoader *loader, const JceArchiveResour
 JceArchiveRequestId jce_archive_loader_request(JceArchiveLoader *loader, const char *path)
 {
     if (!loader || !path) return 0;
-    uint64_t hash = jce_archive_hash_path(path);
+    uint64_t hash = jce_archive_path_id(loader->archive, path);
     if (hash == 0) return 0;
 
     jce_mutex_lock(loader->lock);
@@ -600,7 +600,7 @@ void jce_archive_loader_tick(JceArchiveLoader *loader)
 void jce_archive_loader_preload(JceArchiveLoader *loader, const char *path)
 {
     if (!loader || !path) return;
-    uint64_t hash = jce_archive_hash_path(path);
+    uint64_t hash = jce_archive_path_id(loader->archive, path);
     if (hash == 0) return;
 
     jce_mutex_lock(loader->lock);

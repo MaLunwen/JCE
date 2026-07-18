@@ -28,6 +28,13 @@ void jce_editor_apply_theme(int theme_idx);
 /* Get current theme index. */
 int  jce_editor_get_theme(void);
 
+/* Parse a persisted theme string into a JCE_THEME_* index.
+   Case-insensitive; accepts "Dark", "Light", "Blue" (and the legacy
+   alias "SSMS" for Blue).  Unknown/empty strings map to JCE_THEME_DARK.
+   Single canonical parser — boot restore and the Preferences panel must
+   both use this so the accepted spellings can never drift apart. */
+int  jce_editor_theme_from_string(const char *s);
+
 /* Load fonts and set the default. Resolution priority for each font:
      1. user override path (if non-NULL and file exists)
      2. system font (e.g. Ink Free / KaiTi installed on the host OS)
@@ -69,6 +76,17 @@ void jce_editor_apply_pending_font_reload(void);
    scale proxy via style.FontScaleMain while dragging (avoids an atlas
    re-bake every frame). */
 float jce_editor_get_baked_font_size(void);
+
+/* Make the language picker's native names renderable in EVERY session.
+   The Korean (Hangul) and Cyrillic font passes are locale-gated (memory
+   charter: the ~13.5MB Korean font stays out of non-ko sessions), so
+   "한국어" / "Русский" / "Українська" rendered as "?" in the picker under
+   other locales.  Call this when the UI is about to SHOW the picker
+   (Preferences > Appearance): the first call latches a flag that lifts
+   the locale gates and requests one deferred atlas rebuild; later calls
+   are no-ops.  The cost is paid only by sessions that actually open the
+   language settings. */
+void jce_editor_style_ensure_locale_picker_glyphs(void);
 
 #ifdef __cplusplus
 }

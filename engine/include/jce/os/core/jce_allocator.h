@@ -113,6 +113,40 @@ typedef struct JceMemStats {
  * Always populates `*out`; returns false only if `out` is NULL. */
 JCE_API bool jce_mem_stats(JceMemStats *out);
 
+/* Low-memory allocator mode (512MB charter baseline): makes the allocator
+ * purge freed memory back to the OS immediately instead of on its default
+ * lazy schedule.  The default (off) favors allocation throughput on strong
+ * machines.  Call once at startup (idempotent, cheap). */
+JCE_API void jce_alloc_low_mem_mode(bool on);
+
+/* Return freed-but-retained allocator memory to the OS.  The allocator's
+ * purge is OPPORTUNISTIC — it only runs during allocation activity, so an
+ * idle process retains its startup-peak commit forever (measured: a ~1.3GB
+ * startup transient stayed committed at editor idle).  Call periodically
+ * from a slow tick (every ~10-30s); `aggressive` forces a full collection
+ * (low-memory machines), otherwise a cheap incremental one. */
+JCE_API void jce_alloc_trim(bool aggressive);
+
+/* Third-party allocator bridge — routes a library's heap into THIS allocator
+ * so its memory becomes visible to jce_mem_stats and reclaimable by
+ * jce_alloc_trim (attribution: the editor's CRT/NT-heap block — bgfx + SDL +
+ * ImGui + stb — is several hundred MB and sits outside the managed heap
+ * otherwise).  Escape hatch for all hook consumers: JCE_NO_ALLOC_HOOKS=1. */
+
+/* realloc with alignment, full malloc contract: ptr NULL => alloc, size 0 =>
+ * free (returns NULL).  align <= sizeof(void*) uses the plain path.  Freeing
+ * any pointer from this allocator with jce_free_raw is always valid. */
+JCE_API void *jce_realloc_aligned(void *ptr, size_t size, size_t align);
+
+/* Free any pointer allocated by this allocator (plain or aligned). */
+JCE_API void  jce_free_raw(void *ptr);
+
+/* Route SDL's allocations through this allocator.  Must be called BEFORE any
+ * SDL allocation: it refuses (returns false) when SDL reports outstanding
+ * allocations, since memory allocated by the previous functions would then be
+ * freed by ours (undefined behavior).  Returns true when installed. */
+JCE_API bool jce_alloc_hook_sdl(void);
+
 /* ================================================================== */
 /* Debug allocation tracking (engine-side leak hunting)                */
 /* ================================================================== */
@@ -152,6 +186,13 @@ JCE_API bool jce_alloc_track_snapshot(JceAllocTrack *out);
 /* Print the snapshot (totals + the largest size buckets) to stderr.
  * No-op when tracking is compiled out. */
 JCE_API void jce_alloc_track_dump(void);
+
+/* Always-on (release-included) per-frame allocation counter.  Writes the number
+ * of allocations and bytes requested SINCE THE LAST CALL into *out_allocs /
+ * *out_bytes (either may be NULL).  Cheap (two native-word reads + writes); used
+ * by the JCE_PERF_LOG emit to surface allocs/frame so per-frame heap churn is
+ * measurable in a profiling build (rank-9). */
+JCE_API void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes);
 
 JCE_EXTERN_C_END
 

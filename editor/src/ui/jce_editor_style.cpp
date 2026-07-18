@@ -8,6 +8,7 @@
 
 #include "jce_editor_colors.h"
 #include "core/jce_editor_alloc.h"
+#include "core/jce_editor_config.h" /* boot-locale fallback (fonts build pre-i18n) */
 #include "core/jce_editor_i18n.h"   /* active locale → bake only its glyphs */
 #include <jce/ui/jce_imgui_renderer.h>
 
@@ -250,6 +251,15 @@ void jce_editor_apply_theme(int theme_idx)
 int jce_editor_get_theme(void)
 {
     return s_current_theme;
+}
+
+int jce_editor_theme_from_string(const char *s)
+{
+    if (!s || !*s) return JCE_THEME_DARK;
+    if (jce_strcasecmp(s, "Light") == 0) return JCE_THEME_LIGHT;
+    if (jce_strcasecmp(s, "Blue")  == 0 ||
+        jce_strcasecmp(s, "SSMS")  == 0) return JCE_THEME_SSMS;
+    return JCE_THEME_DARK;
 }
 
 /* ── Font loading ──────────────────────────────────────────────────── */
@@ -582,6 +592,13 @@ static ImFont *load_font_with_fallback(
     return NULL;
 }
 
+/* Latched by jce_editor_style_ensure_locale_picker_glyphs(): lifts the
+ * locale gates on the Korean + Cyrillic merge passes so the language
+ * picker's native names ("한국어", "Русский", "Українська") render under
+ * ANY locale.  Off by default — a session that never opens the language
+ * settings keeps the memory-charter savings. */
+static bool s_ext_locale_glyphs = false;
+
 bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
                            const char *en_override, const char *zh_override)
 {
@@ -689,7 +706,22 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        change (the function is called again from Project Settings → Save), so
        switching to zh/ko/ja rebuilds the atlas with that language's glyphs. */
     const char *active_loc = jce_editor_i18n_locale_code(jce_editor_i18n_get_locale());
-    const bool loc_is_ko = active_loc && strcmp(active_loc, "ko") == 0;
+    /* Startup ordering: fonts build BEFORE jce_editor_i18n_init
+     * (jce_editor.cpp — load_fonts at init, i18n right after), so at boot the
+     * i18n locale still reads as the default ("en") regardless of the saved
+     * language.  Fall back to the editor config's language field — the source
+     * the i18n init itself will apply moments later — so the locale-gated
+     * font passes (Korean file load below, Cyrillic merge) see the TRUE boot
+     * locale.  static: the config struct is >10KB (recent-file arrays) and
+     * active_loc points into it for the rest of this function; the font
+     * builder is main-thread, non-reentrant. */
+    static JceEditorConfig s_boot_cfg;
+    if (!active_loc || strcmp(active_loc, "en") == 0) {
+        if (jce_editor_config_load(&s_boot_cfg) && s_boot_cfg.language[0])
+            active_loc = s_boot_cfg.language;
+    }
+    const bool loc_is_ko = (active_loc && strcmp(active_loc, "ko") == 0)
+                        || s_ext_locale_glyphs;
 
     ImFontGlyphRangesBuilder cjk_builder;
     /* Chinese-common stays unconditional (covers user-typed Han in scene/asset
@@ -809,8 +841,15 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         "NanumGothic",
         "NanumMyeongjo",
         NULL };
-    bool ko_ok = false;
-    {   /* Linux: fontconfig Korean system font first (native lookup). */
+    /* Locale gate (512MB charter): the Korean font FILE is held resident by
+     * the atlas whole (FontDataOwnedByAtlas — malgun.ttf is 13.5MB on this
+     * machine), so only load it when the UI locale is actually Korean —
+     * mirroring the Cyrillic pass below, which has always been locale-gated.
+     * Switching the locale re-runs this function (Project Settings → Save),
+     * so picking Korean loads the font then.  Hangul typed into scene/asset
+     * names under a non-ko locale falls back like Cyrillic does. */
+    bool ko_ok = !loc_is_ko;
+    if (loc_is_ko) {   /* Linux: fontconfig Korean system font first. */
         char fcpath[1024];
         if (linux_fc_match(":lang=ko", fcpath, sizeof(fcpath))) {
             ImFont *kf = load_font_with_fallback(
@@ -835,8 +874,9 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        system sans on macOS; fontconfig :lang=ru on Linux). The merged CJK
        font frequently carries Cyrillic too, but make it explicit rather
        than rely on whichever CJK fallback won above. */
-    const bool loc_is_cyrillic = active_loc &&
-        (strcmp(active_loc, "ru") == 0 || strcmp(active_loc, "uk") == 0);
+    const bool loc_is_cyrillic = (active_loc &&
+        (strcmp(active_loc, "ru") == 0 || strcmp(active_loc, "uk") == 0))
+        || s_ext_locale_glyphs;
     if (loc_is_cyrillic) {
         static const ImWchar cyrillic_ranges[] = {
             0x0400, 0x04FF,   /* Cyrillic */
@@ -1129,4 +1169,21 @@ extern "C" void jce_editor_apply_pending_font_reload(void)
     jce_editor_load_fonts(NULL, g_pending.size,
                           g_pending.en[0] ? g_pending.en : NULL,
                           g_pending.zh[0] ? g_pending.zh : NULL);
+}
+
+extern "C" void jce_editor_style_ensure_locale_picker_glyphs(void)
+{
+    if (s_ext_locale_glyphs)
+        return;
+    s_ext_locale_glyphs = true;
+    /* One deferred rebuild with the gates lifted (same proven path as the
+     * font-size slider).  Font overrides come from the config singleton so
+     * the rebuild keeps the user's chosen font files. */
+    JceEditorConfig cfg;
+    jce_editor_config_load(&cfg);
+    float sz = jce_editor_get_baked_font_size();
+    if (sz <= 0.0f) sz = (float)cfg.font_size;
+    jce_editor_request_font_reload(sz, cfg.font_en_path, cfg.font_zh_path);
+    LOG_INFO(LOG_TAG, "locale-picker glyphs requested (Korean + Cyrillic "
+                      "merge passes enabled for this session)");
 }

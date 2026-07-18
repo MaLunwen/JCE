@@ -30,7 +30,8 @@ extern const size_t        assets_pak_data_size;
  * jce_generated/jce_pak_key.c, the SDK helper's zeroed stub, or the
  * engine's own zeroed default TU (jce_pak_key_default.c) — exe-level
  * objects override the library default by normal static-link resolution.
- * This is keyed obfuscation, not secrecy: the key ships with the game. */
+ * The archive is authenticated and anonymously indexed, but this is not
+ * secrecy against a determined local attacker: the key ships with the game. */
 extern const unsigned char jce_embedded_pak_key_shares[64];
 extern const int           jce_embedded_pak_key_present;
 

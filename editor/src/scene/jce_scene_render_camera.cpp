@@ -3,6 +3,7 @@
  */
 
 #include "jce_scene_render_internal.h"
+#include "core/jce_editor_project_state.h"
 
 #include <cstdlib>   /* getenv/atof — headless vista camera env overrides */
 
@@ -18,6 +19,33 @@
 #define ORBIT_FOCUS_BOUNDS_EPS    0.001f
 
 /* ── Internal: recompute camera position from orbit state ─────────── */
+
+/* Persist the orbit pose under the current scene's per-scene state so
+ * re-opening the scene lands where the user left off.  Gated on an
+ * actual value change: the store's writes are debounced/cheap, but
+ * skipping no-ops keeps static frames from dirtying the state file. */
+static void orbit_persist_pose(void)
+{
+    const char *scene = jce_state_get_current_scene_path();
+    if (!scene || !scene[0]) return;
+
+    static float s_last[6] = { 0 };
+    static bool  s_last_valid = false;
+    const float cur[6] = {
+        s_sr.orbit_target.x, s_sr.orbit_target.y, s_sr.orbit_target.z,
+        s_sr.orbit_yaw, s_sr.orbit_pitch, s_sr.orbit_distance,
+    };
+    if (s_last_valid && memcmp(cur, s_last, sizeof(cur)) == 0) return;
+    memcpy(s_last, cur, sizeof(s_last));
+    s_last_valid = true;
+
+    jce_editor_pstate_scene_set_float(scene, "cam.tx",    cur[0]);
+    jce_editor_pstate_scene_set_float(scene, "cam.ty",    cur[1]);
+    jce_editor_pstate_scene_set_float(scene, "cam.tz",    cur[2]);
+    jce_editor_pstate_scene_set_float(scene, "cam.yaw",   cur[3]);
+    jce_editor_pstate_scene_set_float(scene, "cam.pitch", cur[4]);
+    jce_editor_pstate_scene_set_float(scene, "cam.dist",  cur[5]);
+}
 
 void orbit_apply(void)
 {
@@ -44,6 +72,12 @@ void orbit_apply(void)
     float far_clip_target = d * 100.0f;
     if (far_clip_target < 100.0f)    far_clip_target = 100.0f;
     if (far_clip_target > 100000.0f) far_clip_target = 100000.0f;
+    /* JCE_DBG_VISTA_FAR: headless override of the far clip — lets a stress test
+     * narrow the frustum so most of a huge instance field falls OFF-screen (the
+     * default vista far = d*100 sees everything → no GPU cull benefit to measure). */
+    { static float s_far = -2.0f;
+      if (s_far < -1.0f) { const char *e = getenv("JCE_DBG_VISTA_FAR"); s_far = e ? (float)atof(e) : -1.0f; }
+      if (s_far > 0.0f) far_clip_target = s_far; }
 
     if (!s_sr.orbit_clip_valid) {
         s_sr.orbit_near_cached = near_clip_target;
@@ -70,6 +104,10 @@ void orbit_apply(void)
     jce_camera_set_near_far(s_sr.camera,
                             s_sr.orbit_near_cached,
                             s_sr.orbit_far_cached);
+
+    /* Every pose change funnels through here, so this is the one save
+     * seam needed for per-scene camera persistence. */
+    orbit_persist_pose();
 }
 
 static void orbit_cancel_focus_anim(void)
@@ -79,6 +117,24 @@ static void orbit_cancel_focus_anim(void)
 
 void jce_editor_scene_camera_update(float dt_sec)
 {
+    /* JCE_DBG_VISTA_SPIN=<deg/frame>: slowly orbit the fixed headless vista so an
+     * A/B can stress the Hi-Z occlusion cull's 1-frame latency (it reads LAST
+     * frame's depth) under camera MOTION — a static vista can never reveal the
+     * occlusion-edge popping that latency risks.  Frame-count-deterministic (a
+     * fixed per-frame delta from the one-shot vista yaw), so frame N lands on the
+     * identical pose in the Hi-Z-on and Hi-Z-off runs → any diff is a cull delta,
+     * not a camera mismatch. */
+    {
+        static float s_spin = -999.0f;
+        if (s_spin < -900.0f) { const char *e = getenv("JCE_DBG_VISTA_SPIN");
+                                s_spin = e ? (float)atof(e) : 0.0f; }
+        if (s_spin != 0.0f && s_sr.initialized && s_sr.camera) {
+            s_sr.orbit_yaw += s_spin * JCE_DEG2RAD;
+            s_sr.camera_cache_valid = false;
+            s_sr.orbit_clip_valid   = false;
+            orbit_apply();
+        }
+    }
     if (!s_sr.initialized || !s_sr.camera || !s_sr.focus_anim.active) return;
 
     JceEditorSceneFocusSample sample =
@@ -289,6 +345,24 @@ void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
     orbit_apply();
 }
 
+bool jce_editor_scene_camera_restore_pose(const char *scene_path)
+{
+    if (!s_sr.initialized || !scene_path || !scene_path[0]) return false;
+    /* Distance doubles as the presence probe: a stored pose always has a
+     * positive distance, so the negative fallback means "no pose yet" —
+     * leave the default framing untouched. */
+    float dist = jce_editor_pstate_scene_get_float(scene_path, "cam.dist", -1.0f);
+    if (dist <= 0.0f) return false;
+    float target[3];
+    target[0]   = jce_editor_pstate_scene_get_float(scene_path, "cam.tx",    0.0f);
+    target[1]   = jce_editor_pstate_scene_get_float(scene_path, "cam.ty",    0.0f);
+    target[2]   = jce_editor_pstate_scene_get_float(scene_path, "cam.tz",    0.0f);
+    float yaw   = jce_editor_pstate_scene_get_float(scene_path, "cam.yaw",   0.0f);
+    float pitch = jce_editor_pstate_scene_get_float(scene_path, "cam.pitch", 0.0f);
+    jce_editor_scene_camera_set_state(target, yaw, pitch, dist);
+    return true;
+}
+
 void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 {
     if (!s_sr.initialized) return;
@@ -426,7 +500,12 @@ void jce_editor_scene_frame_vista(void)
     /* Fixed eye-level-ish vista for headless visual QA (JCE_DBG_VISTA): a few
      * metres above the meadow centre, looking across the grass toward the
      * backdrop + sky.  Set directly (no focus anim) so a one-shot capture is
-     * deterministic and comparable across tuning passes. */
+     * deterministic and comparable across tuning passes.  A focus animation armed
+     * on scene load would otherwise re-drive orbit_target/distance every frame via
+     * jce_editor_scene_camera_update — at a FRAME-RATE-DEPENDENT rate — so two runs
+     * of different speed (e.g. GPU-cull on vs off) land on DIFFERENT cameras at the
+     * same capture frame.  Cancel it so the vista truly stays put. */
+    orbit_cancel_focus_anim();
     s_sr.orbit_target   = jce_v3(0.0f, 10.0f, 0.0f);
     s_sr.orbit_pitch    = 3.0f * JCE_DEG2RAD;   /* near-horizontal: ground+horizon+sky */
     s_sr.orbit_yaw      = 0.4f;
@@ -440,7 +519,10 @@ void jce_editor_scene_frame_vista(void)
       if ((e = getenv("JCE_DBG_VISTA_TZ"))) s_sr.orbit_target.z = (float)atof(e);
       if ((e = getenv("JCE_DBG_VISTA_DIST")))  s_sr.orbit_distance = (float)atof(e);
       if ((e = getenv("JCE_DBG_VISTA_PITCH"))) s_sr.orbit_pitch = (float)atof(e) * JCE_DEG2RAD;
-      if ((e = getenv("JCE_DBG_VISTA_YAW")))   s_sr.orbit_yaw   = (float)atof(e) * JCE_DEG2RAD; }
+      if ((e = getenv("JCE_DBG_VISTA_YAW")))   s_sr.orbit_yaw   = (float)atof(e) * JCE_DEG2RAD;
+      /* JCE_DBG_VISTA_FOV: narrow the camera cone so a huge instance field falls
+       * mostly off-screen (verifies GPU frustum cull — see JCE_DBG_VISTA_FAR). */
+      if ((e = getenv("JCE_DBG_VISTA_FOV")))   jce_camera_set_fov(s_sr.camera, (float)atof(e)); }
     s_sr.focus_last_bounds_valid = false;
     s_sr.focus_zoom_step = 0;
     orbit_apply();

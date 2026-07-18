@@ -54,6 +54,16 @@ static const char *const kAssetKeys[] = {
      * The packer's descriptor recursion re-scans it for its "atlasPath" (a
      * recognised key above) so the baked atlas .png is pulled in too. */
     "impostorMetaPath",
+    /* Look-profile colour-grading LUT (rendering.look.lutPath): a strip PNG
+     * loaded from the PAK by jce_texture_load_lut_3d in the shipped runtime. */
+    "lutPath",         "lut_path",
+    /* Terrain/vegetation/water component textures & masks whose spellings are
+     * component-specific and not covered by the generic texture keys above:
+     *   FoliageCluster.alphaTex, Water.dataTex, VegetationScatter.densityMaskPath */
+    "alphaTex",        "dataTex",          "densityMaskPath",
+    /* SkeletalAnimator retarget SOURCE rig — a second model/skeleton loaded by
+     * path just like skeletonPath, so its GLB + .anim.json clips recurse in. */
+    "retargetSource",
     /* Nested-descriptor keys: .mat.json texture maps (primary keys +
      * loader-accepted aliases — see jce_pbr_material_load_json and the
      * editor's try_resolve_texture_from_material_json).  These appear
@@ -124,17 +134,25 @@ static int list_grow(JceBundleDepList *list)
     return 1;
 }
 
-static void list_push(JceBundleDepList *list, const char *path,
-                      const char *bundle_tag)
+static int list_push(JceBundleDepList *list, const char *path,
+                     const char *bundle_tag)
 {
-    if (!path || path[0] == '\0') return;
-    if (dep_has_path(list, path)) return;
-    if (list->count + 1 > list->capacity && !list_grow(list)) return;
+    if (!path || path[0] == '\0') return 1;
+    if (dep_has_path(list, path)) return 1;
+    if (list->count + 1 > list->capacity && !list_grow(list)) return 0;
+
+    char *path_copy = dup_str(path);
+    char *bundle_copy = dup_str(bundle_tag);
+    if (!path_copy || (bundle_tag && !bundle_copy)) {
+        if (path_copy) JCE_FREE(path_copy);
+        if (bundle_copy) JCE_FREE(bundle_copy);
+        return 0;
+    }
+    normalise_slashes(path_copy);
 
     JceBundleDep *d = &list->items[list->count++];
-    d->path   = dup_str(path);
-    d->bundle = dup_str(bundle_tag); /* may be NULL */
-    if (d->path) normalise_slashes(d->path);
+    d->path   = path_copy;
+    d->bundle = bundle_copy;
 
     /* Sidecar: a `.terrain.json` always pairs with a `.terrain.bin` that
      * the terrain loader reads via jce_fs_host_read_all.  Recurse once
@@ -150,10 +168,11 @@ static void list_push(JceBundleDepList *list, const char *path,
                 memcpy(sidecar, d->path, n - sn);
                 memcpy(sidecar + (n - sn), ".terrain.bin",
                        sizeof(".terrain.bin"));
-                list_push(list, sidecar, bundle_tag);
+                if (!list_push(list, sidecar, bundle_tag)) return 0;
             }
         }
     }
+    return 1;
 }
 
 void jce_bundle_deps_free(JceBundleDepList *list)
@@ -325,5 +344,127 @@ bool jce_bundle_deps_scan_file(const char *scene_path,
 
     bool ok = jce_bundle_deps_scan((const char *)vbuf, (size_t)sz, out_list);
     jce_fs_buffer_free(vbuf);
+    return ok;
+}
+
+static bool parse_dep_array(const cJSON *array, JceBundleDepList *out)
+{
+    if (!array) return true;
+    if (!cJSON_IsArray(array)) return false;
+
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, array) {
+        const char *path = NULL;
+        const char *bundle = NULL;
+        if (cJSON_IsString(item)) {
+            path = item->valuestring;
+        } else if (cJSON_IsObject(item)) {
+            const cJSON *path_json =
+                cJSON_GetObjectItemCaseSensitive(item, "path");
+            const cJSON *bundle_json =
+                cJSON_GetObjectItemCaseSensitive(item, "bundle");
+            if (!path_json || !cJSON_IsString(path_json)) return false;
+            path = path_json->valuestring;
+            if (bundle_json) {
+                if (!cJSON_IsString(bundle_json) ||
+                    !bundle_json->valuestring ||
+                    !bundle_json->valuestring[0])
+                    return false;
+                bundle = bundle_json->valuestring;
+            }
+        } else {
+            return false;
+        }
+        if (!path || !path[0] || !list_push(out, path, bundle)) return false;
+    }
+    return true;
+}
+
+static bool parse_labels(const cJSON *array,
+                         JceBundleDependencyDocument *out)
+{
+    if (!array) return true;
+    if (!cJSON_IsArray(array)) return false;
+
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, array) {
+        if (!cJSON_IsString(item) || !item->valuestring ||
+            !item->valuestring[0])
+            return false;
+
+        bool duplicate = false;
+        for (uint32_t i = 0; i < out->label_count; ++i) {
+            if (strcmp(out->labels[i], item->valuestring) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        char **grown = (char **)JCE_REALLOC(
+            out->labels, (out->label_count + 1u) * sizeof(*grown));
+        if (!grown) return false;
+        out->labels = grown;
+        out->labels[out->label_count] = dup_str(item->valuestring);
+        if (!out->labels[out->label_count]) return false;
+        ++out->label_count;
+    }
+    return true;
+}
+
+void jce_bundle_deps_document_free(JceBundleDependencyDocument *document)
+{
+    if (!document) return;
+    jce_bundle_deps_free(&document->assets);
+    jce_bundle_deps_free(&document->optional_assets);
+    for (uint32_t i = 0; i < document->label_count; ++i)
+        JCE_FREE(document->labels[i]);
+    JCE_FREE(document->labels);
+    document->labels = NULL;
+    document->label_count = 0;
+}
+
+bool jce_bundle_deps_parse_document(
+    const char *json, size_t json_len,
+    JceBundleDependencyDocument *out_document)
+{
+    if (!json || !out_document) return false;
+    memset(out_document, 0, sizeof(*out_document));
+    if (json_len == 0) json_len = strlen(json);
+
+    cJSON *root = cJSON_ParseWithLength(json, json_len);
+    if (!root || !cJSON_IsObject(root)) {
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+
+    const cJSON *contract =
+        cJSON_GetObjectItemCaseSensitive(root, JCE_BUNDLE_KEY_CONTRACT);
+    const cJSON *name = contract ? cJSON_GetObjectItemCaseSensitive(
+        contract, JCE_BUNDLE_KEY_CONTRACT_NAME) : NULL;
+    const cJSON *major = contract ? cJSON_GetObjectItemCaseSensitive(
+        contract, JCE_BUNDLE_KEY_CONTRACT_MAJOR) : NULL;
+    const cJSON *minor = contract ? cJSON_GetObjectItemCaseSensitive(
+        contract, JCE_BUNDLE_KEY_CONTRACT_MINOR) : NULL;
+
+    bool ok = cJSON_IsObject(contract) && cJSON_IsString(name) &&
+              name->valuestring &&
+              strcmp(name->valuestring, JCE_BUNDLE_DEPS_CONTRACT_NAME) == 0 &&
+              cJSON_IsNumber(major) &&
+              major->valuedouble == (double)JCE_BUNDLE_DEPS_CONTRACT_MAJOR &&
+              cJSON_IsNumber(minor) && minor->valuedouble >= 0.0 &&
+              minor->valuedouble == (double)minor->valueint;
+    if (ok) {
+        ok = parse_dep_array(cJSON_GetObjectItemCaseSensitive(root, "assets"),
+                             &out_document->assets) &&
+             parse_dep_array(cJSON_GetObjectItemCaseSensitive(
+                                 root, "optional_assets"),
+                             &out_document->optional_assets) &&
+             parse_labels(cJSON_GetObjectItemCaseSensitive(root, "labels"),
+                          out_document);
+    }
+
+    cJSON_Delete(root);
+    if (!ok) jce_bundle_deps_document_free(out_document);
     return ok;
 }

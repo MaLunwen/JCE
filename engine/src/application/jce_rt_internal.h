@@ -896,6 +896,9 @@ void        rt_update_audio_3d(JceRuntime *rt, float dt);
  * walk; rt_tick_music advances it each frame from the audio update path. */
 void        rt_spawn_music(JceRuntime *rt, JceScene *scene, JceEntity e);
 void        rt_tick_music(JceRuntime *rt, float dt);
+/* Canonical synchronous load path used by script one-shots and host-resolved
+ * editor clips.  Honors JceRuntimeDesc.audio_load_fn before the PAK fallback. */
+JceSound    rt_load_sound(JceRuntime *rt, const char *path);
 /* Pending async audio-source decode (own: jce_rt_audio.c).  rt_finish_audio_
  * source + rt_spawn_audio_async are called from the core scene-spawn walk;
  * rt_audio_poll is pumped from jce_runtime_step. */

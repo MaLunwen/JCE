@@ -146,23 +146,19 @@ bool jce_physics_layer_matrix_save_json(const char *vfs_path)
     return true;
 }
 
-bool jce_physics_layer_matrix_load_json(const char *vfs_path)
+/* Parse the layer collision matrix from an already-loaded JSON buffer.  The
+ * single-exe runtime uses this to read physics_layers.json straight from the
+ * embedded PAK (jce_pak_decompress bytes) when no loose cooked tree exists. */
+bool jce_physics_layer_matrix_load_json_mem(const char *json, size_t len)
 {
-    if (!vfs_path) return false;
+    if (!json) return false;
+    if (len == 0) len = strlen(json);
+    if (len > (1u << 20)) return false;
     layers_ensure_init();
 
-    uint64_t sz = 0;
-    char *buf = (char *)jce_fs_host_read_all(vfs_path, &sz);
-    if (!buf) return false;
-    if (sz == 0 || sz > (1u << 20)) {
-        JCE_FREE(buf);
-        return false;
-    }
-
-    JceJson *root = jce_json_parse(buf, (size_t)sz);
-    JCE_FREE(buf);
+    JceJson *root = jce_json_parse(json, len);
     if (!root) {
-        LOG_WARN(LOG_TAG, "invalid JSON in physics layers: %s", vfs_path);
+        LOG_WARN(LOG_TAG, "%s", "invalid JSON in physics layers (mem)");
         return false;
     }
 
@@ -190,6 +186,21 @@ bool jce_physics_layer_matrix_load_json(const char *vfs_path)
 
     jce_json_free(root);
     return true;
+}
+
+bool jce_physics_layer_matrix_load_json(const char *vfs_path)
+{
+    if (!vfs_path) return false;
+
+    uint64_t sz = 0;
+    char *buf = (char *)jce_fs_host_read_all(vfs_path, &sz);
+    if (!buf) return false;
+    if (sz == 0 || sz > (1u << 20)) { JCE_FREE(buf); return false; }
+
+    bool ok = jce_physics_layer_matrix_load_json_mem(buf, (size_t)sz);
+    if (!ok) LOG_WARN(LOG_TAG, "invalid JSON in physics layers: %s", vfs_path);
+    JCE_FREE(buf);
+    return ok;
 }
 
 /* ── Body integration ─────────────────────────────────────────────── */

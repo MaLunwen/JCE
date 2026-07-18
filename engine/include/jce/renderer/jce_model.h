@@ -24,6 +24,7 @@ JCE_EXTERN_C_BEGIN
 #ifndef JCE_MODEL_FWD_DECLARED
 #define JCE_MODEL_FWD_DECLARED
 typedef struct JceModel    JceModel;
+typedef struct JceMesh     JceMesh;             /* opaque (jce_mesh.h) */
 #endif
 typedef struct JceRenderer JceRenderer;
 typedef struct JcePakArchive  JcePakArchive;
@@ -174,6 +175,13 @@ void jce_model_draw_program(const JceModel *model,
  * palettes and cannot share one instanced submit). */
 JCE_API bool jce_model_is_instanceable(const JceModel *model);
 
+/* True when EVERY drawable primitive is skinned (dual of _is_instanceable): the
+ * model has no static / non-skinned sub-mesh.  The bind-pose instancing paths
+ * (color + shadow) draw ONLY skinned primitives, so they gate on this — a mixed
+ * skinned+static rig falls through to the per-primitive path that also draws /
+ * casts its static parts. */
+JCE_API bool jce_model_is_purely_skinned(const JceModel *model);
+
 /* GPU-instanced color draw: render `count` copies of a non-skinned model, one
  * per roots[i] model-to-world transform, batching each primitive into a single
  * instanced submit (PBR material bound once per primitive, shared across all
@@ -200,6 +208,101 @@ JCE_API void jce_model_draw_instanced_tinted(const JceModel *model,
                                              const jce_vec4 *tints,
                                              uint32_t count);
 
+/* 千万 S4/S5 LOD-in-cull draw: the GPU cull has already compacted survivors
+ * into the band PARTITIONS of `visible_vb` and built one drawIndexedIndirect
+ * element per band in `indirect_buf` (element b's startInstance = the band's
+ * partition base).  Binds the single drawable primitive's material and issues
+ * one submit_indirect per band at that band's reduced LOD index buffer (bands
+ * share one vertex buffer).  Band 0 = base LOD, band b>=1 = reduced level
+ * (b-1), clamped.  Single-primitive foliage models only; prog = the cross-fade
+ * instanced program (vs_pbr_inst_fade) or plain vs_pbr_inst.  The global PBR
+ * (lights/IBL/shadows) + forward+ must be bound by the caller. */
+JCE_API void jce_model_draw_foliage_lod_indirect(
+        const JceModel *model, const JceRenderer *r, uint16_t view_id,
+        uint16_t prog_idx, uint32_t band_count,
+        uint16_t visible_vb, uint16_t indirect_buf);
+
+/* GPU crowd instancing: draw `count` uniquely-posed instances of a SKINNED
+ * model in one instanced submit per skinned primitive.  Per-instance stream:
+ * world matrix (i_data0..3) + bone PALETTE BASE in bones (i_data4.x) into the
+ * shared per-frame bone texture, bound at sampler stage 4 — ALIASING s_emissive
+ * (all 16 stages are otherwise occupied; 9-12 belong to the CSM cascades, which
+ * the pre-submit hook re-binds after any earlier bind).  Callers must therefore
+ * exclude emissive materials (jce_model_any_emissive) so the aliased sample is
+ * shading-neutral.  prog must be vs_pbr_skinned_inst + fs_pbr; the palette is
+ * skeleton-local (world applied per instance).  Raw idx handles keep bgfx out
+ * of this header. */
+JCE_API void jce_model_draw_crowd_instanced(const JceModel *model,
+                                            const JceRenderer *r,
+                                            uint16_t view_id, uint16_t prog_idx,
+                                            const jce_mat4 *worlds,
+                                            const uint32_t *bases, uint32_t count,
+                                            uint16_t s_bones_idx,
+                                            uint16_t bone_tex_idx,
+                                            uint16_t u_params_idx,
+                                            float tex_w, float tex_h);
+
+/* GPU bind-pose instancing: draw `count` NON-animating skinned instances of a
+ * model in one instanced submit per skinned primitive, via the plain instanced
+ * PBR program (vs_pbr_inst) + per-instance world matrix — no bone palette (a
+ * bind-pose skinned mesh is effectively static).  Collapses the bind-pose
+ * majority of a large crowd. */
+JCE_API void jce_model_draw_bindpose_instanced(const JceModel *model,
+                                               const JceRenderer *r,
+                                               uint16_t view_id,
+                                               const jce_mat4 *worlds,
+                                               uint32_t count);
+
+/* Depth-only sibling of jce_model_draw_bindpose_instanced: casts the same
+ * NON-animating skinned instances into a shadow view in one instanced submit
+ * per skinned primitive, via the instanced shadow program (vs_shadow_inst) —
+ * depth-only, no material.  Collapses the per-char skinned shadow submits that
+ * dominate a crowd's cascade gather (the #1 sh_gather cost). */
+JCE_API void jce_model_draw_bindpose_shadow_instanced(const JceModel *model,
+                                                      const JceRenderer *r,
+                                                      uint16_t view_id,
+                                                      const jce_mat4 *worlds,
+                                                      uint32_t count);
+
+/* ANIMATED sibling: casts `count` uniquely-POSED skinned instances into a
+ * shadow view in one instanced submit per skinned primitive.  Per-instance
+ * stream mirrors jce_model_draw_crowd_instanced (world i_data0..3 + palette
+ * base i_data4.x into the shared bone texture, sampler stage 4).  prog must be
+ * vs_shadow_skinned_inst + fs_shadow; raw idx handles keep bgfx out of here. */
+JCE_API void jce_model_draw_crowd_shadow_instanced(const JceModel *model,
+                                                   const JceRenderer *r,
+                                                   uint16_t view_id,
+                                                   uint16_t prog_idx,
+                                                   const jce_mat4 *worlds,
+                                                   const uint32_t *bases,
+                                                   uint32_t count,
+                                                   uint16_t s_bones_idx,
+                                                   uint16_t bone_tex_idx,
+                                                   uint16_t u_params_idx,
+                                                   float tex_w, float tex_h);
+
+
+/* Instanced draw of a SINGLE static mesh with a per-instance RGBA tint stream
+ * (i_data4) — the mesh-level sibling of jce_model_draw_instanced_tinted, for the
+ * scene renderer's factor-only primitive tint-instancing: shape primitives that
+ * share one built-in mesh + one material signature and differ only in base_color
+ * COLLAPSE into one instanced submit instead of one solo draw each.  `state` is
+ * the shared bgfx render state (blend/cull/depth).  `pre_submit` (if non-NULL) is
+ * invoked once per instance-buffer chunk immediately before the submit to bind
+ * the shared material + frame-global light/shadow/IBL state (e.g. the renderer's
+ * sr_bind_material_cb) — the tint program modulates the bound base-color factor
+ * by v_tint, so binding a WHITE base material yields per-instance colours.
+ * tints == NULL falls back to the plain (stride-64) instanced program. */
+JCE_API void jce_mesh_draw_instanced_tinted(const JceMesh *mesh,
+                                            const JceRenderer *r,
+                                            uint16_t view_id,
+                                            const jce_mat4 *worlds,
+                                            const jce_vec4 *tints,
+                                            uint32_t count,
+                                            uint64_t state,
+                                            void (*pre_submit)(void *user, uint16_t view_id),
+                                            void *pre_submit_user);
+
 /* GPU-driven instancing helper (roadmap #18, Phase 0+1).  Returns true when the
  * model has EXACTLY ONE drawable, non-skinned, non-joint-parented primitive — the
  * case the GPU-driven color path handles (one world matrix per resident
@@ -210,20 +313,64 @@ JCE_API void jce_model_draw_instanced_tinted(const JceModel *model,
 JCE_API bool jce_model_gpu_instanceable(const JceModel *model,
                                         jce_mat4 *out_node_lt);
 
-/* GPU-driven instanced color draw: submits the single drawable primitive once,
+/* Number of drawable primitives jce_model_gpu_instanceable would submit (>1 = a
+ * shared-node multi-primitive model, drawn as one GPU cull run + one indirect draw
+ * PER primitive).  0 when not GPU-instanceable. */
+JCE_API uint32_t jce_model_gpu_drawable_count(const JceModel *model);
+
+/* Index count of the `which`-th drawable primitive (0-based).  Fills that
+ * primitive's GPU indirect draw args (numIndices).  0 if out of range. */
+JCE_API uint32_t jce_model_gpu_primitive_index_count(const JceModel *model,
+                                                     uint32_t which);
+
+/* Static mesh of the `which`-th drawable primitive (same walk order), for CPU-side
+ * instancing paths that need the raw VB/IB (e.g. the velocity/depth prepass render
+ * queue).  NULL if out of range or the primitive isn't a static mesh. */
+JCE_API JceMesh *jce_model_gpu_primitive_mesh(const JceModel *model, uint32_t which);
+
+/* Non-skinned SkinnedMesh (the LOD carrier) of the `which`-th drawable primitive
+ * — holds the per-LOD reduced index buffers (jce_skinned_mesh_lod_ibh) the GPU
+ * LOD-in-cull path (千万 S4) binds per distance band while sharing one vertex
+ * buffer.  NULL when `which` is out of range or that primitive has no static-LOD
+ * skinned mesh. */
+JCE_API const JceSkinnedMesh *jce_model_gpu_primitive_skinned_mesh(
+    const JceModel *model, uint32_t which);
+
+/* SKINNED primitive walk (the complement of the gpu_* static walk) — raw
+ * buffers of the model's `which`-th skinned primitive, so a BIND-POSE crowd
+ * character can ride the render-queue instancing paths (velocity prepass) as
+ * if static: bind-pose vertices are model-space, and the instanced programs
+ * ignore the bone attributes.  Returns false when out of range. */
+/* True when ANY of the model's materials has an active emissive term (map or
+ * non-zero factor).  The GPU crowd-instancing path aliases the s_emissive
+ * sampler stage for its bone-palette texture (all 16 stages are otherwise
+ * occupied); emissive models are excluded from the batch (per-char path) so
+ * the aliased sample can never contribute to shading (fs multiplies it by the
+ * factor, which the gate guarantees is zero). */
+JCE_API bool jce_model_any_emissive(const JceModel *model);
+
+JCE_API uint32_t jce_model_skinned_primitive_count(const JceModel *model);
+JCE_API bool jce_model_skinned_primitive_buffers(const JceModel *model,
+                                                 uint32_t which,
+                                                 uint32_t *out_vbh,
+                                                 uint32_t *out_ibh,
+                                                 uint32_t *out_index_count);
+
+/* GPU-driven instanced color draw: submits the `which`-th drawable primitive once,
  * sourcing per-instance model matrices from the compute-written visible dynamic
  * vertex buffer `visible_vb` (a bgfx dynamic_vertex_buffer handle index; mat4
  * per slot, byte-compatible with vs_pbr_inst's i_data0..3), starting at slot
- * `start` for `count` instances (this run's partition).  `count` is the upper-
- * bound instance count (the GPU cull leaves the partition tail zeroed →
- * degenerate).  No-op unless jce_model_gpu_instanceable(model, NULL) would
- * return true. */
+ * `start` for `count` instances (this partition).  `count` is the upper-bound
+ * instance count (the GPU cull leaves the partition tail zeroed → degenerate).
+ * `which` = 0 for a single-primitive model; 0..N-1 across a shared-node
+ * multi-primitive model.  No-op unless jce_model_gpu_instanceable. */
 JCE_API void jce_model_draw_instanced_from_buffer(const JceModel *model,
                                                   const JceRenderer *r,
                                                   uint16_t view_id,
                                                   uint16_t visible_vb,
                                                   uint32_t start,
-                                                  uint32_t count);
+                                                  uint32_t count,
+                                                  uint32_t which);
 
 /* Index count of the single drawable primitive (the one jce_model_gpu_instanceable
  * accepts).  Used to fill the GPU indirect draw args (numIndices).  Returns 0
@@ -242,7 +389,8 @@ JCE_API void jce_model_draw_indirect_from_buffer(const JceModel *model,
                                                  uint16_t view_id,
                                                  uint16_t visible_vb,
                                                  uint16_t indirect_buf,
-                                                 uint32_t indirect_el);
+                                                 uint32_t indirect_el,
+                                                 uint32_t which);
 
 /* Draw all primitives into a shadow/depth pass (depth-only, no materials).
  *
@@ -282,14 +430,51 @@ JCE_API void jce_model_draw_shadow_instanced_from_buffer(const JceModel *model,
                                                          uint16_t program_idx,
                                                          uint16_t visible_vb,
                                                          uint32_t start,
-                                                         uint32_t count);
+                                                         uint32_t count,
+                                                         uint32_t which);
 JCE_API void jce_model_draw_shadow_indirect_from_buffer(const JceModel *model,
                                                         const JceRenderer *r,
                                                         uint16_t view_id,
                                                         uint16_t program_idx,
                                                         uint16_t visible_vb,
                                                         uint16_t indirect_buf,
-                                                        uint32_t indirect_el);
+                                                        uint32_t indirect_el,
+                                                        uint32_t which);
+
+/* Nanite-lite V2: one submit_indirect over the meshlet-grouped index buffer
+ * (per-meshlet args written by cs_meshlet_cull; culled = zero-index).  Binds
+ * prim 0's material + the entity world transform; prog = the solo pbr
+ * program.  Global PBR state must already be bound by the caller. */
+JCE_API void jce_model_draw_meshlet_culled(const JceModel *model,
+                                           const JceRenderer *r,
+                                           uint16_t view_id, uint16_t prog_idx,
+                                           const jce_mat4 *world,
+                                           uint16_t indirect_buf,
+                                           uint32_t count);
+
+/* Nanite-lite V4: depth-only meshlet-culled draw into a shadow cascade view.
+ * Same per-cluster indirect args (from a shadow-mode cull against the light
+ * frustum), but the static depth-only shadow program + shadow depth state and
+ * no material bind. */
+JCE_API void jce_model_draw_meshlet_culled_shadow(const JceModel *model,
+                                                  const JceRenderer *r,
+                                                  uint16_t view_id,
+                                                  const jce_mat4 *world,
+                                                  uint16_t indirect_buf,
+                                                  uint32_t count);
+
+/* Scatter-shadow instanced submit (千万 ③): one depth-only instanced draw of
+ * the model's single drawable primitive at reduced in-asset LOD `level`
+ * (clamped to the coarsest available; UINT32_MAX = coarsest), with instance
+ * matrices sourced from a persistent dynamic VB (raw idx, e.g. the scatter's
+ * COMPUTE_READ roots buffer doubling as plain instance data). */
+JCE_API void jce_model_draw_shadow_instanced_lod(const JceModel *model,
+                                                 const JceRenderer *r,
+                                                 uint16_t view_id,
+                                                 uint16_t program_idx,
+                                                 uint16_t inst_vb,
+                                                 uint32_t count,
+                                                 uint32_t level);
 
 /* Morph-aware sibling of jce_model_draw / jce_model_draw_shadow (FEATURE 3.1
  * GPU vertex-deform).  Identical to the base entrypoints EXCEPT that, for each
@@ -387,6 +572,30 @@ void jce_model_draw_velocity(const JceModel *model,
                              const jce_mat4 *prev_transform,
                              const jce_mat4 *prev_joint_matrices,
                              uint32_t num_prev_joints);
+
+/* ANIMATED-crowd velocity: per-limb motion vectors + world normals for `count`
+ * uniquely-posed skinned instances in one instanced MRT submit per skinned
+ * primitive, dual-skinning from THIS frame's bone texture (sampler stage 4)
+ * and LAST frame's (stage 5, packed at the same bases).  Per-instance stream =
+ * world (i_data0..3) + palette base (i_data4.x).  prog must be
+ * vs_gbuffer_vel_skinned_inst + fs_gbuffer_vel; `roughness` fills the SSR
+ * normal-buffer alpha (u_gbuffer_mat) for the whole batch. */
+JCE_API void jce_model_draw_crowd_velocity_instanced(const JceModel *model,
+                                                     const JceRenderer *r,
+                                                     uint16_t view_id,
+                                                     uint16_t prog_idx,
+                                                     const JceModelVelocityCtx *ctx,
+                                                     const jce_mat4 *worlds,
+                                                     const uint32_t *bases,
+                                                     uint32_t count,
+                                                     uint16_t s_bones_idx,
+                                                     uint16_t bone_tex_idx,
+                                                     uint16_t s_prev_bones_idx,
+                                                     uint16_t bone_prev_tex_idx,
+                                                     uint16_t u_params_idx,
+                                                     float tex_w, float tex_h,
+                                                     uint16_t u_gbuffer_mat_idx,
+                                                     float roughness);
 
 /* -- Skeleton & animation accessors -------------------------------- */
 

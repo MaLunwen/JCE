@@ -19,6 +19,7 @@ extern "C" {
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_lifecycle.h>
 #include <jce/application/jce_project.h>
+#include <jce/application/jce_runtime_boot.h>
 #include <jce/application/jce_cook.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/application/jce_screenshot.h>

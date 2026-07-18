@@ -55,10 +55,43 @@ typedef struct {
     char value[MAX_VALUE_LEN];
 } I18nEntry;
 
+/* Open-addressing key index (entry+1 values, 0 = empty; 2x capacity so the
+ * probe always terminates).  Every visible ImGui control looks its label up
+ * per frame; the linear strcmp scan over ~4.8k keys (x2 tables on a non-EN
+ * locale, x2 again on a miss) was the editor UI's single largest algorithmic
+ * cost — a hash probe makes each lookup O(1). */
+#define I18N_IDX_CAP  (MAX_STRINGS * 2)
+#define I18N_IDX_MASK (I18N_IDX_CAP - 1)
+
 typedef struct {
     I18nEntry entries[MAX_STRINGS];
     int       count;
+    uint16_t  idx[I18N_IDX_CAP];   /* entry+1; zero-init = empty */
 } I18nTable;
+
+static uint32_t i18n_key_hash(const char *key)
+{
+    uint32_t h = 2166136261u;               /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)key; *p; ++p)
+        h = (h ^ *p) * 16777619u;
+    return h;
+}
+
+/* (Re)build the index from entries[0..count).  Later duplicates win, which
+ * matches the old linear scan only if it returned the FIRST match — it did,
+ * so insert in REVERSE order (the first occurrence overwrites later ones). */
+static void i18n_table_index(I18nTable *table)
+{
+    memset(table->idx, 0, sizeof(table->idx));
+    for (int i = table->count - 1; i >= 0; --i) {
+        uint32_t h = i18n_key_hash(table->entries[i].key) & I18N_IDX_MASK;
+        while (table->idx[h] &&
+               strcmp(table->entries[table->idx[h] - 1].key,
+                      table->entries[i].key) != 0)
+            h = (h + 1) & I18N_IDX_MASK;
+        table->idx[h] = (uint16_t)(i + 1);
+    }
+}
 
 typedef struct {
     char       code[MAX_CODE_LEN];        /* e.g. "en", "zh_cn", "ko"   */
@@ -112,6 +145,7 @@ static bool parse_json_table(const char *json, I18nTable *table)
     }
 
     jce_json_free(root);
+    i18n_table_index(table);   /* tables are only mutated here — index once */
     return true;
 }
 
@@ -178,9 +212,14 @@ static const char *lookup_in_table(const I18nTable *table, const char *key)
 {
     if (!table || !key) return NULL;
 
-    for (int i = 0; i < table->count; i++) {
-        if (strcmp(table->entries[i].key, key) == 0)
-            return table->entries[i].value;
+    /* O(1) hash probe (see i18n_table_index); the empty cell terminates a
+     * miss, and 2x capacity guarantees one exists. */
+    uint32_t h = i18n_key_hash(key) & I18N_IDX_MASK;
+    while (table->idx[h]) {
+        const I18nEntry *e = &table->entries[table->idx[h] - 1];
+        if (strcmp(e->key, key) == 0)
+            return e->value;
+        h = (h + 1) & I18N_IDX_MASK;
     }
     return NULL;
 }

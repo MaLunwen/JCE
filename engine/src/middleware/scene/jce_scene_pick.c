@@ -863,6 +863,64 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
             }
         }
 
+        /* Custom-drawn components (FoliageCluster / GrassField / Water) carry
+         * no MeshRenderer, so they would be unpickable.  Submit the builtin
+         * unit cube scaled to the component's spatial extent as a pick proxy —
+         * the artist can click the leaves/grass/water and get a selection like
+         * any mesh.  (The proxy is invisible outside the pick pass.) */
+        {
+            float ex = 0.0f, ey = 0.0f, ez = 0.0f;
+            float y_off = 0.0f;   /* world-Y offset of the proxy centre */
+            if (jce_scene_has_foliage_cluster(scene, e)) {
+                JceFoliageClusterComponent *fc = jce_scene_get_foliage_cluster(scene, e);
+                if (fc && fc->visible) {
+                    float r = fc->radius > 0.0f ? fc->radius : 1.0f;
+                    float sy = fc->squash_y > 0.0f ? fc->squash_y : 1.0f;
+                    ex = 2.0f * r; ey = 2.0f * r * sy; ez = 2.0f * r;
+                }
+            } else if (jce_scene_has_grass_field(scene, e)) {
+                JceGrassFieldComponent *g = jce_scene_get_grass_field(scene, e);
+                if (g && g->visible) {
+                    ex = g->area_x > 0.0f ? g->area_x : 1.0f;
+                    ey = g->blade_height > 0.0f ? g->blade_height : 0.5f;
+                    ez = g->area_z > 0.0f ? g->area_z : 1.0f;
+                }
+            } else if (jce_scene_has_water(scene, e)) {
+                /* Water: thin slab around the surface plane.  The surface sits
+                 * at base_height in entity-local Y (mirrors sr_draw_water's
+                 * base_height + world-Y placement); the slab is tall enough to
+                 * cover the Gerstner wave band so clicking a crest also hits. */
+                JceWaterComponent *w = jce_scene_get_water(scene, e);
+                if (w && w->visible && w->size_x > 0.0f && w->size_z > 0.0f) {
+                    ex = w->size_x;
+                    ez = w->size_z;
+                    float amp = 0.0f;
+                    for (int wi = 0; wi < w->wave_count &&
+                                     wi < JCE_WATER_COMP_MAX_WAVES; wi++)
+                        amp += fabsf(w->waves[wi].amplitude);
+                    ey = (amp > 0.25f) ? 2.0f * amp : 0.5f;
+                    y_off = w->base_height;
+                }
+            }
+            if (ex > 0.0f && pass->builtin[0]) {
+                float color[4];
+                if (!pick_register_entity(pass, e, color)) continue;
+                /* Compose scale into the entity world matrix (translation kept). */
+                jce_mat4 pm = model;
+                pm.col[0] = jce_v4(pm.col[0].x * ex, pm.col[0].y * ex, pm.col[0].z * ex, 0.0f);
+                pm.col[1] = jce_v4(pm.col[1].x * ey, pm.col[1].y * ey, pm.col[1].z * ey, 0.0f);
+                pm.col[2] = jce_v4(pm.col[2].x * ez, pm.col[2].y * ez, pm.col[2].z * ez, 0.0f);
+                pm.col[3].y += y_off;
+                bgfx_set_uniform(pass->u_pick_id, color, 1);
+                bgfx_set_transform(pm.raw[0], 1);
+                jce_mesh_submit_pick_id(pass->builtin[0], pass->renderer,
+                                        pass->view_id,
+                                        (JceShaderHandle){ pass->prog_mesh.idx },
+                                        true);
+                continue;
+            }
+        }
+
         JceMesh *mesh = pick_resolve_entity_mesh(pass, scene, e);
         if (!mesh)
             continue;

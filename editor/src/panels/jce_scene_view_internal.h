@@ -95,6 +95,16 @@ bool has_valid_gizmo_target(void);
 
 void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam);
 
+/* Screen-space picking for the 2D helper icons (camera/light entities have
+ * no mesh -- icons draw ON TOP of the scene, so the GPU id-buffer never sees
+ * them).  Mirrors draw_scene_helper_icons' enumeration + placement exactly.
+ * hit_test returns the topmost icon's entity id under `pt` (0 = none);
+ * in_rect appends every icon whose center lies in [mn,mx] (dedup'd),
+ * returning the count. */
+uint32_t scene_helper_icon_hit_test(const JceGizmoCamera *cam, ImVec2 pt);
+int      scene_helper_icons_in_rect(const JceGizmoCamera *cam, ImVec2 mn,
+                                    ImVec2 mx, uint32_t *out, int cap);
+
 void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape);
 
 /* extra_comp_flag = 0 means "no additional component beyond the default

@@ -64,6 +64,17 @@ typedef struct JceBundleDepList {
     uint32_t      capacity;
 } JceBundleDepList;
 
+/* Explicit dependency contract used when a runtime reference cannot be
+ * derived from typed scene/descriptor data (for example a path selected by a
+ * script at runtime).  `assets` are strict build inputs; missing
+ * `optional_assets` are reported but do not fail the build. */
+typedef struct JceBundleDependencyDocument {
+    JceBundleDepList assets;
+    JceBundleDepList optional_assets;
+    char           **labels;
+    uint32_t         label_count;
+} JceBundleDependencyDocument;
+
 /* Scan a scene JSON string and return the list of asset references.
  * `json_len` may be 0 to use strlen.  Returns true on parse success
  * (deps list may still be empty for pure-logic scenes). */
@@ -73,6 +84,18 @@ JCE_API bool jce_bundle_deps_scan(const char *json, size_t json_len,
 /* Convenience: read a scene JSON from a host file path and scan. */
 JCE_API bool jce_bundle_deps_scan_file(const char *scene_path,
                                        JceBundleDepList *out_list);
+
+/* Parse a `jce.bundle.dependencies` 1.x document.  Entries in `assets` and
+ * `optional_assets` may be path strings or `{ "path", "bundle" }` objects.
+ * Unknown fields are ignored for forward-compatible minor revisions; field
+ * types and the contract major version are strict. */
+JCE_API bool jce_bundle_deps_parse_document(
+    const char *json, size_t json_len,
+    JceBundleDependencyDocument *out_document);
+
+/* Release all lists, labels and strings owned by a parsed document. */
+JCE_API void jce_bundle_deps_document_free(
+    JceBundleDependencyDocument *document);
 
 /* Release every string + the items array.  Safe to call on a
  * zero-initialised list. */

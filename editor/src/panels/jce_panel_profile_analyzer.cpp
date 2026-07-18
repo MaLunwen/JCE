@@ -14,6 +14,7 @@
 
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_ui_state.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/renderer/jce_lowlevel.h>
@@ -35,10 +36,11 @@ constexpr int   kBufLen     = 256;
 constexpr float kDefaultMs  = 33.3f;   /* spike threshold default (~30 fps) */
 
 struct FrameRecord {
-    float frame_ms  = 0.0f;
-    float cpu_ms    = 0.0f;
-    float gpu_ms    = 0.0f;
-    float wait_ms   = 0.0f;
+    float    frame_ms  = 0.0f;
+    float    cpu_ms    = 0.0f;
+    float    gpu_ms    = 0.0f;
+    float    wait_ms   = 0.0f;
+    uint64_t frame_no  = 0;     /* stable id (ring index shifts every frame) */
 };
 
 struct State {
@@ -48,6 +50,7 @@ struct State {
     float       spike_thresh  = kDefaultMs;
     bool        paused        = false;
     bool        show_spikes   = true;
+    uint64_t    next_frame_no = 1;
 };
 
 State s;
@@ -91,12 +94,17 @@ void sample_frame(void)
     if (st) {
         int64_t cpu_freq = st->cpu_timer_freq > 0 ? st->cpu_timer_freq : 1;
         int64_t gpu_freq = st->gpu_timer_freq > 0 ? st->gpu_timer_freq : 1;
-        r.cpu_ms  = (float)((double)st->cpu_time_frame * 1000.0 / (double)cpu_freq);
+        /* CPU work = wall frame time minus GPU waits (else CPU==Frame and
+         * the panel cannot tell CPU-bound from GPU-bound). */
+        int64_t cpu_work = st->cpu_time_frame - st->wait_render - st->wait_submit;
+        if (cpu_work < 0) cpu_work = 0;
+        r.cpu_ms  = (float)((double)cpu_work * 1000.0 / (double)cpu_freq);
         r.gpu_ms  = (float)((double)(st->gpu_time_end - st->gpu_time_begin)
                             * 1000.0 / (double)gpu_freq);
         r.wait_ms = (float)((double)(st->wait_render + st->wait_submit)
                             * 1000.0 / (double)cpu_freq);
     }
+    r.frame_no = s.next_frame_no++;
     push_record(r);
 }
 
@@ -114,16 +122,28 @@ void export_csv(void)
     if (!out) return;
 
     int pos = 0;
-    pos += snprintf(out + pos, (size_t)(cap - pos),
-                    "frame,frame_ms,cpu_ms,gpu_ms,wait_ms\n");
-    for (int i = 0; i < s.filled && pos < cap - 80; ++i) {
+    {
+        int rem = cap - pos;
+        int n = snprintf(out + pos, (size_t)rem,
+                         "frame,frame_ms,cpu_ms,gpu_ms,wait_ms\n");
+        if (n > 0 && n < rem) pos += n;
+    }
+    for (int i = 0; i < s.filled; ++i) {
         const FrameRecord &r = at(i);
-        pos += snprintf(out + pos, (size_t)(cap - pos),
-                        "%d,%.3f,%.3f,%.3f,%.3f\n",
-                        i, r.frame_ms, r.cpu_ms, r.gpu_ms, r.wait_ms);
+        int rem = cap - pos;
+        if (rem <= 1) break;
+        /* Clamp: snprintf returns the WOULD-HAVE length on truncation —
+         * adding it blindly walked pos past the buffer (heap OOB on write). */
+        int n = snprintf(out + pos, (size_t)rem,
+                         "%llu,%.3f,%.3f,%.3f,%.3f\n",
+                         (unsigned long long)r.frame_no,
+                         r.frame_ms, r.cpu_ms, r.gpu_ms, r.wait_ms);
+        if (n <= 0 || n >= rem) break;
+        pos += n;
     }
 
-    jce_fs_host_write_all("profile_export.csv", out, (uint64_t)pos);
+    bool ok = jce_fs_host_write_all("profile_export.csv", out, (uint64_t)pos);
+    (void)ok;
     jce_free(out);
 }
 
@@ -219,7 +239,8 @@ void draw_spike_table(void)
             if (r.frame_ms <= s.spike_thresh) continue;
             ImGui::TableNextRow();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%d", i);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%llu", (unsigned long long)r.frame_no);
             ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", r.frame_ms);
             ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", r.cpu_ms);
             ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", r.gpu_ms);
@@ -232,13 +253,27 @@ void draw_spike_table(void)
 
 void draw_toolbar(void)
 {
-    ImGui::Checkbox(jce_editor_i18n_id("profileAnalyzer.pause", "pa_pause"),  &s.paused);
+    /* One-time restore of the persisted knobs (user-global, so the analyzer
+     * setup carries across projects and restarts). */
+    static bool s_knobs_loaded = false;
+    if (!s_knobs_loaded) {
+        s_knobs_loaded = true;
+        s.spike_thresh = jce_editor_ui_state_load_float(
+                             "profana.spike_thresh", s.spike_thresh,
+                             1.0f, 200.0f);
+        s.paused       = jce_editor_ui_state_load_int(
+                             "profana.paused", s.paused ? 1 : 0, 0, 1) != 0;
+    }
+
+    if (ImGui::Checkbox(jce_editor_i18n_id("profileAnalyzer.pause", "pa_pause"),  &s.paused))
+        jce_editor_ui_state_save_int("profana.paused", s.paused ? 1 : 0);
     ImGui::SameLine();
     ImGui::Checkbox(jce_editor_i18n_id("profileAnalyzer.showSpikes", "pa_sp"), &s.show_spikes);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120.0f);
-    ImGui::DragFloat(jce_editor_i18n_id("profileAnalyzer.spikeThresh", "pa_thresh"),
-                     &s.spike_thresh, 0.5f, 1.0f, 200.0f, "%.1f ms");
+    if (ImGui::DragFloat(jce_editor_i18n_id("profileAnalyzer.spikeThresh", "pa_thresh"),
+                         &s.spike_thresh, 0.5f, 1.0f, 200.0f, "%.1f ms"))
+        jce_editor_ui_state_save_float("profana.spike_thresh", s.spike_thresh);
     ImGui::SameLine();
     if (ImGui::SmallButton(jce_editor_i18n_id("profileAnalyzer.clear", "pa_clear")))
         s.filled = 0;

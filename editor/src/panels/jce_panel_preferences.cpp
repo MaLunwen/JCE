@@ -15,13 +15,19 @@
  *
  * Persistence
  * -----------
- * This panel writes TWO user-scoped stores under ".jce/":
- *   prefs.json          — autosave / startup / recent_max / toolchains
- *   editor-config.json  — appearance / fonts / viewport / input / paths
- *                         (the canonical JceEditorConfig, mirrored in s_cfg)
- * plus hotkeys.json via the hotkey registry.  s_cfg is re-synced from disk
- * on every panel OPEN so an external edit between sessions is not clobbered
- * by a whole-struct save.  The live gizmo-display accessors
+ * Everything this panel edits lives in the canonical JceEditorConfig
+ * (mirrored in s_cfg), persisted as the split per-user stores
+ *   ~/.jce/editor-preferences.json  — appearance / fonts / viewport /
+ *                                     input / paths / general (autosave,
+ *                                     startup, recent_max); toolchain
+ *                                     overrides as "toolchain.<kind>" KV
+ *   ~/.jce/editor-session.json      — last-state keys (view mode, recents…)
+ * plus hotkeys.json via the hotkey registry.  The former stores prefs.json
+ * and editor-config.json are RETIRED: jce_editor_config_load merges them
+ * forward one time and the next flush renames them *.migrated (hand-edits
+ * to a dead file can never be silently inert).  s_cfg is re-synced from
+ * disk on every panel OPEN so an external edit between sessions is not
+ * clobbered by a whole-struct save.  The live gizmo-display accessors
  * (jce_editor_prefs_show_gizmos / _gizmo_scale) read s_cfg, so those prefs
  * now persist across restarts (they previously lived only in a retired
  * panel's in-memory struct and were lost every launch).
@@ -79,29 +85,23 @@ enum AutosaveInterval {
  * label "Blue" maps to JCE_THEME_SSMS — kept for legacy compatibility
  * with the older Preferences dialog. */
 struct UserPrefs {
-    /* Truly new fields persisted to .jce/prefs.json. */
+    /* UI mirror of the general fields; persisted via JceEditorConfig
+     * (autosave_interval / startup_mode / recent_max in
+     * ~/.jce/editor-preferences.json — the old prefs.json is retired). */
     int   autosave        = AUTOSAVE_5MIN;
     int   startup         = JCE_EDITOR_STARTUP_LAST;
     int   recent_max      = 10;
 };
 
 /* Theme/font/ui_scale/renderer are NOT duplicated here — they live in
- * the canonical JceEditorConfig (.jce/editor-config.json) so this panel
- * and the legacy Preferences dialog stay in sync. */
+ * the canonical JceEditorConfig (~/.jce/editor-preferences.json) so every
+ * consumer of those keys stays in sync. */
 
 UserPrefs        s_prefs;
-JceEditorConfig  s_cfg;       /* mirror of editor-config for live editing */
+JceEditorConfig  s_cfg;       /* mirror of the canonical config for live editing */
 bool             s_loaded = false;
 int              s_active_tab = 0;   /* 0=General, 1=Appearance, 2=Fonts,
                                         3=Viewport, 4=Input, 5=Paths, 6=Hotkeys */
-
-/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
-static const char *prefs_path(void) {
-    static char p[1024]; static bool init = false;
-    if (!init) { jce_editor_dotjce_path("prefs.json", p, sizeof(p)); init = true; }
-    return p;
-}
-#define PREFS_PATH prefs_path()
 
 int clamp_int(int v, int lo, int hi)
 {
@@ -119,15 +119,9 @@ float clamp_float(float v, float lo, float hi)
 
 /* ── Live apply ────────────────────────────────────────────────────── */
 
-/* String <-> theme index — matches the legacy dialog's normalization. */
-int theme_str_to_idx(const char *s)
-{
-    if (!s || !*s) return JCE_THEME_DARK;
-    if (jce_strcasecmp(s, "Light") == 0) return JCE_THEME_LIGHT;
-    if (jce_strcasecmp(s, "Blue")  == 0) return JCE_THEME_SSMS;
-    if (jce_strcasecmp(s, "SSMS")  == 0) return JCE_THEME_SSMS;
-    return JCE_THEME_DARK;
-}
+/* String -> theme index parsing is the shared canonical helper
+ * jce_editor_theme_from_string (jce_editor_style.h) — do NOT re-implement
+ * it here, or the accepted spellings drift from the boot restore path. */
 
 const char *theme_idx_to_str(int idx)
 {
@@ -184,78 +178,69 @@ void apply_ui_scale(float s)
 
 void apply_all()
 {
-    jce_editor_apply_theme(theme_str_to_idx(s_cfg.theme));
+    jce_editor_apply_theme(jce_editor_theme_from_string(s_cfg.theme));
     apply_ui_scale(s_cfg.ui_scale);
     /* Font size applies on next frame via the deferred font reload. */
 }
 
 /* ── Disk I/O ──────────────────────────────────────────────────────── */
 
+/* General prefs + toolchain overrides now live in the canonical config
+ * (the retired ~/.jce/prefs.json is merged forward by
+ * jce_editor_config_load and renamed *.migrated on the next flush).
+ * Toolchain per-kind path overrides persist as "toolchain.<kind>" string
+ * KV on the config singleton. */
 void load_from_disk()
 {
-    JceJson *root = jce_json_parse_file(PREFS_PATH);
-    if (!root) return;
+    JceEditorConfig cfg;
+    if (!jce_editor_config_load(&cfg))
+        jce_editor_config_defaults(&cfg);
+    s_prefs.autosave   = clamp_int(cfg.autosave_interval, 0, AUTOSAVE_COUNT - 1);
+    s_prefs.startup    = clamp_int(cfg.startup_mode, 0,
+                                   JCE_EDITOR_STARTUP_COUNT - 1);
+    s_prefs.recent_max = clamp_int(cfg.recent_max, 1, 20);
 
-    s_prefs.autosave   = clamp_int(jce_json_get_int(root, "autosave",   s_prefs.autosave),
-                                   0, AUTOSAVE_COUNT - 1);
-    s_prefs.startup    = clamp_int(jce_json_get_int(root, "startup",    s_prefs.startup),
-                                   0, JCE_EDITOR_STARTUP_COUNT - 1);
-    s_prefs.recent_max = clamp_int(jce_json_get_int(root, "recent_max", s_prefs.recent_max),
-                                   1, 20);
-
-    /* Toolchain overrides (P6).  Keyed by canonical kind name. */
-    JceJson *tc = jce_json_get(root, "toolchain_overrides");
-    if (tc && jce_json_is_object(tc)) {
-        for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
-            const char *k = jce_toolchain_kind_name((JceToolchainKind)i);
-            const char *p = jce_json_get_string(tc, k, "");
-            if (p && p[0]) {
-                jce_toolchain_set_override((JceToolchainKind)i, p);
-            }
-        }
+    for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+        char key[64], path[512];
+        snprintf(key, sizeof(key), "toolchain.%s",
+                 jce_toolchain_kind_name((JceToolchainKind)i));
+        if (jce_editor_config_get_ui_str(key, path, sizeof(path)) && path[0])
+            jce_toolchain_set_override((JceToolchainKind)i, path);
     }
-    jce_json_free(root);
 }
 
 void save_to_disk()
 {
-    /* Ensure the per-user .jce directory (~/.jce) exists. */
-    char dir[1024];
-    jce_editor_dotjce_path(nullptr, dir, sizeof(dir));
-    jce_fs_host_create_directory(dir);
+    JceEditorConfig cfg;
+    if (!jce_editor_config_load(&cfg))
+        jce_editor_config_defaults(&cfg);
+    cfg.autosave_interval = s_prefs.autosave;
+    cfg.startup_mode      = s_prefs.startup;
+    cfg.recent_max        = s_prefs.recent_max;
+    jce_editor_config_save(&cfg);
 
-    JceJson *root = jce_json_object();
-    if (!root) return;
-    jce_json_set_int   (root, "autosave",   s_prefs.autosave);
-    jce_json_set_int   (root, "startup",    s_prefs.startup);
-    jce_json_set_int   (root, "recent_max", s_prefs.recent_max);
-
-    /* Toolchain overrides: only persist kinds the user actually set
-     * (non-empty path & from_override flag). */
-    JceJson *tc = jce_json_object();
-    if (tc) {
-        for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
-            const JceToolchain *t = jce_toolchain_get((JceToolchainKind)i);
-            if (t && t->from_override && t->path[0]) {
-                jce_json_set_string(tc,
-                    jce_toolchain_kind_name((JceToolchainKind)i),
-                    t->path);
-            }
-        }
-        jce_json_set_child(root, "toolchain_overrides", tc);
+    /* Toolchain overrides: persist kinds the user actually set; clear the
+     * KV for kinds whose override was removed this session. */
+    for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+        char key[64];
+        snprintf(key, sizeof(key), "toolchain.%s",
+                 jce_toolchain_kind_name((JceToolchainKind)i));
+        const JceToolchain *t = jce_toolchain_get((JceToolchainKind)i);
+        if (t && t->from_override && t->path[0])
+            jce_editor_config_set_ui_str(key, t->path);
+        else
+            jce_editor_config_set_ui_str(key, "");
     }
-
-    jce_json_write_file(PREFS_PATH, root, /*pretty=*/true,
-                        /*take_ownership=*/true);
 }
 
 void ensure_loaded()
 {
     if (s_loaded) return;
-    /* New-fields prefs first, then mirror canonical editor config. */
-    load_from_disk();
+    /* Canonical config first (it performs the one-time prefs.json merge),
+     * then mirror the general fields + toolchains out of it. */
     if (!jce_editor_config_load(&s_cfg))
         jce_editor_config_defaults(&s_cfg);
+    load_from_disk();
     /* Push the user's recent-list cap into the config layer so add_recent
      * honors it from startup (previously recent_max was inert). */
     jce_editor_config_set_recent_cap(s_prefs.recent_max);
@@ -326,7 +311,7 @@ void draw_tab_general()
          * already-stored lists so the change is observable now, not only
          * after entries age out. */
         jce_editor_config_set_recent_cap(s_prefs.recent_max);
-        int cap = s_prefs.recent_max < 10 ? s_prefs.recent_max : 10;
+        int cap = s_prefs.recent_max;   /* arrays hold 20 (was min(.,10)) */
         bool cfg_trimmed = false;
         if (s_cfg.recent_count > cap)       { s_cfg.recent_count = cap;       cfg_trimmed = true; }
         if (s_cfg.recent_scene_count > cap) { s_cfg.recent_scene_count = cap; cfg_trimmed = true; }
@@ -340,6 +325,13 @@ void draw_tab_appearance()
 {
     bool prefs_dirty = false;
     bool cfg_dirty   = false;
+
+    /* The language picker below shows every locale's NATIVE name; the
+     * Korean/Cyrillic glyphs those names need are locale-gated out of
+     * non-ko/ru/uk sessions (memory charter).  Lift the gates the moment
+     * the user reaches this tab — one deferred atlas rebuild, latched for
+     * the session — so "한국어" / "Русский" never show as "?" here. */
+    jce_editor_style_ensure_locale_picker_glyphs();
 
     /* Language — picker is data-driven: it walks every installed
      * locale via jce_editor_i18n_locale_count() and asks each one for
@@ -371,15 +363,26 @@ void draw_tab_appearance()
                 bool sel = (i == cur_loc);
                 if (ImGui::Selectable(unique, sel) && i != cur_loc) {
                     jce_editor_i18n_set_locale((JceLocale)i);
-                    /* Persist the new locale into editor-config.json so it
-                       survives a restart. Without this the runtime switch
-                       happens but the config save below writes the OLD
-                       language back to disk. */
+                    /* Persist the new locale so it survives a restart.
+                       Without this the runtime switch happens but the config
+                       save below writes the OLD language back to disk. */
                     const char *code = jce_editor_i18n_locale_code((JceLocale)i);
                     if (code && *code) {
                         snprintf(s_cfg.language, sizeof(s_cfg.language),
                                  "%s", code);
                     }
+                    /* Rebuild the font atlas for the new locale.  The heavy
+                       locale-gated glyph passes (Korean Hangul ~11k glyphs,
+                       Cyrillic) only enter the atlas when the font builder
+                       runs WITH that locale active — without this rebuild,
+                       switching to ko/ru/uk rendered '?' until the next
+                       editor restart (the boot path loads the right font
+                       from the saved language).  set_locale above already
+                       switched the active locale, so the deferred reload
+                       sees the new language. */
+                    jce_editor_request_font_reload((float)s_cfg.font_size,
+                                                   s_cfg.font_en_path,
+                                                   s_cfg.font_zh_path);
                     cfg_dirty = true;
                 }
                 if (sel) ImGui::SetItemDefaultFocus();
@@ -390,7 +393,7 @@ void draw_tab_appearance()
 
     /* Theme — 3 choices (Dark/Light/Blue) matching the canonical
      * jce_editor_style.cpp custom palettes. */
-    int  cur_theme = theme_str_to_idx(s_cfg.theme);
+    int  cur_theme = jce_editor_theme_from_string(s_cfg.theme);
     int  new_theme = cur_theme;
     if (combo_enum(jce_editor_i18n("panel.preferences.theme"),
                    &new_theme, JCE_THEME_COUNT, theme_label_i18n)) {
@@ -730,9 +733,12 @@ void draw_tab_toolchains()
             ImVec4 col = t->from_override
                 ? ImVec4(0.4f, 0.7f, 1.0f, 1.0f)
                 : ImVec4(0.4f, 0.9f, 0.4f, 1.0f);
-            ImGui::TextColored(col, t->from_override ? "override" : "OK");
+            ImGui::TextColored(col, "%s", t->from_override
+                ? jce_editor_i18n_or("panel.preferences.toolchain.override", "override")
+                : jce_editor_i18n_or("panel.preferences.toolchain.ok", "OK"));
         } else {
-            ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.5f, 1.0f), "missing");
+            ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.5f, 1.0f), "%s",
+                jce_editor_i18n_or("panel.preferences.toolchain.missing", "missing"));
         }
 
         ImGui::TableSetColumnIndex(2);
@@ -743,12 +749,11 @@ void draw_tab_toolchains()
         ImGui::SetNextItemWidth(-1.0f);
         char label[64];
         std::snprintf(label, sizeof label, "##tcpath_%d", i);
-        if (ImGui::InputTextWithHint(label, t->path,
-                                     s_buf[i], sizeof s_buf[i],
-                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
-            jce_toolchain_set_override((JceToolchainKind)i, s_buf[i]);
-            save_to_disk();
-        }
+        /* Commit only on deactivate-after-edit: Enter both returns true
+         * (EnterReturnsTrue) AND deactivates the widget, so a second
+         * commit branch fired set+save TWICE per edit.  Deactivation
+         * covers every commit path (Enter, Tab, click-away). */
+        ImGui::InputTextWithHint(label, t->path, s_buf[i], sizeof s_buf[i]);
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             jce_toolchain_set_override((JceToolchainKind)i, s_buf[i]);
             save_to_disk();
@@ -1012,6 +1017,21 @@ extern "C" void jce_editor_panel_user_preferences(void)
     if (!s_modal_open) return;
 
     ensure_loaded();
+
+    /* Close the stale-snapshot clobber window: when another writer bumps the
+     * config singleton mid-modal (autosave recents, a toolbar toggle), re-sync
+     * the mirror before drawing, so the next whole-struct save from this
+     * panel carries their values instead of reverting them.  Generation-
+     * gated (not per-frame) so in-flight widget edits — a font-size slider
+     * drag lives in s_cfg across frames before its release-commit — are
+     * never fought.  Our own saves bump the generation too, causing one
+     * no-op re-sync next frame (s_cfg already equals the singleton). */
+    static uint64_t s_seen_gen = 0;
+    if (jce_editor_config_generation() != s_seen_gen) {
+        if (!jce_editor_config_load(&s_cfg))
+            jce_editor_config_defaults(&s_cfg);
+        s_seen_gen = jce_editor_config_generation();
+    }
 
     /* Center on the main viewport (no docking, no save settings). */
     const ImGuiViewport *vp = ImGui::GetMainViewport();

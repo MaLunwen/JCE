@@ -151,6 +151,12 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     if (def.alignment_log2 == 0) def.alignment_log2 = 4;
 
     const bool encrypt = def.encrypt && def.encryption_key != NULL;
+    /* Archive v1 dictionaries are stored before the data region and are not
+     * encrypted independently.  Training them from protected JSON/text can
+     * therefore reproduce asset names or content in plaintext even when every
+     * entry and the index are encrypted.  Secure cooks disable dictionaries
+     * until the format has an authenticated encrypted-dictionary contract. */
+    const bool use_dict = def.use_dict && !encrypt;
 
     JceArchiveWriterConfig wc = {0};
     wc.zstd_level     = def.zstd_level;
@@ -179,7 +185,7 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     int class_dict[CLS_COUNT];
     for (int c = 0; c < CLS_COUNT; ++c) class_dict[c] = -1;
     uint16_t trained = 0;
-    if (def.use_dict && count > 0) {
+    if (use_dict && count > 0) {
         class_dict[CLS_JSON]   = train_class_dict(w, inputs, cls_of, count, CLS_JSON);
         class_dict[CLS_TEXT]   = train_class_dict(w, inputs, cls_of, count, CLS_TEXT);
         class_dict[CLS_SHADER] = train_class_dict(w, inputs, cls_of, count, CLS_SHADER);
@@ -190,9 +196,9 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     bool ok = true;
     for (size_t i = 0; i < count && ok; ++i) {
         int dict_id = cls_of ? class_dict[cls_of[i]] : -1;
-        /* Encrypt EVERYTHING when requested (incl. manifests): the
-         * encrypted add path composes with dictionary compression —
-         * compress (optionally with dict) first, then encrypt (§9.2). */
+        /* Encrypt EVERYTHING when requested (including manifests). Secure
+         * archive v1 intentionally uses independent zstd compression because
+         * its dictionary region has no encrypted representation. */
         ok = encrypt
             ? jce_archive_writer_add_encrypted(w, inputs[i].vpath,
                                                inputs[i].data, inputs[i].size, dict_id)

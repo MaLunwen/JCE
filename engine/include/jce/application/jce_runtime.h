@@ -48,6 +48,15 @@ typedef struct JceBlackboard        JceBlackboard;
  * public surface).  Callers that act on it include the internal header. */
 typedef struct JceRagdoll           JceRagdoll;
 
+#define JCE_RUNTIME_MAX_TOUCHES 5
+
+typedef struct {
+	uint64_t id;
+	float x;
+	float y;
+	float pressure;
+} JceRuntimeTouch;
+
 typedef struct {
 	/* Scene to drive — must remain valid for the runtime's lifetime. */
 	JceScene      *scene;
@@ -69,8 +78,9 @@ typedef struct {
 	float          gravity_y;        /* default -9.81 */
 	float          fixed_timestep;   /* default 1/60  */
 
-	/* Optional audio resolver.  When set, the runtime calls this for
-	 * every AudioSource clip instead of `jce_audio_load(audio, pak, clip)`.
+    /* Optional audio resolver.  When set, the runtime calls this for
+     * every synchronous one-shot and editor-hosted AudioSource clip instead
+     * of `jce_audio_load(audio, pak, clip)`.
 	 * Use this to plug in a host-filesystem probe (editor in-tree assets)
 	 * or any custom path resolution layer.  Return JCE_SOUND_INVALID to
 	 * signal "could not load" — the runtime will warn-log and skip the
@@ -158,6 +168,19 @@ typedef struct {
 	bool  sprint;
 	bool  jump_held;
 	bool  attack_pressed;   /* edge-triggered melee button (script: jce.attack_pressed) */
+	/* Raw pointer state for data-driven gameplay scripts.  This is a frame
+	 * sample: deltas, wheel, and buttons are cleared after each runtime step,
+	 * so every host supplies the current state immediately before step().
+	 * Button bits use JCE's 1-based numbering:
+	 * bit 0 = button 1 (left), bit 1 = button 2 (middle), etc. */
+	float pointer_dx;
+	float pointer_dy;
+	float pointer_wheel;
+	uint32_t pointer_buttons;
+	/* Bounded transient touch sample.  Hosts replace it each frame; the runtime
+	 * clears it after step() so focus loss cannot leave a gesture held. */
+	int touch_count;
+	JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES];
 } JceRuntimeInput;
 
 /* Snapshot the scene into physics/audio state.  Returns NULL on failure.
@@ -352,6 +375,17 @@ JCE_API float       JCE_CALL jce_runtime_interpolation_alpha(const JceRuntime *r
  * worrying about exact frame alignment. */
 JCE_API void        JCE_CALL jce_runtime_set_input(JceRuntime *rt,
                                                    const JceRuntimeInput *in);
+
+/* Supply one frame of raw pointer state without disturbing movement/jump
+ * input.  The complete pointer sample is cleared after the next step(). */
+JCE_API void        JCE_CALL jce_runtime_set_pointer_input(
+    JceRuntime *rt, float dx, float dy, float wheel, uint32_t buttons);
+
+/* Replace the current frame's touch sample without disturbing movement or
+ * pointer state.  At most JCE_RUNTIME_MAX_TOUCHES finite samples are kept in
+ * stable input order; NULL/zero releases all touches. */
+JCE_API void        JCE_CALL jce_runtime_set_touch_input(
+    JceRuntime *rt, const JceRuntimeTouch *touches, int count);
 
 /* Bind the live data-driven action map for THIS frame so gameplay scripts can
  * query arbitrary authored verbs/axes by name (jce.is_action_down / get_axis),

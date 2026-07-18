@@ -9,14 +9,41 @@
 #include "jce_panel_hierarchy_internal.h"
 #include "jce_panel_hierarchy_input.h"
 #include "ui/jce_editor_dnd.h"
+#include "core/jce_editor_project_state.h"
 #include "core/jce_hotkeys.h"
+#include <jce/os/core/jce_perf_phase.h>
+#include <jce/os/core/jce_timer.h>
 #include <cctype>
+
+/* Tag-filter combo entries; the i18n ids double as the stable tokens the
+ * per-project store persists the filter under (indices could drift if the
+ * palette ever changes). */
+static const char *kTagFilter[] = {
+    "tagColor.all", "tagColor.red", "tagColor.orange", "tagColor.yellow",
+    "tagColor.green", "tagColor.blue", "tagColor.purple", "tagColor.gray"
+};
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
 void jce_editor_panel_hierarchy_content(void)
 {
     ensure_hier_init();
+
+    /* Restore per-project view state once the project store is live — it is
+     * inert until a project root is known, so the first draw can be too
+     * early to read from it. */
+    static bool s_pstate_restored = false;
+    if (!s_pstate_restored && jce_editor_pstate_active()) {
+        s_pstate_restored = true;
+        int sm = jce_editor_pstate_get_int("hierarchy.sort", s_hier.sort_mode);
+        if (sm >= 0 && sm < 3) s_hier.sort_mode = sm;
+        char tag[32];
+        if (jce_editor_pstate_get_str("hierarchy.tag_filter", tag, sizeof(tag))) {
+            for (int i = 0; i < 8; i++) {
+                if (strcmp(tag, kTagFilter[i]) == 0) { s_hier.tag_filter = i; break; }
+            }
+        }
+    }
 
     uint32_t focused_now = jce_state_get_focused();
     if (focused_now != s_hier.last_focus_seen) {
@@ -32,21 +59,18 @@ void jce_editor_panel_hierarchy_content(void)
     ImGui::PopItemWidth();
 
     ImGui::PushItemWidth(100);
-    {
-        static const char *kTagFilter[] = {
-            "tagColor.all", "tagColor.red", "tagColor.orange", "tagColor.yellow",
-            "tagColor.green", "tagColor.blue", "tagColor.purple", "tagColor.gray"
-        };
-        ImGui::Combo("##tag_filter", &s_hier.tag_filter,
-                     jce_editor_i18n_combo(kTagFilter, 8));
-    }
+    if (ImGui::Combo("##tag_filter", &s_hier.tag_filter,
+                     jce_editor_i18n_combo(kTagFilter, 8)))
+        jce_editor_pstate_set_str("hierarchy.tag_filter",
+                                  kTagFilter[s_hier.tag_filter]);
     ImGui::SameLine();
     {
         static const char *kSort[] = {
             "hierarchy.sort.default", "hierarchy.sort.byName", "hierarchy.sort.byTag"
         };
-        ImGui::Combo("##sort", &s_hier.sort_mode,
-                     jce_editor_i18n_combo(kSort, 3));
+        if (ImGui::Combo("##sort", &s_hier.sort_mode,
+                         jce_editor_i18n_combo(kSort, 3)))
+            jce_editor_pstate_set_int("hierarchy.sort", s_hier.sort_mode);
     }
     ImGui::PopItemWidth();
 
@@ -342,9 +366,15 @@ void jce_editor_panel_hierarchy(void)
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY);
     if (!*vis) return;
 
+    /* ed_hier phase: at 150k entities the per-frame rebuild (get_roots full
+     * scan + flatten) is the prime suspect for the editor's non-render
+     * app_update remainder — this number decides the change-gated rebuild. */
+    uint64_t _t0_hier = jce_time_perf_counter();
     char title[256];
     snprintf(title, sizeof(title), "%s###hierarchy", jce_editor_i18n("Hierarchy"));
     if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_hierarchy_content();
     ImGui::End();
+    jce_perf_phase_add("ed_hier", jce_time_perf_to_ms(_t0_hier,
+                                                      jce_time_perf_counter()));
 }

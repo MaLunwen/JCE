@@ -55,6 +55,10 @@
  *       jce.music_set_intensity(value)         -- set adaptive-music intensity
  *       jce.music_get_intensity()              -- read it back (0..1)
  *       jce.music_request_transition(segment)  -- beat/bar-quantized switch
+ *       jce.asset_read_text(path) -> string|nil
+ *                                              -- bounded virtual text asset
+ *       jce.get_touch_count() -> integer       -- current frame touch sample
+ *       jce.get_touch(index) -> id,x,y,p|nil   -- one-based touch lookup
  */
 
 #ifndef JCE_SCRIPT_H
@@ -70,6 +74,10 @@ JCE_EXTERN_C_BEGIN
 
 /* Entity identifier as seen by scripts (matches JceEntity = uint64_t). */
 typedef uint64_t JceScriptEntity;
+
+/* Text assets exposed to Lua are intentionally bounded.  Scripts can parse
+ * authored sidecars without gaining an unbounded allocation primitive. */
+#define JCE_SCRIPT_TEXT_ASSET_MAX_BYTES (1024u * 1024u)
 
 /* Result of jce.raycast(...) marshalled back to the script.  Plain POD so the
  * script layer never pulls in a physics type (the host maps the hit body back
@@ -122,6 +130,16 @@ typedef struct JceScriptHost {
     bool  (*action_down)(void *user, const char *name);
     bool  (*action_pressed)(void *user, const char *name);
     float (*action_axis)(void *user, const char *name);
+    /* Raw pointer input for scene-authored orbit/strategy controls.  Button
+     * numbers are 1-based (1 = left).  Deltas/wheel are per-frame values. */
+    void  (*pointer_delta)(void *user, float out_xy[2]);
+    float (*pointer_wheel)(void *user);
+    bool  (*pointer_button)(void *user, int button);
+    /* Backend-neutral touch sample.  Indices are zero-based at the host
+     * boundary; the Lua binding presents one-based indices. */
+    int   (*touch_count)(void *user);
+    bool  (*touch_get)(void *user, int index, uint64_t *id,
+                       float *x, float *y, float *pressure);
     /* Time control (Phase 0.2): let scripts drive global slow-motion /
      * hitstop / pause (jce.set_time_scale(s) / jce.pause(bool)). */
     void (*set_time_scale)(void *user, float scale);
@@ -145,9 +163,9 @@ typedef struct JceScriptHost {
                     float *out_value);
     bool (*gas_apply)(void *user, JceScriptEntity e, const char *attr_name,
                       int op, float magnitude, float duration_seconds);
-    /* Read a script file (PAK / mounted dirs). Returns a heap buffer the VM
-     * frees with jce_free, or NULL on miss. Required for jce_script_instantiate
-     * (file path); jce_script_instantiate_source does not use it. */
+    /* Read a script or text asset (PAK / mounted dirs). Returns a heap buffer
+     * the VM frees with jce_free, or NULL on miss. Required for
+     * jce_script_instantiate(path) and backs bounded jce.asset_read_text(). */
     void *(*read_file)(void *user, const char *path, uint64_t *out_size);
 
     /* ── Physics queries / forces (gameplay scripting depth) ───────────────
@@ -261,6 +279,11 @@ typedef struct JceScriptHost {
      *                           jce.particle_set_emitting(entity, on). */
     void (*particle_burst)(void *user, JceScriptEntity e, int count);
     void (*particle_set_emitting)(void *user, JceScriptEntity e, bool on);
+    /* particle_set_color : retint the entity emitter's newly-spawned particles
+     *                      (RGB; alphas preserved). Backs
+     *                      jce.particle_set_color(entity, r, g, b). */
+    void (*particle_set_color)(void *user, JceScriptEntity e,
+                               float r, float g, float b);
 
     /* ── Component presence / enable (lightweight runtime reflection) ────────
      * Query / toggle a component on entity `e` BY NAME (the registry name, e.g.
@@ -318,6 +341,38 @@ typedef struct JceScriptHost {
     void  (*music_set_intensity)(void *user, float intensity);
     float (*music_get_intensity)(void *user);
     float (*music_request_transition)(void *user, int to_segment);
+
+    /* ── Scene-driver surface (editor-Play/runtime logic parity) ──────────
+     * Lets a scene-bound script own look/season/weather logic that used to
+     * require app exe code, so editor Play simulates identically to the
+     * shipped runtime.
+     *   find_by_name   : entities whose NAME matches exactly. Returns count;
+     *                    Lua exposes the first entity plus that match count so
+     *                    strict scene directors can reject duplicate names.
+     *   find_by_prefix : entities whose name STARTS WITH prefix (bulk sets
+     *                    like "leaf_"). Returns count.
+     *   comp_get_json  : serialize one live component ("Water", "PointLight",
+     *                    "MeshRenderer", ...) to its authored scene-JSON
+     *                    object. Heap string — release via json_free.
+     *   comp_set_json  : apply a JSON object of authored fields to a
+     *                    component (routes through the typed setters, so
+     *                    epochs/derived state update like a scene load).
+     *   render_get_json/render_set_json : same for the scene-level rendering
+     *                    settings (dome/fog/ambient/postfx). set merges —
+     *                    absent keys keep their current value.
+     *   audio_set_volume : live volume of the entity's AudioSource voice
+     *                    (looping soundscapes; base for occlusion math). */
+    int   (*find_by_name)(void *user, const char *name,
+                          JceScriptEntity *out, int max);
+    int   (*find_by_prefix)(void *user, const char *prefix,
+                            JceScriptEntity *out, int max);
+    char *(*comp_get_json)(void *user, JceScriptEntity e, const char *type);
+    bool  (*comp_set_json)(void *user, JceScriptEntity e, const char *type,
+                           const char *json);
+    char *(*render_get_json)(void *user);
+    bool  (*render_set_json)(void *user, const char *json);
+    void  (*json_free)(void *user, char *s);
+    void  (*audio_set_volume)(void *user, JceScriptEntity e, float volume);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;

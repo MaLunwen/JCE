@@ -256,6 +256,7 @@ JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
 
     sky->cubemap_size = cubemap_size > 0 ? cubemap_size : 512;
     sky->cubemap_tex.idx = UINT16_MAX;
+    sky->equirect_tex.idx = UINT16_MAX;   /* idx==0 is valid: sentinel for parity */
 
     int w = 0, h = 0;
     float *pixels = load_hdr_pixels(path, NULL, 0, &w, &h);
@@ -291,6 +292,7 @@ JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_siz
 
     sky->cubemap_size = cubemap_size > 0 ? cubemap_size : 512;
     sky->cubemap_tex.idx = UINT16_MAX;
+    sky->equirect_tex.idx = UINT16_MAX;   /* idx==0 is valid: sentinel for parity */
 
     int w = 0, h = 0;
     float *pixels = load_hdr_pixels(NULL, data, data_size, &w, &h);

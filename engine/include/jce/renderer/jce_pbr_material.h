@@ -19,6 +19,8 @@
 
 JCE_EXTERN_C_BEGIN
 
+typedef struct JceFileSystem JceFileSystem;
+
 typedef struct JceRenderer JceRenderer;
 
 /* ================================================================== */
@@ -132,8 +134,16 @@ JCE_API void jce_pbr_material_shutdown(void);
  * bgfx .bin blobs), both are loaded and linked into out->custom_program so
  * graph-generated shaders persisted by the editor render automatically.
  * Returns true on success. */
-bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
-                                 char out_tex_paths[5][256]);
+JCE_API bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
+                                        char out_tex_paths[5][256]);
+
+/* VFS equivalent of jce_pbr_material_load_json().  Paths remain virtual and
+ * are resolved relative to the material path before falling back to the VFS
+ * root, so PAK-only scenes retain the same material contract as loose files. */
+JCE_API bool jce_pbr_material_load_json_vfs(const JceFileSystem *fs,
+                                            const char *path,
+                                            JcePbrMaterial *out,
+                                            char out_tex_paths[5][256]);
 
 /* Save PBR material parameters to a .mat.json file.
  * tex_paths[0..4] = albedo, metallic_roughness, normal, ao, emissive. */

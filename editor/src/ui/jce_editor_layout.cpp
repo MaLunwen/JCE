@@ -34,6 +34,7 @@
 #include "core/jce_editor_project.h"
 #include "jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_game_input_bridge.h"
 #include "core/jce_editor_config.h"
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
@@ -47,6 +48,8 @@ extern "C" {
 #include "scene/jce_editor_game_render.h"   /* jce_editor_game_render_is_mouse_captured */
 #include "core/jce_workspace.h"
 #include "panels/jce_panel_preferences.h"
+#include <jce/os/core/jce_perf_phase.h>
+#include <jce/os/core/jce_timer.h>
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/middleware/scene/jce_lod.h>
@@ -204,6 +207,7 @@ static bool s_reset_layout_requested = false;
 /* Layout preset to apply on next reset. 0=Default, 1=Wide, 2=Animation, 3=TwoByTwo. */
 static int  s_layout_preset_pending = 0;
 static bool s_focus_scene_view = false;
+static bool s_focus_game_view = false;
 static bool s_focus_inspector = false;
 static bool s_focus_file_viewer = false;
 static void cmd_toggle_demo_lod_(void);  /* fwd-decl: defined further down */
@@ -1111,7 +1115,31 @@ static void draw_menu_bar(void)
             bool has_any = (_ecfg.recent_scene_count > 0);
             if (ImGui::BeginMenu(jce_editor_i18n("menu.file.openRecentScene"), has_any)) {
                 int remove_idx = -1;
-                for (int i = 0; i < _ecfg.recent_scene_count; i++) {
+                /* Display order: scenes under the CURRENT project first, then
+                 * a separator, then the rest (cross-project jump list stays
+                 * whole — this is purely presentational).  Storage untouched. */
+                extern char s_current_project_root[512];
+                int order[20]; int n_order = 0; int n_first = 0;
+                size_t root_len = strlen(s_current_project_root);
+                auto under_project = [&](const char *p) -> bool {
+                    if (root_len == 0) return false;
+                    return strncmp(p, s_current_project_root, root_len) == 0;
+                };
+                for (int pass = 0; pass < 2; pass++) {
+                    for (int i = 0; i < _ecfg.recent_scene_count &&
+                                    n_order < (int)(sizeof(order)/sizeof(order[0])); i++) {
+                        const char *p = _ecfg.recent_scene_paths[i];
+                        if (!p || !p[0]) continue;
+                        bool in_proj = under_project(p);
+                        if ((pass == 0) == in_proj) order[n_order++] = i;
+                    }
+                    if (pass == 0) n_first = n_order;   /* in-project group size */
+                }
+                for (int oi = 0; oi < n_order; oi++) {
+                    /* Separator between the current-project group and the rest. */
+                    if (oi == n_first && n_first > 0 && n_first < n_order)
+                        ImGui::Separator();
+                    int i = order[oi];
                     const char *p = _ecfg.recent_scene_paths[i];
                     if (!p || !p[0]) continue;
                     bool exists = jce_fs_host_exists_file(p);
@@ -2285,20 +2313,38 @@ extern "C" void jce_editor_panel_default_pose(const char *imgui_window_name)
     ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
 }
 
+
+/* Rolling per-panel phase sampler for draw_panel_windows: one phase per
+ * section, charged from the previous sample point — locates which panel
+ * owns the 150k "panels-other-than-hierarchy" 9.9ms/frame remainder. */
+static inline void panel_phase(const char *name, uint64_t *t)
+{
+    uint64_t now = jce_time_perf_counter();
+    jce_perf_phase_add(name, jce_time_perf_to_ms(*t, now));
+    *t = now;
+}
+
 static void draw_panel_windows(void)
 {
+    uint64_t ed_pt = jce_time_perf_counter();
     char lbl[256];
 
     /* ── Hierarchy ────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY)) {
+        /* ed_hier phase: prime suspect for the pure-UI app_update remainder
+         * at large entity counts (per-frame get_roots scan + flatten). */
+        uint64_t _t0_hier = jce_time_perf_counter();
         snprintf(lbl, sizeof(lbl), "%s###hierarchy", jce_editor_i18n("Hierarchy"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY), ImGuiWindowFlags_NoFocusOnAppearing)) {
             jce_editor_panel_hierarchy_content();
         }
         ImGui::End();
+        jce_perf_phase_add("ed_hier", jce_time_perf_to_ms(_t0_hier,
+                                                          jce_time_perf_counter()));
     }
 
+    panel_phase("ed_p_hierarchy", &ed_pt);
     /* ── Scene View ───────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###scene_view", jce_editor_i18n("Scene"));
@@ -2315,18 +2361,27 @@ static void draw_panel_windows(void)
         ImGui::PopStyleVar();
     }
 
+    panel_phase("ed_p_scene_view", &ed_pt);
     /* ── Game View ────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###game_view", jce_editor_i18n("Game"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        if (s_focus_game_view) {
+            ImGui::SetNextWindowFocus();
+            s_focus_game_view = false;
+        }
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW), ImGuiWindowFlags_NoFocusOnAppearing)) {
             jce_editor_panel_game_view_content();
+        } else {
+            jce_editor_game_input_bridge_publish(
+                jce_editor_game_input_bridge_shared(), nullptr);
         }
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
+    panel_phase("ed_p_game_view", &ed_pt);
     /* ── Inspector ────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_INSPECTOR)) {
         snprintf(lbl, sizeof(lbl), "%s###inspector", jce_editor_i18n("Inspector"));
@@ -2341,6 +2396,7 @@ static void draw_panel_windows(void)
         ImGui::End();
     }
 
+    panel_phase("ed_p_inspector", &ed_pt);
     /* ── File Viewer ──────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER)) {
         snprintf(lbl, sizeof(lbl), "%s###file_viewer", jce_editor_i18n("File Viewer"));
@@ -2355,6 +2411,7 @@ static void draw_panel_windows(void)
         ImGui::End();
     }
 
+    panel_phase("ed_p_file_viewer", &ed_pt);
     /* ── Console ──────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE)) {
         snprintf(lbl, sizeof(lbl), "%s###console", jce_editor_i18n("Console"));
@@ -2371,6 +2428,7 @@ static void draw_panel_windows(void)
         jce_editor_panel_timeline();
     }
 
+    panel_phase("ed_p_console", &ed_pt);
     /* ── Asset Browser ────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS)) {
         snprintf(lbl, sizeof(lbl), "%s###assets", jce_editor_i18n("Asset Browser"));
@@ -2391,6 +2449,7 @@ static void draw_panel_windows(void)
         jce_editor_panel_postfx();
     }
 
+    panel_phase("ed_p_asset_browser", &ed_pt);
     /* ── Lighting ─────────────────────────────────────────────────── */
     /* (Merged into JCE_PANEL_LIGHTING_SETTINGS — see below.) */
 
@@ -2402,6 +2461,7 @@ static void draw_panel_windows(void)
         jce_editor_panel_reverb_zones_content();
     }
 
+    panel_phase("ed_p_lighting", &ed_pt);
     /* ── Audio Mixer ──────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_AUDIO_MIXER)) {
         snprintf(lbl, sizeof(lbl), "%s###audio_mixer",
@@ -2413,6 +2473,7 @@ static void draw_panel_windows(void)
         ImGui::End();
     }
 
+    panel_phase("ed_p_audio_mixer", &ed_pt);
     /* ── Input Manager ────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_INPUT_MANAGER)) {
         snprintf(lbl, sizeof(lbl), "%s###input_manager",
@@ -2614,6 +2675,7 @@ static void draw_panel_windows(void)
     /* Bottom Status Bar (P0) */
     jce_editor_panel_status_bar();
 
+    panel_phase("ed_p_input_manager", &ed_pt);
     /* ── Profiler ─────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER)) {
         char title[64];
@@ -2660,6 +2722,7 @@ static void draw_panel_windows(void)
         jce_editor_panel_curve_editor();
     }
 
+    panel_phase("ed_p_profiler", &ed_pt);
     /* ── Animation Editor ────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR)) {
         jce_editor_panel_default_pose("animation_editor");
@@ -2684,24 +2747,28 @@ static void draw_panel_windows(void)
         jce_editor_panel_sequencer();
     }
 
+    panel_phase("ed_p_animation_edit", &ed_pt);
     /* ── NavMesh ─────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_NAVMESH)) {
         jce_editor_panel_default_pose("navmesh");
         jce_editor_panel_navmesh();
     }
 
+    panel_phase("ed_p_navmesh", &ed_pt);
     /* ── BT Visualizer ───────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_BT_VISUALIZER)) {
         jce_editor_panel_default_pose("bt_visualizer");
         jce_editor_panel_bt_visualizer();
     }
 
+    panel_phase("ed_p_bt_visualizer", &ed_pt);
     /* ── World Streaming ─────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_WORLD_STREAMING)) {
         jce_editor_panel_default_pose("world_streaming");
         jce_editor_panel_world_streaming();
     }
 
+    panel_phase("ed_p_world_streamin", &ed_pt);
     /* ── Terrain ─────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_TERRAIN)) {
         jce_editor_panel_default_pose("terrain");
@@ -2714,6 +2781,7 @@ static void draw_panel_windows(void)
         /* Redirects to the Lighting Settings workbench's Pipeline tab. */
         jce_editor_panel_render_pipeline();
     }
+    panel_phase("ed_p_terrain", &ed_pt);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -2898,7 +2966,12 @@ void jce_editor_layout_draw(void)
     ImGui::PopStyleVar(3);
 
     /* Menu bar */
-    draw_menu_bar();
+    {
+        uint64_t _t0_menu = jce_time_perf_counter();
+        draw_menu_bar();
+        jce_perf_phase_add("ed_menu", jce_time_perf_to_ms(_t0_menu,
+                                                          jce_time_perf_counter()));
+    }
 
     /* Top toolbar — drawn inline so the Window > Toolbar visibility
        toggle re-flows the layout (the DockSpace below naturally takes
@@ -3022,7 +3095,12 @@ void jce_editor_layout_draw(void)
     ImGui::End(); /* DockSpace */
 
     /* Draw all panel windows (dockable). */
-    draw_panel_windows();
+    {
+        uint64_t _t0_panels = jce_time_perf_counter();
+        draw_panel_windows();
+        jce_perf_phase_add("ed_panels", jce_time_perf_to_ms(_t0_panels,
+                                                            jce_time_perf_counter()));
+    }
 
     /* Panels get first refusal for context-specific editing shortcuts
      * (Assets, Material Graph, Hierarchy). Anything unconsumed falls back
@@ -3160,6 +3238,12 @@ void jce_editor_layout_request_focus_scene_view(void)
 {
     *jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW) = true;
     s_focus_scene_view = true;
+}
+
+void jce_editor_layout_request_focus_game_view(void)
+{
+    *jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW) = true;
+    s_focus_game_view = true;
 }
 
 void jce_editor_layout_request_focus_inspector(void)

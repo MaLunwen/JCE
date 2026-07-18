@@ -31,6 +31,7 @@ extern "C" {
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_occlusion_culler.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -137,6 +138,10 @@ struct SceneRenderState {
 
     /* GPU-query occlusion culler — optional two-pass coherence culling. */
     JceOcclusionCuller *occlusion_culler;
+
+    /* ECS-UI (Canvas) overlay renderer for the Scene View — mirrors the
+     * game view's instance; draw-only (no pointer interaction). */
+    JceUICanvas        *ui_canvas;
 };
 
 extern SceneRenderState s_sr;

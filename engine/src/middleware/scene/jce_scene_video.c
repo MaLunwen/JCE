@@ -170,6 +170,30 @@ typedef struct {
     void                 *resolve_ud;
 } SvCtx;
 
+static void *sv_read_clip_bytes(const SvCtx *ctx, const char *virtual_path,
+                                uint64_t *out_size)
+{
+    if (out_size) *out_size = 0;
+    if (!ctx || !virtual_path || !virtual_path[0]) return NULL;
+
+    if (ctx->resolve) {
+        char resolved[1024];
+        if (ctx->resolve(virtual_path, resolved, (int)sizeof(resolved),
+                         ctx->resolve_ud)) {
+            void *bytes = jce_fs_host_read_all(resolved, out_size);
+            if (bytes) return bytes;
+        }
+    }
+
+    JceFileSystem *fs = jce_fs_get_active();
+    if (fs) {
+        void *bytes = jce_fs_read_all(fs, virtual_path, out_size);
+        if (bytes) return bytes;
+    }
+
+    return jce_fs_host_read_all(virtual_path, out_size);
+}
+
 static void sv_ensure_open(JceVideoPlayerComponent *c, const SvCtx *ctx)
 {
     if (c->video != JCE_VIDEO_INVALID) return;
@@ -185,14 +209,8 @@ static void sv_ensure_open(JceVideoPlayerComponent *c, const SvCtx *ctx)
      * undo-redo) without the editor having to bump a counter. */
     const uint64_t want = jce_fnv1a64_str(c->clip_path);
 
-    char        resolved[1024];
-    const char *path = c->clip_path;
-    if (ctx->resolve &&
-        ctx->resolve(c->clip_path, resolved, (int)sizeof(resolved), ctx->resolve_ud))
-        path = resolved;
-
     uint64_t size = 0;
-    void    *bytes = jce_fs_host_read_all(path, &size);
+    void    *bytes = sv_read_clip_bytes(ctx, c->clip_path, &size);
     if (!bytes || size == 0) {
         if (bytes) jce_fs_buffer_free(bytes);
         /* Mark started (with the attempted path's hash) so we don't hammer the
@@ -203,7 +221,7 @@ static void sv_ensure_open(JceVideoPlayerComponent *c, const SvCtx *ctx)
         return;
     }
 
-    c->video       = jce_video_load_memory(bytes, (uint32_t)size, path);
+    c->video       = jce_video_load_memory(bytes, (uint32_t)size, c->clip_path);
     jce_fs_buffer_free(bytes);
     c->started     = true;
     c->opened_hash = want;
@@ -271,5 +289,7 @@ void jce_scene_video_update(JceScene *s, double dt,
     ctx.dt         = dt;
     ctx.resolve    = resolve_path;
     ctx.resolve_ud = resolve_ud;
-    jce_scene_each_entity(s, sv_each, &ctx);
+    /* Component-filtered walk (O(#players)); O(1) all-clear gate. */
+    if (jce_scene_count_video_players(s) == 0) return;
+    jce_scene_each_video_player(s, sv_each, &ctx);
 }

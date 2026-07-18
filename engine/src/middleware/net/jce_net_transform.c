@@ -386,6 +386,10 @@ static void entity_apply_transform(JceNetObjectId id,
     if (!t) return;
     t->position = pos;
     t->rotation = rot;
+    /* In-place snapshot apply: name the entity for L2 incremental repair
+     * (previously rendered correctly only because the physics blanket
+     * overflow forced a full ecull rebuild every frame). */
+    jce_scene_notify_physics_writeback_entity(g_nt.scene, (JceEntity)ent);
 }
 
 /* Send every entry whose authority side matches `is_authoritative` AND
