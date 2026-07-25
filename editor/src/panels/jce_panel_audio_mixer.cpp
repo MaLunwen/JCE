@@ -21,6 +21,7 @@
  *             └─ UI
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
@@ -29,6 +30,7 @@
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <jce/os/core/jce_json.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,9 +76,7 @@ static JceAudioBusId  s_selected_bus     = JCE_AUDIO_BUS_MASTER;
 static char           s_rename_buf[64]   = {0};
 static JceAudioBusId  s_renaming_bus     = JCE_AUDIO_BUS_INVALID;
 /* Tabs: 0=mixer, 1=snapshots, 2=reverb. */
-static int            s_pending_focus_tab = -1;
-static int            s_current_tab       = 0;
-static bool           s_tab_state_loaded  = false;
+static JcePanelTabState s_tabs{ "panel.audio_mixer.current_tab", /*max_tab=*/2 };
 static char           s_snapshot_buf[JCE_AUDIO_SNAPSHOT_NAME] = {0};
 static float          s_snapshot_fade     = 1.0f;
 
@@ -87,68 +87,47 @@ static float          s_snapshot_fade     = 1.0f;
  * each bus's chain by name at play start. */
 static std::map<JceAudioBusId, std::vector<JceAudioEffectDesc>> s_bus_effects;
 
-static const char *k_audio_tab_state_key = "panel.audio_mixer.current_tab";
-
-static void ensure_tab_state_loaded(void)
-{
-    if (s_tab_state_loaded)
-        return;
-    s_current_tab =
-        jce_editor_ui_state_load_int(k_audio_tab_state_key, 0, 0, 2);
-    s_pending_focus_tab = s_current_tab;
-    s_tab_state_loaded = true;
-}
-
-static void set_current_tab(int idx)
-{
-    if (idx < 0 || idx > 2 || s_current_tab == idx)
-        return;
-    s_current_tab = idx;
-    if (s_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_audio_tab_state_key, idx);
-}
-
 /* ── Persistence ────────────────────────────────────────────────────── */
 
-/* Append one effect-desc object to a std::string (compact JSON). */
-static void effect_to_json(std::string &s, const JceAudioEffectDesc &d)
+/* Build one effect-desc object node.  Returns nullptr on allocation failure. */
+static JceJson *effect_to_json(const JceAudioEffectDesc &d)
 {
-    char tmp[256];
+    JceJson *e = jce_json_object();
+    if (!e) return nullptr;
     switch (d.type) {
     case JCE_AUDIO_EFFECT_EQ:
-        std::snprintf(tmp, sizeof(tmp),
-            "{ \"type\": \"eq\", \"shape\": %d, \"freq\": %.4f, "
-            "\"gain_db\": %.4f, \"q\": %.4f }",
-            (int)d.u.eq.shape, (double)d.u.eq.frequency_hz,
-            (double)d.u.eq.gain_db, (double)d.u.eq.q);
+        jce_json_set_string(e, "type",    "eq");
+        jce_json_set_int   (e, "shape",   (int)d.u.eq.shape);
+        jce_json_set_number(e, "freq",    (double)d.u.eq.frequency_hz);
+        jce_json_set_number(e, "gain_db", (double)d.u.eq.gain_db);
+        jce_json_set_number(e, "q",       (double)d.u.eq.q);
         break;
     case JCE_AUDIO_EFFECT_COMPRESSOR:
-        std::snprintf(tmp, sizeof(tmp),
-            "{ \"type\": \"comp\", \"threshold_db\": %.4f, \"ratio\": %.4f, "
-            "\"attack_ms\": %.4f, \"release_ms\": %.4f, \"makeup_db\": %.4f, "
-            "\"knee_db\": %.4f }",
-            (double)d.u.comp.threshold_db, (double)d.u.comp.ratio,
-            (double)d.u.comp.attack_ms, (double)d.u.comp.release_ms,
-            (double)d.u.comp.makeup_db, (double)d.u.comp.knee_db);
+        jce_json_set_string(e, "type",         "comp");
+        jce_json_set_number(e, "threshold_db", (double)d.u.comp.threshold_db);
+        jce_json_set_number(e, "ratio",        (double)d.u.comp.ratio);
+        jce_json_set_number(e, "attack_ms",    (double)d.u.comp.attack_ms);
+        jce_json_set_number(e, "release_ms",   (double)d.u.comp.release_ms);
+        jce_json_set_number(e, "makeup_db",    (double)d.u.comp.makeup_db);
+        jce_json_set_number(e, "knee_db",      (double)d.u.comp.knee_db);
         break;
     case JCE_AUDIO_EFFECT_LIMITER:
-        std::snprintf(tmp, sizeof(tmp),
-            "{ \"type\": \"limiter\", \"ceiling_db\": %.4f, "
-            "\"release_ms\": %.4f }",
-            (double)d.u.limiter.ceiling_db, (double)d.u.limiter.release_ms);
+        jce_json_set_string(e, "type",       "limiter");
+        jce_json_set_number(e, "ceiling_db", (double)d.u.limiter.ceiling_db);
+        jce_json_set_number(e, "release_ms", (double)d.u.limiter.release_ms);
         break;
     case JCE_AUDIO_EFFECT_DELAY:
-        std::snprintf(tmp, sizeof(tmp),
-            "{ \"type\": \"delay\", \"delay_ms\": %.4f, \"feedback\": %.4f, "
-            "\"wet\": %.4f, \"dry\": %.4f }",
-            (double)d.u.delay.delay_ms, (double)d.u.delay.feedback,
-            (double)d.u.delay.wet, (double)d.u.delay.dry);
+        jce_json_set_string(e, "type",     "delay");
+        jce_json_set_number(e, "delay_ms", (double)d.u.delay.delay_ms);
+        jce_json_set_number(e, "feedback", (double)d.u.delay.feedback);
+        jce_json_set_number(e, "wet",      (double)d.u.delay.wet);
+        jce_json_set_number(e, "dry",      (double)d.u.delay.dry);
         break;
     default:
-        std::snprintf(tmp, sizeof(tmp), "{ \"type\": \"none\" }");
+        jce_json_set_string(e, "type", "none");
         break;
     }
-    s += tmp;
+    return e;
 }
 
 static void mixer_save(void)
@@ -157,105 +136,123 @@ static void mixer_save(void)
     JceAudioBusId ids[256] = {0};
     uint32_t      n        = jce_audio_mixer_list_buses(s_mixer, ids, 256);
 
-    /* Built with std::string so the extended schema (sends / sidechain /
-     * per-bus effects / snapshots) has no fixed-size buffer ceiling. */
-    std::string out;
-    out.reserve(1024 + n * 256);
+    /* Built as a JceJson tree, not printf'd text: bus and snapshot names are
+     * user-typed, and a name carrying a '"' or '\\' used to be pasted raw into
+     * the file (corrupting it / injecting keys).  The facade escapes. */
+    JceJson *root = jce_json_object();
+    if (!root) return;
     /* "version" gives future breaking schema changes something to gate on;
-     * both readers (mixer_load + engine jce_audio_mixer_config.c) are
-     * key-scanning and tolerate files with or without it. */
-    out += "{\n  \"version\": 1,\n  \"buses\": [\n";
+     * both readers (mixer_load + engine jce_audio_mixer_config.c) default
+     * every field, so files with or without it load identically. */
+    jce_json_set_int(root, "version", 1);
 
-    char row[512];
+    JceJson *buses = jce_json_array();
+    if (!buses) { jce_json_free(root); return; }
+    jce_json_set_child(root, "buses", buses);   /* buses now owned by root */
+
     for (uint32_t i = 0; i < n; ++i) {
         JceAudioBusId id     = ids[i];
         JceAudioBusId parent = jce_audio_mixer_get_parent(s_mixer, id);
         const char   *name   = jce_audio_mixer_get_name(s_mixer, id);
-        if (!name) name = "";
-        std::snprintf(row, sizeof(row),
-            "    { \"id\": %u, \"parent\": %u, \"name\": \"%s\","
-            " \"volume\": %.4f, \"muted\": %d, \"solo\": %d",
-            (unsigned)id, (unsigned)parent, name,
-            (double)jce_audio_mixer_get_volume(s_mixer, id),
-            jce_audio_mixer_is_muted(s_mixer, id) ? 1 : 0,
-            jce_audio_mixer_is_solo(s_mixer, id)  ? 1 : 0);
-        out += row;
+        JceJson      *b      = jce_json_object();
+        if (!b) { jce_json_free(root); return; }
+        jce_json_array_push(buses, b);          /* b now owned by buses */
+        jce_json_set_int   (b, "id",     (int)id);
+        jce_json_set_int   (b, "parent", (int)parent);
+        jce_json_set_string(b, "name",   name ? name : "");
+        jce_json_set_number(b, "volume",
+                            (double)jce_audio_mixer_get_volume(s_mixer, id));
+        /* muted/solo stay 0/1 NUMBERS so files written here still load in
+         * editors/runtimes that predate this rewrite. */
+        jce_json_set_int   (b, "muted",
+                            jce_audio_mixer_is_muted(s_mixer, id) ? 1 : 0);
+        jce_json_set_int   (b, "solo",
+                            jce_audio_mixer_is_solo(s_mixer, id)  ? 1 : 0);
 
         /* Aux sends from this bus.  Enumerated (send_at), not probed via
          * get_send: get_send returns 0 for both "no send" and "registered
          * but silent", so probing silently dropped amount-0 sends on save. */
-        std::string sends;
         uint32_t send_n = jce_audio_mixer_send_count(s_mixer, id);
+        JceJson *sends  = nullptr;
         for (uint32_t j = 0; j < send_n; ++j) {
             JceAudioBusId dest = JCE_AUDIO_BUS_INVALID;
             float amt = 0.0f;
             if (!jce_audio_mixer_send_at(s_mixer, id, j, &dest, &amt)) break;
-            std::snprintf(row, sizeof(row),
-                "%s{ \"dest\": %u, \"amount\": %.4f }",
-                sends.empty() ? "" : ", ",
-                (unsigned)dest, (double)amt);
-            sends += row;
-        }
-        if (!sends.empty()) {
-            out += ", \"sends\": [ ";
-            out += sends;
-            out += " ]";
+            if (!sends) {
+                sends = jce_json_array();
+                if (!sends) break;
+                jce_json_set_child(b, "sends", sends);
+            }
+            JceJson *s = jce_json_object();
+            if (!s) break;
+            jce_json_array_push(sends, s);
+            jce_json_set_int   (s, "dest",   (int)dest);
+            jce_json_set_number(s, "amount", (double)amt);
         }
 
         /* Sidechain installed on this (target) bus. */
         JceAudioDuckParams dp;
         if (jce_audio_mixer_get_sidechain(s_mixer, id, &dp)) {
-            std::snprintf(row, sizeof(row),
-                ", \"sidechain\": { \"key\": %u, \"threshold_db\": %.4f, "
-                "\"ratio\": %.4f, \"attack_ms\": %.4f, \"release_ms\": %.4f, "
-                "\"floor_db\": %.4f }",
-                (unsigned)dp.key, (double)dp.threshold_db, (double)dp.ratio,
-                (double)dp.attack_ms, (double)dp.release_ms,
-                (double)dp.max_attenuation_db);
-            out += row;
+            JceJson *sc = jce_json_object();
+            if (sc) {
+                jce_json_set_child (b,  "sidechain", sc);
+                jce_json_set_int   (sc, "key",          (int)dp.key);
+                jce_json_set_number(sc, "threshold_db", (double)dp.threshold_db);
+                jce_json_set_number(sc, "ratio",        (double)dp.ratio);
+                jce_json_set_number(sc, "attack_ms",    (double)dp.attack_ms);
+                jce_json_set_number(sc, "release_ms",   (double)dp.release_ms);
+                jce_json_set_number(sc, "floor_db",
+                                    (double)dp.max_attenuation_db);
+            }
         }
 
         /* Insert-effect chain (editor-side model). */
         auto it = s_bus_effects.find(id);
         if (it != s_bus_effects.end() && !it->second.empty()) {
-            out += ", \"effects\": [ ";
-            for (size_t k = 0; k < it->second.size(); ++k) {
-                if (k) out += ", ";
-                effect_to_json(out, it->second[k]);
+            JceJson *fx = jce_json_array();
+            if (fx) {
+                jce_json_set_child(b, "effects", fx);
+                for (const JceAudioEffectDesc &d : it->second)
+                    jce_json_array_push(fx, effect_to_json(d));
             }
-            out += " ]";
         }
-
-        out += (i + 1 < n) ? " },\n" : " }\n";
     }
-    out += "  ]";
 
     /* Top-level named snapshots. */
     uint32_t snap_n = jce_audio_mixer_snapshot_count(s_mixer);
     if (snap_n > 0) {
-        out += ",\n  \"snapshots\": [\n";
-        for (uint32_t si = 0; si < snap_n; ++si) {
-            char sname[JCE_AUDIO_SNAPSHOT_NAME] = {0};
-            if (!jce_audio_mixer_snapshot_name(s_mixer, si, sname, sizeof(sname)))
-                continue;
-            out += "    { \"name\": \"";
-            out += sname;
-            out += "\", \"volumes\": [ ";
-            std::string vols;
-            for (uint32_t i = 0; i < n; ++i) {
-                float v = jce_audio_mixer_snapshot_get_volume(s_mixer, sname, ids[i]);
-                if (v < 0.0f) continue;
-                std::snprintf(row, sizeof(row), "%s{ \"id\": %u, \"volume\": %.4f }",
-                              vols.empty() ? "" : ", ", (unsigned)ids[i], (double)v);
-                vols += row;
+        JceJson *snaps = jce_json_array();
+        if (snaps) {
+            jce_json_set_child(root, "snapshots", snaps);
+            for (uint32_t si = 0; si < snap_n; ++si) {
+                char sname[JCE_AUDIO_SNAPSHOT_NAME] = {0};
+                if (!jce_audio_mixer_snapshot_name(s_mixer, si, sname,
+                                                   sizeof(sname)))
+                    continue;
+                JceJson *sn = jce_json_object();
+                if (!sn) break;
+                jce_json_array_push(snaps, sn);
+                jce_json_set_string(sn, "name", sname);
+                JceJson *vols = jce_json_array();
+                if (!vols) continue;
+                jce_json_set_child(sn, "volumes", vols);
+                for (uint32_t i = 0; i < n; ++i) {
+                    float v = jce_audio_mixer_snapshot_get_volume(s_mixer,
+                                                                  sname, ids[i]);
+                    if (v < 0.0f) continue;
+                    JceJson *e = jce_json_object();
+                    if (!e) break;
+                    jce_json_array_push(vols, e);
+                    jce_json_set_int   (e, "id",     (int)ids[i]);
+                    jce_json_set_number(e, "volume", (double)v);
+                }
             }
-            out += vols;
-            out += " ] }";
-            out += (si + 1 < snap_n) ? ",\n" : "\n";
         }
-        out += "  ]";
     }
-    out += "\n}\n";
+
+    char *text = jce_json_print(root, /*pretty=*/true);
+    jce_json_free(root);
+    if (!text) return;
 
     /* Project Settings/ dir may not exist yet (fresh project). */
     if (s_current_project_root[0]) {
@@ -265,7 +262,8 @@ static void mixer_save(void)
     }
     /* Atomic (temp+rename): a mid-write crash must not corrupt the mixer
      * file — it seeds the runtime mixer at Play start and bundle builds. */
-    jce_fs_host_write_all_atomic(MIXER_PATH, out.data(), out.size());
+    jce_fs_host_write_all_atomic(MIXER_PATH, text, std::strlen(text));
+    jce_json_free_string(text);
 }
 
 /* Deferred-save latch: FX-insert and sidechain DragFloats report a change on
@@ -294,115 +292,55 @@ static void mixer_seed_default(void)
     jce_audio_mixer_add_bus(s_mixer, JCE_AUDIO_BUS_MASTER, "UI",    1.0f);
 }
 
-/* Scan a key:number within a bounded region [beg,end). Tolerates both
- * "key" : v and "key":v spacing.  Returns true if found. */
-static bool scan_uint(const char *beg, const char *end, const char *key,
-                      unsigned *out)
+/* Parse one effect-desc object.  Missing fields keep the type's engine
+ * defaults; returns false for an unknown/absent "type". */
+static bool parse_effect(const JceJson *e, JceAudioEffectDesc &d)
 {
-    const char *k = std::strstr(beg, key);
-    if (!k || k >= end) return false;
-    const char *c = std::strchr(k, ':');
-    if (!c || c >= end) return false;
-    return std::sscanf(c + 1, " %u", out) == 1;
-}
-static bool scan_float(const char *beg, const char *end, const char *key,
-                       float *out)
-{
-    const char *k = std::strstr(beg, key);
-    if (!k || k >= end) return false;
-    const char *c = std::strchr(k, ':');
-    if (!c || c >= end) return false;
-    return std::sscanf(c + 1, " %f", out) == 1;
-}
-static bool scan_str(const char *beg, const char *end, const char *key,
-                     char *out, size_t cap)
-{
-    const char *k = std::strstr(beg, key);
-    if (!k || k >= end) return false;
-    const char *c = std::strchr(k, ':');
-    if (!c || c >= end) return false;
-    const char *q1 = std::strchr(c, '"');
-    const char *q2 = q1 ? std::strchr(q1 + 1, '"') : nullptr;
-    if (!q1 || !q2 || q1 >= end || q2 >= end) return false;
-    size_t nl = (size_t)(q2 - q1 - 1);
-    if (nl >= cap) nl = cap - 1;
-    std::memcpy(out, q1 + 1, nl);
-    out[nl] = 0;
-    return true;
-}
-
-/* Find the matching closing brace for the '{' at `open` (handles nesting and
- * skips braces inside strings).  Returns pointer to the '}' or end. */
-static const char *match_brace(const char *open, const char *end)
-{
-    int depth = 0;
-    bool in_str = false;
-    for (const char *p = open; p < end; ++p) {
-        if (in_str) { if (*p == '"') in_str = false; continue; }
-        if (*p == '"') in_str = true;
-        else if (*p == '{') ++depth;
-        else if (*p == '}') { if (--depth == 0) return p; }
+    const char *type = jce_json_get_string(e, "type", "");
+    if (std::strcmp(type, "eq") == 0) {
+        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_EQ);
+        d.u.eq.shape = (JceAudioEqShape)
+            jce_json_get_int(e, "shape", (int)d.u.eq.shape);
+        d.u.eq.frequency_hz =
+            (float)jce_json_get_number(e, "freq",    d.u.eq.frequency_hz);
+        d.u.eq.gain_db =
+            (float)jce_json_get_number(e, "gain_db", d.u.eq.gain_db);
+        d.u.eq.q =
+            (float)jce_json_get_number(e, "q",       d.u.eq.q);
+    } else if (std::strcmp(type, "comp") == 0) {
+        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_COMPRESSOR);
+        d.u.comp.threshold_db =
+            (float)jce_json_get_number(e, "threshold_db", d.u.comp.threshold_db);
+        d.u.comp.ratio =
+            (float)jce_json_get_number(e, "ratio",        d.u.comp.ratio);
+        d.u.comp.attack_ms =
+            (float)jce_json_get_number(e, "attack_ms",    d.u.comp.attack_ms);
+        d.u.comp.release_ms =
+            (float)jce_json_get_number(e, "release_ms",   d.u.comp.release_ms);
+        d.u.comp.makeup_db =
+            (float)jce_json_get_number(e, "makeup_db",    d.u.comp.makeup_db);
+        d.u.comp.knee_db =
+            (float)jce_json_get_number(e, "knee_db",      d.u.comp.knee_db);
+    } else if (std::strcmp(type, "limiter") == 0) {
+        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_LIMITER);
+        d.u.limiter.ceiling_db =
+            (float)jce_json_get_number(e, "ceiling_db", d.u.limiter.ceiling_db);
+        d.u.limiter.release_ms =
+            (float)jce_json_get_number(e, "release_ms", d.u.limiter.release_ms);
+    } else if (std::strcmp(type, "delay") == 0) {
+        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_DELAY);
+        d.u.delay.delay_ms =
+            (float)jce_json_get_number(e, "delay_ms", d.u.delay.delay_ms);
+        d.u.delay.feedback =
+            (float)jce_json_get_number(e, "feedback", d.u.delay.feedback);
+        d.u.delay.wet =
+            (float)jce_json_get_number(e, "wet",      d.u.delay.wet);
+        d.u.delay.dry =
+            (float)jce_json_get_number(e, "dry",      d.u.delay.dry);
+    } else {
+        return false;
     }
-    return end;
-}
-
-/* Find the matching closing ']' for the '[' at `open` (handles nesting,
- * skips brackets inside strings).  Returns pointer to ']' or NULL. */
-static const char *match_brace_arr_end(const char *open, const char *end)
-{
-    int depth = 0;
-    bool in_str = false;
-    for (const char *p = open; p < end; ++p) {
-        if (in_str) { if (*p == '"') in_str = false; continue; }
-        if (*p == '"') in_str = true;
-        else if (*p == '[') ++depth;
-        else if (*p == ']') { if (--depth == 0) return p; }
-    }
-    return nullptr;
-}
-
-/* Parse one effects array (between '[' and its ']') into `dst`. */
-static void parse_effects(const char *beg, const char *end,
-                          std::vector<JceAudioEffectDesc> &dst)
-{
-    const char *p = beg;
-    while (p < end) {
-        const char *o = std::strchr(p, '{');
-        if (!o || o >= end) break;
-        const char *c = match_brace(o, end);
-        char type[16] = {0};
-        if (scan_str(o, c, "\"type\"", type, sizeof(type))) {
-            JceAudioEffectDesc d{};
-            if (std::strcmp(type, "eq") == 0) {
-                d = jce_audio_effect_default(JCE_AUDIO_EFFECT_EQ);
-                unsigned shape = (unsigned)d.u.eq.shape;
-                scan_uint (o, c, "\"shape\"",   &shape); d.u.eq.shape = (JceAudioEqShape)shape;
-                scan_float(o, c, "\"freq\"",    &d.u.eq.frequency_hz);
-                scan_float(o, c, "\"gain_db\"", &d.u.eq.gain_db);
-                scan_float(o, c, "\"q\"",       &d.u.eq.q);
-            } else if (std::strcmp(type, "comp") == 0) {
-                d = jce_audio_effect_default(JCE_AUDIO_EFFECT_COMPRESSOR);
-                scan_float(o, c, "\"threshold_db\"", &d.u.comp.threshold_db);
-                scan_float(o, c, "\"ratio\"",        &d.u.comp.ratio);
-                scan_float(o, c, "\"attack_ms\"",    &d.u.comp.attack_ms);
-                scan_float(o, c, "\"release_ms\"",   &d.u.comp.release_ms);
-                scan_float(o, c, "\"makeup_db\"",    &d.u.comp.makeup_db);
-                scan_float(o, c, "\"knee_db\"",      &d.u.comp.knee_db);
-            } else if (std::strcmp(type, "limiter") == 0) {
-                d = jce_audio_effect_default(JCE_AUDIO_EFFECT_LIMITER);
-                scan_float(o, c, "\"ceiling_db\"",  &d.u.limiter.ceiling_db);
-                scan_float(o, c, "\"release_ms\"",  &d.u.limiter.release_ms);
-            } else if (std::strcmp(type, "delay") == 0) {
-                d = jce_audio_effect_default(JCE_AUDIO_EFFECT_DELAY);
-                scan_float(o, c, "\"delay_ms\"",  &d.u.delay.delay_ms);
-                scan_float(o, c, "\"feedback\"",  &d.u.delay.feedback);
-                scan_float(o, c, "\"wet\"",       &d.u.delay.wet);
-                scan_float(o, c, "\"dry\"",       &d.u.delay.dry);
-            }
-            if (d.type != JCE_AUDIO_EFFECT_NONE) dst.push_back(d);
-        }
-        p = c + 1;
-    }
+    return d.type != JCE_AUDIO_EFFECT_NONE;
 }
 
 static bool mixer_load(void)
@@ -411,16 +349,16 @@ static bool mixer_load(void)
     char  *raw = (char *)ed_read_file(MIXER_PATH, &len);
     if (!raw) return false;
     if (len > (1 << 20)) { ED_FREE(raw); return false; }
-    const char *file_end = raw + len;
     s_bus_effects.clear();
 
-    /* Locate the buses array; bound bus parsing to it so snapshot/volume
-     * "id" keys are never mistaken for bus rows.  A top-level "version" key
-     * may precede it (absent in pre-version files) — the scanners key on
-     * names, so both forms parse identically. */
-    const char *buses_key = std::strstr(raw, "\"buses\"");
-    const char *buses_beg = buses_key ? std::strchr(buses_key, '[') : nullptr;
-    if (!buses_beg) { ED_FREE(raw); return true; }
+    JceJson *root = jce_json_parse(raw, len);
+    ED_FREE(raw);
+    /* The file EXISTS, so report loaded even when it is unparseable or carries
+     * no buses array: returning false makes ensure_mixer seed defaults and
+     * immediately mixer_save() over whatever the user had there. */
+    if (!root) return true;
+    JceJson *buses = jce_json_get(root, "buses");
+    if (!jce_json_is_array(buses)) { jce_json_free(root); return true; }
 
     /* Map a parsed JSON id -> the live bus id actually assigned. Buses are
      * created in file order, so deferred send/sidechain refs (which name
@@ -428,40 +366,29 @@ static bool mixer_load(void)
     std::map<unsigned, JceAudioBusId> id_map;
     id_map[JCE_AUDIO_BUS_MASTER] = JCE_AUDIO_BUS_MASTER;
 
-    /* Record per-bus deferred refs for pass 2 (object byte range). */
-    struct BusObj { JceAudioBusId live; const char *beg; const char *end; };
+    /* Record per-bus deferred refs for pass 2 (the bus's JSON node). */
+    struct BusObj { JceAudioBusId live; const JceJson *node; };
     std::vector<BusObj> objs;
 
-    /* Pass 1: create every bus, capture its object span.  Bound it to the
-     * matching ']' of the buses '[' so the snapshots array (which follows)
-     * is never scanned for bus rows. */
-    int bdepth = 0; bool bstr = false; const char *buses_end = file_end;
-    for (const char *q = buses_beg; q < file_end; ++q) {
-        if (bstr) { if (*q == '"') bstr = false; continue; }
-        if (*q == '"') bstr = true;
-        else if (*q == '[') ++bdepth;
-        else if (*q == ']') { if (--bdepth == 0) { buses_end = q; break; } }
-    }
-    const char *p = buses_beg + 1;
-    while (p < buses_end) {
-        const char *o = std::strchr(p, '{');
-        if (!o || o >= buses_end) break;
-        const char *c = match_brace(o, buses_end);
-        unsigned id = 0, parent = 0, mutedv = 0, solov = 0;
-        float    vol = 1.0f;
-        char     name[64] = {0};
-        scan_uint (o, c, "\"id\"",     &id);
-        scan_uint (o, c, "\"parent\"", &parent);
-        scan_str  (o, c, "\"name\"",   name, sizeof(name));
-        scan_float(o, c, "\"volume\"", &vol);
-        scan_uint (o, c, "\"muted\"",  &mutedv);
-        scan_uint (o, c, "\"solo\"",   &solov);
+    /* Pass 1: create every bus. */
+    const int bus_n = jce_json_array_size(buses);
+    for (int i = 0; i < bus_n; ++i) {
+        const JceJson *b = jce_json_array_at(buses, i);
+        if (!jce_json_is_object(b)) continue;
+        unsigned    id     = (unsigned)jce_json_get_int(b, "id",     0);
+        unsigned    parent = (unsigned)jce_json_get_int(b, "parent", 0);
+        float       vol    = (float)jce_json_get_number(b, "volume", 1.0);
+        /* muted/solo are written as 0/1 numbers; get_bool takes numbers and
+         * real booleans alike, so old and future files both read back. */
+        bool        muted  = jce_json_get_bool(b, "muted", false);
+        bool        solo   = jce_json_get_bool(b, "solo",  false);
+        const char *name   = jce_json_get_string(b, "name", "");
 
         JceAudioBusId live = JCE_AUDIO_BUS_INVALID;
         if (id == JCE_AUDIO_BUS_MASTER) {
             jce_audio_mixer_set_volume(s_mixer, JCE_AUDIO_BUS_MASTER, vol);
-            jce_audio_mixer_set_muted (s_mixer, JCE_AUDIO_BUS_MASTER, mutedv != 0);
-            jce_audio_mixer_set_solo  (s_mixer, JCE_AUDIO_BUS_MASTER, solov  != 0);
+            jce_audio_mixer_set_muted (s_mixer, JCE_AUDIO_BUS_MASTER, muted);
+            jce_audio_mixer_set_solo  (s_mixer, JCE_AUDIO_BUS_MASTER, solo);
             live = JCE_AUDIO_BUS_MASTER;
         } else if (id != 0 && name[0]) {
             unsigned par = parent ? parent : JCE_AUDIO_BUS_MASTER;
@@ -470,114 +397,97 @@ static bool mixer_load(void)
                 ? pit->second : JCE_AUDIO_BUS_MASTER;
             live = jce_audio_mixer_add_bus(s_mixer, par_id, name, vol);
             if (live != JCE_AUDIO_BUS_INVALID) {
-                jce_audio_mixer_set_muted(s_mixer, live, mutedv != 0);
-                jce_audio_mixer_set_solo (s_mixer, live, solov  != 0);
+                jce_audio_mixer_set_muted(s_mixer, live, muted);
+                jce_audio_mixer_set_solo (s_mixer, live, solo);
             }
         }
         if (live != JCE_AUDIO_BUS_INVALID) {
             id_map[id] = live;
-            objs.push_back({ live, o, c });
+            objs.push_back({ live, b });
 
             /* Insert-effect chain (resolved immediately; no id refs). */
-            const char *fx = std::strstr(o, "\"effects\"");
-            if (fx && fx < c) {
-                const char *fb = std::strchr(fx, '[');
-                const char *fe = (fb && fb < c) ? match_brace_arr_end(fb, c)
-                                                : nullptr;
-                if (fb && fe)
-                    parse_effects(fb + 1, fe, s_bus_effects[live]);
+            const JceJson *fx = jce_json_get(b, "effects");
+            if (jce_json_is_array(fx)) {
+                std::vector<JceAudioEffectDesc> &dst = s_bus_effects[live];
+                const int fx_n = jce_json_array_size(fx);
+                for (int k = 0; k < fx_n; ++k) {
+                    const JceJson *e = jce_json_array_at(fx, k);
+                    if (!jce_json_is_object(e)) continue;
+                    JceAudioEffectDesc d{};
+                    if (parse_effect(e, d)) dst.push_back(d);
+                }
             }
         }
-        p = c + 1;
     }
 
     /* Pass 2: sends + sidechain (need the full id_map resolved). */
     for (const BusObj &b : objs) {
-        const char *o = b.beg, *c = b.end;
         /* Sends: iterate { dest, amount } objects inside "sends":[...]. */
-        const char *sk = std::strstr(o, "\"sends\"");
-        if (sk && sk < c) {
-            const char *sb = std::strchr(sk, '[');
-            const char *se = sb ? match_brace_arr_end(sb, c) : nullptr;
-            if (sb && se) {
-                const char *q = sb + 1;
-                while (q < se) {
-                    const char *so = std::strchr(q, '{');
-                    if (!so || so >= se) break;
-                    const char *sc = match_brace(so, se);
-                    unsigned dest = 0; float amt = 0.0f;
-                    scan_uint (so, sc, "\"dest\"",   &dest);
-                    scan_float(so, sc, "\"amount\"", &amt);
-                    auto dit = id_map.find(dest);
-                    /* amount 0 = registered-but-silent (valid authored
-                     * state); reject only negative garbage. */
-                    if (dit != id_map.end() && amt >= 0.0f)
-                        jce_audio_mixer_set_send(s_mixer, b.live, dit->second, amt);
-                    q = sc + 1;
-                }
-            }
+        const JceJson *sends  = jce_json_get(b.node, "sends");
+        const int      send_n = jce_json_array_size(sends);
+        for (int si = 0; si < send_n; ++si) {
+            const JceJson *s = jce_json_array_at(sends, si);
+            if (!jce_json_is_object(s)) continue;
+            unsigned dest = (unsigned)jce_json_get_int(s, "dest",   0);
+            float    amt  = (float)jce_json_get_number(s, "amount", 0.0);
+            auto dit = id_map.find(dest);
+            /* amount 0 = registered-but-silent (valid authored state);
+             * reject only negative garbage. */
+            if (dit != id_map.end() && amt >= 0.0f)
+                jce_audio_mixer_set_send(s_mixer, b.live, dit->second, amt);
         }
         /* Sidechain object. */
-        const char *xk = std::strstr(o, "\"sidechain\"");
-        if (xk && xk < c) {
-            const char *xo = std::strchr(xk, '{');
-            const char *xc = xo ? match_brace(xo, c) : nullptr;
-            if (xo && xc) {
-                unsigned key = 0;
-                JceAudioDuckParams dp = jce_audio_duck_default_params();
-                scan_uint (xo, xc, "\"key\"",          &key);
-                scan_float(xo, xc, "\"threshold_db\"", &dp.threshold_db);
-                scan_float(xo, xc, "\"ratio\"",        &dp.ratio);
-                scan_float(xo, xc, "\"attack_ms\"",    &dp.attack_ms);
-                scan_float(xo, xc, "\"release_ms\"",   &dp.release_ms);
-                scan_float(xo, xc, "\"floor_db\"",     &dp.max_attenuation_db);
-                auto kit = id_map.find(key);
-                if (kit != id_map.end()) {
-                    dp.key = kit->second;
-                    jce_audio_mixer_set_sidechain(s_mixer, b.live, &dp, 48000u);
-                }
+        const JceJson *sc = jce_json_get(b.node, "sidechain");
+        if (jce_json_is_object(sc)) {
+            JceAudioDuckParams dp = jce_audio_duck_default_params();
+            unsigned key = (unsigned)jce_json_get_int(sc, "key", 0);
+            dp.threshold_db =
+                (float)jce_json_get_number(sc, "threshold_db", dp.threshold_db);
+            dp.ratio =
+                (float)jce_json_get_number(sc, "ratio",        dp.ratio);
+            dp.attack_ms =
+                (float)jce_json_get_number(sc, "attack_ms",    dp.attack_ms);
+            dp.release_ms =
+                (float)jce_json_get_number(sc, "release_ms",   dp.release_ms);
+            dp.max_attenuation_db =
+                (float)jce_json_get_number(sc, "floor_db", dp.max_attenuation_db);
+            auto kit = id_map.find(key);
+            if (kit != id_map.end()) {
+                dp.key = kit->second;
+                jce_audio_mixer_set_sidechain(s_mixer, b.live, &dp, 48000u);
             }
         }
     }
 
     /* Snapshots array (top-level). */
-    const char *snap_key = std::strstr(buses_end, "\"snapshots\"");
-    const char *snap_beg = snap_key ? std::strchr(snap_key, '[') : nullptr;
-    if (snap_beg) {
-        const char *snap_end = match_brace_arr_end(snap_beg, file_end);
-        const char *q = snap_beg ? snap_beg + 1 : nullptr;
-        while (q && snap_end && q < snap_end) {
-            const char *so = std::strchr(q, '{');
-            if (!so || so >= snap_end) break;
-            const char *sc = match_brace(so, snap_end);
-            char sname[JCE_AUDIO_SNAPSHOT_NAME] = {0};
-            if (scan_str(so, sc, "\"name\"", sname, sizeof(sname)) && sname[0]) {
-                /* volumes:[ { id, volume } ] */
-                const char *vb = std::strstr(so, "\"volumes\"");
-                vb = vb ? std::strchr(vb, '[') : nullptr;
-                if (vb && vb < sc) {
-                    const char *ve = match_brace_arr_end(vb, sc);
-                    const char *r = vb + 1;
-                    while (ve && r < ve) {
-                        const char *vo = std::strchr(r, '{');
-                        if (!vo || vo >= ve) break;
-                        const char *vc = match_brace(vo, ve);
-                        unsigned vid = 0; float vv = 0.0f;
-                        scan_uint (vo, vc, "\"id\"",     &vid);
-                        scan_float(vo, vc, "\"volume\"", &vv);
-                        auto vit = id_map.find(vid);
-                        if (vit != id_map.end())
-                            jce_audio_mixer_snapshot_set_volume(
-                                s_mixer, sname, vit->second, vv);
-                        r = vc + 1;
-                    }
-                }
-            }
-            q = sc + 1;
+    const JceJson *snaps  = jce_json_get(root, "snapshots");
+    const int      snap_n = jce_json_array_size(snaps);
+    for (int si = 0; si < snap_n; ++si) {
+        const JceJson *s = jce_json_array_at(snaps, si);
+        if (!jce_json_is_object(s)) continue;
+        /* The mixer stores snapshot names in a fixed 32-byte field, so a
+         * longer authored name must be truncated the same way here or the
+         * volumes below would key a second, differently-named snapshot. */
+        char sname[JCE_AUDIO_SNAPSHOT_NAME] = {0};
+        std::snprintf(sname, sizeof(sname), "%s",
+                      jce_json_get_string(s, "name", ""));
+        if (!sname[0]) continue;
+        /* volumes:[ { id, volume } ] */
+        const JceJson *vols  = jce_json_get(s, "volumes");
+        const int      vol_n = jce_json_array_size(vols);
+        for (int vi = 0; vi < vol_n; ++vi) {
+            const JceJson *v = jce_json_array_at(vols, vi);
+            if (!jce_json_is_object(v)) continue;
+            unsigned vid = (unsigned)jce_json_get_int(v, "id",     0);
+            float    vv  = (float)jce_json_get_number(v, "volume", 0.0);
+            auto vit = id_map.find(vid);
+            if (vit != id_map.end())
+                jce_audio_mixer_snapshot_set_volume(s_mixer, sname,
+                                                    vit->second, vv);
         }
     }
 
-    ED_FREE(raw);
+    jce_json_free(root);
     return true;
 }
 
@@ -1245,30 +1155,27 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
      * ramp the live bus volumes while this panel is open. */
     jce_audio_mixer_update(s_mixer, ImGui::GetIO().DeltaTime);
 
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(s_tabs);
     if (ImGui::BeginTabBar("##audio_mixer_tabs")) {
-        ImGuiTabItemFlags mixer_flags = (s_pending_focus_tab == 0)
-            ? ImGuiTabItemFlags_SetSelected : 0;
-        ImGuiTabItemFlags snap_flags = (s_pending_focus_tab == 1)
-            ? ImGuiTabItemFlags_SetSelected : 0;
-        ImGuiTabItemFlags reverb_flags = (s_pending_focus_tab == 2)
-            ? ImGuiTabItemFlags_SetSelected : 0;
-        s_pending_focus_tab = -1;
+        ImGuiTabItemFlags mixer_flags  = jce_panel_tab_flags(s_tabs, 0);
+        ImGuiTabItemFlags snap_flags   = jce_panel_tab_flags(s_tabs, 1);
+        ImGuiTabItemFlags reverb_flags = jce_panel_tab_flags(s_tabs, 2);
+        s_tabs.request = -1;
         if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.mixer"),
                                 nullptr, mixer_flags)) {
-            set_current_tab(0);
+            jce_panel_tab_set_current(s_tabs, 0);
             draw_mixer_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.snapshots"),
                                 nullptr, snap_flags)) {
-            set_current_tab(1);
+            jce_panel_tab_set_current(s_tabs, 1);
             draw_snapshots_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.reverb"),
                                 nullptr, reverb_flags)) {
-            set_current_tab(2);
+            jce_panel_tab_set_current(s_tabs, 2);
             draw_reverb_zones_tab();
             ImGui::EndTabItem();
         }
@@ -1281,22 +1188,17 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
 
 extern "C" void jce_editor_audio_mixer_focus_reverb_tab(void)
 {
-    s_pending_focus_tab = 2;
-    s_current_tab = 2;
-    jce_editor_ui_state_save_int(k_audio_tab_state_key, 2);
+    jce_panel_tab_request(s_tabs, 2);
 }
 
 extern "C" void jce_editor_audio_mixer_focus_mixer_tab(void)
 {
-    s_pending_focus_tab = 0;
-    s_current_tab = 0;
-    jce_editor_ui_state_save_int(k_audio_tab_state_key, 0);
+    jce_panel_tab_request(s_tabs, 0);
 }
 
 extern "C" int jce_editor_audio_mixer_current_tab(void)
 {
-    ensure_tab_state_loaded();
-    return s_current_tab;
+    return jce_panel_tab_current(s_tabs);
 }
 
 extern "C" void jce_editor_panel_audio_mixer(void)

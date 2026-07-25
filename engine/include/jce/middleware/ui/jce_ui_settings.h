@@ -81,13 +81,13 @@ JCE_API void               jce_settings_activate(JceSettingsPanel *panel);
 JCE_API void               jce_settings_update_i18n(JceSettingsPanel *panel);
 
 /* Change body font-family (e.g. on language switch). */
-void               jce_settings_set_font_family(JceSettingsPanel *panel,
+JCE_API void               jce_settings_set_font_family(JceSettingsPanel *panel,
                                                 const char *family);
 
 JCE_API JceUIDocHandle     jce_settings_get_doc(const JceSettingsPanel *panel);
 
 JCE_API JceSettingsVolumes jce_settings_get_volumes(const JceSettingsPanel *panel);
-void               jce_settings_set_volumes(JceSettingsPanel *panel,
+JCE_API void               jce_settings_set_volumes(JceSettingsPanel *panel,
                                             const JceSettingsVolumes *v);
 
 JCE_EXTERN_C_END

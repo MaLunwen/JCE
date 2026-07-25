@@ -44,6 +44,11 @@ static struct {
     void                *cb_user;
     double               accum_sec;  /* poll throttle accumulator */
     bool                 cap_warned;
+    /* Total materials refused because the table was full.  cap_warned
+     * silences the warning after the FIRST overflow, so without a running
+     * count a developer sees one line early in the session and never learns
+     * that hundreds more silently lost hot-reload. */
+    int                  dropped;
 } s;
 
 static void build_host_path(const char *vfs_path,
@@ -77,6 +82,13 @@ bool jce_material_registry_init(const char *dev_assets_dir)
 
 void jce_material_registry_shutdown(void)
 {
+    if (s.dropped > 0) {
+        LOG_WARN(LOG_TAG,
+                 "hot-reload: %d material(s) were never tracked (capacity %d "
+                 "reached; %d tracked). Those materials did not hot-reload "
+                 "this session — raise MAT_REG_MAX if this is routine.",
+                 s.dropped, MAT_REG_MAX, s.count);
+    }
     memset(&s, 0, sizeof(s));
 }
 
@@ -90,6 +102,7 @@ void jce_material_registry_clear(void)
 {
     s.count = 0;
     s.cap_warned = false;
+    s.dropped = 0;
 }
 
 void jce_material_registry_track(const char *vfs_path)
@@ -102,9 +115,11 @@ void jce_material_registry_track(const char *vfs_path)
     }
 
     if (s.count >= MAT_REG_MAX) {
+        s.dropped++;
         if (!s.cap_warned) {
             LOG_WARN(LOG_TAG,
-                "hot-reload capacity %d reached; further materials ignored",
+                "hot-reload capacity %d reached; further materials ignored "
+                "(total reported at shutdown)",
                 MAT_REG_MAX);
             s.cap_warned = true;
         }

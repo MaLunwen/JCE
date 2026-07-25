@@ -26,15 +26,21 @@ if(TARGET jce_i18n_auto)
 	add_dependencies(JCE_Editor jce_i18n_auto)
 endif()
 
-# Editor is C++17 (per project policy: engine = C99, editor = C++17).
+# Editor is C++20 (per project policy: engine = C99, editor = C++20).
 set_target_properties(JCE_Editor PROPERTIES
-	CXX_STANDARD 17
+	CXX_STANDARD 20
 	CXX_STANDARD_REQUIRED YES
 	CXX_EXTENSIONS NO)
 
+# The editor is a pure L7 engine consumer: it reaches the engine only through
+# the JCE facade + the sanctioned jce_tools_imgui (ImGui) target. It links no
+# third-party engine dependency directly — cjson/SDL3_image/bgfx were dead
+# direct links (editor sources reference them only in comments; verified by
+# scripts/lint/check_editor_consumer_purity.py). Removed per architecture
+# audit R-D41 (link-boundary: JCE_Editor). If a real need for a backend
+# symbol appears, expose it through a JCE public API instead of relinking.
 target_link_libraries(JCE_Editor PRIVATE
-	JCE jce_tools_imgui
-	cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
+	JCE jce_tools_imgui)
 
 target_include_directories(JCE_Editor PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")

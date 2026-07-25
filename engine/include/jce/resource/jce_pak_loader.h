@@ -79,7 +79,7 @@ JCE_API size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t bu
 
 /* Like jce_pak_decompress but reuses the archive's ZSTD decompression context
  * for better performance when decompressing many assets sequentially. */
-size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset, void *buf,
+JCE_API size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset, void *buf,
                              size_t buf_size);
 
 /* Verify decompressed bytes match the TOC's content_hash (XXH3-64).
@@ -111,16 +111,29 @@ JCE_API const JcePakAsset *jce_pak_get(const JcePakArchive *pak, uint32_t index)
  * Useful when loading PAK data from a file/stream into a heap buffer. */
 JCE_API JcePakArchive *jce_pak_open_owned(void *data, size_t size);
 
-/* ── PAK overlay chain ────────────────────────────────────────────────
- * Stack additional archives behind a base PAK so that any miss in the
+/* ── PAK fallback chain — BASE WINS ───────────────────────────────────
+ * Stack additional archives BEHIND a base PAK so that any miss in the
  * base transparently falls through to the next layer.  Used by the
- * runtime to mount project bundles on top of the engine PAK so all
+ * runtime to aggregate project bundles behind the engine PAK so all
  * engine subsystems (skybox, audio, asset_manager, scene_renderer
- * fallback) see bundle content without per-call callback wiring.
+ * fallback) see one merged archive without per-call callback wiring.
+ *
+ * PRECEDENCE: the base archive ALWAYS wins a contested path.  Pushed
+ * layers are searched in push order (FIFO — first pushed = first
+ * fallback) and can only ADD paths the layers before them lack.  This
+ * is an aggregation mechanism, NOT a patch/override mechanism, and the
+ * historical "overlay" spelling in these two names means *fallback*,
+ * not *override*.
+ *
+ * DO NOT CONFUSE with the layered-archive mount stack (jce_archive_mount_*
+ * in <jce/resource/jce_archive.h>), which applies the OPPOSITE rule: there
+ * the most recently added layer wins, because it exists so a patch / DLC /
+ * mod can override base content (spec §11.2, <jce/resource/jce_mod_loader.h>).
+ * Use a mount when a later layer must override; use this chain when the base
+ * must stay authoritative.  The two are never composed: this chain links
+ * JcePakArchive handles, a mount holds raw JceArchive handles.
  *
  * Ownership: caller retains both archives; neither is acquired/closed.
- * Priority: the base archive always wins for a given path; layers are
- * searched in push order (FIFO — first pushed = first fallback).
  * Cycle-safe: pushing an already-attached layer or one that would form
  * a cycle is a no-op. */
 JCE_API void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer);

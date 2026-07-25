@@ -26,29 +26,71 @@
 
 #define MAX_PEERS_DEFAULT 32
 
-/* ── One-time ENet initialisation ─────────────────────────────────── */
+/* ── ENet lifecycle (process-wide, refcounted) ─────────────────────────
+ *
+ * ENet's global init is a process singleton (on Windows it wraps
+ * WSAStartup).  Two independent modules need it — the host API here and
+ * LAN discovery (jce_lan_discovery.c, which drives raw enet_socket_*) —
+ * so this TU owns ONE refcount and both call the acquire/release pair.
+ * N acquires need N releases; the last release deinitialises.  Neither
+ * module can therefore tear ENet down while the other still has live
+ * sockets.
+ *
+ * The atexit hook stays as a last-resort net for a leaked host: with a
+ * balanced acquire/release the counter is already 0 by then and the hook
+ * is a no-op.
+ *
+ * Not thread-safe — matching the rest of the net layer, which is driven
+ * from the poll loop's thread.
+ *
+ * L4-internal seam: declared `extern` at the jce_lan_discovery.c call
+ * site, deliberately NOT in any public header. */
 
-static bool g_enet_initialised = false;
+bool jce__net_enet_acquire(void);
+void jce__net_enet_release(void);
 
-static void enet_shutdown(void)
+static uint32_t g_enet_refcount   = 0;
+static bool     g_enet_initialised = false;
+static bool     g_enet_atexit_hooked = false;
+
+static void enet_atexit_shutdown(void)
 {
     if (g_enet_initialised) {
         enet_deinitialize();
         g_enet_initialised = false;
+        g_enet_refcount    = 0;
     }
 }
 
-static bool enet_ensure_init(void)
+bool jce__net_enet_acquire(void)
 {
-    if (g_enet_initialised) return true;
+    if (g_enet_refcount > 0) {
+        g_enet_refcount++;
+        return true;
+    }
 
     if (enet_initialize() != 0) {
         LOG_ERROR(LOG_TAG, "enet_initialize() failed");
         return false;
     }
     g_enet_initialised = true;
-    atexit(enet_shutdown);
+    g_enet_refcount    = 1;
+    if (!g_enet_atexit_hooked) {
+        atexit(enet_atexit_shutdown);
+        g_enet_atexit_hooked = true;
+    }
     return true;
+}
+
+void jce__net_enet_release(void)
+{
+    if (g_enet_refcount == 0) return;
+    if (--g_enet_refcount > 0) return;
+
+    if (g_enet_initialised) {
+        enet_deinitialize();
+        g_enet_initialised = false;
+    }
 }
 
 /* ── Host struct ──────────────────────────────────────────────────── */
@@ -86,10 +128,13 @@ static bool peer_idx_valid(const JceNetHost *host, JcePeerHandle peer)
 JceNetHost *jce_net_host_create(const JceNetHostDesc *desc, jce_allocator_t alloc)
 {
     if (!desc) return NULL;
-    if (!enet_ensure_init()) return NULL;
+    if (!jce__net_enet_acquire()) return NULL;
 
     JceNetHost *host = (JceNetHost *)alloc.alloc(sizeof(JceNetHost), alloc.ctx);
-    if (!host) return NULL;
+    if (!host) {
+        jce__net_enet_release();
+        return NULL;
+    }
 
     memset(host, 0, sizeof(*host));
     host->alloc     = alloc;
@@ -121,6 +166,7 @@ JceNetHost *jce_net_host_create(const JceNetHostDesc *desc, jce_allocator_t allo
         LOG_ERROR(LOG_TAG, "enet_host_create() failed (port=%u)",
                   (unsigned)desc->port);
         alloc.free(host, alloc.ctx);
+        jce__net_enet_release();
         return NULL;
     }
 
@@ -146,6 +192,7 @@ void jce_net_host_destroy(JceNetHost *host)
     }
 
     a.free(host, a.ctx);
+    jce__net_enet_release();   /* balances the acquire in host_create */
 }
 
 /* ── Connection ───────────────────────────────────────────────────── */

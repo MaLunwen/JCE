@@ -11,6 +11,17 @@
  * must happen on the same thread (typically the main thread).
  * For cross-thread communication, queue events and flush on main.
  *
+ * Related but deliberately NOT merged: jce_lifecycle.h (L6) keeps its
+ * own listener table.  This bus dispatches in registration order only,
+ * removes subscribers by (fn, userdata) with a swap-to-last that
+ * destroys ordering, silently de-duplicates identical (fn, userdata)
+ * pairs, and lives in a caller-owned instance.  jce_lifecycle needs
+ * the opposite of all four (priority order, order-preserving removal
+ * by opaque id, duplicates allowed, process-global lifetime).  Adding
+ * priorities here would change dispatch semantics for the existing
+ * subscriber (ai_dispatch); see the boundary note in jce_lifecycle.h
+ * before proposing a unification.
+ *
  * Layer: Foundation (Layer 1 — no engine dependencies).
  */
 
@@ -55,11 +66,11 @@ JCE_API void             jce_event_bus_destroy(jce_event_bus_t *bus);
 
 /* Subscribe to an event.  The same (fn, userdata) pair can only be
    registered once per event ID — duplicates are silently ignored. */
-void jce_event_subscribe(jce_event_bus_t *bus, jce_event_id id,
+JCE_API void jce_event_subscribe(jce_event_bus_t *bus, jce_event_id id,
                          jce_event_fn fn, void *userdata);
 
 /* Remove a subscription.  No-op if not found. */
-void jce_event_unsubscribe(jce_event_bus_t *bus, jce_event_id id,
+JCE_API void jce_event_unsubscribe(jce_event_bus_t *bus, jce_event_id id,
                            jce_event_fn fn, void *userdata);
 
 /* ================================================================== */
@@ -68,7 +79,7 @@ void jce_event_unsubscribe(jce_event_bus_t *bus, jce_event_id id,
 
 /* Synchronously broadcast to all subscribers of 'id'.
    'data' may be NULL if size is 0 (signal-only event). */
-void jce_event_publish(jce_event_bus_t *bus, jce_event_id id,
+JCE_API void jce_event_publish(jce_event_bus_t *bus, jce_event_id id,
                        const void *data, size_t size);
 
 /* ================================================================== */

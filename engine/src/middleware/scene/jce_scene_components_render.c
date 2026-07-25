@@ -360,16 +360,21 @@ void parse_volume(JceScene *s, JceEntity e, const cJSON *props)
     vc.weight         = (float)j_num(props, "weight",        1.0);
     vc.is_global      = j_bool(props, "isGlobal", false);
     vc.profile.enabled_mask = (uint16_t)(int)j_num(props, "profileMask", 0);
-    vc.profile.values.exposure            = (float)j_num(props, "exposure",           1.0);
-    vc.profile.values.gamma               = (float)j_num(props, "gamma",              2.2);
-    vc.profile.values.bloom_threshold     = (float)j_num(props, "bloomThreshold",     1.0);
-    vc.profile.values.bloom_intensity     = (float)j_num(props, "bloomIntensity",     0.5);
-    vc.profile.values.fxaa_span_max       = (float)j_num(props, "fxaaSpanMax",        8.0);
-    vc.profile.values.fxaa_reduce_min     = (float)j_num(props, "fxaaReduceMin",      1.0 / 128.0);
-    vc.profile.values.fxaa_reduce_mul     = (float)j_num(props, "fxaaReduceMul",      1.0 / 8.0);
-    vc.profile.values.vignette_intensity  = (float)j_num(props, "vignetteIntensity",  0.3);
-    vc.profile.values.vignette_smoothness = (float)j_num(props, "vignetteSmoothness", 2.0);
-    vc.profile.values.chromatic_strength  = (float)j_num(props, "chromaticStrength",  0.005);
+    /* An absent profile key falls back to the neutral post-FX value.  Derive
+     * those from the single authority (jce_postfx_default_params) instead of
+     * restating them here — the editor's Add-Component initialiser reads the
+     * same function, so all three sites stay in step. */
+    const JcePostFXParams pfx_def = jce_postfx_default_params();
+    vc.profile.values.exposure            = (float)j_num(props, "exposure",           pfx_def.exposure);
+    vc.profile.values.gamma               = (float)j_num(props, "gamma",              pfx_def.gamma);
+    vc.profile.values.bloom_threshold     = (float)j_num(props, "bloomThreshold",     pfx_def.bloom_threshold);
+    vc.profile.values.bloom_intensity     = (float)j_num(props, "bloomIntensity",     pfx_def.bloom_intensity);
+    vc.profile.values.fxaa_span_max       = (float)j_num(props, "fxaaSpanMax",        pfx_def.fxaa_span_max);
+    vc.profile.values.fxaa_reduce_min     = (float)j_num(props, "fxaaReduceMin",      pfx_def.fxaa_reduce_min);
+    vc.profile.values.fxaa_reduce_mul     = (float)j_num(props, "fxaaReduceMul",      pfx_def.fxaa_reduce_mul);
+    vc.profile.values.vignette_intensity  = (float)j_num(props, "vignetteIntensity",  pfx_def.vignette_intensity);
+    vc.profile.values.vignette_smoothness = (float)j_num(props, "vignetteSmoothness", pfx_def.vignette_smoothness);
+    vc.profile.values.chromatic_strength  = (float)j_num(props, "chromaticStrength",  pfx_def.chromatic_strength);
     jce_scene_set_volume(s, e, &vc);
 }
 

@@ -79,12 +79,12 @@ typedef struct {
 
 typedef struct JcePostFXPipeline JcePostFXPipeline;
 
-JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
+JCE_API JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
                                      uint32_t width, uint32_t height);
 JCE_API void               jce_postfx_destroy(JcePostFXPipeline *pipeline);
 
 /* Recreate internal framebuffers after window resize. */
-void jce_postfx_resize(JcePostFXPipeline *pipeline,
+JCE_API void jce_postfx_resize(JcePostFXPipeline *pipeline,
                        uint32_t width, uint32_t height);
 
 /* Override the first bgfx view ID used by jce_postfx_apply().
@@ -239,13 +239,13 @@ JCE_API void jce_postfx_set_taa_motion_tex(JcePostFXPipeline *pipeline,
 /* Load the shaders required by the enabled effects.
    Must be called after renderer and shader system are ready.
    pak: the PAK archive containing compiled shader binaries. */
-bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
+JCE_API bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
                              const JcePakArchive *pak);
 
 /* Execute the enabled post-processing chain.
    scene_fb: the framebuffer containing the rendered scene.
    The final result is written to the back buffer. */
-void jce_postfx_apply(JcePostFXPipeline *pipeline,
+JCE_API void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_color,
                       JceTextureHandle scene_depth);
 
@@ -266,6 +266,54 @@ JCE_API void jce_postfx_present(JcePostFXPipeline *pipeline,
  * Editors can submit overlay passes to this FBO so gizmos render *after*
  * tone-mapping / bloom instead of being filtered through PostFX. */
 JCE_API uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline);
+
+/* Resolve `src` (rendered at src_w x src_h) into the framebuffer `dst_fb_idx`
+ * at out_w x out_h using a contrast-adaptive sharpen (RCAS/FSR1/CAS parity)
+ * when upscaling, else a plain copy. `view_id` is a free view slot the caller
+ * owns. The runtime present path (jce_postfx_present) sharpens in place; this
+ * is the equivalent for consumers that composite into their own offscreen
+ * target (the editor Scene View's dynamic-resolution upscale). Orientation is
+ * a UV-identity copy (optionally V-flipped for bottom-left-origin backends),
+ * so the destination texture reads the same way the source would. Returns true
+ * only when it actually sharpened into the destination (upscaling + RCAS
+ * program present); returns false without drawing otherwise, so the caller can
+ * keep showing its source directly rather than a blank/mis-oriented copy. */
+JCE_API bool jce_postfx_upscale_resolve(JcePostFXPipeline *pipeline,
+                                        uint16_t view_id,
+                                        uint16_t dst_fb_idx,
+                                        JceTextureHandle src,
+                                        uint32_t src_w, uint32_t src_h,
+                                        uint32_t out_w, uint32_t out_h,
+                                        bool flip_v);
+
+/* Temporal super-resolution upscale (FSR2/UE-TSR-style), v2. Reconstructs an
+ * out_w x out_h image from the render_w x render_h jittered `color` frame by
+ * depositing each frame's sub-pixel samples into an internal output-res
+ * ping-pong history, REPROJECTED by camera motion so accumulation survives
+ * camera movement. The caller renders the scene JITTERED (jitter_u/jitter_v =
+ * this frame's jitter offset in render-UV space) and supplies the scene `depth`
+ * plus `inv_view_proj` (inverse of the current UN-jittered view*proj) and
+ * `prev_view_proj` (previous frame's UN-jittered view*proj) to drive the motion
+ * pass; pass depth.idx==UINT16_MAX / NULL matrices for a static-only fallback.
+ * `feedback` is the base history weight (~0.9); the shader tapers it by motion
+ * speed and drops it on disocclusion. Uses `view_base` for the motion pass and
+ * view_base+1 for the resolve. Owns its buffers (lazily at out_w x out_h);
+ * returns THIS frame's reconstruction texture idx to display, or UINT16_MAX. */
+/* `ext_motion` (optional, UINT16_MAX to omit): a render-res per-object velocity
+ * buffer (the scene renderer's gbuffer_vel prepass, RG = (cur-prev)*0.5+0.5) so
+ * animated/skinned geometry reprojects too — not just the camera. When omitted,
+ * the resolve generates camera-only motion from `depth` + the VP matrices. */
+JCE_API uint16_t jce_postfx_tsr_resolve(JcePostFXPipeline *pipeline,
+                                        uint16_t view_base,
+                                        JceTextureHandle color,
+                                        JceTextureHandle depth,
+                                        const float *inv_view_proj,
+                                        const float *prev_view_proj,
+                                        JceTextureHandle ext_motion,
+                                        uint32_t render_w, uint32_t render_h,
+                                        uint32_t out_w, uint32_t out_h,
+                                        float jitter_u, float jitter_v,
+                                        float feedback, bool flip_v);
 
 JCE_EXTERN_C_END
 

@@ -21,6 +21,8 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
+#include "jce_panel_node_canvas.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_project_state.h"
@@ -481,12 +483,7 @@ void draw_grid(ImDrawList *dl, ImVec2 origin, ImVec2 size)
     if (step < 8.0f) step = 8.0f;
     float ox = std::fmod(g.pan.x * g.zoom, step);
     float oy = std::fmod(g.pan.y * g.zoom, step);
-    for (float x = ox; x < size.x; x += step)
-        dl->AddLine(ImVec2(origin.x + x, origin.y),
-                    ImVec2(origin.x + x, origin.y + size.y), col_grid);
-    for (float y = oy; y < size.y; y += step)
-        dl->AddLine(ImVec2(origin.x, origin.y + y),
-                    ImVec2(origin.x + size.x, origin.y + y), col_grid);
+    jce_node_canvas_draw_grid(dl, origin, size, step, ImVec2(ox, oy), col_grid);
 }
 
 bool point_in_state(const State &s, const ImVec2 &origin, const ImVec2 &mp,
@@ -985,16 +982,9 @@ extern "C" void jce_editor_panel_animator_sm(void)
      * to that workbench and requests the State Machine tab.  Symbol
      * kept so menu/hotkey entries registered against
      * JCE_PANEL_ANIMATOR_SM keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATOR_SM);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
-    if (ae_vis) *ae_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###jce_anim_editor",
-             jce_editor_i18n("animationEditor.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_animation_editor_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_ANIMATOR_SM,
+                                        JCE_PANEL_ANIMATION_EDITOR,
+                                        "animationEditor.title",
+                                        "jce_anim_editor"))
+        jce_panel_animation_editor_request_tab(1);
 }

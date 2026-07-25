@@ -32,10 +32,10 @@ typedef struct JceSkybox JceSkybox;
  * @param data_size  Size of data buffer.
  * @param cubemap_size  Resolution of each cubemap face (e.g., 512, 1024).
  */
-JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
+JCE_API JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
                                             uint32_t cubemap_size);
 
-JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_size,
+JCE_API JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_size,
                                               uint32_t cubemap_size);
 
 JCE_API void jce_skybox_destroy(JceSkybox *sky);
@@ -49,7 +49,7 @@ JCE_API void jce_skybox_destroy(JceSkybox *sky);
  * @param inv_vp      Inverse of (projection * view) matrix.
  * @param exposure    Exposure multiplier (default 1.0).
  */
-void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
+JCE_API void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
                        const jce_mat4 *inv_vp, float exposure);
 
 /*

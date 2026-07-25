@@ -7,6 +7,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "jce_panel_common.h"
 #include "jce_panel_hierarchy_input.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_project_state.h"
@@ -84,13 +85,14 @@ void jce_editor_panel_hierarchy_content(void)
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
             if (jce_state_is_selected(dragged_id)) {
-                int sel_n = 0;
-                const uint32_t *sel = jce_state_get_selection(&sel_n);
-                uint32_t ids[256];
-                int n = sel_n < 256 ? sel_n : 256;
-                for (int i = 0; i < n; i++) ids[i] = sel[i];
-                for (int i = 0; i < n; i++)
-                    jce_state_reparent_entity(ids[i], 0);
+                /* One undo entry for the whole drop: jce_state_reparent_entity
+                 * opens its own edit scope, so the previous per-entity loop
+                 * left Ctrl+Z able to unparent only the last entity. */
+                JcePanelSelection sel;
+                jce_panel_selection_snapshot(sel);
+                jce_panel_selection_apply(sel, [](uint32_t id) {
+                    jce_state_reparent_entity(id, 0);
+                });
             } else {
                 jce_state_reparent_entity(dragged_id, 0);
             }
@@ -217,46 +219,10 @@ void jce_editor_panel_hierarchy_content(void)
             if (s_hier.renaming_id == 0 && !ImGui::GetIO().WantTextInput &&
                 (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
                  || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT))) {
-                int sel_count = 0;
-                const uint32_t *sel = jce_state_get_selection(&sel_count);
-                if (sel_count > 1) {
-                    uint32_t ids[JCE_MAX_SELECTED];
-                    int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-                    for (int si = 0; si < n; si++) ids[si] = sel[si];
-                    jce_editor_inspector_request_delete_confirm_many(ids, n);
-                } else {
-                    jce_editor_inspector_request_delete_confirm(focused);
-                }
+                jce_panel_delete_selection();
             }
             if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
-                int sel_count = 0;
-                const uint32_t *sel = jce_state_get_selection(&sel_count);
-                if (sel_count > 1) {
-                    uint32_t src_ids[JCE_MAX_SELECTED];
-                    uint32_t dup_ids[JCE_MAX_SELECTED];
-                    int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-                    int dup_count = 0;
-
-                    for (int i = 0; i < n; i++)
-                        src_ids[i] = sel[i];
-
-                    jce_state_begin_batch_edit();
-                    for (int i = 0; i < n; i++) {
-                        uint32_t dup = jce_state_duplicate_entity(src_ids[i]);
-                        if (dup != 0)
-                            dup_ids[dup_count++] = dup;
-                    }
-                    jce_state_end_batch_edit();
-
-                    if (dup_count > 0) {
-                        jce_state_select_entity(dup_ids[0], false);
-                        for (int i = 1; i < dup_count; i++)
-                            jce_state_select_entity(dup_ids[i], true);
-                    }
-                } else {
-                    uint32_t dup = jce_state_duplicate_entity(focused);
-                    jce_state_select_entity(dup, false);
-                }
+                jce_panel_duplicate_selection();
             }
             if (jce_hotkey_pressed(JCE_HK_EDIT_COPY)) {
                 int sel_count = 0;
@@ -294,24 +260,7 @@ void jce_editor_panel_hierarchy_content(void)
 
             ImGuiIO &io = ImGui::GetIO();
             if (!io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
-                char typed = '\0';
-                for (ImGuiKey key = ImGuiKey_A; key <= ImGuiKey_Z && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('a' + (key - ImGuiKey_A));
-                for (ImGuiKey key = ImGuiKey_0; key <= ImGuiKey_9 && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('0' + (key - ImGuiKey_0));
-                for (ImGuiKey key = ImGuiKey_Keypad0; key <= ImGuiKey_Keypad9 && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('0' + (key - ImGuiKey_Keypad0));
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Space, false))          typed = ' ';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Minus, false))          typed = '-';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Period, false))         typed = '.';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false))  typed = '.';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) typed = '-';
+                char typed = jce_panel_typeahead_key();
 
                 if (jce_hierarchy_alpha_jump_key_consumed(
                         typed,
@@ -326,23 +275,13 @@ void jce_editor_panel_hierarchy_content(void)
                     bool cycling = (lc == s_jump_char
                                     && (now - s_jump_reset) < kCycleWindow);
                     int start = cycling ? s_jump_start : 0;
-                    int n = s_hier.display_count;
-                    int found = -1;
-
-                    for (int pass = 0; pass < 2 && found < 0; ++pass) {
-                        int from = (pass == 0) ? start : 0;
-                        int to   = (pass == 0) ? n     : start;
-                        for (int k = from; k < to; ++k) {
-                            uint32_t eid = s_hier.display_order[k];
-                            const char *nm = jce_state_entity_name(eid);
-                            if (nm && nm[0]
-                                && tolower((unsigned char)nm[0]) == (unsigned char)lc)
-                            {
-                                found = k;
-                                break;
-                            }
-                        }
-                    }
+                    int found = jce_panel_typeahead_scan(
+                        s_hier.display_count, start, [lc](int k) {
+                            const char *nm =
+                                jce_state_entity_name(s_hier.display_order[k]);
+                            return nm && nm[0]
+                                && tolower((unsigned char)nm[0]) == (unsigned char)lc;
+                        });
 
                     if (found >= 0) {
                         uint32_t target = s_hier.display_order[found];

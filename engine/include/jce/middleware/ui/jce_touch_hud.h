@@ -39,23 +39,23 @@ typedef enum {
 } JceTouchButton;
 
 /* Create / destroy.  label_font may be NULL (labels will be skipped). */
-JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
+JCE_API JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
                                    JceFont *label_font);
 JCE_API void         jce_touch_hud_destroy(JceTouchHud *hud);
 
 /* Process touch input and update virtual controls.  Call once per frame. */
-void         jce_touch_hud_update(JceTouchHud *hud,
+JCE_API void         jce_touch_hud_update(JceTouchHud *hud,
                                    const JceInput *input, float dt_ms);
 
 /* Draw semi-transparent overlays.  Call after game rendering. */
 JCE_API void         jce_touch_hud_draw(JceTouchHud *hud);
 
 /* Query virtual joystick output (each axis in [-1, 1]). */
-void         jce_touch_hud_get_move(const JceTouchHud *hud,
+JCE_API void         jce_touch_hud_get_move(const JceTouchHud *hud,
                                      float *dx, float *dz);
 
 /* Query accumulated look delta (in degrees) since last update. */
-void         jce_touch_hud_get_look(const JceTouchHud *hud,
+JCE_API void         jce_touch_hud_get_look(const JceTouchHud *hud,
                                      float *yaw, float *pitch);
 
 /* Query whether a virtual button was "pressed" this frame (edge). */

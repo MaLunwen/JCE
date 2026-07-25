@@ -88,6 +88,21 @@ JCE_API bool     JCE_CALL jce_lan_discovery_client_get_server(uint32_t idx,
                                                               JceLanDiscoveredServer *out);
 JCE_API void     JCE_CALL jce_lan_discovery_client_clear(void);
 
+/* STATUS: NEVER COMPILED.  JCE_NET_SELF_TEST is not defined by any
+ * CMakeLists, cmake module or build script in this repository, so this
+ * routine — and the matching one in jce_session.c — is unconditionally
+ * preprocessed away in every configuration we ship or test.
+ *
+ * This matters when reading the tree: the presence of a "self test" here
+ * suggests LAN discovery has automated coverage.  It does not.  Even when
+ * compiled in, the routine deliberately soft-asserts (it logs on mismatch
+ * rather than failing) because loopback broadcast availability varies across
+ * CI sandboxes, so its result was never authoritative either.
+ *
+ * Turning it on means accepting a ~600 ms busy-wait spin and real UDP
+ * broadcast in the build — which is exactly why it was left off.  If LAN
+ * discovery needs coverage, the honest place is tests/ with the broadcast
+ * transport faked, not this macro. */
 #ifdef JCE_NET_SELF_TEST
 JCE_API void JCE_CALL jce_lan_discovery_self_test(void);
 #endif

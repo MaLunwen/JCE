@@ -20,6 +20,19 @@
  * decompression step behind a per-archive lock (the surrounding image /
  * audio decode stays parallel).  This matches the single-core baseline
  * priority (spec §1.3).
+ *
+ * LAYER PRECEDENCE — BASE WINS.  jce_pak_find() searches *this* archive
+ * first and only falls through to fallback_next on a miss, so the head of
+ * the chain wins every contested path and a pushed layer can only supply
+ * paths the layers before it lack.  This chain AGGREGATES (engine PAK +
+ * project bundles behind one authoritative base); it does not patch.
+ *
+ * That is the OPPOSITE rule from JceArchiveMount (jce_archive_mount.c),
+ * where the most recently added layer wins because it exists so a patch /
+ * DLC / mod can override base content (spec §11.2, jce_mod_loader.c).
+ * Same shape, opposite direction — never assume one behaves like the
+ * other.  The two are never composed: this chain links JcePakArchive
+ * handles, a mount holds raw JceArchive handles.
  */
 
 #include <jce/os/core/jce_profiler.h>
@@ -56,9 +69,11 @@ struct JcePakArchive {
     PakAsset     *assets;      /* count records, archive index order      */
     SDL_AtomicInt refcount;    /* shared-ownership counter (>=1 while alive)*/
     SDL_Mutex    *decode_lock; /* serializes jce_archive_read (shared dctx)*/
-    /* Overlay chain: a miss in *this* archive falls through to the next
-     * (lower-priority) layer.  Base archive wins for a given path. */
-    struct JcePakArchive *overlay_next;
+    /* Fallback chain (BASE WINS): a miss in *this* archive falls through
+     * to fallback_next, the next LOWER-priority layer.  Pushes append at
+     * the tail (FIFO), so priority is: this archive, then the first layer
+     * pushed, and so on.  NOT an override stack — see the file header. */
+    struct JcePakArchive *fallback_next;
 };
 
 /* ================================================================== */
@@ -156,40 +171,38 @@ int jce_pak_refcount(const JcePakArchive *pak) {
 }
 
 /* ================================================================== */
-/* jce_pak_find — normalized hash + binary search                      */
+/* jce_pak_find — normalized hash + binary search, BASE-FIRST chain    */
 /* ================================================================== */
 
 const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
-    if (!pak || !path) {
-        if (pak && pak->overlay_next && path)
-            return jce_pak_find(pak->overlay_next, path);
-        return NULL;
-    }
+    if (!path) return NULL;
 
-    const JceArchiveEntry *e = jce_archive_find(pak->ar, path);
-    if (e) {
+    /* Head-first walk: `pak` (the base) wins, and only a miss falls
+     * through to the next lower-priority layer. */
+    for (const JcePakArchive *layer = pak; layer; layer = layer->fallback_next) {
+        const JceArchiveEntry *e = jce_archive_find(layer->ar, path);
+        if (!e) continue;
+
         /* Map the entry back to its PakAsset.  Entries are sorted
          * ascending by path_hash and unique (the writer rejects hash
          * collisions, spec §12.3), so a hash binary search is exact. */
         uint64_t h = e->path_hash;
-        uint32_t lo = 0, hi = pak->count;
+        uint32_t lo = 0, hi = layer->count;
         while (lo < hi) {
             uint32_t mid = lo + (hi - lo) / 2;
-            if (pak->assets[mid].entry->path_hash < h)
+            if (layer->assets[mid].entry->path_hash < h)
                 lo = mid + 1;
             else
                 hi = mid;
         }
-        if (lo < pak->count && pak->assets[lo].entry == e)
-            return &pak->assets[lo].pub;
+        if (lo < layer->count && layer->assets[lo].entry == e)
+            return &layer->assets[lo].pub;
         /* Defensive linear fallback (should not happen). */
-        for (uint32_t i = 0; i < pak->count; ++i)
-            if (pak->assets[i].entry == e)
-                return &pak->assets[i].pub;
+        for (uint32_t i = 0; i < layer->count; ++i)
+            if (layer->assets[i].entry == e)
+                return &layer->assets[i].pub;
+        /* Entry found but unmappable: keep walking, as before. */
     }
-
-    if (pak->overlay_next)
-        return jce_pak_find(pak->overlay_next, path);
     return NULL;
 }
 
@@ -213,19 +226,24 @@ bool jce_image_decode_pak(const JcePakArchive *pak,
 }
 
 /* ================================================================== */
-/* jce_pak_overlay_push / _remove                                      */
+/* jce_pak_overlay_push / _remove — append a LOWER-priority fallback   */
 /* ================================================================== */
 
+/* Appends `layer` at the TAIL of base's chain, i.e. as the new LOWEST-
+ * priority layer: it can only supply paths that neither the base nor an
+ * earlier-pushed layer provides.  (Contrast jce_archive_mount_add, which
+ * puts the new layer on TOP so it overrides — see the file header.)
+ * The historical "overlay" spelling means *fallback*, not *override*. */
 void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer) {
     if (!base || !layer || base == layer) return;
-    for (JcePakArchive *p = layer; p; p = p->overlay_next)
+    for (JcePakArchive *p = layer; p; p = p->fallback_next)
         if (p == base) return; /* would form a cycle */
     JcePakArchive *tail = base;
-    while (tail->overlay_next) {
-        if (tail->overlay_next == layer) return; /* already attached */
-        tail = tail->overlay_next;
+    while (tail->fallback_next) {
+        if (tail->fallback_next == layer) return; /* already attached */
+        tail = tail->fallback_next;
     }
-    tail->overlay_next = layer;
+    tail->fallback_next = layer;
 }
 
 void jce_pak_set_decryption_key(JcePakArchive *pak, const uint8_t key[32]) {
@@ -236,11 +254,11 @@ void jce_pak_set_decryption_key(JcePakArchive *pak, const uint8_t key[32]) {
 void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer) {
     if (!base || !layer) return;
     JcePakArchive *prev = base;
-    while (prev->overlay_next && prev->overlay_next != layer)
-        prev = prev->overlay_next;
-    if (prev->overlay_next == layer) {
-        prev->overlay_next = layer->overlay_next;
-        layer->overlay_next = NULL;
+    while (prev->fallback_next && prev->fallback_next != layer)
+        prev = prev->fallback_next;
+    if (prev->fallback_next == layer) {
+        prev->fallback_next = layer->fallback_next;
+        layer->fallback_next = NULL;
     }
 }
 

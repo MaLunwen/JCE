@@ -20,9 +20,9 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_gpu_particles.h>
-#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -88,55 +88,11 @@ struct JceGpuParticleSystem {
     bgfx_uniform_handle_t u_color_end;
 };
 
-static const char *backend_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
-
-static bgfx_shader_handle_t load_shader(const JcePakArchive *pak,
-                                          const char *name, const char *sfx)
-{
-    bgfx_shader_handle_t invalid = { UINT16_MAX };
-    char path[256];
-    snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-
-    /* Engine shaders are usually baked into jce_renderer (not in the scene
-     * PAK).  Try the caller pak, then fall back to the embedded engine pak —
-     * same fallback the standard shader loader uses. */
-    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
-    if (!asset) {
-        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
-        if (fb && fb != pak) {
-            asset = jce_pak_find(fb, path);
-            if (asset) pak = fb;
-        }
-    }
-    if (!asset) {
-        LOG_ERROR(LOG_TAG, "shader not found in pak: %s", path);
-        return invalid;
-    }
-    void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return invalid;
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) { JCE_FREE(buf); return invalid; }
-    const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)asset->original_size);
-    JCE_FREE(buf);
-    return bgfx_create_shader(mem);
-}
-
 static bgfx_program_handle_t load_compute(const JcePakArchive *pak,
                                             const char *name, const char *sfx)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    bgfx_shader_handle_t cs = load_shader(pak, name, sfx);
+    bgfx_shader_handle_t cs = jce_shader_load_from_pak(pak, name, sfx, LOG_TAG);
     if (cs.idx == UINT16_MAX) return invalid;
     return bgfx_create_compute_program(cs, true);
 }
@@ -146,9 +102,9 @@ static bgfx_program_handle_t load_vsfs(const JcePakArchive *pak,
                                          const char *sfx)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    bgfx_shader_handle_t vsh = load_shader(pak, vs, sfx);
+    bgfx_shader_handle_t vsh = jce_shader_load_from_pak(pak, vs, sfx, LOG_TAG);
     if (vsh.idx == UINT16_MAX) return invalid;
-    bgfx_shader_handle_t fsh = load_shader(pak, fs, sfx);
+    bgfx_shader_handle_t fsh = jce_shader_load_from_pak(pak, fs, sfx, LOG_TAG);
     if (fsh.idx == UINT16_MAX) { bgfx_destroy_shader(vsh); return invalid; }
     return bgfx_create_program(vsh, fsh, true);
 }
@@ -176,7 +132,7 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         return sys; /* no-op mode */
     }
 
-    const char *sfx = backend_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) {
         LOG_ERROR(LOG_TAG, "no shader suffix for current renderer");
         alloc.free(sys, alloc.ctx);

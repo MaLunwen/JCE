@@ -128,11 +128,36 @@ JCE_API void jce_pbr_material_shutdown(void);
 /* Material file I/O (.mat.json)                                       */
 /* ================================================================== */
 
+/* The .mat.json keys accepted for texture slot `slot` (0=albedo,
+ * 1=metallic-roughness, 2=normal, 3=AO, 4=emissive — the same order as the
+ * out_tex_paths / tex_paths arrays below), in the exact priority order
+ * jce_pbr_material_load_json applies them.  Index 0 is the canonical key
+ * jce_pbr_material_save_json writes; the rest are accepted aliases.  The
+ * returned array is static, immutable and NULL-terminated; NULL is returned
+ * for an out-of-range slot.
+ *
+ * This is the SINGLE authority for material texture keys.  Any other code
+ * that has to find a texture reference inside a .mat.json — the editor's
+ * material preview resolver, the bundle packer's dependency scan — must
+ * iterate this instead of hard-coding its own alias list, or previews and
+ * cooked bundles end up disagreeing with the runtime about which texture a
+ * material actually uses. */
+JCE_API const char *const *jce_pbr_material_texture_keys(int slot);
+
 /* Load PBR material parameters from a .mat.json file.
- * Texture paths are returned via out_tex_paths (not bound to handles).
+ * Texture paths are returned via out_tex_paths (not bound to handles); each
+ * slot accepts the key set published by jce_pbr_material_texture_keys(), read
+ * from a "properties" object when present and from the root otherwise (and
+ * as a fallback when a "properties" object exists but omits the key).
+ *
  * When the file declares "customProgramVs" + "customProgramFs" (compiled
  * bgfx .bin blobs), both are loaded and linked into out->custom_program so
  * graph-generated shaders persisted by the editor render automatically.
+ * That link is why this call is NOT thread-safe — it creates a bgfx program
+ * and records it in a process-wide cache with no lock, so only the thread
+ * that owns the renderer may call it.  Code on a worker thread that just
+ * needs a texture reference must parse the file itself, driving the key set
+ * from jce_pbr_material_texture_keys() so it stays in step with this loader.
  * Returns true on success. */
 JCE_API bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
                                         char out_tex_paths[5][256]);
@@ -147,7 +172,7 @@ JCE_API bool jce_pbr_material_load_json_vfs(const JceFileSystem *fs,
 
 /* Save PBR material parameters to a .mat.json file.
  * tex_paths[0..4] = albedo, metallic_roughness, normal, ao, emissive. */
-bool jce_pbr_material_save_json(const char *path,
+JCE_API bool jce_pbr_material_save_json(const char *path,
                                  const JcePbrMaterial *mat,
                                  const char tex_paths[5][256]);
 

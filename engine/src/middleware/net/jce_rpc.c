@@ -22,6 +22,7 @@
 #include <jce/middleware/net/jce_net.h>
 #include <jce/os/core/jce_log.h>
 
+#include "jce_net_bytes.h"
 #include "jce_session_internal.h"
 #include "os/core/jce_memory.h"
 
@@ -69,84 +70,9 @@ typedef struct RpcState {
 
 static RpcState g_rpc;
 
-/* ================================================================== */
-/* Little-endian byte writers / readers (local copy — symmetric with   */
-/* the helpers in jce_replication.c).                                  */
-/* ================================================================== */
-
-typedef struct WBuf {
-    uint8_t *buf;
-    uint32_t size;
-    uint32_t cap;
-    bool     ok;
-} WBuf;
-
-static void wbuf_reserve(WBuf *w, uint32_t need)
-{
-    if (!w->ok) return;
-    if (w->size + need <= w->cap) return;
-    uint32_t nc = w->cap ? w->cap : 256u;
-    while (nc < w->size + need) nc *= 2u;
-    uint8_t *nb = (uint8_t *)JCE_REALLOC(w->buf, nc);
-    if (!nb) { w->ok = false; return; }
-    w->buf = nb;
-    w->cap = nc;
-}
-static void w_bytes(WBuf *w, const void *p, uint32_t n)
-{
-    wbuf_reserve(w, n);
-    if (!w->ok) return;
-    memcpy(w->buf + w->size, p, n);
-    w->size += n;
-}
-static void w_u8 (WBuf *w, uint8_t  v) { w_bytes(w, &v, 1); }
-static void w_u16(WBuf *w, uint16_t v) {
-    uint8_t b[2] = { (uint8_t)(v & 0xFFu), (uint8_t)((v >> 8) & 0xFFu) };
-    w_bytes(w, b, 2);
-}
-static void w_u32(WBuf *w, uint32_t v) {
-    uint8_t b[4] = { (uint8_t)(v        & 0xFFu),
-                     (uint8_t)((v >> 8) & 0xFFu),
-                     (uint8_t)((v >> 16)& 0xFFu),
-                     (uint8_t)((v >> 24)& 0xFFu) };
-    w_bytes(w, b, 4);
-}
-
-typedef struct RBuf {
-    const uint8_t *buf;
-    uint32_t       size;
-    uint32_t       cursor;
-    bool           ok;
-} RBuf;
-
-static bool r_bytes(RBuf *r, void *dst, uint32_t n)
-{
-    if (!r->ok || r->cursor + n > r->size) { r->ok = false; return false; }
-    memcpy(dst, r->buf + r->cursor, n);
-    r->cursor += n;
-    return true;
-}
-static bool r_u8(RBuf *r, uint8_t *out)
-{
-    return r_bytes(r, out, 1);
-}
-static bool r_u16(RBuf *r, uint16_t *out)
-{
-    uint8_t b[2];
-    if (!r_bytes(r, b, 2)) return false;
-    *out = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
-    return true;
-}
-static bool r_u32(RBuf *r, uint32_t *out)
-{
-    uint8_t b[4];
-    if (!r_bytes(r, b, 4)) return false;
-    *out = (uint32_t)b[0]
-         | ((uint32_t)b[1] << 8)
-         | ((uint32_t)b[2] << 16)
-         | ((uint32_t)b[3] << 24);
-    return true;
-}
+/* Little-endian wire codec: JceNetWBuf / JceNetRBuf from
+ * jce_net_bytes.h — shared with jce_replication.c so both ends of the
+ * packet-type-byte protocol encode identically. */
 
 /* ================================================================== */
 /* Registry helpers                                                    */
@@ -187,11 +113,11 @@ void jce_rpc_shutdown(void)
     memset(&g_rpc, 0, sizeof(g_rpc));
 }
 
-void jce_rpc_register(const JceRpcDesc *desc)
+bool jce_rpc_register(const JceRpcDesc *desc)
 {
     if (!desc || !desc->name || !*desc->name || !desc->handler) {
         LOG_WARN(LOG_TAG, "register: bad descriptor (need name + handler)");
-        return;
+        return false;
     }
     if (!g_rpc.inited) jce_rpc_init();
 
@@ -199,7 +125,7 @@ void jce_rpc_register(const JceRpcDesc *desc)
     if (nlen + 1u > JCE_RPC_NAME_MAX) {
         LOG_WARN(LOG_TAG, "register: name '%s' exceeds %u bytes",
                  desc->name, (unsigned)JCE_RPC_NAME_MAX - 1u);
-        return;
+        return false;
     }
 
     RpcEntry *e = find_entry(desc->name);
@@ -208,7 +134,7 @@ void jce_rpc_register(const JceRpcDesc *desc)
         if (!e) {
             LOG_WARN(LOG_TAG, "register: table full (cap=%u)",
                      (unsigned)JCE_RPC_REGISTRY_CAP);
-            return;
+            return false;
         }
         e->used = true;
         memcpy(e->name, desc->name, nlen + 1u);
@@ -217,6 +143,7 @@ void jce_rpc_register(const JceRpcDesc *desc)
     e->desc = *desc;
     /* Keep our copy of the name authoritative on lookups. */
     e->desc.name = e->name;
+    return true;
 }
 
 uint32_t jce_rpc_registered_count(void) { return g_rpc.count; }
@@ -244,18 +171,18 @@ static uint8_t *encode_packet(JceNetObjectId net_id,
     size_t nlen = strlen(rpc_name);
     if (nlen + 1u > JCE_RPC_NAME_MAX) return NULL;
 
-    WBuf w = { NULL, 0, 0, true };
-    w_u8 (&w, JCE_REPL_PKT_RPC);
-    w_u32(&w, 0u);                    /* tick placeholder (v1 unused) */
-    w_u32(&w, net_id);
-    w_u16(&w, (uint16_t)nlen);
-    w_bytes(&w, rpc_name, (uint32_t)nlen);
-    w_u16(&w, sender);
-    w_u8 (&w, (uint8_t)target);
-    w_u16(&w, specific_client);       /* extension over the v1 spec */
-    w_u8 (&w, (uint8_t)reliability);
-    w_u32(&w, payload_size);
-    if (payload_size && payload) w_bytes(&w, payload, payload_size);
+    JceNetWBuf w = JCE_NET_WBUF_INIT;
+    jce_net_w_u8 (&w, JCE_REPL_PKT_RPC);
+    jce_net_w_u32(&w, 0u);            /* tick placeholder (v1 unused) */
+    jce_net_w_u32(&w, net_id);
+    jce_net_w_u16(&w, (uint16_t)nlen);
+    jce_net_w_bytes(&w, rpc_name, (uint32_t)nlen);
+    jce_net_w_u16(&w, sender);
+    jce_net_w_u8 (&w, (uint8_t)target);
+    jce_net_w_u16(&w, specific_client);  /* extension over the v1 spec */
+    jce_net_w_u8 (&w, (uint8_t)reliability);
+    jce_net_w_u32(&w, payload_size);
+    if (payload_size && payload) jce_net_w_bytes(&w, payload, payload_size);
 
     if (!w.ok) { JCE_FREE(w.buf); return NULL; }
     *out_size = w.size;
@@ -487,9 +414,9 @@ void jce_rpc_handle_packet(const void *data, uint32_t size)
 {
     if (!g_rpc.inited || !data || size < 1u) return;
 
-    RBuf r = { (const uint8_t *)data, size, 0u, true };
+    JceNetRBuf r = JCE_NET_RBUF_INIT(data, size);
     uint8_t type = 0;
-    if (!r_u8(&r, &type)) return;
+    if (!jce_net_r_u8(&r, &type)) return;
     if (type != JCE_REPL_PKT_RPC) return;
 
     uint32_t tick = 0, net_id = 0, payload_size = 0;
@@ -497,20 +424,20 @@ void jce_rpc_handle_packet(const void *data, uint32_t size)
     uint8_t  target = 0, reliability = 0;
     char     name[JCE_RPC_NAME_MAX];
 
-    if (!r_u32(&r, &tick))           return;
-    if (!r_u32(&r, &net_id))         return;
-    if (!r_u16(&r, &name_len))       return;
+    if (!jce_net_r_u32(&r, &tick))           return;
+    if (!jce_net_r_u32(&r, &net_id))         return;
+    if (!jce_net_r_u16(&r, &name_len))       return;
     if (name_len + 1u > JCE_RPC_NAME_MAX) {
         LOG_WARN(LOG_TAG, "recv: rpc_name too long (%u)", (unsigned)name_len);
         return;
     }
-    if (!r_bytes(&r, name, name_len)) return;
+    if (!jce_net_r_bytes(&r, name, name_len)) return;
     name[name_len] = '\0';
-    if (!r_u16(&r, &sender))         return;
-    if (!r_u8 (&r, &target))         return;
-    if (!r_u16(&r, &specific_client)) return;
-    if (!r_u8 (&r, &reliability))    return;
-    if (!r_u32(&r, &payload_size))   return;
+    if (!jce_net_r_u16(&r, &sender))         return;
+    if (!jce_net_r_u8 (&r, &target))         return;
+    if (!jce_net_r_u16(&r, &specific_client)) return;
+    if (!jce_net_r_u8 (&r, &reliability))    return;
+    if (!jce_net_r_u32(&r, &payload_size))   return;
 
     const void *payload = NULL;
     if (payload_size) {

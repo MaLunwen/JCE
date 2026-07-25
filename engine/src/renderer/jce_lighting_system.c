@@ -162,7 +162,7 @@ static void ensure_light_uniforms(void)
                                           BGFX_TEXTURE_FORMAT_RGBA8,
                                           BGFX_TEXTURE_NONE
                                           | BGFX_SAMPLER_U_CLAMP
-                                          | BGFX_SAMPLER_V_CLAMP, mem);
+                                          | BGFX_SAMPLER_V_CLAMP, mem, 0);
 
     s_light_uniforms_init = true;
 
@@ -185,7 +185,7 @@ static void ensure_light_uniforms(void)
                     (uint16_t)k_cookie_dim, (uint16_t)k_cookie_dim,
                     false, (uint16_t)k_cookie_layers,
                     BGFX_TEXTURE_FORMAT_RGBA8,
-                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, amem);
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, amem, 0);
                 LOG_DEBUG(LOG_TAG, "cookie atlas array texture created (%d layers)", k_cookie_layers);
                 /* TODO(P4-E.3b): populate array layers from registered cookie textures
                  * using bgfx_blit() (requires source textures to have

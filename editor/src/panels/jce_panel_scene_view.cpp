@@ -8,6 +8,7 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include "jce_panel_common.h"        /* multi-select duplicate / delete */
 #include "ui/jce_editor_dnd.h"
 #include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
@@ -707,6 +708,73 @@ static void flush_async_drop_material_extracts(void)
         jce_editor_inspector_request_sync();
 }
 
+/* ── The coarse, SYNCHRONOUS picker ──────────────────────────────────
+ * Ray-test every enabled entity against the box built from its transform
+ * POSITION and SCALE (a unit cube scaled by the transform, floored at 0.1 per
+ * axis) and report the nearest hit.  Deliberately coarse: it ignores the
+ * mesh's real bounds, so a glTF model whose geometry is much larger or
+ * smaller than its transform scale is hit at the wrong extent.
+ *
+ * Why it exists next to the pixel-accurate GPU object-id pick
+ * (jce_editor_scene_pick_* → engine jce_scene_pick.c): that pick is
+ * ASYNCHRONOUS by contract — request() only records the pixel, an ID render
+ * services it on a later frame, poll() answers frames after that (see the
+ * s_gpu_pick_selection_pending state machine in handle_ray_pick), and only
+ * one request may be in flight.  Click and marquee selection CAN wait across
+ * frames, so they use it and fall back here only when it is unsupported or
+ * refuses the request.  Drag-and-drop cannot wait: handle_scene_view_asset_drop
+ * must know the hovered entity inside the ImGui callback (Alt-replace vs
+ * create-new is decided before the payload is released) and needs a fresh
+ * hover answer on every frame of the drag; compute_surface_hit additionally
+ * needs the ray parameter — a world-space hit POINT that an object-id buffer
+ * does not carry at all.  Keep the limitation in mind before "fixing" a drop
+ * that lands on the wrong object: the answer is finer bounds here, not the
+ * GPU pick.
+ *
+ * `out_t` (optional) receives the ray parameter of the nearest hit; only
+ * written when something was hit.  Returns the entity id, 0 = none. */
+static uint32_t cpu_pick_entity_along_ray(const float ray_o[3],
+                                          const float ray_d[3],
+                                          float *out_t)
+{
+    uint32_t best_id = 0;
+    float    best_t  = 1e30f;
+
+    JceScene *scene = jce_state_get_scene();
+    int total = jce_state_get_entity_count();
+    for (int pi = 0; pi < total; pi++) {
+        uint32_t pid = jce_state_get_entity_id_by_index(pi);
+        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
+        if (!jce_state_entity_enabled(pid)) continue;
+
+        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
+        if (!t) continue;
+
+        float hx = fabsf(t->scale.x) * 0.5f;
+        float hy = fabsf(t->scale.y) * 0.5f;
+        float hz = fabsf(t->scale.z) * 0.5f;
+        if (hx < 0.1f) hx = 0.1f;
+        if (hy < 0.1f) hy = 0.1f;
+        if (hz < 0.1f) hz = 0.1f;
+
+        float t_hit;
+        jce_vec3 ro    = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
+        jce_vec3 rd    = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
+        jce_vec3 bminv = jce_v3(t->position.x - hx, t->position.y - hy,
+                                t->position.z - hz);
+        jce_vec3 bmaxv = jce_v3(t->position.x + hx, t->position.y + hy,
+                                t->position.z + hz);
+        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit)
+            && t_hit >= 0.0f && t_hit < best_t) {
+            best_t  = t_hit;
+            best_id = pid;
+        }
+    }
+
+    if (best_id != 0 && out_t) *out_t = best_t;
+    return best_id;
+}
+
 /* Ray-cast pick: find the nearest entity under the current mouse position.
  * Returns entity ID (0 = none). */
 static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
@@ -729,44 +797,7 @@ static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
     float ray_o[3], ray_d[3];
     gm_screen_to_ray(&cam, mouse.x, mouse.y, ray_o, ray_d);
 
-    uint32_t best_id = 0;
-    float    best_t  = 1e30f;
-
-    JceScene *scene = jce_state_get_scene();
-    int total = jce_state_get_entity_count();
-    for (int pi = 0; pi < total; pi++) {
-        uint32_t pid = jce_state_get_entity_id_by_index(pi);
-        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
-        if (!jce_state_entity_enabled(pid)) continue;
-
-        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
-        if (!t) continue;
-        float pos[3] = { t->position.x, t->position.y, t->position.z };
-        float scl[3] = { t->scale.x,    t->scale.y,    t->scale.z    };
-
-        float hx = fabsf(scl[0]) * 0.5f;
-        float hy = fabsf(scl[1]) * 0.5f;
-        float hz = fabsf(scl[2]) * 0.5f;
-        if (hx < 0.1f) hx = 0.1f;
-        if (hy < 0.1f) hy = 0.1f;
-        if (hz < 0.1f) hz = 0.1f;
-
-        float bmin[3] = { pos[0]-hx, pos[1]-hy, pos[2]-hz };
-        float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
-
-        float t_hit;
-        jce_vec3 ro    = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
-        jce_vec3 rd    = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
-        jce_vec3 bminv = jce_v3(bmin[0],  bmin[1],  bmin[2]);
-        jce_vec3 bmaxv = jce_v3(bmax[0],  bmax[1],  bmax[2]);
-        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit) && t_hit >= 0.0f) {
-            if (t_hit < best_t) {
-                best_t  = t_hit;
-                best_id = pid;
-            }
-        }
-    }
-    return best_id;
+    return cpu_pick_entity_along_ray(ray_o, ray_d, NULL);
 }
 
 /* Compute the world-space hit position on the Y=0 ground plane from
@@ -804,8 +835,11 @@ static bool compute_ground_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3]
 /* Raycast the camera ray against scene-entity AABBs and return the nearest
  * world-space hit point — the real surface under the cursor — so a dropped model
  * lands ON whatever is beneath the cursor (Unity-style) instead of always on
- * Y=0. Falls back to the Y=0 ground plane when nothing is hit. (Uses the same
- * transform-scale AABBs as pick_entity_at_mouse.) */
+ * Y=0. Falls back to the Y=0 ground plane when nothing is hit.
+ *
+ * Uses the coarse CPU picker, and could not use the GPU id pick even if it
+ * were synchronous: what is wanted here is the HIT POINT along the ray, and
+ * an object-id buffer stores ids, not depth. */
 static bool compute_surface_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3])
 {
     float view_mat[16], proj_mat[16], eye[3];
@@ -826,34 +860,8 @@ static bool compute_surface_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3
     float ray_o[3], ray_d[3];
     gm_screen_to_ray(&cam, mouse.x, mouse.y, ray_o, ray_d);
 
-    JceScene *scene = jce_state_get_scene();
-    int total = jce_state_get_entity_count();
-    float best_t = 1e30f;
-    bool  hit = false;
-    for (int pi = 0; pi < total; pi++) {
-        uint32_t pid = jce_state_get_entity_id_by_index(pi);
-        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
-        if (!jce_state_entity_enabled(pid)) continue;
-        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
-        if (!t) continue;
-        float hx = fabsf(t->scale.x) * 0.5f; if (hx < 0.1f) hx = 0.1f;
-        float hy = fabsf(t->scale.y) * 0.5f; if (hy < 0.1f) hy = 0.1f;
-        float hz = fabsf(t->scale.z) * 0.5f; if (hz < 0.1f) hz = 0.1f;
-        jce_vec3 ro    = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
-        jce_vec3 rd    = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
-        jce_vec3 bminv = jce_v3(t->position.x - hx, t->position.y - hy,
-                                t->position.z - hz);
-        jce_vec3 bmaxv = jce_v3(t->position.x + hx, t->position.y + hy,
-                                t->position.z + hz);
-        float t_hit;
-        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit)
-            && t_hit >= 0.0f && t_hit < best_t) {
-            best_t = t_hit;
-            hit = true;
-        }
-    }
-
-    if (hit) {
+    float best_t = 0.0f;
+    if (cpu_pick_entity_along_ray(ray_o, ray_d, &best_t) != 0) {
         out_pos[0] = ray_o[0] + ray_d[0] * best_t;
         out_pos[1] = ray_o[1] + ray_d[1] * best_t;
         out_pos[2] = ray_o[2] + ray_d[2] * best_t;
@@ -1308,9 +1316,8 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
         ImGui::OpenPopup("SceneViewContextMenu");
 
     if (ImGui::BeginPopup("SceneViewContextMenu")) {
-        uint32_t focused = jce_state_get_focused();
         int sel_count = 0;
-        const uint32_t *sel_ids = jce_state_get_selection(&sel_count);
+        jce_state_get_selection(&sel_count);
         bool has_selection = sel_count > 0;
 
         if (ImGui::BeginMenu(jce_editor_i18n("dialog.create"))) {
@@ -1406,39 +1413,11 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
         if (has_selection) {
             ImGui::Separator();
 
-            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.duplicate"), "Ctrl+D")) {
-                if (sel_count > 1) {
-                    uint32_t dup_ids[JCE_MAX_SELECTED];
-                    int dup_count = 0;
-                    int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-                    jce_state_begin_batch_edit();
-                    for (int i = 0; i < n; i++) {
-                        uint32_t dup = jce_state_duplicate_entity(sel_ids[i]);
-                        if (dup != 0 && dup_count < JCE_MAX_SELECTED)
-                            dup_ids[dup_count++] = dup;
-                    }
-                    jce_state_end_batch_edit();
-                    if (dup_count > 0) {
-                        jce_state_select_entity(dup_ids[0], false);
-                        for (int i = 1; i < dup_count; i++)
-                            jce_state_select_entity(dup_ids[i], true);
-                    }
-                } else if (focused != 0) {
-                    uint32_t dup = jce_state_duplicate_entity(focused);
-                    if (dup != 0)
-                        jce_state_select_entity(dup, false);
-                }
-                jce_editor_inspector_request_sync();
-            }
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.duplicate"), "Ctrl+D"))
+                jce_panel_duplicate_selection();
 
-            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Delete")) {
-                uint32_t ids[JCE_MAX_SELECTED];
-                int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-                for (int si = 0; si < n; si++)
-                    ids[si] = sel_ids[si];
-                if (n > 0)
-                    jce_editor_inspector_request_delete_confirm_many(ids, n);
-            }
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Delete"))
+                jce_panel_delete_selection();
 
             ImGui::Separator();
 
@@ -1561,41 +1540,16 @@ static void handle_scene_view_shortcuts(void)
             scene_view_frame_entities(frame_all_);
         }
 
+        if (jce_hotkey_pressed(JCE_HK_EDIT_SNAP_TO_GROUND))
+            jce_scene_view_snap_selection_to_ground();
+
         if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
             || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)) {
-            int dk = 0;
-            const uint32_t *dids = jce_state_get_selection(&dk);
-            if (dk > 0) {
-                uint32_t ids[JCE_MAX_SELECTED];
-                int n = dk < JCE_MAX_SELECTED ? dk : JCE_MAX_SELECTED;
-                for (int di = 0; di < n; di++)
-                    ids[di] = dids[di];
-                jce_editor_inspector_request_delete_confirm_many(ids, n);
-            }
+            jce_panel_delete_selection();
         }
 
         if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
-            int dk = 0;
-            const uint32_t *dids = jce_state_get_selection(&dk);
-            if (dk > 0) {
-                uint32_t new_ids[JCE_MAX_SELECTED];
-                int nc = 0;
-                if (dk > 1)
-                    jce_state_begin_batch_edit();
-                for (int di = 0; di < dk && di < JCE_MAX_SELECTED; di++) {
-                    uint32_t dup = jce_state_duplicate_entity(dids[di]);
-                    if (dup != 0 && nc < JCE_MAX_SELECTED)
-                        new_ids[nc++] = dup;
-                }
-                if (dk > 1)
-                    jce_state_end_batch_edit();
-                if (nc > 0) {
-                    jce_state_select_entity(new_ids[0], false);
-                    for (int di = 1; di < nc; di++)
-                        jce_state_select_entity(new_ids[di], true);
-                }
-                jce_editor_inspector_request_sync();
-            }
+            jce_panel_duplicate_selection();
         }
     }
 }
@@ -1798,49 +1752,17 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
         return;
 
+    /* Coarse CPU fallback — only reached when the GPU id pick is unsupported
+     * on this backend or refused the request (see request_gpu_pick_for_click);
+     * every other click above returned already.  Same transform-scale AABB
+     * test the drag-drop path uses, so the two never disagree about a hit
+     * when selection lands here. */
     float ray_o[3], ray_d[3];
     gm_screen_to_ray(&pick_cam, s_sel_click_pos.x,
                      s_sel_click_pos.y, ray_o, ray_d);
 
-    uint32_t best_id = 0;
-    float    best_t  = 1e30f;
-
-    JceScene *scene = jce_state_get_scene();
-    int total = jce_state_get_entity_count();
-    for (int pi = 0; pi < total; pi++) {
-        uint32_t pid = jce_state_get_entity_id_by_index(pi);
-        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
-        if (!jce_state_entity_enabled(pid)) continue;
-
-        JceTransform *xf = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
-        if (!xf) continue;
-        float pos[3] = { xf->position.x, xf->position.y, xf->position.z };
-        float scl[3] = { xf->scale.x,    xf->scale.y,    xf->scale.z    };
-
-        float hx = fabsf(scl[0]) * 0.5f;
-        float hy = fabsf(scl[1]) * 0.5f;
-        float hz = fabsf(scl[2]) * 0.5f;
-        if (hx < 0.1f) hx = 0.1f;
-        if (hy < 0.1f) hy = 0.1f;
-        if (hz < 0.1f) hz = 0.1f;
-
-        float bmin[3] = { pos[0]-hx, pos[1]-hy, pos[2]-hz };
-        float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
-
-        float t;
-        jce_vec3 ro = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
-        jce_vec3 rd = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
-        jce_vec3 bmin_v = jce_v3(bmin[0], bmin[1], bmin[2]);
-        jce_vec3 bmax_v = jce_v3(bmax[0], bmax[1], bmax[2]);
-        if (jce_ray_aabb_intersect(ro, rd, bmin_v, bmax_v, &t) && t >= 0.0f) {
-            if (t < best_t) {
-                best_t  = t;
-                best_id = pid;
-            }
-        }
-    }
-
-    apply_single_pick_selection(best_id, add_mode);
+    apply_single_pick_selection(cpu_pick_entity_along_ray(ray_o, ray_d, NULL),
+                                add_mode);
 }
 
 /* Orange diamond outline on all selected entities. */

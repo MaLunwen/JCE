@@ -13,6 +13,37 @@
  * affinity, and must be cheap (no blocking I/O — save snapshots should
  * be queued, not synchronous).
  *
+ * Why this is not built on jce_event_bus (os/core), even though L6 may
+ * depend on L2 — four contracts that bus cannot express:
+ *   1. Priority order.  The bus dispatches in registration order; this
+ *      registry sorts ascending by priority with stable ties.  That is
+ *      load-bearing: the engine registers its own listener at -1000 so
+ *      engine-internal teardown runs ahead of consumer listeners.
+ *   2. Removal.  The bus removes by (fn, userdata) with a swap-to-last
+ *      that destroys ordering; this removes by opaque id via memmove
+ *      and keeps the sort intact.
+ *   3. Duplicates.  The bus silently drops a repeat (fn, userdata);
+ *      here the same callback may be registered at two priorities and
+ *      gets a distinct handle for each.
+ *   4. Lifetime.  The bus is a caller-owned instance; jce_engine_destroy
+ *      frees it well before it calls jce_lifecycle_shutdown(), and emit
+ *      must stay usable in between.  Being a process-global with no
+ *      handle to thread through is the point, not an accident.
+ *
+ * Relationship to the JceEvent stream (jce_window_event.h): focus and
+ * quit surface on both channels, and they are NOT the same fact.
+ *   - JCE_EVENT_WINDOW_FOCUS_* / JCE_EVENT_QUIT / JCE_EVENT_WINDOW_CLOSE
+ *     go to the single JceAppDesc::on_event callback.  Quit there is a
+ *     *request*: it is delivered before should_quit() arbitration and is
+ *     still cancellable (returning false swallows it and the app runs on).
+ *   - JCE_LIFECYCLE_* is the multi-listener broadcast.  WILL_QUIT is the
+ *     committed decision to exit — emitted only on paths that really do
+ *     terminate, including paths that produce no JceEvent at all
+ *     (SDL_EVENT_TERMINATING, jce_engine_quit_requested(), JCE_MAX_FRAMES).
+ * So for "are we shutting down / focused" this header is authoritative;
+ * on_event is the raw request stream.  Neither channel is redundant —
+ * do not remove one to feed the other.
+ *
  * Layer: L6 (application).  Consumed via <jce/api_app.h>.
  */
 

@@ -45,6 +45,25 @@ static void rt_script_set_position(void *user, JceScriptEntity e,
 	jce_scene_set_transform(rt->scene, (JceEntity)e, &t);
 }
 
+static bool rt_script_set_parent(void *user, JceScriptEntity child,
+                                 JceScriptEntity parent, bool preserve_world)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene || child == 0) return false;
+	return jce_scene_reparent(rt->scene, (JceEntity)child,
+	                          parent != 0 ? (JceEntity)parent
+	                                      : JCE_ENTITY_INVALID,
+	                          preserve_world);
+}
+
+static JceScriptEntity rt_script_get_parent(void *user,
+                                            JceScriptEntity child)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene || child == 0) return 0;
+	return (JceScriptEntity)jce_scene_get_parent(rt->scene, (JceEntity)child);
+}
+
 /* Read an asset's bytes host-fs-first (live editor source), then from the
  * mounted PAK + overlays (shipped builds where there is no source tree) —
  * the same host→PAK fallback terrain/audio/colliders use.  Returns a
@@ -1109,6 +1128,8 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.set_rotation   = rt_script_set_rotation;
 	host.get_scale      = rt_script_get_scale;
 	host.set_scale      = rt_script_set_scale;
+	host.set_parent     = rt_script_set_parent;
+	host.get_parent     = rt_script_get_parent;
 	host.find_with_tag  = rt_script_find_with_tag;
 	host.destroy_entity = rt_script_destroy_entity;
 	host.spawn          = rt_script_spawn;

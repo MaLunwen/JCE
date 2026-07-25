@@ -18,6 +18,7 @@
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
 #include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_texture.h>
 #include <jce/middleware/ui/jce_localization.h>
 #include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
@@ -201,8 +202,20 @@ void save_if_dirty(void)
     g_st.cfg = disk;   /* keep the snapshot consistent with what we wrote */
 
     jce_hotkeys_save();
-    if (ok_ps)
+    if (ok_ps) {
         jce_project_settings_apply(&g_st.ps);
+        /* Live re-apply the PROCESS-GLOBAL texture state so a Quality/Graphics
+         * edit shows in the editor viewport immediately, not only on the next
+         * scene load.  (Per-scene rendering — shadows/fog/ambient/exposure — is
+         * owned by the scene and intentionally NOT changed retroactively, which
+         * is why editing those here only affects newly-created scenes.) */
+        const int lvl = g_st.ps.quality.current_level;
+        const JceProjectQualityLevel *q =
+            (lvl >= 0 && lvl < g_st.ps.quality.count)
+                ? &g_st.ps.quality.levels[lvl] : nullptr;
+        jce_texture_set_quality_mip_bias(q ? (int8_t)q->texture_quality : 0);
+        jce_texture_set_aniso_override((int)g_st.ps.graphics.anisotropic_textures);
+    }
     if (ok_ps && ok_cfg)
         g_st.dirty = false;
 }
@@ -211,6 +224,10 @@ void save_if_dirty(void)
 
 void draw_input(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.input.notConsumed",
+        "Not consumed yet: JCE input uses per-binding action deadzones (Input "
+        "Manager), not a global dead zone / sensitivity. Kept for project parity."));
+    ImGui::Spacing();
     /* Reuse the existing Input Manager panel content verbatim. */
     jce_editor_panel_input_manager_content();
 
@@ -275,6 +292,11 @@ void draw_layer_collision_matrix(uint32_t mat[JCE_PS_LAYER_COUNT])
 
 void draw_physics(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.physics.partialConsumed",
+        "Consumed: gravity, solver iterations, sleep threshold, layer matrix, "
+        "auto-simulation. Not consumed (no Bullet equivalent): contact offset, "
+        "bounce threshold, solver velocity iterations."));
+    ImGui::Spacing();
     JceProjectPhysics &p = g_st.ps.physics;
     ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "gravity", "Gravity"));
     if (ImGui::DragFloat3("##phys_gravity", p.gravity, 0.05f, -50.0f, 50.0f))
@@ -309,6 +331,10 @@ void draw_physics(void)
 
 void draw_physics2d(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.physics2d.partialConsumed",
+        "Consumed: gravity (2D world). Not consumed yet: iteration counts, query "
+        "flags, auto-sync transforms."));
+    ImGui::Spacing();
     JceProjectPhysics2D &p = g_st.ps.physics2d;
     ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "gravity2d", "Gravity (2D)"));
     if (ImGui::DragFloat2("##phys2d_gravity", p.gravity, 0.05f, -50.0f, 50.0f))
@@ -367,6 +393,10 @@ void draw_string_array_editor(const char *id, char (*arr)[JCE_PS_NAME_LEN],
 
 void draw_tags_layers(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.tagsLayers.sortingNote",
+        "Tags + Layers are consumed. Sorting Layers are not consumed yet "
+        "(no 2D sorted renderer)."));
+    ImGui::Spacing();
     JceProjectTagsAndLayers &t = g_st.ps.tags_layers;
     if (ImGui::CollapsingHeader(jce_editor_i18n("projectSettings.tagsLayers.tags"),
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -591,6 +621,11 @@ void draw_quality(void)
 
 void draw_graphics(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.graphics.notConsumed",
+        "Consumed: Anisotropic Textures (sampler override), Default MSAA (cook). "
+        "Not consumed: color space / sRGB write (gamma pipeline is fixed), HDR "
+        "(driven by the Render Pipeline asset)."));
+    ImGui::Spacing();
     JceGpuTier  tier = jce_renderer_get_tier();
     const char *name = jce_gpu_tier_name(tier);
     ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "gpu_tier", "Current GPU Tier (read-only):"));
@@ -626,6 +661,13 @@ void draw_graphics(void)
         const int v[] = { 0, 2, 4, 8 };
         g.default_msaa = v[msaa_idx]; mark_dirty();
     }
+    /* Clarify the parallel-MSAA split: this value is baked into the cooked
+     * render settings the SHIPPED GAME reads; the editor viewport itself runs
+     * tier-appropriate MSAA (RenderPipelineDesc.msaa_samples), so changing this
+     * does NOT change what the editor viewport shows. */
+    ImGui::TextDisabled("%s", jce_editor_i18n_or(PS_KEY "default_msaa.hint",
+        "Shipped-game default MSAA (baked at cook). The editor viewport uses "
+        "tier MSAA, so this does not change the editor preview."));
     static const char *aniso[] = {
         jce_editor_i18n_or(PS_KEY "aniso.disabled", "Disabled"),
         jce_editor_i18n_or(PS_KEY "aniso.perTexture", "Per Texture"),
@@ -739,6 +781,10 @@ void draw_audio(void)
 
 void draw_editor(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.editor.notConsumed",
+        "Not consumed yet: 2D/3D default behaviour mode and version-control mode "
+        "(persisted for project-format parity)."));
+    ImGui::Spacing();
     JceProjectEditor &e = g_st.ps.editor;
     /* Auto-save is a per-user editor preference (it never travels with the
      * project), configured in Preferences > General and driven by
@@ -1185,16 +1231,14 @@ void draw_project(void)
 
 void draw_build(void)
 {
-    ImGui::TextUnformatted(jce_editor_i18n("projectSettings.build.cfgPreset"));
-    ImGui::PushItemWidth(-1);
-    if (ImGui::InputText("##cfg_preset", g_st.cfg.build_configure_preset,
-                         sizeof(g_st.cfg.build_configure_preset)))
-        mark_dirty();
-    ImGui::TextUnformatted(jce_editor_i18n("projectSettings.build.buildPreset"));
-    if (ImGui::InputText("##build_preset", g_st.cfg.build_preset,
-                         sizeof(g_st.cfg.build_preset)))
-        mark_dirty();
-    ImGui::PopItemWidth();
+    /* build_configure_preset / build_preset were built-but-unwired: the real
+     * build is driven by JceProject + the Build Profiles panel (CMakePresets),
+     * and repack ignores the preset string — so these two inputs never affected
+     * a build.  Removed from the UI to stop implying a live setting; the
+     * persisted fields stay inert and "repack on save" is governed solely by
+     * Preferences > auto_repack_on_save.  Output Dir + CMake Target below ARE
+     * consumed: Output Dir feeds the launcher's executable search, and CMake
+     * Target overrides the Build Profiles target (see refresh_prefill_from_project). */
     if (jce_draw_path_input_folder(
             jce_editor_i18n("projectSettings.build.outputDir"),
             g_st.cfg.build_output_path,
@@ -1339,6 +1383,10 @@ void draw_hotkeys(void)
 
 void draw_preset_manager(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.presets.notConsumed",
+        "Not consumed yet: preset bindings are persisted but new components are "
+        "not auto-initialised from them."));
+    ImGui::Spacing();
     JceProjectPresetManager &pm = g_st.ps.presets;
     ImGui::Text("%s %d / %d",
                 jce_editor_i18n("projectSettings.presetManager.bindings"),
@@ -1394,6 +1442,12 @@ void draw_preset_manager(void)
 
 void draw_quality_levels(void)
 {
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("projectSettings.quality.partialConsumed",
+        "Consumed per level: shadow distance/cascades/resolution/quality, texture "
+        "quality (mip drop), LOD bias, vsync. Not consumed yet: pixel light count, "
+        "anti-aliasing (use Graphics > Default MSAA), soft particles, reflection "
+        "probes, target FPS."));
+    ImGui::Spacing();
     JceProjectQuality &q = g_st.ps.quality;
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "quality.perLevel", "Per-Level Editor"));

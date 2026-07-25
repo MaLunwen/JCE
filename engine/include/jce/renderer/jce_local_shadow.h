@@ -32,7 +32,7 @@ JCE_EXTERN_C_BEGIN
  *
  * Returns proj*view. Uses a safe up-vector when dir is near-vertical so the
  * look-at never degenerates to NaN. */
-jce_mat4 jce_local_shadow_vp(jce_vec3 pos, jce_vec3 dir,
+JCE_API jce_mat4 jce_local_shadow_vp(jce_vec3 pos, jce_vec3 dir,
                              float fov_rad, float near_z, float far_z,
                              bool homogeneous_depth);
 
@@ -43,7 +43,7 @@ jce_mat4 jce_local_shadow_vp(jce_vec3 pos, jce_vec3 dir,
  * Writes the tile origin (out_x,out_y) and edge length (out_size).
  * Returns false (and writes nothing) if slot is out of range or inputs are
  * degenerate. */
-bool jce_local_shadow_atlas_tile(uint32_t slot, uint32_t atlas_size,
+JCE_API bool jce_local_shadow_atlas_tile(uint32_t slot, uint32_t atlas_size,
                                  uint32_t tiles_per_side,
                                  uint16_t *out_x, uint16_t *out_y,
                                  uint16_t *out_size);

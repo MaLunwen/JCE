@@ -49,7 +49,7 @@ typedef struct JcePakArchive JcePakArchive;
  * @param json_path  Path to the Aseprite .json atlas.
  * @param image_path Override image path (NULL = use meta.image from JSON).
  */
-JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
+JCE_API JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
                                             const char *image_path);
 
 /* Load an Aseprite atlas stored at a virtual path in a JPAK archive. */
@@ -67,7 +67,7 @@ JCE_API JceSpriteSheet *jce_sprite_sheet_load_json_pak(
  * @param frame_h     Frame height (pixels).
  * @param frame_duration_ms  Duration per frame in milliseconds (default 100).
  */
-JceSpriteSheet *jce_sprite_sheet_create_grid(const char *image_path,
+JCE_API JceSpriteSheet *jce_sprite_sheet_create_grid(const char *image_path,
                                               uint32_t image_w,
                                               uint32_t image_h,
                                               uint32_t frame_w,
@@ -79,13 +79,13 @@ JCE_API void jce_sprite_sheet_destroy(JceSpriteSheet *sheet);
 /* Accessors. */
 JCE_API const char       *jce_sprite_sheet_image_path(const JceSpriteSheet *sheet);
 JCE_API uint32_t          jce_sprite_sheet_frame_count(const JceSpriteSheet *sheet);
-const JceSpriteFrame *jce_sprite_sheet_get_frame(const JceSpriteSheet *sheet,
+JCE_API const JceSpriteFrame *jce_sprite_sheet_get_frame(const JceSpriteSheet *sheet,
                                                   uint32_t index);
 
 JCE_API uint32_t          jce_sprite_sheet_anim_count(const JceSpriteSheet *sheet);
-const JceSpriteAnim *jce_sprite_sheet_get_anim(const JceSpriteSheet *sheet,
+JCE_API const JceSpriteAnim *jce_sprite_sheet_get_anim(const JceSpriteSheet *sheet,
                                                 uint32_t index);
-const JceSpriteAnim *jce_sprite_sheet_find_anim(const JceSpriteSheet *sheet,
+JCE_API const JceSpriteAnim *jce_sprite_sheet_find_anim(const JceSpriteSheet *sheet,
                                                  const char *name);
 
 /* ================================================================== */

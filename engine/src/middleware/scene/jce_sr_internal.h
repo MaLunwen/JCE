@@ -41,8 +41,7 @@
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_ibl.h>
-#include <jce/os/core/jce_thread.h>   /* async IBL bake worker */
-#include <jce/os/core/jce_jobs.h>     /* data-parallel frustum cull */
+#include <jce/os/core/jce_thread.h>   /* async IBL bake worker + data-parallel cull */
 #include <jce/os/core/jce_console.h>  /* r.forwardplus cvar toggle */
 #include <jce/renderer/jce_particles.h>
 #include <jce/renderer/jce_gpu_particles.h>
@@ -132,6 +131,7 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
  * an open-addressing path hash (sr_get_model). */
 #define SR_MODEL_CACHE_MAX     256
 #define SR_MODEL_MAX_INFLIGHT  3    /* concurrent async model decodes */
+#define SR_MODEL_UPLOADS_PER_FRAME 1 /* GPU uploads; CPU decode stays parallel */
 /* 千万 S4: max distance-LOD bands for the model scatter (LOD0..LODn + impostor
  * terminal share these contiguous bands). */
 #define JCE_FOLIAGE_LOD_BANDS  6
@@ -1029,6 +1029,21 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t      u_csm_splits;
     bgfx_uniform_handle_t      u_csm_params;
     bgfx_uniform_handle_t      u_csm_bias_scales;
+
+    /* Dual shadow maps (JCE_SHADOW_DUAL): a SECOND CSM depth atlas holding ONLY
+     * dynamic (mover) casters, a 2x2 tile grid of the 4 cascades in one texture,
+     * re-rendered every frame with the SAME cascade VPs.  The static csm_tex[c]
+     * then cache aggressively (movers no longer dirty them), and the PBR shader
+     * min()s the two — so a moving object no longer forces re-rendering all the
+     * static casters in its cascade (Unity Shadowmask / UE static-vs-movable).
+     * Sampled via the s_shadowMap stage (dead under CSM); u_csmDynParams carries
+     * {tiles=2, 1/atlas_size, enabled, 0}. */
+    bgfx_texture_handle_t      dyn_csm_atlas_tex;
+    bgfx_frame_buffer_handle_t dyn_csm_atlas_fbo;
+    bgfx_uniform_handle_t      u_csm_dyn_params;
+    uint16_t                   dyn_csm_atlas_size;   /* = shadow_map_size */
+    bool                       dyn_csm_valid;        /* allocated this size */
+    bool                       frame_dyn_csm_active; /* atlas rendered this frame */
     /* Shadow FILTER tier (x lane; see JceRenderPipelineDesc
        .shadow_filter_quality). Frame-constant uniform branch in
        fs_pbr/fs_terrain selecting 1-tap / 3x3 / full PCF — coherent for
@@ -1069,12 +1084,17 @@ struct JceSceneRenderer {
     jce_mat4   shadow_cache_vp[JCE_CSM_MAX_CASCADES]; /* VP each csm_fbo[c] holds */
     bool       shadow_cache_valid[JCE_CSM_MAX_CASCADES];
     uint64_t   shadow_cache_caster_key;   /* caster_key at last render */
+    uint64_t   shadow_cache_static_caster_key; /* STATIC-only key at last render (dual) */
     uint64_t   shadow_cache_struct_epoch; /* structural_epoch at last render */
     uint32_t   shadow_cache_cascades;     /* csm.cascade_count at last render */
     uint16_t   shadow_cache_map_size;     /* shadow_map_size at last render */
     /* Per-frame caster-state signals, accumulated in the ecull build loop and
      * consumed by sr_draw_shadow_pass. */
     uint64_t   shadow_caster_key;         /* FNV-1a over (entity, xform_gen) of casters */
+    /* Dual mode: key folding ONLY the STATIC (non-is_dyn_caster) casters, so a
+     * mover's xform_gen churn does not void the static cascade cache (movers go
+     * to the dynamic atlas).  The full shadow_caster_key still gates single-map. */
+    uint64_t   shadow_static_caster_key;
     bool       shadow_has_dynamic_caster; /* any rigidbody/character/skeletal caster */
     /* Per-cascade dynamic gates: list of ecull indices of dynamic casters
      * (rebuilt with the full ecull build; appended by the L2 repair), and
@@ -1184,6 +1204,7 @@ struct JceSceneRenderer {
     uint64_t                   ecull_frz_struct;
     const void                *ecull_frz_scene;
     uint64_t                   ecull_frz_caster_key;
+    uint64_t                   ecull_frz_static_caster_key; /* dual: static-only */
     bool                       ecull_frz_dyn;
 
     /* Slice 5b (DOTS floor): the LOD/fade loop's constants are valid for this
@@ -1325,6 +1346,10 @@ struct JceSceneRenderer {
      * failed. */
     JceTaaState               taa_state;
     JceCvar                  *cv_taa;
+    /* r.upscaler: dynamic-resolution upscaler for the editor Scene View —
+     * 0=Off (bilinear), 1=RCAS spatial sharpen (default), 2=TSR temporal.
+     * Read live each frame; JCE_TSR / JCE_RCAS env force the boot value. */
+    JceCvar                  *cv_upscaler;
 
     /* Skybox / IBL state. */
     JceSkybox               *skybox;
@@ -1422,6 +1447,8 @@ struct JceSceneRenderer {
     /* Model / animation cache. */
     SrModelCache             model_cache[SR_MODEL_CACHE_MAX];
     int                      model_inflight;   /* concurrent async model decodes */
+    uint32_t                 model_upload_frame;
+    bool                     model_upload_frame_valid;
     SrAnimInstance           anim_inst[SR_ANIM_INSTANCE_MAX];
     /* O(1) entity -> anim_inst slot index (open addressing, linear probe,
      * capacity 2x the slot cap, power of two).  Value is slot+1 (0 = empty).
@@ -1475,6 +1502,26 @@ struct JceSceneRenderer {
     } tex_cache[SR_TEX_CACHE_MAX];
     int tex_cache_count;
     int tex_inflight;            /* concurrent async decodes */
+
+    /* Private decode pool for async texture + model loads (audit C4-5).
+     *
+     * These used to be raw jce_thread_create() per asset — one OS thread
+     * created and destroyed for every texture and every model, thousands of
+     * them over a streaming session.  jce_thread.h states the policy this
+     * now follows: whole-file reads and image/mesh decode run on a small
+     * PRIVATE pool, never the shared one, because enkiTS waits
+     * cooperatively — the main thread's per-frame parallel_for would pick a
+     * hundred-millisecond decode off the queue and finish it before its own
+     * cull could complete.  The world streamers, the async asset pool, the
+     * archive loader and the bundle cook each keep one for the same reason;
+     * this renderer was the one place still spawning threads by hand.
+     *
+     * Sized to the in-flight budget already enforced above (SR_TEX_MAX_
+     * INFLIGHT + SR_MODEL_MAX_INFLIGHT), so concurrency is unchanged and
+     * only the thread churn goes away.  NULL is tolerated everywhere: the
+     * callers fall back to decoding inline, exactly as they did when
+     * jce_thread_create returned NULL. */
+    JceThreadPool *decode_pool;
     /* Persistent open-addressing index (path_hash -> tex_cache idx) so the
      * runtime texture resolve is O(1) instead of an O(tex_cache_count) strncmp
      * scan (the model cache beside it is already hashed — see sr_get_model).

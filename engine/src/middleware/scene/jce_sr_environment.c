@@ -2213,7 +2213,7 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
                     | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
                 sr->water_cache[slot].fft_tex = bgfx_create_texture_2d(
                     (uint16_t)res, (uint16_t)res, false, 1,
-                    BGFX_TEXTURE_FORMAT_RGBA32F, tflags, NULL);
+                    BGFX_TEXTURE_FORMAT_RGBA32F, tflags, NULL, 0);
             }
             sr->water_cache[slot].fft_res = res;
         }

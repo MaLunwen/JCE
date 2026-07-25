@@ -13,6 +13,18 @@
  *   jce_loc_shutdown();
  *
  * Layer: middleware/ui (L4) — depends on jce_json, jce_alloc (L2).
+ *
+ * This is the authoritative localization system for game and UI strings:
+ * open-ended key space, N locales, reloadable at runtime, change listeners.
+ * Prefer it for anything new.
+ *
+ * It does NOT subsume <jce/os/core/jce_i18n.h> (jce_i18n_*), which stays for
+ * two reasons that cannot be met here: it is reachable from L2/L3 (this
+ * module is not), and it keeps every language resident at once so
+ * jce_i18n_collect_codepoints() can build one font atlas covering all of
+ * them — jce_loc holds a single locale and clears the table on each switch.
+ * Both read the same i18n/<locale>.json files and share one key namespace;
+ * the JceStringId key names are a reserved subset (see jce_i18n_key_name).
  */
 
 #ifndef JCE_LOCALIZATION_H

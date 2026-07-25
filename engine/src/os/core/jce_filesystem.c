@@ -152,29 +152,30 @@ void jce_fs_destroy(JceFileSystem *fs)
 /* Mount points                                                        */
 /* ================================================================== */
 
-void jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
+bool jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
 {
-    if (!fs) return;
+    if (!fs || !pak) return false;
 
     /* Replace the legacy unnamed slot if present; otherwise append. */
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
         if (fs->paks[i].name == NULL) {
             fs->paks[i].pak = pak;
             fs->pak = pak;
-            return;
+            return true;
         }
     }
 
     if (fs->pak_count >= JCE_FS_MAX_PAKS) {
         LOG_WARN(LOG_TAG, "mount table full (%u); refusing legacy pak mount",
                  (unsigned)JCE_FS_MAX_PAKS);
-        return;
+        return false;
     }
 
     fs->paks[fs->pak_count].pak  = pak;
     fs->paks[fs->pak_count].name = NULL;
     ++fs->pak_count;
     fs->pak = pak;
+    return true;
 }
 
 bool jce_fs_mount_pak_named(JceFileSystem *fs, const char *name,
@@ -242,21 +243,22 @@ uint32_t jce_fs_mounted_pak_count(const JceFileSystem *fs)
     return fs ? fs->pak_count : 0;
 }
 
-void jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
+bool jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
                       const char *directory)
 {
-    if (!fs || !directory) return;
+    if (!fs || !directory) return false;
 
     /* PhysFS mount: mountPoint is the virtual prefix. */
     if (!PHYSFS_mount(directory, prefix, 1)) {
         LOG_WARN(LOG_TAG, "PHYSFS_mount('%s' -> '%s') failed: %s",
                  directory, prefix ? prefix : "/",
                  PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
-        return;
+        return false;
     }
 
     LOG_DEBUG(LOG_TAG, "mounted dir '%s' -> '%s'",
               prefix ? prefix : "/", directory);
+    return true;
 }
 
 /* ================================================================== */

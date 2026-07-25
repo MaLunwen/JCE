@@ -1,9 +1,28 @@
 /*
  * jce_reflect_builtin.cpp  Register engine component metadata.
  *
- * This is a thin layer that exposes JceTransform, JceCameraComponent,
- * JceDirectionalLight, JcePointLight, JceSpotLight to the reflection
- * registry so the inspector can draw them generically.
+ * Scope note (deliberate, do not "restore" the removed entries):
+ *   The data-driven jce_reflect drawer is NOT the inspector's general
+ *   path.  Every component except two is drawn by a handwritten
+ *   draw_comp_* function in editor/src/panels/jce_panel_inspector_*.cpp,
+ *   and those handwritten drawers are the AUTHORITY for labels, ranges
+ *   and reset values.
+ *
+ *   jce_reflect_draw is called from exactly two places:
+ *     - draw_comp_camera()  (jce_panel_inspector_lighting.cpp) → "Camera",
+ *       registered here;
+ *     - the particle editor (jce_panel_particle_editor.cpp) →
+ *       "Particle Emitter", registered there next to its own drawer.
+ *
+ *   Registrations for Transform / Pivot / Directional Light / Point Light
+ *   used to live here too.  Nothing ever looked them up, so they were pure
+ *   drift bait: the Point Light "Reset to Default" radius had already
+ *   silently diverged (5.0) from the engine's JSON parse fallback and the
+ *   editor's Add-Component initialiser (10.0) without anyone noticing,
+ *   because the blob was unreachable.  They were removed rather than kept
+ *   as a half-migration.  If reflect is ever extended to another component,
+ *   register it HERE together with the jce_reflect_draw call that consumes
+ *   it, and delete the handwritten drawer in the same change.
  */
 
 #include "jce_reflect.h"
@@ -14,26 +33,11 @@ extern "C" {
 
 /* ── Type registrations ─────────────────────────────────────────── */
 
-static const JceTransform g_def_JceTransform = {
-    /* position */ {0.0f, 0.0f, 0.0f},
-    /* rotation */ {0.0f, 0.0f, 0.0f, 1.0f},
-    /* scale    */ {1.0f, 1.0f, 1.0f},
-};
-JCE_REFLECT_BEGIN(JceTransform, "Transform")
-    JCE_FIELD(JceTransform, position, JCE_FT_VEC3, "Position")
-    JCE_FIELD(JceTransform, rotation, JCE_FT_QUAT, "Rotation")
-    JCE_FIELD(JceTransform, scale,    JCE_FT_VEC3, "Scale")
-JCE_REFLECT_END_DEFAULTS(JceTransform, "Transform", &g_def_JceTransform)
-
-static const JcePivotComponent g_def_JcePivotComponent = {
-    /* local_position */ {0.0f, 0.0f, 0.0f},
-    /* local_rotation */ {0.0f, 0.0f, 0.0f, 1.0f},
-};
-JCE_REFLECT_BEGIN(JcePivotComponent, "Pivot")
-    JCE_FIELD(JcePivotComponent, local_position, JCE_FT_VEC3, "Local Position")
-    JCE_FIELD(JcePivotComponent, local_rotation, JCE_FT_QUAT, "Orientation")
-JCE_REFLECT_END_DEFAULTS(JcePivotComponent, "Pivot", &g_def_JcePivotComponent)
-
+/* This blob is the inspector's per-field "Reset to Default" source, so it
+ * MUST agree with the engine's JSON parse fallbacks (parse_camera in
+ * engine/src/middleware/scene/jce_scene_components_json.c) and with the
+ * editor's Add-Component initialisers (adddef_* in
+ * jce_editor_component_defaults.cpp).  The engine parser is authoritative. */
 static const JceCameraComponent g_def_JceCameraComponent = {
     /* fov_deg    */ 60.0f,
     /* near_plane */ 0.1f,
@@ -49,42 +53,7 @@ JCE_REFLECT_BEGIN(JceCameraComponent, "Camera")
     JCE_FIELD(JceCameraComponent, ortho,      JCE_FT_BOOL,  "Orthographic")
 JCE_REFLECT_END_DEFAULTS(JceCameraComponent, "Camera", &g_def_JceCameraComponent)
 
-static const JceDirectionalLight g_def_JceDirectionalLight = {
-    /* direction    */ {0.0f, -1.0f, 0.0f},
-    /* color        */ {1.0f, 1.0f, 1.0f},
-    /* intensity    */ 1.0f,
-    /* casts_shadow */ true,
-    /* cookie       */ {UINT16_MAX},
-    /* cookie str   */ 0.0f,
-    /* cookie path  */ "",
-};
-JCE_REFLECT_BEGIN(JceDirectionalLight, "Directional Light")
-    JCE_FIELD(JceDirectionalLight, direction,    JCE_FT_VEC3,    "Direction")
-    JCE_FIELD(JceDirectionalLight, color,        JCE_FT_COLOR3,  "Color")
-    JCE_FIELD_RANGE(JceDirectionalLight, intensity, JCE_FT_FLOAT, "Intensity", 0.0f, 100.0f, 0.05f)
-    JCE_FIELD(JceDirectionalLight, casts_shadow, JCE_FT_BOOL,    "Casts Shadow")
-JCE_REFLECT_END_DEFAULTS(JceDirectionalLight, "Directional Light", &g_def_JceDirectionalLight)
-
-static const JcePointLight g_def_JcePointLight = {
-    /* position  */ {0.0f, 0.0f, 0.0f},
-    /* color     */ {1.0f, 1.0f, 1.0f},
-    /* intensity */ 1.0f,
-    /* radius    */ 5.0f,
-};
-JCE_REFLECT_BEGIN(JcePointLight, "Point Light")
-    JCE_FIELD(JcePointLight, position,  JCE_FT_VEC3,   "Position")
-    JCE_FIELD(JcePointLight, color,     JCE_FT_COLOR3, "Color")
-    JCE_FIELD_RANGE(JcePointLight, intensity, JCE_FT_FLOAT, "Intensity", 0.0f, 1000.0f, 0.1f)
-    JCE_FIELD_RANGE(JcePointLight, radius,    JCE_FT_FLOAT, "Radius",    0.01f, 1000.0f, 0.1f)
-JCE_REFLECT_END_DEFAULTS(JcePointLight, "Point Light", &g_def_JcePointLight)
-
-/* JceSpotLight has inner/outer cone — register conservatively. */
-
 extern "C" void jce_reflect_register_builtin(void)
 {
-    jce_reflect_register(&g_jce_type_JceTransform);
-    jce_reflect_register(&g_jce_type_JcePivotComponent);
     jce_reflect_register(&g_jce_type_JceCameraComponent);
-    jce_reflect_register(&g_jce_type_JceDirectionalLight);
-    jce_reflect_register(&g_jce_type_JcePointLight);
 }

@@ -3,7 +3,7 @@
  *
  * Declares extern "C" functions that wrap ozz-animation's optimized
  * job-based API (sampling, local-to-model, blending).  The implementation
- * lives in jce_anim_ozz.cpp (C++17); every other translation unit
+ * lives in jce_anim_ozz.cpp (C++20); every other translation unit
  * includes this header as plain C.
  *
  * Layer: Animation (Layer 3) -- internal.

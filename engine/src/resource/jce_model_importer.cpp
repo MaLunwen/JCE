@@ -7,6 +7,10 @@
 
 #include <jce/resource/jce_model_importer.h>
 
+#include <exception>   /* std::exception — extern "C" firewall */
+#include <stdexcept>
+#include <utility>     /* std::forward                        */
+
 #include <jce/os/core/jce_filesystem.h>
 /* The skinned-import path (guarded by JCE_MODEL_IMPORTER_COOK_ONLY) is the
  * sole consumer of jce_math / jce_skinned_mesh / jce_skeleton types; the static
@@ -67,6 +71,50 @@ static std::string to_cwd_relative(const std::string &p)
             return rel.string();
     } catch (...) {}
     return p;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Exception firewall for the extern "C" surface.
+ *
+ *  Every function below is reached across the flat C ABI, and an exception
+ *  crossing that boundary is undefined behaviour — in practice std::terminate
+ *  with a stack the C caller cannot interpret.  This TU is the one that feeds
+ *  UNTRUSTED bytes to a C++ library: model files arrive from a PAK, from disk,
+ *  or from whatever a game ships, and the body allocates std::vector /
+ *  std::string per mesh while doing it.  std::bad_alloc on a malformed or
+ *  hostile file is not exotic here, it is the expected failure.
+ *
+ *  Same shape as the firewalls added to jce_bt_impl.cpp (BT registerBuilder /
+ *  tickOnce / haltTree): log what happened, then return the value the C
+ *  caller already knows how to handle as failure.
+ * ------------------------------------------------------------------ */
+template <typename R, typename Fn>
+static R mi_guard(const char *what, R on_error, Fn &&fn)
+{
+    try {
+        return fn();
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "%s: C++ exception escaped (%s) — reporting failure",
+                  what, e.what());
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "%s: non-std exception escaped — reporting failure",
+                  what);
+    }
+    return on_error;
+}
+
+/* void-returning entry points: nothing to report, but an escaping exception
+ * would still terminate the process. */
+template <typename Fn>
+static void mi_guard_void(const char *what, Fn &&fn)
+{
+    try {
+        fn();
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "%s: C++ exception escaped (%s)", what, e.what());
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "%s: non-std exception escaped", what);
+    }
 }
 
 extern "C" {
@@ -327,7 +375,20 @@ static unsigned parts_postprocess_flags(void)
          | aiProcess_FlipUVs;
 }
 
+static bool jce_model_importer_load_parts_memory_impl(const void *data, size_t size,
+                                          const char *ext_hint,
+                                          JceModelParts *out);
+
 bool jce_model_importer_load_parts_memory(const void *data, size_t size,
+                                          const char *ext_hint,
+                                          JceModelParts *out)
+{
+    return mi_guard("load_parts_memory", false, [&] {
+        return jce_model_importer_load_parts_memory_impl(data, size, ext_hint, out);
+    });
+}
+
+static bool jce_model_importer_load_parts_memory_impl(const void *data, size_t size,
                                           const char *ext_hint,
                                           JceModelParts *out)
 {
@@ -347,7 +408,18 @@ bool jce_model_importer_load_parts_memory(const void *data, size_t size,
     return build_parts(scene, out);
 }
 
+static bool jce_model_importer_load_parts_file_impl(const char *file_path,
+                                        JceModelParts *out);
+
 bool jce_model_importer_load_parts_file(const char *file_path,
+                                        JceModelParts *out)
+{
+    return mi_guard("load_parts_file", false, [&] {
+        return jce_model_importer_load_parts_file_impl(file_path, out);
+    });
+}
+
+static bool jce_model_importer_load_parts_file_impl(const char *file_path,
                                         JceModelParts *out)
 {
     if (!file_path || file_path[0] == '\0' || !out) return false;
@@ -399,7 +471,18 @@ void jce_model_importer_free_parts(JceModelParts *parts)
     parts->count = 0;
 }
 
+static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
+                                    JceModelCpuMeshData *out);
+
 bool jce_model_importer_load_cpu_file(const char *file_path,
+                                    JceModelCpuMeshData *out)
+{
+    return mi_guard("load_cpu_file", false, [&] {
+        return jce_model_importer_load_cpu_file_impl(file_path, out);
+    });
+}
+
+static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
                                     JceModelCpuMeshData *out)
 {
     if (!file_path || file_path[0] == '\0' || !out) return false;
@@ -1700,7 +1783,18 @@ static void resolve_embedded_textures(const aiScene *scene,
     try_resolve(out->emissive_tex, sizeof(out->emissive_tex));
 }
 
+static bool jce_model_importer_extract_material_impl(const char *file_path,
+                                       JceModelMaterialInfo *out);
+
 bool jce_model_importer_extract_material(const char *file_path,
+                                       JceModelMaterialInfo *out)
+{
+    return mi_guard("extract_material", false, [&] {
+        return jce_model_importer_extract_material_impl(file_path, out);
+    });
+}
+
+static bool jce_model_importer_extract_material_impl(const char *file_path,
                                        JceModelMaterialInfo *out)
 {
     if (!file_path || file_path[0] == '\0' || !out) return false;
@@ -1716,6 +1810,18 @@ bool jce_model_importer_extract_material(const char *file_path,
     out->ao_strength    = 1.0f;
     out->alpha_cutoff   = 0.5f;
 
+    /* Host path on purpose — NOT the VFS-first idiom load_cpu_file uses.
+     * Assimp's ReadFileFromMemory "doesn't handle model formats that spread
+     * their data across multiple files ... OBJ ... outsource parts of their
+     * material info into external scripts" (Importer.hpp): an OBJ's materials
+     * live in a sibling .mtl and a non-GLB glTF's in sibling .bin/image files,
+     * so a memory buffer would hand back the default material for exactly the
+     * formats this function exists to read.  Sound because this is an
+     * authoring-only entry point (see the header): it also probes sibling
+     * texture files with fs::exists and WRITES a GLB's embedded textures next
+     * to the model — neither is available on a read-only VFS/PAK mount, and
+     * packaged content never arrives here (cooked bundles carry materials
+     * through jce_bundle_convert_to_glb + the glTF loader). */
     Assimp::Importer importer;
     const aiScene *scene = importer.ReadFile(file_path, ASSIMP_FLAGS);
     if (!scene || !scene->mNumMeshes || !scene->mNumMaterials) {
@@ -1933,7 +2039,22 @@ static bool fill_inspect(const aiScene *scene, bool want_wireframe,
     return true;
 }
 
+static bool jce_model_importer_inspect_memory_impl(const void *data, size_t size,
+                                       const char *ext_hint,
+                                       bool        want_wireframe,
+                                       JceModelInspectResult *out);
+
 bool jce_model_importer_inspect_memory(const void *data, size_t size,
+                                       const char *ext_hint,
+                                       bool        want_wireframe,
+                                       JceModelInspectResult *out)
+{
+    return mi_guard("inspect_memory", false, [&] {
+        return jce_model_importer_inspect_memory_impl(data, size, ext_hint, want_wireframe, out);
+    });
+}
+
+static bool jce_model_importer_inspect_memory_impl(const void *data, size_t size,
                                        const char *ext_hint,
                                        bool        want_wireframe,
                                        JceModelInspectResult *out)
@@ -1960,7 +2081,20 @@ bool jce_model_importer_inspect_memory(const void *data, size_t size,
     return fill_inspect(scene, want_wireframe, out);
 }
 
+static bool jce_model_importer_inspect_file_impl(const char *file_path,
+                                     bool        want_wireframe,
+                                     JceModelInspectResult *out);
+
 bool jce_model_importer_inspect_file(const char *file_path,
+                                     bool        want_wireframe,
+                                     JceModelInspectResult *out)
+{
+    return mi_guard("inspect_file", false, [&] {
+        return jce_model_importer_inspect_file_impl(file_path, want_wireframe, out);
+    });
+}
+
+static bool jce_model_importer_inspect_file_impl(const char *file_path,
                                      bool        want_wireframe,
                                      JceModelInspectResult *out)
 {
@@ -1970,6 +2104,11 @@ bool jce_model_importer_inspect_file(const char *file_path,
         snprintf(out->error, sizeof(out->error), "empty file path");
         return false;
     }
+    /* Host path is deliberate, for the same reason extract_material reads one:
+     * ReadFileFromMemory cannot follow an OBJ's .mtl or a glTF's sibling .bin,
+     * so this entry reports complete metadata where the _memory twin degrades.
+     * A caller holding VFS/PAK/bundle bytes uses _inspect_memory instead —
+     * the model viewer tries this first and falls back to it on failure. */
     Assimp::Importer imp;
     const aiScene *scene = imp.ReadFile(file_path, INSPECT_FLAGS);  /* see note above */
     if (!scene || scene->mNumMeshes == 0) {

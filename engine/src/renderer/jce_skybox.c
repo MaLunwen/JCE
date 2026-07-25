@@ -2,7 +2,7 @@
  * jce_skybox.c  Equirectangular HDR skybox loading and cubemap rendering.
  *
  * Pipeline:
- *   1. Load equirect HDR image via SDL3_image → RGBA16F texture
+ *   1. Load equirect HDR image via jce_image → RGBA16F texture
  *   2. Convert equirect to cubemap via 6-pass GPU rendering (TODO: Phase 1B)
  *   3. Render cubemap skybox as fullscreen quad reconstructing view ray
  *
@@ -13,9 +13,9 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_image.h>
 #include <jce/renderer/jce_skybox.h>
 
-#include "internal/stb_image.h"
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
@@ -84,17 +84,18 @@ static uint16_t float_to_half(float f)
 }
 
 /* Load an HDR file and create a RGBA16F bgfx texture.
- * Uses stb_image for HDR decoding (SDL3_image lacks HDR support).
+ * The decode goes through the jce_image service, which picks the HDR codec
+ * internally — this file only asks for RGBA32F.
  * Kept for compatibility — new code uses load_hdr_pixels + upload_equirect_rgba16f. */
 
-/* Load HDR float pixels (RGBA32F).  Caller must stbi_image_free().
+/* Load HDR float pixels (RGBA32F).  Caller must jce_image_free_hdr().
    Returns NULL on failure. */
 static float *load_hdr_pixels(const char *path,
                               const void *mem_data,
                               uint32_t mem_size,
                               int *out_w, int *out_h)
 {
-    int w = 0, h = 0, channels = 0;
+    int w = 0, h = 0;
     float *pixels = NULL;
 
     if (path) {
@@ -102,14 +103,13 @@ static float *load_hdr_pixels(const char *path,
         unsigned char *fbuf = (unsigned char *)jce_fs_host_read_all(path, &fsize);
         if (!fbuf) { LOG_WARN(LOG_TAG, "failed to open HDR file: %s", path); return NULL; }
         if (fsize == 0) { JCE_FREE(fbuf); return NULL; }
-        pixels = stbi_loadf_from_memory(fbuf, (int)fsize, &w, &h, &channels, 4);
+        pixels = jce_image_load_hdr_from_memory(fbuf, fsize, &w, &h);
         JCE_FREE(fbuf);
     } else if (mem_data && mem_size > 0) {
-        pixels = stbi_loadf_from_memory((const stbi_uc *)mem_data,
-                                        (int)mem_size, &w, &h, &channels, 4);
+        pixels = jce_image_load_hdr_from_memory(mem_data, (uint64_t)mem_size, &w, &h);
     }
     if (!pixels || w <= 0 || h <= 0) {
-        if (pixels) stbi_image_free(pixels);
+        if (pixels) jce_image_free_hdr(pixels);
         return NULL;
     }
     *out_w = w;
@@ -132,7 +132,7 @@ static bgfx_texture_handle_t upload_equirect_rgba16f(const float *pixels,
     JCE_FREE(half_data);
     return bgfx_create_texture_2d((uint16_t)w, (uint16_t)h, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA16F,
-        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, bm);
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, bm, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -237,7 +237,7 @@ static bgfx_texture_handle_t equirect_to_cubemap_cpu(const float *src,
     return bgfx_create_texture_cube((uint16_t)size, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA16F,
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP,
-        bm);
+        bm, 0);
 }
 
 
@@ -267,7 +267,7 @@ JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
     sky->equirect_tex = upload_equirect_rgba16f(pixels, w, h);
     sky->cubemap_tex  = equirect_to_cubemap_cpu(pixels, w, h, sky->cubemap_size);
     skybox_retain_pixels(sky, pixels, w, h);
-    stbi_image_free(pixels);
+    jce_image_free_hdr(pixels);
 
     if (!BGFX_HANDLE_IS_VALID(sky->equirect_tex)) {
         if (BGFX_HANDLE_IS_VALID(sky->cubemap_tex))
@@ -303,7 +303,7 @@ JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_siz
     sky->equirect_tex = upload_equirect_rgba16f(pixels, w, h);
     sky->cubemap_tex  = equirect_to_cubemap_cpu(pixels, w, h, sky->cubemap_size);
     skybox_retain_pixels(sky, pixels, w, h);
-    stbi_image_free(pixels);
+    jce_image_free_hdr(pixels);
 
     if (!BGFX_HANDLE_IS_VALID(sky->equirect_tex)) {
         if (BGFX_HANDLE_IS_VALID(sky->cubemap_tex))

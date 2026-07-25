@@ -8,7 +8,7 @@
 
 #include <jce/os/core/jce_easing.h>   /* per-property lifetime curves */
 #include <jce/os/core/jce_json.h>
-#include <jce/os/core/jce_jobs.h>      /* parallel emitter update */
+#include <jce/os/core/jce_thread.h>    /* parallel emitter update */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_particles.h>
@@ -559,10 +559,10 @@ static void update_emitter(JceParticleSystem *sys, Emitter *em,
  * the parallel step never writes another emitter's pool or runs user code. */
 typedef struct { JceParticleSystem *sys; Emitter *emitters; float dt; } PUpdateCtx;
 
-static void particles_update_range(int begin, int end, void *user)
+static void particles_update_range(uint32_t begin, uint32_t end, void *user)
 {
     PUpdateCtx *c = (PUpdateCtx *)user;
-    for (int i = begin; i < end; i++)
+    for (uint32_t i = begin; i < end; i++)
         update_emitter(c->sys, &c->emitters[i], c->dt, &c->emitters[i].rng_state);
 }
 
@@ -608,11 +608,12 @@ void jce_particles_update(JceParticleSystem *sys, float dt)
     if (!sys) return;
     JCE_PROFILE_ZONE_N("Particles::Update");
     PUpdateCtx ctx = { sys, sys->emitters, dt };
-    JceJobSystem *jobs = jce_jobs_default();
-    if (jobs)
-        jce_jobs_parallel_for(jobs, MAX_EMITTERS, 0, particles_update_range, &ctx);
+    JceThreadPool *pool = jce_thread_pool_shared();
+    if (pool)
+        jce_thread_pool_parallel_for(pool, MAX_EMITTERS, 0,
+                                     particles_update_range, &ctx);
     else
-        particles_update_range(0, MAX_EMITTERS, &ctx);
+        particles_update_range(0u, MAX_EMITTERS, &ctx);
 
     /* Serial: deliver events + apply sub-emitter spawns (cross-emitter). */
     particles_drain_events(sys);

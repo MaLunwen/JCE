@@ -44,6 +44,18 @@ JceShaderHandle shader_load_program_fs(
 JceShaderHandle shader_load_program_fs_named(
     const char *dev_dir, const char *vs_base, const char *fs_base);
 
+/* Destroy a program created by the loaders above.  No-op on an invalid
+ * handle.  Non-renderer layers that own program lifetimes (the resource
+ * shader cache) must release through this instead of unwrapping the
+ * handle into a bgfx one themselves — jce_gfx_types.h reserves that
+ * conversion to renderer .c files. */
+JCE_API void jce_shader_program_destroy(JceShaderHandle prog);
+
+/* Shader-binary suffix ("dx11"/"spv"/"glsl"/"essl"/"mtl") for the live
+ * backend, or NULL when the backend ships no compiled variants.  Single
+ * source of truth for anyone that has to name a .bin on disk. */
+JCE_API const char *jce_shaders_backend_suffix(void);
+
 /* Pre-loaded shader set (color + textured + mesh + PBR). */
 typedef struct JceShaderSet {
     JceShaderHandle color;

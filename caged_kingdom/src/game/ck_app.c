@@ -12,6 +12,7 @@
 #include "ck_scene_director.h"
 
 #include <jce/api.h>
+#include <jce/renderer/jce_image.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/renderer/jce_renderer_caps.h>   /* jce_renderer_get_tier (baseline gating) */
@@ -315,8 +316,17 @@ CkApp *ck_app_create(const JceServices *svc)
             if (buf) {
                 size_t sz = jce_pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
-                if (sz > 0)
-                    jce_window_set_icon(app->svc.window, buf, sz);
+                if (sz > 0) {
+                    /* Decode via the image service — see jce_window.h: the
+                     * platform layer no longer holds a decoder. */
+                    int iw = 0, ih = 0;
+                    uint8_t *px = jce_image_load_rgba8_from_memory(
+                        buf, (uint64_t)sz, &iw, &ih);
+                    if (px) {
+                        jce_window_set_icon_rgba8(app->svc.window, px, iw, ih);
+                        jce_image_free_rgba8(px);
+                    }
+                }
                 jce_free(buf);
             }
         } else {

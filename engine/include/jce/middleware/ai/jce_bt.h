@@ -148,7 +148,7 @@ static inline bool jce_bt_tree_valid(JceBtTreeHandle h) { return h.idx != UINT32
  * Load a behavior tree from an XML string.
  * The XML uses BehaviorTree.CPP's standard format.
  */
-JceBtTreeHandle jce_bt_load_tree(JceBtContext *ctx,
+JCE_API JceBtTreeHandle jce_bt_load_tree(JceBtContext *ctx,
                                  const char *xml, uint32_t xml_len);
 
 /*

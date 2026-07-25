@@ -33,7 +33,7 @@ typedef struct JceIblData JceIblData;
  * @param prefilter_size    Size of the prefilter cubemap face at mip 0 (e.g., 128).
  * @param brdf_lut_size     Size of the BRDF LUT (e.g., 256).
  */
-JceIblData *jce_ibl_generate(JceTexture equirect_tex,
+JCE_API JceIblData *jce_ibl_generate(JceTexture equirect_tex,
                               uint32_t irradiance_size,
                               uint32_t prefilter_size,
                               uint32_t brdf_lut_size);

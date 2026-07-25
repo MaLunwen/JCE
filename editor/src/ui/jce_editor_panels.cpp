@@ -113,8 +113,43 @@ static struct {
     int         head;
 } s_console;
 
+/* Tag stamped on console entries mirrored into jce_log.  The Console panel's
+ * own jce_log sink (jce_panel_console.cpp) drops records carrying it, so a
+ * message added here shows up exactly once on screen while still reaching
+ * every real log destination. */
+const char *const kEditorConsoleLogTag = "editor";
+
+static JceLogLevel console_level_to_log(JceConsoleLevel level)
+{
+    switch (level) {
+    case JCE_CONSOLE_ERROR:   return JCE_LOG_LEVEL_ERROR;
+    case JCE_CONSOLE_WARNING: return JCE_LOG_LEVEL_WARN;
+    case JCE_CONSOLE_DEBUG:   return JCE_LOG_LEVEL_DEBUG;
+    default:                  return JCE_LOG_LEVEL_INFO;
+    }
+}
+
 static void console_add(JceConsoleLevel level, const char *text)
 {
+    /* Mirror into the engine log FIRST.  The Console ring is in-memory only
+     * and dies with the process, so before this every one of the ~240
+     * jce_editor_console_log* call sites was invisible in JCE_LOG_FILE — a
+     * user's attached log simply had no editor-side diagnostics in it, which
+     * is precisely when you need them.  The Console panel keeps its own ring
+     * for display (immediate, main-thread, filterable); this is about the
+     * message also existing somewhere durable.
+     *
+     * The file/line recorded is THIS function, not the ultimate caller —
+     * jce_editor_console_log* are ordinary variadic functions, so capturing
+     * the real origin would mean turning ~240 call sites into macros.  The
+     * message text plus the "editor" tag is what actually identifies these
+     * entries; the location field is not load-bearing for them.
+     *
+     * Safe before jce_log_init(): jce_log_write falls back to a synchronous
+     * emit when the ring does not exist yet. */
+    jce_log_write(console_level_to_log(level), kEditorConsoleLogTag,
+                  __FILE__, __LINE__, "%s", text);
+
     int idx = s_console.head % CONSOLE_MAX_LINES;
     s_console.lines[idx].level = level;
     snprintf(s_console.lines[idx].text, CONSOLE_LINE_LEN, "%s", text);

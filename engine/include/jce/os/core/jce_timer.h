@@ -1,8 +1,10 @@
 /*
- * jce_timer.h  High-precision frame timer with fixed timestep support.
+ * jce_timer.h  High-precision frame timer.
  *
  * Uses SDL_GetPerformanceCounter for sub-millisecond accuracy.
- * Provides delta time, fixed-step accumulator, and interpolation alpha.
+ * Provides delta time, elapsed time, smoothed FPS and an interpolation
+ * alpha.  The engine's fixed-step simulation cadence is owned by
+ * JceFixedClock (jce_fixed_clock.h) — this timer does not drive it.
  */
 
 #ifndef JCE_TIMER_H
@@ -36,14 +38,7 @@ JCE_API double JCE_CALL jce_timer_dt(const JceTimer *t);
 /* Get frame delta time in milliseconds (convenience). */
 JCE_API float JCE_CALL jce_timer_dt_ms(const JceTimer *t);
 
-/* Fixed timestep: returns true while the accumulator has >= one fixed step.
-   Call in a while loop for fixed updates:
-     while (jce_timer_consume_fixed(timer))
-         physics_update(fixed_dt);
-   The fixed dt is the value passed to jce_timer_create(). */
-JCE_API bool JCE_CALL jce_timer_consume_fixed(JceTimer *t);
-
-/* Get the fixed timestep (seconds). */
+/* Get the fixed timestep (seconds) passed to jce_timer_create(). */
 JCE_API double JCE_CALL jce_timer_fixed_dt(const JceTimer *t);
 
 /* Get interpolation alpha (0..1) for rendering between fixed steps.

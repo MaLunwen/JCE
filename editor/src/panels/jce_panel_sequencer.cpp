@@ -23,6 +23,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
@@ -1179,16 +1180,9 @@ extern "C" void jce_editor_panel_sequencer(void)
      * that workbench and requests the Sequencer tab.  Symbol kept so
      * menu/hotkey entries registered against JCE_PANEL_SEQUENCER
      * keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SEQUENCER);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
-    if (ae_vis) *ae_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###jce_anim_editor",
-             jce_editor_i18n("animationEditor.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_animation_editor_request_tab(3);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_SEQUENCER,
+                                        JCE_PANEL_ANIMATION_EDITOR,
+                                        "animationEditor.title",
+                                        "jce_anim_editor"))
+        jce_panel_animation_editor_request_tab(3);
 }

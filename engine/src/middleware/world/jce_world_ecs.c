@@ -20,8 +20,9 @@ struct JceWorldEcs {
     ecs_query_t     *q_observers;
 };
 
-JceWorldEcs *jce_world_ecs_create(ecs_world_t *w, JceTriggerWorld *tw)
+JceWorldEcs *jce_world_ecs_create(void *w_opaque, JceTriggerWorld *tw)
 {
+    ecs_world_t *w = (ecs_world_t *)w_opaque;
     if (!w) return NULL;
 
     JceWorldEcs *we = (JceWorldEcs *)ecs_os_calloc(sizeof(*we));

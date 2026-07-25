@@ -22,14 +22,14 @@ typedef struct JceRenderer JceRenderer;
 JCE_API void jce_debug_draw_line(jce_vec3 from, jce_vec3 to, uint32_t abgr);
 
 /* Draw a wireframe box. */
-void jce_debug_draw_box(jce_vec3 center, jce_vec3 half_extents,
+JCE_API void jce_debug_draw_box(jce_vec3 center, jce_vec3 half_extents,
                          jce_quat rot, uint32_t abgr);
 
 /* Draw a wireframe sphere (3 circles: XY, XZ, YZ). */
 JCE_API void jce_debug_draw_sphere(jce_vec3 center, float radius, uint32_t abgr);
 
 /* Draw a wireframe capsule (Y-axis oriented). */
-void jce_debug_draw_capsule(jce_vec3 center, float radius,
+JCE_API void jce_debug_draw_capsule(jce_vec3 center, float radius,
                              float half_height, jce_quat rot,
                              uint32_t abgr);
 

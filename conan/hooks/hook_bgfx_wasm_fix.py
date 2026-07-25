@@ -1,7 +1,7 @@
 """
-Conan 2 hook: normalise bgfx/1.129.8930-495's conan_cmake_project_include.cmake.
+Conan 2 hook: normalise bgfx's CMake sources for JCE's target matrix.
 
-Two issues patched:
+Three cross-platform issues patched:
 
 1. UNIX AND NOT APPLE guard is TRUE for Emscripten (CMake sets UNIX=TRUE for
    wasm32 targets), causing find_package(wayland REQUIRED CONFIG) to fail.
@@ -23,6 +23,11 @@ Two issues patched:
    Emscripten, 1 everywhere else — correct regardless of which platform built
    the shared source first. Run on every platform so the file is always
    normalised (and any stale unconditional line is replaced).
+
+3. bx enables ``-msse4.2`` for every non-MSVC compiler. Emscripten 5 rejects
+   x86 SIMD flags unless ``-msimd128`` is also present. JCE's Web baseline is
+   wasm SIMD128, so select ``-msimd128`` on Emscripten and retain ``-msse4.2``
+   on native non-MSVC targets.
 """
 
 import os
@@ -56,6 +61,21 @@ _MC_BLOCK = (
     'if(NOT (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))\n'
     '    add_compile_definitions(BGFX_CONFIG_MAX_MATRIX_CACHE=131072)\n'
     'endif()\n'
+)
+
+_BX_SIMD_OLD = (
+    "\ttarget_compile_options(bx PUBLIC "
+    "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-msse4.2>)"
+)
+_BX_SIMD_MARKER = "JCE: Emscripten SIMD128 baseline"
+_BX_SIMD_NEW = (
+    'if(EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")\n'
+    '    # JCE: Emscripten SIMD128 baseline; do not pass x86 ISA flags.\n'
+    '    target_compile_options(bx PUBLIC -msimd128)\n'
+    'else()\n'
+    '    target_compile_options(bx PUBLIC '
+    '$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-msse4.2>)\n'
+    'endif()'
 )
 
 
@@ -106,7 +126,39 @@ def post_source(conanfile):
         )
 
     _patch_d3d12_pso_guards(conanfile)
+    _patch_d3d12_resource_guards(conanfile)
     _patch_gl_compute_barrier(conanfile)
+    _patch_bx_wasm_simd(conanfile)
+
+
+def _patch_wasm_simd_flags_text(content):
+    if _BX_SIMD_MARKER in content:
+        return content, 0
+    if content.count(_BX_SIMD_OLD) != 1:
+        return content, 0
+    return content.replace(_BX_SIMD_OLD, _BX_SIMD_NEW), 1
+
+
+def _patch_bx_wasm_simd(conanfile):
+    cmake_file = os.path.join(conanfile.source_folder, "cmake", "bx", "bx.cmake")
+    if not os.path.exists(cmake_file):
+        conanfile.output.warning("[bgfx_fix hook] cmake/bx/bx.cmake not found")
+        return
+
+    with open(cmake_file, "r", newline="") as f:
+        content = f.read()
+    patched, applied = _patch_wasm_simd_flags_text(content)
+    if patched != content:
+        with open(cmake_file, "w", newline="") as f:
+            f.write(patched)
+    if applied:
+        conanfile.output.info("[bgfx_fix hook] bx wasm SIMD128 flags: applied")
+    elif _BX_SIMD_MARKER in patched:
+        conanfile.output.info("[bgfx_fix hook] bx wasm SIMD128 flags: already present")
+    else:
+        conanfile.output.warning(
+            "[bgfx_fix hook] bx SIMD anchor not found - bgfx drift, patch skipped"
+        )
 
 
 # ── D3D12 pipeline-state-creation robustness (P0 crash fix, 2026-07-02) ──
@@ -127,36 +179,48 @@ _PSO_PATCHES = [
     # (name, old_anchor, already_applied_marker, new, expected_count)
     ("compute-create",
      "\t\t\tif (NULL == pso)\n\t\t\t{\n"
-     "\t\t\t\tDX_CHECK(m_device->CreateComputePipelineState(&desc\n"
+     "\t\t\t\tDX_CHECK(m_device->CreateComputePipelineState(\n"
+     "\t\t\t\t\t  &desc\n"
      "\t\t\t\t\t, IID_ID3D12PipelineState\n"
      "\t\t\t\t\t, (void**)&pso\n"
      "\t\t\t\t\t) );\n\t\t\t}\n",
-     "CreateComputePipelineState failed",
+     "JCE: compute PSO create failed",
      "\t\t\tif (NULL == pso)\n\t\t\t{\n"
-     "\t\t\t\t/* JCE patch: survive compute-PSO creation failure. */\n"
-     "\t\t\t\tHRESULT jceHr = m_device->CreateComputePipelineState(&desc\n"
-     "\t\t\t\t\t, IID_ID3D12PipelineState, (void**)&pso);\n"
-     "\t\t\t\tif (FAILED(jceHr) || NULL == pso) {\n"
-     "\t\t\t\t\tBX_TRACE(\"CreateComputePipelineState failed (0x%08x).\", jceHr);\n"
+     "\t\t\t\tHRESULT jceHr = m_device->CreateComputePipelineState(\n"
+     "\t\t\t\t\t  &desc\n"
+     "\t\t\t\t\t, IID_ID3D12PipelineState\n"
+     "\t\t\t\t\t, (void**)&pso\n"
+     "\t\t\t\t\t);\n"
+     "\t\t\t\tif (FAILED(jceHr) || NULL == pso)\n"
+     "\t\t\t\t{\n"
+     "\t\t\t\t\tBX_TRACE(\"JCE: compute PSO create failed (0x%08x).\", uint32_t(jceHr) );\n"
+     "\t\t\t\t\tif (NULL != cachedData) { bx::free(g_allocator, cachedData); }\n"
      "\t\t\t\t\treturn NULL;\n\t\t\t\t}\n\t\t\t}\n", 1),
     # graphics: replace the fatal with a soft NULL return (the cache add +
     # blob read that follow are skipped by the early return).
-    ("graphics-fatal",
+    ("graphics-create",
      "\t\t\tBGFX_FATAL(NULL != pso, Fatal::InvalidShader, \"Failed to create PSO!\");\n",
-     "JCE: graphics PSO create failed",
-     "\t\t\tif (NULL == pso) { BX_TRACE(\"JCE: graphics PSO create failed - skipping draw.\"); return NULL; }\n", 1),
+     "JCE: graphics PSO create failed; draw skipped",
+     "\t\t\tif (NULL == pso)\n"
+     "\t\t\t{\n"
+     "\t\t\t\tBX_TRACE(\"JCE: graphics PSO create failed; draw skipped.\");\n"
+     "\t\t\t\tif (NULL != temp) { release(temp); }\n"
+     "\t\t\t\tif (NULL != cachedData) { bx::free(g_allocator, cachedData); }\n"
+     "\t\t\t\treturn NULL;\n"
+     "\t\t\t}\n", 1),
     # compute dispatch site: skip on NULL pso.
     ("compute-use",
      "\t\t\t\t\tID3D12PipelineState* pso = getPipelineState(key.m_program);\n"
      "\t\t\t\t\tif (pso != currentPso)\n",
-     "compute-PSO creation failed",
+     "JCE: skip compute on PSO fail",
      "\t\t\t\t\tID3D12PipelineState* pso = getPipelineState(key.m_program);\n"
-     "\t\t\t\t\tif (NULL == pso) { continue; } /* JCE: skip on PSO fail */\n"
+     "\t\t\t\t\tif (NULL == pso) { continue; } /* JCE: skip compute on PSO fail */\n"
      "\t\t\t\t\tif (pso != currentPso)\n", 1),
     # graphics draw site: skip on NULL pso.
     ("graphics-use",
      "\t\t\t\t\tID3D12PipelineState* pso = getPipelineState(\n"
      "\t\t\t\t\t\t  state\n"
+     "\t\t\t\t\t\t, draw.m_rgba\n"
      "\t\t\t\t\t\t, draw.m_stencil\n"
      "\t\t\t\t\t\t, numStreams\n"
      "\t\t\t\t\t\t, layouts\n"
@@ -166,6 +230,7 @@ _PSO_PATCHES = [
      "JCE: skip draw on PSO fail",
      "\t\t\t\t\tID3D12PipelineState* pso = getPipelineState(\n"
      "\t\t\t\t\t\t  state\n"
+     "\t\t\t\t\t\t, draw.m_rgba\n"
      "\t\t\t\t\t\t, draw.m_stencil\n"
      "\t\t\t\t\t\t, numStreams\n"
      "\t\t\t\t\t\t, layouts\n"
@@ -173,6 +238,23 @@ _PSO_PATCHES = [
      "\t\t\t\t\t\t, uint8_t(draw.m_instanceDataStride/16)\n"
      "\t\t\t\t\t\t);\n"
      "\t\t\t\t\tif (NULL == pso) { continue; } /* JCE: skip draw on PSO fail */\n", 1),
+    # Debug text and mip generation also bind dynamically-created PSOs outside
+    # the main draw/dispatch paths.
+    ("debug-blit-use",
+     "\t\t\t\t);\n"
+     "\t\t\tm_commandList->SetPipelineState(pso);\n"
+     "\t\t\tm_commandList->SetGraphicsRootSignature(m_rootSignature);\n",
+     "JCE: skip debug blit on PSO fail",
+     "\t\t\t\t);\n"
+     "\t\t\tif (NULL == pso) { return; } /* JCE: skip debug blit on PSO fail */\n"
+     "\t\t\tm_commandList->SetPipelineState(pso);\n"
+     "\t\t\tm_commandList->SetGraphicsRootSignature(m_rootSignature);\n", 1),
+    ("mipgen-use",
+     "\t\t\t_commandList->SetPipelineState(getPipelineState(prog) );\n",
+     "JCE: skip mip generation on PSO fail",
+     "\t\t\tID3D12PipelineState* pso = getPipelineState(prog);\n"
+     "\t\t\tif (NULL == pso) { break; } /* JCE: skip mip generation on PSO fail */\n"
+     "\t\t\t_commandList->SetPipelineState(pso);\n", 1),
 ]
 
 
@@ -237,6 +319,52 @@ def _patch_gl_compute_barrier(conanfile):
     conanfile.output.info("[bgfx_fix hook] GL compute barrier: applied")
 
 
+def _d3d12_pso_patch_candidates(name, old, new):
+    candidates = [(old, new)]
+    if name == "compute-create":
+        candidates.append((
+            old.replace(
+                "CreateComputePipelineState(\n\t\t\t\t\t  &desc",
+                "CreateComputePipelineState(&desc",
+            ),
+            new,
+        ))
+    elif name == "graphics-create":
+        candidates.append((
+            "\t\t\tif (NULL == pso) { BX_TRACE(\"JCE: graphics PSO "
+            "create failed - skipping draw.\"); return NULL; }\n",
+            new,
+        ))
+    elif name == "compute-use":
+        candidates.append((
+            old.replace(
+                "if (pso != currentPso)",
+                "if (NULL == pso) { continue; } /* JCE: skip on PSO fail */\n"
+                "\t\t\t\t\tif (pso != currentPso)",
+            ),
+            new,
+        ))
+    elif name == "graphics-use":
+        rgba = "\t\t\t\t\t\t, draw.m_rgba\n"
+        candidates.append((old.replace(rgba, ""), new.replace(rgba, "")))
+    return candidates
+
+
+def _patch_d3d12_pso_guards_text(content):
+    applied = 0
+    for name, old, marker, new, want in _PSO_PATCHES:
+        if marker in content:
+            continue
+        for candidate_old, candidate_new in _d3d12_pso_patch_candidates(
+            name, old, new
+        ):
+            if content.count(candidate_old) == want:
+                content = content.replace(candidate_old, candidate_new)
+                applied += 1
+                break
+    return content, applied
+
+
 def _patch_d3d12_pso_guards(conanfile):
     src = os.path.join(conanfile.source_folder, "bgfx", "src",
                        "renderer_d3d12.cpp")
@@ -245,26 +373,139 @@ def _patch_d3d12_pso_guards(conanfile):
         return
     with open(src, "r", newline="") as f:
         content = f.read()
-    # Apply each patch INDEPENDENTLY: a prior partial application (e.g. an
-    # earlier compute-only patch left in the cached source) must not block the
-    # remaining guards.  Skip a patch whose distinctive marker is already
-    # present; apply when its exact anchor matches; warn (but continue) on a
-    # genuine anchor miss (bgfx version drift).
-    applied, skipped = 0, 0
-    for name, old, marker, new, want in _PSO_PATCHES:
-        if marker in content:
-            skipped += 1
-            continue
-        if content.count(old) == want:
-            content = content.replace(old, new)
-            applied += 1
-        else:
-            conanfile.output.warning(
-                "[bgfx_fix hook] d3d12 PSO anchor '%s' not found (%d != %d) — "
-                "bgfx drift, that guard skipped" % (name, content.count(old), want))
-    if applied:
+    patched, applied = _patch_d3d12_pso_guards_text(content)
+    missing = [
+        name for name, _, marker, _, _ in _PSO_PATCHES
+        if marker not in patched
+    ]
+    for name in missing:
+        conanfile.output.warning(
+            "[bgfx_fix hook] d3d12 PSO anchor '%s' not found - bgfx drift, "
+            "that guard skipped" % name
+        )
+    if patched != content:
         with open(src, "w", newline="") as f:
-            f.write(content)
+            f.write(patched)
+    present = len(_PSO_PATCHES) - len(missing)
     conanfile.output.info(
-        "[bgfx_fix hook] d3d12 PSO guards: %d applied, %d already present"
-        % (applied, skipped))
+        "[bgfx_fix hook] d3d12 PSO guards: %d applied, %d/%d present"
+        % (applied, present, len(_PSO_PATCHES)))
+
+
+# ── D3D12 resource-creation failure diagnostics (P0 crash fix, 2026-07-19) ──
+# bgfx release builds compile DX_CHECK/BX_WARN out.  createCommittedResource
+# therefore returned an uninitialised/null pointer after a failed D3D12 call,
+# and BufferD3D12 immediately dereferenced it in GetGPUVirtualAddress or Map.
+# Keep the backend alive long enough to report both the original HRESULT and
+# GetDeviceRemovedReason through bgfx's callback, then skip the failed upload.
+_D3D12_RESOURCE_PATCHES = [
+    ("committed-resource-result",
+     "\t\tID3D12Resource* resource;\n"
+     "\t\tDX_CHECK(_device->CreateCommittedResource(&heapProperty.m_properties\n"
+     "\t\t\t, D3D12_HEAP_FLAG_NONE\n"
+     "\t\t\t, _resourceDesc\n"
+     "\t\t\t, heapProperty.m_state\n"
+     "\t\t\t, _clearValue\n"
+     "\t\t\t, IID_ID3D12Resource\n"
+     "\t\t\t, (void**)&resource\n"
+     "\t\t\t) );\n",
+     "JCE D3D12 CreateCommittedResource failed",
+     "\t\tID3D12Resource* resource = NULL;\n"
+     "\t\tHRESULT jceHr = _device->CreateCommittedResource(&heapProperty.m_properties\n"
+     "\t\t\t, D3D12_HEAP_FLAG_NONE\n"
+     "\t\t\t, _resourceDesc\n"
+     "\t\t\t, heapProperty.m_state\n"
+     "\t\t\t, _clearValue\n"
+     "\t\t\t, IID_ID3D12Resource\n"
+     "\t\t\t, (void**)&resource\n"
+     "\t\t\t);\n"
+     "\t\tif (FAILED(jceHr) || NULL == resource)\n"
+     "\t\t{\n"
+     "\t\t\tHRESULT jceRemoved = _device->GetDeviceRemovedReason();\n"
+     "\t\t\tbgfx::trace(__FILE__, uint16_t(__LINE__),\n"
+     "\t\t\t\t\"JCE D3D12 CreateCommittedResource failed: hr=0x%08x \"\n"
+     "\t\t\t\t\"removed=0x%08x heap=%u size=%llu\\n\",\n"
+     "\t\t\t\tuint32_t(jceHr), uint32_t(jceRemoved), uint32_t(_heapProperty),\n"
+     "\t\t\t\t(unsigned long long)_resourceDesc->Width);\n"
+     "\t\t\treturn NULL;\n"
+     "\t\t}\n"),
+    ("buffer-create-null",
+     "\t\tm_ptr   = createCommittedResource(device, HeapProperty::Default, _size, D3D12_RESOURCE_FLAGS(flags) );\n"
+     "\t\tm_gpuVA = m_ptr->GetGPUVirtualAddress();\n",
+     "JCE D3D12 buffer allocation failed",
+     "\t\tm_ptr   = createCommittedResource(device, HeapProperty::Default, _size, D3D12_RESOURCE_FLAGS(flags) );\n"
+     "\t\tif (NULL == m_ptr)\n"
+     "\t\t{\n"
+     "\t\t\tbgfx::trace(__FILE__, uint16_t(__LINE__),\n"
+     "\t\t\t\t\"JCE D3D12 buffer allocation failed: size=%u\\n\", _size);\n"
+     "\t\t\tm_gpuVA = 0;\n"
+     "\t\t\treturn;\n"
+     "\t\t}\n"
+     "\t\tm_gpuVA = m_ptr->GetGPUVirtualAddress();\n"),
+    ("buffer-update-null",
+     "\t\tID3D12Resource* staging = createCommittedResource(s_renderD3D12->m_device, HeapProperty::Upload, _size);\n"
+     "\t\tuint8_t* data;\n",
+     "JCE D3D12 staging allocation failed",
+     "\t\tif (NULL == m_ptr)\n"
+     "\t\t{\n"
+     "\t\t\tbgfx::trace(__FILE__, uint16_t(__LINE__),\n"
+     "\t\t\t\t\"JCE D3D12 buffer update skipped: destination is null\\n\");\n"
+     "\t\t\treturn;\n"
+     "\t\t}\n"
+     "\t\tID3D12Resource* staging = createCommittedResource(s_renderD3D12->m_device, HeapProperty::Upload, _size);\n"
+     "\t\tif (NULL == staging)\n"
+     "\t\t{\n"
+     "\t\t\tbgfx::trace(__FILE__, uint16_t(__LINE__),\n"
+     "\t\t\t\t\"JCE D3D12 staging allocation failed: size=%u\\n\", _size);\n"
+     "\t\t\treturn;\n"
+     "\t\t}\n"
+     "\t\tuint8_t* data;\n"),
+]
+
+_D3D12_RESOURCE_TEST_SOURCE = "\n".join(
+    old for _, old, _, _ in _D3D12_RESOURCE_PATCHES
+)
+
+
+def _patch_d3d12_resource_guards_text(content):
+    applied = 0
+    for _, old, marker, new in _D3D12_RESOURCE_PATCHES:
+        if marker in content:
+            continue
+        candidates = [(old, new)]
+        if "D3D12_HEAP_FLAG_NONE" in old:
+            candidates.append((
+                old.replace("D3D12_HEAP_FLAG_NONE", "_heapFlags"),
+                new.replace("D3D12_HEAP_FLAG_NONE", "_heapFlags"),
+            ))
+        for candidate_old, candidate_new in candidates:
+            if content.count(candidate_old) == 1:
+                content = content.replace(candidate_old, candidate_new)
+                applied += 1
+                break
+    return content, applied
+
+
+def _patch_d3d12_resource_guards(conanfile):
+    src = os.path.join(conanfile.source_folder, "bgfx", "src",
+                       "renderer_d3d12.cpp")
+    if not os.path.exists(src):
+        conanfile.output.warning("[bgfx_fix hook] renderer_d3d12.cpp not found")
+        return
+    with open(src, "r", newline="") as f:
+        content = f.read()
+
+    patched, applied = _patch_d3d12_resource_guards_text(content)
+    missing = []
+    for name, old, marker, _ in _D3D12_RESOURCE_PATCHES:
+        if marker not in patched and old not in content:
+            missing.append(name)
+    if missing:
+        conanfile.output.warning(
+            "[bgfx_fix hook] d3d12 resource anchors missing: %s — bgfx drift"
+            % ", ".join(missing))
+    if patched != content:
+        with open(src, "w", newline="") as f:
+            f.write(patched)
+    conanfile.output.info(
+        "[bgfx_fix hook] d3d12 resource guards: %d applied" % applied)

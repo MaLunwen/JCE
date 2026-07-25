@@ -24,8 +24,9 @@ struct JceAiEcs {
     ecs_query_t   *q_path;
 };
 
-JceAiEcs *jce_ai_ecs_create(ecs_world_t *world, JceGraphAstar *astar)
+JceAiEcs *jce_ai_ecs_create(void *world_opaque, JceGraphAstar *astar)
 {
+    ecs_world_t *world = (ecs_world_t *)world_opaque;
     if (!world) return NULL;
     JceAiEcs *a = (JceAiEcs *)JCE_CALLOC(1, sizeof(*a));
     if (!a) return NULL;

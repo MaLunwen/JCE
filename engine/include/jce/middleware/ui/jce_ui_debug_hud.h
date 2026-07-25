@@ -57,14 +57,14 @@ JCE_API void           jce_debug_hud_hide(JceDebugHud *hud);
 JCE_API bool           jce_debug_hud_is_visible(const JceDebugHud *hud);
 
 /* Push current data into HUD elements.  Call before jce_ui_update(). */
-void           jce_debug_hud_update(JceDebugHud *hud,
+JCE_API void           jce_debug_hud_update(JceDebugHud *hud,
                                     const JceDebugHudData *data);
 
 /* Draw supplemental HUD graphics after jce_ui_render(). */
 JCE_API void           jce_debug_hud_draw(JceDebugHud *hud);
 
 /* Change the body font-family at runtime (e.g. on language switch). */
-void           jce_debug_hud_set_font_family(JceDebugHud *hud,
+JCE_API void           jce_debug_hud_set_font_family(JceDebugHud *hud,
                                              const char *family);
 
 /* Get the underlying document handle for advanced use. */

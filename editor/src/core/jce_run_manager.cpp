@@ -94,6 +94,23 @@ static std::string resolve_executable(const std::string &configured)
         }
     }
 
+    /* User-configured build output (Project Settings > Build > Output Dir +
+     * CMake Target): try <build_output_path>/<game_target_name>[.exe] before
+     * the built-in candidate list, so a project that builds to a custom output
+     * directory is found even when the explicit game-executable path is unset.
+     * Previously build_output_path was persisted by the panel but read by
+     * nothing, so a custom output dir never influenced the launcher. */
+    {
+        JceEditorConfig ecfg;
+        if (jce_editor_config_load(&ecfg) &&
+            ecfg.build_output_path[0] && ecfg.game_target_name[0]) {
+            std::string p = std::string(ecfg.build_output_path) + "/" +
+                            ecfg.game_target_name;
+            hit = try_with_suffix(p);
+            if (!hit.empty()) return hit;
+        }
+    }
+
     /* Per-platform "well-known build-preset output" candidates so the
      * default path (which targets one specific arch/variant) still finds
      * the binary when the user actually built a different variant. */

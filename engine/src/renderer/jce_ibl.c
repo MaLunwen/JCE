@@ -197,7 +197,11 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
     /* ── Try disk cache ──────────────────────────────────────────────
        The BRDF LUT is a deterministic function of pixel coordinates
        (importance-sampled split-sum GGX), so we can cache the raw
-       RGBA16F bytes on disk and reload instantly on subsequent runs. */
+       RGBA16F bytes on disk and reload instantly on subsequent runs.
+       Raw host IO on purpose: this is our own regenerable artefact, not an
+       asset, so it must NOT go through the VFS-aware reader — an ISOLATED
+       active-VFS would null the read while the write below still lands on
+       the host, silently disabling the cache for good. */
     bool from_cache = false;
     char cache_path[256];
     snprintf(cache_path, sizeof(cache_path),
@@ -268,7 +272,7 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
         (uint16_t)size, (uint16_t)size, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA16F,
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        mem);
+        mem, 0);
 
     LOG_INFO(LOG_TAG, "BRDF LUT: texture idx=%u valid=%d",
              (unsigned)tex.idx, BGFX_HANDLE_IS_VALID(tex) ? 1 : 0);
@@ -594,7 +598,11 @@ JceIblData *jce_ibl_generate(JceTexture equirect_tex,
  * pure function of the source HDR pixels + the requested sizes, so — like a
  * professional engine baking its sky/reflection IBL — we cache the baked
  * cubemap face data on disk keyed by a content hash and reload it instantly on
- * subsequent loads (of this scene or any scene using the same HDR). */
+ * subsequent loads (of this scene or any scene using the same HDR).
+ * As with the BRDF LUT cache above, load/store deliberately use raw host IO:
+ * a regenerable cache must not be intercepted by an active VFS, and the
+ * header + two payload blocks are read at offsets into caller-owned buffers,
+ * which a whole-file reader cannot express without an extra full copy. */
 #define JCE_IBL_CACHE_MAGIC   0x434C4249u  /* 'IBLC' */
 #define JCE_IBL_CACHE_VERSION 1u
 
@@ -675,7 +683,7 @@ static bgfx_texture_handle_t ibl_upload_cube(const uint16_t *data,
         (uint16_t)face_size, has_mips, 1,
         BGFX_TEXTURE_FORMAT_RGBA16F,
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP,
-        mem);
+        mem, 0);
 }
 
 /* CPU-side baked cubemap face data (no GPU handles) — produced by

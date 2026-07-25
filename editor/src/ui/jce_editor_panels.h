@@ -381,6 +381,11 @@ typedef enum {
     JCE_CONSOLE_DEBUG,
 } JceConsoleLevel;
 
+/* Console entries are ALSO written to jce_log (so they survive in the log
+ * file) under this tag.  The Console panel's jce_log sink filters records
+ * carrying it, so a message still appears exactly once on screen. */
+extern const char *const kEditorConsoleLogTag;
+
 void  jce_editor_console_log(const char *fmt, ...);
 void  jce_editor_console_log_level(JceConsoleLevel level, const char *fmt, ...);
 void  jce_editor_console_clear(void);
@@ -400,6 +405,13 @@ bool  jce_editor_console_entry_get(int display_idx, JceConsoleEntry *out);
    Returns the count of entries; *out_names (if non-NULL) receives a
    pointer to a const array of UI strings of that length. */
 int   jce_editor_renderer_backends(const char *const **out_names);
+
+/* Scene-view op: drop every selected entity straight down so the bottom of
+   its world AABB rests on the first surface below it (other entities'
+   AABBs, the terrain heightfield, or the Y=0 ground plane as fallback).
+   One undo entry for the whole selection.  Hotkey: End (Edit / Snap To
+   Ground); also in the Edit menu. */
+void  jce_scene_view_snap_selection_to_ground(void);
 
 #ifdef __cplusplus
 }

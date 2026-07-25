@@ -143,7 +143,7 @@ JceTextureHandle jce_texture_create_2d(uint16_t w, uint16_t h, bool has_mips,
     bgfx_texture_handle_t bh = bgfx_create_texture_2d(w, h, has_mips, num_layers,
                                                       (bgfx_texture_format_t)fmt,
                                                       flags,
-                                                      (const bgfx_memory_t *)mem);
+                                                      (const bgfx_memory_t *)mem, 0);
     JceTextureHandle r = { bh.idx };
     return r;
 }

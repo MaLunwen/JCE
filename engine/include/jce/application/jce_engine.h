@@ -12,6 +12,9 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
+#include <stddef.h>   /* size_t (jce_engine_set_app_desc_sized) */
+
 JCE_EXTERN_C_BEGIN
 
 /* Application result codes (match SDL_AppResult values). */
@@ -29,8 +32,40 @@ struct JceRenderer;
 
 /* Register the application descriptor (IApp callbacks).
    Must be called before jce_engine_create().
-   If not called, engine falls back to direct jce_app_* calls. */
+   If not called, engine falls back to direct jce_app_* calls.
+
+   ── Why there are two of these ──────────────────────────────────────
+   The engine COPIES the descriptor by value.  A game built against an
+   older SDK allocates an older, SMALLER JceAppDesc — the struct has grown
+   more than once (window_width/window_height, then headless) — so copying
+   sizeof(JceAppDesc) as the ENGINE currently sees it reads past the end of
+   the caller's object, and the trailing fields come back as garbage.  It
+   is an out-of-bounds read of somebody else's stack, and "headless" being
+   randomly true is a spectacular way to find out.
+
+   jce_engine_set_app_desc_sized() takes the CALLER's sizeof and copies
+   min(caller, engine), zero-filling the rest, so a short descriptor is
+   safe and a longer one (game newer than engine) has its unknown tail
+   ignored.  Pass sizeof(JceAppDesc) as seen at YOUR compile time.
+
+   The macro below routes consumer code through the sized form
+   automatically, so simply rebuilding picks up the fix with no source
+   change.  Engine-internal TUs skip it (they are always in lockstep, and
+   jce_engine.c has to be able to DEFINE the plain symbol).  Define
+   JCE_NO_APP_DESC_SIZE_SHIM if you need the real function symbol — e.g.
+   to take its address for an FFI binding table. */
+JCE_API void JCE_CALL jce_engine_set_app_desc_sized(const JceAppDesc *desc,
+                                                    size_t desc_size);
+
+/* Legacy entry point: assumes the caller's JceAppDesc matches the engine's.
+   Kept so already-compiled binaries keep linking; new code should let the
+   shim below pick the sized form. */
 JCE_API void JCE_CALL jce_engine_set_app_desc(const JceAppDesc *desc);
+
+#if !defined(JCE_BUILDING_ENGINE) && !defined(JCE_NO_APP_DESC_SIZE_SHIM)
+#  define jce_engine_set_app_desc(desc) \
+       jce_engine_set_app_desc_sized((desc), sizeof(JceAppDesc))
+#endif
 
 /* Set optional config file path override used by jce_engine_create.
    Pass NULL or empty string to clear override. */

@@ -7,6 +7,18 @@
  * the runtime can mount a single mesh loader (cgltf) and never has to
  * see the source format.
  *
+ * AUTHORITY BOUNDARY: this is the AUTHORING-format importer.  An input
+ * that is ALREADY glTF belongs to cgltf (engine/src/renderer/jce_gltf_loader.c),
+ * and pushing it back through here is a lossy round-trip: write_indexed_glb()
+ * below emits POSITION/NORMAL/UV0 + a baseColorFactor material ONLY, so a
+ * skin, an animation clip or a morph target that entered as glTF leaves as
+ * bare geometry, and even the assimp glb2 exporter fallback re-encodes them
+ * through assimp's own intermediate scene.  Callers must therefore decide
+ * BEFORE calling: jce_bundle_pack.c probes such inputs with cgltf and ships
+ * the rigged / morphed ones verbatim; the editor's import_ensure_glb likewise
+ * passes .gltf/.glb through untouched.  The probe cannot live in this TU —
+ * jce_cook compiles it without linking cgltf.
+ *
  * C ABI only — declared via extern "C" so jce_bundle_pack.c (C99) can
  * call straight in without dragging Assimp headers across the layer.
  *

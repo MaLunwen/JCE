@@ -212,12 +212,23 @@ void jce_event_publish(jce_event_bus_t *bus, jce_event_id id,
 {
     if (!bus) return;
 
-    event_slot_t *s = find_slot(bus, id, false);
-    if (!s) return;
+    const event_slot_t *probe = find_slot(bus, id, false);
+    if (!probe) return;
 
     /* Iterate a snapshot of count — if a handler subscribes/unsubscribes
-       during this loop, the new entry won't be called this frame. */
-    uint32_t n = s->count;
-    for (uint32_t i = 0; i < n; i++)
+       during this loop, the new entry won't be called this frame.
+     *
+     * The slot is re-resolved every iteration and MUST NOT be cached across
+     * the callback: a handler that subscribes to a *different* id can grow the
+     * bus and make find_slot() rehash(), which frees the array this pointer
+     * points into; subscribing to the *same* id can reallocate s->subs.  Either
+     * one turns a cached pointer into a dangling read.  The extra lookup is a
+     * hash plus a short probe, against a subscriber list that is small by
+     * construction. */
+    uint32_t n = probe->count;
+    for (uint32_t i = 0; i < n; i++) {
+        event_slot_t *s = find_slot(bus, id, false);
+        if (!s || i >= s->count) break;   /* unsubscribed mid-dispatch */
         s->subs[i].fn(data, size, s->subs[i].userdata);
+    }
 }

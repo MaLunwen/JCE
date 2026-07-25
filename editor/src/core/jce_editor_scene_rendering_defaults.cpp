@@ -9,6 +9,7 @@
 #include "jce_project_settings.h"
 #include "jce_editor_project.h"
 #include <jce/renderer/jce_render_settings.h>
+#include <jce/renderer/jce_texture.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <cstdio>
@@ -146,6 +147,19 @@ void jce_editor_scene_rendering_settings_from_project(
 
 void jce_editor_scene_ensure_rendering_settings(JceScene *scene)
 {
+    /* Process-global texture state from Project Settings (Quality > Texture
+     * Quality mip drop + Graphics > Anisotropic override) applies on EVERY
+     * scene load — BEFORE the has-rendering-settings guard — so already-authored
+     * scenes honour it too, not just freshly-created ones. */
+    {
+        const JceProjectSettings *ps = jce_project_settings_current();
+        JceProjectSettings defaults;
+        if (!ps) { jce_project_settings_defaults(&defaults); ps = &defaults; }
+        const JceProjectQualityLevel *q = current_quality_level(ps);
+        jce_texture_set_quality_mip_bias(q ? (int8_t)q->texture_quality : 0);
+        jce_texture_set_aniso_override((int)ps->graphics.anisotropic_textures);
+    }
+
     if (!scene || jce_scene_has_rendering_settings(scene))
         return;
 

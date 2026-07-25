@@ -95,9 +95,9 @@ JCE_API bool          jce_physics2d_body_add_box(JcePhysics2D *world,
 /* 2D body state queries                                               */
 /* ================================================================== */
 
-void     jce_physics2d_body_get_transform(const JcePhysics2D *world, JceBodyHandle body,
+JCE_API void     jce_physics2d_body_get_transform(const JcePhysics2D *world, JceBodyHandle body,
                                           jce_vec2 *out_pos, float *out_angle);
-void     jce_physics2d_body_set_transform(JcePhysics2D *world, JceBodyHandle body,
+JCE_API void     jce_physics2d_body_set_transform(JcePhysics2D *world, JceBodyHandle body,
                                           jce_vec2 pos, float angle);
 
 JCE_API jce_vec2 jce_physics2d_body_get_velocity(const JcePhysics2D *world, JceBodyHandle body);
@@ -123,7 +123,7 @@ typedef struct {
     JceBodyHandle body;
 } JceRaycast2DResult;
 
-JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
+JCE_API JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
                                          jce_vec2 origin, jce_vec2 direction,
                                          float max_distance);
 

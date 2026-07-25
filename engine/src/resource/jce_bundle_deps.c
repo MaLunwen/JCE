@@ -3,6 +3,7 @@
 #include <jce/resource/jce_bundle_deps.h>
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
 
 #include "os/core/jce_memory.h"
 
@@ -110,10 +111,7 @@ static char *dup_str(const char *s)
     return r;
 }
 
-static void normalise_slashes(char *s)
-{
-    for (; *s; ++s) if (*s == '\\') *s = '/';
-}
+
 
 static int dep_has_path(const JceBundleDepList *list, const char *path)
 {
@@ -148,7 +146,7 @@ static int list_push(JceBundleDepList *list, const char *path,
         if (bundle_copy) JCE_FREE(bundle_copy);
         return 0;
     }
-    normalise_slashes(path_copy);
+    jce_path_canonicalise_inplace(path_copy);
 
     JceBundleDep *d = &list->items[list->count++];
     d->path   = path_copy;

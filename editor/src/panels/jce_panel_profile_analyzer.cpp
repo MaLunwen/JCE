@@ -12,6 +12,7 @@
  * panel works with or without Tracy.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_ui_state.h"
@@ -302,16 +303,8 @@ extern "C" void jce_editor_panel_profile_analyzer_content(void)
  * keep working. */
 extern "C" void jce_editor_panel_profile_analyzer(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROFILE_ANALYZER);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *pf_vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER);
-    if (pf_vis) *pf_vis = true;
-
-    char title[96];
-    snprintf(title, sizeof(title), "%s###profiler",
-             jce_editor_i18n_or("panel.profiler", "Profiler"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_profiler_request_tab(2);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_PROFILE_ANALYZER,
+                                        JCE_PANEL_PROFILER,
+                                        "panel.profiler", "profiler"))
+        jce_panel_profiler_request_tab(2);
 }

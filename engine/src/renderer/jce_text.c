@@ -443,6 +443,23 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
                                  extra_cps, extra_count);
 }
 
+/* Public: open a font from an in-memory TTF/OTF blob (e.g. bytes read from the
+   active VFS / a mounted content bundle).  Copies `data` into an engine
+   allocation the font then owns (font_open_from_memory + jce_font_close manage
+   its lifetime), so the caller's buffer may be freed immediately after. */
+JceFont *jce_font_open_mem_ex(const void *data, size_t size, const char *label,
+                              float pt_size, const uint32_t *extra_cps,
+                              int extra_count)
+{
+    if (!data || size == 0) return NULL;
+    if (!ensure_ft_init()) return NULL;
+    void *buf = JCE_MALLOC(size);
+    if (!buf) return NULL;
+    memcpy(buf, data, size);
+    return font_open_from_memory(buf, size, label ? label : "<mem>",
+                                 pt_size, extra_cps, extra_count);
+}
+
 /* Build a JceFont from an in-memory TTF/OTF blob.  Takes ownership of `buf`
    (engine-internal allocation) in every path — FreeType keeps referencing it
    for the font's lifetime, so it is stored on the font and released by

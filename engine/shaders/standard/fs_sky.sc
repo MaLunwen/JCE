@@ -118,23 +118,26 @@ void main()
          * All linear; tonemap downstream applies gamma. */
 
         /* ORIGIN-ANCHORED dome (u_sky_dome_sun_col.w = sphere radius; 0 =
-         * legacy view-direction dome, byte-identical).  The reference sky
-         * is a world mesh (SphereGeometry(150) at the origin), NOT a
-         * view-space gradient: its horizon line and its authored sun/moon
-         * positions parallax correctly as the camera orbits.  Emulate by
-         * intersecting the view ray with that sphere and shading by the
-         * HIT POINT's direction from the origin — dome coordinates become
-         * world-anchored and the authored reference positions (e.g. sun
-         * (-0.846,-0.085,-1.0)) work verbatim from every camera.  Column
-         * extraction via mul() — raw u_invView[i][j] transposes on GL. */
+         * infinite view-direction dome).  The anchored mode intersects the
+         * view ray with a world sphere.  Near its shell the mapping becomes
+         * extremely distorted, and an outside camera can miss the sphere
+         * entirely.  Fade to the infinite-sky direction before the shell and
+         * use it directly for misses/outside cameras. */
         if (u_sky_dome_sun_col.w > 0.5) {
-            float R    = u_sky_dome_sun_col.w;
-            vec3 camW  = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-            float b2   = dot(camW, dir);
-            float disc = b2 * b2 - dot(camW, camW) + R * R;
-            /* Camera is always far inside the R>=100 sphere: disc > 0. */
-            float t    = -b2 + sqrt(max(disc, 0.0));
-            dir = normalize(camW + dir * t);
+            float R          = u_sky_dome_sun_col.w;
+            vec3 viewDir     = dir;
+            vec3 camW        = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            float camRadius2 = dot(camW, camW);
+            float b2         = dot(camW, dir);
+            float disc       = b2 * b2 - camRadius2 + R * R;
+            if (disc > 0.0 && camRadius2 < R * R) {
+                float t = -b2 + sqrt(disc);
+                vec3 anchoredDir = normalize(camW + dir * t);
+                float camRadius = sqrt(camRadius2);
+                float anchorWeight = 1.0 -
+                    smoothstep(R * 0.75, R * 0.95, camRadius);
+                dir = normalize(mix(viewDir, anchoredDir, anchorWeight));
+            }
         }
 
         float y    = clamp(dir.y, -1.0, 1.0);

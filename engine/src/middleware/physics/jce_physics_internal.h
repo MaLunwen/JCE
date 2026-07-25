@@ -448,6 +448,15 @@ JceBulletWorld *jce_physics_default_bullet_world_(void);
 /* Setter used internally by jce_physics_create / jce_physics_destroy. */
 void jce_physics_set_default_bullet_world_(JceBulletWorld *bw);
 
+/* Install the Bullet->jce allocator hook (btAlignedAllocSetCustom*) exactly
+ * once.  MUST be called before ANY Bullet object is allocated in a TU, or
+ * that object's memory comes from the CRT allocator and is later freed via
+ * mi_free = cross-allocator free / heap corruption.  Idempotent (internal
+ * latch); Bullet forbids swapping allocators once allocations exist, so the
+ * latch must never be reset.  Owned by jce_physics_bullet.cpp; the cloth
+ * module (separate TU, secondary soft world) calls it in ensure_world. */
+void jce_bullet_install_allocator_(void);
+
 #ifdef __cplusplus
 }
 #endif

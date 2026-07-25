@@ -26,21 +26,12 @@
 
 #define LOG_TAG "asset_index"
 
-namespace {
-
-struct PathSet { std::vector<std::string> paths; };
-
-/* One complete index.  The live copy is read on the main thread by
- * lookups; an async rebuild builds a fresh one on a worker and the main
- * thread move-assigns it over the live copy. */
-struct IndexMaps {
-    std::unordered_map<std::string, PathSet> by_lower;
-    std::unordered_map<std::string, PathSet> by_alphanum;
-    std::unordered_map<std::string, PathSet> by_alphanum_stem_ext;
-    size_t total = 0;
-};
-
-IndexMaps g_live;
+/* ── Shared name normalization ──────────────────────────────────────
+ * The ONE definition.  jce_asset_cache_resolve.cpp's fallback walk
+ * declares and reuses these so the O(1) index and the walk it fronts
+ * normalize a filename identically (REF-019).  Not declared in the
+ * header — see the note at the bottom of jce_asset_path_index.h. */
+namespace jce_asset_name {
 
 std::string lower_copy(const std::string &s)
 {
@@ -67,7 +58,7 @@ void split_stem_ext(const std::string &basename,
     std::string lower = lower_copy(basename);
     static const char *const compound[] = {
         ".mat.json", ".scene.json", ".prefab.json", ".particle.json",
-        ".matgraph.json"
+        ".matgraph.json", ".tar.gz"
     };
     for (const char *suf : compound) {
         size_t L = std::strlen(suf);
@@ -99,6 +90,29 @@ std::string strip_asset_prefix(const std::string &stem)
     }
     return stem;
 }
+
+} /* namespace jce_asset_name */
+
+using jce_asset_name::alphanum_lower;
+using jce_asset_name::lower_copy;
+using jce_asset_name::split_stem_ext;
+using jce_asset_name::strip_asset_prefix;
+
+namespace {
+
+struct PathSet { std::vector<std::string> paths; };
+
+/* One complete index.  The live copy is read on the main thread by
+ * lookups; an async rebuild builds a fresh one on a worker and the main
+ * thread move-assigns it over the live copy. */
+struct IndexMaps {
+    std::unordered_map<std::string, PathSet> by_lower;
+    std::unordered_map<std::string, PathSet> by_alphanum;
+    std::unordered_map<std::string, PathSet> by_alphanum_stem_ext;
+    size_t total = 0;
+};
+
+IndexMaps g_live;
 
 /* Hard ceiling on auto-index walks.  Protects against starting the
  * editor in `$HOME` or another massive directory tree where the walk

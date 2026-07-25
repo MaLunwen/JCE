@@ -858,10 +858,10 @@ static void sr_anim_do_sample(SrAnimSample *r)
 }
 
 /* Worker: sample requests [begin,end) (per-instance disjoint writes). */
-static void sr_anim_sample_range(int begin, int end, void *user)
+static void sr_anim_sample_range(uint32_t begin, uint32_t end, void *user)
 {
     SrAnimSample *reqs = (SrAnimSample *)user;
-    for (int i = begin; i < end; i++)
+    for (uint32_t i = begin; i < end; i++)
         sr_anim_do_sample(&reqs[i]);
 }
 
@@ -2140,11 +2140,11 @@ void sr_pack_bone_palettes(JceSceneRenderer *sr)
                                BGFX_SAMPLER_MIP_POINT | BGFX_SAMPLER_U_CLAMP |
                                BGFX_SAMPLER_V_CLAMP;
         sr->bone_tex = bgfx_create_texture_2d(W, (uint16_t)rows, false, 1,
-                                              BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL);
+                                              BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL, 0);
         /* PREV-palette sibling (animated crowd velocity): same dims, packed at
          * the same bases.  Optional — velocity falls back per-char without it. */
         sr->bone_prev_tex = bgfx_create_texture_2d(W, (uint16_t)rows, false, 1,
-                                                   BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL);
+                                                   BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL, 0);
         if (!BGFX_HANDLE_IS_VALID(sr->bone_tex)) { sr->bone_tex_texel_cap = 0u; return; }
         sr->bone_tex_w = W;
         sr->bone_tex_h = (uint16_t)rows;
@@ -2796,11 +2796,12 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
      * distinct instance whose player owns its scratch buffers, so this only
      * reads shared skeletons/clips and writes per-instance palettes. */
     if (req_count > 0) {
-        JceJobSystem *jobs = jce_jobs_default();
-        if (jobs && req_count >= 2)
-            jce_jobs_parallel_for(jobs, req_count, 1, sr_anim_sample_range, reqs);
+        JceThreadPool *pool = jce_thread_pool_shared();
+        if (pool && req_count >= 2)
+            jce_thread_pool_parallel_for(pool, (uint32_t)req_count, 1,
+                                         sr_anim_sample_range, reqs);
         else
-            sr_anim_sample_range(0, req_count, reqs);
+            sr_anim_sample_range(0u, (uint32_t)req_count, reqs);
 
         /* Pass 3 (serial): fire frame events for single-clip samples — they
          * read the post-sample player time and dispatch into game code. */

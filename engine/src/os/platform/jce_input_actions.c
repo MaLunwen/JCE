@@ -576,24 +576,15 @@ int jce_actions_bind_fps_defaults(JceInputActions *a)
 
 /* ── JSON action-map loading (editor-authored input_actions.json) ──── */
 
-JceInputActions *jce_actions_load_file(const char *path)
+static JceInputActions *actions_from_json(const JceJson *root)
 {
-    if (!path || !path[0]) return NULL;
-
-    JceJson *root = jce_json_parse_file(path);
-    if (!root) return NULL;
-
     JceJson *arr = jce_json_get(root, "actions");
-    if (!jce_json_is_array(arr)) {
-        jce_json_free(root);
+    if (!jce_json_is_array(arr))
         return NULL;
-    }
 
     JceInputActions *a = jce_actions_create();
-    if (!a) {
-        jce_json_free(root);
+    if (!a)
         return NULL;
-    }
 
     int registered = 0;
     const int n = jce_json_array_size(arr);
@@ -659,12 +650,36 @@ JceInputActions *jce_actions_load_file(const char *path)
             jce_json_get_bool(root, "scheme_auto", jce_action_scheme_auto(a)));
     }
 
-    jce_json_free(root);
-
     if (registered == 0) {
         jce_actions_destroy(a);
         return NULL;
     }
+    return a;
+}
+
+JceInputActions *jce_actions_load_memory(const void *data, size_t size)
+{
+    if (!data || size == 0)
+        return NULL;
+
+    JceJson *root = jce_json_parse((const char *)data, size);
+    if (!root)
+        return NULL;
+    JceInputActions *a = actions_from_json(root);
+    jce_json_free(root);
+    return a;
+}
+
+JceInputActions *jce_actions_load_file(const char *path)
+{
+    if (!path || !path[0])
+        return NULL;
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root)
+        return NULL;
+    JceInputActions *a = actions_from_json(root);
+    jce_json_free(root);
     return a;
 }
 

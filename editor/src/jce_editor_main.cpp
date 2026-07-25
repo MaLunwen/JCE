@@ -128,15 +128,13 @@ static std::string to_lower_copy(const char *s)
 static int renderer_name_to_backend_enum(const char *renderer_name)
 {
     std::string r = to_lower_copy(renderer_name);
-    if (r.empty() || r == "auto")  return 0;  /* JCE_BACKEND_AUTO */
-    if (r == "d3d11" || r == "direct3d11")  return 1;  /* JCE_BACKEND_D3D11 */
-    if (r == "d3d12" || r == "direct3d12")  return 2;  /* JCE_BACKEND_D3D12 */
-    if (r == "vulkan")                      return 3;  /* JCE_BACKEND_VULKAN */
-    if (r == "opengl" || r == "gl")         return 4;  /* JCE_BACKEND_OPENGL */
-    if (r == "opengl es" || r == "opengles" || r == "gles")
-        return 5; /* JCE_BACKEND_OPENGLES*/
-    if (r == "metal")
-        return 6; /* JCE_BACKEND_METAL   */
+    if (r.empty() || r == "auto")                           return 0;  /* JCE_BACKEND_AUTO */
+    if (r == "d3d11" || r == "direct3d11" || r == "dx11")   return 1;  /* JCE_BACKEND_D3D11 */
+    if (r == "d3d12" || r == "direct3d12" || r == "dx12")   return 2;  /* JCE_BACKEND_D3D12 */
+    if (r == "vulkan" || r == "vk")                         return 3;  /* JCE_BACKEND_VULKAN */
+    if (r == "opengl" || r == "gl")                         return 4;  /* JCE_BACKEND_OPENGL */
+    if (r == "opengl es" || r == "opengles" || r == "gles") return 5;  /* JCE_BACKEND_OPENGLES*/
+    if (r == "metal")                                       return 6;  /* JCE_BACKEND_METAL   */
     return -1;
 }
 
@@ -182,7 +180,16 @@ static bool editor_app_init(const JceServices *svc, void *ud)
                         || si.cpu_cores <= 1;
         const char *lm = getenv("JCE_LOW_MEM");
         if (lm && lm[0]) charter_low = (lm[0] != '0');
-        if (!charter_low && jce_renderer_get_tier() < JCE_GPU_TIER_HIGH)
+        /* Do NOT float an INTEGRATED GPU up to HIGH: it has ample RAM/cores (so
+         * charter_low is false) but a fraction of a discrete part's fill rate,
+         * and HIGH re-enables 2048 shadows + the full RGBA16F postfx + TAA chain
+         * that tanks its framerate — the same reason the whole-device auto-detect
+         * now caps iGPUs at MEDIUM.  The editor must RUN smoothly on the weak GPU
+         * before it looks pretty; the status-bar tier picker still forces HIGH
+         * explicitly for a capable iGPU. */
+        const bool has_discrete = jce_renderer_get_recommendation().has_discrete_gpu;
+        if (!charter_low && has_discrete &&
+            jce_renderer_get_tier() < JCE_GPU_TIER_HIGH)
             jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
     }
     /* Re-apply the tier preset ONLY when engine boot fell back to it.

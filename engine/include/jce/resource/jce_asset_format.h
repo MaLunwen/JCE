@@ -22,6 +22,7 @@
 
 #include <jce/os/core/jce_defs.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -207,6 +208,37 @@ typedef struct JceAssetAudioInfo {
 
 #define JCEASSET_HEADER_SIZE      32u
 #define JCEASSET_CHUNK_ENTRY_SIZE 32u
+
+/* ================================================================== */
+/* Source-extension classification (single authority)                  */
+/* ================================================================== */
+
+/*
+ * Classify a SOURCE asset by its file extension.
+ *
+ * This is the one authoritative extension -> asset-kind table in the
+ * engine.  Before it existed, the cooker, the runtime texture whitelist,
+ * the editor asset database, the editor texture cache and the asset-browser
+ * thumbnailer each carried their own list, and they disagreed: a .webp was
+ * a texture to the asset browser but cooked as an opaque RAW blob, .gif and
+ * .ktx2 were textures to some tables and unknown to others, and .dae/.stl/
+ * .usd were models in the browser but never routed to the model importer.
+ * The browser would label a file "Texture"/"Model" while the cooker packed
+ * it as RAW, so it failed to load at runtime with no obvious cause.
+ *
+ * `path` may be a full path or a bare extension, with or without the dot.
+ * Matching is case-insensitive.  Returns one of the JCEASSET_TYPE_* tags,
+ * or JCEASSET_TYPE_RAW when the extension is unknown.
+ *
+ * NOTE — this answers "what kind of file is this?", NOT "can this build
+ * step handle it?".  A consumer that supports only a subset (e.g. the
+ * cooker only encodes the formats it has an importer for) must apply its
+ * own explicit capability check on top; it must not narrow this table.
+ */
+JCE_API int jce_asset_type_from_ext(const char *path);
+
+/* Convenience predicate for the very common texture test. */
+JCE_API bool jce_asset_ext_is_texture(const char *path);
 
 JCE_EXTERN_C_END
 

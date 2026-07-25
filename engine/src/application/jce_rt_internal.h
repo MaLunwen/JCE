@@ -762,8 +762,13 @@ struct JceRuntime {
 	const char      *desc_mixer_config_path;  /* not owned (caller-stable) */
 	char             desc_navmesh_path[512];
 	bool             enable_physics;
-	float            desc_gravity_y;
+	float            desc_gravity[3];   /* resolved gravity vector (X,Y,Z) */
 	float            desc_fixed_timestep;
+	int32_t          desc_solver_iterations;
+	float            desc_sleep_threshold;
+	bool             desc_disable_auto_physics;
+	float            desc_max_frame_dt;
+	float            desc_gravity2d[2];  /* resolved 2D gravity (X,Y) */
 };
 
 /* Scene-transition phases (FEATURE 9.4). */
@@ -936,5 +941,14 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
  * jce_rt_fracture.c).  Both entry points are pumped from jce_runtime_step. */
 void rt_drive_draw_distance(JceRuntime *rt);
 void rt_flush_pending_fractures(JceRuntime *rt);
+
+/* Is `name` a script method a REMOTE peer may invoke?  Explicit opt-in by
+ * name: only "rpc_<something>" qualifies.  Shared by the send and receive
+ * halves of the scripted-RPC channel so the two cannot disagree, and
+ * declared here (rather than staying static) so the policy is testable
+ * without standing up a network session — this is a security boundary, and
+ * an untested security boundary is a hope.  See jce_runtime.c for why the
+ * whole method surface used to be reachable. */
+bool rt_script_rpc_name_allowed(const char *name);
 
 #endif /* JCE_RT_INTERNAL_H */

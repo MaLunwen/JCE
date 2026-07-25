@@ -191,9 +191,9 @@ bool jce_mem_profile_get_process_stats(JceProcessMemStats *out)
                     &cur_commit, &peak_commit,
                     &page_faults);
 
-    /* mi_stats_merge() folds thread-local stats into the main thread's
-     * stats first so subsequent reads see a stable view. */
-    mi_stats_merge();
+    /* mimalloc 3.x's release build compiles out the stats subsystem (MI_STAT=0),
+     * so mi_stats_merge() has no linkable definition — and mi_process_info()
+     * above already provides the process RSS/commit snapshot without it. */
 
     out->process_rss_bytes        = (uint64_t)cur_rss;
     out->process_committed_bytes  = (uint64_t)cur_commit;

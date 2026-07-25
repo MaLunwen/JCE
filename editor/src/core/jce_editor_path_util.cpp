@@ -2,6 +2,12 @@
  *
  * Path helpers for editor-side serialization (#4).
  * Convert absolute paths to project- or scene-relative paths.
+ *
+ * All the path *arithmetic* is the engine's: jce_path_is_absolute /
+ * _normalize / _relative (jce/os/core/jce_path.h) do the work below.
+ * The three small decomposition helpers at the bottom deliberately do
+ * NOT delegate to jce_path_basename / _parent / _replace_extension —
+ * see the note above them for the exact semantic differences.
  */
 
 #include "ui/jce_editor_panels.h"
@@ -112,35 +118,66 @@ void jce_editor_path_store_asset_ref(char *out, size_t out_size,
     for (char *p = out; *p; ++p) if (*p == '\\') *p = '/';
 }
 
+/* ── Decomposition: why these stay editor-local ───────────────────────
+ *
+ * jce_path.h has jce_path_basename / _parent / _replace_extension, but
+ * none of them is a drop-in for the three below:
+ *
+ *   basename_view  — returns a VIEW into the caller's string (no buffer,
+ *                    no length limit).  jce_path_basename copies into a
+ *                    caller-supplied buffer; there is no view form.
+ *                    Content matches in every case tested ("a/b/", "/",
+ *                    "a\\b", bare name, "" ).
+ *   trim_to_parent — jce_path_parent PRESERVES the root ("/foo" -> "/",
+ *                    "/" -> "/"); this one empties it ("/foo" -> "").
+ *                    Load-bearing: every caller uses "" as the "nothing
+ *                    left to walk up to" sentinel — see the 5-level
+ *                    walk-up loop in scene/jce_editor_scene_render.cpp,
+ *                    which would spin on "/" instead of breaking.
+ *   strip_extension— jce_path_replace_extension(.., NULL) treats a
+ *                    leading dot as part of the name (".gitignore" stays
+ *                    ".gitignore") and canonicalizes separators in the
+ *                    kept prefix ("a\\b.txt" -> "a/b").  This one strips
+ *                    ".gitignore" to "" and leaves separators alone.
+ *
+ * So none of the three can delegate without changing editor behaviour.
+ * What they DID duplicate three times over was the "last separator of
+ * either flavour" scan; that now lives in one place. */
+
+/* Offset of the last '/' or '\\' in `p`, or (size_t)-1 when there is
+ * none.  Mirrors jce_path.c's s_last_sep so the two agree on what a
+ * separator is. */
+static size_t path_last_sep(const char *p)
+{
+    size_t last = (size_t)-1;
+    for (size_t i = 0; p[i]; ++i)
+        if (p[i] == '/' || p[i] == '\\') last = i;
+    return last;
+}
+
 const char *jce_editor_path_basename_view(const char *path)
 {
     if (!path || !path[0]) return "";
-    const char *slash  = strrchr(path, '/');
-    const char *bslash = strrchr(path, '\\');
-    const char *sep    = (slash > bslash) ? slash : bslash;
-    return sep ? sep + 1 : path;
+    size_t sep = path_last_sep(path);
+    return (sep == (size_t)-1) ? path : path + sep + 1;
 }
 
 void jce_editor_path_trim_to_parent(char *path)
 {
     if (!path || !path[0]) return;
-    char *slash  = strrchr(path, '/');
-    char *bslash = strrchr(path, '\\');
-    char *sep    = (slash > bslash) ? slash : bslash;
-    if (sep) *sep = '\0';
-    else     path[0] = '\0';
+    size_t sep = path_last_sep(path);
+    if (sep != (size_t)-1) path[sep] = '\0';
+    else                   path[0]   = '\0';
 }
 
 void jce_editor_path_strip_extension(char *path)
 {
     if (!path || !path[0]) return;
-    char *dot    = strrchr(path, '.');
+    char *dot = strrchr(path, '.');
     if (!dot) return;
-    char *slash  = strrchr(path, '/');
-    char *bslash = strrchr(path, '\\');
-    char *sep    = (slash > bslash) ? slash : bslash;
+    size_t sep = path_last_sep(path);
     /* Only strip when the dot belongs to the basename (not "../foo"). */
-    if (sep && dot < sep) return;
+    if (sep != (size_t)-1 && (size_t)(dot - path) < sep) return;
     *dot = '\0';
 }
 

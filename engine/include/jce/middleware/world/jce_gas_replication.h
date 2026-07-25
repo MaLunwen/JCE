@@ -75,7 +75,11 @@ typedef struct JceGasAttribRepl {
  * cast to void*).  Safe to call more than once (idempotent).  No-op for a
  * NULL world.  Call AFTER jce_net_var_register_all() so it does not disturb
  * the NetworkVariable registration order. */
-JCE_API void JCE_CALL jce_gas_replication_register(void *ecs_world);
+/* Returns false when the GAS attribute replica component was NOT wired:
+ * NULL world, or the flecs component could not be created.  CHECK IT — a
+ * silent miss means attributes (health, stamina, ...) never replicate, and
+ * the symptom is a client whose HP simply never changes. */
+JCE_API bool JCE_CALL jce_gas_replication_register(void *ecs_world);
 
 /* Authority-side fill: copy `gas`'s live attribute *current* values into the
  * entity's JceGasAttribRepl component (creating it if absent), in

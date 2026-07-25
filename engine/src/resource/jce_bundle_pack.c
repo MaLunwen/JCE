@@ -13,7 +13,6 @@
 #include <jce/resource/jce_bundle_pack.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_str.h>
-#include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_cook.h>
@@ -40,6 +39,10 @@
 
 #include <cjson/cJSON.h>
 #include <xxhash.h>
+/* cgltf is the engine's single glTF authority — used here ONLY to probe an
+ * already-authored .gltf/.glb before handing it to the assimp-backed mesh
+ * converter (see the COOK_CLASS_MODEL branch in cook_asset). */
+#include <cgltf.h>
 
 /* Mesh→GLB converter (jce_bundle_mesh_convert.cpp, same layer). */
 JCE_API int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
@@ -649,6 +652,42 @@ typedef struct {
     char err[96];      /* short failure detail for the driver-side warning   */
 } CookStatus;
 
+/* Would round-tripping this glTF/GLB blob through the assimp mesh converter
+ * destroy data cgltf would otherwise have loaded at runtime?
+ *
+ * True for anything the converter's two writers cannot express: both the
+ * indexed-glb writer and assimp's glb2 exporter fallback emit plain
+ * POSITION/NORMAL/UV0 primitives, so skins, animation clips and morph targets
+ * do not survive the trip.  Detection runs on cgltf so the answer comes from
+ * the same parser that owns the format at runtime; cgltf_parse reads only the
+ * JSON header (plus the GLB chunk table) — no buffer load, no image decode —
+ * which keeps this cheap enough for the parallel cook.  Reentrant: no globals,
+ * allocations go through cgltf's default malloc/free.
+ *
+ * A parse failure returns false so a malformed/unusual input keeps the exact
+ * pre-existing behaviour (hand it to assimp and let that path report). */
+static bool gltf_assimp_roundtrip_is_lossy(const uint8_t *raw, size_t raw_size)
+{
+    cgltf_options options;
+    cgltf_data   *data = NULL;
+    memset(&options, 0, sizeof options);
+    if (cgltf_parse(&options, raw, (cgltf_size)raw_size, &data)
+            != cgltf_result_success || !data)
+        return false;
+
+    bool lossy = (data->skins_count > 0) || (data->animations_count > 0);
+    for (cgltf_size m = 0; !lossy && m < data->meshes_count; ++m) {
+        const cgltf_mesh *mesh = &data->meshes[m];
+        if (mesh->weights_count > 0) { lossy = true; break; }
+        for (cgltf_size p = 0; p < mesh->primitives_count; ++p) {
+            if (mesh->primitives[p].targets_count > 0) { lossy = true; break; }
+        }
+    }
+
+    cgltf_free(data);
+    return lossy;
+}
+
 /* Cook one gathered asset.  On success frees `raw` and returns a freshly
  * JCE_MALLOC'd cooked buffer (out_size set), keeping the original vpath
  * (runtime loaders content-sniff).  On any non-cook / failure case returns
@@ -744,8 +783,10 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
 
     /* COOK_CLASS_MODEL — convert any Assimp-readable mesh to GLB (+meshopt).
      * Already-GLB inputs are re-run through the converter so the meshopt
-     * dedup/vertex-cache pass still applies; if conversion fails we ship the
-     * source bytes verbatim (a .gltf/.glb still loads at runtime). */
+     * dedup/vertex-cache pass still applies — EXCEPT the rigged/morphed ones
+     * the round-trip would mangle (see the cgltf guard below); if conversion
+     * fails we ship the source bytes verbatim (a .gltf/.glb still loads at
+     * runtime). */
     if (imp) cJSON_Delete(imp);   /* model import.json (scale/normals) is
                                      honoured by the editor importer, not the
                                      bundle-time GLB converter; consult here
@@ -753,6 +794,21 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
     {
         const char *dot = strrchr(vpath, '.');
         const char *ext_hint = dot ? dot + 1 : "";
+
+        /* glTF dual-authority guard: an already-authored .gltf/.glb is cgltf's
+         * asset, and the converter above is an ASSIMP path.  Re-importing it
+         * only to re-export it is a lossy round-trip — both the indexed-glb
+         * writer and assimp's glb2 exporter emit POSITION/NORMAL/UV0 geometry
+         * only, so a rigged character silently comes out of the bundle with no
+         * skeleton, no animations and no morph targets.  Probe the source with
+         * cgltf (the engine's single glTF authority; header parse only — no
+         * buffer load, no image decode) and ship those inputs verbatim.  Static
+         * glTF still goes through the converter, so the meshopt dedup +
+         * auto-LOD + auto-meshlet cook is unchanged for the common case. */
+        if ((ends_with_ci(vpath, ".glb") || ends_with_ci(vpath, ".gltf")) &&
+            gltf_assimp_roundtrip_is_lossy(raw, raw_size))
+            return raw;
+
         uint8_t *glb = NULL;
         size_t   glb_sz = 0;
         if (jce_bundle_convert_to_glb(raw, raw_size, ext_hint, &glb, &glb_sz)
@@ -803,10 +859,10 @@ typedef struct {
     int               target_platform;
 } CookCtx;
 
-static void cook_jobs_range(int begin, int end, void *user)
+static void cook_jobs_range(uint32_t begin, uint32_t end, void *user)
 {
     CookCtx *c = (CookCtx *)user;
-    for (int k = begin; k < end; ++k) {
+    for (uint32_t k = begin; k < end; ++k) {
         CookJob *j = &c->jobs[k];
         j->buf = cook_asset(j->vpath, j->buf, j->in_size, c->resource_root,
                             c->resolve_fn, c->resolve_user, c->emap,
@@ -1421,9 +1477,31 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         if (!scenes_dir[0])
             snprintf(scenes_dir, sizeof(scenes_dir),
                      "%s", opts->project_root);
-        if (!resource_root[0])
-            snprintf(resource_root, sizeof(resource_root),
-                     "%s", opts->project_root);
+        if (!resource_root[0]) {
+            /* Prefer the project's ASSET root over the bare project root: JCE
+             * keeps assets under <project>/resources/assets, and a bundle_roots
+             * dep like fonts/<x>.ttf is resolved as <resource_root>/fonts/... .
+             * Using the bare project root here made those probe at
+             * <project>/fonts/... and silently fail to pack (the walk-up below
+             * only runs for explicit-scene builds, and is pre-empted anyway once
+             * resource_root is set).  Fall through resources/assets → resources
+             * → assets → the project root itself. */
+            static const char *const kAssetSub[] = {
+                "resources/assets", "resources", "assets" };
+            for (size_t _si = 0;
+                 _si < sizeof(kAssetSub) / sizeof(kAssetSub[0]); ++_si) {
+                char _probe[1024];
+                snprintf(_probe, sizeof(_probe), "%s/%s",
+                         opts->project_root, kAssetSub[_si]);
+                if (jce_fs_host_exists_dir(_probe)) {
+                    snprintf(resource_root, sizeof(resource_root), "%s", _probe);
+                    break;
+                }
+            }
+            if (!resource_root[0])
+                snprintf(resource_root, sizeof(resource_root),
+                         "%s", opts->project_root);
+        }
         if (!out_dir[0])
             snprintf(out_dir, sizeof(out_dir),
                      "%s/.bundles", opts->project_root);
@@ -1505,6 +1583,12 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             prev_catalog[0] = '\0';
         }
     }
+
+    /* Diagnostic: the resolved asset root that read_asset probes as
+     * <resource_root>/<vpath>.  A bundle_roots asset that fails to pack almost
+     * always means this points at the project root instead of resources/assets. */
+    pack_log_info("resource_root='%s' (scenes_dir='%s', single_file=%d)",
+                  resource_root, scenes_dir, (int)single_file);
 
     int shared_threshold = opts->shared_threshold > 0 ? opts->shared_threshold : 2;
     if (shared_threshold < 2) shared_threshold = 2;
@@ -2519,12 +2603,37 @@ static int run_build_impl(const JceBundlePackOptions *opts)
              * OOM degrades to the prior (racy) behaviour rather than crashing. */
             s_vfs_read_mutex = jce_mutex_create();
 
-            JceJobSystem *jobs_sys = jce_jobs_default();
-            if (jobs_sys && njobs >= 2)
-                jce_jobs_parallel_for(jobs_sys, (int)njobs, 1,
-                                      cook_jobs_range, &cctx);
+            /* A PRIVATE pool, not jce_thread_pool_shared(), for two reasons.
+             *
+             * Correctness first: the editor runs this whole function on its own
+             * "jce-bundle-pack" thread (jce_panel_bundle_browser.cpp) while the
+             * frame loop keeps drawing.  enkiTS routes a submission into the
+             * pipe of the SUBMITTING thread's scheduler slot, and a thread that
+             * never registered with the scheduler reports slot 0 — the slot the
+             * frame loop owns.  Those pipes are single-producer, so submitting
+             * the shared pool from here would have raced the main thread's own
+             * per-frame submissions.  A scheduler created on this thread makes
+             * this thread its slot 0, so the writes stay ours.
+             *
+             * And policy second: cooking a texture or a mesh blocks for far
+             * longer than a frame, and jce_thread_pool_parallel_for() waits by
+             * running ANY queued task — so a cook job sitting in the shared
+             * pool would get executed by the main thread inside a cull.  See
+             * the private-pool note in jce_thread.h.
+             *
+             * Sized by the house policy rather than enkiTS auto-detect: a build
+             * must not take every core out from under an editor that is still
+             * drawing.  NULL (OOM) degrades to the inline path. */
+            JceThreadPool *cook_pool = NULL;
+            if (njobs >= 2)
+                cook_pool = jce_thread_pool_create(
+                    jce_thread_pool_default_workers() + 1);
+            if (cook_pool)
+                jce_thread_pool_parallel_for(cook_pool, (uint32_t)njobs, 1,
+                                             cook_jobs_range, &cctx);
             else
-                cook_jobs_range(0, (int)njobs, &cctx);
+                cook_jobs_range(0u, (uint32_t)njobs, &cctx);
+            if (cook_pool) jce_thread_pool_destroy(cook_pool);
 
             if (s_vfs_read_mutex) {
                 jce_mutex_destroy(s_vfs_read_mutex);

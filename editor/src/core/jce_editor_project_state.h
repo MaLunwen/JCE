@@ -26,6 +26,10 @@
  * Per-scene keys: pass the scene's project-relative path as `scene`.
  * Scene sections are LRU-capped (most recent 24 scenes) so the file can't
  * grow without bound in a many-scene project.
+ *
+ * This module also OWNS the open-project root string itself (see the
+ * accessors at the bottom) — it is the module that has to follow the
+ * root anyway, so the storage lives next to the code that watches it.
  */
 
 #ifndef JCE_EDITOR_PROJECT_STATE_H
@@ -69,6 +73,22 @@ bool  jce_editor_pstate_active(void);
  * flush_tick also detects project-root changes (flush old, reload new). */
 void  jce_editor_pstate_flush_tick(float dt_sec);
 void  jce_editor_pstate_flush_now(void);
+
+/* ── Open-project root ───────────────────────────────────────────────
+ *
+ * The editor-wide "which project is currently open" string.  Never NULL;
+ * "" means no project is open.  The returned pointer is stable for the
+ * lifetime of the process (fixed-size storage owned by this module), so
+ * it is safe to hold across calls — but re-read it if you need the
+ * current value.
+ *
+ * The setter only replaces the string (truncated at 511 chars).  The
+ * full open-project transition — asset DB, PAK key, render pipeline,
+ * project settings, build/run profile, game l10n — is
+ * set_current_project_root() in dialogs/jce_dialog_project.cpp, which
+ * calls this.  Do not call the setter from anywhere else. */
+const char *jce_editor_current_project_root(void);
+void        jce_editor_current_project_root_set(const char *root);
 
 #ifdef __cplusplus
 }

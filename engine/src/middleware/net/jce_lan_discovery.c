@@ -27,6 +27,8 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>
 
+#include "jce_net_bytes.h"
+
 #include <enet/enet.h>
 
 #include <stdio.h>
@@ -42,51 +44,19 @@
 #define LAN_RESP_HDR_SIZE  23u
 #define LAN_MAX_PACKET     512u   /* name <= 63 chars → headroom plenty */
 
-/* ── Minimal little-endian write/read helpers ─────────────────────── */
+/* Little-endian wire codec: the advancing-cursor helpers in
+ * jce_net_bytes.h (jce_net_wr_* / jce_net_rd_*).  Both packets are
+ * bounds-checked by their LAN_*_SIZE guards before any read, so the
+ * unchecked cursor flavour is the right one here. */
 
-static void wr_u8(uint8_t **p, uint8_t v)   { (*p)[0] = v; *p += 1; }
-static void wr_u16(uint8_t **p, uint16_t v) {
-    (*p)[0] = (uint8_t)(v & 0xFFu); (*p)[1] = (uint8_t)((v >> 8) & 0xFFu); *p += 2;
-}
-static void wr_u32(uint8_t **p, uint32_t v) {
-    (*p)[0] = (uint8_t)(v & 0xFFu);
-    (*p)[1] = (uint8_t)((v >> 8) & 0xFFu);
-    (*p)[2] = (uint8_t)((v >> 16) & 0xFFu);
-    (*p)[3] = (uint8_t)((v >> 24) & 0xFFu);
-    *p += 4;
-}
-
-static uint8_t  rd_u8(const uint8_t **p)  { uint8_t  v = (*p)[0]; *p += 1; return v; }
-static uint16_t rd_u16(const uint8_t **p) {
-    uint16_t v = (uint16_t)((*p)[0] | ((uint16_t)(*p)[1] << 8));
-    *p += 2; return v;
-}
-static uint32_t rd_u32(const uint8_t **p) {
-    uint32_t v = (uint32_t)((*p)[0])
-               | ((uint32_t)(*p)[1] << 8)
-               | ((uint32_t)(*p)[2] << 16)
-               | ((uint32_t)(*p)[3] << 24);
-    *p += 4; return v;
-}
-
-/* ── One-time ENet init (mirrors jce_net.c, but local to this TU so we
- * do not depend on jce_net_host_create being called first). ─────────── */
-
-static bool g_lan_enet_init = false;
-
-static bool lan_ensure_enet(void)
-{
-    if (g_lan_enet_init) return true;
-    if (enet_initialize() != 0) {
-        LOG_ERROR(LOG_TAG, "enet_initialize() failed");
-        return false;
-    }
-    g_lan_enet_init = true;
-    /* Intentionally no atexit(enet_deinitialize): jce_net.c owns that
-     * hook when it boots, and on Windows ENet's WSAStartup is
-     * ref-counted internally. */
-    return true;
-}
+/* ── ENet lifecycle ───────────────────────────────────────────────────
+ *
+ * jce_net.c owns the process-wide ENet refcount; discovery holds one
+ * reference for as long as a beacon / scan socket is open.  Symmetric on
+ * purpose: neither module may enet_deinitialize() while the other still
+ * has live sockets. */
+extern bool jce__net_enet_acquire(void);
+extern void jce__net_enet_release(void);
 
 static uint16_t lan_default_port(uint16_t requested)
 {
@@ -155,7 +125,7 @@ bool jce_lan_discovery_server_start(const char *server_name,
         LOG_WARN(LOG_TAG, "server_start: already running");
         return false;
     }
-    if (!lan_ensure_enet()) return false;
+    if (!jce__net_enet_acquire()) return false;
 
     memset(&g_srv, 0, sizeof(g_srv));
     g_srv.sock = ENET_SOCKET_NULL;
@@ -178,6 +148,7 @@ bool jce_lan_discovery_server_start(const char *server_name,
     g_srv.sock = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
     if (g_srv.sock == ENET_SOCKET_NULL) {
         LOG_ERROR(LOG_TAG, "server: enet_socket_create failed");
+        jce__net_enet_release();
         return false;
     }
     (void)enet_socket_set_option(g_srv.sock, ENET_SOCKOPT_NONBLOCK,  1);
@@ -189,6 +160,7 @@ bool jce_lan_discovery_server_start(const char *server_name,
     if (enet_socket_bind(g_srv.sock, &bind_addr) != 0) {
         LOG_ERROR(LOG_TAG, "server: bind 0.0.0.0:%u failed", (unsigned)g_srv.port);
         server_close_socket();
+        jce__net_enet_release();
         return false;
     }
 
@@ -203,6 +175,7 @@ void jce_lan_discovery_server_stop(void)
     if (!g_srv.running) return;
     server_close_socket();
     g_srv.running = false;
+    jce__net_enet_release();
     LOG_INFO(LOG_TAG, "server beacon down");
 }
 
@@ -221,10 +194,10 @@ static void server_handle_request(const uint8_t *data, size_t size,
 {
     if (size < LAN_REQ_SIZE) return;
     const uint8_t *p = data;
-    uint32_t magic   = rd_u32(&p);
-    uint16_t version = rd_u16(&p);
-    uint8_t  opcode  = rd_u8(&p);
-    uint32_t nonce   = rd_u32(&p);
+    uint32_t magic   = jce_net_rd_u32(&p);
+    uint16_t version = jce_net_rd_u16(&p);
+    uint8_t  opcode  = jce_net_rd_u8(&p);
+    uint32_t nonce   = jce_net_rd_u32(&p);
 
     if (magic != LAN_MAGIC)                         return;
     if (version != JCE_LAN_PROTOCOL_VERSION)        return;
@@ -232,15 +205,15 @@ static void server_handle_request(const uint8_t *data, size_t size,
 
     uint8_t reply[LAN_MAX_PACKET];
     uint8_t *w = reply;
-    wr_u32(&w, LAN_MAGIC);
-    wr_u16(&w, (uint16_t)JCE_LAN_PROTOCOL_VERSION);
-    wr_u8 (&w, (uint8_t)LAN_OPCODE_RESP);
-    wr_u32(&w, nonce);
-    wr_u32(&w, g_srv.game_port);
-    wr_u16(&w, g_srv.current_players);
-    wr_u16(&w, g_srv.max_players);
-    wr_u32(&w, (uint32_t)JCE_LAN_PROTOCOL_VERSION);
-    wr_u16(&w, g_srv.name_len);
+    jce_net_wr_u32(&w, LAN_MAGIC);
+    jce_net_wr_u16(&w, (uint16_t)JCE_LAN_PROTOCOL_VERSION);
+    jce_net_wr_u8 (&w, (uint8_t)LAN_OPCODE_RESP);
+    jce_net_wr_u32(&w, nonce);
+    jce_net_wr_u32(&w, g_srv.game_port);
+    jce_net_wr_u16(&w, g_srv.current_players);
+    jce_net_wr_u16(&w, g_srv.max_players);
+    jce_net_wr_u32(&w, (uint32_t)JCE_LAN_PROTOCOL_VERSION);
+    jce_net_wr_u16(&w, g_srv.name_len);
     if (g_srv.name_len > 0) {
         memcpy(w, g_srv.name, g_srv.name_len);
         w += g_srv.name_len;
@@ -324,7 +297,7 @@ bool jce_lan_discovery_client_is_scanning(void)
 bool jce_lan_discovery_client_start_scan(uint16_t discovery_port, uint32_t duration_ms)
 {
     if (g_cli.scanning) jce_lan_discovery_client_stop_scan();
-    if (!lan_ensure_enet()) return false;
+    if (!jce__net_enet_acquire()) return false;
 
     memset(&g_cli, 0, sizeof(g_cli));
     g_cli.sock        = ENET_SOCKET_NULL;
@@ -335,6 +308,7 @@ bool jce_lan_discovery_client_start_scan(uint16_t discovery_port, uint32_t durat
     g_cli.sock = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
     if (g_cli.sock == ENET_SOCKET_NULL) {
         LOG_ERROR(LOG_TAG, "client: enet_socket_create failed");
+        jce__net_enet_release();
         return false;
     }
     (void)enet_socket_set_option(g_cli.sock, ENET_SOCKOPT_NONBLOCK,  1);
@@ -346,16 +320,17 @@ bool jce_lan_discovery_client_start_scan(uint16_t discovery_port, uint32_t durat
     if (enet_socket_bind(g_cli.sock, &bind_addr) != 0) {
         LOG_ERROR(LOG_TAG, "client: bind 0.0.0.0:0 failed");
         client_close_socket();
+        jce__net_enet_release();
         return false;
     }
 
     /* Send the broadcast REQ. */
     uint8_t pkt[LAN_REQ_SIZE];
     uint8_t *w = pkt;
-    wr_u32(&w, LAN_MAGIC);
-    wr_u16(&w, (uint16_t)JCE_LAN_PROTOCOL_VERSION);
-    wr_u8 (&w, (uint8_t)LAN_OPCODE_REQ);
-    wr_u32(&w, g_cli.nonce);
+    jce_net_wr_u32(&w, LAN_MAGIC);
+    jce_net_wr_u16(&w, (uint16_t)JCE_LAN_PROTOCOL_VERSION);
+    jce_net_wr_u8 (&w, (uint8_t)LAN_OPCODE_REQ);
+    jce_net_wr_u32(&w, g_cli.nonce);
 
     ENetAddress bcast;
     bcast.host = ENET_HOST_BROADCAST;
@@ -386,6 +361,7 @@ void jce_lan_discovery_client_stop_scan(void)
     if (!g_cli.scanning) return;
     client_close_socket();
     g_cli.scanning = false;
+    jce__net_enet_release();
     LOG_INFO(LOG_TAG, "client scan end (%u server(s) found)", (unsigned)g_server_count);
 }
 
@@ -427,20 +403,20 @@ static void client_handle_response(const uint8_t *data, size_t size,
 {
     if (size < LAN_RESP_HDR_SIZE) return;
     const uint8_t *p = data;
-    uint32_t magic   = rd_u32(&p);
-    uint16_t version = rd_u16(&p);
-    uint8_t  opcode  = rd_u8(&p);
-    uint32_t nonce   = rd_u32(&p);
+    uint32_t magic   = jce_net_rd_u32(&p);
+    uint16_t version = jce_net_rd_u16(&p);
+    uint8_t  opcode  = jce_net_rd_u8(&p);
+    uint32_t nonce   = jce_net_rd_u32(&p);
     if (magic != LAN_MAGIC)                         return;
     if (version != JCE_LAN_PROTOCOL_VERSION)        return;
     if (opcode != LAN_OPCODE_RESP)                  return;
     if (nonce != g_cli.nonce)                       return;
 
-    uint32_t game_port = rd_u32(&p);
-    uint16_t current   = rd_u16(&p);
-    uint16_t maxp      = rd_u16(&p);
-    uint32_t proto     = rd_u32(&p);
-    uint16_t name_len  = rd_u16(&p);
+    uint32_t game_port = jce_net_rd_u32(&p);
+    uint16_t current   = jce_net_rd_u16(&p);
+    uint16_t maxp      = jce_net_rd_u16(&p);
+    uint32_t proto     = jce_net_rd_u32(&p);
+    uint16_t name_len  = jce_net_rd_u16(&p);
     if (proto != JCE_LAN_PROTOCOL_VERSION)          return;
     if ((size_t)(p - data) + name_len > size)       return;
     if (name_len >= JCE_LAN_DISCOVERY_NAME_LEN) name_len = (uint16_t)(JCE_LAN_DISCOVERY_NAME_LEN - 1u);

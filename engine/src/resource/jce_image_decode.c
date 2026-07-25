@@ -1,46 +1,40 @@
 /*
- * jce_image_decode.c  Generic image decode wrapper (stb_image backend).
+ * jce_image_decode.c  JceImage-shaped adapter over the one image service.
+ *
+ * This file does NOT pick a codec.  It forwards to jce_image, which is the
+ * single dispatcher (LDR -> SDL_image, HDR / 16-bit grayscale -> stb_image),
+ * so the editor preview, the density-mask loader, the PAK decode helper and
+ * the cooker all see exactly the pixels the runtime texture loader sees.
+ * It used to call stb_image directly, which made it a second general-purpose
+ * loader with its own format set and its own JPEG IDCT — the thing the
+ * dependency charter (README "Rendering, Images, Fonts, UI, and Assets")
+ * explicitly forbids.
  */
 
 #include <jce/resource/jce_image_decode.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/renderer/jce_image.h>    /* the one image-decode service */
 
 #include "os/core/jce_memory.h"
 
 #include <string.h>
 
-/* stb_image is implemented in renderer/jce_stb_image_impl.c with the
-   STBI_MALLOC/FREE macros pointing at the engine allocator.  We only
-   need the public function declarations here. */
-#define STBI_NO_STDIO       /* match the impl translation unit */
-#include "renderer/internal/stb_image.h"
-
 bool jce_image_decode(const void *data, size_t size, JceImage *out)
 {
     if (!data || size == 0 || !out) return false;
 
-    int w = 0, h = 0, n = 0;
-    stbi_uc *px = stbi_load_from_memory((const stbi_uc *)data,
-                                        (int)size, &w, &h, &n,
-                                        /*req_comp=*/4);
-    if (!px || w <= 0 || h <= 0) {
-        if (px) stbi_image_free(px);
+    /* The service hands back a tightly-packed RGBA8 buffer owned by the
+       ENGINE allocator, which is exactly what jce_image_free releases —
+       so the buffer is adopted, not re-copied. */
+    int w = 0, h = 0;
+    uint8_t *px = jce_image_load_rgba8_from_memory(data, (uint64_t)size, &w, &h);
+    if (!px) return false;
+    if (w <= 0 || h <= 0) {
+        jce_image_free_rgba8(px);
         return false;
     }
 
-    /* Copy into engine-owned buffer so callers free with JCE_FREE
-       (stb_image_free maps to the engine allocator via the macros in
-       jce_stb_image_impl.c, but we hide that contract from clients). */
-    size_t bytes = (size_t)w * (size_t)h * 4u;
-    uint8_t *copy = (uint8_t *)JCE_MALLOC(bytes);
-    if (!copy) {
-        stbi_image_free(px);
-        return false;
-    }
-    memcpy(copy, px, bytes);
-    stbi_image_free(px);
-
-    out->pixels = copy;
+    out->pixels = px;
     out->width  = (uint32_t)w;
     out->height = (uint32_t)h;
     return true;

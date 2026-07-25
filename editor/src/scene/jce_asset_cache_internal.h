@@ -31,6 +31,7 @@ extern "C" {
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_image_decode.h>
 }
 
@@ -85,6 +86,257 @@ struct AssetCacheState {
 
 extern AssetCacheState s_cache;
 
+/* ── Locking helper ────────────────────────────────────────────── */
+
+/* RAII guard around JceMutex — replaces std::lock_guard usage. */
+struct JceMutexGuard {
+    JceMutex *m;
+    explicit JceMutexGuard(JceMutex *mtx) : m(mtx) { jce_mutex_lock(m); }
+    ~JceMutexGuard() { jce_mutex_unlock(m); }
+    JceMutexGuard(const JceMutexGuard &) = delete;
+    JceMutexGuard &operator=(const JceMutexGuard &) = delete;
+};
+
+/* ── Shared async-loader scaffold ──────────────────────────────── */
+
+/*
+ * The mesh and texture caches each own one worker thread that drains a
+ * `pending` request queue and publishes results the main thread finalizes
+ * under a per-frame budget.  Only the decode step and the finalize step
+ * differ, so the worker / mutex / condvar / queue / generation plumbing
+ * lives here once, parameterised on the request and result types.
+ *
+ * Threading contract (identical to the hand-rolled copies this replaces):
+ *   - `pending`, `completed`, `generation`, `next_order` and `stop` are
+ *     only ever touched with `mutex` held.
+ *   - The worker decodes; it never touches a GPU resource.  Every
+ *     jce_mesh_create / jce_texture_from_rgba call happens on the main
+ *     thread inside async_loader_drain_completed().
+ *   - `generation` invalidates in-flight work: the drain drops any result
+ *     whose generation no longer matches instead of applying it.
+ *   - async_loader_stop() joins the worker *before* the queues are
+ *     cleared, so a worker can never outlive the state it writes into.
+ *
+ * The material cache deliberately does NOT use this scaffold — see the
+ * note above MaterialAsyncState.
+ */
+
+template <typename Request, typename Result>
+struct AsyncLoaderState {
+    /* Named so the main-thread drain can hold a batch of results. */
+    typedef Result ResultType;
+
+    JceThread            *worker;
+    JceMutex             *mutex;
+    JceCondVar           *cv;
+    std::vector<Request>  pending;
+    std::vector<Result>   completed;
+    /* Monotonic arrival counter stamped onto each queued request; queues
+     * that pop by priority use it as the FIFO tie-break.  Reset with the
+     * generation. */
+    uint32_t              next_order;
+    uint64_t              generation;
+    bool                  running;
+    bool                  stop;
+};
+
+/* What the main-thread finalize step decided about one result. */
+enum AsyncFinalizeAction {
+    ASYNC_FINALIZE_DROPPED,  /* stale or unusable; released, no budget spent */
+    ASYNC_FINALIZE_DEFERRED, /* usable but out of budget; retry next frame   */
+    ASYNC_FINALIZE_APPLIED   /* uploaded on the main thread; spends one slot */
+};
+
+/* Creates the sync primitives, resets the queues and spawns the worker.
+ * Callers guard on `running` themselves so a second start cannot reset
+ * state a live worker is using. */
+template <typename State>
+void async_loader_start(State &st, JceThreadFn worker_main,
+                        const char *thread_name)
+{
+    if (!st.mutex) st.mutex = jce_mutex_create();
+    if (!st.cv)    st.cv    = jce_cond_create();
+
+    st.next_order = 0;
+    st.generation = 1;
+    st.stop = false;
+    st.pending.clear();
+    st.completed.clear();
+
+    st.worker = jce_thread_create(worker_main, NULL, thread_name);
+    st.running = true;
+}
+
+/* Asks the worker to finish, wakes it and joins it before the queues are
+ * cleared — that ordering is what keeps the worker from writing into
+ * state the caller is tearing down.  `on_discard` releases the payload of
+ * results nobody finalized (results that own their memory need none). */
+template <typename State, typename DiscardFn>
+void async_loader_stop(State &st, DiscardFn on_discard)
+{
+    {
+        JceMutexGuard lock(st.mutex);
+        st.stop = true;
+    }
+    jce_cond_broadcast(st.cv);
+
+    if (st.worker) {
+        jce_thread_join(st.worker);
+        st.worker = NULL;
+    }
+
+    for (auto &res : st.completed)
+        on_discard(res);
+
+    st.pending.clear();
+    st.completed.clear();
+    st.running = false;
+
+    if (st.cv)    { jce_cond_destroy(st.cv);    st.cv = NULL; }
+    if (st.mutex) { jce_mutex_destroy(st.mutex); st.mutex = NULL; }
+}
+
+template <typename State>
+void async_loader_stop(State &st)
+{
+    async_loader_stop(st, [](auto &) {});
+}
+
+/* Invalidates every queued request.  `drop_completed` also throws away
+ * results the worker already published — only correct when the result
+ * type owns its payload; a result holding raw CPU data must instead reach
+ * the drain, which releases it on the generation check. */
+template <typename State>
+void async_loader_begin_new_generation(State &st, bool drop_completed)
+{
+    JceMutexGuard lock(st.mutex);
+    st.generation++;
+    st.next_order = 0;
+    st.pending.clear();
+    if (drop_completed)
+        st.completed.clear();
+}
+
+template <typename State>
+uint64_t async_loader_generation(State &st)
+{
+    JceMutexGuard lock(st.mutex);
+    return st.generation;
+}
+
+/* Queues a request unless an equal one is already pending for the current
+ * generation, then wakes the worker.  `same(existing)` runs with the mutex
+ * held and may fold the new request into the existing one (the mesh queue
+ * tightens its distance priority that way); `make(generation, order)`
+ * builds the request when nothing matched.  Both paths signal, exactly as
+ * the hand-rolled queues did. */
+template <typename State, typename SameFn, typename MakeFn>
+void async_loader_queue_request(State &st, SameFn same, MakeFn make)
+{
+    {
+        JceMutexGuard lock(st.mutex);
+
+        bool merged = false;
+        for (auto &req : st.pending) {
+            if (req.generation == st.generation && same(req)) {
+                merged = true;
+                break;
+            }
+        }
+
+        if (!merged)
+            st.pending.push_back(make(st.generation, st.next_order++));
+    }
+
+    jce_cond_signal(st.cv);
+}
+
+/* Worker side: blocks until a request can be taken or the loader is
+ * stopping.  `pop` runs with the mutex held and returns false when it
+ * declined to take anything.  Returns false only once the loader is
+ * stopping and the queue has drained — i.e. the worker should exit. */
+template <typename State, typename PopFn>
+bool async_loader_worker_take(State &st, PopFn pop)
+{
+    for (;;) {
+        jce_mutex_lock(st.mutex);
+        while (!(st.stop || !st.pending.empty()))
+            jce_cond_wait(st.cv, st.mutex);
+
+        if (st.stop && st.pending.empty()) {
+            jce_mutex_unlock(st.mutex);
+            return false;
+        }
+
+        const bool got = pop();
+        jce_mutex_unlock(st.mutex);
+        if (got)
+            return true;
+    }
+}
+
+/* Worker side: publish one finished result (moved from `result`). */
+template <typename State, typename Result>
+void async_loader_publish(State &st, Result &result)
+{
+    JceMutexGuard lock(st.mutex);
+    st.completed.push_back(std::move(result));
+}
+
+/* Main thread: steal the whole completed list in one lock. */
+template <typename State, typename Result>
+void async_loader_take_completed(State &st, std::vector<Result> *out)
+{
+    if (!out) return;
+
+    JceMutexGuard lock(st.mutex);
+    out->swap(st.completed);
+}
+
+/* Main thread: hand back the results the per-frame budget deferred. */
+template <typename State, typename Result>
+void async_loader_push_back_completed(State &st, std::vector<Result> *results)
+{
+    if (!results || results->empty()) return;
+
+    JceMutexGuard lock(st.mutex);
+    for (Result &res : *results)
+        st.completed.push_back(std::move(res));
+    results->clear();
+}
+
+/* Main thread: take everything the worker published and finalize at most
+ * `budget` of it, pushing the rest back for the next frame.
+ *
+ * `finalize(result, generation, budget_left)` runs once per result in
+ * arrival order and reports what it did.  The generation is read once,
+ * after the batch is taken, so an idle frame still costs a single lock. */
+template <typename State, typename FinalizeFn>
+void async_loader_drain_completed(State &st, uint32_t budget,
+                                  FinalizeFn finalize)
+{
+    std::vector<typename State::ResultType> completed;
+    async_loader_take_completed(st, &completed);
+    if (completed.empty())
+        return;
+
+    const uint64_t generation = async_loader_generation(st);
+    uint32_t finalized = 0;
+    std::vector<typename State::ResultType> deferred;
+    deferred.reserve(completed.size());
+
+    for (typename State::ResultType &res : completed) {
+        const AsyncFinalizeAction action =
+            finalize(res, generation, finalized < budget);
+        if (action == ASYNC_FINALIZE_DEFERRED)
+            deferred.push_back(std::move(res));
+        else if (action == ASYNC_FINALIZE_APPLIED)
+            finalized++;
+    }
+
+    async_loader_push_back_completed(st, &deferred);
+}
+
 /* ── Mesh async types + state ───────────────────────────────────── */
 
 struct MeshLoadRequest {
@@ -102,17 +354,7 @@ struct MeshLoadResult {
     JceEditorCpuMeshData cpu;
 };
 
-struct MeshAsyncState {
-    JceThread                   *worker;
-    JceMutex                    *mutex;
-    JceCondVar                  *cv;
-    std::vector<MeshLoadRequest> pending;
-    std::vector<MeshLoadResult>  completed;
-    uint32_t                    discovery;
-    uint64_t                    generation;
-    bool                        running;
-    bool                        stop;
-};
+typedef AsyncLoaderState<MeshLoadRequest, MeshLoadResult> MeshAsyncState;
 
 extern MeshAsyncState s_mesh_async;
 
@@ -136,20 +378,17 @@ struct TextureLoadResult {
     uint32_t             height;
 };
 
-struct TextureAsyncState {
-    JceThread                      *worker;
-    JceMutex                       *mutex;
-    JceCondVar                     *cv;
-    std::vector<TextureLoadRequest> pending;
-    std::vector<TextureLoadResult>  completed;
-    uint64_t                       generation;
-    bool                           running;
-    bool                           stop;
-};
+typedef AsyncLoaderState<TextureLoadRequest, TextureLoadResult> TextureAsyncState;
 
 extern TextureAsyncState s_tex_async;
 
 /* ── Material async types + state (thread-pool based) ───────────── */
+
+/* Not an AsyncLoaderState: material extraction owns no thread and no
+ * condvar, submits tracked tasks to a JceThreadPool instead of a pending
+ * queue, has no per-frame finalize budget, and its results are *pulled* by
+ * the caller (material_take_completed_result) rather than applied into a
+ * cache.  Nothing of the worker scaffold above fits it. */
 
 struct MaterialAsyncContext {
     uint32_t              entity_id;
@@ -182,15 +421,6 @@ extern MaterialAsyncState s_mat_async;
 #define TEX_FINALIZE_BUDGET_PER_FRAME  4
 
 /* ── Inline helpers ─────────────────────────────────────────────── */
-
-/* RAII guard around JceMutex — replaces std::lock_guard usage. */
-struct JceMutexGuard {
-    JceMutex *m;
-    explicit JceMutexGuard(JceMutex *mtx) : m(mtx) { jce_mutex_lock(m); }
-    ~JceMutexGuard() { jce_mutex_unlock(m); }
-    JceMutexGuard(const JceMutexGuard &) = delete;
-    JceMutexGuard &operator=(const JceMutexGuard &) = delete;
-};
 
 static inline JceTexture tex_invalid(void)
 {

@@ -45,11 +45,12 @@ struct JceAudioEcs {
 
 /* ── Lifetime ──────────────────────────────────────────────────────── */
 
-JceAudioEcs *jce_audio_ecs_create(ecs_world_t              *world,
+JceAudioEcs *jce_audio_ecs_create(void                     *world_opaque,
                                   JceReverbZones           *rz,
                                   JceAudioOcclusionTracker *occ,
                                   JceAudioMixer            *mx)
 {
+    ecs_world_t *world = (ecs_world_t *)world_opaque;
     if (!world) return NULL;
     JceAudioEcs *a = (JceAudioEcs *)JCE_CALLOC(1, sizeof(*a));
     if (!a) return NULL;

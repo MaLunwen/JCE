@@ -74,10 +74,24 @@ JceAidResult JCE_CALL jce_aid_init(const JceAidConfig* cfg)
     if (g_aid.cfg.local_model)
         g_aid.cfg_local_model = jce_aid_strdup(g_aid.cfg.local_model);
     g_aid.stats_mutex = jce_mutex_create();
-    /* default transport preference: libcurl (HTTPS-capable) when built,
-     * else the plaintext socket fallback; tests swap in the mock. */
-    if (!jce_aid_curl_install())
+    /* Default transport preference: libcurl (HTTPS-capable) when built, else
+     * the plaintext socket fallback; tests swap in the mock.
+     *
+     * The fallback is NARROWER, not equivalent: it speaks http:// only, so an
+     * https:// endpoint stops working entirely rather than silently
+     * downgrading to plaintext (parse_http_url rejects the scheme).  That is
+     * the safe failure mode, but it presents to an operator as "every T1
+     * request fails" with nothing pointing at the transport — so say so.
+     * libcurl is an unconditional Conan requirement, which means reaching
+     * here at all implies curl_global_init() failed at runtime. */
+    if (!jce_aid_curl_install()) {
         jce_aid_http_install();
+        LOG_WARN(LOG_TAG,
+                 "libcurl transport unavailable (curl_global_init failed, or "
+                 "built without JCE_AID_HAVE_CURL) — falling back to the "
+                 "plaintext HTTP transport. http:// localhost/LAN inference "
+                 "still works; every https:// endpoint will now fail.");
+    }
 
     /* DEBUG TOGGLES mirroring JCE_INPUT_RECORD / JCE_INPUT_REPLAY */
     {

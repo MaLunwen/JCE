@@ -85,26 +85,26 @@ JCE_API bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out
 /* Open a reusable parser context over an in-memory MP4 blob.
  * The input blob must remain valid until jce_mp4_parser_close().
  * Returns NULL on parse failure. */
-JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
+JCE_API JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
                                          JceMp4Info *out_info);
 
 JCE_API void jce_mp4_parser_close(JceMp4Parser *parser);
 
 /* Query the selected primary audio track metadata.
  * Returns false when no audio track is present. */
-bool jce_mp4_parser_get_audio_track_info(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_get_audio_track_info(const JceMp4Parser *parser,
                                          JceMp4AudioTrackInfo *out_info);
 
 /* Resolve one audio sample by index.
  * Returns false when index is out of bounds or no audio track exists. */
-bool jce_mp4_parser_get_audio_sample(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_get_audio_sample(const JceMp4Parser *parser,
                                      uint32_t sample_index,
                                      JceMp4SampleInfo *out_sample);
 
 /* Copy a single encoded audio sample into caller memory.
  * out_bytes receives the required/written byte count.
  * Returns false when buffer is too small, out of bounds, or no audio track exists. */
-bool jce_mp4_parser_copy_audio_sample(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_copy_audio_sample(const JceMp4Parser *parser,
                                       uint32_t sample_index,
                                       void *dst,
                                       size_t dst_capacity,
@@ -114,18 +114,18 @@ bool jce_mp4_parser_copy_audio_sample(const JceMp4Parser *parser,
 
 /* Query the selected primary video track metadata.
  * Returns false when no video track is present. */
-bool jce_mp4_parser_get_video_track_info(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_get_video_track_info(const JceMp4Parser *parser,
                                          JceMp4VideoTrackInfo *out_info);
 
 /* Resolve one video sample by index.
  * Returns false when index is out of bounds or no video track exists. */
-bool jce_mp4_parser_get_video_sample(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_get_video_sample(const JceMp4Parser *parser,
                                      uint32_t sample_index,
                                      JceMp4SampleInfo *out_sample);
 
 /* Copy a single encoded video sample into caller memory.
  * Returns false when buffer is too small or out of bounds. */
-bool jce_mp4_parser_copy_video_sample(const JceMp4Parser *parser,
+JCE_API bool jce_mp4_parser_copy_video_sample(const JceMp4Parser *parser,
                                       uint32_t sample_index,
                                       void *dst,
                                       size_t dst_capacity,

@@ -1,9 +1,15 @@
 /*
- * jce_i18n.c  Internationalisation implementation.
+ * jce_i18n.c  Fixed-set internationalisation implementation.
  *
  * Loads flat {"key":"value"} JSON files from the PAK archive
  * using the engine JSON facade for correct parsing (Unicode escapes,
  * nested structures, proper error handling).
+ *
+ * Every language is loaded up front and stays resident, because
+ * jce_i18n_collect_codepoints() has to report the union of all glyphs so a
+ * single font atlas can cover them.  The general, one-locale-at-a-time
+ * localization system is jce_loc_* (engine/src/middleware/ui/
+ * jce_localization.c); the header documents the boundary between them.
  */
 
 #include <jce/os/core/jce_i18n.h>
@@ -140,6 +146,14 @@ const char *jce_i18n_get(JceStringId id)
 const char *jce_i18n_lang_name(void)
 {
     return s_lang_names[s_lang];
+}
+
+const char *jce_i18n_key_name(JceStringId id)
+{
+    for (int i = 0; i < KEY_MAP_COUNT; i++) {
+        if (s_key_map[i].id == id) return s_key_map[i].key;
+    }
+    return "";
 }
 
 /* ------------------------------------------------------------------ */

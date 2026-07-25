@@ -343,6 +343,16 @@ static void build_demo_scene(void)
                  * falls/collides N bodies — the standard Bullet broadphase + solver
                  * stress.  Measured via the runtime "physics" perf-phase. */
                 const bool phys = (std::getenv("JCE_STRESS_PHYSICS") != NULL);
+                /* JCE_STRESS_PHYS_MOVERS=N: give ONLY the first N cubes a dynamic
+                 * rigidbody (the rest stay static) — a MIXED static+dynamic-caster
+                 * scene for the CSM static/dynamic shadow-separation work.  Unlike
+                 * JCE_STRESS_MOVERS (set_transform, which bumps the caster key and
+                 * is classified static), rigidbody movers mutate in place → the
+                 * shadow system's is_dyn_caster path keeps the static caster key
+                 * stable, so a static-shadow cache can actually survive their
+                 * motion.  Needs JCE_KPI_AUTOPLAY to start the simulation. */
+                const long phys_movers = std::getenv("JCE_STRESS_PHYS_MOVERS")
+                                       ? atol(std::getenv("JCE_STRESS_PHYS_MOVERS")) : 0;
                 s_suppress_add_component_log = true;
 
                 /* JCE_STRESS_TEXTURES=D: create D distinct 4x4 RGBA8 runtime
@@ -452,7 +462,7 @@ static void build_demo_scene(void)
                                 const std::string &p = tex_paths[(size_t)(spawned % (long)tex_paths.size())];
                                 snprintf(mm->albedo_tex, sizeof mm->albedo_tex, "%s", p.c_str());
                             }
-                            if (phys) {
+                            if (phys || spawned < phys_movers) {
                                 jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
                                 jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
                                 if (JceRigidBodyComponent *rb =
@@ -1218,7 +1228,22 @@ const char *jce_state_entity_prefab_path(uint32_t id)
     return m ? m->prefab_path : "";
 }
 
-JceEntity jce_state_to_ecs_entity(uint32_t id)   { return (JceEntity)id; }
+/* The editor stores 32-bit ids (audit C5-02), so a round trip through these
+ * two DISCARDS the entity generation.  That is a real limitation, not a
+ * detail: a selection held across a destroy+recreate can address the new
+ * occupant of the slot rather than reporting that the old entity is gone.
+ *
+ * What changed is that the limitation is now LOCAL.  It used to be paid by
+ * the whole engine: jce_scene_resolve_entity guessed "high bits zero means
+ * the caller stripped the generation", which is bit-identical to a valid
+ * generation-0 handle, so gameplay and network code lost dangling detection
+ * for every entity in a fresh scene too.  The engine now always checks the
+ * generation, and callers that really do hold a bare index — this one — say
+ * so explicitly. */
+JceEntity jce_state_to_ecs_entity(uint32_t id)
+{
+    return jce_scene_entity_from_index(s.scene, id);
+}
 uint32_t  jce_state_from_ecs_entity(JceEntity e) { return (uint32_t)e; }
 
 /* ── Root entity enumeration ─────────────────────────────────────── */
@@ -1250,12 +1275,37 @@ uint32_t jce_state_get_root_id(int index)
 int jce_state_get_roots(uint32_t *out, int max)
 {
     if (!s.scene || !out || max <= 0) return 0;
-    int n = 0;
-    for (uint32_t id : g_entity_order) {
-        if (n >= max) break;
-        if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
-            out[n++] = id;
+
+    /* Root-set cache (large-world editor perf).  Finding the parent-less roots
+     * scans all of g_entity_order with one jce_scene_get_parent per entity — an
+     * O(all-entities) pass the hierarchy panel runs EVERY frame.  On a 150k-entity
+     * scene that alone is ~3 ms/frame of pure editor overhead (the second-largest
+     * frame phase after scene_render).  The root SET only changes on a structural
+     * edit — create / delete / reparent — so cache it, keyed on the union of the
+     * scene's structural_epoch (bumped by reparent / add / remove / any world-
+     * matrix edit) and the editor order gen (bumped by every g_entity_order
+     * mutation).  Either counter advancing forces a rebuild; the union can only
+     * OVER-invalidate (recompute as often as today), never return a stale root.
+     * g_entity_order_gen is globally monotonic, so the pair also differs after a
+     * scene switch even if the new scene's epoch coincides with the old one. */
+    static std::vector<uint32_t> s_roots_cache;
+    static uint64_t s_roots_struct = UINT64_MAX;
+    static uint64_t s_roots_order  = UINT64_MAX;
+    const uint64_t se = jce_scene_get_structural_epoch(s.scene);
+    const uint64_t oe = g_entity_order_gen;
+    if (s_roots_struct != se || s_roots_order != oe) {
+        s_roots_cache.clear();
+        for (uint32_t id : g_entity_order)
+            if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
+                s_roots_cache.push_back(id);
+        s_roots_struct = se;
+        s_roots_order  = oe;
     }
+
+    int n = 0;
+    const int cap = (int)s_roots_cache.size();
+    for (int i = 0; i < cap && n < max; i++)
+        out[n++] = s_roots_cache[i];
     return n;
 }
 
@@ -1346,6 +1396,7 @@ void jce_state_delete_entity(uint32_t id)
  *   2 Triangle (scatter sphere)        3 Entity Count (grid + ECS spin)
  *   4 Physics (grid + dynamic rigid body). */
 extern "C" int jce_scene_stress_spin_runtime;
+extern "C" unsigned int jce_scene_stress_spin_root;
 static uint32_t s_bench_root    = 0;
 static uint32_t s_bench_spawned = 0;
 static int      s_bench_kind    = -1;
@@ -1365,6 +1416,7 @@ extern "C" void jce_state_benchmark_clear(void)
     s_bench_spawned = 0;
     s_bench_kind    = -1;
     jce_scene_stress_spin_runtime = 0;
+    jce_scene_stress_spin_root    = 0u;
     /* Restore the JCE_PERF_LOG latch instead of hard-off: a plain 0 here
      * permanently silenced the log's phase line for the rest of the session
      * (the env latch never re-arms). */
@@ -1464,6 +1516,17 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
                     mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
                     mm->base_color[2] = 0.15f + 0.7f * (float)((spawned * 71) % 107) / 107.0f;
                     mm->base_color[3] = 1.0f;
+                    /* Vary roughness+metallic, not just base_color: base_color rides
+                     * the per-instance tint (i_data4) so the instancers merge it away
+                     * (a "unique colour" grid actually collapses to one instanced
+                     * batch).  roughness/metallic fold into the material KEY instead,
+                     * giving each cube a genuinely distinct material the instancers
+                     * cannot merge — so the "Draw Call" workload lives up to its name:
+                     * N unbatchable solo submits = the true CPU draw-call submission
+                     * floor, the axis Unity/UE draw-call benchmarks actually measure
+                     * (a colour-only grid measures instanced throughput instead). */
+                    mm->roughness = 0.05f + 0.9f * (float)((spawned * 53) % 991) / 991.0f;
+                    mm->metallic  = (float)((spawned * 29) % 251) / 251.0f;
                 }
                 if (phys) {
                     jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
@@ -1484,7 +1547,12 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
 
     s_suppress_add_component_log = prev_suppress;
     s_bench_kind = kind;
-    if (kind == 3) jce_scene_stress_spin_runtime = 1;   /* Entity Count = per-frame spin */
+    if (kind == 3) {
+        jce_scene_stress_spin_runtime = 1;   /* Entity Count = per-frame spin */
+        jce_scene_stress_spin_root    = s_bench_root;  /* move ONLY the benchmark's
+                                                        * own entities, not the
+                                                        * real authored scene */
+    }
     jce_perf_phase_set_enabled(1);   /* capture CPU phases for the live readout */
 }
 
@@ -1595,31 +1663,10 @@ void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 
     if (!s.scene || id == 0 || id == new_parent) return;
     if (!jce_state_entity_exists(id)) return;
-
-    /* Cycle detection: ensure new_parent is not a descendant of id. */
-    uint32_t check = new_parent;
-    while (check != 0) {
-        if (check == id) return;
-        check = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)check);
-    }
-
-    /* Preserve the child's WORLD pose across the reparent: capture it before
-       changing the parent, then back-solve a new LOCAL transform relative to
-       the new parent so the object does not visually jump. */
-    jce_mat4 child_world = jce_scene_get_world_matrix(s.scene, (JceEntity)id);
-
-    jce_scene_set_parent(s.scene, (JceEntity)id,
-                         new_parent != 0 ? (JceEntity)new_parent : JCE_ENTITY_INVALID);
-
-    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
-    if (t) {
-        jce_mat4 parent_world = (new_parent != 0)
-            ? jce_scene_get_world_matrix(s.scene, (JceEntity)new_parent)
-            : jce_m4_identity();
-        jce_mat4 inv   = jce_m4_inverse(&parent_world);
-        jce_mat4 local = jce_m4_multiply(&inv, &child_world);
-        jce_m4_decompose(&local, &t->position, &t->rotation, &t->scale);
-    }
+    jce_scene_reparent(s.scene, (JceEntity)id,
+                       new_parent != 0 ? (JceEntity)new_parent
+                                       : JCE_ENTITY_INVALID,
+                       true);
 }
 
 void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,

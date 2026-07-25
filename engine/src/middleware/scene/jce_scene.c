@@ -15,6 +15,7 @@
 #include <flecs.h>
 #include <string.h>
 #include <stdlib.h>   /* getenv — JCE_DISABLE_XGEN kill-switch */
+#include <math.h>     /* sinf/cosf — bounded orbit for the #4 entity-count spin */
 
 #define LOG_TAG "scene"
 
@@ -22,6 +23,11 @@
  * the per-frame JceTransform integrate in jce_scene_update without a relaunch
  * (the JCE_STRESS_SPIN env is the headless equivalent). */
 int jce_scene_stress_spin_runtime = 0;
+/* Entity-count BENCHMARK root: when non-zero the stress-spin integrate moves
+ * ONLY this root's descendants (the benchmark's own spawned entities), so the
+ * real authored scene's models are never dragged around by the test.  0 = move
+ * everything (the raw env JCE_STRESS_SPIN dev throughput path). */
+unsigned int jce_scene_stress_spin_root = 0u;
 
 /* Implemented in jce_scene_video.c — installs flecs lifecycle hooks
  * (ctor/dtor/copy/move) on the VideoPlayer component so its decoder handle
@@ -192,6 +198,10 @@ struct JceScene {
     ecs_query_t *each_query;    /* cached; created lazily in jce_scene_each_entity
                                  * (leak fix: was ecs_query()+ecs_query_fini() on
                                  * EVERY call, 4-5x/frame in Play → unbounded) */
+    ecs_query_t *spin_query;    /* stress-spin (entity-count benchmark) integrate:
+                                 * JceTransform WITHOUT Camera / CharacterController
+                                 * so the view-driving entities are never moved by
+                                 * the benchmark (else the game-view follow drifts). */
     uint64_t      world_epoch;  /* bumped per frame to invalidate the world-matrix cache */
     JceWorldCache world_cache;  /* per-entity world matrix memo (side table) */
     /* Structural epoch: bumped ONLY on real structural edits (a set_transform /
@@ -731,6 +741,7 @@ void jce_scene_destroy(JceScene *s)
     jce_scene_particles_shutdown(s);                    /* free lazy particle sys */
     if (s->cloth_query) ecs_query_fini(s->cloth_query); /* before world fini */
     if (s->each_query)  ecs_query_fini(s->each_query);  /* before world fini */
+    if (s->spin_query)  ecs_query_fini(s->spin_query);  /* before world fini */
     if (s->world) ecs_fini(s->world);
     if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
     if (s->xgen) JCE_FREE(s->xgen);
@@ -878,9 +889,9 @@ void jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name)
 
 /* ── Parent / child hierarchy ──────────────────────────────────────── */
 
-void jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent)
+static void scene_set_parent_unchecked(JceScene *s, JceEntity child,
+                                       JceEntity parent)
 {
-    if (!s || child == JCE_ENTITY_INVALID) return;
     if (parent == JCE_ENTITY_INVALID) {
         /* Remove parent (make root entity). */
         ecs_entity_t cur = ecs_get_parent(s->world, (ecs_entity_t)child);
@@ -896,6 +907,11 @@ void jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent)
     jce_scene_invalidate_world_cache(s);
 }
 
+void jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent)
+{
+    (void)jce_scene_reparent(s, child, parent, false);
+}
+
 JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return JCE_ENTITY_INVALID;
@@ -907,6 +923,17 @@ JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e)
     return (JceEntity)p;
 }
 
+static JcePivotComponent *scene_active_pivot(JceScene *s, JceEntity e)
+{
+    JcePivotComponent *p = jce_scene_get_pivot(s, e);
+    if (p) {
+        static int s_pivot_cid = -2;
+        if (s_pivot_cid == -2) s_pivot_cid = jce_component_find("Pivot");
+        if (s_pivot_cid >= 0 && !jce_scene_comp_enabled(s, e, s_pivot_cid)) p = NULL;
+    }
+    return p;
+}
+
 /* Local TRS matrix for one entity (scale-0 components default to 1). */
 static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
 {
@@ -915,12 +942,7 @@ static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
     jce_mat4 local = jce_m4_from_trs(t->position, t->rotation,
                                      jce_v3_safe_scale(t->scale));
 
-    JcePivotComponent *p = jce_scene_get_pivot(s, e);
-    if (p) {   /* honour the per-component disable (only pay the lookup when a pivot exists) */
-        static int s_pivot_cid = -2;
-        if (s_pivot_cid == -2) s_pivot_cid = jce_component_find("Pivot");
-        if (s_pivot_cid >= 0 && !jce_scene_comp_enabled(s, e, s_pivot_cid)) p = NULL;
-    }
+    JcePivotComponent *p = scene_active_pivot(s, e);
     if (p && (p->local_position.x != 0.0f ||
               p->local_position.y != 0.0f ||
               p->local_position.z != 0.0f)) {
@@ -1359,6 +1381,78 @@ jce_mat4 jce_scene_get_world_matrix(const JceScene *s, JceEntity e)
     return scene_world_matrix_memo(ms, e, 0);
 }
 
+static bool scene_parent_chain_accepts(const JceScene *s, JceEntity child,
+                                       JceEntity parent)
+{
+    JceEntity slow = parent;
+    JceEntity fast = parent;
+
+    while (slow != JCE_ENTITY_INVALID) {
+        if (slow == child)
+            return false;
+        slow = jce_scene_get_parent(s, slow);
+
+        for (int step = 0; step < 2 && fast != JCE_ENTITY_INVALID; step++) {
+            if (fast == child)
+                return false;
+            fast = jce_scene_get_parent(s, fast);
+        }
+
+        if (slow != JCE_ENTITY_INVALID && slow == fast)
+            return false;
+    }
+
+    return true;
+}
+
+bool jce_scene_reparent(JceScene *s, JceEntity child, JceEntity parent,
+                        bool preserve_world)
+{
+    if (!s || child == JCE_ENTITY_INVALID ||
+        !ecs_is_alive(s->world, (ecs_entity_t)child))
+        return false;
+    if (parent != JCE_ENTITY_INVALID &&
+        !ecs_is_alive(s->world, (ecs_entity_t)parent))
+        return false;
+    if (child == parent)
+        return false;
+    if (!scene_parent_chain_accepts(s, child, parent))
+        return false;
+
+    if (jce_scene_get_parent(s, child) == parent)
+        return true;
+
+    JceTransform *current = jce_scene_get_transform(s, child);
+    bool solve_local = preserve_world && current != NULL;
+    JceTransform next = solve_local ? *current : (JceTransform){0};
+    jce_mat4 child_world = solve_local
+        ? jce_scene_get_world_matrix(s, child)
+        : jce_m4_identity();
+
+    scene_set_parent_unchecked(s, child, parent);
+
+    if (solve_local) {
+        jce_mat4 parent_world = parent != JCE_ENTITY_INVALID
+            ? jce_scene_get_world_matrix(s, parent)
+            : jce_m4_identity();
+        jce_mat4 inv_parent = jce_m4_inverse(&parent_world);
+        jce_mat4 local_model = jce_m4_multiply(&inv_parent, &child_world);
+        JcePivotComponent *pivot = scene_active_pivot(s, child);
+        if (pivot && (pivot->local_position.x != 0.0f ||
+                      pivot->local_position.y != 0.0f ||
+                      pivot->local_position.z != 0.0f)) {
+            jce_mat4 pivot_offset = jce_m4_translate(pivot->local_position);
+            local_model = jce_m4_multiply(&local_model, &pivot_offset);
+        }
+
+        jce_m4_decompose(&local_model, &next.position, &next.rotation,
+                         &next.scale);
+        jce_scene_set_transform(s, child, &next);
+    }
+
+    return true;
+}
+
 static jce_vec3 scene_transform_point(const jce_mat4 *m, jce_vec3 p)
 {
     jce_vec4 v = jce_m4_mul_v4(m, jce_v4(p.x, p.y, p.z, 1.0f));
@@ -1501,12 +1595,43 @@ int jce_scene_get_child_count(const JceScene *s, JceEntity parent)
  * the live entity (ecs_is_alive false) and selection/has-component fail.  Ids
  * that already carry a generation (high bits set) pass through unchanged, so
  * engine-internal callers are byte-identical to before. */
+/* Resolve a caller-supplied handle to a LIVE entity, or 0.
+ *
+ * This used to guess from the bit pattern: "high 32 bits zero => the caller
+ * stripped the generation, so look up whoever is in that slot now".  That
+ * guess is unsound, because a FIRST-GENERATION entity has generation 0 — its
+ * full, correct handle is bit-identical to a bare index.  So every gen-0
+ * handle took the stripped path and resolved through ecs_get_alive(), which
+ * answers "who lives at this index" rather than "is this still the same
+ * entity".  Destroy an entity, let flecs recycle its index, and a stale
+ * handle to it silently resolved to the NEW occupant: reads returned another
+ * entity's components and, worse, jce_scene_set_* wrote to it.  Gen-0 covers
+ * every entity in a scene that has not recycled yet, i.e. most of them.
+ *
+ * Now the generation is always checked.  ecs_is_alive() compares the full id
+ * including generation, so a recycled slot rejects the old handle even when
+ * the old generation was 0.  Callers that genuinely hold only an index must
+ * say so via jce_scene_entity_from_index(), which documents that it cannot
+ * detect staleness. */
 static ecs_entity_t jce_scene_resolve_entity(const JceScene *s, JceEntity e)
 {
     if (!s || e == 0) return 0;
-    if ((uint32_t)e == (ecs_entity_t)e)            /* high bits zero => bare index */
-        return ecs_get_alive(s->world, (ecs_entity_t)e);
-    return (ecs_entity_t)e;
+    const ecs_entity_t id = (ecs_entity_t)e;
+    return ecs_is_alive(s->world, id) ? id : 0;
+}
+
+bool jce_scene_entity_alive(const JceScene *s, JceEntity e)
+{
+    return jce_scene_resolve_entity(s, e) != 0;
+}
+
+JceEntity jce_scene_entity_from_index(const JceScene *s, uint32_t index)
+{
+    if (!s || index == 0) return 0;
+    /* ecs_get_alive() answers "which live entity occupies this index", which
+     * is all an index can support — see the header for why that is not a
+     * dangling check. */
+    return (JceEntity)ecs_get_alive(s->world, (ecs_entity_t)index);
 }
 
 #define JCE_COMP_IMPL(TYPE, NAME)                                       \
@@ -2368,29 +2493,107 @@ void jce_scene_update(JceScene *s, float dt)
      * entity with a JceTransform and integrate it (the standard flecs N-entity
      * Transform/Velocity throughput test) — pure component read+write over the
      * flecs storage, measured via the "ecs_move" perf-phase.  Off by default
-     * (env unset) → zero cost.  Does not invalidate the world cache: the metric
-     * is raw ECS iteration throughput, not the rendered result. */
+     * (env unset) → zero cost.
+     *
+     * Two callers, two visibility contracts:
+     *   • headless env JCE_STRESS_SPIN (bench_root == 0): does NOT invalidate the
+     *     world cache — the metric is raw ECS iteration throughput, not the
+     *     rendered result, so the persistent static render caches stay warm.
+     *   • the editor "Entity Count" benchmark (bench_root != 0): the spawned
+     *     cubes are plain STATIC MeshRenderers (no rigidbody), so the renderer
+     *     keeps them in its cross-frame persistent static world cache and draws
+     *     STALE matrices — the Transforms update (visible on select) but the
+     *     render is frozen.  After the in-place integrate we bump structural_
+     *     epoch once (jce_scene_invalidate_world_cache — the same pattern the
+     *     floating-origin rebase uses after ITS in-place bulk move) so the static
+     *     world cache + collect-list freeze drop and every visible entity
+     *     recomposes its world matrix from the updated Transforms. */
     {
         static int s_spin = -1;
         if (s_spin < 0) { const char *e = getenv("JCE_STRESS_SPIN");
                           s_spin = (e && e[0] && e[0] != '0') ? 1 : 0; }
         if (s_spin || jce_scene_stress_spin_runtime) {
             uint64_t _t0 = jce_time_perf_counter();
-            if (!s->each_query) {
-                s->each_query = ecs_query(s->world, {
-                    .terms = {{ .id = ecs_id(JceTransform) }}
+            if (!s->spin_query) {
+                /* Move every JceTransform EXCEPT the entities that drive the
+                 * view (Camera / CharacterController): the benchmark is a raw
+                 * N-entity throughput test and must not translate the player /
+                 * camera, or the game-view third-person follow drifts steadily
+                 * in +X/+Y (the integrate direction) as reported. */
+                s->spin_query = ecs_query(s->world, {
+                    .terms = {
+                        { .id = ecs_id(JceTransform) },
+                        { .id = ecs_id(JceCameraComponent),
+                          .oper = EcsNot },
+                        { .id = ecs_id(JceCharacterControllerComponent),
+                          .oper = EcsNot },
+                    }
                 });
             }
-            if (s->each_query) {
-                ecs_iter_t it = ecs_query_iter(s->world, s->each_query);
+            if (s->spin_query) {
+                /* Benchmark scoping: when the entity-count benchmark set a root,
+                 * integrate ONLY entities under it (walk the ChildOf chain, the
+                 * same way the editor's bench_root_of does).  This is what stops
+                 * the REAL scene's textured models from translating away while
+                 * the benchmark runs; env JCE_STRESS_SPIN (root 0) still moves
+                 * everything. */
+                const uint32_t bench_root = jce_scene_stress_spin_root;
+                int moved = 0;
+                /* Bounded orbit velocity: integrating sin/cos over time keeps each
+                 * cube's accumulated offset within ~±1–2 units of where it spawned
+                 * (∫sin dt = 1−cos ∈ [0,2]), so the grid gently orbits + spins in
+                 * PLACE.  The old raw `position += dt` accumulated unbounded, and
+                 * combined with the root being spun too it smeared the group into
+                 * a spiral — that is the "扭曲伸展" (twist/stretch) seen on the
+                 * selection outline.  sin/cos are evaluated once per frame here,
+                 * not per entity, so the ecs_move throughput cost is unchanged. */
+                static float s_spin_phase = 0.0f;
+                s_spin_phase += dt;
+                const float vx = sinf(s_spin_phase);
+                const float vy = cosf(s_spin_phase);
+                ecs_iter_t it = ecs_query_iter(s->world, s->spin_query);
                 while (ecs_query_next(&it)) {
                     JceTransform *xf = ecs_field(&it, JceTransform, 0);
                     for (int i = 0; i < it.count; i++) {
-                        xf[i].position.x += dt;          /* velocity integrate */
-                        xf[i].position.y += dt * 0.5f;
-                        xf[i].rotation.y += dt;          /* angular integrate  */
+                        const uint32_t ent = (uint32_t)it.entities[i];
+                        if (bench_root) {
+                            /* Anchor the group root itself — spinning BOTH the
+                             * root and its children compounded (parent∘child) into
+                             * the spiral distortion.  Move strict descendants. */
+                            if (ent == bench_root) continue;
+                            uint32_t p = ent;
+                            int under = 0;
+                            for (int g = 0; p && g < 64; ++g) {
+                                if (p == bench_root) { under = 1; break; }
+                                uint32_t np =
+                                    (uint32_t)jce_scene_get_parent(s, (JceEntity)p);
+                                if (np == 0u || np == (uint32_t)JCE_ENTITY_INVALID)
+                                    break;
+                                p = np;
+                            }
+                            if (!under) continue;
+                        }
+                        xf[i].position.x += vx * dt;     /* bounded orbit  */
+                        xf[i].position.y += vy * dt * 0.5f;
+                        xf[i].rotation.y += dt;          /* spin in place  */
+                        if (xf[i].rotation.y > 6.2831853f)
+                            xf[i].rotation.y -= 6.2831853f;
+                        moved = 1;
                     }
                 }
+                /* Editor "Entity Count" benchmark: the cubes are plain STATIC
+                 * MeshRenderers, so the renderer caches their world matrices in
+                 * its cross-frame persistent static cache (keyed on structural_
+                 * epoch + per-entity xform_gen).  The in-place integrate above
+                 * bumps NEITHER key, so the cache serves stale matrices and the
+                 * render is frozen even though the Transforms update.  Bump
+                 * structural_epoch once for the whole batch (the proven pattern
+                 * jce_scene_apply_world_shift_impl uses after its in-place bulk
+                 * move): it invalidates the static world cache + the collect-list
+                 * freeze so every visible entity recomposes from the updated
+                 * Transforms and the cubes visibly move.  Headless env path
+                 * (bench_root == 0) stays raw so its ecs_move number is unchanged. */
+                if (bench_root && moved) jce_scene_invalidate_world_cache(s);
             }
             jce_perf_phase_add("ecs_move",
                                jce_time_perf_to_ms(_t0, jce_time_perf_counter()));

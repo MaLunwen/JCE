@@ -69,7 +69,7 @@ static void ensure_uniforms(void)
         uint32_t white = 0xFFFFFFFF;
         const bgfx_memory_t *mem = bgfx_copy(&white, 4);
         s_white_tex = bgfx_create_texture_2d(1, 1, false, 1,
-                                              BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                              BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     /* 1x1 flat normal fallback (128, 128, 255, 255). */
@@ -77,7 +77,7 @@ static void ensure_uniforms(void)
         uint8_t normal_data[4] = { 128, 128, 255, 255 };
         const bgfx_memory_t *mem = bgfx_copy(normal_data, 4);
         s_flat_normal_tex = bgfx_create_texture_2d(1, 1, false, 1,
-                                                    BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                                    BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     s_uniforms_init = true;
@@ -378,6 +378,41 @@ void jce_pbr_material_shutdown(void)
 }
 
 /* ================================================================== */
+/* Material texture keys (single authority)                            */
+/* ================================================================== */
+
+/* Per-slot .mat.json key list: index 0 is the canonical key that
+ * jce_pbr_material_save_json writes, the rest are aliases the loader also
+ * accepts, in the order it tries them.  Every consumer that has to find a
+ * texture reference inside a .mat.json goes through
+ * jce_pbr_material_texture_keys() instead of hard-coding its own spellings:
+ * the editor's material preview used to carry a DIFFERENT albedo alias list
+ * (baseColorMap / diffuseMap / mainTexture), so a preview could resolve a
+ * texture this loader never read for the very same file, and the bundle
+ * packer (jce_bundle_deps.c kAssetKeys) cooked those aliases into the PAK
+ * where the runtime then ignored them. */
+static const char *const kAlbedoKeys[] = {
+    "albedoMap", "baseColorMap", "diffuseMap", "mainTexture", NULL
+};
+static const char *const kMetalRoughKeys[] = {
+    "metallicRoughnessMap", "metallicMap", NULL
+};
+static const char *const kNormalKeys[]   = { "normalMap", NULL };
+static const char *const kAoKeys[]       = { "aoMap", "occlusionMap", NULL };
+static const char *const kEmissiveKeys[] = { "emissiveMap", "emissionMap", NULL };
+
+static const char *const *const kTexKeys[5] = {
+    kAlbedoKeys, kMetalRoughKeys, kNormalKeys, kAoKeys, kEmissiveKeys
+};
+
+const char *const *jce_pbr_material_texture_keys(int slot)
+{
+    if (slot < 0 || slot >= 5)
+        return NULL;
+    return kTexKeys[slot];
+}
+
+/* ================================================================== */
 /* Load .mat.json                                                      */
 /* ================================================================== */
 
@@ -412,21 +447,22 @@ static bool pbr_material_load_json(const JceFileSystem *fs, const char *path,
     JceJson *props_obj = jce_json_get(root, "properties");
     JceJson *props = jce_json_is_object(props_obj) ? props_obj : root;
 
-    /* Texture paths (primary keys + fallback aliases). */
-    const char *tex_keys[5] = {
-        "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
-    };
-    const char *tex_keys_alt[5] = {
-        NULL, "metallicMap", NULL, "occlusionMap", "emissionMap"
-    };
+    /* Texture paths: try every key the slot accepts (canonical first, then
+     * aliases — see kTexKeys) under "properties", then again at the root.
+     * An empty string counts as absent so a blank primary key falls through
+     * to its aliases instead of masking them. */
     for (int i = 0; i < 5; i++) {
-        const char *v = json_string(props, tex_keys[i]);
-        if (!v && tex_keys_alt[i])
-            v = json_string(props, tex_keys_alt[i]);
+        const char *const *keys = jce_pbr_material_texture_keys(i);
+        const char *v = NULL;
+        for (int k = 0; keys[k] && !v; k++) {
+            const char *s = json_string(props, keys[k]);
+            if (s && s[0]) v = s;
+        }
         if (!v && props != root) {
-            v = json_string(root, tex_keys[i]);
-            if (!v && tex_keys_alt[i])
-                v = json_string(root, tex_keys_alt[i]);
+            for (int k = 0; keys[k] && !v; k++) {
+                const char *s = json_string(root, keys[k]);
+                if (s && s[0]) v = s;
+            }
         }
         if (v) safe_copy(out_tex_paths[i], 256, v);
     }
@@ -529,13 +565,13 @@ bool jce_pbr_material_save_json(const char *path,
 
     jce_json_set_string(root, "type", "pbr");
 
-    /* Texture paths. */
-    const char *tex_keys[5] = {
-        "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
-    };
+    /* Texture paths — always the CANONICAL key of each slot (index 0 of the
+     * loader's alias list, so save and load can never drift apart); aliases
+     * read on load are normalised away and never written back out. */
     for (int i = 0; i < 5; i++) {
         if (tex_paths[i][0])
-            jce_json_set_string(root, tex_keys[i], tex_paths[i]);
+            jce_json_set_string(root, jce_pbr_material_texture_keys(i)[0],
+                                tex_paths[i]);
     }
 
     /* Base color factor. */

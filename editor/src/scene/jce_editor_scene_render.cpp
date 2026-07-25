@@ -13,6 +13,7 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_scene_content_context.h"
 #include "jce_scene_render_internal.h"
+#include "jce_editor_viewport_common.h"   /* plumbing shared with the Game View */
 #include "core/jce_assetdb.h"
 #include "core/jce_editor_project.h"
 #include "ui/jce_editor_panels.h"
@@ -25,14 +26,12 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_taa.h>   /* TSR jitter (Halton) for temporal upscale */
+#include <jce/os/core/jce_console.h>   /* r.upscaler live cvar (Off/RCAS/TSR) */
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>   /* jce_renderer_request_screenshot_fbo */
 #include <jce/renderer/jce_render_settings.h>   /* grass_enabled project gate (Stage 1b.6) */
 #include <jce/renderer/jce_volumetric_fog.h>
-
-bool jce_editor_lighting_get_fog_enabled(void);
-void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
-void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
 
 /* ── State instance (shared via extern in internal header) ────────── */
@@ -322,6 +321,17 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         return false;
     }
 
+    /* Native-resolution upscale target for the dynamic-resolution RCAS resolve.
+     * Its own view (base+POST_BASE+23 = 46) sits after the postfx composite (+21)
+     * and canvas UI (+22) and before the screenshot readback (+24), so the
+     * resolve reads the fully composited bridge. Non-fatal: absence just falls
+     * back to ImGui bilinear upscale. */
+    s_sr.present = jce_offscreen_target_create(
+        renderer, (uint16_t)(JCE_VIEW_EDITOR_SCENE + JCE_VIEW_POST_BASE + 23));
+    s_sr.present_tex = UINT16_MAX;
+    if (!s_sr.present)
+        LOG_WARN(LOG_TAG, "failed to create editor upscale target (RCAS disabled)");
+
     JceGfxCaps caps = jce_gfx_caps();
     s_sr.homogeneous_depth = caps.homogeneous_depth;
 
@@ -339,6 +349,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.camera = jce_camera_create(&cam_desc);
     if (!s_sr.camera) {
         LOG_WARN(LOG_TAG, "failed to create editor camera");
+        if (s_sr.present) { jce_offscreen_target_destroy(s_sr.present); s_sr.present = NULL; }
         if (s_sr.bridge) {
             jce_offscreen_target_destroy(s_sr.bridge);
             s_sr.bridge = NULL;
@@ -408,6 +419,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     if (!s_sr.scene_renderer) {
         LOG_WARN(LOG_TAG, "failed to create engine scene renderer");
         if (s_sr.camera) { jce_camera_destroy(s_sr.camera); s_sr.camera = NULL; }
+        if (s_sr.present) { jce_offscreen_target_destroy(s_sr.present); s_sr.present = NULL; }
         if (s_sr.bridge) { jce_offscreen_target_destroy(s_sr.bridge); s_sr.bridge = NULL; }
         jce_editor_scene_asset_cache_shutdown();
         return false;
@@ -443,25 +455,16 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
      * Opt-OUT via JCE_DISABLE_OCCLUSION=1 (A/B measurement + safety toggle) —
      * mirrors the game-view path so the documented toggle disables BOTH editor
      * viewports, not just Play. */
-    {
-        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
-        const bool occlusion_off = (dis && dis[0] && dis[0] != '0');
-        if (occlusion_off) {
-            s_sr.occlusion_culler = NULL;
-            LOG_INFO(LOG_TAG,
-                "JCE_DISABLE_OCCLUSION set — scene-view occlusion culling OFF");
-        } else {
-            JceShaderSet oc_shaders;
-            memset(&oc_shaders, 0, sizeof(oc_shaders));
-            JceShaderHandle ch = jce_renderer_get_program_color(renderer);
-            oc_shaders.color.idx = ch.idx;
-
-            JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
-            oc_cfg.query_pool_share_count = 2;
-            s_sr.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
-            if (!s_sr.occlusion_culler)
-                LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
-        }
+    if (jce_editor_viewport_occlusion_disabled()) {
+        s_sr.occlusion_culler = NULL;
+        LOG_INFO(LOG_TAG,
+            "JCE_DISABLE_OCCLUSION set — scene-view occlusion culling OFF");
+    } else {
+        /* Default proxy view; the game view creates its own on a distinct one. */
+        s_sr.occlusion_culler =
+            jce_editor_viewport_create_occlusion_culler(renderer, -1);
+        if (!s_sr.occlusion_culler)
+            LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
     }
 
     /* World streamer: built from the scene's authored streaming settings
@@ -504,6 +507,11 @@ void jce_editor_scene_render_shutdown(void)
     }
 
     jce_editor_scene_asset_cache_shutdown();
+
+    if (s_sr.present) {
+        jce_offscreen_target_destroy(s_sr.present);
+        s_sr.present = NULL;
+    }
 
     if (s_sr.bridge) {
         jce_offscreen_target_destroy(s_sr.bridge);
@@ -652,7 +660,12 @@ void jce_editor_scene_render_streaming_rebuild(void)
         LOG_WARN(LOG_TAG, "world-streaming preview: no asset root resolved");
         return;
     }
-    jce_fs_mount_dir(fs, "", base);
+    if (!jce_fs_mount_dir(fs, "", base)) {
+        jce_fs_destroy(fs);
+        LOG_WARN(LOG_TAG, "world-streaming preview: cannot mount asset root '%s'",
+                 base);
+        return;
+    }
 
     JceWorldStreamConfig wsc = jce_world_stream_config_default();
     wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR
@@ -665,7 +678,13 @@ void jce_editor_scene_render_streaming_rebuild(void)
 
     /* Async chunk loads: disk read + JSON staging off-thread; the apply/spawn
      * stays time-sliced on the main thread (jce_world_streamer_update).  Web
-     * has no real threads, so keep the cooperative single-thread path there. */
+     * has no real threads, so keep the cooperative single-thread path there.
+     *
+     * Private for the same reason as the Play streamer (jce_editor_play.cpp):
+     * a whole-file chunk read on the shared pool becomes something the scene
+     * view's own per-frame parallel_for can be handed mid-wait.  This preview
+     * streamer is the one that runs while the viewport is live, so it is the
+     * one that would show the hitch. */
     JceThreadPool *pool = NULL;
 #if !JCE_PLATFORM_WEB
     /* Bench/diagnostic toggle (M2 A/B): mirror the editor-Play JCE_STREAM_SYNC
@@ -730,6 +749,71 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 {
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
+
+    /* iGPU ADAPTIVE dynamic resolution (editor scene view): steer the 3D render
+     * scale from the LAST frame's measured GPU time (Unity DynamicResolution /
+     * UE dynamic-res).  A light scene rides the scale back to 1.0 (crisp); only a
+     * genuinely GPU-bound frame downscales, at ANY panel size.  The smaller color
+     * target is upscaled by the panel's ImGui::Image (uv=1.0, target sized exactly
+     * to the render); disp_w/disp_h keep the NATIVE size for the on-demand full-
+     * res PICK pass, so click->entity stays pixel-exact regardless of scale (pick
+     * coords are avail-space).  width/height below become the reduced RENDER size
+     * (color target + cfg viewport; camera aspect stays proportional).
+     *
+     * FLICKER GUARD (this is an editing surface): a WIDE dead zone [0.70*target,
+     * target] plus small ASYMMETRIC steps — shrink quickly to relieve a hitch,
+     * grow slowly — so the viewport settles instead of hunting while orbiting.
+     * Gizmos/grid composite into the color target and soften when scaled (accepted
+     * for FPS).  iGPU MEDIUM only; discrete GPUs render 1:1.  JCE_DYNRES=0 forces
+     * native; JCE_DYNRES_SCALE=<0.25..1> pins a fixed scale (QA / A-B). */
+    const uint32_t disp_w = width, disp_h = height;
+    if (jce_renderer_get_tier() == JCE_GPU_TIER_MEDIUM &&
+        !jce_renderer_get_recommendation().has_discrete_gpu) {
+        static int   s_mode  = -1;    /* -1 unresolved, 0 off, 1 adaptive, 2 fixed */
+        static float s_fixed = 1.0f;
+        if (s_mode < 0) {
+            s_mode = 1;
+            if (const char *d = getenv("JCE_DYNRES")) { if (d[0] == '0') s_mode = 0; }
+            if (const char *fs = getenv("JCE_DYNRES_SCALE")) {
+                float v = (float)atof(fs);
+                if (v >= 0.25f && v <= 1.0f) { s_mode = 2; s_fixed = v; }
+            }
+        }
+        /* s_scale is QUANTIZED to 0.1 steps and only moves on SUSTAINED load, so
+         * a transient GPU spike never resizes the target (each resize is a RT
+         * realloc = a hitch).  This is the anti-flicker/anti-hitch core: the
+         * viewport holds a stable resolution and steps only when the load is
+         * genuinely sustained, then settles. */
+        static float s_scale = 1.0f;
+        static int   s_over = 0, s_under = 0;
+        if (s_mode == 2) {
+            s_scale = s_fixed;
+        } else if (s_mode == 1) {
+            JceGpuStats gs;
+            if (jce_renderer_get_gpu_stats(&gs) && gs.valid && gs.gpu_ms > 0.01) {
+                const double target = 16.0;           /* ~60 FPS whole-frame GPU */
+                const double lo     = target * 0.65;  /* grow only well below     */
+                if (gs.gpu_ms > target)  { s_over++;  s_under = 0; }
+                else if (gs.gpu_ms < lo) { s_under++; s_over  = 0; }
+                else                     { s_over = 0; s_under = 0; } /* dead zone: hold */
+                /* 3 sustained over-target frames shrink a step; 12 sustained
+                 * under-lo frames grow one back (asymmetric: quick to relieve a
+                 * real hitch, slow to restore res so a light scene doesn't hunt). */
+                if (s_over >= 3 && s_scale > 0.551f)       { s_scale -= 0.1f; s_over = 0; }
+                else if (s_under >= 12 && s_scale < 0.999f) { s_scale += 0.1f; s_under = 0; }
+                if (s_scale < 0.55f) s_scale = 0.55f;
+                if (s_scale > 1.0f)  s_scale = 1.0f;
+            }
+        } else {
+            s_scale = 1.0f;
+        }
+        if (s_scale < 0.999f) {
+            uint32_t nw = (uint32_t)((float)width * s_scale);
+            uint32_t nh = (uint32_t)((float)height * s_scale);
+            if (nw >= 16u && nh >= 16u) { width = nw; height = nh; }
+        }
+    }
+
     s_cap_w = (uint16_t)width;
     s_cap_h = (uint16_t)height;
 
@@ -752,6 +836,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     s_sr.viewport_height = height;
     s_sr.camera_cache_valid = false;
     s_sr.postfx_output_tex = UINT16_MAX;
+    s_sr.present_tex = UINT16_MAX;
 
     uint64_t now_ticks = jce_time_perf_counter();
     float dt_sec = 0.0f;
@@ -822,6 +907,68 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
          * skinned characters stop ghosting. */
         jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, taa_on);
     }
+
+    /* TSR (JCE_TSR=1): temporal super-resolution upscale of the dynamic-resolution
+     * render. Jitter the colour projection ourselves (Halton) even though TAA is
+     * off on the iGPU, so successive low-res frames carry distinct sub-pixel
+     * offsets to accumulate into a native-res history. v1 accumulates across a
+     * STATIC view only: feedback -> 0 whenever the clean view/proj changes (no
+     * motion reprojection yet), so history is only trusted pixel-for-pixel. Only
+     * when dynres is downscaling and TAA isn't already jittering. Opt-in; RCAS
+     * stays the default upscale. */
+    /* r.upscaler (LIVE): 0=Off/bilinear, 1=RCAS, 2=TSR. Read the cvar each frame
+     * so the Render Pipeline panel dropdown A/Bs instantly on the same scene.
+     * JCE_TSR / JCE_RCAS env forced the boot value at cvar registration. */
+    static JceCvar *s_cv_up = NULL;
+    static bool     s_cv_up_tried = false;
+    if (!s_cv_up_tried) { s_cv_up = jce_cvar_find("r.upscaler"); s_cv_up_tried = true; }
+    int   upscaler     = s_cv_up ? jce_cvar_get_int(s_cv_up) : 1;
+    bool  tsr_active   = false;
+    float tsr_jit_u    = 0.0f, tsr_jit_v = 0.0f;
+    float tsr_feedback = 0.0f;
+    float tsr_inv_vp[16] = {0};   /* inverse of current clean view*proj  */
+    float tsr_prev_vp[16] = {0};  /* previous frame's clean view*proj    */
+    bool  tsr_has_prev = false;   /* prev VP available -> motion reproject */
+    if (upscaler == 2 && !taa_on && width < disp_w && height < disp_h) {
+        static JceTaaState s_tsr_state = {};
+        static float       s_tsr_prev_vp[16];
+        static bool        s_tsr_prev_valid = false;
+        tsr_active = true;
+        jce_taa_advance(&s_tsr_state, width, height);
+        jce_taa_apply_jitter(&color_proj, s_tsr_state.current_jitter);
+        tsr_jit_u = s_tsr_state.current_jitter[0] * 0.5f;   /* NDC -> render-UV */
+        tsr_jit_v = s_tsr_state.current_jitter[1] * 0.5f;
+        tsr_feedback = 0.9f;   /* base; the shader tapers by motion speed */
+        /* Clean (un-jittered) VP + its inverse drive the motion-vector pass so
+         * the history reprojects under camera movement (v2). Roll prev<-cur. */
+        jce_mat4 clean_vp = jce_m4_multiply(&proj, &view);
+        jce_mat4 inv_vp   = jce_m4_inverse(&clean_vp);
+        memcpy(tsr_inv_vp, inv_vp.raw[0], sizeof(tsr_inv_vp));
+        if (s_tsr_prev_valid) {
+            memcpy(tsr_prev_vp, s_tsr_prev_vp, sizeof(tsr_prev_vp));
+            tsr_has_prev = true;
+        }
+        memcpy(s_tsr_prev_vp, clean_vp.raw[0], sizeof(s_tsr_prev_vp));
+        s_tsr_prev_valid = true;
+    }
+
+    /* TSR v3: drive the scene renderer's per-object velocity prepass
+     * (gbuffer_vel) when TSR is active so moving/skinned geometry reprojects,
+     * not just the camera. TAA is off on the iGPU, so the taa_on-gated enable
+     * above leaves it off — turn it on here for TSR. This adds a full-scene
+     * velocity geometry pass — cheap for typical scenes (~0.4ms CPU / negligible
+     * GPU at ~200 entities, measured) but the vertex/submit side scales with
+     * entity count, so it stays OPT-IN (a perf feature shouldn't add a scaling
+     * pass by default): JCE_TSR_VELOCITY=1 enables it. Default = camera-only v2,
+     * the neighbourhood clamp bounding animated-object ghosting. */
+    static int s_tsr_vel = -1;
+    if (s_tsr_vel < 0) {
+        const char *v = getenv("JCE_TSR_VELOCITY");
+        s_tsr_vel = (v && v[0] != '0') ? 1 : 0;
+    }
+    if (tsr_active && s_tsr_vel && s_sr.scene_renderer)
+        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, true);
+
     {
         jce_vec3 eye = jce_camera_get_position(s_sr.camera);
         s_sr.cached_eye[0] = eye.x;
@@ -903,46 +1050,16 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     };
     cfg.on_after_sky_ud = nullptr;
 
-    /* Broadphase frustum culling — uniform-grid backed. Stats appear in
-     * the Profiler panel under "Scene Culling". Approximate AABBs derived
-     * from transform position + scale; precise mesh AABBs are a TODO. */
-    cfg.frustum_culling = true;
-    cfg.viewport_width = width;
-    cfg.viewport_height = height;
+    /* Bridge FBO, panel resolution, volumetric fog, SSR and GI — the plumbing
+     * that must be identical on both editor render paths (see
+     * jce_editor_viewport_common.h). */
+    jce_editor_viewport_apply_shared_config(&cfg, s_sr.bridge, width, height);
+
     cfg.viewport_id = 1;   /* Scene viewport slot (Game = 0): own TAA prev camera */
 
     /* Two-pass GPU-query occlusion culling. Falls back to always-visible
      * when hardware queries are unsupported (ES2/WebGL1). */
     cfg.occlusion_culler = s_sr.occlusion_culler;
-    /* The scene-view renders into the offscreen bridge FBO; the engine binds the
-     * occlusion proxy view to THIS framebuffer so its depth test runs against the
-     * depth the color pass actually wrote (not the backbuffer → would make the
-     * culler inert or false-cull visible geometry in the offscreen path). */
-    cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
-
-    /* Volumetric fog (Stage 1: render only — composite pass deferred).
-     * Lighting panel writes; renderer consumes here. */
-    cfg.fog_enabled = jce_editor_lighting_get_fog_enabled();
-    if (cfg.fog_enabled) {
-        jce_editor_lighting_get_fog_params(&cfg.fog);
-        cfg.fog_depth_tex_handle =
-            jce_offscreen_target_get_depth_texture(s_sr.bridge);
-        cfg.fog_rt_width  = (int)s_sr.viewport_width;
-        cfg.fog_rt_height = (int)s_sr.viewport_height;
-    } else {
-        cfg.fog_depth_tex_handle = UINT16_MAX;
-        cfg.fog_rt_width = 0;
-        cfg.fog_rt_height = 0;
-    }
-
-    /* SSR: the renderer reflects the bridge's lit color RT (gated on the
-     * scene's ssr_enabled).  SSR's ray-march view renders after the color
-     * pass, so it samples the current frame's clean (pre-composite) color. */
-    cfg.ssr_color_tex_handle =
-        jce_offscreen_target_get_color_texture(s_sr.bridge);
-    /* GI L1: the dynamic probe gather samples the same lit RT (it reads it
-     * on the pre-color compute view = last frame's content). */
-    cfg.gi_color_tex_handle = cfg.ssr_color_tex_handle;
 
     /* Focus-bounded entity collection ("draw distance"): only entities within
      * cull_radius (horizontal) of the orbit target are collected, so every
@@ -991,11 +1108,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
     JceScene *scene = jce_state_get_scene();
     if (scene && s_sr.scene_renderer) {
-        float amb_color[3];
-        float amb_intensity = 0.15f;
-        jce_editor_lighting_get_ambient(amb_color, &amb_intensity);
-        jce_scene_renderer_set_ambient_override(s_sr.scene_renderer,
-                                                 amb_color, amb_intensity);
+        /* Ambient override from the editor Lighting panel — applied on both
+         * viewports so panel changes reach whichever one renders. */
+        jce_editor_viewport_apply_ambient_override(s_sr.scene_renderer);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
 
@@ -1025,33 +1140,20 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * costs a flag test on idle frames (the former every-frame full-scene
      * ID render was the editor's single largest fixed frame cost). */
     if (scene && s_sr.pick_pass) {
+        /* Full-res pick (disp_w/disp_h), NOT the scaled render size: the click
+         * coords are avail-space, so a native-res ID buffer keeps selection
+         * pixel-exact even when the color pass is downscaled by dynamic res. */
         jce_scene_pick_render(s_sr.pick_pass, scene, s_sr.camera,
-                              width, height);
+                              disp_w, disp_h);
     }
 
-    /* Composite volumetric fog into the bridge color RT (after the
-     * scene draws into it but before overlays / PostFX run). The
-     * scene renderer has already filled the depth buffer & fog RT;
-     * here we blend rgb in-scatter + transmittance into the bridge.
-     * No-op when fog is disabled or composite shader unavailable. */
-    if (cfg.fog_enabled && s_sr.scene_renderer) {
-        uint16_t fog_composite_view = (uint16_t)(scene_view_id() + 16);
-        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
-        jce_scene_renderer_composite_fog(s_sr.scene_renderer,
-                                         fog_composite_view, dst_fb);
-    }
-
-    /* Composite SSR reflections into the bridge color RT (after the scene +
-     * fog, before overlays).  No-op unless SSR was active this frame.  Uses
-     * scene base+3 (> the SSR ray-march at base+2 and the color pass). */
-    if (s_sr.scene_renderer) {
-        /* base+19 (after the base+18 ray-march); the postfx was relocated to
-         * base+JCE_VIEW_POST_BASE so base+18/+19 stay free below it. */
-        uint16_t ssr_composite_view = (uint16_t)(scene_view_id() + 19);
-        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
-        jce_scene_renderer_composite_ssr(s_sr.scene_renderer,
-                                         ssr_composite_view, dst_fb);
-    }
+    /* Composite volumetric fog (base+16) and SSR (base+19) into the bridge
+     * color RT — after the scene draws into it, before overlays / PostFX run.
+     * The scene renderer has already filled the depth buffer, the fog RT and
+     * the SSR RT; here they are blended into the bridge.  The postfx chain was
+     * relocated to base+JCE_VIEW_POST_BASE so base+16/+19 stay free below it. */
+    jce_editor_viewport_composite_fog_ssr(s_sr.scene_renderer, s_sr.bridge,
+                                          scene_view_id(), cfg.fog_enabled);
 
     /* Tick the world streamer each frame so pending chunk loads are applied
        to the scene synchronously on the main/render thread. */
@@ -1109,13 +1211,20 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * tonemapping along with the scene (matches 0.5.7 behavior). */
     JcePostFXPipeline *postfx = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
     if (postfx) {
-        bool any_effect = false;
-        for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
-            if (jce_postfx_is_enabled(postfx, (JcePostFXType)i)) {
-                any_effect = true;
-                break;
-            }
+        /* TSR is the anti-aliaser (jittered temporal accumulation resolves
+         * aliasing), so FXAA must NOT run first — it would pre-blur the very
+         * samples TSR reconstructs (the classic double-AA anti-pattern). Disable
+         * FXAA for this scene-view apply when TSR is active, then restore below so
+         * pick / preview / thumbnail invocations keep their FXAA. */
+        bool tsr_fxaa_saved = false;
+        static int s_tsr_keep_fxaa = -1;   /* QA A/B: JCE_TSR_KEEP_FXAA=1 keeps FXAA on */
+        if (s_tsr_keep_fxaa < 0)
+            s_tsr_keep_fxaa = getenv("JCE_TSR_KEEP_FXAA") ? 1 : 0;
+        if (tsr_active && !s_tsr_keep_fxaa) {
+            tsr_fxaa_saved = jce_postfx_is_enabled(postfx, JCE_POSTFX_FXAA);
+            if (tsr_fxaa_saved) jce_postfx_enable(postfx, JCE_POSTFX_FXAA, false);
         }
+        bool any_effect = jce_editor_viewport_postfx_any_effect(postfx);
 
         jce_postfx_resize(postfx, width, height);
 
@@ -1140,25 +1249,18 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                     s_sr.postfx_output_tex = out.idx;
             }
         }
+        if (tsr_active && tsr_fxaa_saved)
+            jce_postfx_enable(postfx, JCE_POSTFX_FXAA, true);   /* restore */
     }
 
     /* Fold the tone-mapped PostFX output back into the bridge so the canvas
      * UI (below) lands AFTER post-fx — same scene→postfx→UI compositing the
      * Game View and the shipped runtime use.  Editor gizmo overlays stay
-     * pre-postfx above (they need the bridge depth buffer).  flip_v: the
-     * postfx RT's sampling orientation is inverted vs the bridge/canvas
-     * convention on bottom-left-origin backends (GL). */
-    bool postfx_composited = false;
-    if (s_sr.postfx_output_tex != UINT16_MAX) {
-        const uint16_t comp_view =
-            (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 21);
-        jce_offscreen_target_composite_texture(
-            s_sr.bridge, comp_view, s_sr.postfx_output_tex,
-            (uint16_t)width, (uint16_t)height,
-            jce_renderer_origin_bottom_left());
+     * pre-postfx above (they need the bridge depth buffer). */
+    const bool postfx_composited = jce_editor_viewport_composite_postfx(
+        s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex, width, height);
+    if (postfx_composited)
         s_sr.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
-        postfx_composited = true;
-    }
 
     /* ── ECS-UI (Canvas) overlay — scene-view parity with the game view ──
      * Unity renders scene-space UI in the Scene View too; gate on the
@@ -1171,12 +1273,84 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (s_sr.ui_canvas && jce_state_show_flag(JCE_SHOW_FLAG_UI)) {
         JceScene *ui_scene = jce_state_get_scene();
         if (ui_scene) {
-            uint16_t ui_view = postfx_composited
-                ? (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 22)
-                : (uint16_t)(scene_view_id() + 17);
+            uint16_t ui_view = jce_editor_viewport_ui_overlay_view(
+                scene_view_id(), postfx_composited);
             uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
             jce_ui_canvas_render(s_sr.ui_canvas, ui_scene, ui_view, ui_fb,
                                  (float)width, (float)height, NULL, dt_sec);
+        }
+    }
+
+    /* Dynamic-resolution RCAS resolve: when the scene rendered below native
+     * (width/height < the panel's disp size), the bridge now holds the fully
+     * composited scaled frame.  Resolve it into the native-size present target
+     * with contrast-adaptive sharpening (RCAS/FSR1/CAS parity) so the panel
+     * displays 1:1 crisp instead of letting ImGui bilinear-stretch the scaled
+     * bridge.  Only the real Scene View panel (no view-id override — overlay /
+     * preview / thumbnail reuse must not resolve).  JCE_RCAS=0 forces the plain
+     * bilinear path (A/B + QA); JCE_RCAS_FLIP is a QA-only V-flip override. */
+    if (s_sr.present && s_view_id_override == UINT16_MAX &&
+        width < disp_w && height < disp_h && tsr_active) {
+        /* TSR temporal upscale (opt-in via JCE_TSR): reconstruct native res from
+         * the jittered scaled bridge by depositing sub-pixel samples into an
+         * output-res history, reprojected by camera motion (v2). Owns its own
+         * history buffers (no s_sr.present target). Uses base+25 (motion) and
+         * base+26 (resolve) — after the screenshot readback (+24). */
+        JcePostFXPipeline *pfx = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
+        JceTextureHandle src = {
+            jce_offscreen_target_get_color_texture(s_sr.bridge) };
+        JceTextureHandle depth = {
+            jce_offscreen_target_get_depth_texture(s_sr.bridge) };
+        uint16_t base = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 25);
+        bool flip = false;
+        if (const char *f = getenv("JCE_TSR_FLIP")) flip = (f[0] != '0');
+        /* v3: per-object velocity from the scene renderer's gbuffer_vel prepass
+         * (enabled above). When valid it drives the reprojection (moving/skinned
+         * geometry stops ghosting); otherwise the resolve falls back to
+         * camera-only motion from depth + the VP matrices (v2). */
+        JceTextureHandle ext_motion = {
+            jce_scene_renderer_get_velocity_texture(s_sr.scene_renderer) };
+        if (pfx && jce_gfx_texture_valid(src)) {
+            uint16_t out = jce_postfx_tsr_resolve(
+                pfx, base, src, depth,
+                tsr_has_prev ? tsr_inv_vp  : NULL,
+                tsr_has_prev ? tsr_prev_vp : NULL,
+                ext_motion,
+                width, height, disp_w, disp_h,
+                tsr_jit_u, tsr_jit_v, tsr_feedback, flip);
+            if (out != UINT16_MAX) s_sr.present_tex = out;
+        }
+    } else if (upscaler == 1 && s_sr.present && s_view_id_override == UINT16_MAX &&
+        width < disp_w && height < disp_h) {
+        {
+            /* No flip: vs_postfx already normalises orientation for
+             * offscreen->offscreen passes (its GLSL V-flip), so the resolve is
+             * an identity copy of the bridge on every backend — verified
+             * right-side up on D3D11 (top-left) and OpenGL (bottom-left).
+             * JCE_RCAS_FLIP overrides for QA only. */
+            bool flip = false;
+            if (const char *f = getenv("JCE_RCAS_FLIP")) flip = (f[0] != '0');
+
+            jce_mat4 id = jce_m4_identity();
+            if (jce_offscreen_target_prepare(s_sr.present, disp_w, disp_h,
+                                             id.raw[0], id.raw[0],
+                                             0x000000FFu, "EditorUpscale")) {
+                JcePostFXPipeline *pfx =
+                    jce_scene_renderer_get_postfx(s_sr.scene_renderer);
+                JceTextureHandle src = {
+                    jce_offscreen_target_get_color_texture(s_sr.bridge) };
+                uint16_t dst_fb =
+                    jce_offscreen_target_get_frame_buffer(s_sr.present);
+                uint16_t rv =
+                    (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 23);
+                if (pfx && jce_gfx_texture_valid(src) && dst_fb != UINT16_MAX &&
+                    jce_postfx_upscale_resolve(pfx, rv, dst_fb, src,
+                                               width, height, disp_w, disp_h,
+                                               flip)) {
+                    s_sr.present_tex =
+                        jce_offscreen_target_get_color_texture(s_sr.present);
+                }
+            }
         }
     }
 
@@ -1194,6 +1368,11 @@ uint16_t jce_editor_scene_render_get_texture(void)
 {
     if (!s_sr.initialized || !s_sr.bridge)
         return UINT16_MAX;
+
+    /* Dynamic-resolution RCAS upscale produced a native-res frame this frame:
+     * display it 1:1 instead of the scaled bridge (ImGui would bilinear-blur). */
+    if (s_sr.present_tex != UINT16_MAX)
+        return s_sr.present_tex;
 
     if (s_sr.postfx_output_tex != UINT16_MAX)
         return s_sr.postfx_output_tex;
@@ -1215,20 +1394,9 @@ bool jce_editor_scene_render_screenshot(const char *path)
      * jce_editor_scene_render_capture_poll() each frame until it completes. */
     if (s_cap_w == 0 || s_cap_h == 0)
         return false;
-    uint16_t source = s_sr.postfx_output_tex;
-    int yflip = 1;   /* postfx RT reads back bottom-up on every backend */
-    if (source == UINT16_MAX) {
-        source = jce_offscreen_target_get_color_texture(s_sr.bridge);
-        yflip = jce_renderer_origin_bottom_left() ? 1 : 0;
-    }
-    if (source == UINT16_MAX)
-        return false;
-    /* +24: after the postfx chain (+18 worst case), the postfx→bridge
-     * composite (+21) and the canvas-UI overlay (+22), so the readback sees
-     * the fully composited frame of the SAME bgfx frame. */
-    uint16_t blit_view = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 24);
-    return jce_renderer_readback_capture_submit(source, blit_view,
-                                                s_cap_w, s_cap_h, path, yflip);
+    return jce_editor_viewport_screenshot_submit(
+        s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex,
+        s_cap_w, s_cap_h, path);
 }
 
 /* Pump the in-flight read-back capture (no-op when idle).  Call once per frame. */

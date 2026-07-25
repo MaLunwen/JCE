@@ -20,11 +20,40 @@ public final class JceRuntime implements AutoCloseable {
     private static final String LIB_FILE;
     private static final String RESOURCE_PATH;
 
+    /**
+     * Packed JCE C-ABI version this binding was written against, in the
+     * jce_version.h layout 0xMMmmpp00 (0.11.2 -> 0x000B0200). Bump in
+     * lockstep with project(JCE VERSION ...) in the root CMakeLists.txt
+     * whenever the native surface used below changes shape.
+     */
+    private static final int EXPECTED_API_VERSION = 0x000B0200;
+
+    /**
+     * Mirror of JceAppResult in engine/include/jce/application/jce_engine.h.
+     * Ordinals ARE the wire values — a boolean cannot distinguish a clean
+     * quit (SUCCESS) from an error quit (FAILURE), which is exactly what
+     * callers need in order to pick a process exit code.
+     */
+    public enum Result {
+        CONTINUE,
+        SUCCESS,
+        FAILURE;
+
+        static Result fromNative(int value) {
+            switch (value) {
+                case 0:  return CONTINUE;
+                case 1:  return SUCCESS;
+                default: return FAILURE;  /* unknown code == not safe to keep running */
+            }
+        }
+    }
+
     static {
         CLASSIFIER = detectClassifier();
         LIB_FILE = detectLibFileName();
         RESOURCE_PATH = "/natives/" + CLASSIFIER + "/" + LIB_FILE;
         loadNativeLibrary();
+        verifyApiVersion();
     }
 
     private static String detectClassifier() {
@@ -71,9 +100,11 @@ public final class JceRuntime implements AutoCloseable {
 
     private long nativeHandle;
 
+    private static native int nativeApiVersion();
+    private static native String nativeApiVersionString();
     private static native long nativeCreate();
-    private static native boolean nativeIterate(long handle);
-    private static native boolean nativeShouldQuit(long handle);
+    private static native int nativeIterate(long handle);
+    private static native int nativeLastResult(long handle);
     private static native void nativeDestroy(long handle);
 
     public void init() {
@@ -96,14 +127,20 @@ public final class JceRuntime implements AutoCloseable {
         }
     }
 
-    public boolean iterate() {
+    /** Runs one frame. Returns the engine's own JceAppResult, not a boolean. */
+    public Result iterate() {
         ensureInitialized();
-        return nativeIterate(nativeHandle);
+        return Result.fromNative(nativeIterate(nativeHandle));
+    }
+
+    /** Result of the last {@link #iterate()} — survives the loop exit. */
+    public Result lastResult() {
+        ensureInitialized();
+        return Result.fromNative(nativeLastResult(nativeHandle));
     }
 
     public boolean shouldQuit() {
-        ensureInitialized();
-        return nativeShouldQuit(nativeHandle);
+        return lastResult() != Result.CONTINUE;
     }
 
     @Override
@@ -145,6 +182,37 @@ public final class JceRuntime implements AutoCloseable {
         } catch (IOException e) {
             throw new IllegalStateException("Failed to unpack bundled native library", e);
         }
+    }
+
+    /**
+     * ABI handshake — the JAR and the native library ship separately (the
+     * library can also come from java.library.path), so a stale one of
+     * either must fail loudly here rather than corrupt memory later.
+     *
+     * Rule follows jce_version.h: reject a differing major. Pre-1.0 the
+     * minor IS the breaking axis, so while major == 0 a differing minor is
+     * rejected too. The patch field is deliberately ignored.
+     */
+    private static void verifyApiVersion() {
+        int actual = nativeApiVersion();
+        int actualMajor = (actual >>> 24) & 0xFF;
+        int actualMinor = (actual >>> 16) & 0xFF;
+        int expectedMajor = (EXPECTED_API_VERSION >>> 24) & 0xFF;
+        int expectedMinor = (EXPECTED_API_VERSION >>> 16) & 0xFF;
+
+        boolean compatible = actualMajor == expectedMajor
+            && (expectedMajor != 0 || actualMinor == expectedMinor);
+        if (compatible) {
+            return;
+        }
+
+        throw new IllegalStateException(
+            "JCE native/Java ABI mismatch: native library reports "
+            + nativeApiVersionString() + " (0x" + Integer.toHexString(actual)
+            + "), but this binding was built for " + expectedMajor + "." + expectedMinor
+            + ".x (0x" + Integer.toHexString(EXPECTED_API_VERSION) + "). "
+            + "Rebuild the JAR and the native library together "
+            + "(scripts/package-jni-jar.bat).");
     }
 
     private static Path createSecureExtractionDirectory() throws IOException {

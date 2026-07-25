@@ -189,9 +189,9 @@ JCE_API void               jce_particles_destroy(JceParticleSystem *sys);
 /* Emitter management                                                  */
 /* ================================================================== */
 
-JceEmitterHandle jce_particles_emitter_add(JceParticleSystem *sys,
+JCE_API JceEmitterHandle jce_particles_emitter_add(JceParticleSystem *sys,
                                            const JceParticleEmitterDesc *desc);
-void             jce_particles_emitter_remove(JceParticleSystem *sys,
+JCE_API void             jce_particles_emitter_remove(JceParticleSystem *sys,
                                               JceEmitterHandle emitter);
 
 /* Start / stop emission.  Stopping lets existing particles live out
@@ -200,7 +200,7 @@ JCE_API void jce_particles_emitter_start(JceParticleSystem *sys, JceEmitterHandl
 JCE_API void jce_particles_emitter_stop(JceParticleSystem *sys, JceEmitterHandle emitter);
 
 /* Move the emitter origin (only matters when world_space = false). */
-void jce_particles_emitter_set_position(JceParticleSystem *sys,
+JCE_API void jce_particles_emitter_set_position(JceParticleSystem *sys,
                                         JceEmitterHandle emitter, jce_vec3 pos);
 
 /* Retint newly-spawned particles (RGB of start+end colors; alphas preserved). */
@@ -208,7 +208,7 @@ JCE_API void jce_particles_emitter_set_color(JceParticleSystem *sys,
                                              JceEmitterHandle emitter, jce_vec3 rgb);
 
 /* Fire a one-shot burst of count particles. */
-void jce_particles_emitter_burst(JceParticleSystem *sys,
+JCE_API void jce_particles_emitter_burst(JceParticleSystem *sys,
                                  JceEmitterHandle emitter, uint32_t count);
 
 /* ================================================================== */

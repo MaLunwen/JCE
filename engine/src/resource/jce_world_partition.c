@@ -5,19 +5,20 @@
  * -hash streamable entities into grid cells, MOVE their JSON nodes into per-cell
  * fragment trees, leave residents in the master, and inject the chunk roster.
  *
- * Engine-internal TU: may use cJSON directly (only DetachItemViaPointer, which
- * jce_json.h does not expose) — same allowance the scene (de)serialiser uses.
+ * Goes entirely through the jce_json facade.  The one call that used to need
+ * raw cJSON — DetachItemViaPointer, to MOVE a node between documents instead
+ * of copying it — is now jce_json_detach().
  */
 
 #include <jce/resource/jce_world_partition.h>
 
 #include <jce/middleware/scene/jce_scene.h>                  /* JCE_SCENE_MAX_STREAM_CHUNKS */
 #include <jce/middleware/scene/jce_scene_components_json.h>  /* jce_scene_save_json          */
+#include <jce/os/core/jce_hash.h>                            /* jce_hash_fmix64              */
+#include <jce/os/core/jce_hashmap.h>                         /* jce_hashmap_cap_pow2         */
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
-
-#include <cjson/cJSON.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -29,14 +30,6 @@
 /* ── id -> entity-index hash (open addressing, linear probe) ──────────── */
 
 typedef struct { uint64_t id; uint32_t idx; bool used; } EntSlot;
-
-static uint32_t mix64(uint64_t h)
-{
-    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
-    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return (uint32_t)h;
-}
 
 /* ── Per-cell accumulator ────────────────────────────────────────────── */
 
@@ -91,16 +84,15 @@ bool jce_world_partition_build(const struct JceScene    *scene,
     Cell     *cells       = NULL;
     JceJson **node_ptrs   = NULL;
 
-    /* 2. id -> ent index hash. */
-    uint32_t hcap = 16;
-    while (hcap < ent_count * 2u) hcap <<= 1;
+    /* 2. id -> ent index hash (2x capacity => load <= 0.5, never grows). */
+    uint32_t hcap = jce_hashmap_cap_pow2(ent_count * 2u, 16u);
     hash = (EntSlot *)JCE_CALLOC(hcap, sizeof(EntSlot));
     cell_of_ent = (int *)JCE_MALLOC((size_t)(ent_count ? ent_count : 1) * sizeof(int));
     cells = (Cell *)JCE_CALLOC(JCE_SCENE_MAX_STREAM_CHUNKS, sizeof(Cell));
     if (!hash || !cell_of_ent || !cells) goto done;
 
     for (uint32_t i = 0; i < ent_count; ++i) {
-        uint32_t h = mix64(ents[i].entity_id) & (hcap - 1);
+        uint32_t h = (uint32_t)jce_hash_fmix64(ents[i].entity_id) & (hcap - 1);
         while (hash[h].used) h = (h + 1) & (hcap - 1);
         hash[h].used = true;
         hash[h].id   = ents[i].entity_id;
@@ -198,14 +190,14 @@ bool jce_world_partition_build(const struct JceScene    *scene,
         /* hash lookup */
         int ci = -1;
         if (ent_count) {
-            uint32_t h = mix64(id) & (hcap - 1);
+            uint32_t h = (uint32_t)jce_hash_fmix64(id) & (hcap - 1);
             while (hash[h].used) {
                 if (hash[h].id == id) { ci = cell_of_ent[hash[h].idx]; break; }
                 h = (h + 1) & (hcap - 1);
             }
         }
         if (ci >= 0) {
-            cJSON_DetachItemViaPointer((cJSON *)entities, (cJSON *)node);
+            jce_json_detach(entities, node);
             jce_json_array_push(cells[ci].fents, node);
             out->streamed_count++;
         } else {

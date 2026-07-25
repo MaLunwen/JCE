@@ -13,6 +13,7 @@
  *     focus it, so the reader can follow every topic hands-on.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
@@ -21,7 +22,6 @@
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
-#include <cctype>
 
 /* ── Chapter registry ───────────────────────────────────────────────── */
 
@@ -62,20 +62,6 @@ extern "C" void jce_editor_panel_user_guide_select_chapter(int chapter_index)
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
-
-static bool ci_contains(const char *hay, const char *needle)
-{
-    if (!hay || !needle || !*needle) return false;
-    size_t nlen = strlen(needle);
-    for (const char *p = hay; *p; p++) {
-        size_t i = 0;
-        while (i < nlen && p[i] &&
-               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
-            i++;
-        if (i == nlen) return true;
-    }
-    return false;
-}
 
 static void draw_hotkey_chip(JceHotkeyId id)
 {
@@ -224,9 +210,9 @@ static void draw_hotkey_reference(void)
         jce_hotkey_chord_label(jce_hotkey_get(id), chord, sizeof(chord));
 
         if (s_hk_filter[0] &&
-            !ci_contains(name, s_hk_filter) &&
-            !ci_contains(id_str, s_hk_filter) &&
-            !ci_contains(chord, s_hk_filter))
+            !jce_panel_contains_ci(name, s_hk_filter) &&
+            !jce_panel_contains_ci(id_str, s_hk_filter) &&
+            !jce_panel_contains_ci(chord, s_hk_filter))
             continue;
 
         ImGui::TableNextRow();
@@ -272,11 +258,11 @@ extern "C" void jce_editor_panel_user_guide_content(void)
         const char *ch_title = jce_editor_i18n(ch->title_key);
 
         /* Filter: keep the chapter if its title or any topic title hits. */
-        bool ch_hit = !s_filter[0] || ci_contains(ch_title, s_filter);
+        bool ch_hit = !s_filter[0] || jce_panel_contains_ci(ch_title, s_filter);
         bool any_topic_hit = false;
         if (s_filter[0]) {
             for (int t = 0; t < ch->topic_count && !any_topic_hit; t++)
-                if (ci_contains(jce_editor_i18n(ch->topics[t].title_key),
+                if (jce_panel_contains_ci(jce_editor_i18n(ch->topics[t].title_key),
                                 s_filter))
                     any_topic_hit = true;
             if (!ch_hit && !any_topic_hit) continue;
@@ -288,7 +274,7 @@ extern "C" void jce_editor_panel_user_guide_content(void)
         if (!open) continue;
         for (int t = 0; t < ch->topic_count; t++) {
             const char *tt = jce_editor_i18n(ch->topics[t].title_key);
-            if (s_filter[0] && !ch_hit && !ci_contains(tt, s_filter)) continue;
+            if (s_filter[0] && !ch_hit && !jce_panel_contains_ci(tt, s_filter)) continue;
             bool selected = (c == s_sel_chapter && t == s_sel_topic);
             if (ImGui::Selectable(tt, selected)) {
                 s_sel_chapter = c;
@@ -301,7 +287,7 @@ extern "C" void jce_editor_panel_user_guide_content(void)
     /* Virtual hotkey-reference chapter. */
     {
         const char *hk_title = jce_editor_i18n("guide.hotkeys.title");
-        if (!s_filter[0] || ci_contains(hk_title, s_filter)) {
+        if (!s_filter[0] || jce_panel_contains_ci(hk_title, s_filter)) {
             bool selected = (s_sel_chapter == k_hotkey_chapter_index);
             if (ImGui::Selectable(hk_title, selected)) {
                 s_sel_chapter = k_hotkey_chapter_index;

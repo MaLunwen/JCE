@@ -93,8 +93,16 @@ JCE_API void JCE_CALL jce_rpc_init(void);
 JCE_API void JCE_CALL jce_rpc_shutdown(void);
 
 /* Register an RPC name + handler.  Call during init.  Re-registering by
- * the same name updates the entry in place. */
-JCE_API void JCE_CALL jce_rpc_register(const JceRpcDesc *desc);
+ * the same name updates the entry in place.
+ *
+ * Returns false when the RPC was NOT registered: bad descriptor (missing
+ * name or handler), name longer than JCE_RPC_NAME_MAX, or the registry is
+ * full.  CHECK IT — a dropped registration has no runtime symptom at the
+ * call site; the RPC simply never fires, which surfaces much later as "this
+ * ability does not replicate".  The table-full case in particular is
+ * load-dependent, so it appears only once a project is large and only for
+ * whatever registered last. */
+JCE_API bool JCE_CALL jce_rpc_register(const JceRpcDesc *desc);
 
 /* Number of currently registered RPCs (diagnostic). */
 JCE_API uint32_t JCE_CALL jce_rpc_registered_count(void);

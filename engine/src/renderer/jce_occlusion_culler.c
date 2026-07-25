@@ -14,6 +14,8 @@
  */
 
 #include <jce/renderer/jce_occlusion_culler.h>
+#include <jce/os/core/jce_hash.h>
+#include <jce/os/core/jce_hashmap.h>
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
@@ -118,15 +120,10 @@ struct JceOcclusionCuller {
 
 /* ── Hash helpers ─────────────────────────────────────────────────────── */
 
+/* SplitMix64 finalizer (shared, jce_hash.h) masked to the power-of-two cap. */
 static uint32_t hash_id(uint64_t id, uint32_t cap)
 {
-    /* Murmur-inspired finalizer */
-    uint64_t h = id ^ (id >> 30);
-    h *= UINT64_C(0xbf58476d1ce4e5b9);
-    h ^= (h >> 27);
-    h *= UINT64_C(0x94d049bb133111eb);
-    h ^= (h >> 31);
-    return (uint32_t)(h & (uint64_t)(cap - 1));
+    return (uint32_t)(jce_hash_splitmix64(id) & (uint64_t)(cap - 1));
 }
 
 /* Grow + rehash the table 2x.  The render path is now uncapped (a scene can have
@@ -229,9 +226,8 @@ JceOcclusionCuller *jce_occlusion_culler_create(
         return oc; /* still valid, just always-visible */
     }
 
-    /* Round up max_entities to next power-of-two. */
-    uint32_t cap = 64;
-    while (cap < config->max_entities) cap <<= 1;
+    /* Round up max_entities to next power-of-two (floor 64). */
+    uint32_t cap = jce_hashmap_cap_pow2(config->max_entities, 64u);
 
     /* bgfx owns one global query pool.  Reserve a deterministic share for this
      * view so independent editor cullers cannot starve one another. */

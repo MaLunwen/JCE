@@ -10,6 +10,7 @@
  * Panel is registered under Window menu alongside other network panels.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 
@@ -227,16 +228,9 @@ extern "C" void jce_editor_panel_lan_discovery(void)
      * as a tab.  Activating this panel now redirects to that workbench and
      * requests the Discovery tab.  Symbol kept so the menu/hotkey entries
      * registered against JCE_PANEL_LAN_DISCOVERY keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_LAN_DISCOVERY);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *net_vis = jce_editor_panel_visible_ptr(JCE_PANEL_NETWORK_STATS);
-    if (net_vis) *net_vis = true;
-
-    char title[64];
-    std::snprintf(title, sizeof(title), "%s###network_stats",
-                  jce_editor_i18n("panel.network_stats.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_network_stats_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_LAN_DISCOVERY,
+                                        JCE_PANEL_NETWORK_STATS,
+                                        "panel.network_stats.title",
+                                        "network_stats"))
+        jce_panel_network_stats_request_tab(1);
 }

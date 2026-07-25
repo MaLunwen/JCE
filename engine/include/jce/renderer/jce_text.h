@@ -46,7 +46,7 @@ JCE_API JceFont *jce_font_open(const JcePakArchive *pak, const char *asset_path,
 /* Open a font with additional Unicode codepoints beyond ASCII.
    extra_cps / extra_count: non-ASCII codepoints to pre-render
    (e.g. CJK characters for i18n). */
-JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
+JCE_API JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
                            float pt_size,
                            const uint32_t *extra_cps, int extra_count);
 
@@ -54,20 +54,29 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
    contract as jce_font_open_ex but reads via jce_fs_host_read_all instead
    of a PAK — the editor uses this so canvas UI resolves project-authored
    fonts that are not baked into its embedded pak. */
-JceFont *jce_font_open_file_ex(const char *host_path, float pt_size,
+JCE_API JceFont *jce_font_open_file_ex(const char *host_path, float pt_size,
                                const uint32_t *extra_cps, int extra_count);
+
+/* Open a font from an in-memory TTF/OTF blob.  Same contract as
+   jce_font_open_ex, but the bytes come from the caller (e.g. read from the
+   active VFS / a mounted content bundle) — the canvas uses this so bundle-Play
+   resolves fonts that live only in the mounted bundle, not on the host FS or in
+   the embedded pak.  The blob is copied; the caller keeps ownership of `data`. */
+JCE_API JceFont *jce_font_open_mem_ex(const void *data, size_t size, const char *label,
+                              float pt_size,
+                              const uint32_t *extra_cps, int extra_count);
 
 /* Close a font and free its atlas texture. */
 JCE_API void jce_font_close(JceFont *font);
 
 /* Draw a UTF-8 text string at (x, y) in logical coordinates.
    color: ABGR packed via jce_rgba(). */
-void jce_text_draw(const JceRenderer *r, JceFont *font,
+JCE_API void jce_text_draw(const JceRenderer *r, JceFont *font,
                    float x, float y,
                    const char *text, uint32_t color);
 
 /* Draw text with a uniform scale factor. */
-void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
+JCE_API void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
                           float x, float y, float scale,
                           const char *text, uint32_t color);
 
@@ -75,7 +84,7 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
    an explicit bgfx `view_id` instead of the fixed JCE_VIEW_UI overlay, so
    off-screen UI passes can draw text into their own framebuffer's view.
    Engine-internal (not part of the public consumer API). */
-void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
+JCE_API void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
                                uint16_t view_id,
                                float x, float y, float scale,
                                const char *text, uint32_t color);
@@ -84,7 +93,7 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
 JCE_API int jce_font_line_height(const JceFont *font);
 
 /* Measure a string's bounding box in pixels (at native pt_size). */
-void jce_text_measure(const JceFont *font, const char *text,
+JCE_API void jce_text_measure(const JceFont *font, const char *text,
                       float *out_w, float *out_h);
 
 /* ── Math markup ───────────────────────────────────────────────────────
@@ -95,9 +104,9 @@ void jce_text_measure(const JceFont *font, const char *text,
  *   Unicode math such as √ μ ² also passes through).  Single line.
  * Backed by the on-demand glyph atlas, so Greek/symbol glyphs render even
  * when they were never pre-baked into the font. */
-void jce_text_measure_math(const JceFont *font, const char *markup,
+JCE_API void jce_text_measure_math(const JceFont *font, const char *markup,
                            float *out_w, float *out_h);
-void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
+JCE_API void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
                              uint16_t view_id, float x, float y, float scale,
                              const char *markup, uint32_t color);
 

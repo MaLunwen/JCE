@@ -45,7 +45,8 @@
 
 JCE_EXTERN_C_BEGIN
 
-typedef struct ecs_world_t ecs_world_t;
+/* The ECS world is passed as an opaque void* (from jce_scene_get_world());
+ * the concrete flecs type must not appear in the public ABI. */
 typedef struct JceWorldEcs JceWorldEcs;
 
 typedef struct {
@@ -62,7 +63,7 @@ typedef struct {
     JceObserverHandle handle;  /* filled by tick on first sync */
 } JceTriggerObserverEcs;
 
-JCE_API JceWorldEcs *jce_world_ecs_create(ecs_world_t *w, JceTriggerWorld *tw);
+JCE_API JceWorldEcs *jce_world_ecs_create(void *w, JceTriggerWorld *tw);
 JCE_API void         jce_world_ecs_destroy(JceWorldEcs *we);
 
 /* Sync new entities → engine handles, push observer positions and any

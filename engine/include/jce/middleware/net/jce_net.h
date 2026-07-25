@@ -52,7 +52,7 @@ JCE_API void        jce_net_host_destroy(JceNetHost *host);
 
 /* Connect to a remote address.  Returns peer handle (valid before
    JCE_NET_EVENT_CONNECT fires — do not send until connected). */
-JcePeerHandle jce_net_connect(JceNetHost *host,
+JCE_API JcePeerHandle jce_net_connect(JceNetHost *host,
                               const char *address, uint16_t port,
                               uint8_t channel_count);
 

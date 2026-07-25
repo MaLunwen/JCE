@@ -53,7 +53,8 @@
 extern "C" {
 #endif
 
-typedef struct ecs_world_t  ecs_world_t;
+/* The ECS world is passed as an opaque void* (from jce_scene_get_world());
+ * the concrete flecs type is private and must not appear in the public ABI. */
 typedef struct JceRendererEcs JceRendererEcs;
 
 typedef struct {
@@ -68,7 +69,7 @@ typedef struct {
     bool                   enabled;
 } JceVolumetricFogComponent;
 
-JCE_API JceRendererEcs *jce_renderer_ecs_create(ecs_world_t *w,
+JCE_API JceRendererEcs *jce_renderer_ecs_create(void *w,
                                                 JceSsr *ssr,
                                                 JceVolumetricFog *fog);
 JCE_API void            jce_renderer_ecs_destroy(JceRendererEcs *re);

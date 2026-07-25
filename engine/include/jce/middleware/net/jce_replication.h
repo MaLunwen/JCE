@@ -117,6 +117,38 @@ JCE_API void JCE_CALL jce_net_replication_shutdown(void);
  * pointer returned by jce_scene_get_world().  May be NULL to detach. */
 JCE_API void JCE_CALL jce_net_replication_set_world(void *ecs_world);
 
+/* ── Entity lifecycle adapter (audit C5-03) ────────────────────────────
+ *
+ * Replication needs to create and destroy entities for replicated objects.
+ * Without these hooks it falls back to raw ecs_new()/ecs_delete() on the
+ * bound world, which SKIPS everything the scene layer does around an entity:
+ *
+ *   - the scene's roster epoch, so every cache keyed on it (editor
+ *     hierarchy, streaming, renderer rosters) keeps a stale entity list
+ *     across a network spawn or despawn;
+ *   - the default JceTransform, so a replicated entity has no transform at
+ *     all until a snapshot happens to carry one;
+ *   - the JceTagActive tag, so systems that filter on "active" skip the
+ *     entity ENTIRELY — a replicated object that exists but is invisible to
+ *     the very systems meant to run on it.
+ *
+ * The substrate cannot call jce_scene_* itself: jce_net is L4 and links only
+ * jce_core, and reaching sideways into jce_scene would invert the layer
+ * direction this module already documents for the player loop above.  So the
+ * owner installs the hooks instead — jce_runtime does it, wiring them to
+ * jce_scene_create_entity / jce_scene_destroy_entity.
+ *
+ * Pass NULL fns to detach.  With no hooks installed the raw path still
+ * works, and says so once, so a standalone/test embedding is not broken —
+ * only louder about what it is giving up. */
+typedef uint64_t (*JceNetEntityCreateFn)(void *user);
+typedef void     (*JceNetEntityDestroyFn)(void *user, uint64_t entity);
+
+JCE_API void JCE_CALL jce_net_replication_set_entity_hooks(
+    JceNetEntityCreateFn  create_fn,
+    JceNetEntityDestroyFn destroy_fn,
+    void                 *user);
+
 /* Bind the JceNetHost used for snapshot send / receive.  May be NULL
  * to detach (e.g. between session start/end). */
 JCE_API void JCE_CALL jce_net_replication_attach_host(JceNetHost *host);

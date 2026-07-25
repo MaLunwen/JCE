@@ -7,10 +7,18 @@
  * so the editor can later show the link, jump-to-source, or apply
  * variant overrides.
  *
- * Format reuse: prefab files ARE scene files. There is no separate
- * "prefab schema". Convention: store under .prefab.json (e.g.
- * `assets/prefabs/enemy_grunt.prefab.json`). The serializer emits
- * the same envelope used by full scenes; loaders treat it identically.
+ * Convention: store under .prefab.json (e.g.
+ * `assets/prefabs/enemy_grunt.prefab.json`).
+ *
+ * On-disk formats — the loader accepts BOTH:
+ *   1. Flat scene form  {contract, scene:{version, entities:[{id, parentId,
+ *      components}, ...]}} — what jce_prefab_save_subtree() below emits;
+ *      identical to a full scene file, so loaders treat it identically.
+ *   2. Nested node-tree form  {contract, prefab:{version, root:{name,
+ *      components, children:[...]}}} — what the editor's "Save as Prefab"
+ *      writes, where parenthood is structural and nodes carry no id.
+ * Both land on the same component parsers and produce the same entities;
+ * only the way parenthood is expressed differs.
  *
  * Layer: Middleware/Scene (Layer 4) — depends on Resource/scene_serial.
  */

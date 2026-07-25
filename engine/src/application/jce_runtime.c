@@ -842,7 +842,15 @@ static void rt_register_input_cmd_rpc(void)
 	desc.server_authoritative = true;   /* client -> server only */
 	desc.handler              = rt_input_cmd_rpc_handler;
 	desc.user                 = NULL;
-	jce_rpc_register(&desc);
+	if (!jce_rpc_register(&desc)) {
+		/* Client prediction sends every input command through this RPC.
+		 * Without it the server receives nothing and the client rubber-bands
+		 * against a server that never saw an input — which looks like a
+		 * network problem, not a failed registration at startup. */
+		LOG_ERROR(LOG_TAG,
+		          "input-command RPC '%s' failed to register — client input "
+		          "will NOT reach the server", RT_INPUT_CMD_RPC_NAME);
+	}
 }
 
 /* ── Scripted RPC channel (jce.rpc_send) ──────────────────────────────
@@ -855,11 +863,53 @@ static void rt_register_input_cmd_rpc(void)
  * without a session / NetworkObject / live instance. */
 #define RT_SCRIPT_RPC_NAME  "jce.script_rpc"
 
+/* Is `name` a method a REMOTE peer is allowed to invoke on a script?
+ *
+ * The dispatch below takes this string straight off the wire and hands it to
+ * jce_script_call_message, which does a plain lua_getfield on the instance —
+ * so without a filter a peer can call ANY method the script (or its
+ * metatable) exposes: on_update, on_collision, on_destroy, every private
+ * helper.  The channel is registered server_authoritative = false, meaning it
+ * flows both ways, so that reach belongs to any client as well as the server.
+ *
+ * The rule is EXPLICIT OPT-IN BY NAME.  Only methods a script author
+ * deliberately named "rpc_..." are reachable; everything else is refused.
+ * Every mainstream engine requires per-method opt-in for exactly this reason
+ * — Unity [Command]/[ClientRpc], Unreal UFUNCTION(Server), Photon [PunRPC] —
+ * and none of them make the whole object surface remotely callable.
+ *
+ * A prefix (rather than a declared table) is used because it needs no script
+ * VM cooperation and is legible at the definition site: reading a script, the
+ * network entry points are the functions whose names say so.  If per-method
+ * direction or authority is ever needed, a declared table is the natural
+ * upgrade; the check stays in this one function either way.
+ *
+ * The charset check is hygiene, not injection defence — lua_getfield treats
+ * any string as an opaque key — but it keeps a malformed or padded name from
+ * reaching the VM and keeps log output readable. */
+#define RT_SCRIPT_RPC_PREFIX     "rpc_"
+#define RT_SCRIPT_RPC_PREFIX_LEN 4u
+
+bool rt_script_rpc_name_allowed(const char *name)
+{
+	if (!name || !name[0]) return false;
+	if (strncmp(name, RT_SCRIPT_RPC_PREFIX, RT_SCRIPT_RPC_PREFIX_LEN) != 0)
+		return false;
+	/* Must have something AFTER the prefix. */
+	if (!name[RT_SCRIPT_RPC_PREFIX_LEN]) return false;
+	for (const char *c = name; *c; ++c) {
+		const bool ok = (*c >= 'a' && *c <= 'z') ||
+		                (*c >= 'A' && *c <= 'Z') ||
+		                (*c >= '0' && *c <= '9') || *c == '_';
+		if (!ok) return false;
+	}
+	return true;
+}
+
 static void rt_script_rpc_handler(JceNetObjectId net_id, JceClientId sender,
                                   const void *payload, uint32_t payload_size,
                                   void *user)
 {
-	(void)sender;
 	JceRuntime *rt = (JceRuntime *)user;
 	if (!rt || !rt->script_vm || !payload || payload_size < 2u) return;
 
@@ -871,7 +921,14 @@ static void rt_script_rpc_handler(JceNetObjectId net_id, JceClientId sender,
 	uint16_t ec = elen < 255u ? elen : 255u;
 	memcpy(event, p + 2, ec);
 	event[ec] = '\0';
-	if (!event[0]) return;
+	if (!rt_script_rpc_name_allowed(event)) {
+		/* Attacker-controlled string; log it as data, never dispatch it. */
+		LOG_WARN(LOG_TAG,
+		         "script RPC from client %u refused: '%s' is not an "
+		         "rpc_-prefixed method (see rt_script_rpc_name_allowed)",
+		         (unsigned)sender, event);
+		return;
+	}
 
 	uint32_t poff = 2u + (uint32_t)elen;
 	char pl[512];
@@ -897,6 +954,15 @@ bool rt_script_rpc_send(void *user, JceScriptEntity e, const char *event,
 {
 	JceRuntime *rt = (JceRuntime *)user;
 	if (!rt || !event || !event[0]) return false;
+	/* Refuse at the SENDER too.  The receiver would drop it anyway, but a
+	 * silent no-op on a remote machine is the worst possible way for an author
+	 * to learn their method is not exposed. */
+	if (!rt_script_rpc_name_allowed(event)) {
+		LOG_WARN(LOG_TAG,
+		         "jce.rpc_send('%s') refused: remote-callable script methods "
+		         "must be named rpc_<something>", event);
+		return false;
+	}
 	if (jce_session_mode() == JCE_SESSION_MODE_NONE) return false;
 	JceNetObjectId nid = jce_net_object_from_entity((uint64_t)e);
 	if (nid == JCE_NET_OBJECT_INVALID) return false;
@@ -933,6 +999,32 @@ static void rt_register_script_rpc(JceRuntime *rt)
 /* Bring the networking bridge up at create() time when a session exists.
  * Binds the ECS world + scene into the net subsystems and walks net
  * objects.  Idempotent: no-op without a live session. */
+/* Entity lifecycle adapter for the replication substrate (audit C5-03).
+ *
+ * jce_net is L4 and links only jce_core, so it cannot call jce_scene_* —
+ * left to itself it falls back to raw ecs_new/ecs_delete on the bound world.
+ * That skips the scene roster epoch (caches keep a stale entity list across
+ * a network spawn), the default JceTransform, and JceTagActive — the last of
+ * which makes a replicated entity invisible to every active-filtered system,
+ * i.e. present but not simulated.
+ *
+ * The runtime owns both sides, so it installs the bridge here. */
+static uint64_t rt_net_entity_create(void *user)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene) return 0u;
+	/* Named so a replicated object is identifiable in the hierarchy rather
+	 * than showing up as an unnamed entity nobody can attribute. */
+	return (uint64_t)jce_scene_create_entity(rt->scene, "NetObject");
+}
+
+static void rt_net_entity_destroy(void *user, uint64_t entity)
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!rt || !rt->scene || !entity) return;
+	jce_scene_destroy_entity(rt->scene, (JceEntity)entity);
+}
+
 static void rt_init_net_bridge(JceRuntime *rt)
 {
 	if (jce_session_mode() == JCE_SESSION_MODE_NONE) return;
@@ -941,6 +1033,10 @@ static void rt_init_net_bridge(JceRuntime *rt)
 	/* Plumb the flecs world into replication + bind the scene into the
 	 * transform module so it can read / write entity transforms. */
 	jce_net_replication_set_world(jce_scene_get_world(rt->scene));
+	/* Route replicated entity create/destroy through the scene layer so
+	 * they get the roster bump, default transform and JceTagActive. */
+	jce_net_replication_set_entity_hooks(rt_net_entity_create,
+	                                     rt_net_entity_destroy, rt);
 	jce_net_transform_set_scene(rt->scene);
 
 	/* FEATURE 7.2 — register the built-in NetworkVariable component types
@@ -948,14 +1044,26 @@ static void rt_init_net_bridge(JceRuntime *rt)
 	 * components (jce_net_replication_component_count() > 0).  Must run
 	 * AFTER set_world() — register_all() creates its backing flecs
 	 * components on the bound world. */
-	jce_net_var_register_all();
+	if (!jce_net_var_register_all()) {
+		/* Every replicated float/int stops moving, AND the wire component
+		 * ids are interned in this call, so a peer that skipped it cannot
+		 * agree with one that did not. */
+		LOG_ERROR(LOG_TAG, "NetworkVariable components failed to register — "
+		                   "replicated variables will NOT sync");
+	}
 
 	/* GAS attribute replication — register the packed JceGasAttribRepl
 	 * replica component AFTER jce_net_var_register_all() so the substrate's
 	 * u16 component interning order (f32, i32, then gas-replica) is identical
 	 * on every peer and the NetworkVariable registration is undisturbed.
 	 * Same bound world as set_world() above. */
-	jce_gas_replication_register(jce_scene_get_world(rt->scene));
+	if (!jce_gas_replication_register(jce_scene_get_world(rt->scene))) {
+		/* Attributes stop replicating entirely.  On a client that reads as
+		 * "my health never changes" — a gameplay bug hunt, not a startup
+		 * one, unless it is said out loud here. */
+		LOG_ERROR(LOG_TAG, "GAS attribute replication failed to register — "
+		                   "attributes will NOT replicate");
+	}
 
 	/* Upstream client->server input command channel (F12 slice): intern the
 	 * RPC + its server handler once.  Registered on both roles (harmless on a
@@ -3282,10 +3390,14 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 
 		JcePhysicsWorldDesc wd;
 		memset(&wd, 0, sizeof wd);
-		wd.gravity.x      = 0.0f;
-		wd.gravity.y      = rt->desc_gravity_y != 0.0f ? rt->desc_gravity_y : -9.81f;
-		wd.gravity.z      = 0.0f;
+		wd.gravity.x      = rt->desc_gravity[0];
+		wd.gravity.y      = rt->desc_gravity[1];
+		wd.gravity.z      = rt->desc_gravity[2];
 		wd.fixed_timestep = fixed_dt;
+		/* Project Settings > Physics tuning (0 = leave Bullet default). */
+		wd.solver_iterations       = rt->desc_solver_iterations;
+		wd.linear_sleep_threshold  = rt->desc_sleep_threshold;
+		wd.angular_sleep_threshold = rt->desc_sleep_threshold;
 		wd.split_impulse  = -1; /* leave Bullet default (ON) */
 		/* JCE_PHYSICS_MAX_BODIES: raise the Bullet body pool past the 4096
 		 * default for large-scale physics stress benchmarks (#5). */
@@ -3305,8 +3417,8 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 
 		JcePhysics2DDesc wd2;
 		memset(&wd2, 0, sizeof wd2);
-		wd2.gravity.x  = 0.0f;
-		wd2.gravity.y  = rt->desc_gravity_y != 0.0f ? rt->desc_gravity_y : -9.81f;
+		wd2.gravity.x  = rt->desc_gravity2d[0];
+		wd2.gravity.y  = rt->desc_gravity2d[1];
 		wd2.max_bodies = 0; /* wrapper default (4096) */
 		rt->physics2d = jce_physics2d_create(&wd2);
 		if (!rt->physics2d)
@@ -3577,8 +3689,32 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	/* Capture the desc fields a scene transition needs so it can re-init each
 	 * loaded scene's subsystems with the same wiring (FEATURE 9.4). */
 	rt->enable_physics          = desc->enable_physics;
-	rt->desc_gravity_y          = desc->gravity_y;
+	/* Resolve the effective gravity vector once: an explicit gravity[] wins;
+	 * else the scalar gravity_y (source-compat); else the -9.81 Y default.
+	 * The old scalar-only path silently dropped X and Z. */
+	if (desc->gravity[0] != 0.0f || desc->gravity[1] != 0.0f ||
+	    desc->gravity[2] != 0.0f) {
+		rt->desc_gravity[0] = desc->gravity[0];
+		rt->desc_gravity[1] = desc->gravity[1];
+		rt->desc_gravity[2] = desc->gravity[2];
+	} else {
+		rt->desc_gravity[0] = 0.0f;
+		rt->desc_gravity[1] = (desc->gravity_y != 0.0f) ? desc->gravity_y : -9.81f;
+		rt->desc_gravity[2] = 0.0f;
+	}
 	rt->desc_fixed_timestep     = desc->fixed_timestep;
+	rt->desc_solver_iterations  = desc->solver_iterations;
+	rt->desc_sleep_threshold    = desc->sleep_threshold;
+	rt->desc_disable_auto_physics = desc->disable_auto_physics;
+	rt->desc_max_frame_dt       = desc->max_frame_dt;
+	/* 2D gravity: explicit gravity2d wins; else default (0, -9.81). */
+	if (desc->gravity2d[0] != 0.0f || desc->gravity2d[1] != 0.0f) {
+		rt->desc_gravity2d[0] = desc->gravity2d[0];
+		rt->desc_gravity2d[1] = desc->gravity2d[1];
+	} else {
+		rt->desc_gravity2d[0] = 0.0f;
+		rt->desc_gravity2d[1] = -9.81f;
+	}
 	rt->desc_mixer_config_path  = desc->mixer_config_path;
 	if (desc->navmesh_path && desc->navmesh_path[0]) {
 		size_t nn = strlen(desc->navmesh_path);
@@ -4018,7 +4154,10 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	const float sim_dt = rt->paused ? 0.0f : dt * rt->time_scale;
 
 	uint64_t _t0_physics = jce_time_perf_counter();
-	if (rt->physics) {
+	/* Project Settings > Physics > auto simulation == false: the world still
+	 * exists (for manual stepping via the physics API) but the runtime does not
+	 * auto-step it. */
+	if (rt->physics && !rt->desc_disable_auto_physics) {
 		/* Keep the physics cadence locked to the engine-wide clock so a
 		 * jce_engine_set_fixed_hz() (or the FIXED_UPDATE phase rate) and the
 		 * physics step can never desync (P1-fixed-clock-unify).  We copy the
@@ -4031,6 +4170,11 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 		if (gdt > 0.0 && gdt != rt->clock.fixed_dt) {
 			rt->clock.fixed_dt     = gdt;
 			rt->clock.max_frame_dt = gdt * (double)RT_MAX_FIXED_STEPS;
+			/* Project Settings > Time > max_allowed_timestep: a tighter
+			 * user-authored spiral-of-death clamp wins over the tick ceiling. */
+			if (rt->desc_max_frame_dt > 0.0f &&
+			    (double)rt->desc_max_frame_dt < rt->clock.max_frame_dt)
+				rt->clock.max_frame_dt = (double)rt->desc_max_frame_dt;
 			/* Don't let a now-oversized residual replay as a burst. */
 			if (rt->clock.accumulator > gdt)
 				rt->clock.accumulator = gdt;
@@ -4330,16 +4474,22 @@ JCE_API float JCE_CALL jce_runtime_vehicle_get_speed(JceRuntime *rt,
 	return jce_physics_vehicle_get_speed(rt->physics, ve->veh);
 }
 
-JCE_API void JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path)
+JCE_API bool JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path)
 {
-	if (!rt || !rt->script_vm || !path || !path[0]) return;
+	if (!rt || !rt->script_vm || !path || !path[0]) {
+		/* Previously a bare `return` with no log at all — a file watcher
+		 * firing before the VM exists looked exactly like a successful
+		 * reload that changed nothing. */
+		LOG_WARN(LOG_TAG, "hot-reload ignored: no script VM or empty path");
+		return false;
+	}
 
 	uint64_t size = 0;
 	void *src = rt_read_asset_with_fallback(rt, path, &size);
 	if (!src || size == 0) {
 		if (src) jce_free(src);
 		LOG_WARN(LOG_TAG, "hot-reload: cannot read '%s'", path);
-		return;
+		return false;
 	}
 	char chunkname[256];
 	snprintf(chunkname, sizeof chunkname, "@%s", path);
@@ -4348,7 +4498,7 @@ JCE_API void JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path
 	jce_free(src);
 	if (mod == 0) {
 		LOG_WARN(LOG_TAG, "hot-reload: '%s' failed to compile; keeping previous", path);
-		return;
+		return false;
 	}
 	int rebound = 0;
 	for (int i = 0; i < rt->script_count; ++i) {
@@ -4362,6 +4512,8 @@ JCE_API void JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path
 	 * this temp handle is safe (the module stays alive while in use). */
 	jce_script_release_module(rt->script_vm, mod);
 	LOG_INFO(LOG_TAG, "hot-reload: '%s' -> rebound %d instance(s)", path, rebound);
+	/* rebound == 0 is success: the file compiled, nothing live uses it yet. */
+	return true;
 }
 
 JCE_API bool JCE_CALL jce_runtime_dispatch_ui_click(JceRuntime *rt,

@@ -14,6 +14,8 @@
 
 #include "jce_rt_internal.h"
 
+#include <jce/os/core/jce_timer.h>   /* attribute the live collider-cook hitch */
+
 /*
  * Apply authored per-body properties that must be set AFTER body creation:
  *   - collision layer  -> broadphase group/mask via the layer matrix
@@ -156,6 +158,17 @@ static bool rt_try_load_cached_collider(JceRuntime *rt, const char *model_path,
 	return ok;
 }
 
+/* A live cook slower than this gets its own named log line, so the stall is
+ * attributable to an asset instead of showing up as an anonymous hitch. */
+#define RT_LIVE_COOK_WARN_MS 2.0
+
+/* The "you are cooking colliders inside the shipped runtime" explanation is
+ * printed ONCE per process; the per-asset cost lines below repeat.  Plain bool
+ * (not atomic) because every route into rt_spawn_entity is main-thread: the
+ * scene-load walk, the script-spawn flush and the streamer's per-entity
+ * wire-in all run inside the runtime step. */
+static bool s_live_cook_warned = false;
+
 /*
  * Cook + instantiate a body for entity `e` from a compound-collider
  * description.  Shared by the real Compound Collider component and the
@@ -186,7 +199,42 @@ static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 
 	if (!have_cooked) {
 
-		/* Load parts from the pak (deployed) or the host filesystem (editor). */
+		/* ── HAZARD: the OFFLINE cooker running inside the SHIPPED runtime ──
+		 * Everything below (an assimp parse of the whole model + jce_collider_cook)
+		 * is build-time work executing on the main thread at scene load — and
+		 * mid-gameplay for anything spawned later (jce.spawn, a streamed-in cell).
+		 * Nothing is memoised, so N entities sharing one model pay it N times,
+		 * and when the authored mode is JCE_COLLIDER_MODE_CONVEX_DECOMP it is a
+		 * full V-HACD voxel decomposition: seconds on a dense mesh.
+		 *
+		 * It stays anyway.  The two "cheaper" options are both worse: refusing to
+		 * cook above some complexity budget hands the player an entity with NO
+		 * collision (fall-through beats a hitch only until you fall through the
+		 * world), and substituting the box/sphere path from rt_spawn_entity_body
+		 * would silently give a shipped game a different collision shape than the
+		 * one it was authored and tested against.  So the cost is kept, and made
+		 * loud + attributable instead.
+		 *
+		 * The real fix is on the content side: cook colliders offline with
+		 * `jce_cook --collider` and ship the "<model>.jcol" blob beside the model
+		 * so rt_try_load_cached_collider above hits and none of this runs.  Note
+		 * that a CONVEX or DYNAMIC Mesh Collider passes allow_blob_cache=false and
+		 * therefore lands here unconditionally, blob or not (see rt_try_spawn_mesh). */
+		const uint64_t cook_t0 = jce_time_perf_counter();
+
+		/* Load parts from the pak (deployed) or the host filesystem (editor).
+		 *
+		 * NOTE: this is the one runtime path that still hands a .gltf/.glb to
+		 * assimp instead of cgltf.  It is tolerable — a collider consumes only
+		 * per-node positions/indices/world-transform, the subset both parsers
+		 * agree on, and the material/skin/morph data assimp drops is never
+		 * consulted here — but it is not drift-free: the part SPLIT and the
+		 * part NAMES come from assimp's node graph, and cc->detect_naming keys
+		 * collider behaviour off those names, so an authored glTF node name
+		 * assimp renames or a node whose primitives it merges yields a
+		 * different decomposition than the cgltf renderer draws.  Closing it
+		 * needs a cgltf per-node JceModelParts extractor, which does not exist
+		 * yet; until then keep the extension-agnostic call. */
 		JceModelParts parts;
 		memset(&parts, 0, sizeof parts);
 		bool loaded = false;
@@ -227,7 +275,14 @@ static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 		JceColliderPart *cparts =
 			(JceColliderPart *)jce_malloc((size_t)parts.count * sizeof(*cparts));
 		if (!cparts) { jce_model_importer_free_parts(&parts); return false; }
+		/* Snapshot the input size for the cost line below — `parts` is freed
+		 * before the cook result is checked. */
+		uint32_t cook_tris  = 0;
+		uint32_t cook_parts = parts.count;
 		for (uint32_t i = 0; i < parts.count; i++) {
+			cook_tris += parts.parts[i].index_count
+			             ? parts.parts[i].index_count / 3u
+			             : parts.parts[i].vertex_count / 3u;
 			cparts[i].name         = parts.parts[i].name;
 			cparts[i].vertices     = parts.parts[i].positions;
 			cparts[i].vertex_count = parts.parts[i].vertex_count;
@@ -253,6 +308,23 @@ static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 			LOG_WARN(LOG_TAG, "compound collider: cook failed for %s", cc->model_path);
 			return false;
 		}
+
+		/* Make the hazard above visible: the advisory once, the price per asset. */
+		double cook_ms = jce_time_perf_to_ms(cook_t0, jce_time_perf_counter());
+		if (!s_live_cook_warned) {
+			s_live_cook_warned = true;
+			LOG_WARN(LOG_TAG, "collider cook is running INSIDE the runtime — no "
+			         "'<model>.jcol' blob was found, so this scene parses and cooks "
+			         "collision geometry on the main thread at load.  Cook colliders "
+			         "offline (jce_cook --collider) and ship the .jcol beside the "
+			         "model to remove the hitch.");
+		}
+		if (cook_ms >= RT_LIVE_COOK_WARN_MS)
+			LOG_WARN(LOG_TAG, "live collider cook: %.1f ms for '%s' (%u tris in %u "
+			         "parts, mode %u%s) — cook this asset offline",
+			         cook_ms, cc->model_path, cook_tris, cook_parts,
+			         (unsigned)cfg.mode,
+			         cfg.mode == JCE_COLLIDER_MODE_CONVEX_DECOMP ? ", V-HACD" : "");
 	} /* !have_cooked */
 
 	JceColliderInstanceDesc id;
@@ -353,7 +425,11 @@ bool rt_try_spawn_mesh(JceRuntime *rt, JceScene *scene,
 	cc.restitution   = mc->restitution;
 
 	/* The offline ".jcol" blob beside the model is cooked AUTO + static —
-	 * only shape-compatible with the static triangle-mesh case here. */
+	 * only shape-compatible with the static triangle-mesh case here.  A convex
+	 * or dynamic mesh collider therefore ALWAYS takes the live parse+cook path
+	 * in rt_spawn_cooked_body (see the hazard note there) — cooking the asset
+	 * offline does NOT spare it, because the only blob the offline cooker emits
+	 * beside the model is the static one. */
 	bool allow_blob_cache = !convex && !dynamic;
 	return rt_spawn_cooked_body(rt, scene, e, tf, &cc, allow_blob_cache);
 }

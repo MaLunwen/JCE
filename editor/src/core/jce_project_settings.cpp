@@ -16,6 +16,7 @@
 #include <string.h>
 
 extern "C" {
+#include <jce/middleware/physics/jce_physics_layers.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
@@ -677,4 +678,25 @@ void jce_project_settings_apply(const JceProjectSettings *s)
      * session creation (see jce_editor_play). The values here are picked
      * up at that boundary. Hot-apply for currently-playing sessions is
      * tracked under the P1 follow-up backlog. */
+}
+
+/* ── Physics layer matrix push ────────────────────────────────────── */
+
+/* The engine's process-wide matrix and this authoring model must describe
+ * the same 32 slots — the push below indexes one with the other's count. */
+static_assert(JCE_PS_LAYER_COUNT == JCE_PHYSICS_LAYER_COUNT,
+              "project-settings layer count must match the engine matrix");
+
+void jce_project_settings_push_physics_layers(const JceProjectSettings *s)
+{
+    if (!s) return;
+    for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
+        jce_physics_layer_set_name(i, s->tags_layers.layers[i]);
+        /* jce_physics_set_layer_collides writes both (i,j) and (j,i), so
+         * walking the upper triangle covers every pair exactly once. */
+        for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j) {
+            bool collides = (s->physics.layer_collision_matrix[i] >> j) & 1u;
+            jce_physics_set_layer_collides(i, j, collides);
+        }
+    }
 }

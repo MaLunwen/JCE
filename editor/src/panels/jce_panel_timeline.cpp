@@ -6,6 +6,7 @@
  * and the scene render model cache for real-time animation preview.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_i18n.h"
@@ -330,16 +331,9 @@ void jce_editor_panel_timeline(void)
      * that workbench and requests the Timeline tab.  Symbol kept so
      * menu/hotkey entries registered against JCE_PANEL_TIMELINE
      * keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_TIMELINE);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
-    if (ae_vis) *ae_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###jce_anim_editor",
-             jce_editor_i18n("animationEditor.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_animation_editor_request_tab(4);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_TIMELINE,
+                                        JCE_PANEL_ANIMATION_EDITOR,
+                                        "animationEditor.title",
+                                        "jce_anim_editor"))
+        jce_panel_animation_editor_request_tab(4);
 }

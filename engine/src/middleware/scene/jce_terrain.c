@@ -11,15 +11,12 @@
 
 #include "os/core/jce_memory.h"
 
-/* stb_image is implemented (with all built-in codecs) in
- * renderer/jce_stb_image_impl.c; jce_scene links jce_renderer privately so
- * those symbols resolve at final link.  We only need the declarations here,
- * matching the impl translation unit's STBI_NO_STDIO contract.  stb's loaders
- * allocate with plain malloc/free (the impl does not override STBI_MALLOC), so
- * buffers returned by stbi_load_* must be released with stbi_image_free — NOT
- * the engine allocator. */
-#define STBI_NO_STDIO
-#include "renderer/internal/stb_image.h"
+/* Heightmap PNG/16-bit decode goes through the JCE image facade
+ * (jce_image_load_gray16_from_memory) instead of reaching stb_image
+ * directly — keeping the specialized numeric decode behind a JCE seam
+ * (audit R-D41 / image-service boundary). jce_scene links jce_renderer
+ * privately, so the facade symbols resolve at final link. */
+#include <jce/renderer/jce_image.h>
 
 #include <limits.h>
 #include <math.h>
@@ -1241,12 +1238,10 @@ bool jce_terrain_import_heightmap_file(JceTerrain *t, const char *path)
      * buffer length as an int, so a file larger than INT_MAX cannot go through
      * the codec path safely (the cast would wrap negative / truncate); skip
      * straight to the headerless RAW / warn branch in that case. */
-    int w = 0, h = 0, comp = 0;
-    /* 16-bit load promotes 8-bit sources to the full 0..65535 range. */
-    stbi_us *px16 = (got > (uint64_t)INT_MAX)
-                  ? NULL
-                  : stbi_load_16_from_memory((const stbi_uc *)file, (int)got,
-                                             &w, &h, &comp, /*req_comp=*/1);
+    int w = 0, h = 0;
+    /* 16-bit load promotes 8-bit sources to the full 0..65535 range.  The
+     * facade rejects buffers larger than INT_MAX internally. */
+    uint16_t *px16 = jce_image_load_gray16_from_memory(file, got, &w, &h);
     if (px16 && w > 0 && h > 0) {
         size_t n = (size_t)w * (size_t)h;
         float *norm = (float *)JCE_MALLOC(n * sizeof(float));
@@ -1258,9 +1253,9 @@ bool jce_terrain_import_heightmap_file(JceTerrain *t, const char *path)
         } else {
             LOG_WARN("terrain", "OOM decoding heightmap image: %s", path);
         }
-        stbi_image_free(px16);
+        jce_image_free_gray16(px16);
     } else {
-        if (px16) stbi_image_free(px16);
+        if (px16) jce_image_free_gray16(px16);
         /* Fallback: headerless RAW grayscale.  Infer bit depth + square or
          * grid-matching dims from the byte count. */
         size_t W = (size_t)t->w, H = (size_t)t->h;

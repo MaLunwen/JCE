@@ -18,6 +18,7 @@
 #include <jce/os/core/jce_defs.h>
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -119,6 +120,12 @@ JCE_API void             jce_actions_destroy(JceInputActions *a);
  * / unparseable / empty file so the caller can fall back to
  * jce_actions_bind_fps_defaults(). */
 JCE_API JceInputActions *jce_actions_load_file(const char *path);
+
+/* Load the same editor-authored schema from a bounded memory block.  The
+ * bytes need not be NUL-terminated.  This is the canonical parser used by
+ * packed single-file applications; malformed, empty, or action-free input
+ * returns NULL. */
+JCE_API JceInputActions *jce_actions_load_memory(const void *data, size_t size);
 
 /* Save an action map to a JSON file in the exact schema
  * jce_actions_load_file() reads.  Returns true on success. */

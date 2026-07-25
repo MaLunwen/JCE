@@ -13,8 +13,12 @@
  * `(b,a)`.  Defaults: every pair collides (rows = 0xFFFFFFFF), layer
  * 0 is named "Default" and the remaining slots hold "Layer N".
  *
- * JSON I/O writes the canonical `.jce/physics_layers.json` document
- * consumed by both the editor panel and runtime body filter helpers.
+ * JSON I/O is the authoring → shipped-game bridge, NOT an unread write
+ * path: the editor build exports the project's authored matrix as
+ * `<cooked>/physics_layers.json` and the shipped runtime loads it back in
+ * app_init — loose cooked tree first, then the embedded PAK via the _mem
+ * variant — before any body spawns.  Editor Play needs no file at all: it
+ * pushes the same authored matrix straight into this cache.
  *
  * Layer: middleware/physics (L4).  Pure C99.
  */
@@ -66,8 +70,10 @@ JCE_API void JCE_CALL jce_physics_layer_matrix_reset_default(void);
  *     "names":   [ "Default", "Layer 1", ..., "Layer 31" ],
  *     "matrix":  [ 4294967295, 4294967295, ... ]  // 32 row masks
  *   }
- * Both functions use jce_fs_host_* under the hood (no raw C runtime).
- * Returns false on I/O or parse error. */
+ * The file-backed pair uses jce_fs_host_* under the hood (no raw C
+ * runtime).  Returns false on I/O or parse error.
+ * save_json's output is read back by the loaders below in every shipped
+ * build — do not retire it as a write-only path. */
 JCE_API bool JCE_CALL jce_physics_layer_matrix_save_json(const char *vfs_path);
 JCE_API bool JCE_CALL jce_physics_layer_matrix_load_json(const char *vfs_path);
 /* Parse from an in-memory JSON buffer (single-exe: bytes decompressed from the

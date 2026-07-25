@@ -350,10 +350,11 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
     sr->tex_cache[idx].failed  = false;
     sr->tex_cache[idx].pending = true;
     sr->tex_cache[idx].job     = j;
-    sr->tex_cache[idx].thr     = jce_thread_create(sr_tex_worker, j,
-                                                   "jce_sr_tex");
-    if (!sr->tex_cache[idx].thr) {
-        /* No worker thread: decode + upload inline this frame. */
+    sr->tex_cache[idx].thr     = NULL;   /* pooled now; no handle to join */
+    if (!sr->decode_pool ||
+        !jce_thread_pool_submit(sr->decode_pool, sr_tex_worker, j)) {
+        /* Could not queue: decode + upload inline this frame, exactly as
+         * when jce_thread_create used to fail. */
         sr_tex_worker(j);
         JceTexture tex = jce_texture_upload_cpu(j->result);
         sr->tex_cache[idx].tex     = tex;
@@ -510,10 +511,20 @@ static void sr_model_worker(void *arg)
     jce_atomic_i32_store(j->done, 1);
 }
 
-/* RENDER thread, per-frame: upload any finished async model decodes. */
+/* RENDER thread: upload a bounded number of finished async model decodes per
+ * bgfx frame.  CPU decode remains parallel, but a model can fan out into many
+ * vertex/index/wireframe resources.  Submitting several completed models in
+ * one frame creates a large burst of backend staging allocations; Intel D3D12
+ * drivers can reject that burst even though the payload is small. */
 static void sr_model_poll(JceSceneRenderer *sr)
 {
     if (!sr || sr->model_inflight == 0) return;
+
+    uint32_t frame = jce_renderer_get_frame_index(sr->renderer);
+    if (sr->model_upload_frame_valid && sr->model_upload_frame == frame)
+        return;
+
+    uint32_t uploaded = 0;
     for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
         SrModelCache *e = &sr->model_cache[i];
         if (!e->pending) continue;
@@ -538,6 +549,13 @@ static void sr_model_poll(JceSceneRenderer *sr)
             LOG_WARN(LOG_TAG, "model cache: cannot load %s (will not retry)", e->path);
         else
             LOG_INFO(LOG_TAG, "model cache: loaded %s (async)", e->path);
+
+        uploaded++;
+        if (uploaded >= SR_MODEL_UPLOADS_PER_FRAME) {
+            sr->model_upload_frame = frame;
+            sr->model_upload_frame_valid = true;
+            break;
+        }
     }
 }
 
@@ -633,9 +651,10 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
     e->job     = j;
     e->vram_bytes      = 0;
     e->last_used_frame = sr->model_frame;   /* requested this frame */
-    e->thr     = jce_thread_create(sr_model_worker, j, "jce_sr_model");
-    if (!e->thr) {
-        /* No worker thread: decode + upload inline this frame. */
+    e->thr     = NULL;                   /* pooled now; no handle to join */
+    if (!sr->decode_pool ||
+        !jce_thread_pool_submit(sr->decode_pool, sr_model_worker, j)) {
+        /* Could not queue: decode + upload inline this frame. */
         sr_model_worker(j);
         e->model   = jce_model_upload_gltf_cpu(j->cpu);
         e->failed  = (e->model == NULL);
@@ -1279,6 +1298,17 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
 
     sr->renderer = renderer;
     sr->pak = pak;
+
+    /* Private decode pool — see the field comment in jce_sr_internal.h.
+     * Sized to the in-flight budget the resolvers already enforce, so this
+     * changes thread CHURN (one create+destroy per asset) into reuse without
+     * changing how much decoding runs at once.  A NULL pool is survivable:
+     * every caller falls back to decoding inline. */
+    sr->decode_pool = jce_thread_pool_create(SR_TEX_MAX_INFLIGHT +
+                                             SR_MODEL_MAX_INFLIGHT);
+    if (!sr->decode_pool)
+        LOG_WARN(LOG_TAG, "decode pool unavailable — texture and model loads "
+                          "will run inline on the render thread");
     if (cbs) { sr->cbs = *cbs; sr->has_cbs = true; }
 
     /* Per-frame per-entity cull cache (SrEntityCull).  Heap-allocated here
@@ -1327,6 +1357,9 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_light_color.idx   = UINT16_MAX;
     sr->shadow_tex.idx      = UINT16_MAX;
     sr->shadow_fbo.idx      = UINT16_MAX;
+    sr->dyn_csm_atlas_tex.idx = UINT16_MAX;
+    sr->dyn_csm_atlas_fbo.idx = UINT16_MAX;
+    sr->u_csm_dyn_params.idx  = UINT16_MAX;
     sr->u_shadowMap.idx     = UINT16_MAX;
     sr->u_shadowVP.idx      = UINT16_MAX;
     sr->local_atlas_tex.idx       = UINT16_MAX;
@@ -1524,7 +1557,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         uint32_t white = 0xFFFFFFFFu;
         const bgfx_memory_t *mem = bgfx_copy(&white, 4);
         sr->white_tex = bgfx_create_texture_2d(1, 1, false, 1,
-                                               BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                               BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     /* 1×1 black CUBEMAP placeholder for the IBL samplers (stages 6/7).  When
@@ -1538,7 +1571,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         uint32_t faces[6] = { 0, 0, 0, 0, 0, 0 };
         const bgfx_memory_t *mem = bgfx_copy(faces, sizeof(faces));
         sr->dummy_cube = bgfx_create_texture_cube(1, false, 1,
-                                                  BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                                  BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     /* 8×8 magenta/yellow "missing texture" checkerboard (TEXTURED-mode
@@ -1552,7 +1585,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                 pix[y * 8 + x] = (((x ^ y) >> 1) & 1) ? MAG : YEL;
         const bgfx_memory_t *mem = bgfx_copy(pix, sizeof(pix));
         sr->checker_tex = bgfx_create_texture_2d(8, 8, false, 1,
-                                                 BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                                 BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     LOG_INFO(LOG_TAG, "[init] shadow map (depth_fmt=%d)", (int)depth_fmt);
@@ -1563,7 +1596,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             BGFX_TEXTURE_RT
             | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
             | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-            NULL);
+            NULL, 0);
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
         bgfx_attachment_init(&at, sr->shadow_tex, BGFX_ACCESS_WRITE,
@@ -1598,7 +1631,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                 BGFX_TEXTURE_RT
                 | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                 | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-                NULL);
+                NULL, 0);
             bgfx_attachment_t at;
             memset(&at, 0, sizeof(at));
             bgfx_attachment_init(&at, sr->csm_tex[i], BGFX_ACCESS_WRITE,
@@ -1608,6 +1641,24 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                 BGFX_UNIFORM_TYPE_SAMPLER, 1);
             if (!BGFX_HANDLE_IS_VALID(sr->csm_fbo[i])) sr->csm_valid = false;
         }
+        /* Dual shadow-map DYNAMIC atlas (JCE_SHADOW_DUAL): one depth texture the
+         * size of a full cascade map, holding the 4 cascades as a 2x2 grid of
+         * (sz/2)^2 tiles.  Movers render here every frame while the static
+         * csm_tex[c] cache aggressively; the PBR shader min()s the two. */
+        {
+            sr->dyn_csm_atlas_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
+                BGFX_TEXTURE_RT
+                | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+                NULL, 0);
+            bgfx_attachment_t dat;
+            memset(&dat, 0, sizeof(dat));
+            bgfx_attachment_init(&dat, sr->dyn_csm_atlas_tex, BGFX_ACCESS_WRITE,
+                                 0, 1, 0, BGFX_RESOLVE_NONE);
+            sr->dyn_csm_atlas_fbo = bgfx_create_frame_buffer_from_attachment(1, &dat, false);
+            sr->dyn_csm_atlas_size = sz;
+            sr->dyn_csm_valid = BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_fbo);
+        }
         sr->u_csm_vp = bgfx_create_uniform("u_csmVP",
             BGFX_UNIFORM_TYPE_MAT4, JCE_CSM_MAX_CASCADES);
         sr->u_csm_splits      = bgfx_create_uniform("u_csmSplits",
@@ -1615,6 +1666,11 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         sr->u_csm_params      = bgfx_create_uniform("u_csmParams",
             BGFX_UNIFORM_TYPE_VEC4, 1);
         sr->u_csm_bias_scales = bgfx_create_uniform("u_csmBiasScales",
+            BGFX_UNIFORM_TYPE_VEC4, 1);
+        /* Dual shadow-map dynamic-atlas params: {tiles=2, 1/atlas_size,
+         * enabled, 0}.  Uploaded in sr_bind_frame_shadow_state; the shader
+         * min()s the dynamic tile into sample_csm_shadow when enabled>0.5. */
+        sr->u_csm_dyn_params  = bgfx_create_uniform("u_csmDynParams",
             BGFX_UNIFORM_TYPE_VEC4, 1);
         LOG_INFO(LOG_TAG, "[init] csm_valid=%d", (int)sr->csm_valid);
     }
@@ -1703,14 +1759,19 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
      * scratch-buffer overflow that used to crash large scenes (hundreds+ of
      * entities) when TAA was on.  Verified crash-free under ASAN at 1500
      * entities. */
-    /* TAA default is TIER-RESOLVED: MEDIUM+ keeps it on; the LOW tier
-     * (512MB / no-dGPU charter baseline) defaults to FXAA — TAA's resident RT
-     * family (full-res RGBA16F history + resolve ping-pong + motion/velocity
-     * targets) costs ~100MB at 2560x1600, which the shared-memory baseline
-     * cannot spare.  This is only the DEFAULT: the cvar / render-pipeline
-     * panel still lets any machine opt in or out explicitly. */
+    /* TAA default is TIER + GPU-CLASS resolved: it defaults ON only on a
+     * DISCRETE MEDIUM+ GPU.  The LOW tier (512MB charter baseline) and every
+     * INTEGRATED GPU default to FXAA instead — TAA's resident RT family
+     * (full-res RGBA16F history + resolve ping-pong + motion/velocity targets,
+     * ~100MB at 2560x1600) AND its per-frame velocity GEOMETRY pre-pass are
+     * exactly the bandwidth/fill cost a shared-memory iGPU cannot spare (an
+     * iGPU is capped at MEDIUM, so `>= MEDIUM` alone would wrongly enable it).
+     * Matches the has_discrete gate the capability recommendation already uses
+     * for TAA.  DEFAULT only: the cvar / render-pipeline panel still lets any
+     * machine force TAA on or off explicitly. */
     const bool taa_default =
-        jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM;
+        jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM &&
+        jce_renderer_get_recommendation().has_discrete_gpu;
     sr->cv_taa = jce_cvar_register_bool(
         "r.taa", taa_default, JCE_CVAR_FLAG_NONE,
         "Temporal anti-aliasing (default on at MEDIUM tier and above; the LOW "
@@ -1751,6 +1812,26 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             jce_cvar_set_bool(sr->cv_gpu_driven, true);
             LOG_INFO(LOG_TAG, "[init] settings perf.gpu_scene -> r.gpu_driven ON");
         }
+    }
+
+    /* r.upscaler — the dynamic-resolution upscaler the editor Scene View uses
+     * (0=Off/bilinear, 1=RCAS spatial sharpen, 2=TSR temporal super-resolution).
+     * Default RCAS. Read LIVE each frame so the Render Pipeline panel dropdown
+     * A/Bs instantly on the same scene. JCE_RCAS=0 -> Off, JCE_TSR=1 -> TSR force
+     * the boot value for headless QA (mirrors the JCE_GPU_SCENE idiom above). */
+    sr->cv_upscaler = jce_cvar_register_int(
+        "r.upscaler", 1, JCE_CVAR_FLAG_NONE,
+        "Dynamic-resolution upscaler (editor Scene View): 0=Off (bilinear), "
+        "1=RCAS spatial sharpen (default), 2=TSR temporal super-resolution. "
+        "Only active while dynamic resolution is downscaling (GPU-bound / "
+        "JCE_DYNRES_SCALE).");
+    if (sr->cv_upscaler) {
+        const char *rcas_env = getenv("JCE_RCAS");
+        const char *tsr_env  = getenv("JCE_TSR");
+        if (tsr_env && tsr_env[0] && tsr_env[0] != '0')
+            jce_cvar_set_int(sr->cv_upscaler, 2);
+        else if (rcas_env && rcas_env[0] == '0')
+            jce_cvar_set_int(sr->cv_upscaler, 0);
     }
     /* GPUScene helper: loads cs_cull_frustum from the engine shader pak (with
      * the embedded-engine-pak fallback).  Returns a no-op handle on devices
@@ -1942,6 +2023,15 @@ struct JceModel *jce_scene_renderer_get_model(
 void jce_scene_renderer_destroy(JceSceneRenderer *sr)
 {
     if (!sr) return;
+
+    /* Drain BEFORE anything else: jce_thread_pool_destroy waits for pending
+     * tasks, and those tasks write into the per-asset job structs that the
+     * cache teardown below frees.  Destroying in the other order would let a
+     * decode finish into memory that had just been released. */
+    if (sr->decode_pool) {
+        jce_thread_pool_destroy(sr->decode_pool);
+        sr->decode_pool = NULL;
+    }
 
     /* Per-entity animation instances (players reference, but don't own, the
        shared skeletons in model_cache — destroy them before the models). */
@@ -2609,6 +2699,11 @@ static void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
     if (sr->ecull[eci].casts_shadow) {
         sr->shadow_caster_key ^=
             sr_ecull_mix64((uint64_t)e * 1099511628211ull + e_gen);
+        /* Dual mode: the static-only key folds NON-dynamic casters only, so a
+         * mover's xform_gen churn leaves the static cascade cache valid. */
+        if (!e_is_dynamic)
+            sr->shadow_static_caster_key ^=
+                sr_ecull_mix64((uint64_t)e * 1099511628211ull + e_gen);
         if (e_is_dynamic) {
             sr->shadow_has_dynamic_caster = true;
             /* Append to the per-frame dynamic-caster list (dedup: the L2
@@ -2686,23 +2781,25 @@ typedef struct SrEcullBuildCtx {
  * disjoint ecull[eci] writes); misses land in the chunk's segment of
  * sr->ecull_miss for the serial replay.  Each chunk owns its own slots of
  * ecull_key_parts / ecull_miss_counts (begin/CHUNK is unique per chunk). */
-static void sr_ecull_hit_range(int begin, int end, void *user)
+static void sr_ecull_hit_range(uint32_t begin, uint32_t end, void *user)
 {
     SrEcullBuildCtx *c = (SrEcullBuildCtx *)user;
     JceSceneRenderer *sr = c->sr;
     JceScene *scene = c->scene;
-    const uint32_t chunk_id = (uint32_t)begin / SR_ECULL_PAR_CHUNK;
+    /* Exact because jce_thread_pool_parallel_for pins begin to a multiple of
+     * the chunk size — this slot is written (not accumulated) once per chunk. */
+    const uint32_t chunk_id = begin / SR_ECULL_PAR_CHUNK;
     uint32_t *miss_seg = sr->ecull_miss + (size_t)chunk_id * SR_ECULL_PAR_CHUNK;
     uint32_t  miss_n   = 0;   /* wcache misses fill the segment front… */
     uint32_t  fmiss_n  = 0;   /* …focus-insert requests fill it from the back */
     uint64_t  key_part = 0;
-    for (int eci = begin; eci < end; eci++) {
+    for (uint32_t eci = begin; eci < end; eci++) {
         JceEntity e = c->list->entities[eci];
         const uint64_t e_gen = jce_scene_entity_xform_gen(scene, e);
         SrWorldCacheEntry *hit =
             sr_wcache_find(sr, (uint32_t)e, c->struct_epoch, e_gen);
-        if (!hit) { miss_seg[miss_n++] = (uint32_t)eci; continue; }
-        sr_ecull_copy_hit(sr, scene, e, eci, hit);
+        if (!hit) { miss_seg[miss_n++] = eci; continue; }
+        sr_ecull_copy_hit(sr, scene, e, (int)eci, hit);
         if (sr->ecull[eci].casts_shadow)
             key_part ^= sr_ecull_mix64((uint64_t)e * 1099511628211ull + e_gen);
         hit->touched = true;           /* keep alive through the prune */
@@ -2712,7 +2809,7 @@ static void sr_ecull_hit_range(int begin, int end, void *user)
         if (sr->ecull[eci].has_aabb &&
             !sr_focus_aabb_touch_update(sr, (uint32_t)e, sr->ecull[eci].wmin,
                                         sr->ecull[eci].wmax))
-            miss_seg[SR_ECULL_PAR_CHUNK - 1u - fmiss_n++] = (uint32_t)eci;
+            miss_seg[SR_ECULL_PAR_CHUNK - 1u - fmiss_n++] = eci;
     }
     sr->ecull_key_parts[chunk_id]   = key_part;
     sr->ecull_miss_counts[chunk_id] = miss_n | (fmiss_n << 16);
@@ -3725,6 +3822,9 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                      * repair's build_miss calls via shadow_has_dynamic_caster. */
                     sr->shadow_caster_key =
                         sr->ecull_frz_caster_key ^ sr_ecull_mix64(frz_xform);
+                    /* Static-only key is UNCHANGED by mover motion (dual mode) —
+                     * restore the frozen value, do NOT perturb with frz_xform. */
+                    sr->shadow_static_caster_key = sr->ecull_frz_static_caster_key;
                     sr->ecull_frz_dyn = sr->shadow_has_dynamic_caster;
                     sr->ecull_frz_list_gen = s_col_list_gen;
                     sr->ecull_frz_xform    = frz_xform;
@@ -3749,11 +3849,13 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     }
     if (ecull_frozen) {
         sr->shadow_caster_key         = sr->ecull_frz_caster_key;
+        sr->shadow_static_caster_key  = sr->ecull_frz_static_caster_key;
         sr->shadow_has_dynamic_caster = sr->ecull_frz_dyn;
         sr->frame_list_gen = s_col_list_gen;
         goto ecull_build_done;
     }
     sr->shadow_caster_key = 1469598103934665603ull; /* FNV offset basis */
+    sr->shadow_static_caster_key = 1469598103934665603ull;
     sr->shadow_has_dynamic_caster = false;
     sr->shadow_dyn_count = 0;
     sr->cull_movers_count = -1;              /* full rebuild: movers unknown */
@@ -3797,10 +3899,10 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             const char *pv = getenv("JCE_DISABLE_ECULL_PAR");
             s_ecull_par_disabled = (pv && pv[0] && pv[0] != '0') ? 1 : 0;
         }
-        JceJobSystem *ecull_jobs =
-            s_ecull_par_disabled ? NULL : jce_jobs_default();
-        bool ecull_par = wcache_on && ecull_jobs &&
-                         jce_jobs_worker_count(ecull_jobs) > 1 &&
+        JceThreadPool *ecull_pool =
+            s_ecull_par_disabled ? NULL : jce_thread_pool_shared();
+        bool ecull_par = wcache_on && ecull_pool &&
+                         jce_thread_pool_worker_count(ecull_pool) > 1 &&
                          list.count >= (int)SR_ECULL_PAR_CHUNK;
         uint32_t n_chunks = 0;
         if (ecull_par) {
@@ -3838,9 +3940,9 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             bctx.sr = sr; bctx.scene = scene; bctx.list = &list;
             bctx.struct_epoch = struct_epoch;
             uint64_t _t0_ehit = jce_time_perf_counter();
-            jce_jobs_parallel_for(ecull_jobs, list.count,
-                                  (int)SR_ECULL_PAR_CHUNK,
-                                  sr_ecull_hit_range, &bctx);
+            jce_thread_pool_parallel_for(ecull_pool, (uint32_t)list.count,
+                                         SR_ECULL_PAR_CHUNK,
+                                         sr_ecull_hit_range, &bctx);
             uint64_t _t0_emiss = jce_time_perf_counter();
             jce_perf_phase_add("ecull_hit",
                                jce_time_perf_to_ms(_t0_ehit, _t0_emiss));
@@ -3921,6 +4023,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
 
     /* Memoize the freshly built caster key for the frozen-frame replay. */
     sr->ecull_frz_caster_key = sr->shadow_caster_key;
+    sr->ecull_frz_static_caster_key = sr->shadow_static_caster_key;
     sr->ecull_frz_dyn        = sr->shadow_has_dynamic_caster;
     sr->ecull_frz_valid      = true;
 

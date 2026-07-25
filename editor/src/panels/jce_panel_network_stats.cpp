@@ -3,6 +3,7 @@
  * rolling 60-second plots (P4-E.2).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
@@ -93,50 +94,18 @@ void plot_lines(const char *label, const float *data, int head, const char *over
                      FLT_MAX, FLT_MAX, ImVec2(0, 40));
 }
 
-int g_request_tab = -1;
-int g_current_tab = 0;  /* mirror of active TabItem for menu markers */
-bool g_tab_state_loaded = false;
-
-static const char *k_tab_state_key = "panel.network.current_tab";
-
-bool valid_tab(int idx)
-{
-    return idx >= 0 && idx <= 1;
-}
-
-void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-void set_current_tab(int idx)
-{
-    if (!valid_tab(idx) || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+JcePanelTabState g_tabs{ "panel.network.current_tab", /*max_tab=*/1 };
 
 } /* namespace */
 
 extern "C" void jce_panel_network_stats_request_tab(int idx)
 {
-    if (!valid_tab(idx))
-        return;
-    g_request_tab = idx;
-    g_current_tab = idx;
-    jce_editor_ui_state_save_int(k_tab_state_key, idx);
+    jce_panel_tab_request(g_tabs, idx);
 }
 
 extern "C" int jce_panel_network_stats_current_tab(void)
 {
-    ensure_tab_state_loaded();
-    return g_current_tab;
+    return jce_panel_tab_current(g_tabs);
 }
 
 extern "C" void jce_editor_panel_lan_discovery_content(void);
@@ -263,12 +232,12 @@ static void draw_stats_tab(void)
 
 extern "C" void jce_editor_panel_network_stats_content(void)
 {
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (!ImGui::BeginTabBar("##net_tabs"))
         return;
 
-    ImGuiTabItemFlags stats_flags = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags disc_flags  = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags stats_flags = jce_panel_tab_flags(g_tabs, 0);
+    ImGuiTabItemFlags disc_flags  = jce_panel_tab_flags(g_tabs, 1);
 
     char stats_label[64];
     char disc_label[64];
@@ -278,18 +247,18 @@ extern "C" void jce_editor_panel_network_stats_content(void)
                   jce_editor_i18n("panel.lan_discovery.title"));
 
     if (ImGui::BeginTabItem(stats_label, nullptr, stats_flags)) {
-        set_current_tab(0);
+        jce_panel_tab_set_current(g_tabs, 0);
         draw_stats_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(disc_label, nullptr, disc_flags)) {
-        set_current_tab(1);
+        jce_panel_tab_set_current(g_tabs, 1);
         jce_editor_panel_lan_discovery_content();
         ImGui::EndTabItem();
     }
 
     ImGui::EndTabBar();
-    g_request_tab = -1;
+    g_tabs.request = -1;
 }
 
 extern "C" void jce_editor_panel_network_stats(void)

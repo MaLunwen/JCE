@@ -4,21 +4,21 @@
  * Converts raw assets into .jceasset binary containers.
  * Each cook function: decode input → build chunks → compress → serialize.
  *
- * Dependencies: SDL3_image (texture decode), miniaudio (audio decode),
+ * Dependencies: jce_image via jce_image_decode (texture decode — the cooker
+ *               never picks a codec), miniaudio (audio decode),
  *               ZSTD (compression), XXHash (source hash).
  */
 
 #include "jce_asset_cooker.h"
 
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/resource/jce_image_decode.h>  /* gray16-PNG bypass (see below) */
+#include <jce/resource/jce_image_decode.h>  /* the one image-decode service */
 
 #include "jce_cook_policy.h"
 #include "jce_tex_compress.h"
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +26,26 @@
 #include <zstd.h>
 
 #ifndef JCE_NO_AUDIO
+/* Audio decode source of truth.
+ *
+ * Compiled INTO the engine (jce_resource, which links jce_audio — the
+ * JCE_BUILDING_ENGINE marker every _jce_add_layer target sets), cook through
+ * the audio module's canonical decoder so the cooked PCM is exactly what the
+ * runtime would have produced, including the Opus custom backend and the
+ * M4A/AAC route a bare ma_decoder knows nothing about (audit
+ * A2-AUDIO-DECODE-DRIFT).
+ *
+ * The standalone jce_cook host tool compiles this same TU from an explicit
+ * source list that links neither jce_audio nor Opus/Ogg/fdk-aac, so there it
+ * falls back to the lean miniaudio-only decode below: .opus/.m4a sources must
+ * be cooked in-process (editor "Build Bundles") until jce_cook links the audio
+ * layer. */
+#ifdef JCE_BUILDING_ENGINE
+#define JCE_COOK_AUDIO_VIA_AUDIO_LAYER 1
+#include <jce/middleware/audio/jce_audio.h>
+#else
 #include <miniaudio.h>
+#endif
 #endif
 
 /* ================================================================== */
@@ -227,74 +246,45 @@ static JceCookResult build_asset(uint32_t asset_type,
 /* Cook: Texture (with optional mipmaps)                               */
 /* ================================================================== */
 
-/* 16-bit GRAYSCALE PNG (IHDR bitdepth=16, colortype=0): the bundled
- * SDL3_image/libpng path heap-overruns on this class (STATUS_HEAP_CORRUPTION
- * in jce_cook — found cooking a DCC-exported height map).  Detect it from
- * the raw header and decode via the engine's stb_image path instead, which
- * down-converts 16->8 with correct 2-byte stride. */
-static bool cook_is_gray16_png(const void *data, size_t size)
-{
-    const uint8_t *b = (const uint8_t *)data;
-    static const uint8_t sig[8] = { 0x89,'P','N','G','\r','\n',0x1A,'\n' };
-    return size >= 26 &&
-           memcmp(b, sig, 8) == 0 &&
-           memcmp(b + 12, "IHDR", 4) == 0 &&
-           b[24] == 16 /* bit depth */ &&
-           b[25] == 0  /* colortype gray */;
-}
-
 JceCookResult jce_cook_texture(const void *input, size_t input_size,
                                const JceCookOptions *opts)
 {
     JceCookResult result = {0};
     SDL_Surface *surf = NULL;
 
-    if (cook_is_gray16_png(input, input_size)) {
-        JceImage img;
-        if (!jce_image_decode(input, input_size, &img) || !img.pixels) {
-            snprintf(result.error, sizeof(result.error),
-                     "16-bit gray PNG decode failed");
-            return result;
-        }
-        surf = SDL_CreateSurface((int)img.width, (int)img.height,
-                                 SDL_PIXELFORMAT_RGBA32);
-        if (!surf) {
-            jce_image_free(&img);
-            snprintf(result.error, sizeof(result.error),
-                     "SDL_CreateSurface failed");
-            return result;
-        }
-        for (uint32_t y = 0; y < img.height; y++)
-            memcpy((uint8_t *)surf->pixels + (size_t)y * surf->pitch,
-                   img.pixels + (size_t)y * img.width * 4u,
-                   (size_t)img.width * 4u);
+    /* Decode through the ONE image service (jce_image, reached here via the
+     * JceImage adapter).  Two reasons this call site must not pick a codec:
+     *
+     *   1. Cooked pixels must be exactly what the runtime would have decoded
+     *      from the same source, and the runtime decodes through this service.
+     *   2. A 16-bit GRAYSCALE PNG (IHDR bitdepth=16, colortype=0) heap-overruns
+     *      the bundled SDL3_image/libpng path — STATUS_HEAP_CORRUPTION, found
+     *      cooking a DCC-exported height map.  This file used to carry its own
+     *      copy of the header sniff that routes that class to stb_image; the
+     *      sniff now lives in the service, so there is one implementation of
+     *      it instead of two that can silently drift apart.
+     *
+     * The service always yields tightly-packed RGBA8, so the surface below is
+     * RGBA8 by construction and needs no convert step.  It exists only because
+     * the rest of this function drives SDL blits (the max-dimension downscale). */
+    JceImage img;
+    if (!jce_image_decode(input, input_size, &img) || !img.pixels) {
+        snprintf(result.error, sizeof(result.error), "image decode failed");
+        return result;
+    }
+    surf = SDL_CreateSurface((int)img.width, (int)img.height,
+                             SDL_PIXELFORMAT_RGBA32);
+    if (!surf) {
         jce_image_free(&img);
-    } else {
-        /* Decode image via SDL3_image. */
-        SDL_IOStream *io = SDL_IOFromConstMem(input, input_size);
-        if (!io) {
-            snprintf(result.error, sizeof(result.error), "SDL_IOFromConstMem failed");
-            return result;
-        }
-
-        surf = IMG_Load_IO(io, true);
-        if (!surf) {
-            snprintf(result.error, sizeof(result.error), "IMG_Load_IO failed: %s",
-                     SDL_GetError());
-            return result;
-        }
+        snprintf(result.error, sizeof(result.error),
+                 "SDL_CreateSurface failed");
+        return result;
     }
-
-    /* Ensure RGBA8. */
-    if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-        SDL_DestroySurface(surf);
-        surf = conv;
-        if (!surf) {
-            snprintf(result.error, sizeof(result.error), "RGBA conversion failed");
-            return result;
-        }
-    }
+    for (uint32_t y = 0; y < img.height; y++)
+        memcpy((uint8_t *)surf->pixels + (size_t)y * surf->pitch,
+               img.pixels + (size_t)y * img.width * 4u,
+               (size_t)img.width * 4u);
+    jce_image_free(&img);
 
     /* Downscale if exceeding max texture dimension cap. */
     int max_dim = opts ? opts->max_texture_size : 0;
@@ -484,7 +474,18 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
     info->height    = base_h;
     info->format    = (uint32_t)target_format;
     info->mip_count = mip_count;
-    info->flags     = 1; /* sRGB */
+    /* WARNING (audit img-srgb-flag-dead-and-wrong): this asserts sRGB for
+     * EVERY cooked texture, including normal / roughness / metallic / mask
+     * maps, which are linear data.  It is currently harmless only because
+     * nothing reads the bit — grep for JceAssetTexInfo::flags and you will
+     * find no consumer.  Do NOT start trusting it without first giving the
+     * cooker the texture's semantic: JceCookOptions has no usage/semantic
+     * field, so at this point the cooker genuinely cannot tell an albedo map
+     * from a normal map, and the honest value would be "unknown".  Whoever
+     * wires a consumer must plumb the semantic from the material/importer
+     * (which does know) and set this accordingly — otherwise the first thing
+     * that happens is normal maps getting gamma-decoded. */
+    info->flags     = 1; /* sRGB — see WARNING above; not semantically derived */
     info->_pad      = 0;
 
     /* Copy mip offsets after the info struct. */
@@ -525,6 +526,31 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
     snprintf(result.error, sizeof(result.error), "audio disabled");
     return result;
 #else
+    /* Decoded PCM plus its format.  The buffer is borrowed here because the
+     * two backends below own it differently — see the release step at the end. */
+    const void *pcm         = NULL;
+    size_t      pcm_size    = 0;
+    uint32_t    sample_rate = 0;
+    uint16_t    channels    = 0;
+    uint16_t    bits        = 16;
+
+#ifdef JCE_COOK_AUDIO_VIA_AUDIO_LAYER
+    /* Canonical decode — same code the runtime loads clips with. */
+    JceAudioCpu *cpu = jce_audio_decode_cpu_memory(input, input_size, NULL);
+    if (!cpu) {
+        snprintf(result.error, sizeof(result.error), "audio decode failed");
+        return result;
+    }
+    uint32_t cpu_pcm_bytes = 0;
+    if (!jce_audio_cpu_get_pcm(cpu, &pcm, &cpu_pcm_bytes, &channels,
+                               &sample_rate, &bits)) {
+        jce_audio_cpu_free(cpu);
+        snprintf(result.error, sizeof(result.error),
+                 "audio decoded to no samples");
+        return result;
+    }
+    pcm_size = (size_t)cpu_pcm_bytes;
+#else
     /* Decode via miniaudio. */
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
     ma_decoder decoder;
@@ -537,16 +563,16 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
     ma_uint64 total_frames = 0;
     ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
 
-    ma_uint32 channels    = decoder.outputChannels;
-    ma_uint32 sample_rate = decoder.outputSampleRate;
-    void *pcm = NULL;
+    channels    = (uint16_t)decoder.outputChannels;
+    sample_rate = decoder.outputSampleRate;
+    void *raw_pcm = NULL;
 
     if (total_frames == 0) {
         /* Unknown length — decode in chunks. */
         size_t alloc = 256 * 1024;
         size_t used  = 0;
-        pcm = JCE_MALLOC(alloc * channels * sizeof(int16_t));
-        if (!pcm) {
+        raw_pcm = JCE_MALLOC(alloc * channels * sizeof(int16_t));
+        if (!raw_pcm) {
             ma_decoder_uninit(&decoder);
             snprintf(result.error, sizeof(result.error), "allocation failed");
             return result;
@@ -554,45 +580,63 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
         for (;;) {
             if (used + 4096 > alloc) {
                 alloc *= 2;
-                void *tmp = JCE_REALLOC(pcm, alloc * channels * sizeof(int16_t));
+                void *tmp = JCE_REALLOC(raw_pcm,
+                    alloc * channels * sizeof(int16_t));
                 if (!tmp) {
-                    JCE_FREE(pcm);
+                    JCE_FREE(raw_pcm);
                     ma_decoder_uninit(&decoder);
                     snprintf(result.error, sizeof(result.error), "realloc failed");
                     return result;
                 }
-                pcm = tmp;
+                raw_pcm = tmp;
             }
             ma_uint64 read = 0;
             ma_decoder_read_pcm_frames(&decoder,
-                (int16_t *)pcm + used * channels, 4096, &read);
+                (int16_t *)raw_pcm + used * channels, 4096, &read);
             if (read == 0) break;
             used += (size_t)read;
         }
         total_frames = (ma_uint64)used;
     } else {
-        pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
-        if (!pcm) {
+        raw_pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
+        if (!raw_pcm) {
             ma_decoder_uninit(&decoder);
             snprintf(result.error, sizeof(result.error), "allocation failed");
             return result;
         }
         ma_uint64 read = 0;
-        ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &read);
+        ma_decoder_read_pcm_frames(&decoder, raw_pcm, total_frames, &read);
         total_frames = read;
     }
 
     ma_decoder_uninit(&decoder);
 
+    pcm      = raw_pcm;
+    pcm_size = (size_t)(total_frames * channels * sizeof(int16_t));
+#endif
+
+    /* Derive the frame count from the byte count so both backends agree even
+     * on a short read.  `bits` is 16 for every encoded source; only a cooked
+     * pass-through can carry 8. */
+    uint32_t bytes_per_frame = (uint32_t)channels * (uint32_t)(bits / 8u);
+    if (bytes_per_frame == 0) {
+#ifdef JCE_COOK_AUDIO_VIA_AUDIO_LAYER
+        jce_audio_cpu_free(cpu);
+#else
+        JCE_FREE(raw_pcm);
+#endif
+        snprintf(result.error, sizeof(result.error), "invalid audio format");
+        return result;
+    }
+
     /* Build info chunk. */
     JceAssetAudioInfo info = {0};
     info.sample_rate     = sample_rate;
-    info.channels        = (uint16_t)channels;
-    info.bits_per_sample = 16;
-    info.total_frames    = total_frames;
+    info.channels        = channels;
+    info.bits_per_sample = bits;
+    info.total_frames    = (uint64_t)(pcm_size / bytes_per_frame);
     info.format          = 0; /* PCM_S16 */
 
-    size_t pcm_size = (size_t)(total_frames * channels * sizeof(int16_t));
     uint64_t source_hash = XXH3_64bits(input, input_size);
 
     ChunkInput chunks[2];
@@ -605,7 +649,13 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 
     result = build_asset(JCEASSET_TYPE_SOUND, source_hash, chunks, 2, opts);
 
-    JCE_FREE(pcm);
+    /* Whoever allocated frees: the JceAudioCpu owns its buffer, the lean
+     * miniaudio path JCE_MALLOC'd one directly. */
+#ifdef JCE_COOK_AUDIO_VIA_AUDIO_LAYER
+    jce_audio_cpu_free(cpu);
+#else
+    JCE_FREE(raw_pcm);
+#endif
     return result;
 #endif
 }
@@ -631,50 +681,48 @@ JceCookResult jce_cook_raw(const void *input, size_t input_size,
 /* Cook: file dispatch                                                 */
 /* ================================================================== */
 
+/*
+ * Extensions this cooker actually has an encoder for.  The canonical table
+ * (jce_asset_type_from_ext) answers "what kind of file is this?" across the
+ * whole engine; it deliberately recognises more formats than any single build
+ * step can process.  This predicate is the cooker's own capability check, kept
+ * explicit so widening the shared table never silently changes what gets
+ * cooked: an unsupported source still falls through to RAW exactly as before.
+ */
+static bool cook_can_encode(const char *ext, int type)
+{
+    switch (type) {
+    case JCEASSET_TYPE_TEXTURE:
+        return SDL_strcasecmp(ext, "png") == 0 ||
+               SDL_strcasecmp(ext, "jpg") == 0 ||
+               SDL_strcasecmp(ext, "jpeg") == 0 ||
+               SDL_strcasecmp(ext, "bmp") == 0 ||
+               SDL_strcasecmp(ext, "tga") == 0;
+    case JCEASSET_TYPE_MODEL:
+        return SDL_strcasecmp(ext, "obj") == 0 ||
+               SDL_strcasecmp(ext, "fbx") == 0 ||
+               SDL_strcasecmp(ext, "gltf") == 0 ||
+               SDL_strcasecmp(ext, "glb") == 0;
+    case JCEASSET_TYPE_SHADER:
+        /* '.sh'/'.sb' are recognised engine-wide but were never cooked. */
+        return SDL_strcasecmp(ext, "sc") == 0 ||
+               SDL_strcasecmp(ext, "bin") == 0;
+    case JCEASSET_TYPE_SOUND:
+    case JCEASSET_TYPE_FONT:
+        return true;   /* every canonical audio/font extension is handled */
+    default:
+        return false;
+    }
+}
+
 int jce_cook_detect_type(const char *path)
 {
     if (!path) return -1;
     const char *dot = strrchr(path, '.');
     if (!dot) return JCEASSET_TYPE_RAW;
 
-    dot++; /* skip the dot */
-
-    /* Texture extensions. */
-    if (SDL_strcasecmp(dot, "png") == 0 ||
-        SDL_strcasecmp(dot, "jpg") == 0 ||
-        SDL_strcasecmp(dot, "jpeg") == 0 ||
-        SDL_strcasecmp(dot, "bmp") == 0 ||
-        SDL_strcasecmp(dot, "tga") == 0)
-        return JCEASSET_TYPE_TEXTURE;
-
-    /* Audio extensions. */
-    if (SDL_strcasecmp(dot, "wav") == 0 ||
-        SDL_strcasecmp(dot, "ogg") == 0 ||
-        SDL_strcasecmp(dot, "opus") == 0 ||   /* royalty-free (preferred) */
-        SDL_strcasecmp(dot, "flac") == 0 ||
-        SDL_strcasecmp(dot, "mp3") == 0 ||
-        SDL_strcasecmp(dot, "m4a") == 0 ||    /* legacy AAC-in-MP4 */
-        SDL_strcasecmp(dot, "aac") == 0)      /* legacy raw AAC */
-        return JCEASSET_TYPE_SOUND;
-
-    /* Mesh/model extensions. */
-    if (SDL_strcasecmp(dot, "obj") == 0 ||
-        SDL_strcasecmp(dot, "fbx") == 0 ||
-        SDL_strcasecmp(dot, "gltf") == 0 ||
-        SDL_strcasecmp(dot, "glb") == 0)
-        return JCEASSET_TYPE_MODEL;
-
-    /* Font extensions. */
-    if (SDL_strcasecmp(dot, "ttf") == 0 ||
-        SDL_strcasecmp(dot, "otf") == 0)
-        return JCEASSET_TYPE_FONT;
-
-    /* Shader extensions. */
-    if (SDL_strcasecmp(dot, "sc") == 0 ||
-        SDL_strcasecmp(dot, "bin") == 0)
-        return JCEASSET_TYPE_SHADER;
-
-    return JCEASSET_TYPE_RAW;
+    int type = jce_asset_type_from_ext(path);
+    return cook_can_encode(dot + 1, type) ? type : JCEASSET_TYPE_RAW;
 }
 
 /* Texture-format policy (normal-map heuristic + per-platform auto format)
@@ -710,8 +758,8 @@ JceCookResult jce_cook_file(const char *input_path,
     int type = jce_cook_detect_type(input_path);
 
     /* LUT strip PNGs must ship as verbatim PNG bytes.  jce_texture_load_lut_3d
-     * calls jce_texture_decode_cpu which runs SDL3_image on the raw bytes; a
-     * .jceasset wrapper (any chunk layout) is opaque to that loader's raw path,
+     * calls jce_texture_decode_cpu, which runs the image service on the raw
+     * bytes; a .jceasset wrapper (any chunk layout) is opaque to that raw path,
      * and block-compression destroys the LUT's per-channel precision.
      * Synthesise a successful result pointing at the original file bytes so
      * the cooked output is exactly the source PNG. */

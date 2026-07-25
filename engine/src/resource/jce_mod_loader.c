@@ -10,6 +10,13 @@
  *     base + enabled mods so a higher-priority mod's asset transparently
  *     overrides a lower-priority one's and, last, the base content.
  *
+ * The override direction is load-bearing: jce_archive_mount_* resolves
+ * LAST-ADDED-WINS, which is why mount() below adds the base first and the
+ * enabled mods after it.  The similarly shaped PAK fallback chain
+ * (jce_pak_overlay_push, jce_pak_loader.c) resolves BASE-FIRST instead, so
+ * re-pointing this module at it would silently stop every mod override from
+ * ever taking effect.  Do not substitute one for the other.
+ *
  * It deliberately executes NO code from a mod: a mod is a bag of asset bytes
  * read through the normalized virtual-path namespace.  Discovery is explicit
  * (jce_mod_loader_scan) so nothing auto-runs from engine boot.
@@ -19,8 +26,9 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
-#include <cjson/cJSON.h>
+#include <jce/os/core/jce_json.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,14 +61,6 @@ struct JceModLoader {
 /* Small helpers                                                        */
 /* ================================================================== */
 
-static char *dup_str(const char *s) {
-    if (!s) s = "";
-    size_t n = strlen(s) + 1;
-    char *r = (char *)jce_malloc(n);
-    if (r) memcpy(r, s, n);
-    return r;
-}
-
 /* Case-insensitive suffix test (extension match). */
 static bool ends_with_ci(const char *s, const char *suffix) {
     if (!s || !suffix) return false;
@@ -82,7 +82,7 @@ static bool name_is_mod_file(const char *name) {
 
 /* Strip the directory + last extension from a file path to get a stem id. */
 static char *stem_from_path(const char *path) {
-    if (!path) return dup_str("");
+    if (!path) return jce_strdup("");
     const char *base = path;
     for (const char *p = path; *p; ++p)
         if (*p == '/' || *p == '\\') base = p + 1;
@@ -137,34 +137,32 @@ static void mod_record_free(ModRecord *m) {
  *   enabled           : bool (default true)
  * Unknown fields are ignored; crucially NO field can request code execution.
  */
+/* Replace *slot with a copy of `v`, leaving *slot untouched if the copy
+ * fails — a failed strdup must not blank a field that already had a value. */
+static void manifest_set_str(char **slot, const char *v) {
+    if (!v || !v[0]) return;
+    char *nv = jce_strdup(v);
+    if (!nv) return;
+    jce_free(*slot);
+    *slot = nv;
+}
+
 static void apply_manifest_json(ModRecord *rec, const char *json, size_t len) {
     if (!rec || !json || len == 0) return;
-    cJSON *root = cJSON_ParseWithLength(json, len);
+    JceJson *root = jce_json_parse(json, len);
     if (!root) return;
 
-    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(root, "id");
-    if (cJSON_IsString(jid) && jid->valuestring && jid->valuestring[0]) {
-        char *nv = dup_str(jid->valuestring);
-        if (nv) { jce_free(rec->id); rec->id = nv; }
-    }
-    const cJSON *jname = cJSON_GetObjectItemCaseSensitive(root, "name");
-    if (cJSON_IsString(jname) && jname->valuestring) {
-        char *nv = dup_str(jname->valuestring);
-        if (nv) { jce_free(rec->name); rec->name = nv; }
-    }
-    const cJSON *jver = cJSON_GetObjectItemCaseSensitive(root, "version");
-    if (cJSON_IsString(jver) && jver->valuestring) {
-        char *nv = dup_str(jver->valuestring);
-        if (nv) { jce_free(rec->version); rec->version = nv; }
-    }
-    const cJSON *jord = cJSON_GetObjectItemCaseSensitive(root, "load_order");
-    if (cJSON_IsNumber(jord))
-        rec->load_order = (int32_t)jord->valuedouble;
-    const cJSON *jen = cJSON_GetObjectItemCaseSensitive(root, "enabled");
-    if (cJSON_IsBool(jen))
-        rec->enabled = cJSON_IsTrue(jen) ? true : false;
+    manifest_set_str(&rec->id,      jce_json_get_string(root, "id",      NULL));
+    manifest_set_str(&rec->name,    jce_json_get_string(root, "name",    NULL));
+    manifest_set_str(&rec->version, jce_json_get_string(root, "version", NULL));
 
-    cJSON_Delete(root);
+    /* Absent/wrong-typed keys keep the value the record already carries,
+     * which is what the previous cJSON_Is* guards did. */
+    rec->load_order = (int32_t)jce_json_get_number(root, "load_order",
+                                                   (double)rec->load_order);
+    rec->enabled    = jce_json_get_bool(root, "enabled", rec->enabled);
+
+    jce_json_free(root);
 }
 
 /* Read the sibling "<stem>.mod.json" sidecar, if present, into rec. */
@@ -275,10 +273,10 @@ static bool scan_cb(const char *name, bool is_dir, void *user) {
     ModRecord *rec = &ml->mods[ml->count];
     memset(rec, 0, sizeof(*rec));
     rec->archive    = ar;
-    rec->file       = dup_str(full);
+    rec->file       = jce_strdup(full);
     rec->id         = stem_from_path(full);   /* default id = file stem      */
-    rec->name       = dup_str(rec->id ? rec->id : "");
-    rec->version    = dup_str("");
+    rec->name       = jce_strdup(rec->id ? rec->id : "");
+    rec->version    = jce_strdup("");
     rec->load_order = 0;
     rec->enabled    = true;
     rec->mounted    = false;
@@ -291,7 +289,7 @@ static bool scan_cb(const char *name, bool is_dir, void *user) {
      * the manifest never supplied an explicit one (name still equals stem). */
     if (rec->name && rec->id && rec->name[0] == '\0') {
         jce_free(rec->name);
-        rec->name = dup_str(rec->id);
+        rec->name = jce_strdup(rec->id);
     }
 
     if (!rec->id || !rec->name || !rec->version || !rec->file) {
@@ -436,7 +434,8 @@ int JCE_CALL jce_mod_loader_mount(JceModLoader *ml) {
 
     int layers = 0;
 
-    /* Base is the lowest-priority layer (added first). */
+    /* Base is the lowest-priority layer, so it is added FIRST (the mount
+     * resolves last-added-first). */
     if (ml->base) {
         if (jce_archive_mount_add(m, ml->base)) layers++;
     }

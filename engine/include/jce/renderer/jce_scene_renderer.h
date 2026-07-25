@@ -18,8 +18,13 @@
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_decals.h>
+/* Both types below are used by POINTER only, so a forward declaration would
+ * normally do — but each is declared as an UNTAGGED `typedef struct {…} X;`,
+ * which C gives no way to forward declare.  Removing these two middleware
+ * includes therefore requires tagging the definitions at their source
+ * (jce_anim_ik.h / jce_time_of_day.h); until then the includes stay. */
 #include <jce/middleware/animation/jce_anim_ik.h>   /* JceAnimEvent (POD) */
-#include <jce/middleware/world/jce_time_of_day.h>
+#include <jce/middleware/world/jce_time_of_day.h>   /* JceTimeOfDayState */
 #include <jce/renderer/jce_volumetric_fog.h>
 
 #include <stdbool.h>
@@ -266,7 +271,7 @@ typedef struct {
  *   pak      : PAK archive for loading shaders and fallback assets.
  *   cbs      : optional asset callbacks (NULL = use PAK only).
  */
-JceSceneRenderer *jce_scene_renderer_create(
+JCE_API JceSceneRenderer *jce_scene_renderer_create(
     JceRenderer           *renderer,
     const JcePakArchive   *pak,
     const JceSceneRendererCallbacks *cbs);
@@ -295,7 +300,7 @@ JCE_API void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr);
  * Decision: animation dt is caller-provided (not internal timer) so
  * editor and runtime can each provide their own frame timing.
  */
-uint16_t jce_scene_renderer_render(
+JCE_API uint16_t jce_scene_renderer_render(
     JceSceneRenderer           *sr,
     JceScene                   *scene,
     const JceCamera            *camera,

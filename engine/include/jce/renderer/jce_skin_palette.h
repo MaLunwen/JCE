@@ -34,7 +34,7 @@ JCE_EXTERN_C_BEGIN
  *
  * Returns the number of matrices written = min(num_joints, out_cap), or 0
  * when joints/out is NULL or either count is 0. */
-uint32_t jce_skin_build_world_palette(const jce_mat4 *root,
+JCE_API uint32_t jce_skin_build_world_palette(const jce_mat4 *root,
                                       const jce_mat4 *joints,
                                       uint32_t num_joints,
                                       jce_mat4 *out,

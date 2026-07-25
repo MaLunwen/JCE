@@ -1,7 +1,9 @@
 // jce_net_messages.proto  Network message definitions for JCE engine.
 //
-// Used by the protobuf encode/decode shim (jce_net_proto.cpp) to
-// serialise structured messages before handing them to the ENet layer.
+// Schema kept as the sanctioned channel for schema-defined binary messages.
+// It currently has no C++ consumer: the shim that used it (jce_net_proto.cpp)
+// was deleted as dead code.  The runtime snapshot path uses the hand-rolled
+// codec in jce_replication.c / jce_net_transform.c instead.
 
 syntax = "proto3";
 package jce.net;

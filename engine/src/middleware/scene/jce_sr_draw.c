@@ -1706,10 +1706,10 @@ typedef struct {
 } SrPgCtx;
 
 /* parallel_for body: build [begin,end) of the eligible set into disjoint slots. */
-static void sr_pg_worker(int begin, int end, void *user)
+static void sr_pg_worker(uint32_t begin, uint32_t end, void *user)
 {
     SrPgCtx *c = (SrPgCtx *)user;
-    for (int k = begin; k < end; k++) {
+    for (uint32_t k = begin; k < end; k++) {
         int cull_idx = c->sr->pg_idx[k];
         JceEntity e  = c->list->entities[cull_idx];
         SrPgCmd *o   = &c->sr->pg_cmds[k];
@@ -1902,7 +1902,7 @@ static bgfx_texture_handle_t sr_tex_array_get(JceSceneRenderer *sr,
      * into its level (source must carry those mips — cooked/streamed albedos do). */
     bgfx_texture_handle_t arr = bgfx_create_texture_2d(
         w, h, mips > 1, count, BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     if (!BGFX_HANDLE_IS_VALID(arr)) return inval;
     for (uint16_t l = 0; l < count; l++) {
         bgfx_texture_handle_t s = { src[l] };
@@ -1969,10 +1969,26 @@ static bool sr_tex_inst_add(JceSceneRenderer *sr, JceScene *scene,
          * chain (e.g. a video texture) would otherwise have its non-resident mip
          * levels blitted as garbage. 0 ⇒ single mip (safe). */
         mips = mr->albedo_runtime_mips > 0 ? mr->albedo_runtime_mips : 1u;
+        /* Raw handles carry no format; if the registry happens to track this
+         * one, honour its recorded format (untracked keeps the documented
+         * RGBA8 runtime-texture contract). */
+        JceTexture rt; rt.idx = albedo_idx;
+        uint32_t rf = jce_texture_get_format(rt);
+        if (rf != UINT32_MAX && rf != (uint32_t)BGFX_TEXTURE_FORMAT_RGBA8)
+            return false;
     } else {
         JceTexture at; at.idx = albedo_idx;
         jce_texture_get_size(at, &w, &h);   /* registry-loaded (path) albedo */
         mips = (uint8_t)jce_texture_get_mips(at);
+        /* The slice-A array is RGBA8 and bgfx_blit REQUIRES equal formats:
+         * on D3D12 a mismatched CopyTextureRegion (e.g. BC7 source → RGBA8
+         * array) removes the device with DXGI_ERROR_INVALID_CALL — this was
+         * the space_demo runtime D3D12 crash (cooked PAK albedos are BC7,
+         * editor loads uncompressed PNG so it never reproduced there).
+         * D3D11/GL/VK merely drop the illegal copy.  Non-RGBA8 albedos take
+         * the solo path — correct image, just unbatched. */
+        if (jce_texture_get_format(at) != (uint32_t)BGFX_TEXTURE_FORMAT_RGBA8)
+            return false;
     }
     if (w == 0 || h == 0 || w > 65535u || h > 65535u) return false;
 
@@ -2909,7 +2925,9 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     (uint32_t)cfg->viewport_height,
                     sr->homogeneous_depth,
                     gi_sky, 0.35f,
-                    gi_csm_tex, gi_csm_vp, gi_sun_dir, gi_sun_col, 0.35f);
+                    gi_csm_tex, sr->shadow_map_size,
+                    (uint32_t)sr->shadow_depth_fmt,
+                    gi_csm_vp, gi_sun_dir, gi_sun_col, 0.35f);
                 /* Sample AHEAD of the camera: the probes immediately
                  * around the eye project onto/behind the near plane and
                  * can never screen-gather — the first well-fed probes sit
@@ -3142,14 +3160,14 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
      * Eligible entities (factor-only shape primitives, SHADED+opaque) defer their
      * material build to worker threads (Pass B, under flecs readonly mode) instead
      * of building inline.  Default OFF → the serial path below is byte-unchanged.
-     * Single core → jce_jobs_default()==NULL/1 worker → pg_active false → serial. */
+     * Single core → shared pool NULL / 1 worker → pg_active false → serial. */
     static int s_pg_env = -2;   /* -2 unparsed / -1 no env / 0 off / 1 on */
     if (s_pg_env == -2) { const char *v = getenv("JCE_PARALLEL_GATHER");
                           s_pg_env = (!v || !v[0]) ? -1 : (v[0] != '0'); }
     const bool pg_enabled = (s_pg_env >= 0) ? (s_pg_env != 0)
         : jce_render_pipeline_perf_enabled(JCE_RP_PERF_PARALLEL_GATHER, false);
-    JceJobSystem *pg_jobs = pg_enabled ? jce_jobs_default() : NULL;
-    const bool pg_mode = pg_jobs && jce_jobs_worker_count(pg_jobs) > 1 && use_rq
+    JceThreadPool *pg_pool = pg_enabled ? jce_thread_pool_shared() : NULL;
+    const bool pg_mode = pg_pool && jce_thread_pool_worker_count(pg_pool) > 1 && use_rq
                       && cfg->view_mode == JCE_SCENE_VIEW_SHADED && cfg->draw_opaque;
     uint32_t pg_count = 0;
     if (pg_mode && (uint32_t)list->count > sr->pg_cap) {
@@ -3194,10 +3212,12 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         cfg->view_mode == JCE_SCENE_VIEW_SHADED && cfg->draw_opaque &&
         jce_renderer_get_program_pbr_inst_tint(sr->renderer).idx != UINT16_MAX;
 
-    /* ── Texture-diverse instancing (opt-in JCE_TEX_INSTANCE) ──────────────
+    /* ── Texture-diverse instancing (JCE_TEX_INSTANCE / rp perf) ───────────
      * Diverts same-mesh entities that each carry their own albedo TEXTURE into
      * the (mesh,mat_key) + 2D-array batch, flushed after the loop.  Needs SHADED
-     * + opaque + the array program.  Default OFF → byte-identical. */
+     * + opaque + the array program.  Env wins when set; otherwise the render
+     * pipeline decides (rp_perf_enable_safe_wins turns it ON for MEDIUM+
+     * tiers).  Only RGBA8 albedos batch — sr_tex_inst_add rejects the rest. */
     static int s_ti_env = -2;
     if (s_ti_env == -2) { const char *v = getenv("JCE_TEX_INSTANCE");
                           s_ti_env = (!v || !v[0]) ? -1 : (v[0] != '0'); }
@@ -3428,14 +3448,19 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 bool enabled  = (s_grass_cid < 0) ||
                                 jce_scene_comp_enabled(scene, e, s_grass_cid);
                 bool caps_ok  = (jce_renderer_get_caps() & JCE_CAP_INSTANCING) != 0;
-                /* WebGL2 exemption: the browser reports the GPU as "Unknown"
-                 * (ANGLE masks the real adapter), so the tier heuristic lands
-                 * on LOW and this gate silently deleted ALL grass on web —
-                 * the single most visible win64-vs-wasm gap.  Behind ANGLE
-                 * there is almost always a real desktop GPU, instancing is
-                 * ES3-core, and an authored field is ~1e5 blades; let the
-                 * project-level grass_enabled make the call there instead. */
-                bool tier_ok  = jce_renderer_get_tier() >= JCE_GPU_TIER_HIGH
+                /* Floor at MEDIUM (was HIGH): integrated GPUs are auto-capped to
+                 * MEDIUM (they can't sustain the HIGH postfx/shadow budget), but
+                 * they ARE instancing-capable and can render an authored grass
+                 * field just fine — the HIGH floor silently deleted ALL grass on
+                 * every iGPU once the cap landed, the same class of regression as
+                 * the WebGL2/ANGLE case below.  grass_enabled (project opt-in) is
+                 * the real switch; the tier floor only protects the truly-weak
+                 * LOW tier (which also gets a density floor elsewhere).
+                 * WebGL2 exemption: ANGLE masks the adapter as "Unknown" -> the
+                 * tier heuristic lands on LOW, but behind ANGLE there is almost
+                 * always a real desktop GPU and instancing is ES3-core, so let
+                 * grass_enabled make the call there regardless of tier. */
+                bool tier_ok  = jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM
                              || jce_renderer_get_active_backend()
                                     == JCE_BACKEND_OPENGLES;
                 bool proj_ok  = sr->grass_enabled;
@@ -4348,7 +4373,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         ctx.prog_single = (prog_pbr_h.idx != UINT16_MAX) ? (uint16_t)prog_pbr_h.idx
                                                          : (uint16_t)UINT16_MAX;
         jce_scene_parallel_read_begin(scene);
-        jce_jobs_parallel_for(pg_jobs, (int)pg_count, 256, sr_pg_worker, &ctx);
+        jce_thread_pool_parallel_for(pg_pool, pg_count, 256, sr_pg_worker, &ctx);
         jce_scene_parallel_read_end(scene);
 
         /* Deterministic race check (JCE_PARALLEL_VERIFY): sr_pg_build_one is a

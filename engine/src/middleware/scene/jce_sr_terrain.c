@@ -393,7 +393,7 @@ static bgfx_texture_handle_t sr_terrain_tile_splat_tex(JceSceneRenderer *sr,
         if (mem)
             st = bgfx_create_texture_2d((uint16_t)span, (uint16_t)span, true, 1,
                     BGFX_TEXTURE_FORMAT_RGBA8,
-                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem);
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
     }
     if (sp) JCE_FREE(sp);
     cache[idx] = st;
@@ -426,7 +426,7 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
                 sr->terrain_cache[slot].splat_tex =
                     bgfx_create_texture_2d((uint16_t)tw, (uint16_t)th, true, 1,
                         BGFX_TEXTURE_FORMAT_RGBA8,
-                        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem);
+                        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
         }
         sr->terrain_cache[slot].splat_uploaded = true;
     }

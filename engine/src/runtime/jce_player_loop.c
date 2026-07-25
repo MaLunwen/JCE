@@ -7,6 +7,12 @@
  * process-default mimalloc-backed jce_allocator_t.
  *
  * Single-threaded by contract; see jce_player_loop.h.
+ *
+ * The near-identical slot list in application/jce_lifecycle.c is a
+ * deliberate second instance, not un-deduplicated code: its dispatch
+ * contract differs from run_phase's id-identity snapshot below, and
+ * merging the two would undo the F81 fix.  Full verdict at the top of
+ * that file.
  */
 
 #include <jce/runtime/jce_player_loop.h>

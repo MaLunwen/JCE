@@ -12,8 +12,19 @@
  * Layer: Middleware/Scene (Layer 4).  Built into the jce_scene layer next to
  * jce_scene_renderer.c because it needs both scene component access and the
  * renderer's low-level 2D draw path — the exact dependency set that file
- * already carries.  This is NOT RmlUI (the shipping HTML/CSS game-UI path)
- * and does not touch it.
+ * already carries.
+ *
+ * OWNERSHIP (ADR-0002): this system owns SCENE UI — anything placed in a
+ * scene, carried by a prefab, or addressed per entity from a gameplay script.
+ * RmlUI (jce_ui.h) owns DOCUMENT UI — shell, settings, menus, anything that
+ * wants flow/flex layout or a CSS cascade.  The split is structural, not a
+ * preference: only this one has entities and serialization, and only that one
+ * has a layout engine.
+ *
+ * This header used to describe RmlUI as "the shipping game-UI path", which
+ * was wrong for everything the editor authors here.  The two must not
+ * converge: no CSS/stylesheet/document concept belongs in this API, and no
+ * JceEntity belongs in RmlUI's.
  */
 
 #ifndef JCE_UI_CANVAS_H

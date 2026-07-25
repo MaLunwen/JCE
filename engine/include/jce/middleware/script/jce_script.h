@@ -21,6 +21,8 @@
  *       jce.log(msg)
  *       jce.get_position(entity) -> x,y,z      (nil if no transform)
  *       jce.set_position(entity, x,y,z)
+ *       jce.set_parent(child, parent, keep_world) -> bool
+ *       jce.get_parent(child) -> entity_or_zero
  *       jce.is_key_down(keycode) -> bool
  *       jce.set_time_scale(scale)              -- slow-mo / hitstop / fast
  *       jce.pause(bool)                        -- pause/resume the simulation
@@ -373,6 +375,27 @@ typedef struct JceScriptHost {
     bool  (*render_set_json)(void *user, const char *json);
     void  (*json_free)(void *user, char *s);
     void  (*audio_set_volume)(void *user, JceScriptEntity e, float volume);
+
+    /* ── APPEND ONLY BELOW THIS LINE ──────────────────────────────────
+     *
+     * This struct is a TABLE OF FUNCTION POINTERS the GAME fills in and the
+     * engine copies whole (jce_script.c: `s->host = *host;`).  Inserting a
+     * member anywhere but the end shifts every slot after it, so a game built
+     * against an older header makes the engine call through the WRONG SLOT —
+     * not garbage data, a jump to a different function with a different
+     * signature.
+     *
+     * set_parent / get_parent were first added after set_scale, i.e. in the
+     * middle, and the ABI snapshot gate caught it.  Appending is behaviourally
+     * identical and safe for an older consumer, whose shorter struct simply
+     * leaves these NULL — which callers must check anyway, as they already do
+     * for every optional host hook. */
+
+    /* Hierarchy ownership. Entity 0 means no parent. set_parent validates the
+     * operation in the host and reports whether it was applied. */
+    bool (*set_parent)(void *user, JceScriptEntity child,
+                       JceScriptEntity parent, bool preserve_world);
+    JceScriptEntity (*get_parent)(void *user, JceScriptEntity child);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;
@@ -381,9 +404,27 @@ typedef struct JceScript JceScript;
 typedef uint32_t JceScriptInstance;
 
 /* Create / destroy the VM. `host` is copied; pass NULL for a binding-less VM
- * (bindings become no-ops). */
+ * (bindings become no-ops).
+ *
+ * Pass sizeof(JceScriptHost) as `host_size`.  JceScriptHost is allocated by
+ * the CALLER and gains members over time, so the engine must not copy it at
+ * its own sizeof — that reads past the end of a host built against an older
+ * header and then calls whatever followed it.  With the size, the engine
+ * copies min(caller, engine) over a zeroed table; members the caller does not
+ * have stay NULL and are skipped (every call site null-checks).
+ *
+ * The macro below applies this automatically, so ordinary callers keep
+ * writing jce_script_create(&host).  Define JCE_NO_SCRIPT_HOST_SIZE_SHIM to
+ * reach the raw symbol (it assumes your layout matches the engine's). */
+JCE_API JceScript *jce_script_create_sized(const JceScriptHost *host,
+                                           size_t host_size);
 JCE_API JceScript *jce_script_create(const JceScriptHost *host);
 JCE_API void       jce_script_destroy(JceScript *s);
+
+#if !defined(JCE_BUILDING_ENGINE) && !defined(JCE_NO_SCRIPT_HOST_SIZE_SHIM)
+#  define jce_script_create(host) \
+       jce_script_create_sized((host), sizeof(JceScriptHost))
+#endif
 
 /* Load a `.lua` file through the engine filesystem (PAK / mounted dirs) and
  * create an instance bound to `owner`. Returns 0 on read/compile/run error

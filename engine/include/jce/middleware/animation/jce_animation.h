@@ -44,7 +44,7 @@ JCE_API bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 
 /* Advance by dt seconds and produce joint matrices for GPU upload.
  * Returns number of joints written to out_joint_matrices. */
-uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
+JCE_API uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                                 jce_mat4 *out_joint_matrices,
                                 uint32_t max_joints);
 

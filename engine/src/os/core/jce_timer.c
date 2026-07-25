@@ -11,7 +11,8 @@
 
 #include <SDL3/SDL.h>
 
-/* Clamp frame delta to avoid spiral of death after breakpoints / sleep. */
+/* Clamp frame delta to avoid spiral of death after breakpoints / sleep.
+   Same cap as JCE_FIXED_CLOCK_DEFAULT_MAX_DT in jce_fixed_clock.c. */
 #define MAX_FRAME_DT 0.25  /* 250 ms (4 FPS minimum) */
 
 struct JceTimer {
@@ -22,9 +23,10 @@ struct JceTimer {
     double   dt;            /* raw frame delta (seconds) */
     double   elapsed;       /* total elapsed time (seconds) */
 
-    /* Fixed timestep state. */
+    /* Fixed timestep state — feeds jce_timer_alpha() only.  The engine's
+       simulation cadence is driven by JceFixedClock, not by this timer. */
     double   fixed_dt;      /* target fixed step (0 = variable) */
-    double   accumulator;   /* unconsumed time (seconds) */
+    double   accumulator;   /* accumulated time (seconds) */
 
     /* FPS smoothing. */
     float    fps_smoothed;
@@ -83,16 +85,6 @@ double jce_timer_dt(const JceTimer *t)
 float jce_timer_dt_ms(const JceTimer *t)
 {
     return t ? (float)(t->dt * 1000.0) : 0.0f;
-}
-
-bool jce_timer_consume_fixed(JceTimer *t)
-{
-    if (!t || t->fixed_dt <= 0.0) return false;
-    if (t->accumulator >= t->fixed_dt) {
-        t->accumulator -= t->fixed_dt;
-        return true;
-    }
-    return false;
 }
 
 double jce_timer_fixed_dt(const JceTimer *t)

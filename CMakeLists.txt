@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.10.14 LANGUAGES C)
+project(JCE VERSION 0.11.2 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -141,7 +141,12 @@ else()
 	set(CMAKE_C_EXTENSIONS OFF)
 endif()
 
-set(CMAKE_CXX_STANDARD          17)
+# C++20 required by bgfx 1.146: its public C99 header <bgfx/c99/bgfx.h> now
+# includes <bx/platform.h>, whose C++ path static_asserts on C++20.  So every
+# C++ TU that touches bgfx (even via the C API) needs C++20; a project-wide bump
+# is cleaner than tagging each such TU.  The C99 engine core is unaffected
+# (CMAKE_C_STANDARD stays 99; bx's assert is __cplusplus-gated).
+set(CMAKE_CXX_STANDARD          20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS        OFF)
 
@@ -230,6 +235,7 @@ find_package(v-hacd       REQUIRED)
 find_package(recastnavigation REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
+find_package(protobuf_BUILD REQUIRED CONFIG)
 find_package(lua          REQUIRED)
 
 # ── Patent-free codecs (preferred path) ──────────────────────────────
@@ -254,94 +260,72 @@ find_package(webm         REQUIRED)
 #   * openh264:   upstream meson doesn't recognise emscripten.
 # Single source of truth that works across all platforms.
 
-# Ensure protoc comes from the Conan package, not a system/conda protoc.
-# Conan sets protobuf_PACKAGE_FOLDER_RELEASE after find_package(protobuf).
-# Override Protobuf_PROTOC_EXECUTABLE so protobuf_generate() uses the
-# version-matching protoc (e.g. 6.33.x, not Anaconda 4.25.x).
-# CROSS-COMPILE NOTE: When building for Android/WASM from a Windows host,
-# Conan compiles the entire protobuf package (including protoc) for the target
-# architecture, producing an ELF binary that cannot run on Windows. In that
-# case we find a Windows-native protoc.exe from the Conan2 package cache.
+# Code generation is a host operation even when the engine is cross-compiled.
+# Conan's build context gives us an executable for the build machine while the
+# ordinary protobuf package remains compiled for the target architecture.
+if(NOT protobuf_VERSION_STRING STREQUAL protobuf_BUILD_VERSION_STRING)
+    message(FATAL_ERROR
+        "JCE: protobuf graph mismatch: target=${protobuf_VERSION_STRING}, "
+        "build=${protobuf_BUILD_VERSION_STRING}")
+endif()
+
+set(_found_protoc "")
+set(_protoc_version "")
 foreach(_pb_cfg RELEASE RELWITHDEBINFO DEBUG)
-    if(DEFINED "protobuf_PACKAGE_FOLDER_${_pb_cfg}")
-        set(_pb_bin_dir "${protobuf_PACKAGE_FOLDER_${_pb_cfg}}/bin")
-        # Probe .exe first (native build), then bare binary (cross-compile package)
-        set(_found_protoc "")
-        foreach(_protoc_name "protoc.exe" "protoc")
-            if(EXISTS "${_pb_bin_dir}/${_protoc_name}")
-                set(_found_protoc "${_pb_bin_dir}/${_protoc_name}")
-                break()
-            endif()
-        endforeach()
-        # Verify the found binary can actually run on THIS host.
-        # Cross-compile packages may ship arm64/WASM executables that the
-        # build host cannot execute (Exec format error on Linux, wrong PE arch
-        # on Windows, or .js-only for WASM).  Probe with --version and fall
-        # back to a glob search over the full Conan2 cache when it fails.
-        set(_need_native_search FALSE)
-        if(_found_protoc)
-            execute_process(
-                COMMAND "${_found_protoc}" --version
-                RESULT_VARIABLE _run_rc
-                OUTPUT_QUIET ERROR_QUIET
-                TIMEOUT 10
-            )
-            if(NOT _run_rc EQUAL 0)
-                message(STATUS "JCE: Conan protoc cannot run on this host (cross-compile pkg). Searching Conan2 cache for native protoc.")
-                set(_need_native_search TRUE)
-                set(_found_protoc "")
-            endif()
-            unset(_run_rc)
-        else()
-            message(STATUS "JCE: No native protoc in Conan package bin dir. Searching Conan2 cache for native protoc.")
-            set(_need_native_search TRUE)
+    if(NOT DEFINED "protobuf_BUILD_PACKAGE_FOLDER_${_pb_cfg}")
+        continue()
+    endif()
+    set(_pb_bin_dir "${protobuf_BUILD_PACKAGE_FOLDER_${_pb_cfg}}/bin")
+    foreach(_protoc_name "protoc.exe" "protoc")
+        set(_candidate "${_pb_bin_dir}/${_protoc_name}")
+        if(NOT EXISTS "${_candidate}")
+            continue()
         endif()
-        if(_need_native_search)
-            if(CMAKE_HOST_WIN32)
-                file(GLOB _protoc_list "$ENV{USERPROFILE}/.conan2/p/b/proto*/p/bin/protoc.exe")
-            else()
-                file(GLOB _protoc_list "$ENV{HOME}/.conan2/p/b/proto*/p/bin/protoc")
-            endif()
-            list(SORT _protoc_list ORDER DESCENDING)
-            foreach(_candidate IN LISTS _protoc_list)
-                if(EXISTS "${_candidate}")
-                    execute_process(
-                        COMMAND "${_candidate}" --version
-                        RESULT_VARIABLE _run_rc
-                        OUTPUT_QUIET ERROR_QUIET
-                        TIMEOUT 10
-                    )
-                    if(_run_rc EQUAL 0)
-                        set(_found_protoc "${_candidate}")
-                        break()
-                    endif()
-                endif()
-            endforeach()
-            unset(_protoc_list)
-            unset(_candidate)
-            unset(_run_rc)
+        execute_process(
+            COMMAND "${_candidate}" --version
+            RESULT_VARIABLE _run_rc
+            OUTPUT_VARIABLE _candidate_version
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            TIMEOUT 10)
+        if(_run_rc EQUAL 0 AND _candidate_version MATCHES "^libprotoc ")
+            set(_found_protoc "${_candidate}")
+            set(_protoc_version "${_candidate_version}")
+            break()
         endif()
-        unset(_need_native_search)
-        if(_found_protoc)
-            set(Protobuf_PROTOC_EXECUTABLE "${_found_protoc}"
-                CACHE FILEPATH "The protoc compiler" FORCE)
-            if(TARGET protobuf::protoc)
-                set_target_properties(protobuf::protoc PROPERTIES
-                    IMPORTED_LOCATION               "${_found_protoc}"
-                    IMPORTED_LOCATION_RELEASE       "${_found_protoc}"
-                    IMPORTED_LOCATION_DEBUG         "${_found_protoc}"
-                    IMPORTED_LOCATION_RELWITHDEBINFO "${_found_protoc}"
-                    IMPORTED_LOCATION_MINSIZEREL    "${_found_protoc}")
-            endif()
-            message(STATUS "JCE: Using Conan protoc: ${_found_protoc}")
-        endif()
+    endforeach()
+    if(_found_protoc)
         break()
     endif()
 endforeach()
+
+if(NOT _found_protoc)
+    message(FATAL_ERROR
+        "JCE: version-matched Conan build-context protoc is missing or cannot "
+        "run on this host. Re-run conan install with the build profile.")
+endif()
+
+set(Protobuf_PROTOC_EXECUTABLE "${_found_protoc}"
+    CACHE FILEPATH "The protoc compiler" FORCE)
+if(TARGET protobuf::protoc)
+    set_target_properties(protobuf::protoc PROPERTIES
+        IMPORTED_LOCATION                "${_found_protoc}"
+        IMPORTED_LOCATION_RELEASE        "${_found_protoc}"
+        IMPORTED_LOCATION_DEBUG          "${_found_protoc}"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_found_protoc}"
+        IMPORTED_LOCATION_MINSIZEREL     "${_found_protoc}")
+endif()
+message(STATUS
+    "JCE: Using Conan build-context protoc ${_protoc_version}: ${_found_protoc}")
+
+unset(_candidate)
+unset(_candidate_version)
 unset(_found_protoc)
 unset(_pb_bin_dir)
 unset(_pb_cfg)
 unset(_protoc_name)
+unset(_protoc_version)
+unset(_run_rc)
 
 find_package(behaviortree_cpp REQUIRED)
 find_package(RmlUi        REQUIRED)
@@ -408,6 +392,28 @@ if(JCE_PLATFORM_WEB)
 	set(JCE_PATENTED_CODECS_ENABLED OFF)
 endif()
 
+# Assert the derivation actually held.
+#
+# "dist ships royalty-free, release carries the codecs" is a LICENSING
+# decision, and until now it was only an ordering property of the if()s
+# above: reorder them, add a branch that re-derives the variable, or move the
+# Web check, and a dist build starts shipping AAC/H.264/H.265 with nothing
+# saying so.  That failure is invisible in every build log and every test —
+# the first person to notice would be a lawyer.
+#
+# FATAL_ERROR rather than a warning on purpose: a royalty-bearing artifact
+# that got built anyway is not something a warning can un-ship.
+if(JCE_BUILD_VARIANT STREQUAL "dist" AND JCE_PATENTED_CODECS_ENABLED)
+	message(FATAL_ERROR
+		"dist variant derived JCE_PATENTED_CODECS_ENABLED=ON. The dist build "
+		"must be royalty-free; something above stopped forcing it OFF.")
+endif()
+if(JCE_PLATFORM_WEB AND JCE_PATENTED_CODECS_ENABLED)
+	message(FATAL_ERROR
+		"Web target derived JCE_PATENTED_CODECS_ENABLED=ON. WASM builds must "
+		"use royalty-free codecs only.")
+endif()
+
 if(JCE_BUILD_JNI)
 	find_package(JNI REQUIRED)
 endif()
@@ -440,44 +446,22 @@ set(JCE_SHADER_OUTPUT_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}/shaders")
 # platform can actually load.  Saves compile time and keeps shipped
 # .pak slim (e.g. no Metal binaries on Windows builds).
 #
+# The matrix itself lives in cmake/JCESDKHelpers.cmake — the file the
+# SDK installs beside JCEConfig.cmake — so this engine build and an
+# out-of-tree `find_package(JCE)` consumer share ONE definition.
+#
 # Override at configure time with -DJCE_SHADER_PROFILES="dx11;spv".
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCESDKHelpers.cmake")
 if(NOT JCE_SHADER_PROFILES)
-	if(JCE_PLATFORM_WINDOWS)
-		set(JCE_SHADER_PROFILES dx11 spv glsl)
-	elseif(JCE_PLATFORM_MACOS OR JCE_PLATFORM_IOS)
-		# Apple deprecated desktop OpenGL and bgfx no longer reports
-		# BGFX_RENDERER_TYPE_OPENGL on Apple platforms, so the `glsl`
-		# profile would only bloat the .pak with unreachable binaries.
-		set(JCE_SHADER_PROFILES mtl spv)
-	elseif(JCE_PLATFORM_ANDROID)
-		# NOTE: no essl1 — the runtime shader loader (jce_shaders.c
-		# shader_suffix) maps BGFX_RENDERER_TYPE_OPENGLES to "essl"
-		# unconditionally, so essl1 binaries were built + PAKed but
-		# never loadable (dead .pak weight).  If a real GLES2 tier is
-		# ever wanted, add a caps-based suffix pick there first.
-		set(JCE_SHADER_PROFILES essl spv)
-	elseif(JCE_PLATFORM_WEB)
-		# NOTE: no essl1 — see the Android note above (never loaded).
-		set(JCE_SHADER_PROFILES essl)
-	elseif(JCE_PLATFORM_LINUX)
-		set(JCE_SHADER_PROFILES spv glsl)
-	else()
-		set(JCE_SHADER_PROFILES dx11 spv glsl essl mtl)
-	endif()
+	jce_shader_profiles(JCE_SHADER_PROFILES)
 endif()
 message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
 
 # Build a list of `--exclude-suffix _<sfx>.bin` flags for jce_pak so
 # that any *stale* shader binaries left in the shared output dir (from
 # a previous build for another platform) are not packed into the .pak.
-set(_all_shader_suffixes dx11 spv glsl essl essl1 mtl)
-set(JCE_PAK_SHADER_EXCLUDE_FLAGS "")
-foreach(_sfx IN LISTS _all_shader_suffixes)
-	if(NOT _sfx IN_LIST JCE_SHADER_PROFILES)
-		list(APPEND JCE_PAK_SHADER_EXCLUDE_FLAGS
-			--exclude-suffix "_${_sfx}.bin")
-	endif()
-endforeach()
+jce_shader_pak_exclude_flags(JCE_PAK_SHADER_EXCLUDE_FLAGS
+	PROFILES ${JCE_SHADER_PROFILES})
 
 jce_compile_shaders(
 	TARGET        CompileShaders
@@ -653,6 +637,11 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
+		# Canonical extension -> asset-kind table shared by the cooker, the
+		# runtime and the editor (jce_asset_type_from_ext).  This target has
+		# an explicit source list rather than the engine's glob, so the TU
+		# must be named here or jce_cook_detect_type fails to link.
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_ext.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c"
 		# Offline collider cook (--collider): model import (assimp) +
@@ -668,10 +657,24 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		# .obj/.fbx/.dae to a single runtime mesh format (binary glTF).
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_mesh_convert.cpp"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_mesh_lod_cook.c"
-		# stb-backed decode for the gray16-PNG bypass in jce_cook_texture
-		# (SDL3_image's libpng path heap-overruns on 16-bit grayscale PNGs).
+		# The ONE image-decode service + its JceImage adapter.  jce_cook_texture
+		# decodes through it so cooked pixels are byte-for-byte what the runtime
+		# decodes, and so the 16-bit-grayscale-PNG bypass (SDL3_image's libpng
+		# path heap-overruns on that class) has a single implementation instead
+		# of a copy here and a copy in the engine.  jce_image.c sits under
+		# renderer/ but is deliberately bgfx-FREE: it needs only SDL3 +
+		# SDL3_image (linked below), the vendored stb build and jce_memory —
+		# all already part of this target.
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_image_decode.c"
+		"${JCE_ENGINE_SRC_DIR}/renderer/jce_image.c"
 		"${JCE_ENGINE_SRC_DIR}/renderer/jce_stb_image_impl.c")
+	# bimg/bx headers use C++20 constructs in bgfx 1.146, so the texture-
+	# encoder TU (pulls bimg/encode.h + bx/) must compile as C++20; the rest
+	# of jce_cook stays C99/C++20.
+	set_source_files_properties(
+		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
+		PROPERTIES COMPILE_OPTIONS
+		"$<$<CXX_COMPILER_ID:MSVC>:/std:c++20>;$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-std=c++20>")
 	# When the SDK install is enabled, jce_cook ships in <sdk>/bin/ so
 	# end-user projects can cook raw assets (textures/audio) without the
 	# editor or a JCE source tree.  Otherwise keep it out of the default
@@ -1192,16 +1195,21 @@ if(MSVC)
 	# linking, which Release already uses).  Release config covers the release
 	# AND dist variants (both build_type=Release); Debug is left incremental.
 	add_link_options("$<$<CONFIG:Release>:/Brepro>" "$<$<CONFIG:Release>:/INCREMENTAL:NO>")
-	# Release debug symbols: emit a .pdb so the in-process crash handler
-	# (DbgHelp SymFromAddr/SymGetLineFromAddr64 in jce_crash_handler.c) resolves
-	# STATIC functions + file:line instead of nearest-export noise.  /DEBUG turns
-	# off /OPT:REF,ICF by default, so restore them to keep the release binary
-	# optimized + small.  (Diagnostic aid for the streaming rapid-zoom crash;
-	# the .pdb ships beside the .exe and is only read at crash time.)
-	add_compile_options("$<$<CONFIG:Release>:/Zi>")
-	add_link_options("$<$<CONFIG:Release>:/DEBUG>"
-	                 "$<$<CONFIG:Release>:/OPT:REF>"
+	# /OPT:REF + /OPT:ICF: dead-strip unused code + fold identical COMDATs, for
+	# BOTH the release and dist variants (on by default without /DEBUG, but the
+	# /Zi+/DEBUG block below disables them, so set them explicitly).
+	add_link_options("$<$<CONFIG:Release>:/OPT:REF>"
 	                 "$<$<CONFIG:Release>:/OPT:ICF>")
+	# .pdb (/Zi + /DEBUG): dev `release` variant ONLY, so the in-process crash
+	# handler (DbgHelp SymFromAddr/SymGetLineFromAddr64 in jce_crash_handler.c)
+	# resolves STATIC functions + file:line instead of nearest-export noise.
+	# The `dist` (shipping) variant OMITS the .pdb — matching the POSIX `-s`
+	# strip below, and package-editor never bundled it anyway — so a dist link is
+	# leaner + faster.  (The .pdb is only read at crash time.)
+	if(NOT JCE_BUILD_VARIANT STREQUAL "dist")
+		add_compile_options("$<$<CONFIG:Release>:/Zi>")
+		add_link_options("$<$<CONFIG:Release>:/DEBUG>")
+	endif()
 	# Trim the absolute repo prefix from __FILE__ so embedded paths are stable
 	# across machines/checkout locations.  Harmless no-op when the prefix is
 	# absent.  (/d1trimfile is the practical MSVC equivalent of -ffile-prefix-map.)

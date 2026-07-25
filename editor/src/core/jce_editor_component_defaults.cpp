@@ -9,12 +9,21 @@
  * duplicate_components()'s particle-emitter fixup — adding a future
  * component means one engine REG row, one editor descriptor row and one
  * adddef_* function here.
+ *
+ * These values are the THIRD copy of each component's defaults: the engine's
+ * JSON parse fallbacks (engine/src/middleware/scene/jce_scene_components_*.c)
+ * are authoritative, and jce_reflect_builtin.cpp holds a fourth for the
+ * inspector's "Reset to Default".  A deliberate difference is fine (a fresh
+ * component may start with starter content an omitted JSON key must not
+ * invent, and a legacy-compat fallback must keep loading old scenes the same
+ * way) — an ACCIDENTAL one is a bug.  Comment the deliberate ones.
  */
 
 #include "jce_editor_component_registry.h"
 
 extern "C" {
 #include <jce/middleware/physics/jce_cloth.h>
+#include <jce/renderer/jce_postfx.h>
 }
 
 #include <stdio.h>
@@ -170,6 +179,10 @@ void adddef_constraint(JceScene *scene, JceEntity e)
 {
     JceConstraintComponent c;
     memset(&c, 0, sizeof(c));
+    /* +Y hinge/slider axis, matching the scene parser's fallback: a zeroed axis
+     * is degenerate the moment the designer switches the type off point2point
+     * (rt_spawn_joint hands it straight to Bullet). */
+    c.axis[1] = 1.0f;
     jce_scene_set_constraint(scene, e, &c);
 }
 
@@ -965,6 +978,12 @@ void adddef_volume(JceScene *scene, JceEntity e)
 {
     JceVolumeComponent c;
     memset(&c, 0, sizeof(c));
+    /* enabled_mask stays 0 (no overrides), but the per-field values must start
+     * NEUTRAL, not zero: the inspector only ungreys a field when its override
+     * bit is ticked and never seeds it, so a zeroed blob would tick "Gamma"
+     * straight to 0.  Same source the scene parser falls back to for an absent
+     * key (parse_volume in jce_scene_components_render.c). */
+    c.profile.values = jce_postfx_default_params();
     c.shape          = JCE_VOLUME_SHAPE_BOX;
     c.extents        = jce_v3(1.0f, 1.0f, 1.0f);
     c.blend_distance = 1.0f;

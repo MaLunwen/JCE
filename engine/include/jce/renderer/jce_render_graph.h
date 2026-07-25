@@ -8,8 +8,19 @@
  *
  * Layer: Render Abstraction (Layer 4).
  *
- * STATUS: Implemented — topological sort (Kahn's), transient resource
- *         allocation, cycle detection, automatic view assignment.
+ * STATUS: BUILT BUT NOT WIRED.  The machinery below is complete —
+ *         topological sort (Kahn's), transient resource allocation, cycle
+ *         detection, automatic view assignment — but jce_rg_execute has no
+ *         production caller and no test.  The renderer submits its passes
+ *         directly against fixed JCE_VIEW_* ids (see jce_scene_renderer.c),
+ *         so pass ordering and resource lifetime are NOT graph-managed
+ *         today; the frame debugger notes the same thing.
+ *
+ *         This distinction matters when auditing the architecture: reading
+ *         "Implemented" here previously suggested the engine had
+ *         graph-ordered passes, which it does not.  Wiring it up means
+ *         moving the scene renderer's view assignments into passes — a real
+ *         project, not a switch to flip.
  */
 
 #ifndef JCE_RENDER_GRAPH_H
@@ -78,11 +89,11 @@ JCE_API void            jce_rg_destroy(JceRenderGraph *rg);
 /* ================================================================== */
 
 /* Declare a transient resource (allocated per-frame by the graph). */
-JceRGResource jce_rg_create_resource(JceRenderGraph *rg,
+JCE_API JceRGResource jce_rg_create_resource(JceRenderGraph *rg,
                                       const JceRGResourceDesc *desc);
 
 /* Import an external resource (e.g. backbuffer, persistent texture). */
-JceRGResource jce_rg_import_resource(JceRenderGraph *rg,
+JCE_API JceRGResource jce_rg_import_resource(JceRenderGraph *rg,
                                       uint16_t texture_handle,
                                       const char *debug_name);
 
@@ -91,15 +102,15 @@ JceRGResource jce_rg_import_resource(JceRenderGraph *rg,
 /* ================================================================== */
 
 /* Register a named render pass with an execution callback. */
-JceRGPass jce_rg_add_pass(JceRenderGraph *rg, const char *name,
+JCE_API JceRGPass jce_rg_add_pass(JceRenderGraph *rg, const char *name,
                            JceRGPassExecuteFn fn, void *userdata);
 
 /* Declare that a pass reads from a resource. */
-void jce_rg_pass_read(JceRenderGraph *rg, JceRGPass pass,
+JCE_API void jce_rg_pass_read(JceRenderGraph *rg, JceRGPass pass,
                        JceRGResource resource);
 
 /* Declare that a pass writes to a resource (color or depth attachment). */
-void jce_rg_pass_write(JceRenderGraph *rg, JceRGPass pass,
+JCE_API void jce_rg_pass_write(JceRenderGraph *rg, JceRGPass pass,
                         JceRGResource resource);
 
 /* ================================================================== */

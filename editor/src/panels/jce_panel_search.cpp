@@ -17,6 +17,7 @@
  * goes through jce_fs_host_* / jce_json (no raw libc, no platform macros).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
@@ -31,15 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <jce/os/core/jce_defs.h>
-
-#if JCE_PLATFORM_WINDOWS
-#  define jce_strncasecmp _strnicmp
-#else
-#  include <strings.h>
-#  define jce_strncasecmp strncasecmp
-#endif
-
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -49,9 +41,8 @@ extern "C" {
 /* ── State ─────────────────────────────────────────────────────────── */
 
 static char s_query[128] = {0};
-static int  s_tab        = 0; /* 0 scene, 1 menus/panels, 2 project */
-static int  s_request_tab = -1;
-static bool s_tab_state_loaded = false;
+/* Tabs: 0 scene, 1 menus/panels, 2 project. */
+static JcePanelTabState s_tabs{ "panel.search.current_tab", /*max_tab=*/2 };
 
 struct SceneHit { JceEntity e; std::string label; };
 struct PathHit  { std::string path; std::string label; /* "file :: name" or just path */ };
@@ -69,19 +60,7 @@ static std::vector<PathHit>  s_path_hits;
 static char s_last_query[128] = {0};
 static int  s_last_tab = -1;
 
-static const char *k_search_tab_state_key = "panel.search.current_tab";
-
 /* ── Helpers ───────────────────────────────────────────────────────── */
-
-static bool ci_contains(const char *hay, const char *needle)
-{
-    if (!hay || !needle || !*needle) return false;
-    size_t n = strlen(needle);
-    for (const char *p = hay; *p; p++) {
-        if (jce_strncasecmp(p, needle, n) == 0) return true;
-    }
-    return false;
-}
 
 static void locale_short_tag(JceLocale loc, char out[4])
 {
@@ -230,7 +209,7 @@ static void scan_menus_panels(const char *q)
         JceLocale  match_loc = JCE_LOCALE_EN;
 
         /* Raw key match (allows searching by identifier). */
-        if (ci_contains(row.key, q)) {
+        if (jce_panel_contains_ci(row.key, q)) {
             matched   = true;
             match_loc = jce_editor_i18n_get_locale();
         }
@@ -239,7 +218,7 @@ static void scan_menus_panels(const char *q)
         for (int li = 0; !matched && li < n_loc; li++) {
             JceLocale loc = (JceLocale)li;
             const char *s = jce_editor_i18n_lookup_locale(loc, row.key);
-            if (s && ci_contains(s, q)) {
+            if (s && jce_panel_contains_ci(s, q)) {
                 matched   = true;
                 match_loc = loc;
                 break;
@@ -263,7 +242,7 @@ static void scan_menus_panels(const char *q)
         bool       matched   = false;
         JceLocale  match_loc = JCE_LOCALE_EN;
 
-        if (ci_contains(row.child_key, q)) {
+        if (jce_panel_contains_ci(row.child_key, q)) {
             matched   = true;
             match_loc = jce_editor_i18n_get_locale();
         }
@@ -271,8 +250,8 @@ static void scan_menus_panels(const char *q)
             JceLocale loc = (JceLocale)li;
             const char *cs = jce_editor_i18n_lookup_locale(loc, row.child_key);
             const char *ps = jce_editor_i18n_lookup_locale(loc, row.parent_key);
-            if ((cs && ci_contains(cs, q)) ||
-                (ps && ci_contains(ps, q))) {
+            if ((cs && jce_panel_contains_ci(cs, q)) ||
+                (ps && jce_panel_contains_ci(ps, q))) {
                 matched   = true;
                 match_loc = loc;
                 break;
@@ -300,7 +279,7 @@ static void scene_scan_cb(JceScene *s, JceEntity e, void *ud)
     ScCtx *c = (ScCtx *)ud;
     JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
     if (!m) return;
-    if (ci_contains(m->name, c->q) || ci_contains(m->tag, c->q)) {
+    if (jce_panel_contains_ci(m->name, c->q) || jce_panel_contains_ci(m->tag, c->q)) {
         SceneHit h; h.e = e;
         h.label = std::string(m->name[0] ? m->name : "(unnamed)") +
                    (m->tag[0] ? std::string("  [") + m->tag + "]" : std::string());
@@ -402,7 +381,7 @@ static bool project_walk_cb(const char *path, bool is_dir, void *user)
     if ((int)c->out->size() >= c->max_hits) return false;
 
     /* Path/filename hit (legacy behaviour). */
-    if (ci_contains(path, c->q)) {
+    if (jce_panel_contains_ci(path, c->q)) {
         PathHit h;
         h.path  = path;
         h.label = path;
@@ -417,7 +396,7 @@ static bool project_walk_cb(const char *path, bool is_dir, void *user)
             const char *leaf = path_leaf(path);
             for (const auto &name : *names) {
                 if ((int)c->out->size() >= c->max_hits) return false;
-                if (ci_contains(name.c_str(), c->q)) {
+                if (jce_panel_contains_ci(name.c_str(), c->q)) {
                     PathHit h;
                     h.path  = path;
                     h.label = std::string(leaf) + " :: " + name;
@@ -438,12 +417,12 @@ static void rescan(void)
     s_path_hits.clear();
     if (s_query[0] == '\0') return;
 
-    if (s_tab == 0) {
+    if (s_tabs.current == 0) {
         JceScene *scene = jce_state_get_scene();
         if (!scene) return;
         ScCtx ctx{ s_query, &s_scene_hits };
         jce_scene_each_entity(scene, scene_scan_cb, &ctx);
-    } else if (s_tab == 1) {
+    } else if (s_tabs.current == 1) {
         scan_menus_panels(s_query);
     } else {
         const char *root = jce_editor_assets_get_project();
@@ -453,29 +432,14 @@ static void rescan(void)
     }
 }
 
-static void ensure_tab_state_loaded(void)
-{
-    if (s_tab_state_loaded)
-        return;
-
-    s_tab = jce_editor_ui_state_load_int(k_search_tab_state_key, 0, 0, 2);
-    s_request_tab = s_tab;
-    s_tab_state_loaded = true;
-}
-
-static ImGuiTabItemFlags tab_flags(int idx)
-{
-    return (s_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
-}
-
+/* Local wrapper: unlike the shared setter, switching Search tabs must also
+ * re-run the query against the newly selected scope. */
 static void select_tab(int idx)
 {
-    if (idx < 0 || idx > 2 || s_tab == idx)
+    if (!jce_panel_tab_valid(s_tabs, idx) || s_tabs.current == idx)
         return;
 
-    s_tab = idx;
-    if (s_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_search_tab_state_key, idx);
+    jce_panel_tab_set_current(s_tabs, idx);
     rescan();
 }
 
@@ -489,7 +453,7 @@ static void open_panel(JceEditorPanel p)
 
 extern "C" void jce_editor_panel_search_content(void)
 {
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(s_tabs);
 
     ImGui::SetNextItemWidth(-100);
     bool query_changed = ImGui::InputTextWithHint(
@@ -497,13 +461,13 @@ extern "C" void jce_editor_panel_search_content(void)
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("common.search")) || query_changed) {
         snprintf(s_last_query, sizeof(s_last_query), "%s", s_query);
-        s_last_tab = s_tab;
+        s_last_tab = s_tabs.current;
         rescan();
     }
 
     if (ImGui::BeginTabBar("##search_tabs")) {
         if (ImGui::BeginTabItem(jce_editor_i18n("search.tab.scene"),
-                                nullptr, tab_flags(0))) {
+                                nullptr, jce_panel_tab_flags(s_tabs, 0))) {
             select_tab(0);
             ImGui::Text("%s %zu", jce_editor_i18n("search.hits"), s_scene_hits.size());
             ImGui::Separator();
@@ -519,7 +483,7 @@ extern "C" void jce_editor_panel_search_content(void)
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("search.tab.menusPanels"),
-                                nullptr, tab_flags(1))) {
+                                nullptr, jce_panel_tab_flags(s_tabs, 1))) {
             select_tab(1);
             ImGui::Text("%s %zu", jce_editor_i18n("search.hits"), s_mp_hits.size());
             ImGui::Separator();
@@ -540,7 +504,7 @@ extern "C" void jce_editor_panel_search_content(void)
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("search.tab.project"),
-                                nullptr, tab_flags(2))) {
+                                nullptr, jce_panel_tab_flags(s_tabs, 2))) {
             select_tab(2);
             ImGui::Text("%s %zu", jce_editor_i18n("search.hits"), s_path_hits.size());
             ImGui::Separator();
@@ -557,6 +521,6 @@ extern "C" void jce_editor_panel_search_content(void)
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
-        s_request_tab = -1;
+        s_tabs.request = -1;
     }
 }

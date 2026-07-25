@@ -16,7 +16,7 @@
  *   Android    | API 21 (Lollipop) | arm64-v8a    | NEON
  *   Web (wasm) | wasm32 + simd128  | —            | wasm-SIMD
  *
- * Language baseline: C11 + C++17.
+ * Language baseline: C11 + C++20.
  *
  * This header is intentionally dependency-light and safe for FFI tools.
  */
@@ -33,8 +33,8 @@ extern "C" {
 /* -- Language baseline ----------------------------------------------- */
 
 #if defined(__cplusplus)
-#if __cplusplus < 201703L && !defined(_MSC_VER)
-#error "JCE requires C++17 or later"
+#if __cplusplus < 202002L && !defined(_MSC_VER)
+#error "JCE requires C++20 or later"
 #endif
 #elif defined(__STDC_VERSION__)
 #if __STDC_VERSION__ < 199901L

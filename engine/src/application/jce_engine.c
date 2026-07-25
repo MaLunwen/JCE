@@ -14,7 +14,6 @@
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
-#include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/runtime/jce_player_loop.h>
 
@@ -113,14 +112,33 @@ void JCE_CALL jce_engine_request_quit(void)  { g_quit_requested = true; }
 bool JCE_CALL jce_engine_quit_requested(void) { return g_quit_requested; }
 static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
+void jce_engine_set_app_desc_sized(const JceAppDesc *desc, size_t desc_size)
+{
+    if (!desc || desc_size == 0) {
+        g_app_desc_set = false;
+        return;
+    }
+    /* Zero first so a SHORT descriptor (caller built against an older SDK,
+     * before window_width/window_height or headless existed) leaves the
+     * fields it never knew about at their documented defaults rather than
+     * at whatever followed the caller's object in memory. */
+    memset(&g_app_desc, 0, sizeof(g_app_desc));
+
+    /* A LONGER descriptor (caller newer than this engine) is equally fine:
+     * copy only what this engine understands and ignore the tail. */
+    const size_t n = desc_size < sizeof(g_app_desc) ? desc_size
+                                                    : sizeof(g_app_desc);
+    memcpy(&g_app_desc, desc, n);
+    g_app_desc_set = true;
+}
+
 void jce_engine_set_app_desc(const JceAppDesc *desc)
 {
-    if (desc) {
-        g_app_desc = *desc;
-        g_app_desc_set = true;
-    } else {
-        g_app_desc_set = false;
-    }
+    /* Legacy entry point — asserts the caller's layout equals ours, which is
+     * exactly the assumption that breaks for an SDK consumer with older
+     * headers.  Engine-internal callers are always in lockstep, and the
+     * header's shim routes external code to the sized form. */
+    jce_engine_set_app_desc_sized(desc, sizeof(JceAppDesc));
 }
 
 void jce_engine_set_config_path(const char *path)
@@ -230,12 +248,7 @@ static void jce_select_config_path(char *out_path, size_t out_size)
     snprintf(out_path, out_size, "%s.config/jce.ini", base ? base : "");
 }
 
-/* QW-input-actions — locate the action-map authored by the editor.
- * The editor's Input Manager panel writes `~/.jce/input_actions.json`
- * (jce_editor_dotjce_path).  A shipped game may instead drop a
- * project-relative `.jce/input_actions.json` next to its working dir.
- * Prefer the CWD-relative copy (game ships its own), then the per-user
- * one (editor authoring), so play-in-editor and standalone both work. */
+/* QW-input-actions — locate the project action-map authored by the editor. */
 static void jce_select_input_actions_path(char *out_path, size_t out_size)
 {
     out_path[0] = '\0';
@@ -246,6 +259,11 @@ static void jce_select_input_actions_path(char *out_path, size_t out_size)
         return;
     }
 
+}
+
+static void jce_select_user_input_actions_path(char *out_path, size_t out_size)
+{
+    out_path[0] = '\0';
     char home[512];
     if (jce_host_get_user_folder(JCE_USER_FOLDER_HOME, home, sizeof(home))) {
         size_t hl = strlen(home);
@@ -255,9 +273,29 @@ static void jce_select_input_actions_path(char *out_path, size_t out_size)
     }
 }
 
-/* input_actions.json loading lives in the input-actions module itself
- * (jce_actions_load_file) so the editor's Play mode and other hosts can
- * reuse it instead of duplicating the parser. */
+#define JCE_INPUT_ACTIONS_PAK_PATH "settings/input_actions.json"
+#define JCE_INPUT_ACTIONS_MAX_BYTES (256u * 1024u)
+
+static JceInputActions *jce_actions_load_pak(const JcePakArchive *pak)
+{
+    if (!pak)
+        return NULL;
+    const JcePakAsset *asset =
+        jce_pak_find(pak, JCE_INPUT_ACTIONS_PAK_PATH);
+    if (!asset || asset->original_size == 0 ||
+        asset->original_size > JCE_INPUT_ACTIONS_MAX_BYTES)
+        return NULL;
+
+    const size_t size = (size_t)asset->original_size;
+    void *bytes = JCE_MALLOC(size);
+    if (!bytes)
+        return NULL;
+    const size_t written = jce_pak_decompress(asset, bytes, size);
+    JceInputActions *actions = written == size
+        ? jce_actions_load_memory(bytes, size) : NULL;
+    JCE_FREE(bytes);
+    return actions;
+}
 
 /* P3-B.3 — engine-internal lifecycle listener.  Bridges OS LOW_MEMORY
  * signals to the streaming pressure system so registered mip-streaming
@@ -277,6 +315,7 @@ static void JCE_CALL engine_lifecycle_listener(JceLifecycleEvent event, void *us
 struct JceEngine {
     JceConfig        config;
     JceGpuCaps       gpu_caps;
+    bool             headless;        /* dedicated-server: no window/GPU/audio/UI */
     JceWindow       *window;
     JceInput        *input;
     JceInputActions *actions;       /* action-map layer (QW-input-actions) */
@@ -434,7 +473,9 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     }
     /* Settings S5: publish the boot-only perf knobs so the renderer (bgfx
      * pool sizing) and jobs layers — which never receive the JceConfig — can
-     * read them.  Done before bgfx_init / any jce_jobs_default. */
+     * read them.  Load-bearing ordering: publish_perf now PUSHES the worker
+     * count into the shared pool, so it must stay ahead of bgfx_init and of
+     * the first jce_thread_pool_shared() consumer. */
     jce_config_publish_perf(e->config.machine_class, e->config.job_workers);
 
     /* Apply renderer backend override from editor (or other host). */
@@ -450,13 +491,34 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     SDL_SetAppMetadata("JCE", "0.1.0", "com.jce");
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    /* Headless / dedicated-server boot: no window, no GPU device, no audio/UI.
+     * Selected by the app descriptor (authoritative) or forced by JCE_HEADLESS
+     * (same diagnostic env family as JCE_BACKEND / JCE_AUDIO_DISABLE).  In this
+     * mode we init only SDL_INIT_EVENTS — never VIDEO/GAMEPAD — so the engine
+     * boots on a display-less host (CI, dedicated server). */
+    {
+        const char *hl_env = getenv("JCE_HEADLESS");
+        e->headless = (g_app_desc_set && g_app_desc.headless) ||
+                      (hl_env && hl_env[0] && hl_env[0] != '0');
+    }
+
+    if (e->headless) {
+        if (!SDL_Init(SDL_INIT_EVENTS)) {
+            fatal_msg("SDL_Init(EVENTS) failed: %s", SDL_GetError());
+            JCE_FREE(e);
+            return NULL;
+        }
+        LOG_INFO(LOG_TAG, "HEADLESS boot: no window, no GPU device, no audio/UI "
+                 "(dedicated-server mode)");
+    } else if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fatal_msg("SDL_Init failed: %s", SDL_GetError());
         JCE_FREE(e);
         return NULL;
     }
 
-    if (!jce_single_instance_lock(e->config.window_title)) {
+    /* Servers routinely run several instances on one host; the single-instance
+     * activation dance (window restore/foreground) is meaningless headless. */
+    if (!e->headless && !jce_single_instance_lock(e->config.window_title)) {
         /* Second instance: activate the first instance's window instead
          * of interrupting the user with a modal — restore it if
          * minimized, best-effort foreground, and flash its taskbar
@@ -600,32 +662,47 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         e->config.window_height = (int)g_app_desc.window_height;
 
     /* -- Window ------------------------------------------------------- */
+    /* Headless: no window at all (dedicated server).  e->window stays NULL;
+     * every windowed path below is guarded on e->headless. */
+    if (!e->headless) {
+        JceWindowConfig win_cfg = {
+            .title     = e->config.window_title,
+            .logical_w = e->config.window_width,
+            .logical_h = e->config.window_height,
+            .flags     = (e->config.resizable  ? JCE_WINDOW_RESIZABLE  : 0)
+                       | (e->config.fullscreen ? JCE_WINDOW_FULLSCREEN : 0)
+                       | (e->config.maximized  ? JCE_WINDOW_MAXIMIZED  : 0)
+                       | (g_app_desc_set && g_app_desc.maximized ? JCE_WINDOW_MAXIMIZED : 0)
+        };
+        e->window = jce_window_create(&win_cfg);
+        if (!e->window) {
+            fatal_msg("Window creation failed: %s", SDL_GetError());
+            goto fail;
+        }
 
-    JceWindowConfig win_cfg = {
-        .title     = e->config.window_title,
-        .logical_w = e->config.window_width,
-        .logical_h = e->config.window_height,
-        .flags     = (e->config.resizable  ? JCE_WINDOW_RESIZABLE  : 0)
-                   | (e->config.fullscreen ? JCE_WINDOW_FULLSCREEN : 0)
-                   | (e->config.maximized  ? JCE_WINDOW_MAXIMIZED  : 0)
-                   | (g_app_desc_set && g_app_desc.maximized ? JCE_WINDOW_MAXIMIZED : 0)
-    };
-    e->window = jce_window_create(&win_cfg);
-    if (!e->window) {
-        fatal_msg("Window creation failed: %s", SDL_GetError());
-        goto fail;
-    }
-
-    /* Publish the native handle so a later second instance can activate
-     * this window (restore + foreground + taskbar flash) instead of
-     * showing a modal. */
-    {
+        /* Publish the native handle so a later second instance can activate
+         * this window (restore + foreground + taskbar flash) instead of
+         * showing a modal. */
         JceNativeWindow nw;
         jce_window_get_native(e->window, &nw);
         jce_single_instance_publish_window(nw.nwh);
     }
 
     /* -- Renderer ------------------------------------------------- */
+
+    if (e->headless) {
+        /* NullRHI: bgfx NOOP, no window.  Scene/resource render calls stay
+         * valid no-ops; the headless loop never draws. */
+        e->renderer = jce_renderer_create_headless();
+        if (!e->renderer) {
+            fatal_msg("Headless renderer (NullRHI) init failed");
+            goto fail;
+        }
+        /* No shaders, GPU caps, render pipeline, or graphics config in a
+         * server build — nothing is ever submitted. */
+        e->input = NULL;   /* no window = no raw input device */
+        goto headless_after_renderer;
+    }
 
     JceRendererConfig ren_cfg = {
         .backend     = (int)e->config.renderer_backend,
@@ -706,7 +783,17 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         e->actions = jce_actions_load_file(actions_path);
         if (e->actions) {
             LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
+        } else if ((e->actions = jce_actions_load_pak(e->pak)) != NULL) {
+            LOG_INFO(LOG_TAG, "input actions loaded from PAK: %s",
+                     JCE_INPUT_ACTIONS_PAK_PATH);
         } else {
+            jce_select_user_input_actions_path(actions_path,
+                                               sizeof(actions_path));
+            e->actions = jce_actions_load_file(actions_path);
+            if (e->actions)
+                LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
+        }
+        if (!e->actions) {
             e->actions = jce_actions_create();
             if (e->actions) {
                 jce_actions_bind_fps_defaults(e->actions);
@@ -770,6 +857,13 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     if (e->audio && e->config.master_volume < 1.0f)
         jce_audio_set_master_volume(e->audio, e->config.master_volume);
+
+    /* Headless boot rejoins here: skips shaders, GPU caps, render pipeline,
+     * graphics config, raw input, input actions/record-replay, and audio —
+     * all windowed/GPU/HID concerns.  PAK, asset manager, event bus,
+     * subsystems, and app.init below all run so a server can load scenes and
+     * tick simulation + network. */
+headless_after_renderer:;
 
     /* -- Asset manager -------------------------------------------- */
 
@@ -838,7 +932,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* -- Initialize application ----------------------------------- */
 
     if (g_app_desc_set && g_app_desc.init) {
-        if (should_render_loading_frame())
+        if (!e->headless && should_render_loading_frame())
             render_loading_frame(e->renderer, e->window, "Loading assets...");
         if (!g_app_desc.init(&e->svc, g_app_desc.user_data))
             goto fail;
@@ -847,13 +941,17 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         goto fail;
     }
 
-    /* Register live-resize watcher so resize events are handled even
-       during platform modal message loops (needed for JNI bridge). */
-    SDL_AddEventWatch(jce_resize_event_watch, e);
+    /* Window-tied hooks: skipped headless (no window to resize / no modal
+     * sizing loop). */
+    if (!e->headless) {
+        /* Register live-resize watcher so resize events are handled even
+           during platform modal message loops (needed for JNI bridge). */
+        SDL_AddEventWatch(jce_resize_event_watch, e);
 
-    /* Keep rendering while the user holds the title bar / window border
-       on platforms with a modal sizing loop (Windows). No-op elsewhere. */
-    jce_window_install_modal_tick(jce_modal_tick_cb, e);
+        /* Keep rendering while the user holds the title bar / window border
+           on platforms with a modal sizing loop (Windows). No-op elsewhere. */
+        jce_window_install_modal_tick(jce_modal_tick_cb, e);
+    }
 
     /* P3-B.3 — wire OS LOW_MEMORY signals into the streaming pressure
      * system (pairs with the P3-A.2 mip-streaming hook).  Priority is
@@ -1238,6 +1336,32 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     if (dt < 0.0f) dt = 0.0f;
     if (dt > JCE_MAX_FRAME_DT) dt = JCE_MAX_FRAME_DT;
 
+    /* Deterministic benchmark dt (JCE_FRAME_DT_FIXED=seconds): pin the sim step
+     * to a fixed value regardless of wall clock, so a headless run advances
+     * physics/animation IDENTICALLY at every frame index across processes — the
+     * standard reproducible-benchmark practice (UE -fixedtimestep, Unity
+     * Time.captureDeltaTime).  This removes the real-dt confounder that makes
+     * two A/B runs place moving objects at different positions at the same frame
+     * index.  NOTE: the perf-lows ring is dt-derived, so under this mode it
+     * reports the pinned cadence, NOT real FPS — read timing from the
+     * perf-phases (real perf-counter CPU durations) or an external sampler.
+     * Unset (default) = normal wall-clock dt. */
+    {
+        static int   s_fixed_dt   = -1;
+        static float s_fixed_dt_v = 0.0f;
+        if (s_fixed_dt < 0) {
+            const char *v = SDL_getenv("JCE_FRAME_DT_FIXED");
+            if (v && v[0]) {
+                s_fixed_dt_v = (float)SDL_atof(v);
+                if (s_fixed_dt_v <= 0.0f) s_fixed_dt_v = JCE_DEFAULT_FRAME_DT;
+                s_fixed_dt = 1;
+            } else {
+                s_fixed_dt = 0;
+            }
+        }
+        if (s_fixed_dt) dt = s_fixed_dt_v;
+    }
+
     if (jce_engine_quit_requested()) {
         jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
         return JCE_APP_SUCCESS;
@@ -1246,6 +1370,45 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
             return JCE_APP_SUCCESS;
+    }
+
+    /* ── Headless / dedicated-server fast path ────────────────────────
+     * Tick simulation only: no window, no input pump, no begin/end frame,
+     * no draw().  The server's update() advances ECS/scene/AI/physics/save/
+     * network.  A fixed-step cadence is standard for dedicated servers; use
+     * JCE_FRAME_DT_FIXED for a deterministic step (already applied to dt
+     * above).  We do NOT busy-spin: pace to the sim step so a single-core
+     * box isn't pinned at 100%. */
+    if (e->headless) {
+        if (g_app_desc.update)
+            g_app_desc.update(dt, g_app_desc.user_data);
+
+        /* Pace the loop to the intended tick period (default ~60 Hz) minus the
+         * time already spent this iteration, so the server yields the core
+         * instead of spinning.  A real tickrate knob can layer on later. */
+        {
+            const double step_s   = (dt > 0.0f) ? (double)dt : (double)JCE_DEFAULT_FRAME_DT;
+            const uint64_t after  = jce_time_perf_counter();
+            const double spent_s  = (e->perf_freq > 0 && after > now)
+                                      ? (double)(after - now) / (double)e->perf_freq
+                                      : 0.0;
+            double sleep_s = step_s - spent_s;
+            if (sleep_s > 0.0) {
+                if (sleep_s > 0.1) sleep_s = 0.1;   /* cap: stay responsive to quit */
+                jce_thread_sleep_ms((uint32_t)(sleep_s * 1000.0));
+            }
+        }
+
+        if (e->max_frames) {
+            e->frame_index++;
+            if (e->frame_index >= e->max_frames) {
+                LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES reached (%u) — quitting (headless)",
+                         e->max_frames);
+                jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
+                return JCE_APP_SUCCESS;
+            }
+        }
+        return JCE_APP_CONTINUE;
     }
 
     if (jce_renderer_is_fallback(e->renderer)) {
@@ -1714,8 +1877,10 @@ void jce_engine_destroy(JceEngine *e)
      * GPU-touching cleanup the text subsystem may grow. */
     if (e->renderer) jce_renderer_destroy(e->renderer);
     /* Shared data-parallel job pool (frustum cull etc.) — joined after the
-     * renderer so no cull is in flight. */
-    jce_jobs_shutdown_default();
+     * renderer so no cull is in flight.  The old jce_jobs_shutdown_default()
+     * guarded this call against straggler JceJobSystem handles; with that
+     * facade gone the shared pool is the only owner, so shut it down directly. */
+    jce_thread_pool_shared_shutdown();
     if (e->audio)    jce_audio_destroy(e->audio);
     if (e->bundle_catalog) {
         jce_bundle_catalog_close((JceBundleCatalog *)e->bundle_catalog);

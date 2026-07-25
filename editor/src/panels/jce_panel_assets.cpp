@@ -17,6 +17,7 @@
 #include "core/jce_assetdb.h"
 #include "ui/jce_editor_modals.h"
 #include "jce_panel_assets_internal.h"
+#include "jce_panel_common.h"
 #include "scene/jce_asset_path_index.h"
 
 /* ── State instance (shared via extern in internal header) ───────── */
@@ -180,6 +181,13 @@ bool restore_asset_browser_project_root(void)
     return set_asset_browser_root(s_assets.followed_project_root, false, false);
 }
 
+/* Project root the current session is opening.  jce_editor_assets_set_project()
+ * stashes it here BEFORE the first ensure_assets_init() so the one-time initial
+ * index targets the project actually being opened — not the previously-opened
+ * project persisted in config, whose synchronous main-thread scan would stall
+ * the first frame only to be thrown away moments later. */
+static std::string s_pending_init_root;
+
 void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
@@ -196,7 +204,17 @@ void ensure_assets_init(void)
      *      directory is stable, bounded, and never $HOME regardless of how
      *      the editor was launched.  Filesystem roots are still refused. */
     std::string resolved_root;
-    {
+    bool        root_from_session = false;
+    /* Priority 0: the project this session is actually opening (set by
+     * jce_editor_assets_set_project before this first init) — prefer it over
+     * the persisted last_project/recent_projects[0] so a cold boot does not
+     * synchronously index the PREVIOUS project. */
+    if (!s_pending_init_root.empty() &&
+        jce_fs_host_exists_dir(s_pending_init_root.c_str())) {
+        resolved_root = s_pending_init_root;
+        root_from_session = true;
+    }
+    if (resolved_root.empty()) {
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
             if (ecfg.last_project[0] &&
@@ -256,17 +274,21 @@ void ensure_assets_init(void)
     }
     s_assets.initialized       = true;
 
-    /* Index the resolved root, but only if it is a bounded directory.
-     * Filesystem roots (`/`, `X:\`) are always refused — those
-     * indicate a fallback that hit no useful candidate. */
-    if (!s_assets.project_root.empty() &&
+    /* Index the resolved root ONLY when it is the project this session is
+     * actually opening (root_from_session).  A config/base-path FALLBACK root
+     * — the PREVIOUSLY-opened project, or the exe directory — is NOT indexed
+     * here: on a cold boot that meant synchronously walking an unrelated
+     * project's entire tree (thousands of files, on the MAIN THREAD, before
+     * the first event pump) only to be replaced moments later when the real
+     * scene/project opens.  The real index runs from set_asset_browser_root()
+     * when a scene/project is actually opened (follow_scene_project_root ->
+     * jce_editor_assets_set_project).  Filesystem roots are always refused. */
+    if (root_from_session &&
+        !s_assets.project_root.empty() &&
         !is_filesystem_root(s_assets.project_root.c_str())) {
         jce_asset_path_index_rebuild_async(s_assets.project_root.c_str());
-        /* Mirror the resolved root into the editor-wide asset DB so the
-         * in-modal asset picker (and any other consumer that queries
-         * jce_assetdb_*) sees the same content as this browser even
-         * when the user launched a standalone scene/bundle without
-         * going through Open Project. */
+        /* Mirror into the editor-wide asset DB so the in-modal asset picker
+         * sees the same content as the browser. */
         jce_assetdb_set_root(s_assets.project_root.c_str());
     }
 }
@@ -633,6 +655,11 @@ void collect_selected_from_view_for_deletion(
 
 void jce_editor_assets_set_project(const char *path)
 {
+    /* Stash the project being opened BEFORE first-time init so
+     * ensure_assets_init indexes THIS project rather than the stale config
+     * one (a wasted synchronous scan of the previously-opened project). */
+    if (path && path[0])
+        s_pending_init_root = path;
     ensure_assets_init();
     if (!path || !path[0]) return;
 
@@ -739,26 +766,7 @@ static void handle_asset_keyboard_shortcuts(
             ImGuiIO &io = ImGui::GetIO();
             /* Ignore if any modifier is held (avoids eating Ctrl+A etc.) */
             if (!io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
-                /* Map ImGuiKey → char.  Covers letters, digits, numpad digits,
-                 * dot, minus, space — mirrors Windows Explorer. */
-                char typed = '\0';
-                for (ImGuiKey key = ImGuiKey_A; key <= ImGuiKey_Z && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('a' + (key - ImGuiKey_A));
-                for (ImGuiKey key = ImGuiKey_0; key <= ImGuiKey_9 && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('0' + (key - ImGuiKey_0));
-                for (ImGuiKey key = ImGuiKey_Keypad0; key <= ImGuiKey_Keypad9 && !typed;
-                     key = (ImGuiKey)(key + 1))
-                    if (ImGui::IsKeyPressed(key, false))
-                        typed = (char)('0' + (key - ImGuiKey_Keypad0));
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Space, false))          typed = ' ';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Minus, false))          typed = '-';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Period, false))         typed = '.';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false))  typed = '.';
-                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) typed = '-';
+                char typed = jce_panel_typeahead_key();
 
                 if (typed) {
                     char lc = (char)tolower((unsigned char)typed);
@@ -766,21 +774,11 @@ static void handle_asset_keyboard_shortcuts(
                     bool cycling = (lc == s_assets.jump_last_char
                                     && (now - s_assets.jump_reset_time) < kCycleWindow);
                     int start = cycling ? s_assets.jump_next_start : 0;
-                    int n = (int)view.size();
-                    int found = -1;
-
-                    for (int pass = 0; pass < 2 && found < 0; ++pass) {
-                        int from = (pass == 0) ? start : 0;
-                        int to   = (pass == 0) ? n     : start;
-                        for (int k = from; k < to; ++k) {
-                            if (!view[k].name.empty()
-                                && tolower((unsigned char)view[k].name[0]) == (unsigned char)lc)
-                            {
-                                found = k;
-                                break;
-                            }
-                        }
-                    }
+                    int found = jce_panel_typeahead_scan(
+                        (int)view.size(), start, [&view, lc](int k) {
+                            return !view[k].name.empty()
+                                && tolower((unsigned char)view[k].name[0]) == (unsigned char)lc;
+                        });
 
                     if (found >= 0) {
                         s_assets.selected_set.clear();

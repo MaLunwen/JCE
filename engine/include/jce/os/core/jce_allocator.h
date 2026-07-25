@@ -31,8 +31,10 @@ typedef struct jce_allocator {
     void  *ctx;   /* opaque context passed to every call */
 } jce_allocator_t;
 
-/* Default allocator backed by SDL_malloc (which is mimalloc when
-   SDL is configured with it, otherwise the platform allocator). */
+/* Default allocator, backed by mimalloc.  It shares both the underlying
+   heap and the allocation accounting (see "Debug allocation tracking"
+   below) with the engine-internal JCE_MALLOC macros, so the two are two
+   spellings of one allocator rather than two heaps. */
 JCE_API jce_allocator_t JCE_CALL jce_allocator_default(void);
 
 /* ================================================================== */
@@ -152,13 +154,24 @@ JCE_API bool jce_alloc_hook_sdl(void);
 /* ================================================================== */
 
 /*
- * In DEBUG builds (NDEBUG undefined) the default + aligned allocators record
- * live bytes and allocation counts, bucketed by size class.  Engine memory
- * goes through mimalloc (NOT the CRT heap), so a CRT leak dump and VS native
- * heap snapshots miss it — a rising live-byte total here pinpoints an
- * ENGINE-side leak and the size class it lives in.  Portable: plain native-word
- * counters, no platform-specific libraries.  Compiled out in release (snapshot
- * returns false, dump is a no-op), so zero overhead there.
+ * In DEBUG builds (NDEBUG undefined) the engine records live bytes and
+ * allocation counts, bucketed by size class.  Engine memory goes through
+ * mimalloc (NOT the CRT heap), so a CRT leak dump and VS native heap
+ * snapshots miss it — a rising live-byte total here pinpoints an ENGINE-side
+ * leak and the size class it lives in.  Portable: plain native-word counters,
+ * no platform-specific libraries.  Compiled out in release (snapshot returns
+ * false, dump is a no-op), so zero overhead there.
+ *
+ * SCOPE — one authoritative total, not a per-front-end sample.  COUNTED:
+ * jce_allocator_default(), jce_aligned_alloc(), and the engine-internal
+ * JCE_MALLOC / JCE_NEW macros (which jce_malloc / jce_free in jce_alloc.h
+ * also wrap).  All of them account identically, so a block taken from one
+ * and released through another still balances.  NOT COUNTED: the foreign-heap
+ * bridge (jce_realloc_aligned / jce_free_raw / jce_alloc_hook_sdl), which is
+ * unaccounted on BOTH ends and so neither inflates nor unbalances the totals;
+ * arena sub-allocations, which are counted once as their backing block; and
+ * anything outside this allocator.  For the process-wide figure that does
+ * include the foreign heaps, use jce_mem_stats().
  *
  * NOTE: counters are updated without locks, so values are APPROXIMATE under
  * heavy concurrent allocation (asset worker threads) — fine for a leak TREND.
@@ -191,7 +204,9 @@ JCE_API void jce_alloc_track_dump(void);
  * of allocations and bytes requested SINCE THE LAST CALL into *out_allocs /
  * *out_bytes (either may be NULL).  Cheap (two native-word reads + writes); used
  * by the JCE_PERF_LOG emit to surface allocs/frame so per-frame heap churn is
- * measurable in a profiling build (rank-9). */
+ * measurable in a profiling build (rank-9).  Same scope as the tracker above:
+ * every counted front-end contributes, so this is the frame's whole engine-heap
+ * churn, not one front-end's share of it. */
 JCE_API void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes);
 
 JCE_EXTERN_C_END

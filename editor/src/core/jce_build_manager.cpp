@@ -1425,6 +1425,28 @@ bool append_runtime_boot_asset(const std::string &project,
     jce_json_set_int(boot_json, "schema", JCE_RUNTIME_BOOT_SCHEMA_VERSION);
     jce_json_set_string(boot_json, "startup_scene",
                         startup_scene ? startup_scene : "");
+    /* Player window metadata (Project Settings > Player) -> shipped-game window.
+     * Emitted from the currently-loaded project settings; empty product name or
+     * zero size is omitted so the shipped game keeps its engine-config default.
+     * Previously the whole Player block was persisted but read by nothing. */
+    {
+        const JceProjectSettings *ps = jce_project_settings_current();
+        if (ps) {
+            if (ps->player.product_name[0])
+                jce_json_set_string(boot_json, "window_title",
+                                    ps->player.product_name);
+            if (ps->player.default_screen_width > 0)
+                jce_json_set_int(boot_json, "window_width",
+                                 ps->player.default_screen_width);
+            if (ps->player.default_screen_height > 0)
+                jce_json_set_int(boot_json, "window_height",
+                                 ps->player.default_screen_height);
+            jce_json_set_int(boot_json, "fullscreen",
+                             ps->player.fullscreen_default ? 1 : 0);
+            jce_json_set_int(boot_json, "run_in_background",
+                             ps->player.run_in_background ? 1 : 0);
+        }
+    }
     char *text = jce_json_print(boot_json, false);
     jce_json_free(boot_json);
     jce_project_free(manifest);

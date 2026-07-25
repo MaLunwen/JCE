@@ -1,11 +1,14 @@
 /*
- * jce_editor_recorder.cpp  F9 screen recorder (VP9 video + Opus system audio -> .mkv).
+ * jce_editor_recorder.cpp  F9 screen recorder (VP9 video + Opus engine audio -> .mkv).
  *
  * Video: renderer capture sink (screenshot path) -> bounded queue.
- * Audio: WASAPI loopback (system output) -> bounded queue.
+ * Audio: the engine's master-mix tap (jce_audio_master_tap_set) -> bounded
+ * queue.  Cross-platform and editor-only by construction: the tap observes
+ * the process's own final mix (Play / viewers), never other applications.
+ * The tap stream is gapless (constant device cadence, silence when idle).
  * A worker thread drains both and feeds the encoder, which reorders by
- * timestamp before muxing. Audio is Windows-only (loopback); on failure the
- * recording is video-only.
+ * timestamp before muxing.  On tap failure (no output device) the recording
+ * is video-only.
  */
 
 #include "core/jce_editor_recorder.h"
@@ -15,7 +18,7 @@ extern "C" {
 #include <jce/renderer/jce_renderer.h>
 #include <jce/ui/jce_imgui_renderer.h>
 #include <jce/middleware/video/jce_webm_encoder.h>
-#include <jce/middleware/audio/jce_audio_loopback.h>
+#include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
@@ -27,7 +30,7 @@ extern "C" {
 
 #define LOG_TAG       "jce_editor_rec"
 #define VID_QUEUE_MAX 12
-/* Audio chunks are tiny (~4 KB each, ~100/s from WASAPI loopback); a deep
+/* Audio chunks are tiny (~4 KB each, ~100/s from the master-mix tap); a deep
    queue costs little and absorbs any encoder stall (a heavy VP9 keyframe)
    without dropping ~5 s of audio. */
 #define AUD_QUEUE_MAX 512
@@ -97,7 +100,7 @@ void rec_frame(void *ud, const void *data, uint32_t size) {
 }
 void rec_end(void *ud) { (void)ud; }
 
-/* ── Audio loopback callback (audio thread) ───────────────────────── */
+/* ── Master-mix tap callback (audio device thread) ────────────────── */
 void aud_cb(void *ud, const float *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
     (void)ud; (void)rate;
     if (!pcm || !frames) return;
@@ -268,9 +271,9 @@ extern "C" bool jce_editor_recorder_start(JceRenderer *r, const char *out_path) 
 
     /* Audio first (so the encoder is created with the right track count). */
     g.aud_ch = 2;
-    g.have_audio = jce_audio_loopback_start(aud_cb, nullptr);
+    g.have_audio = jce_audio_master_tap_set(aud_cb, nullptr);
     if (!g.have_audio)
-        LOG_WARN(LOG_TAG, "no system loopback — recording video only");
+        LOG_WARN(LOG_TAG, "no master-mix device — recording video only");
 
     jce_renderer_set_capture_sink(rec_begin, rec_frame, rec_end, nullptr);
     jce_renderer_set_backbuffer_capture(r, true);
@@ -291,7 +294,7 @@ extern "C" void jce_editor_recorder_stop(void) {
     jce_renderer_set_capture_imgui_mode(false);
     jce_renderer_set_backbuffer_capture(g.renderer, false);
     jce_renderer_set_capture_sink(nullptr, nullptr, nullptr, nullptr);
-    if (g.have_audio) jce_audio_loopback_stop();
+    if (g.have_audio) jce_audio_master_tap_set(nullptr, nullptr);
 
     jce_mutex_lock(g.mtx);
     g.worker_run = false;

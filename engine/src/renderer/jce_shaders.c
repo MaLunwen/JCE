@@ -4,6 +4,7 @@
  * Decompresses .bin blobs, feeds them to bgfx_create_shader().
  */
 
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
@@ -12,7 +13,6 @@
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,6 +165,18 @@ JceShaderHandle shader_load_program_named(const JcePakArchive *pak,
     return load_program_named(pak, vs_base, fs_base);
 }
 
+void jce_shader_program_destroy(JceShaderHandle prog)
+{
+    if (!jce_shader_valid(prog)) return;
+    bgfx_program_handle_t p = { prog.idx };
+    bgfx_destroy_program(p);
+}
+
+const char *jce_shaders_backend_suffix(void)
+{
+    return shader_suffix(bgfx_get_renderer_type());
+}
+
 /* ================================================================== */
 /* Filesystem overlay (hot-reload support)                            */
 /* ================================================================== */
@@ -174,36 +186,25 @@ static bgfx_shader_handle_t load_single_fs(const char *full_path)
     bgfx_shader_handle_t invalid;
     invalid.idx = UINT16_MAX;
 
-    SDL_IOStream *io = SDL_IOFromFile(full_path, "rb");
-    if (!io) {
-        LOG_ERROR(LOG_TAG, "fs open failed: %s", full_path);
+    /* Read through the filesystem adapter rather than raw SDL: the dev-dir
+     * overlay is an ASSET read, so an active-VFS override (editor bundle
+     * preview) must be able to serve the shader bin it shipped. */
+    uint64_t sz  = 0;
+    void    *buf = jce_fs_host_read_all(full_path, &sz);
+    if (!buf) {
+        /* The adapter folds open-failure, short read and OOM into NULL. */
+        LOG_ERROR(LOG_TAG, "fs open/read failed: %s", full_path);
         return invalid;
     }
 
-    Sint64 sz = SDL_GetIOSize(io);
-    if (sz <= 0) {
-        SDL_CloseIO(io);
+    if (sz == 0) {
+        jce_fs_buffer_free(buf);
         LOG_ERROR(LOG_TAG, "fs empty: %s", full_path);
         return invalid;
     }
 
-    void *buf = JCE_MALLOC((size_t)sz);
-    if (!buf) {
-        SDL_CloseIO(io);
-        return invalid;
-    }
-
-    size_t n = SDL_ReadIO(io, buf, (size_t)sz);
-    SDL_CloseIO(io);
-
-    if (n != (size_t)sz) {
-        JCE_FREE(buf);
-        LOG_ERROR(LOG_TAG, "fs short read: %s", full_path);
-        return invalid;
-    }
-
     const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)sz);
-    JCE_FREE(buf);
+    jce_fs_buffer_free(buf);
     return bgfx_create_shader(mem);
 }
 

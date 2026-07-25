@@ -2409,14 +2409,50 @@ JCE_API int       jce_scene_clear(JceScene *scene);
 /* Entity management. */
 JCE_API JceEntity jce_scene_create_entity(JceScene *s, const char *name);
 JCE_API void      jce_scene_destroy_entity(JceScene *s, JceEntity e);
+
+/* Is `e` still the entity it was when the handle was obtained?
+ *
+ * A JceEntity carries an index in its low 32 bits and a GENERATION in its
+ * high 32.  Destroying an entity frees its index for reuse and bumps the
+ * generation, so a handle kept across a destroy refers to a slot that now
+ * holds somebody else.  This is the predicate that tells them apart, and it
+ * is the only safe thing to call on a handle of unknown age: every other
+ * entity entry point treats a stale handle as "no such entity", which is
+ * correct but silent.
+ *
+ * Returns false for a NULL scene and for entity 0. */
+JCE_API bool      JCE_CALL jce_scene_entity_alive(const JceScene *s, JceEntity e);
+
+/* Resolve a BARE INDEX (no generation) to whatever entity currently occupies
+ * that slot.
+ *
+ * This deliberately has NO dangling protection — that is the entire content
+ * of an index without a generation, and no implementation can recover it.
+ * If the original entity was destroyed and its slot reused, this returns the
+ * NEW occupant, happily and with no error.
+ *
+ * It exists because the editor stores 32-bit ids (audit C5-02) and needs a
+ * documented way back.  New code must NOT use it: keep the full JceEntity.
+ * Returns 0 when no live entity occupies the index. */
+JCE_API JceEntity JCE_CALL jce_scene_entity_from_index(const JceScene *s,
+                                                       uint32_t index);
 JCE_API const char *jce_scene_entity_name(const JceScene *s, JceEntity e);
 JCE_API const char *jce_scene_entity_registered_name(const JceScene *s, JceEntity e);
 JCE_API void      jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name);
 
 /* Parent / child hierarchy. */
+/* Compatibility setter: keeps the local transform and silently rejects dead
+ * entities, self-parenting, and hierarchy cycles. Use jce_scene_reparent when
+ * the caller needs keep-world behavior or an explicit success result. */
 JCE_API void      jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent);
+/* Change hierarchy ownership with validation. When preserve_world is true,
+ * the rendered model matrix remains unchanged, including an enabled custom
+ * pivot. Passing JCE_ENTITY_INVALID makes child a root entity. Returns false
+ * for dead entities, self-parenting, or a hierarchy cycle. */
+JCE_API bool      jce_scene_reparent(JceScene *s, JceEntity child,
+                                     JceEntity parent, bool preserve_world);
 JCE_API JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e);
-int       jce_scene_get_children(const JceScene *s, JceEntity parent,
+JCE_API int       jce_scene_get_children(const JceScene *s, JceEntity parent,
                                  JceEntity *out, int max_out);
 JCE_API int       jce_scene_get_child_count(const JceScene *s, JceEntity parent);
 

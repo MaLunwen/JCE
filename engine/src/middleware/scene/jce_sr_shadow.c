@@ -277,6 +277,27 @@ void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
         for (uint32_t ci = 0;
              ci < sr->csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
             jce_enc_set_texture((uint8_t)(9 + ci), sr->u_csm_samplers[ci], sr->csm_tex[ci], UINT32_MAX);
+
+        /* Dual shadow maps: bind the dynamic-caster atlas to stage 5 (s_shadowMap
+         * — dead under CSM, the single sampler-slot unlock) + upload
+         * u_csmDynParams {tiles=2, 1/atlas_size, enabled, 0}.  The PBR shader
+         * min()s the atlas tile into sample_csm_shadow only when enabled>0.5, so
+         * OFF (or a frame with no movers) stays byte-identical to the single-map
+         * path (no atlas bound, enabled=0). */
+        if (BGFX_HANDLE_IS_VALID(sr->u_csm_dyn_params)) {
+            const bool dual = sr->frame_dyn_csm_active &&
+                              BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_tex) &&
+                              BGFX_HANDLE_IS_VALID(sr->u_shadowMap);
+            float dp[4] = {
+                2.0f,
+                sr->dyn_csm_atlas_size > 0 ? 1.0f / (float)sr->dyn_csm_atlas_size : 0.0f,
+                dual ? 1.0f : 0.0f,
+                0.0f
+            };
+            jce_enc_set_uniform(sr->u_csm_dyn_params, dp, 1);
+            if (dual)
+                jce_enc_set_texture(5, sr->u_shadowMap, sr->dyn_csm_atlas_tex, UINT32_MAX);
+        }
         return;
     }
 
@@ -304,6 +325,8 @@ static bool point_cube_views_on(const JceSceneRenderConfig *cfg)
         || (getenv("JCE_POINT_CUBE_SHADOWS") != NULL);
 }
 
+static bool sr_shadow_dual_on(void);   /* fwd: dual shadow-map env toggle */
+
 void sr_apply_view_order(uint16_t view_id_base,
                                 const JceSceneRenderConfig *cfg,
                                 uint32_t csm_cascade_count,
@@ -325,6 +348,10 @@ void sr_apply_view_order(uint16_t view_id_base,
                producer (r.point_shadows cvar [idempotent re-register returns the
                existing handle] OR the JCE_POINT_CUBE_SHADOWS env). */
             point_cube_views_on(cfg),
+            /* Dual shadow-map dynamic-atlas band (base+21..25): reserve it before
+               the color view whenever dual mode is enabled so the atlas renders
+               before it is sampled.  Harmless when unused (empty views). */
+            sr_shadow_dual_on(),
             &order))
         return;
 
@@ -363,6 +390,18 @@ void sr_destroy_shadow_targets(JceSceneRenderer *sr)
             sr->csm_tex[i].idx = UINT16_MAX;
         }
     }
+    /* Dual shadow-map dynamic atlas (idx==0 is a legal bgfx handle → guard +
+     * reset to UINT16_MAX so a stale handle can't silently destroy another
+     * resource; see the D3D12 leak family). */
+    if (BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_fbo)) {
+        bgfx_destroy_frame_buffer(sr->dyn_csm_atlas_fbo);
+        sr->dyn_csm_atlas_fbo.idx = UINT16_MAX;
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_tex)) {
+        bgfx_destroy_texture(sr->dyn_csm_atlas_tex);
+        sr->dyn_csm_atlas_tex.idx = UINT16_MAX;
+    }
+    sr->dyn_csm_valid = false;
     sr->shadow_valid = false;
     sr->csm_valid = false;
     sr->last_csm_valid = false;
@@ -380,7 +419,7 @@ void sr_create_shadow_targets(JceSceneRenderer *sr)
         BGFX_TEXTURE_RT
         | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
         | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-        NULL);
+        NULL, 0);
     memset(&at, 0, sizeof(at));
     bgfx_attachment_init(&at, sr->shadow_tex, BGFX_ACCESS_WRITE,
                          0, 1, 0, BGFX_RESOLVE_NONE);
@@ -393,7 +432,7 @@ void sr_create_shadow_targets(JceSceneRenderer *sr)
             BGFX_TEXTURE_RT
             | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
             | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-            NULL);
+            NULL, 0);
         memset(&at, 0, sizeof(at));
         bgfx_attachment_init(&at, sr->csm_tex[i], BGFX_ACCESS_WRITE,
                              0, 1, 0, BGFX_RESOLVE_NONE);
@@ -406,12 +445,29 @@ void sr_create_shadow_targets(JceSceneRenderer *sr)
         sr->shadow_cache_valid[i] = false;
     }
 
+    /* Dual shadow-map DYNAMIC atlas (JCE_SHADOW_DUAL): one depth texture the
+     * same size as a full cascade map, holding the 4 cascades as a 2x2 grid of
+     * (sz/2)^2 tiles.  Same depth fmt / point-clamp as csm_tex.  Always allocated
+     * (cheap: one map) so toggling the env needs no target rebuild; only written
+     * + sampled when dual mode is active. */
+    sr->dyn_csm_atlas_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
+        BGFX_TEXTURE_RT
+        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+        NULL, 0);
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, sr->dyn_csm_atlas_tex, BGFX_ACCESS_WRITE,
+                         0, 1, 0, BGFX_RESOLVE_NONE);
+    sr->dyn_csm_atlas_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    sr->dyn_csm_atlas_size = sz;
+    sr->dyn_csm_valid = BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_fbo);
+
     /* Local (spot/point) shadow atlas: one square depth texture, NxN tiles. */
     sr->local_atlas_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
         BGFX_TEXTURE_RT
         | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
         | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-        NULL);
+        NULL, 0);
     memset(&at, 0, sizeof(at));
     bgfx_attachment_init(&at, sr->local_atlas_tex, BGFX_ACCESS_WRITE,
                          0, 1, 0, BGFX_RESOLVE_NONE);
@@ -500,11 +556,41 @@ static bool sr_csm_far_defer(JceSceneRenderer *sr, uint32_t c,
     return (s_pass % (uint32_t)iv) != (c % (uint32_t)iv);
 }
 
+/* Cascade cache-hit tallies for JCE_DBG_CSM_STATS (dumped from the CSM block,
+ * incremented at the SR_CASCADE_CACHE_HIT sites).  File scope so both reach
+ * them; only touched under the debug env, otherwise dead. */
+static uint64_t g_sr_dbg_cascade_eval = 0;
+static uint64_t g_sr_dbg_cascade_hit  = 0;
+
 #define SR_SHADOW_DYN_MAX 512u
 static bool sr_shadow_percascade_active(const JceSceneRenderer *sr)
 {
     return sr_shadow_percascade_on()
         && sr->shadow_dyn_count <= SR_SHADOW_DYN_MAX;
+}
+
+/* Dual shadow maps (JCE_SHADOW_DUAL, default OFF): render dynamic casters into a
+ * SEPARATE atlas and min() it in the shader, so the static csm_tex[c] cache is
+ * no longer voided by a mover overlapping the cascade.  Requires percascade
+ * active (dynamics tracked in shadow_dyn) and a valid atlas. */
+static bool sr_shadow_dual_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("JCE_SHADOW_DUAL");
+        if (e && e[0]) {
+            v = (e[0] != '0') ? 1 : 0;          /* explicit override wins */
+        } else {
+            /* Default ON for INTEGRATED GPUs: measured net-positive there
+             * (~9.5% on a 15k-static + 400-mover scene — the shadow re-render
+             * collapses to the cached static maps while the tier-matched 1-tap
+             * dynamic min-combine is ~free, and it costs nothing on mover-free
+             * frames).  Default OFF on DISCRETE until its higher-tier 3x3
+             * min-combine cost is measured net-positive there. */
+            v = jce_renderer_get_recommendation().has_discrete_gpu ? 0 : 1;
+        }
+    }
+    return v != 0;
 }
 
 /* True when any listed dynamic caster overlaps cascade c's coverage disc —
@@ -708,6 +794,75 @@ static void sr_cascade_world_aabb(jce_vec3 cc, float radius,
     mx.x += wpad; mx.y += wpad; mx.z += wpad;
     *out_mn = mn;
     *out_mx = mx;
+}
+
+/* Dual shadow maps: render ONLY the dynamic (mover) casters into the dynamic CSM
+ * atlas — a 2x2 tile grid of the 4 cascades in one depth texture — using the
+ * SAME cascade VPs as the static maps.  One full-atlas depth clear, then one
+ * BGFX_CLEAR_NONE tile view per cascade (per-tile clears wipe neighbours on
+ * D3D).  Iterates only sr->shadow_dyn[], fine-culled per cascade.  The instanced
+ * / crowd shadow batchers are flushed per tile view so a mover lands in its own
+ * cascade tile.  Runs every frame (movers change) while the static cascades stay
+ * cached.  The PBR shader min()s this atlas into sample_csm_shadow. */
+static void sr_draw_dyn_csm_pass(JceSceneRenderer *sr, JceScene *scene,
+                                 EntityList *list, const JceCsmData *csm,
+                                 uint16_t view_id_base,
+                                 jce_vec3 scull_right, jce_vec3 scull_up)
+{
+    sr->frame_dyn_csm_active = false;
+    if (!sr->dyn_csm_valid || sr->shadow_dyn_count == 0) return;
+
+    const uint16_t N    = sr->dyn_csm_atlas_size;
+    const uint16_t half = (uint16_t)(N / 2u);
+    /* Dynamic-atlas view band base+21 (clear) + base+22..25 (tiles): reserved
+     * before the color view in jce_scene_renderer_view_order_build.  (base+16 is
+     * the fog composite; the shadow band is base+10..14, local base+4..8.) */
+    const uint16_t clear_v = (uint16_t)(view_id_base + 21u);
+    float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+    /* One full-target depth clear (depth=1 => "no dynamic occluder"). */
+    bgfx_set_view_rect(clear_v, 0, 0, N, N);
+    bgfx_set_view_frame_buffer(clear_v, sr->dyn_csm_atlas_fbo);
+    bgfx_set_view_clear(clear_v, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+    bgfx_touch(clear_v);
+
+    sr_crowd_shadow_reset(sr);
+
+    for (uint32_t c = 0; c < csm->cascade_count && c < JCE_CSM_MAX_CASCADES; c++) {
+        const uint16_t cv = (uint16_t)(view_id_base + 22u + c);
+        const uint16_t tx = (uint16_t)((c % 2u) * half);
+        const uint16_t ty = (uint16_t)((c / 2u) * half);
+        bgfx_set_view_rect(cv, tx, ty, half, half);
+        bgfx_set_view_frame_buffer(cv, sr->dyn_csm_atlas_fbo);
+        bgfx_set_view_clear(cv, BGFX_CLEAR_NONE, 0, 1.0f, 0);   /* never per-tile clear */
+        bgfx_set_view_transform(cv, identity, csm->vp[c].raw[0]);
+        bgfx_touch(cv);
+
+        for (uint32_t di = 0; di < sr->shadow_dyn_count; di++) {
+            const uint32_t i = sr->shadow_dyn[di];
+            const SrEntityCull *ec = &sr->ecull[i];
+            if (!ec->casts_shadow || !ec->is_dyn_caster) continue;
+            if (ec->has_aabb &&
+                sr_caster_culled_for_cascade(&ec->wmin, &ec->wmax,
+                                             scull_right, scull_up,
+                                             csm->center[c], csm->radius[c]))
+                continue;
+            JceEntity e = list->entities[i];
+            if (sr_try_submit_bindpose_shadow(sr, scene, e, (int)i, cv)) continue;
+            if (sr_try_submit_skinned_shadow(sr, scene, e, (int)i, cv)) continue;
+            if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, (int)i, cv)) continue;
+            jce_mat4 model; JceMesh *mesh = NULL;
+            if (!sr_build_entity_model(sr, scene, e, (int)i, &model, &mesh, NULL)) continue;
+            if (!mesh) continue;
+            jce_enc_set_transform(model.raw[0], 1);
+            jce_mesh_submit_shadow(mesh, sr->renderer, cv);
+        }
+        /* Drain the deferred instanced/crowd shadow batches into THIS tile view
+         * (skinned/instanced movers accumulate, must flush per view). */
+        sr_sh_flush(sr, cv);
+        sr_crowd_shadow_flush(sr, cv);
+    }
+    sr->frame_dyn_csm_active = true;
 }
 
 void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
@@ -960,8 +1115,36 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
        (~25 float eqs + one mat4 memcmp) is far cheaper than jce_csm_compute().
        Exact compare is safe: identical inputs are bit-identical (jce_camera_view
        is deterministic, shadow_far is coarse-bucketed) and any change recomputes. */
-    JceCsmData csm;
-    bool csm_changed =
+    /* Cascade near-plane fit bound.  MUST bound dynamic casters too: jce_csm.c
+     * uses this AABB only to size near_extend (the light-axis push toward the
+     * sun so tall casters between the cascade sphere and the sun clear the near
+     * plane).  Fitting it to a STATIC-only bound clips the shadow of any mover
+     * that rises higher toward the sun than all static geometry in a cascade
+     * footprint (projectile over a low wall, a jump on flat terrain) — a real
+     * truncation regression (two independent audits).  VP stabilization against
+     * movers therefore belongs in the DUAL shadow-map path (static map fits the
+     * static-only bound safely because movers go in a SEPARATE full-range dynamic
+     * map); the shared single-map path here stays on the all-entity bound. */
+    const bool     fit_valid = sr->scene_world_valid;
+    const jce_vec3 fit_min   = sr->scene_world_min;
+    const jce_vec3 fit_max   = sr->scene_world_max;
+
+    /* Split the change detection by CAUSE so JCE_DBG_CSM_STATS can attribute
+     * each recompute to camera motion (view) vs caster-bound churn (bound) vs
+     * config (other).  This makes the static-fit fix measurable independent of
+     * mover positions: a working fix drives `bound` toward zero. */
+    const bool csm_view_changed =
+        memcmp(&sr->csm_key.view, &cam_view, sizeof(jce_mat4)) != 0;
+    const bool csm_bound_changed =
+        sr->csm_key.caster_valid != fit_valid ||
+        (fit_valid &&
+            (sr->csm_key.caster_min.x != fit_min.x ||
+             sr->csm_key.caster_min.y != fit_min.y ||
+             sr->csm_key.caster_min.z != fit_min.z ||
+             sr->csm_key.caster_max.x != fit_max.x ||
+             sr->csm_key.caster_max.y != fit_max.y ||
+             sr->csm_key.caster_max.z != fit_max.z));
+    const bool csm_other_changed =
         !sr->csm_key.valid ||
         sr->csm_key.cascades != sr->csm_cascade_count ||
         sr->csm_key.map_size != sr->shadow_map_size ||
@@ -973,16 +1156,45 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->csm_key.lambda   != split_lambda ||
         sr->csm_key.light_dir.x != light_dir.x ||
         sr->csm_key.light_dir.y != light_dir.y ||
-        sr->csm_key.light_dir.z != light_dir.z ||
-        sr->csm_key.caster_valid != sr->scene_world_valid ||
-        (sr->scene_world_valid &&
-            (sr->csm_key.caster_min.x != sr->scene_world_min.x ||
-             sr->csm_key.caster_min.y != sr->scene_world_min.y ||
-             sr->csm_key.caster_min.z != sr->scene_world_min.z ||
-             sr->csm_key.caster_max.x != sr->scene_world_max.x ||
-             sr->csm_key.caster_max.y != sr->scene_world_max.y ||
-             sr->csm_key.caster_max.z != sr->scene_world_max.z)) ||
-        memcmp(&sr->csm_key.view, &cam_view, sizeof(jce_mat4)) != 0;
+        sr->csm_key.light_dir.z != light_dir.z;
+
+    JceCsmData csm;
+    bool csm_changed = csm_view_changed || csm_bound_changed || csm_other_changed;
+
+    /* ── Mechanism instrumentation (JCE_DBG_CSM_STATS=1) ─────────────────── */
+    static int s_dbg_csm = -1;
+    if (s_dbg_csm < 0) {
+        const char *v = getenv("JCE_DBG_CSM_STATS");
+        s_dbg_csm = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    static uint64_t s_csm_frames = 0, s_csm_recompute = 0,
+                    s_csm_view = 0, s_csm_bound = 0, s_csm_other = 0;
+    /* All counters (these + the file-scope cascade-hit tallies incremented in
+     * the loops below) are CUMULATIVE since process start — never reset.  Each
+     * logged line is a running total; recover a per-window rate by subtracting
+     * the previous line's value.  Cumulative is deliberate: it keeps the numbers
+     * monotonic and lets any window be reconstructed post-hoc. */
+    if (s_dbg_csm) {
+        s_csm_frames++;
+        if (csm_changed)       s_csm_recompute++;
+        if (csm_view_changed)  s_csm_view++;
+        if (csm_bound_changed) s_csm_bound++;
+        if (csm_other_changed) s_csm_other++;
+        if ((s_csm_frames % 120u) == 0u) {
+            LOG_INFO(LOG_TAG,
+                "csm-stats: frames=%llu recompute=%llu (view=%llu bound=%llu other=%llu) | "
+                "cascade eval=%llu hit=%llu | pc_on=%d dyn=%u",
+                (unsigned long long)s_csm_frames,
+                (unsigned long long)s_csm_recompute,
+                (unsigned long long)s_csm_view,
+                (unsigned long long)s_csm_bound,
+                (unsigned long long)s_csm_other,
+                (unsigned long long)g_sr_dbg_cascade_eval,
+                (unsigned long long)g_sr_dbg_cascade_hit,
+                sr_shadow_percascade_active(sr) ? 1 : 0,
+                sr->shadow_dyn_count);
+        }
+    }
 
     if (csm_changed) {
         jce_csm_compute(&csm, sr->csm_cascade_count,
@@ -990,8 +1202,8 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                         &cam_view, &light_dir,
                         sr->homogeneous_depth, sr->shadow_map_size,
                         split_lambda,
-                        sr->scene_world_valid ? &sr->scene_world_min : NULL,
-                        sr->scene_world_valid ? &sr->scene_world_max : NULL);
+                        fit_valid ? &fit_min : NULL,
+                        fit_valid ? &fit_max : NULL);
         sr->csm_key.valid     = true;
         sr->csm_key.cascades  = sr->csm_cascade_count;
         sr->csm_key.map_size  = sr->shadow_map_size;
@@ -1003,9 +1215,9 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->csm_key.lambda    = split_lambda;
         sr->csm_key.light_dir = light_dir;
         sr->csm_key.view      = cam_view;
-        sr->csm_key.caster_valid = sr->scene_world_valid;
-        sr->csm_key.caster_min   = sr->scene_world_min;
-        sr->csm_key.caster_max   = sr->scene_world_max;
+        sr->csm_key.caster_valid = fit_valid;
+        sr->csm_key.caster_min   = fit_min;
+        sr->csm_key.caster_max   = fit_max;
     } else {
         csm = sr->last_csm;
     }
@@ -1042,6 +1254,15 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     jce_vec3 scull_right = jce_v3_normalize(jce_v3_cross(scull_ld, scull_upref));
     jce_vec3 scull_up    = jce_v3_normalize(jce_v3_cross(scull_right, scull_ld));
 
+    /* Dual shadow maps active this frame: needs the flag, percascade tracking
+     * (dynamics in shadow_dyn), and a valid atlas.  When on, movers are NOT
+     * gathered into the static cascade maps (they go to the dynamic atlas) and
+     * the per-cascade dynamic cache gate is dropped (a mover no longer voids the
+     * static cascade cache). */
+    const bool dual_on = sr_shadow_dual_on()
+                      && sr_shadow_percascade_active(sr)
+                      && sr->dyn_csm_valid;
+
     /* #6 — build the shadow-caster grid ONCE so each cascade gathers only the
      * casters overlapping its (conservative) bounds.  On failure (or when there
      * are no AABB casters) the cascade falls back to the full-list scan — never a
@@ -1050,6 +1271,23 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     const bool has_grid = sr_build_shadow_space(sr, list, scene);
     jce_perf_phase_add("sh_space", jce_time_perf_to_ms(_ts_space, jce_time_perf_counter()));
     uint64_t _ts_gather = jce_time_perf_counter();
+
+    /* Shadow-caster texel-footprint culling (standard-engine parity: UE
+     * r.Shadow.RadiusThreshold / Unity small-shadow culling).  A caster whose
+     * shadow spans fewer than `min_texels` shadow-map texels in a cascade is
+     * sub-detail — skip it there.  The cascade radius scales the texel world
+     * size, so a small caster stays in the tight NEAR cascades (small texels →
+     * large footprint) and only drops from the FAR ones, exactly where distant
+     * clutter dominates the caster count + the re-render cost.  A shadow below a
+     * texel cannot resolve at all, so the 1.5-texel default is visually
+     * conservative.  JCE_SHADOW_CASTER_MIN_TEXELS=0 disables (byte-identical). */
+    static float s_shadow_min_texels = -1.0f;
+    if (s_shadow_min_texels < 0.0f) {
+        const char *v = getenv("JCE_SHADOW_CASTER_MIN_TEXELS");
+        s_shadow_min_texels = (v && v[0]) ? (float)atof(v) : 1.5f;
+        if (s_shadow_min_texels < 0.0f) s_shadow_min_texels = 0.0f;
+    }
+    const float shadow_lod_texels = s_shadow_min_texels;
 
     /* Per-cascade caster gather: when the grid is available, query the
      * conservative cascade world AABB into sr->shadow_query (a guaranteed
@@ -1075,8 +1313,10 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                  total < sr->shadow_query_cap; n++)            \
                 sr->shadow_query[total++] = sr->shadow_noaabb[n];               \
             /* Per-cascade mode: dynamics are un-gridded — append them all;    \
-             * the cascade body's fine cull drops the non-overlapping ones. */  \
-            if (sr_shadow_percascade_active(sr))                                      \
+             * the cascade body's fine cull drops the non-overlapping ones.    \
+             * Dual mode: movers render into the SEPARATE dynamic atlas, so do  \
+             * NOT append them to the static cascade (keeps it cacheable). */    \
+            if (sr_shadow_percascade_active(sr) && !dual_on)                          \
                 for (uint32_t n = 0; n < sr->shadow_dyn_count &&               \
                                      total < sr->shadow_query_cap; n++)        \
                     sr->shadow_query[total++] = sr->shadow_dyn[n];              \
@@ -1105,7 +1345,12 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
          * regardless of HOW the cascade was produced — the map is identical.  So
          * the cache applies to the GPU-driven path too (it previously bailed here,
          * making static-camera GPU-driven scenes re-gather every frame). */
-        && sr->shadow_cache_caster_key   == sr->shadow_caster_key
+        /* Dual mode keys the static cascade cache on the STATIC-only caster key,
+         * so a mover's xform_gen churn (folded into the full key) does not void
+         * it — the mover is in the dynamic atlas, not this map. */
+        && (dual_on
+              ? (sr->shadow_cache_static_caster_key == sr->shadow_static_caster_key)
+              : (sr->shadow_cache_caster_key        == sr->shadow_caster_key))
         && sr->shadow_cache_struct_epoch == sh_struct_epoch
         && sr->shadow_cache_cascades     == csm.cascade_count
         && sr->shadow_cache_map_size     == sr->shadow_map_size;
@@ -1115,11 +1360,14 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
          /* per-cascade dynamic gate: a mover overlapping this cascade NOW,   \
           * or at its LAST render (must erase its old shadow), dirties it.    \
           * With percascade off shadow_dyn_count is irrelevant because        \
-          * sh_global_clean already carried the ANY-dynamic veto. */          \
-         !(sr_shadow_percascade_active(sr) &&                                        \
-           (sr->shadow_cache_dyn_c[c] ||                                       \
-            sr_cascade_has_dyn(sr, scull_right, scull_up,                      \
-                               csm.center[c], csm.radius[c]))))
+          * sh_global_clean already carried the ANY-dynamic veto.  DUAL mode  \
+          * drops this gate entirely: movers live in the dynamic atlas, so a  \
+          * mover no longer dirties the static cascade cache (the whole win). */ \
+         (dual_on ||                                                          \
+          !(sr_shadow_percascade_active(sr) &&                                      \
+            (sr->shadow_cache_dyn_c[c] ||                                      \
+             sr_cascade_has_dyn(sr, scull_right, scull_up,                     \
+                                csm.center[c], csm.radius[c])))))
     #define SR_CASCADE_CACHE_STORE(c)                                          \
         do { sr->shadow_cache_vp[c] = csm.vp[c];                              \
              sr->shadow_cache_valid[c] = true;                                 \
@@ -1135,7 +1383,10 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             uint16_t cv = (uint16_t)(view_id_base + 11 + c);
 
             /* Cache hit: skip clear+gather+submit; csm_fbo[c] keeps last render. */
-            if (SR_CASCADE_CACHE_HIT(c)) continue;
+            { const bool _cache_hit = SR_CASCADE_CACHE_HIT(c);
+              if (s_dbg_csm) { g_sr_dbg_cascade_eval++;
+                               if (_cache_hit) g_sr_dbg_cascade_hit++; }
+              if (_cache_hit) continue; }
             /* Opt-in far-cascade round-robin (pixel-changing, default off). */
             if (sr_csm_far_defer(sr, c, scull_right, scull_up,
                                  csm.center[c], csm.radius[c])) continue;
@@ -1168,6 +1419,17 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                                  scull_right, scull_up,
                                                  csm.center[c], csm.radius[c]))
                     continue;
+                /* Texel-footprint LOD (see shadow_lod_texels above): drop a
+                 * caster whose shadow is sub-detail in this cascade. */
+                if (shadow_lod_texels > 0.0f && ec->has_aabb && csm.radius[c] > 0.0f) {
+                    const float dx = ec->wmax.x - ec->wmin.x;
+                    const float dy = ec->wmax.y - ec->wmin.y;
+                    const float dz = ec->wmax.z - ec->wmin.z;
+                    const float diag = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (diag * (float)sr->shadow_map_size
+                            < shadow_lod_texels * 2.0f * csm.radius[c])
+                        continue;
+                }
                 if (!kc_fast && sr_try_submit_bindpose_shadow(sr, scene, e, i, cv))
                     continue;
                 if (!kc_fast && sr_try_submit_skinned_shadow(sr, scene, e, i, cv))
@@ -1222,7 +1484,10 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             uint16_t cv = (uint16_t)(view_id_base + 11 + c);
 
             /* Cache hit: skip clear+gather+submit; csm_fbo[c] keeps last render. */
-            if (SR_CASCADE_CACHE_HIT(c)) continue;
+            { const bool _cache_hit = SR_CASCADE_CACHE_HIT(c);
+              if (s_dbg_csm) { g_sr_dbg_cascade_eval++;
+                               if (_cache_hit) g_sr_dbg_cascade_hit++; }
+              if (_cache_hit) continue; }
             /* Opt-in far-cascade round-robin (pixel-changing, default off). */
             if (sr_csm_far_defer(sr, c, scull_right, scull_up,
                                  csm.center[c], csm.radius[c])) continue;
@@ -1255,6 +1520,17 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                                  scull_right, scull_up,
                                                  csm.center[c], csm.radius[c]))
                     continue;
+                /* Texel-footprint LOD (see shadow_lod_texels above): drop a
+                 * caster whose shadow is sub-detail in this cascade. */
+                if (shadow_lod_texels > 0.0f && ec->has_aabb && csm.radius[c] > 0.0f) {
+                    const float dx = ec->wmax.x - ec->wmin.x;
+                    const float dy = ec->wmax.y - ec->wmin.y;
+                    const float dz = ec->wmax.z - ec->wmin.z;
+                    const float diag = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (diag * (float)sr->shadow_map_size
+                            < shadow_lod_texels * 2.0f * csm.radius[c])
+                        continue;
+                }
                 if (!kc_fast && sr_try_submit_bindpose_shadow(sr, scene, e, i, cv))
                     continue;
                 if (!kc_fast && sr_try_submit_skinned_shadow(sr, scene, e, i, cv))
@@ -1284,11 +1560,18 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         }
     }
 
+    /* Dual shadow maps: after the static cascades (now mover-free + cached),
+     * render the dynamic casters into the separate atlas the PBR shader min()s. */
+    if (dual_on)
+        sr_draw_dyn_csm_pass(sr, scene, list, &csm, view_id_base,
+                             scull_right, scull_up);
+
     #undef SR_CASCADE_GATHER
 
     /* Commit the cache key for next frame: per-cascade VPs were stored as each
      * cascade rendered; record the caster-set state they correspond to. */
     sr->shadow_cache_caster_key   = sr->shadow_caster_key;
+    sr->shadow_cache_static_caster_key = sr->shadow_static_caster_key;
     sr->shadow_cache_struct_epoch = sh_struct_epoch;
     sr->shadow_cache_cascades     = csm.cascade_count;
     sr->shadow_cache_map_size     = sr->shadow_map_size;
@@ -1407,10 +1690,17 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         { 0.0f, 1.0f, 0.0f}, { 0.0f,-1.0f, 0.0f},
         { 0.0f, 0.0f, 1.0f}, { 0.0f, 0.0f,-1.0f} };
 
-    /* Spots — index aligns with u_spotLights[]. */
+    /* Spots — index aligns with u_spotLights[].  O(1) all-clear gate: a scene
+     * with no spot lights (e.g. a 150k-primitive stress world) otherwise paid
+     * a full 150k-entity has_spot_light probe walk EVERY frame (~6ms) inside
+     * shadow_gather.  The byte-mirror pre-filter (ecull_light_byte) then skips
+     * the non-light bulk cheaply when lights DO exist among many entities. */
     uint32_t spot_idx = 0;
+    const bool kc_ls = sr->kindcache_on && sr->ecull_light_byte;
+    if (jce_scene_count_spot_lights(scene) > 0)
     for (int li = 0; li < list->count && slot < JCE_MAX_LOCAL_SHADOWS; li++) {
         JceEntity e = list->entities[li];
+        if (kc_ls && !sr->ecull_light_byte[li]) continue;
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_spot_light(scene, e)) continue;
         /* Match the light-gather filter EXACTLY (it skips component-disabled
@@ -1453,8 +1743,10 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     const uint32_t max_slot = sr->point_cube_shadows
         ? (uint32_t)(JCE_LOCAL_SHADOW_TILES_CUBE * JCE_LOCAL_SHADOW_TILES_CUBE)
         : (uint32_t)JCE_MAX_LOCAL_SHADOWS;
+    if (jce_scene_count_point_lights(scene) > 0)
     for (int li = 0; li < list->count && slot < max_slot; li++) {
         JceEntity e = list->entities[li];
+        if (kc_ls && !sr->ecull_light_byte[li]) continue;
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_point_light(scene, e)) continue;
         /* Match the light-gather filter EXACTLY (skip component-disabled) so

@@ -58,13 +58,21 @@ RAW_ALLOC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
      "raw free — use JCE_FREE / ED_FREE"),
 ]
 
-# C++ new/delete are also banned in editor (engine is C99 — non-issue).
-CPP_ALLOC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"(?<![\w])\bnew\s+[A-Za-z_]"),
-     "C++ `new` — use ED_ALLOC + placement new (or container)"),
-    (re.compile(r"(?<![\w])\bdelete\s+[A-Za-z_]"),
-     "C++ `delete` — use ED_FREE (with manual dtor if needed)"),
-]
+# NOT gated: C++ new/delete.
+#
+# A table of new/delete patterns used to sit here, unreferenced by any code
+# path — which read as "new/delete are banned" to anyone skimming the gate,
+# while nothing enforced it.  Measured before deleting it: 103 `new` + 26
+# `delete` in editor/src, 404 `new` in engine's C++ TUs.  Those are not
+# oversights.  Bullet, ozz, ImGui and BehaviorTree.CPP hand out objects whose
+# APIs require `new`/`delete` (btCollisionShape, btRigidBody, BT nodes), and
+# placement new over ED_ALLOC storage is itself spelled `new`.  Gating them
+# would produce an allowlist longer than the rule.
+#
+# So the bar this file actually enforces is the C one: no raw
+# malloc/calloc/realloc/free outside the allocator implementation.  If
+# new/delete are ever gated, they need their own vendored-API allowlist and a
+# separate decision — not a silent table.
 
 
 def rel(p: Path) -> str:
@@ -72,11 +80,16 @@ def rel(p: Path) -> str:
 
 
 def patterns_for(tree: str) -> list[tuple[re.Pattern[str], str]]:
-    if tree == "editor":
-        # Editor still has many legitimate C++ new/delete sites in panels
-        # using STL containers internally; gating new/delete is a future
-        # tightening pass. Today we only enforce the C-style raw bar.
-        return RAW_ALLOC_PATTERNS
+    """Rules applied to `tree` ("engine" | "editor" | "client").
+
+    Every tree currently gets the same C-style raw-allocator bar.  The editor
+    additionally has many legitimate C++ new/delete sites (panels holding STL
+    containers), so gating new/delete there is a deliberate future tightening
+    pass rather than an oversight — this hook is where that per-tree split
+    would land.  It used to be written as an if/else whose branches returned
+    the identical list, which read as a distinction that did not exist.
+    """
+    del tree  # no per-tree divergence yet — see docstring
     return RAW_ALLOC_PATTERNS
 
 

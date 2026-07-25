@@ -152,13 +152,13 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
         (uint16_t)width, (uint16_t)height, false, 1,
         color_fmt,
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL);
+        NULL, 0);
 
     textures[1] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
         BGFX_TEXTURE_FORMAT_D24S8,
         BGFX_TEXTURE_RT,
-        NULL);
+        NULL, 0);
 
     if (!BGFX_HANDLE_IS_VALID(textures[0])
         || !BGFX_HANDLE_IS_VALID(textures[1])) {

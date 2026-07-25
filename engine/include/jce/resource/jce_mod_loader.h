@@ -13,6 +13,11 @@
  * asset wins over a lower-priority mod's copy, which in turn wins over the
  * base content.
  *
+ * Precedence comes from the mount stack (jce_archive_mount_*, spec §11.2):
+ * LAST ADDED WINS.  Do not read a mounted stack through the PAK fallback
+ * chain (jce_pak_overlay_push, <jce/resource/jce_pak_loader.h>) — that one
+ * resolves BASE-FIRST and would silently disable every mod override.
+ *
  * Sandbox / threat model (read before extending):
  *   - Mods override ASSET READS via jce_mod_loader_mount(), nothing else.
  *     Path lookups go through jce_archive_normalize_path(), which strips

@@ -10,6 +10,8 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_renderer_caps.h>
 
+#include "jce_gpu_vendor.h"
+
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL_cpuinfo.h>   /* SDL_GetNumLogicalCPUCores / SDL_GetSystemRAM */
 #include <stdbool.h>
@@ -88,10 +90,9 @@ static JceGpuTier s_detect_tier(void)
         score += 1;
 
     /* Known discrete GPU vendors score higher. */
-    if (caps->vendorId == 0x10DE || /* NVIDIA */
-        caps->vendorId == 0x1002)   /* AMD */
+    if (jce_gpu_vendor_is_discrete(caps->vendorId))
         score += 2;
-    else if (caps->vendorId == 0x106B) /* Apple Silicon */
+    else if (caps->vendorId == JCE_GPU_VENDOR_APPLE) /* Apple Silicon */
         score += 1;
 
     /* Large max texture size indicates desktop-class hardware. */
@@ -118,9 +119,22 @@ static JceGpuTier s_detect_tier(void)
             tier = JCE_GPU_TIER_MEDIUM;
         if (cores > 0 && cores <= 1 && tier > JCE_GPU_TIER_LOW)
             tier = JCE_GPU_TIER_LOW;
+
+        /* The score above rewards a modern API + compute heavily, so an Intel
+         * iGPU on D3D12 reaches 9 = HIGH — and driving one at the HIGH preset
+         * (2048 shadows + full RGBA16F postfx family + TAA chain) is exactly
+         * the fill/bandwidth wall it cannot pay.  Cap the parts that may not
+         * run at HIGH down to MEDIUM so the WHOLE-device auto-detect matches
+         * real iGPU throughput; jce_gpu_vendor_allows_high_tier() owns which
+         * those are (Apple Silicon is the uncapped exception).  The status-bar
+         * tier picker / JCE_GPU_TIER still forces HIGH for a capable iGPU. */
+        bool discrete_or_apple = jce_gpu_vendor_allows_high_tier(caps->vendorId);
+        if (!discrete_or_apple && tier > JCE_GPU_TIER_MEDIUM)
+            tier = JCE_GPU_TIER_MEDIUM;
+
         LOG_INFO(LOG_TAG,
-                 "capability auto-detect: gpu-score=%d cores=%d ram=%dMB -> tier=%s",
-                 score, cores, ram, jce_gpu_tier_name(tier));
+                 "capability auto-detect: gpu-score=%d cores=%d ram=%dMB discrete=%d -> tier=%s",
+                 score, cores, ram, discrete_or_apple ? 1 : 0, jce_gpu_tier_name(tier));
     }
     return tier;
 }
@@ -233,9 +247,10 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
     bool has_tex3d     = caps && (caps->supported & BGFX_CAPS_TEXTURE_3D);
     bool has_fp_fbo    = caps &&
         (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F] & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER);
-    bool has_discrete  = caps &&
-        (caps->vendorId == 0x10DE /* NVIDIA */ ||
-         caps->vendorId == 0x1002 /* AMD     */);
+    /* Strictly discrete — NOT the same predicate as the HIGH-tier cap above,
+       which also lets Apple Silicon through.  A unified-memory part still has
+       no dedicated VRAM to spend on the extra RGBA16F targets these gate. */
+    bool has_discrete  = caps && jce_gpu_vendor_is_discrete(caps->vendorId);
     rec.has_discrete_gpu = has_discrete;
 
     switch (tier) {

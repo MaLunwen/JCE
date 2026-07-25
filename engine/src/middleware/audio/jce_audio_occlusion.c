@@ -3,6 +3,8 @@
  */
 
 #include <jce/middleware/audio/jce_audio_occlusion.h>
+#include <jce/os/core/jce_hash.h>
+#include <jce/os/core/jce_hashmap.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -87,14 +89,6 @@ struct JceAudioOcclusionTracker {
     uint32_t                gc_gen;
 };
 
-static uint32_t hash_u64(uint64_t x)
-{
-    x ^= x >> 33; x *= 0xFF51AFD7ED558CCDULL;
-    x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ULL;
-    x ^= x >> 33;
-    return (uint32_t)x;
-}
-
 static TrackerEntry *table_find_or_insert(JceAudioOcclusionTracker *t, uint64_t id)
 {
     /* Linear-probe open-addressed table; resize when 70% full. */
@@ -104,7 +98,8 @@ static TrackerEntry *table_find_or_insert(JceAudioOcclusionTracker *t, uint64_t 
         if (!new_tab) return NULL;
         for (uint32_t i = 0; i < t->cap; ++i) {
             if (t->table[i].voice_id == 0) continue;
-            uint32_t h = hash_u64(t->table[i].voice_id) & (new_cap - 1u);
+            uint32_t h = (uint32_t)jce_hash_fmix64(t->table[i].voice_id) &
+                         (new_cap - 1u);
             while (new_tab[h].voice_id != 0) h = (h + 1u) & (new_cap - 1u);
             new_tab[h] = t->table[i];
         }
@@ -112,7 +107,7 @@ static TrackerEntry *table_find_or_insert(JceAudioOcclusionTracker *t, uint64_t 
         t->table = new_tab;
         t->cap   = new_cap;
     }
-    uint32_t h = hash_u64(id) & (t->cap - 1u);
+    uint32_t h = (uint32_t)jce_hash_fmix64(id) & (t->cap - 1u);
     while (t->table[h].voice_id != 0 && t->table[h].voice_id != id)
         h = (h + 1u) & (t->cap - 1u);
     if (t->table[h].voice_id == 0) {
@@ -126,9 +121,8 @@ static TrackerEntry *table_find_or_insert(JceAudioOcclusionTracker *t, uint64_t 
 
 JceAudioOcclusionTracker *jce_audio_occlusion_tracker_create(uint32_t cap)
 {
-    if (cap < 16) cap = 16;
-    /* Round up to power of two. */
-    uint32_t p = 1; while (p < cap) p <<= 1;
+    /* Round up to power of two, floor 16. */
+    uint32_t p = jce_hashmap_cap_pow2(cap, 16u);
     JceAudioOcclusionTracker *t = (JceAudioOcclusionTracker *)JCE_CALLOC(1, sizeof(*t));
     if (!t) return NULL;
     t->table = (TrackerEntry *)JCE_CALLOC(p, sizeof(TrackerEntry));
@@ -198,7 +192,7 @@ void jce_audio_occlusion_tracker_gc(JceAudioOcclusionTracker *t,
     /* Mark active. */
     for (uint32_t i = 0; i < active_count; ++i) {
         if (active[i] == 0) continue;
-        uint32_t h = hash_u64(active[i]) & (t->cap - 1u);
+        uint32_t h = (uint32_t)jce_hash_fmix64(active[i]) & (t->cap - 1u);
         while (t->table[h].voice_id != 0 && t->table[h].voice_id != active[i])
             h = (h + 1u) & (t->cap - 1u);
         if (t->table[h].voice_id == active[i])
@@ -211,8 +205,10 @@ void jce_audio_occlusion_tracker_gc(JceAudioOcclusionTracker *t,
             t->size--;
             uint32_t j = (i + 1u) & (t->cap - 1u);
             while (t->table[j].voice_id != 0) {
-                uint32_t home = hash_u64(t->table[j].voice_id) & (t->cap - 1u);
-                if (((j - home) & (t->cap - 1u)) > 0) {
+                uint32_t home = (uint32_t)jce_hash_fmix64(t->table[j].voice_id) &
+                                (t->cap - 1u);
+                /* `i` is the hole and follows every move (jce_hashmap.h). */
+                if (jce_hashmap_shift_back(home, i, j, t->cap)) {
                     t->table[i] = t->table[j];
                     t->table[j].voice_id = 0;
                     i = j;

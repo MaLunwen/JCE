@@ -212,7 +212,7 @@ static ecs_entity_t make_component(ecs_world_t *world, const char *name,
     return ecs_component_init(world, &cdesc);
 }
 
-void jce_net_var_register_all(void)
+bool jce_net_var_register_all(void)
 {
     ecs_world_t *world = nv_world();
     JceNetCompDesc cd;
@@ -225,7 +225,7 @@ void jce_net_var_register_all(void)
     if (!world) {
         LOG_WARN(LOG_TAG,
                  "register_all: no world bound — call set_world() first");
-        return;
+        return false;
     }
 
     g_nv.f32_comp = make_component(world, JCE_NETVAR_F32_NAME,
@@ -256,6 +256,7 @@ void jce_net_var_register_all(void)
     jce_net_replication_register_component(&cd);
 
     LOG_INFO(LOG_TAG, "registered NetworkVariable components (f32+i32)");
+    return true;
 }
 
 /* ================================================================== */

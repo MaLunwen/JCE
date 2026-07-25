@@ -81,28 +81,10 @@
 #define JCE_VIEW_INIT_CLEAR_COUNT 16
 #define JCE_VIEW_INIT_CLEAR       JCE_VIEW_INIT_CLEAR_BASE  /* legacy alias */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* No-op stub kept for ABI; see jce_views.c. The right way to scrub
- * fresh GPU textures is to upload zero memory at create time, which
- * each subsystem now does directly via bgfx_create_texture_2d's _mem
- * parameter when needed. */
-void jce_clear_freshly_created_fbo(unsigned short fb_idx,
-                                   unsigned short width,
-                                   unsigned short height);
-
-/* Returns a bgfx_memory_t of `size_bytes` filled with zeros (or NULL
- * on alloc failure). Pass to bgfx_create_texture_2d's _mem parameter
- * so the new texture's GPU storage starts as solid black instead of
- * leftover uninitialised VRAM ("rainbow garbage"). bgfx releases the
- * memory once the upload is enqueued. */
-struct bgfx_memory_s;
-const struct bgfx_memory_s *jce_zero_init_mem(unsigned int size_bytes);
-
-#ifdef __cplusplus
-}
-#endif
+/* NOTE: the render-target scrub helpers jce_clear_freshly_created_fbo() and
+ * jce_zero_init_mem() used to be declared here.  jce_zero_init_mem returns a
+ * bgfx type (bgfx_memory_t) and both are renderer-internal, so they were
+ * moved to engine/src/renderer/jce_renderer_internal.h to keep the public
+ * ABI free of bgfx types (audit R-D41 / rend-01-bgfx-type-in-public-abi). */
 
 #endif /* JCE_VIEWS_H */

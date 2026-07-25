@@ -3,6 +3,8 @@
  */
 
 #include <jce/middleware/audio/jce_audio_mixer.h>
+#include <jce/os/core/jce_hash.h>
+#include <jce/os/core/jce_hashmap.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -77,14 +79,6 @@ struct JceAudioMixer {
     bool      fade_has[MAX_BUSES];   /* whether this bus participates          */
 };
 
-static uint32_t hash_u64(uint64_t x)
-{
-    x ^= x >> 33; x *= 0xFF51AFD7ED558CCDULL;
-    x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ULL;
-    x ^= x >> 33;
-    return (uint32_t)x;
-}
-
 JceAudioMixer *jce_audio_mixer_create(void)
 {
     JceAudioMixer *m = (JceAudioMixer *)JCE_CALLOC(1, sizeof(*m));
@@ -149,9 +143,29 @@ bool jce_audio_mixer_remove_bus(JceAudioMixer *m, JceAudioBusId bus)
     if (m->buses[bus].solo && m->solo_count > 0) m->solo_count--;
     m->buses[bus].alive = false;
     m->bus_count--;
-    /* Drop voice assignments to this bus. */
-    for (uint32_t i = 0; i < m->voices_cap; ++i)
-        if (m->voices[i].bus == bus) { m->voices[i].voice_id = 0; m->voices[i].bus = JCE_AUDIO_BUS_INVALID; m->voices_size--; }
+    /* Drop voice assignments to this bus.
+     *
+     * This must go through jce_audio_mixer_unassign_voice() rather than
+     * clearing slots in place: the voice table is open-addressed, so blanking
+     * a slot without the backward-shift repair leaves any voice that probed
+     * PAST it stranded behind an empty slot, permanently unreachable via
+     * jce_audio_mixer_get_voice_bus() even though it belongs to a live bus.
+     *
+     * Each unassign may shift later entries backwards, so the scan restarts
+     * instead of continuing with a stale index.  Bus removal is a rare
+     * authoring/config operation and the loop is bounded by the number of
+     * voices actually routed to `bus`. */
+    for (;;) {
+        uint64_t victim = 0;
+        for (uint32_t i = 0; i < m->voices_cap; ++i) {
+            if (m->voices[i].voice_id != 0 && m->voices[i].bus == bus) {
+                victim = m->voices[i].voice_id;
+                break;
+            }
+        }
+        if (victim == 0) break;
+        jce_audio_mixer_unassign_voice(m, victim);
+    }
     /* Drop dangling aux sends that point at the removed bus, and any
      * sidechain whose key was the removed bus (FEATURE 5.2). */
     for (uint16_t i = 1; i < MAX_BUSES; ++i) {
@@ -251,7 +265,8 @@ static VoiceMap *vm_find(JceAudioMixer *m, uint64_t id, bool insert)
         if (!nv) return NULL;
         for (uint32_t i = 0; i < m->voices_cap; ++i) {
             if (m->voices[i].voice_id == 0) continue;
-            uint32_t h = hash_u64(m->voices[i].voice_id) & (new_cap - 1u);
+            uint32_t h = (uint32_t)jce_hash_fmix64(m->voices[i].voice_id) &
+                         (new_cap - 1u);
             while (nv[h].voice_id != 0) h = (h + 1u) & (new_cap - 1u);
             nv[h] = m->voices[i];
         }
@@ -259,7 +274,7 @@ static VoiceMap *vm_find(JceAudioMixer *m, uint64_t id, bool insert)
         m->voices = nv;
         m->voices_cap = new_cap;
     }
-    uint32_t h = hash_u64(id) & (m->voices_cap - 1u);
+    uint32_t h = (uint32_t)jce_hash_fmix64(id) & (m->voices_cap - 1u);
     while (m->voices[h].voice_id != 0 && m->voices[h].voice_id != id)
         h = (h + 1u) & (m->voices_cap - 1u);
     if (m->voices[h].voice_id == 0) {
@@ -282,7 +297,7 @@ void jce_audio_mixer_unassign_voice(JceAudioMixer *m, uint64_t id)
 {
     if (!m || id == 0) return;
     /* Backward-shift delete. */
-    uint32_t h = hash_u64(id) & (m->voices_cap - 1u);
+    uint32_t h = (uint32_t)jce_hash_fmix64(id) & (m->voices_cap - 1u);
     while (m->voices[h].voice_id != 0 && m->voices[h].voice_id != id)
         h = (h + 1u) & (m->voices_cap - 1u);
     if (m->voices[h].voice_id != id) return;
@@ -291,8 +306,10 @@ void jce_audio_mixer_unassign_voice(JceAudioMixer *m, uint64_t id)
     m->voices_size--;
     uint32_t j = (h + 1u) & (m->voices_cap - 1u);
     while (m->voices[j].voice_id != 0) {
-        uint32_t home = hash_u64(m->voices[j].voice_id) & (m->voices_cap - 1u);
-        if (((j - home) & (m->voices_cap - 1u)) > ((j - h) & (m->voices_cap - 1u))) {
+        uint32_t home = (uint32_t)jce_hash_fmix64(m->voices[j].voice_id) &
+                        (m->voices_cap - 1u);
+        /* `h` is the hole and follows every move (jce_hashmap.h). */
+        if (jce_hashmap_shift_back(home, h, j, m->voices_cap)) {
             m->voices[h] = m->voices[j];
             m->voices[j].voice_id = 0;
             m->voices[j].bus      = JCE_AUDIO_BUS_INVALID;
@@ -305,7 +322,7 @@ void jce_audio_mixer_unassign_voice(JceAudioMixer *m, uint64_t id)
 JceAudioBusId jce_audio_mixer_get_voice_bus(const JceAudioMixer *m, uint64_t id)
 {
     if (!m || id == 0) return JCE_AUDIO_BUS_INVALID;
-    uint32_t h = hash_u64(id) & (m->voices_cap - 1u);
+    uint32_t h = (uint32_t)jce_hash_fmix64(id) & (m->voices_cap - 1u);
     while (m->voices[h].voice_id != 0 && m->voices[h].voice_id != id)
         h = (h + 1u) & (m->voices_cap - 1u);
     return m->voices[h].voice_id == id ? m->voices[h].bus : JCE_AUDIO_BUS_INVALID;

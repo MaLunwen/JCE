@@ -98,16 +98,16 @@ JCE_API void jce_space_remove(JceSpaceIndex *idx, uint32_t handle);
 
 /* Frustum culling: fill out_ids with user_ids of objects inside the
  * frustum (6 planes).  Returns the number of results (capped at max). */
-uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
+JCE_API uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
                                   const jce_vec4 planes[6],
                                   uint32_t *out_ids, uint32_t max);
 
 /* AABB overlap query. */
-uint32_t jce_space_query_aabb(const JceSpaceIndex *idx, JceAABB region,
+JCE_API uint32_t jce_space_query_aabb(const JceSpaceIndex *idx, JceAABB region,
                                uint32_t *out_ids, uint32_t max);
 
 /* Sphere query. */
-uint32_t jce_space_query_sphere(const JceSpaceIndex *idx,
+JCE_API uint32_t jce_space_query_sphere(const JceSpaceIndex *idx,
                                  jce_vec3 center, float radius,
                                  uint32_t *out_ids, uint32_t max);
 

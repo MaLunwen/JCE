@@ -32,6 +32,7 @@ extern "C" {
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_image_decode.h>
 }
@@ -77,9 +78,10 @@ bool ext_eq(const char *path, const char *suffix)
 
 bool is_image_path(const char *path)
 {
-    return ext_eq(path, ".png") || ext_eq(path, ".jpg")  ||
-           ext_eq(path, ".jpeg") || ext_eq(path, ".tga") ||
-           ext_eq(path, ".bmp") || ext_eq(path, ".hdr");
+    /* Engine-canonical table (jce_asset_format.h) — previously this list
+     * omitted dds/ktx/ktx2/webp/gif/psd, so those assets showed a generic
+     * icon while the asset database classified them as textures. */
+    return jce_asset_ext_is_texture(path);
 }
 
 bool is_material_path(const char *path)

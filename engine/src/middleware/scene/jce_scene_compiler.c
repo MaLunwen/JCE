@@ -2,14 +2,14 @@
 
 #include <jce/middleware/scene/jce_scene_compiler.h>
 
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_rand.h>
+#include <jce/os/core/jce_str.h>
 
 #include <limits.h>
 #include <string.h>
 
 #define JCE_PLAN_MAGIC 0x5046534au /* "JSFP" in little-endian bytes */
-#define JCE_FNV64_OFFSET 14695981039346656037ULL
-#define JCE_FNV64_PRIME 1099511628211ULL
 #define JCE_DEFAULT_PLACEMENT_ATTEMPTS 64u
 
 typedef struct {
@@ -75,83 +75,46 @@ static size_t bounded_length(const char *text, size_t capacity)
     return capacity;
 }
 
+/* NULL-tolerant jce_strlcpy: a NULL/zero-capacity `dst` is a no-op and a NULL
+ * `src` yields "", where the bare jce_strlcpy would dereference.  Bytes past
+ * the terminator are left untouched (the operation record is memset first, so
+ * the fixed-size field stays zero-padded for the wire format). */
 static void copy_text(char *dst, size_t capacity, const char *src)
 {
-    size_t i = 0u;
-
     if (!dst || capacity == 0u)
         return;
-    if (src) {
-        while (i + 1u < capacity && src[i] != '\0') {
-            dst[i] = src[i];
-            ++i;
-        }
-    }
-    dst[i] = '\0';
+    jce_strlcpy(dst, src ? src : "", capacity);
 }
 
-static uint64_t hash_bytes(uint64_t hash, const void *bytes, size_t size)
-{
-    const uint8_t *src = (const uint8_t *)bytes;
-    size_t i;
-
-    for (i = 0u; i < size; ++i) {
-        hash ^= (uint64_t)src[i];
-        hash *= JCE_FNV64_PRIME;
-    }
-    return hash;
-}
-
-static uint64_t hash_u16(uint64_t hash, uint16_t value)
-{
-    uint8_t bytes[2];
-    bytes[0] = (uint8_t)(value & 0xffu);
-    bytes[1] = (uint8_t)((value >> 8u) & 0xffu);
-    return hash_bytes(hash, bytes, sizeof(bytes));
-}
-
-static uint64_t hash_u32(uint64_t hash, uint32_t value)
-{
-    uint8_t bytes[4];
-    uint32_t i;
-    for (i = 0u; i < 4u; ++i)
-        bytes[i] = (uint8_t)((value >> (i * 8u)) & 0xffu);
-    return hash_bytes(hash, bytes, sizeof(bytes));
-}
-
-static uint64_t hash_u64(uint64_t hash, uint64_t value)
-{
-    uint8_t bytes[8];
-    uint32_t i;
-    for (i = 0u; i < 8u; ++i)
-        bytes[i] = (uint8_t)((value >> (i * 8u)) & 0xffu);
-    return hash_bytes(hash, bytes, sizeof(bytes));
-}
-
+/* The pinned deterministic FNV-1a-64 primitives this file hashes with live in
+ * jce_hash.h (jce_hash_det64_*); only the signed-int adapter is local. */
 static uint64_t hash_i32(uint64_t hash, int32_t value)
 {
-    return hash_u32(hash, (uint32_t)value);
+    return jce_hash_det64_u32(hash, (uint32_t)value);
 }
 
+/* Length-prefixed text.  The u16 length prefix and the "0 means overflow"
+ * sentinel are this file's own framing — the director's hash_text uses a u32
+ * prefix and no sentinel, so the two are NOT interchangeable. */
 static uint64_t hash_text(uint64_t hash, const char *text, size_t capacity)
 {
     size_t length = bounded_length(text, capacity);
 
     if (length >= capacity || length > UINT16_MAX)
         return 0u;
-    hash = hash_u16(hash, (uint16_t)length);
-    return hash_bytes(hash, text, length);
+    hash = jce_hash_det64_u16(hash, (uint16_t)length);
+    return jce_hash_det64_bytes(hash, text, length);
 }
 
 static uint64_t stable_entity_id(const char *stable_role,
                                  uint32_t instance_index)
 {
-    uint64_t hash = JCE_FNV64_OFFSET;
+    uint64_t hash = JCE_HASH_DET64_OFFSET;
     size_t length = bounded_length(stable_role, JCE_SCENE_STABLE_ROLE_MAX);
 
-    hash = hash_bytes(hash, stable_role, length);
-    hash = hash_u32(hash, instance_index);
-    hash = hash_u32(hash, JCE_SCENE_COMPILER_VERSION);
+    hash = jce_hash_det64_bytes(hash, stable_role, length);
+    hash = jce_hash_det64_u32(hash, instance_index);
+    hash = jce_hash_det64_u32(hash, JCE_SCENE_COMPILER_VERSION);
     return hash ? hash : 1u;
 }
 
@@ -160,21 +123,21 @@ static void seed_role_rng(JceRng *rng, const JceSceneRecipe *recipe,
                           const JceSceneRecipeRole *role,
                           const QuantizedRole *quantized)
 {
-    uint64_t state = JCE_FNV64_OFFSET;
-    uint64_t stream = JCE_FNV64_OFFSET;
+    uint64_t state = JCE_HASH_DET64_OFFSET;
+    uint64_t stream = JCE_HASH_DET64_OFFSET;
     uint32_t axis;
 
-    state = hash_u64(state, recipe->seed);
-    state = hash_u64(state, catalog->content_hash);
-    state = hash_u32(state, recipe->compiler_version);
+    state = jce_hash_det64_u64(state, recipe->seed);
+    state = jce_hash_det64_u64(state, catalog->content_hash);
+    state = jce_hash_det64_u32(state, recipe->compiler_version);
     state = hash_text(state, role->stable_role,
                       sizeof(role->stable_role));
     state = hash_text(state, role->capability,
                       sizeof(role->capability));
-    state = hash_u32(state, role->min_count);
-    state = hash_u32(state, role->max_count);
-    state = hash_u32(state, (uint32_t)role->placement);
-    state = hash_u32(state, role->required ? 1u : 0u);
+    state = jce_hash_det64_u32(state, role->min_count);
+    state = jce_hash_det64_u32(state, role->max_count);
+    state = jce_hash_det64_u32(state, (uint32_t)role->placement);
+    state = jce_hash_det64_u32(state, role->required ? 1u : 0u);
     for (axis = 0u; axis < 3u; ++axis) {
         state = hash_i32(state, quantized->center[axis]);
         state = hash_i32(state, quantized->extent[axis]);
@@ -187,8 +150,8 @@ static void seed_role_rng(JceRng *rng, const JceSceneRecipe *recipe,
 
     stream = hash_text(stream, role->stable_role,
                        sizeof(role->stable_role));
-    stream = hash_u32(stream, recipe->compiler_version);
-    stream = hash_u64(stream, catalog->content_hash);
+    stream = jce_hash_det64_u32(stream, recipe->compiler_version);
+    stream = jce_hash_det64_u64(stream, catalog->content_hash);
     jce_rng_seed(rng, state ? state : 1u, stream ? stream : 1u);
 }
 
@@ -790,24 +753,24 @@ jce_scene_compile(const JceSceneRecipe *recipe,
 JCE_API uint64_t JCE_CALL
 jce_scene_frozen_plan_hash(const JceSceneFrozenPlan *plan)
 {
-    uint64_t hash = JCE_FNV64_OFFSET;
+    uint64_t hash = JCE_HASH_DET64_OFFSET;
     uint32_t i;
 
     if (!frozen_plan_topological_order(plan, NULL, 0u))
         return 0u;
-    hash = hash_u32(hash, plan->format_version);
-    hash = hash_u32(hash, plan->compiler_version);
-    hash = hash_u64(hash, plan->request_id);
-    hash = hash_u64(hash, plan->seed);
-    hash = hash_u64(hash, plan->catalog_hash);
-    hash = hash_u32(hash, plan->operation_count);
+    hash = jce_hash_det64_u32(hash, plan->format_version);
+    hash = jce_hash_det64_u32(hash, plan->compiler_version);
+    hash = jce_hash_det64_u64(hash, plan->request_id);
+    hash = jce_hash_det64_u64(hash, plan->seed);
+    hash = jce_hash_det64_u64(hash, plan->catalog_hash);
+    hash = jce_hash_det64_u32(hash, plan->operation_count);
     for (i = 0u; i < plan->operation_count; ++i) {
         const JceScenePlanOperation *operation = &plan->operations[i];
         uint32_t axis;
 
-        hash = hash_u64(hash, operation->stable_entity_id);
-        hash = hash_u64(hash, operation->parent_stable_entity_id);
-        hash = hash_u64(hash, operation->asset_content_hash);
+        hash = jce_hash_det64_u64(hash, operation->stable_entity_id);
+        hash = jce_hash_det64_u64(hash, operation->parent_stable_entity_id);
+        hash = jce_hash_det64_u64(hash, operation->asset_content_hash);
         hash = hash_text(hash, operation->stable_role,
                          sizeof(operation->stable_role));
         if (hash == 0u)

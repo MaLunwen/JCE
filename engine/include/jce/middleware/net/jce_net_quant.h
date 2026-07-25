@@ -32,18 +32,18 @@ extern "C" {
 
 /* ------- scalar fp16 ------- */
 
-uint16_t jce_quant_f32_to_f16(float v);
-float    jce_quant_f16_to_f32(uint16_t v);
+JCE_API uint16_t jce_quant_f32_to_f16(float v);
+JCE_API float    jce_quant_f16_to_f32(uint16_t v);
 
 /* ------- vec3 in fp16 (6 bytes) ------- */
 
-void     jce_quant_pack_vec3_f16  (jce_vec3 v, uint16_t out[3]);
-jce_vec3 jce_quant_unpack_vec3_f16(const uint16_t in[3]);
+JCE_API void     jce_quant_pack_vec3_f16  (jce_vec3 v, uint16_t out[3]);
+JCE_API jce_vec3 jce_quant_unpack_vec3_f16(const uint16_t in[3]);
 
 /* ------- smallest-three quaternion (4 bytes / 32 bits) ------- */
 
-uint32_t jce_quant_pack_quat_st3  (jce_quat q);
-jce_quat jce_quant_unpack_quat_st3(uint32_t packed);
+JCE_API uint32_t jce_quant_pack_quat_st3  (jce_quat q);
+JCE_API jce_quat jce_quant_unpack_quat_st3(uint32_t packed);
 
 #ifdef __cplusplus
 }

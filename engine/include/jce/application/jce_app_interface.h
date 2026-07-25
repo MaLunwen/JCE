@@ -94,6 +94,14 @@ typedef struct JceAppDesc {
     /* Default window dimensions. 0 = use config default. */
     uint32_t window_width;
     uint32_t window_height;
+
+    /* Dedicated-server / headless boot.  When true, the engine creates no
+     * window, no GPU device (NullRHI: bgfx NOOP), and no audio/UI, and inits
+     * SDL with events only — so it runs on a display-less host.  The app's
+     * update() still ticks (ECS/scene/AI/physics/save/network); draw() is
+     * never called.  The JCE_HEADLESS=1 env var forces this on regardless.
+     * Default: false. */
+    bool  headless;
 } JceAppDesc;
 
 JCE_EXTERN_C_END

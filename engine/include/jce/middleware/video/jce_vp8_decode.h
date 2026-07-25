@@ -37,7 +37,7 @@ typedef struct JceVp8FrameInfo {
 JCE_API bool jce_vp8_is_ivf(const void *data, size_t size);
 
 /* Open an in-memory IVF/VP8 stream. The buffer must outlive the decoder. */
-JceVp8Decoder *jce_vp8_open_ivf_memory(const void *data, size_t size,
+JCE_API JceVp8Decoder *jce_vp8_open_ivf_memory(const void *data, size_t size,
                                        JceVp8FrameInfo *out_info);
 
 /* Open a raw decoder (no container) — caller feeds VP8 packets via
@@ -47,7 +47,7 @@ JCE_API JceVp8Decoder *jce_vp8_decoder_open(void);
 /* Decode the next IVF frame. Plane pointers point into libvpx-owned memory
  * and are valid until the next call. Returns false at EOF or on error.
  * Only valid when opened via jce_vp8_open_ivf_memory(). */
-bool jce_vp8_decode_next(JceVp8Decoder *dec,
+JCE_API bool jce_vp8_decode_next(JceVp8Decoder *dec,
                          const uint8_t **out_y, ptrdiff_t *out_y_stride,
                          const uint8_t **out_u, ptrdiff_t *out_uv_stride,
                          const uint8_t **out_v,
@@ -55,7 +55,7 @@ bool jce_vp8_decode_next(JceVp8Decoder *dec,
 
 /* Decode one VP8 packet. Same output semantics as jce_vp8_decode_next()
  * but driven by the caller (e.g. a WebM demuxer). Returns false on error. */
-bool jce_vp8_decode_packet(JceVp8Decoder *dec,
+JCE_API bool jce_vp8_decode_packet(JceVp8Decoder *dec,
                            const void *packet, size_t packet_size,
                            const uint8_t **out_y, ptrdiff_t *out_y_stride,
                            const uint8_t **out_u, ptrdiff_t *out_uv_stride,

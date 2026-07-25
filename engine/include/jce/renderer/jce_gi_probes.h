@@ -55,6 +55,14 @@ JCE_API void jce_gi_probes_update(JceGiProbes *gi,
                                    * follows real sun occlusion.  csm_tex ==
                                    * UINT16_MAX or amount <= 0 disables. */
                                   uint16_t sun_csm_tex,
+                                  /* The cascade's REAL square size + bgfx depth
+                                   * format — the private copy must match them
+                                   * exactly (bgfx_blit neither clamps nor
+                                   * converts; a mismatched copy removes the
+                                   * D3D12 device with INVALID_CALL).  0 size
+                                   * disables the term. */
+                                  uint16_t sun_csm_size,
+                                  uint32_t sun_csm_fmt,
                                   const float *sun_csm_vp /* 16 or NULL */,
                                   jce_vec3 sun_dir, jce_vec3 sun_color,
                                   float sun_amount);

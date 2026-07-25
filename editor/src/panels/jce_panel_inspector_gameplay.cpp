@@ -19,12 +19,13 @@ void draw_comp_behavior_tree(JceBehaviorTree *bt)
         insp_undo_bool(&bt->active);
 
     /* Behavior-tree asset (BehaviorTree.CPP XML).  The runtime loads this
-     * file into its JceBtContext at Play and ticks it each gameplay frame. */
+     * file into its JceBtContext at Play and ticks it each gameplay frame.
+     * jce_draw_path_input_asset owns the JCE_DND_ASSET_PATH drop target on
+     * the text field — no accept_asset_drop() needed here or below. */
     ImGui::TextUnformatted(jce_editor_i18n("inspector.bt.treePath"));
     if (jce_draw_path_input_asset("##bt_tree", bt->tree_path,
                                   sizeof(bt->tree_path), JCE_ASSET_KIND_DATA))
         insp_track_edit();
-    accept_asset_drop(bt->tree_path, sizeof(bt->tree_path));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("inspector.bt.clearTree", "bt")))
     { bt->tree_path[0] = '\0'; insp_track_edit(); }
@@ -206,7 +207,6 @@ void draw_comp_terrain(JceTerrainComponent *tc)
     if (!tc) return;
     jce_draw_path_input_asset(jce_editor_i18n("inspector.terrain.path"), tc->terrain_path, sizeof tc->terrain_path, JCE_ASSET_KIND_DATA);
     insp_track_edit();
-    accept_asset_drop(tc->terrain_path, sizeof tc->terrain_path);
     ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.dropHint"));
 
     if (ImGui::Checkbox(jce_editor_i18n("inspector.terrain.visible"), &tc->visible))
@@ -230,8 +230,6 @@ void draw_comp_terrain(JceTerrainComponent *tc)
         jce_draw_path_input_asset(label, tc->layer_albedo_path[i],
                          sizeof tc->layer_albedo_path[i], JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(tc->layer_albedo_path[i],
-                          sizeof tc->layer_albedo_path[i]);
         ImGui::PopID();
     }
     ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.splatChannels"));
@@ -330,7 +328,6 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
     if (jce_draw_path_input_asset("##veg_mesh", vs->mesh_path,
                                   sizeof vs->mesh_path, JCE_ASSET_KIND_MODEL))
         ch = true;
-    accept_asset_drop(vs->mesh_path, sizeof vs->mesh_path);
 
     /* No mesh asset => scatter a built-in PRIMITIVE (the instanced-primitive ISM
      * path: one GPU-instanced submit for N shapes, Unity-ISM / UE-HISM level).
@@ -350,7 +347,6 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
     if (jce_draw_path_input_asset("##veg_albedo", vs->albedo_path,
                                   sizeof vs->albedo_path, JCE_ASSET_KIND_TEXTURE))
         ch = true;
-    accept_asset_drop(vs->albedo_path, sizeof vs->albedo_path);
 
     /* Density mask (large-world #8a): a grayscale texture whose R channel over
      * the area rect modulates per-instance keep-probability — sparse where dark,
@@ -360,7 +356,6 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
     if (jce_draw_path_input_asset("##veg_density_mask", vs->density_mask_path,
                                   sizeof vs->density_mask_path, JCE_ASSET_KIND_TEXTURE))
         ch = true;
-    accept_asset_drop(vs->density_mask_path, sizeof vs->density_mask_path);
 
     /* In-editor density paint brush (large-world #8a): paint the density grid
      * directly on the terrain in Scene View (supersedes the mask asset). */
@@ -480,7 +475,6 @@ void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc)
     if (jce_draw_path_input_asset("##fc_alpha_tex", fc->alpha_tex,
                                   sizeof fc->alpha_tex, JCE_ASSET_KIND_TEXTURE))
         ch = true;
-    accept_asset_drop(fc->alpha_tex, sizeof fc->alpha_tex);
     ch |= ImGui::Checkbox(jce_editor_i18n("inspector.visible"), &fc->visible);
 
     if (ch) insp_track_edit();
@@ -561,7 +555,6 @@ void draw_comp_grass_field(JceGrassFieldComponent *g)
                                   sizeof g->density_mask_path,
                                   JCE_ASSET_KIND_TEXTURE))
         ch = true;
-    accept_asset_drop(g->density_mask_path, sizeof g->density_mask_path);
     if (g->density_mask_path[0]) {
         ch |= ImGui::SliderFloat(jce_editor_i18n_id("inspector.grassField.densityThreshold",
                                                     "Mask Threshold"),
@@ -655,7 +648,6 @@ void draw_comp_water(JceWaterComponent *w)
         ImGui::SeparatorText(jce_editor_i18n("inspector.water.stylized.header"));
         ch |= jce_draw_path_input_asset(jce_editor_i18n("inspector.water.dataTex"),
                   w->data_tex, sizeof w->data_tex, JCE_ASSET_KIND_TEXTURE);
-        accept_asset_drop(w->data_tex, sizeof w->data_tex);
         ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.splashRatio"),
                                  &w->splash_ratio, 0.0f, 1.0f, "%.2f");
     } else { /* JCE_WATER_MODE_FFT */
@@ -723,7 +715,6 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
     if (jce_draw_path_input_asset("##pe_asset", pe->asset_path,
                                   sizeof(pe->asset_path), JCE_ASSET_KIND_PARTICLE))
         insp_track_edit();
-    accept_asset_drop(pe->asset_path, sizeof(pe->asset_path));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("inspector.pe.clearAsset", "pe")))
     { pe->asset_path[0] = '\0'; insp_track_edit(); }
@@ -771,7 +762,6 @@ void draw_comp_script(JceScriptComponent *scr)
      * on_start/on_update/on_collision/on_trigger/on_message via the Lua VM). */
     jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
     insp_track_edit();
-    accept_asset_drop(scr->script_path, 128);
 }
 
 void draw_comp_nav_agent(JceNavAgentComponent *na)
@@ -857,7 +847,6 @@ void draw_comp_sequence_player(JceSequencePlayerComponent *sp)
     if (jce_draw_path_input_asset("##seqplayer_path", sp->seq_path,
                                   sizeof(sp->seq_path), JCE_ASSET_KIND_DATA))
         insp_track_edit();
-    accept_asset_drop(sp->seq_path, sizeof(sp->seq_path));
 
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.seqplayer.playOnAwake", "seqp"),
                         &sp->play_on_awake))

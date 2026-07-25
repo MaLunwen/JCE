@@ -93,6 +93,30 @@ static int l_jce_set_position(lua_State *L)
     return 0;
 }
 
+static int l_jce_set_parent(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity child = (JceScriptEntity)luaL_checkinteger(L, 1);
+    JceScriptEntity parent = (JceScriptEntity)luaL_checkinteger(L, 2);
+    luaL_checktype(L, 3, LUA_TBOOLEAN);
+    bool preserve_world = lua_toboolean(L, 3) != 0;
+    bool applied = s->have_host && s->host.set_parent &&
+        s->host.set_parent(s->host.user, child, parent, preserve_world);
+    lua_pushboolean(L, applied ? 1 : 0);
+    return 1;
+}
+
+static int l_jce_get_parent(lua_State *L)
+{
+    JceScript *s = self_from_upvalue(L);
+    JceScriptEntity child = (JceScriptEntity)luaL_checkinteger(L, 1);
+    JceScriptEntity parent = s->have_host && s->host.get_parent
+        ? s->host.get_parent(s->host.user, child)
+        : 0;
+    lua_pushinteger(L, (lua_Integer)parent);
+    return 1;
+}
+
 static int l_jce_is_key_down(lua_State *L)
 {
     JceScript *s = self_from_upvalue(L);
@@ -1109,6 +1133,8 @@ static void install_bindings(JceScript *s)
     register_binding(L, s, "set_rotation",   l_jce_set_rotation);
     register_binding(L, s, "get_scale",      l_jce_get_scale);
     register_binding(L, s, "set_scale",      l_jce_set_scale);
+    register_binding(L, s, "set_parent",     l_jce_set_parent);
+    register_binding(L, s, "get_parent",     l_jce_get_parent);
     register_binding(L, s, "is_key_down",    l_jce_is_key_down);
     register_binding(L, s, "find_with_tag",  l_jce_find_with_tag);
     register_binding(L, s, "destroy",        l_jce_destroy);
@@ -1177,8 +1203,73 @@ static void install_bindings(JceScript *s)
 }
 
 /* ── Sandboxed standard libs ────────────────────────────────────────────── */
+
+/* Replacement for the base library's `load`, with two restrictions the stock
+ * one does not have:
+ *
+ *   1. TEXT CHUNKS ONLY.  Stock load() defaults to mode "bt" and will happily
+ *      compile a *binary* chunk.  The Lua VM does not validate bytecode, so a
+ *      crafted binary chunk is a well-known way to read and write arbitrary
+ *      process memory — i.e. a full sandbox escape, from a plain string.
+ *      The caller's `mode` argument is accepted and IGNORED; it is always "t".
+ *   2. STRING CHUNKS ONLY.  The reader-function form is refused, so a script
+ *      cannot assemble a chunk from sources this function cannot inspect.
+ *
+ * Everything else is preserved, including the custom-environment argument
+ * that first-party scripts rely on (space_director.lua:335 passes one). */
+static int l_sandbox_load(lua_State *L)
+{
+    size_t      len = 0;
+    const char *src;
+
+    if (lua_type(L, 1) != LUA_TSTRING) {
+        lua_pushnil(L);
+        lua_pushstring(L, "load: only string chunks are allowed in the JCE "
+                          "sandbox (reader functions are refused)");
+        return 2;
+    }
+    src = lua_tolstring(L, 1, &len);
+
+    /* Reject a binary chunk explicitly rather than letting luaL_loadbufferx
+     * produce a vaguer "attempt to load a binary chunk" — the caller should
+     * see WHY this is policy, not a mode mismatch. */
+    if (len > 0 && src[0] == LUA_SIGNATURE[0]) {
+        lua_pushnil(L);
+        lua_pushstring(L, "load: binary chunks are refused (unvalidated "
+                          "bytecode is a sandbox escape)");
+        return 2;
+    }
+
+    {
+        const char *name = luaL_optstring(L, 2, "=(load)");
+        /* arg 3 (mode) deliberately ignored — always text. */
+        const int rc = luaL_loadbufferx(L, src, len, name, "t");
+        if (rc != LUA_OK) {
+            lua_pushnil(L);
+            lua_insert(L, -2);          /* nil, errmsg */
+            return 2;
+        }
+    }
+
+    if (!lua_isnoneornil(L, 4)) {       /* custom _ENV upvalue */
+        lua_pushvalue(L, 4);
+        if (lua_setupvalue(L, -2, 1) == NULL)
+            lua_pop(L, 1);              /* chunk has no _ENV; drop the value */
+    }
+    return 1;
+}
+
 /* Open base/table/string/math only — NOT io/os/package/debug, so scripts
- * can't touch the filesystem, processes, or load native code. */
+ * can't touch processes or load native code.
+ *
+ * That list alone is NOT a filesystem sandbox, which is what this comment
+ * used to claim: luaopen_base installs `dofile` and `loadfile`, and both open
+ * a HOST path directly — bypassing the VFS, the PAK, and every mount policy
+ * around them.  A script shipped inside a signed PAK could read anything the
+ * process could.  Neither has a single first-party user, so both are removed
+ * outright rather than redirected.
+ *
+ * `load` IS used (space_director.lua), so it stays — hardened, see above. */
 static void open_sandboxed_libs(lua_State *L)
 {
     static const luaL_Reg libs[] = {
@@ -1192,11 +1283,19 @@ static void open_sandboxed_libs(lua_State *L)
         luaL_requiref(L, lib->name, lib->func, 1);
         lua_pop(L, 1);
     }
+
+    /* Host-filesystem escapes from luaopen_base. */
+    lua_pushnil(L); lua_setglobal(L, "dofile");
+    lua_pushnil(L); lua_setglobal(L, "loadfile");
+
+    /* Text-only, string-only load. */
+    lua_pushcfunction(L, l_sandbox_load);
+    lua_setglobal(L, "load");
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
-JceScript *jce_script_create(const JceScriptHost *host)
+JceScript *jce_script_create_sized(const JceScriptHost *host, size_t host_size)
 {
     JceScript *s = (JceScript *)jce_malloc(sizeof(*s));
     if (!s) return NULL;
@@ -1208,7 +1307,27 @@ JceScript *jce_script_create(const JceScriptHost *host)
         LOG_ERROR(LOG_TAG, "luaL_newstate failed (OOM)");
         return NULL;
     }
-    if (host) { s->host = *host; s->have_host = true; }
+    if (host && host_size > 0) {
+        /* `s->host = *host` copied at THIS engine's sizeof.  JceScriptHost is
+         * a caller-allocated table of function pointers that grows as bindings
+         * are added, so a consumer built against an older header hands us a
+         * SHORTER object — and the struct copy read past its end, then called
+         * whatever bytes happened to follow.  A garbage function pointer
+         * invoked as a binding is not a crash you can debug from the stack it
+         * produces.
+         *
+         * Copy min(caller, engine) over a zeroed destination instead: members
+         * the caller never knew about stay NULL, and every call site here
+         * already null-checks its callback.  A LONGER host (caller newer than
+         * this engine) is equally fine — the tail is ignored.
+         *
+         * Same contract as jce_engine_set_app_desc_sized(); see the ABI note
+         * in docs/architecture/language-driver-abi.md. */
+        const size_t n = host_size < sizeof(s->host) ? host_size
+                                                     : sizeof(s->host);
+        memcpy(&s->host, host, n);
+        s->have_host = true;
+    }
 
     /* Coroutine slots start free (memset 0 would read as a valid ref). */
     for (int i = 0; i < JCE_SCRIPT_MAX_COROUTINES; ++i)
@@ -1222,6 +1341,15 @@ JceScript *jce_script_create(const JceScriptHost *host)
                 LUA_VERSION_MAJOR "." LUA_VERSION_MINOR,
                 s->have_host ? " (host bridged)" : "");
     return s;
+}
+
+JceScript *jce_script_create(const JceScriptHost *host)
+{
+    /* Legacy entry point.  Kept as a real symbol so binaries already linked
+     * against it keep resolving; it asserts the caller's layout equals ours,
+     * which is true for anything compiled against THIS header.  Callers that
+     * include the header get the _sized form via the macro shim there. */
+    return jce_script_create_sized(host, sizeof(JceScriptHost));
 }
 
 void jce_script_destroy(JceScript *s)

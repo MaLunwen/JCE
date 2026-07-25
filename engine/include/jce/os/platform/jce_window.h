@@ -63,13 +63,28 @@ JCE_API void        jce_window_get_native(const JceWindow *win, JceNativeWindow 
 JCE_API void        jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h);
 
 /* Compute a letterbox viewport that preserves the logical aspect ratio. */
-void        jce_window_calc_viewport(const JceWindow *win,
+JCE_API void        jce_window_calc_viewport(const JceWindow *win,
                                      uint16_t *vp_x, uint16_t *vp_y,
                                      uint16_t *vp_w, uint16_t *vp_h);
 
-/* Set window icon from in-memory PNG/image data (e.g. decompressed from PAK). */
-void        jce_window_set_icon(JceWindow *win,
-                                const void *data, size_t size);
+/* Set the window icon from DECODED, tightly-packed RGBA8 pixels.
+ *
+ * This used to take encoded bytes and call IMG_Load_IO itself, which put
+ * an image DECODER in the platform layer — the one place that cannot reach
+ * the image service (jce_image is L3, this is L2).  So the icon path
+ * bypassed every protection the service adds; concretely it fed 16-bit
+ * greyscale PNGs straight to SDL_image's libpng, the exact input the
+ * service routes around because it overruns the heap there.  Icons come
+ * from a PAK, and a PAK can be replaced.
+ *
+ * Decoding now happens above L3 — callers use jce_image_load_rgba8_from_
+ * memory() and hand the pixels down — so the platform layer holds no
+ * decoder at all and there is nothing left to keep in sync.
+ *
+ * `pixels` must be w*h*4 bytes; it is copied, so the caller may free it
+ * immediately. */
+JCE_API void        jce_window_set_icon_rgba8(JceWindow *win,
+                                      const void *pixels, int w, int h);
 
 /* Toggle between fullscreen and windowed mode. */
 JCE_API void        jce_window_toggle_fullscreen(JceWindow *win);

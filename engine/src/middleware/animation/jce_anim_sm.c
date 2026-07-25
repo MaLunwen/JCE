@@ -5,6 +5,7 @@
 #include <jce/middleware/animation/jce_anim_sm.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
 #include "os/core/jce_memory.h"
 
@@ -70,16 +71,6 @@ enum { SM_OP_GT = 0, SM_OP_LT = 1, SM_OP_EQ = 2, SM_OP_NEQ = 3, SM_OP_TRUE = 4, 
 
 /* ───── Helpers ────────────────────────────────────────────── */
 
-static void copy_str(char *dst, size_t cap, const char *src)
-{
-    if (!dst || cap == 0) return;
-    if (!src) { dst[0] = 0; return; }
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
-
 static bool eval_condition(const JceAnimSm *sm, const SmCondition *c, bool *consume_trigger)
 {
     if (c->param_idx < 0 || c->param_idx >= sm->param_count) return false;
@@ -142,8 +133,8 @@ static JceAnimSm *load_root(JceJson *root)
         for (int i = 0; i < sm->param_count; ++i) {
             JceJson *o = jce_json_array_at(params, i);
             SmParam *p = &sm->params[i];
-            copy_str(p->name, sizeof(p->name),
-                     jce_json_get_string(o, "name", "param"));
+            jce_strlcpy(p->name, jce_json_get_string(o, "name", "param"),
+                        sizeof(p->name));
             p->type = jce_json_get_int(o, "type", JCE_ANIM_SM_PARAM_FLOAT);
             p->vf   = (float)jce_json_get_number(o, "defF", 0.0);
             p->vi   = jce_json_get_int(o, "defI", 0);
@@ -160,10 +151,10 @@ static JceAnimSm *load_root(JceJson *root)
         for (int i = 0; i < sm->state_count; ++i) {
             JceJson *o = jce_json_array_at(states, i);
             SmState *s = &sm->states[i];
-            copy_str(s->name,      sizeof(s->name),
-                     jce_json_get_string(o, "name", "State"));
-            copy_str(s->clip_path, sizeof(s->clip_path),
-                     jce_json_get_string(o, "clip", ""));
+            jce_strlcpy(s->name,      jce_json_get_string(o, "name", "State"),
+                        sizeof(s->name));
+            jce_strlcpy(s->clip_path, jce_json_get_string(o, "clip", ""),
+                        sizeof(s->clip_path));
             s->speed   = (float)jce_json_get_number(o, "speed", 1.0);
             s->looping = jce_json_get_bool(o, "loop", true);
         }

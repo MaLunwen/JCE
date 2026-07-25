@@ -1,5 +1,24 @@
 /*
  * jce_scene_pick.c  GPU object-ID scene picking.
+ *
+ * DEFERRED BY CONTRACT — read this before "unifying" any other picker with
+ * it.  jce_scene_pick_request() only RECORDS a pixel; the next
+ * jce_scene_pick_render() services it with a full ID render + blit; and
+ * jce_scene_pick_poll() answers only once that frame's read-back has landed,
+ * several frames after the click.  At most one point request and one rect
+ * request may be in flight, and a request is refused outright while another
+ * is pending or when the backend lacks blit/read-back.
+ *
+ * So this pass only serves callers that can wait across frames — the editor's
+ * click selection and marquee selection, which drive it from a pending-state
+ * machine.  Call sites needing an answer WITHIN the current UI callback keep
+ * their own coarse, synchronous CPU AABB ray test
+ * (cpu_pick_entity_along_ray in editor/src/panels/jce_panel_scene_view.cpp):
+ * viewport drag-and-drop must know the hovered entity before it releases the
+ * ImGui payload, and its surface-hit query needs a world-space hit POINT,
+ * which an object-id buffer does not carry at any latency.  The two pickers
+ * are NOT duplicates; folding the CPU one into this pass would either stall
+ * the frame on a read-back or silently answer "nothing" mid-drag.
  */
 
 #include <jce/middleware/scene/jce_scene.h>
@@ -168,13 +187,13 @@ static bool pick_ensure_target(JceScenePickPass *pass,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_RT |
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL);
+        NULL, 0);
 
     tex[1] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
         BGFX_TEXTURE_FORMAT_D24S8,
         BGFX_TEXTURE_RT,
-        NULL);
+        NULL, 0);
 
     if (!BGFX_HANDLE_IS_VALID(tex[0]) || !BGFX_HANDLE_IS_VALID(tex[1])) {
         if (BGFX_HANDLE_IS_VALID(tex[0])) bgfx_destroy_texture(tex[0]);
@@ -227,7 +246,7 @@ static bool pick_ensure_readback_texture(JceScenePickPass *pass)
         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
         BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL);
+        NULL, 0);
     if (!BGFX_HANDLE_IS_VALID(pass->readback_tex)) {
         LOG_WARN(LOG_TAG, "failed to allocate 1x1 pick readback texture");
         return false;
@@ -252,7 +271,7 @@ static bool pick_ensure_rect_readback(JceScenePickPass *pass,
             BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
             BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
             BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-            NULL);
+            NULL, 0);
         if (!BGFX_HANDLE_IS_VALID(pass->rect_readback_tex)) {
             LOG_WARN(LOG_TAG, "failed to allocate %ux%u pick rect readback texture", w, h);
             pass->rect_rb_w = pass->rect_rb_h = 0;
@@ -982,7 +1001,7 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
                       pass->color, 0, (uint16_t)x0, (uint16_t)y0, 0,
                       (uint16_t)w, (uint16_t)h, 1);
             pass->rect_ready_frame =
-                bgfx_read_texture(pass->rect_readback_tex, pass->rect_readback, 0);
+                bgfx_read_texture(pass->rect_readback_tex, pass->rect_readback, 0, 0);
             pass->rect_pending = true;
         } else {
             pass->rect_failed = true;
@@ -1005,7 +1024,7 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
               pass->color, 0, (uint16_t)rx, (uint16_t)ry, 0,
               1, 1, 1);
     pass->ready_frame = bgfx_read_texture(pass->readback_tex,
-                                          pass->readback, 0);
+                                          pass->readback, 0, 0);
     pass->pending = true;
     pass->want_render = false;
 

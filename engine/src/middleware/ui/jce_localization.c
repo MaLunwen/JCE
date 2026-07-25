@@ -7,8 +7,9 @@
  * <jce/os/core/jce_hash.h>).  All allocations go
  * through jce_alloc; file I/O uses jce_json_parse_file (host FS)
  * with an optional in-PAK fallback source (jce_loc_set_source_pak)
- * for shipped/WASM builds.  PAK include from a middleware TU follows
- * the jce_i18n.c precedent.
+ * for shipped/WASM builds.  jce_pak_loader (L3) is a legal downward
+ * include from this L4 TU — unlike jce_i18n.c, which sits at L2 and must
+ * reach the PAK through the inverted jce_fs provider instead.
  */
 
 #include <jce/middleware/ui/jce_localization.h>

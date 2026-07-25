@@ -19,6 +19,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_mem_profile.h>
 
+#include "jce_net_bytes.h"
 #include "jce_session_internal.h"
 #include "os/core/jce_memory.h"
 
@@ -119,6 +120,14 @@ typedef struct ReplState {
     JceNetRole       role;
     ecs_world_t     *world;
     JceNetHost      *host;
+
+    /* Entity lifecycle adapter (audit C5-03).  See the header: without
+     * these the substrate calls ecs_new/ecs_delete directly and skips
+     * the scene roster epoch, the default transform, and JceTagActive. */
+    JceNetEntityCreateFn   entity_create;
+    JceNetEntityDestroyFn  entity_destroy;
+    void                  *entity_user;
+    bool                   raw_entity_warned;
 
     ObjectEntry     *objects;
     uint32_t         object_count;
@@ -338,79 +347,10 @@ static bool object_relevant_to_origin(const ObjectEntry *e,
     return (dx * dx + dy * dy + dz * dz) <= g_repl.interest_radius_sq;
 }
 
-/* ================================================================== */
-/* Little-endian byte writers / readers                                */
-/* ================================================================== */
-
-typedef struct WBuf {
-    uint8_t *buf;
-    uint32_t size;
-    uint32_t cap;
-    bool     ok;
-} WBuf;
-
-static void wbuf_reserve(WBuf *w, uint32_t need)
-{
-    if (!w->ok) return;
-    if (w->size + need <= w->cap) return;
-    uint32_t nc = w->cap ? w->cap : 256u;
-    while (nc < w->size + need) nc *= 2u;
-    uint8_t *nb = (uint8_t *)JCE_REALLOC(w->buf, nc);
-    if (!nb) { w->ok = false; return; }
-    w->buf = nb;
-    w->cap = nc;
-}
-static void w_bytes(WBuf *w, const void *p, uint32_t n)
-{
-    wbuf_reserve(w, n);
-    if (!w->ok) return;
-    memcpy(w->buf + w->size, p, n);
-    w->size += n;
-}
-static void w_u8 (WBuf *w, uint8_t  v) { w_bytes(w, &v, 1); }
-static void w_u16(WBuf *w, uint16_t v) {
-    uint8_t b[2] = { (uint8_t)(v & 0xFFu), (uint8_t)((v >> 8) & 0xFFu) };
-    w_bytes(w, b, 2);
-}
-static void w_u32(WBuf *w, uint32_t v) {
-    uint8_t b[4] = { (uint8_t)(v        & 0xFFu),
-                     (uint8_t)((v >> 8) & 0xFFu),
-                     (uint8_t)((v >> 16)& 0xFFu),
-                     (uint8_t)((v >> 24)& 0xFFu) };
-    w_bytes(w, b, 4);
-}
-
-typedef struct RBuf {
-    const uint8_t *buf;
-    uint32_t       size;
-    uint32_t       cursor;
-    bool           ok;
-} RBuf;
-
-static bool r_bytes(RBuf *r, void *dst, uint32_t n)
-{
-    if (!r->ok || r->cursor + n > r->size) { r->ok = false; return false; }
-    memcpy(dst, r->buf + r->cursor, n);
-    r->cursor += n;
-    return true;
-}
-static bool r_u16(RBuf *r, uint16_t *out)
-{
-    uint8_t b[2];
-    if (!r_bytes(r, b, 2)) return false;
-    *out = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
-    return true;
-}
-static bool r_u32(RBuf *r, uint32_t *out)
-{
-    uint8_t b[4];
-    if (!r_bytes(r, b, 4)) return false;
-    *out = (uint32_t)b[0]
-         | ((uint32_t)b[1] << 8)
-         | ((uint32_t)b[2] << 16)
-         | ((uint32_t)b[3] << 24);
-    return true;
-}
+/* Little-endian wire codec: JceNetWBuf / JceNetRBuf from
+ * jce_net_bytes.h.  Every module that speaks the packet-type-byte
+ * protocol (rpc, net_transform) shares those helpers, so encode and
+ * decode cannot drift apart. */
 
 /* ================================================================== */
 /* Internal — event listeners + ECS sync (P3-D.3)                      */
@@ -503,6 +443,49 @@ void jce_net_replication_set_world(void *ecs_world)
     g_repl.transform_comp_id = 0;  /* re-resolve lazily on next use */
 }
 
+void jce_net_replication_set_entity_hooks(JceNetEntityCreateFn create_fn,
+                                          JceNetEntityDestroyFn destroy_fn,
+                                          void *user)
+{
+    g_repl.entity_create  = create_fn;
+    g_repl.entity_destroy = destroy_fn;
+    g_repl.entity_user    = user;
+}
+
+/* Create the entity backing a replicated object.
+ *
+ * Prefers the installed adapter so the entity goes through the scene layer
+ * and gets its roster bump, default transform and JceTagActive.  The raw
+ * fallback keeps standalone/test embeddings working, but announces once what
+ * they are giving up — silently producing entities that active-filtered
+ * systems skip is exactly the failure this finding is about. */
+static uint64_t repl_entity_create(void)
+{
+    if (g_repl.entity_create)
+        return g_repl.entity_create(g_repl.entity_user);
+    if (!g_repl.world) return 0u;
+    if (!g_repl.raw_entity_warned) {
+        g_repl.raw_entity_warned = true;
+        LOG_WARN(LOG_TAG,
+                 "no entity hooks installed: replicated entities are created "
+                 "with raw ecs_new — no scene roster bump, no default "
+                 "transform, and no JceTagActive (active-filtered systems "
+                 "will skip them)");
+    }
+    return (uint64_t)ecs_new(g_repl.world);
+}
+
+static void repl_entity_destroy(uint64_t entity)
+{
+    if (!entity) return;
+    if (g_repl.entity_destroy) {
+        g_repl.entity_destroy(g_repl.entity_user, entity);
+        return;
+    }
+    if (g_repl.world)
+        ecs_delete(g_repl.world, (ecs_entity_t)entity);
+}
+
 void jce_net_replication_attach_host(JceNetHost *host) { g_repl.host = host; }
 
 /* L4-internal — expose the bound flecs world to the NetworkVariable layer
@@ -543,8 +526,7 @@ JceNetObjectId jce_net_object_spawn(const JceNetObjectDesc *desc)
     e->prefab_path  = strdup_jce(desc->prefab_path);
     e->pending_spawn = true;
 
-    if (g_repl.world)
-        e->entity = (uint64_t)ecs_new(g_repl.world);
+    e->entity = repl_entity_create();
 
     sync_net_obj_component(e);
     fire_event(JCE_NETOBJ_SPAWNED, e->id, e->owner);
@@ -596,7 +578,7 @@ void jce_net_object_despawn(JceNetObjectId id)
      * outbound packet can name the id. */
     if (g_repl.world && e->entity) {
         remove_net_obj_component(e);
-        ecs_delete(g_repl.world, (ecs_entity_t)e->entity);
+        repl_entity_destroy(e->entity);
     }
     e->entity = 0;
     e->pending_despawn = true;
@@ -727,7 +709,7 @@ static int comp_serialize(ObjectEntry *e, CompEntry *cd, uint8_t **out_scratch)
 /* Write the spawn + despawn blocks (common to delta + burst).  For a
  * FULL burst `force_all_spawn` re-spawns EVERY live object regardless of
  * the pending flag so a late joiner learns the whole world. */
-static void write_spawn_despawn(WBuf *w, bool force_all_spawn,
+static void write_spawn_despawn(JceNetWBuf *w, bool force_all_spawn,
                                 uint16_t *out_spawn_n, uint16_t *out_desp_n)
 {
     uint16_t spawn_n = 0, desp_n = 0;
@@ -743,42 +725,42 @@ static void write_spawn_despawn(WBuf *w, bool force_all_spawn,
 /* Encode a snapshot for ONE recipient.  When `interest_origin` is non-
  * NULL the per-tick component stream is interest-filtered against it.
  * `full` forces a full-state burst (every object, every component,
- * ignores baseline).  Returns the encoded WBuf (caller frees). */
-static void encode_snapshot_for(WBuf *w, JceNetTick tick, bool full,
+ * ignores baseline).  Returns the encoded JceNetWBuf (caller frees). */
+static void encode_snapshot_for(JceNetWBuf *w, JceNetTick tick, bool full,
                                 const float *interest_origin)
 {
-    w_u8 (w, JCE_REPL_PKT_SNAPSHOT);
-    w_u32(w, tick);
-    w_u32(w, g_repl.last_tick_received);
+    jce_net_w_u8 (w, JCE_REPL_PKT_SNAPSHOT);
+    jce_net_w_u32(w, tick);
+    jce_net_w_u32(w, g_repl.last_tick_received);
 
     uint16_t spawn_n = 0, desp_n = 0;
     write_spawn_despawn(w, full, &spawn_n, &desp_n);
 
     /* comp_n is patched after we know how many entries we wrote. */
     uint32_t comp_n_off = w->size;
-    w_u16(w, spawn_n);
-    w_u16(w, desp_n);
-    w_u16(w, 0u);  /* comp_n placeholder (offset comp_n_off + 4) */
-    w_u16(w, full ? JCE_REPL_SNAP_FLAG_FULL : 0u);
+    jce_net_w_u16(w, spawn_n);
+    jce_net_w_u16(w, desp_n);
+    jce_net_w_u16(w, 0u);  /* comp_n placeholder (offset comp_n_off + 4) */
+    jce_net_w_u16(w, full ? JCE_REPL_SNAP_FLAG_FULL : 0u);
 
     /* Spawns. */
     for (uint32_t i = 0; i < g_repl.object_count; ++i) {
         ObjectEntry *e = &g_repl.objects[i];
         if (e->pending_despawn) continue;
         if (!full && !e->pending_spawn) continue;
-        w_u32(w, e->id);
-        w_u16(w, e->owner);
-        w_u16(w, e->flags);
+        jce_net_w_u32(w, e->id);
+        jce_net_w_u16(w, e->owner);
+        jce_net_w_u16(w, e->flags);
         uint16_t plen = e->prefab_path ? (uint16_t)strlen(e->prefab_path) : 0u;
-        w_u16(w, plen);
-        if (plen) w_bytes(w, e->prefab_path, plen);
+        jce_net_w_u16(w, plen);
+        if (plen) jce_net_w_bytes(w, e->prefab_path, plen);
     }
     /* Despawns (never in a full burst — a burst describes a fresh world). */
     if (!full) {
         for (uint32_t i = 0; i < g_repl.object_count; ++i) {
             ObjectEntry *e = &g_repl.objects[i];
             if (!e->pending_despawn) continue;
-            w_u32(w, e->id);
+            jce_net_w_u32(w, e->id);
         }
     }
 
@@ -815,11 +797,11 @@ static void encode_snapshot_for(WBuf *w, JceNetTick tick, bool full,
                     }
                 }
 
-                w_u32(w, e->id);
-                w_u16(w, (uint16_t)c);     /* interned component index */
-                w_u32(w, cd->version);
-                w_u32(w, (uint32_t)n);
-                w_bytes(w, scratch, (uint32_t)n);
+                jce_net_w_u32(w, e->id);
+                jce_net_w_u16(w, (uint16_t)c);     /* interned component index */
+                jce_net_w_u32(w, cd->version);
+                jce_net_w_u32(w, (uint32_t)n);
+                jce_net_w_bytes(w, scratch, (uint32_t)n);
                 written++;
                 g_repl.comp_entries_sent++;
             }
@@ -844,7 +826,7 @@ static void encode_snapshot_for(WBuf *w, JceNetTick tick, bool full,
 uint32_t jce_net_replication_encode_snapshot(JceNetTick tick, bool full,
                                              void **out_buf)
 {
-    WBuf w = { NULL, 0, 0, true };
+    JceNetWBuf w = JCE_NET_WBUF_INIT;
     if (!g_repl.inited || !out_buf) return 0u;
     encode_snapshot_for(&w, tick, full, /*interest=*/NULL);
     if (!w.ok || w.size == 0u) { JCE_FREE(w.buf); *out_buf = NULL; return 0u; }
@@ -909,7 +891,7 @@ static void encode_and_broadcast(JceNetTick tick)
     for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
         PeerState *p = &g_repl.peers[i];
         if (!p->used || !p->needs_full_burst) continue;
-        WBuf w = { NULL, 0, 0, true };
+        JceNetWBuf w = JCE_NET_WBUF_INIT;
         encode_snapshot_for(&w, tick, /*full=*/true, /*interest=*/NULL);
         if (w.ok && w.size > 0) {
             JcePeerHandle ph = { p->peer_idx };
@@ -939,7 +921,7 @@ static void encode_and_broadcast(JceNetTick tick)
             float origin[3];
             const float *use_origin =
                 peer_interest_origin(p->client, origin) ? origin : NULL;
-            WBuf w = { NULL, 0, 0, true };
+            JceNetWBuf w = JCE_NET_WBUF_INIT;
             encode_snapshot_for(&w, tick, /*full=*/false, use_origin);
             if (w.ok && w.size > 0) {
                 JcePeerHandle ph = { p->peer_idx };
@@ -953,7 +935,7 @@ static void encode_and_broadcast(JceNetTick tick)
         }
         (void)sent;
     } else {
-        WBuf w = { NULL, 0, 0, true };
+        JceNetWBuf w = JCE_NET_WBUF_INIT;
         encode_snapshot_for(&w, tick, /*full=*/false, /*interest=*/NULL);
         if (w.ok && w.size > 0) {
             jce_mem_profile_record_alloc(JCE_MEM_TAG_NETWORK, w.size);
@@ -982,8 +964,7 @@ static ObjectEntry *ensure_client_object(JceNetObjectId id,
     e->owner       = owner;
     e->flags       = flags;
     e->prefab_path = strdup_jce(prefab_path);
-    if (g_repl.world)
-        e->entity = (uint64_t)ecs_new(g_repl.world);
+    e->entity = repl_entity_create();
     if (g_repl.next_id <= id) g_repl.next_id = id + 1u;
     sync_net_obj_component(e);
     fire_event(JCE_NETOBJ_SPAWNED, e->id, e->owner);
@@ -991,31 +972,31 @@ static ObjectEntry *ensure_client_object(JceNetObjectId id,
 }
 
 /* Snapshot decode (client) — assumes type byte already consumed. */
-static void decode_snapshot(RBuf *r)
+static void decode_snapshot(JceNetRBuf *r)
 {
     uint32_t tick = 0, ack_tick = 0;
     uint16_t spawn_n = 0, desp_n = 0, comp_n = 0, flags = 0;
-    if (!r_u32(r, &tick))     return;
-    if (!r_u32(r, &ack_tick)) return;
-    if (!r_u16(r, &spawn_n))  return;
-    if (!r_u16(r, &desp_n))   return;
-    if (!r_u16(r, &comp_n))   return;
-    if (!r_u16(r, &flags))    return;
+    if (!jce_net_r_u32(r, &tick))     return;
+    if (!jce_net_r_u32(r, &ack_tick)) return;
+    if (!jce_net_r_u16(r, &spawn_n))  return;
+    if (!jce_net_r_u16(r, &desp_n))   return;
+    if (!jce_net_r_u16(r, &comp_n))   return;
+    if (!jce_net_r_u16(r, &flags))    return;
     (void)ack_tick; (void)flags;
     g_repl.last_tick_received = tick;
 
     /* Spawns. */
     for (uint16_t i = 0; i < spawn_n; ++i) {
         uint32_t id; uint16_t owner, fl, plen;
-        if (!r_u32(r, &id))    return;
-        if (!r_u16(r, &owner)) return;
-        if (!r_u16(r, &fl))    return;
-        if (!r_u16(r, &plen))  return;
+        if (!jce_net_r_u32(r, &id))    return;
+        if (!jce_net_r_u16(r, &owner)) return;
+        if (!jce_net_r_u16(r, &fl))    return;
+        if (!jce_net_r_u16(r, &plen))  return;
         char path[512];
         uint16_t copy = plen < (uint16_t)(sizeof(path) - 1) ? plen
                                                             : (uint16_t)(sizeof(path) - 1);
         if (plen) {
-            if (!r_bytes(r, path, copy)) return;
+            if (!jce_net_r_bytes(r, path, copy)) return;
             /* Skip overflow tail. */
             if (plen > copy) r->cursor += (uint32_t)(plen - copy);
         }
@@ -1025,14 +1006,14 @@ static void decode_snapshot(RBuf *r)
     /* Despawns. */
     for (uint16_t i = 0; i < desp_n; ++i) {
         uint32_t id;
-        if (!r_u32(r, &id)) return;
+        if (!jce_net_r_u32(r, &id)) return;
         for (uint32_t k = 0; k < g_repl.object_count; ++k) {
             if (g_repl.objects[k].id != id) continue;
             ObjectEntry *e = &g_repl.objects[k];
             JceClientId own = e->owner;
             if (g_repl.world && e->entity) {
                 remove_net_obj_component(e);
-                ecs_delete(g_repl.world, (ecs_entity_t)e->entity);
+                repl_entity_destroy(e->entity);
             }
             fire_event(JCE_NETOBJ_DESPAWNED, id, own);
             object_table_remove(k);
@@ -1043,11 +1024,16 @@ static void decode_snapshot(RBuf *r)
      * index (registration order is identical on both peers). */
     for (uint16_t i = 0; i < comp_n; ++i) {
         uint32_t id; uint16_t comp_index; uint32_t ver, payload_sz;
-        if (!r_u32(r, &id))         return;
-        if (!r_u16(r, &comp_index)) return;
-        if (!r_u32(r, &ver))        return;
-        if (!r_u32(r, &payload_sz)) return;
-        if (r->cursor + payload_sz > r->size) return;
+        if (!jce_net_r_u32(r, &id))         return;
+        if (!jce_net_r_u16(r, &comp_index)) return;
+        if (!jce_net_r_u32(r, &ver))        return;
+        if (!jce_net_r_u32(r, &payload_sz)) return;
+        /* Overflow-safe: `cursor + payload_sz > size` is 32-bit modular and
+         * an attacker-chosen payload_sz near UINT32_MAX wraps it below size,
+         * bypassing the check; then payload_sz drives both cd->read's length
+         * and the ecs_ensure_id alloc size. Subtraction can't wrap (a
+         * successful jce_net_r_u32 guarantees cursor <= size). */
+        if (payload_sz > r->size - r->cursor) return;
         const uint8_t *payload = r->buf + r->cursor;
         r->cursor += payload_sz;
 
@@ -1058,10 +1044,15 @@ static void decode_snapshot(RBuf *r)
         if (!fid) continue;
         (void)ver; /* TODO: version negotiation */
 
+        /* A component registered with size 0 would fall back to the
+         * wire-controlled payload_sz as the ECS storage size — an attacker
+         * could request a multi-GB allocation. A zero-size replicated
+         * component is meaningless; skip it rather than trust the wire. */
+        if (cd->size == 0) continue;
         void *slot = ecs_ensure_id(g_repl.world,
                                    (ecs_entity_t)e->entity,
                                    (ecs_id_t)fid,
-                                   (size_t)(cd->size ? cd->size : payload_sz));
+                                   (size_t)cd->size);
         if (!slot) continue;
         if (cd->read(payload, payload_sz, slot, cd->user) <= 0) continue;
         ecs_modified_id(g_repl.world,
@@ -1074,11 +1065,11 @@ static void decode_snapshot(RBuf *r)
      * server), so a broadcast on the repl channel reaches it.  Skipped on
      * a FULL burst is unnecessary — acking the burst tick is also useful. */
     if (g_repl.role == JCE_NET_ROLE_CLIENT && g_repl.host) {
-        WBuf a = { NULL, 0, 0, true };
-        w_u8 (&a, JCE_REPL_PKT_ACK);
-        w_u32(&a, tick);
-        w_u16(&a, (uint16_t)g_repl.local_client_id);
-        w_u16(&a, 0u); /* reserved */
+        JceNetWBuf a = JCE_NET_WBUF_INIT;
+        jce_net_w_u8 (&a, JCE_REPL_PKT_ACK);
+        jce_net_w_u32(&a, tick);
+        jce_net_w_u16(&a, (uint16_t)g_repl.local_client_id);
+        jce_net_w_u16(&a, 0u); /* reserved */
         if (a.ok && a.size > 0)
             jce_net_broadcast(g_repl.host, JCE_NET_REPL_CHANNEL,
                               a.buf, a.size, JCE_NET_UNRELIABLE);
@@ -1089,13 +1080,13 @@ static void decode_snapshot(RBuf *r)
 /* Ack decode (server).  Wire: tick u32, client u16, reserved u16.
  * Records the most recent tick a client acknowledged so future work can
  * cap retransmit windows / baseline staleness per peer. */
-static void decode_ack(RBuf *r)
+static void decode_ack(JceNetRBuf *r)
 {
     uint32_t acked_tick = 0;
     uint16_t client = 0, reserved = 0;
-    if (!r_u32(r, &acked_tick)) return;
-    if (!r_u16(r, &client))     return;
-    if (!r_u16(r, &reserved))   return;
+    if (!jce_net_r_u32(r, &acked_tick)) return;
+    if (!jce_net_r_u16(r, &client))     return;
+    if (!jce_net_r_u16(r, &reserved))   return;
     (void)reserved;
     if (g_repl.role != JCE_NET_ROLE_SERVER) return;
     for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
@@ -1110,14 +1101,14 @@ static void decode_ack(RBuf *r)
 
 /* Ownership-change decode (clients).  Wire: tick u32, net_id u32,
  * new_owner u16, reserved u16. */
-static void decode_owner_change(RBuf *r)
+static void decode_owner_change(JceNetRBuf *r)
 {
     uint32_t tick = 0, id = 0;
     uint16_t new_owner = 0, reserved = 0;
-    if (!r_u32(r, &tick))      return;
-    if (!r_u32(r, &id))        return;
-    if (!r_u16(r, &new_owner)) return;
-    if (!r_u16(r, &reserved))  return;
+    if (!jce_net_r_u32(r, &tick))      return;
+    if (!jce_net_r_u32(r, &id))        return;
+    if (!jce_net_r_u16(r, &new_owner)) return;
+    if (!jce_net_r_u16(r, &reserved))  return;
     (void)tick; (void)reserved;
 
     ObjectEntry *e = find_object(id);
@@ -1133,12 +1124,12 @@ static void decode_owner_change(RBuf *r)
 void jce_net_replication_handle_packet(const void *data, uint32_t size)
 {
     if (!g_repl.inited || !data || size < 1u) return;
-    RBuf r = { (const uint8_t *)data, size, 0u, true };
+    JceNetRBuf r = JCE_NET_RBUF_INIT(data, size);
 
     uint8_t type = 0;
     {
         uint8_t b;
-        if (!r_bytes(&r, &b, 1)) return;
+        if (!jce_net_r_bytes(&r, &b, 1)) return;
         type = b;
     }
     switch (type) {
@@ -1275,12 +1266,12 @@ static void broadcast_owner_changes(JceNetTick tick)
     for (uint32_t i = 0; i < g_repl.object_count; ++i) {
         ObjectEntry *e = &g_repl.objects[i];
         if (!e->pending_owner_change) continue;
-        WBuf w = { NULL, 0, 0, true };
-        w_u8 (&w, JCE_REPL_PKT_OWNER_CHG);
-        w_u32(&w, tick);
-        w_u32(&w, e->id);
-        w_u16(&w, e->owner);
-        w_u16(&w, 0u); /* reserved */
+        JceNetWBuf w = JCE_NET_WBUF_INIT;
+        jce_net_w_u8 (&w, JCE_REPL_PKT_OWNER_CHG);
+        jce_net_w_u32(&w, tick);
+        jce_net_w_u32(&w, e->id);
+        jce_net_w_u16(&w, e->owner);
+        jce_net_w_u16(&w, 0u); /* reserved */
         if (w.ok && w.size > 0) {
             jce_net_broadcast(g_repl.host, JCE_NET_REPL_CHANNEL,
                               w.buf, w.size, JCE_NET_RELIABLE);

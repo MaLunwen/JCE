@@ -22,7 +22,7 @@ typedef struct JcePakArchive  JcePakArchive;
 JCE_API JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path);
 
 /* Load a texture with explicit sampler flags (JCE_TEX_CLAMP/WRAP/MIRROR). */
-JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
+JCE_API JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
                                 int sampler_mode);
 
 /* Load a 3D colour-grading LUT from a horizontal PNG strip: N tiles of NxN
@@ -48,7 +48,7 @@ JCE_API JceTexture jce_texture_load_from_surface(const void *surface, int sample
 
 /* Load a texture from raw pixel data (RGBA8, top-left origin).
    Caller retains ownership of data. */
-JceTexture jce_texture_from_rgba(const void *data,
+JCE_API JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height);
 
 /* Create a GPU texture from a cooked .jceasset pixel payload, honoring the
@@ -115,19 +115,27 @@ JCE_API void jce_texture_cpu_free(JceTextureCpu *c);
 
 /* Update an existing RGBA8 texture in-place.
    Returns false when the handle is invalid, dimensions mismatch, or upload fails. */
-bool       jce_texture_update_rgba(JceTexture tex, const void *data,
+JCE_API bool       jce_texture_update_rgba(JceTexture tex, const void *data,
                                    uint32_t width, uint32_t height);
 
 /* Update an existing RGBA8 texture in-place (zero-copy variant).
    bgfx takes a reference to `data`; caller guarantees data remains valid
    until bgfx_frame() is called (end of the current render frame).
    Returns false when the handle is invalid or dimensions mismatch. */
-bool       jce_texture_update_rgba_ref(JceTexture tex, const void *data,
+JCE_API bool       jce_texture_update_rgba_ref(JceTexture tex, const void *data,
                                        uint32_t width, uint32_t height);
 JCE_API void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h);
 /* Source mip count (>=1) of a registry-loaded texture; 1 if not tracked. Used by
  * the texture-array batcher to build the albedo array with a matching mip chain. */
 JCE_API uint32_t   jce_texture_get_mips(JceTexture tex);
+/* bgfx texture format (bgfx_texture_format_t numeric) recorded at creation for a
+ * registry-tracked texture; UINT32_MAX when the handle is untracked.  Used by the
+ * texture-array batcher to refuse mixing formats: bgfx_blit between mismatched
+ * formats is ILLEGAL (on D3D12 an out-of-family CopyTextureRegion removes the
+ * device with DXGI_ERROR_INVALID_CALL; D3D11/GL/VK merely drop the copy), and
+ * cooked shipping albedos are block-compressed (BC7/ASTC) while the batcher's
+ * arrays are RGBA8. */
+JCE_API uint32_t   jce_texture_get_format(JceTexture tex);
 
 /* Destroy a texture. */
 JCE_API void       jce_texture_destroy(JceTexture tex);
@@ -195,6 +203,15 @@ JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
  */
 JCE_API void   jce_texture_set_global_mip_bias(int8_t bias);
 JCE_API int8_t jce_texture_get_global_mip_bias(void);
+
+/* Project Settings > Quality > Texture Quality: a BASE mip-drop (Full/Half/
+ * Quarter/Eighth -> 0/1/2/3) that stacks (max) with the streaming global bias
+ * so lower texture quality uses smaller resident mips. */
+JCE_API void   jce_texture_set_quality_mip_bias(int8_t bias);
+
+/* Project Settings > Graphics > Anisotropic Textures: <0 keeps the tier default
+ * (aniso on HIGH+ only); 0 forces anisotropic filtering OFF; >0 forces it ON. */
+JCE_API void   jce_texture_set_aniso_override(int mode);
 
 /*
  * Arm/disarm "streaming uploads".  While armed, NEW uncompressed-RGBA8 texture

@@ -61,7 +61,9 @@
 
 JCE_EXTERN_C_BEGIN
 
-typedef struct ecs_world_t ecs_world_t;
+/* The ECS world is passed as an opaque void* — the concrete flecs type
+ * (ecs_world_t) is a private implementation detail and must not appear in
+ * the public ABI.  Obtain the world from jce_scene_get_world(scene). */
 
 /* ------------------------------------------------------------------ *
  *  Steering agent component
@@ -120,8 +122,9 @@ typedef struct JcePathRequestEcs {
 
 typedef struct JceAiEcs JceAiEcs;
 
-/* `astar` may be NULL — tick_paths becomes a no-op. */
-JCE_API JceAiEcs *jce_ai_ecs_create(ecs_world_t *world, JceGraphAstar *astar);
+/* `world` is the opaque ECS world from jce_scene_get_world().
+ * `astar` may be NULL — tick_paths becomes a no-op. */
+JCE_API JceAiEcs *jce_ai_ecs_create(void *world, JceGraphAstar *astar);
 JCE_API void JCE_CALL jce_ai_ecs_destroy(JceAiEcs *a);
 
 /* ------------------------------------------------------------------ *

@@ -12,10 +12,26 @@
  *         Asset Picker modal (jce_dialog_asset_picker).
  *
  *   Return value: true if the buffer's contents changed THIS frame
- *   (either from typing or from a browse result that just landed).
+ *   (from typing, from a browse result that just landed, or from an
+ *   asset dropped onto the field).
  *
  *   The helper owns its own per-label static ready/cancel flags so
  *   callers do not have to wire up the async pump plumbing.
+ *
+ *   DRAG-DROP IS OWNED BY THIS WIDGET.  It installs the
+ *   JCE_DND_ASSET_PATH target on the text field itself and normalises
+ *   the dropped path (project-relative for AssetVfs, verbatim for the
+ *   *Abs kinds).  Call sites must NOT bolt an extra accept_asset_drop()
+ *   on afterwards: by then ImGui's "last item" is the trailing browse /
+ *   clear button, so the extra target lands on a button, duplicates the
+ *   handling, and mutates the buffer without the widget's return value
+ *   reporting the change.  There is deliberately no opt-out flag — every
+ *   path field in the editor should accept asset drops, and no call site
+ *   has ever wanted otherwise.
+ *
+ *   Call sites that need EXTRA work on drop (e.g. the MeshRenderer's
+ *   "dropping a model also imports its material") cannot express that
+ *   here yet — see the note in jce_path_input.cpp.
  */
 
 #ifndef JCE_PATH_INPUT_H
@@ -44,6 +60,20 @@ struct JcePathInputOpts {
     /* If true, the Browse button is drawn BEFORE InputText instead of
        after.  Default after. */
     bool button_first = false;
+
+    /* Optional: receives the RAW dropped path when this frame's edit came from
+       a drag-and-drop, and is left untouched otherwise (so test it for '\0').
+       The widget consumes the JCE_DND_ASSET_PATH payload itself, so a call
+       site that must react to a drop with more than "store the path" — e.g.
+       MeshRenderer importing a dropped model's materials, or reloading a
+       dropped .mat.json — cannot see the payload and, crucially, cannot get
+       the ABSOLUTE host path an importer needs (`buf` holds the relativized
+       form).  Point this at a scratch buffer to get it.
+       Do NOT add a second BeginDragDropTarget at the call site: by then
+       ImGui's last item is the trailing browse/clear button, so the target
+       lands on a button and the edit bypasses the widget's return value. */
+    char  *dropped_raw = nullptr;
+    size_t dropped_raw_size = 0;
 };
 
 /* Draws label + InputText + "..." Browse button.
@@ -71,6 +101,20 @@ inline bool jce_draw_path_input_save(const char *label, char *buf, size_t sz,
 inline bool jce_draw_path_input_asset(const char *label, char *buf, size_t sz,
                                       int asset_kind = 0) {
     JcePathInputOpts o; o.asset_kind = asset_kind;
+    return jce_draw_path_input(label, buf, sz, JcePathKind::AssetVfs, &o);
+}
+
+/* As above, but also reports the RAW (absolute) path when the edit came from a
+   drag-and-drop.  `dropped_raw` is left untouched otherwise, so zero it first
+   and test dropped_raw[0].  Use this when the drop must trigger more than
+   storing the path — see JcePathInputOpts::dropped_raw. */
+inline bool jce_draw_path_input_asset_dnd(const char *label, char *buf, size_t sz,
+                                          char *dropped_raw, size_t dropped_raw_sz,
+                                          int asset_kind = 0) {
+    JcePathInputOpts o;
+    o.asset_kind        = asset_kind;
+    o.dropped_raw       = dropped_raw;
+    o.dropped_raw_size  = dropped_raw_sz;
     return jce_draw_path_input(label, buf, sz, JcePathKind::AssetVfs, &o);
 }
 

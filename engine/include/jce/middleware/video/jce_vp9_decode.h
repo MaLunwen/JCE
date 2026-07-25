@@ -35,7 +35,7 @@ typedef struct JceVp9FrameInfo {
 JCE_API bool jce_vp9_is_ivf(const void *data, size_t size);
 
 /* Open an in-memory IVF/VP9 stream. The buffer must outlive the decoder. */
-JceVp9Decoder *jce_vp9_open_ivf_memory(const void *data, size_t size,
+JCE_API JceVp9Decoder *jce_vp9_open_ivf_memory(const void *data, size_t size,
                                        JceVp9FrameInfo *out_info);
 
 /* Open a raw decoder (no container) — caller feeds VP9 packets via
@@ -45,7 +45,7 @@ JCE_API JceVp9Decoder *jce_vp9_decoder_open(void);
 /* Decode the next IVF frame. Plane pointers point into libvpx-owned memory
  * and are valid until the next call. Returns false at EOF or on error.
  * Only valid when opened via jce_vp9_open_ivf_memory(). */
-bool jce_vp9_decode_next(JceVp9Decoder *dec,
+JCE_API bool jce_vp9_decode_next(JceVp9Decoder *dec,
                          const uint8_t **out_y, ptrdiff_t *out_y_stride,
                          const uint8_t **out_u, ptrdiff_t *out_uv_stride,
                          const uint8_t **out_v,
@@ -55,7 +55,7 @@ bool jce_vp9_decode_next(JceVp9Decoder *dec,
  * but driven by the caller (e.g. a WebM/MP4 demuxer). VP9 in MP4 stores
  * a single VP9 frame per sample as a raw bitstream (no NAL framing).
  * Returns false on error. */
-bool jce_vp9_decode_packet(JceVp9Decoder *dec,
+JCE_API bool jce_vp9_decode_packet(JceVp9Decoder *dec,
                            const void *packet, size_t packet_size,
                            const uint8_t **out_y, ptrdiff_t *out_y_stride,
                            const uint8_t **out_u, ptrdiff_t *out_uv_stride,

@@ -184,28 +184,51 @@ JCE_API void jce_asset_manager_destroy(JceAssetManager *mgr);
  *
  * Returns JCE_ASSET_HANDLE_INVALID on failure.
  */
-JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
+JCE_API JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
                                  const char *asset_path,
                                  JceAssetType type,
                                  const JceAssetLoadParams *params);
 
 /* Convenience: synchronous acquire with default params. */
-JceAssetHandle jce_asset_load(JceAssetManager *mgr,
+JCE_API JceAssetHandle jce_asset_load(JceAssetManager *mgr,
                               const char *asset_path,
                               JceAssetType type);
 
 /* Release an asset (decrement ref count; freed at zero). */
 JCE_API void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle);
 
-/* Force reload an asset (for hot-reload in editor). */
-JCE_API void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle);
+/* Force reload an asset (for hot-reload in editor).
+ *
+ * Returns the resulting state, which a file-watcher driving this MUST branch
+ * on — the outcomes need different responses and a plain success/failure flag
+ * cannot express them:
+ *
+ *   JCE_ASSET_STATE_READY     reloaded; the new payload is live.
+ *   JCE_ASSET_STATE_LOADING   DEFERRED, not failed — a load for this slot is
+ *                             already in flight.  Retry once it settles;
+ *                             treating this as failure abandons an asset that
+ *                             was merely busy.
+ *   JCE_ASSET_STATE_FAILED    the reload attempt failed AND THE PREVIOUS
+ *                             PAYLOAD IS STILL LIVE.  Nothing was lost, so a
+ *                             watcher should report and stop retrying rather
+ *                             than spin on a file that no longer parses.
+ *   JCE_ASSET_STATE_UNLOADED  invalid handle, or the slot has no source path
+ *                             (it was never loaded from one) — a caller bug;
+ *                             retrying cannot help.
+ *
+ * This reuses the asset domain's existing state vocabulary on purpose: the
+ * distinction that matters here is "busy vs broken vs bad-call", which a bool
+ * collapses, and a new bespoke enum would just add a 19th unrelated error
+ * type to the ABI (see docs/architecture/language-driver-abi.md §5). */
+JCE_API JceAssetState jce_asset_reload(JceAssetManager *mgr,
+                                       JceAssetHandle handle);
 
 /* ================================================================== */
 /* Query                                                               */
 /* ================================================================== */
 
 /* Get the current loading state of an asset. */
-JceAssetState jce_asset_state(const JceAssetManager *mgr,
+JCE_API JceAssetState jce_asset_state(const JceAssetManager *mgr,
                               JceAssetHandle handle);
 
 /* Is the asset fully ready for use? */
@@ -216,11 +239,11 @@ static inline bool jce_asset_ready(const JceAssetManager *mgr,
 }
 
 /* Get reference count (0 if invalid/freed). */
-uint32_t jce_asset_ref_count(const JceAssetManager *mgr,
+JCE_API uint32_t jce_asset_ref_count(const JceAssetManager *mgr,
                              JceAssetHandle handle);
 
 /* Get the asset type stored in a slot. */
-JceAssetType jce_asset_type(const JceAssetManager *mgr,
+JCE_API JceAssetType jce_asset_type(const JceAssetManager *mgr,
                             JceAssetHandle handle);
 
 /* Get total number of loaded assets. */
@@ -241,29 +264,29 @@ typedef struct JceModel        JceModel;
 typedef struct JceFont         JceFont;
 
 /* Texture: returns JCE_TEXTURE_INVALID if not a ready texture. */
-JceTexture jce_asset_get_texture(const JceAssetManager *mgr,
+JCE_API JceTexture jce_asset_get_texture(const JceAssetManager *mgr,
                                  JceAssetHandle handle);
 
 /* Mesh: returns NULL if not a ready mesh. */
-JceMesh *jce_asset_get_mesh(const JceAssetManager *mgr,
+JCE_API JceMesh *jce_asset_get_mesh(const JceAssetManager *mgr,
                             JceAssetHandle handle);
 
 /* Model: returns NULL if not a ready model. */
-JceModel *jce_asset_get_model(const JceAssetManager *mgr,
+JCE_API JceModel *jce_asset_get_model(const JceAssetManager *mgr,
                               JceAssetHandle handle);
 
 /* Sound handle — reuse existing audio type definition. */
 #include <jce/os/core/jce_asset_types.h>
 
-JceSound jce_asset_get_sound(const JceAssetManager *mgr,
+JCE_API JceSound jce_asset_get_sound(const JceAssetManager *mgr,
                              JceAssetHandle handle);
 
 /* Font: returns NULL if not a ready font. */
-JceFont *jce_asset_get_font(const JceAssetManager *mgr,
+JCE_API JceFont *jce_asset_get_font(const JceAssetManager *mgr,
                             JceAssetHandle handle);
 
 /* Raw blob: returns pointer and sets *out_size. NULL if not ready. */
-const void *jce_asset_get_raw(const JceAssetManager *mgr,
+JCE_API const void *jce_asset_get_raw(const JceAssetManager *mgr,
                               JceAssetHandle handle,
                               size_t *out_size);
 
@@ -282,7 +305,7 @@ const void *jce_asset_get_raw(const JceAssetManager *mgr,
  *
  * Returns number of assets finalized this frame.
  */
-uint32_t jce_asset_manager_update(JceAssetManager *mgr,
+JCE_API uint32_t jce_asset_manager_update(JceAssetManager *mgr,
                                   float max_finalize_ms);
 
 /* ================================================================== */
@@ -298,7 +321,7 @@ typedef struct JceAssetStats {
     uint64_t total_memory_bytes;  /* approximate */
 } JceAssetStats;
 
-void jce_asset_manager_stats(const JceAssetManager *mgr,
+JCE_API void jce_asset_manager_stats(const JceAssetManager *mgr,
                              JceAssetStats *out);
 
 /* ================================================================== */
@@ -360,7 +383,7 @@ typedef void (*jce_asset_destroy_fn)(void *data);
 
 /* Register a loader for a given asset type.
    Returns false if type is out of range or load_fn is NULL. */
-bool jce_asset_register_loader(JceAssetManager *mgr,
+JCE_API bool jce_asset_register_loader(JceAssetManager *mgr,
                                JceAssetType type,
                                jce_asset_load_fn load_fn,
                                jce_asset_destroy_fn destroy_fn);

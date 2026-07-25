@@ -286,7 +286,18 @@ bool jce_draw_path_input(const char *label,
     /* Drag-drop target: accept asset paths from the asset browser (and any
      * other source that publishes JCE_DND_ASSET_PATH).  For AssetVfs kind
      * we relativize against the project root so the saved value stays
-     * portable; for *Abs kinds we keep the dropped path verbatim. */
+     * portable; for *Abs kinds we keep the dropped path verbatim.
+     *
+     * This is the ONLY drop target for a path field — see the contract in
+     * jce_path_input.h; call sites must not add their own.
+     *
+     * A call site that must react to a drop with more than "store the path"
+     * (MeshRenderer importing a dropped model's materials, or reloading a
+     * dropped .mat.json) sets opts->dropped_raw and reads it after this
+     * returns: `buf` holds the relativized value, dropped_raw holds the
+     * ABSOLUTE host path an importer needs.  Adding a second drop target at
+     * the call site does NOT work — by then ImGui's last item is the trailing
+     * browse/clear button. */
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *pl =
                 ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
@@ -299,6 +310,8 @@ bool jce_draw_path_input(const char *label,
                 } else {
                     snprintf(buf, buf_size, "%s", src);
                 }
+                if (opts->dropped_raw && opts->dropped_raw_size)
+                    snprintf(opts->dropped_raw, opts->dropped_raw_size, "%s", src);
                 changed = true;
             }
         }

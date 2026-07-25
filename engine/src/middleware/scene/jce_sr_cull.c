@@ -170,12 +170,12 @@ void sr_ensure_ssao_target(JceSceneRenderer *sr, uint16_t w, uint16_t h,
         | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
         | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
     sr->ssao_normal_tex = bgfx_create_texture_2d(w, h, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL);
+        BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL, 0);
     sr->ssao_depth_tex = bgfx_create_texture_2d(w, h, false, 1,
-        sr->shadow_depth_fmt, rt_flags, NULL);
+        sr->shadow_depth_fmt, rt_flags, NULL, 0);
     if (want_velocity)
         sr->ssao_velocity_tex = bgfx_create_texture_2d(w, h, false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA16F, rt_flags, NULL);
+            BGFX_TEXTURE_FORMAT_RGBA16F, rt_flags, NULL, 0);
 
     bgfx_attachment_t at[3];
     memset(at, 0, sizeof(at));
@@ -1109,11 +1109,11 @@ typedef struct {
 /* Pass-A fast path: ecull-covered entities copy their cached world AABB
  * (mode 2); everything else is marked mode 3 for the serial resolve sweep
  * (shared model/mesh caches).  Pure reads + disjoint prep[i] writes. */
-static void sr_cull_prep_a_range(int begin, int end, void *user)
+static void sr_cull_prep_a_range(uint32_t begin, uint32_t end, void *user)
 {
     SrCullPrepACtx *c = (SrCullPrepACtx *)user;
     const SrEntityCull *ecull = c->sr->ecull;
-    for (int i = begin; i < end; i++) {
+    for (uint32_t i = begin; i < end; i++) {
         if (ecull && ecull[i].has_aabb) {
             c->prep[i].wmn  = ecull[i].wmin;
             c->prep[i].wmx  = ecull[i].wmax;
@@ -1133,10 +1133,10 @@ typedef struct {
 
 /* Transform entities [begin,end) local AABBs into world AABBs.  Writes
  * only aabbs[i]/visible[i] for i in range → safe to run in parallel. */
-static void sr_cull_xform_range(int begin, int end, void *user)
+static void sr_cull_xform_range(uint32_t begin, uint32_t end, void *user)
 {
     SrCullXformCtx *c = (SrCullXformCtx *)user;
-    for (int i = begin; i < end; i++) {
+    for (uint32_t i = begin; i < end; i++) {
         if (c->prep[i].mode == 0) {
             c->aabbs[i].min = c->aabbs[i].max = jce_v3(0, 0, 0);
             c->visible[i] = true;   /* no transform/model → always kept */
@@ -1329,10 +1329,10 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
                 const int i = (int)sr->cull_movers[k];
                 if (i >= list->count) { fast_ok = false; break; }
                 SrCullPrepACtx pa1 = { sr, list, prep };
-                sr_cull_prep_a_range(i, i + 1, &pa1);
+                sr_cull_prep_a_range((uint32_t)i, (uint32_t)i + 1u, &pa1);
                 if (prep[i].mode == 3) { fast_ok = false; break; }
                 SrCullXformCtx xc1 = { prep, aabbs, visible };
-                sr_cull_xform_range(i, i + 1, &xc1);
+                sr_cull_xform_range((uint32_t)i, (uint32_t)i + 1u, &xc1);
                 if (prep[i].mode != 0) {
                     const JceAABB *bw = &sr->cull_space_world;
                     if (aabbs[i].min.x < bw->min.x || aabbs[i].min.y < bw->min.y ||
@@ -1363,12 +1363,12 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
 
     {
         SrCullPrepACtx pa = { sr, list, prep };
-        JceJobSystem *pa_jobs = jce_jobs_default();
-        if (pa_jobs && list->count >= 4096)
-            jce_jobs_parallel_for(pa_jobs, list->count, 0,
-                                  sr_cull_prep_a_range, &pa);
+        JceThreadPool *pa_pool = jce_thread_pool_shared();
+        if (pa_pool && list->count >= 4096)
+            jce_thread_pool_parallel_for(pa_pool, (uint32_t)list->count, 0,
+                                         sr_cull_prep_a_range, &pa);
         else
-            sr_cull_prep_a_range(0, list->count, &pa);
+            sr_cull_prep_a_range(0u, (uint32_t)list->count, &pa);
     }
     for (int i = 0; i < list->count; i++) {
         if (prep[i].mode != 3) continue;   /* fast path already handled it */
@@ -1421,11 +1421,12 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     /* Pass B: transform corners → world AABBs.  Fan out when the entity
      * count justifies the dispatch overhead; otherwise run inline. */
     SrCullXformCtx xc = { prep, aabbs, visible };
-    JceJobSystem *jobs = jce_jobs_default();
-    if (jobs && list->count >= 256)
-        jce_jobs_parallel_for(jobs, list->count, 0, sr_cull_xform_range, &xc);
+    JceThreadPool *pool = jce_thread_pool_shared();
+    if (pool && list->count >= 256)
+        jce_thread_pool_parallel_for(pool, (uint32_t)list->count, 0,
+                                     sr_cull_xform_range, &xc);
     else
-        sr_cull_xform_range(0, list->count, &xc);
+        sr_cull_xform_range(0u, (uint32_t)list->count, &xc);
 
     /* Pass C (serial): reduce world bounds over the computed AABBs. */
     jce_vec3 wmin = { +FLT_MAX, +FLT_MAX, +FLT_MAX };

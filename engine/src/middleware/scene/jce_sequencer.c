@@ -6,6 +6,7 @@
 #include <jce/os/core/jce_easing.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
 #include "os/core/jce_memory.h"
 
@@ -51,16 +52,6 @@ struct JceSequencer {
     bool      playing;
     float     time;
 };
-
-static void copy_str(char *dst, size_t cap, const char *src)
-{
-    if (!dst || cap == 0) return;
-    if (!src) { dst[0] = 0; return; }
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
 
 /* Map an authored "ease" value (string id like "easeInOutQuad"/"QuadInOut",
  * or a raw int matching JceEaseType) onto a JceEaseType.  Unknown / absent →
@@ -150,7 +141,7 @@ static void parse_legacy_binding(SeqTrack *t)
     for (const char *d = s; d < p; ++d)
         id = id * 10u + (uint64_t)(*d - '0');
     t->bind_entity_hint = id;
-    copy_str(t->bind_prop, sizeof(t->bind_prop), p + 1);
+    jce_strlcpy(t->bind_prop, p + 1, sizeof(t->bind_prop));
 }
 
 static JceSequencer *load_root(JceJson *root)
@@ -170,18 +161,19 @@ static JceSequencer *load_root(JceJson *root)
         for (int i = 0; i < seq->track_count; ++i) {
             JceJson *o = jce_json_array_at(tarr, i);
             SeqTrack *t = &seq->tracks[i];
-            copy_str(t->name,    sizeof(t->name),
-                     jce_json_get_string(o, "name", "track"));
-            copy_str(t->binding, sizeof(t->binding),
-                     jce_json_get_string(o, "binding", ""));
+            jce_strlcpy(t->name,    jce_json_get_string(o, "name", "track"),
+                        sizeof(t->name));
+            jce_strlcpy(t->binding, jce_json_get_string(o, "binding", ""),
+                        sizeof(t->binding));
             t->type = jce_json_get_int(o, "type", JCE_SEQ_TRACK_PROPERTY);
             /* Structured binding keys (additive; absent in legacy files). */
-            copy_str(t->bind_prop, sizeof(t->bind_prop),
-                     jce_json_get_string(o, "bindProp", ""));
+            jce_strlcpy(t->bind_prop, jce_json_get_string(o, "bindProp", ""),
+                        sizeof(t->bind_prop));
             t->bind_entity_hint =
                 (uint64_t)jce_json_get_number(o, "bindEntity", 0.0);
-            copy_str(t->bind_entity_name, sizeof(t->bind_entity_name),
-                     jce_json_get_string(o, "bindEntityName", ""));
+            jce_strlcpy(t->bind_entity_name,
+                        jce_json_get_string(o, "bindEntityName", ""),
+                        sizeof(t->bind_entity_name));
             /* Legacy "<digits>/<prop>" binding → structured fields, only
              * when the additive keys did not already provide them. */
             if (!t->bind_prop[0] && t->bind_entity_hint == 0)
@@ -205,8 +197,8 @@ static JceSequencer *load_root(JceJson *root)
                     /* EVENT / CAMERA-CUT payload (ignored by property/color
                      * eval).  "name" doubles as the script handler for an EVENT
                      * key; "entity" (a.k.a. "camera") is the cut target. */
-                    copy_str(k->name, sizeof(k->name),
-                             jce_json_get_string(ko, "name", ""));
+                    jce_strlcpy(k->name, jce_json_get_string(ko, "name", ""),
+                                sizeof(k->name));
                     k->entity = (uint64_t)jce_json_get_number(ko, "entity", 0.0);
                     if (k->entity == 0)
                         k->entity =

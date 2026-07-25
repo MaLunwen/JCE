@@ -96,7 +96,12 @@ typedef void (*JceNetVarI32ChangedFn)(uint64_t entity,
  * call more than once (re-registration is idempotent).  REQUIRES a world
  * bound via jce_net_replication_set_world() first.  Call from production
  * init so a shipped build carries replicated components. */
-JCE_API void JCE_CALL jce_net_var_register_all(void);
+/* Returns false when the NetworkVariable components were NOT registered
+ * (no world bound — call jce_net_replication_set_world() first).  CHECK IT:
+ * on a miss every replicated float/int silently stops moving, and because
+ * the registration order also fixes the wire component ids, a peer that
+ * skipped it disagrees with one that did not. */
+JCE_API bool JCE_CALL jce_net_var_register_all(void);
 
 /* ================================================================== */
 /* Typed access (float)                                                */

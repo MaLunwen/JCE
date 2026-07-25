@@ -64,7 +64,18 @@ struct RmlBgfxVertex {
     float    u, v;
 };
 
-static inline uint32_t rml_colour_to_abgr(const Rml::Colourb &c)
+/* Heap-allocated storage backing a compiled-geometry handle. RmlUi 6.x moved
+   geometry to the compiled model (CompileGeometry/RenderGeometry/ReleaseGeometry),
+   so we keep a private COPY of the vertices/indices and rebuild bgfx transient
+   buffers from it each time RenderGeometry is called. */
+struct JceRmlCompiledGeometry {
+    std::vector<Rml::Vertex> vertices;
+    std::vector<int>         indices;
+};
+
+/* RmlUi 6.x switched vertex colours to premultiplied alpha
+   (Rml::ColourbPremultiplied). The RGBA byte layout is unchanged. */
+static inline uint32_t rml_colour_to_abgr(const Rml::ColourbPremultiplied &c)
 {
     return ((uint32_t)c.alpha << 24) | ((uint32_t)c.blue << 16)
          | ((uint32_t)c.green << 8)  |  (uint32_t)c.red;
@@ -220,14 +231,33 @@ public:
             jce_texture_destroy(tex);
     }
 
-    /* ── Immediate geometry (transient buffers) ────────────────────── */
+    /* ── Compiled geometry (RmlUi 6.x) ─────────────────────────────── */
 
-    void RenderGeometry(Rml::Vertex *vertices, int num_vertices,
-                        int *indices, int num_indices,
-                        Rml::TextureHandle texture,
-                        const Rml::Vector2f &translation) override
+    Rml::CompiledGeometryHandle CompileGeometry(
+        Rml::Span<const Rml::Vertex> vertices,
+        Rml::Span<const int> indices) override
     {
-        if (!renderer_ || num_vertices <= 0 || num_indices <= 0) return;
+        auto *geo = jce_cxx_new<JceRmlCompiledGeometry>();
+        if (!geo) return 0;
+        /* Store a COPY: the spans are only valid for the duration of the call. */
+        geo->vertices.assign(vertices.data(), vertices.data() + vertices.size());
+        geo->indices.assign(indices.data(), indices.data() + indices.size());
+        return reinterpret_cast<Rml::CompiledGeometryHandle>(geo);
+    }
+
+    void RenderGeometry(Rml::CompiledGeometryHandle geometry,
+                        Rml::Vector2f translation,
+                        Rml::TextureHandle texture) override
+    {
+        auto *geo = reinterpret_cast<JceRmlCompiledGeometry *>(geometry);
+        if (!renderer_ || !geo) return;
+
+        const int num_vertices = (int)geo->vertices.size();
+        const int num_indices  = (int)geo->indices.size();
+        if (num_vertices <= 0 || num_indices <= 0) return;
+
+        const Rml::Vertex *vertices = geo->vertices.data();
+        const int         *indices  = geo->indices.data();
 
         bool textured = (texture != 0);
         const bgfx_vertex_layout_t *layout = textured
@@ -290,11 +320,12 @@ public:
             bgfx_set_texture(0, sampler, bgfx_tex, UINT32_MAX);
         }
 
-          /* RmlUi font atlases are generated as transparent white with glyph
-              coverage in alpha. Use standard alpha blending so fully transparent
-              atlas texels do not render as solid white rectangles. */
-          uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                              | BGFX_STATE_BLEND_ALPHA;
+        /* RmlUi 6.x vertex colours are premultiplied alpha, so blend with
+           (ONE, INV_SRC_ALPHA) instead of straight alpha. Fully transparent
+           font-atlas texels then contribute nothing rather than solid white. */
+        uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                       | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
+                                               BGFX_STATE_BLEND_INV_SRC_ALPHA);
 
         if (scissor_enabled_)
             bgfx_set_scissor(scissor_x_, scissor_y_,
@@ -304,6 +335,12 @@ public:
         bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
     }
 
+    void ReleaseGeometry(Rml::CompiledGeometryHandle geometry) override
+    {
+        auto *geo = reinterpret_cast<JceRmlCompiledGeometry *>(geometry);
+        jce_cxx_delete(geo);
+    }
+
     /* ── Scissor ──────────────────────────────────────────────────── */
 
     void EnableScissorRegion(bool enable) override
@@ -311,8 +348,12 @@ public:
         scissor_enabled_ = enable;
     }
 
-    void SetScissorRegion(int x, int y, int width, int height) override
+    void SetScissorRegion(Rml::Rectanglei region) override
     {
+        const int x      = region.Left();
+        const int y      = region.Top();
+        const int width  = region.Width();
+        const int height = region.Height();
         scissor_x_ = (uint16_t)(x > 0 ? x : 0);
         scissor_y_ = (uint16_t)(y > 0 ? y : 0);
         scissor_w_ = (uint16_t)(width  > 0 ? width  : 0);
@@ -321,45 +362,45 @@ public:
 
     /* ── Textures ─────────────────────────────────────────────────── */
 
-    bool LoadTexture(Rml::TextureHandle &texture_handle,
-                     Rml::Vector2i &texture_dimensions,
-                     const Rml::String &source) override
+    Rml::TextureHandle LoadTexture(Rml::Vector2i &texture_dimensions,
+                                   const Rml::String &source) override
     {
         /* RmlUI calls this for <img src="..."> in documents.
-           We load from PAK via the engine's texture loader. */
-        if (!pak_) return false;
+           We load from PAK via the engine's texture loader.
+           RmlUi 6.x returns the handle (0 on failure) rather than an out-param. */
+        if (!pak_) return 0;
 
         JceTexture tex = jce_texture_load(pak_, source.c_str());
         if (!jce_texture_valid(tex)) {
             LOG_WARN(LOG_TAG, "LoadTexture failed: %s", source.c_str());
-            return false;
+            return 0;
         }
 
         uint32_t w = 0, h = 0;
         jce_texture_get_size(tex, &w, &h);
-        texture_handle = (Rml::TextureHandle)tex.idx;
         texture_dimensions = Rml::Vector2i((int)w, (int)h);
 
         generated_textures_.push_back(tex);
-        return true;
+        return (Rml::TextureHandle)tex.idx;
     }
 
-    bool GenerateTexture(Rml::TextureHandle &texture_handle,
-                         const Rml::byte *source,
-                         const Rml::Vector2i &source_dimensions) override
+    Rml::TextureHandle GenerateTexture(Rml::Span<const Rml::byte> source,
+                                       Rml::Vector2i source_dimensions) override
     {
           /* RmlUi generated textures are premultiplied RGBA. bgfx uses linear
               filtering by default when the point-sampler flags are omitted,
-              which keeps UI text from looking blocky at non-integer scale. */
-        if (!source || source_dimensions.x <= 0 || source_dimensions.y <= 0)
-            return false;
+              which keeps UI text from looking blocky at non-integer scale.
+              RmlUi 6.x passes the pixels as a Span and returns the handle. */
+        if (!source.data() || source.empty()
+            || source_dimensions.x <= 0 || source_dimensions.y <= 0)
+            return 0;
 
         const uint32_t width = (uint32_t)source_dimensions.x;
         const uint32_t height = (uint32_t)source_dimensions.y;
         LOG_INFO(LOG_TAG, "GenerateTexture %ux%u", width, height);
         const bgfx_memory_t *mem = bgfx_alloc(width * height * 4);
-        if (!mem) { LOG_ERROR(LOG_TAG, "bgfx_alloc failed for %ux%u", width, height); return false; }
-        memcpy(mem->data, source, width * height * 4);
+        if (!mem) { LOG_ERROR(LOG_TAG, "bgfx_alloc failed for %ux%u", width, height); return 0; }
+        memcpy(mem->data, source.data(), width * height * 4);
 
         bgfx_texture_handle_t handle = bgfx_create_texture_2d(
             (uint16_t)width, (uint16_t)height,
@@ -368,18 +409,17 @@ public:
             BGFX_TEXTURE_NONE
                 | BGFX_SAMPLER_U_CLAMP
                 | BGFX_SAMPLER_V_CLAMP,
-            mem);
+            mem, 0);
 
         if (handle.idx == UINT16_MAX)
-            return false;
+            return 0;
 
         JceTexture tex;
         tex.idx = handle.idx;
-        if (!jce_texture_valid(tex)) return false;
+        if (!jce_texture_valid(tex)) return 0;
 
-        texture_handle = (Rml::TextureHandle)tex.idx;
         generated_textures_.push_back(tex);
-        return true;
+        return (Rml::TextureHandle)tex.idx;
     }
 
     void ReleaseTexture(Rml::TextureHandle texture) override
@@ -836,8 +876,10 @@ bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
                 dot != std::string::npos ? dot : std::string::npos);
     }
 
+    /* RmlUi 6.x: font data is passed as a Span<const byte>. */
     bool ok = Rml::LoadFontFace(
-        reinterpret_cast<const Rml::byte *>(data), (int)sz,
+        Rml::Span<const Rml::byte>(
+            reinterpret_cast<const Rml::byte *>(data), (size_t)sz),
         family, Rml::Style::FontStyle::Normal,
         Rml::Style::FontWeight::Normal, false);
 

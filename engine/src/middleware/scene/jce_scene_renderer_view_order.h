@@ -25,6 +25,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_gpu_particle_view,
                                          bool include_gpu_cull_view,
                                          bool include_point_cube_views,
+                                         bool include_dyn_csm_views,
                                          JceSceneRendererViewOrder *out);
 
 #endif /* JCE_SCENE_RENDERER_VIEW_ORDER_H */

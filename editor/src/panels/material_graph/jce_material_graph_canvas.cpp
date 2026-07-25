@@ -8,6 +8,7 @@
 
 #include "core/jce_editor_i18n.h"
 #include "core/jce_hotkeys.h"
+#include "panels/jce_panel_node_canvas.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui_internal.h>
@@ -174,14 +175,10 @@ void draw_canvas(void)
 
     /* Grid. */
     const float grid = 32.0f;
-    for (float x = fmodf(s_g.scroll.x, grid); x < canvas_sz.x; x += grid)
-        dl->AddLine(ImVec2(canvas_p0.x + x, canvas_p0.y),
-                    ImVec2(canvas_p0.x + x, canvas_p1.y),
-                    jce_theme::grid_minor());
-    for (float y = fmodf(s_g.scroll.y, grid); y < canvas_sz.y; y += grid)
-        dl->AddLine(ImVec2(canvas_p0.x, canvas_p0.y + y),
-                    ImVec2(canvas_p1.x, canvas_p0.y + y),
-                    jce_theme::grid_minor());
+    jce_node_canvas_draw_grid(dl, canvas_p0, canvas_sz, grid,
+                              ImVec2(fmodf(s_g.scroll.x, grid),
+                                     fmodf(s_g.scroll.y, grid)),
+                              jce_theme::grid_minor());
 
     ImGui::InvisibleButton("canvas", canvas_sz,
                            ImGuiButtonFlags_MouseButtonLeft |
@@ -253,11 +250,9 @@ void draw_canvas(void)
         ImVec2 asize(170.0f, 0.0f), bsize(170.0f, 0.0f);
         ImVec2 p0 = socket_screen_pos(atl, asize, l.from_sock, SK_OUTPUT);
         ImVec2 p1 = socket_screen_pos(btl, bsize, l.to_sock,   SK_INPUT);
-        ImVec2 c1 = ImVec2(p0.x + 50.0f, p0.y);
-        ImVec2 c2 = ImVec2(p1.x - 50.0f, p1.y);
         ImU32 col = (as[l.from_sock].dtype == DT_COLOR)
             ? IM_COL32(220, 200, 80, 255) : IM_COL32(120, 220, 200, 255);
-        dl->AddBezierCubic(p0, c1, c2, p1, col, 2.5f);
+        jce_node_canvas_draw_link(dl, p0, p1, 50.0f, col, 2.5f);
         (void)bs;
     }
 
@@ -296,10 +291,8 @@ void draw_canvas(void)
             ImVec2 p0  = socket_screen_pos(atl, ImVec2(170, 0),
                                            s_g.pending_from_sock, SK_OUTPUT);
             ImVec2 mp  = ImGui::GetIO().MousePos;
-            dl->AddBezierCubic(p0,
-                               ImVec2(p0.x + 50.0f, p0.y),
-                               ImVec2(mp.x - 50.0f, mp.y), mp,
-                               jce_theme::col_from(ImGuiCol_Text, 0.8f), 2.0f);
+            jce_node_canvas_draw_link(dl, p0, mp, 50.0f,
+                                      jce_theme::col_from(ImGuiCol_Text, 0.8f), 2.0f);
             if (ImGui::IsMouseClicked(1)) s_g.pending_from_node = -1;
         }
     }

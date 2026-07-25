@@ -347,9 +347,9 @@ bool jce_impostor_bake_submit(const JceImpostorBakeDesc *desc)
 
     g_bake.color = bgfx_create_texture_2d((uint16_t)apx, (uint16_t)apx, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     g_bake.depth = bgfx_create_texture_2d((uint16_t)apx, (uint16_t)apx, false, 1,
-        BGFX_TEXTURE_FORMAT_D24S8, BGFX_TEXTURE_RT, NULL);
+        BGFX_TEXTURE_FORMAT_D24S8, BGFX_TEXTURE_RT, NULL, 0);
     if (!BGFX_HANDLE_IS_VALID(g_bake.color) || !BGFX_HANDLE_IS_VALID(g_bake.depth)) {
         LOG_ERROR(LOG_TAG, "bake: atlas RT alloc failed (%dx%d)", apx, apx);
         if (BGFX_HANDLE_IS_VALID(g_bake.color)) bgfx_destroy_texture(g_bake.color);
@@ -375,7 +375,7 @@ bool jce_impostor_bake_submit(const JceImpostorBakeDesc *desc)
     g_bake.staging = bgfx_create_texture_2d((uint16_t)apx, (uint16_t)apx, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
-        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     if (!BGFX_HANDLE_IS_VALID(g_bake.staging)) {
         LOG_ERROR(LOG_TAG, "bake: staging readback texture alloc failed");
         bake_destroy_fbo();
@@ -473,7 +473,7 @@ static void bake_render_views(void)
     bgfx_blit(blit_view, g_bake.staging, 0, 0, 0, 0,
               g_bake.color, 0, 0, 0, 0,
               (uint16_t)g_bake.atlas_px, (uint16_t)g_bake.atlas_px, 1);
-    g_bake.ready_frame = bgfx_read_texture(g_bake.staging, g_bake.pixels, 0);
+    g_bake.ready_frame = bgfx_read_texture(g_bake.staging, g_bake.pixels, 0, 0);
     g_bake.blit_done = true;
 }
 

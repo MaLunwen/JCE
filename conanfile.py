@@ -22,10 +22,22 @@ class JCEConan(ConanFile):
     # NOTE: legal-/packaging-sensitive switches (JCE_BUILD_JNI,
     # JCE_ENABLE_PATENTED_CODECS) are intentionally NOT exposed here.
     # They are CMake-only and must be set with -D at configure time:
-    #   cmake -DJCE_ENABLE_PATENTED_CODECS=ON   (default OFF)
+    #   cmake -DJCE_ENABLE_PATENTED_CODECS=OFF  (default ON; forced OFF
+    #                                            for the dist variant and
+    #                                            for Web — see the root
+    #                                            CMakeLists derivation)
     #   cmake -DJCE_BUILD_JNI=ON                (default OFF)
-    # Keeping them out of Conan options ensures `conan install .` is
-    # legally neutral: it never silently enables AAC/H.264/H.265.
+    #
+    # The line above used to say the codec option defaults OFF.  It does
+    # not: engine/CMakeLists.txt declares it ON, deliberately, because the
+    # editor needs AAC/H.264/H.265 to import legacy assets.  A comment that
+    # understates what a build produces is worse than none on a
+    # licensing-sensitive switch, so it now states the real default and
+    # where it is overridden.
+    # Keeping them out of Conan options still means `conan install .`
+    # itself pulls no patent-encumbered dependency — the vendored codec
+    # sources are not Conan packages.  It does NOT mean a subsequent
+    # cmake configure leaves them off; that is the option default above.
     default_options = {
         "bgfx/*:tools": True,
         # Build Bullet thread-safe (BULLET2_MULTITHREADING -> the Mt solver
@@ -42,6 +54,45 @@ class JCEConan(ConanFile):
         # when no profiler is attached — an unbounded leak (~20 MB/s in Play,
         # reaching multiple GB over a session).
         "tracy/*:on_demand": True,
+        # ── Keep the dependency closure free of copyleft ────────────────
+        # The SDK merges every static dependency into one redistributable fat
+        # lib (engine/cmake/JCESDKInstall.cmake), so anything that lands in the
+        # graph lands in what consumers ship. These three defaults each pulled
+        # in a subtree that NO first-party code uses:
+        #
+        #   harfbuzz:with_glib   -> glib + libiconv + gettext(intl) + pcre2 +
+        #                           libffi. glib/iconv/intl are LGPL-2.1+, and
+        #                           statically merging them puts a relinking
+        #                           obligation on every SDK consumer. Nothing
+        #                           here calls a glib API or hb_glib_*; with it
+        #                           off, HarfBuzz uses its built-in UCDN
+        #                           Unicode functions and JCE shapes through
+        #                           FreeType exactly as before.
+        #   enable_groot_interface -> cppzmq + ZeroMQ, for the Groot2 debugger.
+        #                           No BT publisher exists in this tree. (ZeroMQ
+        #                           is MPL-2.0, not LGPL as the audit first
+        #                           recorded — dropped for closure size and to
+        #                           stop shipping a network stack nothing uses.)
+        #   enable_sqlite_logging  -> sqlite3, for BT SQLite logging. No
+        #                           SqliteLogger anywhere in the tree.
+        #
+        # Turning any of these back on is a licensing decision, not just a
+        # feature toggle — see docs/audits/dependency-and-language-audit.md.
+        "harfbuzz/*:with_glib": False,
+        "behaviortree.cpp/*:enable_groot_interface": False,
+        "behaviortree.cpp/*:enable_sqlite_logging": False,
+        # libtiff's LZMA codec is the ONLY thing pulling xz_utils into the host
+        # graph (sdl_image -> libtiff -> xz_utils). The xz package is
+        # multi-licensed and its recipe declares GPL-2.0+/GPL-3.0+/LGPL-2.1+
+        # alongside Unlicense; rather than argue over which sub-license covers
+        # the part we would link, drop it. TIFF itself still loads — only the
+        # rare COMPRESSION_LZMA (tag 34925) variant is unsupported.
+        #
+        # NOTE: strawberryperl (Artistic-1.0/GPL-1.0) is still in the graph for
+        # libaom-av1 and nasm, but it is a BUILD-CONTEXT tool that runs on the
+        # build machine and is never linked or redistributed, so it carries no
+        # distribution obligation.
+        "libtiff/*:lzma": False,
     }
 
     def configure(self):
@@ -74,10 +125,10 @@ class JCEConan(ConanFile):
         self.requires("sdl/3.4.0")
         self.requires("sdl_image/3.4.0")
 
-        self.requires("bgfx/1.129.8930-495")
+        self.requires("bgfx/1.146.9306-550")
 
         self.requires("harfbuzz/12.3.0")
-        self.requires("freetype/2.13.2", force=True)
+        self.requires("freetype/2.14.3", force=True)
 
         self.requires("miniaudio/0.11.22")
         self.requires("opus/1.5.2")
@@ -87,40 +138,34 @@ class JCEConan(ConanFile):
         self.requires("libwebm/1.0.0.31")
 
         self.requires("imgui/1.92.6-docking")
-        self.requires("flecs/4.1.1")
+        self.requires("flecs/4.1.5")
         self.requires("cjson/1.7.19")
-        # ai_dispatch T1 HTTPS transport (owner-approved 2026-07-17).  On
-        # Windows TLS rides the native schannel stack (no OpenSSL pull);
-        # elsewhere the recipe default (openssl) applies.
-        self.requires("libcurl/8.21.0")
+
         self.requires("assimp/6.0.2")
         self.requires("cgltf/1.15")
         self.requires("meshoptimizer/1.0")
+        self.requires("v-hacd/4.1.0")
 
         self.requires("ozz-animation/0.14.1")
         self.requires("behaviortree.cpp/4.9.0")
+        self.requires("recastnavigation/1.6.0")
 
-        # Gameplay scripting VM (Phase 0 keystone). Plain Lua 5.4 (not LuaJIT)
-        # for full cross-platform/arch portability — wasm, iOS (no-JIT) and
-        # arm targets need an interpreter, not a JIT.
+        self.requires("box2d/3.1.1")
+        self.requires("bullet3/3.25")
+
         self.requires("lua/5.4.8")
+        self.requires("rmlui/6.2")
 
         self.requires("physfs/3.2.0")
         self.requires("zstd/1.5.7")
         self.requires("xxhash/0.8.3")
 
-        self.requires("mimalloc/2.2.4")
+        self.requires("mimalloc/3.3.2")
         self.requires("enkits/1.11")
 
-        self.requires("box2d/3.1.1")
-        self.requires("bullet3/3.25")
-        self.requires("v-hacd/4.1.0")
-        self.requires("recastnavigation/1.6.0")
-
-        self.requires("rmlui/4.4")
-
+        self.requires("libcurl/8.21.0")
         self.requires("enet/1.3.18")
-        self.requires("protobuf/6.33.5")
+        self.requires("protobuf/7.35.0")
 
         self.requires("tracy/0.13.1")
 
@@ -128,6 +173,14 @@ class JCEConan(ConanFile):
         if self.settings.os == "Linux":
             # bgfx pins wayland/1.23.92 while SDL & others pull 1.24.0
             self.requires("wayland/1.24.0", override=True)
+
+    def build_requirements(self):
+        # protobuf_generate() executes protoc on the build machine.  A target
+        # protoc from a WASM/Android/iOS package cannot run there, while an
+        # unrelated system protoc may generate code incompatible with the
+        # target headers.  Conan's <host_version> token keeps both graph
+        # contexts on the exact same protobuf recipe revision and version.
+        self.tool_requires("protobuf/<host_version>")
 
     def layout(self):
         cmake_layout(self)
@@ -146,6 +199,27 @@ class JCEConan(ConanFile):
                                 comp.frameworks.remove(fw)
 
         deps = CMakeDeps(self)
+        # Emit a separately named CMake package for the native protoc supplied
+        # by build_requirements().  The target-context protobuf package remains
+        # authoritative for headers and libraries.
+        deps.build_context_activated = ["protobuf"]
+        deps.build_context_suffix = {"protobuf": "_BUILD"}
+        # The protobuf recipe assigns absolute CMake names to its components.
+        # CMakeDeps cannot suffix those automatically, so make the build graph
+        # collision-free explicitly.  We only execute protoc from this context;
+        # none of these host libraries may enter a target link interface.
+        for component in (
+            "utf8_range",
+            "utf8_validity",
+            "libprotobuf",
+            "libprotoc",
+        ):
+            deps.set_property(
+                f"protobuf::{component}",
+                "cmake_target_name",
+                f"protobuf_BUILD::{component}_BUILD",
+                build_context=True,
+            )
         deps.generate()
         tc = CMakeToolchain(self)
         # JCE_BUILD_JNI and JCE_ENABLE_PATENTED_CODECS are intentionally

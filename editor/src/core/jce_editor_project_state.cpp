@@ -35,11 +35,24 @@ extern "C" {
 #define PSTATE_STR_MAX    512
 #define PSTATE_SCENE_LRU  24
 
-/* Open-project root — owned by dialog_project.cpp (same explicit-root
- * pattern as jce_project_settings / jce_pak_key).  Declared at global
- * scope: inside the anonymous namespace the extern would acquire internal
- * linkage and never bind to the definition. */
-extern char s_current_project_root[512];
+/* Open-project root — OWNED HERE (this module has to follow the root
+ * anyway, so the storage lives next to the code that watches it).  Reach
+ * it through jce_editor_current_project_root() / _set() below; the same
+ * explicit-root pattern as jce_project_settings / jce_pak_key.
+ *
+ * TRANSITIONAL: the `s_`-prefixed name and the external linkage are kept
+ * on purpose — a dozen editor translation units still bind to this
+ * symbol through a hand-written `extern char s_current_project_root[512]`
+ * — one in dialogs/jce_editor_dialogs_internal.h, the rest re-declared
+ * locally in build_manager, editor_build_profile, editor_play,
+ * run_manager, scene_serial, editor_layout, dialog_welcome and the
+ * benchmark / audio_mixer / input_manager / package_manager /
+ * build_profiles panels.  Once those are migrated to the accessors this
+ * becomes `static`, at which point it
+ * stops being shared mutable state with no owner.  Defined at global
+ * scope: inside the anonymous namespace it would acquire internal
+ * linkage and those externs would not bind. */
+char s_current_project_root[512] = {0};
 
 namespace {
 
@@ -298,6 +311,21 @@ void mark_dirty(void) { s_dirty = true; s_quiet = 0.0f; }
 /* ── Public API ─────────────────────────────────────────────────────── */
 
 extern "C" {
+
+const char *jce_editor_current_project_root(void)
+{
+    return s_current_project_root;
+}
+
+void jce_editor_current_project_root_set(const char *root)
+{
+    /* Same truncation as the snprintf this replaced in dialog_project.cpp;
+     * NULL / "" both mean "no project open".  The store itself follows
+     * lazily via ensure_root() — do not flush from here, the caller
+     * (set_current_project_root) snapshots the outgoing project first. */
+    snprintf(s_current_project_root, sizeof(s_current_project_root),
+             "%s", root ? root : "");
+}
 
 bool jce_editor_pstate_active(void) { ensure_root(); return s_root[0] != '\0'; }
 

@@ -12,8 +12,10 @@
  * at the bottom of this file (see jce_editor_panel_bundle_browser_*).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
+#include "core/jce_assetdb.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_pak_key.h"
@@ -109,16 +111,6 @@ struct BrowseState {
     uint64_t                 total_bytes        = 0;
 };
 BrowseState g_br;
-
-const char *fmt_size(uint64_t b, char *out, size_t n)
-{
-    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
-    double v = (double)b;
-    int k = 0;
-    while (v >= 1024.0 && k < 4) { v /= 1024.0; ++k; }
-    snprintf(out, n, "%.2f %s", v, u[k]);
-    return out;
-}
 
 void browse_init_default_path()
 {
@@ -352,7 +344,7 @@ void draw_browse_tab()
             ImGui::PopID();
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(fmt_size(r.size_bytes, sb, sizeof(sb)));
+            ImGui::TextUnformatted(jce_panel_fmt_size(r.size_bytes, sb, sizeof(sb)));
             ImGui::TableSetColumnIndex(2);
             if (r.has_entries) ImGui::Text("%u", r.entries);
             else               ImGui::TextDisabled("-");
@@ -386,7 +378,7 @@ void draw_browse_tab()
 
     ImGui::Separator();
     char sb[32];
-    fmt_size(g_br.total_bytes, sb, sizeof(sb));
+    jce_panel_fmt_size(g_br.total_bytes, sb, sizeof(sb));
     ImGui::Text(jce_editor_i18n("panel.bundle_browser.status.total"),
                 (int)g_br.rows.size(), sb);
 }
@@ -525,7 +517,21 @@ bool editor_pack_resolve(const char *vpath, char *out, size_t outsz,
                          void * /*user*/)
 {
     if (!vpath || !out || outsz == 0) return false;
-    return jce_asset_path_index_lookup(vpath, out, (int)outsz);
+    if (jce_asset_path_index_lookup(vpath, out, (int)outsz))
+        return true;
+    /* Fallback: resolve vpath directly under the project asset root.  The
+     * basename index only holds assets the project walk discovered; a loose
+     * file declared solely in bundle_roots.json (a font/audio referenced only
+     * at runtime by C or Lua, so it is in no scanned component field) may not
+     * be indexed, yet it must still pack.  A direct on-disk check makes any
+     * declared, existing asset resolvable so the bundle is complete. */
+    const char *root = jce_assetdb_get_root();
+    if (root && root[0]) {
+        snprintf(out, outsz, "%s/%s", root, vpath);
+        if (jce_fs_host_exists_file(out))
+            return true;
+    }
+    return false;
 }
 
 void worker_log_sink(JceBundlePackLogLevel level, const char *msg, void *user)
@@ -562,7 +568,11 @@ void bundle_pack_worker_main(void * /*user*/)
 {
     JceBundlePackOptions opts{};
     const bool selected_or_single = gb.mode_owned == 1 || gb.mode_owned == 2;
-    opts.project_root     = (selected_or_single || gb.project_root_owned.empty())
+    /* Pass project_root even in single-file / selected mode so the packer can
+     * derive the ASSET root (<project>/resources/assets) for resolving
+     * bundle_roots deps (fonts/audio); scenes_dir + out_dir still come from the
+     * explicit scene files, so single-file semantics are unchanged. */
+    opts.project_root     = gb.project_root_owned.empty()
                                 ? nullptr : gb.project_root_owned.c_str();
     opts.scenes_dir       = (selected_or_single || gb.scenes_dir_owned.empty())
                                 ? nullptr : gb.scenes_dir_owned.c_str();

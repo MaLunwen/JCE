@@ -3,6 +3,7 @@
  */
 
 #include "jce_gpu_caps.h"
+#include "jce_gpu_vendor.h"
 
 #include <jce/os/core/jce_log.h>
 
@@ -10,19 +11,6 @@
 #include <string.h>
 
 #define LOG_TAG "jce_gpu_caps"
-
-static const char *vendor_string(uint16_t id)
-{
-    switch (id) {
-    case 0x1002: return "AMD";
-    case 0x10DE: return "NVIDIA";
-    case 0x8086: return "Intel";
-    case 0x13B5: return "ARM";
-    case 0x106B: return "Apple";
-    case 0x5143: return "Qualcomm";
-    default:     return "Unknown";
-    }
-}
 
 void jce_gpu_caps_init(JceGpuCaps *caps)
 {
@@ -34,7 +22,7 @@ void jce_gpu_caps_init(JceGpuCaps *caps)
 
     /* Vendor / device. */
     caps->vendor_id     = bc->vendorId;
-    caps->vendor_name   = vendor_string(bc->vendorId);
+    caps->vendor_name   = jce_gpu_vendor_name(bc->vendorId);
     caps->renderer_name = bgfx_get_renderer_name(bgfx_get_renderer_type());
     caps->homogeneous_ndc = bc->homogeneousDepth;
 

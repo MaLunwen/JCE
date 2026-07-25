@@ -11,9 +11,9 @@
  *   - Synchronous acquire() loads inline (serialised by io_lock for the shared
  *     decode context) and caches the result.
  *   - Asynchronous request()/poll()/tick(): with workers, each load runs as a
- *     jce_jobs task that pushes its result onto a done queue drained by tick();
- *     without workers, request() queues the load and tick() services the queue
- *     within frame_budget_ms.
+ *     task on the process-wide shared pool that pushes its result onto a done
+ *     queue drained by tick(); without workers, request() queues the load and
+ *     tick() services the queue within frame_budget_ms.
  *
  * Concurrency: `lock` guards all cache/table/queue/counter state; `io_lock`
  * serialises jce_archive_read (shared zstd DCtx).  Workers never touch the
@@ -23,7 +23,6 @@
 
 #include <jce/resource/jce_archive_loader.h>
 
-#include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
@@ -86,7 +85,8 @@ struct JceArchiveLoader {
     JceArchiveRequestId next_id;
 
     /* async plumbing */
-    JceJobSystem *jobs;         /* NULL on the inline path                   */
+    int           async;        /* 1 = dispatch to `pool`                    */
+    JceThreadPool *pool;        /* private, owned; see create() for why      */
     JceMutex     *lock;         /* guards table/queues/counters              */
     JceMutex     *io_lock;      /* serialises archive reads (shared DCtx)    */
 
@@ -275,6 +275,16 @@ static void job_worker(void *arg)
     jce_mutex_unlock(l->lock);
 }
 
+/* Hand `j` to the loader's own pool, or run it here if there is none or the
+ * submit failed.  Never called with `lock` held — job_worker takes it.
+ * Dropping the job instead is not an option: `inflight` would never fall back
+ * to 0 and destroy() would hang. */
+static void dispatch_or_run(JceArchiveLoader *l, Job *j)
+{
+    if (!l->pool || !jce_thread_pool_submit(l->pool, job_worker, j))
+        job_worker(j);
+}
+
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
 /* Look up the index entry and create a LOADING placeholder + Job.  Returns the
@@ -343,8 +353,23 @@ JceArchiveLoader *jce_archive_loader_create(JceArchive *archive,
     }
 
     if (l->worker_count > 0) {
-        l->jobs = jce_jobs_create((int)l->worker_count);
-        if (!l->jobs) {
+        /* A PRIVATE pool, deliberately not jce_thread_pool_shared().
+         *
+         * This briefly borrowed the shared pool (DUP-037), on the reasoning
+         * that loads are short I/O + zstd bursts and io_lock already
+         * serialises the heavy step.  That reasoning was backwards.  io_lock
+         * is exactly what makes it unsafe: jce_thread_pool_parallel_for()
+         * waits by running ANY queued task, so a per-frame cull on the main
+         * thread could pick up a queued job_worker, block on io_lock while a
+         * worker holds it across a disk read plus a zstd inflate, and stall
+         * the frame for the duration.  Priority inversion, not a hitch.
+         *
+         * Owning the pool also gives `worker_count` from the config its
+         * meaning back.  See the private-pool note in jce_thread.h. */
+        l->pool = jce_thread_pool_create(l->worker_count + 1);
+        if (l->pool) {
+            l->async = 1;
+        } else {
             /* fall back to the inline path rather than failing the loader */
             l->worker_count = 0;
         }
@@ -357,8 +382,12 @@ void jce_archive_loader_destroy(JceArchiveLoader *loader)
     if (!loader) return;
 
     /* Wait for in-flight worker loads to land before tearing anything down.
-     * No new work is dispatched after this point. */
-    if (loader->jobs) {
+     * No new work is dispatched after this point.  Destroying the pool would
+     * join the workers, but this spin runs FIRST and is the real barrier: a
+     * job that has already dropped `inflight` under `lock` is done touching
+     * the loader, which is the state the frees below need — pool teardown
+     * alone would not tell us that. */
+    if (loader->async) {
         for (;;) {
             jce_mutex_lock(loader->lock);
             int32_t infl = loader->inflight;
@@ -366,7 +395,11 @@ void jce_archive_loader_destroy(JceArchiveLoader *loader)
             if (infl <= 0) break;
             jce_thread_sleep_ms(1);
         }
-        jce_jobs_destroy(loader->jobs);
+    }
+    if (loader->pool) {
+        jce_thread_pool_destroy(loader->pool);
+        loader->pool = NULL;
+        loader->async = 0;
     }
 
     /* Free queued + completed jobs. */
@@ -495,10 +528,10 @@ JceArchiveRequestId jce_archive_loader_request(JceArchiveLoader *loader, const c
     if (!e) {
         Job *j = begin_load(loader, hash);
         if (!j) { jce_mutex_unlock(loader->lock); return 0; } /* absent */
-        if (loader->jobs) {
+        if (loader->async) {
             loader->inflight++;
             jce_mutex_unlock(loader->lock);
-            jce_jobs_dispatch(loader->jobs, job_worker, j);
+            dispatch_or_run(loader, j);
             jce_mutex_lock(loader->lock);
         } else {
             j->next = NULL;
@@ -571,7 +604,7 @@ void jce_archive_loader_tick(JceArchiveLoader *loader)
     }
 
     /* 2. Inline path: service queued loads within the frame budget (§14.1). */
-    if (loader->jobs) return;
+    if (loader->async) return;
 
     uint64_t start = jce_time_perf_counter();
     for (;;) {
@@ -607,10 +640,10 @@ void jce_archive_loader_preload(JceArchiveLoader *loader, const char *path)
     if (!ht_find(loader, hash)) {
         Job *j = begin_load(loader, hash);
         if (j) {
-            if (loader->jobs) {
+            if (loader->async) {
                 loader->inflight++;
                 jce_mutex_unlock(loader->lock);
-                jce_jobs_dispatch(loader->jobs, job_worker, j);
+                dispatch_or_run(loader, j);
                 return;
             }
             j->next = NULL;

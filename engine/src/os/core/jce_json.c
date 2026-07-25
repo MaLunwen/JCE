@@ -3,31 +3,149 @@
  *
  * Public/editor code should talk to this facade instead of cJSON directly.
  * Low-level JSON bridge modules may still include cJSON internally.
+ *
+ * ── Why cJSON_InitHooks is NOT called here (audit JSON-05) ───────────
+ * cJSON allocates through the CRT, so JSON trees — which is most of what a
+ * scene/prefab/material/settings load allocates — sit outside mimalloc and
+ * outside the engine's memory accounting.  Routing them through JCE_MALLOC
+ * looks like a one-line fix and is a trap: cJSON_InitHooks swaps GLOBAL
+ * function pointers, so any tree allocated before the swap is later freed by
+ * cJSON_Delete through the NEW free — a cross-allocator free, i.e. exactly
+ * the P0 class this audit already had to fix twice elsewhere.  Several TUs
+ * still call cJSON directly (scene, resource, ai_dispatch), so a lazy
+ * "install on first facade call" cannot guarantee it wins the race against
+ * the first allocation.
+ *
+ * The safe fix is to install the hooks exactly once BEFORE any cJSON
+ * allocation in the process — a single early init that every binary
+ * (engine, editor, and each host tool) is guaranteed to run — and only then
+ * is it worth doing.  Left deliberately undone rather than half-done.
  */
 
 #include "jce/os/core/jce_json.h"
 #include "jce/os/core/jce_filesystem.h"
+#include "jce/os/core/jce_log.h"
 #include "jce/os/core/jce_path.h"
 
 #include <cjson/cJSON.h>
 #include <SDL3/SDL.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define LOG_TAG "jce_json"
+
+/* ── Parse-failure diagnostics (audit JSON-08) ─────────────────────── */
+
+/* Thread-local rather than a plain static because asset loads parse JSON on
+ * worker threads: a global record would be a data race AND would routinely
+ * hand the main thread some other load's failure.  This is also why cJSON's
+ * cJSON_GetErrorPtr() is not used — that one IS a plain global; the *Opts
+ * parse entry points hand the same pointer back per call, so we take it from
+ * there instead. */
+#ifdef _MSC_VER
+static __declspec(thread) char   tl_err[192]   = {0};
+static __declspec(thread) size_t tl_err_offset = (size_t)-1;
+#else
+static __thread char   tl_err[192]   = {0};
+static __thread size_t tl_err_offset = (size_t)-1;
+#endif
+
+static void s_err_clear(void)
+{
+    tl_err[0]     = '\0';
+    tl_err_offset = (size_t)-1;
+}
+
+/* Record a non-parse (input / I/O) failure.  Leaves the offset at the "not a
+ * parse failure" sentinel, and refuses to overwrite a parse failure already
+ * recorded: when a VFS mount served bytes that do not parse, THAT is the
+ * actionable diagnosis — the development-tree fallback also being absent is
+ * noise on top of it. */
+static void s_err_set_io(const char *fmt, ...)
+{
+    if (tl_err_offset != (size_t)-1) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tl_err, sizeof tl_err, fmt, ap);
+    va_end(ap);
+}
+
+/* Record a cJSON failure.  `at` is where the parser stopped inside
+ * [text, text+len).  The offset is resolved to line/column plus a short
+ * excerpt because a bare byte offset is unusable to someone staring at a
+ * 40k-line scene file. */
+static void s_err_set_parse(const char *text, size_t len, const char *at)
+{
+    if (!text) len = 0;
+
+    size_t off = 0;
+    if (text && at && at > text) {
+        off = (size_t)(at - text);
+        if (off > len) off = len;
+    }
+
+    size_t line = 1, col = 1;
+    for (size_t i = 0; i < off; i++) {
+        if (text[i] == '\n') { line++; col = 1; }
+        else                   col++;
+    }
+
+    char   snippet[25];
+    size_t n = 0;
+    while (n + 1 < sizeof snippet && off + n < len) {
+        /* Printable ASCII only: a raw slice can cut a UTF-8 sequence in half
+         * and poison the log line it lands in. */
+        unsigned char c = (unsigned char)text[off + n];
+        if (c == '\n' || c == '\r') break;
+        snippet[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    snippet[n] = '\0';
+
+    snprintf(tl_err, sizeof tl_err,
+             "malformed JSON: line %zu, column %zu (byte %zu), near %s",
+             line, col, off, snippet);
+    tl_err_offset = off;
+}
+
+/* Report content corruption, never a missing file: many jce_json_parse_file
+ * callers probe for an optional file (per-user config, sidecar metadata) and
+ * treat NULL as "absent", so logging every miss would bury the one case a
+ * user must act on — a file that IS there and is broken.  A non-sentinel
+ * offset is exactly "we got far enough to parse it". */
+static void s_log_failure(const char *path)
+{
+    if (tl_err_offset != (size_t)-1)
+        LOG_ERROR(LOG_TAG, "'%s': %s", path, tl_err);
+}
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
 JceJson *jce_json_parse(const char *text, size_t len)
 {
-    if (!text) return NULL;
-    if (len == 0)
-        return cJSON_Parse(text);
-    return cJSON_ParseWithLength(text, len);
+    s_err_clear();
+    if (!text) {
+        s_err_set_io("no input (NULL text)");
+        return NULL;
+    }
+
+    const char *end = NULL;
+    JceJson    *j   = (len == 0)
+                    ? cJSON_ParseWithOpts(text, &end, 0)
+                    : cJSON_ParseWithLengthOpts(text, len, &end, 0);
+    if (!j) s_err_set_parse(text, len ? len : strlen(text), end);
+    return j;
 }
 
 JceJson *jce_json_parse_file(const char *path)
 {
-    if (!path) return NULL;
+    s_err_clear();
+    if (!path) {
+        s_err_set_io("no input (NULL path)");
+        return NULL;
+    }
 
     const bool isolated_relative =
         jce_fs_get_active() != NULL &&
@@ -41,7 +159,11 @@ JceJson *jce_json_parse_file(const char *path)
         uint64_t  sz   = 0;
         void     *vbuf = jce_fs_host_read_all(path, &sz);
         if (vbuf) {
-            JceJson *j = cJSON_ParseWithLength((const char *)vbuf, (size_t)sz);
+            const char *end = NULL;
+            JceJson    *j   = cJSON_ParseWithLengthOpts((const char *)vbuf,
+                                                        (size_t)sz, &end, 0);
+            /* Must read the buffer before it is released. */
+            if (!j) s_err_set_parse((const char *)vbuf, (size_t)sz, end);
             jce_fs_buffer_free(vbuf);
             if (j) return j;
             /* An isolated mount is authoritative, including malformed data. */
@@ -50,25 +172,59 @@ JceJson *jce_json_parse_file(const char *path)
 
     /* Bundle Preview must expose missing dependencies instead of silently
      * borrowing a same-named development file from the process directory. */
-    if (isolated_relative) return NULL;
+    if (isolated_relative) {
+        s_err_set_io("not present in the active isolated mount");
+        s_log_failure(path);
+        return NULL;
+    }
 
     SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-    if (!io) return NULL;
+    if (!io) {
+        s_err_set_io("cannot open file: %s", SDL_GetError());
+        return NULL;
+    }
 
     Sint64 sz = SDL_GetIOSize(io);
-    if (sz <= 0) { SDL_CloseIO(io); return NULL; }
+    if (sz <= 0) {
+        SDL_CloseIO(io);
+        s_err_set_io("file is empty or has unknown size");
+        return NULL;
+    }
 
     char *buf = (char *)SDL_malloc((size_t)sz + 1);
-    if (!buf) { SDL_CloseIO(io); return NULL; }
+    if (!buf) {
+        SDL_CloseIO(io);
+        s_err_set_io("out of memory reading %lld bytes", (long long)sz);
+        return NULL;
+    }
 
     size_t nread = SDL_ReadIO(io, buf, (size_t)sz);
     SDL_CloseIO(io);
-    if (nread != (size_t)sz) { SDL_free(buf); return NULL; }
+    if (nread != (size_t)sz) {
+        SDL_free(buf);
+        s_err_set_io("truncated read (%zu of %lld bytes): %s",
+                     nread, (long long)sz, SDL_GetError());
+        return NULL;
+    }
     buf[nread] = '\0';
 
-    JceJson *j = cJSON_ParseWithLength(buf, nread);
+    const char *end = NULL;
+    JceJson    *j   = cJSON_ParseWithLengthOpts(buf, nread, &end, 0);
+    if (j) s_err_clear();  /* a VFS miss on the way here is not a failure */
+    else   s_err_set_parse(buf, nread, end);
     SDL_free(buf);
+    if (!j) s_log_failure(path);
     return j;
+}
+
+const char *jce_json_last_error(void)
+{
+    return tl_err;
+}
+
+size_t jce_json_last_error_offset(void)
+{
+    return tl_err_offset;
 }
 
 JceJson *jce_json_object(void) { return cJSON_CreateObject(); }
@@ -132,6 +288,16 @@ void jce_json_remove(JceJson *obj, const char *key)
 {
     if (!obj || !key) return;
     cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+}
+
+void jce_json_detach(JceJson *parent, JceJson *child)
+{
+    if (!parent || !child) return;
+    /* cJSON_DetachItemViaPointer unlinks and RETURNS the item without
+     * freeing it; ownership moves to the caller.  It already tolerates a
+     * child that does not belong to parent (returns NULL, changes nothing),
+     * so no extra guard is needed here. */
+    (void)cJSON_DetachItemViaPointer(parent, child);
 }
 
 int jce_json_array_size(const JceJson *arr)

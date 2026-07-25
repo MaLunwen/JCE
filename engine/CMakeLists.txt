@@ -98,11 +98,24 @@ endfunction()
 # L0 — Foundation (core)                                              #
 # ================================================================== #
 
+# NOTE on sdl::sdl being PRIVATE here (audit: cmake-jce-core-public-sdl).
+# It used to be LINK_PUBLIC, which pushed SDL's include directories onto every
+# consumer of jce_core — i.e. every engine layer, the editor, and every SDK
+# consumer.  That made SDL part of jce_core's public contract even though no
+# public header under engine/include/ includes an SDL header (enforced by
+# scripts/lint/check_public_api_purity.py), and it let 44 first-party files
+# across 5 other layers include <SDL3/...> without ever declaring the
+# dependency — free-riding that hid the real dependency graph.
+#
+# PRIVATE is the correct spelling for a static library: CMake still propagates
+# the LINK requirement transitively (as $<LINK_ONLY:sdl::sdl>) so final links
+# resolve, but the include directories stop leaking.  Every layer that really
+# uses SDL now says so itself, below.
 _jce_add_layer(jce_core
 	DIRS      os/core
 	LINK_PUBLIC
-		sdl::sdl
 	LINK_PRIVATE
+		sdl::sdl
 		cjson::cjson
 		mimalloc-static
 		enkits::enkits
@@ -127,6 +140,7 @@ _jce_add_layer(jce_platform
 	LINK_PUBLIC
 		jce_core
 	LINK_PRIVATE
+		sdl::sdl
 		SDL3_image::SDL3_image)
 if(WIN32)
 	# jce_tcp.c (minimal TCP client for the ai_dispatch HTTP transport)
@@ -201,7 +215,7 @@ endif()
 _jce_add_layer(jce_video
 	DIRS      middleware/video
 	LINK_PUBLIC jce_core
-	LINK_PRIVATE dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
+	LINK_PRIVATE sdl::sdl dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
 
 # S3: compile the AVX2 YUV conversion TU with SIMD flags on x86 only.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
@@ -223,7 +237,7 @@ endif()
 _jce_add_layer(jce_audio
 	DIRS      middleware/audio
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE miniaudio::miniaudio jce_video flecs::flecs_static
+	LINK_PRIVATE sdl::sdl miniaudio::miniaudio jce_video flecs::flecs_static
 	            Opus::opus Ogg::ogg)
 
 if(JCE_PATENTED_CODECS_ENABLED)
@@ -289,6 +303,10 @@ _jce_add_layer(jce_net
 	CXX)
 
 # Protobuf code generation (net layer owns the proto files).
+# The generated .pb.cc has no consumer since the dead jce_net_proto.cpp shim was
+# removed; the schema, this generate step and the protobuf link are kept as the
+# sanctioned channel for schema-defined messages (and to keep the build-context
+# protoc wiring in the root CMakeLists.txt exercised).
 set(JCE_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(JCE_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY "${JCE_PROTO_OUT}")
@@ -304,12 +322,12 @@ _jce_add_layer(jce_scene
 	DIRS      middleware/scene
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE
+		sdl::sdl
 		jce_animation
 		jce_video
 		flecs::flecs_static
 		cjson::cjson
 		bgfx::bgfx
-		cgltf::cgltf
 	CXX)
 
 _jce_add_layer(jce_world
@@ -327,7 +345,7 @@ _jce_add_layer(jce_save
 	# component-JSON schema (jce_scene_save_json / jce_scene_load_json), so the
 	# save layer links the scene layer.  jce_scene is declared above and does
 	# not link jce_save, so there is no dependency cycle.
-	LINK_PRIVATE jce_scene)
+	LINK_PRIVATE jce_scene sdl::sdl)
 
 option(JCE_ENABLE_AI_DISPATCH
 	"Compile the ai_dispatch middleware (constraint-record scene parameter \
@@ -343,7 +361,8 @@ if(JCE_ENABLE_AI_DISPATCH)
 		# jce_ai_dispatch, so this private edge introduces no cycle.
 		# cjson: JSON boundary of the network tiers (jce_aid_json.c);
 		# jce_platform: jce_tcp for the plaintext HTTP transport.
-		LINK_PRIVATE xxHash::xxhash jce_save cjson::cjson jce_platform)
+		# sdl: jce_aid_events.c uses <SDL3/SDL_iostream.h> for its record log.
+		LINK_PRIVATE sdl::sdl xxHash::xxhash jce_save cjson::cjson jce_platform)
 	target_compile_definitions(jce_ai_dispatch PUBLIC JCE_ENABLE_AI_DISPATCH=1)
 	if(CURL_FOUND)
 		# Production T1 HTTPS transport (jce_aid_transport_curl.c compiles
@@ -374,6 +393,7 @@ _jce_add_layer(jce_renderer
 		jce_platform
 		jce_animation
 	LINK_PRIVATE
+		sdl::sdl
 		bgfx::bgfx
 		SDL3_image::SDL3_image
 		Freetype::Freetype
@@ -428,7 +448,8 @@ _jce_add_layer(jce_ui
 		jce_platform
 		jce_audio
 	LINK_PRIVATE
-		rmlui::rmlui
+		sdl::sdl
+		RmlUi::RmlUi
 		bgfx::bgfx
 		jce_tools_imgui
 	CXX)
@@ -446,7 +467,11 @@ _jce_add_layer(jce_resource
 		jce_animation
 		jce_scene
 	LINK_PRIVATE
-		SDL3_image::SDL3_image
+		sdl::sdl
+		# NO SDL3_image here on purpose: the resource layer decodes images
+		# through jce_image_decode -> the one image service (jce_image.c,
+		# renderer layer), never by calling IMG_* itself.  Re-adding this is
+		# the signal that a second decode path has crept back in.
 		cgltf::cgltf
 		miniaudio::miniaudio
 		zstd::libzstd_static
@@ -501,6 +526,7 @@ _jce_add_layer(jce_application
 		jce_scene
 		jce_script
 	LINK_PRIVATE
+		sdl::sdl
 		bgfx::bgfx)
 
 # The embedded-PAK key fallback must not live in the application archive.
@@ -611,7 +637,9 @@ elseif(JCE_PLATFORM_MACOS)
 		"-framework GameController"
 		"-framework CoreHaptics")
 elseif(WIN32)
-	target_link_libraries(JCE INTERFACE psapi)
+	# Static SDK consumers must receive the transitive system imports used by
+	# curl/Schannel and network-interface discovery inside jce_engine_deps.
+	target_link_libraries(JCE INTERFACE psapi crypt32 secur32 iphlpapi)
 endif()
 
 # Linux + macOS: dladdr() is in libdl on glibc; on macOS it's in libSystem

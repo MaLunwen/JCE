@@ -58,6 +58,7 @@
 #include <jce/os/core/jce_profiler.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* shared backend suffix */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -194,20 +195,9 @@ struct JceGpuScene {
     uint32_t           runmeta_cap;
 };
 
-/* ── shader loading (mirrors jce_gpu_particles.c) ─────────────────────── */
-
-static const char *backend_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
+/* ── shader loading ───────────────────────────────────────────────────── *
+ * The backend suffix comes from renderer/jce_shader_load.h; the loader stays
+ * local because of the JCE_SHADER_DIAG instrumentation below. */
 
 static bgfx_shader_handle_t load_shader(const JcePakArchive *pak,
                                         const char *name, const char *sfx)
@@ -438,7 +428,7 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
         return gs;  /* no-op mode */
     }
 
-    const char *sfx = backend_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) {
         LOG_WARN(LOG_TAG, "no shader suffix for current renderer; GPU-driven off");
         return gs;
@@ -1045,7 +1035,7 @@ static bool hiz_build(JceGpuScene *gs, uint16_t view)
             w, h, want_mips > 1, 1, BGFX_TEXTURE_FORMAT_R32F,
             BGFX_TEXTURE_COMPUTE_WRITE | BGFX_SAMPLER_MIN_POINT |
             BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT |
-            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
         gs->hiz_w = w; gs->hiz_h = h; gs->hiz_mips = want_mips;
     }
     if (gs->hiz_tex.idx == UINT16_MAX) { gs->hiz_on = false; return false; }

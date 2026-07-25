@@ -31,7 +31,11 @@
 
 /* ── Shared state ─────────────────────────────────────────────────── */
 
-char s_current_project_root[512] = {0};
+/* The open-project root now lives in core/jce_editor_project_state.cpp
+ * and is reached through jce_editor_current_project_root() / _set().
+ * (jce_editor_dialogs_internal.h still carries the legacy
+ * `extern char s_current_project_root[512]` for the translation units
+ * that have not been migrated yet — see the note at the definition.) */
 static char s_last_browse_folder[512] = {0};
 
 /* Lazy one-time restore of the persisted last-browse folder (user-global
@@ -51,16 +55,16 @@ static void last_browse_folder_load_once(void)
 void set_current_project_root(const char *path)
 {
     /* Snapshot the OUTGOING project's machine-local overlays (build/run
-     * profile + favourites) while s_current_project_root still names it (the
+     * profile + favourites) while the project root still names it (the
      * project store follows the root lazily, so this must run before we
      * overwrite the root below). */
-    if (s_current_project_root[0]) {
+    if (jce_editor_current_project_root()[0]) {
         jce_editor_build_profile_snapshot();
         jce_editor_favorites_snapshot();
     }
 
     if (!path || path[0] == '\0') {
-        s_current_project_root[0] = '\0';
+        jce_editor_current_project_root_set(nullptr);
         jce_project_settings_set_root(nullptr);
         jce_assetdb_set_root("");
         jce_editor_project_set_root(nullptr);
@@ -96,10 +100,11 @@ void set_current_project_root(const char *path)
     while (L > 1 && (buf[L - 1] == '/' || buf[L - 1] == '\\'))
         buf[--L] = '\0';
 
-    snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", buf);
-    jce_project_settings_set_root(s_current_project_root);
-    jce_assetdb_set_root(s_current_project_root);
-    jce_editor_project_set_root(s_current_project_root);
+    jce_editor_current_project_root_set(buf);
+    const char *root = jce_editor_current_project_root();
+    jce_project_settings_set_root(root);
+    jce_assetdb_set_root(root);
+    jce_editor_project_set_root(root);
 
     /* Render-pipeline assets are project-owned.  Resolve the new root before
      * touching live renderer state, and use the current hardware-tier preset
@@ -107,8 +112,7 @@ void set_current_project_root(const char *path)
      * inheriting the descriptor last applied by project A. */
     {
         JceRenderPipelineDesc pipeline{};
-        if (!jce_editor_project_render_pipeline_load(s_current_project_root,
-                                                     &pipeline))
+        if (!jce_editor_project_render_pipeline_load(root, &pipeline))
             jce_render_pipeline_preset_for_current_tier(&pipeline);
         jce_render_pipeline_apply(&pipeline);
     }
@@ -117,7 +121,7 @@ void set_current_project_root(const char *path)
      * encrypted PAKs / bundles of this project open transparently in the
      * editor (Play mode, bundle preview, asset browser).  Clears any key
      * left over from a previously opened project. */
-    jce_pak_key_install_process(s_current_project_root);
+    jce_pak_key_install_process(root);
 
     /* Game string tables: load <root>/<source_assets>/i18n/*.json into the
      * L10n grid model and point jce_loc at it so UIText locale_key fields
@@ -126,7 +130,7 @@ void set_current_project_root(const char *path)
         const JceProject *jp = jce_editor_project_get();
         const char *src = (jp && jp->source_assets && jp->source_assets[0])
                           ? jp->source_assets : "assets";
-        jce_editor_gl10n_load(s_current_project_root, src);
+        jce_editor_gl10n_load(root, src);
     }
 
     /* Reload project settings for the newly opened root and write through

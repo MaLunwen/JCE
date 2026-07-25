@@ -17,6 +17,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_timer.h>
 
 #include <algorithm>
@@ -68,14 +69,19 @@ JceAssetKind classify(const std::string &ext_in)
 {
     std::string e = ext_in;
     for (auto &c : e) c = (char)std::tolower((unsigned char)c);
-    if (e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".bmp"
-        || e == ".tga" || e == ".dds" || e == ".ktx" || e == ".gif"
-        || e == ".webp" || e == ".hdr") return JCE_ASSET_KIND_TEXTURE;
-    if (e == ".gltf" || e == ".glb" || e == ".obj" || e == ".fbx"
-        || e == ".dae" || e == ".stl" || e == ".ply" || e == ".usd"
-        || e == ".usdc" || e == ".usdz") return JCE_ASSET_KIND_MODEL;
-    if (e == ".wav" || e == ".mp3" || e == ".ogg" || e == ".flac"
-        || e == ".opus" || e == ".aac" || e == ".m4a") return JCE_ASSET_KIND_AUDIO;
+    /* Texture / model / audio / shader classification comes from the
+     * engine-canonical table (jce_asset_format.h) so the browser, the cooker
+     * and the runtime can never disagree about what a file IS.  The kinds
+     * below it (material / scene / script / particle / data) are editor-only
+     * concepts with no engine counterpart, so they stay here.  '.mat.json'
+     * and friends are compound suffixes and must be tested before the
+     * generic '.json' data rule. */
+    switch (jce_asset_type_from_ext(e.c_str())) {
+    case JCEASSET_TYPE_TEXTURE: return JCE_ASSET_KIND_TEXTURE;
+    case JCEASSET_TYPE_MODEL:   return JCE_ASSET_KIND_MODEL;
+    case JCEASSET_TYPE_SOUND:   return JCE_ASSET_KIND_AUDIO;
+    default:                    break;
+    }
     if (e == ".mat" || e == ".mat.json") return JCE_ASSET_KIND_MATERIAL;
     if (e == ".scn" || e == ".scene" || e == ".scene.json")
         return JCE_ASSET_KIND_SCENE;

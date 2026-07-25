@@ -15,6 +15,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* shared backend suffix */
 
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_shaders.h>   /* embedded engine pak fallback */
@@ -74,6 +75,7 @@ struct JceGiProbes {
      * color/depth/VP inputs. */
     bgfx_texture_handle_t  csm_copy;
     uint16_t               csm_copy_size;
+    uint32_t               csm_copy_fmt;   /* bgfx_texture_format_t of csm_copy */
     float                  csm_prev_vp[16];
     bool                   csm_prev_valid;
     bgfx_uniform_handle_t  s_color, s_depth;
@@ -83,24 +85,13 @@ struct JceGiProbes {
     uint32_t               frame;
 };
 
-/* Shader loading — jce_gpu_scene.c pattern (engine-pak fallback rule). */
-static const char *gig_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
-
+/* Shader loading — jce_gpu_scene.c pattern (engine-pak fallback rule).
+ * Kept local rather than routed through jce_shader_load_from_pak(): a missing
+ * GI shader is a WARN here (the probe grid is optional), not an ERROR. */
 static bgfx_program_handle_t gig_load(const JcePakArchive *pak, const char *name)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    const char *sfx = gig_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) return invalid;
     char path[256];
     snprintf(path, sizeof path, "shaders/%s_%s.bin", name, sfx);
@@ -160,11 +151,11 @@ JceGiProbes *jce_gi_probes_create(const JcePakArchive *pak)
     }
 
     gi->atlas = bgfx_create_texture_2d(GIG_AW, GIG_AH, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA32F, BGFX_TEXTURE_COMPUTE_WRITE, NULL);
+        BGFX_TEXTURE_FORMAT_RGBA32F, BGFX_TEXTURE_COMPUTE_WRITE, NULL, 0);
     for (int i = 0; i < GIG_RING; ++i) {
         gi->staging[i] = bgfx_create_texture_2d(GIG_AW, GIG_AH, false, 1,
             BGFX_TEXTURE_FORMAT_RGBA32F,
-            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK, NULL);
+            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK, NULL, 0);
         gi->pixels[i] = (uint8_t *)JCE_CALLOC(1, (size_t)GIG_AW * GIG_AH * 16u);
     }
     if (gi->atlas.idx == UINT16_MAX ||
@@ -247,7 +238,8 @@ void jce_gi_probes_update(JceGiProbes *gi,
                           const float prev_vp[16], jce_vec3 cam_pos,
                           uint32_t vp_w, uint32_t vp_h, bool gl_ndc,
                           jce_vec3 sky_color, float sky_amount,
-                          uint16_t sun_csm_tex, const float *sun_csm_vp,
+                          uint16_t sun_csm_tex, uint16_t sun_csm_size,
+                          uint32_t sun_csm_fmt, const float *sun_csm_vp,
                           jce_vec3 sun_dir, jce_vec3 sun_color,
                           float sun_amount)
 {
@@ -301,7 +293,8 @@ void jce_gi_probes_update(JceGiProbes *gi,
         s_sun_env = (v && v[0]) ? (float)atof(v) : -1.0f;
     }
     float sun_amt = (s_sun_env >= 0.0f) ? s_sun_env : sun_amount;
-    bool sun_in = (sun_csm_tex != UINT16_MAX) && sun_csm_vp && sun_amt > 0.0f;
+    bool sun_in = (sun_csm_tex != UINT16_MAX) && sun_csm_vp && sun_amt > 0.0f &&
+                  sun_csm_size > 0;
     /* Sample the PRIVATE COPY from last frame (never the live cascade). */
     bool sun_ready = sun_in && gi->csm_prev_valid &&
                      gi->csm_copy.idx != UINT16_MAX;
@@ -341,28 +334,34 @@ void jce_gi_probes_update(JceGiProbes *gi,
      * frame's shadows; the paired VP is saved alongside).  Lazily (re)size
      * to the live cascade — bgfx blit requires equal formats/sizes. */
     if (sun_in) {
-        /* The cascade is square shadow_map_size; probe it via bgfx caps?  We
-         * size the copy on first use from the CALLER's texture via the only
-         * dimension we know — keep a fixed square that tracks recreation
-         * through jce_gi_probes_set_csm_size (simple: recreate when the
-         * caller-passed size in the high bits changes is overkill; the
-         * cascade size is engine-constant per run, so create once from the
-         * first blit's implicit size using BGFX_TEXTURE_BLIT_DST +
-         * readback-free sampling). */
+        /* The private copy must EXACTLY match the live cascade: bgfx_blit does
+         * NOT clamp or convert — a size or format mismatch is an ILLEGAL copy
+         * (on D3D12 CopyTextureRegion out-of-bounds / out-of-family removes
+         * the device with DXGI_ERROR_INVALID_CALL; D3D11/GL/VK silently drop
+         * it).  The caller passes the cascade's real size + depth format
+         * (tier-dependent: 512..4096, D16/D24S8/D32F), and the copy is
+         * recreated whenever either changes (quality switch at runtime). */
+        if (gi->csm_copy.idx != UINT16_MAX &&
+            (gi->csm_copy_size != sun_csm_size ||
+             gi->csm_copy_fmt  != sun_csm_fmt)) {
+            bgfx_destroy_texture(gi->csm_copy);
+            gi->csm_copy.idx = UINT16_MAX;
+            gi->csm_prev_valid = false;
+        }
         if (gi->csm_copy.idx == UINT16_MAX) {
-            /* Size: JCE shadow maps are square, engine-constant per run.
-             * 2048 is the engine default; a mismatch merely clips the blit
-             * region (bgfx clamps), degrading — not breaking — the term. */
-            gi->csm_copy = bgfx_create_texture_2d(2048, 2048, false, 1,
-                BGFX_TEXTURE_FORMAT_D32F,
+            gi->csm_copy = bgfx_create_texture_2d(sun_csm_size, sun_csm_size,
+                false, 1,
+                (bgfx_texture_format_t)sun_csm_fmt,
                 BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_MIN_POINT |
                 BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT |
-                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+            gi->csm_copy_size = sun_csm_size;
+            gi->csm_copy_fmt  = sun_csm_fmt;
         }
         if (gi->csm_copy.idx != UINT16_MAX) {
             bgfx_texture_handle_t live = { sun_csm_tex };
             bgfx_blit(blit_view, gi->csm_copy, 0, 0, 0, 0,
-                      live, 0, 0, 0, 0, 2048, 2048, 0);
+                      live, 0, 0, 0, 0, sun_csm_size, sun_csm_size, 1);
             memcpy(gi->csm_prev_vp, sun_csm_vp, sizeof gi->csm_prev_vp);
             gi->csm_prev_valid = true;
         }
@@ -385,8 +384,8 @@ void jce_gi_probes_update(JceGiProbes *gi,
     for (int i = 0; (gi->update_ix % s_cadence) == 0 && i < GIG_RING; ++i) {
         if (gi->kicks[i] < 0) {
             bgfx_blit(blit_view, gi->staging[i], 0, 0, 0, 0,
-                      gi->atlas, 0, 0, 0, 0, GIG_AW, GIG_AH, 0);
-            bgfx_read_texture(gi->staging[i], gi->pixels[i], 0);
+                      gi->atlas, 0, 0, 0, 0, GIG_AW, GIG_AH, 1);
+            bgfx_read_texture(gi->staging[i], gi->pixels[i], 0, 0);
             gi->kicks[i] = gi->update_ix;
             break;
         }

@@ -14,6 +14,7 @@
  * Schema: jce.buildreport.v1 (see engine/src/resource/jce_bundle_pack.c).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
@@ -22,7 +23,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -81,44 +81,8 @@ struct State {
     int                        top_n           = 25;
 };
 State g_st;
-int  g_request_tab = -1;
-int  g_current_tab = 0;
-bool g_tab_state_loaded = false;
 
-const char *k_tab_state_key = "panel.build_report.current_tab";
-
-void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 4);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-ImGuiTabItemFlags tab_flags(int idx)
-{
-    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
-}
-
-void set_current_tab(int idx)
-{
-    if (idx < 0 || idx > 4 || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
-
-const char *fmt_size(uint64_t b, char *out, size_t n)
-{
-    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
-    double v = (double)b;
-    int k = 0;
-    while (v >= 1024.0 && k < 4) { v /= 1024.0; ++k; }
-    snprintf(out, n, "%.2f %s", v, u[k]);
-    return out;
-}
+JcePanelTabState g_tabs{ "panel.build_report.current_tab", /*max_tab=*/4 };
 
 void init_default_path()
 {
@@ -143,22 +107,11 @@ void reset_state()
     g_st.flat_entries.clear();
 }
 
+/* std::string overload of the shared filter test — the report rows are
+ * all std::string, so this keeps the call sites free of .c_str(). */
 bool ci_contains(const std::string &hay, const char *needle)
 {
-    if (!needle || !*needle) return true;
-    size_t hn = hay.size(), nn = std::strlen(needle);
-    if (nn > hn) return false;
-    for (size_t i = 0; i + nn <= hn; ++i) {
-        size_t j = 0;
-        for (; j < nn; ++j) {
-            char a = hay[i + j], b = needle[j];
-            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-            if (a != b) break;
-        }
-        if (j == nn) return true;
-    }
-    return false;
+    return jce_panel_filter_match_ci(hay.c_str(), needle);
 }
 
 void refresh()
@@ -266,7 +219,7 @@ void refresh()
 
     g_st.loaded = true;
     char sb[32];
-    fmt_size(g_st.total_bytes, sb, sizeof(sb));
+    jce_panel_fmt_size(g_st.total_bytes, sb, sizeof(sb));
     snprintf(g_st.status_msg, sizeof(g_st.status_msg),
              jce_editor_i18n("panel.build_report.status.loaded"),
              (int)g_st.bundles.size(), sb);
@@ -298,7 +251,7 @@ void draw_overview()
         ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
         ImGui::TextUnformatted(jce_editor_i18n("panel.build_report.overview.total_size"));
         ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted(fmt_size(g_st.total_bytes, sb, sizeof(sb)));
+        ImGui::TextUnformatted(jce_panel_fmt_size(g_st.total_bytes, sb, sizeof(sb)));
 
         ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
         ImGui::TextUnformatted(jce_editor_i18n("panel.build_report.overview.unique_assets"));
@@ -347,7 +300,7 @@ void draw_bundles()
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(br.id.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(fmt_size(br.size_bytes, sb, sizeof(sb)));
+            ImGui::TextUnformatted(jce_panel_fmt_size(br.size_bytes, sb, sizeof(sb)));
             ImGui::TableSetColumnIndex(2); ImGui::Text("%u", br.entry_count);
             ImGui::TableSetColumnIndex(3); ImGui::Text("%u", br.dep_count);
             ImGui::TableSetColumnIndex(4);
@@ -390,7 +343,7 @@ void draw_entries()
             ImGui::TableSetColumnIndex(1);
             ImGui::TextUnformatted(er.type.empty() ? "-" : er.type.c_str());
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(fmt_size(er.size_bytes, sb, sizeof(sb)));
+            ImGui::TextUnformatted(jce_panel_fmt_size(er.size_bytes, sb, sizeof(sb)));
             ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(br.id.c_str());
             ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(er.hash.empty() ? "-" : er.hash.c_str());
@@ -428,7 +381,7 @@ void draw_duplicates()
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(dr.hash.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(fmt_size(dr.size_bytes, sb, sizeof(sb)));
+            ImGui::TextUnformatted(jce_panel_fmt_size(dr.size_bytes, sb, sizeof(sb)));
             ImGui::TableSetColumnIndex(2); ImGui::Text("%u", (uint32_t)dr.bundles.size());
             ImGui::TableSetColumnIndex(3);
             std::string joined;
@@ -487,7 +440,7 @@ void draw_top_n()
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(er.path.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(fmt_size(er.size_bytes, sb, sizeof(sb)));
+            ImGui::TextUnformatted(jce_panel_fmt_size(er.size_bytes, sb, sizeof(sb)));
             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(br.id.c_str());
             ImGui::TableSetColumnIndex(3);
             float frac = (float)((double)er.size_bytes / (double)max_size);
@@ -531,40 +484,40 @@ extern "C" void build_report_draw_content(void)
         return;
     }
 
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (ImGui::BeginTabBar("##br_tabs")) {
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.overview"),
-                                nullptr, tab_flags(0))) {
-            set_current_tab(0);
+                                nullptr, jce_panel_tab_flags(g_tabs, 0))) {
+            jce_panel_tab_set_current(g_tabs, 0);
             draw_overview();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.bundles"),
-                                nullptr, tab_flags(1))) {
-            set_current_tab(1);
+                                nullptr, jce_panel_tab_flags(g_tabs, 1))) {
+            jce_panel_tab_set_current(g_tabs, 1);
             draw_bundles();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.entries"),
-                                nullptr, tab_flags(2))) {
-            set_current_tab(2);
+                                nullptr, jce_panel_tab_flags(g_tabs, 2))) {
+            jce_panel_tab_set_current(g_tabs, 2);
             draw_entries();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.duplicates"),
-                                nullptr, tab_flags(3))) {
-            set_current_tab(3);
+                                nullptr, jce_panel_tab_flags(g_tabs, 3))) {
+            jce_panel_tab_set_current(g_tabs, 3);
             draw_duplicates();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.top_n"),
-                                nullptr, tab_flags(4))) {
-            set_current_tab(4);
+                                nullptr, jce_panel_tab_flags(g_tabs, 4))) {
+            jce_panel_tab_set_current(g_tabs, 4);
             draw_top_n();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
-        g_request_tab = -1;
+        g_tabs.request = -1;
     }
 }
 
@@ -574,18 +527,11 @@ extern "C" void build_report_draw_content(void)
  * registered against JCE_PANEL_BUILD_REPORT keep working. */
 extern "C" void jce_editor_panel_build_report(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_REPORT);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *bp_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES);
-    if (bp_vis) *bp_vis = true;
-
-    char title[128];
-    std::snprintf(title, sizeof(title), "%s###build_profiles",
-                  jce_editor_i18n("buildProfiles.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_build_profiles_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_BUILD_REPORT,
+                                        JCE_PANEL_BUILD_PROFILES,
+                                        "buildProfiles.title",
+                                        "build_profiles"))
+        jce_panel_build_profiles_request_tab(1);
 }
 
 /* Back-compat alias for callers that referenced the old _content symbol. */

@@ -7,7 +7,7 @@ arch=armv8
 compiler=apple-clang
 compiler.version=15
 compiler.libcxx=libc++
-compiler.cppstd=17
+compiler.cppstd=20
 
 [conf]
 tools.cmake.cmaketoolchain:extra_variables={"CMAKE_POLICY_VERSION_MINIMUM": "3.5"}

@@ -223,23 +223,32 @@ static void ui_event_bridge(uint32_t elem_idx, const char *event_type,
     }
 }
 
-void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
+bool jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
                     const char *event_type, jce_ui_event_fn fn, void *userdata)
 {
-    if (!ctx || !jce_ui_elem_valid(elem) || !fn) return;
+    if (!ctx || !jce_ui_elem_valid(elem) || !fn) {
+        /* Previously a bare return with no log: a stale element handle
+         * produced a control that simply never responded, and nothing
+         * anywhere said so. */
+        LOG_WARN(LOG_TAG,
+                 "elem_on('%s'): not attached (invalid context, element or "
+                 "callback)", event_type ? event_type : "?");
+        return false;
+    }
 
     UIEventCBWrapper *w =
         (UIEventCBWrapper *)ctx->alloc.alloc(sizeof(UIEventCBWrapper),
                                              ctx->alloc.ctx);
     if (!w) {
         LOG_ERROR(LOG_TAG, "failed to allocate event wrapper");
-        return;
+        return false;
     }
 
     w->fn       = fn;
     w->userdata = userdata;
 
     jce_rml_elem_on(ctx->backend, elem.idx, event_type, ui_event_bridge, w);
+    return true;
 }
 
 /* ── Per-frame ─────────────────────────────────────────────────────── */

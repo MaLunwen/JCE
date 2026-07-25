@@ -923,6 +923,12 @@ def cmd_editor(args) -> None:
     kind = {"debug": "debug", "dist": "dist"}.get(args.variant, "release")
     preset = preset_name(t, kind)        # windows-x64-{release|debug|dist}
     bdir = preset_binary_dir(t, kind)
+    if args.clean:
+        for directory in (bdir, conan_dir(t)):
+            if directory.exists():
+                log(f"clean: {directory}")
+                if not DRY_RUN:
+                    shutil.rmtree(directory, ignore_errors=True)
     conan_install(t, config, env)
     # Pin the build variant on EVERY configure.  release & dist share one
     # build dir (build/desktop/<stem>; exe lands in <stem>/<variant>) and the
@@ -1016,6 +1022,7 @@ def cmd_app(args) -> None:
             shutil.rmtree(bdir, ignore_errors=True)
     cfg = ["cmake", "-S", str(project), "-B", str(bdir), "-G", "Ninja",
            f"-DCMAKE_BUILD_TYPE={config}",
+           f"-DJCE_BUILD_VARIANT={args.variant}",
            # Tool paths are find_program cache entries. A build directory may
            # be reused with --sdk pointing at a different installation, so
            # make the selected SDK authoritative while preserving all other
@@ -1025,7 +1032,16 @@ def cmd_app(args) -> None:
            "-U", "JCE_BIN2OBJ_EXECUTABLE",
            f"-DJCE_DIR={jce_cmake}"]
     if t.get("emscripten"):
-        cfg.append(f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}")
+        cfg.extend([
+            f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}",
+            # CMake 3.27 probes this feature with `emcc -Wl,--help` while
+            # enabling C/C++.  That starts Emscripten's full JS-symbol cache
+            # path merely to inspect a native-GNU-linker capability and can
+            # stall in restricted or concurrent build environments.  Web
+            # links do not consume GNU linker depfiles, so state this once.
+            "-DCMAKE_C_LINKER_DEPFILE_SUPPORTED=FALSE",
+            "-DCMAKE_CXX_LINKER_DEPFILE_SUPPORTED=FALSE",
+        ])
     elif HOST == "windows":
         cfg.append("-DCMAKE_C_COMPILER=cl")
     run(cfg, env=env, cwd=ROOT)
@@ -1074,6 +1090,27 @@ def _host_exe(base: str) -> str:
     return base + ".exe" if HOST == "windows" else base
 
 
+def _announce_codec_policy(variant: str, what: str) -> None:
+    """Say plainly what a bundle carries, at the moment it is staged.
+
+    `package editor` and `package game` both default to variant=release, and
+    release deliberately carries the vendored AAC / H.264 / H.265 adapters —
+    the editor needs them to import legacy assets.  That is the decided
+    policy, not an accident.  What was missing is that the person running the
+    command was never told: a plain `jce.py package game` produced a
+    royalty-bearing bundle with nothing in the output saying so.
+
+    Not a prompt and not a default change: the release bundle is supposed to
+    have them.  Just a line that makes the choice visible where it is made,
+    so shipping royalty-free is a decision rather than a discovery."""
+    if variant == "dist":
+        log(f"{what}: dist variant — royalty-free "
+            "(AAC / H.264 / H.265 adapters compiled OUT)")
+    else:
+        log(f"{what}: {variant} variant — INCLUDES patent-encumbered codec "
+            "adapters (AAC / H.264 / H.265). You are responsible for "
+            "licensing. Use --variant dist for a royalty-free bundle.")
+
 def cmd_package_editor(args) -> None:
     """Stage a redistributable editor bundle (exe + sdk/ + VERSION + README)
     into dist/editor/<tag>-<arch>[-dist].  Replaces package-editor.bat."""
@@ -1082,6 +1119,7 @@ def cmd_package_editor(args) -> None:
         die(f"editor package target {t['key']} must be built on host '{t['host']}'.")
     variant = args.variant                       # release | dist
     suffix  = "-dist" if variant == "dist" else ""
+    _announce_codec_policy(variant, "editor bundle")
     src     = preset_binary_dir(t, "dist" if variant == "dist" else "release") / variant
     editor_exe = src / _host_exe("jce_editor")
     sdk_dir = sdk_install_dir(t, variant)
@@ -1131,6 +1169,7 @@ def cmd_package_game(args) -> None:
     manifest = read_manifest(project)
     t = resolve_target(args.arch)
     variant = args.variant
+    _announce_codec_policy(variant, "game bundle")
     name    = args.name or manifest.get("name") or project.name
     version = args.version or manifest.get("version") or "0.0.0"
 

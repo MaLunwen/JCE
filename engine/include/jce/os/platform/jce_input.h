@@ -55,17 +55,17 @@ JCE_API float     jce_input_mouse_wheel(const JceInput *input);
 /* -- Touch (mobile) ------------------------------------------------- */
 
 JCE_API int       jce_input_touch_count(const JceInput *input);
-bool      jce_input_touch_get(const JceInput *input, int index,
+JCE_API bool      jce_input_touch_get(const JceInput *input, int index,
               JceFingerID *id, float *x, float *y, float *pressure);
 
 /* -- Gamepad -------------------------------------------------------- */
 
 JCE_API int       jce_input_gamepad_count(const JceInput *input);
-bool      jce_input_gamepad_button(const JceInput *input, int pad,
+JCE_API bool      jce_input_gamepad_button(const JceInput *input, int pad,
               JceGamepadButton btn);
-bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,
+JCE_API bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,
               JceGamepadButton btn);
-float     jce_input_gamepad_axis(const JceInput *input, int pad,
+JCE_API float     jce_input_gamepad_axis(const JceInput *input, int pad,
               JceGamepadAxis axis);
 
 /* -- Frame snapshot (for record / replay) --------------------------- */

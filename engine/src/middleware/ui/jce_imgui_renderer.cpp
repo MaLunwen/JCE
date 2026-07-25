@@ -135,7 +135,7 @@ static void update_imgui_texture(ImTextureData *tex)
             BGFX_TEXTURE_FORMAT_RGBA8,
             BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
             BGFX_SAMPLER_MIP_POINT,
-            NULL);
+            NULL, 0);
         const bgfx_memory_t *mem =
             bgfx_copy(tex->GetPixels(), (uint32_t)tex->GetSizeInBytes());
         bgfx_update_texture_2d(h, 0, 0, 0, 0,
@@ -275,7 +275,7 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
             s_cap.tex = bgfx_create_texture_2d(width, height, false, 1,
                 BGFX_TEXTURE_FORMAT_RGBA16F,
                 BGFX_TEXTURE_RT |
-                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
             bgfx_texture_handle_t ths[1] = { s_cap.tex };
             s_cap.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
             s_cap.w = width; s_cap.h = height;
@@ -312,7 +312,7 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
             if (s_rec.fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s_rec.fb);
             s_rec.tex = bgfx_create_texture_2d(width, height, false, 1,
                 BGFX_TEXTURE_FORMAT_RGBA16F,
-                BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+                BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
             bgfx_texture_handle_t ths[1] = { s_rec.tex };
             s_rec.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
             s_rec.w = width; s_rec.h = height;

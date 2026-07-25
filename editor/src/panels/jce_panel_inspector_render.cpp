@@ -10,6 +10,7 @@
 #include <jce/renderer/jce_impostor.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/resource/jce_mesh_lod.h>
 #include "scene/jce_editor_scene_asset_cache.h"
 
 static bool is_mat_json(const char *path)
@@ -94,23 +95,10 @@ static bool save_renderer_to_material_file(const JceMeshRenderer *mr)
     return true;
 }
 
-static void accept_material_drop(JceMeshRenderer *mr)
-{
-    if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
-            const char *path = (const char *)payload->Data;
-            char rel[1024];
-            const char *stored = jce_editor_path_relative_or(rel, sizeof(rel), path);
-            jce_state_begin_batch_edit();
-            snprintf(mr->material_path, sizeof(mr->material_path),
-                     "%s", stored);
-            load_material_into_renderer(mr);
-            jce_state_end_batch_edit();
-        }
-        ImGui::EndDragDropTarget();
-    }
-}
+/* accept_material_drop() was removed: jce_draw_path_input owns the
+ * JCE_DND_ASSET_PATH target, so this second one landed on the trailing
+ * browse/clear button rather than the text field.  The material-field call site
+ * now reads JcePathInputOpts::dropped_raw and reloads from there. */
 
 void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 {
@@ -132,20 +120,38 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 
     ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.mesh"));
     ImGui::SameLine();
-    jce_draw_path_input_asset("##mesh_path", mr->mesh_path, sizeof(mr->mesh_path), JCE_ASSET_KIND_MODEL);
+    /* The widget owns the drop target and hands back the raw absolute path;
+     * the material import needs that, not the relativized mr->mesh_path. */
+    char mesh_dropped[1024] = {0};
+    jce_draw_path_input_asset_dnd("##mesh_path", mr->mesh_path, sizeof(mr->mesh_path),
+                                  mesh_dropped, sizeof(mesh_dropped),
+                                  JCE_ASSET_KIND_MODEL);
     insp_track_edit();
-    accept_mesh_drop_with_material(mr);
+    if (mesh_dropped[0]) {
+        jce_state_begin_batch_edit();
+        apply_mesh_drop_material(mr, mesh_dropped);
+        jce_state_end_batch_edit();
+    }
 
     ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.materials"));
     ImGui::SameLine();
-    jce_draw_path_input_asset("##mat_path", mr->material_path, sizeof(mr->material_path), JCE_ASSET_KIND_MATERIAL);
+    char mat_dropped[1024] = {0};
+    jce_draw_path_input_asset_dnd("##mat_path", mr->material_path, sizeof(mr->material_path),
+                                  mat_dropped, sizeof(mat_dropped),
+                                  JCE_ASSET_KIND_MATERIAL);
     if (ImGui::IsItemDeactivatedAfterEdit() && is_mat_json(mr->material_path)) {
         jce_state_begin_batch_edit();
         load_material_into_renderer(mr);
         jce_state_end_batch_edit();
     }
     insp_track_edit();
-    accept_material_drop(mr);
+    /* Dropping a .mat.json must load it, not just store the path.  The widget
+     * has already written the relativized path into mr->material_path. */
+    if (mat_dropped[0] && is_mat_json(mr->material_path)) {
+        jce_state_begin_batch_edit();
+        load_material_into_renderer(mr);
+        jce_state_end_batch_edit();
+    }
     if (is_mat_json(mr->material_path)) {
         ImGui::SameLine();
         if (ImGui::SmallButton(jce_editor_i18n("codeViewer.reload"))) {
@@ -266,22 +272,19 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     }
 
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.textures"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        /* jce_draw_path_input_asset already installs the JCE_DND_ASSET_PATH
+         * drop target on the text field — no accept_asset_drop() needed. */
         jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.albedo"), mr->albedo_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(mr->albedo_tex, 128);
         jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.metalRough"), mr->mr_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(mr->mr_tex, 128);
         jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.normal"), mr->normal_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(mr->normal_tex, 128);
         jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.ao"), mr->ao_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(mr->ao_tex, 128);
         snprintf(lbl, sizeof(lbl), "%s###tex", jce_editor_i18n("inspector.texture.emissive"));
         jce_draw_path_input_asset(lbl, mr->emissive_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        accept_asset_drop(mr->emissive_tex, 128);
         ImGui::TreePop();
     }
 
@@ -312,7 +315,6 @@ void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
 {
     jce_draw_path_input_asset(jce_editor_i18n("spriteRenderer.sprite"), sr->sprite_path, 128, JCE_ASSET_KIND_TEXTURE);
     insp_track_edit();
-    accept_asset_drop(sr->sprite_path, 128);
     ImGui::ColorEdit4(jce_editor_i18n("spriteRenderer.color"), sr->color);
     INSP_RESET_CTX("##rst_spriteColor",
                    sr->color[0] = 1.0f; sr->color[1] = 1.0f;
@@ -331,7 +333,6 @@ void draw_comp_skybox(JceSkyboxComponent *sky)
 {
     jce_draw_path_input_asset(jce_editor_i18n("skybox.hdrPath"), sky->hdr_path, 256, JCE_ASSET_KIND_TEXTURE);
     insp_track_edit();
-    accept_asset_drop(sky->hdr_path, 256);
     ImGui::DragFloat(jce_editor_i18n("skybox.rotation"), &sky->rotation, 1.0f, 0.0f, 360.0f, "%.1f deg");
     insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n("skybox.exposure"), &sky->exposure, 0.01f, 0.01f, 10.0f, "%.2f");
@@ -339,23 +340,6 @@ void draw_comp_skybox(JceSkyboxComponent *sky)
     if (sky->exposure <= 0.0f) sky->exposure = 1.0f;
     if (ImGui::Checkbox(jce_editor_i18n("skybox.useAsIbl"), &sky->use_as_ibl))
         insp_undo_bool(&sky->use_as_ibl);
-}
-
-/* The cook auto-LOD core (engine resource layer, INTERNAL header not in the
- * public include tree).  Declared here so the inspector can PREVIEW the exact
- * chain the cook will persist into the .glb (per-level triangle counts), driven
- * over the same loose mesh the editor already loads.  Symbols are linked from
- * the engine; signature mirrors jce_mesh_lod_cook.h. */
-extern "C" {
-extern const float JCE_MESH_LOD_DEFAULT_RATIOS[];
-size_t jce_mesh_generate_lod_chain(const float *positions, size_t vertex_count,
-                                   size_t position_stride_bytes,
-                                   const unsigned int *base_indices,
-                                   size_t base_index_count,
-                                   const float *target_ratios, size_t level_count,
-                                   unsigned int **out_level_indices,
-                                   size_t *out_level_index_counts);
-void jce_mesh_lod_chain_free(unsigned int **level_indices, size_t level_count);
 }
 
 /* Cached LOD preview for the last "Generate LODs" press (one slot; the inspector
@@ -407,12 +391,13 @@ static void lod_preview_generate(JceScene *scene, JceEntity e,
         pos[v * 3 + 2] = cpu.vertices[v].pos[2];
     }
 
-    unsigned int *lvl_idx[8] = {};
-    size_t        lvl_cnt[8] = {};
+    unsigned int *lvl_idx[JCE_MESH_LOD_MAX_LEVELS] = {};
+    size_t        lvl_cnt[JCE_MESH_LOD_MAX_LEVELS] = {};
     size_t levels = jce_mesh_generate_lod_chain(
         pos.data(), cpu.vertex_count, 3 * sizeof(float),
         cpu.indices, cpu.index_count,
-        JCE_MESH_LOD_DEFAULT_RATIOS, 3u, lvl_idx, lvl_cnt);
+        JCE_MESH_LOD_DEFAULT_RATIOS, JCE_MESH_LOD_DEFAULT_LEVEL_COUNT,
+        lvl_idx, lvl_cnt);
 
     s_lod_preview.base_tris = cpu.index_count / 3;
     s_lod_preview.lod_count = 0;
@@ -601,7 +586,6 @@ void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e)
         jce_draw_path_input_asset(jce_editor_i18n("inspector.lod.meshOverride"), lg->level_mesh_paths[i],
                          sizeof lg->level_mesh_paths[i], JCE_ASSET_KIND_MODEL);
         insp_track_edit();
-        accept_asset_drop(lg->level_mesh_paths[i], sizeof lg->level_mesh_paths[i]);
         ImGui::Separator();
         ImGui::PopID();
     }
@@ -645,7 +629,6 @@ void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e)
                      lg->impostor_meta_path, sizeof lg->impostor_meta_path,
                      JCE_ASSET_KIND_MODEL);
     insp_track_edit();
-    accept_asset_drop(lg->impostor_meta_path, sizeof lg->impostor_meta_path);
 
     if (lg->impostor_meta_path[0]) {
         JceImpostorMeta meta;
@@ -676,7 +659,6 @@ void draw_comp_trail_renderer(JceTrailRendererComponent *t)
     if (!t) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
-    accept_asset_drop(t->material_path, sizeof t->material_path);
     ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.time", "trail"), &t->time, 0.05f, 0.0f, 600.0f, "%.2fs"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.minVertexDistance", "trail"), &t->min_vertex_distance, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.widthStart", "trail"), &t->width_start, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
@@ -695,7 +677,6 @@ void draw_comp_line_renderer(JceLineRendererComponent *l)
     if (!l) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
-    accept_asset_drop(l->material_path, sizeof l->material_path);
     int n = l->position_count;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.line.positions", "line"), &n, 1.0f, 0, JCE_LINE_MAX_POINTS)) {
         if (n < 0) n = 0; if (n > JCE_LINE_MAX_POINTS) n = JCE_LINE_MAX_POINTS;
@@ -725,7 +706,6 @@ void draw_comp_decal(JceDecalComponent *d)
     if (!d) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.decal.material", "decal"), d->material_path, sizeof d->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
-    accept_asset_drop(d->material_path, sizeof d->material_path);
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.decal.size", "decal"),  d->size,  0.05f, 0.0f, 1000.0f, "%.3f"); insp_track_edit();
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.decal.pivot", "decal"), d->pivot, 0.05f); insp_track_edit();
     ImGui::ColorEdit4(jce_editor_i18n_id("inspector.decal.color", "decal"), d->color); insp_track_edit();

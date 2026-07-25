@@ -9,33 +9,9 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "jce_panel_common.h"
 
 namespace {
-
-bool substr_ci(const char *hay, const char *needle)
-{
-    if (!hay || !needle || !*needle)
-        return false;
-    for (const char *h = hay; *h; ++h) {
-        const char *a = h;
-        const char *b = needle;
-        while (*a && *b) {
-            unsigned char ca = (unsigned char)*a;
-            unsigned char cb = (unsigned char)*b;
-            if (ca >= 'A' && ca <= 'Z')
-                ca = (unsigned char)(ca + ('a' - 'A'));
-            if (cb >= 'A' && cb <= 'Z')
-                cb = (unsigned char)(cb + ('a' - 'A'));
-            if (ca != cb)
-                break;
-            ++a;
-            ++b;
-        }
-        if (!*b)
-            return true;
-    }
-    return false;
-}
 
 bool component_matches_filter(const JceEditorComponentDescriptor *desc,
                               const char *filter)
@@ -43,7 +19,7 @@ bool component_matches_filter(const JceEditorComponentDescriptor *desc,
     if (!desc || !filter || !*filter)
         return true;
 
-    if (substr_ci(desc->display_name, filter))
+    if (jce_panel_contains_ci(desc->display_name, filter))
         return true;
 
     if (!desc->i18n_key)
@@ -53,7 +29,7 @@ bool component_matches_filter(const JceEditorComponentDescriptor *desc,
     for (int li = 0; li < n_loc; ++li) {
         const char *loc_name = jce_editor_i18n_lookup_locale(
             (JceLocale)li, desc->i18n_key);
-        if (substr_ci(loc_name, filter))
+        if (jce_panel_contains_ci(loc_name, filter))
             return true;
     }
     return false;

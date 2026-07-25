@@ -375,7 +375,7 @@ int ck_engine_smoke_run(void)
 
 static bool s_ecs_audio(void *world)
 {
-    JceAudioEcs *a = jce_audio_ecs_create((ecs_world_t *)world, NULL, NULL, NULL);
+    JceAudioEcs *a = jce_audio_ecs_create(world, NULL, NULL, NULL);
     EXPECT(a != NULL, "create with all-NULL modules ok");
 
     /* All ticks must be no-ops with NULL modules and empty world. */
@@ -393,7 +393,7 @@ static bool s_ecs_audio(void *world)
 static bool s_ecs_ai(void *world)
 {
     /* Without an astar context the path tick must still no-op. */
-    JceAiEcs *a = jce_ai_ecs_create((ecs_world_t *)world, NULL);
+    JceAiEcs *a = jce_ai_ecs_create(world, NULL);
     EXPECT(a != NULL, "create without astar ok");
     jce_ai_ecs_tick_steering(a, 0.016f);
     jce_ai_ecs_tick_paths(a, 8);
@@ -401,7 +401,7 @@ static bool s_ecs_ai(void *world)
 
     /* With a real astar the lifetime still works. */
     JceGraphAstar *gs = jce_graph_astar_create();
-    JceAiEcs *b = jce_ai_ecs_create((ecs_world_t *)world, gs);
+    JceAiEcs *b = jce_ai_ecs_create(world, gs);
     EXPECT(b != NULL, "create with astar ok");
     jce_ai_ecs_tick_paths(b, 4);
     jce_ai_ecs_destroy(b);
@@ -413,7 +413,7 @@ static bool s_ecs_world(void *world)
 {
     JceTriggerWorld *tw = jce_trigger_world_create();
     EXPECT(tw != NULL, "trigger world create");
-    JceWorldEcs *we = jce_world_ecs_create((ecs_world_t *)world, tw);
+    JceWorldEcs *we = jce_world_ecs_create(world, tw);
     EXPECT(we != NULL, "world ecs create");
 
     jce_world_ecs_tick_triggers(we);
@@ -427,7 +427,7 @@ static bool s_ecs_world(void *world)
 static bool s_ecs_renderer(void *world)
 {
     /* SSR/VFog modules need bgfx — pass NULL to test the adapter alone. */
-    JceRendererEcs *re = jce_renderer_ecs_create((ecs_world_t *)world, NULL, NULL);
+    JceRendererEcs *re = jce_renderer_ecs_create(world, NULL, NULL);
     EXPECT(re != NULL, "create with NULL effects ok");
 
     /* Tick with an empty world: no entity carries the component, so tick

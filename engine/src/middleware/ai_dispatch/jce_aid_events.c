@@ -13,7 +13,10 @@
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
 
-#include <stdio.h>
+/* Sequential record/replay handles: the OS one-shot helpers cannot express
+ * "open once, write one entry per publish", so this is the sanctioned
+ * streaming adapter (same shape as jce_input_record.c). */
+#include <SDL3/SDL_iostream.h>
 
 #define AID_JARC_VERSION 1u
 #define LOG_TAG "ai_dispatch"
@@ -109,13 +112,14 @@ jce_aid_publish_record(struct jce_event_bus* bus, const JceAidRecord* rec)
     log_append(st, wire, (uint16_t)len);
 
     if (st->stream_file) {
-        FILE*   f = (FILE*)st->stream_file;
-        uint8_t hdr[2];
+        SDL_IOStream* io = (SDL_IOStream*)st->stream_file;
+        uint8_t       hdr[2];
         hdr[0] = (uint8_t)len;
         hdr[1] = (uint8_t)((uint16_t)len >> 8);
-        if (fwrite(hdr, 1, 2, f) != 2 || fwrite(wire, 1, len, f) != len) {
+        if (SDL_WriteIO(io, hdr, 2) != 2 ||
+            SDL_WriteIO(io, wire, len) != len) {
             LOG_WARN(LOG_TAG, "record stream write failed -- stream closed");
-            fclose(f);
+            SDL_CloseIO(io);
             st->stream_file = NULL;
         }
     }
@@ -129,25 +133,25 @@ jce_aid_publish_record(struct jce_event_bus* bus, const JceAidRecord* rec)
 
 JceAidResult JCE_CALL jce_aid_stream_record_open(const char* path)
 {
-    JceAidState* st = jce_aid_state();
-    FILE*        f;
-    uint8_t      hdr[16];
+    JceAidState*  st = jce_aid_state();
+    SDL_IOStream* io;
+    uint8_t       hdr[16];
 
     if (!st) return JCE_AID_ERR_NOT_INIT;
     if (!path) return JCE_AID_ERR_INVALID_ARG;
     if (st->stream_file) return JCE_AID_ERR_DUPLICATE;
 
-    f = fopen(path, "wb");
-    if (!f) return JCE_AID_ERR_INVALID_ARG;
+    io = SDL_IOFromFile(path, "wb");
+    if (!io) return JCE_AID_ERR_INVALID_ARG;
 
     hdr[0] = 'J'; hdr[1] = 'A'; hdr[2] = 'R'; hdr[3] = 'C';
     hdr[4] = (uint8_t)AID_JARC_VERSION; hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
     memset(hdr + 8, 0, 8); /* pad */
-    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
-        fclose(f);
+    if (SDL_WriteIO(io, hdr, sizeof(hdr)) != sizeof(hdr)) {
+        SDL_CloseIO(io);
         return JCE_AID_ERR_INVALID_ARG;
     }
-    st->stream_file = f;
+    st->stream_file = io;
     return JCE_AID_OK;
 }
 
@@ -156,11 +160,11 @@ void JCE_CALL jce_aid_stream_close(void)
     JceAidState* st = jce_aid_state();
     if (!st) return;
     if (st->stream_file) {
-        fclose((FILE*)st->stream_file);
+        SDL_CloseIO((SDL_IOStream*)st->stream_file);
         st->stream_file = NULL;
     }
     if (st->replay_file) {
-        fclose((FILE*)st->replay_file);
+        SDL_CloseIO((SDL_IOStream*)st->replay_file);
         st->replay_file = NULL;
     }
     st->replay_active = 0;
@@ -174,21 +178,21 @@ void JCE_CALL jce_aid_stream_close(void)
  * a corrupted stream must never silently skip records. */
 static void replay_prefetch(JceAidState* st)
 {
-    FILE*    f = (FILE*)st->replay_file;
-    uint8_t  hdr[2];
-    uint16_t len;
+    SDL_IOStream* io = (SDL_IOStream*)st->replay_file;
+    uint8_t       hdr[2];
+    uint16_t      len;
 
     st->replay_has_pending = 0;
-    if (!f) return;
+    if (!io) return;
 
-    if (fread(hdr, 1, 2, f) != 2) goto eof; /* clean EOF */
+    if (SDL_ReadIO(io, hdr, 2) != 2) goto eof; /* clean EOF */
     len = (uint16_t)(hdr[0] | ((uint16_t)hdr[1] << 8));
     if (len < 55u || len > JCE_AID_MAX_RECORD_SIZE) {
         LOG_WARN(LOG_TAG, "replay: bad entry length %u -- stopping",
                  (unsigned)len);
         goto eof;
     }
-    if (fread(st->replay_pending_buf, 1, len, f) != len) {
+    if (SDL_ReadIO(io, st->replay_pending_buf, len) != len) {
         LOG_WARN(LOG_TAG, "replay: truncated entry -- stopping");
         goto eof;
     }
@@ -202,30 +206,30 @@ static void replay_prefetch(JceAidState* st)
     return;
 
 eof:
-    fclose(f);
+    SDL_CloseIO(io);
     st->replay_file = NULL;
     st->replay_active = 0;
 }
 
 JceAidResult JCE_CALL jce_aid_replay_open(const char* path)
 {
-    JceAidState* st = jce_aid_state();
-    FILE*        f;
-    uint8_t      hdr[16];
+    JceAidState*  st = jce_aid_state();
+    SDL_IOStream* io;
+    uint8_t       hdr[16];
 
     if (!st) return JCE_AID_ERR_NOT_INIT;
     if (!path) return JCE_AID_ERR_INVALID_ARG;
     if (st->replay_file || st->replay_active) return JCE_AID_ERR_DUPLICATE;
 
-    f = fopen(path, "rb");
-    if (!f) return JCE_AID_ERR_INVALID_ARG;
-    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+    io = SDL_IOFromFile(path, "rb");
+    if (!io) return JCE_AID_ERR_INVALID_ARG;
+    if (SDL_ReadIO(io, hdr, sizeof(hdr)) != sizeof(hdr) ||
         hdr[0] != 'J' || hdr[1] != 'A' || hdr[2] != 'R' || hdr[3] != 'C' ||
         hdr[4] != (uint8_t)AID_JARC_VERSION) {
-        fclose(f);
+        SDL_CloseIO(io);
         return JCE_AID_ERR_BAD_FORMAT;
     }
-    st->replay_file   = f;
+    st->replay_file   = io;
     st->replay_active = 1;
     replay_prefetch(st);
     if (!st->replay_has_pending && !st->replay_file) {

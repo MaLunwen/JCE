@@ -6,6 +6,7 @@
  * (currently emit a console log; engine-side bake pipeline TBD).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
@@ -170,16 +171,9 @@ extern "C" void jce_editor_panel_reflection_probes_content(void)
  * keep working. */
 extern "C" void jce_editor_panel_reflection_probes(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
-    if (ls_vis) *ls_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###lighting_settings",
-             jce_editor_i18n("panel.lighting.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_lighting_settings_request_tab(3);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_REFLECTION_PROBES,
+                                        JCE_PANEL_LIGHTING_SETTINGS,
+                                        "panel.lighting.title",
+                                        "lighting_settings"))
+        jce_panel_lighting_settings_request_tab(3);
 }

@@ -28,6 +28,8 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
+#include "jce_panel_node_canvas.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
@@ -468,8 +470,7 @@ static void draw_links(ImVec2 origin)
         node_sockets(b->type, &bc);
         ImVec2 p1(origin.x + a->pos.x + 180 - 6, origin.y + a->pos.y + 28 + L.from_socket * 18 + 6);
         ImVec2 p2(origin.x + b->pos.x + 6,       origin.y + b->pos.y + 28 + L.to_socket   * 18 + 6);
-        ImVec2 c1(p1.x + 60, p1.y), c2(p2.x - 60, p2.y);
-        dl->AddBezierCubic(p1, c1, c2, p2, IM_COL32(220, 200, 80, 220), 2.0f);
+        jce_node_canvas_draw_link(dl, p1, p2, 60.0f, IM_COL32(220, 200, 80, 220), 2.0f);
     }
 }
 
@@ -503,14 +504,11 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 origin = ImGui::GetCursorScreenPos();
 
-    /* Background grid. */
+    /* Background grid — anchored to the child window, not the cursor: this
+     * canvas has no pan/zoom, so the grid never scrolls. */
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImVec2 ws = ImGui::GetWindowSize();
-    for (float x = 0; x < ws.x; x += 32)
-        dl->AddLine(ImVec2(wp.x + x, wp.y), ImVec2(wp.x + x, wp.y + ws.y), jce_theme::grid_minor());
-    for (float y = 0; y < ws.y; y += 32)
-        dl->AddLine(ImVec2(wp.x, wp.y + y), ImVec2(wp.x + ws.x, wp.y + y), jce_theme::grid_minor());
+    jce_node_canvas_draw_grid(dl, ImGui::GetWindowPos(), ImGui::GetWindowSize(),
+                              32.0f, ImVec2(0, 0), jce_theme::grid_minor());
 
     draw_links(origin);
     for (auto &n : s_g.nodes) draw_node(n);
@@ -521,7 +519,7 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
         if (a) {
             ImVec2 p1(origin.x + a->pos.x + 180 - 6, origin.y + a->pos.y + 28 + s_state.link_from_sock * 18 + 6);
             ImVec2 p2 = ImGui::GetIO().MousePos;
-            dl->AddBezierCubic(p1, ImVec2(p1.x + 60, p1.y), ImVec2(p2.x - 60, p2.y), p2, IM_COL32(255, 255, 100, 200), 2.0f);
+            jce_node_canvas_draw_link(dl, p1, p2, 60.0f, IM_COL32(255, 255, 100, 200), 2.0f);
         }
         if (ImGui::IsMouseClicked(1)) s_state.linking = false;
     }
@@ -559,16 +557,9 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
  * working. */
 extern "C" void jce_editor_panel_vfx_graph(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
-    if (mg_vis) *mg_vis = true;
-
-    char title[96];
-    snprintf(title, sizeof(title), "%s###jce_material_graph",
-             jce_editor_i18n("materialGraph.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_material_graph_request_tab(2);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_VFX_GRAPH,
+                                        JCE_PANEL_MATERIAL_GRAPH,
+                                        "materialGraph.title",
+                                        "jce_material_graph"))
+        jce_panel_material_graph_request_tab(2);
 }

@@ -14,6 +14,17 @@
  *
  * Multiple files sharing a basename are stored; the *shortest* absolute
  * path wins on lookup (heuristic: shorter = closer to project root).
+ *
+ * NOT the asset database.  editor/src/core/jce_assetdb.* indexes the same
+ * tree and the split is deliberate (REF-019): the DB maps an exact
+ * normalized ABSOLUTE PATH -> asset KIND plus a project-relative path, and
+ * enumerates in insertion order for the asset browser / picker; it is built
+ * synchronously so set_root() is queryable the moment it returns.  This
+ * index maps a FUZZY BASENAME -> absolute path for repairing stale
+ * references, is built on a worker and swapped in whole, and publishes a
+ * generation counter for the resolver's negative cache.  Different key,
+ * different value, different lifecycle — do not fold them together.  What
+ * they SHOULD share is one tree walk; today they still do two.
  */
 
 #ifndef JCE_ASSET_PATH_INDEX_H
@@ -31,7 +42,10 @@ void jce_asset_path_index_clear(void);
 
 /* Recursively scan `root`, adding every regular file to the index.
  * Safe to call multiple times for several roots; entries accumulate.
- * Skips dot-prefixed directories, build/, .git/, node_modules/.
+ * Skips .git/, node_modules/, CMakeFiles/, .vs/, .cache_* and the noisy
+ * per-user directories that matter when the editor is launched from $HOME.
+ * Build outputs are deliberately NOT skipped here (unlike the asset DB):
+ * a reference may legitimately resolve to a file under dist/ or build/.
  * Returns number of files indexed in this call.
  *
  * Synchronous: blocks the caller for the whole walk (up to a 3 s / 50k
@@ -70,5 +84,13 @@ uint32_t jce_asset_path_index_generation(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* The fuzzy name-normalization helpers this index builds its keys with —
+ * namespace jce_asset_name: lower_copy / alphanum_lower / split_stem_ext /
+ * strip_asset_prefix — are deliberately NOT declared here: this header is
+ * included from inside an `extern "C"` block by at least one panel, where a
+ * namespace taking std::string would acquire C language linkage.  They live
+ * in jce_asset_path_index.cpp and are declared where they are consumed
+ * (jce_asset_cache_resolve.cpp).  One definition, no copies (REF-019). */
 
 #endif /* JCE_ASSET_PATH_INDEX_H */

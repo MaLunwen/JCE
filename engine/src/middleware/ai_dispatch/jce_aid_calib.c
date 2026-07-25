@@ -14,6 +14,8 @@
  * are rejected and T3 falls back to the frozen uniform path. */
 #include "jce_aid_internal.h"
 
+#include <jce/os/core/jce_filesystem.h>
+
 #include <stdio.h>
 
 #define AID_CALIB_CAP     256u
@@ -310,12 +312,9 @@ JceAidResult JCE_CALL jce_aid_calib_fit(JceAidSchemaId id)
     /* ---- persist (JCAL v1) ---- */
     {
         char path[512];
-        FILE* fp;
         snprintf(path, sizeof(path), "%s/aid_calib_%016llx.bin",
                  st->calib_dir ? st->calib_dir : ".",
                  (unsigned long long)id);
-        fp = fopen(path, "wb");
-        if (!fp) return JCE_AID_ERR_INVALID_ARG;
         {
             /* serialise into a memory blob first so the checksum covers
              * everything before the trailer */
@@ -325,7 +324,7 @@ JceAidResult JCE_CALL jce_aid_calib_fit(JceAidSchemaId id)
             uint8_t* blob = (uint8_t*)jce_aid_malloc(cap + 8);
             size_t   n = 0;
             uint16_t e;
-            if (!blob) { fclose(fp); return JCE_AID_ERR_LIMIT; }
+            if (!blob) return JCE_AID_ERR_LIMIT;
 
             blob[n++] = 'J'; blob[n++] = 'C'; blob[n++] = 'A'; blob[n++] = 'L';
             wr_u32(blob + n, AID_CALIB_FILE_V);          n += 4;
@@ -363,14 +362,15 @@ JceAidResult JCE_CALL jce_aid_calib_fit(JceAidSchemaId id)
             wr_u64(blob + n, jce_aid_hash64(blob, n));
             n += 8;
 
-            if (fwrite(blob, 1, n, fp) != n) {
+            /* Atomic: a torn table survives its own checksum only by luck,
+             * and a half-written file would cost the whole reservoir --
+             * losing the table outright is the cheaper failure. */
+            if (!jce_fs_host_write_all_atomic(path, blob, n)) {
                 jce_aid_free(blob);
-                fclose(fp);
                 return JCE_AID_ERR_INVALID_ARG;
             }
             jce_aid_free(blob);
         }
-        fclose(fp);
     }
     return JCE_AID_OK;
 }
@@ -383,7 +383,6 @@ JceAidResult JCE_CALL jce_aid_calib_load(JceAidSchemaId id)
     const JceAidSchema* s;
     JceAidCalib*        c = NULL;
     char                path[512];
-    FILE*               fp;
     uint8_t*            blob = NULL;
     size_t              n = 0;
     JceAidResult        result = JCE_AID_ERR_BAD_FORMAT;
@@ -394,23 +393,22 @@ JceAidResult JCE_CALL jce_aid_calib_load(JceAidSchemaId id)
 
     snprintf(path, sizeof(path), "%s/aid_calib_%016llx.bin",
              st->calib_dir ? st->calib_dir : ".", (unsigned long long)id);
-    fp = fopen(path, "rb");
-    if (!fp) return JCE_AID_ERR_NOT_FOUND;
-    fseek(fp, 0, SEEK_END);
     {
-        long sz = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (sz < 32 || sz > (1 << 22)) { fclose(fp); return JCE_AID_ERR_BAD_FORMAT; }
-        blob = (uint8_t*)jce_aid_malloc((size_t)sz);
-        if (!blob) { fclose(fp); return JCE_AID_ERR_LIMIT; }
-        if (fread(blob, 1, (size_t)sz, fp) != (size_t)sz) {
-            jce_aid_free(blob);
-            fclose(fp);
+        /* Size first: the 1<<22 ceiling must reject an oversized (or hostile)
+         * file BEFORE it is pulled into memory.  read_capped is the host-only
+         * reader -- unlike read_all it never consults the active VFS, and the
+         * calibration table is always a real file next to the project. */
+        uint64_t sz = 0, got = 0;
+        if (!jce_fs_host_get_size(path, &sz)) return JCE_AID_ERR_NOT_FOUND;
+        if (sz < 32 || sz > (1 << 22)) return JCE_AID_ERR_BAD_FORMAT;
+        blob = (uint8_t*)jce_fs_host_read_capped(path, sz, &got, NULL);
+        if (!blob) return JCE_AID_ERR_LIMIT;
+        if (got != sz) {
+            jce_fs_buffer_free(blob);
             return JCE_AID_ERR_BAD_FORMAT;
         }
         n = (size_t)sz;
     }
-    fclose(fp);
 
     /* checksum + header validation; any failure = safe fallback */
     do {
@@ -494,7 +492,7 @@ JceAidResult JCE_CALL jce_aid_calib_load(JceAidSchemaId id)
         break;
     } while (0);
 
-    jce_aid_free(blob);
+    jce_fs_buffer_free(blob);
     return result;
 }
 

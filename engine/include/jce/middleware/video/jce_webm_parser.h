@@ -59,12 +59,12 @@ typedef struct JceWebmParser JceWebmParser;
 JCE_API bool jce_webm_is_webm(const void *data, size_t size);
 
 /* Open an in-memory WebM/Matroska stream. Buffer must outlive the parser. */
-JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
+JCE_API JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
                                     JceWebmInfo *out_info);
 
 /* Codec-private data (e.g. Vorbis 3-packet header, Opus extradata).
  * Pointer is owned by parser and valid until close. Returns false if absent. */
-bool jce_webm_get_audio_codec_private(JceWebmParser *p,
+JCE_API bool jce_webm_get_audio_codec_private(JceWebmParser *p,
                                       const uint8_t **out_data,
                                       size_t *out_size);
 
@@ -72,12 +72,12 @@ bool jce_webm_get_audio_codec_private(JceWebmParser *p,
  * call. Returns false at EOF or on error. *out_pts_ns is the block's
  * presentation timestamp in nanoseconds. *out_keyframe is true iff this
  * frame can be used as a seek target. */
-bool jce_webm_read_video_packet(JceWebmParser *p,
+JCE_API bool jce_webm_read_video_packet(JceWebmParser *p,
                                 const uint8_t **out_data, size_t *out_size,
                                 uint64_t *out_pts_ns, bool *out_keyframe);
 
 /* Read the next audio packet. Same lifetime rules. */
-bool jce_webm_read_audio_packet(JceWebmParser *p,
+JCE_API bool jce_webm_read_audio_packet(JceWebmParser *p,
                                 const uint8_t **out_data, size_t *out_size,
                                 uint64_t *out_pts_ns);
 

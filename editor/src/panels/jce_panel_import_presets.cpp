@@ -12,6 +12,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 
@@ -855,16 +856,9 @@ extern "C" void import_presets_draw_content(void)
  * JCE_PANEL_IMPORT_PRESETS keep working. */
 extern "C" void jce_editor_panel_import_presets(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_IMPORT_PRESETS);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *bb_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
-    if (bb_vis) *bb_vis = true;
-
-    char title[128];
-    std::snprintf(title, sizeof(title), "%s###bundle_browser",
-                  jce_editor_i18n("panel.bundle_browser.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_bundle_browser_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_IMPORT_PRESETS,
+                                        JCE_PANEL_BUNDLE_BROWSER,
+                                        "panel.bundle_browser.title",
+                                        "bundle_browser"))
+        jce_panel_bundle_browser_request_tab(1);
 }

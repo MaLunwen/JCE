@@ -5,6 +5,6 @@ os=Windows
 arch=x86
 compiler=msvc
 compiler.version=194
-compiler.cppstd=17
+compiler.cppstd=20
 compiler.runtime=dynamic
 compiler.runtime_type=Release

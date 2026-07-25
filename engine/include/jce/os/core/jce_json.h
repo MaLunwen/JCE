@@ -35,8 +35,36 @@ typedef struct cJSON JceJson;
  * failure.  When `len == 0`, treats `text` as NUL-terminated. */
 JCE_API JceJson *jce_json_parse(const char *text, size_t len);
 
-/* Read a file from disk and parse it.  Returns NULL on I/O or parse fail. */
+/* Read a file from disk and parse it.  Returns NULL on I/O or parse fail;
+ * jce_json_last_error() tells those two apart. */
 JCE_API JceJson *jce_json_parse_file(const char *path);
+
+/* ── Parse-failure diagnostics ─────────────────────────────────────── */
+
+/* Why the most recent jce_json_parse / jce_json_parse_file call on THIS
+ * thread returned NULL, e.g.
+ *   malformed JSON: line 42, column 7 (byte 1180), near ,"tint": [1,
+ *   cannot open file: No such file or directory
+ * Never NULL; "" when that call succeeded, or when this thread has not
+ * parsed anything yet.
+ *
+ * Threading: the record is thread-local, so an asset-loader thread cannot
+ * clobber the message the main thread is about to read.  The flip side is
+ * that it must be read on the SAME thread that received the NULL — reading
+ * it after a job-system hop yields the other thread's (probably empty)
+ * record.  The string is owned by the facade and is overwritten by the next
+ * parse on this thread; copy it if you keep it.
+ *
+ * cJSON's own cJSON_GetErrorPtr() is deliberately not surfaced: it reads a
+ * plain global inside cJSON, which is already wrong the moment two threads
+ * parse at once — and the engine does parse JSON off the main thread. */
+JCE_API const char *jce_json_last_error(void);
+
+/* Byte offset into the parsed text at which the parser stopped, for that
+ * same record.  (size_t)-1 when the failure was not a parse failure (absent
+ * or unreadable file, NULL input) or when there was no failure — which also
+ * makes this the "could not read it" vs "read it but it is broken" test. */
+JCE_API size_t JCE_CALL jce_json_last_error_offset(void);
 
 /* Construct empty container nodes. */
 JCE_API JceJson *jce_json_object(void);
@@ -65,13 +93,26 @@ JCE_API bool JCE_CALL jce_json_is_number(const JceJson *j);
 JCE_API bool JCE_CALL jce_json_is_string(const JceJson *j);
 JCE_API bool JCE_CALL jce_json_is_bool(const JceJson *j);
 
-JceJson *jce_json_get(const JceJson *obj, const char *key);   /* case-sensitive */
+JCE_API JceJson *jce_json_get(const JceJson *obj, const char *key);   /* case-sensitive */
 JCE_API bool JCE_CALL jce_json_has(const JceJson *obj, const char *key);
 
 /* Remove (and free) a member by key.  No-op when the key is absent.  Use
  * before a jce_json_set_* call to replace a key without leaving a duplicate
  * (the set helpers append rather than overwrite). */
 JCE_API void JCE_CALL jce_json_remove(JceJson *obj, const char *key);
+
+/* Detach `child` from `parent` WITHOUT freeing it: ownership transfers to the
+ * caller, which must either re-attach it (jce_json_array_push /
+ * jce_json_set_child) or free it (jce_json_free).
+ *
+ * This is the move primitive — the difference from jce_json_remove is that
+ * remove destroys the subtree.  Needed to relocate a node between documents
+ * without a print/re-parse round trip; the world partitioner moves entity
+ * nodes from the master scene into per-cell fragments this way.  Without it
+ * such callers had to reach past the facade for cJSON_DetachItemViaPointer.
+ *
+ * No-op if either argument is NULL or `child` is not a child of `parent`. */
+JCE_API void JCE_CALL jce_json_detach(JceJson *parent, JceJson *child);
 
 JCE_API int JCE_CALL jce_json_array_size(const JceJson *arr);
 JCE_API JceJson *jce_json_array_at(const JceJson *arr, int index);
@@ -85,7 +126,7 @@ JCE_API JceJson *jce_json_array_at(const JceJson *arr, int index);
  */
 JCE_API JceJson    *jce_json_first_child  (const JceJson *obj);
 JCE_API JceJson    *jce_json_next_sibling (const JceJson *node);
-const char *jce_json_member_key   (const JceJson *node);  /* may be NULL for array items */
+JCE_API const char *jce_json_member_key   (const JceJson *node);  /* may be NULL for array items */
 JCE_API const char *jce_json_string_value (const JceJson *node, const char *def);
 JCE_API double JCE_CALL jce_json_number_value(const JceJson *node, double def);
 
@@ -94,13 +135,13 @@ JCE_API double JCE_CALL jce_json_number_value(const JceJson *node, double def);
 JCE_API double JCE_CALL jce_json_get_number(const JceJson *obj, const char *key, double def);
 JCE_API int JCE_CALL jce_json_get_int(const JceJson *obj, const char *key, int def);
 JCE_API bool JCE_CALL jce_json_get_bool(const JceJson *obj, const char *key, bool def);
-const char *jce_json_get_string(const JceJson *obj, const char *key,
+JCE_API const char *jce_json_get_string(const JceJson *obj, const char *key,
                                 const char *def);
 
 /* "Any-of" variants: try each key in order; returns first hit or default. */
 JCE_API double JCE_CALL jce_json_get_number_any(const JceJson *obj,
                                     const char *const *keys, int n, double def);
-const char *jce_json_get_string_any(const JceJson *obj,
+JCE_API const char *jce_json_get_string_any(const JceJson *obj,
                                     const char *const *keys, int n,
                                     const char *def);
 

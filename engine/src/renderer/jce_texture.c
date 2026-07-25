@@ -1,27 +1,29 @@
 /*
  * jce_texture.c  Cross-platform texture loading implementation.
  *
- * Pipeline: PAK → decompress → SDL3_image → SDL_Surface → bgfx texture.
- * Handles pixel format conversion to RGBA8 for bgfx compatibility.
+ * Pipeline: PAK → decompress → jce_image decode → RGBA8 → bgfx texture.
+ * The decode itself belongs to the jce_image service — this file never
+ * picks a codec.
  */
 
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_jobs.h>      /* parallel mip downsample */
+#include <jce/os/core/jce_thread.h>    /* parallel mip downsample */
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/renderer/jce_image.h>    /* the one image-decode service */
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_filesystem.h> /* jce_fs_host_read_all (LUT host loader) */
 
+#include "jce_texture_internal.h"      /* jce_lut_strip_to_volume decl */
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
 #include "resource/jce_tex_compress.h"
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
+#include <SDL3/SDL.h>   /* SDL_Surface: the pre-decoded upload entry point */
 #include <stdbool.h>
 #include <string.h>
 
@@ -46,6 +48,8 @@ typedef struct {
     bool     has_source_pixels;   /* CPU copy retained for re-upload     */
     uint8_t *source_pixels;       /* RGBA8 mip-0 bytes (owned)           */
     int      sampler_mode;
+    uint8_t  bgfx_fmt;            /* bgfx_texture_format_t at creation
+                                     (0xFF = unknown / never batchable)  */
 } TexEntry;
 
 static TexEntry s_registry[MAX_TEXTURES];
@@ -55,6 +59,12 @@ static bool     s_registry_warned_full;
 /* Global mip bias state — driven by streaming pressure or tools. */
 static int8_t   s_global_mip_bias;
 static bool     s_global_mip_bias_set;
+/* Project Settings > Quality > Texture Quality (Full/Half/Quarter/Eighth ->
+ * 0/1/2/3): a BASE mip-drop that stacks (max) with streaming pressure. */
+static int8_t   s_texture_quality_bias;
+/* Project Settings > Graphics > Anisotropic Textures override: <0 keeps the
+ * tier default (aniso on HIGH+); 0 forces off; >0 forces on. */
+static int8_t   s_aniso_override = -1;
 
 /* VRAM ceiling (large-world-opt): when set, NEW raw-RGBA8 texture uploads
  * (the streamed-texture path: PAK PNG/JPG → SDL_Surface, and cooked RGBA8)
@@ -106,7 +116,8 @@ static uint8_t full_mip_count(uint32_t w, uint32_t h)
 #define REG_IDX_CAP 8192u   /* 2x bgfx default MAX_TEXTURES, 16KB static */
 static uint16_t s_reg_slot[REG_IDX_CAP];
 
-static void registry_add(uint16_t idx, uint32_t w, uint32_t h, uint8_t mip_count)
+static void registry_add(uint16_t idx, uint32_t w, uint32_t h, uint8_t mip_count,
+                         uint8_t bgfx_fmt)
 {
     if (s_count < MAX_TEXTURES) {
         TexEntry *e = &s_registry[s_count++];
@@ -120,6 +131,7 @@ static void registry_add(uint16_t idx, uint32_t w, uint32_t h, uint8_t mip_count
         e->max_top_mip      = compute_max_top_mip(w, h);
         e->resident_top_mip = 0;
         e->desired_top_mip  = 0;
+        e->bgfx_fmt         = bgfx_fmt;
         if (idx < REG_IDX_CAP)
             s_reg_slot[idx] = (uint16_t)s_count;   /* slot+1 */
         return;
@@ -188,21 +200,6 @@ static void registry_opt_in_streaming(uint16_t idx, uint32_t w, uint32_t h,
 
 /* -- Helpers -------------------------------------------------------- */
 
-/* Convert any SDL_Surface to RGBA8 (SDL_PIXELFORMAT_RGBA8888). */
-static SDL_Surface *ensure_rgba8(SDL_Surface *src)
-{
-    if (!src) return NULL;
-
-    if (src->format == SDL_PIXELFORMAT_RGBA32)
-        return src;
-
-    SDL_Surface *converted = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGBA32);
-    SDL_DestroySurface(src);
-    if (!converted)
-        LOG_ERROR(LOG_TAG, "SDL_ConvertSurface failed: %s", SDL_GetError());
-    return converted;
-}
-
 /* Map a cooked JCEASSET_TEXFMT_* GPU format to its bgfx texture format.
  * Block-compressed formats (BC/ASTC/ETC2) are uploaded as-is — the GPU
  * samples them directly with no runtime decode. Anything unrecognized
@@ -232,7 +229,12 @@ static uint64_t sampler_flags(int mode)
      * opt-in extra the charter reserves for capable devices).  UI/sprite (CLAMP)
      * textures are sampled ~1:1 and never benefit, so they skip it. */
     uint64_t aniso = 0;
-    if (jce_renderer_get_tier() >= JCE_GPU_TIER_HIGH)
+    /* Project Settings > Graphics > Anisotropic Textures overrides the tier
+     * default: <0 = tier gate (HIGH+); 0 = force off; >0 = force on. */
+    const bool want_aniso = (s_aniso_override < 0)
+        ? (jce_renderer_get_tier() >= JCE_GPU_TIER_HIGH)
+        : (s_aniso_override > 0);
+    if (want_aniso)
         aniso = BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
     switch (mode) {
     case JCE_TEX_WRAP:
@@ -249,13 +251,15 @@ static uint64_t sampler_flags(int mode)
 static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
                                  uint32_t *out_dw, uint32_t *out_dh); /* fwd (mip chain) */
 
-static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
+/* Core upload: RGBA8 rows at `pitch` bytes.  Both entry points (the decoded
+ * jce_image buffer and the pre-decoded SDL_Surface handed in by the async
+ * pool) funnel here so the tier cap / mip chain / streaming opt-in run
+ * identically whatever produced the pixels. */
+static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, uint32_t h,
+                                        uint32_t pitch, int mode)
 {
-    if (!surf) return JCE_TEXTURE_INVALID;
+    if (!src_pixels) return JCE_TEXTURE_INVALID;
 
-    uint32_t w = (uint32_t)surf->w;
-    uint32_t h = (uint32_t)surf->h;
-    uint32_t pitch = (uint32_t)surf->pitch;
     uint32_t expected_pitch = w * 4;
 
     /* Charter tier cap (512MB / weak-GPU baseline): runtime-uploaded SCENE
@@ -277,9 +281,9 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
             uint8_t *packed = (uint8_t *)JCE_MALLOC((size_t)w * h * 4u);
             if (packed) {
                 if (pitch == expected_pitch) {
-                    memcpy(packed, surf->pixels, (size_t)w * h * 4u);
+                    memcpy(packed, src_pixels, (size_t)w * h * 4u);
                 } else {
-                    const uint8_t *src = (const uint8_t *)surf->pixels;
+                    const uint8_t *src = src_pixels;
                     for (uint32_t y = 0; y < h; y++)
                         memcpy(packed + (size_t)y * expected_pitch,
                                src + (size_t)y * pitch, expected_pitch);
@@ -324,9 +328,9 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
         JCE_FREE(shrunk);
         shrunk = NULL;
     } else if (pitch == expected_pitch) {
-        memcpy(mem->data, surf->pixels, (size_t)w * h * 4u);
+        memcpy(mem->data, src_pixels, (size_t)w * h * 4u);
     } else {
-        const uint8_t *src = (const uint8_t *)surf->pixels;
+        const uint8_t *src = src_pixels;
         uint8_t *dst = mem->data;
         for (uint32_t y = 0; y < h; y++) {
             memcpy(dst, src, expected_pitch);
@@ -354,14 +358,15 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
         1,      /* layers */
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(mode),
-        mem);
+        mem, 0);
 
     if (handle.idx == UINT16_MAX) {
         LOG_ERROR(LOG_TAG, "bgfx_create_texture_2d failed (%ux%u)", w, h);
         return JCE_TEXTURE_INVALID;
     }
 
-    registry_add(handle.idx, w, h, full_mip_count(w, h));
+    registry_add(handle.idx, w, h, full_mip_count(w, h),
+                 (uint8_t)BGFX_TEXTURE_FORMAT_RGBA8);
     /* VRAM ceiling: streamed RGBA8 uploads retain a CPU mip-0 + opt into
      * streaming so mip-bias under pressure physically reclaims VRAM.  mem->data
      * is the tightly-packed RGBA8 we just filled (valid this frame, same
@@ -378,7 +383,9 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
 JceTexture jce_texture_load_from_surface(const void *surface, int sampler_mode)
 {
     if (!surface) return JCE_TEXTURE_INVALID;
-    return texture_from_surface_ex((const SDL_Surface *)surface, sampler_mode);
+    const SDL_Surface *surf = (const SDL_Surface *)surface;
+    return texture_from_rgba8_ex((const uint8_t *)surf->pixels, (uint32_t)surf->w,
+                                 (uint32_t)surf->h, (uint32_t)surf->pitch, sampler_mode);
 }
 
 JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path)
@@ -387,15 +394,18 @@ JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path)
 }
 
 /* CPU-side decode result (see jce_texture.h).  Holds EITHER a cooked
- * payload (is_cooked: info + concatenated mip pixels) OR a raw RGBA8
- * SDL_Surface.  Owns its buffers; upload_cpu/cpu_free release them. */
+ * payload (is_cooked: info + concatenated mip pixels) OR a raw, tightly
+ * packed RGBA8 buffer from the jce_image service.  Owns its buffers;
+ * upload_cpu/cpu_free release them (each with its own allocator). */
 struct JceTextureCpu {
     int             sampler_mode;
     bool            is_cooked;
     JceAssetTexInfo info;          /* cooked */
     void           *pixels;        /* cooked: owned TEX_PIXELS payload */
     size_t          pixel_bytes;
-    SDL_Surface    *surface;       /* raw: owned RGBA8 surface */
+    uint8_t        *rgba8;         /* raw: owned RGBA8, jce_image_free_rgba8 */
+    uint32_t        rgba8_w;
+    uint32_t        rgba8_h;
 };
 
 JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
@@ -407,7 +417,7 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
     /* Extension whitelist — silently reject obvious non-image assets.
      * Some scenes accidentally point texture fields at .obj / .glb /
      * .fbx files; the asset manager finds them in the PAK and feeds the
-     * bytes to IMG_Load which then spams ERROR every frame. Filtering by
+     * bytes to the decoder which then spams ERROR every frame. Filtering by
      * extension keeps the log clean and short-circuits the wasted work. */
     {
         const char *dot = strrchr(asset_path, '.');
@@ -505,31 +515,26 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
         return c;
     }
 
-    /* ── Raw path: PNG/JPG → SDL3_image → RGBA8 ── */
-    SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)asset->original_size);
-    if (!io) {
-        JCE_FREE(buf);
-        return NULL;
-    }
-
-    SDL_Surface *surf = IMG_Load_IO(io, true);  /* true = auto-close io */
+    /* ── Raw path: PNG/JPG → jce_image → RGBA8 ── */
+    int img_w = 0, img_h = 0;
+    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(buf, (uint64_t)asset->original_size,
+                                                      &img_w, &img_h);
     JCE_FREE(buf);
 
-    if (!surf) {
-        LOG_ERROR(LOG_TAG, "IMG_Load_IO failed for %s: %s",
-                  asset_path, SDL_GetError());
+    if (!rgba8) {
+        /* The codec-level reason is logged by the image service itself. */
+        LOG_ERROR(LOG_TAG, "image decode failed for %s", asset_path);
         return NULL;
     }
 
-    surf = ensure_rgba8(surf);
-    if (!surf) return NULL;
-
     JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
-    if (!c) { SDL_DestroySurface(surf); return NULL; }
+    if (!c) { jce_image_free_rgba8(rgba8); return NULL; }
     memset(c, 0, sizeof(*c));
     c->sampler_mode = sampler_mode;
     c->is_cooked    = false;
-    c->surface      = surf;
+    c->rgba8        = rgba8;
+    c->rgba8_w      = (uint32_t)img_w;
+    c->rgba8_h      = (uint32_t)img_h;
     return c;
 }
 
@@ -537,19 +542,19 @@ JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded, size_t size,
                                           int sampler_mode)
 {
     if (!encoded || size == 0) return NULL;
-    SDL_IOStream *io = SDL_IOFromConstMem(encoded, size);
-    if (!io) return NULL;
-    SDL_Surface *surf = IMG_Load_IO(io, true);   /* true = auto-close io */
-    if (!surf) return NULL;
-    surf = ensure_rgba8(surf);
-    if (!surf) return NULL;
+    int img_w = 0, img_h = 0;
+    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(encoded, (uint64_t)size,
+                                                      &img_w, &img_h);
+    if (!rgba8) return NULL;
 
     JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
-    if (!c) { SDL_DestroySurface(surf); return NULL; }
+    if (!c) { jce_image_free_rgba8(rgba8); return NULL; }
     memset(c, 0, sizeof(*c));
     c->sampler_mode = sampler_mode;
     c->is_cooked    = false;
-    c->surface      = surf;
+    c->rgba8        = rgba8;
+    c->rgba8_w      = (uint32_t)img_w;
+    c->rgba8_h      = (uint32_t)img_h;
     return c;
 }
 
@@ -626,8 +631,9 @@ JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
     if (c->is_cooked) {
         tex = jce_texture_from_cooked(&c->info, c->pixels, c->pixel_bytes,
                                       c->sampler_mode);
-    } else if (c->surface) {
-        tex = texture_from_surface_ex(c->surface, c->sampler_mode);
+    } else if (c->rgba8) {
+        tex = texture_from_rgba8_ex(c->rgba8, c->rgba8_w, c->rgba8_h,
+                                    c->rgba8_w * 4u, c->sampler_mode);
     }
     jce_texture_cpu_free(c);
     return tex;
@@ -636,8 +642,10 @@ JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
 void jce_texture_cpu_free(JceTextureCpu *c)
 {
     if (!c) return;
-    if (c->pixels)  JCE_FREE(c->pixels);
-    if (c->surface) SDL_DestroySurface(c->surface);
+    /* Each buffer goes back to the allocator that produced it: the cooked
+     * payload is ours, the raw pixels belong to the image service. */
+    if (c->pixels) JCE_FREE(c->pixels);
+    if (c->rgba8)  jce_image_free_rgba8(c->rgba8);
     JCE_FREE(c);
 }
 
@@ -661,9 +669,10 @@ JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
 /* Reorder a horizontal strip (N tiles of NxN laid left-to-right) to a
  * z-major N×N×N volume.  Tile z holds the slice where blue index == z.
  * strip_w = N*N texels per row.  Volume layout: out[(z*N + y)*N + x].
- * This is the authoritative implementation; tests/test_jce_postfx_lut.c
- * compiles its own identical copy to lock the contract. */
-static void jce_lut_strip_to_volume(const uint8_t *strip, int N, uint8_t *out)
+ * Declared in jce_texture_internal.h (external linkage, not JCE_API) so
+ * tests/renderer/test_jce_postfx_lut.c exercises THIS code instead of a
+ * copy that can pass while the shipped reorder is broken. */
+void jce_lut_strip_to_volume(const uint8_t *strip, int N, uint8_t *out)
 {
     int strip_w = N * N;
     for (int z = 0; z < N; z++)
@@ -677,15 +686,17 @@ static void jce_lut_strip_to_volume(const uint8_t *strip, int N, uint8_t *out)
             }
 }
 
-/* File-scope accessor: returns the raw surface pointer and writes dims.
- * Only valid when !c->is_cooked; returns NULL otherwise. */
-static SDL_Surface *texture_cpu_surface(const JceTextureCpu *c,
+/* File-scope accessor: returns the raw RGBA8 pixels and writes dims.
+ * Only valid when !c->is_cooked; returns NULL otherwise.  The buffer is
+ * tightly packed (row stride == w*4), which is what the strip reorder
+ * below assumes. */
+static const uint8_t *texture_cpu_rgba8(const JceTextureCpu *c,
                                         int *out_w, int *out_h)
 {
-    if (!c || c->is_cooked || !c->surface) return NULL;
-    if (out_w) *out_w = c->surface->w;
-    if (out_h) *out_h = c->surface->h;
-    return c->surface;
+    if (!c || c->is_cooked || !c->rgba8) return NULL;
+    if (out_w) *out_w = (int)c->rgba8_w;
+    if (out_h) *out_h = (int)c->rgba8_h;
+    return c->rgba8;
 }
 
 JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
@@ -699,12 +710,11 @@ JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
     /* Decode the strip to a CPU surface (reuses the worker decode path). */
     JceTextureCpu *c = jce_texture_decode_cpu(pak, asset_path, JCE_TEX_CLAMP);
     if (!c) return invalid;
-    /* Pull RGBA8 + dims out of the decoded result.  For raw surfaces this is
-     * c->surface.  V1 LUTs are plain PNGs, so handle the surface case;
-     * fall through to abort on cooked (which v1 LUTs never are). */
+    /* Pull RGBA8 + dims out of the decoded result.  V1 LUTs are plain PNGs,
+     * so handle the raw case; fall through to abort on cooked (which v1
+     * LUTs never are). */
     int img_w = 0, img_h = 0;
-    SDL_Surface *surf = texture_cpu_surface(c, &img_w, &img_h);
-    const uint8_t *pixels = surf ? (const uint8_t *)surf->pixels : NULL;
+    const uint8_t *pixels = texture_cpu_rgba8(c, &img_w, &img_h);
     if (!pixels || img_h <= 0 || img_w != img_h * img_h) {
         LOG_WARN(LOG_TAG, "LUT strip %s wrong shape (%dx%d; need N*N x N)",
                  asset_path, img_w, img_h);
@@ -719,7 +729,7 @@ JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
     bgfx_texture_handle_t h = bgfx_create_texture_3d(
         (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
         BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem);
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem, 0);
     JCE_FREE(vol);
     jce_texture_cpu_free(c);
     if (h.idx == UINT16_MAX) {
@@ -731,7 +741,7 @@ JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
      * letting the stomp derive ln=N and pass the correct lut_size to
      * jce_postfx_set_lut.  Without this the registry misses the 3D handle
      * and returns h=0, collapsing the shader UV to a uniform tint. */
-    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u);
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u, 0xFFu /* 3D LUT: not batchable */);
     JceTexture t = JCE_TEXTURE_INVALID;
     t.idx = h.idx;
     return t;
@@ -757,7 +767,7 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
         if (file_buf) jce_fs_buffer_free(file_buf);
         return invalid;
     }
-    /* Decode the in-memory PNG to an RGBA8 CPU surface. */
+    /* Decode the in-memory PNG to RGBA8 CPU pixels. */
     JceTextureCpu *c = jce_texture_decode_cpu_mem(file_buf, (size_t)file_size,
                                                   JCE_TEX_CLAMP);
     jce_fs_buffer_free(file_buf);
@@ -766,8 +776,7 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
         return invalid;
     }
     int img_w = 0, img_h = 0;
-    SDL_Surface *surf = texture_cpu_surface(c, &img_w, &img_h);
-    const uint8_t *pixels = surf ? (const uint8_t *)surf->pixels : NULL;
+    const uint8_t *pixels = texture_cpu_rgba8(c, &img_w, &img_h);
     if (!pixels || img_h <= 0 || img_w != img_h * img_h) {
         LOG_WARN(LOG_TAG, "LUT host strip %s wrong shape (%dx%d; need N*N x N)",
                  host_path, img_w, img_h);
@@ -782,7 +791,7 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
     bgfx_texture_handle_t h = bgfx_create_texture_3d(
         (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
         BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem);
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem, 0);
     JCE_FREE(vol);
     jce_texture_cpu_free(c);
     if (h.idx == UINT16_MAX) {
@@ -790,7 +799,7 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
         return invalid;
     }
     LOG_DEBUG(LOG_TAG, "loaded 3D LUT (host) %s (N=%d)", host_path, N);
-    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u);
+    registry_add(h.idx, (uint32_t)N, (uint32_t)N, 1u, 0xFFu /* 3D LUT: not batchable */);
     JceTexture t = JCE_TEXTURE_INVALID;
     t.idx = h.idx;
     return t;
@@ -807,12 +816,13 @@ JceTexture jce_texture_from_rgba(const void *data,
         false, 1,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL);
+        NULL, 0);
 
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
 
-    registry_add(handle.idx, width, height, 1u);
+    registry_add(handle.idx, width, height, 1u,
+                 (uint8_t)BGFX_TEXTURE_FORMAT_RGBA8);
 
     const uint32_t bytes = width * height * 4u;
     const bgfx_memory_t *mem = bgfx_alloc(bytes);
@@ -864,12 +874,14 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)info->width, (uint16_t)info->height,
         has_mips, 1, bgfx_fmt,
-        BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
+        BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem, 0);
 
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
 
-    registry_add(handle.idx, info->width, info->height, (uint8_t)(info->mip_count > 0u ? info->mip_count : 1u));
+    registry_add(handle.idx, info->width, info->height,
+                 (uint8_t)(info->mip_count > 0u ? info->mip_count : 1u),
+                 (uint8_t)bgfx_fmt);   /* cooked: RGBA8 or block-compressed */
     /* VRAM ceiling: only the uncompressed RGBA8 cooked format keeps a CPU
      * source for streaming demote — its mip-0 lives at offset 0 of the chunk as
      * plain RGBA8 (the box-filter downsample is RGBA8-only).  Block-compressed
@@ -917,9 +929,20 @@ bool jce_texture_update_rgba(JceTexture tex, const void *data,
     return true;
 }
 
-/* Zero-copy variant: bgfx takes a reference to caller-owned data.
- * Data must remain valid until bgfx_frame() is called (end of render frame).
- * Saves a ~33 MB memcpy per frame at 4K resolution vs jce_texture_update_rgba. */
+/* Upload caller-owned RGBA8 into an existing texture.
+ *
+ * HISTORY: this used bgfx_make_ref (zero-copy) with NO release callback,
+ * which imposed a "data must stay valid until bgfx_frame()" contract that
+ * the sole callers — the runtime video component (jce_scene_video.c) and
+ * the editor video viewer — could not honour: jce_video_unload / the
+ * display_rgba realloc free the buffer immediately (same frame) from flecs
+ * dtor/move hooks, entity delete, scene teardown and clip-path edits, so a
+ * video entity deleted on the frame it uploads left bgfx reading freed
+ * memory at submit (a reproducible UAF, worsened by mimalloc page purge).
+ * bgfx_copy makes bgfx own the pixels, removing the lifetime coupling.  The
+ * cost is one memcpy per *decoded* video frame (video fps, not render fps);
+ * a future zero-copy path would need bgfx_make_ref_release + a refcounted
+ * buffer or a 2-frame deferred-free list (see audit R-D41 / video-frame-ref-uaf). */
 bool jce_texture_update_rgba_ref(JceTexture tex, const void *data,
                                  uint32_t width, uint32_t height)
 {
@@ -931,7 +954,7 @@ bool jce_texture_update_rgba_ref(JceTexture tex, const void *data,
         return false;
 
     const uint32_t bytes = width * height * 4u;
-    const bgfx_memory_t *mem = bgfx_make_ref(data, bytes);
+    const bgfx_memory_t *mem = bgfx_copy(data, bytes);
 
     bgfx_texture_handle_t handle;
     handle.idx = tex.idx;
@@ -959,6 +982,12 @@ uint32_t jce_texture_get_mips(JceTexture tex)
 {
     TexEntry *e = registry_find(tex.idx);
     return (e && e->mip_count > 0) ? e->mip_count : 1u;
+}
+
+uint32_t jce_texture_get_format(JceTexture tex)
+{
+    TexEntry *e = registry_find(tex.idx);
+    return e ? (uint32_t)e->bgfx_fmt : UINT32_MAX;
 }
 
 
@@ -1030,7 +1059,8 @@ static int8_t clamp_bias(int b)
 static uint8_t effective_top_mip(const TexEntry *e)
 {
     int b = (int)caps_floor();
-    if ((int)s_global_mip_bias    > b) b = s_global_mip_bias;
+    if ((int)s_global_mip_bias      > b) b = s_global_mip_bias;
+    if ((int)s_texture_quality_bias > b) b = s_texture_quality_bias;
     if ((int)e->per_texture_bias  > b) b = e->per_texture_bias;
     if ((int)e->desired_top_mip   > b) b = e->desired_top_mip;
     if (b > (int)e->max_top_mip)  b = e->max_top_mip;
@@ -1112,7 +1142,7 @@ static bool mip_upload_gpu(TexEntry *e, uint8_t *px, uint32_t w, uint32_t h,
         (uint16_t)w, (uint16_t)h,
         false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(e->sampler_mode),
-        mem);
+        mem, 0);
 
     if (nh.idx == UINT16_MAX) {
         LOG_WARN(LOG_TAG,
@@ -1161,10 +1191,10 @@ typedef struct {
 } MipRecompute;
 
 /* Worker: downsample entries [begin,end) (pure CPU, disjoint writes). */
-static void mip_downsample_range(int begin, int end, void *user)
+static void mip_downsample_range(uint32_t begin, uint32_t end, void *user)
 {
     MipRecompute *list = (MipRecompute *)user;
-    for (int i = begin; i < end; i++) {
+    for (uint32_t i = begin; i < end; i++) {
         MipRecompute *m = &list[i];
         m->ok = mip_downsample_cpu(m->e, m->target,
                                    &m->pixels, &m->w, &m->h, &m->owned);
@@ -1222,6 +1252,17 @@ uint8_t jce_texture_get_resident_top_mip(JceTextureId tex)
     return e ? e->resident_top_mip : 0;
 }
 
+void jce_texture_set_quality_mip_bias(int8_t bias)
+{
+    s_texture_quality_bias = clamp_bias(bias);
+}
+
+void jce_texture_set_aniso_override(int mode)
+{
+    /* Store as-is: <0 tier default, 0 off, >0 forced on. */
+    s_aniso_override = (int8_t)(mode < -1 ? -1 : (mode > 2 ? 2 : mode));
+}
+
 void jce_texture_set_global_mip_bias(int8_t bias)
 {
     s_global_mip_bias     = clamp_bias(bias);
@@ -1262,11 +1303,12 @@ void jce_texture_set_global_mip_bias(int8_t bias)
     if (n == 0) { JCE_FREE(list); return; }
 
     /* Pass A: parallel CPU downsample (worker-safe, disjoint per-index). */
-    JceJobSystem *jobs = jce_jobs_default();
-    if (jobs && n >= 4)
-        jce_jobs_parallel_for(jobs, n, 0, mip_downsample_range, list);
+    JceThreadPool *pool = jce_thread_pool_shared();
+    if (pool && n >= 4)
+        jce_thread_pool_parallel_for(pool, (uint32_t)n, 0,
+                                     mip_downsample_range, list);
     else
-        mip_downsample_range(0, n, list);
+        mip_downsample_range(0u, (uint32_t)n, list);
 
     /* Pass B: serial GPU recreate on this (render) thread. */
     for (int i = 0; i < n; i++) {

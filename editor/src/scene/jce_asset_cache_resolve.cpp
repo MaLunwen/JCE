@@ -9,21 +9,51 @@
 #include "jce_asset_path_index.h"
 
 extern "C" {
-#include <jce/os/core/jce_timer.h>   /* jce_time_ticks_ms — stall guard */
+#include <jce/os/core/jce_timer.h>          /* jce_time_ticks_ms — stall guard */
+#include <jce/renderer/jce_pbr_material.h>  /* canonical .mat.json texture keys */
 }
 
 #include <cstring>
 #include <unordered_map>
+
+/* Fuzzy name normalization, defined once in jce_asset_path_index.cpp.  The
+ * O(1) index builds its keys with these and the fallback walk below matches
+ * with them, so the fast path and the walk it fronts can never disagree
+ * about what a filename normalizes to.  Declared here rather than in
+ * jce_asset_path_index.h because that header is included from inside an
+ * `extern "C"` block elsewhere in the editor (REF-019). */
+namespace jce_asset_name {
+
+/* ASCII lowercase copy. */
+std::string lower_copy(const std::string &s);
+
+/* Keep only [0-9a-z], lowercasing A-Z, so `Tree-Scary_Dead` and
+ * `treescarydead` compare equal (kebab vs snake vs Pascal). */
+std::string alphanum_lower(const std::string &s);
+
+/* Split a basename into stem + lowercase extension, treating a known
+ * compound suffix (.mat.json, .scene.json, .tar.gz, ...) as one extension.
+ * No dot ⇒ the whole basename is the stem and the extension is empty. */
+void split_stem_ext(const std::string &basename,
+                    std::string *out_stem, std::string *out_ext_lower);
+
+/* Strip a Unity/UE asset-class prefix (SM_, T_, MAT_, ...) from a stem so
+ * a request for `tree-scary-dead.obj` can match `SM_Tree_Scary_Dead.obj`.
+ * Returns `stem` unchanged when it carries no known prefix. */
+std::string strip_asset_prefix(const std::string &stem);
+
+} /* namespace jce_asset_name */
+
+using jce_asset_name::alphanum_lower;
+using jce_asset_name::split_stem_ext;
+using jce_asset_name::strip_asset_prefix;
 
 
 /* ── String utilities ───────────────────────────────────────────── */
 
 std::string lower_copy(const std::string &s)
 {
-    std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return (char)tolower(c); });
-    return out;
+    return jce_asset_name::lower_copy(s);
 }
 
 std::string trim_copy(const std::string &s)
@@ -225,67 +255,6 @@ static bool resolve_walk_token_take(void)
     return true;
 }
 
-/* Normalize a filename to alphanumeric-lowercase only.  This lets us
- * match against Unity-imported assets whose names differ only in case
- * or in separator style (kebab vs snake vs Pascal). */
-static std::string alphanum_lower(const std::string &s)
-{
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) out.push_back(c);
-        else if (c >= 'A' && c <= 'Z') out.push_back((char)(c + 32));
-    }
-    return out;
-}
-
-/* Split "Foo.bar.json" into stem "Foo" + ext "bar.json".  We treat
- * any .mat.json / .scene.json compound suffix as the extension. */
-static void split_basename_stem_ext(const std::string &basename,
-                                    std::string *out_stem,
-                                    std::string *out_ext_lower)
-{
-    std::string lower = lower_copy(basename);
-    static const char *const compound[] = {
-        ".mat.json", ".scene.json", ".prefab.json", ".particle.json",
-        ".matgraph.json", ".tar.gz"
-    };
-    for (const char *suf : compound) {
-        size_t L = std::strlen(suf);
-        if (lower.size() >= L && lower.compare(lower.size() - L, L, suf) == 0) {
-            *out_stem = basename.substr(0, basename.size() - L);
-            *out_ext_lower = std::string(suf);
-            return;
-        }
-    }
-    size_t dot = basename.find_last_of('.');
-    if (dot == std::string::npos) {
-        *out_stem = basename;
-        out_ext_lower->clear();
-    } else {
-        *out_stem = basename.substr(0, dot);
-        *out_ext_lower = lower.substr(dot);
-    }
-}
-
-/* Strip common Unity / UE asset prefixes from a stem so requests like
- * `tree-scary-dead.obj` can match disk file `SM_Tree_Scary_Dead.obj`.
- * Returns stem unchanged if no known prefix found. */
-static std::string strip_asset_prefix(const std::string &stem)
-{
-    static const char *const prefixes[] = {
-        "SM_", "SKM_", "SK_", "T_", "Tex_", "TEX_", "M_", "MAT_",
-        "MI_", "BP_", "ANIM_", "FX_", "VFX_"
-    };
-    for (const char *p : prefixes) {
-        size_t L = std::strlen(p);
-        if (stem.size() > L && stem.compare(0, L, p) == 0) {
-            return stem.substr(L);
-        }
-    }
-    return stem;
-}
-
 static bool find_file_walker(const char *path, bool is_dir, void *user)
 {
     FindFileContext *ctx = (FindFileContext*)user;
@@ -324,7 +293,7 @@ static bool find_file_walker(const char *path, bool is_dir, void *user)
          * Unity asset-class prefix. Compare extension + alphanum stem. */
         if (ctx->prefix_out_buf[0] == '\0' && !ctx->target_ext_lower.empty()) {
             std::string disk_stem, disk_ext;
-            split_basename_stem_ext(base_str, &disk_stem, &disk_ext);
+            split_stem_ext(base_str, &disk_stem, &disk_ext);
             if (disk_ext == ctx->target_ext_lower) {
                 std::string stripped = strip_asset_prefix(disk_stem);
                 if (stripped != disk_stem) {
@@ -368,7 +337,7 @@ bool find_file_by_name_recursive(const std::vector<std::string> &roots,
     char loose_buf[512] = {0};
     char prefix_buf[512] = {0};
     std::string stem, ext_lower;
-    split_basename_stem_ext(file_name, &stem, &ext_lower);
+    split_stem_ext(file_name, &stem, &ext_lower);
 
     FindFileContext ctx;
     ctx.target_lower = lower_copy(file_name);
@@ -521,10 +490,27 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
     JceJson *props = jce_json_get(root, "properties");
     if (!jce_json_is_object(props)) props = root;
 
-    std::string tex_ref = json_string(props, "albedoMap");
-    if (tex_ref.empty()) tex_ref = json_string(props, "baseColorMap");
-    if (tex_ref.empty()) tex_ref = json_string(props, "diffuseMap");
-    if (tex_ref.empty()) tex_ref = json_string(props, "mainTexture");
+    /* The albedo key list is the ENGINE's, never a private copy: the viewport
+     * preview must resolve the SAME texture the runtime loads for a given
+     * .mat.json.  This used to hard-code its own list — "albedoMap",
+     * "baseColorMap", "diffuseMap", "mainTexture" — of which the canonical
+     * loader accepted only the first, while this copy in turn missed the
+     * loader's root-level fallback, so preview and shipped build could
+     * disagree about a material's texture (REF-036 / DUP-025).
+     *
+     * Only the KEY TABLE is shared; the parse deliberately stays here rather
+     * than calling jce_pbr_material_load_json, because this function runs on
+     * the texture async WORKER thread (texture_async_worker_main) and that
+     * loader is renderer-thread-only: it links custom shader programs through
+     * bgfx and mutates an unsynchronised process-wide program cache. */
+    const char *const *albedo_keys = jce_pbr_material_texture_keys(0);
+    std::string tex_ref;
+    for (int k = 0; albedo_keys && albedo_keys[k] && tex_ref.empty(); k++)
+        tex_ref = json_string(props, albedo_keys[k]);
+    if (tex_ref.empty() && props != root) {
+        for (int k = 0; albedo_keys && albedo_keys[k] && tex_ref.empty(); k++)
+            tex_ref = json_string(root, albedo_keys[k]);
+    }
 
     bool loaded = false;
     if (!tex_ref.empty()) {

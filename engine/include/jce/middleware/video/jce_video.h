@@ -62,7 +62,7 @@ typedef enum {
 /* Load a video clip from raw file bytes in memory (MP4/ISO-BMFF).
  * The module copies the bytes internally; caller retains ownership of
  * the input buffer.  Returns JCE_VIDEO_INVALID on failure. */
-JceVideo jce_video_load_memory(const void *data, uint32_t size,
+JCE_API JceVideo jce_video_load_memory(const void *data, uint32_t size,
                                 const char *hint_path);
 
 /* Release a clip.  Safe to call with JCE_VIDEO_INVALID. */
@@ -102,7 +102,7 @@ JCE_API void     jce_video_set_loop(JceVideo v, bool loop);
  *
  * If out_frame_time is non-NULL it receives the presentation time of
  * the returned frame in seconds. */
-const uint8_t *jce_video_get_frame_rgba(JceVideo v,
+JCE_API const uint8_t *jce_video_get_frame_rgba(JceVideo v,
                                          int *out_w, int *out_h,
                                          double *out_frame_time);
 
@@ -127,7 +127,7 @@ JCE_API uint32_t jce_video_get_audio_sample_count(JceVideo v);
  * resident. With the streaming pipeline this returns NULL for codec
  * paths that have been migrated (e.g. WebM/Opus). New code should use
  * jce_video_audio_pull(). */
-const int16_t *jce_video_get_audio_pcm(JceVideo v,
+JCE_API const int16_t *jce_video_get_audio_pcm(JceVideo v,
                                         uint32_t *out_frame_count,
                                         uint32_t *out_channels,
                                         uint32_t *out_samplerate);
@@ -137,7 +137,7 @@ const int16_t *jce_video_get_audio_pcm(JceVideo v,
 /* Returns format metadata for the embedded audio track, regardless of
  * whether playback has started. Returns false if no audio is available
  * (status != READY). */
-bool jce_video_get_audio_format(JceVideo v,
+JCE_API bool jce_video_get_audio_format(JceVideo v,
                                  uint32_t *out_channels,
                                  uint32_t *out_samplerate,
                                  double   *out_duration_sec);
@@ -146,7 +146,7 @@ bool jce_video_get_audio_format(JceVideo v,
  * decoder. Returns the number written. May return less than requested
  * (under-run); callers that need continuous output should fill the
  * remainder with silence. Safe to call from the audio device thread. */
-uint32_t jce_video_audio_pull(JceVideo v,
+JCE_API uint32_t jce_video_audio_pull(JceVideo v,
                                int16_t *out, uint32_t frames);
 
 /* Seek the audio stream to `time_sec`. */

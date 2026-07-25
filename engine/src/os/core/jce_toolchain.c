@@ -22,6 +22,7 @@
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_process.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
 #include <SDL3/SDL.h>
 
@@ -64,7 +65,7 @@ bool jce_toolchain_kind_from_name(const char *name, JceToolchainKind *out_kind)
 {
     if (!name || !out_kind) return false;
     for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
-        if (SDL_strcasecmp(name, k_kind_names[i]) == 0) {
+        if (jce_strcasecmp(name, k_kind_names[i]) == 0) {
             *out_kind = (JceToolchainKind)i;
             return true;
         }
@@ -76,11 +77,12 @@ bool jce_toolchain_kind_from_name(const char *name, JceToolchainKind *out_kind)
 /*  Generic helpers                                                   */
 /* ------------------------------------------------------------------ */
 
+/* NULL-tolerant jce_strlcpy: a NULL/zero-cap `dst` is a no-op and a NULL
+ * `src` yields "", where the bare jce_strlcpy would dereference. */
 static void str_copy(char *dst, size_t cap, const char *src)
 {
     if (!dst || cap == 0) return;
-    if (!src) { dst[0] = 0; return; }
-    SDL_strlcpy(dst, src, cap);
+    jce_strlcpy(dst, src ? src : "", cap);
 }
 
 static const char *tc_getenv(const char *name)
@@ -488,7 +490,7 @@ static void probe_ndk(JceToolchain *out)
                 for (int i = 0; list[i]; ++i) {
                     /* Lexicographic max works fine for "26.2.x" etc. */
                     if (strcmp(list[i], best_name) > 0) {
-                        SDL_strlcpy(best_name, list[i], sizeof best_name);
+                        jce_strlcpy(best_name, list[i], sizeof best_name);
                         SDL_snprintf(best_path, sizeof best_path, "%s%c%s",
                                      ndk_dir, TC_NATIVE_DIR_SEP, list[i]);
                     }
@@ -675,7 +677,7 @@ void jce_toolchain_set_override(JceToolchainKind kind, const char *path)
 {
     if ((int)kind < 0 || (int)kind >= JCE_TOOLCHAIN_COUNT) return;
     if (path && path[0]) {
-        SDL_strlcpy(s_override_path[kind], path, sizeof s_override_path[kind]);
+        jce_strlcpy(s_override_path[kind], path, sizeof s_override_path[kind]);
         s_has_override[kind] = true;
     } else {
         s_override_path[kind][0] = 0;

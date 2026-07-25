@@ -17,6 +17,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
@@ -44,34 +45,7 @@ extern "C" {
 
 namespace {
 
-int  g_request_tab = -1;
-int  g_current_tab = 0;
-bool g_tab_state_loaded = false;
-
-const char *k_tab_state_key = "panel.lightmap_bake.current_tab";
-
-void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-ImGuiTabItemFlags tab_flags(int idx)
-{
-    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
-}
-
-void set_current_tab(int idx)
-{
-    if (idx < 0 || idx > 1 || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+JcePanelTabState g_tabs{ "panel.lightmap_bake.current_tab", /*max_tab=*/1 };
 
 /* -------------------------------------------------------------------- */
 /* Minimal PNG (RGBA8) writer: stored deflate blocks + manual CRC/Adler */
@@ -848,25 +822,25 @@ void draw_lightmap_tab(void);
 
 void draw_content(void)
 {
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (!ImGui::BeginTabBar("##lm_tabs")) return;
 
     if (ImGui::BeginTabItem(
             jce_editor_i18n_or("lightmapBake.tab.lightmap", "Lightmap"),
-            nullptr, tab_flags(0))) {
-        set_current_tab(0);
+            nullptr, jce_panel_tab_flags(g_tabs, 0))) {
+        jce_panel_tab_set_current(g_tabs, 0);
         draw_lightmap_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(
             jce_editor_i18n_or("lightmapBake.tab.lightProbes", "Light Probes"),
-            nullptr, tab_flags(1))) {
-        set_current_tab(1);
+            nullptr, jce_panel_tab_flags(g_tabs, 1))) {
+        jce_panel_tab_set_current(g_tabs, 1);
         draw_probe_tab();
         ImGui::EndTabItem();
     }
     ImGui::EndTabBar();
-    g_request_tab = -1;
+    g_tabs.request = -1;
 }
 
 void draw_lightmap_tab(void)
@@ -934,16 +908,9 @@ extern "C" void jce_editor_panel_lightmap_bake(void)
      * redirects to that workbench and requests the Lightmap tab.
      * Symbol kept so menu/hotkey entries registered against
      * JCE_PANEL_LIGHTMAP_BAKE keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTMAP_BAKE);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
-    if (ls_vis) *ls_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###lighting_settings",
-             jce_editor_i18n("panel.lighting.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_lighting_settings_request_tab(2);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_LIGHTMAP_BAKE,
+                                        JCE_PANEL_LIGHTING_SETTINGS,
+                                        "panel.lighting.title",
+                                        "lighting_settings"))
+        jce_panel_lighting_settings_request_tab(2);
 }

@@ -18,12 +18,14 @@
  *     ] }
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <jce/os/core/jce_json.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,65 +120,34 @@ static const char *pkg_desc_i18n(const PkgEntry &p)
 /* ── Persistence ────────────────────────────────────────────────────── */
 static void pkgs_save(void)
 {
-    size_t cap = 256;
-    for (auto &p : s_pkgs)
-        cap += p.name.size() + p.version.size() + p.description.size() + 96;
+    JceJson *root = jce_json_object();
+    if (!root) return;
+    JceJson *arr = jce_json_array();
+    if (!arr) { jce_json_free(root); return; }
+    jce_json_set_child(root, "packages", arr);
 
-    char *buf = (char *)ED_MALLOC(cap);
-    if (!buf) return;
-    size_t off = 0;
-    int    w   = std::snprintf(buf + off, cap - off, "{\n  \"packages\": [\n");
-    if (w < 0) { ED_FREE(buf); return; }
-    off += (size_t)w;
-
-    int written = 0;
-    for (size_t i = 0; i < s_pkgs.size(); ++i) {
-        const PkgEntry &p = s_pkgs[i];
+    for (const PkgEntry &p : s_pkgs) {
         /* Persist user_added entries verbatim; persist built-in only if disabled. */
         if (!p.user_added && p.enabled) continue;
-        w = std::snprintf(buf + off, cap - off,
-            "%s    { \"name\": \"%s\", \"version\": \"%s\","
-            " \"enabled\": %d, \"user_added\": %d,"
-            " \"description\": \"%s\" }",
-            (written == 0 ? "" : ",\n"),
-            p.name.c_str(), p.version.c_str(),
-            p.enabled    ? 1 : 0,
-            p.user_added ? 1 : 0,
-            p.description.c_str());
-        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
-        off += (size_t)w;
-        ++written;
+        JceJson *e = jce_json_object();
+        if (!e) break;
+        jce_json_array_push(arr, e);
+        jce_json_set_string(e, "name",        p.name.c_str());
+        jce_json_set_string(e, "version",     p.version.c_str());
+        /* 1/0 rather than true/false: that is what every file already on
+         * disk carries, and the loader accepts either. */
+        jce_json_set_int   (e, "enabled",     p.enabled    ? 1 : 0);
+        jce_json_set_int   (e, "user_added",  p.user_added ? 1 : 0);
+        jce_json_set_string(e, "description", p.description.c_str());
     }
-    w = std::snprintf(buf + off, cap - off, "\n  ]\n}\n");
-    if (w < 0) { ED_FREE(buf); return; }
-    off += (size_t)w;
+
     /* Project .jce/ dir may not exist yet (fresh project). */
     if (s_current_project_root[0])
         jce_fs_host_create_directory(packages_dir());
-    ed_write_file(PACKAGES_PATH, buf, off);
-    ED_FREE(buf);
-}
-
-static bool extract_str(const char *block, const char *key, std::string &out)
-{
-    char keypat[32];
-    std::snprintf(keypat, sizeof(keypat), "\"%s\"", key);
-    const char *k = std::strstr(block, keypat);
-    if (!k) return false;
-    const char *q1 = std::strchr(k + std::strlen(keypat), '"');
-    const char *q2 = q1 ? std::strchr(q1 + 1, '"') : nullptr;
-    if (!q1 || !q2) return false;
-    out.assign(q1 + 1, q2 - q1 - 1);
-    return true;
-}
-
-static bool extract_int(const char *block, const char *key, int *out)
-{
-    char keypat[32];
-    std::snprintf(keypat, sizeof(keypat), "\"%s\"", key);
-    const char *k = std::strstr(block, keypat);
-    if (!k) return false;
-    return std::sscanf(k + std::strlen(keypat), " : %d", out) == 1;
+    /* Serialised through the JSON facade so a package name carrying a quote
+     * or backslash is escaped instead of corrupting the store, and written
+     * atomically (temp+rename) because this is authored editor state. */
+    ed_write_json_to_file(PACKAGES_PATH, root);
 }
 
 static void pkgs_load_overlay(void)
@@ -186,46 +157,44 @@ static void pkgs_load_overlay(void)
     if (!raw) return;
     if (len > (1 << 20)) { ED_FREE(raw); return; }
 
-    const char *p = raw;
-    while (p && *p) {
-        const char *brace = std::strchr(p, '{');
-        if (!brace) break;
-        const char *end = std::strchr(brace, '}');
-        if (!end) break;
-        std::string block(brace, end - brace + 1);
+    JceJson *root = jce_json_parse(raw, len);
+    ED_FREE(raw);
+    if (!root) return;
+    JceJson *arr = jce_json_get(root, "packages");
+    if (!jce_json_is_array(arr)) { jce_json_free(root); return; }
 
-        std::string name, version, description;
-        int enabled = 1, user_added = 0;
-        if (extract_str(block.c_str(), "name", name) && !name.empty()) {
-            extract_str(block.c_str(), "version",     version);
-            extract_str(block.c_str(), "description", description);
-            extract_int(block.c_str(), "enabled",     &enabled);
-            extract_int(block.c_str(), "user_added",  &user_added);
+    int n = jce_json_array_size(arr);
+    for (int i = 0; i < n; ++i) {
+        const JceJson *o = jce_json_array_at(arr, i);
+        if (!jce_json_is_object(o)) continue;
 
-            /* Match against built-ins by name; otherwise append. */
-            bool merged = false;
-            for (auto &b : s_pkgs) {
-                if (b.name == name) {
-                    b.enabled = (enabled != 0);
-                    if (!b.user_added && user_added)
-                        b.user_added = true;
-                    merged = true;
-                    break;
-                }
-            }
-            if (!merged) {
-                PkgEntry e;
-                e.name        = std::move(name);
-                e.version     = std::move(version);
-                e.description = std::move(description);
-                e.enabled     = (enabled    != 0);
-                e.user_added  = (user_added != 0);
-                s_pkgs.push_back(std::move(e));
+        std::string name = jce_json_get_string(o, "name", "");
+        if (name.empty()) continue;
+        bool enabled    = jce_json_get_bool(o, "enabled",    true);
+        bool user_added = jce_json_get_bool(o, "user_added", false);
+
+        /* Match against built-ins by name; otherwise append. */
+        bool merged = false;
+        for (auto &b : s_pkgs) {
+            if (b.name == name) {
+                b.enabled = enabled;
+                if (!b.user_added && user_added)
+                    b.user_added = true;
+                merged = true;
+                break;
             }
         }
-        p = end + 1;
+        if (!merged) {
+            PkgEntry e;
+            e.name        = std::move(name);
+            e.version     = jce_json_get_string(o, "version",     "");
+            e.description = jce_json_get_string(o, "description", "");
+            e.enabled     = enabled;
+            e.user_added  = user_added;
+            s_pkgs.push_back(std::move(e));
+        }
     }
-    ED_FREE(raw);
+    jce_json_free(root);
 }
 
 /* One-time forward-migration: older editors stored the enable list per-user
@@ -384,16 +353,9 @@ extern "C" void package_manager_draw_content(void)
  * JCE_PANEL_PACKAGE_MANAGER keep working. */
 extern "C" void jce_editor_panel_package_manager(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PACKAGE_MANAGER);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *bb_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
-    if (bb_vis) *bb_vis = true;
-
-    char title[128];
-    std::snprintf(title, sizeof(title), "%s###bundle_browser",
-                  jce_editor_i18n("panel.bundle_browser.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_bundle_browser_request_tab(2);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_PACKAGE_MANAGER,
+                                        JCE_PANEL_BUNDLE_BROWSER,
+                                        "panel.bundle_browser.title",
+                                        "bundle_browser"))
+        jce_panel_bundle_browser_request_tab(2);
 }

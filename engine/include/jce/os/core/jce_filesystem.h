@@ -62,8 +62,11 @@ JCE_API void JCE_CALL jce_fs_destroy(JceFileSystem *fs);
    Assets stored in PAK are resolved by their embedded path.
    This is the legacy single-pak entry point: the archive occupies the
    "unnamed" slot in the priority list and is replaced (not stacked)
-   by subsequent calls to this function. */
-JCE_API void JCE_CALL jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak);
+   by subsequent calls to this function.
+   Returns true if the archive is mounted; false on a NULL argument or a
+   full mount table.  A dropped mount otherwise only surfaces much later
+   as a puzzling "asset not found", so callers should report it. */
+JCE_API bool JCE_CALL jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak);
 
 /* Mount an additional named PAK at the FRONT of the priority list so
  * its assets shadow earlier mounts (Unity AssetBundle semantics).
@@ -86,8 +89,10 @@ JCE_API uint32_t JCE_CALL jce_fs_mounted_pak_count(const JceFileSystem *fs);
 /* Register a loose-file directory as a read source.
    prefix: virtual path prefix (e.g. "assets/").
    directory: actual filesystem path (e.g. "C:/project/assets/").
-   Loose-file mounts are checked BEFORE PAK (developer override). */
-JCE_API void JCE_CALL jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
+   Loose-file mounts are checked BEFORE PAK (developer override).
+   Returns true if the directory is mounted; false if `directory` does not
+   exist / is unreadable, or PhysFS is unavailable (see jce_fs_create). */
+JCE_API bool JCE_CALL jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
                       const char *directory);
 
 /* -- File operations ------------------------------------------------ */

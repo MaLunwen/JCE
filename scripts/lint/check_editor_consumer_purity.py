@@ -17,7 +17,7 @@ Sanctioned exceptions:
   * ImGui — the editor's own UI toolkit, reachable via the
     `jce_tools_imgui` INTERFACE target (`<jce/tools/jce_imgui.hpp>` or
     `<imgui...>`). The engine deliberately does not wrap ImGui.
-  * C/C++ standard library — the editor is C++17.
+  * C/C++ standard library — the editor is C++20.
 
 Usage:
   python scripts/lint/check_editor_consumer_purity.py

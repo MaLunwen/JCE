@@ -22,7 +22,6 @@
 #include <bgfx/c99/bgfx.h>
 #include <stdlib.h>
 #include <string.h>
-#include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_thread.h>
 #include "renderer/jce_render_encoder.h"
 #include <jce/renderer/jce_render_pipeline.h>   /* settings S3: perf tri-state */
@@ -464,28 +463,31 @@ typedef struct {
     uint32_t            defer_end[RQ_MAX_CHUNKS];
 } RqFlushCtx;
 
-static void rq_flush_chunk(int begin, int end, void *user)
+static void rq_flush_chunk(uint32_t begin, uint32_t end, void *user)
 {
     RqFlushCtx *c = (RqFlushCtx *)user;
-    uint32_t ci = (c->per ? (uint32_t)begin / c->per : 0u);
+    /* Exact: jce_thread_pool_parallel_for pins `begin` to a multiple of `per`,
+     * so each chunk index is visited by exactly one worker — stats[ci] and
+     * defer_*[ci] are single-writer slots, not accumulators. */
+    uint32_t ci = (c->per ? begin / c->per : 0u);
     if (ci >= RQ_MAX_CHUNKS) ci = RQ_MAX_CHUNKS - 1;
 
-    /* jce_jobs_group_wait drains COOPERATIVELY: the API thread runs one chunk
+    /* The parallel-for wait drains COOPERATIVELY: the API thread runs one chunk
      * itself — it must use the implicit path (it owns m_encoder[0]). */
     if (jce_thread_current_id() == c->api_tid) {
         jce_render_encoder_set(NULL);
-        rq_flush_range(c->rq, (uint32_t)begin, (uint32_t)end,
+        rq_flush_range(c->rq, begin, end,
                        c->disable_instancing, c->have_binder, &c->stats[ci]);
         return;
     }
     bgfx_encoder_t *enc = bgfx_encoder_begin(true);
     if (!enc) {                       /* pool exhausted → defer to the API thread */
-        c->defer_begin[ci] = (uint32_t)begin;
-        c->defer_end[ci]   = (uint32_t)end;
+        c->defer_begin[ci] = begin;
+        c->defer_end[ci]   = end;
         return;
     }
     jce_render_encoder_set(enc);
-    rq_flush_range(c->rq, (uint32_t)begin, (uint32_t)end,
+    rq_flush_range(c->rq, begin, end,
                    c->disable_instancing, c->have_binder, &c->stats[ci]);
     jce_render_encoder_set(NULL);
     bgfx_encoder_end(enc);
@@ -521,8 +523,8 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
     }
     const bool mt_enabled = (s_mt_env >= 0) ? (s_mt_env != 0)
         : jce_render_pipeline_perf_enabled(JCE_RP_PERF_PARALLEL_SUBMIT, false);
-    JceJobSystem *jobs = mt_enabled ? jce_jobs_default() : NULL;
-    int nworkers = jobs ? jce_jobs_worker_count(jobs) : 0;
+    JceThreadPool *pool = mt_enabled ? jce_thread_pool_shared() : NULL;
+    int nworkers = pool ? jce_thread_pool_worker_count(pool) : 0;
 
     /* !rq->no_batch excludes the order-dependent transparent queue (no_batch +
      * back-to-front): in bgfx SEQUENTIAL view mode the sort key is the atomic
@@ -548,7 +550,7 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
         ctx.have_binder = have_binder;
         ctx.per = per;
         ctx.api_tid = jce_thread_current_id();
-        jce_jobs_parallel_for(jobs, (int)rq->count, (int)per, rq_flush_chunk, &ctx);
+        jce_thread_pool_parallel_for(pool, rq->count, per, rq_flush_chunk, &ctx);
 
         /* Replay any deferred (pool-exhausted) ranges serially on the API thread
          * via the implicit encoder — safe here, never on a worker. */

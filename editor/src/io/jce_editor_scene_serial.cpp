@@ -209,29 +209,22 @@ static JceJson *serialize_entity_tree_json_ex(uint32_t entity_id,
 
     jce_json_set_string(node, "name", meta->name);
     jce_json_set_bool(node, "enabled", meta->enabled);
-    /* Per-component enable toggles — written as a canonical-NAME array so every
-     * registered component round-trips, including post-64 rows whose legacy
-     * flag is 0 (Pivot / unified Light / VideoPlayer / NavAgent / IkConstraints
-     * / SequencePlayer / CompoundCollider).  The old numeric mask silently
-     * dropped those, so a disabled such component came back ENABLED through
-     * prefab / copy-paste / Play-snapshot round-trips (audit Round-3 P2-A).
-     * This matches the engine's main-scene writer; parse_disabled_components
-     * (invoked via jce_scene_parse_entity_json on load) accepts both this array
-     * and the legacy number. */
-    {
-        JceJson *dis = NULL;
-        const int ncomp = jce_component_count();
-        for (int id = 0; id < ncomp; id++) {
-            if (jce_scene_comp_enabled(s.scene, e, id)) continue;
-            if (!dis) dis = jce_json_array();
-            if (!dis) break;
-            jce_json_array_push_string(dis, jce_component_name(id));
-        }
-        if (dis) jce_json_set_child(node, "disabledComponents", dis);
-    }
+    /* Per-component enable toggles.  The scan lives in the engine now
+     * (jce_scene_write_disabled_components): this file used to carry a
+     * hand-copied duplicate whose comment ASSERTED it matched the
+     * engine writer — a claim maintained by hand, which is exactly how
+     * the two drift. */
+    jce_scene_write_disabled_components(node, s.scene, e);
+
     jce_json_set_number(node, "tagColor", (double)meta->tag_color);
     if (meta->tag[0] != '\0')
         jce_json_set_string(node, "tag", meta->tag);
+    /* Entity LAYER (the ECS component, NOT JceEditorMeta.layer).  Same
+     * gate and same source as the engine writer — shared outright now
+     * rather than mirrored, so "byte-identical nodes" is a property of
+     * one implementation instead of a promise in two comments. */
+    jce_scene_write_entity_layer(node, s.scene, e);
+
     if (meta->prefab_instance) {
         jce_json_set_bool(node, "prefabInstance", true);
         if (meta->prefab_path[0] != '\0')

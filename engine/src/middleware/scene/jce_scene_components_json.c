@@ -938,27 +938,8 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
      * forward-slash key so jce_pak_find can look them up at runtime. */
     if (jce_path_is_absolute(mr.mesh_path)) {
         char norm[sizeof(mr.mesh_path)];
-        jce_path_to_canonical(norm, sizeof(norm), mr.mesh_path);
-        static const char *const s_markers[] = {
-            "resources/assets/", "resources/_cooked/", NULL
-        };
-        static const char *const s_tops[] = {
-            "/models/", "/scenes/", "/shaders/", "/fonts/",
-            "/i18n/", "/audio/", "/prefabs/", "/anim/",
-            "/textures/", NULL
-        };
-        const char *rel = NULL;
-        for (int mi = 0; s_markers[mi] && !rel; mi++) {
-            const char *p = strstr(norm, s_markers[mi]);
-            if (p) rel = p + strlen(s_markers[mi]);
-        }
-        if (!rel) {
-            for (int ti = 0; s_tops[ti] && !rel; ti++) {
-                const char *p = strstr(norm, s_tops[ti]);
-                if (p) rel = p + 1;   /* skip the leading '/' */
-            }
-        }
-        if (rel && rel[0])
+        const char *rel = jce_path_asset_key(mr.mesh_path, norm, sizeof(norm));
+        if (rel)
             copy_str(mr.mesh_path, sizeof(mr.mesh_path), rel);
     }
     if (mt) copy_str(mr.material_path, sizeof(mr.material_path), mt);
@@ -1535,6 +1516,36 @@ static void ser_editor_meta(const JceEditorMeta *m, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+/* ── Shared entity-envelope writers ───────────────────────────────── */
+
+void jce_scene_write_disabled_components(JceJson *obj, const JceScene *s,
+                                         JceEntity e)
+{
+    if (!obj || !s) return;
+    JceJson *dis = NULL;
+    const int n = jce_component_count();
+    for (int id = 0; id < n; id++) {
+        if (jce_scene_comp_enabled(s, e, id)) continue;
+        if (!dis) {
+            dis = jce_json_array();
+            if (!dis) return;
+        }
+        jce_json_array_push_string(dis, jce_component_name(id));
+    }
+    /* Nothing disabled -> emit nothing, so a default entity keeps
+     * serialising byte-for-byte as it did before this was extracted. */
+    if (dis) jce_json_set_child(obj, "disabledComponents", dis);
+}
+
+void jce_scene_write_entity_layer(JceJson *obj, const JceScene *s, JceEntity e)
+{
+    if (!obj || !s) return;
+    if (!(jce_scene_get_component_flags(s, e) & JCE_COMP_FLAG_LAYER)) return;
+    const uint8_t layer = jce_scene_get_entity_layer((JceScene *)s, e);
+    if (layer != 0)
+        jce_json_set_number(obj, "layer", (double)layer);
+}
+
 /* ── Entity-level (de)serialization ───────────────────────────────── */
 
 typedef struct {
@@ -1723,18 +1734,7 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
      * component names currently disabled.  Replaces the legacy numeric
      * JCE_COMP_FLAG_* mask (the 64-bit space is exhausted); the loader
      * accepts both forms.  Omitted entirely when nothing is disabled. */
-    {
-        cJSON *dis = NULL;
-        const int n = jce_component_count();
-        for (int id = 0; id < n; id++) {
-            if (jce_scene_comp_enabled(s, e, id)) continue;
-            if (!dis)
-                dis = cJSON_AddArrayToObject(eobj, "disabledComponents");
-            if (!dis) break;
-            cJSON_AddItemToArray(dis,
-                cJSON_CreateString(jce_component_name(id)));
-        }
-    }
+    jce_scene_write_disabled_components((JceJson *)eobj, s, e);
 
     cJSON *comps = cJSON_CreateArray();
     if (!comps) { cJSON_Delete(eobj); return; }
@@ -1862,6 +1862,61 @@ static const cJSON *resolve_entities(const cJSON *root)
     const cJSON *ents = cJSON_GetObjectItemCaseSensitive(root, "entities");
     if (cJSON_IsArray(ents)) return ents;
 
+    return NULL;
+}
+
+/* ── Nested node-tree documents (editor-authored prefabs) ──────────────
+ *
+ * The editor does NOT write the flat entity array for a prefab: its
+ * build_prefab_json_root() (editor/src/io/jce_editor_scene_serial.cpp)
+ * emits a NESTED node tree,
+ *
+ *     { "contract": { ... },
+ *       "prefab": { "version": 1,
+ *                   "root": { "name": "...", "enabled": true,
+ *                             "tag": "...", "tagColor": 0,
+ *                             "disabledComponents": [ ... ],
+ *                             "components": [ ... ],
+ *                             "children": [ <node>, ... ] } } }
+ *
+ * where parenthood is structural (nesting) instead of the flat form's
+ * id/parentId pairs, and a node carries no id at all.  Every .prefab.json
+ * the editor saves has that shape, so the runtime loader has to accept it
+ * or jce_prefab_instantiate*() silently produces zero entities.
+ *
+ * Returns the root NODE (never the document envelope), or NULL. */
+static const cJSON *resolve_entity_tree_root(const cJSON *root)
+{
+    if (!root || !cJSON_IsObject(root)) return NULL;
+
+    /* Contract envelope: root.prefab.root */
+    const cJSON *prefab = cJSON_GetObjectItemCaseSensitive(root, "prefab");
+    if (cJSON_IsObject(prefab)) {
+        const cJSON *node = cJSON_GetObjectItemCaseSensitive(prefab, "root");
+        if (cJSON_IsObject(node)) return node;
+    }
+
+    /* Bare node at the document root.  Accepted only on an unambiguous
+     * entity signature so unrelated JSON assets keep failing cleanly. */
+    if (cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(root, "components")) ||
+        cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(root, "children")))
+        return root;
+
+    return NULL;
+}
+
+/* Child-list of a tree node.  The key aliases match the editor's reader
+ * (load_entity_tree_node in editor/src/io/jce_editor_scene_parse.cpp) so
+ * anything the editor can open, the runtime can instantiate. */
+static const cJSON *tree_node_children(const cJSON *node)
+{
+    static const char *const keys[] = {
+        "children", "nodes", "entities", "objects"
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const cJSON *a = cJSON_GetObjectItemCaseSensitive(node, keys[i]);
+        if (cJSON_IsArray(a)) return a;
+    }
     return NULL;
 }
 
@@ -2113,6 +2168,84 @@ static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
     }
 }
 
+/* ── Nested node-tree load (editor-authored prefabs) ──────────────────
+ *
+ * Same entities, same components, same fixups as the flat form — only
+ * the way parenthood is expressed differs, so the node body reuses
+ * load_one_entity() rather than growing a second component parser. */
+
+static int count_tree_nodes(const cJSON *node)
+{
+    if (!cJSON_IsObject(node)) return 0;
+
+    int n = 1;
+    const cJSON *kids = tree_node_children(node);
+    if (kids) {
+        for (const cJSON *c = kids->child; c; c = c->next)
+            n += count_tree_nodes(c);
+    }
+    return n;
+}
+
+/* Depth-first: create the node's entity, then its children parented to
+ * it.  `cap` bounds the remap table (sized by count_tree_nodes). */
+static void load_tree_node(JceScene *scene, const cJSON *node,
+                           JceEntity parent, EntityRemap *map,
+                           int *loaded, int cap)
+{
+    if (!cJSON_IsObject(node) || *loaded >= cap) return;
+
+    int idx = *loaded;
+    load_one_entity(scene, node, map, loaded);
+    if (*loaded == idx) return;   /* entity creation failed — skip subtree */
+
+    /* Parenthood is structural here; clear the id-based link so the
+     * second pass cannot re-parent from a stray "parentId" field. */
+    map[idx].parent_src = 0;
+    if (parent != 0)
+        jce_scene_set_parent(scene, map[idx].new_id, parent);
+
+    const cJSON *kids = tree_node_children(node);
+    if (!kids) return;
+    for (const cJSON *c = kids->child; c; c = c->next)
+        load_tree_node(scene, c, map[idx].new_id, map, loaded, cap);
+}
+
+/* One-shot loader for a tree document: the streaming cursor below walks
+ * an entity ARRAY, which this shape does not have.  The scene-settings
+ * presence gate and the second-pass reference fixups mirror
+ * jce_scene_load_stream_begin/finalize so both shapes behave alike. */
+static int load_entity_tree_document(JceScene *scene, const cJSON *root,
+                                     const cJSON *tree_root)
+{
+    uint32_t existing_entities = 0;
+    jce_scene_each_entity(scene, count_existing_entity_cb,
+                          &existing_entities);
+    if (!parse_scene_rendering_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_rendering_settings(scene);
+    if (!parse_scene_streaming_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_streaming_settings(scene);
+
+    int total = count_tree_nodes(tree_root);
+    if (total <= 0) return 0;
+
+    EntityRemap *map =
+        (EntityRemap *)JCE_CALLOC((size_t)total, sizeof(EntityRemap));
+    if (!map) return -1;
+
+    matcache_begin();   /* dedup shared .mat.json reads across this load */
+
+    int loaded = 0;
+    load_tree_node(scene, tree_root, 0, map, &loaded, total);
+    load_fixup_refs(scene, map, loaded);
+
+    matcache_end();
+    JCE_FREE(map);
+    return loaded;
+}
+
 /* ── Incremental scene load (frame-sliced) ────────────────────────────
  *
  * The streaming loader IS the one-shot loader, split at the per-entity
@@ -2256,6 +2389,16 @@ int jce_scene_load_stream_finalize(JceSceneLoadStream *st)
 int jce_scene_load_json(JceScene *scene, const cJSON *root)
 {
     if (!scene || !root) return -1;
+
+    /* Editor-authored prefabs are a nested node tree, which the streaming
+     * cursor (an entity-ARRAY walker) cannot drive — dispatch those to the
+     * tree loader.  The flat entity-array path below is untouched, and a
+     * document that is neither shape still fails through stream_begin. */
+    if (!resolve_entities(root)) {
+        const cJSON *tree_root = resolve_entity_tree_root(root);
+        if (tree_root)
+            return load_entity_tree_document(scene, root, tree_root);
+    }
 
     int total = 0;
     JceSceneLoadStream *st = jce_scene_load_stream_begin(scene, root, &total);

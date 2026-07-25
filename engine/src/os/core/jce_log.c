@@ -90,6 +90,14 @@ static SDL_IOStream *g_log_file       = NULL; /* optional file sink    */
 static SDL_Mutex    *g_file_mtx       = NULL; /* protects g_log_file   */
 #endif
 
+/* Optional observer of the emitted stream (see jce_log_set_sink).
+   g_sink_mtx stays NULL until jce_log_init() and on non-threaded platforms;
+   SDL mutex calls are no-ops on a NULL handle, so the lock/unlock pairs below
+   are unconditional (same pattern as g_file_mtx in jce_log_set_file). */
+static JceLogSinkFn  g_sink      = NULL;
+static void         *g_sink_user = NULL;
+static SDL_Mutex    *g_sink_mtx  = NULL;
+
 /* -- Level metadata ------------------------------------------------ */
 
 static const char *level_str(JceLogLevel level)
@@ -136,10 +144,9 @@ static void emit_message(const JceLogMessage *m)
     /* Timestamp string.  wall_time is resolved here (backend / sync
        fallback) so the producer path never calls SDL_GetCurrentTime(). */
     char ts[32];
+    SDL_Time wt = m->wall_time;
+    if (wt == 0) SDL_GetCurrentTime(&wt);
     {
-        SDL_Time wt = m->wall_time;
-        if (wt == 0) SDL_GetCurrentTime(&wt);
-
         SDL_DateTime dt;
         if (SDL_TimeToDateTime(wt, &dt, true)) {
             int ms = (int)(m->timestamp_ms % 1000);
@@ -192,6 +199,25 @@ static void emit_message(const JceLogMessage *m)
     __android_log_print(to_android_prio(m->level), m->tag,
                         "%s at %s:%d", m->message, fname, m->line);
 #endif
+
+    /* Secondary observer, last so it can never affect the output above.
+       The lock is held across the call so that jce_log_set_sink(NULL, ...)
+       returns only once no sink invocation is still running. */
+    SDL_LockMutex(g_sink_mtx);
+    if (g_sink) {
+        JceLogRecord rec;
+        rec.level        = m->level;
+        rec.tag          = m->tag;
+        rec.message      = m->message;
+        rec.file         = fname;
+        rec.line         = m->line;
+        rec.thread_name  = m->thread_name;
+        rec.timestamp_ms = m->timestamp_ms;
+        /* SDL_Time counts nanoseconds since the Unix epoch. */
+        rec.wall_epoch_s = (int64_t)(wt / 1000000000);
+        g_sink(&rec, g_sink_user);
+    }
+    SDL_UnlockMutex(g_sink_mtx);
 }
 
 /* -- Async backend thread ------------------------------------------ */
@@ -277,6 +303,7 @@ void jce_log_init(void)
     if (!g_ring) {
         g_ring     = jce_log_ring_create();
         g_file_mtx = SDL_CreateMutex();
+        g_sink_mtx = SDL_CreateMutex();
         SDL_SetAtomicInt(&g_running, 1);
         /* Intentional: dedicated SDL thread instead of enkiTS — the log backend
          * must outlive the task system so that shutdown messages are still captured. */
@@ -309,6 +336,12 @@ void jce_log_shutdown(void)
     if (g_file_mtx) {
         SDL_DestroyMutex(g_file_mtx);
         g_file_mtx = NULL;
+    }
+    /* Safe now: the backend thread is joined, so no sink call is in flight.
+       g_sink itself is deliberately kept, like g_min_level / g_colors. */
+    if (g_sink_mtx) {
+        SDL_DestroyMutex(g_sink_mtx);
+        g_sink_mtx = NULL;
     }
 #endif
 }
@@ -368,6 +401,14 @@ void jce_log_set_thread_name(const char *name)
     } else {
         tl_thread_name[0] = '\0';
     }
+}
+
+void jce_log_set_sink(JceLogSinkFn fn, void *user)
+{
+    SDL_LockMutex(g_sink_mtx);
+    g_sink      = fn;
+    g_sink_user = user;
+    SDL_UnlockMutex(g_sink_mtx);
 }
 
 void jce_log_write(JceLogLevel level, const char *tag,

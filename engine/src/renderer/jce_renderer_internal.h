@@ -37,6 +37,15 @@ bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow(const JceRenderer *r)
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow_skinned(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_terrain(const JceRenderer *r);
 
+/* Render-target scrub helpers (moved out of the public jce_views.h because
+ * jce_zero_init_mem returns a bgfx type). No-op stub kept for ABI; the real
+ * workhorse returns zeroed bgfx memory for bgfx_create_texture_2d's _mem so
+ * a fresh texture starts solid-black instead of leftover VRAM. */
+void jce_clear_freshly_created_fbo(unsigned short fb_idx,
+                                   unsigned short width,
+                                   unsigned short height);
+const bgfx_memory_t *jce_zero_init_mem(unsigned int size_bytes);
+
 #ifdef __cplusplus
 }
 #endif

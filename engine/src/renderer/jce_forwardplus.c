@@ -398,7 +398,7 @@ static bool fp_gpu_init(JceForwardPlus *fp)
                          | BGFX_SAMPLER_U_CLAMP   | BGFX_SAMPLER_V_CLAMP;
 
     fp->tex_cluster = bgfx_create_texture_2d(fp->tex_w, fp->tex_h, false, 1,
-                                             BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL);
+                                             BGFX_TEXTURE_FORMAT_RGBA32F, flags, NULL, 0);
 
     fp->s_cluster        = bgfx_create_uniform("s_cluster",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
     fp->u_clusterParams  = bgfx_create_uniform("u_clusterParams",  BGFX_UNIFORM_TYPE_VEC4,    1);

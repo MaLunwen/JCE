@@ -28,14 +28,22 @@ public final class Main {
         }
 
         int frameCount = 0;
+        JceRuntime.Result result = JceRuntime.Result.SUCCESS;
         try (JceRuntime runtime = new JceRuntime()) {
             runtime.init();
             boolean running = true;
-            while (running && !runtime.shouldQuit()) {
-                boolean frameOk = runtime.iterate();
+            while (running) {
+                result = runtime.iterate();
                 boolean reachedMaxFrames = maxFrames > 0 && ++frameCount >= maxFrames;
-                running = frameOk && !reachedMaxFrames;
+                running = result == JceRuntime.Result.CONTINUE && !reachedMaxFrames;
             }
+        }
+
+        // Propagate the engine's own verdict: an error quit must not look
+        // like a clean one to whatever launched us (CI, shell, installer).
+        if (result == JceRuntime.Result.FAILURE) {
+            System.err.println("[JCE] engine exited with failure");
+            System.exit(1);
         }
     }
 

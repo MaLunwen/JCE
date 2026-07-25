@@ -5,7 +5,30 @@
  * Storage mirrors the PlayerLoop registry pattern: a single dynamic
  * array of slots sorted by ascending priority, with stable insertion
  * (equal priorities preserve registration order).  Backing allocator
- * is the process-default mimalloc-backed jce_allocator_t.
+ * is the process-default mimalloc-backed jce_allocator_t.  This is
+ * NOT built on os/core/jce_event.c, whose dispatch contract differs
+ * on ordering, removal, duplicates and lifetime; see the header.
+ *
+ * On folding the slot list together with runtime/jce_player_loop.c
+ * (audited, and REJECTED — do not re-open):
+ *   - Only upper_bound is algorithmically identical (12 lines).
+ *     ensure_alloc and grow close over per-module file statics — slot
+ *     type, log tag, allocator latch, id counter — that must stay
+ *     separate: one shared id counter would make either shutdown()
+ *     reset the other module's ids, and one shared allocator latch is
+ *     new cross-layer global state.
+ *   - The dispatch loops implement DIFFERENT contracts on purpose.
+ *     jce_player_loop_run_phase dispatches by id-identity snapshot
+ *     (the audit Round-3 F81 fix, pinned by tests/application/
+ *     test_jce_player_loop.c); emit() below is positional over a
+ *     snapshotted count.  A shared list must pick one, and either
+ *     choice re-introduces F81 or silently changes this registry.
+ *   - What is left is a 12-line bisection whose only type-generic C99
+ *     form is (base, stride, field-offset) pointer arithmetic — the
+ *     shape os/core/jce_hashmap.h already argues against for exactly
+ *     this class of intrusive, hand-rolled table.
+ *   - It is also a two-site pattern: those are the only two ordered
+ *     priority-slot lists in engine/ (third_party excluded).
  *
  * Thread model: registration / unregistration / emit are MAIN-THREAD
  * ONLY (lifecycle events originate from the SDL event pump, which is

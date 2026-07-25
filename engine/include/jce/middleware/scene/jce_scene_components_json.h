@@ -96,7 +96,7 @@ JCE_API int jce_scene_load_stream_finalize(JceSceneLoadStream *st);
  * and all key aliases / component types the engine recognizes.
  * Editor-specific fields (name, tag, enabled, etc.) on the entity object
  * are applied as EditorMeta if present. */
-void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
+JCE_API void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
                                  const JceJson *entity_obj);
 
 /* Serialize all components of a single entity into a JSON array.
@@ -122,6 +122,40 @@ JCE_API void jce_scene_serial_set_base_dir(const char *dir);
  * Pass NULL for host-file parsing. The context is thread-local so async scene
  * work cannot overwrite another scene's relative asset resolution. */
 JCE_API void jce_scene_serial_set_asset_vfs(const JceFileSystem *fs);
+
+/* ── Entity envelope writers (audit entity-envelope-dual-writers) ─────
+ *
+ * The two fields below were emitted by THREE writers with hand-copied
+ * logic: the engine's flat scene writer, the engine's EditorMeta writer,
+ * and the editor's tree writer (prefabs, clipboard, Play snapshots).  The
+ * editor copy even carried a comment asserting it "matches the engine's",
+ * which is the tell — a claim maintained by hand.
+ *
+ * They are extracted rather than the whole envelope because these two are
+ * genuine ALGORITHM duplicates (a component scan, and a flag gate plus a
+ * non-default test), while the remaining fields differ deliberately: the
+ * editor always emits `enabled`/`tagColor` and the runtime writer emits
+ * only non-defaults, to keep each file kind byte-identical to what it
+ * produced before.  Merging those would change file contents to remove a
+ * duplication that is only skin deep.
+ *
+ * Both append into a caller-supplied object and write NOTHING when there is
+ * nothing to say — no empty array, no zero layer — so an entity with
+ * default state still serialises byte-for-byte as it did. */
+
+/* Emit "disabledComponents": [ "<canonical name>", ... ] for every
+ * registered component currently disabled on `e`.  Uses canonical NAMES,
+ * not the legacy 64-bit flag mask: that space is exhausted, and components
+ * past it silently came back ENABLED through every round trip. */
+JCE_API void JCE_CALL jce_scene_write_disabled_components(JceJson *obj,
+                                                          const JceScene *s,
+                                                          JceEntity e);
+
+/* Emit "layer": <n> for the ECS layer component (NOT JceEditorMeta.layer),
+ * gated on the component being present and the value being non-default. */
+JCE_API void JCE_CALL jce_scene_write_entity_layer(JceJson *obj,
+                                                   const JceScene *s,
+                                                   JceEntity e);
 
 JCE_EXTERN_C_END
 

@@ -3,6 +3,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "jce_panel_common.h"
 #include "ui/jce_editor_dnd.h"
 
 #include <algorithm>     /* std::sort — O(n log n) root sort at full-load */
@@ -96,20 +97,7 @@ int ascii_tolower(int c)
 
 bool text_matches_filter_ci(const char *text, const char *filter)
 {
-    if (!filter || !filter[0]) return true;
-    if (!text || !text[0]) return false;
-
-    for (const char *h = text; *h; h++) {
-        const char *a = h;
-        const char *b = filter;
-        while (*a && *b && ascii_tolower((unsigned char)*a) == ascii_tolower((unsigned char)*b)) {
-            a++;
-            b++;
-        }
-        if (!*b) return true;
-    }
-
-    return false;
+    return jce_panel_filter_match_ci(text, filter);
 }
 
 bool entity_matches_search_fields(uint32_t entity_id, const char *filter)

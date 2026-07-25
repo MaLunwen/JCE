@@ -413,7 +413,7 @@ void jce_rg_execute(JceRenderGraph *rg)
             w, h, false, 1,
             to_bgfx_fmt(r->desc.format),
             BGFX_TEXTURE_RT,
-            NULL);
+            NULL, 0);
         r->transient_allocated = true;
     }
 

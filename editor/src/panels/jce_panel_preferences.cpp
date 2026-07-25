@@ -612,13 +612,11 @@ void draw_tab_paths()
     ImGui::TextWrapped("%s", jce_editor_i18n("preferences.paths.help"));
     ImGui::Spacing();
 
-    if (jce_draw_path_input(jce_editor_i18n("preferences.paths.buildOutput"),
-                            s_cfg.build_output_path,
-                            sizeof(s_cfg.build_output_path),
-                            JcePathKind::FolderAbs))
-        cfg_dirty = true;
+    /* build_output_path lives in Project Settings > Build (it is project build
+     * output, not a per-user path) — a second copy here just let two panels
+     * write the same field and confused which one was authoritative.  Edit it
+     * there; this tab keeps the genuinely per-user path/tool + repack toggles. */
 
-    ImGui::Spacing();
     ImGui::SeparatorText(jce_editor_i18n("preferences.paths.autoRepackGroup"));
     if (ImGui::Checkbox(jce_editor_i18n("preferences.paths.autoRepackOnSave"),
                         &s_cfg.auto_repack_on_save))

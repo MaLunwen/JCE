@@ -14,9 +14,9 @@
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_ssao.h>
 #include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -52,42 +52,6 @@ struct JceSsao {
     bgfx_texture_handle_t       tex_blur;
 };
 
-static const char *ssao_backend_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
-
-static bgfx_shader_handle_t ssao_load_shader(const JcePakArchive *pak,
-                                              const char *name, const char *sfx)
-{
-    bgfx_shader_handle_t invalid = { UINT16_MAX };
-    char path[256];
-    snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-    /* Engine shaders are in jce_renderer's embedded pak, not the scene/editor
-     * pak.  Try the caller pak, then fall back to the embedded engine pak. */
-    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
-    if (!asset) {
-        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
-        if (fb && fb != pak) { asset = jce_pak_find(fb, path); if (asset) pak = fb; }
-    }
-    if (!asset) { LOG_ERROR(LOG_TAG, "shader not in pak: %s", path); return invalid; }
-    void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return invalid;
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) { JCE_FREE(buf); return invalid; }
-    const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)asset->original_size);
-    JCE_FREE(buf);
-    return bgfx_create_shader(mem);
-}
-
 static void create_targets(JceSsao *s)
 {
     if (s->fb_raw.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb_raw);
@@ -118,7 +82,7 @@ JceSsaoParams jce_ssao_default_params(void)
 JceSsao *jce_ssao_create(const JceSsaoDesc *desc)
 {
     if (!desc || !desc->pak) return NULL;
-    const char *sfx = ssao_backend_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) return NULL;
 
     JceSsao *s = (JceSsao *)JCE_CALLOC(1, sizeof(*s));
@@ -144,9 +108,9 @@ JceSsao *jce_ssao_create(const JceSsaoDesc *desc)
                                        &s->layout, BGFX_BUFFER_NONE);
     s->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)), BGFX_BUFFER_NONE);
 
-    bgfx_shader_handle_t vsh   = ssao_load_shader(desc->pak, "vs_ssao",      sfx);
-    bgfx_shader_handle_t fsh_a = ssao_load_shader(desc->pak, "fs_ssao",      sfx);
-    bgfx_shader_handle_t fsh_b = ssao_load_shader(desc->pak, "fs_ssao_blur", sfx);
+    bgfx_shader_handle_t vsh   = jce_shader_load_from_pak(desc->pak, "vs_ssao",      sfx, LOG_TAG);
+    bgfx_shader_handle_t fsh_a = jce_shader_load_from_pak(desc->pak, "fs_ssao",      sfx, LOG_TAG);
+    bgfx_shader_handle_t fsh_b = jce_shader_load_from_pak(desc->pak, "fs_ssao_blur", sfx, LOG_TAG);
     if (vsh.idx == UINT16_MAX || fsh_a.idx == UINT16_MAX || fsh_b.idx == UINT16_MAX) {
         LOG_ERROR(LOG_TAG, "shader load failed");
         if (vsh.idx   != UINT16_MAX) bgfx_destroy_shader(vsh);

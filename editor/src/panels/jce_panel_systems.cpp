@@ -16,6 +16,7 @@
  * platform calls.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
@@ -35,34 +36,8 @@ extern "C" {
 namespace {
 
 constexpr int kMaxFilter = 96;
-int  g_request_tab = -1;
-int  g_current_tab = 0;
-bool g_tab_state_loaded = false;
 
-const char *k_tab_state_key = "panel.systems.current_tab";
-
-void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-ImGuiTabItemFlags tab_flags(int idx)
-{
-    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
-}
-
-void set_current_tab(int idx)
-{
-    if (idx < 0 || idx > 1 || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+JcePanelTabState g_tabs{ "panel.systems.current_tab", /*max_tab=*/1 };
 
 struct PanelState {
     float refresh_rate     = 0.5f;
@@ -321,7 +296,7 @@ void draw_ecs_tab(PanelState &st)
 extern "C" void jce_editor_panel_systems_content(void)
 {
     PanelState &st = state();
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
 
     draw_refresh_combo(st);
     ImGui::Separator();
@@ -329,19 +304,19 @@ extern "C" void jce_editor_panel_systems_content(void)
     if (ImGui::BeginTabBar("##sys_tabs")) {
         if (ImGui::BeginTabItem(
                 jce_editor_i18n("panel.systems.tab.player_loop"),
-                nullptr, tab_flags(0))) {
-            set_current_tab(0);
+                nullptr, jce_panel_tab_flags(g_tabs, 0))) {
+            jce_panel_tab_set_current(g_tabs, 0);
             draw_player_loop_tab(st);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(
                 jce_editor_i18n("panel.systems.tab.ecs"),
-                nullptr, tab_flags(1))) {
-            set_current_tab(1);
+                nullptr, jce_panel_tab_flags(g_tabs, 1))) {
+            jce_panel_tab_set_current(g_tabs, 1);
             draw_ecs_tab(st);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
-        g_request_tab = -1;
+        g_tabs.request = -1;
     }
 }

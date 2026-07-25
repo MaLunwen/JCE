@@ -11,6 +11,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
 #include "jce_app_path.h"
 
@@ -22,16 +23,6 @@
 #define PROJECT_TAG "project"
 
 /* ── small string helpers ───────────────────────────────────────────── */
-
-static char *xstrdup(const char *s)
-{
-	if (!s) return NULL;
-	size_t n = strlen(s) + 1;
-	char  *p = (char *)jce_malloc(n);
-	if (!p) return NULL;
-	memcpy(p, s, n);
-	return p;
-}
 
 static void xfree(void *p) { if (p) jce_free(p); }
 
@@ -114,7 +105,7 @@ static char **read_str_array(const JceJson *obj, const char *key, int *out_n)
 		if (!it || !jce_json_is_string(it)) continue;
 		const char *s = jce_json_string_value(it, NULL);
 		if (!s) continue;
-		dst[kept] = xstrdup(s);
+		dst[kept] = jce_strdup(s);
 		if (dst[kept]) ++kept;
 	}
 	*out_n = kept;
@@ -142,7 +133,7 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	JceProject *p = (JceProject *)xcalloc(1, sizeof *p);
 	if (!p) return NULL;
 
-	p->project_root  = xstrdup(project_root);
+	p->project_root  = jce_strdup(project_root);
 	jce_app_normalise_slashes(p->project_root);
 	jce_app_strip_trailing_slash(p->project_root);
 
@@ -165,7 +156,7 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 			if (eq) {
 				if (tail == p->project_root) {
 					xfree(p->project_root);
-					p->project_root = xstrdup(".");
+					p->project_root = jce_strdup(".");
 				} else {
 					char prev = *(tail - 1);
 					if (prev == '/' || prev == '\\')
@@ -189,15 +180,15 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	}
 
 	p->schema_version           = jce_json_get_int   (root, "schema",   JCE_PROJECT_SCHEMA_VERSION);
-	p->name                     = xstrdup(jce_json_get_string(root, "name",     "untitled"));
-	p->version                  = xstrdup(jce_json_get_string(root, "version",  "0.1.0"));
-	p->target_name              = xstrdup(jce_json_get_string(root, "target",   p->name));
-	p->output_exe               = xstrdup(jce_json_get_string(root, "exe",      ""));
+	p->name                     = jce_strdup(jce_json_get_string(root, "name",     "untitled"));
+	p->version                  = jce_strdup(jce_json_get_string(root, "version",  "0.1.0"));
+	p->target_name              = jce_strdup(jce_json_get_string(root, "target",   p->name));
+	p->output_exe               = jce_strdup(jce_json_get_string(root, "exe",      ""));
 	{
 		const char *sdk = jce_json_get_string(root, "sdk", NULL);
-		p->sdk_path = sdk ? xstrdup(sdk) : NULL;
+		p->sdk_path = sdk ? jce_strdup(sdk) : NULL;
 	}
-	p->default_target_platform  = xstrdup(jce_json_get_string(root, "platform", "win"));
+	p->default_target_platform  = jce_strdup(jce_json_get_string(root, "platform", "win"));
 
 	p->asset_dirs     = read_str_array(root, "assets",   &p->asset_dirs_count);
 	p->build_variants = read_str_array(root, "variants", &p->build_variants_count);
@@ -206,20 +197,20 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	{
 		const char *s = jce_json_get_string(root, "source_assets", NULL);
 		if (s && *s) {
-			p->source_assets = xstrdup(s);
+			p->source_assets = jce_strdup(s);
 		} else if (p->asset_dirs_count > 0 && p->asset_dirs[0]) {
-			p->source_assets = xstrdup(p->asset_dirs[0]);
+			p->source_assets = jce_strdup(p->asset_dirs[0]);
 		} else {
-			p->source_assets = xstrdup("assets");
+			p->source_assets = jce_strdup("assets");
 		}
 	}
 	{
 		const char *s = jce_json_get_string(root, "cooked_assets", NULL);
-		p->cooked_assets = xstrdup(s && *s ? s : "resources/_cooked");
+		p->cooked_assets = jce_strdup(s && *s ? s : "resources/_cooked");
 	}
 	{
 		const char *s = jce_json_get_string(root, "startup_scene", NULL);
-		p->startup_scene = (s && *s) ? xstrdup(s) : NULL;
+		p->startup_scene = (s && *s) ? jce_strdup(s) : NULL;
 	}
 
 	/* v3: bundles array (optional). */
@@ -241,34 +232,34 @@ JceProject *JCE_CALL jce_project_new(const char *project_root, const char *name)
 	JceProject *p = (JceProject *)xcalloc(1, sizeof *p);
 	if (!p) return NULL;
 
-	p->project_root  = xstrdup(project_root);
+	p->project_root  = jce_strdup(project_root);
 	jce_app_normalise_slashes(p->project_root);
 	jce_app_strip_trailing_slash(p->project_root);
 	p->manifest_path = jce_app_path_join(p->project_root, JCE_PROJECT_FILENAME);
 	p->schema_version           = JCE_PROJECT_SCHEMA_VERSION;
-	p->name                     = xstrdup(name);
-	p->version                  = xstrdup("0.1.0");
-	p->target_name              = xstrdup(name);
+	p->name                     = jce_strdup(name);
+	p->version                  = jce_strdup("0.1.0");
+	p->target_name              = jce_strdup(name);
 	p->output_exe               = NULL;
 	p->sdk_path                 = NULL;
-	p->default_target_platform  = xstrdup("win");
+	p->default_target_platform  = jce_strdup("win");
 
 	/* Seed with conventional defaults the new-project template will use. */
 	p->asset_dirs = (char **)jce_malloc(sizeof(char *) * 1);
 	if (p->asset_dirs) {
-		p->asset_dirs[0] = xstrdup("assets");
+		p->asset_dirs[0] = jce_strdup("assets");
 		p->asset_dirs_count = p->asset_dirs[0] ? 1 : 0;
 	}
 	p->build_variants = (char **)jce_malloc(sizeof(char *) * 2);
 	if (p->build_variants) {
-		p->build_variants[0] = xstrdup("debug");
-		p->build_variants[1] = xstrdup("release");
+		p->build_variants[0] = jce_strdup("debug");
+		p->build_variants[1] = jce_strdup("release");
 		p->build_variants_count = (p->build_variants[0] && p->build_variants[1]) ? 2 : 0;
 	}
 
 	/* v2 defaults — new projects always use the canonical layout. */
-	p->source_assets  = xstrdup("assets");
-	p->cooked_assets  = xstrdup("resources/_cooked");
+	p->source_assets  = jce_strdup("assets");
+	p->cooked_assets  = jce_strdup("resources/_cooked");
 	p->startup_scene  = NULL;
 	return p;
 }
@@ -341,7 +332,7 @@ bool JCE_CALL jce_project_set_field(JceProject *p,
 	else if (!strcmp(field, "cooked_assets"))           slot = &p->cooked_assets;
 	else if (!strcmp(field, "startup_scene"))           slot = &p->startup_scene;
 	if (!slot) return false;
-	char *dup = (value && *value) ? xstrdup(value) : NULL;
+	char *dup = (value && *value) ? jce_strdup(value) : NULL;
 	if (value && *value && !dup) return false;
 	xfree(*slot);
 	*slot = dup;
@@ -357,7 +348,7 @@ bool JCE_CALL jce_project_bundle_add(JceProject *p, const char *path)
 	char **nb = (char **)jce_malloc(sizeof(char *) * (cnt + 1));
 	if (!nb) return false;
 	for (size_t i = 0; i < cnt; ++i) nb[i] = p->bundles[i];
-	char *dup = xstrdup(path);
+	char *dup = jce_strdup(path);
 	if (!dup) { jce_free(nb); return false; }
 	nb[cnt] = dup;
 	xfree(p->bundles);
@@ -391,7 +382,7 @@ bool JCE_CALL jce_project_bundle_set_all(JceProject *p,
 	int kept = 0;
 	for (int i = 0; i < count; ++i) {
 		if (!paths[i] || !*paths[i]) continue;
-		char *dup = xstrdup(paths[i]);
+		char *dup = jce_strdup(paths[i]);
 		if (dup) nb[kept++] = dup;
 	}
 	if (kept == 0) { jce_free(nb); return true; }
@@ -640,7 +631,7 @@ bool JCE_CALL jce_project_create_from_template(const char *project_dir,
 	{
 		/* Default output_exe to "<name>" (no extension; build picks one). */
 		xfree(p->output_exe);
-		p->output_exe = xstrdup(name);
+		p->output_exe = jce_strdup(name);
 	}
 	bool saved = jce_project_save(p);
 	jce_project_free(p);

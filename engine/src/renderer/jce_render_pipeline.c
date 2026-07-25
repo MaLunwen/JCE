@@ -240,6 +240,30 @@ void jce_render_pipeline_preset_for_current_tier(JceRenderPipelineDesc *out)
     case JCE_GPU_TIER_ULTRA:  jce_render_pipeline_preset_ultra(out); break;
     default:                  jce_render_pipeline_preset_mid(out);   break;
     }
+
+    /* Integrated-GPU pixel-fill reductions (MEDIUM only — an iGPU is capped
+     * there).  The MEDIUM preset is balanced for a weak DISCRETE part; an iGPU
+     * is fill/bandwidth-bound at native res, so cheapen the costs the balanced
+     * preset assumes discrete VRAM/fill can pay.  All three are the standard
+     * integrated-GPU quality tier (Unity/UE) and config-only — no shader edits:
+     *   - shadow_filter_quality 0: the CSM PCF collapses from a 3x3 (9-tap) to a
+     *     1-tap hard shadow via the shader's existing tier-0 branch (proven on
+     *     LOW).  ~8 fewer texture fetches per shadowed fragment — the single
+     *     biggest per-pixel cost on this hardware.  The ALU normal-offset bias
+     *     is kept on every tier, so no acne returns; edges just lose PCF softening.
+     *   - msaa_samples 1: the iGPU already runs FXAA (see the has_discrete TAA
+     *     gate), so 2x MSAA is redundant edge AA that only burns the color+depth
+     *     resolve bandwidth an iGPU is starved for.
+     * The dominant iGPU cost — raw pixel FILL at native res — is handled
+     * separately by budget-based dynamic resolution in the shipped-game present
+     * path (jce_default_main.inc.h), now enabled for the integrated MEDIUM tier;
+     * the editor scene view stays native so gizmos/grid/pick stay crisp.
+     * Discrete GPUs (HIGH/ULTRA, or a rare discrete MEDIUM) are untouched. */
+    if (t == JCE_GPU_TIER_MEDIUM &&
+        !jce_renderer_get_recommendation().has_discrete_gpu) {
+        out->shadow_filter_quality = 0;
+        out->msaa_samples          = 1;
+    }
 }
 
 /* ── Apply / query ────────────────────────────────────────────────── */
@@ -273,6 +297,27 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
     }
     s_active     = *desc;
     s_active_set = true;
+
+    /* Resolve AUTO perf opt-ins against the current hardware tier's default.
+     * The "safe win" batchers (prim/tex instancing + draw-cmd cache) are set ON
+     * at MEDIUM+ tier by every preset (rp_perf_enable_safe_wins), but a LATER
+     * settings layer — a project/scene RenderPipeline asset that predates these
+     * perf flags — carries them as AUTO, which the per-feature query then
+     * resolves to its hardcoded OFF builtin_default.  That silently disabled the
+     * batchers for real projects: color/texture-variant content fell to the slow
+     * per-material solo path and hit the 512-material cache overflow (measured
+     * 8467 draws / 73 FPS vs 322 / 200 FPS with the batcher live).  Bake the tier
+     * recommendation into AUTO entries here so "unspecified" inherits the tier
+     * default.  An EXPLICIT 0/1 in `desc` still overrides (user force off/on),
+     * and LOW tier leaves the safe wins AUTO (→ query OFF), so the 512MB / iGPU
+     * charter baseline stays byte-identical. */
+    {
+        JceRenderPipelineDesc tierdef;
+        jce_render_pipeline_preset_for_current_tier(&tierdef);
+        for (int i = 0; i < (int)JCE_RP_PERF_COUNT; i++)
+            if (s_active.perf[i] == JCE_RP_AUTO)
+                s_active.perf[i] = tierdef.perf[i];
+    }
 
     /* WebGL2 / OpenGL ES clamp: the browser backend is a low-caps GLES3 target
      * (no compute, no MSAA), yet a shipped RenderPipeline.rp.json can request a

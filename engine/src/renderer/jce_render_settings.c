@@ -56,8 +56,13 @@ bool jce_render_settings_save_json(const char *vfs_path, const JceRenderSettings
 
     /* ── Look Profile project defaults (plan 02) ─────────────────────────
      * Nested "look" object; absent in old files (v1) → parse keeps neutral
-     * defaults.  Flat channel keys (groundR/rimR…) avoid needing a float-
-     * array helper that does not exist in this lighter jce_json API. */
+     * defaults.  Colours are written as flat per-channel keys (groundR/rimR…)
+     * because v2 files already on disk use that spelling — NOT because the
+     * facade lacks an array helper (jce_json_set_float_array exists).  The
+     * scene serializer writes the same look profile with "groundColor" /
+     * "rimColor" float3 arrays; the loader above accepts both spellings, so
+     * do not "fix" this writer by renaming the keys — that would strand every
+     * jce.rendersettings.v2 file already written. */
     JceJson *look = jce_json_object();
     if (look) {
         jce_json_set_number(look, "wrap", (double)s->wrap_factor);
@@ -130,6 +135,19 @@ bool jce_render_settings_load_json_mem(const char *json, size_t len,
                                                         (double)out->wrap_factor);
         out->ambient_hemisphere = jce_json_get_bool(look, "hemisphere",
                                                     out->ambient_hemisphere);
+        /* Colours accept BOTH on-disk spellings of the SAME look profile.
+         * This module writes the flat per-channel keys (groundR/G/B, rimR/G/B);
+         * the scene serializer writes the identical field set with nested
+         * float3 arrays ("groundColor" / "rimColor") — and that array form is
+         * the one every shipped .scene.json on disk actually carries.  Read the
+         * array form first and let the flat keys override it, so a file written
+         * by this module still loads bit-identically while a look block lifted
+         * out of a scene's rendering.look also resolves.  Absent keys leave the
+         * defaults untouched (out is both source and fallback). */
+        jce_json_get_floats(look, "groundColor", out->ambient_ground_color, 3,
+                            out->ambient_ground_color);
+        jce_json_get_floats(look, "rimColor", out->rim_color, 3,
+                            out->rim_color);
         out->ambient_ground_color[0] = (float)jce_json_number_value(
             jce_json_get(look, "groundR"), (double)out->ambient_ground_color[0]);
         out->ambient_ground_color[1] = (float)jce_json_number_value(

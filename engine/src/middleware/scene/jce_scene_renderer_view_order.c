@@ -35,6 +35,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_gpu_particle_view,
                                          bool include_gpu_cull_view,
                                          bool include_point_cube_views,
+                                         bool include_dyn_csm_views,
                                          JceSceneRendererViewOrder *out)
 {
     if (!out)
@@ -133,6 +134,19 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
         }
     }
 
+    /* Dual shadow-map DYNAMIC atlas: 1 full-atlas depth clear (base+21) + 4
+       cascade tiles (base+22..25), pushed BEFORE the color view so the atlas is
+       produced before the PBR pass samples it (via the s_shadowMap stage).  A
+       SPARSE band (outside [base, max_view], above the fog composite base+16), so
+       it adds 5 to the order count beyond range_count (see the return below). */
+    if (include_dyn_csm_views) {
+        for (uint16_t v = (uint16_t)(view_id_base + 21u);
+             v <= (uint16_t)(view_id_base + 25u); v++) {
+            if (!order_push(out, v))
+                return false;
+        }
+    }
+
     /* GPU particle compute view (base+9): the simulate/emit dispatches must
        execute before base+0 (the color view that draws the pool).  In the
        GPU-cull path base+9 was already pushed early above (order_push dedups, so
@@ -156,5 +170,6 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
        [base, max_view], so it adds to the count beyond the contiguous range. */
     uint16_t expected = (uint16_t)range_count;
     if (include_point_cube_views) expected = (uint16_t)(expected + 17u);
+    if (include_dyn_csm_views)    expected = (uint16_t)(expected + 5u);
     return out->count == expected;
 }

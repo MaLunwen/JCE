@@ -2,7 +2,7 @@
  * jce_physics_bullet.cpp  C++ Bullet3 back-end for jce_physics.
  *
  * Wraps btDiscreteDynamicsWorld behind the extern "C" bridge declared
- * in jce_physics_internal.h.  Compiled as C++17.
+ * in jce_physics_internal.h.  Compiled as C++20.
  */
 
 #include "jce_physics_internal.h"
@@ -97,7 +97,13 @@ void  bt_jce_free_aligned(void *ptr)
     jce_free(raw);
 }
 
-void install_bullet_allocator_once()
+} /* namespace */
+
+/* External-linkage allocator installer (declared in jce_physics_internal.h).
+ * Kept out of the anonymous namespace so the cloth TU can install the hook
+ * before it allocates its own secondary Bullet world.  References the
+ * anon-namespace trampolines above (same TU). */
+void jce_bullet_install_allocator_(void)
 {
     static bool installed = false;
     if (installed) return;
@@ -105,7 +111,6 @@ void install_bullet_allocator_once()
     btAlignedAllocSetCustomAligned(&bt_jce_alloc_aligned, &bt_jce_free_aligned);
     installed = true;
 }
-} /* namespace */
 
 /* ================================================================== */
 /* Conversion helpers                                                  */
@@ -384,7 +389,7 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies,
                                   float angular_sleep_threshold,
                                   bool multithreaded)
 {
-    install_bullet_allocator_once();
+    jce_bullet_install_allocator_();
 
     auto *bw = static_cast<JceBulletWorld *>(
         JCE_CALLOC(1, sizeof(JceBulletWorld)));

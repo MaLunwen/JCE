@@ -115,7 +115,11 @@ void insp_undo_int(int *value, int prev);
 void draw_vec3_control(const char *label, float *values,
                        float speed = 0.1f, float reset_value = 0.0f);
 void accept_asset_drop(char *buf, size_t buf_size);
-void accept_mesh_drop_with_material(JceMeshRenderer *mr);
+/* Apply the "a model was dropped on the mesh field" side effects: reset the
+   primitive shape and, for a real mesh file, import its material/textures.
+   `abs_path` must be the RAW absolute dropped path (assimp needs a real
+   filesystem path); get it from JcePathInputOpts::dropped_raw. */
+void apply_mesh_drop_material(JceMeshRenderer *mr, const char *abs_path);
 
 /* ── load_material_into_renderer — defined in jce_panel_inspector_render.cpp ── */
 /* Forward-declared here because jce_editor_inspector_reload_material

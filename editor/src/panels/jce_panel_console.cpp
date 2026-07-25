@@ -2,8 +2,11 @@
  * jce_panel_console.cpp  Console panel (log output with filtering).
  * Extracted from jce_editor_panels.cpp.
  *
- * The console ring buffer lives in jce_editor_panels.cpp; this file
- * uses the iteration API (jce_editor_console_entry_count/get) to read it.
+ * The console shows two interleaved streams:
+ *   - editor events, kept in the ring buffer in jce_editor_panels.cpp and
+ *     read through the iteration API (jce_editor_console_entry_count/get);
+ *   - the engine's own structured log, mirrored here through the jce_log
+ *     sink (see the "engine log bridge" section below).
  */
 
 #include "ui/jce_editor_colors.h"
@@ -15,10 +18,14 @@
 
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/os/core/jce_console.h>   /* cvar + command registry */
+#include <jce/os/core/jce_log.h>       /* engine log stream + sink hook */
+#include <jce/os/core/jce_thread.h>    /* JceMutex for the sink hand-off */
+#include <jce/os/core/jce_timer.h>     /* local-time formatting */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
+#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
@@ -73,13 +80,196 @@ static bool entry_passes_filter(const JceConsoleEntry &e)
     return true;
 }
 
+/* ── Engine log bridge (jce_log → this panel) ─────────────────────────
+ *
+ * jce_log is the engine's one structured logger.  This panel subscribes to it
+ * so engine output lands in the Console next to the editor's own entries,
+ * instead of only in stderr and the log file.
+ *
+ * The sink fires on jce_log's backend thread, so it must not touch ImGui or
+ * the display ring.  All it does is copy the record into `pending` under a
+ * mutex; console_engine_drain() moves that into the main-thread-only `view`
+ * ring once per content pass, and console_build_rows() merges `view` with the
+ * editor console ring by timestamp.
+ *
+ * Severity mapping — jce_log has six levels, the console four.  Nothing is
+ * dropped; the two pairs that would share a colour are folded:
+ *     JCE_LOG_LEVEL_TRACE   ─┐
+ *     JCE_LOG_LEVEL_DEBUG   ─┴→ JCE_CONSOLE_DEBUG    (hidden unless "Debug")
+ *     JCE_LOG_LEVEL_INFO    ─┐
+ *     JCE_LOG_LEVEL_SUCCESS ─┴→ JCE_CONSOLE_INFO
+ *     JCE_LOG_LEVEL_WARN     → JCE_CONSOLE_WARNING
+ *     JCE_LOG_LEVEL_ERROR    → JCE_CONSOLE_ERROR
+ *     JCE_LOG_LEVEL_OFF      → never emitted by jce_log
+ * The console has no level of its own that jce_log lacks, so the mapping is
+ * total in both directions.
+ *
+ * Engine records are deliberately NOT pushed through
+ * jce_editor_console_log_level(): that entry point also raises a toast, and
+ * one toast per engine warning would evict the editor's own notifications
+ * (8 slots, 4 s each).  Editor events keep their existing path and this
+ * bridge stays purely additive.
+ */
+
+#define CONSOLE_ENGINE_LINE_LEN 256
+#define CONSOLE_ENGINE_PENDING  256   /* power of two: sink → main hand-off */
+#define CONSOLE_ENGINE_VIEW     512   /* power of two: what the panel shows */
+
+struct EngineLogLine {
+    char            text[CONSOLE_ENGINE_LINE_LEN];
+    char            timestamp[24];
+    JceConsoleLevel level;
+};
+
+static struct {
+    JceMutex     *mtx;      /* guards pending / head / tail / dropped   */
+    EngineLogLine pending[CONSOLE_ENGINE_PENDING];
+    unsigned      head;     /* advanced by the sink (log thread)        */
+    unsigned      tail;     /* advanced by the drain (main thread)      */
+    int           dropped;  /* pending overflows since the last drain   */
+
+    EngineLogLine view[CONSOLE_ENGINE_VIEW];   /* main thread only */
+    unsigned      view_head;
+    int           view_count;
+} s_engine;
+
+/* Fill in a line's timestamp in the same format the editor console ring uses,
+ * so the two streams sort against each other lexicographically. */
+static void engine_line_stamp(EngineLogLine *l, int64_t epoch_s)
+{
+    if (jce_time_format_local(epoch_s, "%Y-%m-%d %H:%M:%S",
+                              l->timestamp, sizeof(l->timestamp)) == 0)
+        snprintf(l->timestamp, sizeof(l->timestamp), "----------  --:--:--");
+}
+
+/* jce_log sink.  Runs on the log backend thread: copy only, no ImGui, no
+ * allocation, no jce_log_* re-entry. */
+static void console_log_sink(const JceLogRecord *rec, void *user)
+{
+    (void)user;
+    if (!rec || !s_engine.mtx) return;
+
+    /* Entries that ORIGINATED in the editor Console (jce_editor_console_log*)
+     * are mirrored into jce_log so they reach the log file, and they carry
+     * this tag.  They are already in the editor ring, so taking them again
+     * here would show every editor message twice. */
+    if (rec->tag && strcmp(rec->tag, kEditorConsoleLogTag) == 0) return;
+
+    JceConsoleLevel level;
+    switch (rec->level) {
+    case JCE_LOG_LEVEL_TRACE:
+    case JCE_LOG_LEVEL_DEBUG: level = JCE_CONSOLE_DEBUG;   break;
+    case JCE_LOG_LEVEL_WARN:  level = JCE_CONSOLE_WARNING; break;
+    case JCE_LOG_LEVEL_ERROR: level = JCE_CONSOLE_ERROR;   break;
+    default:                  level = JCE_CONSOLE_INFO;    break; /* INFO, SUCCESS */
+    }
+
+    jce_mutex_lock(s_engine.mtx);
+    if (s_engine.head - s_engine.tail >= CONSOLE_ENGINE_PENDING) {
+        s_engine.dropped++;   /* panel not drawn, or a burst between frames */
+    } else {
+        EngineLogLine *l = &s_engine.pending[s_engine.head & (CONSOLE_ENGINE_PENDING - 1)];
+        l->level = level;
+        /* The engine's own line shape minus the parts the console renders
+         * itself (timestamp column, level prefix). */
+        snprintf(l->text, sizeof(l->text), "[%s] %s: %s at %s:%d",
+                 rec->thread_name, rec->tag, rec->message, rec->file, rec->line);
+        engine_line_stamp(l, rec->wall_epoch_s);
+        s_engine.head++;
+    }
+    jce_mutex_unlock(s_engine.mtx);
+}
+
+/* Append to the display ring.  Main thread only. */
+static void console_engine_view_push(const EngineLogLine *l)
+{
+    s_engine.view[s_engine.view_head & (CONSOLE_ENGINE_VIEW - 1)] = *l;
+    s_engine.view_head++;
+    if (s_engine.view_count < CONSOLE_ENGINE_VIEW)
+        s_engine.view_count++;
+}
+
+/* Move everything the sink queued into the display ring.  Main thread only. */
+static void console_engine_drain(void)
+{
+    if (!s_engine.mtx) return;
+
+    jce_mutex_lock(s_engine.mtx);
+    while (s_engine.head != s_engine.tail) {
+        console_engine_view_push(&s_engine.pending[s_engine.tail & (CONSOLE_ENGINE_PENDING - 1)]);
+        s_engine.tail++;
+    }
+    int dropped = s_engine.dropped;
+    s_engine.dropped = 0;
+    jce_mutex_unlock(s_engine.mtx);
+
+    if (dropped > 0) {
+        EngineLogLine note;
+        note.level = JCE_CONSOLE_WARNING;
+        snprintf(note.text, sizeof(note.text),
+                 "[console] %d engine log line(s) dropped (see the log file)",
+                 dropped);
+        engine_line_stamp(&note, jce_time_now_epoch_seconds());
+        console_engine_view_push(&note);
+    }
+}
+
+/* Clear both streams: "Clear" must not leave half the console behind. */
+static void console_clear_all(void)
+{
+    jce_editor_console_clear();
+    if (s_engine.mtx) {
+        jce_mutex_lock(s_engine.mtx);
+        s_engine.tail    = s_engine.head;
+        s_engine.dropped = 0;
+        jce_mutex_unlock(s_engine.mtx);
+    }
+    s_engine.view_head  = 0;
+    s_engine.view_count = 0;
+}
+
+/* Build the merged display list.  Both inputs are already in timestamp order,
+ * so an in-place merge is enough.  Entries point at storage owned by the two
+ * rings, neither of which is touched again before the frame ends. */
+static void console_build_rows(std::vector<JceConsoleEntry> &rows)
+{
+    int editor_count = jce_editor_console_entry_count();
+    rows.clear();
+    rows.reserve((size_t)editor_count + (size_t)s_engine.view_count);
+
+    for (int i = 0; i < editor_count; i++) {
+        JceConsoleEntry e;
+        if (jce_editor_console_entry_get(i, &e))
+            rows.push_back(e);
+    }
+    size_t editor_n = rows.size();
+
+    int start = 0;
+    if (s_engine.view_count >= CONSOLE_ENGINE_VIEW)
+        start = (int)(s_engine.view_head & (CONSOLE_ENGINE_VIEW - 1));
+    for (int i = 0; i < s_engine.view_count; i++) {
+        const EngineLogLine &l = s_engine.view[(start + i) & (CONSOLE_ENGINE_VIEW - 1)];
+        JceConsoleEntry e;
+        e.text      = l.text;
+        e.timestamp = l.timestamp;
+        e.level     = l.level;
+        rows.push_back(e);
+    }
+
+    if (editor_n == 0 || rows.size() == editor_n) return;   /* one stream only */
+    std::inplace_merge(rows.begin(), rows.begin() + (ptrdiff_t)editor_n, rows.end(),
+                       [](const JceConsoleEntry &a, const JceConsoleEntry &b) {
+                           return strcmp(a.timestamp, b.timestamp) < 0;
+                       });
+}
+
 static void execute_console_command(const char *cmd)
 {
     if (!cmd || !*cmd) return;
     jce_editor_console_log("> %s", cmd);
 
     if (strncmp(cmd, "clear", 5) == 0) {
-        jce_editor_console_clear();
+        console_clear_all();
         s_ui.selected.clear();
         s_ui.anchor = -1;
     } else if (strncmp(cmd, "help", 4) == 0) {
@@ -126,15 +316,24 @@ static void ensure_init(void)
     s_ui.auto_scroll   = jce_editor_ui_state_load_int("console.autoscroll",     1, 0, 1) != 0;
     s_ui.initialized = true;
     jce_console_set_output(console_sink, nullptr);
+
+    /* Subscribe to the engine log.  The mutex must exist before the sink can
+     * fire, and the sink is never removed — the log backend thread is joined
+     * by jce_log_shutdown() long before these statics go away. */
+    if (!s_engine.mtx) {
+        s_engine.mtx = jce_mutex_create();
+        if (s_engine.mtx)
+            jce_log_set_sink(console_log_sink, nullptr);
+    }
 }
 
-static void copy_selection_to_clipboard(void)
+static void copy_selection_to_clipboard(const std::vector<JceConsoleEntry> &rows)
 {
     if (s_ui.selected.empty()) return;
     std::string out;
     for (int idx : s_ui.selected) {
-        JceConsoleEntry entry;
-        if (!jce_editor_console_entry_get(idx, &entry)) continue;
+        if (idx < 0 || (size_t)idx >= rows.size()) continue;
+        const JceConsoleEntry &entry = rows[(size_t)idx];
         const char *prefix;
         switch (entry.level) {
         case JCE_CONSOLE_WARNING: prefix = "[WARN]  "; break;
@@ -152,13 +351,11 @@ static void copy_selection_to_clipboard(void)
         ImGui::SetClipboardText(out.c_str());
 }
 
-static void copy_all_visible_to_clipboard(void)
+static void copy_all_visible_to_clipboard(const std::vector<JceConsoleEntry> &rows)
 {
     std::string out;
-    int count = jce_editor_console_entry_count();
-    for (int i = 0; i < count; i++) {
-        JceConsoleEntry entry;
-        if (!jce_editor_console_entry_get(i, &entry)) continue;
+    for (size_t i = 0; i < rows.size(); i++) {
+        const JceConsoleEntry &entry = rows[i];
         bool show = false;
         switch (entry.level) {
         case JCE_CONSOLE_INFO:    show = s_ui.show_info;    break;
@@ -256,10 +453,13 @@ void jce_editor_panel_console_content(void)
 {
     ensure_init();
 
+    /* Pull whatever the engine log queued since the last frame. */
+    console_engine_drain();
+
     /* Clear-on-play: detect transition to PLAYING. */
     JcePlayState ps_now = jce_state_get_play_state();
     if (s_ui.clear_on_play && ps_now == JCE_PLAY_PLAYING && s_ui.last_play != JCE_PLAY_PLAYING) {
-        jce_editor_console_clear();
+        console_clear_all();
         s_ui.selected.clear();
         s_ui.anchor = -1;
     }
@@ -267,7 +467,7 @@ void jce_editor_panel_console_content(void)
 
     /* Toolbar: Clear + filter checkboxes + auto-scroll + clear-on-play + collapse */
     if (ImGui::SmallButton(jce_editor_i18n("console.clear")))
-        jce_editor_console_clear();
+        console_clear_all();
     ImGui::SameLine();
     {
         char _lbl[64];
@@ -324,7 +524,10 @@ void jce_editor_panel_console_content(void)
     ImGui::BeginChild("ConsoleScroll", ImVec2(0, -cmd_h), ImGuiChildFlags_None,
                        ImGuiWindowFlags_HorizontalScrollbar);
 
-    int count = jce_editor_console_entry_count();
+    /* Editor events and mirrored engine log, interleaved by timestamp. */
+    std::vector<JceConsoleEntry> rows;
+    console_build_rows(rows);
+    int count = (int)rows.size();
 
     /* Pre-compute per-entry visibility + collapse counts.
      * collapse merges consecutive entries with identical (level,text). */
@@ -335,16 +538,14 @@ void jce_editor_panel_console_content(void)
 
     int i = 0;
     while (i < count) {
-        JceConsoleEntry e;
-        if (!jce_editor_console_entry_get(i, &e)) { i++; continue; }
+        const JceConsoleEntry &e = rows[(size_t)i];
         if (!entry_passes_filter(e)) { i++; continue; }
 
         int run = 1;
         if (s_ui.collapse) {
             int j = i + 1;
             while (j < count) {
-                JceConsoleEntry e2;
-                if (!jce_editor_console_entry_get(j, &e2)) break;
+                const JceConsoleEntry &e2 = rows[(size_t)j];
                 if (!entry_passes_filter(e2)) { j++; continue; }
                 if (e2.level == e.level && strcmp(e2.text, e.text) == 0) {
                     run++;
@@ -364,8 +565,7 @@ void jce_editor_panel_console_content(void)
     for (size_t vi = 0; vi < visible_idx.size(); ++vi) {
         int idx = visible_idx[vi];
         int dup = collapse_count[vi];
-        JceConsoleEntry entry;
-        if (!jce_editor_console_entry_get(idx, &entry)) continue;
+        const JceConsoleEntry &entry = rows[(size_t)idx];
 
         ImVec4 color;
         const char *prefix;
@@ -431,12 +631,12 @@ void jce_editor_panel_console_content(void)
         if (ImGui::BeginPopupContextItem("##ctx")) {
             if (ImGui::MenuItem(jce_editor_i18n("console.copy"), "Ctrl+C",
                                 false, !s_ui.selected.empty()))
-                copy_selection_to_clipboard();
+                copy_selection_to_clipboard(rows);
             if (ImGui::MenuItem(jce_editor_i18n("console.copyAll")))
-                copy_all_visible_to_clipboard();
+                copy_all_visible_to_clipboard(rows);
             ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("console.clear"))) {
-                jce_editor_console_clear();
+                console_clear_all();
                 s_ui.selected.clear();
                 s_ui.anchor = -1;
             }
@@ -468,9 +668,9 @@ void jce_editor_panel_console_content(void)
             ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
     {
         if (ImGui::MenuItem(jce_editor_i18n("console.copyAll")))
-            copy_all_visible_to_clipboard();
+            copy_all_visible_to_clipboard(rows);
         if (ImGui::MenuItem(jce_editor_i18n("console.clear"))) {
-            jce_editor_console_clear();
+            console_clear_all();
             s_ui.selected.clear();
             s_ui.anchor = -1;
         }
@@ -482,7 +682,7 @@ void jce_editor_panel_console_content(void)
     {
         bool ctrl = ImGui::GetIO().KeyCtrl;
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
-            copy_selection_to_clipboard();
+            copy_selection_to_clipboard(rows);
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             s_ui.selected.clear();
             s_ui.anchor = -1;

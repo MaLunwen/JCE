@@ -61,9 +61,13 @@ typedef enum {
 } JceAttrib;
 
 typedef enum {
-    JCE_ATTRIB_TYPE_UINT8 = 0,
+    /* Values mirror bgfx_attrib_type_t for a zero-cost cast (asserted in
+     * jce_lowlevel.c).  bgfx 1.146 inserted INT8 at 0 and UINT16 at 4. */
+    JCE_ATTRIB_TYPE_INT8 = 0,
+    JCE_ATTRIB_TYPE_UINT8,
     JCE_ATTRIB_TYPE_UINT10,
     JCE_ATTRIB_TYPE_INT16,
+    JCE_ATTRIB_TYPE_UINT16,
     JCE_ATTRIB_TYPE_HALF,
     JCE_ATTRIB_TYPE_FLOAT
 } JceAttribType;
@@ -142,7 +146,7 @@ JCE_API const JceGfxMemory * JCE_CALL jce_gfx_memory_copy(const void *data, uint
 typedef enum {
     JCE_TEXTURE_FORMAT_BC1 = 0,
     /* ... many compressed formats ... */
-    JCE_TEXTURE_FORMAT_RGBA8 = 67   /* matches bgfx::TextureFormat::RGBA8 */
+    JCE_TEXTURE_FORMAT_RGBA8 = 71   /* matches bgfx::TextureFormat::RGBA8 (bgfx 1.146) */
 } JceTextureFormat;
 
 /* No-op flag set (matches BGFX_TEXTURE_NONE / BGFX_SAMPLER_NONE). */

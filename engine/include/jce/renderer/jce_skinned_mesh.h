@@ -88,14 +88,14 @@ typedef struct {
  * undeformed base and re-upload into a dynamic VB.  Default (false) keeps the
  * legacy behavior byte-identical with zero extra RAM — callers MUST only opt in
  * for morph-bearing primitives (FEATURE 3.1). */
-JceSkinnedMesh *jce_skinned_mesh_create(
+JCE_API JceSkinnedMesh *jce_skinned_mesh_create(
     const JceSkinnedVertex *vertices, uint32_t num_verts,
     const uint32_t *indices, uint32_t num_indices,
     bool retain_cpu);
 
 /* Create a static PBR mesh (tangents, no skinning) from raw data.
  * retain_cpu: see jce_skinned_mesh_create (kept base verts for morph deform). */
-JceSkinnedMesh *jce_pbr_mesh_create(
+JCE_API JceSkinnedMesh *jce_pbr_mesh_create(
     const JcePbrVertex *vertices, uint32_t num_verts,
     const uint32_t *indices, uint32_t num_indices,
     bool retain_cpu);

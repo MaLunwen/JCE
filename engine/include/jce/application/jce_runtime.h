@@ -75,8 +75,40 @@ typedef struct {
 	bool           enable_physics;
 
 	/* Optional overrides — leave 0 for sensible defaults. */
-	float          gravity_y;        /* default -9.81 */
+	float          gravity_y;        /* default -9.81 (source-compat scalar) */
 	float          fixed_timestep;   /* default 1/60  */
+
+	/* Full gravity vector (X, Y, Z).  When ANY component is non-zero it
+	 * overrides the scalar gravity_y above (kept so existing callers still
+	 * compile/behave).  Default {0,0,0} -> fall back to (0, gravity_y|-9.81, 0).
+	 * Set this to honour a project's tilted / non-Y gravity — the scalar
+	 * gravity_y silently dropped the X and Z components. */
+	float          gravity[3];
+
+	/* Physics tuning (Project Settings > Physics; 0 = leave the engine/Bullet
+	 * default).  solver_iterations -> btContactSolverInfo.m_numIterations;
+	 * sleep_threshold applies to BOTH the linear and angular body sleep
+	 * thresholds.  (Unity-schema fields without a clean Bullet equivalent —
+	 * default_contact_offset / bounce_threshold / solver_velocity_iterations —
+	 * are intentionally not routed here; Bullet has no direct counterpart.) */
+	int32_t        solver_iterations;
+	float          sleep_threshold;
+
+	/* When false, the runtime does NOT step the physics world (manual-sim
+	 * projects drive it themselves).  Project Settings > Physics > auto
+	 * simulation.  Default true is expressed as 0 here == "unset == step"; set
+	 * `disable_auto_physics` to skip stepping. */
+	bool           disable_auto_physics;
+
+	/* Frame-dt clamp (spiral-of-death guard) in seconds; <=0 keeps the engine
+	 * default (RT_MAX_FIXED_STEPS-derived).  Project Settings > Time >
+	 * max_allowed_timestep. */
+	float          max_frame_dt;
+
+	/* 2D physics gravity (Project Settings > Physics 2D).  When any component
+	 * is non-zero it drives the Box2D world; else it falls back to (0, -9.81).
+	 * Previously the 2D world reused the 3D gravity vector. */
+	float          gravity2d[2];
 
     /* Optional audio resolver.  When set, the runtime calls this for
      * every synchronous one-shot and editor-hosted AudioSource clip instead
@@ -359,8 +391,19 @@ JCE_API float       JCE_CALL jce_runtime_vehicle_get_speed(JceRuntime *rt,
  * — per-instance `self` state is preserved and on_start is NOT re-run, so a
  * running game keeps its state while picking up edited on_update/on_collision
  * logic.  A compile error keeps the previous version.  The editor drives this
- * automatically via a file watcher; exposed for scripted live-coding too. */
-JCE_API void        JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path);
+ * automatically via a file watcher; exposed for scripted live-coding too.
+ *
+ * Returns false when the script was NOT reloaded — unreadable file, a
+ * compile error (the previous version stays live), or no script VM.  A
+ * live-coding caller needs this: the whole point of hot-reload is the edit
+ * taking effect, and silently keeping the old bytecode looks identical to
+ * "my change did nothing".
+ *
+ * Returning true with ZERO rebound instances is normal, not a failure: the
+ * file compiled but no live entity currently runs it.  The instance count
+ * is logged rather than returned, so callers do not have to encode "how
+ * many" and "did it work" in one integer. */
+JCE_API bool        JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path);
 
 /* Renderer interpolation factor in [0,1] left over from the last
  * jce_runtime_step: residual_accumulator / fixed_timestep.  This is the

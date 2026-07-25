@@ -3,6 +3,7 @@
 #include <jce/runtime/jce_ai_scene_director.h>
 
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_json.h>
 
 #include <limits.h>
@@ -10,8 +11,6 @@
 
 #define JCE_AI_REQUEST_CONTRACT "jce.scene.recipe.request"
 #define JCE_AI_RESPONSE_CONTRACT "jce.scene.recipe.response"
-#define JCE_AI_FNV64_OFFSET 14695981039346656037ULL
-#define JCE_AI_FNV64_PRIME 1099511628211ULL
 
 struct JceAiSceneDirector {
     JceAiSceneDirectorDesc desc;
@@ -63,52 +62,27 @@ static bool request_strings_valid(const JceAiSceneRequest *request)
     return true;
 }
 
-static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size)
-{
-    const uint8_t *bytes = (const uint8_t *)data;
-    size_t i;
-
-    for (i = 0u; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= JCE_AI_FNV64_PRIME;
-    }
-    return hash;
-}
-
-static uint64_t hash_u32(uint64_t hash, uint32_t value)
-{
-    uint8_t bytes[4];
-    uint32_t i;
-    for (i = 0u; i < 4u; ++i)
-        bytes[i] = (uint8_t)((value >> (8u * i)) & 0xffu);
-    return hash_bytes(hash, bytes, sizeof(bytes));
-}
-
-static uint64_t hash_u64(uint64_t hash, uint64_t value)
-{
-    uint8_t bytes[8];
-    uint32_t i;
-    for (i = 0u; i < 8u; ++i)
-        bytes[i] = (uint8_t)((value >> (8u * i)) & 0xffu);
-    return hash_bytes(hash, bytes, sizeof(bytes));
-}
-
+/* The pinned deterministic FNV-1a-64 primitives this file hashes with live in
+ * jce_hash.h (jce_hash_det64_*).  This length-prefixed text framing is local:
+ * it uses a u32 length prefix, where the scene compiler's same-named helper
+ * uses a u16 prefix plus an overflow sentinel — the two are NOT
+ * interchangeable and neither may adopt the other's framing. */
 static uint64_t hash_text(uint64_t hash, const char *text, size_t capacity)
 {
     size_t length = bounded_length(text, capacity);
-    hash = hash_u32(hash, (uint32_t)length);
-    return hash_bytes(hash, text, length);
+    hash = jce_hash_det64_u32(hash, (uint32_t)length);
+    return jce_hash_det64_bytes(hash, text, length);
 }
 
 static void build_cache_key(JceAiSceneDirector *director)
 {
-    uint64_t hash = JCE_AI_FNV64_OFFSET;
+    uint64_t hash = JCE_HASH_DET64_OFFSET;
 
-    hash = hash_u32(hash, director->desc.policy_version);
-    hash = hash_u32(hash, JCE_SCENE_COMPILER_VERSION);
-    hash = hash_u64(hash, director->request.request_id);
-    hash = hash_u64(hash, director->request.seed);
-    hash = hash_u64(hash, director->catalog.content_hash);
+    hash = jce_hash_det64_u32(hash, director->desc.policy_version);
+    hash = jce_hash_det64_u32(hash, JCE_SCENE_COMPILER_VERSION);
+    hash = jce_hash_det64_u64(hash, director->request.request_id);
+    hash = jce_hash_det64_u64(hash, director->request.seed);
+    hash = jce_hash_det64_u64(hash, director->catalog.content_hash);
     hash = hash_text(hash, director->request.locale,
                      sizeof(director->request.locale));
     hash = hash_text(hash, director->request.intent,

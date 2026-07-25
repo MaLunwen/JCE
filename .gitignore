@@ -44,6 +44,7 @@ sync_*.py
 
 agents.*
 tests/
+tools/audit/
 
 # sample projects (local-only, deliberately unversioned)
 science_lab/
@@ -52,6 +53,8 @@ meadow_valley/
 # sample projects
 elemental_serenity/
 space/
+# game project
+# caged_kingdom/
 
 
 # Android APK build

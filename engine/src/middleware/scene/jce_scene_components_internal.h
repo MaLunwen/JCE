@@ -24,6 +24,7 @@
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_postfx.h>
 #include <jce/resource/jce_scene_contract.h>
 
 #include "jce_component_registry_internal.h"
@@ -137,14 +138,13 @@ static inline const char *j_str_any(const cJSON *o, const char *const *keys, int
     return NULL;
 }
 
+/* Bounded copy = jce_strlcpy with the NULL tolerance these call sites rely on:
+   a NULL/zero-cap `dst` is a no-op and a NULL `src` yields "", where the bare
+   jce_strlcpy would dereference. Argument order stays (dst, cap, src). */
 static inline void copy_str(char *dst, size_t cap, const char *src)
 {
     if (!dst || cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = '\0';
+    jce_strlcpy(dst, src ? src : "", cap);
 }
 
 static inline int streq_ci(const char *a, const char *b)

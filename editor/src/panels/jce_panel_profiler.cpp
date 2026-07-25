@@ -16,6 +16,7 @@
  * "Renderer" section below is the place to wire it in.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
@@ -1216,48 +1217,22 @@ extern "C" void jce_editor_panel_benchmark_content(void);
 
 namespace {
 
-int g_request_tab = -1;
-int g_current_tab = 0;  /* mirror of active profiling TabItem for menu markers */
-bool g_tab_state_loaded = false;
-
-static const char *k_tab_state_key = "panel.profiler.current_tab";
-
-bool valid_tab(int idx)
-{
-    return idx >= 0 && idx <= 4;
-}
-
-void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    /* Clamp must span all 5 tabs (0..4, see valid_tab) — a tighter max
-     * silently remaps a persisted Benchmark tab onto Frame Debugger. */
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 4);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-void set_current_tab(int idx)
-{
-    if (!valid_tab(idx) || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+/* max_tab must span all 5 tabs (0..4): it is both the validity bound and
+ * the load clamp, so a persisted Benchmark tab can never be silently
+ * remapped onto Frame Debugger. */
+JcePanelTabState g_tabs{ "panel.profiler.current_tab", /*max_tab=*/4 };
 
 void draw_workbench(void)
 {
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (!ImGui::BeginTabBar("##profiling_tabs"))
         return;
 
-    ImGuiTabItemFlags cpu_flags = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags mem_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags ana_flags = (g_request_tab == 2) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags fd_flags  = (g_request_tab == 3) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags bm_flags  = (g_request_tab == 4) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags cpu_flags = jce_panel_tab_flags(g_tabs, 0);
+    ImGuiTabItemFlags mem_flags = jce_panel_tab_flags(g_tabs, 1);
+    ImGuiTabItemFlags ana_flags = jce_panel_tab_flags(g_tabs, 2);
+    ImGuiTabItemFlags fd_flags  = jce_panel_tab_flags(g_tabs, 3);
+    ImGuiTabItemFlags bm_flags  = jce_panel_tab_flags(g_tabs, 4);
 
     char cpu_label[96];
     char mem_label[96];
@@ -1276,33 +1251,33 @@ void draw_workbench(void)
                   jce_editor_i18n("benchmark.title"));
 
     if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
-        set_current_tab(0);
+        jce_panel_tab_set_current(g_tabs, 0);
         draw_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(mem_label, nullptr, mem_flags)) {
-        set_current_tab(1);
+        jce_panel_tab_set_current(g_tabs, 1);
         jce_editor_panel_memory_profiler_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(ana_label, nullptr, ana_flags)) {
-        set_current_tab(2);
+        jce_panel_tab_set_current(g_tabs, 2);
         jce_editor_panel_profile_analyzer_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(fd_label, nullptr, fd_flags)) {
-        set_current_tab(3);
+        jce_panel_tab_set_current(g_tabs, 3);
         jce_editor_panel_frame_debugger_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(bm_label, nullptr, bm_flags)) {
-        set_current_tab(4);
+        jce_panel_tab_set_current(g_tabs, 4);
         jce_editor_panel_benchmark_content();
         ImGui::EndTabItem();
     }
 
     ImGui::EndTabBar();
-    g_request_tab = -1;
+    g_tabs.request = -1;
 }
 
 } /* anonymous namespace */
@@ -1325,17 +1300,12 @@ extern "C" void jce_panel_profiler_draw_view_table(void)
 
 extern "C" void jce_panel_profiler_request_tab(int idx)
 {
-    if (!valid_tab(idx))
-        return;
-    g_request_tab = idx;
-    g_current_tab = idx;
-    jce_editor_ui_state_save_int(k_tab_state_key, idx);
+    jce_panel_tab_request(g_tabs, idx);
 }
 
 extern "C" int jce_panel_profiler_current_tab(void)
 {
-    ensure_tab_state_loaded();
-    return g_current_tab;
+    return jce_panel_tab_current(g_tabs);
 }
 
 extern "C" void jce_editor_panel_profiler_content(void)

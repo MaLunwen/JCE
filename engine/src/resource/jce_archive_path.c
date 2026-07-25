@@ -22,7 +22,12 @@ size_t jce_archive_normalize_path(const char *in, char *out, size_t out_cap) {
 
     const char *p = in;
 
-    /* (1) strip a leading drive letter of the form "X:". */
+    /* (1) strip a leading drive letter of the form "X:".
+     *
+     * Open-coded on purpose (audit DUP-044): this function IS the canonical
+     * definition of resource identity, and the TU is compiled into the
+     * standalone jce_pak host tool, which links no engine library, so it must
+     * stay dependency-free. */
     if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
         p[1] == ':') {
         p += 2;

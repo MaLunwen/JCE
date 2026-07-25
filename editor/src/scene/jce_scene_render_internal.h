@@ -63,6 +63,11 @@ struct SceneRenderState {
     bool                    homogeneous_depth;
     JceRenderer            *renderer;
     JceOffscreenTarget  *bridge;
+    /* Native-resolution target the dynamic-resolution upscale resolves into
+     * (RCAS sharpen), so the Scene View displays 1:1 instead of letting ImGui
+     * bilinear-stretch the scaled bridge. NULL until first upscaled frame. */
+    JceOffscreenTarget  *present;
+    uint16_t                present_tex;   /* color tex to display, or UINT16_MAX */
     JceCamera              *camera;
 
     /* Engine-owned scene renderer (sky, shadows, entities, sprites, IBL). */

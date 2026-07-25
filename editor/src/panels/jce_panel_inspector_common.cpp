@@ -167,18 +167,19 @@ static bool is_mesh_ext(const char *path)
     return false;
 }
 
-void accept_mesh_drop_with_material(JceMeshRenderer *mr)
+/* Post-drop half of the old accept_mesh_drop_with_material(): everything that
+ * has to happen once a model path has been dropped onto the mesh field.
+ *
+ * Split out because jce_draw_path_input now owns the JCE_DND_ASSET_PATH target
+ * (a second BeginDragDropTarget at the call site would land on the trailing
+ * browse button instead of the text field).  The widget hands back the raw
+ * ABSOLUTE path via JcePathInputOpts::dropped_raw, which is what assimp needs —
+ * mr->mesh_path itself has already been relativized by the widget. */
+void apply_mesh_drop_material(JceMeshRenderer *mr, const char *abs_path)
 {
-    if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
-            const char *path = (const char *)payload->Data;
-            /* Store the mesh ref as project-relative.  Keep the
-             * absolute `path` for the importer call below — assimp
-             * needs a real filesystem path. */
-            copy_payload_as_relative(mr->mesh_path,
-                                     sizeof(mr->mesh_path),
-                                     payload->Data);
+    if (mr && abs_path && abs_path[0]) {
+        {
+            const char *path = abs_path;
             mr->mesh_shape = 0;
 
             if (is_mesh_ext(path)) {
@@ -219,6 +220,5 @@ void accept_mesh_drop_with_material(JceMeshRenderer *mr)
                 }
             }
         }
-        ImGui::EndDragDropTarget();
     }
 }

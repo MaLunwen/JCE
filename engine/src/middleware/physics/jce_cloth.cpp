@@ -105,6 +105,13 @@ static bool ensure_world(void)
 {
     if (g_initialised) return true;
 
+    /* Install the Bullet->jce allocator hook BEFORE the first `new` below.
+     * Cloth can initialise from jce_scene_update (edit mode, no Play), which
+     * may run before jce_bullet_create ever installs the hook; without this,
+     * these Bullet objects would be CRT-allocated and later mi_free'd — a
+     * cross-allocator free.  Idempotent. */
+    jce_bullet_install_allocator_();
+
     g_ctx.config     = new btSoftBodyRigidBodyCollisionConfiguration();
     g_ctx.dispatcher = new btCollisionDispatcher(g_ctx.config);
     g_ctx.broadphase = new btDbvtBroadphase();

@@ -30,11 +30,11 @@ typedef struct JceWindow JceWindow;
    thread when no parent HWND is supplied (heap/COM teardown races).
    Pass NULL to clear (e.g. on shutdown).  Safe to call from any thread,
    but in practice only the main thread should set this. */
-void jce_host_dialog_set_parent_window(struct SDL_Window *window);
+JCE_API void jce_host_dialog_set_parent_window(struct SDL_Window *window);
 
 /* Convenience: same as set_parent_window but takes a JceWindow.  The
    engine knows how to extract the underlying SDL_Window. */
-void jce_host_dialog_set_parent_jce_window(JceWindow *window);
+JCE_API void jce_host_dialog_set_parent_jce_window(JceWindow *window);
 
 typedef enum {
     JCE_DIALOG_OK        = 0,
@@ -55,7 +55,7 @@ typedef void (*JceDialogPathCallback)(void *user,
    - default_path: starting directory (may be NULL or "").
    - cb:           result callback (must be non-NULL).
    - user:         opaque pointer passed back to cb. */
-void jce_host_dialog_pick_folder(const char *title,
+JCE_API void jce_host_dialog_pick_folder(const char *title,
                                  const char *default_path,
                                  JceDialogPathCallback cb,
                                  void *user);
@@ -64,14 +64,14 @@ void jce_host_dialog_pick_folder(const char *title,
    - filters: optional Qt-style filter string e.g.
        "Scenes (*.scn);;All Files (*.*)"
        Pass NULL for no filtering.  Parsed into SDL_DialogFileFilter[]. */
-void jce_host_dialog_pick_file(const char *title,
+JCE_API void jce_host_dialog_pick_file(const char *title,
                                const char *default_path,
                                const char *filters,
                                JceDialogPathCallback cb,
                                void *user);
 
 /* Show a save-file dialog.  Same filter syntax as pick_file. */
-void jce_host_dialog_save_file(const char *title,
+JCE_API void jce_host_dialog_save_file(const char *title,
                                const char *default_path,
                                const char *filters,
                                JceDialogPathCallback cb,

@@ -15,6 +15,7 @@
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 
 #include "jce_app_path.h"
 
@@ -24,16 +25,6 @@
 #define COOK_TAG "cook"
 
 /* ── tiny helpers ───────────────────────────────────────────────────── */
-
-static char *xstrdup(const char *s)
-{
-	if (!s) return NULL;
-	size_t n = strlen(s) + 1;
-	char  *p = (char *)jce_malloc(n);
-	if (!p) return NULL;
-	memcpy(p, s, n);
-	return p;
-}
 
 static void xfree(void *p) { if (p) jce_free(p); }
 
@@ -45,7 +36,7 @@ static char *abs_under(const char *project_root, const char *rel)
 	bool is_abs = (rel[0] == '/' || rel[0] == '\\' ||
 	               (rel[0] && rel[1] == ':'));
 	if (is_abs) {
-		char *p = xstrdup(rel);
+		char *p = jce_strdup(rel);
 		if (p) { jce_app_normalise_slashes(p); jce_app_strip_trailing_slash(p); }
 		return p;
 	}
@@ -58,7 +49,7 @@ static char *abs_under(const char *project_root, const char *rel)
 static bool ensure_parents(const char *file_path)
 {
 	if (!file_path) return false;
-	char *tmp = xstrdup(file_path);
+	char *tmp = jce_strdup(file_path);
 	if (!tmp) return false;
 	char *slash = strrchr(tmp, '/');
 	if (!slash || slash == tmp) { xfree(tmp); return true; }

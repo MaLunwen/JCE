@@ -14,9 +14,9 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_decals.h>
-#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -52,61 +52,13 @@ struct JceDecalPool {
     bgfx_uniform_handle_t       s_decal;
 };
 
-/* ---- shader loading (mirrors jce_gpu_particles.c) -------------------- */
-
-static const char *decal_backend_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
-
-static bgfx_shader_handle_t decal_load_shader(const JcePakArchive *pak,
-                                                const char *name,
-                                                const char *sfx)
-{
-    bgfx_shader_handle_t invalid = { UINT16_MAX };
-    char path[256];
-    snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-
-    /* The scene/editor PAK rarely carries engine shaders (the editor ships
-     * editor_assets.pak with zero shaders; engine shaders are baked into
-     * jce_renderer).  Mirror load_single(): try the caller pak, then fall
-     * back to the embedded engine-shader pak. */
-    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
-    if (!asset) {
-        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
-        if (fb && fb != pak) {
-            asset = jce_pak_find(fb, path);
-            if (asset) pak = fb;
-        }
-    }
-    if (!asset) {
-        LOG_ERROR(LOG_TAG, "shader not found in pak: %s", path);
-        return invalid;
-    }
-    void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return invalid;
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) { JCE_FREE(buf); return invalid; }
-    const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)asset->original_size);
-    JCE_FREE(buf);
-    return bgfx_create_shader(mem);
-}
-
 /* ---- pool create/destroy --------------------------------------------- */
 
 JceDecalPool *jce_decals_create(const JceDecalPoolDesc *desc)
 {
     if (!desc || !desc->pak || desc->max_decals == 0) return NULL;
 
-    const char *sfx = decal_backend_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) {
         LOG_ERROR(LOG_TAG, "unsupported renderer backend");
         return NULL;
@@ -126,8 +78,8 @@ JceDecalPool *jce_decals_create(const JceDecalPoolDesc *desc)
     bgfx_vertex_layout_add(&pool->layout, BGFX_ATTRIB_COLOR0,    4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&pool->layout);
 
-    bgfx_shader_handle_t vsh = decal_load_shader(desc->pak, "vs_decal", sfx);
-    bgfx_shader_handle_t fsh = decal_load_shader(desc->pak, "fs_decal", sfx);
+    bgfx_shader_handle_t vsh = jce_shader_load_from_pak(desc->pak, "vs_decal", sfx, LOG_TAG);
+    bgfx_shader_handle_t fsh = jce_shader_load_from_pak(desc->pak, "fs_decal", sfx, LOG_TAG);
     if (vsh.idx == UINT16_MAX || fsh.idx == UINT16_MAX) {
         if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
         if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);

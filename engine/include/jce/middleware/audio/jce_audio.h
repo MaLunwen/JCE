@@ -28,6 +28,20 @@ typedef struct JceAudio JceAudio;
 JCE_API JceAudio *jce_audio_create(void);
 JCE_API void      jce_audio_destroy(JceAudio *audio);
 
+/* -- Master mix tap -------------------------------------------------- */
+
+/* All JceAudio engines in the process are summed by ONE shared output device
+ * (the master bus — see .docs/AUDIO_MASTER_MIX_DESIGN.md).  The tap observes
+ * that final mix: interleaved f32, 48000 Hz, 2 channels, called from the
+ * audio device thread at a constant cadence (silence when engines are idle,
+ * so the stream is gapless — recording-encoder friendly).  Keep the callback
+ * cheap (copy to a queue).  One consumer at a time; fn=NULL clears the tap
+ * and returns only after the callback can no longer fire into the old fn. */
+typedef void (*JceAudioMasterTapFn)(void *ud, const float *pcm,
+                                    uint32_t frames, uint32_t sample_rate,
+                                    uint32_t channels);
+JCE_API bool jce_audio_master_tap_set(JceAudioMasterTapFn fn, void *ud);
+
 /* -- Sound loading (from PAK) --------------------------------------- */
 
 /* Load a sound from the PAK archive.  Supports .wav files.
@@ -37,7 +51,7 @@ JCE_API JceSound  jce_audio_load(JceAudio *audio, const JcePakArchive *pak, cons
 /* Upload pre-decoded PCM data as a sound.
    channels: 1 or 2, bits: 8 or 16.
    Caller retains ownership of pcm_data. */
-JceSound  jce_audio_load_pcm(JceAudio *audio,
+JCE_API JceSound  jce_audio_load_pcm(JceAudio *audio,
                                const void *pcm_data, uint32_t pcm_size,
                                uint16_t channels, uint32_t sample_rate,
                                uint16_t bits_per_sample);
@@ -70,6 +84,24 @@ JCE_API JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
 JCE_API JceSound     jce_audio_upload_cpu(JceAudio *audio, JceAudioCpu *cpu);
 JCE_API void         jce_audio_cpu_free(JceAudioCpu *cpu);
 
+/* Read back a decoded CPU sound without registering it in an audio device.
+ * This is what makes jce_audio_decode_cpu_memory() the ONE decoder for the
+ * whole engine: callers that only want PCM bytes (offline asset cooking, the
+ * async loader's worker thread) go through it instead of driving a private
+ * ma_decoder, which would silently miss the Opus custom backend and the
+ * M4A/AAC path this module registers (audit A2-AUDIO-DECODE-DRIFT).
+ *
+ * The PCM stays owned by `cpu` — it dies with jce_audio_cpu_free() and is
+ * consumed by jce_audio_upload_cpu(), so a caller that needs to outlive `cpu`
+ * must copy.  Any out-param may be NULL.  Returns false when `cpu` is NULL or
+ * carries no samples. */
+JCE_API bool jce_audio_cpu_get_pcm(const JceAudioCpu *cpu,
+                                   const void **out_pcm,
+                                   uint32_t *out_pcm_bytes,
+                                   uint16_t *out_channels,
+                                   uint32_t *out_sample_rate,
+                                   uint16_t *out_bits_per_sample);
+
 /* Load encoded audio or a cooked JCEA sound from memory. `hint_path` is used
  * only for diagnostics and encoded-format hints; payload representation wins. */
 JCE_API JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
@@ -88,7 +120,7 @@ JCE_API void      jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec
 
 /* Access decoded PCM data of a loaded sound (16-bit signed).
    Returns NULL on error.  Caller must NOT free the returned pointer. */
-const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
+JCE_API const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
                                        uint32_t *out_frame_count,
                                        uint32_t *out_channels);
 
@@ -96,7 +128,7 @@ const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
 
 /* Play a sound.  Returns a voice handle for further control.
    volume: 0.01.0,  pitch: 1.0 = normal. */
-JceVoice  jce_audio_play(JceAudio *audio, JceSound snd,
+JCE_API JceVoice  jce_audio_play(JceAudio *audio, JceSound snd,
                           bool loop, float volume, float pitch);
 
 JCE_API void      jce_audio_stop(JceAudio *audio, JceVoice voice);
@@ -123,7 +155,7 @@ typedef uint32_t (*JceAudioStreamPullFn)(void *ud,
 /* Begin streaming playback driven by a pull callback. Returns a voice
  * handle. The caller retains ownership of `ud` and is responsible for
  * keeping it valid until the voice is stopped (jce_audio_stop). */
-JceVoice  jce_audio_play_stream(JceAudio *audio,
+JCE_API JceVoice  jce_audio_play_stream(JceAudio *audio,
                                  JceAudioStreamPullFn on_read, void *ud,
                                  uint16_t channels, uint32_t sample_rate,
                                  float volume, float pitch);

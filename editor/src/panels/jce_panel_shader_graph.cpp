@@ -6,6 +6,7 @@
  * documents the relationship and offers a one-click jump.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 
@@ -34,16 +35,9 @@ extern "C" void jce_editor_panel_shader_graph_content(void)
  * keep working. */
 extern "C" void jce_editor_panel_shader_graph(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
-    if (mg_vis) *mg_vis = true;
-
-    char title[96];
-    snprintf(title, sizeof(title), "%s###jce_material_graph",
-             jce_editor_i18n("materialGraph.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_material_graph_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_SHADER_GRAPH,
+                                        JCE_PANEL_MATERIAL_GRAPH,
+                                        "materialGraph.title",
+                                        "jce_material_graph"))
+        jce_panel_material_graph_request_tab(1);
 }

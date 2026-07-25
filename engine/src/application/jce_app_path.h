@@ -13,6 +13,7 @@
 #define JCE_APP_PATH_H
 
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_path.h>
 
 #include <string.h>
 
@@ -20,9 +21,10 @@
  * and a single canonical separator keeps string compares meaningful. */
 static void jce_app_normalise_slashes(char *s)
 {
-	if (!s) return;
-	for (char *c = s; *c; ++c)
-		if (*c == '\\') *c = '/';
+	/* Delegates to the os/core authority (audit DUP-044).  Kept as a named
+	 * wrapper rather than rewriting the 10 call sites, so this header still
+	 * reads as one self-contained path toolkit. */
+	jce_path_canonicalise_inplace(s);
 }
 
 static void jce_app_strip_trailing_slash(char *s)

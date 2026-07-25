@@ -25,6 +25,7 @@
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>
+#include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_asset_format.h>
 
 #include "jce_asset_loaders.h"
@@ -46,11 +47,6 @@ static void fire_asset_error(JceAssetManager *mgr,
 /* ================================================================== */
 /* Helpers                                                             */
 /* ================================================================== */
-
-static uint64_t hash_path(const char *path)
-{
-    return XXH3_64bits(path, strlen(path));
-}
 
 static JceAssetLoadParams sanitize_load_params(const JceAssetLoadParams *params)
 {
@@ -79,12 +75,19 @@ static char *dup_asset_path(const char *path)
 }
 
 /* Hash that incorporates both path and load params (e.g. sampler mode)
-   so the same file with different parameters occupies different slots. */
+   so the same file with different parameters occupies different slots.
+
+   The path component uses jce_archive_hash_path() — the engine's single
+   source of truth for resource identity (it canonicalises separators and
+   case before hashing).  Hashing the raw string here instead would give the
+   registry a DIFFERENT identity than the archive layer that actually fetches
+   the bytes, so two spellings of one asset ("Textures/Wall.PNG" vs
+   "textures/wall.png", "a//b.png", "./a/b.png") would occupy two slots, be
+   decoded and GPU-uploaded twice, and defeat the "already loaded -> bump
+   refcount" guarantee. */
 static uint64_t hash_asset_key(const char *path, JceAssetType type,
                                const JceAssetLoadParams *params)
 {
-    /* Build a combined buffer: path + type + relevant params. */
-    size_t path_len = strlen(path);
     struct {
         uint32_t type;
         int      sampler;
@@ -94,8 +97,8 @@ static uint64_t hash_asset_key(const char *path, JceAssetType type,
     suffix.sampler = (params) ? params->texture_sampler_mode : 0;
     suffix.font_size = (params) ? params->font_size : 0.0f;
 
-    /* Two-step: hash path then mix with suffix. */
-    uint64_t h1 = XXH3_64bits(path, path_len);
+    /* Two-step: canonical path identity, then mix with suffix. */
+    uint64_t h1 = jce_archive_hash_path(path);
     uint64_t h2 = XXH3_64bits(&suffix, sizeof(suffix));
     /* Combine using a simple mix. */
     return h1 ^ (h2 * 0x9E3779B97F4A7C15ULL);
@@ -397,24 +400,27 @@ void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle)
     free_slot(mgr, handle.index);
 }
 
-void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
+JceAssetState jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
 {
     if (!mgr || !validate_handle(mgr, handle)) {
         LOG_WARN(LOG_TAG, "reload ignored: invalid handle");
-        return;
+        return JCE_ASSET_STATE_UNLOADED;
     }
 
     JceAssetSlot *slot = &mgr->slots[handle.index];
     if (!slot->path || slot->path[0] == '\0') {
         LOG_WARN(LOG_TAG, "reload ignored: slot %u has no source path",
                  (unsigned)handle.index);
-        return;
+        return JCE_ASSET_STATE_UNLOADED;
     }
 
     if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_QUEUED ||
         JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_LOADING) {
         LOG_WARN(LOG_TAG, "reload deferred: asset still loading (%s)", slot->path);
-        return;
+        /* DEFERRED, not failed: the caller should retry once the in-flight
+         * load settles.  Reporting failure here would make a watcher give
+         * up on an asset that was only busy. */
+        return JCE_ASSET_STATE_LOADING;
     }
 
     JceAssetLoadParams params = slot->load_params;
@@ -434,7 +440,9 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
                          JCE_ASSET_ERR_INTERNAL, "reload failed");
         LOG_WARN(LOG_TAG, "reload failed, keeping previous asset data: %s",
                  slot->path);
-        return;
+        /* The previous payload is untouched and still usable — this is a
+         * failed ATTEMPT, not a lost asset. */
+        return JCE_ASSET_STATE_FAILED;
     }
 
     JceAssetSlot old_payload;
@@ -462,6 +470,7 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
 
     LOG_INFO(LOG_TAG, "asset reloaded: %s (slot=%u)",
              slot->path, (unsigned)handle.index);
+    return JCE_ASSET_STATE_READY;
 }
 
 /* ================================================================== */

@@ -73,6 +73,13 @@ bool jce_path_to_canonical(char *out, size_t out_size, const char *path)
     return true;
 }
 
+void jce_path_canonicalise_inplace(char *s)
+{
+    if (!s) return;
+    for (char *c = s; *c; ++c)
+        if (*c == '\\') *c = '/';
+}
+
 bool jce_path_is_canonical(const char *path)
 {
     if (!path) return true;
@@ -92,6 +99,52 @@ bool jce_path_is_absolute(const char *path)
         path[1] == ':')
         return true;
     return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Asset keys                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Layout markers, in priority order.  Anything after one of these is
+ * already the PAK key. */
+static const char *const s_asset_markers[] = {
+    "resources/assets/", "resources/_cooked/", NULL
+};
+
+/* Fallback: a path that does not carry a marker but does pass through a
+ * known top-level asset folder.  The key starts AT the folder name, so the
+ * leading '/' is skipped (see the `p + 1` below). */
+static const char *const s_asset_tops[] = {
+    "/models/", "/scenes/", "/shaders/", "/fonts/",
+    "/i18n/", "/audio/", "/prefabs/", "/anim/",
+    "/textures/", NULL
+};
+
+const char *jce_path_asset_key(const char *path, char *buf, size_t buf_size)
+{
+    if (!path || !buf || buf_size == 0) return NULL;
+
+    /* Canonicalise into the caller's buffer.  Using the shared converter
+     * rather than an open-coded '\\'->'/' loop is the point of this helper:
+     * it also does the overflow check, which the hand-rolled copies in the
+     * glTF loader and the scene deserialiser each had to repeat. */
+    if (!jce_path_to_canonical(buf, buf_size, path)) return NULL;
+
+    for (int mi = 0; s_asset_markers[mi]; mi++) {
+        const char *p = strstr(buf, s_asset_markers[mi]);
+        if (p) {
+            const char *rel = p + strlen(s_asset_markers[mi]);
+            return rel[0] ? rel : NULL;
+        }
+    }
+    for (int ti = 0; s_asset_tops[ti]; ti++) {
+        const char *p = strstr(buf, s_asset_tops[ti]);
+        if (p) {
+            const char *rel = p + 1;   /* skip the leading '/' */
+            return rel[0] ? rel : NULL;
+        }
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,6 +350,34 @@ bool jce_path_normalize(char *out, size_t out_size, const char *path)
     return true;
 }
 
+/* Compare two path characters for prefix matching.
+ *
+ * Case matters on Linux and macOS-with-a-case-sensitive-volume, and does
+ * NOT matter on Windows.  A byte-exact comparison there is not merely
+ * pedantic — it produces WRONG OUTPUT: Windows APIs disagree about the case
+ * of the same path (drive letters especially, and a file dialog returns what
+ * the user typed while GetCurrentDirectory returns what the shell recorded),
+ * so "D:/Proj/Game" and "d:/proj/game" name one directory and compared byte
+ * for byte share no prefix at all.
+ *
+ * jce_path_relative then finds no common root and fails, and its callers
+ * fall back to storing the ABSOLUTE path — which is how a machine-specific
+ * path ends up inside a scene file that is supposed to be portable
+ * (audit C2-SCENE-ABS-PATH).
+ *
+ * Case folding is ASCII-only on purpose: path components here are already
+ * canonicalised UTF-8, and locale-dependent folding would make the result
+ * depend on the process locale, which is worse than under-folding a
+ * non-ASCII name that Windows would have matched. */
+static bool s_path_char_eq(char a, char b)
+{
+#if JCE_PLATFORM_WINDOWS
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+#endif
+    return a == b;
+}
+
 bool jce_path_relative(char *out, size_t out_size,
                        const char *path, const char *base)
 {
@@ -312,7 +393,7 @@ bool jce_path_relative(char *out, size_t out_size,
     /* Find the longest matching directory prefix. */
     size_t common = 0;
     size_t i = 0;
-    while (np[i] && nb[i] && np[i] == nb[i]) {
+    while (np[i] && nb[i] && s_path_char_eq(np[i], nb[i])) {
         if (np[i] == '/') common = i + 1;
         ++i;
     }

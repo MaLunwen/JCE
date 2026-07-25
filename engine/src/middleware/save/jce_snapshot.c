@@ -2,6 +2,7 @@
  * jce_snapshot.c — Generic versioned save/load implementation.
  */
 #include <jce/middleware/save/jce_snapshot.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -255,10 +256,18 @@ bool jce_snapshot_save_to_file(JceSnapshotRegistry *r, const char *path)
 {
     void *buf = NULL; size_t sz = 0;
     if (!jce_snapshot_save_to_buffer(r, &buf, &sz)) return false;
-    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
-    if (!io) { JCE_FREE(buf); LOG_ERROR("snapshot", " open '%s' failed", path); return false; }
-    bool ok = SDL_WriteIO(io, buf, sz) == sz;
-    SDL_CloseIO(io);
+
+    /* Atomic (temp file + rename) rather than a plain write: a save file is
+     * the least regenerable data the engine owns, and a crash or power loss
+     * partway through a direct write leaves a truncated .jsnp that fails its
+     * header check on load — i.e. the player's progress is gone, and the
+     * previous good save has already been overwritten.  Routing through the
+     * OS adapter also creates the parent directory, which the raw SDL path
+     * did not (a SavePoint firing before the saves dir existed silently
+     * failed to open). */
+    const bool ok = jce_fs_host_write_all_atomic(path, buf, (uint64_t)sz);
+    if (!ok)
+        LOG_ERROR("snapshot", " write '%s' failed", path);
     JCE_FREE(buf);
     return ok;
 }

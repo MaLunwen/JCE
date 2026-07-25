@@ -9,6 +9,7 @@
  * Memory grows monotonically per context as larger graphs are searched.
  */
 #include <jce/middleware/ai/jce_graph_astar.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_profiler.h>
 #include "os/core/jce_memory.h"
 #include <string.h>
@@ -73,13 +74,6 @@ static uint32_t next_pow2(uint32_t v)
     return p;
 }
 
-static uint32_t hash_u32(uint32_t x)
-{
-    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15;
-    x *= 0x846ca68bu; x ^= x >> 16;
-    return x;
-}
-
 static void map_grow(JceGraphAstar *a, uint32_t need)
 {
     uint32_t target = next_pow2((need * HASH_LOAD_DEN) / HASH_LOAD_NUM + 1);
@@ -103,7 +97,7 @@ static void map_grow(JceGraphAstar *a, uint32_t need)
             uint32_t k = old_keys[i];
             uint32_t v = old_vals[i];
             uint32_t mask = a->map_cap - 1;
-            uint32_t h = hash_u32(k) & mask;
+            uint32_t h = jce_hash_mix32(k) & mask;
             while (a->map_keys[h] != EMPTY_SLOT) h = (h + 1) & mask;
             a->map_keys[h] = k;
             a->map_vals[h] = v;
@@ -120,7 +114,7 @@ static uint32_t slot_for(JceGraphAstar *a, uint32_t id)
     if ((a->map_count + 1) * HASH_LOAD_DEN >= a->map_cap * HASH_LOAD_NUM)
         map_grow(a, a->map_count + 1);
     uint32_t mask = a->map_cap - 1;
-    uint32_t h = hash_u32(id) & mask;
+    uint32_t h = jce_hash_mix32(id) & mask;
     while (a->map_keys[h] != EMPTY_SLOT) {
         if (a->map_keys[h] == id) return a->map_vals[h];
         h = (h + 1) & mask;

@@ -111,7 +111,7 @@ static ecs_entity_t gas_repl_make_component(ecs_world_t *world)
     return ecs_component_init(world, &cdesc);
 }
 
-void jce_gas_replication_register(void *ecs_world)
+bool jce_gas_replication_register(void *ecs_world)
 {
     ecs_world_t *world = (ecs_world_t *)ecs_world;
     JceNetCompDesc cd;
@@ -119,14 +119,14 @@ void jce_gas_replication_register(void *ecs_world)
     if (!world) {
         LOG_WARN(LOG_TAG,
                  "register: no world — call after set_world()");
-        return;
+        return false;
     }
 
     g_gr_world = world;
     g_gr_comp  = gas_repl_make_component(world);
     if (!g_gr_comp) {
         LOG_WARN(LOG_TAG, "register: failed to create flecs component");
-        return;
+        return false;
     }
 
     memset(&cd, 0, sizeof(cd));
@@ -139,6 +139,7 @@ void jce_gas_replication_register(void *ecs_world)
     jce_net_replication_register_component(&cd);
 
     LOG_INFO(LOG_TAG, "registered GAS attribute replica component");
+    return true;
 }
 
 /* Resolve the component id against the (possibly re-bound) world. */

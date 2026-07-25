@@ -30,7 +30,7 @@ typedef struct {
 
 /* Create a mesh from raw vertex/index data.
    Copies the data  caller retains ownership of arrays. */
-JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
+JCE_API JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
                           const uint32_t *indices, uint32_t num_indices);
 
 /* Load a mesh from a model file in PAK (e.g. "models/chalet.obj").
@@ -47,7 +47,7 @@ JCE_API void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t
 /* Submit mesh as wireframe overlay with LEQUAL depth test.
    Used for selection outlines that render on top of solid geometry.
    Caller must set transforms, uniforms, and textures before calling. */
-void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
+JCE_API void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
                                        uint16_t view_id);
 
 /* Get vertex/index counts. */
@@ -67,7 +67,7 @@ JCE_API void jce_mesh_get_aabb(const JceMesh *mesh,
 /* Built-in procedural meshes. */
 JCE_API JceMesh *jce_mesh_create_cube(float size);
 JCE_API JceMesh *jce_mesh_create_plane(float width, float depth, uint32_t subdivs);
-JceMesh *jce_mesh_create_plane_ex(float width, float depth,
+JCE_API JceMesh *jce_mesh_create_plane_ex(float width, float depth,
                                    uint32_t subdivs, float uv_scale);
 JCE_API JceMesh *jce_mesh_create_sphere(float radius);
 JCE_API JceMesh *jce_mesh_create_capsule(float radius, float height);

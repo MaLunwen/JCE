@@ -397,6 +397,11 @@ void *jce_fs_host_read_all(const char *path, uint64_t *out_size)
     {
         JceFileSystem *afs = jce_fs_get_active();
         JceFsReadFn    fn  = jce__fs_active_reader();
+        /* Open-coded rather than calling jce_path_is_absolute (audit DUP-044):
+         * this TU is compiled into the standalone jce_cook host tool, whose
+         * explicit source list in the root CMakeLists.txt does NOT include
+         * os/core/jce_path.c, so delegating here would be an unresolved
+         * external there.  Keep in step with jce_path_is_absolute. */
         bool absolute = path[0] == '/' || path[0] == '\\' ||
             (((path[0] >= 'A' && path[0] <= 'Z') ||
               (path[0] >= 'a' && path[0] <= 'z')) &&

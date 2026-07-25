@@ -1,8 +1,12 @@
 /*
  * jce_image_decode.h  Decode common image formats (PNG/JPG/BMP/TGA/HDR).
  *
- * Returns RGBA8 pixel buffers with no dependency on SDL_image or any
- * other vendor library on the client side.  Internally backed by stb_image.
+ * Returns RGBA8 pixel buffers with no dependency on SDL_image, stb_image or
+ * any other vendor library on the client side.  This is a JceImage-shaped
+ * adapter over the one image service (jce_image); the SERVICE decides which
+ * codec runs, never this header's callers and never this header.  Use it when
+ * you want the {pixels,w,h} struct plus the file/PAK conveniences below;
+ * <jce/renderer/jce_image.h> is the same decode with a raw-buffer signature.
  *
  * Layer: OS / Resource (Layer 2).
  */

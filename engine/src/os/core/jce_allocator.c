@@ -3,80 +3,23 @@
  *
  * Default allocator delegates to mi_malloc / mi_realloc / mi_free.
  * Arena is a simple linear bump allocator with 16-byte alignment.
+ *
+ * Allocation accounting is NOT kept here: this file and jce_memory.c are
+ * two front-ends over one mimalloc heap, so both report through the
+ * shared jce__alloc_account_* hooks (owned by jce_memory.c, which the
+ * host tools link without this SDL-dependent TU). One set of counters
+ * therefore covers the whole engine heap instead of one front-end each.
  */
 
 #include <jce/os/core/jce_allocator.h>
+
+#include "jce_memory.h"        /* jce__alloc_account_*, JCE_ALLOC_TRACKING */
 
 #include <mimalloc.h>
 #include <SDL3/SDL_stdinc.h>   /* SDL_SetMemoryFunctions (allocator bridge) */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-/* ================================================================== */
-/* Debug allocation tracking (engine-side leak hunting)                */
-/* ================================================================== */
-
-#ifndef NDEBUG
-#  define JCE_ALLOC_TRACKING 1
-#else
-#  define JCE_ALLOC_TRACKING 0
-#endif
-
-#if JCE_ALLOC_TRACKING
-/* Native-word counters (no tearing on aligned access; no locks ⇒ APPROXIMATE
- * under concurrent allocation, which is fine for a leak trend). */
-static size_t s_live_bytes, s_live_count, s_peak_bytes;
-static size_t s_total_allocs, s_total_frees;
-static size_t s_bkt_bytes[JCE_ALLOC_TRACK_BUCKETS];
-static size_t s_bkt_count[JCE_ALLOC_TRACK_BUCKETS];
-
-static int track_bucket(size_t sz)
-{
-    int b = 0;
-    size_t lim = 16;
-    while (sz >= lim && b < JCE_ALLOC_TRACK_BUCKETS - 1) { lim <<= 1; ++b; }
-    return b;
-}
-static void track_on_alloc(void *p)
-{
-    if (!p) return;
-    size_t sz = mi_usable_size(p);
-    int b = track_bucket(sz);
-    s_live_bytes += sz; s_live_count += 1; s_total_allocs += 1;
-    s_bkt_bytes[b] += sz; s_bkt_count[b] += 1;
-    if (s_live_bytes > s_peak_bytes) s_peak_bytes = s_live_bytes;
-}
-static void track_on_free(void *p)   /* call BEFORE mi_free, while p is valid */
-{
-    if (!p) return;
-    size_t sz = mi_usable_size(p);
-    int b = track_bucket(sz);
-    s_live_bytes -= sz; s_live_count -= 1; s_total_frees += 1;
-    s_bkt_bytes[b] -= sz; s_bkt_count[b] -= 1;
-}
-#else
-#  define track_on_alloc(p) ((void)(p))
-#  define track_on_free(p)  ((void)(p))
-#endif
-
-/* Always-on per-frame allocation counters (rank-9): two native-word increments
- * per allocation, compiled into RELEASE too (unlike the NDEBUG-only tracker
- * above), so JCE_PERF_LOG can surface allocs/frame + KB/frame in a profiling
- * build — making per-frame heap churn measurable (verify-before-fix) instead of
- * reasoned-from-code.  Unlocked ⇒ approximate under concurrent allocation, which
- * is all a per-frame trend needs. */
-static size_t s_pf_allocs, s_pf_alloc_bytes;        /* monotonic since start */
-static size_t s_pf_last_allocs, s_pf_last_bytes;    /* sampled by frame_delta */
-
-void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes)
-{
-    size_t a = s_pf_allocs, b = s_pf_alloc_bytes;
-    if (out_allocs) *out_allocs = (uint64_t)(a - s_pf_last_allocs);
-    if (out_bytes)  *out_bytes  = (uint64_t)(b - s_pf_last_bytes);
-    s_pf_last_allocs = a;
-    s_pf_last_bytes  = b;
-}
 
 /* ================================================================== */
 /* Default allocator (mimalloc)                                        */
@@ -86,25 +29,23 @@ static void *default_alloc(size_t size, void *ctx)
 {
     (void)ctx;
     void *p = mi_malloc(size);
-    track_on_alloc(p);
-    if (p) { s_pf_allocs++; s_pf_alloc_bytes += size; }   /* rank-9 always-on */
+    jce__alloc_account_alloc(p, size);
     return p;
 }
 
 static void *default_realloc(void *ptr, size_t new_size, void *ctx)
 {
     (void)ctx;
-    track_on_free(ptr);                 /* drop old accounting (NULL ⇒ no-op) */
+    jce__alloc_account_free(ptr);            /* drop old accounting (NULL ⇒ no-op) */
     void *p = mi_realloc(ptr, new_size);
-    track_on_alloc(p);                  /* add new accounting (NULL ⇒ no-op)  */
-    if (p) { s_pf_allocs++; s_pf_alloc_bytes += new_size; }   /* rank-9 */
+    jce__alloc_account_alloc(p, new_size);   /* add new accounting (NULL ⇒ no-op)  */
     return p;
 }
 
 static void default_free(void *ptr, void *ctx)
 {
     (void)ctx;
-    track_on_free(ptr);                 /* account before the block is freed  */
+    jce__alloc_account_free(ptr);       /* account before the block is freed  */
     mi_free(ptr);
 }
 
@@ -201,13 +142,13 @@ void jce_arena_destroy(jce_arena_t *a)
 void *jce_aligned_alloc(size_t size, size_t alignment)
 {
     void *p = mi_malloc_aligned(size, alignment);
-    track_on_alloc(p);
+    jce__alloc_account_alloc(p, size);
     return p;
 }
 
 void jce_aligned_free(void *ptr)
 {
-    track_on_free(ptr);
+    jce__alloc_account_free(ptr);
     mi_free(ptr);
 }
 
@@ -259,6 +200,12 @@ void jce_alloc_trim(bool aggressive)
 /* Third-party allocator bridge                                        */
 /* ================================================================== */
 
+/* Deliberately NOT routed through jce__alloc_account_*: these serve foreign
+ * heaps (bgfx, SDL) whose churn would drown the engine-side leak trend the
+ * counters exist to expose.  Alloc and free are both unaccounted, so the
+ * bridge is self-consistent — it neither inflates nor unbalances the totals.
+ * Foreign memory is still visible through jce_mem_stats (process-level). */
+
 void *jce_realloc_aligned(void *ptr, size_t size, size_t align)
 {
     if (size == 0) {           /* full malloc contract: size 0 == free */
@@ -303,26 +250,6 @@ size_t jce_alloc_track_bucket_hi(int bucket)
     if (bucket < 0) bucket = 0;
     if (bucket >= JCE_ALLOC_TRACK_BUCKETS - 1) return (size_t)-1; /* open-ended */
     return (size_t)16 << bucket;
-}
-
-bool jce_alloc_track_snapshot(JceAllocTrack *out)
-{
-    if (!out) return false;
-#if JCE_ALLOC_TRACKING
-    out->live_bytes   = (uint64_t)s_live_bytes;
-    out->live_count   = (uint64_t)s_live_count;
-    out->peak_bytes   = (uint64_t)s_peak_bytes;
-    out->total_allocs = (uint64_t)s_total_allocs;
-    out->total_frees  = (uint64_t)s_total_frees;
-    for (int i = 0; i < JCE_ALLOC_TRACK_BUCKETS; ++i) {
-        out->bucket_bytes[i] = (uint64_t)s_bkt_bytes[i];
-        out->bucket_count[i] = (uint64_t)s_bkt_count[i];
-    }
-    return true;
-#else
-    memset(out, 0, sizeof(*out));
-    return false;
-#endif
 }
 
 void jce_alloc_track_dump(void)

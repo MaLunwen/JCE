@@ -25,6 +25,7 @@
 #include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/ui/jce_localization.h>
+#include <jce/os/core/jce_filesystem.h>   /* active-VFS font fallback (bundle Play) */
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
@@ -185,6 +186,26 @@ static JceFont *uc_get_font(JceUICanvas *uc, const char *path, int px)
             char full[768];
             snprintf(full, sizeof full, "%s/%s", s_uc_asset_root, p);
             f = jce_font_open_file_ex(full, (float)px, cps, n);
+        }
+        /* Active-VFS fallback: in bundle Play (isolated preview) and shipped
+         * bundle boots the font lives ONLY in the mounted bundle — not on the
+         * host FS (s_uc_asset_root unset) nor in the embedded pak (uc->pak).
+         * Read it from the active VFS the way meshes/textures load, then open
+         * from memory.  (The bundle stores keys case-folded; the VFS normalises
+         * the query, so a mixed-case path like fonts/LXGWWenKai-Regular.ttf
+         * still resolves.) */
+        if (!f) {
+            JceFileSystem *afs = jce_fs_get_active();
+            if (afs) {
+                uint64_t vsz = 0;
+                void *vbuf = jce_fs_read_all(afs, p, &vsz);
+                if (vbuf) {
+                    if (vsz > 0)
+                        f = jce_font_open_mem_ex(vbuf, (size_t)vsz, p,
+                                                 (float)px, cps, n);
+                    jce_fs_buffer_free(vbuf);
+                }
+            }
         }
         if (!f && uc->pak)
             f = jce_font_open_ex(uc->pak, p, (float)px, cps, n);

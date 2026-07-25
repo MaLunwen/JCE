@@ -230,7 +230,7 @@ typedef struct {
     JceBodyHandle body;
 } JceRaycastResult;
 
-JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
+JCE_API JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
                                      jce_vec3 origin, jce_vec3 direction,
                                      float max_distance);
 
@@ -396,7 +396,7 @@ typedef struct {
     bool              disable_collision; /* disable collision between A and B */
 } JceConstraintDesc;
 
-JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
+JCE_API JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
                                                    const JceConstraintDesc *desc);
 JCE_API void JCE_CALL jce_physics_constraint_destroy(JcePhysicsWorld *world,
                                                      JceConstraintHandle con);
@@ -456,32 +456,32 @@ typedef struct {
     float    air_control;
 } JceCharacterDesc;
 
-JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
+JCE_API JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
                                                  const JceCharacterDesc *desc);
 JCE_API void JCE_CALL jce_physics_character_destroy(JcePhysicsWorld *world,
                                                     JceCharacterHandle ch);
-void jce_physics_character_move(JcePhysicsWorld *world,
+JCE_API void jce_physics_character_move(JcePhysicsWorld *world,
                                  JceCharacterHandle ch,
                                  jce_vec3 walk_dir, float dt);
 /* Returns true when the jump fired (false while already mid-jump). */
-bool jce_physics_character_jump(JcePhysicsWorld *world,
+JCE_API bool jce_physics_character_jump(JcePhysicsWorld *world,
                                  JceCharacterHandle ch);
-void jce_physics_character_get_position(const JcePhysicsWorld *world,
+JCE_API void jce_physics_character_get_position(const JcePhysicsWorld *world,
                                          JceCharacterHandle ch,
                                          jce_vec3 *out_pos);
 /* Teleport the character to the given capsule-CENTER position. */
-void jce_physics_character_set_position(JcePhysicsWorld *world,
+JCE_API void jce_physics_character_set_position(JcePhysicsWorld *world,
                                          JceCharacterHandle ch,
                                          jce_vec3 pos);
-bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
+JCE_API bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
                                         JceCharacterHandle ch);
 /* Live linear velocity of the capsule body (m/s). */
-void jce_physics_character_get_velocity(const JcePhysicsWorld *world,
+JCE_API void jce_physics_character_get_velocity(const JcePhysicsWorld *world,
                                          JceCharacterHandle ch,
                                          jce_vec3 *out_vel);
 /* Early jump release: scales any remaining upward velocity by `factor`
  * (0..1) so short taps yield short hops.  No-op when not ascending. */
-void jce_physics_character_cut_jump(JcePhysicsWorld *world,
+JCE_API void jce_physics_character_cut_jump(JcePhysicsWorld *world,
                                      JceCharacterHandle ch,
                                      float factor);
 

@@ -323,18 +323,33 @@ bool jce_semaphore_wait_timeout(JceSemaphore *s, uint32_t timeout_ms)
 /* enkiTS task adapter                                                 */
 /* ================================================================== */
 
-/* Bridge between JceTaskFn(void*) and enkiTS range callback. */
+/* Bridge between JceTaskFn(void*) / JceTaskRangeFn(begin,end,void*) and the
+   enkiTS range callback.  Exactly one of fn / range_fn is set. */
 typedef struct TaskAdapter {
-    JceTaskFn fn;
-    void     *arg;
+    JceTaskFn      fn;
+    JceTaskRangeFn range_fn;
+    void          *arg;
+    JceThreadPool *pool;         /* owner, for the running-pool marker below */
 } TaskAdapter;
+
+/* Which pool's task the calling thread is currently executing, or NULL.
+   enkiTS's own thread number lives in ONE process-wide thread_local shared by
+   every scheduler, so it cannot answer "is this thread a worker of THIS pool"
+   once more than one pool exists — a worker of another pool would report a
+   non-zero number here and be mistaken for ours.  SDL_TLSID is designed to be
+   used zero-initialised, so this needs no lazy construction. */
+static SDL_TLSID g_running_pool;
 
 static void task_range_adapter(uint32_t start_, uint32_t end_,
                                uint32_t threadnum_, void *pArgs_)
 {
-    (void)start_; (void)end_; (void)threadnum_;
+    (void)threadnum_;
     TaskAdapter *a = (TaskAdapter *)pArgs_;
-    a->fn(a->arg);
+    void *prev = SDL_GetTLS(&g_running_pool);   /* nested tasks restore it */
+    SDL_SetTLS(&g_running_pool, a->pool, NULL);
+    if (a->range_fn) a->range_fn(start_, end_, a->arg);
+    else             a->fn(a->arg);
+    SDL_SetTLS(&g_running_pool, prev, NULL);
 }
 
 /* ================================================================== */
@@ -344,6 +359,7 @@ static void task_range_adapter(uint32_t start_, uint32_t end_,
 struct JceTask {
     enkiTaskScheduler *scheduler;   /* back-reference for wait/query */
     enkiTaskSet       *task_set;
+    JceThreadPool     *pool;        /* back-reference for the wait check */
     TaskAdapter        adapter;     /* embedded — no separate alloc  */
 };
 
@@ -365,6 +381,8 @@ struct JceThreadPool {
     enkiTaskScheduler *scheduler;
     PendingTask       *pending_head;
     SDL_Mutex         *pending_mutex;
+    int                worker_count;  /* threads enkiTS spawned (excl. creator) */
+    uint64_t           owner_tid;     /* creator = enkiTS thread 0              */
 };
 
 /* Garbage-collect completed fire-and-forget tasks. */
@@ -405,7 +423,17 @@ JceThreadPool *jce_thread_pool_create(int num_threads)
 
     pool->pending_head  = NULL;
     pool->pending_mutex = SDL_CreateMutex();
+    /* enkiGetNumTaskThreads() counts the initialising thread too — it runs
+       tasks while it waits but is not a thread we spawned. */
+    pool->worker_count  = (int)enkiGetNumTaskThreads(pool->scheduler) - 1;
+    if (pool->worker_count < 0) pool->worker_count = 0;
+    pool->owner_tid     = jce_thread_current_id();
     return pool;
+}
+
+int jce_thread_pool_worker_count(const JceThreadPool *pool)
+{
+    return pool ? pool->worker_count : 0;
 }
 
 void jce_thread_pool_destroy(JceThreadPool *pool)
@@ -429,23 +457,24 @@ void jce_thread_pool_destroy(JceThreadPool *pool)
     JCE_FREE(pool);
 }
 
-void jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
+bool jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
 {
-    if (!pool || !fn) return;
+    if (!pool || !fn) return false;
 
     cleanup_pending(pool);
 
     TaskAdapter *adapter = JCE_NEW(TaskAdapter);
-    if (!adapter) return;
-    adapter->fn  = fn;
-    adapter->arg = arg;
+    if (!adapter) return false;
+    adapter->fn   = fn;
+    adapter->arg  = arg;
+    adapter->pool = pool;
 
     /* Pre-allocate tracking node BEFORE submitting so we never lose
        the adapter pointer if the allocation fails. */
     PendingTask *pending = JCE_NEW(PendingTask);
     if (!pending) {
         JCE_FREE(adapter);
-        return;
+        return false;
     }
 
     enkiTaskSet *ts = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
@@ -458,6 +487,7 @@ void jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
     pending->next      = pool->pending_head;
     pool->pending_head = pending;
     SDL_UnlockMutex(pool->pending_mutex);
+    return true;
 }
 
 JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
@@ -469,8 +499,10 @@ JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
     if (!task) return NULL;
 
     task->scheduler    = pool->scheduler;
+    task->pool         = pool;
     task->adapter.fn   = fn;
     task->adapter.arg  = arg;
+    task->adapter.pool = pool;
 
     task->task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
     enkiAddTaskSetArgs(pool->scheduler, task->task_set, &task->adapter, 1);
@@ -478,10 +510,118 @@ JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
     return task;
 }
 
+JceTask *jce_thread_pool_submit_range(JceThreadPool *pool,
+                                      JceTaskRangeFn fn, void *arg,
+                                      uint32_t set_size, uint32_t min_range)
+{
+    if (!pool || !fn || set_size == 0) return NULL;
+    if (min_range == 0) min_range = 1;
+
+    JceTask *task = JCE_NEW(JceTask);
+    if (!task) return NULL;
+
+    task->scheduler        = pool->scheduler;
+    task->pool             = pool;
+    task->adapter.range_fn = fn;
+    task->adapter.arg      = arg;
+    task->adapter.pool     = pool;
+
+    task->task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    enkiAddTaskSetMinRange(pool->scheduler, task->task_set, &task->adapter,
+                           set_size, min_range);
+
+    return task;
+}
+
+/* ── Blocking parallel-for with pinned chunk boundaries ─────────────── */
+
+typedef struct {
+    JceTaskRangeFn fn;
+    void          *arg;
+    uint32_t       count;
+    uint32_t       chunk;
+} ParallelForCtx;
+
+/* The scheduler hands us a run of CHUNK indices, not element indices: keeping
+   the chunk as the unit of work is exactly what pins the element boundaries to
+   multiples of `chunk`, which consumers that key per-chunk state off begin/chunk
+   (render queue, entity-cull hit pass) depend on. */
+static void parallel_for_chunks(uint32_t begin, uint32_t end, void *arg)
+{
+    const ParallelForCtx *c = (const ParallelForCtx *)arg;
+    for (uint32_t i = begin; i < end; ++i) {
+        uint32_t b = i * c->chunk;
+        uint32_t e = b + c->chunk;
+        if (e > c->count) e = c->count;
+        c->fn(b, e, c->arg);
+    }
+}
+
+void jce_thread_pool_parallel_for(JceThreadPool *pool, uint32_t count,
+                                  uint32_t chunk, JceTaskRangeFn fn, void *arg)
+{
+    if (!fn || count == 0) return;
+
+    if (chunk == 0) {
+        const int wc = jce_thread_pool_worker_count(pool);
+        const uint32_t w = wc > 0 ? (uint32_t)wc : 1u;
+        chunk = (count + w - 1u) / w;
+        if (chunk == 0) chunk = 1u;
+    }
+    const uint32_t n_chunks = (count + chunk - 1u) / chunk;
+
+    ParallelForCtx ctx;
+    ctx.fn = fn; ctx.arg = arg; ctx.count = count; ctx.chunk = chunk;
+
+    /* No pool, or a single chunk: nothing to overlap, and the cooperative wait
+       would have run it on this thread anyway. */
+    if (!pool || n_chunks <= 1u) { fn(0u, count, arg); return; }
+
+    /* The handle lives on THIS stack — the wait below is what makes that safe,
+       and it keeps the per-frame consumers free of the malloc/free pair a
+       submit_range + jce_task_free round trip would cost every frame. */
+    JceTask task;
+    task.scheduler        = pool->scheduler;
+    task.pool             = pool;
+    task.adapter.fn       = NULL;
+    task.adapter.range_fn = parallel_for_chunks;
+    task.adapter.arg      = &ctx;
+    task.adapter.pool     = pool;
+
+    task.task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    if (!task.task_set) {           /* OOM: run it here rather than drop it */
+        parallel_for_chunks(0u, n_chunks, &ctx);
+        return;
+    }
+    enkiAddTaskSetMinRange(pool->scheduler, task.task_set, &task.adapter,
+                           n_chunks, 1u);
+    jce_task_wait(&task);
+    enkiDeleteTaskSet(pool->scheduler, task.task_set);
+}
+
+/* True when the caller owns a thread slot in THIS pool's scheduler and may
+   therefore use the work-stealing wait: either one of its workers (marked
+   while it runs one of our tasks) or the thread that initialised it, which
+   enkiTS treats as thread 0.  Any other thread would run tasks under thread
+   0's slot and corrupt that thread's single-producer work queue. */
+static bool ets_wait_safe_here(const JceThreadPool *pool)
+{
+    if (!pool) return false;
+    if (SDL_GetTLS(&g_running_pool) == (const void *)pool) return true;
+    return jce_thread_current_id() == pool->owner_tid;
+}
+
 void jce_task_wait(JceTask *task)
 {
     if (!task) return;
-    enkiWaitForTaskSet(task->scheduler, task->task_set);
+    if (ets_wait_safe_here(task->pool)) {
+        enkiWaitForTaskSet(task->scheduler, task->task_set);
+        return;
+    }
+    /* Foreign thread: poll instead of stealing work.  Only reached by callers
+       that are already I/O paced, so 1 ms granularity is free. */
+    while (!enkiIsTaskSetComplete(task->scheduler, task->task_set))
+        SDL_Delay(1);
 }
 
 bool jce_task_done(const JceTask *task)
@@ -495,4 +635,76 @@ void jce_task_free(JceTask *task)
     if (!task) return;
     enkiDeleteTaskSet(task->scheduler, task->task_set);
     JCE_FREE(task);
+}
+
+/* ================================================================== */
+/* Process-wide shared thread pool                                     */
+/* ================================================================== */
+
+static JceThreadPool *g_shared_pool;
+static int            g_shared_workers = -1;  /* <=0 = apply the auto formula */
+static SDL_AtomicInt  g_shared_lock;          /* zero-init = unlocked        */
+
+/* A spin lock rather than a JceMutex: this guards the *creation* of the one
+   shared pool, so it must work before any engine object exists and cannot
+   itself need lazy construction.  Held only across pool create (never across
+   destroy, which blocks on worker joins). */
+static void shared_lock(void)
+{
+    while (!SDL_CompareAndSwapAtomicInt(&g_shared_lock, 0, 1))
+        SDL_Delay(0);
+}
+
+static void shared_unlock(void)
+{
+    SDL_SetAtomicInt(&g_shared_lock, 0);
+}
+
+void jce_thread_pool_shared_set_workers(int workers)
+{
+    shared_lock();
+    if (!g_shared_pool) g_shared_workers = workers;  /* too late once it exists */
+    shared_unlock();
+}
+
+/* Leave a core for the thread that waits, and cap at 8 — our per-frame loops
+   saturate well under that, and enkiTS's own auto-detect takes every core.
+   SDL-only on purpose: this layer must not reach into jce_config. */
+int jce_thread_pool_default_workers(void)
+{
+    int workers = SDL_GetNumLogicalCPUCores() - 1;
+    if (workers < 1) workers = 1;
+    if (workers > 8) workers = 8;
+    return workers;
+}
+
+JceThreadPool *jce_thread_pool_shared(void)
+{
+    shared_lock();
+    if (!g_shared_pool) {
+        /* A pin from jce_thread_pool_shared_set_workers() (jce.ini
+           [performance] job_workers, pushed by jce_config_publish_perf) wins
+           over the house policy. */
+        int workers = g_shared_workers;
+        if (workers <= 0) workers = jce_thread_pool_default_workers();
+        /* enkiTS counts the initialising thread inside its thread total, so
+           ask for workers+1 to end up with `workers` spawned threads. */
+        g_shared_pool = jce_thread_pool_create(workers + 1);
+    }
+    JceThreadPool *p = g_shared_pool;
+    shared_unlock();
+    return p;
+}
+
+void jce_thread_pool_shared_shutdown(void)
+{
+    shared_lock();
+    JceThreadPool *p = g_shared_pool;
+    g_shared_pool    = NULL;
+    g_shared_workers = -1;
+    shared_unlock();
+
+    /* Outside the lock: destroy waits for every outstanding task and joins the
+       workers, and one of those tasks may call jce_thread_pool_shared(). */
+    if (p) jce_thread_pool_destroy(p);
 }

@@ -66,6 +66,7 @@ extern "C" {
 #include <jce/os/platform/jce_clipboard.h>
 #include <jce/os/platform/jce_cursor.h>
 #include <jce/os/platform/jce_window.h>
+#include <jce/renderer/jce_image.h>
 #include <jce/renderer/jce_views.h>
 }
 
@@ -397,8 +398,21 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
             if (buf) {
                 size_t sz = jce_pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
-                if (sz > 0)
-                    jce_window_set_icon(window, buf, sz);
+                if (sz > 0) {
+                    /* Decode through the image SERVICE, not in the platform
+                     * layer: it is the single place that routes the
+                     * libpng-hostile 16-bit-greyscale class away from
+                     * SDL_image instead of overrunning the heap on it. */
+                    int iw = 0, ih = 0;
+                    uint8_t *px = jce_image_load_rgba8_from_memory(
+                        buf, (uint64_t)sz, &iw, &ih);
+                    if (px) {
+                        jce_window_set_icon_rgba8(window, px, iw, ih);
+                        jce_image_free_rgba8(px);
+                    } else {
+                        LOG_WARN(LOG_TAG, "editor icon failed to decode");
+                    }
+                }
                 ED_FREE(buf);
             }
         } else {

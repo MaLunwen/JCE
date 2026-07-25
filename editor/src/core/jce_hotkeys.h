@@ -94,6 +94,8 @@ typedef enum {
     JCE_HK_WORKSPACE_6,
     JCE_HK_WORKSPACE_7,
 
+    JCE_HK_EDIT_SNAP_TO_GROUND,
+
     JCE_HK_COUNT
 } JceHotkeyId;
 

@@ -236,6 +236,29 @@ static uint32_t             s_mesh_index_cap   = 0;     /* power of two, or 0 */
 static uint32_t             s_mesh_cache_count = 0;
 static uint32_t             s_mesh_cache_cap   = 0;
 
+/* Case-insensitive ".gltf"/".glb" suffix test.  cgltf is the engine's single
+ * glTF authority (the scene renderer routes such a mesh_path to its JceModel /
+ * cgltf cache and never reaches this callback); assimp is the importer for the
+ * authoring formats cgltf cannot read.  Hand-rolled rather than strcasecmp
+ * because that is POSIX, not C99. */
+static bool dm_path_is_gltf(const char *s) {
+    size_t n = strlen(s);
+    for (int k = 0; k < 2; ++k) {
+        const char *suf = k ? ".gltf" : ".glb";
+        size_t      sn  = k ? 5u : 4u;
+        if (n < sn) continue;
+        const char *p = s + (n - sn);
+        size_t      i = 0;
+        for (; i < sn; ++i) {
+            char a = p[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != suf[i]) break;
+        }
+        if (i == sn) return true;
+    }
+    return false;
+}
+
 /* FNV-1a 64-bit — small, deterministic, avoids pulling xxhash into this TU. */
 static uint64_t dm_path_hash(const char *s) {
     uint64_t h = 1469598103934665603ULL;
@@ -361,8 +384,9 @@ static bool jce_default_mount_runtime_assets(const JceProject *proj)
     }
 
     if (s_engine_pak) {
-        jce_fs_mount_pak(s_runtime_fs, s_engine_pak);
-        has_pak = true;
+        has_pak = jce_fs_mount_pak(s_runtime_fs, s_engine_pak);
+        if (!has_pak)
+            LOG_ERROR("app", "%s", "embedded PAK could not be mounted");
     }
 
     if (jce_fs_host_get_base_path(base, sizeof(base))) {
@@ -373,8 +397,10 @@ static bool jce_default_mount_runtime_assets(const JceProject *proj)
         int n = snprintf(root, sizeof(root), "%s%s", base, cooked);
         if (n > 0 && n < (int)sizeof(root) &&
             jce_fs_host_exists_dir(root)) {
-            jce_fs_mount_dir(s_runtime_fs, "", root);
-            has_loose = true;
+            has_loose = jce_fs_mount_dir(s_runtime_fs, "", root);
+            if (!has_loose)
+                LOG_ERROR("app", "cooked asset dir could not be mounted: %s",
+                          root);
         }
     }
 
@@ -598,15 +624,25 @@ static bool s_runtime_resolve_path(void *user_data, const char *in_path,
 static JceMesh *s_default_load_mesh(const char *path, void *ud)
 {
     (void)ud;
-    /* Load .glb / .gltf / .obj geometry from the overlaid PAK chain.
-     * When a bundle is mounted (jce_pak_overlay_push), the PAK walk
-     * automatically finds files inside the bundle, including
-     * bundle-converted _external/<hash>.glb meshes.
+    /* Load NON-glTF geometry (.obj / .fbx / .dae / …) from the overlaid PAK
+     * chain.  When a bundle is mounted (jce_pak_overlay_push), the PAK walk
+     * automatically finds files inside the bundle.
+     *
+     * glTF is explicitly NOT handled here: cgltf owns that format end to end
+     * (materials, skins, morph targets, the JCE_lod / JCE_meshlets primitive
+     * extensions), and jce_model_importer_* is the assimp path, which flattens
+     * to one static JceMesh and drops all of it.  The scene renderer already
+     * classifies a .gltf/.glb mesh_path as a MODEL and resolves it through its
+     * own cgltf cache without ever calling this callback, so the gate below is
+     * an assertion of that contract rather than a behaviour change — it keeps
+     * a second glTF parser out of the shipped runtime should another caller
+     * (e.g. a pick pass) be wired to load_mesh later.
      *
      * Results are cached by path: the renderer calls this many times per
      * frame (once per shadow cascade / depth / main pass per entity), and
      * each import is expensive (decompress + Assimp + GPU upload). */
     if (!s_engine_pak || !path || path[0] == '\0') return NULL;
+    if (dm_path_is_gltf(path)) return NULL;
 
     uint64_t h  = dm_path_hash(path);
     int      ei = dm_mesh_cache_find(h, path);
@@ -779,6 +815,17 @@ static bool app_init(const JceServices *svc, void *ud)
         LOG_ERROR("app", "%s",
                   "jce_project.json and packed runtime boot manifest are both missing");
         return false;
+    }
+    /* Player window metadata (Project Settings > Player, boot manifest schema
+     * >= 2): open the shipped game with the authored window title + fullscreen.
+     * The manifest loads AFTER window creation, so only title (no visible flash)
+     * and fullscreen are applied here; the authored window SIZE has no
+     * post-create setter yet and keeps the engine-config default. */
+    if (boot_loaded && svc && svc->window) {
+        if (runtime_boot.window_title[0])
+            jce_window_set_title(svc->window, runtime_boot.window_title);
+        if (runtime_boot.fullscreen && !jce_window_is_fullscreen(svc->window))
+            jce_window_toggle_fullscreen(svc->window);
     }
     if (!jce_default_mount_runtime_assets(s_project))
         return false;
@@ -1435,7 +1482,16 @@ static void app_draw(const JceServices *svc, void *ud)
              * knobs measured too small alone on a 50ms iGPU frame; the
              * bundle is what moves it.  HIGH/ULTRA render 1:1 as before. */
             uint32_t rw = sw, rh = sh;
-            if (jce_renderer_get_tier() <= JCE_GPU_TIER_LOW) {
+            /* Dynamic resolution applies to the fill-bound low-end: the LOW
+             * charter baseline AND every INTEGRATED GPU (capped at MEDIUM).  An
+             * iGPU's color pass is pixel-count-bound at native res, so the same
+             * pixel-budget scaling that holds 60 on the charter box holds it on
+             * an iGPU — while UI/text stay native.  Discrete MEDIUM+ renders 1:1. */
+            const bool dynres_tier =
+                jce_renderer_get_tier() <= JCE_GPU_TIER_LOW ||
+                (jce_renderer_get_tier() == JCE_GPU_TIER_MEDIUM &&
+                 !jce_renderer_get_recommendation().has_discrete_gpu);
+            if (dynres_tier) {
                 /* Pixel-BUDGET dynamic resolution (replaces the old flat 0.65x,
                  * which blurred even small windows).  The 3D offscreen chain
                  * renders 1:1 — fully crisp — as long as the surface is within

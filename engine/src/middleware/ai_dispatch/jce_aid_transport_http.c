@@ -1,10 +1,24 @@
 /* jce_aid_transport_http.c -- minimal plaintext HTTP/1.0 transport over
- * jce_tcp (spec F.4 fallback path while libcurl awaits approval).
+ * jce_tcp (spec F.4 fallback path).
  *
  * Scope: http:// only, IPv4, Content-Length or connection-close bodies
  * (HTTP/1.0 request => servers do not chunk).  Intended for T2 localhost
- * inference and development-only T1; production T1 HTTPS arrives with
- * the curl transport. */
+ * inference and development-only T1; production T1 HTTPS goes through the
+ * curl transport.
+ *
+ * WHY THIS STILL EXISTS ALONGSIDE libcurl (audit: A2-HANDWRITTEN-HTTP-
+ * FALLBACK).  The original note here said "while libcurl awaits approval";
+ * that approval landed and libcurl/8.21.0 is now an unconditional Conan
+ * requirement, so the stated reason is stale.  It is NOT dead code, though:
+ * jce_aid_init falls back here when curl_global_init() fails at runtime.
+ *
+ * It is also not a second authoritative HTTP client.  Its contract is
+ * deliberately narrower than curl's — plaintext, IPv4, no chunked encoding,
+ * no redirects, no TLS — and parse_http_url REJECTS https://, so a config
+ * pointing at an HTTPS endpoint fails loudly instead of being silently
+ * downgraded to cleartext.  Widening it toward parity with curl would be the
+ * actual duplication; keep it boring, and prefer deleting it over growing it
+ * if the fallback ever stops earning its ~160 lines. */
 #include "jce_aid_transport.h"
 
 #include <jce/os/platform/jce_tcp.h>

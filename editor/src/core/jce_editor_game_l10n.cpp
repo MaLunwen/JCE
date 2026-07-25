@@ -10,6 +10,7 @@
 #include "core/jce_editor_game_l10n.h"
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_path.h>
@@ -36,16 +37,6 @@ struct Gl10nState {
 };
 
 Gl10nState g_l10n;
-
-/* Legacy fixed-enum jce_i18n keys (engine/src/os/core/jce_i18n.c
- * s_key_map) — consumed by the built-in pause/settings menu.  Keep in
- * sync with that table. */
-const char *const k_protected_keys[] = {
-    "paused", "continue", "quit", "controls_hint", "text_demo",
-    "settings", "video", "audio", "fullscreen", "resolution",
-    "vsync", "master_volume", "music_volume", "sfx_volume",
-    "ok", "cancel", "apply", "on", "off",
-};
 
 bool is_meta_key(const char *k)
 {
@@ -261,9 +252,13 @@ bool jce_editor_gl10n_add_locale(const char *code)
 
 bool jce_editor_gl10n_key_protected(const char *key)
 {
+    /* The fixed-enum jce_i18n keys the built-in pause/settings menu reads
+     * by JceStringId.  Queried from the owning module rather than copied. */
     if (!key) return false;
-    for (const char *pk : k_protected_keys)
-        if (std::strcmp(pk, key) == 0) return true;
+    for (int id = 0; id < JCE_STR_COUNT; ++id) {
+        const char *pk = jce_i18n_key_name((JceStringId)id);
+        if (pk[0] && std::strcmp(pk, key) == 0) return true;
+    }
     return false;
 }
 

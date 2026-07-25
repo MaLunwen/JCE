@@ -243,6 +243,16 @@ bool jce_project_settings_save    (const JceProjectSettings *s);
  * Safe to call repeatedly. */
 void jce_project_settings_apply   (const JceProjectSettings *s);
 
+/* Push the authored 3D Layer Collision Matrix + layer names into the
+ * engine's process-wide physics layer cache (jce_physics_layers.h). This is
+ * the single authoring -> runtime conversion for the matrix: editor Play
+ * calls it before jce_runtime_create (bodies read the engine matrix at
+ * spawn) and the build calls it before exporting the cooked
+ * physics_layers.json the shipped game loads. Deliberately NOT folded into
+ * apply(): the engine matrix must change at the play/cook boundary, not when
+ * the settings dialog is confirmed. NULL is a no-op. */
+void jce_project_settings_push_physics_layers(const JceProjectSettings *s);
+
 /* Process-wide cached snapshot — populated by load/apply. Read-only
  * accessor for runtime subsystems that want the current values without
  * hitting disk. Returns NULL until the first load. */

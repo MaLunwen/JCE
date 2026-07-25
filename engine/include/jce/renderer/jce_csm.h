@@ -59,7 +59,7 @@ typedef struct {
  * @param caster_aabb_max World-space max corner of the shadow-caster bounds, or
  *                        NULL (disables the near-plane extension; legacy fit).
  */
-void jce_csm_compute(JceCsmData *out,
+JCE_API void jce_csm_compute(JceCsmData *out,
                      uint32_t cascade_count,
                      float near_plane,
                      float far_plane,

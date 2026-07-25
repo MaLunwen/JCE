@@ -232,7 +232,12 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
         jce_free(dir);
         return NULL;
     }
-    jce_fs_mount_pak(dir->fs, pak);
+    if (!jce_fs_mount_pak(dir->fs, pak)) {
+        LOG_ERROR(LOG_TAG, "jce_fs_mount_pak failed — no asset source");
+        jce_fs_destroy(dir->fs);
+        jce_free(dir);
+        return NULL;
+    }
 
     /* Dev-mode override: when the editor (or a developer) passes
      * `--dev <project_assets_dir>`, mount that loose folder so any
@@ -243,12 +248,19 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
     {
         char dev_dir[512];
         if (jce_args_get_dev_assets(dev_dir, sizeof(dev_dir))) {
-            jce_fs_mount_dir(dir->fs, "", dev_dir);
-            LOG_INFO(LOG_TAG,
-                "dev-mode: loose assets mounted from '%s' (overrides PAK)",
-                dev_dir);
-            jce_material_registry_init(dev_dir);
-            jce_material_registry_set_reload_cb(on_material_reloaded, dir);
+            if (jce_fs_mount_dir(dir->fs, "", dev_dir)) {
+                LOG_INFO(LOG_TAG,
+                    "dev-mode: loose assets mounted from '%s' (overrides PAK)",
+                    dev_dir);
+                jce_material_registry_init(dev_dir);
+                jce_material_registry_set_reload_cb(on_material_reloaded, dir);
+            } else {
+                /* Hot-reload stays off rather than watching a folder the VFS
+                 * never mounted: the game runs on PAK assets as usual. */
+                LOG_WARN(LOG_TAG,
+                    "dev-mode: could not mount '%s' — PAK assets only",
+                    dev_dir);
+            }
         }
     }
 

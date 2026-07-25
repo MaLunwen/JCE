@@ -17,6 +17,7 @@
 
 #include "panels/material_graph/jce_material_graph_state.h"
 
+#include "jce_panel_common.h"
 #include "core/jce_editor_i18n.h"
 #include "dialogs/jce_path_input.h"
 #include "ui/jce_editor_panels.h"
@@ -105,34 +106,8 @@ static void draw_content(void)
 
 namespace jce_mgp {
 
-static int g_request_tab = -1;
-static int g_current_tab = 0;  /* mirror of active TabItem for menu markers */
-static bool g_tab_state_loaded = false;
-
-static const char *k_tab_state_key = "panel.graph_authoring.current_tab";
-
-static bool valid_tab(int idx)
-{
-    return idx >= 0 && idx <= 3;
-}
-
-static void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 3);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-static void set_current_tab(int idx)
-{
-    if (!valid_tab(idx) || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+static JcePanelTabState g_tabs{ "panel.graph_authoring.current_tab",
+                                /*max_tab=*/3 };
 
 void draw_workbench(void)
 {
@@ -140,14 +115,14 @@ void draw_workbench(void)
      * authoring tab is active. */
     shader_compile_poll();
 
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (!ImGui::BeginTabBar("##graph_authoring_tabs"))
         return;
 
-    ImGuiTabItemFlags mat_flags = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags shd_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags vfx_flags = (g_request_tab == 2) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags par_flags = (g_request_tab == 3) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags mat_flags = jce_panel_tab_flags(g_tabs, 0);
+    ImGuiTabItemFlags shd_flags = jce_panel_tab_flags(g_tabs, 1);
+    ImGuiTabItemFlags vfx_flags = jce_panel_tab_flags(g_tabs, 2);
+    ImGuiTabItemFlags par_flags = jce_panel_tab_flags(g_tabs, 3);
 
     char mat_label[96];
     char shd_label[96];
@@ -163,45 +138,40 @@ void draw_workbench(void)
                   jce_editor_i18n("particleEditor.title"));
 
     if (ImGui::BeginTabItem(mat_label, nullptr, mat_flags)) {
-        set_current_tab(0);
+        jce_panel_tab_set_current(g_tabs, 0);
         draw_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(shd_label, nullptr, shd_flags)) {
-        set_current_tab(1);
+        jce_panel_tab_set_current(g_tabs, 1);
         jce_editor_panel_shader_graph_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(vfx_label, nullptr, vfx_flags)) {
-        set_current_tab(2);
+        jce_panel_tab_set_current(g_tabs, 2);
         jce_editor_panel_vfx_graph_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(par_label, nullptr, par_flags)) {
-        set_current_tab(3);
+        jce_panel_tab_set_current(g_tabs, 3);
         jce_editor_panel_particle_editor_content();
         ImGui::EndTabItem();
     }
 
     ImGui::EndTabBar();
-    g_request_tab = -1;
+    g_tabs.request = -1;
 }
 
 } /* namespace jce_mgp */
 
 extern "C" void jce_panel_material_graph_request_tab(int idx)
 {
-    if (!jce_mgp::valid_tab(idx))
-        return;
-    jce_mgp::g_request_tab = idx;
-    jce_mgp::g_current_tab = idx;
-    jce_editor_ui_state_save_int(jce_mgp::k_tab_state_key, idx);
+    jce_panel_tab_request(jce_mgp::g_tabs, idx);
 }
 
 extern "C" int jce_panel_material_graph_current_tab(void)
 {
-    jce_mgp::ensure_tab_state_loaded();
-    return jce_mgp::g_current_tab;
+    return jce_panel_tab_current(jce_mgp::g_tabs);
 }
 
 extern "C" void jce_editor_panel_material_graph(void)

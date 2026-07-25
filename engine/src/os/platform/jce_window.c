@@ -9,7 +9,6 @@
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL_metal.h>
-#include <SDL3_image/SDL_image.h>
 #include <string.h>
 
 /* Verify JCE_WINDOW_* flags match SDL_WINDOW_* at compile time (C99-safe). */
@@ -209,31 +208,31 @@ void jce_window_calc_viewport(const JceWindow *win,
     if (vp_h) *vp_h = (uint16_t)win->pixel_h;
 }
 
-void jce_window_set_icon(JceWindow *win, const void *data, size_t size)
+void jce_window_set_icon_rgba8(JceWindow *win, const void *pixels, int w, int h)
 {
-    if (!win || !data || size == 0) return;
+    if (!win || !win->sdl_win || !pixels || w <= 0 || h <= 0) return;
 
 #ifdef __EMSCRIPTEN__
-    /* SDL3's Emscripten SDL_SetWindowIcon uses MAIN_THREAD_EM_ASM with
-       an `instanceof SharedArrayBuffer` guard that throws ReferenceError
-       when the browser lacks cross-origin isolation.  Browser favicons
-       should be set in the HTML shell instead. */
-    (void)data; (void)size;
+    /* SDL3's Emscripten SDL_SetWindowIcon uses MAIN_THREAD_EM_ASM with an
+       `instanceof SharedArrayBuffer` guard that throws ReferenceError when
+       the browser lacks cross-origin isolation.  Browser favicons should be
+       set in the HTML shell instead. */
+    (void)pixels; (void)w; (void)h;
     return;
-#endif
-
-    SDL_IOStream *io = SDL_IOFromConstMem(data, size);
-    if (!io) return;
-
-    SDL_Surface *icon = IMG_Load_IO(io, true);  /* true = auto-close io */
-    if (icon) {
-        SDL_SetWindowIcon(win->sdl_win, icon);
-        SDL_DestroySurface(icon);
-    } else {
-        LOG_WARN(LOG_TAG, "IMG_Load_IO failed: %s", SDL_GetError());
+#else
+    /* SDL_CreateSurfaceFrom does not copy, and SDL_SetWindowIcon does not
+     * retain — so the surface only has to outlive the call, and the caller's
+     * buffer only has to outlive this function. */
+    SDL_Surface *icon = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32,
+                                              (void *)pixels, w * 4);
+    if (!icon) {
+        LOG_WARN(LOG_TAG, "icon surface failed: %s", SDL_GetError());
+        return;
     }
+    SDL_SetWindowIcon(win->sdl_win, icon);
+    SDL_DestroySurface(icon);
+#endif
 }
-
 void jce_window_toggle_fullscreen(JceWindow *win)
 {
     if (!win || !win->sdl_win) return;

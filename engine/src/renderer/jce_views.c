@@ -13,6 +13,7 @@
  */
 
 #include <jce/renderer/jce_views.h>
+#include "jce_renderer_internal.h"   /* decls for the two helpers below */
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>

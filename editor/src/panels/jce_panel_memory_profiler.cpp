@@ -12,6 +12,7 @@
  * no bgfx, no raw libc.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_ui_state.h"
@@ -350,16 +351,8 @@ extern "C" void jce_editor_panel_memory_profiler_content(void)
  * entries registered against JCE_PANEL_MEMORY_PROFILER keep working. */
 extern "C" void jce_editor_panel_memory_profiler(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_MEMORY_PROFILER);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *pf_vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER);
-    if (pf_vis) *pf_vis = true;
-
-    char title[96];
-    snprintf(title, sizeof(title), "%s###profiler",
-             jce_editor_i18n("panel.profiler"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_profiler_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_MEMORY_PROFILER,
+                                        JCE_PANEL_PROFILER,
+                                        "panel.profiler", "profiler"))
+        jce_panel_profiler_request_tab(1);
 }

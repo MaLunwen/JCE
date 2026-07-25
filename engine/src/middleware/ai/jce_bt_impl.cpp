@@ -142,11 +142,21 @@ void jce_bt_backend_register_action(JceBtBackend *b, const char *name,
                 node_name, config, captured_fn, captured_ud);
         };
 
-    b->factory.registerBuilder(
-        BT::TreeNodeManifest{BT::NodeType::ACTION, name, {}, {}},
-        builder);
-
-    LOG_DEBUG(LOG_TAG, "registered action '%s'", name);
+    /* registerBuilder throws BT::BehaviorTreeException on a duplicate name
+     * (e.g. two agents both register "Attack").  This is an extern "C"
+     * entry point reachable from the public C99 API (jce_bt_register_action);
+     * an exception escaping here would cross the C ABI into C frames = UB /
+     * terminate.  Contain it exactly like bt_lib_register / the tree loader. */
+    try {
+        b->factory.registerBuilder(
+            BT::TreeNodeManifest{BT::NodeType::ACTION, name, {}, {}},
+            builder);
+        LOG_DEBUG(LOG_TAG, "registered action '%s'", name);
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "register action '%s' failed: %s", name, e.what());
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "register action '%s' failed: unknown exception", name);
+    }
 }
 
 /* ── Bundled deterministic node library ──────────────────────────────
@@ -614,19 +624,40 @@ JceBtStatus jce_bt_backend_tick(JceBtBackend *b, uint32_t tree_idx)
     if (!b || tree_idx >= b->trees.size() || !b->trees[tree_idx])
         return JCE_BT_FAILURE;
 
-    BT::NodeStatus status = b->trees[tree_idx]->tickOnce();
-    switch (status) {
-    case BT::NodeStatus::SUCCESS: return JCE_BT_SUCCESS;
-    case BT::NodeStatus::FAILURE: return JCE_BT_FAILURE;
-    case BT::NodeStatus::RUNNING: return JCE_BT_RUNNING;
-    default:                      return JCE_BT_FAILURE;
+    /* tickOnce() throws BT::RuntimeError/NodeExecutionError on data faults
+     * that pass XML parsing but fail at run time — e.g. a built-in Repeat
+     * with num_cycles="{missing_key}".  This extern "C" entry is called
+     * from the C99 runtime (jce_bt_tick), so an escaping exception would
+     * cross the C ABI = UB.  Contain and report as FAILURE. */
+    try {
+        BT::NodeStatus status = b->trees[tree_idx]->tickOnce();
+        switch (status) {
+        case BT::NodeStatus::SUCCESS: return JCE_BT_SUCCESS;
+        case BT::NodeStatus::FAILURE: return JCE_BT_FAILURE;
+        case BT::NodeStatus::RUNNING: return JCE_BT_RUNNING;
+        default:                      return JCE_BT_FAILURE;
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "tree %u tick threw: %s", tree_idx, e.what());
+        return JCE_BT_FAILURE;
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "tree %u tick threw unknown exception", tree_idx);
+        return JCE_BT_FAILURE;
     }
 }
 
 void jce_bt_backend_halt(JceBtBackend *b, uint32_t tree_idx)
 {
     if (!b || tree_idx >= b->trees.size() || !b->trees[tree_idx]) return;
-    b->trees[tree_idx]->haltTree();
+    /* haltTree() runs node halt() callbacks which may throw; same C-ABI
+     * firewall as tick above. */
+    try {
+        b->trees[tree_idx]->haltTree();
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "tree %u halt threw: %s", tree_idx, e.what());
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "tree %u halt threw unknown exception", tree_idx);
+    }
 }
 
 uint32_t jce_bt_backend_tree_count(const JceBtBackend *b)

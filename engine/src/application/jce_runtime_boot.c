@@ -70,16 +70,38 @@ bool JCE_CALL jce_runtime_boot_manifest_parse(
 
     contract = jce_json_get_string(root, "contract", NULL);
     startup_scene = jce_json_get_string(root, "startup_scene", NULL);
-    if (!contract || strcmp(contract, JCE_RUNTIME_BOOT_CONTRACT) != 0 ||
-        jce_json_get_int(root, "schema", 0) !=
-            JCE_RUNTIME_BOOT_SCHEMA_VERSION ||
-        !startup_scene ||
-        (startup_scene[0] && !runtime_boot_path_is_virtual(startup_scene))) {
-        goto done;
+    {
+        /* Accept any schema in [1, current]: schema-1 manifests predate the
+         * player window metadata and parse fine with those fields left zeroed. */
+        const int schema = jce_json_get_int(root, "schema", 0);
+        if (!contract || strcmp(contract, JCE_RUNTIME_BOOT_CONTRACT) != 0 ||
+            schema < 1 || schema > JCE_RUNTIME_BOOT_SCHEMA_VERSION ||
+            !startup_scene ||
+            (startup_scene[0] && !runtime_boot_path_is_virtual(startup_scene))) {
+            goto done;
+        }
     }
 
     memcpy(out_manifest->startup_scene, startup_scene,
            strlen(startup_scene) + 1);
+
+    /* Optional player window metadata (schema >= 2; absent keys stay zeroed,
+     * which the shipped game reads as "keep the engine-config default"). */
+    {
+        const char *title = jce_json_get_string(root, "window_title", NULL);
+        if (title && title[0]) {
+            size_t n = strlen(title);
+            if (n >= JCE_RUNTIME_BOOT_TITLE_MAX)
+                n = JCE_RUNTIME_BOOT_TITLE_MAX - 1;
+            memcpy(out_manifest->window_title, title, n);
+            out_manifest->window_title[n] = '\0';
+        }
+        out_manifest->window_width      = jce_json_get_int(root, "window_width", 0);
+        out_manifest->window_height     = jce_json_get_int(root, "window_height", 0);
+        out_manifest->fullscreen        = jce_json_get_int(root, "fullscreen", 0) != 0;
+        out_manifest->run_in_background =
+            jce_json_get_int(root, "run_in_background", 0) != 0;
+    }
     ok = true;
 
 done:

@@ -51,7 +51,7 @@ JCE_API JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asse
 
 /* Load a glTF/GLB model from raw file bytes in memory.
    name is used for logging only; may be NULL. */
-JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
+JCE_API JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
                                       const char *name);
 
 /* Header-only rig probe: cgltf-parses just the glTF/GLB JSON header (no
@@ -94,7 +94,7 @@ JCE_API void jce_model_destroy(JceModel *model);
 #define JCE_MODEL_PRESUBMIT_CB_DEFINED
 typedef void (*JceModelPreSubmitCb)(void *user, uint16_t view_id);
 #endif
-void jce_model_set_pre_submit_cb(JceModelPreSubmitCb cb, void *user);
+JCE_API void jce_model_set_pre_submit_cb(JceModelPreSubmitCb cb, void *user);
 
 /* Per-draw material override.  When `mat` is non-NULL, the NEXT jce_model_draw /
  * _draw_morphed calls bind it for EVERY primitive instead of the model's own
@@ -150,7 +150,7 @@ JCE_API uint32_t jce_model_lod_index_counts(const JceModel *model,
  * transform:      model-to-world matrix applied to every node (required).
  * joint_matrices: bone palette for skinned meshes; pass NULL for static models.
  * num_joints:     number of matrices in joint_matrices (0 for static models). */
-void jce_model_draw(const JceModel *model,
+JCE_API void jce_model_draw(const JceModel *model,
                     const JceRenderer *r, uint16_t view_id,
                     const jce_mat4 *transform,
                     const jce_mat4 *joint_matrices,
@@ -163,7 +163,7 @@ void jce_model_draw(const JceModel *model,
  * other behaviour are UNCHANGED.  Passing JCE_INVALID_SHADER is BYTE-IDENTICAL
  * to jce_model_draw (which is now a thin caller of this).  Used by the scene
  * renderer to draw a toon character with the pbr_toon program. */
-void jce_model_draw_program(const JceModel *model,
+JCE_API void jce_model_draw_program(const JceModel *model,
                             const JceRenderer *r, uint16_t view_id,
                             const jce_mat4 *transform,
                             const jce_mat4 *joint_matrices,
@@ -399,7 +399,7 @@ JCE_API void jce_model_draw_indirect_from_buffer(const JceModel *model,
  * skeleton.  Pass NULL/0 joints to rasterize the bind pose.
  *
  * view_id must be a shadow producer view (single map or a CSM cascade). */
-void jce_model_draw_shadow(const JceModel *model,
+JCE_API void jce_model_draw_shadow(const JceModel *model,
                            const JceRenderer *r, uint16_t view_id,
                            const jce_mat4 *transform,
                            const jce_mat4 *joint_matrices,
@@ -488,14 +488,14 @@ JCE_API void jce_model_draw_shadow_instanced_lod(const JceModel *model,
  * VB.  A NULL vb_cb makes these byte-identical to jce_model_draw / _shadow.
  * The color and shadow variants MUST be driven by the SAME callback/handles so
  * the cast silhouette matches the lit, morphed mesh. */
-void jce_model_draw_morphed(const JceModel *model,
+JCE_API void jce_model_draw_morphed(const JceModel *model,
                             const JceRenderer *r, uint16_t view_id,
                             const jce_mat4 *transform,
                             const jce_mat4 *joint_matrices,
                             uint32_t num_joints,
                             JceModelMorphVbCb vb_cb, void *vb_user);
 
-void jce_model_draw_morphed_shadow(const JceModel *model,
+JCE_API void jce_model_draw_morphed_shadow(const JceModel *model,
                                    const JceRenderer *r, uint16_t view_id,
                                    const jce_mat4 *transform,
                                    const jce_mat4 *joint_matrices,
@@ -563,7 +563,7 @@ typedef struct {
  *   prev_joint_matrices / num_prev_joints   = PREVIOUS frame's skin palette
  *                                             (NULL/0 => reuse current => bones
  *                                             contribute no motion this frame) */
-void jce_model_draw_velocity(const JceModel *model,
+JCE_API void jce_model_draw_velocity(const JceModel *model,
                              const JceRenderer *r, uint16_t view_id,
                              const JceModelVelocityCtx *ctx,
                              const jce_mat4 *transform,

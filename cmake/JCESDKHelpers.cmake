@@ -6,6 +6,9 @@
 # Shipped to <sdk>/lib/cmake/JCE/ and auto-included by JCEConfig.cmake.
 #
 # Public:
+#   jce_shader_profiles(<out-var>)
+#   jce_shader_pak_exclude_flags(<out-var> [PROFILES <p> [<p>...]])
+#
 #   jce_target_embed_pak(<target>
 #       RESOURCE_DIRS  <dir> [<dir>...]
 #       [PAK_FILE      <path>]                  # default: <bin>/<target>_assets.pak
@@ -27,6 +30,111 @@
 # assets_pak_data / assets_pak_data_size by default.
 
 include_guard(GLOBAL)
+
+# ------------------------------------------------------------------ #
+# jce_shader_profiles(<out-var>)                                      #
+#                                                                     #
+# THE per-platform bgfx shader-profile matrix.  Single definition:    #
+# the in-tree engine build includes this file for it, and an          #
+# out-of-tree `find_package(JCE)` consumer gets it because this file  #
+# is what the SDK installs next to JCEConfig.cmake.  Keeping two      #
+# copies drifted before (the SDK's unknown-platform fallback still    #
+# listed `essl1`, which the runtime can never load).                  #
+#                                                                     #
+# Compile (and pak) only the bgfx renderer back-ends the target       #
+# platform can actually load: saves compile time and keeps a shipped  #
+# .pak slim (e.g. no Metal binaries in a Windows build).              #
+#                                                                     #
+# The in-tree build sets JCE_PLATFORM_*; a standalone SDK consumer    #
+# never processes the engine's root CMakeLists and therefore has only #
+# the stock CMake platform variables.  Both arms must answer the      #
+# same — that is the point of having one function.                    #
+# ------------------------------------------------------------------ #
+function(jce_shader_profiles OUT_VAR)
+	if(JCE_PLATFORM_WINDOWS)
+		set(_plat windows)
+	elseif(JCE_PLATFORM_MACOS OR JCE_PLATFORM_IOS)
+		set(_plat apple)
+	elseif(JCE_PLATFORM_ANDROID)
+		set(_plat android)
+	elseif(JCE_PLATFORM_WEB)
+		set(_plat web)
+	elseif(JCE_PLATFORM_LINUX)
+		set(_plat linux)
+	elseif(EMSCRIPTEN)
+		set(_plat web)
+	elseif(ANDROID)
+		set(_plat android)
+	elseif(WIN32)
+		set(_plat windows)
+	elseif(APPLE)
+		set(_plat apple)
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		set(_plat linux)
+	else()
+		set(_plat other)
+	endif()
+
+	if(_plat STREQUAL "windows")
+		set(_profiles dx11 spv glsl)
+	elseif(_plat STREQUAL "apple")
+		# Apple deprecated desktop OpenGL and bgfx no longer reports
+		# BGFX_RENDERER_TYPE_OPENGL on Apple platforms, so the `glsl`
+		# profile would only bloat the .pak with unreachable binaries.
+		set(_profiles mtl spv)
+	elseif(_plat STREQUAL "android")
+		# NOTE: no essl1 — the runtime shader loader (jce_shaders.c
+		# shader_suffix) maps BGFX_RENDERER_TYPE_OPENGLES to "essl"
+		# unconditionally, so essl1 binaries were built + PAKed but
+		# never loadable (dead .pak weight).  If a real GLES2 tier is
+		# ever wanted, add a caps-based suffix pick there first.
+		set(_profiles essl spv)
+	elseif(_plat STREQUAL "web")
+		# NOTE: no essl1 — see the Android note above (never loaded).
+		set(_profiles essl)
+	elseif(_plat STREQUAL "linux")
+		set(_profiles spv glsl)
+	else()
+		# Unknown platform: keep every *loadable* profile.  essl1 is
+		# excluded here too, for the reason spelled out above.
+		set(_profiles dx11 spv glsl essl mtl)
+	endif()
+
+	set(${OUT_VAR} ${_profiles} PARENT_SCOPE)
+endfunction()
+
+# ------------------------------------------------------------------ #
+# jce_shader_pak_exclude_flags(<out-var> [PROFILES <p> [<p>...]])     #
+#                                                                     #
+# Turn a profile selection into the `--exclude-suffix _<sfx>.bin`     #
+# flags jce_pak needs, so neither a stale binary left in a shared     #
+# output dir by a previous build for another platform, nor an SDK     #
+# resource tree that ships every platform's precompiled variant, ends #
+# up inside the .pak.  PROFILES defaults to jce_shader_profiles().    #
+# ------------------------------------------------------------------ #
+function(jce_shader_pak_exclude_flags OUT_VAR)
+	cmake_parse_arguments(SX "" "" "PROFILES" ${ARGN})
+
+	# Every suffix jce_compile_shaders can emit (tools/compile_shaders.cmake).
+	set(_all_profiles dx11 spv glsl essl essl1 mtl)
+
+	# An explicitly passed but EMPTY profile list means "exclude every
+	# backend"; only an absent PROFILES keyword falls back to the matrix.
+	if(SX_PROFILES OR "PROFILES" IN_LIST SX_KEYWORDS_MISSING_VALUES)
+		set(_profiles ${SX_PROFILES})
+	else()
+		jce_shader_profiles(_profiles)
+	endif()
+
+	set(_flags)
+	foreach(_p IN LISTS _all_profiles)
+		if(NOT _p IN_LIST _profiles)
+			list(APPEND _flags --exclude-suffix "_${_p}.bin")
+		endif()
+	endforeach()
+
+	set(${OUT_VAR} ${_flags} PARENT_SCOPE)
+endfunction()
 
 # ------------------------------------------------------------------ #
 # jce_configure_application_target(<target>)                           #
@@ -308,35 +416,19 @@ function(jce_target_embed_pak TARGET)
 		list(APPEND _excl_flags --exclude-segment "${_s}")
 	endforeach()
 
-	# Shader bytecode is backend-specific. Mirror the engine build's profile
-	# selection so an SDK consumer does not embed unreachable ESSL/Metal/etc.
-	# binaries merely because the SDK resource tree contains every platform's
-	# precompiled variant. Callers may override the selected set with
+	# Shader bytecode is backend-specific. Use the shared profile matrix
+	# (jce_shader_profiles above — the same one the engine build uses) so an
+	# SDK consumer does not embed unreachable ESSL/Metal/etc. binaries merely
+	# because the SDK resource tree contains every platform's precompiled
+	# variant. Callers may override the selected set with
 	# JCE_PAK_SHADER_PROFILES (for example "dx11;spv" on a D3D/Vulkan-only app).
-	set(_all_shader_profiles dx11 spv glsl essl essl1 mtl)
+	set(_shader_profile_args)
 	if(DEFINED JCE_PAK_SHADER_PROFILES)
-		set(_shader_profiles ${JCE_PAK_SHADER_PROFILES})
-	elseif(WIN32)
-		set(_shader_profiles dx11 spv glsl)
-	elseif(APPLE)
-		set(_shader_profiles mtl spv)
-	elseif(ANDROID)
-		set(_shader_profiles essl spv)
-	elseif(EMSCRIPTEN)
-		set(_shader_profiles essl)
-	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-		set(_shader_profiles spv glsl)
-	else()
-		set(_shader_profiles ${_all_shader_profiles})
+		set(_shader_profile_args PROFILES ${JCE_PAK_SHADER_PROFILES})
 	endif()
+	jce_shader_pak_exclude_flags(_shader_exclude_flags ${_shader_profile_args})
+
 	jce_configure_application_target(${TARGET})
-	set(_shader_exclude_flags)
-	foreach(_profile IN LISTS _all_shader_profiles)
-		if(NOT _profile IN_LIST _shader_profiles)
-			list(APPEND _shader_exclude_flags
-				--exclude-suffix "_${_profile}.bin")
-		endif()
-	endforeach()
 
 	# Release packages use hash-only archive indices. Keep debug strings for
 	# Debug builds unless the caller explicitly requests stripping them.

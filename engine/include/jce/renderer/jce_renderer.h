@@ -56,8 +56,17 @@ JCE_API bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
 /* Create a safe fallback renderer using SDL_Renderer. */
 JCE_API JceRenderer *jce_renderer_create_fallback(JceWindow *win);
 
+/* Create a headless NullRHI renderer (bgfx NOOP, no window) for the
+ * dedicated-server / headless boot.  Never touches a GPU or a display;
+ * render entry points are no-ops.  Used by jce_engine_create() in headless
+ * mode. */
+JCE_API JceRenderer *jce_renderer_create_headless(void);
+
 /* Check if the renderer is running in fallback mode. */
 JCE_API bool         jce_renderer_is_fallback(const JceRenderer *r);
+
+/* Check if the renderer is a headless NullRHI (bgfx NOOP, no window). */
+JCE_API bool         jce_renderer_is_headless(const JceRenderer *r);
 
 /* Check if the EGL swap-buffers call has hung (Android only). */
 JCE_API bool         jce_renderer_is_egl_hung(void);

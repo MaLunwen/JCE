@@ -21,9 +21,11 @@
  * correct at the cost of serialising the heavy step — an acceptable, documented
  * trade since archive reads are largely I/O bound.
  *
- * Worker model.  When `worker_count` > 0 a small worker pool (jce_jobs) performs
- * I/O + decompression off the main thread; jce_archive_loader_tick() integrates
- * completed loads into the cache on the main thread.  When `worker_count` == 0
+ * Worker model.  When `worker_count` > 0 the process-wide shared thread pool
+ * (jce_thread_pool_shared) performs I/O + decompression off the main thread;
+ * jce_archive_loader_tick() integrates completed loads into the cache on the
+ * main thread.  `worker_count` is therefore advisory — it selects the worker
+ * path, but the pool's size is process policy.  When `worker_count` == 0
  * — the single-core / WebAssembly baseline where worker parallelism is
  * unavailable — requests are serviced inline by tick(), bounded to
  * `frame_budget_ms` per call so a heavy load spreads across several frames

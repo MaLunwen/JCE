@@ -21,10 +21,11 @@ struct JceRendererEcs {
     ecs_query_t      *q_fog;
 };
 
-JceRendererEcs *jce_renderer_ecs_create(ecs_world_t *w,
+JceRendererEcs *jce_renderer_ecs_create(void *w_opaque,
                                         JceSsr *ssr,
                                         JceVolumetricFog *fog)
 {
+    ecs_world_t *w = (ecs_world_t *)w_opaque;
     if (!w) return NULL;
 
     JceRendererEcs *re = (JceRendererEcs *)ecs_os_calloc(sizeof(*re));

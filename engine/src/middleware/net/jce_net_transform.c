@@ -36,6 +36,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 
+#include "jce_net_bytes.h"
 #include "os/core/jce_memory.h"
 
 #include <math.h>
@@ -239,100 +240,9 @@ static float quat_angle_between_deg(jce_quat a, jce_quat b)
     return angle_rad * (180.0f / 3.14159265358979323846f);
 }
 
-/* ================================================================== */
-/* Wire helpers (little-endian, mirror jce_replication.c)              */
-/* ================================================================== */
-
-typedef struct WBuf {
-    uint8_t *buf;
-    uint32_t size;
-    uint32_t cap;
-    bool     ok;
-} WBuf;
-
-static bool wb_reserve(WBuf *w, uint32_t extra)
-{
-    if (!w->ok) return false;
-    uint32_t need = w->size + extra;
-    if (need <= w->cap) return true;
-    uint32_t nc = w->cap ? w->cap : 256u;
-    while (nc < need) nc *= 2u;
-    uint8_t *nb = (uint8_t *)JCE_REALLOC(w->buf, nc);
-    if (!nb) { w->ok = false; return false; }
-    w->buf = nb;
-    w->cap = nc;
-    return true;
-}
-
-static void wb_u8(WBuf *w, uint8_t v)
-{
-    if (!wb_reserve(w, 1u)) return;
-    w->buf[w->size++] = v;
-}
-
-static void wb_u16(WBuf *w, uint16_t v)
-{
-    if (!wb_reserve(w, 2u)) return;
-    w->buf[w->size++] = (uint8_t)( v        & 0xFFu);
-    w->buf[w->size++] = (uint8_t)((v >> 8u) & 0xFFu);
-}
-
-static void wb_u32(WBuf *w, uint32_t v)
-{
-    if (!wb_reserve(w, 4u)) return;
-    w->buf[w->size++] = (uint8_t)( v         & 0xFFu);
-    w->buf[w->size++] = (uint8_t)((v >>  8u) & 0xFFu);
-    w->buf[w->size++] = (uint8_t)((v >> 16u) & 0xFFu);
-    w->buf[w->size++] = (uint8_t)((v >> 24u) & 0xFFu);
-}
-
-static void wb_f32(WBuf *w, float v)
-{
-    uint32_t u;
-    memcpy(&u, &v, 4);
-    wb_u32(w, u);
-}
-
-typedef struct RBuf {
-    const uint8_t *buf;
-    uint32_t       size;
-    uint32_t       cursor;
-    bool           ok;
-} RBuf;
-
-static bool rb_bytes(RBuf *r, void *dst, uint32_t n)
-{
-    if (!r->ok || r->cursor + n > r->size) { r->ok = false; return false; }
-    memcpy(dst, r->buf + r->cursor, n);
-    r->cursor += n;
-    return true;
-}
-
-static bool rb_u8 (RBuf *r, uint8_t  *v) { return rb_bytes(r, v, 1); }
-static bool rb_u16(RBuf *r, uint16_t *v)
-{
-    uint8_t b[2];
-    if (!rb_bytes(r, b, 2)) return false;
-    *v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
-    return true;
-}
-static bool rb_u32(RBuf *r, uint32_t *v)
-{
-    uint8_t b[4];
-    if (!rb_bytes(r, b, 4)) return false;
-    *v =  (uint32_t)b[0]
-       | ((uint32_t)b[1] <<  8)
-       | ((uint32_t)b[2] << 16)
-       | ((uint32_t)b[3] << 24);
-    return true;
-}
-static bool rb_f32(RBuf *r, float *v)
-{
-    uint32_t u;
-    if (!rb_u32(r, &u)) return false;
-    memcpy(v, &u, 4);
-    return true;
-}
+/* Little-endian wire codec: JceNetWBuf / JceNetRBuf from
+ * jce_net_bytes.h — the same helpers jce_replication.c uses, so the
+ * shared packet-type-byte protocol stays byte-identical. */
 
 /* ================================================================== */
 /* Encode / broadcast                                                  */
@@ -426,10 +336,10 @@ static void encode_and_broadcast(uint32_t tick, JceNetRole role)
     }
     if (n == 0u) return;
 
-    WBuf w = { NULL, 0u, 0u, true };
-    wb_u8 (&w, JCE_REPL_PKT_NET_TRANSFORM_V2);
-    wb_u32(&w, tick);
-    wb_u16(&w, n);
+    JceNetWBuf w = JCE_NET_WBUF_INIT;
+    jce_net_w_u8 (&w, JCE_REPL_PKT_NET_TRANSFORM_V2);
+    jce_net_w_u32(&w, tick);
+    jce_net_w_u16(&w, n);
 
     for (uint16_t k = 0; k < n; ++k) {
         NtEntry *e = &g_nt.entries[indices[k]];
@@ -449,10 +359,10 @@ static void encode_and_broadcast(uint32_t tick, JceNetRole role)
         jce_quant_pack_vec3_f16(pos, pos16);
         uint32_t rot_st3 = jce_quant_pack_quat_st3(rot);
 
-        wb_u32(&w, e->id);
-        wb_u16(&w, pos16[0]); wb_u16(&w, pos16[1]); wb_u16(&w, pos16[2]);
-        wb_u32(&w, rot_st3);
-        wb_f32(&w, 0.0f);  wb_f32(&w, 0.0f);  wb_f32(&w, 0.0f);   /* velocity */
+        jce_net_w_u32(&w, e->id);
+        jce_net_w_u16(&w, pos16[0]); jce_net_w_u16(&w, pos16[1]); jce_net_w_u16(&w, pos16[2]);
+        jce_net_w_u32(&w, rot_st3);
+        jce_net_w_f32(&w, 0.0f);  jce_net_w_f32(&w, 0.0f);  jce_net_w_f32(&w, 0.0f);   /* velocity */
 
         /* Locally mirror into the ring — keeps host loopback + the
          * non-owning split-screen path consistent.  We round-trip
@@ -486,15 +396,15 @@ void jce__net_transform_recv_packet(const void *data, uint32_t size)
 {
     if (!g_nt.inited || !data || size < 7u) return;
 
-    RBuf r = { (const uint8_t *)data, size, 0u, true };
+    JceNetRBuf r = JCE_NET_RBUF_INIT(data, size);
     uint8_t  type = 0;
     uint32_t tick = 0;
     uint16_t n    = 0;
-    if (!rb_u8 (&r, &type)) return;
+    if (!jce_net_r_u8 (&r, &type)) return;
     if (type != JCE_REPL_PKT_NET_TRANSFORM &&
         type != JCE_REPL_PKT_NET_TRANSFORM_V2) return;
-    if (!rb_u32(&r, &tick)) return;
-    if (!rb_u16(&r, &n))    return;
+    if (!jce_net_r_u32(&r, &tick)) return;
+    if (!jce_net_r_u16(&r, &n))    return;
 
     if (tick > g_nt.last_known_server_tick)
         g_nt.last_known_server_tick = tick;
@@ -504,34 +414,34 @@ void jce__net_transform_recv_packet(const void *data, uint32_t size)
         jce_vec3 pos;
         jce_quat rot;
         float    vx, vy, vz;
-        if (!rb_u32(&r, &id)) return;
+        if (!jce_net_r_u32(&r, &id)) return;
 
         if (type == JCE_REPL_PKT_NET_TRANSFORM_V2) {
             uint16_t p0, p1, p2;
             uint32_t rot_st3;
-            if (!rb_u16(&r, &p0)) return;
-            if (!rb_u16(&r, &p1)) return;
-            if (!rb_u16(&r, &p2)) return;
-            if (!rb_u32(&r, &rot_st3)) return;
+            if (!jce_net_r_u16(&r, &p0)) return;
+            if (!jce_net_r_u16(&r, &p1)) return;
+            if (!jce_net_r_u16(&r, &p2)) return;
+            if (!jce_net_r_u32(&r, &rot_st3)) return;
             uint16_t p16[3] = { p0, p1, p2 };
             pos = jce_quant_unpack_vec3_f16(p16);
             rot = jce_quant_unpack_quat_st3(rot_st3);
         } else {
             float px, py, pz, rx, ry, rz, rw;
-            if (!rb_f32(&r, &px)) return;
-            if (!rb_f32(&r, &py)) return;
-            if (!rb_f32(&r, &pz)) return;
-            if (!rb_f32(&r, &rx)) return;
-            if (!rb_f32(&r, &ry)) return;
-            if (!rb_f32(&r, &rz)) return;
-            if (!rb_f32(&r, &rw)) return;
+            if (!jce_net_r_f32(&r, &px)) return;
+            if (!jce_net_r_f32(&r, &py)) return;
+            if (!jce_net_r_f32(&r, &pz)) return;
+            if (!jce_net_r_f32(&r, &rx)) return;
+            if (!jce_net_r_f32(&r, &ry)) return;
+            if (!jce_net_r_f32(&r, &rz)) return;
+            if (!jce_net_r_f32(&r, &rw)) return;
             pos = jce_v3(px, py, pz);
             rot = jce_v4(rx, ry, rz, rw);
         }
 
-        if (!rb_f32(&r, &vx)) return;
-        if (!rb_f32(&r, &vy)) return;
-        if (!rb_f32(&r, &vz)) return;
+        if (!jce_net_r_f32(&r, &vx)) return;
+        if (!jce_net_r_f32(&r, &vy)) return;
+        if (!jce_net_r_f32(&r, &vz)) return;
 
         NtEntry *e = find_entry((JceNetObjectId)id);
         if (!e) continue;

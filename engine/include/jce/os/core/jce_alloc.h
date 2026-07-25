@@ -5,6 +5,10 @@
  * jce_fs_host_read_capped) come from the engine's tracked allocator.
  * Clients must release them with jce_free() rather than the C library
  * free() to keep the engine's allocation accounting balanced.
+ *
+ * These wrap the same heap and the same accounting as
+ * jce_allocator_default() (jce_allocator.h) — they are a convenience
+ * spelling of it, not a second allocator, so both appear in one total.
  */
 
 #ifndef JCE_ALLOC_H

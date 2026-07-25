@@ -22,6 +22,12 @@ void material_async_start(void)
         return;
 
     if (!s_mat_async.mutex) s_mat_async.mutex = jce_mutex_create();
+    /* Two private threads rather than jce_thread_pool_shared(): the worker
+     * calls jce_editor_model_extract_material(), i.e. a full glTF/FBX parse of
+     * the dropped file — seconds on a large FBX.  A drag-drop is exactly when
+     * the viewport must stay responsive, and on the shared pool the viewport's
+     * own per-frame parallel_for would run that parse while waiting for its
+     * cull.  See jce_thread.h for the frame-work / blocking-work split. */
     s_mat_async.pool = jce_thread_pool_create(2);
     s_mat_async.generation = 1;
     s_mat_async.inflight.clear();

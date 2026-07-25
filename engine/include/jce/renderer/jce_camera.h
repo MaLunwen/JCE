@@ -49,7 +49,7 @@ JCE_API void jce_camera_destroy(JceCamera *cam);
 JCE_API jce_mat4 jce_camera_view(const JceCamera *cam);
 
 /* Get the projection matrix. Requires aspect ratio for perspective mode. */
-jce_mat4 jce_camera_proj(const JceCamera *cam, float aspect,
+JCE_API jce_mat4 jce_camera_proj(const JceCamera *cam, float aspect,
                           bool homogeneous_ndc);
 
 JCE_API jce_vec3       jce_camera_get_position(const JceCamera *cam);

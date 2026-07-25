@@ -107,6 +107,10 @@ JcePhysicsLayerMask jce_physics_get_layer_collision_mask(uint32_t layer)
 
 /* ── JSON I/O ─────────────────────────────────────────────────────── */
 
+/* Serialize the current names + matrix.  The sole non-test caller is the
+ * editor build, which exports `<cooked>/physics_layers.json` for the shipped
+ * runtime to load back in app_init (see the loaders below) — this is a live
+ * cook→ship bridge, not an unread write path. */
 bool jce_physics_layer_matrix_save_json(const char *vfs_path)
 {
     if (!vfs_path) return false;

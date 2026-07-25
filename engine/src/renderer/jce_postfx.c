@@ -50,11 +50,16 @@ struct JcePostFXPipeline {
     bgfx_program_handle_t prog_grayscale;
     bgfx_program_handle_t prog_composite;  /* uber: combine+tonemap+chromatic+vignette+grayscale */
     bgfx_program_handle_t prog_present;    /* pass-through: output -> backbuffer (runtime path) */
+    bgfx_program_handle_t prog_rcas;       /* contrast-adaptive sharpen resolve for dynres upscale */
+    bgfx_program_handle_t prog_tsr;        /* temporal super-resolution upscale (dynres) */
     bgfx_program_handle_t prog_motion_vec; /* TAA: depth -> NDC motion delta (RG) */
     bgfx_program_handle_t prog_taa;        /* TAA: resolve current + history -> output */
 
     /* Uniforms. */
     bgfx_uniform_handle_t u_texColor;
+    bgfx_uniform_handle_t u_rcasParams;    /* xy=1/output size, z=sharpness 0..1 */
+    bgfx_uniform_handle_t u_tsrTexel;      /* xy=1/render, zw=1/output */
+    bgfx_uniform_handle_t u_tsrJitter;     /* xy=jitter render-UV, z=feedback, w=flip */
     bgfx_uniform_handle_t u_texBloom;
     bgfx_uniform_handle_t u_tonemapParams;
     bgfx_uniform_handle_t u_bloomParams;
@@ -118,6 +123,20 @@ struct JcePostFXPipeline {
      * THIS texture as s_texMotion instead — so animated/skinned geometry stops
      * ghosting.  Reset to invalid every apply() (one-shot per frame). */
     bgfx_texture_handle_t      taa_ext_motion_tex;
+
+    /* TSR (temporal super-resolution) output-res history — ping-pong so the
+     * resolve reads last frame's reconstruction and writes this frame's. Sized
+     * to the OUTPUT (native) resolution, distinct from the render-res chain. */
+    bgfx_texture_handle_t      tsr_hist_tex[2];
+    bgfx_frame_buffer_handle_t tsr_hist_fb[2];
+    uint32_t                   tsr_ow, tsr_oh;   /* current output-buffer size */
+    int                        tsr_ping;         /* index of the CURRENT buffer */
+    bool                       tsr_valid;        /* buffers allocated */
+    bool                       tsr_have_history; /* the OTHER buffer holds a frame */
+    /* Render-res camera motion buffer for the TSR history reprojection. */
+    bgfx_texture_handle_t      tsr_motion_tex;
+    bgfx_frame_buffer_handle_t tsr_motion_fb;
+    uint32_t                   tsr_mw, tsr_mh;
 
     /* Selectable tonemap + 3D-LUT grade + soft bloom (Stage 1a.5). */
     int                    tonemap_op;     /* JcePostFXTonemap; 0=ACES default */
@@ -226,7 +245,7 @@ static void alloc_one_fbo(JcePostFXPipeline *p, int i)
         (uint16_t)p->width, (uint16_t)p->height, false, 1,
         postfx_color_format(),
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL);
+        NULL, 0);
     bgfx_attachment_t at;
     memset(&at, 0, sizeof(at));
     bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
@@ -330,7 +349,7 @@ static void ensure_bloom_mips(JcePostFXPipeline *p, int mip_count)
         p->bloom_mip_tex[i] = bgfx_create_texture_2d(
             (uint16_t)w, (uint16_t)h, false, 1,
             postfx_color_format(),
-            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
 
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
@@ -356,7 +375,7 @@ static void create_taa_fbos(JcePostFXPipeline *p)
     p->taa_history_tex = bgfx_create_texture_2d(
         (uint16_t)p->width, (uint16_t)p->height, false, 1,
         postfx_color_format(),
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     {
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
@@ -384,7 +403,7 @@ static bool ensure_taa_motion_fbo(JcePostFXPipeline *p)
     p->taa_motion_tex = bgfx_create_texture_2d(
         (uint16_t)p->width, (uint16_t)p->height, false, 1,
         postfx_color_format(),
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     bgfx_attachment_t at;
     memset(&at, 0, sizeof(at));
     bgfx_attachment_init(&at, p->taa_motion_tex, BGFX_ACCESS_WRITE,
@@ -452,6 +471,19 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_grayscale.idx     = UINT16_MAX;
     p->prog_composite.idx     = UINT16_MAX;
     p->prog_present.idx        = UINT16_MAX;
+    p->prog_rcas.idx          = UINT16_MAX;
+    p->prog_tsr.idx           = UINT16_MAX;
+    p->tsr_hist_tex[0].idx    = UINT16_MAX;
+    p->tsr_hist_tex[1].idx    = UINT16_MAX;
+    p->tsr_hist_fb[0].idx     = UINT16_MAX;
+    p->tsr_hist_fb[1].idx     = UINT16_MAX;
+    p->tsr_ow = p->tsr_oh = 0;
+    p->tsr_ping = 0;
+    p->tsr_valid = false;
+    p->tsr_have_history = false;
+    p->tsr_motion_tex.idx = UINT16_MAX;
+    p->tsr_motion_fb.idx  = UINT16_MAX;
+    p->tsr_mw = p->tsr_mh = 0;
     p->prog_motion_vec.idx    = UINT16_MAX;
     p->prog_taa.idx           = UINT16_MAX;
     p->prog_custom.idx        = UINT16_MAX;
@@ -518,6 +550,9 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
 
     /* Create uniforms. */
     p->u_texColor       = bgfx_create_uniform("s_texColor",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_rcasParams     = bgfx_create_uniform("u_rcasParams",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_tsrTexel       = bgfx_create_uniform("u_tsrTexel",       BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_tsrJitter      = bgfx_create_uniform("u_tsrJitter",      BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_texBloom       = bgfx_create_uniform("s_texBloom",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
     p->u_tonemapParams  = bgfx_create_uniform("u_tonemapParams",  BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_bloomParams    = bgfx_create_uniform("u_bloomParams",    BGFX_UNIFORM_TYPE_VEC4, 1);
@@ -557,7 +592,7 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
         uint32_t texel = 0xFFFFFFFFu;
         const bgfx_memory_t *mem = bgfx_copy(&texel, 4);
         p->dummy_lut3d = bgfx_create_texture_3d(1, 1, 1, false,
-                                                BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+                                                BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
@@ -579,6 +614,9 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
 
     /* Destroy uniforms. */
     bgfx_destroy_uniform(pipeline->u_texColor);
+    bgfx_destroy_uniform(pipeline->u_rcasParams);
+    bgfx_destroy_uniform(pipeline->u_tsrTexel);
+    bgfx_destroy_uniform(pipeline->u_tsrJitter);
     bgfx_destroy_uniform(pipeline->u_texBloom);
     bgfx_destroy_uniform(pipeline->u_tonemapParams);
     bgfx_destroy_uniform(pipeline->u_bloomParams);
@@ -612,6 +650,14 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
     if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
     if (pipeline->prog_present.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_present);
+    if (pipeline->prog_rcas.idx          != UINT16_MAX) bgfx_destroy_program(pipeline->prog_rcas);
+    if (pipeline->prog_tsr.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tsr);
+    for (int i = 0; i < 2; ++i) {
+        if (pipeline->tsr_hist_fb[i].idx  != UINT16_MAX) bgfx_destroy_frame_buffer(pipeline->tsr_hist_fb[i]);
+        if (pipeline->tsr_hist_tex[i].idx != UINT16_MAX) bgfx_destroy_texture(pipeline->tsr_hist_tex[i]);
+    }
+    if (pipeline->tsr_motion_fb.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(pipeline->tsr_motion_fb);
+    if (pipeline->tsr_motion_tex.idx != UINT16_MAX) bgfx_destroy_texture(pipeline->tsr_motion_tex);
     if (pipeline->prog_motion_vec.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_motion_vec);
     if (pipeline->prog_taa.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_taa);
     if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
@@ -842,6 +888,10 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     pipeline->prog_grayscale     = load_postfx_prog(pak, "grayscale");
     pipeline->prog_composite     = load_postfx_prog(pak, "composite");
     pipeline->prog_present       = load_postfx_prog(pak, "present");
+    /* RCAS sharpen resolve (optional: absence -> plain bilinear present). */
+    pipeline->prog_rcas          = load_postfx_prog(pak, "rcas");
+    /* TSR temporal upscale (optional: absence -> RCAS/bilinear present). */
+    pipeline->prog_tsr           = load_postfx_prog(pak, "tsr");
     /* TAA pair (optional; absence just means r.taa is a no-op on this build). */
     pipeline->prog_motion_vec    = load_postfx_prog(pak, "motion_vec");
     pipeline->prog_taa           = load_postfx_prog(pak, "taa");
@@ -1369,6 +1419,27 @@ void jce_postfx_present(JcePostFXPipeline *pipeline,
     bgfx_set_view_name(view_id, "PostFX/Present", INT32_MAX);
     bgfx_set_texture(0, pipeline->u_texColor, pipeline->output_tex,
                      UINT32_MAX);
+
+    /* When the chain rendered below the present target (dynamic resolution),
+     * the plain present would bilinear-stretch and soften edges.  Resolve with
+     * a contrast-adaptive sharpen (RCAS/FSR1/CAS parity) instead — same quad,
+     * same view, no extra pass — sharpening harder the more we downscaled.
+     * Falls back to the plain present when RCAS isn't in the PAK or when the
+     * source is already at native resolution. */
+    if (pipeline->prog_rcas.idx != UINT16_MAX &&
+        width > 0 && height > 0 &&
+        pipeline->width  < width &&
+        pipeline->height < height) {
+        float factor = (float)pipeline->width / (float)width;   /* <1 */
+        float sharp  = (1.0f - factor) * 1.6f + 0.2f;
+        if (sharp < 0.2f) sharp = 0.2f;
+        if (sharp > 0.9f) sharp = 0.9f;
+        float p[4] = { 1.0f / (float)width, 1.0f / (float)height, sharp, 0.0f };
+        bgfx_set_uniform(pipeline->u_rcasParams, p, 1);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_rcas);
+        return;
+    }
+
     draw_fullscreen(pipeline, view_id, pipeline->prog_present);
 }
 
@@ -1376,4 +1447,166 @@ uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline)
 {
     if (!pipeline) return UINT16_MAX;
     return pipeline->output_fb.idx;
+}
+
+bool jce_postfx_upscale_resolve(JcePostFXPipeline *pipeline,
+                                uint16_t view_id,
+                                uint16_t dst_fb_idx,
+                                JceTextureHandle src,
+                                uint32_t src_w, uint32_t src_h,
+                                uint32_t out_w, uint32_t out_h,
+                                bool flip_v)
+{
+    /* Only meaningful (and only reports success) when actually upscaling with a
+     * loaded RCAS program — the caller falls back to its own bilinear display
+     * otherwise, so we deliberately do NOT draw a plain copy here (that would
+     * leave a mis-oriented/blank destination the caller might then show). */
+    if (!pipeline || src.idx == UINT16_MAX || dst_fb_idx == UINT16_MAX ||
+        pipeline->prog_rcas.idx == UINT16_MAX ||
+        src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0 ||
+        src_w >= out_w || src_h >= out_h)
+        return false;
+
+    bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)out_w, (uint16_t)out_h);
+    bgfx_set_view_frame_buffer(view_id, dst);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx_set_view_name(view_id, "PostFX/Upscale", INT32_MAX);
+
+    bgfx_texture_handle_t stex = { src.idx };
+    bgfx_set_texture(0, pipeline->u_texColor, stex, UINT32_MAX);
+
+    float factor = (float)src_w / (float)out_w;   /* <1 */
+    float sharp  = (1.0f - factor) * 1.6f + 0.2f;
+    if (sharp < 0.2f) sharp = 0.2f;
+    if (sharp > 0.9f) sharp = 0.9f;
+    float p[4] = { 1.0f / (float)out_w, 1.0f / (float)out_h, sharp,
+                   flip_v ? 1.0f : 0.0f };
+    bgfx_set_uniform(pipeline->u_rcasParams, p, 1);
+    draw_fullscreen(pipeline, view_id, pipeline->prog_rcas);
+    return true;
+}
+
+/* (Re)allocate the TSR output-res ping-pong history buffers on size change. */
+static bool ensure_tsr_buffers(JcePostFXPipeline *p, uint32_t ow, uint32_t oh)
+{
+    if (p->tsr_valid && p->tsr_ow == ow && p->tsr_oh == oh) return true;
+    for (int i = 0; i < 2; ++i) {
+        if (p->tsr_hist_fb[i].idx  != UINT16_MAX) { bgfx_destroy_frame_buffer(p->tsr_hist_fb[i]); p->tsr_hist_fb[i].idx = UINT16_MAX; }
+        if (p->tsr_hist_tex[i].idx != UINT16_MAX) { bgfx_destroy_texture(p->tsr_hist_tex[i]); p->tsr_hist_tex[i].idx = UINT16_MAX; }
+    }
+    for (int i = 0; i < 2; ++i) {
+        p->tsr_hist_tex[i] = bgfx_create_texture_2d(
+            (uint16_t)ow, (uint16_t)oh, false, 1, postfx_color_format(),
+            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+        if (p->tsr_hist_tex[i].idx == UINT16_MAX) { p->tsr_valid = false; return false; }
+        bgfx_attachment_t at; memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, p->tsr_hist_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+        p->tsr_hist_fb[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+        if (p->tsr_hist_fb[i].idx == UINT16_MAX) { p->tsr_valid = false; return false; }
+    }
+    p->tsr_ow = ow; p->tsr_oh = oh; p->tsr_ping = 0;
+    p->tsr_valid = true; p->tsr_have_history = false;   /* fresh buffers: no usable history */
+    return true;
+}
+
+/* (Re)allocate the render-res TSR camera-motion buffer on size change. */
+static bool ensure_tsr_motion(JcePostFXPipeline *p, uint32_t rw, uint32_t rh)
+{
+    if (p->tsr_motion_fb.idx != UINT16_MAX && p->tsr_mw == rw && p->tsr_mh == rh)
+        return true;
+    if (p->tsr_motion_fb.idx  != UINT16_MAX) { bgfx_destroy_frame_buffer(p->tsr_motion_fb); p->tsr_motion_fb.idx = UINT16_MAX; }
+    if (p->tsr_motion_tex.idx != UINT16_MAX) { bgfx_destroy_texture(p->tsr_motion_tex); p->tsr_motion_tex.idx = UINT16_MAX; }
+    p->tsr_motion_tex = bgfx_create_texture_2d(
+        (uint16_t)rw, (uint16_t)rh, false, 1, postfx_color_format(),
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+    if (p->tsr_motion_tex.idx == UINT16_MAX) return false;
+    bgfx_attachment_t at; memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, p->tsr_motion_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+    p->tsr_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    if (p->tsr_motion_fb.idx == UINT16_MAX) return false;
+    p->tsr_mw = rw; p->tsr_mh = rh;
+    return true;
+}
+
+uint16_t jce_postfx_tsr_resolve(JcePostFXPipeline *pipeline, uint16_t view_base,
+                                JceTextureHandle color, JceTextureHandle depth,
+                                const float *inv_view_proj,
+                                const float *prev_view_proj,
+                                JceTextureHandle ext_motion,
+                                uint32_t render_w, uint32_t render_h,
+                                uint32_t out_w, uint32_t out_h,
+                                float jitter_u, float jitter_v,
+                                float feedback, bool flip_v)
+{
+    if (!pipeline || pipeline->prog_tsr.idx == UINT16_MAX ||
+        color.idx == UINT16_MAX || render_w == 0 || render_h == 0 ||
+        out_w == 0 || out_h == 0)
+        return UINT16_MAX;
+    if (!ensure_tsr_buffers(pipeline, out_w, out_h))
+        return UINT16_MAX;
+
+    /* Motion source. Preferred: an EXTERNAL per-object velocity buffer (the
+     * scene renderer's gbuffer_vel prepass — camera AND moving/skinned geometry,
+     * so animated objects stop ghosting). Fallback: generate camera-only motion
+     * here (reconstruct world pos from depth, reproject through the previous VP).
+     * When neither is available, CLEAR to 0.5 gray = zero motion so the resolve
+     * reprojects to the same pixel (correct static view) instead of garbage. */
+    bool has_ext      = ext_motion.idx != UINT16_MAX;
+    bool motion_ready = has_ext || ensure_tsr_motion(pipeline, render_w, render_h);
+    bool gen_motion   = !has_ext && motion_ready && depth.idx != UINT16_MAX &&
+                        inv_view_proj && prev_view_proj &&
+                        pipeline->prog_motion_vec.idx != UINT16_MAX;
+    if (gen_motion) {
+        bgfx_set_uniform(pipeline->u_taaInvViewProj,  inv_view_proj,  1);
+        bgfx_set_uniform(pipeline->u_taaPrevViewProj, prev_view_proj, 1);
+        bgfx_set_view_rect(view_base, 0, 0, (uint16_t)render_w, (uint16_t)render_h);
+        bgfx_set_view_frame_buffer(view_base, pipeline->tsr_motion_fb);
+        bgfx_set_view_clear(view_base, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+        bgfx_set_view_name(view_base, "PostFX/TSR_Motion", INT32_MAX);
+        bgfx_texture_handle_t dtex = { depth.idx };
+        bgfx_set_texture(0, pipeline->u_texDepth, dtex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_base, pipeline->prog_motion_vec);
+    } else if (!has_ext && motion_ready) {
+        bgfx_set_view_rect(view_base, 0, 0, (uint16_t)render_w, (uint16_t)render_h);
+        bgfx_set_view_frame_buffer(view_base, pipeline->tsr_motion_fb);
+        bgfx_set_view_clear(view_base, BGFX_CLEAR_COLOR, 0x808080ffu, 1.0f, 0);
+        bgfx_set_view_name(view_base, "PostFX/TSR_ZeroMotion", INT32_MAX);
+        bgfx_touch(view_base);
+    }
+
+    const uint16_t v_resolve = (uint16_t)(view_base + 1);
+    const int cur  = pipeline->tsr_ping;   /* write reconstruction here */
+    const int prev = cur ^ 1;              /* read last frame's history here */
+    /* No usable history on the first frame after (re)alloc -> pure current. */
+    float fb = pipeline->tsr_have_history ? feedback : 0.0f;
+    if (fb < 0.0f) fb = 0.0f;
+    if (fb > 0.98f) fb = 0.98f;
+
+    bgfx_set_view_rect(v_resolve, 0, 0, (uint16_t)out_w, (uint16_t)out_h);
+    bgfx_set_view_frame_buffer(v_resolve, pipeline->tsr_hist_fb[cur]);
+    bgfx_set_view_clear(v_resolve, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx_set_view_name(v_resolve, "PostFX/TSR", INT32_MAX);
+
+    bgfx_texture_handle_t ctex = { color.idx };
+    /* External per-object velocity when supplied; else the internally generated
+     * (or zero-cleared) camera motion; else the history handle (degenerate OOM). */
+    bgfx_texture_handle_t mtex;
+    if (has_ext)          mtex.idx = ext_motion.idx;
+    else if (motion_ready) mtex = pipeline->tsr_motion_tex;
+    else                   mtex = pipeline->tsr_hist_tex[prev];
+    bgfx_set_texture(0, pipeline->u_texColor,   ctex, UINT32_MAX);
+    bgfx_set_texture(1, pipeline->u_texHistory, pipeline->tsr_hist_tex[prev], UINT32_MAX);
+    bgfx_set_texture(2, pipeline->u_texMotion,  mtex, UINT32_MAX);
+
+    float texel[4] = { 1.0f / (float)render_w, 1.0f / (float)render_h,
+                       1.0f / (float)out_w,    1.0f / (float)out_h };
+    float jit[4]   = { jitter_u, jitter_v, fb, flip_v ? 1.0f : 0.0f };
+    bgfx_set_uniform(pipeline->u_tsrTexel,  texel, 1);
+    bgfx_set_uniform(pipeline->u_tsrJitter, jit,   1);
+    draw_fullscreen(pipeline, v_resolve, pipeline->prog_tsr);
+
+    pipeline->tsr_ping        = prev;   /* next frame writes the other buffer */
+    pipeline->tsr_have_history = true;
+    return pipeline->tsr_hist_tex[cur].idx;
 }

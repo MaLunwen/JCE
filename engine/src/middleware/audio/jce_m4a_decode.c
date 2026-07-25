@@ -13,7 +13,11 @@
  * └─────────────────────────────────────────────────────────────┘
  *
  * Detects MP4/M4A containers via the ftyp box, parses with minimp4,
- * extracts AAC audio frames, and decodes to s16 PCM using FDK-AAC.
+ * extracts AAC audio frames, and decodes to s16 PCM.
+ *
+ * This TU owns the *container* job only; the raw AAC access-unit decode is
+ * delegated to the single fdk-aac adapter in middleware/video so that the
+ * video player and this loader share one wrapper (and one patent gate).
  */
 
 #include <jce/middleware/audio/jce_m4a_decode.h>
@@ -23,13 +27,10 @@
 #include <jce/middleware/video/jce_mp4_parser.h>
 #include <jce/os/core/jce_log.h>
 
+#include "middleware/video/jce_aac_decode.h"
 #include "os/core/jce_memory.h"
 
-#include <aacdecoder_lib.h>
 #include <string.h>
-
-/* Ensure the fdk-aac build matches our expected s16 output. */
-typedef char jce_m4a_pcm16_check_[(sizeof(INT_PCM) == sizeof(int16_t)) ? 1 : -1];
 
 #define LOG_TAG "jce_m4a"
 
@@ -94,23 +95,11 @@ bool jce_m4a_decode_to_pcm(const void *data, size_t size,
     LOG_INFO(LOG_TAG, "M4A audio: %u samples, %u Hz, %uch, codec=%s",
              atr.sample_count, atr.samplerate_hz, atr.channels, atr.codec);
 
-    /* ── Open FDK-AAC decoder ──────────────────────────────────── */
-    HANDLE_AACDECODER aac = aacDecoder_Open(TT_MP4_RAW, 1);
+    /* ── Open the shared AAC adapter (ASC from the esds box) ───── */
+    JceAacDecoder *aac = jce_aac_decoder_open(atr.decoder_config,
+                                              atr.decoder_config_bytes);
     if (!aac) {
-        LOG_ERROR(LOG_TAG, "aacDecoder_Open failed");
-        jce_mp4_parser_close(parser);
-        return false;
-    }
-
-    UCHAR *conf_array[1];
-    UINT   conf_sizes[1];
-    conf_array[0] = (UCHAR *)atr.decoder_config;
-    conf_sizes[0] = (UINT)atr.decoder_config_bytes;
-
-    AAC_DECODER_ERROR err = aacDecoder_ConfigRaw(aac, conf_array, conf_sizes);
-    if (err != AAC_DEC_OK) {
-        LOG_ERROR(LOG_TAG, "aacDecoder_ConfigRaw failed: 0x%04x", (unsigned)err);
-        aacDecoder_Close(aac);
+        LOG_ERROR(LOG_TAG, "failed to open AAC decoder for M4A track");
         jce_mp4_parser_close(parser);
         return false;
     }
@@ -125,7 +114,7 @@ bool jce_m4a_decode_to_pcm(const void *data, size_t size,
     if (est_bytes > (uint64_t)500u * 1024u * 1024u) {
         LOG_WARN(LOG_TAG, "M4A audio too large (%llu est bytes), skipping",
                  (unsigned long long)est_bytes);
-        aacDecoder_Close(aac);
+        jce_aac_decoder_close(aac);
         jce_mp4_parser_close(parser);
         return false;
     }
@@ -134,7 +123,7 @@ bool jce_m4a_decode_to_pcm(const void *data, size_t size,
     if (!pcm_buf) {
         LOG_ERROR(LOG_TAG, "out of memory for M4A decode (%llu bytes)",
                   (unsigned long long)est_bytes);
-        aacDecoder_Close(aac);
+        jce_aac_decoder_close(aac);
         jce_mp4_parser_close(parser);
         return false;
     }
@@ -168,30 +157,25 @@ bool jce_m4a_decode_to_pcm(const void *data, size_t size,
             break;
         }
 
-        /* Feed data to FDK-AAC. */
-        UCHAR *in_buf[1]  = { (UCHAR *)sbuf };
-        UINT   in_size[1] = { (UINT)copied };
-        UINT   valid       = (UINT)copied;
+        /* A single undecodable access unit must not abort the whole track. */
+        uint32_t remain  = pcm_cap - pcm_pos;
+        uint32_t written = 0;
+        if (!jce_aac_decode_frame(aac, sbuf, copied,
+                                  pcm_buf + pcm_pos, remain, &written)) {
+            continue;
+        }
 
-        err = aacDecoder_Fill(aac, in_buf, in_size, &valid);
-        if (err != AAC_DEC_OK) continue;
-
-        uint32_t remain = pcm_cap - pcm_pos;
-        err = aacDecoder_DecodeFrame(aac, (INT_PCM *)(pcm_buf + pcm_pos),
-                                      (INT)remain, 0);
-        if (err != AAC_DEC_OK) continue;
-
-        CStreamInfo *si_info = aacDecoder_GetStreamInfo(aac);
-        if (si_info && si_info->numChannels > 0 && si_info->sampleRate > 0) {
-            actual_ch = (uint32_t)si_info->numChannels;
-            actual_sr = (uint32_t)si_info->sampleRate;
-            uint32_t written = (uint32_t)si_info->frameSize * actual_ch;
-            pcm_pos += written;
+        uint32_t ch = jce_aac_decoder_get_channels(aac);
+        uint32_t sr = jce_aac_decoder_get_samplerate(aac);
+        if (ch > 0 && sr > 0) {
+            actual_ch = ch;
+            actual_sr = sr;
+            pcm_pos  += written;
         }
     }
 
     JCE_FREE(sbuf);
-    aacDecoder_Close(aac);
+    jce_aac_decoder_close(aac);
     jce_mp4_parser_close(parser);
 
     if (!ok || pcm_pos == 0 || actual_ch == 0 || actual_sr == 0) {

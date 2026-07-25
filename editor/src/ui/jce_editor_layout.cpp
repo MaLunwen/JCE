@@ -47,6 +47,7 @@ extern "C" {
 #include "core/jce_hotkeys.h"
 #include "scene/jce_editor_game_render.h"   /* jce_editor_game_render_is_mouse_captured */
 #include "core/jce_workspace.h"
+#include "panels/jce_panel_common.h"         /* multi-select duplicate / delete */
 #include "panels/jce_panel_preferences.h"
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_timer.h>
@@ -54,6 +55,7 @@ extern "C" {
 
 #include <jce/middleware/scene/jce_lod.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <cstdlib>   /* getenv (JCE_DBG_FOCUS_SCENE QA hook) */
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
 #include <stdio.h>
@@ -446,60 +448,9 @@ static void paste_scene_clipboard(void)
     }
 }
 
-static void duplicate_scene_selection(void)
-{
-    int sel_count = 0;
-    const uint32_t *sel = jce_state_get_selection(&sel_count);
-    uint32_t focused = jce_state_get_focused();
-    if (sel_count <= 0 && focused == 0)
-        return;
-
-    uint32_t src[JCE_MAX_SELECTED];
-    int n = sel_count > 0 ? sel_count : 1;
-    if (n > JCE_MAX_SELECTED)
-        n = JCE_MAX_SELECTED;
-    if (sel_count > 0) {
-        for (int i = 0; i < n; i++)
-            src[i] = sel[i];
-    } else {
-        src[0] = focused;
-    }
-
-    uint32_t dup_ids[JCE_MAX_SELECTED];
-    int dup_count = 0;
-    if (n > 1)
-        jce_state_begin_batch_edit();
-    for (int i = 0; i < n; i++) {
-        uint32_t dup = jce_state_duplicate_entity(src[i]);
-        if (dup != 0 && dup_count < JCE_MAX_SELECTED)
-            dup_ids[dup_count++] = dup;
-    }
-    if (n > 1)
-        jce_state_end_batch_edit();
-
-    if (dup_count > 0) {
-        jce_state_select_entity(dup_ids[0], false);
-        for (int i = 1; i < dup_count; i++)
-            jce_state_select_entity(dup_ids[i], true);
-        jce_editor_inspector_request_sync();
-    }
-}
-
-static void delete_scene_selection(void)
-{
-    int sel_count = 0;
-    const uint32_t *sel = jce_state_get_selection(&sel_count);
-    uint32_t focused = jce_state_get_focused();
-    if (sel_count > 0) {
-        uint32_t ids[JCE_MAX_SELECTED];
-        int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-        for (int i = 0; i < n; i++)
-            ids[i] = sel[i];
-        jce_editor_inspector_request_delete_confirm_many(ids, n);
-    } else if (focused != 0) {
-        jce_editor_inspector_request_delete_confirm(focused);
-    }
-}
+/* Duplicate / delete of the whole selection live in jce_panel_common.h
+ * (jce_panel_duplicate_selection / jce_panel_delete_selection) so the menu
+ * bar, the Hierarchy and the Scene View all run the same orchestration. */
 
 static void cmd_toggle_demo_lod_(void);
 static void cmd_pack_current_scene_(void);
@@ -593,11 +544,11 @@ static void handle_global_edit_shortcuts(void)
         return;
     }
     if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
-        duplicate_scene_selection();
+        jce_panel_duplicate_selection();
         return;
     }
     if (delete_hotkey_pressed()) {
-        delete_scene_selection();
+        jce_panel_delete_selection();
         return;
     }
     if (jce_hotkey_pressed(JCE_HK_EDIT_SELECT_ALL)) {
@@ -1305,17 +1256,23 @@ static void draw_menu_bar(void)
                 }
             }
         }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.duplicate"), "Ctrl+D")) {
-            uint32_t f = jce_state_get_focused();
-            if (f) {
-                uint32_t d = jce_state_duplicate_entity(f);
-                jce_state_select_entity(d, false);
-            }
+        /* Same body as the Ctrl+D the item advertises — it used to
+         * duplicate only the focused entity, silently ignoring the rest of
+         * a multi-selection. */
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.duplicate"), "Ctrl+D"))
+            jce_panel_duplicate_selection();
+        {
+            int sc = 0;
+            jce_state_get_selection(&sc);
+            const bool can_snap = sc > 0 || jce_state_get_focused() != 0;
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.snapToGround"),
+                                "End", false, can_snap))
+                jce_scene_view_snap_selection_to_ground();
         }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del / Backspace")) {
-            uint32_t f = jce_state_get_focused();
-            if (f) jce_editor_inspector_request_delete_confirm(f);
-        }
+        /* Likewise: the item advertises Del / Backspace, so it must offer
+         * the same whole-selection delete those keys perform. */
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del / Backspace"))
+            jce_panel_delete_selection();
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.preferences"), "Ctrl+,")) {
             bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
@@ -2345,6 +2302,14 @@ static void draw_panel_windows(void)
     }
 
     panel_phase("ed_p_hierarchy", &ed_pt);
+    /* QA-only: JCE_DBG_FOCUS_SCENE keeps the Scene View tab foregrounded so
+     * headless whole-window captures (JCE_WINCAP_*) see it instead of the
+     * Game View that imgui.ini last selected. No effect unless the env is set. */
+    static int s_dbg_focus_scene = -1;
+    if (s_dbg_focus_scene < 0)
+        s_dbg_focus_scene = getenv("JCE_DBG_FOCUS_SCENE") ? 1 : 0;
+    if (s_dbg_focus_scene) s_focus_scene_view = true;
+
     /* ── Scene View ───────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###scene_view", jce_editor_i18n("Scene"));
@@ -2363,7 +2328,7 @@ static void draw_panel_windows(void)
 
     panel_phase("ed_p_scene_view", &ed_pt);
     /* ── Game View ────────────────────────────────────────────────── */
-    if (*jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
+    if (!s_dbg_focus_scene && *jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###game_view", jce_editor_i18n("Game"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         if (s_focus_game_view) {

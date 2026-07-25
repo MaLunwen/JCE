@@ -108,6 +108,11 @@ uniform vec4 u_csmSplits;
 uniform vec4 u_csmParams;
 // Per-cascade bias scale (x..w for cascades 0..3)
 uniform vec4 u_csmBiasScales;
+// Dual shadow maps (JCE_SHADOW_DUAL): dynamic-caster atlas params.
+// x = tiles per side (2), y = 1 / dynAtlasSize, z = enabled (0/1), w = pad.
+// Atlas is a 2x2 tile grid of the 4 cascades, bound to s_shadowMap (stage 5,
+// dead under CSM); sample_csm_shadow min()s it into the static factor.
+uniform vec4 u_csmDynParams;
 
 // IBL samplers (stages 6-8)
 SAMPLERCUBE(s_irradiance, 6);
@@ -488,15 +493,19 @@ float sample_csm_shadow(int cascade,
     // Tier 0: single hard tap; the bias math above stays (it is ALU-only
     // and remains the acne defence), and the hash-rotation sin/cos is
     // skipped along with the 25-tap kernel.
+    // STATIC shadow factor `s` (this cascade's csm_tex).  Computed per filter
+    // tier, then — for dual shadow maps — min()'d with the dynamic atlas below
+    // through a SINGLE return so cascade fallthrough/blend/edge logic inherits it.
+    float s;
     if (u_shadowQuality.x < 0.5)
     {
+        // Tier 0: single hard tap.
         float depth0 = csm_sample_depth(cascade, csm_uv);
-        return (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
+        s = (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
     }
-
-    // Tier 1: unrotated 3x3 PCF (9 taps).
-    if (u_shadowQuality.x < 1.5)
+    else if (u_shadowQuality.x < 1.5)
     {
+        // Tier 1: unrotated 3x3 PCF (9 taps).
         float sum9 = 0.0;
         for (int y = -1; y <= 1; y++)
         {
@@ -507,28 +516,77 @@ float sample_csm_shadow(int cascade,
                 sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
             }
         }
-        return sum9 / 9.0;
+        s = sum9 / 9.0;
+    }
+    else
+    {
+        // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
+        // to eliminate visible grid patterns while keeping temporally stable shadows.
+        float angle = shadow_hash(world_pos) * 6.283185;
+        float rot_c = cos(angle);
+        float rot_s = sin(angle);
+
+        float sum = 0.0;
+        for (int y = -2; y <= 2; y++)
+        {
+            for (int x = -2; x <= 2; x++)
+            {
+                vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
+                vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
+                                   raw.x * rot_s + raw.y * rot_c);
+                float depth = csm_sample_depth(cascade, csm_uv + offset);
+                sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            }
+        }
+        s = sum / 25.0;
     }
 
-    // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
-    // to eliminate visible grid patterns while keeping temporally stable shadows.
-    float angle = shadow_hash(world_pos) * 6.283185;
-    float rot_c = cos(angle);
-    float rot_s = sin(angle);
-
-    float sum = 0.0;
-    for (int y = -2; y <= 2; y++)
+    // Dual shadow maps: min() with the DYNAMIC-caster atlas tile for this cascade
+    // (movers, rendered separately with the SAME cascade VP into s_shadowMap as a
+    // 2x2 tile grid).  Occluded if EITHER the static map OR the dynamic map
+    // occludes — a 3x3 PCF clamped inside the tile so it can't bleed into a
+    // neighbour cascade.  Enabled lane is 0 unless dual mode is active this frame,
+    // so the whole block is a no-op (byte-identical) otherwise.
+    if (u_csmDynParams.z > 0.5)
     {
-        for (int x = -2; x <= 2; x++)
+        float tiles = u_csmDynParams.x;            // 2.0
+        float invT  = 1.0 / tiles;
+        float col   = mod(float(cascade), tiles);
+        float row   = floor(float(cascade) / tiles);
+#if BGFX_SHADER_LANGUAGE_GLSL
+        row = tiles - 1.0 - row;                   // GL bottom-left tile-row flip
+#endif
+        vec2 org = vec2(col, row) * invT;
+        vec2 dt  = vec2_splat(u_csmDynParams.y);
+        vec2 lo  = org + dt * 0.5;
+        vec2 hi  = org + invT - dt * 0.5;
+        vec2 ctr = clamp(org + csm_uv * invT, lo, hi);
+        // Match the dynamic tap count to the STATIC filter tier so the min-combine
+        // — which runs for EVERY shadowed pixel, movers or not — costs the same as
+        // the static sample it augments.  Tier 0 (iGPU) = 1 hard tap keeps the
+        // dynamic add ~free; higher tiers use 3x3 PCF for a soft mover edge.
+        if (u_shadowQuality.x < 0.5)
         {
-            vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
-            vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
-                               raw.x * rot_s + raw.y * rot_c);
-            float depth = csm_sample_depth(cascade, csm_uv + offset);
-            sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            float dd = texture2D(s_shadowMap, ctr).r;
+            s = min(s, (csm_z - depth_bias > dd) ? 0.0 : 1.0);
+        }
+        else
+        {
+            float dsum = 0.0;
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    vec2 t = clamp(org + csm_uv * invT + vec2(float(dx), float(dy)) * dt,
+                                   lo, hi);
+                    float dd = texture2D(s_shadowMap, t).r;
+                    dsum += (csm_z - depth_bias > dd) ? 0.0 : 1.0;
+                }
+            }
+            s = min(s, dsum * (1.0 / 9.0));
         }
     }
-    return sum / 25.0;
+    return s;
 }
 
 vec3 safe_normalize_vec3(vec3 value, vec3 fallback)

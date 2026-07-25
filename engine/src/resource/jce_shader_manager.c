@@ -10,7 +10,6 @@
 
 #include "os/core/jce_memory.h"
 
-#include <bgfx/c99/bgfx.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -50,10 +49,7 @@ void jce_shader_manager_destroy(JceShaderManager *mgr)
 {
     if (!mgr) return;
     for (int i = 0; i < mgr->count; i++) {
-        if (jce_shader_valid(mgr->entries[i].handle)) {
-            bgfx_program_handle_t p = { mgr->entries[i].handle.idx };
-            bgfx_destroy_program(p);
-        }
+        jce_shader_program_destroy(mgr->entries[i].handle);
     }
     JCE_FREE(mgr);
 }
@@ -101,8 +97,7 @@ void jce_shader_manager_release(JceShaderManager *mgr, const char *name)
     for (int i = 0; i < mgr->count; i++) {
         if (strcmp(mgr->entries[i].name, name) == 0) {
             if (--mgr->entries[i].ref_count <= 0) {
-                bgfx_program_handle_t p = { mgr->entries[i].handle.idx };
-                bgfx_destroy_program(p);
+                jce_shader_program_destroy(mgr->entries[i].handle);
                 mgr->entries[i] = mgr->entries[--mgr->count];
                 LOG_INFO(LOG_TAG, "released shader '%s'", name);
             }
@@ -156,8 +151,7 @@ bool jce_shader_manager_reload(JceShaderManager *mgr, const char *name)
 
         /* Destroy old program; bgfx tolerates destruction of in-flight
            handles (it defers to the end of the current frame). */
-        bgfx_program_handle_t old = { mgr->entries[i].handle.idx };
-        bgfx_destroy_program(old);
+        jce_shader_program_destroy(mgr->entries[i].handle);
 
         mgr->entries[i].handle = nh;
         mgr->generation++;
@@ -209,18 +203,11 @@ int jce_shader_manager_attach_watcher(JceShaderManager *mgr,
     }
     mgr->watcher = watcher;
 
-    /* Backend suffix selection mirrors jce_shaders.c:shader_suffix(). */
-    const char *sfx = NULL;
-    bgfx_renderer_type_t rt = bgfx_get_renderer_type();
-    switch (rt) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: sfx = "dx11"; break;
-    case BGFX_RENDERER_TYPE_VULKAN:     sfx = "spv";  break;
-    case BGFX_RENDERER_TYPE_OPENGL:     sfx = "glsl"; break;
-    case BGFX_RENDERER_TYPE_OPENGLES:   sfx = "essl"; break;
-    case BGFX_RENDERER_TYPE_METAL:      sfx = "mtl";  break;
-    default: return 0;
-    }
+    /* Watch paths must name the exact .bin the loader would pick, so the
+       suffix comes from the renderer rather than a second copy of the
+       backend→suffix table. */
+    const char *sfx = jce_shaders_backend_suffix();
+    if (!sfx) return 0;
 
     int registered = 0;
     char path[MAX_PATH_LEN];

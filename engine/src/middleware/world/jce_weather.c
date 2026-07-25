@@ -12,10 +12,10 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 #include <jce/middleware/world/jce_weather.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -39,48 +39,10 @@ struct JceWeatherSystem {
 
 typedef struct { float pos[2]; float uv[2]; } QuadV;
 
-static const char *weather_backend_suffix(void)
-{
-    switch (bgfx_get_renderer_type()) {
-    case BGFX_RENDERER_TYPE_DIRECT3D11:
-    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
-    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
-    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
-    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
-    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
-    default:                            return NULL;
-    }
-}
-
-static bgfx_shader_handle_t weather_load_shader(const JcePakArchive *pak,
-                                                 const char *name,
-                                                 const char *sfx)
-{
-    bgfx_shader_handle_t invalid = { UINT16_MAX };
-    char path[256];
-    snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-    /* Engine shaders are baked into jce_renderer's embedded pak, not the scene/
-     * editor pak (which ships zero shaders).  Try the caller pak, then fall back
-     * to the embedded engine-shader pak (mirrors load_single / decals). */
-    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
-    if (!asset) {
-        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
-        if (fb && fb != pak) { asset = jce_pak_find(fb, path); if (asset) pak = fb; }
-    }
-    if (!asset) { LOG_ERROR(LOG_TAG, "shader not found: %s", path); return invalid; }
-    void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return invalid;
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) { JCE_FREE(buf); return invalid; }
-    const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)asset->original_size);
-    JCE_FREE(buf);
-    return bgfx_create_shader(mem);
-}
-
 JceWeatherSystem *jce_weather_create(const JceWeatherDesc *desc)
 {
     if (!desc || !desc->pak) return NULL;
-    const char *sfx = weather_backend_suffix();
+    const char *sfx = jce_shader_backend_suffix();
     if (!sfx) return NULL;
 
     JceWeatherSystem *w = (JceWeatherSystem *)JCE_CALLOC(1, sizeof(*w));
@@ -104,8 +66,8 @@ JceWeatherSystem *jce_weather_create(const JceWeatherDesc *desc)
     w->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)),
                                       BGFX_BUFFER_NONE);
 
-    bgfx_shader_handle_t vsh = weather_load_shader(desc->pak, "vs_weather", sfx);
-    bgfx_shader_handle_t fsh = weather_load_shader(desc->pak, "fs_weather", sfx);
+    bgfx_shader_handle_t vsh = jce_shader_load_from_pak(desc->pak, "vs_weather", sfx, LOG_TAG);
+    bgfx_shader_handle_t fsh = jce_shader_load_from_pak(desc->pak, "fs_weather", sfx, LOG_TAG);
     if (vsh.idx == UINT16_MAX || fsh.idx == UINT16_MAX) {
         if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
         if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);

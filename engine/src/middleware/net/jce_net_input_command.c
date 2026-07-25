@@ -23,45 +23,9 @@
 
 #include <jce/middleware/net/jce_net_input_command.h>
 
+#include "jce_net_bytes.h"
+
 #include <string.h>
-
-/* ================================================================== */
-/* Little-endian fixed-layout primitives                               */
-/* (local copies — symmetric with jce_rpc.c / jce_replication.c)       */
-/* ================================================================== */
-
-static void put_u32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)( v        & 0xFFu);
-    p[1] = (uint8_t)((v >> 8)  & 0xFFu);
-    p[2] = (uint8_t)((v >> 16) & 0xFFu);
-    p[3] = (uint8_t)((v >> 24) & 0xFFu);
-}
-
-static uint32_t get_u32(const uint8_t *p)
-{
-    return  (uint32_t)p[0]
-         | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16)
-         | ((uint32_t)p[3] << 24);
-}
-
-/* Floats travel as their IEEE-754 bit pattern in a u32, byte-ordered LE.
- * memcpy avoids the strict-aliasing UB of a float*->uint32_t* cast. */
-static void put_f32(uint8_t *p, float v)
-{
-    uint32_t bits;
-    memcpy(&bits, &v, sizeof bits);
-    put_u32(p, bits);
-}
-
-static float get_f32(const uint8_t *p)
-{
-    uint32_t bits = get_u32(p);
-    float v;
-    memcpy(&v, &bits, sizeof v);
-    return v;
-}
 
 /* ================================================================== */
 /* PURE codec                                                          */
@@ -74,10 +38,10 @@ uint32_t jce_input_command_encode(const JceInputCommand *cmd,
         return 0u;
 
     uint8_t *p = (uint8_t *)dst;
-    put_u32(p +  0, cmd->tick);
-    put_f32(p +  4, cmd->walk_x);
-    put_f32(p +  8, cmd->walk_z);
-    put_f32(p + 12, cmd->speed_mult);
+    jce_net_put_u32(p +  0, cmd->tick);
+    jce_net_put_f32(p +  4, cmd->walk_x);
+    jce_net_put_f32(p +  8, cmd->walk_z);
+    jce_net_put_f32(p + 12, cmd->speed_mult);
     p[16] = cmd->jump   ? 1u : 0u;   /* normalise to 0/1 on the wire */
     p[17] = cmd->sprint ? 1u : 0u;
     p[18] = 0u;                      /* reserved pad */
@@ -93,10 +57,10 @@ uint32_t jce_input_command_decode(const void *src, uint32_t size,
 
     const uint8_t *p = (const uint8_t *)src;
     memset(out, 0, sizeof *out);
-    out->tick       = get_u32(p +  0);
-    out->walk_x     = get_f32(p +  4);
-    out->walk_z     = get_f32(p +  8);
-    out->speed_mult = get_f32(p + 12);
+    out->tick       = jce_net_get_u32(p +  0);
+    out->walk_x     = jce_net_get_f32(p +  4);
+    out->walk_z     = jce_net_get_f32(p +  8);
+    out->speed_mult = jce_net_get_f32(p + 12);
     out->jump       = p[16] ? 1u : 0u;
     out->sprint     = p[17] ? 1u : 0u;
     /* p[18], p[19] are reserved padding — ignored. */

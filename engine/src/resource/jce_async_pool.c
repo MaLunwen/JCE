@@ -6,8 +6,8 @@
  * requests each frame via jce_pool_drain().
  *
  * Worker decoding:
- *   TEXTURE → jce_pak_decompress + IMG_Load_IO → SDL_Surface (RGBA8)
- *   AUDIO   → jce_pak_decompress + miniaudio decode → PCM s16
+ *   TEXTURE → jce_pak_decompress + jce_image (RGBA8) → SDL_Surface
+ *   AUDIO   → jce_pak_decompress + jce_audio_decode_cpu_memory → PCM
  *   MESH    → jce_pak_decompress (raw bytes for main-thread GPU upload)
  *   RAW     → jce_pak_decompress (pass-through)
  */
@@ -17,6 +17,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/renderer/jce_image.h>    /* the one image-decode service */
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 
@@ -24,16 +25,20 @@
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef JCE_NO_AUDIO
-#include <miniaudio.h>
+#include <jce/middleware/audio/jce_audio.h>
 #endif
 
 #define LOG_TAG "jce_pool"
+
+/* Free a request's decoded payload with the allocator that produced it
+ * (raw SDL_Surface vs JCE_MALLOC'd buffer).  Defined below; forward-declared
+ * here because jce_pool_destroy (above the definition) also uses it. */
+static void request_payload_free(JceAsyncRequest *req);
 
 /* ================================================================== */
 /* Pool internals                                                      */
@@ -71,13 +76,23 @@ struct JceAsyncPool {
 /* Worker: texture decode                                              */
 /* ================================================================== */
 
-static SDL_Surface *ensure_rgba8(SDL_Surface *src)
+/* Wrap engine-owned RGBA8 pixels in an SDL_Surface.
+ *
+ * The raw-texture payload contract with the consumer (jce_asset_loaders.c
+ * finalize_texture_inner, and request_payload_free below) is "decoded_data is
+ * an SDL_Surface*", so the decode result is copied into one here.  It cannot
+ * be handed over zero-copy: SDL_CreateSurfaceFrom does not take ownership and
+ * an SDL_Surface has no release callback, so SDL_DestroySurface would leak the
+ * engine buffer.  One memcpy per decoded texture, on a worker thread. */
+static SDL_Surface *surface_from_rgba8(const uint8_t *rgba8, int w, int h)
 {
-    if (!src) return NULL;
-    if (src->format == SDL_PIXELFORMAT_RGBA32) return src;
-    SDL_Surface *conv = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGBA32);
-    SDL_DestroySurface(src);
-    return conv;
+    SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32);
+    if (!surf) return NULL;
+    const size_t row_bytes = (size_t)w * 4u;
+    for (int y = 0; y < h; y++)
+        memcpy((uint8_t *)surf->pixels + (size_t)y * (size_t)surf->pitch,
+               rgba8 + (size_t)y * row_bytes, row_bytes);
+    return surf;
 }
 
 static void decode_texture_inner(JceAsyncRequest *req)
@@ -152,27 +167,36 @@ static void decode_texture_inner(JceAsyncRequest *req)
         return;
     }
 
-    /* ── Raw path: PNG/JPG → SDL_Surface ── */
-    SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)asset->original_size);
-    if (!io) {
-        JCE_FREE(buf);
-        return;
-    }
-
-    SDL_Surface *surf = IMG_Load_IO(io, true); /* closes io */
+    /* ── Raw path: PNG/JPG → jce_image → RGBA8 → SDL_Surface ──
+     *
+     * Decoding through the service rather than calling IMG_Load_IO here is
+     * what keeps this worker off SDL_image's libpng path for 16-bit grayscale
+     * PNGs, which heap-overruns on that class (STATUS_HEAP_CORRUPTION).  The
+     * synchronous loader and the cooker already routed around it; this path
+     * did not, so a game that streamed such a height map in asynchronously
+     * corrupted the heap on a worker thread.  The service also guarantees
+     * RGBA8 + a tight stride, so no separate convert step is needed. */
+    int img_w = 0, img_h = 0;
+    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(
+        buf, (uint64_t)asset->original_size, &img_w, &img_h);
     JCE_FREE(buf);
 
-    if (!surf) {
-        LOG_ERROR(LOG_TAG, "IMG_Load_IO failed: %s", req->path);
+    if (!rgba8) {
+        /* The codec-level reason is logged by the image service itself. */
+        LOG_ERROR(LOG_TAG, "image decode failed: %s", req->path);
         return;
     }
 
-    surf = ensure_rgba8(surf);
-    if (surf) {
-        req->decoded_data = surf;
-        req->decoded_size = (size_t)(surf->w * surf->h * 4);
-        req->success = true;
+    SDL_Surface *surf = surface_from_rgba8(rgba8, img_w, img_h);
+    jce_image_free_rgba8(rgba8);
+    if (!surf) {
+        LOG_ERROR(LOG_TAG, "SDL_CreateSurface failed: %s", req->path);
+        return;
     }
+
+    req->decoded_data = surf;
+    req->decoded_size = (size_t)img_w * (size_t)img_h * 4u;
+    req->success = true;
 }
 
 static void decode_texture(JceAsyncRequest *req)
@@ -214,125 +238,50 @@ static void decode_audio_inner(JceAsyncRequest *req)
         uint32_t pcm_size;
     } AudioResult;
 
-    /* ── Cooked path: .jceasset AUDIO_INFO + AUDIO_PCM → direct copy ── */
-    if (jce_asset_is_cooked(buf, n)) {
-        JceAssetView view;
-        if (!jce_asset_open(&view, buf, n)) {
-            JCE_FREE(buf);
-            return;
-        }
+    /* Both representations — a cooked .jceasset (AUDIO_INFO + AUDIO_PCM) and a
+     * raw encoded clip — go through the audio module's canonical decoder.  It
+     * touches no JceAudio state, so it is safe on this worker thread, and it
+     * is the only decode path that has the Opus custom backend and the
+     * M4A/AAC route registered: the private ma_decoder this function used to
+     * drive silently failed on .opus/.m4a that jce_audio_load() played fine
+     * (audit A2-AUDIO-DECODE-DRIFT). */
+    bool cooked = jce_asset_is_cooked(buf, n);
 
-        const JceAssetChunkEntry *info_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
-        const JceAssetChunkEntry *pcm_c =
-            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
-
-        if (!info_c || !pcm_c) {
-            JCE_FREE(buf);
-            return;
-        }
-
-        JceAssetAudioInfo ainfo;
-        if (jce_asset_chunk_data(&view, info_c,
-                                  &ainfo, sizeof(ainfo)) == 0) {
-            JCE_FREE(buf);
-            return;
-        }
-
-        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
-        AudioResult *result = JCE_MALLOC(sizeof(AudioResult) + pcm_size);
-        if (!result) { JCE_FREE(buf); return; }
-
-        result->sample_rate     = ainfo.sample_rate;
-        result->channels        = ainfo.channels;
-        result->bits_per_sample = ainfo.bits_per_sample;
-        result->pcm_size        = pcm_size;
-
-        if (jce_asset_chunk_data(&view, pcm_c,
-                                  (uint8_t *)result + sizeof(AudioResult),
-                                  pcm_size) == 0) {
-            JCE_FREE(result);
-            JCE_FREE(buf);
-            return;
-        }
-
-        JCE_FREE(buf);
-        req->decoded_data = result;
-        req->decoded_size = sizeof(AudioResult) + pcm_size;
-        req->is_cooked = true;
-        req->success = true;
-        return;
-    }
-
-    /* ── Raw path: OGG/WAV → miniaudio decode → PCM s16 ── */
-    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
-    ma_decoder decoder;
-
-    if (ma_decoder_init_memory(buf, n, &cfg, &decoder) != MA_SUCCESS) {
-        LOG_ERROR(LOG_TAG, "audio decode failed: %s", req->path);
-        JCE_FREE(buf);
-        return;
-    }
-
-    ma_uint64 total_frames = 0;
-    ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
-
-    ma_uint32 channels    = decoder.outputChannels;
-    ma_uint32 sample_rate = decoder.outputSampleRate;
-    void *pcm = NULL;
-
-    if (total_frames == 0) {
-        size_t alloc_frames = 256 * 1024;
-        size_t used_frames  = 0;
-        pcm = JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
-        if (!pcm) { ma_decoder_uninit(&decoder); JCE_FREE(buf); return; }
-
-        for (;;) {
-            if (used_frames + 4096 > alloc_frames) {
-                alloc_frames *= 2;
-                void *tmp = JCE_REALLOC(pcm,
-                    alloc_frames * channels * sizeof(int16_t));
-                if (!tmp) {
-                    JCE_FREE(pcm);
-                    ma_decoder_uninit(&decoder);
-                    JCE_FREE(buf);
-                    return;
-                }
-                pcm = tmp;
-            }
-            ma_uint64 read = 0;
-            ma_decoder_read_pcm_frames(&decoder,
-                (int16_t *)pcm + used_frames * channels, 4096, &read);
-            if (read == 0) break;
-            used_frames += (size_t)read;
-        }
-        total_frames = (ma_uint64)used_frames;
-    } else {
-        pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
-        if (!pcm) { ma_decoder_uninit(&decoder); JCE_FREE(buf); return; }
-
-        ma_uint64 frames_read = 0;
-        ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &frames_read);
-        total_frames = frames_read;
-    }
-
-    ma_decoder_uninit(&decoder);
+    JceAudioCpu *cpu = jce_audio_decode_cpu_memory(buf, n, req->path);
     JCE_FREE(buf);
+    if (!cpu) {
+        LOG_ERROR(LOG_TAG, "audio decode failed: %s", req->path);
+        return;
+    }
 
-    uint32_t pcm_size = (uint32_t)(total_frames * channels * sizeof(int16_t));
+    const void *pcm         = NULL;
+    uint32_t    pcm_size    = 0;
+    uint32_t    sample_rate = 0;
+    uint16_t    channels    = 0;
+    uint16_t    bits        = 0;
+    if (!jce_audio_cpu_get_pcm(cpu, &pcm, &pcm_size, &channels,
+                               &sample_rate, &bits)) {
+        LOG_ERROR(LOG_TAG, "audio decoded to no samples: %s", req->path);
+        jce_audio_cpu_free(cpu);
+        return;
+    }
 
+    /* Copy out of the JceAudioCpu: decoded_data is a single JCE_MALLOC'd block
+     * (header + PCM) released by request_payload_free / the loader, whereas
+     * `cpu` owns its buffer and must be handed back to jce_audio_cpu_free. */
     AudioResult *result = JCE_MALLOC(sizeof(AudioResult) + pcm_size);
-    if (!result) { JCE_FREE(pcm); return; }
+    if (!result) { jce_audio_cpu_free(cpu); return; }
 
     result->sample_rate     = sample_rate;
-    result->channels        = (uint16_t)channels;
-    result->bits_per_sample = 16;
+    result->channels        = channels;
+    result->bits_per_sample = bits;
     result->pcm_size        = pcm_size;
     memcpy((uint8_t *)result + sizeof(AudioResult), pcm, pcm_size);
-    JCE_FREE(pcm);
+    jce_audio_cpu_free(cpu);
 
     req->decoded_data = result;
     req->decoded_size = sizeof(AudioResult) + pcm_size;
+    req->is_cooked = cooked;
     req->success = true;
 #endif
 }
@@ -409,6 +358,13 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
 #endif
     }
 
+    /* A private scheduler, deliberately not jce_thread_pool_shared().  Every
+     * task here is a whole-asset decode — zstd inflate, PNG/JPEG decode,
+     * Opus/AAC decode — that runs for tens to hundreds of milliseconds, and
+     * the shared pool's waits are cooperative: the main thread's per-frame
+     * jce_thread_pool_parallel_for() would pick one of these off the queue and
+     * finish it before its own cull could complete.  Isolation is the point;
+     * the extra threads are the price.  See the policy note in jce_thread.h. */
     pool->tp = jce_thread_pool_create((int)num_workers);
     if (!pool->tp) {
         JCE_FREE(pool);
@@ -425,6 +381,9 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
     LOG_INFO(LOG_TAG, "async pool: %u workers (enkiTS)", num_workers);
     return pool;
 }
+
+/* Defined below (request teardown section); destroy paths free payloads too. */
+static void request_payload_free(JceAsyncRequest *req);
 
 void jce_pool_destroy(JceAsyncPool *pool)
 {
@@ -453,7 +412,7 @@ void jce_pool_destroy(JceAsyncPool *pool)
         InFlight *next = inf->next;
         if (inf->task) jce_task_free(inf->task);
         if (inf->req) {
-            if (inf->req->decoded_data) JCE_FREE(inf->req->decoded_data);
+            request_payload_free(inf->req);
             JCE_FREE(inf->req);
         }
         JCE_FREE(inf);
@@ -468,7 +427,7 @@ void jce_pool_destroy(JceAsyncPool *pool)
     if (pool->done_lock) jce_mutex_unlock(pool->done_lock);
     while (req) {
         JceAsyncRequest *next = req->next;
-        if (req->decoded_data) JCE_FREE(req->decoded_data);
+        request_payload_free(req);
         JCE_FREE(req);
         req = next;
     }
@@ -599,11 +558,31 @@ JceAsyncRequest *jce_pool_drain(JceAsyncPool *pool, uint32_t max_count)
     return result;
 }
 
+/* Free a request's decoded payload with the allocator that produced it.
+ * The RAW texture path stores an SDL_Surface* (SDL heap) in decoded_data
+ * (decode_texture_inner: surface_from_rgba8); every other path — cooked texture,
+ * audio, mesh, model — stores a JCE_MALLOC'd buffer.  Releasing an
+ * SDL_Surface with JCE_FREE (mi_free) is a cross-allocator free: it
+ * corrupts the heap wherever the SDL->jce alloc bridge is absent (the
+ * editor never installs jce_alloc_hook_sdl), and even when the bridge IS
+ * active it leaks surface->pixels and the surface's SDL properties.
+ * jce_pool_free_request / jce_pool_destroy reach this on the drop paths
+ * (stale-generation result discarded on scene switch, pool teardown with
+ * loads in flight); only finalize_texture_inner freed it correctly before. */
+static void request_payload_free(JceAsyncRequest *req)
+{
+    if (!req || !req->decoded_data) return;
+    if (req->type == JCE_ASYNC_TEXTURE && !req->is_cooked)
+        SDL_DestroySurface((SDL_Surface *)req->decoded_data);
+    else
+        JCE_FREE(req->decoded_data);
+    req->decoded_data = NULL;
+}
+
 void jce_pool_free_request(JceAsyncRequest *req)
 {
     if (!req) return;
-    if (req->decoded_data)
-        JCE_FREE(req->decoded_data);
+    request_payload_free(req);
     JCE_FREE(req);
 }
 

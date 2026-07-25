@@ -6,6 +6,7 @@
  * `jce_scene_renderer_get_postfx`.
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
@@ -122,6 +123,7 @@ static const CustomLook kLooks[] = {
     { "pixel",      false, 1, { 4.0f,6.0f,0.6f,0 } },
     { "psx",        false, 1, { 3.0f,32.0f,0.7f,0.5f } },
     { "watercolor", false, 2, { 2.0f,0.4f,0.06f,0.18f, 0.25f,0,0,0 } },
+    { "aquarelle",  false, 3, { 4.0f,8.0f,1.15f,0.4f,  0.05f,0.5f,0.12f,0.2f, 1.0f,1.5f,0,0 } },
     { "comic",      true,  2, { 1.0f,0.28f,5.0f,30.0f, 3.0f,1.35f,0.55f,0 } },
     { "blueprint",  true,  4, { 1.0f,0.22f,22.0f,1.0f,  0.35f,0.45f,5.0f,0, 0.055f,0.16f,0.42f,0, 0.80f,0.90f,1.0f,0 } },
 };
@@ -347,16 +349,9 @@ void jce_editor_panel_postfx(void)
      * redirects to that workbench and requests the Post-FX tab.
      * Symbol kept so menu/hotkey entries registered against
      * JCE_PANEL_POSTFX keep working. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
-    if (ls_vis) *ls_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###lighting_settings",
-             jce_editor_i18n("panel.lighting.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_lighting_settings_request_tab(1);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_POSTFX,
+                                        JCE_PANEL_LIGHTING_SETTINGS,
+                                        "panel.lighting.title",
+                                        "lighting_settings"))
+        jce_panel_lighting_settings_request_tab(1);
 }

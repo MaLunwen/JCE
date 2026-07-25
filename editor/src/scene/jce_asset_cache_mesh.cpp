@@ -51,19 +51,10 @@ static void mesh_async_worker_main(void *arg)
     (void)arg;
     for (;;) {
         MeshLoadRequest req;
-        {
-            jce_mutex_lock(s_mesh_async.mutex);
-            while (!(s_mesh_async.stop || !s_mesh_async.pending.empty()))
-                jce_cond_wait(s_mesh_async.cv, s_mesh_async.mutex);
-
-            if (s_mesh_async.stop && s_mesh_async.pending.empty()) {
-                jce_mutex_unlock(s_mesh_async.mutex);
-                break;
-            }
-
-            bool got = mesh_pop_best_request_locked(&req);
-            jce_mutex_unlock(s_mesh_async.mutex);
-            if (!got) continue;
+        if (!async_loader_worker_take(
+                s_mesh_async,
+                [&req] { return mesh_pop_best_request_locked(&req); })) {
+            break;
         }
 
         MeshLoadResult result = {};
@@ -76,9 +67,7 @@ static void mesh_async_worker_main(void *arg)
                                         found_path,
                                         sizeof(found_path))) {
                 result.success = false;
-
-                JceMutexGuard lock(s_mesh_async.mutex);
-                s_mesh_async.completed.push_back(std::move(result));
+                async_loader_publish(s_mesh_async, result);
                 continue;
             }
             req.file_path = found_path;
@@ -86,9 +75,7 @@ static void mesh_async_worker_main(void *arg)
 
         result.success = jce_editor_model_load_cpu_file(req.file_path.c_str(),
                                                         &result.cpu);
-
-        JceMutexGuard lock(s_mesh_async.mutex);
-        s_mesh_async.completed.push_back(std::move(result));
+        async_loader_publish(s_mesh_async, result);
     }
 }
 
@@ -99,18 +86,8 @@ void mesh_async_start(void)
     if (s_mesh_async.running)
         return;
 
-    if (!s_mesh_async.mutex) s_mesh_async.mutex = jce_mutex_create();
-    if (!s_mesh_async.cv)    s_mesh_async.cv    = jce_cond_create();
-
-    s_mesh_async.discovery = 0;
-    s_mesh_async.generation = 1;
-    s_mesh_async.stop = false;
-    s_mesh_async.pending.clear();
-    s_mesh_async.completed.clear();
-
-    s_mesh_async.worker = jce_thread_create(mesh_async_worker_main, NULL,
-                                            "scene_mesh_async");
-    s_mesh_async.running = true;
+    async_loader_start(s_mesh_async, mesh_async_worker_main,
+                       "scene_mesh_async");
 }
 
 void mesh_async_stop(void)
@@ -118,40 +95,22 @@ void mesh_async_stop(void)
     if (!s_mesh_async.running)
         return;
 
-    {
-        JceMutexGuard lock(s_mesh_async.mutex);
-        s_mesh_async.stop = true;
-    }
-    jce_cond_broadcast(s_mesh_async.cv);
-
-    if (s_mesh_async.worker) {
-        jce_thread_join(s_mesh_async.worker);
-        s_mesh_async.worker = NULL;
-    }
-
-    for (auto &res : s_mesh_async.completed)
+    async_loader_stop(s_mesh_async, [](MeshLoadResult &res) {
         jce_editor_model_free_cpu_data(&res.cpu);
-
-    s_mesh_async.pending.clear();
-    s_mesh_async.completed.clear();
-    s_mesh_async.running = false;
-
-    if (s_mesh_async.cv)    { jce_cond_destroy(s_mesh_async.cv);    s_mesh_async.cv = NULL; }
-    if (s_mesh_async.mutex) { jce_mutex_destroy(s_mesh_async.mutex); s_mesh_async.mutex = NULL; }
+    });
 }
 
 void mesh_async_begin_new_generation(void)
 {
-    JceMutexGuard lock(s_mesh_async.mutex);
-    s_mesh_async.generation++;
-    s_mesh_async.discovery = 0;
-    s_mesh_async.pending.clear();
+    /* Results the worker already published stay queued: they hold raw CPU
+     * mesh data that only the drain releases, and it drops them anyway on
+     * the generation check. */
+    async_loader_begin_new_generation(s_mesh_async, false);
 }
 
 uint64_t mesh_async_current_generation(void)
 {
-    JceMutexGuard lock(s_mesh_async.mutex);
-    return s_mesh_async.generation;
+    return async_loader_generation(s_mesh_async);
 }
 
 void mesh_async_queue_request(const char *mesh_path,
@@ -161,51 +120,26 @@ void mesh_async_queue_request(const char *mesh_path,
     if (!s_mesh_async.running || !mesh_path)
         return;
 
-    bool inserted = false;
-    {
-        JceMutexGuard lock(s_mesh_async.mutex);
-        for (MeshLoadRequest &req : s_mesh_async.pending) {
-            if (req.generation == s_mesh_async.generation
-                && req.mesh_path == mesh_path) {
-                if (priority_dist2 < req.priority_dist2)
-                    req.priority_dist2 = priority_dist2;
-                inserted = true;
-                break;
-            }
-        }
-
-        if (!inserted) {
+    async_loader_queue_request(
+        s_mesh_async,
+        /* A pending request for the same mesh absorbs this one, keeping the
+         * nearest distance so the worker picks it up sooner. */
+        [&](MeshLoadRequest &req) {
+            if (req.mesh_path != mesh_path)
+                return false;
+            if (priority_dist2 < req.priority_dist2)
+                req.priority_dist2 = priority_dist2;
+            return true;
+        },
+        [&](uint64_t generation, uint32_t order) {
             MeshLoadRequest req;
             req.mesh_path = mesh_path;
             req.file_path = file_path ? file_path : "";
             req.priority_dist2 = priority_dist2;
-            req.order = s_mesh_async.discovery++;
-            req.generation = s_mesh_async.generation;
-            s_mesh_async.pending.push_back(std::move(req));
-            inserted = true;
-        }
-    }
-
-    if (inserted)
-        jce_cond_signal(s_mesh_async.cv);
-}
-
-static void mesh_async_take_completed(std::vector<MeshLoadResult> *out)
-{
-    if (!out) return;
-
-    JceMutexGuard lock(s_mesh_async.mutex);
-    out->swap(s_mesh_async.completed);
-}
-
-static void mesh_async_push_back_completed(std::vector<MeshLoadResult> *results)
-{
-    if (!results || results->empty()) return;
-
-    JceMutexGuard lock(s_mesh_async.mutex);
-    for (MeshLoadResult &res : *results)
-        s_mesh_async.completed.push_back(std::move(res));
-    results->clear();
+            req.order = order;
+            req.generation = generation;
+            return req;
+        });
 }
 
 /* ── Mesh cache entry management ────────────────────────────────── */
@@ -308,79 +242,70 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
 
 /* ── Mesh finalization + cache lookup ───────────────────────────── */
 
-void mesh_finalize_completed_loads(void)
+static AsyncFinalizeAction mesh_finalize_result(MeshLoadResult &res,
+                                                uint64_t generation,
+                                                bool budget_left)
 {
-    std::vector<MeshLoadResult> completed;
-    mesh_async_take_completed(&completed);
-    if (completed.empty())
-        return;
-
-    const uint64_t generation = mesh_async_current_generation();
-    uint32_t finalized = 0;
-    std::vector<MeshLoadResult> deferred;
-    deferred.reserve(completed.size());
-
-    for (MeshLoadResult &res : completed) {
-        if (res.generation != generation) {
-            jce_editor_model_free_cpu_data(&res.cpu);
-            continue;
-        }
-
-        int idx = find_mesh_cache_entry(res.mesh_path.c_str());
-        if (idx < 0) {
-            /* The cache key was lost (e.g. path buffer was too small at
-             * queue time, or the cache was cleared mid-flight). Log so a
-             * future regression surfaces immediately rather than as a
-             * silent fallback to the procedural cube shape. */
-            LOG_WARN(LOG_TAG,
-                "mesh finalize: no cache entry for completed load: %s",
-                res.mesh_path.c_str());
-            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                "Mesh load completed but cache entry was lost: %s",
-                res.mesh_path.c_str());
-            jce_editor_model_free_cpu_data(&res.cpu);
-            continue;
-        }
-
-        if (finalized >= MESH_FINALIZE_BUDGET_PER_FRAME) {
-            deferred.push_back(std::move(res));
-            continue;
-        }
-
-        s_cache.mesh_cache[idx].requested = false;
-
-        if (!res.success) {
-            s_cache.mesh_cache[idx].failed = true;
-            LOG_WARN(LOG_TAG, "mesh async load failed: %s",
-                     res.mesh_path.c_str());
-            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                "Mesh import failed: %s (Assimp could not parse the file or path resolution failed)",
-                res.mesh_path.c_str());
-            jce_editor_model_free_cpu_data(&res.cpu);
-            continue;
-        }
-
-        JceMesh *mesh = jce_mesh_create(res.cpu.vertices,
-                                        res.cpu.vertex_count,
-                                        res.cpu.indices,
-                                        res.cpu.index_count);
+    if (res.generation != generation) {
         jce_editor_model_free_cpu_data(&res.cpu);
-
-        if (!mesh) {
-            s_cache.mesh_cache[idx].failed = true;
-            LOG_WARN(LOG_TAG, "mesh finalize failed: %s", res.mesh_path.c_str());
-            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                "Mesh GPU upload failed: %s (vertex/index buffer creation rejected)",
-                res.mesh_path.c_str());
-            continue;
-        }
-
-        s_cache.mesh_cache[idx].mesh = mesh;
-        finalized++;
+        return ASYNC_FINALIZE_DROPPED;
     }
 
-    if (!deferred.empty())
-        mesh_async_push_back_completed(&deferred);
+    int idx = find_mesh_cache_entry(res.mesh_path.c_str());
+    if (idx < 0) {
+        /* The cache key was lost (e.g. path buffer was too small at
+         * queue time, or the cache was cleared mid-flight). Log so a
+         * future regression surfaces immediately rather than as a
+         * silent fallback to the procedural cube shape. */
+        LOG_WARN(LOG_TAG,
+            "mesh finalize: no cache entry for completed load: %s",
+            res.mesh_path.c_str());
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "Mesh load completed but cache entry was lost: %s",
+            res.mesh_path.c_str());
+        jce_editor_model_free_cpu_data(&res.cpu);
+        return ASYNC_FINALIZE_DROPPED;
+    }
+
+    if (!budget_left)
+        return ASYNC_FINALIZE_DEFERRED;
+
+    s_cache.mesh_cache[idx].requested = false;
+
+    if (!res.success) {
+        s_cache.mesh_cache[idx].failed = true;
+        LOG_WARN(LOG_TAG, "mesh async load failed: %s",
+                 res.mesh_path.c_str());
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Mesh import failed: %s (Assimp could not parse the file or path resolution failed)",
+            res.mesh_path.c_str());
+        jce_editor_model_free_cpu_data(&res.cpu);
+        return ASYNC_FINALIZE_DROPPED;
+    }
+
+    JceMesh *mesh = jce_mesh_create(res.cpu.vertices,
+                                    res.cpu.vertex_count,
+                                    res.cpu.indices,
+                                    res.cpu.index_count);
+    jce_editor_model_free_cpu_data(&res.cpu);
+
+    if (!mesh) {
+        s_cache.mesh_cache[idx].failed = true;
+        LOG_WARN(LOG_TAG, "mesh finalize failed: %s", res.mesh_path.c_str());
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Mesh GPU upload failed: %s (vertex/index buffer creation rejected)",
+            res.mesh_path.c_str());
+        return ASYNC_FINALIZE_DROPPED;
+    }
+
+    s_cache.mesh_cache[idx].mesh = mesh;
+    return ASYNC_FINALIZE_APPLIED;
+}
+
+void mesh_finalize_completed_loads(void)
+{
+    async_loader_drain_completed(s_mesh_async, MESH_FINALIZE_BUDGET_PER_FRAME,
+                                 mesh_finalize_result);
 }
 
 JceMesh *asset_cache_get_mesh(const char *mesh_path, const float *world_pos)

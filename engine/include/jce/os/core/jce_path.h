@@ -8,7 +8,7 @@
  *
  * Companion to jce_filesystem.h: this header replaces std::filesystem::path
  * arithmetic for client / editor / engine code that wants to stay in C99
- * and avoid pulling in a C++17 STL dependency.
+ * and avoid pulling in a C++20 STL dependency.
  */
 
 #ifndef JCE_PATH_H
@@ -30,12 +30,48 @@ JCE_EXTERN_C_BEGIN
 JCE_API bool jce_path_to_canonical(char *out, size_t out_size,
                                    const char *path);
 
+/* In-place form of the above: rewrite '\\' to '/' inside `s`.
+ *
+ * Exists because the copying form can FAIL (buffer overflow) while callers that
+ * already own a mutable buffer cannot fail and should not have to check.  That
+ * mismatch is why several modules hand-rolled `for (; *s; ++s) if (*s=='\\')
+ * *s='/';` instead of calling jce_path_to_canonical.  NULL is a no-op. */
+JCE_API void JCE_CALL jce_path_canonicalise_inplace(char *s);
+
 /* True if `path` already uses only '/' separators. */
 JCE_API bool JCE_CALL jce_path_is_canonical(const char *path);
 
 /* True if `path` starts with a drive letter (Windows: "C:") or '/'
    (POSIX-style absolute).  Empty / NULL is false. */
 JCE_API bool JCE_CALL jce_path_is_absolute(const char *path);
+
+/* ------------------------------------------------------------------ */
+/* Asset keys: host path -> PAK-relative lookup key                    */
+/* ------------------------------------------------------------------ */
+
+/* Derive the PAK-relative, forward-slash asset key from an absolute or
+ * mixed-separator host path — e.g.
+ *   "D:/proj/resources/assets\models\city\building-b.glb"
+ *     -> "models/city/building-b.glb"
+ *
+ * Writes a canonicalised copy of `path` into `buf`, then returns a pointer
+ * INTO `buf` at the start of the relative remainder, or NULL when no safe
+ * key can be derived (unrecognised layout, empty remainder, or `buf` too
+ * small).  The returned pointer is valid for as long as `buf` is.
+ *
+ * Recognition is by layout marker: everything after "resources/assets/" or
+ * "resources/_cooked/", else everything from a known top-level asset folder
+ * ("/models/", "/scenes/", ...) onward.  Deliberately a cheap string scan
+ * with no allocation and no filesystem access — call it on the PAK-miss
+ * path, not per frame.
+ *
+ * Single authority on purpose (audit: C2-DUP-KEY-DERIVE): this scan used to
+ * exist as two byte-identical copies of the marker tables, in the glTF
+ * loader and the scene component deserialiser.  Two copies of an asset-key
+ * rule silently disagree the moment one grows a folder the other lacks, and
+ * the symptom is "this asset loads from the editor but not from the PAK". */
+JCE_API const char *jce_path_asset_key(const char *path,
+                                       char *buf, size_t buf_size);
 
 /* ------------------------------------------------------------------ */
 /* Decomposition: parent / filename / stem / extension                */

@@ -7,6 +7,7 @@
 #include "scene/jce_editor_game_render.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h"  /* finalize() — GPU-upload async loads */
+#include "scene/jce_editor_viewport_common.h"    /* plumbing shared with Scene View */
 #include "gizmo/jce_gizmo_compound_collider.h"   /* draw fitted compound colliders */
 #include "core/jce_editor_state.h"
 
@@ -24,7 +25,6 @@ extern "C" {
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
-#include <jce/renderer/jce_shaders.h>  /* JceShaderSet for the occlusion proxy */
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_taa.h>
 #include <jce/renderer/jce_views.h>
@@ -35,16 +35,10 @@ extern "C" {
 #include <jce/runtime/jce_game_module.h>
 #include <jce/application/jce_runtime.h>  /* UI widget → script dispatch in Play */
 extern void jce_game_module_set_active_scene(JceScene *scene);
-
-/* Lighting panel accessors — defined in jce_panel_lighting_settings.cpp */
-bool jce_editor_lighting_get_fog_enabled(void);
-void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
-void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
 
-#include <cstring>
 #include <cmath>
-#include <cstdlib>   /* getenv — JCE_DISABLE_OCCLUSION A/B + safety toggle */
+#include <cstdlib>   /* getenv — JCE_KPI_OCCLUSION_LOG forensic toggle */
 
 #define LOG_TAG "game_render"
 
@@ -67,10 +61,11 @@ struct GameRenderState {
      * ENGINE scene renderer with the scene view but renders in its own pass with
      * its own camera, so it needs its OWN culler instance (per-entity visibility
      * history must not be shared with the scene-view camera).  Uses a DISTINCT
-     * proxy view id (253) from the scene-view culler (254) so the two never
-     * clobber each other's depth-only proxy pass when both panels render in the
-     * same bgfx frame.  NULL when JCE_DISABLE_OCCLUSION is set or hardware
-     * queries are unsupported (silent always-visible fallback). */
+     * proxy view id (253) from the scene-view culler (which keeps the config
+     * default, 252) so the two never clobber each other's depth-only proxy pass
+     * when both panels render in the same bgfx frame.  NULL when
+     * JCE_DISABLE_OCCLUSION is set or hardware queries are unsupported (silent
+     * always-visible fallback). */
     JceOcclusionCuller    *occlusion_culler  = nullptr;
 
     /* TAA (game view): own jitter/history state so the first-person view also
@@ -186,28 +181,17 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
      * scene-view).  Opt-OUT via JCE_DISABLE_OCCLUSION=1 for A/B measurement and
      * as a safety hatch (mirrors JCE_DISABLE_WCACHE / JCE_STREAM_SYNC).  Degrades
      * silently to always-visible when hardware queries are unsupported. */
-    {
-        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
-        bool occlusion_off = (dis && dis[0] && dis[0] != '0');
-        if (occlusion_off) {
-            LOG_INFO(LOG_TAG,
-                     "[init] JCE_DISABLE_OCCLUSION set — game-view occlusion culling OFF");
-        } else {
-            JceShaderSet oc_shaders;
-            memset(&oc_shaders, 0, sizeof(oc_shaders));
-            JceShaderHandle ch = jce_renderer_get_program_color(renderer);
-            oc_shaders.color.idx = ch.idx;
-
-            JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
-            oc_cfg.query_pool_share_count = 2;
-            /* Distinct proxy view from the scene-view culler (254) so both can
-             * run in the same bgfx frame without clobbering each other. */
-            oc_cfg.view_id = 253;
-            g.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
-            if (!g.occlusion_culler)
-                LOG_WARN(LOG_TAG,
-                         "[init] occlusion culler creation failed (game-view culling disabled)");
-        }
+    if (jce_editor_viewport_occlusion_disabled()) {
+        LOG_INFO(LOG_TAG,
+                 "[init] JCE_DISABLE_OCCLUSION set — game-view occlusion culling OFF");
+    } else {
+        /* Proxy view 253 — distinct from the scene-view culler's so both can
+         * run in the same bgfx frame without clobbering each other. */
+        g.occlusion_culler =
+            jce_editor_viewport_create_occlusion_culler(renderer, 253);
+        if (!g.occlusion_culler)
+            LOG_WARN(LOG_TAG,
+                     "[init] occlusion culler creation failed (game-view culling disabled)");
     }
 
     return true;
@@ -396,22 +380,9 @@ bool jce_editor_game_render_screenshot(const char *path)
         return false;
     }
 
-    uint16_t source = g.postfx_output_tex;
-    int yflip = 1;
-    if (source == UINT16_MAX) {
-        source = jce_offscreen_target_get_color_texture(g.bridge);
-        yflip = jce_renderer_origin_bottom_left() ? 1 : 0;
-    }
-    if (source == UINT16_MAX)
-        return false;
-
-    /* +24: after the postfx chain (+18 worst case), the postfx→bridge
-     * composite (+21) and the canvas-UI overlay (+22), so the readback sees
-     * the fully composited frame of the SAME bgfx frame. */
-    const uint16_t blit_view = static_cast<uint16_t>(
-        jce_offscreen_target_get_view_id(g.bridge) + JCE_VIEW_POST_BASE + 24u);
-    return jce_renderer_readback_capture_submit(
-        source, blit_view, g.render_width, g.render_height, path, yflip);
+    return jce_editor_viewport_screenshot_submit(
+        g.bridge, jce_offscreen_target_get_view_id(g.bridge),
+        g.postfx_output_tex, g.render_width, g.render_height, path);
 }
 
 int jce_editor_game_render_capture_poll(void)
@@ -473,6 +444,14 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
     /* Per-frame tick (only when actually PLAYING, not PAUSED). */
     if (play_state == 1 /*PLAYING*/ && g.module_inited && mod) {
+        /* Re-point the module at the CURRENT scene every frame.  The active
+         * scene was pinned at module-init (rising edge above); if the editor
+         * scene has since been swapped or recreated (scene load / project
+         * switch mid-Play), that pinned pointer now dangles and mod->draw ->
+         * jce_scene_update would dereference freed memory (ACCESS_VIOLATION at
+         * jce_scene.c scene_drop_world_cache_frame).  `scene` is this frame's
+         * jce_state_get_scene(), already null-checked above, so it is valid. */
+        jce_game_module_set_active_scene(scene);
         if (mod->update) mod->update(frame_dt, mod->user_data);
         if (mod->draw)   mod->draw(&g.svc, mod->user_data);
     }
@@ -574,18 +553,12 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     cfg.view_mode = JCE_SCENE_VIEW_SHADED;
 
-    /* The SSAO/SSR offscreen targets and the screen-space AO sampling UV must
-     * match the ACTUAL panel resolution.  The scene viewport sets these
-     * (jce_editor_scene_render.cpp), but the game viewport previously left them
-     * 0, so the SSAO target + u_ssaoParams texel size defaulted to 1920x1080
-     * while the colour pass rendered at the real panel size — the PBR shader
-     * then sampled AO at misregistered UVs (gl_FragCoord * 1/1920,1/1080),
-     * producing a scaled/offset, 1-frame-late grey AO smear that trails moving
-     * skinned characters (the "透明果冻状" jelly ghost).  Sizing them to the
-     * panel fixes the misregistration. */
-    cfg.viewport_width  = width;
-    cfg.viewport_height = height;
-    cfg.viewport_id     = 0;   /* Game viewport slot (Scene = 1): own TAA prev camera */
+    /* Bridge FBO, panel resolution, volumetric fog, SSR and GI — the plumbing
+     * that must be identical on both editor render paths (see
+     * jce_editor_viewport_common.h). */
+    jce_editor_viewport_apply_shared_config(&cfg, g.bridge, width, height);
+
+    cfg.viewport_id = 0;   /* Game viewport slot (Scene = 1): own TAA prev camera */
 
     /* The editor's Game View is meant to preview "what the player
      * would see", so always draw the skybox / sprites and never inject
@@ -593,46 +566,15 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     cfg.on_after_sky    = nullptr;
     cfg.on_after_sky_ud = nullptr;
 
-    cfg.frustum_culling = true;
-
     /* Two-pass GPU-query occlusion culling (Play / game-view).  Mirrors the
      * scene-view: the renderer drives begin_frame / entity_visible / submit_query
      * internally from this pointer.  NULL when JCE_DISABLE_OCCLUSION is set or
      * hardware queries are unsupported (always-visible fallback). */
     cfg.occlusion_culler = g.occlusion_culler;
-    /* Game-view also renders into the offscreen bridge FBO — bind the occlusion
-     * proxy view to it so its depth test reads the depth the color pass wrote
-     * (else the offscreen path's queries hit the backbuffer → inert/false-cull). */
-    cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(g.bridge);
 
-    /* ── Lighting settings from the editor Lighting panel ──────────
-     * Apply the same ambient override and volumetric fog that the scene
-     * viewport uses so both viewports reflect lighting panel changes. */
-    {
-        float amb_color[3];
-        float amb_intensity = 0.15f;
-        jce_editor_lighting_get_ambient(amb_color, &amb_intensity);
-        jce_scene_renderer_set_ambient_override(engine_sr, amb_color, amb_intensity);
-    }
-
-    cfg.fog_enabled = jce_editor_lighting_get_fog_enabled();
-    if (cfg.fog_enabled) {
-        jce_editor_lighting_get_fog_params(&cfg.fog);
-        cfg.fog_depth_tex_handle =
-            jce_offscreen_target_get_depth_texture(g.bridge);
-        cfg.fog_rt_width  = (int)width;
-        cfg.fog_rt_height = (int)height;
-    } else {
-        cfg.fog_depth_tex_handle = UINT16_MAX;
-        cfg.fog_rt_width  = 0;
-        cfg.fog_rt_height = 0;
-    }
-
-    /* SSR: reflect the bridge's lit color RT (gated on the scene's ssr_enabled). */
-    cfg.ssr_color_tex_handle = jce_offscreen_target_get_color_texture(g.bridge);
-    /* GI L1: same lit RT feeds the dynamic probe gather (SSR-twin lesson —
-     * every cfg-dependent effect must be wired on BOTH editor render paths). */
-    cfg.gi_color_tex_handle = cfg.ssr_color_tex_handle;
+    /* Ambient override from the editor Lighting panel — applied on both
+     * viewports so panel changes reach whichever one renders. */
+    jce_editor_viewport_apply_ambient_override(engine_sr);
 
     /* Focus-bounded entity collection ("draw distance"): only entities within
      * cull_radius (horizontal) of the play camera are collected, so every
@@ -676,21 +618,10 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         }
     }
 
-    /* Composite volumetric fog (mirrors scene view path). */
-    if (cfg.fog_enabled) {
-        uint16_t fog_composite_view = (uint16_t)(base + 16);
-        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(g.bridge);
-        jce_scene_renderer_composite_fog(engine_sr, fog_composite_view, dst_fb);
-    }
-
-    /* Composite SSR reflections (no-op unless SSR was active this frame).
-     * base+19 (after the base+18 ray-march); free between the game UI (base+17)
-     * and postfx (base+20). */
-    {
-        uint16_t ssr_composite_view = (uint16_t)(base + 19);
-        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(g.bridge);
-        jce_scene_renderer_composite_ssr(engine_sr, ssr_composite_view, dst_fb);
-    }
+    /* Composite volumetric fog (base+16) and SSR (base+19) back over the bridge
+     * — same passes, same offsets as the scene view. */
+    jce_editor_viewport_composite_fog_ssr(engine_sr, g.bridge, base,
+                                          cfg.fog_enabled);
 
     /* ── PostFX ─────────────────────────────────────────────────────
      * Sync enabled flags and params from the shared scene renderer
@@ -702,38 +633,12 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         JcePostFXPipeline *shared_pfx =
             jce_scene_renderer_get_postfx(engine_sr);
         if (shared_pfx) {
-            /* Mirror enabled state. */
-            bool any_effect = false;
-            for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
-                bool en = jce_postfx_is_enabled(shared_pfx, (JcePostFXType)i);
-                jce_postfx_enable(g.postfx, (JcePostFXType)i, en);
-                if (en) any_effect = true;
-            }
-            /* Mirror params. */
-            JcePostFXParams pfx_params;
-            jce_postfx_get_params(shared_pfx, &pfx_params);
-            jce_postfx_set_params(g.postfx, &pfx_params);
-
-            /* Mirror the data-driven custom pass (shader name + params). */
-            char  cust_name[64]  = {0};
-            bool  cust_depth     = false;
-            float cust_params[JCE_POSTFX_CUSTOM_PARAMS * 4];
-            jce_postfx_get_custom_shader(shared_pfx, cust_name,
-                                         (int)sizeof(cust_name), &cust_depth);
-            int cust_count = jce_postfx_get_custom_params(
-                shared_pfx, cust_params, JCE_POSTFX_CUSTOM_PARAMS);
-            jce_postfx_set_custom_shader(g.postfx, cust_name, cust_depth);
-            jce_postfx_set_custom_params(g.postfx, cust_params, cust_count);
-
-            /* Mirror Stage-1a.5 postfx finish (tonemap-op / LUT / bloom). */
-            jce_postfx_set_tonemap_op(g.postfx, jce_postfx_get_tonemap_op(shared_pfx));
-            jce_postfx_set_bloom_knee(g.postfx, jce_postfx_get_bloom_knee(shared_pfx));
-            jce_postfx_set_bloom_quality(g.postfx, jce_postfx_get_bloom_quality(shared_pfx));
-            {
-                JceTexture lut; int ln; float ls;
-                jce_postfx_get_lut(shared_pfx, &lut, &ln, &ls);
-                jce_postfx_set_lut(g.postfx, lut, ln, ls);  /* shares the 3D handle */
-            }
+            /* Replay the shared pipeline's authorable look onto the game view's
+             * own pipeline.  Single conversion — see
+             * jce_editor_viewport_postfx_mirror for what it does and does NOT
+             * copy (view base / chain size / TAA stay per-viewport). */
+            jce_editor_viewport_postfx_mirror(g.postfx, shared_pfx);
+            bool any_effect = jce_editor_viewport_postfx_any_effect(shared_pfx);
 
             /* TAA (game view): bind the shared renderer's per-object velocity
              * buffer as the motion source so animated/skinned geometry stops
@@ -762,23 +667,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         }
     }
 
-    /* Fold the tone-mapped PostFX output back into the bridge so the canvas
-     * UI (drawn next) lands AFTER post-fx — the shipped runtime's
-     * scene→postfx→UI compositing order.  The bridge then holds the final
-     * LDR frame, so display and deterministic captures read the bridge and
-     * match the standalone game pixel-for-pixel (modulo content).  The
-     * composite view sits past the postfx chain's worst case (+18). */
-    bool postfx_composited = false;
-    if (g.postfx_output_tex != UINT16_MAX) {
-        const uint16_t comp_view =
-            (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE + 21);
-        jce_offscreen_target_composite_texture(
-            g.bridge, comp_view, g.postfx_output_tex,
-            (uint16_t)width, (uint16_t)height,
-            jce_renderer_origin_bottom_left());
+    /* Fold the tone-mapped PostFX output back into the bridge so the canvas UI
+     * (drawn next) lands AFTER post-fx, matching the standalone game
+     * pixel-for-pixel (modulo content). */
+    const bool postfx_composited = jce_editor_viewport_composite_postfx(
+        g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, width, height);
+    if (postfx_composited)
         g.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
-        postfx_composited = true;
-    }
 
     /* ── ECS-UI (Canvas) overlay ────────────────────────────────────
      * Draw Canvas/UIImage/UIText/UIButton on top of the rendered game
@@ -787,9 +682,8 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * UI, matching the runtime); without PostFX it draws right after the
      * scene color (base) and fog composite (base+16). */
     if (g.ui_canvas && scene) {
-        uint16_t ui_view = postfx_composited
-            ? (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE + 22)
-            : (uint16_t)(GAME_VIEW_BASE + 17);
+        uint16_t ui_view = jce_editor_viewport_ui_overlay_view(GAME_VIEW_BASE,
+                                                               postfx_composited);
         uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(g.bridge);
         const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,

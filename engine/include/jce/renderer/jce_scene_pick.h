@@ -9,7 +9,6 @@
 #ifndef JCE_SCENE_PICK_H
 #define JCE_SCENE_PICK_H
 
-#include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_pick_id.h>
 #include <jce/renderer/jce_scene_renderer.h>
@@ -18,6 +17,12 @@
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
+
+/* Entity ids are spelled uint64_t here rather than JceEntity: this is a
+ * renderer header and must not pull <jce/middleware/scene/jce_scene.h> in
+ * just to name that typedef (JceEntity IS uint64_t, so callers pass their
+ * JceEntity values through unchanged).  JceScene / JceCamera are declared
+ * by <jce/renderer/jce_scene_renderer.h> above and only used by pointer. */
 
 typedef struct JceScenePickPass JceScenePickPass;
 
@@ -35,7 +40,7 @@ typedef struct JceScenePickDesc {
 } JceScenePickDesc;
 
 typedef struct JceScenePickResult {
-    JceEntity entity;      /* 0 = no object at the requested pixel */
+    uint64_t  entity;      /* JceEntity; 0 = no object at the requested pixel */
     uint32_t  x;
     uint32_t  y;
     uint32_t  frame_index;
@@ -88,7 +93,7 @@ JCE_API bool jce_scene_pick_request_rect(JceScenePickPass *pass,
  * true exactly once when the result becomes available (an empty rect => true
  * with *out_count == 0). */
 JCE_API bool jce_scene_pick_poll_rect(JceScenePickPass *pass,
-                                      JceEntity *out_ids, uint32_t max_ids,
+                                      uint64_t *out_ids, uint32_t max_ids,
                                       uint32_t *out_count);
 
 JCE_EXTERN_C_END

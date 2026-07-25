@@ -13,6 +13,7 @@ extern "C" {
 #include <jce/os/core/jce_log.h>
 }
 #include "core/jce_assetdb.h"
+#include "panels/jce_panel_common.h"
 
 #include <imgui.h>
 
@@ -42,25 +43,6 @@ struct PickerState {
 };
 
 PickerState g_pk;
-
-bool icontains(const char *hay, const char *needle)
-{
-    if (!needle || !needle[0]) return true;
-    if (!hay) return false;
-    size_t hn = strlen(hay), nn = strlen(needle);
-    if (nn > hn) return false;
-    for (size_t i = 0; i + nn <= hn; ++i) {
-        size_t k = 0;
-        for (; k < nn; ++k) {
-            char a = hay[i + k], b = needle[k];
-            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-            if (a != b) break;
-        }
-        if (k == nn) return true;
-    }
-    return false;
-}
 
 const char *kind_label_i18n(int kind)
 {
@@ -183,7 +165,7 @@ void jce_editor_asset_picker_draw(void)
         int k = (int)jce_assetdb_kind_at(i);
         if (g_pk.kind_filter != 0 && k != g_pk.kind_filter) continue;
         const char *p = jce_assetdb_path_at(i);
-        if (!p || !icontains(p, g_pk.search)) continue;
+        if (!p || !jce_panel_filter_match_ci(p, g_pk.search)) continue;
         filtered.push_back(i);
     }
 

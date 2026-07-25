@@ -146,6 +146,10 @@ bool jce_renderer_is_egl_hung(void) { return false; }
 
 struct JceRenderer {
     bool is_fallback;
+    /* NullRHI: bgfx NOOP backend, no window (dedicated-server / headless).
+     * Render entry points early-out like is_fallback so nothing is submitted,
+     * but resource/scene calls that create bgfx handles stay valid no-ops. */
+    bool headless;
     SDL_Renderer *sdl_renderer;
 
     bgfx_program_handle_t program;          /* color (pos+color) */
@@ -261,11 +265,11 @@ static void apply_transient_limits(bgfx_init_t *init)
     if (low_mem) {
         /* 2x the bgfx defaults (6/2): headroom over a shipped game's HUD
          * without the developer-box editor sizing.  Saves ~48MB vs 32/8. */
-        init->limits.transientVbSize = 12u * 1024u * 1024u;
-        init->limits.transientIbSize =  4u * 1024u * 1024u;
+        init->limits.maxTransientVbSize = 12u * 1024u * 1024u;
+        init->limits.maxTransientIbSize =  4u * 1024u * 1024u;
     } else {
-        init->limits.transientVbSize = 32u * 1024u * 1024u;  /* (default 6) */
-        init->limits.transientIbSize =  8u * 1024u * 1024u;  /* (default 2) */
+        init->limits.maxTransientVbSize = 32u * 1024u * 1024u;  /* (default 6) */
+        init->limits.maxTransientIbSize =  8u * 1024u * 1024u;  /* (default 2) */
     }
 
     /* Encoder pool for multi-threaded command recording (JCE_PARALLEL_SUBMIT).
@@ -526,9 +530,37 @@ static bool s_fbo_capture_pending = false;
 
 static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint32_t _width, uint32_t _height, uint32_t _pitch,
+                                 bgfx_texture_format_t _format,
                                  const void *_data, uint32_t _size, bool _yflip)
 {
     (void)_this;
+
+    /* bgfx delivers the captured pixels in the source surface's NATIVE channel
+       order: BGRA8 on D3D11/D3D12/Vulkan/Metal, but RGBA8 on OpenGL / OpenGL ES
+       (glReadPixels). Unconditionally treating the data as BGRA8 swapped the
+       red and blue channels in every screenshot taken on the GL backend.
+       Honour the source format bgfx reports (>= 1.146); if it is neither known
+       8-bit form, fall back to the active renderer type. */
+    bool src_is_rgba;
+    switch (_format) {
+    case BGFX_TEXTURE_FORMAT_RGBA8: src_is_rgba = true;  break;
+    case BGFX_TEXTURE_FORMAT_BGRA8: src_is_rgba = false; break;
+    default: {
+        bgfx_renderer_type_t rt = bgfx_get_renderer_type();
+        src_is_rgba = (rt == BGFX_RENDERER_TYPE_OPENGL ||
+                       rt == BGFX_RENDERER_TYPE_OPENGLES);
+        break;
+    }
+    }
+    {
+        static bool s_ss_fmt_logged = false;
+        if (!s_ss_fmt_logged) {
+            s_ss_fmt_logged = true;
+            LOG_INFO(LOG_TAG, "screenshot channel order: bgfx fmt=%d -> %s",
+                     (int)_format, src_is_rgba ? "RGBA8 (no R/B swap)"
+                                               : "BGRA8 (R/B swap)");
+        }
+    }
 
     /* Impostor-bake FBO readback: deliver raw RGBA8 (alpha preserved) to the
        one-shot sink instead of writing a file.  bgfx delivers BGRA8 with a row
@@ -542,11 +574,20 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                     const uint8_t *srow = src + (size_t)y * _pitch;
                     uint8_t       *drow = rgba + (size_t)y * _width * 4u;
                     for (uint32_t x = 0; x < _width; ++x) {
-                        /* BGRA8 -> RGBA8 */
-                        drow[x * 4 + 0] = srow[x * 4 + 2];
-                        drow[x * 4 + 1] = srow[x * 4 + 1];
-                        drow[x * 4 + 2] = srow[x * 4 + 0];
-                        drow[x * 4 + 3] = srow[x * 4 + 3];
+                        /* Emit tightly-packed RGBA8 for the consumer, swapping
+                           R/B only when the source is BGRA (D3D/VK); a GL source
+                           is already RGBA. */
+                        if (src_is_rgba) {
+                            drow[x * 4 + 0] = srow[x * 4 + 0];
+                            drow[x * 4 + 1] = srow[x * 4 + 1];
+                            drow[x * 4 + 2] = srow[x * 4 + 2];
+                            drow[x * 4 + 3] = srow[x * 4 + 3];
+                        } else {
+                            drow[x * 4 + 0] = srow[x * 4 + 2];
+                            drow[x * 4 + 1] = srow[x * 4 + 1];
+                            drow[x * 4 + 2] = srow[x * 4 + 0];
+                            drow[x * 4 + 3] = srow[x * 4 + 3];
+                        }
                     }
                 }
                 s_fbo_capture_sink.fn(s_fbo_capture_sink.ud, rgba, _width,
@@ -560,14 +601,38 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
         return;
     }
 
-    /* Recording frame: route pixels to the capture sink, write no file. */
+    /* Recording frame: route pixels to the capture sink, write no file. The
+       WebM sink consumes BGRA8; a GL source hands us RGBA8, so swap R/B into a
+       scratch buffer first (D3D/VK are already BGRA and pass through). This is
+       the backbuffer recording path (JCE_CAPTURE_SENTINEL); the editor's normal
+       recording reads an RGBA16F FBO and converts explicitly elsewhere. */
     if (_filePath && strcmp(_filePath, JCE_CAPTURE_SENTINEL) == 0) {
         if (s_capture_active && _data && _width && _height) {
+            const void *frame_data = _data;
+            uint8_t    *swz = NULL;
+            if (src_is_rgba) {
+                swz = (uint8_t *)JCE_MALLOC((size_t)_size);
+                if (swz) {
+                    const uint8_t *s = (const uint8_t *)_data;
+                    for (uint32_t y = 0; y < _height; ++y) {
+                        const uint8_t *srow = s   + (size_t)y * _pitch;
+                        uint8_t       *drow = swz + (size_t)y * _pitch;
+                        for (uint32_t x = 0; x < _width; ++x) {
+                            drow[x * 4 + 0] = srow[x * 4 + 2];
+                            drow[x * 4 + 1] = srow[x * 4 + 1];
+                            drow[x * 4 + 2] = srow[x * 4 + 0];
+                            drow[x * 4 + 3] = srow[x * 4 + 3];
+                        }
+                    }
+                    frame_data = swz;
+                }
+            }
             if (s_capture_sink.begin)
                 s_capture_sink.begin(s_capture_sink.ud, _width, _height, _pitch,
                                      _yflip ? 1 : 0);
             if (s_capture_sink.frame)
-                s_capture_sink.frame(s_capture_sink.ud, _data, _size);
+                s_capture_sink.frame(s_capture_sink.ud, frame_data, _size);
+            if (swz) JCE_FREE(swz);
         }
         s_capture_shot_pending = false;
         return;
@@ -598,12 +663,14 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
 
     bool ok = false;
     if (_data && _filePath && _width && _height) {
-        /* bgfx delivers the backbuffer as BGRA8.  Wrap it (respecting the
-           row pitch), drop the undefined backbuffer alpha by converting to
-           RGB24, flip when the backend reports bottom-up data, then encode by
-           file extension (.png default, .bmp optional). */
+        /* Wrap the raw pixels in their native channel order (BGRA8 on D3D/VK,
+           RGBA8 on GL — see src_is_rgba above), respecting the row pitch; drop
+           the undefined backbuffer alpha by converting to RGB24, flip when the
+           backend reports bottom-up data, then encode by file extension
+           (.png default, .bmp optional). */
         SDL_Surface *src = SDL_CreateSurfaceFrom((int)_width, (int)_height,
-            SDL_PIXELFORMAT_BGRA32, (void *)(uintptr_t)_data, (int)_pitch);
+            src_is_rgba ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_BGRA32,
+            (void *)(uintptr_t)_data, (int)_pitch);
         if (src) {
             SDL_Surface *rgb = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGB24);
             SDL_DestroySurface(src);
@@ -809,7 +876,7 @@ static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
         slot->staging = bgfx_create_texture_2d(w, h, false, 1,
             BGFX_TEXTURE_FORMAT_RGBA16F,
             BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
-            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
         if (!BGFX_HANDLE_IS_VALID(slot->staging))
             return false;
         slot->pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u); /* RGBA16F */
@@ -830,7 +897,7 @@ static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
     slot->yflip = yflip;
     slot->path[0] = '\0';
     if (mode == 0) snprintf(slot->path, sizeof slot->path, "%s", path);
-    slot->ready_frame = bgfx_read_texture(slot->staging, slot->pixels, 0);
+    slot->ready_frame = bgfx_read_texture(slot->staging, slot->pixels, 0, 0);
     slot->w = w; slot->h = h;
     slot->seq = s_rb_seq_submit++;
     slot->state = 1;
@@ -1066,6 +1133,45 @@ static const bgfx_renderer_type_t *get_platform_fallback_chain(void)
 
 /* -- Lifecycle ------------------------------------------------------ */
 
+/* JCE_BACKEND=auto|d3d11|d3d12|vulkan|opengl|gles|metal|noop — overrides the
+ * caller-selected backend (same diagnostic env family as JCE_FORCE_FALLBACK).
+ * Primary consumer: tools/render_parity.py, which boots the SAME binary on
+ * several backends and pixel-compares the output to catch backend-divergent
+ * shader/render behavior (the class of bug where a raw mat3 ctor flipped TBN
+ * on GLSL only) without touching any per-user config.
+ *
+ * Resolved BEFORE the native-window handle is acquired so the windowless NOOP
+ * backend is reachable (dependency audit P0 `headless-forced-window-init`). */
+static int resolve_backend_choice(int cfg_backend)
+{
+    int backend_choice = cfg_backend;
+    const char *bv = getenv("JCE_BACKEND");
+    if (bv && bv[0]) {
+        char   low[16];
+        size_t bi;
+        for (bi = 0; bi + 1 < sizeof(low) && bv[bi]; bi++)
+            low[bi] = (char)((bv[bi] >= 'A' && bv[bi] <= 'Z')
+                             ? bv[bi] + ('a' - 'A') : bv[bi]);
+        low[bi] = '\0';
+        if      (strcmp(low, "auto")   == 0) backend_choice = JCE_BACKEND_AUTO;
+        else if (strcmp(low, "d3d11")  == 0) backend_choice = JCE_BACKEND_D3D11;
+        else if (strcmp(low, "d3d12")  == 0) backend_choice = JCE_BACKEND_D3D12;
+        else if (strcmp(low, "vulkan") == 0) backend_choice = JCE_BACKEND_VULKAN;
+        else if (strcmp(low, "opengl") == 0 || strcmp(low, "gl") == 0)
+            backend_choice = JCE_BACKEND_OPENGL;
+        else if (strcmp(low, "gles") == 0 || strcmp(low, "opengles") == 0)
+            backend_choice = JCE_BACKEND_OPENGLES;
+        else if (strcmp(low, "metal")  == 0) backend_choice = JCE_BACKEND_METAL;
+        else if (strcmp(low, "noop")   == 0) backend_choice = JCE_BACKEND_NOOP;
+        else
+            LOG_WARN(LOG_TAG, "JCE_BACKEND=%s not recognized — ignored", bv);
+        if (backend_choice != cfg_backend)
+            LOG_WARN(LOG_TAG,
+                "DEBUG TOGGLE: JCE_BACKEND=%s -> backend override", bv);
+    }
+    return backend_choice;
+}
+
 JceRenderer *jce_renderer_create(JceWindow *win,
                                   const JceRendererConfig *cfg)
 {
@@ -1089,30 +1195,45 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         }
     }
 
-    /* Retrieve native window handle.
-     * On iOS the native handle may become available slightly after window
-     * creation, so retry briefly before giving up. */
-    JceNativeWindow nw;
-    memset(&nw, 0, sizeof(nw));
-    for (int i = 0; i < 120; i++) {
-        jce_window_get_native(win, &nw);
-        if (nw.nwh) break;
-        SDL_PumpEvents();
-        jce_thread_sleep_ms(16);
-    }
-
-    if (!nw.nwh) {
-        LOG_ERROR(LOG_TAG, "native window handle is NULL");
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "JCE",
-            "Native window not ready", NULL);
-        return NULL;
-    }
+    /* Resolve the backend BEFORE touching the window.  The NOOP backend needs
+     * no window at all, so demanding a native handle first made it
+     * unreachable on a display-less host (dependency audit P0
+     * `headless-forced-window-init`).  The dedicated headless entry point is
+     * jce_renderer_create_headless(); this keeps the windowed entry honest
+     * when a caller forces JCE_BACKEND=noop. */
+    int backend_choice = resolve_backend_choice(cfg->backend);
+    const bool want_noop = (backend_choice == JCE_BACKEND_NOOP);
 
     bgfx_platform_data_t pd;
     memset(&pd, 0, sizeof(pd));
-    pd.nwh = nw.nwh;
-    pd.ndt = nw.ndt;
-    bgfx_set_platform_data(&pd);
+
+    if (!want_noop) {
+        /* Retrieve native window handle.
+         * On iOS the native handle may become available slightly after window
+         * creation, so retry briefly before giving up. */
+        JceNativeWindow nw;
+        memset(&nw, 0, sizeof(nw));
+        for (int i = 0; i < 120; i++) {
+            jce_window_get_native(win, &nw);
+            if (nw.nwh) break;
+            SDL_PumpEvents();
+            jce_thread_sleep_ms(16);
+        }
+
+        if (!nw.nwh) {
+            LOG_ERROR(LOG_TAG, "native window handle is NULL");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "JCE",
+                "Native window not ready", NULL);
+            return NULL;
+        }
+
+        pd.nwh = nw.nwh;
+        pd.ndt = nw.ndt;
+        bgfx_set_platform_data(&pd);
+    } else {
+        LOG_WARN(LOG_TAG, "JCE_BACKEND=noop — initialising the null backend "
+                 "without a native window handle");
+    }
 
     /* Initialise bgfx with graceful fallback. */
     uint32_t w, h;
@@ -1130,41 +1251,6 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     }
     if (gfx_debug)
         LOG_INFO(LOG_TAG, "JCE_GFX_DEBUG enabled (D3D12/Vulkan validation on)");
-
-    /* JCE_BACKEND=auto|d3d11|d3d12|vulkan|opengl|gles|metal|noop — overrides
-       the caller-selected backend (same diagnostic env family as
-       JCE_FORCE_FALLBACK above). Primary consumer: tools/render_parity.py,
-       which boots the SAME binary on several backends and pixel-compares
-       the output to catch backend-divergent shader/render behavior (the
-       class of bug where a raw mat3 ctor flipped TBN on GLSL only) without
-       touching any per-user config. */
-    int backend_choice = cfg->backend;
-    {
-        const char *bv = getenv("JCE_BACKEND");
-        if (bv && bv[0]) {
-            char   low[16];
-            size_t bi;
-            for (bi = 0; bi + 1 < sizeof(low) && bv[bi]; bi++)
-                low[bi] = (char)((bv[bi] >= 'A' && bv[bi] <= 'Z')
-                                 ? bv[bi] + ('a' - 'A') : bv[bi]);
-            low[bi] = '\0';
-            if      (strcmp(low, "auto")   == 0) backend_choice = JCE_BACKEND_AUTO;
-            else if (strcmp(low, "d3d11")  == 0) backend_choice = JCE_BACKEND_D3D11;
-            else if (strcmp(low, "d3d12")  == 0) backend_choice = JCE_BACKEND_D3D12;
-            else if (strcmp(low, "vulkan") == 0) backend_choice = JCE_BACKEND_VULKAN;
-            else if (strcmp(low, "opengl") == 0 || strcmp(low, "gl") == 0)
-                backend_choice = JCE_BACKEND_OPENGL;
-            else if (strcmp(low, "gles") == 0 || strcmp(low, "opengles") == 0)
-                backend_choice = JCE_BACKEND_OPENGLES;
-            else if (strcmp(low, "metal")  == 0) backend_choice = JCE_BACKEND_METAL;
-            else if (strcmp(low, "noop")   == 0) backend_choice = JCE_BACKEND_NOOP;
-            else
-                LOG_WARN(LOG_TAG, "JCE_BACKEND=%s not recognized — ignored", bv);
-            if (backend_choice != cfg->backend)
-                LOG_WARN(LOG_TAG,
-                    "DEBUG TOGGLE: JCE_BACKEND=%s -> backend override", bv);
-        }
-    }
 
     bgfx_renderer_type_t requested_type = map_backend(backend_choice);
     const char *backend_name =
@@ -1407,10 +1493,84 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     return r;
 }
 
+/* NullRHI: a bgfx NOOP renderer with NO window / platform data, for the
+ * dedicated-server / headless boot (cf. Unreal's NullRHI, Unity's headless
+ * graphics device).  bgfx NOOP never touches a GPU or a display, so this
+ * boots on a display-less host.  Render entry points early-out on r->headless;
+ * resource/scene calls that create bgfx handles remain valid no-ops. */
+JceRenderer *jce_renderer_create_headless(void)
+{
+    /* macOS single-thread guard mirrors the windowed path (harmless for NOOP). */
+#if JCE_PLATFORM_MACOS
+    bgfx_render_frame(-1);
+#endif
+
+    bgfx_init_t init;
+    bgfx_init_ctor(&init);
+    init.type              = BGFX_RENDERER_TYPE_NOOP;
+    init.resolution.width  = 1;
+    init.resolution.height = 1;
+    init.resolution.reset  = BGFX_RESET_NONE;
+    /* No platformData (no window), no callback: NOOP needs neither. */
+    if (!bgfx_init(&init)) {
+        LOG_ERROR(LOG_TAG, "headless bgfx NOOP init failed");
+        return NULL;
+    }
+
+    JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
+    if (!r) {
+        bgfx_shutdown();
+        return NULL;
+    }
+    r->headless    = true;
+    r->reset_flags = BGFX_RESET_NONE;
+
+    /* Vertex layouts + uniforms: valid NOOP handles so any resource/scene code
+     * that queries them stays well-formed. */
+    bgfx_vertex_layout_begin(&r->layout, BGFX_RENDERER_TYPE_NOOP);
+    bgfx_vertex_layout_add(&r->layout, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&r->layout, BGFX_ATTRIB_COLOR0, 4, BGFX_ATTRIB_TYPE_UINT8, true, false);
+    bgfx_vertex_layout_end(&r->layout);
+
+    bgfx_vertex_layout_begin(&r->layout_textured, BGFX_RENDERER_TYPE_NOOP);
+    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_COLOR0, 4, BGFX_ATTRIB_TYPE_UINT8, true, false);
+    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_TEXCOORD0, 2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&r->layout_textured);
+
+    r->u_tex_color   = bgfx_create_uniform("s_texColor", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    r->u_light_dir   = bgfx_create_uniform("u_lightDir", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_light_color = bgfx_create_uniform("u_lightColor", BGFX_UNIFORM_TYPE_VEC4, 1);
+
+    /* All shader programs start invalid (never set — headless never draws). */
+    r->program.idx                    = UINT16_MAX;
+    r->program_textured.idx           = UINT16_MAX;
+    r->program_mesh.idx               = UINT16_MAX;
+    r->program_pbr.idx                = UINT16_MAX;
+    r->program_pbr_inst.idx           = UINT16_MAX;
+    r->program_pbr_inst_tint.idx      = UINT16_MAX;
+    r->program_pbr_inst_tex_array.idx = UINT16_MAX;
+    r->program_pbr_inst_fade.idx      = UINT16_MAX;
+    r->program_pbr_skinned.idx        = UINT16_MAX;
+    r->program_pbr_fwdplus.idx        = UINT16_MAX;
+    r->program_pbr_inst_fwdplus.idx   = UINT16_MAX;
+    r->program_pbr_skinned_fwdplus.idx = UINT16_MAX;
+    r->program_pbr_toon.idx           = UINT16_MAX;
+    r->program_outline_skinned.idx    = UINT16_MAX;
+    r->program_shadow.idx             = UINT16_MAX;
+    r->program_shadow_inst.idx        = UINT16_MAX;
+    r->program_shadow_skinned.idx     = UINT16_MAX;
+    r->program_terrain.idx            = UINT16_MAX;
+
+    SDL_strlcpy(r->gpu_name, "Null / Noop (headless)", sizeof(r->gpu_name));
+    LOG_SUCCESS(LOG_TAG, "headless renderer initialized (NullRHI: bgfx NOOP, no window)");
+    return r;
+}
+
 void jce_renderer_set_shaders(JceRenderer *r,
                               const JceShaderSet *shaders)
 {
-    if (!r || !shaders || r->is_fallback) return;
+    if (!r || !shaders || r->is_fallback || r->headless) return;
 
     r->program = (bgfx_program_handle_t){
         shaders->color.idx };
@@ -1543,6 +1703,11 @@ JceRenderer *jce_renderer_create_fallback(JceWindow *win)
 bool jce_renderer_is_fallback(const JceRenderer *r)
 {
     return r ? r->is_fallback : false;
+}
+
+bool jce_renderer_is_headless(const JceRenderer *r)
+{
+    return r ? r->headless : false;
 }
 
 /* -- Fallback frame: real 2D rendering via SDL_Renderer ------------- */
@@ -1779,7 +1944,7 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
 {
     JCE_PROFILE_ZONE_N("Renderer::BeginFrame");
     if (!r || !win) { JCE_PROFILE_ZONE_END; return; }
-    if (r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
+    if (r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return; }
 
     /* Full-backbuffer viewport for all views. */
     uint16_t vp_x, vp_y, vp_w, vp_h;
@@ -1883,7 +2048,7 @@ void jce_renderer_present_splash(const JceRenderer *r,
 void jce_renderer_end_frame(const JceRenderer *r)
 {
     JCE_PROFILE_ZONE_N("Renderer::EndFrame");
-    if (!r || r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
+    if (!r || r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return; }
 
     /* ── GPU memory diagnostic (every 15 seconds) ─────────────────────
      * Logs bgfx GPU resource counts and memory usage. Use this to

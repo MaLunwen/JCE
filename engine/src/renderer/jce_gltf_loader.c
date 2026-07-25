@@ -14,6 +14,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_path.h>   /* jce_path_asset_key (PAK-miss retry) */
 #include <float.h>   /* FLT_MAX (model AABB seed) */
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
@@ -26,7 +27,6 @@
 
 #include <cgltf.h>
 #include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1305,38 +1305,9 @@ static JceModelCpu *build_model_cpu(const JcePakArchive *pak,
 /* Worker: decode (no bgfx)                                            */
 /* ================================================================== */
 
-/* Derive a PAK-relative forward-slash key from an absolute or mixed-separator
- * path (e.g. "D:/.../resources/assets\models\city\building-b.glb").
- * Writes a normalised copy to buf, then returns a pointer into buf at the
- * start of the relative remainder, or NULL if no safe key can be derived.
- * Only call on the PAK-miss path — cheap string scan, no allocation. */
-static const char *pak_derive_relative_key(const char *path,
-                                           char *buf, size_t buf_sz)
-{
-    if (!path || !buf || buf_sz == 0) return NULL;
-    size_t L = strlen(path);
-    if (L >= buf_sz) return NULL;
-    for (size_t i = 0; i <= L; i++)
-        buf[i] = (path[i] == '\\') ? '/' : path[i];
-
-    static const char *const s_markers[] = {
-        "resources/assets/", "resources/_cooked/", NULL
-    };
-    static const char *const s_tops[] = {
-        "/models/", "/scenes/", "/shaders/", "/fonts/",
-        "/i18n/", "/audio/", "/prefabs/", "/anim/",
-        "/textures/", NULL
-    };
-    for (int mi = 0; s_markers[mi]; mi++) {
-        const char *p = strstr(buf, s_markers[mi]);
-        if (p) { const char *r = p + strlen(s_markers[mi]); return r[0] ? r : NULL; }
-    }
-    for (int ti = 0; s_tops[ti]; ti++) {
-        const char *p = strstr(buf, s_tops[ti]);
-        if (p) { const char *r = p + 1; return r[0] ? r : NULL; }
-    }
-    return NULL;
-}
+/* The PAK-relative key derivation that used to live here is now
+ * jce_path_asset_key() in os/core — it was byte-identical to a second copy
+ * in the scene deserialiser (audit: C2-DUP-KEY-DERIVE). */
 
 JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_path)
 {
@@ -1351,8 +1322,8 @@ JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_pat
         /* Belt-and-suspenders: if the exact key missed (e.g. absolute+backslash
          * path saved by the editor), derive a PAK-relative key and retry.
          * Only on the miss path — zero cost for well-formed relative keys. */
-        const char *rel = pak_derive_relative_key(asset_path, norm_buf,
-                                                  sizeof(norm_buf));
+        const char *rel = jce_path_asset_key(asset_path, norm_buf,
+                                             sizeof(norm_buf));
         if (rel) asset = jce_pak_find(pak, rel);
         if (asset)
             pak_path = rel;

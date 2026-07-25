@@ -150,7 +150,7 @@ JCE_API void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem
 JCE_API void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool);
 
 /* Set callbacks for chunk load/unload events (optional). */
-void jce_streaming_set_callbacks(JceStreamingSystem *sys,
+JCE_API void jce_streaming_set_callbacks(JceStreamingSystem *sys,
                                   JceChunkLoadedFn on_loaded,
                                   JceChunkUnloadedFn on_unloaded,
                                   void *user_data);
@@ -160,11 +160,11 @@ void jce_streaming_set_callbacks(JceStreamingSystem *sys,
 /* ================================================================== */
 
 /* Register a chunk that can be streamed in/out. */
-void jce_streaming_register_chunk(JceStreamingSystem *sys,
+JCE_API void jce_streaming_register_chunk(JceStreamingSystem *sys,
                                    const JceStreamChunk *chunk);
 
 /* Unregister a chunk. */
-void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
+JCE_API void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
                                      uint32_t chunk_id);
 
 /* Update a LOADED chunk's accounted residency in bytes.  The streaming system
@@ -174,7 +174,7 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
  * it here makes LRU eviction and the pressure signal actually engage instead
  * of counting tiny JSON byte sizes that never reach the budget (audit F3).
  * No-op if the chunk is not currently LOADED. */
-void jce_streaming_set_chunk_residency(JceStreamingSystem *sys,
+JCE_API void jce_streaming_set_chunk_residency(JceStreamingSystem *sys,
                                        uint32_t chunk_id, uint64_t bytes);
 
 /* ================================================================== */
@@ -325,15 +325,15 @@ JCE_API void jce_streaming_signal_low_memory_all(void);
 JCE_API uint32_t jce_streaming_refused_loads(const JceStreamingSystem *sys);
 
 /* Check if a specific chunk is loaded. */
-bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,
+JCE_API bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,
                                  uint32_t chunk_id);
 
 /* Query the state of a specific chunk. */
-JceChunkState jce_streaming_chunk_state(const JceStreamingSystem *sys,
+JCE_API JceChunkState jce_streaming_chunk_state(const JceStreamingSystem *sys,
                                         uint32_t chunk_id);
 
 /* Get the loaded data for a chunk (NULL if not loaded). */
-void *jce_streaming_chunk_data(const JceStreamingSystem *sys,
+JCE_API void *jce_streaming_chunk_data(const JceStreamingSystem *sys,
                                 uint32_t chunk_id, size_t *out_size);
 
 /* Return true if the streaming system is operating in single-thread mode. */

@@ -247,7 +247,7 @@ extern "C" uint16_t jce__ktx_load_cubemap(const char *path)
         1,                     /* numLayers */
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE,
-        mem);
+        mem, 0);
 
     if (!BGFX_HANDLE_IS_VALID(h)) {
         LOG_WARN(JCE_KTX_TAG, "cubemap GPU upload failed: %s", path);

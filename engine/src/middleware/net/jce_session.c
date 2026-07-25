@@ -746,10 +746,18 @@ void jce_session_tick(void)
 }
 
 /* ================================================================== */
-/* Built-in self-test (debug builds only)                              */
+/* Built-in self-test — STATUS: NEVER COMPILED                         */
 /*                                                                     */
 /* Guarded by JCE_NET_SELF_TEST as well as NDEBUG so loopback flakes   */
 /* never gate normal debug builds.  Skips if a port can't be bound.    */
+/*                                                                     */
+/* JCE_NET_SELF_TEST is not defined by ANY CMakeLists, cmake module or */
+/* build script in this repository, so "debug builds only" overstates  */
+/* it: this block is preprocessed away in every configuration,         */
+/* including debug.  Nothing below has ever run in CI or locally       */
+/* without someone adding the define by hand.  Recorded so the code is */
+/* not mistaken for live session coverage — see the matching note on   */
+/* jce_lan_discovery_self_test in jce_lan_discovery.h.                 */
 /* ================================================================== */
 #if !defined(NDEBUG) && defined(JCE_NET_SELF_TEST)
 #include <assert.h>

@@ -10,6 +10,7 @@
 #include <jce/middleware/audio/jce_m4a_decode.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_str.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 
@@ -31,6 +32,7 @@
 #define JCE_MAX_VOICES  64
 #define JCE_MAX_BUSES   16
 #define JCE_BUS_NAME_MAX 32
+#define JCE_AUDIO_SOUND_PATH_MAX 256   /* dedup key length for loaded clips */
 
 /* ── Freeverb (public-domain Schroeder reverb) ─────────────────────────
  *
@@ -106,6 +108,13 @@ typedef struct {
     ma_uint64  frame_count;
     ma_uint32  channels;
     ma_uint32  sample_rate;
+    /* Source path this slot was loaded from, or "" for a raw-PCM load.  Used to
+     * dedup repeated path loads (jce_audio_load / jce_audio_load_memory): a clip
+     * requested again returns the already-loaded slot instead of allocating a
+     * new one, so a scene firing the same one-shot every few seconds cannot
+     * exhaust the 64-slot table.  A slot is playback-shared: many voices carry
+     * independent read cursors over the same PCM. */
+    char       path[JCE_AUDIO_SOUND_PATH_MAX];
 } SoundSlot;
 
 /* A named output bus backed by a ma_sound_group node. */
@@ -506,6 +515,161 @@ static void dsp_node_uninit(DspNode *dn)
     }
 }
 
+/* ================================================================== */
+/* Process-wide master mix (single shared output device)               */
+/* ================================================================== */
+/* Every JceAudio engine is DEVICE-LESS (ma_engine_config.noDevice — the
+ * miniaudio-documented multi-engine form) and is pumped + summed by ONE
+ * shared playback device, the engine's "master bus" (the same shape as
+ * Unreal's master submix / Unity's AudioListener / Godot's Master bus).
+ * Consequences:
+ *   - the process opens exactly one OS audio stream, resident once created
+ *     (Play start/stop no longer opens/closes devices);
+ *   - jce_audio_master_tap_set() observes the final mixed PCM — sample-
+ *     exact, cross-platform capture of everything THIS process plays
+ *     (the editor recorder's audio source; see
+ *     .docs/AUDIO_MASTER_MIX_DESIGN.md);
+ *   - the tap stream is gapless by construction: the device callback runs
+ *     at a constant cadence and sums to silence when engines are idle.
+ * Threading: create/destroy/tap_set are main-thread (the existing JceAudio
+ * contract); the mix callback runs on the device thread and never blocks —
+ * slots publish via "pointer first, flag second" over SDL atomic ints
+ * (full barriers), teardown waits one callback generation (RCU-lite). */
+
+#define JCE_AUDIO_MAX_ENGINES 8
+#define JCE_AUDIO_MASTER_RATE 48000u  /* Opus/recording expectation */
+#define JCE_AUDIO_MASTER_CH   2u
+
+typedef struct {
+    SDL_AtomicInt live;   /* 1 = ptr readable by the mix callback */
+    JceAudio     *ptr;
+} MasterSlot;
+
+static struct {
+    bool                 device_inited;
+    bool                 device_failed;  /* don't retry every create */
+    ma_device            device;
+    MasterSlot           slots[JCE_AUDIO_MAX_ENGINES];
+    SDL_AtomicInt        generation;    /* bumped each callback entry */
+    SDL_AtomicInt        tap_live;
+    JceAudioMasterTapFn  tap_fn;
+    void                *tap_ud;
+} s_master;
+
+/* Wait until the mix callback has entered at least once more, so a slot or
+ * tap cleared BEFORE this call can no longer be referenced.  No-op when the
+ * device never started (nothing runs the callback). */
+static void master_wait_generation(void)
+{
+    if (!s_master.device_inited) return;
+    int g0 = SDL_GetAtomicInt(&s_master.generation);
+    for (int spin = 0; spin < 400; ++spin) {   /* ~2 s worst case */
+        if (SDL_GetAtomicInt(&s_master.generation) != g0) return;
+        SDL_Delay(5);
+    }
+}
+
+static void master_device_cb(ma_device *dev, void *out, const void *in,
+                             ma_uint32 frames)
+{
+    (void)dev; (void)in;
+    SDL_AddAtomicInt(&s_master.generation, 1);
+
+    float *dst = (float *)out;   /* f32/2ch as requested at device init */
+    memset(dst, 0, (size_t)frames * JCE_AUDIO_MASTER_CH * sizeof(float));
+
+    enum { CHUNK = 1024 };
+    static float tmp[CHUNK * JCE_AUDIO_MASTER_CH];  /* device thread only */
+    ma_uint32 done = 0;
+    while (done < frames) {
+        ma_uint32 n = frames - done;
+        if (n > CHUNK) n = CHUNK;
+        float *acc = dst + (size_t)done * JCE_AUDIO_MASTER_CH;
+        for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
+            if (!SDL_GetAtomicInt(&s_master.slots[i].live)) continue;
+            JceAudio *a = s_master.slots[i].ptr;
+            if (!a) continue;
+            ma_uint64 read = 0;
+            ma_engine_read_pcm_frames(&a->engine, tmp, n, &read);
+            const ma_uint32 cnt = (ma_uint32)read * JCE_AUDIO_MASTER_CH;
+            for (ma_uint32 s = 0; s < cnt; ++s) acc[s] += tmp[s];
+        }
+        done += n;
+    }
+
+    if (SDL_GetAtomicInt(&s_master.tap_live) && s_master.tap_fn)
+        s_master.tap_fn(s_master.tap_ud, dst, frames,
+                        JCE_AUDIO_MASTER_RATE, JCE_AUDIO_MASTER_CH);
+}
+
+static bool master_device_ensure(void)
+{
+    if (s_master.device_inited) return true;
+    if (s_master.device_failed) return false;
+
+    ma_device_config dc = ma_device_config_init(ma_device_type_playback);
+    dc.playback.format   = ma_format_f32;
+    dc.playback.channels = JCE_AUDIO_MASTER_CH;
+    dc.sampleRate        = JCE_AUDIO_MASTER_RATE;
+    dc.dataCallback      = master_device_cb;
+
+    if (ma_device_init(NULL, &dc, &s_master.device) != MA_SUCCESS) {
+        s_master.device_failed = true;
+        LOG_WARN("jce_audio", "master mix device init failed — engines run "
+                              "silent, master tap unavailable");
+        return false;
+    }
+    if (ma_device_start(&s_master.device) != MA_SUCCESS) {
+        ma_device_uninit(&s_master.device);
+        s_master.device_failed = true;
+        LOG_WARN("jce_audio", "master mix device start failed");
+        return false;
+    }
+    s_master.device_inited = true;
+    LOG_SUCCESS("jce_audio", "master mix device started (48kHz/2ch)");
+    return true;
+}
+
+static bool master_register(JceAudio *a)
+{
+    for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
+        if (SDL_GetAtomicInt(&s_master.slots[i].live) ||
+            s_master.slots[i].ptr)
+            continue;
+        s_master.slots[i].ptr = a;                  /* pointer first… */
+        SDL_SetAtomicInt(&s_master.slots[i].live, 1); /* …flag second */
+        return true;
+    }
+    return false;
+}
+
+static void master_unregister(JceAudio *a)
+{
+    for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
+        if (s_master.slots[i].ptr != a) continue;
+        SDL_SetAtomicInt(&s_master.slots[i].live, 0);
+        master_wait_generation();   /* callback can no longer touch it */
+        s_master.slots[i].ptr = NULL;
+        return;
+    }
+}
+
+bool jce_audio_master_tap_set(JceAudioMasterTapFn fn, void *ud)
+{
+    if (fn) {
+        if (!master_device_ensure()) return false;
+        s_master.tap_fn = fn;                    /* fields first… */
+        s_master.tap_ud = ud;
+        SDL_SetAtomicInt(&s_master.tap_live, 1); /* …flag second */
+        return true;
+    }
+    SDL_SetAtomicInt(&s_master.tap_live, 0);
+    master_wait_generation();   /* no further calls into the old fn */
+    s_master.tap_fn = NULL;
+    s_master.tap_ud = NULL;
+    return true;
+}
+
 /* -- Lifecycle ------------------------------------------------------ */
 
 JceAudio *jce_audio_create(void)
@@ -513,7 +677,12 @@ JceAudio *jce_audio_create(void)
     JceAudio *audio = (JceAudio *)JCE_CALLOC(1, sizeof(*audio));
     if (!audio) return NULL;
 
+    /* Device-less engine pinned to the master-mix format; the shared device
+     * pumps it via ma_engine_read_pcm_frames (see master mix above). */
     ma_engine_config cfg = ma_engine_config_init();
+    cfg.noDevice   = MA_TRUE;
+    cfg.channels   = JCE_AUDIO_MASTER_CH;
+    cfg.sampleRate = JCE_AUDIO_MASTER_RATE;
     if (ma_engine_init(&cfg, &audio->engine) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_engine_init failed");
         JCE_FREE(audio);
@@ -521,6 +690,16 @@ JceAudio *jce_audio_create(void)
     }
 
     audio->engine_inited = true;
+
+    /* Best effort: without an output device the engine still works (silent). */
+    master_device_ensure();
+    if (!master_register(audio)) {
+        LOG_ERROR("jce_audio", "master mix slots exhausted (%d live engines)",
+                  JCE_AUDIO_MAX_ENGINES);
+        ma_engine_uninit(&audio->engine);
+        JCE_FREE(audio);
+        return NULL;
+    }
 
     for (int i = 0; i < JCE_MAX_VOICES; i++) {
         audio->voices[i].sound_slot = -1;
@@ -558,6 +737,11 @@ static void uninit_voice(VoiceSlot *v)
 void jce_audio_destroy(JceAudio *audio)
 {
     if (!audio) return;
+
+    /* FIRST detach from the master mix — after this the shared device
+     * callback can no longer pump this engine, making the teardown below
+     * race-free against the audio thread. */
+    master_unregister(audio);
 
     /* Uninit all voices first (they reference engine). */
     for (int i = 0; i < JCE_MAX_VOICES; i++)
@@ -605,6 +789,29 @@ static int alloc_buffer_slot(const JceAudio *audio)
             return i;
     }
     return -1;
+}
+
+/* Return the slot already holding `path` (case-insensitive, matching the VFS
+ * key normalization), or -1 if none.  Empty paths (raw-PCM loads) never match. */
+static int find_sound_slot_by_path(const JceAudio *audio, const char *path)
+{
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < JCE_MAX_SOUNDS; i++) {
+        if (audio->sound_used[i] && audio->sounds[i].path[0] &&
+            jce_strcasecmp(audio->sounds[i].path, path) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Record the source path on a loaded slot so future loads of the same clip
+ * dedup to it.  Truncates safely if the path exceeds the key length (a
+ * truncated key still dedups consistently within one session). */
+static void set_sound_slot_path(JceAudio *audio, int slot, const char *path)
+{
+    if (slot < 0 || slot >= JCE_MAX_SOUNDS || !path) return;
+    snprintf(audio->sounds[slot].path, sizeof(audio->sounds[slot].path),
+             "%s", path);
 }
 
 /* Check if path ends with a given suffix (case-insensitive). */
@@ -830,6 +1037,8 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     audio->sounds[slot].frame_count = frame_count;
     audio->sounds[slot].channels    = channels;
     audio->sounds[slot].sample_rate = sample_rate;
+    audio->sounds[slot].path[0]     = '\0';  /* raw-PCM: no dedup key until a
+                                              * path-aware caller records one */
     audio->sound_used[slot]         = true;
 
     return (JceSound)(slot + 1);
@@ -926,6 +1135,10 @@ static JceSound jce_audio_load_inner(JceAudio *audio, const JcePakArchive *pak,
 {
     if (!audio || !pak || !path) return JCE_SOUND_INVALID;
 
+    /* Dedup: reuse the slot if this clip is already resident. */
+    int cached = find_sound_slot_by_path(audio, path);
+    if (cached >= 0) return (JceSound)(cached + 1);
+
     const JcePakAsset *asset = jce_pak_find(pak, path);
     if (!asset) {
         LOG_ERROR("jce_audio", "asset '%s' not found in PAK", path);
@@ -945,7 +1158,10 @@ static JceSound jce_audio_load_inner(JceAudio *audio, const JcePakArchive *pak,
 
     JceAudioCpu *cpu = jce_audio_decode_cpu_memory(raw, decoded, path);
     JCE_FREE(raw);
-    return jce_audio_upload_cpu(audio, cpu);
+    JceSound snd = jce_audio_upload_cpu(audio, cpu);
+    if (snd != JCE_SOUND_INVALID)
+        set_sound_slot_path(audio, (int)snd - 1, path);
+    return snd;
 }
 
 JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path)
@@ -1000,6 +1216,20 @@ void jce_audio_cpu_free(JceAudioCpu *c)
     JCE_FREE(c);
 }
 
+bool jce_audio_cpu_get_pcm(const JceAudioCpu *c,
+                           const void **out_pcm, uint32_t *out_pcm_bytes,
+                           uint16_t *out_channels, uint32_t *out_sample_rate,
+                           uint16_t *out_bits_per_sample)
+{
+    if (!c || !c->pcm || c->pcm_bytes == 0) return false;
+    if (out_pcm)             *out_pcm             = c->pcm;
+    if (out_pcm_bytes)       *out_pcm_bytes       = c->pcm_bytes;
+    if (out_channels)        *out_channels        = c->channels;
+    if (out_sample_rate)     *out_sample_rate     = c->sample_rate;
+    if (out_bits_per_sample) *out_bits_per_sample = c->bits;
+    return true;
+}
+
 void jce_audio_unload(JceAudio *audio, JceSound snd)
 {
     if (!audio || snd == JCE_SOUND_INVALID) return;
@@ -1014,6 +1244,7 @@ void jce_audio_unload(JceAudio *audio, JceSound snd)
 
     JCE_FREE(audio->sounds[slot].pcm_data);
     audio->sounds[slot].pcm_data = NULL;
+    audio->sounds[slot].path[0]  = '\0';
     audio->sound_used[slot] = false;
 }
 
@@ -1650,9 +1881,20 @@ JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
                                 uint32_t size, const char *hint_path)
 {
     if (!audio || !data || size == 0) return JCE_SOUND_INVALID;
+    /* Dedup by path: a scene firing the same one-shot every few seconds would
+     * otherwise decode + allocate a fresh slot per call and exhaust the 64-slot
+     * table (the editor-Play "cannot load" after ~a minute of play).  A clip
+     * already resident replays from its shared slot. */
+    if (hint_path && hint_path[0]) {
+        int cached = find_sound_slot_by_path(audio, hint_path);
+        if (cached >= 0) return (JceSound)(cached + 1);
+    }
     JceAudioCpu *cpu = jce_audio_decode_cpu_memory(
         data, (size_t)size, hint_path ? hint_path : "<memory>");
-    return jce_audio_upload_cpu(audio, cpu);
+    JceSound snd = jce_audio_upload_cpu(audio, cpu);
+    if (snd != JCE_SOUND_INVALID && hint_path && hint_path[0])
+        set_sound_slot_path(audio, (int)snd - 1, hint_path);
+    return snd;
 }
 
 float jce_audio_get_duration(const JceAudio *audio, JceSound snd)
@@ -1884,6 +2126,18 @@ JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
 JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
     const char *hint_path) {
     (void)data; (void)size; (void)hint_path; return NULL;
+}
+bool jce_audio_cpu_get_pcm(const JceAudioCpu *cpu,
+    const void **out_pcm, uint32_t *out_pcm_bytes,
+    uint16_t *out_channels, uint32_t *out_sample_rate,
+    uint16_t *out_bits_per_sample) {
+    (void)cpu;
+    if (out_pcm)             *out_pcm             = NULL;
+    if (out_pcm_bytes)       *out_pcm_bytes       = 0;
+    if (out_channels)        *out_channels        = 0;
+    if (out_sample_rate)     *out_sample_rate     = 0;
+    if (out_bits_per_sample) *out_bits_per_sample = 0;
+    return false;
 }
 float jce_audio_get_duration(const JceAudio *audio, JceSound snd) {
     (void)audio; (void)snd; return 0.0f;

@@ -8,19 +8,9 @@
 
 bool looks_like_texture_asset_path(const char *path)
 {
-    if (!path || path[0] == '\0')
-        return false;
-
-    char ext_buf[32];
-    if (!jce_path_extension(ext_buf, sizeof(ext_buf), path))
-        return false;
-        
-    std::string ext(ext_buf);
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)tolower(c); });
-    return ext == ".png" || ext == ".jpg" || ext == ".jpeg"
-        || ext == ".bmp" || ext == ".tga" || ext == ".dds"
-        || ext == ".ktx" || ext == ".ktx2";
+    /* Engine-canonical table (jce_asset_format.h) — the editor must agree
+     * with the cooker and the runtime about what counts as a texture. */
+    return path && path[0] != '\0' && jce_asset_ext_is_texture(path);
 }
 
 /* ── Texture cache entry management ─────────────────────────────── */
@@ -151,29 +141,26 @@ bool decode_texture_rgba_path(const char *path,
 
 /* ── Texture async worker ───────────────────────────────────────── */
 
+/* Runs with the async mutex held.  LIFO — newest request first. */
+static bool texture_pop_request_locked(TextureLoadRequest *out)
+{
+    if (!out || s_tex_async.pending.empty())
+        return false;
+
+    *out = std::move(s_tex_async.pending.back());
+    s_tex_async.pending.pop_back();
+    return true;
+}
+
 static void texture_async_worker_main(void *arg)
 {
     (void)arg;
     for (;;) {
         TextureLoadRequest req;
-        {
-            jce_mutex_lock(s_tex_async.mutex);
-            while (!(s_tex_async.stop || !s_tex_async.pending.empty()))
-                jce_cond_wait(s_tex_async.cv, s_tex_async.mutex);
-
-            if (s_tex_async.stop && s_tex_async.pending.empty()) {
-                jce_mutex_unlock(s_tex_async.mutex);
-                break;
-            }
-
-            if (s_tex_async.pending.empty()) {
-                jce_mutex_unlock(s_tex_async.mutex);
-                continue;
-            }
-
-            req = std::move(s_tex_async.pending.back());
-            s_tex_async.pending.pop_back();
-            jce_mutex_unlock(s_tex_async.mutex);
+        if (!async_loader_worker_take(
+                s_tex_async,
+                [&req] { return texture_pop_request_locked(&req); })) {
+            break;
         }
 
         TextureLoadResult result = {};
@@ -207,8 +194,7 @@ static void texture_async_worker_main(void *arg)
             }
         }
 
-        JceMutexGuard lock(s_tex_async.mutex);
-        s_tex_async.completed.push_back(std::move(result));
+        async_loader_publish(s_tex_async, result);
     }
 }
 
@@ -219,17 +205,8 @@ void texture_async_start(void)
     if (s_tex_async.running)
         return;
 
-    if (!s_tex_async.mutex) s_tex_async.mutex = jce_mutex_create();
-    if (!s_tex_async.cv)    s_tex_async.cv    = jce_cond_create();
-
-    s_tex_async.generation = 1;
-    s_tex_async.stop = false;
-    s_tex_async.pending.clear();
-    s_tex_async.completed.clear();
-
-    s_tex_async.worker = jce_thread_create(texture_async_worker_main, NULL,
-                                           "scene_tex_async");
-    s_tex_async.running = true;
+    async_loader_start(s_tex_async, texture_async_worker_main,
+                       "scene_tex_async");
 }
 
 void texture_async_stop(void)
@@ -237,37 +214,42 @@ void texture_async_stop(void)
     if (!s_tex_async.running)
         return;
 
-    {
-        JceMutexGuard lock(s_tex_async.mutex);
-        s_tex_async.stop = true;
-    }
-    jce_cond_broadcast(s_tex_async.cv);
-
-    if (s_tex_async.worker) {
-        jce_thread_join(s_tex_async.worker);
-        s_tex_async.worker = NULL;
-    }
-
-    s_tex_async.pending.clear();
-    s_tex_async.completed.clear();
-    s_tex_async.running = false;
-
-    if (s_tex_async.cv)    { jce_cond_destroy(s_tex_async.cv);    s_tex_async.cv = NULL; }
-    if (s_tex_async.mutex) { jce_mutex_destroy(s_tex_async.mutex); s_tex_async.mutex = NULL; }
+    async_loader_stop(s_tex_async);
 }
 
 void texture_async_begin_new_generation(void)
 {
-    JceMutexGuard lock(s_tex_async.mutex);
-    s_tex_async.generation++;
-    s_tex_async.pending.clear();
-    s_tex_async.completed.clear();
+    /* Decoded pixels live in the result itself, so completions can be
+     * dropped right here instead of waiting for the drain to reject them. */
+    async_loader_begin_new_generation(s_tex_async, true);
 }
 
 uint64_t texture_async_current_generation(void)
 {
-    JceMutexGuard lock(s_tex_async.mutex);
-    return s_tex_async.generation;
+    return async_loader_generation(s_tex_async);
+}
+
+/* Both queue entry points differ only in how the request is built. */
+static void texture_async_queue(const char *key,
+                                const char *file_path,
+                                const char *material_path,
+                                const char *mesh_path,
+                                bool resolve_path)
+{
+    async_loader_queue_request(
+        s_tex_async,
+        [&](TextureLoadRequest &req) { return req.key == key; },
+        [&](uint64_t generation, uint32_t order) {
+            (void)order;
+            TextureLoadRequest req;
+            req.key = key;
+            req.file_path = file_path ? file_path : "";
+            req.material_path = material_path ? material_path : "";
+            req.mesh_path = mesh_path ? mesh_path : "";
+            req.resolve_path = resolve_path;
+            req.generation = generation;
+            return req;
+        });
 }
 
 void texture_async_queue_request(const char *key, const char *file_path)
@@ -275,31 +257,7 @@ void texture_async_queue_request(const char *key, const char *file_path)
     if (!s_tex_async.running || !key || key[0] == '\0' || !file_path || !file_path[0])
         return;
 
-    bool inserted = false;
-    {
-        JceMutexGuard lock(s_tex_async.mutex);
-        for (TextureLoadRequest &req : s_tex_async.pending) {
-            if (req.generation == s_tex_async.generation && req.key == key) {
-                inserted = true;
-                break;
-            }
-        }
-
-        if (!inserted) {
-            TextureLoadRequest req;
-            req.key = key;
-            req.file_path = file_path;
-            req.material_path.clear();
-            req.mesh_path.clear();
-            req.resolve_path = false;
-            req.generation = s_tex_async.generation;
-            s_tex_async.pending.push_back(std::move(req));
-            inserted = true;
-        }
-    }
-
-    if (inserted)
-        jce_cond_signal(s_tex_async.cv);
+    texture_async_queue(key, file_path, NULL, NULL, false);
 }
 
 void texture_async_queue_resolve_request(const char *key,
@@ -309,114 +267,63 @@ void texture_async_queue_resolve_request(const char *key,
     if (!s_tex_async.running || !key || key[0] == '\0')
         return;
 
-    bool inserted = false;
-    {
-        JceMutexGuard lock(s_tex_async.mutex);
-        for (TextureLoadRequest &req : s_tex_async.pending) {
-            if (req.generation == s_tex_async.generation && req.key == key) {
-                inserted = true;
-                break;
-            }
-        }
-
-        if (!inserted) {
-            TextureLoadRequest req;
-            req.key = key;
-            req.file_path.clear();
-            req.material_path = material_path ? material_path : "";
-            req.mesh_path = mesh_path ? mesh_path : "";
-            req.resolve_path = true;
-            req.generation = s_tex_async.generation;
-            s_tex_async.pending.push_back(std::move(req));
-            inserted = true;
-        }
-    }
-
-    if (inserted)
-        jce_cond_signal(s_tex_async.cv);
-}
-
-static void texture_async_take_completed(std::vector<TextureLoadResult> *out)
-{
-    if (!out) return;
-
-    JceMutexGuard lock(s_tex_async.mutex);
-    out->swap(s_tex_async.completed);
-}
-
-static void texture_async_push_back_completed(std::vector<TextureLoadResult> *results)
-{
-    if (!results || results->empty()) return;
-
-    JceMutexGuard lock(s_tex_async.mutex);
-    for (TextureLoadResult &res : *results)
-        s_tex_async.completed.push_back(std::move(res));
-    results->clear();
+    texture_async_queue(key, NULL, material_path, mesh_path, true);
 }
 
 /* ── Texture finalization ───────────────────────────────────────── */
 
-void texture_finalize_completed_loads(void)
+static AsyncFinalizeAction texture_finalize_result(TextureLoadResult &res,
+                                                   uint64_t generation,
+                                                   bool budget_left)
 {
-    std::vector<TextureLoadResult> completed;
-    texture_async_take_completed(&completed);
-    if (completed.empty())
-        return;
+    if (res.generation != generation)
+        return ASYNC_FINALIZE_DROPPED;
 
-    const uint64_t generation = texture_async_current_generation();
-    uint32_t finalized = 0;
-    std::vector<TextureLoadResult> deferred;
-    deferred.reserve(completed.size());
+    const int idx = find_texture_cache_entry(res.key.c_str());
+    if (idx < 0)
+        return ASYNC_FINALIZE_DROPPED;
 
-    for (TextureLoadResult &res : completed) {
-        if (res.generation != generation)
-            continue;
+    if (!budget_left)
+        return ASYNC_FINALIZE_DEFERRED;
 
-        const int idx = find_texture_cache_entry(res.key.c_str());
-        if (idx < 0)
-            continue;
+    s_cache.tex_cache[idx].requested = false;
 
-        if (finalized >= TEX_FINALIZE_BUDGET_PER_FRAME) {
-            deferred.push_back(std::move(res));
-            continue;
-        }
-
-        s_cache.tex_cache[idx].requested = false;
-
-        if (!res.success || res.rgba.empty() || res.width == 0 || res.height == 0) {
-            s_cache.tex_cache[idx].failed = true;
-            continue;
-        }
-
-        JceTexture tex = jce_texture_from_rgba(res.rgba.data(),
-                                               res.width, res.height);
-
-        if (!jce_texture_valid(tex)) {
-            s_cache.tex_cache[idx].failed = true;
-            LOG_WARN(LOG_TAG, "texture finalize failed (upload): %s",
-                     res.key.c_str());
-            continue;
-        }
-
-        if (jce_texture_valid(s_cache.tex_cache[idx].tex)
-            && !s_cache.tex_cache[idx].tex_from_asset_manager) {
-            jce_texture_destroy(s_cache.tex_cache[idx].tex);
-        }
-
-        if (s_cache.assets && asset_handle_valid(s_cache.tex_cache[idx].asset_handle)) {
-            jce_asset_release(s_cache.assets, s_cache.tex_cache[idx].asset_handle);
-            s_cache.tex_cache[idx].asset_handle = asset_handle_invalid();
-        }
-
-        s_cache.tex_cache[idx].tex = tex;
-        s_cache.tex_cache[idx].tex_from_asset_manager = false;
-        s_cache.tex_cache[idx].warned_missing = false;
-        s_cache.tex_cache[idx].failed = false;
-        finalized++;
+    if (!res.success || res.rgba.empty() || res.width == 0 || res.height == 0) {
+        s_cache.tex_cache[idx].failed = true;
+        return ASYNC_FINALIZE_DROPPED;
     }
 
-    if (!deferred.empty())
-        texture_async_push_back_completed(&deferred);
+    JceTexture tex = jce_texture_from_rgba(res.rgba.data(),
+                                           res.width, res.height);
+
+    if (!jce_texture_valid(tex)) {
+        s_cache.tex_cache[idx].failed = true;
+        LOG_WARN(LOG_TAG, "texture finalize failed (upload): %s",
+                 res.key.c_str());
+        return ASYNC_FINALIZE_DROPPED;
+    }
+
+    if (jce_texture_valid(s_cache.tex_cache[idx].tex)
+        && !s_cache.tex_cache[idx].tex_from_asset_manager) {
+        jce_texture_destroy(s_cache.tex_cache[idx].tex);
+    }
+
+    if (s_cache.assets && asset_handle_valid(s_cache.tex_cache[idx].asset_handle)) {
+        jce_asset_release(s_cache.assets, s_cache.tex_cache[idx].asset_handle);
+        s_cache.tex_cache[idx].asset_handle = asset_handle_invalid();
+    }
+
+    s_cache.tex_cache[idx].tex = tex;
+    s_cache.tex_cache[idx].tex_from_asset_manager = false;
+    s_cache.tex_cache[idx].warned_missing = false;
+    s_cache.tex_cache[idx].failed = false;
+    return ASYNC_FINALIZE_APPLIED;
+}
+
+void texture_finalize_completed_loads(void)
+{
+    async_loader_drain_completed(s_tex_async, TEX_FINALIZE_BUDGET_PER_FRAME,
+                                 texture_finalize_result);
 }
 
 /* ── Texture cache lookup ───────────────────────────────────────── */

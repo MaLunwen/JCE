@@ -8,6 +8,17 @@
  * The database is rebuilt on demand (jce_assetdb_rescan); call this
  * after large file changes.  Initial path uses the asset browser's
  * project_root.
+ *
+ * NOT the asset path index.  editor/src/scene/jce_asset_path_index.*
+ * indexes the same tree and the split is deliberate (REF-019): that one
+ * maps a FUZZY BASENAME -> absolute path to repair stale references, is
+ * built on a worker and swapped in whole, and publishes a generation
+ * counter.  This one maps an exact normalized ABSOLUTE PATH -> asset KIND
+ * (plus the project-relative path) and enumerates in insertion order for
+ * the browser / picker; it is SYNCHRONOUS on purpose so set_root() is
+ * queryable the moment it returns, and this translation unit is kept
+ * dependency-free (jce_core only) so it unit-tests standalone.  Different
+ * key, different value, different lifecycle — do not fold them together.
  */
 
 #ifndef JCE_ASSETDB_H

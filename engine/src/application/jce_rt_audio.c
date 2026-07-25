@@ -567,6 +567,25 @@ static void rt_audio_decode_run(void *arg)
 
 RT_GROW_FN(rt_grow_pending_audio, pending_audio, pending_audio_cap, 8)
 
+/* Concurrency cap for play_on_awake decodes.  One OS thread per clip is a
+ * thread storm on the single-core / 512 MB baseline once a scene authors
+ * dozens of AudioSources (every one spawns at the same instant during the
+ * scene walk), so at most this many decodes own a worker at a time; the rest
+ * sit in the pending list as UNSTARTED slots and rt_audio_poll promotes them
+ * as running decodes retire.  An unstarted slot is (thr == NULL, done == 0) —
+ * unambiguous, because thr is only cleared after a join, which only happens
+ * once done == 1. */
+enum { RT_AUDIO_DECODE_MAX = 4 };
+
+/* Pending slots that currently own a live worker thread. */
+static int rt_audio_inflight(const JceRuntime *rt)
+{
+    int n = 0;
+    for (int i = 0; i < rt->pending_audio_count; ++i)
+        if (rt->pending_audio[i].thr) ++n;
+    return n;
+}
+
 /* Kick an async decode of `as->clip_path` for entity `e` (default loader
  * path only).  The worker owns `args` (stable heap) for its full run; the
  * pending slot only references it, so the slot array may realloc freely. */
@@ -588,21 +607,25 @@ void rt_spawn_audio_async(JceRuntime *rt, JceEntity e,
     args->cpu  = NULL;
     args->done = jce_atomic_i32_create(0);
 
-    JceThread *thr = jce_thread_create(rt_audio_decode_run, args, "jce_rt_audio");
-    if (!thr) {
-        /* No worker thread: decode + play inline, then drop the job. */
+    RtPendingAudio *p = &rt->pending_audio[rt->pending_audio_count++];
+    p->entity = e;
+    p->thr    = NULL;
+    p->args   = args;
+
+    /* Over the cap: leave the slot unstarted for rt_audio_poll to promote. */
+    if (rt_audio_inflight(rt) >= RT_AUDIO_DECODE_MAX)
+        return;
+
+    p->thr = jce_thread_create(rt_audio_decode_run, args, "jce_rt_audio");
+    if (!p->thr) {
+        /* No worker thread: decode + play inline, then drop the slot. */
         rt_audio_decode_run(args);
         JceSound snd = jce_audio_upload_cpu(rt->audio, args->cpu);
         rt_finish_audio_source(rt, rt->scene, e, snd, as);
         if (args->done) jce_atomic_i32_destroy(args->done);
         jce_free(args);
-        return;
+        rt->pending_audio_count--;   /* release the slot taken above */
     }
-
-    RtPendingAudio *p = &rt->pending_audio[rt->pending_audio_count++];
-    p->entity = e;
-    p->thr    = thr;
-    p->args   = args;
 }
 
 /* ── Adaptive music director (FEATURE 5.3) ───────────────────────────
@@ -685,4 +708,20 @@ void rt_audio_poll(JceRuntime *rt)
         /* slot dropped (not copied to w) */
     }
     rt->pending_audio_count = w;
+
+    /* Promote slots the cap held back, now that retiring decodes freed
+     * workers.  Order is spawn order, so a scene's clips still start in the
+     * order the scene walk visited them. */
+    int live = rt_audio_inflight(rt);
+    for (int i = 0; i < rt->pending_audio_count &&
+                    live < RT_AUDIO_DECODE_MAX; ++i) {
+        RtPendingAudio *p = &rt->pending_audio[i];
+        if (p->thr || !p->args) continue;       /* running, or nothing to run */
+        p->thr = jce_thread_create(rt_audio_decode_run, p->args,
+                                   "jce_rt_audio");
+        if (p->thr) { ++live; continue; }
+        /* OS refused the thread: decode inline so the clip still plays — the
+         * next poll retires it through the normal finished path. */
+        rt_audio_decode_run(p->args);
+    }
 }

@@ -3,6 +3,10 @@
  *
  * Accepts AudioSpecificConfig for initialization and decodes individual
  * AAC access units to interleaved signed 16-bit PCM.
+ *
+ * This is the ONE fdk-aac wrapper in the engine: the video player uses it for
+ * MP4 audio tracks and jce_m4a_decode.c (audio layer) for standalone M4A
+ * files. Don't add a second one — extend this instead.
  */
 
 #ifndef JCE_AAC_DECODE_H

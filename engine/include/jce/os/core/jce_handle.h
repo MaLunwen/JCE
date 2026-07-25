@@ -46,7 +46,7 @@ typedef struct jce_handle_pool jce_handle_pool_t;
 
 /* Create a pool that stores items of 'item_size' bytes.
    'capacity' is the maximum number of live items (up to 2^20 - 1). */
-jce_handle_pool_t *jce_handle_pool_create(jce_allocator_t alloc,
+JCE_API jce_handle_pool_t *jce_handle_pool_create(jce_allocator_t alloc,
                                           uint32_t item_size,
                                           uint32_t capacity);
 

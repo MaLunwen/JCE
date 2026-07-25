@@ -56,7 +56,7 @@ typedef struct JceCameraInput {
 /* Create a controller bound to an existing camera.
    The camera is NOT owned  caller manages its lifetime.
    Pass NULL desc for defaults. */
-JceCameraController *jce_camctrl_create(JceCamera *cam,
+JCE_API JceCameraController *jce_camctrl_create(JceCamera *cam,
                                          const JceCameraControllerDesc *desc);
 
 JCE_API void jce_camctrl_destroy(JceCameraController *ctrl);

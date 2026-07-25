@@ -56,7 +56,7 @@ typedef enum {
 /* Allocate a flat terrain.  width/height are vertex counts (must be
  * >= 2 and ideally `(N * chunk_size) + 1` so an integer number of
  * chunks tile the grid). */
-JceTerrain *jce_terrain_create(int width, int height,
+JCE_API JceTerrain *jce_terrain_create(int width, int height,
                                float world_size_x, float world_size_z,
                                float max_height, int chunk_size);
 
@@ -136,7 +136,7 @@ JCE_API JceTerrain *jce_terrain_load_file(const char *meta_json_path);
  * is present but the .bin is missing, an empty terrain is returned. */
 JCE_API JceTerrain *jce_terrain_load_from_pak(const struct JcePakArchive *pak,
                                               const char *meta_vpath);
-bool        jce_terrain_save_file(const JceTerrain *t,
+JCE_API bool        jce_terrain_save_file(const JceTerrain *t,
                                   const char *meta_json_path);
 
 JCE_API void        jce_terrain_free(JceTerrain *t);
@@ -178,14 +178,14 @@ JCE_API bool jce_terrain_build_collision_mesh(const JceTerrain *t,
 JCE_API float jce_terrain_sample_height(const JceTerrain *t, float wx, float wz);
 
 /* Bilinearly samples 4-layer splat weights (sum == 1.0). */
-void  jce_terrain_sample_splat (const JceTerrain *t, float wx, float wz,
+JCE_API void  jce_terrain_sample_splat (const JceTerrain *t, float wx, float wz,
                                 float out_w[4]);
 
 /* Vertical raycast (downward only).  Walks a stepwise refinement
  * along the world-XZ projection of the ray; good enough for editor
  * picking and casual physics queries.  Returns true if a hit occurs
  * within [0, max_dist] and writes the hit point + height. */
-bool jce_terrain_raycast(const JceTerrain *t,
+JCE_API bool jce_terrain_raycast(const JceTerrain *t,
                          const float origin[3], const float dir[3],
                          float max_dist,
                          float out_hit[3]);
@@ -195,13 +195,13 @@ bool jce_terrain_raycast(const JceTerrain *t,
 /* Returns the number of vertices and (triangle-list) indices needed
  * for `chunk(cx,cz)` at the given LOD.  Cheaper than a real build
  * call; lets the caller size buffers up front. */
-void jce_terrain_chunk_mesh_size(const JceTerrain *t, int cx, int cz, int lod,
+JCE_API void jce_terrain_chunk_mesh_size(const JceTerrain *t, int cx, int cz, int lod,
                                  int *out_vertex_count, int *out_index_count);
 
 /* Builds the chunk mesh into the caller-allocated buffers.  Returns
  * the actual vertex / index counts written.  Caller is responsible
  * for buffer capacity (use jce_terrain_chunk_mesh_size first). */
-void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
+JCE_API void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
                                   JceTerrainVertex *out_verts, int v_cap,
                                   uint32_t *out_indices,       int i_cap,
                                   int *out_vertex_count,
@@ -212,14 +212,14 @@ void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
 /* Apply a Gaussian-falloff brush at world XZ.  `strength` is per
  * second so the editor panel must scale by frame dt for stable
  * feel.  Radius is in world units. */
-void jce_terrain_sculpt_apply(JceTerrain *t,
+JCE_API void jce_terrain_sculpt_apply(JceTerrain *t,
                               JceTerrainSculptMode mode,
                               float wx, float wz,
                               float radius_world, float strength,
                               float dt);
 
 /* Paint splat layer `layer` (0..3) up at expense of the others. */
-void jce_terrain_splat_paint(JceTerrain *t, int layer,
+JCE_API void jce_terrain_splat_paint(JceTerrain *t, int layer,
                              float wx, float wz,
                              float radius_world, float strength,
                              float dt);
@@ -230,14 +230,14 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
  * only; the per-cell mask is serialized in the .bin side-car (v2). */
 
 /* Whether ANY cell is currently cut (also gates v2 serialization). */
-bool jce_terrain_has_holes(const JceTerrain *t);
+JCE_API bool jce_terrain_has_holes(const JceTerrain *t);
 
 /* Test / set a single cell (cx in 0..W-2, cz in 0..H-2). */
-bool jce_terrain_cell_is_hole(const JceTerrain *t, int cx, int cz);
-void jce_terrain_set_hole(JceTerrain *t, int cx, int cz, bool hole);
+JCE_API bool jce_terrain_cell_is_hole(const JceTerrain *t, int cx, int cz);
+JCE_API void jce_terrain_set_hole(JceTerrain *t, int cx, int cz, bool hole);
 
 /* Paint (erase=false) / fill (erase=true) holes under a circular world brush. */
-void jce_terrain_hole_apply(JceTerrain *t, float wx, float wz,
+JCE_API void jce_terrain_hole_apply(JceTerrain *t, float wx, float wz,
                             float radius_world, bool erase);
 
 /* -- Heightmap image import / export --------------------------- */

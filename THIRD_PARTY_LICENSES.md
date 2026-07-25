@@ -64,7 +64,7 @@ freely, subject to the following restrictions:
 
 ## FreeType
 
-- **Version**: 2.13.2
+- **Version**: 2.14.3
 - **License**: FreeType License (FTL) [selected]
 - **URL**: https://freetype.org/
 
@@ -172,7 +172,7 @@ SOFTWARE.
 
 ## bgfx / bx / bimg
 
-- **Version**: 1.129.8930-495
+- **Version**: 1.146.9306-550
 - **License**: BSD 2-Clause
 - **URL**: https://github.com/bkaradzic/bgfx
 
@@ -206,7 +206,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
 
 ## flecs
 
-- **Version**: 4.1.1
+- **Version**: 4.1.5
 - **License**: MIT
 - **URL**: https://github.com/SanderMertens/flecs
 
@@ -540,7 +540,7 @@ freely, subject to the following restrictions:
 
 ## mimalloc
 
-- **Version**: 2.2.4
+- **Version**: 3.3.2
 - **License**: MIT
 - **URL**: https://github.com/microsoft/mimalloc
 
@@ -785,7 +785,7 @@ THE SOFTWARE.
 
 ## RmlUi
 
-- **Version**: 4.4
+- **Version**: 6.2
 - **License**: MIT
 - **URL**: https://github.com/mikke89/RmlUi
 
@@ -846,7 +846,7 @@ SOFTWARE.
 
 ## Protocol Buffers (protobuf)
 
-- **Version**: 6.33.5
+- **Version**: 7.35.0
 - **License**: BSD 3-Clause
 - **URL**: https://github.com/protocolbuffers/protobuf
 

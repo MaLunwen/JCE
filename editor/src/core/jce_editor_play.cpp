@@ -17,7 +17,6 @@
 extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/physics/jce_physics.h>
-#include <jce/middleware/physics/jce_physics_layers.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
@@ -287,7 +286,12 @@ static void play_streaming_begin(void)
 
     JceFileSystem *fs = jce_fs_create();
     if (!fs) return;
-    jce_fs_mount_dir(fs, "", base);
+    if (!jce_fs_mount_dir(fs, "", base)) {
+        jce_fs_destroy(fs);
+        LOG_WARN(LOG_TAG, "world streaming: cannot mount asset root '%s' — disabled",
+                 base);
+        return;
+    }
 
     JceWorldStreamConfig wsc = jce_world_stream_config_default();
     wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR : JCE_STREAM_RADIAL;
@@ -300,7 +304,15 @@ static void play_streaming_begin(void)
     /* Hand the streamer a small worker pool so chunk disk-read + JSON-byte
      * staging run OFF the main thread (the apply/spawn stays time-sliced on
      * main); this kills the per-cell frame hitch.  Web has no real threads, so
-     * keep the cooperative single-thread path there. */
+     * keep the cooperative single-thread path there.
+     *
+     * Private, not jce_thread_pool_shared(): a chunk load is one whole-file
+     * read, so putting it on the shared pool would put it in reach of the
+     * frame loop's own cooperative waits — jce_thread_pool_parallel_for()
+     * runs whatever is queued while it waits, and a cull that lands on a cold
+     * multi-megabyte chunk read is precisely the hitch this pool exists to
+     * remove.  The three threads buy that isolation.  jce_thread.h documents
+     * the split and the priority-tier work that would end it. */
     JceThreadPool *pool = NULL;
 #if !JCE_PLATFORM_WEB
     /* Bench/diagnostic toggle (M2 A/B): JCE_STREAM_SYNC=1 forces the synchronous
@@ -429,17 +441,9 @@ void jce_state_play(void)
     /* Bridge the project Layer Collision Matrix + layer names into the
      * engine's process-wide physics matrix.  jce_physics_body_set_layer
      * (applied per body at spawn inside jce_runtime_create below) reads
-     * this engine matrix, so the push must happen first. */
-    if (ps) {
-        for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
-            jce_physics_layer_set_name(i, ps->tags_layers.layers[i]);
-            for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j) {
-                bool collides =
-                    (ps->physics.layer_collision_matrix[i] >> j) & 1u;
-                jce_physics_set_layer_collides(i, j, collides);
-            }
-        }
-    }
+     * this engine matrix, so the push must happen first.  Same conversion
+     * the cooked-build export uses — Play and ship cannot drift. */
+    jce_project_settings_push_physics_layers(ps);
 
     JceRuntimeDesc rd;
     memset(&rd, 0, sizeof(rd));
@@ -455,7 +459,19 @@ void jce_state_play(void)
      * back to its own defaults (1/60 timestep, -9.81 gravity). */
     if (ps) {
         rd.fixed_timestep = ps->time.fixed_timestep;
-        rd.gravity_y      = ps->physics.gravity[1];
+        /* Full gravity vector — the old rd.gravity_y silently dropped X/Z, so
+         * a project with tilted / non-Y gravity ran straight-down in Play. */
+        rd.gravity[0]     = ps->physics.gravity[0];
+        rd.gravity[1]     = ps->physics.gravity[1];
+        rd.gravity[2]     = ps->physics.gravity[2];
+        /* Physics tuning + time clamp + manual-sim gate (Project Settings). */
+        rd.solver_iterations    = ps->physics.default_solver_iterations;
+        rd.sleep_threshold      = ps->physics.sleep_threshold;
+        rd.disable_auto_physics = !ps->physics.auto_simulation;
+        rd.max_frame_dt         = ps->time.max_allowed_timestep;
+        /* 2D physics gets its OWN gravity (was reusing the 3D vector). */
+        rd.gravity2d[0]         = ps->physics2d.gravity[0];
+        rd.gravity2d[1]         = ps->physics2d.gravity[1];
     }
     /* Seed the runtime mixer from the same audio_mixer.json the Audio Mixer
      * panel writes (<root>/Settings/, project-scoped), so Music/SFX/Voice

@@ -56,8 +56,8 @@
 
 JCE_EXTERN_C_BEGIN
 
-/* Forward-declare flecs world (caller-owned). */
-typedef struct ecs_world_t ecs_world_t;
+/* The caller-owned ECS world is passed as an opaque void* (from
+ * jce_scene_get_world()); the concrete flecs type is private to the ABI. */
 
 /* ------------------------------------------------------------------ *
  *  Components
@@ -99,7 +99,7 @@ typedef struct JceAudioEcs JceAudioEcs;
 /* Register components in `world` and bind to caller-owned modules.
  * Any of `rz`/`occ`/`mx` may be NULL — the corresponding tick
  * function is then a no-op (graceful degradation). */
-JCE_API JceAudioEcs *jce_audio_ecs_create(ecs_world_t              *world,
+JCE_API JceAudioEcs *jce_audio_ecs_create(void                     *world,
                                           JceReverbZones           *rz,
                                           JceAudioOcclusionTracker *occ,
                                           JceAudioMixer            *mx);

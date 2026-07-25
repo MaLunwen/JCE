@@ -1,5 +1,5 @@
 /*
- * jce_anim_ozz.cpp  ozz-animation bridge implementation (C++17).
+ * jce_anim_ozz.cpp  ozz-animation bridge implementation (C++20).
  *
  * Wraps ozz-animation runtime types and SIMD math utilities behind the
  * extern "C" interface declared in jce_anim_ozz.h.  This is the only

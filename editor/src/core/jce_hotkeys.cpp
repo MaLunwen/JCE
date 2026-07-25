@@ -4,10 +4,12 @@
 
 #include "jce_hotkeys.h"
 #include "jce_editor_config.h"
+#include "jce_editor_i18n.h"   /* localize hotkey display names (hotkey.<id_string>) */
 #include "jce_editor_alloc.h"
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <jce/os/core/jce_json.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -96,6 +98,8 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "workspace.fx",              "Workspace / FX",              { ImGuiKey_F5, JCE_HKM_CTRL }, {} },
     { "workspace.rendering",       "Workspace / Rendering",       { ImGuiKey_F6, JCE_HKM_CTRL }, {} },
     { "workspace.uv_editing",      "Workspace / UV Editing",      { ImGuiKey_F7, JCE_HKM_CTRL }, {} },
+
+    { "edit.snap_to_ground",       "Edit / Snap To Ground",       { ImGuiKey_End, JCE_HKM_NONE }, {} },
 };
 /* clang-format on */
 
@@ -210,7 +214,13 @@ extern "C" JceHotkeyId jce_hotkey_find_conflict(JceHotkeyId for_id,
 extern "C" const char *jce_hotkey_name(JceHotkeyId id)
 {
     if (id < 0 || id >= JCE_HK_COUNT) return "";
-    return s_table[id].display;
+    /* Localized display name: key = "hotkey.<id_string>", English `display`
+     * as the fallback. Localizes every consumer (Hotkeys tab, Preferences,
+     * User Guide) without touching them. i18n_or returns a persistent pointer
+     * (the resolved translation or the fallback), so `key` being local is fine. */
+    char key[96];
+    std::snprintf(key, sizeof(key), "hotkey.%s", s_table[id].id_string);
+    return jce_editor_i18n_or(key, s_table[id].display);
 }
 extern "C" const char *jce_hotkey_id_string(JceHotkeyId id)
 {
@@ -274,7 +284,7 @@ extern "C" char *jce_hotkey_chord_label(JceHotkeyChord c, char *out, size_t n)
     return out;
 }
 
-/* ── Persistence (very small JSON; no library) ─────────────────────── */
+/* ── Persistence (schema: { "hotkeys": [ {id,key,mods}, ... ] }) ────── */
 
 extern "C" bool jce_hotkeys_save(void)
 {
@@ -282,32 +292,32 @@ extern "C" bool jce_hotkeys_save(void)
     char path[640];
     hotkeys_path(path, sizeof(path));
 
-    /* Build JSON in a heap buffer; bound estimate per row ≈ 120 bytes. */
-    size_t cap = 64 + (size_t)JCE_HK_COUNT * 128;
-    char *buf = (char *)ED_MALLOC(cap);
-    if (!buf) return false;
-    size_t off = 0;
-    int n = std::snprintf(buf + off, cap - off, "{\n  \"hotkeys\": [\n");
-    if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
-    off += (size_t)n;
-    for (int i = 0; i < JCE_HK_COUNT; ++i) {
-        n = std::snprintf(buf + off, cap - off,
-            "    { \"id\": \"%s\", \"key\": %d, \"mods\": %u }%s\n",
-            s_table[i].id_string,
-            (int)s_table[i].cur.key,
-            (unsigned)s_table[i].cur.mods,
-            (i + 1 < JCE_HK_COUNT) ? "," : "");
-        if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
-        off += (size_t)n;
+    JceJson *root = jce_json_object();
+    JceJson *arr  = jce_json_array();
+    if (!root || !arr) {
+        jce_json_free(root);
+        jce_json_free(arr);
+        return false;
     }
-    n = std::snprintf(buf + off, cap - off, "  ]\n}\n");
-    if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
-    off += (size_t)n;
+    jce_json_set_child(root, "hotkeys", arr);   /* arr now owned by root */
+    for (int i = 0; i < JCE_HK_COUNT; ++i) {
+        JceJson *item = jce_json_object();
+        if (!item) { jce_json_free(root); return false; }
+        jce_json_set_string(item, "id",   s_table[i].id_string);
+        jce_json_set_int   (item, "key",  s_table[i].cur.key);
+        jce_json_set_int   (item, "mods", (int)s_table[i].cur.mods);
+        jce_json_array_push(arr, item);
+    }
+
+    char *text = jce_json_print(root, /*pretty=*/true);
+    jce_json_free(root);
+    if (!text) return false;
 
     /* Atomic: a torn hotkeys.json parses as absent and silently resets
-     * every binding to defaults. */
-    bool ok = jce_fs_host_write_all_atomic(path, buf, off);
-    ED_FREE(buf);
+     * every binding to defaults.  (Hence printing to a buffer instead of
+     * jce_json_write_file, which is a plain write.) */
+    bool ok = jce_fs_host_write_all_atomic(path, text, std::strlen(text));
+    jce_json_free_string(text);
     return ok;
 }
 
@@ -320,37 +330,29 @@ extern "C" bool jce_hotkeys_load(void)
     if (!buf) return false;
     if (len > (1 << 20)) { ED_FREE(buf); return false; }
 
-    /* Tiny scanner: look for "id": "...", "key": N, "mods": N triples. */
-    const char *p = buf;
-    while (p && *p) {
-        const char *id_key = std::strstr(p, "\"id\"");
-        if (!id_key) break;
-        const char *q1 = std::strchr(id_key + 4, '"'); if (!q1) break;
-        const char *q2 = std::strchr(q1 + 1,    '"'); if (!q2) break;
-        char idbuf[64] = {0};
-        size_t idlen = (size_t)(q2 - q1 - 1);
-        if (idlen >= sizeof(idbuf)) idlen = sizeof(idbuf) - 1;
-        std::memcpy(idbuf, q1 + 1, idlen);
+    JceJson *root = jce_json_parse(buf, len);
+    ED_FREE(buf);
+    if (!root) return false;   /* malformed: keep the bindings already loaded */
 
-        const char *key_key  = std::strstr(q2, "\"key\"");
-        const char *mods_key = std::strstr(q2, "\"mods\"");
-        if (!key_key || !mods_key) break;
-        int keyv = 0; unsigned modsv = 0;
-        std::sscanf(key_key,  "\"key\" : %d", &keyv);
-        if (keyv == 0) std::sscanf(key_key,  "\"key\":%d",  &keyv);
-        std::sscanf(mods_key, "\"mods\" : %u", &modsv);
-        if (modsv == 0 && std::strstr(mods_key, "0") == nullptr)
-            std::sscanf(mods_key, "\"mods\":%u", &modsv);
+    JceJson *arr = jce_json_get(root, "hotkeys");
+    int n = jce_json_array_size(arr);   /* 0 when absent or not an array */
+    for (int e = 0; e < n; ++e) {
+        JceJson *item = jce_json_array_at(arr, e);
+        const char *id = jce_json_string_value(jce_json_get(item, "id"), nullptr);
+        /* A row without "key" says nothing about the binding, so leave it
+         * alone; key 0 is a deliberate unbind and must round-trip. */
+        if (!id || !jce_json_has(item, "key")) continue;
 
+        /* Ids no longer in s_table (renamed / retired) find no match and are
+         * silently skipped. */
         for (int i = 0; i < JCE_HK_COUNT; ++i) {
-            if (std::strcmp(s_table[i].id_string, idbuf) == 0) {
-                s_table[i].cur.key  = keyv;
-                s_table[i].cur.mods = (uint8_t)modsv;
+            if (std::strcmp(s_table[i].id_string, id) == 0) {
+                s_table[i].cur.key  = jce_json_get_int(item, "key", 0);
+                s_table[i].cur.mods = (uint8_t)(jce_json_get_int(item, "mods", 0) & 0xFF);
                 break;
             }
         }
-        p = mods_key + 1;
     }
-    ED_FREE(buf);
+    jce_json_free(root);
     return true;
 }

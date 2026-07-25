@@ -38,7 +38,7 @@ JCE_API void jce_sprite_batch_begin(JceSpriteBatch *batch);
  * @param color     ABGR color tint.
  * @param sort_key  Sorting key (lower = drawn first).
  */
-void jce_sprite_batch_add(JceSpriteBatch *batch,
+JCE_API void jce_sprite_batch_add(JceSpriteBatch *batch,
                            JceTexture texture,
                            const float *world,
                            float u0, float v0, float u1, float v1,
@@ -46,7 +46,7 @@ void jce_sprite_batch_add(JceSpriteBatch *batch,
 
 /* Flush all queued sprites as draw calls.
  * Uses transient buffers for zero-copy GPU upload. */
-void jce_sprite_batch_flush(JceSpriteBatch *batch,
+JCE_API void jce_sprite_batch_flush(JceSpriteBatch *batch,
                              const JceRenderer *renderer,
                              uint16_t view_id);
 

@@ -17,6 +17,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "jce_panel_common.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_build_manager.h"
 #include "core/jce_cook_manager.h"
@@ -162,6 +163,18 @@ static void refresh_prefill_from_project(void)
     if (p->target_name && p->target_name[0]) {
         snprintf(s_bp.build_target, sizeof(s_bp.build_target),
                  "%s", p->target_name);
+    }
+    /* Project Settings > Build > "CMake Target" (JceEditorConfig.game_target_name)
+     * overrides the jce_project.json target when the user set it, so the
+     * Project-Settings field is authoritative for the --target the engine-
+     * workspace build passes (previously game_target_name was persisted but
+     * never read by any builder). */
+    {
+        JceEditorConfig ecfg;
+        if (jce_editor_config_load(&ecfg) && ecfg.game_target_name[0]) {
+            snprintf(s_bp.build_target, sizeof(s_bp.build_target),
+                     "%s", ecfg.game_target_name);
+        }
     }
     if (p->output_exe && p->output_exe[0]) {
         snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
@@ -538,48 +551,16 @@ static void apply_post_success(const JceBuildStatus &st)
  * its own window chrome, so we can render it as a tab here. */
 extern "C" void build_report_draw_content(void);
 
-static int g_request_tab = -1;
-static int g_current_tab = 0;  /* mirror of active TabItem for menu markers */
-static bool g_tab_state_loaded = false;
-
-static const char *k_tab_state_key = "panel.build_profiles.current_tab";
-
-static bool valid_tab(int idx)
-{
-    return idx >= 0 && idx <= 1;
-}
-
-static void ensure_tab_state_loaded(void)
-{
-    if (g_tab_state_loaded)
-        return;
-    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
-    g_request_tab = g_current_tab;
-    g_tab_state_loaded = true;
-}
-
-static void set_current_tab(int idx)
-{
-    if (!valid_tab(idx) || g_current_tab == idx)
-        return;
-    g_current_tab = idx;
-    if (g_tab_state_loaded)
-        jce_editor_ui_state_save_int(k_tab_state_key, idx);
-}
+static JcePanelTabState g_tabs{ "panel.build_profiles.current_tab", /*max_tab=*/1 };
 
 extern "C" void jce_panel_build_profiles_request_tab(int idx)
 {
-    if (!valid_tab(idx))
-        return;
-    g_request_tab = idx;
-    g_current_tab = idx;
-    jce_editor_ui_state_save_int(k_tab_state_key, idx);
+    jce_panel_tab_request(g_tabs, idx);
 }
 
 extern "C" int jce_panel_build_profiles_current_tab(void)
 {
-    ensure_tab_state_loaded();
-    return g_current_tab;
+    return jce_panel_tab_current(g_tabs);
 }
 
 static void draw_project_root_strip(void)
@@ -1322,12 +1303,12 @@ static void draw_profiles_tab(void)
 
 extern "C" void jce_editor_panel_build_profiles_content(void)
 {
-    ensure_tab_state_loaded();
+    jce_panel_tab_ensure_loaded(g_tabs);
     if (!ImGui::BeginTabBar("##bp_tabs"))
         return;
 
-    ImGuiTabItemFlags prof_flags   = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags report_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags prof_flags   = jce_panel_tab_flags(g_tabs, 0);
+    ImGuiTabItemFlags report_flags = jce_panel_tab_flags(g_tabs, 1);
 
     char prof_label[64];
     char report_label[64];
@@ -1337,18 +1318,18 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
                   jce_editor_i18n("panel.build_report.title"));
 
     if (ImGui::BeginTabItem(prof_label, nullptr, prof_flags)) {
-        set_current_tab(0);
+        jce_panel_tab_set_current(g_tabs, 0);
         draw_profiles_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(report_label, nullptr, report_flags)) {
-        set_current_tab(1);
+        jce_panel_tab_set_current(g_tabs, 1);
         build_report_draw_content();
         ImGui::EndTabItem();
     }
 
     ImGui::EndTabBar();
-    g_request_tab = -1;
+    g_tabs.request = -1;
 }
 
 extern "C" void jce_editor_panel_build_profiles(void)

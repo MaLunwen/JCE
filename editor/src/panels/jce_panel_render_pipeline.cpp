@@ -10,6 +10,7 @@
  * _tick() for any per-frame housekeeping (currently just guards init).
  */
 
+#include "jce_panel_common.h"
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_texture.h>
+#include <jce/os/core/jce_console.h>   /* r.upscaler live cvar */
 }
 
 /* ── Panel state ──────────────────────────────────────────────────── */
@@ -213,6 +215,29 @@ void jce_editor_panel_render_pipeline_content(void)
                     "panel.render_pipeline.quality.tex_lod_bias.tip"));
         }
 
+        /* Dynamic-resolution upscaler — LIVE cvar r.upscaler (not part of the
+         * .rp.json asset, like the tex-LOD bias above): Off / RCAS / TSR.
+         * Only active while dynamic resolution is downscaling (GPU-bound). */
+        {
+            JceCvar *cv = jce_cvar_find("r.upscaler");
+            int up = cv ? jce_cvar_get_int(cv) : 1;
+            if (up < 0) up = 0;
+            if (up > 2) up = 2;
+            const char *kUpLabels[] = {
+                jce_editor_i18n("panel.render_pipeline.quality.upscaler.off"),
+                jce_editor_i18n("panel.render_pipeline.quality.upscaler.rcas"),
+                jce_editor_i18n("panel.render_pipeline.quality.upscaler.tsr") };
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::Combo("##rp_upscaler", &up, kUpLabels, 3) && cv)
+                jce_cvar_set_int(cv, up);
+            ImGui::SameLine();
+            ImGui::TextUnformatted(jce_editor_i18n(
+                "panel.render_pipeline.quality.upscaler"));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n(
+                    "panel.render_pipeline.quality.upscaler.tip"));
+        }
+
         /* CSM cascade count 1–4. */
         int cascades = (int)s_rp.desc.csm_cascade_count;
         ImGui::SetNextItemWidth(110.0f);
@@ -339,16 +364,9 @@ void jce_editor_panel_render_pipeline_tick(void)
  * keep working. */
 extern "C" void jce_editor_panel_render_pipeline(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_RENDER_PIPELINE);
-    if (!vis || !*vis) return;
-    *vis = false;
-
-    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
-    if (ls_vis) *ls_vis = true;
-
-    char title[128];
-    snprintf(title, sizeof(title), "%s###lighting_settings",
-             jce_editor_i18n("panel.lighting.title"));
-    ImGui::SetWindowFocus(title);
-    jce_panel_lighting_settings_request_tab(4);
+    if (jce_panel_redirect_to_workbench(JCE_PANEL_RENDER_PIPELINE,
+                                        JCE_PANEL_LIGHTING_SETTINGS,
+                                        "panel.lighting.title",
+                                        "lighting_settings"))
+        jce_panel_lighting_settings_request_tab(4);
 }

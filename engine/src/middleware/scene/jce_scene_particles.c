@@ -340,6 +340,15 @@ void jce_scene_particle_burst(JceScene *s, JceEntity e, int count)
     JceEmitterHandle h;
     JceParticleSystem *sys = sp_resolve(s, e, &h);
     if (!sys) return;
+    /* Sync the emitter origin to the entity's CURRENT world position before
+     * bursting.  A script that does jce.set_position + jce.particle_burst in
+     * the same tick must spawn AT the just-set position: the per-tick origin
+     * sync in sp_each runs only during jce_scene_particles_update, AFTER the
+     * script tick, so without this the burst fires from the PREVIOUS sync's
+     * origin (e.g. lightning bursts landing at the prior strike point). */
+    jce_mat4 w = jce_scene_get_world_matrix(s, e);
+    jce_particles_emitter_set_position(
+        sys, h, jce_v3(w.raw[3][0], w.raw[3][1], w.raw[3][2]));
     jce_particles_emitter_burst(sys, h, (uint32_t)count);
 }
 

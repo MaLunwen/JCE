@@ -134,6 +134,17 @@ JCE_API bool jce_model_importer_load_parts_memory(const void    *data,
                                                   JceModelParts  *out);
 JCE_API void jce_model_importer_free_parts(JceModelParts *parts);
 
+/* AUTHORING-ONLY, and host-filesystem-only by necessity — there is
+ * deliberately no _memory twin.  Assimp cannot follow an OBJ's sibling .mtl
+ * or a non-GLB glTF's sibling .bin from a memory buffer, and this call also
+ * probes sibling texture files and WRITES a GLB's embedded textures next to
+ * the model, so a read-only VFS/PAK mount cannot serve it.  Packaged content
+ * (PAK / bundle / mod) never needs it: cooked meshes carry their materials.
+ *
+ * The *_tex fields come back as HOST paths relative to the process CWD, so a
+ * caller storing them in a scene/asset reference MUST canonicalise them first
+ * (the editor uses jce_editor_path_store_asset_ref) or the host layout leaks
+ * into serialised content. */
 JCE_API bool jce_model_importer_extract_material(const char           *file_path,
                                                  JceModelMaterialInfo *out);
 
@@ -162,6 +173,10 @@ typedef struct JceModelInspectResult {
     char      error[256];
 } JceModelInspectResult;
 
+/* _memory is the VFS/PAK/bundle-capable entry; _file is the complete one —
+ * Assimp resolves data spread across sibling files (OBJ .mtl, glTF .bin) only
+ * when given a path, so _memory degrades on those formats.  Prefer _file and
+ * fall back to _memory when the bytes are all you have. */
 JCE_API bool jce_model_importer_inspect_memory(const void *data, size_t size,
                                                const char *ext_hint,
                                                bool        want_wireframe,
