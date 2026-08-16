@@ -6,10 +6,9 @@
  * Designed for both open-world (distance rings) and RTS
  * (rectangular viewport) streaming strategies.
  *
- * On Emscripten (WASM), threads are restricted.  When single_thread
- * is true (auto-detected on web), the system uses a cooperative
- * frame-budget approach: each jce_streaming_update() call processes
- * at most one pending load/unload within the given time budget.
+ * Loading uses a private structured executor. On Emscripten (WASM),
+ * single_thread is auto-enabled and the executor advances cooperatively
+ * from jce_streaming_update() within the frame budget.
  *
  * Layer: Resource Streaming (Layer 3).
  */
@@ -78,9 +77,8 @@ typedef struct {
     uint32_t      max_pending;      /* max concurrent async loads */
     uint32_t      budget_mb;        /* memory budget in MiB */
 
-    /* Single-thread mode: when true, loading is done cooperatively
-       within jce_streaming_update() using a per-frame time budget.
-       Auto-detected on Emscripten if not explicitly set. */
+    /* Cooperative mode: when true, one deferred load is advanced from
+       jce_streaming_update() per frame. Auto-enabled on Emscripten. */
     bool          single_thread;
 
     /* Per-frame time budget for single-thread mode, in milliseconds.
@@ -145,8 +143,8 @@ JCE_API void                jce_streaming_destroy(JceStreamingSystem *sys);
 /* Bind file system for loading. Must be called before streaming starts. */
 JCE_API void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem *fs);
 
-/* Bind thread pool for multi-threaded loading (optional).
- * If not set, single_thread mode is forced. */
+/* Legacy compatibility hook. Streaming now owns a structured executor, so
+ * the supplied frame-job pool is not borrowed. New code may omit this call. */
 JCE_API void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool);
 
 /* Set callbacks for chunk load/unload events (optional). */

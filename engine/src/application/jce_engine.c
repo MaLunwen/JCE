@@ -10,11 +10,13 @@
 #include <jce/application/jce_args.h>
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_lifecycle.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_fixed_clock.h>
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/runtime/jce_player_loop.h>
 
 #include "os/core/jce_memory.h"
@@ -40,6 +42,7 @@
 #include <jce/middleware/ui/jce_localization.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
+#include "os/core/jce_sampler.h"
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_archive.h>
@@ -58,12 +61,15 @@
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_modal_loop.h>
 #include <jce/renderer/jce_renderer.h>
+#include "renderer/jce_view_bands.h"
 #include <jce/renderer/jce_lowlevel.h>   /* jce_gfx_stats_capture — per-view GPU timing */
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/resource/jce_asset.h>
 
 #include "jce_embedded_assets.h"
+#include "jce_engine_windowed_input.h"
+#include "os/platform/jce_input_sdl.h"
 #include "os/platform/jce_window_internal.h"
 #include "renderer/jce_gpu_caps.h"
 
@@ -108,8 +114,8 @@ static char        g_config_path_override[512];
 static char        g_pak_path_override[512];
 static char        g_bundle_catalog_path[512];
 
-void JCE_CALL jce_engine_request_quit(void)  { g_quit_requested = true; }
-bool JCE_CALL jce_engine_quit_requested(void) { return g_quit_requested; }
+void jce_engine_request_quit(void)  { g_quit_requested = true; }
+bool jce_engine_quit_requested(void) { return g_quit_requested; }
 static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
 void jce_engine_set_app_desc_sized(const JceAppDesc *desc, size_t desc_size)
@@ -181,7 +187,7 @@ void jce_engine_set_bundle_catalog_path(const char *path)
  * descriptor, then the individual toggles override on top.  "custom" keeps
  * whatever the boot resolution (.rp.json or tier preset) produced and only
  * layers the toggles.  No-op when no [graphics] section was loaded. */
-void JCE_CALL jce_engine_apply_graphics_config(const struct JceConfig *cfg,
+void jce_engine_apply_graphics_config(const struct JceConfig *cfg,
                                                struct JceRenderer *renderer)
 {
     if (!cfg || !cfg->gfx_valid) return;
@@ -273,15 +279,43 @@ static void jce_select_user_input_actions_path(char *out_path, size_t out_size)
     }
 }
 
-#define JCE_INPUT_ACTIONS_PAK_PATH "settings/input_actions.json"
 #define JCE_INPUT_ACTIONS_MAX_BYTES (256u * 1024u)
+
+/* Secure Dist archives deliberately omit debug paths and key the archive
+ * index.  Keep this engine-owned bootstrap address out of the executable's
+ * static string table as well: otherwise a release can pass archive
+ * encryption/authentication while still disclosing one protected virtual
+ * path through the loader's own literal.  This raises static-analysis cost;
+ * it is not a substitute for the authenticated archive. */
+static void jce_input_actions_pak_path(char out_path[28])
+{
+    static const volatile uint8_t encoded[27] = {
+        0xd4, 0xa1, 0x95, 0x8a, 0x72, 0x56, 0x32, 0x01, 0xa0,
+        0xc5, 0xa7, 0x96, 0x76, 0x54, 0x62, 0x3b, 0x14, 0xe0,
+        0xd8, 0xa1, 0x85, 0x7b, 0x0b, 0x28, 0x2c, 0x13, 0xf7
+    };
+    const size_t encoded_size = sizeof(encoded) / sizeof(encoded[0]);
+    size_t i;
+
+    for (i = 0; i < encoded_size; ++i) {
+        uint8_t mask = (uint8_t)(0xa7u + (uint8_t)(i * 29u));
+        out_path[i] = (char)(encoded[i] ^ mask);
+    }
+    out_path[encoded_size] = '\0';
+}
 
 static JceInputActions *jce_actions_load_pak(const JcePakArchive *pak)
 {
+    char path[28];
+    const JcePakAsset *asset;
+    size_t i;
+
     if (!pak)
         return NULL;
-    const JcePakAsset *asset =
-        jce_pak_find(pak, JCE_INPUT_ACTIONS_PAK_PATH);
+    jce_input_actions_pak_path(path);
+    asset = jce_pak_find(pak, path);
+    for (i = 0; i < sizeof(path); ++i)
+        ((volatile char *)path)[i] = '\0';
     if (!asset || asset->original_size == 0 ||
         asset->original_size > JCE_INPUT_ACTIONS_MAX_BYTES)
         return NULL;
@@ -302,7 +336,7 @@ static JceInputActions *jce_actions_load_pak(const JcePakArchive *pak)
  * / cache hooks fire even before our own budget tripped.  Other events
  * are logged at info level when JCE_DEBUG is on (lifecycle visibility
  * is cheap and very useful during platform bring-up). */
-static void JCE_CALL engine_lifecycle_listener(JceLifecycleEvent event, void *user)
+static void engine_lifecycle_listener(JceLifecycleEvent event, void *user)
 {
     (void)user;
     LOG_INFO(LOG_TAG, "lifecycle: %s", jce_lifecycle_event_to_string(event));
@@ -316,6 +350,7 @@ struct JceEngine {
     JceConfig        config;
     JceGpuCaps       gpu_caps;
     bool             headless;        /* dedicated-server: no window/GPU/audio/UI */
+    bool             hidden_window;   /* real GPU device, window never mapped */
     JceWindow       *window;
     JceInput        *input;
     JceInputActions *actions;       /* action-map layer (QW-input-actions) */
@@ -446,6 +481,25 @@ static const JceFsPakProvider ENG_PAK_PROVIDER = {
     eng_pak_find, eng_pak_asset_size, eng_pak_decompress
 };
 
+/* See jce_engine_windowed_input.h for why the create and the install are one
+ * named function instead of two adjacent lines in jce_engine_create: it is the
+ * only way the install line is reachable from a test with no display, and the
+ * P0 this guards against shipped precisely because nothing without a display
+ * could see it. */
+JceInput *jce_engine_create_windowed_input(void)
+{
+    JceInput *in = jce_input_create();
+    if (!in)
+        return NULL;
+
+    /* jce_input_create() installs no backend by design (see jce_input.c) --
+     * this is the install jce_input_sdl.h's own header comment already
+     * promises callers.  Without it open_device is never called, so
+     * SDL_OpenGamepad never runs and no gamepad event reaches the app. */
+    jce_input_set_backend(in, jce_input_sdl_backend());
+    return in;
+}
+
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
     /* Snapshot argv first so any subsystem init below can read launch
@@ -460,7 +514,19 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     jce_log_init();
     jce_log_set_thread_name("MAIN");
     jce_thread_mark_main();
+    {
+        const char *trace_env = SDL_getenv("JCE_TRACE");
+        const char *perf_env = SDL_getenv("JCE_PERF_LOG");
+        bool trace_on = (trace_env && trace_env[0] != '0') ||
+                        (perf_env && perf_env[0] != '0');
+#ifndef NDEBUG
+        trace_on = true;
+#endif
+        jce_trace_set_enabled(trace_on);
+        jce_trace_thread_register("MAIN");
+    }
     jce_crash_handler_init();
+    jce_sampler_init();   /* no-op unless JCE_SAMPLER is set */
 
     JceEngine *e = JCE_CALLOC(1, sizeof(*e));
     if (!e) return NULL;
@@ -502,6 +568,42 @@ JceEngine *jce_engine_create(int argc, char *argv[])
                       (hl_env && hl_env[0] && hl_env[0] != '0');
     }
 
+    /* JCE_WINDOW_HIDDEN=1: a REAL GPU device on an unmapped window.  This is
+     * not a weaker `headless`; it is the other axis.  headless removes the
+     * device (bgfx NOOP) and with it draw() and every pixel, so a capture
+     * harness cannot use it.  Hidden keeps the whole windowed path — device,
+     * swapchain, draw(), screenshot readback — and only withholds the window
+     * from the desktop, which is what lets an offscreen capture run without
+     * stealing focus.  Ignored when headless is on: there is no window to
+     * hide.  Measured on this platform before the flag was added; see the
+     * comment on JCE_WINDOW_HIDDEN in jce_window.h. */
+    {
+        const char *hw_env = getenv("JCE_WINDOW_HIDDEN");
+        e->hidden_window = !e->headless &&
+                           (hw_env && hw_env[0] && hw_env[0] != '0');
+        if (e->hidden_window)
+            LOG_INFO(LOG_TAG, "JCE_WINDOW_HIDDEN=1: real GPU device, window "
+                              "never mapped");
+    }
+
+    /* The windowed branch below asks for SDL_INIT_JOYSTICK alongside
+     * SDL_INIT_GAMEPAD.  That is EXPLICIT, not load-bearing, and the
+     * difference was measured rather than assumed.  The design note this line
+     * came from said SDL_EVENT_JOYSTICK_* is "never generated without
+     * SDL_INIT_JOYSTICK"; that is wrong on SDL3.  Probing SDL_WasInit()
+     * straight after SDL_Init(VIDEO|GAMEPAD) on Windows x64 returns
+     * 0x00000200 for JOYSTICK -- SDL already brings the joystick subsystem up
+     * as a dependency of GAMEPAD, so raw joystick events flow either way
+     * today.
+     *
+     * It is asked for anyway, because JCE consumes raw joystick events in
+     * their own right (the wheel / HOTAS / arcade-stick translator cases) and
+     * a dependency that exists only as an implementation detail of another
+     * subsystem is not a contract: SDL subsystems are refcounted, so the day
+     * anything calls SDL_QuitSubSystem(SDL_INIT_GAMEPAD) -- nothing in this
+     * repo does today, grep says -- the implied joystick refcount would go
+     * with it and raw devices would go silent.  One flag states the
+     * dependency instead of inheriting it. */
     if (e->headless) {
         if (!SDL_Init(SDL_INIT_EVENTS)) {
             fatal_msg("SDL_Init(EVENTS) failed: %s", SDL_GetError());
@@ -510,15 +612,31 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         }
         LOG_INFO(LOG_TAG, "HEADLESS boot: no window, no GPU device, no audio/UI "
                  "(dedicated-server mode)");
-    } else if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    } else if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD |
+                         SDL_INIT_JOYSTICK)) {
         fatal_msg("SDL_Init failed: %s", SDL_GetError());
         JCE_FREE(e);
         return NULL;
     }
 
-    /* Servers routinely run several instances on one host; the single-instance
-     * activation dance (window restore/foreground) is meaningless headless. */
-    if (!e->headless && !jce_single_instance_lock(e->config.window_title)) {
+    /*
+     * Servers routinely run several instances on one host.  Windowed CI and
+     * profiler A/B runs may opt in as well, so they never steal focus from an
+     * interactive editor that happens to be open on the same workstation.
+     */
+    const char *multi_instance_env = SDL_getenv("JCE_MULTI_INSTANCE");
+    bool allow_multiple_instances =
+        e->headless ||
+        /* A hidden run has no window to activate and no focus to steal, so
+         * the single-instance handshake below — which exists to raise the
+         * FIRST instance's window instead of showing a modal — would instead
+         * silently exit a capture run whenever an editor happens to be open.
+         * That failure mode is a green build and a missing PNG. */
+        e->hidden_window ||
+        (multi_instance_env && multi_instance_env[0] &&
+         multi_instance_env[0] != '0');
+    if (!allow_multiple_instances &&
+        !jce_single_instance_lock(e->config.window_title)) {
         /* Second instance: activate the first instance's window instead
          * of interrupting the user with a modal — restore it if
          * minimized, best-effort foreground, and flash its taskbar
@@ -531,6 +649,16 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         SDL_Quit();
         JCE_FREE(e);
         return NULL;
+    }
+    if (!e->headless && allow_multiple_instances)
+        LOG_INFO(LOG_TAG, "JCE_MULTI_INSTANCE set: single-instance lock bypassed");
+
+    /* Long-lived background work has a process-wide structured executor.
+     * Create it on the registered main thread so owner completions are
+     * deterministic and the published worker configuration is respected. */
+    if (!jce_async_default_executor()) {
+        fatal_msg("Structured async executor initialization failed");
+        goto fail;
     }
 
     /* Force landscape on mobile / mobile-web. JCE_PLATFORM_TOUCH covers
@@ -673,6 +801,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
                        | (e->config.fullscreen ? JCE_WINDOW_FULLSCREEN : 0)
                        | (e->config.maximized  ? JCE_WINDOW_MAXIMIZED  : 0)
                        | (g_app_desc_set && g_app_desc.maximized ? JCE_WINDOW_MAXIMIZED : 0)
+                       | (e->hidden_window ? JCE_WINDOW_HIDDEN : 0)
         };
         e->window = jce_window_create(&win_cfg);
         if (!e->window) {
@@ -736,36 +865,37 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         jce_renderer_set_shaders(e->renderer, &shaders);
     }
 
-    if (jce_renderer_is_fallback(e->renderer)) {
-        SDL_ShowSimpleMessageBox(
-            SDL_MESSAGEBOX_WARNING,
-            "JCE - GPU Unsupported",
-            "Hardware acceleration could not be "
-            "initialized.\nThe application will now "
-            "run in safe fallback mode.",
-            jce_window_sdl(e->window));
-        jce_engine_reset_frame_clock(e);
-        return e;
-    }
-
-    /* -- Remaining subsystems ------------------------------------- */
-
-    if (should_render_loading_frame()) {
-        render_loading_frame(e->renderer, e->window, "Loading...");
-    }
-    jce_gpu_caps_init(&e->gpu_caps);
-
-    /* Render Pipeline Asset (P3-E.4): pick `<cwd>/Settings/RenderPipeline.rp.json`
-     * if present, otherwise fall back to the preset matching the GPU tier. */
-    jce_render_pipeline_apply_boot("Settings/RenderPipeline.rp.json");
-
-    /* Settings S7 follow-up: layer the player's saved in-game graphics
-     * choices (jce.ini [graphics]) on top of the boot resolution above —
-     * the same seam where the other jce.ini sections (window/audio) apply.
-     * No-op for configs without the section. */
-    jce_engine_apply_graphics_config(&e->config, e->renderer);
-
-    e->input = jce_input_create();
+    /* Raw input, the action map and record/replay are created HERE -- above
+     * the fallback-renderer early return below -- and not after it.  They used
+     * to sit below it, so a machine that fell back to the software renderer
+     * returned from jce_engine_create with e->input and e->actions NULL for the
+     * life of the process.  Nothing here needs a working GPU, so nothing here
+     * belongs behind that return.
+     *
+     * WHAT THAT DOES AND DOES NOT BUY -- the first version of this comment
+     * overstated it, and it is the overstatement that got reviewed.  A
+     * safe-mode boot does NOT come away with a populated JceServices: e->svc is
+     * assembled in the "Build services struct" block far below, and so are
+     * jce_subsystem_init_all() and the app's init() -- all three downstream of
+     * the same return.  No consumer is handed a JceServices on that path at
+     * all, so nothing could have dereferenced a NULL .input / .actions.  What
+     * actually changes is narrower, and it is real:
+     *   - jce_engine_event()'s jce_input_handle_event() and the
+     *     jce_input_update() inside jce_engine_iterate's fallback branch now
+     *     drive a live JceInput instead of being skipped by their NULL guards;
+     *   - jce_engine_get_actions(), the public accessor an SDK host may call on
+     *     a JceEngine* it holds, returns a loaded map instead of NULL.
+     * The map is loaded but NOT evaluated in safe mode: jce_actions_update()
+     * sits below the fallback branch's own early return in jce_engine_iterate,
+     * so every action value stays at its initial state for the process
+     * lifetime.  Moving this block back down would only re-NULL that accessor,
+     * so it stays; the inertness is written down rather than papered over by
+     * wiring app init onto a path that deliberately returns before it.
+     *
+     * The create and the SDL-backend install are one named function so the
+     * install is reachable from a test with no window: see
+     * jce_engine_windowed_input.h. */
+    e->input = jce_engine_create_windowed_input();
     if (!e->input) {
         fatal_msg("Input system init failed");
         goto fail;
@@ -784,8 +914,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         if (e->actions) {
             LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
         } else if ((e->actions = jce_actions_load_pak(e->pak)) != NULL) {
-            LOG_INFO(LOG_TAG, "input actions loaded from PAK: %s",
-                     JCE_INPUT_ACTIONS_PAK_PATH);
+            LOG_INFO(LOG_TAG, "input actions loaded from embedded PAK");
         } else {
             jce_select_user_input_actions_path(actions_path,
                                                sizeof(actions_path));
@@ -793,7 +922,20 @@ JceEngine *jce_engine_create(int argc, char *argv[])
             if (e->actions)
                 LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
         }
-        if (!e->actions) {
+        if (e->actions) {
+            /* A loaded map wins outright, which is how a plugged-in pad ended
+             * up dead: every map on disk is keyboard-only (the editor's bind
+             * editor cannot author a pad bind), and the defaults above are
+             * only reached when EVERY load path fails.  Merge the canonical
+             * pad bindings into the loaded map in memory -- the user's file is
+             * never rewritten, and a map that already has any pad binding, or
+             * that set "gamepad_defaults": false, is left exactly as authored. */
+            int added = jce_actions_merge_gamepad_defaults(e->actions);
+            if (added > 0)
+                LOG_INFO(LOG_TAG,
+                         "input actions: merged %d default gamepad binding(s) "
+                         "into a map that had none", added);
+        } else {
             e->actions = jce_actions_create();
             if (e->actions) {
                 jce_actions_bind_fps_defaults(e->actions);
@@ -841,6 +983,35 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         }
     }
 
+    if (jce_renderer_is_fallback(e->renderer)) {
+        SDL_ShowSimpleMessageBox(
+            SDL_MESSAGEBOX_WARNING,
+            "JCE - GPU Unsupported",
+            "Hardware acceleration could not be "
+            "initialized.\nThe application will now "
+            "run in safe fallback mode.",
+            jce_window_sdl(e->window));
+        jce_engine_reset_frame_clock(e);
+        return e;
+    }
+
+    /* -- Remaining subsystems ------------------------------------- */
+
+    if (should_render_loading_frame()) {
+        render_loading_frame(e->renderer, e->window, "Loading...");
+    }
+    jce_gpu_caps_init(&e->gpu_caps);
+
+    /* Render Pipeline Asset (P3-E.4): pick `<cwd>/Settings/RenderPipeline.rp.json`
+     * if present, otherwise fall back to the preset matching the GPU tier. */
+    jce_render_pipeline_apply_boot("Settings/RenderPipeline.rp.json");
+
+    /* Settings S7 follow-up: layer the player's saved in-game graphics
+     * choices (jce.ini [graphics]) on top of the boot resolution above —
+     * the same seam where the other jce.ini sections (window/audio) apply.
+     * No-op for configs without the section. */
+    jce_engine_apply_graphics_config(&e->config, e->renderer);
+
     /* JCE_AUDIO_DISABLE: skip audio entirely (diagnostic A/B — on wasm the
      * miniaudio callback runs on the MAIN thread via ScriptProcessorNode,
      * so this isolates "is the frame-time hole the audio path?").  The
@@ -858,9 +1029,10 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     if (e->audio && e->config.master_volume < 1.0f)
         jce_audio_set_master_volume(e->audio, e->config.master_volume);
 
-    /* Headless boot rejoins here: skips shaders, GPU caps, render pipeline,
-     * graphics config, raw input, input actions/record-replay, and audio —
-     * all windowed/GPU/HID concerns.  PAK, asset manager, event bus,
+    /* Headless boot rejoins here: skips shaders, raw input, input
+     * actions/record-replay, GPU caps, render pipeline, graphics config, and
+     * audio — all windowed/GPU/HID concerns.  (Listed in code order; input now
+     * precedes GPU caps because it moved above the fallback-renderer return.)  PAK, asset manager, event bus,
      * subsystems, and app.init below all run so a server can load scenes and
      * tick simulation + network. */
 headless_after_renderer:;
@@ -1280,9 +1452,18 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 
 JceAppResult jce_engine_iterate(JceEngine *e)
 {
+    /* Whole-iterate stopwatch. wall_dt measures start-of-frame to
+     * start-of-frame; this measures only the time INSIDE iterate. The
+     * difference is time the process spent between frames -- the OS,
+     * the SDL main loop, a driver wait -- which no per-phase timer can
+     * ever attribute, and which needs to be distinguishable from a
+     * genuine but uninstrumented engine phase. */
+    const uint64_t _t0_iter = jce_time_perf_counter();
+    jce_view_bands_begin_frame();   /* view-id ownership guard */
     JCE_PROFILE_ZONE_N("Frame");
 
     float dt = JCE_DEFAULT_FRAME_DT;
+    float wall_dt = JCE_DEFAULT_FRAME_DT;
     const uint64_t now = jce_time_perf_counter();
 
     if (e->perf_freq == 0)
@@ -1328,7 +1509,8 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         e->frame_counter_prev > 0 &&
         now >= e->frame_counter_prev) {
         const double elapsed = (double)(now - e->frame_counter_prev);
-        dt = (float)(elapsed / (double)e->perf_freq);
+        wall_dt = (float)(elapsed / (double)e->perf_freq);
+        dt = wall_dt;
     }
 
     e->frame_counter_prev = now;
@@ -1361,6 +1543,15 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         }
         if (s_fixed_dt) dt = s_fixed_dt_v;
     }
+
+    jce_trace_frame_mark(
+        e->frame_index,
+        (uint64_t)((double)wall_dt * 1000000000.0),
+        (uint64_t)((double)dt * 1000000000.0));
+
+    /* Dispatch owner-thread completions on every path. In cooperative Web
+     * builds this also advances deferred work within the default frame budget. */
+    jce_async_default_pump(NULL);
 
     if (jce_engine_quit_requested()) {
         jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
@@ -1484,13 +1675,32 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     }
     SDL_SetAtomicInt(&s_in_render_frame, 1);
 
+    /* Rotate the per-frame phase snapshot before any phase of this frame is
+     * accumulated, so it holds the PREVIOUS frame whole.  The hitch reporter
+     * below reads it one frame later still, which is why that works.
+     *
+     * This call did not exist.  jce_perf_phase_frame_tick() was called only by
+     * the editor, so in every standalone run -- every game, every headless CI
+     * pass -- the snapshot stayed all zeros and the hitch reporter said the
+     * time was "outside every instrumented phase" on every hitch it ever
+     * printed.  The one tool for answering "what was slow in that frame" had
+     * never answered it outside the editor, and its wording made the silence
+     * look like a finding. */
+    if (jce_perf_phase_enabled()) jce_perf_phase_frame_tick();
+
     /* ── PlayerLoop: INITIALIZATION / EARLY_UPDATE ──────────────────
      * Initialization runs before any per-frame work; EarlyUpdate is
      * for input poll and event-drain style hooks that need to see a
      * fresh frame.  Engine-owned input update remains at END_OF_FRAME
      * below (it drives swap-edge / just-pressed detection). */
-    jce_player_loop_run_phase(JCE_PHASE_INITIALIZATION, dt);
-    jce_player_loop_run_phase(JCE_PHASE_EARLY_UPDATE, dt);
+    {   uint64_t _t0_pl_init = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_INITIALIZATION, dt);
+        jce_perf_phase_add("pl_init",
+            jce_time_perf_to_ms(_t0_pl_init, jce_time_perf_counter())); }
+    {   uint64_t _t0_pl_early = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_EARLY_UPDATE, dt);
+        jce_perf_phase_add("pl_early",
+            jce_time_perf_to_ms(_t0_pl_early, jce_time_perf_counter())); }
 
     /* DEBUG TOGGLE: input record / replay (JCE_INPUT_RECORD /
      * JCE_INPUT_REPLAY, opened in jce_engine_create).  This sits right
@@ -1558,7 +1768,10 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     /* ── PlayerLoop: PRE_RENDER ─────────────────────────────────────
      * Fires immediately before bgfx begin_frame so hooks can prep
      * frame-local GPU state without racing the renderer. */
-    jce_player_loop_run_phase(JCE_PHASE_PRE_RENDER, dt);
+    {   uint64_t _t0_pl_prerender = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_PRE_RENDER, dt);
+        jce_perf_phase_add("pl_prerender",
+            jce_time_perf_to_ms(_t0_pl_prerender, jce_time_perf_counter())); }
 
     jce_renderer_begin_frame(e->renderer, e->window);
 
@@ -1599,14 +1812,20 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     /* Tick registered subsystems. */
     if (e->subsystems) {
         JCE_PROFILE_ZONE_N("Subsystems::Update");
+        uint64_t _t0_sub = jce_time_perf_counter();
         jce_subsystem_update_all(e->subsystems, dt);
+        jce_perf_phase_add("subsystems",
+                           jce_time_perf_to_ms(_t0_sub, jce_time_perf_counter()));
         JCE_PROFILE_ZONE_END;
     }
 
     /* ── PlayerLoop: UPDATE ─────────────────────────────────────────
      * Gameplay / ECS world tick.  Runs after legacy subsystem update
      * so phase consumers observe the same world state the app does. */
-    jce_player_loop_run_phase(JCE_PHASE_UPDATE, dt);
+    {   uint64_t _t0_pl_update = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_UPDATE, dt);
+        jce_perf_phase_add("pl_update",
+            jce_time_perf_to_ms(_t0_pl_update, jce_time_perf_counter())); }
 
     if (g_app_desc.update) {
         JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
@@ -1621,7 +1840,10 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
     /* ── PlayerLoop: LATE_UPDATE ────────────────────────────────────
      * Post-gameplay: cameras, IK, anim post-processing. */
-    jce_player_loop_run_phase(JCE_PHASE_LATE_UPDATE, dt);
+    {   uint64_t _t0_pl_late = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_LATE_UPDATE, dt);
+        jce_perf_phase_add("pl_late",
+            jce_time_perf_to_ms(_t0_pl_late, jce_time_perf_counter())); }
 
     {
         /* end_frame = bgfx_frame kick + any API-thread wait: the gap between
@@ -1636,7 +1858,10 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     /* ── PlayerLoop: POST_RENDER ────────────────────────────────────
      * After the renderer submits but before we release the in-frame
      * guard, so hooks can still touch frame-local resources. */
-    jce_player_loop_run_phase(JCE_PHASE_POST_RENDER, dt);
+    {   uint64_t _t0_pl_postrender = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_POST_RENDER, dt);
+        jce_perf_phase_add("pl_postrender",
+            jce_time_perf_to_ms(_t0_pl_postrender, jce_time_perf_counter())); }
 
     /* Promote deferred render-pipeline toggles (settings slice S1): the
      * per-feature setters write a pending descriptor; landing it here —
@@ -1655,7 +1880,10 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     /* ── PlayerLoop: END_OF_FRAME ───────────────────────────────────
      * Last thing before the profiler frame mark.  Use for screenshot
      * captures, async readbacks, and per-frame analytics. */
-    jce_player_loop_run_phase(JCE_PHASE_END_OF_FRAME, dt);
+    {   uint64_t _t0_pl_eof = jce_time_perf_counter();
+        jce_player_loop_run_phase(JCE_PHASE_END_OF_FRAME, dt);
+        jce_perf_phase_add("pl_eof",
+            jce_time_perf_to_ms(_t0_pl_eof, jce_time_perf_counter())); }
 
     JCE_PROFILE_FRAME_MARK;
     JCE_PROFILE_ZONE_END;
@@ -1687,7 +1915,7 @@ JceAppResult jce_engine_iterate(JceEngine *e)
             static double   s_ring[JCE_PERF_RING];
             static uint32_t s_ring_head = 0u, s_ring_count = 0u;
             static uint32_t s_warm = 0u;
-            const double    ms = (double)dt * 1000.0;
+            const double    ms = (double)wall_dt * 1000.0;
             s_acc_ms += ms;
             if (ms > s_worst_ms) s_worst_ms = ms;
             if (s_warm < 120u) {
@@ -1696,6 +1924,126 @@ JceAppResult jce_engine_iterate(JceEngine *e)
                 s_ring[s_ring_head] = ms;
                 s_ring_head = (s_ring_head + 1u) & (JCE_PERF_RING - 1u);
                 if (s_ring_count < JCE_PERF_RING) s_ring_count++;
+
+                /* Hitch detector.
+                 *
+                 * perf-lows already reports that a 0.1%-low exists; nothing
+                 * said what was slow IN that frame. The windowed
+                 * perf-phases line cannot: it averages over 120 frames, so a
+                 * single 68 ms hitch in a 5.5 ms scene shows up as +0.5 ms
+                 * spread across every bucket and reads as noise. The per-frame
+                 * snapshot needed to answer it is already maintained for the
+                 * editor profiler (jce_perf_phase_frame_tick), just never
+                 * logged.
+                 *
+                 * Fires on a frame >= JCE_HITCH_FACTOR x the running mean of
+                 * the ring (default 4x, floor 8 ms so an idle 0.5 ms frame
+                 * cannot make 2 ms a "hitch"), and dumps that frame's own
+                 * phase breakdown sorted by cost. Rate-limited so a stall
+                 * storm cannot flood the log. */
+                {
+                    static double s_hitch_factor = -1.0;
+                    static uint32_t s_hitch_logged = 0u;
+                    /* Deferred by exactly one frame ON PURPOSE.
+                     * jce_perf_phase_frame_tick() runs early in the frame (the
+                     * editor calls it during its update), so the snapshot
+                     * readable at the END of frame N still describes frame
+                     * N-1. Reading it here would blame the wrong frame. By
+                     * frame N+1 the tick has rotated frame N's real work —
+                     * end_frame, scene_render, the streaming and upload
+                     * phases — into the snapshot, so that is when we read. */
+                    static double s_pending_ms = 0.0;
+                    static double s_pending_mean = 0.0;
+                    if (s_hitch_factor < 0.0) {
+                        const char *hv = getenv("JCE_HITCH_FACTOR");
+                        s_hitch_factor = (hv && hv[0]) ? atof(hv) : 4.0;
+                        if (s_hitch_factor < 1.5) s_hitch_factor = 1.5;
+                    }
+                    if (s_pending_ms > 0.0) {
+                        const double hitch_ms = s_pending_ms;
+                        const double mean = s_pending_mean;
+                        s_pending_ms = 0.0;
+                        {
+                            char hb[512];
+                            int off = 0, i, n = jce_perf_phase_count();
+                            /* Sorted-by-cost selection over <=24 slots; the
+                             * frame is already lost, so an O(n^2) pick beats
+                             * allocating or mutating the snapshot. */
+                            double used[24];
+                            for (i = 0; i < n && i < 24; ++i) used[i] = 0.0;
+                            for (i = 0; i < n && i < 8; ++i) {
+                                int best = -1, j;
+                                double best_ms = 0.0;
+                                for (j = 0; j < n && j < 24; ++j) {
+                                    const char *nm = NULL;
+                                    double pm = 0.0;
+                                    if (used[j] != 0.0) continue;
+                                    if (!jce_perf_phase_peek_frame(j, &nm, &pm))
+                                        continue;
+                                    if (pm > best_ms) { best_ms = pm; best = j; }
+                                }
+                                if (best < 0 || best_ms <= 0.0) break;
+                                used[best] = 1.0;
+                                {
+                                    const char *nm = NULL;
+                                    double pm = 0.0;
+                                    jce_perf_phase_peek_frame(best, &nm, &pm);
+                                    off += snprintf(hb + off,
+                                                    sizeof(hb) - (size_t)off,
+                                                    "%s%s=%.2f",
+                                                    off ? " " : "",
+                                                    nm ? nm : "?", pm);
+                                }
+                                if (off >= (int)sizeof(hb) - 24) break;
+                            }
+                            /* CPU/GPU split alongside the phases: when the
+                             * phases account for almost none of a hitch, the
+                             * question becomes whether the frame was waiting
+                             * on the GPU, on the present/vsync, or on the OS.
+                             * The phase list alone cannot distinguish those. */
+                            JceGpuStats hgs;
+                            double hcpu = 0.0, hgpu = 0.0;
+                            unsigned hdraws = 0u;
+                            const double inside =
+                                jce_time_perf_to_ms(_t0_iter,
+                                                    jce_time_perf_counter());
+                            if (jce_renderer_get_gpu_stats(&hgs)) {
+                                hcpu = hgs.cpu_frame_ms;
+                                hgpu = hgs.gpu_ms;
+                                hdraws = (unsigned)hgs.num_draw;
+                            }
+                            ++s_hitch_logged;
+                            LOG_WARN(LOG_TAG,
+                                "perf-hitch: %.2f ms (%.1fx the %.2f ms mean) "
+                                "| cpu %.2f gpu %.2f draws %u "
+                                "| inside-iterate %.2f, between-frames %.2f ms "
+                                "| top phases: %s",
+                                hitch_ms,
+                                hitch_ms / (mean > 0.0 ? mean : 1.0), mean,
+                                hcpu, hgpu, hdraws,
+                                inside, hitch_ms - inside,
+                                off ? hb
+                                    : (jce_perf_phase_frame_has_data()
+                                       ? "(none attributed - the time is "
+                                         "outside every instrumented phase)"
+                                       : "(NO PHASE SNAPSHOT - the per-frame "
+                                         "table is empty, so this hitch was "
+                                         "not measured; nothing here says the "
+                                         "time was outside a phase)"));
+                        }
+                    }
+                    if (s_ring_count >= 32u && s_hitch_logged < 64u
+                        && s_pending_ms <= 0.0) {
+                        double mean = 0.0;
+                        uint32_t k;
+                        for (k = 0u; k < s_ring_count; ++k) mean += s_ring[k];
+                        mean /= (double)s_ring_count;
+                        if (ms >= 8.0 && ms >= mean * s_hitch_factor) {
+                            s_pending_ms = ms;
+                            s_pending_mean = mean;
+                        }
+                    }
+                }
             }
             if (++s_n >= 120u) {
                 const double avg = s_acc_ms / (double)s_n;
@@ -1723,10 +2071,20 @@ JceAppResult jce_engine_iterate(JceEngine *e)
                      * the present); commit = committed private bytes — the
                      * truthful steady-state figure for the 512MB budget. */
                     LOG_INFO(LOG_TAG,
-                             "perf: %.2f ms avg (%.0f FPS) | cpu %.1f / gpu %.1f ms | %u draws | gpu-mem %lld MB | rss %lld MB | commit %lld MB | worst %.2f ms / %u",
+                             "perf: %.2f ms avg (%.0f FPS) | cpu %.1f / gpu %.1f ms | %u draws | gpu-mem %lld MB (tex %lld + rt %lld) | rss %lld MB | commit %lld MB | worst %.2f ms / %u",
                              avg, (avg > 0.0) ? (1000.0 / avg) : 0.0,
                              gs.cpu_frame_ms, gs.gpu_ms, gs.num_draw,
                              (long long)(gs.gpu_memory_used > 0 ? gs.gpu_memory_used >> 20 : 0),
+                             /* Split out so the budget line says WHERE the GPU
+                              * memory went: textures are content (cook/mip
+                              * settings), render targets are configuration
+                              * (resolution, shadow atlas, postfx chain).  The
+                              * two have completely different remedies and the
+                              * single total could not distinguish them. */
+                             (long long)(gs.texture_memory_used > 0
+                                         ? gs.texture_memory_used >> 20 : 0),
+                             (long long)(gs.rt_memory_used > 0
+                                         ? gs.rt_memory_used >> 20 : 0),
                              rss_mb, commit_mb, s_worst_ms, s_n);
                 } else {
                     LOG_INFO(LOG_TAG,
@@ -1754,9 +2112,31 @@ JceAppResult jce_engine_iterate(JceEngine *e)
                 }
                 {
                     char phase_buf[512];
-                    jce_perf_phase_report(phase_buf, (int)sizeof(phase_buf));
+                    jce_perf_phase_report_average(
+                        phase_buf, (int)sizeof(phase_buf), s_n);
                     if (phase_buf[0])
-                        LOG_INFO(LOG_TAG, "perf-phases: %s", phase_buf);
+                        LOG_INFO(LOG_TAG,
+                                 "perf-phases: avg-ms/frame over %u: %s",
+                                 s_n, phase_buf);
+                }
+                {
+                    JceTraceStats trace_stats;
+                    jce_trace_get_stats(&trace_stats);
+                    LOG_INFO(
+                        LOG_TAG,
+                        "trace: events=%llu resident=%u/%u threads=%u "
+                        "work=%u waits=%u submitted=%llu completed=%llu "
+                        "max-queue=%.3f ms max-run=%.3f ms max-wait=%.3f ms",
+                        (unsigned long long)trace_stats.recorded_events,
+                        trace_stats.resident_events, trace_stats.capacity,
+                        trace_stats.active_threads,
+                        trace_stats.active_work_items,
+                        trace_stats.active_waits,
+                        (unsigned long long)trace_stats.tasks_submitted,
+                        (unsigned long long)trace_stats.work_items_completed,
+                        (double)trace_stats.max_queue_time_ns / 1000000.0,
+                        (double)trace_stats.max_run_time_ns / 1000000.0,
+                        (double)trace_stats.max_wait_time_ns / 1000000.0);
                 }
                 {
                     /* Per-VIEW GPU breakdown — WHICH pass costs the GPU (shadow
@@ -1806,7 +2186,32 @@ JceAppResult jce_engine_iterate(JceEngine *e)
                      * steady-state — watch those for per-frame churn regressions). */
                     uint64_t af = 0, ab = 0;
                     jce_alloc_frame_delta(&af, &ab);
-                    LOG_INFO(LOG_TAG, "perf-alloc: %.1f allocs/frame, %.1f KB/frame",
+                    /* Say WHICH heap, because this reads 0.0 in steady state
+                     * and a bare zero invites "nothing allocates per frame".
+                     *
+                     * It covers the two accounted mimalloc front-ends: the
+                     * JCE_MALLOC macros and the jce_allocator_t vtable. That is
+                     * more than it sounds -- ImGui (SetAllocatorFunctions ->
+                     * ED_MALLOC, jce_editor.cpp), bgfx (init->allocator =
+                     * jce_bgfx_allocator, jce_renderer.c) and SDL
+                     * (jce_main_sdl.c) all bridge into it, sharing the
+                     * JCE_NO_ALLOC_HOOKS escape hatch. Those are visible here.
+                     *
+                     * What is NOT: C++ global operator new/delete is not
+                     * replaced, so every std::string, std::map and
+                     * std::unordered_map goes to the CRT heap, as does Tracy.
+                     * A sampler profile of graveyard puts ~2% of the frame in
+                     * RtlFreeHeap / RtlAllocateHeap / free_base while this line
+                     * reads 0.0, and the named rows under it are STL and Tracy
+                     * containers. So: the accounted heap really is quiet per
+                     * frame, and the STL heap is the part this number cannot
+                     * see. (An earlier version of this comment claimed ImGui
+                     * and bgfx were on the CRT heap. They are not, and asserting
+                     * it from general knowledge rather than from this repo's
+                     * wiring was the error.) */
+                    LOG_INFO(LOG_TAG,
+                             "perf-alloc (engine allocator only, not the CRT "
+                             "heap): %.1f allocs/frame, %.1f KB/frame",
                              (double)af / (double)s_n,
                              (double)ab / 1024.0 / (double)s_n);
                 }
@@ -1850,12 +2255,30 @@ void jce_engine_destroy(JceEngine *e)
 {
     if (!e) return;
 
+#define JCE_SHUTDOWN_DIAG(phase_)                                            \
+    do {                                                                     \
+        const char *_diag = SDL_getenv("JCE_SHUTDOWN_DIAG");                \
+        if (_diag && _diag[0] && _diag[0] != '0') {                          \
+            LOG_INFO(LOG_TAG, "shutdown: %s", (phase_));                    \
+            jce_log_flush();                                                 \
+        }                                                                    \
+    } while (0)
+    JCE_SHUTDOWN_DIAG("begin");
     SDL_RemoveEventWatch(jce_resize_event_watch, e);
 
     jce_window_uninstall_modal_tick();
 
+    /* Stop background producers while application state and GPU-facing
+     * resources are still alive. Completion callbacks are owner-thread work
+     * and may legitimately release objects owned by the application. */
+    if (!jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+                                    JCE_ASYNC_WAIT_INFINITE))
+        LOG_ERROR(LOG_TAG, "structured async executor shutdown failed");
+    JCE_SHUTDOWN_DIAG("async executor stopped");
+
     if (g_app_desc.exit)
         g_app_desc.exit(g_app_desc.user_data);
+    JCE_SHUTDOWN_DIAG("application callback stopped");
 
     /* Shut down registered subsystems (reverse priority). */
     if (e->subsystems) {
@@ -1876,6 +2299,7 @@ void jce_engine_destroy(JceEngine *e)
      * bgfx_shutdown(), preserving the LIFO contract for any future
      * GPU-touching cleanup the text subsystem may grow. */
     if (e->renderer) jce_renderer_destroy(e->renderer);
+    JCE_SHUTDOWN_DIAG("renderer stopped");
     /* Shared data-parallel job pool (frustum cull etc.) — joined after the
      * renderer so no cull is in flight.  The old jce_jobs_shutdown_default()
      * guarded this call against straggler JceJobSystem handles; with that
@@ -1914,6 +2338,23 @@ void jce_engine_destroy(JceEngine *e)
     jce_single_instance_unlock();
     JCE_FREE(e);
 
+    /*
+     * Export only after every producer has joined so the capture is a stable
+     * process-lifetime snapshot. JCE_TRACE_EXPORT is intended for CI and
+     * unattended profiling; the editor profiler exposes the same export
+     * explicitly for interactive captures.
+     */
+    jce_trace_thread_unregister();
+    {
+        const char *trace_path = SDL_getenv("JCE_TRACE_EXPORT");
+        if (trace_path && trace_path[0]) {
+            if (jce_trace_export_chrome_json(trace_path))
+                LOG_INFO(LOG_TAG, "runtime trace exported: %s", trace_path);
+            else
+                LOG_ERROR(LOG_TAG, "runtime trace export failed: %s", trace_path);
+        }
+    }
+
     /* The async log backend runs on an SDL thread and parks on SDL
        mutex/condvar primitives — it MUST be shut down while SDL is still
        alive. The previous order (SDL_Quit first, log shutdown last "so all
@@ -1928,6 +2369,11 @@ void jce_engine_destroy(JceEngine *e)
        once the ring is gone. */
     jce_log_shutdown();
 
+    /* Report BEFORE SDL_Quit: the sampler writes its profile through
+     * SDL_IOStream, and after SDL_Quit that write silently produces an empty
+     * file -- which is exactly what happened the first time it ran here. */
+    jce_sampler_shutdown();
+
     /* SDL_Init pairs with SDL_Quit; perform it after every other
      * SDL-dependent subsystem is gone so OS resources owned by SDL are
      * released last. */
@@ -1940,6 +2386,7 @@ void jce_engine_destroy(JceEngine *e)
      * any teardown-time callbacks have already fired. */
     jce_player_loop_shutdown();
     jce_lifecycle_shutdown();
+#undef JCE_SHUTDOWN_DIAG
 }
 
 /* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */

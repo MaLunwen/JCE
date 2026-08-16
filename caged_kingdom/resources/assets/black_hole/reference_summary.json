@@ -1,0 +1,83 @@
+{
+	"contract":	{
+		"name":	"ck.kerr-reference-summary",
+		"major":	1,
+		"minor":	0
+	},
+	"config_hash":	"sha256:19f2dbf8fa9eee5394e8b77f27afe227925e88e26cfe9a3ae6c0adb17feda3dd",
+	"source_corpus_hash":	"sha256:d7830ba33f1e55474e241d804b2c260829b1f75ec0976c09a357774ebab41b69",
+	"validation":	{
+		"status":	"passed",
+		"max_residual":	1.3386625141720288e-10,
+		"truth_policy":	"REFERENCE_DATA"
+	},
+	"invariants":	{
+		"schwarzschild_horizon_over_m":	2,
+		"schwarzschild_photon_radius_over_m":	3,
+		"schwarzschild_critical_impact_over_m":	5.196152422706632,
+		"default_kerr_horizon_over_m":	1.6,
+		"default_kerr_isco_over_m":	2.9066438544641957
+	},
+	"ray_corpus":	[{
+			"screen_x":	0,
+			"screen_y":	0,
+			"outcome":	"capture",
+			"accepted_steps":	436,
+			"rejected_steps":	39,
+			"radius_over_m":	1.6019346407105528,
+			"lambda":	0,
+			"eta":	-0.0048615190360934181,
+			"max_residual":	1.8077186577888146e-16
+		}, {
+			"screen_x":	1,
+			"screen_y":	-1,
+			"outcome":	"escape",
+			"accepted_steps":	563,
+			"rejected_steps":	82,
+			"radius_over_m":	600.29102484848852,
+			"lambda":	27.14841961680068,
+			"eta":	240.52672180059514,
+			"max_residual":	1.3386625141720288e-10
+		}, {
+			"screen_x":	0,
+			"screen_y":	0.18,
+			"outcome":	"capture",
+			"accepted_steps":	409,
+			"rejected_steps":	51,
+			"radius_over_m":	1.601932473982201,
+			"lambda":	0,
+			"eta":	17.9902978100697,
+			"max_residual":	2.5536497524588416e-16
+		}],
+	"assets":	[{
+			"path":	"textures/black_hole/starfield_reference.jceasset",
+			"format":	"RGBA16F",
+			"width":	3072,
+			"height":	2048,
+			"decoded_texel_sha256":	"sha256:65b7e82c359951a6bbe5b2bb187181a05b1625b25c28d9f8150d3022062af166",
+			"asset_sha256":	"sha256:b1f1d7cb04166c221948bd5da3892384803c585d1e98b3956c12323e47726f71"
+		}, {
+			"path":	"textures/black_hole/disk_flux_lut.jceasset",
+			"format":	"R32F",
+			"width":	512,
+			"height":	127,
+			"decoded_texel_sha256":	"sha256:571561afcd9142c71292e0281ed8d291e51524de0c09737940f890926ca9ba30",
+			"asset_sha256":	"sha256:7f250ff5b5284c00a11939327bb31806b886e936f7d10570e6fa259ab87d0785"
+		}, {
+			"path":	"textures/black_hole/blackbody_rgb_lut.jceasset",
+			"format":	"RGBA16F",
+			"width":	1024,
+			"height":	1,
+			"decoded_texel_sha256":	"sha256:73da69a9875bdeab2d34eede9054e4cc12bf5821b6bf6f8f6aa498bc075a1b92",
+			"asset_sha256":	"sha256:7f729510bd2793725fa1ce73405841e61fdb5d4053aab4ef8085c667cfcab485"
+		}, {
+			"path":	"textures/black_hole/starfield_prefiltered.jceasset",
+			"format":	"RGBA16F",
+			"width":	384,
+			"height":	256,
+			"decoded_texel_sha256":	"sha256:4853626c174b06a7bd69a0d3b8d346815f7e62d9b5469c2fa4f722ba19d78a21",
+			"asset_sha256":	"sha256:2fafabb60c74c8ae2220311ef420dc2f7084f9b49510d46e1ba53224cd05a4ba"
+		}],
+	"scope":	"Kerr vacuum null geodesics and optically thick equatorial thin disk",
+	"limitation":	"False-color bolometric visualization; no radiative transfer through plasma"
+}

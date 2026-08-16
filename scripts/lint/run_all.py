@@ -1,3 +1,15 @@
+# The four tools/audit/ gates that used to run here -- abi-snapshot
+# --committed, script-vm-parity, script-language-catalog and
+# sdk-scripting-export -- were removed with tools/audit/ itself (owner
+# decision, 2026-08-17).  They are listed here rather than silently
+# dropped because each answered a question nothing else does, and a
+# reader of this file should know the questions stopped being asked:
+#   * did a commit change a public header without updating the snapshot
+#   * is JceScriptVM still the same lifecycle as the public jce_script_*
+#     surface (a 20th function added Lua-only is green in every test)
+#   * does every backend's claimed extension have a catalog row
+#   * does the SDK still ship what an out-of-tree project needs
+# Restoring them means restoring tools/audit/ and re-adding the entries.
 #!/usr/bin/env python3
 """
 run_all.py — Run every JCE lint in sequence and aggregate results.
@@ -18,8 +30,12 @@ import sys
 from pathlib import Path
 
 LINT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = LINT_DIR.parents[1]
 
 # Order: cheap structural checks first, then content scans.
+#
+# An entry is either a bare filename (resolved under scripts/lint/) or a
+# (repo-relative path, argv) pair for a checker that lives elsewhere.
 LINTS = [
     "check_agents_md.py",
     "check_public_api_purity.py",
@@ -27,28 +43,48 @@ LINTS = [
     "check_layer_dependencies.py",
     "check_engine_native_io.py",
     "check_platform_macros.py",
+    "check_input_seam.py",
+    "check_mesh_enable_consumers.py",
+    "check_cull_gen_consumers.py",
+    "check_instance_sort_depth.py",
     "check_raw_allocator.py",
     "check_sdk_asset_embed_shape.py",
     "check_project_build_layout.py",
+    "check_jce_tests_closure.py",
+    "check_env_light_authority.py",
+    "check_water_field_authority.py",
+    "check_terrain_single_owner.py",
+    "check_shader_sampler_slots.py",
+    "check_shader_branch_order.py",
+    "check_shader_varying_pairs.py",
+    "check_format_has_producer.py",
+    "check_material_texture_sampler.py",
     "i18n_audit.py",
     "i18n_hardcoded.py",
     "check_i18n_dup_values.py",
 ]
 
 
-def run_one(script: str) -> tuple[str, int, str]:
-    path = LINT_DIR / script
+def resolve(entry) -> tuple[Path, list[str], str]:
+    if isinstance(entry, tuple):
+        rel, argv = entry
+        return REPO_ROOT / rel, list(argv), " ".join([rel, *argv])
+    return LINT_DIR / entry, [], entry
+
+
+def run_one(entry) -> tuple[str, int, str]:
+    path, argv, label = resolve(entry)
     if not path.is_file():
-        return script, 127, f"(skipped: {script} not found)"
+        return label, 127, f"(skipped: {label} not found)"
     proc = subprocess.run(
-        [sys.executable, str(path)],
+        [sys.executable, str(path), *argv],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
     out = (proc.stdout or "") + (proc.stderr or "")
-    return script, proc.returncode, out.rstrip()
+    return label, proc.returncode, out.rstrip()
 
 
 def main() -> int:

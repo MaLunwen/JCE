@@ -34,10 +34,24 @@ namespace {
 
 enum PresetKind { PK_TEXTURE = 0, PK_MODEL = 1 };
 
+/* Colour space, as an explicit three-state choice.
+ *
+ * It replaces a `bool srgb` that defaulted to TRUE and was written into every
+ * `.import.json` -- including the ones beside normal maps -- and then read by
+ * nobody.  The checkbox in the UI did nothing at all, which is worse than
+ * absent: it looked like the control for a decision it never made.
+ *
+ * AUTO is the default and writes NO key, so the cooker keeps its own answer:
+ * the sidecar the model importer wrote from the material slot it filled, or
+ * failing that its filename heuristic.  A preset must not out-shout the one
+ * producer that actually knows, and "the user never touched this control"
+ * cannot be allowed to mean "the user asserts sRGB". */
+enum TexColourSpace { TCS_AUTO = 0, TCS_SRGB = 1, TCS_LINEAR = 2 };
+
 struct TexOpts {
     int  target_format = 0;        /* 0=rgba8 1=bc1 2=bc3 3=bc7 */
     bool gen_mips      = true;
-    bool srgb          = true;
+    int  colour_space  = TCS_AUTO;
     int  max_size      = 2048;
 };
 
@@ -134,7 +148,7 @@ void save_presets(void)
         if (p.kind == PK_TEXTURE) {
             jce_json_set_int (o, "target_format", p.tex.target_format);
             jce_json_set_bool(o, "gen_mips",      p.tex.gen_mips);
-            jce_json_set_bool(o, "srgb",          p.tex.srgb);
+            jce_json_set_int (o, "colour_space",  p.tex.colour_space);
             jce_json_set_int (o, "max_size",      p.tex.max_size);
         } else {
             jce_json_set_number(o, "scale",       p.mdl.scale);
@@ -181,7 +195,16 @@ void load_presets(void)
             if (p.kind == PK_TEXTURE) {
                 p.tex.target_format = jce_json_get_int (o, "target_format", 0);
                 p.tex.gen_mips      = jce_json_get_bool(o, "gen_mips", true);
-                p.tex.srgb          = jce_json_get_bool(o, "srgb", true);
+                /* Migrate the old `srgb` bool.  Its default was true and it
+                 * reached nothing, so a preset carrying true asserts nothing
+                 * and becomes AUTO.  An explicit false, however, was somebody
+                 * deliberately saying "this is not colour" -- the only signal
+                 * that key ever carried -- so it survives as LINEAR. */
+                p.tex.colour_space  = jce_json_get_int(o, "colour_space", -1);
+                if (p.tex.colour_space < 0) {
+                    p.tex.colour_space =
+                        jce_json_get_bool(o, "srgb", true) ? TCS_AUTO : TCS_LINEAR;
+                }
                 p.tex.max_size      = jce_json_get_int (o, "max_size", 2048);
             } else {
                 p.mdl.scale        = (float)jce_json_get_number(o, "scale", 1.0);
@@ -223,7 +246,13 @@ bool emit_sidecar(const char *asset_path, const Preset &p)
     if (p.kind == PK_TEXTURE) {
         jce_json_set_string(root, "target_format", kFmts[p.tex.target_format]);
         jce_json_set_bool  (root, "gen_mips",      p.tex.gen_mips);
-        jce_json_set_bool  (root, "srgb",          p.tex.srgb);
+        /* "colorSpace" -- the key jce_cook_colour_space_parse reads, in both
+         * the bundle packer and the CLI.  Written ONLY when the user chose,
+         * so AUTO leaves the cooker's better-informed answer standing. */
+        if (p.tex.colour_space == TCS_SRGB)
+            jce_json_set_string(root, "colorSpace", "srgb");
+        else if (p.tex.colour_space == TCS_LINEAR)
+            jce_json_set_string(root, "colorSpace", "linear");
         jce_json_set_int   (root, "max_size",      p.tex.max_size);
     } else {
         jce_json_set_number(root, "scale",        p.mdl.scale);
@@ -734,7 +763,22 @@ void draw_preset_editor(Preset &p)
         ImGui::Combo(jce_editor_i18n("importPresets.editor.targetFormat"), &p.tex.target_format,
                      "rgba8\0bc1\0bc3\0bc7\0");
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.genMipmaps"), &p.tex.gen_mips);
-        ImGui::Checkbox(jce_editor_i18n("importPresets.editor.srgb"),      &p.tex.srgb);
+        {
+            const char *kSpaces[] = {
+                jce_editor_i18n_id("importPresets.editor.colourSpace.auto",   "Auto"),
+                jce_editor_i18n_id("importPresets.editor.colourSpace.srgb",   "sRGB (colour)"),
+                jce_editor_i18n_id("importPresets.editor.colourSpace.linear", "Linear (data)"),
+            };
+            ImGui::Combo(jce_editor_i18n_id("importPresets.editor.colourSpace",
+                                            "Colour space"),
+                         &p.tex.colour_space, kSpaces, 3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n_id(
+                    "importPresets.editor.colourSpace.tip",
+                    "Auto keeps what the model importer recorded for this "
+                    "texture, or the cooker's own guess. Only override when "
+                    "you know better than both."));
+        }
         ImGui::SliderInt(jce_editor_i18n("importPresets.editor.maxSize"), &p.tex.max_size, 64, 8192);
     } else {
         ImGui::SliderFloat(jce_editor_i18n("importPresets.editor.scale"), &p.mdl.scale, 0.001f, 100.0f, "%.3f",

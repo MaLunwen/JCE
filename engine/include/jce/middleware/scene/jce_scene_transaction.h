@@ -23,6 +23,14 @@ typedef bool (JCE_CALL *JceSceneTransactionApplyFn)(
     void *user, JceScene *staging,
     const JceScenePlanOperation *operation, JceEntity *out_entity);
 
+/* Reads the plan-governed state back from the materialized candidate. The
+ * mutable scene handle matches the existing component getter API; callbacks
+ * must not mutate the scene. */
+typedef bool (JCE_CALL *JceSceneTransactionAttestFn)(
+    void *user, JceScene *staging,
+    const JceScenePlanOperation *expected, JceEntity entity,
+    JceScenePlanOperation *out_actual);
+
 typedef bool (JCE_CALL *JceSceneTransactionValidateFn)(
     void *user, const JceScene *staging,
     const JceSceneFrozenPlan *plan);
@@ -48,6 +56,8 @@ typedef struct {
     JceSceneTransactionPrewarmFn prewarm;
     JceSceneTransactionDestroySceneFn destroy_scene;
     JceSceneTransactionActivatedFn on_activated;
+    JceSceneTransactionAttestFn attest;
+    bool require_attestation;
 } JceSceneTransactionDesc;
 
 typedef enum {
@@ -59,7 +69,8 @@ typedef enum {
     JCE_SCENE_TRANSACTION_HEALTH_CHECK,
     JCE_SCENE_TRANSACTION_ACTIVE,
     JCE_SCENE_TRANSACTION_FAILED,
-    JCE_SCENE_TRANSACTION_CANCELLED
+    JCE_SCENE_TRANSACTION_CANCELLED,
+    JCE_SCENE_TRANSACTION_ATTESTING
 } JceSceneTransactionState;
 
 typedef enum {
@@ -73,7 +84,8 @@ typedef enum {
     JCE_SCENE_TRANSACTION_ERROR_VALIDATION,
     JCE_SCENE_TRANSACTION_ERROR_PREWARM,
     JCE_SCENE_TRANSACTION_ERROR_GENERATION,
-    JCE_SCENE_TRANSACTION_ERROR_HEALTH_CHECK
+    JCE_SCENE_TRANSACTION_ERROR_HEALTH_CHECK,
+    JCE_SCENE_TRANSACTION_ERROR_ATTESTATION
 } JceSceneTransactionError;
 
 typedef struct JceSceneTransaction JceSceneTransaction;
@@ -125,6 +137,12 @@ JCE_API uint64_t JCE_CALL
 jce_scene_transaction_pending_generation(
     const JceSceneTransaction *transaction);
 
+/* Nonzero only after every required operation has been read back from the
+ * candidate and matched the canonical FrozenPlan. */
+JCE_API uint64_t JCE_CALL
+jce_scene_transaction_pending_attestation_hash(
+    const JceSceneTransaction *transaction);
+
 JCE_API uint64_t JCE_CALL
 jce_scene_transaction_active_generation(
     const JceSceneTransaction *transaction);
@@ -134,6 +152,10 @@ jce_scene_transaction_active_scene(const JceSceneTransaction *transaction);
 
 JCE_API uint64_t JCE_CALL
 jce_scene_transaction_active_plan_hash(
+    const JceSceneTransaction *transaction);
+
+JCE_API uint64_t JCE_CALL
+jce_scene_transaction_active_attestation_hash(
     const JceSceneTransaction *transaction);
 
 JCE_API uint32_t JCE_CALL

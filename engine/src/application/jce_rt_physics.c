@@ -12,6 +12,8 @@
  * else stays file-static here.  No behaviour change.
  */
 
+#include "jce_terrain_collision_stream.h"
+#include "middleware/scene/jce_terrain_cache.h"
 #include "jce_rt_internal.h"
 
 #include <jce/os/core/jce_timer.h>   /* attribute the live collider-cook hitch */
@@ -447,6 +449,48 @@ bool rt_try_spawn_mesh(JceRuntime *rt, JceScene *scene,
  * and CWD is the project root), then from the PAK (shipped game).  Returns
  * true if a terrain body was spawned.
  */
+/* JceTerrainCacheLoadFn: host filesystem first (editor Play, where the
+ * .terrain.json is loose and CWD is the project root), then the PAK (shipped
+ * game).  The cache owns whatever this returns. */
+static JceTerrain *rt_terrain_cache_load(void *ud, const char *path)
+{
+	JceRuntime *rt = (JceRuntime *)ud;
+	char        tbuf[1024];
+	const char *tpath = rt_resolve_host_path(rt, path, tbuf, sizeof tbuf);
+	/* jce-terrain-owner-exempt: this IS the cache's loader callback; the
+	 * cache takes ownership of the result. */
+	JceTerrain *t = jce_terrain_load_file(tpath);
+	/* jce-terrain-owner-exempt: same callback, PAK fallback. */
+	if (!t && rt->pak) t = jce_terrain_load_from_pak(rt->pak, path);
+	return t;
+}
+
+/* JceTerrainCollisionSampleFn over a tile-aware JceTerrain.  Samples on the
+ * tile's own grid, INCLUDING the far edge (span covers [0, tile_world_size]),
+ * so adjacent collision tiles share their boundary row exactly and no seam
+ * opens between them. */
+static bool rt_terrain_collision_sample(void *ctx, uint32_t tile_x,
+                                        uint32_t tile_z, uint32_t span,
+                                        float origin_x, float origin_z,
+                                        float tile_world_size,
+                                        float *out_heights)
+{
+	JceTerrain *t = (JceTerrain *)ctx;
+	(void)tile_x; (void)tile_z;
+	if (!t || span < 2u || !out_heights) return false;
+
+	const float step = tile_world_size / (float)(span - 1u);
+	for (uint32_t z = 0; z < span; ++z) {
+		for (uint32_t x = 0; x < span; ++x) {
+			const float wx = origin_x + (float)x * step;
+			const float wz = origin_z + (float)z * step;
+			out_heights[(size_t)z * span + x] =
+			    jce_terrain_sample_height(t, wx, wz);
+		}
+	}
+	return true;
+}
+
 bool rt_try_spawn_terrain(JceRuntime *rt, JceScene *scene, JceEntity e,
                                  const JceTransform *tf)
 {
@@ -454,19 +498,154 @@ bool rt_try_spawn_terrain(JceRuntime *rt, JceScene *scene, JceEntity e,
 	if (!tc || tc->terrain_path[0] == '\0') return false;
 	if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_TERRAIN)) return false;
 
-	char        tbuf[1024];
-	const char *tpath = rt_resolve_host_path(rt, tc->terrain_path, tbuf, sizeof tbuf);
-	JceTerrain *t = jce_terrain_load_file(tpath);
-	if (!t && rt->pak) t = jce_terrain_load_from_pak(rt->pak, tc->terrain_path);
+	/* BORROWED from the scene's terrain cache -- the renderer and the pick
+	 * pass read the same grid.  This used to be a private load, which is why
+	 * the collider was whatever was on disk when the level opened: an editor
+	 * sculpt changed what you saw and never what you walked on. */
+	JceTerrain *t = jce_terrain_cache_acquire(
+	    jce_scene_terrain_cache(scene), tc->terrain_path,
+	    rt_terrain_cache_load, rt);
 	if (!t) {
 		LOG_WARN(LOG_TAG, "terrain physics: cannot load '%s' for entity %llu",
 		         tc->terrain_path, (unsigned long long)e);
 		return false;
 	}
 
+	/* Remember the grid for anything that needs to ASK the terrain a question
+	 * rather than collide with it -- the water disturbance layer reads it for
+	 * bathymetry.
+	 *
+	 * Recorded HERE, not at the streamed-collider branch below, because that
+	 * branch only runs for TILED terrain. Taking it from there made the water's
+	 * bed depend on whether the terrain happened to be streamed, so a plain
+	 * terrain silently got a flat bed and no wave refraction -- a difference
+	 * between two authoring choices that nothing in the water system should be
+	 * able to see.
+	 *
+	 * Borrowed, like the collider's copy: the scene's cache owns it. */
+	rt->terrain_stream_src = t;
+
+	bool ok = false;
+
+	/* ── Heightfield first (the industry-standard terrain collider) ──────
+	 *
+	 * btHeightfieldTerrainShape stores ONE float per sample and finds the
+	 * candidate cell by arithmetic; the triangle soup stored three floats per
+	 * vertex plus six indices per cell and had to be traversed by a BVH.  For
+	 * a 1025x1025 terrain that is ~4 MB against ~50 MB, and no tree walk.
+	 *
+	 * It cannot represent HOLES, though -- there is no way to tell Bullet a
+	 * cell is absent -- so terrain with authored holes keeps the soup, which
+	 * simply omits those cells.  Silently filling a cave mouth with collision
+	 * would be worse than the memory. */
+	const int   W  = jce_terrain_width(t);
+	const int   H  = jce_terrain_height(t);
+	const float sx = jce_terrain_world_size_x(t);
+	const float sz = jce_terrain_world_size_z(t);
+	const float mh = jce_terrain_max_height(t);
+	const float *norm = jce_terrain_heights(t);
+
+	if (norm && !jce_terrain_has_holes(t) && W >= 2 && H >= 2 &&
+	    sx > 0.0f && sz > 0.0f) {
+		/* jce_terrain_heights() is NORMALIZED 0..1; the collider wants world
+		 * Y, exactly as the renderer's vertex Y = grid * max_height. */
+		const size_t n = (size_t)W * (size_t)H;
+		float *world_y = (float *)jce_malloc(n * sizeof(float));
+		if (world_y) {
+			for (size_t i = 0; i < n; i++) world_y[i] = norm[i] * mh;
+
+			JceHeightfieldBodyDesc hd;
+			memset(&hd, 0, sizeof hd);
+			hd.position    = tf->position;   /* the field's MIN corner */
+			hd.rotation    = tf->rotation;
+			hd.heights     = world_y;        /* copied by the bridge */
+			hd.samples_x   = (uint32_t)W;
+			hd.samples_z   = (uint32_t)H;
+			hd.cell_size_x = sx / (float)(W - 1);
+			hd.cell_size_z = sz / (float)(H - 1);
+			hd.min_height  = 0.0f;           /* normalized heights are >= 0 */
+			hd.max_height  = mh > 0.0f ? mh : 1.0f;
+			/* FIXED == Bullet's unflipped split == the v10-v01 anti-diagonal
+			 * the renderer draws.  Measured, not assumed -- see
+			 * test_fixed_diagonal_matches_the_triangle_soup. */
+			hd.diagonal    = JCE_HEIGHTFIELD_DIAG_FIXED;
+			hd.friction    = 0.8f;
+			/* Without this a capsule sliding across flat terrain catches on the
+			 * shared diagonal of every cell.  A drop-and-settle test cannot see
+			 * the difference; only walking can. */
+			hd.smooth_internal_edges = true;
+
+			JceBodyHandle body =
+			    jce_physics_body_create_heightfield(rt->physics, &hd);
+			jce_free(world_y);
+
+			if (jce_body_valid(body)) {
+				if (rt->body_count < rt->body_cap || rt_grow_bodies(rt))
+					rt_track_body(rt, e, body, tf, (uint8_t)JCE_BODY_STATIC);
+				LOG_INFO(LOG_TAG,
+				         "terrain physics: %dx%d heightfield static body for "
+				         "entity %llu", W, H, (unsigned long long)e);
+				/* borrowed from the scene cache -- freed there, not here */
+				return true;
+			}
+		}
+	}
+
+	/* ── Tiled / procedural: no resident grid, so PAGE the colliders ─────
+	 *
+	 * This is the case that previously produced NOTHING.  Both paths above
+	 * need `jce_terrain_heights()`, which a tiled terrain does not have -- so a
+	 * streamed multi-kilometre world was simply not solid.  The stream samples
+	 * the terrain (which is tile-aware) per collision tile and keeps bodies
+	 * only near the focus point. */
+	if (!norm && W >= 2 && H >= 2 && sx > 0.0f && sz > 0.0f) {
+		const float tile_ws = 128.0f;   /* collision tile size, world units */
+		const uint32_t tx = (uint32_t)ceilf(sx / tile_ws);
+		const uint32_t tz = (uint32_t)ceilf(sz / tile_ws);
+
+		JceTerrainCollisionStreamDesc sd;
+		memset(&sd, 0, sizeof sd);
+		sd.world           = rt->physics;
+		sd.sample_fn       = rt_terrain_collision_sample;
+		sd.sample_ctx      = t;          /* borrowed from the scene cache */
+		sd.sample_span     = 33u;
+		sd.tiles_x         = tx ? tx : 1u;
+		sd.tiles_z         = tz ? tz : 1u;
+		sd.origin          = tf->position;
+		sd.tile_world_size = tile_ws;
+		sd.min_height      = 0.0f;
+		sd.max_height      = mh > 0.0f ? mh : 1.0f;
+		sd.radius          = tile_ws * 1.5f;
+		sd.friction        = 0.8f;
+		sd.diagonal        = JCE_HEIGHTFIELD_DIAG_FIXED;
+		sd.smooth_internal_edges = true;
+		sd.max_bodies      = 16u;
+
+		/* One stream per runtime: a scene with two streamed terrains would
+		 * need one each, which no content does yet.  Replacing rather than
+		 * leaking is the conservative choice. */
+		if (rt->terrain_stream) {
+			jce_terrain_collision_stream_destroy(rt->terrain_stream);
+			rt->terrain_stream = NULL;
+		}
+		rt->terrain_stream = jce_terrain_collision_stream_create(&sd);
+		if (rt->terrain_stream) {
+			rt->terrain_stream_src = t;
+			/* Seed residency at the terrain origin so the first frame is
+			 * already solid where the player starts. */
+			jce_terrain_collision_stream_update(rt->terrain_stream,
+			                                    tf->position);
+			LOG_INFO(LOG_TAG,
+			         "terrain physics: streamed collider %ux%u tiles for "
+			         "entity %llu", sd.tiles_x, sd.tiles_z,
+			         (unsigned long long)e);
+			return true;
+		}
+	}
+
+	/* ── Triangle-soup fallback: holes, or a terrain with no resident grid ── */
 	float    *verts = NULL; uint32_t vcount = 0;
 	uint32_t *idx   = NULL; uint32_t icount = 0;
-	bool ok = false;
 	if (jce_terrain_build_collision_mesh(t, &verts, &vcount, &idx, &icount)) {
 		JceColliderChild child;
 		memset(&child, 0, sizeof child);
@@ -491,14 +670,16 @@ bool rt_try_spawn_terrain(JceRuntime *rt, JceScene *scene, JceEntity e,
 			if (rt->body_count < rt->body_cap || rt_grow_bodies(rt))
 				rt_track_body(rt, e, body, tf, (uint8_t)JCE_BODY_STATIC);
 			ok = true;
-			LOG_INFO(LOG_TAG, "terrain physics: %u verts / %u tris static body "
-			         "for entity %llu", vcount, icount / 3u,
-			         (unsigned long long)e);
+			LOG_INFO(LOG_TAG, "terrain physics: %u verts / %u tris triangle-soup "
+			         "static body for entity %llu (%s)", vcount, icount / 3u,
+			         (unsigned long long)e,
+			         jce_terrain_has_holes(t) ? "has holes"
+			                                  : "no resident height grid");
 		}
 		jce_free(verts);
 		jce_free(idx);
 	}
-	jce_terrain_free(t);
+	/* borrowed from the scene cache -- freed there, not here */
 	return ok;
 }
 

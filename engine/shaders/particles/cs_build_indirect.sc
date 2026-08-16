@@ -2,14 +2,14 @@
  * cs_build_indirect.sc -- GPU-driven indirect cull: fill the indirect draw-args
  * buffer from the compacted per-run survivor counts (roadmap #18, Direction C).
  *
- * One thread per RUN.  After cs_cull_compact has compacted each run's survivors
- * into b_visible[run_base .. run_base+survivors) and tallied b_counter[run], this
- * pass writes that run's drawIndexedIndirect args so the renderer can issue ONE
- * bgfx_submit_indirect per run with the EXACT survivor instance count (no CPU
- * round-trip, no fixed conservative count, no degenerate instances):
+ * One thread per primitive draw. After cs_cull_compact has compacted one
+ * visibility group's survivors into
+ * b_visible[run_base .. run_base+survivors), this pass writes every primitive's
+ * drawIndexedIndirect args. Primitives from one model share the same survivor
+ * counter and visible partition, so visibility is evaluated only once:
  *
  *   numIndices    = run's mesh index count (from b_runmeta)
- *   numInstances  = b_counter[run]              (survivors)
+ *   numInstances  = b_counter[counter_index]    (survivors)
  *   startIndex    = 0
  *   startVertex   = 0
  *   startInstance = run_base                    (partition slot in b_visible)
@@ -21,7 +21,8 @@
  * before the first indirect draw.
  *
  * Buffer / record layout (must mirror jce_gpu_scene.c):
- *   b_runmeta  : RO, 1 vec4 per run: (numIndices, run_base, _, _) stored as FLOAT
+ *   b_runmeta  : RO, 1 vec4 per draw:
+ *                (numIndices, run_base, counter_index, _) stored as FLOAT
  *                values (bgfx exposes a vertex buffer's compute SRV as RGBA32F,
  *                so the meta is stored float-typed and uint()'d here — same trick
  *                the scene-record ids use); ring-rebased by u_indirect_params.y
@@ -52,11 +53,12 @@ void main()
 	}
 
 	uint meta_off = uint(u_indirect_params.y);
-	vec4 meta = b_runmeta[meta_off + run];   /* (numIndices, run_base, _, _) */
+	vec4 meta = b_runmeta[meta_off + run];
 
 	uint numIndices   = uint(meta.x);
 	uint run_base     = uint(meta.y);
-	uint numInstances = b_counter[run];
+	uint counter_index = uint(meta.z);
+	uint numInstances = b_counter[counter_index];
 
 	drawIndexedIndirect(
 		b_indirect,        /* target indirect buffer            */

@@ -36,6 +36,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_gpu_cull_view,
                                          bool include_point_cube_views,
                                          bool include_dyn_csm_views,
+                                         bool include_underwater_view,
                                          JceSceneRendererViewOrder *out)
 {
     if (!out)
@@ -59,6 +60,16 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
         uint16_t fog_composite_view = (uint16_t)(view_id_base + 16u);
         if (fog_composite_view > max_view)
             max_view = fog_composite_view;
+    }
+    /* Underwater absorption (base+17).  Gated on the scene CONTAINING water
+     * with absorption authored, not on the camera being submerged: submersion
+     * is decided during the water draw, which happens after this range is
+     * built, so gating on it would leave the pass outside the ordered range on
+     * exactly the frame you enter the water. */
+    if (include_underwater_view) {
+        uint16_t uw_view = (uint16_t)(view_id_base + 17u);
+        if (uw_view > max_view)
+            max_view = uw_view;
     }
     /* The GPU-driven cull dispatch (roadmap #18) shares the pre-color compute
        band slot base+9 with the GPU particle compute view — both are dispatches
@@ -134,14 +145,22 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
         }
     }
 
-    /* Dual shadow-map DYNAMIC atlas: 1 full-atlas depth clear (base+21) + 4
-       cascade tiles (base+22..25), pushed BEFORE the color view so the atlas is
-       produced before the PBR pass samples it (via the s_shadowMap stage).  A
-       SPARSE band (outside [base, max_view], above the fog composite base+16), so
-       it adds 5 to the order count beyond range_count (see the return below). */
+    /* Dual shadow-map DYNAMIC atlas: 1 full-atlas depth clear + 4 cascade tiles,
+       pushed BEFORE the color view so the atlas is produced before the PBR pass
+       samples it (via the s_shadowMap stage).  A SPARSE band (outside
+       [base, max_view]) so it adds 5 to the order count beyond range_count (see
+       the return below).
+
+       Lives at base+JCE_VIEW_DYN_CSM_OFFSET (52) .. +56, clear of both the
+       postfx range (base+20..40) and the cube band
+       and above it.  It was base+21..25, which is NOT free: postfx re-bases to
+       base+20, so those five ids were PostFX/TAA_Resolve, TAA_HistoryCopy and
+       Composite.  Last-write-wins view state pointed the postfx chain at the
+       shadow atlas and the frame never reached the backbuffer.  Keep in sync
+       with JCE_VIEW_DYN_CSM_OFFSET in jce_sr_internal.h. */
     if (include_dyn_csm_views) {
-        for (uint16_t v = (uint16_t)(view_id_base + 21u);
-             v <= (uint16_t)(view_id_base + 25u); v++) {
+        for (uint16_t v = (uint16_t)(view_id_base + JCE_VIEW_DYN_CSM_OFFSET);
+             v <= (uint16_t)(view_id_base + JCE_VIEW_DYN_CSM_OFFSET + 4u); v++) {
             if (!order_push(out, v))
                 return false;
         }
@@ -166,10 +185,48 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
             return false;
     }
 
-    /* The cube-tile band (17 sparse views: base+100..+116) is outside
-       [base, max_view], so it adds to the count beyond the contiguous range. */
-    uint16_t expected = (uint16_t)range_count;
-    if (include_point_cube_views) expected = (uint16_t)(expected + 17u);
-    if (include_dyn_csm_views)    expected = (uint16_t)(expected + 5u);
-    return out->count == expected;
+    /* ── Close the window into a true permutation ─────────────────────────
+     *
+     * bgfx_set_view_order(first, count, order) does
+     *
+     *     memCopy(&m_viewRemap[first], order, count * sizeof(ViewId))
+     *
+     * and later inverts it: viewRemap[m_viewRemap[ii]] = ii, so order[i] is
+     * "the view that sorts at position first+i".  The values may name views
+     * anywhere, but the WINDOW it overwrites is always the contiguous run
+     * [first, first + count).
+     *
+     * The sparse bands (cube tiles at base+100..116, dynamic CSM atlas at
+     * base+52..56) each push ids from outside [base, max_view], so count
+     * grew past the contiguous range while `first` stayed at base.  Every id
+     * in the overshoot -- base+range_count .. base+count-1 -- had its sort key
+     * silently rewritten to whatever sat at the tail of the array, and those
+     * are live views: the scene viewport's own upscale/present target is at
+     * base+POST_BASE+23, inside the overshoot.  Two views then claim one sort
+     * position and the composite can run before the pass that fills it, which
+     * is why enabling the dynamic atlas rendered a black, flickering viewport
+     * wherever a band was active.
+     *
+     * Fix: make the array cover its whole window.  Everything already pushed
+     * keeps its position; every remaining id in [first, highest_pushed] is
+     * appended so no live view is left holding a borrowed sort key.  The
+     * appended ids are unused slots, so their relative order does not matter.
+     *
+     * The count is no longer a fixed arithmetic expectation -- it is
+     * whatever the span requires -- so the check below verifies the property
+     * that actually matters: the array is a permutation of its own window. */
+    out->named_count = (uint16_t)out->count;   /* everything above is ours */
+
+    uint16_t highest = out->first;
+    for (uint16_t i = 0; i < out->count; i++)
+        if (out->order[i] > highest) highest = out->order[i];
+
+    for (uint16_t v = out->first; v <= highest; v++) {
+        if (!order_push(out, v))
+            return false;          /* window wider than the order buffer */
+    }
+
+    /* Permutation check: count must span first..highest exactly once each.
+     * order_push dedups, so a correct build has one entry per id. */
+    return out->count == (uint32_t)(highest - out->first + 1u);
 }

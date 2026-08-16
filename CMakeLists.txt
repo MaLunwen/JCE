@@ -1,9 +1,44 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ── MUST be set before project() ──
-set(CMAKE_SUPPRESS_REGENERATION TRUE)
+#
+# IDE generators only, and the scoping is the whole point.
+#
+# CMAKE_SUPPRESS_REGENERATION removes the edge that re-runs CMake when a
+# CMakeLists.txt changes.  On Visual Studio / Xcode that edge is the ZERO_CHECK
+# project, and suppressing it is a taste call.  On Ninja and Makefiles — which
+# is what every build script in this repo generates — that edge is the ONLY
+# thing that keeps the build graph in step with the build files, and it is also
+# what makes file(GLOB ... CONFIGURE_DEPENDS) work: CONFIGURE_DEPENDS writes
+# CMakeFiles/VerifyGlobs.cmake and then relies on the regeneration edge to run
+# it.  With the edge gone, all 55 CONFIGURE_DEPENDS globs in this repo are
+# inert and a stale tree silently compiles new sources against old rules.
+#
+# TWICE MEASURED IN ONE SESSION (2026-08-16), both times as a build failure
+# that belonged to nobody who could see it:
+#
+#   * a7a2dbfc added editor/src/core/jce_editor_script_backends.cpp.  In a tree
+#     configured before it, build.ninja held 0 references to that file while
+#     jce_editor.cpp called into it:
+#         error LNK2019: unresolved external symbol
+#         "void __cdecl jce_editor_register_script_backends(void)"
+#     A manual `cmake .` took the reference count 0 -> 2 and it linked.
+#
+#   * 4e1154c4 added target_compile_definitions to
+#     tests/scripting/java/vm/CMakeLists.txt.  A tree configured 25 minutes
+#     earlier compiled the NEW test source with the OLD command line:
+#         error C2065: 'JCE_JAVA_VM_TEST_PRECOMPILED_DIR': undeclared identifier
+#     Same manual `cmake .` took that define 0 -> 1 in build.ninja.
+#
+# Neither is a defect in the commit that "caused" it, and neither reproduces
+# for whoever configured most recently — which is exactly why this stayed
+# unexplained.  Restoring the edge for Ninja/Makefiles costs one CMake re-run
+# (~11 s here) the first time a build file changes, and nothing after that.
+if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
+	set(CMAKE_SUPPRESS_REGENERATION TRUE)
+endif()
 
-project(JCE VERSION 0.11.2 LANGUAGES C)
+project(JCE VERSION 0.11.4 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -345,6 +380,70 @@ endif()
 
 if(JCE_TRACY_ENABLED)
 	find_package(Tracy REQUIRED)
+
+	# ── Assert the Tracy we link really is loopback-only ──────────────────
+	#
+	# conanfile.py pins tracy/*:only_localhost and tracy/*:no_broadcast so no
+	# JCE binary ever asks the OS for a public listening socket. Those live in
+	# the conan graph, not in this tree: a stale package in the conan cache, a
+	# hand-run `conan install` with different -o flags, or a profile that
+	# resolves a different binary would silently restore the public listener,
+	# and the only symptom is a Windows Firewall dialog on someone else's
+	# machine days later. This has now been reported twice.
+	#
+	# Both options are PUBLIC compile definitions on Tracy::TracyClient, so
+	# the linked artefact can state its own configuration. Check it, rather
+	# than trusting that conanfile.py was the file that produced this build.
+	# Opting in to remote profiling is legitimate -- pass
+	# -DJCE_PROFILING_ALLOW_REMOTE=ON together with the conan -o flags
+	# documented in conanfile.py -- but it must be deliberate, not a default
+	# that reappears on its own.
+	option(JCE_PROFILING_ALLOW_REMOTE
+		"Allow Tracy to listen on all interfaces and broadcast for discovery (prompts the firewall; requires -o tracy/*:only_localhost=False)" OFF)
+
+	# Conan hands these back wrapped in a per-config generator expression, e.g.
+	#   $<$<CONFIG:Debug>:TRACY_ENABLE;TRACY_ON_DEMAND;TRACY_ONLY_LOCALHOST>
+	# CMake splits that on the embedded ';', so the FIRST and LAST tokens carry
+	# genex punctuation ("$<...:TRACY_ENABLE", "TRACY_NO_BROADCAST>") and an
+	# exact IN_LIST test silently fails on them. Match as text instead; none of
+	# Tracy's option names is a substring of another, so this cannot alias.
+	get_target_property(_jce_tracy_defs Tracy::TracyClient
+		INTERFACE_COMPILE_DEFINITIONS)
+	if(NOT _jce_tracy_defs)
+		set(_jce_tracy_defs "")
+	endif()
+	if(JCE_PROFILING_ALLOW_REMOTE)
+		if(_jce_tracy_defs MATCHES "TRACY_ONLY_LOCALHOST")
+			message(FATAL_ERROR
+				"JCE_PROFILING_ALLOW_REMOTE=ON but the linked Tracy was built "
+				"with TRACY_ONLY_LOCALHOST. Re-run conan install with "
+				"-o \"tracy/*:only_localhost=False\" -o \"tracy/*:no_broadcast=False\".")
+		endif()
+		message(STATUS "Tracy: remote profiling ENABLED -- expect a firewall prompt.")
+	else()
+		foreach(_jce_tracy_req TRACY_ONLY_LOCALHOST TRACY_NO_BROADCAST)
+			if(NOT _jce_tracy_defs MATCHES "${_jce_tracy_req}")
+				message(FATAL_ERROR
+					"Tracy was built without ${_jce_tracy_req}, so every JCE "
+					"binary would open a non-loopback socket and trip the "
+					"Windows Firewall prompt. conanfile.py pins this; the "
+					"conan graph this build resolved disagrees, which means "
+					"the conan install predates that pin. scripts/jce.py "
+					"SKIPS conan install whenever "
+					"build/desktop/<target>-conan/build/<Config>/generators/"
+					"conan_toolchain.cmake already exists, so a conanfile.py "
+					"edit does not propagate on its own: re-run the build with "
+					"--clean, or delete that generators directory and "
+					"reconfigure. To profile from another machine instead, set "
+					"-DJCE_PROFILING_ALLOW_REMOTE=ON and pass the conan -o "
+					"flags documented in conanfile.py. "
+					"Tracy defines seen: '${_jce_tracy_defs}'")
+			endif()
+		endforeach()
+		message(STATUS "Tracy: loopback-only listener, discovery broadcast off.")
+	endif()
+	unset(_jce_tracy_req)
+	unset(_jce_tracy_defs)
 endif()
 
 # RenderDoc in-application GPU-capture trigger (debug aid). Mirror the Tracy
@@ -571,6 +670,11 @@ else()
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_path.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_dict.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_crypto.c"
+		# Canonical extension tables (asset kind + script language).  Same
+		# reason as the jce_cook list below: this target has an explicit
+		# source list, so the TU must be named here or jce_archive_cook.c's
+		# compression classifier fails to link.
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_ext.c"
 		"${JCE_ENGINE_SRC_DIR}/os/platform/jce_mmap.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
@@ -637,6 +741,7 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_writer_internal.c"
 		# Canonical extension -> asset-kind table shared by the cooker, the
 		# runtime and the editor (jce_asset_type_from_ext).  This target has
 		# an explicit source list rather than the engine's glob, so the TU
@@ -665,6 +770,19 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		# renderer/ but is deliberately bgfx-FREE: it needs only SDL3 +
 		# SDL3_image (linked below), the vendored stb build and jce_memory —
 		# all already part of this target.
+		# The cooked-terrain v3 codec.  It was compiled into the engine but
+		# into no TOOL, so nothing in the tree could produce a file in the
+		# format -- the codec was reachable only from its own unit tests.
+		# Runtime terrain authoring, through the PUBLIC api (jce_terrain.h):
+		# create -> import heightmap -> save.  The CLI must not reproduce the
+		# .bin byte layout -- a caller that has to read engine internals to
+		# use a feature is exactly what the public API exists to prevent.
+		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_terrain.c"
+		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_phacelle.c"
+		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_horizon.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_json.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_path.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_terrain_format.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_image_decode.c"
 		"${JCE_ENGINE_SRC_DIR}/renderer/jce_image.c"
 		"${JCE_ENGINE_SRC_DIR}/renderer/jce_stb_image_impl.c")
@@ -706,7 +824,9 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		v-hacd::v-hacd
 		# Offline model→GLB conversion (--convert-model) needs the meshopt
 		# dedup/simplify core that jce_bundle_mesh_convert.cpp drives.
-		meshoptimizer::meshoptimizer)
+		meshoptimizer::meshoptimizer
+		# Runtime terrain authoring writes its meta through jce_json.
+		cjson::cjson)
 	# JCE_DIST: compile out the engine LOG_* macros pulled in by the
 	#   collider/model-import TUs so jce_cook needs no async log subsystem.
 	# JCE_COLLIDER_ASSET_NO_PHYSICS: omit jce_collider_instantiate() so the
@@ -784,6 +904,16 @@ set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
 set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
 set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
 
+_jce_prepare_runtime_boot_manifest(CagedKingdom
+	"${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/jce_project.json"
+	GAME_RUNTIME_METADATA_DIR GAME_RUNTIME_BOOT_FILE)
+set(GAME_RUNTIME_INPUT_FILE "")
+if(GAME_RUNTIME_METADATA_DIR AND
+   EXISTS "${GAME_RUNTIME_METADATA_DIR}/settings/input_actions.json")
+	set(GAME_RUNTIME_INPUT_FILE
+		"${GAME_RUNTIME_METADATA_DIR}/settings/input_actions.json")
+endif()
+
 # THIRD_PARTY_LICENSES.md is sourced from the repo root and copied
 # directly into each PAK at build time. We do NOT mirror it into the
 # source tree (no engine/resources/THIRD_PARTY_LICENSES.md).
@@ -809,6 +939,24 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 	set(EDITOR_COOKED_DIR  "${CMAKE_CURRENT_BINARY_DIR}/_cooked/editor")
 	set(COOK_GAME_STAMP    "${CMAKE_CURRENT_BINARY_DIR}/_cook_game.stamp")
 	set(COOK_EDITOR_STAMP  "${CMAKE_CURRENT_BINARY_DIR}/_cook_editor.stamp")
+	# jce_cook sweeps unseen outputs from its catalog.  Every source root needs
+	# an independent catalog when several roots merge into one cooked tree;
+	# sharing the default catalog would let each later batch erase the earlier
+	# batches and leave the PAK with only the final UI directory.
+	set(GAME_COOK_CATALOG_ENGINE
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_game_engine.catalog")
+	set(GAME_COOK_CATALOG_ENGINE_UI
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_game_engine_ui.catalog")
+	set(GAME_COOK_CATALOG_PROJECT
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_game_project.catalog")
+	set(GAME_COOK_CATALOG_PROJECT_UI
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_game_project_ui.catalog")
+	set(EDITOR_COOK_CATALOG_ENGINE
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_editor_engine.catalog")
+	set(EDITOR_COOK_CATALOG_ENGINE_UI
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_editor_engine_ui.catalog")
+	set(EDITOR_COOK_CATALOG_PROJECT
+		"${CMAKE_CURRENT_BINARY_DIR}/_cook_editor_project.catalog")
 
 	add_custom_command(
 		OUTPUT     "${COOK_GAME_STAMP}"
@@ -817,15 +965,19 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${GAME_COOKED_DIR}"
+		           --catalog "${GAME_COOK_CATALOG_ENGINE}"
 		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_UI_DIR}"        "${GAME_COOKED_DIR}"
+		           --catalog "${GAME_COOK_CATALOG_ENGINE_UI}"
 		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_RESOURCE_DIR}"    "${GAME_COOKED_DIR}"
+		           --catalog "${GAME_COOK_CATALOG_PROJECT}"
 		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_UI_DIR}"          "${GAME_COOKED_DIR}"
+		           --catalog "${GAME_COOK_CATALOG_PROJECT_UI}"
 		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/CK_icon.png"
@@ -849,12 +1001,15 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${EDITOR_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
+		           --catalog "${EDITOR_COOK_CATALOG_ENGINE}"
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_UI_DIR}"        "${EDITOR_COOKED_DIR}"
+		           --catalog "${EDITOR_COOK_CATALOG_ENGINE_UI}"
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${EDITOR_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
+		           --catalog "${EDITOR_COOK_CATALOG_PROJECT}"
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${EDITOR_ICON_FILE}" "${EDITOR_COOKED_DIR}/JCE_icon.png"
@@ -876,6 +1031,10 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 
 	# PAK reads from a single cooked dir (engine + app merged).
 	set(_GAME_PAK_RES_FLAGS    --resource-dir "${GAME_COOKED_DIR}")
+	if(GAME_RUNTIME_METADATA_DIR)
+		list(APPEND _GAME_PAK_RES_FLAGS
+			--resource-dir "${GAME_RUNTIME_METADATA_DIR}")
+	endif()
 	set(_EDITOR_PAK_RES_FLAGS  --resource-dir "${EDITOR_COOKED_DIR}")
 	set(_COOK_GAME_DEP    CookGameAssets)
 	set(_COOK_EDITOR_DEP  CookEditorAssets)
@@ -887,6 +1046,10 @@ else()
 		--resource-dir "${GAME_RESOURCE_DIR}"
 		--resource-dir "${GAME_UI_DIR}"
 		--resource-dir "${GAME_ICON_STAGE_DIR}")
+	if(GAME_RUNTIME_METADATA_DIR)
+		list(APPEND _GAME_PAK_RES_FLAGS
+			--resource-dir "${GAME_RUNTIME_METADATA_DIR}")
+	endif()
 	set(_EDITOR_PAK_RES_FLAGS
 		--resource-dir "${ENGINE_RESOURCE_DIR}"
 		--resource-dir "${ENGINE_UI_DIR}"
@@ -1004,6 +1167,7 @@ add_custom_command(
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 	           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 	           "${GAME_ICON_FILE}"
+	           ${GAME_RUNTIME_BOOT_FILE} ${GAME_RUNTIME_INPUT_FILE}
 	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing game assets -> ${GAME_PAK_FILE}"
 	VERBATIM)
@@ -1274,6 +1438,20 @@ endfunction()
 # ------------------------------------------------------------------ #
 
 add_subdirectory(engine)
+# The language-binding layer: the narrow, versioned C ABI the Python / Java /
+# C++ backends load, and those backends themselves.  It links no engine layer
+# (see scripting/c_abi/CMakeLists.txt), and scripting/CMakeLists.txt discovers
+# its own subdirectories so that adding a backend touches no file outside that
+# backend's directory.
+#
+# BEFORE editor/, and that ordering is load-bearing rather than tidy: the
+# editor asks `if(TARGET jce_script_vm_python)` so editor Play can run the
+# languages the shipped game runs, and a target declared by a LATER
+# add_subdirectory() reads as absent — silently, with a green configure and a
+# green build.  Measured: with this line still below editor/, the editor
+# configured cleanly with all three backends ON and linked none of them.
+# It comes after engine/ because the backends link jce_script and jce_core.
+add_subdirectory(scripting)
 add_subdirectory(editor)
 # CK is downstream of the SDK: it builds as an SDK consumer (scripts/jce.py
 # app), not as a first-party in-tree target.  Gated ON only for dev iteration.
@@ -1285,8 +1463,70 @@ endif()
 if(JCE_BUILD_INTREE_MEADOW)
 	add_subdirectory(meadow_valley)
 endif()
+# elemental_serenity is added AFTER scripting/, not here — see below.
 # science_lab is intentionally NOT add_subdirectory()'d: it is a standalone
 # find_package(JCE) consumer built out-of-tree (see science_lab/CMakeLists.txt).
+
+# The STANDARD GPU TASK: one deterministic task, the Elemental Serenity scene,
+# a real GPU frame, and one implementation per driver language.  Gated OFF by
+# default because it needs a GPU, and added AFTER scripting/ because it links
+# whichever backends that directory declared.
+#
+# It lives under tools/ and NOT under elemental_serenity/ even though that is
+# the scene it drives: .gitignore:150 makes /elemental_serenity/ deliberately
+# unversioned ("Sample projects (local-only)"), and `git ls-files
+# elemental_serenity` returns nothing.  A harness committed in there would be
+# ignored by `git add` without a word — the silent-absence failure this task
+# exists to catch, reintroduced by its own layout.
+option(JCE_BUILD_GPU_TASK
+	"Build the cross-language standard GPU task (tools/gpu_task)" OFF)
+if(JCE_BUILD_GPU_TASK)
+	add_subdirectory(tools/gpu_task)
+endif()
+
+# Elemental Serenity, in-tree, and ALSO after scripting/ for the same reason
+# the GPU task is: it links whichever backends that directory declared, and
+# `if(TARGET jce_script_vm_python)` reads FALSE for a directory added earlier.
+# That is not a hypothetical — this block was first written up beside
+# JCE_BUILD_INTREE_MEADOW and configured cleanly with all three backends ON
+# and all three silently absent from the app.  The three message(WARNING)s in
+# the project's own CMakeLists are what caught it; ordering alone would not
+# have said a word.
+#
+# ITS ONLY REASON WAS SCRIPTING, AND THAT REASON IS GONE.  This block was
+# written when the SDK a normal consumer project builds against installed the
+# engine and NOTHING from scripting/ — no jce_script_api import library, no
+# jce_script_vm_* archive, no `jce_script` Python package, no compiled Java
+# classes — so an out-of-tree find_package(JCE) project could not enable
+# Python, Java or C++ scripting at all, whatever it wrote in its own
+# CMakeLists, and in-tree was the only place the four-language path could be
+# exercised end to end.
+#
+# scripting/cmake/JCEScriptingInstall.cmake now installs that layer and
+# JCEConfig.cmake includes the generated JCEScripting.cmake, so an SDK
+# consumer gets the same target names this tree uses; the out-of-tree proof
+# is tests/sdk_smoke_scripting.  What is left here is a convenience for
+# iterating on a local-only project without producing an SDK first — keep the
+# option, but it is no longer the only door.
+#
+# Gated OFF, and guarded on EXISTS because /elemental_serenity/ is
+# deliberately unversioned (.gitignore, "Sample projects (local-only)"): a
+# bare add_subdirectory() would be a configure error in a fresh clone that
+# turned this option on, and the message below is what says why.
+option(JCE_BUILD_INTREE_ES
+	"Build elemental_serenity in-tree (the four-language scripting bring-up)"
+	OFF)
+if(JCE_BUILD_INTREE_ES)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/elemental_serenity/CMakeLists.txt")
+		add_subdirectory(elemental_serenity)
+	else()
+		message(FATAL_ERROR
+			"JCE_BUILD_INTREE_ES=ON but elemental_serenity/ is not in this "
+			"checkout. It is a local-only project (.gitignore) and is never "
+			"committed; obtain it separately, or configure with "
+			"-DJCE_BUILD_INTREE_ES=OFF.")
+	endif()
+endif()
 
 # After jce_renderer has been declared in engine/CMakeLists.txt, hook
 # in the generated embedded-shader C array (and exclude the stub TU).
@@ -1341,7 +1581,7 @@ if(JCE_ENABLE_PUBLIC_API_GUARD)
 	if(Python3_FOUND)
 		add_custom_target(check_public_api
 			COMMAND ${Python3_EXECUTABLE}
-				"${CMAKE_SOURCE_DIR}/tools/check_public_headers.py"
+				"${CMAKE_SOURCE_DIR}/scripts/lint/check_public_api_purity.py"
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			COMMENT "Verifying public headers have no third-party leaks"
 			VERBATIM)

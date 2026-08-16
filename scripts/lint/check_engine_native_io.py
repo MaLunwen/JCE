@@ -45,6 +45,7 @@ ALLOW_FILES = {
     "engine/src/os/core/jce_log.c",                 # OutputDebugString hook
     "engine/src/os/core/jce_sysinfo.c",             # CPU/RAM probe
     "engine/src/os/core/jce_crash_handler.c",       # SetUnhandledExceptionFilter
+    "engine/src/os/core/jce_sampler.c",             # SuspendThread + dbghelp
     "engine/src/os/platform/jce_single_instance.c", # native mutex / lock file
     "engine/src/os/platform/jce_window_modal_loop.c", # Win32 modal-loop hook
 }

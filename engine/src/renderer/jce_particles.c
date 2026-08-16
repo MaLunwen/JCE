@@ -11,6 +11,7 @@
 #include <jce/os/core/jce_thread.h>    /* parallel emitter update */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/renderer/jce_particles.h>
 
 #include "os/core/jce_memory.h"   /* JCE_MALLOC / JCE_FREE (mimalloc-tracked) */
@@ -22,6 +23,9 @@
 #define LOG_TAG "particles"
 
 #define MAX_EMITTERS 256
+#define PARALLEL_MIN_WORK_PER_LANE 512u
+#define PARALLEL_MIN_SECONDARY_WORK 256u
+#define PARALLEL_CHUNKS_PER_WORKER 2u
 
 /* ── Single particle ───────────────────────────────────────────────── */
 
@@ -85,6 +89,7 @@ struct JceParticleSystem {
     jce_allocator_t alloc;
     Emitter         emitters[MAX_EMITTERS];
     uint32_t        emitter_count;
+    uint32_t        emitter_high_water;
     uint32_t        rng_state;   /* xorshift32 */
 };
 
@@ -208,61 +213,72 @@ static JceEmitterHandle emitter_add_depth(JceParticleSystem *sys,
                                           const JceParticleEmitterDesc *desc,
                                           uint32_t depth)
 {
+    uint32_t slot = MAX_EMITTERS;
+    Emitter *em;
+    uint32_t cap;
+
     if (!sys || !desc) return JCE_EMITTER_INVALID;
 
-    for (uint32_t i = 0; i < MAX_EMITTERS; i++) {
+    for (uint32_t i = 0; i < sys->emitter_high_water; i++) {
         if (!sys->emitters[i].alive) {
-            Emitter *em = &sys->emitters[i];
-            memset(em, 0, sizeof(*em));
-            em->alive      = true;
-            em->emitting   = true;
-            em->desc       = *desc;
-            em->origin     = jce_v3(0, 0, 0);
-            em->sub_handle = JCE_EMITTER_INVALID;
-            em->depth      = depth;
+            slot = i;
+            break;
+        }
+    }
+    if (slot == MAX_EMITTERS && sys->emitter_high_water < MAX_EMITTERS)
+        slot = sys->emitter_high_water;
 
-            uint32_t cap = desc->max_particles ? desc->max_particles : 1024;
-            em->pool = (Particle *)sys->alloc.alloc(
-                sizeof(Particle) * cap, sys->alloc.ctx);
-            if (!em->pool) {
-                em->alive = false;
-                return JCE_EMITTER_INVALID;
-            }
-            memset(em->pool, 0, sizeof(Particle) * cap);
-            em->desc.max_particles = cap;
+    if (slot == MAX_EMITTERS) {
+        LOG_ERROR(LOG_TAG, "emitter limit reached (%u)", MAX_EMITTERS);
+        return JCE_EMITTER_INVALID;
+    }
 
-            /* Distinct per-emitter seed (never 0 — xorshift32 stalls on 0)
-             * so each emitter's randomness is independent → parallel-safe. */
-            em->rng_state = ((uint32_t)i + 1u) * 2654435761u ^ 0x9E3779B9u;
-            if (em->rng_state == 0u) em->rng_state = 0xDEADBEEFu;
+    em = &sys->emitters[slot];
+    memset(em, 0, sizeof(*em));
+    em->alive      = true;
+    em->emitting   = true;
+    em->desc       = *desc;
+    em->origin     = jce_v3(0, 0, 0);
+    em->sub_handle = JCE_EMITTER_INVALID;
+    em->depth      = depth;
 
-            sys->emitter_count++;
+    cap = desc->max_particles ? desc->max_particles : 1024;
+    em->pool = (Particle *)sys->alloc.alloc(
+        sizeof(Particle) * cap, sys->alloc.ctx);
+    if (!em->pool) {
+        em->alive = false;
+        return JCE_EMITTER_INVALID;
+    }
+    memset(em->pool, 0, sizeof(Particle) * cap);
+    em->desc.max_particles = cap;
 
-            /* Build the child sub-emitter, depth-bounded.  The child never
-             * free-runs: it is set non-emitting so it only produces particles
-             * via parent-driven spawns.  Beyond the depth cap the chain is
-             * silently truncated to prevent spawn storms. */
-            if (desc->sub_emitter &&
-                (desc->sub_spawn_on_birth || desc->sub_spawn_on_death) &&
-                depth + 1u < JCE_PARTICLE_SUBEMITTER_MAX_DEPTH) {
-                JceEmitterHandle ch =
-                    emitter_add_depth(sys, desc->sub_emitter, depth + 1u);
-                if (jce_emitter_valid(ch)) {
-                    /* `em` may have moved relative to nothing (array slot is
-                     * stable), but re-fetch to be explicit about the slot. */
-                    sys->emitters[i].sub_handle = ch;
-                    sys->emitters[ch.idx].emitting = false;
-                } else {
-                    LOG_WARN(LOG_TAG, "sub-emitter pool full; child skipped");
-                }
-            }
+    /* Distinct per-emitter seed (never 0 — xorshift32 stalls on 0)
+     * so each emitter's randomness is independent and parallel-safe. */
+    em->rng_state = (slot + 1u) * 2654435761u ^ 0x9E3779B9u;
+    if (em->rng_state == 0u) em->rng_state = 0xDEADBEEFu;
 
-            return (JceEmitterHandle){ i };
+    sys->emitter_count++;
+    if (slot >= sys->emitter_high_water)
+        sys->emitter_high_water = slot + 1u;
+
+    /* Build the child sub-emitter, depth-bounded.  The child never
+     * free-runs: it is set non-emitting so it only produces particles
+     * via parent-driven spawns.  Beyond the depth cap the chain is
+     * silently truncated to prevent spawn storms. */
+    if (desc->sub_emitter &&
+        (desc->sub_spawn_on_birth || desc->sub_spawn_on_death) &&
+        depth + 1u < JCE_PARTICLE_SUBEMITTER_MAX_DEPTH) {
+        JceEmitterHandle child =
+            emitter_add_depth(sys, desc->sub_emitter, depth + 1u);
+        if (jce_emitter_valid(child)) {
+            sys->emitters[slot].sub_handle = child;
+            sys->emitters[child.idx].emitting = false;
+        } else {
+            LOG_WARN(LOG_TAG, "sub-emitter pool full; child skipped");
         }
     }
 
-    LOG_ERROR(LOG_TAG, "emitter limit reached (%u)", MAX_EMITTERS);
-    return JCE_EMITTER_INVALID;
+    return (JceEmitterHandle){ slot };
 }
 
 JceEmitterHandle jce_particles_emitter_add(JceParticleSystem *sys,
@@ -296,6 +312,9 @@ void jce_particles_emitter_remove(JceParticleSystem *sys,
         em->sink_user   = NULL;
         em->alive       = false;
         sys->emitter_count--;
+        while (sys->emitter_high_water > 0u &&
+               !sys->emitters[sys->emitter_high_water - 1u].alive)
+            sys->emitter_high_water--;
     }
 }
 
@@ -557,13 +576,21 @@ static void update_emitter(JceParticleSystem *sys, Emitter *em,
  * so emitters are independent and safe to step concurrently (disjoint writes).
  * Sub-emitter spawns and sink callbacks are DEFERRED to a serial drain pass so
  * the parallel step never writes another emitter's pool or runs user code. */
-typedef struct { JceParticleSystem *sys; Emitter *emitters; float dt; } PUpdateCtx;
+typedef struct {
+    JceParticleSystem *sys;
+    Emitter           *emitters;
+    float              dt;
+    uint16_t           active_slots[MAX_EMITTERS];
+} PUpdateCtx;
 
 static void particles_update_range(uint32_t begin, uint32_t end, void *user)
 {
     PUpdateCtx *c = (PUpdateCtx *)user;
-    for (uint32_t i = begin; i < end; i++)
-        update_emitter(c->sys, &c->emitters[i], c->dt, &c->emitters[i].rng_state);
+    for (uint32_t i = begin; i < end; i++) {
+        uint32_t slot = c->active_slots[i];
+        update_emitter(c->sys, &c->emitters[slot], c->dt,
+                       &c->emitters[slot].rng_state);
+    }
 }
 
 /* Serial post-pass: drain each emitter's deferred events.  Invokes the
@@ -573,7 +600,7 @@ static void particles_update_range(uint32_t begin, uint32_t end, void *user)
  * capacity and the build-time depth cap, so a single step cannot storm. */
 static void particles_drain_events(JceParticleSystem *sys)
 {
-    for (uint32_t i = 0; i < MAX_EMITTERS; i++) {
+    for (uint32_t i = 0; i < sys->emitter_high_water; i++) {
         Emitter *em = &sys->emitters[i];
         if (!em->alive || em->event_count == 0) continue;
 
@@ -603,20 +630,102 @@ static void particles_drain_events(JceParticleSystem *sys)
     }
 }
 
+static uint32_t particles_estimated_emitter_work(const Emitter *em, float dt)
+{
+    uint64_t work = (uint64_t)em->alive_count + 1u;
+
+    if (em->emitting && em->desc.emit_rate > 0.0f &&
+        em->alive_count < em->desc.max_particles) {
+        float credit = em->emit_accumulator + em->desc.emit_rate * dt;
+        uint32_t available = em->desc.max_particles - em->alive_count;
+        uint32_t spawning = 0u;
+
+        if (credit > 0.0f) {
+            spawning = credit >= (float)available
+                     ? available : (uint32_t)credit;
+        }
+        work += (uint64_t)spawning * 2u;
+    }
+    return work > UINT32_MAX ? UINT32_MAX : (uint32_t)work;
+}
+
 void jce_particles_update(JceParticleSystem *sys, float dt)
 {
+    uint64_t estimated_work = 0u;
+    uint32_t max_emitter_work = 0u;
+    uint32_t active_count = 0u;
+    uint32_t chunk = 0u;
+    bool use_parallel = false;
+    PUpdateCtx ctx;
+
     if (!sys) return;
     JCE_PROFILE_ZONE_N("Particles::Update");
-    PUpdateCtx ctx = { sys, sys->emitters, dt };
-    JceThreadPool *pool = jce_thread_pool_shared();
-    if (pool)
-        jce_thread_pool_parallel_for(pool, MAX_EMITTERS, 0,
-                                     particles_update_range, &ctx);
-    else
-        particles_update_range(0u, MAX_EMITTERS, &ctx);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.sys = sys;
+    ctx.emitters = sys->emitters;
+    ctx.dt = dt;
+
+    for (uint32_t i = 0; i < sys->emitter_high_water; ++i) {
+        Emitter *em = &sys->emitters[i];
+        uint32_t work;
+
+        if (!em->alive)
+            continue;
+        ctx.active_slots[active_count++] = (uint16_t)i;
+        work = particles_estimated_emitter_work(em, dt);
+        estimated_work += work;
+        if (work > max_emitter_work)
+            max_emitter_work = work;
+    }
+
+    JceThreadPool *pool = NULL;
+    if (active_count >= 2u &&
+        estimated_work >= PARALLEL_MIN_WORK_PER_LANE * 2u &&
+        estimated_work - max_emitter_work >=
+            PARALLEL_MIN_SECONDARY_WORK) {
+        pool = jce_thread_pool_shared();
+        if (pool) {
+            int worker_count = jce_thread_pool_worker_count(pool);
+            uint32_t lanes = worker_count > 0
+                           ? (uint32_t)worker_count : 1u;
+            uint32_t target_chunks;
+
+            if (lanes > active_count)
+                lanes = active_count;
+            use_parallel =
+                lanes > 1u &&
+                estimated_work >=
+                    (uint64_t)lanes * PARALLEL_MIN_WORK_PER_LANE;
+            target_chunks = lanes * PARALLEL_CHUNKS_PER_WORKER;
+            if (target_chunks > active_count)
+                target_chunks = active_count;
+            if (target_chunks > 0u)
+                chunk = (active_count + target_chunks - 1u) / target_chunks;
+        }
+    }
+
+    if (use_parallel)
+        jce_thread_pool_parallel_for_named(
+            pool, "particles.update", active_count, chunk,
+            particles_update_range, &ctx);
+    else if (active_count > 0u)
+        particles_update_range(0u, active_count, &ctx);
 
     /* Serial: deliver events + apply sub-emitter spawns (cross-emitter). */
     particles_drain_events(sys);
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                      "particles.active_emitters",
+                      (int64_t)sys->emitter_count);
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                      "particles.alive",
+                      (int64_t)jce_particles_alive_count(sys));
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                      "particles.work_estimate",
+                      (int64_t)estimated_work);
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                      "particles.parallel",
+                      use_parallel ? 1 : 0);
     JCE_PROFILE_ZONE_END;
 }
 
@@ -626,7 +735,7 @@ uint32_t jce_particles_alive_count(const JceParticleSystem *sys)
 {
     if (!sys) return 0;
     uint32_t total = 0;
-    for (uint32_t i = 0; i < MAX_EMITTERS; i++) {
+    for (uint32_t i = 0; i < sys->emitter_high_water; i++) {
         if (sys->emitters[i].alive)
             total += sys->emitters[i].alive_count;
     }

@@ -210,6 +210,54 @@ static bool s_reset_layout_requested = false;
 static int  s_layout_preset_pending = 0;
 static bool s_focus_scene_view = false;
 static bool s_focus_game_view = false;
+/* Game viewport maximised over the whole editor window.
+ *
+ * Deliberately NOT persisted: booting the editor into a state where one
+ * panel covers everything, with no visible chrome explaining why, is a
+ * worse first frame than re-pressing F10.
+ *
+ * The maximised view is a SEPARATE window id (###game_view_maximized) that
+ * hosts the same content, and the docked ###game_view is skipped for that
+ * frame. Re-posing the docked window itself would detach it from its dock
+ * node and ImGui would write the detachment into imgui.ini -- the user's
+ * layout would not survive the round trip. */
+/* ONE slot, not one bool per viewport. Two independent flags would let both
+ * viewports claim the work area in the same frame, and whichever drew second
+ * would win silently -- and each content function drives its own render target,
+ * so both would also render. A single slot makes the modes mutually exclusive
+ * by construction rather than by a rule someone has to remember.
+ *
+ * JCE_PANEL_COUNT means "none maximised". */
+static JceEditorPanel s_maximized_panel = JCE_PANEL_COUNT;
+
+bool jce_editor_panel_is_maximized(JceEditorPanel kind)
+{
+    return s_maximized_panel == kind;
+}
+
+void jce_editor_panel_set_maximized(JceEditorPanel kind, bool on)
+{
+    if (on) {
+        s_maximized_panel = kind;
+        if (kind >= 0 && kind < JCE_PANEL_COUNT)
+            *jce_editor_panel_visible_ptr(kind) = true;
+    } else if (s_maximized_panel == kind) {
+        s_maximized_panel = JCE_PANEL_COUNT;
+    }
+}
+
+JceEditorPanel jce_editor_panel_maximized(void) { return s_maximized_panel; }
+
+/* Kept so existing call sites and the Game View toolbar read the same way. */
+bool jce_editor_game_view_maximized(void)
+{
+    return jce_editor_panel_is_maximized(JCE_PANEL_GAME_VIEW);
+}
+
+void jce_editor_game_view_set_maximized(bool on)
+{
+    jce_editor_panel_set_maximized(JCE_PANEL_GAME_VIEW, on);
+}
 static bool s_focus_inspector = false;
 static bool s_focus_file_viewer = false;
 static void cmd_toggle_demo_lod_(void);  /* fwd-decl: defined further down */
@@ -456,6 +504,7 @@ static void cmd_toggle_demo_lod_(void);
 static void cmd_pack_current_scene_(void);
 static void cmd_screenshot_(void);
 static void cmd_record_toggle_(void);
+static void cmd_copy_repro_(void);
 
 static void handle_global_edit_shortcuts(void)
 {
@@ -475,6 +524,37 @@ static void handle_global_edit_shortcuts(void)
     /* Record (F9): toggle continuous backbuffer capture (Phase 0: PNG frames). */
     if (jce_hotkey_pressed(JCE_HK_UI_RECORD)) {
         cmd_record_toggle_();
+        return;
+    }
+
+    /* Copy repro command (Ctrl+Shift+C): put the exact envshot invocation for
+     * WHAT IS ON SCREEN RIGHT NOW on the clipboard, and print it to the log.
+     *
+     * A screenshot shows a defect and hides the one thing needed to measure it.
+     * Visual defects in this engine have been chased at cameras the reporter
+     * never used -- one such hunt consumed a whole session and ended in "I
+     * cannot reproduce it", which is a statement about the investigator's
+     * camera and not about the bug. This turns "it looks wrong here" into a
+     * command anyone can run.
+     *
+     * Both clipboard AND log: the clipboard is what a person wants, the log is
+     * what survives the clipboard being overwritten by whatever they paste
+     * next. */
+    if (jce_hotkey_pressed(JCE_HK_UI_COPY_REPRO)) {
+        cmd_copy_repro_();
+        return;
+    }
+
+    /* Maximise the Game viewport (F10). Handled in this early block, before the
+     * WantTextInput and game-input gates below, because the moment a user most
+     * wants to un-maximise is while they are driving the game camera with the
+     * mouse captured -- a handler placed after those gates would be dead
+     * exactly then. */
+    if (jce_hotkey_pressed(JCE_HK_UI_TOGGLE_GAME_MAXIMIZE)) {
+        if (s_maximized_panel != JCE_PANEL_COUNT)
+            s_maximized_panel = JCE_PANEL_COUNT;
+        else
+            jce_editor_panel_set_maximized(JCE_PANEL_GAME_VIEW, true);
         return;
     }
 
@@ -698,6 +778,39 @@ static void cmd_screenshot_(void)
 
 /* F9 — toggle screen recording to a VP9 .webm (backbuffer -> VP9 -> WebM on a
  * worker thread). Audio (Opus) is a planned follow-up. */
+/* Build the envshot line that reproduces the current scene view. */
+static void cmd_copy_repro_(void)
+{
+    float tgt[3] = { 0, 0, 0 }, dist = 0.0f, pitch = 0.0f, yaw = 0.0f;
+    jce_editor_scene_get_orbit(tgt, &dist, &pitch, &yaw);
+
+    const char *scene = jce_state_get_current_scene_path();
+    char line[1024];
+    /* `--view bay` is a placeholder every field of which the overrides below
+     * replace; the tool needs a named view to start from. Naming that here is
+     * cheaper than a reader discovering it by getting a different picture.
+     *
+     * The target's Y and the distance come out as a trailing COMMENT rather
+     * than as flags, because envshot's named views own those two and there is
+     * no override for them. Printing them anyway lets the reader see whether
+     * the placeholder's y/dist are close enough, instead of silently getting a
+     * different framing. */
+    snprintf(line, sizeof line,
+             "python tools/envshot.py capture --name repro "
+             "--scene \"%s\" --view bay --dx %.3f --dz %.3f "
+             "--pitch %.2f --yaw %.2f   # target y=%.3f dist=%.3f",
+             (scene && scene[0]) ? scene : "<unsaved scene>",
+             (double)tgt[0], (double)tgt[2], (double)pitch, (double)yaw,
+             (double)tgt[1], (double)dist);
+
+    ImGui::SetClipboardText(line);
+    /* A toast, not a log line: this is pressed while looking at a defect, and
+     * the person needs to know it worked without leaving the view they are
+     * reporting. The command itself is on the clipboard; the toast only has to
+     * confirm that. */
+    jce_toast_info(jce_editor_i18n("toast.copyRepro"), line);
+}
+
 static void cmd_record_toggle_(void)
 {
     if (jce_editor_recorder_is_active()) {
@@ -1362,6 +1475,14 @@ static void draw_menu_bar(void)
         if (ImGui::BeginMenu(jce_editor_i18n("window.group.scene"))) {
             panel_toggle(jce_editor_i18n("Scene"), JCE_PANEL_SCENE_VIEW, "###scene_view");
             panel_toggle(jce_editor_i18n("Game"),  JCE_PANEL_GAME_VIEW,  "###game_view");
+            /* i18n_or rather than a new key: sort_i18n.py --check --strict
+             * fails CI if en.json defines a key the other 13 locales lack. */
+            {
+                bool gmax = jce_editor_panel_is_maximized(JCE_PANEL_GAME_VIEW);
+                if (ImGui::MenuItem(jce_editor_i18n("window.game.maximize"),
+                                    "Shift+F11", &gmax))
+                    jce_editor_panel_set_maximized(JCE_PANEL_GAME_VIEW, gmax);
+            }
             ImGui::EndMenu();
         }
 
@@ -2310,8 +2431,30 @@ static void draw_panel_windows(void)
         s_dbg_focus_scene = getenv("JCE_DBG_FOCUS_SCENE") ? 1 : 0;
     if (s_dbg_focus_scene) s_focus_scene_view = true;
 
+    /* QA-only: the mirror of the above. JCE_DBG_FOCUS_GAME foregrounds the
+     * Game View and suppresses the Scene View, so a headless whole-window
+     * capture sees the GAME camera.
+     *
+     * It exists because a defect was reported in Play mode and every
+     * measurement available was of the scene view -- a different camera, a
+     * different focus disc, and a different far plane (jce_editor_game_render
+     * pins 1000). "I cannot reproduce it" from the wrong panel is a statement
+     * about the harness. Suppressing the other panel rather than merely
+     * raising this one matters: both are docked into one tab bar, and a
+     * focused-but-tabbed window still renders behind its neighbour. */
+    static int s_dbg_focus_game = -1;
+    if (s_dbg_focus_game < 0)
+        s_dbg_focus_game = getenv("JCE_DBG_FOCUS_GAME") ? 1 : 0;
+    if (s_dbg_focus_game) s_focus_game_view = true;
+
     /* ── Scene View ───────────────────────────────────────────────── */
-    if (*jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
+    /* No Scene View maximise is offered yet, so the slot can never name it and
+     * this guard is always true today. It is kept because the guard, not the UI
+     * that sets the slot, is what makes the mode correct -- adding the button
+     * back must not also require remembering to add this. */
+    if (!s_dbg_focus_game &&
+        !jce_editor_panel_is_maximized(JCE_PANEL_SCENE_VIEW) &&
+        *jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###scene_view", jce_editor_i18n("Scene"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         if (s_focus_scene_view) {
@@ -2328,7 +2471,8 @@ static void draw_panel_windows(void)
 
     panel_phase("ed_p_scene_view", &ed_pt);
     /* ── Game View ────────────────────────────────────────────────── */
-    if (!s_dbg_focus_scene && *jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
+    if (!s_dbg_focus_scene &&
+        (s_dbg_focus_game || *jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW))) {
         snprintf(lbl, sizeof(lbl), "%s###game_view", jce_editor_i18n("Game"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         if (s_focus_game_view) {
@@ -2336,9 +2480,27 @@ static void draw_panel_windows(void)
             s_focus_game_view = false;
         }
         jce_editor_panel_default_pose(lbl);
-        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW), ImGuiWindowFlags_NoFocusOnAppearing)) {
+        /* The docked window is submitted EVERY frame, maximised or not.
+         *
+         * Skipping it was wrong: an ImGui window that goes one frame without
+         * being submitted is dropped from its dock node's tab bar, and on
+         * return its tab is re-inserted at the end rather than in its original
+         * position. Maximising and restoring would therefore quietly reorder
+         * the user's tabs -- exactly the "must not affect the existing layout"
+         * property this mode is supposed to have.
+         *
+         * Submitting it with no content keeps the dock membership, tab order,
+         * split sizes and ini state bit-identical; the maximised overlay draws
+         * on top of it, so nothing of the empty window is ever seen. The
+         * content function still runs exactly once per frame -- there, not
+         * here -- because it drives the game render target. */
+        const bool maximized = jce_editor_panel_is_maximized(JCE_PANEL_GAME_VIEW);
+        const bool docked_open = ImGui::Begin(
+            lbl, jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW),
+            ImGuiWindowFlags_NoFocusOnAppearing);
+        if (docked_open && !maximized) {
             jce_editor_panel_game_view_content();
-        } else {
+        } else if (!maximized) {
             jce_editor_game_input_bridge_publish(
                 jce_editor_game_input_bridge_shared(), nullptr);
         }
@@ -2659,6 +2821,14 @@ static void draw_panel_windows(void)
         jce_editor_panel_profile_analyzer();
     }
 
+    /* panel_phase attributes everything since the PREVIOUS marker, so a
+     * marker has to sit immediately after the panels it names.  This one used
+     * to sit seven panels later, which made "ed_p_profiler" a bucket holding
+     * the particle editor, the material graph, import presets, lightmap bake
+     * and the curve editor as well -- and reading that bucket as the cost of
+     * the Profiler panel is exactly the wrong conclusion to draw from it. */
+    panel_phase("ed_p_profiler", &ed_pt);
+
     /* ── Particle Editor (shim → Material Graph workbench) ────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_PARTICLE_EDITOR)) {
         jce_editor_panel_particle_editor();
@@ -2669,6 +2839,8 @@ static void draw_panel_windows(void)
         jce_editor_panel_default_pose("material_graph");
         jce_editor_panel_material_graph();
     }
+
+    panel_phase("ed_p_graph_editors", &ed_pt);
 
     /* ── Import Presets (shim → Bundle Browser workbench) ────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_IMPORT_PRESETS)) {
@@ -2687,7 +2859,7 @@ static void draw_panel_windows(void)
         jce_editor_panel_curve_editor();
     }
 
-    panel_phase("ed_p_profiler", &ed_pt);
+    panel_phase("ed_p_bake_curves", &ed_pt);
     /* ── Animation Editor ────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR)) {
         jce_editor_panel_default_pose("animation_editor");
@@ -3065,6 +3237,51 @@ void jce_editor_layout_draw(void)
         draw_panel_windows();
         jce_perf_phase_add("ed_panels", jce_time_perf_to_ms(_t0_panels,
                                                             jce_time_perf_counter()));
+    }
+
+    /* Maximised Game viewport.
+     *
+     * Drawn after the dock host and the docked panels so it paints on top (the
+     * host carries NoBringToFrontOnFocus). NoSavedSettings keeps this window
+     * out of imgui.ini entirely, so toggling it can never perturb the saved
+     * dock layout. WorkPos/WorkSize rather than Pos/Size: the menu bar and the
+     * status bar stay reachable, which is what makes this a viewing mode and
+     * not a trap the user cannot get out of.
+     *
+     * jce_editor_panel_game_view_content() drives jce_editor_game_render_frame()
+     * and publishes the input-bridge viewport, so it must run EXACTLY once per
+     * frame -- the docked block above is skipped whenever this one runs. */
+    if (s_maximized_panel != JCE_PANEL_COUNT) {
+        if (!*jce_editor_panel_visible_ptr(s_maximized_panel)) {
+            /* The panel was hidden while maximised; leave the mode rather than
+             * showing a window the user just closed. */
+            s_maximized_panel = JCE_PANEL_COUNT;
+        } else {
+            const ImGuiViewport *mv = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(mv->WorkPos);
+            ImGui::SetNextWindowSize(mv->WorkSize);
+            ImGui::SetNextWindowViewport(mv->ID);
+            ImGuiWindowFlags mflags =
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                ImGuiWindowFlags_NoNavFocus;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            if (ImGui::Begin("###viewport_maximized", nullptr, mflags)) {
+                if (s_maximized_panel == JCE_PANEL_SCENE_VIEW)
+                    jce_editor_panel_scene_view_content();
+                else
+                    jce_editor_panel_game_view_content();
+            } else if (s_maximized_panel == JCE_PANEL_GAME_VIEW) {
+                jce_editor_game_input_bridge_publish(
+                    jce_editor_game_input_bridge_shared(), nullptr);
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+        }
     }
 
     /* Panels get first refusal for context-specific editing shortcuts

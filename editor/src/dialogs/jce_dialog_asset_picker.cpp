@@ -159,13 +159,28 @@ void jce_editor_asset_picker_draw(void)
     /* Build filtered index list each frame (cheap unless assetdb huge;
        we use ImGuiListClipper to keep render cost bounded). */
     std::vector<int> filtered;
+    /* Counted, not just skipped, so the "N / M" line below can say WHY a
+     * project full of .cpp files shows so few scripts.  Silently hiding them
+     * would trade one confusing picker for another. */
+    int code_not_attachable = 0;
     const int total = jce_assetdb_count();
     filtered.reserve((size_t)total);
     for (int i = 0; i < total; ++i) {
-        int k = (int)jce_assetdb_kind_at(i);
-        if (g_pk.kind_filter != 0 && k != g_pk.kind_filter) continue;
+        const JceAssetKind k = jce_assetdb_kind_at(i);
         const char *p = jce_assetdb_path_at(i);
         if (!p || !jce_panel_filter_match_ci(p, g_pk.search)) continue;
+        /* The whole kind/attachability rule, unit-tested in
+         * test_jce_editor_assetdb.cpp — deliberately NOT reimplemented here,
+         * because the version that was inline offered every .cpp and .h in
+         * the project as an attachable script for as long as it existed. */
+        if (!jce_assetdb_picker_accepts(g_pk.kind_filter, k, p)) {
+            /* Distinguish "wrong kind" (unremarkable) from "right kind, but
+             * a Script component could not resolve it" (worth a sentence). */
+            if (g_pk.kind_filter == JCE_ASSET_KIND_SCRIPT &&
+                k == JCE_ASSET_KIND_SCRIPT)
+                ++code_not_attachable;
+            continue;
+        }
         filtered.push_back(i);
     }
 
@@ -175,6 +190,17 @@ void jce_editor_asset_picker_draw(void)
         ImGui::TextColored(dim, "%s: %d / %d",
             jce_editor_i18n_or("assetPicker.label.matches", "matches"),
             (int)filtered.size(), total);
+        /* Say it only when it happened.  A user hunting for their .cpp needs
+         * to learn that a C++ script is reached by class name and not by
+         * path — the one place they are certain to look for it is the picker
+         * that no longer lists it. */
+        if (code_not_attachable > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(dim, "%s",
+                jce_editor_i18n_or("assetPicker.script.codeHidden",
+                                   "(project code hidden: a script must be a "
+                                   "file the engine can load by extension)"));
+        }
     }
 
     /* List. */

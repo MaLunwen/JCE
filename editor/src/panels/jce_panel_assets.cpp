@@ -5,6 +5,8 @@
  * Grid rendering & context menus are in jce_panel_assets_grid.cpp.
  */
 
+#include <jce/os/core/jce_perf_phase.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_timer.h>
@@ -846,9 +848,21 @@ static void draw_asset_delete_dialog(void)
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
+/* Sub-attribution probe: the panel measured 1.19 ms in a static graveyard
+ * frame -- 40% of a 2.99 ms frame, and the single largest phase in it. Marks
+ * are free when JCE_PERF_LOG is off (jce_perf_phase_add early-outs). */
+static inline void ab_mark(const char *name, uint64_t *t)
+{
+    uint64_t now = jce_time_perf_counter();
+    jce_perf_phase_add(name, jce_time_perf_to_ms(*t, now));
+    *t = now;
+}
+
 void jce_editor_panel_assets_content(void)
 {
+    uint64_t _abt = jce_time_perf_counter();
     ensure_assets_init();
+    ab_mark("ab_init", &_abt);
 
     /* Restore per-project view state once the project store is live — it is
      * inert until a project root is known, so the first draw can be too
@@ -931,6 +945,7 @@ void jce_editor_panel_assets_content(void)
     ImVec2 avail = ImGui::GetContentRegionAvail();
 
     draw_asset_directory_tree(tree_w, avail.y);
+    ab_mark("ab_tree", &_abt);
 
     ImGui::SameLine();
 
@@ -938,6 +953,7 @@ void jce_editor_panel_assets_content(void)
     {
         draw_asset_breadcrumb_bar();
         draw_asset_search_bar();
+        ab_mark("ab_bars", &_abt);
 
         /* (Type filter is now embedded in the search bar — see draw_asset_search_bar.) */
 
@@ -990,11 +1006,13 @@ void jce_editor_panel_assets_content(void)
                     draw_asset_grid_item(display_entries[i], i, cols, col, want_ctx_popup);
             } else {
                 draw_asset_details_list(display_entries, want_ctx_popup);
+            ab_mark("ab_items", &_abt);
             }
 
             if (want_ctx_popup)
                 ImGui::OpenPopup("AssetContextMenu");
 
+            ab_mark("ab_items", &_abt);
             draw_asset_item_context_menu(display_entries);
             handle_asset_keyboard_shortcuts(display_entries);
             draw_asset_empty_area_menu();

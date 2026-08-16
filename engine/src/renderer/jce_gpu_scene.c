@@ -8,19 +8,18 @@
  *   BGFX_CAPS_DRAW_INDIRECT and the compact/indirect compute programs load, the
  *   cull does TRUE STREAM COMPACTION + INDIRECT DRAW.  Three compute passes on
  *   the cull view:
- *     1. cs_cull_reset    : zero the per-run survivor counters (GPU clear; no
+ *     1. cs_cull_reset    : zero the per-group survivor counters (GPU clear; no
  *                           CPU bgfx_update_dynamic_* -> avoids the D3D12 staging
  *                           NULL-deref under pressure).
  *     2. cs_cull_compact  : one thread per record; survivors atomicAdd into their
- *                           run counter and write their mat4 DENSELY into the
- *                           run's partition of the visible buffer.  Culled records
- *                           write nothing -> no degenerate zero-area instances.
- *     3. cs_build_indirect: one thread per run; reads the survivor counter + the
- *                           run's mesh index count and writes the run's
- *                           drawIndexedIndirect args (numInstances = survivors).
- *   The renderer then issues ONE bgfx_submit_indirect per run.  This removes the
- *   degenerate-slot raster waste AND the CPU per-run fixed-count submit cost of
- *   the fallback path below.
+ *                           group counter and write their mat4 DENSELY into the
+ *                           group's partition of the visible buffer. Culled
+ *                           records write nothing.
+ *     3. cs_build_indirect: one thread per primitive draw; reads its owning
+ *                           group's survivor counter and writes that primitive's
+ *                           drawIndexedIndirect args.
+ *   Multi-primitive models therefore pay one record upload and cull per instance,
+ *   while retaining one indirect submit per primitive.
  *
  * FALLBACK 1:1 (no BGFX_CAPS_DRAW_INDIRECT): the redesigned cs_cull_frustum
  *   writes EVERY visible-buffer slot 1:1 (record id -> slot id); survivors get
@@ -30,10 +29,10 @@
  *
  * STAGING-FREE DESIGN (no per-frame bgfx_update_dynamic_* on compute buffers)
  * --------------------------------------------------------------------------
- * Per-frame data (scene records, run meta) rides TRANSIENT buffers (bgfx uploads
- * the whole transient ring with ONE staging allocation per frame), and the
- * persistent visible/counter buffers are written only by compute / cleared by the
- * GPU reset pass.  jce_gpu_scene_dispatch makes ZERO bgfx_update_dynamic_* calls.
+ * Scene records and draw metadata use persistent COMPUTE_READ dynamic buffers,
+ * because transient VBs do not expose shader-resource views on D3D11/D3D12.
+ * Visible/counter buffers are written only by compute and cleared by the GPU
+ * reset pass. jce_gpu_scene_dispatch updates each read-only input buffer once.
  *
  * One per-frame BATCH covers the whole color-pass instanced set; bgfx orders the
  * compute view ahead of the color view and inserts UAV barriers between the three
@@ -41,14 +40,15 @@
  * resident before the first draw.
  *
  * Layout (must mirror the .sc shaders):
- *   scene_buf  (transient VB) : 7 vec4 per record (stride 112 B), bound RO,
- *                               ring-rebased by u_cull_params.z (vec4 offset).
+ *   scene_buf  (dynamic VB)   : 7 vec4 per record (stride 112 B), bound RO;
+ *                               persistent and updated once per dispatch.
  *   visible_buf (dynamic VB)  : 4 vec4 per slot (a mat4 instance stream),
- *                               COMPUTE_READ_WRITE; compact per run (indirect) or
+ *                               COMPUTE_READ_WRITE; compact per group (indirect) or
  *                               1:1 slot==record id (fallback).
- *   counter_buf (dynamic VB)  : 1 uint per run, COMPUTE_READ_WRITE (indirect only)
- *   runmeta_buf (transient VB): 1 uvec4 per run (numIndices, run_base, _, _)
- *   indirect_buf (indirect)   : 1 element per run (2 uvec4 drawIndexedIndirect)
+ *   counter_buf (dynamic VB)  : 1 uint per visibility group (indirect only)
+ *   runmeta_buf (dynamic VB)  : 1 uvec4 per primitive draw
+ *                               (numIndices, run_base, counter_index, _)
+ *   indirect_buf (indirect)   : 1 element per primitive draw
  */
 
 #include <jce/renderer/jce_gpu_scene.h>
@@ -73,7 +73,10 @@
 #define SCENE_STRIDE_BYTES  (SCENE_VEC4_PER_REC * 16u)   /* 112 B */
 #define VIS_VEC4_PER_SLOT   4u
 #define VIS_STRIDE_BYTES    (VIS_VEC4_PER_SLOT * 16u)    /* 64 B (mat4) */
-#define RUNMETA_STRIDE_BYTES 16u                         /* one uvec4 per run */
+#define RUNMETA_STRIDE_BYTES 16u                         /* one uvec4 per primitive draw */
+#define MAX_SCENE_RECORDS    (UINT32_MAX / SCENE_STRIDE_BYTES)
+#define MAX_VISIBLE_SLOTS    (UINT32_MAX / VIS_STRIDE_BYTES)
+#define MAX_DRAW_METADATA    (UINT32_MAX / RUNMETA_STRIDE_BYTES)
 
 /* The record struct MUST be exactly the 7-vec4 (112 B) GPU layout so a straight
  * memcpy populates the scene buffer.  C99 has no _Static_assert; use the
@@ -105,14 +108,14 @@ struct JceGpuScene {
     bgfx_dynamic_vertex_buffer_handle_t visible_buf;
     uint32_t        capacity;        /* visible slots the buffer can hold */
 
-    /* Persistent per-run survivor counter buffer (indirect path).  One uint per
-     * run; zeroed by cs_cull_reset, atomicAdd'd by cs_cull_compact. */
+    /* Persistent survivor counter buffer (indirect path). One uint per
+     * visibility group; zeroed by reset and incremented by compact. */
     bgfx_dynamic_vertex_buffer_handle_t counter_buf;
-    uint32_t        counter_cap;     /* runs the counter buffer can hold */
+    uint32_t        counter_cap;     /* visibility groups it can hold */
 
-    /* Indirect draw-args buffer (indirect path).  One element per run. */
+    /* Indirect draw-args buffer (indirect path). One element per primitive. */
     bgfx_indirect_buffer_handle_t indirect_buf;
-    uint32_t        indirect_cap;    /* runs the indirect buffer can hold */
+    uint32_t        indirect_cap;    /* primitive draws it can hold */
 
     /* Persistent COMPUTE-READ scene-record buffer.  A bgfx TRANSIENT VB is
      * created with flags=NONE, so on D3D11/D3D12 it has NO shader-resource view;
@@ -124,15 +127,15 @@ struct JceGpuScene {
      * each frame; its SRV starts at element 0 (no ring rebase → scene_off = 0). */
     bgfx_dynamic_vertex_buffer_handle_t scene_buf;
     uint32_t        scene_cap;       /* records the scene buffer can hold */
-    /* Persistent COMPUTE-READ run-meta buffer (indirect path) — same transient-VB
-     * NULL-SRV defect as scene_buf; one uvec4 (numIndices, run_base, 0, 0) per run. */
+    /* Persistent COMPUTE-READ draw-meta buffer (indirect path) — same transient-VB
+     * NULL-SRV defect as scene_buf; one uvec4 per primitive draw. */
     bgfx_dynamic_vertex_buffer_handle_t runmeta_gpu_buf;
     uint32_t        runmeta_gpu_cap;
 
-    bgfx_vertex_layout_t scene_layout;     /* 7 vec4 (transient scene records) */
+    bgfx_vertex_layout_t scene_layout;     /* 7 vec4 (persistent scene records) */
     bgfx_vertex_layout_t visible_layout;   /* 4 vec4 (instance mat4)           */
-    bgfx_vertex_layout_t counter_layout;   /* 1 uint per run                   */
-    bgfx_vertex_layout_t runmeta_layout;   /* 1 uvec4 per run                  */
+    bgfx_vertex_layout_t counter_layout;   /* 1 uint per visibility group      */
+    bgfx_vertex_layout_t runmeta_layout;   /* 1 uvec4 per primitive draw       */
 
     bgfx_uniform_handle_t u_cull_planes;        /* vec4[6] */
     bgfx_uniform_handle_t u_cull_params;        /* vec4    */
@@ -182,17 +185,22 @@ struct JceGpuScene {
     uint16_t              hiz_view_w, hiz_view_h;
     bool                  hiz_on;
 
-    /* Per-frame batch (host scratch accumulated by add_run, uploaded by dispatch
-     * into transient VBs). */
+    /* Per-frame host batch accumulated by add_draw_group and uploaded once. */
     JceGpuSceneRecord *rec;
     uint32_t           rec_count;
     uint32_t           rec_cap;
 
-    /* Per-run mesh index counts (indirect path): runmeta[r] = (num_indices,
-     * run_base).  Index by run id. */
-    struct { uint32_t num_indices; uint32_t run_base; } *runmeta;
-    uint32_t           run_count;    /* number of runs appended this frame */
+    /* Per-draw metadata. Several primitive draws may share one visibility
+     * group and therefore the same run_base + survivor counter. */
+    struct {
+        uint32_t num_indices;
+        uint32_t run_base;
+        uint32_t counter_index;
+    } *runmeta;
+    uint32_t           group_count;  /* visibility groups this frame */
+    uint32_t           run_count;    /* primitive draws this frame */
     uint32_t           runmeta_cap;
+    JceGpuSceneFrameStats frame_stats;
 };
 
 /* ── shader loading ───────────────────────────────────────────────────── *
@@ -258,6 +266,46 @@ static void destroy_visible_buffer(JceGpuScene *gs)
     gs->capacity = 0;
 }
 
+/* Choose a geometric capacity without wrapping uint32_t. Alignment is a
+ * performance preference, not a correctness requirement: near the API limit
+ * the exact requested capacity is valid even when it cannot be rounded up. */
+static bool choose_capacity(uint32_t current, uint32_t need, uint32_t initial,
+                            uint32_t alignment, uint32_t max_count,
+                            uint32_t *out_capacity)
+{
+    uint32_t cap;
+
+    if (!out_capacity || need == 0u || need > max_count ||
+        current > max_count || initial == 0u)
+        return false;
+
+    cap = current;
+    if (cap < need) {
+        if (cap < initial) cap = initial;
+        if (cap > max_count) cap = need;
+
+        while (cap < need) {
+            if (cap > max_count / 2u) {
+                cap = need;
+                break;
+            }
+            cap *= 2u;
+        }
+    }
+
+    if (alignment > 1u) {
+        uint32_t remainder = cap % alignment;
+        if (remainder != 0u) {
+            uint32_t add = alignment - remainder;
+            if (add <= max_count - cap) cap += add;
+        }
+    }
+
+    if (cap < need || cap > max_count) return false;
+    *out_capacity = cap;
+    return true;
+}
+
 /* Ensure the visible buffer holds at least `need` slots.  Grows geometrically;
  * not shrunk (steady-state size stabilises).  This is a Default-heap resource
  * created once per growth (createCommittedResource at create time only — NOT a
@@ -267,11 +315,13 @@ static bool ensure_capacity(JceGpuScene *gs, uint32_t need)
 {
     if (need <= gs->capacity && gs->visible_buf.idx != UINT16_MAX) return true;
 
-    uint32_t cap = gs->capacity ? gs->capacity : 1024u;
-    while (cap < need) cap *= 2u;
-    cap = (cap + CULL_THREADS_X - 1u) & ~(CULL_THREADS_X - 1u);
+    uint32_t cap;
+    if (!choose_capacity(gs->capacity, need, 1024u, CULL_THREADS_X,
+                         MAX_VISIBLE_SLOTS, &cap))
+        return false;
 
     destroy_visible_buffer(gs);
+    gs->frame_stats.buffer_growths++;
 
     gs->visible_buf = bgfx_create_dynamic_vertex_buffer(
         cap, &gs->visible_layout,
@@ -287,21 +337,23 @@ static bool ensure_capacity(JceGpuScene *gs, uint32_t need)
     return true;
 }
 
-/* Ensure the per-run counter buffer holds at least `runs` uints (indirect path).
- * One uint per run; written/cleared only by compute. */
-static bool ensure_counter_capacity(JceGpuScene *gs, uint32_t runs)
+/* Ensure the survivor counter buffer holds at least `groups` uints.
+ * One uint per visibility group; written and cleared only by compute. */
+static bool ensure_counter_capacity(JceGpuScene *gs, uint32_t groups)
 {
-    if (runs <= gs->counter_cap && gs->counter_buf.idx != UINT16_MAX) return true;
+    if (groups <= gs->counter_cap && gs->counter_buf.idx != UINT16_MAX) return true;
 
-    uint32_t cap = gs->counter_cap ? gs->counter_cap : 256u;
-    while (cap < runs) cap *= 2u;
-    cap = (cap + CULL_THREADS_X - 1u) & ~(CULL_THREADS_X - 1u);
+    uint32_t cap;
+    if (!choose_capacity(gs->counter_cap, groups, 256u, CULL_THREADS_X,
+                         UINT32_MAX / 4u, &cap))
+        return false;
 
     if (gs->counter_buf.idx != UINT16_MAX) {
         bgfx_destroy_dynamic_vertex_buffer(gs->counter_buf);
         gs->counter_buf.idx = UINT16_MAX;
         gs->counter_cap = 0;
     }
+    gs->frame_stats.buffer_growths++;
     gs->counter_buf = bgfx_create_dynamic_vertex_buffer(
         cap, &gs->counter_layout,
         BGFX_BUFFER_COMPUTE_READ_WRITE
@@ -319,14 +371,17 @@ static bool ensure_scene_capacity(JceGpuScene *gs, uint32_t need)
 {
     if (need <= gs->scene_cap && gs->scene_buf.idx != UINT16_MAX) return true;
 
-    uint32_t cap = gs->scene_cap ? gs->scene_cap : 1024u;
-    while (cap < need) cap *= 2u;
+    uint32_t cap;
+    if (!choose_capacity(gs->scene_cap, need, 1024u, 1u,
+                         MAX_SCENE_RECORDS, &cap))
+        return false;
 
     if (gs->scene_buf.idx != UINT16_MAX) {
         bgfx_destroy_dynamic_vertex_buffer(gs->scene_buf);
         gs->scene_buf.idx = UINT16_MAX;
         gs->scene_cap = 0;
     }
+    gs->frame_stats.buffer_growths++;
     gs->scene_buf = bgfx_create_dynamic_vertex_buffer(
         cap, &gs->scene_layout,
         BGFX_BUFFER_COMPUTE_READ
@@ -337,20 +392,23 @@ static bool ensure_scene_capacity(JceGpuScene *gs, uint32_t need)
     return true;
 }
 
-/* Ensure the persistent COMPUTE_READ run-meta buffer holds >= `runs` runs (one
- * uvec4 per run).  Same transient-VB NULL-SRV defect fix as ensure_scene_capacity. */
-static bool ensure_runmeta_gpu_capacity(JceGpuScene *gs, uint32_t runs)
+/* Ensure the persistent COMPUTE_READ draw-metadata buffer holds at least
+ * `draws` entries. Same transient-VB NULL-SRV fix as ensure_scene_capacity. */
+static bool ensure_runmeta_gpu_capacity(JceGpuScene *gs, uint32_t draws)
 {
-    if (runs <= gs->runmeta_gpu_cap && gs->runmeta_gpu_buf.idx != UINT16_MAX) return true;
+    if (draws <= gs->runmeta_gpu_cap && gs->runmeta_gpu_buf.idx != UINT16_MAX) return true;
 
-    uint32_t cap = gs->runmeta_gpu_cap ? gs->runmeta_gpu_cap : 256u;
-    while (cap < runs) cap *= 2u;
+    uint32_t cap;
+    if (!choose_capacity(gs->runmeta_gpu_cap, draws, 256u, 1u,
+                         MAX_DRAW_METADATA, &cap))
+        return false;
 
     if (gs->runmeta_gpu_buf.idx != UINT16_MAX) {
         bgfx_destroy_dynamic_vertex_buffer(gs->runmeta_gpu_buf);
         gs->runmeta_gpu_buf.idx = UINT16_MAX;
         gs->runmeta_gpu_cap = 0;
     }
+    gs->frame_stats.buffer_growths++;
     gs->runmeta_gpu_buf = bgfx_create_dynamic_vertex_buffer(
         cap, &gs->runmeta_layout,
         BGFX_BUFFER_COMPUTE_READ
@@ -361,19 +419,22 @@ static bool ensure_runmeta_gpu_capacity(JceGpuScene *gs, uint32_t runs)
     return true;
 }
 
-/* Ensure the indirect buffer holds at least `runs` draw elements. */
-static bool ensure_indirect_capacity(JceGpuScene *gs, uint32_t runs)
+/* Ensure the indirect buffer holds at least `draws` primitive draw elements. */
+static bool ensure_indirect_capacity(JceGpuScene *gs, uint32_t draws)
 {
-    if (runs <= gs->indirect_cap && gs->indirect_buf.idx != UINT16_MAX) return true;
+    if (draws <= gs->indirect_cap && gs->indirect_buf.idx != UINT16_MAX) return true;
 
-    uint32_t cap = gs->indirect_cap ? gs->indirect_cap : 256u;
-    while (cap < runs) cap *= 2u;
+    uint32_t cap;
+    if (!choose_capacity(gs->indirect_cap, draws, 256u, 1u,
+                         UINT32_MAX, &cap))
+        return false;
 
     if (gs->indirect_buf.idx != UINT16_MAX) {
         bgfx_destroy_indirect_buffer(gs->indirect_buf);
         gs->indirect_buf.idx = UINT16_MAX;
         gs->indirect_cap = 0;
     }
+    gs->frame_stats.buffer_growths++;
     gs->indirect_buf = bgfx_create_indirect_buffer(cap);
     if (gs->indirect_buf.idx == UINT16_MAX) return false;
     gs->indirect_cap = cap;
@@ -424,7 +485,14 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
 
     const bgfx_caps_t *caps = bgfx_get_caps();
     if (!caps || !(caps->supported & BGFX_CAPS_COMPUTE)) {
-        LOG_WARN(LOG_TAG, "GPU has no compute support; GPU-driven path disabled");
+        /* Expected on GLES3/WebGL2-class backends; several gpu-scene
+         * instances are created per app, so say it once, not per instance. */
+        static bool warned_no_compute = false;
+        if (!warned_no_compute) {
+            warned_no_compute = true;
+            LOG_WARN(LOG_TAG,
+                     "GPU has no compute support; GPU-driven path disabled");
+        }
         return gs;  /* no-op mode */
     }
 
@@ -469,9 +537,8 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
         return gs;
     }
 
-    /* scene_buf layout: 7 vec4 (TEXCOORD0..6).  Used to alloc the transient VB
-     * that holds the scene records; stride 112 B (== 7 vec4, so the transient
-     * allocator's stride-aligned offset is always 16-byte aligned). */
+    /* scene_buf layout: 7 vec4 (TEXCOORD0..6). The persistent compute-readable
+     * buffer holds tightly packed 112-byte records. */
     bgfx_vertex_layout_begin(&gs->scene_layout, BGFX_RENDERER_TYPE_NOOP);
     bgfx_vertex_layout_add(&gs->scene_layout, BGFX_ATTRIB_TEXCOORD0, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_add(&gs->scene_layout, BGFX_ATTRIB_TEXCOORD1, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
@@ -492,13 +559,13 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
     bgfx_vertex_layout_add(&gs->visible_layout, BGFX_ATTRIB_TEXCOORD4, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&gs->visible_layout);
 
-    /* counter_buf layout: one uint per run. */
+    /* counter_buf layout: one uint per visibility group. */
     bgfx_vertex_layout_begin(&gs->counter_layout, BGFX_RENDERER_TYPE_NOOP);
     bgfx_vertex_layout_add(&gs->counter_layout, BGFX_ATTRIB_TEXCOORD0, 1, BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&gs->counter_layout);
 
-    /* runmeta_buf layout: one uvec4 per run (carried as 4 floats; the shader
-     * reads it as uvec4 via the buffer's uint format). */
+    /* runmeta_buf layout: one uvec4 per primitive draw (carried as 4 floats;
+     * the shader converts the RGBA32F values to uints). */
     bgfx_vertex_layout_begin(&gs->runmeta_layout, BGFX_RENDERER_TYPE_NOOP);
     bgfx_vertex_layout_add(&gs->runmeta_layout, BGFX_ATTRIB_TEXCOORD0, 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&gs->runmeta_layout);
@@ -579,41 +646,107 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
 void jce_gpu_scene_destroy(JceGpuScene *gs)
 {
     if (!gs) return;
-    if (gs->cull_program.idx    != UINT16_MAX) bgfx_destroy_program(gs->cull_program);
-    if (gs->reset_program.idx   != UINT16_MAX) bgfx_destroy_program(gs->reset_program);
-    if (gs->compact_program.idx != UINT16_MAX) bgfx_destroy_program(gs->compact_program);
-    if (gs->build_program.idx   != UINT16_MAX) bgfx_destroy_program(gs->build_program);
+    const bool diag = getenv("JCE_GPU_SCENE_DIAG") != NULL;
+#define GS_DESTROY_DIAG(kind_, handle_)                                      \
+    do {                                                                     \
+        if (diag) {                                                          \
+            LOG_INFO(LOG_TAG, "destroy %p: %s handle=%u", (void *)gs,       \
+                     (kind_), (unsigned)(handle_).idx);                       \
+            jce_log_flush();                                                 \
+        }                                                                    \
+    } while (0)
+    if (gs->cull_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("cull_program", gs->cull_program);
+        bgfx_destroy_program(gs->cull_program);
+    }
+    if (gs->reset_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("reset_program", gs->reset_program);
+        bgfx_destroy_program(gs->reset_program);
+    }
+    if (gs->compact_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("compact_program", gs->compact_program);
+        bgfx_destroy_program(gs->compact_program);
+    }
+    if (gs->build_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("build_program", gs->build_program);
+        bgfx_destroy_program(gs->build_program);
+    }
+    GS_DESTROY_DIAG("visible_buf", gs->visible_buf);
     destroy_visible_buffer(gs);
-    if (gs->counter_buf.idx  != UINT16_MAX) bgfx_destroy_dynamic_vertex_buffer(gs->counter_buf);
-    if (gs->scene_buf.idx    != UINT16_MAX) bgfx_destroy_dynamic_vertex_buffer(gs->scene_buf);
-    if (gs->runmeta_gpu_buf.idx != UINT16_MAX) bgfx_destroy_dynamic_vertex_buffer(gs->runmeta_gpu_buf);
-    if (gs->indirect_buf.idx != UINT16_MAX) bgfx_destroy_indirect_buffer(gs->indirect_buf);
-    if (gs->u_cull_planes.idx       != UINT16_MAX) bgfx_destroy_uniform(gs->u_cull_planes);
-    if (gs->u_cull_params.idx       != UINT16_MAX) bgfx_destroy_uniform(gs->u_cull_params);
-    if (gs->u_cull_reset_params.idx != UINT16_MAX) bgfx_destroy_uniform(gs->u_cull_reset_params);
-    if (gs->u_indirect_params.idx   != UINT16_MAX) bgfx_destroy_uniform(gs->u_indirect_params);
-    if (gs->foliage_cull_program.idx     != UINT16_MAX) bgfx_destroy_program(gs->foliage_cull_program);
-    if (gs->foliage_indirect_program.idx != UINT16_MAX) bgfx_destroy_program(gs->foliage_indirect_program);
-    if (gs->u_fcull_params.idx != UINT16_MAX) bgfx_destroy_uniform(gs->u_fcull_params);
-    if (gs->u_fcull_aabb.idx   != UINT16_MAX) bgfx_destroy_uniform(gs->u_fcull_aabb);
-    if (gs->u_find_params.idx  != UINT16_MAX) bgfx_destroy_uniform(gs->u_find_params);
-    if (gs->u_find_counts.idx  != UINT16_MAX) bgfx_destroy_uniform(gs->u_find_counts);
-    if (gs->u_mlcull_params.idx != UINT16_MAX) bgfx_destroy_uniform(gs->u_mlcull_params);
-    if (gs->u_mlcull_model.idx  != UINT16_MAX) bgfx_destroy_uniform(gs->u_mlcull_model);
-    if (gs->meshlet_cull_program.idx != UINT16_MAX) bgfx_destroy_program(gs->meshlet_cull_program);
-    if (gs->u_fcull_lod.idx    != UINT16_MAX) bgfx_destroy_uniform(gs->u_fcull_lod);
-    if (gs->u_cull_campos.idx  != UINT16_MAX) bgfx_destroy_uniform(gs->u_cull_campos);
-    if (gs->hiz_program.idx     != UINT16_MAX) bgfx_destroy_program(gs->hiz_program);
-    if (gs->hiz_reduce_program.idx != UINT16_MAX) bgfx_destroy_program(gs->hiz_reduce_program);
-    if (gs->hiz_tex.idx         != UINT16_MAX) bgfx_destroy_texture(gs->hiz_tex);
-    if (gs->u_hiz_build.idx     != UINT16_MAX) bgfx_destroy_uniform(gs->u_hiz_build);
-    if (gs->s_hiz.idx           != UINT16_MAX) bgfx_destroy_uniform(gs->s_hiz);
-    if (gs->s_hiz_src.idx       != UINT16_MAX) bgfx_destroy_uniform(gs->s_hiz_src);
-    if (gs->u_cull_viewproj.idx != UINT16_MAX) bgfx_destroy_uniform(gs->u_cull_viewproj);
-    if (gs->u_hiz_params.idx    != UINT16_MAX) bgfx_destroy_uniform(gs->u_hiz_params);
+    if (gs->counter_buf.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("counter_buf", gs->counter_buf);
+        bgfx_destroy_dynamic_vertex_buffer(gs->counter_buf);
+    }
+    if (gs->scene_buf.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("scene_buf", gs->scene_buf);
+        bgfx_destroy_dynamic_vertex_buffer(gs->scene_buf);
+    }
+    if (gs->runmeta_gpu_buf.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("runmeta_gpu_buf", gs->runmeta_gpu_buf);
+        bgfx_destroy_dynamic_vertex_buffer(gs->runmeta_gpu_buf);
+    }
+    if (gs->indirect_buf.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("indirect_buf", gs->indirect_buf);
+        bgfx_destroy_indirect_buffer(gs->indirect_buf);
+    }
+#define GS_DESTROY_UNIFORM(field_)                                           \
+    do {                                                                     \
+        if (gs->field_.idx != UINT16_MAX) {                                  \
+            GS_DESTROY_DIAG(#field_, gs->field_);                            \
+            bgfx_destroy_uniform(gs->field_);                                \
+        }                                                                    \
+    } while (0)
+    GS_DESTROY_UNIFORM(u_cull_planes);
+    GS_DESTROY_UNIFORM(u_cull_params);
+    GS_DESTROY_UNIFORM(u_cull_reset_params);
+    GS_DESTROY_UNIFORM(u_indirect_params);
+    if (gs->foliage_cull_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("foliage_cull_program", gs->foliage_cull_program);
+        bgfx_destroy_program(gs->foliage_cull_program);
+    }
+    if (gs->foliage_indirect_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("foliage_indirect_program",
+                        gs->foliage_indirect_program);
+        bgfx_destroy_program(gs->foliage_indirect_program);
+    }
+    GS_DESTROY_UNIFORM(u_fcull_params);
+    GS_DESTROY_UNIFORM(u_fcull_aabb);
+    GS_DESTROY_UNIFORM(u_find_params);
+    GS_DESTROY_UNIFORM(u_find_counts);
+    GS_DESTROY_UNIFORM(u_mlcull_params);
+    GS_DESTROY_UNIFORM(u_mlcull_model);
+    if (gs->meshlet_cull_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("meshlet_cull_program", gs->meshlet_cull_program);
+        bgfx_destroy_program(gs->meshlet_cull_program);
+    }
+    GS_DESTROY_UNIFORM(u_fcull_lod);
+    GS_DESTROY_UNIFORM(u_cull_campos);
+    if (gs->hiz_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("hiz_program", gs->hiz_program);
+        bgfx_destroy_program(gs->hiz_program);
+    }
+    if (gs->hiz_reduce_program.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("hiz_reduce_program", gs->hiz_reduce_program);
+        bgfx_destroy_program(gs->hiz_reduce_program);
+    }
+    if (gs->hiz_tex.idx != UINT16_MAX) {
+        GS_DESTROY_DIAG("hiz_tex", gs->hiz_tex);
+        bgfx_destroy_texture(gs->hiz_tex);
+    }
+    GS_DESTROY_UNIFORM(u_hiz_build);
+    GS_DESTROY_UNIFORM(s_hiz);
+    GS_DESTROY_UNIFORM(s_hiz_src);
+    GS_DESTROY_UNIFORM(u_cull_viewproj);
+    GS_DESTROY_UNIFORM(u_hiz_params);
+#undef GS_DESTROY_UNIFORM
+    if (diag) {
+        LOG_INFO(LOG_TAG, "destroy %p: host storage", (void *)gs);
+        jce_log_flush();
+    }
     JCE_FREE(gs->rec);
     JCE_FREE(gs->runmeta);
     gs->alloc.free(gs, gs->alloc.ctx);
+#undef GS_DESTROY_DIAG
 }
 
 bool jce_gpu_scene_is_supported(const JceGpuScene *gs)
@@ -912,23 +1045,46 @@ void jce_gpu_scene_meshlet_dispatch(JceGpuScene *gs, uint16_t cull_view,
 void jce_gpu_scene_begin(JceGpuScene *gs)
 {
     if (!gs) return;
+    memset(&gs->frame_stats, 0, sizeof(gs->frame_stats));
+    gs->frame_stats.supported = gs->supported;
+    gs->frame_stats.indirect_supported = gs->indirect;
     gs->rec_count = 0;
+    gs->group_count = 0;
     gs->run_count = 0;
     gs->indirect_ready = false;  /* no valid indirect args until pass-3 runs */
 }
 
-bool jce_gpu_scene_add_run(JceGpuScene *gs, const JceGpuSceneRecord *records,
-                           uint32_t count, uint32_t num_indices,
-                           JceGpuSceneRun *out_run)
+bool jce_gpu_scene_add_draw_group(
+    JceGpuScene *gs, const JceGpuSceneRecord *records, uint32_t count,
+    const uint32_t *num_indices, uint32_t draw_count,
+    JceGpuSceneDrawGroup *out_group)
 {
-    if (!gs || !gs->supported || !records || count == 0) return false;
+    uint32_t base;
+    uint32_t group_index;
+    uint32_t first_run;
 
-    uint32_t base      = gs->rec_count;
-    uint32_t run_index = gs->run_count;
+    if (!gs || !gs->supported || !records || count == 0u ||
+        !num_indices || draw_count == 0u)
+        return false;
+    if (gs->group_count == UINT32_MAX ||
+        count > MAX_SCENE_RECORDS - gs->rec_count ||
+        draw_count > MAX_DRAW_METADATA - gs->run_count)
+        return false;
 
-    if (gs->rec_count + count > gs->rec_cap) {
+    base = gs->rec_count;
+    group_index = gs->group_count;
+    first_run = gs->run_count;
+
+    if (base + count > gs->rec_cap) {
+        uint32_t need = base + count;
         uint32_t nc = gs->rec_cap ? gs->rec_cap : 1024u;
-        while (nc < gs->rec_count + count) nc *= 2u;
+        while (nc < need) {
+            if (nc > UINT32_MAX / 2u) {
+                nc = need;
+                break;
+            }
+            nc *= 2u;
+        }
         JceGpuSceneRecord *nr = (JceGpuSceneRecord *)JCE_REALLOC(
             gs->rec, (size_t)nc * sizeof(JceGpuSceneRecord));
         if (!nr) return false;
@@ -936,36 +1092,71 @@ bool jce_gpu_scene_add_run(JceGpuScene *gs, const JceGpuSceneRecord *records,
         gs->rec_cap = nc;
     }
 
-    /* Grow per-run meta scratch (indirect path) — one slot per run. */
-    if (gs->indirect && run_index >= gs->runmeta_cap) {
-        uint32_t nc = gs->runmeta_cap ? gs->runmeta_cap * 2u : 256u;
+    /* Reserve every primitive's metadata before mutating counts, making this
+     * append transactional under allocation failure. */
+    if (gs->indirect && first_run + draw_count > gs->runmeta_cap) {
+        uint32_t need = first_run + draw_count;
+        uint32_t nc = gs->runmeta_cap ? gs->runmeta_cap : 256u;
+        while (nc < need) {
+            if (nc > UINT32_MAX / 2u) {
+                nc = need;
+                break;
+            }
+            nc *= 2u;
+        }
         void *nm = JCE_REALLOC(gs->runmeta, (size_t)nc * sizeof(*gs->runmeta));
         if (!nm) return false;
         gs->runmeta = nm;
         gs->runmeta_cap = nc;
     }
 
-    /* Copy the run's records, tagging each with its partition base + run index so
-     * the compact cull appends survivors densely within [base, base+count) and
-     * tallies b_counter[run_index].  In the 1:1 fallback the shader ignores these
-     * (slot == record id), so they are harmless there. */
+    /* Copy records once. Every primitive draw shares this compacted visibility
+     * partition and its survivor counter. */
     for (uint32_t i = 0; i < count; i++) {
         JceGpuSceneRecord r = records[i];
         r.run_base  = (float)base;
-        r.run_index = (float)run_index;
+        r.run_index = (float)group_index;
         gs->rec[base + i] = r;
     }
-    gs->rec_count += count;
 
     if (gs->indirect) {
-        gs->runmeta[run_index].num_indices = num_indices;
-        gs->runmeta[run_index].run_base    = base;
+        for (uint32_t draw = 0; draw < draw_count; draw++) {
+            uint32_t run = first_run + draw;
+            gs->runmeta[run].num_indices = num_indices[draw];
+            gs->runmeta[run].run_base = base;
+            gs->runmeta[run].counter_index = group_index;
+        }
     }
-    gs->run_count += 1;
+
+    gs->rec_count += count;
+    gs->group_count += 1u;
+    gs->run_count += draw_count;
+    gs->frame_stats.records = gs->rec_count;
+    gs->frame_stats.groups = gs->group_count;
+    gs->frame_stats.runs = gs->run_count;
+
+    if (out_group) {
+        out_group->run_base = base;
+        out_group->first_indirect_el =
+            gs->indirect ? first_run : UINT32_MAX;
+        out_group->draw_count = draw_count;
+    }
+    return true;
+}
+
+bool jce_gpu_scene_add_run(JceGpuScene *gs, const JceGpuSceneRecord *records,
+                           uint32_t count, uint32_t num_indices,
+                           JceGpuSceneRun *out_run)
+{
+    JceGpuSceneDrawGroup group;
+
+    if (!jce_gpu_scene_add_draw_group(
+            gs, records, count, &num_indices, 1u, &group))
+        return false;
 
     if (out_run) {
-        out_run->run_base    = base;
-        out_run->indirect_el = gs->indirect ? run_index : UINT32_MAX;
+        out_run->run_base = group.run_base;
+        out_run->indirect_el = group.first_indirect_el;
     }
     return true;
 }
@@ -984,6 +1175,9 @@ static bool upload_scene_records(JceGpuScene *gs, float *out_off_vec4)
         bgfx_copy(gs->rec, (uint32_t)((size_t)gs->rec_count * SCENE_STRIDE_BYTES));
     if (!mem) return false;
     bgfx_update_dynamic_vertex_buffer(gs->scene_buf, 0, mem);
+    gs->frame_stats.upload_calls++;
+    gs->frame_stats.uploaded_bytes +=
+        (uint64_t)gs->rec_count * SCENE_STRIDE_BYTES;
 
     *out_off_vec4 = 0.0f;   /* persistent buffer: records start at element 0 */
     return true;
@@ -1047,6 +1241,7 @@ static bool hiz_build(JceGpuScene *gs, uint16_t view)
     bgfx_set_image(1, gs->hiz_tex, 0, BGFX_ACCESS_WRITE, BGFX_TEXTURE_FORMAT_R32F);
     bgfx_dispatch(view, gs->hiz_program, (w + 7u) / 8u, (h + 7u) / 8u, 1,
                   BGFX_DISCARD_ALL);
+    gs->frame_stats.compute_dispatches++;
 
     /* mips 1..N-1 from the previous mip (image read → image write; distinct mips
      * of the same texture, so no SRV/UAV aliasing).  Same view: on D3D11 the
@@ -1063,6 +1258,7 @@ static bool hiz_build(JceGpuScene *gs, uint16_t view)
                        BGFX_TEXTURE_FORMAT_R32F);
         bgfx_dispatch(view, gs->hiz_reduce_program, (mw + 7u) / 8u, (mh + 7u) / 8u,
                       1, BGFX_DISCARD_ALL);
+        gs->frame_stats.compute_dispatches++;
     }
     if (getenv("JCE_HIZ_DIAG")) {
         static uint32_t s_f = 0;
@@ -1095,6 +1291,8 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
     if (!gs || !gs->supported || !planes || gs->rec_count == 0) return false;
 
     JCE_PROFILE_ZONE_N("GpuScene::Dispatch");
+    gs->frame_stats.dispatches++;
+    gs->frame_stats.hiz_enabled = gs->hiz_on;
 
     /* No valid indirect args until pass-3 runs this dispatch (defensive: also
      * cleared in begin(), but a fall-through to the 1:1 cull below must leave the
@@ -1127,18 +1325,18 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
 
     /* ── INDIRECT compaction path ─────────────────────────────────────── */
     if (gs->indirect) {
-        /* Indirect needs the per-run counter + indirect buffers + the run-meta
-         * transient.  If any prerequisite fails, fall through to the 1:1 path
-         * (still correct, just no compaction) by clearing gs->indirect for THIS
-         * dispatch via a local flag. */
-        bool ok = ensure_counter_capacity(gs, gs->run_count)
+        /* Indirect needs one counter per visibility group and one metadata plus
+         * indirect element per primitive draw. If any prerequisite fails, fall
+         * through to the correct 1:1 path for this dispatch. */
+        bool ok = ensure_counter_capacity(gs, gs->group_count)
                && ensure_indirect_capacity(gs, gs->run_count)
                && ensure_runmeta_gpu_capacity(gs, gs->run_count);
 
         float runmeta_off_vec4 = 0.0f;
         if (ok) {
-            /* Pack run meta as vec4 FLOAT values (numIndices, run_base, 0, 0)
-             * into the persistent COMPUTE_READ run-meta buffer (a transient VB
+            /* Pack draw meta as vec4 FLOAT values
+             * (numIndices, run_base, counter_index, 0)
+             * into the persistent COMPUTE_READ draw-metadata buffer (a transient VB
              * has no D3D11 SRV — see scene_buf).  bgfx exposes a vertex buffer's
              * compute SRV as RGBA32F, so the shader reads vec4 and uint()'s it.
              * Counts/bases are < 2^24 in any real scene → the float round-trip is
@@ -1152,16 +1350,19 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                 for (uint32_t r = 0; r < gs->run_count; r++) {
                     dst[r * 4 + 0] = (float)gs->runmeta[r].num_indices;
                     dst[r * 4 + 1] = (float)gs->runmeta[r].run_base;
-                    dst[r * 4 + 2] = 0.0f;
+                    dst[r * 4 + 2] = (float)gs->runmeta[r].counter_index;
                     dst[r * 4 + 3] = 0.0f;
                 }
                 bgfx_update_dynamic_vertex_buffer(gs->runmeta_gpu_buf, 0, mem);
+                gs->frame_stats.upload_calls++;
+                gs->frame_stats.uploaded_bytes +=
+                    (uint64_t)gs->run_count * RUNMETA_STRIDE_BYTES;
                 runmeta_off_vec4 = 0.0f;   /* persistent: starts at element 0 */
             }
         }
 
         if (ok) {
-            /* Pass 1: reset per-run counters.  Dispatched on a SEPARATE, earlier
+            /* Pass 1: reset per-group counters. Dispatched on a separate, earlier
              * compute view (reset_view, ordered before cull_view by the view-order
              * builder).  This is required for correctness on D3D12: reset binds the
              * counter ACCESS_WRITE and compact binds it ACCESS_READWRITE — both are
@@ -1173,11 +1374,15 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
              * (Vulkan/GL emit a per-dispatch global compute barrier, so they were
              * already safe; this also fixes D3D12, the default Windows backend.) */
             {
-                float rparams[4] = { (float)gs->run_count, 0.0f, 0.0f, 0.0f };
+                float rparams[4] = {
+                    (float)gs->group_count, 0.0f, 0.0f, 0.0f
+                };
                 bgfx_set_uniform(gs->u_cull_reset_params, rparams, 1);
                 bgfx_set_compute_dynamic_vertex_buffer(0, gs->counter_buf, BGFX_ACCESS_WRITE);
-                uint32_t groups = (gs->run_count + CULL_THREADS_X - 1u) / CULL_THREADS_X;
+                uint32_t groups =
+                    (gs->group_count + CULL_THREADS_X - 1u) / CULL_THREADS_X;
                 bgfx_dispatch(reset_view, gs->reset_program, groups, 1, 1, BGFX_DISCARD_ALL);
+                gs->frame_stats.compute_dispatches++;
             }
             /* Pass 2: cull + compact survivors into their run partitions. */
             {
@@ -1191,8 +1396,9 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                 bgfx_set_compute_dynamic_vertex_buffer(2, gs->counter_buf, BGFX_ACCESS_READWRITE);
                 uint32_t groups = (gs->rec_count + CULL_THREADS_X - 1u) / CULL_THREADS_X;
                 bgfx_dispatch(cull_view, gs->compact_program, groups, 1, 1, BGFX_DISCARD_ALL);
+                gs->frame_stats.compute_dispatches++;
             }
-            /* Pass 3: build the per-run indirect draw args. */
+            /* Pass 3: build one indirect argument per primitive draw. */
             {
                 float iparams[4] = { (float)gs->run_count, runmeta_off_vec4, 0.0f, 0.0f };
                 bgfx_set_uniform(gs->u_indirect_params, iparams, 1);
@@ -1201,10 +1407,12 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                 bgfx_set_compute_indirect_buffer(2, gs->indirect_buf, BGFX_ACCESS_WRITE);
                 uint32_t groups = (gs->run_count + CULL_THREADS_X - 1u) / CULL_THREADS_X;
                 bgfx_dispatch(cull_view, gs->build_program, groups, 1, 1, BGFX_DISCARD_ALL);
+                gs->frame_stats.compute_dispatches++;
             }
-            /* Pass-3 ran: the indirect buffer now holds valid per-run args, so the
-             * draw side may consume it via jce_gpu_scene_indirect_buffer(). */
+            /* Pass 3 produced valid arguments for every primitive draw. */
             gs->indirect_ready = true;
+            gs->frame_stats.indirect_ready = true;
+            gs->frame_stats.dispatch_succeeded = true;
             JCE_PROFILE_ZONE_END;
             return true;
         }
@@ -1224,8 +1432,22 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
         bgfx_set_compute_dynamic_vertex_buffer(1, gs->visible_buf, BGFX_ACCESS_WRITE);
         uint32_t groups = (gs->rec_count + CULL_THREADS_X - 1u) / CULL_THREADS_X;
         bgfx_dispatch(cull_view, gs->cull_program, groups, 1, 1, BGFX_DISCARD_ALL);
+        gs->frame_stats.compute_dispatches++;
     }
 
+    gs->frame_stats.dispatch_succeeded = true;
     JCE_PROFILE_ZONE_END;
     return true;
+}
+
+void jce_gpu_scene_get_frame_stats(const JceGpuScene *gs,
+                                   JceGpuSceneFrameStats *out_stats)
+{
+    if (!out_stats)
+        return;
+    if (!gs) {
+        memset(out_stats, 0, sizeof(*out_stats));
+        return;
+    }
+    *out_stats = gs->frame_stats;
 }

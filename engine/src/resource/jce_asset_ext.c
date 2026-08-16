@@ -126,3 +126,110 @@ bool jce_asset_ext_is_texture(const char *path)
 {
     return jce_asset_type_from_ext(path) == JCEASSET_TYPE_TEXTURE;
 }
+
+/* ================================================================== */
+/* Script languages                                                    */
+/* ================================================================== */
+
+/* A script extension is NOT a JCEASSET_TYPE_*: there is no cooked
+ * .jceasset container for a script (it ships as its own bytes), and adding
+ * a tenth JCEASSET_TYPE_ tag would change an on-disk enum every existing
+ * bundle already encodes.  So scripts get their own table, keyed the same
+ * way and answering a different question — see the contract note on
+ * jce_asset_script_language_from_ext() in <jce/resource/jce_asset_format.h>.
+ *
+ * `.class` is java's compiled form and is listed because a shipped Java game
+ * carries bytecode, not sources; it differs from the rest ONLY in `form`,
+ * which is the single field anything downstream branches on.
+ *
+ * WHY C++'s ROW IS `.jcecpp` AND NOT `.cpp`.  A C++ script is a CLASS in a
+ * compiled native module, so its `scriptPath` names code rather than
+ * containing it — but the runtime still has to ROUTE that path to the cpp VM,
+ * and jce_script_vm_language_for_path() answers only by extension.  So the
+ * backend claims one, and the claim has to be an extension no C++ toolchain
+ * uses:
+ *
+ *   `.cpp` / `.cc` / `.h` / `.hpp` are REFUSED BY CONSTRUCTION.  A row for
+ *   any of them would classify every translation unit in the project as an
+ *   attachable script — re-opening the exact defect eedff3ea closed, where
+ *   the Script picker offered every .cpp and .h in the project — and would
+ *   additionally hand the cooker and the publication policy a mandate to pack
+ *   the project's C++ SOURCE into the shipped game.
+ *
+ * `.jcecpp` is engine-namespaced, so it cannot collide with a real build
+ * input, and it is the SAME string the backend claims at runtime
+ * (scripting/cpp/src/jce_script_vm_cpp.c, jce_script_vm_cpp_register).
+ * *Was enforced by* (no longer checked — tools/audit/ was removed):
+ * check_script_language_catalog.py — a backend
+ * that claims an extension this table does not carry, or carries for another
+ * language, fails it.
+ *
+ * Its `form` is REFERENCE, not SOURCE: nothing compiles these bytes.  A
+ * project need not create a file at all — the path can be typed into the
+ * Script component — but a project that DOES drop a stub beside its other
+ * scripts gets the editor's asset browser, the Script picker and the
+ * publication policy for free, because all three read this table.
+ *
+ * WHY `.jcec` IS ITS OWN ROW AND NOT A SECOND SPELLING OF `.jcecpp`.  C is a
+ * DRIVER LANGUAGE here, registered as "c" by scripting/c — not a dialect of
+ * "cpp" and not an alias of it.  The two share one native class registry
+ * (a compiled class has no language at run time; the module ABI is a plain C
+ * ABI), and they are still two languages because everything a USER meets is
+ * different: the header they include, the toolchain that compiles them, the
+ * name the editor prints beside their Script component, and the language
+ * every refusal message names.  A row saying `.jcec` -> "cpp" would make the
+ * editor tell a C author their script is C++, which is the same
+ * name-the-wrong-thing defect `.jcecpp` itself was introduced to end.
+ *
+ * `.c` and `.h` are REFUSED BY CONSTRUCTION for exactly the reasons `.cpp`
+ * and `.hpp` are, one paragraph up, and more sharply: `.h` is also every
+ * engine and third-party header a project vendors.  `.jcec` is
+ * engine-namespaced, is a distinct string from `.jcecpp` (matching is on the
+ * whole text after the last dot, so neither is a prefix of the other for this
+ * table), and collides with no build input. */
+typedef struct {
+    const char *ext;             /* lowercase, no leading dot            */
+    const char *language;        /* the jce_script_vm_register() key     */
+    const char *representation;  /* JCE_BUNDLE_KEY_REPRESENTATION token  */
+    int         form;            /* JCEASSET_SCRIPT_FORM_*               */
+} ScriptExtRow;
+
+static const ScriptExtRow k_script_ext_table[] = {
+    { "lua",    "lua",    "lua.source",    JCEASSET_SCRIPT_FORM_SOURCE    },
+    { "py",     "python", "python.source", JCEASSET_SCRIPT_FORM_SOURCE    },
+    { "java",   "java",   "java.source",   JCEASSET_SCRIPT_FORM_SOURCE    },
+    { "class",  "java",   "java.class",    JCEASSET_SCRIPT_FORM_BYTECODE  },
+    { "jcecpp", "cpp",    "cpp.class-ref", JCEASSET_SCRIPT_FORM_REFERENCE },
+    { "jcec",   "c",      "c.class-ref",   JCEASSET_SCRIPT_FORM_REFERENCE },
+};
+
+static const ScriptExtRow *script_row(const char *path)
+{
+    const char *ext = ext_of(path);
+    if (!ext) return NULL;
+
+    for (size_t i = 0;
+         i < sizeof(k_script_ext_table) / sizeof(k_script_ext_table[0]); ++i) {
+        if (ext_icmp(ext, k_script_ext_table[i].ext) == 0)
+            return &k_script_ext_table[i];
+    }
+    return NULL;
+}
+
+const char *jce_asset_script_language_from_ext(const char *path)
+{
+    const ScriptExtRow *row = script_row(path);
+    return row ? row->language : NULL;
+}
+
+const char *jce_asset_script_representation_from_ext(const char *path)
+{
+    const ScriptExtRow *row = script_row(path);
+    return row ? row->representation : NULL;
+}
+
+int jce_asset_script_form_from_ext(const char *path)
+{
+    const ScriptExtRow *row = script_row(path);
+    return row ? row->form : JCEASSET_SCRIPT_FORM_NONE;
+}

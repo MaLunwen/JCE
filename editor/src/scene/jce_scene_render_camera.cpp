@@ -6,6 +6,8 @@
 #include "core/jce_editor_project_state.h"
 
 #include <cstdlib>   /* getenv/atof — headless vista camera env overrides */
+#include <cstdio>    /* snprintf for the spin-capture path */
+#include <jce/ui/jce_imgui_renderer.h>  /* deterministic spin capture */
 
 /* ── Orbit constants ──────────────────────────────────────────────── */
 
@@ -124,15 +126,113 @@ void jce_editor_scene_camera_update(float dt_sec)
      * fixed per-frame delta from the one-shot vista yaw), so frame N lands on the
      * identical pose in the Hi-Z-on and Hi-Z-off runs → any diff is a cull delta,
      * not a camera mismatch. */
+    /* JCE_BENCH_CAM="yaw,pitch,dist[,tx,ty,tz]" (yaw/pitch in degrees) pins the
+     * viewport pose every frame.
+     *
+     * Without it a benchmark does not measure the same scene twice. The editor
+     * persists camera pose in per-user session state, so the 200k bench has
+     * been recorded at 3.10 ms / 45 draws / ~25k visible and, after the pose
+     * drifted, at 19.07 ms / 133 draws with all 200,833 entities in one
+     * instanced batch -- both real, neither comparable. That drift has now
+     * produced two defects on its own: it hid a transient-pool overrun until
+     * the whole scene came into view, and it broke a memo keyed on
+     * frame_list_gen. Pinning is the fix for the measurement, not for either
+     * defect.
+     *
+     * Applied AFTER any other camera work each frame so nothing can move it,
+     * and before the spin below, which then advances from this yaw. */
     {
-        static float s_spin = -999.0f;
-        if (s_spin < -900.0f) { const char *e = getenv("JCE_DBG_VISTA_SPIN");
-                                s_spin = e ? (float)atof(e) : 0.0f; }
-        if (s_spin != 0.0f && s_sr.initialized && s_sr.camera) {
-            s_sr.orbit_yaw += s_spin * JCE_DEG2RAD;
+        static int   s_bcam = -2;          /* -2 unparsed, 0 off, 1 on */
+        static float s_bc[6] = { 0, 0, 0, 0, 0, 0 };
+        static bool  s_bc_target = false;
+        if (s_bcam == -2) {
+            s_bcam = 0;
+            const char *v = getenv("JCE_BENCH_CAM");
+            if (v && v[0]) {
+                int n = sscanf(v, "%f,%f,%f,%f,%f,%f", &s_bc[0], &s_bc[1],
+                               &s_bc[2], &s_bc[3], &s_bc[4], &s_bc[5]);
+                if (n >= 3) { s_bcam = 1; s_bc_target = (n >= 6); }
+                else LOG_WARN("scene_render", "JCE_BENCH_CAM needs at least "
+                              "yaw,pitch,dist -- ignoring '%s'", v);
+            }
+        }
+        if (s_bcam == 1 && s_sr.initialized && s_sr.camera) {
+            s_sr.orbit_yaw      = s_bc[0] * JCE_DEG2RAD;
+            s_sr.orbit_pitch    = s_bc[1] * JCE_DEG2RAD;
+            s_sr.orbit_distance = s_bc[2] > 0.0f ? s_bc[2] : s_sr.orbit_distance;
+            if (s_bc_target) s_sr.orbit_target = jce_v3(s_bc[3], s_bc[4], s_bc[5]);
             s_sr.camera_cache_valid = false;
             s_sr.orbit_clip_valid   = false;
             orbit_apply();
+        }
+    }
+
+    {
+        static float s_spin = -999.0f;
+        static float s_spin_base = 0.0f;
+        static uint32_t s_spin_n = 0;
+        static int   s_spin_cap = -2;     /* capture step, -1 = off */
+        static char  s_spin_cap_path[512];
+        if (s_spin < -900.0f) { const char *e = getenv("JCE_DBG_VISTA_SPIN");
+                                s_spin = e ? (float)atof(e) : 0.0f; }
+        if (s_spin != 0.0f && s_sr.initialized && s_sr.camera) {
+            if (s_spin_n == 0) {
+                /* ABSOLUTE base, not the yaw that happens to be there.
+                 * The editor persists camera pose in its per-user session
+                 * state, so a relative base starts each run where the previous
+                 * one stopped: measured 92.174 rad in one run and 94.258 in the
+                 * next, same build. Every pixel of the 3D view differed, which
+                 * is what a shadow A/B was being compared against. */
+                const char *sb = getenv("JCE_DBG_VISTA_SPIN_START");
+                /* JCE_BENCH_CAM pinned the yaw just above; start from it so the
+                 * two switches compose instead of fighting. */
+                s_spin_base = (sb && sb[0]) ? (float)atof(sb) * JCE_DEG2RAD
+                                            : s_sr.orbit_yaw;
+            }
+            /* Pose as a pure function of the step count, not an accumulator:
+             * `yaw += step` also drifts with float accumulation, and more
+             * importantly it made the pose depend on HOW MANY TIMES this ran. */
+            s_sr.orbit_yaw = s_spin_base + s_spin * (float)s_spin_n * JCE_DEG2RAD;
+            s_spin_n++;
+            s_sr.camera_cache_valid = false;
+            s_sr.orbit_clip_valid   = false;
+            orbit_apply();
+
+            /* Capture keyed to the SAME counter that placed the camera.
+             *
+             * The comment above claims this spin is frame-count-deterministic so
+             * that "frame N lands on the identical pose" in an A/B. It was not:
+             * this runs per viewport render while JCE_WINCAP_FRAME counts editor
+             * updates, and the ratio varies run to run, so frame N landed on a
+             * different yaw each time. Two captures of the SAME BUILD differed
+             * across 19% of pixels, which is what a shadow A/B was being
+             * compared against.
+             *
+             * JCE_DBG_VISTA_SPIN_CAPTURE=<n> requests the window capture on spin
+             * step n instead, into JCE_WINCAP_PATH. Pose and capture then share
+             * one counter by construction and cannot drift apart. */
+            if (s_spin_cap == -2) {
+                s_spin_cap = -1;
+                const char *cs = getenv("JCE_DBG_VISTA_SPIN_CAPTURE");
+                const char *cp = getenv("JCE_WINCAP_PATH");
+                if (cs && cs[0] && cp && cp[0]) {
+                    s_spin_cap = atoi(cs);
+                    snprintf(s_spin_cap_path, sizeof s_spin_cap_path, "%s", cp);
+                }
+            }
+            if (s_spin_cap > 0 && s_spin_n == (uint32_t)s_spin_cap) {
+                const jce_vec3 cp = jce_camera_get_position(s_sr.camera);
+                LOG_INFO("scene_render",
+                    "spin-capture step %u: yaw=%.6f base=%.6f pitch=%.6f dist=%.4f "
+                    "target=(%.4f,%.4f,%.4f) pos=(%.4f,%.4f,%.4f)",
+                    s_spin_n, (double)s_sr.orbit_yaw, (double)s_spin_base,
+                    (double)s_sr.orbit_pitch, (double)s_sr.orbit_distance,
+                    (double)s_sr.orbit_target.x, (double)s_sr.orbit_target.y,
+                    (double)s_sr.orbit_target.z,
+                    (double)cp.x, (double)cp.y, (double)cp.z);
+                jce_imgui_renderer_request_capture(s_spin_cap_path);
+                s_spin_cap = -1;
+            }
         }
     }
     if (!s_sr.initialized || !s_sr.camera || !s_sr.focus_anim.active) return;
@@ -149,6 +249,22 @@ void jce_editor_scene_camera_update(float dt_sec)
 }
 
 /* ── Public camera API ────────────────────────────────────────────── */
+
+void jce_editor_scene_get_orbit(float *out_target3, float *out_distance,
+                                float *out_pitch_deg, float *out_yaw_deg)
+{
+    if (out_target3) {
+        out_target3[0] = s_sr.orbit_target.x;
+        out_target3[1] = s_sr.orbit_target.y;
+        out_target3[2] = s_sr.orbit_target.z;
+    }
+    if (out_distance)  *out_distance  = s_sr.orbit_distance;
+    /* Degrees, because that is what tools/envshot.py takes and what a person
+     * reads. Converting here rather than at the call site keeps the one
+     * conversion in the file that owns the radians. */
+    if (out_pitch_deg) *out_pitch_deg = s_sr.orbit_pitch * (180.0f / 3.14159265f);
+    if (out_yaw_deg)   *out_yaw_deg   = s_sr.orbit_yaw   * (180.0f / 3.14159265f);
+}
 
 JceCamera *jce_editor_scene_get_camera(void)
 {
@@ -343,6 +459,24 @@ void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
     if (distance > ORBIT_DIST_MAX) distance = ORBIT_DIST_MAX;
     s_sr.orbit_distance = distance;
     orbit_apply();
+}
+
+void jce_editor_scene_camera_set_projection(bool orthographic,
+                                            float fov_deg,
+                                            float near_plane,
+                                            float far_plane,
+                                            float ortho_width,
+                                            float ortho_height)
+{
+    if (!s_sr.initialized || !s_sr.camera) return;
+
+    jce_camera_set_mode(s_sr.camera, orthographic
+        ? JCE_CAMERA_ORTHO : JCE_CAMERA_PERSPECTIVE);
+    jce_camera_set_fov(s_sr.camera, fov_deg);
+    jce_camera_set_near_far(s_sr.camera, near_plane, far_plane);
+    if (orthographic)
+        jce_camera_set_ortho_size(s_sr.camera, ortho_width, ortho_height);
+    s_sr.camera_cache_valid = false;
 }
 
 bool jce_editor_scene_camera_restore_pose(const char *scene_path)

@@ -10,9 +10,8 @@
  * yet; that is planned for Sprint 5.
  *
  * The baker is intentionally CPU-only and self-contained (no Embree
- * dependency) so that the editor's lightmap panel can drive it inline.
- * For full progressive baking the editor uses jce_thread_create to
- * background a worker.
+ * dependency). Editor callers snapshot scene inputs on the owner thread,
+ * execute the bake through jce_async, then apply results on the owner thread.
  */
 
 #ifndef JCE_LIGHTMAPPER_H

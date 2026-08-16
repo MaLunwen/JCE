@@ -83,6 +83,31 @@ jce_vec3 jce_impostor_oct_decode(jce_vec2 uv)
 
 /* ── Metadata sidecar ─────────────────────────────────────────────── */
 
+/* See jce_impostor.h.  Kept here, beside the bake that WRITES meta->center and
+ * meta->radius, so the producer and the consumer of that convention cannot
+ * drift apart in separate files. */
+void jce_impostor_card_place(const float model[16], const JceImpostorMeta *meta,
+                             float out_center[3], float *out_radius)
+{
+    if (!model || !meta || !out_center || !out_radius) return;
+
+    const float cx = meta->center[0], cy = meta->center[1], cz = meta->center[2];
+
+    /* Full transform of the local anchor: m * (center, 1). */
+    out_center[0] = model[0] * cx + model[4] * cy + model[8]  * cz + model[12];
+    out_center[1] = model[1] * cx + model[5] * cy + model[9]  * cz + model[13];
+    out_center[2] = model[2] * cx + model[6] * cy + model[10] * cz + model[14];
+
+    /* Largest column length: the only scalar that cannot crop the silhouette
+     * under anisotropic scale (see the header). */
+    const float s0 = sqrtf(model[0]*model[0] + model[1]*model[1] + model[2]*model[2]);
+    const float s1 = sqrtf(model[4]*model[4] + model[5]*model[5] + model[6]*model[6]);
+    const float s2 = sqrtf(model[8]*model[8] + model[9]*model[9] + model[10]*model[10]);
+    float smax = s0 > s1 ? s0 : s1;
+    if (s2 > smax) smax = s2;
+    *out_radius = meta->radius * smax;
+}
+
 bool jce_impostor_meta_write(const char *json_path, const JceImpostorMeta *meta)
 {
     if (!json_path || !json_path[0] || !meta) return false;

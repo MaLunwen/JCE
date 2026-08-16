@@ -35,6 +35,12 @@ typedef struct cJSON JceJson;
  * failure.  When `len == 0`, treats `text` as NUL-terminated. */
 JCE_API JceJson *jce_json_parse(const char *text, size_t len);
 
+/* Parse exactly one JSON value.  Unlike jce_json_parse(), trailing non-space
+ * bytes are rejected.  `len == 0` treats text as NUL-terminated.  This is the
+ * right entry point for trust-boundary data such as project/script assets;
+ * the lenient function remains for backward-compatible document readers. */
+JCE_API JceJson *jce_json_parse_strict(const char *text, size_t len);
+
 /* Read a file from disk and parse it.  Returns NULL on I/O or parse fail;
  * jce_json_last_error() tells those two apart. */
 JCE_API JceJson *jce_json_parse_file(const char *path);
@@ -92,6 +98,7 @@ JCE_API bool JCE_CALL jce_json_is_array(const JceJson *j);
 JCE_API bool JCE_CALL jce_json_is_number(const JceJson *j);
 JCE_API bool JCE_CALL jce_json_is_string(const JceJson *j);
 JCE_API bool JCE_CALL jce_json_is_bool(const JceJson *j);
+JCE_API bool JCE_CALL jce_json_is_null(const JceJson *j);
 
 JCE_API JceJson *jce_json_get(const JceJson *obj, const char *key);   /* case-sensitive */
 JCE_API bool JCE_CALL jce_json_has(const JceJson *obj, const char *key);
@@ -129,6 +136,7 @@ JCE_API JceJson    *jce_json_next_sibling (const JceJson *node);
 JCE_API const char *jce_json_member_key   (const JceJson *node);  /* may be NULL for array items */
 JCE_API const char *jce_json_string_value (const JceJson *node, const char *def);
 JCE_API double JCE_CALL jce_json_number_value(const JceJson *node, double def);
+JCE_API bool JCE_CALL jce_json_bool_value(const JceJson *node, bool def);
 
 /* ── Typed accessors with defaults ─────────────────────────────────── */
 

@@ -118,6 +118,8 @@ void jce_editor_path_store_asset_ref(char *out, size_t out_size,
     for (char *p = out; *p; ++p) if (*p == '\\') *p = '/';
 }
 
+
+
 /* ── Decomposition: why these stay editor-local ───────────────────────
  *
  * jce_path.h has jce_path_basename / _parent / _replace_extension, but

@@ -77,7 +77,8 @@ static inline JceWorldStreamConfig jce_world_stream_config_default(void)
 /* ================================================================== */
 
 /* Create a world streamer bound to an existing scene and file system.
-   thread_pool may be NULL; if so, single-thread mode is used. */
+ * thread_pool is retained for source compatibility; streaming now owns a
+ * structured executor and does not borrow the frame-job pool. */
 JCE_API JceWorldStreamer *jce_world_streamer_create(
     const JceWorldStreamConfig *config,
     JceScene                   *scene,
@@ -180,11 +181,11 @@ JCE_API void jce_world_streamer_set_residency_query(
  * SHOWN again the moment the chunk unloads — eliminating the double-draw /
  * z-fight of the proxy box over the real streamed buildings.
  *
- * The proxies are baked (build/gen_hlod.py) into the MASTER scene as always-
- * resident entities named "HLOD_<gx>_<gz>", one per streamable cell.  This
- * builds the chunk-id -> proxy-entity map from the scene's authored streaming
- * table (chunk fragment path "…/cell_<gx>_<gz>.scene.json" -> proxy name
- * "HLOD_<gx>_<gz>", resolved against each entity's EditorMeta name, which the
+ * The proxies are baked (tools/worldgen/gen_hlod.py) into the MASTER scene as
+ * always-resident entities named "HLOD_<gx>_<gz>", one per streamable cell.
+ * This builds the chunk-id -> proxy-entity map from the scene's authored
+ * streaming table (chunk fragment path "…/cell_<gx>_<gz>.scene.json" -> proxy
+ * name "HLOD_<gx>_<gz>", resolved against each entity's EditorMeta name, which the
  * shared scene loader populates in BOTH the editor and the cooked runtime
  * scene) and installs the streamer chunk callback to toggle the proxy's
  * MeshRenderer.  It then chains to `extra_cb` (with `extra_ud`) if non-NULL, so

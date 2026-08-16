@@ -133,6 +133,14 @@ void main()
 	vec4 clip = mul(u_gig_vp, vec4(ppos, 1.0));
 	if (clip.w > 1.0e-4) {
 		vec2 base_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+		/* Top-left texture origin: NDC y grows UP, UV v grows DOWN.  Pairs with
+		 * the uv->NDC step in the loop below -- change one, change both.  They
+		 * round-tripped, so the geometry was self-consistent in mirror space
+		 * and the damage was that s_gigDepth / s_gigColor were sampled from the
+		 * mirrored half of the frame. */
+		base_uv.y = 1.0 - base_uv.y;
+#endif
 		float K = max(u_gig_screen.z, 1.0);
 		vec2 rpx = vec2(u_gig_screen.w / max(u_gig_screen.x, 1.0),
 		                u_gig_screen.w / max(u_gig_screen.y, 1.0));
@@ -147,7 +155,11 @@ void main()
 				continue;
 			float d = texture2DLod(s_gigDepth, uv, 0).x;
 			float ndc_z = (u_gig_misc.w > 0.5) ? d * 2.0 - 1.0 : d;
-			vec4 wp4 = mul(u_gig_ivp, vec4(uv * 2.0 - 1.0, ndc_z, 1.0));
+			vec2 gndc = uv * 2.0 - 1.0;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+			gndc.y = -gndc.y;   /* exact inverse of the base_uv flip above */
+#endif
+			vec4 wp4 = mul(u_gig_ivp, vec4(gndc, ndc_z, 1.0));
 			vec3 radiance = texture2DLod(s_gigColor, uv, 0).rgb;
 			/* Scene color is gamma-encoded by the manual-gamma pipeline;
 			 * linearise for energy accumulation. */
@@ -287,6 +299,9 @@ void main()
 		if (sc.w > 1.0e-4) {
 			vec3 sndc = sc.xyz / sc.w;
 			vec2 suv  = sndc.xy * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+			suv.y = 1.0 - suv.y;   /* matches csm_shadow.sh's cascade lookup */
+#endif
 			float sz  = (u_gig_misc.w > 0.5) ? sndc.z * 0.5 + 0.5 : sndc.z;
 			if (suv.x > 0.0 && suv.x < 1.0 && suv.y > 0.0 && suv.y < 1.0 &&
 			    sz > 0.0 && sz < 1.0) {

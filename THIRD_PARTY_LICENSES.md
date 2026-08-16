@@ -1260,7 +1260,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## AOSP libhevc (Android Open Source Project)
 
-- **Version**: android-platform-15.0.0_r1
+- **Version**: v1.6.0
 - **License**: Apache-2.0
 - **URL**: https://android.googlesource.com/platform/external/libhevc/
 
@@ -1278,6 +1278,36 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+```
+
+---
+
+## LXGW WenKai (霞鹜文楷)
+
+Redistributed as a binary font asset inside sample-project PAK archives
+(`space/resources/assets/fonts/LXGWWenKai-Regular.ttf`, and the same file in
+`elemental_serenity/`). It is the CJK-capable UI font those projects author
+their `UIText` components against; the engine itself only references the path
+in a comment. The upstream project derives from Klee One, whose authors are
+credited in the second copyright line below (both notices are reproduced
+verbatim from the font's own `name` table, IDs 0 and 13).
+
+Under OFL 1.1 clause 2, this notice must accompany any redistribution of the
+font, including inside a packed asset archive or a single-file executable.
+The Reserved Font Name is "LXGW WenKai": a modified version of this font must
+not be distributed under that name.
+
+- **Version**: 1.522 (March 17, 2026)
+- **License**: SIL Open Font License, Version 1.1
+- **URL**: https://github.com/lxgw/LxgwWenKai
+- **License text**: https://openfontlicense.org
+
+```
+Copyright 2021-2026 LXGW (https://github.com/lxgw/LxgwWenKai)
+Copyright 2020 The Klee Project Authors (https://github.com/fontworks-fonts/Klee)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is available with a FAQ at: https://openfontlicense.org
 ```
 
 ---

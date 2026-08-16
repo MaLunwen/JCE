@@ -20,6 +20,7 @@
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "os/core/jce_memory.h"
 
@@ -31,6 +32,14 @@
 
 static JceRenderPipelineDesc s_active;
 static bool                  s_active_set = false;
+
+/* The last descriptor handed to jce_render_pipeline_apply, BEFORE the tier
+ * floor clamped it.  Needed because the clamp is order dependent: the tier is
+ * frequently not resolved yet when the pipeline is first applied, and the
+ * clamp has to be re-run once it is.  Re-running it from s_active would be
+ * one-way (the request is already destroyed), so the request is kept. */
+static JceRenderPipelineDesc s_requested;
+static bool                  s_requested_set = false;
 
 /* ── P4-E.2: pending (shadow) descriptor ──────────────────────────── *
  * Accumulates per-feature changes during a frame.  Promoted to s_active *
@@ -288,6 +297,23 @@ static JceRpQuality quality_from_str(const char *s)
     return JCE_RP_QUALITY_MID;
 }
 
+/* Re-resolve the active descriptor against the CURRENT hardware tier.
+ *
+ * The LOW-tier floor is applied inside jce_render_pipeline_apply, which reads
+ * jce_renderer_get_tier().  Boot order does not guarantee the tier is known by
+ * then -- engine init applies a pipeline before the caps probe settles, and
+ * the editor can override the tier afterwards -- so the floor silently did not
+ * hold whenever the tier arrived late.  The symptom was the same LOW-tier
+ * build behaving differently in two hosts.  Anything that changes the
+ * effective tier calls this so the floor is a property of the tier, not of
+ * call order.  No-op before the first apply. */
+void jce_render_pipeline_notify_tier_changed(void)
+{
+    if (!s_requested_set) return;
+    JceRenderPipelineDesc again = s_requested;
+    jce_render_pipeline_apply(&again);
+}
+
 void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
 {
     JceRenderPipelineDesc tmp;
@@ -295,6 +321,15 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
         jce_render_pipeline_preset_low(&tmp);
         desc = &tmp;
     }
+    /* Keep the descriptor AS REQUESTED, before any tier clamp.  The clamp
+     * below reads the hardware tier, so a pipeline applied before the tier is
+     * resolved skips it -- and re-clamping later from s_active would be
+     * lossy: the original HIGH request is gone, so a machine that resolves
+     * upward could never get it back.  jce_render_pipeline_notify_tier_changed
+     * re-clamps from this copy instead. */
+    s_requested     = *desc;
+    s_requested_set = true;
+
     s_active     = *desc;
     s_active_set = true;
 
@@ -334,7 +369,15 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
             s_active.hdr_color            = false;  /* no half-float offscreen RT */
             s_active.enable_taa           = false;  /* needs motion vectors + history */
             s_active.enable_ssr           = false;  /* screen-space reflections */
-            s_active.enable_volumetric_fog = false;
+            /* Volumetric fog is NOT disabled here.  This block is for things
+             * GLES CANNOT do -- half-float targets, motion-vector history.
+             * The fog pass is an ordinary fragment quad that compiles and
+             * runs on WebGL2 (essl binaries are produced for it).  Whether it
+             * SHOULD run there is a COST question, and the LOW-tier floor
+             * below -- which WebGL2 always hits -- is where that is decided.
+             * Listing it here conflated "cannot" with "should not", and the
+             * two need separate answers or a future tier that can afford the
+             * march still never gets it. */
             s_active.enable_motion_blur   = false;
             s_active.depth_prepass        = false;
             /* Web perf: every WebGL draw crosses the JS/ANGLE boundary, so
@@ -344,9 +387,16 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
              * ~half the shadow-pass draws AND half the shadow rasterization. */
             if (s_active.csm_cascade_count > 1)
                 s_active.csm_cascade_count = 1;
-            /* (A web-only bloom-quality clamp was tried alone and measured
-             * too small to feel on a 50ms iGPU frame; it now ships as part
-             * of the LOW-tier floor bundle below instead.) */
+            /* The bloom-quality clamp used to ride along in the LOW-tier
+             * floor below, on the stated assumption that "every WebGL2
+             * browser ... lands LOW".  That assumption is no longer true: the
+             * tier probe now classifies an ES3-class GLES device as MEDIUM so
+             * the web build gets PBR, and the floor -- which is gated on
+             * tier <= LOW -- stopped applying to exactly the backend it was
+             * written for.  The COST constraint is a property of the WebGL
+             * draw path, not of the tier, so it belongs here. */
+            if (s_active.post_quality > JCE_RP_QUALITY_LOW)
+                s_active.post_quality = JCE_RP_QUALITY_LOW;   /* 1-mip bloom */
         }
     }
 
@@ -364,6 +414,13 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
             s_active.post_quality = JCE_RP_QUALITY_LOW;      /* 1-mip bloom  */
         if (s_active.csm_cascade_count > 1)
             s_active.csm_cascade_count = 1;                  /* one cascade  */
+        /* The comment above has always promised "no HDR extras", but the
+         * clamp never cleared the flag, so a shipped .rp.json asking for
+         * hdr=1 got half-float render targets on exactly the hardware this
+         * floor exists to protect -- 8 bytes per pixel on every full-res
+         * target while PBR, bloom-beyond-one-mip, SSAO, SSR and TAA are all
+         * off and nothing can consume a value above 1.0. */
+        s_active.hdr_color             = false;
         s_active.enable_taa            = false;
         s_active.enable_ssr            = false;
         s_active.enable_volumetric_fog = false;
@@ -387,6 +444,46 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
      * the flag per frame (sr_drive_gpu_particles re-checks it each
      * render and sweeps its pools when it turns off), so the deferred
      * toggle works for free. */
+
+    /* Say so when the asset asks for materially less than the hardware
+     * would give.  A .rp.json overrides the tier preset silently and
+     * completely, and the only trace was one `applied:` line among dozens
+     * of INFO records -- so a debugging leftover (shadow 512 against a
+     * HIGH-tier 2048, filter 1 against 2) survived in a project for weeks
+     * and was eventually found by someone noticing blocky shadows, not by
+     * reading a log.  A downgrade is legitimate; being quiet about it is
+     * not, because the same line is what tells you it was deliberate. */
+    JceRenderPipelineDesc tier;
+    jce_render_pipeline_preset_for_current_tier(&tier);
+    char why[256];
+    int  n = 0;
+    if (desc->shadow_resolution && tier.shadow_resolution &&
+        desc->shadow_resolution * 2u <= tier.shadow_resolution)
+        n += snprintf(why + n, sizeof(why) - (size_t)n,
+              "%sshadow %u<%u", n ? ", " : "",
+              (unsigned)desc->shadow_resolution,
+              (unsigned)tier.shadow_resolution);
+    /* One cascade fewer is a taste call and looks nothing like the defect this
+     * guard exists for; two or more is a different picture. Same halving rule
+     * as the resolution above, so the guard reports magnitudes, not opinions. */
+    if (n < (int)sizeof(why) &&
+        desc->csm_cascade_count + 1u < tier.csm_cascade_count)
+        n += snprintf(why + n, sizeof(why) - (size_t)n,
+              "%scascades %u<%u", n ? ", " : "",
+              (unsigned)desc->csm_cascade_count,
+              (unsigned)tier.csm_cascade_count);
+    if (n < (int)sizeof(why) &&
+        desc->shadow_filter_quality < tier.shadow_filter_quality)
+        n += snprintf(why + n, sizeof(why) - (size_t)n,
+              "%sshadow-filter %u<%u", n ? ", " : "",
+              (unsigned)desc->shadow_filter_quality,
+              (unsigned)tier.shadow_filter_quality);
+    if (n > 0)
+        LOG_WARN(LOG_TAG,
+        "render pipeline '%s' asks for LESS than this %s-tier GPU "
+        "offers: %s. Intended? If it is a leftover from testing, the "
+        "engine default for a new scene is the tier preset.",
+        "(active pipeline)", jce_gpu_tier_name(jce_renderer_get_tier()), why);
 
     LOG_INFO(LOG_TAG,
         "applied: csm=%d ssao=%d ssr=%d taa=%d bloom=%d volfog=%d "
@@ -415,9 +512,59 @@ void jce_render_pipeline_get(JceRenderPipelineDesc *out)
     *out = s_active;
 }
 
+/* JCE_RP_FORCE="ssao=1,volumetric_fog=0" -- force feature flags for a
+ * measurement, ahead of every other source.
+ *
+ * This exists because a whole subsystem was found to have never run, and the
+ * reason it survived was that it could not be ablated. The .rp.json preset is
+ * the documented way to turn features on and off, and it does not reach the
+ * editor's viewport pipeline -- an override written there shows up in the UI
+ * and changes nothing about what is rendered. So "capture with SSAO on, then
+ * with it off, and compare" was not a thing anyone could actually do, and a
+ * feature that silently depended on SSAO stayed invisible.
+ *
+ * One override at the single point where every feature question is answered,
+ * rather than one cvar per feature. It announces what it forced: a silent
+ * override is the same defect wearing a different hat, and this one outranks
+ * the authored settings. */
+static int  s_force_n = -1;
+static char s_force_name[12][32];
+static int  s_force_val[12];
+
+static void rp_force_parse(void)
+{
+    s_force_n = 0;
+    const char *e = getenv("JCE_RP_FORCE");
+    if (!e || !e[0]) return;
+    const char *p = e;
+    while (*p && s_force_n < 12) {
+        while (*p == ' ' || *p == ',') p++;
+        const char *k = p;
+        while (*p && *p != '=' && *p != ',') p++;
+        size_t klen = (size_t)(p - k);
+        if (*p != '=' || klen == 0 || klen >= sizeof s_force_name[0]) {
+            while (*p && *p != ',') p++;
+            continue;
+        }
+        p++;
+        const int v = (*p == '0') ? 0 : 1;
+        while (*p && *p != ',') p++;
+        memcpy(s_force_name[s_force_n], k, klen);
+        s_force_name[s_force_n][klen] = 0;
+        s_force_val[s_force_n] = v;
+        LOG_WARN(LOG_TAG, "JCE_RP_FORCE: %s = %d (overriding every other source)",
+                 s_force_name[s_force_n], v);
+        s_force_n++;
+    }
+}
+
 bool jce_render_pipeline_is_feature_enabled(const char *feature)
 {
-    if (!feature || !s_active_set) return false;
+    if (!feature) return false;
+    if (s_force_n < 0) rp_force_parse();
+    for (int i = 0; i < s_force_n; i++)
+        if (strcmp(feature, s_force_name[i]) == 0) return s_force_val[i] != 0;
+    if (!s_active_set) return false;
     if (strcmp(feature, "csm")            == 0) return s_active.enable_csm;
     if (strcmp(feature, "ssao")           == 0) return s_active.enable_ssao;
     if (strcmp(feature, "ssr")            == 0) return s_active.enable_ssr;

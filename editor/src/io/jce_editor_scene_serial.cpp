@@ -27,7 +27,7 @@ extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
-#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
@@ -349,10 +349,10 @@ void mark_prefab_instance_recursive(uint32_t entity_id, const char *prefab_path)
 
     if (prefab_path && prefab_path[0] != '\0') {
         m->prefab_instance = true;
-        snprintf(m->prefab_path, sizeof(m->prefab_path), "%s", prefab_path);
+        m->prefab_path = jce_scene_intern(s.scene, prefab_path);
     } else {
         m->prefab_instance = false;
-        m->prefab_path[0] = '\0';
+        m->prefab_path = jce_scene_intern(s.scene, "");
     }
 
     uint32_t child_ids[JCE_MAX_CHILDREN];
@@ -408,24 +408,33 @@ struct MeshValidJob {
     std::vector<std::string> rel;   /* scene-relative, for logging */
     int                      checked = 0;
     int                      failed  = 0;
-    JceAtomicI32            *done    = nullptr;   /* 0 running, 1 finished */
 };
 
-static JceThread    *g_mv_worker = nullptr;
+static JceAsyncTask *g_mv_task   = nullptr;
 static MeshValidJob *g_mv_job    = nullptr;
 
-/* WORKER thread: read + cgltf-parse each mesh (no ECS / GPU). */
-static void mesh_valid_worker(void *arg)
+/* WORKER: read + CPU-decode each mesh (no ECS or bgfx object creation). */
+static JceAsyncRunResult mesh_valid_worker(JceAsyncContext *ctx, void *arg)
 {
     MeshValidJob *j = (MeshValidJob *)arg;
     for (size_t i = 0; i < j->abs.size(); ++i) {
+        if (jce_async_context_cancel_requested(ctx))
+            return JCE_ASYNC_RUN_CANCELLED;
+
         uint64_t file_size = 0;
         void *data = jce_fs_host_read_all(j->abs[i].c_str(), &file_size);
         if (!data) continue;
         j->checked++;
+        if (file_size > UINT32_MAX) {
+            jce_free(data);
+            j->failed++;
+            LOG_WARN(LOG_TAG, "mesh validation skipped oversized asset '%s'",
+                     j->rel[i].c_str());
+            continue;
+        }
         /* Pass the resolved absolute path so the loader resolves any
          * external .bin buffer from the asset's own directory. */
-        JceModel *model = jce_model_load_gltf_memory(
+        JceModelCpu *model = jce_model_decode_gltf_cpu_memory(
             data, (uint32_t)file_size, j->abs[i].c_str());
         jce_free(data);
         if (!model) {
@@ -434,19 +443,19 @@ static void mesh_valid_worker(void *arg)
                      "runtime may fail to display this model",
                      j->rel[i].c_str());
         } else {
-            jce_model_destroy(model);
+            jce_model_gltf_cpu_free(model);
         }
     }
-    jce_atomic_i32_store(j->done, 1);
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
-static void mesh_valid_finalize(void)
+static void mesh_valid_finalize(JceAsyncTask *task, void *arg)
 {
-    MeshValidJob *j = g_mv_job;
+    MeshValidJob *j = (MeshValidJob *)arg;
     if (!j) return;
-    if (g_mv_worker) { jce_thread_join(g_mv_worker); g_mv_worker = nullptr; }
 
-    if (j->checked > 0 && j->failed == 0) {
+    if (jce_async_task_state(task) == JCE_ASYNC_STATE_SUCCEEDED &&
+        j->checked > 0 && j->failed == 0) {
         LOG_SUCCESS(LOG_TAG, "mesh asset validation passed: %d glTF "
                     "files verified with engine cgltf", j->checked);
     } else if (j->failed > 0) {
@@ -454,16 +463,18 @@ static void mesh_valid_finalize(void)
                  "failed engine cgltf load", j->failed, j->checked);
     }
 
-    if (j->done) jce_atomic_i32_destroy(j->done);
-    delete j;
     g_mv_job = nullptr;
+    JceAsyncTask *owned = g_mv_task;
+    g_mv_task = nullptr;
+    if (owned) jce_async_task_release(owned);
+    delete j;
 }
 
 static void validate_mesh_assets(const char *scene_path)
 {
     /* A prior validation still running: let it finish on its own (it
      * covers a near-identical scene state); skip starting a second. */
-    if (g_mv_worker) return;
+    if (g_mv_task) return;
 
     char scene_dir[1024] = "";
     if (scene_path) {
@@ -478,22 +489,28 @@ static void validate_mesh_assets(const char *scene_path)
     MeshValidJob *j = new MeshValidJob();
     j->abs  = std::move(gctx.abs);
     j->rel  = std::move(gctx.rel);
-    j->done = jce_atomic_i32_create(0);
-    g_mv_job = j;
 
-    g_mv_worker = jce_thread_create(mesh_valid_worker, j, "jce_mesh_valid");
-    if (!g_mv_worker) {
-        /* No worker thread: run inline then finalise immediately. */
-        mesh_valid_worker(j);
-        mesh_valid_finalize();
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = mesh_valid_worker;
+    desc.complete   = mesh_valid_finalize;
+    desc.user_data  = j;
+    desc.debug_name = "editor.mesh.validate";
+    desc.priority   = JCE_ASYNC_PRIORITY_LOW;
+    JceAsyncTask *task =
+        jce_async_submit(jce_async_default_executor(), &desc);
+    if (!task) {
+        delete j;
+        LOG_WARN(LOG_TAG, "mesh validation task queue is full");
+        return;
     }
+    g_mv_job = j;
+    g_mv_task = task;
 }
 
-/* MAIN thread, per-frame: pick up a finished mesh validation. */
+/* Retained compatibility pump; completion is delivered by jce_async. */
 extern "C" void jce_state_scene_serial_poll(void)
 {
-    if (g_mv_job && jce_atomic_i32_load(g_mv_job->done) != 0)
-        mesh_valid_finalize();
 }
 
 /* ── Post-load asset path repair (O(1) per path via asset index) ──── */
@@ -509,7 +526,7 @@ static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
 
     if (mr->mesh_path[0] != '\0' && !jce_fs_host_exists_file(mr->mesh_path)) {
         if (jce_asset_path_index_lookup(mr->mesh_path, resolved, (int)sizeof(resolved))) {
-            snprintf(mr->mesh_path, sizeof(mr->mesh_path), "%s", resolved);
+            mr->mesh_path = jce_scene_intern(s.scene, resolved);
             ctx->mesh_repaired++;
         }
     }
@@ -519,7 +536,7 @@ static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
     bool repaired_mat = false;
     if (!jce_fs_host_exists_file(mr->material_path)) {
         if (jce_asset_path_index_lookup(mr->material_path, resolved, (int)sizeof(resolved))) {
-            snprintf(mr->material_path, sizeof(mr->material_path), "%s", resolved);
+            mr->material_path = jce_scene_intern(s.scene, resolved);
             ctx->mat_repaired++;
             repaired_mat = true;
         }
@@ -544,11 +561,11 @@ static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
     if (!jce_pbr_material_load_json(mr->material_path, &pbr, tex_paths))
         return;
 
-    if (tex_paths[0][0]) snprintf(mr->albedo_tex, sizeof(mr->albedo_tex), "%s", tex_paths[0]);
-    if (tex_paths[1][0]) snprintf(mr->mr_tex, sizeof(mr->mr_tex), "%s", tex_paths[1]);
-    if (tex_paths[2][0]) snprintf(mr->normal_tex, sizeof(mr->normal_tex), "%s", tex_paths[2]);
-    if (tex_paths[3][0]) snprintf(mr->ao_tex, sizeof(mr->ao_tex), "%s", tex_paths[3]);
-    if (tex_paths[4][0]) snprintf(mr->emissive_tex, sizeof(mr->emissive_tex), "%s", tex_paths[4]);
+    if (tex_paths[0][0]) mr->albedo_tex = jce_scene_intern(s.scene, tex_paths[0]);
+    if (tex_paths[1][0]) mr->mr_tex = jce_scene_intern(s.scene, tex_paths[1]);
+    if (tex_paths[2][0]) mr->normal_tex = jce_scene_intern(s.scene, tex_paths[2]);
+    if (tex_paths[3][0]) mr->ao_tex = jce_scene_intern(s.scene, tex_paths[3]);
+    if (tex_paths[4][0]) mr->emissive_tex = jce_scene_intern(s.scene, tex_paths[4]);
     mr->base_color[0] = pbr.base_color_factor[0];
     mr->base_color[1] = pbr.base_color_factor[1];
     mr->base_color[2] = pbr.base_color_factor[2];
@@ -649,6 +666,17 @@ static void rel_in_place(char *field, size_t cap, const char *base_dir)
 
 struct RelSweepCtx { JceScene *scene; const char *base_dir; };
 
+/* rel_in_place for an interned field: the string is shared and immutable, so
+ * the relative form is built in a scratch buffer and interned back. */
+static void rel_interned(JceScene *sc, const char **field, const char *base)
+{
+    if (!field || !*field || !(*field)[0]) return;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", *field);
+    rel_in_place(tmp, sizeof(tmp), base);
+    *field = jce_scene_intern(sc, tmp);
+}
+
 static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
 {
     RelSweepCtx *ctx = (RelSweepCtx *)ud;
@@ -657,16 +685,22 @@ static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
     JceScene *scene = ctx->scene;
 
     JceEditorMeta *meta = jce_scene_get_editor_meta(scene, e);
-    if (meta) rel_in_place(meta->prefab_path, sizeof(meta->prefab_path), base);
+    /* rel_interned, not rel_in_place: an interned string is shared and
+     * immutable, so it cannot be rewritten in place.  The helper three
+     * functions above was written for exactly this when MeshRenderer's paths
+     * were interned. */
+    if (meta) rel_interned(scene, &meta->prefab_path, base);
 
     if (JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e)) {
-        rel_in_place(mr->mesh_path,     sizeof(mr->mesh_path),     base);
-        rel_in_place(mr->material_path, sizeof(mr->material_path), base);
-        rel_in_place(mr->albedo_tex,    sizeof(mr->albedo_tex),    base);
-        rel_in_place(mr->mr_tex,        sizeof(mr->mr_tex),        base);
-        rel_in_place(mr->normal_tex,    sizeof(mr->normal_tex),    base);
-        rel_in_place(mr->ao_tex,        sizeof(mr->ao_tex),        base);
-        rel_in_place(mr->emissive_tex,  sizeof(mr->emissive_tex),  base);
+        /* Interned paths are immutable and shared, so an in-place rewrite is
+         * not available: relativise into a scratch buffer and re-intern. */
+        rel_interned(scene, &mr->mesh_path,     base);
+        rel_interned(scene, &mr->material_path, base);
+        rel_interned(scene, &mr->albedo_tex,    base);
+        rel_interned(scene, &mr->mr_tex,        base);
+        rel_interned(scene, &mr->normal_tex,    base);
+        rel_interned(scene, &mr->ao_tex,        base);
+        rel_interned(scene, &mr->emissive_tex,  base);
     }
     if (JceCompoundColliderComponent *cc = jce_scene_get_compound_collider(scene, e)) {
         rel_in_place(cc->model_path, sizeof(cc->model_path), base);

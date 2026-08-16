@@ -1,5 +1,5 @@
 $input a_position, a_normal, a_texcoord0, i_data0, i_data1
-$output v_texcoord0, v_normal, v_worldpos
+$output v_texcoord0, v_normal, v_worldpos, v_localpos
 
 #include <bgfx_shader.sh>
 
@@ -96,4 +96,8 @@ void main()
     v_texcoord0 = a_texcoord0.xy;
     v_normal    = i_data1.xyz;
     v_worldpos  = world;
+    /* Object space, for hashed alpha.  It must be the PRE-WIND position: the
+     * whole point of the hash is that it does not move, and world position
+     * sways every frame. */
+    v_localpos  = a_position;
 }

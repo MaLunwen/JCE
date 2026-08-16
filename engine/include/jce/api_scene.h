@@ -13,12 +13,18 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_camera.h>
+#include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
 #include <jce/middleware/scene/jce_scene_async.h>
 #include <jce/middleware/scene/jce_scene_compiler.h>
 #include <jce/middleware/scene/jce_scene_recipe.h>
 #include <jce/middleware/scene/jce_scene_systems.h>
 #include <jce/middleware/scene/jce_scene_transaction.h>
 #include <jce/middleware/scene/jce_space_partition.h>
+#include <jce/middleware/scene/jce_vcam_system.h>
+#include <jce/middleware/scene/jce_water.h>
+#include <jce/middleware/scene/jce_water_fft.h>
+#include <jce/middleware/scene/jce_water_field.h>
 
 
 

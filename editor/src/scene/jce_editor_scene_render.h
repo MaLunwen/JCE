@@ -81,6 +81,17 @@ bool jce_editor_scene_pick_poll_rect(uint32_t *out_ids, uint32_t max_ids,
 /* Get the editor camera (for gizmo projection, etc.). */
 JceCamera *jce_editor_scene_get_camera(void);
 
+/* The scene view's orbit rig, in the units tools/envshot.py takes: target XYZ,
+ * distance in metres, pitch and yaw in DEGREES.
+ *
+ * Exposed so a repro line can be printed from the pose a defect was actually
+ * seen at. The rig's own state is the right source: a view/projection matrix
+ * would have to be inverted back into these numbers by whoever consumed it,
+ * and the inversion is ambiguous in yaw sign -- which is precisely the kind of
+ * detail that turns a reproduction into a near-miss. */
+void jce_editor_scene_get_orbit(float *out_target3, float *out_distance,
+                                float *out_pitch_deg, float *out_yaw_deg);
+
 /* Get camera view/projection as flat 16-float arrays (C++-safe).
  * Returns false if camera is not initialized. */
 bool jce_editor_scene_get_camera_matrices(float *out_view16,
@@ -110,6 +121,14 @@ void jce_editor_scene_camera_get_state(float out_target3[3], float *out_yaw,
                                        float *out_pitch, float *out_distance);
 void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
                                        float pitch, float distance);
+
+/* Set the editor camera projection without invalidating its orbit pose. */
+void jce_editor_scene_camera_set_projection(bool orthographic,
+                                            float fov_deg,
+                                            float near_plane,
+                                            float far_plane,
+                                            float ortho_width,
+                                            float ortho_height);
 
 /* Restore the orbit pose saved per scene in the project state (written
  * continuously as the camera moves).  Returns false — leaving the current

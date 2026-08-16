@@ -8,7 +8,7 @@
  * directly (the editor never sees argv at all otherwise — `JCE_MAIN`
  * hides it).
  *
- * Today we expose only the two switches the runtime actually needs.
+ * The accessors below expose only the switches the runtime actually needs.
  * Add new accessors here (do NOT expose raw argv) when a feature
  * needs another flag.
  *
@@ -46,6 +46,25 @@ JCE_API bool JCE_CALL jce_args_has_dev(void);
  * The returned path is not normalised; callers that need a
  * canonical form should run it through jce_path_*. */
 JCE_API bool JCE_CALL jce_args_get_dev_assets(char *out, size_t cap);
+
+/* Returns a one-shot startup-scene override, in priority order:
+ *   1. `--scene <vfs-path>` or `--scene=<vfs-path>`
+ *   2. JCE_STARTUP_SCENE environment variable
+ *
+ * Only normalized VFS-relative paths accepted by
+ * jce_runtime_boot_scene_path_is_valid() are returned.  This keeps debugger,
+ * editor and CI launches on the same path-safety contract as shipped PAK boot
+ * metadata.  `out` is left untouched when no valid override exists. */
+JCE_API bool JCE_CALL jce_args_get_startup_scene(char *out, size_t cap);
+
+/* Returns the development shader overlay root, in priority order:
+ *   1. `--shader-dir <host-path>` or `--shader-dir=<host-path>`
+ *   2. JCE_SHADER_DEV_DIR environment variable
+ *
+ * The directory contains the backend binaries under `shaders/`.  It is a
+ * development/CI overlay only; shipped builds continue to resolve shaders
+ * from their PAK when no override is supplied. */
+JCE_API bool JCE_CALL jce_args_get_shader_dev_dir(char *out, size_t cap);
 
 JCE_EXTERN_C_END
 

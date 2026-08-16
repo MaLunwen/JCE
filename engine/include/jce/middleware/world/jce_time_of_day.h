@@ -73,6 +73,36 @@ JCE_API void jce_time_of_day_evaluate(const JceTimeOfDayConfig *cfg,
                                        float                      hour_of_day,
                                        JceTimeOfDayState         *out);
 
+/* ── Publish contract ───────────────────────────────────────────────
+ *
+ * The snapshot above is only worth computing if consumers actually read it.
+ * fog_color, fog_density and exposure were computed for every frame of every
+ * day/night cycle and read by nothing, so a scene kept its daytime fog and
+ * daytime exposure at midnight.
+ *
+ * These resolvers are the publish points.  They are pure functions of
+ * (authored value, snapshot) so the policy is testable without a renderer,
+ * and so there is exactly one place that decides how a day/night cycle
+ * overrides authored scene settings.
+ *
+ * `tod` NULL means the cycle is inactive: the authored value passes through
+ * unchanged, so a scene with no day/night cycle is bit-identical. */
+
+/* Fog colour and density for this moment.  A day/night cycle owns the fog
+ * TINT and THICKNESS (night is darker and hazier); the scene keeps ownership
+ * of whether fog exists at all and of its start/end distances. */
+JCE_API void JCE_CALL jce_time_of_day_resolve_fog(
+    const JceTimeOfDayState *tod,
+    const float              authored_color[3],
+    float                    authored_density,
+    float                    out_color[3],
+    float                   *out_density);
+
+/* Exposure multiplier for this moment.  Returns `authored_exposure` when the
+ * cycle is inactive. */
+JCE_API float JCE_CALL jce_time_of_day_resolve_exposure(
+    const JceTimeOfDayState *tod, float authored_exposure);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_TIME_OF_DAY_H */

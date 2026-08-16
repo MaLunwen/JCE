@@ -9,6 +9,7 @@
 #define JCE_TEX_COMPRESS_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -52,6 +53,27 @@ void jce_tex_mip_dimensions(uint32_t base_w, uint32_t base_h,
  */
 void jce_tex_generate_mip(const uint8_t *src, uint32_t src_w, uint32_t src_h,
                           uint8_t *dst, uint32_t *dst_w, uint32_t *dst_h);
+
+/*
+ * As above, but `srgb` selects the space the 2x2 average is taken in.
+ *
+ * true  -- the texels are sRGB-ENCODED colour: decode to linear, average,
+ *          re-encode.  This is what a mipmap of an albedo or emissive map
+ *          must do, and the difference is a function of local contrast: flat
+ *          regions are identical either way, while a 2x2 of {255,255,0,0}
+ *          averages to 127 raw and 188 correctly.
+ * false -- the texels are LINEAR DATA: normal, metallic-roughness, occlusion,
+ *          height, masks, LUTs.  Average the bytes as they are.  Decoding
+ *          these would corrupt values that are currently right, which is why
+ *          the plain jce_tex_generate_mip above keeps this behaviour and the
+ *          caller must opt in rather than out.
+ *
+ * Alpha is averaged linearly in BOTH modes: sRGB describes colour channels,
+ * and alpha is coverage.
+ */
+void jce_tex_generate_mip_ex(const uint8_t *src, uint32_t src_w, uint32_t src_h,
+                             uint8_t *dst, uint32_t *dst_w, uint32_t *dst_h,
+                             bool srgb);
 
 /* ================================================================== */
 /* GPU block compression (implemented in jce_tex_encode.cpp via bimg)  */

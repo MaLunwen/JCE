@@ -7,6 +7,9 @@
  * queries afterwards are lock-free reads of an append-only table.
  */
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include "jce_component_registry_internal.h"
 
 #include <jce/os/core/jce_log.h>
@@ -29,14 +32,29 @@ static int g_flag_to_id[64] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 };
 
+/* Index of the single set bit, or -1 for zero / multi-bit.
+ *
+ * The shift-until-set loop this replaces ran once per bit position, so a
+ * high-numbered flag cost proportionally more -- and it sits on the per-entity
+ * path: every jce_scene_component_enabled call converts a compile-time flag
+ * back to an id through here, ~27k times a frame in the submit loop alone.
+ * Counting trailing zeros is one instruction on every target JCE builds for. */
 static int flag_bit_index(uint64_t single_bit_flag)
 {
     if (single_bit_flag == 0 ||
         (single_bit_flag & (single_bit_flag - 1)) != 0)
         return -1;   /* zero or multi-bit mask */
+#if defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward64(&idx, single_bit_flag);
+    return (int)idx;
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(single_bit_flag);
+#else
     int i = 0;
     while ((single_bit_flag & 1) == 0) { single_bit_flag >>= 1; i++; }
     return i;
+#endif
 }
 
 /* ── Registration ─────────────────────────────────────────────────── */

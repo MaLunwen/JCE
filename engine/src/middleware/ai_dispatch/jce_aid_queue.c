@@ -203,9 +203,19 @@ static int queue_ensure(void)
     }
     g_q.mutex = jce_mutex_create();
     g_q.cond  = jce_cond_create();
-    if (!g_q.mutex || !g_q.cond) return 0;
+    if (!g_q.mutex || !g_q.cond) {
+        if (g_q.cond) jce_cond_destroy(g_q.cond);
+        if (g_q.mutex) jce_mutex_destroy(g_q.mutex);
+        memset(&g_q, 0, sizeof(g_q));
+        return 0;
+    }
     g_q.worker = jce_thread_create(worker_main, NULL, "jce_aid_worker");
-    if (!g_q.worker) return 0;
+    if (!g_q.worker) {
+        jce_cond_destroy(g_q.cond);
+        jce_mutex_destroy(g_q.mutex);
+        memset(&g_q, 0, sizeof(g_q));
+        return 0;
+    }
     g_q.alive = 1;
     return 1;
 }

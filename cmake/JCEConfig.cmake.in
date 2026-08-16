@@ -36,7 +36,8 @@ endif()
 # jce_add_pak() uses jce_cook+jce_pak+jce_bin2obj to cook+pack+embed
 # real assets without the editor; the packaged editor instead passes
 # prebuilt artifacts through JCE_PROJECT_PREBUILT_* variables.
-foreach(_jce_tool_pair "PAK;jce_pak" "BIN2OBJ;jce_bin2obj" "COOK;jce_cook")
+foreach(_jce_tool_pair "PAK;jce_pak" "BIN2OBJ;jce_bin2obj" "COOK;jce_cook"
+		"SHADERC;shaderc")
 	list(GET _jce_tool_pair 0 _jce_tool_up)
 	list(GET _jce_tool_pair 1 _jce_tool_name)
 	find_program(JCE_${_jce_tool_up}_EXECUTABLE
@@ -48,6 +49,12 @@ endforeach()
 unset(_jce_tool_pair)
 unset(_jce_tool_up)
 unset(_jce_tool_name)
+
+if(IS_DIRECTORY "${_jce_share_dir}/shader_include")
+	set(JCE_BGFX_SHADER_INCLUDE_PATH "${_jce_share_dir}/shader_include")
+	set(JCE_SHADER_INCLUDE_PATH "${_jce_share_dir}/shader_include")
+	set(BGFX_SHADER_INCLUDE_PATH "${JCE_BGFX_SHADER_INCLUDE_PATH}")
+endif()
 
 # All three found -> jce_add_pak() can cook+pack+embed turnkey. A cross
 # SDK consumed on a DIFFERENT OS than it was built on will not find the
@@ -294,5 +301,63 @@ set(JCE_FOUND        TRUE)
 
 # ---- SDK helpers (jce_target_embed_pak, …). ----------------------- #
 include("${CMAKE_CURRENT_LIST_DIR}/JCESDKHelpers.cmake" OPTIONAL)
+
+# ---- The scripting layer, when this SDK shipped one. --------------- #
+# Declares JCE::ScriptApi / JCE::ScriptVm{Cpp,Python,Java}, their in-tree
+# aliases (jce_script_vm_python, …) and the runtime paths a game must hand
+# each backend.  Generated and installed by scripting/cmake/.
+#
+# OPTIONAL, and the reason is not hypothetical: EVERY SDK PRODUCED BEFORE
+# 2026-08-16 HAS NO SUCH FILE.  There is one on this machine
+# (dist/sdk/win32-x86_64, commit d3ecc452 — a tree with no scripting/ in it
+# at all), and a non-optional include would turn every such SDK from
+# "engine-only" into "broken".  The same holds for any checkout where the
+# scripting/ sibling is absent.
+#
+# It is included HERE, after JCE::JCE exists, because every VM
+# archive links it — and BEFORE check_required_components, which is what
+# turns find_package(JCE COMPONENTS ScriptPython) on an SDK that cannot run
+# Python into a named failure instead of a target that silently is not there.
+#
+# It names a FILE and not a target or a path in scripting/, which is what
+# keeps check_dependency_boundaries.py's engine -> scripting
+# direction rule intact: the install rules themselves live in scripting/.
+include("${CMAKE_CURRENT_LIST_DIR}/JCEScripting.cmake" OPTIONAL)
+
+# ---- Why a Script* component is missing, IN WORDS. ----------------- #
+# check_required_components() below is CMake's stock macro and it does exactly
+# one thing: set JCE_FOUND FALSE.  It sets no reason, so a project asking for
+# COMPONENTS ScriptPython against an SDK that cannot run Python gets
+#
+#     Found package configuration file: .../JCEConfig.cmake
+#     but it set JCE_FOUND to FALSE so package "JCE" is considered NOT FOUND.
+#
+# and nothing else — measured, against dist/sdk/win32-x86_64.  That is louder
+# than the silence it replaced (a target that simply was not there) and still
+# does not say whether the SDK lacks the backend, the consumer lacks a
+# CPython, or the component name is a typo.  JCE_NOT_FOUND_MESSAGE is printed
+# by CMake as "Reason given by package:", so the reason travels with the
+# refusal.
+foreach(_jce_comp IN LISTS JCE_FIND_COMPONENTS)
+	if(_jce_comp MATCHES "^Script" AND NOT JCE_${_jce_comp}_FOUND)
+		if(NOT JCE_SCRIPTING_FOUND)
+			string(APPEND JCE_NOT_FOUND_MESSAGE
+				"component ${_jce_comp}: this SDK ships NO scripting layer — "
+				"there is no lib/cmake/JCE/JCEScripting.cmake in it. Either it "
+				"was produced before 2026-08-16, when the SDK installed "
+				"nothing from scripting/, or from a tree without that "
+				"directory. Rebuild it; for Python you also need an embeddable "
+				"CPython at SDK-build time (Python3 COMPONENTS "
+				"Development.Embed), and for Java -DJCE_BUILD_SCRIPT_JAVA=ON. ")
+		else()
+			string(APPEND JCE_NOT_FOUND_MESSAGE
+				"component ${_jce_comp}: this SDK's scripting layer offers "
+				"'${JCE_SCRIPT_LANGUAGES}' — see the JCE scripting STATUS "
+				"lines above for what was missing on THIS machine (a matching "
+				"CPython, a JVM, the shipped classes). ")
+		endif()
+	endif()
+endforeach()
+unset(_jce_comp)
 
 check_required_components(JCE)

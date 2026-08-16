@@ -195,12 +195,26 @@ void parse_water(JceScene *s, JceEntity e, const cJSON *c)
     w.color_deep[1]    = (float)j_num(c, "deepG", 0.1);
     w.color_deep[2]    = (float)j_num(c, "deepB", 0.2);
     w.transparency     = (float)j_num(c, "transparency", 0.5);
+    /* Default 0 = absorption off: an authored scene must keep rendering as
+     * authored until someone opts in. */
+    w.clarity          = (float)j_num(c, "clarity", 0.0);
+    w.caustics         = (float)j_num(c, "caustics", 0.0);
+    w.shore_foam_m     = (float)j_num(c, "shoreFoam", 0.0);
+    w.shore_surge_s    = (float)j_num(c, "shoreSurge", 0.0);
     w.sun_specular     = (float)j_num(c, "sunSpecular", 1.0);
     /* Stylized extras default to 0 (off) so pre-existing scenes render and
      * round-trip byte-identically. */
     w.shore_ripple     = (float)j_num(c, "shoreRipple", 0.0);
     w.ice_ratio        = (float)j_num(c, "iceRatio", 0.0);
     w.splash_ratio     = (float)j_num(c, "splashRatio", 0.0);
+    /* Absent => false => byte-identical to every scene authored before this
+     * field existed, which is the whole reason it defaults off. */
+    w.depth_write      = j_bool(c, "depthWrite", false);
+    /* Absent => 0 => Phillips, so every scene authored before this existed
+     * round-trips byte-identically. */
+    w.ocean            = j_bool(c, "ocean", false);
+    w.fft_fetch        = (float)j_num(c, "fftFetch", 0.0);
+    w.fft_swell        = (float)j_num(c, "fftSwell", 0.0);
     copy_str(w.data_tex, sizeof(w.data_tex), j_str(c, "dataTex", ""));
     w.visible          = j_bool(c, "visible", true);
 
@@ -389,10 +403,18 @@ static void ser_water(const JceWaterComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "deepG", c->color_deep[1]);
     cJSON_AddNumberToObject(o, "deepB", c->color_deep[2]);
     cJSON_AddNumberToObject(o, "transparency", c->transparency);
+    cJSON_AddNumberToObject(o, "clarity", c->clarity);
+    cJSON_AddNumberToObject(o, "caustics", c->caustics);
+    cJSON_AddNumberToObject(o, "shoreFoam", c->shore_foam_m);
+    cJSON_AddNumberToObject(o, "shoreSurge", c->shore_surge_s);
     cJSON_AddNumberToObject(o, "sunSpecular", c->sun_specular);
     cJSON_AddNumberToObject(o, "shoreRipple", c->shore_ripple);
     cJSON_AddNumberToObject(o, "iceRatio", c->ice_ratio);
     cJSON_AddNumberToObject(o, "splashRatio", c->splash_ratio);
+    cJSON_AddBoolToObject(o, "depthWrite", c->depth_write);
+    cJSON_AddBoolToObject(o, "ocean", c->ocean);
+    cJSON_AddNumberToObject(o, "fftFetch", c->fft_fetch);
+    cJSON_AddNumberToObject(o, "fftSwell", c->fft_swell);
     if (c->data_tex[0])
         cJSON_AddStringToObject(o, "dataTex", c->data_tex);
     cJSON_AddBoolToObject  (o, "visible", c->visible);

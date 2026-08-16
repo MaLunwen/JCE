@@ -37,17 +37,93 @@ JCE_API void JCE_CALL jce_log_init(void);
    Call once at engine shutdown.  Safe to call if init was never called. */
 JCE_API void JCE_CALL jce_log_shutdown(void);
 
-/* Synchronously drain the ring buffer to stderr / log file.
-   Use in crash handlers before re-raising the signal. */
+/* Fence the backend so records queued before this call reach stderr / file.
+   Safe with concurrent producers.  Crash-path waits are bounded, so the call
+   becomes best-effort if the backend itself is unavailable. */
 JCE_API void JCE_CALL jce_log_flush(void);
 
 /* Runtime configuration. */
 JCE_API void JCE_CALL jce_log_set_level(JceLogLevel level);
 JCE_API void JCE_CALL jce_log_set_colors(bool enabled);
 
+/* -- File sink: persistence with a bounded, compressed history ------
+ *
+ * The live log stays plain text — no ANSI, no framing, no compression — so it
+ * needs no tool to read.  NOT, on Windows, while the sink is open: SDL opens a
+ * writable file with a share mode of 0 (SDL_iostream.c, CreateFileW), so the
+ * live file is exclusive to this process until jce_log_set_file(NULL) or
+ * jce_log_shutdown() releases it.  That is pre-existing behaviour of the sink,
+ * recorded here because "plain text" otherwise reads as "tailable" and on
+ * Windows it is not.  Rotated generations are closed files and always readable.
+ *
+ * The live log is not allowed to grow without limit: once it passes
+ * `max_bytes` the backend closes it, moves it aside as generation 1, shifts
+ * the older generations down and reopens a fresh live file.  Generation
+ * `max_files` is deleted, so the directory holds at most `max_files` rotated
+ * files plus the live one.
+ *
+ * Rotated generations are compressed with zstd and named "<path>.N.zst".
+ * If compression fails for any reason the generation is still kept, renamed
+ * to "<path>.N" with no ".zst" suffix — losing a log is worse than storing it
+ * uncompressed.  Both spellings participate in the shift and in the deletion
+ * of the oldest, so a mixed directory is still bounded.
+ *
+ * Costs, stated so nothing here is a surprise:
+ *   - Rotation runs on the log backend thread while the file lock is held.
+ *     Producers do not block on it: they only enqueue into the ring buffer.
+ *     The exception is the synchronous fallback path (before jce_log_init(),
+ *     after jce_log_shutdown()), where the calling thread IS the emitter and
+ *     therefore pays for the rotation itself.  Either way log IO pauses for
+ *     the duration of one compress, and a long enough pause fills the ring,
+ *     which drops records — that is why the level here is 3, not 9.
+ *   - Compression buffers the whole rotated file in memory, twice: once raw,
+ *     once compressed.  `max_bytes` therefore also sizes that allocation, and
+ *     it has NO upper clamp — do not set it larger than you will allocate.
+ *   - There is no per-line stat(): the sink counts the bytes it writes.
+ *
+ * On Emscripten there is no file sink at all and all of this is compiled out;
+ * jce_log_set_file/_ex are no-ops and jce_log_get_file_config returns false.
+ */
+
+/* Defaults applied when a field is 0 / the config pointer is NULL.  These are
+   the values the implementation uses — jce_log_get_file_config() reports the
+   effective config back, so the numbers below are checkable, not just claimed
+   (tests/os/core/test_jce_log_rotation.c asserts them). */
+#define JCE_LOG_FILE_DEFAULT_MAX_BYTES  (8u * 1024u * 1024u)  /* 8 MiB     */
+#define JCE_LOG_FILE_DEFAULT_MAX_FILES  4u                    /* + live    */
+
+/* Floor on max_bytes.  A smaller request is RAISED to this, because a
+   threshold below one line would rotate on every record.  Enforced in
+   jce_log_set_file_ex() and observable through jce_log_get_file_config(). */
+#define JCE_LOG_FILE_MIN_MAX_BYTES      1024u
+
+/* Ceiling on max_files.  A larger request is LOWERED to this. */
+#define JCE_LOG_FILE_MAX_MAX_FILES      64u
+
+typedef struct JceLogFileConfig {
+    uint64_t max_bytes;   /* rotate once the live file reaches this size  */
+    uint32_t max_files;   /* rotated generations to keep (live excluded)  */
+    bool     compress;    /* zstd-compress rotated generations            */
+} JceLogFileConfig;
+
 /* Enable persistent file output (plain text, no ANSI).
-   Pass NULL to close the current log file. */
+   Pass NULL to close the current log file.
+   Equivalent to jce_log_set_file_ex(path, NULL): rotation is ON with the
+   defaults above.  An unbounded log directory is the failure this sink is
+   meant to avoid, so there is deliberately no "never rotate" setting. */
 JCE_API void JCE_CALL jce_log_set_file(const char *path);
+
+/* As jce_log_set_file(), with explicit rotation settings.  `cfg` is copied;
+   NULL or a zero field means "use the default".  The config applies to the
+   file opened by THIS call and is replaced by the next one. */
+JCE_API void JCE_CALL jce_log_set_file_ex(const char *path,
+                                          const JceLogFileConfig *cfg);
+
+/* Report the config the sink is actually using, after defaults and clamping.
+   Returns true iff a log file is currently open.  *out is filled either way:
+   with the pending/last config when no file is open, and zeroed on platforms
+   that have no file sink.  Returns false and touches nothing if out is NULL. */
+JCE_API bool JCE_CALL jce_log_get_file_config(JceLogFileConfig *out);
 
 /* Set the display name for the calling thread (e.g. "MAIN", "RENDER").
  * Must be called per-thread; defaults to the numeric thread ID. */
@@ -88,7 +164,7 @@ typedef struct JceLogRecord {
     int         line;
     const char *thread_name;  /* display name of the ORIGINATING thread     */
     uint64_t    timestamp_ms; /* monotonic ms (jce_time_ticks_ms) at LOG_*  */
-    int64_t     wall_epoch_s; /* Unix epoch seconds, resolved at emit time  */
+    int64_t     wall_epoch_s; /* Unix epoch seconds at producer enqueue     */
 } JceLogRecord;
 
 typedef void (*JceLogSinkFn)(const JceLogRecord *rec, void *user);

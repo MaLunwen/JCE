@@ -23,6 +23,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
@@ -100,7 +101,7 @@ struct JceMutexGuard {
 /* ── Shared async-loader scaffold ──────────────────────────────── */
 
 /*
- * The mesh and texture caches each own one worker thread that drains a
+ * The mesh and texture caches each own one persistent worker thread that drains a
  * `pending` request queue and publishes results the main thread finalizes
  * under a per-frame budget.  Only the decode step and the finalize step
  * differ, so the worker / mutex / condvar / queue / generation plumbing
@@ -151,11 +152,23 @@ enum AsyncFinalizeAction {
  * Callers guard on `running` themselves so a second start cannot reset
  * state a live worker is using. */
 template <typename State>
-void async_loader_start(State &st, JceThreadFn worker_main,
+bool async_loader_start(State &st, JceThreadFn worker_main,
                         const char *thread_name)
 {
     if (!st.mutex) st.mutex = jce_mutex_create();
     if (!st.cv)    st.cv    = jce_cond_create();
+    if (!st.mutex || !st.cv) {
+        if (st.cv) {
+            jce_cond_destroy(st.cv);
+            st.cv = NULL;
+        }
+        if (st.mutex) {
+            jce_mutex_destroy(st.mutex);
+            st.mutex = NULL;
+        }
+        st.running = false;
+        return false;
+    }
 
     st.next_order = 0;
     st.generation = 1;
@@ -164,19 +177,30 @@ void async_loader_start(State &st, JceThreadFn worker_main,
     st.completed.clear();
 
     st.worker = jce_thread_create(worker_main, NULL, thread_name);
+    if (!st.worker) {
+        jce_cond_destroy(st.cv);
+        jce_mutex_destroy(st.mutex);
+        st.cv = NULL;
+        st.mutex = NULL;
+        st.running = false;
+        return false;
+    }
     st.running = true;
+    return true;
 }
 
-/* Asks the worker to finish, wakes it and joins it before the queues are
- * cleared — that ordering is what keeps the worker from writing into
- * state the caller is tearing down.  `on_discard` releases the payload of
- * results nobody finalized (results that own their memory need none). */
+/* Stops accepting queued work, drops requests that have not started, and
+ * joins the current decode before clearing completed results. This bounds
+ * project-switch and editor-shutdown latency without abandoning a worker
+ * that can still publish into the state. `on_discard` releases payloads
+ * that nobody finalized. */
 template <typename State, typename DiscardFn>
 void async_loader_stop(State &st, DiscardFn on_discard)
 {
     {
         JceMutexGuard lock(st.mutex);
         st.stop = true;
+        st.pending.clear();
     }
     jce_cond_broadcast(st.cv);
 
@@ -188,7 +212,6 @@ void async_loader_stop(State &st, DiscardFn on_discard)
     for (auto &res : st.completed)
         on_discard(res);
 
-    st.pending.clear();
     st.completed.clear();
     st.running = false;
 
@@ -382,13 +405,12 @@ typedef AsyncLoaderState<TextureLoadRequest, TextureLoadResult> TextureAsyncStat
 
 extern TextureAsyncState s_tex_async;
 
-/* ── Material async types + state (thread-pool based) ───────────── */
+/* ── Material async types + state (structured executor) ─────────── */
 
 /* Not an AsyncLoaderState: material extraction owns no thread and no
- * condvar, submits tracked tasks to a JceThreadPool instead of a pending
- * queue, has no per-frame finalize budget, and its results are *pulled* by
- * the caller (material_take_completed_result) rather than applied into a
- * cache.  Nothing of the worker scaffold above fits it. */
+ * condvar, submits independent jobs to a bounded JceAsyncExecutor instead
+ * of a pending queue, has no per-frame finalize budget, and its results are
+ * pulled by the caller rather than applied into a cache. */
 
 struct MaterialAsyncContext {
     uint32_t              entity_id;
@@ -400,12 +422,12 @@ struct MaterialAsyncContext {
 };
 
 struct MaterialInFlightTask {
-    JceTask              *task;
+    JceAsyncTask         *task;
     MaterialAsyncContext *context;
 };
 
 struct MaterialAsyncState {
-    JceThreadPool                              *pool;
+    JceAsyncExecutor                           *executor;
     JceMutex                                   *mutex;
     std::vector<MaterialInFlightTask>           inflight;
     std::vector<JceEditorMaterialExtractResult> completed;

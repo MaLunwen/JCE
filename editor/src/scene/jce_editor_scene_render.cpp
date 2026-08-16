@@ -7,6 +7,7 @@
  * hover, physics debug) and the editor's PostFX bloom/tonemap chain.
  */
 
+#include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_filesystem.h>
 
@@ -19,7 +20,8 @@
 #include "ui/jce_editor_panels.h"
 
 #include <cstdio>
-#include <cstdlib>   /* getenv for JCE_STREAM_SYNC bench toggle (M2) */
+#include <cstdlib>
+#include <cstring>   /* getenv for JCE_STREAM_SYNC bench toggle (M2) */
 
 extern "C" {
 #include <jce/middleware/animation/jce_animation.h>
@@ -327,7 +329,8 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
      * resolve reads the fully composited bridge. Non-fatal: absence just falls
      * back to ImGui bilinear upscale. */
     s_sr.present = jce_offscreen_target_create(
-        renderer, (uint16_t)(JCE_VIEW_EDITOR_SCENE + JCE_VIEW_POST_BASE + 23));
+        renderer, (uint16_t)(JCE_VIEW_EDITOR_SCENE +
+                             JCE_EDITOR_VP_UPSCALE_OFFSET));
     s_sr.present_tex = UINT16_MAX;
     if (!s_sr.present)
         LOG_WARN(LOG_TAG, "failed to create editor upscale target (RCAS disabled)");
@@ -540,11 +543,6 @@ void jce_editor_scene_render_shutdown(void)
         jce_world_streamer_destroy(s_sr.world_streamer);
         s_sr.world_streamer = NULL;
     }
-    /* After the streamer (which joins in-flight chunk tasks) — never before. */
-    if (s_sr.stream_pool) {
-        jce_thread_pool_destroy(s_sr.stream_pool);
-        s_sr.stream_pool = NULL;
-    }
     if (s_sr.stream_fs) {
         jce_fs_destroy(s_sr.stream_fs);
         s_sr.stream_fs = NULL;
@@ -585,12 +583,6 @@ void jce_editor_scene_render_streaming_teardown(void)
         /* Re-show all HLOD proxies so the master skyline is whole again once
          * the preview streamer is gone (no chunk is resident to hide them). */
         jce_state_detach_streamer_hlod();
-    }
-    /* Destroy the worker pool only AFTER the streamer has joined its in-flight
-     * chunk tasks, so no worker can still be reading the fs we free below. */
-    if (s_sr.stream_pool) {
-        jce_thread_pool_destroy(s_sr.stream_pool);
-        s_sr.stream_pool = NULL;
     }
     if (s_sr.stream_fs) {
         jce_fs_destroy(s_sr.stream_fs);
@@ -676,31 +668,15 @@ void jce_editor_scene_render_streaming_rebuild(void)
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
 
-    /* Async chunk loads: disk read + JSON staging off-thread; the apply/spawn
-     * stays time-sliced on the main thread (jce_world_streamer_update).  Web
-     * has no real threads, so keep the cooperative single-thread path there.
-     *
-     * Private for the same reason as the Play streamer (jce_editor_play.cpp):
-     * a whole-file chunk read on the shared pool becomes something the scene
-     * view's own per-frame parallel_for can be handed mid-wait.  This preview
-     * streamer is the one that runs while the viewport is live, so it is the
-     * one that would show the hitch. */
-    JceThreadPool *pool = NULL;
-#if !JCE_PLATFORM_WEB
-    /* Bench/diagnostic toggle (M2 A/B): mirror the editor-Play JCE_STREAM_SYNC
-     * gate so the scene-view preview streamer uses the same sync/async path as
-     * the Play streamer (see jce_editor_play.cpp). */
+    /* WorldStreamer owns its bounded structured executor. The diagnostic
+     * switch selects cooperative execution without allocating an idle pool. */
     {
         const char *ss = getenv("JCE_STREAM_SYNC");
-        if (!(ss && ss[0] && ss[0] != '0'))
-            pool = jce_thread_pool_create(3);
+        wsc.single_thread = ss && ss[0] && ss[0] != '0';
     }
-#endif
-    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
 
-    JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, pool);
+    JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, NULL);
     if (!ws) {
-        if (pool) jce_thread_pool_destroy(pool);
         jce_fs_destroy(fs);
         LOG_WARN(LOG_TAG, "world streamer creation failed (preview disabled)");
         return;
@@ -709,7 +685,6 @@ void jce_editor_scene_render_streaming_rebuild(void)
 
     s_sr.world_streamer = ws;
     s_sr.stream_fs      = fs;
-    s_sr.stream_pool    = pool;
     /* Mirror streamed chunk entities into the editor hierarchy/selection so
      * they are first-class (listed in the Hierarchy panel, selectable). */
     jce_state_attach_streamer_hierarchy(ws);
@@ -745,8 +720,19 @@ void jce_editor_scene_render_streaming_autostart(void)
  * (jce_editor_scene_render_screenshot sizes its read-back staging to match). */
 static uint16_t s_cap_w = 0, s_cap_h = 0;
 
+/* Sub-attribution of the editor-side viewport frame: ed_sv_vp measured 9.87 ms
+ * against the engine's scene_render at 6.77 ms, so ~3.1 ms/frame is spent here,
+ * around the engine call.  ~10 marks per frame - free at this granularity. */
+static inline void ed_vp_mark(const char *name, uint64_t *t)
+{
+    uint64_t now = jce_time_perf_counter();
+    jce_perf_phase_add(name, jce_time_perf_to_ms(*t, now));
+    *t = now;
+}
+
 void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 {
+    uint64_t _vpt = jce_time_perf_counter();
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
 
@@ -879,7 +865,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         }
     }
 
+    ed_vp_mark("evp_head", &_vpt);
     jce_editor_scene_camera_update(dt_sec);
+    ed_vp_mark("evp_camera", &_vpt);
 
     float aspect = (float)width / (float)height;
 
@@ -888,7 +876,12 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     memcpy(s_sr.cached_view, view.raw[0], sizeof(s_sr.cached_view));
     memcpy(s_sr.cached_proj, proj.raw[0], sizeof(s_sr.cached_proj));
 
-    /* TAA (r.taa, default OFF): when active, sub-pixel-jitter the colour
+    /* TAA (r.taa; the DEFAULT is tier >= MEDIUM && has_discrete_gpu, see
+     * jce_scene_renderer.c's cvar registration -- so it is ON, not off, on any
+     * discrete-GPU machine.  This said "default OFF", which is the kind of
+     * stale sentence that turns a measurement into a wrong conclusion: it made
+     * a 19% frame-to-frame residual difference look like it could not be TAA.)
+     * When active, sub-pixel-jitter the colour
        pass's projection and arm the engine PostFX pipeline's TAA resolve.
        When OFF this returns false and leaves color_proj == proj, so the
        prepare/render path is byte-identical to the legacy FXAA path. The
@@ -995,7 +988,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         return;
     }
 
+    ed_vp_mark("evp_target", &_vpt);
     jce_editor_scene_asset_cache_finalize();
+    ed_vp_mark("evp_assetcache", &_vpt);
 
     /* Engine renders sky, shadows, entities, and PostFX into the bridge view.
      * PostFX is driven via the engine's pipeline (same one the panel controls). */
@@ -1017,6 +1012,12 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.view_mode = JCE_SCENE_VIEW_METALLIC; break;
     case JCE_VIEW_AO:
         cfg.view_mode = JCE_SCENE_VIEW_AO; break;
+    case JCE_VIEW_SCENE_DEPTH:
+        cfg.view_mode = JCE_SCENE_VIEW_SCENE_DEPTH; break;
+    case JCE_VIEW_SHADOW_CASCADES:
+        cfg.view_mode = JCE_SCENE_VIEW_SHADOW_CASCADES; break;
+    case JCE_VIEW_SHADOW_MASK:
+        cfg.view_mode = JCE_SCENE_VIEW_SHADOW_MASK; break;
     case JCE_VIEW_SHADED:
     default:
         cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
@@ -1028,8 +1029,59 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * stress in the default view never exercises the gpu-scene instanced-model /
      * Hi-Z path. Forcing SHADED engages instancing exactly as runtime does. */
     if (const char *vm = std::getenv("JCE_DBG_VIEW_MODE")) {
-        if (vm[0] == 's') cfg.view_mode = JCE_SCENE_VIEW_SHADED;
+        /* Every view mode reachable by name.
+         *
+         * A debug view only a human clicking a menu can select cannot be part
+         * of a measurement, and a PARTIAL table is worse than none: the first
+         * version accepted shaded/depth/cascades/shadowmask, so asking for
+         * "normals" silently rendered the default view and the capture looked
+         * like a normals buffer that happened to be shaded. Longest match
+         * first, because "shaded", "shadowcascades" and "shadowmask" share a
+         * prefix, and an unrecognised name is refused rather than ignored. */
+        static const struct { const char *name; JceSceneViewModeKind mode; } kModes[] = {
+            { "wireframetextured", JCE_SCENE_VIEW_WIREFRAME_TEXTURED },
+            { "shadowcascades",    JCE_SCENE_VIEW_SHADOW_CASCADES    },
+            { "shadowmask",        JCE_SCENE_VIEW_SHADOW_MASK        },
+            { "scenedepth",        JCE_SCENE_VIEW_SCENE_DEPTH        },
+            { "cascades",          JCE_SCENE_VIEW_SHADOW_CASCADES    },
+            { "wireframe",         JCE_SCENE_VIEW_WIREFRAME          },
+            { "roughness",         JCE_SCENE_VIEW_ROUGHNESS          },
+            { "metallic",          JCE_SCENE_VIEW_METALLIC           },
+            { "textured",          JCE_SCENE_VIEW_TEXTURED           },
+            { "normals",           JCE_SCENE_VIEW_NORMALS            },
+            { "shaded",            JCE_SCENE_VIEW_SHADED             },
+            { "depth",             JCE_SCENE_VIEW_SCENE_DEPTH        },
+            { "mask",              JCE_SCENE_VIEW_SHADOW_MASK        },
+            { "ao",                JCE_SCENE_VIEW_AO                 },
+        };
+        bool matched = false;
+        for (const auto &m : kModes) {
+            if (std::strcmp(vm, m.name) == 0) { cfg.view_mode = m.mode; matched = true; break; }
+        }
+        if (!matched)
+            std::fprintf(stderr, "JCE_DBG_VIEW_MODE=%s is not a view mode; "
+                                 "leaving the current view\n", vm);
     }
+
+    /* Debug views bypass post-processing -- ALL of them, from NORMALS on.
+     *
+     * These three write a colour that MEANS something -- a cascade index, a
+     * shadow factor, a depth bucket -- and tonemapping plus exposure plus the
+     * gamma encode turn it into a different colour. That is fine for a picture
+     * and fatal for a readout: the first attempt to count cascade coverage from
+     * this view classified 0.29% of the ground because the tints it was looking
+     * for had been graded away. A view whose colours are data must deliver the
+     * data.
+     *
+     * Extended to cover the material channels (normals, roughness, metallic,
+     * AO) as well, which had been shipping through the tonemapper since they
+     * were added. A normal encoded as N*0.5+0.5 and then graded is not a
+     * normal any more -- it still LOOKS like a normal buffer, which is why
+     * nobody noticed, and it cannot be decoded back to a direction. The first
+     * attempt to use it here to hold N.L constant would have measured the
+     * tonemapper. */
+    if (cfg.view_mode >= JCE_SCENE_VIEW_NORMALS)
+        cfg.apply_postfx = false;
 
     /* Wire the editor's Show menu flags into engine config so toggles
        actually take effect. */
@@ -1053,7 +1105,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     /* Bridge FBO, panel resolution, volumetric fog, SSR and GI — the plumbing
      * that must be identical on both editor render paths (see
      * jce_editor_viewport_common.h). */
-    jce_editor_viewport_apply_shared_config(&cfg, s_sr.bridge, width, height);
+    jce_editor_viewport_apply_shared_config(&cfg, s_sr.bridge, width, height,
+                                            jce_state_get_scene());
+    ed_vp_mark("evp_cfg", &_vpt);
 
     cfg.viewport_id = 1;   /* Scene viewport slot (Game = 0): own TAA prev camera */
 
@@ -1099,10 +1153,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
              * (base+17/+18) coexist below it.  Default is the absolute
              * JCE_VIEW_POST_BASE, which == base+17 for the scene base (3) and
              * would collide with SSR. */
-            jce_postfx_set_view_base(pf,
-                (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE));
-            if (jce_offscreen_target_is_hdr(s_sr.bridge))
-                jce_postfx_enable(pf, JCE_POSTFX_TONEMAP, true);
+            jce_postfx_set_view_base(pf, (uint16_t)(
+                scene_view_id() + JCE_EDITOR_VP_POSTFX_BASE_OFFSET));
+            /* The "HDR target => force tonemap" rule used to live here, before
+             * jce_scene_renderer_render.  That call rewrites every postfx
+             * enable flag from scene_rendering->postfx_enabled[], so the force
+             * was stomped and never took effect -- dead code that read as
+             * protection.  It now runs after the render, next to any_effect,
+             * matching the runtime and the Game View. */
         }
     }
 
@@ -1113,6 +1171,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         jce_editor_viewport_apply_ambient_override(s_sr.scene_renderer);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
+        ed_vp_mark("evp_scene_render", &_vpt);
 
         /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1): log the scene-view
          * culler stats every 60 frames so a headless A/B run can confirm the
@@ -1145,6 +1204,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
          * pixel-exact even when the color pass is downscaled by dynamic res. */
         jce_scene_pick_render(s_sr.pick_pass, scene, s_sr.camera,
                               disp_w, disp_h);
+        ed_vp_mark("evp_pick", &_vpt);
     }
 
     /* Composite volumetric fog (base+16) and SSR (base+19) into the bridge
@@ -1154,6 +1214,11 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * relocated to base+JCE_VIEW_POST_BASE so base+16/+19 stay free below it. */
     jce_editor_viewport_composite_fog_ssr(s_sr.scene_renderer, s_sr.bridge,
                                           scene_view_id(), cfg.fog_enabled);
+    const bool fullscreen_composited =
+        jce_editor_viewport_apply_fullscreen_effects(
+            s_sr.scene_renderer, scene, s_sr.camera, s_sr.bridge,
+            scene_view_id(), 1, width, height, dt_sec);
+    ed_vp_mark("evp_composite", &_vpt);
 
     /* Tick the world streamer each frame so pending chunk loads are applied
        to the scene synchronously on the main/render thread. */
@@ -1171,10 +1236,12 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
          * jce_editor_play.cpp) so gameplay streaming is unaffected. */
         jce_vec3 focus = s_sr.orbit_target;
         jce_world_streamer_update(s_sr.world_streamer, focus);
+        ed_vp_mark("evp_streamer", &_vpt);
         /* If preview-streaming just unloaded a chunk the user had a streamed
          * object selected from, drop the now-dead id so the gizmo/inspector
          * never touch it (mirrors the Play-tick prune). */
         jce_state_prune_dead();
+        ed_vp_mark("evp_prune", &_vpt);
     }
 
     /* ── 0.5.7 ordering: scene → overlays → PostFX ─────────────────────
@@ -1188,7 +1255,18 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * resolves to bridge view since s_view_id_override is unset). Grid is
      * NOT drawn here — it runs via on_after_sky callback BEFORE entities,
      * mirroring 0.5.7 ordering exactly. */
+    if (fullscreen_composited &&
+        jce_offscreen_target_prepare_overlay_view(
+            s_sr.bridge,
+            (uint16_t)(scene_view_id() + JCE_EDITOR_VP_OVERLAY_OFFSET),
+            view.raw[0], proj.raw[0], "EditorSceneOverlay")) {
+        s_view_id_override = (uint16_t)(
+            scene_view_id() + JCE_EDITOR_VP_OVERLAY_OFFSET);
+    }
+
+    ed_vp_mark("evp_render", &_vpt);
     draw_selection_outlines();
+    ed_vp_mark("evp_outlines", &_vpt);
     if (jce_state_get_show_physics_debug()) {
         draw_physics_debug();
         /* Selected compound collider's fitted wireframe is part of the collider
@@ -1203,9 +1281,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         draw_cloth_gizmos();
     }
     draw_navmesh_overlay();
+    ed_vp_mark("evp_navmesh", &_vpt);
     draw_streaming_overlay();
+    ed_vp_mark("evp_streaming", &_vpt);
     draw_hover_highlight();
+    ed_vp_mark("evp_hover", &_vpt);
     draw_ghost_entity();
+    ed_vp_mark("evp_ghost", &_vpt);
+    s_view_id_override = UINT16_MAX;
 
     /* Apply the engine PostFX pipeline AFTER overlays so they receive
      * tonemapping along with the scene (matches 0.5.7 behavior). */
@@ -1224,6 +1307,31 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
             tsr_fxaa_saved = jce_postfx_is_enabled(postfx, JCE_POSTFX_FXAA);
             if (tsr_fxaa_saved) jce_postfx_enable(postfx, JCE_POSTFX_FXAA, false);
         }
+        /* The "HDR target => force tone mapping" guard used to sit here.  It is
+         * gone on purpose, and NOT because it was in the wrong place.
+         *
+         * 2e5174e3 moved it after jce_scene_renderer_render so the
+         * renderer's per-frame rewrite of scene_rendering->postfx_enabled[]
+         * could no longer stomp it.  That made it live -- and live, it
+         * overrides what a scene explicitly authored.  Its own rationale
+         * was that an untonemapped HDR target reads washed out; bisected
+         * against real content, forcing it ON is what washes out:
+         *
+         *   caged_kingdom/graveyard, same camera, PNG size as a proxy
+         *     ec933eb8 (guard dead)  1,126,840 -> correct
+         *     2e5174e3 (guard live)  1,494,787 -> washed out
+         *
+         * and the split across projects is exactly postfx.tonemap:
+         * elemental_serenity and space author it TRUE (forcing it is a
+         * no-op there, and they always looked right), while caged_kingdom
+         * and street_demo author it FALSE and had their exposure and
+         * lights tuned that way.  A new scene defaults to false, which is
+         * why every newly created scene came up white too.
+         *
+         * Silently overriding an explicit authored value to protect
+         * against a hypothetical is the wrong trade: honour the scene.  A
+         * scene that wants tone mapping says so. */
+
         bool any_effect = jce_editor_viewport_postfx_any_effect(postfx);
 
         jce_postfx_resize(postfx, width, height);
@@ -1280,6 +1388,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                  (float)width, (float)height, NULL, dt_sec);
         }
     }
+    ed_vp_mark("evp_uicanvas", &_vpt);
 
     /* Dynamic-resolution RCAS resolve: when the scene rendered below native
      * (width/height < the panel's disp size), the bridge now holds the fully
@@ -1301,7 +1410,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
             jce_offscreen_target_get_color_texture(s_sr.bridge) };
         JceTextureHandle depth = {
             jce_offscreen_target_get_depth_texture(s_sr.bridge) };
-        uint16_t base = (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 25);
+        uint16_t base = (uint16_t)(scene_view_id() +
+                                   JCE_EDITOR_VP_TSR_OFFSET);
         bool flip = false;
         if (const char *f = getenv("JCE_TSR_FLIP")) flip = (f[0] != '0');
         /* v3: per-object velocity from the scene renderer's gbuffer_vel prepass
@@ -1341,8 +1451,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                     jce_offscreen_target_get_color_texture(s_sr.bridge) };
                 uint16_t dst_fb =
                     jce_offscreen_target_get_frame_buffer(s_sr.present);
-                uint16_t rv =
-                    (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE + 23);
+                uint16_t rv = (uint16_t)(
+                    scene_view_id() + JCE_EDITOR_VP_UPSCALE_OFFSET);
                 if (pfx && jce_gfx_texture_valid(src) && dst_fb != UINT16_MAX &&
                     jce_postfx_upscale_resolve(pfx, rv, dst_fb, src,
                                                width, height, disp_w, disp_h,

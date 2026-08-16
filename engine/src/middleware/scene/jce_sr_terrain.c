@@ -7,6 +7,7 @@
  * declared in jce_sr_internal.h; everything else stays file-static here.
  */
 
+#include "jce_terrain_cache.h"
 #include "jce_sr_internal.h"
 
 /* ── Terrain per-chunk LOD cache (P1-terrain-lod) ─────────────────────
@@ -265,9 +266,47 @@ JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
 /* Find (or lazily load) the terrain cache slot for `path`, initialising the
  * per-chunk metadata on first load.  Returns the slot index, or -1 on failure
  * (no free slot, load failed, or chunk init failed). */
-int sr_terrain_find_or_load_slot(JceSceneRenderer *sr, const char *path)
+/* Release everything this slot OWNS.  The JceTerrain is not among it: that is
+ * borrowed from the scene's terrain cache and freed there.  Freeing it here
+ * would leave the pick pass and the physics world pointing at a dead grid. */
+void sr_terrain_slot_free(JceSceneRenderer *sr, int slot)
 {
-    if (!sr || !path || !path[0]) return -1;
+    if (!sr || slot < 0 || slot >= 16) return;
+    sr_terrain_free_chunks(sr, slot);
+    if (BGFX_HANDLE_IS_VALID(sr->terrain_cache[slot].splat_tex))
+        bgfx_destroy_texture(sr->terrain_cache[slot].splat_tex);
+    memset(&sr->terrain_cache[slot], 0, sizeof sr->terrain_cache[slot]);
+    sr->terrain_cache[slot].splat_tex.idx = UINT16_MAX;
+}
+
+/* JceTerrainCacheLoadFn: PAK-first so a deployed bundle needs no host
+ * filesystem access; the cache owns whatever this returns. */
+static JceTerrain *sr_terrain_cache_load(void *ud, const char *path)
+{
+    JceSceneRenderer *sr = (JceSceneRenderer *)ud;
+    /* jce-terrain-owner-exempt: this IS the cache's loader callback; the
+     * cache takes ownership of the result. */
+    JceTerrain *terr = jce_terrain_load_from_pak(sr->pak, path);
+    if (terr) return terr;
+
+    char        resolved[1024];
+    const char *load_path = path;
+    if (sr->has_cbs && sr->cbs.resolve_path &&
+        sr->cbs.resolve_path(path, resolved, (int)sizeof(resolved),
+                             sr->cbs.userdata)) {
+        load_path = resolved;
+    }
+    /* jce-terrain-owner-exempt: same callback, host-filesystem fallback. */
+    return jce_terrain_load_file(load_path);
+}
+
+int sr_terrain_find_or_load_slot(JceSceneRenderer *sr, JceScene *scene,
+                                 const char *path)
+{
+    if (!sr || !scene || !path || !path[0]) return -1;
+    JceTerrainCache *tcache = jce_scene_terrain_cache(scene);
+    const uint64_t rev = jce_terrain_cache_revision(tcache, path);
+
     int slot = -1, free_slot = -1;
     for (int i = 0; i < 16; i++) {
         if (sr->terrain_cache[i].used &&
@@ -277,6 +316,18 @@ int sr_terrain_find_or_load_slot(JceSceneRenderer *sr, const char *path)
         }
         if (!sr->terrain_cache[i].used && free_slot < 0) free_slot = i;
     }
+
+    /* A stale borrow is a rebuild, not a reuse: chunk meshes and the splat
+     * texture were derived from a grid the cache may already have freed.  This
+     * is the path an editor sculpt travels -- before the shared cache existed
+     * there was no revision to compare and the renderer simply kept drawing
+     * whatever it loaded at level open. */
+    if (slot >= 0 && sr->terrain_cache[slot].revision != rev) {
+        sr_terrain_slot_free(sr, slot);
+        free_slot = slot;
+        slot = -1;
+    }
+
     if (slot >= 0)
         return sr->terrain_cache[slot].failed ? -1 : slot;
     if (free_slot < 0) return -1;
@@ -288,24 +339,15 @@ int sr_terrain_find_or_load_slot(JceSceneRenderer *sr, const char *path)
     sr->terrain_cache[slot].used = true;
     sr->terrain_cache[slot].splat_tex.idx = UINT16_MAX;
 
-    /* PAK-first: deployed bundles overlay sr->pak, so a bundled terrain
-     * meta+bin loads with zero host filesystem access.  If the path isn't in
-     * the PAK, fall back to the host-resolved path (editor / loose files). */
-    JceTerrain *terr = jce_terrain_load_from_pak(sr->pak, path);
-    char        resolved[1024];
-    const char *load_path = path;
-    if (!terr) {
-        if (sr->has_cbs && sr->cbs.resolve_path &&
-            sr->cbs.resolve_path(path, resolved, (int)sizeof(resolved),
-                                 sr->cbs.userdata)) {
-            load_path = resolved;
-        }
-        terr = jce_terrain_load_file(load_path);
-    }
+    /* BORROWED from the scene's terrain cache -- the pick pass and the physics
+     * world read the same grid.  Never freed here. */
+    JceTerrain *terr = jce_terrain_cache_acquire(tcache, path,
+                                                 sr_terrain_cache_load, sr);
+    sr->terrain_cache[slot].revision =
+        jce_terrain_cache_revision(tcache, path);
     if (!terr) {
         sr->terrain_cache[slot].failed = true;
-        LOG_WARN(LOG_TAG, "terrain load failed: '%s' (from '%s')",
-                 load_path, path);
+        LOG_WARN(LOG_TAG, "terrain load failed: '%s'", path);
         return -1;
     }
     sr->terrain_cache[slot].terrain = terr;
@@ -457,7 +499,11 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
     bool have_planes = false;
     if (camera) {
         const jce_mat4 v  = jce_camera_view(camera);
-        const jce_mat4 p  = jce_camera_proj(camera, 16.0f / 9.0f,
+        /* The viewport's aspect, not 16:9 -- see sr->frame_aspect. A narrower
+         * test frustum than the real one culls ground that is still on
+         * screen, and the ground is the one thing whose absence shows the
+         * skybox through the floor. */
+        const jce_mat4 p  = jce_camera_proj(camera, sr->frame_aspect,
                                             sr->homogeneous_depth);
         const jce_mat4 vp = jce_m4_multiply(&p, &v);
         sr_extract_frustum_planes(&vp, planes);
@@ -521,13 +567,32 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         }
 
         /* Per-chunk state (re-bound every submit; BGFX_DISCARD_ALL clears it). */
-        sr_inline_bind_pbr_global(sr, pbr, view_id, scene, list);
+        sr_inline_bind_pbr_global_overrides(
+            sr, pbr, view_id, scene, list,
+            (JceTexture){ layer_tex[0].idx },
+            (JceTexture){ layer_tex[3].idx });
         bgfx_set_transform(model->raw[0], 1);
-        bgfx_set_texture(0,  sr->s_terrain_layer0, layer_tex[0], UINT32_MAX);
-        bgfx_set_texture(4,  sr->s_terrain_layer3, layer_tex[3], UINT32_MAX);
         bgfx_set_texture(14, sr->s_terrain_layer1, layer_tex[1], UINT32_MAX);
         bgfx_set_texture(15, sr->s_terrain_layer2, layer_tex[2], UINT32_MAX);
         bgfx_set_uniform(sr->u_terrain_params, tparams, 1);
+        /* Stage 3 is fs_terrain.sc's s_cloudShadow -- the one stage terrain
+         * could free, because it held a declared-but-never-bound s_aoMap.
+         * Bound here rather than with the shared shadow state: the mesh
+         * shader uses stage 3 for a real AO map, so a global bind would
+         * overwrite it. This is terrain's ONLY draw path. */
+        sr_bind_cloud_shadow(sr);
+        /* Stage 1 is fs_terrain.sc's s_terrainAO -- the screen-space AO target.
+         * Bound after the material bind, which puts a metallic-roughness map
+         * there that this shader has never read. White when SSAO did not run,
+         * because an unbound sampler is undefined the moment something reads
+         * it, and the shader's own u_ssaoParams.x gate is what actually
+         * decides whether the value is used. */
+        {
+            bgfx_texture_handle_t ao_h = sr->white_tex;
+            if (sr->ssao_active_frame && sr->ssao_ao_idx != UINT16_MAX)
+                ao_h.idx = sr->ssao_ao_idx;
+            bgfx_set_texture(1, sr->s_terrain_ao, ao_h, UINT32_MAX);
+        }
 
         if (per_tile_splat) {
             /* Bind this chunk's tile splat texture + remap the global terrain UV
@@ -557,12 +622,14 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
  * mesh already cached by the colour pass; otherwise builds it at the coarse
  * shadow LOD.  Returns false for non-terrain entities. */
 bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
-                                  JceEntity e, uint16_t view_id)
+                                  JceEntity e, uint16_t view_id,
+                                  const jce_mat4 *cull_vp)
 {
+    sr->stat_terrain_shadow_calls++;
     if (!jce_scene_has_terrain(scene, e)) return false;
     JceTerrainComponent *tc = jce_scene_get_terrain(scene, e);
     if (!tc || !tc->visible || !tc->terrain_path[0]) return false;
-    int slot = sr_terrain_find_or_load_slot(sr, tc->terrain_path);
+    int slot = sr_terrain_find_or_load_slot(sr, scene, tc->terrain_path);
     if (slot < 0 || sr->terrain_cache[slot].chunk_count <= 0) return false;
     if (!jce_scene_has_transform(scene, e)) return false;
 
@@ -570,9 +637,40 @@ bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
     int ncx = sr->terrain_cache[slot].chunk_nx;
     int ncz = sr->terrain_cache[slot].chunk_nz;
 
+    /* Cull against the shadow view's own frustum.
+     *
+     * This loop had no test at all: every chunk went into every cascade and
+     * every local-light view. The caller's per-caster cull does not cover it
+     * -- sr_shadow_caster_aabb returns false for terrain by design ("Returns
+     * false for primitives/terrain/unresolvable"), so `has_aabb` is false and
+     * the cascade reject never fires for a terrain entity. The shipped
+     * hidden_cove is 16x16 chunks, so that was 256 depth draws per cascade,
+     * 1024 a frame, against a colour pass that draws a few dozen.
+     *
+     * The planes come from the caller because only the caller knows which
+     * cascade this view id is. NULL keeps the old behaviour for the paths
+     * that have no matrix to give (the single-map legacy path, local lights),
+     * which is correct rather than merely compatible: a cull with the wrong
+     * frustum removes shadows that should be there. */
+    jce_vec4 splanes[6];
+    const bool scull = (cull_vp != NULL);
+    if (scull) sr_extract_frustum_planes(cull_vp, splanes);
+
     for (int cz = 0; cz < ncz; cz++)
     for (int cx = 0; cx < ncx; cx++) {
         int cidx = cz * ncx + cx;
+        if (scull) {
+            jce_vec3 wmn, wmx;
+            sr_transform_aabb(&model,
+                              sr->terrain_cache[slot].chunk_min[cidx],
+                              sr->terrain_cache[slot].chunk_max[cidx],
+                              &wmn, &wmx);
+            if (!sr_aabb_in_frustum(splanes, wmn, wmx)) {
+                sr->stat_terrain_shadow_culled++;
+                continue;
+            }
+        }
+        sr->stat_terrain_shadow_drawn++;
         JceMesh *cm = sr->terrain_cache[slot].chunk_meshes[cidx];
         if (!cm) cm = sr_terrain_chunk_mesh(sr, slot, cx, cz,
                                             SR_TERRAIN_SHADOW_LOD);

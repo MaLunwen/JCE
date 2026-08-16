@@ -54,7 +54,9 @@ typedef struct JceThread JceThread;
 typedef void (*JceThreadFn)(void *arg);
 
 /* Spawn a dedicated OS thread. `name` is optional (debug label).
-   Returns NULL on failure. */
+ * Reserve this for long-lived service loops and platform adapters. One-shot
+ * or cross-frame work must use jce_async_submit() instead. Returns NULL on
+ * failure. */
 JCE_API JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name);
 
 /* Block until the thread function returns; releases all resources.
@@ -156,6 +158,8 @@ typedef void (*JceTaskFn)(void *arg);
 
 /* Create a pool with num_threads workers (0 = auto-detect CPU cores). */
 JCE_API JceThreadPool *jce_thread_pool_create(int num_threads);
+JCE_API JceThreadPool *jce_thread_pool_create_named(int num_threads,
+                                                     const char *debug_name);
 
 /* The house worker-count policy: logical cores - 1, clamped to 1..8.
  *
@@ -170,10 +174,14 @@ JCE_API int JCE_CALL jce_thread_pool_default_workers(void);
 /* Wait for all pending tasks to finish, then destroy the pool. */
 JCE_API void JCE_CALL jce_thread_pool_destroy(JceThreadPool *pool);
 
-/* Submit a fire-and-forget task.  Returns false when the task could not be
-   queued (no pool, or out of memory) — `fn` then never runs, so a caller that
-   tracks outstanding work must run it inline rather than leak the count. */
+/* Submit bounded fire-and-forget batch work. Returns false when it could not
+ * be queued and `fn` did not run. This primitive has no cancellation,
+ * completion-thread, deadline, or ownership contract; cross-frame work must
+ * use jce_async_submit(). Never run blocking fallback work on a frame thread. */
 JCE_API bool JCE_CALL jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg);
+JCE_API bool JCE_CALL
+jce_thread_pool_submit_named(JceThreadPool *pool, const char *debug_name,
+                             JceTaskFn fn, void *arg);
 
 /* Submit a task and get a waitable handle.
    Caller must call jce_task_wait() and then jce_task_free(). */
@@ -181,6 +189,8 @@ typedef struct JceTask JceTask;
 
 JCE_API JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
                                          JceTaskFn fn, void *arg);
+JCE_API JceTask *jce_thread_pool_submit_tracked_named(
+    JceThreadPool *pool, const char *debug_name, JceTaskFn fn, void *arg);
 
 /* Submit a data-parallel range and get a waitable handle.
    The scheduler splits [0, set_size) into partitions of at least `min_range`
@@ -194,6 +204,9 @@ JCE_API JceTask *jce_thread_pool_submit_range(JceThreadPool *pool,
                                               JceTaskRangeFn fn, void *arg,
                                               uint32_t set_size,
                                               uint32_t min_range);
+JCE_API JceTask *jce_thread_pool_submit_range_named(
+    JceThreadPool *pool, const char *debug_name,
+    JceTaskRangeFn fn, void *arg, uint32_t set_size, uint32_t min_range);
 
 /* Blocking data-parallel loop over [0, count) with FIXED chunk boundaries.
    The range is cut into ceil(count/chunk) chunks of exactly `chunk` indices
@@ -209,6 +222,9 @@ JCE_API JceTask *jce_thread_pool_submit_range(JceThreadPool *pool,
 JCE_API void JCE_CALL jce_thread_pool_parallel_for(JceThreadPool *pool,
                                                    uint32_t count, uint32_t chunk,
                                                    JceTaskRangeFn fn, void *arg);
+JCE_API void JCE_CALL jce_thread_pool_parallel_for_named(
+    JceThreadPool *pool, const char *debug_name,
+    uint32_t count, uint32_t chunk, JceTaskRangeFn fn, void *arg);
 
 /* Number of dedicated background worker threads.  Excludes the thread that
    created the pool, which also runs tasks while it waits — so a pool created
@@ -241,28 +257,13 @@ JCE_API void JCE_CALL jce_task_free(JceTask *task);
  * 512 MB baseline cannot afford.  This IS the engine's job system for frame
  * work.
  *
- * What does NOT belong here: anything that blocks longer than a frame.
- * Whole-file reads, glTF/FBX parsing, image and audio decode, asset cooking
- * run on a small private pool of their own (jce_thread_pool_create, sized by
- * jce_thread_pool_default_workers) — the world streamers, the async asset
- * pool, the archive loader, the bundle cook and the editor's material
- * extractor each keep one, and each says so at its create site.  The reason
- * is enkiTS's cooperative wait, not thread budget:
- * jce_thread_pool_parallel_for() ends in enkiWaitForTaskSet(), which runs ANY
- * queued task from ANY worker's pipe at ANY priority until the set it waits
- * on completes.  The per-frame consumers above call it from the main thread
- * several times a frame, so a queued 200 ms disk read is not "one worker
- * busy" — it is 200 ms of disk read executed by the main thread in the middle
- * of a cull.  Worse when the blocking job takes a lock (the archive loader's
- * io_lock): the main thread then blocks on a mutex a worker holds across disk
- * I/O, which is priority inversion, not a hitch.  Separate schedulers are
- * what stop the two classes of work from running on each other's threads.
- *
- * The way out of that split is priority tiers, not more threads: give the
- * blocking class a low enkiTS priority and let parallel_for wait with
- * enkiWaitForTaskSetPriority() so the frame loop only ever runs frame work.
- * Nothing sets a priority today, so every task is TASK_PRIORITY_HIGH and the
- * wait is unrestricted; until that lands, the private pools stay.
+ * Anything that can outlive the frame does NOT belong here. Whole-file reads,
+ * model/image/audio decode, streaming, cooking, and editor background work use
+ * jce_async instead. Structured executors provide bounded queues, priorities,
+ * cancellation, deadlines, owner-thread completion, Web cooperative pumping,
+ * and explicit shutdown; frame waits can therefore never steal a blocking
+ * asset task. Dedicated jce_thread_create() threads are limited to persistent
+ * service loops such as audio/video devices and platform adapters.
  *
  * Ordering:
  *   - jce_thread_pool_shared() creates the pool on first call and returns a

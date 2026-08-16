@@ -7,6 +7,7 @@
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_str.h>   /* jce_strlcpy for the PNG writer job path */
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/platform/jce_library.h>
@@ -229,6 +230,101 @@ static bgfx_allocator_interface_t *jce_bgfx_allocator(void)
         s_no_hooks = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
     return s_no_hooks ? NULL : &s_jce_alloc_iface;
+}
+
+/* ── GPU adapter selection ──────────────────────────────────────────────
+ *
+ * A laptop with both an integrated and a discrete GPU otherwise gets whatever
+ * the driver hands out, which is not always what the user wants: the discrete
+ * part is faster but costs battery and can be unavailable on a docked/eGPU
+ * setup, and testing the low-end path requires *forcing* the integrated one.
+ * bgfx picks by PCI vendor id at init, so the preference has to be resolved
+ * BEFORE bgfx_init -- it cannot be changed afterwards without a full restart.
+ *
+ * Resolution order: explicit vendor id, then the JCE_GPU_ADAPTER preference,
+ * then the driver default.  Values: "auto" (default), "integrated", "discrete",
+ * "intel", "nvidia", "amd", or a raw hex vendor id such as "0x10DE". */
+static uint16_t adapter_vendor_from_name(const char *v)
+{
+    if (!v || !v[0]) return BGFX_PCI_ID_NONE;
+    if (jce_strcasecmp(v, "auto") == 0)       return BGFX_PCI_ID_NONE;
+    if (jce_strcasecmp(v, "integrated") == 0 ||
+        jce_strcasecmp(v, "intel") == 0)      return BGFX_PCI_ID_INTEL;
+    if (jce_strcasecmp(v, "nvidia") == 0)     return BGFX_PCI_ID_NVIDIA;
+    if (jce_strcasecmp(v, "amd") == 0 ||
+        jce_strcasecmp(v, "ati") == 0)        return BGFX_PCI_ID_AMD;
+    /* "discrete": prefer NVIDIA, fall back to AMD if that adapter is absent.
+     * bgfx has no "any discrete" selector, so this is a best-effort hint --
+     * an unmatched vendor id makes bgfx fall back to the default adapter
+     * rather than fail, which is the behaviour we want. */
+    if (jce_strcasecmp(v, "discrete") == 0)   return BGFX_PCI_ID_NVIDIA;
+    if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X'))
+        return (uint16_t)strtoul(v + 2, NULL, 16);
+    LOG_WARN(LOG_TAG, "unknown GPU adapter preference '%s'; using auto", v);
+    return BGFX_PCI_ID_NONE;
+}
+
+static uint16_t s_adapter_vendor_pref = BGFX_PCI_ID_NONE;
+static bool     s_adapter_pref_read;
+
+void jce_renderer_set_gpu_adapter_preference(const char *name)
+{
+    s_adapter_vendor_pref = adapter_vendor_from_name(name);
+    s_adapter_pref_read   = true;
+}
+
+/* Stamp the resolved preference onto an init struct.  Called from EVERY
+ * bgfx_init_ctor site: the fallback chain must honour the same choice as the
+ * primary path, or a backend fallback would silently move the user to a
+ * different GPU. */
+static void apply_adapter_preference(bgfx_init_t *init)
+{
+    if (!s_adapter_pref_read) {
+        jce_renderer_set_gpu_adapter_preference(getenv("JCE_GPU_ADAPTER"));
+    }
+    init->vendorId = s_adapter_vendor_pref;
+    if (s_adapter_vendor_pref != BGFX_PCI_ID_NONE)
+        LOG_INFO(LOG_TAG, "GPU adapter preference: vendor 0x%04X",
+                 (unsigned)s_adapter_vendor_pref);
+}
+
+uint32_t jce_renderer_get_gpu_adapters(JceGpuAdapter *out, uint32_t cap)
+{
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps) return 0;
+    const uint32_t n = caps->numGPUs < cap ? caps->numGPUs : cap;
+    for (uint32_t i = 0; i < n && out; ++i) {
+        out[i].vendor_id = caps->gpu[i].vendorId;
+        out[i].device_id = caps->gpu[i].deviceId;
+    }
+    return caps->numGPUs;
+}
+
+/* Log what the driver actually offers.  Without this a user asking for a
+ * specific GPU has no way to find out which ones exist, and no way to tell a
+ * silently-ignored preference from an honoured one. */
+static void log_gpu_adapters(void)
+{
+    JceGpuAdapter list[8];
+    const uint32_t total = jce_renderer_get_gpu_adapters(list, 8);
+    if (total == 0) {
+        LOG_INFO(LOG_TAG, "GPU adapters: backend does not enumerate");
+        return;
+    }
+    const uint32_t shown = total < 8 ? total : 8;
+    for (uint32_t i = 0; i < shown; ++i) {
+        const char *vendor =
+            list[i].vendor_id == BGFX_PCI_ID_INTEL  ? "Intel"  :
+            list[i].vendor_id == BGFX_PCI_ID_NVIDIA ? "NVIDIA" :
+            list[i].vendor_id == BGFX_PCI_ID_AMD    ? "AMD"    : "other";
+        LOG_INFO(LOG_TAG,
+                 "GPU adapter %u/%u: %s (vendor 0x%04X device 0x%04X)%s",
+                 (unsigned)(i + 1), (unsigned)total, vendor,
+                 (unsigned)list[i].vendor_id, (unsigned)list[i].device_id,
+                 (s_adapter_vendor_pref != BGFX_PCI_ID_NONE &&
+                  s_adapter_vendor_pref == list[i].vendor_id)
+                     ? "  <- requested" : "");
+    }
 }
 
 static void apply_transient_limits(bgfx_init_t *init)
@@ -511,6 +607,10 @@ static struct {
 } s_capture_sink;
 static bool s_capture_active       = false;
 static bool s_capture_shot_pending = false;
+/* Scratch for the GL RGBA->BGRA swizzle on the recording path; see the note at
+   its use. Sized on demand, released when capture stops. */
+static uint8_t *s_swz_buf;
+static size_t   s_swz_cap;
 /* When set, recording is driven by the ImGui renderer reading its offscreen FBO
    back into the sink (whole-window video) instead of the backbuffer screen_shot
    path below (which is black on D3D flip-model swap chains). */
@@ -527,6 +627,14 @@ static struct {
     void           *ud;
 } s_fbo_capture_sink;
 static bool s_fbo_capture_pending = false;
+
+/* Defined with the PNG writer service further down. Copies `data` and hands
+   the encode + file write to the writer thread; false means "not queued, do it
+   yourself". */
+static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
+                              uint32_t pitch, uint32_t size, int format,
+                              int yflip, int drop_alpha, const char *what,
+                              const char *path);
 
 static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint32_t _width, uint32_t _height, uint32_t _pitch,
@@ -609,9 +717,27 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
     if (_filePath && strcmp(_filePath, JCE_CAPTURE_SENTINEL) == 0) {
         if (s_capture_active && _data && _width && _height) {
             const void *frame_data = _data;
+            /* Persistent scratch, not a per-frame allocation.
+             *
+             * This is the recording path: it runs on EVERY captured frame, and
+             * at 2560x1600 the buffer is 16 MB. Allocating and freeing 16 MB
+             * per frame means faulting in ~4000 fresh pages per frame and
+             * handing them straight back -- a per-frame cost that grows with
+             * window size and does no work. The staging texture and pixel
+             * buffer on the readback side were made resident for exactly this
+             * reason in the earlier recording pass; this allocation was missed
+             * because it only exists on GL (D3D and VK deliver BGRA and pass
+             * through untouched).
+             *
+             * Freed when capture stops, so an idle editor holds nothing. */
             uint8_t    *swz = NULL;
             if (src_is_rgba) {
-                swz = (uint8_t *)JCE_MALLOC((size_t)_size);
+                if (s_swz_cap < (size_t)_size) {
+                    JCE_FREE(s_swz_buf);
+                    s_swz_buf = (uint8_t *)JCE_MALLOC((size_t)_size);
+                    s_swz_cap = s_swz_buf ? (size_t)_size : 0;
+                }
+                swz = s_swz_buf;
                 if (swz) {
                     const uint8_t *s = (const uint8_t *)_data;
                     for (uint32_t y = 0; y < _height; ++y) {
@@ -632,7 +758,6 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                                      _yflip ? 1 : 0);
             if (s_capture_sink.frame)
                 s_capture_sink.frame(s_capture_sink.ud, frame_data, _size);
-            if (swz) JCE_FREE(swz);
         }
         s_capture_shot_pending = false;
         return;
@@ -661,6 +786,81 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                  (n && sum / (n * 3.0) < 1.0) ? "<-- BLACK backbuffer (data, not write)" : "");
     }
 
+    /* This callback runs on the thread bgfx calls back on while the main thread
+       sits inside bgfx_frame() waiting for it, so everything done here is
+       frame stall, measured at 2560x1600:
+
+           convert (SDL RGB24 + flip)        5-8 ms
+           IMG_SavePNG encode + write      348-369 ms
+           -------------------------------------------
+           total                           354-375 ms per screenshot
+
+       At a 13.8 ms frame that is a 26-frame freeze on every F12, and the same
+       stall on every frame of a recording that writes stills. The readback
+       capture path already solved this exact problem with a PNG writer thread
+       -- it just was not wired to the backbuffer path, which is the one F12
+       uses. So hand the raw pixels over and let the writer do the conversion
+       too; the frame keeps only a memcpy of the staging buffer.
+
+       Anything that cannot be handed over (queue full, allocation failed, or a
+       .bmp, which the writer does not encode) still runs inline. A screenshot
+       is never dropped to save a frame. */
+    const uint64_t t_freq  = SDL_GetPerformanceFrequency();
+    const uint64_t t_enter = SDL_GetPerformanceCounter();
+    uint64_t t_conv = t_enter;
+    bool async = false;
+
+    if (_data && _filePath && _width && _height) {
+        const char *aext = strrchr(_filePath, '.');
+        const bool  is_bmp = aext && SDL_strcasecmp(aext, ".bmp") == 0;
+        if (!is_bmp)
+            async = rb_png_submit_raw(_data, _width, _height, _pitch, _size,
+                                      (int)(src_is_rgba ? SDL_PIXELFORMAT_RGBA32
+                                                        : SDL_PIXELFORMAT_BGRA32),
+                                      _yflip ? 1 : 0, 1, "screenshot",
+                                      _filePath);
+    }
+    /* JCE_SHOT_DUAL=1 also writes the inline version to "<path>.inline.png".
+     *
+     * The two files then come from ONE callback invocation and one pixel
+     * buffer, so a diff between them measures the code and nothing else.
+     * Comparing an async PNG against an inline PNG from a SEPARATE run does
+     * not: this scene's own run-to-run floor reaches 4.10%, which is larger
+     * than any difference the two write paths could plausibly have, and a
+     * cross-run comparison here reported 1.05-2.57%. Reading that as a defect
+     * in the async path would have repeated an attribution error this campaign
+     * has already made twice. */
+    if (async) {
+        static int s_dual = -1;
+        if (s_dual < 0) {
+            const char *dv = getenv("JCE_SHOT_DUAL");
+            s_dual = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
+        }
+        if (s_dual && _data && _filePath) {
+            char ip[600];
+            snprintf(ip, sizeof ip, "%s.inline.png", _filePath);
+            SDL_Surface *ds = SDL_CreateSurfaceFrom((int)_width, (int)_height,
+                src_is_rgba ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_BGRA32,
+                (void *)(uintptr_t)_data, (int)_pitch);
+            if (ds) {
+                SDL_Surface *drgb = SDL_ConvertSurface(ds, SDL_PIXELFORMAT_RGB24);
+                SDL_DestroySurface(ds);
+                if (drgb) {
+                    if (_yflip) SDL_FlipSurface(drgb, SDL_FLIP_VERTICAL);
+                    IMG_SavePNG(drgb, ip);
+                    SDL_DestroySurface(drgb);
+                }
+            }
+        }
+        const uint64_t t_end = SDL_GetPerformanceCounter();
+        LOG_INFO(LOG_TAG, "screenshot queued in %.2f ms (%ux%u) — encode and "
+                 "write run on the PNG writer thread",
+                 (double)(t_end - t_enter) * 1000.0 /
+                 (double)(t_freq ? t_freq : 1), _width, _height);
+        s_screenshot_pending = false;
+        return;
+    }
+
     bool ok = false;
     if (_data && _filePath && _width && _height) {
         /* Wrap the raw pixels in their native channel order (BGRA8 on D3D/VK,
@@ -677,6 +877,7 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
             if (rgb) {
                 if (_yflip)
                     SDL_FlipSurface(rgb, SDL_FLIP_VERTICAL);
+                t_conv = SDL_GetPerformanceCounter();
                 const char *ext = strrchr(_filePath, '.');
                 if (ext && SDL_strcasecmp(ext, ".bmp") == 0)
                     ok = SDL_SaveBMP(rgb, _filePath);
@@ -685,6 +886,17 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                 SDL_DestroySurface(rgb);
             }
         }
+    }
+
+    {   /* Inline fallback took the frame with it — say so, with the split, so
+           a regression back onto this path is visible rather than merely slow. */
+        const uint64_t t_end = SDL_GetPerformanceCounter();
+        const double ms = 1000.0 / (double)(t_freq ? t_freq : 1);
+        LOG_WARN(LOG_TAG, "screenshot written INLINE: convert %.2f ms + "
+                 "encode/write %.2f ms = %.2f ms blocking the frame (%ux%u)",
+                 (double)(t_conv - t_enter) * ms,
+                 (double)(t_end - t_conv) * ms,
+                 (double)(t_end - t_enter) * ms, _width, _height);
     }
 
     if (ok)
@@ -929,6 +1141,215 @@ bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx, uint16_t bl
     return rb_submit(src_tex_idx, blit_view, w, h, 1, yflip, NULL);
 }
 
+/* ── Off-thread PNG writer ──────────────────────────────────────────────
+ *
+ * The readback itself is already asynchronous (staging + N slots), but the
+ * DELIVERY encoded the PNG on the main thread.  A 1280x720 zlib encode plus
+ * the file write costs on the order of 100 ms, which showed up as a
+ * "frame_dt exceeded max_frame_dt; clamping to avoid spiral of death" warning
+ * timestamped against every single capture: one screenshot stalled the frame
+ * hard enough for the fixed clock to drop simulated time.
+ *
+ * Encoding is pure CPU work on a private pixel buffer with a private output
+ * path, so it moves to a writer thread. The main thread keeps only the LUT
+ * conversion (a few ms) and hands the buffer over. The queue is bounded; when
+ * it is full the ready readback slot stays pending and retries next frame.
+ * This preserves every capture without ever encoding inline on a frame. */
+#define RB_PNG_QUEUE 4
+
+typedef struct {
+    uint8_t *pixels;     /* owned; freed by whoever encodes it */
+    uint16_t w, h;
+    uint32_t pitch;      /* bytes per row in `pixels` */
+    int      format;     /* SDL_PixelFormat of `pixels` */
+    int      yflip;
+    int      drop_alpha; /* convert to RGB24 first (backbuffer alpha is junk) */
+    const char *what;    /* log label; a literal, never freed */
+    char     path[512];
+} RbPngJob;
+
+static RbPngJob   s_png_queue[RB_PNG_QUEUE];
+static int        s_png_head, s_png_tail, s_png_count;
+static JceMutex  *s_png_mu;
+static JceCondVar *s_png_cv;       /* signalled on enqueue and on shutdown */
+static JceCondVar *s_png_drained;  /* signalled when the queue empties     */
+static JceThread *s_png_thread;
+static bool       s_png_quit;
+static int        s_png_busy;      /* jobs handed out but not yet finished */
+
+/* Encode + write on the serial writer service. Takes ownership of rgba8. */
+static void rb_png_write(RbPngJob *job)
+{
+    SDL_Surface *surf = SDL_CreateSurfaceFrom((int)job->w, (int)job->h,
+        (SDL_PixelFormat)job->format, job->pixels, (int)job->pitch);
+    if (surf) {
+        SDL_Surface *out = surf;
+        /* The backbuffer's alpha channel is undefined, so that path asks for
+         * RGB24 and the readback path does not. Doing the conversion HERE
+         * rather than at the submitter is the point of the exercise: it used
+         * to cost 5-8 ms on the frame. */
+        if (job->drop_alpha) {
+            out = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGB24);
+            SDL_DestroySurface(surf);
+            surf = NULL;
+        }
+        if (out) {
+            /* Flip only when the SUBMITTER declared bottom-up rows (postfx RT,
+             * or plain FBO on GL). Plain FBOs read back top-down on D3D/VK/
+             * Metal — an unconditional flip inverted those PNGs. */
+            if (job->yflip)
+                SDL_FlipSurface(out, SDL_FLIP_VERTICAL);
+            if (IMG_SavePNG(out, job->path))
+                LOG_SUCCESS(LOG_TAG, "%s saved: %s (%ux%u)",
+                            job->what, job->path, job->w, job->h);
+            else
+                LOG_ERROR(LOG_TAG, "%s PNG write failed: %s (%s)",
+                          job->what, job->path, SDL_GetError());
+            SDL_DestroySurface(out);
+        }
+        if (surf) SDL_DestroySurface(surf);
+    }
+    JCE_FREE(job->pixels);
+    job->pixels = NULL;
+}
+
+static void rb_png_worker(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        RbPngJob job;
+        jce_mutex_lock(s_png_mu);
+        while (s_png_count == 0 && !s_png_quit)
+            jce_cond_wait(s_png_cv, s_png_mu);
+        if (s_png_count == 0 && s_png_quit) {
+            jce_mutex_unlock(s_png_mu);
+            return;
+        }
+        job = s_png_queue[s_png_head];
+        s_png_head = (s_png_head + 1) % RB_PNG_QUEUE;
+        s_png_count--;
+        s_png_busy++;
+        jce_mutex_unlock(s_png_mu);
+
+        rb_png_write(&job);
+
+        jce_mutex_lock(s_png_mu);
+        s_png_busy--;
+        if (s_png_count == 0 && s_png_busy == 0)
+            jce_cond_broadcast(s_png_drained);
+        jce_mutex_unlock(s_png_mu);
+    }
+}
+
+static bool rb_png_prepare(void)
+{
+    if (!s_png_mu) {
+        s_png_mu      = jce_mutex_create();
+        s_png_cv      = jce_cond_create();
+        s_png_drained = jce_cond_create();
+        if (!s_png_mu || !s_png_cv || !s_png_drained) {
+            if (s_png_drained) jce_cond_destroy(s_png_drained);
+            if (s_png_cv) jce_cond_destroy(s_png_cv);
+            if (s_png_mu) jce_mutex_destroy(s_png_mu);
+            s_png_drained = NULL;
+            s_png_cv = NULL;
+            s_png_mu = NULL;
+            return false;
+        }
+    }
+    if (!s_png_thread) {
+        s_png_thread = jce_thread_create(rb_png_worker, NULL, "jce-png-write");
+        if (!s_png_thread)
+            return false;
+    }
+    return true;
+}
+
+static bool rb_png_has_capacity(void)
+{
+    bool has_capacity;
+
+    jce_mutex_lock(s_png_mu);
+    has_capacity = s_png_count < RB_PNG_QUEUE;
+    jce_mutex_unlock(s_png_mu);
+    return has_capacity;
+}
+
+/* Hand a converted frame to the writer service without blocking. */
+static bool rb_png_enqueue(RbPngJob *job)
+{
+    bool queued = false;
+
+    jce_mutex_lock(s_png_mu);
+    if (s_png_count < RB_PNG_QUEUE) {
+        s_png_queue[s_png_tail] = *job;
+        s_png_tail = (s_png_tail + 1) % RB_PNG_QUEUE;
+        s_png_count++;
+        queued = true;
+        jce_cond_signal(s_png_cv);
+    }
+    jce_mutex_unlock(s_png_mu);
+    return queued;
+}
+
+static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
+                              uint32_t pitch, uint32_t size, int format,
+                              int yflip, int drop_alpha, const char *what,
+                              const char *path)
+{
+    if (!data || !path || !w || !h || !size) return false;
+    if (w > 0xFFFFu || h > 0xFFFFu)          return false;
+    if (!rb_png_prepare())                   return false;
+
+    uint8_t *copy = (uint8_t *)JCE_MALLOC((size_t)size);
+    if (!copy) return false;
+    memcpy(copy, data, (size_t)size);
+
+    RbPngJob job;
+    job.pixels     = copy;
+    job.w          = (uint16_t)w;
+    job.h          = (uint16_t)h;
+    job.pitch      = pitch;
+    job.format     = format;
+    job.yflip      = yflip;
+    job.drop_alpha = drop_alpha;
+    job.what       = what;
+    jce_strlcpy(job.path, path, sizeof job.path);
+    if (!rb_png_enqueue(&job)) {
+        JCE_FREE(copy);
+        return false;
+    }
+    return true;
+}
+
+void jce_renderer_readback_capture_flush(void)
+{
+    if (!s_png_mu) return;
+    jce_mutex_lock(s_png_mu);
+    while (s_png_count > 0 || s_png_busy > 0)
+        jce_cond_wait(s_png_drained, s_png_mu);
+    jce_mutex_unlock(s_png_mu);
+}
+
+void jce_renderer_readback_capture_shutdown(void)
+{
+    if (!s_png_mu) return;
+    jce_renderer_readback_capture_flush();
+    jce_mutex_lock(s_png_mu);
+    s_png_quit = true;
+    jce_cond_broadcast(s_png_cv);
+    jce_mutex_unlock(s_png_mu);
+    if (s_png_thread) {
+        jce_thread_join(s_png_thread);
+        s_png_thread = NULL;
+    }
+    jce_cond_destroy(s_png_drained); s_png_drained = NULL;
+    jce_cond_destroy(s_png_cv);      s_png_cv      = NULL;
+    jce_mutex_destroy(s_png_mu);     s_png_mu      = NULL;
+    s_png_quit = false;
+    s_png_head = s_png_tail = s_png_count = s_png_busy = 0;
+}
+
 /* Deliver one ready slot, strictly FIFO.  Returns the poll result code. */
 static int rb_deliver(RbSlot *slot)
 {
@@ -961,30 +1382,38 @@ static int rb_deliver(RbSlot *slot)
         return result;
     }
 
-    /* mode 0: convert the RGBA16F half-float readback (tonemapped 0..1) to RGBA8 PNG. */
+    /*
+     * mode 0: convert the RGBA16F half-float readback (tonemapped 0..1)
+     * to RGBA8 PNG. A saturated writer queue leaves this slot ready so
+     * polling retries it on a later frame.
+     */
+    if (!rb_png_prepare()) {
+        LOG_ERROR(LOG_TAG, "readback capture PNG service unavailable");
+        slot->state = 0;
+        return 2;
+    }
+    if (!rb_png_has_capacity())
+        return 0;
+
     uint8_t *rgba8 = lut ? (uint8_t *)JCE_MALLOC(npx * 4u) : NULL;
     if (rgba8) {
         for (size_t i = 0; i < npx * 4u; ++i)
             rgba8[i] = lut[src[i]];
-        SDL_Surface *surf = SDL_CreateSurfaceFrom((int)slot->w, (int)slot->h,
-            SDL_PIXELFORMAT_RGBA32, rgba8, (int)(slot->w * 4u));
-        if (surf) {
-            /* Flip only when the SUBMITTER declared bottom-up rows (postfx RT,
-             * or plain FBO on GL). Plain FBOs read back top-down on D3D/VK/
-             * Metal — an unconditional flip inverted those PNGs. */
-            if (slot->yflip)
-                SDL_FlipSurface(surf, SDL_FLIP_VERTICAL);
-            if (IMG_SavePNG(surf, slot->path)) {
-                LOG_SUCCESS(LOG_TAG, "readback capture saved: %s (%ux%u)",
-                            slot->path, slot->w, slot->h);
-                result = 1;
-            } else {
-                LOG_ERROR(LOG_TAG, "readback capture PNG write failed: %s (%s)",
-                          slot->path, SDL_GetError());
-            }
-            SDL_DestroySurface(surf);
+        RbPngJob job;
+        job.pixels     = rgba8;
+        job.w          = slot->w;
+        job.h          = slot->h;
+        job.pitch      = (uint32_t)slot->w * 4u;
+        job.format     = (int)SDL_PIXELFORMAT_RGBA32;
+        job.yflip      = slot->yflip;
+        job.drop_alpha = 0;
+        job.what       = "readback capture";
+        jce_strlcpy(job.path, slot->path, sizeof job.path);
+        if (!rb_png_enqueue(&job)) {
+            JCE_FREE(rgba8);
+            return 0;
         }
-        JCE_FREE(rgba8);
+        result = 1;
     }
     slot->state = 0;
     return result;
@@ -1011,8 +1440,10 @@ int jce_renderer_readback_capture_poll(void)
             break;
         if (s_bgfx_frame_index < next->ready_frame)
             return 0;   /* oldest capture still on the GPU */
-        s_rb_seq_deliver++;
         last_result = rb_deliver(next);
+        if (next->state == 1)
+            return 0;   /* writer backpressure: preserve FIFO and retry */
+        s_rb_seq_deliver++;
         any_in_flight = 0;   /* recount on the next loop iteration */
     }
 
@@ -1286,6 +1717,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                      bgfx_get_renderer_name(requested_type));
         } else {
             bgfx_init_ctor(&init);
+            apply_adapter_preference(&init);
             apply_transient_limits(&init);
             init.type              = requested_type;
             init.resolution.width  = w;
@@ -1313,6 +1745,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             LOG_INFO(LOG_TAG, "trying backend: %s",
                      bgfx_get_renderer_name(chain[i]));
             bgfx_init_ctor(&init);
+            apply_adapter_preference(&init);
             apply_transient_limits(&init);
             init.type              = chain[i];
             init.resolution.width  = w;
@@ -1337,13 +1770,38 @@ JceRenderer *jce_renderer_create(JceWindow *win,
 
     LOG_INFO(LOG_TAG, "renderer: %s",
              bgfx_get_renderer_name(bgfx_get_renderer_type()));
+    log_gpu_adapters();
 
+    /* bgfx's built-in debug text is an ALLOWLIST, not a denylist.
+     *
+     * It was a denylist with exactly one entry -- OpenGL -- and Vulkan then
+     * crashed the render thread on the first submitted frame:
+     *
+     *     bgfx::vk::RendererContextVK::dbgTextRenderBegin
+     *     bgfx::dbgTextSubmit
+     *     bgfx::vk::RendererContextVK::submit
+     *     bgfx::Context::renderFrame
+     *
+     * -- i.e. the editor could not start at all on Vulkan, on a machine where
+     * D3D11, D3D12 and GL all run. A denylist makes that the DEFAULT outcome
+     * for every backend nobody has tried yet: the untested case is the one
+     * that gets the feature.
+     *
+     * Inverting it costs nothing that matters. Debug text is a development
+     * overlay, and a backend that does not draw it is missing an overlay,
+     * while a backend that crashes on it is missing everything. */
     bool enable_debug_text = cfg->debug_text;
-    if (bgfx_get_renderer_type() == BGFX_RENDERER_TYPE_OPENGL) {
-        if (enable_debug_text) {
-            LOG_INFO(LOG_TAG, "disabling bgfx debug text on OpenGL backend");
+    if (enable_debug_text) {
+        const bgfx_renderer_type_t rt = bgfx_get_renderer_type();
+        const bool known_good = (rt == BGFX_RENDERER_TYPE_DIRECT3D11 ||
+                                 rt == BGFX_RENDERER_TYPE_DIRECT3D12);
+        if (!known_good) {
+            LOG_INFO(LOG_TAG,
+                     "disabling bgfx debug text on the %s backend "
+                     "(allowlisted on D3D11/D3D12 only)",
+                     bgfx_get_renderer_name(rt));
+            enable_debug_text = false;
         }
-        enable_debug_text = false;
     }
 
     uint32_t debug_flags = enable_debug_text ? BGFX_DEBUG_TEXT : 0;
@@ -1507,6 +1965,7 @@ JceRenderer *jce_renderer_create_headless(void)
 
     bgfx_init_t init;
     bgfx_init_ctor(&init);
+    apply_adapter_preference(&init);
     init.type              = BGFX_RENDERER_TYPE_NOOP;
     init.resolution.width  = 1;
     init.resolution.height = 1;
@@ -1846,6 +2305,10 @@ void jce_renderer_render_fallback_frame(const JceRenderer *r)
 void jce_renderer_destroy(JceRenderer *r)
 {
     if (!r) return;
+    /* Drain and join the PNG writer BEFORE anything else goes away: a capture
+     * delivered on the last frame is still only pixels in a queue, and losing
+     * it on exit would defeat every harness that reads the files back. */
+    jce_renderer_readback_capture_shutdown();
     if (r->is_fallback) {
         if (r->sdl_renderer) {
             SDL_DestroyRenderer(r->sdl_renderer);
@@ -2627,6 +3090,11 @@ void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable)
     if (s_capture_active == enable) return;
     s_capture_active       = enable;
     s_capture_shot_pending = false;
+    if (!enable) {                 /* idle editor holds no capture scratch */
+        JCE_FREE(s_swz_buf);
+        s_swz_buf = NULL;
+        s_swz_cap = 0;
+    }
 }
 
 /* -- Transform / texture binding (game-layer wrappers) ------------- */

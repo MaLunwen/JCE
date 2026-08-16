@@ -35,6 +35,12 @@ struct JceVolumetricFog {
     bgfx_uniform_handle_t  u_p0;
     bgfx_uniform_handle_t  u_p1;
     bgfx_uniform_handle_t  u_color;
+    bgfx_uniform_handle_t  u_sun;        /* dir.xyz + Henyey-Greenstein g */
+    bgfx_uniform_handle_t  u_sun_color;  /* rgb + cascade count           */
+    bgfx_uniform_handle_t  u_csm_vp;     /* mat4[4]                       */
+    bgfx_uniform_handle_t  u_csm_splits;
+    bgfx_uniform_handle_t  u_csm_params;
+    bgfx_uniform_handle_t  s_csm[4];
     bgfx_uniform_handle_t  s_depth;
 
     /* Composite pass — draws the fog RT into a destination frame
@@ -123,6 +129,15 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
     f->u_p0    = bgfx_create_uniform("u_volfog_p0",    BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_p1    = bgfx_create_uniform("u_volfog_p1",    BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_color = bgfx_create_uniform("u_volfog_color", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_sun        = bgfx_create_uniform("u_volfog_sun",        BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_sun_color  = bgfx_create_uniform("u_volfog_sun_color",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_csm_vp     = bgfx_create_uniform("u_volfog_csm_vp",     BGFX_UNIFORM_TYPE_MAT4, 4);
+    f->u_csm_splits = bgfx_create_uniform("u_volfog_csm_splits", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_csm_params = bgfx_create_uniform("u_volfog_csm_params", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->s_csm[0] = bgfx_create_uniform("s_volfog_csm0", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    f->s_csm[1] = bgfx_create_uniform("s_volfog_csm1", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    f->s_csm[2] = bgfx_create_uniform("s_volfog_csm2", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    f->s_csm[3] = bgfx_create_uniform("s_volfog_csm3", BGFX_UNIFORM_TYPE_SAMPLER, 1);
     f->s_depth = bgfx_create_uniform("s_depth",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
     /* Composite pass program (vs_volfog reused). Optional — if the
@@ -160,6 +175,13 @@ void jce_volumetric_fog_destroy(JceVolumetricFog *f)
     if (f->u_p0.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p0);
     if (f->u_p1.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p1);
     if (f->u_color.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_color);
+    if (f->u_sun.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_sun);
+    if (f->u_sun_color.idx  != UINT16_MAX) bgfx_destroy_uniform(f->u_sun_color);
+    if (f->u_csm_vp.idx     != UINT16_MAX) bgfx_destroy_uniform(f->u_csm_vp);
+    if (f->u_csm_splits.idx != UINT16_MAX) bgfx_destroy_uniform(f->u_csm_splits);
+    if (f->u_csm_params.idx != UINT16_MAX) bgfx_destroy_uniform(f->u_csm_params);
+    for (int i = 0; i < 4; i++)
+        if (f->s_csm[i].idx != UINT16_MAX) bgfx_destroy_uniform(f->s_csm[i]);
     if (f->s_depth.idx        != UINT16_MAX) bgfx_destroy_uniform(f->s_depth);
     if (f->s_fog.idx          != UINT16_MAX) bgfx_destroy_uniform(f->s_fog);
     if (f->vbh.idx      != UINT16_MAX) bgfx_destroy_vertex_buffer(f->vbh);
@@ -197,6 +219,7 @@ void jce_volumetric_fog_set_params(JceVolumetricFog *f, const JceVolumetricFogPa
 void jce_volumetric_fog_render(JceVolumetricFog *f,
                                uint16_t depth_tex_handle,
                                const jce_mat4 *view, const jce_mat4 *proj,
+                               const JceVolumetricFogSun *sun,
                                uint16_t first_view_id)
 {
     if (!f || f->prog.idx == UINT16_MAX || !view || !proj) return;
@@ -221,6 +244,83 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
     bgfx_set_uniform(f->u_p0,    p0,  1);
     bgfx_set_uniform(f->u_p1,    p1,  1);
     bgfx_set_uniform(f->u_color, col, 1);
+
+    /* Sun + cascades.  Bound UNCONDITIONALLY, including the disabled case:
+     * bgfx retains uniform values between submits, so a frame that skipped the
+     * write would march against whatever the last frame that DID set them left
+     * behind -- shafts pointing at a sun that has moved, on some frames only. */
+    {
+        const bool on = sun && sun->enabled && sun->cascade_count > 0u;
+        float sd[4]  = { 0.0f, 1.0f, 0.0f, 0.0f };
+        float sc[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float spl[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float par[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        jce_mat4 vps[4];
+        for (int i = 0; i < 4; i++) vps[i] = jce_m4_identity();
+
+        if (on) {
+            sd[0] = sun->sun_dir[0]; sd[1] = sun->sun_dir[1];
+            sd[2] = sun->sun_dir[2];
+            /* Clamp g strictly inside (-1,1): the phase function divides by
+             * (1+g^2-2g*cos)^1.5, which is exactly 0 at g=1 looking straight
+             * at the sun.  A value of 1 from a config file would paint NaN. */
+            float g = sun->anisotropy;
+            if (g >  0.95f) g =  0.95f;
+            if (g < -0.95f) g = -0.95f;
+            sd[3] = g;
+
+            sc[0] = sun->sun_color[0]; sc[1] = sun->sun_color[1];
+            sc[2] = sun->sun_color[2];
+            sc[3] = (float)((sun->cascade_count > 4u) ? 4u : sun->cascade_count);
+
+            for (uint32_t i = 0; i < 4u; i++) {
+                if (i < sun->cascade_count) {
+                    vps[i] = sun->cascade_vp[i];
+                    spl[i] = sun->splits[i];
+                }
+            }
+            /* Pad the unused split lanes with the last real one.
+             *
+             * The shader reads them as an ordered ladder and reads lane 3 as
+             * the shadow reach for its distance fade, exactly as
+             * csm_shadow.sh does -- so a zero there does not mean "no
+             * cascade", it means "the ladder ends at zero", which sends every
+             * sample past the last real split into cascade 3 and disables the
+             * fade. Same defect the static path carried; fixed there in
+             * sr_pack_csm_splits and duplicated here rather than shared,
+             * because this struct is the renderer's public one and the other
+             * is internal. */
+            for (uint32_t i = sun->cascade_count; i < 4u; i++)
+                spl[i] = (sun->cascade_count > 0u)
+                       ? sun->splits[sun->cascade_count - 1u] : 0.0f;
+            par[0] = sun->inv_map_size;
+            /* The blend fraction the SURFACE path uses for the same splits.
+             * Passing the surface's own value rather than a second tuning knob
+             * is the point: the fog and the wall in front of it must soften
+             * the same boundary by the same amount, or the fog bands where the
+             * wall does not. */
+            par[1] = sun->cascade_blend;
+        }
+
+        bgfx_set_uniform(f->u_sun,        sd,  1);
+        bgfx_set_uniform(f->u_sun_color,  sc,  1);
+        bgfx_set_uniform(f->u_csm_vp,     JCE_M4_PTR(vps[0]), 4);
+        bgfx_set_uniform(f->u_csm_splits, spl, 1);
+        bgfx_set_uniform(f->u_csm_params, par, 1);
+
+        /* Every cascade stage gets a texture whether or not the lookup runs:
+         * an unbound sampler is undefined on several backends, and "undefined"
+         * here means the fog is shadowed by garbage. */
+        for (uint32_t i = 0; i < 4u; i++) {
+            bgfx_texture_handle_t t = { UINT16_MAX };
+            if (on && i < sun->cascade_count) t.idx = sun->cascade_tex[i];
+            if (!BGFX_HANDLE_IS_VALID(t)) t.idx = depth_tex_handle;
+            bgfx_set_texture((uint8_t)(1u + i), f->s_csm[i], t,
+                             BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                             | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
+                             | BGFX_SAMPLER_MIP_POINT);
+        }
+    }
 
     bgfx_texture_handle_t depth = { depth_tex_handle };
     bgfx_set_texture(0, f->s_depth, depth,

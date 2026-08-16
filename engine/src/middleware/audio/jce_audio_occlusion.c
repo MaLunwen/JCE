@@ -7,6 +7,7 @@
 #include <jce/os/core/jce_hashmap.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>   /* solve-to-solve interval for smoothing */
 
 #include "os/core/jce_memory.h"
 
@@ -87,7 +88,27 @@ struct JceAudioOcclusionTracker {
     uint32_t                cap;        /* power of two */
     uint32_t                size;
     uint32_t                gc_gen;
+    uint64_t                last_solve_ms;  /* for frame-rate independence */
 };
+
+/* The authored `smoothing` coefficient is a per-update retention factor, so
+ * applying it once per rendered frame made occlusion fade at a speed that
+ * tracked frame rate: the same wall-clock second retains s^60 at 60 fps but
+ * s^144 at 144 fps, i.e. a source ducks noticeably faster on a faster
+ * machine.  Re-expressing it against elapsed time keeps the authored feel at
+ * the reference rate and holds it constant everywhere else. */
+#define JCE_OCC_SMOOTHING_REFERENCE_HZ 60.0f
+/* Long gaps (load hitch, alt-tab) must not snap the filter open; short ones
+ * must not divide by an absurdly small dt.  Both ends are clamped. */
+#define JCE_OCC_MAX_STEP_SECONDS       0.25f
+
+float jce_audio_occlusion_retention_for_dt(float authored, float dt_seconds)
+{
+    if (dt_seconds <= 0.0f) return authored;
+    if (dt_seconds > JCE_OCC_MAX_STEP_SECONDS)
+        dt_seconds = JCE_OCC_MAX_STEP_SECONDS;
+    return powf(authored, dt_seconds * JCE_OCC_SMOOTHING_REFERENCE_HZ);
+}
 
 static TrackerEntry *table_find_or_insert(JceAudioOcclusionTracker *t, uint64_t id)
 {
@@ -155,6 +176,20 @@ void jce_audio_occlusion_tracker_solve(JceAudioOcclusionTracker *t,
     float s = t->params.smoothing;
     if (s < 0.0f) s = 0.0f;
     if (s > 0.999f) s = 0.999f;
+
+    /* Elapsed time since the previous solve.  Measured here rather than taken
+     * as a parameter so no caller has to be changed to get correct behaviour;
+     * the tracker is solved once per audio/gameplay update, which is exactly
+     * the interval the filter needs.  The first solve uses the reference step
+     * so behaviour at the authored rate is bit-for-bit what it was. */
+    {
+        const uint64_t now_ms = jce_time_ticks_ms();
+        float dt_seconds = 1.0f / JCE_OCC_SMOOTHING_REFERENCE_HZ;
+        if (t->last_solve_ms != 0 && now_ms > t->last_solve_ms)
+            dt_seconds = (float)(now_ms - t->last_solve_ms) * 0.001f;
+        t->last_solve_ms = now_ms;
+        s = jce_audio_occlusion_retention_for_dt(s, dt_seconds);
+    }
 
     for (uint32_t i = 0; i < n; ++i) {
         TrackerEntry *e = table_find_or_insert(t, ids[i]);

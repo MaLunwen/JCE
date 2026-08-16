@@ -27,7 +27,8 @@ typedef enum {
     JCE_SCENE_GENERATION_HEALTH_CHECK,
     JCE_SCENE_GENERATION_ACTIVE,
     JCE_SCENE_GENERATION_FAILED,
-    JCE_SCENE_GENERATION_CANCELLED
+    JCE_SCENE_GENERATION_CANCELLED,
+    JCE_SCENE_GENERATION_ATTESTING
 } JceSceneGenerationStatus;
 
 typedef struct {
@@ -97,6 +98,14 @@ jce_scene_generation_active_scene(
 
 JCE_API uint64_t JCE_CALL
 jce_scene_generation_active_plan_hash(
+    const JceSceneGenerationCoordinator *coordinator);
+
+JCE_API uint64_t JCE_CALL
+jce_scene_generation_pending_attestation_hash(
+    const JceSceneGenerationCoordinator *coordinator);
+
+JCE_API uint64_t JCE_CALL
+jce_scene_generation_active_attestation_hash(
     const JceSceneGenerationCoordinator *coordinator);
 
 JCE_EXTERN_C_END

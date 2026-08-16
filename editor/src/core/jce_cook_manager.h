@@ -1,12 +1,12 @@
 /*
  * jce_cook_manager.h  Editor-side wrapper around jce_cook_*.
  *
- * Spawns the engine cook on a dedicated worker thread, drains progress
- * back to the editor main thread (Console + status line), and exposes
+ * Submits the engine cook as structured background work, reports progress
+ * through the Console + status line, and exposes
  * a small state machine so the toolbar "▶ Play" button can chain
  * Cook → Build → Run.
  *
- * Layer: Editor (depends on jce_application's jce_cook + jce_thread).
+ * Layer: Editor (depends on jce_application's jce_cook + jce_async).
  * One cook at a time.  Re-entrancy returns false from start().
  */
 
@@ -39,8 +39,8 @@ typedef struct {
 void jce_cook_manager_init(void);
 void jce_cook_manager_shutdown(void);
 
-/* Drain the worker thread's mailbox; flip state on completion.  Call
- * once per editor frame.  Cheap when idle. */
+/* Compatibility pump hook. Structured completion is driven by the engine's
+ * default executor, so this is cheap and has no private thread to join. */
 void jce_cook_manager_poll(void);
 
 /* Kick a full cook for `project_root`.  Returns false if a cook is

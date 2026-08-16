@@ -146,6 +146,14 @@ void jce_scene_particle_emitter_desc_tex(const JceParticleEmitterComponent *c,
 {
     if (!out) return;
     if (tex_path && tex_cap > 0) tex_path[0] = '\0';
+    /* Seed a valid descriptor BEFORE any load is attempted.  Callers pass an
+     * uninitialised stack struct (jce_scene_particles.c sp_emitter_build), and
+     * the authored-asset branch below used to return without writing *out when
+     * every load path missed -- handing garbage emit_rate/lifetimes and a wild
+     * sub-emitter pointer to jce_particles_emitter_add, which then got freed.
+     * Defaulting first makes an unreadable asset degrade to a visible plain
+     * emitter instead of undefined behaviour. */
+    jce_particles_desc_default(out);
     if (c && c->asset_path[0]) {
         /* PAK-first (single-exe: the .particles.json is in the embedded PAK). */
         if (s_sp_pak) {
@@ -172,11 +180,18 @@ void jce_scene_particle_emitter_desc_tex(const JceParticleEmitterComponent *c,
             if (jce_particles_desc_load_json(full, out, tex_path, tex_cap))
                 return;
         }
-        jce_particles_desc_load_json(c->asset_path, out, tex_path, tex_cap);
+        if (jce_particles_desc_load_json(c->asset_path, out, tex_path, tex_cap))
+            return;
+        /* Every path missed.  This used to be silent, so a wrong asset root
+         * (the editor Game View never set one) produced empty emitters with
+         * nothing in the log to say why. */
+        LOG_WARN(LOG_TAG,
+                 "particle asset '%s' not found in PAK or under root '%s';"
+                 " emitter falls back to the default descriptor",
+                 c->asset_path, s_sp_asset_root[0] ? s_sp_asset_root : "(unset)");
         return;
     }
     /* No asset: synthesize from the legacy quick-tune fields. */
-    jce_particles_desc_default(out);
     if (!c) return;
     if (c->emit_rate    > 0.0f) out->emit_rate    = c->emit_rate;
     if (c->lifetime_min > 0.0f) out->lifetime_min = c->lifetime_min;
@@ -226,7 +241,10 @@ static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
     c->emitter_handle_idx = h.idx;
     c->loaded             = true;
     c->asset_epoch        = jce_scene_particle_emitter_epoch(c);
-    jce_particles_emitter_start(ctx->sys, h);
+    /* Honour a stop that arrived before this emitter existed (see
+     * emit_suppressed): otherwise a lazily-built emitter ignores the script. */
+    if (c->emit_suppressed) jce_particles_emitter_stop(ctx->sys, h);
+    else                    jce_particles_emitter_start(ctx->sys, h);
 }
 
 /* ── Per-entity tick ──────────────────────────────────────────────── */
@@ -354,6 +372,11 @@ void jce_scene_particle_burst(JceScene *s, JceEntity e, int count)
 
 void jce_scene_particle_set_emitting(JceScene *s, JceEntity e, bool on)
 {
+    /* Record the request first: the emitter may not have been built yet, and
+     * sp_emitter_build applies emit_suppressed when it eventually is. */
+    JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
+    if (c) c->emit_suppressed = !on;
+
     JceEmitterHandle h;
     JceParticleSystem *sys = sp_resolve(s, e, &h);
     if (!sys) return;

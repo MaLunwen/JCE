@@ -47,9 +47,23 @@ JCE_API JceTexture jce_texture_load_lut_3d_host(const char *host_path);
 JCE_API JceTexture jce_texture_load_from_surface(const void *surface, int sampler_mode);
 
 /* Load a texture from raw pixel data (RGBA8, top-left origin).
-   Caller retains ownership of data. */
+   Caller retains ownership of data.
+
+   CLAMP, mip-0 only.  Correct for surfaces sampled at ~1:1 where wrapping
+   would fetch an unrelated neighbour (glyph atlases, lookup tables, video
+   frames, UI thumbnails).  For a MATERIAL texture -- anything tiled or viewed
+   at a distance -- use jce_texture_from_rgba_ex() with JCE_TEX_WRAP instead:
+   clamp smears the edge texel across every tile past the first, and without
+   mips the surface aliases under minification. */
 JCE_API JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height);
+
+/* As above, with an explicit sampler mode (JCE_TEX_CLAMP/WRAP/MIRROR) and a
+   full box-filtered mip chain.  This is the material/scene-texture entry
+   point; jce_texture_from_rgba() is the ~1:1 surface one. */
+JCE_API JceTexture jce_texture_from_rgba_ex(const void *data,
+                                  uint32_t width, uint32_t height,
+                                  int sampler_mode);
 
 /* Create a GPU texture from a cooked .jceasset pixel payload, honoring the
    block-compressed format (BC1/BC3/BC5/BC7/ASTC4x4/ETC2A, default RGBA8) and

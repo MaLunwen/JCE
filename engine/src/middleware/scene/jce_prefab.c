@@ -77,9 +77,7 @@ static JceEntity finalize_instance(JceScene       *scene,
             tmp.tag_color = 0;
         }
         tmp.prefab_instance = true;
-        /* Truncating copy is fine — header-defined bound. */
-        size_t cap = sizeof(tmp.prefab_path);
-        jce_strlcpy(tmp.prefab_path, prefab_path, cap);
+        tmp.prefab_path = jce_scene_intern(scene, prefab_path);
         jce_scene_set_editor_meta(scene, e, &tmp);
     }
 

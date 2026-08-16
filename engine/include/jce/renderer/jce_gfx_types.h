@@ -81,6 +81,38 @@ typedef enum {
     JCE_BLEND_MULTIPLY     /* Multiply */
 } JceBlendMode;
 
+typedef enum JceRenderFormat {
+    JCE_RENDER_FORMAT_RGBA8 = 0,
+    JCE_RENDER_FORMAT_RGBA16F,
+    JCE_RENDER_FORMAT_DEPTH24_STENCIL8,
+    JCE_RENDER_FORMAT_DEPTH32F,
+    JCE_RENDER_FORMAT_R32F,
+    JCE_RENDER_FORMAT_R16F,
+    JCE_RENDER_FORMAT_RG16F,
+    JCE_RENDER_FORMAT_RG32F,
+    JCE_RENDER_FORMAT_RGBA32F
+} JceRenderFormat;
+
+typedef enum JceSamplerAddress {
+    JCE_SAMPLER_ADDRESS_CLAMP = 0,
+    JCE_SAMPLER_ADDRESS_WRAP,
+    JCE_SAMPLER_ADDRESS_MIRROR
+} JceSamplerAddress;
+
+typedef enum JceSamplerFilter {
+    JCE_SAMPLER_FILTER_NEAREST = 0,
+    JCE_SAMPLER_FILTER_LINEAR
+} JceSamplerFilter;
+
+typedef struct JceSamplerDesc {
+    uint32_t struct_size;
+    uint32_t address_u;
+    uint32_t address_v;
+    uint32_t filter_min;
+    uint32_t filter_mag;
+    uint32_t filter_mip;
+} JceSamplerDesc;
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_GFX_TYPES_H */

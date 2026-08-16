@@ -5,28 +5,24 @@
  *
  * Threading model:
  *   - single_thread == true  (WASM default):
- *       Each call to jce_streaming_update() processes at most one
- *       pending load/unload within the frame time budget.  This is a
- *       cooperative "coroutine-style" approach that avoids blocking
- *       the main thread.
+ *       A cooperative structured executor starts at most one deferred
+ *       chunk read per update.
  *
  *   - single_thread == false (desktop/mobile default):
- *       Loads are queued and dispatched to background threads via
- *       JceThreadPool.  Main thread polls for completion.
+ *       Loads are queued on a bounded private structured executor.
+ *       Main thread polls terminal task state and finalizes callbacks.
  */
 
 #include <jce/resource/jce_streaming.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
 #include "os/core/jce_memory.h"
 
 #include <math.h>
-#include <SDL3/SDL_atomic.h>
-#include <SDL3/SDL_timer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,8 +49,7 @@ typedef struct {
     size_t        data_size;
 
     /* Async load tracking. */
-    JceTask      *pending_task;
-    SDL_AtomicInt load_complete;
+    JceAsyncTask *pending_task;
     void         *loaded_data;
     size_t        loaded_size;
     bool          load_success;
@@ -118,7 +113,7 @@ struct JceStreamingSystem {
 
     /* External dependencies. */
     JceFileSystem     *fs;
-    JceThreadPool     *thread_pool;
+    JceAsyncExecutor *executor;
 
     /* Callbacks. */
     JceChunkLoadedFn   on_loaded;
@@ -204,101 +199,95 @@ static double now_ms(void)
 
 /* ── Async load worker function ───────────────────────────────────── */
 
-static void chunk_load_worker(void *arg)
+static void chunk_load_job_cleanup(void *arg)
+{
+    JCE_FREE(arg);
+}
+
+static JceAsyncRunResult chunk_load_worker(JceAsyncContext *ctx, void *arg)
 {
     ChunkLoadJob *job = (ChunkLoadJob *)arg;
     if (!job || !job->fs || !job->record) {
-        if (job) JCE_FREE(job);
-        return;
+        jce_async_context_fail(ctx, 1, "invalid chunk load job");
+        return JCE_ASYNC_RUN_FAILED;
     }
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
 
     uint64_t size = 0;
     void *data = jce_fs_read_all(job->fs, job->path, &size);
+    if (jce_async_context_cancel_requested(ctx)) {
+        JCE_FREE(data);
+        return JCE_ASYNC_RUN_CANCELLED;
+    }
+    if (size > (uint64_t)SIZE_MAX) {
+        JCE_FREE(data);
+        jce_async_context_fail(ctx, 3, "chunk exceeds address space");
+        return JCE_ASYNC_RUN_FAILED;
+    }
 
     job->record->loaded_data = data;
     job->record->loaded_size = (size_t)size;
     job->record->load_success = (data != NULL && size > 0);
-
-    /* Signal completion (memory barrier). */
-    SDL_SetAtomicInt(&job->record->load_complete, 1);
-
-    JCE_FREE(job);
+    if (!job->record->load_success) {
+        jce_async_context_fail(ctx, 2, "chunk read failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
-/* ── Synchronous load (single-thread mode) ────────────────────────── */
+/* ── Structured async load ───────────────────────────────────────── */
 
-static bool load_chunk_sync(JceStreamingSystem *sys, ChunkRecord *c)
+static bool start_chunk_load_async(JceStreamingSystem *sys, ChunkRecord *c)
 {
-    if (!sys->fs) {
-        LOG_ERROR(LOG_TAG, "no filesystem bound");
+    JceAsyncTaskDesc desc;
+    if (!sys->fs || !sys->executor)
         return false;
-    }
-
-    uint64_t size = 0;
-    void *data = jce_fs_read_all(sys->fs, c->asset_path, &size);
-
-    if (!data || size == 0) {
-        LOG_ERROR(LOG_TAG, "failed to load chunk %u: %s",
-                  c->chunk_id, c->asset_path);
-        return false;
-    }
-
-    c->data = data;
-    c->data_size = (size_t)size;
-    c->estimated_size = size;
-    c->state = JCE_CHUNK_LOADED;
-
-    if (sys->on_loaded)
-        sys->on_loaded(c->chunk_id, c->data, c->data_size, sys->callback_data);
-
-    LOG_DEBUG(LOG_TAG, "loaded chunk %u (%zu bytes): %s",
-              c->chunk_id, size, c->asset_path);
-    return true;
-}
-
-/* ── Async load (multi-thread mode) ──────────────────────────────── */
-
-static void start_chunk_load_async(JceStreamingSystem *sys, ChunkRecord *c)
-{
-    if (!sys->fs || !sys->thread_pool) {
-        /* Fall back to sync if no pool available. */
-        load_chunk_sync(sys, c);
-        return;
-    }
 
     ChunkLoadJob *job = (ChunkLoadJob *)JCE_MALLOC(sizeof(ChunkLoadJob));
     if (!job) {
         c->state = JCE_CHUNK_UNLOADED;
-        return;
+        return false;
     }
 
     job->fs = sys->fs;
     job->record = c;
     snprintf(job->path, sizeof(job->path), "%s", c->asset_path);
 
-    SDL_SetAtomicInt(&c->load_complete, 0);
     c->loaded_data = NULL;
     c->loaded_size = 0;
     c->load_success = false;
 
-    c->pending_task = jce_thread_pool_submit_tracked(sys->thread_pool,
-                                                      chunk_load_worker, job);
+    jce_async_task_desc_init(&desc);
+    desc.work = chunk_load_worker;
+    desc.cleanup = chunk_load_job_cleanup;
+    desc.user_data = job;
+    desc.debug_name = c->asset_path;
+    desc.priority = JCE_ASYNC_PRIORITY_LOW;
+    c->pending_task = jce_async_submit(sys->executor, &desc);
+    if (!c->pending_task) {
+        JCE_FREE(job);
+        c->state = JCE_CHUNK_UNLOADED;
+        return false;
+    }
+    return true;
 }
 
 /* ── Finalize async load (main thread) ────────────────────────────── */
 
 static void finalize_chunk_load(JceStreamingSystem *sys, ChunkRecord *c)
 {
-    if (!SDL_GetAtomicInt(&c->load_complete))
+    JceAsyncState task_state;
+
+    if (!c->pending_task ||
+        !jce_async_task_is_terminal(c->pending_task))
         return;
 
-    if (c->pending_task) {
-        jce_task_wait(c->pending_task);
-        jce_task_free(c->pending_task);
-        c->pending_task = NULL;
-    }
+    task_state = jce_async_task_state(c->pending_task);
+    jce_async_task_release(c->pending_task);
+    c->pending_task = NULL;
 
-    if (c->load_success) {
+    if (task_state == JCE_ASYNC_STATE_SUCCEEDED && c->load_success) {
         c->data = c->loaded_data;
         c->data_size = c->loaded_size;
         c->estimated_size = c->loaded_size;
@@ -309,12 +298,16 @@ static void finalize_chunk_load(JceStreamingSystem *sys, ChunkRecord *c)
 
         LOG_DEBUG(LOG_TAG, "async loaded chunk %u (%zu bytes)",
                   c->chunk_id, c->data_size);
-    } else {
+    } else if (task_state == JCE_ASYNC_STATE_FAILED) {
         c->state = JCE_CHUNK_UNLOADED;
         LOG_ERROR(LOG_TAG, "async load failed for chunk %u: %s",
                   c->chunk_id, c->asset_path);
+    } else {
+        c->state = JCE_CHUNK_UNLOADED;
     }
 
+    if (c->state != JCE_CHUNK_LOADED)
+        JCE_FREE(c->loaded_data);
     c->loaded_data = NULL;
     c->loaded_size = 0;
 }
@@ -383,6 +376,7 @@ static uint32_t evict_lru_for_budget(JceStreamingSystem *sys,
 
 JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
 {
+    JceAsyncExecutorConfig async_config;
     if (!config) return NULL;
 
     JceStreamingSystem *sys = (JceStreamingSystem *)JCE_CALLOC(1, sizeof(*sys));
@@ -393,6 +387,8 @@ JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
     /* Apply defaults. */
     if (sys->config.max_pending == 0)
         sys->config.max_pending = DEFAULT_MAX_PENDING;
+    if (sys->config.max_pending > MAX_CHUNKS)
+        sys->config.max_pending = MAX_CHUNKS;
     if (sys->config.frame_budget_ms <= 0.0f)
         sys->config.frame_budget_ms = DEFAULT_BUDGET_MS;
 
@@ -412,6 +408,28 @@ JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
     sys->config.single_thread = true;
 #endif
 
+    jce_async_executor_config_init(&async_config);
+    async_config.mode = sys->config.single_thread
+        ? JCE_ASYNC_EXECUTION_COOPERATIVE
+        : JCE_ASYNC_EXECUTION_THREADED;
+    async_config.worker_count =
+        sys->config.max_pending < 4u ? sys->config.max_pending : 4u;
+    async_config.reserve_latency_worker = false;
+    async_config.max_tasks = sys->config.max_pending;
+    async_config.cooperative_tasks_per_pump = 1;
+    async_config.cooperative_completions_per_pump =
+        sys->config.max_pending;
+    async_config.cooperative_time_budget_us =
+        (uint64_t)(sys->config.frame_budget_ms * 1000.0f);
+    if (async_config.cooperative_time_budget_us == 0)
+        async_config.cooperative_time_budget_us = 1;
+    async_config.debug_name = "world-streaming";
+    sys->executor = jce_async_executor_create(&async_config);
+    if (!sys->executor) {
+        JCE_FREE(sys);
+        return NULL;
+    }
+
     LOG_SUCCESS(LOG_TAG, "streaming system created (mode=%s, budget=%.1fms, %s)",
                 config->mode == JCE_STREAM_RADIAL ? "radial" : "rectangular",
                 (double)sys->config.frame_budget_ms,
@@ -426,14 +444,24 @@ void jce_streaming_destroy(JceStreamingSystem *sys)
 
     live_unregister(sys);
 
-    /* Wait for pending loads and unload all chunks. */
+    for (uint32_t i = 0; i < sys->chunk_count; i++) {
+        ChunkRecord *c = &sys->chunks[i];
+        if (c->pending_task)
+            (void)jce_async_task_cancel(c->pending_task);
+    }
+    if (sys->executor) {
+        (void)jce_async_executor_shutdown(
+            sys->executor, JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+            JCE_ASYNC_WAIT_INFINITE);
+    }
+
+    /* Release terminal handles and unload all chunks. */
     for (uint32_t i = 0; i < sys->chunk_count; i++) {
         ChunkRecord *c = &sys->chunks[i];
         if (!c->registered) continue;
 
         if (c->pending_task) {
-            jce_task_wait(c->pending_task);
-            jce_task_free(c->pending_task);
+            jce_async_task_release(c->pending_task);
             c->pending_task = NULL;
         }
 
@@ -445,6 +473,8 @@ void jce_streaming_destroy(JceStreamingSystem *sys)
         JCE_FREE(c->loaded_data);
     }
 
+    if (sys->executor)
+        jce_async_executor_destroy(sys->executor);
     JCE_FREE(sys);
 }
 
@@ -457,11 +487,8 @@ void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem *fs)
 
 void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool)
 {
-    if (sys) {
-        sys->thread_pool = pool;
-        /* If no pool, force single-thread mode. */
-        if (!pool) sys->config.single_thread = true;
-    }
+    (void)sys;
+    (void)pool;
 }
 
 void jce_streaming_set_callbacks(JceStreamingSystem *sys,
@@ -536,8 +563,9 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
 
     /* Cancel pending load. */
     if (c->pending_task) {
-        jce_task_wait(c->pending_task);
-        jce_task_free(c->pending_task);
+        (void)jce_async_task_cancel(c->pending_task);
+        jce_async_task_wait(c->pending_task);
+        jce_async_task_release(c->pending_task);
         c->pending_task = NULL;
     }
 
@@ -665,12 +693,19 @@ static void apply_dbg_preview_env(JceStreamingSystem *sys)
 
 void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
 {
+    JceAsyncPumpBudget async_budget;
     JCE_PROFILE_ZONE_N("Streaming::Update");
     if (!sys) { JCE_PROFILE_ZONE_END; return; }
 
     apply_dbg_preview_env(sys);   /* one-shot JCE_DBG_PREVIEW headless hook */
 
     double start = now_ms();
+    jce_async_pump_budget_init(&async_budget);
+    async_budget.max_work_items = 1;
+    async_budget.max_completions = sys->config.max_pending;
+    async_budget.max_time_us =
+        (uint64_t)(sys->config.frame_budget_ms * 1000.0f);
+    jce_async_executor_pump(sys->executor, &async_budget);
     float load_r2   = sys->config.load_radius   * sys->config.load_radius;
     float unload_r2 = sys->config.unload_radius * sys->config.unload_radius;
     uint64_t budget_bytes = (uint64_t)sys->config.budget_mb * 1024ULL * 1024ULL;
@@ -787,12 +822,15 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
             pending_count++;
 
             /* Check for async completion (rate-limited; see kMaxFinalizePerFrame). */
-            if (!sys->config.single_thread && SDL_GetAtomicInt(&c->load_complete) &&
+            if (c->pending_task &&
+                jce_async_task_is_terminal(c->pending_task) &&
                 finalized_this_frame < kMaxFinalizePerFrame) {
                 finalize_chunk_load(sys, c);
+                if (pending_count > 0)
+                    pending_count--;
+                finalized_this_frame++;
                 if (c->state == JCE_CHUNK_LOADED) {
                     sys->memory_used += c->estimated_size;
-                    finalized_this_frame++;
                 }
             }
             break;
@@ -903,16 +941,9 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
 
         c->state = JCE_CHUNK_LOADING;
 
-        if (sys->config.single_thread) {
-            /* Synchronous load within frame budget. */
-            if (load_chunk_sync(sys, c)) {
-                sys->memory_used += c->estimated_size;
-            }
-            loads_this_frame++;
-        } else {
-            /* Async load via thread pool. */
-            start_chunk_load_async(sys, c);
-        }
+        if (!start_chunk_load_async(sys, c))
+            continue;
+        loads_this_frame++;
 
         LOG_TRACE(LOG_TAG, "started loading chunk %u", c->chunk_id);
 
@@ -938,7 +969,7 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
             }
         }
 
-        /* In single-thread mode, respect the frame time budget. */
+        /* Cooperative mode defers actual reads to the next budgeted pump. */
         if (sys->config.single_thread && loads_this_frame > 0) {
             double elapsed = now_ms() - start;
             if (elapsed >= (double)sys->config.frame_budget_ms)

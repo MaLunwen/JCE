@@ -10,25 +10,26 @@
  *     (borrowed, never freed) or an owned decompressed buffer.
  *   - Synchronous acquire() loads inline (serialised by io_lock for the shared
  *     decode context) and caches the result.
- *   - Asynchronous request()/poll()/tick(): with workers, each load runs as a
- *     task on the process-wide shared pool that pushes its result onto a done
- *     queue drained by tick(); without workers, request() queues the load and
- *     tick() services the queue within frame_budget_ms.
+ *   - Asynchronous request()/poll()/tick(): loads run on a private structured
+ *     executor. Threaded and cooperative modes share the same completion and
+ *     ownership path; tick() performs all cache integration on the owner.
  *
  * Concurrency: `lock` guards all cache/table/queue/counter state; `io_lock`
  * serialises jce_archive_read (shared zstd DCtx).  Workers never touch the
- * cache directly — they only produce a buffer and hand the job back via the
- * done queue, so all table mutation happens on the main thread under `lock`.
+ * cache directly, so all table mutation happens on the owner under `lock`.
  */
 
 #include <jce/resource/jce_archive_loader.h>
 
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_thread.h>
-#include <jce/os/core/jce_timer.h>
 
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+
+#define ARCHIVE_LOADER_MAX_WORKERS 16u
+#define ARCHIVE_LOADER_MAX_TASKS   1024u
 
 /* ── Load state ─────────────────────────────────────────────────────────── */
 enum { LS_LOADING = 0, LS_READY = 1, LS_FAILED = 2 };
@@ -53,7 +54,6 @@ typedef struct Job {
     uint32_t          size;
     int               borrowed;
     int               success;
-    struct Job       *next;
 } Job;
 
 /* ── Pending async request (id → hash) ──────────────────────────────────── */
@@ -85,15 +85,11 @@ struct JceArchiveLoader {
     JceArchiveRequestId next_id;
 
     /* async plumbing */
-    int           async;        /* 1 = dispatch to `pool`                    */
-    JceThreadPool *pool;        /* private, owned; see create() for why      */
+    JceAsyncExecutor *executor; /* private structured executor               */
     JceMutex     *lock;         /* guards table/queues/counters              */
     JceMutex     *io_lock;      /* serialises archive reads (shared DCtx)    */
 
-    Job          *pending_head, *pending_tail; /* inline-path queue          */
-    Job          *done_head,    *done_tail;    /* worker-completed queue     */
     uint32_t      pending_count;               /* queued + in flight         */
-    int32_t       inflight;                    /* dispatched, not yet done   */
 };
 
 /* ── Hash table ─────────────────────────────────────────────────────────── */
@@ -231,7 +227,8 @@ static void integrate(JceArchiveLoader *l, Job *j)
         /* No placeholder (shouldn't happen): create one. */
         e = ht_insert(l, j->hash);
         if (!e) {
-            if (j->success && !j->borrowed) JCE_FREE(j->buf);
+            if (j->buf && !j->borrowed) JCE_FREE(j->buf);
+            j->buf = NULL;
             return;
         }
     }
@@ -239,7 +236,8 @@ static void integrate(JceArchiveLoader *l, Job *j)
     if (e->state == LS_READY) {
         /* Already satisfied by another path (e.g. a synchronous acquire that
          * raced the worker): discard the duplicate result. */
-        if (j->success && !j->borrowed) JCE_FREE(j->buf);
+        if (j->buf && !j->borrowed) JCE_FREE(j->buf);
+        j->buf = NULL;
         return;
     }
 
@@ -254,35 +252,72 @@ static void integrate(JceArchiveLoader *l, Job *j)
     e->state = LS_READY;
     e->lru = ++l->lru_clock;
     if (!e->borrowed) l->bytes += e->pub.size;
+    j->buf = NULL; /* cache owns the decoded bytes now */
     enforce_budget(l);
 }
 
-/* ── Worker entry point ─────────────────────────────────────────────────── */
+/* ── Structured async callbacks ────────────────────────────────────────── */
 
-static void job_worker(void *arg)
+static JceAsyncRunResult job_worker(JceAsyncContext *ctx, void *arg)
+{
+    Job *j = (Job *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
+    do_load(j->loader, j);
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    if (!j->success) {
+        jce_async_context_fail(ctx, -1, "archive resource load failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
+}
+
+static void job_complete(JceAsyncTask *task, void *arg)
 {
     Job *j = (Job *)arg;
     JceArchiveLoader *l = j->loader;
-
-    do_load(l, j);
+    if (jce_async_task_state(task) != JCE_ASYNC_STATE_SUCCEEDED)
+        j->success = 0;
 
     jce_mutex_lock(l->lock);
-    j->next = NULL;
-    if (l->done_tail) l->done_tail->next = j;
-    else              l->done_head = j;
-    l->done_tail = j;
-    l->inflight--;
+    integrate(l, j);
+    if (l->pending_count > 0) l->pending_count--;
     jce_mutex_unlock(l->lock);
 }
 
-/* Hand `j` to the loader's own pool, or run it here if there is none or the
- * submit failed.  Never called with `lock` held — job_worker takes it.
- * Dropping the job instead is not an option: `inflight` would never fall back
- * to 0 and destroy() would hang. */
-static void dispatch_or_run(JceArchiveLoader *l, Job *j)
+static void job_cleanup(void *arg)
 {
-    if (!l->pool || !jce_thread_pool_submit(l->pool, job_worker, j))
-        job_worker(j);
+    Job *j = (Job *)arg;
+    if (j->buf && !j->borrowed) JCE_FREE(j->buf);
+    JCE_FREE(j);
+}
+
+/* Submission is non-inline. On rejection, restore the cache to its state
+ * before begin_load() so callers can retry on a later frame. Lock held. */
+static int dispatch_job(JceArchiveLoader *l, Job *j)
+{
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = job_worker;
+    desc.complete   = job_complete;
+    desc.cleanup    = job_cleanup;
+    desc.user_data  = j;
+    desc.debug_name = "archive.resource.load";
+    desc.priority   = JCE_ASYNC_PRIORITY_NORMAL;
+
+    JceAsyncTask *task = jce_async_submit(l->executor, &desc);
+    if (task) {
+        jce_async_task_release(task);
+        return 1;
+    }
+
+    CacheEntry *e = ht_find(l, j->hash);
+    if (e && e->state == LS_LOADING) ht_remove(l, e);
+    if (l->pending_count > 0) l->pending_count--;
+    job_cleanup(j);
+    return 0;
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -341,6 +376,8 @@ JceArchiveLoader *jce_archive_loader_create(JceArchive *archive,
     l->frame_ms = (cfg && cfg->frame_budget_ms > 0.0) ? cfg->frame_budget_ms : 2.0;
     l->verify = cfg ? cfg->verify_crc : 0;
     l->worker_count = cfg ? cfg->worker_count : 0;
+    if (l->worker_count > ARCHIVE_LOADER_MAX_WORKERS)
+        l->worker_count = ARCHIVE_LOADER_MAX_WORKERS;
     l->next_id = 1;
 
     l->bucket_count = 64;
@@ -352,27 +389,22 @@ JceArchiveLoader *jce_archive_loader_create(JceArchive *archive,
         return NULL;
     }
 
-    if (l->worker_count > 0) {
-        /* A PRIVATE pool, deliberately not jce_thread_pool_shared().
-         *
-         * This briefly borrowed the shared pool (DUP-037), on the reasoning
-         * that loads are short I/O + zstd bursts and io_lock already
-         * serialises the heavy step.  That reasoning was backwards.  io_lock
-         * is exactly what makes it unsafe: jce_thread_pool_parallel_for()
-         * waits by running ANY queued task, so a per-frame cull on the main
-         * thread could pick up a queued job_worker, block on io_lock while a
-         * worker holds it across a disk read plus a zstd inflate, and stall
-         * the frame for the duration.  Priority inversion, not a hitch.
-         *
-         * Owning the pool also gives `worker_count` from the config its
-         * meaning back.  See the private-pool note in jce_thread.h. */
-        l->pool = jce_thread_pool_create(l->worker_count + 1);
-        if (l->pool) {
-            l->async = 1;
-        } else {
-            /* fall back to the inline path rather than failing the loader */
-            l->worker_count = 0;
-        }
+    JceAsyncExecutorConfig async_cfg;
+    jce_async_executor_config_init(&async_cfg);
+    async_cfg.mode = l->worker_count > 0
+                   ? JCE_ASYNC_EXECUTION_THREADED
+                   : JCE_ASYNC_EXECUTION_COOPERATIVE;
+    async_cfg.worker_count = l->worker_count;
+    async_cfg.max_tasks = ARCHIVE_LOADER_MAX_TASKS;
+    async_cfg.cooperative_tasks_per_pump = 1;
+    async_cfg.cooperative_completions_per_pump = 64;
+    async_cfg.cooperative_time_budget_us =
+        (uint64_t)(l->frame_ms * 1000.0);
+    async_cfg.debug_name = "archive-loader";
+    l->executor = jce_async_executor_create(&async_cfg);
+    if (!l->executor) {
+        jce_archive_loader_destroy(l);
+        return NULL;
     }
     return l;
 }
@@ -381,32 +413,13 @@ void jce_archive_loader_destroy(JceArchiveLoader *loader)
 {
     if (!loader) return;
 
-    /* Wait for in-flight worker loads to land before tearing anything down.
-     * No new work is dispatched after this point.  Destroying the pool would
-     * join the workers, but this spin runs FIRST and is the real barrier: a
-     * job that has already dropped `inflight` under `lock` is done touching
-     * the loader, which is the state the frees below need — pool teardown
-     * alone would not tell us that. */
-    if (loader->async) {
-        for (;;) {
-            jce_mutex_lock(loader->lock);
-            int32_t infl = loader->inflight;
-            jce_mutex_unlock(loader->lock);
-            if (infl <= 0) break;
-            jce_thread_sleep_ms(1);
-        }
+    if (loader->executor) {
+        (void)jce_async_executor_shutdown(loader->executor,
+                                          JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+                                          JCE_ASYNC_WAIT_INFINITE);
+        jce_async_executor_destroy(loader->executor);
+        loader->executor = NULL;
     }
-    if (loader->pool) {
-        jce_thread_pool_destroy(loader->pool);
-        loader->pool = NULL;
-        loader->async = 0;
-    }
-
-    /* Free queued + completed jobs. */
-    Job *j = loader->pending_head;
-    while (j) { Job *n = j->next; if (j->success && !j->borrowed) JCE_FREE(j->buf); JCE_FREE(j); j = n; }
-    j = loader->done_head;
-    while (j) { Job *n = j->next; if (j->success && !j->borrowed) JCE_FREE(j->buf); JCE_FREE(j); j = n; }
 
     /* Free requests. */
     Request *r = loader->requests;
@@ -528,16 +541,9 @@ JceArchiveRequestId jce_archive_loader_request(JceArchiveLoader *loader, const c
     if (!e) {
         Job *j = begin_load(loader, hash);
         if (!j) { jce_mutex_unlock(loader->lock); return 0; } /* absent */
-        if (loader->async) {
-            loader->inflight++;
+        if (!dispatch_job(loader, j)) {
             jce_mutex_unlock(loader->lock);
-            dispatch_or_run(loader, j);
-            jce_mutex_lock(loader->lock);
-        } else {
-            j->next = NULL;
-            if (loader->pending_tail) loader->pending_tail->next = j;
-            else                      loader->pending_head = j;
-            loader->pending_tail = j;
+            return 0;
         }
     }
 
@@ -585,49 +591,16 @@ int jce_archive_loader_poll(JceArchiveLoader *loader, JceArchiveRequestId id,
 
 void jce_archive_loader_tick(JceArchiveLoader *loader)
 {
-    if (!loader) return;
+    if (!loader || !loader->executor) return;
 
-    /* 1. Integrate worker-completed jobs (worker path). */
-    jce_mutex_lock(loader->lock);
-    Job *done = loader->done_head;
-    loader->done_head = loader->done_tail = NULL;
-    jce_mutex_unlock(loader->lock);
-
-    while (done) {
-        Job *next = done->next;
-        jce_mutex_lock(loader->lock);
-        integrate(loader, done);
-        if (loader->pending_count > 0) loader->pending_count--;
-        jce_mutex_unlock(loader->lock);
-        JCE_FREE(done);
-        done = next;
-    }
-
-    /* 2. Inline path: service queued loads within the frame budget (§14.1). */
-    if (loader->async) return;
-
-    uint64_t start = jce_time_perf_counter();
-    for (;;) {
-        jce_mutex_lock(loader->lock);
-        Job *j = loader->pending_head;
-        if (j) {
-            loader->pending_head = j->next;
-            if (!loader->pending_head) loader->pending_tail = NULL;
-        }
-        jce_mutex_unlock(loader->lock);
-        if (!j) break;
-
-        do_load(loader, j);
-
-        jce_mutex_lock(loader->lock);
-        integrate(loader, j);
-        if (loader->pending_count > 0) loader->pending_count--;
-        jce_mutex_unlock(loader->lock);
-        JCE_FREE(j);
-
-        if (jce_time_perf_to_ms(start, jce_time_perf_counter()) >= loader->frame_ms)
-            break; /* defer the rest to a later tick */
-    }
+    JceAsyncPumpBudget budget;
+    jce_async_pump_budget_init(&budget);
+    budget.max_work_items =
+        jce_async_executor_mode(loader->executor) ==
+        JCE_ASYNC_EXECUTION_COOPERATIVE ? 1u : 0u;
+    budget.max_completions = 64;
+    budget.max_time_us = (uint64_t)(loader->frame_ms * 1000.0);
+    (void)jce_async_executor_pump(loader->executor, &budget);
 }
 
 void jce_archive_loader_preload(JceArchiveLoader *loader, const char *path)
@@ -639,18 +612,7 @@ void jce_archive_loader_preload(JceArchiveLoader *loader, const char *path)
     jce_mutex_lock(loader->lock);
     if (!ht_find(loader, hash)) {
         Job *j = begin_load(loader, hash);
-        if (j) {
-            if (loader->async) {
-                loader->inflight++;
-                jce_mutex_unlock(loader->lock);
-                dispatch_or_run(loader, j);
-                return;
-            }
-            j->next = NULL;
-            if (loader->pending_tail) loader->pending_tail->next = j;
-            else                      loader->pending_head = j;
-            loader->pending_tail = j;
-        }
+        if (j) (void)dispatch_job(loader, j);
     }
     jce_mutex_unlock(loader->lock);
 }

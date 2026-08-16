@@ -10,9 +10,13 @@ $input v_normal, v_curClip, v_prevClip
  *
  * The velocity encoding is identical to fs_motion_vec.sc so fs_taa.sc consumes
  * it unchanged.  Zero motion -> (0.5,0.5), matching the shared MRT clear.
- * This engine maps screen UV -> NDC as uv*2-1 with NO Y flip on every backend
- * (fs_motion_vec reconstructs world from v_texcoord0*2-1, validated by the
- * camera path), so the screen-space delta equals the clip-NDC delta.
+ * The invariant is that s_texMotion carries a TRUE CLIP-NDC delta on every
+ * backend -- which is what v_curClip / v_prevClip give here for free, straight
+ * out of the vertex pipeline.  Screen UV -> NDC is NOT uv*2-1 everywhere: that
+ * holds only on GL (bottom-left origin, after vs_postfx.sc's V-flip); on
+ * D3D/VK/Metal uv.y grows DOWN so ndc.y = 1 - 2*uv.y.  fs_motion_vec.sc
+ * branches on that to produce the same encoding, and fs_taa.sc / fs_tsr.sc
+ * branch on it again turning the NDC delta back into a UV offset.
  */
 uniform vec4 u_gbufferMat;   /* x = roughness */
 

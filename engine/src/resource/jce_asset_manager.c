@@ -368,9 +368,14 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
             }
         }
 
-        jce_pool_submit(mgr->pool, asset_type_to_async(type),
-                        idx, slot->generation, asset_path,
-                        mgr->pak, mgr->fs, &info);
+        if (!jce_pool_submit(mgr->pool, asset_type_to_async(type),
+                             idx, slot->generation, asset_path,
+                             mgr->pak, mgr->fs, &info)) {
+            JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
+            mgr->failed_loads++;
+            fire_asset_error(mgr, slot, idx, JCE_ASSET_ERR_INTERNAL,
+                             "async submission rejected");
+        }
     }
 
     return handle;

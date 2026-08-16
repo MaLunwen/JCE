@@ -24,8 +24,10 @@ extern "C" {
 #include <jce/application/jce_runtime.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/os/platform/jce_host_dialog.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_window.h>
@@ -39,6 +41,7 @@ extern "C" {
 #include "core/jce_editor.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_game_input_bridge.h"
+#include "core/jce_editor_headless_build.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
 #include "core/jce_build_manager.h"
@@ -62,6 +65,16 @@ static EditorState g_state;
 static uint64_t g_startup_t0;
 static bool g_startup_reported;
 static uint64_t g_last_update_counter;
+static bool g_headless_build_mode;
+
+static void editor_shutdown_diag(const char *phase)
+{
+    const char *diag = getenv("JCE_SHUTDOWN_DIAG");
+    if (!diag || !diag[0] || diag[0] == '0')
+        return;
+    LOG_INFO("editor-main", "shutdown: %s", phase);
+    jce_log_flush();
+}
 
 static void play_commit_pointer(void *, float dx, float dy, float wheel,
                                 uint32_t buttons)
@@ -83,6 +96,26 @@ static void play_commit_actions(void *, const JceInputActions *actions)
 static void play_commit_step(void *, float dt)
 {
     jce_state_play_mode_tick(dt);
+}
+
+/* The engine's hardware-fed action map.  g_state is file-static here, so
+ * panels that need pad input reach it through this accessor rather than a
+ * second copy of the services pointer. */
+const JceInputActions *jce_editor_engine_actions(void)
+{
+    return (g_state.svc && g_state.svc->actions) ? g_state.svc->actions
+                                                 : nullptr;
+}
+
+/* The engine's live input system, same lifetime rule as the map above: `svc`
+ * is stamped in editor_app_init(), so this answers from editor startup onward
+ * and in EDIT mode -- it is NOT gated on Play.  The Input Manager's device
+ * strip is the caller, and it must see a pad while the owner is authoring.
+ * See the contract at the declaration for why this one is not const. */
+JceInput *jce_editor_engine_input(void)
+{
+    return (g_state.svc && g_state.svc->input) ? g_state.svc->input
+                                               : nullptr;
 }
 
 /* ── KPI: startup latency ──────────────────────────────────────────── */
@@ -157,6 +190,11 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
+
+    if (g_headless_build_mode) {
+        jce_build_manager_init();
+        return jce_editor_headless_build_initialize();
+    }
 
     /* Editor authoring default: float the render pipeline to at least HIGH so the
      * stylized look (toon shading, 5-mip bloom, stylized sky dome, wrap/rim look
@@ -253,17 +291,34 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 static void editor_app_exit(void *ud)
 {
     (void)ud;
+    editor_shutdown_diag("application callback begin");
+    if (g_headless_build_mode) {
+        jce_editor_headless_build_shutdown();
+        jce_build_manager_shutdown();
+        editor_shutdown_diag("headless application stopped");
+        return;
+    }
     /* Detach dialogs before tearing down the window. */
     jce_host_dialog_set_parent_jce_window(NULL);
+    editor_shutdown_diag("host dialogs detached");
     jce_editor_game_render_shutdown();
+    editor_shutdown_diag("game renderer stopped");
     jce_editor_scene_render_shutdown();
+    editor_shutdown_diag("scene renderer stopped");
     jce_editor_shutdown();
+    editor_shutdown_diag("editor UI stopped");
 }
 
 static void editor_app_update(float dt, void *ud)
 {
     (void)dt;
     (void)ud;
+
+    if (g_headless_build_mode) {
+        jce_build_manager_poll();
+        jce_editor_headless_build_poll();
+        return;
+    }
 
     /* Engine passes 0.0f; compute a real delta from the perf counter. */
     uint64_t now = jce_time_perf_counter();
@@ -369,6 +424,8 @@ static void editor_app_update(float dt, void *ud)
 static void editor_app_draw(const JceServices *svc, void *ud)
 {
     (void)ud;
+    if (g_headless_build_mode)
+        return;
     /* Scene rendering is triggered from inside the ImGui scene panel
      * (jce_editor_scene_render_frame) so it renders to the FBO at the
      * panel's actual size; ImGui then displays the texture. */
@@ -386,6 +443,8 @@ static void editor_app_draw(const JceServices *svc, void *ud)
 static void editor_app_event(const JceEvent *event, void *ud)
 {
     (void)ud;
+    if (g_headless_build_mode)
+        return;
 
     if (event->type == JCE_EVENT_QUIT
         && !jce_editor_layout_is_quit_confirmed())
@@ -399,7 +458,9 @@ static void editor_app_event(const JceEvent *event, void *ud)
 static bool editor_should_quit(void *ud)
 {
     (void)ud;
-    return jce_editor_layout_is_quit_confirmed();
+    return g_headless_build_mode
+        ? jce_editor_headless_build_should_quit()
+        : jce_editor_layout_is_quit_confirmed();
 }
 
 /* ── JCE entry point (engine owns SDL) ─────────────────────────────── */
@@ -451,15 +512,21 @@ extern "C" JceAppDesc editor_app_get_desc(void)
 #endif
     g_startup_t0 = jce_time_perf_counter();
     g_startup_reported = false;
+    jce_trace_set_enabled(true);
+    jce_trace_thread_register("MAIN");
 
     /* Apply renderer override before jce_engine_create() picks a backend. */
-    configure_engine_renderer_from_editor_config();
+    g_headless_build_mode =
+        jce_editor_headless_build_environment_present();
+    if (!g_headless_build_mode)
+        configure_engine_renderer_from_editor_config();
 
     JceAppDesc desc = {};
     desc.name          = "JCE Editor";
     desc.maximized     = true;
     desc.window_width  = 1600;
     desc.window_height = 900;
+    desc.headless   = g_headless_build_mode;
     desc.init      = editor_app_init;
     desc.exit      = editor_app_exit;
     desc.update    = editor_app_update;

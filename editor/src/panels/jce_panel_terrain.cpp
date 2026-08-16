@@ -19,6 +19,7 @@
 #include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
+#include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -82,6 +83,24 @@ struct PanelState {
     int preview_w = 0;
     int preview_h = 0;
     bool preview_dirty = true;
+
+    /* ── Generators (cook-time passes over the whole grid) ────────────
+     * These were implemented and unit-tested with no way for an artist to
+     * reach them, which makes them shelf-ware however correct they are.
+     * They are whole-grid operations, so they live here rather than on the
+     * brush: a brush edits where you drag, a generator rewrites the map. */
+    unsigned gen_seed       = 1337u;
+    int      gen_octaves    = 0;        /* 0 = the filter's tuned default */
+    float    gen_strength   = 0.0f;     /* 0 = default                    */
+    float    gen_detail     = 0.0f;     /* 0 = default                    */
+    float    talus_angle    = 35.0f;
+    int      talus_iters    = 8;
+    float    talus_strength = 0.5f;
+    int      occl_dirs      = 16;
+    /* Sky-occlusion output, kept so the artist can see it took effect and a
+     * later cook can consume it without recomputing. */
+    std::vector<float> sky_visibility;
+    std::vector<float> ridge_field;
 } s;
 
 /* ── Local undo for brush edits ────────────────────────────────────
@@ -211,6 +230,14 @@ void rebuild_preview()
     s.preview_h = ph;
     s.preview_pixels.resize((size_t)pw * (size_t)ph, 0xFF000000u);
     const float *heights = jce_terrain_heights(s.terrain);
+    if (!heights) {
+        /* Tiled / procedural: no resident height grid to preview. Leave the
+         * cleared image rather than dereferencing NULL -- this runs from
+         * draw_preview_section on the frame after Load, and a `"procedural":
+         * true` meta reaches it. */
+        s.preview_dirty = false;
+        return;
+    }
     for (int j = 0; j < ph; ++j) {
         for (int i = 0; i < pw; ++i) {
             int x = std::min(i * step, w - 1);
@@ -285,6 +312,14 @@ void draw_toolbar()
                 /* Force the Scene View renderer to re-load this terrain
                  * so authoring edits are reflected immediately.  Invalidate
                  * by both the scene-relative key and the absolute path. */
+                /* The shared terrain cache is the authority: renderer, pick
+                 * pass and physics all BORROW one loaded grid per path.
+                 * Invalidating only the renderer drops its chunk meshes and
+                 * then rebuilds them from exactly the same stale heights. */
+                if (JceScene *sc = jce_state_get_scene()) {
+                    jce_scene_invalidate_terrain(sc, s.io_path);
+                    jce_scene_invalidate_terrain(sc, save_path);
+                }
                 JceSceneRenderer *sr = jce_editor_get_scene_renderer();
                 if (sr) {
                     jce_scene_renderer_invalidate_terrain(sr, s.io_path);
@@ -369,11 +404,18 @@ void draw_heightmap_io_section()
                 s.preview_dirty = true;
                 /* Force the Scene View renderer to re-load this terrain so the
                  * imported relief shows up immediately (matches the Save path). */
+                char tr[1024];
+                const bool have_abs =
+                    jce_editor_resolve_asset_path(s.io_path, tr, sizeof(tr));
+                /* Shared cache first -- see the Save path above. */
+                if (JceScene *sc = jce_state_get_scene()) {
+                    jce_scene_invalidate_terrain(sc, s.io_path);
+                    if (have_abs) jce_scene_invalidate_terrain(sc, tr);
+                }
                 JceSceneRenderer *sr = jce_editor_get_scene_renderer();
                 if (sr) {
                     jce_scene_renderer_invalidate_terrain(sr, s.io_path);
-                    char tr[1024];
-                    if (jce_editor_resolve_asset_path(s.io_path, tr, sizeof(tr)))
+                    if (have_abs)
                         jce_scene_renderer_invalidate_terrain(sr, tr);
                 }
             } else {
@@ -430,6 +472,101 @@ void draw_brush_section()
         ImGui::TextDisabled("%s", jce_editor_i18n("terrain.brush.needTerrain"));
         return;
     }
+    if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.gen.header"))) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("terrain.gen.hint"));
+
+        /* ── Gully erosion ──────────────────────────────────────────── */
+        ImGui::SeparatorText(jce_editor_i18n("terrain.gen.gully"));
+        int seed_i = (int)s.gen_seed;
+        if (ImGui::InputInt(jce_editor_i18n_id("terrain.gen.seed", "##tgenseed"), &seed_i))
+            s.gen_seed = (unsigned)(seed_i < 0 ? 0 : seed_i);
+        ImGui::SliderInt(jce_editor_i18n("terrain.gen.octaves"), &s.gen_octaves, 0, 8);
+        ImGui::SliderFloat(jce_editor_i18n("terrain.gen.strength"), &s.gen_strength, 0.0f, 40.0f);
+        ImGui::SliderFloat(jce_editor_i18n("terrain.gen.detail"), &s.gen_detail, 0.0f, 4.0f);
+        if (ImGui::Button(jce_editor_i18n("terrain.gen.applyErosion"))) {
+            push_undo();
+            JceTerrainErosionParams ep;
+            memset(&ep, 0, sizeof ep);
+            ep.seed      = s.gen_seed;
+            ep.octaves   = s.gen_octaves;
+            ep.strength  = s.gen_strength;
+            ep.detail    = s.gen_detail;
+            /* Capture the ridge mask too: it is nearly free here and is what
+             * splat weights and foliage density want instead of a hand-painted
+             * mask.  Sized to the grid so a later cook can ship it. */
+            const size_t cells = (size_t)jce_terrain_width(s.terrain) *
+                                 (size_t)jce_terrain_height(s.terrain);
+            s.ridge_field.assign(cells, 0.0f);
+            if (jce_terrain_apply_erosion(s.terrain, &ep, s.ridge_field.data())) {
+                /* Preview only.  The renderer, pick pass and collider read
+                 * the SHARED cache, which reflects what is on DISK -- this
+                 * panel holds its own mutable authoring copy, so a generator
+                 * result reaches them at Save, exactly like a brush stroke.
+                 * Invalidating here would drop their caches and have them
+                 * reload the unchanged file. */
+                s.preview_dirty = true;
+            } else {
+                /* Refused (e.g. a tiled terrain with no resident grid): drop
+                 * the undo entry we just pushed rather than leaving a
+                 * no-op step in the stack. */
+                if (!s_undo.empty()) s_undo.pop_back();
+                s.ridge_field.clear();
+            }
+        }
+
+        /* ── Thermal / talus ────────────────────────────────────────── */
+        ImGui::SeparatorText(jce_editor_i18n("terrain.gen.thermal"));
+        ImGui::SliderFloat(jce_editor_i18n("terrain.gen.reposeAngle"), &s.talus_angle, 5.0f, 80.0f, "%.0f");
+        ImGui::SliderInt(jce_editor_i18n("terrain.gen.iterations"), &s.talus_iters, 1, 200);
+        ImGui::SliderFloat(jce_editor_i18n("terrain.gen.rate"), &s.talus_strength, 0.05f, 1.0f);
+        if (ImGui::Button(jce_editor_i18n("terrain.gen.applyThermal"))) {
+            push_undo();
+            JceTerrainThermalParams tp;
+            memset(&tp, 0, sizeof tp);
+            tp.talus_angle_deg = s.talus_angle;
+            tp.iterations      = s.talus_iters;
+            tp.strength        = s.talus_strength;
+            if (jce_terrain_apply_thermal(s.terrain, &tp)) {
+                /* Preview only.  The renderer, pick pass and collider read
+                 * the SHARED cache, which reflects what is on DISK -- this
+                 * panel holds its own mutable authoring copy, so a generator
+                 * result reaches them at Save, exactly like a brush stroke.
+                 * Invalidating here would drop their caches and have them
+                 * reload the unchanged file. */
+                s.preview_dirty = true;
+            } else if (!s_undo.empty()) {
+                s_undo.pop_back();
+            }
+        }
+
+        /* ── Sky occlusion ──────────────────────────────────────────── */
+        ImGui::SeparatorText(jce_editor_i18n("terrain.gen.skyOcclusion"));
+        ImGui::SliderInt(jce_editor_i18n("terrain.gen.directions"), &s.occl_dirs, 4, 64);
+        if (ImGui::Button(jce_editor_i18n("terrain.gen.bakeOcclusion"))) {
+            const size_t cells = (size_t)jce_terrain_width(s.terrain) *
+                                 (size_t)jce_terrain_height(s.terrain);
+            s.sky_visibility.assign(cells, 1.0f);
+            /* Read-only: no undo entry, because it does not touch heights. */
+            if (!jce_terrain_bake_sky_occlusion(s.terrain, s.occl_dirs,
+                                                s.sky_visibility.data(), NULL))
+                s.sky_visibility.clear();
+        }
+        if (!s.sky_visibility.empty()) {
+            double sum = 0.0;
+            float lo = 1.0f, hi = 0.0f;
+            for (float v : s.sky_visibility) {
+                sum += v;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            ImGui::Text(jce_editor_i18n("terrain.gen.visibilityStats"),
+                        (double)lo, (double)hi,
+                        sum / (double)s.sky_visibility.size());
+        }
+        if (!s.ridge_field.empty())
+            ImGui::Text(jce_editor_i18n("terrain.gen.ridgeSamples"), (int)s.ridge_field.size());
+    }
+
     if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.brush.header"), ImGuiTreeNodeFlags_DefaultOpen)) {
         int tool = (int)s.tool;
         if (ImGui::Combo(jce_editor_i18n("terrain.brush.tool"), &tool, "Sculpt\0Splat\0Holes\0\0")) {

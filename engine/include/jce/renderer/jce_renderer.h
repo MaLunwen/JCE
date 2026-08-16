@@ -204,6 +204,34 @@ JCE_API bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t
 /* -1 = idle, 0 = pending (call again next frame), 1 = wrote PNG, 2 = write failed. */
 JCE_API int  jce_renderer_readback_capture_poll(void);
 
+/* PNG encoding for path-mode captures runs on a writer thread, because doing
+ * it inline cost ~100 ms per screenshot and tripped the fixed clock's spiral
+ * guard.  _poll() therefore returns once the pixels have been handed over,
+ * not once the file exists.
+ *   _flush()    - block until every queued capture has been written.  Call
+ *                 before a process exits or before reading the files back.
+ *   _shutdown() - flush, then stop and join the writer thread. */
+/* Which GPU to ask for on a machine that has more than one.  Accepts "auto"
+ * (driver default), "integrated"/"intel", "discrete"/"nvidia"/"amd", or a raw
+ * PCI vendor id like "0x10DE".  MUST be set before the renderer is created --
+ * bgfx binds the adapter at init and cannot be moved without a restart -- so
+ * a UI that changes this has to tell the user it applies next launch.  When
+ * unset, the JCE_GPU_ADAPTER environment variable is consulted instead.
+ * An adapter that is not present is not an error: the driver default is used,
+ * which is what makes "discrete" safe to request on a machine without one. */
+JCE_API void jce_renderer_set_gpu_adapter_preference(const char *name);
+
+/* Adapters the driver reported, filled after the renderer exists.  Returns
+ * the number written (0 when the backend does not enumerate). */
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t device_id;
+} JceGpuAdapter;
+JCE_API uint32_t jce_renderer_get_gpu_adapters(JceGpuAdapter *out, uint32_t cap);
+
+JCE_API void jce_renderer_readback_capture_flush(void);
+JCE_API void jce_renderer_readback_capture_shutdown(void);
+
 /* Recording variant of _submit: instead of writing a PNG, the poll converts the
  * read-back to BGRA8 and feeds it to the capture sink (video encoder).  Shares
  * the single in-flight slot with _submit; returns false if busy (skip the frame).

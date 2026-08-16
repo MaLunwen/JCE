@@ -18,6 +18,7 @@
 extern "C" {
 #endif
 
+#include <jce/middleware/world/jce_atmosphere.h>
 #include <jce/middleware/world/jce_gas.h>
 #include <jce/middleware/world/jce_road_network.h>
 #include <jce/middleware/world/jce_spawn_manager.h>

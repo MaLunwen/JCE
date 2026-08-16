@@ -34,7 +34,19 @@
 #include <float.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Non-faulting hint: bring a line toward L1 without stalling if it is absent.
+ * Local to this file until a second caller wants it. */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#  include <xmmintrin.h>
+#  define JCE_PREFETCH(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define JCE_PREFETCH(p) __builtin_prefetch((const void *)(p), 0, 3)
+#else
+#  define JCE_PREFETCH(p) ((void)(p))
+#endif
 
 #define LOG_TAG "space_partition"
 
@@ -94,6 +106,13 @@ struct JceSpaceIndex {
     uint32_t      free_cap;
 
     uint32_t      query_epoch;
+
+    /* Work counters from the most recent frustum query.  Banked here rather
+     * than logged in place: a query runs on whatever thread called it. */
+    uint32_t      q_cells_walked;
+    uint32_t      q_cells_acc;
+    uint32_t      q_objs_visited;
+    uint32_t      q_objs_tested;
 };
 
 /* ================================================================== */
@@ -223,6 +242,12 @@ static bool jce__aabb_overlap(JceAABB a, JceAABB b)
 static bool jce__aabb_inside_frustum(JceAABB b, const jce_vec4 planes[6])
 {
     return jce_aabb_in_frustum(planes, b.min, b.max);
+}
+
+static inline bool jce__aabb_in_frustum_fast(JceAABB b, const jce_vec4 planes[6],
+                                             const float absn[6][3])
+{
+    return jce_aabb_in_frustum_fast(planes, absn, b.min, b.max);
 }
 
 static bool jce__sphere_aabb(jce_vec3 c, float r, JceAABB b)
@@ -570,11 +595,152 @@ uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
     const uint32_t epoch = ++g->query_epoch;
     uint32_t found = 0;
 
+    /* Hoist |n| once for the whole query: the per-box test then has no sign
+     * tests or selects.  Same predicate, by identity -- see jce_frustum.h. */
+    float absn[6][3];
+    jce_frustum_abs_normals(planes, absn);
+
+    /* A uniform grid only pays when cells outnumber the objects they hold.
+     * Large flat geometry breaks that: street_demo registers 832 objects across
+     * 69696 occupied cells -- 84 cells per object, because a road or a terrain
+     * chunk spans hundreds of them -- so the cell walk ran 69696 frustum tests
+     * to filter 832 objects, and that WAS the frame's scene cost (sr_vis 0.97 ms
+     * of a 2.04 ms frame that issued 218 draws).
+     *
+     * The opposite regime is just as real: the 200k bench holds 200833 objects
+     * in 14393 occupied cells on a 145x75x145 grid, and the coarse reject keeps
+     * only 905 of them (6.3%) -- the grid is worth an order of magnitude there.
+     * So this is a per-query decision, not a configuration one.
+     *
+     * Walking the objects directly is not an approximation: each gets the same
+     * per-object test it would get through a cell, and the epoch dedup a
+     * multi-cell object needs is moot because each object is visited once.  A
+     * cell walk can be TIGHTER -- rejecting a long thin box by its cells
+     * resolves a frustum corner finer than any single whole-box test -- so this
+     * path may emit a few extra objects.  That is the conservative direction,
+     * and the one the broad-phase contract allows. */
+    if (g->obj_count > 0 && g->occupied_count >= g->obj_count) {
+        for (uint32_t slot = 0; slot < g->obj_count; slot++) {
+            JceSpaceObj *o = &g->objs[slot];
+            if (o->cmin[0] < 0) continue;              /* freed slot */
+            o->epoch = epoch;
+            if (!jce__aabb_in_frustum_fast(o->bounds, planes, absn)) continue;
+            if (out_ids && found < max) out_ids[found] = o->user_id;
+            found++;
+            if (out_ids && found >= max) return found;
+        }
+        return found;
+    }
+
     /* Iterate only the OCCUPIED cells (a dense list maintained on push/remove)
      * instead of all res³ — on a sparse streamed world the empty-space scan is
      * what made a fine grid expensive, and it produced ZERO extra candidates.
      * Same per-cell coarse frustum reject + per-object dedup as before, so the
      * result set is byte-identical to the full scan. */
+    /* PARALLELISING this walk was tried too, and it is the most interesting
+     * failure of the four. The whole-process sampler (JCE_SAMPLER_ALL=1) shows
+     * every worker thread parked at 100% in a wait while the main thread spends
+     * ~21% here, so fanning 14,393 independent cells across an idle pool looks
+     * free. It is not:
+     *
+     *     serial    query median 0.827 ms   (0.816-0.854)
+     *     parallel  query median 0.909 ms   (0.887-1.008)
+     *
+     * and the sampler says exactly why. With the parallel path on, the workers
+     * DO run jce__space_q_range and enkiTS SplitAndAdd/TryRunTask appear -- and
+     * MAIN's 21% in the query becomes 20% in NtWaitForSingleObject. It traded
+     * work for waiting. The dispatch and wake of parked workers costs about
+     * what the walk costs, because the walk is only ~0.8 ms and the main thread
+     * must block on the result before it can do anything else.
+     *
+     * So the lever is not fan-out. It is PIPELINING -- overlapping the query
+     * with main-thread work that does not depend on it -- which is a change to
+     * the frame's dependency chain, not to this function. Do not re-try the
+     * fan-out without first breaking that dependency.
+     *
+     * (The implementation itself was sound and is worth rebuilding if that
+     * dependency ever breaks: read-only parallel phase over objs[], no epoch
+     * writes so no false sharing, slots appended through one atomic cursor in
+     * 256-wide batches, then a single serial pass to stamp epochs, dedup and
+     * convert slots to user_ids in place. Visible counts matched exactly.)
+     */
+
+    /* THREE memory-layout changes have been tried on the loop below and all
+     * three measured as nothing. Recorded together because the pattern is the
+     * finding, not any one of them:
+     *
+     *   inline the AABB in the cell item   13.90 vs 13.67 ns/unit   slower
+     *   split hot(32B)/cold(24B) records    query 0.872 -> 0.963 median,
+     *                                       ranges 0.853-1.161 vs 0.742-0.970
+     *
+     * The third of them, accepting a fully-inside cell's contents untested, has
+     * since SHIPPED -- see the classify below. It measured -3.4% and inside the
+     * noise the first time, and this note said why and named the condition to
+     * retry under: "a camera INSIDE a dense field would flip that, and nothing
+     * here can produce one". JCE_BENCH_CAM can now produce one, and under it:
+     *     per-object tests   199,675 -> 66,183   -67%
+     *     query median       2.980 -> 1.909 ms   (2.884-2.995 vs 1.882-2.051)
+     * Same visible count, 194,667, in all six runs. The rejection was right for
+     * the load it was measured on and wrong as a general conclusion, which is
+     * the argument for writing the retry condition down rather than just the
+     * verdict.
+     *
+     * All were interleaved A/B, three rounds, identical visible counts. The
+     * third is the most instructive: 32-byte records never straddle a cache
+     * line where 56-byte ones straddle ~44% of the time, and the working set
+     * drops 11.2 -> 6.4 MB, yet the median moved the WRONG way.
+     *
+     * The reading that fits all three: the prefetch a few lines down already
+     * covers the latency this loop would otherwise stall on, so bytes-touched
+     * is no longer the binding constraint and shrinking them buys nothing. What
+     * would move it is fewer object tests (67688 for 25433 visible) or fewer
+     * cells walked -- an algorithmic change, not a layout one. Bring a
+     * measurement, not a cache-line argument.
+     */
+
+    /* Counters, not timers, and NOT logged from here.
+     *
+     * Counters because bracketing a loop body this hot with rdtsc costs more
+     * than the body -- the per-entity probes in the submit loop inflate it 2.6x
+     * (sr_loop 2.12 -> 7.55 ms at the 200k bench), which makes their
+     * percentages upper bounds rather than measurements. Counting is free and
+     * exact; divide by the phase timer the caller already keeps.
+     *
+     * Not logged from here because a query runs in whatever context called it,
+     * including job threads, and logging from one crashed this engine before.
+     * The numbers are banked on the index and printed by the caller. */
+    uint32_t n_cell_acc = 0, n_obj_visit = 0, n_obj_test = 0;
+
+    /* A cell lists SLOT INDICES, and JceSpaceObj is 56 bytes, so an accepted
+     * cell turns into a scatter over an 11 MB array at the 200k bench (85155
+     * slot touches per frame).  That is memory latency, not arithmetic, so walk
+     * ahead in the (contiguous) item list and prefetch the object the loop will
+     * want a few iterations from now.  JCE_CULL_PREFETCH tunes the distance;
+     * 0 disables, which is how the effect was measured. */
+    static int s_pf = -2;
+    if (s_pf == -2) {
+        const char *v = getenv("JCE_CULL_PREFETCH");
+        s_pf = (v && v[0]) ? atoi(v) : 8;
+        if (s_pf < 0) s_pf = 0;
+        if (s_pf > 64) s_pf = 64;
+    }
+    const int pf_dist = s_pf;
+
+    /* Tried and rejected: carrying each object's AABB inline in the cell item
+     * so the coarse reject touches no object record at all, with epoch and
+     * user_id moved to dense side arrays.  It is the textbook answer and it
+     * does remove every scattered read -- and it measured SLOWER.
+     *
+     * Interleaved A/B, three alternating rounds, normalised by work done
+     * because occupied_count swings 14056..95782 between runs and an unnormalised
+     * comparison is meaningless here:
+     *     prefetch (this code)  13.67 ns per (cell + item)
+     *     inline-bounds item    13.90 ns per (cell + item)
+     * The prefetch already hides the latency the restructure removes, while the
+     * item grows 4 -> 28 bytes, so the win comes back as bandwidth. It also cost
+     * ~2 MB and a bounds-refresh pass on every in-place update.  Not worth it
+     * unless the walk itself gets cheaper first. */
+
     for (uint32_t oc = 0; oc < g->occupied_count; oc++) {
         const uint32_t ci = g->occupied[oc];
         /* Decompose the linear cell index back to (x,y,z) for its world AABB. */
@@ -592,21 +758,86 @@ uint32_t jce_space_query_frustum(const JceSpaceIndex *idx,
         cell_aabb.max.x = cell_aabb.min.x + cell_dx;
         cell_aabb.max.y = cell_aabb.min.y + cell_dy;
         cell_aabb.max.z = cell_aabb.min.z + cell_dz;
-        if (!jce__aabb_inside_frustum(cell_aabb, planes)) continue;
+        /* Tried and rejected: classify the cell three ways and let a cell that
+         * is FULLY inside the frustum answer for its contents, skipping the
+         * per-object test entirely. The reasoning is sound -- an object is only
+         * registered in cells it overlaps, so a non-empty overlap inside the
+         * frustum proves the object intersects it -- and the extra cost is one
+         * subtract and compare per plane on the CELL test only.
+         *
+         * It does not pay here. 478 of 855 accepted cells classify as fully
+         * inside, but they hold ~3% of the objects: a dense field mostly
+         * OUTSIDE the frustum meets it at the boundary, and boundary cells
+         * straddle by definition. Interleaved A/B, three rounds, identical
+         * visible count (25433) both ways:
+         *     per-object tests  67688 -> 65366   (-3.4%)
+         *     query median      0.977 -> 0.957 ms, ranges 0.955-1.096 vs
+         *                       0.948-1.110 -- overlapping, so not a result.
+         * A camera INSIDE a dense field would flip that, and nothing here can
+         * produce one; revisit with such a load, not on this evidence. */
+        /* Three-way classify. A cell wholly inside the frustum answers for its
+         * contents: an object is only registered in cells it overlaps, so a
+         * non-empty overlap inside the frustum proves the object intersects it.
+         * Exact, not conservative.
+         *
+         * This was measured and reverted once (-3.4% tests, ranges overlapping)
+         * and the note said why: 478 of 855 accepted cells classified inside
+         * but held ~3% of the objects, because that camera had the field mostly
+         * OUTSIDE the frustum and met it at the boundary, where cells straddle
+         * by definition. The same note named the condition to retry under -- a
+         * camera INSIDE the field -- which JCE_BENCH_CAM can now produce. */
+        static int s_inside = -2;
+        if (s_inside == -2) {
+            const char *v = getenv("JCE_CULL_CELL_INSIDE");
+            s_inside = (v && v[0]) ? (v[0] != '0') : 1;
+        }
+        int cls;
+        if (s_inside) {
+            cls = jce_aabb_frustum_classify(planes, absn,
+                                            cell_aabb.min, cell_aabb.max);
+            if (cls == 0) continue;
+        } else {
+            if (!jce__aabb_in_frustum_fast(cell_aabb, planes, absn)) continue;
+            cls = 1;
+        }
+        n_cell_acc++;
 
         const JceCell *c = &g->cells[ci];
+        n_obj_visit += c->count;
         for (uint32_t i = 0; i < c->count; i++) {
             const uint32_t slot = c->items[i];
+            if (pf_dist && i + (uint32_t)pf_dist < c->count)
+                JCE_PREFETCH(&g->objs[c->items[i + (uint32_t)pf_dist]]);
             JceSpaceObj *o = &g->objs[slot];
             if (o->epoch == epoch) continue;
             o->epoch = epoch;
-            if (!jce__aabb_inside_frustum(o->bounds, planes)) continue;
+            if (cls != 2) {
+                n_obj_test++;
+                if (!jce__aabb_in_frustum_fast(o->bounds, planes, absn)) continue;
+            }
             if (out_ids && found < max) out_ids[found] = o->user_id;
             found++;
-            if (out_ids && found >= max) return found;
+            if (out_ids && found >= max) goto qf_done;
         }
     }
+qf_done:
+    g->q_cells_walked = g->occupied_count;
+    g->q_cells_acc    = n_cell_acc;
+    g->q_objs_visited = n_obj_visit;
+    g->q_objs_tested  = n_obj_test;
     return found;
+}
+
+void jce_space_last_query_stats(const JceSpaceIndex *idx,
+                                 uint32_t *out_cells_walked,
+                                 uint32_t *out_cells_accepted,
+                                 uint32_t *out_objs_visited,
+                                 uint32_t *out_objs_tested)
+{
+    if (out_cells_walked)   *out_cells_walked   = idx ? idx->q_cells_walked : 0u;
+    if (out_cells_accepted) *out_cells_accepted = idx ? idx->q_cells_acc    : 0u;
+    if (out_objs_visited)   *out_objs_visited   = idx ? idx->q_objs_visited : 0u;
+    if (out_objs_tested)    *out_objs_tested    = idx ? idx->q_objs_tested  : 0u;
 }
 
 /* --- AABB query --- */

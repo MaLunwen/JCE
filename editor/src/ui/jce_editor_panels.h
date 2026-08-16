@@ -8,6 +8,7 @@
 #ifndef JCE_EDITOR_PANELS_H
 #define JCE_EDITOR_PANELS_H
 
+#include <jce/middleware/scene/jce_scene.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -189,6 +190,23 @@ void  jce_editor_panel_inspector_content(void);
 void  jce_editor_panel_console_content(void);
 void  jce_editor_panel_scene_view_content(void);
 void  jce_editor_panel_game_view_content(void);
+
+/* Game viewport maximised over the editor work area.
+ *
+ * The flag lives in the layout TU because a full-work-area host window is
+ * chrome, not panel content (editor/src/ui/AGENTS.md rule 1). The Game View
+ * toolbar reads and writes it through these, so the control can sit where a
+ * user actually looks for it -- beside the aspect-ratio combo -- without the
+ * panel opening a top-level window of its own. */
+bool  jce_editor_game_view_maximized(void);
+void  jce_editor_game_view_set_maximized(bool on);
+
+/* At most ONE viewport may be maximised at a time, so the state is a slot and
+ * not a flag per panel: two flags would let both claim the work area in the
+ * same frame and both drive their render targets. JCE_PANEL_COUNT = none. */
+bool           jce_editor_panel_is_maximized(JceEditorPanel kind);
+void           jce_editor_panel_set_maximized(JceEditorPanel kind, bool on);
+JceEditorPanel jce_editor_panel_maximized(void);
 void  jce_editor_panel_timeline_content(void);
 void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
@@ -318,8 +336,31 @@ void jce_editor_path_to_relative(char *out, size_t out_size,
  * texture files) to an absolute path, then converts to the canonical
  * PROJECT-relative form.  Paths outside the project keep their absolute
  * form (the bundle packer virtualises those). */
+struct JceScene;
+typedef struct JceScene JceScene;
+
 void jce_editor_path_store_asset_ref(char *out, size_t out_size,
                                      const char *path);
+
+/* Interned-field form of the above.
+ *
+ * Component asset paths are interned pointers now (see jce_str_intern.h), so a
+ * writer cannot be handed the field to fill: the string is shared and
+ * immutable.  This canonicalises into a scratch buffer and interns the result
+ * back into the field.  `*field` is never left NULL. */
+/* Inline so it needs no link edge of its own: it is a two-line composition of
+ * two functions every caller already links. */
+static inline void jce_editor_path_store_asset_ref_interned(JceScene *scene,
+                                                            const char **field,
+                                                            const char *path)
+{
+    if (!field) return;
+    char tmp[512];
+    tmp[0] = 0;
+    jce_editor_path_store_asset_ref(tmp, sizeof(tmp), path ? path : "");
+    *field = jce_scene_intern(scene, tmp);
+}
+
 /* Same as above but uses a caller-supplied base directory.  Useful when
  * the natural anchor is the scene file's directory rather than project root.
  */

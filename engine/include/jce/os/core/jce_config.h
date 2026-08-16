@@ -67,7 +67,8 @@ typedef struct JceConfig {
                                          * editor undo budget.
                                          * INI: [performance] machine_class = low */
     int         job_workers;            /* 0 = auto (cores-1, clamped 1..8);
-                                         * >0 pins the worker-thread count.
+                                         * >0 pins the frame-job count and
+                                         * caps structured async executors.
                                          * INI: [performance] job_workers = 4 */
 
     /* Graphics (settings S7 follow-up: in-game graphics persistence) — the

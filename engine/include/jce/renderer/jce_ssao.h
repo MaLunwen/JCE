@@ -47,6 +47,40 @@ typedef struct {
     float intensity;    /* 0..2, default 1.5 */
     float near_plane;
     float far_plane;
+
+    /* ── Contact shadows ────────────────────────────────────────────────
+     * A short view-space raymarch toward the sun, written into the GREEN
+     * channel of this pass's target (.r stays ambient occlusion).
+     *
+     * It rides along here rather than in a pass of its own because the PBR
+     * fragment shader occupies all 16 sampler stages -- the WebGL2 budget the
+     * charter requires -- so a separate mask has nowhere to bind at the tiers
+     * the design wants contact shadows on.  This pass already samples depth and
+     * already writes an RGBA8 target whose green channel duplicated red.
+     *
+     * CONSEQUENCE, and it is not hidden: contact shadows exist only when the
+     * SSAO pass runs.  Turning SSAO off turns them off.  That coupling is real
+     * and is the price of the sampler budget. */
+    float cs_steps;         /* 0 disables the march (LOW tier, and default) */
+    float cs_ray_length;    /* world units; 0 disables                       */
+    float cs_jitter;        /* 1 only where a temporal resolve exists        */
+    float cs_sun_view[3];   /* direction TOWARD the sun, VIEW space, unit    */
+    float cs_proj_scale[2]; /* (tan(fovY/2)*aspect, tan(fovY/2))             */
+
+    /* ── Cloud shadows ──────────────────────────────────────────────────
+     * A top-down transmittance map (jce_cloud_shadow.h) sampled by world XZ
+     * and written into the BLUE channel of this pass's target.  Same reason
+     * contact shadows ride in green: the PBR fragment shader has all 16
+     * sampler stages occupied, and both PBR and terrain already bind this
+     * target at stage 3.
+     *
+     * The alternative the design named -- the directional light cookie -- does
+     * not reach terrain at all (fs_terrain.sc has no cookie path), and terrain
+     * is where a cloud shadow is most visible. */
+    uint16_t cloud_tex;     /* bgfx handle idx; UINT16_MAX = no cloud shadow */
+    float    cloud_extent;  /* world size the map covers; 0 = off            */
+    float    cloud_center[2];
+    float    cloud_strength; /* 0..1 lerp toward full shadow                 */
 } JceSsaoParams;
 
 JCE_API JceSsao        *jce_ssao_create(const JceSsaoDesc *desc);
@@ -58,9 +92,18 @@ JCE_API JceSsaoParams   jce_ssao_default_params(void);
 
 /* Render AO into internal RT. depth_tex must be a bgfx_texture_handle_t
  * value (uint16_t idx). first_view_id reserves 2 sequential view slots
- * (sampling pass + blur pass). */
+ * (sampling pass + blur pass).
+ *
+ * view/proj are the matrices this frame was rendered with.  They are set on
+ * the view so bgfx publishes u_invViewProj, which the contact-shadow march and
+ * the cloud-shadow lookup both need -- the latter is a WORLD-space map, and
+ * without the inverse there is no way back from a depth sample to a world XZ.
+ * NULL for either falls back to identity, which disables anything that needs
+ * world space rather than reconstructing garbage positions. */
 JCE_API void            jce_ssao_render(JceSsao *s,
                                          uint16_t depth_tex_handle,
+                                         const jce_mat4 *view,
+                                         const jce_mat4 *proj,
                                          uint16_t first_view_id);
 
 /* Returns texture handle (uint16_t) of the final blurred AO RT, or

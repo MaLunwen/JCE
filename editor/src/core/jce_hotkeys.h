@@ -51,6 +51,8 @@ typedef enum {
 
     JCE_HK_VIEW_FRAME_SELECTED,
     JCE_HK_VIEW_FRAME_ALL,
+    JCE_HK_VIEW_ALIGN_SELECTED_CAMERA,
+    JCE_HK_VIEW_PILOT_SELECTED_CAMERA,
     JCE_HK_VIEW_FOCUS_PERSP,
     JCE_HK_VIEW_FOCUS_TOP,
     JCE_HK_VIEW_FOCUS_FRONT,
@@ -68,6 +70,20 @@ typedef enum {
     JCE_HK_UI_TOGGLE_FULLSCREEN_VIEW,
     JCE_HK_UI_SCREENSHOT,
     JCE_HK_UI_RECORD,
+    /* Print everything needed to REPRODUCE what is on screen right now:
+     * camera pose, scene, backend, and the render-feature switches.
+     *
+     * It exists because a bug report is only as good as the pose it happened
+     * at. Three separate visual defects in this engine were chased at cameras
+     * the reporter never used -- one of them for an entire session, ending in
+     * "I cannot reproduce it", which is a statement about the investigator's
+     * camera and not about the bug. A screenshot shows the symptom and hides
+     * the one thing needed to put a measurement on it. */
+    JCE_HK_UI_COPY_REPRO,
+    /* Maximise the Game viewport over the whole editor window. Distinct from
+     * UI_TOGGLE_FULLSCREEN_VIEW, which borderless-fullscreens the OS window
+     * and leaves the docked layout as it is. */
+    JCE_HK_UI_TOGGLE_GAME_MAXIMIZE,
 
     JCE_HK_FILE_BUILD_SETTINGS,
     JCE_HK_FILE_PACK_CURRENT_SCENE,

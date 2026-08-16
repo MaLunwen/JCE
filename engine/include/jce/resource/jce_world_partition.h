@@ -5,7 +5,7 @@
  * per-cell fragment format the runtime already consumes (jce_streaming.c +
  * jce_world_streamer.c) — the engine equivalent of UE World Partition's
  * "author one world, the engine grids it", replacing the street_demo-specific
- * offline Python (build/gen_city_streaming.py).
+ * offline Python (tools/worldgen/gen_city_streaming.py).
  *
  * This is a PURE tree transform: it serialises the scene to JSON once, then
  * spatial-hashes each STREAMABLE entity (by its world-AABB centre) into a

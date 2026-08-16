@@ -34,6 +34,7 @@
 
 extern "C" {
 #include <jce/api_resource.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_thread.h>
@@ -433,11 +434,9 @@ struct BuildState {
     char single_bundle_id[128] {};
     bool auto_resource_root = true;
 
-    JceThread *   worker     = nullptr;
-    JceAtomicI32 *running    = nullptr;
-    JceAtomicI32 *finished   = nullptr;
-    JceAtomicI32 *last_exit  = nullptr;
-    JceMutex *    log_mtx    = nullptr;
+    JceAsyncTask *task       = nullptr;
+    int           last_exit  = 0;
+    JceMutex     *log_mtx    = nullptr;
     std::deque<LogLine>  log_queue;
 
     std::string project_root_owned;
@@ -497,10 +496,7 @@ void build_initialise_defaults_from_project()
         gb.inited = true;
         snprintf(gb.shared_id, sizeof(gb.shared_id), "%s",
                  JCE_BUNDLE_SHARED_DEFAULT_ID);
-        if (!gb.running)   gb.running   = jce_atomic_i32_create(0);
-        if (!gb.finished)  gb.finished  = jce_atomic_i32_create(0);
-        if (!gb.last_exit) gb.last_exit = jce_atomic_i32_create(0);
-        if (!gb.log_mtx)   gb.log_mtx   = jce_mutex_create();
+        if (!gb.log_mtx) gb.log_mtx = jce_mutex_create();
     }
     const char *proj_root = s_current_project_root;
     if (!proj_root || !proj_root[0]) return;
@@ -564,8 +560,13 @@ void drain_log_queue()
     }
 }
 
-void bundle_pack_worker_main(void * /*user*/)
+void load_summary_from_catalog();
+
+JceAsyncRunResult bundle_pack_worker_main(JceAsyncContext *ctx, void * /*user*/)
 {
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
     JceBundlePackOptions opts{};
     const bool selected_or_single = gb.mode_owned == 1 || gb.mode_owned == 2;
     /* Pass project_root even in single-file / selected mode so the packer can
@@ -603,15 +604,41 @@ void bundle_pack_worker_main(void * /*user*/)
     opts.encrypt            = gb.encrypt_owned;
     opts.encryption_key     = gb.encrypt_owned ? gb.key_owned : nullptr;
 
-    int rc = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
-    jce_atomic_i32_store(gb.last_exit, rc);
-    jce_atomic_i32_store(gb.running, 0);
-    jce_atomic_i32_store(gb.finished, 1);
+    gb.last_exit = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    if (gb.last_exit != 0) {
+        jce_async_context_fail(ctx, gb.last_exit, "bundle pack failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
+}
+
+void bundle_pack_complete(JceAsyncTask *task, void * /*user*/)
+{
+    JceAsyncState state = jce_async_task_state(task);
+
+    drain_log_queue();
+    if (state == JCE_ASYNC_STATE_SUCCEEDED) {
+        gb.last_status = BL("status.succeeded", "build succeeded");
+        load_summary_from_catalog();
+    } else if (state == JCE_ASYNC_STATE_CANCELLED) {
+        gb.last_status = BL("status.cancelled", "build cancelled");
+    } else {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp),
+                 BL("status.failed_fmt", "build failed (rc=%d)"),
+                 gb.last_exit);
+        gb.last_status = tmp;
+    }
+
+    gb.task = nullptr;
+    jce_async_task_release(task);
 }
 
 void start_build()
 {
-    if (jce_atomic_i32_load(gb.running)) return;
+    if (gb.task) return;
 
     /* Resolve the encryption key on the main thread before the worker
      * spawns.  No key and no project -> refuse rather than silently pack
@@ -661,21 +688,21 @@ void start_build()
 
     gb.summary.clear();
     gb.last_status.clear();
-    jce_atomic_i32_store(gb.last_exit, 0);
-    jce_atomic_i32_store(gb.finished, 0);
-    jce_atomic_i32_store(gb.running, 1);
+    gb.last_exit = 0;
 
-    if (gb.worker) { jce_thread_join(gb.worker); gb.worker = nullptr; }
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = bundle_pack_worker_main;
+    desc.complete = bundle_pack_complete;
+    desc.debug_name = "editor.bundle.pack";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
 
-    gb.worker = jce_thread_create(&bundle_pack_worker_main, nullptr,
-                                   "jce-bundle-pack");
-    if (!gb.worker) {
-        jce_atomic_i32_store(gb.running, 0);
-        jce_atomic_i32_store(gb.finished, 1);
-        jce_atomic_i32_store(gb.last_exit, -1);
+    gb.task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!gb.task) {
+        gb.last_exit = -1;
         gb.last_status = BL("status.failed_fmt", "build failed (rc=%d)");
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "[bundle] worker thread spawn failed");
+            "[bundle] background queue rejected the build");
         return;
     }
 
@@ -797,19 +824,6 @@ void draw_build_tab()
     build_initialise_defaults_from_project();
 
     drain_log_queue();
-    if (gb.finished && jce_atomic_i32_exchange(gb.finished, 0)) {
-        if (gb.worker) { jce_thread_join(gb.worker); gb.worker = nullptr; }
-        int rc = jce_atomic_i32_load(gb.last_exit);
-        if (rc == 0) {
-            gb.last_status = BL("status.succeeded", "build succeeded");
-            load_summary_from_catalog();
-        } else {
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp),
-                     BL("status.failed_fmt", "build failed (rc=%d)"), rc);
-            gb.last_status = tmp;
-        }
-    }
 
     ImGui::TextUnformatted(BL("desc",
         "Pack scene-level asset bundles for incremental shipping.\n"
@@ -945,7 +959,7 @@ void draw_build_tab()
 
     ImGui::Separator();
 
-    bool running = gb.running ? jce_atomic_i32_load(gb.running) != 0 : false;
+    bool running = gb.task != nullptr;
     if (running) ImGui::BeginDisabled();
     const char *build_label = is_single
         ? BL("btn.pack_scene", "Pack Scene")

@@ -43,7 +43,16 @@ vec3 reconstruct_world(vec2 uv, float d)
 #else
 	float ndc_z = d;               /* D3D/Vulkan/Metal/WebGPU: NDC z is [0,1] */
 #endif
-	vec4 ndc = vec4(uv * 2.0 - 1.0, ndc_z, 1.0);
+	vec2 ndc_xy = uv * 2.0 - 1.0;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+	/* Top-left texture origin.  Kept in lockstep with the ndc->uv step in the
+	 * march below: the two are inverses and currently cancelled, which left the
+	 * march self-consistent in a MIRRORED view space while view_n came from the
+	 * g-buffer at the TRUE pixel -- so on a floor the surface normal's view y
+	 * had the wrong sign and reflections went the wrong way. */
+	ndc_xy.y = -ndc_xy.y;
+#endif
+	vec4 ndc = vec4(ndc_xy, ndc_z, 1.0);
 	vec4 wp = mul(u_invViewProj, ndc);
 	return wp.xyz / wp.w;
 }
@@ -92,6 +101,9 @@ void main()
 			vec4 clip = mul(u_proj, vec4(ray_pos, 1.0));
 			vec3 ndc = clip.xyz / clip.w;
 			vec2 sample_uv = ndc.xy * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+			sample_uv.y = 1.0 - sample_uv.y;   /* pairs with reconstruct_world */
+#endif
 			if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
 				sample_uv.y < 0.0 || sample_uv.y > 1.0) break;
 			float sd = texture2D(s_depth, sample_uv).r;

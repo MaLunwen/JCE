@@ -173,11 +173,10 @@ void generate_shader(void);
  * keeps its previous value (last-known-good fallback).
  *
  * Async: codegen + path resolution run on the calling (UI) thread, then
- * the two shaderc.exe invocations run on a background worker so the UI
- * never blocks (shaderc can take seconds, with a 30 s hard cap).  The
- * GPU program create + .bin/.mat.json persist happen on the main thread
- * in shader_compile_poll().  Call shader_compile_poll() every frame the
- * panel is alive to pick up a finished compile. */
+ * the two shaderc.exe invocations run as structured background work so the
+ * UI never blocks (shaderc can take seconds, with a 30 s hard cap). The GPU
+ * program create + .bin/.mat.json persist happen in the owner-thread
+ * completion. shader_compile_poll() remains a compatibility no-op. */
 void compile_and_bind(void);
 void shader_compile_poll(void);
 bool shader_compile_running(void);

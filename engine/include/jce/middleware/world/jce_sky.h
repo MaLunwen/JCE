@@ -93,6 +93,38 @@ JCE_API void jce_sky_radiance(const JceSkyState *st,
                               const float        view_dir[3],
                               float              out_rgb[3]);
 
+/* ── Sky-derived ambient (spherical harmonics) ──────────────────────
+ *
+ * The Lambertian cosine kernel is so low-frequency that projecting the
+ * environment onto 3 SH bands (9 coefficients) reproduces diffuse irradiance
+ * with about 1% average error (Ramamoorthi & Hanrahan 2001).  That makes
+ * sky-derived ambient affordable everywhere: 9 vec3 uniforms, no sampler, no
+ * view id, no cubemap, and no GPU work at all.
+ *
+ * This is what replaces hand-picked ambient constants.  A literal like
+ * (0.25, 0.45, 0.80) is somebody approximating the sky by eye; these
+ * coefficients ARE the sky the renderer is drawing, so the two cannot drift.
+ *
+ * Only the UPPER hemisphere is projected.  Sky light genuinely comes from
+ * above, and leaving the lower hemisphere at zero is what stops SH ambient
+ * from lighting the underside of everything like open sky.  Ground bounce is
+ * a separate term and does not belong in a sky projection.
+ *
+ * Coefficients are stored pre-convolved with the cosine kernel (the
+ * per-band constants pi, 2pi/3, 0, pi/4), so reconstruction is 9 multiply-adds
+ * and nothing else.  Output is divided by pi, i.e. it is the radiance a white
+ * Lambertian surface would emit -- which is what an "ambient colour" means. */
+
+/* Project the sky onto 9 SH coefficients per RGB channel. */
+JCE_API void jce_sky_project_sh9(const JceSkyState *st, float out_sh9[9][3]);
+
+/* Reconstruct ambient radiance for a surface normal.  `n` need not be
+ * normalised.  Output is clamped to >= 0: an L2 fit can ring slightly
+ * negative, and negative light is never correct. */
+JCE_API void jce_sky_irradiance_sh9(const float sh9[9][3],
+                                    const float n[3],
+                                    float       out_rgb[3]);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SKY_H */

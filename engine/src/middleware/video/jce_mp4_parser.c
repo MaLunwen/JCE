@@ -53,13 +53,633 @@ typedef struct {
     size_t size;
 } JceMp4Blob;
 
+/* ── Fragmented MP4 (moof / traf / trun) sample index ───────────────── *
+ *
+ * minimp4 reads sample tables out of moov/trak/stbl only.  A fragmented
+ * file (CMAF, DASH, anything an adaptive streamer produced) carries an
+ * *empty* stbl in moov and puts the real sample records in a moof box in
+ * front of every mdat, so minimp4 reports sample_count == 0 and the very
+ * first jce_mp4_parser_get_video_sample() fails.  jce_video.cpp treats
+ * that as "no decode backend" and drops to metadata-only — after it has
+ * already successfully opened the H.264/H.265 decoder, which is why the
+ * symptom reads as a codec problem rather than a container one.
+ *
+ * This builds the missing index by walking the fragments ourselves and
+ * leaves the rest of the file (and minimp4) untouched for progressive
+ * MP4s.  ISO/IEC 14496-12 §8.8.
+ */
+
+#define JCE_MP4_FRAG_MAX_SAMPLES 4000000u   /* hostile-input backstop */
+
+typedef struct {
+    uint64_t offset;     /* absolute byte offset of the sample payload */
+    uint32_t size;
+    uint64_t dts;        /* track timescale units */
+    uint32_t duration;   /* track timescale units */
+    bool     sync;       /* random-access point */
+} JceMp4FragSample;
+
+typedef struct {
+    uint32_t          track_id;
+    uint32_t          count;
+    uint32_t          cap;
+    JceMp4FragSample *samples;
+    uint64_t          next_dts;      /* running DTS when tfdt is absent */
+    uint32_t          trex_duration; /* mvex/trex per-track defaults */
+    uint32_t          trex_size;
+    uint32_t          trex_flags;
+} JceMp4FragTrack;
+
 struct JceMp4Parser {
     JceMp4Blob  blob;
     MP4D_demux_t mp4;
     int         video_track_idx;
     int         audio_track_idx;
     JceMp4Info  info;
+
+    /* Present only for fragmented files; parallel to mp4.track[]. */
+    bool             fragmented;
+    uint32_t         frag_count;
+    JceMp4FragTrack *frag;
 };
+
+#define JCE_MP4_BOX(a, b, c, d) \
+    (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | \
+     ((uint32_t)(c) << 8)  |  (uint32_t)(d))
+
+static uint32_t jce_mp4_rd_u32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
+static uint64_t jce_mp4_rd_u64(const unsigned char *p)
+{
+    return ((uint64_t)jce_mp4_rd_u32(p) << 32) | (uint64_t)jce_mp4_rd_u32(p + 4);
+}
+
+/* Decode the box header at `off`. On success reports the box type, the
+ * offset of its payload, and the offset one past the box. Every field is
+ * bounds-checked against `end`: this parses untrusted bytes. */
+static bool jce_mp4_box_at(const unsigned char *d, uint64_t off, uint64_t end,
+                           uint32_t *out_type, uint64_t *out_body,
+                           uint64_t *out_next)
+{
+    uint64_t size;
+    uint64_t body;
+
+    if (off + 8u > end || off > end) {
+        return false;
+    }
+    size = (uint64_t)jce_mp4_rd_u32(d + off);
+    *out_type = jce_mp4_rd_u32(d + off + 4u);
+    body = off + 8u;
+
+    if (size == 1u) {                      /* 64-bit largesize */
+        if (body + 8u > end) {
+            return false;
+        }
+        size = jce_mp4_rd_u64(d + body);
+        body += 8u;
+    } else if (size == 0u) {               /* extends to end of file */
+        size = end - off;
+    }
+
+    /* `off + size > end` would be the natural check and it is WRONG: size is
+     * an attacker-controlled 64-bit largesize, so the addition wraps. A box
+     * at off=0x200 declaring largesize 2^64-0x200 makes off+size == 0, which
+     * passes, and *out_next then points BACKWARDS — every caller does
+     * `off = next` inside `while (off < end)` and spins forever at 100% CPU
+     * while re-pushing the same samples until the allocation backstop.
+     * Subtract instead of adding, and require forward progress explicitly so
+     * no future arithmetic slip can reintroduce a non-monotonic walk. */
+    if (size < (body - off) || size > end - off) {
+        return false;
+    }
+    if (off + size <= off) {
+        return false;
+    }
+    *out_body = body;
+    *out_next = off + size;
+    return true;
+}
+
+/* Collect track_IDs in moov order, so index i in mp4.track[] maps to
+ * ids[i]. minimp4 fills its track array in trak order, and there is no
+ * track_id in MP4D_track_t to read back. */
+static uint32_t jce_mp4_frag_track_ids(const unsigned char *d, uint64_t size,
+                                       uint32_t *ids, uint32_t max_ids)
+{
+    uint64_t off = 0u, body = 0u, next = 0u;
+    uint32_t type = 0u;
+    uint32_t n = 0u;
+
+    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('m', 'o', 'o', 'v')) {
+            uint64_t t = body;
+            uint64_t tb = 0u, tn = 0u;
+            uint32_t tt = 0u;
+            while (t < next && jce_mp4_box_at(d, t, next, &tt, &tb, &tn)) {
+                if (tt == JCE_MP4_BOX('t', 'r', 'a', 'k')) {
+                    uint64_t k = tb;
+                    uint64_t kb = 0u, kn = 0u;
+                    uint32_t kt = 0u;
+                    while (k < tn && jce_mp4_box_at(d, k, tn, &kt, &kb, &kn)) {
+                        if (kt == JCE_MP4_BOX('t', 'k', 'h', 'd')
+                            && kb + 4u <= kn) {
+                            unsigned ver = d[kb];
+                            /* fullbox(4) + creation/modification, then ID */
+                            uint64_t idp = kb + 4u + (ver == 1u ? 16u : 8u);
+                            if (idp + 4u <= kn && n < max_ids) {
+                                ids[n++] = jce_mp4_rd_u32(d + idp);
+                            }
+                            break;
+                        }
+                        k = kn;
+                    }
+                }
+                t = tn;
+            }
+            return n;
+        }
+        off = next;
+    }
+    return n;
+}
+
+static JceMp4FragTrack *jce_mp4_frag_find(JceMp4FragTrack *tracks,
+                                          uint32_t count, uint32_t track_id)
+{
+    uint32_t i;
+    for (i = 0u; i < count; ++i) {
+        if (tracks[i].track_id == track_id) {
+            return &tracks[i];
+        }
+    }
+    return NULL;
+}
+
+/* mvex/trex per-track defaults (ISO/IEC 14496-12 §8.8.3). */
+static void jce_mp4_frag_read_trex(const unsigned char *d, uint64_t size,
+                                   JceMp4FragTrack *tracks, uint32_t count)
+{
+    uint64_t off = 0u, body = 0u, next = 0u;
+    uint32_t type = 0u;
+
+    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('m', 'o', 'o', 'v')) {
+            uint64_t t = body, tb = 0u, tn = 0u;
+            uint32_t tt = 0u;
+            while (t < next && jce_mp4_box_at(d, t, next, &tt, &tb, &tn)) {
+                if (tt == JCE_MP4_BOX('m', 'v', 'e', 'x')) {
+                    uint64_t e = tb, eb = 0u, en = 0u;
+                    uint32_t et = 0u;
+                    while (e < tn && jce_mp4_box_at(d, e, tn, &et, &eb, &en)) {
+                        if (et == JCE_MP4_BOX('t', 'r', 'e', 'x')
+                            && eb + 24u <= en) {
+                            JceMp4FragTrack *tr = jce_mp4_frag_find(
+                                tracks, count, jce_mp4_rd_u32(d + eb + 4u));
+                            if (tr) {
+                                tr->trex_duration = jce_mp4_rd_u32(d + eb + 12u);
+                                tr->trex_size     = jce_mp4_rd_u32(d + eb + 16u);
+                                tr->trex_flags    = jce_mp4_rd_u32(d + eb + 20u);
+                            }
+                        }
+                        e = en;
+                    }
+                }
+                t = tn;
+            }
+            return;
+        }
+        off = next;
+    }
+}
+
+static bool jce_mp4_frag_push(JceMp4FragTrack *tr, const JceMp4FragSample *s)
+{
+    if (tr->count == tr->cap) {
+        uint32_t cap = tr->cap ? (tr->cap * 2u) : 256u;
+        JceMp4FragSample *grown;
+        if (cap > JCE_MP4_FRAG_MAX_SAMPLES) {
+            cap = JCE_MP4_FRAG_MAX_SAMPLES;
+        }
+        if (cap == tr->cap) {
+            return false;                  /* backstop reached */
+        }
+        grown = (JceMp4FragSample *)JCE_REALLOC(tr->samples,
+                                                (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        tr->samples = grown;
+        tr->cap = cap;
+    }
+    tr->samples[tr->count++] = *s;
+    return true;
+}
+
+/* One traf: tfhd (per-fragment defaults) + optional tfdt (base DTS) +
+ * one or more trun (the sample records themselves). */
+static void jce_mp4_frag_read_traf(const unsigned char *d,
+                                   uint64_t traf_body, uint64_t traf_end,
+                                   uint64_t moof_off, uint64_t file_size,
+                                   JceMp4FragTrack *tracks, uint32_t count,
+                                   uint64_t *moof_data_end,
+                                   uint32_t *total, uint32_t total_cap)
+{
+    uint64_t off = traf_body, body = 0u, next = 0u;
+    uint32_t type = 0u;
+    JceMp4FragTrack *tr = NULL;
+    uint32_t tf_flags = 0u;
+    uint64_t base_offset = moof_off;
+    uint32_t def_duration = 0u, def_size = 0u, def_flags = 0u;
+    bool have_def_duration = false, have_def_size = false, have_def_flags = false;
+    uint64_t dts = 0u;
+    bool have_tfdt = false;
+    uint64_t run_cursor = 0u;              /* next byte after previous trun */
+    bool have_cursor = false;
+
+    /* Pass 1: tfhd and tfdt must be known before any trun is expanded. */
+    while (off < traf_end && jce_mp4_box_at(d, off, traf_end, &type, &body,
+                                            &next)) {
+        if (type == JCE_MP4_BOX('t', 'f', 'h', 'd') && body + 8u <= next) {
+            uint64_t p = body + 4u;
+            tf_flags = jce_mp4_rd_u32(d + body) & 0x00FFFFFFu;
+            tr = jce_mp4_frag_find(tracks, count, jce_mp4_rd_u32(d + p));
+            p += 4u;
+
+            /* The optional fields are positional: each present flag consumes
+             * its bytes and shifts the next one. Skipping a field that does
+             * not fit (rather than bailing) would make every LATER field read
+             * from the truncated one's bytes — a short base_data_offset would
+             * silently become the default_sample_size. A tfhd that lies about
+             * its own length is not recoverable; drop the whole traf. */
+            if (tf_flags & 0x000001u) {                       /* base-data-offset */
+                if (p + 8u > next) { return; }
+                base_offset = jce_mp4_rd_u64(d + p);
+                p += 8u;
+            } else if (tf_flags & 0x020000u) {                /* default-base-is-moof */
+                base_offset = moof_off;
+            } else {
+                /* ISO/IEC 14496-12 §8.8.7: absent both flags, the base is the
+                 * first byte of the enclosing moof for the FIRST track
+                 * fragment, and the end of the previous track fragment's data
+                 * for any later one. Using moof_off for both aliased track N
+                 * onto track N-1's bytes in a multi-track fragment. */
+                base_offset = (*moof_data_end != 0u) ? *moof_data_end : moof_off;
+            }
+            if (tf_flags & 0x000002u) {                       /* sample-desc-index */
+                if (p + 4u > next) { return; }
+                p += 4u;
+            }
+            if (tf_flags & 0x000008u) {
+                if (p + 4u > next) { return; }
+                def_duration = jce_mp4_rd_u32(d + p); p += 4u;
+                have_def_duration = true;
+            }
+            if (tf_flags & 0x000010u) {
+                if (p + 4u > next) { return; }
+                def_size = jce_mp4_rd_u32(d + p); p += 4u;
+                have_def_size = true;
+            }
+            if (tf_flags & 0x000020u) {
+                if (p + 4u > next) { return; }
+                def_flags = jce_mp4_rd_u32(d + p); p += 4u;
+                have_def_flags = true;
+            }
+        } else if (type == JCE_MP4_BOX('t', 'f', 'd', 't') && body + 8u <= next) {
+            unsigned ver = d[body];
+            if (ver == 1u && body + 12u <= next) {
+                dts = jce_mp4_rd_u64(d + body + 4u);
+                have_tfdt = true;
+            } else if (ver == 0u) {
+                dts = (uint64_t)jce_mp4_rd_u32(d + body + 4u);
+                have_tfdt = true;
+            }
+        }
+        off = next;
+    }
+
+    if (!tr) {
+        return;
+    }
+    /* Fall back to the trex defaults on ABSENCE, not on a zero value: a tfhd
+     * may legitimately signal default_sample_duration == 0 (an empty-duration
+     * fragment), and testing the value would silently override it. */
+    if (!have_def_duration) def_duration = tr->trex_duration;
+    if (!have_def_size)     def_size     = tr->trex_size;
+    if (!have_def_flags)    def_flags    = tr->trex_flags;
+    if (!have_tfdt) {
+        dts = tr->next_dts;
+    }
+
+    /* Pass 2: expand every trun. */
+    off = traf_body;
+    while (off < traf_end && jce_mp4_box_at(d, off, traf_end, &type, &body,
+                                            &next)) {
+        if (type == JCE_MP4_BOX('t', 'r', 'u', 'n') && body + 8u <= next) {
+            uint32_t tr_flags = jce_mp4_rd_u32(d + body) & 0x00FFFFFFu;
+            uint32_t n = jce_mp4_rd_u32(d + body + 4u);
+            uint64_t p = body + 8u;
+            uint64_t data = have_cursor ? run_cursor : base_offset;
+            uint32_t first_flags = 0u;
+            bool have_first = false;
+            uint32_t i;
+
+            if (tr_flags & 0x000001u) {                       /* data-offset */
+                if (p + 4u > next) { off = next; continue; }
+                data = (uint64_t)((int64_t)base_offset
+                                  + (int32_t)jce_mp4_rd_u32(d + p));
+                p += 4u;
+            }
+            if (tr_flags & 0x000004u) {                       /* first-sample-flags */
+                if (p + 4u > next) { off = next; continue; }
+                first_flags = jce_mp4_rd_u32(d + p);
+                have_first = true;
+                p += 4u;
+            }
+
+            /* sample_count is a raw attacker-controlled uint32. When the trun
+             * carries per-sample fields the box size is the real bound, so
+             * clamp to what actually fits. When it carries NONE, the loop body
+             * reads nothing and cannot run off the end of the box — a 16-byte
+             * trun declaring 2^32-1 samples would push zero-length records
+             * until the per-track backstop, ~128 MB per track and ~8 GB with
+             * 64 tracks. The shared budget below bounds that case. */
+            {
+                uint32_t stride = 0u;
+                if (tr_flags & 0x000100u) stride += 4u;
+                if (tr_flags & 0x000200u) stride += 4u;
+                if (tr_flags & 0x000400u) stride += 4u;
+                if (tr_flags & 0x000800u) stride += 4u;
+                if (stride > 0u) {
+                    uint64_t room = (next > p) ? (next - p) : 0u;
+                    uint64_t fit  = room / stride;
+                    if ((uint64_t)n > fit) {
+                        n = (uint32_t)fit;
+                    }
+                }
+            }
+
+            for (i = 0u; i < n; ++i) {
+                if (*total >= total_cap) {
+                    tr->next_dts = dts;
+                    return;
+                }
+                JceMp4FragSample s;
+                uint32_t dur = def_duration;
+                uint32_t sz  = def_size;
+                uint32_t fl  = def_flags;
+
+                if (tr_flags & 0x000100u) {
+                    if (p + 4u > next) break;
+                    dur = jce_mp4_rd_u32(d + p); p += 4u;
+                }
+                if (tr_flags & 0x000200u) {
+                    if (p + 4u > next) break;
+                    sz = jce_mp4_rd_u32(d + p); p += 4u;
+                }
+                if (tr_flags & 0x000400u) {
+                    if (p + 4u > next) break;
+                    fl = jce_mp4_rd_u32(d + p); p += 4u;
+                }
+                if (tr_flags & 0x000800u) {                   /* cts offset */
+                    if (p + 4u > next) break;
+                    p += 4u;
+                }
+                if (i == 0u && have_first) {
+                    fl = first_flags;
+                }
+
+                if (data > file_size || (uint64_t)sz > file_size - data) {
+                    break;                 /* truncated / lying fragment */
+                }
+
+                s.offset   = data;
+                s.size     = sz;
+                s.dts      = dts;
+                s.duration = dur;
+                /* §8.8.3.1: bit 16 is sample_is_non_sync_sample, and
+                 * sample_depends_on == 2 means "depends on nothing" (an
+                 * I-frame). Either one makes this a seek point. */
+                s.sync = ((fl & 0x00010000u) == 0u)
+                       || (((fl >> 24) & 0x03u) == 2u);
+
+                if (!jce_mp4_frag_push(tr, &s)) {
+                    tr->next_dts = dts;
+                    return;
+                }
+                ++(*total);
+                data += sz;
+                dts  += dur;
+            }
+            run_cursor = data;
+            have_cursor = true;
+            if (data > *moof_data_end) {
+                *moof_data_end = data;
+            }
+        }
+        off = next;
+    }
+    tr->next_dts = dts;
+}
+
+/* Walk every top-level moof and build the per-track sample index.
+ * Returns true when the file is fragmented AND at least one sample was
+ * recovered. */
+static bool jce_mp4_frag_build(JceMp4Parser *parser)
+{
+    const unsigned char *d = parser->blob.data;
+    uint64_t size = (uint64_t)parser->blob.size;
+    uint64_t off = 0u, body = 0u, next = 0u;
+    uint32_t type = 0u;
+    uint32_t ids[64];
+    uint32_t n_ids;
+    uint32_t i;
+    uint32_t total = 0u;
+    bool saw_moof = false;
+    /* Shared allocation budget across ALL tracks, tied to the input size: a
+     * real sample costs bytes in the file, so a few KB of boxes must not be
+     * able to demand hundreds of MB of index. The honest 4.3 MB measured file
+     * needs 3240 entries and gets a ceiling of ~542k. */
+    uint32_t total_cap;
+    uint64_t budget = (size / 8u) + 1024u;
+    if (budget > (uint64_t)JCE_MP4_FRAG_MAX_SAMPLES) {
+        budget = (uint64_t)JCE_MP4_FRAG_MAX_SAMPLES;
+    }
+    total_cap = (uint32_t)budget;
+
+    /* Cheap pre-scan: no moof means nothing to do, and this must be decided
+     * before any allocation so progressive files pay nothing. */
+    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('m', 'o', 'o', 'f')) {
+            saw_moof = true;
+            break;
+        }
+        off = next;
+    }
+    if (!saw_moof) {
+        return false;
+    }
+    off = 0u;
+
+    n_ids = jce_mp4_frag_track_ids(d, size, ids, 64u);
+    if (n_ids == 0u) {
+        return false;
+    }
+    /* minimp4's track array and the moov trak order must line up for the
+     * id mapping to mean anything. If they do not, index nothing rather
+     * than index the wrong track. */
+    if (n_ids != parser->mp4.track_count) {
+        return false;
+    }
+
+    parser->frag = (JceMp4FragTrack *)JCE_CALLOC(n_ids, sizeof(*parser->frag));
+    if (!parser->frag) {
+        return false;
+    }
+    parser->frag_count = n_ids;
+    for (i = 0u; i < n_ids; ++i) {
+        parser->frag[i].track_id = ids[i];
+    }
+
+    jce_mp4_frag_read_trex(d, size, parser->frag, n_ids);
+
+    /* Hybrid layout (ffmpeg -movflags +frag_keyframe WITHOUT +empty_moov):
+     * moov/stbl describes the first run of samples and the moofs describe the
+     * rest. Seed from stbl so the fragment records append after them; taking
+     * only one of the two sources ends playback at the first seam. Pure
+     * fragmented files have sample_count == 0 here and skip this entirely. */
+    for (i = 0u; i < n_ids; ++i) {
+        const MP4D_track_t *mt = &parser->mp4.track[i];
+        unsigned s;
+        for (s = 0u; s < mt->sample_count; ++s) {
+            JceMp4FragSample smp;
+            unsigned fb = 0u, ts = 0u, du = 0u;
+            MP4D_file_offset_t o;
+            if (total >= total_cap) {
+                break;
+            }
+            o = MP4D_frame_offset(&parser->mp4, i, s, &fb, &ts, &du);
+            if ((uint64_t)o > size || (uint64_t)fb > size - (uint64_t)o) {
+                break;
+            }
+            smp.offset   = (uint64_t)o;
+            smp.size     = (uint32_t)fb;
+            smp.dts      = (uint64_t)ts;
+            smp.duration = du;
+            /* stbl sync flags are not exposed by minimp4; keyframe_count is
+             * the only consumer of this bit and it is advisory. */
+            smp.sync     = true;
+            if (!jce_mp4_frag_push(&parser->frag[i], &smp)) {
+                break;
+            }
+            ++total;
+            parser->frag[i].next_dts = (uint64_t)ts + du;
+        }
+    }
+
+    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('m', 'o', 'o', 'f')) {
+            uint64_t t = body, tb = 0u, tn = 0u;
+            uint32_t tt = 0u;
+            /* Reset per moof: the "end of the previous track fragment's data"
+             * base rule is scoped to the enclosing moof. */
+            uint64_t moof_data_end = 0u;
+            saw_moof = true;
+            while (t < next && jce_mp4_box_at(d, t, next, &tt, &tb, &tn)) {
+                if (tt == JCE_MP4_BOX('t', 'r', 'a', 'f')) {
+                    jce_mp4_frag_read_traf(d, tb, tn, off, size,
+                                           parser->frag, n_ids,
+                                           &moof_data_end, &total, total_cap);
+                }
+                t = tn;
+            }
+        }
+        off = next;
+    }
+
+    /* Rebase each track's DTS to zero. tfdt carries baseMediaDecodeTime on the
+     * MEDIA timeline, so a segment taken from the middle of a stream starts at
+     * a large value; a progressive file's stts always starts at 0. Consumers
+     * compare sample timestamps against a playback clock that starts at 0, so
+     * leaving the raw value in freezes on frame 1 and makes every seek land at
+     * sample 0. */
+    for (i = 0u; i < n_ids; ++i) {
+        JceMp4FragTrack *ft = &parser->frag[i];
+        uint64_t base;
+        uint32_t k;
+        if (ft->count == 0u) {
+            continue;
+        }
+        base = ft->samples[0].dts;
+        if (base == 0u) {
+            continue;
+        }
+        for (k = 0u; k < ft->count; ++k) {
+            ft->samples[k].dts = (ft->samples[k].dts >= base)
+                                     ? (ft->samples[k].dts - base) : 0u;
+        }
+    }
+
+    total = 0u;
+    for (i = 0u; i < n_ids; ++i) {
+        total += parser->frag[i].count;
+    }
+    if (total == 0u) {
+        for (i = 0u; i < n_ids; ++i) {
+            JCE_FREE(parser->frag[i].samples);
+        }
+        JCE_FREE(parser->frag);
+        parser->frag = NULL;
+        parser->frag_count = 0u;
+        return false;
+    }
+    return true;
+}
+
+static const JceMp4FragTrack *jce_mp4_frag_track(const JceMp4Parser *parser,
+                                                 int track_idx)
+{
+    if (!parser->fragmented || !parser->frag || track_idx < 0
+        || (uint32_t)track_idx >= parser->frag_count) {
+        return NULL;
+    }
+    /* A track that appears in moov but in no moof gets an EMPTY entry here.
+     * Reporting it as "fragment-backed with 0 samples" made every request for
+     * it fail and, worse, suppressed the minimp4 path that could still serve
+     * it from its own stbl. An empty index is not an index. */
+    if (parser->frag[track_idx].count == 0u) {
+        return NULL;
+    }
+    return &parser->frag[track_idx];
+}
+
+/* Serve one sample out of the fragment index. Returns false when this is
+ * not a fragmented file (caller falls back to minimp4). */
+static bool jce_mp4_frag_sample(const JceMp4Parser *parser, int track_idx,
+                                uint32_t sample_index,
+                                JceMp4SampleInfo *out, bool *out_valid)
+{
+    const JceMp4FragTrack *tr = jce_mp4_frag_track(parser, track_idx);
+    const JceMp4FragSample *s;
+
+    *out_valid = false;
+    if (!tr) {
+        return false;
+    }
+    if (sample_index >= tr->count) {
+        return true;                       /* handled, but out of range */
+    }
+    s = &tr->samples[sample_index];
+    out->offset = s->offset;
+    out->size_bytes = s->size;
+    out->timestamp = s->dts;
+    out->duration = s->duration;
+    *out_valid = true;
+    return true;
+}
 
 static void jce_mp4_set_error(JceMp4Info *out, const char *msg)
 {
@@ -227,6 +847,58 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
         return NULL;
     }
 
+    /* Fragmented files carry an empty stbl, so minimp4 reports zero samples
+     * for every track. Recover the real index from the moof chain before
+     * anyone asks for sample 0. Attempted unconditionally, not just when the
+     * video track's stbl is empty: an audio-only or hybrid file has a
+     * non-zero count there and still needs the fragments. frag_build
+     * pre-scans for a moof and costs a progressive file one box walk. */
+    parser->fragmented = jce_mp4_frag_build(parser);
+    if (parser->fragmented) {
+        const JceMp4FragTrack *vt = jce_mp4_frag_track(parser,
+                                                       parser->video_track_idx);
+        const JceMp4FragTrack *at = jce_mp4_frag_track(parser,
+                                                       parser->audio_track_idx);
+        parser->info.fragmented = true;
+        if (vt) {
+            uint32_t i;
+            uint32_t keys = 0u;
+            uint64_t ticks = 0u;
+            unsigned ts = parser->mp4.track[parser->video_track_idx].timescale;
+
+            for (i = 0u; i < vt->count; ++i) {
+                if (vt->samples[i].sync) {
+                    ++keys;
+                }
+                ticks += vt->samples[i].duration;
+            }
+            parser->info.sample_count = vt->count;
+            parser->info.keyframe_count = keys ? keys : 1u;
+            /* mvhd/tkhd duration is often 0 in an init segment; the summed
+             * sample durations are the honest answer. */
+            if (ts > 0u && ticks > 0u) {
+                double secs = (double)ticks / (double)ts;
+                if (parser->info.duration_seconds <= 0.0) {
+                    parser->info.duration_seconds = secs;
+                }
+                if (secs > 0.0) {
+                    parser->info.framerate = (double)vt->count / secs;
+                }
+            }
+        }
+        if (at && parser->info.duration_seconds <= 0.0) {
+            uint32_t i;
+            uint64_t ticks = 0u;
+            unsigned ts = parser->mp4.track[parser->audio_track_idx].timescale;
+            for (i = 0u; i < at->count; ++i) {
+                ticks += at->samples[i].duration;
+            }
+            if (ts > 0u && ticks > 0u) {
+                parser->info.duration_seconds = (double)ticks / (double)ts;
+            }
+        }
+    }
+
     if (out_info) {
         *out_info = parser->info;
     }
@@ -237,6 +909,13 @@ void jce_mp4_parser_close(JceMp4Parser *parser)
 {
     if (!parser) {
         return;
+    }
+    if (parser->frag) {
+        uint32_t i;
+        for (i = 0u; i < parser->frag_count; ++i) {
+            JCE_FREE(parser->frag[i].samples);
+        }
+        JCE_FREE(parser->frag);
     }
     MP4D_close(&parser->mp4);
     JCE_FREE(parser);
@@ -275,7 +954,17 @@ bool jce_mp4_parser_get_audio_track_info(const JceMp4Parser *parser,
 
     audio_track = &parser->mp4.track[parser->audio_track_idx];
     out_info->track_index = (uint32_t)parser->audio_track_idx;
-    return jce_mp4_get_audio_track_info_internal(audio_track, out_info);
+    if (!jce_mp4_get_audio_track_info_internal(audio_track, out_info)) {
+        return false;
+    }
+    {   /* fragmented: stbl is empty, the count lives in the moof chain */
+        const JceMp4FragTrack *ft = jce_mp4_frag_track(parser,
+                                                       parser->audio_track_idx);
+        if (ft) {
+            out_info->sample_count = ft->count;
+        }
+    }
+    return true;
 }
 
 bool jce_mp4_parser_get_audio_sample(const JceMp4Parser *parser,
@@ -296,6 +985,14 @@ bool jce_mp4_parser_get_audio_sample(const JceMp4Parser *parser,
 
     if (parser->audio_track_idx < 0) {
         return false;
+    }
+
+    {
+        bool valid = false;
+        if (jce_mp4_frag_sample(parser, parser->audio_track_idx, sample_index,
+                                out_sample, &valid)) {
+            return valid;
+        }
     }
 
     audio_track = &parser->mp4.track[parser->audio_track_idx];
@@ -691,6 +1388,13 @@ bool jce_mp4_parser_get_video_track_info(const JceMp4Parser *parser,
     vt = &parser->mp4.track[parser->video_track_idx];
     out_info->track_index = (uint32_t)parser->video_track_idx;
     out_info->sample_count = vt->sample_count;
+    {   /* fragmented: stbl is empty, the count lives in the moof chain */
+        const JceMp4FragTrack *ft = jce_mp4_frag_track(parser,
+                                                       parser->video_track_idx);
+        if (ft) {
+            out_info->sample_count = ft->count;
+        }
+    }
     out_info->timescale = vt->timescale;
     out_info->width = vt->SampleDescription.video.width;
     out_info->height = vt->SampleDescription.video.height;
@@ -732,6 +1436,14 @@ bool jce_mp4_parser_get_video_sample(const JceMp4Parser *parser,
 
     if (parser->video_track_idx < 0) {
         return false;
+    }
+
+    {
+        bool valid = false;
+        if (jce_mp4_frag_sample(parser, parser->video_track_idx, sample_index,
+                                out_sample, &valid)) {
+            return valid;
+        }
     }
 
     vt = &parser->mp4.track[parser->video_track_idx];

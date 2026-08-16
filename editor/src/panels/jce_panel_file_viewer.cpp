@@ -212,9 +212,21 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         || strcmp(ext, ".properties") == 0)
         return JCE_FV_TEXT;
 
+    /* Keep in sync with the SOUND row of k_ext_table in
+     * engine/src/resource/jce_asset_ext.c and with the audio kind filter in
+     * jce_panel_assets.cpp. .m4a and .aac were missing here while every other
+     * layer already called them audio — the asset browser colours them as
+     * audio, the "Audio" kind filter keeps them, and the cooker maps them to
+     * JCEASSET_TYPE_SOUND — so double-clicking one fell through to
+     * JCE_FV_BINARY and opened a hex dump with no error. That reads exactly
+     * like "this build cannot decode AAC", which is why it was reported as the
+     * patented codecs having gone missing; the decoder was simply never
+     * reached (jce_fv_audio.cpp -> jce_audio_load_memory -> the M4A branch at
+     * jce_audio.c:836). */
     if (strcmp(ext, ".wav") == 0 || strcmp(ext, ".ogg") == 0
         || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0
-        || strcmp(ext, ".opus") == 0 || strcmp(ext, ".oga") == 0)
+        || strcmp(ext, ".opus") == 0 || strcmp(ext, ".oga") == 0
+        || strcmp(ext, ".m4a") == 0 || strcmp(ext, ".aac") == 0)
         return JCE_FV_AUDIO;
 
     if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0

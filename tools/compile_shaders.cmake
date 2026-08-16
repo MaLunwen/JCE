@@ -26,9 +26,9 @@
 #   )
 
 function(jce_compile_shaders)
-    cmake_parse_arguments(ARG ""
+    cmake_parse_arguments(ARG "REQUIRED"
         "TARGET;SHADER_DIR;VARYING_DEF;OUTPUT_DIR;OUT_FILES_VAR"
-        "" ${ARGN})
+        "INCLUDE_DIRS" ${ARGN})
 
     # ── defaults ──────────────────────────────────────────────────
     if(NOT ARG_VARYING_DEF)
@@ -73,6 +73,11 @@ function(jce_compile_shaders)
         endforeach()
     endif()
     if(NOT _shaderc OR NOT EXISTS "${_shaderc}")
+        if(ARG_REQUIRED)
+            message(FATAL_ERROR
+                "shaderc not found; ${ARG_TARGET} requires project shader "
+                "compilation. Set JCE_SHADERC_EXECUTABLE to a host shaderc.")
+        endif()
         message(WARNING
             "shaderc not found — shader rebuilds disabled.\n"
             "Pre-baked pak shaders are still usable.\n"
@@ -97,6 +102,26 @@ function(jce_compile_shaders)
     endif()
 
     set(_varying "${ARG_SHADER_DIR}/${ARG_VARYING_DEF}")
+    if(NOT EXISTS "${_varying}")
+        message(FATAL_ERROR
+            "jce_compile_shaders: varying definition not found: ${_varying}")
+    endif()
+
+    set(_include_dirs "${BGFX_SHADER_INCLUDE_PATH}" ${ARG_INCLUDE_DIRS})
+    list(REMOVE_DUPLICATES _include_dirs)
+    set(_include_args)
+    set(_include_inputs)
+    foreach(_include_dir IN LISTS _include_dirs)
+        if(NOT IS_DIRECTORY "${_include_dir}")
+            message(FATAL_ERROR
+                "jce_compile_shaders: include directory not found: "
+                "${_include_dir}")
+        endif()
+        list(APPEND _include_args -i "${_include_dir}")
+        file(GLOB_RECURSE _dir_include_inputs CONFIGURE_DEPENDS
+            "${_include_dir}/*.sh" "${_include_dir}/*.sc")
+        list(APPEND _include_inputs ${_dir_include_inputs})
+    endforeach()
 
     # ── cross-backend portability lint ────────────────────────────
     # tools/shader_lint.py bans constructs that COMPILE on every bgfx
@@ -136,6 +161,19 @@ function(jce_compile_shaders)
         "${ARG_SHADER_DIR}/vs_*.sc"
         "${ARG_SHADER_DIR}/fs_*.sc"
         "${ARG_SHADER_DIR}/cs_*.sc")
+
+    # Shared .sh includes are real inputs and were not listed as dependencies,
+    # so editing one rebuilt NOTHING.  That is the worst shape a build bug can
+    # take: fs_pbr_body.sh carries the entire lit path -- shadows, IBL, lights --
+    # and a fix landed there would build clean, run green, and ship the previous
+    # binary, with the source and the artefact disagreeing and no error anywhere.
+    #
+    # The dependency is deliberately coarse (every shader in a group depends on
+    # every .sh in that group) rather than parsed from #include lines.  Includes
+    # nest, so a parser has to be transitively correct to be correct at all,
+    # and its failure mode is silent staleness again.  Over-rebuilding a group
+    # of ~40 shaders costs seconds; under-rebuilding costs a wrong binary.
+    file(GLOB _shared_includes "${ARG_SHADER_DIR}/*.sh")
 
     if(NOT _sources)
         message(WARNING
@@ -265,9 +303,10 @@ function(jce_compile_shaders)
                         --platform "${_platform}"
                         -p "${_profile}"
                         --varyingdef "${_varying}"
-                        -i "${BGFX_SHADER_INCLUDE_PATH}"
+                        ${_include_args}
                         ${_shader_defines}
                 DEPENDS "${_src}" "${_varying}" ${_lint_stamp}
+                        ${_shared_includes} ${_include_inputs}
                 COMMENT "Shader: ${_name} (${_suffix})"
                 VERBATIM)
 

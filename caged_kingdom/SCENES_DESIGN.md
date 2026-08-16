@@ -133,6 +133,137 @@
 
 ---
 
+## 技术实验场景
+
+### `lightning_lab.scene.json` — 拉普拉斯介电击穿闪电实验
+
+**用途**：独立于主线的可复现实验场景，用于验证 JCE 的场景脚本、
+LineRenderer、瞬态光照、后处理、天气和空间音频。编辑器 Play 与发行运行时
+都执行 `scripts/lightning_lab.lua`，场景本身不依赖项目专有 C 逻辑。
+
+**模拟流程**：
+
+1. 在 31 x 25 的电势求解平面上设置云端/地面边界，并将结果映射为具有
+   空间相关性的三维曲折通道；
+2. 分帧执行有硬预算的 Gauss-Seidel 松弛，求解离散拉普拉斯方程；
+3. 按介电击穿权重 `P_i proportional to phi_i^1.65` 生长负先导，保留自然分支；
+4. 根据云端起点、导体高度和水平距离选择接闪目标；下降先导进入连接区后，
+   从目标顶部生成向上流光，两者接触后才建立导电主通道；
+5. 首次回击由地向云传播，随后以确定性的 35-90 ms 间隔生成 1-3 次
+   dart leader / 后续回击；白热核心、蓝紫外晕、分支余辉和云内散射光分别
+   渲染，避免用单根等宽蓝线代替整个放电过程；
+6. 依据观察者到通道各段的距离，以 343 m/s 安排近场爆裂与较远通道滚雷，
+   高频爆裂先到，低频尾声后到。
+
+**性能与确定性**：每帧最多生长 4 个网格单元，每个单元最多 4 轮松弛；
+通道至少发展 82 个节点后才允许接地，124 节点为软上限并带强制接地兜底。
+随机序列使用固定 Park-Miller
+生成器和 strike serial 种子，因此同一次序列可复现，不使用全局 `math.random`。
+CPU 只负责低频场求解、三维几何细分和事件时序；每段细分具有父方向惯性，
+避免逐点独立白噪声造成的锯齿。GPU 负责线段、天气、光照和后处理绘制。
+真实先导/回击的微秒级过程低于普通显示器帧周期，因此案例提供“可见但受限”
+的时间扩展：先导约 0.25 s，首次回击约 0.035 s；相位次序与传播方向保持正确。
+
+**Entity 清单**（ID 段 9000-9099）：
+
+| ID | Name | 作用 | 关键组件 |
+|---|---|---|---|
+| 9000 | `LightningLabRoot` | 实验根节点 | Transform + EditorMeta |
+| 9001 | `StormCamera` | 固定观察镜头 | Camera + VirtualCamera，look-at 导雷区 |
+| 9010 | `StormGround` | 湿润试验地面 | plane，50 m x 50 m，低粗糙度深灰材质 |
+| 9011-9015 | `GroundGrid_*` | 地面导体/尺度参照 | 扁平金属 cube |
+| 9020-9022 | `LightningRod_*` | 接闪目标 | 细长金属 cube |
+| 9030-9032 | `StormCloud_*` | 云层轮廓 | 扁平 sphere，粗糙深灰材质 |
+| 9040 | `LightningLeader` | 分帧先导主通道 | LineRenderer，蓝紫细线 |
+| 9041 | `LightningReturnStroke` | 地面回击 | LineRenderer，白蓝宽线 |
+| 9042-9047 | `LightningBranch_0..5` | 放电分支 | LineRenderer |
+| 9048 | `LightningCore` | 饱和白热导电核心 | 窄 LineRenderer |
+| 9049 | `LightningHalo` | 电离通道外晕 | 宽低透明 LineRenderer |
+| 9053 | `LightningUpwardStreamer` | 导体向上连接流光 | LineRenderer，地向云生长 |
+| 9050 | `LightningImpactLight` | 落点瞬态照明 | Point Light，无阴影 |
+| 9051 | `LightningCloudLight` | 云底散射闪光 | Point Light，无阴影 |
+| 9052 | `LightningImpactGlow` | 落点发光球 | sphere + emissive PBR |
+| 9054-9055 | `LightningCloudScatter_A/B` | 云体多点散射 | Point Light，无阴影 |
+| 9060 | `LightningDirector` | 模拟生命周期 | Script `scripts/lightning_lab.lua` |
+
+**资产清单**：
+
+- `scripts/lightning_lab.lua`
+- `scripts/lightning_lab.lua.deps.json`
+- `sounds/lightning_lab_thunder_crack.wav`（项目内确定性程序合成，原创）
+- `sounds/lightning_lab_thunder_roll.wav`（项目内确定性程序合成，原创）
+
+**验收**：打开场景后进入 Play，约 1 秒出现低亮度阶梯先导；导体向上流光与
+下降先导连接后，白热回击从地面向云端传播，并出现至少一次强度递减的后续
+回击。雷声按观察距离分成爆裂和滚雷到达；脚本公开入口
+`ck_lightning_trigger` 可立即开始下一次放电。
+
+### `black_hole_lab.scene.json` — Kerr 黑洞科学可视化实验
+
+**用途**：独立于主线的广义相对论科普与数值验证场景。场景以 Kerr 时空的
+零测地线反向积分为权威图像来源，展示引力透镜、光子俘获、参考系拖曳、
+吸积盘高阶像、引力红移和相对论多普勒增亮。不得用黑色球体、径向 UV 扭曲
+或手绘亮环冒充求解结果。
+
+**模型范围**：默认采用 `chi = 0.8` 的旋转超大质量黑洞和
+Page-Thorne 薄吸积盘；`chi = 0` 为 Schwarzschild 基准。内部使用
+`G = c = M = 1`，质量只负责映射物理长度、时间和盘温标。科学界面必须区分
+事件视界、临界曲线、黑洞阴影、光子环和引力透镜环；不把 EHT 的观测厚环
+直接称作理论光子环。v1 不模拟 GRMHD、喷流、日冕、偏振和视界内部。
+
+**求解与验证**：GPU 使用有界 RK4 积分 Kerr 分离测地线方程，并逐射线报告
+俘获、盘命中、逃逸或无效结果，以及步数和势函数残差。CK 的宿主测试目标
+另用双精度 Kerr-Schild Hamiltonian + 自适应 RK45 作为独立参考。必须恢复
+Schwarzschild 的 `r_h = 2M`、`r_ph = 3M`、`b_c = 3 sqrt(3) M`、
+`r_ISCO = 6M`，并通过 `64 x 64` 浮点诊断目标的 4096 条射线进行 CPU/GPU
+对比；8 位截图不得代替数值残差读回。
+
+**架构边界**：JCE 只提供通用 HDR Fullscreen Effect、项目 Shader 编译、
+项目优先的 Shader/PAK 解析、通用数值纹理、异步类型化诊断回读、受限 JSON
+脚本读取、序列化、相机对齐/驾驶、编辑器通用检查器和生命周期管理。Kerr
+方程、观察者标架、吸积盘模型、配置、Shader、预设、Canvas HUD 和验证数据
+全部位于 `caged_kingdom`。交互由 CK 场景 Lua 脚本驱动，因此编辑器默认 Game
+Module 与运行时消费同一套项目 PAK、脚本和 Shader，不要求编辑器静态链接 CK
+C 代码。场景序列化经验证的默认参数快照，使编辑态无需执行项目脚本也能运行
+真实 Shader；Scene View 保持独立自由相机，选择 `KerrObserverCamera` 后可通过
+通用对齐/驾驶命令核对标准构图。Play 前由同一 JSON 配置重新校验并绑定。
+
+**Entity 清单**（ID 段 9100-9199）：
+
+| ID | Name | 作用 | 关键组件 |
+|---|---|---|---|
+| 9100 | `BlackHoleLabRoot` | 实验根节点 | Transform + EditorMeta |
+| 9101 | `KerrObserverCamera` | ZAMO 观察相机，坐标单位为 `M` | Camera + VirtualCamera |
+| 9110 | `KerrCoordinateAnchor` | 编辑器可选原点代理，游戏视图不渲染 | Transform + EditorMeta |
+| 9120 | `KerrFullscreenEffect` | 项目 Kerr Shader 的通用 HDR 入口 | FullscreenEffect（required） |
+| 9130 | `KerrLabDirector` | CK 配置、预设、相机和参数绑定 | Script `scripts/black_hole_lab.lua` |
+| 9140 | `KerrScienceHUD` | 科学标签、参数与诊断切换 | ECS Canvas + 控件 |
+| 9150 | `CriticalCurveOverlay` | 临界曲线、视界与 ISCO 解释层 | CK Canvas 诊断覆盖层 |
+| 9160 | `ReferenceRayProbe` | 烘焙参考摘要与可视射线探针，不冒充运行时自动验证 | Script + Canvas |
+
+**计划资产**：
+
+- `scenes/black_hole_lab.scene.json`
+- `black_hole/kerr_lab.json`
+- `black_hole/reference_summary.json`（完整语料仅生成到构建报告目录）
+- `scripts/black_hole_lab.lua` 与 `.deps.json`
+- `textures/black_hole/starfield_reference.png`
+- `textures/black_hole/disk_flux_lut.jceasset`（通用 `R32F` 数值纹理容器）
+- `textures/black_hole/blackbody_rgb_lut.jceasset`（通用 `RGBA16F` 数值纹理）
+- `shaders/black_hole/include/ck_kerr_lensing_solver.sc`
+- `shaders/black_hole/fs_ck_kerr_lensing_{128,192,320,640}.sc`
+  （四档项目包装入口共享同一求解器正文，构建后进入 PAK）
+
+**验收**：默认、Schwarzschild、正向/反向自旋和近侧视预设均可交互；
+科学诊断能显示射线结果、红移、像阶、步数和残差。相同后端、视口、配置哈希
+与帧号下，编辑器 Game View 和发行运行时输出一致。缺少 required Shader 或
+纹理时必须给出资源与后端诊断，不得仅显示黑屏。科普界面采用观察、比较、
+诊断三种紧凑工作态，公式、单位、模型假设和引用可核对，且不遮挡临界曲线。
+完整理论、数值误差预算、通用 API 与跨后端测试见
+`docs/superpowers/specs/2026-08-12-scientific-kerr-black-hole-lab-design.md`。
+
+---
+
 ## 历史场景（保留）
 
 - `main.scene.json` — 烟测场景（Sun+Ground+BagMan）。**v1 保留作 smoke test**，不入主线。
@@ -267,5 +398,3 @@ typedef struct CkPlayerState {
 - ❌ 场景流式加载（cell-based streaming）—— ROADMAP §2 提及，但留给 B 区拉斯帕兹大地图，本机制仅做关卡式切换
 - ❌ 联机场景同步 —— ROADMAP §9，主机推进，客户端被动跟随，本机制设计阶段仅考虑单机
 - ❌ 存档跨平台序列化 —— ROADMAP §13，独立模块
-
-

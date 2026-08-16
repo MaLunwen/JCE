@@ -1,17 +1,24 @@
 /*
  * jce_time_of_day.c -- analytical day/night curve.
  *
- * The model is intentionally cheap: a single sun trajectory parameterised
- * by hour-of-day, plus a small number of curated colour gradients keyed
- * on the sun's altitude angle.  This is far simpler than a Hosek-Wilkie
- * fit, but produces convincing dawn / midday / dusk / night transitions
- * without any GPU work.
+ * A single sun trajectory parameterised by hour-of-day, plus the lighting
+ * snapshot the renderer needs for that moment.  No GPU work.
  *
- * Colour palettes were hand-tuned to read well under a tone-mapped HDR
- * pipeline (Reinhard at exposure ~1.0).
+ * The sun colour and the daytime sky gradient are DERIVED, not authored:
+ * sun colour is E_top_of_atmosphere * atmospheric transmittance
+ * (jce_atmosphere.h), and the three sky stops are sampled from the same
+ * analytic Preetham sky the renderer draws (jce_sky.h).  Both used to be
+ * hand-tuned palettes lerped on the sun altitude, which meant the cheap
+ * gradient tier and the analytic sky could disagree about the same moment
+ * of the same day, and every atmosphere change needed a re-tune.
+ *
+ * Night stops remain authored: Preetham is a daylight model and is not
+ * valid with the sun below the horizon.
  */
 
 #include <jce/middleware/world/jce_time_of_day.h>
+#include <jce/middleware/world/jce_atmosphere.h>
+#include <jce/middleware/world/jce_sky.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -154,46 +161,121 @@ void jce_time_of_day_evaluate(const JceTimeOfDayConfig *cfg_in,
 
     /* ---- Palettes (linear RGB, tuned for HDR + Reinhard) -------- */
 
-    /* Sun colour: deep night → warm dawn → white noon → warm dusk → night. */
-    jce_vec3 col_night  = jce_v3(0.05f, 0.07f, 0.15f); /* moonlight tint */
-    jce_vec3 col_dawn   = jce_v3(2.20f, 1.20f, 0.55f); /* warm orange */
-    jce_vec3 col_noon   = jce_v3(2.80f, 2.70f, 2.55f); /* near-white, hot */
-    jce_vec3 col_dusk   = jce_v3(2.40f, 1.05f, 0.40f); /* deeper red */
+    /* Sun colour is DERIVED, not authored.
+     *
+     * It used to be a four-stop palette (night tint -> warm dawn -> white noon
+     * -> deeper dusk) lerped on the sun's altitude.  That has to be re-tuned
+     * for every atmosphere and it can never agree with a sky drawn by a
+     * different model.  Now it is E_top_of_atmosphere * transmittance, so the
+     * reddening near the horizon falls out of Rayleigh extinction instead of
+     * being painted in: blue is scattered away over the long grazing path
+     * while red survives.
+     *
+     * The result is divided back down into the renderer's existing arbitrary
+     * intensity range.  Publishing true lux would overflow mediump on the
+     * WebGL2 / integrated-GPU tier, and every shipped scene is authored
+     * against the old range, so a units migration is deliberately NOT done
+     * here -- see the environment-lighting design.  `sun_reference_lux` is the
+     * single constant that maps physical to authored; changing it rescales
+     * every light in lockstep rather than drifting one curve stop at a time. */
+    JceAtmosphereParams atmo = jce_atmosphere_default_params();
+    jce_vec3 lux = jce_atmosphere_sun_illuminance(&atmo, 0.0f, sun, up);
 
-    /* Choose dawn vs dusk based on hour. */
-    bool morning = (hour < (cfg.dawn_hour + cfg.dusk_hour) * 0.5f);
-    jce_vec3 sun_color;
-    if (alt_dot < 0.0f) {
-        sun_color = col_night;
-    } else if (alt_dot < 0.25f) {
-        float t = alt_dot / 0.25f;
-        jce_vec3 warm = morning ? col_dawn : col_dusk;
-        sun_color = td_lerp(warm, col_noon, td_smooth(t));
-    } else {
-        sun_color = col_noon;
-    }
+    /* Peak clear-noon illuminance maps to the previous palette's peak so
+     * existing content keeps its exposure. */
+    const float sun_reference_lux = 105000.0f;
+    const float sun_peak_intensity = 2.80f;
+    const float k = sun_peak_intensity / sun_reference_lux;
+    jce_vec3 sun_color = jce_v3(lux.x * k, lux.y * k, lux.z * k);
 
-    /* Sky gradient. */
-    jce_vec3 sky_top_day     = jce_v3(0.18f, 0.45f, 0.85f);
+    /* Night floor: a moonlight tint so a fully-set sun still reads as a
+     * direction rather than as pure black. */
+    const jce_vec3 col_night = jce_v3(0.05f, 0.07f, 0.15f);
+    if (sun_color.x < col_night.x) sun_color.x = col_night.x;
+    if (sun_color.y < col_night.y) sun_color.y = col_night.y;
+    if (sun_color.z < col_night.z) sun_color.z = col_night.z;
+
+    /* Sky gradient -- DERIVED from the same analytic sky the renderer draws.
+     *
+     * These three stops used to be nine hand-tuned palette entries (day /
+     * night / twilight zenith, day / night / dawn / dusk horizon, day / night
+     * ground) lerped on the sun altitude.  Nothing tied them to the Preetham
+     * sky, so the cheap gradient tier and the analytic tier could disagree
+     * about the same moment of the same day.
+     *
+     * Sampling the model at three directions makes the gradient a faithful
+     * three-point reduction of the sky.  The warm dawn/dusk horizon is no
+     * longer painted in: it comes out of the model automatically, because a
+     * low sun means a long grazing path and a reddened horizon.  That is why
+     * the separate dawn and dusk horizon palettes are gone.
+     *
+     * Preetham is a DAYLIGHT model and is not valid with the sun below the
+     * horizon, so the night stops remain authored and are blended in by
+     * day_t.  Deriving those needs a night-sky model, which is out of scope
+     * here. */
     jce_vec3 sky_top_night   = jce_v3(0.02f, 0.03f, 0.07f);
     jce_vec3 sky_top_twilight= jce_v3(0.18f, 0.10f, 0.30f);
+    jce_vec3 sky_horiz_night = jce_v3(0.04f, 0.05f, 0.10f);
+    jce_vec3 sky_ground_night= jce_v3(0.02f, 0.02f, 0.04f);
 
-    jce_vec3 sky_horiz_day      = jce_v3(0.65f, 0.78f, 0.92f);
-    jce_vec3 sky_horiz_night    = jce_v3(0.04f, 0.05f, 0.10f);
-    jce_vec3 sky_horiz_dawn     = jce_v3(1.10f, 0.55f, 0.30f);
-    jce_vec3 sky_horiz_dusk     = jce_v3(1.15f, 0.40f, 0.25f);
+    jce_vec3 sky_top_day, sky_horiz_day, sky_ground_day;
+    {
+        JceSkyConfig scfg = jce_sky_config_default();
+        /* normalize divides luminance by the zenith value, so the output is
+         * turbidity-independent and lands in a stable O(1) range.  The scale
+         * below then maps it onto the range existing content is authored
+         * against -- one constant, rather than nine drifting palette stops. */
+        scfg.normalize = 1;
+        const float sd[3] = { sun.x, sun.y, sun.z };
+        JceSkyState sst = jce_sky_evaluate(&scfg, sd);
 
-    jce_vec3 sky_ground_day   = jce_v3(0.22f, 0.22f, 0.28f);
-    jce_vec3 sky_ground_night = jce_v3(0.02f, 0.02f, 0.04f);
+        const float SKY_GRADIENT_SCALE = 0.45f;
+        /* Fraction of horizon light the ground bounces back.  Ground is not
+         * part of a daylight sky model, so it is an explicit albedo. */
+        const float GROUND_ALBEDO = 0.30f;
+
+        float rgb[3];
+        const float up_d[3] = { up.x, up.y, up.z };
+        jce_sky_radiance(&sst, up_d, rgb);
+        sky_top_day = jce_v3(rgb[0] * SKY_GRADIENT_SCALE,
+                             rgb[1] * SKY_GRADIENT_SCALE,
+                             rgb[2] * SKY_GRADIENT_SCALE);
+
+        /* Horizon: average a ring just above the horizon so the stop is the
+         * whole skyline rather than one azimuth, and so it stays continuous
+         * as the sun swings around. */
+        jce_vec3 east  = jce_v3_normalize(jce_v3_cross(cfg.north_axis, up));
+        jce_vec3 north = jce_v3_normalize(jce_v3_cross(up, east));
+        jce_vec3 acc = jce_v3(0.0f, 0.0f, 0.0f);
+        const int RING = 8;
+        for (int i = 0; i < RING; i++) {
+            const float a = (float)i * (2.0f * (float)M_PI / (float)RING);
+            const float ca = cosf(a), sa2 = sinf(a);
+            /* ~3 degrees above the horizon: inside the model's valid range
+             * but low enough to read as "the horizon". */
+            const float el = 0.052f;
+            jce_vec3 d = jce_v3(
+                (east.x * sa2 + north.x * ca) * cosf(el) + up.x * sinf(el),
+                (east.y * sa2 + north.y * ca) * cosf(el) + up.y * sinf(el),
+                (east.z * sa2 + north.z * ca) * cosf(el) + up.z * sinf(el));
+            d = jce_v3_normalize(d);
+            const float dd[3] = { d.x, d.y, d.z };
+            jce_sky_radiance(&sst, dd, rgb);
+            acc.x += rgb[0]; acc.y += rgb[1]; acc.z += rgb[2];
+        }
+        const float inv = SKY_GRADIENT_SCALE / (float)RING;
+        sky_horiz_day = jce_v3(acc.x * inv, acc.y * inv, acc.z * inv);
+
+        sky_ground_day = jce_v3(sky_horiz_day.x * GROUND_ALBEDO,
+                                sky_horiz_day.y * GROUND_ALBEDO,
+                                sky_horiz_day.z * GROUND_ALBEDO);
+    }
 
     jce_vec3 sky_top     = td_lerp(sky_top_night, sky_top_day, day_t);
     /* Boost twilight blue-purple. */
     sky_top = td_lerp(sky_top, sky_top_twilight, horizon_band * (1.0f - day_t) * 0.4f);
 
     jce_vec3 sky_horizon = td_lerp(sky_horiz_night, sky_horiz_day, day_t);
-    jce_vec3 horiz_warm  = morning ? sky_horiz_dawn : sky_horiz_dusk;
-    sky_horizon = td_lerp(sky_horizon, horiz_warm,
-                          horizon_band * (alt_dot > -0.15f ? 1.0f : 0.0f));
 
     jce_vec3 sky_ground = td_lerp(sky_ground_night, sky_ground_day, day_t);
 
@@ -223,4 +305,53 @@ void jce_time_of_day_evaluate(const JceTimeOfDayConfig *cfg_in,
     out->exposure      = exposure;
     out->is_night      = (alt_dot < 0.0f);
     JCE_PROFILE_ZONE_END;
+}
+
+/* ── Publish contract ──────────────────────────────────────────────── */
+
+void JCE_CALL jce_time_of_day_resolve_fog(const JceTimeOfDayState *tod,
+                                          const float authored_color[3],
+                                          float       authored_density,
+                                          float       out_color[3],
+                                          float      *out_density)
+{
+    /* Inactive cycle: pass the authored values straight through, so a scene
+     * without a day/night cycle renders bit-identically. */
+    if (out_color) {
+        if (tod) {
+            out_color[0] = tod->fog_color.x;
+            out_color[1] = tod->fog_color.y;
+            out_color[2] = tod->fog_color.z;
+        } else if (authored_color) {
+            out_color[0] = authored_color[0];
+            out_color[1] = authored_color[1];
+            out_color[2] = authored_color[2];
+        } else {
+            out_color[0] = out_color[1] = out_color[2] = 0.0f;
+        }
+    }
+
+    if (out_density) {
+        /* The cycle scales the authored density rather than replacing it, so
+         * an artist who authored thick fog keeps thick fog and still gets the
+         * night thickening.  tod->fog_density is calibrated around the daytime
+         * default, so the ratio is what carries the time-of-day signal. */
+        if (tod) {
+            const float daytime_reference = 0.0025f;
+            float scale = tod->fog_density / daytime_reference;
+            if (scale < 0.0f) scale = 0.0f;
+            *out_density = authored_density * scale;
+        } else {
+            *out_density = authored_density;
+        }
+    }
+}
+
+float JCE_CALL jce_time_of_day_resolve_exposure(const JceTimeOfDayState *tod,
+                                                float authored_exposure)
+{
+    if (!tod) return authored_exposure;
+    /* Multiplicative: the cycle dims toward night relative to whatever the
+     * scene authored, instead of discarding the authored value. */
+    return authored_exposure * tod->exposure;
 }

@@ -2,6 +2,8 @@
  * jce_terrain.c -- Terrain runtime impl.
  */
 
+#include "jce_phacelle.h"
+#include "jce_horizon.h"
 #include <jce/middleware/scene/jce_terrain.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
@@ -244,8 +246,17 @@ bool jce_terrain_build_collision_mesh(const JceTerrain *t,
             const uint32_t v10 = v00 + 1u;
             const uint32_t v01 = v00 + (uint32_t)W;
             const uint32_t v11 = v01 + 1u;
-            idx[k++] = v00; idx[k++] = v01; idx[k++] = v11;
-            idx[k++] = v00; idx[k++] = v11; idx[k++] = v10;
+            /* Split on the v10-v01 ANTI-diagonal, matching
+             * jce_terrain_chunk_build_mesh (a,c,b + b,c,d, shared edge b-c)
+             * and Bullet's unflipped heightfield.
+             *
+             * This used to split v00-v11, i.e. the OTHER diagonal from the one
+             * the renderer draws.  The two agree exactly at every vertex, so
+             * nothing looked wrong -- but across half of each cell the surface
+             * you collided with was not the surface you could see, by the full
+             * corner-to-corner height difference. */
+            idx[k++] = v00; idx[k++] = v01; idx[k++] = v10;
+            idx[k++] = v10; idx[k++] = v01; idx[k++] = v11;
         }
     }
     *out_verts   = verts;  *out_vcount = vcount;
@@ -488,6 +499,10 @@ static void make_bin_path(const char *meta_json_path, char *out, size_t cap)
 bool jce_terrain_save_file(const JceTerrain *t, const char *meta_json_path)
 {
     if (!t || !meta_json_path) return false;
+    /* The .bin is header + heights + splat (+ hole mask). A tiled terrain has
+     * neither array resident, so this used to memcpy from NULL -- and the
+     * editor's Save button is only disabled when there is no terrain at all. */
+    if (!t->heights || !t->splat) return false;
     char bin_path[1024];
     make_bin_path(meta_json_path, bin_path, sizeof(bin_path));
 
@@ -1037,6 +1052,18 @@ void jce_terrain_sculpt_apply(JceTerrain *t,
                               float dt)
 {
     if (!t || radius_world <= 0.0f || dt <= 0.0f) return;
+    /* A tiled or procedural terrain has no resident height grid: w and h are
+     * the FULL extent and heights is NULL, so the usual `w < 2` shape check
+     * lets it straight through to `t->heights[idx]`.
+     *
+     * The header states the contract -- "authoring (sculpt / import / export)
+     * requires a monolithic terrain" -- and import, export, erosion, thermal
+     * and the sky-occlusion bake all enforce it. These brush entry points did
+     * not, and the editor reaches them: a `"procedural": true` meta loads
+     * through the Load button, and the next brush stroke dereferences NULL.
+     * capture_snapshot already returns false for tiled, so the undo push
+     * silently no-ops first and the crash is not even preceded by a snapshot. */
+    if (!t->heights) return;
     int x0, z0, x1, z1;
     brush_grid_extents(t, wx, wz, radius_world, &x0, &z0, &x1, &z1);
     float dx_world = t->world_size_x / (float)(t->w - 1);
@@ -1095,6 +1122,7 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
                              float dt)
 {
     if (!t || layer < 0 || layer > 3 || radius_world <= 0.0f || dt <= 0.0f) return;
+    if (!t->splat) return;    /* tiled/procedural: no resident splat grid */
     int x0, z0, x1, z1;
     brush_grid_extents(t, wx, wz, radius_world, &x0, &z0, &x1, &z1);
     float dx_world = t->world_size_x / (float)(t->w - 1);
@@ -1290,4 +1318,268 @@ bool jce_terrain_import_heightmap_file(JceTerrain *t, const char *path)
 
     jce_fs_buffer_free(file);
     return ok;
+}
+
+/* ── Sky occlusion (cook-time) ──────────────────────────────────────────
+ *
+ * See jce_terrain.h.  The horizon sweep is a standalone, engine-independent
+ * module; all this does is present the terrain's grid in the units it expects
+ * -- which is exactly where a mistake would hide, because heights are stored
+ * NORMALIZED and the sweep needs world Y or every elevation angle is wrong by
+ * the max_height factor. */
+
+bool jce_terrain_bake_sky_occlusion(const JceTerrain *t, int directions,
+                                    float *out_visibility,
+                                    float *out_bent_normals)
+{
+    if (!t) return false;
+    if (!out_visibility && !out_bent_normals) return false;
+    if (t->w < 1 || t->h < 1) return false;
+
+    const float *norm = jce_terrain_heights(t);
+    if (!norm) return false;   /* tiled/procedural: no resident grid to sweep */
+
+    const size_t n = (size_t)t->w * (size_t)t->h;
+    float *world_y = (float *)jce_malloc(n * sizeof(float));
+    if (!world_y) return false;
+    for (size_t i = 0; i < n; i++) world_y[i] = norm[i] * t->max_height;
+
+    JceHorizonDesc d;
+    memset(&d, 0, sizeof d);
+    d.heights     = world_y;
+    d.w           = (uint32_t)t->w;
+    d.h           = (uint32_t)t->h;
+    /* Sample spacing, not cell count: a WxH grid spans W-1 cells.  Using W
+     * here would shrink every cell and tilt every horizon. */
+    d.cell_size_x = (t->w > 1) ? t->world_size_x / (float)(t->w - 1)
+                               : t->world_size_x;
+    d.cell_size_z = (t->h > 1) ? t->world_size_z / (float)(t->h - 1)
+                               : t->world_size_z;
+    d.directions  = (directions > 0) ? (uint32_t)directions : 0u;
+
+    const bool ok = jce_horizon_bake(&d, out_visibility, out_bent_normals);
+    jce_free(world_y);
+    return ok;
+}
+
+float jce_terrain_sample_sky_visibility(const JceTerrain *t,
+                                        const float *visibility,
+                                        float wx, float wz)
+{
+    /* Open sky is the honest answer for a point that is not over this terrain,
+     * and it is also the safe one: it can only fail to darken, never invent
+     * shadow where there is none. */
+    if (!t || !visibility) return 1.0f;
+
+    float fx, fz;
+    world_to_uv(t, wx, wz, &fx, &fz);
+    if (fx < 0.0f || fz < 0.0f ||
+        fx > (float)(t->w - 1) || fz > (float)(t->h - 1))
+        return 1.0f;
+
+    const int x0 = (int)floorf(fx), z0 = (int)floorf(fz);
+    const int x1 = clampi(x0 + 1, 0, t->w - 1);
+    const int z1 = clampi(z0 + 1, 0, t->h - 1);
+    const int cx0 = clampi(x0, 0, t->w - 1);
+    const int cz0 = clampi(z0, 0, t->h - 1);
+    const float u = fx - (float)x0;
+    const float v = fz - (float)z0;
+
+    const float v00 = visibility[(size_t)cz0 * (size_t)t->w + (size_t)cx0];
+    const float v10 = visibility[(size_t)cz0 * (size_t)t->w + (size_t)x1];
+    const float v01 = visibility[(size_t)z1  * (size_t)t->w + (size_t)cx0];
+    const float v11 = visibility[(size_t)z1  * (size_t)t->w + (size_t)x1];
+
+    const float a = v00 + (v10 - v00) * u;
+    const float b = v01 + (v11 - v01) * u;
+    return a + (b - a) * v;
+}
+
+/* ── Erosion (cook-time) ────────────────────────────────────────────────
+ * See jce_terrain.h.  Whole-grid application of the gully filter, plus the
+ * ridge channel it produces almost for free. */
+
+bool jce_terrain_apply_erosion(JceTerrain *t,
+                               const JceTerrainErosionParams *params,
+                               float *out_ridge)
+{
+    if (!t || t->w < 2 || t->h < 2) return false;
+
+    float *norm = (float *)jce_terrain_heights(t);
+    if (!norm) return false;   /* tiled/procedural: nothing resident to erode */
+
+    const float max_h = (t->max_height > 0.0f) ? t->max_height : 1.0f;
+    const float dx = (t->w > 1) ? t->world_size_x / (float)(t->w - 1) : 1.0f;
+    const float dz = (t->h > 1) ? t->world_size_z / (float)(t->h - 1) : 1.0f;
+
+    JcePhacelleParams pp;
+    jce_phacelle_params_default(&pp);
+    if (params) {
+        pp.seed = params->seed;
+        /* 0 means "keep the tuned default" -- a zeroed struct must be a valid
+         * request, not a silent request for zero octaves (which would erode
+         * nothing and look like the call did not happen). */
+        if (params->octaves   > 0)    pp.octaves   = params->octaves;
+        if (params->frequency > 0.0f) pp.frequency = params->frequency;
+        if (params->strength  > 0.0f) pp.strength  = params->strength;
+        if (params->detail    > 0.0f) pp.detail    = params->detail;
+    }
+    jce_phacelle_params_sanitize(&pp);
+
+    const size_t cells = (size_t)t->w * (size_t)t->h;
+    /* Read from a snapshot: the filter needs the ORIGINAL slope at every
+     * sample, and eroding in place would feed already-carved neighbours into
+     * later gradients -- a directional bias that reads as combing. */
+    float *src = (float *)jce_malloc(cells * sizeof(float));
+    if (!src) return false;
+    for (size_t i = 0; i < cells; i++) src[i] = norm[i] * max_h;
+
+    for (int z = 0; z < t->h; z++) {
+        for (int x = 0; x < t->w; x++) {
+            const int xm = (x > 0)          ? x - 1 : x;
+            const int xp = (x < t->w - 1)   ? x + 1 : x;
+            const int zm = (z > 0)          ? z - 1 : z;
+            const int zp = (z < t->h - 1)   ? z + 1 : z;
+            /* Span is 2 cells in the interior and 1 at the border, where the
+             * clamped index makes the difference one-sided. */
+            const float sx = (float)(xp - xm) * dx;
+            const float sz = (float)(zp - zm) * dz;
+
+            const float gx = (sx > 0.0f)
+                ? (src[(size_t)z * t->w + xp] - src[(size_t)z * t->w + xm]) / sx
+                : 0.0f;
+            const float gz = (sz > 0.0f)
+                ? (src[(size_t)zp * t->w + x] - src[(size_t)zm * t->w + x]) / sz
+                : 0.0f;
+
+            float out_h = 0.0f, out_gx = 0.0f, out_gz = 0.0f, ridge = 0.0f;
+            jce_phacelle_erode(&pp,
+                               (float)x * dx, (float)z * dz,
+                               src[(size_t)z * t->w + x], gx, gz,
+                               &out_h, &out_gx, &out_gz, &ridge);
+
+            /* Back to normalized storage, clamped: erosion can push a sample
+             * below the terrain's own floor, and a negative normalized height
+             * would wrap through the 16-bit cooked format. */
+            float n = out_h / max_h;
+            if (n < 0.0f) n = 0.0f;
+            if (n > 1.0f) n = 1.0f;
+            norm[(size_t)z * t->w + x] = n;
+
+            if (out_ridge) out_ridge[(size_t)z * t->w + x] = ridge;
+        }
+    }
+
+    jce_free(src);
+    return true;
+}
+
+/* ── Thermal / talus erosion (cook-time) ────────────────────────────────
+ * See jce_terrain.h.  Material above the angle of repose slides to lower
+ * neighbours; nothing is created or destroyed. */
+
+bool jce_terrain_apply_thermal(JceTerrain *t,
+                               const JceTerrainThermalParams *params)
+{
+    if (!t || t->w < 2 || t->h < 2) return false;
+
+    float *norm = (float *)jce_terrain_heights(t);
+    if (!norm) return false;   /* tiled/procedural: nothing resident */
+
+    float angle = params ? params->talus_angle_deg : 0.0f;
+    int   iters = params ? params->iterations      : 0;
+    float k     = params ? params->strength        : 0.0f;
+    if (!(angle > 0.0f)) angle = 35.0f;
+    if (iters <= 0)      iters = 8;
+    if (!(k > 0.0f))     k = 0.5f;
+    if (k > 1.0f)        k = 1.0f;
+    if (angle > 89.0f)   angle = 89.0f;
+    if (iters > 256)     iters = 256;
+
+    const float max_h = (t->max_height > 0.0f) ? t->max_height : 1.0f;
+    const float dx = (t->w > 1) ? t->world_size_x / (float)(t->w - 1) : 1.0f;
+    const float dz = (t->h > 1) ? t->world_size_z / (float)(t->h - 1) : 1.0f;
+
+    /* The maximum height difference a neighbour may sit below before material
+     * starts sliding.  Anisotropic on purpose: a grid with dx != dz has a
+     * different threshold along each axis, and using one value for both would
+     * carve terraces aligned to whichever axis was favoured. */
+    const float tan_r = tanf(angle * 3.14159265358979323846f / 180.0f);
+    const float talus_x = tan_r * dx / max_h;   /* in NORMALIZED height units */
+    const float talus_z = tan_r * dz / max_h;
+
+    const size_t cells = (size_t)t->w * (size_t)t->h;
+    float *delta = (float *)jce_malloc(cells * sizeof(float));
+    if (!delta) return false;
+
+    for (int it = 0; it < iters; ++it) {
+        memset(delta, 0, cells * sizeof(float));
+
+        for (int z = 0; z < t->h; ++z) {
+            for (int x = 0; x < t->w; ++x) {
+                const size_t c = (size_t)z * t->w + x;
+                const float  hc = norm[c];
+
+                /* Gather the four von Neumann neighbours that sit far enough
+                 * below to be unstable, and how far below they are. */
+                size_t idx[4];
+                float  excess[4];
+                int    n = 0;
+                float  total = 0.0f;
+
+                if (x > 0) {
+                    const size_t o = c - 1;
+                    const float  d = hc - norm[o] - talus_x;
+                    if (d > 0.0f) { idx[n] = o; excess[n] = d; total += d; n++; }
+                }
+                if (x < t->w - 1) {
+                    const size_t o = c + 1;
+                    const float  d = hc - norm[o] - talus_x;
+                    if (d > 0.0f) { idx[n] = o; excess[n] = d; total += d; n++; }
+                }
+                if (z > 0) {
+                    const size_t o = c - (size_t)t->w;
+                    const float  d = hc - norm[o] - talus_z;
+                    if (d > 0.0f) { idx[n] = o; excess[n] = d; total += d; n++; }
+                }
+                if (z < t->h - 1) {
+                    const size_t o = c + (size_t)t->w;
+                    const float  d = hc - norm[o] - talus_z;
+                    if (d > 0.0f) { idx[n] = o; excess[n] = d; total += d; n++; }
+                }
+                if (n == 0 || total <= 0.0f) continue;
+
+                /* Move a fraction of the LARGEST excess, split among the
+                 * unstable neighbours in proportion to how unstable each is.
+                 * Capping on the maximum rather than the sum is what keeps the
+                 * pass stable: moving the full sum would overshoot and let the
+                 * surface oscillate between iterations. */
+                float max_excess = excess[0];
+                for (int i = 1; i < n; ++i)
+                    if (excess[i] > max_excess) max_excess = excess[i];
+
+                const float moved = k * 0.5f * max_excess;
+                for (int i = 0; i < n; ++i) {
+                    const float share = moved * (excess[i] / total);
+                    delta[c]      -= share;
+                    delta[idx[i]] += share;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < cells; ++i) {
+            float v = norm[i] + delta[i];
+            /* Conservation makes escaping the range essentially impossible,
+             * but a clamp here would silently DESTROY mass, so assert the
+             * range by construction instead: material only ever moves from a
+             * higher cell to a lower one, so neither end can leave [0,1] if
+             * the input was inside it. */
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            norm[i] = v;
+        }
+    }
+
+    jce_free(delta);
+    return true;
 }

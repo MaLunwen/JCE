@@ -21,5 +21,15 @@ void main()
 		}
 	}
 	float v = sum / cnt;
-	gl_FragColor = vec4(v, v, v, 1.0);
+	/* Green passes through UNBLURRED.  The 5x5 box is sized for AO, which is a
+	 * low-frequency term; contact shadows are the opposite -- their entire
+	 * purpose is the high-frequency detail no shadow map resolves, and blurring
+	 * them away would leave the cost and remove the effect, with the result
+	 * still looking like plausible soft shadowing. */
+	vec4 center = texture2D(s_ao, uv);
+	/* Green (contact shadow) and blue (cloud shadow) pass through UNBLURRED.
+	 * The 5x5 box is sized for AO, a low-frequency term.  Contact shadows are
+	 * the opposite -- their whole purpose is detail no shadow map resolves --
+	 * and the cloud map is already smooth, so blurring it only costs. */
+	gl_FragColor = vec4(v, center.g, center.b, 1.0);
 }

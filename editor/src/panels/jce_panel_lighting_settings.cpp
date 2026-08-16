@@ -201,20 +201,42 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
         changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
                                      rendering->ambient_color);
 
-        /* ── Sky pass (gradient / equirect / analytic Preetham / stylized dome) */
-        const char *sky_modes[4] = {
+        /* ── Sky pass (gradient / equirect / Preetham / stylized / physical) */
+        const char *sky_modes[5] = {
             jce_editor_i18n("panel.lighting.env.sky_mode.gradient"),
             jce_editor_i18n("panel.lighting.env.sky_mode.equirect"),
             jce_editor_i18n("panel.lighting.env.sky_mode.preetham"),
             jce_editor_i18n("panel.lighting.env.sky_mode.stylized"),
+            jce_editor_i18n("panel.lighting.env.sky_mode.physical"),
         };
         int sky_mode = rendering->sky_mode;
         if (sky_mode < JCE_SCENE_SKY_GRADIENT) sky_mode = JCE_SCENE_SKY_GRADIENT;
-        if (sky_mode > JCE_SCENE_SKY_STYLIZED) sky_mode = JCE_SCENE_SKY_STYLIZED;
+        if (sky_mode > JCE_SCENE_SKY_PHYSICAL) sky_mode = JCE_SCENE_SKY_PHYSICAL;
         if (ImGui::Combo(jce_editor_i18n("panel.lighting.env.sky_mode"),
-                         &sky_mode, sky_modes, 4)) {
+                         &sky_mode, sky_modes, 5)) {
             rendering->sky_mode = sky_mode;
             changed = true;
+        }
+
+        /* ── Volumetric clouds ─────────────────────────────────────────
+         * Coverage 0 skips the march entirely, so leaving this alone costs
+         * nothing -- the control is the feature's on/off switch as well as
+         * its amount. */
+        ImGui::SeparatorText(jce_editor_i18n("panel.lighting.env.clouds"));
+        changed |= ImGui::SliderFloat(
+            jce_editor_i18n("panel.lighting.env.clouds.coverage"),
+            &rendering->cloud_coverage, 0.0f, 1.0f, "%.2f");
+        if (rendering->cloud_coverage > 0.0f) {
+            changed |= ImGui::SliderFloat(
+                jce_editor_i18n("panel.lighting.env.clouds.density"),
+                &rendering->cloud_density, 0.0f, 8.0f, "%.2f");
+            changed |= ImGui::DragFloatRange2(
+                jce_editor_i18n("panel.lighting.env.clouds.layer"),
+                &rendering->cloud_bottom_km, &rendering->cloud_top_km,
+                0.05f, 0.0f, 20.0f, "%.2f km", "%.2f km");
+        } else {
+            ImGui::TextDisabled("%s",
+                jce_editor_i18n("panel.lighting.env.clouds.off"));
         }
         if (rendering->sky_mode == JCE_SCENE_SKY_PREETHAM) {
             changed |= ImGui::DragFloat(
@@ -681,6 +703,55 @@ bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
     changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.weather.intensity"),
                                   &rendering->weather_intensity, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
+
+    /* Air temperature.
+     *
+     * Not cosmetic and not optional: the environment accumulates lying snow
+     * only below 1 C and melts it to zero on every frame above, so with the
+     * 15 C default this control is the difference between snow existing and
+     * not. Nothing wrote it before, which is why an engine that renders
+     * snowfall could never show snow on the ground. */
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.weather.temperature"),
+                                &rendering->temperature_c, 0.5f, -60.0f, 60.0f,
+                                "%.1f C");
+    if (rendering->weather_type == 2 && rendering->temperature_c > 1.0f)
+        ImGui::TextDisabled("%s", jce_editor_i18n("panel.lighting.weather.too_warm"));
+
+    /* Wind direction: one authority for the whole scene's weather.
+     *
+     * Shown under Weather rather than beside the grass and ocean controls
+     * because it is not those surfaces' setting -- it is the wind, and they
+     * follow it. Until today nothing wrote it at all, so every scene blew
+     * along +X: whatever jce_environment_default left in the struct was the
+     * answer every consumer got, for the life of the process.
+     *
+     * (0, 0) means "not authored" and leaves that default in place, so a scene
+     * saved before this control existed loads and re-saves unchanged. The
+     * button restores that state explicitly, because dragging a slider to zero
+     * is a thing people do by accident and "no opinion" should be reachable on
+     * purpose. */
+    ImGui::SeparatorText(jce_editor_i18n("panel.lighting.wind"));
+    {
+        float dir[2] = { rendering->wind_direction_x, rendering->wind_direction_z };
+        if (ImGui::DragFloat2(jce_editor_i18n("panel.lighting.wind.direction"),
+                              dir, 0.01f, -1.0f, 1.0f, "%.2f")) {
+            rendering->wind_direction_x = dir[0];
+            rendering->wind_direction_z = dir[1];
+            changed = true;
+        }
+        const bool authored = (rendering->wind_direction_x != 0.0f ||
+                               rendering->wind_direction_z != 0.0f);
+        if (authored) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(jce_editor_i18n("panel.lighting.wind.clear"))) {
+                rendering->wind_direction_x = 0.0f;
+                rendering->wind_direction_z = 0.0f;
+                changed = true;
+            }
+        } else {
+            ImGui::TextDisabled("%s", jce_editor_i18n("panel.lighting.wind.unset"));
+        }
+    }
 
     return changed;
 }
@@ -1176,26 +1247,7 @@ extern "C" void jce_editor_lighting_settings_get_sun(
         *out_cast_shadows = g_lit.sun_cast_shadows ? 1 : 0;
 }
 
-extern "C" bool jce_editor_lighting_get_fog_enabled(void)
-{
-    const JceSceneRenderingSettings *r = current_scene_rendering_settings();
-    return r && r->fog_enabled && r->fog_mode != JCE_SCENE_FOG_NONE;
-}
 
-extern "C" void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out)
-{
-    if (!out) return;
-    const JceSceneRenderingSettings *r = current_scene_rendering_settings();
-    *out = jce_volumetric_fog_default_params();
-    if (!r)
-        return;
-    out->color_r        = r->fog_color[0];
-    out->color_g        = r->fog_color[1];
-    out->color_b        = r->fog_color[2];
-    out->density        = r->fog_density;
-    out->height_falloff = r->fog_height_falloff;
-    out->height_origin  = r->fog_height_origin;
-}
 
 extern "C" void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)
 {

@@ -5,7 +5,7 @@
  * A single backend IO thread drains the ring in batches.
  *
  * Design:
- *   - write_pos / read_pos are monotonically increasing uint32_t counters.
+ *   - write_pos / read_pos are monotonically increasing atomic counters.
  *   - Actual buffer index = pos & mask  (power-of-two capacity).
  *   - Ring is empty when read_pos == write_pos.
  *   - Ring is full  when write_pos - read_pos >= capacity.
@@ -36,7 +36,6 @@ typedef struct JceLogMessage {
     JceLogLevel level;
     int         line;
     uint64_t    timestamp_ms;   /* SDL_GetTicks() */
-    SDL_Time    wall_time;      /* SDL_GetCurrentTime() */
     char        tag[32];
     char        file[64];
     char        thread_name[32];
@@ -54,8 +53,8 @@ typedef struct JceLogMessage {
 
 typedef struct JceLogRing {
     JceLogMessage  *buf;        /* heap-allocated array [capacity]      */
-    uint32_t        write_pos;  /* next slot to write (monotonic)       */
-    uint32_t        read_pos;   /* next slot to read  (monotonic)       */
+    SDL_AtomicU32   write_pos;  /* next slot to write (monotonic)       */
+    SDL_AtomicU32   read_pos;   /* next slot to read  (monotonic)       */
     uint32_t        capacity;
     uint32_t        mask;       /* capacity - 1                         */
     SDL_Mutex      *push_mtx;   /* serializes producers on push         */
@@ -75,13 +74,13 @@ static inline JceLogRing *jce_log_ring_create(void)
 
     r->capacity  = JCE_LOG_RING_CAPACITY;
     r->mask      = r->capacity - 1;
-    r->write_pos = 0;
-    r->read_pos  = 0;
     r->buf       = (JceLogMessage *)JCE_CALLOC(r->capacity, sizeof(JceLogMessage));
     r->push_mtx  = SDL_CreateMutex();
     r->wake_mtx  = SDL_CreateMutex();
     r->wake_cond = SDL_CreateCondition();
 
+    SDL_SetAtomicU32(&r->write_pos, 0);
+    SDL_SetAtomicU32(&r->read_pos, 0);
     SDL_SetAtomicInt(&r->dropped, 0);
 
     if (!r->buf || !r->push_mtx || !r->wake_mtx || !r->wake_cond) {
@@ -117,12 +116,14 @@ static inline bool jce_log_ring_push(JceLogRing *r, const JceLogMessage *msg)
 
     SDL_LockMutex(r->push_mtx);
     {
-        uint32_t used = r->write_pos - r->read_pos;
+        uint32_t write = SDL_GetAtomicU32(&r->write_pos);
+        uint32_t read = SDL_GetAtomicU32(&r->read_pos);
+        uint32_t used = write - read;
         if (used < r->capacity) {
-            uint32_t idx = r->write_pos & r->mask;
+            uint32_t idx = write & r->mask;
             r->buf[idx] = *msg;               /* struct copy */
             SDL_MemoryBarrierRelease();
-            r->write_pos++;
+            SDL_SetAtomicU32(&r->write_pos, write + 1u);
             ok = true;
         } else {
             SDL_AddAtomicInt(&r->dropped, 1);
@@ -148,16 +149,17 @@ static inline int jce_log_ring_pop_batch(JceLogRing *r,
                                          JceLogMessage *out,
                                          int max_count)
 {
+    uint32_t read = SDL_GetAtomicU32(&r->read_pos);
+    uint32_t write = SDL_GetAtomicU32(&r->write_pos);
     int count = 0;
-    while (count < max_count) {
-        SDL_MemoryBarrierAcquire();
-        if (r->read_pos == r->write_pos)
-            break;                              /* ring empty */
-        uint32_t idx = r->read_pos & r->mask;
+    while (count < max_count && read != write) {
+        uint32_t idx = read & r->mask;
         out[count] = r->buf[idx];              /* struct copy */
-        r->read_pos++;
+        read++;
         count++;
     }
+    if (count > 0)
+        SDL_SetAtomicU32(&r->read_pos, read);
     return count;
 }
 
@@ -166,9 +168,10 @@ static inline int jce_log_ring_pop_batch(JceLogRing *r,
 /* ------------------------------------------------------------------ */
 
 /* Number of messages currently in the ring (approximate). */
-static inline uint32_t jce_log_ring_count(const JceLogRing *r)
+static inline uint32_t jce_log_ring_count(JceLogRing *r)
 {
-    return r->write_pos - r->read_pos;
+    return SDL_GetAtomicU32(&r->write_pos) -
+           SDL_GetAtomicU32(&r->read_pos);
 }
 
 #endif /* JCE_LOG_ASYNC */

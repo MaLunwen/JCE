@@ -1,5 +1,5 @@
 $input a_position, a_normal, a_texcoord0, i_data0, i_data1
-$output v_texcoord0, v_normal, v_worldpos
+$output v_texcoord0, v_normal, v_worldpos, v_localpos
 
 #include <bgfx_shader.sh>
 
@@ -89,4 +89,15 @@ void main()
     v_texcoord0 = a_texcoord0.xy;
     v_normal    = n;
     v_worldpos  = world;
+    /* Object space for hashed alpha in fs_foliage_shadow.  Must be the
+     * PRE-WIND position -- the hash exists so the stipple does not move, and
+     * world position sways every frame.
+     *
+     * This shader and vs_foliage.sc are SEPARATE programs paired with
+     * fs_foliage.sc and fs_foliage_shadow.sc respectively.  Adding a varying
+     * to one fragment shader obliges its own vertex shader, not the other's:
+     * a mismatched $input/$output set is an invalid program, and the symptom
+     * is silent -- the foliage simply does not draw, and the shadow pass drops
+     * to its sphere-proxy blobs, so bare branches keep casting round shadows. */
+    v_localpos  = a_position;
 }

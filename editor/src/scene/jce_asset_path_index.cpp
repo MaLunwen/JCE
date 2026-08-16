@@ -3,7 +3,7 @@
  *
  * The recursive project walk can take seconds on large trees, so it also
  * offers an async variant (jce_asset_path_index_rebuild_async): a worker
- * thread builds a fresh index into a private set of maps, and the main
+ * task builds a fresh index into a private set of maps, and the main
  * thread swaps it into the live index in one move (jce_asset_path_index_poll).
  * Lookups keep using the previous index until the swap, so the UI never
  * blocks and never sees a half-populated table.
@@ -11,10 +11,10 @@
 
 #include "jce_asset_path_index.h"
 
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
 #include <algorithm>
@@ -128,9 +128,10 @@ static const uint64_t kAutoIndexTimeBudgetMs = 3000;
 /* Per-walk context, passed through jce_fs_host_walk's user pointer so the
  * walk targets a specific IndexMaps (live for sync, private for async). */
 struct WalkCtx {
-    IndexMaps *maps;
-    uint64_t   start_ms;
-    bool       budget_exceeded;
+    IndexMaps       *maps;
+    JceAsyncContext *async_ctx;
+    uint64_t         start_ms;
+    bool             budget_exceeded;
 };
 
 bool walk_cb(const char *path, bool is_dir, void *user)
@@ -140,6 +141,9 @@ bool walk_cb(const char *path, bool is_dir, void *user)
 
     /* Abort the entire walk once any cap is reached.  jce_fs_host_walk
      * treats a `false` return as STOP-WHOLE-WALK. */
+    if (wc->async_ctx &&
+        jce_async_context_cancel_requested(wc->async_ctx))
+        return false;
     if (m->total >= kAutoIndexFileCap) {
         return false;
     }
@@ -217,7 +221,8 @@ const std::string *pick_shortest(const PathSet *set)
 /* Walk `root` into `m` (additive).  Returns files added.  Thread-safe:
  * touches only `m` + read-only OS calls, so a worker can call it on a
  * private IndexMaps. */
-int index_walk_into(IndexMaps *m, const char *root)
+int index_walk_into(IndexMaps *m, const char *root,
+                    JceAsyncContext *async_ctx = nullptr)
 {
     if (!root || !*root) return 0;
     if (!jce_fs_host_exists_dir(root)) return 0;
@@ -238,7 +243,7 @@ int index_walk_into(IndexMaps *m, const char *root)
         }
     }
     size_t before = m->total;
-    WalkCtx wc{ m, jce_time_ticks_ms(), false };
+    WalkCtx wc{ m, async_ctx, jce_time_ticks_ms(), false };
     jce_fs_host_walk(root, walk_cb, &wc);
     int added = (int)(m->total - before);
     if (m->total >= kAutoIndexFileCap) {
@@ -256,23 +261,24 @@ int index_walk_into(IndexMaps *m, const char *root)
 
 /* ── Async rebuild plumbing ───────────────────────────────────────── */
 struct AsyncIndexJob {
-    std::string   root;
-    IndexMaps     maps;
-    JceAtomicI32 *done = nullptr;   /* 0 running, 1 finished */
+    std::string root;
+    IndexMaps   maps;
 };
 
-JceThread     *g_aidx_worker      = nullptr;
+JceAsyncTask  *g_aidx_task        = nullptr;
 AsyncIndexJob *g_aidx_job         = nullptr;
 std::string    g_aidx_pending_root;   /* newest request while busy */
 uint32_t       g_aidx_generation = 0; /* bumped on every index change;
                                          consumed by the resolver's
                                          negative cache (stall guard) */
 
-void aidx_worker(void *arg)
+JceAsyncRunResult aidx_worker(JceAsyncContext *ctx, void *arg)
 {
     AsyncIndexJob *j = (AsyncIndexJob *)arg;
-    index_walk_into(&j->maps, j->root.c_str());   /* into private maps */
-    jce_atomic_i32_store(j->done, 1);
+    index_walk_into(&j->maps, j->root.c_str(), ctx); /* into private maps */
+    return jce_async_context_cancel_requested(ctx)
+        ? JCE_ASYNC_RUN_CANCELLED
+        : JCE_ASYNC_RUN_SUCCESS;
 }
 
 void aidx_finalize(void);   /* fwd */
@@ -281,30 +287,41 @@ void aidx_start(const std::string &root)
 {
     AsyncIndexJob *j = new AsyncIndexJob();
     j->root = root;
-    j->done = jce_atomic_i32_create(0);
-    g_aidx_job = j;
-    g_aidx_worker = jce_thread_create(aidx_worker, j, "jce_asset_index");
-    if (!g_aidx_worker) {
-        /* No worker thread: build inline then finalise immediately. */
-        aidx_worker(j);
-        aidx_finalize();
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = aidx_worker;
+    desc.user_data  = j;
+    desc.debug_name = "editor.asset-index.rebuild";
+    desc.priority   = JCE_ASYNC_PRIORITY_LOW;
+    JceAsyncTask *task =
+        jce_async_submit(jce_async_default_executor(), &desc);
+    if (!task) {
+        delete j;
+        LOG_WARN(LOG_TAG, "asset index task queue is full");
+        return;
     }
+    g_aidx_job = j;
+    g_aidx_task = task;
 }
 
 void aidx_finalize(void)
 {
     AsyncIndexJob *j = g_aidx_job;
     if (!j) return;
-    if (g_aidx_worker) { jce_thread_join(g_aidx_worker); g_aidx_worker = nullptr; }
+    JceAsyncState state = jce_async_task_state(g_aidx_task);
+    jce_async_task_release(g_aidx_task);
+    g_aidx_task = nullptr;
     g_aidx_job = nullptr;
 
-    /* Swap the freshly-built index in (replaces the previous one). */
-    g_live = std::move(j->maps);
-    g_aidx_generation++;   /* invalidates negative resolve caches */
-    LOG_INFO(LOG_TAG, "async asset index ready: %d files under %s",
-             (int)g_live.total, j->root.c_str());
+    if (state == JCE_ASYNC_STATE_SUCCEEDED) {
+        /* Swap the freshly-built index in (replaces the previous one). */
+        g_live = std::move(j->maps);
+        g_aidx_generation++;   /* invalidates negative resolve caches */
+        LOG_INFO(LOG_TAG, "async asset index ready: %d files under %s",
+                 (int)g_live.total, j->root.c_str());
+    }
 
-    if (j->done) jce_atomic_i32_destroy(j->done);
     delete j;
 
     /* A newer request arrived mid-build → start it now. */
@@ -321,6 +338,15 @@ extern "C" {
 
 void jce_asset_path_index_clear(void)
 {
+    if (g_aidx_task) {
+        (void)jce_async_task_cancel(g_aidx_task);
+        jce_async_task_wait(g_aidx_task);
+        jce_async_task_release(g_aidx_task);
+        g_aidx_task = nullptr;
+        delete g_aidx_job;
+        g_aidx_job = nullptr;
+    }
+    g_aidx_pending_root.clear();
     g_live = IndexMaps{};
     g_aidx_generation++;
 }
@@ -342,7 +368,7 @@ uint32_t jce_asset_path_index_generation(void)
 int jce_asset_path_index_rebuild_async(const char *root)
 {
     if (!root || !*root) return 0;
-    if (g_aidx_worker) {
+    if (g_aidx_task) {
         /* Busy: remember the newest root and rebuild after the current
          * walk completes (avoids blocking to join here). */
         g_aidx_pending_root = root;
@@ -354,7 +380,8 @@ int jce_asset_path_index_rebuild_async(const char *root)
 
 void jce_asset_path_index_poll(void)
 {
-    if (g_aidx_job && jce_atomic_i32_load(g_aidx_job->done) != 0)
+    if (g_aidx_job && g_aidx_task &&
+        jce_async_task_is_terminal(g_aidx_task))
         aidx_finalize();
 }
 

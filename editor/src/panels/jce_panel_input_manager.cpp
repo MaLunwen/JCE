@@ -26,11 +26,15 @@
  */
 
 #include "ui/jce_editor_colors.h"
+#include "core/jce_editor_device_strip.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_state.h"    /* jce_editor_engine_input() */
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -142,6 +146,30 @@ static const char *bind_type_label(int t)
     }
 }
 
+/* The five sources this panel can author, in combo order.
+ *
+ * The combo used to write its INDEX straight into b.type, which was only ever
+ * correct because schema 1 numbered KEY 0 .. COMPOSITE 4.  JceBinding v2
+ * renumbers (JCE_SRC_NONE took slot 0), so an index is no longer a type: with
+ * the old code, picking "Key" would have stored JCE_SRC_NONE and picking
+ * "Composite" would have stored JCE_SRC_PAD_BUTTON -- silently, on every
+ * binding a user touched.  Index and type are separated here, permanently. */
+static const JceBindType k_panel_bind_types[] = {
+    JCE_SRC_KEY, JCE_SRC_MOUSE_BUTTON, JCE_SRC_PAD_BUTTON,
+    JCE_SRC_PAD_AXIS, JCE_SRC_COMPOSITE
+};
+static const int k_panel_bind_type_count =
+    (int)(sizeof(k_panel_bind_types) / sizeof(k_panel_bind_types[0]));
+
+/* Combo index for a stored type; 0 (Key) for anything this panel cannot
+ * author yet, which is what the old `t >= count -> 0` clamp did for garbage. */
+static int bind_type_to_combo_index(int t)
+{
+    for (int i = 0; i < k_panel_bind_type_count; ++i)
+        if ((int)k_panel_bind_types[i] == t) return i;
+    return 0;
+}
+
 /* Device-group combo labels, indexed by JceInputDeviceGroup
  * (NONE / KBM / GAMEPAD / TOUCH). */
 static const char **device_group_labels(void)
@@ -171,10 +199,25 @@ static void copy_from_engine(const JceInputActions *a)
         for (int b = 0; b < bn; ++b) {
             JceBinding bind;
             if (!jce_action_bind_at(a, i, b, &bind)) continue;
+            /* The panel's flat int model can only express KEY sub-sources,
+             * which is exactly what the pre-v2 bare ints always meant.  Plan B
+             * Batch 7 replaces this model with the typed row editor.
+             *
+             * Take the code ONLY when the slot really is a key: the save half
+             * below re-types every non-zero code as JCE_SRC_KEY, so carrying a
+             * pad sub-source's code through here would silently convert it to
+             * a keyboard bind on the next save.  Dropping the slot loses it
+             * visibly (it shows as empty); keeping the code corrupts it
+             * invisibly. */
+            auto sub_key = [](const JceInputSource &s) {
+                return s.type == JCE_SRC_KEY ? s.code : 0;
+            };
             EditBinding eb{ (int)bind.type, bind.code,
-                            bind.scale, bind.deadzone,
-                            bind.comp_pos, bind.comp_neg,
-                            bind.comp_up,  bind.comp_down,
+                            bind.scale, bind.deadzone_inner,
+                            sub_key(bind.comp[JCE_COMP_POS]),
+                            sub_key(bind.comp[JCE_COMP_NEG]),
+                            sub_key(bind.comp[JCE_COMP_UP]),
+                            sub_key(bind.comp[JCE_COMP_DOWN]),
                             bind.device_group };
             ea.binds.push_back(eb);
         }
@@ -205,17 +248,25 @@ static JceInputActions *build_engine_table(void)
         int id = jce_action_register(a, ea.name.c_str());
         if (id < 0) continue;   /* duplicate name / table full */
         for (const EditBinding &eb : ea.binds) {
-            JceBinding b{};
-            b.type      = (JceBindType)eb.type;
-            b.code      = eb.code;
-            b.scale     = eb.scale;
-            b.deadzone  = eb.deadzone;
+            JceBinding b;
+            jce_binding_init(&b, (JceBindType)eb.type, eb.code);
+            b.scale          = eb.scale;
+            b.deadzone_inner = eb.deadzone;
+            /* Schema 1 axes are signed, unpaired and saturate at 1.0 exactly.
+             * jce_binding_init() defers a pad axis to the device profile
+             * (-1); the panel's model has no field for that, so pin the
+             * schema-1 shape rather than let an edit silently change it. */
+            b.deadzone_outer = 1.0f;
+            b.side           = (uint8_t)JCE_AXIS_SIDE_FULL;
+            b.pair_axis      = JCE_BIND_PAIR_NONE;
             /* Carry composite sub-keys through so a composite binding survives
              * load/edit/save instead of being flattened to a bare scalar. */
-            b.comp_pos  = eb.comp_pos;
-            b.comp_neg  = eb.comp_neg;
-            b.comp_up   = eb.comp_up;
-            b.comp_down = eb.comp_down;
+            const int sub[4] = { eb.comp_pos, eb.comp_neg, eb.comp_up, eb.comp_down };
+            for (int c = 0; c < 4; ++c) {
+                b.comp[c].type = (int16_t)(sub[c] ? JCE_SRC_KEY : JCE_SRC_NONE);
+                b.comp[c].side = (int16_t)JCE_AXIS_SIDE_FULL;
+                b.comp[c].code = sub[c];
+            }
             b.device_group = eb.device_group;
             jce_action_bind(a, id, &b);
         }
@@ -391,6 +442,293 @@ extern "C" const JceInputActions *jce_editor_input_actions_live(void)
     return s_live_actions;
 }
 
+/* ── Device strip (Plan D task 11) ───────────────────────────────────
+ *
+ * THE FIRST SURFACE IN THE PRODUCT WHERE A CONNECTED DEVICE IS VISIBLE.
+ * Everything above this line edits the action map ON DISK; none of it asks the
+ * engine what is plugged in, which is why an XInput pad could be connected and
+ * the owner could still read this panel as "keyboard/mouse and touch only".
+ *
+ * It reads the ENGINE's JceInput -- the one jce_engine.c pumps SDL into every
+ * frame -- and NOT s_live_input above, whose synthesized frame carries ImGui
+ * keyboard state and no device table at all.
+ *
+ * NO SILKSCREEN COLUMN.  Drawing SOUTH as "A" or "Cross" needs a GLYPH FAMILY
+ * (PlayStation / Xbox / Nintendo / Generic); JceGamepadStyle is MODEL
+ * granularity (PS4 vs PS5, because a DualSense has adaptive triggers and a
+ * DualShock 4 does not).  The two value sets are not substitutable, the
+ * function that bridges them does not exist yet, and a wrong label is the
+ * exact class of defect this whole strip exists to end.  Missing is honest. */
+
+static const char *tr(const char *key) { return jce_editor_i18n(key); }
+
+static const char *device_class_key(int cls)
+{
+    switch (cls) {
+    case JCE_DEVCLASS_KEYBOARD: return "inputManager.deviceStrip.class.keyboard";
+    case JCE_DEVCLASS_MOUSE:    return "inputManager.deviceStrip.class.mouse";
+    case JCE_DEVCLASS_TOUCH:    return "inputManager.deviceStrip.class.touch";
+    case JCE_DEVCLASS_GAMEPAD:  return "inputManager.deviceStrip.class.gamepad";
+    case JCE_DEVCLASS_JOYSTICK: return "inputManager.deviceStrip.class.joystick";
+    default:                    return "inputManager.deviceStrip.class.unknown";
+    }
+}
+
+static const char *power_state_key(int state)
+{
+    switch (state) {
+    case JCE_POWER_WIRED:      return "inputManager.deviceStrip.power.wired";
+    case JCE_POWER_ON_BATTERY: return "inputManager.deviceStrip.power.onBattery";
+    case JCE_POWER_CHARGING:   return "inputManager.deviceStrip.power.charging";
+    case JCE_POWER_CHARGED:    return "inputManager.deviceStrip.power.charged";
+    default:                   return "inputManager.deviceStrip.power.unknown";
+    }
+}
+
+/* One status line under the table: the verdict of the last button pressed.
+ * Held as text rather than as a key so the formatted variants (slot number)
+ * survive to the next frame. */
+static char s_strip_status[256];
+
+static void strip_status(const char *text)
+{
+    std::snprintf(s_strip_status, sizeof(s_strip_status), "%s", text);
+}
+
+static void draw_device_strip(void)
+{
+    if (!ImGui::CollapsingHeader(tr("inputManager.deviceStrip.title"),
+                                 ImGuiTreeNodeFlags_DefaultOpen))
+        return;
+
+    JceInput *in = jce_editor_engine_input();
+    if (!in) {
+        /* NOT "no devices connected".  There is no input system to ask, and
+         * printing the other sentence here would be the same conflation of
+         * configuration with reality that this strip exists to end. */
+        ImGui::TextDisabled("%s", tr("inputManager.deviceStrip.noEngineInput"));
+        return;
+    }
+
+    JceEditorDeviceRow rows[JCE_INPUT_MAX_DEVICES];
+    const int total = jce_editor_device_strip_collect(in, rows,
+                                                      IM_ARRAYSIZE(rows));
+    const int shown = (total < IM_ARRAYSIZE(rows)) ? total : IM_ARRAYSIZE(rows);
+
+    if (shown <= 0) {
+        ImGui::TextDisabled("%s", tr("inputManager.deviceStrip.none"));
+        return;
+    }
+
+    const ImGuiTableFlags tf = ImGuiTableFlags_Borders |
+                               ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_SizingStretchProp |
+                               ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("##device_strip", 7, tf,
+                          ImVec2(0, ImGui::GetTextLineHeightWithSpacing() *
+                                        (float)(shown + 2)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.colDevice"),
+                                ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.colClass"),
+                                ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.colLayout"),
+                                ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn(tr("inputManager.player"),
+                                ImGuiTableColumnFlags_WidthStretch, 0.8f);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.colControls"),
+                                ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.colFeatures"),
+                                ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableSetupColumn(tr("inputManager.deviceStrip.battery"),
+                                ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < shown; ++i) {
+            const JceEditorDeviceRow &r = rows[i];
+            ImGui::PushID((int)r.info.id);
+            ImGui::TableNextRow();
+
+            /* Device: id + reported name. */
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("#%u  %s", (unsigned)r.info.id,
+                        r.info.name[0] ? r.info.name : "?");
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(tr(device_class_key(r.info.cls)));
+
+            /* Layout.  A raw device has ORDINALS AND NO SEMANTIC MAP -- that is
+             * the definition of the class, not a missing field -- so the cell
+             * says what it has instead of leaving a semantic hole. */
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(
+                r.semantic ? tr("inputManager.deviceStrip.layout.gamepad")
+                           : tr("inputManager.deviceStrip.layout.raw"));
+            if (!r.semantic && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("inputManager.deviceStrip.rawNote"));
+
+            /* Player slot.  Entry 0 is "unassigned"; entries 1..N are slots
+             * 0..N-1, spelled with the API's own 0-based numbers so the value
+             * on screen is the value jce_input_player_* takes. */
+            ImGui::TableSetColumnIndex(3);
+            {
+                const char *slots[1 + JCE_INPUT_MAX_PLAYERS] = {
+                    tr("inputManager.deviceStrip.playerNone"),
+                    "0", "1", "2", "3"
+                };
+                static_assert(JCE_INPUT_MAX_PLAYERS == 4,
+                              "slot labels above are spelled one per player");
+
+                int sel = (r.info.player == JCE_INPUT_PLAYER_NONE)
+                              ? 0 : (int)r.info.player + 1;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::Combo("##player", &sel, slots,
+                                 1 + JCE_INPUT_MAX_PLAYERS)) {
+                    if (sel == 0) {
+                        if (r.info.player != JCE_INPUT_PLAYER_NONE)
+                            jce_input_player_release_device(
+                                in, (int)r.info.player, r.info.id);
+                    } else if (!jce_input_player_assign_device(in, sel - 1,
+                                                               r.info.id)) {
+                        char msg[192];
+                        std::snprintf(msg, sizeof(msg),
+                                      tr("inputManager.deviceStrip.claimRefused"),
+                                      sel - 1);
+                        strip_status(msg);
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s",
+                        tr("inputManager.deviceStrip.claimSlot"));
+            }
+
+            /* Axes / buttons / hats. */
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%u / %u / %u", (unsigned)r.info.axis_count,
+                        (unsigned)r.info.button_count,
+                        (unsigned)r.info.hat_count);
+
+            /* Features: what THIS BUILD reports about THIS unit.  `caps` comes
+             * from the drivers compiled into SDL, so it is never phrased as a
+             * property of the plastic. */
+            ImGui::TableSetColumnIndex(5);
+            {
+                char feats[192];
+                feats[0] = '\0';
+                auto add = [&](const char *key) {
+                    if (feats[0]) {
+                        const size_t n = std::strlen(feats);
+                        std::snprintf(feats + n, sizeof(feats) - n, " · ");
+                    }
+                    const size_t n = std::strlen(feats);
+                    std::snprintf(feats + n, sizeof(feats) - n, "%s", tr(key));
+                };
+                if (r.info.caps & JCE_INPUT_CAP_RUMBLE)
+                    add("inputManager.deviceStrip.cap.rumble");
+                if (r.info.caps & JCE_INPUT_CAP_TRIGGER_RUMBLE)
+                    add("inputManager.deviceStrip.cap.triggerRumble");
+                if (r.info.caps & JCE_INPUT_CAP_LED)
+                    add("inputManager.deviceStrip.cap.led");
+                if (!r.info.active)
+                    add("inputManager.deviceStrip.inactive");
+                if (!feats[0])
+                    ImGui::TextDisabled("%s",
+                        tr("inputManager.deviceStrip.capsNone"));
+                else
+                    ImGui::TextUnformatted(feats);
+            }
+
+            /* Battery.  A percentage is drawn ONLY for a state that has one --
+             * jce_input_device_power() answers -1 for UNKNOWN and for WIRED,
+             * and "-1%" is a number this column must never print. */
+            ImGui::TableSetColumnIndex(6);
+            if (!r.battery_readable) {
+                ImGui::TextDisabled("%s",
+                    tr("inputManager.deviceStrip.batteryUnreadable"));
+            } else {
+                if (r.battery_has_percent)
+                    ImGui::Text("%s  %d%%", tr(power_state_key(r.power_state)),
+                                r.battery_percent);
+                else
+                    ImGui::TextUnformatted(tr(power_state_key(r.power_state)));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s",
+                        tr("inputManager.deviceStrip.batteryNotLive"));
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    /* Per-device actions, one row of buttons per device.  Kept below the table
+     * rather than in an eighth column so the buttons keep their labels at any
+     * panel width instead of being clipped to nothing. */
+    for (int i = 0; i < shown; ++i) {
+        const JceEditorDeviceRow &r = rows[i];
+        ImGui::PushID((1 << 20) | (int)r.info.id);
+
+        ImGui::TextDisabled("#%u", (unsigned)r.info.id);
+        ImGui::SameLine();
+
+        /* GATE 2 IS THE STATE AN EDITOR GREYS A BUTTON ON: the capability bit
+         * being down means this build finds no motors on this device, and the
+         * owner should learn that BEFORE pressing rather than after. */
+        const bool can_rumble = (r.info.caps & JCE_INPUT_CAP_RUMBLE) != 0u;
+        ImGui::BeginDisabled(!can_rumble);
+        if (ImGui::Button(tr("inputManager.deviceStrip.testRumble"))) {
+            /* Past the bit, a false is gate 3 OR the backend's own refusal, and
+             * jce_input_device.h states plainly that this API does not separate
+             * those two -- so the message names both instead of guessing. */
+            switch (jce_editor_device_strip_rumble(in, r.info.id,
+                                                   0.6f, 0.6f, 300u)) {
+            case JCE_EDITOR_RUMBLE_SENT:
+                strip_status(tr("inputManager.deviceStrip.rumbleSent"));
+                break;
+            case JCE_EDITOR_RUMBLE_NO_MOTORS:
+                strip_status(tr("inputManager.deviceStrip.rumbleNoMotors"));
+                break;
+            case JCE_EDITOR_RUMBLE_REFUSED:
+                strip_status(tr("inputManager.deviceStrip.rumbleRefused"));
+                break;
+            case JCE_EDITOR_RUMBLE_GONE:
+                strip_status(tr("inputManager.deviceStrip.rumbleGone"));
+                break;
+            }
+        }
+        ImGui::EndDisabled();
+        if (!can_rumble && ImGui::IsItemHovered(
+                               ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s",
+                tr("inputManager.deviceStrip.rumbleNoMotors"));
+
+        /* A raw device is one SDL's mapping database does not know.  The useful
+         * action for it is not a semantic map it does not have -- it is a stub
+         * the owner can fill in. */
+        if (!r.semantic) {
+            char stub[256];
+            const int len = jce_editor_device_strip_mapping_stub(
+                &r.info, stub, (int)sizeof(stub));
+            ImGui::SameLine();
+            ImGui::BeginDisabled(len <= 0);
+            if (ImGui::Button(tr("inputManager.deviceStrip.copyMappingStub"))) {
+                ImGui::SetClipboardText(stub);
+                strip_status(tr("inputManager.deviceStrip.mappingStubCopied"));
+            }
+            ImGui::EndDisabled();
+            if (len <= 0 && ImGui::IsItemHovered(
+                                ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s",
+                    tr("inputManager.deviceStrip.mappingStubUnavailable"));
+        }
+
+        ImGui::PopID();
+    }
+
+    if (s_strip_status[0])
+        ImGui::TextDisabled("%s", s_strip_status);
+}
+
 /* ── UI ─────────────────────────────────────────────────────────────── */
 
 extern "C" void jce_editor_panel_input_manager_content(void)
@@ -440,6 +778,12 @@ extern "C" void jce_editor_panel_input_manager_content(void)
         jce_editor_i18n("inputManager.path"), INPUT_PATH);
     ImGui::Separator();
 
+    /* What is actually PLUGGED IN, above the map that is merely AUTHORED.
+     * Order is deliberate: the panel used to show only the second and the
+     * owner read it as the first. */
+    draw_device_strip();
+    ImGui::Separator();
+
     /* Two-column: left list, right details */
     ImGui::BeginChild("##actions_left", ImVec2(220, 0), true);
     for (int i = 0; i < (int)s_actions.size(); ++i) {
@@ -476,9 +820,12 @@ extern "C" void jce_editor_panel_input_manager_content(void)
 
             ImGui::SetNextItemWidth(110);
             const char *types[] = { jce_editor_i18n("inputManager.bindType.key"), jce_editor_i18n("inputManager.bindType.mouseBtn"), jce_editor_i18n("inputManager.bindType.padBtn"), jce_editor_i18n("inputManager.bindType.padAxis"), jce_editor_i18n("inputManager.bindType.composite") };
-            int t = b.type; if (t < 0 || t >= (int)IM_ARRAYSIZE(types)) t = 0;
+            static_assert(IM_ARRAYSIZE(types) ==
+                          sizeof(k_panel_bind_types) / sizeof(k_panel_bind_types[0]),
+                          "combo labels and k_panel_bind_types must stay 1:1");
+            int t = bind_type_to_combo_index(b.type);
             if (ImGui::Combo("##type", &t, types, IM_ARRAYSIZE(types))) {
-                b.type = t;
+                b.type = (int)k_panel_bind_types[t];
                 input_save();
             }
             ImGui::SameLine();

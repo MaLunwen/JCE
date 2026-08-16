@@ -3,7 +3,11 @@
  *
  * Values match SDL3 scancodes (USB HID codes) so the engine
  * can cast directly — no runtime translation needed.
- * Verified at compile time with _Static_assert in jce_input.c.
+ * Verified at compile time in jce_input_sdl.c, the one input translation
+ * unit that speaks SDL and therefore the only one that performs that cast.
+ * (It said "_Static_assert in jce_input.c" for as long as it has existed, and
+ * both halves were wrong: this tree is C99, so the assertion is the
+ * negative-size-array idiom, and jce_input.c carries no assertion at all.)
  *
  * Game/application code includes this header instead of SDL.
  */

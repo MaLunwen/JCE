@@ -2,6 +2,8 @@
  * jce_panel_assets_nav.cpp  Directory tree, breadcrumb, search.
  */
 
+#include <unordered_map>
+#include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/platform/jce_host_paths.h>
 
@@ -25,32 +27,103 @@ static void persist_asset_browser_view_mode(void)
 
 /* ── Directory tree (recursive) ──────────────────────────────────── */
 
+/* Per-directory listing cache.
+ *
+ * The tree used to hit the filesystem every frame, for every visible node: one
+ * jce_fs_host_list_dir for the node's children, then ANOTHER for each child
+ * just to answer "does it have sub-folders" (the expander arrow). In a static
+ * graveyard frame that measured 1.02 ms of a 1.12 ms panel and 1.02 of a
+ * 2.99 ms frame -- the single largest phase in the frame, all of it syscalls
+ * re-answering a question whose answer had not changed.
+ *
+ * A short TTL rather than an explicit invalidation everywhere: folders can
+ * appear from outside the editor (a build writing into the tree, a git
+ * checkout), and no in-editor hook can know about those. One second is below
+ * the threshold where a person notices a folder is late, and it turns
+ * per-frame enumeration into roughly one per second per visible node. */
+namespace {
+
+struct DirListing {
+    std::vector<std::string> subdirs;   /* sorted, absolute */
+    std::vector<bool>        has_kids;  /* parallel to subdirs */
+    double                   stamp;     /* seconds, jce_time_seconds() */
+};
+
+double asset_tree_now(void)
+{
+    /* Milliseconds since an arbitrary origin is all the TTL needs; using the
+     * shared perf clock keeps this independent of ImGui's frame delta, which
+     * is 0 on the first frame and would make every entry look fresh. */
+    static const uint64_t s_origin = jce_time_perf_counter();
+    return (double)jce_time_perf_to_ms(s_origin, jce_time_perf_counter()) * 0.001;
+}
+
+const double kDirCacheTTL = 1.0;
+
+std::unordered_map<std::string, DirListing> &dir_cache(void)
+{
+    static std::unordered_map<std::string, DirListing> c;
+    return c;
+}
+
+const DirListing &listing_for(const std::string &dir)
+{
+    DirListing &e = dir_cache()[dir];
+    const double now = asset_tree_now();
+    if (!e.subdirs.empty() || e.stamp != 0.0) {
+        if (now - e.stamp < kDirCacheTTL) return e;
+    }
+
+    e.subdirs.clear();
+    e.has_kids.clear();
+    e.stamp = now;
+
+    struct ListCtx {
+        std::vector<std::string> *subdirs;
+        const std::string        *dir;
+    } ctx;
+    ctx.subdirs = &e.subdirs;
+    ctx.dir     = &dir;
+    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+        if (!is_dir) return true;
+        ListCtx *c = static_cast<ListCtx *>(ud);
+        char full[1024];
+        jce_path_join(full, sizeof(full), c->dir->c_str(), name);
+        c->subdirs->push_back(full);
+        return true;
+    };
+    jce_fs_host_list_dir(dir.c_str(), cb, &ctx);
+    std::sort(e.subdirs.begin(), e.subdirs.end());
+
+    e.has_kids.reserve(e.subdirs.size());
+    for (const std::string &sd : e.subdirs) {
+        struct HasChildCtx { bool has; } hc = { false };
+        auto hc_cb = [](const char *, bool is_dir, void *ud) -> bool {
+            if (is_dir) { static_cast<HasChildCtx *>(ud)->has = true; return false; }
+            return true;
+        };
+        jce_fs_host_list_dir(sd.c_str(), hc_cb, &hc);
+        e.has_kids.push_back(hc.has);
+    }
+    return e;
+}
+
+}  /* namespace */
+
+void jce_editor_assets_tree_cache_invalidate(void)
+{
+    dir_cache().clear();
+}
+
 static void draw_dir_tree(const std::string &dir, int depth)
 {
     if (depth > 5) return;
     
-    struct ListCtx {
-        std::vector<std::string> *subdirs;
-        std::string dir;
-    } ctx;
-    std::vector<std::string> subdirs;
-    ctx.subdirs = &subdirs;
-    ctx.dir = dir;
-    
-    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
-        if (!is_dir) return true;
-        
-        ListCtx *c = static_cast<ListCtx*>(ud);
-        char full[1024];
-        jce_path_join(full, sizeof(full), c->dir.c_str(), name);
-        c->subdirs->push_back(full);
-        return true;
-    };
-    
-    jce_fs_host_list_dir(dir.c_str(), cb, &ctx);
-    std::sort(subdirs.begin(), subdirs.end());
+    const DirListing &listing = listing_for(dir);
+    const std::vector<std::string> &subdirs = listing.subdirs;
 
-    for (auto &sd : subdirs) {
+    for (size_t sd_i = 0; sd_i < subdirs.size(); ++sd_i) {
+        const std::string &sd = subdirs[sd_i];
         char dirname[256];
         jce_path_basename(dirname, sizeof(dirname), sd.c_str());
 
@@ -64,18 +137,11 @@ static void draw_dir_tree(const std::string &dir, int depth)
         if (is_current)
             flags |= ImGuiTreeNodeFlags_Selected;
 
-        /* Check for children */
-        struct HasChildCtx { bool has; };
-        HasChildCtx hc_ctx = { false };
-        auto hc_cb = [](const char *, bool is_dir, void *ud) -> bool {
-            if (is_dir) {
-                static_cast<HasChildCtx*>(ud)->has = true;
-                return false;
-            }
-            return true;
-        };
-        jce_fs_host_list_dir(sd.c_str(), hc_cb, &hc_ctx);
-        bool has_children = hc_ctx.has;
+        /* Answered when the listing was built -- this used to be a second
+         * directory enumeration per child, every frame, purely to decide
+         * whether to draw an expander arrow. */
+        const bool has_children = sd_i < listing.has_kids.size()
+                                      ? listing.has_kids[sd_i] : false;
 
         if (!has_children)
             flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;

@@ -48,6 +48,12 @@ typedef struct {
     char          preset[128];
     /* Last error text — populated when state == JCE_BUILD_FAILED. */
     char          last_error[256];
+    /* Authoritative outputs from the last native project build.  These stay
+     * empty for build modes that do not produce the corresponding artifact. */
+    char          artifact_path[1024];
+    char          package_path[1024];
+    char          asset_bom_path[1024];
+    char          dist_audit_path[1024];
 } JceBuildStatus;
 
 void jce_build_manager_init(void);

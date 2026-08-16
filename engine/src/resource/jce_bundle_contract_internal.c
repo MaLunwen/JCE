@@ -2,6 +2,7 @@
 
 #include <jce/jce_version.h>
 #include <jce/resource/jce_archive.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_bundle_format.h>
 
 #include "jce_asset_reader.h"
@@ -144,7 +145,11 @@ static const char *asset_type_name(const PakEntry *entry)
     if (type == COOK_CLASS_MODEL) return "model";
     if (type == COOK_CLASS_AUDIO) return "sound";
     if (is_scene_path(entry->vpath)) return "scene";
-    if (ends_with_ci(entry->vpath, ".lua")) return "script";
+    /* EVERY script language, not just Lua: the single authority is
+     * jce_asset_ext.c, so a language added there is labelled here without
+     * this file being touched.  A path that lands in the generic "binary"
+     * fallback below is one a shipped runtime cannot recognise as code. */
+    if (jce_asset_script_language_from_ext(entry->vpath)) return "script";
     if (ends_with_ci(entry->vpath, ".mat") ||
         ends_with_ci(entry->vpath, ".mat.json")) return "material";
     if (ends_with_ci(entry->vpath, ".json")) return "descriptor";
@@ -177,7 +182,18 @@ static const char *asset_representation(const PakEntry *entry)
     if (type == COOK_CLASS_MODEL) return "model.source";
     if (is_scene_path(entry->vpath) || ends_with_ci(entry->vpath, ".json"))
         return "json.utf8";
-    if (ends_with_ci(entry->vpath, ".lua")) return "lua.source";
+    {
+        /* "lua.source" was the only script representation this ever emitted.
+         * The suffix is DESCRIPTIVE, not load-bearing: jce_bundle_loader.c
+         * only requires the field to be a non-empty string, nothing
+         * dispatches on its value, and cook/compression decisions are made
+         * from jce_bundle_classify_cook() and the archive cooker's own
+         * class table instead.  It is kept per-language anyway so a bundle
+         * report says which VM a shipped script needs. */
+        const char *script_rep =
+            jce_asset_script_representation_from_ext(entry->vpath);
+        if (script_rep) return script_rep;
+    }
     if (ends_with_ci(entry->vpath, ".ttf") ||
         ends_with_ci(entry->vpath, ".otf")) return "font.source";
     return "binary.raw";

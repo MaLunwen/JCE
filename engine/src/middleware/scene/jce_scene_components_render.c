@@ -378,6 +378,75 @@ void parse_volume(JceScene *s, JceEntity e, const cJSON *props)
     jce_scene_set_volume(s, e, &vc);
 }
 
+void parse_fullscreen_effect(JceScene *s, JceEntity e, const cJSON *props)
+{
+    JceSceneFullscreenEffect value = jce_scene_fullscreen_effect_default();
+    value.enabled = j_bool(props, "enabled", false);
+    value.required = j_bool(props, "required", false);
+    value.use_scene_color = j_bool(props, "useSceneColor", false);
+    value.use_scene_depth = j_bool(props, "useSceneDepth", false);
+    value.use_history = j_bool(props, "useHistory", false);
+    value.order = (int32_t)j_num(props, "order", 0.0);
+    value.insertion = (uint32_t)j_num(props, "insertion", 0.0);
+    value.blend = (uint32_t)j_num(props, "blend", 0.0);
+    value.output_format = (uint32_t)j_num(
+        props, "outputFormat", JCE_RENDER_FORMAT_RGBA16F);
+    value.resolution_scale = (float)j_num(props, "resolutionScale", 1.0);
+    if (value.insertion > JCE_FULLSCREEN_EFFECT_LDR_AFTER_POSTFX)
+        value.insertion = JCE_FULLSCREEN_EFFECT_HDR_BEFORE_POSTFX;
+    if (value.blend > JCE_FULLSCREEN_EFFECT_ALPHA)
+        value.blend = JCE_FULLSCREEN_EFFECT_REPLACE;
+    if (value.output_format > JCE_RENDER_FORMAT_RGBA32F)
+        value.output_format = JCE_RENDER_FORMAT_RGBA16F;
+    if (value.resolution_scale <= 0.0f || value.resolution_scale > 1.0f)
+        value.resolution_scale = 1.0f;
+    copy_str(value.shader, sizeof(value.shader), j_str(props, "shader", ""));
+
+    const cJSON *textures = cJSON_GetObjectItemCaseSensitive(props, "textures");
+    if (cJSON_IsArray(textures)) {
+        int count = cJSON_GetArraySize(textures);
+        if (count > (int)JCE_FULLSCREEN_EFFECT_MAX_TEXTURES)
+            count = (int)JCE_FULLSCREEN_EFFECT_MAX_TEXTURES;
+        value.texture_count = (uint8_t)count;
+        for (int i = 0; i < count; ++i) {
+            const cJSON *slot = cJSON_GetArrayItem(textures, i);
+            if (!cJSON_IsObject(slot)) continue;
+            copy_str(value.textures[i], sizeof(value.textures[i]),
+                     j_str(slot, "path", ""));
+            value.samplers[i].address_u = (uint32_t)j_num(slot, "addressU", 0.0);
+            value.samplers[i].address_v = (uint32_t)j_num(slot, "addressV", 0.0);
+            value.samplers[i].filter_min = (uint32_t)j_num(slot, "filterMin", 1.0);
+            value.samplers[i].filter_mag = (uint32_t)j_num(slot, "filterMag", 1.0);
+            value.samplers[i].filter_mip = (uint32_t)j_num(slot, "filterMip", 1.0);
+            if (value.samplers[i].address_u > JCE_SAMPLER_ADDRESS_MIRROR)
+                value.samplers[i].address_u = JCE_SAMPLER_ADDRESS_CLAMP;
+            if (value.samplers[i].address_v > JCE_SAMPLER_ADDRESS_MIRROR)
+                value.samplers[i].address_v = JCE_SAMPLER_ADDRESS_CLAMP;
+            if (value.samplers[i].filter_min > JCE_SAMPLER_FILTER_LINEAR)
+                value.samplers[i].filter_min = JCE_SAMPLER_FILTER_LINEAR;
+            if (value.samplers[i].filter_mag > JCE_SAMPLER_FILTER_LINEAR)
+                value.samplers[i].filter_mag = JCE_SAMPLER_FILTER_LINEAR;
+            if (value.samplers[i].filter_mip > JCE_SAMPLER_FILTER_LINEAR)
+                value.samplers[i].filter_mip = JCE_SAMPLER_FILTER_LINEAR;
+        }
+    }
+    const cJSON *params = cJSON_GetObjectItemCaseSensitive(props, "params");
+    if (cJSON_IsArray(params)) {
+        int rows = cJSON_GetArraySize(params);
+        if (rows > (int)JCE_FULLSCREEN_EFFECT_MAX_PARAMS)
+            rows = (int)JCE_FULLSCREEN_EFFECT_MAX_PARAMS;
+        for (int row = 0; row < rows; ++row) {
+            const cJSON *vec = cJSON_GetArrayItem(params, row);
+            if (!cJSON_IsArray(vec)) continue;
+            for (int col = 0; col < 4; ++col) {
+                const cJSON *n = cJSON_GetArrayItem(vec, col);
+                if (cJSON_IsNumber(n)) value.params[row][col] = (float)n->valuedouble;
+            }
+        }
+    }
+    jce_scene_set_fullscreen_effect(s, e, &value);
+}
+
 void parse_occlusion_portal(JceScene *s, JceEntity e, const cJSON *props)
 {
     JceOcclusionPortalComponent op; memset(&op, 0, sizeof op);
@@ -410,6 +479,11 @@ static void ser_mesh_renderer(const JceMeshRenderer *mr, cJSON *arr)
     cJSON_AddNumberToObject(o, "alphaMode",   mr->alpha_mode);
     cJSON_AddNumberToObject(o, "alphaCutoff", mr->alpha_cutoff);
     cJSON_AddBoolToObject(o, "doubleSided", mr->double_sided);
+    /* The other half of the round trip parse_mesh_renderer never had.  Always
+     * emitted, including when true: an absent key is what let a script's
+     * comp_get -> comp_set silently re-show a hidden mesh, because the value
+     * it was asked to preserve was not in what it was given. */
+    cJSON_AddBoolToObject(o, "visible", mr->visible);
     cJSON_AddBoolToObject(o, "castsShadow",    !mr->shadow_cast_off);
     cJSON_AddBoolToObject(o, "receivesShadow", !mr->shadow_receive_off);
     if (mr->albedo_tex[0])   cJSON_AddStringToObject(o, "albedoTex",   mr->albedo_tex);
@@ -459,6 +533,49 @@ static void ser_volume(const JceVolumeComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(p, "chromaticStrength",  c->profile.values.chromatic_strength);
     cJSON_AddItemToObject(o, "properties", p);
     cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_fullscreen_effect(const JceSceneFullscreenEffect *value,
+                                  cJSON *arr)
+{
+    cJSON *object = cJSON_CreateObject();
+    cJSON *props = cJSON_CreateObject();
+    cJSON_AddStringToObject(object, "type", "FullscreenEffect");
+    cJSON_AddBoolToObject(props, "enabled", value->enabled);
+    cJSON_AddBoolToObject(props, "required", value->required);
+    cJSON_AddBoolToObject(props, "useSceneColor", value->use_scene_color);
+    cJSON_AddBoolToObject(props, "useSceneDepth", value->use_scene_depth);
+    cJSON_AddBoolToObject(props, "useHistory", value->use_history);
+    cJSON_AddNumberToObject(props, "order", value->order);
+    cJSON_AddNumberToObject(props, "insertion", value->insertion);
+    cJSON_AddNumberToObject(props, "blend", value->blend);
+    cJSON_AddNumberToObject(props, "outputFormat", value->output_format);
+    cJSON_AddNumberToObject(props, "resolutionScale", value->resolution_scale);
+    cJSON_AddStringToObject(props, "shader", value->shader);
+
+    cJSON *textures = cJSON_CreateArray();
+    for (uint32_t i = 0; i < value->texture_count &&
+                         i < JCE_FULLSCREEN_EFFECT_MAX_TEXTURES; ++i) {
+        cJSON *slot = cJSON_CreateObject();
+        cJSON_AddStringToObject(slot, "path", value->textures[i]);
+        cJSON_AddNumberToObject(slot, "addressU", value->samplers[i].address_u);
+        cJSON_AddNumberToObject(slot, "addressV", value->samplers[i].address_v);
+        cJSON_AddNumberToObject(slot, "filterMin", value->samplers[i].filter_min);
+        cJSON_AddNumberToObject(slot, "filterMag", value->samplers[i].filter_mag);
+        cJSON_AddNumberToObject(slot, "filterMip", value->samplers[i].filter_mip);
+        cJSON_AddItemToArray(textures, slot);
+    }
+    cJSON_AddItemToObject(props, "textures", textures);
+    cJSON *params = cJSON_CreateArray();
+    for (uint32_t row = 0; row < JCE_FULLSCREEN_EFFECT_MAX_PARAMS; ++row) {
+        cJSON *vec = cJSON_CreateArray();
+        for (uint32_t col = 0; col < 4u; ++col)
+            cJSON_AddItemToArray(vec, cJSON_CreateNumber(value->params[row][col]));
+        cJSON_AddItemToArray(params, vec);
+    }
+    cJSON_AddItemToObject(props, "params", params);
+    cJSON_AddItemToObject(object, "properties", props);
+    cJSON_AddItemToArray(arr, object);
 }
 
 static void ser_occlusion_portal(const JceOcclusionPortalComponent *c, cJSON *arr)
@@ -816,9 +933,15 @@ void serw_volume(JceScene *s, JceEntity e, cJSON *arr)
     if (c) ser_volume(c, arr);
 }
 
+void serw_fullscreen_effect(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceSceneFullscreenEffect *value =
+        jce_scene_get_fullscreen_effect(s, e);
+    if (value) ser_fullscreen_effect(value, arr);
+}
+
 void serw_occlusion_portal(JceScene *s, JceEntity e, cJSON *arr)
 {
     JceOcclusionPortalComponent *c = jce_scene_get_occlusion_portal(s, e);
     if (c) ser_occlusion_portal(c, arr);
 }
-

@@ -22,9 +22,12 @@
  * not a fixed cap.
  */
 
+#include "jce_terrain_collision_stream.h"
 #include "jce_rt_internal.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
+#include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/scene/jce_water_ripple.h>
 #if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
 #include <jce/middleware/ai_dispatch/jce_ai_dispatch.h>
 #endif
@@ -155,15 +158,15 @@ static void rt_trigger_event(const JceTriggerEvent *ev, void *user)
 	 * start a cutscene/mission).  Mirrors rt_script_collision_cb's linear scan;
 	 * the observer (usually the player) is passed as the number arg (entity id
 	 * fits exactly in a double).  STAY is intentionally not dispatched. */
-	if (rt && rt->script_vm &&
+	if (rt &&
 	    (ev->type == JCE_TRIGGER_EVENT_ENTER || ev->type == JCE_TRIGGER_EVENT_EXIT)) {
 		const char *method = (ev->type == JCE_TRIGGER_EVENT_ENTER)
 		    ? "on_trigger_enter" : "on_trigger_exit";
 		for (int i = 0; i < rt->script_count; ++i) {
 			struct ScriptEntry *se = &rt->scripts[i];
 			if (se->active && (uint64_t)se->entity == ev->trigger_user) {
-				jce_script_call_message(rt->script_vm, se->inst, method,
-				                        (double)ev->observer_user, NULL);
+				rt_script_ref_message(se->ref, method,
+				                      (double)ev->observer_user, NULL);
 				break;
 			}
 		}
@@ -552,15 +555,17 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 	 * Instantiate the authored JceScriptComponent into the runtime VM and call
 	 * on_start.  Gated on the component being enabled (same pattern as BT). */
 	JceScriptComponent *sc = jce_scene_get_script(scene, e);
-	if (sc && sc->script_path[0] && rt->script_vm &&
+	if (sc && sc->script_path[0] && rt->script_enabled &&
 	    jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SCRIPT)) {
-		JceScriptInstance inst =
-			jce_script_instantiate(rt->script_vm, sc->script_path, e);
-		if (inst &&
+		/* The language comes from the PATH: bob.lua and turret.py in one
+		 * scene each land in their own VM, and the ref carries the handle
+		 * that issued the instance so the two can never drift apart. */
+		RtScriptRef ref = rt_script_instantiate(rt, sc->script_path, e);
+		if (ref.inst &&
 		    (rt->script_count < rt->script_cap || rt_grow_scripts(rt))) {
 			struct ScriptEntry *se = &rt->scripts[rt->script_count++];
 			se->entity = e;
-			se->inst   = inst;
+			se->ref    = ref;
 			se->active = true;
 			se->simlod_accum     = 0.0f;   /* sim-LOD cadence state */
 			se->simlod_prev_tier = -1;
@@ -571,11 +576,13 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 			if (rt->script_watcher)
 				jce_file_watcher_add(rt->script_watcher, sc->script_path,
 				                     rt_on_script_changed, rt);
-			jce_script_call_start(rt->script_vm, inst);
-			LOG_INFO(LOG_TAG, "script: loaded '%s' for entity %llu",
-			         sc->script_path, (unsigned long long)e);
-		} else if (inst) {
-			jce_script_release(rt->script_vm, inst);  /* grow failed */
+			rt_script_ref_start(ref);
+			LOG_INFO(LOG_TAG, "script: loaded '%s' (%s) for entity %llu",
+			         sc->script_path,
+			         jce_script_vm_language_of(ref.vm),
+			         (unsigned long long)e);
+		} else if (ref.inst) {
+			rt_script_ref_release(ref);   /* grow failed */
 		}
 	}
 
@@ -911,7 +918,7 @@ static void rt_script_rpc_handler(JceNetObjectId net_id, JceClientId sender,
                                   void *user)
 {
 	JceRuntime *rt = (JceRuntime *)user;
-	if (!rt || !rt->script_vm || !payload || payload_size < 2u) return;
+	if (!rt || !payload || payload_size < 2u) return;
 
 	const uint8_t *p = (const uint8_t *)payload;
 	uint16_t elen = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -941,8 +948,8 @@ static void rt_script_rpc_handler(JceNetObjectId net_id, JceClientId sender,
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (se->active && (uint64_t)se->entity == ent) {
-			jce_script_call_message(rt->script_vm, se->inst, event,
-			                        0.0, pc > 0u ? pl : NULL);
+			rt_script_ref_message(se->ref, event, 0.0,
+			                      pc > 0u ? pl : NULL);
 			return;   /* one instance per entity */
 		}
 	}
@@ -1809,8 +1816,11 @@ static void rt_push_external_transforms(JceRuntime *rt)
 typedef struct {
 	JceScene          *scene;
 	JceWaterComponent *water;     /* first match (NULL = none active)         */
+	JceEntity          entity;    /* key into the scene's water-field set     */
 	int                water_comp_id;
 	float              surface_y; /* still-water world Y (base + entity Y)    */
+	float              center_x;  /* body centre in WORLD XZ                  */
+	float              center_z;
 } BuoyWaterScan;
 
 static void rt_buoy_find_water(JceScene *s, JceEntity e, void *user)
@@ -1825,10 +1835,17 @@ static void rt_buoy_find_water(JceScene *s, JceEntity e, void *user)
 
 	jce_mat4 m = jce_scene_get_world_matrix(s, e);
 	ctx->water     = wc;
+	ctx->entity    = e;
 	ctx->surface_y = wc->base_height + m.col[3].y;
+	ctx->center_x  = m.col[3].x;
+	ctx->center_z  = m.col[3].z;
 }
 
-static void rt_apply_buoyancy(JceRuntime *rt)
+/* fixed_dt is taken rather than read from rt, because the disturbance grid
+ * stepped at the bottom of this function must advance on the SAME cadence the
+ * caller is stepping physics with -- passing it makes that structural instead
+ * of a second lookup that could drift. */
+static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 {
 	if (!rt->physics || !rt->scene || rt->body_count <= 0) return;
 
@@ -1848,7 +1865,115 @@ static void rt_apply_buoyancy(JceRuntime *rt)
 	jce_scene_each_water(rt->scene, rt_buoy_find_water, &scan);
 	if (!scan.water) return;
 
-	const float t = (float)rt->buoyancy_time;
+	/* Sample the SAME field the renderer draws from.  Before this, buoyancy
+	 * evaluated its own Gerstner sum on its own clock -- which disagreed with
+	 * the screen in phase always, and in MODEL entirely whenever the water was
+	 * authored as FFT.  See jce_water_field.h. */
+	JceWaterFieldSet *wfs = jce_scene_water_fields(rt->scene);
+	/* ONE filler, from the scene -- see jce_scene_water_field_desc. The desc
+	 * that used to be written out here was the renderer's twin, and the two
+	 * disagreed: this side never applied the weather's wind multiplier, so in
+	 * any weather the two acquires of the SAME field saw two spectra and the
+	 * whole Tessendorf patch was rebuilt twice a frame. */
+	JceWaterFieldDesc wd;
+	if (!jce_scene_water_field_desc(rt->scene, scan.entity, &wd)) return;
+
+	JceWaterField *field =
+	    jce_water_field_set_acquire(wfs, (uint64_t)scan.entity, &wd);
+
+	/* The DISTURBANCE layer, sized from the same water body this pass already
+	 * picked. Created here and nowhere else: this is the only code that knows
+	 * which body is the active one, and a grid created by a reader would be
+	 * sized by whoever happened to draw first.
+	 *
+	 * Resolution is fixed rather than authored. It is a cost decision, not a
+	 * look decision -- the step is explicit, so the work per simulated second
+	 * goes with the SQUARE of it -- and a field on the component would be a
+	 * knob whose right value nobody could state. 96 over a typical pond gives
+	 * texels of a few tens of centimetres, which is finer than the wake of
+	 * anything that floats.
+	 *
+	 * Depth is left at the uniform default. Real bathymetry from the terrain
+	 * is the next step and belongs with the terrain query, not here; until it
+	 * exists, a flat bed is honest -- waves simply do not refract toward the
+	 * shore yet. */
+	JceWaterRipple *ripple;
+	{
+		JceWaterRippleDesc rd = jce_water_ripple_default_desc();
+		rd.resolution      = 96;
+		rd.size_m          = (wd.size_x > wd.size_z ? wd.size_x : wd.size_z);
+		if (!(rd.size_m > 0.0f)) rd.size_m = 32.0f;
+		rd.center_x        = wd.center_x;
+		rd.center_z        = wd.center_z;
+		rd.default_depth_m = 2.0f;
+		ripple = jce_scene_water_ripple(rt->scene, &rd);
+
+		/* BATHYMETRY: the still-water depth at every cell, from the terrain
+		 * under it.
+		 *
+		 * This is the whole reason the solver carries a depth map instead of a
+		 * constant. The wave speed is c = sqrt(g H), so shallow water carries
+		 * waves more slowly: they bunch up and BEND toward the shore, and cells
+		 * where the terrain is above the waterline become land and REFLECT.
+		 * Nobody authors any of that -- it falls out of H. With a uniform depth
+		 * the pond is a drum skin with a square edge.
+		 *
+		 * Filled ONCE, on the tick the grid is created. The bed is not static
+		 * in principle (a tide, a sculpt, a filling lock all move it), but
+		 * re-reading it every tick would sample the terrain resolution^2 times
+		 * per frame for an answer that almost never changes; a caller that
+		 * moves the bed can call jce_water_ripple_set_depth itself, which is
+		 * why that entry point is public.
+		 *
+		 * Skipped entirely when the runtime has no terrain -- and skipped is
+		 * the right word: jce_water_ripple_create already filled the map with
+		 * the uniform default, so this is a refinement of a valid state rather
+		 * than the only thing standing between it and garbage. */
+		if (ripple && rt->terrain_stream_src && !rt->water_bathymetry_done) {
+			const int rn = jce_water_ripple_resolution(ripple);
+			float cx = 0.0f, cz = 0.0f, sz = 0.0f;
+			jce_water_ripple_world_rect(ripple, &cx, &cz, &sz);
+			if (rn > 1 && sz > 0.0f) {
+				float *dep = (float *)jce_malloc((size_t)rn * (size_t)rn *
+				                                 sizeof(float));
+				if (dep) {
+					/* The still-water plane the depths are measured DOWN from.
+					 * wd.base_height already folds the water entity's world Y
+					 * (see jce_scene_water_field_desc), so this is the same
+					 * datum the ambient field and the renderer use -- taking
+					 * the component's local base_height here would put the bed
+					 * at the wrong depth for any pond not at the origin. */
+					const float surface_y = wd.base_height;
+					const float step = sz / (float)(rn - 1);
+					const float x0 = cx - sz * 0.5f;
+					const float z0 = cz - sz * 0.5f;
+					for (int j = 0; j < rn; ++j) {
+						const float wz = z0 + step * (float)j;
+						for (int i = 0; i < rn; ++i) {
+							const float wx = x0 + step * (float)i;
+							const float ty =
+							    jce_terrain_sample_height(rt->terrain_stream_src,
+							                              wx, wz);
+							/* Depth <= 0 is LAND to the solver, and that is
+							 * exactly what terrain above the waterline is. No
+							 * clamp: clamping to a small positive depth would
+							 * make the shoreline a very fast, very shallow
+							 * channel instead of a bank. */
+							dep[(size_t)j * (size_t)rn + (size_t)i] =
+							    surface_y - ty;
+						}
+					}
+					jce_water_ripple_set_depth(ripple, dep, rn * rn);
+					jce_free(dep);
+					rt->water_bathymetry_done = true;
+				}
+			}
+		}
+	}
+	/* No field (allocation failure, or a set already full of other bodies)
+	 * means nothing floats this tick.  Applying a WRONG force would be worse
+	 * than applying none. */
+	if (!field) return;
 
 	for (int i = 0; i < rt->body_count; ++i) {
 		BodyEntry *be = &rt->bodies[i];
@@ -1875,14 +2000,80 @@ static void rt_apply_buoyancy(JceRuntime *rt)
 		 * to float a body on the visible wave (a water entity offset in XZ would
 		 * otherwise read the wrong phase).  surface_y already folds base_height
 		 * + the water entity world Y. */
-		const float water_y = jce_water_sample_height(
-		    scan.water->waves, scan.water->wave_count,
-		    scan.surface_y, pos.x, pos.z, t);
+		/* The field inverts the horizontal displacement (Gerstner roll or
+		 * FFT chop) before reading the height: the shader moves vertices in X
+		 * and Z as well as Y, so the surface point at this world XZ was
+		 * authored somewhere else, and reading the vertical sum here floats a
+		 * body at visibly the wrong place on a steep wave -- worst at crests.
+		 *
+		 * Outside the body's extent the field refuses rather than inventing a
+		 * surface, so a body far from the pond is simply never floated. */
+		JceWaterSample ws;
+		if (!jce_water_field_sample(field, pos.x, pos.z, 0.0f, &ws)) continue;
+		/* AMBIENT + DISTURBANCE. The wind waves are a pure function of time;
+		 * the ripples are what objects did to the water. A body must float on
+		 * their sum, or it sits on a surface nobody draws -- which is the exact
+		 * disagreement JceWaterField was created to end, reintroduced one layer
+		 * up.
+		 *
+		 * Outside the grid the accessor returns 0, which is correct rather than
+		 * a fallback: outside it there is no disturbance. */
+		const float water_y = ws.position.y
+		                    + jce_water_ripple_height(ripple, pos.x, pos.z);
 
 		const float submersion = water_y - pos.y;   /* >0 only when below */
-		if (submersion <= 0.0f) continue;           /* airborne -> untouched */
-
 		const jce_vec3 vel = jce_physics_body_get_velocity(rt->physics, be->body);
+
+		/* WAKE. A body moving through water displaces it, and the impulse is
+		 * built entirely from quantities this pass already has -- no new
+		 * authored field, because none of them would have a value anyone could
+		 * state.
+		 *
+		 *   radius  the body's own horizontal extent, from the collider bounds
+		 *           the physics already keeps. A wake is as wide as the thing
+		 *           making it.
+		 *   speed   the VERTICAL velocity, which is the component that actually
+		 *           moves water up or down. A body settling pushes the surface
+		 *           down and a body rising pulls it up, and the sign follows
+		 *           from that without a rule.
+		 *
+		 * Gated on being in the water at all: an airborne body has not touched
+		 * it yet, and a body that never enters never disturbs. The gate is the
+		 * same `submersion > 0` the force below uses, so the two cannot
+		 * disagree about whether this body is in the water. */
+		if (submersion > 0.0f && ripple) {
+			/* Horizontal half-extent from the AUTHORED collider, not from the
+			 * physics world: there is no body-AABB query in the physics API,
+			 * and the collider component is the same thing the body was built
+			 * from. A default is used when a body has none of the three, so a
+			 * compound or mesh collider still makes a wake rather than none. */
+			float r = 0.5f;
+			if (jce_scene_has_box_collider(rt->scene, be->entity)) {
+				const JceBoxColliderComponent *bx =
+				    jce_scene_get_box_collider(rt->scene, be->entity);
+				if (bx) {
+					const float ex = 0.5f * bx->size[0];
+					const float ez = 0.5f * bx->size[2];
+					r = (ex > ez ? ex : ez);
+				}
+			} else if (jce_scene_has_sphere_collider(rt->scene, be->entity)) {
+				const JceSphereColliderComponent *sp =
+				    jce_scene_get_sphere_collider(rt->scene, be->entity);
+				if (sp) r = sp->radius;
+			} else if (jce_scene_has_capsule_collider(rt->scene, be->entity)) {
+				const JceCapsuleColliderComponent *cp =
+				    jce_scene_get_capsule_collider(rt->scene, be->entity);
+				if (cp) r = cp->radius;
+			}
+			/* The deadband is not noise rejection: a body resting on the water
+			 * has a small residual vertical velocity forever, and without it
+			 * every floating object would drive the grid on every tick and the
+			 * pond would never go quiet. */
+			if (r > 0.05f && (vel.y < -0.05f || vel.y > 0.05f))
+				jce_water_ripple_impulse(ripple, pos.x, pos.z, r, -vel.y);
+		}
+
+		if (submersion <= 0.0f) continue;           /* airborne -> untouched */
 		float fy = jce_water_buoyancy_force(submersion, vel.y,
 		                                    bc->buoyancy_strength, bc->drag);
 		/* The authored strength/drag are documented as mass-INDEPENDENT (they
@@ -2783,7 +2974,7 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 
 	/* ── Gameplay scripts (Phase 0 keystone): on_update every active
 	 * instance with the (already time-scaled by the caller) frame dt. */
-	if (rt->script_vm) {
+	if (rt->script_enabled) {
 		/* Hot-reload poll (~every 30 ticks ≈ 0.5 s @60 Hz): cheap mtime stat
 		 * per watched script; fires rt_on_script_changed synchronously (which
 		 * only rebinds instances in place — it never mutates scripts[], so it
@@ -2810,12 +3001,16 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			                     &rt->scripts[i].simlod_prev_tier,
 			                     true, &s_dt))
 				continue;
-			jce_script_call_update(rt->script_vm, rt->scripts[i].inst, s_dt);
+			rt_script_ref_update(rt->scripts[i].ref, s_dt);
 		}
 		/* Advance cooperative coroutines (jce.start_coroutine / wait_seconds)
 		 * with the same time-scaled dt the per-instance updates saw.  These are
 		 * shared cooperative timers, not per-entity, so they stay every-frame. */
-		jce_script_update_coroutines(rt->script_vm, dt);
+		/* Every live language advances its own cooperative timers.  A
+		 * scene with bob.lua and turret.py has two VMs and both must
+		 * tick, or one language's jce.wait_seconds never resumes. */
+		for (int i = 0; i < rt->script_lang_count; ++i)
+			jce_script_update_coroutines(rt->script_langs[i].vm, dt);
 	}
 
 	/* ── Simulation-LOD KPI (diagnostic) ─────────────────────────────
@@ -2911,14 +3106,12 @@ static void rt_unwire_entity_gameplay(JceRuntime *rt, JceEntity e)
 	/* Gameplay-script instance — release fires on_destroy (per-instance self
 	 * state freed), same as the bulk teardown.  Removing it from scripts[] stops
 	 * on_update / on_collision / broadcast from ever touching the dead id. */
-	if (rt->script_vm) {
-		for (int i = 0; i < rt->script_count; ++i) {
-			if (rt->scripts[i].entity != e) continue;
-			if (rt->scripts[i].active)
-				jce_script_release(rt->script_vm, rt->scripts[i].inst);
-			rt->scripts[i] = rt->scripts[--rt->script_count];
-			break;   /* one instance per entity */
-		}
+	for (int i = 0; i < rt->script_count; ++i) {
+		if (rt->scripts[i].entity != e) continue;
+		if (rt->scripts[i].active)
+			rt_script_ref_release(rt->scripts[i].ref);
+		rt->scripts[i] = rt->scripts[--rt->script_count];
+		break;   /* one instance per entity */
 	}
 
 	/* Behavior-tree agent — halt the tree on the (reusable) context + free the
@@ -3142,13 +3335,17 @@ JCE_API void JCE_CALL jce_runtime_despawn_gameplay_for_ids(JceRuntime *rt,
  * or final free. */
 static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 {
-	/* Join any in-flight async audio decodes and drop their results. */
+	/* Cancel in-flight structured audio decodes and drop their results. */
 	for (int i = 0; i < rt->pending_audio_count; ++i) {
 		RtPendingAudio *p = &rt->pending_audio[i];
-		if (p->thr) jce_thread_join(p->thr);
+		if (p->task) {
+			(void)jce_async_task_cancel(p->task);
+			jce_async_task_wait(p->task);
+			jce_async_task_release(p->task);
+			p->task = NULL;
+		}
 		if (p->args) {
 			jce_audio_cpu_free(p->args->cpu);
-			if (p->args->done) jce_atomic_i32_destroy(p->args->done);
 			jce_free(p->args);
 		}
 	}
@@ -3315,11 +3512,9 @@ static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 
 	/* Gameplay script instances (the VM itself is REUSABLE — kept).  Release
 	 * each instance (fires on_destroy) so per-scene self state is freed. */
-	if (rt->script_vm) {
-		for (int i = 0; i < rt->script_count; ++i)
-			if (rt->scripts[i].active)
-				jce_script_release(rt->script_vm, rt->scripts[i].inst);
-	}
+	for (int i = 0; i < rt->script_count; ++i)
+		if (rt->scripts[i].active)
+			rt_script_ref_release(rt->scripts[i].ref);
 	rt->script_count = 0;
 	/* Drop the file watcher's per-scene watched paths by recreating it (the
 	 * watcher object is cheap; this avoids stale watches on the old scene's
@@ -3328,7 +3523,7 @@ static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 	 * its (now NULL) watcher — avoids a needless create+immediate-destroy. */
 	if (rt->script_watcher) {
 		jce_file_watcher_destroy(rt->script_watcher);
-		rt->script_watcher = (!destroying && rt->script_vm)
+		rt->script_watcher = (!destroying && rt->script_enabled)
 		                     ? jce_file_watcher_create() : NULL;
 	}
 	rt->pending_spawn_count = 0;
@@ -3455,7 +3650,7 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 
 	/* Physics contact -> script on_collision bridge (one listener slot).  The
 	 * old world's registration was dropped in teardown when the world died. */
-	if (rt->script_vm && rt->physics && !rt->script_collision_registered) {
+	if (rt->script_enabled && rt->physics && !rt->script_collision_registered) {
 		if (jce_physics_add_contact_listener(rt->physics,
 		                                     rt_script_collision_cb, rt))
 			rt->script_collision_registered = true;
@@ -3490,17 +3685,17 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 /* ── Sequencer event / camera-cut dispatch (FEATURE 8.4) ──────────────
  *
  * The scene-sequencer driver fires EVENT keys through this trampoline; we
- * route the authored handler name to the gameplay script VM (so a .seq EVENT
- * key calls a global Lua function, mirroring the UIButton on_click path in
- * jce_runtime_dispatch_ui_click).  Camera-cuts are applied inside the driver
+ * route the authored handler name to the gameplay script VMs (so a .seq EVENT
+ * key calls a global function in whichever live language defines it,
+ * mirroring the UIButton on_click path in jce_runtime_dispatch_ui_click).  Camera-cuts are applied inside the driver
  * (it raises the target vcam's priority); the observer here only logs. */
 static void rt_seq_event_handler(const char *handler, uint64_t entity,
                                  float time, void *user)
 {
 	JceRuntime *rt = (JceRuntime *)user;
 	(void)time;
-	if (!rt || !rt->script_vm || !handler || !handler[0]) return;
-	jce_script_call_named(rt->script_vm, handler, (JceScriptEntity)entity);
+	if (!rt || !handler || !handler[0]) return;
+	(void)rt_script_call_named(rt, handler, (JceScriptEntity)entity);
 }
 
 static void rt_seq_camera_cut_handler(JceScene *s, JceEntity target,
@@ -3756,7 +3951,7 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	 * gameplay walk in rt_spawn_scene_state so rt_spawn_gameplay can load each
 	 * entity's authored behavior tree / Lua script into them as it is visited.
 	 * (These were once created AFTER that walk, so the `rt->bt_ctx` /
-	 * `rt->script_vm` guards inside rt_spawn_gameplay were always false and
+	 * `rt->script_enabled` guards inside rt_spawn_gameplay were always false and
 	 * authored trees and scripts silently never loaded — Phase 0 keystone
 	 * ordering fix, regression-guarded by
 	 * tests/application/test_jce_runtime_script_load.c.) */
@@ -3822,6 +4017,21 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 {
 	if (!rt) return;
 
+	/* Paged terrain colliders own physics bodies; drop them before the
+	 * physics world goes away. */
+	if (rt->terrain_stream) {
+		jce_terrain_collision_stream_destroy(rt->terrain_stream);
+		rt->terrain_stream = NULL;
+		rt->terrain_stream_src = NULL;
+	}
+
+	/* Release the water clock.  The scene outlives this runtime (the editor
+	 * keeps it after Play ends), and a set still claimed by a freed pointer
+	 * would never advance again -- the water would silently freeze, and the
+	 * cause would look like a rendering bug rather than a lifetime one. */
+	if (rt->scene)
+		jce_water_field_set_release(jce_scene_water_fields(rt->scene), rt);
+
 	/* Drop the process-global sequencer event/camera-cut sinks before this
 	 * runtime (their userdata) is freed, so no dangling callback remains. */
 	jce_scene_sequencer_set_event_handler(NULL, NULL);
@@ -3875,8 +4085,7 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 	 * a defensive no-op for that NULL. */
 	if (rt->script_watcher)
 		jce_file_watcher_destroy(rt->script_watcher);
-	if (rt->script_vm)
-		jce_script_destroy(rt->script_vm);
+	rt_script_destroy_vms(rt);
 	if (rt->save_registry) {
 		jce_save_unregister_scene_provider(rt->save_registry);
 		jce_snapshot_registry_destroy(rt->save_registry);
@@ -4217,7 +4426,53 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 			 * the surface phase first so it tracks the fixed cadence; no-op
 			 * when no scene has a buoyant body + active water. */
 			rt->buoyancy_time += (double)fixed_dt;
-			rt_apply_buoyancy(rt);
+			/* Claim the scene's shared water clock and advance it on the
+			 * fixed cadence.  The renderer's own advance becomes a no-op for
+			 * as long as we hold the claim, so the drawn surface and the
+			 * floated body are the same evaluated tick by construction. */
+			jce_water_field_set_advance(jce_scene_water_fields(rt->scene),
+			                            rt, (double)fixed_dt);
+			rt_apply_buoyancy(rt, fixed_dt);
+			/* Advance the DISTURBANCE layer, beside the ambient clock it adds
+			 * to, and OUTSIDE rt_apply_buoyancy.
+			 *
+			 * It was inside, at the bottom, which reads as the natural place:
+			 * that pass already runs exactly once per executed tick, and
+			 * stepping after the impulse loop integrates an impulse on the
+			 * tick it was applied. Both true -- and both irrelevant to the
+			 * defect, because that pass has FOUR early returns above the step:
+			 * no rigid bodies, no enabled+visible water, no field desc, and no
+			 * free field slot. The last of those fires AFTER the grid has been
+			 * created, so a grid could exist and never advance: a pond with a
+			 * ring on it, frozen, in a scene whose seventeenth water body took
+			 * the last slot. A scene with a pond and no rigid bodies froze it
+			 * outright.
+			 *
+			 * Here it is unconditional per executed tick, which is what a
+			 * stateful solver needs. It is still stepped from exactly one
+			 * place -- the property that matters, for the reason
+			 * JceWaterFieldSet takes a driver token: a grid stepped twice
+			 * advances at twice the rate its caller believes, and the symptom
+			 * is a pond that damps too fast rather than anything shaped like a
+			 * bug.
+			 *
+			 * The cost of moving it is one tick of latency between an impulse
+			 * and its integration, which is invisible, against a class of
+			 * silent freeze that is not.
+			 *
+			 * NULL until the buoyancy pass has created it, and stepping NULL
+			 * is a no-op -- so a scene with no water never pays for this. */
+			jce_water_ripple_step(jce_scene_water_ripple(rt->scene, NULL),
+			                      fixed_dt);
+			/* Page terrain colliders around the player.  Seeded at spawn,
+			 * but a streamed world only stays solid if residency follows
+			 * whoever is walking on it. */
+			if (rt->terrain_stream) {
+				jce_vec3 focus;
+				if (jce_runtime_get_player_position(rt, &focus))
+					jce_terrain_collision_stream_update(rt->terrain_stream,
+					                                    focus);
+			}
 			/* Constant Force (Unity ConstantForce last-mile): accumulate
 			 * authored world + body-relative force/torque on enabled dynamic
 			 * bodies BEFORE the step integrates them.  No-op (byte-identical)
@@ -4476,11 +4731,19 @@ JCE_API float JCE_CALL jce_runtime_vehicle_get_speed(JceRuntime *rt,
 
 JCE_API bool JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path)
 {
-	if (!rt || !rt->script_vm || !path || !path[0]) {
+	/* The VM to recompile into is the one that LOADED this path's language,
+	 * and only if it is already live: a language with no VM has no instance
+	 * to rebind, and standing an interpreter up to discover that would be
+	 * absurd.  NULL therefore also covers "nothing in this scene is written
+	 * in that language". */
+	JceScript *vm = rt_script_vm_for_path_existing(rt, path);
+	if (!rt || !vm || !path || !path[0]) {
 		/* Previously a bare `return` with no log at all — a file watcher
 		 * firing before the VM exists looked exactly like a successful
 		 * reload that changed nothing. */
-		LOG_WARN(LOG_TAG, "hot-reload ignored: no script VM or empty path");
+		LOG_WARN(LOG_TAG,
+		         "hot-reload ignored: no live script VM for '%s' or empty path",
+		         path ? path : "(null)");
 		return false;
 	}
 
@@ -4493,7 +4756,7 @@ JCE_API bool JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path
 	}
 	char chunkname[256];
 	snprintf(chunkname, sizeof chunkname, "@%s", path);
-	JceScriptModule mod = jce_script_compile_module(rt->script_vm, chunkname,
+	JceScriptModule mod = jce_script_compile_module(vm, chunkname,
 	                                                (const char *)src, (size_t)size);
 	jce_free(src);
 	if (mod == 0) {
@@ -4504,13 +4767,15 @@ JCE_API bool JCE_CALL jce_runtime_reload_script(JceRuntime *rt, const char *path
 	for (int i = 0; i < rt->script_count; ++i) {
 		if (rt->scripts[i].active &&
 		    strcmp(rt->scripts[i].script_path, path) == 0) {
-			jce_script_rebind_instance(rt->script_vm, rt->scripts[i].inst, mod);
+			/* Same path => same language => the module we just compiled
+			 * belongs to exactly the VM this ref carries. */
+			rt_script_ref_rebind(rt->scripts[i].ref, mod);
 			rebound++;
 		}
 	}
 	/* Rebound instances now reference `mod` via their metatable, so releasing
 	 * this temp handle is safe (the module stays alive while in use). */
-	jce_script_release_module(rt->script_vm, mod);
+	jce_script_release_module(vm, mod);
 	LOG_INFO(LOG_TAG, "hot-reload: '%s' -> rebound %d instance(s)", path, rebound);
 	/* rebound == 0 is success: the file compiled, nothing live uses it yet. */
 	return true;
@@ -4523,9 +4788,8 @@ JCE_API bool JCE_CALL jce_runtime_dispatch_ui_click(JceRuntime *rt,
 	/* Clean no-op when there is no VM or no authored handler — a UIButton with
 	 * an empty on_click_handler is just a visual button (hover/press tint only),
 	 * not an error. */
-	if (!rt || !rt->script_vm || !handler || !handler[0]) return false;
-	return jce_script_call_named(rt->script_vm, handler,
-	                             (JceScriptEntity)button_entity);
+	if (!rt || !handler || !handler[0]) return false;
+	return rt_script_call_named(rt, handler, (JceScriptEntity)button_entity);
 }
 
 JCE_API bool JCE_CALL jce_runtime_dispatch_ui_value_changed(JceRuntime *rt,
@@ -4534,41 +4798,41 @@ JCE_API bool JCE_CALL jce_runtime_dispatch_ui_value_changed(JceRuntime *rt,
 	/* Resolve the widget on the runtime's own scene + fire its authored
 	 * on_value_changed as fn(entity, value).  Slider/Toggle/Dropdown only;
 	 * a non-widget entity or empty handler is a clean no-op. */
-	if (!rt || !rt->script_vm || !rt->scene) return false;
+	if (!rt || !rt->scene) return false;
 	JceEntity e = (JceEntity)entity;
 	JceUISliderComponent *sl = jce_scene_get_ui_slider(rt->scene, e);
 	if (sl)
-		return jce_script_call_named_num(rt->script_vm, sl->on_value_changed,
-		                                 (JceScriptEntity)entity, (double)sl->value);
+		return rt_script_call_named_num(rt, sl->on_value_changed,
+		                                (JceScriptEntity)entity, (double)sl->value);
 	JceUIToggleComponent *tg = jce_scene_get_ui_toggle(rt->scene, e);
 	if (tg)
-		return jce_script_call_named_num(rt->script_vm, tg->on_value_changed,
-		                                 (JceScriptEntity)entity, tg->is_on ? 1.0 : 0.0);
+		return rt_script_call_named_num(rt, tg->on_value_changed,
+		                                (JceScriptEntity)entity, tg->is_on ? 1.0 : 0.0);
 	JceUIDropdownComponent *dd = jce_scene_get_ui_dropdown(rt->scene, e);
 	if (dd)
-		return jce_script_call_named_num(rt->script_vm, dd->on_value_changed,
-		                                 (JceScriptEntity)entity, (double)dd->selected_index);
+		return rt_script_call_named_num(rt, dd->on_value_changed,
+		                                (JceScriptEntity)entity, (double)dd->selected_index);
 	return false;
 }
 
 JCE_API bool JCE_CALL jce_runtime_dispatch_ui_text_changed(JceRuntime *rt,
                                                            uint64_t entity)
 {
-	if (!rt || !rt->script_vm || !rt->scene) return false;
+	if (!rt || !rt->scene) return false;
 	JceUIInputFieldComponent *f = jce_scene_get_ui_input_field(rt->scene, (JceEntity)entity);
 	if (!f) return false;
-	return jce_script_call_named_str(rt->script_vm, f->on_value_changed,
-	                                 (JceScriptEntity)entity, f->text);
+	return rt_script_call_named_str(rt, f->on_value_changed,
+	                                (JceScriptEntity)entity, f->text);
 }
 
 JCE_API bool JCE_CALL jce_runtime_dispatch_ui_submit(JceRuntime *rt,
                                                      uint64_t entity)
 {
-	if (!rt || !rt->script_vm || !rt->scene) return false;
+	if (!rt || !rt->scene) return false;
 	JceUIInputFieldComponent *f = jce_scene_get_ui_input_field(rt->scene, (JceEntity)entity);
 	if (!f) return false;
-	return jce_script_call_named_str(rt->script_vm, f->on_submit,
-	                                 (JceScriptEntity)entity, f->text);
+	return rt_script_call_named_str(rt, f->on_submit,
+	                                (JceScriptEntity)entity, f->text);
 }
 
 JCE_API void JCE_CALL jce_runtime_dispatch_anim_event(JceRuntime *rt,
@@ -4578,14 +4842,13 @@ JCE_API void JCE_CALL jce_runtime_dispatch_anim_event(JceRuntime *rt,
 	/* Clean no-op when there is no VM or no event — an animator whose entity
 	 * authored no gameplay script (or no on_anim_event handler) simply fires
 	 * nothing here; the scene renderer still logs the event. */
-	if (!rt || !rt->script_vm || !ev) return;
+	if (!rt || !ev) return;
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (!se->active) continue;
 		if ((uint64_t)se->entity == entity) {
-			jce_script_call_anim_event(rt->script_vm, se->inst,
-			                           ev->id, ev->name,
-			                           ev->f0, ev->f1, ev->i0);
+			rt_script_ref_anim_event(se->ref, ev->id, ev->name,
+			                         ev->f0, ev->f1, ev->i0);
 			return;   /* one instance per entity; first match wins */
 		}
 	}
@@ -4598,7 +4861,7 @@ JCE_API void JCE_CALL jce_runtime_dispatch_anim_state(JceRuntime *rt,
 {
 	/* Clean no-op when there is no VM — an animator whose entity authored no
 	 * gameplay script (or neither state handler) simply fires nothing here. */
-	if (!rt || !rt->script_vm) return;
+	if (!rt) return;
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (!se->active) continue;
@@ -4608,10 +4871,9 @@ JCE_API void JCE_CALL jce_runtime_dispatch_anim_state(JceRuntime *rt,
 			 * jce_script_call_message tolerates a missing method, so a script
 			 * defining only one (or neither) handler is a clean no-op. */
 			if (from_state && from_state[0])
-				jce_script_call_message(rt->script_vm, se->inst,
-				                        "on_state_exit", 0.0, from_state);
-			jce_script_call_message(rt->script_vm, se->inst,
-			                        "on_state_enter", 0.0, to_state);
+				rt_script_ref_message(se->ref, "on_state_exit",
+				                      0.0, from_state);
+			rt_script_ref_message(se->ref, "on_state_enter", 0.0, to_state);
 			return;   /* one instance per entity; first match wins */
 		}
 	}

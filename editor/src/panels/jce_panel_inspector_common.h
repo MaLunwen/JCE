@@ -45,6 +45,7 @@ void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q, const float
 extern "C" {
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
 }
@@ -149,6 +150,7 @@ void draw_comp_line_renderer(JceLineRendererComponent *l);
 void draw_comp_decal(JceDecalComponent *d);
 void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e);
 void draw_comp_volume(JceVolumeComponent *v);
+void draw_comp_fullscreen_effect(JceSceneFullscreenEffect *effect);
 void draw_comp_occlusion_portal(JceOcclusionPortalComponent *op);
 
 /* jce_panel_inspector_physics.cpp */
@@ -211,7 +213,10 @@ void draw_comp_weapon(JceWeaponComponent *w);
 void draw_comp_save_point(JceSavePointComponent *sp);
 void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv);
 void draw_comp_terrain(JceTerrainComponent *tc);
-void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs);
+/* Takes the scene + entity because the placement BAKE needs the world
+ * transform and the terrain, not just the component. */
+void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
+                                  JceScene *scene, JceEntity entity);
 void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc);
 void draw_comp_grass_field(JceGrassFieldComponent *g);
 void draw_comp_water(JceWaterComponent *w);

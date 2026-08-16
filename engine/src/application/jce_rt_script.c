@@ -13,10 +13,38 @@
 
 #include "middleware/scene/jce_scene_internal.h"  /* JSON bridges (comp/render get/set) */
 
+#include <jce/middleware/script/jce_script_vm.h>  /* per-script language selection */
+#include <jce/resource/jce_asset_format.h>        /* the offline script catalog */
+
+/* JceScriptHost::log, and the tag says "[script]" rather than "[lua]".
+ *
+ * MEASURED (elemental_serenity, four scripted entities, 2026-08-16): a Python
+ * script's jce.log line and a Java script's JceEntityScript.log line both
+ * arrived tagged "[lua]" —
+ *
+ *     runtime: [lua] es_fireflies (python) online: 12 fireflies
+ *     runtime: [lua] es_campfire (java) online: CampfireLight=ok
+ *
+ * — because ONE JceScriptHost is shared by every language VM the runtime
+ * stands up (rt_script_vm_get passes &rt->script_host to every
+ * jce_script_vm_create), and a host callback receives only `user`, which is
+ * the JceRuntime.  The callback cannot know which VM called it, and a wrong
+ * language name is worse than none: it sends the reader to the wrong file.
+ *
+ * NOT fixed by naming the language, deliberately.  Doing that means one host
+ * copy per language with a per-language `user`, and `user` is cast to
+ * JceRuntime * by all ~60 other callbacks in this file — a change with sixty
+ * sites and one benefit.  The line that DOES name the language already
+ * exists and is printed once per script at load:
+ *
+ *     script: loaded 'scripts/es_fireflies.py' (python) for entity 641
+ *
+ * *Enforced by:* nothing, and it needs nothing — the string is a literal with
+ * no branch behind it. */
 static void rt_script_log(void *user, const char *msg)
 {
 	(void)user;
-	LOG_INFO(LOG_TAG, "[lua] %s", msg ? msg : "");
+	LOG_INFO(LOG_TAG, "[script] %s", msg ? msg : "");
 }
 
 static bool rt_script_get_position(void *user, JceScriptEntity e, float out_xyz[3])
@@ -115,9 +143,62 @@ void *rt_read_asset_with_fallback(JceRuntime *rt, const char *path,
 	return NULL;
 }
 
+static void *rt_read_asset_with_fallback_capped(JceRuntime *rt,
+                                                 const char *path,
+                                                 uint64_t max_bytes,
+                                                 uint64_t *out_size)
+{
+	char rbuf[1024];
+	const char *host_path;
+	uint64_t read_size = 0;
+	uint64_t total_size = 0;
+	void *buf;
+
+	if (out_size) *out_size = 0;
+	if (!path || !path[0] || max_bytes == 0) return NULL;
+	host_path = rt_resolve_host_path(rt, path, rbuf, sizeof rbuf);
+	buf = jce_fs_host_read_capped(host_path, max_bytes,
+	                              &read_size, &total_size);
+	if (buf) {
+		if (total_size > max_bytes || read_size != total_size) {
+			jce_fs_buffer_free(buf);
+			if (out_size) *out_size = total_size;
+			return NULL;
+		}
+		if (out_size) *out_size = read_size;
+		return buf;
+	}
+	if (rt && rt->pak) {
+		const JcePakAsset *asset = jce_pak_find(rt->pak, path);
+
+		if (asset && asset->original_size > 0) {
+			if (out_size) *out_size = asset->original_size;
+			if (asset->original_size > max_bytes ||
+			    asset->original_size > (uint64_t)SIZE_MAX)
+				return NULL;
+			buf = jce_malloc((size_t)asset->original_size);
+			if (buf) {
+				size_t n = jce_pak_decompress(asset, buf,
+				                              (size_t)asset->original_size);
+				if (n == (size_t)asset->original_size)
+					return buf;
+				jce_free(buf);
+			}
+		}
+	}
+	return NULL;
+}
+
 static void *rt_script_read_file(void *user, const char *path, uint64_t *out_size)
 {
-	/* Host filesystem in the editor; PAK-resident in shipped builds. */
+	uint64_t cap = out_size ? *out_size : 0;
+
+	/* A nonzero input is the optional bounded-read convention used by Lua
+	 * project-data bindings. Script source loading passes zero and retains the
+	 * historical unbounded asset path. */
+	if (cap > 0)
+		return rt_read_asset_with_fallback_capped((JceRuntime *)user, path,
+		                                           cap, out_size);
 	return rt_read_asset_with_fallback((JceRuntime *)user, path, out_size);
 }
 
@@ -429,6 +510,24 @@ static float rt_script_pointer_wheel(void *user)
 	return rt ? rt->input.pointer_wheel : 0.0f;
 }
 
+static const char *rt_script_loc_translate(void *user, const char *key)
+{
+	(void)user;   /* jce_loc is process-global; user kept for API symmetry */
+	return jce_loc_t(key);
+}
+
+static const char *rt_script_loc_get_locale(void *user)
+{
+	(void)user;
+	return jce_loc_get_locale();
+}
+
+static void rt_script_loc_set_locale(void *user, const char *locale)
+{
+	(void)user;
+	jce_loc_set_locale(locale);
+}
+
 static bool rt_script_pointer_button(void *user, int button)
 {
 	JceRuntime *rt = (JceRuntime *)user;
@@ -513,10 +612,11 @@ static void rt_script_get_move(void *user, float out[3])
  * `pos` non-NULL makes it positional (3D); NULL is a 2D sound.  Loads the
  * sound on each call (the audio sound table dedups by path internally), and
  * is a safe no-op on a missing file / when audio is unavailable. */
-static void rt_script_play_sound(void *user, const char *path,
-                                 const float pos[3], float volume)
+static void rt_script_play_sound_impl(JceRuntime *rt, const char *path,
+                                      const float pos[3], float volume,
+                                      float min_distance, float max_distance,
+                                      float rolloff)
 {
-	JceRuntime *rt = (JceRuntime *)user;
 	if (!rt || !rt->audio || !path || !path[0]) return;
 	JceSound snd = rt_load_sound(rt, path);
 	if (snd == JCE_SOUND_INVALID) {
@@ -528,12 +628,31 @@ static void rt_script_play_sound(void *user, const char *path,
 	if (pos) {
 		jce_audio_voice_set_3d(rt->audio, v, true);
 		jce_audio_voice_set_position(rt->audio, v, pos[0], pos[1], pos[2]);
+		if (min_distance <= 0.0f) min_distance = 1.0f;
+		if (max_distance < min_distance) max_distance = min_distance;
+		if (rolloff <= 0.0f) rolloff = 1.0f;
 		jce_audio_voice_set_attenuation(rt->audio, v,
 		                                JCE_AUDIO_ATTEN_INVERSE,
-		                                1.0f, 25.0f, 1.0f);
+		                                min_distance, max_distance, rolloff);
 	} else {
 		jce_audio_voice_set_3d(rt->audio, v, false);
 	}
+}
+
+static void rt_script_play_sound(void *user, const char *path,
+                                 const float pos[3], float volume)
+{
+	rt_script_play_sound_impl((JceRuntime *)user, path, pos, volume,
+	                          1.0f, 25.0f, 1.0f);
+}
+
+static void rt_script_play_sound_spatial(void *user, const char *path,
+                                         const float pos[3], float volume,
+                                         float min_distance,
+                                         float max_distance, float rolloff)
+{
+	rt_script_play_sound_impl((JceRuntime *)user, path, pos, volume,
+	                          min_distance, max_distance, rolloff);
 }
 
 /* jce.ui_get_slider / ui_set_slider: the live UISlider's value. */
@@ -598,17 +717,15 @@ static void rt_script_ui_set_text(void *user, JceScriptEntity e, const char *txt
 void rt_script_collision_cb(const JceContactEvent *ev, void *ud)
 {
 	JceRuntime *rt = (JceRuntime *)ud;
-	if (!rt || !rt->script_vm || !ev) return;
+	if (!rt || !ev) return;
 	if (ev->type != JCE_CONTACT_BEGIN) return;   /* fire once per contact pair */
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (!se->active) continue;
 		if ((uint64_t)se->entity == ev->entity_a && ev->entity_b != 0)
-			jce_script_call_collision(rt->script_vm, se->inst,
-			                          (JceScriptEntity)ev->entity_b);
+			rt_script_ref_collision(se->ref, (JceScriptEntity)ev->entity_b);
 		else if ((uint64_t)se->entity == ev->entity_b && ev->entity_a != 0)
-			jce_script_call_collision(rt->script_vm, se->inst,
-			                          (JceScriptEntity)ev->entity_a);
+			rt_script_ref_collision(se->ref, (JceScriptEntity)ev->entity_a);
 	}
 }
 
@@ -623,13 +740,12 @@ static void rt_script_send_message(void *user, JceScriptEntity target,
                                    const char *str_arg)
 {
 	JceRuntime *rt = (JceRuntime *)user;
-	if (!rt || !rt->script_vm || !msg) return;
+	if (!rt || !msg) return;
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (!se->active) continue;
 		if ((JceScriptEntity)se->entity == target) {
-			jce_script_call_message(rt->script_vm, se->inst, msg,
-			                        number_arg, str_arg);
+			rt_script_ref_message(se->ref, msg, number_arg, str_arg);
 			return;   /* one instance per entity; first match wins */
 		}
 	}
@@ -643,12 +759,11 @@ static void rt_script_broadcast(void *user, const char *msg,
                                 double number_arg, const char *str_arg)
 {
 	JceRuntime *rt = (JceRuntime *)user;
-	if (!rt || !rt->script_vm || !msg) return;
+	if (!rt || !msg) return;
 	for (int i = 0; i < rt->script_count; ++i) {
 		struct ScriptEntry *se = &rt->scripts[i];
 		if (!se->active) continue;
-		jce_script_call_message(rt->script_vm, se->inst, msg,
-		                        number_arg, str_arg);
+		rt_script_ref_message(se->ref, msg, number_arg, str_arg);
 	}
 }
 
@@ -683,8 +798,13 @@ static void rt_script_set_component_enabled(void *user, JceScriptEntity e,
 	if (!rt || !rt->scene || !comp_name) return;
 	int cid = jce_component_find(comp_name);
 	if (cid < 0) return;
-	if (jce_scene_has_comp(rt->scene, (JceEntity)e, cid))
+	if (jce_scene_has_comp(rt->scene, (JceEntity)e, cid)) {
+		/* Attribute the write before performing it: a script that
+		 * re-asserts the same value every frame changes nothing, so
+		 * the editor cannot infer ownership from state transitions. */
+		jce_scene_mark_comp_script_driven(rt->scene, (JceEntity)e, cid);
 		jce_scene_set_comp_enabled(rt->scene, (JceEntity)e, cid, on);
+	}
 }
 
 /* jce.spawn(prefab_path, x, y, z): instantiate a prefab into the live scene at
@@ -1113,10 +1233,320 @@ void rt_bt_register_default_actions(JceRuntime *rt)
 }
 
 
+/* ── PER-SCRIPT LANGUAGE SELECTION ────────────────────────────────────────
+ *
+ * bob.lua and turret.py sit in one scene and each runs in its own VM.  The
+ * path decides, through the extension claims backends make for themselves
+ * (jce_script_vm.h, REGISTERING A LANGUAGE) — the engine holds no list of
+ * languages and no list of extensions, so a sixth backend needs no edit here.
+ *
+ * JCE_SCRIPT_LANGUAGE IS NOW A GLOBAL OVERRIDE, and that is the only meaning
+ * under which its name stays true once selection is per script: set it and
+ * EVERY script in the process runs in that one language whatever its
+ * extension — which is exactly the old whole-process behaviour, kept because
+ * it is what a cross-language differential needs (run this scene under
+ * python) and because silently reinterpreting the variable as "a default for
+ * unclaimed extensions" would make `JCE_SCRIPT_LANGUAGE=lua` load turret.py
+ * as a Lua chunk.  Unset (the normal case) selects per script.
+ *
+ * THERE IS NO FALLBACK, AND THAT IS THE WHOLE POINT.  Nothing turns an
+ * unresolved path into Lua.  Falling back would load a `.py` as a Lua chunk
+ * and report a syntax error against the script instead of the missing
+ * backend: the exact shape of "nothing compares equal to nothing" that a
+ * cross-language differential exists to catch.  An unresolved path yields no
+ * instance, that entity's script does not run, and the failure is logged with
+ * both registries printed. */
+static bool rt_script_override(const char **out_lang)
+{
+	const char *lang = getenv("JCE_SCRIPT_LANGUAGE");
+	if (!lang || !lang[0]) return false;
+	*out_lang = lang;
+	return true;
+}
+
+/* Both registries, rendered for a diagnostic.
+ *
+ * THE BUFFERS ARE SMALL ON PURPOSE.  jce_log's ring carries 512 bytes per
+ * message (engine/src/os/core/jce_log_ring.h) and silently truncates past it,
+ * so a single long explanatory line loses its TAIL — which is where the
+ * actionable half of any explanation ends up.  The refusals below therefore
+ * emit several short lines instead of one long one, and these two buffers are
+ * sized so that each line plus its prefix still fits.  Measured after the
+ * change: the last sentence of the last line is present in the log. */
+#define RT_SCRIPT_LANGS_CAP 192
+#define RT_SCRIPT_EXTS_CAP  256
+
+static void rt_script_registries(char *langs, size_t langs_cap,
+                                 char *exts,  size_t exts_cap)
+{
+	size_t used = 0;
+	int    i, n;
+
+	langs[0] = '\0';
+	for (i = 0, n = jce_script_vm_count(); i < n; ++i) {
+		const char *nm = jce_script_vm_language_at(i);
+		if (!nm) continue;
+		int w = snprintf(langs + used, langs_cap - used,
+		                 used ? ", %s" : "%s", nm);
+		if (w <= 0 || (size_t)w >= langs_cap - used) break;
+		used += (size_t)w;
+	}
+	if (!langs[0]) snprintf(langs, langs_cap, "<none>");
+
+	used = 0;
+	exts[0] = '\0';
+	for (i = 0, n = jce_script_vm_extension_count(); i < n; ++i) {
+		const char *e = jce_script_vm_extension_at(i);
+		const char *l = jce_script_vm_extension_language_at(i);
+		if (!e || !l) continue;
+		int w = snprintf(exts + used, exts_cap - used,
+		                 used ? ", .%s -> %s" : ".%s -> %s", e, l);
+		if (w <= 0 || (size_t)w >= exts_cap - used) break;
+		used += (size_t)w;
+	}
+	if (!exts[0]) snprintf(exts, exts_cap, "<none>");
+}
+
+/* Both live registries, as evidence under a refusal.  Emitted as separate
+ * lines so none of it is lost to the 512-byte message limit.  The PRESCRIPTION
+ * is not printed here — each caller knows which failure it hit and says so
+ * itself, because the three are not the same problem. */
+static void rt_script_log_registry_evidence(void)
+{
+	char langs[RT_SCRIPT_LANGS_CAP];
+	char exts[RT_SCRIPT_EXTS_CAP];
+	rt_script_registries(langs, sizeof langs, exts, sizeof exts);
+	LOG_ERROR(LOG_TAG, "  registered languages: %s", langs);
+	LOG_ERROR(LOG_TAG, "  claimed extensions  : %s", exts);
+}
+
+/* The language `path` must run in, or NULL with the reason logged.
+ *
+ * ══ WHY THE OFFLINE CATALOG IS CONSULTED AFTER THE RUNTIME REGISTRY FAILS ══
+ *
+ * "this engine has no such language" and "this language's backend was not
+ * linked into this executable" have COMPLETELY different fixes — write a whole
+ * JceScriptVM, versus add one library and one register() call — and until this
+ * function was changed, both printed the same sentence: "no script VM claims
+ * its extension", followed by the live registry and a paragraph asking the
+ * READER to work out which case they were in.
+ *
+ * They do not have to.  jce_asset_script_language_from_ext() is the OFFLINE
+ * catalog (engine/src/resource/jce_asset_ext.c) and it is deliberately
+ * independent of which backends were built: the cooker with no Python linked
+ * still has to know turret.py is Python in order to pack it for a runtime that
+ * does.  So it answers "python" here even in an executable that contains no
+ * Python at all, and that is exactly the fact that separates the two cases.
+ *
+ * MEASURED (elemental_serenity, packaged PAK-only build, python register()
+ * suppressed to model the un-linked exe, 2026-08-16).  Before:
+ *
+ *     script 'scripts/es_fireflies.py': no script VM claims its extension
+ *       registered languages: java, lua, cpp
+ *
+ * The word "python" never appears.  A reader who does not already know this
+ * engine HAS a Python backend reads "java, lua, cpp", concludes case (a), and
+ * sets out to write a JceScriptVM — the expensive wrong fix for a missing
+ * target_link_libraries.
+ *
+ * The `.escpp` case is why the else-branch is worded as it is: a project may
+ * claim its OWN extension at runtime for an already-registered language, and
+ * such an extension is legitimately absent from the catalog.  So "not in the
+ * catalog" is reported as the two possibilities it really is, not as a verdict.
+ *
+ * *Enforced by:* tests/os/resource/test_jce_asset_ext.c ::
+ * test_the_catalog_answers_without_any_backend_linked — that binary links
+ * `jce_core jce_resource` and NO script VM at all, so it is a process in which
+ * the catalog CANNOT be answering from the live registry; it pins "python" for
+ * .py, "java" for .class, and NULL for both an unimplemented language and a
+ * project-private extension, which are the three answers this branch reads. */
+static const char *rt_script_language_for(const char *path)
+{
+	const char *lang = NULL;
+	const char *catalog_lang;
+
+	if (rt_script_override(&lang)) return lang;   /* checked at create time */
+
+	lang = jce_script_vm_language_for_path(path);
+	if (lang) return lang;
+
+	catalog_lang = jce_asset_script_language_from_ext(path);
+	if (catalog_lang) {
+		LOG_ERROR(LOG_TAG,
+		          "script '%s' is %s, and NO %s BACKEND IS IN THIS "
+		          "EXECUTABLE — this entity's script will NOT run, and it is "
+		          "NOT run as Lua.",
+		          path, catalog_lang, catalog_lang);
+		rt_script_log_registry_evidence();
+		LOG_ERROR(LOG_TAG,
+		          "  FIX: link scripting/%s into this target and call "
+		          "jce_script_vm_%s_register() at startup, BEFORE the first "
+		          "scene loads — Script components are instantiated inside "
+		          "jce_runtime_create(). You do NOT need to write a VM: this "
+		          "engine implements %s already.",
+		          catalog_lang, catalog_lang, catalog_lang);
+	} else {
+		LOG_ERROR(LOG_TAG,
+		          "script '%s': no language claims its extension — this "
+		          "entity's script will NOT run, and it is NOT run as Lua.",
+		          path);
+		rt_script_log_registry_evidence();
+		LOG_ERROR(LOG_TAG,
+		          "  FIX: the extension is in neither the live registry above "
+		          "nor the offline catalog (engine/src/resource/jce_asset_ext.c), "
+		          "so either no backend implements it — write a JceScriptVM, see "
+		          "engine/include/jce/middleware/script/jce_script_vm.h — or it "
+		          "is a project-private extension whose "
+		          "jce_script_vm_register_extension() call did not run.");
+	}
+	return NULL;
+}
+
+/* The already-created VM for `language`, or NULL. */
+static JceScript *rt_script_vm_existing(JceRuntime *rt, const char *language)
+{
+	int i;
+	if (!rt || !language) return NULL;
+	for (i = 0; i < rt->script_lang_count; ++i)
+		if (strcmp(rt->script_langs[i].language, language) == 0)
+			return rt->script_langs[i].vm;
+	return NULL;
+}
+
+/* The VM for `language`, standing it up on first use.  NULL (logged) when the
+ * language is not registered or its create_sized refuses. */
+static JceScript *rt_script_vm_get(JceRuntime *rt, const char *language)
+{
+	JceScript *s = rt_script_vm_existing(rt, language);
+	if (s) return s;
+
+	if (rt->script_lang_count >= JCE_SCRIPT_VM_MAX) {
+		LOG_ERROR(LOG_TAG,
+		          "script VM '%s' not created: the runtime already holds %d "
+		          "languages", language, rt->script_lang_count);
+		return NULL;
+	}
+	if (strlen(language) >= (size_t)JCE_SCRIPT_VM_LANGUAGE_MAX) {
+		LOG_ERROR(LOG_TAG, "script VM '%s' not created: name too long",
+		          language);
+		return NULL;
+	}
+
+	s = jce_script_vm_create(language, &rt->script_host,
+	                         sizeof rt->script_host);
+	if (!s) {
+		LOG_ERROR(LOG_TAG,
+		          "script VM '%s' could not be created — every script in that "
+		          "language will NOT run. If '%s' IS listed below, its "
+		          "create_sized refused and logged why above this line.",
+		          language, language);
+		rt_script_log_registry_evidence();
+		return NULL;
+	}
+
+	rt->script_langs[rt->script_lang_count].vm = s;
+	snprintf(rt->script_langs[rt->script_lang_count].language,
+	         sizeof rt->script_langs[0].language, "%s", language);
+	++rt->script_lang_count;
+	LOG_INFO(LOG_TAG, "script VM created for language '%s'", language);
+	return s;
+}
+
+RtScriptRef rt_script_instantiate(JceRuntime *rt, const char *path,
+                                  JceEntity owner)
+{
+	RtScriptRef ref = {NULL, 0};
+	const char *language;
+	JceScript  *vm;
+
+	if (!rt || !rt->script_enabled || !path || !path[0]) return ref;
+
+	language = rt_script_language_for(path);   /* logs its own refusal */
+	if (!language) return ref;
+	vm = rt_script_vm_get(rt, language);       /* logs its own refusal */
+	if (!vm) return ref;
+
+	/* THE ONLY PLACE EITHER HALF OF AN RtScriptRef IS WRITTEN.  Both come
+	 * from this one call, so the pair cannot be mismatched without someone
+	 * hand-building the struct — see RtScriptRef in jce_rt_internal.h. */
+	ref.vm   = vm;
+	ref.inst = jce_script_instantiate(vm, path, (JceScriptEntity)owner);
+	if (!ref.inst) ref.vm = NULL;
+	return ref;
+}
+
+JceScript *rt_script_vm_for_path_existing(JceRuntime *rt, const char *path)
+{
+	const char *lang = NULL;
+	if (!rt || !rt->script_enabled || !path || !path[0]) return NULL;
+	if (!rt_script_override(&lang))
+		lang = jce_script_vm_language_for_path(path);
+	return lang ? rt_script_vm_existing(rt, lang) : NULL;
+}
+
+/* ── Global (non-instance) handlers ───────────────────────────────────────
+ *
+ * A UIButton's on_click / a sequencer EVENT key names a GLOBAL function, not
+ * an instance, so there is no ref to route it with.  With one VM that was not
+ * a question; with several the handler may live in any of them, so each live
+ * language is asked in creation order and the first that HANDLED it wins.
+ *
+ * The three slots return false for "no such global" — the header calls
+ * call_named_num and call_named_str THE TWO SLOTS THAT FAIL SILENTLY for
+ * exactly this reason — so "false" is precisely "not mine, ask the next one",
+ * which is what makes this loop correct rather than a guess.  With a single
+ * Lua VM the loop runs once and the result is identical to the old direct
+ * call. */
+bool rt_script_call_named(JceRuntime *rt, const char *fn_name,
+                          JceScriptEntity arg_entity)
+{
+	int i;
+	if (!rt || !fn_name || !fn_name[0]) return false;
+	for (i = 0; i < rt->script_lang_count; ++i)
+		if (jce_script_call_named(rt->script_langs[i].vm, fn_name, arg_entity))
+			return true;
+	return false;
+}
+
+bool rt_script_call_named_num(JceRuntime *rt, const char *fn_name,
+                              JceScriptEntity arg_entity, double value)
+{
+	int i;
+	if (!rt || !fn_name || !fn_name[0]) return false;
+	for (i = 0; i < rt->script_lang_count; ++i)
+		if (jce_script_call_named_num(rt->script_langs[i].vm, fn_name,
+		                              arg_entity, value))
+			return true;
+	return false;
+}
+
+bool rt_script_call_named_str(JceRuntime *rt, const char *fn_name,
+                              JceScriptEntity arg_entity, const char *str)
+{
+	int i;
+	if (!rt || !fn_name || !fn_name[0]) return false;
+	for (i = 0; i < rt->script_lang_count; ++i)
+		if (jce_script_call_named_str(rt->script_langs[i].vm, fn_name,
+		                              arg_entity, str))
+			return true;
+	return false;
+}
+
+void rt_script_destroy_vms(JceRuntime *rt)
+{
+	int i;
+	if (!rt) return;
+	for (i = 0; i < rt->script_lang_count; ++i) {
+		jce_script_destroy(rt->script_langs[i].vm);
+		rt->script_langs[i].vm = NULL;
+	}
+	rt->script_lang_count = 0;
+}
+
 /* Build the JceScriptHost callback table from this module's bindings and
- * create the runtime's Lua VM (+ editor hot-reload watcher).  Moved verbatim
- * from jce_runtime_create so every rt_script_* callback can stay file-static
- * in this module. */
+ * create the runtime's script VM (+ editor hot-reload watcher).  Moved
+ * verbatim from jce_runtime_create so every rt_script_* callback can stay
+ * file-static in this module. */
 void rt_script_install_vm(JceRuntime *rt)
 {
 	JceScriptHost host = {0};
@@ -1164,7 +1594,11 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.pointer_button = rt_script_pointer_button;
 	host.touch_count = rt_script_touch_count;
 	host.touch_get = rt_script_touch_get;
+	host.loc_translate  = rt_script_loc_translate;
+	host.loc_get_locale = rt_script_loc_get_locale;
+	host.loc_set_locale = rt_script_loc_set_locale;
 	host.play_sound     = rt_script_play_sound;
+	host.play_sound_spatial = rt_script_play_sound_spatial;
 	host.ui_get_slider  = rt_script_ui_get_slider;
 	host.ui_set_slider  = rt_script_ui_set_slider;
 	host.ui_get_toggle  = rt_script_ui_get_toggle;
@@ -1190,11 +1624,42 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.render_set_json  = rt_script_render_set_json;
 	host.json_free        = rt_script_json_free;
 	host.audio_set_volume = rt_script_audio_set_volume;
-	rt->script_vm = jce_script_create(&host);
+
+	/* The host table is built once and reused for every language's VM: all
+	 * languages must see the SAME host or a cross-language differential is
+	 * comparing two engines.  No VM is created here — the first script of a
+	 * given language creates that language's VM (rt_script_vm_get). */
+	rt->script_host       = host;
+	rt->script_lang_count = 0;
+	rt->script_enabled    = true;
+
+	/* The one thing worth failing at STARTUP rather than at the first script:
+	 * JCE_SCRIPT_LANGUAGE naming a language this executable cannot run.  That
+	 * is a whole-run mistake — every script in the process was redirected to a
+	 * VM that does not exist — so it is reported once, here, instead of once
+	 * per entity, and scripting is disabled for the run rather than silently
+	 * degrading to Lua. */
+	{
+		const char *lang = NULL;
+		if (rt_script_override(&lang) && !jce_script_vm_find(lang)) {
+			LOG_ERROR(LOG_TAG,
+			          "JCE_SCRIPT_LANGUAGE=%s: no such script VM — scripts "
+			          "are DISABLED for this run. This is not a fallback to "
+			          "Lua on purpose: a run that asked for %s must not "
+			          "silently be a Lua run.",
+			          lang, lang);
+			rt_script_log_registry_evidence();
+			rt->script_enabled = false;
+		} else if (lang) {
+			LOG_INFO(LOG_TAG,
+			         "JCE_SCRIPT_LANGUAGE=%s: OVERRIDE — every script in this "
+			         "process runs in '%s' whatever its extension", lang, lang);
+		}
+	}
+
 	/* Script hot-reload watcher (editor dev; inert in shipped).  The
 	 * physics contact -> script on_collision bridge is wired per scene in
 	 * rt_spawn_scene_state (it depends on the per-scene physics world). */
-	if (rt->script_vm)
+	if (rt->script_enabled)
 		rt->script_watcher = jce_file_watcher_create();
 }
-

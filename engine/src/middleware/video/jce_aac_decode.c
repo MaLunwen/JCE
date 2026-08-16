@@ -69,6 +69,74 @@ JceAacDecoder *jce_aac_decoder_open(const void *asc_config, uint32_t asc_bytes)
     return dec;
 }
 
+JceAacDecoder *jce_aac_decoder_open_adts(void)
+{
+    /* TT_MP4_ADTS: fdk-aac finds the syncwords and reads the config out of
+     * the per-frame headers, so there is no aacDecoder_ConfigRaw step. */
+    HANDLE_AACDECODER handle = aacDecoder_Open(TT_MP4_ADTS, 1);
+    JceAacDecoder *dec;
+
+    if (!handle) {
+        LOG_ERROR(LOG_TAG, "aacDecoder_Open(ADTS) failed");
+        return NULL;
+    }
+    dec = (JceAacDecoder *)JCE_CALLOC(1, sizeof(*dec));
+    if (!dec) {
+        aacDecoder_Close(handle);
+        return NULL;
+    }
+    dec->handle = handle;
+    return dec;
+}
+
+uint32_t jce_aac_adts_feed(JceAacDecoder *dec, const void *data, uint32_t bytes)
+{
+    UCHAR *in_buf[1];
+    UINT   in_size[1];
+    UINT   valid;
+
+    if (!dec || !dec->handle || !data || bytes == 0u) return 0u;
+
+    in_buf[0]  = (UCHAR *)data;
+    in_size[0] = (UINT)bytes;
+    valid      = (UINT)bytes;
+
+    if (aacDecoder_Fill(dec->handle, in_buf, in_size, &valid) != AAC_DEC_OK) {
+        return 0u;
+    }
+    /* `valid` is what remains UNconsumed. */
+    return (uint32_t)(bytes - valid);
+}
+
+bool jce_aac_adts_decode(JceAacDecoder *dec,
+                         int16_t *out_pcm, uint32_t out_capacity,
+                         uint32_t *out_samples)
+{
+    AAC_DECODER_ERROR err;
+    CStreamInfo *info;
+
+    if (out_samples) *out_samples = 0u;
+    if (!dec || !dec->handle || !out_pcm) return false;
+
+    err = aacDecoder_DecodeFrame(dec->handle, (INT_PCM *)out_pcm,
+                                 (INT)out_capacity, 0);
+    if (err != AAC_DEC_OK) {
+        return false;                      /* drained, or a bad frame */
+    }
+
+    info = aacDecoder_GetStreamInfo(dec->handle);
+    if (info && info->numChannels > 0 && info->sampleRate > 0) {
+        dec->channels   = (uint32_t)info->numChannels;
+        dec->samplerate = (uint32_t)info->sampleRate;
+        dec->frame_size = (uint32_t)info->frameSize;
+        dec->info_valid = true;
+        if (out_samples) {
+            *out_samples = (uint32_t)info->frameSize * (uint32_t)info->numChannels;
+        }
+    }
+    return true;
+}
+
 bool jce_aac_decode_frame(JceAacDecoder *dec,
                           const void *aac_frame, uint32_t frame_bytes,
                           int16_t *out_pcm, uint32_t out_capacity,
@@ -136,6 +204,20 @@ void jce_aac_decoder_close(JceAacDecoder *dec)
  * "unsupported codec" status without pulling in libfdk_aac. */
 JceAacDecoder *jce_aac_decoder_open(const void *asc_config, uint32_t asc_bytes)
 { (void)asc_config; (void)asc_bytes; return (JceAacDecoder *)0; }
+
+JceAacDecoder *jce_aac_decoder_open_adts(void) { return (JceAacDecoder *)0; }
+
+uint32_t jce_aac_adts_feed(JceAacDecoder *dec, const void *data, uint32_t bytes)
+{ (void)dec; (void)data; (void)bytes; return 0u; }
+
+bool jce_aac_adts_decode(JceAacDecoder *dec,
+                         int16_t *out_pcm, uint32_t out_capacity,
+                         uint32_t *out_samples)
+{
+    (void)dec; (void)out_pcm; (void)out_capacity;
+    if (out_samples) *out_samples = 0u;
+    return false;
+}
 
 bool jce_aac_decode_frame(JceAacDecoder *dec,
                           const void *aac_frame, uint32_t frame_bytes,

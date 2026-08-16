@@ -6,15 +6,17 @@
  *
  * Dependencies: jce_image via jce_image_decode (texture decode — the cooker
  *               never picks a codec), miniaudio (audio decode),
- *               ZSTD (compression), XXHash (source hash).
+ *               shared asset writer (compression), XXHash (source hash).
  */
 
 #include "jce_asset_cooker.h"
+#include "jce_asset_writer_internal.h"
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/resource/jce_image_decode.h>  /* the one image-decode service */
 
 #include "jce_cook_policy.h"
+#include <cjson/cJSON.h>   /* the .import.json colorSpace sidecar */
 #include "jce_tex_compress.h"
 #include "os/core/jce_memory.h"
 
@@ -23,7 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <xxhash.h>
-#include <zstd.h>
 
 #ifndef JCE_NO_AUDIO
 /* Audio decode source of truth.
@@ -52,58 +53,6 @@
 /* Internal helpers                                                    */
 /* ================================================================== */
 
-/* Growable buffer for building .jceasset blobs. */
-typedef struct {
-    uint8_t *data;
-    size_t   size;
-    size_t   capacity;
-} Buf;
-
-static bool buf_init(Buf *b, size_t cap)
-{
-    b->data = (uint8_t *)JCE_MALLOC(cap);
-    if (!b->data) return false;
-    b->size = 0;
-    b->capacity = cap;
-    return true;
-}
-
-static bool buf_grow(Buf *b, size_t needed)
-{
-    if (b->size + needed <= b->capacity) return true;
-    size_t new_cap = b->capacity * 2;
-    if (new_cap < b->size + needed) new_cap = b->size + needed;
-    uint8_t *tmp = (uint8_t *)JCE_REALLOC(b->data, new_cap);
-    if (!tmp) return false;
-    b->data = tmp;
-    b->capacity = new_cap;
-    return true;
-}
-
-static bool buf_write(Buf *b, const void *data, size_t len)
-{
-    if (!buf_grow(b, len)) return false;
-    memcpy(b->data + b->size, data, len);
-    b->size += len;
-    return true;
-}
-
-static bool buf_write_zeros(Buf *b, size_t len)
-{
-    if (!buf_grow(b, len)) return false;
-    memset(b->data + b->size, 0, len);
-    b->size += len;
-    return true;
-}
-
-static void buf_free(Buf *b)
-{
-    JCE_FREE(b->data);
-    b->data = NULL;
-    b->size = 0;
-    b->capacity = 0;
-}
-
 /* Build a .jceasset blob from pre-built chunks.
    chunks: array of (chunk_type, raw_data, raw_size) tuples.
    Returns malloc'd blob. */
@@ -121,124 +70,24 @@ static JceCookResult build_asset(uint32_t asset_type,
                                  const JceCookOptions *opts)
 {
     JceCookResult result = {0};
-    int clevel = opts ? opts->compression_level : 3;
-
-    /* Calculate layout sizes. */
-    size_t header_size = JCEASSET_HEADER_SIZE;
-    size_t toc_size    = (size_t)chunk_count * JCEASSET_CHUNK_ENTRY_SIZE;
-    size_t data_start  = header_size + toc_size;
-
-    /* Pre-compress all chunks to get sizes. */
-    typedef struct {
-        void  *comp_data;
-        size_t comp_size;
-        bool   is_compressed;
-    } CompChunk;
-
-    CompChunk *comp = (CompChunk *)JCE_CALLOC(chunk_count, sizeof(CompChunk));
-    if (!comp) {
+    JceAssetWriteChunk *writer_chunks = JCE_CALLOC(chunk_count, sizeof(*writer_chunks));
+    if (!writer_chunks) {
         snprintf(result.error, sizeof(result.error), "allocation failed");
         return result;
     }
-
-    /* Reusable ZSTD compression context — avoids repeated internal
-       allocation/deallocation when compressing multiple chunks. */
-    ZSTD_CCtx *cctx = (clevel > 0) ? ZSTD_createCCtx() : NULL;
-
-    size_t total_data = 0;
-    for (uint32_t i = 0; i < chunk_count; i++) {
-        if (cctx && chunks[i].raw_size > 64) {
-            size_t bound = ZSTD_compressBound(chunks[i].raw_size);
-            comp[i].comp_data = JCE_MALLOC(bound);
-            if (comp[i].comp_data) {
-                size_t csize = ZSTD_compressCCtx(cctx,
-                                                  comp[i].comp_data, bound,
-                                                  chunks[i].raw_data,
-                                                  chunks[i].raw_size,
-                                                  clevel);
-                if (!ZSTD_isError(csize) && csize < chunks[i].raw_size) {
-                    comp[i].comp_size = csize;
-                    comp[i].is_compressed = true;
-                } else {
-                    JCE_FREE(comp[i].comp_data);
-                    comp[i].comp_data = NULL;
-                }
-            }
-        }
-
-        if (comp[i].is_compressed)
-            total_data += comp[i].comp_size;
-        else
-            total_data += chunks[i].raw_size;
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        writer_chunks[i].chunk_type = chunks[i].chunk_type;
+        writer_chunks[i].raw_data = chunks[i].raw_data;
+        writer_chunks[i].raw_size = chunks[i].raw_size;
     }
-
-    ZSTD_freeCCtx(cctx);
-
-    /* Build final blob. */
-    Buf buf;
-    if (!buf_init(&buf, data_start + total_data + 64)) {
-        for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
-        JCE_FREE(comp);
-        snprintf(result.error, sizeof(result.error), "allocation failed");
-        return result;
-    }
-
-    /* Write header. */
-    JceAssetFileHeader hdr = {0};
-    hdr.magic[0]    = JCEASSET_MAGIC_0;
-    hdr.magic[1]    = JCEASSET_MAGIC_1;
-    hdr.magic[2]    = JCEASSET_MAGIC_2;
-    hdr.magic[3]    = JCEASSET_MAGIC_3;
-    hdr.version     = JCEASSET_VERSION;
-    hdr.asset_type  = asset_type;
-    hdr.chunk_count = chunk_count;
-    hdr.source_hash = source_hash;
-    buf_write(&buf, &hdr, sizeof(hdr));
-
-    /* Pad header to JCEASSET_HEADER_SIZE if struct is smaller. */
-    if (sizeof(hdr) < JCEASSET_HEADER_SIZE)
-        buf_write_zeros(&buf, JCEASSET_HEADER_SIZE - sizeof(hdr));
-
-    /* Write chunk table (fill data_offset after calculating). */
-    size_t offset = data_start;
-
-    for (uint32_t i = 0; i < chunk_count; i++) {
-        JceAssetChunkEntry entry = {0};
-        entry.chunk_type    = chunks[i].chunk_type;
-        entry.compression   = comp[i].is_compressed
-            ? JCEASSET_COMPRESS_ZSTD : JCEASSET_COMPRESS_NONE;
-        entry.data_offset   = (uint64_t)offset;
-        entry.original_size = (uint64_t)chunks[i].raw_size;
-
-        if (comp[i].is_compressed) {
-            entry.compressed_size = (uint64_t)comp[i].comp_size;
-            offset += comp[i].comp_size;
-        } else {
-            entry.compressed_size = (uint64_t)chunks[i].raw_size;
-            offset += chunks[i].raw_size;
-        }
-
-        buf_write(&buf, &entry, sizeof(entry));
-        if (sizeof(entry) < JCEASSET_CHUNK_ENTRY_SIZE)
-            buf_write_zeros(&buf, JCEASSET_CHUNK_ENTRY_SIZE - sizeof(entry));
-    }
-
-    /* Write data blocks. */
-    for (uint32_t i = 0; i < chunk_count; i++) {
-        if (comp[i].is_compressed) {
-            buf_write(&buf, comp[i].comp_data, comp[i].comp_size);
-        } else {
-            buf_write(&buf, chunks[i].raw_data, chunks[i].raw_size);
-        }
-    }
-
-    /* Cleanup compressed buffers. */
-    for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
-    JCE_FREE(comp);
-
-    result.data    = buf.data;
-    result.size    = buf.size;
-    result.success = true;
+    JceAssetWriteResult written = jce_asset_writer_build(
+        asset_type, source_hash, writer_chunks, chunk_count,
+        opts ? opts->compression_level : 3);
+    JCE_FREE(writer_chunks);
+    result.data = written.data;
+    result.size = written.size;
+    result.success = written.success;
+    memcpy(result.error, written.error, sizeof(result.error));
     return result;
 }
 
@@ -377,6 +226,18 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
             return result;
         }
     }
+    /* Resolved by the path-aware caller (jce_cook_file / the bundle packer);
+     * false when nobody knew, which is the historical behaviour.
+     *
+     * BC5 vetoes it unconditionally.  BC5 is the two-channel normal-map format
+     * and this file already back-infers `is_normal` from it further down, so a
+     * name or an authored sidecar claiming sRGB next to a normal map cannot
+     * win: the format is a harder signal than either, and this is the one
+     * combination that would corrupt data rather than merely leave it as it
+     * was. */
+    const bool tex_is_srgb = opts && opts->texture_srgb &&
+                             target_format != JCEASSET_TEXFMT_BC5;
+
     uint32_t current_w = base_w, current_h = base_h;
     size_t mip_offset = 0;
 
@@ -392,8 +253,23 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
         if (m + 1 < mip_count) {
             uint32_t next_w, next_h;
             uint8_t *dst = scratch[scratch_idx];
-            jce_tex_generate_mip(current_mip, current_w, current_h,
-                                 dst, &next_w, &next_h);
+            /* Average in the space the texels are ENCODED in.
+             *
+             * A box filter over raw sRGB bytes is exactly right on flat
+             * regions and increasingly wrong as local contrast rises, so the
+             * defect hid in plain sight for as long as the test content was
+             * flat: measured over this repository's textures, worst per-texel
+             * error 73 levels, median texture's worst 27, and on a leaf atlas
+             * a SIGNED mean shift of -14.5 luma / +16 R-B by mip 7.  Distant
+             * foliage was being rendered darker and warmer than it should be
+             * by an amount that grows with mip level -- with distance.
+             *
+             * The renderer decodes sRGB manually in the shader (pow 2.2 in
+             * fs_pbr_body.sh / fs_terrain.sc), never via a sampler flag, so
+             * the stored mips must themselves be sRGB-encoded: decode,
+             * average, re-encode is exactly right for this pipeline. */
+            jce_tex_generate_mip_ex(current_mip, current_w, current_h,
+                                    dst, &next_w, &next_h, tex_is_srgb);
             current_mip = dst;
             scratch_idx ^= 1;   /* next level writes the other buffer */
             current_w = next_w;
@@ -474,18 +350,23 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
     info->height    = base_h;
     info->format    = (uint32_t)target_format;
     info->mip_count = mip_count;
-    /* WARNING (audit img-srgb-flag-dead-and-wrong): this asserts sRGB for
-     * EVERY cooked texture, including normal / roughness / metallic / mask
-     * maps, which are linear data.  It is currently harmless only because
-     * nothing reads the bit — grep for JceAssetTexInfo::flags and you will
-     * find no consumer.  Do NOT start trusting it without first giving the
-     * cooker the texture's semantic: JceCookOptions has no usage/semantic
-     * field, so at this point the cooker genuinely cannot tell an albedo map
-     * from a normal map, and the honest value would be "unknown".  Whoever
-     * wires a consumer must plumb the semantic from the material/importer
-     * (which does know) and set this accordingly — otherwise the first thing
-     * that happens is normal maps getting gamma-decoded. */
-    info->flags     = 1; /* sRGB — see WARNING above; not semantically derived */
+    /* Bit 0 = sRGB.  It used to be hard-coded to 1 for EVERY cooked texture,
+     * normal and roughness maps included, with an audit note saying that was
+     * only harmless because the bit has no readers.  It now carries the same
+     * value the mip filter above was given, so the bit and the pixels agree.
+     *
+     * That is an improvement, not a resolution.  The value is still derived
+     * from a FILENAME heuristic, not from the texture's semantic: the
+     * importers know (JceModelMaterialInfo has five named slots,
+     * JcePbrMaterial five typed handles) and JceCookOptions still has no field
+     * to carry it.  114 textures in this repository are GLB-embedded and named
+     * `<stem>_tex<N>.png`, which no naming scheme can classify.
+     *
+     * So: still do not build anything on this bit that would be WRONG when the
+     * heuristic is.  The next person to want a consumer should plumb the
+     * semantic first; the hook is JceCookOptions::texture_srgb, and widening
+     * it to a real usage enum is the intended path. */
+    info->flags     = tex_is_srgb ? 1u : 0u;
     info->_pad      = 0;
 
     /* Copy mip offsets after the info struct. */
@@ -774,11 +655,48 @@ JceCookResult jce_cook_file(const char *input_path,
        caller didn't force a specific format. cook_texture honors the result. */
     JceCookOptions local;
     const JceCookOptions *use_opts = opts;
-    if (type == JCEASSET_TYPE_TEXTURE && opts &&
-        opts->texture_format == JCEASSET_TEXFMT_RGBA8) {
+    if (type == JCEASSET_TYPE_TEXTURE && opts) {
         local = *opts;
-        local.texture_format =
-            jce_cook_auto_texture_format(input_path, opts->platform);
+        /* Format auto-selection stays gated on "the caller didn't force one";
+         * colour space is resolved for EVERY texture, because a forced format
+         * says nothing about whether the texels are sRGB. */
+        if (opts->texture_format == JCEASSET_TEXFMT_RGBA8)
+            local.texture_format =
+                jce_cook_auto_texture_format(input_path, opts->platform);
+        local.texture_srgb = jce_cook_path_is_srgb(input_path);
+
+        /* `<asset>.import.json` "colorSpace", which outranks the filename
+         * guess above because it was written by something that knew.
+         *
+         * Read HERE as well as in the bundle packer so the two cook entry
+         * points do not disagree.  They already did: the packer honoured the
+         * sidecar and this path ignored it, so the same texture cooked two
+         * different ways depending on which door it came through, and the CLI
+         * -- the one a person reaches for to check a single file -- was the
+         * door that lied.  Only "colorSpace" is read here; the older keys stay
+         * the packer's business, so this cannot change any existing CLI cook
+         * except for textures an importer has explicitly tagged. */
+        {
+            char side[1024];
+            int  n = snprintf(side, sizeof side, "%s.import.json", input_path);
+            if (n > 0 && (size_t)n < sizeof side) {
+                uint64_t side_len = 0;
+                void *side_buf = jce_fs_host_read_all(side, &side_len);
+                if (side_buf) {
+                    cJSON *sj = cJSON_ParseWithLength((const char *)side_buf,
+                                                      (size_t)side_len);
+                    if (cJSON_IsObject(sj)) {
+                        const cJSON *cs =
+                            cJSON_GetObjectItemCaseSensitive(sj, "colorSpace");
+                        if (cJSON_IsString(cs))
+                            (void)jce_cook_colour_space_parse(cs->valuestring,
+                                                              &local.texture_srgb);
+                    }
+                    if (sj) cJSON_Delete(sj);
+                    jce_fs_buffer_free(side_buf);
+                }
+            }
+        }
         use_opts = &local;
     }
 

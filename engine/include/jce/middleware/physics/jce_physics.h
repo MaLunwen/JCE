@@ -143,6 +143,97 @@ JCE_API JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld          
                                                        const JceCompoundBodyDesc *desc);
 
 /* ================================================================== */
+/* Heightfield bodies (terrain)                                        */
+/* ================================================================== */
+
+/* A regular grid of heights, as a dedicated collision primitive.
+ *
+ * Terrain used to collide as generic triangle soup: the whole grid was
+ * expanded to W*H vertices and (W-1)*(H-1)*2 triangles in one allocation with
+ * no chunking and no LOD, which a 4097^2 terrain cannot survive on the 512 MB
+ * profile.  Worse, streamed/procedural terrain got no collision at all,
+ * because the expander required a resident monolithic height array.
+ *
+ * FIVE BULLET CONVENTIONS ARE BAKED INTO THIS CONTRACT.  Each was verified
+ * against the Bullet source, and each produces a distinct shipped defect if
+ * left to the caller:
+ *
+ *  1. CENTRING.  btHeightfieldTerrainShape sets
+ *       m_localOrigin = 0.5 * (m_localAabbMin + m_localAabbMax)
+ *     and getVertex() subtracts it, so the shape is centred on the origin in
+ *     ALL THREE axes.  A field built from heights in [0,100] sits spanning
+ *     -50..+50, not 0..100.  The bridge compensates, so `position` here means
+ *     the MINIMUM corner of the field in world space and behaves the way the
+ *     renderer's terrain transform does.  Without this, terrain collision is
+ *     offset by half the height range everywhere -- a failure that reads like
+ *     a bias-tuning problem and is not one.
+ *
+ *  2. BOUNDS OWNERSHIP.  min_height/max_height must bound the samples for the
+ *     lifetime of the shape.  They are validated on creation and creation
+ *     fails rather than silently corrupting the AABB.
+ *
+ *  3. QUAD DIAGONAL.  Bullet picks each quad's diagonal via
+ *       flip_quad_edges || (diamond && !((j+x)&1)) || (zigzag && !(j&1))
+ *     Renderer mesh, CPU raycast, hole fallback and this shape must all agree
+ *     or the surfaces differ by the full corner-to-corner height AT CELL
+ *     CENTRES -- which a vertex-sampled test can never detect, because every
+ *     triangulation agrees exactly at vertices.  The rule is therefore DATA
+ *     here, not a hidden default.
+ *
+ *  4. SAMPLE OWNERSHIP.  Bullet does not copy the height array.  This bridge
+ *     does, before returning, so no caller buffer can outlive the shape.
+ *
+ *  5. NO THICKNESS.  A heightfield is a surface, not a solid; a fast or
+ *     teleported body can pass through it.  CCD or a kill plane is the
+ *     caller's responsibility and is not provided here.
+ */
+
+typedef enum {
+    /* Both triangles of every quad split the same way. */
+    JCE_HEIGHTFIELD_DIAG_FIXED   = 0,
+    /* Alternate the diagonal in a checker pattern ("diamond"). */
+    JCE_HEIGHTFIELD_DIAG_DIAMOND = 1,
+    /* Alternate per row ("zigzag"). */
+    JCE_HEIGHTFIELD_DIAG_ZIGZAG  = 2
+} JceHeightfieldDiagonal;
+
+typedef struct {
+    jce_vec3     position;      /* world position of the field's MIN corner */
+    jce_quat     rotation;
+
+    const float *heights;       /* samples_x * samples_z, row-major, X fastest.
+                                   COPIED before return (convention 4). */
+    uint32_t     samples_x;     /* >= 2 */
+    uint32_t     samples_z;     /* >= 2 */
+
+    float        cell_size_x;   /* world spacing between samples in X */
+    float        cell_size_z;
+    float        min_height;    /* must bound `heights` (convention 2) */
+    float        max_height;
+
+    JceHeightfieldDiagonal diagonal;  /* convention 3 -- data, not a default */
+
+    float        friction;
+    float        restitution;
+    uint32_t     collision_group;
+    uint32_t     collision_mask;
+    bool         is_trigger;
+
+    /* Install a triangle-info map and the internal-edge contact adjustment.
+     * Without it a capsule or sphere sliding across a flat heightfield catches
+     * on the shared diagonal of every cell -- the single most-reported
+     * heightfield defect.  Costs a hash entry per triangle.  A drop-and-settle
+     * test cannot detect the difference; only a roll or slide can. */
+    bool         smooth_internal_edges;
+} JceHeightfieldBodyDesc;
+
+/* Create a STATIC heightfield body.  Returns JCE_BODY_INVALID and creates
+ * nothing on invalid dimensions, non-finite samples, non-positive cell sizes,
+ * or samples outside [min_height, max_height]. */
+JCE_API JceBodyHandle JCE_CALL jce_physics_body_create_heightfield(
+    JcePhysicsWorld *world, const JceHeightfieldBodyDesc *desc);
+
+/* ================================================================== */
 /* Body state queries                                                  */
 /* ================================================================== */
 

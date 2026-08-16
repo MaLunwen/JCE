@@ -21,15 +21,13 @@
  * correct at the cost of serialising the heavy step — an acceptable, documented
  * trade since archive reads are largely I/O bound.
  *
- * Worker model.  When `worker_count` > 0 the process-wide shared thread pool
- * (jce_thread_pool_shared) performs I/O + decompression off the main thread;
- * jce_archive_loader_tick() integrates completed loads into the cache on the
- * main thread.  `worker_count` is therefore advisory — it selects the worker
- * path, but the pool's size is process policy.  When `worker_count` == 0
- * — the single-core / WebAssembly baseline where worker parallelism is
- * unavailable — requests are serviced inline by tick(), bounded to
- * `frame_budget_ms` per call so a heavy load spreads across several frames
- * rather than producing one long stall (§14.1, §15).
+ * Worker model. The loader owns a bounded structured executor. When
+ * `worker_count` > 0 it performs I/O + decompression off the owner thread;
+ * jce_archive_loader_tick() integrates completions into the cache on the
+ * owner. When `worker_count` == 0, including the no-pthreads WebAssembly
+ * baseline, tick() cooperatively services at most one queued resource per
+ * call. A single decode is not preemptible, but multiple loads are spread
+ * across frames and submissions never execute inline.
  */
 #ifndef JCE_ARCHIVE_LOADER_H
 #define JCE_ARCHIVE_LOADER_H
@@ -61,8 +59,9 @@ typedef struct JceArchiveResource {
 typedef uint64_t JceArchiveRequestId;
 
 typedef struct JceArchiveLoaderConfig {
-    /* Worker threads for asynchronous loads.  0 selects the inline,
-     * frame-budgeted single-core path (no worker threads created). */
+    /* Worker threads for asynchronous loads. 0 selects the cooperative,
+     * frame-budgeted single-core path (no worker threads created). The
+     * implementation caps excessive requests to its process policy. */
     uint32_t worker_count;
     /* Soft cache budget in bytes for owned (decompressed) resources; the loader
      * evicts least-recently-used, unreferenced resources once exceeded.  0 =
@@ -125,9 +124,9 @@ JCE_API JceArchiveRequestId jce_archive_loader_request(JceArchiveLoader *loader,
 JCE_API int jce_archive_loader_poll(JceArchiveLoader *loader, JceArchiveRequestId id,
                                     const JceArchiveResource **out);
 
-/* Drive loading progress once per frame on the main thread: integrate completed
- * worker loads into the cache and, on the inline (worker_count == 0) path,
- * service queued loads bounded by the frame budget (spec §14.1). */
+/* Drive loading progress once per frame on the owner thread: integrate
+ * completed worker loads and, in cooperative mode, service one queued load
+ * within the configured pump budget (spec §14.1). */
 JCE_API void jce_archive_loader_tick(JceArchiveLoader *loader);
 
 /* Predictively warm the cache (e.g. during a loading screen, spec §14.2):

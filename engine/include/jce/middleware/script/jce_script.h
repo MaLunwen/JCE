@@ -32,7 +32,8 @@
  *       jce.apply_impulse(entity, x,y,z)       -- impulse on a dynamic body
  *       jce.set_velocity(entity, x,y,z)        -- set linear velocity
  *       jce.get_velocity(entity) -> x,y,z      (nil if no body)
- *       jce.play_sound(path [,x,y,z] [,vol])   -- one-shot 2D/3D sound
+ *       jce.play_sound(path [,x,y,z] [,vol [,min,max,rolloff]])
+ *                                              -- one-shot 2D/3D sound
  *       jce.ui_get_slider(entity) -> number    (nil if no slider)
  *       jce.ui_set_slider(entity, value)
  *       jce.ui_get_toggle(entity) -> bool      (nil if no toggle)
@@ -59,6 +60,9 @@
  *       jce.music_request_transition(segment)  -- beat/bar-quantized switch
  *       jce.asset_read_text(path) -> string|nil
  *                                              -- bounded virtual text asset
+ *       jce.asset_read_json(path) -> table|nil,error
+ *                                              -- strict bounded JSON asset;
+ *                                                 JSON null is jce.json_null
  *       jce.get_touch_count() -> integer       -- current frame touch sample
  *       jce.get_touch(index) -> id,x,y,p|nil   -- one-based touch lookup
  */
@@ -167,7 +171,13 @@ typedef struct JceScriptHost {
                       int op, float magnitude, float duration_seconds);
     /* Read a script or text asset (PAK / mounted dirs). Returns a heap buffer
      * the VM frees with jce_free, or NULL on miss. Required for
-     * jce_script_instantiate(path) and backs bounded jce.asset_read_text(). */
+     * jce_script_instantiate(path) and backs bounded asset reads.
+     *
+     * Bounded-call convention: a caller may initialize *out_size to a nonzero
+     * byte cap. A host that understands the convention rejects before a large
+     * allocation and leaves the full required size in *out_size. Legacy hosts
+     * may treat it as output-only; the VM still validates after the callback.
+     * Zero on entry means unbounded (used for loading the script itself). */
     void *(*read_file)(void *user, const char *path, uint64_t *out_size);
 
     /* ── Physics queries / forces (gameplay scripting depth) ───────────────
@@ -386,16 +396,49 @@ typedef struct JceScriptHost {
      * signature.
      *
      * set_parent / get_parent were first added after set_scale, i.e. in the
-     * middle, and the ABI snapshot gate caught it.  Appending is behaviourally
-     * identical and safe for an older consumer, whose shorter struct simply
-     * leaves these NULL — which callers must check anyway, as they already do
-     * for every optional host hook. */
+     * middle.  A HUMAN READING THE DIFF caught that — this comment used to
+     * credit the ABI snapshot gate, and the gate could not have: it compared
+     * the whole normalised record text and said CHANGED for an append and an
+     * insertion alike, so "append only" was a sentence nothing enforced.
+     *
+     * It is enforced now, by the ORDERED-PREFIX RULE in
+     * check_abi_snapshot.py: for a record in both the old and the
+     * new snapshot, the old member list must be a PREFIX of the new one.  An
+     * append passes; an insertion, a reorder or a rename fails and the report
+     * names the member and its index.  It runs unskippably in
+     * scripts/lint/run_all.py (`check_abi_snapshot.py --committed`) and in
+     * run_architecture_audit.py, and is covered by
+     * test_abi_ordered_prefix.py.
+     *
+     * Appending is behaviourally identical and safe for an older consumer,
+     * whose shorter struct simply leaves these NULL — which callers must
+     * check anyway, as they already do for every optional host hook. */
 
     /* Hierarchy ownership. Entity 0 means no parent. set_parent validates the
      * operation in the host and reports whether it was applied. */
     bool (*set_parent)(void *user, JceScriptEntity child,
                        JceScriptEntity parent, bool preserve_world);
     JceScriptEntity (*get_parent)(void *user, JceScriptEntity child);
+
+    /* Extended positional one-shot playback.  Appended for host ABI safety.
+     * Lua selects this callback only when all attenuation arguments are
+     * supplied: jce.play_sound(path,x,y,z,volume,min,max,rolloff).  Older
+     * hosts fall back to play_sound and retain the engine defaults. */
+    void (*play_sound_spatial)(void *user, const char *path,
+                               const float pos[3], float volume,
+                               float min_distance, float max_distance,
+                               float rolloff);
+
+    /* Game-content localization (L10n).  Appended for host ABI safety: an
+     * older host leaves these NULL and the Lua side degrades to key
+     * passthrough, which is exactly what jce_loc_t does when a key is
+     * missing -- so an unlocalized build shows keys, never empty strings.
+     *   loc_translate : key -> localized string, or the key itself
+     *   loc_get_locale: current locale name ("" before one is selected)
+     *   loc_set_locale: switch locale and reload its table at runtime */
+    const char *(*loc_translate)(void *user, const char *key);
+    const char *(*loc_get_locale)(void *user);
+    void        (*loc_set_locale)(void *user, const char *locale);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;
@@ -440,8 +483,95 @@ JCE_API JceScriptInstance jce_script_instantiate_source(JceScript *s,
                                                         const char *source,
                                                         JceScriptEntity owner);
 
+/* ── THE FAILING-CALLBACK RULE ────────────────────────────────────────────
+ *
+ * One rule, stated once here and obeyed by every JceScriptVM backend: WHEN A
+ * FIXED-NAME LIFECYCLE CALLBACK RAISES, IT IS CAUGHT, LOGGED, AND THEN
+ * DISABLED ON THAT INSTANCE.  Without the third clause a script that errors
+ * every frame writes one log line per frame forever — sixty a second, from a
+ * defect that was fully described by the first one.
+ *
+ * WHICH CALLBACK.  Exactly the handler that raised, on exactly the instance it
+ * raised on.  `on_update` failing on entity A leaves `on_collision` on A and
+ * `on_update` on B running.  The participating handlers are the REPEATING ones
+ * whose NAME is fixed by this header and therefore means the same thing in
+ * every backend:
+ *
+ *     on_start   on_update   on_collision   on_anim_event
+ *
+ * WHAT DOES NOT PARTICIPATE, AND WHY EACH DOES NOT.  Three exclusions, none of
+ * them an oversight; each is pinned by a named test so that "make it uniform"
+ * has to argue with something.
+ *
+ *   - `on_destroy`.  It is dispatched exactly once, by jce_script_release,
+ *     which drops the instance on the next line.  There is no second call for
+ *     a disable to suppress, so setting the flag would be a store nothing can
+ *     read and the notice below would tell the user to hot-reload an instance
+ *     that no longer exists — advice that is not merely useless but false.
+ *     Its error is still caught and logged.
+ *   - jce_script_call_message().  Its method name comes from the CALLER, and
+ *     the C++ backend routes every name through one `on_message` thunk, so
+ *     "the offending callback" has no identity the four backends share.
+ *   - jce_script_call_named() and its two siblings; see their own comment for
+ *     why a named global has nothing to be disabled on.
+ *
+ * Note what the four have in common and the three do not: each of the four can
+ * fire again, unboundedly, on the same instance.  That is the whole reason the
+ * rule exists.
+ *
+ * FOR HOW LONG.  For the life of the instance's current binding.  The disable
+ * never expires on its own — an expiry would just restart the spam.  It is
+ * lifted by exactly two things:
+ *
+ *   - jce_script_rebind_instance() (hot reload).  Rebinding is the engine
+ *     saying "the code behind this instance may have changed", so it clears
+ *     EVERY disabled handler on that instance.  Without this a script you
+ *     fixed and saved would stay dead until the process restarted, which is a
+ *     worse defect than the one the rule exists to fix.
+ *   - releasing the instance and instantiating it again (respawn, scene
+ *     reload, VM destroy).  A fresh instance has nothing disabled.
+ *
+ * HOW A USER FINDS OUT.  A disabled callback that reported nothing would be
+ * indistinguishable from one the script never declared, so the disable
+ * announces itself: immediately after the "<handler> error: <detail>" line,
+ * and through the SAME sinks (JceScriptHost::log and the engine log), the
+ * backend writes
+ *
+ *     <handler> disabled for this script instance after the error above;
+ *     hot-reload the script or respawn the entity to re-enable
+ *
+ * once, and then nothing further from that handler.  There is deliberately no
+ * query API: adding one would mean adding a JceScriptVM slot, and that vtable
+ * is pinned by a compile-time completeness assertion and by
+ * check_script_vm_parity.py.  The log line is the signal.
+ *
+ * *Enforced by:* tests/middleware/script/test_jce_script_disable.c (Lua, the
+ * reference), and cross-language by all three lifecycle differentials —
+ * tests/scripting/python/lifecycle_differential.py,
+ * tests/scripting/java/vm/run_lifecycle_differential.py and
+ * tests/scripting/cpp/test_jce_script_vm_cpp_lifecycle.cpp.  Each drives a
+ * handler that raises and then the SAME handler again, and compares the
+ * resulting host-call stream against Lua's; the python and java ones go on to
+ * rebind and require the handler back, while the cpp one pins the opposite for
+ * the reason given at jce_script_rebind_instance below.
+ */
+
+/* The EXACT text of the notice the rule above requires, spelled once so that
+ * four backends cannot each invent their own wording.  `%s` is the handler
+ * name.  The three lifecycle differentials compare this line byte for byte
+ * across languages (it carries no language-specific detail, unlike the error
+ * line above it, which is why it can be compared at all).
+ *
+ * The Python VM cannot include this header; scripting/python/jce_script/vm.py
+ * carries the same string and tests/scripting/python/test_emit_python.py ::
+ * test_the_disabled_notice_matches_the_engine fails if the two ever differ. */
+#define JCE_SCRIPT_DISABLED_NOTICE_FMT \
+    "%s disabled for this script instance after the error above; " \
+    "hot-reload the script or respawn the entity to re-enable"
+
 /* Lifecycle dispatch. Safe with invalid handles (no-op). Errors are caught,
- * logged, and disable that instance's offending callback for the run. */
+ * logged, and disable that instance's offending callback until the instance is
+ * rebound or replaced — see THE FAILING-CALLBACK RULE above. */
 JCE_API void jce_script_call_start (JceScript *s, JceScriptInstance inst);
 JCE_API void jce_script_call_update(JceScript *s, JceScriptInstance inst, float dt);
 JCE_API void jce_script_release    (JceScript *s, JceScriptInstance inst);
@@ -449,7 +579,10 @@ JCE_API void jce_script_release    (JceScript *s, JceScriptInstance inst);
 /* Dispatch on_collision(self, other_entity) — called by the runtime when the
  * instance's physics body begins contact with another body.  `other_entity` is
  * the other body's entity id (0 if it is untagged, e.g. the character capsule).
- * No-op when the script defines no on_collision. */
+ * No-op when the script defines no on_collision.  A runtime error inside the
+ * handler is caught, logged and DISABLES on_collision on that instance — see
+ * THE FAILING-CALLBACK RULE above; a body resting against a wall re-fires this
+ * as readily as on_update re-fires per frame. */
 JCE_API void jce_script_call_collision(JceScript *s, JceScriptInstance inst,
                                        JceScriptEntity other_entity);
 
@@ -463,7 +596,17 @@ JCE_API void jce_script_call_collision(JceScript *s, JceScriptInstance inst,
  * Tolerant by design (mirrors jce_script_call_collision): a no-op when `s` is
  * NULL / `inst` is invalid / the receiver defines no method named `msg_name`, so
  * a missing handler is a clean no-op rather than an error.  A runtime error
- * inside the handler is caught + logged via the host (never propagated). */
+ * inside the handler is caught + logged via the host (never propagated).
+ *
+ * WHY THIS DISPATCHER DOES NOT DISABLE.  `msg_name` is chosen
+ * by the caller, so there is no fixed handler identity for the rule above to
+ * name — and the C++ backend cannot supply one even in principle: it routes
+ * every message name through a single `on_message` thunk, so disabling "the
+ * offending callback" there would disable every message the instance receives.
+ * Rather than have the four backends mean different things by one sentence,
+ * this dispatcher keeps log-and-continue.  A message handler that errors on
+ * every send therefore still logs on every send; the send rate is set by the
+ * script that calls jce.send_message, not by the frame clock. */
 JCE_API void jce_script_call_message(JceScript *s, JceScriptInstance inst,
                                      const char *msg_name, double number_arg,
                                      const char *str_arg);
@@ -483,8 +626,8 @@ JCE_API void jce_script_call_message(JceScript *s, JceScriptInstance inst,
  * Tolerant by design (mirrors jce_script_call_message): a no-op when `s` is
  * NULL / `inst` is invalid / the receiver defines no `on_anim_event`, so a
  * missing handler is a clean no-op (most scripts won't define it) rather than
- * an error.  A runtime error inside the handler is caught + logged via the
- * host (never propagated). */
+ * an error.  A runtime error inside the handler is caught, logged and DISABLES
+ * on_anim_event on that instance — see THE FAILING-CALLBACK RULE above. */
 JCE_API void jce_script_call_anim_event(JceScript *s, JceScriptInstance inst,
                                         uint32_t id, const char *name,
                                         float f0, float f1, int i0);
@@ -501,7 +644,26 @@ JCE_API void jce_script_call_anim_event(JceScript *s, JceScriptInstance inst,
  * handler is caught, logged, and still counts as "invoked").  Returns false
  * (no-op) when s/fn_name is NULL/empty or no such global function exists, so
  * callers can treat "no handler" as a clean no-op.  Errors are caught + logged
- * via the host, mirroring the lifecycle dispatchers above. */
+ * via the host, mirroring the lifecycle dispatchers above.
+ *
+ * A NAMED GLOBAL IS NEVER DISABLED, and that is the deliberate exception to
+ * THE FAILING-CALLBACK RULE.  Three reasons, any one of them sufficient:
+ *
+ *   - the rule disables a callback ON AN INSTANCE, and a global has none.  In
+ *     Lua the handler lives in `_G` and is shared by every widget bound to the
+ *     name, so "disable it" would mean disabling all of them.
+ *   - the return value has no room for it.  `false` already means "no such
+ *     global", which every caller treats as a correctly-absent handler; a
+ *     disabled handler answering `false` would make a UISlider / UIToggle /
+ *     UIDropdown / UIInputField go silently dead with the widget reporting
+ *     nothing wrong, and answering `true` without calling would be a lie.
+ *   - the backends do not even agree on WHICH function a name resolves to
+ *     (Lua: one `_G` entry; Python: the newest instance's module namespace;
+ *     Java: a list of public static methods), so there is nothing stable to
+ *     attach a disable to.
+ *
+ * A global handler that errors on every click therefore logs on every click.
+ * That is a user-paced rate, not a frame-paced one. */
 JCE_API bool jce_script_call_named(JceScript *s, const char *fn_name,
                                    JceScriptEntity arg_entity);
 
@@ -543,7 +705,16 @@ JCE_API void jce_script_update_coroutines(JceScript *s, float dt);
  * Usage: mod = jce_script_compile_module(s, "@path", src, len); for each live
  * instance of that script: jce_script_rebind_instance(s, inst, mod); then
  * jce_script_release_module(s, mod) (rebound instances keep the module alive
- * via their metatable, so releasing the temp handle is safe). */
+ * via their metatable, so releasing the temp handle is safe).
+ *
+ * A rebind also CLEARS every callback THE FAILING-CALLBACK RULE disabled on
+ * that instance, because rebinding is the engine saying the code may have
+ * changed.  That is what makes "fix the script and save" a working repair: a
+ * handler disabled by an error in the old module runs again under the new one.
+ * (The "cpp" backend has no rebind — a compiled class cannot be recompiled
+ * in-process, its rebind_instance is a documented no-op, and its re-enable is
+ * jce_script_vm_cpp_unload + _load_library + re-instantiate, which is also its
+ * only hot-reload path.) */
 typedef uint32_t JceScriptModule;   /* 0 == invalid */
 
 JCE_API JceScriptModule jce_script_compile_module(JceScript *s, const char *name,

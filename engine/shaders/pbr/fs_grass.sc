@@ -28,6 +28,13 @@ uniform vec4 u_iblParams;
 // to grass/bush/ground alike) — without this the far grass rim stayed
 // crisp against the fogged ground and the diorama edge never dissolved.
 #include "fog_apply.sh"
+#include "shadow_debug.sh"
+
+/* Rides the PBR global bind, like u_cameraPos / u_dirLights below.  Declared
+ * here because this shader is self-contained: it has its own main() and its
+ * own copy of the cascade selection, so it inherits nothing from
+ * fs_pbr_body.sh. */
+uniform vec4 u_normalScale;   // z = JceSceneViewModeKind
 
 // ── CSM receive (lite port of fs_pbr_body's sampler) ────────────────────
 // The reference grass mesh is receiveShadow=true: tree/bush shadows drape
@@ -42,6 +49,9 @@ uniform mat4 u_csmVP[4];
 uniform vec4 u_csmSplits;
 uniform vec4 u_csmParams;      // x = inv shadow-map size, z = normal-offset
 uniform vec4 u_csmBiasScales;
+SAMPLER2D(s_cloudShadow, 3);
+uniform vec4 u_cloudShadow;   // x=extent  yz=centre XZ  w=strength
+#include "cloud_shadow.sh"
 SAMPLER2D(s_csmShadow0, 9);
 SAMPLER2D(s_csmShadow1, 10);
 SAMPLER2D(s_csmShadow2, 11);
@@ -134,6 +144,10 @@ void main()
     // applied only to the shadow-casting dir light below.
     float csmSh     = 1.0;
     int   shadowIdx = -1;
+    /* Cascade actually used, for view mode 9 -- taken from the selection
+     * below rather than recomputed, same rule as the other two shading
+     * paths. */
+    float dbgCascade = -1.0;
     if (u_lightCounts.w > 0.5 && u_csmSplits.x > 0.0)
     {
         shadowIdx = int(clamp(u_lightCounts.w - 1.0, 0.0, 1.0));
@@ -147,6 +161,7 @@ void main()
         if (csmSh < 0.0 && cascade < 3) { cascade = cascade + 1; csmSh = grass_sample_csm(cascade, v_worldpos, toL); }
         if (csmSh < 0.0 && cascade < 3) { cascade = cascade + 1; csmSh = grass_sample_csm(cascade, v_worldpos, toL); }
         if (csmSh < 0.0 && cascade < 3) { cascade = cascade + 1; csmSh = grass_sample_csm(cascade, v_worldpos, toL); }
+        dbgCascade = (csmSh < 0.0) ? -1.0 : float(cascade);
         if (csmSh < 0.0) csmSh = 1.0;      // beyond every cascade = lit
         // Cascade square-edge blend: with a coplanar mega-caster (e.g. the
         // ground plane toggled to cast) each cascade's bias balances its own
@@ -169,6 +184,22 @@ void main()
         // (the reference keeps fill + env light in its shadowed grass).
         csmSh = mix(0.5, 1.0, csmSh);
     }
+
+    /* A cloud overhead darkens the grass exactly as it darkens the ground the
+     * grass stands in. It did not: terrain sampled the baked map and the blades
+     * on it did not, so a cloud shadow crossing a field left lit grass standing
+     * in a dark patch.
+     *
+     * AFTER the whole cascade block, not inside it. The first attempt put this
+     * line between `if (csmSh < 0.0) csmSh = 1.0;` and the `else if` that
+     * follows it, which severed an if/else chain -- three compilers said so,
+     * in three different dialects, which is the useful half of a shader that
+     * has to build for all of them.
+     *
+     * Folded into csmSh so it multiplies the shadow-casting directional light
+     * and nothing else: a cloud does not dim the ambient sky term, it IS the
+     * sky term changing, and the environment already handles that. */
+    csmSh *= cloud_shadow_at(v_worldpos.xz);
 
     int numDir = int(u_lightCounts.x);
     /* Loop bound MUST be JCE_MAX_DIR_LIGHTS (2), NOT 4: u_dirLights is declared
@@ -199,6 +230,29 @@ void main()
                                   : vec3(0.0, 1.0, 0.0);
     color = apply_aerial_fog(color, v_viewdepth, v_worldpos,
                              u_cameraPos.xyz, fogSunDir);
+
+    /* Debug views.  This shader honoured none of them, and in a scene whose
+     * vegetation is 560 scattered grass and bush entities that meant 46% of
+     * the viewport was invisible to every debug view -- including the depth
+     * view a distance measurement depends on. The gap was found by the depth
+     * view itself: it emits greyscale, so any coloured geometry pixel is a
+     * shader that ignored it, and 46% of the frame stayed green.
+     *
+     * Reported from this shader's OWN cascade result. fs_grass.sc carries a
+     * third independent copy of the cascade selection (after fs_pbr_body.sh
+     * and csm_shadow.sh), so a view that re-derived the answer could show a
+     * cascade this shader never sampled -- which is exactly the divergence
+     * worth being able to see. */
+    float viewMode = u_normalScale.z;
+    if (viewMode > 7.5)
+    {
+        vec3 dbg;
+        if      (viewMode < 8.5) dbg = shadow_debug_depth_color(v_viewdepth, u_csmSplits.w);
+        else if (viewMode < 9.5) dbg = shadow_debug_cascade_color(dbgCascade);
+        else                     dbg = vec3_splat(csmSh);
+        gl_FragColor = vec4(dbg, 1.0);
+        return;
+    }
 
     // When postfx tonemap is enabled, keep linear output for post-processing.
     if (u_iblParams.w < 0.5)

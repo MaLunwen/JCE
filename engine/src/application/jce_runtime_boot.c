@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 
-static bool runtime_boot_path_is_virtual(const char *path)
+bool JCE_CALL jce_runtime_boot_scene_path_is_valid(const char *path)
 {
     size_t segment_start = 0;
     size_t len;
@@ -77,7 +77,8 @@ bool JCE_CALL jce_runtime_boot_manifest_parse(
         if (!contract || strcmp(contract, JCE_RUNTIME_BOOT_CONTRACT) != 0 ||
             schema < 1 || schema > JCE_RUNTIME_BOOT_SCHEMA_VERSION ||
             !startup_scene ||
-            (startup_scene[0] && !runtime_boot_path_is_virtual(startup_scene))) {
+            (startup_scene[0] &&
+             !jce_runtime_boot_scene_path_is_valid(startup_scene))) {
             goto done;
         }
     }

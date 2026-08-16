@@ -335,8 +335,7 @@ JceWorldStreamer *jce_world_streamer_create(
     }
 
     jce_streaming_set_filesystem(ws->ss, fs);
-    if (thread_pool)
-        jce_streaming_set_thread_pool(ws->ss, thread_pool);
+    (void)thread_pool;
 
     jce_streaming_set_callbacks(ws->ss, on_chunk_loaded, on_chunk_unloaded, ws);
 
@@ -407,9 +406,9 @@ static uint64_t roster_residency_bytes(JceWorldStreamer *ws, ChunkRoster *r)
  * once its detailed geometry streams in — the shipped exe no longer
  * double-draws / z-fights the proxy box over the real buildings.  The proxies
  * are always-resident entities named "HLOD_<gx>_<gz>" baked into the master
- * scene (build/gen_hlod.py); we map chunk id -> proxy entity once at attach
- * from the scene's authored streaming table.  See the header for the rationale
- * behind matching by the proxy's EditorMeta name (survives cook in both
+ * scene (tools/worldgen/gen_hlod.py); we map chunk id -> proxy entity once at
+ * attach from the scene's authored streaming table.  See the header for the
+ * rationale behind matching by the proxy's EditorMeta name (survives cook in both
  * builds — verified against the cooked street_demo master scene). */
 
 /* Parse "<dir>/cell_<gx>_<gz>.scene.json" -> the proxy name "HLOD_<gx>_<gz>".

@@ -61,11 +61,20 @@ typedef struct JceRenderRecommendation {
     /* Shadow map resolution (px). */
     uint32_t   shadow_map_size;
 
-    /* Maximum number of post-processing effects to enable. */
-    uint32_t   max_postfx;
-
-    /* Enable PBR (IBL + multi-light) vs. simple Blinn-Phong. */
-    bool       enable_pbr;
+    /* ADVISORY ONLY - nothing in the engine reads these two.
+     *
+     * They describe what a tier "should" do, and the tier log used to print
+     * them as if they were in effect ("pbr=off postfx=1" on the LOW tier while
+     * PBR was running and the full chain was available).  That cost real
+     * debugging time: a divergence hunt spent a pass on "PBR is off at LOW"
+     * before a grep showed the field has zero consumers.  Either wire them or
+     * delete them; until then the log must not claim they are applied.
+     *
+     * What DOES clamp the low tiers is the render-pipeline floor in
+     * jce_render_pipeline.c (post_quality, cascades, TAA/SSR/fog/HDR) plus
+     * shadow_map_size below, all of which are genuinely consumed. */
+    uint32_t   max_postfx;      /* advisory: no consumer */
+    bool       enable_pbr;      /* advisory: no consumer */
 
     /* Enable bloom post-processing. */
     bool       enable_bloom;
@@ -88,8 +97,13 @@ typedef struct JceRenderRecommendation {
        memory-prohibitive on 512MB GPUs. */
     bool       enable_taa;
 
-    /* Enable volumetric fog (3D-texture based).
-       OFF unless the GPU supports compute shaders + 3D textures. */
+    /* Enable volumetric fog.  A fullscreen raymarch in a FRAGMENT shader --
+       no compute, no 3D texture; it runs anywhere the backend can draw a
+       quad, WebGL2 included.  Cost scales with step count, so what gates it
+       is the tier, not a capability probe.
+
+       NOTE: nothing reads this field.  The pass is actually gated by
+       jce_render_pipeline's per-tier presets and by the LOW-tier floor. */
     bool       enable_volumetric_fog;
 
     /* Enable GPU particle simulation (compute-driven).

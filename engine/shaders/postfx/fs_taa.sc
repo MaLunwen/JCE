@@ -44,7 +44,17 @@ void main()
     /* Reproject. Motion vectors stored in [-1,1] NDC delta encoded in
      * [0,1] : decoded as mv * 2 - 1.  Subtract from current UV → prev UV. */
     vec2 mv = texture2D(s_texMotion, v_texcoord0).xy * 2.0 - 1.0;
-    vec2 prev_uv = v_texcoord0 - mv * 0.5;  /* /2 because NDC = 2*UV-1 */
+    /* NDC delta -> UV delta.  On GL (bottom-left origin, vs_postfx already
+       flipped v) uv = (ndc+1)/2, so duv = +dndc/2.  On D3D/VK/Metal (top-left)
+       uv.y = (1-ndc.y)/2, so duv.y = -dndc.y/2.  Must stay in lockstep with
+       fs_motion_vec.sc and fs_gbuffer_vel.sc, which both write TRUE clip-NDC
+       deltas -- this was unconditional, so it was right on GL and inverted on
+       D3D, which is vertical smearing rather than reprojection. */
+#if BGFX_SHADER_LANGUAGE_GLSL
+    vec2 prev_uv = v_texcoord0 - mv * 0.5;
+#else
+    vec2 prev_uv = v_texcoord0 - vec2(mv.x, -mv.y) * 0.5;
+#endif
 
     vec4 hist = texture2D(s_texHistory, prev_uv);
 

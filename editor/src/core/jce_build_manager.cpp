@@ -17,6 +17,7 @@
 #include "jce_build_manager.h"
 
 #include "jce_binary_embed.h"
+#include "jce_build_asset_policy.h"
 #include "jce_editor_project.h"
 #include "jce_dist_content_graph.h"
 #include "jce_dist_audit.h"
@@ -28,6 +29,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_process.h>
 #include <jce/os/core/jce_thread.h>
@@ -80,6 +82,10 @@ struct Build {
     int           exit_code       = 0;
     std::string   preset;
     std::string   last_error;
+    std::string   artifact_path;
+    std::string   package_path;
+    std::string   asset_bom_path;
+    std::string   dist_audit_path;
     std::string   stdout_partial;
     std::string   stderr_partial;
     uint64_t      stop_deadline_ms = 0;
@@ -145,6 +151,14 @@ void reset_pipeline()
     g_finish = FinishPlan{};
 }
 
+void clear_build_outputs()
+{
+    g_build.artifact_path.clear();
+    g_build.package_path.clear();
+    g_build.asset_bom_path.clear();
+    g_build.dist_audit_path.clear();
+}
+
 /* ---------------------------------------------------------------- *
  * Worker-thread log redirect.                                       *
  *                                                                   *
@@ -154,7 +168,7 @@ void reset_pipeline()
  * console ring buffer and the ImGui toast path, neither of which is *
  * thread-safe.  While a sink is installed on the calling thread we  *
  * capture entries here and replay them on the main thread once the  *
- * worker is joined (poll_asset_prep).                               *
+ * structured task completes.                                       *
  * ---------------------------------------------------------------- */
 struct DeferredLogEntry {
     JceConsoleLevel level;
@@ -171,8 +185,8 @@ thread_local WorkerLogSink *t_log_sink = nullptr;
  *                                                                   *
  * prepare_project_generated_assets() is the heavy, UI-freezing step *
  * of a project build (ZSTD archive cook + file writes + embed       *
- * object generation).  It is moved onto a dedicated worker thread;  *
- * the main thread polls `done` each frame and, on success, builds   *
+ * object generation). It is submitted as structured background work;*
+ * the owner-thread completion callback, on success, builds          *
  * the cmake configure/compile queue and spawns it.  All inputs the  *
  * cook needs and all context the post-cook pipeline construction    *
  * needs are captured up-front so the worker touches no shared       *
@@ -206,16 +220,15 @@ struct PendingProjectBuild {
     bool        want_package = false;
     std::string package_out_dir, app_name, app_version;
 
-    /* Worker plumbing */
-    JceThread    *thread = nullptr;
-    JceAtomicI32 *done   = nullptr;   /* 0 running, 1 finished */
-    JceAtomicI32 *cancel = nullptr;   /* set by request_stop */
-    bool          ok     = false;
+    /* Structured background plumbing */
+    JceAsyncTask *task = nullptr;
+    bool          stop_requested = false;
+    bool          ok = false;
     WorkerLogSink sink;
 };
 PendingProjectBuild g_pending;
 
-void poll_asset_prep();           /* main thread, per-frame */
+void poll_asset_prep();           /* compatibility no-op */
 void asset_prep_shutdown();       /* main thread, on editor exit */
 bool asset_prep_active();         /* a cook/pack is in flight */
 
@@ -455,6 +468,7 @@ bool run_dist_audit(const std::string &exe, const char *package_dir)
 void run_finish_plan()
 {
     std::string exe = resolve_artifact();
+    g_build.artifact_path = exe;
 
     if (g_finish.verify) {
         if (exe.empty()) {
@@ -500,13 +514,13 @@ void run_finish_plan()
         set_error("package: cannot create output dir: " + out);
         return;
     }
-
     std::string dst_exe = out + PATH_SEP_CHR_LOCAL + g_finish.exe_name;
     if (!jce_fs_host_copy_file(exe.c_str(), dst_exe.c_str())) {
         g_build.state = JCE_BUILD_FAILED;
         set_error("package: failed to copy exe to " + dst_exe);
         return;
     }
+    g_build.package_path = out;
 
     /* Dist is a one-file public package.  Authoring configs, symbols, BOMs,
      * and audit data remain under the private build/reports tree. */
@@ -777,7 +791,7 @@ void jce_build_manager_init(void)
 
 void jce_build_manager_shutdown(void)
 {
-    asset_prep_shutdown();   /* join any in-flight cook/pack worker */
+    asset_prep_shutdown();   /* retire any in-flight cook/pack task */
     if (g_build.process) {
         jce_process_force_kill(g_build.process);
         release_process();
@@ -787,7 +801,7 @@ void jce_build_manager_shutdown(void)
 
 void jce_build_manager_poll(void)
 {
-    poll_asset_prep();   /* advance a background cook/pack into compile */
+    poll_asset_prep();   /* compatibility hook */
     poll_state();
 }
 
@@ -887,6 +901,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
         return false;
     }
     reset_pipeline();   /* drop any stale native-pipeline queue/finish plan */
+    clear_build_outputs();
 
     const char *wd = (cfg->working_dir && cfg->working_dir[0])
                          ? cfg->working_dir
@@ -1024,12 +1039,12 @@ void jce_build_manager_set_default_working_dir(const char *dir)
 
 void jce_build_manager_request_stop(void)
 {
-    /* If the cook/pack worker is in flight there is no child process yet;
-     * flag the pending build so poll_asset_prep() aborts before the
-     * (heavy) compile is spawned.  The cook itself is a single call and
-     * cannot be interrupted mid-flight. */
-    if (g_pending.active && g_pending.cancel) {
-        jce_atomic_i32_store(g_pending.cancel, 1);
+    /* If cook/pack is in flight there is no child process yet. Request
+     * cooperative cancellation and retain an owner-thread stop flag so a
+     * task that completed just before this click still cannot spawn compile. */
+    if (g_pending.active && g_pending.task) {
+        g_pending.stop_requested = true;
+        jce_async_task_cancel(g_pending.task);
         log_line(JCE_CONSOLE_INFO,
                  "[build] stop requested; will abort after cook completes");
         return;
@@ -1050,12 +1065,21 @@ bool jce_build_manager_is_running(void)
 void jce_build_manager_get_status(JceBuildStatus *out)
 {
     if (!out) return;
+    *out = JceBuildStatus{};
     out->state     = g_build.state;
     out->stage     = g_build.stage;
     out->exit_code = g_build.exit_code;
     snprintf(out->preset, sizeof(out->preset), "%s", g_build.preset.c_str());
     snprintf(out->last_error, sizeof(out->last_error), "%s",
              g_build.last_error.c_str());
+    snprintf(out->artifact_path, sizeof(out->artifact_path), "%s",
+             g_build.artifact_path.c_str());
+    snprintf(out->package_path, sizeof(out->package_path), "%s",
+             g_build.package_path.c_str());
+    snprintf(out->asset_bom_path, sizeof(out->asset_bom_path), "%s",
+             g_build.asset_bom_path.c_str());
+    snprintf(out->dist_audit_path, sizeof(out->dist_audit_path), "%s",
+             g_build.dist_audit_path.c_str());
 }
 
 /* ---------------------------------------------------------------- *
@@ -1195,42 +1219,6 @@ std::string slash_norm(std::string in)
     return in;
 }
 
-bool path_has_segment(const std::string &path, const char *segment)
-{
-    if (!segment || !segment[0])
-        return false;
-    size_t pos = 0;
-    while (pos <= path.size()) {
-        size_t next = path.find('/', pos);
-        size_t len = (next == std::string::npos) ? path.size() - pos
-                                                 : next - pos;
-        if (len == std::strlen(segment) &&
-            path.compare(pos, len, segment) == 0) {
-            return true;
-        }
-        if (next == std::string::npos)
-            break;
-        pos = next + 1;
-    }
-    return false;
-}
-
-bool path_has_hidden_segment(const std::string &path)
-{
-    size_t pos = 0;
-    while (pos <= path.size()) {
-        size_t next = path.find('/', pos);
-        size_t len = (next == std::string::npos) ? path.size() - pos
-                                                 : next - pos;
-        if (len > 0 && path[pos] == '.')
-            return true;
-        if (next == std::string::npos)
-            break;
-        pos = next + 1;
-    }
-    return false;
-}
-
 std::string make_relative_vpath(const std::string &abs_path,
                                 const std::string &root)
 {
@@ -1358,8 +1346,8 @@ bool collect_asset_walk_cb(const char *path, bool is_dir, void *user)
         return true;
 
     std::string rel = make_relative_vpath(path, ctx->root);
-    if (rel.empty() || path_has_segment(rel, "raw_assets") ||
-        path_has_hidden_segment(rel) || shader_profile_unreachable(rel)) {
+    if (!jce_build_asset_path_is_publishable(rel) ||
+        shader_profile_unreachable(rel)) {
         return true;
     }
 
@@ -1471,6 +1459,36 @@ bool append_runtime_boot_asset(const std::string &project,
     item.bytes.assign((const uint8_t *)text,
                       (const uint8_t *)text + text_size);
     jce_json_free_string(text);
+    items.push_back(std::move(item));
+    return true;
+}
+
+bool append_runtime_input_actions_asset(
+    const std::string &project,
+    std::vector<ProjectAssetInput> &items,
+    std::string &error)
+{
+    const std::string path = project + PATH_SEP_CHR_LOCAL + ".jce" +
+                             PATH_SEP_CHR_LOCAL + "input_actions.json";
+    uint64_t size = 0;
+    void *raw;
+
+    if (!jce_fs_host_exists_file(path.c_str()))
+        return true;
+    raw = jce_fs_host_read_all(path.c_str(), &size);
+    if (!raw) {
+        error = "cannot read runtime input actions: " + path;
+        return false;
+    }
+
+    ProjectAssetInput item;
+    item.abs_path = path;
+    item.vpath = "settings/input_actions.json";
+    item.protect_path = true;
+    item.bytes.resize((size_t)size);
+    if (size)
+        std::memcpy(item.bytes.data(), raw, (size_t)size);
+    jce_fs_buffer_free(raw);
     items.push_back(std::move(item));
     return true;
 }
@@ -1926,6 +1944,10 @@ bool prepare_project_generated_assets(const std::string &project,
         set_error("assets: " + error);
         return false;
     }
+    if (!append_runtime_input_actions_asset(project, items, error)) {
+        set_error("assets: " + error);
+        return false;
+    }
 
     std::sort(items.begin(), items.end(),
               [](const ProjectAssetInput &a, const ProjectAssetInput &b) {
@@ -2346,12 +2368,15 @@ bool project_cache_needs_reset(const std::string &cache_path,
 
 bool asset_prep_active() { return g_pending.active; }
 
-/* WORKER thread: run the whole cook/pack/embed.  All log/error output is
- * captured into the job's sink (see t_log_sink) and replayed on the main
- * thread by poll_asset_prep(). */
-void asset_prep_worker(void *arg)
+/* Background work: run the whole cook/pack/embed. All log/error output is
+ * captured into the job's sink (see t_log_sink) and replayed by the
+ * owner-thread completion. */
+JceAsyncRunResult asset_prep_worker(JceAsyncContext *ctx, void *arg)
 {
     PendingProjectBuild *p = (PendingProjectBuild *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
     t_log_sink = &p->sink;
     p->ok = prepare_project_generated_assets(
         p->project, p->sdk, p->cooked, p->bundles, p->variant,
@@ -2362,7 +2387,17 @@ void asset_prep_worker(void *arg)
         p->graph_assets, p->out_graph_snapshot,
         p->out_bundle_dir, p->out_pak_key_c);
     t_log_sink = nullptr;
-    jce_atomic_i32_store(p->done, 1);
+
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    if (!p->ok) {
+        jce_async_context_fail(
+            ctx, 1, p->sink.last_error.empty()
+                        ? "asset cook/pack failed"
+                        : p->sink.last_error.c_str());
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
 /* MAIN thread: the cook succeeded — build the cmake configure/compile
@@ -2476,6 +2511,8 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         g_finish.audit_report = p.reports_dir + PATH_SEP_CHR_LOCAL +
                                 p.target + "_dist_audit.json";
     }
+    g_build.asset_bom_path = g_finish.asset_bom_src;
+    g_build.dist_audit_path = g_finish.audit_report;
     if (p.encrypt_assets && !p.cooked.empty())
         g_finish.warn_loose_dir = p.output_dir + PATH_SEP_CHR_LOCAL +
                                   join_norm_sep(p.cooked);
@@ -2527,72 +2564,95 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
     }
 }
 
-/* MAIN thread, per-frame: pick up a finished cook/pack and continue. */
-void poll_asset_prep()
+/* OWNER thread: consume cook/pack results and continue into the CMake
+ * pipeline. This callback runs even when the Build panel is hidden. */
+void asset_prep_complete(JceAsyncTask *task, void *arg)
 {
-    if (!g_pending.active) return;
-    if (!g_pending.done || jce_atomic_i32_load(g_pending.done) == 0)
-        return;   /* worker still running */
+    PendingProjectBuild *p = (PendingProjectBuild *)arg;
+    JceAsyncState state = jce_async_task_state(task);
 
-    if (g_pending.thread) {
-        jce_thread_join(g_pending.thread);
-        g_pending.thread = nullptr;
-    }
-
-    /* Replay the worker's captured log/error lines now, on the thread
+    /* Replay captured log/error lines now, on the thread
      * where the console + toast path is safe. */
-    for (const DeferredLogEntry &e : g_pending.sink.entries)
+    for (const DeferredLogEntry &e : p->sink.entries)
         jce_editor_console_log_level(e.level, "%s", e.text.c_str());
-    g_pending.sink.entries.clear();
+    p->sink.entries.clear();
 
-    const bool cancelled =
-        g_pending.cancel && jce_atomic_i32_load(g_pending.cancel) != 0;
-    const bool ok = g_pending.ok;
-    const std::string sink_error = g_pending.sink.last_error;
-
-    if (g_pending.done)   { jce_atomic_i32_destroy(g_pending.done);   g_pending.done = nullptr; }
-    if (g_pending.cancel) { jce_atomic_i32_destroy(g_pending.cancel); g_pending.cancel = nullptr; }
+    const bool cancelled = p->stop_requested ||
+                           state == JCE_ASYNC_STATE_CANCELLED;
+    const bool ok = state == JCE_ASYNC_STATE_SUCCEEDED && p->ok;
+    const std::string sink_error = p->sink.last_error;
+    p->active = false;
+    p->task = nullptr;
 
     if (cancelled) {
-        g_pending.active   = false;
         g_build.state      = JCE_BUILD_FAILED;
         g_build.last_error = "build stopped before compile";
         log_line(JCE_CONSOLE_WARNING,
                  "[build] cook/pack finished; build stopped before compile");
         reset_pipeline();
-        std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
-        return;
-    }
-    if (!ok) {
-        g_pending.active   = false;
+    } else if (!ok) {
         g_build.state      = JCE_BUILD_FAILED;
         g_build.last_error = sink_error.empty()
             ? std::string("asset cook/pack failed") : sink_error;
         reset_pipeline();
-        std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
-        return;
+    } else {
+        /* Success: build the cmake queue + spawn it (state stays RUNNING). */
+        finalize_project_build_pipeline(*p);
     }
 
-    /* Success: build the cmake queue + spawn it (state stays RUNNING). */
-    g_pending.active = false;
-    finalize_project_build_pipeline(g_pending);
-    std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
+    std::memset(p->pak_key, 0, sizeof(p->pak_key));
+    jce_async_task_release(task);
 }
 
-/* MAIN thread, on editor shutdown: join any in-flight worker so it does
- * not write into freed state after teardown. */
+/* Compatibility hook retained by jce_build_manager_poll(). */
+void poll_asset_prep()
+{
+}
+
+/* MAIN thread, on editor shutdown: cancel and pump owner-thread completion
+ * before tearing down build state. */
 void asset_prep_shutdown()
 {
     if (!g_pending.active) return;
-    if (g_pending.thread) {
-        jce_thread_join(g_pending.thread);
-        g_pending.thread = nullptr;
+    g_pending.stop_requested = true;
+    if (g_pending.task) {
+        jce_async_task_cancel(g_pending.task);
+        while (g_pending.task) {
+            jce_async_default_pump(nullptr);
+            if (g_pending.task)
+                jce_thread_sleep_ms(1);
+        }
     }
-    if (g_pending.done)   { jce_atomic_i32_destroy(g_pending.done);   g_pending.done = nullptr; }
-    if (g_pending.cancel) { jce_atomic_i32_destroy(g_pending.cancel); g_pending.cancel = nullptr; }
     g_pending.sink.entries.clear();
     std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
     g_pending.active = false;
+}
+
+/* The `variant:` line an SDK stamps into its own VERSION.txt, or "" when the
+ * tree has no such stamp (older SDK, or a hand-assembled one). */
+std::string sdk_stamped_variant(const std::string &sdk)
+{
+    const std::string vf = sdk + PATH_SEP_CHR_LOCAL + "VERSION.txt";
+    uint64_t sz = 0;
+    char *raw = (char *)jce_fs_host_read_all(vf.c_str(), &sz);
+    if (!raw) return std::string();
+    const std::string text(raw, (size_t)sz);
+    jce_fs_buffer_free(raw);
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.rfind("variant:", 0) != 0) continue;
+        std::string v = line.substr(8);
+        size_t b = v.find_first_not_of(" \t\r");
+        if (b == std::string::npos) return std::string();
+        size_t e = v.find_last_not_of(" \t\r");
+        return v.substr(b, e - b + 1);
+    }
+    return std::string();
 }
 
 } // namespace
@@ -2618,6 +2678,7 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     }
 
     reset_pipeline();
+    clear_build_outputs();
 
     const std::string project = join_norm_sep(cfg->project_dir);
     const std::string sdk     = join_norm_sep(cfg->sdk_dir);
@@ -2655,6 +2716,43 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
         } else {
             set_error("SDK CMake package not found under " + sdk +
                       " (expected lib/cmake/JCE/JCEConfig.cmake)");
+            return false;
+        }
+    }
+
+    /* A project build does NOT build the engine — it configures the project
+     * against this prebuilt SDK, whose fat lib already has the patented codec
+     * adapters (AAC / H.264 / H.265) compiled in or out. -DJCE_BUILD_VARIANT
+     * below therefore cannot subtract them, and JCEConfig.cmake links the core
+     * archive with /WHOLEARCHIVE, so a release SDK drags every fdk-aac /
+     * OpenH264 / libhevc object into a bundle the UI labels "dist". The
+     * engine-tree asserts that guard this never run here: add_subdirectory
+     * (engine) is not on this path. Variant and SDK arrive as two independent
+     * inputs (the --dist checkbox vs. the Build Profiles SDK field / project
+     * sdk_path / JCE_SDK_DIR), so nothing tied them together. Compare the
+     * SDK's own stamp against the requested variant. */
+    {
+        const std::string stamped = sdk_stamped_variant(sdk);
+        const std::string want    = (variant == "dist") ? "dist" : "release";
+        if (stamped.empty()) {
+            if (want == "dist") {
+                log_line(JCE_CONSOLE_WARNING,
+                         "[build] SDK at " + sdk + " has no `variant:` stamp "
+                         "- cannot verify it is royalty-free.");
+            }
+        } else if (stamped != want) {
+            if (want == "dist") {
+                set_error("dist build against a '" + stamped + "' SDK at " +
+                          sdk + ". A prebuilt SDK's patented codecs (AAC / "
+                          "H.264 / H.265) cannot be removed at project-"
+                          "configure time, so this would ship them in a bundle "
+                          "labelled royalty-free. Point the SDK root at a dist "
+                          "SDK (built with `jce.py sdk --variant dist`).");
+            } else {
+                set_error("release build against a '" + stamped + "' SDK at " +
+                          sdk + ". Point the SDK root at a release SDK "
+                          "(built with `jce.py sdk --variant release`).");
+            }
             return false;
         }
     }
@@ -2760,8 +2858,8 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
      * object generation) is the slow, UI-freezing part of a build, so it
      * runs on a worker thread.  Capture everything the cook needs AND
      * everything the post-cook cmake pipeline construction needs, then
-     * launch the worker; poll_asset_prep() picks up the result on the
-     * main thread and spawns cmake/ninja. */
+     * submit the task; its owner-thread completion builds the CMake/Ninja
+     * pipeline. */
     PendingProjectBuild &p = g_pending;
     p = PendingProjectBuild{};   /* clears any stale fields/pointers */
     p.project           = project;
@@ -2798,8 +2896,6 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     p.app_version = (cfg->app_version && cfg->app_version[0])
                         ? cfg->app_version : "";
 
-    p.done   = jce_atomic_i32_create(0);
-    p.cancel = jce_atomic_i32_create(0);
     p.active = true;
 
     /* Flip status to RUNNING up-front so the UI shows progress and any
@@ -2814,13 +2910,22 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     log_line(JCE_CONSOLE_INFO,
              "[build] cooking + packing project assets in background…");
 
-    p.thread = jce_thread_create(asset_prep_worker, &p, "jce_build_cook");
-    if (!p.thread) {
-        /* No worker thread available: run the cook inline then drive the
-         * same completion path synchronously. */
-        asset_prep_worker(&p);
-        poll_asset_prep();
-        return g_build.state != JCE_BUILD_FAILED;
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = asset_prep_worker;
+    desc.complete = asset_prep_complete;
+    desc.user_data = &p;
+    desc.debug_name = "editor.build.prepare_assets";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+
+    p.task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!p.task) {
+        p.active = false;
+        g_build.state = JCE_BUILD_FAILED;
+        set_error("asset cook/pack queue is full");
+        std::memset(p.pak_key, 0, sizeof(p.pak_key));
+        reset_pipeline();
+        return false;
     }
     return true;
 }

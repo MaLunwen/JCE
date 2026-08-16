@@ -49,6 +49,8 @@
 
 #include <jce/os/core/jce_defs.h>
 
+#include <stdbool.h>
+
 JCE_EXTERN_C_BEGIN
 
 /* Opaque Tessendorf FFT ocean state.  Holds the immutable initial spectrum
@@ -86,6 +88,52 @@ JCE_API float JCE_CALL
 jce_water_fft_sample_height(const JceWaterFft *fft, float world_x, float world_z);
 
 /* Grid resolution N (power of two).  0 for NULL. */
+/* One point on the parametric FFT surface.
+ *
+ * The surface is NOT a height map: vs_water.sc draws the vertex authored at
+ * world (x,z) at (x + disp_x, base_y + height, z + disp_z).  Asking for "the
+ * height at world p" therefore requires inverting that displacement, which is
+ * what jce_water_fft_sample_surface does.  grid_x/grid_z are the recovered
+ * authored coordinates -- the point the GPU actually drew at p. */
+typedef struct {
+    float height;    /* h at the recovered grid point (add base_y for world Y) */
+    float grid_x;    /* recovered authored X */
+    float grid_z;    /* recovered authored Z */
+    float disp_x;    /* horizontal chop applied at that point */
+    float disp_z;
+
+    /* Filled from the auxiliary fields when they are enabled, so a caller gets
+     * them for the price of the solve it already paid for.  Defaults are the
+     * "undisturbed" answers, not zero: a zero Jacobian would read as a folded
+     * surface and a zero gradient is a legitimate flat one, so only `jacobian`
+     * needs the distinction.
+     *
+     *   slope_x/slope_z  exact dh/dx, dh/dz   (jce_water_fft_enable_slopes)
+     *                    0 when slopes are off
+     *   jacobian         fold determinant     (jce_water_fft_enable_foam)
+     *                    1 when foam is off */
+    float slope_x;
+    float slope_z;
+    float jacobian;
+} JceWaterFftSample;
+
+/* Solve x + D(x) = (world_x, world_z) by fixed-point iteration, then evaluate
+ * the surface there.  `iterations` is clamped to [1,16]; 4 is the production
+ * norm.  Fills `out` with zeros when the field has never been evolved. */
+JCE_API void JCE_CALL jce_water_fft_sample_surface(const JceWaterFft *fft,
+                                                   float world_x, float world_z,
+                                                   int iterations,
+                                                   JceWaterFftSample *out);
+
+/* Convenience: the height component of jce_water_fft_sample_surface.
+ *
+ * Prefer this over jce_water_fft_sample_height for anything that must agree
+ * with what is on screen.  The older function samples h(p) directly, which
+ * ignores the horizontal chop and is therefore wrong by exactly that amount --
+ * worst at crests, where buoyancy needs it most. */
+JCE_API float JCE_CALL jce_water_fft_sample_height_displaced(
+    const JceWaterFft *fft, float world_x, float world_z, int iterations);
+
 JCE_API int JCE_CALL jce_water_fft_resolution(const JceWaterFft *fft);
 
 /* World-space patch side length the fields tile over.  0 for NULL. */
@@ -97,6 +145,79 @@ JCE_API float JCE_CALL jce_water_fft_patch_size(const JceWaterFft *fft);
 JCE_API const float *JCE_CALL jce_water_fft_height_data(const JceWaterFft *fft);
 JCE_API const float *JCE_CALL jce_water_fft_disp_x_data(const JceWaterFft *fft);
 JCE_API const float *JCE_CALL jce_water_fft_disp_z_data(const JceWaterFft *fft);
+
+/* Rebuild the initial spectrum from JONSWAP instead of raw Phillips.
+ *
+ * Phillips has no FETCH, so it cannot distinguish the same wind blowing across
+ * a pond from the same wind blowing across an ocean -- which is the single
+ * control that makes a sea look like a SPECIFIC sea.  `fetch` is that distance
+ * in metres; `swell` in [0,1] adds a Horvath long-period component.
+ *
+ * OPT-IN ON PURPOSE.  Switching spectra changes every height value, so any
+ * golden-hash or golden-image baseline over the water field is a deliberate
+ * rebaseline -- never a side effect of a build.  Phillips stays the default.
+ *
+ * Returns false for a NULL field or one that has already been evolved: h0 is
+ * the field's identity, and swapping it mid-flight would teleport every wave. */
+JCE_API bool JCE_CALL jce_water_fft_use_jonswap(JceWaterFft *fft,
+                                                float wind_speed, float fetch,
+                                                float swell, unsigned int seed);
+
+/* ── Exact surface gradient (Tessendorf eq. 37) ────────────────────────
+ *
+ * OPT-IN, because it costs two more inverse transforms per evolve -- a
+ * two-thirds increase in FFT work -- and a caller that only needs heights
+ * should not pay for gradients it never reads.
+ *
+ * Why not just central-difference the height field?  Because that is wrong
+ * exactly where it shows.  A finite difference across a sharp crest straddles
+ * the peak and reports a gentler slope than the surface really has, so the
+ * specular highlight along a breaking wave -- the most visible part of an
+ * ocean -- is the part the approximation damages most.  i*k*h is the analytic
+ * derivative of the same series the heights came from, so it is exact at every
+ * sample rather than only where the surface is smooth.
+ *
+ * NOTE the field named disp_x/disp_z is the horizontal CHOPPY DISPLACEMENT
+ * (-i*(k/|k|)*h), not a gradient; the two differ by using the unit wavevector
+ * versus the full one, and neither can be derived from the other.
+ *
+ * Enabling re-evolves at the current time, so the slope fields are valid the
+ * moment the call returns.  Returns false only if the allocation failed, in
+ * which case the field is untouched and slopes stay off. */
+JCE_API bool JCE_CALL jce_water_fft_enable_slopes(JceWaterFft *fft);
+
+/* N*N spatial dh/dx and dh/dz, row-major, valid until the next evolve.
+ * NULL when slopes were never enabled -- which is a deliberate signal to the
+ * caller rather than a silently-zero gradient field. */
+JCE_API const float *JCE_CALL jce_water_fft_slope_x_data(const JceWaterFft *fft);
+JCE_API const float *JCE_CALL jce_water_fft_slope_z_data(const JceWaterFft *fft);
+
+/* ── Jacobian foam ─────────────────────────────────────────────────────
+ *
+ * The determinant of the horizontal map x -> x + D(x), per grid cell.
+ *
+ *   > 1  the surface is being stretched (a trough)
+ *   ~ 1  undisturbed
+ *   < 1  compressed -- the leading face of a steepening wave
+ *   < 0  FOLDED over itself, which is physically what a breaking crest is
+ *
+ * This is why foam belongs here rather than in a hand-painted texture: it
+ * appears where the surface actually breaks, so it moves with the sea state
+ * instead of being scattered by a noise function that knows nothing about the
+ * waves underneath it.  The renderer packs it into the displacement texture's
+ * alpha channel, which is otherwise unused.
+ *
+ * OPT-IN, and cheap when on: it is finite differences over the displacement
+ * fields that evolve already produced -- no extra transform.  (A spectral
+ * derivative of D would cost four more inverse FFTs to sharpen a quantity that
+ * is then thresholded anyway.)
+ *
+ * Enabling re-evolves at the current time so the field is valid immediately. */
+JCE_API bool JCE_CALL jce_water_fft_enable_foam(JceWaterFft *fft);
+
+/* N*N Jacobian values, row-major, valid until the next evolve.  NULL when foam
+ * was never enabled -- a deliberate signal, not a silently-flat field. */
+JCE_API const float *JCE_CALL jce_water_fft_foam_data(const JceWaterFft *fft);
 
 JCE_EXTERN_C_END
 

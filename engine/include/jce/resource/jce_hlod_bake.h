@@ -42,9 +42,9 @@ typedef struct {
 /* Merge `inputs` into world space, simplify to ~`target_ratio` of the triangles
  * (clamped (0,1]; e.g. 0.15 keeps 15%), and write a proxy .glb to
  * `out_glb_host_path` tinted `base_color` (RGBA).  The proxy is authored in WORLD
- * space, so the HLOD proxy entity sits at the origin (matches build/gen_hlod.py +
- * jce_world_streamer_attach_hlod).  Returns false on bad args / empty input /
- * write failure.  `out_stats` may be NULL. */
+ * space, so the HLOD proxy entity sits at the origin (matches
+ * tools/worldgen/gen_hlod.py + jce_world_streamer_attach_hlod).  Returns false
+ * on bad args / empty input / write failure.  `out_stats` may be NULL. */
 JCE_API bool jce_hlod_bake_proxy(const JceHlodMeshInput *inputs,
                                  uint32_t                input_count,
                                  float                   target_ratio,

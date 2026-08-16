@@ -1,14 +1,14 @@
 /*
- * jce_cook_manager.cpp  Worker thread wrapper around jce_cook_run_all.
+ * jce_cook_manager.cpp  Structured async wrapper around jce_cook_run_all.
  *
- * Uses jce_thread per AGENTS.md (no STL threading primitives).
- * Progress lines go to jce_log; the main thread polls the mailbox.
+ * Progress lines go to jce_log; completion is applied on the editor thread.
  */
 
 #include "jce_cook_manager.h"
 
 #include <jce/application/jce_cook.h>
 #include <jce/application/jce_project.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_alloc.h>
@@ -24,16 +24,19 @@
 namespace {
 
 struct State {
-    JceMutex          *mu          = nullptr;
-    JceAtomicI32      *done_flag   = nullptr;
-    JceCookMgrStatus   status{};
-    JceCookStats       live_stats{};
-    JceThread         *worker      = nullptr;
-    bool               ok          = false;
-    char               project_root_buf[1024]{};
+    JceMutex         *mu   = nullptr;
+    JceAsyncTask     *task = nullptr;
+    JceCookMgrStatus  status{};
 };
 
 State g;
+
+struct CookJob {
+    JceCookStats stats{};
+    bool         ok = false;
+    char         project_root[1024]{};
+    char         error[256]{};
+};
 
 struct Lock {
     JceMutex *m;
@@ -43,11 +46,11 @@ struct Lock {
 
 bool progress_cb(const char *rel, bool wrote, void *user)
 {
-    (void)user;
+    JceAsyncContext *ctx = static_cast<JceAsyncContext *>(user);
     if (wrote) {
         LOG_INFO(COOK_TAG, "cook  %s", rel);
     }
-    return true;
+    return !jce_async_context_cancel_requested(ctx);
 }
 
 /* Locate the real asset cooker (the same `jce_cook` host tool that the build's
@@ -93,20 +96,19 @@ bool resolve_cook_tool(char *out, size_t cap)
     return false;
 }
 
-void worker_fn(void *arg)
+JceAsyncRunResult worker_fn(JceAsyncContext *ctx, void *arg)
 {
-    (void)arg;
-    JceProject *p = jce_project_load(g.project_root_buf);
+    CookJob *job = static_cast<CookJob *>(arg);
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
+    JceProject *p = jce_project_load(job->project_root);
     if (!p) {
-        {
-            Lock lk(g.mu);
-            std::snprintf(g.status.last_error, sizeof g.status.last_error,
-                          "failed to load jce_project.json under %s",
-                          g.project_root_buf);
-            g.ok = false;
-        }
-        jce_atomic_i32_store(g.done_flag, 1);
-        return;
+        std::snprintf(job->error, sizeof job->error,
+                      "failed to load jce_project.json under %s",
+                      job->project_root);
+        jce_async_context_fail(ctx, 1, job->error);
+        return JCE_ASYNC_RUN_FAILED;
     }
 
     /* Phase 0.4: run the REAL cooker (the jce_cook host tool — the same one
@@ -124,8 +126,6 @@ void worker_fn(void *arg)
     std::string src = std::string(p->project_root) + "/" + src_rel;
     std::string dst = std::string(p->project_root) + "/" + dst_rel;
 
-    JceCookStats stats{};
-    bool ok = false;
     char cook_exe[1024];
 
     if (jce_fs_host_exists_dir(src.c_str()) && resolve_cook_tool(cook_exe, sizeof cook_exe)) {
@@ -144,45 +144,77 @@ void worker_fn(void *arg)
             for (const char *s = cap_out; (s = std::strstr(s, "cook ")) != nullptr; ++s) cooked++;
             jce_free(cap_out);
         }
-        ok = ran && exit_code == 0 && failed == 0;
-        stats.cooked = cooked;
-        stats.failed = failed;
-        if (ok) {
+        job->ok = ran && exit_code == 0 && failed == 0;
+        job->stats.cooked = cooked;
+        job->stats.failed = failed;
+        if (job->ok) {
             LOG_INFO(COOK_TAG, "real cook ok (%s): cooked~%d", cook_exe, cooked);
         } else {
-            Lock lk(g.mu);
-            std::snprintf(g.status.last_error, sizeof g.status.last_error,
+            std::snprintf(job->error, sizeof job->error,
                           "jce_cook failed (exit %d, %d fail) — %s",
                           exit_code, failed, cook_exe);
-            LOG_ERROR(COOK_TAG, "%s", g.status.last_error);
+            LOG_ERROR(COOK_TAG, "%s", job->error);
         }
     } else {
         LOG_WARN(COOK_TAG, "jce_cook tool not found — falling back to copy-only "
                            "cook (no texture/mesh transforms)");
-        ok = jce_cook_run_all(p, progress_cb, nullptr, &stats) && stats.failed == 0;
-        if (!ok) {
-            Lock lk(g.mu);
-            std::snprintf(g.status.last_error, sizeof g.status.last_error,
+        job->ok = jce_cook_run_all(p, progress_cb, ctx, &job->stats) &&
+                  job->stats.failed == 0;
+        if (!job->ok) {
+            std::snprintf(job->error, sizeof job->error,
                           "copy-only cook reported %d failure(s) of %d file(s)",
-                          stats.failed, stats.total);
+                          job->stats.failed, job->stats.total);
         }
     }
 
+    jce_project_free(p);
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    if (!job->ok) {
+        jce_async_context_fail(ctx, 2,
+                               job->error[0] ? job->error : "cook failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
+}
+
+void cook_complete(JceAsyncTask *task, void *arg)
+{
+    CookJob *job = static_cast<CookJob *>(arg);
+    JceAsyncState state = jce_async_task_state(task);
+
     {
         Lock lk(g.mu);
-        g.live_stats = stats;
-        g.ok         = ok;
+        g.status.total   = job->stats.total;
+        g.status.cooked  = job->stats.cooked;
+        g.status.skipped = job->stats.skipped;
+        g.status.failed  = job->stats.failed;
+        if (state == JCE_ASYNC_STATE_SUCCEEDED) {
+            g.status.state = JCE_COOK_SUCCEEDED;
+            g.status.last_error[0] = '\0';
+        } else {
+            g.status.state = JCE_COOK_FAILED;
+            std::snprintf(g.status.last_error,
+                          sizeof g.status.last_error, "%s",
+                          state == JCE_ASYNC_STATE_CANCELLED
+                              ? "cook cancelled"
+                              : (job->error[0] ? job->error : "cook failed"));
+        }
+        g.task = nullptr;
     }
-    jce_project_free(p);
-    jce_atomic_i32_store(g.done_flag, 1);
+
+    LOG_INFO(COOK_TAG, "cook finished: total=%d cooked=%d skipped=%d failed=%d",
+             job->stats.total, job->stats.cooked,
+             job->stats.skipped, job->stats.failed);
+    jce_async_task_release(task);
+    delete job;
 }
 
 } /* namespace */
 
 extern "C" void jce_cook_manager_init(void)
 {
-    if (!g.mu)        g.mu = jce_mutex_create();
-    if (!g.done_flag) g.done_flag = jce_atomic_i32_create(0);
+    if (!g.mu) g.mu = jce_mutex_create();
     Lock lk(g.mu);
     g.status = JceCookMgrStatus{};
     g.status.state = JCE_COOK_IDLE;
@@ -190,12 +222,18 @@ extern "C" void jce_cook_manager_init(void)
 
 extern "C" void jce_cook_manager_shutdown(void)
 {
-    if (g.worker) {
-        jce_thread_join(g.worker);
-        g.worker = nullptr;
+    if (g.task) {
+        jce_async_task_cancel(g.task);
+        while (g.task) {
+            jce_async_default_pump(nullptr);
+            if (g.task)
+                jce_thread_sleep_ms(1);
+        }
     }
-    if (g.done_flag) { jce_atomic_i32_destroy(g.done_flag); g.done_flag = nullptr; }
-    if (g.mu)        { jce_mutex_destroy(g.mu);             g.mu        = nullptr; }
+    if (g.mu) {
+        jce_mutex_destroy(g.mu);
+        g.mu = nullptr;
+    }
 }
 
 extern "C" bool jce_cook_manager_is_running(void)
@@ -220,25 +258,32 @@ extern "C" bool jce_cook_manager_start(const char *project_root)
     {
         Lock lk(g.mu);
         if (g.status.state == JCE_COOK_RUNNING) return false;
-        if (g.worker) {
-            jce_thread_join(g.worker);
-            g.worker = nullptr;
-        }
         g.status = JceCookMgrStatus{};
         g.status.state = JCE_COOK_RUNNING;
         std::snprintf(g.status.project_root, sizeof g.status.project_root,
                       "%s", project_root);
-        std::snprintf(g.project_root_buf, sizeof g.project_root_buf,
-                      "%s", project_root);
-        jce_atomic_i32_store(g.done_flag, 0);
     }
+
+    CookJob *job = new CookJob();
+    std::snprintf(job->project_root, sizeof job->project_root,
+                  "%s", project_root);
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = worker_fn;
+    desc.complete = cook_complete;
+    desc.user_data = job;
+    desc.debug_name = "editor.assets.cook";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+
     LOG_INFO(COOK_TAG, "cook started: %s", project_root);
-    g.worker = jce_thread_create(worker_fn, nullptr, "jce-cook");
-    if (!g.worker) {
+    g.task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!g.task) {
+        delete job;
         Lock lk(g.mu);
         g.status.state = JCE_COOK_FAILED;
         std::snprintf(g.status.last_error, sizeof g.status.last_error,
-                      "failed to spawn worker thread");
+                      "background queue rejected cook");
         return false;
     }
     return true;
@@ -246,22 +291,6 @@ extern "C" bool jce_cook_manager_start(const char *project_root)
 
 extern "C" void jce_cook_manager_poll(void)
 {
-    if (!g.mu || !g.done_flag) return;
-    if (jce_atomic_i32_load(g.done_flag) == 0) return;
-    if (!g.worker) return;
-    jce_thread_join(g.worker);
-    g.worker = nullptr;
-
-    Lock lk(g.mu);
-    g.status.total   = g.live_stats.total;
-    g.status.cooked  = g.live_stats.cooked;
-    g.status.skipped = g.live_stats.skipped;
-    g.status.failed  = g.live_stats.failed;
-    g.status.state   = g.ok ? JCE_COOK_SUCCEEDED : JCE_COOK_FAILED;
-    jce_atomic_i32_store(g.done_flag, 0);
-
-    LOG_INFO(COOK_TAG, "cook finished: total=%d cooked=%d skipped=%d failed=%d",
-             g.status.total, g.status.cooked, g.status.skipped, g.status.failed);
 }
 
 extern "C" bool jce_cook_manager_is_up_to_date(const char *project_root)

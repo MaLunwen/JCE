@@ -112,9 +112,12 @@ void jce_renderer_ecs_tick_fog(JceRendererEcs *re,
                 jce_volumetric_fog_set_params(re->fog, &c->params);
                 c->params_dirty = false;
             }
-            jce_volumetric_fog_render(re->fog,
+            /* NULL sun: this ECS adapter has no access to the scene's cascades.
+     * Unlit bulk fog is the honest result -- passing a zeroed sun struct
+     * would claim shadow data it does not have. */
+    jce_volumetric_fog_render(re->fog,
                                       depth_tex_handle,
-                                      view, proj, first_view_id);
+                                      view, proj, NULL, first_view_id);
         }
     }
 

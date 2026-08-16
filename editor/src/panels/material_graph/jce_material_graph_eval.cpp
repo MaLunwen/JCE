@@ -13,8 +13,8 @@
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 }
@@ -309,10 +309,10 @@ void resolve_varying_def_path(char *out, size_t cap)
  * Async "Compile & Bind".
  *
  * The two shaderc.exe invocations are the slow part (subprocess spawn +
- * drain + poll, up to 30 s each).  They run on a background worker; the
- * fast codegen + path resolution stays on the UI thread, and the GPU
- * program create + .bin/.mat.json persist run back on the main thread in
- * shader_compile_poll() (GPU resource create is render-thread-only).
+ * drain + poll, up to 30 s each). They run as structured background work;
+ * the fast codegen + path resolution stays on the UI thread, and the GPU
+ * program create + .bin/.mat.json persist run in the owner-thread completion
+ * callback (GPU resource create is render-thread-only).
  * ────────────────────────────────────────────────────────────────── */
 namespace {
 
@@ -324,24 +324,35 @@ struct ShaderCompileJob {
     /* outputs (worker) */
     jce_sg::ShadercResult vs_r;
     jce_sg::ShadercResult fs_r;
-    JceAtomicI32         *done = nullptr;   /* 0 running, 1 finished */
 };
 
-JceThread        *g_sc_worker = nullptr;
-ShaderCompileJob *g_sc_job    = nullptr;
+JceAsyncTask *g_sc_task = nullptr;
 
 /* WORKER thread: run shaderc for vs then fs.  Only touches the job (and
  * read-only renderer backend inside compile_sc) — no UI / GPU state. */
-void shader_compile_worker(void *arg)
+JceAsyncRunResult shader_compile_worker(JceAsyncContext *ctx, void *arg)
 {
     ShaderCompileJob *j = (ShaderCompileJob *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
     j->vs_r = jce_sg::compile_sc(j->vs_path, j->var_path, j->include_dir,
                                  jce_sg::ShaderKind::Vertex);
-    if (j->vs_r.ok)
+    jce_async_context_set_progress(ctx, 0.5f);
+
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
+    if (j->vs_r.ok) {
         j->fs_r = jce_sg::compile_sc(j->fs_sc_path, j->var_path,
                                      j->include_dir,
                                      jce_sg::ShaderKind::Fragment);
-    jce_atomic_i32_store(j->done, 1);
+    }
+
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    jce_async_context_set_progress(ctx, 1.0f);
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
 /* MAIN thread: consume a finished compile — link the program, swap it in,
@@ -428,24 +439,39 @@ void shader_compile_finalize(ShaderCompileJob *j)
     }
 }
 
+void shader_compile_complete(JceAsyncTask *task, void *arg)
+{
+    ShaderCompileJob *j = (ShaderCompileJob *)arg;
+    JceAsyncState state = jce_async_task_state(task);
+
+    if (state == JCE_ASYNC_STATE_SUCCEEDED) {
+        shader_compile_finalize(j);
+    } else if (state == JCE_ASYNC_STATE_CANCELLED) {
+        log_append(true, "shader compilation cancelled");
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                                     "material graph: shader compile cancelled");
+    } else {
+        const char *error = jce_async_task_error_message(task);
+        log_append(true, "shader compilation task failed%s%s",
+                   error && error[0] ? ": " : "",
+                   error && error[0] ? error : "");
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                     "material graph: shader compile task failed");
+    }
+
+    g_sc_task = nullptr;
+    jce_async_task_release(task);
+    delete j;
+}
+
 } /* anonymous namespace */
 
-bool shader_compile_running(void) { return g_sc_worker != nullptr; }
+bool shader_compile_running(void) { return g_sc_task != nullptr; }
 
-/* MAIN thread, per-frame: pick up a finished background compile. */
+/* Kept for panel compatibility. Default-executor completions are pumped by
+ * the engine before panel rendering. */
 void shader_compile_poll(void)
 {
-    ShaderCompileJob *j = g_sc_job;
-    if (!j) return;
-    if (jce_atomic_i32_load(j->done) == 0) return;   /* still running */
-
-    if (g_sc_worker) { jce_thread_join(g_sc_worker); g_sc_worker = nullptr; }
-
-    shader_compile_finalize(j);
-
-    jce_atomic_i32_destroy(j->done);
-    delete j;
-    g_sc_job = nullptr;
 }
 
 void compile_and_bind(void)
@@ -498,7 +524,7 @@ void compile_and_bind(void)
     resolve_vs_pbr_path(vs_path, sizeof(vs_path));
     resolve_varying_def_path(var_path, sizeof(var_path));
 
-    /* 3. hand the two shaderc invocations to a worker thread. */
+    /* 3. hand the two shaderc invocations to structured background work. */
     ShaderCompileJob *j = new ShaderCompileJob();
     j->vs_path     = vs_path;
     j->var_path    = var_path;
@@ -508,17 +534,25 @@ void compile_and_bind(void)
     j->dir         = dir;
     j->base        = base;
     j->graph_path  = s_g.path;
-    j->done        = jce_atomic_i32_create(0);
-    g_sc_job = j;
 
     log_append(false, "compiling shaders in background…");
     jce_editor_console_log("material graph: compiling shaders in background…");
 
-    g_sc_worker = jce_thread_create(shader_compile_worker, j, "jce_sg_compile");
-    if (!g_sc_worker) {
-        /* No worker thread available: run inline then finalise now. */
-        shader_compile_worker(j);
-        shader_compile_poll();
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = shader_compile_worker;
+    desc.complete = shader_compile_complete;
+    desc.user_data = j;
+    desc.debug_name = "editor.material_graph.compile";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+
+    g_sc_task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!g_sc_task) {
+        delete j;
+        log_append(true, "could not queue shader compilation");
+        jce_editor_console_log_level(
+            JCE_CONSOLE_ERROR,
+            "material graph: background queue rejected shader compile");
     }
 }
 

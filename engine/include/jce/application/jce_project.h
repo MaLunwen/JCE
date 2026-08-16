@@ -19,7 +19,9 @@
  *     "source_assets":  "assets",           // (v2) primary editor-author dir
  *     "cooked_assets":  "resources/_cooked",// (v2) cook output, fed to PAK
  *     "startup_scene":  "scenes/main.scene",// (v2) loaded at engine boot
- *     "variants":["debug","release","dist"]
+ *     "variants":["debug","release","dist"],
+ *     "bundles": ["dist/main.jbundle"],     // (v3) mounted at boot
+ *     "script_modules": ["build/release/game_scripts.dll"]  // (v3) see below
  *   }
  *
  * Schema v1 manifests still load — missing v2 fields take sensible
@@ -82,6 +84,28 @@ typedef struct JceProject {
 	 * the build pipeline. */
 	char **bundles;
 	int    bundles_count;
+
+	/* Shared objects holding COMPILED SCRIPT CLASSES — what the cpp script
+	 * backend calls a module (scripting/cpp/include/jce/script_vm/
+	 * jce_script_vm_cpp.h).  Each entry is a path to a shared library,
+	 * relative to project_root or absolute.
+	 *
+	 * WHY THE MANIFEST AND NOT A CONVENTION.  A C++ "script" is a class
+	 * compiled into a binary the PROJECT builds, so a tool that wants to run
+	 * one — the editor's Play mode above all — has to load that binary, and
+	 * it is a different process from the game.  The alternative, scanning a
+	 * conventional directory, would have the editor dlopen whatever it found
+	 * in the project tree; declaring it means the editor only ever loads code
+	 * the project named.
+	 *
+	 * NOT read by the runtime: a shipped game links or loads its own modules
+	 * from its own startup code, where the order relative to the first scene
+	 * load is its own to guarantee.  This list exists for TOOLS.
+	 *
+	 * Empty/absent is the normal state — most projects have no C++ scripts —
+	 * and a consumer must treat it as "nothing to load", never as an error. */
+	char **script_modules;
+	int    script_modules_count;
 } JceProject;
 
 /* Walk up from `start_dir` looking for jce_project.json.  When found,

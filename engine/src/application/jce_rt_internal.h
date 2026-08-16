@@ -44,7 +44,8 @@
 #include <jce/middleware/ai/jce_bt.h>
 #include <jce/middleware/ai/jce_perception.h>
 #include <jce/middleware/script/jce_script.h>
-#include <jce/os/platform/jce_file_watcher.h>   /* Lua script hot-reload (editor) */
+#include <jce/middleware/script/jce_script_vm.h> /* per-script language selection */
+#include <jce/os/platform/jce_file_watcher.h>   /* script hot-reload (editor) */
 #include <jce/middleware/ai/jce_nav_agent.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/middleware/save/jce_snapshot.h>
@@ -69,11 +70,11 @@
 #include <jce/middleware/scene/jce_scene_components_json.h> /* serial base-dir for relative material backfill */
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_console.h>   /* real engine cvars driving the sim (gap 9.1) */
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_fixed_clock.h>
-#include <jce/os/core/jce_thread.h>   /* async audio-source decode */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -235,13 +236,73 @@ struct BtEntry {
 	int              simlod_prev_tier;
 };
 
+/* A script instance AND THE VM THAT ISSUED IT, as one value.
+ *
+ * A JceScriptInstance is a bare uint32 whose meaning is PRIVATE to the VM
+ * that issued it — Lua's is a luaL_ref into that lua_State's registry,
+ * Python's is an index into that shim's own array — and both number from 1,
+ * so a Lua instance and a Python instance routinely have the SAME id.
+ * Handing one VM's instance to another is therefore not an error return, it
+ * is a dereference of whatever that id means over there.
+ *
+ * With one language per process the pairing was implicit: there was exactly
+ * one `rt->script_vm` and it was right by construction.  Per-script selection
+ * removes that, so the pairing is made STRUCTURAL instead of remembered:
+ *
+ *   - `rt->script_vm` no longer exists.  There is no "the runtime's VM" to
+ *     pass, so the ~50 dispatch sites cannot reach for one — the ones that
+ *     tried stopped compiling, which is how they were all found.
+ *   - No runtime function takes a JceScript* and a JceScriptInstance as two
+ *     parameters.  Every per-instance dispatch takes an RtScriptRef, and the
+ *     only thing that BUILDS one is rt_script_instantiate(), which fills both
+ *     halves from the same jce_script_instantiate call.
+ *
+ * So a mismatched pair has no expression in the runtime: constructing one
+ * means writing both fields by hand from two different sources, and there is
+ * exactly one place that writes them at all.
+ * *Enforced by:* tests/application/test_jce_runtime_multilang.c ::
+ * test_two_languages_in_one_scene_both_run — the second VM refuses and counts
+ * any instance id it did not issue, and both VMs there issue id 1. */
+typedef struct RtScriptRef {
+	JceScript        *vm;    /* the handle that issued `inst`; NULL == none */
+	JceScriptInstance inst;  /* meaningless without `vm`; 0 == invalid      */
+} RtScriptRef;
+
+/* Per-instance dispatch.  These exist so that no call site anywhere in the
+ * runtime names a VM handle and an instance separately; they are the only
+ * form in which the pair is consumed.  Every one tolerates a NULL/zero ref
+ * exactly the way the public forwarder already tolerates a NULL handle. */
+static inline void rt_script_ref_start(RtScriptRef r)
+{ jce_script_call_start(r.vm, r.inst); }
+
+static inline void rt_script_ref_update(RtScriptRef r, float dt)
+{ jce_script_call_update(r.vm, r.inst, dt); }
+
+static inline void rt_script_ref_release(RtScriptRef r)
+{ jce_script_release(r.vm, r.inst); }
+
+static inline void rt_script_ref_collision(RtScriptRef r, JceScriptEntity other)
+{ jce_script_call_collision(r.vm, r.inst, other); }
+
+static inline void rt_script_ref_message(RtScriptRef r, const char *msg,
+                                         double number_arg, const char *str_arg)
+{ jce_script_call_message(r.vm, r.inst, msg, number_arg, str_arg); }
+
+static inline void rt_script_ref_anim_event(RtScriptRef r, uint32_t id,
+                                            const char *name, float f0,
+                                            float f1, int i0)
+{ jce_script_call_anim_event(r.vm, r.inst, id, name, f0, f1, i0); }
+
+static inline void rt_script_ref_rebind(RtScriptRef r, JceScriptModule mod)
+{ jce_script_rebind_instance(r.vm, r.inst, mod); }
+
 /* One gameplay-script instance bound to an entity (Phase 0 scripting
  * keystone).  Mirrors BtEntry: rt_spawn_gameplay loads the entity's
- * JceScriptComponent into the runtime-owned script VM and calls on_start;
- * rt_tick_gameplay calls on_update each frame. */
+ * JceScriptComponent into the VM for that script's LANGUAGE and calls
+ * on_start; rt_tick_gameplay calls on_update each frame. */
 struct ScriptEntry {
 	JceEntity         entity;
-	JceScriptInstance inst;
+	RtScriptRef       ref;
 	bool              active;
 	char              script_path[256];  /* for hot-reload path matching */
 	/* Simulation-LOD cadence (only consulted when the entity carries a
@@ -356,7 +417,6 @@ typedef struct {
 	const JcePakArchive *pak;
 	char                 path[256];
 	JceAudioCpu         *cpu;    /* worker writes */
-	JceAtomicI32        *done;   /* 0 working, 1 finished */
 } RtAudioDecodeArgs;
 
 /* In-flight async decode of a play_on_awake audio source.  The worker
@@ -364,11 +424,28 @@ typedef struct {
  * sound starts a frame or two late instead of stalling scene load). */
 typedef struct {
 	JceEntity          entity;
-	JceThread         *thr;
-	RtAudioDecodeArgs *args;   /* stable heap; holds done + cpu */
+	JceAsyncTask      *task;
+	RtAudioDecodeArgs *args;   /* stable heap; holds CPU result */
 } RtPendingAudio;
 
+struct JceTerrainCollisionStream;
+
 struct JceRuntime {
+	/* Paged terrain collision for a TILED/PROCEDURAL terrain, which has no
+	 * monolithic height grid and therefore got no collider at all before this
+	 * existed.  NULL for a monolithic terrain, which still spawns one body. */
+	struct JceTerrainCollisionStream *terrain_stream;
+	/* The scene's terrain grid, borrowed from its cache. Named for the
+	 * collision stream that first needed it, but recorded for ANY reader
+	 * that has to ask the terrain a question -- the water disturbance
+	 * layer reads it for bathymetry, and it must not care whether the
+	 * terrain was authored tiled. */
+	struct JceTerrain                *terrain_stream_src;   /* borrowed */
+	/* The disturbance grid's bed has been read from the terrain. One-shot:
+	 * sampling resolution^2 terrain heights every tick would be paid every
+	 * frame for an answer that almost never changes, and a caller that does
+	 * move the bed has jce_water_ripple_set_depth. */
+	bool                              water_bathymetry_done;
 	JceScene        *scene;       /* not owned */
 	JcePakArchive   *pak;         /* not owned */
 	JceAudio        *audio;       /* not owned */
@@ -538,12 +615,33 @@ struct JceRuntime {
 	int              bt_cap;
 
 	/* ── Gameplay scripting (Phase 0 keystone) ───────────────────────
-	 * Runtime-owned Lua VM.  rt_spawn_gameplay instantiates each authored
-	 * JceScriptComponent into it and records a ScriptEntry; rt_tick_gameplay
-	 * calls on_update on every active instance.  Scene access (move/read an
-	 * entity) is provided to scripts via the JceScriptHost callbacks below,
-	 * so the script layer never depends on scene/ECS. */
-	JceScript          *script_vm;       /* owned */
+	 * ONE VM PER LANGUAGE, created on demand.  rt_spawn_gameplay resolves
+	 * each authored JceScriptComponent's script_path to a language
+	 * (jce_script_vm_language_for_path), gets or creates that language's VM,
+	 * instantiates into it and records a ScriptEntry carrying BOTH halves;
+	 * rt_tick_gameplay calls on_update on every active instance through its
+	 * own VM.  Scene access (move/read an entity) is provided to scripts via
+	 * the JceScriptHost callbacks below, so the script layer never depends on
+	 * scene/ECS.
+	 *
+	 * LAZY ON PURPOSE: a build that links the Python backend but whose scene
+	 * authors no .py never calls Py_InitializeFromConfig.  Creating every
+	 * registered language up front would make linking a backend cost a JVM or
+	 * an interpreter even for a project that does not use it.
+	 *
+	 * `script_host` is built ONCE (it is ~74 function pointers) and handed to
+	 * every language's create_sized, so all languages see the same host —
+	 * which is what makes a cross-language differential compare like for
+	 * like.  `script_enabled` is false only when the JCE_SCRIPT_LANGUAGE
+	 * override names a language this executable cannot run; see
+	 * rt_script_install_vm. */
+	JceScriptHost       script_host;
+	bool                script_enabled;
+	struct RtScriptLang {
+		JceScript *vm;                              /* owned */
+		char       language[JCE_SCRIPT_VM_LANGUAGE_MAX];
+	}                   script_langs[JCE_SCRIPT_VM_MAX];
+	int                 script_lang_count;
 	struct ScriptEntry *scripts;
 	int                 script_count;
 	int                 script_cap;
@@ -853,6 +951,35 @@ bool rt_script_rpc_send(void *user, JceScriptEntity e, const char *event,
  * save sinks the core gameplay walk fires, the script hot-reload callback, and
  * the bundled BT perception adapters. */
 void        rt_script_install_vm(JceRuntime *rt);
+
+/* Instantiate `path` in the VM for ITS language, creating that VM on first
+ * use.  The returned ref carries the handle that issued the instance, so the
+ * two can never be separated; {NULL, 0} on any failure, every one of which is
+ * logged with which of the two distinguishable causes it was (see
+ * rt_script_language_for in jce_rt_script.c). */
+RtScriptRef rt_script_instantiate(JceRuntime *rt, const char *path,
+                                  JceEntity owner);
+
+/* The already-created VM for `path`'s language, or NULL — WITHOUT creating
+ * one.  Hot-reload uses this: a language with no live VM has no instance to
+ * rebind, and standing an interpreter up to discover that would be absurd. */
+JceScript  *rt_script_vm_for_path_existing(JceRuntime *rt, const char *path);
+
+/* Destroy every per-language VM (teardown).  Safe to call twice. */
+void        rt_script_destroy_vms(JceRuntime *rt);
+
+/* Global (non-instance) handler dispatch — a UIButton's on_click, a sequencer
+ * EVENT key.  These name a global function, not an instance, so there is no
+ * ref to route them with: every live language is asked in creation order and
+ * the first that HANDLED it wins.  See the comment on the definitions. */
+bool        rt_script_call_named(JceRuntime *rt, const char *fn_name,
+                                 JceScriptEntity arg_entity);
+bool        rt_script_call_named_num(JceRuntime *rt, const char *fn_name,
+                                     JceScriptEntity arg_entity, double value);
+bool        rt_script_call_named_str(JceRuntime *rt, const char *fn_name,
+                                     JceScriptEntity arg_entity,
+                                     const char *str);
+
 const char *rt_resolve_host_path(JceRuntime *rt, const char *path,
                                  char *buf, size_t cap);
 void       *rt_read_asset_with_fallback(JceRuntime *rt, const char *path,

@@ -4,12 +4,19 @@
  * save point, trigger volume, terrain, particle emitter, script.
  */
 
+extern "C" struct JceTerrain *jce_terrain_panel_get_terrain(void);
+#include <vector>
+#include "io/jce_editor_file_util.h"
+#include <jce/middleware/scene/jce_foliage.h>
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_ui_state.h"
 
 extern "C" {
 #include <jce/renderer/jce_renderer_caps.h>    /* compute caps gate (GPU particles) */
 #include <jce/renderer/jce_render_pipeline.h>  /* gpu_particles feature flag hint   */
+#include <jce/resource/jce_asset_format.h>     /* script-extension authority        */
+#include <jce/middleware/script/jce_script_vm.h> /* which VMs THIS build linked     */
+#include "core/jce_assetdb.h"                  /* the picker's own attachability   */
 }
 
 void draw_comp_behavior_tree(JceBehaviorTree *bt)
@@ -319,7 +326,8 @@ extern "C" void jce_foliage_brush_apply_world(float wx, float wz, float dt)
     jce_state_mark_scene_modified();
 }
 
-void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
+void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
+                                  JceScene *scene, JceEntity entity)
 {
     if (!vs) return;
     bool ch = false;
@@ -442,6 +450,77 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs)
                         jce_editor_i18n("inspector.vegetationScatter.estimate"), est);
 
     if (ch) insp_track_edit();
+    /* ── Bake placement ────────────────────────────────────────────────
+     *
+     * Scatter is deterministic, so a level can compute its instances at load
+     * time or ship them precomputed.  Baking makes the cost stop scaling with
+     * instance count and -- more usefully -- lets an artist bake, inspect, and
+     * know that what ships is what was reviewed.
+     *
+     * This is only sound because the surface rules consume no randomness: a
+     * cooked list and a live scatter at the same seed agree instance for
+     * instance.  See jce_foliage.h. */
+    ImGui::Separator();
+    ImGui::SeparatorText(jce_editor_i18n("inspector.vegetationScatter.bake"));
+    {
+        static int  s_baked = -1;      /* -1 = not attempted this session */
+        static char s_bake_path[512] = { 0 };
+
+        if (ImGui::Button(jce_editor_i18n("inspector.vegetationScatter.bakeNow"))) {
+            s_baked = -1;
+            s_bake_path[0] = 0;
+
+            JceFoliageScatterParams fp;
+            memset(&fp, 0, sizeof fp);
+            fp.seed          = vs->seed;
+            fp.density       = vs->density;
+            fp.area_x        = vs->area_x;
+            fp.area_z        = vs->area_z;
+            fp.max_slope_deg = vs->max_slope_deg;
+            fp.scale_min     = vs->scale_min;
+            fp.scale_max     = vs->scale_max;
+            fp.want_normals  = vs->align_to_normal;
+
+            /* The entity's own world position is the scatter origin, exactly
+             * as the renderer uses it -- baking around a different origin
+             * would place a forest that does not match what is on screen. */
+            jce_vec3 origin = jce_v3(0.0f, 0.0f, 0.0f);
+            if (scene && entity) {
+                const jce_mat4 m = jce_scene_get_world_matrix(scene, entity);
+                origin = jce_v3(m.col[3].x, m.col[3].y, m.col[3].z);
+            }
+
+            std::vector<JceFoliageInstance> inst(JCE_FOLIAGE_MAX_INSTANCES);
+            const uint32_t n = jce_foliage_scatter(
+                &fp, jce_terrain_panel_get_terrain(), &origin,
+                inst.data(), (uint32_t)inst.size());
+
+            std::vector<unsigned char> blob(jce_foliage_cook_size(n));
+            if (jce_foliage_cook(inst.data(), n, fp.seed,
+                                 blob.data(), blob.size(), nullptr)) {
+                char rel[256];
+                snprintf(rel, sizeof rel, "vegetation_%u.foliage.bin", vs->seed);
+                char abs_path[512];
+                if (jce_editor_resolve_asset_path(rel, abs_path, sizeof abs_path) &&
+                    ed_write_file(abs_path, blob.data(), blob.size())) {
+                    s_baked = (int)n;
+                    snprintf(s_bake_path, sizeof s_bake_path, "%s", rel);
+                } else {
+                    s_baked = -2;      /* wrote nothing: report, never pretend */
+                }
+            } else {
+                s_baked = -2;
+            }
+        }
+
+        if (s_baked >= 0)
+            ImGui::Text(jce_editor_i18n("inspector.vegetationScatter.bakeOk"),
+                        s_baked, s_bake_path);
+        else if (s_baked == -2)
+            ImGui::TextDisabled("%s",
+                jce_editor_i18n("inspector.vegetationScatter.bakeFail"));
+    }
+
 }
 
 void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc)
@@ -652,6 +731,10 @@ void draw_comp_water(JceWaterComponent *w)
                                  &w->splash_ratio, 0.0f, 1.0f, "%.2f");
     } else { /* JCE_WATER_MODE_FFT */
         ImGui::SeparatorText(jce_editor_i18n("inspector.water.fft.header"));
+        /* Open-ocean geometry.  Off for a pond, where a uniform grid is the
+         * better mesh, not merely the legacy one. */
+        ch |= ImGui::Checkbox(jce_editor_i18n("inspector.water.ocean"),
+                              &w->ocean);
         ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.patchSize"),
                                &w->fft_patch_size, 1.0f, 1.0f, 100000.0f, "%.1f");
         ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.windSpeed"),
@@ -663,6 +746,17 @@ void draw_comp_water(JceWaterComponent *w)
         }
         ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.amplitude"),
                                &w->fft_amplitude, 0.0005f, 0.0f, 1000.0f, "%.4f");
+        /* Fetch: 0 keeps raw Phillips.  Left at 0 by default ON PURPOSE --
+         * switching spectra changes every height value, so it is a deliberate
+         * choice by the author rather than something that drifts in. */
+        ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.fetch"),
+                               &w->fft_fetch, 100.0f, 0.0f, 1000000.0f, "%.0f");
+        if (w->fft_fetch <= 0.0f)
+            ImGui::TextDisabled("%s",
+                jce_editor_i18n("inspector.water.fft.fetchOff"));
+        else
+            ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.fft.swell"),
+                                   &w->fft_swell, 0.01f, 0.0f, 1.0f, "%.2f");
         const char *res_names[] = { "32", "64", "128", "256" };
         const int   res_values[] = { 32, 64, 128, 256 };
         int res_idx = 1; /* default to 64 if unset/out-of-range */
@@ -679,6 +773,36 @@ void draw_comp_water(JceWaterComponent *w)
     ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.water.colorDeep"), w->color_deep);
     ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.transparency"),
                              &w->transparency, 0.0f, 1.0f, "%.2f");
+    /* Beer-Lambert clarity: 0 = off.  Off is the default because absorption
+     * changes how every existing water body looks, and a scene tuned against
+     * the old view-angle gradient must keep rendering as authored. */
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.clarity"),
+                           &w->clarity, 0.1f, 0.0f, 200.0f, "%.1f m");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.water.clarityTip"));
+    /* Caustics are finite-differenced from the FFT displacement map, so
+     * GERSTNER and STYLIZED have no input to differentiate and the term is
+     * inert there.  The slider used to look identical in all three modes: a
+     * designer dragging it on a pond got no picture and no reason.  Disabled
+     * (not hidden) and NOT reset, matching this panel's own rule that the
+     * inactive mode's fields stay serialized so a round-trip is lossless --
+     * switching back to FFT must return the value the author set.
+     * The disable+EndDisabled+TextDisabled shape is the one this file already
+     * uses for an inert control -- see inspector.pe.gpuUnsupported in
+     * draw_comp_particle_emitter below. */
+    const bool caustics_ok = (w->water_mode == JCE_WATER_MODE_FFT);
+    if (!caustics_ok) ImGui::BeginDisabled();
+    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.caustics"),
+                             &w->caustics, 0.0f, 1.0f, "%.2f");
+    if (!caustics_ok) {
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("%s",
+            jce_editor_i18n("inspector.water.causticsFftOnly"));
+    }
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.shoreFoam"),
+                           &w->shore_foam_m, 0.05f, 0.0f, 50.0f, "%.2f m");
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.shoreSurge"),
+                           &w->shore_surge_s, 0.1f, 0.0f, 60.0f, "%.1f s");
     ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.sunSpecular"),
                            &w->sun_specular, 0.02f, 0.0f, 100.0f, "%.2f");
     ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.shoreRipple"),
@@ -759,9 +883,100 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
 void draw_comp_script(JceScriptComponent *scr)
 {
     /* No "unwired" badge: the runtime DOES consume scripts (jce_runtime drives
-     * on_start/on_update/on_collision/on_trigger/on_message via the Lua VM). */
+     * on_start/on_update/on_collision/on_trigger/on_message through the VM
+     * registered for the script's language). */
     jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
     insp_track_edit();
+
+    if (scr->script_path[0] == '\0')
+        return;
+
+    /* TWO INDEPENDENT QUESTIONS, and therefore two messages that never share
+     * a string, because they have two different fixes:
+     *
+     *   1. does ANY language claim this extension?  Answered offline by the
+     *      engine's script-extension authority, so it reads the same in an
+     *      editor built with no backend at all.  Fix: author the file in a
+     *      language the engine ships.
+     *   2. did THIS executable link a VM for that language?  Answered by the
+     *      registry each backend populates from its own register().  Fix:
+     *      configure the build with that backend ON.
+     *
+     * Collapsing them is how "turret.py does nothing" became a silent no-op
+     * at runtime instead of a sentence in the editor.
+     *
+     * A path with no extension is question 1's NULL too, and correctly so:
+     * nothing can be promised about a bare name from the path alone.  A C++
+     * script is NOT that case — it names its class through ".jcecpp", which
+     * the catalog carries — so a working C++ script no longer reads amber
+     * here, which it did for as long as the cpp backend claimed nothing and a
+     * project had to invent its own extension at runtime. */
+    /* Same call the picker filters on, so "offered" and "accepted" are one
+     * set by construction: a path this returns NULL for is a path the picker
+     * will not list, and vice versa. */
+    const char *lang = jce_assetdb_script_language(scr->script_path);
+    if (!lang) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                           jce_editor_i18n("inspector.script.noLanguage"));
+        return;
+    }
+
+    ImGui::TextDisabled("%s: %s",
+                        jce_editor_i18n("inspector.script.language"), lang);
+    if (jce_script_vm_find(lang))
+        return;
+
+    /* Worded about the EDITOR, not about "this build", and that distinction
+     * is the whole point of the line.
+     *
+     * A backend registers itself from its own register() (jce_script_vm.h).
+     * This process calls several — jce_editor_register_script_backends()
+     * registers the cpp VM plus Python and Java when the editor was built
+     * with them — so the set below is real and it is THIS PROCESS'S.  It is not the game's.  The
+     * game links its own backends and makes its own register() calls, and a
+     * project can additionally claim a private extension at runtime
+     * (jce_script_vm_register_extension), which no editor has loaded.
+     *
+     * So "not registered here" is never "will not run there".  Saying "the
+     * script will never run" would be a verdict on a packaged executable this
+     * UI cannot see, and would be false for a game that links the backend
+     * correctly — which is the normal case for Java, whose build option
+     * defaults OFF (scripting/java/CMakeLists.txt) while a shipped game turns
+     * it on.  Informational, not a defect, so it is dimmed rather than amber
+     * — unlike the unclaimed-extension case above, which nothing anywhere
+     * can run.
+     *
+     * (Before a7a2dbfc the editor registered nothing and this comment said
+     * so.  Kept current deliberately: a reader who believes the editor
+     * registers no backend concludes Play cannot run Python, which is now
+     * the opposite of true.) */
+    ImGui::TextDisabled("%s",
+                        jce_editor_i18n("inspector.script.backendMissing"));
+
+    /* Name what IS registered, for the same reason rt_script_create_vm() logs
+     * it: "not registered" without the registered set leaves the reader
+     * guessing whether the backend, the claim, or the spelling is wrong. */
+    char have[192];
+    size_t used = 0;
+    have[0] = '\0';
+    const int count = jce_script_vm_count();
+    for (int i = 0; i < count && used + 1 < sizeof(have); ++i) {
+        const char *name = jce_script_vm_language_at(i);
+        if (!name)
+            continue;
+        const int written = snprintf(have + used, sizeof(have) - used,
+                                     "%s%s", used ? ", " : "", name);
+        if (written <= 0)
+            break;
+        used += (size_t)written;
+        if (used >= sizeof(have)) {
+            used = sizeof(have) - 1;
+            break;
+        }
+    }
+    ImGui::TextDisabled("%s %s",
+                        jce_editor_i18n("inspector.script.backendsPresent"),
+                        have);
 }
 
 void draw_comp_nav_agent(JceNavAgentComponent *na)

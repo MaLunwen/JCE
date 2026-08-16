@@ -23,6 +23,15 @@ JCE_EXTERN_C_BEGIN
 /* Values match SDL_WINDOW_* so no conversion is needed internally.      */
 
 #define JCE_WINDOW_FULLSCREEN          0x00000001u
+/* Created but never mapped.  This is NOT `headless`: the window exists, it has
+ * a native handle, and bgfx initialises a REAL GPU device on it — the only
+ * thing missing is the pixels reaching the desktop.  `headless` (JceAppDesc)
+ * is the opposite trade: no window AND no device (bgfx NOOP), so draw() never
+ * runs and no frame can be read back.  A capture harness that wants pixels
+ * without a visible window wants this flag, not that one.
+ * *Enforced by:* the JCE_SASSERT block at the top of jce_window.c, which pins
+ * every JCE_WINDOW_* value to its SDL_WINDOW_* counterpart. */
+#define JCE_WINDOW_HIDDEN              0x00000008u
 #define JCE_WINDOW_BORDERLESS          0x00000010u
 #define JCE_WINDOW_RESIZABLE           0x00000020u
 #define JCE_WINDOW_MINIMIZED           0x00000040u

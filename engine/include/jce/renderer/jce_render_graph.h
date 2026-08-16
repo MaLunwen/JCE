@@ -28,6 +28,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -50,13 +51,12 @@ typedef struct { uint16_t idx; } JceRGPass;
 /* Resource descriptors                                                */
 /* ================================================================== */
 
-typedef enum {
-    JCE_RG_FORMAT_RGBA8,
-    JCE_RG_FORMAT_RGBA16F,
-    JCE_RG_FORMAT_DEPTH24_STENCIL8,
-    JCE_RG_FORMAT_DEPTH32F,
-    JCE_RG_FORMAT_R32F,
-} JceRGFormat;
+typedef JceRenderFormat JceRGFormat;
+#define JCE_RG_FORMAT_RGBA8           JCE_RENDER_FORMAT_RGBA8
+#define JCE_RG_FORMAT_RGBA16F         JCE_RENDER_FORMAT_RGBA16F
+#define JCE_RG_FORMAT_DEPTH24_STENCIL8 JCE_RENDER_FORMAT_DEPTH24_STENCIL8
+#define JCE_RG_FORMAT_DEPTH32F        JCE_RENDER_FORMAT_DEPTH32F
+#define JCE_RG_FORMAT_R32F            JCE_RENDER_FORMAT_R32F
 
 typedef struct {
     uint16_t    width;      /* 0 = backbuffer-relative */

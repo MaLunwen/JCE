@@ -4,8 +4,9 @@
  * The engine only READS glTF (cgltf); this writes a single-mesh, single-material
  * .glb that the runtime model loader can consume — used by the engine HLOD bake
  * (Direction A2) to emit per-cell proxy meshes.  Faithful C port of the proven
- * writer in build/gen_hlod.py (whose output already loads at runtime): three
- * concatenated blocks (POSITION | NORMAL | indices), a JSON chunk, a BIN chunk.
+ * writer in tools/worldgen/gen_hlod.py (whose output already loads at
+ * runtime): three concatenated blocks (POSITION | NORMAL | indices), a JSON
+ * chunk, a BIN chunk.
  */
 
 #ifndef JCE_GLB_WRITE_H

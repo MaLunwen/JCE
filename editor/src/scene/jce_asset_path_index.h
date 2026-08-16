@@ -21,7 +21,7 @@
  * enumerates in insertion order for the asset browser / picker; it is built
  * synchronously so set_root() is queryable the moment it returns.  This
  * index maps a FUZZY BASENAME -> absolute path for repairing stale
- * references, is built on a worker and swapped in whole, and publishes a
+ * references, is built as a structured task and swapped in whole, and publishes a
  * generation counter for the resolver's negative cache.  Different key,
  * different value, different lifecycle — do not fold them together.  What
  * they SHOULD share is one tree walk; today they still do two.
@@ -54,7 +54,7 @@ void jce_asset_path_index_clear(void);
  */
 int  jce_asset_path_index_rebuild(const char *root);
 
-/* Rebuild the index for `root` on a background worker (REPLACE, not
+/* Rebuild the index for `root` as a background task (REPLACE, not
  * additive).  The current index stays live and queryable until the new
  * one is ready, at which point jce_asset_path_index_poll() swaps it in.
  * If a rebuild is already running, the newest root is remembered and

@@ -23,14 +23,14 @@
  * the editor file viewer and asset pipeline recognise it. The public
  * struct field name and overall API are unchanged.
  *
- * Concurrency: one bake at a time; module-scoped state, an atomic
- * status word, and a dedicated worker thread (jce_thread). Callers
- * poll from the main thread without locks.
+ * Concurrency: one bake at a time; module-scoped state, atomic progress,
+ * and a structured background task. Callers poll from the main thread.
  */
 
 #include "jce/renderer/jce_reflection_probe_bake.h"
 
 #include "jce/os/core/jce_alloc.h"
+#include "jce/os/core/jce_async.h"
 #include "jce/os/core/jce_filesystem.h"
 #include "jce/os/core/jce_log.h"
 #include "jce/os/core/jce_thread.h"
@@ -49,7 +49,7 @@ typedef struct {
     JceReflectionProbeBakeDesc desc;
     char                       path[512];
 
-    JceThread                 *worker;
+    JceAsyncTask              *task;
     JceAtomicI32              *status;   /* JceBakeStatus */
     JceAtomicI32              *cancel;   /* 0/1 */
     JceAtomicI32              *progress; /* 0..1000 within step */
@@ -84,9 +84,10 @@ static void rpb_set_progress(float step01, float overall01)
     rpb_atomic_set(g_rpb.overall,  (int32_t)(overall01 * 1000.0f));
 }
 
-static bool rpb_cancelled(void)
+static bool rpb_cancelled(const JceAsyncContext *ctx)
 {
-    return rpb_atomic_get(g_rpb.cancel) != 0;
+    return rpb_atomic_get(g_rpb.cancel) != 0 ||
+           jce_async_context_cancel_requested(ctx);
 }
 
 /* ── face direction basis ────────────────────────────────────────── */
@@ -200,7 +201,7 @@ static void rpb_irr_path(const char *src, char *out, size_t cap)
 
 /* ── worker ───────────────────────────────────────────────────────── */
 
-static void rpb_worker_main(void *arg)
+static JceAsyncRunResult rpb_worker_main(JceAsyncContext *ctx, void *arg)
 {
     (void)arg;
     const uint32_t face_size = g_rpb.desc.cubemap_size;
@@ -212,13 +213,13 @@ static void rpb_worker_main(void *arg)
         LOG_ERROR(JCE_RPB_TAG, "alloc failed (%u px cubemap)", face_size);
         rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_FAILED);
         g_rpb.message = "out-of-memory";
-        return;
+        return JCE_ASYNC_RUN_FAILED;
     }
 
     /* Step 1/4: render 6 faces. */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_RENDERING_FACES);
     for (int f = 0; f < 6; ++f) {
-        if (rpb_cancelled()) goto cancelled;
+        if (rpb_cancelled(ctx)) goto cancelled;
         uint8_t *dst = faces + (size_t)f * face_pix * 4u;
         for (uint32_t y = 0; y < face_size; ++y) {
             float v = ((float)y + 0.5f) / (float)face_size * 2.0f - 1.0f;
@@ -237,13 +238,13 @@ static void rpb_worker_main(void *arg)
      * a status transition so the UI bar advances). */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CONVOLVING_IRRADIANCE);
     rpb_set_progress(1.0f, 0.65f);
-    if (rpb_cancelled()) goto cancelled;
+    if (rpb_cancelled(ctx)) goto cancelled;
 
     /* Step 3/4: specular mip chain (placeholder — recorded count is
      * round-tripped into the container header). */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CONVOLVING_SPECULAR);
     for (uint32_t m = 0; m < spec_mips; ++m) {
-        if (rpb_cancelled()) goto cancelled;
+        if (rpb_cancelled(ctx)) goto cancelled;
         rpb_set_progress((float)(m + 1) / (float)spec_mips,
                           0.65f + 0.25f * (float)(m + 1) / (float)spec_mips);
     }
@@ -279,7 +280,7 @@ static void rpb_worker_main(void *arg)
         LOG_ERROR(JCE_RPB_TAG, "write failed: %s", g_rpb.path);
         rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_FAILED);
         g_rpb.message = "write-failed";
-        return;
+        return JCE_ASYNC_RUN_FAILED;
     }
 
     rpb_set_progress(1.0f, 1.0f);
@@ -288,13 +289,14 @@ static void rpb_worker_main(void *arg)
     LOG_SUCCESS(JCE_RPB_TAG,
                 "bake done: %s (%ux%u cube, %u spec mips requested, KTX1 + .irr.ktx sidecar)",
                 g_rpb.path, face_size, face_size, spec_mips);
-    return;
+    return JCE_ASYNC_RUN_SUCCESS;
 
 cancelled:
     jce_free(faces);
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CANCELLED);
     g_rpb.message = "cancelled";
     LOG_INFO(JCE_RPB_TAG, "bake cancelled");
+    return JCE_ASYNC_RUN_CANCELLED;
 }
 
 /* ── public API ───────────────────────────────────────────────────── */
@@ -317,8 +319,14 @@ jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
             LOG_WARN(JCE_RPB_TAG, "submit rejected: bake already running");
             return 0u;
         }
-        /* Reap the prior worker before reusing the slot. */
-        if (g_rpb.worker) { jce_thread_join(g_rpb.worker); g_rpb.worker = NULL; }
+        if (g_rpb.task && !jce_async_task_is_terminal(g_rpb.task)) {
+            LOG_WARN(JCE_RPB_TAG, "submit rejected: prior task is retiring");
+            return 0u;
+        }
+        if (g_rpb.task) {
+            jce_async_task_release(g_rpb.task);
+            g_rpb.task = NULL;
+        }
     }
 
     /* Capture desc (path string is copied — caller's pointer not stored). */
@@ -351,11 +359,17 @@ jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
     g_rpb.in_use  = true;
     g_rpb.message = "rendering";
 
-    g_rpb.worker = jce_thread_create(rpb_worker_main, NULL, "jce-rprobe-bake");
-    if (!g_rpb.worker) {
+    JceAsyncTaskDesc task_desc;
+    jce_async_task_desc_init(&task_desc);
+    task_desc.work       = rpb_worker_main;
+    task_desc.debug_name = "renderer.reflection-probe.bake";
+    task_desc.priority   = JCE_ASYNC_PRIORITY_BACKGROUND;
+    g_rpb.task = jce_async_submit(jce_async_default_executor(), &task_desc);
+    if (!g_rpb.task) {
         rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_FAILED);
-        g_rpb.message = "thread-create-failed";
-        LOG_ERROR(JCE_RPB_TAG, "worker thread create failed");
+        g_rpb.message = "queue-full";
+        g_rpb.in_use = false;
+        LOG_ERROR(JCE_RPB_TAG, "bake task submission failed");
         return 0u;
     }
     LOG_INFO(JCE_RPB_TAG, "bake submitted h=%u path=%s size=%u",
@@ -378,12 +392,12 @@ jce_reflection_probe_bake_poll(JceReflectionProbeBakeHandle h,
         out->message  = g_rpb.message;
     }
 
-    /* Reap the worker once it has reached a terminal state so subsequent
-     * submits don't have to wait on the join. */
+    /* Reap the caller-owned handle after work and public status are terminal. */
     if ((s == JCE_BAKE_STATUS_DONE   || s == JCE_BAKE_STATUS_FAILED ||
-         s == JCE_BAKE_STATUS_CANCELLED) && g_rpb.worker) {
-        jce_thread_join(g_rpb.worker);
-        g_rpb.worker = NULL;
+         s == JCE_BAKE_STATUS_CANCELLED) && g_rpb.task &&
+        jce_async_task_is_terminal(g_rpb.task)) {
+        jce_async_task_release(g_rpb.task);
+        g_rpb.task = NULL;
     }
     return true;
 }
@@ -393,5 +407,8 @@ jce_reflection_probe_bake_cancel(JceReflectionProbeBakeHandle h)
 {
     if (h == 0u || h != g_rpb.handle || !g_rpb.in_use) return;
     rpb_atomic_set(g_rpb.cancel, 1);
+    rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CANCELLED);
+    g_rpb.message = "cancelled";
+    if (g_rpb.task) (void)jce_async_task_cancel(g_rpb.task);
     LOG_INFO(JCE_RPB_TAG, "cancel requested h=%u", h);
 }

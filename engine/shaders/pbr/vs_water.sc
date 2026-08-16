@@ -1,5 +1,5 @@
 $input a_position, a_normal, a_tangent, a_texcoord0
-$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos
+$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos, v_tint
 
 #include <bgfx_shader.sh>
 
@@ -42,7 +42,27 @@ uniform vec4 u_water_wave_b[4]; // dir_x, dir_z, _, _
 uniform vec4 u_water_params;    // x=wave_count, y=base_height, z/w unused
 uniform vec4 u_water_time;      // x=time
 uniform vec4 u_water_mode;      // x=0 Gerstner / 1 FFT, y=patch_size
-SAMPLER2D(s_water_disp, 0);     // FFT displacement (R=height,G=dispX,B=dispZ)
+SAMPLER2D(s_water_disp, 0);     // FFT displacement (R=height,G=dispX,B=dispZ,A=foam)
+/* Second cascade.  A single patch tiles and the eye locks onto the REPEAT
+ * rather than the detail; two non-commensurate periods summed only repeat
+ * where both do.  u_water_mode.W carries the second patch size (0 = absent); .z is
+ * already the STYLIZED splash ratio, and overloading one slot across two
+ * modes is a trap even when the modes are mutually exclusive. */
+SAMPLER2D(s_water_disp2, 1);
+/* The DISTURBANCE layer: what objects did to the water, as opposed to what the
+ * wind is doing. R holds height in metres about the still surface.
+ *
+ * A separate texture rather than a channel of the displacement map above,
+ * because that map exists only on the FFT path -- Gerstner and Stylized water
+ * never allocate it -- and a ripple that only appeared on one of the three
+ * wave models would be a worse defect than no ripple at all. This one is
+ * sampled after the two branches converge, so all three get it.
+ *
+ * Addressed in WORLD XZ over the grid's own rectangle, not in patch UV: the
+ * grid is anchored to the world (a ring stays where the rock fell), while the
+ * ambient patch tiles. u_water_ripple carries that rectangle. */
+SAMPLER2D(s_water_ripple, 2);
+uniform vec4 u_water_ripple;   // xy = grid centre XZ, z = grid size (m), w = enabled
 
 #define WATER_TWO_PI 6.28318530717958647692
 
@@ -60,6 +80,9 @@ void main()
     // Displaced position + normal (filled by one of the two branches below).
     float px, py, pz;
     float nx, nz, ny;
+    // 1.0 == undisturbed.  The Gerstner and STYLIZED branches never fold, so
+    // this default IS their correct answer, not a placeholder.
+    float foam_j = 1.0;
 
     // FFT ONLY at mode 1 — mode 2 (STYLIZED overlay) is a flat plane and
     // must fall through to the Gerstner branch with wave_count 0.
@@ -76,9 +99,28 @@ void main()
         vec2 uv = fract(vec2(x, z) * invPatch);
 
         vec4 disp = texture2DLod(s_water_disp, uv, 0.0);
+
+        /* Sum the second cascade at the SAME world XZ -- a different tiling of
+         * one ocean, not a different place.  This MUST match what
+         * jce_water_field_sample does on the CPU, or a floating body would sit
+         * on a surface that is not the one being drawn. */
+        float patch2 = u_water_mode.w;
+        if (patch2 > 0.0) {
+            vec2 uv2 = fract(vec2(x, z) * (1.0 / patch2));
+            vec4 d2  = texture2DLod(s_water_disp2, uv2, 0.0);
+            disp.xyz += d2.xyz;
+            /* Folds compound: whichever cascade folds harder wins. */
+            disp.w = min(disp.w, d2.w);
+        }
+
         px = x + disp.y;          // horizontal X roll (G)
         pz = z + disp.z;          // horizontal Z roll (B)
         py = base_y + disp.x;     // height (R)
+        // A = Jacobian of the horizontal map (see jce_water_fft.h).  < 1 is
+        // compression, < 0 is a fold -- i.e. a breaking crest.  Carried to the
+        // fragment stage so foam appears where the surface actually breaks
+        // rather than wherever a noise function happens to be bright.
+        foam_j = disp.w;
 
         // Normal from central differences of the height channel (R).  The
         // texel step in patch-UV; world step = patch * texelUV.  We don't know
@@ -143,6 +185,48 @@ void main()
             nx -= dir.x * ka * c;
             nz -= dir.y * ka * c;
             ny -= steepness * ka * s;
+        }
+    }
+
+    // Carry the fold determinant to the fragment stage.  COLOR0 is otherwise
+    // unused by water, so this costs no new varying slot.
+    v_tint = vec4(foam_j, 0.0, 0.0, 1.0);
+
+    /* ── The disturbance, added to whichever branch produced this vertex ──
+     *
+     * surface = ambient + disturbance, which is the same sum rt_apply_buoyancy
+     * computes for a floating body. Adding it HERE rather than inside the two
+     * branches is what makes the two agree by construction: neither branch can
+     * forget it, and a fourth wave model added later gets it for free.
+     *
+     * Outside the grid the sample must contribute nothing. The texture is
+     * created with CLAMP, so a fetch beyond the rim repeats the edge texel --
+     * which would smear the rim value across the whole ocean. The explicit
+     * in-rect test is what makes "outside" mean ABSENT rather than "whatever
+     * the edge happened to hold". */
+    if (u_water_ripple.w > 0.5)
+    {
+        vec2 rmin = u_water_ripple.xy - vec2(u_water_ripple.z, u_water_ripple.z) * 0.5;
+        vec2 ruv  = (vec2(px, pz) - rmin) / max(u_water_ripple.z, 1e-4);
+        if (ruv.x >= 0.0 && ruv.x <= 1.0 && ruv.y >= 0.0 && ruv.y <= 1.0)
+        {
+            py += texture2DLod(s_water_ripple, ruv, 0.0).x;
+
+            /* Perturb the normal too. A displaced surface whose normal still
+             * points where it did is lit as though it were flat -- the ripple
+             * would be there in silhouette and invisible in shading, which
+             * reads as a geometry glitch rather than as a wave.
+             *
+             * Central differences in the same world units the ambient branch
+             * uses: d(height)/d(world) = d(height)/d(uv) / size. */
+            float re = 1.0 / 128.0;
+            float rl = texture2DLod(s_water_ripple, vec2(ruv.x - re, ruv.y), 0.0).x;
+            float rr = texture2DLod(s_water_ripple, vec2(ruv.x + re, ruv.y), 0.0).x;
+            float rd = texture2DLod(s_water_ripple, vec2(ruv.x, ruv.y - re), 0.0).x;
+            float ru = texture2DLod(s_water_ripple, vec2(ruv.x, ruv.y + re), 0.0).x;
+            float inv = 1.0 / max(u_water_ripple.z, 1e-4);
+            nx -= (rr - rl) * (0.5 / re) * inv;
+            nz -= (ru - rd) * (0.5 / re) * inv;
         }
     }
 

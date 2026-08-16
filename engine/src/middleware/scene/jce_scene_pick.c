@@ -21,6 +21,7 @@
  * the frame on a read-back or silently answer "nothing" mid-drag.
  */
 
+#include "jce_terrain_cache.h"
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_terrain.h>
 #include <jce/os/core/jce_frustum.h>
@@ -53,8 +54,15 @@
 
 typedef struct PickTerrainCache {
     char        path[256];
-    JceTerrain *terrain;
+    /* The pick MESH is ours -- it is a GPU resource built for this pass.  The
+     * JceTerrain behind it is BORROWED from the scene's terrain cache, so the
+     * pick pass no longer loads its own copy of a grid the renderer and the
+     * physics world already hold.  `revision` is what the borrow is validated
+     * against: when the editor sculpts, the cache drops the terrain and the
+     * revision moves, and this mesh is rebuilt instead of picking against
+     * ground that no longer exists. */
     JceMesh    *mesh;
+    uint64_t    revision;
     bool        used;
     bool        failed;
 } PickTerrainCache;
@@ -299,8 +307,9 @@ static void pick_destroy_terrain_cache(JceScenePickPass *pass)
         PickTerrainCache *tc = &pass->terrain[i];
         if (tc->mesh)
             jce_mesh_destroy(tc->mesh);
-        if (tc->terrain)
-            jce_terrain_free(tc->terrain);
+        /* The JceTerrain is BORROWED from the scene's terrain cache and freed
+         * there.  Freeing it here would leave the renderer and the physics
+         * world holding a dangling pointer to the same grid. */
         memset(tc, 0, sizeof(*tc));
     }
 }
@@ -472,11 +481,16 @@ static JceMesh *pick_resolve_mesh_renderer(JceScenePickPass *pass,
     return pass->builtin[shape];
 }
 
-static JceTerrain *pick_load_terrain(JceScenePickPass *pass, const char *path)
+/* JceTerrainCacheLoadFn: the cache owns the result, we only resolve the path.
+ * PAK-first so a deployed bundle needs no host filesystem access at all. */
+static JceTerrain *pick_load_terrain(void *ud, const char *path)
 {
+    JceScenePickPass *pass = (JceScenePickPass *)ud;
     if (!pass || !path || !path[0])
         return NULL;
 
+    /* jce-terrain-owner-exempt: this IS the cache's loader callback; the
+     * cache takes ownership of the result. */
     JceTerrain *terrain = jce_terrain_load_from_pak(pass->pak, path);
     if (terrain)
         return terrain;
@@ -488,6 +502,7 @@ static JceTerrain *pick_load_terrain(JceScenePickPass *pass, const char *path)
                                pass->cbs.userdata)) {
         load_path = resolved;
     }
+    /* jce-terrain-owner-exempt: same callback, host-filesystem fallback. */
     return jce_terrain_load_file(load_path);
 }
 
@@ -547,11 +562,14 @@ static JceMesh *pick_build_terrain_mesh(JceTerrain *terrain)
     return mesh;
 }
 
-static JceMesh *pick_resolve_terrain(JceScenePickPass *pass,
+static JceMesh *pick_resolve_terrain(JceScenePickPass *pass, JceScene *scene,
                                      const JceTerrainComponent *tc)
 {
-    if (!pass || !tc || !tc->visible || !tc->terrain_path[0])
+    if (!pass || !scene || !tc || !tc->visible || !tc->terrain_path[0])
         return NULL;
+
+    JceTerrainCache *tcache = jce_scene_terrain_cache(scene);
+    const uint64_t rev = jce_terrain_cache_revision(tcache, tc->terrain_path);
 
     int slot = -1;
     int free_slot = -1;
@@ -566,16 +584,29 @@ static JceMesh *pick_resolve_terrain(JceScenePickPass *pass,
             free_slot = i;
     }
 
+    /* A stale borrow is a rebuild, not a reuse: the terrain this mesh was
+     * built from may already have been freed by an invalidate. */
+    if (slot >= 0 && pass->terrain[slot].revision != rev) {
+        if (pass->terrain[slot].mesh) jce_mesh_destroy(pass->terrain[slot].mesh);
+        memset(&pass->terrain[slot], 0, sizeof(pass->terrain[slot]));
+        free_slot = slot;
+        slot = -1;
+    }
+
     if (slot < 0 && free_slot >= 0) {
         slot = free_slot;
         PickTerrainCache *entry = &pass->terrain[slot];
         memset(entry, 0, sizeof(*entry));
         jce_strlcpy(entry->path, tc->terrain_path, sizeof(entry->path));
         entry->used = true;
-        entry->terrain = pick_load_terrain(pass, tc->terrain_path);
-        if (entry->terrain)
-            entry->mesh = pick_build_terrain_mesh(entry->terrain);
-        if (!entry->terrain || !entry->mesh)
+
+        /* Borrowed -- never freed here. */
+        JceTerrain *terrain = jce_terrain_cache_acquire(
+            tcache, tc->terrain_path, pick_load_terrain, pass);
+        if (terrain)
+            entry->mesh = pick_build_terrain_mesh(terrain);
+        entry->revision = jce_terrain_cache_revision(tcache, tc->terrain_path);
+        if (!terrain || !entry->mesh)
             entry->failed = true;
     }
 
@@ -683,7 +714,7 @@ static JceMesh *pick_resolve_entity_mesh(JceScenePickPass *pass,
 
     if (jce_scene_has_terrain(scene, e)) {
         JceTerrainComponent *tc = jce_scene_get_terrain(scene, e);
-        return pick_resolve_terrain(pass, tc);
+        return pick_resolve_terrain(pass, scene, tc);
     }
 
     return NULL;

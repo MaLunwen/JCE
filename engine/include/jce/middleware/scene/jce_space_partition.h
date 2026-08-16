@@ -137,6 +137,18 @@ JCE_API uint32_t jce_space_occupied_cell_count(const JceSpaceIndex *idx);
 /* Per-axis grid resolution (cells per axis), derived from the world extent. */
 JCE_API void jce_space_resolution(const JceSpaceIndex *idx, uint32_t out_res[3]);
 
+/* Work counters from the most recent jce_space_query_frustum call: how many
+ * occupied cells it walked, how many survived the coarse reject, how many
+ * object slots those cells listed, and how many distinct objects were actually
+ * tested after epoch dedup.  Out-params rather than a struct on purpose -- a
+ * caller-allocated stats struct breaks the moment the two sides disagree about
+ * its size.  Any pointer may be NULL. */
+JCE_API void jce_space_last_query_stats(const JceSpaceIndex *idx,
+                                         uint32_t *out_cells_walked,
+                                         uint32_t *out_cells_accepted,
+                                         uint32_t *out_objs_visited,
+                                         uint32_t *out_objs_tested);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SPACE_PARTITION_H */

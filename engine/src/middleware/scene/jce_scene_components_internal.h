@@ -18,6 +18,7 @@
 #define JCE_SCENE_COMPONENTS_INTERNAL_H
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
@@ -357,6 +358,7 @@ void parse_decal(JceScene *s, JceEntity e, const cJSON *c);
 void parse_light_probe_group(JceScene *s, JceEntity e, const cJSON *c);
 void parse_billboard_renderer(JceScene *s, JceEntity e, const cJSON *c);
 void parse_volume(JceScene *s, JceEntity e, const cJSON *c);
+void parse_fullscreen_effect(JceScene *s, JceEntity e, const cJSON *c);
 void parse_occlusion_portal(JceScene *s, JceEntity e, const cJSON *c);
 void serw_mesh_renderer(JceScene *s, JceEntity e, cJSON *arr);
 void serw_light_unified(JceScene *s, JceEntity e, cJSON *arr);
@@ -370,6 +372,7 @@ void serw_decal(JceScene *s, JceEntity e, cJSON *arr);
 void serw_light_probe_group(JceScene *s, JceEntity e, cJSON *arr);
 void serw_billboard_renderer(JceScene *s, JceEntity e, cJSON *arr);
 void serw_volume(JceScene *s, JceEntity e, cJSON *arr);
+void serw_fullscreen_effect(JceScene *s, JceEntity e, cJSON *arr);
 void serw_occlusion_portal(JceScene *s, JceEntity e, cJSON *arr);
 
 #endif /* JCE_SCENE_COMPONENTS_INTERNAL_H */

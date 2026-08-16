@@ -68,7 +68,12 @@ void main()
 	// Reproject the output-res history by camera motion so accumulation follows
 	// the scene under camera movement (mv = previous-frame NDC delta).
 	vec2 mv  = texture2D(s_texMotion, ouv).xy * 2.0 - 1.0;
+	// NDC delta -> UV delta; the y sign is backend-dependent (see fs_taa.sc).
+#if BGFX_SHADER_LANGUAGE_GLSL
 	vec2 ruv = ouv - mv * 0.5;                       // previous-frame screen UV
+#else
+	vec2 ruv = ouv - vec2(mv.x, -mv.y) * 0.5;        // previous-frame screen UV
+#endif
 	vec2 huv = ruv;
 	if (u_tsrJitter.w > 0.5) huv.y = 1.0 - huv.y;    // history texture orientation
 	vec3 hist = clamp(texture2D(s_texHistory, huv).rgb, mn, mx);

@@ -188,20 +188,20 @@ void apply_mesh_drop_material(JceMeshRenderer *mr, const char *abs_path)
                     /* Importer texture paths are CWD-relative — store the
                      * canonical project-relative form (see store_asset_ref). */
                     if (mat.albedo_tex[0])
-                        jce_editor_path_store_asset_ref(mr->albedo_tex,
-                            sizeof(mr->albedo_tex), mat.albedo_tex);
+                        jce_editor_path_store_asset_ref_interned(
+                            jce_state_get_scene(), &mr->albedo_tex, mat.albedo_tex);
                     if (mat.mr_tex[0])
-                        jce_editor_path_store_asset_ref(mr->mr_tex,
-                            sizeof(mr->mr_tex), mat.mr_tex);
+                        jce_editor_path_store_asset_ref_interned(
+                            jce_state_get_scene(), &mr->mr_tex, mat.mr_tex);
                     if (mat.normal_tex[0])
-                        jce_editor_path_store_asset_ref(mr->normal_tex,
-                            sizeof(mr->normal_tex), mat.normal_tex);
+                        jce_editor_path_store_asset_ref_interned(
+                            jce_state_get_scene(), &mr->normal_tex, mat.normal_tex);
                     if (mat.ao_tex[0])
-                        jce_editor_path_store_asset_ref(mr->ao_tex,
-                            sizeof(mr->ao_tex), mat.ao_tex);
+                        jce_editor_path_store_asset_ref_interned(
+                            jce_state_get_scene(), &mr->ao_tex, mat.ao_tex);
                     if (mat.emissive_tex[0])
-                        jce_editor_path_store_asset_ref(mr->emissive_tex,
-                            sizeof(mr->emissive_tex), mat.emissive_tex);
+                        jce_editor_path_store_asset_ref_interned(
+                            jce_state_get_scene(), &mr->emissive_tex, mat.emissive_tex);
 
                     mr->base_color[0] = mat.base_color[0];
                     mr->base_color[1] = mat.base_color[1];

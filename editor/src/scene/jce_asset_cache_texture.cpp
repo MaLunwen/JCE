@@ -205,8 +205,9 @@ void texture_async_start(void)
     if (s_tex_async.running)
         return;
 
-    async_loader_start(s_tex_async, texture_async_worker_main,
-                       "scene_tex_async");
+    if (!async_loader_start(s_tex_async, texture_async_worker_main,
+                            "scene_tex_async"))
+        LOG_ERROR(LOG_TAG, "failed to start texture decode service");
 }
 
 void texture_async_stop(void)
@@ -293,8 +294,13 @@ static AsyncFinalizeAction texture_finalize_result(TextureLoadResult &res,
         return ASYNC_FINALIZE_DROPPED;
     }
 
-    JceTexture tex = jce_texture_from_rgba(res.rgba.data(),
-                                           res.width, res.height);
+    /* WRAP + mip chain: these are scene MATERIAL textures.  Terrain multiplies
+     * its UV by the layer tile scale, so a clamped sampler returns the edge
+     * texel for everything past the first tile -- which renders as horizontal
+     * streaks across the whole surface rather than as a tiled ground. */
+    JceTexture tex = jce_texture_from_rgba_ex(res.rgba.data(),
+                                              res.width, res.height,
+                                              JCE_TEX_WRAP);
 
     if (!jce_texture_valid(tex)) {
         s_cache.tex_cache[idx].failed = true;

@@ -100,15 +100,19 @@ size_t jce_asset_chunk_data(const JceAssetView *view,
         if (out_size < chunk->original_size) return 0;
         size_t result = ZSTD_decompress(out_buf, out_size,
                                         src, (size_t)chunk->compressed_size);
-        if (ZSTD_isError(result)) return 0;
+        if (ZSTD_isError(result) || result != chunk->original_size) return 0;
         return result;
     }
 
-    /* Uncompressed — copy up to out_size bytes, but never read past the
-     * validated source region [data_offset, data_offset + compressed_size). */
-    size_t to_copy = chunk->original_size;
+    /* Fixed-size prefix reads are part of the v1 contract: TEX_INFO may append
+     * mip offsets after JceAssetTexInfo while older callers only request the
+     * fixed header.  Preserve that behavior, but reject unknown compression
+     * tags and never read beyond the stored region. */
+    if (chunk->compression != JCEASSET_COMPRESS_NONE)
+        return 0;
+    size_t to_copy = (size_t)chunk->original_size;
     if (to_copy > out_size) to_copy = out_size;
-    if (to_copy > chunk->compressed_size) to_copy = chunk->compressed_size;
+    if (to_copy > chunk->compressed_size) to_copy = (size_t)chunk->compressed_size;
     memcpy(out_buf, src, to_copy);
     return to_copy;
 }

@@ -79,15 +79,12 @@ void jce_config_publish_perf(int machine_class, int job_workers)
     s_perf_machine_class = machine_class;
     s_perf_job_workers   = job_workers;
 
-    /* Settings S5: [performance] job_workers sizes the process-wide enkiTS
-     * pool, which is the engine's one job system.  Push it rather than let the
-     * pool pull it: the pool is built lazily by whichever consumer runs first
-     * (frustum cull, particle fan-out, archive IO) and set_workers() is a no-op
-     * once it exists, so this has to happen before any of them.  It does —
-     * jce_engine_create() calls us right after jce_config_load(), ahead of
-     * bgfx_init and any frame work.  0 leaves the pool's own cores-1 auto
-     * formula in charge; a pin is clamped to 1..16 (job_workers=1 forces every
-     * parallel consumer onto its serial path). */
+    /* Settings S5: [performance] job_workers sizes the process-wide frame
+     * fork/join pool and is also the upper bound read by structured async
+     * executors. Push it rather than let the frame pool pull it: that pool is
+     * built lazily and set_workers() is a no-op once it exists. This runs
+     * before bgfx init and any frame or background work. Zero leaves the
+     * cores-1 policy in charge; a pin is clamped to 1..16. */
     if (job_workers > 0) {
         int w = job_workers > 16 ? 16 : job_workers;
         LOG_INFO(LOG_TAG, "shared job pool: %d worker(s) "

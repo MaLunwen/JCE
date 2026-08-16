@@ -39,8 +39,6 @@ extern "C" {
 
 /* Lighting panel accessors — defined in jce_panel_lighting_settings.cpp.
  * Declared once here instead of in each viewport translation unit. */
-bool jce_editor_lighting_get_fog_enabled(void);
-void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
 void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
 
@@ -125,7 +123,8 @@ inline void jce_editor_viewport_postfx_mirror(JcePostFXPipeline       *dst,
 inline void jce_editor_viewport_apply_shared_config(JceSceneRenderConfig *cfg,
                                                     JceOffscreenTarget   *bridge,
                                                     uint32_t              width,
-                                                    uint32_t              height)
+                                                    uint32_t              height,
+                                                    const JceScene       *scene)
 {
     if (!cfg) return;
 
@@ -140,15 +139,29 @@ inline void jce_editor_viewport_apply_shared_config(JceSceneRenderConfig *cfg,
      * (against the backbuffer the queries go inert or false-cull). */
     cfg->scene_frame_buffer = jce_offscreen_target_get_frame_buffer(bridge);
 
-    /* Volumetric fog: the Lighting panel writes, the renderer consumes here. */
-    cfg->fog_enabled = jce_editor_lighting_get_fog_enabled();
+    /* Volumetric fog.  Derived by the ENGINE from the scene's authored
+     * settings, not by an editor accessor: the editor-only mapping is why a
+     * shipped game never ran this pass at all.  Both now call the same
+     * function, so what the editor previews is what a build renders. */
+    /* Scene depth is published unconditionally: it is the offscreen target's,
+     * not fog's.  Gating it on fog_enabled -- which is what the old
+     * fog_depth_tex_handle name invited -- meant that switching fog off also
+     * switched off underwater absorption, which reads the same depth for an
+     * unrelated reason.  Only fog's own RT sizing belongs inside the gate. */
+    cfg->scene_depth_tex_handle = jce_offscreen_target_get_depth_texture(bridge);
+
+    /* Both editor viewports composite (jce_editor_viewport_composite_fog_ssr,
+     * called from jce_editor_scene_render.cpp and jce_editor_game_render.cpp),
+     * so declare it here -- in the one helper both fill their config through --
+     * rather than at the two call sites, where the two could drift apart and
+     * one viewport would fog twice while the other did not. */
+    cfg->composites_volumetric_fog = true;
+
+    cfg->fog_enabled = jce_scene_fog_params_from_scene(scene, &cfg->fog);
     if (cfg->fog_enabled) {
-        jce_editor_lighting_get_fog_params(&cfg->fog);
-        cfg->fog_depth_tex_handle = jce_offscreen_target_get_depth_texture(bridge);
         cfg->fog_rt_width  = (int)width;
         cfg->fog_rt_height = (int)height;
     } else {
-        cfg->fog_depth_tex_handle = UINT16_MAX;
         cfg->fog_rt_width  = 0;
         cfg->fog_rt_height = 0;
     }
@@ -172,6 +185,18 @@ inline void jce_editor_viewport_apply_ambient_override(JceSceneRenderer *sr)
 
 /* ── Post passes over the bridge ──────────────────────────────────── */
 
+enum : uint16_t {
+    JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET = 20,
+    JCE_EDITOR_VP_FULLSCREEN_COMPOSITE_OFFSET = 28,
+    JCE_EDITOR_VP_OVERLAY_OFFSET = 29,
+    JCE_EDITOR_VP_POSTFX_BASE_OFFSET = 30,
+    JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET = 51,
+    JCE_EDITOR_VP_UI_OFFSET = 52,
+    JCE_EDITOR_VP_UPSCALE_OFFSET = 53,
+    JCE_EDITOR_VP_SCREENSHOT_OFFSET = 54,
+    JCE_EDITOR_VP_TSR_OFFSET = 55
+};
+
 /* Composite the volumetric-fog (+16) and SSR (+19) render targets back over the
  * bridge's colour RT — after the scene draws into it, before overlays / PostFX.
  * Both are no-ops when the effect was not active this frame. */
@@ -185,6 +210,37 @@ inline void jce_editor_viewport_composite_fog_ssr(JceSceneRenderer   *sr,
     if (fog_enabled)
         jce_scene_renderer_composite_fog(sr, (uint16_t)(view_base + 16), dst_fb);
     jce_scene_renderer_composite_ssr(sr, (uint16_t)(view_base + 19), dst_fb);
+}
+
+/* Run project-authored HDR full-screen stages and fold their output back into
+ * the bridge.  This gives later overlays and the ordinary PostFX chain one
+ * canonical color target in both editor viewports. */
+inline bool jce_editor_viewport_apply_fullscreen_effects(
+    JceSceneRenderer *sr, JceScene *scene, const JceCamera *camera,
+    JceOffscreenTarget *bridge, uint16_t view_base, int viewport_id,
+    uint32_t width, uint32_t height, float dt_sec)
+{
+    if (!sr || !scene || !camera || !bridge || width == 0 || height == 0)
+        return false;
+    JceTextureHandle color = {
+        jce_offscreen_target_get_color_texture(bridge) };
+    JceTextureHandle depth = {
+        jce_offscreen_target_get_depth_texture(bridge) };
+    if (!jce_gfx_texture_valid(color)) return false;
+
+    JceTextureHandle output = jce_scene_renderer_apply_fullscreen_effects(
+        sr, scene, camera, color, depth, width, height,
+        (uint16_t)(view_base + JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET),
+        viewport_id, JCE_FULLSCREEN_EFFECT_HDR_BEFORE_POSTFX, dt_sec);
+    if (!jce_gfx_texture_valid(output) || output.idx == color.idx)
+        return false;
+
+    jce_offscreen_target_composite_texture(bridge,
+        (uint16_t)(view_base +
+                   JCE_EDITOR_VP_FULLSCREEN_COMPOSITE_OFFSET),
+        output.idx, (uint16_t)width, (uint16_t)height,
+        jce_renderer_origin_bottom_left());
+    return true;
 }
 
 /* Fold the tone-mapped PostFX output back into the bridge so the canvas UI
@@ -202,8 +258,8 @@ inline bool jce_editor_viewport_composite_postfx(JceOffscreenTarget *bridge,
                                                  uint32_t            height)
 {
     if (!bridge || postfx_tex == UINT16_MAX) return false;
-    const uint16_t comp_view =
-        (uint16_t)(view_base + JCE_VIEW_POST_BASE + 21);
+    const uint16_t comp_view = (uint16_t)(
+        view_base + JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET);
     jce_offscreen_target_composite_texture(bridge, comp_view, postfx_tex,
                                            (uint16_t)width, (uint16_t)height,
                                            jce_renderer_origin_bottom_left());
@@ -216,9 +272,8 @@ inline bool jce_editor_viewport_composite_postfx(JceOffscreenTarget *bridge,
 inline uint16_t jce_editor_viewport_ui_overlay_view(uint16_t view_base,
                                                     bool     postfx_composited)
 {
-    return postfx_composited
-        ? (uint16_t)(view_base + JCE_VIEW_POST_BASE + 22)
-        : (uint16_t)(view_base + 17);
+    (void)postfx_composited;
+    return (uint16_t)(view_base + JCE_EDITOR_VP_UI_OFFSET);
 }
 
 /* Submit a headless read-back capture of the texture the viewport DISPLAYS.
@@ -244,19 +299,47 @@ inline bool jce_editor_viewport_screenshot_submit(JceOffscreenTarget *bridge,
     }
     if (source == UINT16_MAX) return false;
     const uint16_t blit_view =
-        (uint16_t)(view_base + JCE_VIEW_POST_BASE + 24);
+        (uint16_t)(view_base + JCE_EDITOR_VP_SCREENSHOT_OFFSET);
     return jce_renderer_readback_capture_submit(source, blit_view,
                                                 width, height, path, yflip);
 }
 
 /* ── Occlusion culling ────────────────────────────────────────────── */
 
-/* JCE_DISABLE_OCCLUSION=1 turns GPU-query occlusion culling off in BOTH editor
- * viewports (A/B measurement + safety hatch, mirrors JCE_DISABLE_WCACHE). */
+/* Per-entity hardware-query occlusion culling is OPT-IN (JCE_ENABLE_OCCLUSION=1).
+ *
+ * It was on by default and measurement says it cannot pay for itself here.  The
+ * query budget is maxOcclusionQueries / share_count = 256 / 2 = 128 for an
+ * editor viewport, and JCE_DBG_OCC_STATS reports what that buys:
+ *
+ *   street_demo + 200k   tracked 27176, tested 105 (0.39%), occluded 101,
+ *                        visible 0 -- it decides nothing about 99.6% of the
+ *                        scene, and a screenshot A/B says the 0.4% it does
+ *                        decide is WRONG (0.216% of pixels differ against a
+ *                        0.059% run-to-run floor: it is culling geometry that
+ *                        is visible)
+ *   graveyard            tracked 178, tested 133 (74.7%), occluded 0 -- full
+ *                        coverage, nothing culled, pure cost
+ *
+ * The cost is not small: one proxy draw per tracked entity, each of which
+ * forces bgfx's D3D12 backend to flush its ExecuteIndirect batch, plus a
+ * per-frame scan of the whole 65536-slot result table to poll at most 128
+ * answers.  On the 200k bench it is 11-12% of the submit loop and triples the
+ * draw count by breaking instance runs (147 draws with it on, 45 with it off).
+ *
+ * Turning it OFF draws strictly MORE -- entity_visible returns true whenever
+ * there is no query result -- so this default cannot hide geometry.
+ *
+ * Shipping engines did not abandon occlusion culling; they abandoned ONE DRAW
+ * PER QUERY. Unreal batches queries and prefers Hi-Z, Godot 4 rasterises
+ * software occluders (Embree), Unity 6 uses a compute Hi-Z pass, id Tech and
+ * Frostbite use a software depth pyramid. JCE already has Hi-Z occlusion
+ * (JCE_HIZ_OCCLUSION, jce_gpu_scene.c) -- that is the path worth investing in,
+ * and it is unaffected by this switch. */
 inline bool jce_editor_viewport_occlusion_disabled(void)
 {
-    const char *dis = getenv("JCE_DISABLE_OCCLUSION");
-    return (dis && dis[0] && dis[0] != '0');
+    const char *en = getenv("JCE_ENABLE_OCCLUSION");
+    return !(en && en[0] && en[0] != '0');
 }
 
 /* Create a viewport's own two-pass GPU-query occlusion culler.  Each viewport

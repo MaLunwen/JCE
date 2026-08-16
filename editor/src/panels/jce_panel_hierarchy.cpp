@@ -108,14 +108,23 @@ void jce_editor_panel_hierarchy_content(void)
          * was O(n^2) (each get_root_id rescans g_entity_order), which became
          * catastrophic once the clipper let the display cap grow to 32768. */
         static uint32_t root_ids[HIERARCHY_MAX_DISPLAY];
+        uint64_t _t0_hr = jce_time_perf_counter();
         int root_count = jce_state_get_roots(root_ids, HIERARCHY_MAX_DISPLAY);
+        jce_perf_phase_add("ed_hier_roots",
+            jce_time_perf_to_ms(_t0_hr, jce_time_perf_counter()));
 
+        uint64_t _t0_hs = jce_time_perf_counter();
         sort_entity_ids(root_ids, root_count);
+        jce_perf_phase_add("ed_hier_sort",
+            jce_time_perf_to_ms(_t0_hs, jce_time_perf_counter()));
 
         /* Flatten the visible tree (full list → display_order + flat) then
          * render only the clipper-visible rows.  This is the perf fix: a
          * full-loaded scene flattens thousands of rows but submits ~30. */
+        uint64_t _t0_hf = jce_time_perf_counter();
         jce_hierarchy_flatten(root_ids, root_count);
+        jce_perf_phase_add("ed_hier_flat",
+            jce_time_perf_to_ms(_t0_hf, jce_time_perf_counter()));
 
         ImGuiListClipper clip;
         clip.Begin(s_hier.flat_count);

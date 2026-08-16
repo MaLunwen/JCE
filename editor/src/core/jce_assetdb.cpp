@@ -87,7 +87,19 @@ JceAssetKind classify(const std::string &ext_in)
         return JCE_ASSET_KIND_SCENE;
     if (e == ".sc" || e == ".sh" || e == ".bin" || e == ".sb")
         return JCE_ASSET_KIND_SHADER;
-    if (e == ".lua" || e == ".js" || e == ".ts" || e == ".py"
+    /* Every language the engine knows how to SHIP comes from the same
+     * authority as texture/model/audio above, so the picker offers a .py or
+     * a .java the moment the cooker learns to pack one — the two can no
+     * longer disagree about whether a file is attachable code.  Whether
+     * THIS BUILD can run it is a separate question the inspector asks the
+     * VM registry; a kind is what a file IS, not what is linked. */
+    if (jce_asset_script_language_from_ext(e.c_str()))
+        return JCE_ASSET_KIND_SCRIPT;
+    /* Code the engine does not execute but the browser should still file
+     * under "script" rather than "unknown": C/C++ translation units (the
+     * cpp backend compiles these, it does not load them by path) and the
+     * web-tooling extensions used by project-side scripts. */
+    if (e == ".js" || e == ".ts"
         || e == ".c" || e == ".cpp" || e == ".h" || e == ".hpp")
         return JCE_ASSET_KIND_SCRIPT;
     if (e == ".particle" || e == ".part"
@@ -248,6 +260,34 @@ const char *jce_assetdb_kind_label(JceAssetKind k)
     case JCE_ASSET_KIND_DATA:      return "data";
     default:                       return "unknown";
     }
+}
+
+const char *jce_assetdb_script_language(const char *path)
+{
+    if (!path || !path[0]) return NULL;
+    /* Deliberately the SHIPPED catalog and not jce_script_vm_language_for_
+     * path(): a .py must stay attachable in an editor that cannot run one,
+     * or authoring a script would require first building the backend that
+     * runs it.  The live registry additionally holds whatever extension a
+     * PROJECT claimed at runtime, which no editor process has ever loaded —
+     * see the note in jce_editor_script_backends.cpp about why the cpp
+     * backend cannot be registered here. */
+    return jce_asset_script_language_from_ext(path);
+}
+
+bool jce_assetdb_picker_accepts(int requested_kind, JceAssetKind entry_kind,
+                                const char *path)
+{
+    if (requested_kind == 0) return true;          /* "any" */
+    if ((int)entry_kind != requested_kind) return false;
+    /* A SCRIPT request is the one kind where matching is not enough: the
+     * caller is going to store this in a Script component's scriptPath, and
+     * .c/.cpp/.h/.js carry JCE_ASSET_KIND_SCRIPT so the browser can file
+     * project code as code.  Everything else is attachable by virtue of
+     * being the right kind. */
+    if (requested_kind == JCE_ASSET_KIND_SCRIPT)
+        return jce_assetdb_script_language(path) != NULL;
+    return true;
 }
 
 void jce_assetdb_set_root(const char *project_root)

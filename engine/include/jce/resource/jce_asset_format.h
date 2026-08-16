@@ -72,6 +72,7 @@ JCE_EXTERN_C_BEGIN
 #define JCEASSET_CHUNK_TEX_PIXELS 0x0100  /* raw RGBA8 pixel data */
 #define JCEASSET_CHUNK_TEX_GPU    0x0101  /* reserved for future GPU formats */
 #define JCEASSET_CHUNK_TEX_INFO   0x0102  /* JceAssetTexInfo struct */
+#define JCEASSET_CHUNK_TEX_NUMERIC_INFO 0x0103 /* JceAssetNumericInfo */
 
 /* Mesh chunks */
 #define JCEASSET_CHUNK_MESH_VERTICES  0x0200  /* vertex buffer */
@@ -155,6 +156,26 @@ typedef struct JceAssetTexInfo {
 #define JCEASSET_TEXFMT_ASTC_4x4    5   /* mobile RGBA, 1 byte/px            */
 #define JCEASSET_TEXFMT_ETC2_RGBA8  6   /* mobile RGBA fallback             */
 #define JCEASSET_TEXFMT_BC3         7   /* DXT5 — RGBA color, 1 byte/px      */
+#define JCEASSET_TEXFMT_R16F        8   /* one IEEE-754 binary16 channel     */
+#define JCEASSET_TEXFMT_RG16F       9   /* two IEEE-754 binary16 channels    */
+#define JCEASSET_TEXFMT_RGBA16F    10   /* four IEEE-754 binary16 channels   */
+#define JCEASSET_TEXFMT_R32F       11   /* one IEEE-754 binary32 channel     */
+#define JCEASSET_TEXFMT_RG32F      12   /* two IEEE-754 binary32 channels    */
+#define JCEASSET_TEXFMT_RGBA32F    13   /* four IEEE-754 binary32 channels   */
+
+#define JCEASSET_NUMERIC_FLAG_ALLOW_NONFINITE 0x00000001u
+
+typedef struct JceAssetNumericInfo {
+    uint32_t struct_size;
+    uint32_t row_pitch;
+    uint32_t channel_count;
+    uint32_t sampler_address;
+    uint32_t sampler_filter;
+    uint32_t color_space;
+    uint32_t flags;
+    uint32_t _reserved;
+    uint64_t decoded_hash;
+} JceAssetNumericInfo;
 
 /* Platform target IDs for the jce_pak --platform flag. */
 #define JCEASSET_PLATFORM_DESKTOP   0
@@ -209,6 +230,13 @@ typedef struct JceAssetAudioInfo {
 #define JCEASSET_HEADER_SIZE      32u
 #define JCEASSET_CHUNK_ENTRY_SIZE 32u
 
+typedef char JceAssetHeaderSizeMustBe32[
+    sizeof(JceAssetFileHeader) == JCEASSET_HEADER_SIZE ? 1 : -1];
+typedef char JceAssetChunkEntrySizeMustBe32[
+    sizeof(JceAssetChunkEntry) == JCEASSET_CHUNK_ENTRY_SIZE ? 1 : -1];
+typedef char JceAssetNumericInfoSizeMustBe40[
+    sizeof(JceAssetNumericInfo) == 40u ? 1 : -1];
+
 /* ================================================================== */
 /* Source-extension classification (single authority)                  */
 /* ================================================================== */
@@ -239,6 +267,89 @@ JCE_API int jce_asset_type_from_ext(const char *path);
 
 /* Convenience predicate for the very common texture test. */
 JCE_API bool jce_asset_ext_is_texture(const char *path);
+
+/* ================================================================== */
+/* Script-source classification (single authority)                     */
+/* ================================================================== */
+
+/*
+ * WHAT FORM a script file is in.  This is the only thing about a script
+ * that changes how the pipeline TREATS the bytes, which is why it is an
+ * enum and the language is a string.
+ */
+#define JCEASSET_SCRIPT_FORM_NONE      0 /* not a script file at all      */
+#define JCEASSET_SCRIPT_FORM_SOURCE    1 /* UTF-8 text a VM compiles      */
+#define JCEASSET_SCRIPT_FORM_BYTECODE  2 /* already-compiled binary blob  */
+/*
+ * REFERENCE — the path NAMES the script, it does not CONTAIN it.  The code
+ * was compiled before the process started and lives in a native module; what
+ * the extension identifies is a class inside that module, and the bytes at
+ * the path (if a file exists there at all) are never executed.
+ *
+ * It is a third value rather than a reuse of SOURCE because the one consumer
+ * that branches on `form` is the archive cooker's compression class
+ * (engine/src/resource/jce_archive_cook.c), whose SOURCE arm means "put these
+ * bytes in the shared TEXT dictionary because a VM will compile them".  For a
+ * reference that sentence is false in both halves, and a form that lied about
+ * it would be a comment nothing enforces wearing an enum's clothes.
+ * *Enforced by:* tests/os/resource/test_jce_asset_ext.c ::
+ * test_a_reference_form_script_is_neither_source_nor_bytecode.
+ */
+#define JCEASSET_SCRIPT_FORM_REFERENCE 3 /* the path names code elsewhere */
+
+/*
+ * The scripting LANGUAGE whose files carry this extension, or NULL.
+ *
+ * This is the one authoritative script-extension table in the engine, and
+ * it exists for the same reason as jce_asset_type_from_ext() above: before
+ * it, ".lua" was spelled into the bundle contract twice, into the archive
+ * compressor's text class once, and into the editor's asset database once
+ * more — so a .py attached to an entity was labelled "binary" in the
+ * bundle manifest and dropped outright by the editor's publication policy,
+ * a failure that only appears in a PACKAGED build because the editor keeps
+ * loading it from loose files.
+ *
+ * WHAT THIS IS NOT: it is not "which VM can run this".  That question is
+ * answered per-process by the VM registry
+ * (jce_script_vm_language_for_path, <jce/middleware/script/jce_script_vm.h>)
+ * and its answer depends on which backends this executable linked.  The two
+ * are deliberately different:
+ *
+ *   - this table must NOT depend on build options, because an offline
+ *     cooker with no Python linked still has to pack turret.py into the
+ *     bundle that a Python-enabled runtime will load;
+ *   - the registry must NOT be a static list, because a backend claims its
+ *     own extension from its own register() and no engine file learns
+ *     about a sixth language.
+ *
+ * A consumer that needs "can this build actually run it" asks the registry
+ * ON TOP of this call and reports the two conditions separately — an
+ * unlinked backend and an unknown language have different fixes.
+ * *Was enforced by* (no longer checked — tools/audit/ was removed):
+ * check_script_language_catalog.py, which fails
+ * when a backend under scripting/ claims an extension this table does not
+ * know, or claims it for a different language.
+ *
+ * `path` may be a full path or a bare extension, with or without the dot;
+ * matching is case-insensitive.  The returned pointer is a string literal.
+ */
+JCE_API const char *jce_asset_script_language_from_ext(const char *path);
+
+/*
+ * The payload-contract token a file with this extension carries in a bundle
+ * manifest's JCE_BUNDLE_KEY_REPRESENTATION field ("lua.source",
+ * "python.source", "java.class", ...), or NULL when it is not a script.
+ * Descriptive only — see the note on jce_asset_script_form_from_ext() for
+ * the part of this that is actually load-bearing.
+ */
+JCE_API const char *jce_asset_script_representation_from_ext(const char *path);
+
+/*
+ * JCEASSET_SCRIPT_FORM_* for this extension, JCEASSET_SCRIPT_FORM_NONE when
+ * it is not a script.  The archive cooker keys its compression class off
+ * this: SOURCE joins the shared text dictionary, BYTECODE does not.
+ */
+JCE_API int jce_asset_script_form_from_ext(const char *path);
 
 JCE_EXTERN_C_END
 

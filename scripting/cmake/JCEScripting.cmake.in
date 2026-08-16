@@ -1,0 +1,528 @@
+# JCEScripting.cmake — GENERATED from scripting/cmake/JCEScripting.cmake.in.
+#                       DO NOT EDIT the installed copy.
+#
+# The scripting layer's half of find_package(JCE).  JCEConfig.cmake includes
+# this file OPTIONALly, so an SDK built with every backend off is byte-for-byte
+# the engine-only SDK it always was — this file is simply not installed.
+#
+# ── WHAT THIS DECLARES ─────────────────────────────────────────────────
+#
+#   JCE::ScriptApi        the script-facing C ABI shared library
+#   JCE::ScriptCpp        header-only C++ wrapper over it (a script calls down)
+#   JCE::ScriptCppModule  what a C++ SCRIPT MODULE links (no registry)
+#   JCE::ScriptVmCpp      the "cpp"    JceScriptVM (the engine calls up)
+#   JCE::ScriptVmC        the "c"      JceScriptVM — a second LANGUAGE over
+#                         the same native class registry, not a second registry
+#   JCE::ScriptCModule    what a C SCRIPT MODULE links (no registry)
+#   JCE::ScriptVmPython   the "python" JceScriptVM
+#   JCE::ScriptVmJava     the "java"   JceScriptVM
+#   JCE::ScriptJava       the JNI shim the JVM loads (never linked)
+#
+# and, for each, THE IN-TREE NAME AS AN ALIAS — `jce_script_vm_python`,
+# `jce_script_api`, … — so that
+#
+#     if(TARGET jce_script_vm_python)
+#         target_link_libraries(MyGame PRIVATE jce_script_vm_python jce_script_api)
+#     endif()
+#
+# is the same five lines whether the project is built inside this repository
+# or against an installed SDK.  Two spellings for one question is how a
+# project ends up with a branch that only ever ran in one of the two worlds.
+#
+# ── AND THE PIECES THAT ARE NOT LINKED ─────────────────────────────────
+#
+#   JCE_SCRIPT_LANGUAGES            e.g. "cpp;java;python" — beyond Lua, which
+#                                   is inside the engine and always present
+#   JCE_SCRIPT_API_LIBRARY          the shared library, as a file
+#   JCE_SCRIPT_PYTHON_PACKAGE_DIR   put THIS on sys.path; it holds jce_script/
+#   JCE_SCRIPT_PYTHON_VERSION       the CPython the shim was compiled against
+#   JCE_SCRIPT_JAVA_CLASS_PATH      compiled com/jce/script/*.class
+#   JCE_SCRIPT_JAVA_JNI_LIBRARY     jce_script_java, loaded BY the JVM
+#
+# Three of those are runtime inputs a game must hand the backend before the
+# first scene loads (sys.path, class path, the JNI shim's absolute path).  A
+# backend that is linked but never told where its runtime lives fails at the
+# first script, inside the consumer's process, with a message about an import.
+#
+# ── COMPONENTS ─────────────────────────────────────────────────────────
+#
+#     find_package(JCE REQUIRED COMPONENTS ScriptPython)
+#
+# fails, by name, on an SDK that cannot run Python — including the engine-only
+# SDK where this file does not exist at all, because then JCE_ScriptPython_FOUND
+# is never set and JCEConfig.cmake's check_required_components(JCE) reports it.
+# That is the whole reason components are wired up here: the failure this layer
+# had before was not an error, it was NOTHING — no target, no variable, no
+# message, and a game that shipped on Lua without anybody deciding to.
+
+if(NOT DEFINED PACKAGE_PREFIX_DIR)
+	message(FATAL_ERROR
+		"JCEScripting.cmake was included directly. It is a part of "
+		"JCEConfig.cmake and reads PACKAGE_PREFIX_DIR from it; include "
+		"JCEConfig.cmake (i.e. find_package(JCE)) instead.")
+endif()
+
+set(_jce_s_lib   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@")
+set(_jce_s_inc   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+set(_jce_s_share "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce/scripting")
+
+set(JCE_SCRIPTING_FOUND TRUE)
+set(JCE_SCRIPT_LANGUAGES "")
+
+# ---------------------------------------------------------------------- #
+#  _jce_script_config_file — the per-config artefact that is actually     #
+#  on disk.                                                              #
+#                                                                        #
+#  The SDK's libraries live in lib/Release/ and lib/Debug/, and a given   #
+#  SDK may hold either, both, or (for a cross build) only the one its     #
+#  producer had a toolchain for.  Same probe JCEConfig.cmake runs for the #
+#  fat libs, for the same reason: EXISTS is the only honest test — a      #
+#  path built by string concatenation always "exists" to CMake's `if`.    #
+# ---------------------------------------------------------------------- #
+function(_jce_script_config_file OUT_REL OUT_DBG BASENAME)
+	set(_r "${_jce_s_lib}/Release/${BASENAME}")
+	set(_d "${_jce_s_lib}/Debug/${BASENAME}")
+	if(NOT EXISTS "${_r}")
+		set(_r "")
+	endif()
+	if(NOT EXISTS "${_d}")
+		set(_d "")
+	endif()
+	set(${OUT_REL} "${_r}" PARENT_SCOPE)
+	set(${OUT_DBG} "${_d}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------- #
+#  _jce_script_add_static — one imported archive, both configurations.    #
+# ---------------------------------------------------------------------- #
+function(_jce_script_add_static TARGET_NAME BASENAME OUT_OK)
+	_jce_script_config_file(_rel _dbg
+		"@CMAKE_STATIC_LIBRARY_PREFIX@${BASENAME}@CMAKE_STATIC_LIBRARY_SUFFIX@")
+	if(NOT _rel AND NOT _dbg)
+		set(${OUT_OK} FALSE PARENT_SCOPE)
+		return()
+	endif()
+	add_library(${TARGET_NAME} STATIC IMPORTED GLOBAL)
+	set_target_properties(${TARGET_NAME} PROPERTIES
+		INTERFACE_INCLUDE_DIRECTORIES "${_jce_s_inc}")
+	if(_rel)
+		set_property(TARGET ${TARGET_NAME} APPEND PROPERTY
+			IMPORTED_CONFIGURATIONS RELEASE)
+		set_target_properties(${TARGET_NAME} PROPERTIES
+			IMPORTED_LOCATION_RELEASE "${_rel}"
+			MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+			MAP_IMPORTED_CONFIG_MINSIZEREL     RELEASE)
+	endif()
+	if(_dbg)
+		set_property(TARGET ${TARGET_NAME} APPEND PROPERTY
+			IMPORTED_CONFIGURATIONS DEBUG)
+		set_target_properties(${TARGET_NAME} PROPERTIES
+			IMPORTED_LOCATION_DEBUG "${_dbg}")
+	elseif(_rel)
+		# A Release-only SDK consumed by a Debug build: without this the
+		# imported target resolves to nothing and the link fails naming a
+		# path that was never installed.
+		set_target_properties(${TARGET_NAME} PROPERTIES
+			MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+	endif()
+	set(${OUT_OK} TRUE PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------- #
+#  jce_script_api — SHARED, and the only target here that is a .dll.      #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptApi_FOUND FALSE)
+set(JCE_SCRIPT_API_LIBRARY "")
+if(@JCE_SDK_SCRIPT_HAVE_API@)
+	_jce_script_config_file(_api_rel _api_dbg
+		"@CMAKE_SHARED_LIBRARY_PREFIX@jce_script_api@CMAKE_SHARED_LIBRARY_SUFFIX@")
+	if(_api_rel OR _api_dbg)
+		add_library(JCE::ScriptApi SHARED IMPORTED GLOBAL)
+		set_target_properties(JCE::ScriptApi PROPERTIES
+			INTERFACE_INCLUDE_DIRECTORIES "${_jce_s_inc}")
+		if(_api_rel)
+			set_property(TARGET JCE::ScriptApi APPEND PROPERTY
+				IMPORTED_CONFIGURATIONS RELEASE)
+			set_target_properties(JCE::ScriptApi PROPERTIES
+				IMPORTED_LOCATION_RELEASE "${_api_rel}"
+				MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+				MAP_IMPORTED_CONFIG_MINSIZEREL     RELEASE)
+			set(JCE_SCRIPT_API_LIBRARY "${_api_rel}")
+		endif()
+		if(_api_dbg)
+			set_property(TARGET JCE::ScriptApi APPEND PROPERTY
+				IMPORTED_CONFIGURATIONS DEBUG)
+			set_target_properties(JCE::ScriptApi PROPERTIES
+				IMPORTED_LOCATION_DEBUG "${_api_dbg}")
+			if(NOT JCE_SCRIPT_API_LIBRARY)
+				set(JCE_SCRIPT_API_LIBRARY "${_api_dbg}")
+			endif()
+		elseif(_api_rel)
+			set_target_properties(JCE::ScriptApi PROPERTIES
+				MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+		endif()
+		# On Windows a SHARED IMPORTED target is not linkable without its
+		# import library.  Every consumer of this target links it (the C++
+		# wrapper is inline calls into it), so a missing IMPLIB is an
+		# unresolved-symbol wall rather than a missing file.
+		if(WIN32)
+			_jce_script_config_file(_imp_rel _imp_dbg
+				"@CMAKE_IMPORT_LIBRARY_PREFIX@jce_script_api@CMAKE_IMPORT_LIBRARY_SUFFIX@")
+			if(_imp_rel)
+				set_target_properties(JCE::ScriptApi PROPERTIES
+					IMPORTED_IMPLIB_RELEASE "${_imp_rel}")
+			endif()
+			if(_imp_dbg)
+				set_target_properties(JCE::ScriptApi PROPERTIES
+					IMPORTED_IMPLIB_DEBUG "${_imp_dbg}")
+			endif()
+			if(NOT _imp_rel AND NOT _imp_dbg)
+				message(WARNING
+					"JCE scripting: jce_script_api was installed without an "
+					"import library; linking JCE::ScriptApi on Windows will "
+					"fail with unresolved jce_script_api_* symbols.")
+			endif()
+		endif()
+		add_library(jce_script_api ALIAS JCE::ScriptApi)
+		set(JCE_ScriptApi_FOUND TRUE)
+	endif()
+	unset(_api_rel)
+	unset(_api_dbg)
+	unset(_imp_rel)
+	unset(_imp_dbg)
+endif()
+
+# ---------------------------------------------------------------------- #
+#  scripting/cpp                                                          #
+#                                                                         #
+#  JCE_ScriptCpp_FOUND means THE ENGINE CAN RUN C++ SCRIPTS — the VM       #
+#  archive is here.  It does NOT promise the call-down wrapper: that one   #
+#  is a wrapper over jce_script_api, so an SDK built with                  #
+#  -DJCE_BUILD_SCRIPT_API_SHARED=OFF ships the VM and not the wrapper,     #
+#  exactly as the in-tree build does (scripting/cpp/CMakeLists.txt is      #
+#  explicit that turning the C ABI off must not take the VM with it).      #
+#  A module author needs the wrapper; the engine does not.  Test for       #
+#  TARGET JCE::ScriptCppModule rather than for this component if you are   #
+#  BUILDING a module.                                                      #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptCpp_FOUND FALSE)
+if(@JCE_SDK_SCRIPT_HAVE_CPP@)
+	_jce_script_add_static(JCE::ScriptVmCpp jce_script_vm_cpp _ok)
+	if(_ok)
+		# jce_script and jce_platform, which this archive calls, are inside the
+		# engine fat lib.  JCE::JCE and not JCE::Core: a game that runs C++
+		# scripts is an application, and JCE::Core exists for tools that
+		# supply their own main().
+		set_property(TARGET JCE::ScriptVmCpp APPEND PROPERTY
+			INTERFACE_LINK_LIBRARIES JCE::JCE)
+		add_library(jce_script_vm_cpp ALIAS JCE::ScriptVmCpp)
+		list(APPEND JCE_SCRIPT_LANGUAGES cpp)
+		set(JCE_ScriptCpp_FOUND TRUE)
+	endif()
+	unset(_ok)
+
+	# The two INTERFACE targets. They are headers plus a link rule, so they are
+	# re-declared here rather than imported: there is no file to point at.
+	if(TARGET JCE::ScriptApi AND NOT TARGET JCE::ScriptCpp)
+		add_library(JCE::ScriptCpp INTERFACE IMPORTED GLOBAL)
+		set_target_properties(JCE::ScriptCpp PROPERTIES
+			INTERFACE_INCLUDE_DIRECTORIES "${_jce_s_inc}"
+			INTERFACE_LINK_LIBRARIES      "JCE::ScriptApi"
+			INTERFACE_COMPILE_FEATURES    "cxx_std_17")
+		add_library(jce_script_cpp ALIAS JCE::ScriptCpp)
+
+		# Deliberately NOT linked to JCE::ScriptVmCpp — the registry is the
+		# HOST's, and a module carrying its own copy publishes its classes
+		# into a registry the engine never reads.  Same rule as in-tree.
+		add_library(JCE::ScriptCppModule INTERFACE IMPORTED GLOBAL)
+		set_target_properties(JCE::ScriptCppModule PROPERTIES
+			INTERFACE_INCLUDE_DIRECTORIES "${_jce_s_inc}"
+			INTERFACE_LINK_LIBRARIES      "JCE::ScriptCpp"
+			INTERFACE_COMPILE_FEATURES    "cxx_std_17")
+		add_library(jce_script_cpp_module ALIAS JCE::ScriptCppModule)
+	endif()
+endif()
+
+# ---------------------------------------------------------------------- #
+#  scripting/c                                                            #
+#                                                                         #
+#  JCE_ScriptC_FOUND means THE ENGINE CAN RUN C SCRIPTS.  It requires      #
+#  JCE::ScriptVmCpp, and that is not a packaging accident: "c" is a        #
+#  second registered LANGUAGE over the native class registry the cpp       #
+#  archive owns, so jce_script_vm_c.lib alone links with an unresolved     #
+#  jce_script_vm_cpp_create_for.  An SDK cannot ship one without the       #
+#  other, and this block refuses rather than declaring a target whose      #
+#  first use fails at the consumer's link step.                            #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptC_FOUND FALSE)
+if(@JCE_SDK_SCRIPT_HAVE_C@)
+	if(NOT TARGET JCE::ScriptVmCpp)
+		message(STATUS
+			"JCE: the c scripting VM shipped without the cpp one it is built "
+			"over — JCE::ScriptVmC not declared. This SDK is inconsistent; "
+			"rebuild it.")
+	else()
+		_jce_script_add_static(JCE::ScriptVmC jce_script_vm_c _ok)
+		if(_ok)
+			set_property(TARGET JCE::ScriptVmC APPEND PROPERTY
+				INTERFACE_LINK_LIBRARIES JCE::ScriptVmCpp)
+			add_library(jce_script_vm_c ALIAS JCE::ScriptVmC)
+			list(APPEND JCE_SCRIPT_LANGUAGES c)
+			set(JCE_ScriptC_FOUND TRUE)
+		endif()
+		unset(_ok)
+
+		# The module target. Headers plus a link rule, so it is re-declared
+		# rather than imported — and, like its C++ twin, deliberately NOT
+		# linked to the VM archive: the registry is the HOST's.
+		#
+		# NO cxx_std_17 here. A C module is C99, and demanding a C++ feature
+		# from a C target is how a plain-C consumer discovers that "C support"
+		# quietly needed a C++ compiler.
+		if(TARGET JCE::ScriptApi AND NOT TARGET JCE::ScriptCModule)
+			add_library(JCE::ScriptCModule INTERFACE IMPORTED GLOBAL)
+			set_target_properties(JCE::ScriptCModule PROPERTIES
+				INTERFACE_INCLUDE_DIRECTORIES "${_jce_s_inc}"
+				INTERFACE_LINK_LIBRARIES      "JCE::ScriptApi")
+			add_library(jce_script_c_module ALIAS JCE::ScriptCModule)
+		endif()
+	endif()
+endif()
+
+# ---------------------------------------------------------------------- #
+#  scripting/python                                                       #
+#                                                                         #
+#  The archive references CPython by symbol (Py_InitializeFromConfig, …)   #
+#  and cannot carry it: the interpreter is the CONSUMER's, and it must be  #
+#  the same minor version the shim was compiled against or the link        #
+#  resolves against a different pythonXY and fails, or worse, does not.    #
+#  So the probe is EXACT on major.minor and the mismatch is reported with  #
+#  BOTH numbers — one number cannot say which side is wrong.               #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptPython_FOUND FALSE)
+set(JCE_SCRIPT_PYTHON_VERSION "@JCE_SDK_SCRIPT_PYTHON_VERSION@")
+set(JCE_SCRIPT_PYTHON_PACKAGE_DIR "")
+if(IS_DIRECTORY "${_jce_s_share}/python/jce_script")
+	set(JCE_SCRIPT_PYTHON_PACKAGE_DIR "${_jce_s_share}/python")
+endif()
+if(@JCE_SDK_SCRIPT_HAVE_PYTHON@)
+	set(_jce_py_need "")
+	if(JCE_SCRIPT_PYTHON_VERSION MATCHES "^([0-9]+)\\.([0-9]+)")
+		set(_jce_py_need "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+	endif()
+	# A MINIMUM version to find_package, and the exactness checked below by
+	# hand.  find_package(... EXACT) compares the whole version string, so
+	# "3.12 EXACT" rejects the 3.12.4 that is the only thing anybody has
+	# installed — a probe that is exact about the wrong digit.  What actually
+	# has to match is major.minor, because that is what names pythonXY and
+	# what the C ABI of the interpreter is versioned by.
+	find_package(Python3 ${_jce_py_need} COMPONENTS Development.Embed QUIET)
+
+	set(_jce_py_have "")
+	if(DEFINED Python3_VERSION_MAJOR AND DEFINED Python3_VERSION_MINOR)
+		set(_jce_py_have "${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}")
+	endif()
+	if(Python3_Development.Embed_FOUND AND _jce_py_need
+	   AND NOT _jce_py_have STREQUAL _jce_py_need)
+		message(STATUS
+			"JCE scripting: found CPython ${Python3_VERSION} but "
+			"jce_script_vm_python was compiled against ${JCE_SCRIPT_PYTHON_VERSION}. "
+			"Both numbers are here because one cannot say which side is "
+			"wrong: major.minor names the interpreter's own C ABI, and "
+			"linking the archive against a different one resolves to a "
+			"different pythonXY or to nothing at all.")
+		set(Python3_Development.Embed_FOUND FALSE)
+	endif()
+	unset(_jce_py_have)
+
+	if(NOT Python3_Development.Embed_FOUND)
+		# STATUS and not WARNING: a consumer that never asked for Python
+		# scripting does not need a warning about it.  A consumer that DID
+		# ask gets a hard failure instead — JCE_ScriptPython_FOUND stays
+		# FALSE and JCEConfig.cmake's check_required_components(JCE) refuses
+		# find_package(JCE REQUIRED COMPONENTS ScriptPython) by name.
+		message(STATUS
+			"JCE scripting: this SDK can run Python scripts but no embeddable "
+			"CPython ${_jce_py_need} was found (Python3 COMPONENTS "
+			"Development.Embed). Install the matching Python development "
+			"headers and import library; the version is not a preference, it "
+			"is the one jce_script_vm_python was compiled against.")
+	elseif(NOT JCE_SCRIPT_PYTHON_PACKAGE_DIR)
+		message(STATUS
+			"JCE scripting: this SDK ships jce_script_vm_python but not the "
+			"jce_script Python package. The backend would link and then fail "
+			"at the first script with ImportError: no module named jce_script.")
+	else()
+		_jce_script_add_static(JCE::ScriptVmPython jce_script_vm_python _ok)
+		if(_ok)
+			set_property(TARGET JCE::ScriptVmPython APPEND PROPERTY
+				INTERFACE_LINK_LIBRARIES JCE::JCE Python3::Python)
+			add_library(jce_script_vm_python ALIAS JCE::ScriptVmPython)
+			list(APPEND JCE_SCRIPT_LANGUAGES python)
+			set(JCE_ScriptPython_FOUND TRUE)
+		endif()
+		unset(_ok)
+	endif()
+	unset(_jce_py_need)
+endif()
+
+# ---------------------------------------------------------------------- #
+#  scripting/java                                                         #
+#                                                                         #
+#  NO JDK IS NEEDED TO BUILD AGAINST THIS.  jce_script_vm_java links no    #
+#  JVM: it opens one at runtime by absolute path, which is why the SDK     #
+#  ships the compiled classes and the JNI shim but asks the consumer for   #
+#  nothing at configure time.  jce_script_java is loaded BY the JVM and is #
+#  therefore never a link dependency — it is a file path, and it is here   #
+#  as a target only so `$<TARGET_FILE:JCE::ScriptJava>` works in a copy.   #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptJava_FOUND FALSE)
+set(JCE_SCRIPT_JAVA_CLASS_PATH "")
+set(JCE_SCRIPT_JAVA_JNI_LIBRARY "")
+if(IS_DIRECTORY "${_jce_s_share}/java/classes")
+	set(JCE_SCRIPT_JAVA_CLASS_PATH "${_jce_s_share}/java/classes")
+endif()
+if(@JCE_SDK_SCRIPT_HAVE_JAVA@)
+	_jce_script_config_file(_jni_rel _jni_dbg
+		"@CMAKE_SHARED_LIBRARY_PREFIX@jce_script_java@CMAKE_SHARED_LIBRARY_SUFFIX@")
+	if(_jni_rel OR _jni_dbg)
+		add_library(JCE::ScriptJava MODULE IMPORTED GLOBAL)
+		if(_jni_rel)
+			set_property(TARGET JCE::ScriptJava APPEND PROPERTY
+				IMPORTED_CONFIGURATIONS RELEASE)
+			set_target_properties(JCE::ScriptJava PROPERTIES
+				IMPORTED_LOCATION_RELEASE "${_jni_rel}"
+				MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+				MAP_IMPORTED_CONFIG_MINSIZEREL     RELEASE)
+			set(JCE_SCRIPT_JAVA_JNI_LIBRARY "${_jni_rel}")
+		endif()
+		if(_jni_dbg)
+			set_property(TARGET JCE::ScriptJava APPEND PROPERTY
+				IMPORTED_CONFIGURATIONS DEBUG)
+			set_target_properties(JCE::ScriptJava PROPERTIES
+				IMPORTED_LOCATION_DEBUG "${_jni_dbg}")
+			if(NOT JCE_SCRIPT_JAVA_JNI_LIBRARY)
+				set(JCE_SCRIPT_JAVA_JNI_LIBRARY "${_jni_dbg}")
+			endif()
+		elseif(_jni_rel)
+			set_target_properties(JCE::ScriptJava PROPERTIES
+				MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+		endif()
+		add_library(jce_script_java ALIAS JCE::ScriptJava)
+	endif()
+	unset(_jni_rel)
+	unset(_jni_dbg)
+
+	_jce_script_add_static(JCE::ScriptVmJava jce_script_vm_java _ok)
+	if(_ok)
+		set_property(TARGET JCE::ScriptVmJava APPEND PROPERTY
+			INTERFACE_LINK_LIBRARIES JCE::JCE)
+		add_library(jce_script_vm_java ALIAS JCE::ScriptVmJava)
+		if(NOT JCE_SCRIPT_JAVA_CLASS_PATH)
+			message(STATUS
+				"JCE scripting: this SDK ships jce_script_vm_java but no "
+				"compiled com/jce/script classes. A Java script would reach "
+				"the JVM and die with ClassNotFoundException; compile them "
+				"with scripting/java/build_java.py and set the class path "
+				"yourself.")
+		elseif(NOT JCE_SCRIPT_JAVA_JNI_LIBRARY)
+			message(STATUS
+				"JCE scripting: this SDK ships jce_script_vm_java but no "
+				"jce_script_java shim. Every engine call FROM a Java script "
+				"would throw UnsatisfiedLinkError.")
+		else()
+			list(APPEND JCE_SCRIPT_LANGUAGES java)
+			set(JCE_ScriptJava_FOUND TRUE)
+		endif()
+	endif()
+	unset(_ok)
+endif()
+
+# ---------------------------------------------------------------------- #
+#  jce_script_stage_runtime(<target>)                                     #
+#                                                                         #
+#  Copies the shared libraries that are LOADED BY NAME — jce_script_api    #
+#  and, if present, jce_script_java — next to <target>'s executable.       #
+#                                                                         #
+#  This is a build step and not documentation because of how it fails      #
+#  when it is skipped: the loader cannot find the library, and on Windows  #
+#  that is a process that does not start, with no message from the engine  #
+#  at all.  Both in-tree consumers (editor/CMakeLists.txt and the sample   #
+#  projects) already do exactly this by hand; an SDK consumer had no way   #
+#  to, because it had no target to ask for the file.                       #
+#                                                                         #
+#  PLATFORM NOTE, stated because the engine's own error message is         #
+#  Windows-shaped: the Python binding searches $JCE_SCRIPT_API, then the   #
+#  directory holding jce_script/, then the working directory, and only     #
+#  then the loader's own path.  On Windows the loader's path includes the  #
+#  executable's directory, so "beside the exe" is found.  On Linux and     #
+#  macOS it does not — set JCE_SCRIPT_API, or pass the absolute path.      #
+#  JCE_SCRIPT_API_LIBRARY above is that path.                              #
+# ---------------------------------------------------------------------- #
+function(jce_script_stage_runtime TARGET_NAME)
+	if(NOT TARGET ${TARGET_NAME})
+		message(FATAL_ERROR
+			"jce_script_stage_runtime(${TARGET_NAME}): no such target.")
+	endif()
+	set(_staged 0)
+	foreach(_t JCE::ScriptApi JCE::ScriptJava)
+		if(TARGET ${_t})
+			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+				COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+					"$<TARGET_FILE:${_t}>" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+				VERBATIM)
+			math(EXPR _staged "${_staged}+1")
+		endif()
+	endforeach()
+	if(_staged EQUAL 0)
+		message(WARNING
+			"jce_script_stage_runtime(${TARGET_NAME}): this SDK ships no "
+			"script runtime library to stage. Nothing was added, and the "
+			"call is a no-op rather than a guarantee.")
+	endif()
+endfunction()
+
+# ---------------------------------------------------------------------- #
+#  jce_script_java_find_jvm(<out_var>)                                    #
+#                                                                         #
+#  The JVM library jce_script_vm_java_configure() opens at runtime.  It    #
+#  is resolved from JAVA_HOME and not from the JDK this SDK was built      #
+#  against, because the two are allowed to differ — only jni.h has to      #
+#  match, and it is compiled in already.  Sets <out_var> to "" when there  #
+#  is no JAVA_HOME, so the caller can report it in its own words.          #
+# ---------------------------------------------------------------------- #
+function(jce_script_java_find_jvm OUT_VAR)
+	set(_home "$ENV{JAVA_HOME}")
+	if(NOT _home AND DEFINED JAVA_HOME)
+		set(_home "${JAVA_HOME}")
+	endif()
+	# TO_CMAKE_PATH, and it is not cosmetic.  JAVA_HOME on Windows is
+	# "D:\Java21\openjdk-21", and the first thing a consumer does with this
+	# value is put it in a compile definition — where \J and \o are
+	# unrecognised escape sequences (MSVC C4129) and the path the program
+	# ends up holding is not the path CMake found.  Measured: the first build
+	# of tests/sdk_smoke_scripting warned four times and would have handed the
+	# JVM loader a mangled name.
+	file(TO_CMAKE_PATH "${_home}" _home)
+	set(_jvm "")
+	if(_home)
+		if(WIN32)
+			set(_cand "${_home}/bin/server/jvm.dll")
+		elseif(APPLE)
+			set(_cand "${_home}/lib/server/libjvm.dylib")
+		else()
+			set(_cand "${_home}/lib/server/libjvm.so")
+		endif()
+		if(EXISTS "${_cand}")
+			set(_jvm "${_cand}")
+		endif()
+	endif()
+	set(${OUT_VAR} "${_jvm}" PARENT_SCOPE)
+endfunction()
+
+if(JCE_SCRIPT_LANGUAGES)
+	list(SORT JCE_SCRIPT_LANGUAGES)
+	message(STATUS
+		"JCE scripting: this SDK can run lua (built in) plus "
+		"${JCE_SCRIPT_LANGUAGES}")
+endif()

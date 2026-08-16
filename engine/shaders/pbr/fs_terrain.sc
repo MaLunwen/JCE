@@ -3,10 +3,14 @@ $input v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v
 #include <bgfx_shader.sh>
 #include "pbr_common.sh"
 #include "fog_apply.sh"
+#include "shadow_debug.sh"
 
 // Material uniforms
 uniform vec4 u_baseColorFactor;
 uniform vec4 u_pbrParams;       // x=metallic, y=roughness, z=aoStrength, w=alphaCutoff
+uniform vec4 u_ssaoParams;      // x=SSAO active, yz=1/AO target size, w=contact shadows
+uniform vec4 u_weatherSurface;  // x=wetness y=snow zw=reserved
+#include "wetness.sh"
 uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 2=blend)
 uniform vec4 u_cameraPos;       // xyz=world-space camera position
 uniform vec4 u_normalScale;     // x=normal map scale (x<0 => checker fallback), y=doubleSided flag
@@ -43,11 +47,36 @@ uniform vec4 u_lightCounts;
 
 // Texture samplers
 SAMPLER2D(s_albedo,     0);
-SAMPLER2D(s_metalRough, 1);
+/* Stage 1 was s_metalRough: DECLARED and never read on the terrain path --
+ * terrain takes metallic and roughness from u_pbrParams, not from a texture.
+ * It now carries the screen-space ambient occlusion target, which terrain had
+ * no way to receive at all: every one of terrain's sixteen stages was spoken
+ * for on paper, and two of them (this and s_normalMap at 2) were spoken for by
+ * samplers nothing sampled.
+ *
+ * Screen UV, exactly as fs_pbr_body.sh does it, so the ground and the things
+ * standing on it darken by the same rule at the same contact. */
+SAMPLER2D(s_terrainAO, 1);
 SAMPLER2D(s_normalMap,  2);
-SAMPLER2D(s_aoMap,      3);
+/* Stage 3 was s_aoMap: DECLARED but never bound and never read on the terrain
+ * path (terrain has its own draw path and binds nothing here).  An unbound
+ * sampler is harmless until something reads it and undefined the moment
+ * anything does -- which is exactly how a previous cloud-shadow attempt turned
+ * the whole ground black.  Reusing the stage rather than leaving the hazard in
+ * place is what makes room for the cloud shadow at zero cost: terrain really
+ * does occupy all 16 stages (0-8 material/IBL, 9-12 CSM cascades, 13 splat,
+ * 14-15 layers), so this was the only one available. */
+SAMPLER2D(s_cloudShadow, 3);
+/* x = world extent the map covers (0 = no cloud shadow)
+ * yz = map centre in world XZ
+ * w  = strength (0..1) */
+uniform vec4 u_cloudShadow;
 SAMPLER2D(s_emissive,   4);
-SAMPLER2D(s_shadowMap,  5);
+/* s_shadowMap (stage 5) is declared by csm_shadow.sh, included below: under
+ * CSM that stage carries the DYNAMIC-caster atlas and the header is what
+ * samples it, so the declaration belongs with the code that owns the meaning.
+ * The single-light path further down still uses the same name for the same
+ * stage -- the two are mutually exclusive at the bind site. */
 
 // Shadow uniforms
 uniform mat4 u_shadowVP;
@@ -114,138 +143,9 @@ uniform vec4 u_terrainTileUV;
 // Convert NDC depth to [0,1] range for shadow comparison.
 // OpenGL (GLSL): NDC z is in [-1,1], needs remap.
 // D3D / Vulkan / Metal: NDC z is already in [0,1].
-float toShadowDepth(float ndc_z)
-{
-#if BGFX_SHADER_LANGUAGE_GLSL
-    return ndc_z * 0.5 + 0.5;
-#else
-    return ndc_z;
-#endif
-}
+#include "csm_shadow.sh"
 
-float csm_sample_depth(int cascade, vec2 uv)
-{
-    if      (cascade == 0) return texture2D(s_csmShadow0, uv).r;
-    else if (cascade == 1) return texture2D(s_csmShadow1, uv).r;
-    else if (cascade == 2) return texture2D(s_csmShadow2, uv).r;
-    return texture2D(s_csmShadow3, uv).r;
-}
-
-vec4 csm_clip_for_cascade(int cascade, vec3 world_pos)
-{
-    if      (cascade == 0) return mul(u_csmVP[0], vec4(world_pos, 1.0));
-    else if (cascade == 1) return mul(u_csmVP[1], vec4(world_pos, 1.0));
-    else if (cascade == 2) return mul(u_csmVP[2], vec4(world_pos, 1.0));
-    return mul(u_csmVP[3], vec4(world_pos, 1.0));
-}
-
-float csm_bias_scale_for_cascade(int cascade)
-{
-    if      (cascade == 0) return u_csmBiasScales.x;
-    else if (cascade == 1) return u_csmBiasScales.y;
-    else if (cascade == 2) return u_csmBiasScales.z;
-    return u_csmBiasScales.w;
-}
-
-// Stable per-fragment hash for PCF kernel rotation (breaks grid patterns).
-float shadow_hash(vec3 p)
-{
-    p = fract(p * vec3(443.897, 441.423, 437.195));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
-}
-
-float sample_csm_shadow(int cascade,
-                        vec3 world_pos,
-                        vec3 shading_normal,
-                        vec3 to_light_dir)
-{
-    // World-space normal-offset bias: push the shadow sample point along
-    // the surface normal to prevent light bleeding through thin geometry
-    // and self-shadowing on angled surfaces.
-    vec3 n = normalize(shading_normal);
-    float ndotl = max(dot(n, to_light_dir), 0.0);
-    float sin_theta = sqrt(max(1.0 - ndotl * ndotl, 0.0));
-
-    float bias_scale = csm_bias_scale_for_cascade(cascade);
-    float normal_offset = u_csmParams.z * bias_scale * max(sin_theta, 0.15);
-    vec3 biased_pos = world_pos + n * normal_offset;
-
-    vec4 csm_clip = csm_clip_for_cascade(cascade, biased_pos);
-    vec3 csm_ndc = csm_clip.xyz / csm_clip.w;
-    vec2 csm_uv = csm_ndc.xy * 0.5 + 0.5;
-#if !BGFX_SHADER_LANGUAGE_GLSL
-    csm_uv.y = 1.0 - csm_uv.y;
-#endif
-    float csm_z = toShadowDepth(csm_ndc.z);
-
-    if (csm_uv.x < 0.0 || csm_uv.x > 1.0 ||
-        csm_uv.y < 0.0 || csm_uv.y > 1.0 ||
-        csm_z < 0.0 || csm_z > 1.0)
-    {
-        // Sentinel "not covered" — caller falls through to a wider cascade.
-        return -1.0;
-    }
-
-    float inv_map_size = max(u_csmParams.x, 1.0 / 2048.0);
-    vec2 texel = vec2_splat(inv_map_size);
-    float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
-
-    // Depth bias: constant component + slope-scaled component to handle
-    // grazing-angle shadow acne (parallel-stripe wood-grain pattern).
-    float slope = sin_theta / max(ndotl, 0.1);
-    float depth_bias = inv_map_size * mix(1.0, 2.0, cascade_lerp)
-                     * bias_scale * (1.0 + slope * 4.0);
-    depth_bias = min(depth_bias, 0.01);
-
-    float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
-
-    // Shadow filter tier (see u_shadowQuality; mirrors fs_pbr.sc). GLSL-120
-    // safety rule: uniform branch selecting between CONSTANT-bound loops —
-    // never a variable loop bound, never `continue`.
-    // Tier 0: single hard tap (bias math above stays; hash rotation skipped).
-    if (u_shadowQuality.x < 0.5)
-    {
-        float depth0 = csm_sample_depth(cascade, csm_uv);
-        return (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
-    }
-
-    // Tier 1: unrotated 3x3 PCF (9 taps).
-    if (u_shadowQuality.x < 1.5)
-    {
-        float sum9 = 0.0;
-        for (int y = -1; y <= 1; y++)
-        {
-            for (int x = -1; x <= 1; x++)
-            {
-                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
-                float depth = csm_sample_depth(cascade, csm_uv + offset);
-                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        return sum9 / 9.0;
-    }
-
-    // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
-    // to eliminate visible grid patterns while keeping temporally stable shadows.
-    float angle = shadow_hash(world_pos) * 6.283185;
-    float rot_c = cos(angle);
-    float rot_s = sin(angle);
-
-    float sum = 0.0;
-    for (int y = -2; y <= 2; y++)
-    {
-        for (int x = -2; x <= 2; x++)
-        {
-            vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
-            vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
-                               raw.x * rot_s + raw.y * rot_c);
-            float depth = csm_sample_depth(cascade, csm_uv + offset);
-            sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-        }
-    }
-    return sum / 25.0;
-}
+#include "cloud_shadow.sh"
 
 vec3 safe_normalize_vec3(vec3 value, vec3 fallback)
 {
@@ -273,72 +173,34 @@ void main()
         baseNormal = -baseNormal;
     }
 
+    /* Carries the cascade that actually shadowed this fragment, for view
+     * mode 9.  Terrain takes it from csm_shadow_factor_dbg rather than
+     * recomputing, for the same reason the mesh path does: a visualiser that
+     * derives its own answer can agree with itself while disagreeing with the
+     * renderer. */
+    float dbgCascade = -1.0;
+
     bool shadowEnabled = (shadowDirSlot > 0.5) &&
         ((u_csmSplits.x > 0.0) || (u_csmParams.x > 0.0));
 
     if (shadowEnabled && u_csmSplits.x > 0.0)
     {
-        float fragDepth = max(v_viewdepth, 0.0);
+        shadow = csm_shadow_factor_dbg(v_worldpos, baseNormal, toLightDir,
+                                       v_viewdepth, dbgCascade);
 
-        int cascade = 3;
-        if (fragDepth < u_csmSplits.x)      cascade = 0;
-        else if (fragDepth < u_csmSplits.y)  cascade = 1;
-        else if (fragDepth < u_csmSplits.z)  cascade = 2;
+        /* Cloud shadow attenuates the DIRECT sun, which is the whole point of
+         * having one: a sky with clouds in it and ground lighting that never
+         * changes reads as a painted backdrop.  It multiplies the CSM factor
+         * rather than the ambient, because a cloud blocks the sun, not the sky
+         * -- attenuating ambient instead would darken the shadowed side of
+         * everything, which is the opposite of what a passing cloud does.
+         *
+         * Guarded on extent: the C side leaves it at 0 whenever the bake is
+         * stale or absent, so the branch fails toward full sunlight rather
+         * than toward an unbound texture read. */
+        shadow *= cloud_shadow_at(v_worldpos.xz);
 
-        int sel_cascade = cascade;
-        shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir);
 
-        // Cascade FALLTHROUGH (see fs_pbr_body.sh): a depth-bucketed fragment can
-        // fall outside its cascade's light-space square; step to wider cascades
-        // so it is never wrongly left fully lit (triangular bright wedges).
-        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
-        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
-        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
-
-        if (shadow >= 0.0 && cascade == sel_cascade && cascade < 3)
-        {
-            float split_start = 0.0;
-            float split_end = u_csmSplits.x;
-            if (cascade == 1) {
-                split_start = u_csmSplits.x;
-                split_end = u_csmSplits.y;
-            } else if (cascade == 2) {
-                split_start = u_csmSplits.y;
-                split_end = u_csmSplits.z;
-            }
-
-            float split_span = split_end - split_start;
-            if (split_span > 0.001)
-            {
-                float blend_fraction = clamp(u_csmParams.y, 0.0, 0.35);
-                float blend_range = max(split_span * blend_fraction, 0.001);
-                // Blend entirely within current cascade to prevent
-                // 50%->100% discontinuity at cascade boundaries.
-                float blend = smoothstep(split_end - blend_range,
-                                         split_end,
-                                         fragDepth);
-
-                if (blend > 0.0001)
-                {
-                    float next_shadow = sample_csm_shadow(cascade + 1,
-                                                          v_worldpos,
-                                                          baseNormal,
-                                                          toLightDir);
-                    if (next_shadow >= 0.0)
-                        shadow = mix(shadow, next_shadow, blend);
-                }
-            }
-        }
-
-        // Beyond all cascades: lit.  Then soft shadow-distance fade (u_csmSplits.w
-        // = shadow far) so the shadow edge is a gradient, not a hard boundary.
-        if (shadow < 0.0) shadow = 1.0;
-        float shadow_far = u_csmSplits.w;
-        if (shadow_far > 0.0)
-        {
-            float fade = smoothstep(shadow_far * 0.85, shadow_far, fragDepth);
-            shadow = mix(shadow, 1.0, fade);
-        }
     }
     else if (shadowEnabled)
     {
@@ -421,6 +283,21 @@ void main()
     // u_normalScale.z carries view mode (0=shaded, 1=wireframe(no override),
     // 2=textured/unlit, 3=wireframe+textured).
     float viewMode = u_normalScale.z;
+
+    /* Shadow/depth debug views (8/9/10) are checked BEFORE the unlit-albedo
+     * branch below, which catches everything above mode 1.  Terrain is most of
+     * the ground, so a depth or cascade view that showed albedo here would be
+     * blank exactly where the question is asked. */
+    if (viewMode > 7.5)
+    {
+        vec3 dbg;
+        if      (viewMode < 8.5) dbg = shadow_debug_depth_color(v_viewdepth, u_csmSplits.w);
+        else if (viewMode < 9.5) dbg = shadow_debug_cascade_color(dbgCascade);
+        else                     dbg = vec3_splat(shadow);
+        gl_FragColor = vec4(dbg, 1.0);
+        return;
+    }
+
     if (viewMode > 1.5)
     {
         // Output albedo without lighting (gamma-correct for display).
@@ -446,6 +323,20 @@ void main()
     float metallic  = u_pbrParams.x;
     float roughness = clamp(u_pbrParams.y, 0.04, 1.0);
 
+    /* Rain. Ground is the surface people read wetness off first, and it was
+     * the surface that had none: the environment has integrated
+     * global_wetness since it was written and no lit shader ever asked. */
+    float wet = u_weatherSurface.x * wetness_exposure(N);
+    roughness = clamp(wetness_roughness(roughness, wet), 0.04, 1.0);
+    albedo    = wetness_albedo(albedo, wet);
+
+    /* Lying snow, AFTER the wet response: a surface gets wet first and then
+     * snow settles on top of it, and the snow is what you see. Doing it the
+     * other way round darkens the snow with the rain that fell before it. */
+    float snow = snow_coverage(N, u_weatherSurface.y);
+    albedo     = snow_albedo(albedo, snow);
+    roughness  = clamp(snow_roughness(roughness, snow), 0.04, 1.0);
+
     // Low-cost specular AA from normal derivatives (Toksvig-like).
     vec3 dndx = dFdx(N);
     vec3 dndy = dFdy(N);
@@ -454,7 +345,24 @@ void main()
     roughness = clamp(max(roughness, aa_roughness), 0.04, 1.0);
 
     // --- AO (terrain: uniform strength, no AO map) ---
-    float ao = mix(1.0, 1.0, u_pbrParams.z);
+    /* Ambient occlusion.
+     *
+     * This read `mix(1.0, 1.0, u_pbrParams.z)` -- a constant 1.0 wearing the
+     * shape of a blend, for every value of the aoStrength it appears to
+     * honour. Terrain had NO occlusion of any kind: not a texture, not SSAO,
+     * nothing, in a shader whose whole subject is ground that other things
+     * stand on. Measured before this: turning SSAO on and off changed 59
+     * pixels inside the viewport, out of 1,196,616.
+     *
+     * aoStrength still blends, because an authored 0 must still mean "no AO
+     * on this terrain" -- the difference is that now there is something to
+     * turn down. */
+    float ao = 1.0;
+    if (u_ssaoParams.x > 0.5)
+    {
+        float ssao = texture2D(s_terrainAO, gl_FragCoord.xy * u_ssaoParams.yz).r;
+        ao = mix(1.0, clamp(ssao, 0.0, 1.0), clamp(u_pbrParams.z, 0.0, 1.0));
+    }
 
     // --- View direction ---
     vec3 V = normalize(u_cameraPos.xyz - v_worldpos);

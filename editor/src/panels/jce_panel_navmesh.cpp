@@ -29,8 +29,8 @@
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
 extern "C" {
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_json.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/api_scene.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 }
@@ -187,33 +187,33 @@ struct NavBakeJob {
     uint32_t              vcount = 0, tcount = 0;
     JceRecastStats        stats = {};
     bool                  ok = false;
-    JceAtomicI32         *done = nullptr;   /* 0 running, 1 finished */
 };
 
-static JceThread    *g_nav_worker = nullptr;
-static NavBakeJob   *g_nav_job    = nullptr;
-static JceAtomicI32 *g_nav_cancel = nullptr;
+static JceAsyncTask *g_nav_task = nullptr;
 
-static void nav_bake_worker(void *arg)
+static JceAsyncRunResult nav_bake_worker(JceAsyncContext *ctx, void *arg)
 {
     NavBakeJob *j = (NavBakeJob *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
     j->ok = jce_recast_build_to_file(j->bin_path, j->verts.data(), j->vcount,
                                      j->indices.data(), j->tcount,
                                      &j->rc, &j->stats);
-    jce_atomic_i32_store(j->done, 1);
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
-/* MAIN thread: join the finished bake, apply or discard its result. */
-static void nav_bake_finalize(void)
+/* MAIN thread: apply or discard the completed bake result. */
+static void nav_bake_complete(JceAsyncTask *task, void *arg)
 {
-    NavBakeJob *j = g_nav_job;
-    if (!j) return;
-    if (g_nav_worker) { jce_thread_join(g_nav_worker); g_nav_worker = nullptr; }
-    bool cancelled = g_nav_cancel && jce_atomic_i32_load(g_nav_cancel) != 0;
+    NavBakeJob *j = (NavBakeJob *)arg;
+    JceAsyncState state = jce_async_task_state(task);
 
-    if (cancelled) {
+    if (state == JCE_ASYNC_STATE_CANCELLED) {
         jce_editor_console_log("navmesh bake cancelled (result discarded)");
-    } else if (j->ok) {
+    } else if (state == JCE_ASYNC_STATE_SUCCEEDED && j->ok) {
         s.result.stats        = j->stats;
         s.result.in_vertices  = j->vcount;
         s.result.in_triangles = j->tcount;
@@ -231,19 +231,12 @@ static void nav_bake_finalize(void)
         s.have_result = false;
     }
 
-    if (j->done) jce_atomic_i32_destroy(j->done);
+    g_nav_task = nullptr;
+    jce_async_task_release(task);
     delete j;
-    g_nav_job = nullptr;
 }
 
-/* MAIN thread, per-frame: pick up a finished bake. */
-static void nav_bake_poll(void)
-{
-    if (g_nav_job && jce_atomic_i32_load(g_nav_job->done) != 0)
-        nav_bake_finalize();
-}
-
-static bool nav_bake_running(void) { return g_nav_worker != nullptr; }
+static bool nav_bake_running(void) { return g_nav_task != nullptr; }
 
 /* Gather scene triangles (main thread) and kick the Recast build onto a
  * worker. No-op if a bake is already in flight. */
@@ -283,21 +276,26 @@ void bake_recast(void)
     derive_bin_path(s.path, j->bin_path, sizeof(j->bin_path));
     j->vcount = (uint32_t)(j->verts.size() / 3);
     j->tcount = (uint32_t)(j->indices.size() / 3);
-    j->done   = jce_atomic_i32_create(0);
 
-    if (!g_nav_cancel) g_nav_cancel = jce_atomic_i32_create(0);
-    jce_atomic_i32_store(g_nav_cancel, 0);
-    g_nav_job = j;
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = nav_bake_worker;
+    desc.complete = nav_bake_complete;
+    desc.user_data = j;
+    desc.debug_name = "editor.navmesh.bake";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
 
-    g_nav_worker = jce_thread_create(nav_bake_worker, j, "jce_nav_bake");
-    if (!g_nav_worker) {
-        /* No worker thread available: run inline + finalise immediately. */
-        nav_bake_worker(j);
-        nav_bake_finalize();
-    } else {
-        jce_editor_console_log("navmesh bake started in background (%u tris)…",
-                               (unsigned)j->tcount);
+    g_nav_task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!g_nav_task) {
+        delete j;
+        jce_editor_console_log_level(
+            JCE_CONSOLE_ERROR,
+            "navmesh bake: background queue rejected the bake");
+        return;
     }
+
+    jce_editor_console_log("navmesh bake started in background (%u tris)…",
+                           (unsigned)j->tcount);
 }
 
 JceJson *to_json(void)
@@ -385,8 +383,8 @@ void draw_actions(void)
     if (nav_bake_running()) {
         ImGui::TextUnformatted(jce_editor_i18n("navmesh.status.baking"));
         ImGui::SameLine();
-        if (ImGui::Button(jce_editor_i18n_id("navmesh.button.cancel", "nav_cancel")) && g_nav_cancel)
-            jce_atomic_i32_store(g_nav_cancel, 1);
+        if (ImGui::Button(jce_editor_i18n_id("navmesh.button.cancel", "nav_cancel")))
+            jce_async_task_cancel(g_nav_task);
     } else if (ImGui::Button(jce_editor_i18n_id("navmesh.button.bake", "nav_bake"))) {
         bake_recast();
     }
@@ -445,7 +443,6 @@ void draw_content(void)
                                       sizeof(s.path));
     }
 
-    nav_bake_poll();   /* pick up a finished background bake */
     if (ImGui::CollapsingHeader(jce_editor_i18n("navmesh.section.settings"), ImGuiTreeNodeFlags_DefaultOpen))
         draw_settings();
     ImGui::Separator();

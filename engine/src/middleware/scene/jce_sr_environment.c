@@ -9,7 +9,23 @@
  * everything else stays file-static here.  No behaviour change.
  */
 
+#include <jce/renderer/jce_renderer_caps.h>
+#include "renderer/jce_cloud_noise.h"
+#include <jce/middleware/world/jce_atmosphere.h>
+#include "jce_terrain_cache.h"
+#include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/scene/jce_water_ripple.h>
+#include <jce/middleware/world/jce_sky.h>
+#include <jce/os/core/jce_timer.h>
 #include "jce_sr_internal.h"
+#include <SDL3/SDL.h>   /* SDL_IOStream for the JCE_DBG_ENV_LOG wind probe */
+
+/* Forward declaration: the wind probe is defined further down, beside the
+ * time-of-day driver, but its first callers are the grass and ocean submits
+ * above it. Without this they get implicit declarations and the definition
+ * then conflicts with them. */
+static void sr_dbg_wind(const char *who, float dx, float dy, float dz, float speed);
+#include <jce/renderer/jce_pbr_material.h>
 
 #include <jce/resource/jce_image_decode.h>  /* density-mask load (large-world #8a) */
 #include <jce/renderer/jce_render_pipeline.h> /* foliage Hi-Z perf default */
@@ -129,13 +145,61 @@ static int sr_foliage_find_slot(JceSceneRenderer *sr, JceEntity e)
 
 /* Build a TRS model matrix (uniform scale, Y rotation, translation),
  * column-major to match the renderer's jce_mat4 convention. */
-static jce_mat4 sr_foliage_instance_matrix(const JceFoliageInstance *fi)
+/* `align` in [0,1] blends from upright to fully terrain-aligned.
+ *
+ * align_to_normal was authorable, serialized, editor-exposed and round-trip
+ * tested for a long time while doing nothing at all: this function only ever
+ * built a yaw rotation, and the scatter did not even return a normal.  Toggling
+ * it in the inspector changed nothing, which reads as the feature being broken
+ * rather than absent.
+ *
+ * A blend rather than a boolean because full alignment on a steep slope looks
+ * wrong for anything with a trunk -- trees stay near-upright while ground cover
+ * hugs the surface, which is why the field exists as a toggle in the first
+ * place. */
+static jce_mat4 sr_foliage_instance_matrix(const JceFoliageInstance *fi,
+                                           float align)
 {
     const float s = fi->scale, c = cosf(fi->rot_y), sn = sinf(fi->rot_y);
+
+    /* Interpolate the up axis, then rebuild an orthonormal basis around it.
+     * Slerping the axis and re-orthonormalising keeps the basis rigid, which a
+     * per-column lerp would not. */
+    float ux = 0.0f, uy = 1.0f, uz = 0.0f;
+    if (align > 0.0f) {
+        const float a = (align > 1.0f) ? 1.0f : align;
+        ux = fi->normal[0] * a;
+        uy = 1.0f + (fi->normal[1] - 1.0f) * a;
+        uz = fi->normal[2] * a;
+        const float ul = sqrtf(ux * ux + uy * uy + uz * uz);
+        if (ul > 1e-6f) { ux /= ul; uy /= ul; uz /= ul; }
+        else            { ux = 0.0f; uy = 1.0f; uz = 0.0f; }
+    }
+
+    /* Yaw direction projected onto the plane perpendicular to the new up, so
+     * the authored yaw survives the tilt instead of being replaced by it. */
+    float fx = c, fy = 0.0f, fz = -sn;
+    const float d = fx * ux + fy * uy + fz * uz;
+    fx -= ux * d; fy -= uy * d; fz -= uz * d;
+    float fl = sqrtf(fx * fx + fy * fy + fz * fz);
+    if (fl < 1e-6f) {
+        /* Yaw parallel to the surface normal: pick any perpendicular rather
+         * than emitting a degenerate (zero-determinant) matrix. */
+        fx = 1.0f - ux * ux; fy = -ux * uy; fz = -ux * uz;
+        fl = sqrtf(fx * fx + fy * fy + fz * fz);
+        if (fl < 1e-6f) { fx = 0.0f; fy = 0.0f; fz = 1.0f; fl = 1.0f; }
+    }
+    fx /= fl; fy /= fl; fz /= fl;
+
+    /* right = up x forward */
+    const float rx = uy * fz - uz * fy;
+    const float ry = uz * fx - ux * fz;
+    const float rz = ux * fy - uy * fx;
+
     jce_mat4 m = jce_m4_identity();
-    m.col[0].x =  s * c;  m.col[0].y = 0; m.col[0].z = -s * sn; m.col[0].w = 0;
-    m.col[1].x =  0;      m.col[1].y = s; m.col[1].z =  0;      m.col[1].w = 0;
-    m.col[2].x =  s * sn; m.col[2].y = 0; m.col[2].z =  s * c;  m.col[2].w = 0;
+    m.col[0].x = s * rx; m.col[0].y = s * ry; m.col[0].z = s * rz; m.col[0].w = 0;
+    m.col[1].x = s * ux; m.col[1].y = s * uy; m.col[1].z = s * uz; m.col[1].w = 0;
+    m.col[2].x = s * fx; m.col[2].y = s * fy; m.col[2].z = s * fz; m.col[2].w = 0;
     m.col[3].x = fi->pos[0]; m.col[3].y = fi->pos[1]; m.col[3].z = fi->pos[2];
     m.col[3].w = 1.0f;
     return m;
@@ -268,7 +332,14 @@ static void sr_draw_ribbon(JceSceneRenderer *sr, const JceCamera *camera,
      * depth — the wind lines then appear to "cut through" / erase the rain,
      * smoke and particles behind them.  Matches the reference WindLines material
      * (transparent:true, depthWrite:false). */
+    /* WRITE_Z matters as much as the depth test here. The ribbon is thin,
+     * effectively opaque along its core, and there is no guarantee it is
+     * submitted after every opaque mesh it crosses. Without a depth write,
+     * anything drawn later simply overwrites it: an orbit line unmistakably
+     * in front of a planet disappeared the moment the planet's disc was
+     * behind it, while the same line stayed visible against empty space. */
     uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_WRITE_Z
                    | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA | BGFX_STATE_BLEND_ALPHA;
     bgfx_set_state(state, 0);   /* no cull: ribbon is double-sided */
 
@@ -616,7 +687,8 @@ static bool sr_foliage_tile_make_resident(JceSceneRenderer *sr, int slot,
     }
     for (uint32_t i = 0; i < nc; ++i)
         sr->foliage_cache[slot].roots[i] =
-            sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i]);
+            sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i],
+                                       sr->foliage_cache[slot].align_to_normal);
 
     bgfx_vertex_layout_t il;
     bgfx_vertex_layout_begin(&il, BGFX_RENDERER_TYPE_NOOP);
@@ -768,7 +840,7 @@ static bool sr_foliage_gpu_lod_cull_draw(JceSceneRenderer *sr, int slot,
             if (!jce_scene_has_terrain(scene, te)) continue;
             JceTerrainComponent *tc = jce_scene_get_terrain(scene, te);
             if (!tc || !tc->terrain_path[0]) continue;
-            int tslot = sr_terrain_find_or_load_slot(sr, tc->terrain_path);
+            int tslot = sr_terrain_find_or_load_slot(sr, scene, tc->terrain_path);
             if (tslot >= 0) terr = sr->terrain_cache[tslot].terrain;
         }
 
@@ -886,14 +958,21 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
             if (!jce_scene_has_terrain(scene, te)) continue;
             JceTerrainComponent *tc = jce_scene_get_terrain(scene, te);
             if (!tc || !tc->terrain_path[0]) continue;
-            int tslot = sr_terrain_find_or_load_slot(sr, tc->terrain_path);
+            int tslot = sr_terrain_find_or_load_slot(sr, scene, tc->terrain_path);
             if (tslot >= 0) { terr = sr->terrain_cache[tslot].terrain; break; }
         }
 
         jce_mat4 wm = jce_scene_get_world_matrix(scene, e);
         jce_vec3 origin = { wm.col[3].x, wm.col[3].y, wm.col[3].z };
 
+        /* Zero FIRST, then assign.  Field-by-field initialisation leaves
+         * every field added LATER as uninitialised stack -- and this
+         * struct grew ridge_field/ridge_dim/ridge_min/ridge_max, which
+         * this path never sets.  A garbage ridge_field passes the
+         * `!= NULL` guard and is then dereferenced: an access violation
+         * inside jce_foliage_scatter, reached simply by turning grass on. */
         JceFoliageScatterParams p;
+        memset(&p, 0, sizeof p);
         p.seed          = vs->seed;
         p.density       = vs->density;
         p.area_x        = vs->area_x;
@@ -904,6 +983,12 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
         p.density_mask  = NULL;
         p.mask_dim      = 0;
         p.mask_world_size = 0.0f;   /* legacy local-rect UV */
+        /* Only pay for terrain normals when the scatter actually asks to be
+         * aligned; the four extra height samples per candidate are wasted
+         * otherwise.  Requesting them does not consume randomness, so the
+         * kept-instance set is byte-identical either way. */
+        p.want_normals  = vs->align_to_normal;
+        sr->foliage_cache[slot].align_to_normal = vs->align_to_normal ? 1.0f : 0.0f;
 
         /* Density mask (large-world #8a): decode the grayscale mask asset into a
          * square float grid and feed the scatter so painted/sparse regions thin
@@ -1049,7 +1134,8 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
             }
             for (uint32_t i = 0; i < nc; ++i)
                 sr->foliage_cache[slot].roots[i] =
-                    sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i]);
+                    sr_foliage_instance_matrix(&sr->foliage_cache[slot].insts[i],
+                                       sr->foliage_cache[slot].align_to_normal);
             LOG_INFO(LOG_TAG, "foliage '%s': %u instances scattered "
                      "(single GPU-instanced submit; 4096 draw cap removed)",
                      vs->mesh_path, nc);
@@ -1460,6 +1546,14 @@ static uint32_t sr_grass_param_hash(const JceGrassFieldComponent *g,
  * invalidation (mirrors sr_water_slot_free declared in jce_sr_internal.h). */
 void sr_grass_slot_free(JceSceneRenderer *sr, int slot)
 {
+    if (sr->grass_cache[slot].blade) {
+        jce_mesh_destroy(sr->grass_cache[slot].blade);
+        sr->grass_cache[slot].blade       = NULL;
+        sr->grass_cache[slot].blade_h     = 0.0f;
+        sr->grass_cache[slot].blade_w     = 0.0f;
+        sr->grass_cache[slot].blade_cards = 0;
+    }
+
     JCE_FREE(sr->grass_cache[slot].insts);
     JCE_FREE(sr->grass_cache[slot].packed);
     if (sr->grass_cache[slot].inst_vb_count)
@@ -1546,6 +1640,17 @@ static void sr_grass_submit_range(JceSceneRenderer *sr, int slot,
                 sr->grass_cache[slot].inst_vb, start, n);
             if (sr->frame_shadow_active)
                 sr_bind_frame_shadow_state(sr);
+                    /* Stage 3 is this shader's s_cloudShadow. It is NOT bound in
+                     * sr_bind_frame_shadow_state with the rest of the shadow state, however
+                     * much it belongs there: fs_pbr_body.sh occupies all sixteen stages and
+                     * uses 3 for s_aoMap, so binding the cloud map for everyone overwrites
+                     * every mesh's ambient-occlusion map with a top-down transmittance and the
+                     * mesh reads it by its own UV. That is why meshes take their cloud shadow
+                     * from the SSAO target's blue channel instead, and why that path really
+                     * does depend on SSAO -- an architectural constraint, not an oversight.
+                     *
+                     * After any material bind, because jce_pbr_material binds stage 3 too. */
+                    sr_bind_cloud_shadow(sr);
             bgfx_set_state(state, 0);
             bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
             return;
@@ -1581,6 +1686,17 @@ static void sr_grass_submit_range(JceSceneRenderer *sr, int slot,
          * path; gated so non-shadow frames stay byte-identical. */
         if (sr->frame_shadow_active)
             sr_bind_frame_shadow_state(sr);
+                /* Stage 3 is this shader's s_cloudShadow. It is NOT bound in
+                 * sr_bind_frame_shadow_state with the rest of the shadow state, however
+                 * much it belongs there: fs_pbr_body.sh occupies all sixteen stages and
+                 * uses 3 for s_aoMap, so binding the cloud map for everyone overwrites
+                 * every mesh's ambient-occlusion map with a top-down transmittance and the
+                 * mesh reads it by its own UV. That is why meshes take their cloud shadow
+                 * from the SSAO target's blue channel instead, and why that path really
+                 * does depend on SSAO -- an architectural constraint, not an oversight.
+                 *
+                 * After any material bind, because jce_pbr_material binds stage 3 too. */
+                sr_bind_cloud_shadow(sr);
         bgfx_set_state(state, 0);
         bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
         off += nb;
@@ -1612,6 +1728,43 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
     int slot = sr_grass_find_slot(sr, e);
     if (slot < 0) return;
 
+    /* This field's own blade geometry.
+     *
+     * There used to be ONE shared mesh for every field, built once from the
+     * literals (0.4, 0.05, 4). blade_height / blade_width / cards were live in
+     * the inspector, parsed, serialized, folded into the scatter param hash
+     * and used to size the pick proxy and the selection outline -- and the
+     * geometry ignored all three. Dragging blade height re-ran the whole
+     * scatter, repack and counting sort every frame of the drag, moved the
+     * click box, and changed no pixel.
+     *
+     * A blade is a handful of cards, so one mesh per field costs nothing next
+     * to the instance buffer already on this slot. Rebuilt only when one of
+     * the three moves. */
+    {
+        const float bh = g->blade_height > 0.0f ? g->blade_height : 0.4f;
+        const float bw = g->blade_width  > 0.0f ? g->blade_width  : 0.05f;
+        int   bc = g->cards > 0 ? g->cards : 4;
+        if (bc > 8) bc = 8;
+        if (!sr->grass_cache[slot].blade ||
+            sr->grass_cache[slot].blade_h     != bh ||
+            sr->grass_cache[slot].blade_w     != bw ||
+            sr->grass_cache[slot].blade_cards != bc) {
+            JceMesh *nb = sr_grass_build_blade(bh, bw, bc);
+            if (nb) {
+                if (sr->grass_cache[slot].blade)
+                    jce_mesh_destroy(sr->grass_cache[slot].blade);
+                sr->grass_cache[slot].blade       = nb;
+                sr->grass_cache[slot].blade_h     = bh;
+                sr->grass_cache[slot].blade_w     = bw;
+                sr->grass_cache[slot].blade_cards = bc;
+            }
+        }
+    }
+    JceMesh *blade = sr->grass_cache[slot].blade
+                   ? sr->grass_cache[slot].blade : sr->grass_blade;
+    if (!blade) return;
+
     jce_mat4 wm     = jce_scene_get_world_matrix(scene, e);
     jce_vec3 origin = { wm.col[3].x, wm.col[3].y, wm.col[3].z };
 
@@ -1627,11 +1780,18 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
             if (!jce_scene_has_terrain(scene, te)) continue;
             JceTerrainComponent *tc = jce_scene_get_terrain(scene, te);
             if (!tc || !tc->terrain_path[0]) continue;
-            int tslot = sr_terrain_find_or_load_slot(sr, tc->terrain_path);
+            int tslot = sr_terrain_find_or_load_slot(sr, scene, tc->terrain_path);
             if (tslot >= 0) { terr = sr->terrain_cache[tslot].terrain; break; }
         }
 
+        /* Zero FIRST, then assign.  Field-by-field initialisation leaves
+         * every field added LATER as uninitialised stack -- and this
+         * struct grew ridge_field/ridge_dim/ridge_min/ridge_max, which
+         * this path never sets.  A garbage ridge_field passes the
+         * `!= NULL` guard and is then dereferenced: an access violation
+         * inside jce_foliage_scatter, reached simply by turning grass on. */
         JceFoliageScatterParams p;
+        memset(&p, 0, sizeof p);
         p.seed          = g->seed;
         p.density       = g->density;
         /* LOW-tier grass density floor (engine guarantee: hold frame rate on
@@ -1658,6 +1818,7 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
         p.area_x        = g->area_x;
         p.area_z        = g->area_z;
         p.max_slope_deg = g->max_slope_deg;
+        p.want_normals  = false;   /* blades are authored upright */
         p.scale_min     = g->scale_min;
         p.scale_max     = g->scale_max;
         p.density_mask  = NULL;
@@ -1798,7 +1959,8 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
                 for (uint32_t j = 0; j < n; ++j) {
                     uint32_t oi = binned ? order[j] : j;   /* original blade idx */
                     const JceFoliageInstance *fi = &ins[oi];
-                    jce_mat4 m  = sr_foliage_instance_matrix(fi);
+                    jce_mat4 m  = sr_foliage_instance_matrix(fi,
+                                    sr->foliage_cache[slot].align_to_normal);
                     float    t  = (float)(oi & 7u) / 7.0f;
                     float    hh = (t - 0.5f) * 2.0f * g->hue_jitter;
                     jce_vec4 tint = { 1.0f - hh, 1.0f, 1.0f + hh, 1.0f };
@@ -1823,8 +1985,19 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
 
     /* ── Grass-specific uniforms ──────────────────────────────────── */
     float utime[4]  = { sr->grass_time, 0.0f, 0.0f, 0.0f };
+    /* U4: ONE wind speed. g->wind_speed is now a per-field MULTIPLIER of the
+     * environment's, not a speed of its own -- so a field authored at 1.6 is
+     * 1.6 in calm weather (the base is 1 m/s) and 4.8 in rain, and the number
+     * in the scene file keeps meaning what it meant.
+     *
+     * The DIRECTION is deliberately still the field's. The environment's
+     * direction is a default that nothing authors -- (1,0,0) -- and replacing
+     * an authored value with a default is the silent fallback this project
+     * forbids. It migrates when a scene can author a wind direction; until
+     * then, borrowing one would be a downgrade wearing the word "unified". */
     float uwind[4]  = { g->wind_dir[0], g->wind_dir[1],
-                        g->wind_speed, g->wind_amplitude };
+                        g->wind_speed * jce_environment_wind_speed_now(sr->env),
+                        g->wind_amplitude };
     float ucolor[8] = {
         g->root_color[0], g->root_color[1], g->root_color[2], 1.0f,
         g->tip_color[0],  g->tip_color[1],  g->tip_color[2],  1.0f
@@ -1832,8 +2005,18 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
     float ufade[4]  = { g->fade_start, g->fade_end, g->hue_jitter, 0.0f };
     bgfx_set_uniform(sr->u_grass_time,  utime,  1);
     bgfx_set_uniform(sr->u_grass_wind,  uwind,  1);
+    /* uwind is {dirX, dirZ, speed, amplitude} -- the Y component of the
+     * direction is not carried, which is itself worth seeing next to the
+     * environment's full 3-vector when U4 migrates this. */
+    sr_dbg_wind("grass", uwind[0], 0.0f, uwind[1], uwind[2]);
     bgfx_set_uniform(sr->u_grass_color, ucolor, 2);
     bgfx_set_uniform(sr->u_grass_fade,  ufade,  1);
+
+    /* The grass batch owns its entire uniform set and never goes through
+     * jce_pbr_material_bind, so it had never been told the view mode -- every
+     * debug view rendered ordinary lit grass and looked, from the outside,
+     * like a view that simply had nothing to say about vegetation. */
+    jce_pbr_material_bind_view_mode();
 
     /* ── Submit: frustum + fade-distance CELL cull, then submit only the
      *    visible contiguous blade ranges of the cell-ordered packed cache.
@@ -1842,11 +2025,11 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
     const uint16_t              stride = (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4));
     /* stride = 64 (mat4) + 16 (tint vec4) = 80 bytes */
 
-    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(sr->grass_blade) };
-    bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(sr->grass_blade) };
+    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(blade) };
+    bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(blade) };
     if (!BGFX_HANDLE_IS_VALID(vbh) || !BGFX_HANDLE_IS_VALID(ibh)) return;
-    const uint32_t vcount = jce_mesh_vertex_count(sr->grass_blade);
-    const uint32_t icount = jce_mesh_index_count(sr->grass_blade);
+    const uint32_t vcount = jce_mesh_vertex_count(blade);
+    const uint32_t icount = jce_mesh_index_count(blade);
 
     /* Opaque, depth-tested, depth-write, no back-face cull (double-sided
      * cards visible from both faces), MSAA.  No alpha-blending (v1 cards are
@@ -1879,7 +2062,8 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
                 uint8_t *dst = (uint8_t *)idb.data;
                 for (uint32_t i = 0; i < nb; ++i) {
                     const JceFoliageInstance *fi = &insts[start + i];
-                    jce_mat4 m = sr_foliage_instance_matrix(fi);
+                    jce_mat4 m = sr_foliage_instance_matrix(fi,
+                                    sr->foliage_cache[slot].align_to_normal);
                     float t   = (float)((start + i) & 7u) / 7.0f;
                     float h   = (t - 0.5f) * 2.0f * g->hue_jitter;
                     jce_vec4 tint = { 1.0f - h, 1.0f, 1.0f + h, 1.0f };
@@ -1891,6 +2075,17 @@ void sr_draw_grass(JceSceneRenderer *sr, JceScene *scene,
                 bgfx_set_index_buffer(ibh, 0, icount);
                 bgfx_set_instance_data_buffer(&idb, 0, nb);
                 sr_bind_frame_shadow_state(sr);
+                    /* Stage 3 is this shader's s_cloudShadow. It is NOT bound in
+                     * sr_bind_frame_shadow_state with the rest of the shadow state, however
+                     * much it belongs there: fs_pbr_body.sh occupies all sixteen stages and
+                     * uses 3 for s_aoMap, so binding the cloud map for everyone overwrites
+                     * every mesh's ambient-occlusion map with a top-down transmittance and the
+                     * mesh reads it by its own UV. That is why meshes take their cloud shadow
+                     * from the SSAO target's blue channel instead, and why that path really
+                     * does depend on SSAO -- an architectural constraint, not an oversight.
+                     *
+                     * After any material bind, because jce_pbr_material binds stage 3 too. */
+                    sr_bind_cloud_shadow(sr);
                 bgfx_set_state(state, 0);
                 bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
                 start += nb;
@@ -2009,6 +2204,22 @@ static void sr_water_lazy_init(JceSceneRenderer *sr)
     if (!BGFX_HANDLE_IS_VALID(sr->s_water_disp))
         sr->s_water_disp = bgfx_create_uniform("s_water_disp",
                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->s_water_depth)) {
+        sr->s_water_depth = bgfx_create_uniform("s_water_depth",
+                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+        sr->u_water_absorb = bgfx_create_uniform("u_water_absorb",
+                                                 BGFX_UNIFORM_TYPE_VEC4, 1);
+        sr->u_water_absorb_tint = bgfx_create_uniform("u_water_absorb_tint",
+                                                      BGFX_UNIFORM_TYPE_VEC4, 1);
+        sr->u_water_depth_params = bgfx_create_uniform("u_water_depth_params",
+                                                       BGFX_UNIFORM_TYPE_VEC4, 1);
+        sr->u_water_caustics = bgfx_create_uniform("u_water_caustics",
+                                                   BGFX_UNIFORM_TYPE_VEC4, 1);
+        sr->s_water_caustic_disp = bgfx_create_uniform("s_water_caustic_disp",
+                                                       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+        sr->u_water_shore = bgfx_create_uniform("u_water_shore",
+                                                BGFX_UNIFORM_TYPE_VEC4, 1);
+    }
     if (!BGFX_HANDLE_IS_VALID(sr->s_water_data))
         sr->s_water_data = bgfx_create_uniform("s_water_data",
                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -2072,6 +2283,59 @@ static JceMesh *sr_water_build_grid(float size_x, float size_z)
     return m;
 }
 
+/* Build the ocean surface as concentric rings (jce_water.h).
+ *
+ * The extent is taken as the LARGER half-size, so a rectangular water body
+ * still gets a circular mesh that covers it -- rings are for water that runs
+ * past the horizon, where the authored rectangle is a formality rather than a
+ * boundary anyone sees.
+ *
+ * UVs are radial: u wraps around the ring and v runs outward.  vs_water only
+ * uses world XZ for its displacement lookup, so the UV convention here is
+ * free -- but it must still be something, and a radial layout is what a
+ * shoreline or foam term would want if one is added later. */
+static JceMesh *sr_water_build_rings(float size_x, float size_z)
+{
+    const int   rings = 12;
+    const int   segs  = 64;
+    const float outer = 0.5f * ((size_x > size_z) ? size_x : size_z);
+    /* An inner radius proportional to the extent keeps the near-field
+     * tessellation sane for both a 200 m bay and a 20 km sea. */
+    const float inner = (outer > 0.0f) ? (outer * 0.0025f + 0.5f) : 0.0f;
+
+    uint32_t nverts = 0u, nindices = 0u;
+    if (!jce_water_ring_mesh_size(rings, segs, &nverts, &nindices)) return NULL;
+
+    JceWaterRingVertex *rv = (JceWaterRingVertex *)
+        JCE_MALLOC((size_t)nverts * sizeof(JceWaterRingVertex));
+    uint32_t *indices = (uint32_t *)
+        JCE_MALLOC((size_t)nindices * sizeof(uint32_t));
+    JceMeshVertex *verts = (JceMeshVertex *)
+        JCE_MALLOC((size_t)nverts * sizeof(JceMeshVertex));
+    JceMesh *m = NULL;
+
+    if (rv && indices && verts &&
+        jce_water_ring_build(rings, segs, inner, outer, rv, indices)) {
+        for (uint32_t i = 0; i < nverts; ++i) {
+            verts[i].pos[0] = rv[i].x;
+            verts[i].pos[1] = 0.0f;
+            verts[i].pos[2] = rv[i].z;
+            verts[i].normal[0] = 0.0f;
+            verts[i].normal[1] = 1.0f;
+            verts[i].normal[2] = 0.0f;
+            const float inv = (outer > 0.0f) ? (1.0f / outer) : 0.0f;
+            verts[i].uv[0] = rv[i].x * inv * 0.5f + 0.5f;
+            verts[i].uv[1] = rv[i].z * inv * 0.5f + 0.5f;
+        }
+        m = jce_mesh_create(verts, nverts, indices, nindices);
+    }
+
+    JCE_FREE(rv);
+    JCE_FREE(indices);
+    JCE_FREE(verts);
+    return m;
+}
+
 /* Release ALL resources a water cache slot owns (grid mesh + FFT core + the
  * dynamic FFT displacement texture) and zero it.  Used on eviction and renderer
  * destroy so neither the FFT state nor its GPU texture leak. */
@@ -2079,11 +2343,22 @@ void sr_water_slot_free(JceSceneRenderer *sr, int slot)
 {
     if (sr->water_cache[slot].mesh)
         jce_mesh_destroy(sr->water_cache[slot].mesh);
-    if (sr->water_cache[slot].fft)
-        jce_water_fft_destroy(sr->water_cache[slot].fft);
+    /* No FFT to free here: the simulation belongs to the scene's water field,
+     * and this cache holds only GPU resources.  It used to own a second,
+     * private Tessendorf patch -- which is exactly the duplication that let the
+     * drawn ocean and the simulated ocean drift apart. */
     if (BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex))
         bgfx_destroy_texture(sr->water_cache[slot].fft_tex);
+    if (BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft2_tex))
+        bgfx_destroy_texture(sr->water_cache[slot].fft2_tex);
     memset(&sr->water_cache[slot], 0, sizeof sr->water_cache[slot]);
+    /* memset leaves both texture handles at idx 0, which bgfx reads as a VALID
+     * handle -- the same trap jce_scene_renderer_create already documents for
+     * the initial slots.  Re-invalidate, or the next tenant of this slot both
+     * destroys someone else's texture 0 and (for the cascade, which is now
+     * created only when the field really has one) never creates its own. */
+    sr->water_cache[slot].fft_tex.idx  = UINT16_MAX;
+    sr->water_cache[slot].fft2_tex.idx = UINT16_MAX;
 }
 
 /* Find (or evict into) a water cache slot for entity `e`. */
@@ -2103,12 +2378,54 @@ static int sr_water_find_slot(JceSceneRenderer *sr, JceEntity e)
 }
 
 void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
+                          const JceCamera *camera,
                           EntityList *list, JceEntity e, uint16_t view_id)
 {
     JceWaterComponent *wc = jce_scene_get_water(scene, e);
     if (!wc || !wc->visible) return;
     if (wc->size_x <= 0.0f || wc->size_z <= 0.0f) return;
     if (!jce_scene_has_transform(scene, e)) return;
+
+    /* Frustum-cull against the water's OWN bounds.
+     *
+     * Water deliberately bypasses the per-entity visibility AABB (it is sized
+     * to size_x*size_z and centred on the entity, which that AABB does not
+     * cover), but the previous code took that to mean no culling at all: an
+     * off-screen ocean still evolved its CPU FFT, uploaded a full displacement
+     * texture and submitted every vertex, every frame.  Cull on the real
+     * bounds instead -- a thin slab around the surface plane, tall enough to
+     * contain the wave band, mirroring the editor pick slab so the two agree
+     * about where the water is. */
+    if (camera) {
+        const jce_mat4 wm = jce_scene_get_world_matrix(scene, e);
+        float amp = 0.0f;
+        for (int wi = 0; wi < wc->wave_count &&
+                         wi < JCE_WATER_COMP_MAX_WAVES; wi++)
+            amp += fabsf(wc->waves[wi].amplitude);
+        const float half_y = (amp > 0.25f) ? 2.0f * amp : 0.5f;
+
+        const jce_vec3 c = jce_v3(wm.col[3].x,
+                                  wm.col[3].y + wc->base_height,
+                                  wm.col[3].z);
+        const jce_vec3 mn = jce_v3(c.x - wc->size_x * 0.5f, c.y - half_y,
+                                   c.z - wc->size_z * 0.5f);
+        const jce_vec3 mx = jce_v3(c.x + wc->size_x * 0.5f, c.y + half_y,
+                                   c.z + wc->size_z * 0.5f);
+
+        const jce_mat4 v  = jce_camera_view(camera);
+        /* The viewport's aspect, not 16:9 -- see sr->frame_aspect. A test
+         * frustum narrower than the real one culls what is still on screen at
+         * the left and right edges, and this is the third site to have carried
+         * that hard-code: jce_sr_draw.c already records the same bug being
+         * fixed for streamed objects, where it made the whole streamed set
+         * shimmer every frame. */
+        const jce_mat4 p  = jce_camera_proj(camera, sr->frame_aspect,
+                                            sr->homogeneous_depth);
+        const jce_mat4 vp = jce_m4_multiply(&p, &v);
+        jce_vec4 planes[6];
+        sr_extract_frustum_planes(&vp, planes);
+        if (!sr_aabb_in_frustum(planes, mn, mx)) return;
+    }
 
     sr_water_lazy_init(sr);
     if (!BGFX_HANDLE_IS_VALID(sr->prog_water)) return;
@@ -2119,11 +2436,25 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
     const bool rebuild = !sr->water_cache[slot].used ||
                          !sr->water_cache[slot].mesh ||
                          sr->water_cache[slot].size_x != wc->size_x ||
-                         sr->water_cache[slot].size_z != wc->size_z;
+                         sr->water_cache[slot].size_z != wc->size_z ||
+                         /* Topology, not just extent: flipping `ocean` changes
+                          * the mesh for the SAME size, and without this the
+                          * toggle appears to do nothing until a designer also
+                          * nudges the dimensions. */
+                         sr->water_cache[slot].ocean_mesh != wc->ocean;
     if (rebuild) {
         if (sr->water_cache[slot].mesh)
             jce_mesh_destroy(sr->water_cache[slot].mesh);
-        sr->water_cache[slot].mesh = sr_water_build_grid(wc->size_x, wc->size_z);
+        /* Rings for open ocean, grid for everything else.  A pond wants the
+         * grid: rings only pay when the water runs to the horizon. */
+        sr->water_cache[slot].mesh =
+            wc->ocean ? sr_water_build_rings(wc->size_x, wc->size_z)
+                      : sr_water_build_grid(wc->size_x, wc->size_z);
+        /* Rings and grid are different meshes for the same extent, so the
+         * cache must rebuild when the flag flips, not only when the size
+         * changes -- otherwise toggling `ocean` appears to do nothing until a
+         * designer also nudges the size. */
+        sr->water_cache[slot].ocean_mesh = wc->ocean;
         sr->water_cache[slot].size_x = wc->size_x;
         sr->water_cache[slot].size_z = wc->size_z;
         sr->water_cache[slot].entity = e;
@@ -2173,57 +2504,155 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
      * vs_water; .y carries the patch size for the vertex UV mapping. */
     int water_mode = JCE_WATER_MODE_GERSTNER;
     float fft_patch = 0.0f;
+    /* Second cascade patch size, 0 when the field has only one.  Read from the
+     * FFT rather than recomputed: the field CHOOSES a non-commensurate period
+     * near the requested fraction, so recomputing it here would draw a
+     * different ocean than the one being simulated. */
+    float fft_patch2 = 0.0f;
     if (wc->water_mode == JCE_WATER_MODE_FFT) {
         int res = wc->fft_resolution;
         if (res < 32)  res = 32;
         if (res > 256) res = 256;
 
-        /* (Re)create the FFT core when any spectrum param changes. */
-        const bool fft_rebuild =
-            !sr->water_cache[slot].fft ||
-            sr->water_cache[slot].fft_res        != res ||
-            sr->water_cache[slot].fft_patch_size != wc->fft_patch_size ||
-            sr->water_cache[slot].fft_wind_speed != wc->fft_wind_speed ||
-            sr->water_cache[slot].fft_wind_dir_x != wc->fft_wind_dir_x ||
-            sr->water_cache[slot].fft_wind_dir_z != wc->fft_wind_dir_z ||
-            sr->water_cache[slot].fft_amplitude  != wc->fft_amplitude;
-        if (fft_rebuild) {
-            if (sr->water_cache[slot].fft) {
-                jce_water_fft_destroy(sr->water_cache[slot].fft);
-                sr->water_cache[slot].fft = NULL;
-            }
-            sr->water_cache[slot].fft = jce_water_fft_create(
-                res, wc->fft_patch_size, wc->fft_wind_speed,
-                wc->fft_wind_dir_x, wc->fft_wind_dir_z, wc->fft_amplitude,
-                /* deterministic per-entity seed so distinct waters differ */
-                (unsigned int)(0x9E37u ^ (uint32_t)e));
-            sr->water_cache[slot].fft_patch_size = wc->fft_patch_size;
-            sr->water_cache[slot].fft_wind_speed = wc->fft_wind_speed;
-            sr->water_cache[slot].fft_wind_dir_x = wc->fft_wind_dir_x;
-            sr->water_cache[slot].fft_wind_dir_z = wc->fft_wind_dir_z;
-            sr->water_cache[slot].fft_amplitude  = wc->fft_amplitude;
+        /* The FFT itself belongs to the scene's water field, NOT to this
+         * cache.  The renderer used to build a second, private Tessendorf
+         * patch and evolve it on a private clock, so the ocean on screen and
+         * the ocean the physics solver sampled were two different simulations
+         * that merely happened to share authored parameters.  Here the
+         * renderer is a CONSUMER: it acquires the field and uploads from it.
+         *
+         * What stays local is the GPU texture -- that is a render resource and
+         * has no business in the simulation. */
+        /* ONE filler, from the scene, keyed on the entity -- see
+         * jce_scene_water_field_desc. What used to be here filled the desc by
+         * hand and got three things wrong that nothing reported: base_height
+         * stayed ENTITY-LOCAL (0.000 on hidden_cove, where the water is drawn
+         * at 14.99), center_x/center_z were never set at all, and the wind
+         * multiplier was applied here and nowhere else, so the runtime's desc
+         * for the same field differed by exactly that factor. */
+        JceWaterFieldDesc wd;
+        if (!jce_scene_water_field_desc(scene, e, &wd)) return;
+        /* Resolution is the renderer's clamp, not the component's: the GPU
+         * texture is sized from it. */
+        wd.fft_resolution = res;
+        sr_dbg_wind("ocean", wd.fft_wind_dir_x, 0.0f, wd.fft_wind_dir_z,
+                    wd.fft_wind_speed);
 
-            /* (Re)create the displacement texture if the resolution changed. */
-            if (sr->water_cache[slot].fft &&
+        JceWaterField *wfield = jce_water_field_set_acquire(
+            jce_scene_water_fields(scene), (uint64_t)e, &wd);
+
+        /* The texture is re-created only when the RESOLUTION changes -- the one
+         * spectrum parameter its size depends on.  Every other spectrum change
+         * is the field's business now, and rebuilding a GPU texture for a wind
+         * tweak was always wasted work. */
+        {
+            if (wfield &&
                 (sr->water_cache[slot].fft_res != res ||
                  !BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex))) {
                 if (BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex))
                     bgfx_destroy_texture(sr->water_cache[slot].fft_tex);
-                const uint64_t tflags = BGFX_TEXTURE_NONE
-                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
-                sr->water_cache[slot].fft_tex = bgfx_create_texture_2d(
-                    (uint16_t)res, (uint16_t)res, false, 1,
-                    BGFX_TEXTURE_FORMAT_RGBA32F, tflags, NULL, 0);
+                /* The second cascade shares the primary's resolution, so a
+                 * resolution change invalidates it too.  Dropped here, but NOT
+                 * re-created here -- see the cascade block after this one. */
+                if (BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft2_tex)) {
+                    bgfx_destroy_texture(sr->water_cache[slot].fft2_tex);
+                    sr->water_cache[slot].fft2_tex.idx = UINT16_MAX;
+                }
+                /* REPEAT, not CLAMP.  vs_water.sc tiles this texture with
+                 * fract(), so at the patch seam bilinear filtering needs texel
+                 * N-1 and texel 0; CLAMP hands it texel N-1 twice and leaves a
+                 * half-texel discontinuity along every patch boundary.  The
+                 * module header promises seamless tiling; the sampler flags
+                 * were quietly breaking that promise. */
+                const uint64_t tflags = BGFX_TEXTURE_NONE;   /* = wrap/repeat */
+
+                /* The displacement texture is fetched in the VERTEX shader, and
+                 * RGBA32F is not filterable in core WebGL2 (it needs
+                 * OES_texture_float_linear).  Unguarded, that returns black --
+                 * a silently flat ocean on the platform the charter says must
+                 * work.  This renderer already guards crowd instancing the same
+                 * way; water was the one path that skipped it.
+                 *
+                 * On failure the texture is left invalid so sr_draw_water falls
+                 * back to the analytic Gerstner path, which is a correct ocean
+                 * rather than a black one.  (Downgrading to RGBA16F would halve
+                 * the upload too, but the packer below writes 4 floats per
+                 * texel, so that needs a half-float path -- deliberately not
+                 * bundled in here.) */
+                const bgfx_caps_t *wcaps = bgfx_get_caps();
+                const bool vtx_ok = wcaps &&
+                    (wcaps->formats[BGFX_TEXTURE_FORMAT_RGBA32F] &
+                     BGFX_CAPS_FORMAT_TEXTURE_VERTEX) != 0;
+                if (!vtx_ok) {
+                    sr->water_cache[slot].fft_tex.idx = UINT16_MAX;
+                    static bool s_warned_vtx = false;
+                    if (!s_warned_vtx) {
+                        s_warned_vtx = true;
+                        LOG_WARN(LOG_TAG,
+                                 "water: RGBA32F is not vertex-sampleable on this "
+                                 "backend; FFT displacement disabled, falling back "
+                                 "to the analytic wave path");
+                    }
+                } else {
+                    sr->water_cache[slot].fft_tex = bgfx_create_texture_2d(
+                        (uint16_t)res, (uint16_t)res, false, 1,
+                        BGFX_TEXTURE_FORMAT_RGBA32F, tflags, NULL, 0);
+                }
             }
             sr->water_cache[slot].fft_res = res;
+
+            /* ── Second cascade texture ─────────────────────────────────
+             * Created only when the FIELD actually built a second cascade.
+             *
+             * It used to be created unconditionally, right beside the primary:
+             * a full RGBA32F at the same resolution -- 1 MiB per water body at
+             * res 256 -- that was never written and never bound, because the
+             * only thing that can produce a second cascade is
+             * JceWaterFieldDesc::cascade_fraction and the scene-side filler
+             * (jce_scene_water_field_desc) has never set it.  So on every
+             * scene that has ever run, the allocation was pure cost.
+             *
+             * Allocating for a producer that might arrive is how a renderer
+             * accumulates VRAM that no frame can account for.  The allocation
+             * now follows the fact instead of the hope, and the feature is not
+             * removed: the CPU sum, the upload below and the stage-1 bind are
+             * all still here, so the frame a cascade does appear -- an SDK
+             * caller filling cascade_fraction on the public desc, or an
+             * authored scene field if this project decides to add one -- this
+             * block creates the texture and the rest already works.
+             *
+             * Shares the primary's resolution (the field builds both from one
+             * desc, differing only in patch SIZE) and the primary's REPEAT
+             * sampler flags -- BGFX_TEXTURE_NONE spelled out here because
+             * `tflags` is scoped to the block above, and both cascades are
+             * tiled with fract() so CLAMP would seam either one.  It also
+             * rides the primary's vertex-sampleability guard: with no primary
+             * there is no FFT path at all.
+             *
+             * Falsified if a field ever reports an fft2 while this texture
+             * stays invalid, which would show up as u_water_mode.w staying 0
+             * with a two-cascade field alive. */
+            if (BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex) &&
+                jce_water_field_fft2(wfield) != NULL &&
+                !BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft2_tex)) {
+                sr->water_cache[slot].fft2_tex = bgfx_create_texture_2d(
+                    (uint16_t)res, (uint16_t)res, false, 1,
+                    BGFX_TEXTURE_FORMAT_RGBA32F, BGFX_TEXTURE_NONE, NULL, 0);
+            }
         }
 
-        JceWaterFft *fft = sr->water_cache[slot].fft;
+        const JceWaterFft *fft = jce_water_field_fft(wfield);
         if (fft && BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex)) {
-            /* Advance the surface to the shared phase clock, then pack the three
-             * fields into the RGBA32F texture and upload (mirrors the Forward+
-             * mutable-texture refresh). */
-            jce_water_fft_evolve(fft, sr->water_time);
+            /* No evolve here.  The field is already at the shared clock -- it
+             * was advanced once, by the single driver, before anything drew.
+             * Evolving again would be the second simulation coming back. */
+            /* Foam rides the alpha channel, which was previously written as a
+             * constant 0 -- the texture already costs 4 floats per texel, so
+             * the Jacobian is genuinely free to transport.  Requested here
+             * rather than at create time so a field nobody draws never pays
+             * for it. */
+            jce_water_fft_enable_foam((JceWaterFft *)fft);
+            const float *foam = jce_water_fft_foam_data(fft);
             const float *h  = jce_water_fft_height_data(fft);
             const float *dx = jce_water_fft_disp_x_data(fft);
             const float *dz = jce_water_fft_disp_z_data(fft);
@@ -2234,13 +2663,44 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
                 dstf[i * 4 + 0] = h  ? h[i]  : 0.0f;  /* R = height (Y)        */
                 dstf[i * 4 + 1] = dx ? dx[i] : 0.0f;  /* G = horizontal X roll */
                 dstf[i * 4 + 2] = dz ? dz[i] : 0.0f;  /* B = horizontal Z roll */
-                dstf[i * 4 + 3] = 0.0f;
+                /* A = Jacobian of the horizontal map: < 1 compressed,
+                 * < 0 folded (a breaking crest).  1 = undisturbed, which is
+                 * the correct default when foam is unavailable -- 0 would read
+                 * as "folded everywhere". */
+                dstf[i * 4 + 3] = foam ? foam[i] : 1.0f;
             }
             uint16_t pitch = (uint16_t)((uint32_t)res * 4u * (uint32_t)sizeof(float));
             bgfx_update_texture_2d(sr->water_cache[slot].fft_tex, 0, 0, 0, 0,
                                    (uint16_t)res, (uint16_t)res, mem, pitch);
             water_mode = JCE_WATER_MODE_FFT;
             fft_patch  = wc->fft_patch_size;
+
+            /* Upload the second cascade too.  Summing it on the CPU while the
+             * GPU drew only the first would recreate exactly the disagreement
+             * JceWaterField exists to prevent. */
+            const JceWaterFft *fft2 = jce_water_field_fft2(wfield);
+            if (fft2 && BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft2_tex)) {
+                const int r2 = jce_water_fft_resolution(fft2);
+                const float *h2  = jce_water_fft_height_data(fft2);
+                const float *dx2 = jce_water_fft_disp_x_data(fft2);
+                const float *dz2 = jce_water_fft_disp_z_data(fft2);
+                const float *fm2 = jce_water_fft_foam_data(fft2);
+                const uint32_t c2 = (uint32_t)r2 * (uint32_t)r2;
+                const bgfx_memory_t *m2 =
+                    bgfx_alloc(c2 * 4u * (uint32_t)sizeof(float));
+                float *d2 = (float *)m2->data;
+                for (uint32_t i = 0; i < c2; ++i) {
+                    d2[i * 4 + 0] = h2  ? h2[i]  : 0.0f;
+                    d2[i * 4 + 1] = dx2 ? dx2[i] : 0.0f;
+                    d2[i * 4 + 2] = dz2 ? dz2[i] : 0.0f;
+                    d2[i * 4 + 3] = fm2 ? fm2[i] : 1.0f;
+                }
+                bgfx_update_texture_2d(sr->water_cache[slot].fft2_tex, 0, 0, 0, 0,
+                                       (uint16_t)r2, (uint16_t)r2, m2,
+                                       (uint16_t)((uint32_t)r2 * 4u *
+                                                  (uint32_t)sizeof(float)));
+                fft_patch2 = jce_water_fft_patch_size(fft2);
+            }
         }
     }
     /* ── STYLIZED overlay path (water_mode==STYLIZED) ─────────────────────
@@ -2259,7 +2719,7 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
             stylized_data = sr_resolve_texture(sr, wc->data_tex);
     }
     float wmode[4] = { (float)water_mode, fft_patch,
-                       wc->splash_ratio, 0.0f };
+                       wc->splash_ratio, fft_patch2 };
 
     /* Global PBR bind (lights/camera/ambient/IBL) — same as terrain. */
     JcePbrMaterial wpbr = jce_pbr_material_default();
@@ -2284,13 +2744,256 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
     else
         bgfx_set_texture(0, sr->s_water_disp, sr->white_tex, UINT32_MAX);
 
-    /* Stylized shore-distance data map (stage 5; white = harmless default:
-     * depth 1 everywhere -> zero shore strokes). */
+    /* ── The disturbance layer at stage 2 ─────────────────────────────
+     *
+     * ONE grid per scene, so the upload is keyed on the frame rather than on
+     * the water body: with two ponds in frame this would otherwise re-upload
+     * the same grid twice and the second body would pay for nothing.
+     *
+     * Read-only here. The grid is created and stepped by the runtime's fixed
+     * tick (see jce_scene_water_ripple), and passing NULL is what makes that
+     * true rather than merely intended -- a renderer that could create one
+     * would size the pond by whoever drew first. In the editor with Play
+     * stopped nothing creates it, so this is simply absent and the water draws
+     * exactly as it did before. */
+    {
+        if (!BGFX_HANDLE_IS_VALID(sr->s_water_ripple))
+            sr->s_water_ripple = bgfx_create_uniform("s_water_ripple",
+                                                     BGFX_UNIFORM_TYPE_SAMPLER, 1);
+        if (!BGFX_HANDLE_IS_VALID(sr->u_water_ripple))
+            sr->u_water_ripple = bgfx_create_uniform("u_water_ripple",
+                                                     BGFX_UNIFORM_TYPE_VEC4, 1);
+
+        JceWaterRipple *rip = jce_scene_water_ripple(scene, NULL);
+        float rp[4] = { 0.0f, 0.0f, 1.0f, 0.0f };   /* w = 0 -> shader skips */
+        const int rres = rip ? jce_water_ripple_resolution(rip) : 0;
+        const float *rh = rip ? jce_water_ripple_height_data(rip) : NULL;
+
+        const bgfx_caps_t *rcaps = bgfx_get_caps();
+        const bool r32f_vertex = rcaps &&
+            (rcaps->formats[BGFX_TEXTURE_FORMAT_R32F] &
+             BGFX_CAPS_FORMAT_TEXTURE_VERTEX) != 0;
+
+        if (rh && rres > 0 && r32f_vertex) {
+            if (BGFX_HANDLE_IS_VALID(sr->water_ripple_tex) &&
+                sr->water_ripple_res != rres) {
+                bgfx_destroy_texture(sr->water_ripple_tex);
+                sr->water_ripple_tex.idx = UINT16_MAX;
+            }
+            if (!BGFX_HANDLE_IS_VALID(sr->water_ripple_tex)) {
+                /* CLAMP, and the shader ALSO tests the rectangle explicitly:
+                 * clamping alone would repeat the rim texel across the whole
+                 * ocean, which is the difference between "no disturbance out
+                 * here" and "whatever the rim happened to hold". */
+                sr->water_ripple_tex = bgfx_create_texture_2d(
+                    (uint16_t)rres, (uint16_t)rres, false, 1,
+                    BGFX_TEXTURE_FORMAT_R32F,
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+                sr->water_ripple_res = rres;
+                sr->water_ripple_frame_valid = false;
+            }
+            if (BGFX_HANDLE_IS_VALID(sr->water_ripple_tex) &&
+                (!sr->water_ripple_frame_valid ||
+                 sr->water_ripple_frame != jce_renderer_get_frame_index(sr->renderer))) {
+                const uint32_t cells = (uint32_t)rres * (uint32_t)rres;
+                const bgfx_memory_t *rm =
+                    bgfx_copy(rh, cells * (uint32_t)sizeof(float));
+                bgfx_update_texture_2d(sr->water_ripple_tex, 0, 0, 0, 0,
+                                       (uint16_t)rres, (uint16_t)rres, rm,
+                                       (uint16_t)((uint32_t)rres *
+                                                  (uint32_t)sizeof(float)));
+                sr->water_ripple_frame = jce_renderer_get_frame_index(sr->renderer);
+                sr->water_ripple_frame_valid = true;
+            }
+            if (BGFX_HANDLE_IS_VALID(sr->water_ripple_tex)) {
+                jce_water_ripple_world_rect(rip, &rp[0], &rp[1], &rp[2]);
+                rp[3] = 1.0f;
+            }
+        }
+        bgfx_set_uniform(sr->u_water_ripple, rp, 1);
+        bgfx_set_texture(2, sr->s_water_ripple,
+                         BGFX_HANDLE_IS_VALID(sr->water_ripple_tex)
+                             ? sr->water_ripple_tex : sr->white_tex,
+                         UINT32_MAX);
+    }
+
+    /* Second cascade at stage 1.  Bound unconditionally -- an unbound sampler
+     * is undefined on some backends, and the shader only reads it when
+     * u_water_mode.w carries a patch size. */
+    if (!BGFX_HANDLE_IS_VALID(sr->s_water_disp2))
+        sr->s_water_disp2 = bgfx_create_uniform("s_water_disp2",
+                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    if (fft_patch2 > 0.0f &&
+        BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft2_tex))
+        bgfx_set_texture(1, sr->s_water_disp2,
+                         sr->water_cache[slot].fft2_tex, UINT32_MAX);
+    else
+        bgfx_set_texture(1, sr->s_water_disp2, sr->white_tex, UINT32_MAX);
+
+    /* Stylized shore-distance data map (stage 4; white = harmless default:
+     * depth 1 everywhere -> zero shore strokes).  Stage 4, not 5: stage 5 is
+     * the engine's s_shadowMap slot and must stay free for it. */
     {
         bgfx_texture_handle_t dt = { stylized_data.idx };
         if (!BGFX_HANDLE_IS_VALID(dt)) dt = sr->white_tex;
-        bgfx_set_texture(5, sr->s_water_data, dt, UINT32_MAX);
+        bgfx_set_texture(4, sr->s_water_data, dt, UINT32_MAX);
     }
+
+    /* Directional shadows on the surface.  The translucent pass bound no
+     * shadow data at all, so water stayed lit inside shadows that darkened
+     * every opaque surface around it -- most visible exactly where it matters,
+     * at a shoreline, where lit sea meets shadowed sand along a straight line
+     * that looks authored. */
+    /* ── Beer-Lambert absorption ─────────────────────────────────────────
+     * Bound UNCONDITIONALLY.  bgfx retains uniform values across submits, so a
+     * water body with clarity off, drawn after one with it on, would inherit
+     * the previous body's extinction -- a pond tinted like an ocean, and only
+     * when a second body happens to be in the scene. */
+    {
+        float absorb[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float tint[4]   = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float dparams[4]= { 0.1f, 1000.0f, 0.0f, 0.0f };
+
+        /* depth_prepass_frame, not just a valid handle: the pre-pass target is
+         * kept across frames, so testing the handle alone answered "yes" on
+         * every frame after the pre-pass stopped running and the surface went
+         * on absorbing against a depth buffer frozen at that last frame -- a
+         * pond that keeps the silhouette of a boat that has sailed away.  The
+         * flag is set by the pass itself, so it can only be true on a frame
+         * whose depth was actually written (or validly retained by the
+         * static-frame cache).
+         *
+         * The width/height test stays: the reciprocals below become the
+         * shader's screen-UV scale, and 1/0 would send every fragment to the
+         * same texel. */
+        const bool have_depth = sr->depth_prepass_frame
+                             && BGFX_HANDLE_IS_VALID(sr->ssao_depth_tex)
+                             && sr->ssao_w > 0u && sr->ssao_h > 0u;
+        /* No prepass depth means no path length.  Absorption is skipped rather
+         * than guessed: a made-up path tints the whole surface by a constant,
+         * which looks like an authored colour and hides that the input is
+         * missing.
+         *
+         * Reaching here with clarity > 0 and no depth is now the exception
+         * rather than the rule: sr_water_needs_depth() asks for the pre-pass
+         * on behalf of exactly this block, so the only ways left are a
+         * renderer with no PAK/camera or an FBO that failed to create.  Both
+         * are real failures, and both should read as "no absorption" rather
+         * than as an authored tint. */
+        if (wc->clarity > 0.0f) sr->underwater_possible = true;
+        if (wc->clarity > 0.0f && have_depth) {
+            const JceWaterExtinction ext =
+                jce_water_extinction_from_clarity(wc->clarity);
+            absorb[0] = ext.sigma[0];
+            absorb[1] = ext.sigma[1];
+            absorb[2] = ext.sigma[2];
+
+            /* Is the eye under this surface?  Measured against the DISPLACED
+             * surface via the water field, not against base_height: under a
+             * crest the camera can sit above the still-water plane with water
+             * over it, and a plane test surfaces the camera inside a wave. */
+            float submersion = 0.0f;
+            if (camera) {
+                const jce_vec3 eye = jce_camera_get_position(camera);
+                const JceWaterField *wf =
+                    jce_water_field_set_find(jce_scene_water_fields(scene),
+                                             (uint64_t)e);
+                if (wf) {
+                    if (!jce_water_field_submersion(wf, eye.x, eye.y, eye.z,
+                                                    0.0f, &submersion))
+                        submersion = 0.0f;  /* not over this body, so not under it */
+                } else {
+                    /* No field for this body (a mode that does not build one).
+                     * Fall back to the still-water plane, and say so: this is
+                     * the approximation, not the answer.  It disagrees with the
+                     * real surface by exactly the wave height, so the camera
+                     * can pop underwater a wave-height early or late near the
+                     * waterline.  Better than claiming a submersion we cannot
+                     * measure. */
+                    submersion = wc->base_height - eye.y;
+                }
+            }
+            absorb[3] = (submersion > 0.0f) ? 1.0f : 0.0f;
+
+            /* Remember it for the fullscreen pass.  The surface shader only
+             * covers pixels where the water rasterises; from below that is the
+             * patch overhead, so everything else needs the fullscreen pass or
+             * the view renders dry while the camera is submerged. */
+            if (submersion > 0.0f) {
+                sr->underwater_frame    = true;
+                sr->underwater_sigma[0] = ext.sigma[0];
+                sr->underwater_sigma[1] = ext.sigma[1];
+                sr->underwater_sigma[2] = ext.sigma[2];
+                sr->underwater_tint[0]  = wc->color_deep[0];
+                sr->underwater_tint[1]  = wc->color_deep[1];
+                sr->underwater_tint[2]  = wc->color_deep[2];
+            }
+
+            tint[0] = wc->color_deep[0];
+            tint[1] = wc->color_deep[1];
+            tint[2] = wc->color_deep[2];
+
+            dparams[0] = camera ? jce_camera_get_near(camera) : 0.1f;
+            dparams[1] = camera ? jce_camera_get_far(camera)  : 1000.0f;
+            dparams[2] = 1.0f / (float)sr->ssao_w;
+            dparams[3] = 1.0f / (float)sr->ssao_h;
+        }
+
+        /* Caustics.  Bound unconditionally alongside absorption: bgfx retains
+         * uniform values, so a body with caustics off drawn after one with
+         * them on would inherit the previous body's strength. */
+        {
+            float cs[4] = { 0.0f, 20.0f, 0.0f, 0.0f };
+            bgfx_texture_handle_t cd = sr->white_tex;
+            if (wc->caustics > 0.0f
+                && BGFX_HANDLE_IS_VALID(sr->water_cache[slot].fft_tex)) {
+                cs[0] = wc->caustics;
+                /* Fade over the same distance the absorption is tuned for, so
+                 * the pattern disappears where the water stops being clear
+                 * rather than at an unrelated hand-picked depth. */
+                cs[1] = (wc->clarity > 0.0f) ? wc->clarity : 20.0f;
+                /* One texel of the displacement map, for the finite
+                 * difference.  A wrong step here changes the Jacobian's SCALE,
+                 * which reads as a caustics-strength setting rather than as a
+                 * broken derivative. */
+                cs[2] = 1.0f / (float)(wc->fft_resolution > 0
+                                       ? wc->fft_resolution : 128);
+                cd = sr->water_cache[slot].fft_tex;
+            }
+            bgfx_set_uniform(sr->u_water_caustics, cs, 1);
+
+            /* Shoreline foam needs the same prepass depth the absorption does
+             * -- the band is the water column's thickness -- so it is bound in
+             * the same block and shares its have_depth gate. */
+            float sh[4] = { wc->shore_foam_m, wc->shore_surge_s, 0.9f, 0.0f };
+            bgfx_set_uniform(sr->u_water_shore, sh, 1);
+            bgfx_set_texture(6, sr->s_water_caustic_disp, cd, UINT32_MAX);
+        }
+
+        bgfx_set_uniform(sr->u_water_absorb,       absorb,  1);
+        bgfx_set_uniform(sr->u_water_absorb_tint,  tint,    1);
+        bgfx_set_uniform(sr->u_water_depth_params, dparams, 1);
+
+        bgfx_texture_handle_t dt = have_depth ? sr->ssao_depth_tex
+                                              : sr->white_tex;
+        bgfx_set_texture(2, sr->s_water_depth, dt, UINT32_MAX);
+    }
+
+    /* The same bind every opaque lit surface gets -- reusing it is the point:
+     * a water-specific copy would drift from the terrain it meets at the
+     * shoreline, and the two disagreeing is exactly what a shoreline shows. */
+    sr_bind_frame_shadow_state(sr);
+        /* Stage 3 is this shader's s_cloudShadow. It is NOT bound in
+         * sr_bind_frame_shadow_state with the rest of the shadow state, however
+         * much it belongs there: fs_pbr_body.sh occupies all sixteen stages and
+         * uses 3 for s_aoMap, so binding the cloud map for everyone overwrites
+         * every mesh's ambient-occlusion map with a top-down transmittance and the
+         * mesh reads it by its own UV. That is why meshes take their cloud shadow
+         * from the SSAO target's blue channel instead, and why that path really
+         * does depend on SSAO -- an architectural constraint, not an oversight.
+         *
+         * After any material bind, because jce_pbr_material binds stage 3 too. */
+        sr_bind_cloud_shadow(sr);
 
     bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(mesh) };
     bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(mesh) };
@@ -2306,8 +3009,16 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
                    | BGFX_STATE_DEPTH_TEST_LESS
                    | BGFX_STATE_BLEND_ALPHA
                    | BGFX_STATE_MSAA;
+    /* Authored, default off -- see JceWaterComponent::depth_write.  Without a
+     * depth value at water pixels, SSR / DOF / aerial fog all read whatever
+     * lies BEHIND the surface instead of the surface itself; with one,
+     * translucent geometry further away is depth-rejected.  Neither is
+     * universally right, so the scene decides rather than the engine. */
+    if (wc->depth_write) state |= BGFX_STATE_WRITE_Z;
     bgfx_set_state(state, 0);
 
+    /* Water owns its uniform set too -- third batch with this omission. */
+    jce_pbr_material_bind_view_mode();
     bgfx_submit(view_id, sr->prog_water, 0, BGFX_DISCARD_ALL);
 }
 
@@ -2645,7 +3356,13 @@ void sr_draw_tilemap_chunks(JceSceneRenderer *sr, int slot,
     bool have_planes = false;
     if (camera) {
         const jce_mat4 v  = jce_camera_view(camera);
-        const jce_mat4 p  = jce_camera_proj(camera, 16.0f / 9.0f,
+        /* The viewport's aspect, not 16:9 -- see sr->frame_aspect. A test
+         * frustum narrower than the real one culls what is still on screen at
+         * the left and right edges, and this is the third site to have carried
+         * that hard-code: jce_sr_draw.c already records the same bug being
+         * fixed for streamed objects, where it made the whole streamed set
+         * shimmer every frame. */
+        const jce_mat4 p  = jce_camera_proj(camera, sr->frame_aspect,
                                             sr->homogeneous_depth);
         const jce_mat4 vp = jce_m4_multiply(&p, &v);
         sr_extract_frustum_planes(&vp, planes);
@@ -2680,6 +3397,245 @@ void sr_draw_tilemap_chunks(JceSceneRenderer *sr, int slot,
 }
 
 /* ── Sky pass ─────────────────────────────────────────────────────── */
+
+/* Create and upload the transmittance table once.
+ *
+ * The table is a function of the atmosphere PARAMETERS, not of the sun, so
+ * moving the sun never invalidates it -- which is the whole reason baking is
+ * worth it: the expensive work happens when a designer changes the air, not
+ * every frame.
+ *
+ * Falls back to no texture when RGBA32F is unavailable; the PHYSICAL branch
+ * then reads black, which is a visibly wrong sky.  That is the correct way for
+ * an unsupported configuration to fail -- loudly, not subtly. */
+/* Bake and upload the cloud density atlas once.
+ *
+ * 64x32x32 voxels folded 8 slices per row: 512x128 texels, 256 KB as R32F.
+ * Small on purpose -- the field is low-frequency shape, and the DETAIL that
+ * makes a cloud edge look eroded comes from the shader's own high-frequency
+ * term, not from a larger bake.  A bigger volume would cost memory to store
+ * exactly the frequencies the march can regenerate. */
+#define SR_CLOUD_DIM_X   64u
+#define SR_CLOUD_DIM_Y   32u
+#define SR_CLOUD_DIM_Z   32u
+#define SR_CLOUD_TILES_X  8u
+
+/* Map the scene's coverage [0,1] onto the bake's own coverage bias [-1,1].
+ *
+ * There are two coverage controls in this system and only one of them was
+ * wired.  The renderer baked with jce_cloud_noise_params_default(), whose bias
+ * is 0.0, and then let the SHADER threshold the result.  Measured, that bake
+ * leaves 13.8% of the volume non-zero with a maximum density of 0.46 -- so the
+ * shader's threshold was carving an already almost-empty field, and the slider
+ * did essentially nothing until it approached 1.  (Raising cloudDensity could
+ * not compensate: 10x density measured 2.7x effect, because there was almost
+ * nothing there to multiply.)
+ *
+ * The bias is the control that actually decides how much cloud EXISTS:
+ *      -0.2 ->  1.1% of the volume    0.0 -> 13.8%    +0.4 -> 45.9%
+ *      +0.6 -> 57.8%, and it saturates above that.
+ * So the useful span is about [-0.2, +0.6], which is what this maps onto. */
+/* Moved to jce_sr_internal.h as jce_cloud_bias_for_coverage: the cloud SHADOW
+ * bake needs the identical mapping, and a second copy of it beside the first
+ * is how the sky and the ground stopped agreeing about the weather. */
+#define sr_cloud_bias_for_coverage jce_cloud_bias_for_coverage
+
+static bool sr_sky_ensure_cloud_atlas(JceSceneRenderer *sr)
+{
+    /* Re-bake when the scene's coverage moves: the atlas now ENCODES coverage
+     * rather than merely being thresholded by it, so a cached atlas is only
+     * valid for the coverage it was baked at.  Compared with a small epsilon
+     * so that dragging the slider does not re-bake on every sub-perceptual
+     * step -- the bake is a few million noise evaluations. */
+    const float want_bias = sr_cloud_bias_for_coverage(sr->cloud_coverage);
+    if (sr->cloud_atlas_ready &&
+        fabsf(want_bias - sr->cloud_atlas_bias) < 0.01f)
+        return BGFX_HANDLE_IS_VALID(sr->cloud_atlas_tex);
+
+    if (BGFX_HANDLE_IS_VALID(sr->cloud_atlas_tex)) {
+        bgfx_destroy_texture(sr->cloud_atlas_tex);
+        sr->cloud_atlas_tex.idx = UINT16_MAX;
+    }
+    sr->cloud_atlas_ready = true;
+    sr->cloud_atlas_bias  = want_bias;
+    sr->cloud_atlas_tex.idx = UINT16_MAX;
+
+    if (!BGFX_HANDLE_IS_VALID(sr->u_sky_clouds))
+        sr->u_sky_clouds = bgfx_create_uniform("s_sky_clouds",
+                                               BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_cloud_params))
+        sr->u_cloud_params = bgfx_create_uniform("u_cloud_params",
+                                                 BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_cloud_atlas))
+        sr->u_cloud_atlas = bgfx_create_uniform("u_cloud_atlas",
+                                                BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_cloud_quality))
+        sr->u_cloud_quality = bgfx_create_uniform("u_cloud_quality",
+                                                  BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_cloud_period))
+        sr->u_cloud_period = bgfx_create_uniform("u_cloud_period",
+                                                 BGFX_UNIFORM_TYPE_VEC4, 1);
+
+    uint32_t aw = 0u, ah = 0u;
+    if (!jce_cloud_noise_atlas_size(SR_CLOUD_DIM_X, SR_CLOUD_DIM_Y,
+                                    SR_CLOUD_DIM_Z, SR_CLOUD_TILES_X,
+                                    &aw, &ah))
+        return false;
+
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || (caps->formats[BGFX_TEXTURE_FORMAT_R32F] &
+                  BGFX_CAPS_FORMAT_TEXTURE_2D) == 0) {
+        LOG_WARN(LOG_TAG, "sky: R32F unavailable; volumetric clouds disabled");
+        return false;
+    }
+
+    const bgfx_memory_t *mem =
+        bgfx_alloc((uint32_t)((size_t)aw * ah * sizeof(float)));
+    JceCloudNoiseParams cp;
+    jce_cloud_noise_params_default(&cp);
+    cp.weather_coverage_bias = want_bias;
+    if (!jce_cloud_noise_bake_atlas(&cp, (float *)mem->data,
+                                    SR_CLOUD_DIM_X, SR_CLOUD_DIM_Y,
+                                    SR_CLOUD_DIM_Z, SR_CLOUD_TILES_X))
+        return false;
+
+    /* CLAMP: the atlas fold puts unrelated slices side by side, so a wrapped
+     * fetch at a tile border would read a different altitude entirely. */
+    sr->cloud_atlas_tex = bgfx_create_texture_2d(
+        (uint16_t)aw, (uint16_t)ah, false, 1, BGFX_TEXTURE_FORMAT_R32F,
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
+
+    sr->cloud_atlas_dims[0] = (float)SR_CLOUD_DIM_X;
+    sr->cloud_atlas_dims[1] = (float)SR_CLOUD_DIM_Y;
+    sr->cloud_atlas_dims[2] = (float)SR_CLOUD_DIM_Z;
+    sr->cloud_atlas_dims[3] = (float)SR_CLOUD_TILES_X;
+    return BGFX_HANDLE_IS_VALID(sr->cloud_atlas_tex);
+}
+
+/* Bake and upload the multiple-scattering table.
+ *
+ * Single scattering alone makes a clear sky too dark near the horizon and
+ * collapses twilight to black, because most of what reaches the eye at those
+ * angles has bounced more than once. The baker for this has existed, and been
+ * unit-tested, since the atmosphere module was written -- with NO runtime
+ * caller at all: no texture, no uniform, no bind, no sampler. Its contribution
+ * to every pixel of every frame was exactly zero, which is a statement that
+ * needs no capture to verify, because a term with no sampler cannot enter a
+ * shader.
+ *
+ * THE UNITS, because this is where a fudge factor would otherwise go.
+ *
+ * fs_sky's single-scatter line reads
+ *     col = beta_R * T * phase * depth * exposure
+ * where beta_R is the Rayleigh coefficient divided by its own Rec.709
+ * LUMINANCE (jce_rayleigh.h pins the triple; 5.802/13.558/33.100 over 13.320
+ * gives 0.4356/1.0179/2.4850, which is what the shader hard-codes). So the
+ * shader works in luminance-normalised radiance.
+ *
+ * The LUT is in the atmosphere's own per-kilometre units: it holds
+ * sc * iso_phase * T / (1 - albedo), i.e. the scattering coefficient is
+ * ALREADY in it, as are the isotropic phase, the transmittance and the
+ * geometric series over every further order. Adding it to the shader's term
+ * therefore needs exactly one conversion -- the same luminance -- and that
+ * conversion is DERIVED from the parameters here rather than typed in, so an
+ * atmosphere with different coefficients stays consistent instead of needing
+ * the constant re-tuned.
+ *
+ * Because sc is already inside it, the result must NOT be multiplied by
+ * beta_R again, and must not take the Rayleigh phase: the series is isotropic
+ * by construction. */
+static bool sr_sky_ensure_multiscatter(JceSceneRenderer *sr)
+{
+    if (sr->sky_multiscatter_ready)
+        return BGFX_HANDLE_IS_VALID(sr->sky_multiscatter_tex);
+    sr->sky_multiscatter_ready = true;
+    sr->sky_multiscatter_tex.idx = UINT16_MAX;
+
+    if (!BGFX_HANDLE_IS_VALID(sr->u_sky_multiscatter))
+        sr->u_sky_multiscatter =
+            bgfx_create_uniform("s_sky_multiscatter",
+                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+
+    const uint32_t D = JCE_ATMOSPHERE_MS_LUT_DIM;
+
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || (caps->formats[BGFX_TEXTURE_FORMAT_RGBA32F] &
+                  BGFX_CAPS_FORMAT_TEXTURE_2D) == 0)
+        return false;               /* the transmittance path already warned */
+
+    float *lut = (float *)JCE_MALLOC((size_t)D * D * 3u * sizeof(float));
+    if (!lut) return false;
+    const bgfx_memory_t *mem =
+        bgfx_alloc((uint32_t)((size_t)D * D * 4u * sizeof(float)));
+
+    JceAtmosphereParams ap = jce_atmosphere_default_params();
+    bool ok = jce_atmosphere_bake_multiscatter_lut(&ap, lut);
+    if (ok) {
+        /* Rec.709 luminance of the SAME coefficients fs_sky normalised its
+         * beta_R by. Derived, not typed: change the atmosphere and both sides
+         * move together. */
+        const float lum = 0.2126f * ap.rayleigh_scattering.x
+                        + 0.7152f * ap.rayleigh_scattering.y
+                        + 0.0722f * ap.rayleigh_scattering.z;
+        if (lum > 1e-12f) {
+            const float inv = 1.0f / lum;
+            for (size_t i = 0; i < (size_t)D * D * 3u; i++) lut[i] *= inv;
+        }
+        jce_atmosphere_pack_lut_rgba32f(lut, D * D, (float *)mem->data);
+    }
+    JCE_FREE(lut);
+    if (!ok) return false;
+
+    /* CLAMP for the same reason the transmittance table clamps: the u axis
+     * spans cos(sun zenith) from -1 to +1, so a wrapped fetch at the edge
+     * would blend a sun at the zenith with one below the horizon. */
+    sr->sky_multiscatter_tex = bgfx_create_texture_2d(
+        (uint16_t)D, (uint16_t)D, false, 1, BGFX_TEXTURE_FORMAT_RGBA32F,
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
+    return BGFX_HANDLE_IS_VALID(sr->sky_multiscatter_tex);
+}
+
+static bool sr_sky_ensure_transmittance(JceSceneRenderer *sr)
+{
+    if (sr->sky_transmittance_ready)
+        return BGFX_HANDLE_IS_VALID(sr->sky_transmittance_tex);
+    sr->sky_transmittance_ready = true;
+    sr->sky_transmittance_tex.idx = UINT16_MAX;
+
+    if (!BGFX_HANDLE_IS_VALID(sr->u_sky_transmittance))
+        sr->u_sky_transmittance =
+            bgfx_create_uniform("s_sky_transmittance",
+                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+
+    const uint32_t W = JCE_ATMOSPHERE_LUT_COSINE;
+    const uint32_t H = JCE_ATMOSPHERE_LUT_ALTITUDE;
+
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || (caps->formats[BGFX_TEXTURE_FORMAT_RGBA32F] &
+                  BGFX_CAPS_FORMAT_TEXTURE_2D) == 0) {
+        LOG_WARN(LOG_TAG, "sky: RGBA32F unavailable; physical sky disabled");
+        return false;
+    }
+
+    float *lut = (float *)JCE_MALLOC((size_t)W * H * 3u * sizeof(float));
+    if (!lut) return false;
+    const bgfx_memory_t *mem =
+        bgfx_alloc((uint32_t)((size_t)W * H * 4u * sizeof(float)));
+
+    JceAtmosphereParams ap = jce_atmosphere_default_params();
+    const bool ok = jce_atmosphere_bake_transmittance_lut(&ap, lut);
+    if (ok)
+        jce_atmosphere_pack_lut_rgba32f(lut, W * H, (float *)mem->data);
+    JCE_FREE(lut);
+    if (!ok) return false;
+
+    /* CLAMP, not repeat: u spans cos(zenith) from -1 to +1, so a wrapped fetch
+     * at the edge would blend the zenith with the nadir. */
+    sr->sky_transmittance_tex = bgfx_create_texture_2d(
+        (uint16_t)W, (uint16_t)H, false, 1, BGFX_TEXTURE_FORMAT_RGBA32F,
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
+    return BGFX_HANDLE_IS_VALID(sr->sky_transmittance_tex);
+}
 
 void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
 {
@@ -2788,7 +3744,8 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
         sun4[2] = sun_dir[2]; sun4[3] = 0.0f;
         sky_params[0] = 3.0f;   /* mode = stylized */
         sky_params[1] = 1.0f;   /* exposure (dome is authored in linear)  */
-    } else if (sr->sky_mode == JCE_SCENE_SKY_PREETHAM) {
+    } else if (sr->sky_mode == JCE_SCENE_SKY_PREETHAM ||
+               sr->sky_mode == JCE_SCENE_SKY_PHYSICAL) {
         /* Analytic daylight: use the ToD sun direction when active, else a
          * default high sun.  Evaluate the SAME math as jce_sky_radiance(),
          * which fs_sky.sc mode 2 mirrors. */
@@ -2797,6 +3754,32 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
             sun_dir[0] = sr->tod_state.sun_direction.x;
             sun_dir[1] = sr->tod_state.sun_direction.y;
             sun_dir[2] = sr->tod_state.sun_direction.z;
+        } else if (sr->env) {
+            /* The scene's own directional light, not a constant.
+             *
+             * This branch used to hardcode (0, 0.9, 0.4359) -- a sun 64
+             * degrees up -- so a scene whose Sun entity pointed anywhere else
+             * got a sky whose bright spot and a set of shadows that disagreed
+             * about where the sun was.  In hidden_cove the authored sun sits
+             * at 34 degrees: thirty degrees of disagreement between the glow
+             * in the sky and the direction every shadow falls.
+             *
+             * Worse than the mismatch, it made a low sun UNREACHABLE.  Every
+             * warm-horizon look -- the entire lighting premise of a sunset --
+             * needs sun elevation as a free variable, and in PHYSICAL mode it
+             * was a literal.  Mode 3 has an authored escape hatch
+             * (dome_sun_dir); this mode had none.
+             *
+             * sr->env->sun_direction_ws is the authority the rest of the
+             * renderer already reads (see sr_bake_sky_ibl below, and the CSM
+             * resolve that writes it): a unit vector TOWARD the light, from
+             * the scene's primary directional light or from the day/night
+             * cycle when one is running.  Its own default is
+             * (0, 0.9, 0.436) -- the same numbers that were pinned here --
+             * so a scene with no directional light is unchanged. */
+            sun_dir[0] = sr->env->sun_direction_ws.x;
+            sun_dir[1] = sr->env->sun_direction_ws.y;
+            sun_dir[2] = sr->env->sun_direction_ws.z;
         } else {
             sun_dir[0] = 0.0f; sun_dir[1] = 0.9f; sun_dir[2] = 0.4359f;
         }
@@ -2821,7 +3804,10 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
         sun4[0] = ss.sun_dir[0]; sun4[1] = ss.sun_dir[1];
         sun4[2] = ss.sun_dir[2]; sun4[3] = 0.0f;
 
-        sky_params[0] = 2.0f;          /* mode = Preetham */
+        /* PHYSICAL reuses everything Preetham computed -- sun direction and
+         * exposure -- and differs only in the colour model, so it is a mode
+         * switch rather than a separate path. */
+        sky_params[0] = (sr->sky_mode == JCE_SCENE_SKY_PHYSICAL) ? 4.0f : 2.0f;
         sky_params[1] = ss.exposure;   /* exposure        */
     } else if (sr->skybox_active && sr->skybox) {
         JceTexture jet = jce_skybox_get_equirect_texture(sr->skybox);
@@ -2838,12 +3824,149 @@ void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
     bgfx_set_uniform(sr->u_sky_sun_dir, sun4,   1);
     bgfx_set_uniform(sr->u_sky_params,  sky_params, 1);
 
+    /* ── Sky stylisation grade ────────────────────────────────────────────
+     * Bound UNCONDITIONALLY, including when it is off.  bgfx retains uniform
+     * values across submits, so a frame that skipped the write would grade the
+     * sky with whatever the last stylised scene left behind -- and a sky graded
+     * by a scene that is no longer loaded is not something anyone would think
+     * to look for.
+     *
+     * The master enable in .w is what makes "off" bit-identical: the graded
+     * path ends in a clamp, which is right for a grade and wrong for a
+     * pass-through (see jce_sky_stylise.c). */
+    {
+        if (!BGFX_HANDLE_IS_VALID(sr->u_sky_stylise)) {
+            sr->u_sky_stylise = bgfx_create_uniform("u_sky_stylise",
+                                                    BGFX_UNIFORM_TYPE_VEC4, 1);
+            sr->u_sky_tint_shadow = bgfx_create_uniform("u_sky_tint_shadow",
+                                                        BGFX_UNIFORM_TYPE_VEC4, 1);
+            sr->u_sky_tint_mid = bgfx_create_uniform("u_sky_tint_mid",
+                                                     BGFX_UNIFORM_TYPE_VEC4, 1);
+            sr->u_sky_tint_high = bgfx_create_uniform("u_sky_tint_high",
+                                                      BGFX_UNIFORM_TYPE_VEC4, 1);
+        }
+
+        const JceSkyStylise st = sr->sky_stylise;
+
+        /* One authority for "is it off", shared with the CPU path -- so the
+         * shader and the lighting code can never disagree about whether the
+         * sky is stylised. */
+        const bool on = !jce_sky_stylise_is_identity(&st);
+        const float sp[4]  = { on ? (float)st.bands : 0.0f,
+                               on ? st.rim_strength : 0.0f,
+                               on ? st.saturation   : 1.0f,
+                               on ? 1.0f : 0.0f };
+        const float tsh[4] = { st.shadow_tint[0],    st.shadow_tint[1],    st.shadow_tint[2],    0.0f };
+        const float tmd[4] = { st.mid_tint[0],       st.mid_tint[1],       st.mid_tint[2],       0.0f };
+        const float thi[4] = { st.highlight_tint[0], st.highlight_tint[1], st.highlight_tint[2], 0.0f };
+        bgfx_set_uniform(sr->u_sky_stylise,     sp,  1);
+        bgfx_set_uniform(sr->u_sky_tint_shadow, tsh, 1);
+        bgfx_set_uniform(sr->u_sky_tint_mid,    tmd, 1);
+        bgfx_set_uniform(sr->u_sky_tint_high,   thi, 1);
+    }
+
     bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
     bgfx_set_transient_index_buffer(&tib, 0, 6);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_MSAA, 0);
 
     jce_mat4 identity = jce_m4_identity();
     bgfx_set_transform(identity.raw[0], 1);
+    /* PHYSICAL sky reads the baked table.  Bound whenever it exists: an
+     * unbound sampler is undefined on some backends, and the other modes
+     * simply never fetch it. */
+    if (sr_sky_ensure_transmittance(sr) &&
+        BGFX_HANDLE_IS_VALID(sr->u_sky_transmittance))
+        bgfx_set_texture(1, sr->u_sky_transmittance,
+                         sr->sky_transmittance_tex, UINT32_MAX);
+    /* Stage 3: fs_sky uses 0 (equirect), 1 (transmittance) and 2 (clouds), so
+     * this is the first free one and the shader is nowhere near the 16-sampler
+     * ceiling that has forced re-use elsewhere in this renderer. */
+    if (sr_sky_ensure_multiscatter(sr) &&
+        BGFX_HANDLE_IS_VALID(sr->u_sky_multiscatter))
+        bgfx_set_texture(3, sr->u_sky_multiscatter,
+                         sr->sky_multiscatter_tex, UINT32_MAX);
+
+    /* Clouds: bake only when a scene actually asks for them.  A scene with
+     * coverage 0 must not pay the bake, the upload, or the texture. */
+    float cloud_params[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const bool cloud_atlas_ok = sr->cloud_coverage > 0.0f &&
+                                sr_sky_ensure_cloud_atlas(sr);
+
+    /* Say once, out loud, whether clouds are actually running.
+     *
+     * Every way this switches itself off is silent: a scene that never set
+     * coverage, a backend without R32F, a bake that failed, or a sky mode that
+     * does not reach the march.  All four render an empty sky, which is
+     * indistinguishable from a skybox -- so the question "are the clouds on?"
+     * had no answer short of a graphics capture.  One line, at the point where
+     * the decision is actually made, and only when it changes. */
+    {
+        const int state = !cloud_atlas_ok ? 0 : (sr->sky_mode == 4 ? 2 : 1);
+        if (state != sr->cloud_report_state) {
+            sr->cloud_report_state = state;
+            if (state == 2)
+                LOG_INFO(LOG_TAG,
+                         "sky: volumetric clouds ACTIVE (coverage=%.2f density=%.2f "
+                         "%.1f-%.1f km, %d steps)",
+                         (double)sr->cloud_coverage, (double)sr->cloud_density,
+                         (double)sr->cloud_bottom_km, (double)sr->cloud_top_km,
+                         jce_cloud_march_steps((int)jce_renderer_get_tier()));
+            else if (state == 1)
+                LOG_WARN(LOG_TAG,
+                         "sky: clouds baked (coverage=%.2f) but sky mode is %d — "
+                         "only mode 4 (PHYSICAL) marches them, so the sky renders "
+                         "empty",
+                         (double)sr->cloud_coverage, sr->sky_mode);
+            else
+                LOG_INFO(LOG_TAG, "sky: volumetric clouds off (coverage=%.2f)",
+                         (double)sr->cloud_coverage);
+        }
+    }
+
+    if (cloud_atlas_ok) {
+        cloud_params[0] = sr->cloud_coverage;
+        cloud_params[1] = sr->cloud_density;
+        cloud_params[2] = sr->cloud_bottom_km;
+        cloud_params[3] = sr->cloud_top_km;
+        bgfx_set_texture(2, sr->u_sky_clouds, sr->cloud_atlas_tex, UINT32_MAX);
+        bgfx_set_uniform(sr->u_cloud_atlas, sr->cloud_atlas_dims, 1);
+        /* Step budget from the HARDWARE tier, re-read each frame so a tier
+         * override during a session takes effect without a restart. */
+        /* The atlas covers exactly ONE period of the field in X and Z
+         * (jce_cloud_noise.c: xx = (i+0.5)/dim_x * period_x, and the same for
+         * the slice in Z), so the world-to-tile factor is 1/period -- not the
+         * 0.05 per kilometre the march used to apply, which declares a 20 km
+         * period and stretches a 4096 m field across it by 4.88x.
+         *
+         * Both consumers of this field now agree on its size. They did not
+         * before: the ground shadow samples the CPU field directly, at its
+         * true period, so a cloud and its own shadow were drawn at scales
+         * differing by that factor and drifted at rates differing by it too. */
+        JceCloudNoiseParams cnp;
+        jce_cloud_noise_params_default(&cnp);
+        const float per_x = cnp.period_x > 0.0f ? cnp.period_x : 4096.0f;
+        const float per_z = cnp.period_z > 0.0f ? cnp.period_z : 4096.0f;
+
+        /* yz carry the wind offset the field has been carried by, wrapped into
+         * that same period and expressed in TILE units, so the march adds a
+         * dimensionless number and never has to know about metres. Wrapping at
+         * the period is exact -- fract() cannot tell the two apart -- and it
+         * keeps the value small enough that a float still resolves a frame's
+         * worth of drift after a long session. */
+        const float ox = (float)(fmod(sr->cloud_wind_offset[0], (double)per_x) / (double)per_x);
+        const float oz = (float)(fmod(sr->cloud_wind_offset[1], (double)per_z) / (double)per_z);
+        const float q[4] = {
+            (float)jce_cloud_march_steps((int)jce_renderer_get_tier()),
+            ox, oz, 0.0f
+        };
+        bgfx_set_uniform(sr->u_cloud_quality, q, 1);
+        /* wp arrives in kilometres, so fold the metres-to-km in here. */
+        const float per[4] = { 1000.0f / per_x, 1000.0f / per_z, 0.0f, 0.0f };
+        bgfx_set_uniform(sr->u_cloud_period, per, 1);
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->u_cloud_params))
+        bgfx_set_uniform(sr->u_cloud_params, cloud_params, 1);
+
     bgfx_submit(view_id, sr->prog_sky, 0, BGFX_DISCARD_ALL);
 }
 
@@ -2975,42 +4098,93 @@ void sr_draw_cloth(JceSceneRenderer *sr, JceScene *scene, uint16_t view_id)
 /* struct SrIblJob is defined in jce_sr_internal.h so jce_scene_renderer_destroy
  * (core) can tear down an in-flight bake while the worker/poller live here. */
 
-static void sr_ibl_worker(void *arg)
+static JceAsyncRunResult sr_ibl_worker(JceAsyncContext *ctx, void *arg)
 {
     struct SrIblJob *j = (struct SrIblJob *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
+    /* Timed because the sky bake re-runs whenever the sun moves two degrees,
+     * which under a day/night cycle is continuous. It is on a LOW-priority
+     * worker with one job in flight at a time, so the question is not whether
+     * it stalls the frame -- it cannot -- but whether it keeps a core busy
+     * forever. The number belongs in the log where anyone can see it. */
+    const uint64_t t0 = jce_time_perf_counter();
     j->result = jce_ibl_bake_cpu(j->pixels, j->w, j->h, j->irr, j->pf);
+    j->bake_ms = (float)jce_time_perf_to_ms(t0, jce_time_perf_counter());
     JCE_FREE(j->pixels);
     j->pixels = NULL;
-    j->done = 1;
+    if (!j->result) {
+        jce_async_context_fail(ctx, -1, "IBL CPU bake failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    if (jce_async_context_cancel_requested(ctx)) {
+        jce_ibl_cpu_free(j->result);
+        j->result = NULL;
+        return JCE_ASYNC_RUN_CANCELLED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
-/* MAIN thread: if the async bake finished, join it, upload to GPU and swap it
- * in — unless it is now stale (the skybox changed since the bake started). */
+static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path);
+
+/* MAIN thread: upload a finished bake unless the skybox changed. */
 static void sr_ibl_poll(JceSceneRenderer *sr)
 {
-    if (!sr->ibl_job || !sr->ibl_job->done)
+    if (!sr->ibl_job || !sr->ibl_task ||
+        !jce_async_task_is_terminal(sr->ibl_task))
         return;
-    if (sr->ibl_thread) {        /* join provides the memory barrier */
-        jce_thread_join(sr->ibl_thread);
-        sr->ibl_thread = NULL;
+
+    JceAsyncState state = jce_async_task_state(sr->ibl_task);
+    jce_async_task_release(sr->ibl_task);
+    sr->ibl_task = NULL;
+
+    JceIblCpuData *res =
+        state == JCE_ASYNC_STATE_SUCCEEDED ? sr->ibl_job->result : NULL;
+    const float bake_ms = sr->ibl_job->bake_ms;
+    const bool  sr_ibl_job_is_sky_done_tmp = sr->ibl_job_is_sky;
+    if (sr_ibl_job_is_sky_done_tmp) {
+        /* Wall clock from submit to collection, measured on ONE thread.
+         * Timing it inside the worker and reading the field here produced
+         * 1e7 ms -- a number no bake can take -- and rather than chase which
+         * of the two threads was lying, the whole question is avoided by
+         * never reading a worker-written float. This also measures what
+         * actually matters: how long the sky is stale, queue wait included. */
+        sr->sky_ibl_bake_ms = (float)jce_time_perf_to_ms(
+            sr->sky_ibl_t0, jce_time_perf_counter());
+        sr->sky_ibl_work_ms = bake_ms;
+        sr->sky_ibl_bakes++;
     }
-    JceIblCpuData *res = sr->ibl_job->result;
-    bool stale = (strcmp(sr->ibl_job_hdr, sr->skybox_hdr_path) != 0);
+    if (res) sr->ibl_job->result = NULL;
+    /* A sky bake has no HDR path to compare against; its key is what it was
+     * baked for, and it goes stale when a real skybox has since loaded. */
+    bool stale = sr->ibl_job_is_sky
+        ? sr->skybox_active
+        : (strcmp(sr->ibl_job_hdr, sr->skybox_hdr_path) != 0);
+    sr->ibl_job_is_sky = false;
+    JCE_FREE(sr->ibl_job->pixels);
+    if (sr->ibl_job->result) jce_ibl_cpu_free(sr->ibl_job->result);
     JCE_FREE(sr->ibl_job);
     sr->ibl_job = NULL;
 
+    if (stale) {
+        if (res) jce_ibl_cpu_free(res);
+        if (sr->skybox && sr->skybox_hdr_path[0])
+            sr_ibl_start_async(sr, sr->skybox_hdr_path);
+        return;
+    }
     if (!res) return;
-    if (stale) { jce_ibl_cpu_free(res); return; }
 
     if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
     sr->ibl_data = jce_ibl_upload_cpu(res);   /* MAIN-thread GPU upload */
     if (sr->ibl_data)
-        LOG_INFO(LOG_TAG, "IBL ready (async): %s", sr->skybox_hdr_path);
+        LOG_INFO(LOG_TAG, "IBL ready (async, %.1f ms): %s",
+                 (double)bake_ms,
+                 sr_ibl_job_is_sky_done_tmp ? sr->sky_ibl_key : sr->skybox_hdr_path);
 }
 
-/* Start an async IBL bake from the skybox's decoded equirect pixels. The pixels
- * are copied so the worker is independent of the skybox lifetime. Falls back to
- * a synchronous bake if the worker thread cannot be created. */
+/* Start an async IBL bake from copied skybox pixels. A rapid skybox switch
+ * cancels the obsolete task and lets sr_ibl_poll start the newest one. */
 static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path)
 {
     uint32_t eqw = 0, eqh = 0;
@@ -3018,16 +4192,9 @@ static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path)
     if (!eqpx || eqw == 0 || eqh == 0)
         return;
 
-    /* Keep to one in-flight job: if a previous bake is still running (rapid
-     * skybox swap), wait it out and discard its result. */
-    if (sr->ibl_thread) {
-        jce_thread_join(sr->ibl_thread);
-        sr->ibl_thread = NULL;
-    }
-    if (sr->ibl_job) {
-        if (sr->ibl_job->result) jce_ibl_cpu_free(sr->ibl_job->result);
-        JCE_FREE(sr->ibl_job);
-        sr->ibl_job = NULL;
+    if (sr->ibl_task) {
+        (void)jce_async_task_cancel(sr->ibl_task);
+        return;
     }
 
     size_t bytes = (size_t)eqw * (size_t)eqh * 4u * sizeof(float);
@@ -3036,7 +4203,7 @@ static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path)
     if (!job || !copy) {
         JCE_FREE(job);
         JCE_FREE(copy);
-        sr->ibl_data = jce_ibl_generate_from_pixels(eqpx, eqw, eqh, 32, 128);
+        LOG_WARN(LOG_TAG, "IBL bake allocation failed: %s", hdr_path);
         return;
     }
     memcpy(copy, eqpx, bytes);
@@ -3045,11 +4212,178 @@ static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path)
 
     snprintf(sr->ibl_job_hdr, sizeof(sr->ibl_job_hdr), "%s", hdr_path);
     sr->ibl_job = job;
-    sr->ibl_thread = jce_thread_create(sr_ibl_worker, job, "ibl_bake");
-    if (!sr->ibl_thread) {
-        /* No thread: run on this (main) thread, then finalize immediately. */
-        sr_ibl_worker(job);
-        sr_ibl_poll(sr);
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = sr_ibl_worker;
+    desc.user_data  = job;
+    desc.debug_name = "scene.ibl.bake";
+    desc.priority   = JCE_ASYNC_PRIORITY_LOW;
+    sr->ibl_task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!sr->ibl_task) {
+        JCE_FREE(job->pixels);
+        JCE_FREE(job);
+        sr->ibl_job = NULL;
+        LOG_WARN(LOG_TAG, "IBL bake queue is full: %s", hdr_path);
+    }
+}
+
+/* Bake the analytic sky into the same IBL the HDR path uses.
+ *
+ * WHY THIS EXISTS: sr_scan_skybox builds sr->ibl_data only when a Skybox
+ * component's hdr_path changes. A scene whose sky is the analytic model --
+ * PREETHAM or PHYSICAL, which is every scene with a time-of-day cycle -- never
+ * takes that branch, so u_iblParams.x stayed 0 and the PBR shader fell through
+ * to flat ambient with NO specular environment term whatever. Water reflected
+ * nothing, metal reflected nothing, and wet ground reflected nothing -- which
+ * mattered rather more once the wet-surface response started making it smooth.
+ *
+ * MAGNITUDE: jce_sky_radiance returns Preetham radiance in physical-ish units;
+ * the up-axis irradiance of a default sky measures about (6.1, 8.9, 15.2),
+ * while a scene authors an ambient of about (0.10, 0.10, 0.12) on this
+ * engine's own 0..10 scale. The flat-ambient path already met this and settled
+ * it: the sky decides the ambient's HUE, the author decides its MAGNITUDE.
+ * The same rule applies here and for the same reason -- the alternative is
+ * comparing two quantities in different units, which is how that path once
+ * ended up with a fixed blue ambient sixty times too bright that deleting
+ * every light in the scene could not dim.
+ *
+ * So the equirect is scaled so its up-axis diffuse irradiance matches the
+ * ambient the flat path would have produced. The IBL branch REPLACES flat
+ * ambient in the shader rather than adding to it, so anchoring it there means
+ * the diffuse level is preserved by construction and the specular is what is
+ * new. It also stops being flat: irradiance now varies with the normal.
+ *
+ * The sun is taken exactly as the SH9 ambient path takes it, so the two
+ * sky-derived terms cannot describe two different skies. (Both should
+ * eventually read sr->env->sun_direction_ws, which is the actual authority and
+ * is better when there is no ToD cycle; changing one without the other is what
+ * would introduce the divergence.) */
+void sr_refresh_sky_ibl(JceSceneRenderer *sr,
+                        const JceSceneRenderingSettings *rs)
+{
+    if (!sr || !rs) return;
+    if (sr->skybox_active) return;
+    if (rs->sky_mode != JCE_SCENE_SKY_PREETHAM &&
+        rs->sky_mode != JCE_SCENE_SKY_PHYSICAL) return;
+    if (sr->ibl_job) return;            /* one bake in flight is enough */
+
+    const jce_vec3 sun = sr->tod_active ? sr->tod_state.sun_direction
+                                        : jce_v3(0.0f, 0.9f, 0.4359f);
+    const float turb = sr->sky_turbidity;
+    const float amb_lum = 0.2126f * rs->ambient_color[0]
+                        + 0.7152f * rs->ambient_color[1]
+                        + 0.0722f * rs->ambient_color[2];
+    const float amb = amb_lum * (rs->ambient_intensity > 0.0f
+                                 ? rs->ambient_intensity : 1.0f);
+
+    /* Two degrees, not the half degree the SH9 projection uses. That
+     * projection is nine multiply-adds; this is a cubemap convolution on a
+     * worker, and at a four-hours-per-second cycle the sun crosses half a
+     * degree every eight milliseconds. A specular horizon is also a much
+     * lower-frequency thing than the sun it came from. */
+    char key[96];
+    snprintf(key, sizeof key, "sky:%.3f,%.3f,%.3f/%.2f/%.4f",
+             (double)sun.x, (double)sun.y, (double)sun.z,
+             (double)turb, (double)amb);
+    if (strcmp(key, sr->sky_ibl_key) == 0) return;
+    {
+        /* Deadband on the direction itself; the key alone would rebake on
+         * every float wobble of the last printed digit. */
+        float kx = 0.0f, ky = 0.0f, kz = 0.0f, kt = 0.0f, ka = 0.0f;
+        if (sr->sky_ibl_key[0] &&
+            sscanf(sr->sky_ibl_key, "sky:%f,%f,%f/%f/%f",
+                   &kx, &ky, &kz, &kt, &ka) == 5) {
+            const float dot = sun.x * kx + sun.y * ky + sun.z * kz;
+            if (dot > 0.99939f && kt == turb && ka == amb) return;
+        }
+    }
+
+    const uint32_t W = 128u, H = 64u;
+    float *px = (float *)JCE_MALLOC((size_t)W * H * 4u * sizeof(float));
+    if (!px) return;
+
+    JceSkyConfig scfg = jce_sky_config_default();
+    scfg.turbidity = turb;
+    const float sd[3] = { sun.x, sun.y, sun.z };
+    JceSkyState sst = jce_sky_evaluate(&scfg, sd);
+
+    for (uint32_t y = 0; y < H; ++y) {
+        /* Texel CENTRES: sampling the poles exactly puts every texel of the
+         * top row on the same degenerate direction. */
+        const float theta = ((float)y + 0.5f) / (float)H * 3.14159265f;
+        const float st_ = sinf(theta), ct = cosf(theta);
+        for (uint32_t x = 0; x < W; ++x) {
+            const float phi = ((float)x + 0.5f) / (float)W * 6.28318531f;
+            const float dir[3] = { st_ * cosf(phi), ct, st_ * sinf(phi) };
+            float rgb[3];
+            jce_sky_radiance(&sst, dir, rgb);
+            float *o = px + ((size_t)y * W + x) * 4u;
+            o[0] = rgb[0]; o[1] = rgb[1]; o[2] = rgb[2]; o[3] = 1.0f;
+        }
+    }
+
+    /* Anchor to the authored ambient, as derived above. sky_sh9 is the same
+     * projection the flat path uses, so the two agree by construction rather
+     * than by two people choosing the same constant. */
+    {
+        float sh9[9][3];
+        jce_sky_project_sh9(&sst, sh9);
+        const float up[3] = { 0.0f, 1.0f, 0.0f };
+        float irr[3];
+        jce_sky_irradiance_sh9(sh9, up, irr);
+        const float lum = 0.2126f * irr[0] + 0.7152f * irr[1] + 0.0722f * irr[2];
+        /* The 1/pi is NOT a fudge, and it was measured before it was derived:
+         * without it the ambient came out 18.8 grey levels too bright.
+         *
+         * jce_sky_irradiance_sh9 does not return irradiance. Its projection
+         * folds in the Ramamoorthi cosine-lobe constants AND then divides by
+         * pi, "so the result is the radiance a white Lambertian surface emits
+         * rather than raw irradiance" (jce_sky.c) -- so it returns E/pi.
+         * ibl_compute_irradiance stores raw E: it accumulates
+         * pi * sum(L cos sin) / sum(cos sin). Anchoring one to the other
+         * therefore needs the pi put back.
+         *
+         * The function's only other caller normalises its output to unit
+         * luminance and rescales by the authored ambient, so it never touches
+         * the absolute value and could not have noticed. This is the first
+         * caller for which the convention matters. */
+        const float scale = (lum > 1e-4f && amb > 0.0f)
+            ? (amb / (lum * 3.14159265f)) : 1.0f;
+        for (size_t i = 0, n = (size_t)W * H * 4u; i < n; i += 4u) {
+            px[i + 0] *= scale; px[i + 1] *= scale; px[i + 2] *= scale;
+        }
+    }
+
+    struct SrIblJob *job = (struct SrIblJob *)JCE_CALLOC(1, sizeof(*job));
+    if (!job) { JCE_FREE(px); return; }
+    job->pixels = px;
+    /* Smaller than the HDR path's 32/128, and deliberately so: the source
+     * here is a 128x64 analytic sky with no detail finer than its own
+     * gradient, so a 128-face prefilter spends four times the work
+     * interpolating information that is not in the input. An HDR photograph
+     * has real detail worth that; the Preetham dome does not. */
+    job->w = W; job->h = H; job->irr = 16; job->pf = 32;
+
+    snprintf(sr->sky_ibl_key, sizeof sr->sky_ibl_key, "%s", key);
+    snprintf(sr->ibl_job_hdr, sizeof sr->ibl_job_hdr, "%s", key);
+    sr->ibl_job_is_sky = true;
+    sr->sky_ibl_t0     = jce_time_perf_counter();
+    sr->ibl_job = job;
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = sr_ibl_worker;
+    desc.user_data  = job;
+    desc.debug_name = "scene.ibl.sky";
+    desc.priority   = JCE_ASYNC_PRIORITY_LOW;
+    sr->ibl_task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!sr->ibl_task) {
+        JCE_FREE(job->pixels);
+        JCE_FREE(job);
+        sr->ibl_job = NULL;
+        sr->ibl_job_is_sky = false;
+        sr->sky_ibl_key[0] = '\0';
     }
 }
 
@@ -3169,6 +4503,41 @@ void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *list)
 /* Advance the internal day clock and push the evaluated lighting snapshot
  * into the renderer's ToD override (consumed by the sky + lighting passes
  * already wired to sr->tod_state). */
+/* JCE_DBG_ENV_LOG=<path> also opens <path>.wind, where every subsystem that
+ * consumes a wind reports the value it ACTUALLY used.
+ *
+ * This stands in for the golden-image baseline the capability matrix asks for
+ * before U4, because that baseline was built and measured and found blind.
+ * Zeroing the authored wind in this scene moves at most 0.08% of pixels in the
+ * most sensitive view available (canopy), against a capture-to-capture noise
+ * floor of 0.0008 mean levels -- and the ocean's fftWindSpeed is inert
+ * entirely, because water_mode defaults to GERSTNER and the FFT branch never
+ * runs. A pixel diff cannot certify a change whose whole visible effect sits
+ * at the noise floor. The number each consumer used can, exactly.
+ *
+ * One line per consumer per frame, env-gated, no cost when unset. */
+static void sr_dbg_wind(const char *who, float dx, float dy, float dz, float speed)
+{
+    static SDL_IOStream *s_log;
+    static int           s_tried;
+    if (!s_tried) {
+        const char *e = getenv("JCE_DBG_ENV_LOG");
+        s_tried = 1;
+        if (e && e[0] && e[0] != '0') {
+            char path[512];
+            snprintf(path, sizeof path, "%s.wind", e);
+            s_log = SDL_IOFromFile(path, "wb");
+        }
+    }
+    if (!s_log) return;
+    char line[192];
+    int n = snprintf(line, sizeof line,
+                     "WIND %-8s dir=(%.3f,%.3f,%.3f) speed=%.3f\n",
+                     who, (double)dx, (double)dy, (double)dz, (double)speed);
+    if (n > 0) SDL_WriteIO(s_log, line, (size_t)n);
+    SDL_FlushIO(s_log);
+}
+
 void sr_drive_time_of_day(JceSceneRenderer *sr,
                                  const JceSceneRenderingSettings *rs,
                                  float dt_sec)
@@ -3224,11 +4593,112 @@ void sr_drive_time_of_day(JceSceneRenderer *sr,
 /* Lazily create the screen-space weather overlay, sync its state from the
  * authored settings, advance its animation clock and render it on top of the
  * scene color view. */
+/* Advance THE environment state: once per frame, from one place, before any
+ * consumer reads it.
+ *
+ * Lifted out of sr_drive_weather, which draws the precipitation overlay and
+ * runs late in the frame. That was fine while the state's only reader was the
+ * overlay itself. It stopped being fine the moment the grass and the ocean
+ * started reading the wind (U4): they submit earlier, so they were consuming
+ * LAST frame's value, and on frame zero that value is the struct default --
+ * the wind probe caught exactly that, one frame of speed 0.000 before the
+ * steady state appeared.
+ *
+ * A one-frame lag on wind is nearly invisible, which is what makes it worth
+ * removing now rather than after it has been inherited by a reader where it
+ * is not. This renderer already carries a comment about a one-frame exposure
+ * lag being "exactly the kind that has bitten this renderer before".
+ *
+ * Both early-outs of the drawing path stay where they were: no PAK means no
+ * overlay shader and clear weather means nothing to composite, and neither is
+ * a reason to stop time. */
+void sr_advance_environment_state(JceSceneRenderer *sr,
+                                  const JceSceneRenderingSettings *rs,
+                                  float dt_sec)
+{
+    if (!sr || !rs) return;
+
+    sr->env->weather_type       = (uint32_t)rs->weather_type;
+    sr->env->precipitation_rate = rs->weather_intensity;
+    sr->env->cloud_coverage     = sr->cloud_coverage;
+    sr->env->cloud_density      = sr->cloud_density;
+    /* Wind BEFORE advance: the overlay below reads it this frame, and a
+     * writer that ran after would deliver last frame's value.  Without this
+     * call nothing writes wind at all -- the state keeps its default of zero
+     * and precipitation falls perfectly vertically, which is exactly what
+     * happened when the overlay was first moved onto the environment. */
+    jce_environment_apply_weather_wind(sr->env);
+    /* Same frame, same place, same reason: humidity has no other writer, and
+     * the fog extinction derived from it is read this frame. */
+    jce_environment_apply_weather_humidity(sr->env);
+    /* The source U4 must migrate the two consumers onto. Logged beside them so
+     * the before/after is one file, not two runs and a memory. */
+    sr_dbg_wind("ENV", sr->env->wind_direction_ws.x, sr->env->wind_direction_ws.y,
+                sr->env->wind_direction_ws.z,
+                jce_environment_wind_speed_now(sr->env));
+    /* THE writer for wind direction (capability C13/F27).
+     *
+     * The field existed, every consumer read it, and no line of code in the
+     * repository assigned it -- so the answer every consumer got was
+     * jce_environment_default's (1, 0, 0), for the life of every process. The
+     * plan calls this shape out by name: a carrier that lands before a writer
+     * looks like it works, because a default is a plausible value.
+     *
+     * Written BEFORE jce_environment_advance so the weather models blow along
+     * the authored direction on the very first frame rather than one frame
+     * behind it. Left alone when the scene does not author one: replacing an
+     * absent value with a default is the silent fallback this project forbids,
+     * and here it would also be pointless -- the default is what is already
+     * there. */
+    /* Temperature: written every frame, because unlike the wind direction
+     * there is no value that means "not authored" -- 0 C is a temperature. The
+     * settings default is the environment's own 15 C, so writing it
+     * unconditionally is a no-op for every scene that does not care. */
+    sr->env->temperature_c = rs->temperature_c;
+
+    if (rs->wind_direction_x != 0.0f || rs->wind_direction_z != 0.0f) {
+        const float wx = rs->wind_direction_x, wz = rs->wind_direction_z;
+        const float len = sqrtf(wx * wx + wz * wz);
+        if (len > 1e-6f)
+            sr->env->wind_direction_ws = jce_v3(wx / len, 0.0f, wz / len);
+    }
+
+    jce_environment_advance(sr->env, dt_sec);
+
+    /* Carry the cloud field downwind (capability B23).
+     *
+     * The march sampled `wp = dir * t` with no time term at all, so the cloud
+     * layer was nailed to the world: the sky had weather in it and none of it
+     * was going anywhere. This is the one place the wind is advanced, so it is
+     * the one place the offset advances with it.
+     *
+     * Cloud-base wind is not the wind on the ground. What the environment
+     * carries is a surface value, slowed by friction with the terrain; above
+     * the boundary layer the free-atmosphere wind runs roughly two to four
+     * times it. 3.0 puts this scene's 3 m/s rain wind at about 9 m/s at the
+     * cloud base, which crosses its 400 m of island in around 45 seconds --
+     * moving, without reading as time-lapse.
+     *
+     * Every consumer wraps this into its own period, because they do not share
+     * one: the CPU field tiles at period_x (4096 m by default) and the sky
+     * atlas is addressed as fract(km * 0.05), a 20 km period. Wrapping here
+     * would put a seam in whichever one did not divide it. */
+    {
+        const float speed = jce_environment_wind_speed_now(sr->env)
+                          * JCE_CLOUD_WIND_FACTOR;
+        sr->cloud_wind_offset[0] += (double)(sr->env->wind_direction_ws.x * speed * dt_sec);
+        sr->cloud_wind_offset[1] += (double)(sr->env->wind_direction_ws.z * speed * dt_sec);
+    }
+}
+
 void sr_drive_weather(JceSceneRenderer *sr,
                              const JceSceneRenderingSettings *rs,
                              uint16_t view_id, float dt_sec)
 {
-    if (!sr || !rs || !sr->pak) return;
+    if (!sr || !rs) return;
+
+
+    if (!sr->pak) return;               /* no overlay shader; state still ran */
 
     JceWeatherType type = (JceWeatherType)rs->weather_type;
     if (type == JCE_WEATHER_CLEAR || rs->weather_intensity <= 0.0f) {
@@ -3246,7 +4716,22 @@ void sr_drive_weather(JceSceneRenderer *sr,
         if (!sr->weather) return;   /* shader missing — fail soft */
     }
 
+    /* Derive the overlay from the environment rather than synthesising it.
+     *
+     * jce_weather_default() hard-codes wind_dir = (1,0,0) and ties
+     * wind_strength to precipitation intensity, so the rain always blew due
+     * east and harder rain always meant more wind -- while the ocean spectrum
+     * (JceWaterComponent::fft_wind_dir/speed) and the grass
+     * (JceGrassField::wind_dir/wind_speed) each carried their own, separately
+     * authored wind.  Three winds in one world, none of which had to agree.
+     *
+     * Wetness likewise: the synthesised value was intensity * 0.7, applied
+     * instantly, so the ground was fully wet on the first frame of rain and
+     * bone dry on the first frame after it. The environment INTEGRATES it. */
     JceWeatherState st = jce_weather_default(type, rs->weather_intensity);
+    st.wind_dir      = sr->env->wind_direction_ws;
+    st.wind_strength = jce_environment_wind_speed_now(sr->env);
+    st.wetness       = sr->env->global_wetness;
     jce_weather_set_state(sr->weather, &st);
     jce_weather_update(sr->weather, dt_sec);
     jce_weather_render(sr->weather, view_id);
@@ -3425,6 +4910,18 @@ static int sr_fcluster_ensure_cache(JceSceneRenderer *sr, JceScene *scene,
                                     JceEntity e,
                                     const JceFoliageClusterComponent *fc);
 
+/* Hashed-alpha strength for the foliage shadow pass.
+ *
+ * Gated on a temporal resolve, from the same authority the cascade dither uses
+ * (jce_shadow_blend.h explains why it must be that one and not the tier).  A
+ * stochastic alpha test with nothing to average it is a STIPPLED shadow -- and
+ * stippling reads as a broken filter, which is worse than the popping it
+ * replaces.  Zero keeps the fixed 0.8 cutoff, byte-identical to before. */
+static float sr_foliage_hashed_alpha_scale(void)
+{
+    return jce_render_pipeline_is_feature_enabled("taa") ? 1.0f : 0.0f;
+}
+
 bool sr_try_submit_foliage_shadow(JceSceneRenderer *sr, JceScene *scene,
                                   JceEntity e, uint16_t view_id,
                                   uint16_t shadow_inst_idx, uint16_t shadow_idx)
@@ -3469,9 +4966,23 @@ bool sr_try_submit_foliage_shadow(JceSceneRenderer *sr, JceScene *scene,
                 bgfx_set_index_buffer(ibh, 0, 6);
                 bgfx_set_instance_data_buffer(&idb, 0, n);
                 /* No face cull: wind sway can flip a billboard edge-on. */
+                if (!BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha))
+                    sr->u_foliage_hashed_alpha = bgfx_create_uniform(
+                        "u_foliage_hashed_alpha", BGFX_UNIFORM_TYPE_VEC4, 1);
+                {
+                    const float ha[4] = { sr_foliage_hashed_alpha_scale(),
+                                          0.0f, 0.0f, 0.0f };
+                    bgfx_set_uniform(sr->u_foliage_hashed_alpha, ha, 1);
+                }
                 bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
                               | BGFX_STATE_MSAA, 0);
-                bgfx_submit(view_id, sr->prog_fcluster_shadow, 0,
+                /* Masked bucket: alpha-tested casters sort after opaque
+                 * ones, so by the time they rasterise the depth buffer already
+                 * rejects the ones hidden behind solid geometry -- before the
+                 * alpha fetch and the discard ever run.  Inert unless the view
+                 * is in a depth-sorted mode (see jce_shadow_bucket.h). */
+                bgfx_submit(view_id, sr->prog_fcluster_shadow,
+                            jce_shadow_bucket_key(JCE_SHADOW_BUCKET_MASKED),
                             BGFX_DISCARD_ALL);
                 return true;
             }
@@ -3638,6 +5149,7 @@ static int sr_fcluster_find_slot(JceSceneRenderer *sr, JceEntity e)
 void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr)
 {
     if (!sr) return;
+    sr_fullscreen_effect_reset_all(sr);
     int dropped = 0;
     for (int i = 0; i < (int)(sizeof sr->foliage_cache /
                               sizeof sr->foliage_cache[0]); ++i)
@@ -3827,5 +5339,26 @@ void sr_draw_foliage_cluster(JceSceneRenderer *sr, JceScene *scene,
      * cull (billboards + wind sway can flip an edge). */
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_Z
                   | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA, 0);
+    /* Same omission as the grass batch: this submit owns its uniform set and
+     * never sees u_normalScale, so fs_foliage.sc could not know the view mode
+     * and every debug view rendered ordinary lit foliage.  Uniform values are
+     * sticky across draws in bgfx -- BGFX_DISCARD_ALL discards buffers, state
+     * and textures, not uniform values -- so one bind before the submit is
+     * enough, and u_csmSplits still carries over from the frame shadow bind. */
+    jce_pbr_material_bind_view_mode();
+    /* fs_foliage.sc reads s_cloudShadow at stage 3, and THIS path never bound
+     * it: the other four consumers were wired by following
+     * sr_bind_frame_shadow_state, which this function does not call.
+     *
+     * The failure would not have looked like a missing bind. BGFX_DISCARD_ALL
+     * clears textures but NOT uniform values, so u_cloudShadow kept whatever
+     * the last terrain or grass submit left in it -- a non-zero extent and a
+     * strength of 1 -- and cloud_shadow_at's early-out therefore did not fire.
+     * The shader would have sampled an unbound stage and multiplied the canopy
+     * by whatever that reads, which is backend-defined. A shader that reads a
+     * sampler nobody bound is the hazard fs_terrain.sc's stage-3 comment was
+     * written about; this is the same one, from the other end. */
+    sr_bind_cloud_shadow(sr);
+
     bgfx_submit(view_id, sr->prog_fcluster, 0, BGFX_DISCARD_ALL);
 }

@@ -147,6 +147,27 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
                           "(light-falloff banding may remain)");
     }
 
+    /* NO MSAA, deliberately, and the MSAA SETTINGS DO NOT REACH HERE.
+     *
+     * Neither texture carries BGFX_TEXTURE_RT_MSAA_Xn, so this target is
+     * single-sampled whatever Project Settings > Graphics > MSAA or an
+     * .rp.json msaa_samples says. Both of those configure the BACKBUFFER; the
+     * editor viewport and Game View render into THIS target instead, so for
+     * everything inside them the sample count is 1 and changing the setting is
+     * measurably inert -- 2x, 4x and 8x were all measured and returned an
+     * identical flicker residual of 5.936, which reads as "MSAA does not help"
+     * when the truth is that no MSAA was ever enabled.
+     *
+     * It is not an oversight to fix in passing. The colour and DEPTH textures
+     * here are sampled as ordinary textures by SSAO, the volumetric fog march
+     * and underwater absorption; a multisampled depth target cannot be read
+     * that way without an explicit resolve, so enabling MSAA means adding one
+     * and reworking every pass that reads depth. This pipeline's antialiasing
+     * is TAA, which is why TAA is on by default at HIGH.
+     *
+     * If thin geometry shimmers under fast camera motion, that is TAA
+     * rejecting history, and the answers are on the TAA/LOD side (motion
+     * vectors, history clamping, impostors) -- not the MSAA slider. */
     bgfx_texture_handle_t textures[2];
     textures[0] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
@@ -154,10 +175,17 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL, 0);
 
+    /* CLAMP, not the bgfx default REPEAT.  The comment above already says this
+     * depth texture is sampled as an ordinary texture by SSAO, the volumetric
+     * fog march and underwater absorption -- and fs_ssao.sc's kernel
+     * deliberately taps outside [0,1] near the frame border with no bounds
+     * test (unlike fs_ssr.sc and the contact-shadow march, which both break
+     * out of range).  Under REPEAT those taps wrap to the OPPOSITE edge's
+     * depth and paint an AO rim around all four edges, on every backend. */
     textures[1] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
         BGFX_TEXTURE_FORMAT_D24S8,
-        BGFX_TEXTURE_RT,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL, 0);
 
     if (!BGFX_HANDLE_IS_VALID(textures[0])
@@ -267,6 +295,28 @@ bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
     bgfx_set_view_frame_buffer(bridge->view_id, bridge->target_fbo);
     bgfx_set_view_mode(bridge->view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(bridge->view_id);
+    return true;
+}
+
+bool jce_offscreen_target_prepare_overlay_view(
+    JceOffscreenTarget *bridge, uint16_t view_id,
+    const float *view16, const float *proj16, const char *view_name)
+{
+    if (!bridge || !view16 || !proj16 ||
+        !BGFX_HANDLE_IS_VALID(bridge->target_fbo) ||
+        bridge->target_w == 0 || bridge->target_h == 0)
+        return false;
+
+    bgfx_set_view_name(view_id,
+        view_name && view_name[0] ? view_name : "OffscreenOverlay",
+        INT32_MAX);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)bridge->target_w,
+                       (uint16_t)bridge->target_h);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx_set_view_transform(view_id, view16, proj16);
+    bgfx_set_view_frame_buffer(view_id, bridge->target_fbo);
+    bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
+    bgfx_touch(view_id);
     return true;
 }
 

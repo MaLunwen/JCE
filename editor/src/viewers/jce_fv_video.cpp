@@ -774,9 +774,23 @@ void fv_render_video(FvTab *tab)
                 bool is_h264  = (strcmp(vc, "avc1") == 0 || strcmp(vc, "avc3") == 0);
                 bool is_h265  = (strcmp(vc, "hvc1") == 0 || strcmp(vc, "hev1") == 0);
                 if (is_h264 || is_h265) {
+                    /* metadata_only means the container parsed but no decoder
+                     * opened. That has two very different causes, and this
+                     * used to report only one of them: it blamed the patent
+                     * gate unconditionally, so a per-file decode failure in a
+                     * build that HAS fdk-aac/OpenH264/libhevc linked in still
+                     * read "patent-encumbered and disabled in this build".
+                     * That message is what makes a working release build look
+                     * like it lost its codecs. Only say that when it is true. */
+#if defined(JCE_ENABLE_PATENTED_CODECS) && JCE_ENABLE_PATENTED_CODECS
+                    snprintf(patent_msg, sizeof(patent_msg),
+                        jce_editor_i18n("viewer.video.decoderInitFailed"),
+                        is_h264 ? "H.264 / AVC" : "H.265 / HEVC");
+#else
                     snprintf(patent_msg, sizeof(patent_msg),
                         jce_editor_i18n("viewer.video.patentDisabled"),
                         is_h264 ? "H.264 / AVC" : "H.265 / HEVC");
+#endif
                     msg = patent_msg;
                 } else {
                     msg = jce_editor_i18n("viewer.video.noDecoder");

@@ -15,6 +15,10 @@ extern "C" {
 #endif
 
 #include <jce/renderer/jce_ies_profile.h>
+#include <jce/renderer/jce_fullscreen_effect.h>
+#include <jce/renderer/jce_render_readback.h>
+#include <jce/renderer/jce_material_registry.h>
+#include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_quality_preset.h>
 #include <jce/renderer/jce_render_graph.h>
 #include <jce/renderer/jce_render_pipeline.h>

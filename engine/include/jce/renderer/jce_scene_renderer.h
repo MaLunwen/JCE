@@ -14,6 +14,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_csm.h>
+#include <jce/renderer/jce_fullscreen_effect.h>
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
@@ -38,6 +39,18 @@ typedef struct JceScene          JceScene;
 typedef struct JcePakArchive     JcePakArchive;
 typedef struct JceSceneRenderer  JceSceneRenderer;
 typedef struct JceLodGroup       JceLodGroup;
+
+#define JCE_SCENE_FULLSCREEN_EFFECT_MAX_PASSES 8u
+
+typedef struct JceSceneFullscreenEffectStageStatus {
+    uint32_t struct_size;
+    uint32_t active_count;
+    uint32_t applied_count;
+    uint32_t dropped_count;
+    uint64_t failed_entity;
+    bool required_failure;
+    JceFullscreenEffectStatus pass;
+} JceSceneFullscreenEffectStageStatus;
 
 /* Mirror of middleware's JCE_LOD_MAX_LEVELS — kept local so the
  * renderer's public header doesn't have to pull middleware/scene/.
@@ -81,6 +94,31 @@ typedef enum {
     JCE_SCENE_VIEW_ROUGHNESS,            /* 5: roughness grayscale */
     JCE_SCENE_VIEW_METALLIC,             /* 6: metallic grayscale */
     JCE_SCENE_VIEW_AO,                   /* 7: ambient-occlusion grayscale */
+    /* Shadow/depth debug views.  APPENDED, never inserted: the editor stores
+     * the selected mode in its config, so renumbering the existing values
+     * would silently reinterpret a saved setting as a different view.
+     *
+     * These three exist because "the picture changes with distance" is not
+     * answerable from a shaded frame.  Together they separate the three
+     * candidate causes: SCENE_DEPTH says how far a surface actually is,
+     * SHADOW_CASCADES says which cascade shadowed it (and grey says none did,
+     * i.e. it is past the shadow range), and SHADOW_MASK says how much it was
+     * shadowed.  A band that lines up with a cascade colour change is a
+     * cascade boundary; one that lines up with grey is the shadow-range fade;
+     * one that lines up with neither is not a shadow problem at all. */
+    JCE_SCENE_VIEW_SCENE_DEPTH,          /* 8: view depth, ramped + banded  */
+    JCE_SCENE_VIEW_SHADOW_CASCADES,      /* 9: cascade index as R/G/B/Y     */
+    JCE_SCENE_VIEW_SHADOW_MASK,          /* 10: shadow factor, 0=occluded   */
+
+    /* Sentinel, always last.  The renderer clamps out-of-range modes to
+     * SHADED, and that bound used to name JCE_SCENE_VIEW_AO directly -- so
+     * adding the three views above left them accepted by the editor, plumbed
+     * through the config, and then silently turned back into SHADED one line
+     * before the uniform was written.  Nothing failed; the views simply
+     * rendered a normal frame, which is the hardest kind of wrong to notice.
+     * Bounding against the sentinel means the next view added here is in
+     * range by construction. */
+    JCE_SCENE_VIEW_COUNT
 } JceSceneViewModeKind;
 
 /* Callback invoked between sky pass and entity pass. Editor uses this
@@ -144,9 +182,24 @@ typedef struct {
     JceSceneOnAfterSkyFn on_after_sky;
     void                *on_after_sky_ud;
 
+    /* This frame's scene depth texture (matching this view+proj), or
+     * UINT16_MAX for none.
+     *
+     * Set it whenever you have one, INDEPENDENTLY of any feature that
+     * consumes it.  Several passes need scene depth -- volumetric fog and
+     * underwater absorption today, more later -- and they are unrelated
+     * features that users switch on and off separately.
+     *
+     * It was called fog_depth_tex_handle, and the editor set it only when
+     * fog was enabled, which read as correct because the name says it
+     * belongs to fog.  The consequence was that turning fog off also
+     * silently disabled underwater absorption: an unrelated switch, no
+     * error, and nothing in either feature's code to suggest the other
+     * was involved. */
+    uint16_t                 scene_depth_tex_handle;  /* UINT16_MAX = none */
+
     /* Volumetric fog (analytic + raymarched).  When fog_enabled is true
-     * AND fog_depth_tex_handle is a valid bgfx texture id (the depth tex
-     * matching this frame's view+proj), the renderer will allocate /
+     * AND scene_depth_tex_handle is valid, the renderer will allocate /
      * resize a JceVolumetricFog instance, push fog params, and execute
      * the fog raymarch into a private RT.  The result texture handle is
      * exposed via jce_scene_renderer_get_fog_result_texture() so callers
@@ -155,7 +208,6 @@ typedef struct {
      * that is a separate phase (composite shader pending). */
     bool                     fog_enabled;
     JceVolumetricFogParams   fog;
-    uint16_t                 fog_depth_tex_handle;  /* UINT16_MAX = none */
     int                      fog_rt_width;          /* 0 = skip fog */
     int                      fog_rt_height;         /* 0 = skip fog */
 
@@ -212,6 +264,33 @@ typedef struct {
      * it live without touching this field; either source turning it on
      * engages the GPU path. */
     bool                     gpu_driven;
+
+    /* Will this caller call jce_scene_renderer_composite_fog() this frame?
+     *
+     * It has to say, because the renderer cannot know. The volumetric march
+     * runs inside jce_scene_renderer_render, but the COMPOSITE is a separate
+     * public entry point the application invokes -- so whether the marched fog
+     * ever reaches the screen is decided outside this call, after it returns.
+     *
+     * It matters because the analytic aerial fog in fog_apply.sh and the
+     * volumetric march apply the SAME authored extinction to the SAME pixel.
+     * Composed, the surface's transmittance is exp(-sigma*d) * exp(-sigma*d)
+     * = exp(-2*sigma*d): every scene with fog on was twice as foggy as it
+     * asked to be, and the two halves disagree about how -- one is an
+     * analytic closed form, the other a 32-step march with a phase function.
+     *
+     * When this is true and the volumetric pass actually runs, the analytic
+     * path is suppressed for that frame: one extinction, applied by the
+     * solver that models it better. When it is false -- an embedder that
+     * marches fog and never composites it, or one that does not use the
+     * volumetric pass at all -- the analytic path stays, because otherwise
+     * they would get no fog at all.
+     *
+     * DEFAULT false preserves existing behaviour exactly, including the
+     * doubling: a caller that does composite must opt in by saying so. That
+     * is the safe direction for a field appended to a public struct, where
+     * every existing caller zero-initialises and cannot be asked. */
+    bool                     composites_volumetric_fog;
 } JceSceneRenderConfig;
 
 /* Returns true if a skybox component is currently active in the scene
@@ -285,6 +364,36 @@ JCE_API void jce_scene_renderer_destroy(JceSceneRenderer *sr);
  * hands recycled ids back with bumped generation bits and strands every
  * cached slot.  Content rebuilds lazily on the next draw. */
 JCE_API void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr);
+
+/* Return true when the scene contains at least one full-screen effect that is
+ * enabled at the entity, component-registry, and component-value layers.
+ * This query is CPU-only and never allocates renderer resources. */
+JCE_API bool jce_scene_renderer_has_fullscreen_effect(JceScene *scene);
+
+/* Apply one insertion stage in deterministic (insertion, order, entity) order.
+ * Up to JCE_SCENE_FULLSCREEN_EFFECT_MAX_PASSES consecutive bgfx views starting
+ * at view_id_base may be consumed.  No active effect returns scene_color and
+ * performs no allocation.  Optional failures preserve the previous color;
+ * required failures are reported by get_fullscreen_effect_status(). */
+JCE_API JceTextureHandle jce_scene_renderer_apply_fullscreen_effects(
+    JceSceneRenderer *sr, JceScene *scene, const JceCamera *camera,
+    JceTextureHandle scene_color, JceTextureHandle scene_depth,
+    uint32_t width, uint32_t height, uint16_t view_id_base,
+    int viewport_id, uint32_t insertion, float dt_sec);
+
+JCE_API void jce_scene_renderer_get_fullscreen_effect_status(
+    const JceSceneRenderer *sr, int viewport_id,
+    JceSceneFullscreenEffectStageStatus *out_status);
+
+/* Optional host directory containing a `shaders/` overlay.  Project PAK/VFS
+ * lookup remains authoritative in packaged builds. */
+JCE_API void jce_scene_renderer_set_project_shader_dir(
+    JceSceneRenderer *sr, const char *directory);
+
+/* Return true when the scene contains at least one full-screen effect that is
+ * enabled at the entity, component-registry, and component-value layers.
+ * This query is CPU-only and never allocates renderer resources. */
+JCE_API bool jce_scene_renderer_has_fullscreen_effect(JceScene *scene);
 
 /* ── Per-frame rendering ──────────────────────────────────────────── */
 
@@ -647,6 +756,44 @@ typedef struct {
 JCE_API void jce_scene_renderer_get_rq_stats(const JceSceneRenderer *sr,
                                               JceSceneRqStats *out);
 
+/* GPU-driven model-batch diagnostics from the most recent color pass. */
+typedef struct JceSceneGpuDrivenStats {
+    bool     enabled;
+    bool     active;
+    bool     adaptive_bypass;
+    bool     forced;
+    bool     supported;
+    bool     indirect_supported;
+    bool     indirect_ready;
+    bool     dispatch_succeeded;
+    bool     hiz_enabled;
+    uint32_t candidate_groups;
+    uint32_t candidate_records;
+    uint32_t candidate_draws;
+    uint32_t min_records;
+    uint32_t min_group_records;
+    uint32_t min_records_per_draw;
+    uint32_t total_runs;
+    uint32_t eligible_runs;
+    uint32_t fallback_runs;
+    uint32_t records;
+    uint32_t gpu_groups;
+    uint32_t gpu_runs;
+    uint32_t indirect_submits;
+    uint32_t fixed_count_submits;
+    uint32_t cpu_fallback_submits;
+    uint32_t compute_dispatches;
+    uint32_t upload_calls;
+    uint32_t buffer_growths;
+    uint64_t uploaded_bytes;
+    double   sort_ms;
+    double   prepare_ms;
+    double   flush_ms;
+} JceSceneGpuDrivenStats;
+
+JCE_API void jce_scene_renderer_get_gpu_driven_stats(
+    const JceSceneRenderer *sr, JceSceneGpuDrivenStats *out);
+
 /* Per-frame occlusion culling stats.
  * Only meaningful when an occlusion culler was bound in config. */
 typedef struct {
@@ -704,6 +851,16 @@ JCE_API bool jce_scene_renderer_spawn_decal(JceSceneRenderer    *sr,
  * Call once after loading the project render settings.  Only takes effect
  * when hardware instancing is available AND GPU tier >= HIGH. */
 JCE_API void jce_scene_renderer_set_grass_enabled(JceSceneRenderer *sr, bool on);
+
+/* Map a scene's authored fog settings onto JceVolumetricFogParams.
+ *
+ * Returns true when the scene wants volumetric fog at all.  This lives in the
+ * ENGINE precisely because it used to live in an editor panel: a shipped game
+ * therefore had no way to produce these params, so the fog pass never ran
+ * outside the editor -- the same shape of bug SSR had and already fixed.  One
+ * derivation, both consumers. */
+JCE_API bool jce_scene_fog_params_from_scene(const JceScene *scene,
+                                             JceVolumetricFogParams *out);
 
 JCE_EXTERN_C_END
 

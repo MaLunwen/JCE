@@ -44,9 +44,20 @@ static bool s_uniforms_init = false;
  * before each frame. 0 = SHADED (PBR default). */
 static float s_view_mode = 0.0f;
 
+/* Defined below; the view-mode bind above it needs the handles created. */
+static void ensure_uniforms(void);
+
 void jce_pbr_material_set_view_mode(int mode)
 {
     s_view_mode = (float)mode;
+}
+
+void jce_pbr_material_bind_view_mode(void)
+{
+    ensure_uniforms();
+    /* .z only -- see the header. */
+    float ns[4] = { 0.0f, 0.0f, s_view_mode, 0.0f };
+    jce_enc_set_uniform(s_u_normal_scale, ns, 1);
 }
 
 static void ensure_uniforms(void)
@@ -154,8 +165,9 @@ uint64_t jce_pbr_material_render_state(const JcePbrMaterial *mat)
     return state;
 }
 
-void jce_pbr_material_bind(const JcePbrMaterial *mat,
-                            const JceRenderer *r, uint16_t view_id)
+void jce_pbr_material_bind_texture_overrides(
+    const JcePbrMaterial *mat, const JceRenderer *r, uint16_t view_id,
+    JceTexture albedo_override, JceTexture emissive_override)
 {
     if (!mat) return;
     (void)r;
@@ -190,8 +202,36 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
      *                z=view_mode (0=shaded, 1=wireframe, 2=textured/unlit, 3=wf+tex)
      *                w=receiveShadowsOff (1 = skip all shadow sampling)
      */
+    /* Normal-map scale is ZERO when no normal map is bound.
+     *
+     * The shader perturbs the shading normal under `normalScale > 0`, and
+     * normal_scale defaults to 1.0 -- so that branch ran for every material,
+     * including the overwhelming majority that have no normal map at all. It
+     * sampled the flat fallback texture and then built a tangent basis out of
+     * v_tangent / v_bitangent to transform a vector that was (0,0,1) anyway.
+     *
+     * Costly, and worse, WRONG for any mesh whose vertex layout has no
+     * TANGENT: the missing attribute reads back as (0,0,0,1) on GLES, so the
+     * basis was built from normalize(vec3(0)) and the resulting NaN wiped out
+     * every lit term. That is what rendered the space demo's Earth -- a
+     * procedural sphere, position+normal+texcoord only -- black on WebGL2
+     * while the glTF models beside it lit correctly.
+     *
+     * The binder already knows the answer (it picks the fallback texture two
+     * dozen lines below); it simply never told the shader. Saying so here
+     * fixes the whole CLASS -- any untangented mesh, on any backend -- and
+     * removes a texture fetch, a normalize and a mat3 build per fragment from
+     * every material without a normal map.
+     *
+     * The sign is load-bearing: x < 0 selects the checker fallback (see
+     * useCheckerFallback in fs_pbr_body.sh), so only a POSITIVE scale with no
+     * map is zeroed. */
+    const bool has_normal_map = jce_texture_valid(mat->normal_map);
+    const float effective_normal_scale =
+        (!has_normal_map && mat->normal_scale > 0.0f) ? 0.0f
+                                                      : mat->normal_scale;
     float normal_scale[4] = {
-        mat->normal_scale,
+        effective_normal_scale,
         mat->double_sided ? 1.0f : 0.0f,
         s_view_mode,
         mat->receive_shadows_off ? 1.0f : 0.0f
@@ -199,8 +239,10 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     jce_enc_set_uniform(s_u_normal_scale, normal_scale, 1);
 
     /* Bind textures to sampler stages, using fallbacks for missing maps. */
-    bgfx_texture_handle_t albedo_h = jce_texture_valid(mat->albedo_map)
-        ? (bgfx_texture_handle_t){ mat->albedo_map.idx } : s_white_tex;
+    bgfx_texture_handle_t albedo_h = jce_texture_valid(albedo_override)
+        ? (bgfx_texture_handle_t){ albedo_override.idx }
+        : (jce_texture_valid(mat->albedo_map)
+            ? (bgfx_texture_handle_t){ mat->albedo_map.idx } : s_white_tex);
     jce_enc_set_texture(0, s_albedo, albedo_h, UINT32_MAX);
 
     bgfx_texture_handle_t mr_h = jce_texture_valid(mat->metallic_roughness_map)
@@ -215,9 +257,18 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
         ? (bgfx_texture_handle_t){ mat->ao_map.idx } : s_white_tex;
     jce_enc_set_texture(3, s_ao_map, ao_h, UINT32_MAX);
 
-    bgfx_texture_handle_t em_h = jce_texture_valid(mat->emissive_map)
-        ? (bgfx_texture_handle_t){ mat->emissive_map.idx } : s_white_tex;
+    bgfx_texture_handle_t em_h = jce_texture_valid(emissive_override)
+        ? (bgfx_texture_handle_t){ emissive_override.idx }
+        : (jce_texture_valid(mat->emissive_map)
+            ? (bgfx_texture_handle_t){ mat->emissive_map.idx } : s_white_tex);
     jce_enc_set_texture(4, s_emissive_map, em_h, UINT32_MAX);
+}
+
+void jce_pbr_material_bind(const JcePbrMaterial *mat,
+                           const JceRenderer *r, uint16_t view_id)
+{
+    jce_pbr_material_bind_texture_overrides(
+        mat, r, view_id, JCE_TEXTURE_INVALID, JCE_TEXTURE_INVALID);
 }
 
 /* ================================================================== */

@@ -162,14 +162,14 @@ static void integrate_brdf(float n_dot_v, float roughness,
 /* BRDF LUT parallel-for job descriptor (file-scope so the worker and
    the dispatch site share an exact type). */
 typedef struct {
-    uint32_t  y_begin, y_end, size;
+    uint32_t  size;
     uint16_t *out;
 } JceIblBrdfJob;
 
-static void jce_ibl_brdf_worker(void *arg)
+static void jce_ibl_brdf_worker(uint32_t begin, uint32_t end, void *arg)
 {
     JceIblBrdfJob *j = (JceIblBrdfJob *)arg;
-    for (uint32_t y = j->y_begin; y < j->y_end; y++) {
+    for (uint32_t y = begin; y < end; y++) {
         float roughness = ((float)y + 0.5f) / (float)j->size;
         for (uint32_t x = 0; x < j->size; x++) {
             float n_dot_v = ((float)x + 0.5f) / (float)j->size;
@@ -219,39 +219,14 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
     }
 
     if (!from_cache) {
-        /* ── Parallel CPU integration ──────────────────────────────────
-           Split the y-axis into N row chunks; spawn one short-lived SDL
-           thread per chunk. The work is embarrassingly parallel (no
-           shared state between rows). */
-        int worker_count = 4;
-        if ((uint32_t)worker_count > size) worker_count = (int)size;
-
-        JceIblBrdfJob jobs[8];
-        JceThread    *threads[8] = {0};
-
-        uint32_t rows_per = size / (uint32_t)worker_count;
-        uint32_t y = 0;
-        for (int i = 0; i < worker_count; i++) {
-            jobs[i].size    = size;
-            jobs[i].out     = data;
-            jobs[i].y_begin = y;
-            jobs[i].y_end   = (i == worker_count - 1) ? size : y + rows_per;
-            y               = jobs[i].y_end;
-        }
-
-        LOG_INFO(LOG_TAG, "BRDF LUT: spawning %d worker threads", worker_count);
-        for (int i = 0; i < worker_count; i++) {
-            threads[i] = jce_thread_create(
-                jce_ibl_brdf_worker, &jobs[i], "brdf_lut");
-            if (!threads[i]) {
-                /* Fallback: run inline on the calling thread. */
-                jce_ibl_brdf_worker(&jobs[i]);
-            }
-        }
-        LOG_INFO(LOG_TAG, "BRDF LUT: joining threads");
-        for (int i = 0; i < worker_count; i++) {
-            if (threads[i]) jce_thread_join(threads[i]);
-        }
+        /* Pure fork/join CPU work belongs on the shared frame pool. Fixed row
+         * chunks keep writes disjoint; a missing pool executes serially. */
+        JceIblBrdfJob job = { size, data };
+        uint32_t chunk = size >= 32u ? 16u : 1u;
+        LOG_INFO(LOG_TAG, "BRDF LUT: parallel CPU integration");
+        jce_thread_pool_parallel_for_named(
+            jce_thread_pool_shared(), "ibl.brdf-lut", size, chunk,
+            jce_ibl_brdf_worker, &job);
         LOG_INFO(LOG_TAG, "BRDF LUT: computation done");
 
         /* ── Write cache for next run (best-effort) ─────────────────── */

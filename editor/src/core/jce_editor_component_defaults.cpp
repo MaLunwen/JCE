@@ -23,6 +23,7 @@
 
 extern "C" {
 #include <jce/middleware/physics/jce_cloth.h>
+#include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
 #include <jce/renderer/jce_postfx.h>
 }
 
@@ -63,7 +64,7 @@ void adddef_pivot(JceScene *scene, JceEntity e)
 void adddef_mesh_renderer(JceScene *scene, JceEntity e)
 {
     JceMeshRenderer mr;
-    memset(&mr, 0, sizeof(mr));
+    jce_mesh_renderer_init(&mr);
     mr.visible        = true;
     mr.base_color[0]  = 1.0f;
     mr.base_color[1]  = 1.0f;
@@ -195,6 +196,10 @@ void adddef_rigidbody(JceScene *scene, JceEntity e)
     c.restitution   = 0.0f;
     c.use_gravity   = true;
     c.gravity_scale = 1.0f;
+    /* The loader's fallback, which the memset left at 0. Zero angular drag is
+     * a body that never stops spinning once nudged -- a physical claim nobody
+     * made, arrived at by not mentioning the field. */
+    c.angular_drag  = 0.05f;
     jce_scene_set_rigidbody(scene, e, &c);
 }
 
@@ -237,6 +242,11 @@ void adddef_audio_source(JceScene *scene, JceEntity e)
     memset(&c, 0, sizeof(c));
     c.volume = 1.0f;
     c.pitch  = 1.0f;
+    /* The loader's fallback, which the memset left false. adddef_music_track
+     * directly below sets exactly this, which is what makes the omission here
+     * an omission rather than a decision: an audio source added in the editor
+     * stayed silent while the same component loaded from JSON played. */
+    c.play_on_awake = true;
     jce_scene_set_audio_source(scene, e, &c);
 }
 
@@ -311,6 +321,25 @@ void adddef_water(JceScene *scene, JceEntity e)
     c.transparency = 0.5f;
     c.sun_specular = 1.0f;
     c.visible      = true;
+    /* The FFT half, which the memset above left at zero.
+     *
+     * These are the JSON loader's own fallbacks, not new numbers. A water
+     * component created here and then switched to FFT used to get a patch size
+     * of 0, an amplitude of 0 and a wind direction of (0, 0) -- and a
+     * ZERO-LENGTH direction is the one that does not fail loudly:
+     * jce_water_field.c repairs a zero patch size (it falls back to 64) and
+     * passes the direction straight through to the Tessendorf spectrum.
+     *
+     * A memset zero is never a considered default. Where this file
+     * deliberately differs from the loader it is starter content a missing
+     * JSON key must not invent (the two Gerstner waves above); a field the
+     * function simply never mentions is an omission. */
+    c.fft_resolution  = 64;
+    c.fft_patch_size  = 100.0f;
+    c.fft_wind_speed  = 8.0f;
+    c.fft_wind_dir_x  = 1.0f;
+    c.fft_wind_dir_z  = 0.0f;
+    c.fft_amplitude   = 0.0008f;
     jce_scene_set_water(scene, e, &c);
 }
 
@@ -336,6 +365,9 @@ void adddef_grass_field(JceScene *scene, JceEntity e)
     c.fade_start    = 50.0f;
     c.fade_end      = 110.0f;
     c.hue_jitter    = 0.2f;
+    /* The loader's fallback, which the memset left at 0. A mask world size of
+     * zero is not "no mask" -- it is a mask whose UV mapping divides by it. */
+    c.mask_world_size = 33.0f;
     c.visible       = true;
     jce_scene_set_grass_field(scene, e, &c);
 }
@@ -992,6 +1024,13 @@ void adddef_volume(JceScene *scene, JceEntity e)
     jce_scene_set_volume(scene, e, &c);
 }
 
+void adddef_fullscreen_effect(JceScene *scene, JceEntity e)
+{
+    JceSceneFullscreenEffect c = jce_scene_fullscreen_effect_default();
+    c.enabled = true;
+    jce_scene_set_fullscreen_effect(scene, e, &c);
+}
+
 void adddef_occlusion_portal(JceScene *scene, JceEntity e)
 {
     JceOcclusionPortalComponent c;
@@ -1365,6 +1404,7 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "UIProgressBar",       adddef_ui_progress_bar },
         { "UIDropdown",          adddef_ui_dropdown },
         { "Volume",              adddef_volume },
+        { "FullscreenEffect",    adddef_fullscreen_effect },
         { "OcclusionPortal",     adddef_occlusion_portal },
         { "VideoPlayer",         adddef_video_player },
         { "NavAgent",            adddef_nav_agent },

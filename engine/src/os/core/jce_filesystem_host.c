@@ -266,14 +266,43 @@ typedef struct RmCtx {
     bool ok;
 } RmCtx;
 
-static bool s_rm_collect_cb(const char *path, bool is_dir, void *user)
+static bool s_remove_path_if_present(const char *path)
 {
-    (void)is_dir;
-    RmCtx *ctx = (RmCtx *)user;
-    /* SDL_RemovePath fails on non-empty directories; the post-order
-       removal in jce_fs_host_remove_recursive handles that. */
-    if (!SDL_RemovePath(path)) ctx->ok = false;
-    return true;
+    SDL_PathInfo info;
+
+    if (SDL_RemovePath(path))
+        return true;
+    return !SDL_GetPathInfo(path, &info);
+}
+
+static SDL_EnumerationResult s_rm_postorder_cb(void *userdata,
+                                               const char *dirname,
+                                               const char *fname)
+{
+    RmCtx *ctx = (RmCtx *)userdata;
+    char full[1024];
+    SDL_PathInfo info;
+
+    if (!ctx || !ctx->ok)
+        return SDL_ENUM_FAILURE;
+    if (!fname || fname[0] == '\0')
+        return SDL_ENUM_CONTINUE;
+    if (!s_join(full, sizeof(full), dirname, fname) ||
+        !SDL_GetPathInfo(full, &info)) {
+        ctx->ok = false;
+        return SDL_ENUM_FAILURE;
+    }
+
+    if (info.type == SDL_PATHTYPE_DIRECTORY &&
+        !SDL_EnumerateDirectory(full, s_rm_postorder_cb, ctx)) {
+        ctx->ok = false;
+        return SDL_ENUM_FAILURE;
+    }
+    if (!ctx->ok || !s_remove_path_if_present(full)) {
+        ctx->ok = false;
+        return SDL_ENUM_FAILURE;
+    }
+    return SDL_ENUM_CONTINUE;
 }
 
 bool jce_fs_host_remove_recursive(const char *path)
@@ -284,25 +313,14 @@ bool jce_fs_host_remove_recursive(const char *path)
         /* Already gone — treat as success. */
         return true;
     }
-    if (info.type == SDL_PATHTYPE_FILE)
-        return SDL_RemovePath(path);
+    if (info.type != SDL_PATHTYPE_DIRECTORY)
+        return s_remove_path_if_present(path);
 
-    /* For directories: walk, delete files first, then remove the
-       tree from the leaves up.  SDL_EnumerateDirectory is depth-first
-       pre-order; the simplest reliable approach is to walk twice —
-       once for files, once again removing empty dirs. */
-    {
-        RmCtx ctx;
-        ctx.ok = true;
-        jce_fs_host_walk(path, s_rm_collect_cb, &ctx);
-    }
-    /* Final pass: remove the (now-empty) tree from the leaves. */
-    {
-        RmCtx ctx;
-        ctx.ok = true;
-        jce_fs_host_walk(path, s_rm_collect_cb, &ctx);
-    }
-    return SDL_RemovePath(path);
+    RmCtx ctx;
+    ctx.ok = true;
+    if (!SDL_EnumerateDirectory(path, s_rm_postorder_cb, &ctx) || !ctx.ok)
+        return false;
+    return s_remove_path_if_present(path);
 }
 
 static void s_split_stem_ext(const char *name,

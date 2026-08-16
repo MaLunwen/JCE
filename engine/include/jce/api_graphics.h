@@ -17,6 +17,7 @@ extern "C" {
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_lighting_system.h>
+#include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>

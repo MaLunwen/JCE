@@ -46,6 +46,13 @@ typedef struct JceTaaState {
      * jce_taa_record_camera() at end-of-frame. */
     jce_mat4 prev_view;
     jce_mat4 prev_proj;
+    /* JCE_TAA_JITTER_PHASE, resolved once. phase_pin < 0 means "advance
+       normally"; 0..7 pins the Halton index there so a screenshot A/B is not
+       comparing two different sub-pixel offsets. Zero-init is correct: the
+       env has not been read yet. */
+    int32_t phase_pin;
+    bool    phase_pin_read;
+
     /* Set false after jce_taa_advance() until a record_camera() call —
      * shader code should treat history as invalid on the first frame. */
     bool     prev_valid;

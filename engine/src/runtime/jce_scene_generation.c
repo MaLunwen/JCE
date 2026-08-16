@@ -22,6 +22,7 @@ static bool status_busy(JceSceneGenerationStatus status)
 {
     return status == JCE_SCENE_GENERATION_PLANNING ||
            status == JCE_SCENE_GENERATION_BUILDING ||
+           status == JCE_SCENE_GENERATION_ATTESTING ||
            status == JCE_SCENE_GENERATION_VALIDATING ||
            status == JCE_SCENE_GENERATION_PREWARMING ||
            status == JCE_SCENE_GENERATION_FROZEN_READY ||
@@ -35,6 +36,9 @@ static void sync_transaction_status(
     switch (transaction_status) {
     case JCE_SCENE_TRANSACTION_BUILDING:
         coordinator->status = JCE_SCENE_GENERATION_BUILDING;
+        break;
+    case JCE_SCENE_TRANSACTION_ATTESTING:
+        coordinator->status = JCE_SCENE_GENERATION_ATTESTING;
         break;
     case JCE_SCENE_TRANSACTION_VALIDATING:
         coordinator->status = JCE_SCENE_GENERATION_VALIDATING;
@@ -168,6 +172,7 @@ jce_scene_generation_update(JceSceneGenerationCoordinator *coordinator,
     }
 
     if (coordinator->status == JCE_SCENE_GENERATION_BUILDING ||
+        coordinator->status == JCE_SCENE_GENERATION_ATTESTING ||
         coordinator->status == JCE_SCENE_GENERATION_VALIDATING ||
         coordinator->status == JCE_SCENE_GENERATION_PREWARMING) {
         JceSceneTransactionState transaction_status =
@@ -287,5 +292,25 @@ jce_scene_generation_active_plan_hash(
 {
     return coordinator
         ? jce_scene_transaction_active_plan_hash(coordinator->transaction)
+        : 0u;
+}
+
+JCE_API uint64_t JCE_CALL
+jce_scene_generation_pending_attestation_hash(
+    const JceSceneGenerationCoordinator *coordinator)
+{
+    return coordinator
+        ? jce_scene_transaction_pending_attestation_hash(
+              coordinator->transaction)
+        : 0u;
+}
+
+JCE_API uint64_t JCE_CALL
+jce_scene_generation_active_attestation_hash(
+    const JceSceneGenerationCoordinator *coordinator)
+{
+    return coordinator
+        ? jce_scene_transaction_active_attestation_hash(
+              coordinator->transaction)
         : 0u;
 }

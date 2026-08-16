@@ -1288,3 +1288,30 @@ void jce_physics_debug_flush(JcePhysicsWorld *world)
     jce_bullet_debug_draw(world->bullet, debug_line_adapter, NULL);
 }
 
+
+JceBodyHandle JCE_CALL jce_physics_body_create_heightfield(
+    JcePhysicsWorld *world, const JceHeightfieldBodyDesc *desc)
+{
+    if (!world || !desc || !desc->heights) return JCE_BODY_INVALID;
+
+    float friction = desc->friction > 0.0f ? desc->friction : 0.5f;
+    uint32_t group = desc->collision_group ? desc->collision_group
+                                           : JCE_COLLISION_DEFAULT_GROUP;
+    uint32_t mask  = desc->collision_mask  ? desc->collision_mask
+                                           : JCE_COLLISION_ALL_MASK;
+
+    uint32_t idx = jce_bullet_body_create_heightfield(
+        world->bullet, desc->position, desc->rotation,
+        desc->heights, desc->samples_x, desc->samples_z,
+        desc->cell_size_x, desc->cell_size_z,
+        desc->min_height, desc->max_height,
+        (uint8_t)desc->diagonal,
+        friction, desc->restitution, group, mask,
+        desc->is_trigger, desc->smooth_internal_edges);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "heightfield body create failed");
+        return JCE_BODY_INVALID;
+    }
+    return (JceBodyHandle){ idx };
+}

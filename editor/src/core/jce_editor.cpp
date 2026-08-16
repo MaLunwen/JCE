@@ -22,6 +22,7 @@
 #include "jce_editor_project_state.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_kpi_game_capture.h"
+#include "jce_editor_script_backends.h"
 #include "ui/jce_editor_layout.h"
 #include "ui/jce_editor_panels.h"
 #include "jce_editor_state.h"
@@ -289,6 +290,15 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         const char *log_file = getenv("JCE_LOG_FILE");
         if (log_file && log_file[0]) jce_log_set_file(log_file);
     }
+
+    /* Script VMs for Play.  HERE, and not later, for two reasons that are
+     * both about ordering: a scene's Script components are instantiated
+     * inside jce_runtime_create(), so a language registered after the first
+     * scene load is a language every entity has already been refused by; and
+     * this sits just below the JCE_LOG_FILE sink so a headless run captures
+     * the registration line and every refusal.
+     * See editor/src/core/jce_editor_script_backends.cpp. */
+    jce_editor_register_script_backends();
 
     /* Clipboard. */
     io.SetClipboardTextFn = clipboard_set;
@@ -811,6 +821,22 @@ void jce_editor_update(JceWindow *window)
                 JceRenderer      *r  = jce_editor_get_renderer();
                 JceModel *model = (sr && modelRel[0])
                     ? jce_scene_renderer_get_model(sr, modelRel) : NULL;
+                /* Say why, once.  Four independent conditions gate this bake
+                 * and every one of them fails in silence: no renderer, no
+                 * model resolved under that exact path key, or -- the one that
+                 * actually bit -- the whole block sitting behind
+                 * frame_kpi_index >= 20, a counter that only advances when the
+                 * UNRELATED JCE_KPI_FRAME_LOG is also set.  Without this the
+                 * bake simply produces no file and no output. */
+                if (!sr || !r) {
+                    LOG_WARN("editor", "JCE_IMPOSTOR_BAKE: no scene renderer/renderer yet");
+                } else if (!model) {
+                    LOG_WARN("editor",
+                        "JCE_IMPOSTOR_BAKE: model '%s' is not in the renderer "
+                        "cache -- the path must match a MeshRenderer meshPath "
+                        "in the loaded scene EXACTLY, and that model must have "
+                        "been drawn at least once", modelRel);
+                }
                 if (sr && r && model) {
                     JceImpostorBakeDesc d; memset(&d, 0, sizeof d);
                     d.model = model; d.renderer = r;
@@ -936,6 +962,84 @@ void jce_editor_update(JceWindow *window)
             s_wincap_tick >= (uint32_t)s_wincap_frame) {
             jce_imgui_renderer_request_capture(s_wincap_path);
             s_wincap_done = true;
+        }
+    }
+
+    /* Headless Play hook (JCE_DBG_AUTOPLAY=N): press Play at frame N.
+     *
+     * The scene has to have finished loading first -- jce_state_play snapshots
+     * the whole world for the restore on Stop -- so this is a frame count
+     * rather than a call at startup. It runs once: jce_state_play already
+     * returns early unless the state is STOPPED, but the guard here is what
+     * keeps the intent readable.
+     *
+     * Paired with JCE_DBG_FOCUS_GAME. Either is useful alone: Play with the
+     * scene view foregrounded shows what the editor camera sees of a running
+     * game, which is a different question and occasionally the one being
+     * asked. */
+    {
+        static int      s_autoplay = -2;
+        static uint32_t s_autoplay_tick = 0;
+        static bool     s_autoplay_done = false;
+        ++s_autoplay_tick;
+        if (s_autoplay == -2) {
+            const char *e = getenv("JCE_DBG_AUTOPLAY");
+            s_autoplay = (e && e[0]) ? atoi(e) : -1;
+        }
+        if (s_autoplay >= 0 && !s_autoplay_done &&
+            s_autoplay_tick >= (uint32_t)s_autoplay) {
+            jce_state_play();
+            s_autoplay_done = true;
+            LOG_INFO(LOG_TAG, "autoplay: entered Play at frame %u",
+                     s_autoplay_tick);
+        }
+    }
+
+    /* Headless F12 hook (JCE_SHOT_FRAME=N[,STRIDE] + JCE_SHOT_PATH): drives the
+       BACKBUFFER screenshot path, which is what F12 actually uses and which
+       JCE_WINCAP_FRAME above does NOT -- wincap goes through the ImGui-FBO
+       capture instead. Measuring the wrong one of those two is easy: both
+       write a plausible PNG, and the cost is in the one that was not run.
+       STRIDE repeats the shot every STRIDE frames so a stall can be seen as a
+       recurring spike rather than inferred from a single sample. */
+    {
+        static int  s_shot_frame = -2;
+        static int  s_shot_stride = 0;
+        static char s_shot_path[512];
+        static uint32_t s_shot_tick = 0;
+        static uint32_t s_shot_n = 0;
+        ++s_shot_tick;
+        if (s_shot_frame == -2) {
+            const char *f = getenv("JCE_SHOT_FRAME");
+            const char *p = getenv("JCE_SHOT_PATH");
+            if (f && f[0] && p && p[0]) {
+                s_shot_frame = atoi(f);
+                const char *c = strchr(f, ',');
+                s_shot_stride = c ? atoi(c + 1) : 0;
+                snprintf(s_shot_path, sizeof s_shot_path, "%s", p);
+            } else {
+                s_shot_frame = -1;
+            }
+        }
+        if (s_shot_frame >= 0 && s_shot_tick >= (uint32_t)s_shot_frame) {
+            const bool first = (s_shot_n == 0);
+            const bool again = s_shot_stride > 0 &&
+                ((s_shot_tick - (uint32_t)s_shot_frame) %
+                 (uint32_t)s_shot_stride) == 0u;
+            if (first || again) {
+                char pp[560];
+                snprintf(pp, sizeof pp, "%s", s_shot_path);
+                if (s_shot_stride > 0) {
+                    char *dot = strrchr(pp, '.');
+                    if (dot) {
+                        char tail[32];
+                        snprintf(tail, sizeof tail, "_%u%s", s_shot_n, dot);
+                        snprintf(dot, sizeof pp - (size_t)(dot - pp), "%s", tail);
+                    }
+                }
+                if (jce_screenshot_save(pp, JCE_SCREENSHOT_PNG))
+                    ++s_shot_n;
+            }
         }
     }
 

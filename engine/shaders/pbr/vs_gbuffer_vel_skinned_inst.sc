@@ -20,7 +20,11 @@ $output v_normal, v_curClip, v_prevClip
  */
 
 SAMPLER2D(s_bones,     4);
-SAMPLER2D(s_prevBones, 5);
+/* Stage 6, not 5: stage 5 is the engine-wide s_shadowMap slot.  Nothing
+ * binds shadows for the velocity pass today, so 5 worked -- which is
+ * precisely the shape of the water bug this rule now prevents: the slot
+ * conflict was created later, by adding the feature that was missing. */
+SAMPLER2D(s_prevBones, 6);
 uniform vec4 u_boneTexParams;   /* x = texWidth, y = texHeight (both textures) */
 uniform mat4 u_curViewProj;
 uniform mat4 u_prevViewProj;

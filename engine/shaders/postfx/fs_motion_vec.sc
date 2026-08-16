@@ -48,7 +48,19 @@ void main()
 #endif
 
     vec4 ndc = vec4(v_texcoord0 * 2.0 - 1.0, z, 1.0);
-#if BGFX_SHADER_LANGUAGE_GLSL
+#if !BGFX_SHADER_LANGUAGE_GLSL
+    /* Top-left texture origin (D3D/VK/Metal): v grows DOWN, NDC y grows UP, so
+       v_texcoord0.y*2-1 is the NEGATION of the true NDC y.  On GL vs_postfx.sc
+       has already flipped v, so *2-1 is already true and no flip belongs here.
+
+       The polarity was inverted, which put ndc.y = -trueY on BOTH backends and
+       made this pass report the motion of the vertically mirrored pixel.  It
+       degenerates to correct only for screen-uniform motion; under roll, pitch
+       or perspective it is simply wrong everywhere.
+
+       The invariant this restores is the one fs_gbuffer_vel.sc gets for free
+       out of the vertex pipeline: s_texMotion carries a TRUE clip-NDC delta on
+       every backend, whichever producer wrote it. */
     ndc.y = -ndc.y;
 #endif
 

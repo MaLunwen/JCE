@@ -44,11 +44,11 @@ void load_material_into_renderer(JceMeshRenderer *mr)
     mr->alpha_cutoff   = mat.alpha_cutoff;
     mr->double_sided   = mat.double_sided;
 
-    if (tex_paths[0][0]) snprintf(mr->albedo_tex,   sizeof(mr->albedo_tex),   "%s", tex_paths[0]);
-    if (tex_paths[1][0]) snprintf(mr->mr_tex,       sizeof(mr->mr_tex),       "%s", tex_paths[1]);
-    if (tex_paths[2][0]) snprintf(mr->normal_tex,   sizeof(mr->normal_tex),   "%s", tex_paths[2]);
-    if (tex_paths[3][0]) snprintf(mr->ao_tex,       sizeof(mr->ao_tex),       "%s", tex_paths[3]);
-    if (tex_paths[4][0]) snprintf(mr->emissive_tex, sizeof(mr->emissive_tex), "%s", tex_paths[4]);
+    if (tex_paths[0][0]) mr->albedo_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[0]);
+    if (tex_paths[1][0]) mr->mr_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[1]);
+    if (tex_paths[2][0]) mr->normal_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[2]);
+    if (tex_paths[3][0]) mr->ao_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[3]);
+    if (tex_paths[4][0]) mr->emissive_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[4]);
 }
 
 /* Inverse of load_material_into_renderer: write current MeshRenderer
@@ -123,9 +123,7 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     /* The widget owns the drop target and hands back the raw absolute path;
      * the material import needs that, not the relativized mr->mesh_path. */
     char mesh_dropped[1024] = {0};
-    jce_draw_path_input_asset_dnd("##mesh_path", mr->mesh_path, sizeof(mr->mesh_path),
-                                  mesh_dropped, sizeof(mesh_dropped),
-                                  JCE_ASSET_KIND_MODEL);
+    jce_draw_path_input_asset_dnd_interned("##mesh_path", jce_state_get_scene(), &mr->mesh_path, mesh_dropped, sizeof(mesh_dropped), JCE_ASSET_KIND_MODEL);
     insp_track_edit();
     if (mesh_dropped[0]) {
         jce_state_begin_batch_edit();
@@ -136,9 +134,7 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.materials"));
     ImGui::SameLine();
     char mat_dropped[1024] = {0};
-    jce_draw_path_input_asset_dnd("##mat_path", mr->material_path, sizeof(mr->material_path),
-                                  mat_dropped, sizeof(mat_dropped),
-                                  JCE_ASSET_KIND_MATERIAL);
+    jce_draw_path_input_asset_dnd_interned("##mat_path", jce_state_get_scene(), &mr->material_path, mat_dropped, sizeof(mat_dropped), JCE_ASSET_KIND_MATERIAL);
     if (ImGui::IsItemDeactivatedAfterEdit() && is_mat_json(mr->material_path)) {
         jce_state_begin_batch_edit();
         load_material_into_renderer(mr);
@@ -196,8 +192,7 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
                         if (!jce_scene_has_mesh_renderer(scene, e)) continue;
                         JceMeshRenderer *other = jce_scene_get_mesh_renderer(scene, e);
                         if (!other || other == mr) continue;
-                        snprintf(other->material_path, sizeof(other->material_path),
-                                 "%s", mr->material_path);
+                        other->material_path = jce_scene_intern(jce_state_get_scene(), mr->material_path);
                         load_material_into_renderer(other);
                         ++assigned;
                     }
@@ -274,16 +269,16 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.textures"), ImGuiTreeNodeFlags_DefaultOpen)) {
         /* jce_draw_path_input_asset already installs the JCE_DND_ASSET_PATH
          * drop target on the text field — no accept_asset_drop() needed. */
-        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.albedo"), mr->albedo_tex, 128, JCE_ASSET_KIND_TEXTURE);
+        jce_draw_path_input_asset_interned(jce_editor_i18n("inspector.texture.albedo"), jce_state_get_scene(), &mr->albedo_tex, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.metalRough"), mr->mr_tex, 128, JCE_ASSET_KIND_TEXTURE);
+        jce_draw_path_input_asset_interned(jce_editor_i18n("inspector.texture.metalRough"), jce_state_get_scene(), &mr->mr_tex, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.normal"), mr->normal_tex, 128, JCE_ASSET_KIND_TEXTURE);
+        jce_draw_path_input_asset_interned(jce_editor_i18n("inspector.texture.normal"), jce_state_get_scene(), &mr->normal_tex, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
-        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.ao"), mr->ao_tex, 128, JCE_ASSET_KIND_TEXTURE);
+        jce_draw_path_input_asset_interned(jce_editor_i18n("inspector.texture.ao"), jce_state_get_scene(), &mr->ao_tex, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         snprintf(lbl, sizeof(lbl), "%s###tex", jce_editor_i18n("inspector.texture.emissive"));
-        jce_draw_path_input_asset(lbl, mr->emissive_tex, 128, JCE_ASSET_KIND_TEXTURE);
+        jce_draw_path_input_asset_interned(lbl, jce_state_get_scene(), &mr->emissive_tex, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         ImGui::TreePop();
     }
@@ -785,6 +780,137 @@ void draw_comp_volume(JceVolumeComponent *v)
         insp_track_edit();
         ImGui::EndDisabled();
         ImGui::PopID();
+    }
+}
+
+void draw_comp_fullscreen_effect(JceSceneFullscreenEffect *effect)
+{
+    static const char *const insertion_labels[] = {
+        "HDR - Before Post FX", "LDR - After Post FX"
+    };
+    static const char *const blend_labels[] = {
+        "Replace", "Add", "Alpha"
+    };
+    static const char *const format_labels[] = {
+        "RGBA8", "RGBA16F", "Depth24Stencil8", "Depth32F", "R32F",
+        "R16F", "RG16F", "RG32F", "RGBA32F"
+    };
+    static const char *const address_labels[] = {
+        "Clamp", "Wrap", "Mirror"
+    };
+    static const char *const filter_labels[] = {
+        "Nearest", "Linear"
+    };
+
+    if (!effect) return;
+
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.fullscreen.enabled", "fsfx"),
+                        &effect->enabled))
+        insp_undo_bool(&effect->enabled);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.fullscreen.required", "fsfx"),
+                        &effect->required))
+        insp_undo_bool(&effect->required);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.fullscreen.sceneColor", "fsfx"),
+                        &effect->use_scene_color))
+        insp_undo_bool(&effect->use_scene_color);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.fullscreen.sceneDepth", "fsfx"),
+                        &effect->use_scene_depth))
+        insp_undo_bool(&effect->use_scene_depth);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.fullscreen.history", "fsfx"),
+                        &effect->use_history))
+        insp_undo_bool(&effect->use_history);
+
+    if (ImGui::InputText(jce_editor_i18n_id("inspector.fullscreen.shader", "fsfx"),
+                         effect->shader, sizeof(effect->shader)))
+        insp_track_edit();
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.fullscreen.order", "fsfx"),
+                       &effect->order, 1.0f, -32768, 32767))
+        insp_track_edit();
+
+    int insertion = (int)effect->insertion;
+    if (insertion < 0 || insertion >= (int)IM_ARRAYSIZE(insertion_labels))
+        insertion = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.insertion", "fsfx"),
+                     &insertion, insertion_labels, IM_ARRAYSIZE(insertion_labels))) {
+        effect->insertion = (uint32_t)insertion;
+        insp_track_edit();
+    }
+
+    int blend = (int)effect->blend;
+    if (blend < 0 || blend >= (int)IM_ARRAYSIZE(blend_labels)) blend = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.blend", "fsfx"),
+                     &blend, blend_labels, IM_ARRAYSIZE(blend_labels))) {
+        effect->blend = (uint32_t)blend;
+        insp_track_edit();
+    }
+
+    int format = (int)effect->output_format;
+    if (format < 0 || format >= (int)IM_ARRAYSIZE(format_labels)) format = 1;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.format", "fsfx"),
+                     &format, format_labels, IM_ARRAYSIZE(format_labels))) {
+        effect->output_format = (uint32_t)format;
+        insp_track_edit();
+    }
+    if (ImGui::DragFloat(jce_editor_i18n_id("inspector.fullscreen.resolutionScale", "fsfx"),
+                         &effect->resolution_scale, 0.01f, 0.125f, 1.0f, "%.3f"))
+        insp_track_edit();
+
+    ImGui::SeparatorText(jce_editor_i18n("inspector.fullscreen.textures"));
+    uint8_t texture_count = 0;
+    for (uint32_t i = 0; i < JCE_FULLSCREEN_EFFECT_MAX_TEXTURES; ++i) {
+        JceSamplerDesc *sampler = &effect->samplers[i];
+        char label[64];
+        bool changed = false;
+
+        ImGui::PushID((int)i);
+        snprintf(label, sizeof(label), "%s %u",
+                 jce_editor_i18n("inspector.fullscreen.texture"), i);
+        changed |= jce_draw_path_input_asset(label, effect->textures[i],
+                                             sizeof(effect->textures[i]),
+                                             JCE_ASSET_KIND_TEXTURE);
+        if (effect->textures[i][0]) texture_count = (uint8_t)(i + 1u);
+
+        int address_u = (int)sampler->address_u;
+        int address_v = (int)sampler->address_v;
+        int filter_min = (int)sampler->filter_min;
+        int filter_mag = (int)sampler->filter_mag;
+        int filter_mip = (int)sampler->filter_mip;
+        if (address_u < 0 || address_u > 2) address_u = 0;
+        if (address_v < 0 || address_v > 2) address_v = 0;
+        if (filter_min < 0 || filter_min > 1) filter_min = 1;
+        if (filter_mag < 0 || filter_mag > 1) filter_mag = 1;
+        if (filter_mip < 0 || filter_mip > 1) filter_mip = 1;
+        changed |= ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.addressU", "fsfx"),
+                                &address_u, address_labels, IM_ARRAYSIZE(address_labels));
+        changed |= ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.addressV", "fsfx"),
+                                &address_v, address_labels, IM_ARRAYSIZE(address_labels));
+        changed |= ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.minFilter", "fsfx"),
+                                &filter_min, filter_labels, IM_ARRAYSIZE(filter_labels));
+        changed |= ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.magFilter", "fsfx"),
+                                &filter_mag, filter_labels, IM_ARRAYSIZE(filter_labels));
+        changed |= ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.mipFilter", "fsfx"),
+                                &filter_mip, filter_labels, IM_ARRAYSIZE(filter_labels));
+        sampler->struct_size = sizeof(*sampler);
+        sampler->address_u = (uint32_t)address_u;
+        sampler->address_v = (uint32_t)address_v;
+        sampler->filter_min = (uint32_t)filter_min;
+        sampler->filter_mag = (uint32_t)filter_mag;
+        sampler->filter_mip = (uint32_t)filter_mip;
+        if (changed) insp_track_edit();
+        ImGui::PopID();
+    }
+    if (effect->texture_count != texture_count) {
+        effect->texture_count = texture_count;
+        insp_track_edit();
+    }
+
+    ImGui::SeparatorText(jce_editor_i18n("inspector.fullscreen.parameters"));
+    for (uint32_t i = 0; i < JCE_FULLSCREEN_EFFECT_MAX_PARAMS; ++i) {
+        char label[32];
+        snprintf(label, sizeof(label), "P%u", i);
+        if (ImGui::DragFloat4(label, effect->params[i], 0.01f, -1.0e9f,
+                              1.0e9f, "%.6g"))
+            insp_track_edit();
     }
 }
 

@@ -304,15 +304,35 @@ static bool comp_section_begin(uint32_t entity_id,
     /* Enable checkbox right after the component NAME (prominent), so it clearly
      * reads as that component's on/off switch. Transform is always enabled. */
     if (comp_toggleable) {
+        /* A script that re-asserts this component's enable state every frame
+         * overwrites anything set here within one frame.  Offering a live
+         * checkbox in that case reads as a broken control, so say who owns it
+         * and take the checkbox out of service instead. */
+        const bool script_driven =
+            jce_scene_comp_script_driven(_es, _ee, comp_id);
+
         float cb_x = hdr_x + ImGui::GetTreeNodeToLabelSpacing()
                    + ImGui::CalcTextSize(display_name).x + 12.0f;
         if (cb_x > header_w - 46.0f) cb_x = header_w - 46.0f;
         bool _en = !comp_disabled;
         ImGui::SameLine(cb_x);
-        if (ImGui::Checkbox("##comp_enabled", &_en))
+        ImGui::BeginDisabled(script_driven);
+        if (ImGui::Checkbox("##comp_enabled", &_en) && !script_driven)
             jce_scene_set_comp_enabled(_es, _ee, comp_id, _en);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", jce_editor_i18n("inspector.toggleComponentTip"));
+        ImGui::EndDisabled();
+        /* Tooltip has to be outside BeginDisabled: disabled items do not
+         * report hover, and the explanation is exactly what is needed here. */
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", jce_editor_i18n(
+                script_driven ? "inspector.componentScriptDrivenTip"
+                              : "inspector.toggleComponentTip"));
+        if (script_driven) {
+            ImGui::SameLine(0.0f, 6.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, jce_theme::text_secondary());
+            ImGui::TextUnformatted(
+                jce_editor_i18n("inspector.componentScriptDriven"));
+            ImGui::PopStyleColor();
+        }
     }
 
     ImGui::SameLine(header_w - 20);
@@ -964,7 +984,7 @@ INSP_DRAWFN(skybox, draw_comp_skybox(jce_scene_get_skybox(scene, e)))
 INSP_DRAWFN(sprite_animator, draw_comp_sprite_animator(jce_scene_get_sprite_animator(scene, e)))
 INSP_DRAWFN(constraint, draw_comp_constraint(jce_scene_get_constraint(scene, e)))
 INSP_DRAWFN(terrain, draw_comp_terrain(jce_scene_get_terrain(scene, e)))
-INSP_DRAWFN(vegetation_scatter, draw_comp_vegetation_scatter(jce_scene_get_vegetation_scatter(scene, e)))
+INSP_DRAWFN(vegetation_scatter, draw_comp_vegetation_scatter(jce_scene_get_vegetation_scatter(scene, e), scene, e))
 INSP_DRAWFN(grass_field, draw_comp_grass_field(jce_scene_get_grass_field(scene, e)))
 INSP_DRAWFN(foliage_cluster, draw_comp_foliage_cluster(jce_scene_get_foliage_cluster(scene, e)))
 INSP_DRAWFN(water, draw_comp_water(jce_scene_get_water(scene, e)))
@@ -1024,6 +1044,8 @@ INSP_DRAWFN(tilemap_collider2d,
             draw_comp_tilemap_collider2d(jce_scene_get_tilemap_collider2d(scene, e)))
 INSP_DRAWFN(avatar, draw_comp_avatar(jce_scene_get_avatar(scene, e)))
 INSP_DRAWFN(volume, draw_comp_volume(jce_scene_get_volume(scene, e)))
+INSP_DRAWFN(fullscreen_effect,
+            draw_comp_fullscreen_effect(jce_scene_get_fullscreen_effect(scene, e)))
 INSP_DRAWFN(occlusion_portal, draw_comp_occlusion_portal(jce_scene_get_occlusion_portal(scene, e)))
 INSP_DRAWFN(video_player, draw_comp_video_player(jce_scene_get_video_player(scene, e)))
 INSP_DRAWFN(nav_agent, draw_comp_nav_agent(jce_scene_get_nav_agent(scene, e)))
@@ -1118,6 +1140,7 @@ static void insp_register_draw_fns(void)
         { "TilemapCollider2D", drawfn_tilemap_collider2d },
         { "Avatar", drawfn_avatar },
         { "Volume", drawfn_volume },
+        { "FullscreenEffect", drawfn_fullscreen_effect },
         { "OcclusionPortal", drawfn_occlusion_portal },
         { "VideoPlayer", drawfn_video_player },
         { "NavAgent", drawfn_nav_agent },

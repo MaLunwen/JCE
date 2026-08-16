@@ -26,6 +26,7 @@
 #include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
 
+#include <jce/os/core/jce_async.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/resource/jce_world_streamer.h>
@@ -448,9 +449,10 @@ std::string build_clipboard_snapshot(float dt_ms,
      * along in the copied snapshot too (was missing). */
     s += "\n[CPU phases (engine)]\n";
     {
-        struct PR { const char *n; double ms; } pr[64]; int prn = 0;
+        struct PR { const char *n; double ms; } pr[JCE_PERF_PHASE_MAX_SLOTS];
+        int prn = 0;
         int pc = jce_perf_phase_count();
-        for (int i = 0; i < pc && prn < 64; ++i) {
+        for (int i = 0; i < pc && prn < JCE_PERF_PHASE_MAX_SLOTS; ++i) {
             const char *nm = NULL; double ms = 0.0;
             if (jce_perf_phase_peek_frame(i, &nm, &ms) && nm && ms >= 0.01) {
                 pr[prn].n = nm; pr[prn].ms = ms; prn++;
@@ -561,6 +563,40 @@ std::string build_clipboard_snapshot(float dt_ms,
         append_fmt(s, "  Memory         : %.2f MB\n",
                    (double)mem / (1024.0 * 1024.0));
         append_fmt(s, "  Entities       : %u\n", ents);
+    }
+
+    JceAsyncExecutorStats async_stats = {};
+    JceAsyncExecutor *async_executor = jce_async_default_executor();
+    if (async_executor)
+        jce_async_executor_get_stats(async_executor, &async_stats);
+    {
+        const uint64_t completed = async_stats.succeeded_tasks
+                                 + async_stats.failed_tasks
+                                 + async_stats.cancelled_tasks;
+        const double avg_queue_ms = completed > 0
+            ? (double)async_stats.total_queue_time_ns
+                / (double)completed / 1000000.0
+            : 0.0;
+        const double avg_run_ms = completed > 0
+            ? (double)async_stats.total_run_time_ns
+                / (double)completed / 1000000.0
+            : 0.0;
+        s += "\n[Shared structured async]\n";
+        append_fmt(s, "  Workers        : %u\n", async_stats.worker_count);
+        append_fmt(s, "  Live / capacity: %u / %u (peak %u)\n",
+                   async_stats.live_tasks, async_stats.capacity,
+                   async_stats.peak_live_tasks);
+        append_fmt(s, "  Wait/queue/run : %u / %u / %u\n",
+                   async_stats.waiting_tasks, async_stats.queued_tasks,
+                   async_stats.running_tasks);
+        append_fmt(s, "  Queue avg/max  : %.3f / %.3f ms\n",
+                   avg_queue_ms,
+                   (double)async_stats.max_queue_time_ns / 1000000.0);
+        append_fmt(s, "  Run avg/max    : %.3f / %.3f ms\n",
+                   avg_run_ms,
+                   (double)async_stats.max_run_time_ns / 1000000.0);
+        append_fmt(s, "  Rejected       : %llu\n",
+                   (unsigned long long)async_stats.rejected_tasks);
     }
 
     JceMemStats ms = {};
@@ -759,9 +795,9 @@ void draw_content(void)
     ImGui::SeparatorText(jce_editor_i18n("profiler.section.cpuPhases"));
     {
         struct PhaseRow { const char *name; double ms; };
-        PhaseRow rows[64]; int rn = 0;
+        PhaseRow rows[JCE_PERF_PHASE_MAX_SLOTS]; int rn = 0;
         int pc = jce_perf_phase_count();
-        for (int i = 0; i < pc && rn < 64; ++i) {
+        for (int i = 0; i < pc && rn < JCE_PERF_PHASE_MAX_SLOTS; ++i) {
             const char *nm = NULL; double ms = 0.0;
             if (!jce_perf_phase_peek_frame(i, &nm, &ms) || !nm) continue;
             if (ms < 0.01) continue;
@@ -838,6 +874,79 @@ void draw_content(void)
         std::snprintf(buf, sizeof(buf), "%.1f s", s_prof.uptime_s);
         row(jce_editor_i18n("profiler.row.uptime"),    buf);
         ImGui::EndTable();
+    }
+
+    /* ── Structured asynchronous executor ──────────────────────── */
+    {
+        JceAsyncExecutorStats stats = {};
+        JceAsyncExecutor *executor = jce_async_default_executor();
+        if (executor)
+            jce_async_executor_get_stats(executor, &stats);
+
+        const uint64_t completed = stats.succeeded_tasks
+                                 + stats.failed_tasks
+                                 + stats.cancelled_tasks;
+        const double avg_queue_ms = completed > 0
+            ? (double)stats.total_queue_time_ns
+                / (double)completed / 1000000.0
+            : 0.0;
+        const double avg_run_ms = completed > 0
+            ? (double)stats.total_run_time_ns
+                / (double)completed / 1000000.0
+            : 0.0;
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(
+            jce_editor_i18n("profiler.section.structuredAsync"));
+        if (ImGui::BeginTable("prof_async", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *key, const char *value) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(key);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(value);
+            };
+            char buf[128];
+            const char *mode =
+                stats.mode == JCE_ASYNC_EXECUTION_COOPERATIVE
+                ? jce_editor_i18n("profiler.value.asyncCooperative")
+                : jce_editor_i18n("profiler.value.asyncThreaded");
+
+            std::snprintf(buf, sizeof(buf), "%s / %u", mode,
+                          stats.worker_count);
+            row(jce_editor_i18n("profiler.row.asyncModeWorkers"), buf);
+            std::snprintf(buf, sizeof(buf), "%u / %u (peak %u)",
+                          stats.live_tasks, stats.capacity,
+                          stats.peak_live_tasks);
+            row(jce_editor_i18n("profiler.row.asyncLiveCapacity"), buf);
+            std::snprintf(buf, sizeof(buf), "%u / %u / %u (peak %u)",
+                          stats.waiting_tasks, stats.queued_tasks,
+                          stats.running_tasks, stats.peak_queued_tasks);
+            row(jce_editor_i18n("profiler.row.asyncWaitQueueRun"), buf);
+            std::snprintf(buf, sizeof(buf), "%u",
+                          stats.pending_completions);
+            row(jce_editor_i18n("profiler.row.asyncCompletions"), buf);
+            std::snprintf(
+                buf, sizeof(buf), "%llu / %llu / %llu",
+                (unsigned long long)stats.succeeded_tasks,
+                (unsigned long long)stats.failed_tasks,
+                (unsigned long long)stats.cancelled_tasks);
+            row(jce_editor_i18n("profiler.row.asyncOutcomes"), buf);
+            std::snprintf(buf, sizeof(buf), "%.3f / %.3f ms",
+                          avg_queue_ms,
+                          (double)stats.max_queue_time_ns / 1000000.0);
+            row(jce_editor_i18n("profiler.row.asyncQueueTime"), buf);
+            std::snprintf(buf, sizeof(buf), "%.3f / %.3f ms",
+                          avg_run_ms,
+                          (double)stats.max_run_time_ns / 1000000.0);
+            row(jce_editor_i18n("profiler.row.asyncRunTime"), buf);
+            std::snprintf(buf, sizeof(buf), "%llu",
+                          (unsigned long long)stats.rejected_tasks);
+            row(jce_editor_i18n("profiler.row.asyncRejected"), buf);
+            ImGui::EndTable();
+        }
     }
 
     /* ── Renderer (bgfx live stats) ────────────────────────────── */
@@ -1214,13 +1323,14 @@ extern "C" void jce_editor_panel_memory_profiler_content(void);
 extern "C" void jce_editor_panel_profile_analyzer_content(void);
 extern "C" void jce_editor_panel_frame_debugger_content(void);
 extern "C" void jce_editor_panel_benchmark_content(void);
+extern "C" void jce_editor_panel_profiler_trace_content(void);
 
 namespace {
 
-/* max_tab must span all 5 tabs (0..4): it is both the validity bound and
+/* max_tab must span all 6 tabs (0..5): it is both the validity bound and
  * the load clamp, so a persisted Benchmark tab can never be silently
  * remapped onto Frame Debugger. */
-JcePanelTabState g_tabs{ "panel.profiler.current_tab", /*max_tab=*/4 };
+JcePanelTabState g_tabs{ "panel.profiler.current_tab", /*max_tab=*/5 };
 
 void draw_workbench(void)
 {
@@ -1233,12 +1343,14 @@ void draw_workbench(void)
     ImGuiTabItemFlags ana_flags = jce_panel_tab_flags(g_tabs, 2);
     ImGuiTabItemFlags fd_flags  = jce_panel_tab_flags(g_tabs, 3);
     ImGuiTabItemFlags bm_flags  = jce_panel_tab_flags(g_tabs, 4);
+    ImGuiTabItemFlags tr_flags  = jce_panel_tab_flags(g_tabs, 5);
 
     char cpu_label[96];
     char mem_label[96];
     char ana_label[96];
     char fd_label [96];
     char bm_label [96];
+    char tr_label [96];
     std::snprintf(cpu_label, sizeof(cpu_label), "%s###pf_tab_cpu",
                   jce_editor_i18n("profiler.title"));
     std::snprintf(mem_label, sizeof(mem_label), "%s###pf_tab_memory",
@@ -1249,6 +1361,9 @@ void draw_workbench(void)
                   jce_editor_i18n("frameDebugger.title"));
     std::snprintf(bm_label,  sizeof(bm_label),  "%s###pf_tab_benchmark",
                   jce_editor_i18n("benchmark.title"));
+    std::snprintf(tr_label,  sizeof(tr_label),  "%s###pf_tab_trace",
+                  jce_editor_i18n_or("profiler.trace.title",
+                                     "Threads & Tasks"));
 
     if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
         jce_panel_tab_set_current(g_tabs, 0);
@@ -1273,6 +1388,11 @@ void draw_workbench(void)
     if (ImGui::BeginTabItem(bm_label, nullptr, bm_flags)) {
         jce_panel_tab_set_current(g_tabs, 4);
         jce_editor_panel_benchmark_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(tr_label, nullptr, tr_flags)) {
+        jce_panel_tab_set_current(g_tabs, 5);
+        jce_editor_panel_profiler_trace_content();
         ImGui::EndTabItem();
     }
 

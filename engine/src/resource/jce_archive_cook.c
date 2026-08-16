@@ -10,6 +10,7 @@
 #include <jce/resource/jce_archive_cook.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_writer.h>
+#include <jce/resource/jce_asset_format.h>
 
 #include "os/core/jce_memory.h"
 
@@ -62,12 +63,21 @@ static ResClass classify(const char *path) {
         "mp4", "webm", "mkv", NULL
     };
     static const char *const json[]   = { "json", "scene", "mat", "gltf", NULL };
-    static const char *const text[]   = { "txt", "csv", "xml", "rml", "rcss", "lua", NULL };
+    /* "lua" used to be spelled here too.  It is not, because script
+     * extensions have exactly one authority (jce_asset_ext.c) and this was
+     * one of the places it was copied to — the copy is how .py ended up
+     * compressed as opaque binary while .lua shared the text dictionary. */
+    static const char *const text[]   = { "txt", "csv", "xml", "rml", "rcss", NULL };
     static const char *const shader[] = { "bin", NULL };
 
     if (ext_in(ext, store))  return CLS_STORE;
     if (ext_in(ext, json))   return CLS_JSON;
     if (ext_in(ext, text))   return CLS_TEXT;
+    /* Script SOURCE is UTF-8 text in every language and belongs in the
+     * shared TEXT dictionary; compiled BYTECODE (.class) does not, which is
+     * the only reason `form` exists as an enum rather than a bool. */
+    if (jce_asset_script_form_from_ext(ext) == JCEASSET_SCRIPT_FORM_SOURCE)
+        return CLS_TEXT;
     if (ext_in(ext, shader)) return CLS_SHADER;
     return CLS_DEFAULT;
 }

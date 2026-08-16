@@ -107,6 +107,12 @@ void main()
 #endif
             if (win_z < 0.0) { keep_visible = true; break; }
             vec2 uv = ndc.xy * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+            /* Top-left texture origin: the Hi-Z pyramid inherits the depth
+             * texture's row order, so NDC y (up) must be flipped into UV v
+             * (down) here, exactly as csm_shadow.sh does for the cascades. */
+            uv.y = 1.0 - uv.y;
+#endif
             mn_uv = min(mn_uv, uv);
             mx_uv = max(mx_uv, uv);
             mn_z  = min(mn_z, win_z);

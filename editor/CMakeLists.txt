@@ -45,6 +45,192 @@ target_link_libraries(JCE_Editor PRIVATE
 target_include_directories(JCE_Editor PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+# ------------------------------------------------------------------ #
+#  Script backends in editor Play                                     #
+#                                                                     #
+#  MEASURED BEFORE THIS EXISTED (2026-08-16, the Elemental Serenity    #
+#  scene with four scripted entities): editor Play ran ONE of four     #
+#  languages.  The engine registers only the built-in Lua VM, every    #
+#  other backend registers itself from a call the application makes,   #
+#  and the editor made none — so a .py or .java attached to an entity  #
+#  was refused by name in Play and ran perfectly in the game build.    #
+#  The editor being WEAKER than the shipped runtime is the packaging   #
+#  asymmetry this repo's rules exist to prevent, in reverse.           #
+#                                                                     #
+#  These are FIRST-PARTY sibling targets, not third-party backends:    #
+#  scripting/ is a peer of engine/ and editor/, and                    #
+#  check_editor_consumer_purity.py bans engine-internal THIRD-PARTY    #
+#  headers (SDL, bgfx, flecs, ...) so the editor cannot paper over a   #
+#  missing public API.  Linking a language runtime is not that; there  #
+#  is no engine API that could stand in for "this process contains a   #
+#  CPython", and the alternative is an editor that cannot author the   #
+#  projects the engine can run.                                        #
+#                                                                     #
+#  All are OPTIONAL: absent targets simply leave the editor on Lua,    #
+#  which is exactly where it was.                                      #
+#                                                                      #
+#  THE CPP BACKEND IS HERE TOO, AND THIS COMMENT USED TO SAY IT COULD  #
+#  NOT BE.  The reasoning was that a cpp script is a class compiled    #
+#  into the GAME executable, which the editor does not link — true,    #
+#  and it is an argument about where the CLASSES come from, not about  #
+#  where the VM comes from.  The VM belongs in this process; the       #
+#  classes arrive at run time from the project's own module, named in  #
+#  jce_project.json and loaded with jce_script_vm_cpp_load_library().  #
+#  See editor/src/core/jce_editor_script_backends.cpp.                 #
+# ------------------------------------------------------------------ #
+if(TARGET jce_script_vm_python)
+	target_link_libraries(JCE_Editor PRIVATE jce_script_vm_python)
+	target_compile_definitions(JCE_Editor PRIVATE
+		JCE_EDITOR_HAVE_SCRIPT_PYTHON=1
+		JCE_EDITOR_SCRIPT_PYTHON_PACKAGE_DIR="${JCE_SCRIPT_PYTHON_PACKAGE_DIR}")
+endif()
+
+if(TARGET jce_script_vm_java)
+	# The JDK, DERIVED from the one place the configure already found it, for
+	# the same reason tools/gpu_task derives it: two probes can disagree, and
+	# then the jni.h the backend compiled against and the JVM it starts are
+	# different JDKs — an UnsatisfiedLinkError with no obvious cause.
+	get_filename_component(_ed_java_home "${JCE_JNI_INCLUDE_DIR}" DIRECTORY)
+	if(WIN32)
+		set(_ed_java_jvm "${_ed_java_home}/bin/server/jvm.dll")
+	elseif(APPLE)
+		set(_ed_java_jvm "${_ed_java_home}/lib/server/libjvm.dylib")
+	else()
+		set(_ed_java_jvm "${_ed_java_home}/lib/server/libjvm.so")
+	endif()
+
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(NOT Python3_Interpreter_FOUND)
+		message(WARNING
+			"JCE_Editor: Java scripting NOT wired into Play — the scripting "
+			"classes are compiled by scripting/java/build_java.py and there "
+			"is no Python 3 interpreter.")
+	else()
+		# The classes the JVM loads BY CLASS PATH.  Nothing links them, so the
+		# edge must be add_dependencies: without it they are built only when
+		# somebody happens to build "all", and the symptom is a green editor
+		# build followed by "no script VM claims .java" in Play.
+		set(_ed_java_classes "${CMAKE_CURRENT_BINARY_DIR}/java_classes")
+		file(GLOB_RECURSE _ed_java_srcs CONFIGURE_DEPENDS
+			"${CMAKE_SOURCE_DIR}/scripting/java/src/main/java/*.java")
+		add_custom_command(
+			OUTPUT  "${_ed_java_classes}/.stamp"
+			COMMAND "${Python3_EXECUTABLE}"
+			        "${CMAKE_SOURCE_DIR}/scripting/java/build_java.py"
+			        --out "${_ed_java_classes}" --no-jar
+			COMMAND "${CMAKE_COMMAND}" -E touch "${_ed_java_classes}/.stamp"
+			DEPENDS ${_ed_java_srcs}
+			COMMENT "Compiling the Java scripting classes for editor Play"
+			VERBATIM)
+		add_custom_target(jce_editor_java_classes
+			DEPENDS "${_ed_java_classes}/.stamp")
+
+		target_link_libraries(JCE_Editor PRIVATE jce_script_vm_java)
+		# jce_script_java is loaded BY the JVM, not linked: build-order only.
+		add_dependencies(JCE_Editor jce_editor_java_classes jce_script_java)
+		target_compile_definitions(JCE_Editor PRIVATE
+			JCE_EDITOR_HAVE_SCRIPT_JAVA=1)
+		# file(GENERATE) for the shim path: $<TARGET_FILE:...> is a generator
+		# expression and cannot go through target_compile_definitions here.
+		file(GENERATE
+			OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/jce_editor_java_paths.gen.h"
+			CONTENT "/* GENERATED by editor/CMakeLists.txt. */
+#ifndef JCE_EDITOR_JAVA_PATHS_GEN_H
+#define JCE_EDITOR_JAVA_PATHS_GEN_H
+#define JCE_EDITOR_SCRIPT_JAVA_JVM_LIBRARY \"${_ed_java_jvm}\"
+#define JCE_EDITOR_SCRIPT_JAVA_CLASS_PATH  \"${_ed_java_classes}/classes\"
+#define JCE_EDITOR_SCRIPT_JAVA_SCRIPT_LIB  \"$<TARGET_FILE:jce_script_java>\"
+#endif
+")
+		target_include_directories(JCE_Editor PRIVATE
+			"${CMAKE_CURRENT_BINARY_DIR}/generated")
+	endif()
+	unset(_ed_java_home)
+	unset(_ed_java_jvm)
+	unset(_ed_java_srcs)
+	unset(_ed_java_classes)
+endif()
+
+# ------------------------------------------------------------------ #
+#  C++ scripting in editor Play                                       #
+#                                                                     #
+#  The VM only.  A cpp script CLASS lives in a module the PROJECT     #
+#  builds; the editor loads it at run time from the paths in that      #
+#  project's jce_project.json ("script_modules").  Nothing about the   #
+#  project is known at configure time and nothing here tries to be.    #
+#                                                                     #
+#  jce_script_vm_cpp needs no toolchain and no runtime — it is a       #
+#  registry and eighteen forwarders in C99 — so unlike Python and      #
+#  Java it is present whenever scripting/ was added at all.            #
+# ------------------------------------------------------------------ #
+if(TARGET jce_script_vm_cpp)
+	target_link_libraries(JCE_Editor PRIVATE jce_script_vm_cpp)
+	target_compile_definitions(JCE_Editor PRIVATE JCE_EDITOR_HAVE_SCRIPT_CPP=1)
+	message(STATUS
+		"JCE_Editor: C++ scripting wired into Play (project modules come from "
+		"jce_project.json \"script_modules\").")
+else()
+	# NOT SILENT, and the reason is a measured failure: add_subdirectory()
+	# ordering put editor/ above scripting/ once, every if(TARGET) here read
+	# FALSE, the configure was green, and Play linked no backend at all.  An
+	# if(TARGET) that is lying looks exactly like one that is right, so both
+	# branches say something.
+	message(WARNING
+		"JCE_Editor: C++ scripting NOT wired into Play — there is no "
+		"jce_script_vm_cpp target at this point in the configure. If "
+		"scripting/ IS being built, this is the add_subdirectory ordering "
+		"trap: scripting/ must come BEFORE editor/ in the root CMakeLists.")
+endif()
+
+# ------------------------------------------------------------------ #
+#  C scripting in editor Play                                         #
+#                                                                     #
+#  A SEPARATE if(), not a clause of the one above, because "c" is a    #
+#  separate registered LANGUAGE: an editor that linked the cpp VM and  #
+#  not this one would print `editor Play can run: ... cpp` and refuse  #
+#  a .jcec by extension, which is precisely the answer this language   #
+#  was added to stop giving.                                          #
+#                                                                     #
+#  The CLASSES are the same classes — one native registry serves both  #
+#  languages — so there is nothing extra to load: a project module     #
+#  already reaches the editor through jce_project.json                 #
+#  ("script_modules"), whichever of the two languages wrote it.        #
+# ------------------------------------------------------------------ #
+if(TARGET jce_script_vm_c)
+	target_link_libraries(JCE_Editor PRIVATE jce_script_vm_c)
+	target_compile_definitions(JCE_Editor PRIVATE JCE_EDITOR_HAVE_SCRIPT_C=1)
+	message(STATUS
+		"JCE_Editor: C scripting wired into Play (.jcec; classes come from "
+		"the same project modules the cpp VM reads).")
+else()
+	# Both branches speak, for the reason the cpp block above records.
+	message(WARNING
+		"JCE_Editor: C scripting NOT wired into Play — there is no "
+		"jce_script_vm_c target at this point in the configure. A .jcec "
+		"script will resolve to no language in Play while still running in a "
+		"game build that links the backend.")
+endif()
+
+# jce_script_api is a SHARED library and BOTH bindings call it by name at run
+# time; a project's cpp script module links it too, and the loader resolves a
+# module's dependencies from the EXECUTABLE's directory, not the module's.  A
+# missing DLL is a loader failure that prints nothing, so stage it beside
+# jce_editor.exe whenever any backend is in.
+if(TARGET jce_script_api AND
+   (TARGET jce_script_vm_python OR TARGET jce_script_vm_java
+    OR TARGET jce_script_vm_cpp))
+	add_custom_command(TARGET JCE_Editor POST_BUILD
+		COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+			"$<TARGET_FILE:jce_script_api>" "$<TARGET_FILE_DIR:JCE_Editor>"
+		VERBATIM)
+endif()
+if(TARGET jce_script_java)
+	add_custom_command(TARGET JCE_Editor POST_BUILD
+		COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+			"$<TARGET_FILE:jce_script_java>" "$<TARGET_FILE_DIR:JCE_Editor>"
+		VERBATIM)
+endif()
+
 # Resolve a human-readable OS + arch string for the About dialog.
 if(JCE_PLATFORM_WINDOWS)
     set(_jce_os_str "Windows")

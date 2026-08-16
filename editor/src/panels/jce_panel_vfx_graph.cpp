@@ -433,24 +433,24 @@ static void draw_node(Node &n)
     char _lbl[96];
 #define VFX_LBL(key, en, id)                                                  \
     (snprintf(_lbl, sizeof(_lbl), "%s###" id,                                 \
-              jce_editor_i18n_or("panel.vfxGraph." key, en)), _lbl)
+              jce_editor_i18n_or(key, en)), _lbl)
     if (n.type == NT_EMITTER) {
-        if (ImGui::DragFloat(VFX_LBL("rate", "rate", "vfx_rate"),         &n.rate,     0.5f, 0, 1000)) s_g.dirty = true;
-        if (ImGui::DragFloat(VFX_LBL("lifetime", "lifetime", "vfx_life"), &n.lifetime, 0.05f, 0, 60))  s_g.dirty = true;
-        if (ImGui::DragFloat(VFX_LBL("speed", "speed", "vfx_speed"),      &n.speed,    0.05f, 0, 100)) s_g.dirty = true;
-        if (ImGui::DragFloat(VFX_LBL("size", "size", "vfx_size"),         &n.size,     0.01f, 0, 10))  s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.rate", "rate", "vfx_rate"),         &n.rate,     0.5f, 0, 1000)) s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.lifetime", "lifetime", "vfx_life"), &n.lifetime, 0.05f, 0, 60))  s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.speed", "speed", "vfx_speed"),      &n.speed,    0.05f, 0, 100)) s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.size", "size", "vfx_size"),         &n.size,     0.01f, 0, 10))  s_g.dirty = true;
     } else if (n.type == NT_COLOR_RAMP) {
-        if (ImGui::ColorEdit4(VFX_LBL("start", "start", "vfx_start"), n.start_col)) s_g.dirty = true;
-        if (ImGui::ColorEdit4(VFX_LBL("end", "end", "vfx_end"),       n.end_col))   s_g.dirty = true;
+        if (ImGui::ColorEdit4(VFX_LBL("panel.vfxGraph.start", "start", "vfx_start"), n.start_col)) s_g.dirty = true;
+        if (ImGui::ColorEdit4(VFX_LBL("panel.vfxGraph.end", "end", "vfx_end"),       n.end_col))   s_g.dirty = true;
     } else if (n.type == NT_VELOCITY) {
-        if (ImGui::DragFloat3(VFX_LBL("dir", "dir", "vfx_dir"), n.vel_dir, 0.05f, -1, 1)) s_g.dirty = true;
-        if (ImGui::DragFloat(VFX_LBL("mag", "mag", "vfx_mag"),  &n.vel_mag, 0.05f, 0, 100)) s_g.dirty = true;
+        if (ImGui::DragFloat3(VFX_LBL("panel.vfxGraph.dir", "dir", "vfx_dir"), n.vel_dir, 0.05f, -1, 1)) s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.mag", "mag", "vfx_mag"),  &n.vel_mag, 0.05f, 0, 100)) s_g.dirty = true;
     } else if (n.type == NT_SUB_EMITTER) {
-        if (ImGui::DragInt(VFX_LBL("burst", "burst", "vfx_burst"), &n.sub_burst, 1, 0, 1000)) s_g.dirty = true;
-        if (ImGui::InputText(VFX_LBL("event", "event", "vfx_event"), n.sub_event, sizeof(n.sub_event))) s_g.dirty = true;
+        if (ImGui::DragInt(VFX_LBL("panel.vfxGraph.burst", "burst", "vfx_burst"), &n.sub_burst, 1, 0, 1000)) s_g.dirty = true;
+        if (ImGui::InputText(VFX_LBL("panel.vfxGraph.event", "event", "vfx_event"), n.sub_event, sizeof(n.sub_event))) s_g.dirty = true;
     } else if (n.type == NT_TRAIL) {
-        if (ImGui::DragFloat(VFX_LBL("len", "len", "vfx_tlen"),      &n.trail_len,   0.01f, 0, 10)) s_g.dirty = true;
-        if (ImGui::DragFloat(VFX_LBL("width", "width", "vfx_twidth"), &n.trail_width, 0.005f, 0, 5)) s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.len", "len", "vfx_tlen"),      &n.trail_len,   0.01f, 0, 10)) s_g.dirty = true;
+        if (ImGui::DragFloat(VFX_LBL("panel.vfxGraph.width", "width", "vfx_twidth"), &n.trail_width, 0.005f, 0, 5)) s_g.dirty = true;
     }
 #undef VFX_LBL
     ImGui::PopItemWidth();

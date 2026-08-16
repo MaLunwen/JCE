@@ -37,6 +37,8 @@
 #ifndef JCE_PATH_INPUT_H
 #define JCE_PATH_INPUT_H
 
+#include <jce/middleware/scene/jce_scene.h>
+#include <stdio.h>
 #include <stddef.h>
 
 enum class JcePathKind {
@@ -116,6 +118,41 @@ inline bool jce_draw_path_input_asset_dnd(const char *label, char *buf, size_t s
     o.dropped_raw       = dropped_raw;
     o.dropped_raw_size  = dropped_raw_sz;
     return jce_draw_path_input(label, buf, sz, JcePathKind::AssetVfs, &o);
+}
+
+/* Interned-field forms.
+ *
+ * Component asset paths are interned pointers (see jce_str_intern.h), so the
+ * in-place editors above cannot be pointed at them: the string is shared with
+ * every other component naming the same asset. These copy the field into a
+ * scratch buffer, run the normal widget, and re-intern only when the user
+ * actually changed something -- an untouched field keeps its pointer and adds
+ * nothing to the pool. */
+inline bool jce_draw_path_input_asset_interned(const char *label,
+                                               JceScene *scene,
+                                               const char **field,
+                                               int asset_kind = 0) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", (field && *field) ? *field : "");
+    if (!jce_draw_path_input_asset(label, buf, sizeof(buf), asset_kind))
+        return false;
+    if (field) *field = jce_scene_intern(scene, buf);
+    return true;
+}
+
+inline bool jce_draw_path_input_asset_dnd_interned(const char *label,
+                                                   JceScene *scene,
+                                                   const char **field,
+                                                   char *dropped_raw,
+                                                   size_t dropped_raw_sz,
+                                                   int asset_kind = 0) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", (field && *field) ? *field : "");
+    if (!jce_draw_path_input_asset_dnd(label, buf, sizeof(buf),
+                                       dropped_raw, dropped_raw_sz, asset_kind))
+        return false;
+    if (field) *field = jce_scene_intern(scene, buf);
+    return true;
 }
 
 #endif /* JCE_PATH_INPUT_H */

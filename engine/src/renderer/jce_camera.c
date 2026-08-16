@@ -164,6 +164,35 @@ void jce_camera_set_target(JceCamera *cam, jce_vec3 target)
     jce_camera_look_at(cam, target);
 }
 
+bool jce_camera_set_pose(JceCamera *cam, jce_vec3 position,
+                         jce_vec3 forward, jce_vec3 up)
+{
+    const float epsilon = 1.0e-6f;
+    jce_vec3 ortho_up;
+
+    if (!cam || !isfinite(position.x) || !isfinite(position.y) ||
+        !isfinite(position.z) || !isfinite(forward.x) ||
+        !isfinite(forward.y) || !isfinite(forward.z) ||
+        !isfinite(up.x) || !isfinite(up.y) || !isfinite(up.z) ||
+        jce_v3_len(forward) <= epsilon || jce_v3_len(up) <= epsilon)
+        return false;
+
+    forward = jce_v3_normalize(forward);
+    ortho_up = jce_v3_sub(up, jce_v3_scale(forward,
+        jce_v3_dot(up, forward)));
+    if (jce_v3_len(ortho_up) <= epsilon)
+        return false;
+    ortho_up = jce_v3_normalize(ortho_up);
+
+    cam->position = position;
+    cam->up_world = ortho_up;
+    cam->yaw = atan2f(forward.x, -forward.z);
+    cam->pitch = asinf(fmaxf(-1.0f, fminf(1.0f, forward.y)));
+    if (cam->pitch > MAX_PITCH) cam->pitch = MAX_PITCH;
+    if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
+    return true;
+}
+
 void jce_camera_set_fov(JceCamera *cam, float fov_deg)
 {
     if (cam && fov_deg > 0)

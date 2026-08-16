@@ -248,6 +248,54 @@ JceShaderHandle shader_load_program_fs_named(const char *dev_dir,
     return load_program_fs_named(dev_dir, vs_base, fs_base);
 }
 
+JceShaderHandle shader_load_program_overlay_named(
+    const char *dev_dir, const JcePakArchive *pak,
+    const char *vs_base, const char *fs_base)
+{
+    bgfx_shader_handle_t vsh, fsh;
+    bgfx_program_handle_t program;
+    const char *sfx;
+    char vs_path[512], fs_path[512];
+    bool vs_overlay, fs_overlay;
+
+    if (!vs_base || !fs_base) return JCE_INVALID_SHADER;
+    sfx = shader_suffix(bgfx_get_renderer_type());
+    if (!sfx) return JCE_INVALID_SHADER;
+
+    snprintf(vs_path, sizeof(vs_path),
+             "%s/shaders/vs_%s_%s.bin",
+             dev_dir ? dev_dir : "", vs_base, sfx);
+    snprintf(fs_path, sizeof(fs_path),
+             "%s/shaders/fs_%s_%s.bin",
+             dev_dir ? dev_dir : "", fs_base, sfx);
+    vs_overlay = dev_dir && dev_dir[0] && jce_fs_host_exists_file(vs_path);
+    fs_overlay = dev_dir && dev_dir[0] && jce_fs_host_exists_file(fs_path);
+
+    vsh = vs_overlay ? load_single_fs(vs_path) : (bgfx_shader_handle_t){ UINT16_MAX };
+    if (!vs_overlay) {
+        char pak_path[256];
+        snprintf(pak_path, sizeof(pak_path),
+                 "shaders/vs_%s_%s.bin", vs_base, sfx);
+        vsh = load_single(pak, pak_path);
+    }
+    if (vsh.idx == UINT16_MAX) return JCE_INVALID_SHADER;
+
+    fsh = fs_overlay ? load_single_fs(fs_path) : (bgfx_shader_handle_t){ UINT16_MAX };
+    if (!fs_overlay) {
+        char pak_path[256];
+        snprintf(pak_path, sizeof(pak_path),
+                 "shaders/fs_%s_%s.bin", fs_base, sfx);
+        fsh = load_single(pak, pak_path);
+    }
+    if (fsh.idx == UINT16_MAX) {
+        bgfx_destroy_shader(vsh);
+        return JCE_INVALID_SHADER;
+    }
+
+    program = bgfx_create_program(vsh, fsh, true);
+    return (JceShaderHandle){ program.idx };
+}
+
 JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
 {
     JCE_PROFILE_ZONE_N("Shaders::LoadAll");

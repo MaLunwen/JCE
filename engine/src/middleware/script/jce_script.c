@@ -11,364 +11,56 @@
 
 #include <jce/middleware/script/jce_script.h>
 
+/* struct JceScript, the upvalue accessor, jce_script_register_binding and the
+ * shared json_null token -- the seam the generated binding TU compiles
+ * against.  Engine-private; see the header for who else may include it. */
+#include "jce_script_internal.h"
+
+/* The 71 generated bindings + json_null.  There is one binding set now: the
+ * 71 hand-written originals were deleted with the differential harness that
+ * proved them equivalent, and this file keeps only the seven that are
+ * hand-written on purpose (script_exposure.json's hand_written[]). */
+#include "jce_script_bindings.gen.h"
+
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
 
+#include <math.h>
 #include <string.h>
 
 #define LOG_TAG "script"
+
+#define JCE_SCRIPT_JSON_MAX_DEPTH 32u
+#define JCE_SCRIPT_JSON_MAX_NODES 16384u
+
+/* The one null sentinel, declared extern in jce_script_internal.h so the
+ * generated binding TU pushes the SAME address.  Two tokens compare unequal
+ * and every script testing `v == jce.json_null` silently stops matching.
+ * test_jce_script_internal_header pins the value in the `jce` table to this
+ * object; test_jce_script_asset_json pins the JSON reader's null to the
+ * table's value.  Neither alone is sufficient -- see the header. */
+char jce_script_json_null_token;
 
 /* Re-arms the per-dispatch instruction-budget watchdog (defined below); used by
  * the coroutine + chunk paths above its definition. */
 static void script_arm_watchdog(lua_State *L);
 
-/* Coroutine scheduler slot: a Lua thread (luaL_ref'd into the registry) parked
- * on a jce.wait_seconds() timer.  thread_ref == LUA_NOREF marks a free slot. */
-#define JCE_SCRIPT_MAX_COROUTINES 256
-typedef struct {
-    int   thread_ref;   /* luaL_ref to the coroutine thread, or LUA_NOREF */
-    float remaining;    /* seconds left on the current wait */
-} JceScriptCoro;
-
-struct JceScript {
-    lua_State    *L;
-    JceScriptHost host;       /* copied; callbacks may be NULL */
-    bool          have_host;
-    int           instance_count;
-
-    /* Coroutine timer scheduler (jce.start_coroutine / jce.wait_seconds). */
-    JceScriptCoro coros[JCE_SCRIPT_MAX_COROUTINES];
-    int           coro_count;  /* high-water bound for iteration */
-};
-
-/* ── Host accessor ─────────────────────────────────────────────────────── */
-/* Each jce.* binding is a C closure carrying the JceScript* as upvalue 1. */
-static JceScript *self_from_upvalue(lua_State *L)
-{
-    return (JceScript *)lua_touserdata(L, lua_upvalueindex(1));
-}
-
 /* ── jce.* bindings ─────────────────────────────────────────────────────── */
 
 static int l_jce_log(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
+    JceScript *s = jce_script_self_from_upvalue(L);
     const char *msg = luaL_optstring(L, 1, "");
     if (s->have_host && s->host.log)
         s->host.log(s->host.user, msg);
     else
         LOG_INFO(LOG_TAG, "[lua] %s", msg);
     return 0;
-}
-
-static int l_jce_get_position(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float p[3];
-    if (s->have_host && s->host.get_position &&
-        s->host.get_position(s->host.user, e, p)) {
-        lua_pushnumber(L, (lua_Number)p[0]);
-        lua_pushnumber(L, (lua_Number)p[1]);
-        lua_pushnumber(L, (lua_Number)p[2]);
-        return 3;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static int l_jce_set_position(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.set_position)
-        s->host.set_position(s->host.user, e, x, y, z);
-    return 0;
-}
-
-static int l_jce_set_parent(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity child = (JceScriptEntity)luaL_checkinteger(L, 1);
-    JceScriptEntity parent = (JceScriptEntity)luaL_checkinteger(L, 2);
-    luaL_checktype(L, 3, LUA_TBOOLEAN);
-    bool preserve_world = lua_toboolean(L, 3) != 0;
-    bool applied = s->have_host && s->host.set_parent &&
-        s->host.set_parent(s->host.user, child, parent, preserve_world);
-    lua_pushboolean(L, applied ? 1 : 0);
-    return 1;
-}
-
-static int l_jce_get_parent(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity child = (JceScriptEntity)luaL_checkinteger(L, 1);
-    JceScriptEntity parent = s->have_host && s->host.get_parent
-        ? s->host.get_parent(s->host.user, child)
-        : 0;
-    lua_pushinteger(L, (lua_Integer)parent);
-    return 1;
-}
-
-static int l_jce_is_key_down(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    int keycode = (int)luaL_checkinteger(L, 1);
-    bool down = (s->have_host && s->host.is_key_down)
-                    ? s->host.is_key_down(s->host.user, keycode)
-                    : false;
-    lua_pushboolean(L, down ? 1 : 0);
-    return 1;
-}
-
-static int l_jce_set_time_scale(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float scale = (float)luaL_checknumber(L, 1);
-    if (s->have_host && s->host.set_time_scale)
-        s->host.set_time_scale(s->host.user, scale);
-    return 0;
-}
-
-static int l_jce_pause(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    /* jce.pause()        -> pause (default true)
-       jce.pause(false)   -> resume */
-    bool paused = lua_isnoneornil(L, 1) ? true : lua_toboolean(L, 1);
-    if (s->have_host && s->host.set_paused)
-        s->host.set_paused(s->host.user, paused);
-    return 0;
-}
-
-static int l_jce_shake_camera(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    /* jce.shake_camera(amount) -- amount defaults to a solid 0.5 hit. */
-    float amount = (float)luaL_optnumber(L, 1, 0.5);
-    if (s->have_host && s->host.shake_camera)
-        s->host.shake_camera(s->host.user, amount);
-    return 0;
-}
-
-/* jce.music_set_intensity(value) -- set adaptive-music intensity (0..1). */
-static int l_jce_music_set_intensity(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float v = (float)luaL_checknumber(L, 1);
-    if (s->have_host && s->host.music_set_intensity)
-        s->host.music_set_intensity(s->host.user, v);
-    return 0;
-}
-
-/* jce.music_get_intensity() -> number : current intensity (0 when no track). */
-static int l_jce_music_get_intensity(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float v = (s->have_host && s->host.music_get_intensity)
-              ? s->host.music_get_intensity(s->host.user) : 0.0f;
-    lua_pushnumber(L, v);
-    return 1;
-}
-
-/* jce.music_request_transition(segment) -> number : the absolute playhead time
- * the beat/bar-quantized switch will fire (negative on miss / no track). */
-static int l_jce_music_request_transition(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    int seg = (int)luaL_checkinteger(L, 1);
-    float when = (s->have_host && s->host.music_request_transition)
-                 ? s->host.music_request_transition(s->host.user, seg) : -1.0f;
-    lua_pushnumber(L, when);
-    return 1;
-}
-
-/* jce.gas_activate(entity, ability_id) -> bool
- * Fire the named ability on the entity's live GAS (cost + cooldown gated). */
-static int l_jce_gas_activate(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    uint32_t ability_id = (uint32_t)luaL_checkinteger(L, 2);
-    bool ok = (s->have_host && s->host.gas_activate)
-                  ? s->host.gas_activate(s->host.user, e, ability_id) : false;
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-/* jce.gas_get(entity, attr_name) -> number | nil
- * Read the CURRENT (clamped, modifier-folded) value of an attribute. */
-static int l_jce_gas_get(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    float v = 0.0f;
-    if (s->have_host && s->host.gas_get &&
-        s->host.gas_get(s->host.user, e, name, &v)) {
-        lua_pushnumber(L, (lua_Number)v);
-        return 1;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-/* jce.gas_apply(entity, attr_name, op, magnitude [, duration]) -> bool
- * op: 0=add 1=mult 2=override.  duration<=0 (or omitted) => INSTANT to base
- * (instant damage/heal); duration>0 => a continuous TIMED modifier. */
-static int l_jce_gas_apply(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    int   op  = (int)luaL_optinteger(L, 3, 0);
-    float mag = (float)luaL_checknumber(L, 4);
-    float dur = (float)luaL_optnumber(L, 5, 0.0);
-    bool ok = (s->have_host && s->host.gas_apply)
-                  ? s->host.gas_apply(s->host.user, e, name, op, mag, dur)
-                  : false;
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-/* jce.raycast(ox,oy,oz, dx,dy,dz, max_dist)
- *   -> hit_entity, px,py,pz, nx,ny,nz, dist   (8 values on a hit)
- *   -> 0                                        (single value on a miss)
- * Cast a ray through the live physics world; the host maps the hit body back
- * to its entity id (0 if untagged). */
-static int l_jce_raycast(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float origin[3], dir[3];
-    origin[0] = (float)luaL_checknumber(L, 1);
-    origin[1] = (float)luaL_checknumber(L, 2);
-    origin[2] = (float)luaL_checknumber(L, 3);
-    dir[0]    = (float)luaL_checknumber(L, 4);
-    dir[1]    = (float)luaL_checknumber(L, 5);
-    dir[2]    = (float)luaL_checknumber(L, 6);
-    float max_dist = (float)luaL_checknumber(L, 7);
-
-    JceScriptRaycastHit hit;
-    memset(&hit, 0, sizeof hit);
-    if (s->have_host && s->host.raycast &&
-        s->host.raycast(s->host.user, origin, dir, max_dist, &hit)) {
-        lua_pushinteger(L, (lua_Integer)hit.entity);
-        lua_pushnumber(L, (lua_Number)hit.point[0]);
-        lua_pushnumber(L, (lua_Number)hit.point[1]);
-        lua_pushnumber(L, (lua_Number)hit.point[2]);
-        lua_pushnumber(L, (lua_Number)hit.normal[0]);
-        lua_pushnumber(L, (lua_Number)hit.normal[1]);
-        lua_pushnumber(L, (lua_Number)hit.normal[2]);
-        lua_pushnumber(L, (lua_Number)hit.distance);
-        return 8;
-    }
-    lua_pushinteger(L, 0);   /* miss → single 0 */
-    return 1;
-}
-
-/* jce.apply_impulse(entity, x,y,z): add an instantaneous impulse. */
-static int l_jce_apply_impulse(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.apply_impulse)
-        s->host.apply_impulse(s->host.user, e, x, y, z);
-    return 0;
-}
-
-/* jce.set_velocity(entity, x,y,z): set the body's linear velocity (m/s). */
-static int l_jce_set_velocity(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.set_velocity)
-        s->host.set_velocity(s->host.user, e, x, y, z);
-    return 0;
-}
-
-/* jce.anim_set_float(entity, name, v) — set an animator SM float param. */
-static int l_jce_anim_set_float(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    float v = (float)luaL_checknumber(L, 3);
-    if (s->have_host && s->host.anim_set_float) s->host.anim_set_float(s->host.user, e, name, v);
-    return 0;
-}
-/* jce.anim_set_int(entity, name, v) — set an animator SM int param. */
-static int l_jce_anim_set_int(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    int v = (int)luaL_checkinteger(L, 3);
-    if (s->have_host && s->host.anim_set_int) s->host.anim_set_int(s->host.user, e, name, v);
-    return 0;
-}
-/* jce.anim_set_bool(entity, name, on) — set an animator SM bool param. */
-static int l_jce_anim_set_bool(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    bool v = lua_toboolean(L, 3) != 0;
-    if (s->have_host && s->host.anim_set_bool) s->host.anim_set_bool(s->host.user, e, name, v);
-    return 0;
-}
-/* jce.anim_set_trigger(entity, name) — fire a one-shot animator SM trigger. */
-static int l_jce_anim_set_trigger(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    if (s->have_host && s->host.anim_set_trigger) s->host.anim_set_trigger(s->host.user, e, name);
-    return 0;
-}
-
-/* jce.is_action_down(name) -> bool : is the named input action held this frame
- * (data-driven action map; false when unbound/unknown). */
-static int l_jce_is_action_down(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *name = luaL_checkstring(L, 1);
-    bool down = (s->have_host && s->host.action_down)
-                ? s->host.action_down(s->host.user, name) : false;
-    lua_pushboolean(L, down);
-    return 1;
-}
-/* jce.is_action_pressed(name) -> bool : did the named action go down THIS frame. */
-static int l_jce_is_action_pressed(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *name = luaL_checkstring(L, 1);
-    bool pressed = (s->have_host && s->host.action_pressed)
-                   ? s->host.action_pressed(s->host.user, name) : false;
-    lua_pushboolean(L, pressed);
-    return 1;
-}
-/* jce.get_axis(name) -> number : analog value of the named action (0 if none). */
-static int l_jce_get_axis(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *name = luaL_checkstring(L, 1);
-    float v = (s->have_host && s->host.action_axis)
-              ? s->host.action_axis(s->host.user, name) : 0.0f;
-    lua_pushnumber(L, v);
-    return 1;
 }
 
 static bool script_virtual_asset_path_valid(const char *path)
@@ -402,9 +94,9 @@ static bool script_virtual_asset_path_valid(const char *path)
 
 static int l_jce_asset_read_text(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
+    JceScript *s = jce_script_self_from_upvalue(L);
     const char *path = luaL_checkstring(L, 1);
-    uint64_t size = 0;
+    uint64_t size = JCE_SCRIPT_TEXT_ASSET_MAX_BYTES;
     void *bytes;
 
     if (!script_virtual_asset_path_valid(path) || !s->have_host ||
@@ -423,138 +115,150 @@ static int l_jce_asset_read_text(lua_State *L)
     return 1;
 }
 
-/* Raw pointer input.  Button numbering follows the platform API (1 = left). */
-static int l_jce_get_pointer_delta(lua_State *L)
+static int script_json_fail(lua_State *L, const char *code)
 {
-    JceScript *s = self_from_upvalue(L);
-    float d[2] = { 0.0f, 0.0f };
-    if (s->have_host && s->host.pointer_delta)
-        s->host.pointer_delta(s->host.user, d);
-    lua_pushnumber(L, (lua_Number)d[0]);
-    lua_pushnumber(L, (lua_Number)d[1]);
+    lua_pushnil(L);
+    lua_pushstring(L, code);
     return 2;
 }
 
-static int l_jce_get_pointer_wheel(lua_State *L)
+static bool script_json_push_value(lua_State *L, const JceJson *node,
+                                   uint32_t depth, uint32_t *node_count,
+                                   const char **out_error)
 {
-    JceScript *s = self_from_upvalue(L);
-    float wheel = (s->have_host && s->host.pointer_wheel)
-                  ? s->host.pointer_wheel(s->host.user) : 0.0f;
-    lua_pushnumber(L, (lua_Number)wheel);
-    return 1;
-}
-
-static int l_jce_is_pointer_down(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    int button = (int)luaL_checkinteger(L, 1);
-    bool down = (s->have_host && s->host.pointer_button)
-                ? s->host.pointer_button(s->host.user, button) : false;
-    lua_pushboolean(L, down);
-    return 1;
-}
-
-static int l_jce_get_touch_count(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    int count = (s->have_host && s->host.touch_count)
-                ? s->host.touch_count(s->host.user) : 0;
-    if (count < 0)
-        count = 0;
-    lua_pushinteger(L, (lua_Integer)count);
-    return 1;
-}
-
-static int l_jce_get_touch(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    lua_Integer lua_index = luaL_checkinteger(L, 1);
-    uint64_t id = 0;
-    float x = 0.0f;
-    float y = 0.0f;
-    float pressure = 0.0f;
-
-    if (lua_index < 1 || !s->have_host || !s->host.touch_get ||
-        !s->host.touch_get(s->host.user, (int)(lua_index - 1), &id,
-                           &x, &y, &pressure)) {
-        lua_pushnil(L);
-        return 1;
+    if (!node) {
+        *out_error = "invalid_json";
+        return false;
     }
-    lua_pushinteger(L, (lua_Integer)id);
-    lua_pushnumber(L, (lua_Number)x);
-    lua_pushnumber(L, (lua_Number)y);
-    lua_pushnumber(L, (lua_Number)pressure);
-    return 4;
+    if (depth > JCE_SCRIPT_JSON_MAX_DEPTH) {
+        *out_error = "depth_limit";
+        return false;
+    }
+    if (++(*node_count) > JCE_SCRIPT_JSON_MAX_NODES) {
+        *out_error = "node_limit";
+        return false;
+    }
+
+    if (jce_json_is_object(node)) {
+        lua_newtable(L);
+        for (JceJson *it = jce_json_first_child(node); it;
+             it = jce_json_next_sibling(it)) {
+            const char *key = jce_json_member_key(it);
+
+            if (!key) {
+                lua_pop(L, 1);
+                *out_error = "invalid_json";
+                return false;
+            }
+            lua_getfield(L, -1, key);
+            if (!lua_isnil(L, -1)) {
+                lua_pop(L, 2);
+                *out_error = "duplicate_key";
+                return false;
+            }
+            lua_pop(L, 1);
+            if (!script_json_push_value(L, it, depth + 1u, node_count,
+                                        out_error)) {
+                lua_pop(L, 1);
+                return false;
+            }
+            lua_setfield(L, -2, key);
+        }
+        return true;
+    }
+    if (jce_json_is_array(node)) {
+        int count = jce_json_array_size(node);
+
+        lua_createtable(L, count, 0);
+        for (int i = 0; i < count; ++i) {
+            if (!script_json_push_value(L, jce_json_array_at(node, i),
+                                        depth + 1u, node_count, out_error)) {
+                lua_pop(L, 1);
+                return false;
+            }
+            lua_rawseti(L, -2, (lua_Integer)i + 1);
+        }
+        return true;
+    }
+    if (jce_json_is_string(node)) {
+        lua_pushstring(L, jce_json_string_value(node, ""));
+        return true;
+    }
+    if (jce_json_is_number(node)) {
+        double value = jce_json_number_value(node, 0.0);
+
+        if (!isfinite(value)) {
+            *out_error = "invalid_number";
+            return false;
+        }
+        lua_pushnumber(L, (lua_Number)value);
+        return true;
+    }
+    if (jce_json_is_bool(node)) {
+        lua_pushboolean(L, jce_json_bool_value(node, false));
+        return true;
+    }
+    if (jce_json_is_null(node)) {
+        lua_pushlightuserdata(L, &jce_script_json_null_token);
+        return true;
+    }
+    *out_error = "invalid_json";
+    return false;
 }
 
-/* jce.get_velocity(entity) -> x,y,z | nil (nil when the entity has no body). */
-static int l_jce_get_velocity(lua_State *L)
+static int l_jce_asset_read_json(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float v[3];
-    if (s->have_host && s->host.get_velocity &&
-        s->host.get_velocity(s->host.user, e, v)) {
-        lua_pushnumber(L, (lua_Number)v[0]);
-        lua_pushnumber(L, (lua_Number)v[1]);
-        lua_pushnumber(L, (lua_Number)v[2]);
-        return 3;
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *path = luaL_checkstring(L, 1);
+    uint64_t size = JCE_SCRIPT_TEXT_ASSET_MAX_BYTES;
+    const char *error = NULL;
+    uint32_t node_count = 0;
+    JceJson *root;
+    void *bytes;
+
+    if (!script_virtual_asset_path_valid(path))
+        return script_json_fail(L, "invalid_path");
+    if (!s->have_host || !s->host.read_file)
+        return script_json_fail(L, "not_found");
+
+    bytes = s->host.read_file(s->host.user, path, &size);
+    if (size > JCE_SCRIPT_TEXT_ASSET_MAX_BYTES) {
+        jce_free(bytes);
+        return script_json_fail(L, "too_large");
     }
+    if (!bytes || size == 0u) {
+        jce_free(bytes);
+        return script_json_fail(L, "not_found");
+    }
+    root = jce_json_parse_strict((const char *)bytes, (size_t)size);
+    jce_free(bytes);
+    if (!root)
+        return script_json_fail(L, "invalid_json");
+    if (!jce_json_is_object(root) && !jce_json_is_array(root)) {
+        jce_json_free(root);
+        return script_json_fail(L, "invalid_root");
+    }
+    if (!script_json_push_value(L, root, 1u, &node_count, &error)) {
+        jce_json_free(root);
+        return script_json_fail(L, error ? error : "invalid_json");
+    }
+    jce_json_free(root);
     lua_pushnil(L);
-    return 1;
+    return 2;
 }
 
-/* jce.vehicle_set_input(entity, throttle, brake, steer): drive an authored
- * Vehicle (SCRIPT input mode).  throttle/brake in [0..1] (throttle <0 = reverse),
- * steer in [-1..1].  No-op if the entity has no live vehicle. */
-static int l_jce_vehicle_set_input(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float throttle = (float)luaL_checknumber(L, 2);
-    float brake    = (float)luaL_checknumber(L, 3);
-    float steer    = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.vehicle_set_input)
-        s->host.vehicle_set_input(s->host.user, e, throttle, brake, steer);
-    return 0;
-}
-
-/* jce.vehicle_get_speed(entity) -> number : signed forward speed (m/s), 0 if no
- * live vehicle. */
-static int l_jce_vehicle_get_speed(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float spd = (s->have_host && s->host.vehicle_get_speed)
-                ? s->host.vehicle_get_speed(s->host.user, e) : 0.0f;
-    lua_pushnumber(L, (lua_Number)spd);
-    return 1;
-}
-
-/* jce.get_move() -> steer, throttle, brake : raw movement intent the host fed
- * this frame (steer/throttle in [-1..1], brake 0/1).  Lets a script read WASD
- * without an authored action map. */
-static int l_jce_get_move(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float m[3] = { 0.0f, 0.0f, 0.0f };
-    if (s->have_host && s->host.get_move) s->host.get_move(s->host.user, m);
-    lua_pushnumber(L, (lua_Number)m[0]);
-    lua_pushnumber(L, (lua_Number)m[1]);
-    lua_pushnumber(L, (lua_Number)m[2]);
-    return 3;
-}
-
-/* jce.play_sound(path [, x,y,z] [, volume])
+/* jce.play_sound(path [, x,y,z] [, volume [, min,max,rolloff]])
  *   path required.  Optional 3 coords make it positional (3D); optional final
- *   number is the volume (default 1.0).  Arities supported:
+ *   numbers configure volume and 3D attenuation.  Arities supported:
  *     play_sound(path)                  -> 2D, vol 1.0
  *     play_sound(path, vol)             -> 2D, vol
  *     play_sound(path, x,y,z)           -> 3D, vol 1.0
- *     play_sound(path, x,y,z, vol)      -> 3D, vol */
+ *     play_sound(path, x,y,z, vol)      -> 3D, default attenuation
+ *     play_sound(path, x,y,z, vol,
+ *                min,max,rolloff)       -> 3D, authored attenuation */
 static int l_jce_play_sound(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
+    JceScript *s = jce_script_self_from_upvalue(L);
     const char *path = luaL_checkstring(L, 1);
     int top = lua_gettop(L);
 
@@ -575,453 +279,17 @@ static int l_jce_play_sound(lua_State *L)
     }
     /* top == 1 (or 3, ambiguous) => 2D default volume. */
 
-    if (s->have_host && s->host.play_sound)
+    if (s->have_host && pos_ptr && top >= 8 && s->host.play_sound_spatial) {
+        float min_distance = (float)luaL_checknumber(L, 6);
+        float max_distance = (float)luaL_checknumber(L, 7);
+        float rolloff = (float)luaL_checknumber(L, 8);
+        s->host.play_sound_spatial(s->host.user, path, pos_ptr, volume,
+                                   min_distance, max_distance, rolloff);
+    } else if (s->have_host && s->host.play_sound) {
         s->host.play_sound(s->host.user, path, pos_ptr, volume);
-    return 0;
-}
-
-/* jce.ui_get_slider(entity) -> number | nil */
-static int l_jce_ui_get_slider(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float v = 0.0f;
-    if (s->have_host && s->host.ui_get_slider &&
-        s->host.ui_get_slider(s->host.user, e, &v)) {
-        lua_pushnumber(L, (lua_Number)v);
-        return 1;
     }
-    lua_pushnil(L);
-    return 1;
-}
-
-/* jce.ui_set_slider(entity, value) */
-static int l_jce_ui_set_slider(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float v = (float)luaL_checknumber(L, 2);
-    if (s->have_host && s->host.ui_set_slider)
-        s->host.ui_set_slider(s->host.user, e, v);
     return 0;
 }
-
-/* jce.ui_get_toggle(entity) -> bool | nil */
-static int l_jce_ui_get_toggle(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    bool on = false;
-    if (s->have_host && s->host.ui_get_toggle &&
-        s->host.ui_get_toggle(s->host.user, e, &on)) {
-        lua_pushboolean(L, on ? 1 : 0);
-        return 1;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-/* jce.ui_set_toggle(entity, on) */
-static int l_jce_ui_set_toggle(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    bool on = lua_toboolean(L, 2) ? true : false;
-    if (s->have_host && s->host.ui_set_toggle)
-        s->host.ui_set_toggle(s->host.user, e, on);
-    return 0;
-}
-
-/* jce.ui_set_text(entity, str) */
-static int l_jce_ui_set_text(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *txt = luaL_checkstring(L, 2);
-    if (s->have_host && s->host.ui_set_text)
-        s->host.ui_set_text(s->host.user, e, txt);
-    return 0;
-}
-
-/* jce.send_message(target_entity, msg [, number] [, string])
- * Deliver a message to another entity's live script (decoupled gameplay comms):
- * calls method `msg` on the target's instance with the (number, string) payload.
- * `number` defaults to 0; `string` is optional (omitted/non-string -> nil on the
- * receiver side).  No return value; a no-op when no host / no send_message
- * callback / the target has no matching handler. */
-static int l_jce_send_message(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity target = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *msg = luaL_checkstring(L, 2);
-    double num = luaL_optnumber(L, 3, 0.0);
-    const char *str = lua_isstring(L, 4) ? lua_tostring(L, 4) : NULL;
-    if (s->have_host && s->host.send_message)
-        s->host.send_message(s->host.user, target, msg, num, str);
-    return 0;
-}
-
-static int l_jce_broadcast(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *msg = luaL_checkstring(L, 1);
-    double num = luaL_optnumber(L, 2, 0.0);
-    const char *str = lua_isstring(L, 3) ? lua_tostring(L, 3) : NULL;
-    if (s->have_host && s->host.broadcast)
-        s->host.broadcast(s->host.user, msg, num, str);
-    return 0;
-}
-
-static int l_jce_has_component(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    bool has = (s->have_host && s->host.has_component)
-                   ? s->host.has_component(s->host.user, e, name) : false;
-    lua_pushboolean(L, has ? 1 : 0);
-    return 1;
-}
-
-static int l_jce_is_component_enabled(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    bool on = (s->have_host && s->host.is_component_enabled)
-                  ? s->host.is_component_enabled(s->host.user, e, name) : false;
-    lua_pushboolean(L, on ? 1 : 0);
-    return 1;
-}
-
-static int l_jce_set_component_enabled(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *name = luaL_checkstring(L, 2);
-    bool on = lua_toboolean(L, 3) ? true : false;
-    if (s->have_host && s->host.set_component_enabled)
-        s->host.set_component_enabled(s->host.user, e, name, on);
-    return 0;
-}
-
-/* jce.net_is_server() -> bool
- * True when the live replication role is the authoritative server; false (the
- * safe default) with no host / no net_is_server callback. */
-static int l_jce_net_is_server(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    bool v = (s->have_host && s->host.net_is_server)
-                 ? s->host.net_is_server(s->host.user) : false;
-    lua_pushboolean(L, v ? 1 : 0);
-    return 1;
-}
-
-/* jce.net_is_client() -> bool
- * True when the live role is a connected client; false (the safe default) with
- * no host / no net_is_client callback. */
-static int l_jce_net_is_client(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    bool v = (s->have_host && s->host.net_is_client)
-                 ? s->host.net_is_client(s->host.user) : false;
-    lua_pushboolean(L, v ? 1 : 0);
-    return 1;
-}
-
-/* jce.net_spawn(prefab_path, x, y, z) -> entity
- * Server-authoritative networked spawn of a prefab at world (x,y,z); returns the
- * spawned NetworkObject's backing entity id, or 0 on a client / failure / no
- * host. */
-static int l_jce_net_spawn(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *path = luaL_checkstring(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    JceScriptEntity e = (s->have_host && s->host.net_spawn)
-                            ? s->host.net_spawn(s->host.user, path, x, y, z) : 0;
-    lua_pushinteger(L, (lua_Integer)e);
-    return 1;
-}
-
-static int l_jce_rpc_send(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *event = luaL_checkstring(L, 2);
-    int target = (int)luaL_optinteger(L, 3, 0);              /* default TO_SERVER */
-    const char *payload = lua_isstring(L, 4) ? lua_tostring(L, 4) : NULL;
-    bool ok = (s->have_host && s->host.rpc_send)
-                  ? s->host.rpc_send(s->host.user, e, event, target, payload)
-                  : false;
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-/* jce.particle_burst(entity, count)
- * Fire a one-shot burst of `count` particles from the entity's emitter; a no-op
- * with no host / no callback / no particle emitter on the entity. */
-static int l_jce_particle_burst(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    int count = (int)luaL_checkinteger(L, 2);
-    if (s->have_host && s->host.particle_burst)
-        s->host.particle_burst(s->host.user, e, count);
-    return 0;
-}
-
-/* jce.particle_set_emitting(entity, on)
- * Start (`on`) / stop (!on) the entity emitter's continuous emission; a no-op
- * with no host / no callback / no particle emitter on the entity. */
-static int l_jce_particle_set_emitting(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    bool on = lua_toboolean(L, 2) ? true : false;
-    if (s->have_host && s->host.particle_set_emitting)
-        s->host.particle_set_emitting(s->host.user, e, on);
-    return 0;
-}
-
-/* jce.particle_set_color(entity, r, g, b)
- * Retint the entity emitter's newly-spawned particles; no-op with no host /
- * callback / emitter. */
-static int l_jce_particle_set_color(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float r = (float)luaL_checknumber(L, 2);
-    float g = (float)luaL_checknumber(L, 3);
-    float b = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.particle_set_color)
-        s->host.particle_set_color(s->host.user, e, r, g, b);
-    return 0;
-}
-
-/* ── Scene-driver bindings (editor-Play/runtime logic parity) ──────────── */
-
-/* jce.find_by_name(name) -> entity | nil, match_count
- * The second result lets strict scene directors reject duplicate authored
- * names. Existing callers that consume only the first result remain valid. */
-static int l_jce_find_by_name(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *name = luaL_checkstring(L, 1);
-    JceScriptEntity found[2] = {0, 0};
-    int count = 0;
-    if (s->have_host && s->host.find_by_name)
-        count = s->host.find_by_name(s->host.user, name, found, 2);
-    if (count > 0)
-        lua_pushinteger(L, (lua_Integer)found[0]);
-    else
-        lua_pushnil(L);
-    lua_pushinteger(L, (lua_Integer)count);
-    return 2;
-}
-
-/* jce.find_by_prefix(prefix) -> array of entities (may be empty) */
-static int l_jce_find_by_prefix(lua_State *L)
-{
-    enum { FBP_MAX = 1024 };
-    JceScript *s = self_from_upvalue(L);
-    const char *prefix = luaL_checkstring(L, 1);
-    JceScriptEntity found[FBP_MAX];
-    int n = 0;
-    if (s->have_host && s->host.find_by_prefix)
-        n = s->host.find_by_prefix(s->host.user, prefix, found, FBP_MAX);
-    lua_createtable(L, n, 0);
-    for (int i = 0; i < n; i++) {
-        lua_pushinteger(L, (lua_Integer)found[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    return 1;
-}
-
-/* jce.comp_get(entity, "Water") -> json string | nil */
-static int l_jce_comp_get(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *type = luaL_checkstring(L, 2);
-    char *json = NULL;
-    if (s->have_host && s->host.comp_get_json)
-        json = s->host.comp_get_json(s->host.user, e, type);
-    if (json) {
-        lua_pushstring(L, json);
-        if (s->host.json_free) s->host.json_free(s->host.user, json);
-    } else {
-        lua_pushnil(L);
-    }
-    return 1;
-}
-
-/* jce.comp_set(entity, "Water", json_string) -> bool */
-static int l_jce_comp_set(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    const char *type = luaL_checkstring(L, 2);
-    const char *json = luaL_checkstring(L, 3);
-    bool ok = false;
-    if (s->have_host && s->host.comp_set_json)
-        ok = s->host.comp_set_json(s->host.user, e, type, json);
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-/* jce.render_get() -> json string | nil (scene rendering settings) */
-static int l_jce_render_get(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    char *json = NULL;
-    if (s->have_host && s->host.render_get_json)
-        json = s->host.render_get_json(s->host.user);
-    if (json) {
-        lua_pushstring(L, json);
-        if (s->host.json_free) s->host.json_free(s->host.user, json);
-    } else {
-        lua_pushnil(L);
-    }
-    return 1;
-}
-
-/* jce.render_set(json_patch) -> bool (merge: absent keys keep current) */
-static int l_jce_render_set(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *json = luaL_checkstring(L, 1);
-    bool ok = false;
-    if (s->have_host && s->host.render_set_json)
-        ok = s->host.render_set_json(s->host.user, json);
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-/* jce.audio_set_volume(entity, volume) — live AudioSource voice volume
- * (looping soundscapes; also the base the occlusion pass attenuates). */
-static int l_jce_audio_set_volume(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float vol = (float)luaL_checknumber(L, 2);
-    if (s->have_host && s->host.audio_set_volume)
-        s->host.audio_set_volume(s->host.user, e, vol);
-    return 0;
-}
-
-static int l_jce_get_rotation(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float r[3];
-    if (s->have_host && s->host.get_rotation &&
-        s->host.get_rotation(s->host.user, e, r)) {
-        lua_pushnumber(L, (lua_Number)r[0]);
-        lua_pushnumber(L, (lua_Number)r[1]);
-        lua_pushnumber(L, (lua_Number)r[2]);
-        return 3;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static int l_jce_set_rotation(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.set_rotation)
-        s->host.set_rotation(s->host.user, e, x, y, z);
-    return 0;
-}
-
-static int l_jce_get_scale(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float v[3];
-    if (s->have_host && s->host.get_scale &&
-        s->host.get_scale(s->host.user, e, v)) {
-        lua_pushnumber(L, (lua_Number)v[0]);
-        lua_pushnumber(L, (lua_Number)v[1]);
-        lua_pushnumber(L, (lua_Number)v[2]);
-        return 3;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static int l_jce_set_scale(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    float x = (float)luaL_checknumber(L, 2);
-    float y = (float)luaL_checknumber(L, 3);
-    float z = (float)luaL_checknumber(L, 4);
-    if (s->have_host && s->host.set_scale)
-        s->host.set_scale(s->host.user, e, x, y, z);
-    return 0;
-}
-
-static int l_jce_find_with_tag(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *tag = luaL_checkstring(L, 1);
-    JceScriptEntity e = (s->have_host && s->host.find_with_tag)
-                            ? s->host.find_with_tag(s->host.user, tag) : 0;
-    lua_pushinteger(L, (lua_Integer)e);
-    return 1;
-}
-
-static int l_jce_destroy(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
-    if (s->have_host && s->host.destroy_entity)
-        s->host.destroy_entity(s->host.user, e);
-    return 0;
-}
-
-static int l_jce_spawn(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    const char *path = luaL_checkstring(L, 1);
-    float x = (float)luaL_optnumber(L, 2, 0.0);
-    float y = (float)luaL_optnumber(L, 3, 0.0);
-    float z = (float)luaL_optnumber(L, 4, 0.0);
-    JceScriptEntity e = (s->have_host && s->host.spawn)
-                            ? s->host.spawn(s->host.user, path, x, y, z) : 0;
-    lua_pushinteger(L, (lua_Integer)e);
-    return 1;
-}
-
-static int l_jce_move_axis(lua_State *L)
-{
-    JceScript *s = self_from_upvalue(L);
-    float xz[2] = { 0.0f, 0.0f };
-    if (s->have_host && s->host.move_axis)
-        s->host.move_axis(s->host.user, xz);
-    lua_pushnumber(L, (lua_Number)xz[0]);
-    lua_pushnumber(L, (lua_Number)xz[1]);
-    return 2;
-}
-
-static int l_jce_input_button(lua_State *L, int which)
-{
-    JceScript *s = self_from_upvalue(L);
-    bool down = (s->have_host && s->host.input_button)
-                    ? s->host.input_button(s->host.user, which) : false;
-    lua_pushboolean(L, down ? 1 : 0);
-    return 1;
-}
-static int l_jce_jump_pressed(lua_State *L) { return l_jce_input_button(L, 0); }
-static int l_jce_sprint(lua_State *L)       { return l_jce_input_button(L, 1); }
-static int l_jce_attack_pressed(lua_State *L){ return l_jce_input_button(L, 2); }
 
 /* ── Coroutine timer scheduler (jce.start_coroutine / wait_seconds) ────────
  *
@@ -1045,7 +313,7 @@ static int coro_alloc_slot(JceScript *s)
 
 static int l_jce_start_coroutine(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
+    JceScript *s = jce_script_self_from_upvalue(L);
     luaL_checktype(L, 1, LUA_TFUNCTION);
 
     /* New thread on the MAIN state so the registry ref keeps it alive even when
@@ -1098,7 +366,7 @@ static int l_jce_wait_seconds(lua_State *L)
 
 static int l_jce_stop_coroutine(lua_State *L)
 {
-    JceScript *s = self_from_upvalue(L);
+    JceScript *s = jce_script_self_from_upvalue(L);
     int handle = (int)luaL_optinteger(L, 1, 0);
     if (handle != 0 && handle != LUA_NOREF) {
         for (int i = 0; i < s->coro_count; ++i) {
@@ -1112,95 +380,66 @@ static int l_jce_stop_coroutine(lua_State *L)
     return 0;
 }
 
-/* Register one closure carrying `s` as upvalue into the table on top. */
-static void register_binding(lua_State *L, JceScript *s,
-                             const char *name, lua_CFunction fn)
+/* Register one closure carrying `s` as upvalue into the table on top.
+ * Extern (declared in jce_script_internal.h) because the generated binding TU
+ * registers through this same helper. */
+void jce_script_register_binding(lua_State *L, JceScript *s,
+                                 const char *name, lua_CFunction fn)
 {
     lua_pushlightuserdata(L, s);
     lua_pushcclosure(L, fn, 1);
     lua_setfield(L, -2, name);
 }
 
+/* The call sites below keep the short spelling.  Concrete reason, not taste:
+ * _REGISTER_RE in tools/scriptgen/gen_script_bindings.py matches the call
+ * shape verbatim -- in BOTH translation units, since it is a substring of the
+ * generated TU's jce_script_register_binding( -- and a rename here would
+ * blind condition 5 on the seven names this file still owns.  The macro is
+ * undefined right after the installer so it cannot leak into anything the
+ * generated TU shares.
+ *
+ * That regex scans the whole file, comments included -- spelling the call
+ * shape out in prose here made the gate report an extra binding named after
+ * the placeholder, which is why this paragraph describes it instead. */
+#define register_binding(L, s, n, f) jce_script_register_binding((L), (s), (n), (f))
+
+/* The one `jce` table: 71 generated functions + json_null out of
+ * jce_script_bindings.gen.c, then the seven that stay hand-written.
+ *
+ * The 71 hand-written originals were deleted in the commit that retired the
+ * differential harness, so nothing here compares two implementations any
+ * more.  What keeps this table honest instead:
+ *   - gen_script_bindings.py condition 5, registration parity, which reads
+ *     BOTH this file and jce_script_bindings.gen.c and fails in either
+ *     direction (registered-but-unnamed, named-but-unregistered);
+ *   - tests/middleware/script/test_jce_script_table_shape.c, the 79 keys
+ *     hand-authored and read out of a live VM with pairs(), which is the only
+ *     check that can see jce.json_null at all;
+ *   - test_jce_script_internal_header.c, which counts those keys again from C
+ *     through a TU that includes only the private header. */
 static void install_bindings(JceScript *s)
 {
     lua_State *L = s->L;
     lua_newtable(L);                         /* the `jce` table */
-    register_binding(L, s, "log",            l_jce_log);
+    jce_script_install_generated_bindings(s);   /* 71 functions + json_null */
+    /* The seven that are hand-written permanently.  Their reasons live in
+     * script_exposure.json's hand_written[]; asset_read_text and
+     * asset_read_json are hand-written FOREVER, because a generated
+     * read_file template emits no path validator, no size cap and no bounded
+     * JSON walker -- a generated sandbox escape.  Condition 5 of the gate
+     * fails if anyone marks them otherwise. */
+    register_binding(L, s, "log",             l_jce_log);
     register_binding(L, s, "asset_read_text", l_jce_asset_read_text);
-    register_binding(L, s, "get_position",   l_jce_get_position);
-    register_binding(L, s, "set_position",   l_jce_set_position);
-    register_binding(L, s, "get_rotation",   l_jce_get_rotation);
-    register_binding(L, s, "set_rotation",   l_jce_set_rotation);
-    register_binding(L, s, "get_scale",      l_jce_get_scale);
-    register_binding(L, s, "set_scale",      l_jce_set_scale);
-    register_binding(L, s, "set_parent",     l_jce_set_parent);
-    register_binding(L, s, "get_parent",     l_jce_get_parent);
-    register_binding(L, s, "is_key_down",    l_jce_is_key_down);
-    register_binding(L, s, "find_with_tag",  l_jce_find_with_tag);
-    register_binding(L, s, "destroy",        l_jce_destroy);
-    register_binding(L, s, "spawn",          l_jce_spawn);
-    register_binding(L, s, "move_axis",      l_jce_move_axis);
-    register_binding(L, s, "jump_pressed",   l_jce_jump_pressed);
-    register_binding(L, s, "sprint",         l_jce_sprint);
-    register_binding(L, s, "attack_pressed", l_jce_attack_pressed);
-    register_binding(L, s, "set_time_scale", l_jce_set_time_scale);
-    register_binding(L, s, "pause",          l_jce_pause);
-    register_binding(L, s, "shake_camera",   l_jce_shake_camera);
-    register_binding(L, s, "music_set_intensity",      l_jce_music_set_intensity);
-    register_binding(L, s, "music_get_intensity",      l_jce_music_get_intensity);
-    register_binding(L, s, "music_request_transition", l_jce_music_request_transition);
-    register_binding(L, s, "gas_activate",   l_jce_gas_activate);
-    register_binding(L, s, "gas_get",        l_jce_gas_get);
-    register_binding(L, s, "gas_apply",      l_jce_gas_apply);
-    register_binding(L, s, "raycast",        l_jce_raycast);
-    register_binding(L, s, "apply_impulse",  l_jce_apply_impulse);
-    register_binding(L, s, "set_velocity",   l_jce_set_velocity);
-    register_binding(L, s, "anim_set_float",   l_jce_anim_set_float);
-    register_binding(L, s, "anim_set_int",     l_jce_anim_set_int);
-    register_binding(L, s, "anim_set_bool",    l_jce_anim_set_bool);
-    register_binding(L, s, "anim_set_trigger", l_jce_anim_set_trigger);
-    register_binding(L, s, "is_action_down",    l_jce_is_action_down);
-    register_binding(L, s, "is_action_pressed", l_jce_is_action_pressed);
-    register_binding(L, s, "get_axis",          l_jce_get_axis);
-    register_binding(L, s, "get_pointer_delta", l_jce_get_pointer_delta);
-    register_binding(L, s, "get_pointer_wheel", l_jce_get_pointer_wheel);
-    register_binding(L, s, "is_pointer_down",   l_jce_is_pointer_down);
-    register_binding(L, s, "get_touch_count",   l_jce_get_touch_count);
-    register_binding(L, s, "get_touch",         l_jce_get_touch);
-    register_binding(L, s, "get_velocity",   l_jce_get_velocity);
-    register_binding(L, s, "vehicle_set_input", l_jce_vehicle_set_input);
-    register_binding(L, s, "vehicle_get_speed", l_jce_vehicle_get_speed);
-    register_binding(L, s, "get_move",          l_jce_get_move);
-    register_binding(L, s, "play_sound",     l_jce_play_sound);
-    register_binding(L, s, "ui_get_slider",  l_jce_ui_get_slider);
-    register_binding(L, s, "ui_set_slider",  l_jce_ui_set_slider);
-    register_binding(L, s, "ui_get_toggle",  l_jce_ui_get_toggle);
-    register_binding(L, s, "ui_set_toggle",  l_jce_ui_set_toggle);
-    register_binding(L, s, "ui_set_text",    l_jce_ui_set_text);
-    register_binding(L, s, "send_message",   l_jce_send_message);
-    register_binding(L, s, "broadcast",      l_jce_broadcast);
-    register_binding(L, s, "has_component",        l_jce_has_component);
-    register_binding(L, s, "is_component_enabled", l_jce_is_component_enabled);
-    register_binding(L, s, "set_component_enabled", l_jce_set_component_enabled);
+    register_binding(L, s, "asset_read_json", l_jce_asset_read_json);
+    register_binding(L, s, "play_sound",      l_jce_play_sound);
     register_binding(L, s, "start_coroutine", l_jce_start_coroutine);
     register_binding(L, s, "wait_seconds",    l_jce_wait_seconds);
     register_binding(L, s, "stop_coroutine",  l_jce_stop_coroutine);
-    register_binding(L, s, "net_is_server",  l_jce_net_is_server);
-    register_binding(L, s, "net_is_client",  l_jce_net_is_client);
-    register_binding(L, s, "net_spawn",      l_jce_net_spawn);
-    register_binding(L, s, "rpc_send",       l_jce_rpc_send);
-    register_binding(L, s, "particle_burst", l_jce_particle_burst);
-    register_binding(L, s, "particle_set_emitting", l_jce_particle_set_emitting);
-    register_binding(L, s, "particle_set_color", l_jce_particle_set_color);
-    register_binding(L, s, "find_by_name",     l_jce_find_by_name);
-    register_binding(L, s, "find_by_prefix",   l_jce_find_by_prefix);
-    register_binding(L, s, "comp_get",         l_jce_comp_get);
-    register_binding(L, s, "comp_set",         l_jce_comp_set);
-    register_binding(L, s, "render_get",       l_jce_render_get);
-    register_binding(L, s, "render_set",       l_jce_render_set);
-    register_binding(L, s, "audio_set_volume", l_jce_audio_set_volume);
     lua_setglobal(L, "jce");
 }
+
+#undef register_binding
 
 /* ── Sandboxed standard libs ────────────────────────────────────────────── */
 
@@ -1295,11 +534,17 @@ static void open_sandboxed_libs(lua_State *L)
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
-JceScript *jce_script_create_sized(const JceScriptHost *host, size_t host_size)
+static JceScript *script_lua_create_sized(const JceScriptHost *host, size_t host_size)
 {
     JceScript *s = (JceScript *)jce_malloc(sizeof(*s));
     if (!s) return NULL;
     memset(s, 0, sizeof(*s));
+
+    /* The handle's first bytes are the vtable the public forwarders dispatch
+     * through.  jce_script_vm_create() refuses a handle where this is not the
+     * table it called, so forgetting it is a clean failure, not a call
+     * through whatever the struct happens to start with. */
+    s->vm_header.vm = jce_script_vm_lua();
 
     s->L = luaL_newstate();
     if (!s->L) {
@@ -1322,7 +567,7 @@ JceScript *jce_script_create_sized(const JceScriptHost *host, size_t host_size)
          * this engine) is equally fine — the tail is ignored.
          *
          * Same contract as jce_engine_set_app_desc_sized(); see the ABI note
-         * in docs/architecture/language-driver-abi.md. */
+         * in contracts/language-driver-abi.md. */
         const size_t n = host_size < sizeof(s->host) ? host_size
                                                      : sizeof(s->host);
         memcpy(&s->host, host, n);
@@ -1343,16 +588,11 @@ JceScript *jce_script_create_sized(const JceScriptHost *host, size_t host_size)
     return s;
 }
 
-JceScript *jce_script_create(const JceScriptHost *host)
-{
-    /* Legacy entry point.  Kept as a real symbol so binaries already linked
-     * against it keep resolving; it asserts the caller's layout equals ours,
-     * which is true for anything compiled against THIS header.  Callers that
-     * include the header get the _sized form via the macro shim there. */
-    return jce_script_create_sized(host, sizeof(JceScriptHost));
-}
+/* jce_script_create's legacy entry point moved to jce_script_vm.c with the
+ * rest of the public surface.  It is NOT a JceScriptVM slot — see the note on
+ * struct JceScriptVM for why a size-less create must not be one. */
 
-void jce_script_destroy(JceScript *s)
+static void script_lua_destroy(JceScript *s)
 {
     if (!s) return;
     if (s->L) lua_close(s->L);
@@ -1411,7 +651,7 @@ static JceScriptInstance run_chunk(JceScript *s, JceScriptEntity owner,
     return inst;
 }
 
-JceScriptInstance jce_script_instantiate_source(JceScript *s, const char *name,
+static JceScriptInstance script_lua_instantiate_source(JceScript *s, const char *name,
                                                 const char *source,
                                                 JceScriptEntity owner)
 {
@@ -1426,7 +666,7 @@ JceScriptInstance jce_script_instantiate_source(JceScript *s, const char *name,
     return run_chunk(s, owner, chunkname);
 }
 
-JceScriptInstance jce_script_instantiate(JceScript *s, const char *path,
+static JceScriptInstance script_lua_instantiate(JceScript *s, const char *path,
                                          JceScriptEntity owner)
 {
     if (!s || !path) return 0;
@@ -1472,51 +712,147 @@ static void script_arm_watchdog(lua_State *L)
     lua_sethook(L, script_watchdog_hook, LUA_MASKCOUNT, JCE_SCRIPT_WATCHDOG_INSTR);
 }
 
+/* ── THE FAILING-CALLBACK RULE, Lua side ──────────────────────────────────
+ *
+ * jce_script.h states the rule; this is the reference implementation of it,
+ * and the three other JceScriptVM backends are written against what this does.
+ *
+ * WHERE THE FLAG LIVES.  A JceScriptInstance is a luaL_ref into the registry
+ * and there is no C-side per-instance struct to hang a flag on, so the mask
+ * lives in the instance's OWN METATABLE — the table build_instance() creates
+ * per instance and script_lua_rebind_instance() re-points __index inside.
+ * Three properties fall out of that choice and all three are load-bearing:
+ *
+ *   - it is per instance, which is what the rule requires;
+ *   - it dies with the instance, so a luaL_ref number RECYCLED by a later
+ *     luaL_unref cannot inherit a dead instance's disables.  A C-side table
+ *     keyed by the ref integer would have exactly that bug;
+ *   - a rebind reaches the same metatable it already reaches for __index, so
+ *     clearing on hot reload is one rawset in a function that already has the
+ *     metatable on the stack.
+ *
+ * It is NOT reachable as `self.__jce_disabled` from a script: field lookup on
+ * the instance falls through __index to the MODULE, never to the metatable.
+ *
+ * PARTICIPATION IS PASSED IN, NOT DERIVED FROM THE NAME.  call_message()
+ * dispatches a method whose name the caller chose, and a game that sends a
+ * message literally named "on_update" must not be able to disable the real
+ * on_update.  So every dispatcher states its own slot and call_message states
+ * CB_NONE. */
+#define JCE_SCRIPT_DISABLED_FIELD "__jce_disabled"
+
+typedef enum {
+    /* CB_NONE is not "no slot yet"; it is a STATED non-participation, and two
+     * dispatchers pass it on purpose: call_message (caller-chosen name) and
+     * on_destroy (dispatched once, by a release that frees the instance on the
+     * next line — there is no second call to suppress, and the notice would
+     * tell the user to hot-reload an instance that no longer exists).  Both
+     * reasons are written out in jce_script.h. */
+    CB_NONE      = -1,
+    CB_START     = 0,
+    CB_UPDATE    = 1,
+    CB_COLLISION = 2,
+    CB_ANIM      = 3
+} ScriptCallbackSlot;
+
+/* Is `bit` marked disabled on the instance at stack index `idx`?
+ * Raw access throughout: the metatable is ours, but a script that reached it
+ * with getmetatable() could give it an __index, and a policy flag must not be
+ * answerable by script code. Leaves the stack as it found it. */
+static bool inst_cb_disabled(lua_State *L, int idx, int bit)
+{
+    lua_Integer mask;
+    int         abs = lua_absindex(L, idx);
+
+    if (bit < 0) return false;
+    if (!lua_getmetatable(L, abs)) return false;         /* [ ..., meta ] */
+    lua_pushliteral(L, JCE_SCRIPT_DISABLED_FIELD);
+    lua_rawget(L, -2);                                   /* [ ..., meta, mask ] */
+    mask = lua_tointeger(L, -1);                         /* nil / non-number -> 0 */
+    lua_pop(L, 2);
+    return (mask & ((lua_Integer)1 << bit)) != 0;
+}
+
+static void inst_cb_disable(lua_State *L, int idx, int bit)
+{
+    lua_Integer mask;
+    int         abs = lua_absindex(L, idx);
+
+    if (bit < 0) return;
+    if (!lua_getmetatable(L, abs)) return;               /* [ ..., meta ] */
+    lua_pushliteral(L, JCE_SCRIPT_DISABLED_FIELD);
+    lua_rawget(L, -2);                                   /* [ ..., meta, mask ] */
+    mask = lua_tointeger(L, -1);
+    lua_pop(L, 1);                                       /* [ ..., meta ] */
+    lua_pushliteral(L, JCE_SCRIPT_DISABLED_FIELD);
+    lua_pushinteger(L, mask | ((lua_Integer)1 << bit));
+    lua_rawset(L, -3);                                   /* meta[field] = mask */
+    lua_pop(L, 1);                                       /* [ ... ] */
+}
+
+/* The ONE place a failed per-instance dispatch is reported, so that "which
+ * sink, in which order, with which wording" is decided once for all six
+ * per-instance dispatchers rather than six times.
+ *
+ * Stack on entry: the error object on top, the instance at `inst_idx` (which
+ * is read only when `bit >= 0`).  Pops the error object; leaves the rest. */
+static void report_dispatch_error(JceScript *s, lua_State *L, int inst_idx,
+                                  const char *method, int bit)
+{
+    const char *err = lua_tostring(L, -1);
+    char        buf[512];
+    int         abs = lua_absindex(L, inst_idx);
+
+    snprintf(buf, sizeof(buf), "%s error: %s", method, err ? err : "?");
+    if (s->have_host && s->host.log) s->host.log(s->host.user, buf);
+    LOG_ERROR(LOG_TAG, "%s", buf);
+    lua_pop(L, 1);                                       /* drop error */
+
+    if (bit < 0) return;
+    inst_cb_disable(L, abs, bit);
+    snprintf(buf, sizeof(buf), JCE_SCRIPT_DISABLED_NOTICE_FMT, method);
+    if (s->have_host && s->host.log) s->host.log(s->host.user, buf);
+    LOG_ERROR(LOG_TAG, "%s", buf);
+}
+
 /* ── Lifecycle dispatch ─────────────────────────────────────────────────── */
 
 /* Push instance[fn]; if it's a function, push the instance as `self` and any
  * extra args pushed by the caller before this call are NOT supported here —
  * we handle the fixed arities inline below. */
 static void call_method(JceScript *s, JceScriptInstance inst,
-                        const char *method, bool has_dt, float dt)
+                        const char *method, bool has_dt, float dt, int bit)
 {
     if (!s || inst == 0) return;
     lua_State *L = s->L;
     lua_rawgeti(L, LUA_REGISTRYINDEX, (lua_Integer)inst);  /* [ inst ] */
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    if (inst_cb_disabled(L, -1, bit)) { lua_pop(L, 1); return; }
     lua_getfield(L, -1, method);                            /* [ inst, fn ] (via meta) */
     if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
     lua_pushvalue(L, -2);                                   /* [ inst, fn, self ] */
     int nargs = 1;
     if (has_dt) { lua_pushnumber(L, (lua_Number)dt); nargs = 2; } /* [ ..., dt ] */
     script_arm_watchdog(L);
-    if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {              /* pops fn+args */
-        const char *err = lua_tostring(L, -1);
-        if (s->have_host && s->host.log) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s error: %s", method, err ? err : "?");
-            s->host.log(s->host.user, buf);
-        }
-        LOG_ERROR(LOG_TAG, "%s error: %s", method, err ? err : "?");
-        lua_pop(L, 1);                                      /* drop error */
-    }
+    if (lua_pcall(L, nargs, 0, 0) != LUA_OK)                /* pops fn+args */
+        report_dispatch_error(s, L, -2, method, bit);       /* inst is under it */
     lua_pop(L, 1);                                          /* drop inst */
 }
 
-void jce_script_call_start(JceScript *s, JceScriptInstance inst)
+static void script_lua_call_start(JceScript *s, JceScriptInstance inst)
 {
-    call_method(s, inst, "on_start", false, 0.0f);
+    call_method(s, inst, "on_start", false, 0.0f, CB_START);
 }
 
-void jce_script_call_update(JceScript *s, JceScriptInstance inst, float dt)
+static void script_lua_call_update(JceScript *s, JceScriptInstance inst, float dt)
 {
-    call_method(s, inst, "on_update", true, dt);
+    call_method(s, inst, "on_update", true, dt, CB_UPDATE);
 }
 
-void jce_script_release(JceScript *s, JceScriptInstance inst)
+static void script_lua_release(JceScript *s, JceScriptInstance inst)
 {
     if (!s || inst == 0) return;
-    call_method(s, inst, "on_destroy", false, 0.0f);
+    call_method(s, inst, "on_destroy", false, 0.0f, CB_NONE);
     luaL_unref(s->L, LUA_REGISTRYINDEX, (int)inst);
     if (s->instance_count > 0) s->instance_count--;
 }
@@ -1524,28 +860,21 @@ void jce_script_release(JceScript *s, JceScriptInstance inst)
 /* on_collision(self, other_entity) — like call_method but with a second
  * integer argument (the other body's entity id).  No-op if the script defines
  * no on_collision (so scripts opt in by simply declaring the method). */
-void jce_script_call_collision(JceScript *s, JceScriptInstance inst,
+static void script_lua_call_collision(JceScript *s, JceScriptInstance inst,
                                JceScriptEntity other_entity)
 {
     if (!s || inst == 0) return;
     lua_State *L = s->L;
     lua_rawgeti(L, LUA_REGISTRYINDEX, (lua_Integer)inst);   /* [ inst ] */
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    if (inst_cb_disabled(L, -1, CB_COLLISION)) { lua_pop(L, 1); return; }
     lua_getfield(L, -1, "on_collision");                    /* [ inst, fn ] */
     if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
     lua_pushvalue(L, -2);                                   /* [ inst, fn, self ] */
     lua_pushinteger(L, (lua_Integer)other_entity);         /* [ inst, fn, self, other ] */
     script_arm_watchdog(L);
-    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {                 /* pops fn + args */
-        const char *err = lua_tostring(L, -1);
-        if (s->have_host && s->host.log) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "on_collision error: %s", err ? err : "?");
-            s->host.log(s->host.user, buf);
-        }
-        LOG_ERROR(LOG_TAG, "on_collision error: %s", err ? err : "?");
-        lua_pop(L, 1);                                      /* drop error */
-    }
+    if (lua_pcall(L, 2, 0, 0) != LUA_OK)                   /* pops fn + args */
+        report_dispatch_error(s, L, -2, "on_collision", CB_COLLISION);
     lua_pop(L, 1);                                          /* drop inst */
 }
 
@@ -1554,7 +883,7 @@ void jce_script_call_collision(JceScript *s, JceScriptInstance inst,
  * configurable method name and a (number, string|nil) payload.  No-op if the
  * receiver defines no method named msg_name (so receivers opt in by simply
  * declaring the method); str_arg NULL pushes nil. */
-void jce_script_call_message(JceScript *s, JceScriptInstance inst,
+static void script_lua_call_message(JceScript *s, JceScriptInstance inst,
                              const char *msg_name, double number_arg,
                              const char *str_arg)
 {
@@ -1569,16 +898,12 @@ void jce_script_call_message(JceScript *s, JceScriptInstance inst,
     if (str_arg) lua_pushstring(L, str_arg);               /* [ ..., str ] */
     else         lua_pushnil(L);                            /* [ ..., nil ] */
     script_arm_watchdog(L);
-    if (lua_pcall(L, 3, 0, 0) != LUA_OK) {                 /* pops fn + 3 args */
-        const char *err = lua_tostring(L, -1);
-        if (s->have_host && s->host.log) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s error: %s", msg_name, err ? err : "?");
-            s->host.log(s->host.user, buf);
-        }
-        LOG_ERROR(LOG_TAG, "%s error: %s", msg_name, err ? err : "?");
-        lua_pop(L, 1);                                      /* drop error */
-    }
+    /* CB_NONE, and stated here rather than left to the absence of an argument:
+     * `msg_name` is the CALLER's string, so deriving a slot from it would let
+     * jce.send_message(e, "on_update") disable the real on_update.  See the
+     * jce_script_call_message comment in jce_script.h. */
+    if (lua_pcall(L, 3, 0, 0) != LUA_OK)                   /* pops fn + 3 args */
+        report_dispatch_error(s, L, -2, msg_name, CB_NONE);
     lua_pop(L, 1);                                          /* drop inst */
 }
 
@@ -1588,7 +913,7 @@ void jce_script_call_message(JceScript *s, JceScriptInstance inst,
  * (id, name, f0, f1, i0) animation payload.  No-op if the receiver defines no
  * on_anim_event (so receivers opt in by simply declaring the method); a NULL /
  * empty name pushes nil for that parameter. */
-void jce_script_call_anim_event(JceScript *s, JceScriptInstance inst,
+static void script_lua_call_anim_event(JceScript *s, JceScriptInstance inst,
                                 uint32_t id, const char *name,
                                 float f0, float f1, int i0)
 {
@@ -1596,6 +921,7 @@ void jce_script_call_anim_event(JceScript *s, JceScriptInstance inst,
     lua_State *L = s->L;
     lua_rawgeti(L, LUA_REGISTRYINDEX, (lua_Integer)inst);   /* [ inst ] */
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    if (inst_cb_disabled(L, -1, CB_ANIM)) { lua_pop(L, 1); return; }
     lua_getfield(L, -1, "on_anim_event");                   /* [ inst, fn ] (via meta) */
     if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }  /* missing handler: clean no-op */
     lua_pushvalue(L, -2);                                   /* [ inst, fn, self ] */
@@ -1605,20 +931,12 @@ void jce_script_call_anim_event(JceScript *s, JceScriptInstance inst,
     lua_pushnumber(L, (lua_Number)f0);                     /* [ ..., f0 ] */
     lua_pushnumber(L, (lua_Number)f1);                     /* [ ..., f1 ] */
     lua_pushinteger(L, (lua_Integer)i0);                   /* [ ..., i0 ] */
-    if (lua_pcall(L, 6, 0, 0) != LUA_OK) {                 /* pops fn + 6 args */
-        const char *err = lua_tostring(L, -1);
-        if (s->have_host && s->host.log) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "on_anim_event error: %s", err ? err : "?");
-            s->host.log(s->host.user, buf);
-        }
-        LOG_ERROR(LOG_TAG, "on_anim_event error: %s", err ? err : "?");
-        lua_pop(L, 1);                                      /* drop error */
-    }
+    if (lua_pcall(L, 6, 0, 0) != LUA_OK)                   /* pops fn + 6 args */
+        report_dispatch_error(s, L, -2, "on_anim_event", CB_ANIM);
     lua_pop(L, 1);                                          /* drop inst */
 }
 
-bool jce_script_call_named(JceScript *s, const char *fn_name,
+static bool script_lua_call_named(JceScript *s, const char *fn_name,
                            JceScriptEntity arg_entity)
 {
     if (!s || !s->L || !fn_name || !fn_name[0]) return false;
@@ -1626,6 +944,7 @@ bool jce_script_call_named(JceScript *s, const char *fn_name,
     lua_getglobal(L, fn_name);                              /* [ fn|nil ] */
     if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return false; }
     lua_pushinteger(L, (lua_Integer)arg_entity);           /* [ fn, arg ] */
+    script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
     if (lua_pcall(L, 1, 0, 0) != LUA_OK) {                 /* pops fn + arg */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
@@ -1639,7 +958,7 @@ bool jce_script_call_named(JceScript *s, const char *fn_name,
     return true;   /* a function existed and was invoked (error caught above) */
 }
 
-bool jce_script_call_named_num(JceScript *s, const char *fn_name,
+static bool script_lua_call_named_num(JceScript *s, const char *fn_name,
                                JceScriptEntity arg_entity, double value)
 {
     if (!s || !s->L || !fn_name || !fn_name[0]) return false;
@@ -1648,6 +967,7 @@ bool jce_script_call_named_num(JceScript *s, const char *fn_name,
     if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return false; }
     lua_pushinteger(L, (lua_Integer)arg_entity);           /* [ fn, ent ] */
     lua_pushnumber(L, (lua_Number)value);                  /* [ fn, ent, v ] */
+    script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
     if (lua_pcall(L, 2, 0, 0) != LUA_OK) {                 /* pops fn + 2 args */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
@@ -1661,7 +981,7 @@ bool jce_script_call_named_num(JceScript *s, const char *fn_name,
     return true;
 }
 
-bool jce_script_call_named_str(JceScript *s, const char *fn_name,
+static bool script_lua_call_named_str(JceScript *s, const char *fn_name,
                                JceScriptEntity arg_entity, const char *str)
 {
     if (!s || !s->L || !fn_name || !fn_name[0]) return false;
@@ -1671,6 +991,7 @@ bool jce_script_call_named_str(JceScript *s, const char *fn_name,
     lua_pushinteger(L, (lua_Integer)arg_entity);           /* [ fn, ent ] */
     if (str) lua_pushstring(L, str);                       /* [ fn, ent, s ] */
     else     lua_pushnil(L);                               /* [ fn, ent, nil ] */
+    script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
     if (lua_pcall(L, 2, 0, 0) != LUA_OK) {                 /* pops fn + 2 args */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
@@ -1684,12 +1005,12 @@ bool jce_script_call_named_str(JceScript *s, const char *fn_name,
     return true;
 }
 
-int jce_script_instance_count(const JceScript *s)
+static int script_lua_instance_count(const JceScript *s)
 {
     return s ? s->instance_count : 0;
 }
 
-void jce_script_update_coroutines(JceScript *s, float dt)
+static void script_lua_update_coroutines(JceScript *s, float dt)
 {
     if (!s || !s->L) return;
     /* Snapshot the bound so coroutines started DURING a resume this tick (which
@@ -1731,7 +1052,7 @@ void jce_script_update_coroutines(JceScript *s, float dt)
 
 /* ── Hot-reload ───────────────────────────────────────────────────────────── */
 
-JceScriptModule jce_script_compile_module(JceScript *s, const char *name,
+static JceScriptModule script_lua_compile_module(JceScript *s, const char *name,
                                           const char *source, size_t len)
 {
     if (!s || !source) return 0;
@@ -1765,7 +1086,7 @@ JceScriptModule jce_script_compile_module(JceScript *s, const char *name,
     return (JceScriptModule)ref;
 }
 
-void jce_script_rebind_instance(JceScript *s, JceScriptInstance inst,
+static void script_lua_rebind_instance(JceScript *s, JceScriptInstance inst,
                                 JceScriptModule mod)
 {
     if (!s || inst == 0 || mod == 0) return;
@@ -1775,11 +1096,60 @@ void jce_script_rebind_instance(JceScript *s, JceScriptInstance inst,
     if (!lua_getmetatable(L, -1)) { lua_pop(L, 1); return; } /* [ inst, meta ] */
     lua_rawgeti(L, LUA_REGISTRYINDEX, (lua_Integer)mod);     /* [ inst, meta, module ] */
     lua_setfield(L, -2, "__index");                          /* meta.__index = module */
+    /* And every callback THE FAILING-CALLBACK RULE disabled comes back.  A
+     * rebind is the engine saying the code behind this instance may have
+     * changed; without this line the script you just fixed and saved stays
+     * dead until the process restarts, which is worse than the log spam the
+     * rule exists to stop.  Same metatable the __index above went into. */
+    lua_pushliteral(L, JCE_SCRIPT_DISABLED_FIELD);
+    lua_pushinteger(L, 0);
+    lua_rawset(L, -3);                                       /* meta[field] = 0 */
     lua_pop(L, 2);                                           /* [] */
 }
 
-void jce_script_release_module(JceScript *s, JceScriptModule mod)
+static void script_lua_release_module(JceScript *s, JceScriptModule mod)
 {
     if (!s || mod == 0) return;
     luaL_unref(s->L, LUA_REGISTRYINDEX, (int)mod);
+}
+
+/* ── The Lua JceScriptVM ──────────────────────────────────────────────────
+ *
+ * The first implementation of the vtable, and the one that proves the vtable
+ * was copied rather than designed: every function above kept its body and its
+ * signature exactly as it was when it WAS the public entry point.  Only the
+ * name changed, and `static` was added.  Nothing here adapts, wraps or
+ * reorders arguments — if any slot needed a shim, the slot's signature would
+ * not be the public one and the whole claim would be false.
+ *
+ * POSITIONAL initialisers on purpose.  Designated initialisers would survive
+ * a reordering of JceScriptVM; these do not.  Combined with the public
+ * signature pin in jce_script_vm.c, a reorder or a retype of any slot is a
+ * compile error in two places rather than a silent mis-dispatch. */
+static const JceScriptVM k_lua_vm = {
+    sizeof(JceScriptVM),
+    "lua",
+    script_lua_create_sized,
+    script_lua_destroy,
+    script_lua_instantiate,
+    script_lua_instantiate_source,
+    script_lua_call_start,
+    script_lua_call_update,
+    script_lua_release,
+    script_lua_call_collision,
+    script_lua_call_message,
+    script_lua_call_anim_event,
+    script_lua_call_named,
+    script_lua_call_named_num,
+    script_lua_call_named_str,
+    script_lua_instance_count,
+    script_lua_update_coroutines,
+    script_lua_compile_module,
+    script_lua_rebind_instance,
+    script_lua_release_module,
+};
+
+const JceScriptVM *JCE_CALL jce_script_vm_lua(void)
+{
+    return &k_lua_vm;
 }

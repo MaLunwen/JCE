@@ -1,9 +1,9 @@
 /*
- * jce_async_pool.h  Fixed-size thread pool for async asset loading.
+ * jce_async_pool.h  Structured executor for async asset loading.
  *
  * Architecture:
- *   - N worker threads (configurable, default 2)
- *   - Lock-based FIFO request queue (SDL_Mutex + SDL_Condition)
+ *   - N worker threads (configurable) or cooperative Web execution
+ *   - Bounded structured async submission
  *   - Workers: decompress + decode (CPU-heavy, off main thread)
  *   - Completion list: polled by main thread each frame
  *
@@ -89,8 +89,9 @@ typedef struct JceAsyncRequest {
 typedef struct JceAsyncPool JceAsyncPool;
 
 /*
- * Create thread pool with N worker threads.
- * num_workers=0 → default (2 on mobile, 3 on desktop).
+ * Create a private structured executor requesting N worker threads.
+ * num_workers=0 requests 2 on mobile or 3 on desktop; the core async service
+ * applies the process worker budget before spawning threads.
  */
 JceAsyncPool *jce_pool_create(uint32_t num_workers);
 

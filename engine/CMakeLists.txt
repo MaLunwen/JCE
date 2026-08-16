@@ -169,14 +169,68 @@ if(NOT DEFINED JCE_PATENTED_CODECS_ENABLED)
 	set(JCE_PATENTED_CODECS_ENABLED ${JCE_ENABLE_PATENTED_CODECS})
 endif()
 
-# If the vendor sources are absent, force-disable patented codecs to keep builds working.
+# Vendor-presence probe.
+#
+# This used to test the two `jce_build` directories and, on a miss, print a
+# WARNING and flip the effective switch OFF.  Both halves were wrong.
+#
+# Wrong target: `jce_build` holds the glue CMakeLists, which .gitignore
+# deliberately re-admits (lines 14/16) — so those two EXISTS checks are true in
+# every clone and can never fail.  The upstream trees they actually compile sit
+# one level up and are untracked.  A partially-vendored tree therefore sailed
+# past the guard and died later with "Cannot find source file" at generate
+# time.  Probe one real source file out of each upstream tree instead — the
+# same files the glue lists.
+#
+# Wrong response: disabling was silent in practice.  message(WARNING) is not
+# re-emitted on an incremental reconfigure, so after the first run a release
+# build with no AAC/H.264/H.265 is indistinguishable from one that has them
+# until somebody opens an .mp4.  The root asserts (see the root CMakeLists)
+# only ever guarded the other direction — "dist must not be ON" — so nothing
+# policed a release silently becoming OFF, and `git clone` + CI are exactly
+# the trees where the vendor sources are absent.
+#
+# Shipping with or without these codecs is a licensing decision either way, so
+# it has to be stated, not defaulted into: vendor the sources, or configure
+# with -DJCE_ENABLE_PATENTED_CODECS=OFF and mean it.
 if(JCE_PATENTED_CODECS_ENABLED)
-	set(_JCE_LIBHEVC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc/jce_build")
-	set(_JCE_OPENH264_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264/jce_build")
-	set(_JCE_FDKAAC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac")
-	if(NOT EXISTS "${_JCE_LIBHEVC_DIR}" OR NOT EXISTS "${_JCE_OPENH264_DIR}" OR NOT EXISTS "${_JCE_FDKAAC_DIR}")
-		message(WARNING "JCE: patented codecs requested, but vendor sources are missing. Disabling.")
-		set(JCE_PATENTED_CODECS_ENABLED OFF)
+	set(_JCE_LIBHEVC_ROOT  "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc")
+	set(_JCE_OPENH264_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264")
+	set(_JCE_LIBHEVC_DIR  "${_JCE_LIBHEVC_ROOT}/jce_build")
+	set(_JCE_OPENH264_DIR "${_JCE_OPENH264_ROOT}/jce_build")
+	set(_JCE_FDKAAC_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac")
+
+	# One representative source per tree, each named by that tree's own build
+	# glue — if it is absent the corresponding add_subdirectory() below cannot
+	# succeed.
+	set(_jce_codec_missing "")
+	if(NOT EXISTS "${_JCE_LIBHEVC_ROOT}/common/ihevc_quant_tables.c")
+		list(APPEND _jce_codec_missing
+			"libhevc  -> engine/src/middleware/video/third_party/libhevc/")
+	endif()
+	if(NOT EXISTS "${_JCE_OPENH264_ROOT}/codec/decoder/plus/src/welsDecoderExt.cpp")
+		list(APPEND _jce_codec_missing
+			"openh264 -> engine/src/middleware/video/third_party/openh264/")
+	endif()
+	if(NOT EXISTS "${_JCE_FDKAAC_DIR}/CMakeLists.txt")
+		list(APPEND _jce_codec_missing
+			"fdk-aac  -> engine/src/middleware/audio/third_party/fdk-aac/")
+	endif()
+
+	if(_jce_codec_missing)
+		string(REPLACE ";" "\n    " _jce_codec_missing_txt "${_jce_codec_missing}")
+		message(FATAL_ERROR
+			"JCE: patented codecs are ENABLED (JCE_ENABLE_PATENTED_CODECS=ON, "
+			"JCE_BUILD_VARIANT=${JCE_BUILD_VARIANT}) but these vendor trees are "
+			"not present:\n"
+			"    ${_jce_codec_missing_txt}\n"
+			"They are intentionally untracked (see .gitignore and AGENTS.md) and "
+			"must be vendored on demand.\n"
+			"Either vendor them, or configure with "
+			"-DJCE_ENABLE_PATENTED_CODECS=OFF for a royalty-free build "
+			"(the dist variant does that for you).\n"
+			"Refusing to silently produce a release build with AAC / H.264 / "
+			"H.265 missing.")
 	endif()
 endif()
 
@@ -295,6 +349,23 @@ _jce_add_layer(jce_script
 	DIRS      middleware/script
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE lua::lua)
+
+# The generated Lua bindings must actually reach the compiler.
+#
+# gen_script_bindings.py proves the file is CORRECT; it says nothing about
+# whether it is BUILT.  `_srcs` is local to _jce_add_layer, so this reads the
+# target's own SOURCES property.  The glob's result is defeated by renaming the
+# file, moving it out of DIRS, or adding a list(FILTER ... EXCLUDE ...) line
+# like the two already at :47 and :51 - and every one of those leaves a
+# jce_script that compiles and links, with no bindings, and every script dying
+# at its first call.  FATAL_ERROR, not a warning.
+get_target_property(_script_srcs jce_script SOURCES)
+if(NOT _script_srcs MATCHES "jce_script_bindings\\.gen\\.c")
+	message(FATAL_ERROR
+		"jce_script sources do not include jce_script_bindings.gen.c - the "
+		"generated Lua bindings are not being compiled. Regenerate with:\n"
+		"  python tools/scriptgen/gen_script_bindings.py --write")
+endif()
 
 _jce_add_layer(jce_net
 	DIRS      middleware/net

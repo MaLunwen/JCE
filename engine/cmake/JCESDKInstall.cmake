@@ -410,6 +410,28 @@ function(jce_register_sdk_install)
 		install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/ui/"
 			DESTINATION "${_engine_share_root}/engine_ui")
 	endif()
+
+	# Project-authored shaders are compiled by the SDK with the same shaderc,
+	# profile matrix and lint module as the engine build. Only the stable bgfx
+	# shader ABI includes are installed; project source remains project-owned.
+	set(_jce_shaderc_candidates
+		"${bgfx_PACKAGE_FOLDER_RELEASE}/bin/shaderc${CMAKE_EXECUTABLE_SUFFIX}"
+		"${bgfx_PACKAGE_FOLDER_DEBUG}/bin/shaderc${CMAKE_EXECUTABLE_SUFFIX}")
+	foreach(_jce_shaderc IN LISTS _jce_shaderc_candidates)
+		if(_jce_shaderc AND EXISTS "${_jce_shaderc}")
+			install(PROGRAMS "${_jce_shaderc}"
+				DESTINATION "${CMAKE_INSTALL_BINDIR}")
+			break()
+		endif()
+	endforeach()
+	if(BGFX_SHADER_INCLUDE_PATH AND IS_DIRECTORY "${BGFX_SHADER_INCLUDE_PATH}")
+		install(DIRECTORY "${BGFX_SHADER_INCLUDE_PATH}/"
+			DESTINATION "${_engine_share_root}/shader_include"
+			FILES_MATCHING PATTERN "*.sh")
+	endif()
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/shaders/include/"
+		DESTINATION "${_engine_share_root}/shader_include"
+		FILES_MATCHING PATTERN "*.sh")
 	# Project-scaffolding templates consumed by jce_project_create_from_template().
 	# Editor's "New Project" walks share/jce/templates/<tpl_name>/...
 	if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/engine/templates")
@@ -437,7 +459,11 @@ function(jce_register_sdk_install)
 				"${CMAKE_CURRENT_BINARY_DIR}/JCEConfig.cmake"
 				"${CMAKE_CURRENT_BINARY_DIR}/JCEConfigVersion.cmake"
 				"${CMAKE_SOURCE_DIR}/cmake/JCESDKHelpers.cmake"
+				"${CMAKE_SOURCE_DIR}/tools/shader_lint.py"
 			DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
+		install(FILES "${CMAKE_SOURCE_DIR}/tools/compile_shaders.cmake"
+			DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE"
+			RENAME JCECompileShaders.cmake)
 	else()
 		message(WARNING "JCE SDK: ${_pkg_config_in} missing.")
 	endif()

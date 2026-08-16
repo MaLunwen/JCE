@@ -86,8 +86,9 @@ void mesh_async_start(void)
     if (s_mesh_async.running)
         return;
 
-    async_loader_start(s_mesh_async, mesh_async_worker_main,
-                       "scene_mesh_async");
+    if (!async_loader_start(s_mesh_async, mesh_async_worker_main,
+                            "scene_mesh_async"))
+        LOG_ERROR(LOG_TAG, "failed to start mesh decode service");
 }
 
 void mesh_async_stop(void)

@@ -55,6 +55,7 @@ ALLOW_FILES = {
     "engine/src/os/core/jce_log.c",                 # OutputDebugString / android log
     "engine/src/os/core/jce_sysinfo.c",             # CPU/RAM native probe
     "engine/src/os/core/jce_crash_handler.c",       # signals / backtrace / SEH
+    "engine/src/os/core/jce_sampler.c",             # thread suspend / PC read
 }
 
 # A preprocessor conditional line ...

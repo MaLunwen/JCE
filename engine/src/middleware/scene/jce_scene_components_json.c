@@ -440,10 +440,30 @@ static cJSON *ser_scene_rendering_settings(
             cJSON_AddNumberToObject(weather, "intensity", r->weather_intensity);
             cJSON_AddItemToObject(env, "weather", weather);
         }
+        if (r->temperature_c != 15.0f)
+            cJSON_AddNumberToObject(env, "temperatureC", r->temperature_c);
+        if (r->wind_direction_x != 0.0f || r->wind_direction_z != 0.0f) {
+            cJSON *wind = cJSON_CreateObject();
+            if (wind) {
+                cJSON_AddNumberToObject(wind, "directionX", r->wind_direction_x);
+                cJSON_AddNumberToObject(wind, "directionZ", r->wind_direction_z);
+                cJSON_AddItemToObject(env, "wind", wind);
+            }
+        }
         cJSON *sky = cJSON_CreateObject();
         if (sky) {
             cJSON_AddNumberToObject(sky, "mode", r->sky_mode);
             cJSON_AddNumberToObject(sky, "turbidity", r->sky_turbidity);
+            cJSON_AddNumberToObject(sky, "cloudCoverage", r->cloud_coverage);
+            cJSON_AddNumberToObject(sky, "cloudDensity",  r->cloud_density);
+            cJSON_AddNumberToObject(sky, "cloudBottomKm", r->cloud_bottom_km);
+            cJSON_AddNumberToObject(sky, "cloudTopKm",    r->cloud_top_km);
+            cJSON_AddNumberToObject(sky, "styliseBands",      r->sky_stylise_bands);
+            cJSON_AddNumberToObject(sky, "styliseRim",        r->sky_stylise_rim);
+            cJSON_AddNumberToObject(sky, "styliseSaturation", r->sky_stylise_saturation);
+            cJSON_AddItemToObject(sky, "tintShadow", json_float3(r->sky_tint_shadow));
+            cJSON_AddItemToObject(sky, "tintMid",    json_float3(r->sky_tint_mid));
+            cJSON_AddItemToObject(sky, "tintHigh",   json_float3(r->sky_tint_high));
             /* Stylized dome (absent in old scenes → parse fills defaults). */
             cJSON *dome = cJSON_CreateObject();
             if (dome) {
@@ -763,11 +783,43 @@ static JceSceneRenderingSettings extract_rendering_settings_from_obj(
             r.weather_intensity =
                 (float)j_num(weather, "intensity", r.weather_intensity);
         }
+        /* Wind. Absent => (0,0) => the environment keeps its own default, so
+         * every scene written before this key round-trips unchanged. */
+        const cJSON *wind = cJSON_GetObjectItemCaseSensitive(env, "wind");
+        if (cJSON_IsObject(wind)) {
+            r.wind_direction_x = (float)j_num(wind, "directionX", 0.0);
+            r.wind_direction_z = (float)j_num(wind, "directionZ", 0.0);
+        }
+        /* Absent => the default already in `r`, which is the environment's own
+         * 15 C, so a scene written before this key round-trips unchanged. */
+        r.temperature_c = (float)j_num(env, "temperatureC", (double)r.temperature_c);
+
         /* Sky (analytic Preetham; absent key → default GRADIENT, no change). */
         const cJSON *sky = cJSON_GetObjectItemCaseSensitive(env, "sky");
         if (cJSON_IsObject(sky)) {
             r.sky_mode      = (int)j_num(sky, "mode", r.sky_mode);
             r.sky_turbidity = (float)j_num(sky, "turbidity", r.sky_turbidity);
+            /* Absent => 0 => clouds off, so pre-existing scenes round-trip
+             * byte-identically. */
+            r.cloud_coverage  = (float)j_num(sky, "cloudCoverage", 0.0);
+            r.cloud_density   = (float)j_num(sky, "cloudDensity",  0.0);
+            r.cloud_bottom_km = (float)j_num(sky, "cloudBottomKm", 0.0);
+            r.cloud_top_km    = (float)j_num(sky, "cloudTopKm",    0.0);
+            /* Stylisation defaults to IDENTITY, not to zero.  A scene written
+             * before this layer existed has none of these keys, and a zeroed
+             * tint is BLACK -- so the absent-key default has to be 1, or every
+             * existing scene would load with a black sky. */
+            r.sky_stylise_bands      = (int)j_num(sky, "styliseBands", 0.0);
+            r.sky_stylise_rim        = (float)j_num(sky, "styliseRim", 0.0);
+            r.sky_stylise_saturation = (float)j_num(sky, "styliseSaturation", 1.0);
+            for (int ti = 0; ti < 3; ++ti) {
+                r.sky_tint_shadow[ti] = 1.0f;
+                r.sky_tint_mid[ti]    = 1.0f;
+                r.sky_tint_high[ti]   = 1.0f;
+            }
+            j_float3(sky, "tintShadow", r.sky_tint_shadow, r.sky_tint_shadow);
+            j_float3(sky, "tintMid",    r.sky_tint_mid,    r.sky_tint_mid);
+            j_float3(sky, "tintHigh",   r.sky_tint_high,   r.sky_tint_high);
             const cJSON *dome = cJSON_GetObjectItemCaseSensitive(sky, "dome");
             if (cJSON_IsObject(dome)) parse_dome_into(dome, &r);
         }
@@ -790,6 +842,10 @@ static JceSceneRenderingSettings extract_rendering_settings_from_obj(
         if (cJSON_IsObject(sky_top) && !cJSON_GetObjectItemCaseSensitive(src, "environment")) {
             r.sky_mode      = (int)j_num(sky_top, "mode", r.sky_mode);
             r.sky_turbidity = (float)j_num(sky_top, "turbidity", r.sky_turbidity);
+            r.cloud_coverage  = (float)j_num(sky_top, "cloudCoverage", r.cloud_coverage);
+            r.cloud_density   = (float)j_num(sky_top, "cloudDensity",  r.cloud_density);
+            r.cloud_bottom_km = (float)j_num(sky_top, "cloudBottomKm", r.cloud_bottom_km);
+            r.cloud_top_km    = (float)j_num(sky_top, "cloudTopKm",    r.cloud_top_km);
             const cJSON *dome = cJSON_GetObjectItemCaseSensitive(sky_top, "dome");
             if (cJSON_IsObject(dome)) parse_dome_into(dome, &r);
         }
@@ -926,23 +982,45 @@ static void matcache_insert(const char *path, const JcePbrMaterial *pbr,
 static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceMeshRenderer mr;
-    memset(&mr, 0, sizeof(mr));
-    mr.visible = true;
+    jce_mesh_renderer_init(&mr);
+    /* READ IT.  This line used to be `mr.visible = true;` — a hardcode, not a
+     * default — and ser_mesh_renderer emitted no "visible" key to go with it,
+     * so MeshRenderer was the ONE renderer component whose visibility could
+     * not survive JSON in either direction.  GrassField, FoliageCluster,
+     * Water, TerrainChunk, VegetationScatter and BillboardRenderer all
+     * round-trip theirs (j_bool + cJSON_AddBoolToObject); this one silently
+     * discarded the caller's intent and answered "visible".
+     *
+     * Two consumers were losing, both measured:
+     *   * THE EDITOR CANNOT SAVE A HIDDEN MESH.  Hide a MeshRenderer in the
+     *     Inspector, save the scene, reload: it is back.  Nothing warned.
+     *   * ANY SCRIPT'S comp_get -> modify -> comp_set TURNS THE MESH ON, and
+     *     a script that never mentions `visible` does it too, because the key
+     *     is absent from what comp_get returns.  elemental_serenity's Lua
+     *     director sets `mr.visible` per season on 102 flower cards and has
+     *     never hidden one: 1445 magenta flower pixels in shot_spring_day.png
+     *     (authored visibility 1.00) versus 1410 in shot_winter_day.png
+     *     (0.20) — 97.6% of them, where 20% was asked for.
+     *
+     * `true` stays the DEFAULT, so every scene, prefab and cooked asset in
+     * the tree loads exactly as before: no tracked .scene.json contains a
+     * "visible" key on a MeshRenderer at all (git grep, 0 hits). */
+    mr.visible = j_bool(c, "visible", true);
     static const char *const mk[] = { "meshPath", "mesh_path", "mesh" };
     static const char *const matk[] = { "materialPath", "material_path", "material" };
     const char *mp = j_str_any(c, mk, 3);
     const char *mt = j_str_any(c, matk, 3);
-    if (mp) copy_str(mr.mesh_path, sizeof(mr.mesh_path), mp);
+    if (mp) mr.mesh_path = jce_scene_intern(s, mp);
     /* Normalize absolute mesh paths saved by the editor
      * (e.g. "D:/.../resources/assets\models\...") to the PAK-relative
      * forward-slash key so jce_pak_find can look them up at runtime. */
     if (jce_path_is_absolute(mr.mesh_path)) {
-        char norm[sizeof(mr.mesh_path)];
+        char norm[512];
         const char *rel = jce_path_asset_key(mr.mesh_path, norm, sizeof(norm));
         if (rel)
-            copy_str(mr.mesh_path, sizeof(mr.mesh_path), rel);
+            mr.mesh_path = jce_scene_intern(s, rel);
     }
-    if (mt) copy_str(mr.material_path, sizeof(mr.material_path), mt);
+    if (mt) mr.material_path = jce_scene_intern(s, mt);
     mr.mesh_shape       = (int)j_num(c, "meshShape", 0);
     mr.base_color[0]    = (float)j_num(c, "baseColorR", 1.0);
     mr.base_color[1]    = (float)j_num(c, "baseColorG", 1.0);
@@ -962,11 +1040,11 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
        the keys). Stored inverted in the component. */
     mr.shadow_cast_off    = !j_bool(c, "castsShadow",    true);
     mr.shadow_receive_off = !j_bool(c, "receivesShadow", true);
-    copy_str(mr.albedo_tex,   sizeof(mr.albedo_tex),   j_str(c, "albedoTex",   ""));
-    copy_str(mr.mr_tex,       sizeof(mr.mr_tex),       j_str(c, "mrTex",       ""));
-    copy_str(mr.normal_tex,   sizeof(mr.normal_tex),   j_str(c, "normalTex",   ""));
-    copy_str(mr.ao_tex,       sizeof(mr.ao_tex),       j_str(c, "aoTex",       ""));
-    copy_str(mr.emissive_tex, sizeof(mr.emissive_tex), j_str(c, "emissiveTex", ""));
+    mr.albedo_tex = jce_scene_intern(s, j_str(c, "albedoTex",   ""));
+    mr.mr_tex = jce_scene_intern(s, j_str(c, "mrTex",       ""));
+    mr.normal_tex = jce_scene_intern(s, j_str(c, "normalTex",   ""));
+    mr.ao_tex = jce_scene_intern(s, j_str(c, "aoTex",       ""));
+    mr.emissive_tex = jce_scene_intern(s, j_str(c, "emissiveTex", ""));
     mr.toon           = j_bool(c, "toon", false);
     mr.toon_bands     = (int)j_num(c, "toonBands", 0);
     mr.rim_power      = (float)j_num(c, "toonRimPower", 0.0);
@@ -1075,11 +1153,11 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 have_mat = true;
             }
             if (have_mat) {
-                if (tex_paths[0][0]) copy_str(mr.albedo_tex,   sizeof(mr.albedo_tex),   tex_paths[0]);
-                if (tex_paths[1][0]) copy_str(mr.mr_tex,       sizeof(mr.mr_tex),       tex_paths[1]);
-                if (tex_paths[2][0]) copy_str(mr.normal_tex,   sizeof(mr.normal_tex),   tex_paths[2]);
-                if (tex_paths[3][0]) copy_str(mr.ao_tex,       sizeof(mr.ao_tex),       tex_paths[3]);
-                if (tex_paths[4][0]) copy_str(mr.emissive_tex, sizeof(mr.emissive_tex), tex_paths[4]);
+                if (tex_paths[0][0]) mr.albedo_tex = jce_scene_intern(s, tex_paths[0]);
+                if (tex_paths[1][0]) mr.mr_tex = jce_scene_intern(s, tex_paths[1]);
+                if (tex_paths[2][0]) mr.normal_tex = jce_scene_intern(s, tex_paths[2]);
+                if (tex_paths[3][0]) mr.ao_tex = jce_scene_intern(s, tex_paths[3]);
+                if (tex_paths[4][0]) mr.emissive_tex = jce_scene_intern(s, tex_paths[4]);
                 /* Forward PBR factors so backfilled materials shade correctly. */
                 mr.base_color[0] = pbr.base_color_factor[0];
                 mr.base_color[1] = pbr.base_color_factor[1];
@@ -1129,13 +1207,13 @@ static void parse_camera(JceScene *s, JceEntity e, const cJSON *c)
 static void parse_editor_meta(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceEditorMeta m;
-    memset(&m, 0, sizeof(m));
+    jce_editor_meta_init(&m);
     copy_str(m.name, sizeof(m.name), j_str(c, "name", ""));
     copy_str(m.tag,  sizeof(m.tag),  j_str(c, "tag",  ""));
     m.tag_color       = (uint8_t)j_num(c, "tagColor", 0);
     m.enabled         = j_bool(c, "enabled", true);
     m.prefab_instance = j_bool(c, "prefabInstance", false);
-    copy_str(m.prefab_path, sizeof(m.prefab_path), j_str(c, "prefabPath", ""));
+    m.prefab_path = jce_scene_intern(s, j_str(c, "prefabPath", ""));
     m.layer = (int)j_num(c, "layer", 0);
     if (m.layer < 0 || m.layer > 31) m.layer = 0;
     jce_scene_set_editor_meta(s, e, &m);
@@ -1971,7 +2049,7 @@ static void load_one_entity(JceScene *scene, const cJSON *eobj,
         JceEditorMeta *m = jce_scene_get_editor_meta(scene, new_e);
         if (!m) {
             JceEditorMeta fresh;
-            memset(&fresh, 0, sizeof(fresh));
+            jce_editor_meta_init(&fresh);
             copy_str(fresh.name, sizeof(fresh.name),
                      is_legacy_unnamed_entity_name(name) ? "Entity" : name);
             fresh.enabled = true;
@@ -1983,8 +2061,7 @@ static void load_one_entity(JceScene *scene, const cJSON *eobj,
             if (it_tag) copy_str(m->tag, sizeof(m->tag), j_str_it(it_tag, ""));
             if (it_tc) m->tag_color = (uint8_t)j_num_it(it_tc, 0);
             if (it_pi) m->prefab_instance = j_bool_it(it_pi, false);
-            if (it_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
-                                j_str_it(it_pp, ""));
+            if (it_pp) m->prefab_path = jce_scene_intern(scene, j_str_it(it_pp, ""));
         }
         /* P4-A.4 — mirror tag/layer into engine ECS components. */
         if (it_tag) {
@@ -2430,7 +2507,7 @@ void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
             JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);
             if (!m) {
                 JceEditorMeta fresh;
-                memset(&fresh, 0, sizeof(fresh));
+                jce_editor_meta_init(&fresh);
                 const char *n = j_str(entity_obj, "name", "");
                 copy_str(fresh.name, sizeof(fresh.name),
                          is_legacy_unnamed_entity_name(n) ? "Entity" : n);
@@ -2444,8 +2521,9 @@ void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
                                       j_str(entity_obj, "tag", ""));
                 if (has_tc) m->tag_color = (uint8_t)j_num(entity_obj, "tagColor", 0);
                 if (has_pi) m->prefab_instance = j_bool(entity_obj, "prefabInstance", false);
-                if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
-                                     j_str(entity_obj, "prefabPath", ""));
+                if (has_pp)
+                    m->prefab_path = jce_scene_intern(scene,
+                        j_str(entity_obj, "prefabPath", ""));
             }
         }
         /* P4-A.4 — mirror tag/layer into engine ECS components. */
@@ -2599,6 +2677,7 @@ REG_ACCESSORS(fracture, JceFractureComponent)
 REG_ACCESSORS(vehicle, JceVehicleComponent)
 REG_ACCESSORS(soft_body, JceSoftBodyComponent)
 REG_ACCESSORS(sim_lod, JceSimLodComponent)
+REG_ACCESSORS(fullscreen_effect, JceSceneFullscreenEffect)
 REG_ACCESSORS(network_variable, JceNetworkVariableComponent)
 REG_ACCESSORS(gas, JceGameplayAbilitySystemComponent)
 REG_ACCESSORS(script, JceScriptComponent)
@@ -3251,6 +3330,15 @@ void jce_scene_components_register_all(void)
         jce_scene_has_layer_component, jce_scene_remove_layer_component,
         NULL, NULL,
         NULL, NULL, 0);
+
+    /* Append-only dense registry row: no legacy flag bit exists, and placing
+     * the component last preserves every previously shipped dense id. */
+    REG("FullscreenEffect", "fullscreenEffect", "Fullscreen Effect", "fullscreen_effect",
+        0,
+        jce_scene_has_fullscreen_effect, jce_scene_remove_fullscreen_effect,
+        parse_fullscreen_effect, serw_fullscreen_effect,
+        reg_get_fullscreen_effect, reg_set_fullscreen_effect,
+        sizeof(JceSceneFullscreenEffect));
 
 #undef REG
 }

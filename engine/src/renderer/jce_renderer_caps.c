@@ -9,6 +9,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_render_pipeline.h>  /* tier floor re-clamp */
 
 #include "jce_gpu_vendor.h"
 
@@ -35,11 +36,17 @@ void jce_renderer_set_tier_override(JceGpuTier tier)
         return;
     s_tier_override_value  = (int)tier;
     s_tier_override_active = 1;
+    /* The render pipeline's LOW-tier floor is applied during apply() and reads
+     * this tier, so a pipeline already applied under a different tier is stale
+     * the moment the tier moves.  Push the change instead of hoping every
+     * caller re-applies. */
+    jce_render_pipeline_notify_tier_changed();
 }
 
 void jce_renderer_clear_tier_override(void)
 {
     s_tier_override_active = 0;
+    jce_render_pipeline_notify_tier_changed();
 }
 
 bool jce_renderer_tier_is_overridden(void)
@@ -51,15 +58,54 @@ bool jce_renderer_tier_is_overridden(void)
 
 static JceGpuTier s_detect_tier(void)
 {
+    /* Debug override, same family as JCE_BACKEND / JCE_HEADLESS. The tier
+     * decides PBR, shadow size and the post-FX budget, so reproducing a
+     * low-tier rendering bug on a desktop GPU otherwise means shipping a
+     * build to the target device and iterating there -- which for the web
+     * target is a ten-minute wasm rebuild per attempt. */
+    {
+        const char *env = getenv("JCE_GPU_TIER");
+        if (env && env[0]) {
+            if (env[0] == 'l' || env[0] == 'L') return JCE_GPU_TIER_LOW;
+            if (env[0] == 'm' || env[0] == 'M') return JCE_GPU_TIER_MEDIUM;
+            if (env[0] == 'h' || env[0] == 'H') return JCE_GPU_TIER_HIGH;
+        }
+    }
+
     const bgfx_caps_t *caps = bgfx_get_caps();
     if (!caps)
         return JCE_GPU_TIER_LOW;
 
     bgfx_renderer_type_t backend = bgfx_get_renderer_type();
 
-    /* OpenGL ES is typically mobile — start at LOW. */
-    if (backend == BGFX_RENDERER_TYPE_OPENGLES)
-        return JCE_GPU_TIER_LOW;
+    /* GLES used to return LOW unconditionally, on the reasoning that "OpenGL ES
+     * is typically mobile".  That is a statement about the backend's NAME, not
+     * about the device -- and WebGL2 is one of this engine's two shipped
+     * deliverables, so the web build was pinned to the tier that sets
+     * enable_pbr = false.  The visible result: every web frame rendered about
+     * five times darker than the same scene on D3D or desktop GL, to the point
+     * where the Earth in the space demo read as black-on-black.  Desktop GL
+     * scored HIGH on the same machine; only the backend name differed.
+     *
+     * Classify GLES by CAPABILITY instead.  An ES 3.0-class device advertises
+     * instancing, 2D texture arrays and an 8K+ texture limit; ES 2.0 hardware
+     * -- the 2008/2010-era phones the LOW tier exists for -- advertises none of
+     * them and still lands in LOW.  MEDIUM turns PBR and FXAA back on while
+     * leaving SSAO/TAA gated on a discrete GPU, which is the right envelope for
+     * both a modern phone and a desktop browser. */
+    if (backend == BGFX_RENDERER_TYPE_OPENGLES) {
+        /* Discriminate ES 3 from ES 2 on the two caps this backend actually
+         * advertises.  BGFX_CAPS_TEXTURE_2D_ARRAY was the obvious third test
+         * and it is NOT reported under WebGL2 -- asking for it kept the web
+         * build in LOW and the whole first fix silently did nothing. */
+        const bool has_inst = (caps->supported & BGFX_CAPS_INSTANCING) != 0;
+        const uint32_t maxtex = caps->limits.maxTextureSize;
+        const bool es3_class = has_inst && maxtex >= 8192;
+        LOG_INFO(LOG_TAG, "GLES tier probe: instancing=%s max_tex=%u -> %s",
+                 has_inst ? "yes" : "no", maxtex,
+                 es3_class ? "MEDIUM" : "LOW");
+        return es3_class ? JCE_GPU_TIER_MEDIUM : JCE_GPU_TIER_LOW;
+    }
 
     /* Compute the tier from a simple scoring heuristic. */
     int score = 0;
@@ -266,7 +312,15 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
         rec.enable_ssr            = has_fp_fbo && has_discrete;
         rec.enable_ssao           = true;
         rec.enable_taa            = has_fp_fbo;
-        rec.enable_volumetric_fog = has_compute && has_tex3d;
+        /* Volumetric fog is NOT compute- or 3D-texture-based.  It is a
+         * fullscreen fragment quad into an RGBA8 2D target, submitted with
+         * bgfx_submit; essl binaries are produced for it.  The old
+         * `has_compute && has_tex3d` gate described a froxel design that was
+         * never built, and it excluded exactly the hardware the shipped pass
+         * runs on.  What limits this pass is the per-pixel march cost, which
+         * is a TIER question, not a capability one -- and the tier presets
+         * below already answer it. */
+        rec.enable_volumetric_fog = true;
         rec.enable_gpu_particles  = has_compute;
         rec.max_texture_size = 4096;
         break;
@@ -308,10 +362,14 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
         break;
     }
 
-    /* Logged once per tier value (see memoization above). */
+    /* Logged once per tier value (see memoization above).  max_postfx and
+     * enable_pbr are marked advisory rather than printed as plain values:
+     * nothing consumes them, and printing "pbr=off" next to genuinely-applied
+     * fields read as a statement of fact and sent a divergence investigation
+     * down a dead end.  See JceRenderRecommendation. */
     LOG_INFO(LOG_TAG,
-        "GPU tier: %s  shadow=%u  postfx=%u  pbr=%s  ssr=%s ssao=%s taa=%s "
-        "volfog=%s gpupart=%s discrete=%s",
+        "GPU tier: %s  shadow=%u  postfx=%u(advisory)  pbr=%s(advisory)"
+        "  ssr=%s ssao=%s taa=%s volfog=%s gpupart=%s discrete=%s",
         jce_gpu_tier_name(tier),
         rec.shadow_map_size, rec.max_postfx,
         rec.enable_pbr            ? "on" : "off",

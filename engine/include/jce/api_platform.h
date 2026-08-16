@@ -18,6 +18,7 @@ extern "C" {
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/platform/jce_input_actions.h>
+#include <jce/os/platform/jce_input_device.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_mmap.h>

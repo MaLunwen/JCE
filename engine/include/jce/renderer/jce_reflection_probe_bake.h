@@ -12,9 +12,8 @@
  *   for the largest supported cubemap and lives module-scoped.
  * - `submit()` returns a non-zero JceReflectionProbeBakeHandle on
  *   success; if a bake is already running it returns 0 (invalid).
- * - Heavy work runs on a dedicated worker thread (jce_thread). Callers
- *   poll progress every frame via `poll()` and read the atomic status /
- *   progress snapshot.
+ * - Heavy work runs as a low-priority structured async task. Callers poll
+ *   progress every frame via `poll()` and read the atomic snapshot.
  *
  * v1 limitation
  * -------------

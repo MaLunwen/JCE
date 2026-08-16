@@ -157,6 +157,111 @@ JCE_API int   jce_terrain_chunk_count_z(const JceTerrain *t);
 JCE_API const float    *jce_terrain_heights(const JceTerrain *t);
 JCE_API const uint32_t *jce_terrain_splat  (const JceTerrain *t);
 
+/* -- Erosion (cook-time) ----------------------------------------- *
+ *
+ * Fast Gully Erosion: a stripe-phasor filter that carves drainage-like gullies
+ * down the existing slope, applied over the whole height grid.
+ *
+ * WHAT IT IS AND IS NOT.  This is a plausible-looking EROSION-STYLE FILTER, not
+ * a hydrology simulation.  It has no water volume, no sediment transport and no
+ * connectivity between gullies, so the channels it cuts do not join into a
+ * drainage network and will not necessarily reach a basin.  It is fast and it
+ * reads correctly at a glance, which is what a terrain generator needs; a
+ * caller that needs real flow accumulation needs a different algorithm.
+ *
+ * `out_ridge` (optional, W*H) receives the ridge/crease mask in [-1,1]: -1 deep
+ * in a crease, +1 on a ridge.  It is nearly free to produce and is often the
+ * most useful output -- it can drive splat weights and foliage density directly
+ * instead of an author hand-painting the same mask.
+ *
+ * Returns false, touching nothing, for a terrain with no resident height grid
+ * (tiled/procedural) or degenerate dimensions. */
+typedef struct JceTerrainErosionParams {
+    uint32_t seed;
+    /* Every field below takes the filter's tuned default when left at 0, so a
+     * zeroed struct is a valid "just erode it sensibly" request rather than a
+     * flat no-op. */
+    int   octaves;
+    float frequency;   /* world -> cell scale of the first octave      */
+    float strength;    /* height amplitude of the first octave         */
+    float detail;      /* > 1 keeps gullies alive longer (more detail) */
+} JceTerrainErosionParams;
+
+JCE_API bool jce_terrain_apply_erosion(JceTerrain *t,
+                                       const JceTerrainErosionParams *params,
+                                       float *out_ridge);
+
+/* -- Thermal / talus erosion (cook-time) ------------------------- *
+ *
+ * Material on a slope steeper than its ANGLE OF REPOSE slides downhill until
+ * the slope no longer exceeds it.  That is what turns the knife-edged ridges a
+ * noise function produces into landforms with scree slopes and rounded shoulders
+ * -- the single cheapest step from "procedural noise" toward "terrain".
+ *
+ * Unlike the gully filter above, this one MOVES material rather than inventing
+ * it, so total height is conserved to within float error.  That conservation is
+ * the property worth testing: a thermal pass that quietly adds or destroys mass
+ * is wrong no matter how good it looks.
+ *
+ * `talus_angle_deg` is the repose angle -- roughly 30-40 degrees for dry scree,
+ * lower for sand, higher for consolidated rock.  `iterations` trades quality
+ * for time; each pass can only move material one cell, so a tall spire needs
+ * several.  `strength` in (0,1] is the fraction of the excess moved per pass;
+ * 0.5 is stable, and values approaching 1 can oscillate.
+ *
+ * Any field left at 0 takes a sensible default, so a zeroed struct is a valid
+ * "settle it" request rather than a no-op.
+ *
+ * Returns false, touching nothing, for a terrain with no resident height grid
+ * (tiled/procedural) or degenerate dimensions. */
+typedef struct JceTerrainThermalParams {
+    float talus_angle_deg;   /* default 35                                  */
+    int   iterations;        /* default 8                                   */
+    float strength;          /* default 0.5, clamped to (0,1]               */
+} JceTerrainThermalParams;
+
+JCE_API bool jce_terrain_apply_thermal(JceTerrain *t,
+                                       const JceTerrainThermalParams *params);
+
+/* -- Sky occlusion (cook-time) ----------------------------------- *
+ *
+ * Sky ambient applied unoccluded lights the floor of a canyon exactly like open
+ * ground.  This bakes, per height sample, how much sky that point can actually
+ * see -- and the direction the remaining sky arrives from.
+ *
+ * Pure CPU, deterministic, allocation-free, single-threaded: a cook-time pass,
+ * not a per-frame one.  Cost is O(directions * samples).
+ *
+ *   out_visibility    W*H floats in [0,1].  Mean over azimuths of
+ *                     cos^2(horizon elevation) -- the closed form of the
+ *                     cosine-weighted hemisphere integral, which is what
+ *                     diffuse irradiance wants.  An unweighted angular
+ *                     fraction over-darkens, because it values grazing sky
+ *                     as highly as sky overhead.  May be NULL.
+ *   out_bent_normals  W*H*3 unit vectors toward the least-occluded part of the
+ *                     hemisphere.  Strictly more useful than the scalar: it
+ *                     fixes the DIRECTION sky light arrives from, not only its
+ *                     magnitude.  May be NULL.
+ *
+ * `directions` is clamped to [4,64]; 0 selects 16.  Buffers are caller-owned
+ * (W*H from jce_terrain_width/height) so this adds no new owner of terrain
+ * state -- there are already five.
+ *
+ * Returns false, touching nothing, for a terrain with no resident height grid
+ * (tiled/procedural), degenerate dimensions, or both outputs NULL. */
+JCE_API bool jce_terrain_bake_sky_occlusion(const JceTerrain *t,
+                                            int    directions,
+                                            float *out_visibility,
+                                            float *out_bent_normals);
+
+/* Bilinearly sample a baked visibility field at world (wx, wz), matching
+ * jce_terrain_sample_height's mapping exactly so the two never disagree about
+ * which cell a point is in.  Returns 1.0 (fully open sky) outside the terrain,
+ * which is the correct answer for a point that is not in the canyon. */
+JCE_API float jce_terrain_sample_sky_visibility(const JceTerrain *t,
+                                                const float *visibility,
+                                                float wx, float wz);
+
 /* -- Physics collision mesh ------------------------------------- */
 
 /* Allocate a triangle-soup collision mesh from the height grid (vertex

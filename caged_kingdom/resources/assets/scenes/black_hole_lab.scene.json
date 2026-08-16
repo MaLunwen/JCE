@@ -1,0 +1,441 @@
+{
+  "contract": {
+    "name": "jce.scene",
+    "major": 1,
+    "minor": 0
+  },
+  "scene": {
+    "version": 1,
+    "entities": [
+      {
+        "id": 9100,
+        "name": "BlackHoleLabRoot",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "EditorMeta",
+            "name": "BlackHoleLabRoot",
+            "tag": "science_lab"
+          }
+        ]
+      },
+      {
+        "id": 9101,
+        "name": "KerrObserverCamera",
+        "parentId": 9100,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 34.647943661926,
+            "posY": 20,
+            "posZ": 0,
+            "rotX": -30,
+            "rotY": 90,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "Camera",
+            "fov": 60,
+            "nearClip": 0.01,
+            "farClip": 720,
+            "primary": true,
+            "orthographic": false
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrObserverCamera",
+            "tag": "science_camera"
+          }
+        ]
+      },
+      {
+        "id": 9110,
+        "name": "KerrCoordinateAnchor",
+        "parentId": 9100,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrCoordinateAnchor",
+            "tag": "metric_origin"
+          }
+        ]
+      },
+      {
+        "id": 9120,
+        "name": "KerrFullscreenEffect",
+        "parentId": 9110,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "FullscreenEffect",
+            "properties": {
+              "enabled": true,
+              "required": true,
+              "useSceneColor": false,
+              "useSceneDepth": false,
+              "useHistory": true,
+              "order": 0,
+              "insertion": 0,
+              "blend": 0,
+              "outputFormat": 1,
+              "resolutionScale": 1,
+              "shader": "ck_kerr_lensing_640",
+              "textures": [
+                {
+                  "path": "textures/black_hole/starfield_reference.jceasset",
+                  "addressU": 0,
+                  "addressV": 0,
+                  "filterMin": 1,
+                  "filterMag": 1,
+                  "filterMip": 1
+                },
+                {
+                  "path": "textures/black_hole/disk_flux_lut.jceasset",
+                  "addressU": 0,
+                  "addressV": 0,
+                  "filterMin": 1,
+                  "filterMag": 1,
+                  "filterMip": 0
+                },
+                {
+                  "path": "textures/black_hole/blackbody_rgb_lut.jceasset",
+                  "addressU": 0,
+                  "addressV": 0,
+                  "filterMin": 1,
+                  "filterMag": 1,
+                  "filterMip": 0
+                },
+                {
+                  "path": "textures/black_hole/starfield_prefiltered.jceasset",
+                  "addressU": 0,
+                  "addressV": 0,
+                  "filterMin": 1,
+                  "filterMag": 1,
+                  "filterMip": 0
+                }
+              ],
+              "params": [
+                [0.8, 100000000, 0.1, 0],
+                [18, 600, 0.002, 0.0005],
+                [640, 0, -1, 0.75],
+                [2200, 18000, 0.5, -1],
+                [0, 0, 0, 1],
+                [-0.998, 63.12625250501, 511, 126],
+                [0.04, 0.035, 0.035, 0.04],
+                [1.6, 2.9066438544641957, 8, 0],
+                [0.8, 100000000, 0.1, 0],
+                [18, 600, 0.002, 0.0005],
+                [640, 0, -1, 0.75],
+                [2200, 18000, 0.5, -1],
+                [0, 0, 0, 1],
+                [-0.998, 63.12625250501, 511, 126],
+                [0.04, 0.035, 0.035, 0.04],
+                [1.6, 2.9066438544641957, 8, 0]
+              ]
+            }
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrFullscreenEffect",
+            "tag": "required_science_effect"
+          }
+        ]
+      },
+      {
+        "id": 9130,
+        "name": "KerrLabDirector",
+        "parentId": 9100,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "Script",
+            "scriptPath": "scripts/black_hole_lab.lua"
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrLabDirector",
+            "tag": "science_director"
+          }
+        ]
+      },
+      {
+        "id": 9140,
+        "name": "KerrScienceHUD",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Canvas",
+            "renderMode": 0,
+            "sortOrder": 80,
+            "refResX": 1920,
+            "refResY": 1080,
+            "scaleFactor": 1,
+            "pixelPerfect": false
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrScienceHUD",
+            "tag": "science_hud"
+          }
+        ]
+      },
+      {
+        "id": 9141,
+        "name": "KerrHudBackdrop",
+        "parentId": 9140,
+        "components": [
+          {
+            "type": "UIImage",
+            "spritePath": "",
+            "imageType": 0,
+            "colorR": 0.015,
+            "colorG": 0.023,
+            "colorB": 0.04,
+            "colorA": 0.76,
+            "fillAmount": 1,
+            "preserveAspect": false,
+            "raycastTarget": false,
+            "anchorMinX": 1,
+            "anchorMinY": 1,
+            "anchorMaxX": 1,
+            "anchorMaxY": 1,
+            "pivotX": 1,
+            "pivotY": 1,
+            "anchoredX": -24,
+            "anchoredY": -24,
+            "sizeW": 620,
+            "sizeH": 270
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrHudBackdrop",
+            "tag": "hud_backdrop"
+          }
+        ]
+      },
+      {
+        "id": 9150,
+        "name": "CriticalCurveOverlay",
+        "parentId": 9140,
+        "components": [
+          {
+            "type": "UIText",
+            "text": "Scientific default | chi=+0.800 | inclination=60.000 deg | observer=100.000M | FOV=20.00 deg\nr_plus=1.600000M | r_ISCO=2.906644M | Page-Thorne disk=40.0M | tier=320 | Radiance",
+            "fontPath": "fonts/JCE.ttf",
+            "fontSize": 19,
+            "alignment": 0,
+            "colorR": 0.82,
+            "colorG": 0.9,
+            "colorB": 1,
+            "colorA": 1,
+            "lineSpacing": 1.25,
+            "richText": false,
+            "mathText": false,
+            "bestFit": false,
+            "minSize": 12,
+            "maxSize": 19,
+            "anchorMinX": 1,
+            "anchorMinY": 1,
+            "anchorMaxX": 1,
+            "anchorMaxY": 1,
+            "pivotX": 1,
+            "pivotY": 1,
+            "anchoredX": -48,
+            "anchoredY": -48,
+            "sizeW": 572,
+            "sizeH": 88
+          },
+          {
+            "type": "EditorMeta",
+            "name": "CriticalCurveOverlay",
+            "tag": "science_readout"
+          }
+        ]
+      },
+      {
+        "id": 9151,
+        "name": "KerrTerminology",
+        "parentId": 9140,
+        "components": [
+          {
+            "type": "UIText",
+            "text": "Event horizon: causal boundary, not a surface.  Critical curve: ideal image-plane boundary of asymptotic photon orbits.\nShadow: source-dependent brightness depression.  Photon ring and lensing ring are distinct higher-order image features.",
+            "fontPath": "fonts/JCE.ttf",
+            "fontSize": 15,
+            "alignment": 0,
+            "colorR": 0.65,
+            "colorG": 0.74,
+            "colorB": 0.86,
+            "colorA": 1,
+            "lineSpacing": 1.2,
+            "richText": false,
+            "mathText": false,
+            "bestFit": false,
+            "minSize": 10,
+            "maxSize": 15,
+            "anchorMinX": 1,
+            "anchorMinY": 1,
+            "anchorMaxX": 1,
+            "anchorMaxY": 1,
+            "pivotX": 1,
+            "pivotY": 1,
+            "anchoredX": -48,
+            "anchoredY": -142,
+            "sizeW": 572,
+            "sizeH": 74
+          },
+          {
+            "type": "EditorMeta",
+            "name": "KerrTerminology",
+            "tag": "truth_policy"
+          }
+        ]
+      },
+      {
+        "id": 9160,
+        "name": "ReferenceRayProbe",
+        "parentId": 9140,
+        "components": [
+          {
+            "type": "UIText",
+            "text": "REFERENCE_DATA | awaiting config/reference hash | LIVE_GPU_CHECK_UNAVAILABLE",
+            "fontPath": "fonts/JCE.ttf",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 1,
+            "colorG": 0.7,
+            "colorB": 0.28,
+            "colorA": 1,
+            "lineSpacing": 1,
+            "richText": false,
+            "mathText": false,
+            "bestFit": false,
+            "minSize": 10,
+            "maxSize": 13,
+            "anchorMinX": 1,
+            "anchorMinY": 1,
+            "anchorMaxX": 1,
+            "anchorMaxY": 1,
+            "pivotX": 1,
+            "pivotY": 1,
+            "anchoredX": -48,
+            "anchoredY": -228,
+            "sizeW": 572,
+            "sizeH": 26
+          },
+          {
+            "type": "EditorMeta",
+            "name": "ReferenceRayProbe",
+            "tag": "reference_status"
+          }
+        ]
+      }
+    ],
+    "rendering": {
+      "version": 1,
+      "ambient": {
+        "color": [0, 0, 0],
+        "intensity": 0
+      },
+      "iblEnabled": false,
+      "fog": {
+        "enabled": false,
+        "mode": 0,
+        "color": [0, 0, 0],
+        "density": 0,
+        "start": 0,
+        "end": 1200,
+        "heightFalloff": 0,
+        "heightOrigin": 0
+      },
+      "postfx": {
+        "tonemap": true,
+        "bloom": true,
+        "fxaa": false,
+        "vignette": false,
+        "exposure": 1,
+        "gamma": 2.2,
+        "bloomThreshold": 0.25,
+        "bloomIntensity": 2.5,
+        "ssao": false,
+        "ssr": false
+      },
+      "environment": {
+        "timeOfDay": {
+          "enabled": false,
+          "hour": 0
+        },
+        "weather": {
+          "type": 0,
+          "intensity": 0
+        },
+        "floatingOrigin": {
+          "enabled": false,
+          "threshold": 4096
+        }
+      },
+      "look": {
+        "wrap": 0,
+        "hemisphere": false,
+        "groundColor": [0, 0, 0],
+        "rimColor": [0, 0, 0],
+        "rimPower": 1,
+        "rimIntensity": 0,
+        "tonemapOp": 0,
+        "lutPath": "",
+        "lutStrength": 0,
+        "toonCharacter": false,
+        "bloomKnee": 0.5
+      }
+    }
+  }
+}

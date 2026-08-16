@@ -44,6 +44,15 @@ JceShaderHandle shader_load_program_fs(
 JceShaderHandle shader_load_program_fs_named(
     const char *dev_dir, const char *vs_base, const char *fs_base);
 
+/* Resolve each stage independently: an existing development-overlay binary
+ * wins for that stage, otherwise the stage is loaded from the project PAK
+ * with the normal embedded-engine fallback.  This is the project-shader path:
+ * a project fragment stage can be hot-loaded while the shared engine vertex
+ * stage remains embedded. */
+JceShaderHandle shader_load_program_overlay_named(
+    const char *dev_dir, const JcePakArchive *pak,
+    const char *vs_base, const char *fs_base);
+
 /* Destroy a program created by the loaders above.  No-op on an invalid
  * handle.  Non-renderer layers that own program lifetimes (the resource
  * shader cache) must release through this instead of unwrapping the

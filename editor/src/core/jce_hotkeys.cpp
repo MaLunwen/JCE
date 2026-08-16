@@ -58,6 +58,8 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     /* view */
     { "view.frame_selected",       "View / Frame Selected",       { ImGuiKey_F, JCE_HKM_NONE }, {} },
     { "view.frame_all",            "View / Frame All",            { ImGuiKey_F, JCE_HKM_SHIFT }, {} },
+    { "view.align_selected_camera", "View / Align to Camera",      { ImGuiKey_C, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
+    { "view.pilot_selected_camera", "View / Pilot Camera",         { ImGuiKey_C, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_ALT) }, {} },
     { "view.focus_persp",          "View / Perspective",          { ImGuiKey_Keypad5, JCE_HKM_NONE }, {} },
     { "view.focus_top",            "View / Top",                  { ImGuiKey_Keypad7, JCE_HKM_NONE }, {} },
     { "view.focus_front",          "View / Front",                { ImGuiKey_Keypad1, JCE_HKM_NONE }, {} },
@@ -77,6 +79,11 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F11, JCE_HKM_NONE }, {} },
     { "ui.screenshot",             "UI / Screenshot (PNG)",       { ImGuiKey_F12, JCE_HKM_NONE }, {} },
     { "ui.record",                 "UI / Record toggle (frames)", { ImGuiKey_F9, JCE_HKM_NONE }, {} },
+    /* Ctrl+Shift+C: not a bare key. This is pressed while LOOKING at a defect,
+     * which is exactly when a stray F-key would also toggle a panel and change
+     * the very thing being reported. */
+    { "ui.copy_repro",             "UI / Copy repro command",     { ImGuiKey_C, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
+    { "ui.toggle_game_maximize",   "UI / Maximise Game Viewport", { ImGuiKey_F11, JCE_HKM_SHIFT }, {} },
     { "file.build_settings",       "File / Build Settings",       { ImGuiKey_B, JCE_HKM_CTRL }, {} },
     { "file.pack_current_scene",   "File / Pack Current Scene",   { ImGuiKey_B, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
 

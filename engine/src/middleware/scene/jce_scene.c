@@ -2,7 +2,13 @@
  * jce_scene.c  ECS scene implementation (flecs backend).
  */
 
+#include <jce/middleware/scene/jce_str_intern.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
+#include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/scene/jce_water_ripple.h>
+#include <jce/middleware/world/jce_environment.h>
+#include "jce_terrain_cache.h"
 #include <stdio.h>   /* snprintf (entity-name uniquify) */
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
@@ -54,8 +60,34 @@ void jce_scene_particles_shutdown(JceScene *s);
  * 64-bit JCE_COMP_FLAG_* space, which is full.  4×64 words cover
  * JCE_COMP_MAX rows.  Absent component == everything enabled. */
 typedef struct { uint64_t disabled[4]; } JceCompEnableState;
+/* "A script wrote this component's enable bit during this run."  Purely an
+ * authoring affordance: without it the editor cannot tell a component the user
+ * switched off from one a script re-asserts every frame, so the Inspector
+ * checkbox silently does nothing and reads as broken.  Never serialized, so a
+ * Play-stop restore drops it along with the rest of the run's state. */
+typedef struct { uint64_t driven[4]; } JceCompScriptDriven;
+/* The name the caller actually authored.
+ *
+ * Scene entities are created in the flecs ROOT scope, which already contains
+ * flecs's own built-in entities ("Empty", "Target", "Prefab", "Disabled",
+ * "Name", "Component", "World", "Module", "Observer", ...).  flecs requires
+ * names to be unique within a scope, so jce_scene_create_entity uniquifies a
+ * taken name by appending "_<entity_id>".  That kept flecs's index valid but
+ * made the rename observable: asking for "Target" produced "Target_470", so
+ * every lookup by the authored name failed and the wrong name reached the
+ * saved scene.  Duplicate authored names (many "Ped" from a SpawnManager) hit
+ * the same path.
+ *
+ * The authored name is therefore stored separately and is the entity's
+ * identity for the public API and for serialization; the flecs name remains
+ * an internal, possibly-uniquified index.  The pointer is interned in the
+ * scene string pool, so it is stable across flecs table moves and is owned by
+ * the pool rather than by the component. */
+typedef struct { const char *v; } JceCompAuthoredName;
 
 static ECS_COMPONENT_DECLARE(JceCompEnableState);
+static ECS_COMPONENT_DECLARE(JceCompScriptDriven);
+static ECS_COMPONENT_DECLARE(JceCompAuthoredName);
 static ECS_COMPONENT_DECLARE(JceTransform);
 static ECS_COMPONENT_DECLARE(JcePivotComponent);
 static ECS_COMPONENT_DECLARE(JceMeshRenderer);
@@ -151,6 +183,7 @@ static ECS_COMPONENT_DECLARE(JceFractureComponent);
 static ECS_COMPONENT_DECLARE(JceVehicleComponent);
 static ECS_COMPONENT_DECLARE(JceSoftBodyComponent);
 static ECS_COMPONENT_DECLARE(JceSimLodComponent);
+static ECS_COMPONENT_DECLARE(JceSceneFullscreenEffect);
 
 /* ── Internal world-matrix cache (side table) ──────────────────────────
  *
@@ -194,6 +227,31 @@ struct JceScene {
     /* Lazily heap-allocated (~70 KB with the full chunk table); NULL until
        authored.  Presence of the pointer == "has streaming settings". */
     JceSceneStreamingSettings *streaming_settings;
+    /* Every water body in this scene, on ONE clock.  Lazily created because
+     * most scenes have no water at all.  Owned here rather than by the renderer
+     * or the runtime precisely so neither of them can own a private copy --
+     * that is the bug jce_water_field.h exists to make unrepresentable. */
+    JceWaterFieldSet *water_fields;
+    /* The disturbance layer, beside the ambient one it adds to. */
+    JceWaterRipple   *water_ripple;
+    /* THE environment state for this scene: time of day, weather, wind,
+     * humidity, cloud cover.
+     *
+     * Here for exactly the reason water_fields is here. It lived on the scene
+     * renderer, which is where it is advanced -- and so the runtime, which
+     * needs the wind to build the same ocean the renderer draws, could not
+     * reach it. The renderer therefore multiplied the wave spectrum's wind by
+     * the weather and the runtime did not, and the two handed the SAME water
+     * field two different descriptors. Rendering and physics disagreeing about
+     * the world is the failure this whole layer exists to prevent, and it does
+     * not stop being that failure when the disagreement is about wind. */
+    JceEnvironmentState env;
+    bool                env_init;
+    /* One loaded terrain per path, shared by renderer / pick / physics.  Same
+     * reason as water_fields above: five independent loaders of one asset are
+     * five copies that can disagree, and an editor sculpt reached only one of
+     * them.  Lazily created; most scenes have no terrain. */
+    JceTerrainCache *terrain_cache;
     ecs_query_t *cloth_query;   /* cached; created lazily in jce_scene_update */
     ecs_query_t *each_query;    /* cached; created lazily in jce_scene_each_entity
                                  * (leak fix: was ecs_query()+ecs_query_fini() on
@@ -231,7 +289,55 @@ struct JceScene {
      * xform_counter: every per-entity world invalidation + physics write-back. */
     uint64_t      roster_epoch;
     uint64_t      enable_gen;
+    /* Number of entities carrying a JceCompEnableState row.  Maintained at
+     * the only two write sites (jce_scene_set_comp_enabled) so the read
+     * side is a plain load.  jce_scene_comp_enabled used to ask flecs
+     * (ecs_count_id) on EVERY call for the same all-clear answer; that is
+     * documented as O(1) but iterates the id's table cache and costs ~220
+     * cycles even when it returns 0 - measured as 27% of the scene
+     * renderer's submit loop, 4x the component fetch it guards.
+     *
+     * Deleting an entity drops its row without passing through the setter,
+     * so this can drift HIGH.  That direction is safe: it only falls back
+     * to the per-entity ecs_get, which is always correct.  It must never
+     * drift low, hence the increment sits on the branch that actually adds
+     * a row (cur == NULL) rather than on every write. */
+    /* Owns every interned component asset path (see jce_str_intern.h).
+     * Scene-scoped: the pointers live inside components and must not outlive
+     * the world that holds them. */
+    JceStrPool   *str_pool;
+    int32_t       comp_enable_rows;
+    /* The entities that actually carry a disable row.  Kept because the
+     * all-or-nothing short-circuit below it was defeated by a single row: at
+     * 200k entities exactly ONE carried one, and that made every visible
+     * entity pay a full component lookup every frame (70 cycles x 27295 =
+     * ~0.56 ms).  A scene has a handful of these at most -- a linear scan of
+     * this list answers in a couple of cycles and is exact.
+     *
+     * Above JCE_COMP_DISABLE_SET_MAX the list stops being maintained and the
+     * query falls back to the component lookup: a scene with hundreds of
+     * disabled components is not the case this optimises, and a list that
+     * silently truncated would answer WRONG rather than slow. */
+    JceEntity    *comp_enable_ents;
+    int32_t       comp_enable_ents_count;
+    int32_t       comp_enable_ents_cap;
+    bool          comp_enable_ents_valid;
     uint64_t      xform_counter;
+    /* cull_data_gen: a component whose FIELDS the entity-cull table memoizes
+     * was written.  enable_gen covers only the enabled bit and xform_counter
+     * only transforms, so toggling e.g. casts_shadow on a live entity had no
+     * signal and the cull table served the stale value forever.
+     *
+     * Scoped deliberately.  It was first bumped from the accessor macros
+     * themselves -- every one of the 92 components -- on the theory that a
+     * blanket signal cannot be forgotten.  That made it useless as a cache
+     * key: any script writing ANY component every frame (a UI fill, a line
+     * colour, a material tint) invalidated it, so the cull freeze AND its
+     * incremental-repair path both died every frame and the whole entity
+     * cull rebuilt from scratch.  Only the components jce_sr_cull.c actually
+     * reads may bump it; scripts/lint/check_cull_gen_consumers.py fails the
+     * build if that file grows a read whose component does not. */
+    uint64_t      cull_data_gen;
     /* Dirty ring (DOTS-floor L2): every entity whose world matrix was
      * invalidated since the last take — appended by the
      * invalidate_entity_world subtree walk (the only per-entity xform bump
@@ -321,9 +427,22 @@ static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
     if (r->weather_intensity > 1.0f)
         r->weather_intensity = 1.0f;
 
-    /* Sky clamps (analytic Preetham / stylized dome). */
-    if (r->sky_mode < 0 || r->sky_mode > 3)
-        r->sky_mode = 0;
+    /* Sky clamps.  The upper bound is the LAST enumerator, written as the
+     * symbol rather than a literal: this was `> 3` and silently reset any
+     * newly-added mode to GRADIENT on load, so a new sky would have looked
+     * implemented everywhere and never once rendered. */
+    if (r->sky_mode < JCE_SCENE_SKY_GRADIENT ||
+        r->sky_mode > JCE_SCENE_SKY_PHYSICAL)
+        r->sky_mode = JCE_SCENE_SKY_GRADIENT;
+    /* Clouds: clamp coverage, and keep the layer non-degenerate.  A top at or
+     * below the bottom would make the march divide by a zero-thickness slab. */
+    if (!(r->cloud_coverage > 0.0f)) r->cloud_coverage = 0.0f;
+    if (r->cloud_coverage > 1.0f)    r->cloud_coverage = 1.0f;
+    if (r->cloud_top_km <= r->cloud_bottom_km) {
+        r->cloud_bottom_km = 0.0f;   /* 0 selects the defaults downstream */
+        r->cloud_top_km    = 0.0f;
+    }
+
     if (r->sky_turbidity < 1.0f)
         r->sky_turbidity = 1.0f;
     if (r->sky_turbidity > 10.0f)
@@ -455,6 +574,9 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     r.lut_strength   = 0.0f;           /* off */
     r.toon_character = false;
     r.bloom_knee     = 0.0f;           /* hard cutoff = current bloom */
+    /* Matches jce_environment_default(); a scene that does not author a
+     * temperature must not change what the environment already does. */
+    r.temperature_c = 15.0f;
     return r;
 }
 
@@ -591,7 +713,158 @@ void jce_scene_clear_streaming_settings(JceScene *s)
     s->streaming_settings = NULL;
 }
 
+/* ── Water fields ──────────────────────────────────────────────────────
+ *
+ * Lazily created on first use, so a scene with no water never pays for one.
+ * Returns NULL only if that allocation fails; every caller treats NULL as
+ * "no water this frame" rather than crashing, because a failed 300-byte
+ * allocation should not take down a level. */
+JceEnvironmentState *jce_scene_environment(JceScene *s)
+{
+    if (!s) return NULL;
+    if (!s->env_init) { s->env = jce_environment_default(); s->env_init = true; }
+    return &s->env;
+}
+
+/* Fill a water-field descriptor for `e` from its Water component, its WORLD
+ * transform and this scene's environment.
+ *
+ * ONE function because there were two hand-written descs for one field, and
+ * they disagreed about three things at once. The renderer published
+ * `base_height = wc->base_height` -- which is ENTITY-LOCAL, as the comment
+ * twenty lines above its own shader uniform says -- so on hidden_cove the CPU
+ * water surface sat at y = 0.000 while the water everyone could see was drawn
+ * at 14.99. It also left center_x/center_z at zero, putting the body's centre
+ * 40 m from where the body is. Buoyancy, shoreline and every gameplay query
+ * read that field.
+ *
+ * Taking the entity rather than the component is what makes the mistake
+ * unrepresentable: the caller no longer does the local-to-world mapping, so it
+ * can no longer get it wrong.
+ *
+ * `waves` points into the component and is borrowed for the acquire call only,
+ * exactly as jce_water_field.h requires. */
+bool jce_scene_water_field_desc(JceScene *s, JceEntity e,
+                                JceWaterFieldDesc *out)
+{
+    if (!s || !out) return false;
+    JceWaterComponent *wc = jce_scene_get_water(s, e);
+    if (!wc) return false;
+
+    const jce_mat4 m = jce_scene_get_world_matrix(s, e);
+    const JceEnvironmentState *env = jce_scene_environment(s);
+
+    memset(out, 0, sizeof *out);
+    out->model          = (JceWaterFieldModel)wc->water_mode;
+    out->base_height    = wc->base_height + m.col[3].y;
+    out->center_x       = m.col[3].x;
+    out->center_z       = m.col[3].z;
+    out->size_x         = wc->size_x;
+    out->size_z         = wc->size_z;
+    out->waves          = wc->waves;
+    out->wave_count     = wc->wave_count;
+    out->fft_resolution = wc->fft_resolution;
+    out->fft_patch_size = wc->fft_patch_size;
+    /* U4: the authored value is a MULTIPLIER of the one wind, and this is the
+     * only place that applies it -- when the renderer applied it alone, the
+     * runtime's desc differed by exactly this factor and every frame of
+     * weather rebuilt the whole Tessendorf spectrum twice. */
+    /* SUSTAINED, not instantaneous. Two independent reasons, either of which
+     * alone settles it:
+     *
+     *   Physics -- the Phillips spectrum this feeds is parameterised by the
+     *   wind that has blown over the fetch for hours. A seven-second gust does
+     *   not restructure a developed sea; it puts ripples on one.
+     *
+     *   Cost -- spectrum_differs() in jce_water_field.c keys the spectrum
+     *   cache on exactly this number, so a value that moves every frame
+     *   re-solves the whole Tessendorf spectrum every frame. That is the same
+     *   trap the comment above describes, arrived at from the other side. */
+    out->fft_wind_speed = wc->fft_wind_speed *
+                          jce_environment_wind_speed_sustained(env);
+    out->fft_wind_dir_x = wc->fft_wind_dir_x;
+    out->fft_wind_dir_z = wc->fft_wind_dir_z;
+    out->fft_amplitude  = wc->fft_amplitude;
+    out->fft_seed       = JCE_WATER_FIELD_SEED(e);
+    out->fft_fetch      = wc->fft_fetch;
+    out->fft_swell      = wc->fft_swell;
+    return true;
+}
+
+JceWaterFieldSet *jce_scene_water_fields(JceScene *s)
+{
+    if (!s) return NULL;
+    if (!s->water_fields) s->water_fields = jce_water_field_set_create();
+    return s->water_fields;
+}
+
+/* JCE_API / JCE_CALL 必须与 jce_scene.h:3180 的声明一致。
+ * 缺了它们时 MSVC 过得去（JCE_CALL 展开成 __cdecl，本来就是默认约定），
+ * 而 clang/wasm 报 conflicting types —— 于是 wasm SDK 从此构建不了，
+ * dist/sdk/wasm 停在 06-08，两个多月无人发现，因为没人为 wasm 构建过。
+ * 症状是 web 版所有 T() 退化成原始 key（那份旧 SDK 里没有 loc_translate）。 */
+JCE_API JceWaterRipple *JCE_CALL jce_scene_water_ripple(
+    JceScene *s, const JceWaterRippleDesc *desc)
+{
+    if (!s) return NULL;
+    /* Create only when asked WITH a desc. A reader passing NULL gets whatever
+     * exists and never causes creation, so the size of the grid is decided by
+     * the one caller that knows the water body, not by whoever happens to read
+     * first. */
+    if (!s->water_ripple && desc)
+        s->water_ripple = jce_water_ripple_create(desc);
+    return s->water_ripple;
+}
+
+/* ── Terrain cache ─────────────────────────────────────────────────────
+ *
+ * Lazily created, like the water fields.  Returns NULL only if that allocation
+ * fails; callers treat NULL as "load it yourself this once" rather than
+ * crashing a level over a few hundred bytes. */
+JceTerrainCache *jce_scene_terrain_cache(JceScene *s)
+{
+    if (!s) return NULL;
+    if (!s->terrain_cache) s->terrain_cache = jce_terrain_cache_create();
+    return s->terrain_cache;
+}
+
+void JCE_CALL jce_scene_invalidate_terrain(JceScene *s, const char *path)
+{
+    /* Deliberately does NOT create the cache: invalidating a cache that was
+     * never populated is a no-op, and allocating one to no-op on it would be
+     * the kind of tidy-looking waste that shows up in a profile later. */
+    if (!s || !s->terrain_cache) return;
+    jce_terrain_cache_invalidate(s->terrain_cache, path);
+}
+
 /* ── Create / destroy ──────────────────────────────────────────────── */
+/* Zero-init leaves the interned path pointers NULL; every reader dereferences
+ * them unconditionally.  Point them at the shared empty string instead. */
+
+static void jce__em_ctor(void *ptr, int32_t count, const ecs_type_info_t *ti)
+{
+    (void)ti;
+    JceEditorMeta *m = (JceEditorMeta *)ptr;
+    for (int32_t i = 0; i < count; i++) jce_editor_meta_init(&m[i]);
+}
+
+static void jce__mr_ctor(void *ptr, int32_t count, const ecs_type_info_t *ti)
+{
+    (void)ti;
+    JceMeshRenderer *m = (JceMeshRenderer *)ptr;
+    const char *e = jce_str_empty();
+    for (int32_t i = 0; i < count; i++) {
+        memset(&m[i], 0, sizeof(JceMeshRenderer));
+        m[i].mesh_path     = e;
+        m[i].material_path = e;
+        m[i].albedo_tex    = e;
+        m[i].mr_tex        = e;
+        m[i].normal_tex    = e;
+        m[i].ao_tex        = e;
+        m[i].emissive_tex  = e;
+    }
+}
+
 
 JceScene *jce_scene_create(void)
 {
@@ -618,13 +891,30 @@ JceScene *jce_scene_create(void)
     s->structural_epoch = 1;
     s->roster_epoch     = 1;
     s->enable_gen       = 1;
+    s->cull_data_gen    = 1;
     s->xform_counter    = 1;
 
     /* Register components. */
     ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
+    ECS_COMPONENT_DEFINE(s->world, JceCompScriptDriven);
+    ECS_COMPONENT_DEFINE(s->world, JceCompAuthoredName);
     ECS_COMPONENT_DEFINE(s->world, JceTransform);
     ECS_COMPONENT_DEFINE(s->world, JcePivotComponent);
     ECS_COMPONENT_DEFINE(s->world, JceMeshRenderer);
+
+    {
+        /* The seven asset paths are interned pointers now, and a zero-filled
+         * component would leave them NULL.  Every read site does
+         * `mr->mesh_path[0]` with no null check -- correctly, because these
+         * used to be char[256] where zero-init meant "".  A ctor covers EVERY
+         * creation path, including the ones flecs takes internally when a
+         * component is added without a value, which is more than the setter
+         * could reach. */
+        ecs_type_hooks_t h;
+        memset(&h, 0, sizeof(h));
+        h.ctor = jce__mr_ctor;
+        ecs_set_hooks_id(s->world, ecs_id(JceMeshRenderer), &h);
+    }
     ECS_COMPONENT_DEFINE(s->world, JceCameraComponent);
     ECS_COMPONENT_DEFINE(s->world, JceDirectionalLight);
     ECS_COMPONENT_DEFINE(s->world, JcePointLight);
@@ -648,6 +938,15 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceVideoPlayerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceScriptComponent);
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
+    {   /* Same reason as the JceMeshRenderer ctor: zero-filling would leave
+         * the interned prefab paths NULL and every reader dereferences them.
+         * A ctor covers the creation paths flecs takes internally, which the
+         * setter alone cannot reach. */
+        ecs_type_hooks_t h;
+        memset(&h, 0, sizeof(h));
+        h.ctor = jce__em_ctor;
+        ecs_set_hooks_id(s->world, ecs_id(JceEditorMeta), &h);
+    }
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVegetationScatterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceGrassFieldComponent);
@@ -720,6 +1019,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceVehicleComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSoftBodyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSimLodComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSceneFullscreenEffect);
 
     /* VideoPlayer owns a live decoder handle + a GPU texture; install
      * lifecycle hooks so those resources follow correct ownership across
@@ -730,6 +1030,14 @@ JceScene *jce_scene_create(void)
      * entity delete, and scene destroy (world fini). */
     jce_scene_sequencer_install_hooks(s->world,
                                       ecs_id(JceSequencePlayerComponent));
+
+    /* Starts valid and empty. It only turns invalid on overflow or an
+     * allocation failure, and the query then falls back to the component
+     * lookup -- correct, just slower. Missing this initialiser is not: the flag
+     * stays false, the set is never populated, and the fast path it exists for
+     * is silently dead. */
+    s->comp_enable_ents_valid = true;
+    s->str_pool = jce_str_pool_create();
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -745,7 +1053,12 @@ void jce_scene_destroy(JceScene *s)
     if (s->world) ecs_fini(s->world);
     if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
     if (s->xgen) JCE_FREE(s->xgen);
+    if (s->comp_enable_ents) JCE_FREE(s->comp_enable_ents);
+    jce_str_pool_destroy(s->str_pool);   /* after ecs_fini: components are gone */
     jce_scene_clear_streaming_settings(s);   /* frees the lazy heap block */
+    jce_water_field_set_destroy(s->water_fields);
+    jce_water_ripple_destroy(s->water_ripple);
+    jce_terrain_cache_destroy(s->terrain_cache);
     JCE_FREE(s);
     LOG_INFO(LOG_TAG, "scene destroyed");
 }
@@ -812,6 +1125,14 @@ int jce_scene_clear(JceScene *s)
         }
     }
     ecs_defer_end(s->world);
+    /* roster_epoch is documented as "entity create/destroy" and every
+     * cross-frame consumer keys cache validity on it, but a CLEAR - the
+     * largest destroy there is - did not bump it.  A consumer that skipped
+     * work because "the roster has not moved" therefore kept operating on a
+     * roster that had just been emptied.  Found by the editor's prune
+     * verifier (JCE_DBG_VERIFY_PRUNE=1), which reported 168 of 363 entities
+     * dead across an unchanged epoch when Play mode reloaded the scene. */
+    if (count > 0) s->roster_epoch++;
 
     if (ids != stack_buf) JCE_FREE(ids);
 
@@ -845,6 +1166,14 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
         } else {
             ecs_set_name(s->world, e, name);
         }
+        /* Record what the caller asked for.  The flecs name above may have
+         * been uniquified; that must not be observable (see the
+         * JceCompAuthoredName comment). */
+        {
+            JceCompAuthoredName an;
+            an.v = jce_str_intern(s->str_pool, name);
+            ecs_set_ptr(s->world, e, JceCompAuthoredName, &an);
+        }
     }
 
     /* Default transform. */
@@ -868,23 +1197,54 @@ void jce_scene_destroy_entity(JceScene *s, JceEntity e)
     s->roster_epoch++;
 }
 
+/* The authored name if one was recorded, else the flecs name.  The fallback
+ * covers entities named through paths that predate JceCompAuthoredName and
+ * entities flecs named itself. */
+static const char *scene_authored_name(const JceScene *s, JceEntity e)
+{
+    const JceCompAuthoredName *an =
+        ecs_get(s->world, (ecs_entity_t)e, JceCompAuthoredName);
+    if (an && an->v && an->v[0]) return an->v;
+    return ecs_get_name(s->world, (ecs_entity_t)e);
+}
+
 const char *jce_scene_entity_name(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return "(none)";
-    const char *name = ecs_get_name(s->world, (ecs_entity_t)e);
+    const char *name = scene_authored_name(s, e);
     return name ? name : "(unnamed)";
 }
 
 const char *jce_scene_entity_registered_name(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return NULL;
-    return ecs_get_name(s->world, (ecs_entity_t)e);
+    return scene_authored_name(s, e);
 }
 
 void jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name)
 {
     if (!s || e == JCE_ENTITY_INVALID) return;
-    ecs_set_name(s->world, (ecs_entity_t)e, name);
+
+    /* Mirror jce_scene_create_entity: uniquify the flecs index name when it is
+     * already taken (this used to call ecs_set_name unconditionally), and
+     * record the authored name as the entity's identity. */
+    if (name && name[0]) {
+        ecs_entity_t taken = ecs_lookup(s->world, name);
+        if (taken != 0 && taken != (ecs_entity_t)e) {
+            char unique[256];
+            snprintf(unique, sizeof unique, "%s_%llu",
+                     name, (unsigned long long)e);
+            ecs_set_name(s->world, (ecs_entity_t)e, unique);
+        } else {
+            ecs_set_name(s->world, (ecs_entity_t)e, name);
+        }
+        JceCompAuthoredName an;
+        an.v = jce_str_intern(s->str_pool, name);
+        ecs_set_ptr(s->world, (ecs_entity_t)e, JceCompAuthoredName, &an);
+    } else {
+        ecs_set_name(s->world, (ecs_entity_t)e, name);
+        ecs_remove(s->world, (ecs_entity_t)e, JceCompAuthoredName);
+    }
 }
 
 /* ── Parent / child hierarchy ──────────────────────────────────────── */
@@ -1077,6 +1437,16 @@ uint64_t jce_scene_get_structural_epoch(const JceScene *s)
 uint64_t jce_scene_get_roster_epoch(const JceScene *s)
 {
     return s ? s->roster_epoch : 0;
+}
+
+uint64_t jce_scene_get_cull_data_gen(const JceScene *s)
+{
+    return s ? s->cull_data_gen : 0;
+}
+
+void jce_scene_bump_cull_data_gen(JceScene *s)
+{
+    if (s) s->cull_data_gen++;
 }
 
 uint64_t jce_scene_get_enable_gen(const JceScene *s)
@@ -1613,6 +1983,11 @@ int jce_scene_get_child_count(const JceScene *s, JceEntity parent)
  * the old generation was 0.  Callers that genuinely hold only an index must
  * say so via jce_scene_entity_from_index(), which documents that it cannot
  * detect staleness. */
+/* Returns 0 for a dead or invalid entity, so a NON-ZERO result is already proof
+ * of liveness.  Every accessor below relies on that and does NOT re-test it:
+ * ecs_is_alive is a flecs sparse-set lookup, and doing it twice per component
+ * read cost real cycles -- the submit loop measured 70 of them per visible
+ * entity for jce_scene_get_mesh_renderer alone, on 25.7k entities a frame. */
 static ecs_entity_t jce_scene_resolve_entity(const JceScene *s, JceEntity e)
 {
     if (!s || e == 0) return 0;
@@ -1634,6 +2009,14 @@ JceEntity jce_scene_entity_from_index(const JceScene *s, uint32_t index)
     return (JceEntity)ecs_get_alive(s->world, (ecs_entity_t)index);
 }
 
+/* Whether a setter expanded from the macros below invalidates the entity-cull
+ * freeze.  Off by default: a component the cull pass never reads must not cost
+ * a full cull rebuild when a script writes it every frame.  The block that
+ * declares the components jce_sr_cull.c DOES read flips this on around them,
+ * and check_cull_gen_consumers.py fails the build if that file grows a read
+ * whose component was declared with the no-op form. */
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
+
 #define JCE_COMP_IMPL(TYPE, NAME)                                       \
 void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
 {                                                                       \
@@ -1641,13 +2024,14 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
     ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    JCE_COMP_CULL_BUMP(s);                                              \
 }                                                                       \
                                                                         \
 TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
 {                                                                       \
     if (!s) return NULL;                                                \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    if (!re) return NULL;   /* resolve already proved liveness */     \
     return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
 }                                                                       \
                                                                         \
@@ -1655,7 +2039,7 @@ bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
 {                                                                       \
     if (!s) return false;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    if (!re) return false;  /* resolve already proved liveness */     \
     return ecs_has(s->world, re, TYPE);                                \
 }                                                                       \
                                                                         \
@@ -1680,13 +2064,14 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     if (!re) return;                                                     \
     ecs_set_ptr(s->world, re, TYPE, v);                                 \
     jce_scene_invalidate_entity_material(s, e);                         \
+    JCE_COMP_CULL_BUMP(s);                                              \
 }                                                                       \
                                                                         \
 TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
 {                                                                       \
     if (!s) return NULL;                                                \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    if (!re) return NULL;   /* resolve already proved liveness */     \
     return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
 }                                                                       \
                                                                         \
@@ -1694,7 +2079,7 @@ bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
 {                                                                       \
     if (!s) return false;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    if (!re) return false;  /* resolve already proved liveness */     \
     return ecs_has(s->world, re, TYPE);                                \
 }                                                                       \
                                                                         \
@@ -1714,6 +2099,10 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
     ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    /* No JCE_COMP_CULL_BUMP here: this macro serves Transform/Pivot, whose  \
+     * changes the cull freeze already tracks through xform_counter below.   \
+     * Bumping the cull generation as well would invalidate the freeze on    \
+     * every entity move -- exactly what the per-entity gen exists to avoid. */\
     /* Per-entity world-cache invalidation: a transform/pivot edit changes only \
      * this entity's subtree, so bump its gen instead of the global epoch (a     \
      * moving camera/script entity no longer drops the whole static cache).      \
@@ -1725,7 +2114,7 @@ TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
 {                                                                       \
     if (!s) return NULL;                                                \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    if (!re) return NULL;   /* resolve already proved liveness */     \
     return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
 }                                                                       \
                                                                         \
@@ -1733,7 +2122,7 @@ bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
 {                                                                       \
     if (!s) return false;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
-    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    if (!re) return false;  /* resolve already proved liveness */     \
     return ecs_has(s->world, re, TYPE);                                \
 }                                                                       \
                                                                         \
@@ -1748,7 +2137,13 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
 
 JCE_COMP_IMPL_WORLD(JceTransform,          transform)
 JCE_COMP_IMPL_WORLD(JcePivotComponent,     pivot)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL_MATERIAL(JceMeshRenderer,       mesh_renderer)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 
 /* Read-only ecs_get_id variant for CONCURRENT worker-thread reads under
  * multi-threaded readonly mode. jce_scene_get_mesh_renderer uses ecs_get_mut
@@ -1758,7 +2153,7 @@ const JceMeshRenderer *jce_scene_get_mesh_renderer_const(const JceScene *s, JceE
 {
     if (!s) return NULL;
     ecs_entity_t re = jce_scene_resolve_entity((JceScene *)s, e);
-    if (!re || !ecs_is_alive(s->world, re)) return NULL;
+    if (!re) return NULL;   /* resolve already proved liveness */
     return (const JceMeshRenderer *)ecs_get_id(s->world, re, ecs_id(JceMeshRenderer));
 }
 
@@ -1816,6 +2211,16 @@ void jce_scene_each_camera(JceScene *s, JceEntityCallback cb, void *user_data)
     ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceCameraComponent));
     while (ecs_each_next(&it))
         for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
+void jce_scene_each_fullscreen_effect(JceScene *s, JceEntityCallback cb,
+                                      void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceSceneFullscreenEffect));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; ++i)
             cb(s, (JceEntity)it.entities[i], user_data);
 }
 
@@ -1981,6 +2386,20 @@ void jce_scene_each_dir_light(JceScene *s, JceEntityCallback cb, void *user_data
             cb(s, (JceEntity)it.entities[i], user_data);
 }
 
+/* Canvas entities only.  The UI overlay used to find its canvases by walking
+ * EVERY entity in the world and probing has_canvas per element - 200,833
+ * probes per frame in a large scene, 4.14 ms, and the "no canvases" early-out
+ * came after the walk, so a scene with no UI at all paid the full price.
+ * Iterating the component instead is O(canvases). */
+void jce_scene_each_canvas(JceScene *s, JceEntityCallback cb, void *user_data)
+{
+    if (!s || !s->world || !cb) return;
+    ecs_iter_t it = ecs_each_id(s->world, ecs_id(JceCanvasComponent));
+    while (ecs_each_next(&it))
+        for (int i = 0; i < it.count; i++)
+            cb(s, (JceEntity)it.entities[i], user_data);
+}
+
 void jce_scene_each_reflection_probe(JceScene *s, JceEntityCallback cb, void *user_data)
 {
     if (!s || !s->world || !cb) return;
@@ -2001,13 +2420,31 @@ void jce_scene_each_light_probe_group(JceScene *s, JceEntityCallback cb, void *u
 
 JCE_COMP_IMPL(JceCameraComponent,             camera)
 JCE_COMP_IMPL(JceDirectionalLight,            dir_light)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JcePointLight,                  point_light)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceSpotLight,                   spot_light)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceSkyboxComponent,             skybox)
 JCE_COMP_IMPL(JceSpriteRendererComponent,     sprite_renderer)
 JCE_COMP_IMPL(JceSpriteAnimatorComponent,     sprite_animator)
 JCE_COMP_IMPL(JceAnimatorComponent,           animator)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceSkeletalAnimatorComponent,   skeletal_animator)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceConstraintComponent,         constraint)
 JCE_COMP_IMPL(JceRigidBodyComponent,          rigidbody)
 JCE_COMP_IMPL(JceRigidBody2DComponent,        rigidbody2d)
@@ -2036,9 +2473,21 @@ JCE_COMP_IMPL(JceCompoundColliderComponent,   compound_collider)
 JCE_COMP_IMPL(JceCollider2DComponent,         collider2d)
 JCE_COMP_IMPL(JceTrailRendererComponent,      trail_renderer)
 JCE_COMP_IMPL(JceLineRendererComponent,       line_renderer)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceReflectionProbeComponent,    reflection_probe)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceDecalComponent,              decal)
+/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
+ * write has to invalidate the entity-cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceLightProbeGroupComponent,    light_probe_group)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceAudioListenerComponent,      audio_listener)
 JCE_COMP_IMPL(JceAudioReverbZoneComponent,    audio_reverb_zone)
 JCE_COMP_IMPL(JceAudioOcclusionComponent,     audio_occlusion)
@@ -2088,6 +2537,7 @@ JCE_COMP_IMPL(JceFractureComponent,           fracture)
 JCE_COMP_IMPL(JceVehicleComponent,            vehicle)
 JCE_COMP_IMPL(JceSoftBodyComponent,           soft_body)
 JCE_COMP_IMPL(JceSimLodComponent,             sim_lod)
+JCE_COMP_IMPL(JceSceneFullscreenEffect,       fullscreen_effect)
 
 #undef JCE_COMP_IMPL_WORLD
 #undef JCE_COMP_IMPL
@@ -2193,17 +2643,105 @@ uint32_t jce_scene_anim_take_params(JceScene *s, JceEntity e,
 
 /* ── Id-keyed enable state (component registry) ───────────────────── */
 
+/* Beyond this the set stops paying for itself and the query falls back to the
+ * component lookup.  A scene with more disabled components than this is not the
+ * case being optimised; correctness does not depend on the bound. */
+#define JCE_COMP_DISABLE_SET_MAX 64
+
+static void jce__disable_set_add(JceScene *s, JceEntity e)
+{
+    if (!s->comp_enable_ents_valid) return;
+    for (int32_t i = 0; i < s->comp_enable_ents_count; i++)
+        if (s->comp_enable_ents[i] == e) return;
+    if (s->comp_enable_ents_count >= JCE_COMP_DISABLE_SET_MAX) {
+        /* Give up rather than truncate: a partial set would answer "enabled"
+         * for an entity that is disabled, which is a wrong picture, not a slow
+         * one.  From here the query takes the component lookup again. */
+        s->comp_enable_ents_valid = false;
+        return;
+    }
+    if (s->comp_enable_ents_count == s->comp_enable_ents_cap) {
+        const int32_t nc = s->comp_enable_ents_cap ? s->comp_enable_ents_cap * 2 : 8;
+        JceEntity *ng = (JceEntity *)JCE_REALLOC(s->comp_enable_ents,
+                                                 (size_t)nc * sizeof(JceEntity));
+        if (!ng) { s->comp_enable_ents_valid = false; return; }
+        s->comp_enable_ents = ng;
+        s->comp_enable_ents_cap = nc;
+    }
+    s->comp_enable_ents[s->comp_enable_ents_count++] = e;
+}
+
+static void jce__disable_set_remove(JceScene *s, JceEntity e)
+{
+    if (!s->comp_enable_ents_valid) return;
+    for (int32_t i = 0; i < s->comp_enable_ents_count; i++)
+        if (s->comp_enable_ents[i] == e) {
+            s->comp_enable_ents[i] =
+                s->comp_enable_ents[--s->comp_enable_ents_count];
+            return;
+        }
+}
+
+JceStrPool *jce_scene_str_pool(JceScene *s)
+{
+    return s ? s->str_pool : NULL;
+}
+
+const char *jce_scene_intern(JceScene *s, const char *str)
+{
+    return jce_str_intern(s ? s->str_pool : NULL, str);
+}
+
+bool jce_scene_has_component_disables(const JceScene *s)
+{
+    return s && s->comp_enable_rows > 0;
+}
+
+int32_t jce_scene_component_disable_count(const JceScene *s)
+{
+    return s ? s->comp_enable_rows : 0;
+}
+
+bool jce_scene_comp_enabled_alive(const JceScene *s, JceEntity e, int comp_id)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return true;
+    if (s->comp_enable_rows <= 0) return true;
+    if (s->comp_enable_ents_valid) {
+        for (int32_t i = 0; i < s->comp_enable_ents_count; i++)
+            if (s->comp_enable_ents[i] == e) goto lookup;
+        return true;
+    }
+lookup: {
+        const JceCompEnableState *st =
+            ecs_get(s->world, (ecs_entity_t)e, JceCompEnableState);
+        if (!st) return true;
+        return (st->disabled[comp_id >> 6] & (UINT64_C(1) << (comp_id & 63))) == 0;
+    }
+}
+
 bool jce_scene_comp_enabled(const JceScene *s, JceEntity e, int comp_id)
 {
     if (!s || e == JCE_ENTITY_INVALID) return false;
     if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return true;
     ecs_entity_t ent = (ecs_entity_t)e;
     if (!ecs_is_alive(s->world, ent)) return false;
-    /* O(1) all-clear: no entity in the world carries an enable-state row
-     * (the row is removed when fully re-enabled, see set_comp_enabled), so
-     * every component is enabled — skip the per-entity ecs_get.  This gate
-     * runs AFTER is_alive so dead entities still report disabled. */
-    if (ecs_count_id(s->world, ecs_id(JceCompEnableState)) == 0) return true;
+    /* All-clear: no entity in the world carries an enable-state row (the row
+     * is removed when fully re-enabled, see set_comp_enabled), so every
+     * component is enabled - skip the per-entity ecs_get.  Runs AFTER
+     * is_alive so dead entities still report disabled.  Read from the
+     * maintained counter, not ecs_count_id: same answer, no iterator. */
+    if (s->comp_enable_rows <= 0) return true;
+    /* A scene typically has a handful of disable rows -- one, in the 200k
+     * bench -- and the all-or-nothing check above does nothing for the other
+     * 199,999 entities.  Scanning the id list answers those in a couple of
+     * cycles instead of a component lookup. */
+    if (s->comp_enable_ents_valid) {
+        bool listed = false;
+        for (int32_t i = 0; i < s->comp_enable_ents_count; i++)
+            if (s->comp_enable_ents[i] == e) { listed = true; break; }
+        if (!listed) return true;
+    }
     const JceCompEnableState *st = ecs_get(s->world, ent, JceCompEnableState);
     if (!st) return true;   /* default enabled */
     return (st->disabled[comp_id >> 6] & (UINT64_C(1) << (comp_id & 63))) == 0;
@@ -2226,12 +2764,60 @@ void jce_scene_set_comp_enabled(JceScene *s, JceEntity e, int comp_id,
     else
         st.disabled[comp_id >> 6] |=  (UINT64_C(1) << (comp_id & 63));
 
+    /* Any change to a per-component enable bit invalidates every cached
+     * draw list keyed on enable_gen.  jce_scene_bump_enable_gen existed but
+     * had no caller anywhere in the engine, so the counter sat at 1 for the
+     * lifetime of a scene: a renderer that had frozen its list kept drawing
+     * meshes the script had already switched off.  The editor Game View hit
+     * this and the standalone runtime did not -- their caches happen to be
+     * invalidated by different things -- which is exactly the class of
+     * editor/runtime divergence the parity gate exists to prevent. */
     if ((st.disabled[0] | st.disabled[1] | st.disabled[2] | st.disabled[3]) == 0) {
-        if (ecs_has(s->world, ent, JceCompEnableState))
+        if (ecs_has(s->world, ent, JceCompEnableState)) {
             ecs_remove(s->world, ent, JceCompEnableState);
+            if (s->comp_enable_rows > 0) s->comp_enable_rows--;
+            jce__disable_set_remove(s, e);
+            jce_scene_bump_enable_gen(s);
+        }
         return;
     }
-    ecs_set_ptr(s->world, ent, JceCompEnableState, &st);
+    if (!cur || memcmp(cur, &st, sizeof st) != 0) {
+        ecs_set_ptr(s->world, ent, JceCompEnableState, &st);
+        if (!cur) {
+            s->comp_enable_rows++;   /* a row was ADDED, not edited */
+            jce__disable_set_add(s, e);
+        }
+        jce_scene_bump_enable_gen(s);
+    }
+}
+
+void jce_scene_mark_comp_script_driven(JceScene *s, JceEntity e, int comp_id)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return;
+
+    JceCompScriptDriven st = {{0}};
+    const JceCompScriptDriven *cur = ecs_get(s->world, ent, JceCompScriptDriven);
+    if (cur) st = *cur;
+
+    const uint64_t bit = UINT64_C(1) << (comp_id & 63);
+    if (cur && (st.driven[comp_id >> 6] & bit)) return;   /* already marked */
+    st.driven[comp_id >> 6] |= bit;
+    ecs_set_ptr(s->world, ent, JceCompScriptDriven, &st);
+}
+
+bool jce_scene_comp_script_driven(const JceScene *s, JceEntity e, int comp_id)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return false;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return false;
+    if (ecs_count_id(s->world, ecs_id(JceCompScriptDriven)) == 0) return false;
+    const JceCompScriptDriven *st = ecs_get(s->world, ent, JceCompScriptDriven);
+    if (!st) return false;
+    return (st->driven[comp_id >> 6] & (UINT64_C(1) << (comp_id & 63))) != 0;
 }
 
 /* ── Legacy 64-bit mask shims (flag-keyed callers keep working) ───── */
@@ -2266,6 +2852,14 @@ void jce_scene_set_disabled_components(JceScene *s, JceEntity e, uint64_t mask)
         if (!flag) continue;
         jce_scene_set_comp_enabled(s, e, id, (mask & flag) == 0);
     }
+}
+
+bool jce_scene_component_enabled_alive(const JceScene *s, JceEntity e,
+                                       uint64_t flag)
+{
+    int id = jce_component_from_legacy_flag(flag);
+    if (id == JCE_COMP_ID_INVALID) return true;
+    return jce_scene_comp_enabled_alive(s, e, id);
 }
 
 bool jce_scene_component_enabled(const JceScene *s, JceEntity e, uint64_t flag)

@@ -11,6 +11,8 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/world/jce_environment.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_texture_types.h>
@@ -20,10 +22,13 @@
 #include <jce/middleware/scene/jce_water.h>
 #include <jce/middleware/animation/jce_morph.h>  /* JCE_MORPH_MAX_WEIGHTS */
 
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
+
+typedef struct JceStrPool JceStrPool;
 
 /* ── Component types ─────────────────────────────────────────────── */
 
@@ -47,9 +52,25 @@ typedef struct {
     JceModelHandle  model;
     JceShaderHandle shader;
     bool            visible;
-    /* Persistent asset paths (for serialization). */
-    char            mesh_path[256];
-    char            material_path[256];
+    /* Persistent asset paths (for serialization), INTERNED.
+     *
+     * These were seven inline char[256] -- 1792 of this struct's 1912 bytes,
+     * 94% of it. flecs keeps a component as one contiguous array per table, so
+     * a table of N mesh renderers needs N * sizeof(this) in a SINGLE
+     * allocation. At 1,048,576 entities that was 1.87 GB, growing past it asked
+     * for 3.73 GB contiguous, the allocation failed, flecs did not check, and
+     * the next write went to NULL + 1912 * 2^20 -- the exact faulting address
+     * recovered from the minidump. The entity ceiling was never 2^20; it is
+     * 2 GB / sizeof(component), and this is what sets it.
+     *
+     * Now pointers into the scene's string pool (jce_scene_str_pool). Assign
+     * via jce_str_intern; never write through them. NEVER NULL -- interning ""
+     * yields a dereferenceable empty string, so `mr->mesh_path[0]` reads
+     * exactly as it did when these were arrays, which is why the read sites did
+     * not have to change. Valid for the interning scene's lifetime, the same
+     * rule every other component payload already follows. */
+    const char     *mesh_path;
+    const char     *material_path;
     int             mesh_shape;         /* procedural: 0=cube, 1=sphere, etc. */
     /* Inline PBR material. */
     float           base_color[4];      /* RGBA linear */
@@ -66,11 +87,11 @@ typedef struct {
        behaviour: cast ON, receive ON. */
     bool            shadow_cast_off;    /* true = this mesh casts no shadows */
     bool            shadow_receive_off; /* true = this mesh ignores shadows  */
-    char            albedo_tex[256];
-    char            mr_tex[256];
-    char            normal_tex[256];
-    char            ao_tex[256];
-    char            emissive_tex[256];
+    const char     *albedo_tex;      /* interned, see mesh_path above */
+    const char     *mr_tex;
+    const char     *normal_tex;
+    const char     *ao_tex;
+    const char     *emissive_tex;
     /* Runtime albedo override (NOT serialized; zero-init = off).  When
        has_albedo_runtime is set, the renderer uses albedo_runtime_idx (a bgfx
        texture handle index) as the base-colour texture instead of resolving
@@ -99,6 +120,33 @@ typedef struct {
     float           outline_width;     /* world-units hull extrusion; 0 = no outline */
     float           outline_color[3];  /* linear */
 } JceMeshRenderer;
+
+/* The scene's string pool, and the shorthand every caller actually wants.
+ * jce_scene_intern never returns NULL, so the assignment is unconditional:
+ *     mr->mesh_path = jce_scene_intern(scene, path);
+ * Passing a NULL scene returns the input unchanged, which keeps component
+ * builders that run before a scene exists working. */
+/* Zero a JceMeshRenderer the way it expects to be zeroed.
+ *
+ * A plain memset leaves the seven interned path pointers NULL, and every reader
+ * dereferences them unconditionally -- correctly, because they used to be
+ * char[256] where zero meant "". Components that flecs creates get this through
+ * a ctor hook; ones built on the stack have to call this. */
+JCE_INLINE void jce_mesh_renderer_init(JceMeshRenderer *mr)
+{
+    if (!mr) return;
+    /* A plain literal rather than jce_str_empty(): several minimal test targets
+     * do not link the scene library, and nothing compares these pointers for
+     * identity -- readers use [0] or strcmp. Interning proper still funnels
+     * every non-empty path through the pool, which is where sharing matters. */
+    const char *e = "";
+    memset(mr, 0, sizeof(*mr));
+    mr->mesh_path = mr->material_path = mr->albedo_tex = mr->mr_tex =
+        mr->normal_tex = mr->ao_tex = mr->emissive_tex = e;
+}
+
+JCE_API JceStrPool *jce_scene_str_pool(JceScene *s);
+JCE_API const char *jce_scene_intern(JceScene *s, const char *str);
 
 typedef enum {
     JCE_CAMERA_CLEAR_SKYBOX     = 0, /* clear with skybox (default) */
@@ -201,6 +249,16 @@ typedef enum {
     JCE_SCENE_SKY_EQUIRECT = 1,
     JCE_SCENE_SKY_PREETHAM = 2,
     JCE_SCENE_SKY_STYLIZED = 3,   /* multi-stop dome + horizon glow + sun disk/halo (golden-hour) */
+    /* PHYSICAL (4): samples the CPU-baked atmospheric transmittance table
+     * (jce_atmosphere.h) instead of an analytic fit.  It is the same table the
+     * LIGHTING authority reads, so the sky and the sun colour finally come
+     * from one atmosphere rather than two independent approximations.
+     *
+     * OPT-IN: no scene selects it unless authored, so every existing sky is
+     * pixel-identical.  It is a different look, not a strictly better one --
+     * Preetham is a fit to measured skies and can be prettier at some
+     * elevations; PHYSICAL is consistent with the light it casts. */
+    JCE_SCENE_SKY_PHYSICAL = 4
 } JceSceneSkyMode;
 
 typedef struct {
@@ -271,6 +329,35 @@ typedef struct {
      * Absent in older scenes → defaults to GRADIENT (no visual change). */
     int   sky_mode;            /* JceSceneSkyMode (0 = gradient)          */
     float sky_turbidity;       /* Preetham haze, ~2-3 clear; clamp [1,10] */
+
+    /* ── Volumetric clouds ─────────────────────────────────────────────
+     *
+     * coverage 0 = OFF, and that default is what keeps every existing scene
+     * pixel-identical: the sky pass skips the march entirely rather than
+     * marching a transparent layer.
+     *
+     * The density field is BAKED on the CPU (jce_cloud_noise) and uploaded as
+     * a slice atlas.  That is not a fallback for missing compute -- it is the
+     * only shape that works on the charter's minimum profile, where WebGL2 has
+     * no compute at all, and it also means the same field is available to
+     * anything CPU-side that needs to ask whether a point is in cloud. */
+    float cloud_coverage;      /* [0,1]; 0 = no clouds (default)          */
+
+    float cloud_density;       /* extinction scale; 0 selects 1.0         */
+    float cloud_bottom_km;     /* layer base altitude; 0 selects 1.5      */
+    float cloud_top_km;        /* layer top;          0 selects 4.0       */
+
+    /* ── Sky stylisation grade (design: physical core, graded on top) ───
+     * Identity is: bands 0, rim 0, saturation 1, all three tints (1,1,1).
+     * A scene that never touches these renders bit-identically to one built
+     * before the layer existed -- which is acceptance criterion 7, and the
+     * reason the tints default to ONE rather than to zero. */
+    int   sky_stylise_bands;       /* 0 or 1 = off                          */
+    float sky_stylise_rim;         /* 0 = off                               */
+    float sky_stylise_saturation;  /* 1 = identity; 0 in old scenes -> 1    */
+    float sky_tint_shadow[3];
+    float sky_tint_mid[3];
+    float sky_tint_high[3];
 
     /* ── Floating origin (large-world precision; opt-in, default OFF) ───
      * When floating_origin_enabled, the runtime periodically re-bases the
@@ -376,6 +463,55 @@ typedef struct {
      * dome zenith color as ambient and ignore the authored ambient entirely.
      * Absent in older scenes → true (byte-identical).                      */
     bool  ibl_enabled;
+
+    /* ── APPEND ONLY BELOW THIS LINE ──────────────────────────────────
+     *
+     * This struct is in the frozen public ABI (docs/architecture/
+     * abi-snapshot.txt). A member added at the END is slot-compatible:
+     * everything already compiled keeps reading the same offsets. A member
+     * INSERTED anywhere above shifts every later field, so code built against
+     * the old header silently reads the wrong one -- no link error, no
+     * warning, wrong picture.
+     *
+     * The three fields below are here BECAUSE that happened. They were first
+     * written next to `cloud_coverage`, where they read best, and
+     * check_abi_snapshot.py caught it:
+     *
+     *   CHANGED struct JceSceneRenderingSettings -- 'float wind_direction_x'
+     *   was INSERTED at index 40: 'float cloud_density' was index 40 and is
+     *   now index 43, and so is everything after it
+     *
+     * Reading order is worth something; binary compatibility is worth more,
+     * and only one of the two can be fixed after the fact. */
+
+    /* Which way the weather blows, world XZ. Normalised on load; a zero-length
+     * pair means "not authored" and leaves the environment's own default.
+     *
+     * The environment state has carried wind_direction_ws since it was written
+     * and NOTHING has ever set it, so every scene has blown along +X because
+     * that is what jce_environment_default happens to leave there. That was
+     * nearly invisible in the worst way: the weather overlay multiplies by
+     * dir.x, so a default of 0 would have made rain fall perfectly vertically
+     * with a perfectly healthy wind speed sitting next to it -- which is a
+     * regression this plan has already had once, from the other side.
+     *
+     * SPEED is not authored here. It comes from the weather (U1/U4), and a
+     * scene that could set both would be able to state a calm gale. */
+    float wind_direction_x;    /* world XZ; (0,0) = not authored          */
+    float wind_direction_z;
+
+    /* Air temperature in degrees Celsius. Defaults to the environment's own
+     * 15 C, so a scene that never sets it behaves exactly as before.
+     *
+     * It is here because snow could not otherwise exist. The environment
+     * accumulates `snow_amount` only while `temperature_c <= 1 C` and melts it
+     * to zero on every frame above that, and NOTHING in the repository ever
+     * assigned temperature_c -- so every scene sat at the 15 C struct default
+     * and snow was unreachable by construction, in an engine that renders
+     * snowfall. Adding a reader for snow_amount without this would have been
+     * the same mistake one layer further along: a consumer for a carrier whose
+     * writer does not exist. */
+    float temperature_c;
 } JceSceneRenderingSettings;
 
 /* ── Scene-level world-streaming settings ───────────────────────────
@@ -859,6 +995,13 @@ typedef struct {
     /* Engine-owned runtime state (NOT serialized; cleared on scene load). */
     uint32_t emitter_handle_idx; /* JceEmitterHandle.idx; UINT32_MAX = none */
     bool     loaded;             /* emitter created in the scene particle system */
+    /* Sticky "script asked this emitter to stop" flag.  Emitters are built
+     * lazily (capped per frame) and are started on creation, so a stop issued
+     * BEFORE the emitter existed used to be lost: the effect then began
+     * emitting the moment it was finally built.  A scene that switches most
+     * of its effects off during init had them all firing on frame one.
+     * Zero-initialised, so the default stays "emit" as before. */
+    bool     emit_suppressed;
     uint64_t asset_epoch;        /* path-change marker so edits re-load the asset */
 } JceParticleEmitterComponent;
 
@@ -930,19 +1073,45 @@ typedef struct {
 /* ── Editor metadata (stored on entities only in editor builds) ── */
 
 typedef struct {
+    /* INTERNED, and declared first so the pointers pack ahead of the char
+     * arrays rather than straddling them -- the same treatment JceMeshRenderer
+     * got, for the same reason. These two were char[260]: 520 of this struct's
+     * 656 bytes, 79% of it, on EVERY entity (jce_editor_state.cpp sets
+     * JceEditorMeta unconditionally in jce_state_create_entity). flecs keeps a
+     * component as one contiguous array per table, so at 200k entities that
+     * column alone was 131 MB of mostly-empty path buffers.
+     *
+     * Assign via jce_scene_intern; never write through them. Never NULL --
+     * a ctor hook and jce_editor_meta_init give every instance a
+     * dereferenceable "", because readers do prefab_path[0] with no null
+     * check, correctly, since these used to be arrays. */
+    const char *prefab_path;
+    /* Prefab variant: when this entity was created via "Save as Variant",
+     * this holds the source prefab path the variant inherits from. Empty
+     * string means "not a variant". */
+    const char *variant_parent_path;
     char     name[64];      /* Display name (not flecs name, to allow duplicates) */
+    /* NOT redundant with JceTagComponent.tag_id: that registry caps names at
+     * JCE_TAG_NAME_MAX (32) and holds JCE_TAG_REGISTRY_MAX (1024) entries, so
+     * this field strictly dominates -- a 40-character tag, or the 1025th
+     * distinct one, exists only here. Removing it is silent data loss on save. */
     char     tag[64];
     uint8_t  tag_color;     /* JceTagColor from editor */
     bool     enabled;
     bool     prefab_instance;
-    char     prefab_path[260];
-    /* Prefab variant: when this entity was created via "Save as Variant",
-     * this holds the source prefab path the variant inherits from. Empty
-     * string means "not a variant". */
-    char     variant_parent_path[260];
     /* Unity-style layer index 0..31. References JceProjectTagsAndLayers.layers[]. */
     int      layer;
 } JceEditorMeta;
+
+/* Zero a JceEditorMeta the way it expects: a memset would leave the two
+ * interned pointers NULL and every reader dereferences them. Components flecs
+ * creates get this through a ctor hook; stack-built ones must call this. */
+JCE_INLINE void jce_editor_meta_init(JceEditorMeta *m)
+{
+    if (!m) return;
+    memset(m, 0, sizeof(*m));
+    m->prefab_path = m->variant_parent_path = "";
+}
 
 /* ── Terrain (Phase 2 scene integration) ─────────────────────────── */
 
@@ -1064,6 +1233,48 @@ typedef struct {
     float        color_shallow[3];/* color at grazing / shallow depth         */
     float        color_deep[3];   /* color at steep / deep view               */
     float        transparency;    /* 0 = opaque, 1 = fully transparent        */
+
+    /* Beer-Lambert water clarity, in metres: roughly how far you can see
+     * through it.  0 = off, and OFF IS THE DEFAULT because absorption changes
+     * what every existing water body looks like -- an authored scene tuned
+     * against the old view-angle lerp must keep rendering as authored until
+     * someone opts in.
+     *
+     * One number, not three extinction coefficients: a designer can judge
+     * "how far can I see" by eye and cannot judge per-channel sigmas, and
+     * exposing the raw values is how water gets tuned into a substance that
+     * does not exist.
+     *
+     * REQUIRES the camera depth pre-pass: the path length is `scene depth -
+     * surface depth`, and there is no honest substitute for the scene depth.
+     * The renderer asks for the pre-pass on this component's behalf whenever
+     * any visible water body has clarity > 0, on every quality tier -- it used
+     * to be requested only by SSAO/SSR/TAA, so on the LOW preset (all three
+     * off) absorption vanished with no diagnostic.  It is also the master
+     * switch for `caustics` and `shore_foam_m` below: both live inside the
+     * absorption branch in fs_water.sc, so clarity == 0 silences all three. */
+    float        clarity;
+
+    /* Caustics: the focused sunlight pattern on the floor, derived from the
+     * SAME surface Jacobian the whitecap term uses, so foam and caustics can
+     * never drift apart.  0 = off, and off is the default for the same reason
+     * clarity is: it changes how every existing water body looks.
+     *
+     * FFT MODE ONLY.  The Jacobian is finite-differenced from the FFT
+     * displacement map, and GERSTNER / STYLIZED never build one -- there is no
+     * surface texture to differentiate, so the term is not merely disabled,
+     * it has no input.  Left on a Gerstner pond this value round-trips through
+     * the scene file and changes nothing on screen; the inspector says so next
+     * to the slider rather than letting a designer drag it and wonder.
+     * (Also needs clarity > 0, per the note above.) */
+    float        caustics;
+
+    /* Shoreline foam, derived from how THIN the water is -- so it follows a
+     * rock in a lake and works on a river, unlike `shore_ripple` below which
+     * measures the radius of the mesh quad.  Band width in METRES: a band in
+     * UV is a different physical width on every body.  0 = off. */
+    float        shore_foam_m;
+    float        shore_surge_s;   /* one advance+retreat; 0 = still */
     float        sun_specular;    /* sun highlight intensity                  */
     float        shore_ripple;    /* stylized shore ripple-ring strength
                                    * (0 = off; old scenes render identically) */
@@ -1086,6 +1297,49 @@ typedef struct {
     float        fft_wind_dir_z;
     float        fft_amplitude;   /* Phillips energy scale (wave height)       */
     int          fft_resolution;  /* FFT grid N; clamped to a power-of-2 [32,256] */
+
+    /* ── Modern spectrum (JONSWAP) ─────────────────────────────────────
+     *
+     * FETCH is the distance the wind has blown over open water, in metres.
+     * Raw Phillips -- the default -- has no such parameter, so it cannot tell
+     * the same wind blowing across a pond from the same wind blowing across an
+     * ocean.  Fetch is the single control that makes a sea look like a
+     * SPECIFIC sea: short fetch gives steep, short, choppy water; long fetch
+     * gives the long swell of open ocean.
+     *
+     * 0 keeps Phillips, and that default is load-bearing: switching spectra
+     * changes every height value, so it is a deliberate re-baseline of any
+     * golden hash over the water field, never a side effect of a build.
+     *
+     * `fft_swell` in [0,1] adds a Horvath long-period component on top. */
+    /* Open-ocean geometry: build the surface as concentric rings centred on
+     * the camera instead of a uniform grid.
+     *
+     * OFF by default, and that is not just compatibility -- it is the right
+     * answer for a POND.  A uniform grid is ideal when the whole surface is
+     * about equally far away; rings only pay off when the water runs to the
+     * horizon, where a grid puts a vertex every 78 m and rings put them where
+     * the camera actually is. */
+    bool         ocean;
+
+    float        fft_fetch;       /* metres; 0 = Phillips (default)            */
+    float        fft_swell;       /* [0,1]; 0 = none                           */
+
+    /* Write the water surface into the depth buffer.
+     *
+     * OFF by default, which is the historical behaviour and keeps every
+     * existing scene pixel-identical.  Water is translucent, so NOT writing
+     * depth lets it composite over the solid scene without occluding what is
+     * behind it -- correct for a pond you can see through, and the reason this
+     * is authored rather than simply switched on.
+     *
+     * Turn it ON when the water must take part in DEPTH-based effects:
+     * screen-space reflections, depth of field and aerial fog all read the
+     * depth buffer, and at a non-writing water pixel they see whatever lies
+     * BEHIND the surface rather than the surface itself.  The cost is that
+     * translucent geometry drawn later and further away is depth-rejected, so
+     * water with anything visible beneath it wants this left off. */
+    bool         depth_write;
 } JceWaterComponent;
 
 /* ── Buoyancy (floats a dynamic body on the active water surface, gap 2.3) ─
@@ -2516,6 +2770,11 @@ JCE_API void      jce_scene_invalidate_entity_world(JceScene *s, JceEntity e);
  *    ANY world matrix change" without probing 150k per-entity gens. */
 JCE_API uint64_t  jce_scene_get_roster_epoch(const JceScene *s);
 JCE_API uint64_t  jce_scene_get_enable_gen(const JceScene *s);
+/* Bumped whenever any component's data is written through jce_scene_set_*.
+ * Cache keys that memoize per-entity state derived from component FIELDS
+ * must include this, or a runtime edit to that field will not take effect. */
+JCE_API uint64_t  jce_scene_get_cull_data_gen(const JceScene *s);
+JCE_API void      jce_scene_bump_cull_data_gen(JceScene *s);
 JCE_API uint64_t  jce_scene_get_xform_counter(const JceScene *s);
 JCE_API void      jce_scene_bump_enable_gen(JceScene *s);
 JCE_API void      jce_scene_notify_physics_writeback(JceScene *s);
@@ -2853,6 +3112,86 @@ JCE_API bool                    jce_scene_has_grass_field(const JceScene *s, Jce
 JCE_API void                    jce_scene_remove_grass_field(JceScene *s, JceEntity e);
 
 /* Component access — Water (Gerstner surface). */
+/* The scene's water fields: one simulation per body, all on one clock.
+ *
+ * The renderer and the physics/gameplay simulation both reach the water through
+ * THIS, which is what makes them the same water.  Before it existed each kept
+ * its own accumulator and a floating body bobbed to a wave that was not the
+ * wave beneath it.  Created on first call; NULL only on allocation failure. */
+/* Drop the scene's cached terrain for `path` (NULL = all of them).
+ *
+ * The renderer, the pick pass and the physics world all BORROW one loaded
+ * terrain per path.  This is how an edit reaches them: the next time each
+ * consumer asks for the terrain it sees a new revision and rebuilds its own
+ * derived data -- chunk meshes, pick mesh, collision shape.
+ *
+ * The editor must call this after a sculpt/save/import.  Invalidating only the
+ * renderer drops its meshes but leaves the shared grid untouched, so it would
+ * rebuild them from exactly the same stale heights. */
+JCE_API void JCE_CALL jce_scene_invalidate_terrain(JceScene *s, const char *path);
+
+struct JceWaterFieldSet;
+/* THE environment state for this scene -- time of day, weather, wind,
+ * humidity, cloud cover. Created on first use from jce_environment_default().
+ *
+ * On the SCENE and not on the renderer, so that physics and gameplay can read
+ * the same wind the renderer draws with. It was on the renderer, and the
+ * runtime could not see it: the ocean the buoyancy solver sampled was built
+ * from an unweathered wind while the one on screen was built from a weathered
+ * one, and both were handed to the same water field.
+ *
+ * Never NULL for a live scene. */
+JCE_API JceEnvironmentState *JCE_CALL jce_scene_environment(JceScene *s);
+
+/* Fill a water-field descriptor for `e` from its Water component, its WORLD
+ * transform and this scene's environment. False if `e` has no Water component.
+ *
+ * Use this rather than filling a JceWaterFieldDesc by hand: two callers doing
+ * that produced a CPU water surface fifteen metres below the water that was
+ * drawn, a body centre forty metres from the body, and a wave spectrum that
+ * rebuilt twice a frame because the two descs disagreed about the wind.
+ *
+ * `out->waves` points into the component; it is borrowed for the acquire call
+ * and must not outlive it. */
+JCE_API bool JCE_CALL jce_scene_water_field_desc(JceScene *s, JceEntity e,
+                                                 JceWaterFieldDesc *out);
+
+JCE_API struct JceWaterFieldSet *JCE_CALL jce_scene_water_fields(JceScene *s);
+
+/* The scene's disturbance layer -- the stateful shallow-water grid whose
+ * height is ADDED to the ambient JceWaterField surface.
+ *
+ * Owned here for the same reason the field set is: both are per-scene caches
+ * derived from the scene's water bodies, both must outlive any single frame,
+ * and both are read by the renderer AND the runtime. A solver owned by either
+ * of those two would be invisible to the other, which is how the surface
+ * physics floats on and the surface that is drawn came to be two different
+ * things once already (see jce_water_field.h).
+ *
+ * Created on first use with `desc`; a later call returns the existing one and
+ * IGNORES desc, because resizing a wave grid mid-simulation would discard the
+ * state that is the whole point of it. Pass NULL for desc to fetch without
+ * creating -- which is what a reader should do, so a reader can never be the
+ * thing that decides how big the pond is.
+ *
+ * Returns NULL when absent and not creatable. Absent means "add nothing", not
+ * "add zero": a caller that gets NULL must skip the term rather than treat it
+ * as flat, or a failed allocation would silently become a still pond. */
+/* 两个 tag 必须先在**文件作用域**声明。
+ *
+ * 只写在下面那个原型的参数表里时，C 的原型作用域会把
+ * `struct JceWaterRippleDesc` 当成**只属于该原型的新类型** ——
+ * 与 jce_scene.c 里（那里包含了 jce_water_ripple.h，tag 在文件作用域）
+ * 的同名类型不是同一个。MSVC 对此宽容，clang 报 conflicting types，
+ * 于是 wasm SDK 从此构建不了：dist/sdk/wasm 停在 06-08，两个多月无人发现，
+ * 因为没人为 wasm 构建过。症状是 web 版所有 T() 退化成原始 key
+ * （那份旧 SDK 里根本没有 loc_translate）。 */
+struct JceWaterRipple;
+struct JceWaterRippleDesc;
+
+JCE_API struct JceWaterRipple *JCE_CALL jce_scene_water_ripple(
+    JceScene *s, const struct JceWaterRippleDesc *desc);
+
 JCE_API void                          jce_scene_set_water(JceScene *s, JceEntity e, const JceWaterComponent *c);
 JCE_API JceWaterComponent            *jce_scene_get_water(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_water(const JceScene *s, JceEntity e);
@@ -3342,6 +3681,7 @@ JCE_API void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user
 JCE_API void jce_scene_each_point_light(JceScene *s, JceEntityCallback cb, void *user_data);
 JCE_API void jce_scene_each_spot_light(JceScene *s, JceEntityCallback cb, void *user_data);
 JCE_API void jce_scene_each_dir_light(JceScene *s, JceEntityCallback cb, void *user_data);
+JCE_API void jce_scene_each_canvas(JceScene *s, JceEntityCallback cb, void *user_data);
 JCE_API void jce_scene_each_reflection_probe(JceScene *s, JceEntityCallback cb, void *user_data);
 JCE_API void jce_scene_each_light_probe_group(JceScene *s, JceEntityCallback cb, void *user_data);
 JCE_API void jce_scene_each_water(JceScene *s, JceEntityCallback cb, void *user_data);

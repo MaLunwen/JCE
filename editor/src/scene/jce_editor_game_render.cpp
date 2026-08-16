@@ -11,6 +11,9 @@
 #include "gizmo/jce_gizmo_compound_collider.h"   /* draw fitted compound colliders */
 #include "core/jce_editor_state.h"
 
+#include "jce_scene_content_context.h"   /* project content roots (C++ linkage) */
+#include "core/jce_editor_project.h"
+
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_console.h>  /* r.taa cvar query for game-view TAA */
@@ -31,6 +34,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
+#include <jce/os/core/jce_filesystem.h>          /* active FS policy */
 #include <jce/os/platform/jce_input.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/application/jce_runtime.h>  /* UI widget → script dispatch in Play */
@@ -166,7 +170,8 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
     g.postfx = jce_postfx_create(jce_allocator_default(), 1, 1);
     if (g.postfx) {
         jce_postfx_set_view_base(g.postfx,
-                                 (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE));
+                                 (uint16_t)(GAME_VIEW_BASE +
+                                     JCE_EDITOR_VP_POSTFX_BASE_OFFSET));
         if (pak) {
             jce_postfx_load_shaders(g.postfx, pak);
         }
@@ -547,6 +552,29 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * Scene tab once. */
     jce_editor_scene_asset_cache_finalize();
 
+    /* Same story, one step further along: the particle-descriptor and canvas
+     * font roots are process-wide statics that only the Scene View was
+     * setting. With just the Game View shown, *.particles.json never resolved
+     * and every emitter came up empty -- an engine plume that burned in the
+     * standalone runtime and not in the editor. Set them here too, from the
+     * same project paths, so the Game View is self-sufficient. */
+    {
+        const bool isolated =
+            jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED;
+        const JceProject *proj = jce_editor_project_get();
+        const JceEditorSceneContentPaths paths =
+            jce_editor_scene_content_paths(
+                isolated,
+                proj ? proj->project_root : nullptr,
+                proj ? proj->source_assets : nullptr,
+                proj ? proj->cooked_assets : nullptr);
+        const char *root = paths.particle_asset_root.empty()
+                               ? nullptr
+                               : paths.particle_asset_root.c_str();
+        jce_scene_particles_set_asset_root(root);
+        jce_ui_canvas_set_asset_root(root);
+    }
+
     /* Game view always uses the shipped "shaded" pipeline — no debug
      * wireframe overrides, all engine features (shadows, IBL, postfx)
      * enabled by default. */
@@ -556,7 +584,8 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     /* Bridge FBO, panel resolution, volumetric fog, SSR and GI — the plumbing
      * that must be identical on both editor render paths (see
      * jce_editor_viewport_common.h). */
-    jce_editor_viewport_apply_shared_config(&cfg, g.bridge, width, height);
+    jce_editor_viewport_apply_shared_config(&cfg, g.bridge, width, height,
+                                            jce_state_get_scene());
 
     cfg.viewport_id = 0;   /* Game viewport slot (Scene = 1): own TAA prev camera */
 
@@ -622,6 +651,9 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * — same passes, same offsets as the scene view. */
     jce_editor_viewport_composite_fog_ssr(engine_sr, g.bridge, base,
                                           cfg.fog_enabled);
+    jce_editor_viewport_apply_fullscreen_effects(
+        engine_sr, scene, g.camera, g.bridge, base, 0,
+        width, height, render_dt);
 
     /* ── PostFX ─────────────────────────────────────────────────────
      * Sync enabled flags and params from the shared scene renderer
@@ -638,6 +670,32 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
              * jce_editor_viewport_postfx_mirror for what it does and does NOT
              * copy (view base / chain size / TAA stay per-viewport). */
             jce_editor_viewport_postfx_mirror(g.postfx, shared_pfx);
+
+                /* The "HDR target => force tone mapping" guard used to sit here.  It is
+                 * gone on purpose, and NOT because it was in the wrong place.
+                 *
+                 * 2e5174e3 moved it after jce_scene_renderer_render so the
+                 * renderer's per-frame rewrite of scene_rendering->postfx_enabled[]
+                 * could no longer stomp it.  That made it live -- and live, it
+                 * overrides what a scene explicitly authored.  Its own rationale
+                 * was that an untonemapped HDR target reads washed out; bisected
+                 * against real content, forcing it ON is what washes out:
+                 *
+                 *   caged_kingdom/graveyard, same camera, PNG size as a proxy
+                 *     ec933eb8 (guard dead)  1,126,840 -> correct
+                 *     2e5174e3 (guard live)  1,494,787 -> washed out
+                 *
+                 * and the split across projects is exactly postfx.tonemap:
+                 * elemental_serenity and space author it TRUE (forcing it is a
+                 * no-op there, and they always looked right), while caged_kingdom
+                 * and street_demo author it FALSE and had their exposure and
+                 * lights tuned that way.  A new scene defaults to false, which is
+                 * why every newly created scene came up white too.
+                 *
+                 * Silently overriding an explicit authored value to protect
+                 * against a hypothetical is the wrong trade: honour the scene.  A
+                 * scene that wants tone mapping says so. */
+
             bool any_effect = jce_editor_viewport_postfx_any_effect(shared_pfx);
 
             /* TAA (game view): bind the shared renderer's per-object velocity

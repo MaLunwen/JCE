@@ -12,7 +12,7 @@
  *     texel, we map (u, v) -> (x, z) in the scene XZ bounding box at
  *     minY (the "floor plane"), shoot N cosine-weighted hemisphere
  *     rays upward, and count occluder hits.  AO = 1 - hits/N.
- *  3. The worker thread owns its own snapshot vector, so the editor
+ *  3. The background task owns its own snapshot vector, so the editor
  *     scene can keep mutating while a bake is in flight.
  */
 
@@ -27,9 +27,9 @@
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_lightmapper.h>
 }
 
@@ -385,45 +385,25 @@ struct Settings {
 };
 
 struct State {
-    Settings        cfg;
-    JceThread      *worker   = nullptr;
-    JceAtomicI32   *progress = nullptr;  /* 0..100 */
-    JceAtomicI32   *running  = nullptr;  /* 0/1 */
-    JceAtomicI32   *cancel   = nullptr;  /* 0/1 */
-    char            last_output_path[320] = {0};
-    char            status[160] = "Idle";
+    Settings      cfg;
+    JceAsyncTask *task = nullptr;
+    char          last_output_path[320] = {0};
+    char          status[160] = "Idle";
 };
 
 State s;
-
-static void ensure_atomics(void)
-{
-    if (!s.progress) s.progress = jce_atomic_i32_create(0);
-    if (!s.running)  s.running  = jce_atomic_i32_create(0);
-    if (!s.cancel)   s.cancel   = jce_atomic_i32_create(0);
-}
 
 /* -------------------------------------------------------------------- */
 /* Light probe SH9 bake                                                 */
 /* -------------------------------------------------------------------- */
 
 struct ProbeState {
-    JceThread    *worker   = nullptr;
-    JceAtomicI32 *progress = nullptr;  /* 0..100 */
-    JceAtomicI32 *running  = nullptr;
-    JceAtomicI32 *cancel   = nullptr;
+    JceAsyncTask *task = nullptr;
     char          status[160] = "Idle";
     int           sample_count = 256;
 };
 
 ProbeState ps;
-
-static void ensure_probe_atomics(void)
-{
-    if (!ps.progress) ps.progress = jce_atomic_i32_create(0);
-    if (!ps.running)  ps.running  = jce_atomic_i32_create(0);
-    if (!ps.cancel)   ps.cancel   = jce_atomic_i32_create(0);
-}
 
 struct ProbeWorkerArgs {
     /* Flat probe positions [count][3]. */
@@ -528,37 +508,16 @@ extern "C" void lp_scene_visit(JceScene *scene, JceEntity e, void *user)
     }
 }
 
-void probe_worker_run(void *arg_ptr)
+JceAsyncRunResult probe_worker_run(JceAsyncContext *ctx, void *arg_ptr)
 {
     ProbeWorkerArgs *args = static_cast<ProbeWorkerArgs *>(arg_ptr);
-
     int total = (int)args->positions.size();
-    if (total == 0) {
-        std::snprintf(ps.status, sizeof(ps.status), "No light probe groups in scene.");
-        jce_atomic_i32_store(ps.running, 0);
-        delete args;
-        return;
-    }
-
     args->sh9.resize((size_t)total);
 
-    /* Build flat position array for the C bake function. */
-    std::vector<std::array<float, 3>> flat_pos((size_t)total);
-    for (int i = 0; i < total; ++i) {
-        flat_pos[i][0] = args->positions[i][0];
-        flat_pos[i][1] = args->positions[i][1];
-        flat_pos[i][2] = args->positions[i][2];
-    }
-
     /* Bake one probe at a time so we can update progress and check cancel. */
-    float sh_single[9][3];
     for (int pi = 0; pi < total; ++pi) {
-        if (jce_atomic_i32_load(ps.cancel) != 0) {
-            std::snprintf(ps.status, sizeof(ps.status), "Cancelled at probe %d/%d", pi, total);
-            jce_atomic_i32_store(ps.running, 0);
-            delete args;
-            return;
-        }
+        if (jce_async_context_cancel_requested(ctx))
+            return JCE_ASYNC_RUN_CANCELLED;
 
         float pos_single[1][3];
         pos_single[0][0] = args->positions[pi][0];
@@ -580,16 +539,30 @@ void probe_worker_run(void *arg_ptr)
             args->sh9[pi][c * 3 + 2] = sh_out[0][c][2];
         }
 
-        jce_atomic_i32_store(ps.progress, (pi + 1) * 100 / total);
+        jce_async_context_set_progress(ctx,
+            (float)(pi + 1) / (float)total);
     }
 
-    /* Write results back to scene components (main-thread-safe for read/write
-       when no other system is mutating the same components). */
-    if (args->scene) {
-        /* Track per-entity offset: group probes belong to the same entity.
-           Simple approach: track last entity and its base index. */
+    return jce_async_context_cancel_requested(ctx)
+        ? JCE_ASYNC_RUN_CANCELLED
+        : JCE_ASYNC_RUN_SUCCESS;
+}
+
+void probe_bake_complete(JceAsyncTask *task, void *arg_ptr)
+{
+    ProbeWorkerArgs *args = static_cast<ProbeWorkerArgs *>(arg_ptr);
+    JceAsyncState state = jce_async_task_state(task);
+
+    if (state == JCE_ASYNC_STATE_CANCELLED) {
+        std::snprintf(ps.status, sizeof(ps.status), "Probe bake cancelled.");
+    } else if (state == JCE_ASYNC_STATE_SUCCEEDED &&
+               args->scene && jce_state_get_scene() == args->scene) {
+        /* ECS writes are owner-thread-only. Entity generation checks prevent
+         * deleted probe groups from receiving stale results. */
         JceEntity last_e = JCE_ENTITY_INVALID;
         int       probe_idx_in_group = 0;
+        int       applied = 0;
+        int       total = (int)args->positions.size();
         for (int pi = 0; pi < total; ++pi) {
             JceEntity e = args->entities[pi];
             if (e != last_e) { last_e = e; probe_idx_in_group = 0; }
@@ -602,25 +575,29 @@ void probe_worker_run(void *arg_ptr)
                     lpg->sh9[probe_idx_in_group][c][2] = args->sh9[pi][c * 3 + 2];
                 }
                 lpg->sh9_baked = true;
+                ++applied;
             }
             ++probe_idx_in_group;
         }
+        std::snprintf(ps.status, sizeof(ps.status),
+                      "Done - baked %d probe(s), %d applied, %d spp each.",
+                      total, applied, args->sample_count);
+    } else if (state == JCE_ASYNC_STATE_SUCCEEDED) {
+        std::snprintf(ps.status, sizeof(ps.status),
+                      "Scene changed - probe result discarded.");
+    } else {
+        std::snprintf(ps.status, sizeof(ps.status), "Probe bake failed.");
     }
 
-    std::snprintf(ps.status, sizeof(ps.status),
-                  "Done — baked %d probe(s), %d spp each.", total, args->sample_count);
-    jce_atomic_i32_store(ps.running, 0);
+    ps.task = nullptr;
+    jce_async_task_release(task);
     delete args;
 }
 
 void start_probe_bake(void)
 {
-    ensure_probe_atomics();
-    if (jce_atomic_i32_load(ps.running) != 0) return;
-    jce_atomic_i32_store(ps.cancel,   0);
-    jce_atomic_i32_store(ps.progress, 0);
+    if (ps.task) return;
     std::snprintf(ps.status, sizeof(ps.status), "Baking probes...");
-    jce_atomic_i32_store(ps.running, 1);
 
     ProbeWorkerArgs *args = new ProbeWorkerArgs();
     args->sample_count = ps.sample_count;
@@ -628,16 +605,32 @@ void start_probe_bake(void)
     if (args->scene)
         jce_scene_each_entity(args->scene, lp_scene_visit, args);
 
-    if (ps.worker) {
-        jce_thread_join(ps.worker);
-        ps.worker = nullptr;
+    if (args->positions.empty()) {
+        std::snprintf(ps.status, sizeof(ps.status),
+                      "No light probe groups in scene.");
+        delete args;
+        return;
     }
-    ps.worker = jce_thread_create(probe_worker_run, args, "jce_lp_bake");
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = probe_worker_run;
+    desc.complete = probe_bake_complete;
+    desc.user_data = args;
+    desc.debug_name = "editor.light_probes.bake";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+
+    ps.task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!ps.task) {
+        std::snprintf(ps.status, sizeof(ps.status),
+                      "Probe bake queue is full.");
+        delete args;
+    }
 }
 
 void draw_probe_tab(void)
 {
-    bool busy = ps.running ? (jce_atomic_i32_load(ps.running) != 0) : false;
+    bool busy = ps.task != nullptr;
 
     ImGui::BeginDisabled(busy);
     ImGui::SliderInt(jce_editor_i18n_id("lightmapBake.probe.samples", "lp_smp"),
@@ -650,12 +643,14 @@ void draw_probe_tab(void)
             start_probe_bake();
     } else {
         if (ImGui::Button(jce_editor_i18n_id("lightmapBake.probe.button.cancel", "lp_cancel"))) {
-            if (ps.cancel) jce_atomic_i32_store(ps.cancel, 1);
+            jce_async_task_cancel(ps.task);
         }
     }
 
     ImGui::Separator();
-    int p = ps.progress ? jce_atomic_i32_load(ps.progress) : 0;
+    int p = ps.task
+        ? (int)(jce_async_task_progress(ps.task) * 100.0f + 0.5f)
+        : 0;
     char overlay[32];
     std::snprintf(overlay, sizeof(overlay), "%d%%", p);
     ImGui::ProgressBar(p / 100.0f, ImVec2(-FLT_MIN, 0.0f), overlay);
@@ -683,14 +678,14 @@ void ensure_dir(const char *path)
 struct WorkerArgs {
     Settings      cfg;
     SceneSnapshot snap;
+    char          png_path[320] = { 0 };
 };
 
-void worker_run(void *arg_ptr)
+JceAsyncRunResult worker_run(JceAsyncContext *ctx, void *arg_ptr)
 {
     WorkerArgs *args = static_cast<WorkerArgs *>(arg_ptr);
-    Settings cfg = args->cfg;
-    SceneSnapshot snap = std::move(args->snap);
-    delete args;
+    const Settings &cfg = args->cfg;
+    const SceneSnapshot &snap = args->snap;
 
     int W = cfg.resolution, H = cfg.resolution;
     std::vector<uint8_t> rgba((size_t)W * H * 4, 255);
@@ -705,12 +700,9 @@ void worker_run(void *arg_ptr)
     if (sz < 0.5f) sz = 0.5f;
 
     for (int y = 0; y < H; ++y) {
-        if (jce_atomic_i32_load(s.cancel) != 0) {
-            std::snprintf(s.status, sizeof(s.status),
-                          "Cancelled at row %d/%d", y, H);
-            jce_atomic_i32_store(s.running, 0);
-            return;
-        }
+        if (jce_async_context_cancel_requested(ctx))
+            return JCE_ASYNC_RUN_CANCELLED;
+
         float v = (float)y / (float)(H - 1);
         for (int x = 0; x < W; ++x) {
             float u = (float)x / (float)(W - 1);
@@ -733,7 +725,8 @@ void worker_run(void *arg_ptr)
             rgba[off + 2] = g;
             rgba[off + 3] = 255;
         }
-        jce_atomic_i32_store(s.progress, (int)((y + 1) * 100 / H));
+        jce_async_context_set_progress(ctx,
+            (float)(y + 1) / (float)H);
     }
 
     /* Padding: dilate edge texels into guard band so bilinear sampling
@@ -751,44 +744,68 @@ void worker_run(void *arg_ptr)
         }
     }
 
-    char png_path[320];
-    std::snprintf(png_path, sizeof(png_path), "%s.png", cfg.output);
-    ensure_dir(png_path);
-    if (write_png_rgba(png_path, W, H, rgba.data())) {
+    std::snprintf(args->png_path, sizeof(args->png_path),
+                  "%s.png", cfg.output);
+    ensure_dir(args->png_path);
+    if (!write_png_rgba(args->png_path, W, H, rgba.data())) {
+        jce_async_context_fail(ctx, 1, "cannot write lightmap PNG");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    return jce_async_context_cancel_requested(ctx)
+        ? JCE_ASYNC_RUN_CANCELLED
+        : JCE_ASYNC_RUN_SUCCESS;
+}
+
+void lightmap_bake_complete(JceAsyncTask *task, void *arg_ptr)
+{
+    WorkerArgs *args = static_cast<WorkerArgs *>(arg_ptr);
+    JceAsyncState state = jce_async_task_state(task);
+
+    if (state == JCE_ASYNC_STATE_SUCCEEDED) {
         std::snprintf(s.last_output_path, sizeof(s.last_output_path),
-                      "%s", png_path);
+                      "%s", args->png_path);
         std::snprintf(s.status, sizeof(s.status),
                       "Bake done: %s (%dx%d, %d spp, %d bounces, %d occ)",
-                      png_path, W, H, cfg.samples, cfg.bounces,
-                      (int)snap.occ.size());
+                      args->png_path, args->cfg.resolution,
+                      args->cfg.resolution, args->cfg.samples,
+                      args->cfg.bounces, (int)args->snap.occ.size());
+    } else if (state == JCE_ASYNC_STATE_CANCELLED) {
+        std::snprintf(s.status, sizeof(s.status), "Lightmap bake cancelled.");
     } else {
-        std::snprintf(s.status, sizeof(s.status),
-                      "Bake failed: cannot write %s", png_path);
+        const char *error = jce_async_task_error_message(task);
+        std::snprintf(s.status, sizeof(s.status), "Bake failed: %s",
+                      error && error[0] ? error : "background task failed");
     }
-    jce_atomic_i32_store(s.running, 0);
+
+    s.task = nullptr;
+    jce_async_task_release(task);
+    delete args;
 }
 
 void start_bake(void)
 {
-    ensure_atomics();
-    if (jce_atomic_i32_load(s.running) != 0) return;
-    jce_atomic_i32_store(s.cancel, 0);
-    jce_atomic_i32_store(s.progress, 0);
+    if (s.task) return;
     std::snprintf(s.status, sizeof(s.status), "Baking...");
-    jce_atomic_i32_store(s.running, 1);
 
-    /* Snapshot the scene on the main thread before the worker starts. */
+    /* Snapshot the scene on the main thread before background work starts. */
     WorkerArgs *args = new WorkerArgs();
     args->cfg = s.cfg;
     capture_scene_snapshot(&args->snap);
 
-    /* Join previous worker if any (worker is detached after start, but
-     * keep the handle around for jce_thread_join semantics). */
-    if (s.worker) {
-        jce_thread_join(s.worker);
-        s.worker = nullptr;
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = worker_run;
+    desc.complete = lightmap_bake_complete;
+    desc.user_data = args;
+    desc.debug_name = "editor.lightmap.bake";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+
+    s.task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!s.task) {
+        std::snprintf(s.status, sizeof(s.status),
+                      "Lightmap bake queue is full.");
+        delete args;
     }
-    s.worker = jce_thread_create(worker_run, args, "jce_lightmap_bake");
 }
 
 void write_binding(void)
@@ -845,7 +862,7 @@ void draw_content(void)
 
 void draw_lightmap_tab(void)
 {
-    bool busy = s.running ? (jce_atomic_i32_load(s.running) != 0) : false;
+    bool busy = s.task != nullptr;
 
     ImGui::TextUnformatted(jce_editor_i18n("lightmapBake.section.bakeSettings"));
     ImGui::Separator();
@@ -870,7 +887,7 @@ void draw_lightmap_tab(void)
         if (ImGui::Button(jce_editor_i18n_id("lightmapBake.button.bake", "lmb_bake"))) start_bake();
     } else {
         if (ImGui::Button(jce_editor_i18n_id("lightmapBake.button.cancel", "lmb_cancel"))) {
-            if (s.cancel) jce_atomic_i32_store(s.cancel, 1);
+            jce_async_task_cancel(s.task);
         }
     }
     ImGui::SameLine();
@@ -879,7 +896,9 @@ void draw_lightmap_tab(void)
     ImGui::EndDisabled();
 
     ImGui::Separator();
-    int p = s.progress ? jce_atomic_i32_load(s.progress) : 0;
+    int p = s.task
+        ? (int)(jce_async_task_progress(s.task) * 100.0f + 0.5f)
+        : 0;
     char overlay[32];
     std::snprintf(overlay, sizeof(overlay), "%d%%", p);
     ImGui::ProgressBar(p / 100.0f, ImVec2(-FLT_MIN, 0.0f), overlay);

@@ -14,6 +14,7 @@ extern "C" {
 
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_defs.h>
@@ -30,6 +31,7 @@ extern "C" {
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_toolchain.h>
+#include <jce/os/core/jce_trace.h>
 
 
 

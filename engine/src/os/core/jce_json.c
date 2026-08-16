@@ -139,6 +139,36 @@ JceJson *jce_json_parse(const char *text, size_t len)
     return j;
 }
 
+JceJson *jce_json_parse_strict(const char *text, size_t len)
+{
+    const char *end = NULL;
+    const char *limit;
+    JceJson *j;
+
+    s_err_clear();
+    if (!text) {
+        s_err_set_io("no input (NULL text)");
+        return NULL;
+    }
+    if (len == 0)
+        len = strlen(text);
+    limit = text + len;
+    j = cJSON_ParseWithLengthOpts(text, len, &end, 0);
+    if (!j) {
+        s_err_set_parse(text, len, end);
+        return NULL;
+    }
+    while (end && end < limit &&
+           (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+        ++end;
+    if (!end || end != limit) {
+        cJSON_Delete(j);
+        s_err_set_parse(text, len, end ? end : text);
+        return NULL;
+    }
+    return j;
+}
+
 JceJson *jce_json_parse_file(const char *path)
 {
     s_err_clear();
@@ -272,6 +302,7 @@ bool jce_json_is_array (const JceJson *j) { return cJSON_IsArray(j)  ? true : fa
 bool jce_json_is_number(const JceJson *j) { return cJSON_IsNumber(j) ? true : false; }
 bool jce_json_is_string(const JceJson *j) { return cJSON_IsString(j) ? true : false; }
 bool jce_json_is_bool  (const JceJson *j) { return cJSON_IsBool(j)   ? true : false; }
+bool jce_json_is_null  (const JceJson *j) { return cJSON_IsNull(j)   ? true : false; }
 
 JceJson *jce_json_get(const JceJson *obj, const char *key)
 {
@@ -337,6 +368,12 @@ double jce_json_number_value(const JceJson *node, double def)
 {
     if (cJSON_IsNumber(node)) return node->valuedouble;
     return def;
+}
+
+bool jce_json_bool_value(const JceJson *node, bool def)
+{
+    if (!cJSON_IsBool(node)) return def;
+    return cJSON_IsTrue(node) ? true : false;
 }
 
 /* ── Typed accessors with defaults ─────────────────────────────────── */

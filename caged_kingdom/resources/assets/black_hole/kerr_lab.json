@@ -1,0 +1,67 @@
+{
+  "contract": {
+    "name": "ck.kerr-lab",
+    "major": 1,
+    "minor": 0
+  },
+  "identity": {
+    "revision": 8,
+    "config_hash": "sha256:19f2dbf8fa9eee5394e8b77f27afe227925e88e26cfe9a3ae6c0adb17feda3dd",
+    "hash_basis": "ck.kerr-lab|1|8|100000000|0.8|zamo|40|60|0|60|page_thorne_thin|18|0.1|bolometric_false_color|640|600|0.002|0.0005|0.75|380|780|2200|18000|-0.998|0.01584126984126984|512|127"
+  },
+  "metric": {
+    "mass_solar": 100000000,
+    "spin_chi": 0.8,
+    "units": "G=c=M=1"
+  },
+  "observer": {
+    "model": "zamo",
+    "radius_over_m": 40,
+    "inclination_deg": 85,
+    "azimuth_deg": 0,
+    "fov_deg": 60
+  },
+  "disk": {
+    "model": "page_thorne_thin",
+    "outer_radius_over_m": 18,
+    "luminosity_eddington_ratio": 0.1,
+    "spectrum": "bolometric_false_color",
+    "limb_darkening": 0.5
+  },
+  "integration": {
+    "preset": "scientific_realtime",
+    "max_steps": 640,
+    "escape_radius_over_m": 600,
+    "capture_epsilon": 0.002,
+    "residual_limit": 0.0005,
+    "history_weight": 0.93,
+    "step_fraction_r": 0.04,
+    "step_fraction_theta": 0.035,
+    "step_fraction_phi": 0.035,
+    "edge_threshold": 0.04
+  },
+  "spectrum": {
+    "band_min_nm": 380,
+    "band_max_nm": 780,
+    "temperature_min_kelvin": 2200,
+    "temperature_max_kelvin": 9200,
+    "truth_policy": "Page-Thorne bolometric radiance with CIE false color at g-shifted observed temperature"
+  },
+  "celestial_background": {
+    "model": "deterministic_dual_scale_equirectangular_catalog",
+    "orientation": [0, 0, 0, 1],
+    "seed": 12648430
+  },
+  "flux_lut": {
+    "radial_mapping": "log_r_over_isco",
+    "spin_min": -0.998,
+    "spin_step": 0.01584126984126984,
+    "radial_count": 512,
+    "spin_count": 127
+  },
+  "presentation": {
+    "exposure_ev": 1.5,
+    "diagnostic": "radiance",
+    "compare_split": -1
+  }
+}

@@ -137,9 +137,6 @@ struct SceneRenderState {
     /* World streamer — optional open-world chunk streaming. */
     JceWorldStreamer   *world_streamer;
     JceFileSystem      *stream_fs;
-    /* Worker pool for async chunk loads (disk read off-thread; apply on main).
-     * Destroyed AFTER world_streamer (whose destroy joins in-flight tasks). */
-    JceThreadPool      *stream_pool;
 
     /* GPU-query occlusion culler — optional two-pass coherence culling. */
     JceOcclusionCuller *occlusion_culler;

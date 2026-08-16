@@ -6,28 +6,28 @@
  *  - A small fixed slot table (JCE_ASYNC_SLOTS) holds all in-flight
  *    loads.  Handles encode a (generation, index) pair so stale handles
  *    are detectable after a slot is reused.
- *  - Each load owns a dedicated jce_thread that performs the I/O +
- *    JSON parse in the background.  We deliberately do NOT use
- *    jce_jobs (enkiTS) here: the engine has no global JceJobSystem
- *    instance, and a one-shot dedicated thread per load matches the
- *    "long-lived" guidance from jce_thread.h.
+ *  - I/O + JSON parse uses the process structured executor. This bounds
+ *    worker count, supplies cancellation/backpressure, and preserves
+ *    deferred cooperative execution on Web without pthreads.
  *  - Apply-to-flecs happens on the main thread.  flecs is not safe for
  *    concurrent entity creation against a live world without manual
  *    deferral, and the existing jce_scene_load_json() routine is a
  *    two-pass operation (create + parent-fixup) that doesn't slice
  *    cleanly.  We therefore commit at most ONE finished load per
  *    dispatch_main call to bound per-frame spikes.
- *  - Progress is updated atomically by the worker (40 % weight on parse
- *    completion) and by the main thread (60 % weight when apply lands).
- *  - Cancellation is cooperative: an atomic flag is checked at the
- *    file-read, post-parse, and pre-apply boundaries.
+ *  - Progress is published by the task context at parse completion and
+ *    advanced by the main thread until apply lands.
+ *  - Cancellation is cooperative at file-read, post-parse, and pre-apply
+ *    boundaries.
  */
 
 #include <jce/middleware/scene/jce_scene_async.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_timer.h>   /* monotonic clock for the parse ramp */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_mem_profile.h>
 #include <jce/os/core/jce_thread.h>
@@ -65,12 +65,12 @@ typedef struct {
     JceLoadMode    mode;
     JceLoadCallback cb;
     void          *user;
+    const JceFileSystem *fs;
+    bool           cancel_requested;
 
     /* Worker handoff. */
-    JceThread     *worker;
+    JceAsyncTask *task;
     SlotPhase      phase;          /* main-thread visible phase           */
-    JceAtomicI32  *cancel_flag;    /* 0 = run, 1 = cancel                 */
-    JceAtomicI32  *worker_done;    /* 0 = working, 1 = parsed/failed      */
 
     /* Parsed payload (produced by worker, consumed by main). */
     JceJson       *parsed_root;    /* NULL if parse failed                */
@@ -81,6 +81,7 @@ typedef struct {
     JceLoadResult  result;
     JceLoadStatus  public_status;  /* what callers see via _status()      */
     float          progress;       /* 0..1, monotonic per slot            */
+    uint64_t       parse_started_ms; /* monotonic stamp for the parse ramp */
 } AsyncSlot;
 
 /* ── Module state ──────────────────────────────────────────────────── */
@@ -136,25 +137,15 @@ static void slot_free_payload(AsyncSlot *s)
         JCE_FREE(s->vfs_path);
         s->vfs_path = NULL;
     }
-    if (s->cancel_flag) {
-        jce_atomic_i32_destroy(s->cancel_flag);
-        s->cancel_flag = NULL;
-    }
-    if (s->worker_done) {
-        jce_atomic_i32_destroy(s->worker_done);
-        s->worker_done = NULL;
-    }
 }
 
 static void slot_reap(AsyncSlot *s)
 {
-    /* Worker (if still alive) MUST be joined before we touch payload.
-     * Reap is only called from the main thread after the worker has
-     * signalled worker_done OR a cancel has propagated through.
-     */
-    if (s->worker) {
-        jce_thread_join(s->worker);
-        s->worker = NULL;
+    if (s->task) {
+        (void)jce_async_task_cancel(s->task);
+        jce_async_task_wait(s->task);
+        jce_async_task_release(s->task);
+        s->task = NULL;
     }
     slot_free_payload(s);
     uint16_t next_gen = (uint16_t)(s->generation + 1u);
@@ -165,30 +156,32 @@ static void slot_reap(AsyncSlot *s)
 /* ── Worker entry ─────────────────────────────────────────────────── */
 
 typedef struct {
-    AsyncSlot *slot;
+    AsyncSlot          *slot;
+    const JceFileSystem *fs;
 } WorkerArg;
 
-static void worker_main(void *arg)
+static void worker_arg_cleanup(void *arg)
+{
+    JCE_FREE(arg);
+}
+
+static JceAsyncRunResult worker_main(JceAsyncContext *ctx, void *arg)
 {
     WorkerArg *wa = (WorkerArg *)arg;
     AsyncSlot *s  = wa->slot;
-    JCE_FREE(wa);
 
-    /* Snapshot inputs we need (vfs_path is stable for the slot lifetime
-     * — main thread only frees it during reap, which is gated on
-     * worker_done). */
+    /* vfs_path is stable until the terminal task is reaped. */
     const char *path = s->vfs_path;
 
-    if (jce_atomic_i32_load(s->cancel_flag) != 0) {
+    if (jce_async_context_cancel_requested(ctx)) {
         s->worker_error = 0;
-        jce_atomic_i32_store(s->worker_done, 1);
-        return;
+        return JCE_ASYNC_RUN_CANCELLED;
     }
 
     uint64_t size = 0;
     void    *buf  = NULL;
-    if (g_target_fs) {
-        buf = jce_fs_read_all(g_target_fs, path, &size);
+    if (wa->fs) {
+        buf = jce_fs_read_all(wa->fs, path, &size);
     } else {
         buf = jce_fs_host_read_all(path, &size);
     }
@@ -197,8 +190,8 @@ static void worker_main(void *arg)
         if (buf) JCE_FREE(buf);
         LOG_ERROR(LOG_TAG, "cannot read '%s'", path ? path : "(null)");
         s->worker_error = 1; /* I/O */
-        jce_atomic_i32_store(s->worker_done, 1);
-        return;
+        jce_async_context_fail(ctx, 1, "scene read failed");
+        return JCE_ASYNC_RUN_FAILED;
     }
 
     /* P3-A.5: account the staging buffer against the SCENE_ECS tag for
@@ -206,11 +199,10 @@ static void worker_main(void *arg)
      * of the parse outcome. */
     jce_mem_profile_record_alloc(JCE_MEM_TAG_SCENE_ECS, (size_t)size);
 
-    if (jce_atomic_i32_load(s->cancel_flag) != 0) {
+    if (jce_async_context_cancel_requested(ctx)) {
         JCE_FREE(buf);
         jce_mem_profile_record_free(JCE_MEM_TAG_SCENE_ECS, (size_t)size);
-        jce_atomic_i32_store(s->worker_done, 1);
-        return;
+        return JCE_ASYNC_RUN_CANCELLED;
     }
 
     JceJson *root = jce_json_parse((const char *)buf, (size_t)size);
@@ -220,8 +212,8 @@ static void worker_main(void *arg)
     if (!root) {
         LOG_ERROR(LOG_TAG, "JSON parse failed for '%s'", path);
         s->worker_error = 2; /* parse */
-        jce_atomic_i32_store(s->worker_done, 1);
-        return;
+        jce_async_context_fail(ctx, 2, "scene JSON parse failed");
+        return JCE_ASYNC_RUN_FAILED;
     }
 
     /* Best-effort entity count for progress weighting. */
@@ -241,8 +233,10 @@ static void worker_main(void *arg)
     s->parsed_root          = root;
     s->parsed_entity_count  = ecount;
     s->worker_error         = 0;
-    jce_atomic_i32_store(s->worker_done, 1);
+    jce_async_context_set_progress(ctx, 0.4f);
     /* From this point the main thread owns parsed_root. */
+    return jce_async_context_cancel_requested(ctx)
+        ? JCE_ASYNC_RUN_CANCELLED : JCE_ASYNC_RUN_SUCCESS;
 }
 
 /* ── Player-loop tick ─────────────────────────────────────────────── */
@@ -255,8 +249,8 @@ static void count_cb_main(JceScene *sc, JceEntity e, void *ud)
 
 static void apply_one_locked(AsyncSlot *s)
 {
-    /* Pre-conditions: holding g_mu, phase == SLOT_PARSED, worker joined. */
-    if (jce_atomic_i32_load(s->cancel_flag) != 0) {
+    /* Pre-conditions: holding g_mu, phase == SLOT_PARSED. */
+    if (s->cancel_requested) {
         s->phase         = SLOT_CANCELLED_INT;
         s->public_status = JCE_LOAD_CANCELLED;
         s->progress      = 1.0f;
@@ -286,8 +280,8 @@ static void apply_one_locked(AsyncSlot *s)
     uint32_t after  = 0;
     jce_scene_each_entity(g_target_scene, count_cb_main, &before);
 
-    int n = g_target_fs
-        ? jce_scene_serial_apply_json_vfs(g_target_scene, g_target_fs,
+    int n = s->fs
+        ? jce_scene_serial_apply_json_vfs(g_target_scene, s->fs,
                                           s->vfs_path, s->parsed_root)
         : jce_scene_load_json(g_target_scene, s->parsed_root);
     if (n < 0) {
@@ -328,7 +322,7 @@ JCE_API void JCE_CALL jce_scene_async_dispatch_main(void)
     /* Stage 1: reap anything marked from a previous tick. */
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
-        if (s->in_use && s->reap_pending) {
+        if (s->in_use && s->reap_pending == 2) {
             /* Move public status into a non-readable state by reaping;
              * callers that wanted the result should have grabbed it via
              * get_result() before the next tick. */
@@ -336,9 +330,11 @@ JCE_API void JCE_CALL jce_scene_async_dispatch_main(void)
         }
     }
 
-    /* Stage 2: promote PENDING → PARSING (spawn workers). */
+    /* Stage 2: promote PENDING -> PARSING (submit bounded parse tasks). */
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
+        JceAsyncTaskDesc desc;
+        JceAsyncExecutor *executor;
         if (!s->in_use || s->phase != SLOT_PENDING) continue;
 
         WorkerArg *wa = (WorkerArg *)JCE_CALLOC(1, sizeof(*wa));
@@ -350,40 +346,49 @@ JCE_API void JCE_CALL jce_scene_async_dispatch_main(void)
             s->reap_pending      = 1;
             continue;
         }
-        wa->slot   = s;
-        s->phase   = SLOT_PARSING;
-        s->public_status = JCE_LOAD_RUNNING;
-        s->worker  = jce_thread_create(worker_main, wa, "jce-scene-async");
-        if (!s->worker) {
+        wa->slot = s;
+        wa->fs = s->fs;
+        executor = jce_async_default_executor();
+        jce_async_task_desc_init(&desc);
+        desc.work = worker_main;
+        desc.cleanup = worker_arg_cleanup;
+        desc.user_data = wa;
+        desc.debug_name = s->vfs_path;
+        desc.priority = JCE_ASYNC_PRIORITY_HIGH;
+        s->task = executor ? jce_async_submit(executor, &desc) : NULL;
+        if (!s->task) {
             JCE_FREE(wa);
             s->phase             = SLOT_FAILED_INT;
             s->public_status     = JCE_LOAD_FAILED;
-            s->result.error_code = 6; /* thread spawn */
+            s->result.error_code = 6; /* executor unavailable/rejected */
             s->progress          = 1.0f;
             s->reap_pending      = 1;
+            continue;
         }
+        s->phase = SLOT_PARSING;
+        s->public_status = JCE_LOAD_RUNNING;
+        s->parse_started_ms = jce_time_ticks_ms();
     }
 
-    /* Stage 3: harvest worker_done → PARSED / FAILED / CANCELLED. */
+    /* Stage 3: harvest terminal parse tasks -> parsed/failed/cancelled. */
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
+        JceAsyncState task_state;
         if (!s->in_use || s->phase != SLOT_PARSING) continue;
-        if (jce_atomic_i32_load(s->worker_done) == 0) continue;
+        if (!s->task || !jce_async_task_is_terminal(s->task)) continue;
 
-        /* Worker finished — join thread so its stack/handle is reclaimed. */
-        if (s->worker) {
-            jce_thread_join(s->worker);
-            s->worker = NULL;
-        }
-
-        if (jce_atomic_i32_load(s->cancel_flag) != 0) {
+        task_state = jce_async_task_state(s->task);
+        jce_async_task_release(s->task);
+        s->task = NULL;
+        if (task_state == JCE_ASYNC_STATE_CANCELLED) {
             s->phase         = SLOT_CANCELLED_INT;
             s->public_status = JCE_LOAD_CANCELLED;
             s->progress      = 1.0f;
             s->reap_pending  = 1;
             continue;
         }
-        if (s->worker_error != 0 || !s->parsed_root) {
+        if (task_state == JCE_ASYNC_STATE_FAILED ||
+            s->worker_error != 0 || !s->parsed_root) {
             s->phase             = SLOT_FAILED_INT;
             s->public_status     = JCE_LOAD_FAILED;
             s->result.error_code = s->worker_error ? s->worker_error : 7;
@@ -419,19 +424,21 @@ JCE_API void JCE_CALL jce_scene_async_dispatch_main(void)
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
         if (!s->in_use || !s->reap_pending) continue;
-        if (!s->cb) continue;
         if (s->public_status != JCE_LOAD_COMPLETE
          && s->public_status != JCE_LOAD_FAILED
          && s->public_status != JCE_LOAD_CANCELLED) continue;
 
-        pending[npending].h      = handle_make((uint16_t)i, s->generation);
-        pending[npending].status = s->public_status;
-        pending[npending].result = s->result;
-        pending[npending].cb     = s->cb;
-        pending[npending].user   = s->user;
-        npending++;
-        /* Clear the cb so the callback never fires twice across ticks. */
-        s->cb = NULL;
+        if (s->cb) {
+            pending[npending].h =
+                handle_make((uint16_t)i, s->generation);
+            pending[npending].status = s->public_status;
+            pending[npending].result = s->result;
+            pending[npending].cb     = s->cb;
+            pending[npending].user   = s->user;
+            npending++;
+            s->cb = NULL;
+        }
+        s->reap_pending = 2;
     }
 
     jce_mutex_unlock(g_mu);
@@ -483,33 +490,15 @@ JCE_API void JCE_CALL jce_scene_async_shutdown(void)
         g_loop_handle.id = 0;
     }
 
-    /* Signal cancel on every live slot, then drain. */
+    /* Signal cancellation on every live parse task. */
     jce_mutex_lock(g_mu);
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
         if (!s->in_use) continue;
-        if (s->cancel_flag) jce_atomic_i32_store(s->cancel_flag, 1);
+        s->cancel_requested = true;
+        if (s->task)
+            (void)jce_async_task_cancel(s->task);
     }
-    jce_mutex_unlock(g_mu);
-
-    /* Wait for all workers to observe the cancel. */
-    for (;;) {
-        bool any_active = false;
-        jce_mutex_lock(g_mu);
-        for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
-            AsyncSlot *s = &g_slots[i];
-            if (!s->in_use) continue;
-            if (s->phase == SLOT_PARSING
-             && jce_atomic_i32_load(s->worker_done) == 0) {
-                any_active = true;
-            }
-        }
-        jce_mutex_unlock(g_mu);
-        if (!any_active) break;
-        jce_thread_sleep_ms(1);
-    }
-
-    jce_mutex_lock(g_mu);
     for (uint32_t i = 0; i < JCE_ASYNC_SLOTS; i++) {
         AsyncSlot *s = &g_slots[i];
         if (s->in_use) slot_reap(s);
@@ -554,6 +543,7 @@ jce_scene_instantiate_async(const char     *vfs_path,
     s->mode          = mode;
     s->cb            = cb;
     s->user          = user;
+    s->fs            = g_target_fs;
     s->phase         = SLOT_PENDING;
     s->public_status = JCE_LOAD_PENDING;
     s->progress      = 0.0f;
@@ -562,10 +552,7 @@ jce_scene_instantiate_async(const char     *vfs_path,
     s->vfs_path = (char *)JCE_MALLOC(pl + 1u);
     if (s->vfs_path) memcpy(s->vfs_path, vfs_path, pl + 1u);
 
-    s->cancel_flag = jce_atomic_i32_create(0);
-    s->worker_done = jce_atomic_i32_create(0);
-
-    if (!s->vfs_path || !s->cancel_flag || !s->worker_done) {
+    if (!s->vfs_path) {
         slot_free_payload(s);
         memset(s, 0, sizeof(*s));
         s->generation = (uint16_t)(gen + 1u);
@@ -590,6 +577,23 @@ JCE_API JceLoadStatus JCE_CALL jce_scene_async_status(JceLoadHandle h)
     return st;
 }
 
+/* Parse-phase progress ramp, factored out so it is testable without a live
+ * worker thread.  Time-based and monotonic: `elapsed_ms` is measured from the
+ * moment the slot entered SLOT_PARSING, NOT accumulated per call.  The old
+ * form added a fixed step inside this getter, so progress tracked how often a
+ * caller polled rather than how long the load had taken -- two panels reading
+ * the same handle ran the bar at double speed, and a caller that stopped
+ * polling froze it. */
+JCE_API float JCE_CALL jce_async_parse_ramp(float current, uint64_t elapsed_ms)
+{
+    const float elapsed_s = (float)elapsed_ms * 0.001f;
+    const float ramped =
+        elapsed_s * (JCE_ASYNC_PARSE_CEILING / JCE_ASYNC_PARSE_RAMP_SECONDS);
+    float next = current > ramped ? current : ramped;   /* never goes back */
+    if (next > JCE_ASYNC_PARSE_CEILING) next = JCE_ASYNC_PARSE_CEILING;
+    return next;
+}
+
 JCE_API float JCE_CALL jce_scene_async_progress(JceLoadHandle h)
 {
     if (!g_initialised) return 0.0f;
@@ -597,11 +601,18 @@ JCE_API float JCE_CALL jce_scene_async_progress(JceLoadHandle h)
     AsyncSlot *s = slot_lookup_locked(h);
     float p = 0.0f;
     if (s) {
-        /* Smoothly advance progress while the worker runs so callers
-         * see motion before the parse boundary lands. */
-        if (s->phase == SLOT_PARSING && s->progress < 0.35f) {
-            s->progress += 0.01f;
-            if (s->progress > 0.35f) s->progress = 0.35f;
+        /* Smoothly advance progress while the worker runs so callers see
+         * motion before the parse boundary lands.  Driven by the monotonic
+         * clock, NOT by a per-call increment: this is a getter, so the old
+         * form advanced once per CALL -- a caller polling twice a frame ran
+         * the bar twice as fast, and one that stopped polling froze it.  The
+         * ramp now takes the same 1.75 s of wall time regardless of frame
+         * rate or polling pattern. */
+        if (s->phase == SLOT_PARSING && s->progress < JCE_ASYNC_PARSE_CEILING) {
+            const uint64_t now_ms = jce_time_ticks_ms();
+            if (s->parse_started_ms == 0) s->parse_started_ms = now_ms;
+            s->progress = jce_async_parse_ramp(s->progress,
+                                               now_ms - s->parse_started_ms);
         }
         p = s->progress;
     }
@@ -629,8 +640,9 @@ JCE_API void JCE_CALL jce_scene_async_cancel(JceLoadHandle h)
     if (!g_initialised) return;
     jce_mutex_lock(g_mu);
     AsyncSlot *s = slot_lookup_locked(h);
-    if (s && s->cancel_flag) {
-        jce_atomic_i32_store(s->cancel_flag, 1);
+    if (s) {
+        s->cancel_requested = true;
+        if (s->task) (void)jce_async_task_cancel(s->task);
         if (s->phase == SLOT_PENDING) {
             /* Never started — terminate immediately. */
             s->phase         = SLOT_CANCELLED_INT;

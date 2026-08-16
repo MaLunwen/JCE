@@ -127,3 +127,135 @@ float JCE_CALL jce_water_buoyancy_force(float submersion, float vel_y,
     const float f_drag = -drag * vel_y * submersion;       /* opposes vert vel */
     return f_buoy + f_drag;
 }
+
+/* ── Inverse-displacement surface query (Gerstner) ──────────────────
+ *
+ * jce_water_sample_height returns only the vertical sine sum.  vs_water.sc
+ * ALSO rolls the vertex horizontally by the Gerstner steepness term, so for
+ * steepness > 0 the surface point at world XZ is not the one that sampler
+ * returns -- it is the one authored at some other XZ that got rolled to here.
+ * A body floating on the naive answer sits at visibly the wrong place on a
+ * steep wave, worst at crests.
+ *
+ * Same fix as the FFT path: solve  x + horizontalRoll(x) = p  by fixed-point
+ * iteration, then evaluate the height there.  Converges while Q*k*A < 1, which
+ * is also the condition that keeps a Gerstner wave from self-intersecting, so
+ * a surface too steep for this to converge is a surface that was already
+ * geometrically invalid. */
+float JCE_CALL jce_water_sample_height_displaced(const JceWaterWave *waves,
+                                                 int n, float base_y,
+                                                 float x, float z, float t,
+                                                 int iterations)
+{
+    if (!waves || n <= 0) return base_y;
+    if (iterations < 1)  iterations = 1;
+    if (iterations > 16) iterations = 16;
+
+    float wx = x, wz = z;
+    for (int it = 0; it < iterations; ++it) {
+        /* Horizontal roll contributed by the authored point (wx, wz). */
+        float rx = 0.0f, rz = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const JceWaterWave w = waves[i];
+            if (w.wavelength <= 0.0f) continue;
+            float dx = w.dir_x, dz = w.dir_z;
+            if (!water_norm2(&dx, &dz)) continue;
+
+            const float k     = WATER_TWO_PI / w.wavelength;
+            const float omega = k * w.speed;
+            const float phase = k * (dx * wx + dz * wz) + omega * t;
+            const float q     = w.steepness * w.amplitude;
+            const float c     = cosf(phase);
+            rx += q * dx * c;
+            rz += q * dz * c;
+        }
+        wx = x - rx;
+        wz = z - rz;
+    }
+
+    return jce_water_sample_height(waves, n, base_y, wx, wz, t);
+}
+
+/* ── Concentric-ring ocean geometry ────────────────────────────────────
+ * See jce_water.h. */
+
+bool JCE_CALL jce_water_ring_mesh_size(int rings, int segments,
+                                       uint32_t *out_verts,
+                                       uint32_t *out_indices)
+{
+    if (out_verts)   *out_verts   = 0u;
+    if (out_indices) *out_indices = 0u;
+    if (rings < 1 || segments < 3) return false;
+    if (rings > 64 || segments > 512) return false;
+
+    /* One centre vertex, then `segments` per ring. */
+    const uint32_t verts = 1u + (uint32_t)rings * (uint32_t)segments;
+    /* The cap is a fan of `segments` triangles; each subsequent gap between
+     * two rings is a quad strip of `segments` quads = 2*segments triangles. */
+    const uint32_t tris = (uint32_t)segments
+                        + (uint32_t)(rings - 1) * (uint32_t)segments * 2u;
+
+    if (out_verts)   *out_verts   = verts;
+    if (out_indices) *out_indices = tris * 3u;
+    return true;
+}
+
+bool JCE_CALL jce_water_ring_build(int rings, int segments,
+                                   float inner, float outer,
+                                   JceWaterRingVertex *out_verts,
+                                   uint32_t *out_indices)
+{
+    if (!out_verts || !out_indices) return false;
+    if (!jce_water_ring_mesh_size(rings, segments, NULL, NULL)) return false;
+    if (!(inner > 0.0f) || !(outer > inner)) return false;
+
+    /* Centre vertex: without it the innermost ring is a hole, and the hole
+     * sits directly under the camera where it is most visible. */
+    out_verts[0].x = 0.0f;
+    out_verts[0].z = 0.0f;
+    out_verts[0].radius = 0.0f;
+
+    /* Geometric radii: r_i = inner * (outer/inner)^(i/(rings-1)).  Geometric
+     * rather than linear because perspective shrinks by ratio, not by
+     * difference -- linear spacing would waste rings near the camera and leave
+     * the horizon under-tessellated. */
+    const float ratio = outer / inner;
+    for (int r = 0; r < rings; ++r) {
+        const float t = (rings > 1) ? (float)r / (float)(rings - 1) : 0.0f;
+        const float radius = inner * powf(ratio, t);
+        for (int sIdx = 0; sIdx < segments; ++sIdx) {
+            const float a = 6.28318530717958647692f *
+                            (float)sIdx / (float)segments;
+            const uint32_t vi = 1u + (uint32_t)r * (uint32_t)segments +
+                                (uint32_t)sIdx;
+            out_verts[vi].x = cosf(a) * radius;
+            out_verts[vi].z = sinf(a) * radius;
+            out_verts[vi].radius = radius;
+        }
+    }
+
+    uint32_t k = 0;
+    /* Cap fan. */
+    for (int sIdx = 0; sIdx < segments; ++sIdx) {
+        const uint32_t a = 1u + (uint32_t)sIdx;
+        const uint32_t b = 1u + (uint32_t)((sIdx + 1) % segments);
+        out_indices[k++] = 0u;
+        out_indices[k++] = b;
+        out_indices[k++] = a;
+    }
+    /* Ring strips.  Both sides of every boundary use the SAME segment count,
+     * so vertices coincide exactly and no T-junction can open. */
+    for (int r = 0; r + 1 < rings; ++r) {
+        const uint32_t base0 = 1u + (uint32_t)r * (uint32_t)segments;
+        const uint32_t base1 = base0 + (uint32_t)segments;
+        for (int sIdx = 0; sIdx < segments; ++sIdx) {
+            const uint32_t s0 = (uint32_t)sIdx;
+            const uint32_t s1 = (uint32_t)((sIdx + 1) % segments);
+            const uint32_t i00 = base0 + s0, i01 = base0 + s1;
+            const uint32_t i10 = base1 + s0, i11 = base1 + s1;
+            out_indices[k++] = i00; out_indices[k++] = i01; out_indices[k++] = i10;
+            out_indices[k++] = i10; out_indices[k++] = i01; out_indices[k++] = i11;
+        }
+    }
+    return true;
+}

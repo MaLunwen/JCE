@@ -99,9 +99,7 @@ uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_i
             JceEditorMeta *m =
                 jce_scene_get_editor_meta(s.scene, (JceEntity)id);
             if (m) {
-                snprintf(m->variant_parent_path,
-                         sizeof(m->variant_parent_path),
-                         "%s", vp_copy);
+                m->variant_parent_path = jce_scene_intern(s.scene, vp_copy);
             }
         }
     }
@@ -196,9 +194,8 @@ bool jce_state_save_prefab_variant(uint32_t entity_id,
         JceEditorMeta *m =
             jce_scene_get_editor_meta(s.scene, (JceEntity)entity_id);
         if (m) {
-            snprintf(m->variant_parent_path,
-                     sizeof(m->variant_parent_path),
-                     "%s", parent_prefab_path);
+            m->variant_parent_path =
+                jce_scene_intern(s.scene, parent_prefab_path);
         }
     }
     LOG_INFO(LOG_TAG, "prefab variant saved: %s (parent=%s)",

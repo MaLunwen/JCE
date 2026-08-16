@@ -7,6 +7,10 @@
 
 #include <jce/os/core/jce_thread.h>
 
+#include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_trace.h>
+
 #include "jce_memory.h"
 
 #include <enkiTS/TaskScheduler_c.h>
@@ -94,12 +98,17 @@ struct JceThread {
     SDL_Thread *handle;
     JceThreadFn fn;
     void       *arg;
+    char        name[JCE_TRACE_NAME_CAP];
 };
 
 static int sdl_thread_trampoline(void *user)
 {
     JceThread *t = (JceThread *)user;
+    if (t)
+        jce_trace_thread_register(t->name);
     if (t && t->fn) t->fn(t->arg);
+    if (t)
+        jce_trace_thread_unregister();
     return 0;
 }
 
@@ -110,8 +119,10 @@ JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name)
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
+    SDL_strlcpy(t->name, name && name[0] ? name : "jce-thread",
+                sizeof(t->name));
     t->handle = SDL_CreateThread(sdl_thread_trampoline,
-                                 name ? name : "jce_thread", t);
+                                 t->name, t);
     if (!t->handle) { JCE_FREE(t); return NULL; }
     return t;
 }
@@ -330,6 +341,11 @@ typedef struct TaskAdapter {
     JceTaskRangeFn range_fn;
     void          *arg;
     JceThreadPool *pool;         /* owner, for the running-pool marker below */
+    uint64_t       trace_task_id;
+    uint64_t       trace_parent_id;
+    uint64_t       trace_submitted_ns;
+    char           debug_name[JCE_TRACE_NAME_CAP];
+    char           pool_name[JCE_TRACE_NAME_CAP];
 } TaskAdapter;
 
 /* Which pool's task the calling thread is currently executing, or NULL.
@@ -343,13 +359,42 @@ static SDL_TLSID g_running_pool;
 static void task_range_adapter(uint32_t start_, uint32_t end_,
                                uint32_t threadnum_, void *pArgs_)
 {
-    (void)threadnum_;
     TaskAdapter *a = (TaskAdapter *)pArgs_;
     void *prev = SDL_GetTLS(&g_running_pool);   /* nested tasks restore it */
+    uint64_t previous_trace_id = jce_trace_task_current_id();
+    uint64_t span_id = 0;
+    uint64_t started_ns = 0;
+
+    if (threadnum_ > 0 && a->pool) {
+        char thread_name[JCE_TRACE_NAME_CAP];
+        SDL_snprintf(thread_name, sizeof(thread_name), "%s-%u",
+                     a->pool_name, (unsigned)threadnum_);
+        jce_trace_thread_register(thread_name);
+    }
+    if (a->trace_task_id != 0 && jce_trace_enabled()) {
+        uint64_t now = jce_time_ticks_ns();
+        uint64_t queue_ns = now >= a->trace_submitted_ns
+            ? now - a->trace_submitted_ns : 0;
+        span_id = jce_trace_next_id();
+        started_ns = now;
+        jce_trace_task_begin(span_id, a->trace_task_id,
+                             a->debug_name, queue_ns);
+    }
     SDL_SetTLS(&g_running_pool, a->pool, NULL);
-    if (a->range_fn) a->range_fn(start_, end_, a->arg);
-    else             a->fn(a->arg);
+    {
+        JCE_PROFILE_ZONE_N(a->debug_name);
+        if (a->range_fn) a->range_fn(start_, end_, a->arg);
+        else             a->fn(a->arg);
+        JCE_PROFILE_ZONE_END;
+    }
     SDL_SetTLS(&g_running_pool, prev, NULL);
+    if (span_id != 0) {
+        uint64_t ended_ns = jce_time_ticks_ns();
+        jce_trace_task_end(span_id, a->trace_task_id, a->debug_name,
+                           JCE_TRACE_TASK_SUCCEEDED,
+                           ended_ns >= started_ns ? ended_ns - started_ns : 0);
+        jce_trace_task_restore_id(previous_trace_id);
+    }
 }
 
 /* ================================================================== */
@@ -383,7 +428,43 @@ struct JceThreadPool {
     SDL_Mutex         *pending_mutex;
     int                worker_count;  /* threads enkiTS spawned (excl. creator) */
     uint64_t           owner_tid;     /* creator = enkiTS thread 0              */
+    char               debug_name[JCE_TRACE_NAME_CAP];
 };
+
+static void task_adapter_init(TaskAdapter *adapter,
+                              JceThreadPool *pool,
+                              const char *debug_name,
+                              JceTaskFn fn,
+                              JceTaskRangeFn range_fn,
+                              void *arg)
+{
+    SDL_zero(*adapter);
+    adapter->fn = fn;
+    adapter->range_fn = range_fn;
+    adapter->arg = arg;
+    adapter->pool = pool;
+    SDL_strlcpy(adapter->debug_name,
+                debug_name && debug_name[0] ? debug_name : "frame-job",
+                sizeof(adapter->debug_name));
+    SDL_strlcpy(adapter->pool_name,
+                pool && pool->debug_name[0] ? pool->debug_name : "jce-jobs",
+                sizeof(adapter->pool_name));
+    if (jce_trace_enabled()) {
+        adapter->trace_task_id = jce_trace_next_id();
+        adapter->trace_parent_id = jce_trace_task_current_id();
+    }
+}
+
+static void task_adapter_trace_submit(TaskAdapter *adapter)
+{
+    if (!adapter || adapter->trace_task_id == 0 || !jce_trace_enabled())
+        return;
+    adapter->trace_submitted_ns = jce_time_ticks_ns();
+    jce_trace_task_submit(adapter->trace_task_id,
+                          adapter->trace_parent_id,
+                          JCE_TRACE_TASK_FRAME_JOB,
+                          adapter->debug_name);
+}
 
 /* Garbage-collect completed fire-and-forget tasks. */
 static void cleanup_pending(JceThreadPool *pool)
@@ -408,13 +489,24 @@ static void cleanup_pending(JceThreadPool *pool)
 /* Thread pool public API                                              */
 /* ================================================================== */
 
-JceThreadPool *jce_thread_pool_create(int num_threads)
+JceThreadPool *jce_thread_pool_create_named(int num_threads,
+                                             const char *debug_name)
 {
     JceThreadPool *pool = JCE_NEW(JceThreadPool);
     if (!pool) return NULL;
 
     pool->scheduler = enkiNewTaskScheduler();
     if (!pool->scheduler) { JCE_FREE(pool); return NULL; }
+
+#if JCE_PLATFORM_WEB
+    /* The web build links without a pthread pool (BGFX_CONFIG_MULTITHREADED=0
+       single-threaded contract): enkiTS StartThreads() would throw
+       system_error 138 ("thread constructor failed") and abort the runtime.
+       Force every pool onto the calling thread; enkiTS executes tasks inline
+       when the creator waits, which is the same degraded mode the async pool
+       already ships on this platform. */
+    num_threads = 1;
+#endif
 
     if (num_threads <= 0)
         enkiInitTaskScheduler(pool->scheduler);          /* auto-detect */
@@ -428,7 +520,15 @@ JceThreadPool *jce_thread_pool_create(int num_threads)
     pool->worker_count  = (int)enkiGetNumTaskThreads(pool->scheduler) - 1;
     if (pool->worker_count < 0) pool->worker_count = 0;
     pool->owner_tid     = jce_thread_current_id();
+    SDL_strlcpy(pool->debug_name,
+                debug_name && debug_name[0] ? debug_name : "jce-jobs",
+                sizeof(pool->debug_name));
     return pool;
+}
+
+JceThreadPool *jce_thread_pool_create(int num_threads)
+{
+    return jce_thread_pool_create_named(num_threads, "jce-jobs");
 }
 
 int jce_thread_pool_worker_count(const JceThreadPool *pool)
@@ -459,15 +559,20 @@ void jce_thread_pool_destroy(JceThreadPool *pool)
 
 bool jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
 {
+    return jce_thread_pool_submit_named(pool, "frame-job", fn, arg);
+}
+
+bool jce_thread_pool_submit_named(JceThreadPool *pool,
+                                  const char *debug_name,
+                                  JceTaskFn fn, void *arg)
+{
     if (!pool || !fn) return false;
 
     cleanup_pending(pool);
 
     TaskAdapter *adapter = JCE_NEW(TaskAdapter);
     if (!adapter) return false;
-    adapter->fn   = fn;
-    adapter->arg  = arg;
-    adapter->pool = pool;
+    task_adapter_init(adapter, pool, debug_name, fn, NULL, arg);
 
     /* Pre-allocate tracking node BEFORE submitting so we never lose
        the adapter pointer if the allocation fails. */
@@ -478,7 +583,20 @@ bool jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
     }
 
     enkiTaskSet *ts = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    if (!ts) {
+        JCE_FREE(pending);
+        JCE_FREE(adapter);
+        return false;
+    }
+    task_adapter_trace_submit(adapter);
     enkiAddTaskSetArgs(pool->scheduler, ts, adapter, 1);
+#if JCE_PLATFORM_WEB
+    /* Zero-worker pools (web build) have nobody to pick queued work up and
+       fire-and-forget submitters never wait: execute inline right now, on
+       the calling thread, so async decode work still completes. */
+    if (pool->worker_count == 0)
+        enkiWaitForTaskSet(pool->scheduler, ts);
+#endif
 
     pending->task_set = ts;
     pending->adapter  = adapter;
@@ -493,6 +611,13 @@ bool jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
 JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
                                          JceTaskFn fn, void *arg)
 {
+    return jce_thread_pool_submit_tracked_named(
+        pool, "tracked-frame-job", fn, arg);
+}
+
+JceTask *jce_thread_pool_submit_tracked_named(
+    JceThreadPool *pool, const char *debug_name, JceTaskFn fn, void *arg)
+{
     if (!pool || !fn) return NULL;
 
     JceTask *task = JCE_NEW(JceTask);
@@ -500,12 +625,20 @@ JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
 
     task->scheduler    = pool->scheduler;
     task->pool         = pool;
-    task->adapter.fn   = fn;
-    task->adapter.arg  = arg;
-    task->adapter.pool = pool;
+    task_adapter_init(&task->adapter, pool, debug_name, fn, NULL, arg);
 
     task->task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    if (!task->task_set) {
+        JCE_FREE(task);
+        return NULL;
+    }
+    task_adapter_trace_submit(&task->adapter);
     enkiAddTaskSetArgs(pool->scheduler, task->task_set, &task->adapter, 1);
+#if JCE_PLATFORM_WEB
+    /* Zero-worker pools: complete inline so pollers see it finish. */
+    if (pool->worker_count == 0)
+        enkiWaitForTaskSet(pool->scheduler, task->task_set);
+#endif
 
     return task;
 }
@@ -513,6 +646,15 @@ JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
 JceTask *jce_thread_pool_submit_range(JceThreadPool *pool,
                                       JceTaskRangeFn fn, void *arg,
                                       uint32_t set_size, uint32_t min_range)
+{
+    return jce_thread_pool_submit_range_named(
+        pool, "range-frame-job", fn, arg, set_size, min_range);
+}
+
+JceTask *jce_thread_pool_submit_range_named(
+    JceThreadPool *pool, const char *debug_name,
+    JceTaskRangeFn fn, void *arg,
+    uint32_t set_size, uint32_t min_range)
 {
     if (!pool || !fn || set_size == 0) return NULL;
     if (min_range == 0) min_range = 1;
@@ -522,13 +664,21 @@ JceTask *jce_thread_pool_submit_range(JceThreadPool *pool,
 
     task->scheduler        = pool->scheduler;
     task->pool             = pool;
-    task->adapter.range_fn = fn;
-    task->adapter.arg      = arg;
-    task->adapter.pool     = pool;
+    task_adapter_init(&task->adapter, pool, debug_name, NULL, fn, arg);
 
     task->task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    if (!task->task_set) {
+        JCE_FREE(task);
+        return NULL;
+    }
+    task_adapter_trace_submit(&task->adapter);
     enkiAddTaskSetMinRange(pool->scheduler, task->task_set, &task->adapter,
                            set_size, min_range);
+#if JCE_PLATFORM_WEB
+    /* Zero-worker pools: complete inline so pollers see it finish. */
+    if (pool->worker_count == 0)
+        enkiWaitForTaskSet(pool->scheduler, task->task_set);
+#endif
 
     return task;
 }
@@ -560,6 +710,17 @@ static void parallel_for_chunks(uint32_t begin, uint32_t end, void *arg)
 void jce_thread_pool_parallel_for(JceThreadPool *pool, uint32_t count,
                                   uint32_t chunk, JceTaskRangeFn fn, void *arg)
 {
+    jce_thread_pool_parallel_for_named(
+        pool, "parallel-for", count, chunk, fn, arg);
+}
+
+void jce_thread_pool_parallel_for_named(JceThreadPool *pool,
+                                        const char *debug_name,
+                                        uint32_t count,
+                                        uint32_t chunk,
+                                        JceTaskRangeFn fn,
+                                        void *arg)
+{
     if (!fn || count == 0) return;
 
     if (chunk == 0) {
@@ -575,7 +736,14 @@ void jce_thread_pool_parallel_for(JceThreadPool *pool, uint32_t count,
 
     /* No pool, or a single chunk: nothing to overlap, and the cooperative wait
        would have run it on this thread anyway. */
-    if (!pool || n_chunks <= 1u) { fn(0u, count, arg); return; }
+    if (!pool || n_chunks <= 1u) {
+        TaskAdapter direct;
+
+        task_adapter_init(&direct, pool, debug_name, NULL, fn, arg);
+        task_adapter_trace_submit(&direct);
+        task_range_adapter(0u, count, 0u, &direct);
+        return;
+    }
 
     /* The handle lives on THIS stack — the wait below is what makes that safe,
        and it keeps the per-frame consumers free of the malloc/free pair a
@@ -583,16 +751,16 @@ void jce_thread_pool_parallel_for(JceThreadPool *pool, uint32_t count,
     JceTask task;
     task.scheduler        = pool->scheduler;
     task.pool             = pool;
-    task.adapter.fn       = NULL;
-    task.adapter.range_fn = parallel_for_chunks;
-    task.adapter.arg      = &ctx;
-    task.adapter.pool     = pool;
+    task_adapter_init(&task.adapter, pool, debug_name,
+                      NULL, parallel_for_chunks, &ctx);
 
     task.task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
     if (!task.task_set) {           /* OOM: run it here rather than drop it */
-        parallel_for_chunks(0u, n_chunks, &ctx);
+        task_adapter_trace_submit(&task.adapter);
+        task_range_adapter(0u, n_chunks, 0u, &task.adapter);
         return;
     }
+    task_adapter_trace_submit(&task.adapter);
     enkiAddTaskSetMinRange(pool->scheduler, task.task_set, &task.adapter,
                            n_chunks, 1u);
     jce_task_wait(&task);
@@ -613,15 +781,31 @@ static bool ets_wait_safe_here(const JceThreadPool *pool)
 
 void jce_task_wait(JceTask *task)
 {
+    uint64_t wait_id = 0;
+    uint64_t wait_started_ns = 0;
+
     if (!task) return;
+    if (task->adapter.trace_task_id != 0 && jce_trace_enabled()) {
+        wait_id = jce_trace_next_id();
+        wait_started_ns = jce_time_ticks_ns();
+        jce_trace_wait_begin(wait_id, task->adapter.trace_task_id,
+                             task->adapter.debug_name);
+    }
     if (ets_wait_safe_here(task->pool)) {
         enkiWaitForTaskSet(task->scheduler, task->task_set);
-        return;
+    } else {
+        /* Foreign thread: poll instead of stealing work.  Only reached by callers
+           that are already I/O paced, so 1 ms granularity is free. */
+        while (!enkiIsTaskSetComplete(task->scheduler, task->task_set))
+            SDL_Delay(1);
     }
-    /* Foreign thread: poll instead of stealing work.  Only reached by callers
-       that are already I/O paced, so 1 ms granularity is free. */
-    while (!enkiIsTaskSetComplete(task->scheduler, task->task_set))
-        SDL_Delay(1);
+    if (wait_id != 0) {
+        uint64_t ended_ns = jce_time_ticks_ns();
+        jce_trace_wait_end(wait_id, task->adapter.trace_task_id,
+                           task->adapter.debug_name,
+                           ended_ns >= wait_started_ns
+                               ? ended_ns - wait_started_ns : 0);
+    }
 }
 
 bool jce_task_done(const JceTask *task)
@@ -689,7 +873,8 @@ JceThreadPool *jce_thread_pool_shared(void)
         if (workers <= 0) workers = jce_thread_pool_default_workers();
         /* enkiTS counts the initialising thread inside its thread total, so
            ask for workers+1 to end up with `workers` spawned threads. */
-        g_shared_pool = jce_thread_pool_create(workers + 1);
+        g_shared_pool = jce_thread_pool_create_named(
+            workers + 1, "jce-frame");
     }
     JceThreadPool *p = g_shared_pool;
     shared_unlock();

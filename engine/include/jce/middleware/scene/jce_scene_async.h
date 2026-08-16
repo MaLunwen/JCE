@@ -7,8 +7,8 @@
  * block the main thread for the full I/O + parse + ECS-apply cost.  This
  * module splits that work:
  *
- *   - A background worker (jce_thread) opens the VFS file and runs the
- *     JSON parser.  This is by far the heaviest portion of a load.
+ *   - The structured async runtime opens the VFS file and runs the JSON
+ *     parser. This is by far the heaviest portion of a load.
  *   - The main thread calls jce_scene_async_dispatch_main() once per
  *     frame (wired into JCE_PHASE_EARLY_UPDATE by jce_scene_async_init);
  *     at most one parsed payload is committed to the live flecs world
@@ -78,9 +78,9 @@ typedef void (*JceLoadCallback)(JceLoadHandle h, JceLoadStatus status,
 JCE_API bool JCE_CALL jce_scene_async_init(JceScene             *target,
                                             const JceFileSystem  *fs);
 
-/* Shut down the async loader: joins any worker threads still running,
- * drops pending state, unregisters the player-loop hook.  Called by the
- * engine shutdown sequence; idempotent. */
+/* Shut down the async loader: cooperatively cancels and waits for accepted
+ * parse tasks, drops pending state, and unregisters the player-loop hook.
+ * Called by the engine shutdown sequence; idempotent. */
 JCE_API void JCE_CALL jce_scene_async_shutdown(void);
 
 /* ── Submit ─────────────────────────────────────────────────────────
@@ -107,6 +107,16 @@ jce_scene_instantiate_async(const char     *vfs_path,
  *          next dispatch_main call; cache the result if needed. */
 JCE_API JceLoadStatus JCE_CALL jce_scene_async_status(JceLoadHandle h);
 JCE_API float         JCE_CALL jce_scene_async_progress(JceLoadHandle h);
+
+/* Ceiling the parse phase ramps toward, and how long (seconds) it takes to
+ * get there.  The remainder of the bar is driven by real load milestones. */
+#define JCE_ASYNC_PARSE_CEILING      0.35f
+#define JCE_ASYNC_PARSE_RAMP_SECONDS 1.75f
+
+/* Pure ramp used by jce_scene_async_progress: monotonic in `current`, driven
+ * by milliseconds elapsed since the parse began rather than by call count.
+ * Exposed so the timing contract can be tested without a worker thread. */
+JCE_API float JCE_CALL jce_async_parse_ramp(float current, uint64_t elapsed_ms);
 JCE_API bool          JCE_CALL jce_scene_async_get_result(JceLoadHandle h,
                                                             JceLoadResult *out);
 

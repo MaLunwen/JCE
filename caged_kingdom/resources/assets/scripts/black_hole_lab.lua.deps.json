@@ -1,0 +1,20 @@
+{
+  "contract": {
+    "name": "jce.bundle.dependencies",
+    "major": 1,
+    "minor": 0
+  },
+  "assets": [
+    "black_hole/kerr_lab.json",
+    "black_hole/reference_summary.json",
+    "textures/black_hole/starfield_reference.jceasset",
+    "textures/black_hole/disk_flux_lut.jceasset",
+    "textures/black_hole/blackbody_rgb_lut.jceasset",
+    "textures/black_hole/starfield_prefiltered.jceasset"
+  ],
+  "labels": [
+    "ck.black_hole_lab",
+    "ck.kerr_lab.v1",
+    "science.reference_data"
+  ]
+}

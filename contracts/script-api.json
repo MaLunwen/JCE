@@ -1,0 +1,1700 @@
+{
+  "script_api_version": 1,
+  "_generated_by": "python tools/scriptgen/gen_script_bindings.py --write",
+  "_note": "vtable_index is emitted for traceability only. No binding may key off it: the append-only rule plus the min(caller, engine) copy over a zeroed destination is what makes a short host safe, and a slot-indexed binding would defeat it.",
+  "declared_totals": {
+    "host_members": 74,
+    "expose": 71,
+    "hand_written": 7,
+    "constants": 1,
+    "table_keys": 79,
+    "members_reached_by_generated": 70,
+    "members_reached_only_by_hand_written": 4
+  },
+  "constants": [
+    {
+      "name": "json_null",
+      "kind": "lightuserdata_sentinel",
+      "since": 1,
+      "doc": "Null sentinel returned inside asset_read_json tables. Compared by identity, so it must be the same object the reader pushes."
+    }
+  ],
+  "hand_written": [
+    {
+      "name": "log",
+      "vtable": "log",
+      "since": 1,
+      "reason": "no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the only one among the 78"
+    },
+    {
+      "name": "asset_read_text",
+      "vtable": "read_file",
+      "since": 1,
+      "reason": "policy, not glue: script_virtual_asset_path_valid (:66, called :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)"
+    },
+    {
+      "name": "asset_read_json",
+      "vtable": "read_file",
+      "since": 1,
+      "reason": "all of asset_read_text (the same script_virtual_asset_path_valid at :219) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)"
+    },
+    {
+      "name": "play_sound",
+      "vtable": "play_sound",
+      "since": 1,
+      "also_reaches": "play_sound_spatial",
+      "reason": "arity dispatch across two members: lua_gettop at :263 routes to play_sound_spatial (:286) or play_sound (:289); its own comment at :280 concedes top == 3 is ambiguous"
+    },
+    {
+      "name": "start_coroutine",
+      "vtable": null,
+      "since": 1,
+      "reason": "Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume; owns s->coros[]"
+    },
+    {
+      "name": "wait_seconds",
+      "vtable": null,
+      "since": 1,
+      "reason": "lua_yield into the same scheduler"
+    },
+    {
+      "name": "stop_coroutine",
+      "vtable": null,
+      "since": 1,
+      "reason": "scans s->coros[]"
+    }
+  ],
+  "expose": [
+    {
+      "name": "get_position",
+      "vtable": "get_position",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "World-space position of `entity`. Absent when the entity has no transform.",
+      "vtable_index": 1,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xyz[3])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_xyz",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_position",
+      "vtable": "set_position",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 2,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y, float z)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_rotation",
+      "vtable": "get_rotation",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 3,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_euler_deg[3])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_euler_deg",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_rotation",
+      "vtable": "set_rotation",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 4,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y, float z)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_scale",
+      "vtable": "get_scale",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 5,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xyz[3])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_xyz",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_scale",
+      "vtable": "set_scale",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 6,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y, float z)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_parent",
+      "vtable": "set_parent",
+      "shape": "value_return",
+      "since": 1,
+      "strict": [
+        "preserve_world"
+      ],
+      "doc": "The ONLY boolean argument on this surface that is type-checked; the other five accept any truthy value. The luaL_checktype is emitted from this entry's `strict` modifier -- no line citation, because the hand-written body that carried it is gone. test_strict_emits_a_type_check_only_for_the_named_parameter is what fails if the emitter drops it.",
+      "vtable_index": 68,
+      "c_signature": "bool (*)(void *user, JceScriptEntity child, JceScriptEntity parent, bool preserve_world)",
+      "params": [
+        {
+          "name": "child",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "parent",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "preserve_world",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_parent",
+      "vtable": "get_parent",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 69,
+      "c_signature": "JceScriptEntity (*)(void *user, JceScriptEntity child)",
+      "params": [
+        {
+          "name": "child",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_key_down",
+      "vtable": "is_key_down",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 7,
+      "c_signature": "bool (*)(void *user, int keycode)",
+      "params": [
+        {
+          "name": "keycode",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "find_with_tag",
+      "vtable": "find_with_tag",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 8,
+      "c_signature": "JceScriptEntity (*)(void *user, const char * tag)",
+      "params": [
+        {
+          "name": "tag",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "destroy",
+      "vtable": "destroy_entity",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 9,
+      "c_signature": "void (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "spawn",
+      "vtable": "spawn",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "vtable_index": 10,
+      "c_signature": "JceScriptEntity (*)(void *user, const char * prefab_path, float x, float y, float z)",
+      "params": [
+        {
+          "name": "prefab_path",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "move_axis",
+      "vtable": "move_axis",
+      "shape": "void_out_array",
+      "since": 1,
+      "vtable_index": 11,
+      "c_signature": "void (*)(void *user, float out_xz[2])",
+      "params": [],
+      "out_params": [
+        {
+          "name": "out_xz",
+          "c_type": "float",
+          "arity": 2
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "jump_pressed",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 0
+      },
+      "vtable_index": 12,
+      "c_signature": "bool (*)(void *user, int button)",
+      "params": [
+        {
+          "name": "button",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "sprint",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 1
+      },
+      "vtable_index": 12,
+      "c_signature": "bool (*)(void *user, int button)",
+      "params": [
+        {
+          "name": "button",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "attack_pressed",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 2
+      },
+      "vtable_index": 12,
+      "c_signature": "bool (*)(void *user, int button)",
+      "params": [
+        {
+          "name": "button",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_time_scale",
+      "vtable": "set_time_scale",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 21,
+      "c_signature": "void (*)(void *user, float scale)",
+      "params": [
+        {
+          "name": "scale",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "pause",
+      "vtable": "set_paused",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "paused": true
+      },
+      "doc": "jce.pause() with no argument pauses; jce.pause(false) resumes.",
+      "vtable_index": 22,
+      "c_signature": "void (*)(void *user, bool paused)",
+      "params": [
+        {
+          "name": "paused",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "shake_camera",
+      "vtable": "shake_camera",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "amount": 0.5
+      },
+      "vtable_index": 23,
+      "c_signature": "void (*)(void *user, float amount)",
+      "params": [
+        {
+          "name": "amount",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "music_set_intensity",
+      "vtable": "music_set_intensity",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 57,
+      "c_signature": "void (*)(void *user, float intensity)",
+      "params": [
+        {
+          "name": "intensity",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "music_get_intensity",
+      "vtable": "music_get_intensity",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 58,
+      "c_signature": "float (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "music_request_transition",
+      "vtable": "music_request_transition",
+      "shape": "value_return",
+      "since": 1,
+      "absent_value": -1.0,
+      "doc": "Absolute playhead time of the quantized switch; negative on miss or no track, which is why the no-host value is -1 and not 0.",
+      "vtable_index": 59,
+      "c_signature": "float (*)(void *user, int to_segment)",
+      "params": [
+        {
+          "name": "to_segment",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "gas_activate",
+      "vtable": "gas_activate",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 24,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, uint32_t ability_id)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "ability_id",
+          "c_type": "uint32_t",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "gas_get",
+      "vtable": "gas_get",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 25,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * attr_name, float *out_value)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "attr_name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_value",
+          "c_type": "float",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "gas_apply",
+      "vtable": "gas_apply",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "op": 0,
+        "duration_seconds": 0.0
+      },
+      "vtable_index": 26,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * attr_name, int op, float magnitude, float duration_seconds)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "attr_name",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "op",
+          "c_type": "int",
+          "role": "in"
+        },
+        {
+          "name": "magnitude",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "duration_seconds",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "raycast",
+      "vtable": "raycast",
+      "shape": "fallible_out",
+      "since": 1,
+      "miss_value": 0,
+      "doc": "8 values on a hit; a MISS pushes integer 0, not nil -- scripts branch on `e == 0`.",
+      "vtable_index": 28,
+      "c_signature": "bool (*)(void *user, const float origin[3], const float dir[3], float max_dist, JceScriptRaycastHit *out)",
+      "params": [
+        {
+          "name": "origin",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "dir",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "max_dist",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptRaycastHit",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "apply_impulse",
+      "vtable": "apply_impulse",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 29,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y, float z)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_velocity",
+      "vtable": "set_velocity",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 30,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y, float z)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "anim_set_float",
+      "vtable": "anim_set_float",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 32,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * name, float v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "anim_set_int",
+      "vtable": "anim_set_int",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 33,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * name, int v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "anim_set_bool",
+      "vtable": "anim_set_bool",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 34,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * name, bool v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "anim_set_trigger",
+      "vtable": "anim_set_trigger",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 35,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * name)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_action_down",
+      "vtable": "action_down",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 13,
+      "c_signature": "bool (*)(void *user, const char * name)",
+      "params": [
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_action_pressed",
+      "vtable": "action_pressed",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 14,
+      "c_signature": "bool (*)(void *user, const char * name)",
+      "params": [
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_axis",
+      "vtable": "action_axis",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 15,
+      "c_signature": "float (*)(void *user, const char * name)",
+      "params": [
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_pointer_delta",
+      "vtable": "pointer_delta",
+      "shape": "void_out_array",
+      "since": 1,
+      "vtable_index": 16,
+      "c_signature": "void (*)(void *user, float out_xy[2])",
+      "params": [],
+      "out_params": [
+        {
+          "name": "out_xy",
+          "c_type": "float",
+          "arity": 2
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_pointer_wheel",
+      "vtable": "pointer_wheel",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 17,
+      "c_signature": "float (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_pointer_down",
+      "vtable": "pointer_button",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 18,
+      "c_signature": "bool (*)(void *user, int button)",
+      "params": [
+        {
+          "name": "button",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_touch_count",
+      "vtable": "touch_count",
+      "shape": "value_return",
+      "since": 1,
+      "clamp_min": 0,
+      "doc": "A host returning a negative count is clamped to 0 so `for i = 1, jce.get_touch_count()` cannot underflow.",
+      "vtable_index": 19,
+      "c_signature": "int (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_touch",
+      "vtable": "touch_get",
+      "shape": "fallible_out",
+      "since": 1,
+      "index_base": 1,
+      "doc": "1-based Lua index mapped to 0-based C; an index below 1 returns nil without calling the host.",
+      "vtable_index": 20,
+      "c_signature": "bool (*)(void *user, int index, uint64_t *id, float *x, float *y, float *pressure)",
+      "params": [
+        {
+          "name": "index",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "id",
+          "c_type": "uint64_t",
+          "arity": -1
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "arity": -1
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "arity": -1
+        },
+        {
+          "name": "pressure",
+          "c_type": "float",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "tr",
+      "vtable": "loc_translate",
+      "shape": "value_return",
+      "since": 1,
+      "absent_value": {
+        "param": "key"
+      },
+      "doc": "Passthrough is the contract, not a fallback: an unlocalized build shows readable keys instead of blank UI.",
+      "vtable_index": 71,
+      "c_signature": "const char * (*)(void *user, const char * key)",
+      "params": [
+        {
+          "name": "key",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_locale",
+      "vtable": "loc_get_locale",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 72,
+      "c_signature": "const char * (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_locale",
+      "vtable": "loc_set_locale",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 73,
+      "c_signature": "void (*)(void *user, const char * locale)",
+      "params": [
+        {
+          "name": "locale",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_velocity",
+      "vtable": "get_velocity",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 31,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out[3])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "vehicle_set_input",
+      "vtable": "vehicle_set_input",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 54,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float throttle, float brake, float steer)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "throttle",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "brake",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "steer",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "vehicle_get_speed",
+      "vtable": "vehicle_get_speed",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 55,
+      "c_signature": "float (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_move",
+      "vtable": "get_move",
+      "shape": "void_out_array",
+      "since": 1,
+      "vtable_index": 56,
+      "c_signature": "void (*)(void *user, float out[3])",
+      "params": [],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_slider",
+      "vtable": "ui_get_slider",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 37,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float *out)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "float",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_slider",
+      "vtable": "ui_set_slider",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 38,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_toggle",
+      "vtable": "ui_get_toggle",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 39,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, bool *out)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "bool",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_toggle",
+      "vtable": "ui_set_toggle",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 40,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, bool v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_text",
+      "vtable": "ui_set_text",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 41,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * txt)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "txt",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "send_message",
+      "vtable": "send_message",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "number_arg": 0.0,
+        "str_arg": null
+      },
+      "vtable_index": 42,
+      "c_signature": "void (*)(void *user, JceScriptEntity target, const char * msg, double number_arg, const char * str_arg)",
+      "params": [
+        {
+          "name": "target",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "msg",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "number_arg",
+          "c_type": "double",
+          "role": "in"
+        },
+        {
+          "name": "str_arg",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "broadcast",
+      "vtable": "broadcast",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "number_arg": 0.0,
+        "str_arg": null
+      },
+      "vtable_index": 43,
+      "c_signature": "void (*)(void *user, const char * msg, double number_arg, const char * str_arg)",
+      "params": [
+        {
+          "name": "msg",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "number_arg",
+          "c_type": "double",
+          "role": "in"
+        },
+        {
+          "name": "str_arg",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "has_component",
+      "vtable": "has_component",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 51,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * comp_name)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "comp_name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_component_enabled",
+      "vtable": "is_component_enabled",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 52,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * comp_name)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "comp_name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_component_enabled",
+      "vtable": "set_component_enabled",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 53,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * comp_name, bool on)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "comp_name",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "on",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "net_is_server",
+      "vtable": "net_is_server",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 44,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "net_is_client",
+      "vtable": "net_is_client",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 45,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "net_spawn",
+      "vtable": "net_spawn",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 46,
+      "c_signature": "JceScriptEntity (*)(void *user, const char * prefab_path, float x, float y, float z)",
+      "params": [
+        {
+          "name": "prefab_path",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "rpc_send",
+      "vtable": "rpc_send",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "target": 0,
+        "payload": null
+      },
+      "vtable_index": 47,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * event, int target, const char * payload)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "event",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "target",
+          "c_type": "int",
+          "role": "in"
+        },
+        {
+          "name": "payload",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "particle_burst",
+      "vtable": "particle_burst",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 48,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, int count)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "count",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "particle_set_emitting",
+      "vtable": "particle_set_emitting",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 49,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, bool on)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "on",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "particle_set_color",
+      "vtable": "particle_set_color",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 50,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float r, float g, float b)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "r",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "g",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "b",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "find_by_name",
+      "vtable": "find_by_name",
+      "shape": "first_and_count",
+      "since": 1,
+      "out_capacity": 2,
+      "doc": "first-or-nil AND a match count, so a strict scene director can reject duplicate authored names. IDENTICAL C signature to find_by_prefix and a DIFFERENT contract.",
+      "vtable_index": 60,
+      "c_signature": "int (*)(void *user, const char * name, JceScriptEntity *out, int max)",
+      "params": [
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "find_by_prefix",
+      "vtable": "find_by_prefix",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 1024,
+      "doc": "One Lua array. IDENTICAL C signature to find_by_name and a DIFFERENT contract.",
+      "vtable_index": 61,
+      "c_signature": "int (*)(void *user, const char * prefix, JceScriptEntity *out, int max)",
+      "params": [
+        {
+          "name": "prefix",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "comp_get",
+      "vtable": "comp_get_json",
+      "shape": "owned_string_release",
+      "since": 1,
+      "release": "json_free",
+      "vtable_index": 62,
+      "c_signature": "char * (*)(void *user, JceScriptEntity e, const char * type)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "type",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "comp_set",
+      "vtable": "comp_set_json",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 63,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * type, const char * json)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "type",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "json",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "render_get",
+      "vtable": "render_get_json",
+      "shape": "owned_string_release",
+      "since": 1,
+      "release": "json_free",
+      "vtable_index": 64,
+      "c_signature": "char * (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "render_set",
+      "vtable": "render_set_json",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 65,
+      "c_signature": "bool (*)(void *user, const char * json)",
+      "params": [
+        {
+          "name": "json",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "audio_set_volume",
+      "vtable": "audio_set_volume",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 67,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float volume)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "volume",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    }
+  ]
+}

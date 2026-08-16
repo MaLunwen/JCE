@@ -44,6 +44,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		"${CMAKE_CURRENT_SOURCE_DIR}/src")
 	target_link_libraries(CagedKingdom PRIVATE JCE::JCE)
 
+	# Project-owned shaders use the SDK's backend/profile matrix and land in a
+	# generated resource root. The engine only supplies the generic full-screen
+	# vertex stage and resolver; every Kerr equation remains in this project.
+	set(_ck_shader_asset_root
+		"${CMAKE_CURRENT_BINARY_DIR}/generated/project_assets")
+	jce_add_project_shaders(
+		TARGET       CKBlackHoleShaders
+		SOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/black_hole"
+		OUTPUT_DIR   "${_ck_shader_asset_root}/shaders"
+		VARYING_DEF  varying.def.sc
+		INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/black_hole/include"
+		OUT_FILES_VAR _ck_shader_outputs)
+	add_dependencies(CagedKingdom CKBlackHoleShaders)
+
 	# ---- Game asset PAK ------------------------------------------- #
 	# Prefer the SDK's turnkey jce_add_pak(): it cooks raw assets
 	# (PNG→RGBA8, WAV/OGG→PCM) via jce_cook when the SDK shipped it,
@@ -62,6 +76,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	if(IS_DIRECTORY "${_ck_ui}")
 		list(APPEND _ck_dirs "${_ck_ui}")
 	endif()
+	list(APPEND _ck_dirs "${_ck_shader_asset_root}")
 
 	# Editor-driven builds feed pre-cooked assets via
 	# JCE_PROJECT_PREBUILT_ASSETS_*; jce_add_pak() consumes those without
@@ -76,7 +91,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	if(COMMAND jce_add_pak AND
 	   (_ck_have_prebuilt OR (JCE_PAK_EXECUTABLE AND _ck_dirs)))
 		jce_add_pak(CagedKingdom
-			RESOURCE_DIRS ${_ck_dirs})
+			RESOURCE_DIRS ${_ck_dirs}
+			EXTRA_DEPENDS ${_ck_shader_outputs})
 	else()
 		set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
 		file(WRITE "${_stub}"
@@ -176,6 +192,22 @@ endif()
 
 target_include_directories(CagedKingdom PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+# In-tree project shaders share the generated shader resource root so the
+# existing cook/pack/editor pipelines consume exactly the same logical names.
+jce_add_project_shaders(
+	TARGET       CKBlackHoleShaders
+	SOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/black_hole"
+	OUTPUT_DIR   "${JCE_SHADER_OUTPUT_DIR}"
+	VARYING_DEF  varying.def.sc
+	INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/black_hole/include")
+add_dependencies(CagedKingdom CKBlackHoleShaders)
+if(TARGET CookGameAssets)
+	add_dependencies(CookGameAssets CKBlackHoleShaders)
+endif()
+if(TARGET PackGameAssets)
+	add_dependencies(PackGameAssets CKBlackHoleShaders)
+endif()
 
 # When building a shared library for host JNI, we must force the linker to
 # include ALL symbols from the JCE static archives — otherwise unreferenced JNI

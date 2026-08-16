@@ -84,6 +84,23 @@ typedef struct JceCookOptions {
        2 = HIGHEST (iterative cluster-fit — slowest, for a final ship pass).
        0 keeps the historical behaviour, so existing callers are unaffected. */
     int encode_quality;
+
+    /* For textures: are the texels sRGB-ENCODED COLOUR?
+     *
+     * Selects the space mipmaps are averaged in.  Colour maps must be decoded
+     * to linear, averaged, and re-encoded; normal / metallic-roughness /
+     * occlusion / height / mask / LUT data must be averaged as stored, and
+     * decoding those would corrupt values that are currently right.
+     *
+     * FALSE is the zero-initialised value AND the historical behaviour, so a
+     * caller that does not set it gets exactly what it got before.  The
+     * path-aware entry points (jce_cook_file, and the bundle packer) set it
+     * from jce_cook_path_is_srgb().  jce_cook_texture() takes only a buffer
+     * and cannot know, which is precisely the gap the cooker's own audit note
+     * describes: JceCookOptions has no texture SEMANTIC, only this one derived
+     * bit, and the semantic the importers already hold has still not been
+     * plumbed down here. */
+    bool texture_srgb;
 } JceCookOptions;
 
 #define JCE_COOK_ENCODE_DEFAULT 0

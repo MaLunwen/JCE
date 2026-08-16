@@ -62,11 +62,6 @@ static float       s_play_resync_dt = 1.0f / 60.0f;
  * byte-identical to before. */
 static JceWorldStreamer *s_play_streamer        = NULL;
 static JceFileSystem    *s_play_stream_fs       = NULL;
-/* Background worker pool for async chunk loads (off-thread disk read + private
- * buffer; the scene APPLY/spawn stays on the main thread).  Owned alongside the
- * streamer for the Play session: destroyed AFTER the streamer (whose destroy
- * joins all in-flight chunk tasks first) so no worker can touch a freed fs. */
-static JceThreadPool    *s_play_stream_pool      = NULL;
 static jce_vec3          s_play_stream_pos       = { 0.0f, 0.0f, 0.0f };
 static bool              s_play_stream_pos_valid = false;
 
@@ -264,7 +259,6 @@ static void play_streaming_begin(void)
 {
     s_play_streamer = NULL;
     s_play_stream_fs = NULL;
-    s_play_stream_pool = NULL;
     s_play_stream_pos_valid = false;
     if (!s.scene) return;
 
@@ -301,41 +295,30 @@ static void play_streaming_begin(void)
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
 
-    /* Hand the streamer a small worker pool so chunk disk-read + JSON-byte
-     * staging run OFF the main thread (the apply/spawn stays time-sliced on
-     * main); this kills the per-cell frame hitch.  Web has no real threads, so
-     * keep the cooperative single-thread path there.
-     *
-     * Private, not jce_thread_pool_shared(): a chunk load is one whole-file
-     * read, so putting it on the shared pool would put it in reach of the
-     * frame loop's own cooperative waits — jce_thread_pool_parallel_for()
-     * runs whatever is queued while it waits, and a cull that lands on a cold
-     * multi-megabyte chunk read is precisely the hitch this pool exists to
-     * remove.  The three threads buy that isolation.  jce_thread.h documents
-     * the split and the priority-tier work that would end it. */
-    JceThreadPool *pool = NULL;
+    /* Streaming owns a bounded structured executor for blocking reads. Web
+     * advances the same contract cooperatively from update(). */
+    bool force_sync = false;
 #if !JCE_PLATFORM_WEB
-    /* Bench/diagnostic toggle (M2 A/B): JCE_STREAM_SYNC=1 forces the synchronous
-     * single-thread chunk-load path (no worker pool) so the async chunk-load
-     * benefit can be measured, and as a safety hatch if the pool ever misbehaves.
+    /* Bench/diagnostic toggle (M2 A/B): JCE_STREAM_SYNC=1 forces the
+     * cooperative chunk-load path so the async benefit can be measured,
+     * and as a safety hatch if background loading ever misbehaves.
      * Mirrors JCE_DISABLE_WCACHE for the render-cache A/B. */
     const char *stream_sync = getenv("JCE_STREAM_SYNC");
-    const bool force_sync = (stream_sync && stream_sync[0] && stream_sync[0] != '0');
-    if (!force_sync)
-        pool = jce_thread_pool_create(3);
-    else
-        LOG_INFO(LOG_TAG, "JCE_STREAM_SYNC=1: forcing synchronous chunk loads (no pool)");
+    force_sync = (stream_sync && stream_sync[0] && stream_sync[0] != '0');
+    if (force_sync)
+        LOG_INFO(LOG_TAG,
+                 "JCE_STREAM_SYNC=1: forcing cooperative chunk loads");
+#else
+    force_sync = true;
 #endif
-    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
+    wsc.single_thread = force_sync;
 
-    s_play_streamer = jce_world_streamer_create(&wsc, s.scene, fs, pool);
+    s_play_streamer = jce_world_streamer_create(&wsc, s.scene, fs, NULL);
     if (!s_play_streamer) {
-        if (pool) jce_thread_pool_destroy(pool);
         jce_fs_destroy(fs);
         LOG_WARN(LOG_TAG, "play world streamer creation failed — streaming disabled");
         return;
     }
-    s_play_stream_pool = pool;
     s_play_stream_fs = fs;
     jce_world_streamer_register_from_scene_settings(s_play_streamer, st);
     /* Mirror Play-streamed entities into the editor hierarchy/selection AND wire
@@ -397,13 +380,9 @@ static void play_streaming_tick(void)
 
 static void play_streaming_end(void)
 {
-    /* Order matters: jce_world_streamer_destroy → jce_streaming_destroy joins
-     * (jce_task_wait) every in-flight chunk task before freeing, so once the
-     * streamer is gone no worker is still touching the fs/scene.  Only then is
-     * it safe to destroy the pool (which also waits-for-all on shutdown) and
-     * the fs the workers were reading from. */
+    /* The streamer joins its private executor before returning, so the mounted
+     * filesystem can be destroyed immediately afterwards. */
     if (s_play_streamer)   { jce_world_streamer_destroy(s_play_streamer); s_play_streamer = NULL; }
-    if (s_play_stream_pool){ jce_thread_pool_destroy(s_play_stream_pool); s_play_stream_pool = NULL; }
     if (s_play_stream_fs)  { jce_fs_destroy(s_play_stream_fs);            s_play_stream_fs = NULL; }
     s_play_stream_pos_valid = false;
     /* Re-show all HLOD proxies so the master skyline is whole again after Play. */
@@ -661,6 +640,36 @@ void jce_state_play_mode_tick(float dt)
         if (s_play_resync_clock) {
             dt = s_play_resync_dt;
             s_play_resync_clock = false;
+        }
+        /* JCE_FRAME_DT_FIXED=<seconds>: pin the Play step, as the standalone
+         * runtime already does (jce_engine.c).
+         *
+         * Without it the editor's Play advances by the WALL-CLOCK frame time,
+         * so two runs of the same build reach different physics and animation
+         * states at the same frame index. Measured: two captures of one build,
+         * same scene, same camera path, differed by a mean of 31.58 grey levels
+         * with 584275 pixels over threshold -- the entire viewport. Against
+         * that, an A/B of two builds differing by 135 pixels says nothing at
+         * all, and the shadow fix it was meant to test could not be measured
+         * either way.
+         *
+         * The engine has had this switch since it was needed for benchmarks;
+         * the editor's Play was simply never wired to it, which made the one
+         * mode where movers actually move the one mode nothing could be
+         * measured in. */
+        {
+            static int   s_fdt  = -1;
+            static float s_fdtv = 0.0f;
+            if (s_fdt < 0) {
+                const char *v = getenv("JCE_FRAME_DT_FIXED");
+                if (v && v[0]) {
+                    s_fdtv = (float)atof(v);
+                    s_fdt  = (s_fdtv > 0.0f) ? 1 : 0;
+                } else {
+                    s_fdt = 0;
+                }
+            }
+            if (s_fdt) dt = s_fdtv;
         }
         jce_runtime_step(s_play_runtime, dt);
         jce_state_prune_dead();   /* drop runtime-destroyed entities (jce.destroy)

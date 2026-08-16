@@ -216,6 +216,13 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	/* v3: bundles array (optional). */
 	p->bundles = read_str_array(root, "bundles", &p->bundles_count);
 
+	/* v3: script_modules array (optional).  Read here and NEVER derived: a
+	 * default would name a shared object this project may not build, and the
+	 * editor would then report a missing file for every project that has no
+	 * C++ scripts at all. */
+	p->script_modules = read_str_array(root, "script_modules",
+	                                   &p->script_modules_count);
+
 	jce_json_free(root);
 	return p;
 
@@ -289,6 +296,13 @@ bool JCE_CALL jce_project_save(const JceProject *p)
 	if (p->startup_scene  && *p->startup_scene)  jce_json_set_string(root, "startup_scene",  p->startup_scene);
 
 	write_str_array(root, "bundles", p->bundles, p->bundles_count);
+	/* WRITTEN BACK EVEN THOUGH NOTHING IN THE EDITOR EDITS IT.  The saver
+	 * rebuilds the manifest from this struct rather than patching the file, so
+	 * a key that is read but not written is a key that DISAPPEARS the first
+	 * time any unrelated field is saved — a project whose C++ scripts stop
+	 * loading because someone renamed the startup scene. */
+	write_str_array(root, "script_modules",
+	                p->script_modules, p->script_modules_count);
 
 	return jce_json_write_file(p->manifest_path, root, /*pretty*/ true,
 	                           /*take_ownership*/ true);
@@ -313,6 +327,7 @@ void JCE_CALL jce_project_free(JceProject *p)
 	free_str_array(p->asset_dirs,     p->asset_dirs_count);
 	free_str_array(p->build_variants, p->build_variants_count);
 	free_str_array(p->bundles,        p->bundles_count);
+	free_str_array(p->script_modules, p->script_modules_count);
 	jce_free(p);
 }
 

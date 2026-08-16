@@ -1,9 +1,9 @@
 /*
- * jce_async_pool.c  Async asset loading via enkiTS (JceThreadPool).
+ * jce_async_pool.c  Async asset loading via JceAsyncExecutor.
  *
- * Each submitted request is dispatched to the engine's work-stealing
- * thread pool as a tracked task.  The main thread drains completed
- * requests each frame via jce_pool_drain().
+ * Each submitted request is dispatched to a private structured executor.
+ * The main thread drains completed requests each frame via
+ * jce_pool_drain().
  *
  * Worker decoding:
  *   TEXTURE → jce_pak_decompress + jce_image (RGBA8) → SDL_Surface
@@ -14,6 +14,7 @@
 
 #include "jce_async_pool.h"
 
+#include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
@@ -47,12 +48,12 @@ static void request_payload_free(JceAsyncRequest *req);
 /* A tracked in-flight request. */
 typedef struct InFlight {
     JceAsyncRequest *req;
-    JceTask         *task;
+    JceAsyncTask    *task;
     struct InFlight *next;
 } InFlight;
 
 struct JceAsyncPool {
-    JceThreadPool *tp;
+    JceAsyncExecutor *executor;
 
     /* Quiesce flag set during shutdown.  All public APIs (submit, drain,
      * destroy) MUST be called from the same thread (typically the main
@@ -95,18 +96,34 @@ static SDL_Surface *surface_from_rgba8(const uint8_t *rgba8, int w, int h)
     return surf;
 }
 
+static bool pak_asset_size(const JcePakAsset *asset, const char *path,
+                           size_t *out_size)
+{
+    if (!asset || !out_size || asset->original_size == 0 ||
+        asset->original_size > (uint64_t)SIZE_MAX) {
+        LOG_ERROR(LOG_TAG, "asset size is not addressable: %s",
+                  path ? path : "(null)");
+        return false;
+    }
+    *out_size = (size_t)asset->original_size;
+    return true;
+}
+
 static void decode_texture_inner(JceAsyncRequest *req)
 {
     const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
+    size_t asset_size;
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found: %s", req->path);
         return;
     }
+    if (!pak_asset_size(asset, req->path, &asset_size))
+        return;
 
-    void *buf = JCE_MALLOC(asset->original_size);
+    void *buf = JCE_MALLOC(asset_size);
     if (!buf) return;
 
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, asset_size);
     if (n == 0) {
         JCE_FREE(buf);
         LOG_ERROR(LOG_TAG, "decompress failed: %s", req->path);
@@ -132,11 +149,20 @@ static void decode_texture_inner(JceAsyncRequest *req)
         }
 
         /* Read texture info (info chunk may include mip offsets). */
-        void *info_buf = JCE_MALLOC((size_t)info_c->original_size);
+        if (info_c->original_size < sizeof(JceAssetTexInfo) ||
+            info_c->original_size > (uint64_t)SIZE_MAX ||
+            pix_c->original_size > (uint64_t)
+                (SIZE_MAX - sizeof(JceAssetTexInfo))) {
+            JCE_FREE(buf);
+            return;
+        }
+
+        size_t info_size = (size_t)info_c->original_size;
+        void *info_buf = JCE_MALLOC(info_size);
         if (!info_buf) { JCE_FREE(buf); return; }
 
         if (jce_asset_chunk_data(&view, info_c,
-                                  info_buf, (size_t)info_c->original_size) == 0) {
+                                  info_buf, info_size) == 0) {
             JCE_FREE(info_buf);
             JCE_FREE(buf);
             return;
@@ -178,7 +204,7 @@ static void decode_texture_inner(JceAsyncRequest *req)
      * RGBA8 + a tight stride, so no separate convert step is needed. */
     int img_w = 0, img_h = 0;
     uint8_t *rgba8 = jce_image_load_rgba8_from_memory(
-        buf, (uint64_t)asset->original_size, &img_w, &img_h);
+        buf, (uint64_t)asset_size, &img_w, &img_h);
     JCE_FREE(buf);
 
     if (!rgba8) {
@@ -217,15 +243,18 @@ static void decode_audio_inner(JceAsyncRequest *req)
     return;
 #else
     const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
+    size_t asset_size;
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found: %s", req->path);
         return;
     }
+    if (!pak_asset_size(asset, req->path, &asset_size))
+        return;
 
-    void *buf = JCE_MALLOC(asset->original_size);
+    void *buf = JCE_MALLOC(asset_size);
     if (!buf) return;
 
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, asset_size);
     if (n == 0) {
         JCE_FREE(buf);
         return;
@@ -300,15 +329,18 @@ static void decode_audio(JceAsyncRequest *req)
 static void decode_raw(JceAsyncRequest *req)
 {
     const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
+    size_t asset_size;
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found: %s", req->path);
         return;
     }
+    if (!pak_asset_size(asset, req->path, &asset_size))
+        return;
 
-    void *buf = JCE_MALLOC(asset->original_size);
+    void *buf = JCE_MALLOC(asset_size);
     if (!buf) return;
 
-    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, asset_size);
     if (n == 0) {
         JCE_FREE(buf);
         return;
@@ -323,9 +355,14 @@ static void decode_raw(JceAsyncRequest *req)
 /* Task callback (dispatches by request type)                          */
 /* ================================================================== */
 
-static void async_task_fn(void *arg)
+static JceAsyncRunResult async_task_fn(JceAsyncContext *ctx, void *arg)
 {
     JceAsyncRequest *req = (JceAsyncRequest *)arg;
+
+    if (jce_async_context_cancel_requested(ctx)) {
+        SDL_SetAtomicInt(&req->done, 1);
+        return JCE_ASYNC_RUN_CANCELLED;
+    }
 
     switch (req->type) {
     case JCE_ASYNC_TEXTURE: decode_texture(req); break;
@@ -337,6 +374,7 @@ static void async_task_fn(void *arg)
     }
 
     SDL_SetAtomicInt(&req->done, 1);
+    return req->success ? JCE_ASYNC_RUN_SUCCESS : JCE_ASYNC_RUN_FAILED;
 }
 
 /* ================================================================== */
@@ -345,28 +383,31 @@ static void async_task_fn(void *arg)
 
 JceAsyncPool *jce_pool_create(uint32_t num_workers)
 {
+    JceAsyncExecutorConfig config;
+    JceAsyncExecutorStats stats;
     JceAsyncPool *pool = JCE_NEW(JceAsyncPool);
     if (!pool) return NULL;
 
     if (num_workers == 0) {
-#if JCE_PLATFORM_WEB
-        num_workers = 1;  /* single-threaded WASM: no pthreads, no worker threads */
-#elif JCE_PLATFORM_ANDROID
+#if JCE_PLATFORM_ANDROID
         num_workers = 2;
 #else
         num_workers = 3;
 #endif
     }
 
-    /* A private scheduler, deliberately not jce_thread_pool_shared().  Every
+    /* A private executor, deliberately not the shared frame pool. Every
      * task here is a whole-asset decode — zstd inflate, PNG/JPEG decode,
-     * Opus/AAC decode — that runs for tens to hundreds of milliseconds, and
-     * the shared pool's waits are cooperative: the main thread's per-frame
-     * jce_thread_pool_parallel_for() would pick one of these off the queue and
-     * finish it before its own cull could complete.  Isolation is the point;
-     * the extra threads are the price.  See the policy note in jce_thread.h. */
-    pool->tp = jce_thread_pool_create((int)num_workers);
-    if (!pool->tp) {
+     * Opus/AAC decode — that runs for tens to hundreds of milliseconds.
+     * Structured async keeps that work isolated from frame fork/join jobs and
+     * supplies bounded submission, cancellation, Web deferral, and teardown. */
+    jce_async_executor_config_init(&config);
+    config.worker_count = num_workers;
+    config.reserve_latency_worker = false;
+    config.max_tasks = 1024;
+    config.debug_name = "asset-decode";
+    pool->executor = jce_async_executor_create(&config);
+    if (!pool->executor) {
         JCE_FREE(pool);
         return NULL;
     }
@@ -378,7 +419,10 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
         return NULL;
     }
 
-    LOG_INFO(LOG_TAG, "async pool: %u workers (enkiTS)", num_workers);
+    jce_async_executor_get_stats(pool->executor, &stats);
+    LOG_INFO(LOG_TAG, "async pool: %u workers (%s)", stats.worker_count,
+             stats.mode == JCE_ASYNC_EXECUTION_COOPERATIVE
+                 ? "cooperative" : "enkiTS");
     return pool;
 }
 
@@ -394,11 +438,19 @@ void jce_pool_destroy(JceAsyncPool *pool)
      * request struct (atomic `done` flag), so this is purely defensive. */
     SDL_SetAtomicInt(&pool->shutting_down, 1);
 
-    /* Destroy the thread pool — calls enkiWaitforAllAndShutdown(), which
-     * blocks until every submitted task callback has returned.  After this
-     * point no worker can race with the cleanup below. */
-    if (pool->tp)
-        jce_thread_pool_destroy(pool->tp);
+    /*
+     * Do not start queued decodes while the owning asset manager is
+     * shutting down.  Running decoders observe cooperative cancellation;
+     * shutdown still waits for their cleanup before request payloads are
+     * released below.
+     */
+    if (pool->executor) {
+        (void)jce_async_executor_shutdown(
+            pool->executor, JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+            JCE_ASYNC_WAIT_INFINITE);
+        jce_async_executor_destroy(pool->executor);
+        pool->executor = NULL;
+    }
 
     /* Free in-flight tracking nodes (tasks are already complete).  Take
      * the lock for symmetry with submit/drain even though no other thread
@@ -410,7 +462,7 @@ void jce_pool_destroy(JceAsyncPool *pool)
     if (pool->lock) jce_mutex_unlock(pool->lock);
     while (inf) {
         InFlight *next = inf->next;
-        if (inf->task) jce_task_free(inf->task);
+        if (inf->task) jce_async_task_release(inf->task);
         if (inf->req) {
             request_payload_free(inf->req);
             JCE_FREE(inf->req);
@@ -446,6 +498,9 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
                                  JceFileSystem *fs,
                                  const JceAsyncLoadInfo *info)
 {
+    JceAsyncTaskDesc desc;
+    InFlight *inf;
+    JceAsyncTask *task;
     if (!pool || !path) return NULL;
 
     JceAsyncRequest *req = JCE_NEW(JceAsyncRequest);
@@ -461,21 +516,26 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
     if (info)
         req->info = *info;
 
-    /* Submit to enkiTS thread pool. */
-    JceTask *task = jce_thread_pool_submit_tracked(pool->tp,
-                                                    async_task_fn, req);
-    if (!task) {
+    /* Allocate bookkeeping before submission so an OOM cannot orphan an
+     * already-running request. */
+    inf = JCE_NEW(InFlight);
+    if (!inf) {
         JCE_FREE(req);
         return NULL;
     }
 
-    /* Track in-flight. */
-    InFlight *inf = JCE_NEW(InFlight);
-    if (!inf) {
-        /* Task was already submitted — can't undo.  Best we can do is let
-           it complete and leak the request. */
+    jce_async_task_desc_init(&desc);
+    desc.work = async_task_fn;
+    desc.user_data = req;
+    desc.debug_name = path;
+    desc.priority = JCE_ASYNC_PRIORITY_LOW;
+    task = jce_async_submit(pool->executor, &desc);
+    if (!task) {
+        JCE_FREE(inf);
+        JCE_FREE(req);
         return NULL;
     }
+
     inf->req  = req;
     inf->task = task;
 
@@ -490,7 +550,17 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
 
 JceAsyncRequest *jce_pool_drain(JceAsyncPool *pool, uint32_t max_count)
 {
+    JceAsyncPumpBudget budget;
     if (!pool) return NULL;
+
+    /* On native this dispatches owner completions/reaping; in Web's
+     * no-pthread mode it starts at most one deferred decode. A single image
+     * or model decode can already consume the frame budget. */
+    jce_async_pump_budget_init(&budget);
+    budget.max_work_items = 1;
+    budget.max_completions = UINT32_MAX;
+    budget.max_time_us = 0;
+    jce_async_executor_pump(pool->executor, &budget);
 
     /* Scan in-flight list: move completed tasks to done list. */
     jce_mutex_lock(pool->lock);
@@ -498,12 +568,12 @@ JceAsyncRequest *jce_pool_drain(JceAsyncPool *pool, uint32_t max_count)
     InFlight **pp = &pool->inflight_head;
     while (*pp) {
         InFlight *inf = *pp;
-        if (jce_task_done(inf->task)) {
+        if (jce_async_task_is_terminal(inf->task)) {
             /* Remove from in-flight. */
             *pp = inf->next;
             pool->inflight_count--;
 
-            jce_task_free(inf->task);
+            jce_async_task_release(inf->task);
 
             /* Push to done list. */
             JceAsyncRequest *req = inf->req;
@@ -588,6 +658,10 @@ void jce_pool_free_request(JceAsyncRequest *req)
 
 uint32_t jce_pool_pending_count(const JceAsyncPool *pool)
 {
+    uint32_t count;
     if (!pool) return 0;
-    return pool->inflight_count;
+    jce_mutex_lock(pool->lock);
+    count = pool->inflight_count;
+    jce_mutex_unlock(pool->lock);
+    return count;
 }

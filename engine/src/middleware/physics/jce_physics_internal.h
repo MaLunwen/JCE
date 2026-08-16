@@ -111,6 +111,26 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
                                          const JceBulletColliderChild *children,
                                          uint32_t child_count);
 
+/* Static heightfield.  `pos` is the field's MIN corner in world space; the
+ * bridge applies Bullet's centre-of-AABB origin compensation internally so
+ * callers never see it.  Samples are copied into shape-owned storage before
+ * return.  `diagonal` is JceHeightfieldDiagonal. */
+uint32_t jce_bullet_body_create_heightfield(JceBulletWorld *bw,
+                                            jce_vec3 pos, jce_quat rot,
+                                            const float *heights,
+                                            uint32_t samples_x,
+                                            uint32_t samples_z,
+                                            float cell_size_x,
+                                            float cell_size_z,
+                                            float min_height,
+                                            float max_height,
+                                            uint8_t diagonal,
+                                            float friction, float restitution,
+                                            uint32_t col_group,
+                                            uint32_t col_mask,
+                                            bool is_trigger,
+                                            bool smooth_internal_edges);
+
 /* ================================================================== */
 /* Transform                                                           */
 /* ================================================================== */

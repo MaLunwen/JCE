@@ -62,6 +62,41 @@ bool comp_differs(JceScene *inst_scene, JceEntity inst_e,
         return false;
     if (isz != ssz)
         return true; /* layout change — treat as override */
+
+    /* A component holding POINTERS cannot be byte-compared across scenes.
+     * JceMeshRenderer's asset paths are interned per scene, so an instance and
+     * its prefab source hold different addresses for the same path and memcmp
+     * reports a difference that does not exist -- every cloned mesh renderer
+     * would show up as an override. Compare those fields by value and the rest
+     * of the struct by bytes. */
+    if (comp_id == jce_component_from_legacy_flag(JCE_COMP_FLAG_MESH_RENDERER)) {
+        const JceMeshRenderer *a = (const JceMeshRenderer *)ip;
+        const JceMeshRenderer *b = (const JceMeshRenderer *)sp;
+        const char *const pa[] = { a->mesh_path, a->material_path, a->albedo_tex,
+                                   a->mr_tex, a->normal_tex, a->ao_tex,
+                                   a->emissive_tex };
+        const char *const pb[] = { b->mesh_path, b->material_path, b->albedo_tex,
+                                   b->mr_tex, b->normal_tex, b->ao_tex,
+                                   b->emissive_tex };
+        for (size_t i = 0; i < sizeof(pa) / sizeof(pa[0]); i++) {
+            const char *x = pa[i] ? pa[i] : "";
+            const char *y = pb[i] ? pb[i] : "";
+            if (strcmp(x, y) != 0) return true;
+        }
+        /* Everything after the pointers is plain data: copy both, blank the
+         * pointer fields, and byte-compare the remainder. Keeps new fields
+         * covered automatically instead of listing them here. */
+        JceMeshRenderer ca = *a, cb = *b;
+        ca.mesh_path = cb.mesh_path = NULL;
+        ca.material_path = cb.material_path = NULL;
+        ca.albedo_tex = cb.albedo_tex = NULL;
+        ca.mr_tex = cb.mr_tex = NULL;
+        ca.normal_tex = cb.normal_tex = NULL;
+        ca.ao_tex = cb.ao_tex = NULL;
+        ca.emissive_tex = cb.emissive_tex = NULL;
+        return memcmp(&ca, &cb, sizeof(ca)) != 0;
+    }
+
     return memcmp(ip, sp, isz) != 0;
 }
 

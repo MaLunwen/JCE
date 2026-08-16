@@ -1978,7 +1978,12 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
     }
 
     UCCanvasList canvases; canvases.count = 0;
-    jce_scene_each_entity(scene, uc_collect_canvas_cb, &canvases);
+    /* Component query, not a world walk: this used to visit every entity in
+     * the scene and test has_canvas, and the count==0 early-out below only
+     * ran AFTER that walk - so a scene with no canvas paid for all of it
+     * (measured 4.14 ms/frame at 200k entities, with the overlay at its
+     * shipped default of ON). */
+    jce_scene_each_canvas(scene, uc_collect_canvas_cb, &canvases);
     if (canvases.count == 0) { JCE_PROFILE_ZONE_END; return; }
     uc_sort_canvases(scene, &canvases);
 

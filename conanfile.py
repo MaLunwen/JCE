@@ -54,6 +54,41 @@ class JCEConan(ConanFile):
         # when no profiler is attached — an unbounded leak (~20 MB/s in Play,
         # reaching multiple GB over a session).
         "tracy/*:on_demand": True,
+        # Tracy binds a LISTENING socket from a static initialiser, so merely
+        # LINKING it is enough -- no profiled zone need ever run. Measured:
+        # a debug unit-test binary copied to a scratch path and run directly
+        # listens on `:::8087` (IPv6 ANY -> every interface) and holds a UDP
+        # socket on 0.0.0.0. That is what makes Windows raise "do you want to
+        # allow public and private networks to access this app" for every new
+        # binary path -- unit tests, ad-hoc mutation binaries, space_demo, the
+        # editor. Windows Firewall already holds thousands of JCE rules.
+        #
+        # These two options are COMPILE-TIME (tracy CMakeLists set_option ->
+        # target_compile_definitions(TracyClient PUBLIC ...)), which is the
+        # only reason they work everywhere. The TRACY_ONLY_LOCALHOST *env var*
+        # is read at runtime by ListenSocket::Listen, so it only ever covers
+        # launchers that remember to set it -- it does nothing for a binary a
+        # human or an agent runs directly. Fixing this at the launcher was
+        # tried and did not hold.
+        #
+        #   only_localhost -> getaddrinfo() without AI_PASSIVE; the TCP
+        #                     listener binds loopback only. Profiling from a
+        #                     Tracy GUI on THIS machine is unaffected.
+        #   no_broadcast   -> no UDP discovery socket is created at all.
+        #                     Discovery only ever announced to the LAN, which
+        #                     only_localhost already precludes; with it off,
+        #                     connect the Tracy GUI to 127.0.0.1 explicitly.
+        #
+        # Profiling itself is untouched: JCE_ENABLE_PROFILING stays ON for
+        # editor and release, OFF for dist (root CMakeLists.txt). To profile
+        # from ANOTHER machine, opt in explicitly at install time with
+        #   conan install ... -o "tracy/*:only_localhost=False" \
+        #                     -o "tracy/*:no_broadcast=False"
+        # and expect a firewall prompt. CMakeLists.txt asserts at configure
+        # time that the Tracy actually being linked matches this setting, so
+        # a stale conan package cannot silently restore the public listener.
+        "tracy/*:only_localhost": True,
+        "tracy/*:no_broadcast": True,
         # ── Keep the dependency closure free of copyleft ────────────────
         # The SDK merges every static dependency into one redistributable fat
         # lib (engine/cmake/JCESDKInstall.cmake), so anything that lands in the

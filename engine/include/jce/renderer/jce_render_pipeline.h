@@ -139,11 +139,19 @@ typedef struct JceRenderPipelineDesc {
      * fs_pbr/fs_terrain — no shader permutations). */
     uint8_t  shadow_filter_quality;
     uint8_t  msaa_samples;      /* 1, 2, 4, 8                  */
-    float    render_scale;      /* 0.25..2.0; 1.0 = native     */
+    /* ADVISORY ONLY - parsed, stored and logged, but no renderer reads it.
+     * Resolution scaling is done instead by the runtime host's pixel-budget
+     * dynamic resolution (jce_default_main.inc.h), which ignores this field.
+     * Either wire it or delete it; do not read the log value as applied. */
+    float    render_scale;      /* advisory: no consumer. 1.0 = native */
     JceRpQuality post_quality;
 
-    /* Targets / format */
-    bool hdr_color;             /* true = R11G11B10F, false = RGBA8 */
+    /* Targets / format.  hdr_color drives ONLY the postfx chain's intermediate
+     * format (jce_postfx.c postfx_color_format) and TAA availability; the
+     * scene colour target format is chosen from hardware caps alone
+     * (jce_offscreen_target.c), so an LDR pipeline still renders the scene
+     * into an RGBA16F target. */
+    bool hdr_color;             /* true = RGBA16F chain, false = RGBA8 */
     bool depth_prepass;
 
     /* Settings S3: perf-feature tri-states, indexed by JceRpPerfFeature.
@@ -164,6 +172,14 @@ JCE_API void jce_render_pipeline_get(JceRenderPipelineDesc *out);
 
 /* Per-feature query — render-graph code can gate passes off this. */
 JCE_API bool jce_render_pipeline_is_feature_enabled(const char *feature);
+
+/* Re-resolve the active pipeline against the CURRENT hardware tier.  The
+ * LOW-tier floor is applied during apply() and reads the tier, so a pipeline
+ * applied before the tier is known never got clamped.  Callers that change the
+ * effective tier must invoke this; the renderer caps layer already does, so
+ * the floor holds regardless of whether the tier or the pipeline came first.
+ * No-op before the first apply. */
+JCE_API void jce_render_pipeline_notify_tier_changed(void);
 
 /* ── P4-E.2: deferred feature toggle ─────────────────────────────
  * jce_render_pipeline_set_feature_enabled() writes into a shadow

@@ -1,3 +1,69 @@
+# ── Line endings ────────────────────────────────────────────────────────────
+#
+# LF everywhere: in the repository AND in the working tree, on every platform.
+#
+# The repo was already 1801-to-3 LF; the three exceptions were written by a
+# tool that GUESSED the ending from the file's existing bytes.  That guess is
+# also how 78 working-tree files ended up with mixed endings, and how one file
+# produced a 4133-line phantom diff for a 93-line change -- git's autocrlf
+# clean filter declines to normalise a file whose endings are already mixed, so
+# the damage compounds silently instead of being corrected on the next commit.
+#
+# Checking out LF (rather than the Windows default of "LF in the repo, CRLF in
+# the working tree") takes the filter out of the loop entirely: the file on
+# disk is byte-identical to the blob, so a diff can no longer lie, and any tool
+# that reads or rewrites a file directly sees one convention.  MSVC, clang,
+# cmake, ninja and Visual Studio all accept LF on Windows.
+#
+# This overrides core.autocrlf, which Git for Windows sets to `true` system-wide
+# -- attributes win, so a fresh clone on any machine lands on LF regardless of
+# the developer's global config.
+* text=auto eol=lf
+
+# cmd.exe is the one consumer that genuinely wants CRLF: a batch file with
+# LF-only endings can mis-parse labels and `goto` targets.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Never rewritten, never diffed as text.  Git's NUL heuristic already catches
+# most of these; naming them keeps a stray text-looking asset out of the sweep.
+*.png  -text
+*.jpg  -text
+*.jpeg -text
+*.gif  -text
+*.bmp  -text
+*.tga  -text
+*.dds  -text
+*.ktx  -text
+*.hdr  -text
+*.ico  -text
+*.ttf  -text
+*.otf  -text
+*.woff -text
+*.woff2 -text
+*.wav  -text
+*.mp3  -text
+*.ogg  -text
+*.m4a  -text
+*.mp4  -text
+*.webm -text
+*.glb  -text
+*.bin  -text
+*.pak  -text
+*.jirc -text
+*.zip  -text
+*.7z   -text
+*.gz   -text
+*.jar  -text
+*.exe  -text
+*.dll  -text
+*.lib  -text
+*.pdb  -text
+*.so   -text
+*.dylib -text
+*.a    -text
+*.wasm -text
+
 # Vendored third-party sources — excluded from GitHub language statistics
 **/third_party/** linguist-vendored=true
 **/internal/** linguist-vendored=true

@@ -8,6 +8,7 @@
  */
 
 #include <jce/application/jce_args.h>
+#include <jce/application/jce_runtime_boot.h>
 #include <jce/os/core/jce_log.h>
 
 #include <stdlib.h>
@@ -99,5 +100,75 @@ bool jce_args_get_dev_assets(char *out, size_t cap)
         return true;
     }
 
+    return false;
+}
+
+static bool copy_startup_scene(char *out, size_t cap, const char *value)
+{
+    size_t len;
+
+    if (!value || !jce_runtime_boot_scene_path_is_valid(value))
+        return false;
+    len = strlen(value);
+    if (len >= cap)
+        return false;
+    memcpy(out, value, len + 1);
+    return true;
+}
+
+bool jce_args_get_startup_scene(char *out, size_t cap)
+{
+    const char *env;
+
+    if (!out || cap < 2)
+        return false;
+
+    if (s_stashed) {
+        for (int i = 1; i < s_argc; i++) {
+            const char *arg = s_argv[i];
+
+            if (strncmp(arg, "--scene=", 8) == 0)
+                return copy_startup_scene(out, cap, arg + 8);
+            if (strcmp(arg, "--scene") == 0 && i + 1 < s_argc)
+                return copy_startup_scene(out, cap, s_argv[i + 1]);
+        }
+    }
+
+    env = getenv("JCE_STARTUP_SCENE");
+    return copy_startup_scene(out, cap, env);
+}
+
+bool jce_args_get_shader_dev_dir(char *out, size_t cap)
+{
+    const char *value = NULL;
+
+    if (!out || cap < 2)
+        return false;
+    if (s_stashed) {
+        for (int i = 1; i < s_argc; ++i) {
+            const char *arg = s_argv[i];
+
+            if (strncmp(arg, "--shader-dir=", 13) == 0 && arg[13]) {
+                value = arg + 13;
+                break;
+            }
+            if (strcmp(arg, "--shader-dir") == 0 && i + 1 < s_argc &&
+                s_argv[i + 1][0] && s_argv[i + 1][0] != '-') {
+                value = s_argv[i + 1];
+                break;
+            }
+        }
+    }
+    if (!value)
+        value = getenv("JCE_SHADER_DEV_DIR");
+    if (value && value[0]) {
+        size_t len = strlen(value);
+
+        if (len >= cap)
+            len = cap - 1;
+        memcpy(out, value, len);
+        out[len] = '\0';
+        return true;
+    }
     return false;
 }

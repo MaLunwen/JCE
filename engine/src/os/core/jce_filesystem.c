@@ -125,10 +125,19 @@ JceFileSystem *jce_fs_create(void)
              * physfs_owned.  The embedded PAK carries every asset on web, so
              * the app boots; only loose-dir overrides (a dev convenience) are
              * unavailable where PhysFS cannot initialise. */
+#if JCE_PLATFORM_WEB
+            /* On the web build PAK-only IS the shipped configuration, not a
+             * degradation — keep the note informational so a clean run has a
+             * clean log. */
+            LOG_INFO(LOG_TAG,
+                     "PhysFS unavailable under Emscripten — PAK-only mode "
+                     "(loose-dir overrides are a native dev convenience)");
+#else
             LOG_WARN(LOG_TAG,
                      "PHYSFS_init failed (%s) — PAK-only mode "
                      "(loose-dir overrides disabled)",
                      PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+#endif
             /* physfs_owned stays false: we did not init it, so we must not
              * deinit it, and PHYSFS_isInit() remains false for the no-op BAILs. */
         }

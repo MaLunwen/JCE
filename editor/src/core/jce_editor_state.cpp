@@ -18,6 +18,7 @@
 #include "jce_editor_i18n.h"
 #include "jce_editor_scene_rendering_defaults.h"
 #include "jce_editor_state_internal.h"
+#include "jce_editor_root_set.h"
 #include "core/jce_editor_project_state.h"   /* per-project view mode / grid */
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
@@ -51,6 +52,60 @@ std::vector<uint32_t>                              g_entity_order;
 uint64_t                                           g_entity_order_gen;
 std::unordered_map<uint32_t, EditorEntitySidecar>  g_entity_sidecar;
 
+/* Hierarchy root set - see jce_editor_root_set.h for the why, the order
+ * contract, and the JCE_DBG_VERIFY_ROOTS self-check.  This file only binds
+ * the policy to the editor's scene and entity order. */
+static bool jce_roots_is_root_cb(void *, uint32_t id)
+{
+    return s.scene &&
+           jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID;
+}
+
+static JceRootSet &jce_roots(void)
+{
+    static JceRootSet rs;
+    static bool bound = false;
+    if (!bound) { rs.bind(&jce_roots_is_root_cb, nullptr); bound = true; }
+    return rs;
+}
+
+bool jce_roots_valid(void)      { return jce_roots().valid(); }
+void jce_roots_invalidate(void) { jce_roots().invalidate(); }
+void jce_roots_rebuild(void)    { jce_roots().rebuild(g_entity_order); }
+void jce_roots_note_added(uint32_t id)      { jce_roots().note_added(id); }
+void jce_roots_note_removed(uint32_t id)    { jce_roots().note_removed(id); }
+void jce_roots_note_reparented(uint32_t id) { jce_roots().note_reparented(id); }
+void jce_roots_note_removed_set(const std::unordered_set<uint32_t> &dead)
+{
+    jce_roots().note_removed_set(dead);
+}
+
+/* Prove the incremental set rather than argue it: re-derive from scratch on
+ * every query and report (once per divergence, capped) if they disagree. */
+void jce_roots_verify_if_asked(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JCE_DBG_VERIFY_ROOTS");
+        on = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (!on || !s.scene) return;
+
+    const std::vector<uint32_t> truth = jce_roots().derive(g_entity_order);
+    if (truth != jce_roots().ids()) {
+        static uint32_t reported = 0;
+        if (reported < 16u) {
+            ++reported;
+            LOG_ERROR(LOG_TAG,
+                    "roots-verify: incremental root set diverged - cached %zu, "
+                    "actual %zu. A g_entity_order mutation site is missing its "
+                    "jce_roots_note_* hook.",
+                    jce_roots().ids().size(), truth.size());
+        }
+        jce_roots().adopt(truth);   /* keep the UI correct while reporting */
+    }
+}
+
 std::vector<EditorHistorySnapshot> s_undo_history;
 std::vector<EditorHistorySnapshot> s_redo_history;
 int  s_history_suspend_depth = 0;
@@ -78,6 +133,7 @@ static void erase_from_order(uint32_t id)
     auto it = std::find(g_entity_order.begin(), g_entity_order.end(), id);
     if (it != g_entity_order.end())
         g_entity_order.erase(it); g_entity_order_gen++;
+        jce_roots_note_removed(id);
 }
 
 static void rebuild_order_cb(JceScene * /*scene*/, JceEntity e, void *user_data)
@@ -88,7 +144,7 @@ static void rebuild_order_cb(JceScene * /*scene*/, JceEntity e, void *user_data)
 
 void rebuild_entity_order_from_ecs(void)
 {
-    g_entity_order.clear(); g_entity_order_gen++;
+    g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     if (!s.scene) return;
     jce_scene_each_entity(s.scene, rebuild_order_cb, &g_entity_order);
 }
@@ -124,7 +180,7 @@ void update_scene_dir_from_path(const char *scene_path)
 
 void clear_scene_entities(void)
 {
-    g_entity_order.clear(); g_entity_order_gen++;
+    g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
 
     /* Destroy and recreate engine scene to clear all ECS entities. */
@@ -443,8 +499,7 @@ static void build_demo_scene(void)
                             JceMeshRenderer *mm =
                                 jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
                             if (mm && stress_model && stress_model[0])
-                                snprintf(mm->mesh_path, sizeof mm->mesh_path,
-                                         "%s", stress_model);
+                                mm->mesh_path = jce_scene_intern(s.scene, stress_model);
                             if (mm && diverse) {
                                 mm->base_color[0] = 0.15f + 0.7f * (float)((spawned * 13) % 101) / 101.0f;
                                 mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
@@ -460,7 +515,7 @@ static void build_demo_scene(void)
                             }
                             if (mm && !tex_paths.empty()) {
                                 const std::string &p = tex_paths[(size_t)(spawned % (long)tex_paths.size())];
-                                snprintf(mm->albedo_tex, sizeof mm->albedo_tex, "%s", p.c_str());
+                                mm->albedo_tex = jce_scene_intern(s.scene, p.c_str());
                             }
                             if (phys || spawned < phys_movers) {
                                 jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
@@ -568,7 +623,7 @@ static void build_demo_scene(void)
                     uint32_t c = jce_state_create_entity("sk", sroot);
                     jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
                     if (JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c))
-                        snprintf(mm->mesh_path, sizeof mm->mesh_path, "%s", skpath);
+                        mm->mesh_path = jce_scene_intern(s.scene, skpath);
                     jce_state_add_component(c, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
                     if (JceSkeletalAnimatorComponent *sa =
                             jce_scene_get_skeletal_animator(s.scene, (JceEntity)c)) {
@@ -601,7 +656,7 @@ static void load_persisted_view_toggles(void);
 void jce_editor_state_init(bool with_demo_scene)
 {
     memset(&s, 0, sizeof(s));
-    g_entity_order.clear(); g_entity_order_gen++;
+    g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
     s_undo_history.clear();
     s_redo_history.clear();
@@ -629,7 +684,7 @@ void jce_editor_state_init(bool with_demo_scene)
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
             int vm = ecfg.view_mode;
-            if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_AO)
+            if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_SHADOW_MASK)
                 s.view_mode = (JceSceneViewMode)vm;
             else
                 s.view_mode = JCE_VIEW_SHADED;
@@ -734,7 +789,7 @@ bool jce_state_new_default_scene(void)
 void jce_editor_state_shutdown(void)
 {
     jce_state_close_bundle_preview();
-    g_entity_order.clear(); g_entity_order_gen++;
+    g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
     s_undo_history.clear();
     s_redo_history.clear();
@@ -885,6 +940,80 @@ uint32_t jce_state_find_by_name(const char *name)
 void jce_state_prune_dead(void)
 {
     if (!s.scene) return;
+
+    /* This is called every frame from the viewport render path, and its
+     * comment claimed it was a "cheap no-op when nothing leaked" - it was
+     * not.  The scan below is O(entities) with an ECS presence probe each,
+     * and it ran unconditionally: measured 3.68 ms/frame at 200k entities,
+     * the single largest cost in the editor viewport path.
+     *
+     * Nothing can have died since the last pass unless the scene roster
+     * moved, so key on it.  roster_epoch bumps on create and destroy
+     * (jce_scene.c:898,906); a flecs cascade-delete frees children without
+     * a bump of their own, but the delete that CAUSED it went through
+     * jce_scene_destroy_entity, so the epoch moved that frame and this pass
+     * still sees them.
+     *
+     * Note the failure this guard cannot cause: the AV the prune was
+     * originally written to prevent is already defended one layer down -
+     * jce_scene_get_parent returns INVALID for a non-alive id rather than
+     * dereferencing it (jce_scene.c:956-959).  A stale id surviving an
+     * extra frame is a stale hierarchy row, not a crash. */
+    /* JCE_DBG_VERIFY_PRUNE=1 runs the scan even on a skipped frame and
+     * reports if the gate ever skipped one that DID have dead ids - the
+     * only way this guard can be wrong. */
+    static int verify = -1;
+    if (verify < 0) {
+        const char *v = getenv("JCE_DBG_VERIFY_PRUNE");
+        verify = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    /* Key on the SCENE as well as the epoch: roster_epoch counts per scene and
+     * restarts in a fresh one, so a Play-mode scene swap can present a
+     * different world carrying an epoch this memo has already seen. */
+    static const JceScene *s_pruned_scene = nullptr;
+    static uint64_t s_pruned_roster_epoch = 0u;
+    const uint64_t roster = jce_scene_get_roster_epoch(s.scene);
+    const bool roster_moved =
+        (s_pruned_scene != s.scene || roster != s_pruned_roster_epoch);
+    s_pruned_scene = s.scene;
+    s_pruned_roster_epoch = roster;
+
+    /* When the roster has not moved, SAMPLE rather than trust.
+     *
+     * Gating purely on roster_epoch would require every path that frees an
+     * entity to bump it, and enumerating those paths is exactly the kind of
+     * assumption that rots - the verifier below caught Play mode dropping 168
+     * of 363 entities across an epoch that never moved, and fixing the scene
+     * clear path did not account for all of it.  Correctness here therefore
+     * does NOT depend on that bookkeeping being complete.
+     *
+     * Instead a rotating 1/16 slice is probed every frame, so a dead id is
+     * found within 16 frames whatever killed it, at 1/16 of the cost.  The
+     * unconditional full scan measured 3.68 ms/frame at 200k entities - the
+     * largest single cost in the editor viewport path, on a function whose
+     * comment claimed it was a "cheap no-op when nothing leaked".
+     *
+     * Surviving an extra frame is a stale hierarchy row, not a crash: the AV
+     * this function was written to prevent is already defended a layer down in
+     * jce_scene_get_parent (jce_scene.c:956-959). */
+    static uint32_t s_dead_streak = 0u;
+    bool suspect = roster_moved;
+    const size_t total = g_entity_order.size();
+    if (!suspect) {
+        if (total == 0) return;
+        static size_t s_cursor = 0;
+        const size_t slice = (total + 15u) / 16u;
+        for (size_t k = 0; k < slice; ++k) {
+            const uint32_t id = g_entity_order[(s_cursor + k) % total];
+            if (id == 0 ||
+                !jce_scene_has_editor_meta(s.scene, (JceEntity)id)) {
+                suspect = true;
+                break;
+            }
+        }
+        s_cursor = (s_cursor + slice) % total;
+    }
+    if (!suspect && !verify) return;
     /* Single-pass compaction: the old per-dead-entity vector::erase shifted
      * the whole tail each time — O(N x D) on a wave-unload frame (a 2048-
      * entity chunk despawn against a 20k-entry order list = tens of millions
@@ -901,7 +1030,33 @@ void jce_state_prune_dead(void)
             jce_state_deselect_entity(id);   /* drop from selection/focus too */
         }
     }
-    g_entity_order.resize(keep); g_entity_order_gen++;
+    /* Only signal a change when one actually happened.  This runs every frame
+     * from the streamer mirror, and the overwhelmingly common case is "nothing
+     * leaked" (keep == size).  Bumping the generation unconditionally made
+     * every g_entity_order-keyed cache miss every frame in streaming scenes —
+     * measured as a permanent 3.4ms root-set rescan in the hierarchy panel.
+     * A real prune still invalidates wholesale rather than incrementally: if a
+     * PARENT was pruned, its surviving children silently become new roots, and
+     * that is not derivable from the dead set alone. */
+    if (keep == g_entity_order.size()) s_dead_streak = 0u;
+    if (keep != g_entity_order.size()) {
+        /* A dead id turning up on a sampled frame is EXPECTED - that is what
+         * the sampling is for.  The failure worth reporting is one that
+         * PERSISTS: dead ids still present after two full sweeps of the
+         * rotating slice mean it is not converging. */
+        if (!suspect && ++s_dead_streak > 32u) {
+            static uint32_t reported = 0u;
+            if (reported < 8u) {
+                ++reported;
+                LOG_ERROR(LOG_TAG,
+                    "prune-verify: %zu of %zu entities have been dead for %u "
+                    "frames - the sampled prune is not converging.",
+                    g_entity_order.size() - keep, g_entity_order.size(),
+                    s_dead_streak);
+            }
+        }
+        g_entity_order.resize(keep); g_entity_order_gen++; jce_roots_invalidate();
+    }
     /* Also drop any SELECTED entity that is no longer alive even if it was never
      * in g_entity_order — e.g. a STREAMED chunk entity the user picked in the
      * viewport whose chunk then unloaded.  Without this the gizmo / inspector
@@ -950,6 +1105,7 @@ void jce_state_streamer_mirror_spawn(const uint64_t *ids, uint32_t count)
     for (uint32_t i = 0; i < count; i++) {
         if (!ids[i]) continue;
         g_entity_order.push_back((uint32_t)ids[i]); g_entity_order_gen++;
+        jce_roots_note_added((uint32_t)ids[i]);
         /* Stage these ids; the chunk-state callback (fired right after the
          * spawn callback, carrying the chunk id) claims them into the
          * chunk->entities group map. */
@@ -967,10 +1123,28 @@ void jce_state_streamer_mirror_despawn(const uint64_t *ids, uint32_t count)
         dead.insert(e);
         jce_state_deselect_entity(e);   /* drop selection before the id dies */
     }
+    /* The generation bump used to sit INSIDE the remove_if predicate, after its
+     * return — unreachable, so the streaming despawn path mutated
+     * g_entity_order without ever advancing g_entity_order_gen.
+     *
+     * Nothing broke because every consumer of that counter also keys on the
+     * scene's structural_epoch, which entity destruction does bump; the stale
+     * generation was masked. It stops being masked the moment a consumer
+     * narrows its key to just this counter — which is exactly what the
+     * hierarchy root-set cache wants to do, since a transform edit cannot
+     * change the root set but currently invalidates it anyway.
+     *
+     * Bump once, outside the predicate, and only when something was actually
+     * removed: a predicate is called an unspecified number of times per
+     * element, so counting there is meaningless even when it is reachable. */
+    const size_t before = g_entity_order.size();
     g_entity_order.erase(
         std::remove_if(g_entity_order.begin(), g_entity_order.end(),
-                       [&](uint32_t e) { return dead.find(e) != dead.end(); g_entity_order_gen++; }),
+                       [&](uint32_t e) { return dead.find(e) != dead.end(); }),
         g_entity_order.end());
+    if (g_entity_order.size() != before)
+        g_entity_order_gen++;
+    jce_roots_note_removed_set(dead);
 }
 
 /* Chunk (un)loaded: maintain the chunk->entities group map.  Fired per chunk
@@ -1276,36 +1450,14 @@ int jce_state_get_roots(uint32_t *out, int max)
 {
     if (!s.scene || !out || max <= 0) return 0;
 
-    /* Root-set cache (large-world editor perf).  Finding the parent-less roots
-     * scans all of g_entity_order with one jce_scene_get_parent per entity — an
-     * O(all-entities) pass the hierarchy panel runs EVERY frame.  On a 150k-entity
-     * scene that alone is ~3 ms/frame of pure editor overhead (the second-largest
-     * frame phase after scene_render).  The root SET only changes on a structural
-     * edit — create / delete / reparent — so cache it, keyed on the union of the
-     * scene's structural_epoch (bumped by reparent / add / remove / any world-
-     * matrix edit) and the editor order gen (bumped by every g_entity_order
-     * mutation).  Either counter advancing forces a rebuild; the union can only
-     * OVER-invalidate (recompute as often as today), never return a stale root.
-     * g_entity_order_gen is globally monotonic, so the pair also differs after a
-     * scene switch even if the new scene's epoch coincides with the old one. */
-    static std::vector<uint32_t> s_roots_cache;
-    static uint64_t s_roots_struct = UINT64_MAX;
-    static uint64_t s_roots_order  = UINT64_MAX;
-    const uint64_t se = jce_scene_get_structural_epoch(s.scene);
-    const uint64_t oe = g_entity_order_gen;
-    if (s_roots_struct != se || s_roots_order != oe) {
-        s_roots_cache.clear();
-        for (uint32_t id : g_entity_order)
-            if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
-                s_roots_cache.push_back(id);
-        s_roots_struct = se;
-        s_roots_order  = oe;
-    }
+    if (!jce_roots_valid()) jce_roots_rebuild();
+    jce_roots_verify_if_asked();
 
+    const std::vector<uint32_t> &roots = jce_roots().ids();
     int n = 0;
-    const int cap = (int)s_roots_cache.size();
+    const int cap = (int)roots.size();
     for (int i = 0; i < cap && n < max; i++)
-        out[n++] = s_roots_cache[i];
+        out[n++] = roots[i];
     return n;
 }
 
@@ -1322,17 +1474,21 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
     if (e == JCE_ENTITY_INVALID) return 0;
 
     JceEditorMeta meta;
-    memset(&meta, 0, sizeof(meta));
+    jce_editor_meta_init(&meta);
     snprintf(meta.name, sizeof(meta.name), "%s", name ? name : "Entity");
     meta.tag[0]          = '\0';
     meta.tag_color       = (uint8_t)JCE_TAG_NONE;
     meta.enabled         = true;
     meta.prefab_instance = false;
-    meta.prefab_path[0]  = '\0';
+    meta.prefab_path     = jce_scene_intern(s.scene, "");
     jce_scene_set_editor_meta(s.scene, e, &meta);
 
-    if (parent_id != 0)
+    if (parent_id != 0) {
         jce_scene_set_parent(s.scene, e, (JceEntity)parent_id);
+        /* The order push above already provisionally filed this id as a
+         * root (it had no parent yet). Now that it has one, re-derive. */
+        jce_roots_note_reparented((uint32_t)e);
+    }
 
     JceTransform t;
     t.position = jce_v3(0.0f, 0.0f, 0.0f);
@@ -1342,6 +1498,7 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 
     uint32_t id = (uint32_t)e;
     g_entity_order.push_back(id); g_entity_order_gen++;
+    jce_roots_note_added(id);
     g_entity_sidecar[id] = EditorEntitySidecar{};
     return id;
 }
@@ -1500,14 +1657,45 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
         } else {                                 /* Draw Call / Entity / Physics: grid */
             const bool unique = (kind == 0);
             const bool phys   = (kind == 4);
-            int side = 1;
-            while ((long)side * side * side < count) side++;
-            const float spacing = phys ? 1.6f : 1.5f;
-            const float origin  = -0.5f * (float)(side - 1) * spacing;
+            /* Layout. The default packs count entities into a side^3 cube at
+             * spacing 1.5, which for 200k is an 87x87x87 block at the origin --
+             * smaller than the NEAR shadow cascade (radius ~60). Every cascade
+             * then contains every caster, no per-cascade culling can fire, and
+             * any shadow measurement taken on it is a measurement of that
+             * layout rather than of the engine.
+             *
+             * JCE_BENCH_SPREAD=<world units> lays the same count out on an X/Z
+             * ground plane across that extent instead, with a small deterministic
+             * height variation -- the shape real content has, and the one where
+             * cascade culling means anything. 200k over 4000 units puts ~448 per
+             * axis at ~8.9 unit spacing. */
+            float spread = 0.0f;
+            if (const char *sp_env = getenv("JCE_BENCH_SPREAD"))
+                if (sp_env[0]) spread = (float)atof(sp_env);
+            if (spread < 0.0f) spread = 0.0f;
+
+            int sx, sy, sz;
+            float spx, spy, spz, ox, oy, oz;
+            if (spread > 0.0f) {
+                sx = 1;
+                while ((long)sx * sx < count) sx++;
+                sy = 1; sz = sx;
+                spx = spz = spread / (float)(sx > 1 ? sx - 1 : 1);
+                spy = 0.0f;
+                ox = oz = -0.5f * spread;
+                oy = 0.0f;
+            } else {
+                int side = 1;
+                while ((long)side * side * side < count) side++;
+                const float spacing = phys ? 1.6f : 1.5f;
+                sx = sy = sz = side;
+                spx = spy = spz = spacing;
+                ox = oy = oz = -0.5f * (float)(side - 1) * spacing;
+            }
             int spawned = 0;
-            for (int x = 0; x < side && spawned < count; ++x)
-            for (int y = 0; y < side && spawned < count; ++y)
-            for (int z = 0; z < side && spawned < count; ++z) {
+            for (int x = 0; x < sx && spawned < count; ++x)
+            for (int y = 0; y < sy && spawned < count; ++y)
+            for (int z = 0; z < sz && spawned < count; ++z) {
                 uint32_t c = jce_state_create_entity("b", s_bench_root);
                 jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
                 JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
@@ -1538,7 +1726,13 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
                         bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
                     }
                 }
-                bench_set_pos(c, origin + x * spacing, origin + y * spacing, origin + z * spacing);
+                /* Spread mode varies height deterministically so the ground
+                 * plane is not perfectly flat (a flat sheet casts a degenerate
+                 * shadow volume and would flatter the cascade cull). */
+                const float py = (spread > 0.0f)
+                    ? (float)((spawned * 17) % 23) * 0.35f
+                    : oy + (float)y * spy;
+                bench_set_pos(c, ox + (float)x * spx, py, oz + (float)z * spz);
                 ++spawned;
             }
             s_bench_spawned = (uint32_t)spawned;
@@ -1667,6 +1861,7 @@ void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
                        new_parent != 0 ? (JceEntity)new_parent
                                        : JCE_ENTITY_INVALID,
                        true);
+    jce_roots_note_reparented(id);
 }
 
 void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
@@ -1682,6 +1877,7 @@ void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
     auto it_e = std::find(g_entity_order.begin(), g_entity_order.end(), entity_id);
     if (it_e == g_entity_order.end()) return;
     g_entity_order.erase(it_e); g_entity_order_gen++;
+    jce_roots_invalidate();   /* roots mirror g_entity_order's order */
 
     auto it_r = std::find(g_entity_order.begin(), g_entity_order.end(), ref_id);
     if (it_r == g_entity_order.end()) {
@@ -1755,8 +1951,10 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
         dup_meta->enabled         = src_meta->enabled;
         snprintf(dup_meta->tag, sizeof(dup_meta->tag), "%s", src_meta->tag);
         dup_meta->prefab_instance = src_meta->prefab_instance;
-        snprintf(dup_meta->prefab_path, sizeof(dup_meta->prefab_path),
-                 "%s", src_meta->prefab_path);
+        /* Already interned in this same scene, so the pointer can be shared
+         * directly -- re-interning would find the identical entry anyway. */
+        dup_meta->prefab_path = src_meta->prefab_path;
+        dup_meta->variant_parent_path = src_meta->variant_parent_path;
     }
 
     /* Deep-copy all components from src → dup (overwrites the identity
@@ -1768,8 +1966,10 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
     int cn = jce_scene_get_children(s.scene, (JceEntity)id, src_children, JCE_MAX_CHILDREN);
     for (int i = 0; i < cn; ++i) {
         uint32_t child_dup = jce_state_duplicate_entity((uint32_t)src_children[i]);
-        if (child_dup != 0)
+        if (child_dup != 0) {
             jce_scene_set_parent(s.scene, (JceEntity)child_dup, (JceEntity)dup);
+            jce_roots_note_reparented(child_dup);
+        }
     }
 
     return dup;
@@ -2044,7 +2244,7 @@ void jce_state_apply_project_view_settings(void)
         jce_editor_pstate_set_int("view.show_grid", s.show_grid ? 1 : 0);
         return;
     }
-    if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_AO)
+    if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_SHADOW_MASK)
         s.view_mode = (JceSceneViewMode)vm;
     if (sg >= 0)
         s.show_grid = (sg != 0);

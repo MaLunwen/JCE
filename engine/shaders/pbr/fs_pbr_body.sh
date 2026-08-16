@@ -27,6 +27,9 @@
 #include <bgfx_shader.sh>
 #include "pbr_common.sh"
 #include "fog_apply.sh"
+#include "shadow_debug.sh"
+uniform vec4 u_weatherSurface;  // x=wetness y=snow zw=reserved
+#include "wetness.sh"
 
 // Material uniforms
 uniform vec4 u_baseColorFactor;
@@ -711,6 +714,11 @@ void main()
 #endif
     // --- Shadow calculation ---
     float shadow = 1.0;
+    /* Which cascade this fragment was shadowed by, for view mode 9.  Function
+     * scope because `cascade` below lives inside the shadow block and the
+     * debug branch is further down; -1 means no cascade covered it, which is
+     * a different reason to be lit than "nothing occluded it". */
+    float dbgCascade = -1.0;
     float shadowDirSlot = u_lightCounts.w;
     int shadowDirIndex = int(clamp(shadowDirSlot - 1.0, 0.0, 1.0));
     vec3 toLightDir = safe_normalize_vec3(-u_dirLights[shadowDirIndex * 2].xyz,
@@ -822,6 +830,7 @@ void main()
         }
 
         // No cascade covers this fragment (beyond the shadow range): fully lit.
+        dbgCascade = (shadow < 0.0) ? -1.0 : float(cascade);
         if (shadow < 0.0) shadow = 1.0;
 
         // SHADOW-DISTANCE FADE: smoothly fade shadow -> lit as the fragment
@@ -883,6 +892,45 @@ void main()
         }
     }
 
+    // --- Contact shadows -----------------------------------------------
+    // A short screen-space raymarch, computed in the SSAO pass and delivered in
+    // the GREEN channel of the same target (.r is ambient occlusion).  It has
+    // no sampler of its own because there is no free stage: all 16 are taken,
+    // which is the WebGL2 budget the charter requires.
+    //
+    // It multiplies the DIRECTIONAL shadow term and nothing else.  Contact
+    // shadows answer a specific question -- "is the sun actually reaching this
+    // point, at a scale finer than the shadow map can resolve" -- and folding
+    // them into ambient or into local lights would darken surfaces for a reason
+    // that does not apply to those lights.  The result would still look like
+    // shading rather than like a bug.
+    //
+    // u_ssaoParams.w > 0.5 means the SSAO pass ran WITH the march enabled.  It
+    // is a separate flag from u_ssaoParams.x deliberately: the pass can be
+    // running with the march off (LOW tier), and reading green in that case
+    // would multiply by whatever the AO write left there.
+    if (u_ssaoParams.w > 0.5)
+    {
+        vec2 csUV = gl_FragCoord.xy * u_ssaoParams.yz;
+        shadow = min(shadow, texture2D(s_aoMap, csUV).g);
+    }
+
+    // --- Cloud shadows ---------------------------------------------------
+    // Blue channel of the same target (.r AO, .g contact, .b cloud).  A
+    // MULTIPLY rather than a min(): cloud transmittance and the shadow map
+    // answer different questions -- "how much sun got through the cloud layer"
+    // and "is a solid object in the way" -- and both apply.  min() would let a
+    // half-shadowed cloud completely mask a hard shadow underneath it.
+    //
+    // Gated on u_ssaoParams.x (the pass ran) rather than .w (the contact march
+    // ran): the cloud lookup is independent of the march, and tying them would
+    // silently drop cloud shadows on the LOW tier where the march is off.
+    if (u_ssaoParams.x > 0.5)
+    {
+        vec2 cloudUV = gl_FragCoord.xy * u_ssaoParams.yz;
+        shadow *= texture2D(s_aoMap, cloudUV).b;
+    }
+
     // --- Base color ---
     // Base color texture is sRGB-encoded (glTF spec §5.19). Convert texture
     // to linear space FIRST, then multiply by the linear baseColorFactor.
@@ -938,6 +986,7 @@ void main()
     // UV-space pink/black checker via useCheckerFallback above (never
     // a flat white loading surface).
     float viewMode = u_normalScale.z;
+
     if (viewMode > 1.5 && viewMode < 3.5)
     {
         // Modes 2/3 (TEXTURED / WIREFRAME_TEXTURED): unlit albedo only.
@@ -981,14 +1030,46 @@ void main()
         // sideways, so every light pool was cut in half at the light's own
         // axis: N.L flipped sign with the fragment's side). D3D was correct;
         // this form is bit-identical to the old one on D3D and only fixes GL.
-        mat3 TBN = mtxFromCols(normalize(v_tangent), normalize(v_bitangent), N);
-        N = normalize(mul(TBN, tangentNormal));
+        /* A mesh whose vertex layout has no TANGENT still runs this branch:
+         * normalScale defaults to 1.0 and does not know whether a normal map
+         * was ever bound.  The missing attribute reads back as (0,0,0,1), so
+         * normalize(v_tangent) is normalize(vec3(0)) and the bitangent is a
+         * cross product with it -- NaN.  Even though tangentNormal is (0,0,1)
+         * for the flat fallback map, and the T and B columns are therefore
+         * multiplied by zero, 0 * NaN is NaN: N came out NaN and every lit
+         * term collapsed to black.
+         *
+         * That is what made the space demo's Earth -- a procedural sphere,
+         * position+normal+texcoord only -- render black on WebGL2 while the
+         * glTF models beside it, which do carry tangents, lit correctly.
+         * D3D and desktop GL happened to survive it; relying on that is
+         * relying on undefined attribute values.
+         *
+         * Use the tangent basis only when there IS one. */
+        vec3 Tin = v_tangent;
+        if (dot(Tin, Tin) > 1e-8) {
+            mat3 TBN = mtxFromCols(normalize(Tin), normalize(v_bitangent), N);
+            N = normalize(mul(TBN, tangentNormal));
+        }
     }
 
     // --- Metallic / Roughness ---
     vec4 mrSample = texture2D(s_metalRough, v_texcoord0);
     float metallic  = mrSample.b * u_pbrParams.x;
     float roughness = mrSample.g * u_pbrParams.y;
+
+    /* Rain, same rule the terrain uses -- one include, so the ground and the
+     * things standing on it cannot disagree about what wet means. */
+    float wet = u_weatherSurface.x * wetness_exposure(N);
+    roughness = wetness_roughness(roughness, wet);
+    albedo    = wetness_albedo(albedo, wet);
+
+    /* Lying snow, AFTER the wet response: a surface gets wet first and then
+     * snow settles on top of it, and the snow is what you see. Doing it the
+     * other way round darkens the snow with the rain that fell before it. */
+    float snow = snow_coverage(N, u_weatherSurface.y);
+    albedo     = snow_albedo(albedo, snow);
+    roughness  = clamp(snow_roughness(roughness, snow), 0.04, 1.0);
     roughness = clamp(roughness, 0.04, 1.0);
 
     // Low-cost specular AA from normal derivatives (Toksvig-like).
@@ -1025,7 +1106,10 @@ void main()
         if      (viewMode < 4.5) dbg = N * 0.5 + vec3_splat(0.5);  // 4 normals
         else if (viewMode < 5.5) dbg = vec3_splat(roughness);      // 5 roughness
         else if (viewMode < 6.5) dbg = vec3_splat(metallic);       // 6 metallic
-        else                     dbg = vec3_splat(ao);             // 7 AO
+        else if (viewMode < 7.5) dbg = vec3_splat(ao);             // 7 AO
+        else if (viewMode < 8.5) dbg = shadow_debug_depth_color(v_viewdepth, u_csmSplits.w);
+        else if (viewMode < 9.5) dbg = shadow_debug_cascade_color(dbgCascade);
+        else                     dbg = vec3_splat(shadow);         // 10 mask
         gl_FragColor = vec4(dbg, 1.0);
         return;
     }

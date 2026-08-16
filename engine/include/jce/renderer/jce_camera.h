@@ -65,6 +65,9 @@ JCE_API JceCameraMode  jce_camera_get_mode(const JceCamera *cam);
 
 JCE_API void jce_camera_set_position(JceCamera *cam, jce_vec3 pos);
 JCE_API void jce_camera_set_target(JceCamera *cam, jce_vec3 target);
+/* Set an orthonormal world pose, preserving authored camera roll. */
+JCE_API bool jce_camera_set_pose(JceCamera *cam, jce_vec3 position,
+                                 jce_vec3 forward, jce_vec3 up);
 JCE_API void jce_camera_set_fov(JceCamera *cam, float fov_deg);
 JCE_API void jce_camera_set_near_far(JceCamera *cam, float near_plane, float far_plane);
 JCE_API void jce_camera_set_ortho_size(JceCamera *cam, float w, float h);

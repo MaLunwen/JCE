@@ -728,6 +728,10 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
          * ~5-7x faster than the cluster-fit default at a modest quality cost.
          * An .import.json "quality" overrides per texture for hero/UI art. */
         opt.encode_quality   = JCE_COOK_ENCODE_FAST;
+        /* Colour space for mip averaging.  Positive signal only -- see
+         * jce_cook_path_is_srgb; unknown stays false, which is the behaviour
+         * every bundle built before this had. */
+        opt.texture_srgb     = jce_cook_path_is_srgb(vpath);
         if (imp) {
             const cJSON *tf = cJSON_GetObjectItemCaseSensitive(imp, "target_format");
             const cJSON *gm = cJSON_GetObjectItemCaseSensitive(imp, "gen_mips");
@@ -749,6 +753,24 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
                 else if (jce_strcasecmp(q->valuestring, "highest") == 0)
                     opt.encode_quality = JCE_COOK_ENCODE_HIGHEST;
             }
+
+            /* "colorSpace": "srgb" | "linear" -- the KNOWN answer, and it
+             * outranks the filename guess above because it was written by
+             * code that actually knew: the model importer emits it beside
+             * every texture it extracts from a GLB, tagged with the material
+             * slot the texture filled.
+             *
+             * A NEW key on purpose.  The sidecar already has an "srgb"
+             * boolean, written by the editor's import-preset panel and read
+             * by nobody, and it defaults to TRUE -- so every sidecar already
+             * on disk claims sRGB, including the ones sitting next to normal
+             * maps.  Starting to honour that key would corrupt exactly the
+             * data this change is trying to protect.  "colorSpace" has no
+             * legacy writers, so reading it is safe by construction. */
+            const cJSON *cs = cJSON_GetObjectItemCaseSensitive(imp, "colorSpace");
+            if (cJSON_IsString(cs))
+                (void)jce_cook_colour_space_parse(cs->valuestring,
+                                                  &opt.texture_srgb);
         }
         JceCookResult r = jce_cook_texture(raw, raw_size, &opt);
         if (imp) cJSON_Delete(imp);
@@ -2294,7 +2316,14 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         {
             uint8_t cook_flag = opts->cook_assets ? 1u : 0u;
             int     cook_plat = opts->target_platform;
-            uint32_t writer_revision = 2u;
+            /* 3: mip averaging became colour-space aware
+             * (jce_cook_path_is_srgb -> JceCookOptions::texture_srgb).  The
+             * bump is not optional: the source bytes, the cook flag and the
+             * platform are all unchanged, so without it the incremental cache
+             * reports `reused` and the corrected mips are never written --
+             * the fix would land in the source and not in the output, which
+             * is indistinguishable from it not working. */
+            uint32_t writer_revision = 3u;
             XXH3_64bits_update(xs, &cook_flag, sizeof(cook_flag));
             XXH3_64bits_update(xs, &cook_plat, sizeof(cook_plat));
             XXH3_64bits_update(xs, &writer_revision,
@@ -2605,9 +2634,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
 
             /* A PRIVATE pool, not jce_thread_pool_shared(), for two reasons.
              *
-             * Correctness first: the editor runs this whole function on its own
-             * "jce-bundle-pack" thread (jce_panel_bundle_browser.cpp) while the
-             * frame loop keeps drawing.  enkiTS routes a submission into the
+             * Correctness first: the editor runs this whole function on a
+             * structured background worker while the frame loop keeps drawing.
+             * enkiTS routes a submission into the
              * pipe of the SUBMITTING thread's scheduler slot, and a thread that
              * never registered with the scheduler reports slot 0 — the slot the
              * frame loop owns.  Those pipes are single-producer, so submitting
@@ -2621,16 +2650,22 @@ static int run_build_impl(const JceBundlePackOptions *opts)
              * pool would get executed by the main thread inside a cull.  See
              * the private-pool note in jce_thread.h.
              *
-             * Sized by the house policy rather than enkiTS auto-detect: a build
-             * must not take every core out from under an editor that is still
-             * drawing.  NULL (OOM) degrades to the inline path. */
+             * Sized by the house policy rather than enkiTS auto-detect, then
+             * capped at four workers because the editor's frame and async
+             * schedulers remain active at the same time. NULL (OOM) degrades
+             * to the inline path on this background worker. */
             JceThreadPool *cook_pool = NULL;
-            if (njobs >= 2)
-                cook_pool = jce_thread_pool_create(
-                    jce_thread_pool_default_workers() + 1);
+            if (njobs >= 2) {
+                int cook_workers = jce_thread_pool_default_workers();
+                if (cook_workers > 4)
+                    cook_workers = 4;
+                cook_pool = jce_thread_pool_create_named(
+                    cook_workers + 1, "jce-bundle-cook");
+            }
             if (cook_pool)
-                jce_thread_pool_parallel_for(cook_pool, (uint32_t)njobs, 1,
-                                             cook_jobs_range, &cctx);
+                jce_thread_pool_parallel_for_named(
+                    cook_pool, "bundle.cook-assets", (uint32_t)njobs, 1,
+                    cook_jobs_range, &cctx);
             else
                 cook_jobs_range(0u, (uint32_t)njobs, &cctx);
             if (cook_pool) jce_thread_pool_destroy(cook_pool);

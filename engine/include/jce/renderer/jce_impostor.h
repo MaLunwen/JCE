@@ -58,6 +58,29 @@ typedef struct {
     char     atlas_path[256]; /* project-relative path to the baked PNG atlas */
 } JceImpostorMeta;
 
+/* Place an instance's card: where the billboard sits in the world, and how big.
+ *
+ * `meta->center` is a MODEL-LOCAL point, so it has to go through the whole
+ * model matrix.  The renderer used to compute the anchor as
+ * `translation + center * length(model.col[0])`, which is the same thing only
+ * when the instance is unrotated AND uniformly scaled.  On the scene that
+ * exposed it, 1790 of 1797 instances were rotated (up to 150 degrees) and 1788
+ * were non-uniformly scaled, so nearly every card was anchored at the wrong
+ * world position and sized from the X axis alone -- which is what "distant
+ * models have the wrong size, position and rotation" looks like.
+ *
+ * The radius takes the LARGEST of the three column lengths.  A bounding-sphere
+ * radius under anisotropic scale has no single correct scalar; the largest is
+ * the only choice that cannot crop the silhouette, and a card slightly too big
+ * costs a few transparent texels while one slightly too small clips the model.
+ *
+ * `model` is 16 floats in the engine's column-major layout (elements 12..14 are
+ * the translation).  Out params may not be NULL. */
+JCE_API void jce_impostor_card_place(const float model[16],
+                                     const JceImpostorMeta *meta,
+                                     float out_center[3],
+                                     float *out_radius);
+
 /* Write / read the metadata sidecar (host filesystem, absolute or cooked
  * paths).  Returns false on I/O or parse failure. */
 JCE_API bool jce_impostor_meta_write(const char *json_path,

@@ -22,14 +22,7 @@
 #include "ck_quest_graph.h"
 #include "ck_trigger.h"
 
-#include <jce/middleware/scene/jce_scene.h>
-#include <jce/renderer/jce_scene_renderer.h>
-#include <jce/renderer/jce_material_registry.h>
-#include <jce/application/jce_args.h>
-#include <jce/os/core/jce_alloc.h>
-#include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_log.h>
-#include <jce/resource/jce_scene_serial.h>
+#include <jce/api.h>
 
 #include <string.h>
 
@@ -43,6 +36,7 @@
 struct CkSceneDirector {
     JceRenderer       *renderer;
     JcePakArchive     *pak;
+    JceAudio          *audio;
 
     /* Persistent VFS handle: mounted once with the game PAK, reused for
        every scene/quest/trigger load.  This avoids the per-load mount
@@ -51,6 +45,7 @@ struct CkSceneDirector {
 
     JceScene          *scene;
     JceSceneRenderer  *scene_renderer;
+    JceRuntime        *runtime;
 
     /* Game-data systems owned here so transitions stay atomic: clearing
        the scene and refreshing the trigger set happen back-to-back, and
@@ -149,11 +144,11 @@ static void patch_matching_mesh_renderer(JceScene *s, JceEntity e, void *ud)
      * a texture, so a designer can save a factor tweak without losing
      * a per-entity texture override. */
     const char (*tp)[256] = ctx->tex_paths;
-    if (tp[0][0]) { strncpy(mr->albedo_tex,   tp[0], sizeof(mr->albedo_tex)   - 1); mr->albedo_tex[sizeof(mr->albedo_tex)     - 1] = '\0'; }
-    if (tp[1][0]) { strncpy(mr->mr_tex,       tp[1], sizeof(mr->mr_tex)       - 1); mr->mr_tex[sizeof(mr->mr_tex)             - 1] = '\0'; }
-    if (tp[2][0]) { strncpy(mr->normal_tex,   tp[2], sizeof(mr->normal_tex)   - 1); mr->normal_tex[sizeof(mr->normal_tex)     - 1] = '\0'; }
-    if (tp[3][0]) { strncpy(mr->ao_tex,       tp[3], sizeof(mr->ao_tex)       - 1); mr->ao_tex[sizeof(mr->ao_tex)             - 1] = '\0'; }
-    if (tp[4][0]) { strncpy(mr->emissive_tex, tp[4], sizeof(mr->emissive_tex) - 1); mr->emissive_tex[sizeof(mr->emissive_tex) - 1] = '\0'; }
+    if (tp[0][0]) mr->albedo_tex   = jce_scene_intern(s, tp[0]);
+    if (tp[1][0]) mr->mr_tex       = jce_scene_intern(s, tp[1]);
+    if (tp[2][0]) mr->normal_tex   = jce_scene_intern(s, tp[2]);
+    if (tp[3][0]) mr->ao_tex       = jce_scene_intern(s, tp[3]);
+    if (tp[4][0]) mr->emissive_tex = jce_scene_intern(s, tp[4]);
 
     ctx->hit_count++;
 }
@@ -198,6 +193,23 @@ static bool dir_load_path(CkSceneDirector *dir, const char *vfs_path)
         return false;
     }
 
+    {
+        JceRuntimeDesc runtime_desc = {0};
+        runtime_desc.scene = dir->scene;
+        runtime_desc.pak = dir->pak;
+        runtime_desc.audio = dir->audio;
+        runtime_desc.enable_physics = true;
+        dir->runtime = jce_runtime_create(&runtime_desc);
+        if (!dir->runtime) {
+            LOG_ERROR(LOG_TAG, "runtime create failed for scene: %s", vfs_path);
+            jce_scene_clear(dir->scene);
+            dir->current_path[0] = '\0';
+            ck_trigger_set_destroy(dir->triggers);
+            dir->triggers = NULL;
+            return false;
+        }
+    }
+
     set_current_path(dir, vfs_path);
     refresh_quest_state(dir, vfs_path);
     dir->post_transition_lock = POST_TRANSITION_LOCK_SEC;
@@ -205,6 +217,7 @@ static bool dir_load_path(CkSceneDirector *dir, const char *vfs_path)
     /* Dev-mode: rebuild the hot-reload watch list for this scene. */
     jce_material_registry_clear();
     jce_scene_each_entity(dir->scene, track_scene_materials, NULL);
+    jce_vcam_system_reset();
 
     LOG_INFO(LOG_TAG, "scene loaded: %s", vfs_path);
     return true;
@@ -212,7 +225,9 @@ static bool dir_load_path(CkSceneDirector *dir, const char *vfs_path)
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
-CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *pak)
+CkSceneDirector *ck_scene_director_create(JceRenderer *renderer,
+                                          JcePakArchive *pak,
+                                          JceAudio *audio)
 {
     if (!renderer || !pak) {
         LOG_ERROR(LOG_TAG, "create: renderer/pak must be non-NULL");
@@ -225,6 +240,7 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
 
     dir->renderer = renderer;
     dir->pak      = pak;
+    dir->audio    = audio;
 
     dir->fs = jce_fs_create();
     if (!dir->fs) {
@@ -300,6 +316,7 @@ void ck_scene_director_destroy(CkSceneDirector *dir)
     jce_material_registry_shutdown();
     ck_trigger_set_destroy(dir->triggers);
     ck_quest_graph_destroy(dir->quests);
+    if (dir->runtime)        jce_runtime_destroy(dir->runtime);
     if (dir->scene_renderer) jce_scene_renderer_destroy(dir->scene_renderer);
     if (dir->scene)          jce_scene_destroy(dir->scene);
     if (dir->fs)             jce_fs_destroy(dir->fs);
@@ -313,6 +330,11 @@ bool ck_scene_director_load_initial(CkSceneDirector *dir, const char *vfs_path)
 {
     if (!dir) return false;
     ck_player_state_init(&dir->player);
+    if (dir->runtime) {
+        jce_runtime_destroy(dir->runtime);
+        dir->runtime = NULL;
+    }
+    jce_scene_clear(dir->scene);
     return dir_load_path(dir, vfs_path);
 }
 
@@ -334,6 +356,11 @@ bool ck_scene_director_load(CkSceneDirector *dir, const char *vfs_path)
 {
     if (!dir || !dir->scene) return false;
 
+    if (dir->runtime) {
+        jce_runtime_destroy(dir->runtime);
+        dir->runtime = NULL;
+    }
+
     int cleared = jce_scene_clear(dir->scene);
     LOG_INFO(LOG_TAG, "transition: cleared %d entities", cleared);
 
@@ -346,6 +373,8 @@ void ck_scene_director_tick(CkSceneDirector *dir, float dt_sec,
                             const float player_pos[3])
 {
     if (!dir) return;
+
+    if (dir->runtime) jce_runtime_step(dir->runtime, dt_sec);
 
     /* Dev-mode .mat.json hot-reload poll. Cheap (no-op outside dev). */
     jce_material_registry_poll((double)dt_sec);

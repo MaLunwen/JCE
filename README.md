@@ -76,8 +76,8 @@ The low baseline is a compatibility and efficiency target. It must not prevent t
 ## Dependency Ownership
 
 Every capability below has exactly one authoritative owner. The tables are the
-human-readable form of `docs/architecture/dependency-ownership.yml`, which
-`tools/audit/check_dependency_boundaries.py` enforces.
+human-readable form of `contracts/dependency-ownership.yml`, which
+`check_dependency_boundaries.py` enforces.
 
 ### Core, Platform, and Foundations
 

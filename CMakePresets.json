@@ -12,8 +12,7 @@
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "JCE_BUILD_VARIANT": "release",
-        "JCE_ENABLE_PATENTED_CODECS": "ON"
+        "JCE_BUILD_VARIANT": "release"
       }
     },
     {
@@ -139,8 +138,7 @@
       "binaryDir": "${sourceDir}/build/desktop/windows-x64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-x86_64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -216,8 +214,7 @@
       "binaryDir": "${sourceDir}/build/desktop/windows-arm64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-aarch64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -262,8 +259,7 @@
       "binaryDir": "${sourceDir}/build/desktop/windows-x86-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-i686-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -325,8 +321,7 @@
       "binaryDir": "${sourceDir}/build/desktop/linux-x64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-x86_64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -366,8 +361,7 @@
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-aarch64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -409,8 +403,7 @@
       "binaryDir": "${sourceDir}/build/desktop/macos-x64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-x86_64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -452,8 +445,7 @@
       "binaryDir": "${sourceDir}/build/desktop/macos-arm64-dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-aarch64-dist",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -472,8 +464,7 @@
       "displayName": "Desktop windows-x64 Dist (royalty-free, non-SDK)",
       "inherits": "windows-x64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -481,8 +472,7 @@
       "displayName": "Desktop windows-arm64 Dist (royalty-free, non-SDK)",
       "inherits": "windows-arm64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -490,8 +480,7 @@
       "displayName": "Desktop windows-x86 Dist (royalty-free, non-SDK)",
       "inherits": "windows-x86-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -499,8 +488,7 @@
       "displayName": "Desktop linux-x64 Dist (royalty-free, non-SDK)",
       "inherits": "linux-x64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -508,8 +496,7 @@
       "displayName": "Desktop linux-arm64 Dist (royalty-free, non-SDK)",
       "inherits": "linux-arm64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -517,8 +504,7 @@
       "displayName": "Desktop macos-x64 Dist (royalty-free, non-SDK)",
       "inherits": "macos-x64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     },
     {
@@ -526,8 +512,7 @@
       "displayName": "Desktop macos-arm64 Dist (royalty-free, non-SDK)",
       "inherits": "macos-arm64-release",
       "cacheVariables": {
-        "JCE_BUILD_VARIANT": "dist",
-        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+        "JCE_BUILD_VARIANT": "dist"
       }
     }
   ],

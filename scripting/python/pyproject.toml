@@ -1,0 +1,39 @@
+# jce-script — the JCE scripting surface for Python.
+#
+# PURE PYTHON, ON PURPOSE.  There is no build step, no compiler, no extension
+# module and no third-party dependency: the transport is ctypes over
+# scripting/c_abi's plain C shared library, which is why `[build-system]` names
+# only setuptools and why there is no `[tool.setuptools.ext-modules]`.  A wheel
+# built from this is `py3-none-any`.
+#
+# The shared library itself is NOT packaged here.  It is built with the engine
+# and lives beside the game or the editor; jce_script.load_library() finds it
+# through $JCE_SCRIPT_API, beside the package, or on the loader's search path.
+# Vendoring a binary would make this wheel platform-specific for a file the
+# host process already has open.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jce-script"
+version = "1.0.0"
+description = "Python bindings for the JCE scripting surface (script_api_version 1)"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+# requires-python is 3.10 and not 3.12: the generated module uses PEP 604
+# unions (`str | None`) in annotations, which `from __future__ import
+# annotations` makes lazy on 3.10+, and nothing else newer.  The repo's own
+# tooling pins 3.12 (ci.yml:25); a binding that refused 3.10 would be narrower
+# than it needs to be for no gain.
+
+[tool.setuptools]
+packages = ["jce_script"]
+
+[tool.setuptools.package-data]
+jce_script = ["py.typed", "_generated.pyi"]

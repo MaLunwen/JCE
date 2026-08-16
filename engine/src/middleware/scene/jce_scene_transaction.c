@@ -22,13 +22,17 @@ struct JceSceneTransaction {
     bool active_owned;
     uint64_t active_generation;
     uint64_t active_plan_hash;
+    uint64_t active_attestation_hash;
     RoleBinding active_bindings[JCE_SCENE_FROZEN_PLAN_MAX_OPERATIONS];
     uint32_t active_binding_count;
 
     JceScene *staging_scene;
     JceSceneFrozenPlan pending_plan;
+    JceSceneFrozenPlan *pending_attested_plan;
     uint64_t pending_generation;
+    uint64_t pending_attestation_hash;
     uint32_t next_operation;
+    uint32_t next_attestation;
     bool pending_hierarchy_applied;
     RoleBinding pending_bindings[JCE_SCENE_FROZEN_PLAN_MAX_OPERATIONS];
     uint32_t pending_binding_count;
@@ -37,6 +41,7 @@ struct JceSceneTransaction {
     bool previous_owned;
     uint64_t previous_generation;
     uint64_t previous_plan_hash;
+    uint64_t previous_attestation_hash;
     RoleBinding previous_bindings[JCE_SCENE_FROZEN_PLAN_MAX_OPERATIONS];
     uint32_t previous_binding_count;
 
@@ -57,9 +62,13 @@ static void release_scene(JceSceneTransaction *transaction, JceScene *scene,
 static void clear_pending(JceSceneTransaction *transaction)
 {
     release_scene(transaction, transaction->staging_scene, true);
+    jce_free(transaction->pending_attested_plan);
     transaction->staging_scene = NULL;
+    transaction->pending_attested_plan = NULL;
     transaction->pending_generation = 0u;
+    transaction->pending_attestation_hash = 0u;
     transaction->next_operation = 0u;
+    transaction->next_attestation = 0u;
     transaction->pending_hierarchy_applied = false;
     transaction->pending_binding_count = 0u;
     memset(&transaction->pending_plan, 0, sizeof(transaction->pending_plan));
@@ -138,6 +147,10 @@ static bool pending_contract_valid(const JceSceneTransaction *transaction)
             jce_scene_frozen_plan_hash(&transaction->pending_plan) ||
         transaction->pending_plan.operation_count !=
             transaction->pending_binding_count ||
+        ((transaction->desc.attest ||
+          transaction->desc.require_attestation) &&
+         transaction->pending_attestation_hash !=
+             transaction->pending_plan.plan_hash) ||
         transaction->pending_binding_count > transaction->desc.entity_budget)
         return false;
     for (i = 0u; i < transaction->pending_binding_count; ++i) {
@@ -168,6 +181,77 @@ static bool pending_contract_valid(const JceSceneTransaction *transaction)
     return true;
 }
 
+static bool operation_equal(const JceScenePlanOperation *a,
+                            const JceScenePlanOperation *b)
+{
+    return a && b &&
+        a->stable_entity_id == b->stable_entity_id &&
+        a->parent_stable_entity_id == b->parent_stable_entity_id &&
+        a->asset_content_hash == b->asset_content_hash &&
+        strcmp(a->stable_role, b->stable_role) == 0 &&
+        strcmp(a->asset_id, b->asset_id) == 0 &&
+        memcmp(a->position_mm, b->position_mm,
+               sizeof(a->position_mm)) == 0 &&
+        memcmp(a->rotation_mdeg, b->rotation_mdeg,
+               sizeof(a->rotation_mdeg)) == 0 &&
+        memcmp(a->scale_milli, b->scale_milli,
+               sizeof(a->scale_milli)) == 0;
+}
+
+static bool begin_pending_attestation(JceSceneTransaction *transaction)
+{
+    JceSceneFrozenPlan *attested;
+
+    if (!transaction->desc.attest)
+        return !transaction->desc.require_attestation;
+    attested = (JceSceneFrozenPlan *)jce_malloc(sizeof(*attested));
+    if (!attested)
+        return false;
+    memset(attested, 0, sizeof(*attested));
+    attested->format_version = transaction->pending_plan.format_version;
+    attested->compiler_version = transaction->pending_plan.compiler_version;
+    attested->request_id = transaction->pending_plan.request_id;
+    attested->seed = transaction->pending_plan.seed;
+    attested->catalog_hash = transaction->pending_plan.catalog_hash;
+    attested->operation_count = transaction->pending_plan.operation_count;
+    transaction->pending_attested_plan = attested;
+    transaction->next_attestation = 0u;
+    transaction->pending_attestation_hash = 0u;
+    return true;
+}
+
+static bool attest_pending_operation(JceSceneTransaction *transaction,
+                                     uint32_t index)
+{
+    const JceScenePlanOperation *expected =
+        &transaction->pending_plan.operations[index];
+    JceScenePlanOperation actual;
+    const RoleBinding *binding = &transaction->pending_bindings[index];
+
+    memset(&actual, 0, sizeof(actual));
+    if (!transaction->desc.attest(
+            transaction->desc.user, transaction->staging_scene,
+            expected, binding->entity, &actual) ||
+        !operation_equal(expected, &actual))
+        return false;
+    transaction->pending_attested_plan->operations[index] = actual;
+    return true;
+}
+
+static bool finish_pending_attestation(JceSceneTransaction *transaction)
+{
+    uint64_t hash;
+
+    if (!transaction->pending_attested_plan)
+        return !transaction->desc.require_attestation;
+    hash = jce_scene_frozen_plan_hash(transaction->pending_attested_plan);
+    if (hash == 0u || hash != transaction->pending_plan.plan_hash)
+        return false;
+    transaction->pending_attested_plan->plan_hash = hash;
+    transaction->pending_attestation_hash = hash;
+    return true;
+}
+
 JCE_API void JCE_CALL
 jce_scene_transaction_desc_default(JceSceneTransactionDesc *desc)
 {
@@ -187,7 +271,9 @@ jce_scene_transaction_create(const JceSceneTransactionDesc *desc)
     jce_scene_transaction_desc_default(&effective);
     if (desc)
         effective = *desc;
-    if (!effective.apply || effective.entity_budget == 0u ||
+    if (!effective.apply ||
+        (effective.require_attestation && !effective.attest) ||
+        effective.entity_budget == 0u ||
         effective.entity_budget > JCE_SCENE_FROZEN_PLAN_MAX_OPERATIONS)
         return NULL;
     transaction = (JceSceneTransaction *)jce_malloc(sizeof(*transaction));
@@ -224,6 +310,7 @@ jce_scene_transaction_begin(JceSceneTransaction *transaction,
     if (!transaction || !plan)
         return false;
     if (transaction->state == JCE_SCENE_TRANSACTION_BUILDING ||
+        transaction->state == JCE_SCENE_TRANSACTION_ATTESTING ||
         transaction->state == JCE_SCENE_TRANSACTION_VALIDATING ||
         transaction->state == JCE_SCENE_TRANSACTION_PREWARMING ||
         transaction->state == JCE_SCENE_TRANSACTION_READY ||
@@ -269,6 +356,11 @@ jce_scene_transaction_begin(JceSceneTransaction *transaction,
     transaction->next_operation = 0u;
     transaction->pending_hierarchy_applied = false;
     transaction->pending_binding_count = 0u;
+    if (!begin_pending_attestation(transaction)) {
+        fail_transaction(transaction,
+                         JCE_SCENE_TRANSACTION_ERROR_ATTESTATION);
+        return false;
+    }
     transaction->error = JCE_SCENE_TRANSACTION_ERROR_NONE;
     transaction->state = JCE_SCENE_TRANSACTION_BUILDING;
     return true;
@@ -320,6 +412,34 @@ jce_scene_transaction_step(JceSceneTransaction *transaction,
             if (!apply_pending_hierarchy(transaction))
                 return fail_transaction(
                     transaction, JCE_SCENE_TRANSACTION_ERROR_HIERARCHY);
+            transaction->state = transaction->desc.attest
+                ? JCE_SCENE_TRANSACTION_ATTESTING
+                : JCE_SCENE_TRANSACTION_VALIDATING;
+        }
+        return transaction->state;
+    }
+    if (transaction->state == JCE_SCENE_TRANSACTION_ATTESTING) {
+        uint32_t attested = 0u;
+        if (max_operations == 0u)
+            max_operations = 1u;
+        while (transaction->next_attestation <
+                   transaction->pending_plan.operation_count &&
+               attested < max_operations) {
+            uint32_t index = transaction->next_attestation;
+            if (!attest_pending_operation(transaction, index))
+                return fail_transaction(
+                    transaction,
+                    JCE_SCENE_TRANSACTION_ERROR_ATTESTATION);
+            ++transaction->next_attestation;
+            ++attested;
+        }
+        if (transaction->next_attestation ==
+            transaction->pending_plan.operation_count) {
+            if (!finish_pending_attestation(transaction) ||
+                !pending_contract_valid(transaction))
+                return fail_transaction(
+                    transaction,
+                    JCE_SCENE_TRANSACTION_ERROR_ATTESTATION);
             transaction->state = JCE_SCENE_TRANSACTION_VALIDATING;
         }
         return transaction->state;
@@ -371,6 +491,8 @@ jce_scene_transaction_commit(JceSceneTransaction *transaction,
     transaction->previous_owned = transaction->active_owned;
     transaction->previous_generation = transaction->active_generation;
     transaction->previous_plan_hash = transaction->active_plan_hash;
+    transaction->previous_attestation_hash =
+        transaction->active_attestation_hash;
     transaction->previous_binding_count = transaction->active_binding_count;
     memcpy(transaction->previous_bindings, transaction->active_bindings,
            sizeof(transaction->active_bindings));
@@ -379,13 +501,19 @@ jce_scene_transaction_commit(JceSceneTransaction *transaction,
     transaction->active_owned = true;
     transaction->active_generation = transaction->pending_generation;
     transaction->active_plan_hash = transaction->pending_plan.plan_hash;
+    transaction->active_attestation_hash =
+        transaction->pending_attestation_hash;
     transaction->active_binding_count = transaction->pending_binding_count;
     memcpy(transaction->active_bindings, transaction->pending_bindings,
            sizeof(transaction->active_bindings));
 
     transaction->staging_scene = NULL;
+    jce_free(transaction->pending_attested_plan);
+    transaction->pending_attested_plan = NULL;
     transaction->pending_generation = 0u;
+    transaction->pending_attestation_hash = 0u;
     transaction->next_operation = 0u;
+    transaction->next_attestation = 0u;
     transaction->pending_hierarchy_applied = false;
     transaction->pending_binding_count = 0u;
     memset(&transaction->pending_plan, 0, sizeof(transaction->pending_plan));
@@ -405,6 +533,7 @@ jce_scene_transaction_commit(JceSceneTransaction *transaction,
         transaction->previous_owned = false;
         transaction->previous_generation = 0u;
         transaction->previous_plan_hash = 0u;
+        transaction->previous_attestation_hash = 0u;
         transaction->previous_binding_count = 0u;
         transaction->state = JCE_SCENE_TRANSACTION_ACTIVE;
     }
@@ -425,6 +554,7 @@ jce_scene_transaction_mark_healthy(JceSceneTransaction *transaction,
         transaction->previous_owned = false;
         transaction->previous_generation = 0u;
         transaction->previous_plan_hash = 0u;
+        transaction->previous_attestation_hash = 0u;
         transaction->previous_binding_count = 0u;
         transaction->state = JCE_SCENE_TRANSACTION_ACTIVE;
         transaction->error = JCE_SCENE_TRANSACTION_ERROR_NONE;
@@ -439,6 +569,8 @@ jce_scene_transaction_mark_healthy(JceSceneTransaction *transaction,
         transaction->active_owned = transaction->previous_owned;
         transaction->active_generation = transaction->previous_generation;
         transaction->active_plan_hash = transaction->previous_plan_hash;
+        transaction->active_attestation_hash =
+            transaction->previous_attestation_hash;
         transaction->active_binding_count =
             transaction->previous_binding_count;
         memcpy(transaction->active_bindings, transaction->previous_bindings,
@@ -448,6 +580,7 @@ jce_scene_transaction_mark_healthy(JceSceneTransaction *transaction,
         transaction->previous_owned = false;
         transaction->previous_generation = 0u;
         transaction->previous_plan_hash = 0u;
+        transaction->previous_attestation_hash = 0u;
         transaction->previous_binding_count = 0u;
 
         if (transaction->desc.on_activated)
@@ -470,6 +603,7 @@ jce_scene_transaction_cancel(JceSceneTransaction *transaction)
     if (transaction->state == JCE_SCENE_TRANSACTION_HEALTH_CHECK)
         return;
     if (transaction->state == JCE_SCENE_TRANSACTION_BUILDING ||
+        transaction->state == JCE_SCENE_TRANSACTION_ATTESTING ||
         transaction->state == JCE_SCENE_TRANSACTION_VALIDATING ||
         transaction->state == JCE_SCENE_TRANSACTION_PREWARMING ||
         transaction->state == JCE_SCENE_TRANSACTION_READY)
@@ -500,6 +634,13 @@ jce_scene_transaction_pending_generation(
 }
 
 JCE_API uint64_t JCE_CALL
+jce_scene_transaction_pending_attestation_hash(
+    const JceSceneTransaction *transaction)
+{
+    return transaction ? transaction->pending_attestation_hash : 0u;
+}
+
+JCE_API uint64_t JCE_CALL
 jce_scene_transaction_active_generation(
     const JceSceneTransaction *transaction)
 {
@@ -517,6 +658,13 @@ jce_scene_transaction_active_plan_hash(
     const JceSceneTransaction *transaction)
 {
     return transaction ? transaction->active_plan_hash : 0u;
+}
+
+JCE_API uint64_t JCE_CALL
+jce_scene_transaction_active_attestation_hash(
+    const JceSceneTransaction *transaction)
+{
+    return transaction ? transaction->active_attestation_hash : 0u;
 }
 
 JCE_API uint32_t JCE_CALL

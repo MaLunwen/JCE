@@ -137,8 +137,16 @@ def process_file(path: Path, check: bool) -> bool:
         print(f"[drift] {path}: {reason}")
         return False
 
-    # Write UTF-8 WITHOUT a BOM (encoding='utf-8' never emits one).
-    path.write_text(rendered, encoding="utf-8")
+    # Write UTF-8 WITHOUT a BOM (encoding='utf-8' never emits one) and with
+    # LF line endings.
+    #
+    # newline="" is load-bearing: without it, write_text applies the platform
+    # line-ending translation, so every run on Windows rewrote all 15 locale
+    # files as CRLF -- against .gitattributes, which mandates LF in the
+    # repository AND the working tree.  Because this script runs from a
+    # stamp-driven build step, that happened on every build that touched a
+    # locale file, silently undoing any normalisation.
+    path.write_text(rendered, encoding="utf-8", newline="")
     note = "stripped BOM, " if had_bom else ""
     print(f"[fix  ] {path}: {note}rewrote {len(data)} keys")
     return True

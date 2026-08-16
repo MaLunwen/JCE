@@ -530,8 +530,44 @@ def _tool_runs(path: Path) -> bool:
         return False
 
 
+def sdk_shipped_script_backends(install: Path) -> list:
+    """Which language backends the INSTALLED SDK actually contains.
+
+    Derived from the files on disk and not from the options this run passed:
+    an option says what was asked for, and the question a consumer has is what
+    arrived.  A backend counts only when every piece it cannot run without is
+    there -- Java needs the JNI shim and the compiled com.jce.script classes
+    as well as the archive, and an SDK with the archive alone produces
+    UnsatisfiedLinkError or ClassNotFoundException inside the consumer's JVM,
+    a long way from here.
+
+    Necessary, not sufficient: the consumer still supplies the CPython or the
+    JVM, and lib/cmake/JCE/JCEScripting.cmake is what decides that on their
+    machine at their configure time.
+    """
+    libdir = install / "lib"
+    shipped = []
+    for lang, stem in (("cpp", "jce_script_vm_cpp"),
+                       ("python", "jce_script_vm_python"),
+                       ("java", "jce_script_vm_java")):
+        found = (any(libdir.glob("*/" + stem + ".lib")) or
+                 any(libdir.glob("*/lib" + stem + ".a")) or
+                 any(libdir.glob("*/" + stem + ".a")))
+        if lang == "java" and found:
+            shim = (any(libdir.glob("*/jce_script_java.dll")) or
+                    any(libdir.glob("*/libjce_script_java.so")) or
+                    any(libdir.glob("*/libjce_script_java.dylib")))
+            classes = (install / "share" / "jce" / "scripting" / "java" /
+                       "classes").is_dir()
+            found = bool(shim and classes)
+        if found:
+            shipped.append(lang)
+    return shipped
+
+
 def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
-             tolerate_missing_tools: bool = False) -> None:
+             tolerate_missing_tools: bool = False,
+             codec_flags: list = None, script_java: bool = False) -> None:
     is_wasm = t.get("emscripten", False)
     kind = "debug" if config == "Debug" else f"{variant}-sdk"   # release-sdk|dist-sdk
     preset  = preset_name(t, kind)
@@ -557,7 +593,17 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
                     shutil.rmtree(d, ignore_errors=True)
 
     conan_install(t, config, env)
-    overrides = []
+    # Empty unless --patented-codecs was passed for a non-dist SDK; see
+    # codec_overrides().  release-sdk and dist-sdk have separate binary dirs,
+    # so nothing has to be re-pinned to undo a previous variant here.
+    overrides = list(codec_flags or []) if variant != "dist" else []
+    # BOTH WAYS, ALWAYS.  A CMake option is cached, so passing -D...=ON
+    # only when asked would leave a tree that once built a Java SDK
+    # building one forever, and the SDK a command produces would be a
+    # function of this machine's history rather than of the command.
+    # This repository has been bitten by exactly that already.
+    overrides += ["-DJCE_BUILD_SCRIPT_JAVA=" +
+                  ("ON" if script_java else "OFF")]
     if config == "Debug":
         # No debug-sdk preset by design; enable SDK install via overrides.
         overrides += ["-DJCE_ENABLE_SDK_INSTALL=ON",
@@ -637,12 +683,21 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
     # VERSION.txt — matches package-sdk.bat so consumers can identify the tree.
     if not DRY_RUN:
         _host_tag = "wasm" if is_wasm else f"{SDK_TAG[t['host']]}-{t['arch']}"
+        # Reported as well as stamped: an SDK producer who never opens
+        # VERSION.txt is the person most likely to ship a Lua-only SDK
+        # and find out from a consumer.
+        _langs = sdk_shipped_script_backends(install)
+        _langs_str = ", ".join(_langs) if _langs else "(none)"
+        log(f"SDK scripting backends shipped: {_langs_str}"
+            + ("" if script_java else
+               "  [java NOT included -- pass --script-java]"))
         (install / "VERSION.txt").write_text(
             "JCE SDK build\n"
             f"commit:  {git_short_sha()}\n"
             f"host:    {_host_tag}\n"
             f"variant: {variant}\n"
             f"tools:   {tools_status}\n"
+            f"scripts: lua (built in) + backends shipped: {_langs_str}\n"
             "note:    bin/ tools need the MSVC C++ Redistributable on Windows\n",
             encoding="utf-8")
     log(f"SDK ({variant}/{config}) -> {install}")
@@ -655,18 +710,26 @@ def cmd_sdk(args) -> None:
     variants = {"release": ["release"], "dist": ["dist"],
                 "both": ["release", "dist"]}[args.variant]
     tolerate = getattr(args, "tolerate_missing_tools", False)
+    # `--variant both` runs dist and release in one go, so resolve the codec
+    # flags per SDK variant rather than from args.variant.
+    codec_flags = codec_overrides(argparse.Namespace(
+        patented_codecs=getattr(args, "patented_codecs", None), variant="release"))
+    script_java = getattr(args, "script_java", False)
     for v in variants:
-        _sdk_one(t, v, "Release", args.clean, tolerate)
+        _sdk_one(t, v, "Release", args.clean, tolerate,
+                 codec_flags, script_java)
     # Debug SDK is release-flavoured only: there is no -dist-debug preset, and
     # `dist` is a royalty-free *ship* build. Build Debug once, for release, and
     # only when a release SDK was requested.  Web ships Release-only (the wasm
     # fat lib is Release; a Debug consumer maps to it via MAP_IMPORTED_CONFIG_DEBUG).
     if not args.no_debug and "release" in variants and not t.get("emscripten"):
-        _sdk_one(t, "release", "Debug", args.clean, tolerate)
+        _sdk_one(t, "release", "Debug", args.clean, tolerate,
+                 codec_flags, script_java)
     # Gate: build + run the plain-C99 smoke consumer against each fresh SDK.
     if getattr(args, "smoke", False):
         for v in variants:
             _smoke_one(t, sdk_install_dir(t, v), v)
+            _smoke_scripting_one(t, sdk_install_dir(t, v), v)
     log("sdk: done")
 
 
@@ -765,10 +828,93 @@ def _smoke_one(t: dict, sdk: Path, variant: str) -> None:
     log(f"smoke: PASS ({variant} SDK at {sdk})")
 
 
+# ── The MULTI-LANGUAGE half of the smoke gate ─────────────────────────────
+def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
+    """Build tests/sdk_smoke_scripting OUT-OF-TREE against the SDK at `sdk` and
+    require its `JCE_SMOKE_SCRIPTING: OK` marker.
+
+    A SEPARATE consumer from _smoke_one and not a bigger one, because they
+    gate opposite things: sdk_smoke must keep passing on an engine-only SDK,
+    and this one must FAIL on an SDK that claims a scripting backend and does
+    not ship it.
+
+    SKIPPING IS NOT SILENT.  An SDK with no lib/cmake/JCE/JCEScripting.cmake
+    -- every SDK produced before 2026-08-16, and any built from a tree without
+    scripting/ -- legitimately cannot run this; that is reported WITH THE
+    REASON, because "the scripting gate did not run" and "the scripting gate
+    passed" produced the same empty output for as long as the SDK shipped
+    nothing from scripting/ at all."""
+    jce_cmake = sdk / "lib" / "cmake" / "JCE"
+    fragment = jce_cmake / "JCEScripting.cmake"
+    if not DRY_RUN and not fragment.exists():
+        log(f"smoke-scripting: SKIPPED — {sdk} ships no scripting layer "
+            f"(no lib/cmake/JCE/JCEScripting.cmake): it predates 2026-08-16, "
+            f"or came from a tree without scripting/. Rebuild the SDK to gate "
+            f"it; add an embeddable CPython and -DJCE_BUILD_SCRIPT_JAVA=ON "
+            f"for the Python and Java halves.")
+        return
+
+    env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
+    bdir = ROOT / "build" / "desktop" / f"sdk-smoke-script-{t['key']}-{variant}"
+    cfg = ["cmake", "-S", str(ROOT / "tests" / "sdk_smoke_scripting"),
+           "-B", str(bdir), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+           "-U", "JCE_PAK_EXECUTABLE",
+           "-U", "JCE_COOK_EXECUTABLE",
+           "-U", "JCE_BIN2OBJ_EXECUTABLE",
+           f"-DJCE_DIR={jce_cmake}"]
+    if HOST == "windows" and not t.get("emscripten"):
+        cfg += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
+    run(cfg, env=env, cwd=ROOT)
+    run(["cmake", "--build", str(bdir)], env=env, cwd=ROOT)
+    if DRY_RUN:
+        return
+
+    exe = bdir / ("jce_sdk_smoke_scripting.exe" if HOST == "windows"
+                  else "jce_sdk_smoke_scripting")
+    if not exe.exists():
+        die(f"smoke-scripting: exe missing: {exe}")
+    # The C ABI shared library, staged beside the exe by
+    # jce_script_stage_runtime().  Checked as an ARTIFACT and not only by
+    # running: on a cross SDK there is no run gate, and a staging rule that
+    # silently copied nothing would leave this gate green.
+    lib_names = ("jce_script_api.dll" if HOST == "windows"
+                 else "libjce_script_api.so")
+    if not (bdir / lib_names).exists():
+        die(f"smoke-scripting: {lib_names} was not staged beside {exe.name} — "
+            "jce_script_stage_runtime() copied nothing.")
+
+    if t["cross"] or t.get("emscripten"):
+        log("smoke-scripting: link + staging gates passed (target arch not "
+            "runnable on this host; run gate skipped)")
+        return
+
+    renv = dict(env)
+    renv["JCE_BACKEND"] = "noop"
+    if HOST == "linux":
+        renv.setdefault("SDL_VIDEODRIVER", "dummy")
+    log(f"smoke-scripting: running {exe.name} (JCE_BACKEND=noop)")
+    try:
+        proc = subprocess.run([str(exe)], env=renv, cwd=str(bdir),
+                              capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        die("smoke-scripting: consumer hung (>180 s)")
+    marker_ok = "JCE_SMOKE_SCRIPTING: OK" in (proc.stdout or "")
+    if not marker_ok or proc.returncode != 0:
+        sys.stderr.write(proc.stdout or "")
+        sys.stderr.write(proc.stderr or "")
+        die(f"smoke-scripting: FAILED (exit={proc.returncode}, "
+            f"marker={'yes' if marker_ok else 'MISSING'})")
+    for line in (proc.stdout or "").splitlines():
+        if "JCE_SMOKE_SCRIPTING:" in line:
+            log(line.strip())
+    log(f"smoke-scripting: PASS ({variant} SDK at {sdk})")
+
+
 def cmd_smoke(args) -> None:
     t = resolve_target(args.arch)
     sdk = Path(args.sdk).resolve() if args.sdk else sdk_install_dir(t, args.variant)
     _smoke_one(t, sdk, args.variant)
+    _smoke_scripting_one(t, sdk, args.variant)
 
 
 # ── Subcommand: editor (Track A first-party desktop app) ──────────────────
@@ -910,6 +1056,38 @@ def attach_binsize_reports(t: dict, variant: str, bdir: Path) -> None:
         log(f"binsize: report generation failed (non-fatal): {e}")
 
 
+def codec_overrides(args) -> list:
+    """Configure flags for the patented-codec switch — and, by design, usually
+    none at all.
+
+    The contract is: dist is always royalty-free, release carries AAC/H.264/
+    H.265 by default, and a release build can opt out.  Only the first two were
+    actually true.  This function used to pin
+    -DJCE_ENABLE_PATENTED_CODECS={OFF if dist else ON} on EVERY configure, and
+    CMakePresets.json's `_desktop-base` stamped the same value a second time
+    (added in 26379e69).  A -D always overwrites an existing cache entry, so a
+    user's `-DJCE_ENABLE_PATENTED_CODECS=OFF` survived exactly one configure
+    and was then silently reset to ON by the next build — the opt-out did not
+    exist in practice, on any driver.
+
+    The fix is to stop writing the preference unless the user asked for a
+    change.  The value the option() carries is a *preference* and lives in the
+    cache; the *effective* switch is derived from it per variant by the root
+    CMakeLists (which forces OFF for dist and Web and asserts that it held).
+    So dist needs no flag from us at all, and release needs one only when
+    --patented-codecs was actually passed."""
+    want = getattr(args, "patented_codecs", None)
+    if want is None:
+        return []
+    if getattr(args, "variant", None) == "dist":
+        # Not an error: dist is royalty-free by construction, and the root
+        # CMakeLists asserts it.  Say so rather than implying we honoured it.
+        log("note: --patented-codecs is ignored for --variant dist "
+            "(dist is always royalty-free)")
+        return []
+    return [f"-DJCE_ENABLE_PATENTED_CODECS={'ON' if want == 'on' else 'OFF'}"]
+
+
 def cmd_editor(args) -> None:
     t = resolve_target(args.arch)
     if t["host"] != HOST:
@@ -937,14 +1115,7 @@ def cmd_editor(args) -> None:
     # build silently emit into <stem>/dist/ and leave <stem>/release/ stale.
     # An explicit -D always overrides the cached value.
     overrides = [f"-DJCE_BUILD_VARIANT={args.variant}"]
-    # Same shared-build-dir hazard as JCE_BUILD_VARIANT (above): the *-dist
-    # preset caches JCE_ENABLE_PATENTED_CODECS=OFF, and the *-release presets
-    # rely on the option() default (ON), which CANNOT override an existing
-    # cache entry — so a release configure after a dist one in the same
-    # build/desktop/<stem> dir silently keeps patented codecs OFF.  Pin the
-    # variant-appropriate value on every configure (dist = OFF, else ON).
-    overrides.append(
-        f"-DJCE_ENABLE_PATENTED_CODECS={'OFF' if args.variant == 'dist' else 'ON'}")
+    overrides += codec_overrides(args)
     # Emit a linker map so the build can attach a binary-composition report.
     overrides.append("-DJCE_EMIT_LINK_MAP=ON")
     if t["cross"]:
@@ -983,7 +1154,61 @@ def resolve_sdk(args, t: dict) -> Path:
     if not (sdk / "lib" / "cmake" / "JCE" / "JCEConfig.cmake").exists():
         die(f"no valid SDK at {sdk} (missing lib/cmake/JCE/JCEConfig.cmake). "
             f"Run `jce.py sdk` first, pass --sdk DIR, or set JCE_SDK_DIR.")
+    require_sdk_variant(sdk, getattr(args, "variant", "release"), t)
     return sdk
+
+
+def sdk_variant_of(sdk: Path) -> str | None:
+    """The `variant:` line the SDK stamped into its own VERSION.txt, or None if
+    the tree predates that stamp / is unreadable."""
+    vf = sdk / "VERSION.txt"
+    if not vf.exists():
+        return None
+    for line in vf.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("variant:"):
+            return line.split(":", 1)[1].strip() or None
+    return None
+
+
+def require_sdk_variant(sdk: Path, variant: str, t: dict) -> None:
+    """Refuse to build a dist artifact against a release SDK.
+
+    `app` / `package game` do NOT build the engine — they configure the project
+    against a prebuilt SDK, so the patented-codec #ifdefs were already resolved
+    when that SDK was built.  -DJCE_BUILD_VARIANT=dist cannot subtract codecs
+    from a fat lib that already contains them, and JCEConfig.cmake links that
+    lib with /WHOLEARCHIVE, so every fdk-aac / OpenH264 / libhevc object comes
+    along.  The engine tree's two FATAL_ERROR asserts never run on this path —
+    add_subdirectory(engine) is never reached.
+
+    resolve_sdk() only picked the variant-correct tree in its fallback branch;
+    an explicit --sdk or JCE_SDK_DIR was taken verbatim.  So `--variant dist
+    --sdk dist/sdk/win32-x86_64` produced a royalty-bearing bundle whose log
+    line and VERSION.txt both announced "royalty-free".  Stamped variant vs.
+    requested variant is the check that was missing."""
+    want = "dist" if variant == "dist" else "release"
+    got = sdk_variant_of(sdk)
+    if got is None:
+        # Unstamped tree: cannot verify. Loud for dist (the direction with a
+        # licensing consequence), silent for release.
+        if want == "dist":
+            log(f"WARN: {sdk}\\VERSION.txt has no `variant:` line — cannot "
+                f"verify this SDK is royalty-free. Rebuild it with "
+                f"`jce.py sdk --variant dist`.")
+        return
+    if got == want:
+        return
+    if want == "dist":
+        die(f"--variant dist against a '{got}' SDK at {sdk}.\n"
+            f"  A prebuilt SDK already has the patented codecs compiled in or "
+            f"out; the dist variant cannot remove them at consumer-configure "
+            f"time, so this would ship AAC / H.264 / H.265 in a bundle labelled "
+            f"royalty-free.\n"
+            f"  Use the dist SDK instead: {sdk_install_dir(t, 'dist')}\n"
+            f"  (build it with `jce.py sdk --variant dist`).")
+    die(f"--variant {variant} against a '{got}' SDK at {sdk}.\n"
+        f"  Use {sdk_install_dir(t, 'release')}, or build it with "
+        f"`jce.py sdk --variant release`.")
 
 
 def read_manifest(project: Path) -> dict:
@@ -1379,9 +1604,23 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dist", action="store_true",
                         help="shorthand for --variant dist")
 
+    def add_codec_switch(sp):
+        # The release opt-out.  Default None == "don't touch the cache", which
+        # is what makes the preference persistent: passing -D on every
+        # configure is exactly how this switch got silently reverted before
+        # (see codec_overrides()).  dist ignores this — it is forced
+        # royalty-free by the root CMakeLists and asserted there.
+        sp.add_argument("--patented-codecs", choices=["on", "off"], default=None,
+                        dest="patented_codecs",
+                        help="compile the AAC / H.264 / H.265 adapters "
+                             "(default: keep whatever this build dir was last "
+                             "configured with; ON for a fresh dir). Ignored for "
+                             "--variant dist, which is always royalty-free.")
+
     sp = sub.add_parser("sdk", help="build + install the redistributable SDK")
     add_arch(sp)
     add_variant(sp, ["release", "dist", "both"], "both")
+    add_codec_switch(sp)
     sp.add_argument("--no-debug", action="store_true", help="skip the Debug SDK")
     sp.add_argument("--clean", action="store_true")
     sp.add_argument("--smoke", action="store_true",
@@ -1390,6 +1629,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tolerate-missing-tools", action="store_true",
                     help="ship a DEGRADED SDK without cook/pack host tools "
                          "instead of failing (stamped in VERSION.txt)")
+    # The Java backend is the one scripting language an SDK cannot ship
+    # without a JDK on the PRODUCER's machine (jni.h to compile the shim,
+    # javac for com.jce.script).  OFF by default so producing an SDK never
+    # requires one -- but WITHOUT THIS FLAG THERE IS NO SUPPORTED WAY TO
+    # SHIP IT AT ALL, which is how that half stayed unreachable once
+    # already.  What shipped is stamped in the SDK's VERSION.txt.
+    sp.add_argument("--script-java", action="store_true",
+                    help="include the Java scripting backend in the SDK "
+                         "(needs a JDK: JAVA_HOME, jni.h and javac)")
     sp.set_defaults(func=cmd_sdk)
 
     sp = sub.add_parser("smoke",
@@ -1415,6 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("editor", help="build the first-party editor")
     add_arch(sp)
     add_variant(sp, ["release", "debug", "dist", "asan"], "release")
+    add_codec_switch(sp)
     sp.add_argument("--clean", action="store_true")
     sp.set_defaults(func=cmd_editor)
 

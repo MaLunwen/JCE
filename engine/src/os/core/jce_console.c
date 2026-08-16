@@ -27,6 +27,11 @@ struct JceCvar {
     int         i;
     float       f;
     char        s[256];   /* STRING value (also a scratch for formatting) */
+    /* Pinned by JCE_CVAR: later programmatic writes are refused.  Without the
+     * pin an override is not a lever -- whatever subsystem owns the value
+     * writes it back on the next frame and the measurement silently describes
+     * the default. */
+    bool        env_pinned;
 };
 
 typedef struct {
@@ -123,6 +128,67 @@ static JceCvar *cvar_register(const char *name, JceCvarType type,
  * (cvar_register returns the existing one otherwise, leaving its value
  * untouched — the first registration wins). */
 static bool s_just_created;
+
+/* ── JCE_CVAR: set any cvar before anything can overwrite it ──────────
+ *
+ * "name=value" pairs separated by ';' or ',':
+ *
+ *     JCE_CVAR="r.taa=0"
+ *     JCE_CVAR="r.taa=0;r.ssao=0"
+ *
+ * Cvars were previously reachable only from the in-editor console, which means
+ * every feature behind one was untestable from outside the process: an A/B
+ * needed a human to type it. Measuring TAA cost this session an afternoon of
+ * settings-file overrides that were each silently re-applied by a later layer
+ * -- the pipeline asset, the tier preset and the project settings all write the
+ * same values, and the last writer wins.
+ *
+ * So an override here PINS the cvar: applied at registration, before any owner
+ * has run, and refused to every later programmatic write. That is what makes it
+ * a measurement lever rather than an opening bid. It also gives an external
+ * driver (an engine CLI, a test harness) one uniform way to reach any cvar. */
+static bool parse_bool(const char *s, bool *out);   /* defined below */
+
+static void cvar_apply_env_override(JceCvar *cv, const char *name)
+{
+    if (!cv || !name) return;
+    const char *env = getenv("JCE_CVAR");
+    if (!env || !env[0]) return;
+
+    const size_t nlen = strlen(name);
+    const char *p = env;
+    while (*p) {
+        while (*p == ' ' || *p == ';' || *p == ',') p++;
+        const char *entry = p;
+        while (*p && *p != ';' && *p != ',') p++;
+        const char *eq = memchr(entry, '=', (size_t)(p - entry));
+        if (eq && (size_t)(eq - entry) == nlen &&
+            strncmp(entry, name, nlen) == 0) {
+            char val[128];
+            size_t vlen = (size_t)(p - eq - 1);
+            if (vlen >= sizeof val) vlen = sizeof val - 1;
+            memcpy(val, eq + 1, vlen);
+            val[vlen] = 0;
+            /* Not set_from_string: that refuses READONLY, and the whole point
+             * of the pin is to reach a value the running program will not. */
+            switch (cv->type) {
+            case JCE_CVAR_BOOL: {
+                bool b;
+                if (parse_bool(val, &b)) { cv->b = b; cv->env_pinned = true; }
+                break;
+            }
+            case JCE_CVAR_INT:
+                cv->i = (int)strtol(val, NULL, 0); cv->env_pinned = true; break;
+            case JCE_CVAR_FLOAT:
+                cv->f = (float)atof(val); cv->env_pinned = true; break;
+            default:
+                copy_str(cv->s, sizeof cv->s, val); cv->env_pinned = true; break;
+            }
+            return;
+        }
+    }
+}
+
 static JceCvar *cvar_register_tracked(const char *name, JceCvarType type,
                                       uint32_t flags, const char *help)
 {
@@ -133,21 +199,21 @@ static JceCvar *cvar_register_tracked(const char *name, JceCvarType type,
 JceCvar *jce_cvar_register_bool(const char *name, bool def, uint32_t flags, const char *help)
 {
     JceCvar *cv = cvar_register_tracked(name, JCE_CVAR_BOOL, flags, help);
-    if (cv && s_just_created) cv->b = def;
+    if (cv && s_just_created) { cv->b = def; cvar_apply_env_override(cv, name); }
     return cv;
 }
 
 JceCvar *jce_cvar_register_int(const char *name, int def, uint32_t flags, const char *help)
 {
     JceCvar *cv = cvar_register_tracked(name, JCE_CVAR_INT, flags, help);
-    if (cv && s_just_created) cv->i = def;
+    if (cv && s_just_created) { cv->i = def; cvar_apply_env_override(cv, name); }
     return cv;
 }
 
 JceCvar *jce_cvar_register_float(const char *name, float def, uint32_t flags, const char *help)
 {
     JceCvar *cv = cvar_register_tracked(name, JCE_CVAR_FLOAT, flags, help);
-    if (cv && s_just_created) cv->f = def;
+    if (cv && s_just_created) { cv->f = def; cvar_apply_env_override(cv, name); }
     return cv;
 }
 
@@ -204,12 +270,12 @@ const char *jce_cvar_get_string(const JceCvar *cv)
     return (cv && cv->type == JCE_CVAR_STRING) ? cv->s : "";
 }
 
-void jce_cvar_set_bool (JceCvar *cv, bool  v) { if (cv) cv->b = v; }
-void jce_cvar_set_int  (JceCvar *cv, int   v) { if (cv) cv->i = v; }
-void jce_cvar_set_float(JceCvar *cv, float v) { if (cv) cv->f = v; }
+void jce_cvar_set_bool (JceCvar *cv, bool  v) { if (cv && !cv->env_pinned) cv->b = v; }
+void jce_cvar_set_int  (JceCvar *cv, int   v) { if (cv && !cv->env_pinned) cv->i = v; }
+void jce_cvar_set_float(JceCvar *cv, float v) { if (cv && !cv->env_pinned) cv->f = v; }
 void jce_cvar_set_string(JceCvar *cv, const char *v)
 {
-    if (cv) copy_str(cv->s, sizeof cv->s, v ? v : "");
+    if (cv && !cv->env_pinned) copy_str(cv->s, sizeof cv->s, v ? v : "");
 }
 
 static bool parse_bool(const char *s, bool *out)

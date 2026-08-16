@@ -65,6 +65,11 @@ typedef enum {
     JCE_VIEW_ROUGHNESS,
     JCE_VIEW_METALLIC,
     JCE_VIEW_AO,
+    /* Appended to match JceSceneViewModeKind 8/9/10 -- the two enums are
+     * bridged by a plain cast, so their ORDER is the contract. */
+    JCE_VIEW_SCENE_DEPTH,
+    JCE_VIEW_SHADOW_CASCADES,
+    JCE_VIEW_SHADOW_MASK,
 } JceSceneViewMode;
 
 /* ── Play State ────────────────────────────────────────────────────── */
@@ -167,9 +172,10 @@ uint32_t             jce_state_streaming_group_count(void);
 const uint32_t      *jce_state_streaming_chunk_entities(uint32_t chunk_id,
                                                         uint32_t *out_count);
 /* Install the HLOD far-skyline coordination: map each streaming chunk to its
- * always-resident HLOD_<gx>_<gz> proxy (baked by build/gen_hlod.py) and hide
- * the proxy while the chunk is resident / show it when it unloads.  No-op when
- * no proxies were baked.  Call after creating the streamer (preview + Play). */
+ * always-resident HLOD_<gx>_<gz> proxy (baked by tools/worldgen/gen_hlod.py)
+ * and hide the proxy while the chunk is resident / show it when it unloads.
+ * No-op when no proxies were baked.  Call after creating the streamer
+ * (preview + Play). */
 void              jce_state_attach_streamer_hlod(struct JceWorldStreamer *ws);
 /* Re-show all proxies and clear the map; call when the streamer is torn down. */
 void              jce_state_detach_streamer_hlod(void);
@@ -407,12 +413,51 @@ struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
 struct JceRuntime;
 struct JceRuntime *jce_editor_play_get_runtime(void);
 
-/* Top 6: bind the live editor action map into the Play runtime each frame so
+/* Top 6: bind the live action map into the Play runtime each frame so
  * gameplay scripts can read authored actions by name (jce.is_action_down /
  * get_axis) in editor Play, exactly like a shipped game.  No-op when not in
- * Play.  Pass the result of jce_editor_input_actions_live(). */
+ * Play.  jce_editor_main.cpp passes the ENGINE's map (JceServices.actions),
+ * which jce_actions_update() feeds from real hardware every frame -- not
+ * jce_editor_input_actions_live(), whose synthesized frame carries keyboard
+ * state only. */
 struct JceInputActions;
 void jce_editor_play_set_actions(const struct JceInputActions *actions);
+
+/* The engine's own action map (JceServices.actions), or NULL before the
+ * engine has handed the editor its services.
+ *
+ * This is the ONLY action map in the editor that sees a physical gamepad:
+ * jce_engine.c pumps SDL into JceInput and calls jce_actions_update() on this
+ * map every frame, while the Input Manager panel's own map is synthesized
+ * from ImGui keyboard state.  Panels that want pad input read it from here. */
+const struct JceInputActions *jce_editor_engine_actions(void);
+
+/* The engine's live input system (JceServices.input), or NULL before the
+ * engine has handed the editor its services -- and on a boot that creates no
+ * input at all, where jce_engine.c leaves e->input NULL (headless, dedicated
+ * server).  Sibling of jce_editor_engine_actions() above and gated exactly the
+ * same way.
+ *
+ * IT IS NOT GATED ON PLAY, and reading it as if it were is the mistake this
+ * paragraph exists to stop.  Neither accessor is: `svc` is stamped in
+ * editor_app_init(), so both answer from editor startup onward and keep
+ * answering in EDIT mode.  jce_panel_game_view.cpp's
+ * `play_active ? jce_editor_engine_actions() : nullptr` is a decision AT THAT
+ * CALL SITE about whose input drives a running game -- not a property of the
+ * accessor, and not one to copy here.  The Input Manager's device strip is
+ * used while AUTHORING, and a Play gate on it would print "no devices
+ * connected" at a pad that is plugged in -- which is the exact complaint Plan D
+ * exists to answer.
+ *
+ * NOT const, unlike the actions accessor, and the asymmetry is deliberate:
+ * every device QUERY takes a `const JceInput *` and would be happy with one,
+ * but the strip's Test Rumble button drives an EFFECTOR
+ * (jce_input_device_rumble), which takes a mutable handle.  A const return
+ * plus a const_cast at the one call site that buzzes a motor would be a
+ * signature that says "pure read" about a function whose whole purpose is a
+ * side effect on hardware. */
+struct JceInput;
+struct JceInput *jce_editor_engine_input(void);
 
 /* Live count of active contact pairs during Play (BEGIN++/END--).  0 when
  * not running.  Surfaced by the Physics Debugger. */

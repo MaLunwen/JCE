@@ -16,6 +16,12 @@ extern "C" {
 #include <jce/os/platform/jce_gamepad.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_actions.h>
+#include <jce/os/platform/jce_input_device.h>
+#include <jce/os/platform/jce_input_event.h>
+/* Six JCE_API functions that no umbrella reached from 393d46eb until now: a
+ * client including <jce/api_input.h> could not see the .jirc record/replay API
+ * at all, though the header ships in the SDK include tree. */
+#include <jce/os/platform/jce_input_record.h>
 #include <jce/os/platform/jce_keys.h>
 
 

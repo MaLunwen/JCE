@@ -33,16 +33,19 @@ typedef struct JceScene         JceScene;
 typedef struct JceSceneRenderer JceSceneRenderer;
 typedef struct JceRenderer      JceRenderer;
 typedef struct JcePakArchive    JcePakArchive;
+typedef struct JceAudio         JceAudio;
 
 typedef struct CkSceneDirector CkSceneDirector;
 
 /* Create with the engine subsystems the director will need to load
-   scenes and drive the renderer.  Both must outlive the director.
+   scenes and drive the renderer/runtime.  Renderer and PAK must outlive
+   the director; audio is optional and must outlive it when supplied.
    On success, the director also loads the storyline quest graph from
    `quests/main_storyline.json`; if that file is missing transitions
    simply won't fire (the rest of the director still works). */
 CkSceneDirector *ck_scene_director_create(JceRenderer *renderer,
-                                          JcePakArchive *pak);
+                                          JcePakArchive *pak,
+                                          JceAudio *audio);
 
 void ck_scene_director_destroy(CkSceneDirector *dir);
 

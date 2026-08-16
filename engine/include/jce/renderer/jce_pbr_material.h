@@ -92,6 +92,14 @@ JCE_API JcePbrMaterial jce_pbr_material_default(void);
 JCE_API void jce_pbr_material_bind(const JcePbrMaterial *mat,
                                     const JceRenderer *r, uint16_t view_id);
 
+/* Bind one PBR draw while replacing selected texture slots exactly once.
+ * A JCE_TEXTURE_INVALID override keeps the material texture/fallback.
+ * Terrain and texture-array batching use this because their shaders reuse
+ * s_albedo/s_emissive with draw-specific resources. */
+JCE_API void jce_pbr_material_bind_texture_overrides(
+    const JcePbrMaterial *mat, const JceRenderer *r, uint16_t view_id,
+    JceTexture albedo_override, JceTexture emissive_override);
+
 /* Build the bgfx render state (write masks, depth test, cull, blend) for
  * this material.  Honours alpha_mode (BLEND → src-alpha / inv-src-alpha
  * blend with depth-write disabled) and double_sided (no back-face cull).
@@ -118,6 +126,20 @@ JCE_API uint16_t jce_pbr_material_effective_program(const JcePbrMaterial *mat,
  * 3=wireframe+textured). Affects all subsequent jce_pbr_material_bind
  * calls. The scene renderer pushes this once per frame from its config. */
 JCE_API void jce_pbr_material_set_view_mode(int mode);
+
+/* Bind ONLY the view-mode component of u_normalScale.
+ *
+ * For shading paths that do not go through jce_pbr_material_bind at all --
+ * grass and foliage each own their whole uniform set -- and therefore never
+ * receive the view mode. The symptom is silent and total: those shaders keep
+ * rendering their normal lit output in every debug view, so the view shows a
+ * partial picture that looks complete. In hidden_cove that was 46% of the
+ * viewport, all of it vegetation, which is most of what a forest scene IS.
+ *
+ * Call once before submitting such a batch. Only .z is meaningful to those
+ * shaders; the other components are zeroed, which is correct for them because
+ * they read no other field. */
+JCE_API void jce_pbr_material_bind_view_mode(void);
 
 /* Release the process-wide cache of graph-generated custom programs created
  * lazily by jce_pbr_material_load_json.  Call once during renderer teardown

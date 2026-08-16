@@ -19,6 +19,7 @@
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
+#include "core/jce_editor_script_backends.h"
 #include "core/jce_editor_project_render_pipeline.h"
 #include "core/jce_editor_project_state.h"
 #include "core/jce_editor_state.h"
@@ -68,6 +69,12 @@ void set_current_project_root(const char *path)
         jce_project_settings_set_root(nullptr);
         jce_assetdb_set_root("");
         jce_editor_project_set_root(nullptr);
+        /* Drop the outgoing project's C++ script modules.  A module is a
+         * shared object THIS process has mapped and whose function pointers
+         * the script VM holds; leaving it loaded past its project would let
+         * the next project's scene resolve a class out of the previous
+         * project's binary. */
+        jce_editor_script_modules_reload(nullptr);
         jce_editor_gl10n_unload();
         jce_pak_key_install_process("");  /* clear the process key */
         JceRenderPipelineDesc pipeline{};
@@ -105,6 +112,14 @@ void set_current_project_root(const char *path)
     jce_project_settings_set_root(root);
     jce_assetdb_set_root(root);
     jce_editor_project_set_root(root);
+
+    /* The project's C++ script modules, from its own jce_project.json.  HERE
+     * and not at editor init: a cpp script is a class in a binary the PROJECT
+     * builds, so there is nothing to load until a project is open.  Before
+     * the scene work below, because Play instantiates Script components inside
+     * jce_runtime_create() and a class published afterwards is a class the
+     * scene has already been refused by. */
+    jce_editor_script_modules_reload(root);
 
     /* Render-pipeline assets are project-owned.  Resolve the new root before
      * touching live renderer state, and use the current hardware-tier preset

@@ -255,7 +255,8 @@ static bool sr_prepass_model_culled(JceSceneRenderer *sr, JceScene *scene,
      * cover this index (defensive cull_idx<0/!ecull, or has_aabb==false for an
      * entity ecull couldn't bound). */
     if (cull_idx >= 0 && sr->ecull && sr->ecull[cull_idx].has_aabb)
-        return !sr_aabb_in_frustum(sr->prepass_cull_planes,
+        return !sr_aabb_in_frustum_fast(sr->prepass_cull_planes,
+                                    sr->prepass_cull_absn,
                                    sr->ecull[cull_idx].wmin,
                                    sr->ecull[cull_idx].wmax);
 
@@ -272,7 +273,8 @@ static bool sr_prepass_model_culled(JceSceneRenderer *sr, JceScene *scene,
     jce_vec3 wmn, wmx;
     sr_transform_aabb(&model, jce_v3(lmn[0], lmn[1], lmn[2]),
                       jce_v3(lmx[0], lmx[1], lmx[2]), &wmn, &wmx);
-    return !sr_aabb_in_frustum(sr->prepass_cull_planes, wmn, wmx);
+    return !sr_aabb_in_frustum_fast(sr->prepass_cull_planes,
+                                    sr->prepass_cull_absn, wmn, wmx);
 }
 
 /* Skinned model velocity submit (mirrors sr_try_submit_skinned_shadow). Writes
@@ -603,6 +605,15 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     JceShaderHandle shadow_sh = jce_renderer_get_program_shadow(sr->renderer);
     if (shadow_sh.idx == UINT16_MAX) return;
 
+    /* From here on every path leaves ssao_depth_tex holding depth that is
+     * correct for THIS frame -- including the static-frame cache below, which
+     * returns without submitting precisely BECAUSE the FBO already holds
+     * byte-identical depth.  Announced here rather than after the submit loop
+     * for that reason: set it later and every cached frame would report "no
+     * depth", so consumers gated on it (water absorption) would blink off on
+     * exactly the frames where nothing moved. */
+    sr->depth_prepass_frame = true;
+
     /* Lazy-load the SSR normal G-buffer program (vs_gbuffer + fs_gbuffer).
      * When absent, fall back to depth-only (SSR then has matte normals). */
     if (!sr->gbuffer_prog_tried) {
@@ -662,6 +673,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
      * bounded so bgfx's Vulkan uniform scratch buffer can't overflow). */
     jce_mat4 pre_vp = jce_m4_multiply(&proj, &view);
     sr_extract_frustum_planes(&pre_vp, sr->prepass_cull_planes);
+    jce_frustum_abs_normals(sr->prepass_cull_planes, sr->prepass_cull_absn);
 
     /* ── Static-frame prepass cache (UE-style retained depth) ──────────
      * The pass output is a pure function of (collect list, transforms,
@@ -782,7 +794,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                 if (sr_try_submit_skinned_velocity(sr, scene, e, v, &vctx)) continue;
                 if (sr_try_submit_model_velocity(sr, scene, e, i, v, &vctx,
                         s_vel_rq, vel_inst_ready, (uint16_t)s_vel_inst_prog.idx)) continue;
-                if (sr_try_submit_terrain_shadow(sr, scene, e, v))          continue;
+                if (sr_try_submit_terrain_shadow(sr, scene, e, v, NULL))          continue;
             }
             /* rank-2: frustum-cull off-screen primitives out of the velocity
              * prepass (the sibling SSAO/SSR-only path below already culls; this
@@ -794,7 +806,8 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
              * so this is exact — and skips both the per-entity build and the
              * velocity raster of geometry the camera can't see. */
             if (sr->ecull[i].has_aabb && sr->ecull[i].world_valid &&
-                !sr_aabb_in_frustum(sr->prepass_cull_planes,
+                !sr_aabb_in_frustum_fast(sr->prepass_cull_planes,
+                                    sr->prepass_cull_absn,
                                     sr->ecull[i].wmin, sr->ecull[i].wmax)) {
                 sr_prev_xform_store(sr, (uint32_t)e, &sr->ecull_world[i]);
                 continue;
@@ -863,11 +876,12 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
             if (sr_try_submit_skinned_shadow(sr, scene, e, i, v)) continue;
         }
         if (sr->ecull[i].has_aabb &&
-            !sr_aabb_in_frustum(sr->prepass_cull_planes,
+            !sr_aabb_in_frustum_fast(sr->prepass_cull_planes,
+                                    sr->prepass_cull_absn,
                                 sr->ecull[i].wmin, sr->ecull[i].wmax)) continue;
         if (!kc_prim) {
             if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, i, v)) continue;
-            if (sr_try_submit_terrain_shadow(sr, scene, e, v)) continue;
+            if (sr_try_submit_terrain_shadow(sr, scene, e, v, NULL)) continue;
         }
         jce_mat4 model;
         JceMesh *mesh = NULL;
@@ -1365,8 +1379,9 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
         SrCullPrepACtx pa = { sr, list, prep };
         JceThreadPool *pa_pool = jce_thread_pool_shared();
         if (pa_pool && list->count >= 4096)
-            jce_thread_pool_parallel_for(pa_pool, (uint32_t)list->count, 0,
-                                         sr_cull_prep_a_range, &pa);
+            jce_thread_pool_parallel_for_named(
+                pa_pool, "scene.bounds-refresh", (uint32_t)list->count, 0,
+                sr_cull_prep_a_range, &pa);
         else
             sr_cull_prep_a_range(0u, (uint32_t)list->count, &pa);
     }
@@ -1423,8 +1438,9 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     SrCullXformCtx xc = { prep, aabbs, visible };
     JceThreadPool *pool = jce_thread_pool_shared();
     if (pool && list->count >= 256)
-        jce_thread_pool_parallel_for(pool, (uint32_t)list->count, 0,
-                                     sr_cull_xform_range, &xc);
+        jce_thread_pool_parallel_for_named(
+            pool, "scene.bounds-transform", (uint32_t)list->count, 0,
+            sr_cull_xform_range, &xc);
     else
         sr_cull_xform_range(0u, (uint32_t)list->count, &xc);
 
@@ -1472,9 +1488,27 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     if (s_cull_verify) {
         ref_vis = (bool *)JCE_MALLOC((size_t)list->count * sizeof(bool));
         if (ref_vis) {
+            /* The oracle needs the SAT-complemented test, not the plain
+             * positive-vertex one.
+             *
+             * The grid subdivides an object across its cells and rejects each
+             * cell separately, so for a long thin box it resolves the frustum
+             * corner FINER than a single whole-box plane test can.  With a
+             * plain-plane oracle every such box read as a cull miss: street_demo
+             * at 200k reported 2368 of them, all 24 x 1200 x 24 slivers.  A
+             * census of one settled it -- all 204 of its cells were occupied,
+             * listed it, and were rejected by these same planes.  A conservative
+             * reject PROVES exclusion, so 204 of them covering the whole box
+             * prove the box is outside; the whole-box test was what lied.
+             *
+             * An oracle looser than the thing it checks reports the grid's extra
+             * precision as a defect. */
+            jce_vec3 fc[8];
+            const jce_vec3 *fcp = jce_frustum_corners(planes, fc) ? fc : NULL;
             for (int i = 0; i < list->count; i++) {
                 if (prep[i].mode == 0) { ref_vis[i] = true; continue; } /* always kept */
-                ref_vis[i] = sr_aabb_in_frustum(planes, aabbs[i].min, aabbs[i].max);
+                ref_vis[i] = jce_aabb_in_frustum_exact(planes, fcp,
+                                                       aabbs[i].min, aabbs[i].max);
             }
         }
     }
@@ -1692,6 +1726,21 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     sr->cull_frame_valid   = true;
 
 cull_query:
+    /* Coarse attribution for this tail, behind JCE_DBG_CULLPROF=1.
+     *
+     * Deliberately ONCE PER FRAME, not per entity. The per-entity rdtsc probes
+     * in the submit loop cost 2.6x the work they measure (sr_loop 2.12 -> 7.55
+     * ms at the 200k bench), which makes their percentages upper bounds and
+     * their remainder mostly instrument. Four brackets per frame cost ~70
+     * cycles total against a 1.8 ms phase, so these numbers are real. */
+    static int s_cullprof = -1;
+    if (s_cullprof < 0) {
+        const char *cp = getenv("JCE_DBG_CULLPROF");
+        s_cullprof = (cp && cp[0] && cp[0] != '0') ? 1 : 0;
+    }
+    uint64_t cp_t0 = s_cullprof ? jce_time_perf_counter() : 0u;
+    double cp_query = 0.0, cp_scatter = 0.0, cp_count = 0.0;
+
     /* Frustum query: heap hit buffer, grown to cover the worst case (every
      * entity visible).  Was a 128 KB stack array. */
     if (sr->cull_hit_cap < (uint32_t)list->count) {
@@ -1706,12 +1755,23 @@ cull_query:
         return (uint32_t)list->count;
     }
 
+    if (s_cullprof) cp_t0 = jce_time_perf_counter();
     const uint32_t hits = jce_space_query_frustum(sr->cull_space, planes,
                                                    sr->cull_hit_buf,
                                                    sr->cull_hit_cap);
+    if (s_cullprof) {
+        const uint64_t t = jce_time_perf_counter();
+        cp_query = jce_time_perf_to_ms(cp_t0, t);
+        cp_t0 = t;
+    }
     for (uint32_t k = 0; k < hits; k++) {
         if (sr->cull_hit_buf[k] < (uint32_t)list->count)
             visible[sr->cull_hit_buf[k]] = true;
+    }
+    if (s_cullprof) {
+        const uint64_t t = jce_time_perf_counter();
+        cp_scatter = jce_time_perf_to_ms(cp_t0, t);
+        cp_t0 = t;
     }
 
     /* Visible count: hits from the grid + the always-kept transform-less set
@@ -1722,6 +1782,30 @@ cull_query:
      * gridded). */
     uint32_t vis = 0;
     for (int i = 0; i < list->count; i++) if (visible[i]) vis++;
+
+    if (s_cullprof) {
+        cp_count = jce_time_perf_to_ms(cp_t0, jce_time_perf_counter());
+        static uint32_t s_cpn = 0;
+        /* Accumulate over the report window: a single frame's sample swings
+         * 2.9-3.9 ms on a 1.85 ms phase, which reads as a finding and is not. */
+        static double   s_qsum = 0.0, s_ssum = 0.0, s_csum = 0.0;
+        s_qsum += cp_query; s_ssum += cp_scatter; s_csum += cp_count;
+        if ((++s_cpn % 120u) == 0u) {
+            uint32_t cw = 0, ca = 0, ov = 0, ot = 0;
+            jce_space_last_query_stats(sr->cull_space, &cw, &ca, &ov, &ot);
+            uint32_t res3[3] = {0,0,0};
+            jce_space_resolution(sr->cull_space, res3);
+            LOG_INFO(LOG_TAG,
+                "cullprof: %d ent, %u vis | avg/frame query=%.3f scatter=%.3f "
+                "count=%.3f ms | grid %ux%ux%u: cells %u walked -> %u accepted "
+                "(%.1f%%), objs %u listed / %u tested | fast_ok=%d mode0=%u",
+                list->count, vis, s_qsum / 120.0, s_ssum / 120.0, s_csum / 120.0,
+                res3[0], res3[1], res3[2], cw, ca,
+                cw ? 100.0 * (double)ca / (double)cw : 0.0, ov, ot,
+                (int)fast_ok, sr->cull_mode0_count);
+            s_qsum = s_ssum = s_csum = 0.0;
+        }
+    }
 
     if (s_cull_kpi) {
         static uint32_t s_kc = 0;
@@ -1736,15 +1820,22 @@ cull_query:
                      jce_space_object_count(sr->cull_space));
     }
 
-    /* Self-check: the persistent-grid visible set must EXACTLY equal the
-     * brute-force frustum truth.  Logs (loudly) the first few divergences. */
+    /* Self-check.  The contract a broad-phase owes its caller is ONE-SIDED:
+     * never drop something the frustum can see.  Emitting a few extras is what
+     * "conservative" means and costs at most a wasted draw.
+     *
+     * This asserted exact equality against a whole-box plane test, which is the
+     * wrong shape -- see the oracle above.  A miss (tight oracle says visible,
+     * grid says no) is an error; an extra is the safe direction, counted, and
+     * loud only if it stops being a rounding-edge handful. */
     if (ref_vis) {
-        uint32_t mism = 0;
+        uint32_t mism = 0, extra = 0;
         for (int i = 0; i < list->count; i++) {
-            if (visible[i] != ref_vis[i]) {
+            if (visible[i] && !ref_vis[i]) { extra++; continue; }
+            if (!visible[i] && ref_vis[i]) {
                 if (mism < 8)
                     LOG_ERROR(LOG_TAG,
-                        "CULL_VERIFY mismatch entity[%d] id=%u grid=%d truth=%d "
+                        "CULL_VERIFY MISS entity[%d] id=%u grid=%d truth=%d "
                         "(aabb [%.2f,%.2f,%.2f]..[%.2f,%.2f,%.2f])",
                         i, (uint32_t)list->entities[i], (int)visible[i],
                         (int)ref_vis[i], aabbs[i].min.x, aabbs[i].min.y,
@@ -1753,12 +1844,20 @@ cull_query:
                 mism++;
             }
         }
-        if (mism == 0)
-            LOG_INFO(LOG_TAG, "CULL_VERIFY ok: %d entities, %u visible (grid==truth)",
-                     list->count, vis);
+        /* An extra costs one culled-anyway draw; the budget keeps a grid that
+         * gave up and emitted everything from reading as "clean". */
+        const uint32_t extra_budget = (vis / 20u) + 8u;   /* 5% + slack */
+        if (mism == 0 && extra <= extra_budget)
+            LOG_INFO(LOG_TAG, "CULL_VERIFY ok: %d entities, %u visible "
+                     "(no misses; %u conservative extras)",
+                     list->count, vis, extra);
+        else if (mism)
+            LOG_ERROR(LOG_TAG, "CULL_VERIFY FAILED: %u/%d entities MISSING from "
+                      "the grid (+%u extras)", mism, list->count, extra);
         else
-            LOG_ERROR(LOG_TAG, "CULL_VERIFY FAILED: %u/%d entities diverged",
-                      mism, list->count);
+            LOG_ERROR(LOG_TAG, "CULL_VERIFY FAILED: %u conservative extras "
+                      "exceeds the %u budget for %u visible",
+                      extra, extra_budget, vis);
         JCE_FREE(ref_vis);
     }
     return vis;

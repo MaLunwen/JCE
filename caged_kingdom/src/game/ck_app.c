@@ -31,8 +31,6 @@
 struct CkApp {
     JceServices   svc;            /* owned copy of subsystem pointers */
     JceSound      snd_bounce;
-    JceSound      snd_music;
-    JceVoice      music_voice;
 
     JceTexture    tex_demo;
     JceFont      *font_main;
@@ -53,6 +51,9 @@ struct CkApp {
     CkSceneDirector    *director;
     JceScene           *scene;
     JceSceneRenderer   *scene_renderer;
+    JceOffscreenTarget *post_target;
+    JceScene           *camera_binding_scene;
+    JceSceneCameraResolveResult camera_binding_result;
 
     /* Asset handles for manager-loaded resources. */
     JceAssetHandle h_tex_demo;
@@ -104,9 +105,8 @@ static void on_ck_settings_applied(JceSettingsPanel *panel, void *ud)
     CkApp *app = (CkApp *)ud;
     JceSettingsVolumes v = jce_settings_get_volumes(panel);
 
-    /* Apply music volume to the active music voice. */
-    if (app->svc.audio && app->music_voice != JCE_VOICE_INVALID)
-        jce_audio_set_volume(app->svc.audio, app->music_voice, v.music);
+    if (app->svc.audio)
+        jce_audio_set_master_volume(app->svc.audio, v.master);
 }
 
 static void on_ck_settings_close_game(JceSettingsPanel *panel, void *ud)
@@ -216,13 +216,6 @@ CkApp *ck_app_create(const JceServices *svc)
     if (app->svc.audio) {
         app->snd_bounce = jce_audio_load(app->svc.audio, app->svc.pak,
                              "sounds/bounce.wav");
-        app->snd_music = jce_audio_load(app->svc.audio, app->svc.pak,
-                             "sounds/Aria Math - C418.ogg");
-        if (app->snd_music != JCE_SOUND_INVALID) {
-            float vol = app->svc.config ? app->svc.config->music_volume : 0.8f;
-            app->music_voice = jce_audio_play(app->svc.audio, app->snd_music,
-                                              true, vol, 1.0f);
-        }
     }
 
     LOG_INFO("ck_app", "[init] step 2: textures");
@@ -273,15 +266,33 @@ CkApp *ck_app_create(const JceServices *svc)
     /* Create scene + scene renderer via the director, which owns both
        and provides the runtime swap path used by level transitions
        (see caged_kingdom/SCENES_DESIGN.md appendix A). */
-    app->director = ck_scene_director_create(app->svc.renderer, app->svc.pak);
+    app->director = ck_scene_director_create(app->svc.renderer, app->svc.pak,
+                                             app->svc.audio);
     if (!app->director) {
         LOG_ERROR("ck_app", "ck_scene_director_create failed");
     } else {
-        /* Preferred path: storyline graph picks the start scene.
-           Fallback: legacy editor smoke scene, then the historical
-           main.scene.json — keeps headless smoke tests green even when
-           the storyline data isn't cooked into the PAK. */
-        bool loaded = ck_scene_director_load_start(app->director);
+        /* Launch contract precedence matches the generic runtime shell:
+         * explicit debugger/editor/CI override, shipping PAK metadata, then
+         * the legacy storyline graph.  The app remains project-specific;
+         * path parsing and PAK boot metadata stay generic engine APIs. */
+        JceRuntimeBootManifest boot = {0};
+        char startup_scene[JCE_RUNTIME_BOOT_SCENE_PATH_MAX] = {0};
+        bool loaded = false;
+
+        if (jce_args_get_startup_scene(startup_scene,
+                                       sizeof(startup_scene))) {
+            LOG_INFO("ck_app", "startup scene override: %s", startup_scene);
+            loaded = ck_scene_director_load_initial(app->director,
+                                                     startup_scene);
+        } else if (jce_runtime_boot_manifest_load_pak(app->svc.pak, &boot) &&
+                   boot.startup_scene[0]) {
+            LOG_INFO("ck_app", "startup scene from runtime boot: %s",
+                     boot.startup_scene);
+            loaded = ck_scene_director_load_initial(app->director,
+                                                     boot.startup_scene);
+        }
+        if (!loaded)
+            loaded = ck_scene_director_load_start(app->director);
         if (!loaded) {
             const char *candidates[] = {
                 "scenes/act1_m01_wake.scene.json",
@@ -303,6 +314,16 @@ CkApp *ck_app_create(const JceServices *svc)
     }
     app->scene          = ck_scene_director_scene(app->director);
     app->scene_renderer = ck_scene_director_renderer(app->director);
+
+    if (app->scene_renderer) {
+        char shader_dir[1024];
+
+        if (jce_args_get_shader_dev_dir(shader_dir, sizeof(shader_dir))) {
+            jce_scene_renderer_set_project_shader_dir(app->scene_renderer,
+                                                       shader_dir);
+            LOG_INFO("ck_app", "project shader overlay: %s", shader_dir);
+        }
+    }
 
     LOG_INFO("ck_app", "[init] step 8: scene_renderer=%s",
              app->scene_renderer ? "ok" : "NULL");
@@ -379,6 +400,10 @@ CkApp *ck_app_create(const JceServices *svc)
 void ck_app_destroy(CkApp *app)
 {
     if (!app) return;
+    if (app->post_target) {
+        jce_offscreen_target_destroy(app->post_target);
+        app->post_target = NULL;
+    }
 
     /* Close settings first to prevent event callbacks during UI teardown. */
     jce_settings_close(app->engine_settings);
@@ -763,22 +788,140 @@ static void update_3d_scene(CkApp *app, float dt_ms)
         app->scene          = ck_scene_director_scene(app->director);
         app->scene_renderer = ck_scene_director_renderer(app->director);
     }
+
+    /* A scene-authored primary Camera is the runtime view authority.  Apply it
+       after script/simulation updates so editor Play and the shipped app see
+       the same pose.  Scenes without one retain the free-fly camera above. */
+    if (app->scene) {
+        JceSceneCameraResolveResult result =
+            jce_scene_camera_apply_primary(app->scene, app->camera, NULL);
+        if (app->camera_binding_scene != app->scene ||
+            app->camera_binding_result != result) {
+            if (result == JCE_SCENE_CAMERA_RESOLVE_OK) {
+                LOG_INFO("ck_app", "bound runtime view to scene primary camera");
+            } else if (result == JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS ||
+                       result == JCE_SCENE_CAMERA_RESOLVE_INVALID_POSE) {
+                LOG_ERROR("ck_app", "scene primary camera rejected (status=%d)",
+                          (int)result);
+            }
+            app->camera_binding_scene = app->scene;
+            app->camera_binding_result = result;
+        }
+    }
+
+    /* Match editor Game View and the stock runtime: a scene-authored active
+       VirtualCamera overrides free-fly input after simulation for this frame.
+       With no active VCam the camera controller above remains authoritative. */
+    if (app->scene) {
+        JceVcamOutput output;
+        bool has_vcam = false;
+        jce_vcam_system_evaluate(app->scene, dt_sec, &output, &has_vcam);
+        if (has_vcam) {
+            jce_camera_set_position(app->camera,
+                jce_v3(output.position[0], output.position[1], output.position[2]));
+            jce_camera_look_at(app->camera,
+                jce_v3(output.target[0], output.target[1], output.target[2]));
+            jce_camera_set_fov(app->camera, output.fov_deg);
+        }
+    }
 }
 
 static void draw_3d_scene(CkApp *app, float dt_sec)
 {
-    LOG_TRACE("ck_draw", "begin_frame_3d");
-    jce_renderer_begin_frame_3d(app->svc.renderer,
-        app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
-
-    LOG_TRACE("ck_draw", "scene_renderer_render");
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     /* Tier-gate expensive features for the 512MB / no-GPU baseline: skip the
        multi-cascade shadow passes on LOW-tier (old integrated) GPUs.  LOW-tier
        postfx is tonemap-only (single pass, cheap) so it stays enabled. */
     cfg.draw_shadows = (jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM);
-    jce_scene_renderer_render(
-        app->scene_renderer, app->scene, app->camera,
+    JcePostFXPipeline *postfx =
+        jce_scene_renderer_get_postfx(app->scene_renderer);
+    bool has_fullscreen =
+        jce_scene_renderer_has_fullscreen_effect(app->scene);
+    bool has_postfx = false;
+    uint32_t width = 0, height = 0;
+
+    if (postfx) {
+        for (int i = 0; i < JCE_POSTFX_COUNT; ++i) {
+            if (jce_postfx_is_enabled(postfx, (JcePostFXType)i)) {
+                has_postfx = true;
+                break;
+            }
+        }
+    }
+    if (app->svc.window)
+        jce_window_get_size(app->svc.window, &width, &height);
+
+    if ((has_fullscreen || has_postfx) && postfx && width && height) {
+        if (!app->post_target) {
+            app->post_target = jce_offscreen_target_create(
+                app->svc.renderer, JCE_VIEW_RUNTIME_GAME);
+            jce_postfx_set_view_base(postfx, 100);
+        }
+        if (app->post_target) {
+            const float aspect = (float)width / (float)height;
+            jce_mat4 view = jce_camera_view(app->camera);
+            jce_mat4 proj = jce_camera_proj(app->camera, aspect,
+                                            jce_gfx_caps().homogeneous_depth);
+            if (jce_offscreen_target_prepare(app->post_target, width, height,
+                    view.raw[0], proj.raw[0], 0x000000ffu,
+                    "CagedKingdomScene")) {
+                const uint16_t base = jce_offscreen_target_get_view_id(
+                    app->post_target);
+                cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(
+                    app->post_target);
+                cfg.viewport_width = width;
+                cfg.viewport_height = height;
+                cfg.scene_depth_tex_handle =
+                    jce_offscreen_target_get_depth_texture(app->post_target);
+                cfg.ssr_color_tex_handle =
+                    jce_offscreen_target_get_color_texture(app->post_target);
+                cfg.gi_color_tex_handle = cfg.ssr_color_tex_handle;
+                cfg.fog_enabled = jce_scene_fog_params_from_scene(
+                    app->scene, &cfg.fog);
+                if (cfg.fog_enabled) {
+                    cfg.fog_rt_width = (int)width;
+                    cfg.fog_rt_height = (int)height;
+                }
+
+                jce_scene_renderer_render(app->scene_renderer, app->scene,
+                    app->camera, base, dt_sec, &cfg);
+                if (cfg.fog_enabled)
+                    jce_scene_renderer_composite_fog(app->scene_renderer,
+                        (uint16_t)(base + 16), cfg.scene_frame_buffer);
+                jce_scene_renderer_composite_ssr(app->scene_renderer,
+                    (uint16_t)(base + 19), cfg.scene_frame_buffer);
+
+                JceTextureHandle color = {
+                    jce_offscreen_target_get_color_texture(app->post_target) };
+                JceTextureHandle depth = {
+                    jce_offscreen_target_get_depth_texture(app->post_target) };
+                if (has_fullscreen && jce_gfx_texture_valid(color)) {
+                    color = jce_scene_renderer_apply_fullscreen_effects(
+                        app->scene_renderer, app->scene, app->camera,
+                        color, depth, width, height, 50, 0,
+                        JCE_FULLSCREEN_EFFECT_HDR_BEFORE_POSTFX, dt_sec);
+                }
+                if (jce_gfx_texture_valid(color)) {
+                    jce_postfx_resize(postfx, width, height);
+                    jce_postfx_apply(postfx, color, depth);
+                    if (jce_gfx_texture_valid(jce_postfx_get_output(postfx))) {
+                        jce_postfx_present(postfx, width, height);
+                        LOG_TRACE("ck_draw", "offscreen scene presented");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    cfg = jce_scene_render_config_default();
+    cfg.draw_shadows = (jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM);
+    cfg.viewport_width = width;
+    cfg.viewport_height = height;
+    LOG_TRACE("ck_draw", "begin_frame_3d");
+    jce_renderer_begin_frame_3d(app->svc.renderer,
+        app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
+    jce_scene_renderer_render(app->scene_renderer, app->scene, app->camera,
         JCE_VIEW_MAIN_3D, dt_sec, &cfg);
     LOG_TRACE("ck_draw", "scene_renderer_render done");
 }

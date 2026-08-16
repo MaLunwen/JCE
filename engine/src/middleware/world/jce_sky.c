@@ -211,3 +211,112 @@ void jce_sky_radiance(const JceSkyState *st, const float view_dir[3],
     out_rgb[1] = (g > 0.0f) ? g : 0.0f;
     out_rgb[2] = (b > 0.0f) ? b : 0.0f;
 }
+
+/* ── Sky-derived ambient (spherical harmonics) ─────────────────────── */
+
+/* Real SH basis, bands 0..2, in the canonical order used by
+ * jce_sky_project_sh9 / jce_sky_irradiance_sh9.  Index 2 is the "up" (+Y)
+ * linear term, which is why an all-sky signal has a strong positive value
+ * there and a downward normal receives much less. */
+static void sky_sh9_basis(const float d[3], float y[9])
+{
+    const float x = d[0], u = d[1], z = d[2];
+    y[0] = 0.282095f;                       /* l=0            */
+    y[1] = 0.488603f * x;                   /* l=1, m=-1 (x)  */
+    y[2] = 0.488603f * u;                   /* l=1, m= 0 (up) */
+    y[3] = 0.488603f * z;                   /* l=1, m=+1 (z)  */
+    y[4] = 1.092548f * x * u;               /* l=2            */
+    y[5] = 1.092548f * u * z;
+    y[6] = 0.315392f * (3.0f * u * u - 1.0f);
+    y[7] = 1.092548f * x * z;
+    y[8] = 0.546274f * (x * x - z * z);
+}
+
+void jce_sky_project_sh9(const JceSkyState *st, float out_sh9[9][3])
+{
+    if (!out_sh9) return;
+    for (int i = 0; i < 9; i++)
+        out_sh9[i][0] = out_sh9[i][1] = out_sh9[i][2] = 0.0f;
+    if (!st) return;
+
+    /* Fibonacci sphere: even coverage with no pole clustering and no RNG, so
+     * the projection is deterministic by construction rather than by seeding.
+     * Only the upper hemisphere carries sky radiance (see the header). */
+    enum { SAMPLES = 512 };
+    const float golden = 3.14159265358979f * (3.0f - 1.7320508f); /* pi*(3-sqrt5) */
+
+    int used = 0;
+    for (int i = 0; i < SAMPLES; i++) {
+        /* u goes +1 -> -1 over the sphere; keep the upper half. */
+        const float u = 1.0f - (2.0f * (float)i + 1.0f) / (float)SAMPLES;
+        if (u <= 0.0f) continue;
+
+        const float r = sqrtf(1.0f - u * u);
+        const float a = golden * (float)i;
+        const float d[3] = { cosf(a) * r, u, sinf(a) * r };
+
+        float rad[3];
+        jce_sky_radiance(st, d, rad);
+
+        float basis[9];
+        sky_sh9_basis(d, basis);
+        for (int k = 0; k < 9; k++) {
+            out_sh9[k][0] += rad[0] * basis[k];
+            out_sh9[k][1] += rad[1] * basis[k];
+            out_sh9[k][2] += rad[2] * basis[k];
+        }
+        used++;
+    }
+    if (used == 0) return;
+
+    /* Monte-Carlo weight for a uniformly sampled hemisphere. */
+    const float w = 6.28318530717959f / (float)used;   /* 2*pi / N */
+
+    /* Per-band cosine-convolution constants (Ramamoorthi & Hanrahan), then
+     * divide by pi so the result is the radiance a white Lambertian surface
+     * emits rather than raw irradiance. */
+    const float inv_pi = 1.0f / 3.14159265358979f;
+    const float conv[9] = {
+        3.14159265f * inv_pi,                                  /* l=0: pi   */
+        2.09439510f * inv_pi, 2.09439510f * inv_pi,
+        2.09439510f * inv_pi,                                  /* l=1: 2pi/3*/
+        0.78539816f * inv_pi, 0.78539816f * inv_pi,
+        0.78539816f * inv_pi, 0.78539816f * inv_pi,
+        0.78539816f * inv_pi,                                  /* l=2: pi/4 */
+    };
+
+    for (int k = 0; k < 9; k++) {
+        const float s = w * conv[k];
+        out_sh9[k][0] *= s;
+        out_sh9[k][1] *= s;
+        out_sh9[k][2] *= s;
+    }
+}
+
+void jce_sky_irradiance_sh9(const float sh9[9][3], const float n[3],
+                            float out_rgb[3])
+{
+    if (!out_rgb) return;
+    out_rgb[0] = out_rgb[1] = out_rgb[2] = 0.0f;
+    if (!sh9 || !n) return;
+
+    float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len < 1e-8f) len = 1.0f;
+    const float d[3] = { n[0] / len, n[1] / len, n[2] / len };
+
+    float basis[9];
+    sky_sh9_basis(d, basis);
+
+    float acc[3] = { 0.0f, 0.0f, 0.0f };
+    for (int k = 0; k < 9; k++) {
+        acc[0] += sh9[k][0] * basis[k];
+        acc[1] += sh9[k][1] * basis[k];
+        acc[2] += sh9[k][2] * basis[k];
+    }
+
+    /* An L2 fit can ring slightly negative near a sharp horizon.  Negative
+     * light is never correct, so clamp rather than propagate it. */
+    out_rgb[0] = acc[0] > 0.0f ? acc[0] : 0.0f;
+    out_rgb[1] = acc[1] > 0.0f ? acc[1] : 0.0f;
+    out_rgb[2] = acc[2] > 0.0f ? acc[2] : 0.0f;
+}

@@ -38,7 +38,6 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/os/core/jce_thread.h>           /* async chunk-load thread pool */
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_window.h>
@@ -197,11 +196,6 @@ static JceWorldStreamer *s_world_streamer = NULL;
  * developer overrides. It mounts the embedded PAK plus an optional cooked
  * directory, with the VFS's documented loose-over-PAK precedence. */
 static JceFileSystem    *s_runtime_fs     = NULL;
-/* Background worker pool for async chunk loads (disk read + JSON-byte staging
- * off-thread; scene apply/spawn stays on the main thread).  Owned here for the
- * app lifetime; destroyed at shutdown AFTER the streamer (whose destroy joins
- * all in-flight chunk tasks first) so no worker dereferences a freed fs/scene. */
-static JceThreadPool    *s_stream_pool    = NULL;
 
 /* Runtime mesh cache (path → JceMesh*).
  *
@@ -530,24 +524,19 @@ static void jce_default_init_world_streaming(const JceProject *proj)
     wsc.budget_mb       = st->budget_mb;
     wsc.frame_budget_ms = st->frame_budget_ms;
 
-    /* Chunk disk-read + JSON-byte staging run on a small worker pool; the
-     * scene apply (entity + GPU-resource spawn) stays time-sliced on the
-     * main/render thread inside jce_world_streamer_update.  This removes the
-     * per-cell synchronous-read frame hitch.  Web has no real threads, so keep
-     * the cooperative single-thread path there. */
-    JceThreadPool *pool = NULL;
+    /* Streaming owns its bounded structured executor. Scene apply remains
+     * time-sliced on the main thread; Web advances loads cooperatively. */
 #if !JCE_PLATFORM_WEB
-    pool = jce_thread_pool_create(3);
+    wsc.single_thread = false;
+#else
+    wsc.single_thread = true;
 #endif
-    wsc.single_thread   = (pool == NULL);  /* async iff we have a pool */
 
-    s_world_streamer = jce_world_streamer_create(&wsc, s_scene, fs, pool);
+    s_world_streamer = jce_world_streamer_create(&wsc, s_scene, fs, NULL);
     if (!s_world_streamer) {
         LOG_WARN("app", "%s", "world streamer creation failed — streaming disabled");
-        if (pool) jce_thread_pool_destroy(pool);
         return;
     }
-    s_stream_pool = pool;
     jce_world_streamer_register_from_scene_settings(s_world_streamer, st);
     /* Wire streamed-cell entities into the live runtime gameplay (streaming M3):
      * a script / trigger / NPC authored in a streamed chunk comes alive (on_start
@@ -892,7 +881,15 @@ static bool app_init(const JceServices *svc, void *ud)
      * JCE_DISABLE_WCACHE).  Uses the default proxy view (254); the runtime has a
      * single scene-render path per frame so no second culler shares the view. */
     if (svc && svc->renderer) {
-        const char *dis = getenv("JCE_DISABLE_OCCLUSION");
+        /* OPT-IN now (JCE_ENABLE_OCCLUSION=1), matching the editor viewports --
+         * see jce_editor_viewport_common.h for the measurements. The comment
+         * below already conceded that this is a net loss on small scenes; the
+         * numbers say it is also a net loss on large ones, because the query
+         * budget (256 at runtime) decides nothing about 99%+ of a big scene
+         * while every tracked entity still pays a proxy draw and a table scan.
+         * Turning it off draws strictly MORE, so nothing can go missing. */
+        const char *en = getenv("JCE_ENABLE_OCCLUSION");
+        const bool dis_off = !(en && en[0] && en[0] != '0');
         /* GPU-query occlusion is a NET LOSS on small scenes: its multi-frame
          * result latency (bgfx keeps several frames in flight) exceeds any
          * hysteresis window, so entities flicker under camera rotation, and a
@@ -900,9 +897,10 @@ static bool app_init(const JceServices *svc, void *ud)
          * threshold; large streamed worlds still get it. */
         uint32_t ent_count = 0;
         if (s_scene) jce_scene_each_entity(s_scene, dm_count_entities_cb, &ent_count);
-        if (dis && dis[0] && dis[0] != '0') {
+        if (dis_off) {
             LOG_INFO("app", "%s",
-                     "JCE_DISABLE_OCCLUSION set — runtime occlusion culling OFF");
+                     "runtime occlusion culling OFF (opt in with "
+                     "JCE_ENABLE_OCCLUSION=1)");
         } else if (ent_count > 0 && ent_count < 512) {
             LOG_INFO("app", "scene has %u entities (<512) — runtime occlusion "
                             "culling OFF (no benefit; avoids query-latency flicker)",
@@ -1520,8 +1518,6 @@ static void app_draw(const JceServices *svc, void *ud)
                                             jce_gfx_caps().homogeneous_depth);
             /* HDR target: force tone mapping so the PBR linear output maps to
              * display range (else washed out).  No-op on the RGBA8 fallback. */
-            if (jce_offscreen_target_is_hdr(s_post_target))
-                jce_postfx_enable(pfx, JCE_POSTFX_TONEMAP, true);
             if (jce_offscreen_target_prepare(s_post_target, rw, rh,
                                              view.raw[0], proj.raw[0],
                                              0x000000FFu, "RuntimeScene")) {
@@ -1537,23 +1533,99 @@ static void app_draw(const JceServices *svc, void *ud)
                     jce_offscreen_target_get_frame_buffer(s_post_target);
                 pcfg.viewport_width  = rw;
                 pcfg.viewport_height = rh;
-                /* GI L1: hand the lit RT to the dynamic probe gather (read
-                 * on the pre-color compute view = last frame's content). */
-                pcfg.gi_color_tex_handle =
+                /* SSR reflects the lit colour RT (gated on the scene's
+                 * ssr_enabled); GI L1's dynamic probe gather samples the
+                 * same RT, read on the pre-color compute view = last
+                 * frame's content.  Both handles must be set: the renderer
+                 * treats UINT16_MAX as "no source" and silently skips the
+                 * pass, which is why a shipped game could not run SSR at
+                 * all while the editor viewport could.  Mirrors
+                 * editor/src/scene/jce_editor_viewport_common.h. */
+                pcfg.ssr_color_tex_handle =
                     jce_offscreen_target_get_color_texture(s_post_target);
+                pcfg.gi_color_tex_handle = pcfg.ssr_color_tex_handle;
+
+                /* Volumetric fog.  Same class of bug SSR had immediately above
+                 * and the same fix: the params were mapped in an EDITOR panel,
+                 * so a shipped game could not produce them, fog_enabled stayed
+                 * false, and the raymarch never executed in a shipped exe at
+                 * all.  The mapping now lives in the engine
+                 * (jce_scene_fog_params_from_scene) and both consumers call it.
+                 *
+                 * fog_rt_* must be non-zero or the renderer skips the pass, and
+                 * the depth handle must be the one matching THIS frame's
+                 * view+proj -- the offscreen target's, not the backbuffer's. */
+                /* This main DOES composite (a few lines below), so the
+                 * analytic aerial fog must stand down or the frame gets both. */
+                pcfg.composites_volumetric_fog = true;
+                pcfg.fog_enabled =
+                    jce_scene_fog_params_from_scene(s_scene, &pcfg.fog);
+                if (pcfg.fog_enabled) {
+                    pcfg.scene_depth_tex_handle =
+                        jce_offscreen_target_get_depth_texture(s_post_target);
+                    pcfg.fog_rt_width  = (int)rw;
+                    pcfg.fog_rt_height = (int)rh;
+                }
+
                 jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                           base, s_last_dt, &pcfg);
+
+                /* Composite the fog into the scene RT.  view_base+16 matches
+                 * the editor's slot and MUST be greater than the fog render
+                 * view (base+15): bgfx executes views in ascending order, so a
+                 * lower id would composite last frame's fog. */
+                if (pcfg.fog_enabled)
+                    jce_scene_renderer_composite_fog(
+                        s_scene_renderer, (uint16_t)(base + 16),
+                        pcfg.scene_frame_buffer);
+                jce_scene_renderer_composite_ssr(
+                    s_scene_renderer, (uint16_t)(base + 19),
+                    pcfg.scene_frame_buffer);
+
+                JceTextureHandle color = {
+                    jce_offscreen_target_get_color_texture(s_post_target) };
+                JceTextureHandle depth = {
+                    jce_offscreen_target_get_depth_texture(s_post_target) };
+                const bool has_fullscreen =
+                    jce_scene_renderer_has_fullscreen_effect(s_scene);
+                if (has_fullscreen && jce_gfx_texture_valid(color)) {
+                    color = jce_scene_renderer_apply_fullscreen_effects(
+                        s_scene_renderer, s_scene, s_camera, color, depth,
+                        rw, rh, 50, 0,
+                        JCE_FULLSCREEN_EFFECT_HDR_BEFORE_POSTFX,
+                        s_last_dt);
+                }
+                /* The "HDR target => force tone mapping" guard used to sit here.  It is
+                 * gone on purpose, and NOT because it was in the wrong place.
+                 *
+                 * 2e5174e3 moved it after jce_scene_renderer_render so the
+                 * renderer's per-frame rewrite of scene_rendering->postfx_enabled[]
+                 * could no longer stomp it.  That made it live -- and live, it
+                 * overrides what a scene explicitly authored.  Its own rationale
+                 * was that an untonemapped HDR target reads washed out; bisected
+                 * against real content, forcing it ON is what washes out:
+                 *
+                 *   caged_kingdom/graveyard, same camera, PNG size as a proxy
+                 *     ec933eb8 (guard dead)  1,126,840 -> correct
+                 *     2e5174e3 (guard live)  1,494,787 -> washed out
+                 *
+                 * and the split across projects is exactly postfx.tonemap:
+                 * elemental_serenity and space author it TRUE (forcing it is a
+                 * no-op there, and they always looked right), while caged_kingdom
+                 * and street_demo author it FALSE and had their exposure and
+                 * lights tuned that way.  A new scene defaults to false, which is
+                 * why every newly created scene came up white too.
+                 *
+                 * Silently overriding an explicit authored value to protect
+                 * against a hypothetical is the wrong trade: honour the scene.  A
+                 * scene that wants tone mapping says so. */
                 bool any_effect = false;
                 for (int i = 0; i < JCE_POSTFX_COUNT; ++i)
                     if (jce_postfx_is_enabled(pfx, (JcePostFXType)i)) {
                         any_effect = true; break;
                     }
-                if (any_effect) {
+                if (any_effect || has_fullscreen) {
                     jce_postfx_resize(pfx, rw, rh);
-                    JceTextureHandle color = {
-                        jce_offscreen_target_get_color_texture(s_post_target) };
-                    JceTextureHandle depth = {
-                        jce_offscreen_target_get_depth_texture(s_post_target) };
                     if (jce_gfx_texture_valid(color)) {
                         jce_postfx_apply(pfx, color, depth);
                         if (jce_gfx_texture_valid(jce_postfx_get_output(pfx))) {
@@ -1736,12 +1808,9 @@ static void app_exit(void *ud)
         if (s_preset_rec) { jce_webm_encoder_finish(s_preset_rec); s_preset_rec = NULL; }
         s_preset_rec_active = false;
     }
-    /* Streamer first: destroying it removes its streamed entities from
-     * s_scene and joins all in-flight chunk tasks (jce_task_wait) before
-     * detaching from the fs.  Only then destroy the worker pool (also
-     * waits-for-all on shutdown) and the fs the workers were reading from. */
+    /* Streamer first: it removes streamed entities and joins its private
+     * structured executor before the scene or filesystem are destroyed. */
     if (s_world_streamer) { jce_world_streamer_destroy(s_world_streamer);  s_world_streamer = NULL; }
-    if (s_stream_pool)    { jce_thread_pool_destroy(s_stream_pool);        s_stream_pool    = NULL; }
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     /* Occlusion culler holds bgfx resources (proxy geom + query handles) —

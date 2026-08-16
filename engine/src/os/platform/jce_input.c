@@ -1,43 +1,42 @@
 /*
- * jce_input.c  Cross-platform input management.
+ * jce_input.c  SEAM B — the input state machine, and no SDL at all.
+ *
+ * Everything that reaches JceInput reaches it as a JceInputEvent through
+ * jce_input_submit().  That is the whole point of the split: this file used to
+ * be a wall with SDL on one side and untestable state mutation on the other,
+ * and `#if 0` around its entire gamepad dispatch left every input test green
+ * because no test could call it.  A test can now build the events by hand.
+ *
+ * The SDL half lives in jce_input_sdl.c: jce_input_sdl_translate() turns one
+ * SDL_Event into JceInputEvents, and JceInputBackend opens and closes the
+ * hardware handles.  Both are reached through jce_input_sdl.h, which carries
+ * no SDL token, so this translation unit stays honestly SDL-free while still
+ * being the thing the engine's event loop calls.
  */
 
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
+#include "jce_input_devices.h"
+#include "jce_input_internal.h"
+#include "jce_input_sdl.h"
 #include "os/core/jce_memory.h"
 
-#include <SDL3/SDL.h>
 #include <string.h>
 
 #define LOG_TAG "jce_input"
 
-/* Compile-time verification that JCE key/gamepad constants match SDL (C99-safe). */
-#define JCE_SASSERT(cond, tag)  typedef char jce_sa_##tag[(cond) ? 1 : -1]
-JCE_SASSERT(JCE_KEY_A      == SDL_SCANCODE_A,      key_a);
-JCE_SASSERT(JCE_KEY_Z      == SDL_SCANCODE_Z,      key_z);
-JCE_SASSERT(JCE_KEY_0      == SDL_SCANCODE_0,      key_0);
-JCE_SASSERT(JCE_KEY_RETURN == SDL_SCANCODE_RETURN,  key_ret);
-JCE_SASSERT(JCE_KEY_ESCAPE == SDL_SCANCODE_ESCAPE,  key_esc);
-JCE_SASSERT(JCE_KEY_SPACE  == SDL_SCANCODE_SPACE,   key_spc);
-JCE_SASSERT(JCE_KEY_F1     == SDL_SCANCODE_F1,      key_f1);
-JCE_SASSERT(JCE_KEY_F12    == SDL_SCANCODE_F12,     key_f12);
-JCE_SASSERT(JCE_KEY_UP     == SDL_SCANCODE_UP,      key_up);
-JCE_SASSERT(JCE_KEY_LCTRL  == SDL_SCANCODE_LCTRL,   key_lc);
-JCE_SASSERT(JCE_KEY_RALT   == SDL_SCANCODE_RALT,    key_ra);
-JCE_SASSERT(JCE_KEY_AC_BACK== SDL_SCANCODE_AC_BACK, key_ab);
-JCE_SASSERT(JCE_KEY_COUNT  == SDL_SCANCODE_COUNT,   key_cnt);
-JCE_SASSERT(JCE_GAMEPAD_BUTTON_SOUTH == SDL_GAMEPAD_BUTTON_SOUTH, gp_bs);
-JCE_SASSERT(JCE_GAMEPAD_BUTTON_COUNT == SDL_GAMEPAD_BUTTON_COUNT, gp_bc);
-JCE_SASSERT(JCE_GAMEPAD_AXIS_LEFTX   == SDL_GAMEPAD_AXIS_LEFTX,  gp_al);
-JCE_SASSERT(JCE_GAMEPAD_AXIS_COUNT   == SDL_GAMEPAD_AXIS_COUNT,   gp_ac);
-#undef JCE_SASSERT
+/* One SDL_Event never expands to more than one JceInputEvent today, but the
+ * translator's contract is 0..max and a future compound event (a touchpad
+ * finger carrying position and pressure separately, say) is allowed to use
+ * the room. */
+#define JCE_INPUT_TRANSLATE_MAX 8
 
 struct JceInput {
     /* Keyboard */
-    bool keys_cur[SDL_SCANCODE_COUNT];
-    bool keys_prev[SDL_SCANCODE_COUNT];
+    bool keys_cur[JCE_KEY_COUNT];
+    bool keys_prev[JCE_KEY_COUNT];
 
     /* Mouse */
     float    mouse_x, mouse_y;
@@ -49,35 +48,82 @@ struct JceInput {
     /* Touch */
     int touch_count;
     struct {
-        SDL_FingerID id;
+        JceFingerID id;
         float x, y, pressure;
     } touches[JCE_MAX_TOUCHES];
 
-    /* Gamepads */
-    int gamepad_count;
-    struct {
-        SDL_Gamepad *sdl_pad;
-        SDL_JoystickID jid;
-        uint32_t buttons_cur;
-        uint32_t buttons_prev;
-        float axes[SDL_GAMEPAD_AXIS_COUNT];
-    } gamepads[JCE_MAX_GAMEPADS];
+    /* The device table: monotonic ids, non-compacting removal, reconnect by
+     * signature.  Embedded by value, so a JceInput is still one allocation.
+     *
+     * THE ONLY VIEW OF A DEVICE, as of schema v2.  A second one used to sit
+     * above this line -- a pad-index array with a `present` bool, four public
+     * accessors and its own half of the record/replay frame -- and the two
+     * disagreed in four ways this file documented one at a time: the array
+     * capped at 4 while the table holds 12; jce_input_apply() raised its count
+     * without telling the table; its capture carried 26 button bits and 6 axes
+     * against the table's 128, 16 and 4 hats, so a HOTAS session replayed as
+     * silence; and it COMPACTED on detach, so unplugging one pad handed a
+     * different controller to whoever addressed that index.  Every one of those
+     * is a property of keeping two views, not of either view, so the fix was to
+     * stop keeping two.
+     *
+     * `present` is not lost with it.  It is JceDeviceRecord.replayed now, and
+     * jce_input_devices_find_instance() is where it is enforced -- one lookup
+     * that every ingest path already goes through, instead of a flag each new
+     * reader had to remember to consult. */
+    JceInputDeviceTable devices;
+
+    const JceInputBackend *backend;   /* NULL == null backend, see the header */
 };
 
 JceInput *jce_input_create(void)
 {
+    /* Installs NO backend.  A NULL backend is the NULL BACKEND, not an error:
+     * open_device is absent, so a device record is built from the lifecycle
+     * event alone -- which is what headless, a dedicated server, replay and
+     * the unit suite all want, and what lets the device tests link without
+     * SDL.  The windowed engine installs jce_input_sdl_backend() explicitly
+     * right after this call, in jce_engine_create_windowed_input()
+     * (engine/src/application/jce_engine_windowed_input.h) -- one named
+     * function rather than two lines inside jce_engine_create, because that is
+     * what makes the install assertable without a window.  The guard is
+     * tests/application/test_jce_engine_input_backend.c; delete the install
+     * and it reddens with nothing plugged in. */
     JceInput *input = (JceInput *)JCE_CALLOC(1, sizeof(*input));
+    if (input) jce_input_devices_init(&input->devices);
     LOG_INFO(LOG_TAG, "input system initialized");
     return input;
+}
+
+/* -- the device table, which lives inside this opaque handle --------- */
+
+JceInputDeviceTable *jce_input_device_table(JceInput *in)
+{
+    return in ? &in->devices : NULL;
+}
+
+const JceInputDeviceTable *jce_input_device_table_const(const JceInput *in)
+{
+    return in ? &in->devices : NULL;
+}
+
+const JceInputBackend *jce_input_device_backend(const JceInput *in)
+{
+    return in ? in->backend : NULL;
+}
+
+void jce_input_set_backend(JceInput *input, const JceInputBackend *backend)
+{
+    if (!input) return;
+    input->backend = backend;         /* NULL is legal: the null backend */
 }
 
 void jce_input_destroy(JceInput *input)
 {
     if (!input) return;
-    for (int i = 0; i < input->gamepad_count; i++) {
-        if (input->gamepads[i].sdl_pad)
-            SDL_CloseGamepad(input->gamepads[i].sdl_pad);
-    }
+    /* The device table owns every open hardware handle -- it is the one thing
+     * that called open_device -- so it is the one thing that closes them. */
+    jce_input_devices_detach_all(&input->devices, input->backend);
     JCE_FREE(input);
     LOG_INFO(LOG_TAG, "input system destroyed");
 }
@@ -93,176 +139,259 @@ void jce_input_update(JceInput *input)
     input->mouse_dy   = 0.0f;
     input->wheel       = 0.0f;
 
-    for (int i = 0; i < input->gamepad_count; i++)
-        input->gamepads[i].buttons_prev = input->gamepads[i].buttons_cur;
+    /* jce_input_devices_begin_frame() owns the button-edge roll now, for EVERY
+     * device and all 128 bits of each -- the loop that used to sit here rolled
+     * 32 bits of up to four pads and nothing else. */
+    jce_input_devices_begin_frame(&input->devices);
     JCE_PROFILE_ZONE_END;
 }
 
-/* -- internal: gamepad slot management ------------------------------ */
+/* -- internal: touch slot management -------------------------------- */
 
-static int find_gamepad_by_jid(const JceInput *input, SDL_JoystickID jid)
+static void touch_down_or_move(JceInput *input, const JceInputTouchEvent *t,
+                               bool is_down)
 {
-    for (int i = 0; i < input->gamepad_count; i++)
-        if (input->gamepads[i].jid == jid)
-            return i;
-    return -1;
+    for (int i = 0; i < input->touch_count; i++) {
+        if (input->touches[i].id == (JceFingerID)t->finger) {
+            input->touches[i].x        = t->x;
+            input->touches[i].y        = t->y;
+            input->touches[i].pressure = t->pressure;
+            return;
+        }
+    }
+    if (is_down && input->touch_count < JCE_MAX_TOUCHES) {
+        int s = input->touch_count++;
+        input->touches[s].id       = (JceFingerID)t->finger;
+        input->touches[s].x        = t->x;
+        input->touches[s].y        = t->y;
+        input->touches[s].pressure = t->pressure;
+    }
 }
 
-static void add_gamepad(JceInput *input, SDL_JoystickID jid)
+static void touch_up(JceInput *input, const JceInputTouchEvent *t)
 {
-    if (input->gamepad_count >= JCE_MAX_GAMEPADS) return;
-    if (find_gamepad_by_jid(input, jid) >= 0) return;
-
-    SDL_Gamepad *pad = SDL_OpenGamepad(jid);
-    if (!pad) return;
-
-    int slot = input->gamepad_count++;
-    input->gamepads[slot].sdl_pad     = pad;
-    input->gamepads[slot].jid         = jid;
-    input->gamepads[slot].buttons_cur = 0;
-    input->gamepads[slot].buttons_prev = 0;
-    memset(input->gamepads[slot].axes, 0, sizeof(input->gamepads[slot].axes));
+    for (int i = 0; i < input->touch_count; i++) {
+        if (input->touches[i].id == (JceFingerID)t->finger) {
+            int last = input->touch_count - 1;
+            if (i < last)
+                input->touches[i] = input->touches[last];
+            input->touch_count--;
+            return;
+        }
+    }
 }
 
-static void remove_gamepad(JceInput *input, SDL_JoystickID jid)
+/* -- SEAM B: the one door into the state machine -------------------- */
+
+/* Recency for the three classes that have no device record.
+ *
+ * The keyboard, the mouse and the touchscreen are the reserved VIRTUAL devices
+ * -- they occupy no table slot, so nothing in jce_input_devices.c can stamp
+ * them; the three raw-state ingest functions there only ever see hardware.
+ * Without these calls jce_input_last_active_class() could only ever answer
+ * GAMEPAD or JOYSTICK, which is the fixed-priority answer the recency stamp
+ * exists to replace.
+ *
+ * They are attributed to the KEYBOARD PLAYER, which is what
+ * jce_input_set_keyboard_player() moves and what
+ * jce_input_player_device_of_class() resolves the virtual ids against, so
+ * "who was last active" and "whose keyboard is it" cannot disagree.
+ *
+ * A PRESS IS ACTIVITY AND A RELEASE IS NOT.  Letting go of a key is the tail of
+ * an interaction, not a new one, and stamping it would flip the on-screen
+ * prompts back to keyboard glyphs the instant a player took their hand off the
+ * keys mid-gamepad session. */
+static void mark_virtual_active(JceInput *input, int cls)
 {
-    int idx = find_gamepad_by_jid(input, jid);
-    if (idx < 0) return;
-
-    if (input->gamepads[idx].sdl_pad)
-        SDL_CloseGamepad(input->gamepads[idx].sdl_pad);
-
-    /* Shift remaining entries down. */
-    int last = input->gamepad_count - 1;
-    if (idx < last)
-        input->gamepads[idx] = input->gamepads[last];
-    memset(&input->gamepads[last], 0, sizeof(input->gamepads[last]));
-    input->gamepad_count--;
+    jce_input_devices_mark_active(&input->devices, cls,
+                                  (int)input->devices.keyboard_player);
 }
 
-/* -- event dispatch ------------------------------------------------- */
-
-void jce_input_handle_event(JceInput *input, const void *platform_event)
+static void apply_event(JceInput *input, const JceInputEvent *ev)
 {
-    const SDL_Event *event = (const SDL_Event *)platform_event;
-    if (!input || !event) return;
+    switch (ev->kind) {
 
-    switch (event->type) {
-
-    /* Keyboard */
-    case SDL_EVENT_KEY_DOWN:
-        if (event->key.scancode < SDL_SCANCODE_COUNT)
-            input->keys_cur[event->key.scancode] = true;
-        break;
-    case SDL_EVENT_KEY_UP:
-        if (event->key.scancode < SDL_SCANCODE_COUNT)
-            input->keys_cur[event->key.scancode] = false;
+    case JCE_INPUT_EVENT_KEY:
+        if (ev->key.scancode < 0 || ev->key.scancode >= JCE_KEY_COUNT) break;
+        input->keys_cur[ev->key.scancode] = ev->key.down ? true : false;
+        /* A repeat counts: the key is still being held down deliberately. */
+        if (ev->key.down)
+            mark_virtual_active(input, (int)JCE_DEVCLASS_KEYBOARD);
         break;
 
-    /* Mouse */
-    case SDL_EVENT_MOUSE_MOTION:
-        input->mouse_x  = event->motion.x;
-        input->mouse_y  = event->motion.y;
-        input->mouse_dx += event->motion.xrel;
-        input->mouse_dy += event->motion.yrel;
-        break;
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        input->mouse_cur |= SDL_BUTTON_MASK(event->button.button);
-        break;
-    case SDL_EVENT_MOUSE_BUTTON_UP:
-        input->mouse_cur &= ~SDL_BUTTON_MASK(event->button.button);
-        break;
-    case SDL_EVENT_MOUSE_WHEEL:
-        input->wheel += event->wheel.y;
+    case JCE_INPUT_EVENT_MOUSE_MOTION:
+        input->mouse_x   = ev->motion.x;
+        input->mouse_y   = ev->motion.y;
+        input->mouse_dx += ev->motion.dx;
+        input->mouse_dy += ev->motion.dy;
+        /* A zero-delta motion event is a position report, not a movement --
+         * SDL emits them on window enter and on warp -- and treating one as
+         * activity would let a mouse the user is not touching steal the class
+         * from a pad. */
+        if (ev->motion.dx != 0.0f || ev->motion.dy != 0.0f)
+            mark_virtual_active(input, (int)JCE_DEVCLASS_MOUSE);
         break;
 
-    /* Touch */
-    case SDL_EVENT_FINGER_DOWN:
-    case SDL_EVENT_FINGER_MOTION:
-        for (int i = 0; i < input->touch_count; i++) {
-            if (input->touches[i].id == event->tfinger.fingerID) {
-                input->touches[i].x = event->tfinger.x;
-                input->touches[i].y = event->tfinger.y;
-                input->touches[i].pressure = event->tfinger.pressure;
-                return;
-            }
-        }
-        if (event->type == SDL_EVENT_FINGER_DOWN &&
-            input->touch_count < JCE_MAX_TOUCHES) {
-            int s = input->touch_count++;
-            input->touches[s].id       = event->tfinger.fingerID;
-            input->touches[s].x        = event->tfinger.x;
-            input->touches[s].y        = event->tfinger.y;
-            input->touches[s].pressure = event->tfinger.pressure;
-        }
-        break;
-    case SDL_EVENT_FINGER_UP:
-        for (int i = 0; i < input->touch_count; i++) {
-            if (input->touches[i].id == event->tfinger.fingerID) {
-                int last = input->touch_count - 1;
-                if (i < last)
-                    input->touches[i] = input->touches[last];
-                input->touch_count--;
-                break;
-            }
-        }
+    case JCE_INPUT_EVENT_MOUSE_BUTTON:
+        /* The mask is applied here, once, on the SDL-free side of the seam.
+         * The producer carries the 1-based NUMBER. */
+        if (ev->mbutton.button < 1 || ev->mbutton.button > 32) break;
+        if (ev->mbutton.down)
+            input->mouse_cur |=  JCE_MOUSE_BUTTON_MASK(ev->mbutton.button);
+        else
+            input->mouse_cur &= ~JCE_MOUSE_BUTTON_MASK(ev->mbutton.button);
+        if (ev->mbutton.down)
+            mark_virtual_active(input, (int)JCE_DEVCLASS_MOUSE);
         break;
 
-    /* Gamepad */
-    case SDL_EVENT_GAMEPAD_ADDED:
-        add_gamepad(input, event->gdevice.which);
+    case JCE_INPUT_EVENT_MOUSE_WHEEL:
+        input->wheel += ev->wheel.y;
+        if (ev->wheel.x != 0.0f || ev->wheel.y != 0.0f)
+            mark_virtual_active(input, (int)JCE_DEVCLASS_MOUSE);
         break;
-    case SDL_EVENT_GAMEPAD_REMOVED:
-        remove_gamepad(input, event->gdevice.which);
+
+    case JCE_INPUT_EVENT_TOUCH:
+        if (ev->touch.phase == JCE_INPUT_TOUCH_PHASE_UP)
+            touch_up(input, &ev->touch);
+        else
+            touch_down_or_move(input, &ev->touch,
+                               ev->touch.phase == JCE_INPUT_TOUCH_PHASE_DOWN);
+        /* DOWN and MOTION are activity; lifting a finger is the release. */
+        if (ev->touch.phase != JCE_INPUT_TOUCH_PHASE_UP)
+            mark_virtual_active(input, (int)JCE_DEVCLASS_TOUCH);
         break;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
-        int idx = find_gamepad_by_jid(input,
-            SDL_GetJoystickID(SDL_GetGamepadJoystick(
-                SDL_GetGamepadFromID(event->gbutton.which))));
-        if (idx >= 0)
-            input->gamepads[idx].buttons_cur |= (1u << event->gbutton.button);
+
+    /* ONE VIEW, so these four cases are now one line each.
+     *
+     * Each of them used to carry a second half that mirrored the same event
+     * into a pad-index array, plus the gates that array needed to stay honest:
+     * a layout gate here at ADDED so a JCE_INPUT_LAYOUT_RAW wheel could not
+     * take pad slot 0 and have its steering axis read back as LEFTX, and a
+     * `semantic == 1` requirement on both writes as a second lock on the same
+     * door.  Those gates existed to protect that array and they are gone with
+     * it -- correctly, because the confusion they guarded against was a
+     * property of a store that had ONE spelling (axes[0] means LEFTX) being fed
+     * by devices that speak two.
+     *
+     * WHAT HOLDS THE LINE NOW is that the device table keeps both spellings
+     * over the same storage and gates the SEMANTIC one on info.layout, in
+     * semantic_rec() -- so a raw device answers its ordinals and refuses
+     * LEFTX no matter which reader asks, and there is no second store to keep
+     * in step.  jce_input_devices_apply() carries each device's own layout into
+     * the record it restores, so a replay cannot smuggle an ordinal into a
+     * semantic slot either.  DEVICE_HAT never had a legacy half at all: a
+     * uint32 mask and six axes had nowhere to put a hat, which is why a HOTAS
+     * hat was unreadable for as long as that array existed. */
+
+    case JCE_INPUT_EVENT_DEVICE_ADDED:
+        jce_input_devices_attach(&input->devices, input->backend, &ev->device);
         break;
-    }
-    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
-        int idx = find_gamepad_by_jid(input,
-            SDL_GetJoystickID(SDL_GetGamepadJoystick(
-                SDL_GetGamepadFromID(event->gbutton.which))));
-        if (idx >= 0)
-            input->gamepads[idx].buttons_cur &= ~(1u << event->gbutton.button);
+
+    case JCE_INPUT_EVENT_DEVICE_REMOVED:
+        jce_input_devices_detach(&input->devices, input->backend,
+                                 ev->device.instance);
         break;
-    }
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
-        int idx = find_gamepad_by_jid(input,
-            SDL_GetJoystickID(SDL_GetGamepadJoystick(
-                SDL_GetGamepadFromID(event->gaxis.which))));
-        if (idx >= 0 && event->gaxis.axis < SDL_GAMEPAD_AXIS_COUNT)
-            input->gamepads[idx].axes[event->gaxis.axis] =
-                (float)event->gaxis.value / 32767.0f;
+
+    case JCE_INPUT_EVENT_DEVICE_BUTTON:
+        (void)jce_input_devices_button(&input->devices, &ev->dbutton);
         break;
-    }
+
+    case JCE_INPUT_EVENT_DEVICE_AXIS:
+        (void)jce_input_devices_axis(&input->devices, &ev->daxis);
+        break;
+
+    case JCE_INPUT_EVENT_DEVICE_HAT:
+        (void)jce_input_devices_hat(&input->devices, &ev->dhat);
+        break;
+
+    /* THE FIFTH DEVICE EVENT, and it is not raw state: it refreshes the
+     * battery cache the const jce_input_device_power() reads.  The enumerator
+     * shipped in Plan A and nothing consumed it until now, so an event a
+     * producer submitted fell through the `default` below and was silently
+     * discarded.
+     *
+     * THE ENGINE'S OWN SDL TRANSLATOR DOES EMIT ONE, and this sentence used to
+     * say it did not: jce_input_sdl.c's SDL_EVENT_JOYSTICK_BATTERY_UPDATED
+     * case emits JCE_INPUT_EVENT_DEVICE_POWER, and the double-announce gate
+     * deliberately lets it through for a mapped pad because the GAMEPAD family
+     * has no twin for it.  The old text also made that the reason the
+     * attach-time seed matters, which was the wrong reason twice over: the
+     * reason is the one the other three places give (jce_input_device.h,
+     * jce_input_devices.c's seeding block, jce_input_sdl.c's case comment) --
+     * several drivers report only on a LEVEL CHANGE, so a fully-charged idle
+     * pad may never send a first event and the seed is what a device strip
+     * draws until one arrives. */
+    case JCE_INPUT_EVENT_DEVICE_POWER:
+        (void)jce_input_devices_power(&input->devices, &ev->dpower);
+        break;
 
     default:
         break;
     }
 }
 
+void jce_input_submit(JceInput *input, const JceInputEvent *events, int count)
+{
+    if (!input || !events || count <= 0) return;
+    for (int i = 0; i < count; ++i) {
+        /* A short record is refused, not partially read: the fields past its
+         * end do not exist. */
+        if (events[i].size < JCE_INPUT_EVENT_SIZE_V2) continue;
+        apply_event(input, &events[i]);
+    }
+}
+
+/* -- event dispatch ------------------------------------------------- */
+
+/* THE _live SUFFIX IS LOAD-BEARING AND THIS IS THE ONLY CALL SITE OF IT.
+ *
+ * jce_input_sdl_translate() is PURE -- a function of one SDL_Event and nothing
+ * else -- which is what lets 34 test cases hand it a struct literal with
+ * nothing plugged in.  But SDL delivers every device its mapping database
+ * recognises TWICE: SDL_EVENT_GAMEPAD_* and SDL_EVENT_JOYSTICK_* for the same
+ * instance.  The translator carries both families because a wheel has only the
+ * second, so exactly one gate has to ask SDL which family a given device
+ * speaks -- and that question cannot be answered purely.
+ *
+ * jce_input_sdl_translate_live() is that gate and it lives in jce_input_sdl.c,
+ * the one input TU allowed to name SDL (scripts/lint/check_input_seam.py).
+ * This file stays SDL-free; what changed here is one identifier.
+ *
+ * WHY THE GATE IS NOT IN open_device(), where "anything that needs to probe a
+ * device" would normally belong: open_device() sees DEVICE_ADDED and nothing
+ * else.  It could refuse a mapped pad's second IDENTITY, and could do nothing
+ * about its second STATE STREAM -- which lands in the same record over the
+ * same storage, because ordinal n and semantic n are one float.  The full
+ * argument is at sdl_joystick_echo_is_shadowed() in jce_input_sdl.c. */
+void jce_input_handle_event(JceInput *input, const void *platform_event)
+{
+    JceInputEvent evs[JCE_INPUT_TRANSLATE_MAX];
+    int n;
+
+    if (!input || !platform_event) return;
+
+    n = jce_input_sdl_translate_live(platform_event, evs,
+                                     JCE_INPUT_TRANSLATE_MAX);
+    if (n > 0) jce_input_submit(input, evs, n);
+}
+
 /* -- Keyboard queries ----------------------------------------------- */
 
 bool jce_input_key_down(const JceInput *input, JceKey key)
 {
-    if (!input || key >= SDL_SCANCODE_COUNT) return false;
+    if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
     return input->keys_cur[key];
 }
 
 bool jce_input_key_pressed(const JceInput *input, JceKey key)
 {
-    if (!input || key >= SDL_SCANCODE_COUNT) return false;
+    if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
     return input->keys_cur[key] && !input->keys_prev[key];
 }
 
 bool jce_input_key_released(const JceInput *input, JceKey key)
 {
-    if (!input || key >= SDL_SCANCODE_COUNT) return false;
+    if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
     return !input->keys_cur[key] && input->keys_prev[key];
 }
 
@@ -280,23 +409,30 @@ void jce_input_mouse_delta(const JceInput *input, float *dx, float *dy)
     if (dy) *dy = input ? input->mouse_dy : 0.0f;
 }
 
+/* Buttons are 1-based; button 0 would shift by -1 and 33 would shift past the
+ * mask, both undefined.  Bounded here rather than at every call site. */
+static bool mouse_button_in_range(int button)
+{
+    return button >= 1 && button <= 32;
+}
+
 bool jce_input_mouse_button(const JceInput *input, int button)
 {
-    if (!input) return false;
-    return (input->mouse_cur & SDL_BUTTON_MASK(button)) != 0;
+    if (!input || !mouse_button_in_range(button)) return false;
+    return (input->mouse_cur & JCE_MOUSE_BUTTON_MASK(button)) != 0;
 }
 
 bool jce_input_mouse_button_pressed(const JceInput *input, int button)
 {
-    if (!input) return false;
-    uint32_t mask = SDL_BUTTON_MASK(button);
+    if (!input || !mouse_button_in_range(button)) return false;
+    uint32_t mask = JCE_MOUSE_BUTTON_MASK(button);
     return (input->mouse_cur & mask) && !(input->mouse_prev & mask);
 }
 
 bool jce_input_mouse_button_released(const JceInput *input, int button)
 {
-    if (!input) return false;
-    uint32_t mask = SDL_BUTTON_MASK(button);
+    if (!input || !mouse_button_in_range(button)) return false;
+    uint32_t mask = JCE_MOUSE_BUTTON_MASK(button);
     return !(input->mouse_cur & mask) && (input->mouse_prev & mask);
 }
 
@@ -326,47 +462,32 @@ bool jce_input_touch_get(const JceInput *input, int index,
 
 /* -- Gamepad queries ------------------------------------------------ */
 
-int jce_input_gamepad_count(const JceInput *input)
-{
-    return input ? input->gamepad_count : 0;
-}
-
-bool jce_input_gamepad_button(const JceInput *input, int pad,
-                              JceGamepadButton btn)
-{
-    if (!input || pad < 0 || pad >= input->gamepad_count) return false;
-    return (input->gamepads[pad].buttons_cur & (1u << btn)) != 0;
-}
-
-bool jce_input_gamepad_button_pressed(const JceInput *input, int pad,
-                                      JceGamepadButton btn)
-{
-    if (!input || pad < 0 || pad >= input->gamepad_count) return false;
-    uint32_t mask = 1u << btn;
-    return (input->gamepads[pad].buttons_cur & mask)
-        && !(input->gamepads[pad].buttons_prev & mask);
-}
-
-float jce_input_gamepad_axis(const JceInput *input, int pad,
-                             JceGamepadAxis axis)
-{
-    if (!input || pad < 0 || pad >= input->gamepad_count) return 0.0f;
-    if (axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT) return 0.0f;
-    return input->gamepads[pad].axes[axis];
-}
-
+/* GONE: jce_input_gamepad_count / _button / _button_pressed / _axis.
+ *
+ * All four took an "index among connected pads", which is the defect itself and
+ * not a spelling of it -- see the note in jce/os/platform/jce_input.h for what
+ * callers use instead.  They had four call sites in engine code, every one
+ * passing the literal 0, all in jce_input_actions.c, and those now read through
+ * the querying player.  jce_input_device.h's player-slot group is where the
+ * replacements live, and this file no longer answers a device question at all:
+ * it owns the keyboard, the mouse and touch, and it forwards devices to the
+ * table. */
 
 /* -- Frame capture / apply (record / replay) ------------------------ */
 
 void jce_input_capture(const JceInput *input, JceInputFrame *out)
 {
+    int i;
     if (!input || !out) return;
+    /* Zeroed first, so every field the loops below do not reach -- the device
+     * slots above the high-water mark especially -- is a defined 0 rather than
+     * whatever the caller's stack held.  jce_input_devices_capture() relies on
+     * this and writes only device_count and the live slots. */
     memset(out, 0, sizeof(*out));
     out->version   = JCE_INPUT_FRAME_VERSION;
     out->key_count = (uint32_t)JCE_KEY_COUNT;
 
-    /* Pack key bits. */
-    for (int i = 0; i < (int)SDL_SCANCODE_COUNT && i < 64 * 64; ++i) {
+    for (i = 0; i < (int)JCE_KEY_COUNT && i < 64 * 64; ++i) {
         if (input->keys_cur[i])
             out->keys_bits[i >> 6] |= (uint64_t)1 << (i & 63);
     }
@@ -378,43 +499,51 @@ void jce_input_capture(const JceInput *input, JceInputFrame *out)
     out->mouse_wheel   = input->wheel;
     out->mouse_buttons = input->mouse_cur;
 
-    out->gamepad_count = (uint32_t)input->gamepad_count;
-    for (int i = 0; i < input->gamepad_count && i < JCE_MAX_GAMEPADS; ++i) {
-        out->gamepads[i].buttons = input->gamepads[i].buttons_cur;
-        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && a < 8; ++a)
-            out->gamepads[i].axes[a] = input->gamepads[i].axes[a];
+    out->touch_count = (uint32_t)input->touch_count;
+    for (i = 0; i < input->touch_count && i < JCE_MAX_TOUCHES; ++i) {
+        out->touches[i].id       = (uint64_t)input->touches[i].id;
+        out->touches[i].x        = input->touches[i].x;
+        out->touches[i].y        = input->touches[i].y;
+        out->touches[i].pressure = input->touches[i].pressure;
     }
+
+    jce_input_devices_capture(&input->devices, out);
 }
 
 bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
 {
+    int i, n;
     if (!input || !frame) return false;
     if (frame->version != JCE_INPUT_FRAME_VERSION) return false;
 
-    /* Restore key bits. */
     memset(input->keys_cur, 0, sizeof(input->keys_cur));
-    for (int i = 0; i < (int)SDL_SCANCODE_COUNT && i < 64 * 64; ++i) {
+    for (i = 0; i < (int)JCE_KEY_COUNT && i < 64 * 64; ++i) {
         if (frame->keys_bits[i >> 6] & ((uint64_t)1 << (i & 63)))
             input->keys_cur[i] = true;
     }
 
-    input->mouse_x    = frame->mouse_x;
-    input->mouse_y    = frame->mouse_y;
-    input->mouse_dx   = frame->mouse_dx;
-    input->mouse_dy   = frame->mouse_dy;
-    input->wheel      = frame->mouse_wheel;
-    input->mouse_cur  = frame->mouse_buttons;
+    input->mouse_x   = frame->mouse_x;
+    input->mouse_y   = frame->mouse_y;
+    input->mouse_dx  = frame->mouse_dx;
+    input->mouse_dy  = frame->mouse_dy;
+    input->wheel     = frame->mouse_wheel;
+    input->mouse_cur = frame->mouse_buttons;
 
-    /* NOTE: we do not re-open SDL_Gamepad handles during replay; we just
-     * inject the cached state.  Replays of gamepad-driven sessions still
-     * see the original button/axis values per frame. */
-    for (uint32_t i = 0; i < frame->gamepad_count && i < JCE_MAX_GAMEPADS; ++i) {
-        input->gamepads[i].buttons_cur = frame->gamepads[i].buttons;
-        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && a < 8; ++a)
-            input->gamepads[i].axes[a] = frame->gamepads[i].axes[a];
+    n = (int)frame->touch_count;
+    if (n < 0) n = 0;
+    if (n > JCE_MAX_TOUCHES) n = JCE_MAX_TOUCHES;
+    input->touch_count = n;
+    for (i = 0; i < n; ++i) {
+        input->touches[i].id       = (JceFingerID)frame->touches[i].id;
+        input->touches[i].x        = frame->touches[i].x;
+        input->touches[i].y        = frame->touches[i].y;
+        input->touches[i].pressure = frame->touches[i].pressure;
     }
-    if ((int)frame->gamepad_count > input->gamepad_count)
-        input->gamepad_count = (int)frame->gamepad_count;
 
+    /* Writes the SAME device table the live path writes.  apply() is no longer
+     * a privileged back door into a store nothing else uses, which is the whole
+     * reason a capture/apply round trip can now be checked through the public
+     * query API and mean something. */
+    jce_input_devices_apply(&input->devices, frame);
     return true;
 }

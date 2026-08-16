@@ -59,6 +59,38 @@ typedef struct {
     float ambient_lift;     /* added to scattering term,        default 0.05 */
 } JceVolumetricFogParams;
 
+/* ── Directional light + cascaded shadows for a shadow-aware march ──────
+ *
+ * Without this the march is shadow-blind: it adds the same bulk in-scattering
+ * everywhere, so a scene lit through a window or a canopy fogs up uniformly and
+ * the light shafts that are the entire reason to raymarch fog never appear.
+ * Nothing about that looks broken -- it looks like haze.
+ *
+ * Passed PER RENDER CALL and deliberately not stored.  A stored copy is correct
+ * only for as long as the caller keeps updating it, and the frame it stops, the
+ * march samples this frame's cascade textures with last frame's matrices: not a
+ * missing shadow but a wrong one, anchored where the sun used to be.
+ */
+typedef struct {
+    bool     enabled;           /* false = unlit bulk fog (previous behaviour) */
+    float    sun_dir[3];        /* direction TOWARD the sun, world, unit       */
+    float    sun_color[3];      /* linear radiance, already scaled by intensity*/
+    float    anisotropy;        /* Henyey-Greenstein g in (-1,1); 0=isotropic  */
+    uint32_t cascade_count;     /* 0 disables the shadow lookup                */
+    uint16_t cascade_tex[4];    /* bgfx texture handle .idx per cascade        */
+    jce_mat4 cascade_vp[4];     /* the VP each cascade texture was rendered with*/
+    float    splits[4];         /* view-space split distance per cascade       */
+    float    inv_map_size;      /* 1 / shadow_map_size                         */
+    /* Fraction of each split's span over which the march cross-fades into the
+     * next cascade, 0..0.35. Feed it the SAME value the surface shaders get
+     * (jce_shadow_blend / u_csmParams.y): the fog and the geometry in front of
+     * it must soften the same boundary by the same amount. Zero restores the
+     * hard bucket, which is a visible band that sweeps with the camera.
+     *
+     * APPENDED at the end -- this struct is public ABI. */
+    float    cascade_blend;
+} JceVolumetricFogSun;
+
 JCE_API JceVolumetricFog       *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc);
 JCE_API void                    jce_volumetric_fog_destroy(JceVolumetricFog *f);
 
@@ -69,12 +101,14 @@ JCE_API JceVolumetricFogParams  jce_volumetric_fog_default_params(void);
 /* Render fog into internal RT.
  *   depth_tex_handle : bgfx texture handle .idx of scene depth
  *   view/proj        : same matrices used to render the scene
+ *   sun              : directional light + cascades, or NULL for unlit fog
  *   first_view_id    : reserves 1 view slot
  */
 JCE_API void                    jce_volumetric_fog_render(JceVolumetricFog *f,
                                                           uint16_t depth_tex_handle,
                                                           const jce_mat4 *view,
                                                           const jce_mat4 *proj,
+                                                          const JceVolumetricFogSun *sun,
                                                           uint16_t first_view_id);
 
 JCE_API uint16_t                jce_volumetric_fog_get_result_texture(const JceVolumetricFog *f);

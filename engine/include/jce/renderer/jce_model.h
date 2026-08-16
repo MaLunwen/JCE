@@ -74,7 +74,12 @@ JCE_API bool jce_model_probe_rig_memory(const void *data, uint32_t size,
 typedef struct JceModelCpu JceModelCpu;
 #endif
 JCE_API JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak,
-                                               const char *asset_path);
+                                                const char *asset_path);
+/* Decode glTF/GLB bytes to the same CPU-only intermediate. `name` is used
+ * for logging and resolving external buffers. Safe on background workers. */
+JCE_API JceModelCpu *jce_model_decode_gltf_cpu_memory(const void *data,
+                                                       uint32_t size,
+                                                       const char *name);
 JCE_API JceModel    *jce_model_upload_gltf_cpu(JceModelCpu *cpu);
 JCE_API void         jce_model_gltf_cpu_free(JceModelCpu *cpu);
 

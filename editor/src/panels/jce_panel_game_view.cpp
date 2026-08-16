@@ -3,6 +3,7 @@
  * Extracted from jce_editor_panels.cpp.
  */
 
+#include <cstdlib>   /* getenv for the QA autowalk hook below */
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_game_input_bridge.h"
 #include "core/jce_editor_i18n.h"
@@ -27,6 +28,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/os/platform/jce_keys.h>
+#include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_window_event.h>  /* JCE_KMOD_* */
 #include <ctype.h>
 }
@@ -61,6 +63,27 @@ static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
 static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
 static char s_pending_game_exe_path[512] = {0};
 static bool s_pending_game_exe_ready = false;
+
+/* ── Gamepad in Play ──────────────────────────────────────────────────
+ * The keyboard reaches Play through ImGui, which is what confines it to a
+ * focused, clicked-into viewport.  A pad has no cursor and cannot click into
+ * anything, so it is read from the ENGINE's action map instead -- the only
+ * map in the editor that SDL actually feeds (jce_engine.c calls
+ * jce_actions_update on it every frame).  The two are composed by addition,
+ * so neither is a mode: whichever device the user moves, moves the character.
+ *
+ * The value is SIGNED and analog.  "move_back" / "move_left" have no default
+ * pad binding on purpose -- one stick axis carries both directions and the
+ * sign IS the direction -- so this must never be collapsed to a bool.  That
+ * collapse (jce_action_down's `value != 0`) is exactly what made a stick
+ * pulled fully BACK read as "move_forward is down". */
+static float gv_pad_value(const JceInputActions *map, const char *name)
+{
+    if (!map) return 0.0f;
+    int id = jce_action_find(map, name);
+    if (id < 0) return 0.0f;
+    return jce_action_value_device(map, id, JCE_DEVICE_GAMEPAD);
+}
 
 static bool game_view_has_active_vcam(void)
 {
@@ -277,6 +300,25 @@ void jce_editor_panel_game_view_content(void)
     if (ImGui::Combo("##aspect", &s_aspect_idx, aspects, 6))
         jce_editor_pstate_set_int("gameview.aspect", s_aspect_idx);
     ImGui::PopItemWidth();
+
+    /* Maximise, right next to the aspect control: the two together are "how the
+     * picture is framed", which is where a user looks for it. The flag lives in
+     * the layout TU -- this only asks it to flip.
+     *
+     * Not bound to F10 any more: on Windows F10 is claimed by the Win32
+     * window-menu convention before the app ever sees it, which is why the
+     * first attempt appeared to do nothing at all. Shift+F11 sits beside the
+     * existing F11 (OS-window fullscreen) and is not claimed by the shell. */
+    ImGui::SameLine();
+    {
+        const bool maxed = jce_editor_game_view_maximized();
+        if (ImGui::SmallButton(maxed
+                ? jce_editor_i18n("viewport.restore")
+                : jce_editor_i18n("viewport.maximize")))
+            jce_editor_game_view_set_maximized(!maxed);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("viewport.maximize.tip"));
+    }
 
     ImGui::SameLine();
     /* Renderer backend selector.
@@ -660,9 +702,69 @@ void jce_editor_panel_game_view_content(void)
         bool was_captured = jce_editor_game_render_is_mouse_captured();
         jce_editor_game_render_set_mouse_capture(effective_capture);
 
-        if (effective_capture) {
+        /* Sample the pad once per frame from the engine's hardware-fed map. */
+        const JceInputActions *pad_map =
+            play_active ? jce_editor_engine_actions() : nullptr;
+        /* Signed pairs: the stick axis is bound to the POSITIVE action only,
+         * so pulling back / left comes through as a negative "forward" /
+         * "right".  Subtracting the negative action keeps a hand-authored
+         * pad bind on move_back / move_left working too. */
+        const float pad_fwd    = gv_pad_value(pad_map, "move_forward")
+                               - gv_pad_value(pad_map, "move_back");
+        const float pad_right  = gv_pad_value(pad_map, "move_right")
+                               - gv_pad_value(pad_map, "move_left");
+        const float pad_look_x = gv_pad_value(pad_map, "look_x");
+        const float pad_look_y = gv_pad_value(pad_map, "look_y");
+        const bool  pad_jump   = gv_pad_value(pad_map, "jump")   != 0.0f;
+        const bool  pad_sprint = gv_pad_value(pad_map, "sprint") != 0.0f;
+        const bool  pad_attack = gv_pad_value(pad_map, "attack") != 0.0f;
+
+        /* Rising edge for jump, tracked here because the engine's own
+         * pressed/released edges are computed on the WHOLE action and would
+         * fire for the keyboard SPACE this panel deliberately routes through
+         * ImGui instead. */
+        static bool s_pad_jump_prev = false;
+        const bool pad_jump_pressed = pad_jump && !s_pad_jump_prev;
+        s_pad_jump_prev = pad_jump;
+
+        /* A pad cannot click into the viewport, so it must not need to.  It
+         * ENGAGES on first movement and stays engaged for the rest of the Play
+         * session -- staying engaged is what lets a released stick deliver its
+         * zero, instead of the runtime holding the last non-zero input.  Until
+         * the pad is first touched this is false and the block below behaves
+         * exactly as it did before, so a user without a pad sees no change. */
+        static bool s_pad_engaged = false;
+        if (!play_active) s_pad_engaged = false;
+        if (pad_fwd != 0.0f || pad_right != 0.0f ||
+            pad_look_x != 0.0f || pad_look_y != 0.0f ||
+            pad_jump || pad_sprint || pad_attack)
+            s_pad_engaged = true;
+        const bool pad_drives = play_active && s_pad_engaged;
+
+        /* QA-only: the headless hooks drive this block without a mouse or a
+         * pad.
+         *
+         * `effective_capture` is only true once the user has HOVERED AND
+         * CLICKED the Game View to take the pointer, and `pad_drives` needs a
+         * physical stick. Neither can happen in a headless capture, so the
+         * whole camera-and-player block was being skipped and both
+         * JCE_DBG_AUTOWALK and JCE_DBG_AUTOLOOK were writing into variables
+         * nobody read. Two separate measurements came back with a best rigid
+         * frame shift of exactly (0,0) before this was found -- the camera had
+         * never moved, and each run still produced a full table of residuals
+         * that read like a result.
+         *
+         * A hook that is gated behind a condition it cannot satisfy is worse
+         * than a missing hook: the missing one fails loudly. */
+        static int s_qa_drives = -1;
+        if (s_qa_drives < 0)
+            s_qa_drives = (getenv("JCE_DBG_AUTOLOOK") ||
+                           getenv("JCE_DBG_AUTOWALK")) ? 1 : 0;
+
+        if (effective_capture || pad_drives || s_qa_drives) {
             /* V toggles first/third-person follow camera (Play mode). */
-            if (play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            if (effective_capture &&
+                play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
                 s_third_person = !s_third_person;
                 jce_editor_pstate_set_int("gameview.third_person",
                                           s_third_person ? 1 : 0);
@@ -671,21 +773,61 @@ void jce_editor_panel_game_view_content(void)
              * ImGui::IO::MouseDelta — the latter is always zero in
              * relative-mouse-mode because the absolute cursor is pinned. */
             float dx = 0.0f, dy = 0.0f;
-            jce_editor_game_render_consume_mouse_delta(&dx, &dy);
+            if (effective_capture)
+                jce_editor_game_render_consume_mouse_delta(&dx, &dy);
             const float sensitivity = 0.0025f;
-            if (dx != 0.0f || dy != 0.0f) {
-                jce_camera_rotate(cam,
-                                   dx * sensitivity,
-                                  -dy * sensitivity);
+            /* Right stick looks.  Mouse delta is a displacement already, the
+             * stick is a RATE, so it is the one that needs dt. */
+            const float kPadLookRate = 2.5f;   /* rad/s at full deflection */
+            float yaw   = dx * sensitivity + pad_look_x * kPadLookRate * dt;
+            float pitch = -dy * sensitivity + pad_look_y * kPadLookRate * dt;
+
+            /* QA-only: JCE_DBG_AUTOLOOK=YAW[,PITCH] turns the game camera at a
+             * constant rate, in degrees per frame.
+             *
+             * Turning is the trigger the user names first ("视角位置、角度发生
+             * 变化"), and it is a stronger one than walking: a pure rotation
+             * re-fits every shadow cascade while the walked distance per frame
+             * is a fraction of a metre. Autowalk alone measured a rigid frame
+             * shift of exactly (0,0) -- the camera had not moved at all, so
+             * there was no flicker for the metric to see and the null result
+             * meant nothing.
+             *
+             * Per FRAME rather than per second, because the capture is taken
+             * at a frame number: making the rate depend on dt would put the
+             * pose back under the control of how fast the machine happened to
+             * run, which is the same defect the day-clock pin exists to remove.
+             *
+             * Added, not overridden: a QA run has no mouse, so the sum is the
+             * autolook value. */
+            {
+                static int   s_al = -1;
+                static float s_aly = 0.0f, s_alp = 0.0f;
+                if (s_al < 0) {
+                    const char *e = getenv("JCE_DBG_AUTOLOOK");
+                    s_al = 0;
+                    if (e && e[0]) {
+                        const char *c = strchr(e, ',');
+                        s_aly = (float)atof(e) * 0.01745329f;
+                        s_alp = c ? (float)atof(c + 1) * 0.01745329f : 0.0f;
+                        s_al = 1;
+                    }
+                }
+                if (s_al) { yaw += s_aly; pitch += s_alp; }
+            }
+            if (yaw != 0.0f || pitch != 0.0f) {
+                jce_camera_rotate(cam, yaw, pitch);
             }
 
             float speed_mult = 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
-                ImGui::IsKeyDown(ImGuiKey_RightCtrl))
-                speed_mult = 5.0f;
-            else if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
-                     ImGui::IsKeyDown(ImGuiKey_RightShift))
-                speed_mult = 0.4f;
+            if (effective_capture) {
+                if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
+                    ImGui::IsKeyDown(ImGuiKey_RightCtrl))
+                    speed_mult = 5.0f;
+                else if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                         ImGui::IsKeyDown(ImGuiKey_RightShift))
+                    speed_mult = 0.4f;
+            }
 
             float px, py, pz;
             bool has_player =
@@ -706,8 +848,13 @@ void jce_editor_panel_game_view_content(void)
 
                 /* Input Manager actions drive movement (live panel state,
                  * rebinds apply instantly); the hardcoded key is only the
-                 * fallback when an action is missing or has no key bind. */
-                auto act_down = [](const char *name, ImGuiKey fallback) {
+                 * fallback when an action is missing or has no key bind.
+                 * Keyboard only, and only while the viewport is captured —
+                 * `kb` is what keeps WASD from leaking out of an unfocused
+                 * Game View when the pad is what engaged this block. */
+                const bool kb = effective_capture;
+                auto act_down = [kb](const char *name, ImGuiKey fallback) {
+                    if (!kb) return false;
                     int keys[4];
                     int n = jce_editor_input_action_keys(name, keys, 4);
                     if (n <= 0) return ImGui::IsKeyDown(fallback);
@@ -715,7 +862,8 @@ void jce_editor_panel_game_view_content(void)
                         if (ImGui::IsKeyDown((ImGuiKey)keys[i])) return true;
                     return false;
                 };
-                auto act_pressed = [](const char *name, ImGuiKey fallback) {
+                auto act_pressed = [kb](const char *name, ImGuiKey fallback) {
+                    if (!kb) return false;
                     int keys[4];
                     int n = jce_editor_input_action_keys(name, keys, 4);
                     if (n <= 0) return ImGui::IsKeyPressed(fallback, false);
@@ -724,22 +872,36 @@ void jce_editor_panel_game_view_content(void)
                     return false;
                 };
 
-                float wx = 0.0f, wz = 0.0f;
-                if (act_down("move_forward", ImGuiKey_W)) { wx += fwd.x;   wz += fwd.z;   }
-                if (act_down("move_back",    ImGuiKey_S)) { wx -= fwd.x;   wz -= fwd.z;   }
-                if (act_down("move_right",   ImGuiKey_D)) { wx += right.x; wz += right.z; }
-                if (act_down("move_left",    ImGuiKey_A)) { wx -= right.x; wz -= right.z; }
-                float wlen = sqrtf(wx*wx + wz*wz);
-                if (wlen > 0.0001f) { wx /= wlen; wz /= wlen; }
+                /* Keyboard is a digital ±1 per axis; the pad is the signed
+                 * analog value.  They ADD, so either device alone drives and
+                 * both together simply agree or cancel — no mode, no toggle. */
+                float fwd_amt   = (act_down("move_forward", ImGuiKey_W) ? 1.0f : 0.0f)
+                                - (act_down("move_back",    ImGuiKey_S) ? 1.0f : 0.0f)
+                                + pad_fwd;
+                float right_amt = (act_down("move_right",   ImGuiKey_D) ? 1.0f : 0.0f)
+                                - (act_down("move_left",    ImGuiKey_A) ? 1.0f : 0.0f)
+                                + pad_right;
 
-                bool jump      = act_pressed("jump", ImGuiKey_Space);
-                bool jump_held = act_down("jump", ImGuiKey_Space);
+                float wx = fwd.x * fwd_amt + right.x * right_amt;
+                float wz = fwd.z * fwd_amt + right.z * right_amt;
+                /* CLAMP to unit, do not normalize TO unit: a half-deflected
+                 * stick must stay half length so rt_drive_character walks at
+                 * half speed (it scales by the vector length and only clamps
+                 * above 1).  Keyboard is unaffected — its vectors are already
+                 * length 1 (one key) or √2 (two keys, clamped to 1 exactly as
+                 * the old normalize did). */
+                float wlen = sqrtf(wx*wx + wz*wz);
+                if (wlen > 1.0f) { wx /= wlen; wz /= wlen; }
+
+                bool jump      = act_pressed("jump", ImGuiKey_Space) || pad_jump_pressed;
+                bool jump_held = act_down("jump", ImGuiKey_Space)    || pad_jump;
                 /* Hold sprint (Input Manager action; Ctrl fallback) — the
                  * authored CharacterController sprint_mult raises the speed
                  * so the locomotion blend tree / SM crosses into Run. */
                 bool sprint =
                     act_down("sprint", ImGuiKey_LeftCtrl) ||
-                    ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+                    (effective_capture && ImGui::IsKeyDown(ImGuiKey_RightCtrl)) ||
+                    pad_sprint;
                 /* Melee/attack — fed as HELD (not edge): the player input is
                  * gathered here but consumed by the runtime step on the next
                  * tick, so a 1-frame edge would be missed.  The script's own
@@ -752,9 +914,41 @@ void jce_editor_panel_game_view_content(void)
                  * release is swallowed) — which froze attack_pressed true and
                  * let the Lua rising-edge fire exactly once per Play session. */
                 bool attack = act_down("attack", ImGuiKey_J) ||
-                              jce_editor_game_render_mouse_button(0);
-                /* Unit direction only — move_speed/jump arc come from the
-                 * scene's CharacterController component. */
+                              (effective_capture &&
+                               jce_editor_game_render_mouse_button(0)) ||
+                              pad_attack;
+                /* Direction AND magnitude — move_speed/jump arc still come
+                 * from the scene's CharacterController component, but a
+                 * part-deflected stick now arrives as a shorter vector. */
+                /* QA-only: JCE_DBG_AUTOWALK=X,Z feeds a constant walk vector,
+                 * so a headless capture can put the game camera IN MOTION.
+                 *
+                 * A defect reported as "it happens when the view moves" cannot
+                 * be measured from a still frame, and in Play mode the camera
+                 * only moves because the player does. Every other headless
+                 * camera hook here drives the SCENE view's orbit rig, which is
+                 * a different camera on a different code path -- which is why
+                 * the one report that mentions Play mode is also the one that
+                 * has never been reproduced.
+                 *
+                 * Overrides rather than adds: a QA run has no other input, and
+                 * summing would make the value depend on whether a key happened
+                 * to be down. No effect unless the env is set. */
+                {
+                    static int   s_aw = -1;
+                    static float s_awx = 0.0f, s_awz = 0.0f;
+                    if (s_aw < 0) {
+                        const char *e = getenv("JCE_DBG_AUTOWALK");
+                        s_aw = 0;
+                        if (e && e[0]) {
+                            const char *c = strchr(e, ',');
+                            s_awx = (float)atof(e);
+                            s_awz = c ? (float)atof(c + 1) : 0.0f;
+                            s_aw = 1;
+                        }
+                    }
+                    if (s_aw) { wx = s_awx; wz = s_awz; }
+                }
                 jce_editor_play_set_player_input(wx, wz, jump, jump_held, sprint, attack);
                 /* Facing + idle/walk/run clip are driven generically by the
                  * engine runtime (rt_drive_character), so it also works in the
@@ -763,19 +957,31 @@ void jce_editor_panel_game_view_content(void)
                 /* No CharacterController in scene → classic free-fly cam. */
                 float speed = 5.0f * speed_mult;
                 float step  = speed * dt;
-                if (ImGui::IsKeyDown(ImGuiKey_W)) jce_camera_move_forward(cam,  step);
-                if (ImGui::IsKeyDown(ImGuiKey_S)) jce_camera_move_forward(cam, -step);
-                if (ImGui::IsKeyDown(ImGuiKey_D)) jce_camera_move_right  (cam,  step);
-                if (ImGui::IsKeyDown(ImGuiKey_A)) jce_camera_move_right  (cam, -step);
-                if (ImGui::IsKeyDown(ImGuiKey_Space))
-                    jce_camera_move_up(cam,  step);
-                if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
-                    ImGui::IsKeyDown(ImGuiKey_RightShift))
-                    jce_camera_move_up(cam, -step);
+                if (effective_capture) {
+                    if (ImGui::IsKeyDown(ImGuiKey_W)) jce_camera_move_forward(cam,  step);
+                    if (ImGui::IsKeyDown(ImGuiKey_S)) jce_camera_move_forward(cam, -step);
+                    if (ImGui::IsKeyDown(ImGuiKey_D)) jce_camera_move_right  (cam,  step);
+                    if (ImGui::IsKeyDown(ImGuiKey_A)) jce_camera_move_right  (cam, -step);
+                    if (ImGui::IsKeyDown(ImGuiKey_Space))
+                        jce_camera_move_up(cam,  step);
+                    if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                        ImGui::IsKeyDown(ImGuiKey_RightShift))
+                        jce_camera_move_up(cam, -step);
+                }
+                /* The left stick flies the camera too, so a pad is not dead
+                 * in a scene that has no CharacterController.  Analog: the
+                 * step is scaled by deflection, not gated on it. */
+                if (pad_fwd   != 0.0f) jce_camera_move_forward(cam, step * pad_fwd);
+                if (pad_right != 0.0f) jce_camera_move_right  (cam, step * pad_right);
             }
 
-            ImGui::SetNextFrameWantCaptureKeyboard(true);
-            ImGui::SetNextFrameWantCaptureMouse(true);
+            /* Only a CAPTURED viewport may take the keyboard.  Claiming it
+             * because the PAD engaged would swallow every editor shortcut
+             * while the user is working in another panel. */
+            if (effective_capture) {
+                ImGui::SetNextFrameWantCaptureKeyboard(true);
+                ImGui::SetNextFrameWantCaptureMouse(true);
+            }
         }
 
         /* On release edge: re-park the cursor at the centre of the

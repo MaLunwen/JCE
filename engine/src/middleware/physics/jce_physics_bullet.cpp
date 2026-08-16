@@ -16,6 +16,8 @@ extern "C" {
 #include <btBulletDynamicsCommon.h>
 #include <BulletCollision/CollisionShapes/btShapeHull.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
+#include <BulletCollision/CollisionDispatch/btInternalEdgeUtility.h>
+#include <BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h>
 #include <BulletDynamics/Character/btKinematicCharacterController.h>
 #include <BulletDynamics/Vehicle/btRaycastVehicle.h>
 
@@ -2974,4 +2976,185 @@ extern "C" JceBulletWorld *jce_physics_default_bullet_world_(void)
 extern "C" void jce_physics_set_default_bullet_world_(JceBulletWorld *bw)
 {
     g_default_bullet_world = bw;
+}
+
+/* ================================================================== */
+/* Heightfield bodies (terrain)                                        */
+/* ================================================================== */
+
+/* Bullet does NOT copy the heightfield array -- its own docs say the caller
+ * is responsible for maintaining it -- so the shape owns a btScalar copy for
+ * its whole lifetime.  btScalar rather than float matters: PHY_FLOAT means
+ * btScalar, which is double under BT_USE_DOUBLE_PRECISION, and getting that
+ * wrong reads every other sample as garbage. */
+struct JceBulletHeightfield : public btHeightfieldTerrainShape {
+    btScalar          *samples;
+    btTriangleInfoMap *info_map;   /* nullptr unless edge smoothing is on */
+
+    JceBulletHeightfield(int w, int l, btScalar *data,
+                         btScalar min_h, btScalar max_h)
+        : btHeightfieldTerrainShape(w, l, data, btScalar(1.0),
+                                    min_h, max_h, 1 /* up = Y */,
+                                    PHY_FLOAT, /*flipQuadEdges=*/false),
+          samples(data), info_map(nullptr) {}
+
+    ~JceBulletHeightfield() override
+    {
+        delete info_map;
+        JCE_FREE(samples);
+    }
+};
+
+/* Removes the ghost bumps a capsule feels sliding across the shared diagonal
+ * of every cell.  Bullet routes every added contact through one global hook,
+ * so this chains to whatever was installed before instead of stomping it. */
+static ContactAddedCallback s_prev_contact_added = nullptr;
+
+static bool jce_bullet_edge_contact_added(btManifoldPoint &cp,
+                                          const btCollisionObjectWrapper *a,
+                                          int partId0, int index0,
+                                          const btCollisionObjectWrapper *b,
+                                          int partId1, int index1)
+{
+    /* getUserPointer() is the marker set when edge info was generated, so
+     * shapes without it are skipped rather than mis-adjusted. */
+    if (a && a->getCollisionShape() && a->getCollisionShape()->getUserPointer())
+        btAdjustInternalEdgeContacts(cp, a, b, partId0, index0);
+    if (b && b->getCollisionShape() && b->getCollisionShape()->getUserPointer())
+        btAdjustInternalEdgeContacts(cp, b, a, partId1, index1);
+
+    if (s_prev_contact_added)
+        return s_prev_contact_added(cp, a, partId0, index0, b, partId1, index1);
+    return false;
+}
+
+uint32_t jce_bullet_body_create_heightfield(JceBulletWorld *bw,
+                                            jce_vec3 pos, jce_quat rot,
+                                            const float *heights,
+                                            uint32_t samples_x,
+                                            uint32_t samples_z,
+                                            float cell_size_x,
+                                            float cell_size_z,
+                                            float min_height,
+                                            float max_height,
+                                            uint8_t diagonal,
+                                            float friction, float restitution,
+                                            uint32_t col_group,
+                                            uint32_t col_mask,
+                                            bool is_trigger,
+                                            bool smooth_internal_edges)
+{
+    if (!bw || !bw->world || !heights) return UINT32_MAX;
+    if (samples_x < 2u || samples_z < 2u) return UINT32_MAX;
+    if (!(cell_size_x > 0.0f) || !(cell_size_z > 0.0f)) return UINT32_MAX;
+    if (!(max_height > min_height)) return UINT32_MAX;
+
+    const size_t count = (size_t)samples_x * (size_t)samples_z;
+
+    /* Validate BEFORE allocating.  A non-finite or out-of-range sample would
+     * silently corrupt the shape AABB, and Bullet requires min/max to bound
+     * the data for the shape's entire lifetime. */
+    for (size_t i = 0; i < count; ++i) {
+        const float h = heights[i];
+        if (!(h == h)) return UINT32_MAX;                    /* NaN */
+        if (h < min_height || h > max_height) return UINT32_MAX;
+    }
+
+    /* Rotating free-slot search, same as the compound create path. */
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t n = 0; n < bw->capacity; ++n) {
+        uint32_t i = (bw->alloc_cursor + n) % bw->capacity;
+        if (!bw->alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->alloc_cursor = (idx + 1u) % bw->capacity;
+
+    btScalar *data =
+        static_cast<btScalar *>(JCE_MALLOC(count * sizeof(btScalar)));
+    if (!data) return UINT32_MAX;
+    for (size_t i = 0; i < count; ++i)
+        data[i] = static_cast<btScalar>(heights[i]);
+
+    auto *shape = new JceBulletHeightfield(
+        static_cast<int>(samples_x), static_cast<int>(samples_z), data,
+        static_cast<btScalar>(min_height), static_cast<btScalar>(max_height));
+
+    /* Convention 3: the quad diagonal rule is DATA, not a hidden default.
+     * Renderer mesh, CPU raycast and the hole fallback must pick the same one
+     * or they disagree by the full corner-to-corner height at cell centres. */
+    shape->setUseDiamondSubdivision(diagonal == 1);
+    shape->setUseZigzagSubdivision(diagonal == 2);
+
+    /* The shape assumes one world unit between samples; local scaling turns
+     * that into the real cell size. */
+    shape->setLocalScaling(btVector3(static_cast<btScalar>(cell_size_x),
+                                     btScalar(1.0),
+                                     static_cast<btScalar>(cell_size_z)));
+
+    if (smooth_internal_edges) {
+        shape->info_map = new btTriangleInfoMap();
+        btGenerateInternalEdgeInfo(shape, shape->info_map);
+        shape->setUserPointer(shape->info_map);
+        if (gContactAddedCallback != jce_bullet_edge_contact_added) {
+            s_prev_contact_added = gContactAddedCallback;
+            gContactAddedCallback = jce_bullet_edge_contact_added;
+        }
+    }
+
+    /* Convention 1: btHeightfieldTerrainShape centres itself on the midpoint
+     * of its own AABB in ALL THREE axes -- verified in the Bullet source:
+     * m_localOrigin = 0.5*(localAabbMin+localAabbMax) and getVertex()
+     * subtracts it.  Callers pass the field's MIN corner, so the centring is
+     * undone here rather than left for every caller to rediscover.  Without
+     * it the terrain collides half a height-range away from where it is
+     * drawn, which reads like a shadow-bias bug and is not one. */
+    const btScalar half_x = btScalar(0.5) * btScalar(samples_x - 1u) *
+                            static_cast<btScalar>(cell_size_x);
+    const btScalar half_z = btScalar(0.5) * btScalar(samples_z - 1u) *
+                            static_cast<btScalar>(cell_size_z);
+    const btScalar mid_y  = btScalar(0.5) *
+                            (static_cast<btScalar>(min_height) +
+                             static_cast<btScalar>(max_height));
+
+    btTransform start_xf;
+    start_xf.setRotation(to_bt_q(rot));
+    start_xf.setOrigin(to_bt(pos) +
+                       quatRotate(to_bt_q(rot),
+                                  btVector3(half_x, mid_y, half_z)));
+
+    auto *motion = new btDefaultMotionState(start_xf);
+    btRigidBody::btRigidBodyConstructionInfo ci(btScalar(0.0), motion, shape,
+                                                btVector3(0, 0, 0));
+    ci.m_friction    = static_cast<btScalar>(friction);
+    ci.m_restitution = static_cast<btScalar>(restitution);
+
+    auto *body = new btRigidBody(ci);
+    apply_sleep_thresholds(bw, body);
+
+    if (smooth_internal_edges) {
+        body->setCollisionFlags(body->getCollisionFlags() |
+                                btCollisionObject::CF_CUSTOM_MATERIAL_CALLBACK);
+    }
+    if (is_trigger) {
+        body->setCollisionFlags(body->getCollisionFlags() |
+                                btCollisionObject::CF_NO_CONTACT_RESPONSE);
+    }
+
+    uint32_t handle =
+        handle_encode(idx, bw->generations ? bw->generations[idx] : 0u);
+    body->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(handle)));
+
+    bw->world->addRigidBody(body, static_cast<int>(col_group),
+                            static_cast<int>(col_mask));
+    bw->bodies[idx] = body;
+    bw->alive[idx]  = true;
+
+    /* Registered as an owned shape so teardown deletes it, and through the
+     * destructor the sample copy and the triangle info map with it. */
+    if (bw->owned_shapes) {
+        auto *owned = new btAlignedObjectArray<btCollisionShape *>();
+        owned->push_back(shape);
+        bw->owned_shapes[idx] = owned;
+    }
+    return handle;
 }

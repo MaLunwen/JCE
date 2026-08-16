@@ -8,6 +8,9 @@
 # Public:
 #   jce_shader_profiles(<out-var>)
 #   jce_shader_pak_exclude_flags(<out-var> [PROFILES <p> [<p>...]])
+#   jce_add_project_shaders(TARGET <target> SOURCE_DIR <dir>
+#       OUTPUT_DIR <dir> VARYING_DEF <file> [INCLUDE_DIRS <dir> ...]
+#       [PROFILES <suffix> ...] [OUT_FILES_VAR <var>])
 #
 #   jce_target_embed_pak(<target>
 #       RESOURCE_DIRS  <dir> [<dir>...]
@@ -137,6 +140,85 @@ function(jce_shader_pak_exclude_flags OUT_VAR)
 endfunction()
 
 # ------------------------------------------------------------------ #
+# jce_add_project_shaders(...)                                       #
+#                                                                     #
+# Project shaders use the engine's exact shaderc/profile/lint path.   #
+# The output stays a normal project asset and is never linked into    #
+# the engine library. Missing compiler/include inputs are fatal: an   #
+# executable with silently absent project shaders is not releasable.  #
+# ------------------------------------------------------------------ #
+function(jce_add_project_shaders)
+	cmake_parse_arguments(PS ""
+		"TARGET;SOURCE_DIR;OUTPUT_DIR;VARYING_DEF;OUT_FILES_VAR"
+		"INCLUDE_DIRS;PROFILES" ${ARGN})
+	foreach(_required TARGET SOURCE_DIR OUTPUT_DIR VARYING_DEF)
+		if(NOT PS_${_required})
+			message(FATAL_ERROR
+				"jce_add_project_shaders: ${_required} is required.")
+		endif()
+	endforeach()
+	if(TARGET ${PS_TARGET})
+		message(FATAL_ERROR
+			"jce_add_project_shaders: target '${PS_TARGET}' already exists.")
+	endif()
+	if(NOT IS_DIRECTORY "${PS_SOURCE_DIR}")
+		message(FATAL_ERROR
+			"jce_add_project_shaders: SOURCE_DIR not found: ${PS_SOURCE_DIR}")
+	endif()
+	if(NOT EXISTS "${PS_SOURCE_DIR}/${PS_VARYING_DEF}")
+		message(FATAL_ERROR
+			"jce_add_project_shaders: VARYING_DEF not found: "
+			"${PS_SOURCE_DIR}/${PS_VARYING_DEF}")
+	endif()
+
+	if(NOT BGFX_SHADER_INCLUDE_PATH AND JCE_BGFX_SHADER_INCLUDE_PATH)
+		set(BGFX_SHADER_INCLUDE_PATH "${JCE_BGFX_SHADER_INCLUDE_PATH}")
+	endif()
+	if(NOT BGFX_SHADER_INCLUDE_PATH)
+		message(FATAL_ERROR
+			"jce_add_project_shaders: BGFX shader ABI include path is unavailable.")
+	endif()
+
+	set(_compile_module
+		"${CMAKE_CURRENT_FUNCTION_LIST_DIR}/JCECompileShaders.cmake")
+	if(NOT EXISTS "${_compile_module}")
+		set(_compile_module
+			"${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tools/compile_shaders.cmake")
+	endif()
+	if(NOT EXISTS "${_compile_module}")
+		message(FATAL_ERROR
+			"jce_add_project_shaders: compile module is unavailable.")
+	endif()
+	include("${_compile_module}")
+	set(_project_include_dirs ${PS_INCLUDE_DIRS})
+	if(JCE_SHADER_INCLUDE_PATH)
+		list(APPEND _project_include_dirs "${JCE_SHADER_INCLUDE_PATH}")
+	elseif(EXISTS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../engine/shaders/include")
+		list(APPEND _project_include_dirs
+			"${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../engine/shaders/include")
+	endif()
+
+	if(PS_PROFILES)
+		set(JCE_SHADER_PROFILES ${PS_PROFILES})
+	elseif(NOT JCE_SHADER_PROFILES)
+		jce_shader_profiles(JCE_SHADER_PROFILES)
+	endif()
+	jce_compile_shaders(
+		REQUIRED
+		TARGET        ${PS_TARGET}
+		SHADER_DIR    "${PS_SOURCE_DIR}"
+		VARYING_DEF   "${PS_VARYING_DEF}"
+		OUTPUT_DIR    "${PS_OUTPUT_DIR}"
+		INCLUDE_DIRS  ${_project_include_dirs}
+		OUT_FILES_VAR _project_shader_outputs)
+	set_property(TARGET ${PS_TARGET} PROPERTY
+		JCE_PROJECT_SHADER_OUTPUTS "${_project_shader_outputs}")
+	if(PS_OUT_FILES_VAR)
+		set(${PS_OUT_FILES_VAR} ${_project_shader_outputs} PARENT_SCOPE)
+	endif()
+endfunction()
+
+# ------------------------------------------------------------------ #
 # jce_configure_application_target(<target>)                           #
 #                                                                     #
 # Apply the portable shipping policy to an SDK-consumer executable.   #
@@ -236,9 +318,9 @@ endfunction()
 #                                    <out-file>)                     #
 #                                                                     #
 # Shipping applications boot from their embedded PAK, not from the   #
-# authoring-only jce_project.json staged beside an executable.  Emit  #
-# the narrow runtime contract under the reserved JPAK key             #
-# jce/runtime_boot.json; it contains only the selected scene path.    #
+# authoring-only project files staged beside an executable.  Emit the #
+# narrow boot contract and, when authored, the runtime input map into #
+# reserved virtual paths under one generated resource root.           #
 # ------------------------------------------------------------------ #
 function(_jce_prepare_runtime_boot_manifest TARGET PROJECT_FILE OUT_DIR OUT_FILE)
 
@@ -280,6 +362,15 @@ function(_jce_prepare_runtime_boot_manifest TARGET PROJECT_FILE OUT_DIR OUT_FILE
 		"  \"schema\": 1,\n"
 		"  \"startup_scene\": \"${_scene_json}\"\n"
 		"}\n")
+
+	get_filename_component(_project_dir "${PROJECT_FILE}" DIRECTORY)
+	set(_input_actions "${_project_dir}/.jce/input_actions.json")
+	if(EXISTS "${_input_actions}")
+		set(_input_actions_out
+			"${_boot_dir}/settings/input_actions.json")
+		file(MAKE_DIRECTORY "${_boot_dir}/settings")
+		configure_file("${_input_actions}" "${_input_actions_out}" COPYONLY)
+	endif()
 
 	set(${OUT_DIR} "${_boot_dir}" PARENT_SCOPE)
 	set(${OUT_FILE} "${_boot_file}" PARENT_SCOPE)
@@ -732,7 +823,7 @@ function(jce_add_pak TARGET)
 
 	set(_opts  NO_ENGINE_RESOURCES NO_COOK STRIP_DEBUG_PATHS)
 	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE COOK_PLATFORM)
-	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_COOK_ARGS)
+	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_COOK_ARGS EXTRA_DEPENDS)
 	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
 	# ---- 1. Editor path: prebuilt assets already cooked + packed. --- #
@@ -784,6 +875,9 @@ function(jce_add_pak TARGET)
 		if(_runtime_boot_file)
 			list(APPEND _raw_embed_args EXTRA_DEPENDS "${_runtime_boot_file}")
 		endif()
+		if(AP_EXTRA_DEPENDS)
+			list(APPEND _raw_embed_args EXTRA_DEPENDS ${AP_EXTRA_DEPENDS})
+		endif()
 		jce_target_embed_pak(${TARGET} ${_raw_embed_args})
 		return()
 	endif()
@@ -828,6 +922,9 @@ function(jce_add_pak TARGET)
 		file(GLOB_RECURSE _files CONFIGURE_DEPENDS "${_d}/*")
 		list(APPEND _cook_inputs ${_files})
 	endforeach()
+	if(AP_EXTRA_DEPENDS)
+		list(APPEND _cook_inputs ${AP_EXTRA_DEPENDS})
+	endif()
 
 	# One jce_cook --batch per source dir, all merged into _cooked_dir.
 	#

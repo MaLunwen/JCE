@@ -38,6 +38,12 @@ typedef struct JceRuntimeBootManifest {
     bool    run_in_background;    /* player.run_in_background */
 } JceRuntimeBootManifest;
 
+/* True when `path` is a non-empty, normalized VFS-relative scene path.
+ * Host absolute paths, backslashes, control bytes, empty segments and
+ * dot/dot-dot traversal are rejected.  Runtime launch overrides use the
+ * exact same boundary as the shipping boot manifest. */
+JCE_API bool JCE_CALL jce_runtime_boot_scene_path_is_valid(const char *path);
+
 /* Parse a compact runtime boot manifest. Invalid contracts, schema versions,
  * and non-virtual scene paths are rejected. */
 JCE_API bool JCE_CALL jce_runtime_boot_manifest_parse(

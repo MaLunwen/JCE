@@ -35,6 +35,13 @@ JCE_API bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
                                       uint32_t clear_rgba,
                                       const char *view_name);
 
+/* Bind another ordered view to the bridge's existing framebuffer without
+ * clearing it.  This is used for passes that must retain both scene color and
+ * depth while executing after an intermediate full-screen stage. */
+JCE_API bool jce_offscreen_target_prepare_overlay_view(
+    JceOffscreenTarget *bridge, uint16_t view_id,
+    const float *view16, const float *proj16, const char *view_name);
+
 /* Query bridge-owned texture/view handles for panel integration. */
 JCE_API uint16_t jce_offscreen_target_get_color_texture(
     const JceOffscreenTarget *bridge);

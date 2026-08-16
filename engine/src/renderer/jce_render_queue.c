@@ -550,7 +550,9 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
         ctx.have_binder = have_binder;
         ctx.per = per;
         ctx.api_tid = jce_thread_current_id();
-        jce_thread_pool_parallel_for(pool, rq->count, per, rq_flush_chunk, &ctx);
+        jce_thread_pool_parallel_for_named(
+            pool, "render-queue.flush", rq->count, per,
+            rq_flush_chunk, &ctx);
 
         /* Replay any deferred (pool-exhausted) ranges serially on the API thread
          * via the implicit encoder — safe here, never on a worker. */

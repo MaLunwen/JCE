@@ -6,10 +6,12 @@
  * and the previous pass's output as input texture.
  */
 
+#include "renderer/jce_view_bands.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_render_pipeline.h>  /* hdr_color: LDR on low tiers */
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_views.h>
 
@@ -218,31 +220,59 @@ static const uint16_t s_quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
  * merely LDR-clamped (bloom extraction over threshold 1.0 mostly no-ops). */
 static bgfx_texture_format_t postfx_color_format(void)
 {
-    static bgfx_texture_format_t s_fmt = BGFX_TEXTURE_FORMAT_COUNT; /* unresolved */
-    if (s_fmt == BGFX_TEXTURE_FORMAT_COUNT) {
+    /* Hardware capability is fixed for the process, so cache only that. */
+    static int s_hw_can_16f = -1;
+    if (s_hw_can_16f < 0) {
         const bgfx_caps_t *caps = bgfx_get_caps();
         if (!caps)
             return BGFX_TEXTURE_FORMAT_RGBA16F; /* pre-init probe: don't cache */
-        if ((caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
-             & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) == 0) {
-            s_fmt = BGFX_TEXTURE_FORMAT_RGBA8;
+        s_hw_can_16f = (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
+                        & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) != 0;
+        if (!s_hw_can_16f)
             LOG_WARN(LOG_TAG, "RGBA16F render target unsupported; post-FX "
                               "chain falls back to RGBA8 (LDR bloom/TAA)");
-        } else {
-            s_fmt = BGFX_TEXTURE_FORMAT_RGBA16F;
-        }
     }
-    return s_fmt;
+    if (!s_hw_can_16f) return BGFX_TEXTURE_FORMAT_RGBA8;
+
+    /* The pipeline's hdr_color flag is false on the LOW and MEDIUM tiers --
+     * PBR, bloom, SSAO, SSR and TAA are all off there, so nothing consumes
+     * values above 1.0 and the extra precision buys nothing.  It was never
+     * consulted here, so a low-end machine that merely *could* do RGBA16F
+     * still paid 8 bytes per pixel for every full-resolution target: at 1080p
+     * that is 8.3 MB each, across the composite, bloom and TAA buffers.
+     * Asked live rather than cached because the pipeline can be re-applied
+     * (tier default, then the project's .rp.json) after the first probe. */
+    if (!jce_render_pipeline_is_feature_enabled("hdr_color"))
+        return BGFX_TEXTURE_FORMAT_RGBA8;
+    return BGFX_TEXTURE_FORMAT_RGBA16F;
 }
 
 /* Allocate one full-res RGBA16F intermediate FBO (color texture + framebuffer).
  * destroyTextures=true so destroying the FB also frees the attached texture —
  * otherwise destroy_fbos() leaks handles, which during ImGui drag-resize
  * exhausts bgfx's texture pool and yields recycled-handle AVs in the driver. */
+/* Bloom works at HALF resolution, as it does in every standard engine
+ * (Unity's bloom starts at half-res, Unreal downsamples, Godot uses mips).
+ * Bloom is a low-frequency effect: a full-resolution blur buffer buys no
+ * detail it can represent, and at 1600x1000 the two bloom buffers cost
+ * 12.8 MB of the LOW tier's 44 MB budget.  Halving each axis quarters that.
+ * The blur step uses THIS buffer's texel size, so the screen-space blur
+ * radius is preserved rather than halved. */
+static uint32_t postfx_bloom_w(const JcePostFXPipeline *p)
+{ uint32_t v = p->width  / 2u; return v ? v : 1u; }
+static uint32_t postfx_bloom_h(const JcePostFXPipeline *p)
+{ uint32_t v = p->height / 2u; return v ? v : 1u; }
+
+/* FBO 2 (bloom accumulation) and FBO 3 (legacy blur scratch) are the bloom
+ * buffers; 0 and 1 are the full-resolution composite ping-pong pair. */
+static bool postfx_fbo_is_bloom(int i) { return i == 2 || i == 3; }
+
 static void alloc_one_fbo(JcePostFXPipeline *p, int i)
 {
+    const uint32_t fw = postfx_fbo_is_bloom(i) ? postfx_bloom_w(p) : p->width;
+    const uint32_t fh = postfx_fbo_is_bloom(i) ? postfx_bloom_h(p) : p->height;
     p->fbo_tex[i] = bgfx_create_texture_2d(
-        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        (uint16_t)fw, (uint16_t)fh, false, 1,
         postfx_color_format(),
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL, 0);
@@ -499,9 +529,9 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->taa_motion_tex.idx  = UINT16_MAX;
     p->taa_motion_fb.idx   = UINT16_MAX;
     p->taa_ext_motion_tex.idx = UINT16_MAX;
-    p->taa_params[0] = 0.9f;   /* feedback */
-    p->taa_params[1] = 1.0f;   /* luma_clamp */
-    p->taa_params[2] = 1.0f;   /* motion_clamp */
+    p->taa_params[0] = 0.9f;   /* feedback   -- see r.taa.* cvars; the */
+    p->taa_params[1] = 1.0f;   /* luma_clamp    per-frame jce_postfx_set_taa */
+    p->taa_params[2] = 1.0f;   /* motion_clamp  call is what actually owns    */
     p->taa_params[3] = 0.0f;
     p->custom_name[0]         = '\0';
     p->custom_loaded[0]       = '\0';
@@ -931,6 +961,13 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 {
     if (!pipeline) return;
 
+    /* Declare the chain's view range. It re-bases (jce_postfx_set_view_base)
+     * and spans view_base..+20 -- exactly the span another subsystem assumed
+     * was free and took: the dual-shadow atlas owned TAA_Resolve,
+     * TAA_HistoryCopy and Composite, and the frame stopped reaching the
+     * backbuffer with nothing in any log saying so. */
+    jce_view_bands_claim("postfx", pipeline->view_base, 21u);
+
     reset_output_state(pipeline);
 
     if (!pipeline->shaders_loaded) return;
@@ -1015,6 +1052,15 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_view_rect((vid), 0, 0, (uint16_t)pipeline->width, (uint16_t)pipeline->height);    \
         bgfx_set_view_frame_buffer((vid), (fb));                                                   \
         bgfx_set_view_clear((vid), BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);                         \
+    } while (0)
+
+/* As POSTFX_SETUP_VIEW but with an explicit target size, for the bloom
+ * buffers, which are half resolution. */
+#define POSTFX_SETUP_VIEW_SIZE(vid, fb, w, h)                                                  \
+    do {                                                                                       \
+        bgfx_set_view_rect((vid), 0, 0, (uint16_t)(w), (uint16_t)(h));                         \
+        bgfx_set_view_frame_buffer((vid), (fb));                                                \
+        bgfx_set_view_clear((vid), BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);                      \
     } while (0)
 
 #define POSTFX_LABEL(vid, name) bgfx_set_view_name((vid), (name), INT32_MAX)
@@ -1113,7 +1159,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         };
         bgfx_set_uniform(pipeline->u_bloomParams, bloom_params, 1);
 
-        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
+        POSTFX_SETUP_VIEW_SIZE(view_id, pipeline->fbo[2],
+                               postfx_bloom_w(pipeline), postfx_bloom_h(pipeline));
         bgfx_set_view_name(view_id, "PostFX/BloomExtract", INT32_MAX);
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_extract);
@@ -1135,8 +1182,15 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                 /* Downsample chain: extract result → mip[0] → mip[1] → ... → mip[n-1]. */
                 bgfx_texture_handle_t down_src = pipeline->fbo_tex[2]; /* extract result */
                 for (int mi = 0; mi < n; mi++) {
-                    uint32_t src_w = (mi == 0) ? pipeline->width  : pipeline->bloom_mip_w[mi - 1];
-                    uint32_t src_h = (mi == 0) ? pipeline->height : pipeline->bloom_mip_h[mi - 1];
+                    /* mi == 0 samples fbo_tex[2], which alloc_one_fbo sizes
+                     * at HALF resolution via postfx_bloom_w/h -- not
+                     * pipeline->width/height.  Using the full-res size here
+                     * halved the texel step and made the first downsample tap
+                     * the wrong neighbourhood. */
+                    uint32_t src_w = (mi == 0) ? postfx_bloom_w(pipeline)
+                                               : pipeline->bloom_mip_w[mi - 1];
+                    uint32_t src_h = (mi == 0) ? postfx_bloom_h(pipeline)
+                                               : pipeline->bloom_mip_h[mi - 1];
                     float ts[4] = { 1.0f / (float)src_w, 1.0f / (float)src_h, 0.0f, 0.0f };
                     bgfx_set_uniform(pipeline->u_texelSize, ts, 1);
 
@@ -1168,9 +1222,14 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                     uint32_t dst_w, dst_h;
                     if (mi == 0) {
                         /* Final upsample: write into fbo[2] (the composite's bloom input). */
+                        /* fbo[2] is HALF resolution (postfx_bloom_w/h).
+                         * Setting a full-res view rect on it stretched the
+                         * final upsample over twice the target, smearing the
+                         * bloom across the whole frame -- with a bright source
+                         * that washes the entire image to white. */
                         up_dst = pipeline->fbo[2];
-                        dst_w  = pipeline->width;
-                        dst_h  = pipeline->height;
+                        dst_w  = postfx_bloom_w(pipeline);
+                        dst_h  = postfx_bloom_h(pipeline);
                     } else {
                         up_dst = pipeline->bloom_mip_fb[mi - 1];
                         dst_w  = pipeline->bloom_mip_w[mi - 1];
@@ -1202,17 +1261,24 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             /* ── LOW/MID: legacy single-mip Gaussian blur (byte-identical) ── */
             if (pipeline->prog_bloom_blur.idx != UINT16_MAX &&
                 ensure_bloom_blur_h_fbo(pipeline)) {
-                float blur_h[4] = { texel_size[0], 0.0f, 0.0f, 0.0f };
+                /* Step by the BLOOM buffer's texel, not the full-res one:
+                 * on a half-res target the full-res step would halve the
+                 * screen-space blur radius and visibly tighten the glow. */
+                const float bw = (float)postfx_bloom_w(pipeline);
+                const float bh = (float)postfx_bloom_h(pipeline);
+                float blur_h[4] = { 1.0f / bw, 0.0f, 0.0f, 0.0f };
                 bgfx_set_uniform(pipeline->u_blurDir, blur_h, 1);
-                POSTFX_SETUP_VIEW(view_id, pipeline->fbo[3]);
+                POSTFX_SETUP_VIEW_SIZE(view_id, pipeline->fbo[3],
+                                       (uint32_t)bw, (uint32_t)bh);
                 bgfx_set_view_name(view_id, "PostFX/BloomBlurH", INT32_MAX);
                 bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[2], UINT32_MAX);
                 draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
                 view_id++;
 
-                float blur_v[4] = { 0.0f, texel_size[1], 0.0f, 0.0f };
+                float blur_v[4] = { 0.0f, 1.0f / bh, 0.0f, 0.0f };
                 bgfx_set_uniform(pipeline->u_blurDir, blur_v, 1);
-                POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
+                POSTFX_SETUP_VIEW_SIZE(view_id, pipeline->fbo[2],
+                                       (uint32_t)bw, (uint32_t)bh);
                 bgfx_set_view_name(view_id, "PostFX/BloomBlurV", INT32_MAX);
                 bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[3], UINT32_MAX);
                 draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);

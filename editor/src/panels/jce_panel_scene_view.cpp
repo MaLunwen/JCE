@@ -8,11 +8,15 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include <jce/os/core/jce_filesystem.h>   /* host write: editor code does not use stdio file IO */
+#include <cstdlib>      /* getenv */
+#include <cstdio>       /* snprintf */
 #include "jce_panel_common.h"        /* multi-select duplicate / delete */
 #include "ui/jce_editor_dnd.h"
 #include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
 #include "scene/jce_editor_scene_asset_cache.h"
+#include "scene/jce_editor_scene_camera_tools.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_project_state.h"
@@ -188,6 +192,19 @@ static void draw_scene_view_toolbar(void)
                 jce_state_set_view_mode(JCE_VIEW_METALLIC);
             if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.ao", "Ambient Occlusion"), NULL, vm == JCE_VIEW_AO))
                 jce_state_set_view_mode(JCE_VIEW_AO);
+            ImGui::Separator();
+            /* Shadow + depth views.  Separated from the material channels
+             * above because they answer a different kind of question: those
+             * show what a surface IS, these show where it sits relative to the
+             * shadow cascades.  Read together they say whether a change that
+             * tracks distance is a cascade boundary, the end of the shadow
+             * range, or neither. */
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.sceneDepth", "Scene Depth"), NULL, vm == JCE_VIEW_SCENE_DEPTH))
+                jce_state_set_view_mode(JCE_VIEW_SCENE_DEPTH);
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.shadowCascades", "Shadow Cascades"), NULL, vm == JCE_VIEW_SHADOW_CASCADES))
+                jce_state_set_view_mode(JCE_VIEW_SHADOW_CASCADES);
+            if (ImGui::MenuItem(jce_editor_i18n_id("sceneView.shadowMask", "Shadow Mask"), NULL, vm == JCE_VIEW_SHADOW_MASK))
+                jce_state_set_view_mode(JCE_VIEW_SHADOW_MASK);
             ImGui::EndMenu();
         }
 
@@ -324,6 +341,33 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
 
     ImVec2 screen_pos = ImGui::GetCursorScreenPos();
     ImDrawList *dl = ImGui::GetWindowDrawList();
+
+    /* JCE_DBG_VIEWPORT_RECT=<path> -- write where the 3D view sits in the
+     * window, in pixels.
+     *
+     * The capture harness screenshots the whole editor, so every measurement
+     * taken from one has to know which pixels are the render and which are
+     * chrome.  Guessing that rectangle cost this investigation real time and
+     * two wrong conclusions: a "far ground" region that turned out to be
+     * mostly sky, and a near-to-far colour gradient measured along IMAGE ROWS,
+     * which on a tilted view is not distance at all -- the far hillside also
+     * faces the sun differently, so the two effects were inseparable.
+     *
+     * The panel knows the rectangle exactly. Writing it down is cheaper than
+     * any amount of inferring it from pixels, and it cannot drift from the
+     * layout because it is emitted by the layout. */
+    if (const char *rp = std::getenv("JCE_DBG_VIEWPORT_RECT")) {
+        static bool s_written = false;
+        if (!s_written && avail.x > 1.0f && avail.y > 1.0f) {
+            s_written = true;
+            char line[192];
+            int n = std::snprintf(line, sizeof line,
+                "VIEWPORT x=%d y=%d w=%d h=%d\n",
+                (int)screen_pos.x, (int)screen_pos.y,
+                (int)avail.x, (int)avail.y);
+            if (n > 0) jce_fs_host_write_all(rp, line, (size_t)n);
+        }
+    }
 
     dl->AddRectFilled(screen_pos,
                       ImVec2(screen_pos.x + avail.x, screen_pos.y + avail.y),
@@ -557,20 +601,20 @@ static void assign_texture_drop_to_mesh_renderer(JceMeshRenderer *mesh_renderer_
     auto &mr = *mesh_renderer_comp;
     switch (slot) {
     case 1:
-        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", store_path);
+        mr.mr_tex = jce_scene_intern(jce_state_get_scene(), store_path);
         break;
     case 2:
-        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", store_path);
+        mr.normal_tex = jce_scene_intern(jce_state_get_scene(), store_path);
         break;
     case 3:
-        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", store_path);
+        mr.ao_tex = jce_scene_intern(jce_state_get_scene(), store_path);
         break;
     case 4:
-        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", store_path);
+        mr.emissive_tex = jce_scene_intern(jce_state_get_scene(), store_path);
         break;
     case 0:
     default:
-        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", store_path);
+        mr.albedo_tex = jce_scene_intern(jce_state_get_scene(), store_path);
         break;
     }
 }
@@ -591,23 +635,23 @@ static bool apply_material_asset_to_mesh_renderer(JceMeshRenderer *mesh_renderer
     const char *store_path = jce_editor_path_relative_or(rel, sizeof(rel), asset_path);
 
     auto &mr = *mesh_renderer_comp;
-    snprintf(mr.material_path, sizeof(mr.material_path), "%s", store_path);
-    mr.albedo_tex[0] = '\0';
-    mr.mr_tex[0] = '\0';
-    mr.normal_tex[0] = '\0';
-    mr.ao_tex[0] = '\0';
-    mr.emissive_tex[0] = '\0';
+    mr.material_path = jce_scene_intern(jce_state_get_scene(), store_path);
+    mr.albedo_tex = jce_scene_intern(jce_state_get_scene(), "");
+    mr.mr_tex = jce_scene_intern(jce_state_get_scene(), "");
+    mr.normal_tex = jce_scene_intern(jce_state_get_scene(), "");
+    mr.ao_tex = jce_scene_intern(jce_state_get_scene(), "");
+    mr.emissive_tex = jce_scene_intern(jce_state_get_scene(), "");
 
     if (tex_paths[0][0])
-        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", tex_paths[0]);
+        mr.albedo_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[0]);
     if (tex_paths[1][0])
-        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", tex_paths[1]);
+        mr.mr_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[1]);
     if (tex_paths[2][0])
-        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", tex_paths[2]);
+        mr.normal_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[2]);
     if (tex_paths[3][0])
-        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", tex_paths[3]);
+        mr.ao_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[3]);
     if (tex_paths[4][0])
-        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", tex_paths[4]);
+        mr.emissive_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[4]);
 
     mr.base_color[0] = material.base_color_factor[0];
     mr.base_color[1] = material.base_color_factor[1];
@@ -638,20 +682,15 @@ static void apply_extracted_material_to_mesh_renderer(
      * anchor once the editor runs from a different directory. */
     auto &mr = *mesh_renderer_comp;
     if (material->albedo_tex[0])
-        jce_editor_path_store_asset_ref(mr.albedo_tex, sizeof(mr.albedo_tex),
-                                        material->albedo_tex);
+        jce_editor_path_store_asset_ref_interned(jce_state_get_scene(), &mr.albedo_tex, material->albedo_tex);
     if (material->mr_tex[0])
-        jce_editor_path_store_asset_ref(mr.mr_tex, sizeof(mr.mr_tex),
-                                        material->mr_tex);
+        jce_editor_path_store_asset_ref_interned(jce_state_get_scene(), &mr.mr_tex, material->mr_tex);
     if (material->normal_tex[0])
-        jce_editor_path_store_asset_ref(mr.normal_tex, sizeof(mr.normal_tex),
-                                        material->normal_tex);
+        jce_editor_path_store_asset_ref_interned(jce_state_get_scene(), &mr.normal_tex, material->normal_tex);
     if (material->ao_tex[0])
-        jce_editor_path_store_asset_ref(mr.ao_tex, sizeof(mr.ao_tex),
-                                        material->ao_tex);
+        jce_editor_path_store_asset_ref_interned(jce_state_get_scene(), &mr.ao_tex, material->ao_tex);
     if (material->emissive_tex[0])
-        jce_editor_path_store_asset_ref(mr.emissive_tex, sizeof(mr.emissive_tex),
-                                        material->emissive_tex);
+        jce_editor_path_store_asset_ref_interned(jce_state_get_scene(), &mr.emissive_tex, material->emissive_tex);
 
     mr.base_color[0] = material->base_color[0];
     mr.base_color[1] = material->base_color[1];
@@ -1141,15 +1180,14 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                 jce_state_begin_batch_edit();
                 {
                     auto &mr = *mesh_renderer_comp;
-                    snprintf(mr.mesh_path, sizeof(mr.mesh_path),
-                             "%s", store_mesh);
+                    mr.mesh_path = jce_scene_intern(jce_state_get_scene(), store_mesh);
                     mr.mesh_shape = 0;
-                    mr.material_path[0] = '\0';
-                    mr.albedo_tex[0] = '\0';
-                    mr.mr_tex[0] = '\0';
-                    mr.normal_tex[0] = '\0';
-                    mr.ao_tex[0] = '\0';
-                    mr.emissive_tex[0] = '\0';
+                    mr.material_path = jce_scene_intern(jce_state_get_scene(), "");
+                    mr.albedo_tex = jce_scene_intern(jce_state_get_scene(), "");
+                    mr.mr_tex = jce_scene_intern(jce_state_get_scene(), "");
+                    mr.normal_tex = jce_scene_intern(jce_state_get_scene(), "");
+                    mr.ao_tex = jce_scene_intern(jce_state_get_scene(), "");
+                    mr.emissive_tex = jce_scene_intern(jce_state_get_scene(), "");
                 }
                 jce_state_end_batch_edit();
 
@@ -1220,15 +1258,14 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                                                          src_mesh2);
                             const char *store_mesh2 = rel_mesh2[0]
                                                        ? rel_mesh2 : src_mesh2;
-                            snprintf(mr->mesh_path, sizeof(mr->mesh_path),
-                                     "%s", store_mesh2);
+                            mr->mesh_path = jce_scene_intern(jce_state_get_scene(), store_mesh2);
                             mr->mesh_shape = 0;
-                            mr->material_path[0] = '\0';
-                            mr->albedo_tex[0] = '\0';
-                            mr->mr_tex[0] = '\0';
-                            mr->normal_tex[0] = '\0';
-                            mr->ao_tex[0] = '\0';
-                            mr->emissive_tex[0] = '\0';
+                            mr->material_path = jce_scene_intern(jce_state_get_scene(), "");
+                            mr->albedo_tex = jce_scene_intern(jce_state_get_scene(), "");
+                            mr->mr_tex = jce_scene_intern(jce_state_get_scene(), "");
+                            mr->normal_tex = jce_scene_intern(jce_state_get_scene(), "");
+                            mr->ao_tex = jce_scene_intern(jce_state_get_scene(), "");
+                            mr->emissive_tex = jce_scene_intern(jce_state_get_scene(), "");
                             jce_editor_console_log_level(JCE_CONSOLE_INFO,
                                 "[drop-diag] new entity mesh_path='%s' exists=%d",
                                 mr->mesh_path, (int)jce_fs_host_exists_file(mr->mesh_path));
@@ -1451,6 +1488,29 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                 jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_FRONT);
             if (ImGui::MenuItem(jce_editor_i18n("sceneView.sideView")))
                 jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_RIGHT);
+            ImGui::Separator();
+            const uint32_t focused = jce_state_get_focused();
+            JceScene *scene = jce_state_get_scene();
+            const bool has_camera = scene && focused != 0
+                && jce_scene_get_camera(scene, (JceEntity)focused) != nullptr;
+            char align_chord[64];
+            char pilot_chord[64];
+            jce_hotkey_chord_label(
+                jce_hotkey_get(JCE_HK_VIEW_ALIGN_SELECTED_CAMERA),
+                align_chord, sizeof(align_chord));
+            jce_hotkey_chord_label(
+                jce_hotkey_get(JCE_HK_VIEW_PILOT_SELECTED_CAMERA),
+                pilot_chord, sizeof(pilot_chord));
+            if (ImGui::MenuItem(jce_editor_i18n("sceneView.camera.align"),
+                                align_chord, false, has_camera))
+                (void)jce_editor_scene_camera_align_selected();
+            const char *pilot_label = jce_editor_scene_camera_is_piloting()
+                ? jce_editor_i18n("sceneView.camera.stopPiloting")
+                : jce_editor_i18n("sceneView.camera.pilot");
+            if (ImGui::MenuItem(pilot_label, pilot_chord,
+                                jce_editor_scene_camera_is_piloting(),
+                                has_camera))
+                (void)jce_editor_scene_camera_toggle_pilot();
             ImGui::EndMenu();
         }
 
@@ -1460,7 +1520,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
 
 /* ── Maya-style camera controls ──────────────────────────────────── */
 
-static void handle_scene_camera_controls(bool viewport_hovered)
+static bool handle_scene_camera_controls(bool viewport_hovered)
 {
     ImGuiIO &io = ImGui::GetIO();
     bool alt_held = io.KeyAlt;
@@ -1469,11 +1529,13 @@ static void handle_scene_camera_controls(bool viewport_hovered)
        default sign is +1. The pref opts INTO Apple natural-scroll. */
     float dy_sign     = jce_editor_pref_invert_drag_y      ? -1.0f : 1.0f;
     float wheel_sign  = jce_editor_pref_invert_scroll_zoom ? -1.0f : 1.0f;
+    bool navigated = false;
 
     if (viewport_hovered && alt_held && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)) {
         float dyaw   = io.MouseDelta.x * 0.005f;
         float dpitch = io.MouseDelta.y * 0.005f * dy_sign;
         jce_editor_scene_camera_orbit(dyaw, dpitch);
+        navigated = true;
     }
 
     /* Pan: "grab the world" — drag right → world slides right under cursor
@@ -1484,15 +1546,18 @@ static void handle_scene_camera_controls(bool viewport_hovered)
         float pan_x = io.MouseDelta.x;
         float pan_y = io.MouseDelta.y * dy_sign;
         jce_editor_scene_camera_pan(pan_x, pan_y);
+        navigated = true;
     }
 
     if (viewport_hovered && alt_held && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f)) {
         float zoom_delta = -io.MouseDelta.y * 0.05f * dy_sign;
         jce_editor_scene_camera_zoom(zoom_delta);
+        navigated = true;
     }
 
     if (viewport_hovered && fabsf(io.MouseWheel) > 0.0f) {
         jce_editor_scene_camera_zoom(io.MouseWheel * wheel_sign);
+        navigated = true;
     }
 
     /* Touchpad two-finger horizontal swipe → 3D camera pan. The wheel
@@ -1510,7 +1575,9 @@ static void handle_scene_camera_controls(bool viewport_hovered)
         if (jce_editor_pref_touchpad_h_invert) wheel_h = -wheel_h;
         float h_sign = jce_editor_pref_invert_scroll_zoom ? -1.0f : 1.0f;
         jce_editor_scene_camera_pan(-wheel_h * 8.0f * h_sign, 0.0f);
+        navigated = true;
     }
+    return navigated;
 }
 
 /* ── Keyboard shortcuts ──────────────────────────────────────────── */
@@ -1539,6 +1606,11 @@ static void handle_scene_view_shortcuts(void)
         if (frame_sel || frame_all_) {
             scene_view_frame_entities(frame_all_);
         }
+
+        if (jce_hotkey_pressed(JCE_HK_VIEW_ALIGN_SELECTED_CAMERA))
+            (void)jce_editor_scene_camera_align_selected();
+        if (jce_hotkey_pressed(JCE_HK_VIEW_PILOT_SELECTED_CAMERA))
+            (void)jce_editor_scene_camera_toggle_pilot();
 
         if (jce_hotkey_pressed(JCE_HK_EDIT_SNAP_TO_GROUND))
             jce_scene_view_snap_selection_to_ground();
@@ -1960,7 +2032,11 @@ void jce_editor_panel_scene_view_content(void)
     panel_phase_sv("ed_sv_vp", &sv_t);
 
     draw_scene_context_menu(&ctx);
-    handle_scene_camera_controls(ctx.viewport_hovered);
+    const bool camera_navigated =
+        handle_scene_camera_controls(ctx.viewport_hovered);
+    const float viewport_aspect = ctx.avail.y > 1.0f
+        ? ctx.avail.x / ctx.avail.y : 1.0f;
+    jce_editor_scene_camera_update_pilot(camera_navigated, viewport_aspect);
     panel_phase_sv("ed_sv_cam", &sv_t);
 
     if (jce_scene_view_should_cancel_deferred_pick(
@@ -2053,7 +2129,10 @@ void jce_editor_panel_scene_view_content(void)
 void jce_editor_panel_scene_view(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW);
-    if (!*vis) return;
+    if (!*vis) {
+        jce_editor_scene_camera_stop_pilot();
+        return;
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
@@ -2099,6 +2178,20 @@ void jce_editor_panel_scene_view(void)
                                     cam->is_primary
                                         ? jce_editor_i18n("inspector.camera.preview.stackPrimary")
                                         : "");
+                        if (ImGui::Button(jce_editor_i18n("sceneView.camera.align")))
+                            (void)jce_editor_scene_camera_align_selected();
+                        ImGui::SameLine();
+                        const bool piloting =
+                            jce_editor_scene_camera_is_piloting();
+                        if (ImGui::Button(jce_editor_i18n(piloting
+                                ? "sceneView.camera.stopPiloting"
+                                : "sceneView.camera.pilot")))
+                            (void)jce_editor_scene_camera_toggle_pilot();
+                        if (piloting) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.12f, 1.0f),
+                                "%s", jce_editor_i18n("sceneView.camera.piloting"));
+                        }
                         ImGui::TextDisabled("%s",
                                     jce_editor_i18n("inspector.camera.preview.noTarget"));
                     }

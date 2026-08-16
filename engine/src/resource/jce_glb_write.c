@@ -2,8 +2,9 @@
  * jce_glb_write.c  Minimal binary glTF (.glb) writer.  See jce_glb_write.h.
  *
  * Single mesh / single primitive (POSITION + NORMAL + indices), one PBR
- * material.  Layout mirrors the proven build/gen_hlod.py writer: one binary
- * buffer holding [positions | normals | indices], a JSON chunk, a BIN chunk.
+ * material.  Layout mirrors the proven tools/worldgen/gen_hlod.py writer: one
+ * binary buffer holding [positions | normals | indices], a JSON chunk, a BIN
+ * chunk.
  */
 
 #include <jce/resource/jce_glb_write.h>

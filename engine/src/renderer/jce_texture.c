@@ -209,13 +209,21 @@ static void registry_opt_in_streaming(uint16_t idx, uint32_t w, uint32_t h,
 static bgfx_texture_format_t texfmt_to_bgfx(uint32_t fmt)
 {
     switch (fmt) {
+    case JCEASSET_TEXFMT_RGBA8:      return BGFX_TEXTURE_FORMAT_RGBA8;
+    case JCEASSET_TEXFMT_RGB8:       return BGFX_TEXTURE_FORMAT_RGB8;
     case JCEASSET_TEXFMT_BC1:        return BGFX_TEXTURE_FORMAT_BC1;
     case JCEASSET_TEXFMT_BC3:        return BGFX_TEXTURE_FORMAT_BC3;
     case JCEASSET_TEXFMT_BC5:        return BGFX_TEXTURE_FORMAT_BC5;
     case JCEASSET_TEXFMT_BC7:        return BGFX_TEXTURE_FORMAT_BC7;
     case JCEASSET_TEXFMT_ASTC_4x4:   return BGFX_TEXTURE_FORMAT_ASTC4X4;
     case JCEASSET_TEXFMT_ETC2_RGBA8: return BGFX_TEXTURE_FORMAT_ETC2A;
-    default:                         return BGFX_TEXTURE_FORMAT_RGBA8;
+    case JCEASSET_TEXFMT_R16F:       return BGFX_TEXTURE_FORMAT_R16F;
+    case JCEASSET_TEXFMT_RG16F:      return BGFX_TEXTURE_FORMAT_RG16F;
+    case JCEASSET_TEXFMT_RGBA16F:    return BGFX_TEXTURE_FORMAT_RGBA16F;
+    case JCEASSET_TEXFMT_R32F:       return BGFX_TEXTURE_FORMAT_R32F;
+    case JCEASSET_TEXFMT_RG32F:      return BGFX_TEXTURE_FORMAT_RG32F;
+    case JCEASSET_TEXFMT_RGBA32F:    return BGFX_TEXTURE_FORMAT_RGBA32F;
+    default:                         return BGFX_TEXTURE_FORMAT_COUNT;
     }
 }
 
@@ -250,6 +258,46 @@ static uint64_t sampler_flags(int mode)
 /* Create a bgfx texture from an RGBA8 surface. */
 static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
                                  uint32_t *out_dw, uint32_t *out_dh); /* fwd (mip chain) */
+
+/* ── Mip-chain blob (shared by every RGBA8 upload path) ─────────────
+ *
+ * Split in two at the seam where the callers differ: each one packs mip 0 its
+ * own way (a tier-capped copy, a tight memcpy, or a row walk over a padded
+ * pitch), and every one of them then wants the same box-filtered rest.  Kept as
+ * two functions rather than one so a caller cannot accidentally get a chain
+ * whose level 0 was generated from uninitialised memory. */
+
+/* Sized for the FULL chain; only the mip-0 region is left for the caller. */
+static const bgfx_memory_t *alloc_mip_chain_rgba8(uint32_t w, uint32_t h)
+{
+    size_t total = 0;
+    for (uint32_t mw = w, mh = h;;) {
+        total += (size_t)mw * mh * 4u;
+        if (mw <= 1u && mh <= 1u) break;
+        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u;
+    }
+    return bgfx_alloc((uint32_t)total);
+}
+
+/* Levels 1..N-1, box-filtered in place.  Mip 0 must already be written. */
+static void fill_mip_chain_rgba8(const bgfx_memory_t *mem, uint32_t w, uint32_t h)
+{
+    if (!mem) return;
+    uint8_t *prev = mem->data; uint32_t pw = w, ph = h;
+    uint8_t *cur  = mem->data + (size_t)w * h * 4u;
+    while (pw > 1u || ph > 1u) {
+        const uint32_t nw = pw > 1u ? pw >> 1 : 1u;
+        const uint32_t nh = ph > 1u ? ph >> 1 : 1u;
+        uint32_t gw = 0, gh = 0;
+        uint8_t *ds = downsample_rgba8(prev, pw, ph, &gw, &gh);
+        /* On OOM: a black level is wrong but bounded; leaving it uninitialised
+         * would upload whatever the allocator last held, which reads as random
+         * coloured confetti at distance and gets blamed on the texture. */
+        if (ds) { memcpy(cur, ds, (size_t)nw * nh * 4u); JCE_FREE(ds); }
+        else    { memset(cur, 0, (size_t)nw * nh * 4u); }
+        prev = cur; pw = nw; ph = nh; cur += (size_t)nw * nh * 4u;
+    }
+}
 
 /* Core upload: RGBA8 rows at `pitch` bytes.  Both entry points (the decoded
  * jce_image buffer and the pre-decoded SDL_Surface handed in by the async
@@ -311,16 +359,7 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
      * blob the way bgfx expects for a mipped create; the existing
      * downsample_rgba8 produces each 2x level.  +33% VRAM is reclaimable by the
      * streaming-pressure mip-bias hook (registry_opt_in_streaming below). */
-    uint32_t mips = 1;
-    for (uint32_t mw = w, mh = h; mw > 1u || mh > 1u; ) {
-        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u; mips++;
-    }
-    size_t total = 0;
-    for (uint32_t i = 0, mw = w, mh = h; i < mips; i++) {
-        total += (size_t)mw * mh * 4u;
-        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u;
-    }
-    const bgfx_memory_t *mem = bgfx_alloc((uint32_t)total);
+    const bgfx_memory_t *mem = alloc_mip_chain_rgba8(w, h);
     /* mip 0: tightly-packed copy (row-by-row if the surface pitch is padded).
      * When the tier cap shrunk the source above, `shrunk` IS the packed mip-0. */
     if (shrunk) {
@@ -338,19 +377,7 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
             dst += expected_pitch;
         }
     }
-    /* mips 1..N-1: box-filter the previous level (in-blob) into the next slot. */
-    {
-        uint8_t *prev = mem->data; uint32_t pw = w, ph = h;
-        uint8_t *cur = mem->data + (size_t)w * h * 4u;
-        for (uint32_t i = 1; i < mips; i++) {
-            uint32_t nw = pw > 1u ? pw >> 1 : 1u, nh = ph > 1u ? ph >> 1 : 1u;
-            uint32_t gw = 0, gh = 0;
-            uint8_t *ds = downsample_rgba8(prev, pw, ph, &gw, &gh);
-            if (ds) { memcpy(cur, ds, (size_t)nw * nh * 4u); JCE_FREE(ds); }
-            else    { memset(cur, 0, (size_t)nw * nh * 4u); }
-            prev = cur; pw = nw; ph = nh; cur += (size_t)nw * nh * 4u;
-        }
-    }
+    fill_mip_chain_rgba8(mem, w, h);
 
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)w, (uint16_t)h,
@@ -805,6 +832,50 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
     return t;
 }
 
+/* Surface upload: mip chain + the caller's wrap mode.
+ *
+ * This exists because jce_texture_from_rgba() below is CLAMP and mip-0 only,
+ * which is right for what it was written for -- glyph atlases, IES lookup
+ * tables, video frames, ImGui thumbnails: sampled at ~1:1, and where wrapping
+ * would fetch across an unrelated neighbour.  It is wrong for a MATERIAL.  A
+ * material texture is tiled (terrain multiplies its UV by the layer tile
+ * scale) and minified, so clamp smears the edge texel across everything past
+ * the first tile, and the absent mip chain aliases whatever survives.
+ *
+ * Split rather than fixed in place: changing jce_texture_from_rgba() would put
+ * a mip chain under every glyph atlas in the engine, and bilinear filtering
+ * between glyph mips bleeds neighbouring characters into each other. */
+JceTexture jce_texture_from_rgba_ex(const void *data,
+                                    uint32_t width, uint32_t height,
+                                    int sampler_mode)
+{
+    if (!data || width == 0 || height == 0)
+        return JCE_TEXTURE_INVALID;
+
+    const bgfx_memory_t *mem = alloc_mip_chain_rgba8(width, height);
+    if (!mem) return JCE_TEXTURE_INVALID;
+    memcpy(mem->data, data, (size_t)width * height * 4u);
+    fill_mip_chain_rgba8(mem, width, height);
+
+    bgfx_texture_handle_t handle = bgfx_create_texture_2d(
+        (uint16_t)width, (uint16_t)height,
+        true,   /* mip chain (box-filtered above) */
+        1,
+        BGFX_TEXTURE_FORMAT_RGBA8,
+        BGFX_TEXTURE_NONE | sampler_flags(sampler_mode),
+        mem, 0);
+
+    if (handle.idx == UINT16_MAX)
+        return JCE_TEXTURE_INVALID;
+
+    registry_add(handle.idx, width, height, full_mip_count(width, height),
+                 (uint8_t)BGFX_TEXTURE_FORMAT_RGBA8);
+
+    JceTexture tex;
+    tex.idx = handle.idx;
+    return tex;
+}
+
 JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height)
 {
@@ -856,7 +927,7 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     uint32_t need = jce_tex_cooked_pixel_size(info->width, info->height,
                                               (int)info->format,
                                               info->mip_count);
-    if (need == 0 || pixel_bytes < need)
+    if (need == 0 || pixel_bytes != need)
         return JCE_TEXTURE_INVALID;
 
     /* Block-compressed and multi-mip payloads are uploaded as a single
@@ -867,6 +938,11 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
      * BC/ASTC texture emitted by Build Bundles. */
     bool has_mips = info->mip_count > 1;
     bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(info->format);
+    if (bgfx_fmt == BGFX_TEXTURE_FORMAT_COUNT)
+        return JCE_TEXTURE_INVALID;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || !(caps->formats[bgfx_fmt] & BGFX_CAPS_FORMAT_TEXTURE_2D))
+        return JCE_TEXTURE_INVALID;
 
     const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
     memcpy(mem->data, pixels, pixel_bytes);
@@ -1305,8 +1381,9 @@ void jce_texture_set_global_mip_bias(int8_t bias)
     /* Pass A: parallel CPU downsample (worker-safe, disjoint per-index). */
     JceThreadPool *pool = jce_thread_pool_shared();
     if (pool && n >= 4)
-        jce_thread_pool_parallel_for(pool, (uint32_t)n, 0,
-                                     mip_downsample_range, list);
+        jce_thread_pool_parallel_for_named(
+            pool, "texture.mip-downsample", (uint32_t)n, 0,
+            mip_downsample_range, list);
     else
         mip_downsample_range(0u, (uint32_t)n, list);
 

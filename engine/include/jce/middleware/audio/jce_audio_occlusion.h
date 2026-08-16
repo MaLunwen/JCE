@@ -77,13 +77,24 @@ typedef struct {
     float min_direct_volume;  /* default 0.15 */
     /* Smoothing coefficient applied to per-source state in [0,1].
      *   0 = no smoothing (raw raycast values),
-     *   1 = never update (frozen). */
+     *   1 = never update (frozen).
+     * Authored as the retention per update at 60 Hz.  The tracker rescales it
+     * by the measured solve-to-solve interval, so the perceived fade takes the
+     * same wall-clock time at any frame rate; it used to be applied once per
+     * update, which made sources duck faster on faster machines. */
     float smoothing;          /* default 0.85 */
     /* Maximum raycast distance in metres. */
     float max_raycast_dist;   /* default 200 */
 } JceAudioOcclusionParams;
 
 JCE_API JceAudioOcclusionParams jce_audio_occlusion_default_params(void);
+
+/* Rescale an authored per-update retention coefficient to the elapsed time of
+ * one update, so the same wall-clock fade results at any frame rate.  Exposed
+ * for tests: the property that matters (two half-steps equal one whole step)
+ * cannot be observed through the tracker without controlling its clock. */
+JCE_API float jce_audio_occlusion_retention_for_dt(float authored,
+                                                   float dt_seconds);
 
 /* Stateless one-shot solver.  No history smoothing.                    *
  * `out_queries[i].occlusion / lowpass_hz / attenuation` are written.   */

@@ -219,7 +219,7 @@ JCE_API void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle);
  * This reuses the asset domain's existing state vocabulary on purpose: the
  * distinction that matters here is "busy vs broken vs bad-call", which a bool
  * collapses, and a new bespoke enum would just add a 19th unrelated error
- * type to the ABI (see docs/architecture/language-driver-abi.md §5). */
+ * type to the ABI (see contracts/language-driver-abi.md §5). */
 JCE_API JceAssetState jce_asset_reload(JceAssetManager *mgr,
                                        JceAssetHandle handle);
 

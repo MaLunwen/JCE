@@ -17,21 +17,22 @@
  * Phase 2 (true indirect, roadmap #18 Direction C): when the GPU exposes
  * BGFX_CAPS_DRAW_INDIRECT, the cull does real STREAM COMPACTION + INDIRECT DRAW
  * instead of the 1:1-with-degenerate-slots fallback.  Three compute passes run
- * on the cull view: (1) cs_cull_reset zeroes the per-run survivor counters; (2)
- * cs_cull_compact tests each record and atomically appends survivors densely
- * into their run's partition of the visible buffer (culled records write
- * nothing); (3) cs_build_indirect reads each run's survivor counter + mesh index
- * count and writes that run's drawIndexedIndirect args (numInstances = survivor
- * count).  The renderer then issues ONE bgfx_submit_indirect per run, so there
- * is no CPU per-run fixed-count submit and no degenerate zero-area instances.
+ * on the cull view: (1) cs_cull_reset zeroes one survivor counter per visibility
+ * group; (2) cs_cull_compact tests each record and atomically appends survivors
+ * densely into its group's partition of the visible buffer (culled records
+ * write nothing); (3) cs_build_indirect writes one drawIndexedIndirect argument
+ * per primitive draw, reusing the owning group's survivor count and partition.
+ * A multi-primitive model is uploaded and culled once instead of once per draw,
+ * and no degenerate zero-area instances are emitted.
  * jce_gpu_scene_indirect_buffer() returns the filled indirect handle (or
  * UINT16_MAX when indirect is unavailable, in which case the caller uses the 1:1
  * fixed-count fallback path).
  *
- * Scope: the OPAQUE COLOR pass only.  Shadow / depth-prepass / velocity stay
- * on the CPU instancing path for now.  Flag-gated by the scene renderer
- * (JceSceneRenderConfig.gpu_driven / r.gpu_driven, default off): when off the
- * renderer never touches this module and the CPU path is byte-identical.
+ * Scope: opaque color and directional-shadow instancing. Depth-prepass and
+ * velocity stay on the CPU instancing path. Flag-gated by the scene renderer
+ * (JceSceneRenderConfig.gpu_driven / r.gpu_driven): when the adaptive policy
+ * rejects a small or fragmented workload, the CPU instancing path remains
+ * byte-identical.
  *
  * Backend: bgfx compute (D3D11/D3D12/Vulkan/Metal/GL4/GLES3.1).  Guarded on
  * BGFX_CAPS_COMPUTE; jce_gpu_scene_is_supported() returns false on devices
@@ -59,16 +60,17 @@ typedef struct JcePakArchive  JcePakArchive;
 /* One resident-instance record fed to the GPUScene buffer.  Mirrors the 7-vec4
  * (112 B) layout consumed by cs_cull_frustum.sc.  The buffer is float-typed, so
  * the integer ids are stored as float VALUES (the shader does uint(ids.x)).
- * run_base / run_index are filled by jce_gpu_scene_add_run (the caller leaves
- * them as-is); they partition the shared visible buffer per model-run. */
+ * run_base / run_index retain their original ABI names, but are filled by
+ * jce_gpu_scene_add_draw_group (or its single-draw compatibility wrapper).
+ * They partition the shared visible buffer per visibility group. */
 typedef struct {
     jce_mat4 world;          /* 4 vec4 — model-to-world (column vectors)   */
     float    center[3];      /* world-space AABB center                    */
     float    radius;         /* bounding-sphere radius (unused by cull v1) */
     float    extent[3];      /* world-space AABB half-extents              */
     float    _pad_extent;
-    float    run_base;       /* ids.x — slot offset of this run's partition */
-    float    run_index;      /* ids.y — counter slot for this run           */
+    float    run_base;       /* ids.x — slot offset of this group's partition */
+    float    run_index;      /* ids.y — survivor-counter slot for this group  */
     float    _id_z;          /* ids.z — reserved (mesh, Phase 2)            */
     float    _id_w;          /* ids.w — reserved (material, Phase 2)        */
 } JceGpuSceneRecord;
@@ -85,6 +87,31 @@ typedef struct {
     uint32_t run_base;
     uint32_t indirect_el;
 } JceGpuSceneRun;
+
+/* One visibility group can feed several primitive draws from the same model.
+ * Records are uploaded and culled once; every primitive reuses run_base and
+ * gets a consecutive indirect element. */
+typedef struct {
+    uint32_t run_base;
+    uint32_t first_indirect_el;
+    uint32_t draw_count;
+} JceGpuSceneDrawGroup;
+
+typedef struct JceGpuSceneFrameStats {
+    bool     supported;
+    bool     indirect_supported;
+    bool     indirect_ready;
+    bool     dispatch_succeeded;
+    bool     hiz_enabled;
+    uint32_t records;
+    uint32_t groups;
+    uint32_t runs;
+    uint32_t dispatches;
+    uint32_t compute_dispatches;
+    uint32_t upload_calls;
+    uint32_t buffer_growths;
+    uint64_t uploaded_bytes;
+} JceGpuSceneFrameStats;
 
 /* Create the GPU-driven scene helper.  Loads cs_cull_frustum from the engine
  * shader pak (with the embedded-engine-pak fallback).  Never returns NULL on a
@@ -103,11 +130,11 @@ JCE_API bool jce_gpu_scene_is_supported(const JceGpuScene *gs);
 /* ── Per-frame batch (one cull dispatch for the whole color-pass batch) ───
  *
  * Correctness note: bgfx orders the cull (compute view) entirely before the
- * color view, so ALL surviving instances of ALL model-runs must be resident in
+ * color view, so all surviving instances of all visibility groups must reside in
  * the (single) visible buffer before the first draw.  The visible buffer is
- * therefore PARTITIONED per run: each run owns a contiguous slice [run_base,
- * run_base+count) into which its survivors compact, and the draw sources that
- * slice.  Usage per frame:
+ * therefore partitioned per group: each group owns a contiguous slice
+ * [run_base, run_base+count) into which its survivors compact, and every
+ * primitive draw for that group sources the same slice. Usage per frame:
  *
  *   jce_gpu_scene_begin(gs);
  *   for each model-run:
@@ -142,6 +169,15 @@ JCE_API bool jce_gpu_scene_add_run(JceGpuScene *gs,
                                    uint32_t num_indices,
                                    JceGpuSceneRun *out_run);
 
+/* Append one visibility group and all primitive draws that consume it.
+ * `num_indices[0..draw_count)` supplies one index count per primitive. Records
+ * are copied exactly once, then all indirect args reference the same compacted
+ * survivor range. Allocation failure leaves the current batch unchanged. */
+JCE_API bool jce_gpu_scene_add_draw_group(
+    JceGpuScene *gs, const JceGpuSceneRecord *records, uint32_t count,
+    const uint32_t *num_indices, uint32_t draw_count,
+    JceGpuSceneDrawGroup *out_group);
+
 /* Upload all appended records and dispatch the compute cull over the whole
  * batch.  In the indirect path this is THREE passes: counter reset (on
  * reset_view), cull+compact, build-indirect (both on cull_view); in the 1:1
@@ -158,6 +194,8 @@ JCE_API bool jce_gpu_scene_add_run(JceGpuScene *gs,
  * No-op (returns false) when unsupported or the batch is empty. */
 JCE_API bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                                     uint16_t cull_view, const jce_vec4 planes[6]);
+JCE_API void jce_gpu_scene_get_frame_stats(
+    const JceGpuScene *gs, JceGpuSceneFrameStats *out_stats);
 
 /* Hi-Z occlusion (large-world #5, opt-in). Set the per-frame inputs BEFORE
  * jce_gpu_scene_dispatch: `depth_tex` = the depth-prepass texture idx (the cull
@@ -178,12 +216,12 @@ JCE_API uint16_t jce_gpu_scene_visible_vb(const JceGpuScene *gs);
 /* True iff the last create resolved the INDIRECT path (BGFX_CAPS_DRAW_INDIRECT +
  * the compact/indirect compute programs loaded).  When true, a successful
  * dispatch fills the indirect buffer and the caller should issue one
- * bgfx_submit_indirect per run using JceGpuSceneRun.indirect_el; when false the
- * caller falls back to the 1:1 fixed-count draw from the visible buffer. */
+ * bgfx_submit_indirect per queued primitive draw; when false the caller falls
+ * back to the 1:1 fixed-count draw from the visible buffer. */
 JCE_API bool jce_gpu_scene_is_indirect(const JceGpuScene *gs);
 
-/* The bgfx indirect_buffer handle index holding the per-run drawIndexedIndirect
- * args (one element per queued run), filled by jce_gpu_scene_dispatch.  Pass to
+/* The bgfx indirect_buffer handle index holding one drawIndexedIndirect element
+ * per queued primitive draw, filled by jce_gpu_scene_dispatch. Pass to
  * bgfx_submit_indirect(view, prog, handle, run.indirect_el, 1, ...).  UINT16_MAX
  * when the indirect path is unavailable / before the first dispatch. */
 JCE_API uint16_t jce_gpu_scene_indirect_buffer(const JceGpuScene *gs);
@@ -192,8 +230,8 @@ JCE_API uint16_t jce_gpu_scene_indirect_buffer(const JceGpuScene *gs);
  * GPU frustum-cull a foliage scatter's PERSISTENT roots VB (the S1 instance
  * buffer: 4 vec4 = mat4 per instance) into a compacted visible buffer + a single
  * drawIndexedIndirect arg, so the GPU rasterises only the in-frustum subset.
- * Unlike jce_gpu_scene_dispatch (which reads the per-frame transient scene
- * records), this reads the persistent roots buffer DIRECTLY and computes each
+ * Unlike jce_gpu_scene_dispatch (which uploads per-frame scene records), this
+ * reads the persistent roots buffer DIRECTLY and computes each
  * instance's world-AABB on the GPU from the shared mesh's local AABB — no
  * per-frame CPU work, no per-instance AABB storage.  The visible/counter/indirect
  * buffers are OWNED by the caller (the foliage cache, one set per scatter) and

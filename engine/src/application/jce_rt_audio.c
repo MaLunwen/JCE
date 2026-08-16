@@ -514,8 +514,17 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
 {
     if (snd == JCE_SOUND_INVALID || !as) return;
 
-    float vol   = as->volume > 0.0f ? as->volume : 1.0f;
-    float pitch = as->pitch  > 0.0f ? as->pitch  : 1.0f;
+    /* An authored volume of 0 is a LEVEL, not a missing field.  The JSON
+     * parser already substitutes 1.0 when the key is absent
+     * (jce_scene_components_audio.c), so a `> 0 ? : 1.0` guard here could only
+     * ever fire on a value someone deliberately wrote -- and it turned "start
+     * this source silent and let a script fade it in", which is how every
+     * ambience bed is authored, into "start it at FULL volume", audible for
+     * however many frames pass before the script's first write.  Only negative
+     * volumes are rejected now.  Pitch keeps its guard: 0 there is not a quiet
+     * sound, it is a stopped one. */
+    float vol   = as->volume >= 0.0f ? as->volume : 1.0f;
+    float pitch = as->pitch  >  0.0f ? as->pitch  : 1.0f;
     JceVoice v = jce_audio_play(rt->audio, snd, as->loop, vol, pitch);
     bool spatial = (as->spatial_blend > 0.5f);
     if (spatial) {
@@ -558,45 +567,65 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
 }
 
 /* WORKER: decode a play_on_awake clip to CPU PCM (PAK + miniaudio). */
-static void rt_audio_decode_run(void *arg)
+static JceAsyncRunResult rt_audio_decode_run(JceAsyncContext *ctx, void *arg)
 {
     RtAudioDecodeArgs *a = (RtAudioDecodeArgs *)arg;
+    if (jce_async_context_cancel_requested(ctx))
+        return JCE_ASYNC_RUN_CANCELLED;
+
     a->cpu = jce_audio_decode_cpu(a->pak, a->path);
-    jce_atomic_i32_store(a->done, 1);
+    if (!a->cpu) {
+        jce_async_context_fail(ctx, -1, "audio CPU decode failed");
+        return JCE_ASYNC_RUN_FAILED;
+    }
+    if (jce_async_context_cancel_requested(ctx)) {
+        jce_audio_cpu_free(a->cpu);
+        a->cpu = NULL;
+        return JCE_ASYNC_RUN_CANCELLED;
+    }
+    return JCE_ASYNC_RUN_SUCCESS;
 }
 
 RT_GROW_FN(rt_grow_pending_audio, pending_audio, pending_audio_cap, 8)
 
-/* Concurrency cap for play_on_awake decodes.  One OS thread per clip is a
- * thread storm on the single-core / 512 MB baseline once a scene authors
- * dozens of AudioSources (every one spawns at the same instant during the
- * scene walk), so at most this many decodes own a worker at a time; the rest
- * sit in the pending list as UNSTARTED slots and rt_audio_poll promotes them
- * as running decodes retire.  An unstarted slot is (thr == NULL, done == 0) —
- * unambiguous, because thr is only cleared after a join, which only happens
- * once done == 1. */
+/* Concurrency cap for play_on_awake decodes. Unstarted slots have task ==
+ * NULL and are promoted in scene order as structured tasks retire. */
 enum { RT_AUDIO_DECODE_MAX = 4 };
 
-/* Pending slots that currently own a live worker thread. */
+/* Pending slots that currently own a submitted task. */
 static int rt_audio_inflight(const JceRuntime *rt)
 {
     int n = 0;
     for (int i = 0; i < rt->pending_audio_count; ++i)
-        if (rt->pending_audio[i].thr) ++n;
+        if (rt->pending_audio[i].task) ++n;
     return n;
 }
 
+static bool rt_audio_submit(RtPendingAudio *pending)
+{
+    if (!pending || !pending->args || pending->task) return false;
+
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work       = rt_audio_decode_run;
+    desc.user_data  = pending->args;
+    desc.debug_name = "runtime.audio.decode";
+    desc.priority   = JCE_ASYNC_PRIORITY_HIGH;
+    pending->task = jce_async_submit(jce_async_default_executor(), &desc);
+    return pending->task != NULL;
+}
+
 /* Kick an async decode of `as->clip_path` for entity `e` (default loader
- * path only).  The worker owns `args` (stable heap) for its full run; the
+ * path only). The task uses `args` (stable heap) for its full run; the
  * pending slot only references it, so the slot array may realloc freely. */
 void rt_spawn_audio_async(JceRuntime *rt, JceEntity e,
                                  const JceAudioSourceComponent *as)
 {
     if (rt->pending_audio_count >= rt->pending_audio_cap &&
         !rt_grow_pending_audio(rt)) {
-        /* Out of queue memory — fall back to a synchronous load. */
-        JceSound snd = jce_audio_load(rt->audio, rt->pak, as->clip_path);
-        rt_finish_audio_source(rt, rt->scene, e, snd, as);
+        jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                      "audio decode queue allocation failed for '%s'",
+                      as->clip_path);
         return;
     }
 
@@ -605,27 +634,16 @@ void rt_spawn_audio_async(JceRuntime *rt, JceEntity e,
     args->pak = rt->pak;
     snprintf(args->path, sizeof(args->path), "%s", as->clip_path);
     args->cpu  = NULL;
-    args->done = jce_atomic_i32_create(0);
 
     RtPendingAudio *p = &rt->pending_audio[rt->pending_audio_count++];
     p->entity = e;
-    p->thr    = NULL;
+    p->task   = NULL;
     p->args   = args;
 
     /* Over the cap: leave the slot unstarted for rt_audio_poll to promote. */
     if (rt_audio_inflight(rt) >= RT_AUDIO_DECODE_MAX)
         return;
-
-    p->thr = jce_thread_create(rt_audio_decode_run, args, "jce_rt_audio");
-    if (!p->thr) {
-        /* No worker thread: decode + play inline, then drop the slot. */
-        rt_audio_decode_run(args);
-        JceSound snd = jce_audio_upload_cpu(rt->audio, args->cpu);
-        rt_finish_audio_source(rt, rt->scene, e, snd, as);
-        if (args->done) jce_atomic_i32_destroy(args->done);
-        jce_free(args);
-        rt->pending_audio_count--;   /* release the slot taken above */
-    }
+    (void)rt_audio_submit(p);
 }
 
 /* ── Adaptive music director (FEATURE 5.3) ───────────────────────────
@@ -683,11 +701,11 @@ void rt_audio_poll(JceRuntime *rt)
     int w = 0;
     for (int i = 0; i < rt->pending_audio_count; ++i) {
         RtPendingAudio *p = &rt->pending_audio[i];
-        if (!p->args || jce_atomic_i32_load(p->args->done) == 0) {
+        if (!p->args || !p->task ||
+            !jce_async_task_is_terminal(p->task)) {
             rt->pending_audio[w++] = *p;   /* keep (still running) */
             continue;
         }
-        if (p->thr) { jce_thread_join(p->thr); p->thr = NULL; }
 
         /* Re-fetch the component at play time (the entity may have moved /
          * been disabled in the 1-2 frames since spawn). */
@@ -695,7 +713,9 @@ void rt_audio_poll(JceRuntime *rt)
             jce_scene_get_audio_source(rt->scene, p->entity);
         if (as &&
             jce_scene_component_enabled(rt->scene, p->entity,
-                                        JCE_COMP_FLAG_AUDIO_SOURCE)) {
+                                        JCE_COMP_FLAG_AUDIO_SOURCE) &&
+            jce_async_task_state(p->task) == JCE_ASYNC_STATE_SUCCEEDED &&
+            p->args->cpu) {
             JceSound snd = jce_audio_upload_cpu(rt->audio, p->args->cpu);
             p->args->cpu = NULL;   /* consumed by upload */
             rt_finish_audio_source(rt, rt->scene, p->entity, snd, as);
@@ -703,7 +723,8 @@ void rt_audio_poll(JceRuntime *rt)
             jce_audio_cpu_free(p->args->cpu);   /* source gone — drop it */
             p->args->cpu = NULL;
         }
-        jce_atomic_i32_destroy(p->args->done);
+        jce_async_task_release(p->task);
+        p->task = NULL;
         jce_free(p->args);
         /* slot dropped (not copied to w) */
     }
@@ -716,12 +737,7 @@ void rt_audio_poll(JceRuntime *rt)
     for (int i = 0; i < rt->pending_audio_count &&
                     live < RT_AUDIO_DECODE_MAX; ++i) {
         RtPendingAudio *p = &rt->pending_audio[i];
-        if (p->thr || !p->args) continue;       /* running, or nothing to run */
-        p->thr = jce_thread_create(rt_audio_decode_run, p->args,
-                                   "jce_rt_audio");
-        if (p->thr) { ++live; continue; }
-        /* OS refused the thread: decode inline so the clip still plays — the
-         * next poll retires it through the normal finished path. */
-        rt_audio_decode_run(p->args);
+        if (p->task || !p->args) continue;      /* running, or nothing to run */
+        if (rt_audio_submit(p)) ++live;
     }
 }

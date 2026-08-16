@@ -156,6 +156,12 @@ JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak,
     return jce_gltf_decode_cpu(pak, asset_path);
 }
 
+JceModelCpu *jce_model_decode_gltf_cpu_memory(const void *data, uint32_t size,
+                                              const char *name)
+{
+    return jce_gltf_decode_cpu_memory(data, size, name);
+}
+
 JceModel *jce_model_upload_gltf_cpu(JceModelCpu *cpu)
 {
     return jce_gltf_upload_cpu(cpu);
@@ -1151,6 +1157,29 @@ void jce_model_draw_bindpose_instanced(const JceModel *model, const JceRenderer 
     jce_skinned_mesh_set_submit_double_sided(false);
 }
 
+/* Instances per transient-buffer chunk; see the overflow note below. */
+#define JCE_INST_CHUNK_MAX 8192u
+
+/* Gathered variant: fills the instance buffer straight from the caller's
+ * records through an index list, instead of making the caller pack world+tint
+ * into two scratch arrays that this function immediately unpacks again.
+ *
+ * That round trip was 22% of the frame at the 200k bench -- the gather loop and
+ * this function's copy loop are separately the two hottest lines in it -- and
+ * it moves 160 bytes per instance where 80 will do. `src_stride`/`src_offset`
+ * describe where the contiguous world+tint pair lives inside one record;
+ * `ord[k]` selects the record. NULL ord means identity.
+ *
+ * Internal on purpose: jce_mesh_draw_instanced_tinted stays the public JCE_API
+ * shape and now forwards to this. */
+void jce_mesh_draw_instanced_gathered(const JceMesh *mesh, const JceRenderer *r,
+                                      uint16_t view_id, const void *src,
+                                      size_t src_stride, size_t src_offset,
+                                      const uint32_t *ord, uint32_t count,
+                                      bool has_tint, uint64_t state,
+                                      void (*pre_submit)(void *user, uint16_t view_id),
+                                      void *pre_submit_user);
+
 void jce_mesh_draw_instanced_tinted(const JceMesh *mesh, const JceRenderer *r,
                                     uint16_t view_id, const jce_mat4 *worlds,
                                     const jce_vec4 *tints, uint32_t count,
@@ -1177,13 +1206,59 @@ void jce_mesh_draw_instanced_tinted(const JceMesh *mesh, const JceRenderer *r,
 
     uint32_t start = 0;
     while (start < count) {
+        /* Chunk cap, because neither of bgfx's two numbers can be trusted at
+         * scale here. Asking for 200,000 x 80 B in one go, bgfx answered
+         * avail = 53,687,090 -- about 4 GiB, when the engine configured
+         * limits.maxTransientVbSize = 32 MiB -- and then handed back a buffer
+         * reporting size = 4,294,967,200, which is 2^32 - 96: its own 32-bit
+         * size computation had overflowed. Writing the 16 MB payload into that
+         * ran off the end of the real pool, a 100%-reproducible
+         * ACCESS_VIOLATION (WRITE, faulting exactly on a page boundary).
+         *
+         * A size check does not catch it -- 16,000,000 < 4,294,967,200 passes.
+         * So bound the ask instead: JCE_INST_CHUNK_MAX slots is 640 KB per
+         * chunk, small enough that bgfx's accounting stays in range, and the
+         * loop was already written to iterate. */
         uint32_t want  = count - start;
+        if (want > JCE_INST_CHUNK_MAX) want = JCE_INST_CHUNK_MAX;
         uint32_t avail = bgfx_get_avail_instance_data_buffer(want, stride);
         uint32_t nb    = want < avail ? want : avail;
         if (nb == 0) break;   /* no instance space left this frame */
 
         bgfx_instance_data_buffer_t idb;
+        memset(&idb, 0, sizeof idb);
         bgfx_alloc_instance_data_buffer(&idb, nb, stride);
+
+        /* RE-READ idb.num. bgfx may hand back fewer instances than asked for,
+         * and the count it actually gave is the only bound the fill loop may
+         * use -- writing `nb` slots into a buffer sized for idb.num runs off
+         * the end of the transient pool. That was a 100%-reproducible
+         * ACCESS_VIOLATION here at 200k (WRITE, faulting on a page boundary),
+         * and it is not a new hazard: apply_transient_limits in
+         * jce_renderer.c already documents that "every consumer degrades
+         * cleanly today (rq re-reads idb.num after alloc; ImGui clamps)".
+         * This consumer did not. */
+        /* 64-bit compare: nb*stride in 32 bits is exactly how the overflow
+         * above slipped through. */
+        if (!idb.data || idb.num == 0 ||
+            (uint64_t)idb.size < (uint64_t)nb * (uint64_t)stride) {
+            static uint32_t s_bad = 0;
+            if ((s_bad++ % 120u) == 0u)
+                LOG_WARN(LOG_TAG, "instance buffer unusable: asked %u x %u B, "
+                         "got data=%p size=%u num=%u -- dropping the rest",
+                         nb, (unsigned)stride, (void *)idb.data, idb.size,
+                         idb.num);
+            break;
+        }
+        if (idb.num < nb) {
+            static uint32_t s_warned = 0;
+            if ((s_warned++ % 120u) == 0u)
+                LOG_WARN(LOG_TAG,
+                         "instance pool short: asked %u x %u B (avail said %u), "
+                         "got %u -- drawing %u this chunk",
+                         nb, (unsigned)stride, avail, idb.num, idb.num);
+            nb = idb.num;
+        }
         uint8_t *dst = (uint8_t *)idb.data;
         for (uint32_t i = 0; i < nb; i++) {
             uint8_t *slot = dst + (size_t)i * stride;
@@ -1206,6 +1281,82 @@ void jce_mesh_draw_instanced_tinted(const JceMesh *mesh, const JceRenderer *r,
         start += nb;
     }
 }
+
+void jce_mesh_draw_instanced_gathered(const JceMesh *mesh, const JceRenderer *r,
+                                      uint16_t view_id, const void *src,
+                                      size_t src_stride, size_t src_offset,
+                                      const uint32_t *ord, uint32_t count,
+                                      bool has_tint, uint64_t state,
+                                      void (*pre_submit)(void *user, uint16_t view_id),
+                                      void *pre_submit_user)
+{
+    if (!mesh || !r || !src || count == 0) return;
+
+    JceShaderHandle prog_tint = jce_renderer_get_program_pbr_inst_tint(r);
+    const bool use_tint = has_tint && (prog_tint.idx != UINT16_MAX);
+    JceShaderHandle prog = use_tint ? prog_tint
+                                    : jce_renderer_get_program_pbr_inst(r);
+    if (prog.idx == UINT16_MAX) return;
+    const bgfx_program_handle_t bgfx_prog = { (uint16_t)prog.idx };
+    const uint16_t stride = use_tint ? (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4))
+                                     : (uint16_t)sizeof(jce_mat4);
+
+    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(mesh) };
+    bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(mesh) };
+    const uint64_t st_state = state ? state : BGFX_STATE_DEFAULT;
+    const uint8_t *base = (const uint8_t *)src + src_offset;
+
+    uint32_t start = 0;
+    while (start < count) {
+        uint32_t want = count - start;
+        if (want > JCE_INST_CHUNK_MAX) want = JCE_INST_CHUNK_MAX;
+        uint32_t avail = bgfx_get_avail_instance_data_buffer(want, stride);
+        uint32_t nb    = want < avail ? want : avail;
+        if (nb == 0) break;
+
+        bgfx_instance_data_buffer_t idb;
+        memset(&idb, 0, sizeof idb);
+        bgfx_alloc_instance_data_buffer(&idb, nb, stride);
+        if (!idb.data || idb.num == 0 ||
+            (uint64_t)idb.size < (uint64_t)nb * (uint64_t)stride) break;
+        if (idb.num < nb) nb = idb.num;
+
+        uint8_t *dst = (uint8_t *)idb.data;
+        /* Constant copy sizes, and the branch hoisted out of the loop.
+         *
+         * memcpy with a VARIABLE length is a real call into the CRT, and at
+         * 194k instances a frame that showed up as 15.5% of the frame sitting
+         * on two adjacent instructions inside VCRUNTIME140. With the size a
+         * compile-time constant the compiler inlines it to a few vector moves,
+         * which is what the two struct assignments this replaced were doing.
+         * jce_mat4/jce_vec4 carry no alignment attribute, so these are
+         * unaligned moves and idb.data needs no particular alignment. */
+        if (use_tint) {
+            enum { JCE_INST_TINTED_BYTES = sizeof(jce_mat4) + sizeof(jce_vec4) };
+            for (uint32_t i = 0; i < nb; i++) {
+                const uint32_t k = ord ? ord[start + i] : (start + i);
+                memcpy(dst + (size_t)i * JCE_INST_TINTED_BYTES,
+                       base + (size_t)k * src_stride, JCE_INST_TINTED_BYTES);
+            }
+        } else {
+            for (uint32_t i = 0; i < nb; i++) {
+                const uint32_t k = ord ? ord[start + i] : (start + i);
+                memcpy(dst + (size_t)i * sizeof(jce_mat4),
+                       base + (size_t)k * src_stride, sizeof(jce_mat4));
+            }
+        }
+
+        bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
+        if (ibh.idx != UINT16_MAX)
+            bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(mesh));
+        bgfx_set_state(st_state, 0);
+        bgfx_set_instance_data_buffer(&idb, 0, nb);
+        if (pre_submit) pre_submit(pre_submit_user, view_id);
+        bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
+        start += nb;
+    }
+}
+
 
 /* ── GPU-driven instancing (roadmap #18, Phase 0+1) ──────────────────────
  *
@@ -1928,7 +2079,7 @@ void jce_model_draw_crowd_shadow_instanced(const JceModel *model,
 /* VELOCITY sibling of the animated crowd draws: writes per-limb motion vectors
  * + world normals for `count` uniquely-posed skinned instances in one instanced
  * MRT submit per skinned primitive.  Dual bone textures: s_bones (stage 4, this
- * frame) + s_prevBones (stage 5, last frame at the SAME bases).  prog must be
+ * frame) + s_prevBones (stage 6, last frame at the SAME bases).  prog must be
  * vs_gbuffer_vel_skinned_inst + fs_gbuffer_vel; ctx supplies the un-jittered
  * cur/prev view*proj (set per submit — bgfx clears uniform state per draw). */
 void jce_model_draw_crowd_velocity_instanced(const JceModel *model,
@@ -1988,7 +2139,7 @@ void jce_model_draw_crowd_velocity_instanced(const JceModel *model,
 
                 jce_skinned_mesh_submit(sm, r, view_id);   /* binds VB/IB/state */
                 bgfx_set_texture(4, s_bones, bone_tex, UINT32_MAX);
-                bgfx_set_texture(5, s_prev,  prev_tex, UINT32_MAX);
+                bgfx_set_texture(6, s_prev,  prev_tex, UINT32_MAX);
                 bgfx_set_uniform(u_params,  params, 1);
                 bgfx_set_uniform(u_cur_vp,  ctx->cur_view_proj.raw[0],  1);
                 bgfx_set_uniform(u_prev_vp, ctx->prev_view_proj.raw[0], 1);
