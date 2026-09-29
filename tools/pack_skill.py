@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -102,80 +103,21 @@ def content_id_of(payload):
     return sha256_bytes(blob)[:12]
 
 
-def tracked_state_note():
-    """State plainly which referenced paths a fresh clone actually receives.
-
-    The previous manifest described the machine it ran on, not the commit.
-    Paths like AGENTS.md and tests/ are gitignored on this branch, so a reader
-    who clones and follows the instructions finds them missing.
-    """
-    probes = ["AGENTS.md", "CLAUDE.md", "tests", "tools/audit",
-              "tools/lint/check_skills.py", "tools/pack_skill.py"]
-    lines = ["skill 文本引用的仓库路径，在**当前分支**上的跟踪状态"
-             "（`git ls-files`，全路径逐条查，不用 grep 子串）：",
-             "",
-             "| 路径 | 跟踪 |",
-             "|---|---|"]
-    for path in probes:
-        out = _git("ls-files", "--", path)
-        if out is None:
-            mark = "查询失败"
-        else:
-            n = len([ln for ln in out.splitlines() if ln.strip()])
-            mark = ("是（%d 个文件）" % n) if n else "**否 — 未跟踪**"
-        lines.append("| `%s` | %s |" % (path, mark))
-    lines += [
-        "",
-        "标「否」的路径**不随 clone 走**，它们是本机工作树的叠加物。",
-        "本 zip 里凡引用这些路径的段落，克隆者复现不出来——这是事实陈述而非缺陷；",
-        "写下来是为了不让读者以为照做就能得到同一棵树。",
-    ]
-    return "\n".join(lines)
-
-
-def build_manifest(files, cid, commit):
-    rows = ["| `%s` | %d | %d | `%s` |"
-            % (n, line_count(d), len(d), sha256_bytes(d)) for n, d in files]
-    md_lines = sum(line_count(d) for n, d in files if n.endswith(".md"))
-    total = sum(len(d) for _, d in files)
-    body = [
-        "# jce skill — MANIFEST",
-        "",
-        "内容标识 **`%s`**——对下表除本文件外全部文件的名字与字节的哈希。" % cid,
-        "同内容必得同标识，不同内容必得不同标识；文件名就是它，所以版本不可复用。",
-        "",
-        "打包时 JCE 仓库位于 `%s`。**这只是上下文，它不决定本 zip 的内容**：" % commit,
-        "skill 源在仓库之外，仓库里没有它的任何字节。",
-        "",
-        "## 文件",
-        "",
-        "| 文件 | 行 | 字节 | SHA-256 |",
-        "|---|---:|---:|---|",
-    ] + rows + [
-        "",
-        "合计 **%d 个文件**（含本清单），Markdown **%d 行**，**%d 字节**。"
-        % (len(files) + 1, md_lines, total),
-        "行数按 `splitlines()` 计。按换行切分会给每个以换行结尾的文件多算一行，",
-        "上一版清单把 2394 报成 2406 就是这个原因。",
-        "",
-        "## 这份归档能复现什么、不能复现什么",
-        "",
-        tracked_state_note(),
-        "",
-        "## 校验",
-        "",
-        "```bash",
-        "# zip 自身的哈希在同目录的 .sha256 里（分离式，不在包内）",
-        "sha256sum -c jce-skill-%s.zip.sha256" % cid,
-        "",
-        "# 解包后逐文件复验",
-        "python tools/pack_skill.py --verify <解包目录>/jce",
-        "```",
-        "",
-        "重新打包同一份内容必须得到**逐字节相同**的 zip。若不同，说明打包过程",
-        "本身带了时间戳或顺序这类非内容输入，那时版本号不再标识任何东西。",
-        "",
-    ]
+def build_manifest(files, cid, commit=None):
+    """Derive metadata only from payload; Git context cannot change zip bytes."""
+    chinese = ARCHIVE_ROOT == "jce-zh-cn"
+    title = "JCE skill 清单" if chinese else "JCE skill manifest"
+    explanation = ("内容标识覆盖文件路径与原始字节；本清单为派生数据。" if chinese
+                   else "The content ID covers file paths and original bytes; this manifest is derived.")
+    columns = "| 文件 | 行 | 字节 | SHA-256 |" if chinese else "| File | Lines | Bytes | SHA-256 |"
+    body = [f"# {title}", "", f"<!-- content-id: {cid} -->", "", explanation, "",
+            columns, "| --- | ---: | ---: | --- |"]
+    body += ["| `%s` | %d | %d | `%s` |" % (name, line_count(data), len(data), sha256_bytes(data))
+             for name, data in files]
+    body += ["", ("解包后核验：" if chinese else "Verify after unpacking:"), "", "```bash",
+             "python tools/pack_skill.py --verify <unpacked>/" + ARCHIVE_ROOT, "```", "",
+             ("相同内容应产生逐字节相同的归档。私有扩展不包含在包内。" if chinese
+              else "Identical payloads produce identical archives. Private extensions are excluded."), ""]
     return "\n".join(body).encode("utf-8")
 
 
@@ -198,14 +140,19 @@ def cmd_verify(target):
     files = collect(target)
     payload = [(n, d) for n, d in files if not n.endswith(DERIVED)]
     cid = content_id_of(payload)
-    print("pack_skill: %d payload file(s), content id %s" % (len(payload), cid))
-    for n, d in files:
-        print("  %-46s %5d lines  %s" % (n, line_count(d), sha256_bytes(d)[:16]))
+    manifest = target / "MANIFEST.md"
+    if not manifest.is_file() or manifest.read_bytes() != build_manifest(payload, cid):
+        print("pack_skill: FAIL - manifest or payload differs from its recorded content")
+        return 1
+    print("pack_skill: verified %d payload file(s), content id %s" % (len(payload), cid))
     return 0
 
 
 def main(argv=None):
+    global ARCHIVE_ROOT
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--locale", choices=["en-US", "zh-CN"], default="en-US",
+                    help="skill edition (default: en-US)")
     ap.add_argument("--out", default=str(REPO_ROOT / "dist" / "skill"),
                     help="output directory (default: dist/skill, gitignored)")
     ap.add_argument("--install", default=None,
@@ -215,14 +162,19 @@ def main(argv=None):
                          "unpacked skill directory")
     args = ap.parse_args(argv)
 
+    catalog = json.loads((REPO_ROOT / "contracts/skill-locales.json").read_text(encoding="utf-8"))
+    edition = catalog["locales"][args.locale]
     if args.verify:
-        return cmd_verify(Path(args.verify))
-
-    skill_dir = SKILL_LINK if SKILL_LINK.exists() else SKILL_SRC
+        target = Path(args.verify)
+        for config in catalog["locales"].values():
+            if target.name == config["name"]:
+                edition = config
+        ARCHIVE_ROOT = edition["name"]
+        return cmd_verify(target)
+    ARCHIVE_ROOT = edition["name"]
+    skill_dir = REPO_ROOT / edition["root"]
     if not skill_dir.is_dir():
-        print("pack_skill: no skill at %s or %s -- a broken junction is "
-              "reported by check_skills.py as BROKEN LINK, not as a missing "
-              "skill" % (SKILL_LINK, SKILL_SRC))
+        print("pack_skill: skill edition is missing: %s" % skill_dir)
         return 1
 
     install_path = Path(args.install) if args.install else (skill_dir / "INSTALL.md")
@@ -251,7 +203,7 @@ def main(argv=None):
 
     # Content-addressed, therefore immutable: one content can never be
     # published under two names, and two contents can never share one name.
-    name = "jce-skill-%s.zip" % cid
+    name = "%s-skill-%s.zip" % (ARCHIVE_ROOT, cid)
     dest = Path(args.out) / name
     blob = write_zip(dest, files)
     digest = sha256_bytes(blob)

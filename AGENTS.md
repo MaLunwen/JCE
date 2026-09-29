@@ -38,7 +38,8 @@ Local scratch documents and private extensions are not required by a clone.
 - private/: unpublished AI workflows, their specs, contracts and own tests.
   Public SDK/editor mechanisms and ordinary scene/physics capabilities stay public.
   The public core must configure and validate without this optional directory.
-- skills/jce/: versioned public skill. Local runtime pointers resolve here.
+- skills/jce/: default en-US public skill; skills/jce-zh-cn/: corresponding translation.
+  Local runtime pointers resolve to these versioned directories.
 - build/, dist/, reports/: generated local output, never source authorities.
 
 Original third-party code is fetched from immutable pins, verified byte-for-byte

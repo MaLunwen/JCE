@@ -62,5 +62,6 @@ maintained map, not a delivery plan or a snapshot of feature counts.
 | tools/lint | [tools/lint/AGENTS.md](../tools/lint/AGENTS.md) |
 
 Public ownership and ignore boundaries: [source-layout.json](source-layout.json).
-Public skill: [JCE](../skills/jce/SKILL.md). `docs/`, `.docs/` and `private/`
+Public skill: [JCE en-US](../skills/jce/SKILL.md);
+[zh-CN translation](../skills/jce-zh-cn/SKILL.md). Locale inventory: [skill-locales.json](skill-locales.json). `docs/`, `.docs/` and `private/`
 are local-only and are not required by public source checks or builds.

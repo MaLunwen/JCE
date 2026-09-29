@@ -1,0 +1,30 @@
+{
+  "default": "en-US",
+  "locales": {
+    "en-US": {
+      "name": "jce",
+      "root": "skills/jce"
+    },
+    "zh-CN": {
+      "name": "jce-zh-cn",
+      "root": "skills/jce-zh-cn"
+    }
+  },
+  "references": [
+    "architecture-map.md",
+    "authoring-and-inspection.md",
+    "build-and-gate.md",
+    "capability-liveness.md",
+    "code-style.md",
+    "consumer-ck-production.md",
+    "crossplatform-lowend.md",
+    "editor-panel-workflow.md",
+    "evidence-verification.md",
+    "git-and-worktrees.md",
+    "repository-state.md",
+    "runtime-parity.md",
+    "scripting-bindings.md",
+    "toolchain-reference.md",
+    "user-project-sdk.md"
+  ]
+}

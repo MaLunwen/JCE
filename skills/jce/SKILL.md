@@ -1,47 +1,49 @@
 ---
 name: jce
-description: Use when working on JCE engine/editor code, reusable build tooling, installed-SDK consumer projects and their validation. Read the repository contract and route to the relevant procedure.
+description: Use when working on JCE engine/editor code, reusable build tooling, installed-SDK consumer projects and their validation.
+metadata:
+  language: en-US
 ---
 
 # JCE
 
-The maintained source is skills/jce in this repository. Local skill-directory
-links point here; a clone needs no user-installed skill or scratch documents.
-Read AGENTS.md, README.md, relevant public API headers and the closest module
-charter. User scope and Git preferences take precedence.
+This is the default en-US edition. [Simplified Chinese edition](../jce-zh-cn/SKILL.md).
+The maintained source is skills/jce in this repository; local runtime links resolve here.
 
-Use public SDK interfaces from consumer projects. Search existing APIs and
-implementation before adding code. General tooling takes explicit inputs;
-project content, balance and dedicated generators stay under examples/<project>.
-Keep original third-party source unchanged and outside the tracked tree.
+Read AGENTS.md, README.md, the relevant public API and the closest module charter.
+User scope, language preference and authorized Git actions take precedence.
+Use public SDK interfaces in consumer projects and reuse existing component/runtime mechanisms.
+General tools take explicit inputs; project content and dedicated tooling belong under examples/.
+Original third-party source and packages must remain unchanged.
 
-## Task routing
+## Task references
+
+Read only the reference relevant to the task.
 
 | Task | Reference |
 | --- | --- |
-| Architecture or file ownership | [architecture-map](references/architecture-map.md) |
-| Code style | [code-style](references/code-style.md) |
-| Build, source checks and tests | [build-and-gate](references/build-and-gate.md) |
-| SDK or consumer deployment | [user-project-sdk](references/user-project-sdk.md) |
-| Editor panel, menu or interaction | [editor-panel-workflow](references/editor-panel-workflow.md) |
-| Runtime/editor parity | [runtime-parity](references/runtime-parity.md) |
-| Script binding changes | [scripting-bindings](references/scripting-bindings.md) |
-| Platform and low-end requirements | [crossplatform-lowend](references/crossplatform-lowend.md) |
-| Image or performance evidence | [evidence-verification](references/evidence-verification.md) |
-| Existing capability investigation | [capability-liveness](references/capability-liveness.md) |
-| Project authoring and inspection | [authoring-and-inspection](references/authoring-and-inspection.md) |
-| CK consumer boundaries | [consumer-ck-production](references/consumer-ck-production.md) |
-| Git and pending workspace delivery | [git-and-worktrees](references/git-and-worktrees.md) |
-| Toolchains | [toolchain-reference](references/toolchain-reference.md) |
-| Maintained layout and truth sources | [repository-state](references/repository-state.md) |
+| Architecture and ownership | [Architecture and ownership](references/architecture-map.md) |
+| Code and text conventions | [Code and text conventions](references/code-style.md) |
+| Build and validation | [Build and validation](references/build-and-gate.md) |
+| SDK consumers and distribution | [SDK consumers and distribution](references/user-project-sdk.md) |
+| Editor integration | [Editor integration](references/editor-panel-workflow.md) |
+| Editor/runtime parity | [Editor/runtime parity](references/runtime-parity.md) |
+| Scripting and language bindings | [Scripting and language bindings](references/scripting-bindings.md) |
+| Platform and low-end requirements | [Platform and low-end requirements](references/crossplatform-lowend.md) |
+| Visual and timing evidence | [Visual and timing evidence](references/evidence-verification.md) |
+| Capability liveness | [Capability liveness](references/capability-liveness.md) |
+| Authoring a consumer project | [Authoring a consumer project](references/authoring-and-inspection.md) |
+| Caged Kingdom consumer boundary | [Caged Kingdom consumer boundary](references/consumer-ck-production.md) |
+| Git workflow | [Git workflow](references/git-and-worktrees.md) |
+| Toolchain discovery | [Toolchain discovery](references/toolchain-reference.md) |
+| Maintained repository state | [Maintained repository state](references/repository-state.md) |
 
-Run build/test/gate commands through scripts/jce.py. Its implementation is
-single-sourced under tools/build; automated checks live under tools/lint and
-tools/audit. Public-header changes require SDK refresh and consumer smoke tests.
-A visual or timing claim requires an appropriate capture or real clock check.
-Report unavailable private checks separately; they are never PASS evidence.
+## Verification and publication
 
-Unpublished AI CLI/Agent/scene/physics workflows and their detailed instructions
-are local private extensions. Their source, contracts, prompts and acceptance
-records must not enter public commits or skill archives. Ordinary scene/physics
-APIs, editor interfaces and SDK mechanisms remain reusable public capabilities.
+Use scripts/jce.py for builds, tests and gates. Source checks and the architecture audit are separate requirements.
+Public-header changes require SDK refresh and consumer validation; binding changes require both generators.
+Pixel and timing claims need captures and actual clock evidence. Missing/private checks are unavailable, never PASS.
+
+Unpublished AI CLI/Agent/scene/physics policy, private prompts and delivery notes must not enter public source or skill archives.
+Public model transport, SDK/editor interfaces and ordinary scene/physics capabilities remain reusable public mechanisms.
+Keep both language editions' reference inventory and command examples synchronized.

@@ -50,6 +50,9 @@ LINTS = [
     ("tools/tests/test_build_driver.py", []),
     ("tools/tests/test_conan_configuration.py", []),
     ("tools/tests/test_llm_transport.py", []),
+    ("tools/tests/test_skills_paths.py", []),
+    ("tools/tests/test_pack_skill.py", []),
+    ("tools/lint/check_skill_locales.py", ["--self-check"]),
     ("tools/lint/check_repository_hygiene.py", ["--self-check"]),
     # AGENTS.md §11's 3000-line cap.  It was the one invariant in that list
     # with no checker at all -- restated five times across the charters and

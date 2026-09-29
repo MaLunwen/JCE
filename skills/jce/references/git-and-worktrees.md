@@ -1,17 +1,11 @@
-# Git and workspace delivery
+# Git workflow
 
-Read the actual branch, refs, index and ignore decisions before changing them.
-Use git ls-files -- <exact path> and git check-ignore -v <exact path> to verify
-tracking. docs/, .docs/ and private/ are local; public charters, skill, contracts,
-tests and tools are tracked. Respect the owner's no-commit/no-push instruction.
+Preserve the user's branch, staged changes, ignored assets and backup refs. Read status and the requested baseline before changing history. A source export used for verification is generated test output, not a reason to replace the user's checkout.
 
-Back up Git refs before history alignment. Do not copy ignored media or build
-outputs unless the user requests a filesystem backup. Preserve unrelated edits
-and original third-party bytes. Prefer managed worktrees when isolation is
-needed; never delete or re-purpose another active checkout. Verify restored
-paths and directory migrations, and avoid reset --hard or forced checkout.
+When the user reserves commits and pushes, leave changes reviewable in the workspace. When explicitly authorized to rewrite a published commit, create a Git backup branch first and record the observed remote object ID.
 
-Owned text uses LF, with CRLF checkout for BAT/CMD only. Write explicit newline
-bytes, verify the index and include moves in the same pending change. Do not
-normalize upstream source. ABI checks that inspect HEAD need a post-commit run
-by the person who performs the eventual commit.
+Use force-with-lease with that expected remote ID for an authorized history update; if the lease fails, inspect the new remote history instead of overriding it. Publish only validated public content and exclude local/private delivery files.
+
+Check staged whitespace, real index paths, effective attributes and ignore decisions. Keep unavailable verification separate from PASS and report the exact source/build identity of a delivered artifact.
+
+Use managed worktree lifecycle tools for user-requested isolated checkouts and cleanup. Do not remove a worktree or ignored project content without accounting for ongoing work and retained assets.

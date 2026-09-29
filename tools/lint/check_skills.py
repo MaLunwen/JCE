@@ -221,9 +221,12 @@ def check_skill(skill_dir: Path, known_skills: set) -> tuple[list, list]:
     if not desc:
         fail(1, "frontmatter has no `description`")
     else:
-        if not desc.lower().startswith("use when"):
-            fail(1, "description should start with \"Use when...\" "
-                    "(triggering conditions), got %r" % desc[:48])
+        locale = re.search(r"language:\s*(\S+)", fm.get("metadata", ""))
+        chinese = locale is not None and locale.group(1) == "zh-CN"
+        trigger = "用于" if chinese else "Use when"
+        if not desc.lower().startswith(trigger.lower()):
+            fail(1, "description should start with %r (triggering conditions), got %r"
+                 % (trigger, desc[:48]))
         for pronoun in (" I ", "I'll", "I can", " we ", " you should "):
             if pronoun in " " + desc:
                 fail(1, "description must be third person; found %r" % pronoun)
@@ -303,6 +306,11 @@ def _check_body(doc: Path, skill_dir: Path, text: str, known_skills: set,
                 continue
             if not rel.startswith(REPO_ROOTS):
                 continue          # prose with a slash, not a path claim
+            # Windows trims trailing dots, so exists() can accept "...".
+            # Reject placeholder paths before querying either platform's FS.
+            if "..." in rel:
+                fail(idx, "path `%s` is a placeholder; use a concrete repository path" % rel)
+                continue
             # A path named INSIDE a "this is gone" sentence is the opposite
             # claim, and the two checks must not both fire on it: the positive
             # check would report the absence it is asserting.  Decide which
@@ -359,9 +367,9 @@ def main() -> int:
 
     root = Path(args.skills_dir)
     if not root.exists():
-        print("SKIPPED check_skills: skills dir %s does not exist. The JCE "
-              "skills are user-level (owner decision 2026-08-26) and do not "
-              "travel with a clone; this is not a pass." % root)
+        print("SKIPPED check_skills: skills dir %s does not exist. The repository "
+              "skill is missing or the explicit skill directory is unavailable; "
+              "this is not a pass." % root)
         return 2
 
     # os.listdir, not iterdir+is_dir: the sources live in ~/.agents/skills and

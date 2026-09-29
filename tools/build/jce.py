@@ -2380,8 +2380,16 @@ JCE Editor bundle ({platform}-{arch}, {variant})
 Contents:
   jce_editor.exe   The editor. Double-click to launch.
   sdk/             Engine SDK (headers, libs, CMake config, resources).
+  LICENSE, THIRD_PARTY_LICENSES.md   Source and dependency license notices.
 
-Prerequisites on this machine (NOT bundled):
+Optional scripting runtimes (NOT bundled):
+  * .NET 8 runtime for C#; Java 21 with JAVA_HOME for Java.
+  * A matching Python installation is needed unless its embeddable runtime
+    was supplied through package editor --python-runtime. Binding modules
+    are staged alongside the editor in either case.
+  * Microsoft Visual C++ Redistributable (x64 for an x64 bundle).
+
+Project build tools (NOT bundled; not needed merely to launch the editor):
   * Microsoft Visual C++ Build Tools (MSVC) - the editor compiles your game
     project locally and links it against the SDK libs.
   * CMake 3.20 or newer, on PATH.
@@ -2454,8 +2462,33 @@ def cmd_package_editor(args) -> None:
         for extra in ("jce_editor_sha256.txt",):
             if (src / extra).exists():
                 shutil.copy2(src / extra, out / extra)
-        for dll in src.glob("*.dll"):
-            shutil.copy2(dll, out / dll.name)
+        _assert_no_profiler_listener(out / editor_exe.name, variant)
+        for pattern in ("*.dll", "*.so", "*.so.*", "*.dylib", "*.runtimeconfig.json"):
+            for runtime in src.glob(pattern):
+                shutil.copy2(runtime, out / runtime.name)
+        for runtime in src.glob("jce_script_*"):
+            if runtime.is_dir():
+                shutil.copytree(runtime, out / runtime.name)
+        for assembly in out.glob("*.dll"):
+            config = src / (assembly.stem + ".runtimeconfig.json")
+            if assembly.name == "JceScript.dll" and not config.is_file():
+                die(f"managed scripting runtime configuration missing: {config}")
+        python_runtime = getattr(args, "python_runtime", None)
+        if python_runtime:
+            runtime_dir = Path(python_runtime).resolve()
+            dlls = list(runtime_dir.glob("python3*.dll"))
+            versions = [dll.stem for dll in dlls if dll.stem != "python3"]
+            if not versions or not all((runtime_dir / (v + ext)).is_file()
+                                       for v in versions for ext in (".zip", "._pth")):
+                die(f"incomplete Python embeddable runtime: {runtime_dir}")
+            if not (runtime_dir / "LICENSE.txt").is_file():
+                die(f"Python runtime license missing: {runtime_dir}")
+            for runtime in runtime_dir.iterdir():
+                if not runtime.is_file() or runtime.is_symlink():
+                    die(f"expected original flat Python embeddable runtime: {runtime}")
+                shutil.copy2(runtime, out / runtime.name)
+        for notice in ("LICENSE", "THIRD_PARTY_LICENSES.md"):
+            shutil.copy2(ROOT / notice, out / notice)
         shutil.copytree(sdk_dir, out / "sdk", dirs_exist_ok=True)
         (out / "VERSION.txt").write_text(
             "product:  JCE Editor bundle\n"
@@ -3207,6 +3240,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe = pkg_sub.add_parser("editor", help="stage editor bundle (exe + sdk/ + README)")
     add_arch(pe)
     add_variant(pe, ["release", "dist"], "release")
+    pe.add_argument("--python-runtime", help="original matching Windows Python embeddable runtime directory (including license)")
     pe.add_argument("--skip-build", action="store_true",
                     help="reuse existing editor exe + SDK tree")
     pe.add_argument("--out", help="override output dir")
