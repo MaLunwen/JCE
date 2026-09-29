@@ -13,6 +13,7 @@
 extern "C" {
 #endif
 
+#include <jce/os/platform/jce_console_shell.h>
 #include <jce/os/platform/jce_gamepad.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_actions.h>

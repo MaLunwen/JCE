@@ -156,6 +156,7 @@ typedef struct {
      * scenes grow large enough to benefit from the index. */
     bool                 frustum_culling;
 
+
     /* GPU-query occlusion culling (two-pass coherence-based).
      * Set to a valid JceOcclusionCuller instance to enable; NULL disables.
      * When active, entities occluded in the previous frame are skipped
@@ -291,6 +292,68 @@ typedef struct {
      * is the safe direction for a field appended to a public struct, where
      * every existing caller zero-initialises and cannot be asked. */
     bool                     composites_volumetric_fog;
+    /* Camera culling mask, resolved by the HOST from the camera component it
+     * is rendering (JceCameraComponent.culling_mask).  Bit N set = draw
+     * entities whose JceLayerComponent.layer is N.  ZERO = no filtering, so a
+     * zero-initialised config behaves exactly as every build did before this
+     * field existed.
+     *
+     * Applied to the colour pass AND the depth/velocity prepass, which must
+     * agree: the prepass feeds SSAO, SSR and TAA motion vectors, and a
+     * mismatch there is what made the streamed set shimmer every frame (see
+     * the cull_aspect comment in jce_sr_draw.c).  NOT applied to shadow
+     * passes -- an object a camera does not render can still cast into the
+     * scene -- and NOT to the editor pick pass, so a masked object stays
+     * selectable in the Scene View, which is what Unity does. */
+    uint32_t             camera_culling_mask;
+
+    /* A SECOND, CHEAP RENDER OF THE SAME SCENE.  Set by a caller that wants
+     * the colour pass and nothing else -- a planar reflection, a thumbnail, a
+     * capture.  It suppresses every screen-space effect: SSAO, SSR and SSGI,
+     * and with them the depth/normal pre-pass.
+     *
+     * NOT because they would look wrong in a reflection, though they would.
+     * Because they write into state the MAIN view owns: sr->ssao_depth_tex
+     * and sr->ssao_normal_tex are one pair for the whole renderer, so a
+     * second render that fills them hands the main view someone else's depth
+     * on the next frame.  And because their view offsets (base+2/3, +18/19,
+     * +26/27) are added to whatever base the second render is given -- from a
+     * high base that is arithmetic past 255, which bgfx does not have.
+     *
+     * Default false: every existing caller renders exactly as before.
+     * APPENDED. */
+    bool                 reduced_pass;
+
+    /* CAMERA STACKING -- how many OVERLAY cameras will draw on top of this
+     * render, 0..JCE_VIEW_SR_CAMERA_OVERLAY_MAX.
+     *
+     * The renderer needs it BEFORE it draws anything, because it decides the
+     * view ORDER: the overlay views (base+64..66) have to be named and placed
+     * right after the colour view, ahead of SSR, the fullscreen chain, SSGI's
+     * composite and the PostFX chain -- all of which READ the colour the
+     * overlays write into.  Reserved from this count rather than from whether
+     * an overlay actually drew, the same way the underwater view is reserved:
+     * what draws is decided after the order is set.
+     *
+     * The host sets it from jce_scene_camera_resolve_stack and then calls
+     * jce_scene_renderer_render_camera_overlay once per overlay, after
+     * jce_scene_renderer_render.  Zero -- every scene with one camera, and
+     * every scene authored before stacking existed -- reserves nothing and
+     * produces a byte-identical order.
+     *
+     * APPENDED. */
+    uint8_t              camera_overlay_count;
+
+    /* JceCameraComponent.clear_mode, verbatim, for the camera this config
+     * renders.  Read ONLY by jce_scene_renderer_render_camera_overlay, which
+     * turns it into what the overlay view clears; the main render still
+     * decides the sky through draw_skybox, which the host sets from
+     * jce_scene_camera_clear_draws_skybox -- one authority for the sky
+     * question, one for the clear question, and neither derived from the
+     * other.  Zero is JCE_CAMERA_CLEAR_SKYBOX, which an overlay refuses, so a
+     * zero-initialised config that never authored a stack is unaffected.
+     * APPENDED. */
+    uint8_t              camera_clear_mode;
 } JceSceneRenderConfig;
 
 /* Returns true if a skybox component is currently active in the scene
@@ -340,6 +403,20 @@ typedef struct {
     bool        (*resolve_path)(const char *in, char *out, int outsz,
                                 void *ud);
     void        *userdata;
+    /* OPTIONAL, and the same lookup as load_texture with ONE difference: the
+     * texture is sRGB-ENCODED COLOUR, so it must be created with a hardware
+     * sRGB view -- the sampler then decodes each texel BEFORE filtering it,
+     * which is where the shader's pow(2.2) could never run.  The engine asks
+     * for this only where the consuming shader treats the sampled value as
+     * linear: s_albedo, s_emissive, and fs_terrain's four layer albedos.
+     *
+     * A NULL here is not fatal: the engine falls back to load_texture and
+     * warns ONCE that albedo will render over-bright, because the shader no
+     * longer decodes.  APPENDED (ABI) -- an embedder compiled against the
+     * older struct has a zeroed tail and takes exactly that fallback. */
+    JceTexture  (*load_texture_srgb)(const char *material_path,
+                                     const char *mesh_path,
+                                     void       *ud);
 } JceSceneRendererCallbacks;
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */
@@ -417,6 +494,52 @@ JCE_API uint16_t jce_scene_renderer_render(
     float                       dt_sec,
     const JceSceneRenderConfig *config);
 
+/* Draw ONE overlay camera on top of a render that has already happened.
+ *
+ * Unity's camera stacking: a Base camera renders the scene, and each Overlay
+ * camera draws its own slice of the same scene into the same colour target
+ * without clearing it -- a first-person weapon that never intersects the
+ * level, a 3D inventory model, a portal.  What makes it an overlay is the
+ * clear mode, not a separate target.
+ *
+ * CALL IT AFTER jce_scene_renderer_render, with:
+ *   view_id_base   the SAME base the main render used;
+ *   overlay_index  0..JCE_VIEW_SR_CAMERA_OVERLAY_MAX-1, in stack order;
+ *   config         the OVERLAY camera's own culling mask and clear mode, and
+ *                  the SAME scene_color_fb / viewport as the main render.
+ * The view it draws into is view_id_base + JCE_VIEW_SR_CAMERA_OVERLAY_OFFSET
+ * + overlay_index, which the main render's view-order pass has already placed
+ * immediately after the colour view.  Calling it with a base whose main render
+ * did not declare config->camera_overlay_count leaves the overlay in the
+ * filler tail, where it would draw after tone mapping -- so the count is not
+ * optional, and this function says so rather than guessing.
+ *
+ * CLEAR MODE decides what survives underneath:
+ *   JCE_CAMERA_CLEAR_DEPTH_ONLY  clears depth, keeps colour -- the usual
+ *                                choice: the overlay never intersects what is
+ *                                already drawn.
+ *   JCE_CAMERA_CLEAR_NOTHING     clears nothing -- the overlay shares the
+ *                                base camera's depth and can be occluded by it.
+ *   JCE_CAMERA_CLEAR_COLOR       clears colour and depth, which erases the base
+ *                                camera.  Legal, and almost never what is
+ *                                wanted; it is not refused because a full-frame
+ *                                second view is a real use.
+ *   JCE_CAMERA_CLEAR_SKYBOX      REFUSED and logged once, treated as
+ *                                DEPTH_ONLY: a sky drawn by an overlay covers
+ *                                everything under it, which is not a stack.
+ *                                Unity refuses the same thing in the same way.
+ *
+ * A no-op when scene, camera or config is NULL, or when overlay_index is past
+ * the cap. */
+JCE_API void jce_scene_renderer_render_camera_overlay(
+    JceSceneRenderer           *sr,
+    JceScene                   *scene,
+    const JceCamera            *camera,
+    uint16_t                    view_id_base,
+    uint8_t                     overlay_index,
+    float                       dt_sec,
+    const JceSceneRenderConfig *config);
+
 /* ── Accessors ────────────────────────────────────────────────────── */
 
 /* Returns the CSM data from the most recent render (for overlay shadow
@@ -435,20 +558,25 @@ JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
  *
  * begin_frame: call it RIGHT BEFORE setting the main scene colour pass's
  *   view transform.  Pass the CLEAN (un-jittered) view + proj you were
- *   about to use.  When r.taa is ON it advances the jitter sequence, writes
- *   the JITTERED projection into *out_jittered_proj (use THAT for the colour
- *   pass), pushes the un-jittered inverse-view-proj + previous view*proj to
- *   the engine PostFX pipeline, and enables TAA on it.  Returns true iff TAA
- *   is active this frame (caller uses *out_jittered_proj); returns false and
- *   leaves *out_jittered_proj == clean_proj when r.taa is OFF, so the OFF
- *   path is byte-identical.  Drive the SAME pipeline you then call
+ *   about to use.  It ALWAYS pushes the un-jittered inverse-view-proj +
+ *   previous view*proj to the engine PostFX pipeline -- those are camera
+ *   state, and TAA is only one of the things that reprojects with them; the
+ *   post-fx motion blur wants the same pair, and behind the TAA gate it
+ *   silently required TAA to be on.  THEN, when r.taa is ON, it advances the
+ *   jitter sequence, writes the JITTERED projection into *out_jittered_proj
+ *   (use THAT for the colour pass), and enables TAA on the pipeline.
+ *   Returns true iff TAA is active this frame (caller uses
+ *   *out_jittered_proj); returns false and leaves *out_jittered_proj ==
+ *   clean_proj when r.taa is OFF, so the OFF path is byte-identical to a
+ *   build without TAA.  Drive the SAME pipeline you then call
  *   jce_postfx_apply() on (the engine-owned one from get_postfx()).
  *
  * end_frame: call it AFTER the scene colour pass (end of frame) with the
- *   SAME clean view + proj.  Records them as next frame's reproject source
+ *   SAME clean view + proj.  ALWAYS records them as next frame's reproject
+ *   source -- gated on TAA, "previous" meant "whenever TAA was last on" --
  *   and DISABLES TAA on the engine PostFX pipeline so it never leaks into
  *   the editor's pick / preview / thumbnail postfx invocations.  Safe to
- *   call unconditionally; it self-no-ops when r.taa is OFF. */
+ *   call unconditionally. */
 JCE_API bool jce_scene_renderer_taa_begin_frame(JceSceneRenderer *sr,
                                                 uint32_t target_w,
                                                 uint32_t target_h,
@@ -503,8 +631,47 @@ JCE_API void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t vie
 /* Composite the SSR reflection RT over the destination color framebuffer.
  * No-op when SSR was not active this frame.  view_id must be > the scene's
  * SSR ray-march view (base+2) and the color pass; pass e.g. base+3. */
+/* Render the planar reflection for this frame, if any water asks for one.
+ *
+ * Call it AFTER the main render, once per frame per host.  It is a SECOND,
+ * reduced scene render (jce_planar_reflection.h) into its own absolute view
+ * band, and the water pass consumes it on the NEXT frame -- which is forced,
+ * not chosen: bgfx runs views in ascending id order and the water draws in
+ * the colour view at base+0, so nothing base-relative can precede it.
+ *
+ * No-op when no Water component has planar_reflection set, which is every
+ * scene that has not asked: a project that never opts in pays nothing and
+ * renders byte-identically. */
+JCE_API void jce_scene_renderer_render_planar_reflection(
+    JceSceneRenderer *sr, JceScene *scene, const JceCamera *camera,
+    float dt_sec);
+
+/* Add the SSGI bounce onto the destination colour buffer.  `view_id` must
+ * be greater than the march view (base + JCE_VIEW_SR_SSGI_OFFSET); no-op when
+ * SSGI produced nothing this frame. */
+JCE_API void jce_scene_renderer_composite_ssgi(JceSceneRenderer *sr,
+                                               uint16_t view_id,
+                                               JceFrameBufferHandle dst);
+
 JCE_API void jce_scene_renderer_composite_ssr(JceSceneRenderer *sr, uint16_t view_id,
                                               uint16_t dst_fb_idx);
+
+/* Blend the PLANAR REFLECTION PROBE's mirror over the destination colour.
+ *
+ * Pass the SAME view id as the SSR composite and call this SECOND: the two
+ * are one stage with two producers (jce_views.h's
+ * JCE_VIEW_SR_REFLECTION_COMPOSITE_OFFSET says why), and ordering the planar
+ * one last lets the accurate reflection win where it applies over the
+ * screen-space guess.
+ *
+ * Reads the depth and G-buffer normal this frame already produced, so it
+ * reaches ANY surface that lies on the probe's plane rather than only the
+ * materials with a free sampler slot -- which was one, water.  No-op when no
+ * planar probe asked, when the mirror could not render (camera behind the
+ * plane) or when there is no G-buffer this frame. */
+JCE_API void jce_scene_renderer_composite_planar(JceSceneRenderer *sr,
+                                                 uint16_t view_id,
+                                                 JceFrameBufferHandle dst);
 
 /* Per-frame culling stats from the most recent render call. */
 typedef struct {
@@ -520,6 +687,15 @@ typedef struct {
     uint32_t inserted;        /* entities inserted into the grid this frame */
     uint32_t updated;         /* entities re-bucketed (moved) this frame */
     uint32_t removed;         /* entities removed (despawned) this frame */
+    /* Collected entities the COLOUR pass skipped because they are disabled
+     * (JceEditorMeta.enabled false, or the cached SR_RK_DISABLED kind).
+     *
+     * Counted because nothing else could answer it.  Static batching disables
+     * the renderers it merged, and with only `total` and `visible` available a
+     * bake that worked was indistinguishable from one that did not: a lossless
+     * merge draws the same pixels the originals did, so the picture is the same
+     * either way and the entity count moves by +1 in both cases.  APPENDED. */
+    uint32_t disabled_skipped;
 } JceSceneCullStats;
 
 JCE_API void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
@@ -635,6 +811,25 @@ JCE_API JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr,
 JCE_API void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
                                                     const char *path);
 
+typedef enum JceTerrainEditFlags {
+    JCE_TERRAIN_EDIT_HEIGHTS = 1u << 0,
+    JCE_TERRAIN_EDIT_SPLAT   = 1u << 1,
+    JCE_TERRAIN_EDIT_HOLES   = 1u << 2,
+    JCE_TERRAIN_EDIT_ALL     = (1u << 3) - 1u
+} JceTerrainEditFlags;
+
+/* Invalidate only the terrain-derived GPU data touched by an authoring brush.
+ * Bounds are in the terrain asset's LOCAL XZ coordinates. Height/hole edits
+ * rebuild intersecting chunks plus a one-chunk normal halo; splat edits refresh
+ * the monolithic splat texture or only the intersecting tiled textures. Must be
+ * called on the render/main thread between frames. `scene` lets the renderer
+ * acknowledge a committed shared-terrain revision and avoid a redundant full
+ * slot rebuild on the next frame. */
+JCE_API void jce_scene_renderer_invalidate_terrain_region(
+    JceSceneRenderer *sr, JceScene *scene, const char *path,
+    float min_x, float min_z, float max_x, float max_z,
+    uint32_t edit_flags);
+
 /* Drop the cached tilemap (chunk meshes + map/tileset assets) for `path`
  * (or all cached tilemaps if path is NULL/empty) so the next frame
  * re-loads from disk. Tools (Tile Palette panel) call this after Save. */
@@ -647,6 +842,20 @@ JCE_API void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
  * block a model that exists in the new scene. Joins any in-flight async decode
  * and destroys each GPU model; safe to call between frames. */
 JCE_API void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr);
+
+/* Forget the cached graph PROGRAM for one .mat.json (NULL = all of them).
+ *
+ * sr_resolve_custom_program caches by path, resolves once and never evicts --
+ * correct for a running game, wrong the moment a material is re-authored.
+ * Recompiling a Shader Graph swapped the program on the panel's preview sphere
+ * while every entity already placed in the scene kept drawing with the old
+ * one, so the editor showed two different answers for the same material and
+ * neither of them was labelled.
+ *
+ * Recompiling only forgets the association; the next draw re-reads the
+ * .mat.json and links whatever it now names.  Safe to call between frames. */
+JCE_API void jce_scene_renderer_invalidate_custom_program(JceSceneRenderer *sr,
+                                                          const char *material_path);
 
 /* ── VRAM ceiling (large-world-opt: free GPU resources on cell unload) ──────
  *
@@ -859,6 +1068,68 @@ JCE_API void jce_scene_renderer_set_grass_enabled(JceSceneRenderer *sr, bool on)
  * therefore had no way to produce these params, so the fog pass never ran
  * outside the editor -- the same shape of bug SSR had and already fixed.  One
  * derivation, both consumers. */
+/* ── Intermediate render targets, for an inspector ────────────────────
+ *
+ * WHAT THIS IS FOR.  Unity's Frame Debugger, UE's `viewmode` buffer
+ * visualisation and Godot's debug draw modes all answer one question: what
+ * does the shadow map / depth / normals / AO actually contain right now.  In
+ * this engine those textures existed and nothing could look at one, so a
+ * wrong G-buffer was only ever visible as a wrong final image.
+ *
+ * A PULL, NOT A REGISTRY.  The scene renderer owns every one of these
+ * handles, so it answers directly; there is no second table to drift and no
+ * per-frame cost when nobody is looking.
+ *
+ * ONLY WHAT IS REAL THIS FRAME.  Each target has a validity bit beside it in
+ * the renderer (the depth pre-pass may not have run, TAA may be off so the
+ * velocity attachment holds nothing, shadows may be in CSM mode so the single
+ * map is unused), and the enumeration honours all of them.  A listed-but-
+ * stale target would display LAST frame's pixels, or an uninitialised
+ * allocation -- and an image that is not blank is the hardest wrong answer
+ * there is to notice.  The list therefore CHANGES LENGTH from frame to frame,
+ * by design: an entry appearing is the feature turning on.
+ *
+ * Handles are borrowed and valid only until the next jce_scene_renderer_render
+ * on this renderer.  Copy the pixels (jce_render_readback_*) if you need them
+ * to outlive the frame. */
+
+typedef enum JceRenderTargetKind {
+    JCE_RT_KIND_COLOR = 0,   /* sample and show as-is                    */
+    JCE_RT_KIND_DEPTH,       /* near-white over most of its range; a raw
+                              * sample is legible only after a remap      */
+    JCE_RT_KIND_NORMAL,      /* rgb = normal*0.5+0.5, a = roughness       */
+    JCE_RT_KIND_VELOCITY,    /* rg = (curNDC-prevNDC)*0.5+0.5             */
+    JCE_RT_KIND_SHADOW,      /* depth from a light                        */
+    JCE_RT_KIND_LUT          /* a lookup table, not a picture of a scene  */
+} JceRenderTargetKind;
+
+typedef struct JceRenderTargetInfo {
+    /* Stable dotted id, e.g. "gbuffer.normal".  An inspector persists the
+     * user's selection by NAME: an index would move the moment a target
+     * became invalid for a frame, which is precisely when it is being
+     * watched. */
+    const char      *name;
+    /* One sentence on how to READ it, because most of these are not pictures
+     * and a viewer that shows a velocity buffer with no note has shown the
+     * user a flat grey rectangle and told them nothing. */
+    const char      *note;
+    JceTextureHandle texture;
+    uint16_t         width;      /* 0 when the renderer does not record it */
+    uint16_t         height;
+    uint32_t         kind;       /* JceRenderTargetKind */
+} JceRenderTargetInfo;
+
+/* How many targets are inspectable RIGHT NOW.  Varies by frame and by which
+ * features are enabled; 0 is a legitimate answer (a renderer that has not
+ * drawn a frame yet has nothing real to show). */
+JCE_API int jce_scene_renderer_debug_target_count(const JceSceneRenderer *sr);
+
+/* Fill `out` for target `index` in [0, count).  False for an out-of-range
+ * index or a NULL argument, leaving `out` untouched. */
+JCE_API bool jce_scene_renderer_debug_target_get(const JceSceneRenderer *sr,
+                                                 int index,
+                                                 JceRenderTargetInfo *out);
+
 JCE_API bool jce_scene_fog_params_from_scene(const JceScene *scene,
                                              JceVolumetricFogParams *out);
 

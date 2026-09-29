@@ -112,6 +112,11 @@ typedef enum JceRpPerfFeature {
 
 #define JCE_RP_AUTO ((int8_t)-1)
 
+/* The trail length a pipeline gets when its descriptor does not state one --
+ * which is every .rp.json written before the key existed.  1.0 is the full
+ * frame-to-frame displacement (a 360-degree shutter). */
+#define JCE_RP_MOTION_BLUR_DEFAULT 1.0f
+
 typedef struct JceRenderPipelineDesc {
     /* Features */
     bool enable_csm;            /* cascaded shadow maps        */
@@ -121,6 +126,19 @@ typedef struct JceRenderPipelineDesc {
     bool enable_bloom;
     bool enable_volumetric_fog;
     bool enable_gpu_particles;
+    /* Per-pixel motion blur.  IMPLEMENTED as of 2026-09-06; it spent its
+     * whole life before that set by three editor UIs, serialized to
+     * .rp.json, defaulted ON by the ULTRA preset, cooked into the shipped
+     * PAK, answered by jce_render_pipeline_feature_enabled("motion_blur")
+     * and read by no render pass at all -- the "applied:" log line said
+     * mblur=N(unimplemented) so it would not read as a report of work.
+     *
+     * The consumer is the post-fx composite (jce_postfx_set_motion_blur).
+     * It needs a MOTION SOURCE -- the renderer's per-object velocity buffer,
+     * or the camera-only reprojection, which needs the camera matrices and a
+     * scene depth.  jce_postfx_get_motion_blur_active() answers whether one
+     * was there, because "the toggle is on" and "the frame is being blurred"
+     * are different facts and this engine has shipped the gap between them. */
     bool enable_motion_blur;
     bool enable_cloth;          /* P3-C.4: soft-body / cloth sim */
     bool enable_stylized_sky;   /* stylized sky dome (mode 3); LOW tier off */
@@ -139,11 +157,20 @@ typedef struct JceRenderPipelineDesc {
      * fs_pbr/fs_terrain — no shader permutations). */
     uint8_t  shadow_filter_quality;
     uint8_t  msaa_samples;      /* 1, 2, 4, 8                  */
-    /* ADVISORY ONLY - parsed, stored and logged, but no renderer reads it.
-     * Resolution scaling is done instead by the runtime host's pixel-budget
-     * dynamic resolution (jce_default_main.inc.h), which ignores this field.
-     * Either wire it or delete it; do not read the log value as applied. */
-    float    render_scale;      /* advisory: no consumer. 1.0 = native */
+    /* Resolution the 3D scene renders at, as a fraction of the surface.
+     * 1.0 = native, 0.5 = quarter the pixels, 2.0 = supersampled.  The UI is
+     * NOT scaled: it is drawn at native resolution over the upsampled scene,
+     * which is the point -- text stays crisp while the fill-bound pass gets
+     * cheaper.  Same knob as Unity URP's Render Scale, UE's r.ScreenPercentage
+     * and Godot's Viewport.scaling_3d_scale.
+     *
+     * Read through jce_render_pipeline_scene_extent(), NEVER directly: the
+     * authored value composes with a low-tier pixel budget, and a second
+     * place that multiplies by this field would be a second answer to "how
+     * big is the scene target".  It spent a release as the FIRST answer to
+     * that question with no readers at all, while the runtime host quietly
+     * computed a different one -- see that function. */
+    float    render_scale;      /* 0.25 .. 2.0; 1.0 = native */
     JceRpQuality post_quality;
 
     /* Targets / format.  hdr_color drives ONLY the postfx chain's intermediate
@@ -158,6 +185,58 @@ typedef struct JceRenderPipelineDesc {
      * -1 auto / 0 force-off / 1 force-on.  Presets fill these; the JSON
      * asset serializes them under the "perf" object. */
     int8_t perf[JCE_RP_PERF_COUNT];
+
+    /* APPEND ONLY BELOW THIS LINE.  This struct is in the frozen public ABI
+     * and SDK consumers allocate it by value; a member inserted above shifts
+     * every later field for everything already compiled. */
+
+    /* Motion-blur trail length.  0 (the memset value, and the value every
+     * .rp.json written before this key existed loads to) means "use the
+     * engine default of 1.0" rather than "no blur" -- the ON/OFF decision is
+     * enable_motion_blur above, and a preset that says ON must not render
+     * unblurred just because it predates the knob.
+     *
+     * 1.0 smears a pixel across its full frame-to-frame displacement, which
+     * is the 360-degree-shutter value; below that is a shorter shutter. */
+    float motion_blur_intensity;
+
+    /* SUN ANGULAR DIAMETER, IN DEGREES: the sun's apparent size, which is
+     * what decides how fast a shadow's edge softens with distance from
+     * whatever cast it (PCSS contact hardening).  The real sun is 0.53; larger
+     * values are the usual artistic licence.
+     *
+     * The unit is the same one Godot's DirectionalLight3D.angular_distance
+     * uses, so a value copied from a Godot scene means here what it meant
+     * there.  It is a PHYSICAL unit on purpose: the first version of this
+     * knob was in shadow-map texels, which made the same authored number
+     * produce a different penumbra at every shadow resolution -- and being
+     * resolution-independent is the entire reason a blocker search is worth
+     * paying for.
+     *
+     * 0 -- the memset value, and
+     * the value every .rp.json written before this key existed loads to --
+     * means OFF and byte-identical: the filter radius stays the authored
+     * constant, which is what every scene has had.
+     *
+     * BESIDE shadow_filter_quality rather than on the light or the scene,
+     * because it is the same kind of decision: how much the shadow filter is
+     * allowed to cost.  The widened kernel is still 25 taps, so the cap that
+     * keeps it from breaking into speckle is a constant in the shader, not a
+     * second knob -- an unauthored knob is one somebody finds unread later. */
+    float sun_soft_size;
+
+    /* Screen-space global illumination.  Default false in every preset except
+     * ULTRA: unlike SSAO and SSR it changes a scene's LIGHTING rather than its
+     * shading detail, so a project promoted from HIGH must not have its look
+     * change underneath it.
+     *
+     * AT THE END, not beside enable_ssr where it belongs by subject.  This
+     * struct is public and its member ORDER is the ABI: inserting the flag
+     * next to its siblings moved enable_taa from index 3 to index 4 and
+     * everything after it, which check_abi_snapshot.py refused -- correctly.
+     * Grouping loses to compatibility here, the same trade dof_enabled above
+     * made. */
+    bool enable_ssgi;
 } JceRenderPipelineDesc;
 
 /* ── Apply / query ─────────────────────────────────────────────── */
@@ -172,6 +251,54 @@ JCE_API void jce_render_pipeline_get(JceRenderPipelineDesc *out);
 
 /* Per-feature query — render-graph code can gate passes off this. */
 JCE_API bool jce_render_pipeline_is_feature_enabled(const char *feature);
+
+/* The motion-blur trail length actually in force, with the "0 means the
+ * engine default" rule resolved in ONE place.  Every caller that read the
+ * field directly would have to repeat that rule, and the first one to forget
+ * it turns every pre-existing .rp.json -- which has no such key, so the field
+ * memsets to 0 -- into "motion blur on, trail length zero", i.e. a preset
+ * that says ON and renders unblurred.  Returns the default before the first
+ * apply(). */
+JCE_API float jce_render_pipeline_motion_blur_intensity(void);
+
+/* The sun soft size in force, in shadow-map texels.  0 = contact hardening
+ * OFF, which is what every .rp.json written before the key existed loads to
+ * and what every preset below ULTRA states.  Unlike the motion-blur length,
+ * 0 here is a MEANINGFUL value rather than "unset": a fixed-radius filter is
+ * a legitimate choice and the cheaper one, so there is no default to resolve
+ * and no accessor rule to get wrong.  Returns 0 before the first apply(). */
+JCE_API float jce_render_pipeline_sun_soft_size(void);
+
+/* THE resolution the 3D scene renders at, given the surface it will be
+ * presented on.  Every offscreen scene target is sized through this and
+ * nothing multiplies by render_scale itself.
+ *
+ * It answers with TWO things composed, in this order:
+ *
+ *   1. the AUTHORED render_scale, clamped to 0.25..2.0.  This is a decision
+ *      somebody made and it applies on every machine, upward included.
+ *   2. a pixel BUDGET, applied only on fill-bound hardware (GPU tier LOW, or
+ *      MEDIUM without a discrete GPU) and only DOWNWARD.  An iGPU's colour
+ *      pass is pixel-count-bound at native resolution, so a large surface has
+ *      to give something back to hold 60; a small window keeps rendering 1:1
+ *      and stays crisp.  JCE_DYNRES_BUDGET (in megapixels) overrides it.
+ *
+ * The order matters and is not arbitrary: the budget is a FLOOR under the
+ * frame rate, not an opinion about how the game should look, so it may only
+ * reduce what the author asked for.  Asking for 2.0 on an iGPU gets you the
+ * budget, not a slideshow.
+ *
+ * Both halves existed before this function and neither reached the other:
+ * render_scale was parsed, stored, shown in two editor panels and printed in
+ * the "applied:" log line while no renderer read it, and the runtime host's
+ * budget scaler ignored the field entirely.  A single reader is the fix; a
+ * second caller multiplying by render_scale again would recreate the bug.
+ *
+ * Never returns 0 in either output for a non-zero surface. */
+JCE_API void jce_render_pipeline_scene_extent(uint32_t surface_w,
+                                              uint32_t surface_h,
+                                              uint32_t *out_w,
+                                              uint32_t *out_h);
 
 /* Re-resolve the active pipeline against the CURRENT hardware tier.  The
  * LOW-tier floor is applied during apply() and reads the tier, so a pipeline

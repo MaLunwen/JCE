@@ -1,0 +1,21 @@
+# JceRuntimeDesc fields that are legitimately set on ONE side only.
+#
+# Format: <field> <reason on the same line>.  A line with no reason fails the
+# gate: an exemption without a stated reason is indistinguishable from an
+# oversight, which is the thing this gate exists to catch.
+#
+# Adopted 2026-08-31, after the gate found eleven of eighteen fields asymmetric.
+# Seven of those eleven were REAL and are now wired on both sides
+# (fixed_timestep, gravity, gravity2d, solver_iterations, sleep_threshold,
+# disable_auto_physics, max_frame_dt -- all of them Project Settings the shipped
+# game had been ignoring) plus navmesh_path and saves_dir.  The four below are
+# what was left.
+
+user_data      Editor-only by construction: Play passes its own context pointer (NULL today) so editor callbacks can find the session; a shipped game has no such outer object and jce_runtime_create treats NULL as "no user data".
+
+audio_load_fn  Editor-only by construction: Play installs editor_play_audio_load so clips resolve through the editor's live asset database, which can see un-cooked files on disk. The shipped path resolves audio through the mounted PAK plus resolve_path_fn, so an override would only shadow the real lookup.
+
+locales_dir    Shipped-only, and correctly so: game localisation (jce_loc) is PROCESS-GLOBAL, as jce_runtime_set_locale says out loud, so each process has exactly one owner. In a shipped process that owner is this desc. In the editor process it is already jce_editor_gl10n_load, which points jce_loc at <project>/<source_assets>/i18n and preserves the panel's preview locale. Setting it here would be a REGRESSION, not a fix: jce_runtime_create would call jce_loc_init, and jce_editor_game_l10n.cpp:71 states that jce_loc_init clears the model the Game Localization panel is editing. Play reaches localisation today because rd.pak is NULL and rd.locales_dir is unset, so rt_select_locale_asset returns false and the runtime never touches the binding the editor set up.
+
+locale         Shipped-only, same mechanism as locales_dir and the same reason not to wire it: the active preview locale is whatever the Game Localization panel last selected (jce_editor_game_l10n.cpp:75-80 carries it across a re-init), and handing the runtime a locale here would call jce_loc_set_locale and override the designer's choice mid-session. The editor's OWN i18n (menus, panels) is a separate system and is unaffected either way.
+asset_fs Shipped-only ON PURPOSE, and the asymmetry is the design rather than a gap. The runtime creates a world streamer when handed an asset filesystem; the editor passes NULL because its Play session drives its OWN streamer, which additionally mirrors streamed entities into the hierarchy and selection -- something a runtime has no business knowing about. Two streamers over one scene would double-load it, so exactly one side supplies this. If the editor ever stops owning its streamer, delete this line rather than setting the field on both sides.

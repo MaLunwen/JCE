@@ -6,6 +6,46 @@ Cross-platform, data-driven, native-callable game engine with a C99 first-party 
 
 **Core/headless baseline**: single-core CPU, 512 MB RAM, no discrete GPU (~2010-class hardware). The editor and rendered games use higher, tiered requirements according to workload and enabled features.
 
+**License**: [MPL-2.0](LICENSE). You can ship a closed-source commercial game on JCE, statically linked, with no obligation to open your game. If you modify JCE's *own* source files, those files' changes go back under the MPL. Third-party dependencies keep their own (all permissive) terms — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md); there is no GPL or LGPL component.
+
+## Status, honestly
+
+This is a **single-author engine under active development**, not a shipping product with a support contract. Read that as: the architecture and the gates are the parts worth your attention, and the rough edges are real.
+
+What the repository is unusually strict about, and what you can check yourself:
+
+* **Every capability claim is measured, not asserted.** [`contracts/engine-parity.json`](contracts/engine-parity.json) compares JCE against Unity, Unreal and Godot one capability per row, and a row without evidence is *refused* by `tools/lint/check_parity_ledger.py`. Rows say "behind" where JCE is behind, and each says what it is behind *on*.
+* **The gates are absolute, not relative.** `tools/lint/run_all.py` and `tools/audit/run_architecture_audit.py` must exit 0 with no `FAIL` line. "No worse than before" is not a passing criterion anywhere in this tree.
+* **The engine has zero `JCE_EDITOR` conditionals.** `grep -r JCE_EDITOR engine/` returns nothing. The editor is a *consumer* of the same code a shipped game runs, which is a structural guarantee rather than a discipline.
+
+### What you can run yourself
+
+The unit suite and the CI configuration are **in this repository** as of 2026-09-17. They were untracked while it was private; public, that trade reverses — a measurement nobody else can re-run is worth nothing.
+
+```bash
+python tools/lint/run_all.py                  # the lint suite (no compiler needed)
+python tools/audit/run_architecture_audit.py    # ABI snapshot, layering, licences, bindings
+cmake --build build/desktop/windows-x64 --target jce_tests
+ctest --test-dir build/desktop/windows-x64 -L unit -j 8
+```
+
+`.github/workflows/ci.yml` runs the first two on **every push to every branch**; they need no toolchain and cover what a build cannot see (an ABI break, a layering violation, a copyleft dependency). The build-and-test matrix is deliberately on `schedule` / `workflow_dispatch` for now — that suite had never run in CI before this, so expect its first runs to be red for reasons unrelated to whatever triggered them. The file says which tier each job is in and how to promote one.
+
+Local `docs/`, `.docs/`, generated outputs and unpublished workflows under `private/` are not distributed. Repository rules and the JCE skill are tracked.
+
+### AI authoring, and what is actually here
+
+`<jce/api_llm.h>` is a model-agnostic bridge with one deliberate design choice: **a provider is a PROGRAM**, invoked with `{prompt}` and `{response}` substituted into its argv. That is what makes "any model" a claim this can keep — a hosted API, a local runner like Ollama, or somebody's shell script are all the same thing to the engine. Two consequences worth knowing before you read the code:
+
+* **There is no API-key field, anywhere.** Credentials reach the provider through the environment and never through a JCE struct, a scene file or a log line.
+* **Dry-run is the default.** Nothing leaves your machine without an explicit `--send`, and the editor's AI panel resets that switch every time it opens.
+
+What is public is the mechanism: the bridge, the panel shell, the scene schema export that stops a model inventing fields, and `tools/envshot.py` — which is how an AI-authored change gets *verified* rather than merely accepted. The authoring policy built on top of it is still in progress and not published yet.
+
+### Caged Kingdom: the game consumer in `examples/caged_kingdom/`
+
+Caged Kingdom is the final game project and an SDK consumer alongside the other examples: it consumes JCE exactly the way your project would, through the installed SDK headers, with no privileged access. It is in the repository as *evidence that the engine is usable*, and nothing in `engine/` or `editor/` knows it exists — `grep -rw caged engine/` returns nothing, and a lint keeps it that way.
+
 ## Design Pillars
 
 1. **Cross-platform first** — anything that runs on the baseline scales up.
@@ -31,7 +71,7 @@ The low baseline is a compatibility and efficiency target. It must not prevent t
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ L7 — Consumers: caged_kingdom/, editor/, engine/java/        │
+│ L7 — Consumers: examples/caged_kingdom/, editor/, engine/java/        │
 ├──────────────────────────────────────────────────────────────┤
 │ L6 — Application:  engine/src/application/  (app loop)       │
 ├──────────────────────────────────────────────────────────────┤
@@ -53,25 +93,60 @@ The low baseline is a compatibility and efficiency target. It must not prevent t
 
 ## Public API
 
-`engine/include/jce/api.h` is the single entry point. Per-layer umbrellas:
+<!-- BEGIN GENERATED: readme-facts -->
+<!-- Regenerate: python tools/report_readme_facts.py --write
+     Gated by:   tools/lint/check_readme_facts.py
+     Counts come from the INDEX (list and contents), so they describe
+     the REPOSITORY as this commit delivers it
+     and reproduce on a fresh clone -- not this machine's disk. -->
 
-| Header                   | Layer | Covers                                          |
-| ------------------------ | ----- | ----------------------------------------------- |
-| `<jce/api_core.h>`       | L1+L2 | alloc, log, math, fs, threads, time, profiler   |
-| `<jce/api_platform.h>`   | L2    | window, input, gamepad, clipboard, dialog, watch |
-| `<jce/api_graphics.h>`   | L3    | bgfx wrapper, textures, shaders                 |
-| `<jce/api_render.h>`     | L3    | render graph, scene renderer, lighting, postfx  |
-| `<jce/api_animation.h>`  | L4    | skeleton, blend tree, state machine, IK         |
-| `<jce/api_audio.h>`      | L4    | mixer, decoder, occlusion, reverb               |
-| `<jce/api_physics.h>`    | L4    | Bullet wrapper, collider components             |
-| `<jce/api_ai.h>`         | L4    | navmesh, behaviour tree, steering               |
-| `<jce/api_scene.h>`      | L4    | ECS components, prefab, sequencer, terrain      |
-| `<jce/api_resource.h>`   | L4    | asset loader, pak, glTF, image decode           |
-| `<jce/api_streaming.h>`  | L4    | world streamer                                  |
-| `<jce/api_net.h>`        | L4    | snapshot, replication                           |
-| `<jce/api_ui.h>`         | L4    | RmlUI, HUD, settings                            |
-| `<jce/api_app.h>`        | L6    | engine descriptor, app interface, screenshot    |
-| `<jce/api_middleware.h>` | L4    | aggregate of all middleware umbrellas           |
+### At a glance
+
+| | |
+| --- | --- |
+| Version | `0.11.4` (authoritative: `CMakeLists.txt`) |
+| Engine (C99) | 403 tracked `.c` under `engine/src/` |
+| Editor (C++20) | 220 tracked `.cpp` under `editor/src/`, 108 panels |
+| Public API | 298 headers under `engine/include/jce/`, 24 umbrellas, 3890 `JCE_API` symbols |
+| Shaders | 140 `.sc` under `engine/shaders/` |
+| Scripting | 6 binding trees under `scripting/` (c, cpp, csharp, java, js, python) over one flat C ABI, plus Lua built in |
+| Editor languages | 15 locales under `editor/resources/assets/i18n/` |
+| Build matrix | 49 CMake presets, 13 Conan profiles |
+| Gates | `tools/lint/run_all.py` + `tools/audit/run_architecture_audit.py` -- both must exit 0 with no `FAIL` line |
+| Parity ledger | 255 measured rows vs Unity / Unreal / Godot -- 28 ahead, 165 parity, 56 behind, 3 n/a (76.6% at or above) |
+
+### Public API surface
+
+`#include <jce/api.h>` reaches all of it.  Each umbrella below describes itself on its own second line; this table is generated from those lines, so it cannot disagree with the headers.
+
+| Header | Covers |
+| --- | --- |
+| `<jce/api_ai.h>` | AI / behaviour trees |
+| `<jce/api_ai_dispatch.h>` | Umbrella for the ai_dispatch middleware |
+| `<jce/api_animation.h>` | Layer 3 — Animation system |
+| `<jce/api_app.h>` | Layer 6 — Application |
+| `<jce/api_audio.h>` | Audio system |
+| `<jce/api_core.h>` | Layer 1 — Core utilities |
+| `<jce/api_graphics.h>` | Layer 3 — Graphics abstraction |
+| `<jce/api_input.h>` | Input devices & action mapping (The-Forge IInput parity) |
+| `<jce/api_introspect.h>` | Machine-readable self-description |
+| `<jce/api_llm.h>` | Language-model authoring bridge |
+| `<jce/api_middleware.h>` | Aggregate header for cross-cutting middleware |
+| `<jce/api_net.h>` | Networking |
+| `<jce/api_physics.h>` | Physics simulation |
+| `<jce/api_platform.h>` | Layer 2 — OS / platform abstraction |
+| `<jce/api_render.h>` | Layer 4 — Render abstraction |
+| `<jce/api_resource.h>` | Layer 3 — Resource loading and management |
+| `<jce/api_runtime.h>` | Layer 5 — Runtime / Editor↔Game Bridge |
+| `<jce/api_save.h>` | Save games / persistence |
+| `<jce/api_scene.h>` | Layer 5 — Scene management |
+| `<jce/api_script.h>` | Layer-4 facade for the gameplay scripting VM |
+| `<jce/api_streaming.h>` | Layer 3 — Resource streaming |
+| `<jce/api_ui.h>` | In-game UI |
+| `<jce/api_video.h>` | Video playback and capture |
+| `<jce/api_world.h>` | Aggregate header for the world / gameplay middleware layer |
+
+<!-- END GENERATED: readme-facts -->
 
 ## Dependency Ownership
 
@@ -84,7 +159,7 @@ human-readable form of `contracts/dependency-ownership.yml`, which
 | Capability                                                | Authoritative owner                                     | Allowed scope / helpers                                                             | Do not use as an alternative                                                          |
 | --------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Window, events, input, gamepad, clipboard, host dialogs   | **SDL 3.4.0**, behind `jce_window_*` / `jce_input_*` / `jce_host_*` | `engine/src/os/` plus the application layer's SDL_main callbacks and event pump      | Raw Win32/Cocoa/X11 windowing, or SDL Renderer                                        |
-| Portable C-runtime substrate                              | **SDL 3.4.0** utility headers                           | Sanctioned engine-wide as a portable libc — see `scripts/lint/check_engine_native_io.py` | Platform-specific stdio/threading shims added per module                              |
+| Portable C-runtime substrate                              | **SDL 3.4.0** utility headers                           | Sanctioned engine-wide as a portable libc — see `tools/lint/check_engine_native_io.py` | Platform-specific stdio/threading shims added per module                              |
 | Entity storage, queries, systems, component metadata      | **flecs 4.1.5**, behind `JceEntity` + `jce_scene_*`     | `ecs_*` stays private to the engine implementation                                  | A second entity registry, `ecs_*` in public headers, or flecs in `editor/` and games  |
 | Virtual filesystem and archive mounts                     | **PhysFS 3.2.0**, behind the JCE VFS/resource path API  | All resource access resolves through normalized virtual paths                       | `fopen`/`std::filesystem` for resource access, or a second archive system             |
 | Host/editor filesystem access                             | **JCE OS filesystem adapter** (first-party, SDL-backed) | `jce_fs_host_*` / `SDL_IOStream`, confined to `engine/src/os/`                       | Raw `fopen`/`CreateFile` outside `os/`, or host paths used as resource IDs            |
@@ -257,7 +332,7 @@ cmake --build build/desktop/windows-x64
 ./build/desktop/windows-x64/release/caged_kingdom.exe
 ```
 
-Or use the standardized scripts (thin wrappers over `scripts/jce.py`): `./scripts/windows/build-editor.bat` (editor) or `./scripts/windows/build-project.bat caged_kingdom` (game, via the SDK). Add `--dist` (shorthand for `--variant dist`) for a distribution build.
+Or use the standardized scripts (thin wrappers over `scripts/jce.py`): `./scripts/windows/build-editor.bat` (editor) or `./scripts/windows/build-project.bat examples/caged_kingdom` (game, via the SDK). Add `--dist` (shorthand for `--variant dist`) for a distribution build.
 
 ## B. Editor
 
@@ -327,3 +402,11 @@ cmake ... -DJCE_SHADERC_EXECUTABLE="C:\path\to\shaderc.exe"
 
 The native Windows build produces `shaderc.exe` under the bgfx Conan package folder
 and is picked up automatically when `bgfx` is built with `tools=True` (the default).
+
+## Repository layout
+
+`tools/` owns reusable automation; `scripts/` provides manual entry points.
+Consumer-specific tools and content belong to `examples/<project>/`. Stable
+contracts live in `contracts/`; local plans and delivery notes remain in ignored
+`docs/` and `.docs/`. The public core works without optional private AI workflows.
+See [AGENTS.md](AGENTS.md) and [the JCE skill](skills/jce/SKILL.md).

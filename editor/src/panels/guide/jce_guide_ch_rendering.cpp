@@ -98,6 +98,19 @@ static const JceGuideBlock b_matgraph[] = {
     { JCE_GB_WARN,       "guide.render.matgraph.warn1", 0, nullptr },
     { JCE_GB_P,          "guide.render.matgraph.p4",   0, nullptr },
     { JCE_GB_MENU_PATH,  nullptr,                      0, "menu.edit>shaders.reload" },
+
+    /* Reading back what the compiler produced -- same workbench, so the
+     * section lives with the graph rather than in a topic of its own. */
+    { JCE_GB_H1,         "guide.render.matgraph.insp.h1",   0, nullptr },
+    { JCE_GB_P,          "guide.render.matgraph.insp.p1",   0, nullptr },
+    { JCE_GB_OPEN_PANEL, "window.shaderInspector",
+      JCE_PANEL_SHADER_INSPECTOR, "###jce_material_graph" },
+    { JCE_GB_MENU_PATH,  nullptr,                          0,
+      "menu.window>window.group.workbenches>window.shaderInspector" },
+    { JCE_GB_STEP,       "guide.render.matgraph.insp.s1",   0, nullptr },
+    { JCE_GB_STEP,       "guide.render.matgraph.insp.s2",   0, nullptr },
+    { JCE_GB_STEP,       "guide.render.matgraph.insp.s3",   0, nullptr },
+    { JCE_GB_WARN,       "guide.render.matgraph.insp.warn1", 0, nullptr },
 };
 
 /* ── Topic 6: Render Pipeline & Performance ───────────────────────── */

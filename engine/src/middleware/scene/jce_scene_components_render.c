@@ -26,6 +26,12 @@ void parse_dir_light(JceScene *s, JceEntity e, const cJSON *c)
     /* P3-E.5 — optional cookie projection. */
     copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
     dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
+    /* Rendering layers.  Read HERE as well as in the unified parser because
+     * this file already records what happens when one concept has three
+     * parsers and only some of them read a key (see parse_point_light's
+     * castsShadow note): the scene loads a light whose authored mask is
+     * silently gone, and the next editor save writes the loss back out. */
+    dl.layer_mask = (uint32_t)j_num(c, "lightLayerMask", 0.0);
     jce_scene_set_dir_light(s, e, &dl);
 }
 
@@ -41,6 +47,27 @@ void parse_point_light(JceScene *s, JceEntity e, const cJSON *c)
     pl.color.z = (float)j_num(c, "colorB", 1.0);
     pl.intensity = (float)j_num(c, "intensity", 1.0);
     pl.radius    = (float)j_num(c, "radius", 10.0);
+    /* castsShadow / shadowBias.  These two were read by the unified "Light"
+     * parser and by parse_dir_light, and by neither of the point/spot compat
+     * parsers -- three parsers for one concept, and two of them dropped the
+     * flag.  The asymmetry inside this one file is what shows it was an
+     * oversight: a scene typed "PointLight" with "castsShadow": true loaded a
+     * light that COULD NOT cast, silently, and the draw path reads exactly
+     * these two fields (jce_sr_draw.c:3617-3618).  Worse than ignored: save
+     * that scene once from the editor and it is rewritten as a unified
+     * "Light" row with castsShadow=false, so the authored intent is
+     * destroyed rather than merely unused.
+     *
+     * The defaults here are the memset values, so a scene that never wrote
+     * the keys is byte-identical to before. */
+    pl.casts_shadow = j_bool(c, "castsShadow", false);
+    pl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
+    /* Rendering layers.  Read HERE as well as in the unified parser because
+     * this file already records what happens when one concept has three
+     * parsers and only some of them read a key (see parse_point_light's
+     * castsShadow note): the scene loads a light whose authored mask is
+     * silently gone, and the next editor save writes the loss back out. */
+    pl.layer_mask = (uint32_t)j_num(c, "lightLayerMask", 0.0);
     jce_scene_set_point_light(s, e, &pl);
 }
 
@@ -69,6 +96,15 @@ void parse_spot_light(JceScene *s, JceEntity e, const cJSON *c)
     copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
     copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
     sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
+    /* See parse_point_light: same two keys, same reason. */
+    sl.casts_shadow = j_bool(c, "castsShadow", false);
+    sl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
+    /* Rendering layers.  Read HERE as well as in the unified parser because
+     * this file already records what happens when one concept has three
+     * parsers and only some of them read a key (see parse_point_light's
+     * castsShadow note): the scene loads a light whose authored mask is
+     * silently gone, and the next editor save writes the loss back out. */
+    sl.layer_mask = (uint32_t)j_num(c, "lightLayerMask", 0.0);
     jce_scene_set_spot_light(s, e, &sl);
 }
 
@@ -95,6 +131,7 @@ void parse_sprite_renderer(JceScene *s, JceEntity e, const cJSON *c)
     sp.flip_x   = j_bool(c, "flipX", false);
     sp.flip_y   = j_bool(c, "flipY", false);
     sp.sorting_order = (int)j_num(c, "sortingOrder", 0);
+    sp.sorting_layer = (int)j_num(c, "sortingLayer", 0);
     jce_scene_set_sprite_renderer(s, e, &sp);
 }
 
@@ -109,6 +146,8 @@ void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     float dirX = (float)j_num2(c, "dirX", "dir_x", 0.0);
     float dirY = (float)j_num2(c, "dirY", "dir_y", -1.0);
     float dirZ = (float)j_num2(c, "dirZ", "dir_z", 0.0);
+    /* Rendering layers -- one read for all four light types below. */
+    uint32_t layer_mask = (uint32_t)j_num(c, "lightLayerMask", 0.0);
 
     int ltype = 0;
     const cJSON *lt = cJSON_GetObjectItemCaseSensitive(c, "lightType");
@@ -117,6 +156,8 @@ void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     else if (cJSON_IsString(lt) && lt->valuestring) {
         if (streq_ci(lt->valuestring, "point")) ltype = 1;
         else if (streq_ci(lt->valuestring, "spot")) ltype = 2;
+        else if (streq_ci(lt->valuestring, "area")) ltype = 3;
+        else if (streq_ci(lt->valuestring, "rect")) ltype = 3;
     }
 
     if (ltype == 1) {
@@ -127,7 +168,25 @@ void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         pl.radius    = (float)j_num(c, "radius", 10.0);
         pl.casts_shadow = casts_shadow;
         pl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
+        pl.layer_mask = layer_mask;
         jce_scene_set_point_light(s, e, &pl);
+    } else if (ltype == 3) {
+        JceAreaLight al;
+        memset(&al, 0, sizeof(al));
+        al.direction.x = dirX;
+        al.direction.y = dirY;
+        al.direction.z = dirZ;
+        al.color.x = colorR; al.color.y = colorG; al.color.z = colorB;
+        al.intensity = intensity;
+        /* One-unit default, not zero: a rectangle with no extent emits a zero
+         * solid angle, so a light authored by adding the component and
+         * nothing else would be invisible and read as broken. */
+        al.width     = (float)j_num(c, "width",  1.0);
+        al.height    = (float)j_num(c, "height", 1.0);
+        al.radius    = (float)j_num(c, "radius", 10.0);
+        al.two_sided = j_bool(c, "twoSided", false);
+        al.layer_mask = layer_mask;
+        jce_scene_set_area_light(s, e, &al);
     } else if (ltype == 2) {
         JceSpotLight sl;
         memset(&sl, 0, sizeof(sl));
@@ -149,6 +208,7 @@ void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
         sl.casts_shadow = casts_shadow;
         sl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
+        sl.layer_mask = layer_mask;
         jce_scene_set_spot_light(s, e, &sl);
     } else {
         JceDirectionalLight dl;
@@ -163,6 +223,7 @@ void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         /* P3-E.5 — directional cookie (data-side scaffold). */
         copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
         dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
+        dl.layer_mask = layer_mask;
         jce_scene_set_dir_light(s, e, &dl);
     }
 }
@@ -277,6 +338,16 @@ void parse_reflection_probe(JceScene *s, JceEntity e, const cJSON *c)
     snprintf(r.baked_cubemap_path, sizeof(r.baked_cubemap_path), "%s", bp ? bp : "");
     r.box_projection = j_bool(c, "boxProjection", true);
     r.hdr            = j_bool(c, "hdr", true);
+    /* PLANAR mode.  The defaults are all ZERO on purpose and mean "+Y,
+     * 0.05 m, 15 degrees" at the point of use -- a scene written before this
+     * mode existed parses to exactly those zeroes, so a probe that never
+     * heard of a plane still reads as a usable floor mirror rather than as a
+     * degenerate one.  jce_scene.h says so beside the fields. */
+    r.plane_normal[0]  = (float)j_num(c, "planeNormalX", 0.0);
+    r.plane_normal[1]  = (float)j_num(c, "planeNormalY", 0.0);
+    r.plane_normal[2]  = (float)j_num(c, "planeNormalZ", 0.0);
+    r.planar_thickness = (float)j_num(c, "planarThickness", 0.0);
+    r.planar_angle_deg = (float)j_num(c, "planarAngleDeg", 0.0);
     jce_scene_set_reflection_probe(s, e, &r);
 }
 
@@ -478,7 +549,48 @@ static void ser_mesh_renderer(const JceMeshRenderer *mr, cJSON *arr)
     cJSON_AddNumberToObject(o, "aoStrength",  mr->ao_strength);
     cJSON_AddNumberToObject(o, "alphaMode",   mr->alpha_mode);
     cJSON_AddNumberToObject(o, "alphaCutoff", mr->alpha_cutoff);
+    cJSON_AddNumberToObject(o, "renderPriority", mr->render_priority);
+    cJSON_AddNumberToObject(o, "uvTilingX", mr->uv_tiling[0]);
+    cJSON_AddNumberToObject(o, "uvTilingY", mr->uv_tiling[1]);
+    cJSON_AddNumberToObject(o, "uvOffsetX", mr->uv_offset[0]);
+    cJSON_AddNumberToObject(o, "uvOffsetY", mr->uv_offset[1]);
+    cJSON_AddNumberToObject(o, "blendMode", mr->blend_mode);
+    /* Written only when USED: an off block is six keys of noise on every
+     * MeshRenderer in a project whose every scene file predates it. */
+    if (mr->stencil_func != 0) {
+        cJSON_AddNumberToObject(o, "stencilFunc",     mr->stencil_func);
+        cJSON_AddNumberToObject(o, "stencilRef",      mr->stencil_ref);
+        cJSON_AddNumberToObject(o, "stencilReadMask", mr->stencil_read_mask);
+        cJSON_AddNumberToObject(o, "stencilFailOp",   mr->stencil_fail_op);
+        cJSON_AddNumberToObject(o, "stencilZFailOp",  mr->stencil_zfail_op);
+        cJSON_AddNumberToObject(o, "stencilPassOp",   mr->stencil_pass_op);
+    }
+    cJSON_AddNumberToObject(o, "materialOverrides", (double)mr->material_override_mask);
     cJSON_AddBoolToObject(o, "doubleSided", mr->double_sided);
+    /* Written only when USED: two lobes off is what every scene file in the
+     * tree already means by saying nothing. */
+    if (mr->clearcoat > 0.0f) {
+        cJSON_AddNumberToObject(o, "clearcoat",          mr->clearcoat);
+        cJSON_AddNumberToObject(o, "clearcoatRoughness", mr->clearcoat_roughness);
+    }
+    if (mr->sheen_color[0] > 0.0f || mr->sheen_color[1] > 0.0f ||
+        mr->sheen_color[2] > 0.0f) {
+        cJSON_AddNumberToObject(o, "sheenColorR",    mr->sheen_color[0]);
+        cJSON_AddNumberToObject(o, "sheenColorG",    mr->sheen_color[1]);
+        cJSON_AddNumberToObject(o, "sheenColorB",    mr->sheen_color[2]);
+        cJSON_AddNumberToObject(o, "sheenRoughness", mr->sheen_roughness);
+    }
+    if (mr->anisotropy > 0.0f) {
+        cJSON_AddNumberToObject(o, "anisotropy",         mr->anisotropy);
+        cJSON_AddNumberToObject(o, "anisotropyRotation", mr->anisotropy_rotation);
+    }
+    if (mr->translucency > 0.0f) {
+        cJSON_AddNumberToObject(o, "translucency",          mr->translucency);
+        cJSON_AddNumberToObject(o, "translucencyThickness", mr->translucency_thickness);
+        cJSON_AddNumberToObject(o, "translucencyColorR",    mr->translucency_color[0]);
+        cJSON_AddNumberToObject(o, "translucencyColorG",    mr->translucency_color[1]);
+        cJSON_AddNumberToObject(o, "translucencyColorB",    mr->translucency_color[2]);
+    }
     /* The other half of the round trip parse_mesh_renderer never had.  Always
      * emitted, including when true: an absent key is what let a script's
      * comp_get -> comp_set silently re-show a hidden mesh, because the value
@@ -613,6 +725,10 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
             cJSON_AddStringToObject(o, "cookiePath", dl->cookie_path);
         if (dl->cookie_strength > 0.0f)
             cJSON_AddNumberToObject(o, "cookieStrength", dl->cookie_strength);
+        /* Rendering layers.  Omit-on-default: 0 means every layer, so a scene
+         * that never touched this saves byte-identically to before. */
+        if (dl->layer_mask != 0u)
+            cJSON_AddNumberToObject(o, "lightLayerMask", (double)dl->layer_mask);
         cJSON_AddItemToArray(arr, o);
         return;
     }
@@ -629,6 +745,29 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddBoolToObject(o, "castsShadow", pl->casts_shadow);
         if (pl->shadow_bias != 0.0f)
             cJSON_AddNumberToObject(o, "shadowBias", pl->shadow_bias);
+        if (pl->layer_mask != 0u)
+            cJSON_AddNumberToObject(o, "lightLayerMask", (double)pl->layer_mask);
+        cJSON_AddItemToArray(arr, o);
+        return;
+    }
+    JceAreaLight *al = jce_scene_get_area_light(s, e);
+    if (al) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "type", "Light");
+        cJSON_AddNumberToObject(o, "colorR", al->color.x);
+        cJSON_AddNumberToObject(o, "colorG", al->color.y);
+        cJSON_AddNumberToObject(o, "colorB", al->color.z);
+        cJSON_AddNumberToObject(o, "intensity", al->intensity);
+        cJSON_AddNumberToObject(o, "lightType", 3);
+        cJSON_AddNumberToObject(o, "radius", al->radius);
+        cJSON_AddNumberToObject(o, "dirX", al->direction.x);
+        cJSON_AddNumberToObject(o, "dirY", al->direction.y);
+        cJSON_AddNumberToObject(o, "dirZ", al->direction.z);
+        cJSON_AddNumberToObject(o, "width",  al->width);
+        cJSON_AddNumberToObject(o, "height", al->height);
+        cJSON_AddBoolToObject(o, "twoSided", al->two_sided);
+        if (al->layer_mask != 0u)
+            cJSON_AddNumberToObject(o, "lightLayerMask", (double)al->layer_mask);
         cJSON_AddItemToArray(arr, o);
         return;
     }
@@ -659,6 +798,8 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
             cJSON_AddStringToObject(o, "iesPath", sl->ies_path);
         if (sl->cookie_strength > 0.0f)
             cJSON_AddNumberToObject(o, "cookieStrength", sl->cookie_strength);
+        if (sl->layer_mask != 0u)
+            cJSON_AddNumberToObject(o, "lightLayerMask", (double)sl->layer_mask);
         cJSON_AddItemToArray(arr, o);
     }
 }
@@ -764,6 +905,11 @@ static void ser_reflection_probe(const JceReflectionProbeComponent *c, cJSON *ar
     cJSON_AddStringToObject(o, "bakedCubemapPath", c->baked_cubemap_path);
     cJSON_AddBoolToObject  (o, "boxProjection", c->box_projection);
     cJSON_AddBoolToObject  (o, "hdr", c->hdr);
+    cJSON_AddNumberToObject(o, "planeNormalX",   c->plane_normal[0]);
+    cJSON_AddNumberToObject(o, "planeNormalY",   c->plane_normal[1]);
+    cJSON_AddNumberToObject(o, "planeNormalZ",   c->plane_normal[2]);
+    cJSON_AddNumberToObject(o, "planarThickness", c->planar_thickness);
+    cJSON_AddNumberToObject(o, "planarAngleDeg",  c->planar_angle_deg);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -858,6 +1004,7 @@ static void ser_sprite_renderer(const JceSpriteRendererComponent *c, cJSON *arr)
     cJSON_AddBoolToObject(o, "flipX", c->flip_x);
     cJSON_AddBoolToObject(o, "flipY", c->flip_y);
     cJSON_AddNumberToObject(o, "sortingOrder", c->sorting_order);
+    cJSON_AddNumberToObject(o, "sortingLayer", c->sorting_layer);
     cJSON_AddItemToArray(arr, o);
 }
 

@@ -10,6 +10,7 @@
 
 #include "core/jce_editor_state_internal.h"
 #include "io/jce_editor_prefab_override.h"
+#include <vector>
 
 #include <cstring>
 
@@ -108,13 +109,52 @@ uint32_t load_entity_tree_node(const JceJson *node, uint32_t parent_id)
             jce_state_rename_entity(id, name);
             apply_entity_fields(id, node);
 
-            /* The full subtree (children) was already created by
-             * instantiate_prefab from the source.  The override MVP tracks
-             * ROOT-level component overrides only, so the node's own
-             * "children" array is NOT re-loaded here — doing so would
-             * DUPLICATE the source's children.  Per-child overrides are a
-             * documented follow-up (each child node would carry its own
-             * "overrides" once child diffing exists). */
+            /* The full subtree was already created by instantiate_prefab
+             * from the source, so the node's own "children" array is NOT
+             * re-loaded — that would DUPLICATE the source's children.
+             *
+             * "childOverrides" is how a descendant's edits survive.  Until it
+             * existed, this branch discarded them: moving an instance root
+             * one metre dropped every edit the author had made to any child,
+             * silently, with the file still loading cleanly.
+             *
+             * Each row addresses a descendant by INDEX PATH and carries its
+             * NAME as a witness.  Both are checked: an out-of-range path
+             * resolves to 0 (resolve_child_path fails closed) and a name
+             * mismatch means the prefab's shape changed under this scene
+             * since it was saved.  Either way the row is SKIPPED and warned
+             * about -- overlaying one child's components onto its sibling is
+             * silent corruption, and the scene would still load. */
+            const JceJson *covs = jce_json_get(node, "childOverrides");
+            if (jce_json_is_array(covs)) {
+                int applied = 0, skipped = 0;
+                for (JceJson *row = jce_json_first_child(covs); row;
+                     row = jce_json_next_sibling(row)) {
+                    const JceJson *pj = jce_json_get(row, "path");
+                    if (!jce_json_is_array(pj)) { skipped++; continue; }
+                    std::vector<int> path;
+                    for (JceJson *ix = jce_json_first_child(pj); ix;
+                         ix = jce_json_next_sibling(ix))
+                        path.push_back((int)jce_json_number_value(ix, -1.0));
+                    JceEntity ce = jce_prefab_override::resolve_child_path(
+                        s.scene, e, path);
+                    if (ce == 0) { skipped++; continue; }
+                    const char *want = jce_json_get_string(row, "name", "");
+                    const char *got  = jce_scene_entity_name(s.scene, ce);
+                    if (want && want[0] && got && std::strcmp(want, got) != 0) {
+                        skipped++;
+                        continue;
+                    }
+                    jce_prefab_override::overlay_components(s.scene, ce, row);
+                    applied++;
+                }
+                if (skipped)
+                    LOG_WARN(LOG_TAG,
+                             "prefab '%s': %d child override(s) applied, %d "
+                             "SKIPPED — the prefab's subtree changed since "
+                             "this scene was saved, so those edits could not "
+                             "be placed", prefab_path, applied, skipped);
+            }
             return id;
         }
         /* Instantiation failed — fall through to the legacy full path so

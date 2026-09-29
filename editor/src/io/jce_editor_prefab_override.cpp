@@ -11,6 +11,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <jce/middleware/scene/jce_component_registry.h>
@@ -130,6 +131,7 @@ std::vector<std::string> compute_overrides(JceScene *inst_scene,
         if (strcmp(name, "DirectionalLight") == 0 ||
             strcmp(name, "PointLight") == 0 ||
             strcmp(name, "SpotLight") == 0 ||
+            strcmp(name, "AreaLight") == 0 ||
             strcmp(name, "Light") == 0) {
             light_diff = true;
             continue;
@@ -155,7 +157,7 @@ bool is_component_overridden(JceScene *inst_scene, JceEntity inst_e,
      * overridden).  Mirrors the coalescing in compute_overrides. */
     if (strcmp(comp_name, "Light") == 0) {
         static const char *kLightRows[] = {
-            "DirectionalLight", "PointLight", "SpotLight"
+            "DirectionalLight", "PointLight", "SpotLight", "AreaLight"
         };
         for (const char *ln : kLightRows) {
             int lid = jce_component_find(ln);
@@ -594,6 +596,97 @@ JceJson *make_single_component_node(JceScene *scene, JceEntity e,
     }
     jce_json_set_child(node, "components", kept);
     return node;
+}
+
+
+/* ── Per-CHILD overrides ────────────────────────────────────────────── */
+
+namespace {
+
+/* Children of `e`, in the order jce_scene_get_children reports.  That order
+ * is CREATION order and stable within a scene (measured), which is what
+ * makes an index path meaningful -- but only while nothing has been
+ * destroyed, because destroy SWAP-REMOVES.  subtree_shape_matches is the
+ * guard for exactly that. */
+std::vector<JceEntity> children_of(JceScene *s, JceEntity e)
+{
+    std::vector<JceEntity> out;
+    const int n = jce_scene_get_child_count(s, e);
+    if (n <= 0) return out;
+    out.resize((size_t)n);
+    const int got = jce_scene_get_children(s, e, out.data(), n);
+    out.resize((size_t)(got > 0 ? got : 0));
+    return out;
+}
+
+void collect_child_overrides(JceScene *is, JceEntity ie,
+                             JceScene *ss, JceEntity se,
+                             std::vector<int> &path,
+                             std::vector<ChildOverride> &out)
+{
+    const std::vector<JceEntity> ic = children_of(is, ie);
+    const std::vector<JceEntity> sc = children_of(ss, se);
+    const size_t n = ic.size() < sc.size() ? ic.size() : sc.size();
+    for (size_t i = 0; i < n; ++i) {
+        path.push_back((int)i);
+        std::vector<std::string> diff = compute_overrides(is, ic[i], ss, sc[i]);
+        if (!diff.empty()) {
+            ChildOverride co;
+            co.path = path;
+            const char *nm = jce_scene_entity_name(is, ic[i]);
+            co.name = nm ? nm : "";
+            co.components = diff;
+            out.push_back(co);
+        }
+        collect_child_overrides(is, ic[i], ss, sc[i], path, out);
+        path.pop_back();
+    }
+}
+
+} /* namespace */
+
+bool subtree_shape_matches(JceScene *inst_scene, JceEntity inst_root,
+                           JceScene *src_scene,  JceEntity src_root)
+{
+    if (!inst_scene || !src_scene) return false;
+    const std::vector<JceEntity> ic = children_of(inst_scene, inst_root);
+    const std::vector<JceEntity> sc = children_of(src_scene, src_root);
+    if (ic.size() != sc.size()) return false;
+    for (size_t i = 0; i < ic.size(); ++i)
+        if (!subtree_shape_matches(inst_scene, ic[i], src_scene, sc[i]))
+            return false;
+    return true;
+}
+
+std::vector<ChildOverride> compute_child_overrides(JceScene *inst_scene,
+                                                   JceEntity inst_root,
+                                                   JceScene *src_scene,
+                                                   JceEntity src_root)
+{
+    std::vector<ChildOverride> out;
+    if (!inst_scene || !src_scene) return out;
+    std::vector<int> path;
+    collect_child_overrides(inst_scene, inst_root, src_scene, src_root,
+                            path, out);
+    return out;
+}
+
+JceEntity resolve_child_path(JceScene *scene, JceEntity root,
+                             const std::vector<int> &path)
+{
+    if (!scene) return 0;
+    JceEntity cur = root;
+    for (size_t k = 0; k < path.size(); ++k) {
+        const std::vector<JceEntity> cs = children_of(scene, cur);
+        const int idx = path[k];
+        /* Fail CLOSED.  A path from a file that no longer matches the prefab
+         * must resolve to nothing, not to whatever entity happens to sit at
+         * that index -- overlaying a child's overrides onto its sibling is
+         * silent corruption, and the file would still load. */
+        if (idx < 0 || (size_t)idx >= cs.size()) return 0;
+        cur = cs[(size_t)idx];
+    }
+    return cur;
 }
 
 } /* namespace jce_prefab_override */

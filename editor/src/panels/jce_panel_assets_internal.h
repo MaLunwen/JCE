@@ -72,6 +72,10 @@ struct AssetBrowserState {
     bool show_delete_confirm;
     bool show_delete_dialog_open;
     std::vector<std::string> pending_delete_paths;
+    /* How many files reference what is about to be deleted, counted
+     * when the confirm dialog is raised.  Deleting is legitimate;
+     * deleting silently is the defect. */
+    int                      pending_delete_refs = 0;
     std::vector<std::string> pending_delete_names;
     int pending_delete_dir_count;
     char search_buf[128];

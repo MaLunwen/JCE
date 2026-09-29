@@ -1,0 +1,16 @@
+# EsFlowerSway — a C++ script CLASS, not a script file.
+#
+# THE RUNTIME NEVER READS THESE BYTES.  A .jcecpp path NAMES a class published
+# by a compiled module; cpp_instantiate strips the directory and the extension
+# and looks the name up in the module registry.  The class is in
+# src/es_flower_sway.cpp, built into elemental_serenity.exe and into
+# es_scripts.dll (which the editor loads — see jce_project.json).
+#
+# THIS FILE EXISTS SO THE OFFLINE HALF OF THE PIPELINE CAN SEE IT.  The
+# editor's asset database, the Script component's picker, the cooker and the
+# publication policy all classify by extension through the one catalog in
+# engine/src/resource/jce_asset_ext.c, and they classify FILES.  With this
+# stub the script is attachable by picking it like any other; without it the
+# path still works and has to be typed by hand.  Its form in the catalog is
+# REFERENCE, so the archive cooker does not put it in the shared text
+# dictionary the way it would a real source file.

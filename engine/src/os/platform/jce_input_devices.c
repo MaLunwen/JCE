@@ -1,7 +1,7 @@
 /*
  * jce_input_devices.c  The device layer: identity, capabilities, player slots.
  *
- * SDL-free by construction and by gate (scripts/lint/check_input_seam.py scans
+ * SDL-free by construction and by gate (tools/lint/check_input_seam.py scans
  * this file by name).  Anything that must ask hardware a question goes through
  * the JceInputBackend vtable, whose only SDL implementation lives in
  * jce_input_sdl.c.  That is what lets tests/os/platform/test_jce_input_devices.c
@@ -57,7 +57,7 @@
  * WHAT IS NOT HERE, and is not a gap: the mapping-DB pair
  * (jce_input_add_gamepad_mapping / _mappings_file) is defined in
  * jce_input_sdl.c, the one input TU allowed to name SDL -- both are thin covers
- * over SDL's own mapping database, and scripts/lint/check_input_seam.py would
+ * over SDL's own mapping database, and tools/lint/check_input_seam.py would
  * refuse them here.
  *
  * SO THE STILL-DECLARED LIST IS NOW EMPTY: all 44 functions declared in

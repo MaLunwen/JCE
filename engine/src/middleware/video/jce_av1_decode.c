@@ -25,6 +25,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_av1_packet.h"
 
 #include <dav1d/dav1d.h>
 #include <stdarg.h>
@@ -37,20 +38,10 @@
 
 /* Silent dav1d logger: suppress "Error parsing OBU data" and similar
  * stderr spam that dav1d emits via its default printf logger. We re-emit
- * via our throttled av1_should_log_send_err() path on real send failures. */
+ * via our throttled av1_should_log_send_err(dec) path on real send failures. */
 static void av1_silent_logger(void *cookie, const char *fmt, va_list ap)
 {
     (void)cookie; (void)fmt; (void)ap;
-}
-
-/* Shared throttle counter for dav1d_send_data() warnings. Corrupt streams
- * can hit this every frame; we log first 4, then 1 per 256, with running
- * total so the user still knows the error is recurring. */
-static unsigned long s_send_data_err_count = 0;
-static bool av1_should_log_send_err(void)
-{
-    unsigned long n = ++s_send_data_err_count;
-    return (n <= 4u) || ((n & 0xFFu) == 0u);
 }
 
 static void av1_packet_noop_free(const uint8_t *buf, void *cookie)
@@ -62,12 +53,22 @@ static void av1_packet_noop_free(const uint8_t *buf, void *cookie)
 struct JceAv1Decoder {
     Dav1dContext  *ctx;
     const uint8_t *data;
-    size_t         size;
-    size_t         pos;            /* read cursor (after IVF header) */
+    JceReadSource *source;
+    uint64_t       size;
+    uint64_t       pos;            /* read cursor (after IVF header) */
+    Dav1dData      pending;        /* retained until send_data consumes it */
     Dav1dPicture   pic;            /* last decoded picture (must be unref'd) */
     bool           pic_valid;
     bool           ivf_eof;        /* all IVF packets sent; drain buffered frames */
+    unsigned long  send_data_errors;
 };
+
+/* Per-decoder throttling avoids races between independent preview workers. */
+static bool av1_should_log_send_err(JceAv1Decoder *dec)
+{
+    unsigned long n = ++dec->send_data_errors;
+    return n <= 4u || (n & 0xFFu) == 0u;
+}
 
 static uint32_t rd_u32_le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
@@ -104,7 +105,10 @@ JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
 
     Dav1dSettings s;
     dav1d_default_settings(&s);
-    /* S2: n_threads=0 (auto = logical cores, already the default).
+    /* dav1d selects a CPU-sized worker pool; do not serialize frame decoding. */
+    s.n_threads = 0;
+    s.frame_size_limit = 4096u * 4096u;
+    /* Frame-level parallelism remains enabled with automatic worker selection.
      * max_frame_delay=0 (auto = ceil(sqrt(n_threads))) enables frame-level
      * parallelism inside dav1d, critical for 4K throughput.  Low-latency
      * single-frame mode (=1) is only needed for packet-driven paths where
@@ -128,6 +132,21 @@ JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
         out_info->fps_num = rd_u32_le(p + 16);
         out_info->fps_den = rd_u32_le(p + 20);
     }
+    return dec;
+}
+
+JceAv1Decoder *jce_av1_open_source(JceReadSource *source,
+                                    JceAv1FrameInfo *out_info)
+{
+    uint8_t header[32];
+    JceAv1Decoder *dec;
+    if (jce_read_source_read_at(source,0u,header,sizeof(header)) != sizeof(header))
+        return NULL;
+    dec = jce_av1_open_memory(header,sizeof(header),out_info);
+    if (!dec) return NULL;
+    dec->source = jce_read_source_acquire(source);
+    dec->data = NULL;
+    dec->size = jce_read_source_size(source);
     return dec;
 }
 
@@ -188,35 +207,45 @@ bool jce_av1_decode_next(JceAv1Decoder *dec,
          * been output before EAGAIN was returned, so this is true EOF. */
         if (dec->ivf_eof) return false;
 
-        /* Feed next IVF frame. */
-        if (dec->pos + 12 > dec->size) {
-            dec->ivf_eof = true;
-            continue; /* let dav1d drain buffered frames via get_picture */
-        }
-        uint32_t fsize = rd_u32_le(dec->data + dec->pos);
-        dec->pos += 12;
-        if (dec->pos + fsize > dec->size) {
-            LOG_WARN(LOG_TAG, "truncated IVF frame");
-            return false;
-        }
-
-        Dav1dData d;
-        if (dav1d_data_wrap(&d, dec->data + dec->pos, fsize, NULL, NULL) < 0) {
-            LOG_ERROR(LOG_TAG, "dav1d_data_wrap failed");
-            return false;
-        }
-        dec->pos += fsize;
-
-        int sd = dav1d_send_data(dec->ctx, &d);
-        if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
-            dav1d_data_unref(&d);
-            if (av1_should_log_send_err()) {
-                LOG_WARN(LOG_TAG, "dav1d_send_data: %d (err #%lu)",
-                         sd, s_send_data_err_count);
+        /* EAGAIN leaves ownership with us. Never advance to a new packet
+         * while the previous packet still has unconsumed bytes. */
+        if (!dec->pending.sz) {
+            if (dec->size - dec->pos < 12u) {
+                dec->ivf_eof = true;
+                continue;
             }
+            uint8_t header[12];
+            uint32_t fsize;
+            if (dec->source) {
+                if (jce_read_source_read_at(dec->source,dec->pos,header,12u) != 12u)
+                    return false;
+            } else memcpy(header,dec->data+(size_t)dec->pos,12u);
+            fsize = rd_u32_le(header);
+            dec->pos += 12u;
+            if (!fsize || fsize > 16u*1024u*1024u || fsize > dec->size-dec->pos) {
+                dec->ivf_eof = true;
+                LOG_WARN(LOG_TAG,"invalid or truncated IVF frame");
+                return false;
+            }
+            if (dec->source) {
+                uint8_t *owned = dav1d_data_create(&dec->pending,fsize);
+                if (!owned) return false;
+                if (jce_read_source_read_at(dec->source,dec->pos,owned,fsize) != fsize) {
+                    dav1d_data_unref(&dec->pending);
+                    dec->ivf_eof = true;
+                    return false;
+                }
+            } else if (dav1d_data_wrap(&dec->pending,dec->data+(size_t)dec->pos,
+                                       fsize,av1_packet_noop_free,NULL) < 0)
+                return false;
+            dec->pos += fsize;
+        }
+        int sd = dav1d_send_data(dec->ctx, &dec->pending);
+        if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
+            dav1d_data_unref(&dec->pending);
+            LOG_WARN(LOG_TAG, "dav1d_send_data: %d", sd);
             return false;
         }
-        /* If EAGAIN, dav1d kept a reference; loop and try get_picture. */
     }
 }
 
@@ -224,21 +253,22 @@ void jce_av1_close(JceAv1Decoder *dec)
 {
     if (!dec) return;
     unref_pic(dec);
+    dav1d_data_unref(&dec->pending);
     if (dec->ctx) dav1d_close(&dec->ctx);
+    jce_read_source_close(dec->source);
     JCE_FREE(dec);
 }
 
-JceAv1Decoder *jce_av1_open_packet(void)
+static JceAv1Decoder *av1_open_packet_with_delay(int delay)
 {
     JceAv1Decoder *dec = (JceAv1Decoder *)JCE_CALLOC(1, sizeof(*dec));
     if (!dec) return NULL;
     Dav1dSettings s;
     dav1d_default_settings(&s);
-    /* Packet-driven path (WebM/AV1): keep max_frame_delay=1 (low-latency).
-     * Caller sends one packet and expects at most one frame back immediately.
-     * Frame-level threading (S2) is not useful here since the pipeline is
-     * bounded by network/demux, not decode throughput. */
-    s.max_frame_delay = 1;
+    /* dav1d selects a CPU-sized worker pool; do not serialize frame decoding. */
+    s.n_threads = 0;
+    s.frame_size_limit = 4096u * 4096u;
+    s.max_frame_delay = delay;
     s.logger.cookie = NULL;
     s.logger.callback = av1_silent_logger;
     if (dav1d_open(&dec->ctx, &s) < 0) {
@@ -246,8 +276,62 @@ JceAv1Decoder *jce_av1_open_packet(void)
         JCE_FREE(dec);
         return NULL;
     }
+    LOG_INFO(LOG_TAG, "dav1d %s packet: threads=%d delay=%d", dav1d_version(), s.n_threads,
+             dav1d_get_frame_delay(&s));
     /* No IVF buffer — caller drives via jce_av1_decode_packet(). */
     return dec;
+}
+
+JceAv1Decoder *jce_av1_open_packet(void)
+{
+    return av1_open_packet_with_delay(1);
+}
+
+JceAv1Decoder *jce_av1_packet_open_parallel(void)
+{
+    return av1_open_packet_with_delay(0);
+}
+
+int jce_av1_packet_send(JceAv1Decoder *dec, const void *packet,
+                       size_t size, int64_t timestamp)
+{
+    if (!dec || !packet || !size) return -1;
+    if (!dec->pending.sz) {
+        uint8_t *owned = dav1d_data_create(&dec->pending,size);
+        if (!owned) return -1;
+        memcpy(owned,packet,size);
+        dec->pending.m.timestamp = timestamp;
+    }
+    int sd = dav1d_send_data(dec->ctx, &dec->pending);
+    if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
+        dav1d_data_unref(&dec->pending);
+        LOG_WARN(LOG_TAG, "dav1d packet send: %d", sd);
+        return -1;
+    }
+    return dec->pending.sz ? 0 : 1;
+}
+
+int jce_av1_packet_receive(JceAv1Decoder *dec, JceAv1PacketFrame *frame)
+{
+    if (!dec || !frame) return -1;
+    unref_pic(dec);
+    int gp = dav1d_get_picture(dec->ctx, &dec->pic);
+    if (gp == DAV1D_ERR(EAGAIN)) return 0;
+    if (gp < 0) return -1;
+    dec->pic_valid = true;
+    if (!av1_pic_supported(dec)) {
+        unref_pic(dec);
+        return -1;
+    }
+    frame->y = (const uint8_t *)dec->pic.data[0];
+    frame->u = (const uint8_t *)dec->pic.data[1];
+    frame->v = (const uint8_t *)dec->pic.data[2];
+    frame->y_stride = dec->pic.stride[0];
+    frame->uv_stride = dec->pic.stride[1];
+    frame->width = (uint32_t)dec->pic.p.w;
+    frame->height = (uint32_t)dec->pic.p.h;
+    frame->timestamp = dec->pic.m.timestamp;
+    return 1;
 }
 
 bool jce_av1_decode_packet(JceAv1Decoder *dec,
@@ -262,17 +346,15 @@ bool jce_av1_decode_packet(JceAv1Decoder *dec,
 
     if (packet && packet_size > 0) {
         Dav1dData d;
-        if (dav1d_data_wrap(&d, (const uint8_t *)packet, packet_size,
-                            av1_packet_noop_free, NULL) < 0) {
-            LOG_ERROR(LOG_TAG, "dav1d_data_wrap failed");
-            return false;
-        }
+        uint8_t *owned = dav1d_data_create(&d, packet_size);
+        if (!owned) return false;
+        memcpy(owned, packet, packet_size);
         int sd = dav1d_send_data(dec->ctx, &d);
-        if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
+        if (sd < 0) {
             dav1d_data_unref(&d);
-            if (av1_should_log_send_err()) {
+            if (av1_should_log_send_err(dec)) {
                 LOG_WARN(LOG_TAG, "dav1d_send_data: %d (err #%lu)",
-                         sd, s_send_data_err_count);
+                         sd, dec->send_data_errors);
             }
             return false;
         }

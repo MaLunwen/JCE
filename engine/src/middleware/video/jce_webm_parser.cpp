@@ -1,9 +1,9 @@
 /*
- * jce_webm_parser.cpp  Memory-backed WebM/Matroska demuxer using libwebm.
+ * jce_webm_parser.cpp  Source-backed WebM/Matroska demuxer using libwebm.
  *
  * Implements the C ABI declared in jce_webm_parser.h on top of libwebm's
  * mkvparser (BSD-3, royalty-free). One concrete IMkvReader subclass wraps
- * the input buffer; everything else just walks Cluster→Block→Frame.
+ * bounded random-access input; everything else just walks Cluster→Block→Frame.
  */
 
 #include <jce/middleware/video/jce_webm_parser.h>
@@ -25,17 +25,18 @@ extern "C" {
 
 namespace {
 
-// ── Memory-backed IMkvReader ──────────────────────────────────────────
-class MemReader : public mkvparser::IMkvReader {
+// ── Source-backed IMkvReader ──────────────────────────────────────────
+class SourceReader : public mkvparser::IMkvReader {
 public:
-    MemReader(const uint8_t *data, long long size)
-        : m_data(data), m_size(size) {}
+    explicit SourceReader(JceReadSource *source)
+        : m_source(jce_read_source_acquire(source)),
+          m_size((long long)jce_read_source_size(source)) {}
+    ~SourceReader() override { jce_read_source_close(m_source); }
 
     int Read(long long pos, long len, unsigned char *buf) override {
-        if (pos < 0 || len < 0) return -1;
-        if (pos + len > m_size) return -1;
-        std::memcpy(buf, m_data + pos, static_cast<size_t>(len));
-        return 0;
+        if (pos < 0 || len < 0 || pos > m_size || len > m_size-pos || len > 32*1024*1024) return -1;
+        return jce_read_source_read_at(m_source,(uint64_t)pos,buf,(size_t)len)
+                   == (size_t)len ? 0 : -1;
     }
     int Length(long long *total, long long *available) override {
         if (total)     *total     = m_size;
@@ -43,7 +44,7 @@ public:
         return 0;
     }
 private:
-    const uint8_t *m_data;
+    JceReadSource *m_source;
     long long      m_size;
 };
 
@@ -71,7 +72,7 @@ JceWebmAudioCodec map_audio_codec(const std::string &id) {
 } // namespace
 
 struct JceWebmParser {
-    MemReader            *reader = nullptr;
+    SourceReader            *reader = nullptr;
     mkvparser::Segment   *segment = nullptr;
     long long             timecode_scale_ns = 1000000;// default 1ms
     JceWebmVideoCodec     vcodec = JCE_WEBM_VIDEO_NONE;
@@ -89,6 +90,9 @@ struct JceWebmParser {
     // returned pointer outlives libwebm's internal state).
     unsigned char *frame_buf = nullptr;
     size_t         frame_cap = 0;
+    uint32_t accounted[65536] = {};
+    uint64_t retained_entries = 0;
+    bool metadata_failed = false;
 };
 
 bool jce_webm_is_webm(const void *data, size_t size)
@@ -99,6 +103,36 @@ bool jce_webm_is_webm(const void *data, size_t size)
     return p[0] == 0x1A && p[1] == 0x45 && p[2] == 0xDF && p[3] == 0xA3;
 }
 
+/* libwebm retains parsed block entries. Cap their aggregate as well as clusters. */
+static bool account_cluster(JceWebmParser *p,const mkvparser::Cluster *cluster)
+{
+    const long index=cluster->GetIndex(), entries=cluster->GetEntryCount();
+    if (p->metadata_failed || index<0 || index>=65536 || entries<0) return false;
+    const uint32_t count=(uint32_t)entries;
+    if (count>p->accounted[index]) {
+        p->retained_entries+=count-p->accounted[index];
+        p->accounted[index]=count;
+    }
+    if (p->retained_entries>1000000u) {
+        p->metadata_failed=true;
+        LOG_ERROR(LOG_TAG,"WebM retained block index exceeds budget");
+        return false;
+    }
+    return true;
+}
+
+static const mkvparser::Cluster *next_cluster(JceWebmParser *p,
+                                              const mkvparser::Cluster *current)
+{
+    if (!p || !p->segment || !current) return nullptr;
+    if (current == p->segment->GetLast()) {
+        /* A fixed cluster budget also bounds libwebm's retained index. */
+        if (p->segment->GetCount() >= 65536 || p->segment->LoadCluster() < 0)
+            return nullptr;
+    }
+    return p->segment->GetNext(current);
+}
+
 static bool advance_to_next_block(JceWebmParser *p, TrackCursor &cur)
 {
     if (!p || !p->segment || cur.track_number == 0) return false;
@@ -107,7 +141,7 @@ static bool advance_to_next_block(JceWebmParser *p, TrackCursor &cur)
     long step_budget = total_clusters > 0 ? total_clusters + 4 : 1024;
 
     auto step_to_next_cluster = [&](void) -> bool {
-        const mkvparser::Cluster *nxt = seg->GetNext(cur.cluster);
+        const mkvparser::Cluster *nxt = next_cluster(p,cur.cluster);
         if (!nxt || nxt == cur.cluster || nxt->EOS()) return false;
         long long nt = nxt->GetTime();
         /* Cluster timecodes must be monotonically non-decreasing.
@@ -137,6 +171,7 @@ static bool advance_to_next_block(JceWebmParser *p, TrackCursor &cur)
     while (cur.cluster && !cur.cluster->EOS()) {
         if (cur.entry == nullptr) {
             long st = cur.cluster->GetFirst(cur.entry);
+            if (!account_cluster(p,cur.cluster)) return false;
             if (st < 0 || cur.entry == nullptr) {
                 if (--step_budget <= 0) { cur.reached_eof = true; return false; }
                 if (!step_to_next_cluster()) { cur.reached_eof = true; return false; }
@@ -152,6 +187,7 @@ static bool advance_to_next_block(JceWebmParser *p, TrackCursor &cur)
             }
             const mkvparser::BlockEntry *next = nullptr;
             long st = cur.cluster->GetNext(cur.entry, next);
+            if (!account_cluster(p,cur.cluster)) return false;
             if (st < 0) { cur.entry = nullptr; break; }
             cur.entry = next;
             cur.frame_idx = 0;
@@ -169,10 +205,10 @@ static bool emit_frame(JceWebmParser *p, TrackCursor &cur,
 {
     const mkvparser::Block *blk = cur.entry->GetBlock();
     const mkvparser::Block::Frame &f = blk->GetFrame(cur.frame_idx);
-    if (f.len < 0) return false;
+    if (f.len <= 0 || f.len > 16*1024*1024) return false;
 
     if ((size_t)f.len > p->frame_cap) {
-        size_t new_cap = (size_t)f.len * 2u;
+        size_t new_cap = (size_t)f.len;
         unsigned char *nb = (unsigned char *)JCE_REALLOC(p->frame_buf, new_cap);
         if (!nb) return false;
         p->frame_buf = nb;
@@ -190,6 +226,7 @@ static bool emit_frame(JceWebmParser *p, TrackCursor &cur,
     if (cur.frame_idx >= blk->GetFrameCount()) {
         const mkvparser::BlockEntry *next = nullptr;
         long st = cur.cluster->GetNext(cur.entry, next);
+        if (!account_cluster(p,cur.cluster)) return false;
         if (st < 0 || next == nullptr || next->EOS()) {
             // End of this cluster — eagerly step to the next cluster
             // (with monotonic-time guard) instead of leaving entry=null
@@ -197,7 +234,7 @@ static bool emit_frame(JceWebmParser *p, TrackCursor &cur,
             // advance_to_next_block call GetFirst() and re-walk this
             // cluster's entries forever.
             const mkvparser::Cluster *nxt =
-                p->segment ? p->segment->GetNext(cur.cluster) : nullptr;
+                next_cluster(p,cur.cluster);
             if (!nxt || nxt == cur.cluster || nxt->EOS()) {
                 cur.cluster = nullptr;
                 cur.reached_eof = true;
@@ -221,20 +258,19 @@ static bool emit_frame(JceWebmParser *p, TrackCursor &cur,
     return true;
 }
 
-JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
+JceWebmParser *jce_webm_open_source(JceReadSource *source,
                                     JceWebmInfo *out_info)
 {
-    if (!jce_webm_is_webm(data, size)) {
-        LOG_WARN(LOG_TAG, "input is not a WebM/Matroska stream");
-        return nullptr;
-    }
+    uint8_t magic[4];
+    if (out_info) memset(out_info,0,sizeof(*out_info));
+    if (jce_read_source_read_at(source,0u,magic,4u) != 4u ||
+        !jce_webm_is_webm(magic,4u)) return nullptr;
 
     void *raw = jce_malloc(sizeof(JceWebmParser));
     if (!raw) return nullptr;
     JceWebmParser *p = new (raw) JceWebmParser();
 
-    p->reader = new (std::nothrow) MemReader(static_cast<const uint8_t *>(data),
-                                             (long long)size);
+    p->reader = new (std::nothrow) SourceReader(source);
     if (!p->reader) { p->~JceWebmParser(); jce_free(p); return nullptr; }
 
     long long pos = 0;
@@ -249,7 +285,7 @@ JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
         LOG_WARN(LOG_TAG, "Segment::CreateInstance failed");
         jce_webm_close(p); return nullptr;
     }
-    if (p->segment->Load() < 0) {
+    if (p->segment->ParseHeaders() < 0 || p->segment->LoadCluster() < 0) {
         LOG_WARN(LOG_TAG, "Segment::Load failed");
         jce_webm_close(p); return nullptr;
     }
@@ -311,6 +347,15 @@ JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
     return p;
 }
 
+JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
+                                    JceWebmInfo *out_info)
+{
+    JceReadSource *source = jce_read_source_open_memory(data,size,false);
+    JceWebmParser *parser = jce_webm_open_source(source,out_info);
+    jce_read_source_close(source);
+    return parser;
+}
+
 bool jce_webm_get_audio_codec_private(JceWebmParser *p,
                                       const uint8_t **out_data, size_t *out_size)
 {
@@ -342,6 +387,12 @@ bool jce_webm_read_audio_packet(JceWebmParser *p,
 bool jce_webm_seek(JceWebmParser *p, uint64_t time_ns)
 {
     if (!p || !p->segment) return false;
+    while (p->segment->GetLast() &&
+           (uint64_t)p->segment->GetLast()->GetTime() < time_ns) {
+        const auto *last = p->segment->GetLast();
+        const auto *next = next_cluster(p,last);
+        if (!next || next->EOS() || next == last) break;
+    }
     auto *cl = p->segment->FindCluster((long long)time_ns);
     if (!cl) return false;
     p->video.cluster = cl;  p->video.entry = nullptr; p->video.frame_idx = 0;

@@ -64,6 +64,17 @@ typedef struct {
     jce_vec3 axis_x;
     jce_vec3 axis_y;
     jce_vec3 axis_z;
+    /* Per-trigger STAY opt-in.  The world computes a STAY cadence for ALL
+     * triggers; TriggerVolume.fire_stay is the author saying which ones want
+     * the events, and it had no route in here.  ZERO IS "no STAY", matching
+     * the component's own default and the fact that STAY was dispatched
+     * nowhere at all before this. */
+    bool     fire_stay;
+    /* TriggerVolume.tag: the component calls it "user label propagated to
+     * event payload" and there was no payload field to propagate it to, so a
+     * script could not tell one zone from another except by entity id.
+     * APPENDED, never inserted. */
+    char     tag[64];
 } JceTriggerDesc;
 
 typedef struct { uint32_t idx; uint32_t gen; } JceTriggerHandle;
@@ -91,6 +102,9 @@ typedef struct {
     uint64_t            trigger_user;   /* opaque, set on add */
     uint64_t            observer_user;  /* opaque, set on add */
     jce_vec3            point;          /* observer position at event time */
+    /* The trigger's authored tag, or "" -- points into the trigger world and
+     * is valid only for the duration of the callback.  APPENDED. */
+    const char         *tag;
 } JceTriggerEvent;
 
 /* Event sink — caller-supplied callback invoked once per event during

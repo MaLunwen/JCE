@@ -218,15 +218,55 @@ endif()
 #
 function(jce_target_warnings TARGET)
 	cmake_parse_arguments(ARG "STRICT" "" "" ${ARGN})
+	# AN IMPLICIT DECLARATION IS AN ERROR, NOT A WARNING, AND THE REASON IS
+	# THAT ITS VISIBILITY IS ACCIDENTAL.  Measured 2026-09-21, the SAME defect
+	# twice in one day:
+	#
+	#   jce_audio_duck_pump   C4013 ALONE and silent -- the definition lives in
+	#                         another TU, so nothing ever contradicted the
+	#                         assumed int().  `float dt` went through default
+	#                         argument promotion to double, the call linked, the
+	#                         engine ran, and 479/479 passed with a shipped
+	#                         subsystem receiving a garbage block length.
+	#   bus_terminal_node     C4013 then C2040 -- the definition was in the same
+	#                         TU and contradicted it, so the compiler stopped it.
+	#
+	#   cosf in            C4013 in DEBUG ONLY.  /O2 implies /Oi, so MSVC
+	#   jce_primitives.c   supplies cosf/sinf as intrinsics and the release
+	#                      build compiles clean; /Od supplies neither, and
+	#                      the file has no <math.h>.  Before this flag, the
+	#                      debug build read EAX for a value the CRT returns
+	#                      in XMM0 -- every rotated 2D primitive got a
+	#                      garbage basis, in debug builds only.  Fixed in
+	#                      eeb1b4ff.
+	#
+	# Whether this class halts the build depends on THREE things, none of them
+	# visible at the call site: WHERE the definition sits (same TU and
+	# contradicting stops you; another TU is silent), WHETHER the TU is
+	# compiled at all (an off-by-default module is invisible to every gate --
+	# see engine/src/middleware/ai_dispatch/AGENTS.md), and WHICH optimisation
+	# level supplies an intrinsic.  The dangerous cases are the silent ones.
+	# These two flags make it always.  C99 removed implicit declaration from
+	# the language; this is the language's own rule, enforced.
+	#
+	# AND THIS FLAG ONLY SPEAKS FOR WHAT IT COMPILED, IN THE CONFIGURATION IT
+	# COMPILED IN.  daa0a464 verified the tree release-clean and called ten
+	# statically-scanned candidates false positives; jce_primitives.c was not
+	# one, it was the only real finding, and a debug build is what said so.
+	# A green build and a green build in ONE CONFIGURATION look identical in a
+	# log: when a measurement comes back clean, ask what it was able to SEE.
 	if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-		target_compile_options(${TARGET} PRIVATE -Wall -Wextra)
+		target_compile_options(${TARGET} PRIVATE -Wall -Wextra
+			-Werror=implicit-function-declaration)
 		if(ARG_STRICT)
 			target_compile_options(${TARGET} PRIVATE
 				-Wpedantic -Wconversion -Wshadow
 				-Wdouble-promotion -Wno-unused-parameter)
 		endif()
 	elseif(MSVC)
-		target_compile_options(${TARGET} PRIVATE /W4 /utf-8 /Zc:preprocessor)
+		# /we4013 -- see the note above the Clang/GNU branch.
+		target_compile_options(${TARGET} PRIVATE /W4 /utf-8 /Zc:preprocessor
+			/we4013)
 		if(ARG_STRICT)
 			target_compile_options(${TARGET} PRIVATE
 				/wd4100    # unreferenced formal parameter
@@ -524,7 +564,6 @@ endif()
 set(JCE_ROOT_DIR       "${CMAKE_CURRENT_SOURCE_DIR}")
 set(JCE_ENGINE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine/src")
 set(JCE_TOOLS_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/tools")
-set(JCE_IOS_DIR        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/macos/ios")
 
 # ------------------------------------------------------------------ #
 # Shader compilation (bgfx shaderc)                                   #
@@ -638,11 +677,55 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_SSR_SHADER_FILES)
 
 jce_compile_shaders(
+	TARGET        CompileShadersSSGI
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssgi"
+	VARYING_DEF   "varying_ssgi.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_SSGI_SHADER_FILES)
+
+jce_compile_shaders(
 	TARGET        CompileShadersVolFog
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/volfog"
 	VARYING_DEF   "varying_volfog.def.sc"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_VOLFOG_SHADER_FILES)
+
+# ------------------------------------------------------------------ #
+# Host shader inspector: jce_shader_inspect                           #
+#                                                                     #
+# Its own tiny target rather than a mode of jce_cook: it reads a       #
+# compiled .bin and never touches the asset graph, so it must stay     #
+# runnable on a machine that has a shader and nothing else. Two source #
+# files, no allocator, no zstd -- that is the whole dependency set,    #
+# and keeping it that small is what lets CI and the AI CLI call it.    #
+# ------------------------------------------------------------------ #
+
+if(NOT CMAKE_CROSSCOMPILING)
+	add_executable(jce_shader_inspect
+		"${JCE_TOOLS_DIR}/jce_shader_inspect.c"
+		"${JCE_ENGINE_SRC_DIR}/renderer/jce_shader_reflect.c")
+	set_target_properties(jce_shader_inspect PROPERTIES
+		EXCLUDE_FROM_ALL ON
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+		C_STANDARD            99
+		C_STANDARD_REQUIRED   YES
+		C_EXTENSIONS          OFF)
+	target_include_directories(jce_shader_inspect PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
+		"${JCE_ENGINE_SRC_DIR}")
+	# JCE_API expands to a dllimport in a consumer build; this target
+	# compiles the implementation itself, so it must say so.
+	target_compile_definitions(jce_shader_inspect PRIVATE JCE_BUILDING_ENGINE=1)
+	jce_target_warnings(jce_shader_inspect)
+	# The self-test runs AS PART OF BUILDING IT.  This tree has shipped seven
+	# jce_*_self_test functions with zero call sites; a parser whose only
+	# guarantee is a mode nobody invokes has no guarantee.  It costs
+	# milliseconds and it covers the half no real .bin can reach -- every
+	# truncation of a synthetic blob must be REFUSED, not answered partially.
+	add_custom_command(TARGET jce_shader_inspect POST_BUILD
+		COMMAND jce_shader_inspect --self-test
+		COMMENT "jce_shader_inspect: self-test")
+endif()
 
 # ------------------------------------------------------------------ #
 # Host packer tool: jce_pak                                           #
@@ -736,10 +819,17 @@ if(NOT CMAKE_CROSSCOMPILING AND
    EXISTS "${JCE_TOOLS_DIR}/miniaudio_impl_cook.c")
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
+		# --pack-atlas in its own TU: jce_cook.c is over 1,200 lines and the
+		# file-size ratchet is a standing instruction, not a suggestion.
+		"${JCE_TOOLS_DIR}/jce_cook_atlas.c"
 		"${JCE_TOOLS_DIR}/jce_cook_catalog.c"
 		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
 		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
+		# The packing arithmetic --pack-atlas drives.  jce_cook has an
+		# explicit source list rather than the engine glob, so the TU must be
+		# named here or the link fails on jce_atlas_pack.
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_atlas_pack.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_writer_internal.c"
 		# Canonical extension -> asset-kind table shared by the cooker, the
@@ -755,6 +845,14 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		# serialize path (no Bullet/physics link).
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_importer.cpp"
+		# The importer reads <asset>.import.json now, so its settings module
+		# has to be here too -- this list is EXPLICIT (see the comment above
+		# it), so a new TU the importer calls is a link error, not a silent
+		# omission.  That is the list working.
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_import_settings.c"
+		# And the audio one, for the same reason: jce_cook.c's should_cook
+		# and jce_cook_audio both call into it, and this list is explicit.
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_audio_import_settings.c"
 		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_cook.cpp"
 		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_asset.c"
 		# Offline model→GLB conversion (--convert-model): the same assimp+meshopt
@@ -827,8 +925,13 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		meshoptimizer::meshoptimizer
 		# Runtime terrain authoring writes its meta through jce_json.
 		cjson::cjson)
-	# JCE_DIST: compile out the engine LOG_* macros pulled in by the
+	# JCE_LOG_NONE: compile out ALL engine LOG_* macros pulled in by the
 	#   collider/model-import TUs so jce_cook needs no async log subsystem.
+	#   This was spelled JCE_DIST until 2026-08-31, which made one switch answer
+	#   two unrelated questions -- "is this a lean host tool?" and "is this a
+	#   shipping game?".  The moment the dist variant kept LOG_WARN/LOG_ERROR
+	#   (so a player crash comes back with something to read), jce_cook stopped
+	#   linking: 5 TUs with an unresolved jce_log_write.
 	# JCE_COLLIDER_ASSET_NO_PHYSICS: omit jce_collider_instantiate() so the
 	#   blob codec links without the Bullet/physics chain.
 	# JCE_MODEL_IMPORTER_COOK_ONLY: compile out the skinned/animated FBX import
@@ -836,7 +939,7 @@ if(NOT CMAKE_CROSSCOMPILING AND
 	#   symbols this lean cook tool does not link); only the static part-
 	#   extraction path the --collider cook needs is kept.
 	target_compile_definitions(jce_cook PRIVATE
-		JCE_DIST
+		JCE_LOG_NONE
 		JCE_COLLIDER_ASSET_NO_PHYSICS
 		JCE_MODEL_IMPORTER_COOK_ONLY)
 	jce_target_warnings(jce_cook)
@@ -876,7 +979,8 @@ option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)"
 # against the packaged SDK as real consumers (scripts/jce.py app) — the same
 # path external users take, and the only way the SDK contract is dogfooded.
 # Flip ON only for in-tree dev iteration on the sample itself.
-option(JCE_BUILD_INTREE_SAMPLE "Build the in-tree Caged Kingdom sample (dev only)" OFF)
+option(JCE_BUILD_INTREE_SAMPLE
+	"Build the in-tree sample named by JCE_GAME_PROJECT_DIR (dev only)" OFF)
 # Meadow Valley is the stylized-world dogfood project.  Default OFF; enabled
 # independently of caged_kingdom so CI can gate each project separately.
 option(JCE_BUILD_INTREE_MEADOW  "Build the in-tree Meadow Valley project (dev only)" OFF)
@@ -896,16 +1000,39 @@ endif()
 # Engine-owned runtime assets are generated into this build-local root.  At
 # present these are the compiled shaders; applications/editor resources retain
 # their normal source roots below.
+# The GAME_* slot: which in-tree project supplies the game-side assets.
+#
+# The engine is general; whatever sits in this slot is not.  These inputs used
+# to spell one project's directory, icon and CMake target straight into the
+# engine's build, so the engine's packaging defaults belonged to that project.
+# They are variables now, so any in-tree project with the same layout can take
+# the slot without editing engine build code.  add_subdirectory() for the
+# sample is already gated on JCE_BUILD_INTREE_SAMPLE below -- this is the asset
+# half of the same separation.  (owner decision, 2026-08-27)
+set(JCE_GAME_PROJECT_DIR "examples/caged_kingdom" CACHE STRING
+	"In-tree project directory supplying the GAME_* asset/PAK inputs")
+set(JCE_GAME_TARGET "CagedKingdom" CACHE STRING
+	"CMake target name of the project named by JCE_GAME_PROJECT_DIR")
+set(JCE_GAME_ICON "resources/CK_icon.png" CACHE STRING
+	"Window/app icon file, relative to JCE_GAME_PROJECT_DIR")
+
+set(JCE_GAME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/${JCE_GAME_PROJECT_DIR}")
+
 set(ENGINE_RESOURCE_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}")
-set(GAME_RESOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/assets")
+set(GAME_RESOURCE_DIR   "${JCE_GAME_ROOT}/resources/assets")
 set(EDITOR_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/editor/resources/assets")
-set(GAME_ICON_FILE      "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/CK_icon.png")
+set(GAME_ICON_FILE      "${JCE_GAME_ROOT}/${JCE_GAME_ICON}")
+# The in-PAK name is the icon's own basename, not a fixed string: the GAME
+# looks it up by name (examples/caged_kingdom/src/game/ck_app.c:334 asks the PAK for
+# "CK_icon.png"), so it is a contract between a project and its own PAK.
+# Hardcoding it here would silently rename any other project's icon.
+get_filename_component(JCE_GAME_ICON_NAME "${JCE_GAME_ICON}" NAME)
 set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
 set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
-set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
+set(GAME_UI_DIR         "${JCE_GAME_ROOT}/ui")
 
-_jce_prepare_runtime_boot_manifest(CagedKingdom
-	"${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/jce_project.json"
+_jce_prepare_runtime_boot_manifest(${JCE_GAME_TARGET}
+	"${JCE_GAME_ROOT}/jce_project.json"
 	GAME_RUNTIME_METADATA_DIR GAME_RUNTIME_BOOT_FILE)
 set(GAME_RUNTIME_INPUT_FILE "")
 if(GAME_RUNTIME_METADATA_DIR AND
@@ -961,12 +1088,29 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 	add_custom_command(
 		OUTPUT     "${COOK_GAME_STAMP}"
 		COMMAND    "${CMAKE_COMMAND}" -E rm -f "${COOK_GAME_STAMP}"
-		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${GAME_COOKED_DIR}"
+		# NO `rm -rf ${GAME_COOKED_DIR}` here.  It used to wipe the output tree
+		# before every cook, and jce_cook's incremental cache requires the
+		# previous output to still exist (tools/jce_cook.c
+		# --pack-atlas lives in its own TU: jce_cook.c is over 1,200
+		# lines and the file-size ratchet is a standing instruction.
+		tools/jce_cook_atlas.c:294-296 ANDs the
+		# content-hash hit with jce_fs_host_exists_file(out_path)), so the
+		# catalog never once hit: every build re-decoded and re-block-compressed
+		# every texture.  The orphan problem the wipe was standing in for is
+		# already solved inside the cooker -- tools/jce_cook.c:1192-1206 runs a
+		# per-run stale sweep that drops catalog entries whose source was deleted
+		# or moved AND deletes their now-orphan outputs, before the catalog is
+		# saved.  The two files copied in below are rewritten unconditionally.
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_COOKED_DIR}"
+		# --mipmaps on the RESOURCE trees only.  Shipped textures were cooked
+		# with mip_count=1 and, being BC-compressed already, cannot get a chain
+		# back at runtime -- so minified geometry aliased and thrashed the
+		# texture cache.  The UI trees below stay without it on purpose: a mip
+		# chain on an atlas bleeds neighbouring glyphs/sprites at small scales.
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${GAME_COOKED_DIR}"
 		           --catalog "${GAME_COOK_CATALOG_ENGINE}"
-		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
+		           --preserve-names --level 0 --max-texture-size 2048 --mipmaps --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_UI_DIR}"        "${GAME_COOKED_DIR}"
 		           --catalog "${GAME_COOK_CATALOG_ENGINE_UI}"
@@ -974,20 +1118,20 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_RESOURCE_DIR}"    "${GAME_COOKED_DIR}"
 		           --catalog "${GAME_COOK_CATALOG_PROJECT}"
-		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
+		           --preserve-names --level 0 --max-texture-size 2048 --mipmaps --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_UI_DIR}"          "${GAME_COOKED_DIR}"
 		           --catalog "${GAME_COOK_CATALOG_PROJECT_UI}"
 		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    "${CMAKE_COMMAND}" -E copy
-		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/CK_icon.png"
+		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/${JCE_GAME_ICON_NAME}"
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${TPL_SRC_FILE}" "${GAME_COOKED_DIR}/THIRD_PARTY_LICENSES.md"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_GAME_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 		           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
-		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 		           "${GAME_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
 		VERBATIM)
@@ -997,7 +1141,9 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 	add_custom_command(
 		OUTPUT     "${COOK_EDITOR_STAMP}"
 		COMMAND    "${CMAKE_COMMAND}" -E rm -f "${COOK_EDITOR_STAMP}"
-		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${EDITOR_COOKED_DIR}"
+		# Same reason as the game cook above: the wipe made jce_cook's
+		# incremental catalog structurally unable to hit, and the cooker's own
+		# per-run stale sweep already deletes orphan outputs.
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${EDITOR_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
@@ -1019,7 +1165,7 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 		           ${ENGINE_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
-		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 		           "${EDITOR_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking editor assets (textures/audio → .jceasset)"
 		VERBATIM)
@@ -1058,7 +1204,7 @@ else()
 		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${GAME_ICON_STAGE_DIR}"
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_ICON_STAGE_DIR}"
 		COMMAND    "${CMAKE_COMMAND}" -E copy
-		           "${GAME_ICON_FILE}" "${GAME_ICON_STAGE_DIR}/CK_icon.png")
+		           "${GAME_ICON_FILE}" "${GAME_ICON_STAGE_DIR}/${JCE_GAME_ICON_NAME}")
 	set(_COOK_GAME_DEP   "")
 	set(_COOK_EDITOR_DEP "")
 endif()
@@ -1068,39 +1214,13 @@ if(JCE_PLATFORM_WEB)
 	# Emscripten cannot compile 1.5 GB C arrays; use --preload-file instead.
 	set(_OBJ_FORMAT "none")
 elseif(MSVC)
-	# Derive the embedded-PAK COFF machine type from the compiler's TARGET
-	# architecture, NOT CMAKE_SYSTEM_PROCESSOR.  For an x86 build on an x64 host
-	# (vcvarsall amd64_x86) Conan does not flag a cross-build, so it never sets
-	# CMAKE_SYSTEM_PROCESSOR and it falls back to the host value "AMD64" -- which
-	# would wrongly stamp the PAK object as x64 and break the editor link with
-	# LNK1112 (module machine type 'x64' conflicts with target 'x86').
-	# CMAKE_<LANG>_COMPILER_ARCHITECTURE_ID always reflects what cl.exe/link.exe
-	# actually emit (X86 / x64 / ARM64 / ARM) and matches the linker's /machine.
-	set(_MSVC_TARGET_ARCH "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
-	if(NOT _MSVC_TARGET_ARCH)
-		set(_MSVC_TARGET_ARCH "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
-	endif()
-	string(TOLOWER "${_MSVC_TARGET_ARCH}" _MSVC_TARGET_ARCH)
-	if(_MSVC_TARGET_ARCH STREQUAL "x64")
-		set(_OBJ_ARCH "x64")
-	elseif(_MSVC_TARGET_ARCH STREQUAL "arm64")
-		set(_OBJ_ARCH "arm64")
-	elseif(_MSVC_TARGET_ARCH STREQUAL "x86")
-		set(_OBJ_ARCH "x86")
-	elseif(_MSVC_TARGET_ARCH STREQUAL "arm")
-		set(_OBJ_ARCH "arm")
-	else()
-		message(FATAL_ERROR
-			"Unsupported MSVC target architecture for COFF: "
-			"'${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}' "
-			"(CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}')")
-	endif()
+	_jce_msvc_coff_arch(_OBJ_ARCH)
 	set(_OBJ_FORMAT "coff")
 else()
 	set(_OBJ_FORMAT "none")
 endif()
 
-# ── Game assets PAK (engine base + caged_kingdom) ──
+# ── Game assets PAK (engine base + the JCE_GAME_PROJECT_DIR project) ──
 
 # Locate Python early so the HTML report generator can be wired into the
 # pak custom commands.  Optional: if missing, the report step is skipped.
@@ -1168,7 +1288,7 @@ add_custom_command(
 	           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 	           "${GAME_ICON_FILE}"
 	           ${GAME_RUNTIME_BOOT_FILE} ${GAME_RUNTIME_INPUT_FILE}
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing game assets -> ${GAME_PAK_FILE}"
 	VERBATIM)
 
@@ -1228,7 +1348,7 @@ add_custom_command(
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 	           ${ENGINE_UI_FILES}
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing editor assets -> ${EDITOR_PAK_FILE}"
 	VERBATIM)
 
@@ -1309,7 +1429,7 @@ if(JCE_EMBED_ENGINE_SHADERS)
 		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 		           ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES}
 		           ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES}
-		           ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+		           ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 		COMMENT    "Packing engine shaders -> ${JCE_ENGSH_C_ARRAY}"
 		VERBATIM)
 
@@ -1364,16 +1484,24 @@ if(MSVC)
 	# /Zi+/DEBUG block below disables them, so set them explicitly).
 	add_link_options("$<$<CONFIG:Release>:/OPT:REF>"
 	                 "$<$<CONFIG:Release>:/OPT:ICF>")
-	# .pdb (/Zi + /DEBUG): dev `release` variant ONLY, so the in-process crash
-	# handler (DbgHelp SymFromAddr/SymGetLineFromAddr64 in jce_crash_handler.c)
-	# resolves STATIC functions + file:line instead of nearest-export noise.
-	# The `dist` (shipping) variant OMITS the .pdb — matching the POSIX `-s`
-	# strip below, and package-editor never bundled it anyway — so a dist link is
-	# leaner + faster.  (The .pdb is only read at crash time.)
-	if(NOT JCE_BUILD_VARIANT STREQUAL "dist")
-		add_compile_options("$<$<CONFIG:Release>:/Zi>")
-		add_link_options("$<$<CONFIG:Release>:/DEBUG>")
-	endif()
+	# .pdb (/Zi + /DEBUG) for BOTH the release and dist variants, so the
+	# in-process crash handler (DbgHelp SymFromAddr/SymGetLineFromAddr64 in
+	# jce_crash_handler.c) resolves STATIC functions + file:line instead of
+	# nearest-export noise.
+	#
+	# The dist variant used to skip it, reasoning that "the .pdb is only read at
+	# crash time" and a dist link is leaner without it.  That reasoning is
+	# inverted: being read only at crash time is exactly why the file has to
+	# exist.  A .pdb is a SEPARATE artefact — it does not enter the .exe, and
+	# package-editor has never bundled it — so producing it costs link time and
+	# disk, not shipped bytes, while omitting it makes every minidump a shipped
+	# build will ever produce permanently unsymbolizable.  Archive it beside the
+	# build; do not ship it.
+	#
+	# /OPT:REF + /OPT:ICF are set explicitly above precisely so that turning
+	# /DEBUG on here does not silently give up dead-stripping.
+	add_compile_options("$<$<CONFIG:Release>:/Zi>")
+	add_link_options("$<$<CONFIG:Release>:/DEBUG>")
 	# Trim the absolute repo prefix from __FILE__ so embedded paths are stable
 	# across machines/checkout locations.  Harmless no-op when the prefix is
 	# absent.  (/d1trimfile is the practical MSVC equivalent of -ffile-prefix-map.)
@@ -1456,33 +1584,40 @@ add_subdirectory(editor)
 # CK is downstream of the SDK: it builds as an SDK consumer (scripts/jce.py
 # app), not as a first-party in-tree target.  Gated ON only for dev iteration.
 if(JCE_BUILD_INTREE_SAMPLE)
-	add_subdirectory(caged_kingdom)
+	# Non-empty FIRST: an empty JCE_GAME_PROJECT_DIR makes JCE_GAME_ROOT the
+	# source root, whose CMakeLists.txt does exist -- so an EXISTS test alone
+	# passes and add_subdirectory() is then called with no argument at all.
+	# Measured 2026-08-27: CMake answers "incorrect number of arguments",
+	# which says nothing about the variable that was actually blank.
+	if(NOT JCE_GAME_PROJECT_DIR)
+		message(FATAL_ERROR
+			"JCE_BUILD_INTREE_SAMPLE is ON but JCE_GAME_PROJECT_DIR is empty. "
+			"Set it to the in-tree project directory, or turn the option OFF.")
+	endif()
+	if(EXISTS "${JCE_GAME_ROOT}/CMakeLists.txt")
+		add_subdirectory(${JCE_GAME_PROJECT_DIR})
+	else()
+		# Degrade, do not abort: JCE_GAME_PROJECT_DIR is a variable now, so it
+		# can point at a tree this checkout does not have.  A bare
+		# add_subdirectory() would be a hard configure error naming a
+		# directory the reader never asked for.
+		message(STATUS
+			"SKIPPED in-tree sample: ${JCE_GAME_ROOT}/CMakeLists.txt not present")
+	endif()
 endif()
 # Meadow Valley is gated independently so CI can enable it without also
 # enabling caged_kingdom (JCE_BUILD_INTREE_SAMPLE).
 if(JCE_BUILD_INTREE_MEADOW)
-	add_subdirectory(meadow_valley)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/meadow_valley/CMakeLists.txt")
+		add_subdirectory(meadow_valley)
+	else()
+		message(STATUS "SKIPPED meadow_valley: CMakeLists.txt not present")
+	endif()
 endif()
 # elemental_serenity is added AFTER scripting/, not here — see below.
 # science_lab is intentionally NOT add_subdirectory()'d: it is a standalone
 # find_package(JCE) consumer built out-of-tree (see science_lab/CMakeLists.txt).
 
-# The STANDARD GPU TASK: one deterministic task, the Elemental Serenity scene,
-# a real GPU frame, and one implementation per driver language.  Gated OFF by
-# default because it needs a GPU, and added AFTER scripting/ because it links
-# whichever backends that directory declared.
-#
-# It lives under tools/ and NOT under elemental_serenity/ even though that is
-# the scene it drives: .gitignore:150 makes /elemental_serenity/ deliberately
-# unversioned ("Sample projects (local-only)"), and `git ls-files
-# elemental_serenity` returns nothing.  A harness committed in there would be
-# ignored by `git add` without a word — the silent-absence failure this task
-# exists to catch, reintroduced by its own layout.
-option(JCE_BUILD_GPU_TASK
-	"Build the cross-language standard GPU task (tools/gpu_task)" OFF)
-if(JCE_BUILD_GPU_TASK)
-	add_subdirectory(tools/gpu_task)
-endif()
 
 # Elemental Serenity, in-tree, and ALSO after scripting/ for the same reason
 # the GPU task is: it links whichever backends that directory declared, and
@@ -1558,6 +1693,17 @@ endif()
 # ------------------------------------------------------------------ #
 option(JCE_BUILD_TESTS "Build JCE unit tests (Unity + CTest)" OFF)
 if(JCE_BUILD_TESTS)
+    # SELF-TESTS ARE PRESENT BECAUSE TESTS ARE ON, NOT BECAUSE OPTIMISATION
+    # IS OFF.  They used to hang off `#ifndef NDEBUG`, which tied "does this
+    # invariant run" to the optimisation level: CMake's Release flags carry
+    # /DNDEBUG, so jce_rpc_self_test and friends did not EXIST as symbols in
+    # the configuration that ships, and tests/middleware/net could only
+    # register their wrappers under `if(CMAKE_BUILD_TYPE STREQUAL "Debug")`.
+    # The invariants ran in exactly one configuration -- the one nobody ships.
+    #
+    # Now the gate is named after what it gates, and the checks inside use
+    # JCE_ASSERT (<jce/os/core/jce_assert.h>), which NDEBUG does not strip.
+    target_compile_definitions(jce_core PUBLIC JCE_SELF_TESTS=1)
     enable_testing()
     add_subdirectory(tests)
 endif()
@@ -1581,7 +1727,7 @@ if(JCE_ENABLE_PUBLIC_API_GUARD)
 	if(Python3_FOUND)
 		add_custom_target(check_public_api
 			COMMAND ${Python3_EXECUTABLE}
-				"${CMAKE_SOURCE_DIR}/scripts/lint/check_public_api_purity.py"
+				"${CMAKE_SOURCE_DIR}/tools/lint/check_public_api_purity.py"
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			COMMENT "Verifying public headers have no third-party leaks"
 			VERBATIM)
@@ -1641,8 +1787,13 @@ if(Python3_FOUND)
 		if(TARGET JCE_Editor)
 			add_dependencies(JCE_Editor jce_i18n_auto)
 		endif()
-		if(TARGET caged_kingdom)
-			add_dependencies(caged_kingdom jce_i18n_auto)
+		# JCE_GAME_TARGET, not _PROJECT_DIR: CMake target names are case-sensitive
+		# and this project's target is CagedKingdom while its directory is
+		# caged_kingdom.  The guard read `if(TARGET caged_kingdom)` before
+		# 2026-08-27, so it had never once been true -- the game was never
+		# actually wired to the i18n normalisation stamp.
+		if(TARGET ${JCE_GAME_TARGET})
+			add_dependencies(${JCE_GAME_TARGET} jce_i18n_auto)
 		endif()
 	endif()
 endif()
@@ -1666,8 +1817,8 @@ if(CLANG_FORMAT_EXECUTABLE)
 		"${CMAKE_SOURCE_DIR}/engine/src/*.h"
 		"${CMAKE_SOURCE_DIR}/editor/src/*.cpp"
 		"${CMAKE_SOURCE_DIR}/editor/src/*.h"
-		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.c"
-		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h")
+		"${JCE_GAME_ROOT}/src/*.c"
+		"${JCE_GAME_ROOT}/src/*.h")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/third_party/")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/internal/stb_image\\.h$")
 
@@ -1702,7 +1853,7 @@ if(JCE_ENABLE_CPPCHECK
    AND CMAKE_SIZEOF_VOID_P EQUAL 8
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "(AMD64|amd64|x86_64)"
    AND JCE_BUILD_VARIANT STREQUAL "release")
-	find_program(CPPCHECK_EXECUTABLE NAMES cppcheck HINTS "D:/CMake/Cppcheck")
+	find_program(CPPCHECK_EXECUTABLE NAMES cppcheck)
 	if(CPPCHECK_EXECUTABLE)
 		include(ProcessorCount)
 		ProcessorCount(_JCE_CPPCHECK_JOBS)
@@ -1770,7 +1921,7 @@ if(JCE_ENABLE_CPPCHECK
 			-i${CMAKE_SOURCE_DIR}/engine/src/middleware/video/third_party
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
-			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
+			--file-filter=${JCE_GAME_ROOT}/*
 			-j${_JCE_CPPCHECK_JOBS}
 			--std=c99)
 
@@ -1823,3 +1974,8 @@ string(APPEND _dep_locs_content ")\n")
 
 set(DEP_LOCS_FILE "${CMAKE_CURRENT_BINARY_DIR}/_dep_locs_$<CONFIG>.cmake")
 file(GENERATE OUTPUT "${DEP_LOCS_FILE}" CONTENT "${_dep_locs_content}")
+
+if(TARGET jce_cook)
+  target_include_directories(jce_cook PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")
+  add_dependencies(jce_cook jce_vendor_verify_stb_image)
+endif()

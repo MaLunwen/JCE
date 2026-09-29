@@ -6,7 +6,13 @@ $input v_normal, v_curClip, v_prevClip
  * fs_gbuffer_vel.sc — STATIC G-buffer + per-object motion-vector (MRT).
  *
  *   gl_FragData[0] = world normal*0.5+0.5 (rgb) + roughness (a)  [SSR]
- *   gl_FragData[1] = screen motion (rg) encoded (cur_ndc-prev_ndc)*0.5+0.5 [TAA]
+ *   gl_FragData[1] = base-colour albedo (rgb)                     [SSGI]
+ *   gl_FragData[2] = screen motion (rg) encoded (cur_ndc-prev_ndc)*0.5+0.5 [TAA]
+ *
+ * ALBEDO SITS AT 1 WHETHER OR NOT SSGI IS ON, and velocity moved to 2 for it.
+ * A shifting index is how a shader writes albedo into the velocity target on
+ * the frames the albedo attachment is absent -- and TAA would then ghost for a
+ * reason nothing in the TAA code could explain.
  *
  * The velocity encoding is identical to fs_motion_vec.sc so fs_taa.sc consumes
  * it unchanged.  Zero motion -> (0.5,0.5), matching the shared MRT clear.
@@ -18,7 +24,8 @@ $input v_normal, v_curClip, v_prevClip
  * branches on that to produce the same encoding, and fs_taa.sc / fs_tsr.sc
  * branch on it again turning the NDC delta back into a UV offset.
  */
-uniform vec4 u_gbufferMat;   /* x = roughness */
+uniform vec4 u_gbufferMat;   /* x = roughness                 */
+uniform vec4 u_gbufferAlbedo;/* rgb = base colour, a = unused */
 
 void main()
 {
@@ -29,5 +36,6 @@ void main()
 	vec2 delta = (cur_ndc - prev_ndc);
 
 	gl_FragData[0] = vec4(n * 0.5 + 0.5, u_gbufferMat.x);
-	gl_FragData[1] = vec4(delta * 0.5 + 0.5, 0.0, 1.0);
+	gl_FragData[1] = vec4(u_gbufferAlbedo.rgb, 1.0);
+	gl_FragData[2] = vec4(delta * 0.5 + 0.5, 0.0, 1.0);
 }

@@ -467,7 +467,7 @@ one header two spellings depending on how the project was built.
 * `check_sdk_scripting_export.py` — every library `scripting/`
   declares either ships or carries a reasoned `# SDK-EXEMPT:` line, every
   installed target has the in-tree-named alias, and `JCEConfig.cmake.in` still
-  includes the fragment. Source-only; runs in `scripts/lint/run_all.py`.
+  includes the fragment. Source-only; runs in `tools/lint/run_all.py`.
 * `tests/sdk_smoke_scripting/` — a plain-C99 project built **out of tree**
   against an installed SDK: registers the Python backend, resolves `.py` to
   `python`, reads its script **out of its own cooked PAK**, and asserts

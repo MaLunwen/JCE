@@ -12,11 +12,13 @@
  */
 
 #include "jce_assetdb.h"
+#include "jce_asset_ref_rewrite.h"
 
 #include "io/jce_editor_file_util.h"
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_alloc.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_timer.h>
 
@@ -376,6 +378,72 @@ JceAssetKind jce_assetdb_get_kind(const char *path)
     jce_path_extension(second_buf, sizeof(second_buf), stem_buf);
     if (second_buf[0]) ext = std::string(second_buf) + ext;
     return classify(ext);
+}
+
+bool jce_assetdb_rename_asset(const char *old_path, const char *new_path,
+                              int *out_updated, int *out_unrepaired)
+{
+    if (out_updated)    *out_updated = 0;
+    if (out_unrepaired) *out_unrepaired = 0;
+    if (!old_path || !old_path[0] || !new_path || !new_path[0]) return false;
+
+    DB &d = db();
+
+    /* Collect the referrers BEFORE the rename: the reverse map is keyed on the
+     * old path, and rescanning first would lose every one of them. */
+    static char refs[512][512];
+    const int total = jce_assetdb_find_references(old_path, refs, 512);
+    const int n     = total < 512 ? total : 512;
+
+    /* The rel/basename pair as the referring files spell them.  rel comes from
+     * the DB when the asset is inside the project (the portable form scenes
+     * store); basename always. */
+    std::string old_rel, new_rel;
+    {
+        auto it = d.path_to_idx.find(norm(old_path));
+        if (it != d.path_to_idx.end()) old_rel = d.entries[(size_t)it->second].rel;
+    }
+    if (!old_rel.empty() && !d.project_root.empty()) {
+        const std::string np = norm(new_path);
+        const std::string rt = norm(d.project_root);
+        if (np.size() > rt.size() + 1 && np.compare(0, rt.size(), rt) == 0)
+            new_rel = np.substr(rt.size() + 1);
+    }
+    char ob[512] = {0}, nb[512] = {0};
+    jce_path_basename(ob, sizeof ob, old_path);
+    jce_path_basename(nb, sizeof nb, new_path);
+
+    if (!jce_fs_host_rename(old_path, new_path)) return false;
+
+    int updated = 0, unrepaired = 0;
+    for (int i = 0; i < n; ++i) {
+        size_t sz = 0;
+        char *raw = (char *)ed_read_file(refs[i], &sz);
+        if (!raw) { unrepaired++; continue; }
+        char  *out = nullptr;
+        size_t out_len = 0;
+        const int hits = jce_asset_ref_rewrite(
+            raw, sz,
+            old_rel.empty() ? nullptr : old_rel.c_str(),
+            new_rel.empty() ? nullptr : new_rel.c_str(),
+            ob[0] ? ob : nullptr, nb[0] ? nb : nullptr,
+            &out, &out_len);
+        ED_FREE(raw);
+        if (hits <= 0 || !out) { unrepaired++; continue; }
+        if (jce_fs_host_write_all(refs[i], out, out_len)) updated++;
+        else                                             unrepaired++;
+        jce_free(out);
+    }
+    /* Referrers past the 512 cap were never examined.  Counting them as
+     * unrepaired is the honest reading: "updated 512 files" over a project
+     * with 900 referrers would be a true sentence about the wrong set. */
+    if (total > n) unrepaired += total - n;
+
+    if (out_updated)    *out_updated = updated;
+    if (out_unrepaired) *out_unrepaired = unrepaired;
+
+    jce_assetdb_rescan();
+    return true;
 }
 
 int jce_assetdb_find_references(const char *asset_path,

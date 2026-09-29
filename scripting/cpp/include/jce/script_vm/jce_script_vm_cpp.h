@@ -242,6 +242,13 @@ typedef struct JceCppScriptClass {
     JceCppStatus (*on_anim_event)(void *self, uint32_t id, const char *name,
                                   float f0, float f1, int i0);
     /* ── APPEND ONLY BELOW THIS LINE ─────────────────────────────────── */
+
+    /* Once per PHYSICS step, with the fixed dt, immediately before that
+     * step -- Unity's FixedUpdate.  Zero or many times per rendered
+     * frame; on_update is the one that runs once per frame with a dt
+     * that varies with the frame rate.  Leave it NULL and it is simply
+     * not dispatched, the same as every other slot here. */
+    JceCppStatus (*on_fixed_update)(void *self, float dt);
 } JceCppScriptClass;
 
 /* One named global handler — the C++ answer to a global Lua function, which

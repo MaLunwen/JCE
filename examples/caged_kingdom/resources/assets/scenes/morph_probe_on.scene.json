@@ -1,0 +1,174 @@
+{
+ "contract": {
+  "name": "jce.scene",
+  "major": 1,
+  "minor": 0
+ },
+ "scene": {
+  "version": 1,
+  "entities": [
+   {
+    "id": 1,
+    "name": "Sun",
+    "parentId": 0,
+    "components": [
+     {
+      "type": "Transform",
+      "posX": 0.0,
+      "posY": 10.0,
+      "posZ": 6.0,
+      "rotX": 0,
+      "rotY": 0,
+      "rotZ": 0,
+      "scaleX": 1,
+      "scaleY": 1,
+      "scaleZ": 1
+     },
+     {
+      "type": "Light",
+      "lightType": 0,
+      "colorR": 1.0,
+      "colorG": 0.97,
+      "colorB": 0.92,
+      "intensity": 3.2,
+      "dirX": -0.35,
+      "dirY": -0.55,
+      "dirZ": -0.75,
+      "castsShadow": false
+     }
+    ]
+   },
+   {
+    "id": 3,
+    "name": "RefCube",
+    "parentId": 0,
+    "components": [
+     {
+      "type": "Transform",
+      "posX": -3.0,
+      "posY": 1.0,
+      "posZ": 0.0,
+      "rotX": 0,
+      "rotY": 0,
+      "rotZ": 0,
+      "scaleX": 1,
+      "scaleY": 1,
+      "scaleZ": 1
+     },
+     {
+      "type": "MeshRenderer",
+      "meshPath": "",
+      "materialPath": "",
+      "meshShape": 0,
+      "baseColorR": 0.15,
+      "baseColorG": 0.85,
+      "baseColorB": 0.25,
+      "baseColorA": 1.0,
+      "metallic": 0.0,
+      "roughness": 0.7,
+      "emissiveR": 0.0,
+      "emissiveG": 0.0,
+      "emissiveB": 0.0,
+      "normalScale": 1.0,
+      "aoStrength": 1.0,
+      "alphaMode": 0,
+      "alphaCutoff": 0.5,
+      "doubleSided": false,
+      "castsShadow": false,
+      "receivesShadow": false,
+      "visible": true
+     }
+    ]
+   },
+   {
+    "id": 2,
+    "name": "MorphProbe",
+    "parentId": 0,
+    "components": [
+     {
+      "type": "Transform",
+      "posX": 0.0,
+      "posY": 0.0,
+      "posZ": 0.0,
+      "rotX": 0,
+      "rotY": 0,
+      "rotZ": 0,
+      "scaleX": 1,
+      "scaleY": 1,
+      "scaleZ": 1
+     },
+     {
+      "type": "MeshRenderer",
+      "meshPath": "models/morph_probe.glb",
+      "materialPath": "",
+      "meshShape": 0,
+      "baseColorR": 0.95,
+      "baseColorG": 0.25,
+      "baseColorB": 0.15,
+      "baseColorA": 1.0,
+      "metallic": 0.0,
+      "roughness": 0.7,
+      "emissiveR": 0.0,
+      "emissiveG": 0.0,
+      "emissiveB": 0.0,
+      "normalScale": 1.0,
+      "aoStrength": 1.0,
+      "alphaMode": 0,
+      "alphaCutoff": 0.5,
+      "doubleSided": true,
+      "castsShadow": false,
+      "receivesShadow": false,
+      "visible": true
+     },
+     {
+      "type": "SkeletalAnimator",
+      "skeletonPath": "models/morph_probe.glb"
+     },
+     {
+      "type": "MorphWeights",
+      "count": 1,
+      "overrideMask": 1,
+      "weights": [
+       1.0
+      ]
+     }
+    ]
+   }
+  ],
+  "rendering": {
+   "version": 1,
+   "ambient": {
+    "color": [
+     0.3,
+     0.34,
+     0.4
+    ],
+    "intensity": 0.9
+   },
+   "sky": {
+    "mode": 1,
+    "topColor": [
+     0.24,
+     0.42,
+     0.72
+    ],
+    "horizonColor": [
+     0.7,
+     0.8,
+     0.92
+    ]
+   },
+   "fog": {
+    "enabled": false
+   },
+   "postfx": {
+    "tonemap": true,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "bloom": false,
+    "fxaa": false,
+    "vignette": false
+   }
+  }
+ }
+}

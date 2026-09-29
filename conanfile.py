@@ -11,6 +11,7 @@
 """
 
 from conan import ConanFile
+from conan.tools.build import cross_building
 from conan.tools.cmake import CMakeDeps, CMakeToolchain, cmake_layout
 
 
@@ -136,10 +137,12 @@ class JCEConan(ConanFile):
             # small — no OpenSSL build for the ai_dispatch transport.
             self.options["libcurl/*"].with_ssl = "schannel"
 
-        if self.settings.os in ("Emscripten", "Android", "iOS"):
-            # bgfx tools (shaderc) are host-only build tools; they can't run on
-            # WASM/Android/iOS targets. The host shaderc.exe is passed via
-            # -DJCE_SHADERC_EXECUTABLE in the cross-compile build scripts.
+        if cross_building(self):
+            # bgfx tools (shaderc) execute during the build and therefore must
+            # use the build-machine architecture.  This includes desktop
+            # cross-architecture builds such as Windows x64 -> ARM64, not only
+            # mobile/Web targets.  jce.py supplies the native host shaderc via
+            # -DJCE_SHADERC_EXECUTABLE.
             self.options["bgfx/*"].tools = False
 
         if self.settings.os == "Macos":
@@ -188,6 +191,7 @@ class JCEConan(ConanFile):
         self.requires("box2d/3.1.1")
         self.requires("bullet3/3.25")
 
+        self.requires("quickjs-ng/0.16.2")
         self.requires("lua/5.4.8")
         self.requires("rmlui/6.2")
 

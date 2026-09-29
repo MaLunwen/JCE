@@ -35,6 +35,42 @@ JCE_API bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
                                       uint32_t clear_rgba,
                                       const char *view_name);
 
+/* prepare(), but the view may KEEP what is already in the target instead of
+ * clearing it -- the base-camera half of Unity's four clear flags, which
+ * jce_scene_camera_clear_keeps() turns the authored enum into.
+ *
+ *   keep_color  the colour attachment survives, so this frame draws over the
+ *               last one (Depth Only).
+ *   keep_depth  depth AND stencil survive, so last frame's depth still
+ *               rejects fragments behind it (Don't Clear).  Stencil goes with
+ *               depth for the reason prepare() already documents: a clear
+ *               that touched one and not the other leaves a mask drifting.
+ *
+ * BOTH KEEPS ARE OVERRIDDEN ON THE FIRST FRAME OF A FRESHLY CREATED OR
+ * RESIZED TARGET, which is what makes them safe to expose at all: the colour
+ * and D24S8 textures are created with `NULL, 0`, so keeping them on frame one
+ * would present uninitialised memory -- and garbage depth near the near plane
+ * rejects every draw, which the target could never recover from.  The bridge
+ * owns this guard because it is the only thing that knows it is new; a caller
+ * cannot get it wrong by forgetting.
+ *
+ * prepare() is exactly this with both keeps false. */
+JCE_API bool jce_offscreen_target_prepare_keep(JceOffscreenTarget *bridge,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      const float *view16,
+                                      const float *proj16,
+                                      uint32_t clear_rgba,
+                                      bool keep_color,
+                                      bool keep_depth,
+                                      const char *view_name);
+
+/* True while the target still owes itself the full clear described above --
+ * i.e. it was created or resized and has not been prepared since.  Exposed so
+ * a measurement can tell "the keep was overridden because the target is new"
+ * apart from "the keep did not work". */
+JCE_API bool jce_offscreen_target_is_fresh(const JceOffscreenTarget *bridge);
+
 /* Bind another ordered view to the bridge's existing framebuffer without
  * clearing it.  This is used for passes that must retain both scene color and
  * depth while executing after an intermediate full-screen stage. */

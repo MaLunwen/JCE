@@ -1,0 +1,506 @@
+{
+ "spring": {
+  "day": {
+   "shadowColor": [
+    0.003,
+    0.074,
+    0.003
+   ],
+   "midColor": [
+    0.06,
+    0.23,
+    0.0
+   ],
+   "highlightColor": [
+    0.44,
+    0.5,
+    0.0
+   ],
+   "colorMultiplier": [
+    0.46,
+    0.65,
+    0.3
+   ],
+   "treeShadowColor": [
+    0.03,
+    0.07,
+    0.003
+   ],
+   "treeMidColor": [
+    0.06,
+    0.23,
+    0.0
+   ],
+   "treeHighlightColor": [
+    0.45,
+    0.55,
+    0.002
+   ],
+   "treeColorMultiplier": [
+    0.77,
+    0.71,
+    0.35
+   ],
+   "birchShadowColor": [
+    0.09,
+    0.03,
+    0.0
+   ],
+   "birchMidColor": [
+    0.2,
+    0.03,
+    0.0
+   ],
+   "birchHighlightColor": [
+    1.0,
+    0.58,
+    0.1
+   ],
+   "birchColorMultiplier": [
+    0.68,
+    0.56,
+    0.22
+   ]
+  },
+  "night": {
+   "shadowColor": [
+    0.001,
+    0.03,
+    0.02
+   ],
+   "midColor": [
+    0.02,
+    0.08,
+    0.05
+   ],
+   "highlightColor": [
+    0.15,
+    0.2,
+    0.15
+   ],
+   "colorMultiplier": [
+    0.09,
+    0.13,
+    0.007
+   ],
+   "treeShadowColor": [
+    0.01,
+    0.03,
+    0.001
+   ],
+   "treeMidColor": [
+    0.04,
+    0.1,
+    0.005
+   ],
+   "treeHighlightColor": [
+    0.2,
+    0.25,
+    0.05
+   ],
+   "treeColorMultiplier": [
+    0.25,
+    0.24,
+    0.001
+   ],
+   "birchShadowColor": [
+    0.03,
+    0.015,
+    0.0
+   ],
+   "birchMidColor": [
+    0.08,
+    0.015,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.3,
+    0.17,
+    0.03
+   ],
+   "birchColorMultiplier": [
+    0.3,
+    0.2,
+    0.01
+   ]
+  }
+ },
+ "winter": {
+  "day": {
+   "shadowColor": [
+    0.002,
+    0.04,
+    0.08
+   ],
+   "midColor": [
+    0.01,
+    0.25,
+    0.16
+   ],
+   "highlightColor": [
+    0.8,
+    0.8,
+    0.8
+   ],
+   "colorMultiplier": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "treeShadowColor": [
+    0.01,
+    0.13,
+    0.26
+   ],
+   "treeMidColor": [
+    0.015,
+    0.28,
+    0.27
+   ],
+   "treeHighlightColor": [
+    0.73,
+    0.75,
+    0.78
+   ],
+   "treeColorMultiplier": [
+    0.8,
+    0.8,
+    0.8
+   ],
+   "birchShadowColor": [
+    0.2,
+    0.09,
+    0.0
+   ],
+   "birchMidColor": [
+    0.4,
+    0.2,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.8,
+    0.85,
+    0.9
+   ],
+   "birchColorMultiplier": [
+    0.7,
+    0.7,
+    0.7
+   ]
+  },
+  "night": {
+   "shadowColor": [
+    0.001,
+    0.02,
+    0.04
+   ],
+   "midColor": [
+    0.02,
+    0.06,
+    0.12
+   ],
+   "highlightColor": [
+    0.15,
+    0.22,
+    0.35
+   ],
+   "colorMultiplier": [
+    0.1,
+    0.15,
+    0.25
+   ],
+   "treeShadowColor": [
+    0.01,
+    0.02,
+    0.04
+   ],
+   "treeMidColor": [
+    0.04,
+    0.08,
+    0.15
+   ],
+   "treeHighlightColor": [
+    0.2,
+    0.3,
+    0.4
+   ],
+   "treeColorMultiplier": [
+    0.25,
+    0.3,
+    0.4
+   ],
+   "birchShadowColor": [
+    0.04,
+    0.05,
+    0.08
+   ],
+   "birchMidColor": [
+    0.08,
+    0.1,
+    0.15
+   ],
+   "birchHighlightColor": [
+    0.35,
+    0.4,
+    0.5
+   ],
+   "birchColorMultiplier": [
+    0.3,
+    0.35,
+    0.45
+   ]
+  }
+ },
+ "autumn": {
+  "day": {
+   "shadowColor": [
+    0.12,
+    0.04,
+    0.001
+   ],
+   "midColor": [
+    0.35,
+    0.15,
+    0.03
+   ],
+   "highlightColor": [
+    0.95,
+    0.6,
+    0.2
+   ],
+   "colorMultiplier": [
+    0.85,
+    0.5,
+    0.25
+   ],
+   "treeShadowColor": [
+    0.08,
+    0.05,
+    0.01
+   ],
+   "treeMidColor": [
+    0.33,
+    0.05,
+    0.004
+   ],
+   "treeHighlightColor": [
+    0.85,
+    0.63,
+    0.0
+   ],
+   "treeColorMultiplier": [
+    0.9,
+    0.6,
+    0.3
+   ],
+   "birchShadowColor": [
+    0.09,
+    0.003,
+    0.004
+   ],
+   "birchMidColor": [
+    0.21,
+    0.01,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.8,
+    0.317,
+    0.058
+   ],
+   "birchColorMultiplier": [
+    0.9,
+    0.3,
+    0.2
+   ]
+  },
+  "night": {
+   "shadowColor": [
+    0.0384,
+    0.0128,
+    0.00032
+   ],
+   "midColor": [
+    0.112,
+    0.048,
+    0.0096
+   ],
+   "highlightColor": [
+    0.304,
+    0.192,
+    0.064
+   ],
+   "colorMultiplier": [
+    0.272,
+    0.16,
+    0.08
+   ],
+   "treeShadowColor": [
+    0.0256,
+    0.016,
+    0.0032
+   ],
+   "treeMidColor": [
+    0.1056,
+    0.016,
+    0.00128
+   ],
+   "treeHighlightColor": [
+    0.272,
+    0.2016,
+    0.0
+   ],
+   "treeColorMultiplier": [
+    0.288,
+    0.192,
+    0.096
+   ],
+   "birchShadowColor": [
+    0.0288,
+    0.00096,
+    0.00128
+   ],
+   "birchMidColor": [
+    0.0672,
+    0.0032,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.256,
+    0.10144,
+    0.01856
+   ],
+   "birchColorMultiplier": [
+    0.288,
+    0.096,
+    0.064
+   ]
+  }
+ },
+ "rainy": {
+  "day": {
+   "shadowColor": [
+    0.0,
+    0.019,
+    0.019
+   ],
+   "midColor": [
+    0.011,
+    0.05,
+    0.007
+   ],
+   "highlightColor": [
+    0.102,
+    0.2,
+    0.019
+   ],
+   "colorMultiplier": [
+    0.148,
+    0.405,
+    0.094
+   ],
+   "treeShadowColor": [
+    0.0,
+    0.019,
+    0.019
+   ],
+   "treeMidColor": [
+    0.011,
+    0.05,
+    0.007
+   ],
+   "treeHighlightColor": [
+    0.102,
+    0.2,
+    0.019
+   ],
+   "treeColorMultiplier": [
+    0.148,
+    0.405,
+    0.094
+   ],
+   "birchShadowColor": [
+    0.029,
+    0.027,
+    0.0
+   ],
+   "birchMidColor": [
+    0.061,
+    0.027,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.19,
+    0.2,
+    0.01
+   ],
+   "birchColorMultiplier": [
+    0.68,
+    0.56,
+    0.22
+   ]
+  },
+  "night": {
+   "shadowColor": [
+    0.0,
+    0.017,
+    0.005
+   ],
+   "midColor": [
+    0.004,
+    0.046,
+    0.013
+   ],
+   "highlightColor": [
+    0.029,
+    0.114,
+    0.04
+   ],
+   "colorMultiplier": [
+    0.018,
+    0.074,
+    0.002
+   ],
+   "treeShadowColor": [
+    0.002,
+    0.017,
+    0.0
+   ],
+   "treeMidColor": [
+    0.008,
+    0.057,
+    0.002
+   ],
+   "treeHighlightColor": [
+    0.038,
+    0.143,
+    0.013
+   ],
+   "treeColorMultiplier": [
+    0.048,
+    0.137,
+    0.0
+   ],
+   "birchShadowColor": [
+    0.006,
+    0.009,
+    0.0
+   ],
+   "birchMidColor": [
+    0.015,
+    0.009,
+    0.0
+   ],
+   "birchHighlightColor": [
+    0.14,
+    0.15,
+    0.0
+   ],
+   "birchColorMultiplier": [
+    0.48,
+    0.36,
+    0.02
+   ]
+  }
+ }
+}

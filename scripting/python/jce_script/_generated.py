@@ -22,21 +22,28 @@
 #
 # NOT EXPOSED — the manifest's seven hand-written entries, as a
 # class, with its own reason text, plus json_null:
+#   line_set_points
+#       marshalling, not glue: the host takes a packed `const float *xyz, int
+#       count` and no generated shape reads a Lua array into one. Hand-written
+#       so the table walk, the JCE_LINE_MAX_POINTS clamp and the returned
+#       stored-count live in one place. Exists because the comp_set/JSON route
+#       is O(n^2): cJSON resolves each flat px/py/pz key by walking the
+#       object's child list (jce_scene_components_render.c parse_line_renderer)
 #   log
-#       no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the
+#       no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the
 #       only one among the 78
 #   asset_read_text
-#       policy, not glue: script_virtual_asset_path_valid (:66, called :102),
-#       the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86),
+#       policy, not glue: script_virtual_asset_path_valid (:67, called :103),
+#       the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:114),
 #       jce_free on every exit path. A generated read_file template is a
 #       sandbox escape (P0-2)
 #   asset_read_json
 #       all of asset_read_text (the same script_virtual_asset_path_valid at
-#       :219) plus a depth- and node-capped JSON walk, non-finite rejection,
+#       :220) plus a depth- and node-capped JSON walk, non-finite rejection,
 #       the json_null sentinel and distinct string error codes (P0-2)
 #   play_sound
-#       arity dispatch across two members: lua_gettop at :263 routes to
-#       play_sound_spatial (:286) or play_sound (:289); its own comment at :280
+#       arity dispatch across two members: lua_gettop at :264 routes to
+#       play_sound_spatial (:287) or play_sound (:290); its own comment at :281
 #       concedes top == 3 is ambiguous
 #   start_coroutine
 #       Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume;
@@ -151,7 +158,7 @@ def _owned(fn, args, what: str):
         f"{OWNED_STRING_MAX_ATTEMPTS} attempts")
 
 SCRIPT_API_VERSION = 1
-ENTRY_COUNT = 71
+ENTRY_COUNT = 101
 
 ENTRY_NAMES = (
     "get_position",
@@ -159,6 +166,7 @@ ENTRY_NAMES = (
     "get_rotation",
     "set_rotation",
     "get_scale",
+    "get_world_position",
     "set_scale",
     "set_parent",
     "get_parent",
@@ -180,6 +188,8 @@ ENTRY_NAMES = (
     "gas_get",
     "gas_apply",
     "raycast",
+    "raycast_filtered",
+    "raycast_all",
     "apply_impulse",
     "set_velocity",
     "anim_set_float",
@@ -203,6 +213,8 @@ ENTRY_NAMES = (
     "get_move",
     "ui_get_slider",
     "ui_set_slider",
+    "ui_get_progress",
+    "ui_set_progress",
     "ui_get_toggle",
     "ui_set_toggle",
     "ui_set_text",
@@ -225,20 +237,47 @@ ENTRY_NAMES = (
     "render_get",
     "render_set",
     "audio_set_volume",
+    "ui_get_dropdown",
+    "ui_set_dropdown",
+    "ui_get_input_text",
+    "ui_set_input_text",
+    "ui_get_scroll",
+    "ui_set_scroll",
+    "world_get_hour",
+    "world_set_hour",
+    "world_is_daytime",
+    "world_get_weather",
+    "world_get_weather_intensity",
+    "world_get_wind_speed",
+    "request_scene",
+    "is_transitioning",
+    "audio_play",
+    "audio_stop",
+    "audio_is_playing",
+    "save_game",
+    "load_game",
+    "overlap_sphere",
+    "overlap_box",
+    "get_param",
+    "get_param_text",
+    "curve_eval",
+    "vcam_activate",
 )
 
 # Every Lua table key this module deliberately does not carry, with the
 # reason it does not.  A name may not leave the Lua surface and vanish
 # from here silently; the differential's key-set case reads BOTH.
 NOT_EXPOSED = {
+    "line_set_points":
+        "marshalling, not glue: the host takes a packed `const float *xyz, int count` and no generated shape reads a Lua array into one. Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and the returned stored-count live in one place. Exists because the comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key by walking the object's child list (jce_scene_components_render.c parse_line_renderer)",
     "log":
-        'no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the only one among the 78',
+        'no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the only one among the 78',
     "asset_read_text":
-        'policy, not glue: script_virtual_asset_path_valid (:66, called :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)',
+        'policy, not glue: script_virtual_asset_path_valid (:67, called :103), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:114), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)',
     "asset_read_json":
-        'all of asset_read_text (the same script_virtual_asset_path_valid at :219) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)',
+        'all of asset_read_text (the same script_virtual_asset_path_valid at :220) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)',
     "play_sound":
-        'arity dispatch across two members: lua_gettop at :263 routes to play_sound_spatial (:286) or play_sound (:289); its own comment at :280 concedes top == 3 is ambiguous',
+        'arity dispatch across two members: lua_gettop at :264 routes to play_sound_spatial (:287) or play_sound (:290); its own comment at :281 concedes top == 3 is ambiguous',
     "start_coroutine":
         'Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume; owns s->coros[]',
     "wait_seconds":
@@ -284,6 +323,7 @@ class _Entries:
         "get_rotation",
         "set_rotation",
         "get_scale",
+        "get_world_position",
         "set_scale",
         "set_parent",
         "get_parent",
@@ -305,6 +345,8 @@ class _Entries:
         "gas_get",
         "gas_apply",
         "raycast",
+        "raycast_filtered",
+        "raycast_all",
         "apply_impulse",
         "set_velocity",
         "anim_set_float",
@@ -328,6 +370,8 @@ class _Entries:
         "get_move",
         "ui_get_slider",
         "ui_set_slider",
+        "ui_get_progress",
+        "ui_set_progress",
         "ui_get_toggle",
         "ui_set_toggle",
         "ui_set_text",
@@ -350,6 +394,31 @@ class _Entries:
         "render_get",
         "render_set",
         "audio_set_volume",
+        "ui_get_dropdown",
+        "ui_set_dropdown",
+        "ui_get_input_text",
+        "ui_set_input_text",
+        "ui_get_scroll",
+        "ui_set_scroll",
+        "world_get_hour",
+        "world_set_hour",
+        "world_is_daytime",
+        "world_get_weather",
+        "world_get_weather_intensity",
+        "world_get_wind_speed",
+        "request_scene",
+        "is_transitioning",
+        "audio_play",
+        "audio_stop",
+        "audio_is_playing",
+        "save_game",
+        "load_game",
+        "overlap_sphere",
+        "overlap_box",
+        "get_param",
+        "get_param_text",
+        "curve_eval",
+        "vcam_activate",
     )
 
     def __init__(self, lib: ctypes.CDLL) -> None:
@@ -371,6 +440,9 @@ class _Entries:
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float, ctypes.c_float, ctypes.c_float])
         self.get_scale = _decl(
             lib, "jce_script_api_get_scale", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float * 3])
+        self.get_world_position = _decl(
+            lib, "jce_script_api_get_world_position", ctypes.c_bool,
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float * 3])
         self.set_scale = _decl(
             lib, "jce_script_api_set_scale", None,
@@ -435,6 +507,12 @@ class _Entries:
         self.raycast = _decl(
             lib, "jce_script_api_raycast", ctypes.c_bool,
             [ctypes.c_void_p, ctypes.c_float * 3, ctypes.c_float * 3, ctypes.c_float, ctypes.POINTER(_RaycastHit)])
+        self.raycast_filtered = _decl(
+            lib, "jce_script_api_raycast_filtered", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_float * 3, ctypes.c_float * 3, ctypes.c_float, ctypes.c_uint32, ctypes.c_bool, ctypes.POINTER(_RaycastHit)])
+        self.raycast_all = _decl(
+            lib, "jce_script_api_raycast_all", ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_float * 3, ctypes.c_float * 3, ctypes.c_float, ctypes.c_uint32, ctypes.c_bool, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int])
         self.apply_impulse = _decl(
             lib, "jce_script_api_apply_impulse", None,
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float, ctypes.c_float, ctypes.c_float])
@@ -504,6 +582,12 @@ class _Entries:
         self.ui_set_slider = _decl(
             lib, "jce_script_api_ui_set_slider", None,
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float])
+        self.ui_get_progress = _decl(
+            lib, "jce_script_api_ui_get_progress", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)])
+        self.ui_set_progress = _decl(
+            lib, "jce_script_api_ui_set_progress", None,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float])
         self.ui_get_toggle = _decl(
             lib, "jce_script_api_ui_get_toggle", ctypes.c_bool,
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_bool)])
@@ -570,6 +654,81 @@ class _Entries:
         self.audio_set_volume = _decl(
             lib, "jce_script_api_audio_set_volume", None,
             [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float])
+        self.ui_get_dropdown = _decl(
+            lib, "jce_script_api_ui_get_dropdown", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int)])
+        self.ui_set_dropdown = _decl(
+            lib, "jce_script_api_ui_set_dropdown", None,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int])
+        self.ui_get_input_text = _decl(
+            lib, "jce_script_api_ui_get_input_text", ctypes.c_char_p,
+            [ctypes.c_void_p, ctypes.c_uint64])
+        self.ui_set_input_text = _decl(
+            lib, "jce_script_api_ui_set_input_text", None,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p])
+        self.ui_get_scroll = _decl(
+            lib, "jce_script_api_ui_get_scroll", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float * 2])
+        self.ui_set_scroll = _decl(
+            lib, "jce_script_api_ui_set_scroll", None,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_float, ctypes.c_float])
+        self.world_get_hour = _decl(
+            lib, "jce_script_api_world_get_hour", ctypes.c_float,
+            [ctypes.c_void_p])
+        self.world_set_hour = _decl(
+            lib, "jce_script_api_world_set_hour", None,
+            [ctypes.c_void_p, ctypes.c_float])
+        self.world_is_daytime = _decl(
+            lib, "jce_script_api_world_is_daytime", ctypes.c_bool,
+            [ctypes.c_void_p])
+        self.world_get_weather = _decl(
+            lib, "jce_script_api_world_get_weather", ctypes.c_int,
+            [ctypes.c_void_p])
+        self.world_get_weather_intensity = _decl(
+            lib, "jce_script_api_world_get_weather_intensity", ctypes.c_float,
+            [ctypes.c_void_p])
+        self.world_get_wind_speed = _decl(
+            lib, "jce_script_api_world_get_wind_speed", ctypes.c_float,
+            [ctypes.c_void_p])
+        self.request_scene = _decl(
+            lib, "jce_script_api_request_scene", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p])
+        self.is_transitioning = _decl(
+            lib, "jce_script_api_is_transitioning", ctypes.c_bool,
+            [ctypes.c_void_p])
+        self.audio_play = _decl(
+            lib, "jce_script_api_audio_play", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64])
+        self.audio_stop = _decl(
+            lib, "jce_script_api_audio_stop", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64])
+        self.audio_is_playing = _decl(
+            lib, "jce_script_api_audio_is_playing", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64])
+        self.save_game = _decl(
+            lib, "jce_script_api_save_game", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p])
+        self.load_game = _decl(
+            lib, "jce_script_api_load_game", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p])
+        self.overlap_sphere = _decl(
+            lib, "jce_script_api_overlap_sphere", ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int])
+        self.overlap_box = _decl(
+            lib, "jce_script_api_overlap_box", ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int])
+        self.get_param = _decl(
+            lib, "jce_script_api_get_param", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_uint64)])
+        self.get_param_text = _decl(
+            lib, "jce_script_api_get_param_text", ctypes.c_char_p,
+            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p])
+        self.curve_eval = _decl(
+            lib, "jce_script_api_curve_eval", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_double, ctypes.POINTER(ctypes.c_double)])
+        self.vcam_activate = _decl(
+            lib, "jce_script_api_vcam_activate", ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p])
 
 
 class Api:
@@ -596,8 +755,12 @@ class Api:
     def get_position(self, e: int) -> tuple[float, float, float] | None:
         """jce.get_position — shape: fallible_out, since 1.
 
-        World-space position of `entity`. Absent when the entity has no
-        transform.
+        LOCAL position of `entity` -- its own translation, not composed up the
+        parent chain. Absent when the entity has no transform. Use
+        get_world_position for the composed pose. This doc said 'World-space'
+        until 2026-08-26; the implementation always returned the local TRS
+        (jce_scene_get_transform), and the wrong word was generated into all
+        five language SDKs.
         """
         out_xyz = (ctypes.c_float * 3)()
         if not self._f.get_position(self._h, e, out_xyz):
@@ -629,6 +792,19 @@ class Api:
         """
         out_xyz = (ctypes.c_float * 3)()
         if not self._f.get_scale(self._h, e, out_xyz):
+            return None
+        return (out_xyz[0], out_xyz[1], out_xyz[2],)
+
+    def get_world_position(self, e: int) -> tuple[float, float, float] | None:
+        """jce.get_world_position — shape: fallible_out, since 1.
+
+        WORLD position of `entity`: its local TRS composed up the parent chain
+        (jce_scene_get_world_matrix). Absent when the entity has no transform.
+        Every parented rig -- arms, jaws, fingers, pads -- needs this rather
+        than get_position.
+        """
+        out_xyz = (ctypes.c_float * 3)()
+        if not self._f.get_world_position(self._h, e, out_xyz):
             return None
         return (out_xyz[0], out_xyz[1], out_xyz[2],)
 
@@ -798,6 +974,52 @@ class Api:
             return 0
         return (out.entity, out.point_0, out.point_1, out.point_2, out.normal_0, out.normal_1, out.normal_2, out.distance,)
 
+    def raycast_filtered(self, origin: Sequence[float], dir: Sequence[float], max_dist: float, layer_mask: int | None = 0, hit_triggers: bool | None = False) -> tuple[int, float, float, float, float, float, float, float] | int:
+        """jce.raycast_filtered — shape: fallible_out, since 1.
+
+        Closest hit along the ray, honouring a layer mask and the trigger skip
+        -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts
+        branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every
+        layer and hit_triggers defaults to false, so the common call stays
+        origin/dir/distance and the filter is what you add when you need it.
+        hit_triggers is separate from the mask because a trigger volume is not
+        a layer: collapsing them would make 'ignore triggers on layer 3'
+        inexpressible.
+
+        A miss answers 0, not None — scripts branch on it.
+        """
+        _origin = _f(origin, 3, ctypes.c_float * 3, 'raycast_filtered')
+        _dir = _f(dir, 3, ctypes.c_float * 3, 'raycast_filtered')
+        if layer_mask is None:
+            layer_mask = 0
+        if hit_triggers is None:
+            hit_triggers = False
+        out = _RaycastHit()
+        if not self._f.raycast_filtered(self._h, _origin, _dir, max_dist, layer_mask, bool(hit_triggers), ctypes.byref(out)):
+            return 0
+        return (out.entity, out.point_0, out.point_1, out.point_2, out.normal_0, out.normal_1, out.normal_2, out.distance,)
+
+    def raycast_all(self, origin: Sequence[float], dir: Sequence[float], max_dist: float, layer_mask: int | None = 0, hit_triggers: bool | None = False) -> list[int]:
+        """jce.raycast_all — shape: entity_table, since 1.
+
+        Every entity the ray passes through, as one array sorted near to far.
+        layer_mask 0 means every layer; hit_triggers defaults to false. Returns
+        ENTITIES rather than full hit records because the eight-value hit does
+        not survive as an array shape across seven languages without inventing
+        a per-language container -- re-query a specific one with
+        jce.raycast_filtered when you need its point and normal.
+        """
+        _origin = _f(origin, 3, ctypes.c_float * 3, 'raycast_all')
+        _dir = _f(dir, 3, ctypes.c_float * 3, 'raycast_all')
+        if layer_mask is None:
+            layer_mask = 0
+        if hit_triggers is None:
+            hit_triggers = False
+        found = (ctypes.c_uint64 * 256)()
+        n = self._f.raycast_all(self._h, _origin, _dir, max_dist, layer_mask, bool(hit_triggers), found, 256)
+        n = min(n, 256)
+        return [found[i] for i in range(n)] if n > 0 else []
+
     def apply_impulse(self, e: int, x: float, y: float, z: float) -> None:
         """jce.apply_impulse — shape: void_call, since 1.
         """
@@ -958,6 +1180,20 @@ class Api:
         self._f.ui_set_slider(self._h, e, v)
         return None
 
+    def ui_get_progress(self, e: int) -> tuple[float] | None:
+        """jce.ui_get_progress — shape: fallible_out, since 1.
+        """
+        out = ctypes.c_float()
+        if not self._f.ui_get_progress(self._h, e, ctypes.byref(out)):
+            return None
+        return (out.value,)
+
+    def ui_set_progress(self, e: int, v: float) -> None:
+        """jce.ui_set_progress — shape: void_call, since 1.
+        """
+        self._f.ui_set_progress(self._h, e, v)
+        return None
+
     def ui_get_toggle(self, e: int) -> tuple[bool] | None:
         """jce.ui_get_toggle — shape: fallible_out, since 1.
         """
@@ -1103,3 +1339,255 @@ class Api:
         """
         self._f.audio_set_volume(self._h, e, volume)
         return None
+
+    def ui_get_dropdown(self, e: int) -> tuple[int] | None:
+        """jce.ui_get_dropdown — shape: fallible_out, since 1.
+
+        Selected option INDEX of `entity`'s UIDropdown. Absent when the entity
+        has no dropdown, so a script can tell 'no dropdown' from 'a dropdown
+        reading 0'. The index and not the label: branching on which option is
+        the common case, and a label would make it a string compare.
+        """
+        out = ctypes.c_int()
+        if not self._f.ui_get_dropdown(self._h, e, ctypes.byref(out)):
+            return None
+        return (out.value,)
+
+    def ui_set_dropdown(self, e: int, index: int) -> None:
+        """jce.ui_set_dropdown — shape: void_call, since 1.
+
+        Select an option by INDEX. Clamped into [0, option_count-1] rather than
+        refused, the way ui_set_progress clamps and the way the scene loader
+        clamps: the draw already clamps, so storing outside the range would
+        make the component and the picture disagree.
+        """
+        self._f.ui_set_dropdown(self._h, e, index)
+        return None
+
+    def ui_get_input_text(self, e: int) -> str:
+        """jce.ui_get_input_text — shape: value_return, since 1.
+
+        Current text of `entity`'s UIInputField, or '' when it has none. The
+        string is the component's own buffer and is valid until the next
+        mutation of that entity -- the same contract tr() and get_locale()
+        carry; every binding copies it and none may store it.
+        """
+        v = self._f.ui_get_input_text(self._h, e)
+        return v.decode("utf-8", "replace") if v is not None else ""
+
+    def ui_set_input_text(self, e: int, text: str) -> None:
+        """jce.ui_set_input_text — shape: void_call, since 1.
+
+        Replace the UIInputField's text. Truncated to the field's capacity and
+        to char_limit when one is set -- the same cap the canvas applies to
+        typed input, so a script write and a keystroke cannot disagree about
+        what the field holds. A truncation is logged rather than silent.
+        """
+        self._f.ui_set_input_text(self._h, e, _s(text))
+        return None
+
+    def ui_get_scroll(self, e: int) -> tuple[float, float] | None:
+        """jce.ui_get_scroll — shape: fallible_out, since 1.
+
+        Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units --
+        what the component stores and what the wheel path clamps, not device
+        px. Absent when the entity has no scroll view.
+        """
+        out_xy = (ctypes.c_float * 2)()
+        if not self._f.ui_get_scroll(self._h, e, out_xy):
+            return None
+        return (out_xy[0], out_xy[1],)
+
+    def ui_set_scroll(self, e: int, x: float, y: float) -> None:
+        """jce.ui_set_scroll — shape: void_call, since 1.
+
+        Set the scroll offset in reference units. A disabled axis is pinned to
+        0 and each axis is clamped the way the wheel path clamps, so a script
+        cannot push the offset somewhere a wheel could not; the canvas
+        re-clamps against the resolved viewport on the next render.
+        """
+        self._f.ui_set_scroll(self._h, e, x, y)
+        return None
+
+    def world_get_hour(self) -> float:
+        """jce.world_get_hour — shape: value_return, since 1.
+
+        Live hour of day in [0, 24) -- what the sky is showing now, NOT the
+        authored tod_hour seed a scene starts from. Reading the seed would
+        return the level's start-of-day forever while the sky moved.
+        """
+        return self._f.world_get_hour(self._h)
+
+    def world_set_hour(self, hour: float) -> None:
+        """jce.world_set_hour — shape: void_call, since 1.
+
+        Move the live clock, wrapping into [0, 24). For 'sleep until dawn'. The
+        authored seed is untouched, so reloading the scene still starts where
+        the designer set it.
+        """
+        self._f.world_set_hour(self._h, hour)
+        return None
+
+    def world_is_daytime(self) -> bool:
+        """jce.world_is_daytime — shape: value_return, since 1.
+
+        True while the sun is above the horizon. THE predicate for 'is it
+        night?' -- every key-light chooser in the engine is required to agree
+        on this one, so a script that rolled its own threshold would disagree
+        with the lighting it can see.
+        """
+        return self._f.world_is_daytime(self._h)
+
+    def world_get_weather(self) -> int:
+        """jce.world_get_weather — shape: value_return, since 1.
+
+        Authored weather type: 0 clear, 1 rain, 2 snow.
+        """
+        return self._f.world_get_weather(self._h)
+
+    def world_get_weather_intensity(self) -> float:
+        """jce.world_get_weather_intensity — shape: value_return, since 1.
+
+        Authored weather intensity in [0, 1].
+        """
+        return self._f.world_get_weather_intensity(self._h)
+
+    def world_get_wind_speed(self) -> float:
+        """jce.world_get_wind_speed — shape: value_return, since 1.
+
+        Instantaneous wind speed in m/s -- the sustained speed plus this
+        moment's gust. Do NOT key a cache on it: it changes every frame by
+        design. It is the same number the ocean spectrum and the vegetation
+        shader read, so a script cannot disagree with what is on screen.
+        """
+        return self._f.world_get_wind_speed(self._h)
+
+    def request_scene(self, scene_path: str) -> bool:
+        """jce.request_scene — shape: value_return, since 1.
+        """
+        return self._f.request_scene(self._h, _s(scene_path))
+
+    def is_transitioning(self) -> bool:
+        """jce.is_transitioning — shape: value_return, since 1.
+        """
+        return self._f.is_transitioning(self._h)
+
+    def audio_play(self, e: int) -> bool:
+        """jce.audio_play — shape: value_return, since 1.
+        """
+        return self._f.audio_play(self._h, e)
+
+    def audio_stop(self, e: int) -> bool:
+        """jce.audio_stop — shape: value_return, since 1.
+        """
+        return self._f.audio_stop(self._h, e)
+
+    def audio_is_playing(self, e: int) -> bool:
+        """jce.audio_is_playing — shape: value_return, since 1.
+        """
+        return self._f.audio_is_playing(self._h, e)
+
+    def save_game(self, path: str) -> bool:
+        """jce.save_game — shape: value_return, since 1.
+        """
+        return self._f.save_game(self._h, _s(path))
+
+    def load_game(self, path: str) -> bool:
+        """jce.load_game — shape: value_return, since 1.
+        """
+        return self._f.load_game(self._h, _s(path))
+
+    def overlap_sphere(self, x: float, y: float, z: float, radius: float, layer_mask: int | None = 0) -> list[int]:
+        """jce.overlap_sphere — shape: entity_table, since 1.
+
+        Entities whose collider overlaps the sphere, as one array. layer_mask 0
+        means all layers. Triggers are skipped. layer_mask is OPTIONAL:
+        omitting it means every layer, which is what an explosion or a pickup
+        check wants and keeps the common call to its coordinates and its size.
+        """
+        if layer_mask is None:
+            layer_mask = 0
+        found = (ctypes.c_uint64 * 256)()
+        n = self._f.overlap_sphere(self._h, x, y, z, radius, layer_mask, found, 256)
+        n = min(n, 256)
+        return [found[i] for i in range(n)] if n > 0 else []
+
+    def overlap_box(self, x: float, y: float, z: float, hx: float, hy: float, hz: float, layer_mask: int | None = 0) -> list[int]:
+        """jce.overlap_box — shape: entity_table, since 1.
+
+        Entities whose collider overlaps the axis-aligned box (half-extents),
+        as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL:
+        omitting it means every layer, which is what an explosion or a pickup
+        check wants and keeps the common call to its coordinates and its size.
+        """
+        if layer_mask is None:
+            layer_mask = 0
+        found = (ctypes.c_uint64 * 256)()
+        n = self._f.overlap_box(self._h, x, y, z, hx, hy, hz, layer_mask, found, 256)
+        n = min(n, 256)
+        return [found[i] for i in range(n)] if n > 0 else []
+
+    def get_param(self, e: int, name: str) -> tuple[int, float, int] | None:
+        """jce.get_param — shape: fallible_out, since 1.
+
+        Returns kind, number, entity for an AUTHORED script parameter --
+        Unity's [SerializeField], Godot's @export. Returns nil when the entity
+        has no script component, when no parameter of that name is authored, or
+        when the name is empty: three absences a script cannot act differently
+        on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author
+        expects.
+        """
+        out_kind = ctypes.c_int()
+        out_number = ctypes.c_double()
+        out_entity = ctypes.c_uint64()
+        if not self._f.get_param(self._h, e, _s(name), ctypes.byref(out_kind), ctypes.byref(out_number), ctypes.byref(out_entity)):
+            return None
+        return (out_kind.value, out_number.value, out_entity.value,)
+
+    def get_param_text(self, e: int, name: str) -> str:
+        """jce.get_param_text — shape: value_return, since 1.
+
+        The TEXT value of an authored script parameter, or '' when the entity
+        has no script component, no parameter of that name, or one that is not
+        text. Empty rather than nil for the same reason ui_get_input_text is
+        empty: a script comparing strings should not have to test for nil
+        first. The string is the component's own buffer -- copy it if you keep
+        it.
+        """
+        v = self._f.get_param_text(self._h, e, _s(name))
+        return v.decode("utf-8", "replace") if v is not None else ""
+
+    def curve_eval(self, path: str, channel: str, t: float) -> tuple[float] | None:
+        """jce.curve_eval — shape: fallible_out, since 1.
+
+        Sample an AUTHORED curve -- the documents the editor's Curve Editor
+        writes, which nothing could read until this binding existed. Unity's
+        AnimationCurve shape: the curve is a designer-authored function and the
+        script decides what it means, so the engine never has to invent what a
+        curve DRIVES. Returns nil when the path does not resolve, the document
+        does not parse, the named channel is absent, or that channel has no
+        keys -- so a curve that genuinely evaluates to 0 and a curve that is
+        not there are never one reading, and `jce.curve_eval(p, 'kick', t) or
+        0.0` reads the way an author expects. An empty channel name means the
+        FIRST channel, which is a different request from a name that is not
+        there. The parsed curve is cached per runtime, so a call inside
+        on_update costs a name compare, not a JSON parse.
+        """
+        out_value = ctypes.c_double()
+        if not self._f.curve_eval(self._h, _s(path), _s(channel), t, ctypes.byref(out_value)):
+            return None
+        return (out_value.value,)
+
+    def vcam_activate(self, name: str) -> int:
+        """jce.vcam_activate — shape: value_return, since 1.
+
+        Cut to the virtual camera with this name, ahead of priority. Returns 1
+        when the name resolves to a camera that is active and enabled, 0
+        otherwise -- the request is recorded either way, so naming a camera in
+        a streaming cell that has not loaded yet does not silently become
+        'whatever priority says'. Pass an empty string to clear it and hand the
+        decision back to priority. It does NOT rewrite the authored components:
+        the override lives in the vcam system, so a cutscene cannot bake its
+        camera choice into the level file.
+        """
+        return self._f.vcam_activate(self._h, _s(name))

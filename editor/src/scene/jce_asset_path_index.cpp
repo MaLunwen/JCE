@@ -339,9 +339,7 @@ extern "C" {
 void jce_asset_path_index_clear(void)
 {
     if (g_aidx_task) {
-        (void)jce_async_task_cancel(g_aidx_task);
-        jce_async_task_wait(g_aidx_task);
-        jce_async_task_release(g_aidx_task);
+        (void)jce_async_task_discard(g_aidx_task);
         g_aidx_task = nullptr;
         delete g_aidx_job;
         g_aidx_job = nullptr;

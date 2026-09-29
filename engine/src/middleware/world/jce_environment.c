@@ -56,6 +56,7 @@ JceEnvironmentState JCE_CALL jce_environment_default(void)
     s.world_time_seconds = 0.0;
     s.day_fraction       = 0.5f;         /* noon */
     s.seconds_per_day    = 86400.0f;
+    s.day_seed_hour      = -1.0f;        /* never seeded from an authored hour */
 
     /* Sun overhead and slightly south; moon opposite it so the pair is never
      * both above the horizon at the default, which would make "which is the

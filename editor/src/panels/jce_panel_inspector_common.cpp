@@ -19,10 +19,22 @@ InspDrag          s_drag            = { 0, JCE_COMP_ID_INVALID,
 
 /* ── Undo tracking helpers ─────────────────────────────────────────── */
 
+/* Set by INSP_DRAWFN around each component drawer; 0 outside one. */
+static uint32_t s_insp_edit_scope = 0u;
+
+void insp_set_edit_scope(uint32_t entity_id)
+{
+    s_insp_edit_scope = entity_id;
+}
+
 void insp_track_edit(void)
 {
     if (ImGui::IsItemActivated() && !s_insp_batch_open) {
-        jce_state_begin_batch_edit();
+        /* Scoped when the drawer told us whose component this is -- one
+         * entity's record instead of two full-scene serialisations.  Zero
+         * falls back to the unscoped form, so any drawer reached another way
+         * behaves exactly as before. */
+        jce_state_begin_entity_edit(s_insp_edit_scope);
         s_insp_batch_open = true;
     }
     if (ImGui::IsItemDeactivated() && s_insp_batch_open) {
@@ -43,6 +55,23 @@ void insp_unwired_badge(void)
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", jce_editor_i18n("inspector.unwiredBadge.tip"));
+}
+
+/* Per-FIELD version of insp_unwired_badge.
+ *
+ * The component-wide badge says "the engine runtime does not consume it yet",
+ * which stops being true the moment ONE field gets wired -- and then it is
+ * telling the user to distrust the parts that work.  Measured on the Avatar
+ * component 2026-08-31: jce_sr_anim.c reads mask_path 4 times, layers twice
+ * and apply_root_motion once, while avatar_path and override_controller are
+ * read zero times.  The badge covered all five. */
+void insp_unwired_field_badge(void)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 180, 60, 255));
+    ImGui::TextWrapped("%s", jce_editor_i18n("inspector.unwiredField"));
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.unwiredField.tip"));
 }
 
 void insp_undo_bool(bool *value)
@@ -216,6 +245,11 @@ void apply_mesh_drop_material(JceMeshRenderer *mr, const char *abs_path)
                     mr->ao_strength    = mat.ao_strength;
                     mr->alpha_mode     = mat.alpha_mode;
                     mr->alpha_cutoff   = mat.alpha_cutoff;
+                    /* No render_priority here: `mat` is a
+                     * JceModelMaterialInfo -- what an FBX/glTF import
+                     * describes -- and no model format carries a
+                     * transparent sort override.  Importing a mesh
+                     * must not stomp one the author set. */
                     mr->double_sided   = mat.double_sided;
                 }
             }

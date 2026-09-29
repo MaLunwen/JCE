@@ -5,6 +5,8 @@
  */
 
 extern "C" struct JceTerrain *jce_terrain_panel_get_terrain(void);
+extern "C" void jce_terrain_panel_set_brush_armed(bool armed);
+extern "C" bool jce_terrain_panel_open_asset(const char *path);
 #include <vector>
 #include "io/jce_editor_file_util.h"
 #include <jce/middleware/scene/jce_foliage.h>
@@ -17,6 +19,8 @@ extern "C" {
 #include <jce/resource/jce_asset_format.h>     /* script-extension authority        */
 #include <jce/middleware/script/jce_script_vm.h> /* which VMs THIS build linked     */
 #include "core/jce_assetdb.h"                  /* the picker's own attachability   */
+#include <jce/middleware/scene/jce_script_exports.h> /* what the SCRIPT declares */
+#include <jce/os/core/jce_filesystem.h>            /* reading it to find out    */
 }
 
 void draw_comp_behavior_tree(JceBehaviorTree *bt)
@@ -35,7 +39,7 @@ void draw_comp_behavior_tree(JceBehaviorTree *bt)
         insp_track_edit();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("inspector.bt.clearTree", "bt")))
-    { bt->tree_path[0] = '\0'; insp_track_edit(); }
+        insp_undo_set(&bt->tree_path[0], '\0');
 
     ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.tickHz", "bt"),
                      &bt->tick_hz, 0.5f, 0.0f, 240.0f, "%.1f");
@@ -54,8 +58,8 @@ void draw_comp_behavior_tree(JceBehaviorTree *bt)
         if (ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.sightAngle", "bt"),
                              &deg, 0.5f, 1.0f, 180.0f, "%.0f deg")) {
             bt->sight_half_angle = deg * (3.14159265f / 180.0f);
-            insp_track_edit();
         }
+        insp_track_edit();
     }
     ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.hearingRange", "bt"),
                      &bt->hearing_range, 0.5f, 0.0f, 200.0f, "%.1f m");
@@ -77,19 +81,32 @@ void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
 {
     if (!m) return;
     bool en = m->enabled != 0;
-    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sm.enabled", "sm"), &en)) { m->enabled = en ? 1 : 0; insp_track_edit(); }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sm.enabled", "sm"), &en))
+        insp_undo_set(&m->enabled, en ? 1 : 0);
     ImGui::DragInt  (jce_editor_i18n_id("inspector.sm.maxPeds", "sm"),          &m->max_peds,         1.0f, 0, 1024); insp_track_edit();
     ImGui::DragInt  (jce_editor_i18n_id("inspector.sm.maxVehicles", "sm"),      &m->max_vehicles,     1.0f, 0, 1024); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.minSpawnRadius", "sm"),  &m->min_spawn_radius, 0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.maxSpawnRadius", "sm"),  &m->max_spawn_radius, 0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.despawnPad", "sm"),       &m->despawn_pad,      0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.spawnInterval", "sm"),&m->spawn_interval,   0.05f, 0.0f, 60.0f,    "%.2f"); insp_track_edit();
+    /* WHAT to spawn.  The engine gates on this and the editor never let a
+     * designer set it: jce_runtime.c:192 reads
+     *   if (!smc || !smc->ped_prefab_path[0]) return 0;  // nothing authored
+     * so every SpawnManager placed from the inspector spawned nothing, with
+     * max_peds, the radii and the interval all tunable above it.  The mirror
+     * of the usual defect -- the engine reads a field the editor has no
+     * control for, so the capability exists and cannot be reached. */
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.sm.pedPrefab", "sm"),
+                              m->ped_prefab_path, sizeof m->ped_prefab_path,
+                              JCE_ASSET_KIND_DATA);
+    insp_track_edit();
+    accept_asset_drop(m->ped_prefab_path, sizeof m->ped_prefab_path);
     if (m->max_spawn_radius < m->min_spawn_radius) m->max_spawn_radius = m->min_spawn_radius;
 
     int pn = m->ped_archetype_count;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.pedArchetypes", "sm"), &pn, 1.0f, 0, 8)) {
         if (pn < 0) pn = 0; if (pn > 8) pn = 8;
-        m->ped_archetype_count = pn; insp_track_edit();
+        m->ped_archetype_count = pn;
     }
     char lbl[32];
     for (int i = 0; i < m->ped_archetype_count; ++i) {
@@ -97,22 +114,22 @@ void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
         int v = (int)m->ped_archetypes[i];
         if (ImGui::DragInt(lbl, &v, 1.0f, 0, INT_MAX)) {
             m->ped_archetypes[i] = (uint32_t)(v < 0 ? 0 : v);
-            insp_track_edit();
         }
+        insp_track_edit();
     }
 
     int vn = m->vehicle_archetype_count;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.vehicleArchetypes", "sm"), &vn, 1.0f, 0, 8)) {
         if (vn < 0) vn = 0; if (vn > 8) vn = 8;
-        m->vehicle_archetype_count = vn; insp_track_edit();
+        m->vehicle_archetype_count = vn;
     }
     for (int i = 0; i < m->vehicle_archetype_count; ++i) {
         snprintf(lbl, sizeof lbl, "Vehicle[%d] id##smv%d", i, i);
         int v = (int)m->vehicle_archetypes[i];
         if (ImGui::DragInt(lbl, &v, 1.0f, 0, INT_MAX)) {
             m->vehicle_archetypes[i] = (uint32_t)(v < 0 ? 0 : v);
-            insp_track_edit();
         }
+        insp_track_edit();
     }
 
     /* RNG seed (display as two 32-bit halves to avoid ImGui int64 absence). */
@@ -121,12 +138,12 @@ void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
     int lo_i = (int)lo, hi_i = (int)hi;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.rngSeedLo", "sm"), &lo_i, 1.0f)) {
         m->rng_seed = ((uint64_t)(uint32_t)hi_i << 32) | (uint32_t)lo_i;
-        insp_track_edit();
     }
+    insp_track_edit();
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.rngSeedHi", "sm"), &hi_i, 1.0f)) {
         m->rng_seed = ((uint64_t)(uint32_t)hi_i << 32) | (uint32_t)lo_i;
-        insp_track_edit();
     }
+    insp_track_edit();
     ImGui::TextDisabled(jce_editor_i18n("inspector.sm.roadNetworkNote"));
 }
 
@@ -136,7 +153,8 @@ void draw_comp_weapon(JceWeaponComponent *w)
     ImGui::InputText(jce_editor_i18n_id("inspector.wp.name", "wp"), w->name, sizeof w->name); insp_track_edit();
     const char *kinds[] = { jce_editor_i18n("inspector.wp.kind.hitscan"), jce_editor_i18n("inspector.wp.kind.projectile") };
     int k = w->kind; if (k < 0 || k > 1) k = 0;
-    if (ImGui::Combo(jce_editor_i18n_id("inspector.wp.kind", "wp"), &k, kinds, 2)) { w->kind = k; insp_track_edit(); }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.wp.kind", "wp"), &k, kinds, 2))
+        insp_undo_set(&w->kind, k);
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.damage", "wp"),         &w->damage,          0.1f, 0.0f, 100000.0f, "%.2f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.range", "wp"),      &w->range,           0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.rpm", "wp"),            &w->rpm,             1.0f, 0.0f, 10000.0f,  "%.0f"); insp_track_edit();
@@ -161,9 +179,11 @@ void draw_comp_save_point(JceSavePointComponent *sp)
     ImGui::InputText(jce_editor_i18n_id("inspector.sv.displayName", "sv"),sp->display_name, sizeof sp->display_name); insp_track_edit();
     const char *kinds[] = { jce_editor_i18n("inspector.sv.kind.manual"), jce_editor_i18n("inspector.sv.kind.auto"), jce_editor_i18n("inspector.sv.kind.checkpoint") };
     int k = sp->kind; if (k < 0 || k > 2) k = 0;
-    if (ImGui::Combo(jce_editor_i18n_id("inspector.sv.kind", "sv"), &k, kinds, 3)) { sp->kind = k; insp_track_edit(); }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.sv.kind", "sv"), &k, kinds, 3))
+        insp_undo_set(&sp->kind, k);
     ImGui::DragFloat(jce_editor_i18n_id("inspector.sv.radius", "sv"), &sp->radius, 0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
     ImGui::DragInt  (jce_editor_i18n_id("inspector.sv.slot", "sv"),   &sp->slot,   1.0f, -1, 256);              insp_track_edit();
+    insp_unwired_field_badge();   /* display_name, kind, slot */
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sv.oneShot", "sv"),          &sp->one_shot))         insp_undo_bool(&sp->one_shot);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sv.requireInteract", "sv"),  &sp->require_interact)) insp_undo_bool(&sp->require_interact);
 }
@@ -173,19 +193,18 @@ void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv)
     if (!tv) return;
     const char *shapes[] = { jce_editor_i18n("inspector.trig.shape.aabb"), jce_editor_i18n("inspector.trig.shape.sphere"), jce_editor_i18n("inspector.trig.shape.obb") };
     int sh = tv->shape; if (sh < 0 || sh > 2) sh = 0;
-    if (ImGui::Combo(jce_editor_i18n_id("inspector.trig.shape", "trig"), &sh, shapes, 3)) {
-        tv->shape = sh; insp_track_edit();
-    }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.trig.shape", "trig"), &sh, shapes, 3))
+        insp_undo_set(&tv->shape, sh);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trig.enabled", "trig"), &tv->enabled))
         insp_undo_bool(&tv->enabled);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trig.fireStayEvents", "trig"), &tv->fire_stay))
         insp_undo_bool(&tv->fire_stay);
     ImGui::InputText(jce_editor_i18n_id("inspector.trig.tag", "trig"), tv->tag, sizeof tv->tag);
+    insp_unwired_field_badge();   /* fire_stay, tag */
     /* Commit the tag when the field loses focus (click away / select another
      * object) or on Enter — not every frame — so switching objects mid-edit
      * still records + saves the change. */
-    if (ImGui::IsItemDeactivatedAfterEdit())
-        insp_track_edit();
+    insp_track_edit();
 
     ImGui::Separator();
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.center", "trig"), tv->center, 0.1f);
@@ -220,6 +239,7 @@ void draw_comp_terrain(JceTerrainComponent *tc)
         insp_undo_bool(&tc->visible);
 
     ImGui::ColorEdit3(jce_editor_i18n("inspector.terrain.tint"), tc->tint);
+    insp_unwired_field_badge();   /* tint */
     insp_track_edit();
 
     ImGui::Separator();
@@ -229,6 +249,9 @@ void draw_comp_terrain(JceTerrainComponent *tc)
     if (tc->tile_scale <= 0.0f) tc->tile_scale = 10.0f;
     ImGui::DragFloat(jce_editor_i18n("inspector.terrain.layerTile"), &tc->tile_scale, 0.1f, 0.1f, 256.0f, "%.2f");
     insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.terrain.heightBlend"),
+                       &tc->height_blend, 0.0f, 1.0f, "%.2f");
+    insp_track_edit();
 
     for (int i = 0; i < 4; i++) {
         char label[32];
@@ -237,15 +260,30 @@ void draw_comp_terrain(JceTerrainComponent *tc)
         jce_draw_path_input_asset(label, tc->layer_albedo_path[i],
                          sizeof tc->layer_albedo_path[i], JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.normal"),
+                         tc->layer_normal_path[i],
+                         sizeof tc->layer_normal_path[i], JCE_ASSET_KIND_TEXTURE);
+        insp_track_edit();
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.terrain.maskMap"),
+                         tc->layer_mask_path[i],
+                         sizeof tc->layer_mask_path[i], JCE_ASSET_KIND_TEXTURE);
+        insp_track_edit();
+        ImGui::SliderFloat(jce_editor_i18n("inspector.terrain.normalScale"),
+                           &tc->layer_normal_scale[i], 0.0f, 2.0f, "%.2f");
+        insp_track_edit();
         ImGui::PopID();
     }
     ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.splatChannels"));
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.maskChannels"));
 
     /* Show summary if a terrain file is bound. Using load_file is heavy;
      * for the inspector we just print the path and let the Terrain panel
      * handle authoring. */
     if (tc->terrain_path[0]) {
         ImGui::Separator();
+        if (ImGui::Button(jce_editor_i18n("inspector.terrain.edit"),
+                          ImVec2(-1.0f, 0.0f)))
+            (void)jce_terrain_panel_open_asset(tc->terrain_path);
         ImGui::TextWrapped("%s", jce_editor_i18n("inspector.terrain.useTerrainPanel"));
     } else {
         ImGui::Separator();
@@ -265,9 +303,51 @@ static struct {
     float strength;     /* 0..1 per stroke-frame */
     bool  erase;        /* lower density (true) vs raise (false) */
     bool  stroke_open;
+    bool  stroke_has_point;
+    float stroke_x;
+    float stroke_z;
 } g_veg_brush = { false, 8.0f, 0.5f, true, false };
 
-extern "C" bool jce_foliage_brush_armed(void) { return g_veg_brush.armed; }
+static void foliage_brush_disarm(void)
+{
+    if (g_veg_brush.stroke_open)
+        jce_state_end_batch_edit();
+    g_veg_brush.armed = false;
+    g_veg_brush.stroke_open = false;
+    g_veg_brush.stroke_has_point = false;
+}
+
+extern "C" bool jce_foliage_brush_armed(void)
+{
+    if (!g_veg_brush.armed) return false;
+    JceScene *scene = jce_state_get_scene();
+    const uint32_t focused = jce_state_get_focused();
+    if (!scene || !focused) {
+        foliage_brush_disarm();
+        return false;
+    }
+    JceVegetationScatterComponent *scatter =
+        jce_scene_get_vegetation_scatter(
+            scene, jce_state_to_ecs_entity(focused));
+    if (scatter && scatter->density_paint_active) return true;
+
+    foliage_brush_disarm();
+    return false;
+}
+
+extern "C" void jce_foliage_brush_set_armed(bool armed)
+{
+    if (!armed) {
+        foliage_brush_disarm();
+        return;
+    }
+    g_veg_brush.armed = armed;
+}
+
+extern "C" float jce_foliage_brush_radius(void)
+{
+    return g_veg_brush.radius;
+}
 
 extern "C" void jce_foliage_brush_end_stroke(void)
 {
@@ -275,6 +355,45 @@ extern "C" void jce_foliage_brush_end_stroke(void)
         jce_state_end_batch_edit();
         g_veg_brush.stroke_open = false;
     }
+    g_veg_brush.stroke_has_point = false;
+}
+
+static void foliage_brush_stamp(JceVegetationScatterComponent *vs,
+                                float origin_x, float origin_z,
+                                float wx, float wz, float dt)
+{
+    float ax = vs->area_x > 0.01f ? vs->area_x : 1.0f;
+    float az = vs->area_z > 0.01f ? vs->area_z : 1.0f;
+    const int DIM = JCE_VEG_PAINT_DIM;
+    float cu  = ((wx - origin_x) / ax + 0.5f) * (float)DIM;
+    float cv  = ((wz - origin_z) / az + 0.5f) * (float)DIM;
+    float rcx = (g_veg_brush.radius / ax) * (float)DIM;
+    float rcz = (g_veg_brush.radius / az) * (float)DIM;
+    if (rcx < 0.5f) rcx = 0.5f;
+    if (rcz < 0.5f) rcz = 0.5f;
+
+    float per = g_veg_brush.strength * 255.0f *
+                (dt > 0.0f ? (dt * 6.0f < 1.0f ? dt * 6.0f : 1.0f) : 1.0f);
+    int x0 = (int)floorf(cu - rcx), x1 = (int)ceilf(cu + rcx);
+    int z0 = (int)floorf(cv - rcz), z1 = (int)ceilf(cv + rcz);
+    if (x0 < 0) x0 = 0;
+    if (z0 < 0) z0 = 0;
+    if (x1 > DIM - 1) x1 = DIM - 1;
+    if (z1 > DIM - 1) z1 = DIM - 1;
+    for (int z = z0; z <= z1; ++z)
+        for (int x = x0; x <= x1; ++x) {
+            const float dx = ((x + 0.5f) - cu) * ax / (float)DIM;
+            const float dz = ((z + 0.5f) - cv) * az / (float)DIM;
+            const float distance = sqrtf(dx * dx + dz * dz);
+            if (distance > g_veg_brush.radius) continue;
+            int delta = (int)(per *
+                (1.0f - distance / g_veg_brush.radius));
+            int v = (int)vs->density_paint[z * DIM + x] +
+                    (g_veg_brush.erase ? -delta : delta);
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            vs->density_paint[z * DIM + x] = (uint8_t)v;
+        }
 }
 
 extern "C" void jce_foliage_brush_apply_world(float wx, float wz, float dt)
@@ -286,43 +405,40 @@ extern "C" void jce_foliage_brush_apply_world(float wx, float wz, float dt)
     JceVegetationScatterComponent *vs = jce_scene_get_vegetation_scatter(scene, e);
     if (!vs || !vs->density_paint_active) return;
 
-    jce_mat4 wm = jce_scene_get_world_matrix(scene, e);
-    float ox = wm.col[3].x, oz = wm.col[3].z;
-    float ax = vs->area_x > 0.01f ? vs->area_x : 1.0f;
-    float az = vs->area_z > 0.01f ? vs->area_z : 1.0f;
-    const int DIM = JCE_VEG_PAINT_DIM;
-    float cu  = ((wx - ox) / ax + 0.5f) * (float)DIM;   /* brush centre in cells */
-    float cv  = ((wz - oz) / az + 0.5f) * (float)DIM;
-    float rcx = (g_veg_brush.radius / ax) * (float)DIM;
-    float rcz = (g_veg_brush.radius / az) * (float)DIM;
-    float rc  = rcx > rcz ? rcx : rcz;
-    if (rc < 0.5f) rc = 0.5f;
-
     if (!g_veg_brush.stroke_open) {
         jce_state_begin_batch_edit();
         g_veg_brush.stroke_open = true;
     }
 
-    float per = g_veg_brush.strength * 255.0f *
-                (dt > 0.0f ? (dt * 6.0f < 1.0f ? dt * 6.0f : 1.0f) : 1.0f);
-    int x0 = (int)floorf(cu - rc), x1 = (int)ceilf(cu + rc);
-    int z0 = (int)floorf(cv - rc), z1 = (int)ceilf(cv + rc);
-    if (x0 < 0) x0 = 0;
-    if (z0 < 0) z0 = 0;
-    if (x1 > DIM - 1) x1 = DIM - 1;
-    if (z1 > DIM - 1) z1 = DIM - 1;
-    for (int z = z0; z <= z1; ++z)
-        for (int x = x0; x <= x1; ++x) {
-            float du = (x + 0.5f) - cu, dv = (z + 0.5f) - cv;
-            float d  = sqrtf(du * du + dv * dv);
-            if (d > rc) continue;
-            int delta = (int)(per * (1.0f - d / rc));   /* linear falloff */
-            int v = (int)vs->density_paint[z * DIM + x] +
-                    (g_veg_brush.erase ? -delta : delta);
-            if (v < 0) v = 0;
-            if (v > 255) v = 255;
-            vs->density_paint[z * DIM + x] = (uint8_t)v;
-        }
+    jce_mat4 world = jce_scene_get_world_matrix(scene, e);
+    const float origin_x = world.col[3].x;
+    const float origin_z = world.col[3].z;
+    const float dx = g_veg_brush.stroke_has_point
+        ? wx - g_veg_brush.stroke_x : 0.0f;
+    const float dz = g_veg_brush.stroke_has_point
+        ? wz - g_veg_brush.stroke_z : 0.0f;
+    const float distance = sqrtf(dx * dx + dz * dz);
+    const float spacing = g_veg_brush.radius * 0.25f > 0.25f
+        ? g_veg_brush.radius * 0.25f : 0.25f;
+    int stamp_count = g_veg_brush.stroke_has_point
+        ? (int)ceilf(distance / spacing) : 1;
+    if (stamp_count < 1) stamp_count = 1;
+    if (stamp_count > 256) stamp_count = 256;
+    const float stamp_dt = dt > 0.0f ? dt / (float)stamp_count : dt;
+
+    for (int i = 1; i <= stamp_count; ++i) {
+        const float t = g_veg_brush.stroke_has_point
+            ? (float)i / (float)stamp_count : 1.0f;
+        const float stamp_x = g_veg_brush.stroke_has_point
+            ? g_veg_brush.stroke_x + dx * t : wx;
+        const float stamp_z = g_veg_brush.stroke_has_point
+            ? g_veg_brush.stroke_z + dz * t : wz;
+        foliage_brush_stamp(vs, origin_x, origin_z,
+                            stamp_x, stamp_z, stamp_dt);
+    }
+    g_veg_brush.stroke_x = wx;
+    g_veg_brush.stroke_z = wz;
+    g_veg_brush.stroke_has_point = true;
     jce_state_mark_scene_modified();
 }
 
@@ -375,6 +491,8 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
         ch = true;
         if (vs->density_paint_active && !was_paint)
             memset(vs->density_paint, 255, sizeof vs->density_paint);  /* full on enable */
+        if (!vs->density_paint_active)
+            jce_foliage_brush_set_armed(false);
     }
     if (vs->density_paint_active) {
         /* One-time restore of the persisted brush knobs (user-global, so
@@ -390,8 +508,12 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
                 "brush.foliage.erase", g_veg_brush.erase ? 1 : 0, 0, 1) != 0;
         }
 
-        ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.paintInScene",
-                                           "Paint in Scene"), &g_veg_brush.armed);
+        bool armed = g_veg_brush.armed;
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.vegetationScatter.paintInScene",
+                                               "Paint in Scene"), &armed)) {
+            jce_foliage_brush_set_armed(armed);
+            if (armed) jce_terrain_panel_set_brush_armed(false);
+        }
         if (ImGui::SliderFloat(jce_editor_i18n_id("inspector.vegetationScatter.brushRadius",
                                                   "Brush Radius"),
                                &g_veg_brush.radius, 0.5f, 128.0f, "%.1f"))
@@ -438,6 +560,7 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
     ch |= ImGui::DragFloatRange2(jce_editor_i18n("inspector.vegetationScatter.scaleRange"),
                                  &vs->scale_min, &vs->scale_max, 0.01f, 0.01f, 100.0f, "%.2f");
     ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.vegetationScatter.tint"), vs->tint);
+    insp_unwired_field_badge();   /* tint */
     ch |= ImGui::Checkbox(jce_editor_i18n("inspector.vegetationScatter.alignNormal"),
                           &vs->align_to_normal);
     ch |= ImGui::Checkbox(jce_editor_i18n("inspector.vegetationScatter.castShadow"),
@@ -464,11 +587,37 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
     ImGui::SeparatorText(jce_editor_i18n("inspector.vegetationScatter.bake"));
     {
         static int  s_baked = -1;      /* -1 = not attempted this session */
-        static char s_bake_path[512] = { 0 };
+        static JceEntity s_bake_entity = 0;
+
+        ImGui::TextUnformatted(
+            jce_editor_i18n("inspector.vegetationScatter.bake"));
+        if (jce_draw_path_input_asset("##veg_baked_placement",
+                                      vs->baked_placement_path,
+                                      sizeof vs->baked_placement_path,
+                                      JCE_ASSET_KIND_DATA))
+            ch = true;
+        insp_track_edit();
+        /* TRUE TODAY, AND MEANT TO BE DELETED: nothing under engine/src reads
+         * baked_placement_path yet, so this control is inert.  The field is
+         * in-flight work; when its reader lands,
+         * check_authored_path_consumed.py fails on the now-stale exemption in
+         * authored_path_exempt.txt, and this badge goes with that line. */
+        insp_unwired_field_badge();
+        if (vs->baked_placement_path[0]) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(
+                    jce_editor_i18n("inspector.vegetationScatter.clearEmpty"))) {
+                jce_state_begin_batch_edit();
+                vs->baked_placement_path[0] = '\0';
+                jce_state_end_batch_edit();
+                s_baked = -1;
+                s_bake_entity = 0;
+            }
+        }
 
         if (ImGui::Button(jce_editor_i18n("inspector.vegetationScatter.bakeNow"))) {
             s_baked = -1;
-            s_bake_path[0] = 0;
+            s_bake_entity = entity;
 
             JceFoliageScatterParams fp;
             memset(&fp, 0, sizeof fp);
@@ -499,12 +648,18 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
             if (jce_foliage_cook(inst.data(), n, fp.seed,
                                  blob.data(), blob.size(), nullptr)) {
                 char rel[256];
-                snprintf(rel, sizeof rel, "vegetation_%u.foliage.bin", vs->seed);
+                snprintf(rel, sizeof rel,
+                         "generated/foliage/vegetation_%u_%u.foliage.bin",
+                         (unsigned)entity, vs->seed);
                 char abs_path[512];
                 if (jce_editor_resolve_asset_path(rel, abs_path, sizeof abs_path) &&
-                    ed_write_file(abs_path, blob.data(), blob.size())) {
+                    jce_fs_host_write_all_atomic(abs_path, blob.data(),
+                                                 (uint64_t)blob.size())) {
+                    jce_state_begin_batch_edit();
+                    snprintf(vs->baked_placement_path,
+                             sizeof vs->baked_placement_path, "%s", rel);
+                    jce_state_end_batch_edit();
                     s_baked = (int)n;
-                    snprintf(s_bake_path, sizeof s_bake_path, "%s", rel);
                 } else {
                     s_baked = -2;      /* wrote nothing: report, never pretend */
                 }
@@ -513,10 +668,10 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
             }
         }
 
-        if (s_baked >= 0)
+        if (s_bake_entity == entity && s_baked >= 0)
             ImGui::Text(jce_editor_i18n("inspector.vegetationScatter.bakeOk"),
-                        s_baked, s_bake_path);
-        else if (s_baked == -2)
+                        s_baked, vs->baked_placement_path);
+        else if (s_bake_entity == entity && s_baked == -2)
             ImGui::TextDisabled("%s",
                 jce_editor_i18n("inspector.vegetationScatter.bakeFail"));
     }
@@ -648,11 +803,12 @@ void draw_comp_grass_field(JceGrassFieldComponent *g)
     /* --- Flags --- */
     ImGui::Separator();
     {
-        ImGui::BeginDisabled(true);
+        /* Live now: blades join the CSM depth pass through the same
+         * instanced shadow program the vegetation scatter already drives.
+         * The BeginDisabled(true), the unwired badge and the "(v1: reserved)"
+         * label are all gone together -- a control that works while still
+         * wearing three signs saying it does not is the same lie backwards. */
         ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.castShadow"), &g->cast_shadow);
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.grassField.reserved"));
     }
     ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.visible"), &g->visible);
 
@@ -683,6 +839,32 @@ void draw_comp_water(JceWaterComponent *w)
         if (w->water_mode > JCE_WATER_MODE_STYLIZED) w->water_mode = JCE_WATER_MODE_STYLIZED;
         ch = true;
     }
+
+    /* The engine explicitly defers this one to the scene -- jce_sr_environment.c
+     * at the water draw: "Authored, default off ... Without a depth value at
+     * water pixels, SSR / DOF / aerial fog all read whatever lies BEHIND the
+     * surface instead of the surface itself; with one, translucent geometry
+     * further away is depth-rejected.  Neither is universally right, so the
+     * scene decides rather than the engine."
+     *
+     * The scene had no way to decide: the field was serialised and read every
+     * frame, and no control existed anywhere in the editor. */
+    ch |= ImGui::Checkbox(jce_editor_i18n("inspector.water.depthWrite"),
+                          &w->depth_write);
+    insp_track_edit();
+
+    /* PLANAR REFLECTION.  Off by default and next to a note about its cost:
+     * it is a SECOND scene render, which is a different order of expense from
+     * every other checkbox on this component. */
+    ch |= ImGui::Checkbox(jce_editor_i18n("inspector.water.planarReflection"),
+                          &w->planar_reflection);
+    insp_track_edit();
+    ImGui::BeginDisabled(!w->planar_reflection);
+    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.planarIntensity"),
+                           &w->planar_intensity, 0.01f, 0.0f, 2.0f, "%.2f");
+    insp_track_edit();
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.water.planarNote"));
 
     ch |= ImGui::DragFloat(jce_editor_i18n("inspector.water.sizeX"),
                            &w->size_x, 1.0f, 0.0f, 100000.0f, "%.1f");
@@ -841,7 +1023,7 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
         insp_track_edit();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("inspector.pe.clearAsset", "pe")))
-    { pe->asset_path[0] = '\0'; insp_track_edit(); }
+        insp_undo_set(&pe->asset_path[0], '\0');
 
     const bool has_asset = pe->asset_path[0] != '\0';
     if (has_asset) {
@@ -880,17 +1062,12 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
     ImGui::TextDisabled(jce_editor_i18n("inspector.pe.useParticleSystemPanel"));
 }
 
-void draw_comp_script(JceScriptComponent *scr)
+/* The language / backend diagnostics, split out of draw_comp_script so the
+ * parameter table can follow them.  It keeps its own three early returns --
+ * they end the DIAGNOSTIC, and a script whose extension nothing claims still
+ * has authored parameters worth editing. */
+static void draw_script_language_note(JceScriptComponent *scr)
 {
-    /* No "unwired" badge: the runtime DOES consume scripts (jce_runtime drives
-     * on_start/on_update/on_collision/on_trigger/on_message through the VM
-     * registered for the script's language). */
-    jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
-    insp_track_edit();
-
-    if (scr->script_path[0] == '\0')
-        return;
-
     /* TWO INDEPENDENT QUESTIONS, and therefore two messages that never share
      * a string, because they have two different fixes:
      *
@@ -979,6 +1156,313 @@ void draw_comp_script(JceScriptComponent *scr)
                         have);
 }
 
+/* One row's kind, spelled for a human.  Read every frame rather than cached:
+ * the locale can change without the scene changing, and a cache would keep
+ * showing the old language until something else marked the panel dirty. */
+static const char *script_param_kind_label(int kind)
+{
+    switch (kind) {
+    case JCE_SCRIPT_PARAM_BOOL:   return jce_editor_i18n("inspector.script.kindBool");
+    case JCE_SCRIPT_PARAM_TEXT:   return jce_editor_i18n("inspector.script.kindText");
+    case JCE_SCRIPT_PARAM_ENTITY: return jce_editor_i18n("inspector.script.kindEntity");
+    default:                      return jce_editor_i18n("inspector.script.kindNumber");
+    }
+}
+
+/* Read the script file and return what it DECLARES via @export.
+ *
+ * Project-relative like every other asset path on a component; an empty or
+ * unreadable path yields zero declarations, which the caller renders as "this
+ * script declares nothing" rather than as an error -- a script with no
+ * @export lines is the normal case and must not look broken.
+ *
+ * Read on demand rather than cached.  This runs only while a Script component
+ * is selected AND its section is open, the files are a few KB, and a cache
+ * would need invalidating on every external edit -- the editor already has a
+ * file watcher for scripts, and a stale parameter list is exactly the kind of
+ * wrong answer that reads as correct. */
+static int read_script_declarations(const char *script_path,
+                                    JceScriptParam *out, int max_out)
+{
+    if (!script_path || !script_path[0] || !out || max_out <= 0) return 0;
+
+    char        abs[1024];
+    const char *root = jce_assetdb_get_root();
+    if (root && root[0])
+        snprintf(abs, sizeof abs, "%s/%s", root, script_path);
+    else
+        snprintf(abs, sizeof abs, "%s", script_path);
+
+    uint64_t sz  = 0;
+    void    *buf = jce_fs_host_read_all(abs, &sz);
+    if (!buf) return 0;
+    /* A script far larger than any real one is still cheap to scan, but the
+     * bound keeps a mis-pointed path (a model, a pak) from being walked. */
+    if (sz > (4u << 20)) { jce_fs_buffer_free(buf); return 0; }
+
+    const int n = jce_script_exports_scan((const char *)buf, (size_t)sz,
+                                          out, max_out);
+    jce_fs_buffer_free(buf);
+    return n < 0 ? 0 : n;
+}
+
+/* Parameters -- Unity's [SerializeField], Godot's @export, UE's
+ * UPROPERTY(EditAnywhere).
+ *
+ * THE COMMENT HERE USED TO SAY JCE "CANNOT" read the exposed set out of the
+ * script's own declarations -- "seven backends, no uniform reflection, and a
+ * Lua chunk has no declared fields at all".  That was the sentence that kept
+ * both parity rows behind, because it reads as settled and so nobody looked
+ * again.  The absence of uniform reflection is the ARGUMENT FOR a comment
+ * marker rather than against declarations: `@export number speed = 5` inside
+ * a line comment is identical in all seven languages precisely because none
+ * of them can reflect, and one reader cannot drift between backends the way
+ * seven parsers would.  See jce_script_exports.h.
+ *
+ * SO THERE ARE TWO SOURCES NOW and the table shows which is which: what the
+ * SCRIPT declares, and what the AUTHOR added by hand.  Both remain editable
+ * -- a declaration fixes a parameter's NAME and KIND, never its value, since
+ * the whole point is that two turrets differing only in range share one
+ * script.
+ *
+ * SYNC IS EXPLICIT, not automatic on draw.  The merge is non-destructive by
+ * construction, so running it every frame would be safe for the data -- but
+ * it would silently dirty the scene of anyone who merely SELECTED an entity,
+ * and an undo stack that fills up with edits nobody made is worse than a
+ * button.
+ *
+ * Shape follows the Animator parameter table (jce_panel_animator_sm.cpp): an
+ * author-defined list of typed parameters is the same problem, and the two
+ * should not read differently. */
+static void draw_script_params(JceScriptComponent *scr)
+{
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.script.params"));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.script.paramsHint"));
+
+    /* WHAT THE SCRIPT DECLARES, read before the table so every row below can
+     * say whether the script still asks for it. */
+    JceScriptParam decls[JCE_SCRIPT_PARAM_MAX];
+    memset(decls, 0, sizeof decls);
+    const int decl_n = read_script_declarations(scr->script_path, decls,
+                                                JCE_SCRIPT_PARAM_MAX);
+
+    /* How many declarations are not on the component yet -- the number that
+     * tells an author whether pressing Sync will do anything. */
+    int missing = 0;
+    for (int i = 0; i < decl_n; ++i) {
+        bool have = false;
+        for (int j = 0; j < scr->param_count && j < JCE_SCRIPT_PARAM_MAX; ++j)
+            if (strcmp(scr->params[j].name, decls[i].name) == 0) { have = true; break; }
+        if (!have) ++missing;
+    }
+
+    if (decl_n > 0) {
+        ImGui::TextDisabled("%s",
+            jce_editor_i18n_id("inspector.script.declaredBy",
+                               "declared by the script:"));
+        ImGui::SameLine();
+        ImGui::Text("%d", decl_n);
+        if (missing > 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d %s)", missing,
+                jce_editor_i18n_id("inspector.script.notAdded", "not added"));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(missing == 0);
+        if (ImGui::Button(jce_editor_i18n_id("inspector.script.sync",
+                                             "Sync from script"))) {
+            /* BATCH EDIT, not insp_track_edit().  A Button is DISCRETE:
+             * its `if` body runs on neither the activation nor the
+             * deactivation frame, so insp_track_edit() there records
+             * nothing -- check_inspector_undo_scope named this exact line
+             * and it was right.  The Add Parameter button below mutates the
+             * same array the same way and already uses this idiom. */
+            const int before = scr->param_count;
+            jce_state_begin_batch_edit();
+            const int after  = jce_script_exports_merge(
+                decls, decl_n, scr->params, scr->param_count,
+                JCE_SCRIPT_PARAM_MAX);
+            if (after >= 0 && after != before)
+                scr->param_count = after;
+            jce_state_end_batch_edit();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n_id(
+                "inspector.script.syncHint",
+                "Adds every @export the script declares, with its default. "
+                "Values you have already set are kept, and parameters the "
+                "script no longer declares are left alone rather than "
+                "deleted."));
+    }
+
+    /* CLAMPED BEFORE THE LOOP, and written back.  A hand-edited scene can
+     * carry any int32 here; the parser clamps on load, but the component is
+     * also reachable through the Automation API and through a script, so the
+     * drawer does not get to assume the value it reads came from the parser. */
+    int n = scr->param_count;
+    if (n < 0) n = 0;
+    if (n > JCE_SCRIPT_PARAM_MAX) n = JCE_SCRIPT_PARAM_MAX;
+    if (n != scr->param_count)
+        scr->param_count = n;
+
+    if (n == 0)
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.script.paramsEmpty"));
+
+    int remove_at = -1;
+    if (n > 0 && ImGui::BeginTable("##script_params", 4,
+                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                   ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn(jce_editor_i18n("inspector.script.paramName"));
+        ImGui::TableSetupColumn(jce_editor_i18n("inspector.script.paramKind"),
+                                ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn(jce_editor_i18n("inspector.script.paramValue"),
+                                ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("##rm", ImGuiTableColumnFlags_WidthFixed, 24);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < n; ++i) {
+            JceScriptParam *pm = &scr->params[i];
+            /* A row the script does not declare is either hand-added or left
+             * over from a rename.  MARKED, never removed automatically: the
+             * value cannot be recovered from the script file, so deleting it
+             * would destroy work during a routine redraw.  Only meaningful
+             * once the script declares something -- a script with no @export
+             * at all must not paint every row as stale. */
+            const bool undeclared =
+                decl_n > 0 && pm->name[0] &&
+                !jce_script_exports_declares(decls, decl_n, pm->name);
+            ImGui::TableNextRow();
+            ImGui::PushID(i);
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            /* OUTSIDE the `if`, always: insp_track_edit() keys on
+             * IsItemActivated / IsItemDeactivated and the body of the `if`
+             * runs on the CHANGE frame, which is neither.  Same reasoning as
+             * the combo below, opposite fix. */
+            ImGui::InputText("##nm", pm->name, sizeof(pm->name));
+            insp_track_edit();
+            /* The script does not ask for this one.  Said here, next to
+             * the name, because "which of these is left over from a
+             * rename" is a question an author cannot answer any other
+             * way once a script has changed under a scene. */
+            if (undeclared) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", jce_editor_i18n_id(
+                    "inspector.script.undeclared", "(not declared)"));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", jce_editor_i18n_id(
+                        "inspector.script.undeclaredHint",
+                        "The script no longer declares an @export with "
+                        "this name. The value is kept -- remove the row "
+                        "yourself if it is no longer wanted."));
+            }
+            if (pm->name[0] == '\0') {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                                   jce_editor_i18n("inspector.script.paramUnnamed"));
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##kd", script_param_kind_label((int)pm->kind))) {
+                for (int k = JCE_SCRIPT_PARAM_NUMBER; k <= JCE_SCRIPT_PARAM_ENTITY; ++k) {
+                    const bool sel = ((int)pm->kind == k);
+                    /* insp_undo_set, not insp_track_edit -- see the file
+                     * comment and jce_panel_inspector_common.h:129.  It also
+                     * leaves number/entity/text ALONE, which is deliberate and
+                     * matches the serialiser: flipping the kind must not throw
+                     * away what the author typed under the other one. */
+                    if (ImGui::Selectable(script_param_kind_label(k), sel))
+                        insp_undo_set(&pm->kind, k);
+                    if (sel)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            switch ((JceScriptParamKind)pm->kind) {
+            case JCE_SCRIPT_PARAM_BOOL: {
+                bool b = (pm->number != 0.0f);
+                if (ImGui::Checkbox("##vl", &b))
+                    insp_undo_set(&pm->number, b ? 1.0f : 0.0f);
+                break;
+            }
+            case JCE_SCRIPT_PARAM_TEXT:
+                ImGui::InputText("##vl", pm->text, sizeof(pm->text));
+                insp_track_edit();
+                break;
+            case JCE_SCRIPT_PARAM_ENTITY: {
+                int ent = (int)pm->entity;
+                if (ImGui::DragInt("##vl", &ent, 1.0f, 0, 1 << 30))
+                    pm->entity = (uint64_t)(ent < 0 ? 0 : ent);
+                insp_track_edit();
+                break;
+            }
+            case JCE_SCRIPT_PARAM_NUMBER:
+            default:
+                ImGui::DragFloat("##vl", &pm->number, 0.05f);
+                insp_track_edit();
+                break;
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            if (ImGui::SmallButton("x"))
+                remove_at = i;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n("inspector.script.removeParam"));
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    /* Deferred out of the loop: erasing the row being drawn invalidates the
+     * ImGui IDs of every row after it in the same frame. */
+    if (remove_at >= 0) {
+        jce_state_begin_batch_edit();          /* snapshot is the pre-edit state */
+        for (int i = remove_at; i + 1 < n; ++i)
+            scr->params[i] = scr->params[i + 1];
+        memset(&scr->params[n - 1], 0, sizeof(scr->params[n - 1]));
+        scr->param_count = n - 1;
+        jce_state_end_batch_edit();
+        return;
+    }
+
+    if (n >= JCE_SCRIPT_PARAM_MAX) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.script.paramsFull"));
+        return;
+    }
+    if (ImGui::Button(jce_editor_i18n("inspector.script.addParam"))) {
+        jce_state_begin_batch_edit();
+        memset(&scr->params[n], 0, sizeof(scr->params[n]));
+        scr->params[n].kind = (uint32_t)JCE_SCRIPT_PARAM_NUMBER;
+        scr->param_count = n + 1;
+        jce_state_end_batch_edit();
+    }
+}
+
+void draw_comp_script(JceScriptComponent *scr)
+{
+    if (!scr) return;
+
+    /* No "unwired" badge: the runtime DOES consume scripts (jce_runtime drives
+     * on_start/on_update/on_fixed_update/on_collision/on_trigger/on_message
+     * through the VM registered for the script's language). */
+    jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
+    insp_track_edit();
+
+    if (scr->script_path[0] == '\0')
+        return;
+
+    draw_script_language_note(scr);
+    draw_script_params(scr);
+}
+
 void draw_comp_nav_agent(JceNavAgentComponent *na)
 {
     if (!na) return;
@@ -986,6 +1470,7 @@ void draw_comp_nav_agent(JceNavAgentComponent *na)
         insp_undo_bool(&na->enabled);
     ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.radius", "nav"),         &na->radius,          0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.height", "nav"),         &na->height,          0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
+    insp_unwired_field_badge();   /* height */
     ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.maxSpeed", "nav"),       &na->max_speed,       0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.maxAccel", "nav"),       &na->max_accel,       0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.arriveRadius", "nav"),   &na->arrive_radius,   0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
@@ -996,8 +1481,8 @@ void draw_comp_nav_agent(JceNavAgentComponent *na)
     int target_ent = (int)na->target_entity;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.nav.targetEntity", "nav"), &target_ent, 1.0f, 0, 1<<30)) {
         na->target_entity = (uint64_t)(target_ent < 0 ? 0 : target_ent);
-        insp_track_edit();
     }
+    insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.nav.autoRepath", "nav"), &na->auto_repath))
         insp_undo_bool(&na->auto_repath);
 }

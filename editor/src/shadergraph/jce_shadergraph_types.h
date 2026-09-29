@@ -39,8 +39,72 @@ enum NodeType {
     NT_SUB_F      = 9,
     NT_LERP_C     = 10,
     NT_FRESNEL    = 11,
-    /* Reserve 12..31 for Phase B/C additions. */
-    NT_COUNT_HINT = 32  /* sizing hint only; not a real type */
+
+    /* ── Appended 2026-09-08.  APPEND ONLY: the value is what a .matgraph.json
+     * stores, so renumbering silently turns every saved graph into a different
+     * graph.  Grouped by what they are, numbered by when they arrived. */
+
+    /* Geometry the fragment already has.  These read the arguments the graph
+     * material function is handed, so they cost nothing to add and cannot be
+     * out of sync with the surface being shaded. */
+    NT_POSITION_WS  = 12,   /* world position                     -> vec3  */
+    NT_NORMAL_WS    = 13,   /* interpolated world normal          -> vec3  */
+    NT_VIEW_DIR     = 14,   /* unit vector surface -> camera      -> vec3  */
+    NT_SCREEN_UV    = 15,   /* fragment position / view rect      -> vec2  */
+
+    /* Float maths.  The four that existed (mul/add/sub and lerp on colour)
+     * left a graph unable to express saturate, a power, a step or a remap --
+     * which is most of what a material actually does between its inputs. */
+    NT_DIV_F        = 16,
+    NT_POW_F        = 17,
+    NT_SQRT_F       = 18,
+    NT_ABS_F        = 19,
+    NT_MIN_F        = 20,
+    NT_MAX_F        = 21,
+    NT_CLAMP_F      = 22,
+    NT_SATURATE_F   = 23,
+    NT_ONE_MINUS_F  = 24,
+    NT_FRAC_F       = 25,
+    NT_FLOOR_F      = 26,
+    NT_SIN_F        = 27,
+    NT_COS_F        = 28,
+    NT_STEP_F       = 29,
+    NT_SMOOTHSTEP_F = 30,
+    NT_LERP_F       = 31,
+    NT_REMAP_F      = 32,
+
+    /* Colour maths beside the two that existed. */
+    NT_ADD_C        = 33,
+    NT_SUB_C        = 34,
+    NT_SCALE_C      = 35,   /* vec4 * float */
+
+    /* Vectors.  Split and Combine are the pair that makes every other channel
+     * operation expressible; without them a graph could not touch one channel
+     * of anything. */
+    NT_SPLIT        = 36,   /* vec4 -> R, G, B, A */
+    NT_COMBINE      = 37,   /* R, G, B, A -> vec4 */
+    NT_DOT3         = 38,
+    NT_CROSS3       = 39,
+    NT_NORMALIZE3   = 40,
+    NT_LENGTH3      = 41,
+    NT_DISTANCE3    = 42,
+
+    /* UV. */
+    NT_UV_ROTATE    = 43,
+    NT_UV_POLAR     = 44,
+
+    /* Procedural, backed by engine/shaders/include/graph_nodes.sh. */
+    NT_NOISE        = 45,
+    NT_FBM          = 46,
+    NT_VORONOI      = 47,
+    NT_CHECKER      = 48,
+    NT_GRADIENT     = 49,   /* linear ramp along a uv axis */
+
+    /* Colour utility. */
+    NT_LUMA         = 50,
+    NT_DESATURATE   = 51,
+
+    NT_COUNT_HINT   = 96  /* sizing hint only; not a real type */
 };
 
 enum SocketKind {
@@ -48,10 +112,15 @@ enum SocketKind {
     SK_OUTPUT = 1
 };
 
-/* Data types.  DT_FLOAT/DT_COLOR are the legacy pair driving current
- * panel behaviour.  Extended types are reserved for Phase C codegen
- * and must NOT appear in any current node's socket table (otherwise
- * connections would silently mismatch). */
+/* Data types.
+ *
+ * DT_FLOAT/DT_COLOR were the legacy pair.  DT_VEC2 and DT_VEC3 are now in
+ * live socket tables (UV coordinates, tangent- and world-space normals,
+ * positions); the codegen has emitted the right GLSL type for them all along.
+ * DT_VEC4 is DT_COLOR under another name and the two connect freely -- they
+ * compile to the same type, and refusing the link would be a rule about
+ * vocabulary rather than about types.  DT_SAMPLER2D and DT_NORMAL remain
+ * reserved: no socket declares them. */
 enum DataType {
     DT_FLOAT     = 0,
     DT_COLOR     = 1,  /* == legacy "color" = RGBA */
@@ -76,6 +145,19 @@ struct Socket {
     SocketKind  kind;
     DataType    dtype;
     const char *name;
+    /* GLSL for this INPUT socket when nothing is connected to it.  NULL means
+     * the dtype's zero.
+     *
+     * Zero is the wrong answer more often than it looks.  An unconnected UV
+     * means "this fragment's UV", not vec2(0,0) -- a texture node with zero
+     * UV samples one texel and reads as a broken texture rather than as a
+     * missing wire.  That case was already special-cased by DTYPE in the
+     * codegen, which only worked because every vec2 socket happened to be a
+     * UV; a Rotate UV node's Centre is a vec2 and means (0.5,0.5).  Likewise
+     * a Fresnel with nothing plugged in should use the surface's own normal
+     * and view direction, and a procedural node's Scale of 0 is a constant
+     * pattern.  Per socket, because that is where the answer lives. */
+    const char *default_expr = nullptr;
 };
 
 struct Node {

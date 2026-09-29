@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "sources": {
+    "minimp4": {
+      "version": "4575afb4f69ace25a1a048e25cc86bf8c8d14f2b",
+      "kind": "file",
+      "filename": "minimp4.h",
+      "url": "https://raw.githubusercontent.com/lieff/minimp4/4575afb4f69ace25a1a048e25cc86bf8c8d14f2b/minimp4.h",
+      "sha256": "3dba25777f2c3ab9d21992a67b887905959fff7e4c7be863056d590ca529521f"
+    },
+    "fdk-aac": {
+      "version": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
+      "tag": "v2.0.3",
+      "kind": "tar",
+      "url": "https://codeload.github.com/mstorsjo/fdk-aac/tar.gz/716f4394641d53f0d79c9ddac3fa93b03a49f278",
+      "sha256": "63048f3c3595f161309ea967531d2b99de71c41ecb1f173d44eaccd89c8133c3"
+    },
+    "openh264": {
+      "version": "652bdb7719f30b52b08e506645a7322ff1b2cc6f",
+      "tag": "v2.6.0",
+      "kind": "tar",
+      "url": "https://codeload.github.com/cisco/openh264/tar.gz/652bdb7719f30b52b08e506645a7322ff1b2cc6f",
+      "sha256": "7a060916a9fcb63ba51d83a4f2388660c0b58797be547c4fa5c52e8d65660a85"
+    },
+    "libhevc": {
+      "version": "8dd2b3392a24b2eed124e50531e79fee9ab48fd6",
+      "tag": "v1.6.0",
+      "kind": "tar",
+      "url": "https://codeload.github.com/ittiam-systems/libhevc/tar.gz/8dd2b3392a24b2eed124e50531e79fee9ab48fd6",
+      "sha256": "bfab10e2c61625517693f157822a6fcf8d242202c65f3f058319d81b61d9dfe1"
+    },
+    "unity": {
+      "version": "v2.6.0",
+      "kind": "tar",
+      "url": "https://codeload.github.com/ThrowTheSwitch/Unity/tar.gz/refs/tags/v2.6.0",
+      "sha256": "aa4c9fb1ae5fc5242f914c65f3557e817e40cb37f04a31e5ff76d1ab89dbf674"
+    },
+    "doctest": {
+      "version": "v2.4.11",
+      "kind": "tar",
+      "url": "https://codeload.github.com/doctest/doctest/tar.gz/refs/tags/v2.4.11",
+      "sha256": "632ed2c05a7f53fa961381497bf8069093f0d6628c5f26286161fbd32a560186"
+    },
+    "renderdoc": {
+      "version": "c26a5405e98ece429f3293574b9b5e08095f6e77",
+      "kind": "file",
+      "filename": "renderdoc_app.h",
+      "url": "https://raw.githubusercontent.com/baldurk/renderdoc/c26a5405e98ece429f3293574b9b5e08095f6e77/renderdoc/api/app/renderdoc_app.h",
+      "sha256": "b7005e7dc34c3635046868bbd76d81b9b055aede0f56daa0bd39fedee0639ffb"
+    },
+    "stb_image": {
+      "version": "013ac3beddff3dbffafd5177e7972067cd2b5083",
+      "kind": "file",
+      "filename": "stb_image.h",
+      "url": "https://raw.githubusercontent.com/nothings/stb/013ac3beddff3dbffafd5177e7972067cd2b5083/stb_image.h",
+      "sha256": "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
+    },
+    "sdl-android": {
+      "version": "3.4.0",
+      "kind": "tar",
+      "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.4.0/SDL3-3.4.0.tar.gz",
+      "sha256": "082cbf5f429e0d80820f68dc2b507a94d4cc1b4e70817b119bbb8ec6a69584b8"
+    }
+  }
+}

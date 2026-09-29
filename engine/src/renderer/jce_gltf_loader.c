@@ -16,6 +16,7 @@
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_path.h>   /* jce_path_asset_key (PAK-miss retry) */
 #include <float.h>   /* FLT_MAX (model AABB seed) */
+#include <stddef.h>  /* offsetof (vertex-layout-agnostic de-index) */
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_texture.h>
@@ -204,9 +205,15 @@ static void resolve_path(const char *model_path, const char *uri,
 static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
                                             const char *model_path,
                                             const cgltf_image *image,
-                                            cgltf_data *data)
+                                            cgltf_data *data,
+                                            bool srgb)
 {
     if (!image) return NULL;
+    /* glTF 2.0 states the colour space PER SLOT (§5.19): base colour and
+     * emissive are sRGB-encoded, normal / metallic-roughness / occlusion are
+     * linear data.  The caller passes the slot's answer, so the hardware
+     * decodes before filtering and fs_pbr no longer has to. */
+    const int mode = JCE_TEX_WRAP | (srgb ? JCE_TEX_SRGB : 0);
 
     /* Case 1: embedded texture via buffer_view (common in GLB). */
     if (image->buffer_view) {
@@ -215,7 +222,7 @@ static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
             const uint8_t *img_data = (const uint8_t *)bv->buffer->data
                                       + bv->offset;
             JceTextureCpu *c = jce_texture_decode_cpu_mem(
-                img_data, (size_t)bv->size, JCE_TEX_WRAP);
+                img_data, (size_t)bv->size, mode);
             if (!c)
                 LOG_ERROR(LOG_TAG, "failed to decode embedded texture");
             return c;
@@ -227,7 +234,7 @@ static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
     if (image->uri) {
         char resolved[512];
         resolve_path(model_path, image->uri, resolved, sizeof(resolved));
-        JceTextureCpu *c = jce_texture_decode_cpu(pak, resolved, JCE_TEX_WRAP);
+        JceTextureCpu *c = jce_texture_decode_cpu(pak, resolved, mode);
         if (c) return c;
 
         /* Disk fallback: build absolute path from model_path's directory. */
@@ -256,7 +263,7 @@ static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
             void *img_buf = jce_fs_host_read_all(disk_path, &img_size);
             if (img_buf && img_size > 0) {
                 JceTextureCpu *cc = jce_texture_decode_cpu_mem(
-                    img_buf, (size_t)img_size, JCE_TEX_WRAP);
+                    img_buf, (size_t)img_size, mode);
                 JCE_FREE(img_buf);
                 return cc;
             }
@@ -342,13 +349,15 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
             if (pbr->base_color_texture.texture &&
                 pbr->base_color_texture.texture->image) {
                 m->albedo = load_gltf_texture_cpu(
-                    pak, model_path, pbr->base_color_texture.texture->image, data);
+                    pak, model_path, pbr->base_color_texture.texture->image,
+                    data, /*srgb=*/true);
             }
             if (pbr->metallic_roughness_texture.texture &&
                 pbr->metallic_roughness_texture.texture->image) {
                 m->mr = load_gltf_texture_cpu(
                     pak, model_path,
-                    pbr->metallic_roughness_texture.texture->image, data);
+                    pbr->metallic_roughness_texture.texture->image,
+                    data, /*srgb=*/false);
             }
         }
 
@@ -356,7 +365,8 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
         if (src->normal_texture.texture &&
             src->normal_texture.texture->image) {
             m->normal = load_gltf_texture_cpu(
-                pak, model_path, src->normal_texture.texture->image, data);
+                pak, model_path, src->normal_texture.texture->image,
+                data, /*srgb=*/false);
             dst->normal_scale = src->normal_texture.scale;
             if (dst->normal_scale == 0.0f) dst->normal_scale = 1.0f;
         }
@@ -365,7 +375,8 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
         if (src->occlusion_texture.texture &&
             src->occlusion_texture.texture->image) {
             m->ao = load_gltf_texture_cpu(
-                pak, model_path, src->occlusion_texture.texture->image, data);
+                pak, model_path, src->occlusion_texture.texture->image,
+                data, /*srgb=*/false);
             dst->ao_strength = src->occlusion_texture.scale;
             if (dst->ao_strength == 0.0f) dst->ao_strength = 1.0f;
         }
@@ -374,7 +385,8 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
         if (src->emissive_texture.texture &&
             src->emissive_texture.texture->image) {
             m->emissive = load_gltf_texture_cpu(
-                pak, model_path, src->emissive_texture.texture->image, data);
+                pak, model_path, src->emissive_texture.texture->image,
+                data, /*srgb=*/true);
         }
         dst->emissive_factor[0] = src->emissive_factor[0];
         dst->emissive_factor[1] = src->emissive_factor[1];
@@ -671,6 +683,111 @@ static JceMorphData *build_primitive_morph(const cgltf_primitive *prim,
     return morph;
 }
 
+/* ================================================================== */
+/* Flat normals for primitives that ship no NORMAL attribute           */
+/* ================================================================== */
+
+/* glTF 2.0 (3.7.2.1 Meshes): "When normals are not specified, client
+ * implementations MUST calculate flat normals."  FLAT is the load-bearing
+ * word.  A flat-shaded vertex needs one normal per face it belongs to, and an
+ * indexed vertex buffer cannot hold that -- a cube corner would have to carry
+ * three normals at once.  Averaging the adjacent face normals into the shared
+ * vertex instead produces SMOOTH normals, which round off exactly the hard
+ * edges flat shading exists to show.  So the geometry has to be de-indexed
+ * first: one private vertex per triangle corner. */
+
+/* Face normal of one triangle under glTF's front-face convention: a
+ * right-handed basis with counter-clockwise winding, hence
+ * normalize(cross(p1 - p0, p2 - p0)).
+ *
+ * A zero-area triangle has no defined normal.  It gets +Y rather than the 0/0
+ * that normalizing would produce, because a single NaN normal does not stay
+ * local -- it flows through N.L into the shading of the whole frame. */
+static void flat_face_normal(const float p0[3], const float p1[3],
+                             const float p2[3], float out[3])
+{
+    const float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+    const float e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+    const float n[3]  = { e1[1] * e2[2] - e1[2] * e2[1],
+                          e1[2] * e2[0] - e1[0] * e2[2],
+                          e1[0] * e2[1] - e1[1] * e2[0] };
+    const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    /* Spelled !(len > eps) so a NaN from corrupt POSITION data also takes the
+     * fallback instead of propagating through the divide. */
+    if (!(len > 1e-20f)) {
+        out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
+        return;
+    }
+    out[0] = n[0] / len; out[1] = n[1] / len; out[2] = n[2] / len;
+}
+
+/* De-index a primitive so every triangle owns its three vertices, then stamp
+ * each of them with that triangle's face normal.  The vertex layout arrives as
+ * stride + field offsets so one pass serves both JcePbrVertex and
+ * JceSkinnedVertex without duplicating the loop.
+ *
+ * On success the caller's arrays are replaced (the old ones freed) and the
+ * vertex count becomes 3 * triangle_count.  On allocation failure nothing is
+ * touched: the caller keeps the geometry it already had, which renders
+ * shadeless but is far better than a half-freed primitive. */
+static bool expand_flat_normals(void **io_verts, uint32_t *io_num_verts,
+                                uint32_t **io_indices, uint32_t *io_num_indices,
+                                size_t stride, size_t pos_off, size_t nrm_off)
+{
+    const uint8_t *src     = (const uint8_t *)*io_verts;
+    const uint32_t old_nv  = *io_num_verts;
+    uint32_t      *old_idx = *io_indices;
+    const uint32_t old_ni  = *io_num_indices;
+
+    /* A non-indexed primitive already draws vertices 3t..3t+2 as triangle t,
+     * so its triangle count comes from the vertex array.  It still goes
+     * through the copy: the normals have to be written per triangle, and a
+     * trailing 1-2 vertices that form no triangle are dropped. */
+    const uint32_t tri = old_idx ? (old_ni / 3u) : (old_nv / 3u);
+    if (tri == 0u) return false;
+
+    const uint32_t new_nv = tri * 3u;
+    uint8_t  *dst     = (uint8_t *)JCE_MALLOC((size_t)new_nv * stride);
+    uint32_t *new_idx = old_idx
+        ? (uint32_t *)JCE_MALLOC((size_t)new_nv * sizeof(uint32_t))
+        : NULL;
+    if (!dst || (old_idx && !new_idx)) {
+        if (dst)     JCE_FREE(dst);
+        if (new_idx) JCE_FREE(new_idx);
+        return false;
+    }
+
+    for (uint32_t t = 0; t < tri; ++t) {
+        uint8_t *corner[3];
+        uint32_t k;
+        for (k = 0; k < 3u; ++k) {
+            const uint32_t at = t * 3u + k;
+            uint32_t si = old_idx ? old_idx[at] : at;
+            /* Indices come straight off the accessor unchecked; an
+             * out-of-range one must not become an out-of-bounds read here. */
+            if (si >= old_nv) si = 0u;
+            corner[k] = dst + (size_t)at * stride;
+            memcpy(corner[k], src + (size_t)si * stride, stride);
+            if (new_idx) new_idx[at] = at;
+        }
+        float n[3];
+        flat_face_normal((const float *)(const void *)(corner[0] + pos_off),
+                         (const float *)(const void *)(corner[1] + pos_off),
+                         (const float *)(const void *)(corner[2] + pos_off), n);
+        memcpy(corner[0] + nrm_off, n, sizeof n);
+        memcpy(corner[1] + nrm_off, n, sizeof n);
+        memcpy(corner[2] + nrm_off, n, sizeof n);
+    }
+
+    JCE_FREE(*io_verts);
+    if (old_idx) JCE_FREE(old_idx);
+    *io_verts       = dst;
+    *io_num_verts   = new_nv;
+    *io_indices     = new_idx;
+    *io_num_indices = new_idx ? new_nv : 0u;
+    return true;
+}
+
 /* Extract one glTF primitive's geometry into CPU staging arrays (no GPU
  * buffers; jce_gltf_upload_cpu creates them later).  Ownership of verts +
  * indices transfers to `out`. */
@@ -719,6 +836,19 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
     out->morph = build_primitive_morph(prim, num_verts,
                                        base_weights, base_weights_count);
 
+    /* No NORMAL attribute: the spec demands flat normals, which means
+     * de-indexing (see expand_flat_normals above).  Renumbering the vertices
+     * is only safe while nothing else addresses the base vertex buffer -- the
+     * JCE_lod / JCE_meshlets index sidecars and the per-vertex morph deltas
+     * all do, and the cook only ever attaches those to meshes that already
+     * carry normals.  A non-triangle mode has no face to take a normal from.
+     * Any of those cases keeps the +Y placeholder the loops below write. */
+    const bool flat_normals = (a_norm == NULL) &&
+                              (prim->type == cgltf_primitive_type_triangles) &&
+                              (out->morph == NULL) &&
+                              (out->lod_count == 0u) &&
+                              (out->ml_count == 0u);
+
     /* ---- Skinned mesh ---- */
     if (a_joints && a_wts) {
         JceSkinnedVertex *verts = (JceSkinnedVertex *)JCE_CALLOC(
@@ -758,6 +888,15 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
             verts[vi].weights[3] = tmp[3];
         }
 
+        if (flat_normals) {
+            void *vp = verts;
+            expand_flat_normals(&vp, &num_verts, &indices, &num_indices,
+                                sizeof(JceSkinnedVertex),
+                                offsetof(JceSkinnedVertex, pos),
+                                offsetof(JceSkinnedVertex, normal));
+            verts = (JceSkinnedVertex *)vp;
+        }
+
         out->kind        = 1;   /* skinned */
         out->verts       = verts;
         out->num_verts   = num_verts;
@@ -788,6 +927,15 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
             verts[vi].tangent[2] = 0.0f;
             verts[vi].tangent[3] = 1.0f;
         }
+    }
+
+    if (flat_normals) {
+        void *vp = verts;
+        expand_flat_normals(&vp, &num_verts, &indices, &num_indices,
+                            sizeof(JcePbrVertex),
+                            offsetof(JcePbrVertex, pos),
+                            offsetof(JcePbrVertex, normal));
+        verts = (JcePbrVertex *)vp;
     }
 
     out->kind        = 0;   /* static PBR */

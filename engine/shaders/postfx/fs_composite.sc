@@ -21,12 +21,32 @@ $input v_texcoord0
 
 #include <bgfx_shader.sh>
 
-SAMPLER2D(s_texColor, 0);   /* scene color (HDR) */
-SAMPLER2D(s_texBloom, 1);   /* blurred bloom     */
-SAMPLER3D(s_texLUT,   2);   /* 3D colour-grading LUT (N×N×N RGBA8) */
+SAMPLER2D(s_texColor,  0);  /* scene color (HDR) */
+SAMPLER2D(s_texBloom,  1);  /* blurred bloom     */
+SAMPLER3D(s_texLUT,    2);  /* 3D colour-grading LUT (N×N×N RGBA8) */
+SAMPLER2D(s_texDepth,  4);  /* scene depth, for depth of field.
+                             * Stage 4: 0 colour, 1 bloom, 2 the 3D grade
+                             * LUT, 3 motion vectors are all taken.
+                             * The CoC below never LINEARISES it: the four
+                             * depth edges arrive already projected by the CPU
+                             * through the same matrix that produced this
+                             * buffer, so reverse-Z and the GL/D3D clip-range
+                             * difference cannot make this shader wrong. */
+SAMPLER2D(s_texMotion, 3);  /* RG motion vectors, same encoding as fs_motion_vec.sc.
+                             * ALWAYS BOUND, even with motion blur off: a dangling
+                             * sampler makes WebGL2 reject the whole draw, which is
+                             * the defect the 3D LUT placeholder above exists for. */
 
 uniform vec4 u_compositeFlags;   /* x=bloom y=tonemap z=chromatic w=vignette */
-uniform vec4 u_compositeFlags2;  /* x=grayscale                              */
+uniform vec4 u_compositeFlags2;  /* x=grayscale y=motionBlur z=dof w=dofMaxCoc */
+/* Depth of field, in STORED depth units, sorted numerically low..high:
+ *   x,y = the in-focus band            (CoC 0 between them)
+ *   z,w = where the blur reaches full  (z <= x, w >= y)
+ * Sorted rather than named near/far ON PURPOSE: which numeric end is nearer
+ * depends on the depth convention, and CoC only depends on being OUTSIDE the
+ * band -- so this shader needs no per-backend branch at all. */
+uniform vec4 u_dofParams;
+uniform vec4 u_motionBlurParams; /* x=strength y=maxUvLen z=halfTexelUv w=0  */
 uniform vec4 u_bloomParams;      /* y=intensity                              */
 uniform vec4 u_tonemapParams;    /* x=exposure y=gamma z=tonemapOp(0/1/2)   */
 uniform vec4 u_chromaticParams;  /* x=strength                               */
@@ -90,10 +110,146 @@ vec3 selectTonemap(vec3 c)
     return acesFilm(c);
 }
 
+/* The scene sample, with per-pixel motion blur folded in.
+ *
+ * WHY HERE AND NOT AS ITS OWN PASS.  It costs no extra view and no extra
+ * render target, and it lands on the HDR colour BEFORE the bloom add and the
+ * tonemap -- which is the ordering that makes a smeared highlight bloom as a
+ * streak instead of blooming first and then being smeared into a band.
+ *
+ * The vector is decoded EXACTLY as fs_motion_vec.sc encoded it:
+ *   mv = (cur_ndc - prev_ndc) * 0.5 + 0.5   =>   d_ndc = (mv - 0.5) * 2
+ * and that producer builds its ndc as `v_texcoord0 * 2 - 1`, i.e. it treats
+ * uv as ndc with NO Y flip.  So the inverse is d_uv = d_ndc * 0.5, also with
+ * no flip.  Agreeing with the producer is the whole job: this repository has
+ * shipped a mirrored `uv*2-1` twelve times in one campaign, and every one of
+ * them looked plausible on its own.
+ *
+ * Taps are FIXED at 8 rather than driven by a uniform loop bound: the desktop
+ * GL floor is 3.1 and the GLSL that reaches it goes through glsl-optimizer, so
+ * a constant trip count is the portable one.  Strength lengthens the trail
+ * instead. */
+#define MB_TAPS 8
+
+/* Circle of confusion at `uv`, 0 (sharp) .. 1 (fully blurred).
+ *
+ * NO LINEARISATION, and that is the point: the four edges arrive already
+ * projected by the CPU through the same matrix that filled this depth buffer,
+ * and they arrive SORTED numerically rather than named near/far.  Which
+ * numeric end is nearer depends on the depth convention (reverse-Z, and GL's
+ * [-1,1] clip range against D3D's [0,1]); being OUTSIDE the in-focus band
+ * does not.  So this function has no per-backend branch, in a repository that
+ * has shipped twelve mirrored ones in a single campaign. */
+float dofCoc(vec2 uv)
+{
+    float d = texture2D(s_texDepth, uv).r;
+    if (d < u_dofParams.x)
+        return clamp((u_dofParams.x - d)
+                   / max(u_dofParams.x - u_dofParams.z, 1e-6), 0.0, 1.0);
+    if (d > u_dofParams.y)
+        return clamp((d - u_dofParams.y)
+                   / max(u_dofParams.w - u_dofParams.y, 1e-6), 0.0, 1.0);
+    return 0.0;
+}
+
+/* A 16-tap golden-angle disk.  Constant, so the loop bound is constant --
+ * the GLSL-120 rule this tree's shaders are written to. */
+#define DOF_TAPS 16
+
+vec3 sceneSample(vec2 uv)
+{
+    if (u_compositeFlags2.y > 0.5)
+    {
+        vec2 mv = texture2D(s_texMotion, uv).rg * 2.0 - 1.0;
+        /* NDC delta -> UV delta, WITH the per-backend Y branch.  On GL
+         * (bottom-left origin, vs_postfx already flipped v) duv = +dndc/2; on
+         * D3D/VK/Metal uv.y = (1-ndc.y)/2 so duv.y = -dndc.y/2.  Copied from
+         * fs_taa.sc rather than re-derived, and it stays in lockstep with the
+         * two writers (fs_motion_vec.sc, fs_gbuffer_vel.sc) that both emit a
+         * TRUE clip-NDC delta.  Unconditional, it is right on GL and inverted
+         * on D3D -- which smears vertically instead of along the motion, and
+         * this repository has shipped that exact mirror twelve times in one
+         * campaign because every one of them looks plausible alone. */
+#if BGFX_SHADER_LANGUAGE_GLSL
+        vec2 v = mv * 0.5;
+#else
+        vec2 v = vec2(mv.x, -mv.y) * 0.5;
+#endif
+        v *= u_motionBlurParams.x;
+
+        /* Clamp the trail. Without it a camera cut -- or the first frame after
+         * a teleport, where the previous camera has nothing to do with this
+         * one -- samples right across the screen and the frame turns to soup.
+         * A cut is exactly when the motion vector is both huge and meaningless. */
+        float len = length(v);
+        if (len > u_motionBlurParams.y)
+            v *= u_motionBlurParams.y / max(len, 1e-6);
+
+        /* Sub-pixel motion must be a no-op, not a slightly softer image.
+         *
+         * THE THRESHOLD IS HALF A TEXEL, passed in, not a bare constant.  A
+         * still camera still produces a little numerical drift through the
+         * depth reconstruction and the inverse view-proj, and a fixed 1e-4 is
+         * 0.13 px at 1280 wide and 0.05 px at 3840 -- so the same constant
+         * means different things on different monitors.  Measured: with the
+         * bare constant, a STATIC frame moved 33.3% of its pixels (>4 at
+         * 3.09%) against a 0.38% / 0.00% capture noise floor, and the image
+         * std fell 55.69 -> 55.49.  That is a permanent, unexplained softness
+         * that reads as "the tonemap is wrong", on a frame where nothing is
+         * moving.  Below half a texel every tap lands in the same texel and
+         * the only thing the loop can add is bilinear mush. */
+        if (len > u_motionBlurParams.z)
+        {
+            vec3 acc = vec3_splat(0.0);
+            for (int i = 0; i < MB_TAPS; ++i)
+            {
+                /* Backwards along the trail: the vector points current ->
+                 * previous, so the smear belongs BEHIND the moving pixel. */
+                float t = float(i) / float(MB_TAPS - 1);
+                acc += texture2D(s_texColor, uv - v * t).rgb;
+            }
+            return acc / float(MB_TAPS);
+        }
+    }
+    if (u_compositeFlags2.z > 0.5)
+    {
+        float coc = dofCoc(uv);
+        /* Sub-texel radius is a NO-OP, not a slightly softer image -- the same
+         * rule motion blur above needed, learnt the same way: a threshold of
+         * zero leaves an in-focus frame measurably blurred by bilinear mush
+         * from 16 taps that all land in the same texel. */
+        float r = coc * u_compositeFlags2.w;
+        if (r > u_motionBlurParams.z)
+        {
+            vec3  acc  = vec3_splat(0.0);
+            float wsum = 0.0;
+            for (int i = 0; i < DOF_TAPS; ++i)
+            {
+                /* Golden-angle spiral: even coverage without a lookup table,
+                 * and no two taps land on the same ring the way a regular
+                 * grid's do. */
+                float fi = float(i) + 0.5;
+                float a  = fi * 2.39996323;
+                float rr = sqrt(fi / float(DOF_TAPS)) * r;
+                vec2  o  = vec2(cos(a), sin(a)) * rr;
+                /* Weighted by the SAMPLE's own CoC: a sharp foreground pixel
+                 * must not bleed into a blurred background one, which is the
+                 * classic gather-DoF halo.  +0.05 keeps a fully sharp
+                 * neighbourhood from dividing by zero. */
+                float wgt = dofCoc(uv + o) + 0.05;
+                acc += texture2D(s_texColor, uv + o).rgb * wgt;
+                wsum += wgt;
+            }
+            return acc / max(wsum, 1e-6);
+        }
+    }
+    return texture2D(s_texColor, uv).rgb;
+}
+
 /* scene (+ optional bloom) then optional tonemap, evaluated at one uv. */
 vec3 combineTonemap(vec2 uv)
 {
-    vec3 c = texture2D(s_texColor, uv).rgb;
+    vec3 c = sceneSample(uv);
     if (u_compositeFlags.x > 0.5)
         c += texture2D(s_texBloom, uv).rgb * u_bloomParams.y;
     if (u_compositeFlags.y > 0.5)

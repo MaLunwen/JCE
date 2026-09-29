@@ -21,7 +21,7 @@
  * The guard has TWO spellings and grepping for only the first will convince
  * you this file is broken when it is not:
  *
- *     s->have_host && s->host.<member>          70 functions
+ *     s->have_host && s->host.<member>          100 functions
  *     !s->have_host || !s->host.<member>        1 function (jce.get_touch),
  *                                               where an index_base binding
  *                                               folds the guard into its
@@ -43,7 +43,7 @@
 #include <string.h>
 
 /* jce.get_position — shape: fallible_out
- * World-space position of `entity`. Absent when the entity has no transform. */
+ * LOCAL position of `entity` -- its own translation, not composed up the parent chain. Absent when the entity has no transform. Use get_world_position for the composed pose. This doc said 'World-space' until 2026-08-26; the implementation always returned the local TRS (jce_scene_get_transform), and the wrong word was generated into all five language SDKs. */
 static int l_jce_get_position(lua_State *L)
 {
     JceScript *s = jce_script_self_from_upvalue(L);
@@ -111,6 +111,24 @@ static int l_jce_get_scale(lua_State *L)
     float out_xyz[3];
     if (s->have_host && s->host.get_scale &&
         s->host.get_scale(s->host.user, e, out_xyz)) {
+        lua_pushnumber(L, (lua_Number)out_xyz[0]);
+        lua_pushnumber(L, (lua_Number)out_xyz[1]);
+        lua_pushnumber(L, (lua_Number)out_xyz[2]);
+        return 3;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.get_world_position — shape: fallible_out
+ * WORLD position of `entity`: its local TRS composed up the parent chain (jce_scene_get_world_matrix). Absent when the entity has no transform. Every parented rig -- arms, jaws, fingers, pads -- needs this rather than get_position. */
+static int l_jce_get_world_position(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float out_xyz[3];
+    if (s->have_host && s->host.get_world_position &&
+        s->host.get_world_position(s->host.user, e, out_xyz)) {
         lua_pushnumber(L, (lua_Number)out_xyz[0]);
         lua_pushnumber(L, (lua_Number)out_xyz[1]);
         lua_pushnumber(L, (lua_Number)out_xyz[2]);
@@ -382,6 +400,68 @@ static int l_jce_raycast(lua_State *L)
         return 8;
     }
     lua_pushinteger(L, 0);   /* miss */
+    return 1;
+}
+
+/* jce.raycast_filtered — shape: fallible_out
+ * Closest hit along the ray, honouring a layer mask and the trigger skip -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every layer and hit_triggers defaults to false, so the common call stays origin/dir/distance and the filter is what you add when you need it. hit_triggers is separate from the mask because a trigger volume is not a layer: collapsing them would make 'ignore triggers on layer 3' inexpressible. */
+static int l_jce_raycast_filtered(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float origin[3];
+    origin[0] = (float)luaL_checknumber(L, 1);
+    origin[1] = (float)luaL_checknumber(L, 2);
+    origin[2] = (float)luaL_checknumber(L, 3);
+    float dir[3];
+    dir[0] = (float)luaL_checknumber(L, 4);
+    dir[1] = (float)luaL_checknumber(L, 5);
+    dir[2] = (float)luaL_checknumber(L, 6);
+    float max_dist = (float)luaL_checknumber(L, 7);
+    uint32_t layer_mask = (uint32_t)luaL_optinteger(L, 8, 0);
+    bool hit_triggers = lua_isnoneornil(L, 9) ? false : lua_toboolean(L, 9);
+    JceScriptRaycastHit out;
+    memset(&out, 0, sizeof out);
+    if (s->have_host && s->host.raycast_filtered &&
+        s->host.raycast_filtered(s->host.user, origin, dir, max_dist, layer_mask, hit_triggers, &out)) {
+        lua_pushinteger(L, (lua_Integer)out.entity);
+        lua_pushnumber(L, (lua_Number)out.point[0]);
+        lua_pushnumber(L, (lua_Number)out.point[1]);
+        lua_pushnumber(L, (lua_Number)out.point[2]);
+        lua_pushnumber(L, (lua_Number)out.normal[0]);
+        lua_pushnumber(L, (lua_Number)out.normal[1]);
+        lua_pushnumber(L, (lua_Number)out.normal[2]);
+        lua_pushnumber(L, (lua_Number)out.distance);
+        return 8;
+    }
+    lua_pushinteger(L, 0);   /* miss */
+    return 1;
+}
+
+/* jce.raycast_all — shape: entity_table
+ * Every entity the ray passes through, as one array sorted near to far. layer_mask 0 means every layer; hit_triggers defaults to false. Returns ENTITIES rather than full hit records because the eight-value hit does not survive as an array shape across seven languages without inventing a per-language container -- re-query a specific one with jce.raycast_filtered when you need its point and normal. */
+static int l_jce_raycast_all(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float origin[3];
+    origin[0] = (float)luaL_checknumber(L, 1);
+    origin[1] = (float)luaL_checknumber(L, 2);
+    origin[2] = (float)luaL_checknumber(L, 3);
+    float dir[3];
+    dir[0] = (float)luaL_checknumber(L, 4);
+    dir[1] = (float)luaL_checknumber(L, 5);
+    dir[2] = (float)luaL_checknumber(L, 6);
+    float max_dist = (float)luaL_checknumber(L, 7);
+    uint32_t layer_mask = (uint32_t)luaL_optinteger(L, 8, 0);
+    bool hit_triggers = lua_isnoneornil(L, 9) ? false : lua_toboolean(L, 9);
+    JceScriptEntity found[256];
+    int n = 0;
+    if (s->have_host && s->host.raycast_all)
+        n = s->host.raycast_all(s->host.user, origin, dir, max_dist, layer_mask, hit_triggers, found, 256);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)found[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
     return 1;
 }
 
@@ -671,6 +751,32 @@ static int l_jce_ui_set_slider(lua_State *L)
     return 0;
 }
 
+/* jce.ui_get_progress — shape: fallible_out */
+static int l_jce_ui_get_progress(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float out = 0.0f;
+    if (s->have_host && s->host.ui_get_progress &&
+        s->host.ui_get_progress(s->host.user, e, &out)) {
+        lua_pushnumber(L, (lua_Number)out);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.ui_set_progress — shape: void_call */
+static int l_jce_ui_set_progress(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float v = (float)luaL_checknumber(L, 2);
+    if (s->have_host && s->host.ui_set_progress)
+        s->host.ui_set_progress(s->host.user, e, v);
+    return 0;
+}
+
 /* jce.ui_get_toggle — shape: fallible_out */
 static int l_jce_ui_get_toggle(lua_State *L)
 {
@@ -957,12 +1063,347 @@ static int l_jce_audio_set_volume(lua_State *L)
     return 0;
 }
 
+/* jce.ui_get_dropdown — shape: fallible_out
+ * Selected option INDEX of `entity`'s UIDropdown. Absent when the entity has no dropdown, so a script can tell 'no dropdown' from 'a dropdown reading 0'. The index and not the label: branching on which option is the common case, and a label would make it a string compare. */
+static int l_jce_ui_get_dropdown(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    int out = 0;
+    if (s->have_host && s->host.ui_get_dropdown &&
+        s->host.ui_get_dropdown(s->host.user, e, &out)) {
+        lua_pushinteger(L, (lua_Integer)out);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.ui_set_dropdown — shape: void_call
+ * Select an option by INDEX. Clamped into [0, option_count-1] rather than refused, the way ui_set_progress clamps and the way the scene loader clamps: the draw already clamps, so storing outside the range would make the component and the picture disagree. */
+static int l_jce_ui_set_dropdown(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    int index = (int)luaL_checkinteger(L, 2);
+    if (s->have_host && s->host.ui_set_dropdown)
+        s->host.ui_set_dropdown(s->host.user, e, index);
+    return 0;
+}
+
+/* jce.ui_get_input_text — shape: value_return
+ * Current text of `entity`'s UIInputField, or '' when it has none. The string is the component's own buffer and is valid until the next mutation of that entity -- the same contract tr() and get_locale() carry; every binding copies it and none may store it. */
+static int l_jce_ui_get_input_text(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char * v = (s->have_host && s->host.ui_get_input_text)
+                ? s->host.ui_get_input_text(s->host.user, e) : "";
+    lua_pushstring(L, v ? v : "");
+    return 1;
+}
+
+/* jce.ui_set_input_text — shape: void_call
+ * Replace the UIInputField's text. Truncated to the field's capacity and to char_limit when one is set -- the same cap the canvas applies to typed input, so a script write and a keystroke cannot disagree about what the field holds. A truncation is logged rather than silent. */
+static int l_jce_ui_set_input_text(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char *text = luaL_checkstring(L, 2);
+    if (s->have_host && s->host.ui_set_input_text)
+        s->host.ui_set_input_text(s->host.user, e, text);
+    return 0;
+}
+
+/* jce.ui_get_scroll — shape: fallible_out
+ * Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units -- what the component stores and what the wheel path clamps, not device px. Absent when the entity has no scroll view. */
+static int l_jce_ui_get_scroll(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float out_xy[2];
+    if (s->have_host && s->host.ui_get_scroll &&
+        s->host.ui_get_scroll(s->host.user, e, out_xy)) {
+        lua_pushnumber(L, (lua_Number)out_xy[0]);
+        lua_pushnumber(L, (lua_Number)out_xy[1]);
+        return 2;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.ui_set_scroll — shape: void_call
+ * Set the scroll offset in reference units. A disabled axis is pinned to 0 and each axis is clamped the way the wheel path clamps, so a script cannot push the offset somewhere a wheel could not; the canvas re-clamps against the resolved viewport on the next render. */
+static int l_jce_ui_set_scroll(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    float x = (float)luaL_checknumber(L, 2);
+    float y = (float)luaL_checknumber(L, 3);
+    if (s->have_host && s->host.ui_set_scroll)
+        s->host.ui_set_scroll(s->host.user, e, x, y);
+    return 0;
+}
+
+/* jce.world_get_hour — shape: value_return
+ * Live hour of day in [0, 24) -- what the sky is showing now, NOT the authored tod_hour seed a scene starts from.  Reading the seed would return the level's start-of-day forever while the sky moved. */
+static int l_jce_world_get_hour(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float v = (s->have_host && s->host.world_get_hour)
+                ? s->host.world_get_hour(s->host.user) : 0.0f;
+    lua_pushnumber(L, (lua_Number)v);
+    return 1;
+}
+
+/* jce.world_set_hour — shape: void_call
+ * Move the live clock, wrapping into [0, 24).  For 'sleep until dawn'.  The authored seed is untouched, so reloading the scene still starts where the designer set it. */
+static int l_jce_world_set_hour(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float hour = (float)luaL_checknumber(L, 1);
+    if (s->have_host && s->host.world_set_hour)
+        s->host.world_set_hour(s->host.user, hour);
+    return 0;
+}
+
+/* jce.world_is_daytime — shape: value_return
+ * True while the sun is above the horizon.  THE predicate for 'is it night?' -- every key-light chooser in the engine is required to agree on this one, so a script that rolled its own threshold would disagree with the lighting it can see. */
+static int l_jce_world_is_daytime(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    bool v = (s->have_host && s->host.world_is_daytime)
+                ? s->host.world_is_daytime(s->host.user) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.world_get_weather — shape: value_return
+ * Authored weather type: 0 clear, 1 rain, 2 snow. */
+static int l_jce_world_get_weather(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    int v = (s->have_host && s->host.world_get_weather)
+                ? s->host.world_get_weather(s->host.user) : 0;
+    lua_pushinteger(L, (lua_Integer)v);
+    return 1;
+}
+
+/* jce.world_get_weather_intensity — shape: value_return
+ * Authored weather intensity in [0, 1]. */
+static int l_jce_world_get_weather_intensity(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float v = (s->have_host && s->host.world_get_weather_intensity)
+                ? s->host.world_get_weather_intensity(s->host.user) : 0.0f;
+    lua_pushnumber(L, (lua_Number)v);
+    return 1;
+}
+
+/* jce.world_get_wind_speed — shape: value_return
+ * Instantaneous wind speed in m/s -- the sustained speed plus this moment's gust.  Do NOT key a cache on it: it changes every frame by design.  It is the same number the ocean spectrum and the vegetation shader read, so a script cannot disagree with what is on screen. */
+static int l_jce_world_get_wind_speed(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float v = (s->have_host && s->host.world_get_wind_speed)
+                ? s->host.world_get_wind_speed(s->host.user) : 0.0f;
+    lua_pushnumber(L, (lua_Number)v);
+    return 1;
+}
+
+/* jce.request_scene — shape: value_return */
+static int l_jce_request_scene(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *scene_path = luaL_checkstring(L, 1);
+    bool v = (s->have_host && s->host.request_scene)
+                ? s->host.request_scene(s->host.user, scene_path) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.is_transitioning — shape: value_return */
+static int l_jce_is_transitioning(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    bool v = (s->have_host && s->host.is_transitioning)
+                ? s->host.is_transitioning(s->host.user) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.audio_play — shape: value_return */
+static int l_jce_audio_play(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    bool v = (s->have_host && s->host.audio_play)
+                ? s->host.audio_play(s->host.user, e) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.audio_stop — shape: value_return */
+static int l_jce_audio_stop(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    bool v = (s->have_host && s->host.audio_stop)
+                ? s->host.audio_stop(s->host.user, e) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.audio_is_playing — shape: value_return */
+static int l_jce_audio_is_playing(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    bool v = (s->have_host && s->host.audio_is_playing)
+                ? s->host.audio_is_playing(s->host.user, e) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.save_game — shape: value_return */
+static int l_jce_save_game(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *path = luaL_checkstring(L, 1);
+    bool v = (s->have_host && s->host.save_game)
+                ? s->host.save_game(s->host.user, path) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.load_game — shape: value_return */
+static int l_jce_load_game(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *path = luaL_checkstring(L, 1);
+    bool v = (s->have_host && s->host.load_game)
+                ? s->host.load_game(s->host.user, path) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.overlap_sphere — shape: entity_table
+ * Entities whose collider overlaps the sphere, as one array. layer_mask 0 means all layers. Triggers are skipped. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size. */
+static int l_jce_overlap_sphere(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    float z = (float)luaL_checknumber(L, 3);
+    float radius = (float)luaL_checknumber(L, 4);
+    uint32_t layer_mask = (uint32_t)luaL_optinteger(L, 5, 0);
+    JceScriptEntity found[256];
+    int n = 0;
+    if (s->have_host && s->host.overlap_sphere)
+        n = s->host.overlap_sphere(s->host.user, x, y, z, radius, layer_mask, found, 256);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)found[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* jce.overlap_box — shape: entity_table
+ * Entities whose collider overlaps the axis-aligned box (half-extents), as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size. */
+static int l_jce_overlap_box(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    float z = (float)luaL_checknumber(L, 3);
+    float hx = (float)luaL_checknumber(L, 4);
+    float hy = (float)luaL_checknumber(L, 5);
+    float hz = (float)luaL_checknumber(L, 6);
+    uint32_t layer_mask = (uint32_t)luaL_optinteger(L, 7, 0);
+    JceScriptEntity found[256];
+    int n = 0;
+    if (s->have_host && s->host.overlap_box)
+        n = s->host.overlap_box(s->host.user, x, y, z, hx, hy, hz, layer_mask, found, 256);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)found[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* jce.get_param — shape: fallible_out
+ * Returns kind, number, entity for an AUTHORED script parameter -- Unity's [SerializeField], Godot's @export.  Returns nil when the entity has no script component, when no parameter of that name is authored, or when the name is empty: three absences a script cannot act differently on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author expects. */
+static int l_jce_get_param(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    int out_kind = 0;
+    double out_number = 0.0;
+    JceScriptEntity out_entity = 0;
+    if (s->have_host && s->host.get_script_param &&
+        s->host.get_script_param(s->host.user, e, name, &out_kind, &out_number, &out_entity)) {
+        lua_pushinteger(L, (lua_Integer)out_kind);
+        lua_pushnumber(L, (lua_Number)out_number);
+        lua_pushinteger(L, (lua_Integer)out_entity);
+        return 3;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.get_param_text — shape: value_return
+ * The TEXT value of an authored script parameter, or '' when the entity has no script component, no parameter of that name, or one that is not text. Empty rather than nil for the same reason ui_get_input_text is empty: a script comparing strings should not have to test for nil first. The string is the component's own buffer -- copy it if you keep it. */
+static int l_jce_get_param_text(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    JceScriptEntity e = (JceScriptEntity)luaL_checkinteger(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    const char * v = (s->have_host && s->host.get_script_param_text)
+                ? s->host.get_script_param_text(s->host.user, e, name) : "";
+    lua_pushstring(L, v ? v : "");
+    return 1;
+}
+
+/* jce.curve_eval — shape: fallible_out
+ * Sample an AUTHORED curve -- the documents the editor's Curve Editor writes, which nothing could read until this binding existed. Unity's AnimationCurve shape: the curve is a designer-authored function and the script decides what it means, so the engine never has to invent what a curve DRIVES. Returns nil when the path does not resolve, the document does not parse, the named channel is absent, or that channel has no keys -- so a curve that genuinely evaluates to 0 and a curve that is not there are never one reading, and `jce.curve_eval(p, 'kick', t) or 0.0` reads the way an author expects. An empty channel name means the FIRST channel, which is a different request from a name that is not there. The parsed curve is cached per runtime, so a call inside on_update costs a name compare, not a JSON parse. */
+static int l_jce_curve_eval(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *path = luaL_checkstring(L, 1);
+    const char *channel = luaL_checkstring(L, 2);
+    double t = luaL_checknumber(L, 3);
+    double out_value = 0.0;
+    if (s->have_host && s->host.curve_eval &&
+        s->host.curve_eval(s->host.user, path, channel, t, &out_value)) {
+        lua_pushnumber(L, (lua_Number)out_value);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* jce.vcam_activate — shape: value_return
+ * Cut to the virtual camera with this name, ahead of priority.  Returns 1 when the name resolves to a camera that is active and enabled, 0 otherwise -- the request is recorded either way, so naming a camera in a streaming cell that has not loaded yet does not silently become 'whatever priority says'.  Pass an empty string to clear it and hand the decision back to priority.  It does NOT rewrite the authored components: the override lives in the vcam system, so a cutscene cannot bake its camera choice into the level file. */
+static int l_jce_vcam_activate(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *name = luaL_checkstring(L, 1);
+    int v = (s->have_host && s->host.vcam_activate)
+                ? s->host.vcam_activate(s->host.user, name) : 0;
+    lua_pushinteger(L, (lua_Integer)v);
+    return 1;
+}
+
 const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "get_position",
     "set_position",
     "get_rotation",
     "set_rotation",
     "get_scale",
+    "get_world_position",
     "set_scale",
     "set_parent",
     "get_parent",
@@ -984,6 +1425,8 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "gas_get",
     "gas_apply",
     "raycast",
+    "raycast_filtered",
+    "raycast_all",
     "apply_impulse",
     "set_velocity",
     "anim_set_float",
@@ -1007,6 +1450,8 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "get_move",
     "ui_get_slider",
     "ui_set_slider",
+    "ui_get_progress",
+    "ui_set_progress",
     "ui_get_toggle",
     "ui_set_toggle",
     "ui_set_text",
@@ -1029,6 +1474,31 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "render_get",
     "render_set",
     "audio_set_volume",
+    "ui_get_dropdown",
+    "ui_set_dropdown",
+    "ui_get_input_text",
+    "ui_set_input_text",
+    "ui_get_scroll",
+    "ui_set_scroll",
+    "world_get_hour",
+    "world_set_hour",
+    "world_is_daytime",
+    "world_get_weather",
+    "world_get_weather_intensity",
+    "world_get_wind_speed",
+    "request_scene",
+    "is_transitioning",
+    "audio_play",
+    "audio_stop",
+    "audio_is_playing",
+    "save_game",
+    "load_game",
+    "overlap_sphere",
+    "overlap_box",
+    "get_param",
+    "get_param_text",
+    "curve_eval",
+    "vcam_activate",
 };
 
 void jce_script_install_generated_bindings(JceScript *s)
@@ -1039,6 +1509,7 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "get_rotation", l_jce_get_rotation);
     jce_script_register_binding(L, s, "set_rotation", l_jce_set_rotation);
     jce_script_register_binding(L, s, "get_scale", l_jce_get_scale);
+    jce_script_register_binding(L, s, "get_world_position", l_jce_get_world_position);
     jce_script_register_binding(L, s, "set_scale", l_jce_set_scale);
     jce_script_register_binding(L, s, "set_parent", l_jce_set_parent);
     jce_script_register_binding(L, s, "get_parent", l_jce_get_parent);
@@ -1060,6 +1531,8 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "gas_get", l_jce_gas_get);
     jce_script_register_binding(L, s, "gas_apply", l_jce_gas_apply);
     jce_script_register_binding(L, s, "raycast", l_jce_raycast);
+    jce_script_register_binding(L, s, "raycast_filtered", l_jce_raycast_filtered);
+    jce_script_register_binding(L, s, "raycast_all", l_jce_raycast_all);
     jce_script_register_binding(L, s, "apply_impulse", l_jce_apply_impulse);
     jce_script_register_binding(L, s, "set_velocity", l_jce_set_velocity);
     jce_script_register_binding(L, s, "anim_set_float", l_jce_anim_set_float);
@@ -1083,6 +1556,8 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "get_move", l_jce_get_move);
     jce_script_register_binding(L, s, "ui_get_slider", l_jce_ui_get_slider);
     jce_script_register_binding(L, s, "ui_set_slider", l_jce_ui_set_slider);
+    jce_script_register_binding(L, s, "ui_get_progress", l_jce_ui_get_progress);
+    jce_script_register_binding(L, s, "ui_set_progress", l_jce_ui_set_progress);
     jce_script_register_binding(L, s, "ui_get_toggle", l_jce_ui_get_toggle);
     jce_script_register_binding(L, s, "ui_set_toggle", l_jce_ui_set_toggle);
     jce_script_register_binding(L, s, "ui_set_text", l_jce_ui_set_text);
@@ -1105,6 +1580,31 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "render_get", l_jce_render_get);
     jce_script_register_binding(L, s, "render_set", l_jce_render_set);
     jce_script_register_binding(L, s, "audio_set_volume", l_jce_audio_set_volume);
+    jce_script_register_binding(L, s, "ui_get_dropdown", l_jce_ui_get_dropdown);
+    jce_script_register_binding(L, s, "ui_set_dropdown", l_jce_ui_set_dropdown);
+    jce_script_register_binding(L, s, "ui_get_input_text", l_jce_ui_get_input_text);
+    jce_script_register_binding(L, s, "ui_set_input_text", l_jce_ui_set_input_text);
+    jce_script_register_binding(L, s, "ui_get_scroll", l_jce_ui_get_scroll);
+    jce_script_register_binding(L, s, "ui_set_scroll", l_jce_ui_set_scroll);
+    jce_script_register_binding(L, s, "world_get_hour", l_jce_world_get_hour);
+    jce_script_register_binding(L, s, "world_set_hour", l_jce_world_set_hour);
+    jce_script_register_binding(L, s, "world_is_daytime", l_jce_world_is_daytime);
+    jce_script_register_binding(L, s, "world_get_weather", l_jce_world_get_weather);
+    jce_script_register_binding(L, s, "world_get_weather_intensity", l_jce_world_get_weather_intensity);
+    jce_script_register_binding(L, s, "world_get_wind_speed", l_jce_world_get_wind_speed);
+    jce_script_register_binding(L, s, "request_scene", l_jce_request_scene);
+    jce_script_register_binding(L, s, "is_transitioning", l_jce_is_transitioning);
+    jce_script_register_binding(L, s, "audio_play", l_jce_audio_play);
+    jce_script_register_binding(L, s, "audio_stop", l_jce_audio_stop);
+    jce_script_register_binding(L, s, "audio_is_playing", l_jce_audio_is_playing);
+    jce_script_register_binding(L, s, "save_game", l_jce_save_game);
+    jce_script_register_binding(L, s, "load_game", l_jce_load_game);
+    jce_script_register_binding(L, s, "overlap_sphere", l_jce_overlap_sphere);
+    jce_script_register_binding(L, s, "overlap_box", l_jce_overlap_box);
+    jce_script_register_binding(L, s, "get_param", l_jce_get_param);
+    jce_script_register_binding(L, s, "get_param_text", l_jce_get_param_text);
+    jce_script_register_binding(L, s, "curve_eval", l_jce_curve_eval);
+    jce_script_register_binding(L, s, "vcam_activate", l_jce_vcam_activate);
     /* json_null: lightuserdata_sentinel — no register_binding call,
      * so no source regex can see it.
      * tests/middleware/script/test_jce_script_table_shape.c can. */

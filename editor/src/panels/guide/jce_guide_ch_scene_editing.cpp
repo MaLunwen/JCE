@@ -90,6 +90,20 @@ static const JceGuideBlock b_undo[] = {
     { JCE_GB_MENU_PATH,  nullptr, 0, "menu.file>menu.file.saveScene" },
 };
 
+static const JceGuideBlock b_ai[] = {
+    { JCE_GB_P,          "guide.scene.ai.p1",     0, nullptr },
+    { JCE_GB_OPEN_PANEL, "window.aiAssistant",    JCE_PANEL_AI_ASSISTANT, "###ai_assistant" },
+    { JCE_GB_MENU_PATH,  nullptr, 0, "menu.window>window.group.tools>window.aiAssistant" },
+    { JCE_GB_STEP,       "guide.scene.ai.s1",     0, nullptr },
+    { JCE_GB_STEP,       "guide.scene.ai.s2",     0, nullptr },
+    { JCE_GB_STEP,       "guide.scene.ai.s3",     0, nullptr },
+    { JCE_GB_STEP,       "guide.scene.ai.s4",     0, nullptr },
+    { JCE_GB_STEP,       "guide.scene.ai.s5",     0, nullptr },
+    { JCE_GB_WARN,       "guide.scene.ai.warn1",  0, nullptr },
+    { JCE_GB_TIP,        "guide.scene.ai.tip1",   0, nullptr },
+    { JCE_GB_P,          "guide.scene.ai.p2",     0, nullptr },
+};
+
 static const JceGuideTopic k_topics[] = {
     { "guide.scene.hierarchy.title", b_hierarchy, JCE_GUIDE_COUNT(b_hierarchy) },
     { "guide.scene.selection.title", b_selection, JCE_GUIDE_COUNT(b_selection) },
@@ -97,6 +111,7 @@ static const JceGuideTopic k_topics[] = {
     { "guide.scene.pivot.title",     b_pivot,     JCE_GUIDE_COUNT(b_pivot) },
     { "guide.scene.assetdrop.title", b_assetdrop, JCE_GUIDE_COUNT(b_assetdrop) },
     { "guide.scene.undo.title",      b_undo,      JCE_GUIDE_COUNT(b_undo) },
+    { "guide.scene.ai.title",        b_ai,        JCE_GUIDE_COUNT(b_ai) },
 };
 
 const JceGuideChapter g_jce_guide_ch_scene_editing = {

@@ -8,6 +8,7 @@
  */
 
 #include <jce/os/core/jce_perf_phase.h>
+#include "io/jce_editor_mesh_predecode.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_filesystem.h>
 
@@ -30,11 +31,21 @@ extern "C" {
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_taa.h>   /* TSR jitter (Halton) for temporal upscale */
 #include <jce/os/core/jce_console.h>   /* r.upscaler live cvar (Off/RCAS/TSR) */
+#include <jce/renderer/jce_impostor.h>   /* modal bake owns the frame */
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>   /* jce_renderer_request_screenshot_fbo */
-#include <jce/renderer/jce_render_settings.h>   /* grass_enabled project gate (Stage 1b.6) */
+#include <jce/renderer/jce_render_settings.h>
+#include <jce/middleware/scene/jce_lod.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 }
+
+/* C++ header (std::string): it MUST NOT sit in the extern "C" block above.
+ * It did for one build, and the linker error named an UNMANGLED symbol while
+ * printing a "could potentially match" hint whose demangled text looked
+ * identical to the definition -- the two names differ only in linkage. */
+#include "core/jce_editor_effective_render_settings.h"
+#include <jce/renderer/jce_particles.h>
+#include <jce/middleware/scene/jce_scene_probe_capture.h>
 
 /* ── State instance (shared via extern in internal header) ────────── */
 
@@ -175,6 +186,16 @@ static JceModel *ed_load_model_cb(const char *path, void *ud)
         load_path = resolved;
     }
 
+    /* The mesh validation pass has usually already decoded this exact file on
+     * a worker thread; claiming its result turns a ~92 ms decode+upload into a
+     * ~11 ms upload.  Keyed on the raw component path, which is what both
+     * sides have without depending on their two resolvers agreeing.  A miss is
+     * ordinary -- validation may not have reached this model yet -- and falls
+     * through to the synchronous path below, which is what always happened. */
+    if (JceModelCpu *pre = jce_editor_mesh_predecode_take(path)) {
+        return jce_model_upload_gltf_cpu(pre);   /* consumes pre */
+    }
+
     size_t fsize = 0;
     void *buf = ed_read_file(load_path, &fsize);
     if (!buf) return NULL;
@@ -220,6 +241,15 @@ static JceTexture ed_load_texture_cb(const char *material_path,
      * Passing both paths into a single asset_cache call collapses them
      * into ONE cache entry — matches 0.5.5 single-resolve behavior. */
     return jce_editor_scene_asset_cache_get_texture(material_path, mesh_path);
+}
+
+static JceTexture ed_load_texture_srgb_cb(const char *material_path,
+                                          const char *mesh_path,
+                                          void       *ud)
+{
+    (void)ud;
+    return jce_editor_scene_asset_cache_get_texture_srgb(material_path,
+                                                         mesh_path);
 }
 
 /* ── Animation query cache (forward state for shutdown) ───────────── */
@@ -271,24 +301,58 @@ static void sr_apply_content_context(void)
     jce_ui_canvas_set_asset_root(
         paths.particle_asset_root.empty()
             ? nullptr : paths.particle_asset_root.c_str());
+    /* And the project's fallback face for an empty fontPath -- same reason as
+     * the asset root: it was only reachable from a project's own main(), so
+     * the editor could not know it and rendered such text in a different
+     * typeface than the shipped exe. */
+    jce_ui_canvas_set_default_font(proj ? proj->ui_default_font : nullptr);
+    jce_ui_canvas_set_font_fallbacks(proj ? proj->ui_font_fallbacks
+                                        : nullptr);
 
     if (!s_sr.scene_renderer) return;
 
+    /* Same composition the packager uses -- authored file for the Look Profile
+     * and the grass gate, active quality level on top -- so what Play shows is
+     * what the build produces.  This used to read the file only, which is why
+     * the quality level never reached the viewport. */
     JceRenderSettings rs = jce_render_settings_default();
-    bool loaded = false;
-    std::string settings_path = paths.render_settings_primary;
-    if (!settings_path.empty())
-        loaded = jce_render_settings_load_json(settings_path.c_str(), &rs);
-    if (!loaded && !paths.render_settings_fallback.empty()) {
-        settings_path = paths.render_settings_fallback;
-        loaded = jce_render_settings_load_json(settings_path.c_str(), &rs);
-    }
+    std::string settings_path;
+    const bool loaded = jce_editor_effective_render_settings(
+        isolated,
+        (proj && proj->project_root) ? proj->project_root : nullptr,
+        &rs, &settings_path);
 
-    LOG_INFO("scene_render", "GRASS GATE: root='%s' path='%s' loaded=%d grass_enabled=%d",
+    /* One line for every project-level render setting the editor applies, so
+     * "does Play match the build?" is answerable from the log.  It used to
+     * shout GRASS GATE and report only that one field. */
+    jce_scene_renderer_set_grass_enabled(s_sr.scene_renderer, rs.grass_enabled != 0);
+    /* Parity: the shipped drop-in main applies the same authored value.  The
+     * editor applied NOTHING here, so the LOD bias a designer set was visible
+     * only after a build -- and then as the wrong quantity entirely. */
+    jce_lod_set_global_bias(rs.lod_bias);
+    /* Soft particles, same parity argument: the hard seam where a billboard
+     * cuts the floor is exactly what an author is looking at when they tick
+     * the box, so the viewport has to show the fade rather than the build
+     * being the first place it appears.  Editor Play applies the same value
+     * from the same quality level, so the two cannot disagree. */
+    jce_particles_set_soft_fade_distance(
+        rs.soft_particles ? JCE_PARTICLES_SOFT_FADE_DEFAULT : 0.0f);
+
+    /* Reported AFTER applying, and read back out of the engine rather than
+     * echoed from the request: a bias of 0 or NaN is rejected and the engine
+     * keeps 1.0, which is exactly the case a reader needs to be able to see.
+     * (The first cut logged before the call and would have printed the
+     * PREVIOUS value on every project change.) */
+    LOG_INFO("scene_render",
+             "project render settings %s from '%s' (root %s): grass=%d "
+             "lod_bias=%.2f softparticles=%.2f",
+             loaded ? "applied" : "NOT FOUND, using defaults",
+             settings_path.c_str(),
              isolated ? "(bundle-vfs)" :
                  ((proj && proj->project_root) ? proj->project_root : "(none)"),
-             settings_path.c_str(), (int)loaded, (int)rs.grass_enabled);
-    jce_scene_renderer_set_grass_enabled(s_sr.scene_renderer, rs.grass_enabled != 0);
+             (int)rs.grass_enabled,
+             (double)jce_lod_get_global_bias(),
+             (double)jce_particles_get_soft_fade_distance());
 }
 
 void jce_editor_scene_render_refresh_content_context(void)
@@ -415,6 +479,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     cbs.load_mesh    = ed_load_mesh_cb;
     cbs.load_model   = ed_load_model_cb;
     cbs.load_texture    = ed_load_texture_cb;
+    cbs.load_texture_srgb = ed_load_texture_srgb_cb;
     cbs.texture_failed  = ed_texture_failed_cb;
     cbs.resolve_path    = ed_resolve_path_cb;
     cbs.userdata        = NULL;
@@ -455,13 +520,16 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
      * Only the 'color' program is needed for the depth-only proxy draw.
      * The culler silently degrades to always-visible when hardware
      * occlusion queries are unsupported (ES2 / WebGL1).
-     * Opt-OUT via JCE_DISABLE_OCCLUSION=1 (A/B measurement + safety toggle) —
+     * Opt-IN via JCE_ENABLE_OCCLUSION=1 (A/B measurement) —
      * mirrors the game-view path so the documented toggle disables BOTH editor
      * viewports, not just Play. */
-    if (jce_editor_viewport_occlusion_disabled()) {
+    if (!jce_editor_viewport_occlusion_enabled()) {
         s_sr.occlusion_culler = NULL;
         LOG_INFO(LOG_TAG,
-            "JCE_DISABLE_OCCLUSION set — scene-view occlusion culling OFF");
+            "%s occlusion culling OFF (%s)", "scene-view",
+            jce_editor_viewport_occlusion_forced_by_env()
+                ? "JCE_ENABLE_OCCLUSION=0"
+                : "off by default; enable with Preferences > Viewport > occlusion culling, or JCE_ENABLE_OCCLUSION=1");
     } else {
         /* Default proxy view; the game view creates its own on a distinct one. */
         s_sr.occlusion_culler =
@@ -735,6 +803,37 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     uint64_t _vpt = jce_time_perf_counter();
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
+
+    /* A modal impostor bake owns the frame's view ids (127..227), which is
+     * inside the Game View's range, and the guard reports it either way.
+     * Yield rather than share: the panel shows its last frame for the two or
+     * three frames a bake takes.  That is what an Unreal HLOD build and a
+     * Unity lightmap bake do with the live viewport, and the alternative is
+     * the failure this whole band of work exists to remove -- two owners on
+     * one view id and one of them silently producing nothing.
+     *
+     * The bake is driven from the Inspector / the QA harness, not from here,
+     * so skipping this render does not stall it. */
+    if (jce_impostor_bake_in_flight()) return;
+
+    /* REFLECTION PROBE CAPTURE, driven here and yielded to here.
+     *
+     * Driven: this is the one place that runs every frame AND holds both the
+     * scene renderer and the JceRenderer the capture needs, so a probe bake
+     * proceeds whichever panel started it and whether or not that panel is
+     * still open.
+     *
+     * Yielded to: the capture renders the scene from THIS viewport's base id,
+     * because a full scene render claims 117 view ids and bgfx's 256 do not
+     * hold a third span of that size.  Same arrangement, and same reason, as
+     * the impostor bake immediately above. */
+    if (jce_scene_probe_capture_in_flight()) {
+        (void)jce_scene_probe_capture_poll(s_sr.scene_renderer,
+                                           jce_state_get_scene(),
+                                           jce_editor_get_renderer());
+        return;
+    }
+
 
     /* iGPU ADAPTIVE dynamic resolution (editor scene view): steer the 3D render
      * scale from the LAST frame's measured GPU time (Unity DynamicResolution /
@@ -1023,11 +1122,21 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
     }
 
-    /* Headless test hook: JCE_DBG_VIEW_MODE=shaded forces the SHADED view. The
-     * default editor scene view is TEXTURED, whose missing-albedo checker routes
-     * every model through a SOLO draw (instancing is skipped) — so a headless
-     * stress in the default view never exercises the gpu-scene instanced-model /
-     * Hi-Z path. Forcing SHADED engages instancing exactly as runtime does. */
+    /* Headless test hook: JCE_DBG_VIEW_MODE=<name> forces one view mode.
+     *
+     * This comment used to say "the default editor scene view is TEXTURED".
+     * It is not, and has not been for as long as jce_editor_state.cpp has read
+     * the session file: both the parse fallback and the no-session default are
+     * JCE_VIEW_SHADED (= 0), which is what a capture reports as vm=0.  The
+     * sentence cost real time -- it was read as evidence that an author edits
+     * in an unlit view, in the middle of an investigation into whether the
+     * Scene view lights meshes the way the game does.
+     *
+     * What is true, and is why the hook exists: TEXTURED's missing-albedo
+     * checker routes every model through a SOLO draw (instancing is skipped),
+     * so a headless stress taken in THAT mode never exercises the gpu-scene
+     * instanced-model / Hi-Z path.  Naming SHADED explicitly pins the mode
+     * rather than inheriting whatever the session file happens to hold. */
     if (const char *vm = std::getenv("JCE_DBG_VIEW_MODE")) {
         /* Every view mode reachable by name.
          *
@@ -1169,6 +1278,21 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         /* Ambient override from the editor Lighting panel — applied on both
          * viewports so panel changes reach whichever one renders. */
         jce_editor_viewport_apply_ambient_override(s_sr.scene_renderer);
+        /* PLANAR REFLECTION FIRST, and that ordering is not cosmetic.
+         *
+         * It is a SECOND jce_scene_renderer_render, and the renderer's
+         * per-frame state (entity list, cull, view setup) belongs to whoever
+         * called it last.  Running it AFTER the main render left that state
+         * describing the mirrored camera, and the viewport composited a blank
+         * frame -- caught by the capture harness's own blank-frame guard, and
+         * confirmed by ablating this one call.
+         *
+         * The reflection is still consumed one frame late either way: its
+         * view id is above every scene base, so bgfx executes it after the
+         * colour pass that samples it.  Running it first costs nothing and
+         * leaves the main render owning the state. */
+        jce_scene_renderer_render_planar_reflection(s_sr.scene_renderer, scene,
+                                                     s_sr.camera, dt_sec);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
         ed_vp_mark("evp_scene_render", &_vpt);
@@ -1176,7 +1300,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1): log the scene-view
          * culler stats every 60 frames so a headless A/B run can confirm the
          * occluded count is now >0 (occlusion no longer inert in the offscreen
-         * bridge path) and compare ON vs OFF (JCE_DISABLE_OCCLUSION). */
+         * bridge path) and compare ON vs OFF (JCE_ENABLE_OCCLUSION). */
         static int s_occ_log = -1;
         if (s_occ_log < 0)
             s_occ_log = (getenv("JCE_KPI_OCCLUSION_LOG") != nullptr) ? 1 : 0;
@@ -1365,6 +1489,13 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * UI (below) lands AFTER post-fx — same scene→postfx→UI compositing the
      * Game View and the shipped runtime use.  Editor gizmo overlays stay
      * pre-postfx above (they need the bridge depth buffer). */
+    /* Declare this viewport's own view ids so the engine's ownership guard can
+     * see them.  It could not before: the ECS-UI overlay below sat on top of
+     * the scene renderer's dynamic-CSM atlas for as long as it took a user to
+     * notice the UI was gone, and the guard written for that exact class of
+     * bug reported nothing, because the editor never declared anything. */
+    jce_editor_viewport_claim_view_band("editor-scene-view", scene_view_id());
+
     const bool postfx_composited = jce_editor_viewport_composite_postfx(
         s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex, width, height);
     if (postfx_composited)
@@ -1513,6 +1644,48 @@ bool jce_editor_scene_render_screenshot(const char *path)
 int jce_editor_scene_render_capture_poll(void)
 {
     return jce_renderer_readback_capture_poll();
+}
+
+/* Panel-local px -> the canvas's own space.  The canvas was rendered at the
+ * scene render-target size, which is not the panel's displayed size whenever
+ * dynamic resolution is scaling; asking the canvas for its last size keeps the
+ * two from drifting instead of recomputing the scale here. */
+static bool ed_ui_canvas_scale(float avail_w, float avail_h,
+                               float *out_sx, float *out_sy)
+{
+    if (!s_sr.ui_canvas || avail_w <= 0.0f || avail_h <= 0.0f) return false;
+    float cw = 0.0f, ch = 0.0f;
+    jce_ui_canvas_last_size(s_sr.ui_canvas, &cw, &ch);
+    if (cw <= 0.0f || ch <= 0.0f) return false;
+    *out_sx = cw / avail_w;
+    *out_sy = ch / avail_h;
+    return true;
+}
+
+uint32_t jce_editor_scene_ui_pick(float local_x, float local_y,
+                                  float avail_w, float avail_h)
+{
+    float sx = 1.0f, sy = 1.0f;
+    if (!ed_ui_canvas_scale(avail_w, avail_h, &sx, &sy)) return 0;
+    if (!jce_state_show_flag(JCE_SHOW_FLAG_UI)) return 0;   /* hidden => not pickable */
+    uint64_t e = jce_ui_canvas_pick(s_sr.ui_canvas, local_x * sx, local_y * sy);
+    return e ? jce_state_from_ecs_entity((JceEntity)e) : 0u;
+}
+
+bool jce_editor_scene_ui_entity_rect(uint32_t id, float avail_w, float avail_h,
+                                     float out_rect4[4])
+{
+    float sx = 1.0f, sy = 1.0f;
+    if (!id || !out_rect4) return false;
+    if (!ed_ui_canvas_scale(avail_w, avail_h, &sx, &sy)) return false;
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+    if (!jce_ui_canvas_entity_rect(s_sr.ui_canvas,
+                                   (uint64_t)jce_state_to_ecs_entity(id),
+                                   &x, &y, &w, &h))
+        return false;
+    out_rect4[0] = x / sx; out_rect4[1] = y / sy;
+    out_rect4[2] = w / sx; out_rect4[3] = h / sy;
+    return true;
 }
 
 bool jce_editor_scene_pick_supported(void)

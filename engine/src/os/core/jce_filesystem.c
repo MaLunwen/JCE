@@ -35,6 +35,8 @@ static const JceFsPakProvider *s_pak_provider = NULL;
  * Each PhysFS call is fully atomic under the lock; distinct JceFile handles are
  * independent, so interleaving open/read/close across threads is safe. */
 static JceMutex *s_fs_mutex = NULL;
+static uint32_t  s_fs_users = 0;
+static bool      s_physfs_owned = false;
 static inline void fs_lock(void)   { if (s_fs_mutex) jce_mutex_lock(s_fs_mutex); }
 static inline void fs_unlock(void) { if (s_fs_mutex) jce_mutex_unlock(s_fs_mutex); }
 
@@ -68,7 +70,6 @@ struct JceFileSystem {
     /* Convenience alias to the legacy unnamed slot (or first slot if none).
      * Kept so static helpers below stay readable; not authoritative. */
     JcePakArchive *pak;
-    bool           physfs_owned;   /* true if we called PHYSFS_init */
 };
 
 /* File opened from PhysFS. */
@@ -101,6 +102,29 @@ struct JceFile {
 /* Lifecycle                                                           */
 /* ================================================================== */
 
+static bool fs_physfs_init(void)
+{
+#if JCE_PLATFORM_WEB
+    return PHYSFS_init(NULL) != 0;
+#else
+    char argv0[1024];
+    if (jce_fs_host_get_base_path(argv0, sizeof argv0)) {
+        size_t length = strlen(argv0);
+
+        if (length > 0 && argv0[length - 1] != '/' &&
+            argv0[length - 1] != '\\' && length + 1 < sizeof argv0)
+            argv0[length++] = '/';
+
+        if (length + sizeof "jce" <= sizeof argv0) {
+            memcpy(argv0 + length, "jce", sizeof "jce");
+            return PHYSFS_init(argv0) != 0;
+        }
+    }
+
+    return PHYSFS_init(NULL) != 0;
+#endif
+}
+
 JceFileSystem *jce_fs_create(void)
 {
     JceFileSystem *fs = JCE_NEW(JceFileSystem);
@@ -110,37 +134,33 @@ JceFileSystem *jce_fs_create(void)
      * streamer/asset worker can call into PhysFS. */
     if (!s_fs_mutex) s_fs_mutex = jce_mutex_create();
 
+    fs_lock();
+    bool init_failed = false;
+    const char *init_error = NULL;
     if (!PHYSFS_isInit()) {
-        if (PHYSFS_init(NULL)) {
-            fs->physfs_owned = true;
+        if (fs_physfs_init()) {
+            s_physfs_owned = true;
         } else {
-            /* Non-fatal: PHYSFS_init(NULL) resolves the base dir from the
-             * executable path, which does not exist under Emscripten MEMFS
-             * (no /proc/self/exe, argv0 NULL) — base-dir resolution fails and
-             * PhysFS's own deinit wipes the error code (hence the misleading
-             * "no error").  Rather than abort the whole app, degrade to
-             * PAK-only: every PhysFS entry point below already BAILs with
-             * NOT_INITIALIZED (openRead → NULL → the PAK path runs; mount_dir
-             * → warns and returns), and jce_fs_destroy guards PHYSFS_deinit on
-             * physfs_owned.  The embedded PAK carries every asset on web, so
-             * the app boots; only loose-dir overrides (a dev convenience) are
-             * unavailable where PhysFS cannot initialise. */
-#if JCE_PLATFORM_WEB
-            /* On the web build PAK-only IS the shipped configuration, not a
-             * degradation — keep the note informational so a clean run has a
-             * clean log. */
-            LOG_INFO(LOG_TAG,
-                     "PhysFS unavailable under Emscripten — PAK-only mode "
-                     "(loose-dir overrides are a native dev convenience)");
-#else
-            LOG_WARN(LOG_TAG,
-                     "PHYSFS_init failed (%s) — PAK-only mode "
-                     "(loose-dir overrides disabled)",
-                     PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
-#endif
-            /* physfs_owned stays false: we did not init it, so we must not
-             * deinit it, and PHYSFS_isInit() remains false for the no-op BAILs. */
+            init_failed = true;
+            init_error = PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
         }
+    }
+    ++s_fs_users;
+    fs_unlock();
+
+    if (init_failed) {
+        /* Embedded PAK reads remain available without PhysFS.  Every loose-file
+         * entry point explicitly checks PHYSFS_isInit() before calling it. */
+#if JCE_PLATFORM_WEB
+        LOG_INFO(LOG_TAG,
+                 "PhysFS unavailable under Emscripten — PAK-only mode "
+                 "(loose-dir overrides are a native dev convenience)");
+#else
+        LOG_WARN(LOG_TAG,
+                 "PHYSFS_init failed (%s) — PAK-only mode "
+                 "(loose-dir overrides disabled)",
+                 init_error ? init_error : "unknown error");
+#endif
     }
 
     return fs;
@@ -152,8 +172,18 @@ void jce_fs_destroy(JceFileSystem *fs)
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
         if (fs->paks[i].name) JCE_FREE(fs->paks[i].name);
     }
-    if (fs->physfs_owned && PHYSFS_isInit())
-        PHYSFS_deinit();
+
+    fs_lock();
+    if (s_fs_users > 0) --s_fs_users;
+    if (s_fs_users == 0 && s_physfs_owned && PHYSFS_isInit()) {
+        if (PHYSFS_deinit()) {
+            s_physfs_owned = false;
+        } else {
+            LOG_WARN(LOG_TAG, "PHYSFS_deinit failed: %s",
+                     PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+        }
+    }
+    fs_unlock();
     JCE_FREE(fs);
 }
 
@@ -258,10 +288,16 @@ bool jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
     if (!fs || !directory) return false;
 
     /* PhysFS mount: mountPoint is the virtual prefix. */
-    if (!PHYSFS_mount(directory, prefix, 1)) {
+    fs_lock();
+    bool initialized = PHYSFS_isInit() != 0;
+    bool mounted = initialized && PHYSFS_mount(directory, prefix, 1);
+    const char *error = mounted || !initialized ? NULL :
+        PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
+    fs_unlock();
+    if (!mounted) {
         LOG_WARN(LOG_TAG, "PHYSFS_mount('%s' -> '%s') failed: %s",
                  directory, prefix ? prefix : "/",
-                 PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+                 error ? error : "PhysFS is not initialized");
         return false;
     }
 
@@ -276,6 +312,8 @@ bool jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
 
 static JceFile *try_open_physfs(const char *vpath)
 {
+    if (!PHYSFS_isInit()) return NULL;
+
     PHYSFS_File *h = PHYSFS_openRead(vpath);
     if (!h) return NULL;
 
@@ -425,7 +463,7 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
 
     fs_lock();
     /* Check PhysFS search path, then every mounted PAK (via the provider). */
-    bool found = PHYSFS_exists(virtual_path) ? true : false;
+    bool found = PHYSFS_isInit() && PHYSFS_exists(virtual_path);
     if (!found) {
         const JceFsPakProvider *prov = s_pak_provider;
         if (prov && prov->find) {
@@ -450,18 +488,27 @@ bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory)
 {
     if (!fs) return false;
 
+    fs_lock();
+    if (!PHYSFS_isInit()) {
+        fs_unlock();
+        return !directory || directory[0] == '\0';
+    }
+
     if (!directory || directory[0] == '\0') {
         /* Clear the write directory. */
         PHYSFS_setWriteDir(NULL);
+        fs_unlock();
         return true;
     }
 
     if (!PHYSFS_setWriteDir(directory)) {
+        const char *error = PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
+        fs_unlock();
         LOG_ERROR(LOG_TAG, "PHYSFS_setWriteDir('%s') failed: %s",
-                  directory,
-                  PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+                  directory, error ? error : "unknown error");
         return false;
     }
+    fs_unlock();
 
     LOG_DEBUG(LOG_TAG, "write dir set to '%s'", directory);
     return true;
@@ -471,20 +518,32 @@ JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return NULL;
 
+    fs_lock();
+    if (!PHYSFS_isInit()) {
+        fs_unlock();
+        return NULL;
+    }
+
     PHYSFS_File *h = PHYSFS_openWrite(virtual_path);
     if (!h) {
+        const char *error = PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
+        fs_unlock();
         LOG_ERROR(LOG_TAG, "PHYSFS_openWrite('%s') failed: %s",
-                  virtual_path,
-                  PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+                  virtual_path, error ? error : "unknown error");
         return NULL;
     }
 
     JceFile *f = JCE_NEW(JceFile);
-    if (!f) { PHYSFS_close(h); return NULL; }
+    if (!f) {
+        PHYSFS_close(h);
+        fs_unlock();
+        return NULL;
+    }
 
     f->kind = JCE_FILE_PHYSFS;
     f->u.physfs.handle     = h;
     f->u.physfs.total_size = 0;
+    fs_unlock();
     return f;
 }
 
@@ -497,8 +556,10 @@ uint64_t jce_fs_write(JceFile *file, const void *buf, uint64_t size)
         return 0;
     }
 
+    fs_lock();
     PHYSFS_sint64 n = PHYSFS_writeBytes(file->u.physfs.handle,
-                                         buf, (PHYSFS_uint64)size);
+                                        buf, (PHYSFS_uint64)size);
+    fs_unlock();
     return (n > 0) ? (uint64_t)n : 0;
 }
 

@@ -136,19 +136,27 @@
 #include <jce/os/core/jce_path.h>
 #include <jce/middleware/script/jce_script_vm.h>
 
+/* Generated into this target's binary dir by jce_script_enable(): the
+ * registration shim the editor and every shipped game share. */
+#include <jce_script_register_linked.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#if defined(JCE_EDITOR_HAVE_SCRIPT_CPP)
+#if defined(JCE_SCRIPT_LINKED_CPP)
 #  include <jce/application/jce_project.h>
 #  include <jce/os/platform/jce_library.h>
 #  include <jce/script_vm/jce_script_vm_cpp.h>
 #endif
-#if defined(JCE_EDITOR_HAVE_SCRIPT_C)
+#if defined(JCE_SCRIPT_LINKED_C)
 #  include <jce/script_vm/jce_script_vm_c.h>
+#endif
+#if defined(JCE_SCRIPT_LINKED_CSHARP)
+#  include <jce/application/jce_project.h>
+#  include <jce/script_vm/jce_script_vm_csharp.h>
 #endif
 #if defined(JCE_EDITOR_HAVE_SCRIPT_PYTHON)
 #  include "jce_script_vm_python.h"
@@ -161,6 +169,26 @@
 #  include "jce_editor_java_paths.gen.h"
 #endif
 
+/* THE GATE BELOW NAMES A MACRO THAT IS ACTUALLY DEFINED.
+ *
+ * It used to read JCE_EDITOR_HAVE_SCRIPT_CPP, and nothing in the tree ever
+ * defined that -- it appeared five times in this file and nowhere else, all
+ * of them `#if defined(...)`.  So jce_editor_script_modules_reload() below
+ * compiled to its "deliberately silent" no-op in EVERY build, and a project's
+ * "script_modules" were never loaded by the editor at all.
+ *
+ * What made it survive is that the half above it works: the VMs are
+ * registered through the shared shim, so the editor reports c and cpp as
+ * available languages and the extensions resolve.  The failure is one layer
+ * down and says so plainly -- "NO NATIVE SCRIPT MODULE IS LOADED IN THIS
+ * PROCESS" -- which reads like a project that forgot to build its module
+ * rather than an editor that cannot load one.  Measured on a seven-language
+ * project: editor Play ran three languages, the shipped exe ran seven, from
+ * the same scene file.
+ *
+ * jce_script_enable() puts JCE_SCRIPT_LINKED_<LANG>=1 on every target it
+ * touches, including this one, so that is the condition that means what the
+ * old name was trying to mean. */
 #define LOG_TAG "editor.script"
 
 namespace {
@@ -200,7 +228,7 @@ std::string script_api_beside_exe(const char *libname)
 
 #endif  /* any backend */
 
-#if defined(JCE_EDITOR_HAVE_SCRIPT_CPP)
+#if defined(JCE_SCRIPT_LINKED_CPP)
 
 /* One project script module this process currently holds mapped.
  *
@@ -374,153 +402,34 @@ void explain_load_failure(const char *abs)
              "first is fixed by rebuilding.");
 }
 
-#endif  /* JCE_EDITOR_HAVE_SCRIPT_CPP */
+#endif  /* JCE_SCRIPT_LINKED_CPP */
 
 }  // namespace
 
 void jce_editor_register_script_backends(void)
 {
-#if defined(JCE_EDITOR_HAVE_SCRIPT_PYTHON) || defined(JCE_EDITOR_HAVE_SCRIPT_JAVA)
-#  if JCE_PLATFORM_WINDOWS
-    const char *k_api_lib = "jce_script_api.dll";
-#  elif JCE_PLATFORM_APPLE
-    const char *k_api_lib = "libjce_script_api.dylib";
-#  else
-    const char *k_api_lib = "libjce_script_api.so";
-#  endif
-    const std::string api_lib = script_api_beside_exe(k_api_lib);
-    if (!api_lib.empty())
-        set_env("JCE_SCRIPT_API", api_lib.c_str());
-#endif
-
-#if defined(JCE_EDITOR_HAVE_SCRIPT_PYTHON)
-    {
-        /* CPython writes __pycache__ beside whatever it imports, and in a dev
-         * build that directory is inside the REPOSITORY.  Stale .pyc is
-         * invalidated on (mtime, size), so a same-size edit within one mtime
-         * second leaves the OLD bytecode running.  Set before the interpreter
-         * exists — it is created on the first jce_script_vm_create. */
-        set_env("PYTHONDONTWRITEBYTECODE", "1");
-
-        const std::string pkg = path_from("JCE_SCRIPT_PYTHON_PACKAGE_DIR",
-                                          JCE_EDITOR_SCRIPT_PYTHON_PACKAGE_DIR);
-        if (pkg.empty() || !jce_fs_host_exists_dir(pkg.c_str())) {
-            LOG_WARN(LOG_TAG,
-                     "Python scripting NOT registered: the `jce_script` "
-                     "package directory '%s' does not exist. Set "
-                     "JCE_SCRIPT_PYTHON_PACKAGE_DIR to it. Until then a .py "
-                     "on an entity will be refused in Play — and will still "
-                     "run in a game build that links the backend.",
-                     pkg.c_str());
-        } else if (!jce_script_vm_python_add_path(pkg.c_str())) {
-            LOG_WARN(LOG_TAG,
-                     "Python scripting NOT registered: sys.path refused '%s'",
-                     pkg.c_str());
-        } else if (!jce_script_vm_python_register()) {
-            LOG_WARN(LOG_TAG, "%s",
-                     "Python scripting NOT registered: register() refused "
-                     "(the reason is logged above this line)");
-        } else {
-            LOG_INFO(LOG_TAG, "Python scripting registered (package: %s)",
-                     pkg.c_str());
-        }
-    }
-#endif
-
-#if defined(JCE_EDITOR_HAVE_SCRIPT_JAVA)
-    {
-        const std::string jvm = path_from("JCE_SCRIPT_JAVA_JVM",
-                                          JCE_EDITOR_SCRIPT_JAVA_JVM_LIBRARY);
-        const std::string cp  = path_from("JCE_SCRIPT_JAVA_CLASSPATH",
-                                          JCE_EDITOR_SCRIPT_JAVA_CLASS_PATH);
-        const std::string shim = path_from("JCE_SCRIPT_JAVA_LIBRARY",
-                                           JCE_EDITOR_SCRIPT_JAVA_SCRIPT_LIB);
-
-        if (jvm.empty() || !jce_fs_host_exists_file(jvm.c_str())) {
-            LOG_WARN(LOG_TAG,
-                     "Java scripting NOT registered: no JVM shared library at "
-                     "'%s'. Set JCE_SCRIPT_JAVA_JVM to an absolute path — a "
-                     "bare name is refused on purpose, because jce_library_"
-                     "open() would attach to whatever JVM another component "
-                     "loaded first.",
-                     jvm.c_str());
-        } else if (cp.empty() || !jce_fs_host_exists_dir(cp.c_str())) {
-            LOG_WARN(LOG_TAG,
-                     "Java scripting NOT registered: class path '%s' does not "
-                     "exist. It must hold com.jce.script.vm.JceEntityScript; "
-                     "set JCE_SCRIPT_JAVA_CLASSPATH.",
-                     cp.c_str());
-        } else {
-            /* -Djce.script.library must be ABSOLUTE: com.jce.script.JceScript's
-             * static initialiser otherwise falls back to System.loadLibrary()
-             * against a java.library.path this process never arranged. */
-            std::string lib_opt = "-Djce.script.library=" + shim;
-            const char *opts[1] = { lib_opt.c_str() };
-
-            JceScriptVmJavaConfig cfg;
-            std::memset(&cfg, 0, sizeof cfg);
-            cfg.jvm_library  = jvm.c_str();
-            cfg.class_path   = cp.c_str();
-            cfg.options      = shim.empty() ? nullptr : opts;
-            cfg.option_count = shim.empty() ? 0 : 1;
-
-            if (!jce_script_vm_java_configure(&cfg, sizeof cfg)) {
-                LOG_WARN(LOG_TAG,
-                         "Java scripting NOT registered: configure refused "
-                         "(jvm=%s classpath=%s)", jvm.c_str(), cp.c_str());
-            } else if (!jce_script_vm_java_register()) {
-                LOG_WARN(LOG_TAG, "%s",
-                         "Java scripting NOT registered: register() refused "
-                         "(the reason is logged above this line)");
-            } else {
-                LOG_INFO(LOG_TAG, "Java scripting registered (jvm: %s)",
-                         jvm.c_str());
-            }
-        }
-    }
-#endif
-
-#if defined(JCE_EDITOR_HAVE_SCRIPT_CPP)
-    /* No paths to find and no runtime to locate: the cpp VM is a registry and
-     * eighteen forwarders.  Registering it here also CLAIMS ".jcecpp", which
-     * is what lets the Script inspector name a language for a C++ script
-     * instead of flagging a working one amber.  The classes come later, from
-     * the project — see jce_editor_script_modules_reload(). */
-    if (!jce_script_vm_cpp_register()) {
-        LOG_WARN(LOG_TAG, "%s",
-                 "C++ scripting NOT registered: register() refused (the "
-                 "reason is logged above this line). A .jcecpp script will "
-                 "resolve to no language in Play.");
-    } else {
-        LOG_INFO(LOG_TAG, "%s",
-                 "C++ scripting registered (.jcecpp). Classes come from the "
-                 "open project's \"script_modules\"; none is loaded until a "
-                 "project is opened.");
-    }
-#endif
-
-#if defined(JCE_EDITOR_HAVE_SCRIPT_C)
-    /* A SEPARATE CALL, not a side effect of the one above.  "c" is its own
-     * registered language with its own claimed extension, so an editor that
-     * registered only "cpp" would answer a designer's .jcec with "no script VM
-     * claims its extension" while the shipped game ran it — the editor-weaker-
-     * than-the-runtime asymmetry this whole file exists to end.
+    /* ── ONE MECHANISM, SHARED WITH EVERY SHIPPED GAME ──────────────
      *
-     * NOTHING EXTRA TO LOAD.  The classes are the same classes: one native
-     * registry serves both languages, so jce_editor_script_modules_reload()
-     * below is already the C path too, whichever language wrote the module. */
-    if (!jce_script_vm_c_register()) {
-        LOG_WARN(LOG_TAG, "%s",
-                 "C scripting NOT registered: register() refused (the reason "
-                 "is logged above this line). A .jcec script will resolve to "
-                 "no language in Play.");
-    } else {
-        LOG_INFO(LOG_TAG, "%s",
-                 "C scripting registered (.jcec). Classes come from the same "
-                 "project \"script_modules\" the C++ VM reads — one native "
-                 "class registry serves both languages.");
-    }
-#endif
+     * This was four hand-written blocks — one per language — doing the same
+     * four steps the generated shim does, and they sat on the editor-versus-
+     * shipped parity boundary: a language added to scripting/ worked in a
+     * shipped executable and was silently refused in Play, visible only by
+     * pressing Play.  Two implementations of one contract is how that stays
+     * possible; there is now one, generated by jce_script_enable() from the
+     * backend rosters, and the editor and a game run the SAME CODE.
+     *
+     * WHAT THIS FILE USED TO DO BETTER IS NOT GONE, IT MOVED.  The env
+     * override (JCE_SCRIPT_PYTHON_PACKAGE_DIR, JAVA_HOME, …) and the
+     * existence check before registering — with wording that says the backend
+     * IS linked and the path is wrong, rather than "this language does not
+     * work" — are in the shim now, so every consumer gets them.
+     *
+     * NULL: the editor publishes no native module at INIT.  A cpp/.jcec class
+     * lives in a module the PROJECT builds, loaded later from that project's
+     * jce_project.json "script_modules" — see jce_editor_script_modules_reload
+     * below.  Nothing about the project is known here and nothing pretends to
+     * be. */
+    (void)jce_script_register_linked_languages(nullptr);
 
     /* Always say what Play can actually run, whether or not anything above
      * was compiled in.  A designer whose .py does nothing needs this line
@@ -539,9 +448,168 @@ void jce_editor_register_script_backends(void)
     }
 }
 
+bool jce_editor_script_modules_reload_native(const char *project_root)
+{
+#if !defined(JCE_SCRIPT_LINKED_CPP)
+    (void)project_root;
+    LOG_WARN(LOG_TAG,
+             "native script module reload: this editor was built without the "
+             "cpp script VM, so there is no module to reload.");
+    return false;
+#else
+    if (!project_root || !project_root[0]) {
+        LOG_WARN(LOG_TAG, "native script module reload: no project is open.");
+        return false;
+    }
+
+    /* THE SAFE POINT, ASKED RATHER THAN ASSUMED.  See the header for why
+     * "Play is stopped" is the answer and why this still counts. */
+    int live = 0;
+    const char *live_in = nullptr;
+    for (const LoadedModule &m : g_cpp_modules) {
+        const int n = jce_script_vm_cpp_live_instances(m.handle);
+        if (n > 0) {
+            live += n;
+            if (!live_in) live_in = jce_script_vm_cpp_module_name(m.handle);
+        }
+    }
+    if (live > 0) {
+        LOG_WARN(LOG_TAG,
+                 "native script module reload REFUSED: %d live script "
+                 "instance(s) (first in module '%s'). Unloading now would "
+                 "unmap code those instances dispatch into. Stop Play and "
+                 "try again -- nothing was changed.",
+                 live, live_in ? live_in : "?");
+        return false;
+    }
+
+    /* Unload EVERYTHING before loading, because the load pass below skips a
+     * path it already holds -- which is exactly the short-circuit that makes
+     * the ordinary reload a no-op on the same project. */
+    const int had = (int)g_cpp_modules.size();
+    for (const LoadedModule &m : g_cpp_modules) {
+        if (jce_script_vm_cpp_unload(m.handle)) continue;
+        /* Cannot happen with live == 0, and handled anyway: a partially
+         * unloaded list would leave the editor holding handles to closed
+         * libraries.  Report and keep what is left rather than guess. */
+        LOG_ERROR(LOG_TAG,
+                  "native script module reload: '%s' refused to unload even "
+                  "with no live instances. The module set is now partial; "
+                  "close and reopen the project.",
+                  m.path.c_str());
+        g_cpp_modules.clear();
+        jce_editor_script_modules_reload(project_root);
+        return false;
+    }
+    g_cpp_modules.clear();
+
+    /* REUSE, not a second loader.  With the list empty this takes the ordinary
+     * load path, including the failure explanations and the build-timestamp
+     * line that is the only cheap evidence a module which loaded cleanly is
+     * nonetheless yesterday's build. */
+    jce_editor_script_modules_reload(project_root);
+
+    LOG_INFO(LOG_TAG,
+             "native script modules reloaded from disk (%d were loaded, %d "
+             "now).", had, (int)g_cpp_modules.size());
+    return true;
+#endif
+}
+
+#if defined(JCE_SCRIPT_LINKED_CSHARP)
+/* A log sink for the throwaway VM below.
+ *
+ * A zeroed JceScriptHost has none, and the managed side reports a failed load
+ * THROUGH it -- so with {0} the load returns false and says nothing anywhere.
+ * An instrument that cannot report is indistinguishable from one that found
+ * nothing. */
+static void ed_cs_log(void *user, const char *msg)
+{
+    (void)user;
+    if (msg && msg[0]) LOG_INFO(LOG_TAG, "csharp: %s", msg);
+}
+
+/* Load the project's managed assemblies so a .cs script resolves in Play.
+ *
+ * WHY A VM IS OPENED AND IMMEDIATELY CLOSED.  The assembly list on the
+ * managed side is PROCESS-WIDE, not per-VM -- it has to be, because the
+ * runtime creates its own Vm when Play starts, after any load a tool did.
+ * So loading through a temporary VM here is enough, and keeping one alive
+ * would only add a second handle nothing dispatches into.
+ *
+ * WHY THIS IS SEPARATE FROM THE NATIVE MODULE LOADER.  Neither loader can
+ * tell the two kinds of .dll apart by looking: a native module is dlopened
+ * and publishes classes through an entry symbol, a managed assembly is
+ * handed to the .NET host.  Feeding one list to both would make every
+ * project with C# scripts report a native-module failure and every project
+ * with a native module report a managed one. */
+static void ed_load_project_assemblies(const char *project_root)
+{
+    if (!project_root || !project_root[0]) return;
+    const JceProject *proj = jce_project_load(project_root);
+    if (!proj) return;                    /* no manifest is not an error */
+    if (proj->script_assemblies_count <= 0) {
+        jce_project_free(const_cast<JceProject *>(proj));
+        return;                           /* no C# scripts is the common case */
+    }
+
+    const JceScriptVM *vm = jce_script_vm_find("csharp");
+    if (!vm || !vm->create_sized) {
+        LOG_WARN(LOG_TAG,
+                 "this project declares %d managed assembly/assemblies and "
+                 "this editor has no csharp backend linked, so every .cs "
+                 "script in it will be refused by name in Play.",
+                 proj->script_assemblies_count);
+        jce_project_free(const_cast<JceProject *>(proj));
+        return;
+    }
+
+    JceScriptHost host;
+    std::memset(&host, 0, sizeof host);
+    host.log = ed_cs_log;
+    JceScript *sc = vm->create_sized(&host, sizeof host);
+    if (!sc) {
+        LOG_WARN(LOG_TAG, "could not open a csharp VM to load this "
+                          "project's assemblies");
+        jce_project_free(const_cast<JceProject *>(proj));
+        return;
+    }
+
+    for (int i = 0; i < proj->script_assemblies_count; ++i) {
+        const char *rel = proj->script_assemblies[i];
+        if (!rel || !rel[0]) continue;
+        std::string abs = rel;
+        const bool rooted = (rel[0] == '/' || rel[0] == '\\' ||
+                             (rel[0] && rel[1] == ':'));
+        if (!rooted) abs = std::string(project_root) + "/" + rel;
+        if (!jce_fs_host_exists_file(abs.c_str())) {
+            LOG_WARN(LOG_TAG,
+                     "managed assembly declared but not built: %s "
+                     "(\"script_assemblies\") -- build it, or correct the "
+                     "path; every .cs script will be refused until then.",
+                     abs.c_str());
+            continue;
+        }
+        if (jce_script_vm_csharp_load_assembly(sc, abs.c_str()))
+            LOG_INFO(LOG_TAG, "managed script assembly loaded: %s",
+                     abs.c_str());
+        else
+            LOG_WARN(LOG_TAG, "managed script assembly REFUSED: %s",
+                     abs.c_str());
+    }
+    if (vm->destroy) vm->destroy(sc);
+    jce_project_free(const_cast<JceProject *>(proj));
+}
+#endif  /* JCE_SCRIPT_LINKED_CSHARP */
+
 void jce_editor_script_modules_reload(const char *project_root)
 {
-#if !defined(JCE_EDITOR_HAVE_SCRIPT_CPP)
+#if defined(JCE_SCRIPT_LINKED_CSHARP)
+    /* Managed first and unconditionally: it does not share the native
+     * loader's gate, so a build with C# but no C++ still gets its scripts. */
+    ed_load_project_assemblies(project_root);
+#endif
+#if !defined(JCE_SCRIPT_LINKED_CPP)
     (void)project_root;
     /* Deliberately silent.  With no cpp VM in this build there is nothing a
      * project could declare that this editor could load, and a line on every

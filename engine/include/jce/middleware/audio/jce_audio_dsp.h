@@ -47,8 +47,19 @@ typedef enum {
     JCE_AUDIO_EFFECT_EQ         = 1,  /* parametric biquad EQ band  */
     JCE_AUDIO_EFFECT_COMPRESSOR = 2,  /* dynamics compressor        */
     JCE_AUDIO_EFFECT_LIMITER    = 3,  /* brickwall limiter          */
-    JCE_AUDIO_EFFECT_DELAY      = 4   /* feedback delay line        */
+    JCE_AUDIO_EFFECT_DELAY      = 4,  /* feedback delay line        */
+    /* APPENDED.  These values are written into audio_mixer.json, so they are
+     * wire values: never reordered, never reused. */
+    JCE_AUDIO_EFFECT_CHORUS     = 5,  /* modulated delay, thickens  */
+    JCE_AUDIO_EFFECT_FLANGER    = 6,  /* short modulated delay + fb */
+    JCE_AUDIO_EFFECT_DISTORTION = 7   /* waveshaper                 */
 } JceAudioEffectType;
+
+/* Where a REGISTERED effect's type id starts.  Chosen far above the built-in
+ * range so a project's id can never collide with a built-in added later --
+ * the alternative, handing out the next free small integer, would make every
+ * new built-in a silent renumbering of somebody's saved mixer. */
+#define JCE_AUDIO_EFFECT_CUSTOM_BASE 256
 
 /* Filter shapes for the parametric EQ band. */
 typedef enum {
@@ -89,6 +100,44 @@ typedef struct {
     float dry;            /* 0..1 dry (input) level                    */
 } JceAudioDelayParams;
 
+/* CHORUS and FLANGER are the same machine -- a delay line whose read head is
+ * swept by an LFO -- and share these parameters rather than getting one
+ * struct each.  What separates them is where the numbers live: a chorus sits
+ * around 20-30 ms with little or no feedback and sounds like more than one
+ * player; a flanger sits around 1-5 ms with heavy feedback and sounds like a
+ * jet.  Two structs with identical fields would have invited them to drift.
+ *
+ * `depth_ms` is swept EITHER SIDE of delay_ms, and the effect clamps the read
+ * head to the line rather than letting a deep sweep wrap past the write head
+ * -- which is not a subtle artefact, it is a click every LFO cycle. */
+typedef struct {
+    float delay_ms;       /* centre delay (chorus ~20, flanger ~2)     */
+    float depth_ms;       /* sweep either side of it                   */
+    float rate_hz;        /* LFO speed                                 */
+    float feedback;       /* 0..<1 (chorus ~0, flanger high)           */
+    float wet;            /* 0..1 wet level                            */
+    float dry;            /* 0..1 dry level                            */
+    float stereo_phase;   /* 0..1: LFO phase offset of the RIGHT
+                           * channel, in cycles.  0.25-0.5 is what makes
+                           * a chorus wide; 0 makes it mono-ish.        */
+} JceAudioModDelayParams;
+
+/* Shapes a waveshaper can take.  Wire values. */
+typedef enum {
+    JCE_AUDIO_DIST_SOFT_CLIP = 0,  /* tanh-ish: warm, no hard corners  */
+    JCE_AUDIO_DIST_HARD_CLIP = 1,  /* flat top: fuzzy, lots of odd hs  */
+    JCE_AUDIO_DIST_FOLDBACK  = 2   /* folds past the ceiling: ring-y   */
+} JceAudioDistortionShape;
+
+typedef struct {
+    JceAudioDistortionShape shape;
+    float drive;          /* >=1 pre-gain into the shaper              */
+    float ceiling;        /* clip/fold threshold, typically 1.0        */
+    float wet;            /* 0..1 shaped level                         */
+    float dry;            /* 0..1 clean level                          */
+    float output_gain;    /* post gain; drive without it just gets loud */
+} JceAudioDistortionParams;
+
 /* Tagged union describing one insert effect's configuration. */
 typedef struct {
     JceAudioEffectType type;
@@ -97,8 +146,76 @@ typedef struct {
         JceAudioCompressorParams comp;
         JceAudioLimiterParams    limiter;
         JceAudioDelayParams      delay;
+        JceAudioModDelayParams   mod_delay;   /* CHORUS and FLANGER */
+        JceAudioDistortionParams distortion;
     } u;
+    /* REGISTERED effects only (type >= JCE_AUDIO_EFFECT_CUSTOM_BASE): the
+     * parameter blob handed to the vtable's configure().
+     *
+     * APPENDED AFTER THE UNION, not added to it.  A new union member changes
+     * what the FIRST bytes of this struct mean for a caller compiled against
+     * the old one; a field after it does not.
+     *
+     * The pointer need only be valid FOR THE DURATION of the add/set call --
+     * configure() copies whatever it needs into the effect's own state.  It
+     * is not retained, so a caller may pass a stack local. */
+    const void *custom_params;
+    uint32_t    custom_params_size;
 } JceAudioEffectDesc;
+
+/* -- Registering an effect the engine does not ship ------------------
+ *
+ * This is the axis the parity row actually names: "Unity's is a plugin
+ * surface; this is a closed set."  A palette is always short of somebody's
+ * fifteen; a set a project can extend is not waiting on this engine.
+ *
+ * The chain owns one `state_size` allocation per instance and passes it to
+ * every callback, so an effect keeps its filter/envelope/delay history the
+ * same way a built-in does.  `process` runs ON THE AUDIO THREAD: it must not
+ * allocate, lock, or block, exactly as the built-ins do not.
+ *
+ * `name` is what audio_mixer.json spells, so a registered effect is
+ * authorable rather than script-only.  Registration is process-global and
+ * idempotent by name: registering the same name twice returns the SAME id
+ * rather than a second one, because two ids for one name would make a saved
+ * mixer depend on registration order.
+ */
+typedef struct JceAudioEffectVTable {
+    const char *name;         /* authored spelling; must outlive the process */
+    uint32_t    state_size;   /* bytes of per-instance state (may be 0)      */
+    /* Configure or reconfigure one instance.  `params` is the desc's
+     * custom_params blob and is NOT retained.  Return false to refuse. */
+    bool (*configure)(void *state, uint32_t channels, uint32_t sample_rate,
+                      const void *params, uint32_t params_size);
+    /* Return the instance to silence without changing its configuration.
+     * May be NULL: the chain then zeroes the state block, which is correct
+     * for any effect whose history is plain floats. */
+    void (*reset)(void *state);
+    /* Interleaved, in place, on the audio thread. */
+    void (*process)(void *state, float *buffer, uint32_t frames,
+                    uint32_t channels);
+    /* Release anything configure() allocated.  May be NULL. */
+    void (*release)(void *state);
+} JceAudioEffectVTable;
+
+/* Register `vt` and return its type id (>= JCE_AUDIO_EFFECT_CUSTOM_BASE), or
+ * -1 when vt / vt->name / vt->process is NULL or the table is full.  Returns
+ * the EXISTING id when the name is already registered. */
+JCE_API int JCE_CALL jce_audio_dsp_register_effect(const JceAudioEffectVTable *vt);
+
+/* Type id previously registered under `name`, or -1.  This is how a mixer
+ * config turns an authored string into a type. */
+JCE_API int JCE_CALL jce_audio_dsp_find_effect(const char *name);
+
+/* Authored spelling of a type id, or NULL.  Answers for BUILT-INS too
+ * ("eq", "compressor", "limiter", "delay", "chorus", "flanger",
+ * "distortion"), so a serialiser has ONE place to ask rather than a switch
+ * that drifts from the parser's. */
+JCE_API const char *JCE_CALL jce_audio_dsp_effect_name(int type);
+
+/* Type id for an authored spelling, built-in or registered, or -1.  The
+ * inverse of the above and the other half of that single source of truth. */
+JCE_API int JCE_CALL jce_audio_dsp_effect_type_from_name(const char *name);
 
 /* -- Chain (opaque) ------------------------------------------------- */
 

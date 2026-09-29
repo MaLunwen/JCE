@@ -58,6 +58,15 @@ JCE_REFLECT_BEGIN(JceParticleEmitterDesc, "Particle Emitter")
     JCE_FIELD(JceParticleEmitterDesc, color_start,  JCE_FT_COLOR4, "Color Start")
     JCE_FIELD(JceParticleEmitterDesc, color_end,    JCE_FT_COLOR4, "Color End")
     JCE_FIELD(JceParticleEmitterDesc, world_space,  JCE_FT_BOOL,   "World Space")
+    /* The engine's asset loader has always read these three (jce_particles.c:
+     * "spawnBox", "velocityStretch", and "blend"/"blendMode"); this panel
+     * neither showed nor saved them, and its save rebuilds the document from
+     * scratch -- so opening a hand-authored .particle and saving it DELETED
+     * them.  Authorable and round-tripped now. */
+    JCE_FIELD(JceParticleEmitterDesc, spawn_box,    JCE_FT_VEC3,   "Spawn Box")
+    JCE_FIELD_RANGE(JceParticleEmitterDesc, velocity_stretch, JCE_FT_FLOAT,
+                    "Velocity Stretch", 0.0f, 2.0f, 0.005f)
+    JCE_FIELD(JceParticleEmitterDesc, blend_alpha,  JCE_FT_BOOL,   "Alpha Blend")
 JCE_REFLECT_END(JceParticleEmitterDesc, "Particle Emitter")
 
 namespace {
@@ -299,6 +308,14 @@ void write_desc_fields(JceJson *obj, const JceParticleEmitterDesc *d)
     jce_json_set_int (obj, "flipbookCols", (int)d->flipbook_cols);
     jce_json_set_number(obj, "flipbookFps",  d->flipbook_fps);
     jce_json_set_bool(obj, "flipbookLoop", d->flipbook_loop);
+
+    /* Keys the ENGINE reads and this panel used to drop on save. */
+    jce_json_set_float_array(obj, "spawnBox", &d->spawn_box.x, 3);
+    jce_json_set_number(obj, "velocityStretch", d->velocity_stretch);
+    /* The loader takes a STRING here ("alpha" | "additive"), with
+     * "blendMode" as the alias; absent means additive. */
+    jce_json_set_string(obj, "blend",
+                        d->blend_alpha ? "alpha" : "additive");
 }
 
 bool save_to_json(const char *path, const JceParticleEmitterDesc *d)
@@ -370,6 +387,21 @@ void read_desc_fields(const JceJson *obj, JceParticleEmitterDesc *d)
     d->flipbook_fps  = (float)jce_json_get_number(obj, "flipbookFps",  d->flipbook_fps);
     d->flipbook_loop = jce_json_get_bool(obj, "flipbookLoop", d->flipbook_loop);
     if (d->lifetime_max < d->lifetime_min) d->lifetime_max = d->lifetime_min;
+
+    /* Mirror of the three writes above; without these the panel would
+     * still discard a hand-authored value the moment it loaded. */
+    jce_json_get_floats(obj, "spawnBox", &d->spawn_box.x, 3,
+                        &d->spawn_box.x);
+    d->velocity_stretch =
+        (float)jce_json_get_number(obj, "velocityStretch",
+                                   d->velocity_stretch);
+    {
+        const char *bm = jce_json_get_string(obj, "blend", nullptr);
+        if (!bm || !bm[0])
+            bm = jce_json_get_string(obj, "blendMode", nullptr);
+        if (bm && bm[0])
+            d->blend_alpha = (std::strcmp(bm, "alpha") == 0);
+    }
 }
 
 bool load_from_json(const char *path, JceParticleEmitterDesc *d)

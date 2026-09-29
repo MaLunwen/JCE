@@ -6,12 +6,18 @@
  * JceAppDesc; the actual SDL_App* callbacks live in jce_main_sdl.c
  * (compiled into the jce_application static library).
  */
+#include <jce/middleware/world/jce_environment.h>
+#include "io/jce_editor_mesh_predecode.h"
+#include "shadergraph/jce_shadergraph_shaderc.h"   /* one shaderc driver, one
+                                                     * backend matrix */
+#include "ui/jce_editor_panels.h"                  /* console log */
 #include <jce/application/jce_main.h>
 #include <jce/os/core/jce_defs.h>   /* JCE_PLATFORM_WINDOWS */
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 
 #if JCE_PLATFORM_WINDOWS && defined(_DEBUG)
@@ -22,6 +28,10 @@ extern "C" {
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_runtime.h>
+#include "core/jce_editor_assert_bridge.h"
+#include "core/jce_editor_scene_file_watch.h"
+#include "core/jce_editor_automation.h"
+
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
@@ -145,6 +155,31 @@ static void maybe_log_startup_kpi(void)
     g_startup_reported = true;
 }
 
+/* Time to a FINISHED first frame, not to the first draw call.
+ *
+ * kpi:startup_ms is stamped at the TOP of the first editor_app_draw, so it
+ * answers "how long until we began drawing".  Measured 2026-09-03 on
+ * caged_kingdom/hidden_cove (1797 entities), that first draw then took another
+ * 3.8 s on OpenGL and 3.7 s on D3D12 -- backend-independent, invisible in the
+ * log, and larger than the reported startup itself.  A number that stops
+ * before the expensive part is worse than no number: it says the editor is
+ * ready while the window is still frozen. */
+static bool g_first_frame_reported = false;
+
+static void log_first_frame_kpi(void)
+{
+    if (g_first_frame_reported || g_startup_t0 == 0)
+        return;
+    const uint64_t freq = jce_time_perf_freq();
+    if (freq == 0)
+        return;
+    g_first_frame_reported = true;
+    jce_editor_mesh_predecode_report();
+    fprintf(stderr, "kpi:first_frame_ms=%.3f\n",
+            (double)(jce_time_perf_counter() - g_startup_t0) * 1000.0
+                / (double)freq);
+}
+
 /* ── Renderer backend override from ~/.jce/editor-preferences.json ───
    (legacy ~/.jce/editor-config.json is a read-only fallback until it is
    retired to *.migrated — see jce_editor_config.cpp). */
@@ -190,6 +225,11 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
+
+    /* BEFORE anything that could assert.  Without this the editor's default
+     * for a broken engine invariant is abort(), which takes the user's
+     * unsaved scene -- and the scene that provoked it -- with it. */
+    jce_editor_assert_bridge_install();
 
     if (g_headless_build_mode) {
         jce_build_manager_init();
@@ -335,6 +375,12 @@ static void editor_app_update(float dt, void *ud)
      * gates interaction, so the rest of the per-frame work below is safe to
      * run against a scene that is still being populated. */
     jce_state_scene_load_poll();
+    /* ...and notice a scene file written by somebody else: an agent
+     * working through the Automation API writes into the project and
+     * then asks a human to look before the changeset is committed
+     * (REQ-SCN-04).  Withheld while there are unsaved edits; see
+     * core/jce_editor_scene_file_watch.h. */
+    jce_editor_scene_file_watch_poll();
 
     if (jce_state_get_play_state() == JCE_PLAY_PLAYING) {
         JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES] = {};
@@ -377,6 +423,21 @@ static void editor_app_update(float dt, void *ud)
         }
         jce_state_play_mode_tick(real_dt);
     }
+
+    /* Edit mode runs no simulation, so nothing calls jce_scene_update() and the
+     * scene's environment would stop: a designer with time-of-day enabled would
+     * see a frozen sky.  The panel used to advance its own copy, from ImGui's
+     * frame time and only while its tab was visible; this advances THE clock,
+     * whichever panels happen to be open.  While playing, the runtime's
+     * jce_scene_update() is the driver and this must not double-advance. */
+    /* STOPPED, not "not PLAYING".  Play has three states, and PAUSED is a
+     * running session deliberately not stepping: advancing the environment
+     * there would keep the sky moving behind a paused simulation, and move the
+     * PLAY scene's clock while the thing that owns it is frozen.  Written as
+     * != PLAYING first, which is the same bug the state enum exists to make
+     * visible. */
+    if (jce_state_get_play_state() == JCE_PLAY_STOPPED)
+        jce_scene_environment_advance(jce_state_get_scene(), real_dt);
     jce_state_stress_move_tick(real_dt);   /* JCE_STRESS_MOVERS L2 soak (inert unless set) */
 
     /* VideoPlayer-as-texture and ParticleEmitter previews in Scene View while
@@ -397,6 +458,9 @@ static void editor_app_update(float dt, void *ud)
     jce_build_manager_poll();
     jce_cook_manager_poll();
     jce_state_scene_serial_poll();   /* async post-save mesh validation */
+    /* Drive an in-flight Automation call: it is a subprocess and this
+     * loop never blocks on one. See core/jce_editor_automation.h. */
+    jce_editor_automation_poll();
     jce_asset_path_index_poll();     /* swap in a finished async reindex */
 
     /* Drain any folder/file dialog results enqueued by SDL worker threads.
@@ -429,6 +493,12 @@ static void editor_app_draw(const JceServices *svc, void *ud)
     /* Scene rendering is triggered from inside the ImGui scene panel
      * (jce_editor_scene_render_frame) so it renders to the FBO at the
      * panel's actual size; ImGui then displays the texture. */
+    /* Once, before the first frame draws anything: let the decode workers
+     * finish the scene's meshes.  They are decoding the exact files this frame
+     * is about to ask for, and whichever ones it beats them to it decodes
+     * again, serially, while the window is frozen. */
+    if (!g_startup_reported)
+        jce_editor_wait_for_mesh_predecode(8000u);
     maybe_log_startup_kpi();
     /* Advance the shared renderer's per-frame generation ONCE here, before the
      * Scene + Game viewport panels each render through it.  This lets the
@@ -438,6 +508,7 @@ static void editor_app_draw(const JceServices *svc, void *ud)
      * characters ghost in TAA). */
     jce_scene_renderer_begin_velocity_frame(jce_editor_get_scene_renderer());
     jce_editor_update(svc->window);
+    log_first_frame_kpi();
 }
 
 static void editor_app_event(const JceEvent *event, void *ud)
@@ -470,6 +541,222 @@ static bool editor_should_quit(void *ud)
    2. <exe_dir>/shaders relative path
    3. NULL (PAK-only — effectively a no-op reload)
    Defined here because we have access to the captured JceServices. */
+
+/* ── Recompile stale shader source ──────────────────────────────────
+ *
+ * Two DIFFERENT roots are involved and they are easy to conflate, because one
+ * environment variable has been used for both:
+ *
+ *   the SOURCE root .... holds engine/shaders/**\/(vs|fs)_<base>.sc
+ *   the OUTPUT root .... holds <root>/shaders/(vs|fs)_<base>_<suffix>.bin,
+ *                        which is what jce_renderer_reload_shaders_fs reads
+ *
+ * jce_sg::resolve_vs_pbr_path treats JCE_SHADER_DEV_DIR as the first;
+ * jce_renderer_reload_shaders_fs treats its dev_dir as the second.  Both are
+ * long-standing and both callers are right about their own meaning, so this
+ * takes them SEPARATELY -- JCE_SHADER_SRC_DIR for source, falling back to
+ * JCE_SHADER_DEV_DIR -- rather than picking a winner and silently breaking
+ * whichever caller loses.
+ */
+namespace {
+
+struct ScSweep {
+    std::string out_root;      /* <root>/shaders/*.bin lives here */
+    std::string include_dir;
+    std::string varying_def;
+    int         compiled  = 0;
+    int         up_to_date = 0;
+    int         failed    = 0;
+};
+
+bool sc_is_shader_source(const char *path, std::string *out_base, bool *out_vs)
+{
+    const char *slash = std::strrchr(path, '/');
+    const char *bslash = std::strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    const char *leaf = slash ? slash + 1 : path;
+
+    const size_t n = std::strlen(leaf);
+    if (n < 7) return false;                       /* vs_x.sc */
+    if (std::strcmp(leaf + n - 3, ".sc") != 0) return false;
+    /* varying.def.sc is a declaration file, not a shader. */
+    if (std::strstr(leaf, ".def.sc")) return false;
+
+    if (std::strncmp(leaf, "vs_", 3) == 0)      *out_vs = true;
+    else if (std::strncmp(leaf, "fs_", 3) == 0) *out_vs = false;
+    else return false;                             /* cs_/template/include */
+
+    out_base->assign(leaf + 3, n - 3 - 3);         /* strip "vs_" and ".sc" */
+    return true;
+}
+
+
+/* The newest mtime in a shader's include closure.
+ *
+ * `#include "x.sh"` resolves beside the including file; `#include <x.sh>`
+ * resolves in the shaderc include dir.  Anything that resolves to neither is
+ * skipped rather than treated as an error: a missing include is shaderc's
+ * problem to report, with its line number, not this sweep's to guess at.
+ *
+ * `seen` bounds the walk on the cyclic case and on the diamond, which
+ * fs_pbr_decl.sh and fs_pbr_main.sh form through pbr_common.sh. */
+void sc_newest_mtime(const std::string &path, const std::string &include_dir,
+                     std::set<std::string> *seen, int64_t *newest, int depth)
+{
+    if (depth > 8) return;
+    if (!seen->insert(path).second) return;
+
+    int64_t mt = 0;
+    if (jce_fs_host_get_mtime(path.c_str(), &mt) && mt > *newest) *newest = mt;
+
+    uint64_t sz = 0;
+    void *buf = jce_fs_host_read_all(path.c_str(), &sz);
+    if (!buf) return;
+    std::string src((const char *)buf, (size_t)sz);
+    jce_fs_buffer_free(buf);
+
+    std::string dir = path;
+    size_t cut = dir.find_last_of("/\\");
+    dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+
+    size_t at = 0;
+    while ((at = src.find("#include", at)) != std::string::npos) {
+        size_t q = src.find_first_of("\"<", at);
+        size_t nl = src.find('\n', at);
+        at += 8;
+        if (q == std::string::npos || (nl != std::string::npos && q > nl))
+            continue;
+        const char close = (src[q] == '"') ? '"' : '>';
+        size_t e = src.find(close, q + 1);
+        if (e == std::string::npos) continue;
+        const std::string name = src.substr(q + 1, e - q - 1);
+        if (name.empty()) continue;
+
+        const std::string local = dir + "/" + name;
+        if (jce_fs_host_exists_file(local.c_str())) {
+            sc_newest_mtime(local, include_dir, seen, newest, depth + 1);
+        } else if (!include_dir.empty()) {
+            const std::string sys = include_dir + "/" + name;
+            if (jce_fs_host_exists_file(sys.c_str()))
+                sc_newest_mtime(sys, include_dir, seen, newest, depth + 1);
+        }
+        at = e + 1;
+    }
+}
+
+bool sc_walk_cb(const char *path, bool is_dir, void *user)
+{
+    if (is_dir) return true;
+    ScSweep *sw = (ScSweep *)user;
+
+    std::string base;
+    bool is_vs = false;
+    if (!sc_is_shader_source(path, &base, &is_vs)) return true;
+
+    /* The whole include closure, not just this file: the PBR program lives in
+     * fs_pbr_main.sh and fs_pbr.sc is eighteen lines of $input and one
+     * #include.  Comparing only the .sc would recompile for the edit nobody
+     * makes and stay silent for the edit everybody makes. */
+    int64_t src_mtime = 0;
+    {
+        std::set<std::string> seen;
+        sc_newest_mtime(path, sw->include_dir, &seen, &src_mtime, 0);
+    }
+    if (src_mtime <= 0) return true;
+
+    int ntargets = 0;
+    const jce_sg::GraphTarget *tg = jce_sg::graph_targets(&ntargets);
+    for (int i = 0; i < ntargets; ++i) {
+        char out[1024];
+        std::snprintf(out, sizeof(out), "%s/shaders/%s_%s_%s.bin",
+                      sw->out_root.c_str(), is_vs ? "vs" : "fs",
+                      base.c_str(), tg[i].suffix);
+
+        /* Only what this build actually produced: a profile the engine build
+         * never emitted is not "stale", it is not part of this configuration,
+         * and compiling it here would write a file nothing reads. */
+        int64_t bin_mtime = 0;
+        if (!jce_fs_host_get_mtime(out, &bin_mtime)) continue;
+        if (bin_mtime >= src_mtime) { sw->up_to_date++; continue; }
+
+        /* THE BUILD'S FLAGS, not the graph's.  tools/compile_shaders.cmake
+         * passes no -O and defines BGFX_CONFIG_MAX_BONES=128; reproducing
+         * both is what makes this a RELOAD rather than a silent recompile
+         * with different settings.  Verified by compiling fs_pbr both ways:
+         * these flags give 416168 bytes, which is byte-for-byte what the
+         * engine build had already placed in the output directory. */
+        jce_sg::CompileOpts co;
+        co.pass_opt_flag = false;
+        co.defines       = "BGFX_CONFIG_MAX_BONES=128";
+        /* The shader's own directory, ahead of the bgfx ABI dir.  Without it
+         * an #include resolved to whichever copy the shared dir happened to
+         * hold -- and the SDK installs copies of these very files -- so the
+         * sweep recompiled the SOURCE TREE's .sc against SOMEBODY ELSE'S
+         * includes and wrote a binary that did not contain the edit. */
+        {
+            const char *sl = std::strrchr(path, '/');
+            const char *bs = std::strrchr(path, '\\');
+            if (bs && (!sl || bs > sl)) sl = bs;
+            if (sl) co.extra_include.assign(path, (size_t)(sl - path));
+        }
+        jce_sg::ShadercResult r = jce_sg::compile_sc(
+            path, sw->varying_def, sw->include_dir,
+            is_vs ? jce_sg::ShaderKind::Vertex : jce_sg::ShaderKind::Fragment,
+            tg[i].backend, co);
+        if (!r.ok || r.blob.empty()) {
+            sw->failed++;
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "reload shaders: %s [%s] failed: %s",
+                base.c_str(), tg[i].suffix, r.error.c_str());
+            continue;
+        }
+        if (jce_fs_host_write_all(out, r.blob.data(), (uint64_t)r.blob.size()))
+            sw->compiled++;
+        else
+            sw->failed++;
+    }
+    return true;
+}
+
+/* Returns false only when the sweep could not run at all. */
+bool recompile_stale_shader_sources(const char *out_root)
+{
+    const char *src = std::getenv("JCE_SHADER_SRC_DIR");
+    if (!src || !src[0]) src = std::getenv("JCE_SHADER_DEV_DIR");
+    if (!src || !src[0]) return false;
+
+    std::string include_dir = jce_sg::resolve_shader_include_dir();
+    if (include_dir.empty()) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "reload shaders: no shader include dir "
+            "(JCE_SHADERC_INCLUDE_DIR / BGFX_SHADER_INCLUDE_PATH); "
+            "reloading the compiled blobs only");
+        return false;
+    }
+
+    ScSweep sw;
+    sw.out_root    = out_root ? out_root : "";
+    sw.include_dir = include_dir;
+    sw.varying_def = jce_sg::resolve_varying_def_path();
+
+    char root[1024];
+    std::snprintf(root, sizeof(root), "%s/shaders", src);
+    if (!jce_fs_host_exists_dir(root))
+        std::snprintf(root, sizeof(root), "%s", src);
+
+    if (!jce_fs_host_walk(root, sc_walk_cb, &sw)) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "reload shaders: cannot walk %s", root);
+        return false;
+    }
+    jce_editor_console_log(
+        "reload shaders: %d recompiled, %d already current, %d failed (%s)",
+        sw.compiled, sw.up_to_date, sw.failed, root);
+    return true;
+}
+
+} /* namespace */
+
 extern "C" bool jce_editor_reload_shaders(void)
 {
     if (!g_state.svc || !g_state.svc->renderer || !g_state.svc->pak) {
@@ -488,6 +775,11 @@ extern "C" bool jce_editor_reload_shaders(void)
             dev_dir = inferred;
         }
     }
+
+    /* SOURCE FIRST.  This action used to re-read the compiled blobs, so
+     * editing a .sc changed nothing until the engine was rebuilt outside the
+     * editor -- the name promised source and the behaviour delivered output. */
+    recompile_stale_shader_sources(dev_dir);
 
     bool ok = jce_renderer_reload_shaders_fs(g_state.svc->renderer,
                                              dev_dir,

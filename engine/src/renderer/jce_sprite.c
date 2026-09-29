@@ -293,7 +293,19 @@ struct JceSpritePlayer {
     uint32_t              local_frame;   /* index within current anim */
     float                 elapsed_ms;
     bool                  finished;
+    /* -1 = the atlas tag decides (what every player did before this); else
+       0/1.  See jce_sprite_player_set_loop() in the header for why a caller
+       needs to be able to say this at all. */
+    int8_t                loop_override;
 };
+
+/* The one place the two sources are reconciled, so they cannot drift. */
+static bool sprite_loops(const JceSpritePlayer *p)
+{
+    if (!p || !p->current_anim) return false;
+    if (p->loop_override >= 0)  return p->loop_override != 0;
+    return p->current_anim->loop;
+}
 
 JceSpritePlayer *jce_sprite_player_create(const JceSpriteSheet *sheet)
 {
@@ -301,6 +313,7 @@ JceSpritePlayer *jce_sprite_player_create(const JceSpriteSheet *sheet)
     JceSpritePlayer *p = (JceSpritePlayer *)JCE_CALLOC(1, sizeof(*p));
     if (!p) return NULL;
     p->sheet = sheet;
+    p->loop_override = (int8_t)JCE_SPRITE_LOOP_FROM_ATLAS;
     /* Auto-select first animation. */
     if (sheet->anim_count > 0)
         p->current_anim = &sheet->anims[0];
@@ -324,6 +337,21 @@ bool jce_sprite_player_set_anim(JceSpritePlayer *p, const char *name)
     return true;
 }
 
+void jce_sprite_player_set_loop(JceSpritePlayer *p, int loop)
+{
+    if (!p) return;
+    p->loop_override = (int8_t)(loop < 0 ? JCE_SPRITE_LOOP_FROM_ATLAS
+                                         : (loop != 0));
+    /* Release a player that already ran out.  Without this the switch does
+       nothing until the animation changes, and "nothing happened" is exactly
+       what an unwired control looks like. */
+    if (p->finished && sprite_loops(p)) {
+        p->finished    = false;
+        p->local_frame = 0;
+        p->elapsed_ms  = 0.0f;
+    }
+}
+
 void jce_sprite_player_update(JceSpritePlayer *p, float dt, float speed)
 {
     if (!p || !p->current_anim || p->finished) return;
@@ -340,7 +368,7 @@ void jce_sprite_player_update(JceSpritePlayer *p, float dt, float speed)
         p->local_frame++;
 
         if (p->local_frame >= p->current_anim->frame_count) {
-            if (p->current_anim->loop) {
+            if (sprite_loops(p)) {
                 p->local_frame = 0;
             } else {
                 p->local_frame = p->current_anim->frame_count - 1;

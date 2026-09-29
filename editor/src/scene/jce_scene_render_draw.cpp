@@ -113,8 +113,19 @@ void draw_grid(void)
        shader's grid-LOD fade now dissolves it, so a tighter fade avoids a vast
        shimmer-prone band while keeping plenty of visible grid. */
     float fade_far  = fmaxf(fade_near + 40.0f, s_sr.orbit_distance * 12.0f);
-    float grid_camera[4] = { cam_pos.x, cam_pos.y, cam_pos.z, 0.0f };
-    float grid_fade[4] = { fade_near, fade_far, 10.0f, 1.0f };
+    /* Keep roughly the same screen density while orbiting by selecting
+     * decimal world-space levels.  Fade the fine level before each decade
+     * boundary so the next level takes over without a sudden density jump. */
+    float grid_decade = log10f(fmaxf(s_sr.orbit_distance, 10.0f)) - 1.0f;
+    float minor_spacing = fminf(10000.0f, powf(10.0f, floorf(grid_decade)));
+    float transition = fminf(1.0f, fmaxf(0.0f,
+                                      (grid_decade - floorf(grid_decade) - 0.7f)
+                                      / 0.3f));
+    transition = transition * transition * (3.0f - 2.0f * transition);
+    float grid_camera[4] = { cam_pos.x, cam_pos.y, cam_pos.z,
+                             1.0f - transition };
+    float grid_fade[4] = { fade_near, fade_far,
+                           minor_spacing * 10.0f, minor_spacing };
 
     jce_uniform_set(s_sr.u_grid_camera, grid_camera, 1);
     jce_uniform_set(s_sr.u_grid_fade, grid_fade, 1);
@@ -298,8 +309,9 @@ static void collider2d_box_loop(float cx, float cy, float z, float c, float s,
  * position UNrotated and UNscaled (the shape then rotates about that
  * body origin by the transform's Z angle), box/edge extents scale by the
  * entity's |XY| scale, the circle/capsule radius scales by max(|sx|,|sy|),
- * and the capsule is always vertical (the runtime ignores
- * capsule_direction).  Edge/polygon connect the AUTHORED points array
+ * and the capsule follows capsule_direction (0 = length along Y,
+ * 1 = along X) exactly as the runtime now does.  Edge/polygon connect the
+ * AUTHORED points array
  * when present; with no points they fall back to the shapes the runtime
  * actually spawns (horizontal segment / bounding box). */
 static void draw_collider2d_outline(const JceTransform *t,
@@ -338,34 +350,42 @@ static void draw_collider2d_outline(const JceTransform *t,
             break;
         }
         case JCE_COLLIDER_2D_CAPSULE: {
-            /* Vertical stadium: cap centers at (0,±hl), radius r. */
+            /* Stadium along the AUTHORED axis: cap centres at ±hl, radius r.
+             * capsule_direction used to be ignored here and in the runtime
+             * alike; both honour it now, so the two still agree. */
+            const bool horiz = (col->capsule_direction == 1);
             float r  = ((col->radius > 0.0f) ? col->radius : 0.25f) * smax;
-            float hl = 0.5f * ((col->size[1] > 0.0f) ? col->size[1] : 1.0f) * sy;
+            float len = horiz ? ((col->size[0] > 0.0f) ? col->size[0] : 1.0f)
+                              : ((col->size[1] > 0.0f) ? col->size[1] : 1.0f);
+            float hl = 0.5f * len * (horiz ? sx : sy);
+            /* (across, along) -> local (x, y): the loops below are written in
+             * capsule space so one body draws both axes. */
+            auto cap = [&](float across, float along) {
+                return horiz ? collider2d_pt(cx, cy, z, c, s, along, across)
+                             : collider2d_pt(cx, cy, z, c, s, across, along);
+            };
             const int seg = 12;     /* per semicircle cap */
-            jce_vec3 prev = collider2d_pt(cx, cy, z, c, s, r, -hl);
+            jce_vec3 prev = cap(r, -hl);
             /* Bottom cap: 0 → -π. */
             for (int k = 1; k <= seg; k++) {
                 float a = -(float)k * (3.1415927f / (float)seg);
-                jce_vec3 p = collider2d_pt(cx, cy, z, c, s,
-                                           cosf(a) * r, -hl + sinf(a) * r);
+                jce_vec3 p = cap(cosf(a) * r, -hl + sinf(a) * r);
                 jce_debug_draw_line(prev, p, abgr_capsule);
                 prev = p;
             }
-            /* Left side up to the top-cap start. */
-            jce_vec3 tl = collider2d_pt(cx, cy, z, c, s, -r, hl);
+            /* Far side up to the far-cap start. */
+            jce_vec3 tl = cap(-r, hl);
             jce_debug_draw_line(prev, tl, abgr_capsule);
             prev = tl;
             /* Top cap: π → 0. */
             for (int k = 1; k <= seg; k++) {
                 float a = 3.1415927f - (float)k * (3.1415927f / (float)seg);
-                jce_vec3 p = collider2d_pt(cx, cy, z, c, s,
-                                           cosf(a) * r, hl + sinf(a) * r);
+                jce_vec3 p = cap(cosf(a) * r, hl + sinf(a) * r);
                 jce_debug_draw_line(prev, p, abgr_capsule);
                 prev = p;
             }
-            /* Right side back down to the start. */
-            jce_debug_draw_line(prev,
-                collider2d_pt(cx, cy, z, c, s, r, -hl), abgr_capsule);
+            /* Near side back down to the start. */
+            jce_debug_draw_line(prev, cap(r, -hl), abgr_capsule);
             break;
         }
         case JCE_COLLIDER_2D_EDGE:
@@ -854,14 +874,30 @@ void draw_selection_outlines(void)
                 : jce_v3(0, 0, 0);
             jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
             float sx = ss.x, sy = ss.y, sz = ss.z;
-            float r_scale = fmaxf(sx, sz);
+            /* Follow the AUTHORED axis, exactly as the runtime now does.
+             * jce_debug_draw_capsule draws Y-aligned and already takes a
+             * rotation, so the axis composes into that -- no new draw call
+             * and no second place for draw and physics to disagree. */
+            int cax = cc ? cc->axis : 1;
+            if (cax < 0 || cax > 2) cax = 1;
+            float a0 = (cax == 0) ? sy : sx;
+            float a1 = (cax == 2) ? sy : sz;
+            float r_scale = fmaxf(a0, a1);
+            float len_scale = (cax == 0) ? sx : ((cax == 2) ? sz : sy);
             float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
-            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * len_scale;
             float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
             jce_vec3 c = jce_v3_add(t->position,
                               jce_q_rotate(t->rotation,
                                   jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
-            jce_debug_draw_capsule(c, r, hh, t->rotation, col_outline);
+            /* Y -> X is -90 deg about Z; Y -> Z is +90 deg about X. */
+            jce_quat axis_q = (cax == 0)
+                ? jce_q_from_axis_angle(jce_v3(0.0f, 0.0f, 1.0f), -1.5707963f)
+                : (cax == 2)
+                ? jce_q_from_axis_angle(jce_v3(1.0f, 0.0f, 0.0f),  1.5707963f)
+                : jce_q_identity();
+            jce_debug_draw_capsule(c, r, hh, jce_q_multiply(t->rotation, axis_q),
+                                   col_outline);
             drew_shape = true;
         }
         if (jce_scene_has_character_controller(scene, e)) {
@@ -1072,7 +1108,11 @@ void draw_selection_outlines(void)
          *     clamp.  2D sources keep the generic fallback box. */
         if (jce_scene_has_audio_source(scene, e)) {
             JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
-            if (as && as->spatial_blend > 0.5f) {
+            /* Matches the runtime, which became CONTINUOUS: anything above 0
+             * is spatial and has an attenuation radius worth drawing.  While
+             * this said 0.5 a source authored at 0.3 was spatial in the mix
+             * and had no gizmo. */
+            if (as && as->spatial_blend > 0.0f) {
                 float min_d = as->min_distance > 0.0f ? as->min_distance : 1.0f;
                 float max_d = as->max_distance > 0.0f ? as->max_distance : 25.0f;
                 const uint32_t col_as_min = 0xCC00C5CCu; /* olive */

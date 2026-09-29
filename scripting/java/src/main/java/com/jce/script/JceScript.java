@@ -38,22 +38,30 @@
  * policy here would be a second implementation of a security decision.
  * The manifest's own reasons:
  *
+ *   line_set_points
+ *       marshalling, not glue: the host takes a packed `const float *xyz, int
+ *       count` and no generated shape reads a Lua array into one.
+ *       Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and the
+ *       returned stored-count live in one place. Exists because the
+ *       comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key
+ *       by walking the object's child list (jce_scene_components_render.c
+ *       parse_line_renderer)
  *   log
- *       no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the
+ *       no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the
  *       only one among the 78
  *   asset_read_text
- *       policy, not glue: script_virtual_asset_path_valid (:66, called :102),
- *       the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86),
+ *       policy, not glue: script_virtual_asset_path_valid (:67, called :103),
+ *       the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:114),
  *       jce_free on every exit path. A generated read_file template is a
  *       sandbox escape (P0-2)
  *   asset_read_json
  *       all of asset_read_text (the same script_virtual_asset_path_valid at
- *       :219) plus a depth- and node-capped JSON walk, non-finite rejection,
+ *       :220) plus a depth- and node-capped JSON walk, non-finite rejection,
  *       the json_null sentinel and distinct string error codes (P0-2)
  *   play_sound
- *       arity dispatch across two members: lua_gettop at :263 routes to
- *       play_sound_spatial (:286) or play_sound (:289); its own comment at
- *       :280 concedes top == 3 is ambiguous
+ *       arity dispatch across two members: lua_gettop at :264 routes to
+ *       play_sound_spatial (:287) or play_sound (:290); its own comment at
+ *       :281 concedes top == 3 is ambiguous
  *   start_coroutine
  *       Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume;
  *       owns s->coros[]
@@ -69,7 +77,7 @@
 package com.jce.script;
 
 
-/** The scripting surface: 71 entries over the C ABI. */
+/** The scripting surface: 101 entries over the C ABI. */
 public final class JceScript implements AutoCloseable {
 
     /** The manifest's script_api_version this class was generated from. */
@@ -175,6 +183,25 @@ public final class JceScript implements AutoCloseable {
         }
     }
 
+    /** raycast_filtered: the host's answer when it has one. */
+    public static final class RaycastFilteredResult {
+        /** out parameter entity. */
+        public final long entity;
+        /** out parameter point. */
+        public final float[] point;
+        /** out parameter normal. */
+        public final float[] normal;
+        /** out parameter distance. */
+        public final float distance;
+
+        RaycastFilteredResult(long entity, float[] point, float[] normal, float distance) {
+            this.entity = entity;
+            this.point = point;
+            this.normal = normal;
+            this.distance = distance;
+        }
+    }
+
     /** get_touch: the host's answer when it has one. */
     public static final class GetTouchResult {
         /** out parameter id. */
@@ -207,9 +234,29 @@ public final class JceScript implements AutoCloseable {
         }
     }
 
+    /** get_param: the host's answer when it has one. */
+    public static final class GetParamResult {
+        /** out parameter out_kind. */
+        public final int outKind;
+        /** out parameter out_number. */
+        public final double outNumber;
+        /** out parameter out_entity. */
+        public final long outEntity;
+
+        GetParamResult(int outKind, double outNumber, long outEntity) {
+            this.outKind = outKind;
+            this.outNumber = outNumber;
+            this.outEntity = outEntity;
+        }
+    }
+
     /**
-     * World-space position of `entity`. Absent when the entity has no
-     * transform.
+     * LOCAL position of `entity` -- its own translation, not composed up the
+     * parent chain. Absent when the entity has no transform. Use
+     * get_world_position for the composed pose. This doc said 'World-space'
+     * until 2026-08-26; the implementation always returned the local TRS
+     * (jce_scene_get_transform), and the wrong word was generated into all
+     * five language SDKs.
      * <p>Shape fallible_out, since 1; host member get_position.
      * @param e JceScriptEntity, unsigned; the bits round-trip exactly
      */
@@ -277,6 +324,23 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native boolean nGetScale(long api, long e, float[] outFloat);
+
+    /**
+     * WORLD position of `entity`: its local TRS composed up the parent chain
+     * (jce_scene_get_world_matrix). Absent when the entity has no transform.
+     * Every parented rig -- arms, jaws, fingers, pads -- needs this rather
+     * than get_position.
+     * <p>Shape fallible_out, since 1; host member get_world_position.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public float[] getWorldPosition(long e) {
+        float[] outFloat = new float[3];
+        if (!nGetWorldPosition(handle, e, outFloat))
+            return null;
+        return outFloat;
+    }
+
+    private static native boolean nGetWorldPosition(long api, long e, float[] outFloat);
 
     /**
      * jce.set_scale
@@ -579,6 +643,79 @@ public final class JceScript implements AutoCloseable {
     private static native boolean nRaycast(long api, float[] origin, float[] dir, float maxDist, long[] outLong, float[] outFloat);
 
     /**
+     * Closest hit along the ray, honouring a layer mask and the trigger skip
+     * -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts
+     * branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every
+     * layer and hit_triggers defaults to false, so the common call stays
+     * origin/dir/distance and the filter is what you add when you need it.
+     * hit_triggers is separate from the mask because a trigger volume is not
+     * a layer: collapsing them would make 'ignore triggers on layer 3'
+     * inexpressible.
+     * <p>Shape fallible_out, since 1; host member raycast_filtered.
+     * A miss is null. (The Lua binding renders the same miss as the number 0;
+     * absence is uniformly null here.)
+     * @param origin const float
+     * @param dir const float
+     * @param maxDist float
+     * @param layerMask uint32_t, unsigned; the bits round-trip exactly
+     * @param hitTriggers bool
+     */
+    public RaycastFilteredResult raycastFiltered(float[] origin, float[] dir, float maxDist, int layerMask, boolean hitTriggers) {
+        long[] outLong = new long[1];
+        float[] outFloat = new float[7];
+        if (!nRaycastFiltered(handle, origin, dir, maxDist, layerMask, hitTriggers, outLong, outFloat))
+            return null;
+        return new RaycastFilteredResult(outLong[0], java.util.Arrays.copyOfRange(outFloat, 0, 3), java.util.Arrays.copyOfRange(outFloat, 3, 6), outFloat[6]);
+    }
+
+    /** raycastFiltered with the manifest defaults (hitTriggers=False). */
+    public RaycastFilteredResult raycastFiltered(float[] origin, float[] dir, float maxDist, int layerMask) {
+        return raycastFiltered(origin, dir, maxDist, layerMask, false);
+    }
+
+    /** raycastFiltered with the manifest defaults (layerMask=0, hitTriggers=False). */
+    public RaycastFilteredResult raycastFiltered(float[] origin, float[] dir, float maxDist) {
+        return raycastFiltered(origin, dir, maxDist, 0, false);
+    }
+
+    private static native boolean nRaycastFiltered(long api, float[] origin, float[] dir, float maxDist, int layerMask, boolean hitTriggers, long[] outLong, float[] outFloat);
+
+    /**
+     * Every entity the ray passes through, as one array sorted near to far.
+     * layer_mask 0 means every layer; hit_triggers defaults to false. Returns
+     * ENTITIES rather than full hit records because the eight-value hit does
+     * not survive as an array shape across seven languages without inventing
+     * a per-language container -- re-query a specific one with
+     * jce.raycast_filtered when you need its point and normal.
+     * <p>Shape entity_table, since 1; host member raycast_all.
+     * At most 256 results (manifest out_capacity).
+     * @param origin const float
+     * @param dir const float
+     * @param maxDist float
+     * @param layerMask uint32_t, unsigned; the bits round-trip exactly
+     * @param hitTriggers bool
+     */
+    public long[] raycastAll(float[] origin, float[] dir, float maxDist, int layerMask, boolean hitTriggers) {
+        long[] buf = new long[256];
+        int n = nRaycastAll(handle, origin, dir, maxDist, layerMask, hitTriggers, buf);
+        if (n <= 0) return EMPTY_ENTITIES;
+        if (n > 256) n = 256;
+        return java.util.Arrays.copyOf(buf, n);
+    }
+
+    /** raycastAll with the manifest defaults (hitTriggers=False). */
+    public long[] raycastAll(float[] origin, float[] dir, float maxDist, int layerMask) {
+        return raycastAll(origin, dir, maxDist, layerMask, false);
+    }
+
+    /** raycastAll with the manifest defaults (layerMask=0, hitTriggers=False). */
+    public long[] raycastAll(float[] origin, float[] dir, float maxDist) {
+        return raycastAll(origin, dir, maxDist, 0, false);
+    }
+
+    private static native int nRaycastAll(long api, float[] origin, float[] dir, float maxDist, int layerMask, boolean hitTriggers, long[] out);
+
+    /**
      * jce.apply_impulse
      * <p>Shape void_call, since 1; host member apply_impulse.
      * @param e JceScriptEntity, unsigned; the bits round-trip exactly
@@ -867,6 +1004,32 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native void nUiSetSlider(long api, long e, float v);
+
+    /**
+     * jce.ui_get_progress
+     * <p>Shape fallible_out, since 1; host member ui_get_progress.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public Float uiGetProgress(long e) {
+        float[] outFloat = new float[1];
+        if (!nUiGetProgress(handle, e, outFloat))
+            return null;
+        return Float.valueOf(outFloat[0]);
+    }
+
+    private static native boolean nUiGetProgress(long api, long e, float[] outFloat);
+
+    /**
+     * jce.ui_set_progress
+     * <p>Shape void_call, since 1; host member ui_set_progress.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param v float
+     */
+    public void uiSetProgress(long e, float v) {
+        nUiSetProgress(handle, e, v);
+    }
+
+    private static native void nUiSetProgress(long api, long e, float v);
 
     /**
      * jce.ui_get_toggle
@@ -1180,5 +1343,389 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native void nAudioSetVolume(long api, long e, float volume);
+
+    /**
+     * Selected option INDEX of `entity`'s UIDropdown. Absent when the entity
+     * has no dropdown, so a script can tell 'no dropdown' from 'a dropdown
+     * reading 0'. The index and not the label: branching on which option is
+     * the common case, and a label would make it a string compare.
+     * <p>Shape fallible_out, since 1; host member ui_get_dropdown.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public Integer uiGetDropdown(long e) {
+        int[] outInt = new int[1];
+        if (!nUiGetDropdown(handle, e, outInt))
+            return null;
+        return Integer.valueOf(outInt[0]);
+    }
+
+    private static native boolean nUiGetDropdown(long api, long e, int[] outInt);
+
+    /**
+     * Select an option by INDEX. Clamped into [0, option_count-1] rather than
+     * refused, the way ui_set_progress clamps and the way the scene loader
+     * clamps: the draw already clamps, so storing outside the range would
+     * make the component and the picture disagree.
+     * <p>Shape void_call, since 1; host member ui_set_dropdown.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param index int
+     */
+    public void uiSetDropdown(long e, int index) {
+        nUiSetDropdown(handle, e, index);
+    }
+
+    private static native void nUiSetDropdown(long api, long e, int index);
+
+    /**
+     * Current text of `entity`'s UIInputField, or '' when it has none. The
+     * string is the component's own buffer and is valid until the next
+     * mutation of that entity -- the same contract tr() and get_locale()
+     * carry; every binding copies it and none may store it.
+     * <p>Shape value_return, since 1; host member ui_get_input_text.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public String uiGetInputText(long e) {
+        String v = nUiGetInputText(handle, e);
+        return v == null ? "" : v;
+    }
+
+    private static native String nUiGetInputText(long api, long e);
+
+    /**
+     * Replace the UIInputField's text. Truncated to the field's capacity and
+     * to char_limit when one is set -- the same cap the canvas applies to
+     * typed input, so a script write and a keystroke cannot disagree about
+     * what the field holds. A truncation is logged rather than silent.
+     * <p>Shape void_call, since 1; host member ui_set_input_text.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param text const char *
+     */
+    public void uiSetInputText(long e, String text) {
+        nUiSetInputText(handle, e, text);
+    }
+
+    private static native void nUiSetInputText(long api, long e, String text);
+
+    /**
+     * Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units --
+     * what the component stores and what the wheel path clamps, not device
+     * px. Absent when the entity has no scroll view.
+     * <p>Shape fallible_out, since 1; host member ui_get_scroll.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public float[] uiGetScroll(long e) {
+        float[] outFloat = new float[2];
+        if (!nUiGetScroll(handle, e, outFloat))
+            return null;
+        return outFloat;
+    }
+
+    private static native boolean nUiGetScroll(long api, long e, float[] outFloat);
+
+    /**
+     * Set the scroll offset in reference units. A disabled axis is pinned to
+     * 0 and each axis is clamped the way the wheel path clamps, so a script
+     * cannot push the offset somewhere a wheel could not; the canvas
+     * re-clamps against the resolved viewport on the next render.
+     * <p>Shape void_call, since 1; host member ui_set_scroll.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param x float
+     * @param y float
+     */
+    public void uiSetScroll(long e, float x, float y) {
+        nUiSetScroll(handle, e, x, y);
+    }
+
+    private static native void nUiSetScroll(long api, long e, float x, float y);
+
+    /**
+     * Live hour of day in [0, 24) -- what the sky is showing now, NOT the
+     * authored tod_hour seed a scene starts from. Reading the seed would
+     * return the level's start-of-day forever while the sky moved.
+     * <p>Shape value_return, since 1; host member world_get_hour.
+     */
+    public float worldGetHour() {
+        return nWorldGetHour(handle);
+    }
+
+    private static native float nWorldGetHour(long api);
+
+    /**
+     * Move the live clock, wrapping into [0, 24). For 'sleep until dawn'. The
+     * authored seed is untouched, so reloading the scene still starts where
+     * the designer set it.
+     * <p>Shape void_call, since 1; host member world_set_hour.
+     * @param hour float
+     */
+    public void worldSetHour(float hour) {
+        nWorldSetHour(handle, hour);
+    }
+
+    private static native void nWorldSetHour(long api, float hour);
+
+    /**
+     * True while the sun is above the horizon. THE predicate for 'is it
+     * night?' -- every key-light chooser in the engine is required to agree
+     * on this one, so a script that rolled its own threshold would disagree
+     * with the lighting it can see.
+     * <p>Shape value_return, since 1; host member world_is_daytime.
+     */
+    public boolean worldIsDaytime() {
+        return nWorldIsDaytime(handle);
+    }
+
+    private static native boolean nWorldIsDaytime(long api);
+
+    /**
+     * Authored weather type: 0 clear, 1 rain, 2 snow.
+     * <p>Shape value_return, since 1; host member world_get_weather.
+     */
+    public int worldGetWeather() {
+        return nWorldGetWeather(handle);
+    }
+
+    private static native int nWorldGetWeather(long api);
+
+    /**
+     * Authored weather intensity in [0, 1].
+     * <p>Shape value_return, since 1; host member world_get_weather_intensity.
+     */
+    public float worldGetWeatherIntensity() {
+        return nWorldGetWeatherIntensity(handle);
+    }
+
+    private static native float nWorldGetWeatherIntensity(long api);
+
+    /**
+     * Instantaneous wind speed in m/s -- the sustained speed plus this
+     * moment's gust. Do NOT key a cache on it: it changes every frame by
+     * design. It is the same number the ocean spectrum and the vegetation
+     * shader read, so a script cannot disagree with what is on screen.
+     * <p>Shape value_return, since 1; host member world_get_wind_speed.
+     */
+    public float worldGetWindSpeed() {
+        return nWorldGetWindSpeed(handle);
+    }
+
+    private static native float nWorldGetWindSpeed(long api);
+
+    /**
+     * jce.request_scene
+     * <p>Shape value_return, since 1; host member request_scene.
+     * @param scenePath const char *
+     */
+    public boolean requestScene(String scenePath) {
+        return nRequestScene(handle, scenePath);
+    }
+
+    private static native boolean nRequestScene(long api, String scenePath);
+
+    /**
+     * jce.is_transitioning
+     * <p>Shape value_return, since 1; host member is_transitioning.
+     */
+    public boolean isTransitioning() {
+        return nIsTransitioning(handle);
+    }
+
+    private static native boolean nIsTransitioning(long api);
+
+    /**
+     * jce.audio_play
+     * <p>Shape value_return, since 1; host member audio_play.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public boolean audioPlay(long e) {
+        return nAudioPlay(handle, e);
+    }
+
+    private static native boolean nAudioPlay(long api, long e);
+
+    /**
+     * jce.audio_stop
+     * <p>Shape value_return, since 1; host member audio_stop.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public boolean audioStop(long e) {
+        return nAudioStop(handle, e);
+    }
+
+    private static native boolean nAudioStop(long api, long e);
+
+    /**
+     * jce.audio_is_playing
+     * <p>Shape value_return, since 1; host member audio_is_playing.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     */
+    public boolean audioIsPlaying(long e) {
+        return nAudioIsPlaying(handle, e);
+    }
+
+    private static native boolean nAudioIsPlaying(long api, long e);
+
+    /**
+     * jce.save_game
+     * <p>Shape value_return, since 1; host member save_game.
+     * @param path const char *
+     */
+    public boolean saveGame(String path) {
+        return nSaveGame(handle, path);
+    }
+
+    private static native boolean nSaveGame(long api, String path);
+
+    /**
+     * jce.load_game
+     * <p>Shape value_return, since 1; host member load_game.
+     * @param path const char *
+     */
+    public boolean loadGame(String path) {
+        return nLoadGame(handle, path);
+    }
+
+    private static native boolean nLoadGame(long api, String path);
+
+    /**
+     * Entities whose collider overlaps the sphere, as one array. layer_mask 0
+     * means all layers. Triggers are skipped. layer_mask is OPTIONAL:
+     * omitting it means every layer, which is what an explosion or a pickup
+     * check wants and keeps the common call to its coordinates and its size.
+     * <p>Shape entity_table, since 1; host member overlap_sphere.
+     * At most 256 results (manifest out_capacity).
+     * @param x float
+     * @param y float
+     * @param z float
+     * @param radius float
+     * @param layerMask uint32_t, unsigned; the bits round-trip exactly
+     */
+    public long[] overlapSphere(float x, float y, float z, float radius, int layerMask) {
+        long[] buf = new long[256];
+        int n = nOverlapSphere(handle, x, y, z, radius, layerMask, buf);
+        if (n <= 0) return EMPTY_ENTITIES;
+        if (n > 256) n = 256;
+        return java.util.Arrays.copyOf(buf, n);
+    }
+
+    /** overlapSphere with the manifest defaults (layerMask=0). */
+    public long[] overlapSphere(float x, float y, float z, float radius) {
+        return overlapSphere(x, y, z, radius, 0);
+    }
+
+    private static native int nOverlapSphere(long api, float x, float y, float z, float radius, int layerMask, long[] out);
+
+    /**
+     * Entities whose collider overlaps the axis-aligned box (half-extents),
+     * as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL:
+     * omitting it means every layer, which is what an explosion or a pickup
+     * check wants and keeps the common call to its coordinates and its size.
+     * <p>Shape entity_table, since 1; host member overlap_box.
+     * At most 256 results (manifest out_capacity).
+     * @param x float
+     * @param y float
+     * @param z float
+     * @param hx float
+     * @param hy float
+     * @param hz float
+     * @param layerMask uint32_t, unsigned; the bits round-trip exactly
+     */
+    public long[] overlapBox(float x, float y, float z, float hx, float hy, float hz, int layerMask) {
+        long[] buf = new long[256];
+        int n = nOverlapBox(handle, x, y, z, hx, hy, hz, layerMask, buf);
+        if (n <= 0) return EMPTY_ENTITIES;
+        if (n > 256) n = 256;
+        return java.util.Arrays.copyOf(buf, n);
+    }
+
+    /** overlapBox with the manifest defaults (layerMask=0). */
+    public long[] overlapBox(float x, float y, float z, float hx, float hy, float hz) {
+        return overlapBox(x, y, z, hx, hy, hz, 0);
+    }
+
+    private static native int nOverlapBox(long api, float x, float y, float z, float hx, float hy, float hz, int layerMask, long[] out);
+
+    /**
+     * Returns kind, number, entity for an AUTHORED script parameter --
+     * Unity's [SerializeField], Godot's @export. Returns nil when the entity
+     * has no script component, when no parameter of that name is authored, or
+     * when the name is empty: three absences a script cannot act differently
+     * on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author
+     * expects.
+     * <p>Shape fallible_out, since 1; host member get_script_param.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param name const char *
+     */
+    public GetParamResult getParam(long e, String name) {
+        int[] outInt = new int[1];
+        long[] outLong = new long[1];
+        double[] outDouble = new double[1];
+        if (!nGetParam(handle, e, name, outInt, outLong, outDouble))
+            return null;
+        return new GetParamResult(outInt[0], outDouble[0], outLong[0]);
+    }
+
+    private static native boolean nGetParam(long api, long e, String name, int[] outInt, long[] outLong, double[] outDouble);
+
+    /**
+     * The TEXT value of an authored script parameter, or '' when the entity
+     * has no script component, no parameter of that name, or one that is not
+     * text. Empty rather than nil for the same reason ui_get_input_text is
+     * empty: a script comparing strings should not have to test for nil
+     * first. The string is the component's own buffer -- copy it if you keep
+     * it.
+     * <p>Shape value_return, since 1; host member get_script_param_text.
+     * @param e JceScriptEntity, unsigned; the bits round-trip exactly
+     * @param name const char *
+     */
+    public String getParamText(long e, String name) {
+        String v = nGetParamText(handle, e, name);
+        return v == null ? "" : v;
+    }
+
+    private static native String nGetParamText(long api, long e, String name);
+
+    /**
+     * Sample an AUTHORED curve -- the documents the editor's Curve Editor
+     * writes, which nothing could read until this binding existed. Unity's
+     * AnimationCurve shape: the curve is a designer-authored function and the
+     * script decides what it means, so the engine never has to invent what a
+     * curve DRIVES. Returns nil when the path does not resolve, the document
+     * does not parse, the named channel is absent, or that channel has no
+     * keys -- so a curve that genuinely evaluates to 0 and a curve that is
+     * not there are never one reading, and `jce.curve_eval(p, 'kick', t) or
+     * 0.0` reads the way an author expects. An empty channel name means the
+     * FIRST channel, which is a different request from a name that is not
+     * there. The parsed curve is cached per runtime, so a call inside
+     * on_update costs a name compare, not a JSON parse.
+     * <p>Shape fallible_out, since 1; host member curve_eval.
+     * @param path const char *
+     * @param channel const char *
+     * @param t double
+     */
+    public Double curveEval(String path, String channel, double t) {
+        double[] outDouble = new double[1];
+        if (!nCurveEval(handle, path, channel, t, outDouble))
+            return null;
+        return Double.valueOf(outDouble[0]);
+    }
+
+    private static native boolean nCurveEval(long api, String path, String channel, double t, double[] outDouble);
+
+    /**
+     * Cut to the virtual camera with this name, ahead of priority. Returns 1
+     * when the name resolves to a camera that is active and enabled, 0
+     * otherwise -- the request is recorded either way, so naming a camera in
+     * a streaming cell that has not loaded yet does not silently become
+     * 'whatever priority says'. Pass an empty string to clear it and hand the
+     * decision back to priority. It does NOT rewrite the authored components:
+     * the override lives in the vcam system, so a cutscene cannot bake its
+     * camera choice into the level file.
+     * <p>Shape value_return, since 1; host member vcam_activate.
+     * @param name const char *
+     */
+    public int vcamActivate(String name) {
+        return nVcamActivate(handle, name);
+    }
+
+    private static native int nVcamActivate(long api, String name);
 
 }

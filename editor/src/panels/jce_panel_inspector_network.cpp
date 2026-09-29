@@ -3,6 +3,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include <jce/middleware/net/jce_net_animator.h>
 
 void draw_comp_network_object(JceNetworkObjectComponent *c)
 {
@@ -80,7 +81,10 @@ void draw_comp_net_transform(JceNetTransformComponent *c)
 
 void draw_comp_net_animator(JceNetAnimatorComponent *c)
 {
-    insp_unwired_badge();
+    /* The badge is GONE because the three knobs below now have a reader:
+     * jce_runtime.c registers this component with the animator replication
+     * module and hands it exactly these values.  A badge that outlives the
+     * wire says the opposite of what the code does. */
     if (!c) return;
 
     ImGui::PushItemWidth(-1);
@@ -116,6 +120,22 @@ void draw_comp_net_animator(JceNetAnimatorComponent *c)
     }
 
     ImGui::PopItemWidth();
+
+    /* WHAT IT IS ACTUALLY DOING.  A replication setting you cannot observe is
+     * one you cannot tell is working: these counters are the module's own, so
+     * a zero here means the module saw nothing, not that the panel is stale.
+     * All zero outside Play, which is the honest reading -- nothing is
+     * replicating. */
+    ImGui::Separator();
+    ImGui::TextDisabled("%s: %u   %s: %u \xE2\x86\x91 / %u \xE2\x86\x93",
+                        jce_editor_i18n("inspector.net_animator.live.registered"),
+                        jce_net_animator_registered_count(),
+                        jce_editor_i18n("inspector.net_animator.live.triggers"),
+                        jce_net_animator_triggers_sent_count(),
+                        jce_net_animator_triggers_received_count());
+    ImGui::TextDisabled("%s: %u",
+                        jce_editor_i18n("inspector.net_animator.live.stateChanges"),
+                        jce_net_animator_state_changes_count());
 }
 
 void draw_comp_network_variable(JceNetworkVariableComponent *c)

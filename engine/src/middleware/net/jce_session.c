@@ -759,8 +759,8 @@ void jce_session_tick(void)
 /* not mistaken for live session coverage — see the matching note on   */
 /* jce_lan_discovery_self_test in jce_lan_discovery.h.                 */
 /* ================================================================== */
-#if !defined(NDEBUG) && defined(JCE_NET_SELF_TEST)
-#include <assert.h>
+#if defined(JCE_SELF_TESTS) && defined(JCE_NET_SELF_TEST)
+#include <jce/os/core/jce_assert.h>
 
 static int g_st_evt_started;
 static int g_st_evt_client_connected;
@@ -793,13 +793,13 @@ void jce_session_self_test(void)
 
     jce_session_set_event_handler(st_handler, NULL);
     bool ok = jce_session_start_host(&h);
-    assert(ok);
-    assert(jce_session_state() == JCE_SESSION_STATE_RUNNING);
-    assert(jce_session_local_client_id() == HOST_LOCAL_CLIENT_ID);
-    assert(jce_session_is_server());
-    assert(jce_session_is_host());
-    assert(jce_session_client_count() == 1u);
-    assert(g_st_evt_started == 1);
+    JCE_ASSERT(ok);
+    JCE_ASSERT(jce_session_state() == JCE_SESSION_STATE_RUNNING);
+    JCE_ASSERT(jce_session_local_client_id() == HOST_LOCAL_CLIENT_ID);
+    JCE_ASSERT(jce_session_is_server());
+    JCE_ASSERT(jce_session_is_host());
+    JCE_ASSERT(jce_session_client_count() == 1u);
+    JCE_ASSERT(g_st_evt_started == 1);
 
     /* Snapshot + tear down host to spin a CLIENT against a fresh host
      * (single-process loopback tests are easiest this way).  Skipped:
@@ -808,6 +808,6 @@ void jce_session_self_test(void)
     memcpy(&srv_save, &g_sess, sizeof(g_sess));
     (void)srv_save;
     jce_session_shutdown();
-    assert(g_sess.mode == JCE_SESSION_MODE_NONE);
+    JCE_ASSERT(g_sess.mode == JCE_SESSION_MODE_NONE);
 }
-#endif /* !NDEBUG && JCE_NET_SELF_TEST */
+#endif /* JCE_SELF_TESTS && JCE_NET_SELF_TEST */

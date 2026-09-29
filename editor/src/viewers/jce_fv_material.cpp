@@ -16,6 +16,8 @@ extern "C" {
 #include <jce/resource/jce_image_decode.h>
 }
 
+#include "core/jce_assetdb.h"        /* JCE_ASSET_KIND_MATERIAL */
+#include "dialogs/jce_path_input.h"  /* jce_draw_path_input_asset */
 #include "io/jce_editor_file_util.h"
 #include "ui/jce_editor_panels.h"
 
@@ -38,6 +40,10 @@ struct MatViewState {
     JcePbrMaterial mat;
     char           tex_paths[5][256];   /* albedo, mr, normal, ao, emissive */
     MatTexSlot     thumbs[5];
+    /* The parent link, as the FILE states it (relative, unresolved).  Not in
+     * JcePbrMaterial: that struct is the resolved render state and is copied
+     * by value on every draw. */
+    char           parent[256];
 };
 
 static std::vector<std::pair<std::string, MatViewState>> s_mat_states;
@@ -112,10 +118,14 @@ void fv_render_material(FvTab *tab)
             ms->thumbs[i].tried = false;
         }
 
-        if (tab->path[0] != '\0')
+        ms->parent[0] = '\0';
+        if (tab->path[0] != '\0') {
             ms->load_ok = jce_pbr_material_load_json(tab->path,
                                                       &ms->mat,
                                                       ms->tex_paths);
+            jce_pbr_material_get_parent(tab->path, ms->parent,
+                                        sizeof ms->parent);
+        }
     }
 
     /* ── Toolbar ────────────────────────────────────────────────── */
@@ -171,6 +181,38 @@ void fv_render_material(FvTab *tab)
         ImGui::Separator();
         fv_render_code(tab);
         return;
+    }
+
+    /* ── Parent (material variant) ──────────────────────────────── */
+    {
+        char before[256];
+        snprintf(before, sizeof before, "%s", ms->parent);
+        jce_draw_path_input_asset(
+            jce_editor_i18n_id("viewer.material.parent", "Parent Material"),
+            ms->parent, sizeof ms->parent, JCE_ASSET_KIND_MATERIAL);
+        if (strcmp(before, ms->parent) != 0) {
+            /* Written through the FILE and reloaded immediately: the values
+             * shown below are the RESOLVED ones, and they do not exist until
+             * the link is on disk.  Editing the path and seeing the old
+             * numbers would be the worst of both. */
+            if (jce_pbr_material_set_parent(tab->path,
+                                            ms->parent[0] ? ms->parent : NULL)) {
+                ms->parsed = false;      /* re-resolve on the next frame */
+                ms->modified = false;
+                tab->modified = false;
+                jce_editor_inspector_reload_material(tab->path);
+            } else {
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "Cannot set material parent: %s", tab->path);
+                snprintf(ms->parent, sizeof ms->parent, "%s", before);
+            }
+        }
+        if (ms->parent[0]) {
+            ImGui::TextDisabled("%s", jce_editor_i18n_id(
+                "viewer.material.parentHint",
+                "values below are resolved; saving stores only what differs"));
+        }
+        ImGui::Separator();
     }
 
     /* ── PBR Properties (editable) ──────────────────────────────── */

@@ -1,0 +1,42 @@
+# First-party .cpp allowed under engine/src, one per line, with the
+# third-party C++ library it bridges named after '#' on the SAME line.
+# A bare path with no library is NOT an entry -- check_engine_cxx_bridges.py
+# ignores it, so "I'll say which library later" fails closed.
+#
+# AGENTS.md §11: the engine is C99.  A .cpp exists here only because some
+# third-party library has no C API and somebody has to speak C++ to it.  It is
+# a THIN WRAPPER exposing a jce-style C surface, not a place to write C++.
+#
+# §11's own parenthetical named four libraries -- Bullet, ozz, Recast,
+# behaviortree.cpp.  The tree actually bridges nine, listed below; the
+# parenthetical was written when it was four and never revisited.  That is the
+# reason this list exists in a file the gate reads instead of in prose.
+#
+# 2026-08-31: engine/src/middleware/video/jce_audio_stream.cpp was removed from
+# this category rather than added to it.  381 lines, includes only jce headers
+# and <string.h>, bridged nothing -- a C file with the wrong extension.  It
+# compiled as C11 with zero errors and zero warnings unchanged, and is
+# jce_audio_stream.c now.
+#
+# ---------------------------------------------------------------------------
+
+engine/src/middleware/ai/jce_bt_impl.cpp             # behaviortree.cpp -- <behaviortree_cpp/action_node.h>; C++-only API (BT::TreeNode subclasses)
+engine/src/middleware/ai/jce_navmesh_recast.cpp      # Recast / Detour -- <recastnavigation/Recast.h>, <recastnavigation/DetourAlloc.h>
+engine/src/middleware/animation/jce_anim_ozz.cpp     # ozz-animation -- <ozz/base/maths/simd_math.h>; C++ templates throughout
+engine/src/middleware/physics/jce_cloth.cpp          # Bullet soft body -- <BulletSoftBody/btSoftBody.h>
+engine/src/middleware/physics/jce_collider_cook.cpp  # V-HACD -- "VHACD.h"; convex decomposition, C++ interface class
+engine/src/middleware/physics/jce_physics_bullet.cpp # Bullet -- <btBulletDynamicsCommon.h>
+engine/src/middleware/physics/jce_physics_bullet_internal.hpp # Bullet -- struct JceBulletWorld's members are btDiscreteDynamicsWorld*/btRigidBody*; C++-only by construction
+engine/src/middleware/physics/jce_physics_bullet_vehicle.cpp # Bullet -- <BulletDynamics/Vehicle/btRaycastVehicle.h>
+engine/src/middleware/physics/jce_physics_bullet_char.cpp # Bullet -- btCapsuleShape, btRigidBody and btCollisionWorld::ClosestRayResultCallback are C++-only; the capsule controller is built entirely out of them, and the ground probe reads btRigidBody::getVelocityInLocalPoint() off the body it hit. Split from jce_physics_bullet.cpp at the 3000-line cap: it touches only bw->char_* plus world/ghosts/characters and calls no static defined there, so the seam is the same width as the vehicle one beside it
+engine/src/middleware/physics/jce_physics_bullet_con_query.cpp # Bullet -- btTypedConstraint::getJointFeedback()/setJointFeedback() and btJointFeedback are C++-only; this TU owns one mechanism end to end (install the feedback storage at creation, read force and torque after each step) and exists because keeping those halves apart is how they drifted
+engine/src/middleware/physics/jce_physics_bullet_contact.cpp # Bullet -- gContactAddedCallback is a C++ global whose signature takes btManifoldPoint& and btCollisionObjectWrapper*, so the hook cannot be C; this TU owns the one global contact hook end to end (install it at world create, chain to any previous owner, and run everything that influences a contact inside it) and exists because its installation used to live inside the heightfield path, which is the same drift the con_query file above records
+engine/src/middleware/ui/jce_imgui_renderer.cpp      # Dear ImGui -- C++-only API; renders it through the bgfx C99 header
+engine/src/middleware/ui/jce_ui_rmlui.cpp            # RmlUi -- <RmlUi/Core.h>; C++-only (Rml::Context, interface subclassing)
+engine/src/middleware/video/jce_video.cpp            # Opus + the C++ demux/decode stack this file drives
+engine/src/middleware/video/jce_webm_encoder.cpp     # libvpx / libwebm mkvmuxer -- <vpx/vpx_encoder.h>; muxer side is C++
+engine/src/middleware/video/jce_webm_parser.cpp      # libwebm -- <mkvparser/mkvparser.h>; C++-only parser
+engine/src/renderer/jce_ktx2_writer.cpp              # bimg / bx -- <bimg/bimg.h>, <bx/bx.h>; C++-only
+engine/src/resource/jce_bundle_mesh_convert.cpp      # assimp -- <assimp/Exporter.hpp>
+engine/src/resource/jce_model_importer.cpp           # assimp -- <assimp/Importer.hpp>
+engine/src/sdk_shims/jce_msvc_stl_shims.cpp          # the MSVC C++ runtime itself -- exists to satisfy STL symbols an SDK consumer links against; C++ by definition

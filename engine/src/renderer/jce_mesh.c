@@ -2,6 +2,7 @@
  * jce_mesh.c  GPU mesh implementation.
  */
 
+#include "renderer/jce_vertex_layout.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_mesh.h>
@@ -121,17 +122,103 @@ static bool build_unique_wireframe_indices(const uint32_t *indices,
     return true;
 }
 
-/* Shared mesh vertex layout (position float3 + normal float3 + texcoord float2). */
+/* Shared mesh vertex layout: position float3 + normal float3 + texcoord
+ * float2 + tangent float4 (xyz = tangent, w = bitangent sign).
+ *
+ * The tangent was missing and the shader read it anyway -- see JceMeshVertex.
+ * The skinned layout in jce_skinned_mesh.c has always declared it. */
 static void init_mesh_layout(bgfx_vertex_layout_t *layout)
 {
     bgfx_vertex_layout_begin(layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_NORMAL, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TEXCOORD0, 2,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    jce_vertex_layout_add_pbr_base(layout);
     bgfx_vertex_layout_end(layout);
+}
+
+/* Generate a per-vertex tangent frame from positions, UVs and normals.
+ *
+ * Lengyel's method: accumulate each triangle's UV-space tangent onto its three
+ * vertices, then Gram-Schmidt against the vertex normal and take the
+ * bitangent sign from the handedness.  This is what glTF says to do when a
+ * mesh needs a tangent frame and does not carry one, and what every importer
+ * that generates tangents implements.
+ *
+ * DEGENERATE UVs ARE THE COMMON CASE, not the exception: a procedural sphere's
+ * poles collapse to a point, and a mesh with no UVs at all has every triangle
+ * degenerate.  Those vertices keep a frame derived from the NORMAL instead --
+ * an arbitrary but finite and stable basis -- because the alternative is a
+ * zero tangent, which is the state this whole function exists to remove.
+ *
+ * Returns false only on allocation failure; the caller then ships the vertices
+ * as they came, which is no worse than before this existed. */
+static bool generate_tangents(JceMeshVertex *v, uint32_t nv,
+                              const uint32_t *idx, uint32_t ni)
+{
+    float *acc = (float *)JCE_CALLOC((size_t)nv * 6u, sizeof(float));
+    if (!acc) return false;                 /* [0..2]=tan, [3..5]=bitan */
+
+    if (idx && ni >= 3) {
+        for (uint32_t t = 0; t + 2 < ni; t += 3) {
+            const uint32_t i0 = idx[t], i1 = idx[t + 1], i2 = idx[t + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+            const float *p0 = v[i0].pos, *p1 = v[i1].pos, *p2 = v[i2].pos;
+            const float *w0 = v[i0].uv,  *w1 = v[i1].uv,  *w2 = v[i2].uv;
+
+            const float e1[3] = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] };
+            const float e2[3] = { p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2] };
+            const float du1 = w1[0]-w0[0], dv1 = w1[1]-w0[1];
+            const float du2 = w2[0]-w0[0], dv2 = w2[1]-w0[1];
+
+            const float det = du1 * dv2 - du2 * dv1;
+            if (fabsf(det) < 1e-12f) continue;   /* degenerate in UV space */
+            const float r = 1.0f / det;
+
+            const float tn[3] = { (dv2*e1[0] - dv1*e2[0]) * r,
+                                  (dv2*e1[1] - dv1*e2[1]) * r,
+                                  (dv2*e1[2] - dv1*e2[2]) * r };
+            const float bn[3] = { (du1*e2[0] - du2*e1[0]) * r,
+                                  (du1*e2[1] - du2*e1[1]) * r,
+                                  (du1*e2[2] - du2*e1[2]) * r };
+            const uint32_t tri[3] = { i0, i1, i2 };
+            for (int k = 0; k < 3; k++) {
+                float *a = acc + (size_t)tri[k] * 6u;
+                a[0] += tn[0]; a[1] += tn[1]; a[2] += tn[2];
+                a[3] += bn[0]; a[4] += bn[1]; a[5] += bn[2];
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < nv; i++) {
+        const float *n = v[i].normal;
+        float *a = acc + (size_t)i * 6u;
+        /* Gram-Schmidt: t' = t - n * dot(n, t) */
+        const float d = n[0]*a[0] + n[1]*a[1] + n[2]*a[2];
+        float t[3] = { a[0] - n[0]*d, a[1] - n[1]*d, a[2] - n[2]*d };
+        float len = sqrtf(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+        if (len < 1e-8f) {
+            /* No usable UV gradient here.  A stable basis from the normal --
+             * Duff et al., branchless -- rather than a zero tangent. */
+            const float sg = (n[2] >= 0.0f) ? 1.0f : -1.0f;
+            const float aa = -1.0f / (sg + n[2]);
+            const float bb = n[0] * n[1] * aa;
+            t[0] = 1.0f + sg * n[0] * n[0] * aa;
+            t[1] = sg * bb;
+            t[2] = -sg * n[0];
+            len  = sqrtf(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+            if (len < 1e-8f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; len = 1.0f; }
+        }
+        const float inv = 1.0f / len;
+        v[i].tangent[0] = t[0] * inv;
+        v[i].tangent[1] = t[1] * inv;
+        v[i].tangent[2] = t[2] * inv;
+        /* Handedness: sign of dot(cross(n, t), bitangent). */
+        const float c[3] = { n[1]*t[2] - n[2]*t[1],
+                             n[2]*t[0] - n[0]*t[2],
+                             n[0]*t[1] - n[1]*t[0] };
+        const float h = c[0]*a[3] + c[1]*a[4] + c[2]*a[5];
+        v[i].tangent[3] = (h < 0.0f) ? -1.0f : 1.0f;
+    }
+    JCE_FREE(acc);
+    return true;
 }
 
 JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
@@ -160,9 +247,34 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
         m->aabb_max[0] = mx[0]; m->aabb_max[1] = mx[1]; m->aabb_max[2] = mx[2];
     }
 
+    /* TANGENTS, if the caller did not supply them.
+     *
+     * "Did not supply" is tested across the whole stream rather than per
+     * vertex: a producer either fills the field or leaves the struct zeroed,
+     * and a partially-filled stream would be a bug in the producer that
+     * generating over the top of would hide. */
+    JceMeshVertex *owned = NULL;
+    {
+        bool any_tangent = false;
+        for (uint32_t i = 0; i < num_verts && !any_tangent; i++) {
+            const float *t = vertices[i].tangent;
+            if (t[0] != 0.0f || t[1] != 0.0f || t[2] != 0.0f) any_tangent = true;
+        }
+        if (!any_tangent) {
+            owned = (JceMeshVertex *)JCE_MALLOC((size_t)num_verts * sizeof(*owned));
+            if (owned) {
+                memcpy(owned, vertices, (size_t)num_verts * sizeof(*owned));
+                if (generate_tangents(owned, num_verts, indices, num_indices))
+                    vertices = owned;
+                else { JCE_FREE(owned); owned = NULL; }
+            }
+        }
+    }
+
     /* Create vertex buffer. */
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
                                            num_verts * (uint32_t)sizeof(JceMeshVertex));
+    JCE_FREE(owned);
     m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
     if (m->vbh.idx == UINT16_MAX) {
         /* bgfx static vertex-buffer pool exhausted (or upload failed): fail the

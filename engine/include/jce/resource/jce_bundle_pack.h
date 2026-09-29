@@ -160,6 +160,26 @@ typedef struct JceBundlePackOptions {
      * invalidates the incremental (.prev) cache. */
     bool           encrypt;
     const uint8_t *encryption_key;   /* 32 bytes, borrowed */
+
+    /* ── Always-included roots (Unity's Always Included Shaders) ───────
+     *
+     * Asset paths, resource-root relative, that must travel even though no
+     * scene, material or descriptor points at them.  Unity's setting exists
+     * because a shader named only from a SCRIPT is reachable from no
+     * material and gets stripped; the same is true here of a graph-compiled
+     * .bin blob, or any asset a script names by string.
+     *
+     * MERGED with `bundle_roots.json`, not a replacement for it: a project
+     * may reasonably have both, and a list that silently won over the other
+     * would be a shipped build missing exactly what somebody thought they
+     * had declared.  Each path is a dependency ROOT, so the packer's
+     * fixed-point closure follows whatever it references.
+     *
+     * A path that resolves to nothing is an ERROR, not a warning: the whole
+     * point of the list is that nothing else would have caught it.
+     * APPENDED (ABI); NULL / 0 is the historical behaviour exactly. */
+    const char *const *always_included;
+    int                always_included_count;
 } JceBundlePackOptions;
 
 /* Build all bundles described by `opts`.  Returns 0 on success or a

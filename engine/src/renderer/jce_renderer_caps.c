@@ -12,14 +12,320 @@
 #include <jce/renderer/jce_render_pipeline.h>  /* tier floor re-clamp */
 
 #include "jce_gpu_vendor.h"
+#include "jce_renderer_caps_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL_cpuinfo.h>   /* SDL_GetNumLogicalCPUCores / SDL_GetSystemRAM */
 #include <stdbool.h>
+#include <stdio.h>              /* snprintf */
 #include <stdlib.h>             /* getenv */
 #include <string.h>
 
 #define LOG_TAG "renderer_caps"
+
+#if !defined(JCE_GRAPHICS_API_TIER_VALUE)
+#  error "bgfx package did not publish JCE_GRAPHICS_API_TIER_VALUE"
+#endif
+#if !defined(JCE_BGFX_OPENGL_VERSION)
+#  error "bgfx package did not publish JCE_BGFX_OPENGL_VERSION"
+#endif
+#if !defined(JCE_BGFX_OPENGLES_VERSION)
+#  error "bgfx package did not publish JCE_BGFX_OPENGLES_VERSION"
+#endif
+
+#if JCE_GRAPHICS_API_TIER_VALUE == 0
+#  if JCE_BGFX_OPENGL_VERSION != 31 || JCE_BGFX_OPENGLES_VERSION != 30
+#    error "stable graphics tier must build bgfx for OpenGL 3.1 / GLES 3.0"
+#  endif
+#elif JCE_GRAPHICS_API_TIER_VALUE == 1
+#  if JCE_BGFX_OPENGL_VERSION != 43 || JCE_BGFX_OPENGLES_VERSION != 31
+#    error "modern graphics tier must build bgfx for OpenGL 4.3 / GLES 3.1"
+#  endif
+#elif JCE_GRAPHICS_API_TIER_VALUE == 2
+#  if JCE_BGFX_OPENGL_VERSION != 46 || JCE_BGFX_OPENGLES_VERSION != 32
+#    error "current graphics tier must build bgfx for OpenGL 4.6 / GLES 3.2"
+#  endif
+#else
+#  error "invalid JCE_GRAPHICS_API_TIER_VALUE"
+#endif
+
+static JceRendererApiInfo s_api_info = {
+    JCE_BACKEND_AUTO,
+    (JceGraphicsApiTier)JCE_GRAPHICS_API_TIER_VALUE,
+    {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, false, false
+};
+
+static JceGraphicsApiVersion s_api_version(uint16_t major, uint16_t minor,
+                                           uint16_t patch)
+{
+    JceGraphicsApiVersion version = {major, minor, patch};
+    return version;
+}
+
+static bool s_api_version_at_least(JceGraphicsApiVersion actual,
+                                   JceGraphicsApiVersion required)
+{
+    if (actual.major != required.major)
+        return actual.major > required.major;
+    if (actual.minor != required.minor)
+        return actual.minor > required.minor;
+    return actual.patch >= required.patch;
+}
+
+static bool s_versioned_backend(JceRendererBackend backend)
+{
+    return backend == JCE_BACKEND_OPENGL ||
+           backend == JCE_BACKEND_OPENGLES ||
+           backend == JCE_BACKEND_VULKAN;
+}
+
+static bool s_parse_version(const char *line, const char *marker,
+                            JceGraphicsApiVersion *out)
+{
+    const char *cursor;
+    uint32_t fields[3] = {0, 0, 0};
+    int count = 0;
+
+    if (!line || !marker || !out)
+        return false;
+    cursor = strstr(line, marker);
+    if (!cursor)
+        return false;
+    cursor += strlen(marker);
+
+    while (*cursor && (*cursor < '0' || *cursor > '9'))
+        cursor++;
+    while (*cursor && count < 3) {
+        uint32_t value = 0;
+        if (*cursor < '0' || *cursor > '9')
+            break;
+        while (*cursor >= '0' && *cursor <= '9') {
+            value = value * 10u + (uint32_t)(*cursor - '0');
+            if (value > UINT16_MAX)
+                return false;
+            cursor++;
+        }
+        fields[count++] = value;
+        if (*cursor != '.')
+            break;
+        cursor++;
+    }
+    if (count < 2)
+        return false;
+    *out = s_api_version((uint16_t)fields[0], (uint16_t)fields[1],
+                         (uint16_t)fields[2]);
+    return true;
+}
+
+const char *jce_graphics_api_tier_name(JceGraphicsApiTier tier)
+{
+    switch (tier) {
+    case JCE_GRAPHICS_API_TIER_STABLE:  return "stable";
+    case JCE_GRAPHICS_API_TIER_MODERN:  return "modern";
+    case JCE_GRAPHICS_API_TIER_CURRENT: return "current";
+    default:                            return "unknown";
+    }
+}
+
+JceGraphicsApiVersion jce_renderer_api_tier_minimum(
+    JceRendererBackend backend, JceGraphicsApiTier tier)
+{
+    /* stable is 3.1, not the 3.3 you might expect, and the reason is that the
+     * renderer no longer RUNS at the floor -- it ladders up to the newest core
+     * version the driver grants.  So the floor's only remaining job is "how
+     * old a machine do we still serve", and 3.1 is the true minimum of this
+     * configuration: bgfx writes `#version 140`, which is GLSL 1.40, which is
+     * GL 3.1.  Measured that 33 -> 31 costs nothing here: the three hard #if
+     * blocks are identical at both, all twelve >= 33 sites are extension-table
+     * seeds the runtime GL_EXTENSIONS scan recovers, and the one thing
+     * genuinely lost -- BGFX_CAPS_PRIMITIVE_ID, granted unconditionally at
+     * >= 32 -- is consumed nowhere in this tree. */
+    static const JceGraphicsApiVersion gl[JCE_GRAPHICS_API_TIER_COUNT] = {
+        {3, 1, 0}, {4, 3, 0}, {4, 6, 0}
+    };
+    static const JceGraphicsApiVersion gles[JCE_GRAPHICS_API_TIER_COUNT] = {
+        {3, 0, 0}, {3, 1, 0}, {3, 2, 0}
+    };
+    static const JceGraphicsApiVersion vk[JCE_GRAPHICS_API_TIER_COUNT] = {
+        {1, 0, 0}, {1, 2, 0}, {1, 4, 0}
+    };
+
+    if ((int)tier < 0 || tier >= JCE_GRAPHICS_API_TIER_COUNT)
+        return s_api_version(0, 0, 0);
+    if (backend == JCE_BACKEND_OPENGL)
+        return gl[tier];
+    if (backend == JCE_BACKEND_OPENGLES)
+        return gles[tier];
+    if (backend == JCE_BACKEND_VULKAN)
+        return vk[tier];
+    return s_api_version(0, 0, 0);
+}
+
+JceRendererApiInfo jce_renderer_get_api_info(void)
+{
+    return s_api_info;
+}
+
+const char *jce_renderer_running_backend_name(void)
+{
+    static char buf[48];
+    const char *base = bgfx_get_renderer_name(bgfx_get_renderer_type());
+
+    /* Only rewrite when we actually observed a version.  Inventing one from
+     * the floor is the bug this function exists to end. */
+    if (!s_api_info.runtime_version_verified ||
+        !s_versioned_backend(s_api_info.backend))
+        return base ? base : "unknown";
+
+    /* bgfx's GL/GLES names already carry the compile-time version ("OpenGL
+     * 3.1"); cut it off so the observed one is not appended to a stale one. */
+    {
+        size_t n = 0;
+        while (base[n] && base[n] != ' ') n++;
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        memcpy(buf, base, n);
+        buf[n] = '\0';
+    }
+    {
+        char ver[16];
+        size_t len = strlen(buf);
+        snprintf(ver, sizeof(ver), " %u.%u",
+                 (unsigned)s_api_info.runtime_version.major,
+                 (unsigned)s_api_info.runtime_version.minor);
+        if (len + strlen(ver) < sizeof(buf))
+            memcpy(buf + len, ver, strlen(ver) + 1);
+    }
+    return buf;
+}
+
+void jce_renderer_caps_api_reset(void)
+{
+    memset(&s_api_info, 0, sizeof(s_api_info));
+    s_api_info.backend = JCE_BACKEND_AUTO;
+    s_api_info.build_tier =
+        (JceGraphicsApiTier)JCE_GRAPHICS_API_TIER_VALUE;
+}
+
+void jce_renderer_caps_api_begin_attempt(JceRendererBackend backend)
+{
+    /* Carry a probe reading for THIS backend across the reset.
+     *
+     * The probe runs before the attempt and publishes what the driver said;
+     * a plain reset here threw that away, and accept_active_backend() then
+     * reported "could not read the driver's API version" in the same run whose
+     * log two lines earlier said the driver reports 4.6.0.  Measured, not
+     * reasoned about -- the contradiction was sitting in the log.
+     *
+     * Only for the same backend: a reading taken from the GL driver says
+     * nothing about the Vulkan attempt that follows it down the chain. */
+    const bool carry = s_api_info.runtime_version_verified &&
+                       s_api_info.backend == backend;
+    const JceGraphicsApiVersion api = s_api_info.runtime_version;
+    const JceGraphicsApiVersion sl = s_api_info.shader_language_version;
+    const bool carry_sl = carry && s_api_info.shader_language_version_verified;
+
+    jce_renderer_caps_api_reset();
+    s_api_info.backend = backend;
+    s_api_info.minimum_version = jce_renderer_api_tier_minimum(
+        backend, s_api_info.build_tier);
+    if (carry) {
+        s_api_info.runtime_version = api;
+        s_api_info.runtime_version_verified = true;
+    }
+    if (carry_sl) {
+        s_api_info.shader_language_version = sl;
+        s_api_info.shader_language_version_verified = true;
+    }
+}
+
+void jce_renderer_caps_api_capture_trace(const char *line)
+{
+    JceGraphicsApiVersion version;
+
+    if (s_parse_version(line, "JCE runtime API version:", &version)) {
+        s_api_info.runtime_version = version;
+        s_api_info.runtime_version_verified = true;
+    }
+    if (s_parse_version(line, "JCE runtime shader version:", &version)) {
+        s_api_info.shader_language_version = version;
+        s_api_info.shader_language_version_verified = true;
+    }
+}
+
+bool jce_renderer_caps_api_publish_probe(JceRendererBackend backend,
+                                         const char *api,
+                                         const char *shading)
+{
+    JceGraphicsApiVersion version;
+
+    s_api_info.backend = backend;
+    s_api_info.minimum_version =
+        jce_renderer_api_tier_minimum(backend, s_api_info.build_tier);
+
+    /* An empty marker makes s_parse_version skip leading non-digits, which is
+     * what these strings need: "4.6.0 NVIDIA 566.36" and "OpenGL ES 3.2
+     * v1.r32p1" both start at the first digit. */
+    if (api && s_parse_version(api, "", &version)) {
+        s_api_info.runtime_version = version;
+        s_api_info.runtime_version_verified = true;
+    }
+    if (shading && s_parse_version(shading, "", &version)) {
+        /* GLSL spells its minor with a trailing zero -- "4.60" is 4.6, "3.20"
+         * is ES 3.2.  Only collapse a two-digit minor; 1.50 is genuinely 1.5
+         * and 1.5 would already be correct. */
+        if (version.minor >= 10 && version.minor % 10 == 0)
+            version.minor /= 10;
+        s_api_info.shader_language_version = version;
+        s_api_info.shader_language_version_verified = true;
+    }
+
+    if (!s_api_info.runtime_version_verified) {
+        LOG_WARN(LOG_TAG,
+                 "%s probe: the driver did not report a parseable version "
+                 "(%s); trying the backend without a floor check",
+                 jce_renderer_backend_name(backend), api ? api : "(none)");
+        return true;
+    }
+    return s_api_version_at_least(s_api_info.runtime_version,
+                                  s_api_info.minimum_version);
+}
+
+bool jce_renderer_caps_api_accept_active_backend(void)
+{
+    s_api_info.backend = jce_renderer_get_active_backend();
+    s_api_info.minimum_version = jce_renderer_api_tier_minimum(
+        s_api_info.backend, s_api_info.build_tier);
+
+    if (!s_versioned_backend(s_api_info.backend))
+        return true;
+    if (!s_api_info.runtime_version_verified) {
+        /* Accept, but do NOT pretend this was checked.
+         *
+         * The previous version of this branch returned true for the STABLE
+         * tier on the grounds that "bgfx's context request already enforces
+         * it".  That was measured false on 2026-09-01: bgfx never compares the
+         * runtime version against its compiled-in floor, and the version was
+         * never observed at all in a package built without the trace patch --
+         * so on the DEFAULT tier this function could not reject anything.  A
+         * check that cannot fail is worse than no check, because the log said
+         * a floor was being enforced.
+         *
+         * With the SDL probe in jce_renderer.c the unobserved case is now
+         * rare; when it happens, refusing every backend would be worse than
+         * running one, so this still accepts -- and says why. */
+        LOG_WARN(LOG_TAG,
+                 "%s: could not read the driver's API version, so the %s tier "
+                 "floor of %u.%u was NOT verified; accepting the backend "
+                 "anyway",
+                 jce_renderer_backend_name(s_api_info.backend),
+                 jce_graphics_api_tier_name(s_api_info.build_tier),
+                 (unsigned)s_api_info.minimum_version.major,
+                 (unsigned)s_api_info.minimum_version.minor);
+        return true;
+    }
+    return s_api_version_at_least(s_api_info.runtime_version,
+                                  s_api_info.minimum_version);
+}
 
 /* ── Editor / test tier override ──────────────────────────────────── */
 
@@ -534,4 +840,56 @@ int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max)
         for (int i = 0; i < copy; ++i) out[i] = tmp[i];
     }
     return count;
+}
+
+/* ------------------------------------------------------------------ */
+/* Vertex-stage texture fetch (see the header for why this is 3-valued) */
+/* ------------------------------------------------------------------ */
+
+static bgfx_texture_format_t vfetch_bgfx_format(JceGpuVertexFetchFormat fmt)
+{
+    switch (fmt) {
+    case JCE_GPU_VFETCH_FMT_R32F:    return BGFX_TEXTURE_FORMAT_R32F;
+    case JCE_GPU_VFETCH_FMT_RGBA32F:
+    default:                         return BGFX_TEXTURE_FORMAT_RGBA32F;
+    }
+}
+
+JceGpuVertexFetch jce_gpu_vertex_fetch_state(JceGpuVertexFetchFormat fmt)
+{
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    int f;
+
+    if (!caps)
+        return JCE_GPU_VFETCH_UNANSWERED;
+
+    /* Does this backend populate the field AT ALL?  One format reporting
+     * VERTEX anywhere is enough to prove it answers. */
+    for (f = 0; f < BGFX_TEXTURE_FORMAT_COUNT; ++f) {
+        if (caps->formats[f] & BGFX_CAPS_FORMAT_TEXTURE_VERTEX)
+            break;
+    }
+    if (f == BGFX_TEXTURE_FORMAT_COUNT)
+        return JCE_GPU_VFETCH_UNANSWERED;
+
+    return (caps->formats[vfetch_bgfx_format(fmt)] &
+            BGFX_CAPS_FORMAT_TEXTURE_VERTEX)
+           ? JCE_GPU_VFETCH_YES : JCE_GPU_VFETCH_NO;
+}
+
+bool jce_gpu_vertex_fetch_usable(JceGpuVertexFetchFormat fmt)
+{
+    switch (jce_gpu_vertex_fetch_state(fmt)) {
+    case JCE_GPU_VFETCH_YES:
+        return true;
+    case JCE_GPU_VFETCH_NO:
+        return false;
+    case JCE_GPU_VFETCH_UNANSWERED:
+    default:
+#if JCE_PLATFORM_WEB
+        return false;
+#else
+        return true;
+#endif
+    }
 }

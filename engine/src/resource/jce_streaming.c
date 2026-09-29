@@ -92,7 +92,7 @@ struct JceStreamingSystem {
     bool               prev_valid;
 
     /* Cached JCE_DISABLE_PREFETCH env toggle (-1 = unread, mirrors the
-       JCE_DISABLE_WCACHE / JCE_STREAM_SYNC / JCE_DISABLE_OCCLUSION A/B
+       JCE_DISABLE_WCACHE / JCE_STREAM_SYNC / JCE_ENABLE_OCCLUSION A/B
        hatches).  When set, both the heading offset and nearest-first
        ordering are skipped → exact reactive-isotropic behaviour. */
     int                prefetch_disabled;
@@ -563,9 +563,7 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
 
     /* Cancel pending load. */
     if (c->pending_task) {
-        (void)jce_async_task_cancel(c->pending_task);
-        jce_async_task_wait(c->pending_task);
-        jce_async_task_release(c->pending_task);
+        (void)jce_async_task_discard(c->pending_task);
         c->pending_task = NULL;
     }
 
@@ -730,7 +728,7 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
      * offset → identical to reactive streaming.  Reversing → heading flips
      * → prefetches the new direction.  Wholly disabled by
      * JCE_DISABLE_PREFETCH=1 (A/B + safety hatch; mirrors JCE_DISABLE_WCACHE
-     * / JCE_STREAM_SYNC / JCE_DISABLE_OCCLUSION). */
+     * / JCE_STREAM_SYNC / JCE_ENABLE_OCCLUSION). */
     if (sys->prefetch_disabled < 0) {
         const char *dv = getenv("JCE_DISABLE_PREFETCH");
         sys->prefetch_disabled = (dv && dv[0] && dv[0] != '0') ? 1 : 0;

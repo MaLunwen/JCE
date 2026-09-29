@@ -74,6 +74,7 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
 
     /* ui */
     { "ui.command_palette",        "UI / Command Palette",        { ImGuiKey_P, JCE_HKM_CTRL }, {} },
+
     { "ui.find_in_hierarchy",      "UI / Find in Hierarchy",      { ImGuiKey_F, JCE_HKM_CTRL }, {} },
     { "ui.find_in_assets",         "UI / Find in Assets",         { ImGuiKey_F, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_ALT) }, {} },
     { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F11, JCE_HKM_NONE }, {} },
@@ -107,6 +108,10 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "workspace.uv_editing",      "Workspace / UV Editing",      { ImGuiKey_F7, JCE_HKM_CTRL }, {} },
 
     { "edit.snap_to_ground",       "Edit / Snap To Ground",       { ImGuiKey_End, JCE_HKM_NONE }, {} },
+    /* shaders.  Ctrl+F5 and not F5: F5 is Play / Toggle and has been for as
+     * long as there has been a Play button, so the menu's long-standing "F5"
+     * label was the thing that was wrong, not the binding it collided with. */
+    { "shaders.reload",            "Shaders / Reload",            { ImGuiKey_F5, JCE_HKM_CTRL }, {} },
 };
 /* clang-format on */
 

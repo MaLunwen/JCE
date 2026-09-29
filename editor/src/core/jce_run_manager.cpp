@@ -14,6 +14,8 @@
 
 #include "jce_build_manager.h"
 #include "jce_editor_config.h"
+#include "jce_editor_project.h"
+#include "jce_run_manager_internal.h"
 #include "jce_assetdb.h"
 #include "ui/jce_editor_panels.h"
 
@@ -26,6 +28,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <jce/os/core/jce_defs.h>
 
@@ -39,6 +42,8 @@ static constexpr const char *kExeSuffix = ".exe";
 static constexpr const char *kExeSuffix = "";
 #endif
 
+/* Production existence predicate: a file OR a directory counts, which is what
+ * the launcher accepts (a macOS .app is a directory). */
 static bool path_exists(const std::string &p)
 {
     if (p.empty()) return false;
@@ -46,99 +51,77 @@ static bool path_exists(const std::string &p)
            jce_fs_host_exists_dir(p.c_str());
 }
 
-/* Try `candidate` as-is and (on platforms with an exe suffix) with the
- * suffix appended.  Returns the matching path, or empty string. */
-static std::string try_with_suffix(const std::string &candidate)
+/* The same answer, in the shape jce_run_manager_resolve_path() injects. */
+static bool run_path_exists(const std::string &p, void *)
 {
-    if (path_exists(candidate)) return candidate;
-    if (kExeSuffix[0]) {
-        size_t slen = std::strlen(kExeSuffix);
-        if (candidate.size() < slen ||
-            candidate.compare(candidate.size() - slen, slen, kExeSuffix) != 0) {
-            std::string with = candidate + kExeSuffix;
-            if (path_exists(with)) return with;
-        }
-    }
-    return {};
+    return path_exists(p);
 }
 
-/* Resolve user-configured executable path.  Tries (in order):
- *   1. path as-is (then with platform exe suffix on Windows)
- *   2. for relative paths, prepend a few cwd ancestors ("..", "../..", …)
- *      so launching the editor from build/desktop/.../release still finds
- *      siblings declared with repo-relative paths
- *   3. known CMake preset output dirs for the host platform — keeps the
- *      out-of-the-box defaults working without the user touching anything
- * Returns the first match, or the original string for a useful diagnostic. */
+/*
+ * Resolve the user-configured executable path.
+ *
+ * This function only GATHERS: the saved config, the open project, the
+ * platform's well-known output dirs.  Every ordering and string decision lives
+ * in jce_run_manager_resolve.cpp, because this translation unit drags in
+ * build_manager, assetdb, the panels and the console and therefore cannot be
+ * compiled into a test.  The launch path had no test coverage at all before
+ * that split -- see jce_run_manager_internal.h.
+ */
 static std::string resolve_executable(const std::string &configured)
 {
-    if (configured.empty()) return configured;
-
-    std::string hit = try_with_suffix(configured);
-    if (!hit.empty()) return hit;
-
-    bool is_absolute = false;
-    if (!configured.empty() && (configured[0] == '/' || configured[0] == '\\'))
-        is_absolute = true;
-    if (configured.size() > 1 && configured[1] == ':')
-        is_absolute = true;
-
-    if (!is_absolute) {
-        const char *parents[] = {
-            ".", "..", "../..", "../../..", "../../../..",
-        };
-        for (const char *par : parents) {
-            std::string p = std::string(par) + "/" + configured;
-            hit = try_with_suffix(p);
-            if (!hit.empty()) return hit;
-        }
-    }
-
-    /* User-configured build output (Project Settings > Build > Output Dir +
-     * CMake Target): try <build_output_path>/<game_target_name>[.exe] before
-     * the built-in candidate list, so a project that builds to a custom output
-     * directory is found even when the explicit game-executable path is unset.
-     * Previously build_output_path was persisted by the panel but read by
-     * nothing, so a custom output dir never influenced the launcher. */
-    {
-        JceEditorConfig ecfg;
-        if (jce_editor_config_load(&ecfg) &&
-            ecfg.build_output_path[0] && ecfg.game_target_name[0]) {
-            std::string p = std::string(ecfg.build_output_path) + "/" +
-                            ecfg.game_target_name;
-            hit = try_with_suffix(p);
-            if (!hit.empty()) return hit;
-        }
-    }
-
-    /* Per-platform "well-known build-preset output" candidates so the
-     * default path (which targets one specific arch/variant) still finds
-     * the binary when the user actually built a different variant. */
-    static const char *kCandidates[] = {
+    /* Per-platform "well-known build-preset output" DIRECTORIES, so the
+     * default path (which targets one specific arch/variant) still finds the
+     * binary when the user actually built a different variant.
+     *
+     * The binary's NAME is deliberately not in this list: it belongs to the
+     * project, not to the editor.  Until 2026-08-27 every entry ended in one
+     * game's name, so an editor opened on any other project went looking for
+     * somebody else's executable and reported "not found" for the wrong
+     * reason.  The name now comes from Project Settings > Build > CMake Target
+     * and, failing that, jce_project.json's target_name. */
+    static const char *kOutputDirs[] = {
 #if JCE_PLATFORM_WINDOWS
-        "build/desktop/windows-x64/release/caged_kingdom",
-        "build/desktop/windows-x64/dist/caged_kingdom",
-        "build/desktop/windows-x64/debug/caged_kingdom",
-        "build/desktop/windows-arm64/release/caged_kingdom",
+        "build/desktop/windows-x64/release",
+        "build/desktop/windows-x64/dist",
+        "build/desktop/windows-x64/debug",
+        "build/desktop/windows-arm64/release",
 #elif JCE_PLATFORM_MACOS
-        "build/desktop/macos-arm64/CagedKingdom",
-        "build/desktop/macos-x64/CagedKingdom",
+        "build/desktop/macos-arm64",
+        "build/desktop/macos-x64",
 #elif JCE_PLATFORM_LINUX
-        "build/desktop/linux-x64/CagedKingdom",
-        "build/desktop/linux-arm64/CagedKingdom",
+        "build/desktop/linux-x64",
+        "build/desktop/linux-arm64",
 #endif
         nullptr,
     };
-    const char *parents[] = { ".", "..", "../..", "../../..", "../../../..",
-                              nullptr };
-    for (int ci = 0; kCandidates[ci]; ++ci) {
-        for (int pi = 0; parents[pi]; ++pi) {
-            std::string p = std::string(parents[pi]) + "/" + kCandidates[ci];
-            hit = try_with_suffix(p);
-            if (!hit.empty()) return hit;
+
+    JceRunResolveInputs in;
+    in.configured = configured;
+    in.exe_suffix = kExeSuffix;
+    in.parents    = { ".", "..", "../..", "../../..", "../../../.." };
+    for (int i = 0; kOutputDirs[i]; ++i)
+        in.output_dirs.push_back(kOutputDirs[i]);
+
+    /* Project Settings > Build > Output Dir + CMake Target.  build_output_path
+     * used to be persisted by the panel and read by nothing, so a custom output
+     * directory never influenced the launcher. */
+    {
+        JceEditorConfig ecfg;
+        if (jce_editor_config_load(&ecfg)) {
+            if (ecfg.build_output_path[0])
+                in.build_output_path = ecfg.build_output_path;
+            if (ecfg.game_target_name[0])
+                in.target_name = ecfg.game_target_name;
         }
     }
-    return configured;
+    /* Failing an explicit setting, the opened project names its own target. */
+    if (in.target_name.empty()) {
+        const JceProject *proj = jce_editor_project_get();
+        if (proj && proj->target_name && proj->target_name[0])
+            in.target_name = proj->target_name;
+    }
+
+    return jce_run_manager_resolve_path(in, run_path_exists, nullptr);
 }
 
 /* 2-second graceful-stop window before forcing termination. */

@@ -6,7 +6,7 @@
 
 #include "jce_script_internal.h"
 
-#define JCE_SCRIPT_GENERATED_BINDING_COUNT 71
+#define JCE_SCRIPT_GENERATED_BINDING_COUNT 101
 
 /* Registration order matches script_exposure.json's expose[] order. */
 extern const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[JCE_SCRIPT_GENERATED_BINDING_COUNT];

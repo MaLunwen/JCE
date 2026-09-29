@@ -1,0 +1,17 @@
+# jce_*_self_test functions that cannot be wired into the unit suite, one per
+# line, with the REASON after '#' on the SAME line.  A bare name with no reason
+# is NOT an exemption -- check_self_tests_run.py ignores it, so "reason to
+# follow" fails closed.
+#
+# Prefer the other fix.  On 2026-08-31 this repo had seven self-tests and zero
+# callers; five could be wired, and THREE of those five failed the first time
+# they were ever run -- two of them on real engine bugs (the coroutine handle
+# packing to the invalid sentinel, and despawned network objects never being
+# reaped without a host).  An exemption is a statement that verification which
+# already exists will keep not running.
+#
+# ---------------------------------------------------------------------------
+
+jce_session_self_test        # binds a real socket (port 27015) and is gated behind -DJCE_NET_SELF_TEST as well as !NDEBUG, which no build file defines. The extra gate is deliberate -- see jce_session.c:751, "so loopback flakes" -- and a unit test that opens a listening port is not a unit test.
+
+jce_lan_discovery_self_test  # #ifdef JCE_NET_SELF_TEST only, so it does not compile in any configuration this repo builds. It broadcasts on the LAN; running it from ctest would put UDP traffic on the developer's network.

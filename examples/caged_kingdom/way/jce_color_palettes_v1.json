@@ -1,0 +1,1353 @@
+{
+  "$schema": "jce-color-palettes",
+  "version": "1.1",
+  "generated": "2026-08-15",
+  "notes_zh": "hex/srgb8 为 sRGB 编码值，供 UI 与编辑器使用；linear 为 sRGB EOTF 逆变换后的线性 RGB 浮点，供光照管线(bgfx PBR)直接使用。role_en 可映射引擎参数：background→清屏/雾色，shadow/ambient→环境光，albedo_*→材质基色，highlight/key→主光，accent/emissive→自发光与交互高亮。",
+  "palette_count": 16,
+  "palettes": [
+    {
+      "id": "forest_dawn",
+      "name_zh": "温带森林·晨光",
+      "name_en": "Temperate forest at dawn",
+      "mood": "natural",
+      "shader_hint_zh": "暖主光+冷天光环境；全局饱和度≤0.4；雾色用高光米色",
+      "colors": [
+        {
+          "hex": "#3E5C3A",
+          "srgb8": [
+            62,
+            92,
+            58
+          ],
+          "linear": [
+            0.04817,
+            0.10702,
+            0.04231
+          ],
+          "role_zh": "阴影",
+          "role_en": "shadow"
+        },
+        {
+          "hex": "#6B8E4E",
+          "srgb8": [
+            107,
+            142,
+            78
+          ],
+          "linear": [
+            0.14703,
+            0.2705,
+            0.07619
+          ],
+          "role_zh": "主色",
+          "role_en": "albedo_primary"
+        },
+        {
+          "hex": "#8B6F47",
+          "srgb8": [
+            139,
+            111,
+            71
+          ],
+          "linear": [
+            0.25818,
+            0.15896,
+            0.06301
+          ],
+          "role_zh": "中间调",
+          "role_en": "albedo_mid"
+        },
+        {
+          "hex": "#E8E2D0",
+          "srgb8": [
+            232,
+            226,
+            208
+          ],
+          "linear": [
+            0.80695,
+            0.76052,
+            0.63076
+          ],
+          "role_zh": "雾·高光",
+          "role_en": "fog_highlight"
+        },
+        {
+          "hex": "#A8C5D6",
+          "srgb8": [
+            168,
+            197,
+            214
+          ],
+          "linear": [
+            0.39157,
+            0.55834,
+            0.67244
+          ],
+          "role_zh": "天光",
+          "role_en": "sky_ambient"
+        }
+      ]
+    },
+    {
+      "id": "desert_dusk",
+      "name_zh": "黄昏荒漠",
+      "name_en": "Desert dusk",
+      "mood": "natural",
+      "shader_hint_zh": "暮紫做环境光与远景雾，砂岩橙做主反照率，鼠尾草绿仅点缀植被",
+      "colors": [
+        {
+          "hex": "#43395C",
+          "srgb8": [
+            67,
+            57,
+            92
+          ],
+          "linear": [
+            0.05613,
+            0.04092,
+            0.10702
+          ],
+          "role_zh": "阴影",
+          "role_en": "shadow"
+        },
+        {
+          "hex": "#6E5A7E",
+          "srgb8": [
+            110,
+            90,
+            126
+          ],
+          "linear": [
+            0.15593,
+            0.10224,
+            0.20864
+          ],
+          "role_zh": "暮色",
+          "role_en": "ambient_dusk"
+        },
+        {
+          "hex": "#A65E3F",
+          "srgb8": [
+            166,
+            94,
+            63
+          ],
+          "linear": [
+            0.38133,
+            0.11193,
+            0.04971
+          ],
+          "role_zh": "主色",
+          "role_en": "albedo_primary"
+        },
+        {
+          "hex": "#D9A46B",
+          "srgb8": [
+            217,
+            164,
+            107
+          ],
+          "linear": [
+            0.69387,
+            0.37124,
+            0.14703
+          ],
+          "role_zh": "高光",
+          "role_en": "highlight"
+        },
+        {
+          "hex": "#9CAF88",
+          "srgb8": [
+            156,
+            175,
+            136
+          ],
+          "linear": [
+            0.33245,
+            0.42869,
+            0.2462
+          ],
+          "role_zh": "点缀",
+          "role_en": "accent_flora"
+        }
+      ]
+    },
+    {
+      "id": "minimal_light",
+      "name_zh": "高调极简·暖白",
+      "name_en": "High-key minimal warm white",
+      "mood": "minimalist",
+      "shader_hint_zh": "LUT收窄全局色度；强调色全局唯一且只标记可交互对象",
+      "colors": [
+        {
+          "hex": "#FAF9F5",
+          "srgb8": [
+            250,
+            249,
+            245
+          ],
+          "linear": [
+            0.95597,
+            0.94731,
+            0.9131
+          ],
+          "role_zh": "底色",
+          "role_en": "background"
+        },
+        {
+          "hex": "#E5E2DA",
+          "srgb8": [
+            229,
+            226,
+            218
+          ],
+          "linear": [
+            0.78354,
+            0.76052,
+            0.7011
+          ],
+          "role_zh": "面板",
+          "role_en": "surface"
+        },
+        {
+          "hex": "#A5A29A",
+          "srgb8": [
+            165,
+            162,
+            154
+          ],
+          "linear": [
+            0.37626,
+            0.36131,
+            0.32314
+          ],
+          "role_zh": "次级",
+          "role_en": "secondary"
+        },
+        {
+          "hex": "#2B2B29",
+          "srgb8": [
+            43,
+            43,
+            41
+          ],
+          "linear": [
+            0.02416,
+            0.02416,
+            0.02217
+          ],
+          "role_zh": "文本",
+          "role_en": "text_primary"
+        },
+        {
+          "hex": "#D97757",
+          "srgb8": [
+            217,
+            119,
+            87
+          ],
+          "linear": [
+            0.69387,
+            0.18447,
+            0.09531
+          ],
+          "role_zh": "点缀",
+          "role_en": "accent"
+        }
+      ]
+    },
+    {
+      "id": "minimal_dark",
+      "name_zh": "暗色极简",
+      "name_en": "Dark minimal",
+      "mood": "minimalist",
+      "shader_hint_zh": "同上；暗底注意保持文本对比度≥7:1",
+      "colors": [
+        {
+          "hex": "#121214",
+          "srgb8": [
+            18,
+            18,
+            20
+          ],
+          "linear": [
+            0.00605,
+            0.00605,
+            0.007
+          ],
+          "role_zh": "底色",
+          "role_en": "background"
+        },
+        {
+          "hex": "#1F2023",
+          "srgb8": [
+            31,
+            32,
+            35
+          ],
+          "linear": [
+            0.0137,
+            0.01444,
+            0.01681
+          ],
+          "role_zh": "面板",
+          "role_en": "surface"
+        },
+        {
+          "hex": "#3C3E44",
+          "srgb8": [
+            60,
+            62,
+            68
+          ],
+          "linear": [
+            0.04519,
+            0.04817,
+            0.05781
+          ],
+          "role_zh": "次级",
+          "role_en": "secondary"
+        },
+        {
+          "hex": "#C9CBD1",
+          "srgb8": [
+            201,
+            203,
+            209
+          ],
+          "linear": [
+            0.58408,
+            0.5972,
+            0.6376
+          ],
+          "role_zh": "文本",
+          "role_en": "text_primary"
+        },
+        {
+          "hex": "#4FC3F7",
+          "srgb8": [
+            79,
+            195,
+            247
+          ],
+          "linear": [
+            0.07819,
+            0.54572,
+            0.93011
+          ],
+          "role_zh": "点缀",
+          "role_en": "accent"
+        }
+      ]
+    },
+    {
+      "id": "morgue_green",
+      "name_zh": "病院冷绿",
+      "name_en": "Morgue green",
+      "mood": "horror",
+      "shader_hint_zh": "压暗保留胶片颗粒；雾偏绿；split-tone阴影青绿/高光病黄；呼吸式暗角",
+      "colors": [
+        {
+          "hex": "#0B0D0C",
+          "srgb8": [
+            11,
+            13,
+            12
+          ],
+          "linear": [
+            0.00335,
+            0.00402,
+            0.00368
+          ],
+          "role_zh": "虚空黑",
+          "role_en": "void"
+        },
+        {
+          "hex": "#232A24",
+          "srgb8": [
+            35,
+            42,
+            36
+          ],
+          "linear": [
+            0.01681,
+            0.02315,
+            0.01764
+          ],
+          "role_zh": "阴影",
+          "role_en": "shadow"
+        },
+        {
+          "hex": "#5C6B54",
+          "srgb8": [
+            92,
+            107,
+            84
+          ],
+          "linear": [
+            0.10702,
+            0.14703,
+            0.08866
+          ],
+          "role_zh": "病绿",
+          "role_en": "albedo_sickly"
+        },
+        {
+          "hex": "#C9CFC0",
+          "srgb8": [
+            201,
+            207,
+            192
+          ],
+          "linear": [
+            0.58408,
+            0.62396,
+            0.52712
+          ],
+          "role_zh": "惨白",
+          "role_en": "pale_highlight"
+        },
+        {
+          "hex": "#7E1A1A",
+          "srgb8": [
+            126,
+            26,
+            26
+          ],
+          "linear": [
+            0.20864,
+            0.01033,
+            0.01033
+          ],
+          "role_zh": "血渍",
+          "role_en": "accent_blood"
+        }
+      ]
+    },
+    {
+      "id": "rust_fog",
+      "name_zh": "雾都锈蚀",
+      "name_en": "Rust and fog",
+      "mood": "horror",
+      "shader_hint_zh": "浓雾拉低能见度；锈色做主反照率；警示红仅用于关键威胁",
+      "colors": [
+        {
+          "hex": "#17110D",
+          "srgb8": [
+            23,
+            17,
+            13
+          ],
+          "linear": [
+            0.00857,
+            0.00561,
+            0.00402
+          ],
+          "role_zh": "底色",
+          "role_en": "void"
+        },
+        {
+          "hex": "#4A3527",
+          "srgb8": [
+            74,
+            53,
+            39
+          ],
+          "linear": [
+            0.06848,
+            0.0356,
+            0.02029
+          ],
+          "role_zh": "阴影",
+          "role_en": "shadow"
+        },
+        {
+          "hex": "#8C6B4A",
+          "srgb8": [
+            140,
+            107,
+            74
+          ],
+          "linear": [
+            0.26225,
+            0.14703,
+            0.06848
+          ],
+          "role_zh": "锈",
+          "role_en": "albedo_rust"
+        },
+        {
+          "hex": "#B5B0A6",
+          "srgb8": [
+            181,
+            176,
+            166
+          ],
+          "linear": [
+            0.46208,
+            0.43415,
+            0.38133
+          ],
+          "role_zh": "雾",
+          "role_en": "fog"
+        },
+        {
+          "hex": "#B33A1F",
+          "srgb8": [
+            179,
+            58,
+            31
+          ],
+          "linear": [
+            0.45079,
+            0.04231,
+            0.0137
+          ],
+          "role_zh": "警示",
+          "role_en": "accent_alert"
+        }
+      ]
+    },
+    {
+      "id": "neon_glitch",
+      "name_zh": "霓虹故障",
+      "name_en": "Neon glitch",
+      "mood": "dissonant",
+      "shader_hint_zh": "色相偏移振荡；等亮度双色描边产生边缘游移；RGB通道错位色差",
+      "colors": [
+        {
+          "hex": "#14002E",
+          "srgb8": [
+            20,
+            0,
+            46
+          ],
+          "linear": [
+            0.007,
+            0.0,
+            0.02732
+          ],
+          "role_zh": "底色",
+          "role_en": "background"
+        },
+        {
+          "hex": "#FF2E88",
+          "srgb8": [
+            255,
+            46,
+            136
+          ],
+          "linear": [
+            1.0,
+            0.02732,
+            0.2462
+          ],
+          "role_zh": "品红",
+          "role_en": "clash_magenta"
+        },
+        {
+          "hex": "#00E5D0",
+          "srgb8": [
+            0,
+            229,
+            208
+          ],
+          "linear": [
+            0.0,
+            0.78354,
+            0.63076
+          ],
+          "role_zh": "青",
+          "role_en": "clash_cyan"
+        },
+        {
+          "hex": "#C8F500",
+          "srgb8": [
+            200,
+            245,
+            0
+          ],
+          "linear": [
+            0.57758,
+            0.9131,
+            0.0
+          ],
+          "role_zh": "酸绿",
+          "role_en": "clash_acid"
+        },
+        {
+          "hex": "#FF6A00",
+          "srgb8": [
+            255,
+            106,
+            0
+          ],
+          "linear": [
+            1.0,
+            0.14413,
+            0.0
+          ],
+          "role_zh": "橙",
+          "role_en": "clash_orange"
+        }
+      ]
+    },
+    {
+      "id": "murky_discord",
+      "name_zh": "浑浊失谐",
+      "name_en": "Murky discord",
+      "mood": "dissonant",
+      "shader_hint_zh": "低协调间隔+浑浊中饱和；适合梦境扭曲/精神污染的持续低度不安",
+      "colors": [
+        {
+          "hex": "#6B6B2F",
+          "srgb8": [
+            107,
+            107,
+            47
+          ],
+          "linear": [
+            0.14703,
+            0.14703,
+            0.02843
+          ],
+          "role_zh": "橄榄",
+          "role_en": "murk_olive"
+        },
+        {
+          "hex": "#7C3FB5",
+          "srgb8": [
+            124,
+            63,
+            181
+          ],
+          "linear": [
+            0.20156,
+            0.04971,
+            0.46208
+          ],
+          "role_zh": "紫",
+          "role_en": "murk_purple"
+        },
+        {
+          "hex": "#C2A83E",
+          "srgb8": [
+            194,
+            168,
+            62
+          ],
+          "linear": [
+            0.53948,
+            0.39157,
+            0.04817
+          ],
+          "role_zh": "芥黄",
+          "role_en": "murk_mustard"
+        },
+        {
+          "hex": "#3F7C7C",
+          "srgb8": [
+            63,
+            124,
+            124
+          ],
+          "linear": [
+            0.04971,
+            0.20156,
+            0.20156
+          ],
+          "role_zh": "浊青",
+          "role_en": "murk_teal"
+        },
+        {
+          "hex": "#C99A9A",
+          "srgb8": [
+            201,
+            154,
+            154
+          ],
+          "linear": [
+            0.58408,
+            0.32314,
+            0.32314
+          ],
+          "role_zh": "灰粉",
+          "role_en": "murk_pink"
+        }
+      ]
+    },
+    {
+      "id": "vaporwave_dusk",
+      "name_zh": "蒸汽波暮色",
+      "name_en": "Vaporwave dusk",
+      "mood": "retro_nostalgia",
+      "shader_hint_zh": "CRT扫描线+轻微品红/青通道偏移；bloom偏粉；明度压平制造梦核感",
+      "colors": [
+        {
+          "hex": "#2B1B54",
+          "srgb8": [
+            43,
+            27,
+            84
+          ],
+          "linear": [
+            0.02416,
+            0.01096,
+            0.08866
+          ],
+          "role_zh": "底色",
+          "role_en": "background"
+        },
+        {
+          "hex": "#FF71CE",
+          "srgb8": [
+            255,
+            113,
+            206
+          ],
+          "linear": [
+            1.0,
+            0.16513,
+            0.61721
+          ],
+          "role_zh": "品粉",
+          "role_en": "neon_pink"
+        },
+        {
+          "hex": "#01CDFE",
+          "srgb8": [
+            1,
+            205,
+            254
+          ],
+          "linear": [
+            0.0003,
+            0.6105,
+            0.9911
+          ],
+          "role_zh": "电青",
+          "role_en": "neon_cyan"
+        },
+        {
+          "hex": "#B967FF",
+          "srgb8": [
+            185,
+            103,
+            255
+          ],
+          "linear": [
+            0.48515,
+            0.13563,
+            1.0
+          ],
+          "role_zh": "霓紫",
+          "role_en": "neon_purple"
+        },
+        {
+          "hex": "#FFFB96",
+          "srgb8": [
+            255,
+            251,
+            150
+          ],
+          "linear": [
+            1.0,
+            0.96469,
+            0.30499
+          ],
+          "role_zh": "荧黄",
+          "role_en": "neon_yellow"
+        }
+      ]
+    },
+    {
+      "id": "handheld_lcd",
+      "name_zh": "复古掌机LCD",
+      "name_en": "Retro handheld LCD",
+      "mood": "retro_nostalgia",
+      "shader_hint_zh": "后期做4阶明度量化+有序抖动即可整体套用；UI同色系",
+      "colors": [
+        {
+          "hex": "#0F380F",
+          "srgb8": [
+            15,
+            56,
+            15
+          ],
+          "linear": [
+            0.00478,
+            0.03955,
+            0.00478
+          ],
+          "role_zh": "四阶最暗",
+          "role_en": "shade_0"
+        },
+        {
+          "hex": "#306230",
+          "srgb8": [
+            48,
+            98,
+            48
+          ],
+          "linear": [
+            0.02956,
+            0.12214,
+            0.02956
+          ],
+          "role_zh": "暗调",
+          "role_en": "shade_1"
+        },
+        {
+          "hex": "#8BAC0F",
+          "srgb8": [
+            139,
+            172,
+            15
+          ],
+          "linear": [
+            0.25818,
+            0.41254,
+            0.00478
+          ],
+          "role_zh": "亮调",
+          "role_en": "shade_2"
+        },
+        {
+          "hex": "#9BBC0F",
+          "srgb8": [
+            155,
+            188,
+            15
+          ],
+          "linear": [
+            0.32778,
+            0.50289,
+            0.00478
+          ],
+          "role_zh": "最亮",
+          "role_en": "shade_3"
+        },
+        {
+          "hex": "#C4CFA1",
+          "srgb8": [
+            196,
+            207,
+            161
+          ],
+          "linear": [
+            0.55201,
+            0.62396,
+            0.3564
+          ],
+          "role_zh": "机身",
+          "role_en": "bezel"
+        }
+      ]
+    },
+    {
+      "id": "abyssal_glow",
+      "name_zh": "深海微光",
+      "name_en": "Abyssal glow",
+      "mood": "natural_mystery",
+      "shader_hint_zh": "深度雾按红→绿→蓝顺序衰减；荧光色做emissive并驱动局部点光",
+      "colors": [
+        {
+          "hex": "#050A14",
+          "srgb8": [
+            5,
+            10,
+            20
+          ],
+          "linear": [
+            0.00152,
+            0.00304,
+            0.007
+          ],
+          "role_zh": "深渊",
+          "role_en": "abyss"
+        },
+        {
+          "hex": "#0C2238",
+          "srgb8": [
+            12,
+            34,
+            56
+          ],
+          "linear": [
+            0.00368,
+            0.016,
+            0.03955
+          ],
+          "role_zh": "水体",
+          "role_en": "water_deep"
+        },
+        {
+          "hex": "#1B4965",
+          "srgb8": [
+            27,
+            73,
+            101
+          ],
+          "linear": [
+            0.01096,
+            0.06663,
+            0.13014
+          ],
+          "role_zh": "中层",
+          "role_en": "water_mid"
+        },
+        {
+          "hex": "#62B6CB",
+          "srgb8": [
+            98,
+            182,
+            203
+          ],
+          "linear": [
+            0.12214,
+            0.46778,
+            0.5972
+          ],
+          "role_zh": "透光带",
+          "role_en": "water_photic"
+        },
+        {
+          "hex": "#7CFCD0",
+          "srgb8": [
+            124,
+            252,
+            208
+          ],
+          "linear": [
+            0.20156,
+            0.97345,
+            0.63076
+          ],
+          "role_zh": "生物荧光",
+          "role_en": "emissive_bio"
+        }
+      ]
+    },
+    {
+      "id": "volcanic_forge",
+      "name_zh": "火山熔炉",
+      "name_en": "Volcanic forge",
+      "mood": "threat_energy",
+      "shader_hint_zh": "熔岩emissive沿黑体曲线插值(暗红→橙→白热)；热扭曲+余烬粒子",
+      "colors": [
+        {
+          "hex": "#0D0705",
+          "srgb8": [
+            13,
+            7,
+            5
+          ],
+          "linear": [
+            0.00402,
+            0.00212,
+            0.00152
+          ],
+          "role_zh": "焦黑",
+          "role_en": "char"
+        },
+        {
+          "hex": "#2E1408",
+          "srgb8": [
+            46,
+            20,
+            8
+          ],
+          "linear": [
+            0.02732,
+            0.007,
+            0.00243
+          ],
+          "role_zh": "暗岩",
+          "role_en": "rock_dark"
+        },
+        {
+          "hex": "#7A2E0E",
+          "srgb8": [
+            122,
+            46,
+            14
+          ],
+          "linear": [
+            0.19462,
+            0.02732,
+            0.00439
+          ],
+          "role_zh": "热岩",
+          "role_en": "rock_hot"
+        },
+        {
+          "hex": "#E85D04",
+          "srgb8": [
+            232,
+            93,
+            4
+          ],
+          "linear": [
+            0.80695,
+            0.10946,
+            0.00121
+          ],
+          "role_zh": "熔岩",
+          "role_en": "lava"
+        },
+        {
+          "hex": "#FFBA08",
+          "srgb8": [
+            255,
+            186,
+            8
+          ],
+          "linear": [
+            1.0,
+            0.49102,
+            0.00243
+          ],
+          "role_zh": "白热",
+          "role_en": "incandescent"
+        }
+      ]
+    },
+    {
+      "id": "indigo_washi",
+      "name_zh": "和风·蓝染",
+      "name_en": "Japanese indigo and washi",
+      "mood": "cultural_serene",
+      "shader_hint_zh": "大面积生成色留白；低饱和；朱红仅小面积点缀(印章/鸟居语法)",
+      "colors": [
+        {
+          "hex": "#2B4570",
+          "srgb8": [
+            43,
+            69,
+            112
+          ],
+          "linear": [
+            0.02416,
+            0.05951,
+            0.16203
+          ],
+          "role_zh": "藍主色",
+          "role_en": "indigo_primary"
+        },
+        {
+          "hex": "#EDE6D6",
+          "srgb8": [
+            237,
+            230,
+            214
+          ],
+          "linear": [
+            0.84687,
+            0.7913,
+            0.67244
+          ],
+          "role_zh": "生成底",
+          "role_en": "kinari_ground"
+        },
+        {
+          "hex": "#7A8B5C",
+          "srgb8": [
+            122,
+            139,
+            92
+          ],
+          "linear": [
+            0.19462,
+            0.25818,
+            0.10702
+          ],
+          "role_zh": "抹茶",
+          "role_en": "matcha"
+        },
+        {
+          "hex": "#C9A96A",
+          "srgb8": [
+            201,
+            169,
+            106
+          ],
+          "linear": [
+            0.58408,
+            0.39676,
+            0.14413
+          ],
+          "role_zh": "金茶",
+          "role_en": "kincha"
+        },
+        {
+          "hex": "#C73E1D",
+          "srgb8": [
+            199,
+            62,
+            29
+          ],
+          "linear": [
+            0.57112,
+            0.04817,
+            0.01229
+          ],
+          "role_zh": "朱点缀",
+          "role_en": "vermillion_accent"
+        }
+      ]
+    },
+    {
+      "id": "aurora_tundra",
+      "name_zh": "极光冰原",
+      "name_en": "Aurora tundra",
+      "mood": "awe_sublime",
+      "shader_hint_zh": "极光用窄带高饱和emissive绿/紫做体积光帘幕；雪原反弹冷环境光",
+      "colors": [
+        {
+          "hex": "#0A1128",
+          "srgb8": [
+            10,
+            17,
+            40
+          ],
+          "linear": [
+            0.00304,
+            0.00561,
+            0.02122
+          ],
+          "role_zh": "极夜",
+          "role_en": "polar_night"
+        },
+        {
+          "hex": "#1C3F60",
+          "srgb8": [
+            28,
+            63,
+            96
+          ],
+          "linear": [
+            0.01161,
+            0.04971,
+            0.11697
+          ],
+          "role_zh": "冰影",
+          "role_en": "ice_shadow"
+        },
+        {
+          "hex": "#E8F1F2",
+          "srgb8": [
+            232,
+            241,
+            242
+          ],
+          "linear": [
+            0.80695,
+            0.87962,
+            0.88792
+          ],
+          "role_zh": "雪原",
+          "role_en": "snow"
+        },
+        {
+          "hex": "#3DDC97",
+          "srgb8": [
+            61,
+            220,
+            151
+          ],
+          "linear": [
+            0.04667,
+            0.71569,
+            0.30947
+          ],
+          "role_zh": "极光绿",
+          "role_en": "aurora_green"
+        },
+        {
+          "hex": "#9B5DE5",
+          "srgb8": [
+            155,
+            93,
+            229
+          ],
+          "linear": [
+            0.32778,
+            0.10946,
+            0.78354
+          ],
+          "role_zh": "极光紫",
+          "role_en": "aurora_violet"
+        }
+      ]
+    },
+    {
+      "id": "ink_wash",
+      "name_zh": "水墨",
+      "name_en": "Ink wash",
+      "mood": "abstract_artistic",
+      "shader_hint_zh": "全局去色相+纸纹叠加；印泥红为唯一色相信息，只给核心目标",
+      "colors": [
+        {
+          "hex": "#1A1A18",
+          "srgb8": [
+            26,
+            26,
+            24
+          ],
+          "linear": [
+            0.01033,
+            0.01033,
+            0.00913
+          ],
+          "role_zh": "焦墨",
+          "role_en": "ink_burnt"
+        },
+        {
+          "hex": "#4A4A46",
+          "srgb8": [
+            74,
+            74,
+            70
+          ],
+          "linear": [
+            0.06848,
+            0.06848,
+            0.06125
+          ],
+          "role_zh": "浓墨",
+          "role_en": "ink_dense"
+        },
+        {
+          "hex": "#8C8C86",
+          "srgb8": [
+            140,
+            140,
+            134
+          ],
+          "linear": [
+            0.26225,
+            0.26225,
+            0.2384
+          ],
+          "role_zh": "淡墨",
+          "role_en": "ink_light"
+        },
+        {
+          "hex": "#F2EFE6",
+          "srgb8": [
+            242,
+            239,
+            230
+          ],
+          "linear": [
+            0.88792,
+            0.86316,
+            0.7913
+          ],
+          "role_zh": "宣纸",
+          "role_en": "paper"
+        },
+        {
+          "hex": "#B5312C",
+          "srgb8": [
+            181,
+            49,
+            44
+          ],
+          "linear": [
+            0.46208,
+            0.03071,
+            0.02519
+          ],
+          "role_zh": "印泥红",
+          "role_en": "seal_red"
+        }
+      ]
+    },
+    {
+      "id": "golden_hour",
+      "name_zh": "黄金时刻",
+      "name_en": "Golden hour",
+      "mood": "warm_cinematic",
+      "shader_hint_zh": "teal&orange分级：阴影推青、肤色/主体锁橙区；低角度长阴影",
+      "colors": [
+        {
+          "hex": "#12303F",
+          "srgb8": [
+            18,
+            48,
+            63
+          ],
+          "linear": [
+            0.00605,
+            0.02956,
+            0.04971
+          ],
+          "role_zh": "阴影青",
+          "role_en": "shadow_teal"
+        },
+        {
+          "hex": "#35535C",
+          "srgb8": [
+            53,
+            83,
+            92
+          ],
+          "linear": [
+            0.0356,
+            0.0865,
+            0.10702
+          ],
+          "role_zh": "中调",
+          "role_en": "midtone"
+        },
+        {
+          "hex": "#C97B4A",
+          "srgb8": [
+            201,
+            123,
+            74
+          ],
+          "linear": [
+            0.58408,
+            0.19807,
+            0.06848
+          ],
+          "role_zh": "主橙",
+          "role_en": "key_orange"
+        },
+        {
+          "hex": "#EFB57B",
+          "srgb8": [
+            239,
+            181,
+            123
+          ],
+          "linear": [
+            0.86316,
+            0.46208,
+            0.19807
+          ],
+          "role_zh": "高光",
+          "role_en": "highlight"
+        },
+        {
+          "hex": "#F7E3C1",
+          "srgb8": [
+            247,
+            227,
+            193
+          ],
+          "linear": [
+            0.93011,
+            0.76815,
+            0.53328
+          ],
+          "role_zh": "天光",
+          "role_en": "sky_warm"
+        }
+      ]
+    }
+  ]
+}

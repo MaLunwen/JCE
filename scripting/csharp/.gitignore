@@ -1,0 +1,12 @@
+# The managed BUILD OUTPUTS.  `dotnet build` writes bin/ and obj/ beside the
+# project, and build_csharp.py copies the two files the engine needs into
+# artifacts/ — all of them derived, none of them reviewable, and obj/ carries
+# absolute paths from the machine that built it.
+#
+# artifacts/ is ignored too, deliberately: it is what the SDK install rule and
+# the tests read, so committing it would let a STALE assembly ship while the
+# sources beside it said something else.  build_csharp.py --check compares the
+# two and is what tells you to rebuild.
+bin/
+obj/
+artifacts/

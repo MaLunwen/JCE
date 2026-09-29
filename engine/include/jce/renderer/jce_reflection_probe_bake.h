@@ -52,6 +52,14 @@ typedef struct JceReflectionProbeBakeDesc {
                                           container shipped by bimg. */
     bool        include_skybox;
     bool        include_dynamic_objects;
+    /* HDR: capture, convolve and store in RGBA16F instead of RGBA8.
+     *
+     * An 8-bit container clamps every value above 1.0, and the values above
+     * 1.0 are what a reflection probe is for -- a sun, a lamp, a bright
+     * window all reflect at exactly the brightness of white paper without
+     * this.  `faces` for submit_faces() must then be 8 bytes per texel.
+     * APPENDED. */
+    bool        hdr;
 } JceReflectionProbeBakeDesc;
 
 typedef enum JceBakeStatus {
@@ -75,6 +83,19 @@ typedef struct JceReflectionProbeBakeProgress {
 typedef uint32_t JceReflectionProbeBakeHandle;
 
 /* Submit a bake. Returns 0 on rejection (busy / invalid desc / IO). */
+/* Bake from CAPTURED faces instead of the procedural sky.
+ *
+ * `faces` is 6 * cubemap_size^2 RGBA8 texels in +X,-X,+Y,-Y,+Z,-Z order --
+ * what jce_scene_probe_capture reads back from six scene renders.  The bake
+ * copies them (the caller may free immediately) and runs the same convolution
+ * and container steps as the procedural path, so the two differ in exactly one
+ * thing: whether the probe reflects the scene or a gradient.
+ *
+ * Same single-slot rule as submit(): 0 when a bake is already running. */
+JCE_API JceReflectionProbeBakeHandle JCE_CALL
+jce_reflection_probe_bake_submit_faces(const JceReflectionProbeBakeDesc *desc,
+                                       const unsigned char *faces);
+
 JCE_API JceReflectionProbeBakeHandle JCE_CALL
 jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc);
 

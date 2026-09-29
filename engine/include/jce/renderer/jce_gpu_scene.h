@@ -117,6 +117,13 @@ typedef struct JceGpuSceneFrameStats {
  * shader pak (with the embedded-engine-pak fallback).  Never returns NULL on a
  * compute-capable device unless allocation fails; on a non-compute device it
  * returns a valid handle in no-op mode (is_supported() == false). */
+/* Which Hi-Z pyramid this instance got, "" when Hi-Z is unavailable.  Exists
+ * so the owner can report it ONCE: the scene renderer builds one GpuScene per
+ * CSM cascade plus one for the colour pass, and logging from inside create()
+ * printed five identical lines that read like a five-times-initialised
+ * subsystem.  Returns static storage; never NULL. */
+JCE_API const char *jce_gpu_scene_hiz_kind(const JceGpuScene *gs);
+
 JCE_API JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak,
                                           jce_allocator_t alloc);
 

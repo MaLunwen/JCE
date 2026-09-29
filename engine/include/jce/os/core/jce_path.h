@@ -78,8 +78,22 @@ JCE_API const char *jce_path_asset_key(const char *path,
 /* ------------------------------------------------------------------ */
 
 /* Write the parent directory of `path` into `out` (no trailing
-   separator).  Returns false if path has no separator (root or
-   single component) or buffer overflow.  `path` and `out` may alias. */
+   separator).  Returns false if path has no separator (a single
+   component) or on buffer overflow.
+
+   THE ROOT IS A FIXED POINT, not a false: "/" and "C:/" return true and
+   yield themselves, which is what the implementation has always done
+   ("Preserve root") and what this text used to deny.  An upward walk
+   therefore terminates on `strcmp(parent, current) == 0`, not on the return
+   value; both walkers in the tree already do exactly that
+   (editor/src/dialogs/jce_dialog_project.cpp, editor/src/io/
+   jce_editor_scene_serial.cpp).
+
+   `path` and `out` may alias -- this holds for the whole decomposition
+   family below, and it is TESTED (tests/os/core/test_jce_path.c).  It did
+   not hold when it was first written here: all four cleared `out` before
+   reading `path`, so an aliased call read an empty string, and the two that
+   report an empty result as SUCCESS (basename, stem) hid it completely. */
 JCE_API bool jce_path_parent(char *out, size_t out_size, const char *path);
 
 /* Write the last path component (filename or directory name) into

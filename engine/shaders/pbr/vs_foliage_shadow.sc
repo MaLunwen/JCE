@@ -2,6 +2,7 @@ $input a_position, a_normal, a_texcoord0, i_data0, i_data1
 $output v_texcoord0, v_normal, v_worldpos, v_localpos
 
 #include <bgfx_shader.sh>
+#include "shadow_pancake.sh"
 
 /*
  * vs_foliage_shadow.sc -- foliage-cluster card positioning for the CSM
@@ -85,7 +86,11 @@ void main()
                + basisU * (a_position.y * size)
                + windOffset;
 
-    gl_Position = mul(u_viewProj, vec4(world, 1.0));
+    /* Clamped to the near plane, not rejected by it -- see
+     * shadow_pancake.sh.  A caster further up-sun than the cascade
+     * box reaches would otherwise be clipped away entirely and the
+     * shadow it owes would be missing. */
+    gl_Position = jce_shadow_pancake(mul(u_viewProj, vec4(world, 1.0)));
     v_texcoord0 = a_texcoord0.xy;
     v_normal    = n;
     v_worldpos  = world;

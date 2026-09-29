@@ -22,6 +22,10 @@ struct JceNavMesh {
     float     origin_x;
     float     origin_z;
     uint8_t  *walkable;   /* row-major: idx = z * gx + x */
+    /* The clearance this mesh was CARVED for, in metres, straight out of the
+     * bake settings.  0 = a file written before this was read back, which is
+     * "unknown" and not "zero": an unknown clearance must not reject anybody. */
+    float     agent_height;
 };
 
 static JceNavMesh *load_root(JceJson *root)
@@ -33,9 +37,13 @@ static JceNavMesh *load_root(JceJson *root)
     JceJson *cfg = jce_json_get(root, "settings");
     float def_cell = 0.30f;
     float def_min[3] = { 0.0f, 0.0f, 0.0f };
+    float agent_h = 0.0f;
     if (cfg) {
         def_cell = (float)jce_json_get_number(cfg, "cellSize", 0.30);
         jce_json_get_floats(cfg, "boundsMin", def_min, 3, NULL);
+        /* The bake has always written this; nothing read it back, so a mesh
+         * carved for 1.8m of clearance accepted a 2.4m agent without comment. */
+        agent_h = (float)jce_json_get_number(cfg, "agentHeight", 0.0);
     }
 
     JceJson *res = jce_json_get(root, "result");
@@ -63,6 +71,7 @@ static JceNavMesh *load_root(JceJson *root)
     if (bn > n) bn = n;
     for (size_t i = 0; i < bn; ++i)
         nm->walkable[i] = (bits[i] == '1') ? 1 : 0;
+    nm->agent_height = (agent_h > 0.0f) ? agent_h : 0.0f;
     return nm;
 }
 
@@ -98,6 +107,11 @@ void jce_navmesh_free(JceNavMesh *nm)
 
 int   jce_navmesh_grid_x(const JceNavMesh *nm) { return nm ? nm->gx : 0; }
 int   jce_navmesh_grid_z(const JceNavMesh *nm) { return nm ? nm->gz : 0; }
+float jce_navmesh_agent_height(const JceNavMesh *nm)
+{
+    return nm ? nm->agent_height : 0.0f;
+}
+
 float jce_navmesh_cell  (const JceNavMesh *nm) { return nm ? nm->cell : 0.0f; }
 
 void jce_navmesh_origin(const JceNavMesh *nm, float *out_x, float *out_z)

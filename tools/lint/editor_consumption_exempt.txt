@@ -1,0 +1,408 @@
+# Symbols the editor legitimately never names, one per line, with a REASON
+# after '#' on the SAME line.  A bare symbol with no reason is NOT an
+# exemption -- check_editor_consumption.py ignores it, so "I'll write the
+# reason later" fails closed instead of silently passing.
+#
+# Before adding a line, prefer the other fix: expose the capability in the
+# editor.  "unconsumed" is hard evidence of a dogfooding hole; an exemption
+# only records that the hole is intentional.
+#
+# ---------------------------------------------------------------------------
+# THE PATTERN THESE ENTRIES SHARE (2026-08-26 audit of the two 0.0% umbrellas)
+#
+# The editor authors DATA; an engine system calls the API.  Two shapes:
+#
+#   (1) ECS component -- the editor registers a component in
+#       jce_editor_component_registry.cpp, serialises it into the scene, and a
+#       world/runtime system consumes it.  Evidence for triggers:
+#       engine/src/middleware/world/jce_world_ecs.c declares
+#       ECS_COMPONENT_DECLARE(JceTriggerVolumeEcs) / (JceTriggerObserverEcs).
+#
+#   (2) settings struct -- the editor writes fields of
+#       JceSceneRenderingSettings and the scene renderer drives them per frame.
+#       Evidence for weather: jce_panel_lighting_settings.cpp's own comment
+#       names sr_drive_time_of_day / sr_drive_weather as the consumers.
+#
+# In both shapes a direct editor call would create a SECOND owner of state the
+# runtime already owns, which is the defect these entries prevent -- not a
+# gap.  That is why they are exempt rather than "to be wired".
+#
+# NOT exempt, deliberately: jce_road_network_* (14 symbols).  Repo-wide it is
+# reachable only from engine/src/middleware/world/jce_spawn_manager.c, its own
+# .c and its header; "Road" has zero hits under editor/src, and no user project
+# calls it either.  That is built-but-unwired debt, and exempting it would hide
+# exactly the thing this gate exists to show.
+# ---------------------------------------------------------------------------
+
+# --- api_script.h: the RUNTIME owns the script VM lifecycle -----------------
+# editor/src/panels/jce_panel_inspector_gameplay.cpp:883 draw_comp_script()
+# authors JceScriptComponent.script_path and inspects registration through
+# jce_script_vm_* (a different header).  Its own comment: "the runtime DOES
+# consume scripts (jce_runtime drives ...)".  An editor that called
+# jce_script_create/destroy directly would own a second VM.
+jce_script_create                        # runtime owns VM lifecycle; editor authors JceScriptComponent
+jce_script_create_sized                  # runtime owns VM lifecycle
+jce_script_destroy                       # runtime owns VM lifecycle
+jce_script_release                       # runtime owns VM lifecycle
+jce_script_compile_module                # runtime compiles on load; editor authors the path only
+jce_script_release_module                # runtime owns module lifetime
+jce_script_instantiate                   # runtime instantiates per entity from the component
+jce_script_instantiate_source            # runtime path; editor has no source-string surface
+jce_script_rebind_instance               # runtime rebinds on scene reload
+jce_script_instance_count                # runtime bookkeeping
+jce_script_update_coroutines             # runtime frame hook (jce_player_loop)
+jce_script_call_start                    # runtime lifecycle dispatch
+jce_script_call_update                   # runtime lifecycle dispatch
+jce_script_call_fixed_update             # runtime lifecycle dispatch, same as call_update above -- but dispatched from INSIDE the fixed-step accumulator, immediately before jce_physics_step. The editor has no fixed-step loop of its own (Play mode runs the runtime, which dispatches it), so an editor caller would be the editor inventing a second physics cadence. The capability is exposed: a script component authored on an entity receives on_fixed_update in Play.
+jce_script_call_collision                # runtime dispatches from the physics contact bridge
+jce_script_call_anim_event               # runtime dispatches from the animation event bridge
+jce_script_call_message                  # runtime message bus
+jce_script_call_named                    # runtime/QA entry point (space_qa_case pattern)
+jce_script_call_named_num                # runtime/QA entry point
+jce_script_call_named_str                # runtime/QA entry point
+
+# --- api_scene.h / jce_terrain.h: editor authors, runtime streams/builds ---
+# jce_panel_terrain.cpp consumes the resident authoring surface, including the
+# extended brush descriptor added with the umbrella closure.  Mesh building,
+# tile residency and PAK loading remain renderer/runtime responsibilities; a
+# direct editor call would create a second cache owner.  The scalar legacy
+# brush calls stay public for source compatibility while the editor exercises
+# their shared implementation through the descriptor-based entry points.
+jce_terrain_build_collision_mesh         # physics/runtime builds collision from authored terrain
+jce_terrain_cell_is_hole                 # low-level runtime query; editor uses the hole brush
+jce_terrain_chunk_build_mesh             # scene renderer owns chunk mesh generation
+jce_terrain_chunk_mesh_size              # scene renderer sizes chunk buffers
+jce_terrain_create_procedural            # runtime streamed-terrain lifecycle
+jce_terrain_create_tiled                 # runtime streamed-terrain lifecycle
+jce_terrain_has_holes                    # serializer/runtime query; editor authors through brush
+jce_terrain_import_heightmap_r16         # memory/tool entry; editor consumes the file import facade
+jce_terrain_is_tiled                     # runtime streaming query
+jce_terrain_load_from_pak                # packaged runtime loading path
+jce_terrain_prefetch                     # runtime streaming policy
+jce_terrain_resident_tiles               # runtime streaming diagnostics
+jce_terrain_sample_sky_visibility        # runtime shading query; editor owns the bake UI
+jce_terrain_sculpt_apply                 # legacy compatibility wrapper; editor consumes _apply_brush
+jce_terrain_set_hole                     # low-level mutation; editor consumes the hole brush
+jce_terrain_splat_paint                  # legacy compatibility wrapper; editor consumes _paint_brush
+jce_terrain_tile_copy                    # runtime tile-cache transfer
+jce_terrain_tile_grid                    # runtime tile-cache inspection
+
+# --- api_world.h / jce_trigger_volume.h: driven by the ECS components -------
+# jce_world_ecs.c: ECS_COMPONENT_DECLARE(JceTriggerVolumeEcs),
+# (JceTriggerObserverEcs).  Editor registers "TriggerVolume" (comp.triggerVolume)
+# in jce_editor_component_registry.cpp:60.
+jce_trigger_world_create                 # world system owns the trigger world
+jce_trigger_world_destroy                # world system owns the trigger world
+jce_trigger_world_update                 # per-frame system tick
+jce_trigger_world_set_event_fn           # runtime wires the ECS event bridge
+jce_trigger_world_set_stay_events        # authored via the TriggerVolume component
+jce_trigger_world_set_stay_event_period  # authored via the TriggerVolume component
+jce_trigger_world_stats                  # runtime diagnostics
+jce_trigger_add                          # JceTriggerVolumeEcs component drives this
+jce_trigger_remove                       # JceTriggerVolumeEcs component drives this
+jce_trigger_set_desc                     # authored via the TriggerVolume component fields
+jce_trigger_set_enabled                  # authored via the TriggerVolume component fields
+jce_observer_add                         # JceTriggerObserverEcs component drives this
+jce_observer_remove                      # JceTriggerObserverEcs component drives this
+jce_observer_set_position                # driven from the entity transform each tick
+
+# --- api_world.h / jce_weather.h: authored as JceSceneRenderingSettings -----
+# jce_panel_lighting_settings.cpp:654-718 authors weather_type / intensity /
+# temperature_c; its comment names sr_drive_weather as the per-frame consumer.
+jce_weather_create                       # scene renderer owns the weather instance
+jce_weather_destroy                      # scene renderer owns the weather instance
+jce_weather_default                      # defaults come from JceSceneRenderingSettings
+jce_weather_get_state                    # sr_drive_weather reads/writes state
+jce_weather_set_state                    # editor sets rendering->weather_* instead
+jce_weather_update                       # per-frame system tick
+jce_weather_render                       # scene renderer submits this pass
+
+# --- api_world.h / jce_gas.h: driven by the GameplayAbilitySystem component --
+# jce_editor_component_registry.cpp:111 registers "GameplayAbilitySystem"
+# (comp.gas).  Attributes/effects/abilities are authored as component data and
+# ticked by the gameplay system; a direct editor call would bypass the entity.
+jce_gas_init                             # GameplayAbilitySystem component owns init
+jce_gas_tick                             # gameplay system per-frame tick
+jce_gas_register_ability                 # authored as component data
+jce_gas_activate_ability                 # gameplay/script drives activation
+jce_gas_ability_cooldown_remaining       # runtime query, surfaced via the component inspector
+jce_gas_apply_effect                     # gameplay/script drives effects
+jce_gas_remove_effect                    # gameplay/script drives effects
+jce_gas_clear_effects                    # gameplay/script drives effects
+jce_gas_active_effect_count              # runtime query
+jce_gas_get_modifier_sum                 # runtime query
+jce_gas_attribute_count                  # runtime query
+jce_gas_attribute_name                   # runtime query
+jce_gas_attribute_current                # runtime query
+jce_gas_attribute_get_current_by_index   # runtime query
+jce_gas_attribute_set_base               # authored as component data
+jce_attribute_set_init                   # attribute table is component data
+jce_attribute_set_add                    # attribute table is component data
+jce_attribute_set_find                   # runtime query
+jce_attribute_set_get_current            # runtime query
+
+# --- api_world.h / jce_spawn_manager.h: driven by the SpawnManager component -
+# jce_editor_component_registry.cpp:73 registers "SpawnManager" (comp.spawnManager).
+jce_spawn_manager_create                 # SpawnManager component owns the instance
+jce_spawn_manager_destroy                # SpawnManager component owns the instance
+jce_spawn_manager_clear                  # runtime/system operation
+jce_spawn_manager_update                 # per-frame system tick
+jce_spawn_manager_set_viewer             # runtime supplies the active camera
+jce_spawn_manager_get_stats              # runtime diagnostics
+
+# --- api_world.h / jce_weapon.h: driven by the Weapon component --------------
+# jce_editor_component_registry.cpp:74 registers "Weapon" (comp.weapon).
+jce_weapon_archetype_default             # defaults come from the Weapon component
+jce_weapon_instance_init                 # Weapon component owns the instance
+jce_weapon_update                        # per-frame system tick
+jce_weapon_pull_trigger                  # gameplay input drives this, not the editor
+jce_weapon_release_trigger               # gameplay input drives this, not the editor
+jce_weapon_request_reload                # gameplay input drives this, not the editor
+jce_weapon_add_reserve                   # gameplay/script operation
+
+# --- api_world.h / jce_atmosphere.h: engine-internal LUT math ----------------
+# Repo-wide callers are jce_time_of_day.c, jce_atmosphere.c itself and
+# jce_sr_environment.c (the scene renderer's environment pass).  The editor
+# drives atmosphere through the Lighting panel's time-of-day fields.  Public
+# because user code and scripts may want the same sampling math.
+jce_atmosphere_default_params            # scene renderer / time-of-day consume this
+jce_atmosphere_transmittance             # LUT math consumed by jce_sr_environment.c
+jce_atmosphere_sun_illuminance           # LUT math consumed by jce_time_of_day.c
+jce_atmosphere_lut_uv                    # LUT addressing helper
+jce_atmosphere_bake_transmittance_lut    # renderer bakes at environment init
+jce_atmosphere_bake_multiscatter_lut     # renderer bakes at environment init
+jce_atmosphere_sample_transmittance_lut  # renderer samples per frame
+jce_atmosphere_sample_multiscatter_lut   # renderer samples per frame
+jce_atmosphere_pack_lut_rgba32f          # GPU upload helper
+jce_atmosphere_sample_packed_rgba32f     # GPU-side sampling helper
+
+# --- api_world.h / jce_world_ecs.h: runtime assembles the world -------------
+jce_world_ecs_create                     # runtime assembles the world ECS
+jce_world_ecs_destroy                    # runtime assembles the world ECS
+jce_world_ecs_tick_triggers              # runtime frame hook
+
+# --- api_scene.h / jce_foliage.h: renderer and offline cooked placement -----
+# The Vegetation Scatter inspector authors the component and density grid. The
+# scene renderer owns deterministic projection and cooked-placement loading;
+# calling these low-level routines from a panel would duplicate that authority.
+jce_foliage_scatter_on_surface           # scene renderer projects scatter onto transformed terrain surfaces
+jce_foliage_load_cooked                  # runtime/offline cooked-placement reader, not an authoring action
+jce_foliage_cooked_count                 # query on a runtime/offline cooked-placement handle
+jce_foliage_cooked_seed                  # query on a runtime/offline cooked-placement handle
+
+# ── ECS-UI view-id / dispatch consolidation (2026-08-29) ────────────────
+# The editor's Play loop used to transcribe the four per-channel UI dispatch
+# calls itself.  The two copies drifted -- the shipped runtime gated the whole
+# drain on having a valid pointer while the editor gated it only on having a
+# runtime, and two of the four channels are cleared on read, so a keyboard
+# submit latched in the canvas and fired on an unrelated later frame.  Both
+# sides now call the one seam, jce_runtime_dispatch_ui_events, which IS
+# consumed by editor/src/scene/jce_editor_game_render.cpp; these four are its
+# parts, still public for a project that writes its own main.c.
+jce_runtime_dispatch_ui_click          # consumed via jce_runtime_dispatch_ui_events (one shared drain, editor + runtime)
+jce_runtime_dispatch_ui_value_changed  # consumed via jce_runtime_dispatch_ui_events (one shared drain, editor + runtime)
+jce_runtime_dispatch_ui_text_changed   # consumed via jce_runtime_dispatch_ui_events (one shared drain, editor + runtime)
+jce_runtime_dispatch_ui_submit         # consumed via jce_runtime_dispatch_ui_events (one shared drain, editor + runtime)
+
+# The view-id ownership guard's frame boundary.  The engine owns it: it is
+# called exactly once per frame from jce_engine.c before any view assignment,
+# and a second caller would silently drop every claim made so far that frame.
+# The editor consumes the other three (claim / enabled from the viewport
+# common header, conflict_count in the Profiler panel).
+jce_view_bands_begin_frame             # engine-owned frame boundary; a second caller would drop the frame's claims
+jce_draw_set_scissor                     # widget-system plumbing: the ONE caller is jce_ui_canvas.c clipping a ScrollView subtree; an editor UI for "set a scissor" is not a capability
+jce_draw_clear_scissor                   # the other half of jce_draw_set_scissor; same reason
+jce_draw_get_scissor                     # reads back the above so a test can tell "clipped to nothing" from "not clipped"; nothing to expose
+jce_physics_vehicle_add_wheel_input  # runtime-driven: the editor authors WheelCollider.motor_torque/.brake_torque/.steer_angle_deg (all three are drag floats in the WheelCollider inspector); rt_apply_wheel_trim pushes them to physics each tick.  The editor never calls the physics API directly, exactly as it never calls jce_physics_vehicle_set_input.
+jce_physics2d_joint_get_force  # runtime-driven: the editor authors Joint2D.break_force/.break_torque; rt_monitor_joints2d reads this after each 2D step to decide whether the joint snaps.  The editor never calls the physics API directly.
+jce_physics2d_joint_get_torque  # runtime-driven: same as jce_physics2d_joint_get_force -- read by rt_monitor_joints2d, never by the editor.
+
+# --- api_resource.h / jce_atlas_pack.h: a COOK capability, not an editor one -
+# `jce_cook --pack-atlas` drives these; the editor never builds an atlas, and
+# giving it a button would be a second way to produce an asset the cook already
+# produces deterministically.  The runtime side is jce_sprite_sheet_load_json,
+# which is where the atlas is consumed.  If an "Pack Sprite Atlas" action is
+# ever added to the asset browser, DELETE these four lines rather than leaving
+# them: a stale exemption hides the next capability that falls behind.
+jce_atlas_pack                           # cook-side packer, driven by jce_cook --pack-atlas
+jce_atlas_pack_desc_default              # its defaults; same caller
+jce_atlas_write_aseprite_json            # emits the sheet jce_sprite_sheet_load_json reads
+jce_auto_exposure_step  # THE PER-FRAME INTEGRATOR, AND THERE IS EXACTLY ONE THING TO INTEGRATE. It advances the adapted EV by dt toward the target and is called once per apply, from jce_postfx.c, which owns the only adapted EV in the process and measures its own dt from the engine clock so no consumer can forget to feed it. An editor call would be a SECOND integrator stepping the same value a second time each frame: the adaptation would run at double speed and overshoot on alternate frames. The editor exposes what an author can act on -- the gate, the clamp, the two speeds, the bias, and a live readout of measured/current/target EV including a warning when the target is pinned at a bound (jce_panel_postfx.cpp) -- and consumes jce_auto_exposure_target_ev and _multiplier to build it.
+jce_auto_exposure_log_average_rgba16f  # TAKES A GPU READ-BACK BUFFER AND THE EDITOR NEVER HOLDS ONE. The argument is texel_count*4 IEEE binary16 values as bgfx_read_texture fills a READ_BACK staging copy; the only such buffer for metering lives inside JcePostFXPipeline, which is opaque, and its result is already published to the editor as jce_postfx_get_measured_luminance(). It is public because it is the half of the measurement that can be asserted without a GPU (tests/renderer/test_jce_auto_exposure.c) and because a game metering its own render target should not reimplement a log-average.
+jce_pbr_material_set_uv_override  # per-draw renderer mechanism, not an editor surface: the scene renderer arms it around a model draw so a glTF's own materials still honour the renderer's UV tiling (jce_sr_draw.c). The editor authors that tiling through JceMeshRenderer.uv_tiling in the Inspector; a panel calling this directly would be reaching past the component into the draw loop.
+jce_draw_filled_rect_view_xf  # the rect draw with a 2D transform, called by jce_ui_canvas.c so a UI element can turn. Public for the same reason its untransformed sibling is: the canvas is middleware and cannot reach engine/src/renderer's internal header, where the batched variant of this does live. The editor draws its own chrome with ImGui and has no canvas quad to turn.
+jce_draw_textured_rect_view_xf  # same pair, textured. See jce_draw_filled_rect_view_xf.
+jce_text_draw_scaled_view_xf  # a text run through the same 2D transform, so a UI label turns WITH its panel rather than staying upright inside it. Called from jce_ui_canvas.c; the editor's text is ImGui's.
+jce_postfx_set_depth_of_field  # the engine owns this push. Only jce_scene_renderer.c has the camera, and the focus distances must be projected through the SAME matrix that filled the depth buffer -- doing it anywhere else is how a per-backend depth-convention bug gets in. The editor authors the numbers on JceSceneRenderingSettings and the renderer converts them; the panel does read jce_postfx_get_depth_of_field_active to say when the effect is on but invisible.
+jce_postfx_get_depth_of_field  # asks "is the flag set", which the editor already knows: it is the JceSceneRenderingSettings field the panel itself edits. The question a panel needs is the OTHER one -- is it doing anything -- and that is jce_postfx_get_depth_of_field_active, which the panel consumes.
+jce_scene_set_content_size_fitter  # reached through the component REGISTRY's function-pointer table (reg_set_content_size_fitter in jce_scene_components_json.c), never by name, which is how every other component's set/has/remove already sits inside this gate's baseline. The editor edits the component through jce_scene_get_content_size_fitter, which it does consume.
+jce_scene_has_content_size_fitter  # same: the REG entry passes it as the presence predicate. This component is flagless because the 64-bit JCE_COMP_FLAG space is full, so presence IS its enable gate.
+jce_scene_remove_content_size_fitter  # same: the REG entry passes it as the remover, which is what the Inspector's component menu calls through the registry.
+jce_texture_colour_space  # The READ-BACK half of the colour-space contract. The editor WRITES it (jce_texture_set_colour_space, from Project Settings > Graphics > Color Space) and the ENGINE reads it: jce_scene_renderer.c and jce_render_preview.c pack the output gamma exponent into u_iblParams.z from it, and jce_postfx.c takes the tonemap gamma from it, so the hardware sRGB decode and the frame encode are one decision. It is JCE_API only because this engine has no cross-module engine-internal visibility level (audit pattern 05); an editor consumer would be a caller inventing a second authority.
+jce_light_env_add_area_light  # The RENDERER fills the light environment, not the editor: jce_sr_draw.c gathers every visible AreaLight component into it each frame, exactly as it does for jce_light_env_add_spot_light beside it. The editor authors the COMPONENT (JceAreaLight, through the Light inspector) and never touches JceLightEnv -- a panel calling this would be a second gatherer whose lights the culler does not know about.
+jce_light_env_area_count  # The count read-back, for the same reason: it answers a question about the frame the renderer just built, and only the renderer has that frame. Its point/spot siblings sit outside the editor for the same reason.
+jce_planar_reflection_create  # the editor drives the whole feature through ONE call, jce_scene_renderer_render_planar_reflection, which both viewports make; the module's own lifecycle is the scene renderer's business and exposing create/destroy in the editor would be a second way to own it
+jce_planar_reflection_destroy  # see jce_planar_reflection_create
+jce_planar_reflection_render  # see jce_planar_reflection_create -- the scene renderer calls it, the editor asks the scene renderer
+jce_planar_reflection_texture  # read by the water submit inside the renderer; the editor never binds a reflection itself
+jce_planar_reflection_view_proj  # read by the water submit inside the renderer, for the projection the mirrored render used
+jce_light_env_apply_for_layer  # Same shape as jce_light_env_add_area_light above: the editor authors the COMPONENT (a light's layer_mask, through the Light inspector's Rendering Layers combo) and the RENDERER applies it. This is the per-draw light upload -- it runs inside sr_bind_material_cb and sr_inline_bind_pbr_global, once per material run and once per inline submit. A panel calling it would upload a light set for a draw the panel is not making.
+jce_light_env_has_layer_masks  # The frame-level question "does any light in the env restrict itself to layers". It used to decide whether Forward+ may run; the clustered path honours masks now, so that caller is gone and what remains is a question a TOOL asks. The editor still holds no JceLightEnv -- the renderer gathers one per frame from the scene it is drawing -- so there is nothing here for the editor to ask it about.
+jce_mesh_merge  # The world-space merge under BOTH jce_hlod_bake_proxy and jce_static_batch_bake. The editor calls those two -- the HLOD bake from the World Streaming panel, the static batch from the Build Profiles panel -- and neither wants the raw merged buffers: one simplifies them, the other writes them. A panel calling this would hold a merged mesh with nothing to do with it.
+jce_mesh_merge_free  # The other half of jce_mesh_merge's ownership. Exempt for exactly the same reason: whoever does not call the merge does not free its result.
+jce_glb_write_mesh_uv  # The .glb writer's UV-carrying form, called by jce_static_batch_bake. The editor asks for a static batch and gets .glb files; it has no business assembling vertex arrays and writing glTF itself, which is what calling this directly would mean. Its no-UV sibling jce_glb_write_mesh is exempt on the same grounds one line up in this file's history.
+jce_net_animator_register  # Same shape as the light-env entries above: the editor authors the COMPONENT (NetworkAnimator, in the Inspector) and the RUNTIME registers it -- jce_runtime.c hands this function exactly the three knobs the panel edits. A panel calling it would register an object into a replication session the editor is not in.
+jce_net_animator_unregister  # The other half of that ownership. Whoever does not register does not unregister.
+jce_net_animator_set_scene  # Bound by jce_runtime.c to the scene it is simulating, beside jce_net_transform_set_scene. The editor's scene is not a replicated session.
+jce_net_animator_fixed_step  # A per-fixed-step tick, called by jce_runtime.c beside jce_net_transform_fixed_step. The editor has no fixed-step network tick to call it from.
+jce_net_animator_render_step  # The render-step half of that pair, and exempt for the same reason.
+jce_net_animator_set_local_state  # The AUTHORITY pushes what its animator is doing, once per fixed step, from gameplay. The editor is not the authority for anything.
+jce_net_animator_get_state  # The receiver's read-back, consumed where the pose is applied. A panel that read it would be reporting a state nothing in the editor is applying.
+jce_net_animator_fire_trigger  # Gameplay fires triggers; a designer does not fire one from an inspector, and a button that did would send a reliable packet into a session the editor is not in.
+jce_net_animator_poll_trigger  # The receiving side of that, drained by gameplay at a point it chooses.
+jce_net_animator_hash  # The name->id hash both sides must agree on. Callers hash their own state names; the editor authors names, not hashes.
+jce_net_animator_set_default_config  # Process-wide defaults, set by a game at startup. The editor authors PER-COMPONENT values, which is what the Inspector edits and what jce_runtime.c turns into a config.
+jce_net_animator_get_default_config  # Read by jce_runtime.c as the base a component's knobs override. A panel reading it would show a default the authored component replaces.
+jce_net_animator_reset_stats  # A test helper, exactly as jce_net_transform_reset_stats is. The live counters the Inspector shows are cumulative on purpose.
+jce_net_animator_shutdown  # Tear-down, owned by whoever brought the session up. The editor does not own a replication session's lifetime.
+jce_net_animator_inject_snapshot  # The loopback / test seam: inject a snapshot as though it had arrived. Present so the receive path is reachable without a socket; a panel calling it would fabricate replicated state.
+jce_net_animator_inject_trigger  # The same seam for a trigger, exempt for the same reason.
+jce_scene_has_layout_element  # reached through the component REGISTRY's function-pointer table (the REG entry passes it as the presence predicate), never by name. LayoutElement is flagless because the 64-bit JCE_COMP_FLAG space is full at bit 63, so presence IS its enable gate -- the same arrangement ContentSizeFitter above already has. The editor edits the component through jce_scene_get_layout_element and creates it through jce_scene_set_layout_element, both of which it does consume.
+jce_scene_remove_layout_element  # same: the REG entry passes it as the remover, which is what the Inspector's component menu calls through the registry rather than by name.
+jce_font_sdf_spread  # the DRAW path's question, not the editor's: the text renderer asks it to pick between the coverage program and the distance-field one, and it needs a JceFont* the Inspector does not have. An editor caller would be a second authority on which program a glyph batch uses. The editor consumes the AUTHORING half instead -- JceUITextComponent.sdf, which it edits and which jce_ui_canvas.c turns into jce_font_set_sdf_spread around the open.
+jce_nav_agent_fits  # the pure comparison behind jce_nav_agent_report_fit, exposed so a caller can ask without producing a log line. Both askers are runtime-side and hold the mesh: the agent set (grid backend) and jce_runtime.c (Recast backend). An editor caller would need the baked navmesh loaded, which the Inspector does not have -- the panel that DOES have it is the one that authored the clearance in the first place.
+jce_nav_agent_report_fit  # same, plus the warn-once. Called where the mesh is, which is the runtime; the editor's half of this contract is the NavAgent height field it edits and the bake config it authors.
+jce_navmesh_agent_height  # what the GRID navmesh was carved for, read by jce_nav_agent_add through nav_check_fit. The editor never loads a grid navmesh: the panel bakes a Recast one and holds the settings it baked with, so asking a loaded mesh would be asking a question it already knows the answer to.
+jce_recast_agent_height  # the same for the Detour mesh, read by jce_runtime.c where the mesh is loaded. The navmesh panel authored this number as JceRecastConfig.walkable_height and writes it to the sidecar; reading it back off a loaded tile header is the RUNTIME's question, and an editor caller would be a second authority on it.
+jce_text_draw_styled_view_xf  # jce_text_draw_scaled_view_xf plus an outline/shadow style, called by the thing that DRAWS the text -- the UI canvas, engine side. The editor's half of this contract is the four JceUITextComponent fields it edits (outline_width, outline_color, shadow_offset, shadow_color); jce_ui_canvas.c converts them from authored PIXELS into the field's distance units, a conversion that needs the atlas spread and the draw scale. An editor caller would have neither and would be a second authority on the same style.
+jce_audio_reverb_process_offline  # the same door the DSP chain has had all along: run the reverb over a known PCM buffer with no audio device, which is how its stages are unit-tested. Not an editor capability -- there is nothing for a panel to expose. The reverb HAD no such door, which is how six authored numbers (room_size, diffusion, density, pre_delay_ms and the component's reflections pair) came to reach no part of the DSP with nothing noticing.
+jce_font_add_fallback  # the per-FONT primitive; the editor authors the LIST. A font that lacks a codepoint draws a tofu box, so a Latin UI face in front of Chinese draws one for every character; the chain that fixes it is authored as JceProject.ui_font_fallbacks and applied by jce_ui_canvas_set_font_fallbacks, which BOTH editor viewports call beside jce_ui_canvas_set_default_font (jce_editor_scene_render.cpp, jce_editor_game_render.cpp) and which jce_default_main.inc.h calls for the shipped exe. Attaching a chain needs a JceFont* opened at a specific px and sdf mode inside the canvas's own font cache -- the editor has no such handle, and an editor caller would be a second authority on which faces back which font. It stays JCE_API because an SDK project that renders its own text needs the primitive; same shape as jce_font_sdf_spread above.
+jce_humanoid_clamp_delta  # the muscle clamp on ONE delta rotation, called from inside jce_humanoid_retarget_clamped -- an engine-side transfer step. The editor authors nothing that would call it: what a designer sees is the RANGE (the Animation Rigging panel's Humanoid section lists every role's twist/swing limits through jce_humanoid_muscle_limits, beside the joint that plays it) and what a designer changes is whether a clip retargets at all. An editor caller would have to hold a source pose, a source rig and a bone axis to hand it, which is the retargeter's job and not a panel's.
+jce_humanoid_retarget_clamped  # the retarget itself, called once per frame per retargeting instance by jce_sr_anim_retarget.c. The editor's half of this contract is the SkeletalAnimator's retargetSource field and the avatar it inspects; the transfer runs in the scene renderer, exactly like jce_humanoid_retarget above it, which has the same shape and the same reason.
+jce_mesh_merge_spans  # jce_mesh_merge plus "tell me where each input landed", called by jce_static_batch_bake -- which the editor DOES drive, from the Build Profiles panel's Static Batching tab. The spans are a property of the concatenation and are known only inside the merge; the editor's half of this contract is deciding WHICH instances may merge and then rewriting its scene, which it does through jce_static_batch_bake's out_group_of_instance. An editor caller would be assembling merge inputs by hand, which is the baker's job.
+jce_static_batch_members_parse  # the member table's parser, shared by the two worlds that read the sidecar's BYTES differently: the bake verifies through the host filesystem beside the .glb it just wrote, and the scene renderer reads it out of the PAK. Neither is the editor. It is public because it is the single answer to "what does a member table mean" -- a second parser would drift the first time the format grew a field.
+jce_static_batch_members_load  # the host-filesystem read of that sidecar, used by the bake and by the scene renderer's editor-mode probe (jce_scene_renderer.c). The editor never asks the question itself: what a designer sees is the Static Batching tab's group/draw counts, and what the renderer does with the table is submit fewer index runs.
+jce_static_batch_visible_runs  # pure arithmetic over a member table and a visibility bit per member, called from the colour pass's submit (jce_sr_draw.c sr_draw_batch_runs). It coalesces adjacent visible members so a wholly-visible group stays ONE submit. There is no panel for "which runs would you like" -- the answer is the frustum's.
+jce_skinned_mesh_set_submit_index_range  # the per-submit index-range override, armed by the colour pass for static-batch member culling and cleared by the submit. Same shape and same reason as jce_skinned_mesh_set_submit_state and _set_submit_stencil, neither of which the editor names either: they are how ONE draw is parameterised, and the editor authors what is drawn rather than how a submit is bound.
+jce_model_set_draw_index_runs  # arms index RUNS for the next model draw, so a merged static batch submits only the members the frustum can see. Armed by the scene renderer (jce_sr_batch.c) and applied at the bottom of jce_model_draw_program; the editor's half of this contract is the Build Profiles panel's Static Batching tab, which decides WHICH meshes merge. It lives at the bottom precisely because a static model reaches a draw through several ladders with several exits -- four wirings at individual draw sites each looked right and each reached nothing, measured -- and that is not a decision a panel can make either. Same shape as jce_model_set_draw_lod beside it, which the editor does not name for the same reason.
+jce_ssgi_render_albedo  # jce_ssgi_render plus the receiver's albedo target, called once per frame by the scene renderer. The editor's half of this contract is the Rendering settings it authors -- the scene's `ssgi` flag, ssgiIntensity, ssgiRadius, and the render pipeline's SSGI feature -- and the pass consumes them; which texture the march samples as albedo is not a designer decision. Same shape and same reason as jce_ssgi_render beside it, which the editor does not name either.
+jce_model_morph_anim_count  # promoted from the PRIVATE engine/src/renderer/jce_model.h on 2026-09-18 because the scene renderer drives blendshape animation from it and cannot reach that header from engine/src/middleware/ -- it was calling it through an implicit declaration, which returns int. Same family as jce_model_node_count / _prim_vertex_count / _prim_morph beside it in the public header: narrow accessors that exist so a RENDERER can walk a model without the internal structs. The editor's half of morph authoring is the Animation Editor's blendshape weights, which edits the component; enumerating the model's imported weight TRACKS is what the runtime does with that data.
+jce_model_morph_anim_track  # see jce_model_morph_anim_count above -- same promotion, same reason, and this is the one whose returned pointer the implicit declaration was truncating to 32 bits.
+jce_humanoid_ik_two_bone  # The SOLVER. Its callers are both in the renderer: the kind-7 humanoid-limb constraint (jce_sr_anim.c) and effector preservation on retarget (jce_sr_anim_retarget.c). Neither is an editor capability -- the editor AUTHORS the goal (a limb picker in the Animation Rigging panel, which now also warns when this rig's limb is not a parent chain and the solve will be refused) and the renderer runs it. The 2026-09-18 wording here said "no caller", which stopped being true on 09-19; an exemption that outlives its reason is how a wrong conclusion survives longest in this tree.
+jce_introspect_components_json  # the engine describing its own component table as JSON, landed 2026-09-19. Its consumer is OUT OF PROCESS by construction: a program driving JCE through the SDK -- private/tools/automation/'s schema tools, an MCP client, an IDE. The editor is in the same process and already reads the identical data directly, through jce_component_count / _name / _desc, which is the registry this function round-trips to produce the JSON; routing the Inspector through a JSON serialise/parse inside one address space would add an indirection, a second slower answer, and nothing else. It IS dogfooded, and by the consumer that matters: tests/sdk_smoke calls it through the PACKAGED headers and library (JCE_SMOKE_INTROSPECT=components), which is the only thing that shows the header survives SDK installation -- this tree has shipped a header that worked in-tree and broke every SDK consumer on the first line of api.h. tools/lint/check_introspection_parity.py then compares its answer against tools/jce_scene_kit.py field by field, which is what found 64 fields that validator was calling unknown while the engine read every one.
+jce_introspect_scene_json  # see jce_introspect_components_json above -- same ABI, same out-of-process consumer. The editor has the scene graph in memory and a Hierarchy panel rendering it; serialising that to JSON for itself would be strictly worse than what it does now.
+jce_introspect_entity_json  # see jce_introspect_components_json above. The editor's equivalent is the Inspector, which edits the live component structs; this produces the same values as text for a caller on the other side of a pipe.
+jce_introspect_stats_json  # see jce_introspect_components_json above. The editor shows frame statistics in its own HUD from the same jce_perf_phase_* / jce_mem_profile_* sources this function reads; the JSON form exists so an automated run can record them without a window.
+jce_humanoid_role_model_xform  # Asks where a humanoid ROLE sits under a given POSE. The editor has no posed pose to ask about outside Play -- the Animation Rigging panel's Humanoid section reads the REST rig, which jce_humanoid_map_build already answers. Its consumer is the renderer's retarget step (jce_sr_anim_retarget.c, effector preservation), which is where a posed local set exists. Exposed rather than kept internal because jce_humanoid_ik_two_bone already computes exactly this inside itself, so the alternative was a second parent walk beside it.
+jce_humanoid_redistribute_twist  # Redistributes a POSE's twist along the limb; its consumer is the renderer's retarget step (jce_sr_anim_retarget.c), which is where a posed local set exists. The editor exposes the SETTING -- the Twist redistribution slider on the Skeletal Animator inspector writes retarget_twist -- but a slider writes a component field, it does not call a pose function; the editor has no retargeted pose of its own to redistribute outside Play.
+jce_humanoid_clamp_knee_direction  # Clamps a retarget DELTA, in the source rig's model space, inside the per-frame transfer (jce_humanoid_retarget_clamped -> jce_sr_anim_retarget.c). The editor has no delta: it edits rest poses and clip data, not the rotation one animation added on top of another rig's rest. What the editor DOES show is whether this rig can be protected at all -- the Animation Rigging panel's Humanoid section has a Hinge column calling jce_humanoid_hinge_axis, which is the same derivation this clamp uses.
+jce_humanoid_clamp_elbow_direction  # The elbow half of the pair above, and exempt for the same reason: it clamps a per-frame retarget delta the editor never holds. Its axis comes from the rig's REST BEND rather than the body, so unlike the knee it can be refused -- PSX_BagMan's arms rest at exactly 180 degrees and give no plane. That refusal is the part a rigger needs to see, and it is shown: the Hinge column reads jce_humanoid_hinge_axis and prints 'no hinge plane at rest' for exactly those rigs.
+jce_planar_reflection_render_plane  # Renders the mirrored scene for a PLANE, once per frame, from inside the scene renderer's own planar step (jce_sr_planar.c). The editor authors the PROBE -- JceReflectionProbeComponent in PLANAR mode, with its plane normal and tolerances, in the Reflection Probe inspector -- and the renderer decides which probe is live and drives this. An editor caller would need a scene renderer, a camera and a frame in hand, which is the renderer's job; the same shape as jce_planar_reflection_render beside it.
+jce_planar_reflection_apply  # The screen-space composite of that mirror. What the EDITOR calls is jce_scene_renderer_composite_planar, from jce_editor_viewport_common.h, at the same view offset the shipped runtime uses -- this is the layer below it, and it wants the frame's depth buffer, its G-buffer normal and the main camera's inverse view-projection, none of which a panel holds.
+jce_renderer_get_program_variant  # THE one place a PBR draw's program is decided, called from the renderer's own draw paths and from the scene renderer's. The editor authors the MATERIAL -- Receive Shadows in the Mesh Renderer inspector is the flag that becomes JCE_SHADER_KEY_NOSHADOW -- and the draw path asks this. A panel calling it would be choosing a program for a draw it is not making.
+jce_pbr_material_shader_keys  # Turns a material into the keyword bits its program needs, for the draw paths. The editor's half is the checkbox that sets the field; this is read where the submit happens, which is the renderer. Exempt for the same reason as jce_pbr_material_render_state beside it.
+jce_utf8_prev  # Steps a caret back one CHARACTER. Its consumer is the ENGINE's UI canvas (jce_ui_canvas.c), which owns the in-game InputField; the editor's own text entry is ImGui's, and ImGui does its own UTF-8 stepping internally. An editor caller would be a second implementation of the thing ImGui already does, which is the defect this gate usually finds rather than the fix.
+jce_utf8_next  # The forward half of the same pair, same consumer, same reason.
+jce_utf8_count  # Counts CHARACTERS, not bytes, for the in-game InputField's char_limit -- jce_scene.h calls that field 'max chars' and it was enforced in bytes until 2026-09-20. The editor has no character-limited field of its own; ImGui's InputText takes a byte buffer and handles the limit itself.
+jce_mesh_draw_instanced_tinted_keyed  # The keyed form of jce_mesh_draw_instanced_tinted, whose own exemption covers the pair: an instanced submit of built-in primitives, issued by the scene renderer's primitive batch. The editor does not batch draws; it authors the entities the batch collects.
+jce_assert_fail  # The out-of-line half of JCE_ASSERT / JCE_ASSERTF / JCE_VERIFY. Its own header says "Call the macros, not these" -- it is exported only so the macro bodies resolve across the DLL boundary. The editor DOES consume the facility (editor/src/core/jce_editor_assert_bridge.cpp installs a handler so an engine invariant no longer abort()s the editor with the user's unsaved scene); it reaches this symbol through the macro, which the checker classes as via-macro, not consumed.
+jce_ensure_fail  # The non-fatal half of the same pair, exported for the same reason and reached the same way. A direct call would skip the condition the macro exists to evaluate, so an editor call site here would be a misuse, not consumption.
+jce_ensure_fail_always  # The no-dedup half of JCE_ENSURE_ALWAYS / JCE_ENSUREF_ALWAYS, exported for the same reason as jce_ensure_fail above: the macro bodies have to resolve across the DLL boundary. A direct call would skip the condition the macro exists to evaluate.
+jce_ui_canvas_set_safe_area  # The host tells the canvas which part of the drawable is safe. The editor deliberately does NOT call it: a Game View panel inside a desktop window has no notch, and "never set" already means "the whole view", which is the correct answer there. Calling it with the EDITOR window's safe area would be worse than not calling it -- that rect is about the editor's chrome, not the simulated device's.
+jce_ui_canvas_root_rect  # The one derivation for a canvas's layout rect, read by the renderer and by test_jce_ui_canvas_safe_area.c. An editor reader would be a device simulator -- previewing a notch the way Unity's Device Simulator does -- and that is a separate feature. The alternative considered and rejected was an Inspector preview using a hardcoded example inset: a panel that invents device metrics is the kind of number that rots and then misleads, which is worse than a panel that says nothing.
+jce_window_get_safe_area  # Reports the part of the drawable no notch, punch-hole or gesture bar covers. The editor is a desktop application whose layout is ImGui's docking, and on desktop this always returns the whole window -- so an editor caller would be a call that provably cannot change anything. Its consumer is the shipped runtime (jce_default_main.inc.h), which pushes the rect into the canvas every frame because it changes with orientation.
+jce_scene_solve_local_pose  # The world->local solve WITHOUT the write, for callers that own their own cache invalidation. Its consumers are the runtime's in-place write-back passes (rt_sync_transforms, the soft-body / nav-agent / vehicle-chassis write-backs, the character yaw), which mutate Transforms directly and then name the entities through jce_scene_notify_physics_writeback_entity -- precisely so they do not pay jce_scene_set_transform's per-entity subtree invalidation once per body per frame. The editor has no such pass: every editor write goes through jce_state_begin_batch_edit and jce_scene_set_transform, which is what jce_scene_set_world_pose is (and the Inspector's world-position row DOES call that one). An editor caller here would be an editor writing Transforms behind its own history and invalidation, which is the bug this exemption protects against rather than a capability it withholds.
+jce_scene_has_bone_attachment  # same as the ContentSizeFitter pair above: the REG entry passes it as the presence predicate, and the Inspector's component menu calls it THROUGH the registry rather than by name. BoneAttachment is flagless because the 64-bit JCE_COMP_FLAG space is full, so presence IS its enable gate.
+jce_scene_remove_bone_attachment  # same: the REG entry passes it as the remover, which is what the Inspector's component menu calls through the registry. The two accessors the editor DOES name directly -- get_ in the drawer and set_ in the Add Component defaults -- are consumed and not listed here.
+jce_skin_bone_world  # Recovers a bone's world matrix from the skinning palette (palette[i] * inverse(inverseBind[i]), the formula jce_skeleton.h:92 states). Its consumer is the renderer pass that honours JceBoneAttachment, sr_update_bone_attachments -- the editor does not need to recompute a bone pose in order to let an author type a bone name, and the capability itself IS exposed in the Inspector as that component. An editor caller would be a bone-position GIZMO, which is a separate feature and a device-dependent one: the palette only exists after the render pass has sampled it, so a gizmo would be drawing last frame's skeleton unless it ran inside that pass too.
+jce_physics_constraint_set_motor  # Drives a hinge or slider at a target velocity while the world runs (Unity's HingeJoint.motor changed from script).  A constraint handle exists only inside a runtime's physics world, which the editor has only during Play -- and there the RUNTIME owns the sync: rt_sync_joint_motors re-pushes JceConstraintComponent's motor triple on every fixed tick when it changes.  The capability IS exposed to authors, as the motor block in the Constraint inspector; it reaches the solver through the component.  An editor caller would be a second writer for state the runtime re-pushes anyway, and the two would race on which one the author's last edit meant.
+jce_curve_load  # Loads a curve through the engine's virtual file system (PAK + mounted dirs).  The editor holds no JceFileSystem for the open project -- it reads loose project files through ed_read_file and hands the bytes to jce_curve_parse, which is the half of the pair it DOES consume (see load_curve in jce_panel_curve_editor.cpp).  Its consumers are the shipped runtime and SDK games, where the same path has to resolve inside a PAK.  An editor caller would need a mount set built for a project it is already reading loose, which is a second resolution path for one file.
+jce_curve_eval  # Evaluates a channel of a LOADED curve by index.  The editor's preview evaluates the channel it is EDITING, which is not loaded state -- it is a std::vector<Key> the author is dragging -- so the panel calls jce_curve_eval_keys, the same evaluator this function forwards to.  One evaluator, two entry points; the editor consumes the one that takes the keys it has.
+jce_curve_channel_index  # Resolves a channel BY NAME, which is how a script refers to one (jce.curve_eval(path, 'kick', t)) because an index would break the moment an author reorders the list.  The editor is the thing doing the reordering: it holds the channels as a vector and addresses them by position, and a name lookup inside the editor would answer a question about a document it is in the middle of changing.
+jce_curve_time_min  # The first authored key time of a channel.  The panel does not need it derived: the keys are in hand, sorted, and the number it actually shows on the axis is the VIEW range (tMin/tMax), which is authoring state the engine's JceCurve deliberately does not carry -- where the author was looking is not what they authored.  Its consumers are runtime callers that must know a curve's extent without having its keys.
+jce_curve_time_max  # Same pair as jce_curve_time_min, and exempt for the same reason: the editor has the keys, and the number on its axis is the view range, not the key extent.  Listed separately rather than folded into the line above so that removing one does not silently carry the other.
+jce_renderer_take_device_lost  # READ-AND-CLEAR, so a second reader is not merely absent -- it is WRONG.  The engine polls this once per frame in jce_engine_iterate and turns it into JCE_LIFECYCLE_DEVICE_LOST; an editor caller would CONSUME the flag and starve that emit, so the editor would see the device loss and every lifecycle listener in the process would not.  The header says so: poll it or register for it, not both.  The editor's correct consumption of this fact is jce_lifecycle_register(JCE_LIFECYCLE_DEVICE_LOST, ...), which is the accessor one layer up and is not this symbol.
+jce_anim_clip_parse  # Turns clip bytes into a JceAnimClip.  Its consumer is the RUNTIME -- sr_find_file_clip in jce_sr_anim.c, which resolves a SkeletalAnimator clip name the model itself does not carry by reading <skeleton dir>/<name>.animclip.json, PAK-first and then host.  The editor is on the other side of this format: it SERIALISES (which it does consume, through the Animation Clip Editor's Export clips button) and it has nothing to do with parsing one back, because it edits clips inside models rather than clip files.  This gate's +4 is what found the two real defects in the first draft of that unit -- a VFS loader with no caller at all, and a host-only read that would have returned NULL in every packaged build -- so the remaining one is exempt only after the other three stopped being exportable at all.
+jce_physics_constraint_applied_torque  # The last solver step's torque on a live constraint.  Its product consumer is the RUNTIME break monitor -- rt_cfg_joint_breaks in jce_runtime.c:1463, which compares it against the authored break_torque every fixed tick.  The editor has no caller for the same structural reason its sibling jce_physics_constraint_applied_impulse has none (grep applied_impulse over editor/src/ returns nothing): a constraint handle exists only inside a running physics world, which the editor has only during Play, and the value is per-step live solver state rather than anything authorable.  The capability IS exposed to authors, as the Break Torque field in the ConfigurableJoint inspector; it reaches the solver through the component.  This symbol is the pair to an impulse query that has been unconsumed since it shipped -- if that one ever gains an editor caller (a joint-stress readout in the physics debug panel is the obvious one) then this line is stale and both should go together.
+jce_audio_bus_get_peak  # READ-AND-CLEAR, so a second reader is not merely absent -- it is WRONG, the same shape as jce_renderer_take_device_lost above.  Its product consumer is the RUNTIME: rt_mixer_key_peak in jce_rt_audio.c samples each sidechain key bus once per frame and hands the level to jce_audio_mixer_duck_advance, which is the head of the ducking chain this symbol was added to close.  An editor caller would consume part of that measurement and the duck would be driven by whatever fraction of the peak the panel did not take -- a mixer strip that made ducking quieter by being open.  The obvious editor feature here, a live VU meter per strip during Play, is real and is a separate unit: it needs a non-destructive hold with its own decay, which is not what an envelope follower wants fed to it (the follower would then be smoothing an already-smoothed signal).  The capability IS exposed to authors, as the sidechain block in the audio mixer panel; it reaches the device through the runtime.
+jce_audio_create_offline  # An engine the shared output device does NOT pump -- inaudible by construction, driven only by jce_audio_render_offline.  Its consumers are headless/dedicated-server builds, offline bounce, and tests/middleware/audio/test_jce_audio_bus_meter.c, which needed a graph no device was also pumping in order to measure a bus without skipping for want of sound hardware.  An editor caller would be creating a second audio engine that by definition nobody can hear, inside an application whose entire audio surface is about what the author DOES hear.  The editor's engines are the Play runtime's (jce_editor_play.cpp) and the asset previewer's (jce_fv_audio.cpp), and both are audible on purpose.
+jce_audio_render_offline  # The caller-driven pump for the engine above, and it REFUSES any engine from jce_audio_create() -- two pumps on one node graph race for the same read cursors, so the guard is in the code rather than in a comment.  Both editor engines are device-pumped, so an editor call site here would be a call that provably returns false and logs a warning: not a capability withheld, a misuse the API already rejects.  Its consumers are the same three as jce_audio_create_offline, which is the symbol it is useless without; if that line ever goes, this one goes with it.
+jce_audio_duck_pump  # The head of sidechain ducking: advance every installed sidechain from the LIVE key-bus meter.  Its product consumer is rt_apply_mixer (jce_rt_audio.c), once per frame, and it exists as a named function precisely so that the join between the device meter and the pure follower is written once -- the runtime had it inline and the unit test had a second copy calling itself a model, an arrangement in which a defect in the join is invisible because the copy can be correct while the runtime's is not.  The editor does not call it for the same reason it does not call jce_audio_bus_get_peak, which this function consumes: that meter is READ-AND-CLEAR and the runtime is already sampling it every frame, so an editor caller would be a second pump competing for the same measurement -- and here it would also advance the envelope a second time per frame, which changes the attack and release times the author set.  The capability IS exposed to authors, as the sidechain block in the audio mixer panel.
+jce_audio_play_priority  # The authored priority reaching ALLOCATION, which is the only moment it can matter: the 64-slot pool is consulted when the voice is created, so a source played at 0 and promoted a moment later can already have been refused -- or have stolen something more important -- before the setter runs. Its product consumer is rt_finish_audio_source (jce_rt_audio.c), which passes JceAudioSourceComponent.priority straight through. The capability IS exposed to authors, as the Priority field on the AudioSource inspector; it reaches the device through the runtime. The editor's own audition button goes through jce_runtime_audio_play for exactly that reason -- what the author hears is what the shipped game does.
+jce_audio_voice_set_priority  # Re-prioritises a voice that is ALREADY playing, which the editor has no occasion to do: the inspector edits JceAudioSourceComponent.priority, a scene field, and the runtime applies it at spawn. A panel calling this would be writing to the live voice behind the component's back, so the value an author sees saved and the value actually in effect would differ with nothing reporting it -- the same split the attenuation block avoids by editing the component and letting rt_finish_audio_source apply it. Its consumers are gameplay code and the runtime.
+jce_audio_voice_get_priority  # The read half of the setter above and useless without it; if that line ever goes, this one goes with it. It answers 'how important is this voice', not 'does this voice exist' -- a stale handle and a live normal-priority voice both read 0 -- so it is a poor basis for a panel to display anything, and the authored number the inspector already shows is the one an author can act on. Its product consumer is the voice-priority unit test, which uses it to observe WHICH voice the allocator stole.
+jce_softbody_add_static_sphere  # A zero-mass STATIC proxy in the secondary btSoftRigidDynamicsWorld, so a soft body can rest on a sphere collider. Its product consumer is rt_softbody_mirror_static (jce_rt_physics.c), which walks the scene when the first soft body spawns and mirrors every enabled primitive collider on a non-dynamic entity. The capability IS exposed to authors, as the SphereCollider inspector; it reaches the soft world through the runtime. An editor caller would be creating a proxy with no scene entity behind it, which nothing would clear on scene unload -- jce_softbody_clear_statics is driven by the runtime's lifetime, not the panel's.
+jce_softbody_add_static_capsule  # The capsule half of the symbol above and useless without it; if that line ever goes, this one goes with it. Same consumer, same inspector story (CapsuleCollider). It takes the TOTAL height to match JceCapsuleColliderComponent and converts to Bullet's cylinder section internally, which is exactly the kind of unit conversion a second call site would get wrong -- one more reason the runtime is the only caller.
+jce_audio_voice_set_spatial_blend  # Scales how far DISTANCE ATTENUATION may pull a live voice down, which is a per-voice device-side setting; the editor edits JceAudioSourceComponent.spatial_blend, the scene field, and rt_finish_audio_source applies it at spawn. The capability IS exposed to authors, as the Spatial Blend slider on the AudioSource inspector (jce_panel_inspector_audio.cpp:19) whose gizmo radius the viewport already draws. A panel calling this would write to the live voice behind the component's back, so the value an author sees saved and the value in effect would differ with nothing reporting it -- the same split the attenuation block avoids by editing the component and letting the runtime apply it.
+jce_audio_bus_set_send  # Device-side aux send: a second output edge on the bus's splitter carrying a scaled copy into another bus. Its product consumer is rt_init_mixer (jce_rt_audio.c), which walks jce_audio_mixer_send_count/_send_at for every mirrored bus at Play start and passes jce_audio_mixer_resolve_send's value -- so the send obeys the same mute and solo the direct path does. The capability IS exposed to authors, as the per-bus send rows in the audio mixer panel (jce_panel_audio_mixer.cpp:180, :754, :773), which is where the amount is edited and from where audio_mixer.json is written; it reaches the device through the runtime. An editor caller would be routing the LIVE graph behind the authored config's back, so what an author saved and what is sounding would differ with nothing reporting it.
+jce_audio_bus_get_send  # The read half of the setter above and useless without it; if that line ever goes, this one goes with it. It reports the DEVICE's current send, which during Play is the resolved value (source volume folded in, 0 when muted) rather than the authored amount -- so a panel displaying it would show a number that disagrees with the slider the author is holding. The authored value is the mixer's, via jce_audio_mixer_get_send, and that is what the panel already reads. Its product consumer is the device test, which uses it to prove the send survives a later insert chain.
+jce_audio_load_streaming  # Keeps a clip's ENCODED bytes resident and decodes per voice on demand, instead of one up-front decode into s16. Its product consumer is rt_spawn_audio_source (jce_rt_audio.c), which calls it when the authored JceAudioSourceComponent.load_type says STREAMING. The capability IS exposed to authors, as the Load Type combo on the AudioSource inspector; it reaches the device through the runtime. An editor caller would be choosing residency for a clip behind the component's back, so what an author saved and what is resident would differ with nothing reporting it -- and the editor's own audition goes through jce_runtime_audio_play precisely so what it hears is what the shipped game does.
+jce_console_cmd_count  # The command half of the registry's enumeration, added as the companion to jce_cvar_count()/jce_cvar_at() so that a completion key cannot know half the namespace -- before it, commands could be registered and dispatched but never listed, and the built-in `help`/`list` were an if-branch inside jce_console_exec rather than table entries, so they worked without existing.  Its product consumer is JceConsoleSession (engine/src/os/core/jce_console_session.c), which walks cvars and commands together for Tab completion, and the editor's console panel reaches it THROUGH that session -- the panel's Tab key lists matches from jce_console_session_match_at, which is the accessor one layer up and is consumed.  A direct editor caller would be a second implementation of `help`, which now walks this same table; duplicating it in the panel is the defect this commit removed from that file, not one to reintroduce.
+jce_console_cmd_at  # The accessor half of the pair above, exempt for the same reason and listed separately so that removing one does not silently carry the other.  It is also the only way to read a command's help text, which the engine's `help` command uses when it prints the table -- so its output IS visible in the editor console, routed through the sink the panel installs.  The capability is exposed to the author as `help` and as the Tab key, not as a C call the panel makes.
+
+# ---------------------------------------------------------------------------
+# The developer console a GAME opens (debug.console.cvars-at-runtime).
+#
+# The editor is not the consumer here and should not become one: it already
+# has a console, jce_panel_console.cpp, which is an ImGui panel driven by
+# ImGui text input and which consumes jce_console_session directly.  These two
+# objects exist for the OTHER surface -- a shipped game, where input arrives
+# as JceInput and the document is RML.  Wiring the editor to them would mean
+# two consoles in one process racing for jce_console_set_output's single
+# global sink.
+#
+# The consumer that DOES exist is the engine's own default main, which creates
+# a shell under --dev (jce_default_main.inc.h) -- that is a product caller, it
+# is just not the editor.
+jce_console_shell_create          # game-side console; the editor uses jce_panel_console.cpp + jce_console_session
+jce_console_shell_destroy         # ditto
+jce_console_shell_show            # ditto
+jce_console_shell_hide            # ditto
+jce_console_shell_is_visible      # ditto
+jce_console_shell_handle_input    # takes a JceInput; the editor's console is driven by ImGui, not by JceInput
+jce_console_shell_line            # read by a surface that draws the shell; the editor draws its own panel
+jce_console_shell_print           # ditto
+jce_console_shell_scrollback_count # ditto
+jce_console_shell_scrollback_at   # ditto
+jce_console_overlay_create        # RML overlay for a shipped game; the editor's console is ImGui
+jce_console_overlay_destroy       # ditto
+jce_console_overlay_update        # ditto
+jce_console_overlay_has_document  # ditto
+
+# The insert-effect PLUGIN SURFACE (audio.dsp.insert-effect-chain).
+#
+# These three exist so a PROJECT can add an effect the engine does not ship --
+# that is the axis the parity row names ("Unity's is a plugin surface; this is
+# a closed set").  The editor is not the registrant and cannot be: it would
+# have to link the project's DSP code, which is the game's, not the tool's.
+# The editor DOES consume the rest of the surface -- jce_audio_effect_to_json,
+# jce_audio_effect_from_json and jce_audio_dsp_effect_name are all called by
+# jce_panel_audio_mixer.cpp -- so what is exempt here is exactly the part that
+# belongs to somebody else's code.
+jce_audio_dsp_register_effect       # a PROJECT registers its own effect; the editor cannot link the game's DSP
+jce_audio_dsp_find_effect           # name -> id for a project-registered effect; the engine's mixer parser uses it
+jce_audio_dsp_effect_type_from_name # ditto, and the engine's own audio_mixer.json parser is its caller
+
+# File media viewers use the streaming facade. Low-level source/codec entry
+# points remain available to SDK consumers implementing their own transport.
+jce_read_source_create # callback transport supplied by SDK clients; editor uses jce_video_load_file
+jce_read_source_open_file # host source retained internally by file media facade
+jce_read_source_open_memory # legacy memory transport retained internally by codec wrappers
+jce_read_source_acquire # source reference lifetime managed inside streaming wrappers
+jce_read_source_close # source reference lifetime managed inside streaming wrappers
+jce_read_source_size # internal demuxers query the shared source size
+jce_read_source_read_at # internal demuxers use bounded random-access reads
+jce_read_source_get_stats # SDK diagnostics and streaming regression probes
+jce_webm_open_source # low-level demux source; editor uses jce_video_load_file
+jce_video_load_source # callback transport entry for SDK clients; editor has a host file path
+jce_mp4_parser_open_source # low-level demux source; editor uses jce_video_load_file
+jce_mp4_parser_video_sample_sync # internal seek index consumes MP4 sync flags
+jce_av1_open_source # low-level IVF decoder source; editor uses jce_video_load_file
+jce_video_load_memory # retained memory-input compatibility API; viewer now streams files
+jce_audio_get_duration # resident JceSound API; file viewer now uses jce_audio_file_format
+jce_audio_get_pcm_data # resident PCM access; streaming viewer uses bounded waveform peaks
+jce_audio_get_time # resident JceSound transport; file viewer uses streaming file time
+jce_audio_is_playing # resident JceSound transport; file viewer owns its stream voice state
+jce_audio_play # resident JceSound playback; file viewer uses jce_audio_play_stream
+jce_audio_seek # resident JceSound seek; file viewer seeks its file stream and flushes voice
+jce_audio_unload # resident JceSound lifetime; streaming viewer closes JceAudioFile/JceVideo and its stream voice

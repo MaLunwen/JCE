@@ -84,6 +84,7 @@ static uint32_t avcc_to_annexb(const uint8_t *src, uint32_t src_bytes,
 /* ── Decoder struct ───────────────────────────────────────────────── */
 
 struct JceH264Decoder {
+    bool draining;
     ISVCDecoder *svc;
 
     uint8_t  *annexb_buf;     /* reusable conversion buffer */
@@ -108,6 +109,7 @@ struct JceH264Decoder {
     uint32_t  pending_w;
     uint32_t  pending_h;
     bool      has_pending;
+    uint64_t  input_timestamp, output_timestamp, pending_timestamp;
 };
 
 /* Parse avcC blob, extract SPS/PPS NAL units as Annex B.
@@ -300,6 +302,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
 
     /* Step 1: Feed bitstream into decoder pipeline. */
     memset(&buf_info, 0, sizeof(buf_info));
+    buf_info.uiInBsTimeStamp = dec->input_timestamp;
     ds = (*dec->svc)->DecodeFrame2(dec->svc,
                                     dec->annexb_buf,
                                     (int)annexb_len,
@@ -333,6 +336,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                                yuv[1], buf_info.UsrData.sSystemBuffer.iStride[1],
                                yuv[2], buf_info.UsrData.sSystemBuffer.iStride[1],
                                dec->rgba_buf, fw, fh);
+            dec->output_timestamp = buf_info.uiOutYuvTimeStamp;
             dec->last_w = fw;
             dec->last_h = fh;
             have_frame = true;
@@ -365,6 +369,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                             drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
                             drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
                             dec->pending_rgba, dw, dh);
+                        dec->pending_timestamp = drain_info.uiOutYuvTimeStamp;
                         dec->pending_w = dw;
                         dec->pending_h = dh;
                         dec->has_pending = true;
@@ -383,6 +388,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                         drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
                         drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
                         dec->rgba_buf, dw, dh);
+                    dec->output_timestamp = drain_info.uiOutYuvTimeStamp;
                     dec->last_w = dw;
                     dec->last_h = dh;
                     have_frame = true;
@@ -413,10 +419,59 @@ bool jce_h264_decoder_drain_pending(JceH264Decoder *dec,
     if (!dec || !dec->has_pending) return false;
 
     dec->has_pending = false;
+    dec->output_timestamp = dec->pending_timestamp;
     if (out_rgba)   *out_rgba   = dec->pending_rgba;
     if (out_width)  *out_width  = dec->pending_w;
     if (out_height) *out_height = dec->pending_h;
     return true;
+}
+
+bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
+                             uint32_t *out_width, uint32_t *out_height)
+{
+    SBufferInfo info;
+    uint8_t *yuv[3] = {0};
+    uint32_t w, h, need;
+    if (!dec || !dec->svc) return false;
+    if (!dec->draining) {
+        int ended = 1;
+        if ((*dec->svc)->SetOption(dec->svc, DECODER_OPTION_END_OF_STREAM, &ended) != cmResultSuccess)
+            return false;
+        dec->draining = true;
+    }
+    memset(&info, 0, sizeof(info));
+    (*dec->svc)->FlushFrame(dec->svc, yuv, &info);
+    if (info.iBufferStatus != 1 || !yuv[0] || !yuv[1] || !yuv[2]) return false;
+    w = (uint32_t)info.UsrData.sSystemBuffer.iWidth;
+    h = (uint32_t)info.UsrData.sSystemBuffer.iHeight;
+    if (!w || !h || w > 4096u || h > 4096u) return false;
+    need = w * h * 4u;
+    if (need > dec->rgba_cap) {
+        uint8_t *pixels = JCE_REALLOC(dec->rgba_buf, need);
+        if (!pixels) return false;
+        dec->rgba_buf = pixels;
+        dec->rgba_cap = need;
+    }
+    jce_yuv420_to_rgba(yuv[0], info.UsrData.sSystemBuffer.iStride[0],
+        yuv[1], info.UsrData.sSystemBuffer.iStride[1], yuv[2],
+        info.UsrData.sSystemBuffer.iStride[1], dec->rgba_buf, w, h);
+    dec->last_w = w;
+    dec->last_h = h;
+    dec->output_timestamp = info.uiOutYuvTimeStamp;
+    if (out_rgba) *out_rgba = dec->rgba_buf;
+    if (out_width) *out_width = w;
+    if (out_height) *out_height = h;
+    return true;
+}
+
+void jce_h264_decoder_set_timestamp(JceH264Decoder *dec, uint64_t timestamp)
+{
+    if (dec) dec->input_timestamp = timestamp;
+}
+
+uint64_t jce_h264_decoder_frame_timestamp(const JceH264Decoder *dec)
+{
+    return dec ? dec->output_timestamp : 0u;
 }
 
 void jce_h264_decoder_flush(JceH264Decoder *dec)
@@ -424,6 +479,7 @@ void jce_h264_decoder_flush(JceH264Decoder *dec)
     if (!dec || !dec->svc) return;
 
     dec->has_pending = false;
+    dec->draining = false;
 
     /* Uninit and re-init to flush all internal state. */
     (*dec->svc)->Uninitialize(dec->svc);
@@ -493,6 +549,14 @@ bool jce_h264_decoder_drain_pending(JceH264Decoder *dec,
     if (out_height) *out_height = 0u;
     return false;
 }
+
+bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
+                             uint32_t *out_width, uint32_t *out_height)
+{ (void)dec; (void)out_rgba; (void)out_width; (void)out_height; return false; }
+void jce_h264_decoder_set_timestamp(JceH264Decoder *dec, uint64_t timestamp)
+{ (void)dec; (void)timestamp; }
+uint64_t jce_h264_decoder_frame_timestamp(const JceH264Decoder *dec)
+{ (void)dec; return 0u; }
 
 void jce_h264_decoder_flush(JceH264Decoder *dec) { (void)dec; }
 void jce_h264_decoder_close(JceH264Decoder *dec) { (void)dec; }

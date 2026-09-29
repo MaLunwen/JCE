@@ -27,10 +27,17 @@ JCE_EXTERN_C_BEGIN
 typedef struct JcePhysicsWorld JcePhysicsWorld;
 
 typedef struct {
-    jce_vec3 gravity;          /* default: (0, -9.81, 0) */
-    uint32_t max_bodies;       /* default: 4096 */
-    float    fixed_timestep;   /* default: 1/60 */
-    int32_t  max_sub_steps;    /* default: 4 */
+    /* NO zero-fallback, unlike the three below: zero gravity is a legitimate
+     * request (an orbital or underwater scene asks for exactly that), so
+     * jce_physics_create() cannot tell "unset" from "none" and does not try.
+     * A zero-initialised desc therefore yields a world with NO gravity --
+     * set this explicitly.  Earth-like is (0, -9.81, 0). */
+    jce_vec3 gravity;
+    /* These three ARE zero-fallbacked in jce_physics_create(), because zero
+     * is meaningless for each of them. */
+    uint32_t max_bodies;       /* 0 -> 4096 */
+    float    fixed_timestep;   /* <= 0 -> 1/60 */
+    int32_t  max_sub_steps;    /* <= 0 -> 4 */
 
     /* Solver / sleeping tunables.  All optional — a zero / negative value
        leaves Bullet's stock default in place, reproducing prior behavior. */
@@ -66,6 +73,17 @@ JCE_API void jce_physics_step(JcePhysicsWorld *world, float dt);
 /* Rigid bodies                                                        */
 /* ================================================================== */
 
+/* Which local axis a JCE_SHAPE_CAPSULE runs along.  Bullet has three capsule
+ * classes (btCapsuleShapeX / btCapsuleShape / btCapsuleShapeZ); only the Y
+ * one was ever reachable, so JceCapsuleColliderComponent.axis -- authored,
+ * serialised, in the Inspector -- could not be honoured. */
+typedef enum {
+    JCE_CAPSULE_AXIS_DEFAULT = 0,  /* = Y; what a zeroed desc has always meant */
+    JCE_CAPSULE_AXIS_X       = 1,
+    JCE_CAPSULE_AXIS_Y       = 2,
+    JCE_CAPSULE_AXIS_Z       = 3,
+} JceCapsuleAxis;
+
 typedef struct {
     JceBodyType  type;         /* static / dynamic / kinematic */
     JceShapeType shape;        /* box / sphere / capsule / plane */
@@ -81,6 +99,12 @@ typedef struct {
     uint32_t     collision_group; /* default: JCE_COLLISION_DEFAULT_GROUP */
     uint32_t     collision_mask;  /* default: JCE_COLLISION_ALL_MASK */
     bool         is_trigger;      /* trigger bodies: no contact response */
+    /* Capsule axis.  ZERO MEANS Y, not X: this struct is zero-initialised
+     * everywhere and every capsule built before this field existed was
+     * Y-aligned, so spending 0 on X would silently re-orient every one of
+     * them.  That is why the enum starts at "default" instead of at an axis.
+     * APPENDED, never inserted -- the ABI snapshot enforces ORDERED-PREFIX. */
+    uint8_t      capsule_axis;    /* JceCapsuleAxis */
 } JceBodyDesc;
 
 JCE_API JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceBodyDesc *desc);
@@ -116,6 +140,9 @@ typedef struct {
     uint32_t        vertex_count;
     const uint32_t *indices;
     uint32_t        index_count;
+    /* Capsule axis for a JCE_SHAPE_CAPSULE child; 0 = Y, as everywhere else.
+     * APPENDED, never inserted. */
+    uint8_t         capsule_axis;   /* JceCapsuleAxis */
 } JceColliderChild;
 
 typedef struct {
@@ -485,6 +512,29 @@ typedef struct {
     float             lower_limit;
     float             upper_limit;
     bool              disable_collision; /* disable collision between A and B */
+
+    /* MOTOR -- HINGE and SLIDER only.  Unity's HingeJoint.motor, Godot's
+     * HingeJoint3D motor/target_velocity, Unreal's drive in velocity mode.
+     * A point-to-point or generic-6DOF constraint has no single driven axis,
+     * so these are ignored there; the configurable joint drives per axis
+     * (JceConfigurableJointDesc below).
+     *
+     * APPENDED.  Zero is "no motor", which is exactly what every caller's
+     * memset already produces, so a desc written before this existed keeps
+     * behaving as it did.
+     *
+     * UNITS ARE THE AUTHOR'S, NOT BULLET'S:
+     *     hinge    target_velocity rad/s   max_force N*m (a torque)
+     *     slider   target_velocity m/s     max_force N
+     * Bullet is NOT consistent underneath -- btHingeConstraint takes a
+     * maximum IMPULSE, btSliderConstraint takes a force the solver divides by
+     * the step rate itself, and so does a 6DOF limit motor.  The conversion
+     * lives in ONE place (jce_physics_bullet.cpp) because getting it wrong
+     * yields a motor that runs at 1/60th of the requested strength and says
+     * nothing about it. */
+    bool              use_motor;
+    float             motor_target_velocity;
+    float             motor_max_force;
 } JceConstraintDesc;
 
 JCE_API JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
@@ -494,6 +544,24 @@ JCE_API void JCE_CALL jce_physics_constraint_destroy(JcePhysicsWorld *world,
 JCE_API void JCE_CALL jce_physics_constraint_set_limits(JcePhysicsWorld *world,
                                                         JceConstraintHandle con,
                                                         float lower, float upper);
+
+/* Drive a HINGE or SLIDER at a target velocity, or stop driving it.
+ *
+ * THE RUNTIME HALF, and the reason the desc fields alone are not enough: a
+ * door that opens is a motor whose target velocity changes while the game
+ * runs.  Authoring-time-only motors give a door that is either always opening
+ * or never opening, which is not the feature.
+ *
+ * Units as JceConstraintDesc documents them -- rad/s and N*m for a hinge,
+ * m/s and N for a slider.  `enabled` false leaves the joint free to move
+ * under other forces; it does not lock it.  A handle that is not a hinge or a
+ * slider is a no-op, not an error: the caller is usually a component drawer
+ * or a script that does not know the joint's type. */
+JCE_API void JCE_CALL jce_physics_constraint_set_motor(JcePhysicsWorld *world,
+                                                       JceConstraintHandle con,
+                                                       bool enabled,
+                                                       float target_velocity,
+                                                       float max_force);
 
 /* ── Configurable joint (Unity-style per-axis 6DOF + break) ────────────
  *
@@ -507,6 +575,25 @@ JCE_API void JCE_CALL jce_physics_constraint_set_limits(JcePhysicsWorld *world,
  * registry as jce_physics_constraint_create, so the returned handle is
  * destroyed via jce_physics_constraint_destroy and queried via
  * jce_physics_constraint_applied_impulse. */
+/* How one axis of a configurable joint is driven.
+ *
+ * TWO MODES AND NOT THREE.  Unity's drive is one struct carrying
+ * positionSpring, positionDamper, maximumForce, targetPosition AND
+ * targetVelocity at once, and which of them acts depends on which are
+ * non-zero -- a shape where an author cannot tell a misconfigured drive from
+ * a disabled one.  Naming the mode makes "this axis is driven to a POSITION"
+ * and "this axis is driven at a VELOCITY" two different authored states, and
+ * an unset drive one more.
+ *
+ * VELOCITY is a 6DOF limit motor; SPRING is a Bullet spring with an
+ * equilibrium point.  They are separate mechanisms, not two settings of one,
+ * which is the other reason to make the author pick. */
+typedef enum {
+    JCE_JOINT_DRIVE_OFF      = 0,
+    JCE_JOINT_DRIVE_VELOCITY = 1,
+    JCE_JOINT_DRIVE_SPRING   = 2
+} JceJointDriveMode;
+
 typedef struct {
     JceBodyHandle body_a;
     JceBodyHandle body_b;          /* JCE_BODY_INVALID = world anchor */
@@ -517,7 +604,27 @@ typedef struct {
     float         linear_limit;        /* symmetric ±metres on limited linear axes */
     float         angular_limit_deg[3];/* symmetric ±deg per limited angular axis */
     bool          disable_collision;   /* disable collision between A and B */
+
+    /* PER-AXIS DRIVE -- Unity's xDrive / yDrive / zDrive / angularXDrive.
+     * Index 0..2 are linear X,Y,Z and 3..5 angular X,Y,Z, the same order the
+     * motion arrays above use and the same order Bullet's 6DOF numbers its
+     * axes, so a reader never has to hold two orderings at once.
+     *
+     * APPENDED; a zeroed desc is JCE_JOINT_DRIVE_OFF on every axis.
+     *
+     * A drive only acts on an axis the motion arrays leave FREE or LIMITED.
+     * Driving a LOCKED axis is not an error and does nothing -- the lock wins,
+     * which is what Unity does and the only reading under which
+     * "locked" means locked. */
+    int           drive_mode[6];       /* JceJointDriveMode */
+    float         drive_target[6];     /* VELOCITY: m/s or rad/s.
+                                        * SPRING: metres or radians, the
+                                        * equilibrium the spring pulls to. */
+    float         drive_spring[6];     /* SPRING stiffness (N/m or N*m/rad) */
+    float         drive_damper[6];     /* SPRING damping */
+    float         drive_max_force[6];  /* VELOCITY: N or N*m the motor may use */
 } JceConfigurableJointDesc;
+
 
 JCE_API JceConstraintHandle JCE_CALL jce_physics_configurable_joint_create(
         JcePhysicsWorld *world, const JceConfigurableJointDesc *desc);
@@ -526,6 +633,23 @@ JCE_API JceConstraintHandle JCE_CALL jce_physics_configurable_joint_create(
  * invalid handle.  Used by the runtime break-force monitor: an applied IMPULSE
  * is compared against (break_FORCE * fixed_dt) since impulse = force * dt. */
 JCE_API float JCE_CALL jce_physics_constraint_applied_impulse(
+        const JcePhysicsWorld *world, JceConstraintHandle con);
+
+/* Last-step applied TORQUE magnitude on body A of a live constraint, or 0.
+ *
+ * SEPARATE FROM THE IMPULSE QUERY, and that is the whole point.
+ * jce_physics_constraint_applied_impulse returns one combined magnitude with
+ * no angular component -- which is why break_torque was authored, serialised,
+ * copied into the runtime's tracking entry and then read by nothing.  The
+ * backend's joint feedback carries force and torque apart.
+ *
+ * The comparison the break monitor makes with this value is in ONE place
+ * (rt_cfg_joint_breaks), and the relationship between what the solver reports
+ * and the authored N*m threshold is established by
+ * tests/middleware/physics/test_jce_joint_break_torque.c rather than asserted
+ * here -- a factor-of-dt guess would read as "break_torque still does
+ * nothing". */
+JCE_API float JCE_CALL jce_physics_constraint_applied_torque(
         const JcePhysicsWorld *world, JceConstraintHandle con);
 
 /* ================================================================== */
@@ -545,6 +669,17 @@ typedef struct {
      * scales it while airborne (0..1). */
     float    accel;
     float    air_control;
+    /* Physics layer index (0..31), same 32-slot matrix rigid bodies use.
+     * The broadphase group/mask are resolved from the layer matrix at create
+     * time: group = 1<<layer, mask = that layer's matrix row.  0 = "Default",
+     * which is also what a zeroed desc gets -- matching JceBodyDesc, whose
+     * zeroed collision_group means JCE_COLLISION_DEFAULT_GROUP.
+     *
+     * Before this field existed the capsule was added with Bullet's own
+     * CharacterFilter/StaticFilter|DefaultFilter constants, which alias layer
+     * bits 5 and {0,1}: the character behaved as if pinned to layer 5 and
+     * could only ever touch layers 0 and 1, whatever the matrix said. */
+    uint32_t layer;
 } JceCharacterDesc;
 
 JCE_API JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
@@ -648,6 +783,27 @@ JCE_API void jce_physics_vehicle_set_input(JcePhysicsWorld *world,
                                             JceVehicleHandle veh,
                                             float throttle, float brake,
                                             float steer);
+
+/*
+ * Per-wheel drive TRIM, added on top of the vehicle-level input above.
+ *
+ * WheelCollider.motor_torque / .brake_torque / .steer_angle_deg are Unity's
+ * per-wheel drive controls; here they had no route into the simulation at all,
+ * because the only input this API offered was whole-vehicle.  Bullet has taken
+ * per-wheel arguments the entire time.
+ *
+ * ADDITIVE, so a wheel with the default zero trim behaves exactly as before
+ * and no already-authored vehicle changes.  Brake takes the max of the two
+ * sources rather than their sum.  Call AFTER set_input in the same frame.
+ *
+ * @param wheel  index returned by jce_physics_vehicle_add_wheel().
+ */
+JCE_API void jce_physics_vehicle_add_wheel_input(JcePhysicsWorld *world,
+                                                 JceVehicleHandle veh,
+                                                 uint32_t wheel,
+                                                 float engine_force_n,
+                                                 float brake_force_n,
+                                                 float steer_rad);
 
 /* Chassis transform (centre of mass, world space). */
 JCE_API void jce_physics_vehicle_get_chassis_transform(const JcePhysicsWorld *world,

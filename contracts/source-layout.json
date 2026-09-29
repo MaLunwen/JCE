@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "scratch_roots": [
+    "docs/",
+    ".docs/"
+  ],
+  "private_roots": [
+    "private/"
+  ],
+  "automated_implementations": [
+    "tools/build/",
+    "tools/lint/",
+    "tools/audit/"
+  ],
+  "manual_entrypoints": "scripts/",
+  "consumer_content": "examples/<project>/",
+  "skill_source": "skills/jce/",
+  "contract_role": "stable machine-readable inputs and maintained interface specifications",
+  "protected_original_copies": [
+    "engine/src/renderer/internal/stb_image.h",
+    "scripts/android/gradlew",
+    "scripts/android/gradlew.bat",
+    "scripts/android/gradle/wrapper/gradle-wrapper.jar",
+    "scripts/android/app/src/main/java/org/app/"
+  ],
+  "private_implementation_roots": [
+    "private/",
+    "engine/src/middleware/ai_dispatch/",
+    "tests/middleware/ai_dispatch/",
+    "tools/ai/",
+    "tools/automation/"
+  ]
+}

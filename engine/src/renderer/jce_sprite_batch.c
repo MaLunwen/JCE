@@ -1,7 +1,7 @@
 /*
  * jce_sprite_batch.c  Batched 2D sprite renderer.
  *
- * Collects textured quads, sorts by texture then sort_key,
+ * Collects textured quads, sorts by sort_key then texture,
  * and flushes using transient vertex/index buffers.
  */
 
@@ -10,6 +10,7 @@
 #include <jce/renderer/jce_sprite_batch.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_renderer_internal.h"  /* program_textured */
 
 #include <bgfx/c99/bgfx.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@ typedef struct {
     bgfx_texture_handle_t texture;
     SpriteBatchVertex     verts[4];
     int32_t               sort_key;
+    float                 view_dist2;  /* eye distance, squared */
 } SpriteEntry;
 
 /* ================================================================== */
@@ -42,6 +44,7 @@ typedef struct {
 /* ================================================================== */
 
 struct JceSpriteBatch {
+    float        view_pos[3];   /* eye, for the back-to-front tiebreak */
     SpriteEntry *entries;
     uint32_t     count;
     uint32_t     capacity;
@@ -86,6 +89,15 @@ void jce_sprite_batch_destroy(JceSpriteBatch *batch)
 /* Begin / Add                                                         */
 /* ================================================================== */
 
+void jce_sprite_batch_set_view_pos(JceSpriteBatch *batch,
+                                   float x, float y, float z)
+{
+    if (!batch) return;
+    batch->view_pos[0] = x;
+    batch->view_pos[1] = y;
+    batch->view_pos[2] = z;
+}
+
 void jce_sprite_batch_begin(JceSpriteBatch *batch)
 {
     if (!batch) return;
@@ -103,6 +115,13 @@ void jce_sprite_batch_add(JceSpriteBatch *batch,
     SpriteEntry *e = &batch->entries[batch->count++];
     e->texture  = (bgfx_texture_handle_t){ texture.idx };
     e->sort_key = sort_key;
+    /* Translation column of the world matrix is the sprite's centre. */
+    {
+        float dx = world[12] - batch->view_pos[0];
+        float dy = world[13] - batch->view_pos[1];
+        float dz = world[14] - batch->view_pos[2];
+        e->view_dist2 = dx * dx + dy * dy + dz * dz;
+    }
 
     /* Local quad corners (centered, unit size). */
     static const float local_pos[4][3] = {
@@ -140,10 +159,32 @@ static int sprite_cmp(const void *a, const void *b)
     const SpriteEntry *sa = (const SpriteEntry *)a;
     const SpriteEntry *sb = (const SpriteEntry *)b;
 
-    /* Sort by texture first, then by sort_key. */
+    /* SORT KEY FIRST, TEXTURE SECOND.  It was the other way round, which
+     * made the authored draw order a tiebreak WITHIN one texture: a sprite
+     * with sortingOrder 100 on atlas A drew behind sortingOrder 0 on atlas B
+     * whenever B's handle index was lower, i.e. the paint order was decided
+     * by texture LOAD ORDER instead of by the author.  An explicit painter's
+     * order that only holds inside one atlas is not a painter's order.
+     *
+     * Texture still breaks ties, and that is what keeps batching: sprites
+     * that share a layer and an order are ones the author expressed no
+     * preference between, so grouping them by atlas is free.  Sprites the
+     * author DID order now split the batch -- the same trade Unity makes,
+     * and the reason its docs warn that sorting order costs draw calls.
+     *
+     * Explicit compares, not subtraction: sort_key is a packed (layer,
+     * order) int and differences of packed keys are the classic place a
+     * comparator overflows. */
+    if (sa->sort_key != sb->sort_key)
+        return sa->sort_key < sb->sort_key ? -1 : 1;
+    /* Then FARTHEST FIRST.  The batch does not write depth any more, so
+     * without this two sprites at the same authored key would composite in
+     * whatever order they were submitted. */
+    if (sa->view_dist2 != sb->view_dist2)
+        return sa->view_dist2 > sb->view_dist2 ? -1 : 1;
     if (sa->texture.idx != sb->texture.idx)
-        return (int)sa->texture.idx - (int)sb->texture.idx;
-    return sa->sort_key - sb->sort_key;
+        return sa->texture.idx < sb->texture.idx ? -1 : 1;
+    return 0;
 }
 
 /* ================================================================== */
@@ -172,10 +213,22 @@ void jce_sprite_batch_flush(JceSpriteBatch *batch,
     /* Sort entries for batching. */
     qsort(batch->entries, batch->count, sizeof(SpriteEntry), sprite_cmp);
 
-    /* Get the textured program from the renderer. */
-    JceShaderHandle sh = jce_renderer_get_program_mesh(renderer);
-    bgfx_program_handle_t prog;
-    prog.idx = sh.idx;
+    /* The TEXTURED program, not the mesh one.
+     *
+     * fs_textured.sc is this batch's shader in everything but name: its inputs
+     * are (a_position, a_color0, a_texcoord0) -- the batch's vertex layout to
+     * the letter -- and its body is `texel * v_color0`, i.e. the sprite tint.
+     * The batch was handed program_mesh instead, whose fragment stage takes
+     * (v_normal, v_texcoord0, v_worldpos) and never reads a vertex colour, so
+     * SpriteRenderer.color was packed, uploaded to the GPU and discarded:
+     * tinting a sprite pure green produced a frame identical BYTE FOR BYTE to
+     * tinting it white (26384 red pixels either way).
+     *
+     * The mesh program also made sprites depend on u_lightDir / u_lightColor,
+     * which this batch never sets -- so sprites were shaded by whatever the
+     * previous draw call happened to leave in those uniforms.  That is why a
+     * (220,40,40) texel reached the screen as (104,19,19). */
+    bgfx_program_handle_t prog = jce_renderer_get_program_textured(renderer);
     if (!BGFX_HANDLE_IS_VALID(prog)) return;
 
     /* Emit draw calls per texture batch. */
@@ -221,8 +274,20 @@ void jce_sprite_batch_flush(JceSpriteBatch *batch,
 
         bgfx_set_texture(0, batch->u_texture, cur_tex, UINT32_MAX);
 
+        /* NO WRITE_Z.  It used to be set, and that single bit is why
+         * sortingOrder could not work: alpha-blended quads that write depth
+         * behave like opaque geometry, so the depth buffer decided every
+         * sprite-vs-sprite question and the authored order could only ever
+         * show up as z-fighting between coplanar quads.  It also meant a
+         * sprite's FULLY TRANSPARENT border wrote depth -- fs_mesh.sc has no
+         * alpha discard -- so every sprite punched a rectangular hole in
+         * whatever was drawn behind it afterwards.
+         *
+         * DEPTH_TEST_LESS stays: sprites must still be occluded by the opaque
+         * world.  Only the write is gone.  This is the ordinary transparent-
+         * queue state, and it is what makes the painter's order above real. */
         uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                       | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                       | BGFX_STATE_DEPTH_TEST_LESS
                        | BGFX_STATE_BLEND_ALPHA | BGFX_STATE_MSAA;
         bgfx_set_state(state, 0);
 

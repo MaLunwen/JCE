@@ -1,0 +1,4 @@
+{
+  "_note": "Per-file budgets for insp_track_edit() calls gated by a one-frame ImGui predicate, where the call runs on neither the activation nor the deactivation frame and is therefore a no-op.  This map is EMPTY as of 2026-08-31: every such call was fixed, so the gate is now absolute and any new one fails it.  Do not write a count into prose here -- the machine number is the one the checker prints.  Regenerate with --update-baseline and say in the commit message why a budget came back.",
+  "files": {}
+}

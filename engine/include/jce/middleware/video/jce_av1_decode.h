@@ -13,6 +13,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_read_source.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -35,6 +36,10 @@ JCE_API bool jce_av1_is_ivf(const void *data, size_t size);
 /* Open an in-memory IVF/AV1 stream. The buffer must outlive the decoder. */
 JCE_API JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
                                    JceAv1FrameInfo *out_info);
+
+/* Retains a seekable source, reading one bounded IVF packet at a time. */
+JCE_API JceAv1Decoder *jce_av1_open_source(JceReadSource *source,
+                                         JceAv1FrameInfo *out_info);
 
 /* Decode the next frame. Outputs Y/U/V plane pointers and strides
  * (these point into dav1d-owned memory and are valid until the next call).

@@ -1,0 +1,11 @@
+{
+  "$schema": "jce.rendersettings.v2",
+  "shadowQuality": 2,
+  "shadowMapSize": 4096,
+  "shadowCascades": 4,
+  "shadowDistance": 300,
+  "lodBias": 0,
+  "vsync": 1,
+  "msaa": 2,
+  "grassEnabled": 1
+}

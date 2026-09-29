@@ -2,6 +2,7 @@ $input a_position, a_indices, a_weight, i_data0, i_data1, i_data2, i_data3, i_da
 $output v_texcoord0
 
 #include <bgfx_shader.sh>
+#include "shadow_pancake.sh"
 
 /* Instanced SKINNED shadow vertex shader — GPU crowd instancing, depth-only.
  *
@@ -82,6 +83,10 @@ void main()
             + a_weight.z * mul(b2, lp).xyz + a_weight.w * mul(b3, lp).xyz;
 
     vec3 wpos   = mul(world, vec4(sp, 1.0)).xyz;
-    gl_Position = mul(u_viewProj, vec4(wpos, 1.0));
+    /* Clamped to the near plane, not rejected by it -- see
+     * shadow_pancake.sh.  A caster further up-sun than the cascade
+     * box reaches would otherwise be clipped away entirely and the
+     * shadow it owes would be missing. */
+    gl_Position = jce_shadow_pancake(mul(u_viewProj, vec4(wpos, 1.0)));
     v_texcoord0 = vec2(0.0, 0.0);
 }

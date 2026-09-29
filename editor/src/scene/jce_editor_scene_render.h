@@ -75,6 +75,31 @@ bool jce_editor_scene_pick_poll(uint32_t *out_entity_id);
  * fills out_ids with up to max_ids UNIQUE entity ids + *out_count when ready. */
 bool jce_editor_scene_pick_request_rect(uint32_t x0, uint32_t y0,
                                         uint32_t x1, uint32_t y1);
+/* ── ECS-UI picking in the Scene View ────────────────────────────
+ *
+ * jce_editor_scene_pick_* above is a GPU object-ID render over MESHES, so a
+ * UIImage -- which has no mesh -- was unselectable in the viewport entirely:
+ * the whole ECS-UI tree could only be reached through the Hierarchy.
+ *
+ * These forward to the Scene View's own canvas, which resolves the top-most UI
+ * entity under a point every frame by the rules that actually govern UI
+ * hit-testing (raycast_target, the inherited blocksRaycasts chain, canvas-group
+ * alpha, ScrollView clipping, an open popup's modality).  Synchronous: the
+ * answer is about the frame just rendered, so a click can act on it in the same
+ * ImGui callback -- unlike the deferred id read-back.
+ *
+ * Coordinates are PANEL-LOCAL px; the conversion into canvas space uses the
+ * canvas's own last render size, so there is no second copy of it here. */
+uint32_t jce_editor_scene_ui_pick(float local_x, float local_y,
+                                  float avail_w, float avail_h);
+
+/* Where `id` actually DREW last frame, in panel-local px as {x, y, w, h}.
+ * false when it drew nothing.  A UI rect comes from anchors against its
+ * parent and never consults the Transform, so a selection outline placed at
+ * the Transform position lands somewhere unrelated to the element. */
+bool jce_editor_scene_ui_entity_rect(uint32_t id, float avail_w, float avail_h,
+                                     float out_rect4[4]);
+
 bool jce_editor_scene_pick_poll_rect(uint32_t *out_ids, uint32_t max_ids,
                                      uint32_t *out_count);
 

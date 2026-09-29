@@ -50,6 +50,45 @@ void draw_comp_transform(uint32_t entity_id, JceTransform *t)
         end_transform_write_if_needed(opened);
     }
 
+    /* WORLD POSITION -- shown only for a PARENTED entity, because that is the
+     * only case where it differs from the row above and the only case where
+     * the row above is misleading on its own.  A trigger volume parented to a
+     * door at x=4 and authored at local x=0 reads "0, 0, 0" here, and the
+     * author has no way to tell that from an object genuinely at the origin.
+     *
+     * EDITABLE, not a readout.  UE shows both and lets you type into either;
+     * "put it where the door is" was not expressible in this editor at all,
+     * and a number you can only look at does not make it so.  The rotation is
+     * carried through unchanged so typing a position cannot turn the object.
+     *
+     * A root entity deliberately shows nothing: the row above IS its world
+     * position, and a second identical row would teach an author that the two
+     * are different things when they are not. */
+    JceScene *wscene = jce_state_get_scene();
+    const JceEntity we = jce_state_to_ecs_entity(entity_id);
+    if (wscene && jce_scene_get_parent(wscene, we) != JCE_ENTITY_INVALID) {
+        jce_vec3 wp;
+        jce_quat wr;
+        if (jce_scene_get_world_pose(wscene, we, &wp, &wr, nullptr)) {
+            float wpos[3] = {wp.x, wp.y, wp.z};
+            const float wpos_in[3] = {wpos[0], wpos[1], wpos[2]};
+            ImGui::Text("%s", jce_editor_i18n("transform.worldPosition"));
+            ImGui::SameLine(80);
+            draw_vec3_control("WorldPosition", wpos);
+            if (vec3_changed(wpos, wpos_in)) {
+                bool opened = false;
+                begin_transform_write_if_needed(&opened);
+                /* Solves the local TRS under whatever parent this entity has;
+                 * the same call the physics write-back uses, so the Inspector
+                 * and the simulation cannot disagree about what world means. */
+                jce_scene_set_world_pose(wscene, we,
+                                         jce_v3(wpos[0], wpos[1], wpos[2]), wr);
+                invalidate_scene_world_cache();
+                end_transform_write_if_needed(opened);
+            }
+        }
+    }
+
     ImGui::Text("%s", jce_editor_i18n("transform.rotation"));
     ImGui::SameLine(80);
     float rot_in[3] = {rot[0], rot[1], rot[2]};

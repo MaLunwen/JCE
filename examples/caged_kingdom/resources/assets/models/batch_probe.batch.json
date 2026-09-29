@@ -1,0 +1,121 @@
+{
+ "contract": {
+  "name": "jce.staticbatch",
+  "major": 1,
+  "minor": 0
+ },
+ "members": [
+  {
+   "firstIndex": 0,
+   "indexCount": 6,
+   "aabbMin": [
+    -22.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    -20.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 6,
+   "indexCount": 6,
+   "aabbMin": [
+    -16.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    -14.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 12,
+   "indexCount": 6,
+   "aabbMin": [
+    -10.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    -8.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 18,
+   "indexCount": 6,
+   "aabbMin": [
+    -4.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    -2.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 24,
+   "indexCount": 6,
+   "aabbMin": [
+    2.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    4.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 30,
+   "indexCount": 6,
+   "aabbMin": [
+    8.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    10.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 36,
+   "indexCount": 6,
+   "aabbMin": [
+    14.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    16.0,
+    3.0,
+    0.0
+   ]
+  },
+  {
+   "firstIndex": 42,
+   "indexCount": 6,
+   "aabbMin": [
+    20.0,
+    0.0,
+    0.0
+   ],
+   "aabbMax": [
+    22.0,
+    3.0,
+    0.0
+   ]
+  }
+ ]
+}

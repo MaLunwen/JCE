@@ -28,6 +28,7 @@
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -105,6 +106,32 @@ JCE_API void jce_gpu_particles_render_ex(JceGpuParticleSystem *sys,
                                          uint16_t render_view_id,
                                          uint16_t texture_idx,
                                          bool     blend_alpha);
+
+/* Soft-particle depth fade for one draw (Unity's softParticlesEnabled).
+ * All of it comes from the frame's camera depth pre-pass; a caller with no
+ * depth this frame passes NULL, or fade_distance <= 0, and the shader's soft
+ * block is skipped entirely -- the depth sampler is then never read, which is
+ * why an unbound stage 1 is safe. */
+typedef struct JceGpuParticleSoft {
+    /* JCE_INVALID_TEXTURE = no depth this frame -> no fade.  A struct handle
+     * rather than a bare uint16_t index, which the public-ABI ratchet
+     * requires of new API and which is the point: equally bgfx-free, but a
+     * texture and a view id stop being the same type. */
+    JceTextureHandle depth_texture;
+    float    fade_distance;     /* world units; <= 0 = off      */
+    float    inv_viewport_w;    /* 1/width  -- gl_FragCoord to UV */
+    float    inv_viewport_h;    /* 1/height                       */
+    float    near_z;            /* camera near, to linearise depth */
+    float    far_z;             /* camera far                      */
+} JceGpuParticleSoft;
+
+/* As _render_ex, plus the soft-particle fade.  `soft` may be NULL, which is
+ * exactly what _render_ex passes. */
+JCE_API void jce_gpu_particles_render_soft(JceGpuParticleSystem *sys,
+                                           uint16_t render_view_id,
+                                           JceTextureHandle texture,
+                                           bool     blend_alpha,
+                                           const JceGpuParticleSoft *soft);
 
 /* Pool capacity (rounded). */
 JCE_API uint32_t jce_gpu_particles_capacity(const JceGpuParticleSystem *sys);

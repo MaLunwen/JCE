@@ -460,6 +460,11 @@ class ScriptVM:
     def call_update(self, inst_id: int, dt: float) -> None:
         self._dispatch(inst_id, "on_update", (dt,), "on_update")
 
+    def call_fixed_update(self, inst_id: int, dt: float) -> None:
+        # Its own disable slot, not on_update's: a handler that throws every
+        # physics step must not take the render-frame callback down with it.
+        self._dispatch(inst_id, "on_fixed_update", (dt,), "on_fixed_update")
+
     def call_collision(self, inst_id: int, other: int) -> None:
         self._dispatch(inst_id, "on_collision", (other,), "on_collision")
 

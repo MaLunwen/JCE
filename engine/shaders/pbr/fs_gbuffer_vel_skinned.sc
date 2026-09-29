@@ -11,7 +11,8 @@ $input v_normal, v_curClip, v_prevClip
  * Same encoding as fs_gbuffer_vel.sc / fs_motion_vec.sc.  Zero motion ->
  * (0.5,0.5), matching the shared MRT clear.
  */
-uniform vec4 u_gbufferMat;   /* x = roughness */
+uniform vec4 u_gbufferMat;
+uniform vec4 u_gbufferAlbedo;/* rgb = base colour */   /* x = roughness */
 
 void main()
 {
@@ -22,5 +23,8 @@ void main()
 	vec2 delta = (cur_ndc - prev_ndc);
 
 	gl_FragData[0] = vec4(n * 0.5 + 0.5, u_gbufferMat.x);
-	gl_FragData[1] = vec4(delta * 0.5 + 0.5, 0.0, 1.0);
+	/* Albedo at 1, velocity at 2 -- see fs_gbuffer_vel.sc for why the
+	 * index is fixed rather than following the attachment count. */
+	gl_FragData[1] = vec4(u_gbufferAlbedo.rgb, 1.0);
+	gl_FragData[2] = vec4(delta * 0.5 + 0.5, 0.0, 1.0);
 }

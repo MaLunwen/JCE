@@ -24,6 +24,7 @@
  *             Networking          <jce/api_net.h>
  *             UI                  <jce/api_ui.h>
  *             AI                  <jce/api_ai.h>
+ *             LLM authoring       <jce/api_llm.h>
  *
  * Dependency rule: lower layers NEVER depend on upper layers.
  * This header is completely SDL-free.
@@ -69,10 +70,44 @@ extern "C" {
 
 /* ── Cross-cutting systems ───────────────────────────────────────── */
 #include <jce/api_ai.h>
+#include <jce/api_llm.h>
 #include <jce/api_net.h>
 #include <jce/api_physics.h>
 #include <jce/api_script.h>
 #include <jce/api_ui.h>
+
+/* ── Completed 2026-08-31 ────────────────────────────────────────────
+ *
+ * This file is what §4 means by "用户代码只需 #include <jce/api.h> 即可获得
+ * 整套引擎", and five umbrellas that exist in the tree were missing from it.
+ * api_input.h is named in §4's own table; api_middleware.h claims to
+ * aggregate ALL middleware and reached nobody through this file; api_save.h
+ * and api_video.h are new here because those two subsystems had no umbrella
+ * at all.
+ *
+ * Nothing is included twice in practice -- every umbrella carries its own
+ * include guard -- and the ordering is irrelevant for the same reason.  They
+ * are listed separately from the block above so that a later reader can see
+ * WHEN the entry point stopped being partial.
+ */
+/* ai_dispatch is a PRIVATE module (spec C.8).  JCESDKInstall.cmake EXCLUDES
+ * api_ai_dispatch.h and middleware/ai_dispatch/ from the package whenever
+ * JCE_ENABLE_AI_DISPATCH is OFF -- which is the default -- so an
+ * unconditional include here compiles in-tree and then breaks every SDK
+ * consumer at the first line of api.h.  Guarded exactly as api_middleware.h
+ * has always guarded it. */
+#if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
+#include <jce/api_ai_dispatch.h>
+#endif
+#include <jce/api_input.h>
+#include <jce/api_middleware.h>
+#include <jce/api_save.h>
+#include <jce/api_video.h>
+/* Self-description: what the engine accepts and what it is doing, as JSON.
+ * Unconditional -- unlike ai_dispatch it is not a private module, it pulls no
+ * third-party type into a public header, and the SDK installs it like any
+ * other application header. */
+#include <jce/api_introspect.h>
 
 
 

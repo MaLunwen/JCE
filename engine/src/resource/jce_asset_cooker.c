@@ -10,13 +10,16 @@
  */
 
 #include "jce_asset_cooker.h"
+
+#include "jce_audio_import_settings.h"
 #include "jce_asset_writer_internal.h"
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_image_decode.h>  /* the one image-decode service */
 
 #include "jce_cook_policy.h"
-#include <cjson/cJSON.h>   /* the .import.json colorSpace sidecar */
+#include <jce/os/core/jce_json.h>  /* the .import.json colorSpace sidecar */
 #include "jce_tex_compress.h"
 #include "os/core/jce_memory.h"
 
@@ -44,9 +47,16 @@
 #ifdef JCE_BUILDING_ENGINE
 #define JCE_COOK_AUDIO_VIA_AUDIO_LAYER 1
 #include <jce/middleware/audio/jce_audio.h>
-#else
-#include <miniaudio.h>
 #endif
+/* miniaudio's DECLARATIONS in both configurations, not just the lean one.
+ *
+ * The decode above is the audio layer's when it is linked, but the per-asset
+ * force_mono / sample_rate conversion is ma_data_converter either way -- one
+ * resampler, so "what does 48k -> 22.05k sound like" has one answer whichever
+ * path the asset took.  MINIAUDIO_IMPLEMENTATION is defined in exactly one TU
+ * per binary (jce_audio.c in the engine, miniaudio_impl_cook.c in the host
+ * tool), so this is declarations only and resolves at link. */
+#include <miniaudio.h>
 #endif
 
 /* ================================================================== */
@@ -325,7 +335,7 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
             final_total   = eo;
         } else {
             if (opts && opts->verbose)
-                printf("[cook] block encode failed; storing RGBA8\n");
+                LOG_WARN("cook", "block encode failed; storing RGBA8");
             JCE_FREE(enc_data);    enc_data = NULL;
             JCE_FREE(enc_offsets); enc_offsets = NULL;
             target_format = JCEASSET_TEXFMT_RGBA8;
@@ -399,9 +409,15 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
 /* ================================================================== */
 
 JceCookResult jce_cook_audio(const void *input, size_t input_size,
-                             const JceCookOptions *opts)
+                             const JceCookOptions *opts,
+                             const struct JceAudioImportSettings *imp)
 {
     JceCookResult result = {0};
+    JceAudioImportSettings imp_def;
+    if (!imp) {
+        jce_audio_import_settings_default(&imp_def);
+        imp = &imp_def;
+    }
 
 #ifdef JCE_NO_AUDIO
     snprintf(result.error, sizeof(result.error), "audio disabled");
@@ -510,6 +526,71 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
         return result;
     }
 
+    /* ── Per-asset conversion (force_mono / sample_rate) ───────────────
+     *
+     * AFTER the decode and BEFORE the info chunk, so the header describes the
+     * samples that are actually written.  Getting that order wrong is the
+     * whole failure mode here: a clip whose header says 48000 and whose bytes
+     * are 22050 plays at half speed, and nothing errors.
+     *
+     * ma_data_converter rather than a hand-written resampler: miniaudio
+     * already performed the decode above, so a second implementation would be
+     * a second answer to "what does 48k -> 22.05k sound like", and which one
+     * shipped would depend on the path the asset took.
+     *
+     * A conversion that fails leaves the ORIGINAL pcm in place and logs.
+     * Refusing the whole cook would turn a settings typo into a missing sound
+     * effect; the clip still works, it just did not shrink. */
+    void *conv_pcm = NULL;
+    {
+        const ma_uint32 want_ch   = imp->force_mono ? 1u : (ma_uint32)channels;
+        const ma_uint32 want_rate = imp->sample_rate ? imp->sample_rate
+                                                     : sample_rate;
+        if (bits == 16 && channels > 0 && sample_rate > 0 &&
+            (want_ch != (ma_uint32)channels || want_rate != sample_rate)) {
+            ma_data_converter_config cc = ma_data_converter_config_init(
+                ma_format_s16, ma_format_s16,
+                (ma_uint32)channels, want_ch, sample_rate, want_rate);
+            ma_data_converter conv;
+            if (ma_data_converter_init(&cc, NULL, &conv) == MA_SUCCESS) {
+                const ma_uint64 in_frames =
+                    (ma_uint64)(pcm_size / ((size_t)channels * sizeof(int16_t)));
+                ma_uint64 out_frames = 0;
+                if (ma_data_converter_get_expected_output_frame_count(
+                        &conv, in_frames, &out_frames) == MA_SUCCESS &&
+                    out_frames > 0) {
+                    const size_t out_bytes =
+                        (size_t)out_frames * want_ch * sizeof(int16_t);
+                    conv_pcm = JCE_MALLOC(out_bytes);
+                    if (conv_pcm) {
+                        ma_uint64 fi = in_frames, fo = out_frames;
+                        if (ma_data_converter_process_pcm_frames(
+                                &conv, pcm, &fi, conv_pcm, &fo) == MA_SUCCESS &&
+                            fo > 0) {
+                            pcm         = conv_pcm;
+                            pcm_size    = (size_t)fo * want_ch * sizeof(int16_t);
+                            channels    = (uint16_t)want_ch;
+                            sample_rate = want_rate;
+                        } else {
+                            JCE_FREE(conv_pcm);
+                            conv_pcm = NULL;
+                            LOG_WARN("cook", "%s",
+                                     "audio conversion produced no frames; "
+                                     "keeping the source format");
+                        }
+                    }
+                }
+                ma_data_converter_uninit(&conv, NULL);
+            } else {
+                LOG_WARN("cook",
+                         "audio converter init failed (%u ch %u Hz -> "
+                         "%u ch %u Hz); keeping the source format",
+                         (unsigned)channels, (unsigned)sample_rate,
+                         (unsigned)want_ch, (unsigned)want_rate);
+            }
+        }
+    }
+
     /* Build info chunk. */
     JceAssetAudioInfo info = {0};
     info.sample_rate     = sample_rate;
@@ -537,6 +618,10 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 #else
     JCE_FREE(raw_pcm);
 #endif
+    /* And the converted copy, if one was made.  Freed unconditionally rather
+     * than on a success branch: build_asset has already copied the bytes it
+     * needs, so there is no path where this buffer outlives here. */
+    JCE_FREE(conv_pcm);
     return result;
 #endif
 }
@@ -683,16 +768,16 @@ JceCookResult jce_cook_file(const char *input_path,
                 uint64_t side_len = 0;
                 void *side_buf = jce_fs_host_read_all(side, &side_len);
                 if (side_buf) {
-                    cJSON *sj = cJSON_ParseWithLength((const char *)side_buf,
-                                                      (size_t)side_len);
-                    if (cJSON_IsObject(sj)) {
-                        const cJSON *cs =
-                            cJSON_GetObjectItemCaseSensitive(sj, "colorSpace");
-                        if (cJSON_IsString(cs))
-                            (void)jce_cook_colour_space_parse(cs->valuestring,
+                    JceJson *sj = jce_json_parse((const char *)side_buf,
+                                                 (size_t)side_len);
+                    if (jce_json_is_object(sj)) {
+                        const char *cs =
+                            jce_json_get_string(sj, "colorSpace", NULL);
+                        if (cs)
+                            (void)jce_cook_colour_space_parse(cs,
                                                               &local.texture_srgb);
                     }
-                    if (sj) cJSON_Delete(sj);
+                    if (sj) jce_json_free(sj);
                     jce_fs_buffer_free(side_buf);
                 }
             }
@@ -704,12 +789,34 @@ JceCookResult jce_cook_file(const char *input_path,
     case JCEASSET_TYPE_TEXTURE:
         result = jce_cook_texture(data, nread, use_opts);
         break;
-    case JCEASSET_TYPE_SOUND:
-        result = jce_cook_audio(data, nread, opts);
+    case JCEASSET_TYPE_SOUND: {
+        /* The sidecar belongs to the ASSET, so it is read here where the path
+         * is, not inside jce_cook_audio which only ever sees bytes.  Same
+         * split the model importer uses. */
+        JceAudioImportSettings aimp;
+        (void)jce_audio_import_settings_load(input_path, &aimp);
+        result = jce_cook_audio(data, nread, opts, &aimp);
         break;
+    }
     default:
-        /* For models, fonts, shaders — pass through as raw for now.
-           Full mesh cooking (vertex quantization, etc.) is a future phase. */
+        /* Fonts, shaders, JSON and MODELS pass through unchanged, and for
+         * models that is the design rather than a gap.
+         *
+         * The note that stood here said "full mesh cooking (vertex
+         * quantization, etc.) is a future phase", which reads as unimplemented
+         * work and is not: meshes ARE cooked, offline and elsewhere.
+         * jce_cook --convert-model runs the assimp+meshopt converter in
+         * jce_bundle_mesh_convert.cpp, which builds an LOD chain through
+         * jce_mesh_generate_lod_chain and emits it as a primitive-level
+         * JCE_lod glTF extension.  The pipeline then normalises on .glb: the
+         * batch walk SKIPS authoring meshes (obj/fbx/dae) with a warning when
+         * they have no .glb sibling, so a model never reaches this switch from
+         * `jce.py cook` at all, and should_cook() returns false for models
+         * besides.  The runtime mounts only the cgltf loader, by design.
+         *
+         * So this branch is a pass-through for the runtime format, not a
+         * placeholder.  Chased once on 2026-09-01 as "the cooker is missing
+         * its MESH branch"; it is not. */
         result = jce_cook_raw(data, nread, opts);
         break;
     }

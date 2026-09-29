@@ -61,32 +61,13 @@ uint16_t jce_quant_f32_to_f16(float v)
     return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
 }
 
+/* The decode itself moved to jce_math.h, which is the one layer the renderer
+ * and this module can both reach; this stays as the published net symbol.
+ * The body was byte-for-byte what lives there now -- it is where that
+ * implementation came from. */
 float jce_quant_f16_to_f32(uint16_t v)
 {
-    uint32_t sign = ((uint32_t)v & 0x8000u) << 16;
-    uint32_t exp  = ((uint32_t)v >> 10) & 0x1Fu;
-    uint32_t mant = (uint32_t)v & 0x3FFu;
-    uint32_t out;
-
-    if (exp == 0u) {
-        if (mant == 0u) {
-            out = sign;                         /* +/- 0 */
-        } else {
-            /* Subnormal: normalise. */
-            int32_t e = -1;
-            do { mant <<= 1; e += 1; } while ((mant & 0x400u) == 0u);
-            mant &= 0x3FFu;
-            out = sign | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 31u) {
-        out = sign | 0x7F800000u | (mant << 13); /* Inf / NaN */
-    } else {
-        out = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
-    }
-
-    float f;
-    memcpy(&f, &out, 4);
-    return f;
+    return jce_half_to_float(v);
 }
 
 /* ================================================================== */

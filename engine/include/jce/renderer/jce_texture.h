@@ -227,6 +227,18 @@ JCE_API void   jce_texture_set_quality_mip_bias(int8_t bias);
  * (aniso on HIGH+ only); 0 forces anisotropic filtering OFF; >0 forces it ON. */
 JCE_API void   jce_texture_set_aniso_override(int mode);
 
+/* Project Settings > Graphics > Color Space.  1 = LINEAR (the default): a
+ * texture that asks for JCE_TEX_SRGB gets a hardware sRGB view, so the sampler
+ * decodes each texel before filtering it.  0 = GAMMA: no texture decodes and
+ * (see u_iblParams.z in the PBR shaders) no frame encodes, so lighting happens
+ * on display-space values -- Unity's legacy mode, wrong on purpose.
+ *
+ * The AUTHORITY for both halves lives here rather than in two places: the
+ * renderer reads it back through jce_texture_colour_space() to pack the output
+ * exponent, so the decode and the encode cannot disagree. */
+JCE_API void   jce_texture_set_colour_space(int linear);
+JCE_API int    jce_texture_colour_space(void);
+
 /*
  * Arm/disarm "streaming uploads".  While armed, NEW uncompressed-RGBA8 texture
  * uploads (the streamed-texture path: PAK PNG/JPG and cooked RGBA8) retain a CPU

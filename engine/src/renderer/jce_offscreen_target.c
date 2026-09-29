@@ -49,6 +49,12 @@ struct JceOffscreenTarget {
     uint32_t target_h;
     bgfx_texture_format_t color_format; /* RGBA16F (HDR) or RGBA8 fallback */
 
+    /* Set when the FBO is created or resized, cleared by the next prepare.
+     * A "keep" clear mode is OVERRIDDEN while this is true: the attachments
+     * were created with `NULL, 0` and keeping them would present
+     * uninitialised memory.  See jce_offscreen_target_prepare_keep. */
+    bool fresh;
+
     RetiredTarget retired[BRIDGE_RETIRE_SLOTS];
 };
 
@@ -228,6 +234,7 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
 
     bridge->target_w = width;
     bridge->target_h = height;
+    bridge->fresh = true;   /* nothing has ever been written to these pixels */
     bridge->color_format = color_fmt;
     return true;
 }
@@ -266,12 +273,35 @@ void jce_offscreen_target_destroy(JceOffscreenTarget *bridge)
     JCE_FREE(bridge);
 }
 
+bool jce_offscreen_target_is_fresh(const JceOffscreenTarget *bridge)
+{
+    return bridge ? bridge->fresh : false;
+}
+
 bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
                                       uint32_t width,
                                       uint32_t height,
                                       const float *view16,
                                       const float *proj16,
                                       uint32_t clear_rgba,
+                                      const char *view_name)
+{
+    /* The full clear, which is what every caller that has no camera clear
+     * mode to honour wants -- and there is only ONE body, so the two entry
+     * points cannot drift into clearing differently. */
+    return jce_offscreen_target_prepare_keep(bridge, width, height,
+                                             view16, proj16, clear_rgba,
+                                             false, false, view_name);
+}
+
+bool jce_offscreen_target_prepare_keep(JceOffscreenTarget *bridge,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      const float *view16,
+                                      const float *proj16,
+                                      uint32_t clear_rgba,
+                                      bool keep_color,
+                                      bool keep_depth,
                                       const char *view_name)
 {
     if (!bridge || !view16 || !proj16)
@@ -288,9 +318,28 @@ bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
     bgfx_set_view_rect(bridge->view_id, 0, 0,
                        (uint16_t)bridge->target_w,
                        (uint16_t)bridge->target_h);
-    bgfx_set_view_clear(bridge->view_id,
-                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                        clear_rgba, 1.0f, 0);
+    /* STENCIL alongside DEPTH, everywhere depth is cleared.  A material's
+     * pass/fail op writes this plane, and bgfx's depth clear does not touch
+     * it -- so without this a portal mask or an outline counter inherits the
+     * previous frame's value and the effect drifts instead of failing.  Safe
+     * by construction: anything that survived a DEPTH clear was already not
+     * being reused across it. */
+    /* THE FRESH-TARGET OVERRIDE.  A target that was just created or resized
+     * has never been written to, so both keeps are ignored for exactly one
+     * frame; from the next frame on the author's mode is honoured.  Without
+     * this, "Don't Clear" would present uninitialised memory once and then
+     * never recover, because garbage depth near the near plane rejects every
+     * draw that would have fixed it. */
+    if (bridge->fresh) {
+        keep_color = false;
+        keep_depth = false;
+        bridge->fresh = false;
+    }
+
+    uint16_t clear_flags = 0u;
+    if (!keep_color) clear_flags |= BGFX_CLEAR_COLOR;
+    if (!keep_depth) clear_flags |= BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL;
+    bgfx_set_view_clear(bridge->view_id, clear_flags, clear_rgba, 1.0f, 0);
     bgfx_set_view_transform(bridge->view_id, view16, proj16);
     bgfx_set_view_frame_buffer(bridge->view_id, bridge->target_fbo);
     bgfx_set_view_mode(bridge->view_id, BGFX_VIEW_MODE_SEQUENTIAL);

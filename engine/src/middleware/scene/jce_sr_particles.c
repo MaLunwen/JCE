@@ -105,12 +105,55 @@ static void sr_particle_sprite_lazy_init(JceSceneRenderer *sr)
         bgfx_copy(qi, sizeof qi), BGFX_BUFFER_NONE);
     sr->u_particle_misc = bgfx_create_uniform("u_particle_misc",
                                               BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_particle_soft = bgfx_create_uniform("u_particle_soft",
+                                              BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->s_particle_scene_depth = bgfx_create_uniform("s_sceneDepth",
+                                              BGFX_UNIFORM_TYPE_SAMPLER, 1);
+}
+
+/* The frame's soft-particle block, or "off" when this frame has no depth.
+ *
+ * ONE builder for BOTH paths.  The CPU emitter walk and the compute pool
+ * submit the same fs_particle program, so anything that differs between them
+ * is a fade that works for some emitters and not others -- and the GPU path
+ * is the one an author cannot tell apart by looking.
+ *
+ * Fails to OFF, deliberately: no pre-pass this frame, or a viewport of zero,
+ * and the shader skips its soft block entirely.  Particles then look exactly
+ * as they did before soft particles existed, which is the right failure --
+ * the alternative (sampling an unbound or stale depth target) reads as
+ * particles vanishing. */
+static JceGpuParticleSoft sr_particle_soft_frame(const JceSceneRenderer *sr,
+                                                 const JceCamera *camera)
+{
+    JceGpuParticleSoft soft;
+    soft.depth_texture     = JCE_INVALID_TEXTURE;
+    soft.fade_distance     = 0.0f;
+    soft.inv_viewport_w    = 0.0f;
+    soft.inv_viewport_h    = 0.0f;
+    soft.near_z            = 0.1f;
+    soft.far_z             = 1000.0f;
+
+    const float fade = jce_particles_get_soft_fade_distance();
+    if (fade <= 0.0f || !sr || !camera) return soft;
+    if (!sr->depth_prepass_frame || !BGFX_HANDLE_IS_VALID(sr->ssao_depth_tex))
+        return soft;
+    if (sr->ssao_w == 0 || sr->ssao_h == 0) return soft;
+
+    soft.depth_texture.idx = sr->ssao_depth_tex.idx;
+    soft.fade_distance     = fade;
+    soft.inv_viewport_w    = 1.0f / (float)sr->ssao_w;
+    soft.inv_viewport_h    = 1.0f / (float)sr->ssao_h;
+    soft.near_z            = jce_camera_get_near(camera);
+    soft.far_z             = jce_camera_get_far(camera);
+    return soft;
 }
 
 void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
                        const JceCamera *camera, uint16_t view_id)
 {
-    (void)camera;   /* billboard basis is u_invView (set by the view transform) */
+    /* camera was unused (the billboard basis is u_invView, set by the view
+     * transform); the soft fade needs its near/far to linearise depth. */
     const JceParticleSystem *sys =
         (const JceParticleSystem *)jce_scene_internal_particles_get(scene);
     if (!sys) return;
@@ -119,6 +162,8 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
 
     sr_particle_sprite_lazy_init(sr);
     if (!BGFX_HANDLE_IS_VALID(sr->prog_particle_sprite)) return;
+
+    const JceGpuParticleSoft soft = sr_particle_soft_frame(sr, camera);
 
     uint32_t avail = bgfx_get_avail_instance_data_buffer(
         alive, (uint16_t)SR_PARTICLE_INST_STRIDE);
@@ -144,8 +189,17 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
      * non-zero, so round emitters are unaffected while rain reads as streaks.
      * The GPU pool draw leaves .y=0, so its i_data1 (raw vel/life) never
      * accidentally stretches. */
-    float misc[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+    /* .z = soft-particle fade distance; 0 makes the shader skip the block, so
+     * sampler stage 1 stays unbound and unread. */
+    float misc[4] = { 0.0f, 1.0f, soft.fade_distance, 0.0f };
     bgfx_set_uniform(sr->u_particle_misc, misc, 1);
+    if (soft.fade_distance > 0.0f) {
+        float sp[4] = { soft.inv_viewport_w, soft.inv_viewport_h,
+                        soft.near_z, soft.far_z };
+        bgfx_set_uniform(sr->u_particle_soft, sp, 1);
+        bgfx_texture_handle_t dt = { soft.depth_texture.idx };
+        bgfx_set_texture(1, sr->s_particle_scene_depth, dt, UINT32_MAX);
+    }
 
     /* Match the GPU pool draw: additive soft-glow, depth-tested, no Z-write,
      * cull-CW (the billboard winds the same as the GPU pool's quad). */
@@ -177,6 +231,7 @@ typedef struct {
     float             dt;
     bool              dispatch;      /* false on 2nd+ render of a bgfx frame */
     int              *creates_left;  /* per-frame create budget (stagger)  */
+    JceGpuParticleSoft soft;         /* depth fade, or off (fade == 0)     */
 } SrGpuParticleCtx;
 
 static SrGpuParticleRec *sr_gpu_particle_find_or_add(JceSceneRenderer *sr,
@@ -302,11 +357,13 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
         JceTexture t = sr_resolve_texture(sr, rec->tex_path);
         tex_idx = t.idx;
     }
-    jce_gpu_particles_render_ex(rec->sys, ctx->color_view,
-                                tex_idx, rec->desc.blend_alpha);
+    JceTextureHandle tex_h = { tex_idx };
+    jce_gpu_particles_render_soft(rec->sys, ctx->color_view,
+                                  tex_h, rec->desc.blend_alpha, &ctx->soft);
 }
 
 void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
+                            const JceCamera *camera,
                             uint16_t view_id_base, float dt_sec)
 {
     if (!sr || !scene) return;
@@ -332,6 +389,7 @@ void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
         ctx.color_view   = view_id_base;
         ctx.dt           = dt_sec;
         ctx.dispatch     = dispatch;
+        ctx.soft         = sr_particle_soft_frame(sr, camera);
         /* At most 2 NEW GPU particle systems created per bgfx frame (see the
          * stagger note in sr_gpu_particle_each) — only meter on the dispatch
          * pass so the two viewports don't double-count.  Steady state (no new

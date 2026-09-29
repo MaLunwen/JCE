@@ -1,225 +1,82 @@
-
+# Local scratch, generated output and original upstream copies are excluded.
+# Keep CI, attributes and module instructions public. Asset exceptions below
+# publish only owned fixtures and consumer source, never whole local libraries.
 .*
-# CI configuration is source, not a dotfile-of-convenience: the blanket
-# `.*` above had kept the entire workflow set out of the repository.
-# CI is not tracked for now (owner decision, 2026-08-17): the blanket `.*`
-# rule above therefore applies to .github/ as well.  Restoring CI means
-# putting `!.github/` back here -- and re-tracking tests/, because
-# ci.yml's `ctest -L unit` step has nothing to run without it.
-# !.github/
+!.github/
 !.gitignore
 !.gitattributes
-!.gitattributes
-
-engine/src/middleware/audio/third_party
-!engine/src/middleware/video/third_party/minimp4.h
-
-engine/src/middleware/video/third_party/libhevc/*
-!engine/src/middleware/video/third_party/libhevc/jce_build
-# JCE-authored port artefacts that must live INSIDE the upstream tree because
-# the build references them at those paths.  They are not upstream code and
-# cannot be re-fetched: ithread_win32.c is a JCE Win32 implementation of
-# libhevc's pthread-only ithread.h, and the x86 platform-macros header carries
-# the _MSC_VER branch (declspec align, __nop, __popcnt) that x86 MSVC builds
-# compile against -- jce_build's generic copy is only on the include path for
-# Emscripten and ARM64.  Both were lost once already and had to be recovered
-# from a 2024 commit; track them so a vendor-tree rebuild cannot drop them.
-#
-# git cannot re-include a file whose PARENT DIRECTORY is excluded, so each
-# level has to be re-admitted and then re-excluded on the way down.
-!engine/src/middleware/video/third_party/libhevc/common/
-engine/src/middleware/video/third_party/libhevc/common/*
-# ...and then the two files themselves.  These four lines were MISSING:
-# both files were force-added once and have survived only because they sit
-# in the index, where ignore rules no longer apply.  Re-vendoring libhevc
-# and running a plain `git add` would have dropped them a second time --
-# the exact loss the paragraph above says already happened once.  x86/ needs
-# its own admit/exclude pair because git will not descend into a directory
-# excluded by `common/*`, so a rule naming only the file inside it never
-# gets read.
-!engine/src/middleware/video/third_party/libhevc/common/ithread_win32.c
-!engine/src/middleware/video/third_party/libhevc/common/x86/
-engine/src/middleware/video/third_party/libhevc/common/x86/*
-!engine/src/middleware/video/third_party/libhevc/common/x86/ihevc_platform_macros.h
-engine/src/middleware/video/third_party/openh264/*
-!engine/src/middleware/video/third_party/openh264/jce_build
-
-
-_*
-
-# ...but THREE COMMITTED files under scripting/python/jce_script/ begin with an
-# underscore, because that is Python's spelling of "private module" and of
-# "package entry point", and the rule above has no path anchor so it hides them
-# at every depth.  Two of them are generated AND committed on purpose
-# (engine/CMakeLists.txt globs sources at CONFIGURE time, so an artefact
-# emitted during the build joins its target one build late); the third is the
-# package's __init__.py, without which `import jce_script` finds nothing.
-#
-# While they are ignored, `git add <path>` refuses them BY NAME and `git add -A`
-# skips them in SILENCE -- which is how a binding ships with no bindings in it.
-# Worse in this shared worktree: a pathspec commit builds a temporary index
-# that is incomplete for ignored files, so the next session's commit deletes
-# them.  That has happened here before.
-#
-# This re-admits three NAMED files, not the underscore prefix:
-# scripting/python/jce_script/__pycache__/ stays ignored, and
-# `git check-ignore -q <path>` returning 1 for these three is what says so.
-!scripting/python/jce_script/_generated.py
-!scripting/python/jce_script/_generated.pyi
-!scripting/python/jce_script/__init__.py
-
-build/
-out/
-
-
-caged_kingdom/resources/assets/**
-# The Kerr black hole lab's content layer is SOURCE, not cooked output: the
-# scene, its Lua controller, kerr_lab.json (the semantic authority per the
-# design's section 10.3) and the four numeric-texture LUTs.  A blanket ignore
-# on assets/ made all of it invisible to git, so a git clean would have taken
-# the whole demo silently.  Parent directories are re-included explicitly
-# because git cannot re-include a file underneath an excluded directory.
-!caged_kingdom/resources/assets/black_hole/
-!caged_kingdom/resources/assets/black_hole/**
-!caged_kingdom/resources/assets/scenes/
-!caged_kingdom/resources/assets/scenes/black_hole_lab.scene.json
-!caged_kingdom/resources/assets/scripts/
-!caged_kingdom/resources/assets/scripts/black_hole_lab.lua
-!caged_kingdom/resources/assets/scripts/black_hole_lab.lua.deps.json
-!caged_kingdom/resources/assets/textures/
-!caged_kingdom/resources/assets/textures/black_hole/
-!caged_kingdom/resources/assets/textures/black_hole/**
+!.editorconfig
+**/third_party/
+__pycache__/
+*.py[cod]
+desktop.ini
+Thumbs.db
+/_*
+**/resources/_cooked/
+/build/
+/out/
+/examples/*/build/
+/examples/*/native/build/
+/examples/caged_kingdom/build/
+/examples/caged_kingdom/native/build/
+/scripting/*/build/
+/scripts/android/app/build/
+/scripts/android/build/
+/examples/caged_kingdom/dist/
+/examples/caged_kingdom/_retired_ck_app/
+examples/caged_kingdom/resources/assets/**
+!examples/caged_kingdom/resources/assets/black_hole/
+!examples/caged_kingdom/resources/assets/black_hole/**
+!examples/caged_kingdom/resources/assets/scenes/
+!examples/caged_kingdom/resources/assets/scenes/black_hole_lab.scene.json
+!examples/caged_kingdom/resources/assets/scenes/lightning_lab.scene.json
+!examples/caged_kingdom/resources/assets/scripts/
+!examples/caged_kingdom/resources/assets/scripts/black_hole_lab.lua
+!examples/caged_kingdom/resources/assets/scripts/lightning_lab.lua
+!examples/caged_kingdom/resources/assets/scripts/black_hole_lab.lua.deps.json
+!examples/caged_kingdom/resources/assets/textures/
+!examples/caged_kingdom/resources/assets/textures/black_hole/
+!examples/caged_kingdom/resources/assets/textures/black_hole/**
+!examples/caged_kingdom/resources/assets/models/
+!examples/caged_kingdom/resources/assets/models/morph_probe.glb
+!examples/caged_kingdom/resources/assets/scenes/morph_probe_on.scene.json
+!examples/caged_kingdom/resources/assets/scenes/morph_probe_off.scene.json
+!examples/caged_kingdom/resources/assets/textures/cookie_probe.png
+!examples/caged_kingdom/resources/assets/textures/cookie_probe_b.png
+!examples/caged_kingdom/resources/assets/scenes/cookie_probe_on.scene.json
+!examples/caged_kingdom/resources/assets/scenes/cookie_probe_off.scene.json
+!examples/caged_kingdom/resources/assets/scenes/cookie_two_probe.scene.json
+!examples/caged_kingdom/resources/assets/models/batch_probe.glb
+!examples/caged_kingdom/resources/assets/models/batch_probe.batch.json
+!examples/caged_kingdom/resources/assets/scenes/batch_probe.scene.json
+!examples/caged_kingdom/resources/assets/scenes/ssgi_probe.scene.json
 engine/resources/assets/shaders/
 editor/resources/assets/fonts/
 !editor/resources/assets/i18n/
 !editor/resources/assets/i18n/**
-
-
 raw_assets/
-
-
 scripts/ZKM-VMP/
-
 sonar-project.properties
 CMakeUserPresets.json
-
 bak/
 TODO/
-
-
-# `docs/*`, NOT `docs/` -- excluding the DIRECTORY makes git refuse to descend into
-# it, and a `!docs/...` line below can then never match. Excluding its CONTENTS keeps
-# loose files under docs/ ignored while letting the three re-includes below work.
-# (The i18n block above gets away with `!editor/resources/assets/i18n/` only because
-# its parent `editor/resources/assets/` is not itself excluded.)
-docs/*
-# ...the three subtrees that are project record rather than scratch.
-# Two of these are read by CI: tools/audit/ resolves docs/architecture/
-# dependency-ownership.yml and docs/audits/duplicate-implementation-inventory.yml,
-# and both were UNTRACKED under the blanket rule -- the audit could not see its own
-# inputs.  The rest is the spec/plan trail that every recent feature was built from.
-#
-# Re-including a path inside an excluded directory needs BOTH lines: git never
-# descends into an excluded directory, so the directory itself must be re-included
-# before a glob inside it can match.  Same two-line idiom as the i18n block above.
-#
-# This also closes a silent data-loss path: a file force-added under an ignored
-# directory lives only in whatever index added it, so any concurrent session that
-# rebuilds the shared index drops it from the next commit's tree -- observed twice.
 halloween-test/
-
 sync_*.py
-
-
-agents.*
-# ...but NOT AGENTS.md, which this rule was swallowing on every case-insensitive
-# checkout (Windows, macOS): `agents.*` matched `AGENTS.md` at every depth, so 51 of
-# the repo's 54 per-directory charters existed only on the machine that wrote them.
-# A fresh clone got three. That is the same failure as `docs/` and `tools/audit/`:
-# a broad rule quietly eating the project's own record. It had been patched one file
-# at a time (`!/space/AGENTS.md` below, plus two force-adds) instead of at the root.
-# Root AGENTS.md makes updating the nearest charter mandatory when files move — a
-# rule nobody else can see is not a rule.
-# AGENTS.md is NOT tracked (owner decision, 2026-08-17).  Anchored per
-# name, so it matches at every depth -- there are 85 of them on disk.
-# CONSEQUENCE, stated because it is not obvious: scripts/lint/check_agents_md.py
-# verifies that every required AGENTS.md is IN PLACE, and its canonical list
-# lives in .docs/MEMORY_INDEX.md, which is also untracked.  The gate still
-# passes locally because the files are on disk; on a clean clone it would
-# report all of them missing.  That is the same trade already accepted for
-# tests/ and docs/, not a new one.
-AGENTS.md
-# Anchored: an unanchored `tests/` also swallowed engine/tests, space/tests
-# and tools/tests -- the same class of bug as `space/` and `.*`. Only the
-# scratch tree at the repo root is meant to be ignored.
-# The whole root suite, not just scratch/ (owner decision, 2026-08-17).
-# ANCHORED, for the reason the comment above already gives: an unanchored
-# `tests/` swallowed engine/tests, space/tests and tools/tests.  Those are
-# other trees' suites and stay tracked.
-/tests/
-# Sub-suites too (owner decision, 2026-08-17): tools/audit/tests/ is the
-# gates' own self-test.  Anchored per directory rather than as a bare
-# `tests/`, which this file records swallowing engine/tests, space/tests
-# and tools/tests when it was written unanchored.
-/tools/audit/tests/
-# The flac is commercial copyrighted music, 77 MB, and git history is
-# permanent: once pushed, removing it needs a history rewrite, not a
-# revert.  The rest of caged_kingdom/ stays tracked.
-/caged_kingdom/resources/assets/black_hole/*.flac
-# NOT `tools/audit/`.  Ignoring the whole directory (added in 9507d1ac) left
-# the architecture/licence audit suite untracked, while .github/workflows/
-# ci.yml:44 still runs `python tools/audit/run_architecture_audit.py` — so on
-# any clean checkout the gate step cannot find its own script.  That suite is
-# what is supposed to catch contract drift like the patented-codec gating, and
-# it has not been able to run since.  Ignore only its bytecode.
-# tools/audit/ is NOT tracked (owner decision, 2026-08-17).  The comment below
-# is kept because it records why the directory was un-ignored in the first
-# place, and that reasoning is still true -- it simply lost its argument when
-# CI stopped being tracked too.  The one file the ENGINE needed from here,
-# cdecl.py (the repo's single C-declaration parser), moved to tools/scriptgen/
-# beside its only consumers rather than being restored with the audit suite.
-tools/audit/
-
-# Sample projects (local-only, deliberately unversioned).
-# Leading slash matters: an unanchored `science_lab/` also matches
-# `scripts/science_lab/`, which silently swallowed the repo-side generator
-# tooling for those demos.  Anchor them to the top level only.
-/science_lab/
-/street_demo/
-/meadow_valley/
-/elemental_serenity/
-# game project
-# caged_kingdom/
-
-# Stellar Clean Orbit (space/) is NOT tracked (owner decision, 2026-08-17),
-# like the other consumer projects above.  It was the one exception -- the
-# flagship demo carrying the deterministic-simulation contract, four ctest
-# gates and the parity verifier -- and those gates live inside it, so they
-# leave with it.  Nothing under engine/ or tools/ referenced space/: the
-# only greps that matched were "whitespace/" and "profile_space/".
-# ANCHORED, because an unanchored `space/` is the bug this file already
-# records twice.
-/space/
-
-
-# Android APK build
+!AGENTS.md
+!CLAUDE.md
+/.docs/
+/private/
+/examples/caged_kingdom/resources/assets/black_hole/*.flac
+tools/audit/__pycache__/
 scripts/android/app/src/main/jniLibs/
 scripts/android/app/src/main/assets/
-
 scripts/android/app/src/main/res/*
 !scripts/android/app/src/main/res/drawable-nodpi/
 !scripts/android/app/src/main/res/values/
-
-
-build_standalone/
-dist/
-
-# Local diagnostic captures (KPI csv/png)
+/build_standalone/
+/dist/
 diag/
 *.log
-# Debug artefacts dropped at the repository root by wasm/dist investigation
-# runs and by one-off compiles.  Anchored to the top level: a project's own
-# reports/ directory is its business, and t.obj is only ever debris here.
 /wasm_console.txt
 /wasm_dist*.png
 /wasm_dist*.txt
@@ -228,3 +85,33 @@ diag/
 /wasm_release.png
 /t.obj
 /reports/
+/examples/*/dist/
+/examples/elemental_serenity/archive/
+/examples/elemental_serenity/resources/assets/**
+!examples/elemental_serenity/resources/assets/bundle_roots.json
+!examples/elemental_serenity/resources/assets/render_settings.json
+!examples/elemental_serenity/resources/assets/scenes/
+!examples/elemental_serenity/resources/assets/scenes/**
+!examples/elemental_serenity/resources/assets/scene_ai/
+!examples/elemental_serenity/resources/assets/scene_ai/**
+!examples/elemental_serenity/resources/assets/scripts/
+!examples/elemental_serenity/resources/assets/scripts/**
+!examples/elemental_serenity/resources/assets/particles/
+!examples/elemental_serenity/resources/assets/particles/**
+/examples/*/native/bin/
+/docs/
+/scripts/android/local.properties
+/scripts/android/gradlew
+/scripts/android/gradlew.bat
+/scripts/android/gradle/wrapper/gradle-wrapper.jar
+/scripts/android/app/src/main/java/org/app/
+/engine/src/renderer/internal/stb_image.h
+/examples/*/way/paste*.txt
+/examples/caged_kingdom/way/1/NubisEvolved.png
+/tools/build/android/local.properties
+/tools/build/android/app/build/
+/tools/build/android/build/
+/tools/build/android/app/src/main/assets/
+/tools/build/android/app/src/main/jniLibs/
+
+/examples/*/local_assets/

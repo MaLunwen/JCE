@@ -26,6 +26,7 @@
 
 static char                s_names [JCE_PHYSICS_LAYER_COUNT][LAYER_NAME_MAX];
 static JcePhysicsLayerMask s_matrix[JCE_PHYSICS_LAYER_COUNT];
+static JcePhysicsLayerMask s_matrix2d[JCE_PHYSICS_LAYER_COUNT];
 static bool                s_inited;
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */
@@ -43,8 +44,10 @@ static void layers_ensure_init(void)
 {
     if (s_inited) return;
     layers_default_names();
-    for (uint32_t i = 0; i < JCE_PHYSICS_LAYER_COUNT; i++)
-        s_matrix[i] = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < JCE_PHYSICS_LAYER_COUNT; i++) {
+        s_matrix[i]   = 0xFFFFFFFFu;
+        s_matrix2d[i] = 0xFFFFFFFFu;   /* both default to all-pairs-collide */
+    }
     s_inited = true;
 }
 
@@ -105,6 +108,40 @@ JcePhysicsLayerMask jce_physics_get_layer_collision_mask(uint32_t layer)
     return s_matrix[layer];
 }
 
+/* ── Matrix (2D) ──────────────────────────────────────────────────── *
+ * The same three operations over s_matrix2d.  Deliberately not factored into
+ * a shared helper taking a matrix pointer: the public functions are the API
+ * surface, the bodies are six lines each, and a helper would buy nothing but
+ * an extra indirection between the caller and the bit it sets. */
+
+void jce_physics2d_set_layer_collides(uint32_t a, uint32_t b, bool collides)
+{
+    if (a >= JCE_PHYSICS_LAYER_COUNT || b >= JCE_PHYSICS_LAYER_COUNT) return;
+    layers_ensure_init();
+    if (collides) {
+        s_matrix2d[a] |=  (1u << b);
+        s_matrix2d[b] |=  (1u << a);
+    } else {
+        s_matrix2d[a] &= ~(1u << b);
+        s_matrix2d[b] &= ~(1u << a);
+    }
+}
+
+bool jce_physics2d_get_layer_collides(uint32_t a, uint32_t b)
+{
+    if (a >= JCE_PHYSICS_LAYER_COUNT || b >= JCE_PHYSICS_LAYER_COUNT)
+        return false;
+    layers_ensure_init();
+    return (s_matrix2d[a] & (1u << b)) != 0u;
+}
+
+JcePhysicsLayerMask jce_physics2d_get_layer_collision_mask(uint32_t layer)
+{
+    if (layer >= JCE_PHYSICS_LAYER_COUNT) return 0u;
+    layers_ensure_init();
+    return s_matrix2d[layer];
+}
+
 /* ── JSON I/O ─────────────────────────────────────────────────────── */
 
 /* Serialize the current names + matrix.  The sole non-test caller is the
@@ -123,18 +160,27 @@ bool jce_physics_layer_matrix_save_json(const char *vfs_path)
 
     JceJson *names = jce_json_array();
     JceJson *mat   = jce_json_array();
-    if (!names || !mat) {
+    JceJson *mat2d = jce_json_array();
+    if (!names || !mat || !mat2d) {
         if (names) jce_json_free(names);
         if (mat)   jce_json_free(mat);
+        if (mat2d) jce_json_free(mat2d);
         jce_json_free(root);
         return false;
     }
     for (uint32_t i = 0; i < JCE_PHYSICS_LAYER_COUNT; i++) {
         jce_json_array_push_string(names, s_names[i]);
-        jce_json_array_push_number(mat, (double)s_matrix[i]);
+        jce_json_array_push_number(mat,   (double)s_matrix[i]);
+        jce_json_array_push_number(mat2d, (double)s_matrix2d[i]);
     }
     jce_json_set_child(root, "names",  names);
     jce_json_set_child(root, "matrix", mat);
+    /* "matrix2d" is ADDITIVE and the schema stays v1.  An older file has no
+     * such key and loads with the all-collide default -- which is exactly
+     * what 2D did before it was wired -- and an older reader ignores a key it
+     * does not know.  Bumping the version would have forced a decision on
+     * every existing file for a change that cannot break one. */
+    jce_json_set_child(root, "matrix2d", mat2d);
 
     char *json_str = jce_json_print(root, true);
     jce_json_free(root);
@@ -185,6 +231,23 @@ bool jce_physics_layer_matrix_load_json_mem(const char *json, size_t len)
             JceJson *item = jce_json_array_at(mat, i);
             double v = jce_json_number_value(item, (double)0xFFFFFFFFu);
             s_matrix[i] = (uint32_t)v;
+        }
+    }
+
+    /* ABSENT IS NOT EMPTY.  A file written before 2D was wired has no
+     * "matrix2d", and the right reading of that is "this project never
+     * expressed a 2D matrix", which is the all-collide default already in
+     * place -- not "every 2D layer collides with nothing", which is what
+     * zeroing on absence would mean and would make every 2D body fall
+     * through the world. */
+    JceJson *mat2d = jce_json_get(root, "matrix2d");
+    if (mat2d && jce_json_is_array(mat2d)) {
+        int n = jce_json_array_size(mat2d);
+        if (n > JCE_PHYSICS_LAYER_COUNT) n = JCE_PHYSICS_LAYER_COUNT;
+        for (int i = 0; i < n; i++) {
+            JceJson *item = jce_json_array_at(mat2d, i);
+            double v = jce_json_number_value(item, (double)0xFFFFFFFFu);
+            s_matrix2d[i] = (uint32_t)v;
         }
     }
 

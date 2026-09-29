@@ -116,6 +116,47 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
  * resets it to false afterwards.  Default false = legacy single-sided (CULL_CW). */
 JCE_API void JCE_CALL jce_skinned_mesh_set_submit_double_sided(bool on);
 
+/* The FULL bgfx render state the next submits should use; 0 restores the
+ * legacy default.  Set by jce_model_draw* from
+ * jce_pbr_material_render_state(), because this path owns the state and a
+ * material that only reaches the shader's uniforms cannot express whether it
+ * is transparent.  Superset of _set_submit_double_sided, which is now written
+ * through the same value. */
+JCE_API void JCE_CALL jce_skinned_mesh_set_submit_state(uint64_t state);
+
+/* The bgfx STENCIL word the next submits should use; 0 = none.  Its own call
+ * because bgfx keeps stencil and state separate, and because the stencil has
+ * a lifetime the state does not: bgfx resets it after every submit, so this
+ * value is re-applied by each submit rather than set once on the GPU.
+ *
+ * ORDER MATTERS: _set_submit_state CLEARS this back to 0, so a caller that
+ * wants both calls the state setter FIRST.  That is what keeps every existing
+ * caller -- all of which set only the state -- from inheriting the stencil of
+ * whatever model was drawn before it. */
+JCE_API void JCE_CALL jce_skinned_mesh_set_submit_stencil(uint32_t stencil);
+
+/* Restrict the NEXT submit to ONE index range, then disarm.
+ *
+ * FOR STATIC-BATCH MEMBER CULLING, and for nothing else yet.  A merged group
+ * is one draw -- the point of merging -- and therefore one cullable object: a
+ * row of forty fence posts folded into one mesh draws all forty whenever any
+ * one is on screen.  The member table (jce_static_batch.h) says which index
+ * range each original mesh occupies, so the caller can submit the runs it can
+ * see.  A group entirely on screen coalesces to ONE run and takes exactly the
+ * path it always took.
+ *
+ * ARMED PER SUBMIT and cleared BY the submit, the same shape
+ * jce_skinned_mesh_set_submit_state has above it and for the same reason: the
+ * submit is reached through several layers that have no business carrying a
+ * range they do not use, and a sticky override would silently truncate the
+ * next unrelated mesh.
+ *
+ * count == 0 disarms.  A range is ignored in wireframe, where the index
+ * buffer being drawn is a different one (line pairs) and the member table's
+ * offsets do not address it. */
+JCE_API void JCE_CALL jce_skinned_mesh_set_submit_index_range(uint32_t first,
+                                                     uint32_t count);
+
 /* Submit a wireframe overlay (line topology, LEQUAL depth) of the
  * mesh's geometry. For skinned meshes the bone palette must already
  * have been uploaded via jce_skinned_mesh_set_bones() (or

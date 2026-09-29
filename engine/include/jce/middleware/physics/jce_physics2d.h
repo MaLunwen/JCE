@@ -47,8 +47,19 @@ JCE_API void jce_physics2d_step(JcePhysics2D *world, float dt);
 typedef enum {
     JCE_SHAPE2D_BOX     = 0,
     JCE_SHAPE2D_CIRCLE  = 1,
-    JCE_SHAPE2D_CAPSULE = 2,
-    JCE_SHAPE2D_SEGMENT = 3
+    JCE_SHAPE2D_CAPSULE = 2,   /* axis along Y (Unity's "Vertical")   */
+    JCE_SHAPE2D_SEGMENT = 3,
+    /* Axis along X.  Box2D's b2Capsule already takes two arbitrary end
+     * points, so this costs one line in the wrapper; it was simply never
+     * offered, and Collider2D.capsule_direction -- authored, serialised and
+     * in the Inspector -- therefore did nothing.  APPENDED: existing values
+     * keep their numbers. */
+    JCE_SHAPE2D_CAPSULE_X = 4,
+    /* Convex polygon from JceBody2DDesc.points.  Box2D has had
+     * b2ComputeHull + b2MakePolygon all along; without a shape for it,
+     * Collider2D POLYGON fell back to a BOX and EDGE to a single segment,
+     * so the authored points[] and point_count did nothing at all. */
+    JCE_SHAPE2D_POLYGON   = 5
 } JceShape2DType;
 
 /* ================================================================== */
@@ -68,6 +79,24 @@ typedef struct {
     float          linear_damping;
     float          angular_damping;
     bool           fixed_rotation;
+    /* Sensor (Unity's "Is Trigger"): overlaps are reported, nothing is pushed.
+     * There was no way to say this through this struct at all, so
+     * Collider2D.is_trigger -- authored, serialised, in the Inspector -- gave
+     * you a solid wall.  APPENDED, never inserted: the ABI snapshot enforces
+     * ORDERED-PREFIX. */
+    bool           sensor;
+    /* JCE_SHAPE2D_POLYGON only: xy pairs in body-local space.  Box2D caps a
+     * polygon at B2_MAX_POLYGON_VERTICES (8) and b2ComputeHull discards the
+     * rest, so an authored list longer than that is CONVEX-HULLED, not
+     * faithfully reproduced -- said out loud here because the component
+     * allows 32.  APPENDED, never inserted. */
+    const float   *points;
+    int            point_count;
+    /* Collision layer 0..31, indexing the 2D matrix in jce_physics_layers.h.
+     * 0 is "Default", where an unconfigured body also sits, so an older
+     * caller that leaves this zeroed keeps exactly the behaviour it had.
+     * APPENDED, never inserted: the ABI snapshot enforces ORDERED-PREFIX. */
+    uint32_t       physics_layer;
 } JceBody2DDesc;
 
 JCE_API JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world, const JceBody2DDesc *desc);
@@ -158,7 +187,30 @@ typedef struct {
     bool          use_limits;       /* HINGE                             */
     float         lower_angle_rad;  /* HINGE limit                       */
     float         upper_angle_rad;  /* HINGE limit                       */
+    /* Unity's Joint2D "Enable Collision": do the two jointed bodies still
+     * collide with each other?  Box2D takes it per joint and this struct had
+     * no way to say it, so Joint2D.enable_collision -- authored, serialised,
+     * in the Inspector -- did nothing.  DEFAULT (zero) is false, which is
+     * Box2D's own default and what every joint built so far already had.
+     * APPENDED, never inserted. */
+    bool          collide_connected;
 } JcePhysics2DJointDesc;
+
+/*
+ * Reaction force / torque the joint applied on the LAST step.
+ *
+ * Box2D has no breakable joint: you watch the constraint force and destroy
+ * the joint yourself.  The 3D side already does exactly that
+ * (rt_monitor_configurable_joints), and Joint2D.break_force / .break_torque
+ * had no route to a reading at all, so a 2D joint could not break.
+ *
+ * Force is the MAGNITUDE in newtons; torque is signed N.m.  Both return 0
+ * for an invalid world or handle, which reads as "nothing to break".
+ */
+JCE_API float jce_physics2d_joint_get_force(const JcePhysics2D *world,
+                                            JceConstraintHandle joint);
+JCE_API float jce_physics2d_joint_get_torque(const JcePhysics2D *world,
+                                             JceConstraintHandle joint);
 
 /* Create a 2D joint.  Returns JCE_CONSTRAINT_INVALID on failure (NULL
  * world/desc, invalid body_a, or joint-pool exhaustion).  The handle maps

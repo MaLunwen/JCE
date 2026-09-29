@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(@JCE_PROJECT_NAME@ C)
+project(@JCE_PROJECT_TARGET@ C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -18,9 +18,9 @@ if(NOT DEFINED JCE_DIR AND DEFINED ENV{JCE_SDK_DIR})
 endif()
 find_package(JCE REQUIRED)
 
-add_executable(@JCE_PROJECT_NAME@ src/main.c)
-target_compile_definitions(@JCE_PROJECT_NAME@ PRIVATE SDL_MAIN_USE_CALLBACKS=1)
-target_link_libraries(@JCE_PROJECT_NAME@ PRIVATE JCE::JCE)
+add_executable(@JCE_PROJECT_TARGET@ src/main.c)
+target_compile_definitions(@JCE_PROJECT_TARGET@ PRIVATE SDL_MAIN_USE_CALLBACKS=1)
+target_link_libraries(@JCE_PROJECT_TARGET@ PRIVATE JCE::JCE)
 
 # Cooked-asset tree to pack into the embedded PAK.  build-project.bat
 # scrapes jce_project.json's cooked_assets field and forwards it via
@@ -30,6 +30,32 @@ if(NOT DEFINED JCE_PROJECT_COOKED_ASSETS)
     set(JCE_PROJECT_COOKED_ASSETS "resources/_cooked")
 endif()
 set(_cooked "${CMAKE_SOURCE_DIR}/${JCE_PROJECT_COOKED_ASSETS}")
+
+# Raw (uncooked) asset tree, for the manual path below.  Resolved from the
+# MANIFEST, not hardcoded: jce_project.json is where a project DECLARES this
+# (schema field source_assets, read by the engine at jce_project.c:212 and by
+# scripts/jce.py:2557), and a template that answered it independently would
+# silently miss the assets of any project declaring another directory --
+# which project.create does, "resources".  Note the cooked tree above relies
+# on build-project forwarding -DJCE_PROJECT_COOKED_ASSETS; there is no such
+# forwarder for the raw tree, so reading the manifest is the only way a plain
+# `cmake -S . -B build` can honour the declaration.
+#
+# Order: an explicit -D wins, then the manifest, then "assets" -- the engine
+# model's own default (jce_project.c:270, :281) and the directory this
+# template ships.
+if(NOT DEFINED JCE_PROJECT_RAW_ASSETS)
+    set(JCE_PROJECT_RAW_ASSETS "assets")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/jce_project.json")
+        file(READ "${CMAKE_SOURCE_DIR}/jce_project.json" _jce_manifest_json)
+        string(JSON _jce_src_assets ERROR_VARIABLE _jce_src_err
+               GET "${_jce_manifest_json}" source_assets)
+        if(NOT _jce_src_err AND _jce_src_assets)
+            set(JCE_PROJECT_RAW_ASSETS "${_jce_src_assets}")
+        endif()
+    endif()
+endif()
+set(_raw "${CMAKE_SOURCE_DIR}/${JCE_PROJECT_RAW_ASSETS}")
 
 # In editor-driven builds, jce_target_embed_pak consumes the
 # editor-prebuilt asset source passed through JCE_PROJECT_PREBUILT_ASSETS_C.
@@ -42,15 +68,33 @@ if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_C AND
 endif()
 if(COMMAND jce_target_embed_pak)
     if(_has_prebuilt_assets OR IS_DIRECTORY "${_cooked}")
-        jce_target_embed_pak(@JCE_PROJECT_NAME@ RESOURCE_DIRS "${_cooked}")
+        jce_target_embed_pak(@JCE_PROJECT_TARGET@ RESOURCE_DIRS "${_cooked}")
+    elseif(COMMAND jce_add_pak AND IS_DIRECTORY "${_raw}")
+        # No cooked tree, but the project HAS raw assets.  jce_add_pak is a
+        # superset of jce_target_embed_pak: it cooks the raw tree (or packs it
+        # raw with a WARNING when no cooker is installed) and delegates to
+        # jce_target_embed_pak for the prebuilt case, so the editor-driven
+        # paths above are unaffected.
+        #
+        # Without this branch, a project built outside the editor -- which the
+        # comment at the top of this block says is supported -- linked an
+        # empty PAK and its assets silently did not ship, behind a
+        # message(STATUS) rather than a warning.  MEASURED 2026-09-21: a
+        # marker string in a raw asset was ABSENT from the built exe before
+        # and PRESENT after, same asset bytes and same path in both arms.
+        jce_add_pak(@JCE_PROJECT_TARGET@ RESOURCE_DIRS "${_raw}")
     else()
+        # Still reachable, and deliberately: no cooked tree AND no raw tree
+        # (a freshly created project has neither), or no jce_add_pak.  The
+        # engine references assets_pak_data unconditionally, so something must
+        # define it.
         set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
         file(WRITE "${_stub}"
 "#include <stddef.h>\n"
 "const unsigned char assets_pak_data[1] = {0};\n"
 "const size_t        assets_pak_data_size = 0;\n")
-        target_sources(@JCE_PROJECT_NAME@ PRIVATE "${_stub}")
-        message(STATUS "@JCE_PROJECT_NAME@: no cooked assets at ${_cooked} - linking empty PAK stub")
+        target_sources(@JCE_PROJECT_TARGET@ PRIVATE "${_stub}")
+        message(STATUS "@JCE_PROJECT_NAME@: no cooked assets at ${_cooked} and no raw assets at ${_raw} - linking empty PAK stub")
     endif()
 else()
     set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
@@ -58,17 +102,17 @@ else()
 "#include <stddef.h>\n"
 "const unsigned char assets_pak_data[1] = {0};\n"
 "const size_t        assets_pak_data_size = 0;\n")
-    target_sources(@JCE_PROJECT_NAME@ PRIVATE "${_stub}")
+    target_sources(@JCE_PROJECT_TARGET@ PRIVATE "${_stub}")
     message(STATUS "@JCE_PROJECT_NAME@: JCE asset helper unavailable - linking empty PAK stub")
 endif()
 
 # Stage runtime data alongside the exe so the template's main.c can
 # read jce_project.json (for startup_scene) and load scene/material
 # files from the cooked tree via host-FS APIs.
-add_custom_command(TARGET @JCE_PROJECT_NAME@ POST_BUILD
+add_custom_command(TARGET @JCE_PROJECT_TARGET@ POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/jce_project.json"
-            "$<TARGET_FILE_DIR:@JCE_PROJECT_NAME@>/jce_project.json"
+            "$<TARGET_FILE_DIR:@JCE_PROJECT_TARGET@>/jce_project.json"
     VERBATIM)
 
 # Loose cooked-asset staging is optional: when the project ships its assets
@@ -78,10 +122,10 @@ add_custom_command(TARGET @JCE_PROJECT_NAME@ POST_BUILD
 option(JCE_PROJECT_STAGE_LOOSE_ASSETS
     "Copy the loose cooked asset tree next to the built executable" ON)
 if(JCE_PROJECT_STAGE_LOOSE_ASSETS AND IS_DIRECTORY "${_cooked}")
-    add_custom_command(TARGET @JCE_PROJECT_NAME@ POST_BUILD
+    add_custom_command(TARGET @JCE_PROJECT_TARGET@ POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${_cooked}"
-                "$<TARGET_FILE_DIR:@JCE_PROJECT_NAME@>/${JCE_PROJECT_COOKED_ASSETS}"
+                "$<TARGET_FILE_DIR:@JCE_PROJECT_TARGET@>/${JCE_PROJECT_COOKED_ASSETS}"
         VERBATIM)
 elseif(NOT JCE_PROJECT_STAGE_LOOSE_ASSETS)
     message(STATUS "@JCE_PROJECT_NAME@: loose cooked-asset staging disabled (encrypted assets ship inside the PAK)")
@@ -114,7 +158,7 @@ if(JCE_PROJECT_BUNDLES AND COMMAND jce_target_embed_bundle)
             get_filename_component(_bname "${_bundle}" NAME_WE)
             string(REGEX REPLACE "[^A-Za-z0-9_]" "_" _sym "${_bname}")
             set(_sym "bundle_${_sym}")
-            jce_target_embed_bundle(@JCE_PROJECT_NAME@ BUNDLE "${_bundle}" SYMBOL "${_sym}")
+            jce_target_embed_bundle(@JCE_PROJECT_TARGET@ BUNDLE "${_bundle}" SYMBOL "${_sym}")
             string(APPEND _emb_extern "extern const unsigned char ${_sym}[];\nextern const size_t ${_sym}_size;\n")
             string(APPEND _emb_table  "    { \"${_bname}\", ${_sym}, &${_sym}_size },\n")
             math(EXPR _emb_count "${_emb_count}+1")
@@ -126,4 +170,4 @@ endif()
 string(APPEND _emb_table "    { 0, 0, 0 }\n};\n")
 string(APPEND _emb_lines "${_emb_extern}${_emb_table}#define JCE_PROJECT_EMBEDDED_BUNDLE_COUNT ${_emb_count}\n#endif\n")
 file(WRITE "${_emb_inc}" "${_emb_lines}")
-target_include_directories(@JCE_PROJECT_NAME@ PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(@JCE_PROJECT_TARGET@ PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

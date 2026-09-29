@@ -275,6 +275,10 @@ const JceScriptVM *JCE_CALL jce_script_vm_c(void);
 #define JCE_C_ON_COLLISION(FN)  .on_collision  = (FN),
 #define JCE_C_ON_MESSAGE(FN)    .on_message    = (FN),
 #define JCE_C_ON_ANIM_EVENT(FN) .on_anim_event = (FN),
+/* Once per PHYSICS step with the fixed dt, just before that step --
+ * Unity's FixedUpdate.  JCE_C_ON_UPDATE is the per-frame one, whose dt
+ * varies with the frame rate. */
+#define JCE_C_ON_FIXED_UPDATE(FN) .on_fixed_update = (FN),
 
 #define JCE_C_SCRIPT_CLASS_END() };
 

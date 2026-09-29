@@ -32,6 +32,23 @@ typedef struct {
     jce_vec3 center[JCE_CSM_MAX_CASCADES];
     float    radius[JCE_CSM_MAX_CASCADES];
     uint32_t cascade_count;
+    /* Light-space DEPTH RANGE of each cascade's orthographic projection, in
+     * world units -- the (far - near) that a normalized shadow depth of 1.0
+     * spans.  Appended (not inserted) because this struct crosses the ABI.
+     *
+     * WHY IT IS EXPORTED.  A shadow map stores depth NORMALIZED over this
+     * range, so a fragment shader holding two depths knows how far apart they
+     * are only up to this scale factor.  Everything that needs a WORLD
+     * distance out of the shadow map -- contact-hardening penumbrae are the
+     * first, and are why this was added -- has to be told it, and this is the
+     * only place that knows: the near plane is extended per-cascade by the
+     * caster bounds, so the range is neither constant nor derivable from
+     * `radius`.  Measured 2026-09-06: a penumbra computed WITHOUT it, using
+     * the point-light ratio (z_r - z_b)/z_b against normalized orthographic
+     * depth, came out ~1e-3 of the needed magnitude -- so the widened kernel
+     * never exceeded the base radius and three settings of the knob produced
+     * three identical images. */
+    float    depth_range[JCE_CSM_MAX_CASCADES];
 } JceCsmData;
 
 /*

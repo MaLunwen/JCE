@@ -1,0 +1,1 @@
+Create a blue Minesweeper custom board: width 12, height 12, mines 18, red 24, green 45, blue 64. Return only the six integer fields as JSON.

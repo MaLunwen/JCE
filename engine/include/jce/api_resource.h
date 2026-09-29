@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/resource/jce_curve.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_cook.h>
 #include <jce/resource/jce_archive_loader.h>
@@ -25,6 +26,23 @@ extern "C" {
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/resource/jce_bundle_deps.h>
 #include <jce/resource/jce_numeric_texture.h>
+
+/* Completed 2026-08-31.  These headers export JCE_API symbols and were
+ * reachable from NO umbrella, so §4's promise -- `#include <jce/api.h>`
+ * gives you the whole engine -- did not hold for them.  Several are named
+ * in §4's own table by capability.
+ */
+#include <jce/resource/jce_bundle_pack.h>
+#include <jce/resource/jce_glb_write.h>
+#include <jce/resource/jce_atlas_pack.h>
+#include <jce/resource/jce_hlod_bake.h>
+#include <jce/resource/jce_mesh_merge.h>
+#include <jce/resource/jce_image_decode.h>
+#include <jce/resource/jce_mesh_lod.h>
+#include <jce/resource/jce_mod_loader.h>
+#include <jce/resource/jce_model_importer.h>
+#include <jce/resource/jce_static_batch.h>
+#include <jce/resource/jce_world_partition.h>
 
 
 

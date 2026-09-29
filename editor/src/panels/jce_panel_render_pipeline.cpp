@@ -15,6 +15,7 @@
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_project_state.h"
+#include "scene/jce_editor_scene_render.h"  /* jce_editor_get_scene_renderer */
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -23,6 +24,8 @@
 
 extern "C" {
 #include <jce/renderer/jce_render_pipeline.h>
+#include <jce/renderer/jce_postfx.h>        /* motion-blur active readout */
+#include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/os/core/jce_console.h>   /* r.upscaler live cvar */
@@ -143,6 +146,9 @@ void jce_editor_panel_render_pipeline_content(void)
             jce_editor_i18n("panel.render_pipeline.feature.ssr"),
             &s_rp.desc.enable_ssr);
         changed |= ImGui::Checkbox(
+            jce_editor_i18n("panel.render_pipeline.feature.ssgi"),
+            &s_rp.desc.enable_ssgi);
+        changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.feature.taa"),
             &s_rp.desc.enable_taa);
         changed |= ImGui::Checkbox(
@@ -170,6 +176,35 @@ void jce_editor_panel_render_pipeline_content(void)
         changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.feature.motion_blur"),
             &s_rp.desc.enable_motion_blur);
+        if (s_rp.desc.enable_motion_blur) {
+            ImGui::Indent();
+            if (s_rp.desc.motion_blur_intensity <= 0.0f)
+                s_rp.desc.motion_blur_intensity = JCE_RP_MOTION_BLUR_DEFAULT;
+            ImGui::SetNextItemWidth(160.0f);
+            changed |= ImGui::SliderFloat(
+                jce_editor_i18n("panel.render_pipeline.motion_blur_intensity"),
+                &s_rp.desc.motion_blur_intensity, 0.05f, 2.0f, "%.2f");
+            /* "On" and "doing something" are different facts, and this feature
+             * spent its whole life being the second one.  It needs a motion
+             * source -- a velocity buffer, or camera matrices plus depth --
+             * and if the frame has neither, the checkbox above is the only
+             * thing that would say otherwise. */
+            JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+            JcePostFXPipeline *pfx = sr ? jce_scene_renderer_get_postfx(sr) : NULL;
+            if (pfx && !jce_postfx_get_motion_blur(pfx)) {
+                /* The checkbox above is the DESCRIPTOR; this is what the
+                 * running pipeline was actually told.  They disagree when the
+                 * LOW-tier floor inside jce_render_pipeline_apply clamps the
+                 * feature off -- and today nothing anywhere says so, which is
+                 * how "it works on my machine and not on the target" starts. */
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+                    jce_editor_i18n("panel.render_pipeline.motion_blur_clamped"));
+            } else if (pfx && !jce_postfx_get_motion_blur_active(pfx)) {
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+                    jce_editor_i18n("panel.render_pipeline.motion_blur_no_source"));
+            }
+            ImGui::Unindent();
+        }
         changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.feature.cloth"),
             &s_rp.desc.enable_cloth);
@@ -180,6 +215,18 @@ void jce_editor_panel_render_pipeline_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("panel.render_pipeline.section.quality"),
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        /* Sun soft size (PCSS contact hardening).  0 = off, and it says so
+         * rather than leaving an artist to wonder why the slider's bottom end
+         * looks like every other engine's hard shadow -- because it is. */
+        ImGui::SetNextItemWidth(160.0f);
+        changed |= ImGui::SliderFloat(
+            jce_editor_i18n("panel.render_pipeline.sun_soft_size"),
+            &s_rp.desc.sun_soft_size, 0.0f, 10.0f,
+            s_rp.desc.sun_soft_size <= 0.0f ? "off" : "%.2f deg");
+        if (s_rp.desc.sun_soft_size > 0.0f && s_rp.desc.shadow_filter_quality < 2)
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+                jce_editor_i18n("panel.render_pipeline.sun_soft_needs_tier2"));
+
         /* Shadow resolution: 512 / 1024 / 2048 / 4096. */
         static const int   kSrVals[]   = {512, 1024, 2048, 4096};
         static const char *kSrLabels[] = {"512", "1024", "2048", "4096"};

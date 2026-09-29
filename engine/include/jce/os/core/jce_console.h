@@ -91,6 +91,20 @@ JCE_API bool jce_console_register_cmd(const char *name, JceConsoleCmdFn fn,
  * registered sink; with none set it goes to the engine log.  `printf` callers
  * should pre-format. */
 typedef void (*JceConsoleOutputFn)(const char *text, void *user);
+/* -- Command enumeration --------------------------------------------------
+ * The companion to jce_cvar_count()/jce_cvar_at() for the other half of the
+ * namespace.  A console UI that completes or lists names has to walk both, and
+ * before this it could only walk one.
+ *
+ * The built-in `help` / `list` are ordinary registered commands and appear
+ * here; they are registered on first use, so the first call to either function
+ * below may allocate.  Indices are stable until the next registration.
+ * `out_name` / `out_help` may be NULL; the strings they receive are owned by
+ * the registry. */
+JCE_API int  jce_console_cmd_count(void);
+JCE_API bool jce_console_cmd_at(int index, const char **out_name,
+                                const char **out_help);
+
 JCE_API void jce_console_set_output(JceConsoleOutputFn fn, void *user);
 JCE_API void jce_console_print(const char *text);
 

@@ -13,6 +13,8 @@
 #include <jce/middleware/video/jce_webm_parser.h>
 
 #include "jce_audio_stream.h"
+#include "jce_video_clock.h"
+#include "jce_video_frame.h"
 
 extern "C" {
 #include <opus.h>
@@ -23,7 +25,9 @@ extern "C" {
 #include "jce_aac_decode.h"
 #include "jce_h264_decode.h"
 #include "jce_h265_decode.h"
+#include "jce_mp4_source.h"
 #include "jce_yuv_convert.h"
+#include "jce_av1_packet.h"
 #include "os/core/jce_memory.h"
 
 #include <cmath>
@@ -44,6 +48,7 @@ static const int s_yuv_avx2_init = (jce_yuv_set_avx2(SDL_HasAVX2()), 0);
 
 #define LOG_TAG       "jce_video"
 #define JCE_MAX_VIDEOS 32
+#define VIDEO_PACKET_MAX_BYTES (16u * 1024u * 1024u)
 #define JCE_VIDEO_AUDIO_PCM_MAX_BYTES (100u * 1024u * 1024u) /* 100 MB */
 
 typedef struct {
@@ -56,12 +61,11 @@ typedef struct {
     bool                 ended;
     uint32_t             width;
     uint32_t             height;
-    uint8_t             *mp4_copy;      /* owned copy of raw MP4 data */
-    size_t               mp4_copy_size;
+    uint8_t             *packet; /* bounded encoded sample staging */
+    size_t               packet_capacity;
 
     /* AV1 / IVF: dav1d decoder owns these (must outlive decoder). */
-    uint8_t             *ivf_copy;      /* owned copy of raw IVF stream */
-    size_t               ivf_copy_size;
+    bool                 ivf;
     uint32_t             av1_fps_num;   /* IVF timebase numerator */
     uint32_t             av1_fps_den;   /* IVF timebase denominator */
     uint32_t             av1_frame_idx; /* index of next decoded AV1 frame */
@@ -72,8 +76,7 @@ typedef struct {
     JceWebmParser       *webm;
     JceVp8Decoder       *vp8;
     JceVp9Decoder       *vp9;
-    uint8_t             *webm_copy;      /* owned copy of raw WebM stream */
-    size_t               webm_copy_size;
+
     uint64_t             webm_duration_ns;
     uint32_t             webm_frame_idx;
     int                  webm_video_codec; /* JceWebmVideoCodec */
@@ -119,11 +122,8 @@ typedef struct {
     double   decode_ts_base_sec;
     bool     post_seek;          /* suppress monotonicity in normalize_frame_time */
 
-    /* Decoded embedded audio (full-clip s16 PCM, owned).
-     * DEPRECATED: still produced by the AAC and MP4/Opus paths; the
-     * audio_stream below is what the new public API pulls from. The
-     * blob-fed adapter (blob_stream_*) bridges the old paths into the
-     * streaming surface without re-decoding. */
+    /* Legacy PCM query fields. Streaming paths expose format/count only;
+     * no full-clip PCM allocation is retained. */
     int16_t *audio_pcm;
     uint32_t audio_pcm_frames;
     uint32_t audio_pcm_channels;
@@ -133,11 +133,10 @@ typedef struct {
      * WebM/Opus path, upfront at load time. Owned. */
     JceAudioStream *audio_stream;
 
-    /* Owned WebM data copy kept alive for as long as the streaming
-     * Opus decoder needs it. NULL for non-WebM paths. */
-    uint8_t *webm_data;
-    size_t   webm_data_size;
+    /* Opt-in AV1 receive/input/send stage timing. */
+    uint64_t av1_trace_receive, av1_trace_read, av1_trace_send;
 
+    JceReadSource *source; /* shared immutable memory or host-file input */
     JceVideoDecoder decoder;
 
     /* ── Async decode pipeline (Stage 1) ──────────────────────────
@@ -183,6 +182,8 @@ typedef struct {
     size_t   display_rgba_capacity;
     double   display_frame_time;
     uint64_t display_frame_counter;
+    bool     seek_display_pending;
+    double   seek_display_target;
 
     /* Stage 2 zero-copy pop: pop swaps YUV plane pointers between the
      * queue entry and these display-side buffers. The expensive
@@ -196,6 +197,10 @@ typedef struct {
     int      display_yuv_w;
     int      display_yuv_h;
     bool     display_yuv_pending;
+    JceYuvPreview preview; /* UI fallback for frames queued before configuration */
+    JceVideoFrameProcessor frame_processor; /* worker-owned */
+    uint32_t worker_preview_limit; /* protected by qmtx */
+    bool preview_supported; /* fixed before worker start; safe during seek */
 
     void *worker_thread;               /* JceThread* */
 
@@ -205,7 +210,7 @@ typedef struct {
      * Read race-free via jce_video_get_perf_stats — we accept stale
      * reads since this is debug-only. */
     double   perf_decode_us_ema;
-    double   perf_convert_us_ema;     /* worker-side YUV→RGBA SIMD */
+    double   perf_convert_us_ema;     /* UI-side for queued YUV */
     double   perf_push_us_ema;
     double   perf_pop_us_ema;
     double   perf_decode_us_last;
@@ -382,16 +387,15 @@ static void webm_opus_stream_destroy(void *ud)
 
 /* Build a JceAudioStream that streams WebM/Opus from `webm_data` (which
  * must outlive the stream — the caller stores it on the VideoSlot). */
-static JceAudioStream *create_webm_opus_stream(const void *webm_data,
-                                               size_t webm_size,
+static JceAudioStream *create_webm_opus_stream(JceReadSource *source,
                                                uint32_t channels,
                                                double duration_sec)
 {
-    if (!webm_data || webm_size == 0 || channels == 0 || channels > 8) {
+    if (!source || channels == 0 || channels > 8) {
         return NULL;
     }
     JceWebmInfo info;
-    JceWebmParser *parser = jce_webm_open_memory(webm_data, webm_size, &info);
+    JceWebmParser *parser = jce_webm_open_source(source,&info);
     if (!parser) return NULL;
     int err = 0;
     OpusDecoder *od = opus_decoder_create(48000, (int)channels, &err);
@@ -467,6 +471,10 @@ static uint32_t mp4_opus_stream_decode_next(void *ud,
             st->sample_idx = st->sample_count;
             break;
         }
+        if (!sinfo.size_bytes || sinfo.size_bytes > VIDEO_PACKET_MAX_BYTES) {
+            st->sample_idx = st->sample_count;
+            break;
+        }
         if (sinfo.size_bytes > st->sbuf_cap) {
             JCE_FREE(st->sbuf);
             st->sbuf_cap = sinfo.size_bytes + 256u;
@@ -522,19 +530,17 @@ static void mp4_opus_stream_destroy(void *ud)
     JCE_FREE(st);
 }
 
-static JceAudioStream *create_mp4_opus_stream(const void *mp4_data,
-                                              size_t mp4_size,
+static JceAudioStream *create_mp4_opus_stream(JceReadSource *source,
                                               uint32_t channels,
                                               uint32_t samplerate,
                                               uint32_t sample_count,
                                               double duration_sec)
 {
-    if (!mp4_data || mp4_size == 0 || channels == 0 || channels > 8) {
+    if (!source || channels == 0 || channels > 8) {
         return NULL;
     }
     JceMp4Info dummy;
-    JceMp4Parser *parser = jce_mp4_parser_open_memory(mp4_data, mp4_size,
-                                                       &dummy);
+    JceMp4Parser *parser = jce_mp4_parser_open_source(source,&dummy);
     if (!parser) return NULL;
     JceMp4AudioTrackInfo atr;
     if (!jce_mp4_parser_get_audio_track_info(parser, &atr)) {
@@ -614,6 +620,10 @@ static uint32_t mp4_aac_stream_decode_next(void *ud,
             st->sample_idx = st->sample_count;
             break;
         }
+        if (!sinfo.size_bytes || sinfo.size_bytes > VIDEO_PACKET_MAX_BYTES) {
+            st->sample_idx = st->sample_count;
+            break;
+        }
         if (sinfo.size_bytes > st->sbuf_cap) {
             JCE_FREE(st->sbuf);
             st->sbuf_cap = sinfo.size_bytes + 256u;
@@ -676,19 +686,17 @@ static void mp4_aac_stream_destroy(void *ud)
     JCE_FREE(st);
 }
 
-static JceAudioStream *create_mp4_aac_stream(const void *mp4_data,
-                                             size_t mp4_size,
+static JceAudioStream *create_mp4_aac_stream(JceReadSource *source,
                                              const void *asc, uint32_t asc_bytes,
                                              uint32_t channels,
                                              uint32_t samplerate,
                                              uint32_t sample_count,
                                              double duration_sec)
 {
-    if (!mp4_data || mp4_size == 0 || !asc || asc_bytes == 0) return NULL;
+    if (!source || !asc || asc_bytes == 0) return NULL;
     if (channels == 0 || channels > 8) return NULL;
     JceMp4Info dummy;
-    JceMp4Parser *parser = jce_mp4_parser_open_memory(mp4_data, mp4_size,
-                                                       &dummy);
+    JceMp4Parser *parser = jce_mp4_parser_open_source(source,&dummy);
     if (!parser) return NULL;
     JceMp4AudioTrackInfo atr;
     if (!jce_mp4_parser_get_audio_track_info(parser, &atr)) {
@@ -848,7 +856,7 @@ static bool decoder_emit_frame_yuv420(VideoSlot *slot,
     if (!slot || w == 0u || h == 0u) return false;
     slot->decoder.width  = w;
     slot->decoder.height = h;
-    if (slot->queue_yuv_mode) {
+    {
         slot->pending_yuv_y         = y;
         slot->pending_yuv_u         = u;
         slot->pending_yuv_v         = v;
@@ -857,7 +865,8 @@ static bool decoder_emit_frame_yuv420(VideoSlot *slot,
         slot->pending_yuv_w         = w;
         slot->pending_yuv_h         = h;
         slot->pending_yuv_valid     = true;
-        return true;
+        if (slot->queue_yuv_mode || (slot->queue_active && slot->preview_supported))
+            return true;
     }
     if (!ensure_rgba(slot, w, h)) return false;
     const uint64_t t0 = perf_now();
@@ -868,26 +877,25 @@ static bool decoder_emit_frame_yuv420(VideoSlot *slot,
     return true;
 }
 
-static bool av1_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
+static const uint8_t *decoder_mp4_packet(VideoSlot *slot,
+                                          const JceMp4SampleInfo *sample)
 {
-    if (!slot || !data || size < 32u) return false;
+    if (!sample || !sample->size_bytes || sample->size_bytes > VIDEO_PACKET_MAX_BYTES)
+        return NULL;
+    if (!jce_yuv_buffer_reserve(&slot->decoder.packet,
+        &slot->decoder.packet_capacity,sample->size_bytes)) return NULL;
+    if (jce_read_source_read_at(slot->source,sample->offset,slot->decoder.packet,
+                                sample->size_bytes) != sample->size_bytes) return NULL;
+    return slot->decoder.packet;
+}
 
-    /* dav1d decoder reads from caller-owned memory; copy so the
-     * source buffer (which the caller may free) stays valid. */
-    slot->decoder.ivf_copy = (uint8_t *)JCE_MALLOC(size);
-    if (!slot->decoder.ivf_copy) return false;
-    memcpy(slot->decoder.ivf_copy, data, size);
-    slot->decoder.ivf_copy_size = (size_t)size;
-
+static bool av1_decoder_open(VideoSlot *slot, JceReadSource *source)
+{
+    if (!slot || !source) return false;
     JceAv1FrameInfo info = {0};
-    slot->decoder.av1 = jce_av1_open_memory(
-        slot->decoder.ivf_copy, slot->decoder.ivf_copy_size, &info);
-    if (!slot->decoder.av1) {
-        JCE_FREE(slot->decoder.ivf_copy);
-        slot->decoder.ivf_copy = NULL;
-        slot->decoder.ivf_copy_size = 0;
-        return false;
-    }
+    slot->decoder.av1 = jce_av1_open_source(source,&info);
+    if (!slot->decoder.av1) return false;
+    slot->decoder.ivf = true;
 
     slot->decoder.width        = info.width;
     slot->decoder.height       = info.height;
@@ -955,8 +963,7 @@ static bool av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     slot->decoder.av1 = NULL;
 
     JceAv1FrameInfo info = {0};
-    slot->decoder.av1 = jce_av1_open_memory(
-        slot->decoder.ivf_copy, slot->decoder.ivf_copy_size, &info);
+    slot->decoder.av1 = jce_av1_open_source(slot->source,&info);
     if (!slot->decoder.av1) {
         slot->decoder.ended = true;
         return false;
@@ -965,7 +972,7 @@ static bool av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     slot->decoder.ended = false;
     slot->frame_counter = 0;
     slot->decode_ts_base_set = false;
-    slot->time = time_sec;
+    if (!slot->queue_active) slot->time = time_sec;
     slot->frame_time = 0.0;
 
     /* Decode forward until we land on (or just past) the target time.
@@ -999,147 +1006,85 @@ static void av1_decoder_close(VideoSlot *slot)
         jce_av1_close(slot->decoder.av1);
         slot->decoder.av1 = NULL;
     }
-    if (slot->decoder.ivf_copy) {
-        JCE_FREE(slot->decoder.ivf_copy);
-        slot->decoder.ivf_copy = NULL;
-        slot->decoder.ivf_copy_size = 0;
-    }
+    slot->decoder.ivf = false;
 }
 
 /* ---- MP4-AV1 (av01-in-MP4 / .mp4 with AV1) ----------------------------
  *  Sample data in MP4 av01 is the raw OBU bitstream — feed it directly
- *  to dav1d via jce_av1_decode_packet().  Container parser owns sample
+ *  to the private timestamped dav1d pipeline. Container parser owns sample
  *  index + timing.  Discriminator vs IVF/WebM: parser != NULL && av1 !=
- *  NULL && !webm && ivf_copy == NULL.
+ *  NULL && !webm && !ivf.
  */
 static bool mp4_av1_is_active(const VideoSlot *slot)
 {
     return slot && slot->decoder.av1 && slot->decoder.parser
-        && !slot->decoder.webm && !slot->decoder.ivf_copy;
+        && !slot->decoder.webm && !slot->decoder.ivf;
 }
 
-static bool mp4_av1_decode_one_sample(VideoSlot *slot, uint32_t sample_idx,
-                                      bool *out_got_frame)
+/* Feed until backpressure, retain unconsumed packets, and drain at EOF.
+ * Picture timestamps preserve presentation order across frame threads. */
+static bool mp4_av1_decoder_read_next(VideoSlot *slot)
 {
-    JceMp4SampleInfo si;
-    if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, sample_idx, &si))
-        return false;
-
-    const uint8_t *yp = NULL, *up = NULL, *vp = NULL;
-    ptrdiff_t ys = 0, uvs = 0;
-    uint32_t fw = 0, fh = 0;
-    bool got = jce_av1_decode_packet(
-        slot->decoder.av1,
-        slot->decoder.mp4_copy + si.offset, si.size_bytes,
-        &yp, &ys, &up, &uvs, &vp, &fw, &fh);
-    if (out_got_frame) *out_got_frame = got;
-    if (!got) return true;
-
-    if (!decoder_emit_frame_yuv420(slot, yp, ys, up, uvs, vp, fw, fh)) return false;
-
-    double ts_sec = 0.0;
-    if (slot->decoder.vtrack.timescale > 0) {
-        ts_sec = (double)si.timestamp / (double)slot->decoder.vtrack.timescale;
-    }
-    slot->frame_time = normalize_frame_time(slot, ts_sec, true);
-    slot->frame_counter++;
-    slot->decoder.ended = false;
-    return true;
-}
-
-/* Send the AV1 configOBUs (sequence-header) embedded in the av1C box to
- * dav1d. ISOBMFF-AV1 stores the seq_header only in av1C.configOBUs (NOT
- * inside each sample like WebM does), so without this dav1d would reject
- * sample data with "Error parsing OBU data" / -EINVAL. */
-static void mp4_av1_prime_seq_header(VideoSlot *slot)
-{
-    const uint8_t *dsi = (const uint8_t *)slot->decoder.vtrack.decoder_config;
-    uint32_t       sz  = slot->decoder.vtrack.decoder_config_bytes;
-    /* av1C box layout: 4-byte AV1CodecConfigurationRecord header,
-     * followed by configOBUs[] (raw OBU bytestream). */
-    if (!dsi || sz <= 4u) return;
-    const uint8_t *obus = dsi + 4;
-    size_t         len  = (size_t)(sz - 4u);
-    bool got = false;
-    /* Decode-packet returns whether a *picture* came out; for a header-only
-     * push we don't expect a picture, just want dav1d to absorb the OBUs. */
-    (void)got;
-    const uint8_t *yp = NULL, *up = NULL, *vp = NULL;
-    ptrdiff_t ys = 0, uvs = 0;
-    uint32_t fw = 0, fh = 0;
-    jce_av1_decode_packet(slot->decoder.av1, obus, len,
-                          &yp, &ys, &up, &uvs, &vp, &fw, &fh);
-}
-
-/* ── AV1 OBU keyframe scanner ─────────────────────────────────────
- * AV1-in-ISOBMFF samples are raw OBU bytestreams in the "low overhead"
- * format where each OBU has obu_has_size_field=1. Walk OBUs in a sample
- * and decide if it's a random-access point (contains OBU_SEQUENCE_HEADER,
- * type==1, OR an OBU_FRAME (type==6) whose frame_type==KEY_FRAME (0)).
- * Returns true on a keyframe sample. */
-static bool av1_uleb128_read(const uint8_t *p, size_t avail,
-                             uint64_t *out_val, size_t *out_len)
-{
-    uint64_t val = 0;
-    size_t   i = 0;
-    for (; i < 8 && i < avail; ++i) {
-        uint8_t b = p[i];
-        val |= ((uint64_t)(b & 0x7Fu)) << (7u * i);
-        if ((b & 0x80u) == 0u) {
-            *out_val = val;
-            *out_len = i + 1;
+    bool eof_probe = false;
+    for (;;) {
+        while (slot->decoder.sample_idx < slot->decoder.vtrack.sample_count) {
+            JceMp4SampleInfo si;
+            if (!jce_mp4_parser_get_video_sample(slot->decoder.parser,
+                                                 slot->decoder.sample_idx, &si))
+                return false;
+            const uint64_t read_begin=perf_now();
+            const uint8_t *packet=decoder_mp4_packet(slot,&si);
+            slot->av1_trace_read+=perf_now()-read_begin;
+            const uint64_t send_begin=perf_now();
+            int sent = jce_av1_packet_send(slot->decoder.av1,
+                packet, si.size_bytes,
+                (int64_t)si.timestamp);
+            slot->av1_trace_send+=perf_now()-send_begin;
+            if (sent < 0) { slot->decoder.ended = true; return false; }
+            if (sent == 0) break;
+            slot->decoder.sample_idx++;
+        }
+        JceAv1PacketFrame f;
+        const uint64_t recv_begin=perf_now();
+        int received = jce_av1_packet_receive(slot->decoder.av1, &f);
+        slot->av1_trace_receive+=perf_now()-recv_begin;
+        if (received < 0) { slot->decoder.ended = true; return false; }
+        if (received > 0) {
+            if (!decoder_emit_frame_yuv420(slot, f.y, f.y_stride,
+                    f.u, f.uv_stride, f.v, f.width, f.height)) return false;
+            double ts = slot->decoder.vtrack.timescale
+                ? (double)f.timestamp / slot->decoder.vtrack.timescale : 0.0;
+            slot->frame_time = normalize_frame_time(slot, ts, true);
+            slot->frame_counter++;
+            if (slot->frame_counter%180u==0u && SDL_getenv("JCE_VIDEO_TRACE")) {
+                LOG_INFO(LOG_TAG,"AV1 stages frame=%llu receive_ms=%.1f read_ms=%.1f send_ms=%.1f",
+                    (unsigned long long)slot->frame_counter,
+                    perf_us(slot,0u,slot->av1_trace_receive)/1000.0,
+                    perf_us(slot,0u,slot->av1_trace_read)/1000.0,
+                    perf_us(slot,0u,slot->av1_trace_send)/1000.0);
+            }
+            slot->decoder.ended = false;
             return true;
         }
+        if (slot->decoder.sample_idx >= slot->decoder.vtrack.sample_count) {
+            /* The first EAGAIN switches dav1d into drain mode. Query again
+             * without sending new data to receive delayed frame-thread output. */
+            if (!eof_probe) { eof_probe = true; continue; }
+            slot->decoder.ended = true;
+            return false;
+        }
     }
-    return false;
 }
 
-static bool av1_sample_is_keyframe(const uint8_t *data, size_t size)
+static bool mp4_av1_prime_seq_header(VideoSlot *slot)
 {
-    size_t pos = 0;
-    while (pos < size) {
-        uint8_t hdr = data[pos++];
-        uint8_t obu_type = (uint8_t)((hdr >> 3) & 0x0Fu);
-        bool    ext_flag = (hdr & 0x04u) != 0;
-        bool    has_size = (hdr & 0x02u) != 0;
-        if (ext_flag) {
-            if (pos >= size) return false;
-            pos++;
-        }
-        if (obu_type == 1u /* OBU_SEQUENCE_HEADER */) return true;
-
-        uint64_t obu_size = 0;
-        if (has_size) {
-            size_t lebn = 0;
-            if (!av1_uleb128_read(data + pos, size - pos, &obu_size, &lebn))
-                return false;
-            pos += lebn;
-        } else {
-            obu_size = (uint64_t)(size - pos);
-        }
-        if (obu_size > size - pos) return false;
-
-        if (obu_type == 6u /* OBU_FRAME */
-            || obu_type == 3u /* OBU_FRAME_HEADER */) {
-            /* frame_type lives in the first 1-2 bits after show_existing_frame
-             * flag. For seek-index purposes we only need a conservative test:
-             * if obu_size > 0 and the first byte's top bit is 0, frame_type
-             * occupies bits 6-5 of byte[0]. show_existing_frame=0 → those
-             * are frame_type. */
-            if (obu_size > 0u) {
-                uint8_t b0 = data[pos];
-                bool    show_existing = (b0 & 0x80u) != 0;
-                if (!show_existing) {
-                    uint8_t ftype = (uint8_t)((b0 >> 5) & 0x03u);
-                    if (ftype == 0u /* KEY_FRAME */) return true;
-                }
-            }
-        }
-        pos += (size_t)obu_size;
-    }
-    return false;
+    const uint8_t *dsi = (const uint8_t *)slot->decoder.vtrack.decoder_config;
+    uint32_t sz = slot->decoder.vtrack.decoder_config_bytes;
+    return !dsi || sz <= 4u
+        || jce_av1_packet_send(slot->decoder.av1, dsi + 4, sz - 4u, 0) == 1;
 }
 
+/* Container sync samples provide the random-access index. */
 static void mp4_av1_build_keyframe_index(VideoSlot *slot)
 {
     slot->decoder.keyframe_indices = NULL;
@@ -1154,13 +1099,9 @@ static void mp4_av1_build_keyframe_index(VideoSlot *slot)
     uint32_t cnt = 0;
 
     for (uint32_t si = 0; si < total; ++si) {
-        JceMp4SampleInfo info;
-        if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, si, &info))
+        bool sync = false;
+        if (!jce_mp4_parser_video_sample_sync(slot->decoder.parser,si,&sync) || !sync)
             continue;
-        if (info.size_bytes == 0u) continue;
-        const uint8_t *p = slot->decoder.mp4_copy + info.offset;
-        size_t scan = info.size_bytes < 512u ? info.size_bytes : 512u;
-        if (!av1_sample_is_keyframe(p, scan)) continue;
         if (cnt >= cap) {
             uint32_t new_cap = cap * 2u;
             uint32_t *re = (uint32_t *)JCE_REALLOC(kf, new_cap * sizeof(uint32_t));
@@ -1189,45 +1130,17 @@ static void mp4_av1_build_keyframe_index(VideoSlot *slot)
 
 static bool mp4_av1_decoder_open(VideoSlot *slot)
 {
-    /* Presumes slot->decoder.parser + slot->decoder.vtrack already set up
-     * by decoder_open's MP4 setup. Creates packet-driven dav1d ctx and
-     * decodes the first sample so the slot has frame data immediately. */
-    slot->decoder.av1 = jce_av1_open_packet();
-    if (!slot->decoder.av1) {
-        LOG_WARN(LOG_TAG, "mp4_av1_decoder_open: jce_av1_open_packet failed");
-        return false;
-    }
-    slot->decoder.width  = slot->decoder.vtrack.width;
+    slot->decoder.av1 = jce_av1_packet_open_parallel();
+    if (!slot->decoder.av1) return false;
+    slot->decoder.width = slot->decoder.vtrack.width;
     slot->decoder.height = slot->decoder.vtrack.height;
     slot->decoder.sample_idx = 0;
     slot->decoder.ended = false;
-    mp4_av1_prime_seq_header(slot);
-
-    bool got = false;
-    if (!mp4_av1_decode_one_sample(slot, 0, &got)) {
-        jce_av1_close(slot->decoder.av1);
-        slot->decoder.av1 = NULL;
-        return false;
-    }
-    if (!got) {
-        slot->frame_counter = 0;
-        LOG_INFO(LOG_TAG, "mp4_av1_decoder_open: first frame deferred");
-    }
-    slot->decoder.sample_idx = 1;
-    slot->frame_time = normalize_frame_time(slot, 0.0, true);
-    return true;
-}
-
-static bool mp4_av1_decoder_read_next(VideoSlot *slot)
-{
-    if (slot->decoder.sample_idx >= slot->decoder.vtrack.sample_count) {
-        slot->decoder.ended = true;
-        return false;
-    }
-    bool got = false;
-    bool ok = mp4_av1_decode_one_sample(slot, slot->decoder.sample_idx, &got);
-    slot->decoder.sample_idx++;
-    return ok && got;
+    if (mp4_av1_prime_seq_header(slot) && mp4_av1_decoder_read_next(slot))
+        return true;
+    jce_av1_close(slot->decoder.av1);
+    slot->decoder.av1 = NULL;
+    return false;
 }
 
 static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
@@ -1240,7 +1153,7 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
         jce_av1_close(slot->decoder.av1);
         slot->decoder.av1 = NULL;
     }
-    slot->decoder.av1 = jce_av1_open_packet();
+    slot->decoder.av1 = jce_av1_packet_open_parallel();
     if (!slot->decoder.av1) {
         slot->decoder.ended = true;
         return false;
@@ -1272,31 +1185,31 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     slot->frame_counter = 1;
     slot->decode_ts_base_set = true;
     slot->decode_ts_base_sec = 0.0;
-    slot->time = time_sec;
+    if (!slot->queue_active) slot->time = time_sec;
     slot->frame_time = 0.0;
     /* Seq header may live only in sample 0 / earlier keyframes; if the
      * seek target is past those samples and av1C had configOBUs, prime
      * the decoder so the next sample's frame OBU isn't rejected. */
-    mp4_av1_prime_seq_header(slot);
+    if (!mp4_av1_prime_seq_header(slot)) return false;
 
     /* Drain forward from the keyframe to the target. Bounded for inexact
      * (preview) seek so dragging stays smooth; unbounded for exact
      * (release) seek so audio actually aligns. */
     const uint64_t start_ms = jce_time_ticks_ms();
-    while (slot->decoder.sample_idx < slot->decoder.vtrack.sample_count) {
-        JceMp4SampleInfo si;
-        if (!jce_mp4_parser_get_video_sample(slot->decoder.parser,
-                                             slot->decoder.sample_idx, &si))
-            break;
-        bool got = false;
-        mp4_av1_decode_one_sample(slot, slot->decoder.sample_idx, &got);
-        slot->decoder.sample_idx++;
-        if (si.timestamp >= target_ts) break;
+    bool got = false;
+    while ((got = mp4_av1_decoder_read_next(slot))) {
+        if (slot->frame_time >= time_sec) break;
         if (!exact && (jce_time_ticks_ms() - start_ms) > 50u) break;
+        if (slot->qmtx) {
+            jce_mutex_lock(slot->qmtx);
+            bool cancel = slot->quit_request || slot->seek_request;
+            jce_mutex_unlock(slot->qmtx);
+            if (cancel) return false;
+        }
     }
     /* Leave slot->frame_time at the real last-decoded PTS — see
      * av1_decoder_seek for the rationale. */
-    return true;
+    return got;
 }
 
 /* ======================================================================
@@ -1308,22 +1221,12 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
  *  coarse seek work end-to-end.
  * ====================================================================== */
 
-static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
+static bool webm_decoder_open(VideoSlot *slot, JceReadSource *source)
 {
-    if (!slot || !data || size == 0u) return false;
-
-    slot->decoder.webm_copy = (uint8_t *)JCE_MALLOC(size);
-    if (!slot->decoder.webm_copy) return false;
-    memcpy(slot->decoder.webm_copy, data, size);
-    slot->decoder.webm_copy_size = (size_t)size;
-
+    if (!slot || !source) return false;
     JceWebmInfo info{};
-    slot->decoder.webm = jce_webm_open_memory(
-        slot->decoder.webm_copy, slot->decoder.webm_copy_size, &info);
+    slot->decoder.webm = jce_webm_open_source(source,&info);
     if (!slot->decoder.webm) {
-        JCE_FREE(slot->decoder.webm_copy);
-        slot->decoder.webm_copy = NULL;
-        slot->decoder.webm_copy_size = 0;
         return false;
     }
 
@@ -1332,9 +1235,6 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
         if (!slot->decoder.vp8) {
             jce_webm_close(slot->decoder.webm);
             slot->decoder.webm = NULL;
-            JCE_FREE(slot->decoder.webm_copy);
-            slot->decoder.webm_copy = NULL;
-            slot->decoder.webm_copy_size = 0;
             return false;
         }
     } else if (info.video_codec == JCE_WEBM_VIDEO_VP9) {
@@ -1342,9 +1242,6 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
         if (!slot->decoder.vp9) {
             jce_webm_close(slot->decoder.webm);
             slot->decoder.webm = NULL;
-            JCE_FREE(slot->decoder.webm_copy);
-            slot->decoder.webm_copy = NULL;
-            slot->decoder.webm_copy_size = 0;
             return false;
         }
     } else if (info.video_codec == JCE_WEBM_VIDEO_AV1) {
@@ -1352,9 +1249,6 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
         if (!slot->decoder.av1) {
             jce_webm_close(slot->decoder.webm);
             slot->decoder.webm = NULL;
-            JCE_FREE(slot->decoder.webm_copy);
-            slot->decoder.webm_copy = NULL;
-            slot->decoder.webm_copy_size = 0;
             return false;
         }
     } else {
@@ -1362,9 +1256,6 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
                  (int)info.video_codec);
         jce_webm_close(slot->decoder.webm);
         slot->decoder.webm = NULL;
-        JCE_FREE(slot->decoder.webm_copy);
-        slot->decoder.webm_copy = NULL;
-        slot->decoder.webm_copy_size = 0;
         return false;
     }
 
@@ -1453,7 +1344,7 @@ static bool webm_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     slot->frame_counter = 1;
     slot->decode_ts_base_set = true;
     slot->decode_ts_base_sec = 0.0;
-    slot->time = time_sec;
+    if (!slot->queue_active) slot->time = time_sec;
     slot->frame_time = 0.0;
 
     /* Drain forward until we land on a frame at or past the target. */
@@ -1487,11 +1378,7 @@ static void webm_decoder_close(VideoSlot *slot)
         jce_webm_close(slot->decoder.webm);
         slot->decoder.webm = NULL;
     }
-    if (slot->decoder.webm_copy) {
-        JCE_FREE(slot->decoder.webm_copy);
-        slot->decoder.webm_copy = NULL;
-        slot->decoder.webm_copy_size = 0;
-    }
+
 }
 
 /* ======================================================================
@@ -1519,7 +1406,7 @@ static bool mp4_vp9_decode_one_sample(VideoSlot *slot, uint32_t sample_idx,
     uint32_t fw = 0, fh = 0;
     bool got = jce_vp9_decode_packet(
         slot->decoder.vp9,
-        slot->decoder.mp4_copy + si.offset, si.size_bytes,
+        decoder_mp4_packet(slot,&si), si.size_bytes,
         &yp, &ys, &up, &uvs, &vp, &fw, &fh);
     if (out_got_frame) *out_got_frame = got;
     if (!got) return true;
@@ -1605,7 +1492,7 @@ static bool mp4_vp9_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     slot->frame_counter = 1;
     slot->decode_ts_base_set = true;
     slot->decode_ts_base_sec = 0.0;
-    slot->time = time_sec;
+    if (!slot->queue_active) slot->time = time_sec;
     slot->frame_time = 0.0;
 
     const uint64_t start_ms = jce_time_ticks_ms();
@@ -1636,7 +1523,40 @@ static void mp4_vp9_decoder_close(VideoSlot *slot)
  *  Unified OpenH264 decoder wrappers
  * ====================================================================== */
 
-static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
+static bool is_sample_keyframe(const VideoSlot *slot, uint32_t sample_index);
+
+static bool decoder_publish_legacy(VideoSlot *slot, const uint8_t *rgba,
+                                   uint32_t width, uint32_t height)
+{
+    if (slot->decoder.h265) {
+        JceYuv420Frame frame;
+        if (!jce_h265_decoder_get_yuv(slot->decoder.h265, &frame)) return false;
+        return decoder_emit_frame_yuv420(slot, frame.y, frame.y_stride,
+            frame.u, frame.uv_stride, frame.v, (uint32_t)frame.width,
+            (uint32_t)frame.height);
+    }
+    if (!rgba || !ensure_rgba(slot, width, height)) return false;
+    memcpy(slot->rgba, rgba, (size_t)width * height * 4u);
+    return true;
+}
+
+static uint64_t decoder_packet_pts(const VideoSlot *slot, uint32_t index)
+{
+    uint64_t pts = 0u;
+    (void)jce_mp4_parser_video_presentation_time(slot->decoder.parser, index, &pts);
+    return pts;
+}
+
+static double decoder_legacy_timestamp(const VideoSlot *slot)
+{
+    uint64_t timestamp = slot->decoder.h265
+        ? jce_h265_decoder_frame_timestamp(slot->decoder.h265)
+        : jce_h264_decoder_frame_timestamp(slot->decoder.h264);
+    return slot->decoder.vtrack.timescale
+        ? (double)timestamp / slot->decoder.vtrack.timescale : 0.0;
+}
+
+static bool decoder_open(VideoSlot *slot, JceReadSource *source,
                          JceMp4Parser *parser)
 {
     if (!slot || !parser) return false;
@@ -1683,29 +1603,15 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
         }
     }
 
-    /* Copy the raw MP4 data so the parser's blob reference stays valid. */
-    slot->decoder.mp4_copy = (uint8_t *)JCE_MALLOC(size);
-    if (!slot->decoder.mp4_copy) return false;
-    memcpy(slot->decoder.mp4_copy, data, size);
-    slot->decoder.mp4_copy_size = (size_t)size;
-
-    /* Re-open parser on the owned copy (the original may be freed). */
     JceMp4Info dummy;
-    slot->decoder.parser = jce_mp4_parser_open_memory(
-        slot->decoder.mp4_copy, (size_t)size, &dummy);
-    if (!slot->decoder.parser) {
-        JCE_FREE(slot->decoder.mp4_copy);
-        slot->decoder.mp4_copy = NULL;
-        return false;
-    }
+    slot->decoder.parser = jce_mp4_parser_open_source(source,&dummy);
+    if (!slot->decoder.parser) return false;
 
     /* Re-query video track info from the new parser instance. */
     if (!jce_mp4_parser_get_video_track_info(slot->decoder.parser,
                                              &slot->decoder.vtrack)) {
         jce_mp4_parser_close(slot->decoder.parser);
         slot->decoder.parser = NULL;
-        JCE_FREE(slot->decoder.mp4_copy);
-        slot->decoder.mp4_copy = NULL;
         return false;
     }
 
@@ -1715,8 +1621,6 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
             LOG_WARN(LOG_TAG, "decoder_open: failed to init dav1d for MP4-AV1");
             jce_mp4_parser_close(slot->decoder.parser);
             slot->decoder.parser = NULL;
-            JCE_FREE(slot->decoder.mp4_copy);
-            slot->decoder.mp4_copy = NULL;
             return false;
         }
         /* Build AV1 keyframe sample index by scanning OBUs in each video
@@ -1732,8 +1636,6 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
             LOG_WARN(LOG_TAG, "decoder_open: failed to init libvpx for MP4-VP9");
             jce_mp4_parser_close(slot->decoder.parser);
             slot->decoder.parser = NULL;
-            JCE_FREE(slot->decoder.mp4_copy);
-            slot->decoder.mp4_copy = NULL;
             return false;
         }
         return true;
@@ -1746,8 +1648,6 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
             LOG_WARN(LOG_TAG, "decoder_open: failed to init OpenH264");
             jce_mp4_parser_close(slot->decoder.parser);
             slot->decoder.parser = NULL;
-            JCE_FREE(slot->decoder.mp4_copy);
-            slot->decoder.mp4_copy = NULL;
             return false;
         }
     } else {
@@ -1758,11 +1658,12 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
             LOG_WARN(LOG_TAG, "decoder_open: failed to init libhevc");
             jce_mp4_parser_close(slot->decoder.parser);
             slot->decoder.parser = NULL;
-            JCE_FREE(slot->decoder.mp4_copy);
-            slot->decoder.mp4_copy = NULL;
             return false;
         }
     }
+
+    if (slot->decoder.h265)
+        jce_h265_decoder_set_yuv_output(slot->decoder.h265, true);
 
     slot->decoder.width = slot->decoder.vtrack.width;
     slot->decoder.height = slot->decoder.vtrack.height;
@@ -1783,8 +1684,6 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
         }
         jce_mp4_parser_close(slot->decoder.parser);
         slot->decoder.parser = NULL;
-        JCE_FREE(slot->decoder.mp4_copy);
-        slot->decoder.mp4_copy = NULL;
         return false;
     }
 
@@ -1792,27 +1691,30 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
     uint32_t dw = 0, dh = 0;
     bool got_frame;
     if (slot->decoder.h265) {
+        jce_h265_decoder_set_timestamp(slot->decoder.h265,
+            decoder_packet_pts(slot, slot->decoder.sample_idx));
         got_frame = jce_h265_decode_frame(
             slot->decoder.h265,
-            slot->decoder.mp4_copy + si.offset,
+            decoder_mp4_packet(slot,&si),
             si.size_bytes,
             slot->decoder.vtrack.nal_length_size,
             &rgba, &dw, &dh);
     } else {
+        jce_h264_decoder_set_timestamp(slot->decoder.h264,
+            decoder_packet_pts(slot, slot->decoder.sample_idx));
         got_frame = jce_h264_decode_frame(
             slot->decoder.h264,
-            slot->decoder.mp4_copy + si.offset,
+            decoder_mp4_packet(slot,&si),
             si.size_bytes,
             slot->decoder.vtrack.nal_length_size,
             &rgba, &dw, &dh);
     }
 
-    if (got_frame && rgba && dw > 0 && dh > 0) {
+    if (got_frame && dw > 0 && dh > 0) {
         slot->decoder.width = dw;
         slot->decoder.height = dh;
-        if (ensure_rgba(slot, dw, dh)) {
-            memcpy(slot->rgba, rgba, (size_t)dw * dh * 4);
-        }
+        if (!decoder_publish_legacy(slot, rgba, dw, dh)) return false;
+        slot->frame_time = normalize_frame_time(slot, decoder_legacy_timestamp(slot), true);
         slot->frame_counter = 1;
     } else {
         /* First frame didn't produce output (B-frame delay or SPS/PPS only).
@@ -1822,40 +1724,19 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
         LOG_INFO(LOG_TAG, "decoder_open: first frame deferred (B-frame delay)");
     }
     slot->decoder.sample_idx = 1;
-    slot->frame_time = normalize_frame_time(slot, 0.0, true);
+    /* A deferred packet is not a picture and must not establish a PTS base. */
 
     /* Build keyframe index by scanning NAL headers of every sample.
      * Done once at open time so seek can binary-search O(log n). */
     {
         uint32_t sc = slot->decoder.vtrack.sample_count;
-        uint32_t nls = slot->decoder.vtrack.nal_length_size;
         uint32_t cap = (sc / 30) + 16; /* typical GOP ~30 frames */
         uint32_t *kf = (uint32_t *)JCE_MALLOC(cap * sizeof(uint32_t));
         uint32_t kf_count = 0;
 
         if (kf) {
             for (uint32_t i = 0; i < sc; i++) {
-                JceMp4SampleInfo ksi;
-                if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, i, &ksi))
-                    continue;
-                if (ksi.size_bytes <= nls)
-                    continue;
-                const uint8_t *nd = slot->decoder.mp4_copy + ksi.offset;
-                /* Read the first NAL unit type only (keyframe NAL is always first). */
-                uint32_t nal_len = 0;
-                for (uint32_t b = 0; b < nls; b++)
-                    nal_len = (nal_len << 8) | nd[b];
-                if (nal_len == 0 || nal_len > ksi.size_bytes - nls)
-                    continue;
-                bool is_kf = false;
-                if (slot->decoder.h265) {
-                    uint8_t nt = (nd[nls] >> 1) & 0x3F;
-                    is_kf = (nt >= 16 && nt <= 21);
-                } else {
-                    uint8_t nt = nd[nls] & 0x1F;
-                    is_kf = (nt == 5);
-                }
-                if (is_kf) {
+                if (is_sample_keyframe(slot, i)) {
                     if (kf_count >= cap) {
                         cap = cap * 2;
                         uint32_t *tmp = (uint32_t *)JCE_MALLOC(cap * sizeof(uint32_t));
@@ -1903,9 +1784,8 @@ static bool decoder_read_next(VideoSlot *slot)
             slot->decoder.height = dh;
             if (!ensure_rgba(slot, dw, dh)) return false;
             memcpy(slot->rgba, rgba, (size_t)dw * dh * 4);
-            /* Use synthetic timestamp — normalize_frame_time enforces
-             * monotonicity and will bump by one frame interval. */
-            slot->frame_time = normalize_frame_time(slot, slot->frame_time, true);
+            /* The buffered output carries the original picture PTS. */
+            slot->frame_time = normalize_frame_time(slot, decoder_legacy_timestamp(slot), true);
             slot->frame_counter++;
             slot->decoder.ended = false;
             return true;
@@ -1913,6 +1793,23 @@ static bool decoder_read_next(VideoSlot *slot)
     }
 
     if (slot->decoder.sample_idx >= slot->decoder.vtrack.sample_count) {
+        if (slot->decoder.h265 && jce_h265_decoder_drain(slot->decoder.h265)) {
+            if (!decoder_publish_legacy(slot, NULL, slot->decoder.width,
+                                         slot->decoder.height)) return false;
+            slot->frame_time = normalize_frame_time(slot, decoder_legacy_timestamp(slot), true);
+            ++slot->frame_counter;
+            slot->decoder.ended = false;
+            return true;
+        }
+        const uint8_t *rgba = NULL;
+        uint32_t w = 0u, h = 0u;
+        if (slot->decoder.h264 && jce_h264_decoder_drain(slot->decoder.h264, &rgba, &w, &h)) {
+            if (!decoder_publish_legacy(slot, rgba, w, h)) return false;
+            slot->frame_time = normalize_frame_time(slot, decoder_legacy_timestamp(slot), true);
+            ++slot->frame_counter;
+            slot->decoder.ended = false;
+            return true;
+        }
         slot->decoder.ended = true;
         return false;
     }
@@ -1928,16 +1825,20 @@ static bool decoder_read_next(VideoSlot *slot)
     uint32_t dw = 0, dh = 0;
     bool got_frame;
     if (slot->decoder.h265) {
+        jce_h265_decoder_set_timestamp(slot->decoder.h265,
+            decoder_packet_pts(slot, slot->decoder.sample_idx));
         got_frame = jce_h265_decode_frame(
             slot->decoder.h265,
-            slot->decoder.mp4_copy + si.offset,
+            decoder_mp4_packet(slot,&si),
             si.size_bytes,
             slot->decoder.vtrack.nal_length_size,
             &rgba, &dw, &dh);
     } else {
+        jce_h264_decoder_set_timestamp(slot->decoder.h264,
+            decoder_packet_pts(slot, slot->decoder.sample_idx));
         got_frame = jce_h264_decode_frame(
             slot->decoder.h264,
-            slot->decoder.mp4_copy + si.offset,
+            decoder_mp4_packet(slot,&si),
             si.size_bytes,
             slot->decoder.vtrack.nal_length_size,
             &rgba, &dw, &dh);
@@ -1945,7 +1846,7 @@ static bool decoder_read_next(VideoSlot *slot)
 
     slot->decoder.sample_idx++;
 
-    if (!got_frame || !rgba || dw == 0 || dh == 0) {
+    if (!got_frame || dw == 0 || dh == 0) {
         /* Decoder didn't produce a frame (B-frame delay, non-keyframe
          * without refs, etc).  Not an error — caller should keep going. */
         if (slot->decoder.sample_idx <= 8) {
@@ -1963,14 +1864,8 @@ static bool decoder_read_next(VideoSlot *slot)
 
     slot->decoder.width = dw;
     slot->decoder.height = dh;
-    if (!ensure_rgba(slot, dw, dh)) return false;
-    memcpy(slot->rgba, rgba, (size_t)dw * dh * 4);
-
-    double ts_sec = 0.0;
-    if (slot->decoder.vtrack.timescale > 0) {
-        ts_sec = (double)si.timestamp / (double)slot->decoder.vtrack.timescale;
-    }
-    slot->frame_time = normalize_frame_time(slot, ts_sec, true);
+    if (!decoder_publish_legacy(slot, rgba, dw, dh)) return false;
+    slot->frame_time = normalize_frame_time(slot, decoder_legacy_timestamp(slot), true);
     slot->frame_counter++;
     slot->decoder.ended = false;
     return true;
@@ -1980,48 +1875,9 @@ static bool decoder_read_next(VideoSlot *slot)
  * by inspecting NAL unit types in the bitstream data. */
 static bool is_sample_keyframe(const VideoSlot *slot, uint32_t sample_index)
 {
-    JceMp4SampleInfo si;
-    if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, sample_index, &si))
-        return false;
-
-    uint32_t nls = slot->decoder.vtrack.nal_length_size;
-    if (si.size_bytes <= nls)
-        return false;
-
-    const uint8_t *data = slot->decoder.mp4_copy + si.offset;
-    uint32_t remaining = si.size_bytes;
-
-    /* Walk through all NAL units in the sample (length-prefixed). */
-    while (remaining > nls) {
-        uint32_t nal_len = 0;
-        for (uint32_t i = 0; i < nls; i++)
-            nal_len = (nal_len << 8) | data[i];
-
-        data += nls;
-        remaining -= nls;
-
-        if (nal_len == 0 || nal_len > remaining)
-            break;
-
-        if (slot->decoder.h265) {
-            /* HEVC: nal_unit_type = (byte >> 1) & 0x3F
-             * BLA_W_LP=16, BLA_W_RADL=17, BLA_N_LP=18,
-             * IDR_W_RADL=19, IDR_N_LP=20, CRA_NUT=21 */
-            uint8_t nal_type = (data[0] >> 1) & 0x3F;
-            if (nal_type >= 16 && nal_type <= 21)
-                return true;
-        } else {
-            /* H.264: nal_unit_type = byte & 0x1F
-             * IDR slice = 5 */
-            uint8_t nal_type = data[0] & 0x1F;
-            if (nal_type == 5)
-                return true;
-        }
-
-        data += nal_len;
-        remaining -= nal_len;
-    }
-    return false;
+    bool sync = false;
+    return jce_mp4_parser_video_sample_sync(slot->decoder.parser,sample_index,&sync)
+        && sync;
 }
 
 static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
@@ -2086,15 +1942,7 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
      * cycle if we would land on the same keyframe as last time. */
     if (!exact && keyframe_idx == slot->decoder.last_seek_kf_idx
         && slot->frame_counter > 0) {
-        slot->time = time_sec;
-        /* Recalibrate base so post-scrub advance produces correct times. */
-        JceMp4SampleInfo tsi;
-        if (jce_mp4_parser_get_video_sample(slot->decoder.parser, target_idx, &tsi)) {
-            double target_raw = (double)tsi.timestamp / (double)ts_scale;
-            slot->decode_ts_base_sec = target_raw - time_sec;
-            slot->decode_ts_base_set = true;
-        }
-        slot->frame_time = time_sec;
+        if (!slot->queue_active) slot->time = time_sec;
         return true;
     }
     slot->decoder.last_seek_kf_idx = keyframe_idx;
@@ -2105,21 +1953,25 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     else
         jce_h264_decoder_flush(slot->decoder.h264);
 
-    /* Reset frame counter so normalize_frame_time re-calibrates. */
-    slot->frame_counter = 0;
-    slot->decode_ts_base_set = false;
+    /* Progressive sample DTS is already relative to the track start. Keep
+     * it absolute during the keyframe walk; reseeding the first decoded
+     * frame to zero made long-file seeks show a stale timestamp. */
+    slot->frame_counter = 1;
+    slot->decode_ts_base_set = true;
+    slot->decode_ts_base_sec = 0.0;
+    slot->frame_time = 0.0;
     slot->decoder.sample_idx = keyframe_idx;
     slot->decoder.ended = false;
     slot->ended = false;
-    slot->time = time_sec;
+    if (!slot->queue_active) slot->time = time_sec;
 
     if (exact) {
         /* Exact seek (on scrub release): decode from keyframe up to the
          * target sample.  Stop once we've fed the target to keep
          * sample_idx aligned with the displayed content. */
         const uint64_t seek_start_ms = jce_time_ticks_ms();
-        while (slot->decoder.sample_idx <= target_idx
-               && slot->decoder.sample_idx < sc) {
+        while ((slot->frame_counter <= 1u || slot->frame_time + 0.0005 < time_sec)
+               && !slot->decoder.ended) {
             if (!decoder_read_next(slot)) {
                 if (slot->decoder.ended) break;
             }
@@ -2141,20 +1993,6 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
         }
     }
 
-    /* Recalibrate decode_ts_base so that subsequent normalize_frame_time
-     * calls produce correct absolute playback timestamps.
-     * base = raw_ts[target] - time_sec, so:
-     *   normalize(raw_ts[next]) = raw_ts[next] - base
-     *                            = (raw_ts[next] - raw_ts[target]) + time_sec
-     *                            ≈ time_sec + frame_interval              */
-    {
-        JceMp4SampleInfo tsi;
-        if (jce_mp4_parser_get_video_sample(slot->decoder.parser, target_idx, &tsi)) {
-            double target_raw = (double)tsi.timestamp / (double)ts_scale;
-            slot->decode_ts_base_sec = target_raw - time_sec;
-            slot->decode_ts_base_set = true;
-        }
-    }
     /* Do NOT overwrite slot->frame_time with time_sec here. The real
      * PTS of the last decoded frame (set by decoder_read_next via
      * normalize_frame_time) is what advance()'s catch-up loop needs to
@@ -2185,9 +2023,6 @@ static void decoder_close(VideoSlot *slot)
     JCE_FREE(slot->decoder.keyframe_indices);
     slot->decoder.keyframe_indices = NULL;
     slot->decoder.keyframe_count = 0;
-    JCE_FREE(slot->decoder.mp4_copy);
-    slot->decoder.mp4_copy = NULL;
-    slot->decoder.mp4_copy_size = 0;
 }
 
 /* ======================================================================
@@ -2196,7 +2031,7 @@ static void decoder_close(VideoSlot *slot)
  * The worker thread:
  *   - Owns the parser + decoder exclusively (no locks needed for those)
  *   - Loops decoder_read_next; pushes the decoded RGBA into the queue
- *   - Handles seek / loop-back EOF autonomously
+ *   - Handles owner-requested seek/loop commands; drains delayed EOF output
  *
  * The UI thread (jce_video_advance):
  *   - Reads audio_master clock as before
@@ -2272,6 +2107,27 @@ static void queue_destroy(VideoSlot *slot)
  * queue). Returns false on push failure (alloc OOM); true otherwise. */
 static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
 {
+    bool prepared = false;
+    uint32_t limit;
+    jce_mutex_lock(slot->qmtx);
+    limit = slot->worker_preview_limit;
+    jce_mutex_unlock(slot->qmtx);
+    if (limit && slot->pending_yuv_valid) {
+        const uint64_t begin = perf_now();
+        JceYuv420Frame input = {
+            slot->pending_yuv_y, slot->pending_yuv_u, slot->pending_yuv_v,
+            (int)slot->pending_yuv_y_stride, (int)slot->pending_yuv_uv_stride,
+            (int)slot->pending_yuv_w, (int)slot->pending_yuv_h
+        };
+        if (!jce_video_frame_prepare(&slot->frame_processor, &input, limit))
+            return false;
+        slot->pending_yuv_valid = false;
+        prepared = true;
+        jce_mutex_lock(slot->qmtx);
+        perf_ema_update(&slot->perf_convert_us_ema, &slot->perf_convert_us_last,
+                        perf_us(slot, begin, perf_now()));
+        jce_mutex_unlock(slot->qmtx);
+    }
     /* YUV mode (Stage 2: AV1 / VP8 — saves ~100MB at 4K vs RGBA). */
     if (slot->queue_yuv_mode && slot->pending_yuv_valid) {
         const uint32_t w = slot->pending_yuv_w;
@@ -2352,9 +2208,13 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
         return true;
     }
 
-    /* RGBA mode (legacy, H264 / H265). */
-    if (!slot->rgba || slot->rgba_w <= 0 || slot->rgba_h <= 0) return true;
-    size_t need = (size_t)slot->rgba_w * (size_t)slot->rgba_h * 4u;
+    /* Worker previews and native H.264/H.265 share the RGBA ring. */
+    uint8_t **pixels = prepared ? &slot->frame_processor.rgba : &slot->rgba;
+    size_t *capacity = prepared ? &slot->frame_processor.capacity : NULL;
+    int width = prepared ? slot->frame_processor.width : slot->rgba_w;
+    int height = prepared ? slot->frame_processor.height : slot->rgba_h;
+    if (!*pixels || width <= 0 || height <= 0) return true;
+    size_t need = (size_t)width * (size_t)height * 4u;
 
     jce_mutex_lock(slot->qmtx);
     /* Wait until queue has space (or quit/seek). S7: drop stale head. */
@@ -2375,16 +2235,23 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
     }
 
     VideoQueueEntry *e = qe_at(slot, slot->q_tail);
-    if (e->rgba_capacity < need) {
-        JCE_FREE(e->rgba);
-        e->rgba = (uint8_t *)JCE_MALLOC(need);
-        if (!e->rgba) { e->rgba_capacity = 0; jce_mutex_unlock(slot->qmtx); return false; }
-        e->rgba_capacity = need;
+    if (prepared) {
+        uint8_t *old_pixels = e->rgba;
+        size_t old_capacity = e->rgba_capacity;
+        e->rgba = *pixels;
+        e->rgba_capacity = *capacity;
+        *pixels = old_pixels;
+        *capacity = old_capacity;
+    } else {
+        if (!jce_yuv_buffer_reserve(&e->rgba, &e->rgba_capacity, need)) {
+            jce_mutex_unlock(slot->qmtx);
+            return false;
+        }
+        memcpy(e->rgba, *pixels, need);
     }
-    memcpy(e->rgba, slot->rgba, need);
     e->is_yuv = false;
-    e->w = slot->rgba_w;
-    e->h = slot->rgba_h;
+    e->w = width;
+    e->h = height;
     e->pts_sec = slot->frame_time;
     e->serial = serial;
 
@@ -2404,7 +2271,25 @@ static void worker_main(VideoSlot *slot)
         jce_mutex_unlock(slot->qmtx);
     }
 
+    /* Opening already decoded the first picture. Publish it before advancing
+     * the decoder, unless a newer seek has superseded this initial picture. */
+    jce_mutex_lock(slot->qmtx);
+    bool publish_initial = !slot->seek_request && slot->frame_counter > 0u;
+    jce_mutex_unlock(slot->qmtx);
+    if (publish_initial && worker_push_current_frame(slot, my_serial)) {
+        jce_mutex_lock(slot->qmtx);
+        slot->perf_frames_decoded++;
+        jce_mutex_unlock(slot->qmtx);
+    }
+    /* Published YUV replaces the open-time RGBA copy. The owner only reads
+     * display storage once queue_active is set. */
+    if (slot->preview_supported) {
+        JCE_FREE(slot->rgba);
+        slot->rgba = NULL;
+        slot->rgba_w = slot->rgba_h = 0;
+    }
     int consec_fail = 0;
+    double preroll_target = -1.0;
     while (true) {
         /* Honor quit / seek commands FIRST. */
         bool do_seek = false;
@@ -2428,8 +2313,18 @@ static void worker_main(VideoSlot *slot)
         jce_mutex_unlock(slot->qmtx);
 
         if (do_seek) {
+            preroll_target = seek_exact ? seek_t : -1.0;
             slot->post_seek = true;
-            (void)decoder_seek(slot, seek_t, seek_exact);
+            /* decoder_seek may already decode the requested frame. Publish
+             * it before reading the next packet, otherwise the exact frame
+             * is skipped (and audio can wait forever for a visible frame). */
+            slot->pending_yuv_valid = false;
+            const bool seek_ok = decoder_seek(slot, seek_t, seek_exact);
+            if (seek_ok && (!seek_exact || slot->frame_time + 0.0005 >= seek_t)
+                && (slot->pending_yuv_valid || (slot->rgba && slot->frame_counter > 1))) {
+                (void)worker_push_current_frame(slot, my_serial);
+                preroll_target = -1.0;
+            }
             slot->post_seek = false;
             consec_fail = 0;
             continue;
@@ -2447,27 +2342,17 @@ static void worker_main(VideoSlot *slot)
             continue;
         }
 
-        /* Loop-back: if we're at end and looping, seek to 0 ourselves. */
-        if (slot->loop && slot->duration > 0.0
-            && slot->frame_time >= slot->duration - 0.001) {
-            slot->post_seek = true;
-            if (decoder_seek(slot, 0.0, false)) {
-                slot->frame_time = 0.0;
-            }
-            slot->post_seek = false;
-            consec_fail = 0;
-            continue;
-        }
-
         /* Decode one frame. */
         const uint64_t t_dec0 = perf_now();
         bool ok = decoder_read_next(slot);
         const uint64_t t_dec1 = perf_now();
         if (ok) {
+            jce_mutex_lock(slot->qmtx);
             perf_ema_update(&slot->perf_decode_us_ema,
                             &slot->perf_decode_us_last,
                             perf_us(slot, t_dec0, t_dec1));
             slot->perf_frames_decoded++;
+            jce_mutex_unlock(slot->qmtx);
         }
         if (!ok) {
             if (slot->decoder.ended) {
@@ -2491,12 +2376,24 @@ static void worker_main(VideoSlot *slot)
             continue;
         }
         consec_fail = 0;
+        /* Preroll pictures are references, not presentation output. Avoid
+         * downsampling/converting/copying them merely for the owner to drop. */
+        if (preroll_target >= 0.0 && slot->frame_time + frame_interval_seconds(slot) < preroll_target) {
+            slot->pending_yuv_valid = false;
+            jce_mutex_lock(slot->qmtx);
+            ++slot->perf_frames_dropped;
+            jce_mutex_unlock(slot->qmtx);
+            continue;
+        }
+        preroll_target = -1.0;
 
         const uint64_t t_push0 = perf_now();
         const bool push_ok = worker_push_current_frame(slot, my_serial);
+        jce_mutex_lock(slot->qmtx);
         perf_ema_update(&slot->perf_push_us_ema,
                         &slot->perf_push_us_last,
                         perf_us(slot, t_push0, perf_now()));
+        jce_mutex_unlock(slot->qmtx);
         if (!push_ok) {
             /* OOM on queue buffer; back off briefly. */
             jce_thread_sleep_ms(10);
@@ -2520,13 +2417,15 @@ static bool worker_start(VideoSlot *slot)
      * the old RGBA-in-queue path for a 4-slot queue at 4K.
      * Requires: S3 (AVX2 conversion) to keep UI thread < 8 ms/frame. */
     slot->queue_yuv_mode = true;
-    slot->pending_yuv_valid = false;
     slot->queue_active = true;
+    slot->preview_supported = slot->decoder.av1 || slot->decoder.vp8
+        || slot->decoder.vp9 || slot->decoder.h265;
     slot->worker_running = true;
     slot->worker_thread = jce_thread_create(worker_thread_entry, slot,
                                             "jce_video_worker");
     if (!slot->worker_thread) {
         slot->queue_active = false;
+        slot->preview_supported = false;
         slot->worker_running = false;
         queue_destroy(slot);
         return false;
@@ -2573,20 +2472,8 @@ static bool ensure_display_rgba(VideoSlot *slot, int w, int h)
 {
     if (w <= 0 || h <= 0) return false;
     size_t need = (size_t)w * (size_t)h * 4u;
-    if (slot->display_rgba && slot->display_rgba_capacity >= need) {
-        slot->display_rgba_w = w;
-        slot->display_rgba_h = h;
-        return true;
-    }
-    JCE_FREE(slot->display_rgba);
-    slot->display_rgba = (uint8_t *)JCE_MALLOC(need);
-    if (!slot->display_rgba) {
-        slot->display_rgba_w = 0;
-        slot->display_rgba_h = 0;
-        slot->display_rgba_capacity = 0;
+    if (!jce_yuv_buffer_reserve(&slot->display_rgba, &slot->display_rgba_capacity, need))
         return false;
-    }
-    slot->display_rgba_capacity = need;
     slot->display_rgba_w = w;
     slot->display_rgba_h = h;
     return true;
@@ -2641,6 +2528,38 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec)
         ++drops_this_call;
     }
 
+    /* The first decoded frame after a seek may be just beyond the requested
+     * time. Audio can be paused until that frame appears, so give it at most
+     * one-and-a-half frame intervals of look-ahead to avoid a clock stall. */
+    double seek_slack = 0.0;
+    if (slot->seek_display_pending) {
+        const double fps = slot->framerate > 0.0 ? slot->framerate : 30.0;
+        seek_slack = 1.5 / fps;
+        if (seek_slack < 0.05) seek_slack = 0.05;
+        if (seek_slack > 0.25) seek_slack = 0.25;
+    }
+    /* Keep the previous picture until current-generation preroll reaches
+     * the seek target. Wake the producer even if every queued frame is old. */
+    if (slot->seek_display_pending) {
+        while (slot->q_count > 0 && qe_at(slot, slot->q_head)->pts_sec + seek_slack < slot->seek_display_target) {
+            slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
+            slot->q_count--;
+            ++drops_this_call;
+        }
+        if (drops_this_call) {
+            slot->perf_frames_dropped += (uint64_t)drops_this_call;
+            drops_this_call = 0;
+            jce_cond_broadcast(slot->q_not_full);
+        }
+    }
+    /* Publish an initial preview even when the first presentation timestamp
+     * is positive. This changes only the display target, never the transport
+     * clock; a paused restore must not wait for playback to reach that PTS. */
+    if (slot->display_frame_counter == 0u && !slot->seek_display_pending
+        && slot->q_count > 0) {
+        const double first_pts = qe_at(slot, slot->q_head)->pts_sec;
+        if (first_pts > target_sec) target_sec = first_pts;
+    }
     /* Pop all frames with pts <= target (display only the LAST). */
     VideoQueueEntry *display_e = NULL;
     while (slot->q_count > 0) {
@@ -2650,6 +2569,18 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec)
         display_e = e;
         slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
         slot->q_count--;
+    }
+
+    /* Only use look-ahead when no due picture exists. Selecting every
+     * picture inside the seek window skips an exact target (including PTS 0)
+     * and publishes a future picture while the transport is still frozen. */
+    if (!display_e && slot->seek_display_pending && slot->q_count > 0) {
+        VideoQueueEntry *e = qe_at(slot, slot->q_head);
+        if (e->pts_sec <= target_sec + seek_slack + 0.0005) {
+            display_e = e;
+            slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
+            slot->q_count--;
+        }
     }
 
     if (display_e) {
@@ -2701,23 +2632,32 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec)
     /* OUTSIDE the lock: do the SIMD YUV → RGBA so the worker can push
      * concurrently. RGBA mode is already done (swap copied the pixels). */
     if (is_yuv) {
-        if (!ensure_display_rgba(slot, fw, fh)) return false;
         uint64_t t_conv0 = perf_now();
-        jce_yuv420_to_rgba(slot->display_y, slot->display_y_stride,
-                           slot->display_u, slot->display_uv_stride,
-                           slot->display_v, slot->display_uv_stride,
-                           slot->display_rgba,
-                           (uint32_t)fw, (uint32_t)fh);
+        JceYuv420Frame input = {slot->display_y, slot->display_u, slot->display_v,
+                               slot->display_y_stride, slot->display_uv_stride, fw, fh};
+        JceYuv420Frame output;
+        if (!jce_yuv_preview_prepare(&slot->preview, &input, &output)
+            || !ensure_display_rgba(slot, output.width, output.height)) return false;
+        jce_yuv420_to_rgba(output.y, output.y_stride, output.u, output.uv_stride,
+                          output.v, output.uv_stride, slot->display_rgba,
+                          (uint32_t)output.width, (uint32_t)output.height);
+        jce_mutex_lock(slot->qmtx);
         perf_ema_update(&slot->perf_convert_us_ema, &slot->perf_convert_us_last,
                         perf_us(slot, t_conv0, perf_now()));
+        jce_mutex_unlock(slot->qmtx);
         slot->display_yuv_pending = false;
     }
     slot->display_frame_time = pts;
+    if (slot->seek_display_pending
+        && pts + seek_slack >= slot->seek_display_target)
+        slot->seek_display_pending = false;
     slot->display_frame_counter++;
+    jce_mutex_lock(slot->qmtx);
     slot->perf_frames_displayed++;
     slot->perf_frames_dropped += (uint64_t)drops_this_call;
     perf_ema_update(&slot->perf_pop_us_ema, &slot->perf_pop_us_last,
                     perf_us(slot, t_pop0, perf_now()));
+    jce_mutex_unlock(slot->qmtx);
     return true;
 }
 
@@ -2727,11 +2667,12 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec)
 
 extern "C" {
 
-JceVideo jce_video_load_memory(const void *data, uint32_t size,
-                               const char *hint_path)
+JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
 {
     JceMp4Parser *parser;
-    if (!data || size == 0u) return JCE_VIDEO_INVALID;
+    uint8_t data[32];
+    const size_t size = jce_read_source_read_at(source,0u,data,sizeof(data));
+    if (!source || !size) return JCE_VIDEO_INVALID;
 
     int idx = alloc_slot();
     if (idx < 0) {
@@ -2743,11 +2684,13 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
     if (jce_av1_is_ivf(data, size)) {
         VideoSlot *slot = &s_slots[idx];
         memset(slot, 0, sizeof(*slot));
+        slot->source = jce_read_source_acquire(source);
 
-        if (!av1_decoder_open(slot, data, size)) {
+        if (!av1_decoder_open(slot,source)) {
             LOG_ERROR(LOG_TAG, "AV1/IVF open failed for '%s'",
                       hint_path ? hint_path : "<memory>");
-            memset(slot, 0, sizeof(*slot));
+            jce_read_source_close(slot->source);
+            memset(slot,0,sizeof(*slot));
             return JCE_VIDEO_INVALID;
         }
 
@@ -2787,9 +2730,11 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
         VideoSlot *slot = &s_slots[idx];
         memset(slot, 0, sizeof(*slot));
 
-        if (!webm_decoder_open(slot, data, size)) {
+        slot->source = jce_read_source_acquire(source);
+        if (!webm_decoder_open(slot,source)) {
             LOG_ERROR(LOG_TAG, "WebM open failed for '%s'",
                       hint_path ? hint_path : "<memory>");
+            jce_read_source_close(slot->source);
             memset(slot, 0, sizeof(*slot));
             return JCE_VIDEO_INVALID;
         }
@@ -2815,46 +2760,33 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
         slot->audio_sample_count = 0u;
         if (slot->decoder.webm_audio_codec == JCE_WEBM_AUDIO_OPUS
             && slot->decoder.webm_audio_channels > 0) {
-            /* Streaming WebM/Opus: keep a private copy of the WebM bytes
-             * alive on the slot, build a JceAudioStream that owns its
-             * own webm parser + Opus decoder, and decode lazily as the
-             * audio engine pulls. No background blob worker, no 22 MB
-             * allocation. */
+            /* Independent audio/video parsers share the retained input source.
+             * Opus decodes into a bounded PCM ring on its own worker. */
             uint32_t channels = slot->decoder.webm_audio_channels;
-            uint8_t *wcopy = (uint8_t *)JCE_MALLOC(size);
             snprintf(slot->audio_codec, sizeof(slot->audio_codec), "opus");
-            if (!wcopy) {
+            JceAudioStream *as = create_webm_opus_stream(
+                source, channels, slot->duration);
+            if (!as) {
                 set_audio_status(slot,
                     JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                    "out of memory for WebM Opus streaming buffer");
+                    "failed to initialise WebM Opus stream");
             } else {
-                memcpy(wcopy, data, size);
-                JceAudioStream *as = create_webm_opus_stream(
-                    wcopy, (size_t)size, channels, slot->duration);
-                if (!as) {
-                    JCE_FREE(wcopy);
-                    set_audio_status(slot,
-                        JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                        "failed to initialise WebM Opus stream");
-                } else {
-                    slot->webm_data            = wcopy;
-                    slot->webm_data_size       = (size_t)size;
-                    slot->audio_stream         = as;
-                    slot->has_audio            = true;
-                    slot->samplerate           = 48000;
-                    slot->audio_channels       = (int)channels;
-                    slot->audio_pcm_channels   = channels;
-                    slot->audio_pcm_samplerate = 48000u;
-                    slot->audio_pcm_frames     = (uint32_t)
-                        (slot->duration * 48000.0);
-                    slot->audio_sample_count   = slot->audio_pcm_frames;
-                    set_audio_status(slot, JCE_VIDEO_AUDIO_STATUS_READY,
-                                     "WebM Opus streaming ready");
-                    LOG_INFO(LOG_TAG,
-                        "WebM Opus streaming initialised (%uch @ 48000Hz)",
-                        channels);
-                }
+                slot->audio_stream         = as;
+                slot->has_audio            = true;
+                slot->samplerate           = 48000;
+                slot->audio_channels       = (int)channels;
+                slot->audio_pcm_channels   = channels;
+                slot->audio_pcm_samplerate = 48000u;
+                slot->audio_pcm_frames     = (uint32_t)
+                    (slot->duration * 48000.0);
+                slot->audio_sample_count   = slot->audio_pcm_frames;
+                set_audio_status(slot, JCE_VIDEO_AUDIO_STATUS_READY,
+                                 "WebM Opus streaming ready");
+                LOG_INFO(LOG_TAG,
+                    "WebM Opus streaming initialised (%uch @ 48000Hz)",
+                    channels);
             }
+
         } else if (slot->decoder.webm_audio_codec == JCE_WEBM_AUDIO_VORBIS) {
             snprintf(slot->audio_codec, sizeof(slot->audio_codec), "vorb");
             set_audio_status(slot, JCE_VIDEO_AUDIO_STATUS_UNSUPPORTED_CODEC,
@@ -2882,7 +2814,7 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
     }
 
     JceMp4Info mp4;
-    parser = jce_mp4_parser_open_memory(data, (size_t)size, &mp4);
+    parser = jce_mp4_parser_open_source(source,&mp4);
     if (!parser) {
         LOG_ERROR(LOG_TAG, "load failed for '%s': %s",
             hint_path ? hint_path : "<memory>",
@@ -2892,6 +2824,7 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
 
     VideoSlot *slot = &s_slots[idx];
     memset(slot, 0, sizeof(*slot));
+    slot->source = jce_read_source_acquire(source);
 
     slot->width      = (int)mp4.width;
     slot->height     = (int)mp4.height;
@@ -2926,35 +2859,30 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
                     "-DJCE_ENABLE_PATENTED_CODECS=ON)");
 #else
                 /* ── Streaming AAC: ring-buffered, no full PCM blob ─ */
-                uint8_t *mp4_copy = (uint8_t *)JCE_MALLOC(size);
                 uint8_t *cfg_copy = (uint8_t *)JCE_MALLOC(
                     atr.decoder_config_bytes);
-                if (!mp4_copy || !cfg_copy) {
-                    JCE_FREE(mp4_copy); JCE_FREE(cfg_copy);
+                if (!cfg_copy) {
+                    JCE_FREE(cfg_copy);
                     set_audio_status(slot,
                         JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
                         "out of memory for streaming AAC buffers");
                 } else {
-                    memcpy(mp4_copy, data, size);
                     memcpy(cfg_copy, atr.decoder_config,
                            atr.decoder_config_bytes);
                     uint32_t ch  = atr.channels    ? atr.channels    : 2u;
                     uint32_t sr  = atr.samplerate_hz ? atr.samplerate_hz : 48000u;
                     JceAudioStream *as = create_mp4_aac_stream(
-                        mp4_copy, (size_t)size,
+                        source,
                         cfg_copy, atr.decoder_config_bytes,
                         ch, sr, atr.sample_count, mp4.duration_seconds);
                     /* fdk-aac copies ASC into its own state in
                      * aacDecoder_ConfigRaw — cfg_copy can be freed now. */
                     JCE_FREE(cfg_copy);
                     if (!as) {
-                        JCE_FREE(mp4_copy);
                         set_audio_status(slot,
                             JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
                             "failed to init streaming AAC source");
                     } else {
-                        slot->webm_data            = mp4_copy;
-                        slot->webm_data_size       = (size_t)size;
                         slot->audio_stream         = as;
                         slot->samplerate           = (int)sr;
                         slot->audio_channels       = (int)ch;
@@ -2978,42 +2906,32 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
                                  "AAC track found but decoder config missing");
             } else if (strcmp(atr.codec, "opus") == 0) {
                 /* ── Streaming MP4 Opus: ring-buffered, no full PCM blob ─ */
-                uint8_t *mp4_copy = (uint8_t *)JCE_MALLOC(size);
-                if (!mp4_copy) {
+                uint32_t ch  = atr.channels    ? atr.channels    : 2u;
+                uint32_t sr  = atr.samplerate_hz ? atr.samplerate_hz : 48000u;
+                JceAudioStream *as = create_mp4_opus_stream(
+                    source, ch, sr,
+                    atr.sample_count, mp4.duration_seconds);
+                if (!as) {
                     set_audio_status(slot,
                         JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                        "out of memory for streaming MP4 Opus buffer");
+                        "failed to init streaming MP4 Opus source");
                 } else {
-                    memcpy(mp4_copy, data, size);
-                    uint32_t ch  = atr.channels    ? atr.channels    : 2u;
-                    uint32_t sr  = atr.samplerate_hz ? atr.samplerate_hz : 48000u;
-                    JceAudioStream *as = create_mp4_opus_stream(
-                        mp4_copy, (size_t)size, ch, sr,
-                        atr.sample_count, mp4.duration_seconds);
-                    if (!as) {
-                        JCE_FREE(mp4_copy);
-                        set_audio_status(slot,
-                            JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                            "failed to init streaming MP4 Opus source");
-                    } else {
-                        slot->webm_data            = mp4_copy;
-                        slot->webm_data_size       = (size_t)size;
-                        slot->audio_stream         = as;
-                        slot->samplerate           = (int)sr;
-                        slot->audio_channels       = (int)ch;
-                        slot->audio_pcm_channels   = ch;
-                        slot->audio_pcm_samplerate = sr;
-                        slot->audio_pcm_frames     = (uint32_t)
-                            (mp4.duration_seconds * (double)sr);
-                        slot->audio_sample_count   = slot->audio_pcm_frames;
-                        set_audio_status(slot,
-                            JCE_VIDEO_AUDIO_STATUS_READY,
-                            "MP4 Opus streaming source ready");
-                        LOG_INFO(LOG_TAG,
-                            "MP4 Opus streaming initialised (%uch @ %uHz)",
-                            ch, sr);
-                    }
+                    slot->audio_stream         = as;
+                    slot->samplerate           = (int)sr;
+                    slot->audio_channels       = (int)ch;
+                    slot->audio_pcm_channels   = ch;
+                    slot->audio_pcm_samplerate = sr;
+                    slot->audio_pcm_frames     = (uint32_t)
+                        (mp4.duration_seconds * (double)sr);
+                    slot->audio_sample_count   = slot->audio_pcm_frames;
+                    set_audio_status(slot,
+                        JCE_VIDEO_AUDIO_STATUS_READY,
+                        "MP4 Opus streaming source ready");
+                    LOG_INFO(LOG_TAG,
+                        "MP4 Opus streaming initialised (%uch @ %uHz)",
+                        ch, sr);
                 }
+
             } else if (atr.codec[0]) {
                 char msg[128];
                 snprintf(msg,
@@ -3036,7 +2954,7 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
     }
 
     /* Try cross-platform OpenH264 decoder (must happen before closing parser). */
-    if (!decoder_open(slot, data, size, parser)) {
+    if (!decoder_open(slot,source,parser)) {
         LOG_WARN(LOG_TAG,
             "decoder backend unavailable for '%s' (codec=%s) — metadata-only mode",
             hint_path ? hint_path : "<memory>",
@@ -3054,7 +2972,7 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
         slot->time  = 0.0;
     }
 
-    /* Close the original parser — decoder_open made its own copy. */
+    /* Each decoder parser retains the same input source. */
     jce_mp4_parser_close(parser);
 
     slot->used = true;
@@ -3079,6 +2997,23 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
     return (JceVideo)(idx + 1);
 }
 
+JceVideo jce_video_load_memory(const void *data, uint32_t size,
+                               const char *hint_path)
+{
+    JceReadSource *source = jce_read_source_open_memory(data,size,true);
+    JceVideo video = jce_video_load_source(source,hint_path);
+    jce_read_source_close(source);
+    return video;
+}
+
+JceVideo jce_video_load_file(const char *path)
+{
+    JceReadSource *source = jce_read_source_open_file(path);
+    JceVideo video = jce_video_load_source(source,path);
+    jce_read_source_close(source);
+    return video;
+}
+
 void jce_video_unload(JceVideo v)
 {
     VideoSlot *slot = slot_from_handle(v);
@@ -3088,7 +3023,7 @@ void jce_video_unload(JceVideo v)
     worker_stop(slot);
 
     /* Tear the streaming source down BEFORE the underlying buffers it
-     * borrows (audio_pcm or webm_data). Its worker thread reads from
+     * retains. Its worker thread reads from
      * those, so the order matters. */
     if (slot->audio_stream) {
         jce_audio_stream_destroy(slot->audio_stream);
@@ -3098,9 +3033,13 @@ void jce_video_unload(JceVideo v)
     decoder_close(slot);
 
     if (slot->audio_pcm) { JCE_FREE(slot->audio_pcm); slot->audio_pcm = NULL; }
-    if (slot->webm_data) { JCE_FREE(slot->webm_data); slot->webm_data = NULL; }
+
     if (slot->rgba) { JCE_FREE(slot->rgba); slot->rgba = NULL; }
     if (slot->display_rgba) { JCE_FREE(slot->display_rgba); slot->display_rgba = NULL; }
+    JCE_FREE(slot->preview.buffer);
+    jce_video_frame_destroy(&slot->frame_processor);
+    JCE_FREE(slot->decoder.packet);
+    jce_read_source_close(slot->source);
     if (slot->display_y) { JCE_FREE(slot->display_y); slot->display_y = NULL; slot->display_y_capacity = 0; }
     if (slot->display_u) { JCE_FREE(slot->display_u); slot->display_u = NULL; slot->display_u_capacity = 0; }
     if (slot->display_v) { JCE_FREE(slot->display_v); slot->display_v = NULL; slot->display_v_capacity = 0; }
@@ -3137,6 +3076,21 @@ double jce_video_get_duration(JceVideo v)
     return slot ? slot->duration : 0.0;
 }
 
+bool jce_video_is_ready_to_play(JceVideo v)
+{
+    VideoSlot *slot = slot_from_handle(v);
+    if (!slot || slot->metadata_only || slot->seek_display_pending) return false;
+    if (slot->queue_active) {
+        if (!slot->display_rgba || !slot->display_frame_counter) return false;
+        jce_mutex_lock(slot->qmtx);
+        bool pending = slot->seek_request;
+        jce_mutex_unlock(slot->qmtx);
+        if (pending) return false;
+    } else if (!slot->rgba || !slot->frame_counter) return false;
+    return slot->audio_status != JCE_VIDEO_AUDIO_STATUS_DECODING
+        && (!slot->audio_stream || jce_audio_stream_ready(slot->audio_stream));
+}
+
 bool jce_video_has_ended(JceVideo v)
 {
     VideoSlot *slot = slot_from_handle(v);
@@ -3153,7 +3107,13 @@ void jce_video_get_size(JceVideo v, int *out_w, int *out_h)
 void jce_video_advance(JceVideo v, double dt_seconds)
 {
     VideoSlot *slot = slot_from_handle(v);
-    if (!slot || dt_seconds <= 0.0) return;
+    if (!slot || dt_seconds < 0.0) return;
+    if (dt_seconds == 0.0) {
+        /* Paused consumers still publish worker output, including an exact
+         * seek result, without advancing the clock or pulling audio. */
+        if (slot->queue_active) ui_pop_for_target(slot, slot->time);
+        return;
+    }
     if (dt_seconds > 1.0) dt_seconds = 1.0;
 
     /* Metadata-only: tick the clock. */
@@ -3177,6 +3137,14 @@ void jce_video_advance(JceVideo v, double dt_seconds)
         return;
     }
 
+    /* Never advance into an unpublished seek picture or unbuffered audio.
+     * Both decoders prepare concurrently while the transport stays pinned. */
+    if (slot->queue_active && (slot->seek_display_pending
+        || (slot->audio_stream && !jce_audio_stream_ready(slot->audio_stream)))) {
+        ui_pop_for_target(slot, slot->time);
+        return;
+    }
+
     /* Decode path. */
     /* ── Audio-master clock ──────────────────────────────────────
      * If we have an audio stream that has actually started producing
@@ -3196,22 +3164,21 @@ void jce_video_advance(JceVideo v, double dt_seconds)
     if (slot->audio_stream
         && jce_audio_stream_is_primed(slot->audio_stream)
         && !jce_audio_stream_eof(slot->audio_stream)) {
-        target = jce_audio_stream_get_time(slot->audio_stream);
+        target = jce_video_clock_follow_audio(
+            slot->time, dt_seconds,
+            jce_audio_stream_get_time(slot->audio_stream));
         audio_master = true;
-        /* Guard: never let audio drag the clock backward (a stale pull
-         * that returned <0 frames between get_time samples could in
-         * theory measure as a tiny regression). */
-        if (target < slot->time) target = slot->time;
-        /* Bound forward jumps to avoid swallowing a huge gap in one
-         * tick when audio races ahead during decoder hiccups. Allow up
-         * to 2× the wall-clock dt of catch-up per tick. */
-        double max_step = dt_seconds * 2.0;
-        if (target > slot->time + max_step) target = slot->time + max_step;
     } else {
         target = slot->time + dt_seconds;
     }
     if (slot->duration > 0.0) {
         if (slot->loop) {
+            if (slot->queue_active && target >= slot->duration) {
+                target = fmod(target, slot->duration);
+                jce_video_seek(v, target, true);
+                ui_pop_for_target(slot, target);
+                return;
+            }
             while (target >= slot->duration) {
                 target -= slot->duration;
                 slot->post_seek = true;
@@ -3239,16 +3206,6 @@ void jce_video_advance(JceVideo v, double dt_seconds)
     if (slot->queue_active) {
         ui_pop_for_target(slot, slot->time);
 
-        /* Loop-back audio reset: if worker has reset itself to 0 on loop,
-         * reset audio too. Detect by frame_time going backward. */
-        if (slot->loop && slot->duration > 0.0
-            && slot->display_frame_time + 1.0 < slot->time
-            && slot->time > slot->duration * 0.9) {
-            /* Crossing the loop boundary; audio_stream needs to follow. */
-            if (slot->audio_stream)
-                jce_audio_stream_seek(slot->audio_stream, 0.0);
-        }
-
         /* End-of-clip detection (no loop). */
         if (slot->duration > 0.0 && !slot->loop
             && slot->time >= slot->duration - 0.000001) {
@@ -3258,10 +3215,8 @@ void jce_video_advance(JceVideo v, double dt_seconds)
             jce_mutex_unlock(slot->qmtx);
             bool audio_done = !slot->audio_stream
                            || jce_audio_stream_eof(slot->audio_stream);
-            bool video_caught_up =
-                slot->display_frame_time + 0.250 >= slot->duration
-                || worker_done;
-            if (audio_done && video_caught_up) {
+            /* Drain delayed codec output and every queued frame before EOF. */
+            if (audio_done && worker_done) {
                 slot->ended = true;
             }
         }
@@ -3365,34 +3320,17 @@ void jce_video_seek(JceVideo v, double time_sec, bool exact)
 
     slot->time = time_sec;
     slot->ended = false;
-    slot->display_frame_time = time_sec;
 
     if (slot->queue_active) {
+        slot->seek_display_pending = true;
+        slot->seek_display_target = time_sec;
         worker_request_seek(slot, time_sec, exact);
         if (exact && slot->audio_stream) {
             jce_audio_stream_seek(slot->audio_stream, time_sec);
         }
-        /* For exact seeks, wait briefly for worker to land on a frame
-         * near the target so the user sees the requested frame on
-         * release (UI mental model). Cap at 1.5s to avoid lockups on
-         * very slow decoders. */
-        if (exact) {
-            const uint64_t budget_ms = 1500u;
-            const uint64_t start_ms = jce_time_ticks_ms();
-            while (true) {
-                jce_mutex_lock(slot->qmtx);
-                bool got = slot->q_count > 0
-                    && qe_at(slot, slot->q_head)->serial == slot->seek_serial
-                    && qe_at(slot, slot->q_head)->pts_sec + 0.05 >= time_sec;
-                bool done = slot->worker_eof;
-                jce_mutex_unlock(slot->qmtx);
-                if (got || done) break;
-                if ((jce_time_ticks_ms() - start_ms) >= budget_ms) break;
-                jce_thread_sleep_ms(5);
-            }
-            /* Pop one frame so display_rgba reflects the new position. */
-            ui_pop_for_target(slot, time_sec);
-        }
+        /* The worker performs exact decoding. Waiting here used to block
+         * the editor thread for up to 1.5 seconds on 4K AV1 seeks. The
+         * consumer keeps the old frame until advance() pops a new one. */
         return;
     }
 
@@ -3436,6 +3374,8 @@ void jce_video_rewind(JceVideo v)
     slot->display_frame_time = 0.0;
 
     if (slot->queue_active) {
+        slot->seek_display_pending = true;
+        slot->seek_display_target = 0.0;
         worker_request_seek(slot, 0.0, true);
         if (slot->audio_stream)
             jce_audio_stream_seek(slot->audio_stream, 0.0);
@@ -3459,6 +3399,21 @@ void jce_video_set_loop(JceVideo v, bool loop)
     if (loop && slot->ended) slot->ended = false;
 }
 
+bool jce_video_set_preview_max_dimension(JceVideo v, uint32_t max_dimension)
+{
+    VideoSlot *slot = slot_from_handle(v);
+    if (!slot || max_dimension == 1u) return false;
+    if (max_dimension && !slot->preview_supported)
+        return false;
+    slot->preview.max_dimension = max_dimension;
+    if (slot->qmtx) {
+        jce_mutex_lock(slot->qmtx);
+        slot->worker_preview_limit = max_dimension;
+        jce_mutex_unlock(slot->qmtx);
+    }
+    return true;
+}
+
 const uint8_t *jce_video_get_frame_rgba(JceVideo v,
                                         int *out_w, int *out_h,
                                         double *out_frame_time)
@@ -3472,7 +3427,14 @@ const uint8_t *jce_video_get_frame_rgba(JceVideo v,
     }
     /* Async path: return UI-side display buffer (filled by ui_pop_for_target).
      * Legacy fallback (metadata-only or worker-disabled): return decoder buffer. */
-    if (slot->queue_active && slot->display_rgba) {
+    if (slot->queue_active) {
+        /* Decoder buffers belong to the worker; only return published pixels. */
+        if (!slot->display_rgba) {
+            if (out_w) *out_w = 0;
+            if (out_h) *out_h = 0;
+            if (out_frame_time) *out_frame_time = 0.0;
+            return NULL;
+        }
         if (out_w) *out_w = slot->display_rgba_w;
         if (out_h) *out_h = slot->display_rgba_h;
         if (out_frame_time) *out_frame_time = slot->display_frame_time;
@@ -3588,12 +3550,10 @@ bool jce_video_get_perf_stats(JceVideo v, JceVideoPerfStats *out)
     memset(out, 0, sizeof(*out));
     VideoSlot *slot = slot_from_handle(v);
     if (!slot) return false;
-    /* Race-tolerant snapshot: take qmtx for q_count, copy scalars after.
-     * Stale reads are acceptable for a debug overlay. */
+    /* Worker timings and queue counters share one synchronized snapshot. */
     if (slot->qmtx) {
         jce_mutex_lock(slot->qmtx);
         out->q_count = slot->q_count;
-        jce_mutex_unlock(slot->qmtx);
     }
     out->q_capacity        = JCE_VIDEO_Q_CAP;
     out->decode_us_ema     = slot->perf_decode_us_ema;
@@ -3610,6 +3570,7 @@ bool jce_video_get_perf_stats(JceVideo v, JceVideoPerfStats *out)
     out->worker_running    = slot->worker_running;
     out->worker_eof        = slot->worker_eof;
     out->queue_yuv_mode    = slot->queue_yuv_mode;
+    if (slot->qmtx) jce_mutex_unlock(slot->qmtx);
     return true;
 }
 

@@ -79,6 +79,22 @@ JCE_API bool      jce_input_key_down(const JceInput *input, JceKey key);
 JCE_API bool      jce_input_key_pressed(const JceInput *input, JceKey key);
 JCE_API bool      jce_input_key_released(const JceInput *input, JceKey key);
 
+/* True on the frame a key went down AND on every OS auto-repeat frame while
+ * it is held.  jce_input_key_pressed() is a strict rising edge and therefore
+ * fires exactly once no matter how long the key is held -- correct for a jump
+ * button, wrong for text editing, where holding Backspace must keep deleting.
+ * The repeat flag was already on the wire (JceInputKeyEvent.repeat); nothing
+ * exposed it, so the shipped runtime's InputField deleted one byte where the
+ * editor's deleted the line. */
+JCE_API bool      jce_input_key_repeated(const JceInput *input, JceKey key);
+
+/* Composed UTF-8 text produced this frame by the platform text/IME layer,
+ * NUL-terminated and accumulated in arrival order; "" when there was none.
+ * Valid until the next jce_input_update().  This is the ONLY channel that can
+ * carry an IME commit or a non-ASCII character -- a keycode cannot -- so text
+ * entry must read it rather than translating scancodes. */
+JCE_API const char *jce_input_text(const JceInput *input);
+
 /* -- Mouse ---------------------------------------------------------- */
 
 JCE_API void      jce_input_mouse_pos(const JceInput *input, float *x, float *y);
@@ -87,6 +103,10 @@ JCE_API bool      jce_input_mouse_button(const JceInput *input, int button);
 JCE_API bool      jce_input_mouse_button_pressed(const JceInput *input, int button);
 JCE_API bool      jce_input_mouse_button_released(const JceInput *input, int button);
 JCE_API float     jce_input_mouse_wheel(const JceInput *input);
+/* Horizontal wheel / trackpad pan for this frame (+ = right).  It was already
+ * on the wire as JceInputWheelEvent.x and simply had no accumulator, so every
+ * polling consumer hard-wired the horizontal axis to zero. */
+JCE_API float     jce_input_mouse_wheel_h(const JceInput *input);
 
 /* -- Touch (mobile) ------------------------------------------------- */
 

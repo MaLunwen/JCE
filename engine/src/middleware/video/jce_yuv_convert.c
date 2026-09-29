@@ -15,6 +15,87 @@
 
 #include <jce/os/core/jce_defs.h>   /* canonical JCE_ARCH_* (no raw arch macros) */
 #include <string.h>
+#include "os/core/jce_memory.h"
+
+bool jce_yuv_buffer_reserve(uint8_t **buffer, size_t *capacity, size_t bytes)
+{
+    if (*buffer && *capacity >= bytes) return true;
+    uint8_t *replacement = (uint8_t *)JCE_MALLOC(bytes);
+    if (!replacement) return false;
+    JCE_FREE(*buffer);
+    *buffer = replacement;
+    *capacity = bytes;
+    return true;
+}
+
+bool jce_yuv_preview_prepare(JceYuvPreview *preview, const JceYuv420Frame *input,
+                             JceYuv420Frame *output)
+{
+    *output = *input;
+    uint32_t edge = (uint32_t)(input->width > input->height ? input->width : input->height);
+    uint32_t cap = preview->max_dimension;
+    if (!cap || edge <= cap) return true;
+    int w = (int)(((uint64_t)input->width * cap / edge) & ~1u);
+    int h = (int)(((uint64_t)input->height * cap / edge) & ~1u);
+    if (w < 2) w = input->width < 2 ? input->width : 2;
+    if (h < 2) h = input->height < 2 ? input->height : 2;
+    uint32_t uv_w = (uint32_t)(w + 1) / 2u, uv_h = (uint32_t)(h + 1) / 2u;
+    size_t y_size = (size_t)w * h;
+    size_t uv_size = (size_t)uv_w * uv_h;
+    size_t need = y_size + uv_size * 2u;
+    if (!jce_yuv_buffer_reserve(&preview->buffer, &preview->capacity, need)) return false;
+    uint8_t *dy = preview->buffer, *du = dy + y_size, *dv = du + uv_size;
+    jce_yuv_plane_downsample(input->y, (uint32_t)input->width, (uint32_t)input->height,
+                            input->y_stride, dy, (uint32_t)w, (uint32_t)h);
+    jce_yuv_plane_downsample(input->u, (uint32_t)(input->width + 1) / 2u,
+                            (uint32_t)(input->height + 1) / 2u, input->uv_stride, du, uv_w, uv_h);
+    jce_yuv_plane_downsample(input->v, (uint32_t)(input->width + 1) / 2u,
+                            (uint32_t)(input->height + 1) / 2u, input->uv_stride, dv, uv_w, uv_h);
+    output->y = dy; output->u = du; output->v = dv;
+    output->y_stride = w; output->uv_stride = (int)uv_w;
+    output->width = w; output->height = h;
+    return true;
+}
+
+void jce_yuv_plane_downsample(const uint8_t *src, uint32_t src_w, uint32_t src_h,
+                             int src_stride, uint8_t *dst,
+                             uint32_t dst_w, uint32_t dst_h)
+{
+    if (!src || !dst || !dst_w || !dst_h || dst_w > src_w || dst_h > src_h)
+        return;
+    /* Odd integral ratios have an exact pixel-centre sample (zero bilinear
+     * weights), e.g. 4K portrait -> 720x1280. Avoid four identical loads. */
+    if (src_w % dst_w == 0u && src_h % dst_h == 0u
+        && (src_w / dst_w) % 2u && (src_h / dst_h) % 2u) {
+        uint32_t sx = src_w / dst_w, sy = src_h / dst_h;
+        for (uint32_t y = 0; y < dst_h; ++y) {
+            const uint8_t *row = src + (size_t)(y * sy + sy / 2u) * src_stride;
+            for (uint32_t x = 0; x < dst_w; ++x)
+                dst[(size_t)y * dst_w + x] = row[x * sx + sx / 2u];
+        }
+        return;
+    }
+    const uint64_t step_x = ((uint64_t)src_w << 16) / dst_w;
+    const uint64_t step_y = ((uint64_t)src_h << 16) / dst_h;
+    uint64_t pos_y = (step_y - 65536u) / 2u;
+    for (uint32_t y = 0; y < dst_h; ++y, pos_y += step_y) {
+        uint32_t y0 = (uint32_t)(pos_y >> 16);
+        uint32_t y1 = y0 + 1u < src_h ? y0 + 1u : y0;
+        uint32_t wy = (uint32_t)(pos_y >> 8) & 255u;
+        const uint8_t *row0 = src + (size_t)y0 * src_stride;
+        const uint8_t *row1 = src + (size_t)y1 * src_stride;
+        uint8_t *out = dst + (size_t)y * dst_w;
+        uint64_t pos_x = (step_x - 65536u) / 2u;
+        for (uint32_t x = 0; x < dst_w; ++x, pos_x += step_x) {
+            uint32_t x0 = (uint32_t)(pos_x >> 16);
+            uint32_t x1 = x0 + 1u < src_w ? x0 + 1u : x0;
+            uint32_t wx = (uint32_t)(pos_x >> 8) & 255u;
+            uint32_t top = row0[x0] * (256u - wx) + row0[x1] * wx;
+            uint32_t bottom = row1[x0] * (256u - wx) + row1[x1] * wx;
+            out[x] = (uint8_t)((top * (256u - wy) + bottom * wy + 32768u) >> 16);
+        }
+    }
+}
 
 /* ── SSE2 fast path (32-bit intermediates via madd) ──────────────── */
 

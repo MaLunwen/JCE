@@ -233,6 +233,16 @@ typedef struct {
     jce_vec3 spot_dir;        /* normalized spot forward; (0,0,0) for point */
     float    inner_cone_cos;  /* spot; 1.0 for point */
     float    outer_cone_cos;  /* spot; -1.0 for point */
+    /* Rendering layers, verbatim from the light desc: 0 = every layer.
+     * APPENDED.
+     *
+     * The cluster is built ONCE PER FRAME with no receiver in sight, which is
+     * why a CPU-side mask could not reach these lights and why Forward+ used
+     * to be refused for any frame carrying one.  The mask therefore travels
+     * WITH the light -- packed into the two spare lanes of its L3 texel -- and
+     * is tested in the shader against the receiver's layer, which arrives in
+     * u_areaParams.y. */
+    uint32_t layer_mask;
 } JceForwardPlusLightParam;
 
 /* PURE PACKING (headless; no bgfx).  Flattens a finished light-cluster

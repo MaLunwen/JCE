@@ -78,7 +78,8 @@ const char *override_query_name(int comp_id)
     if (jce_editor_component_id_is_light_group(comp_id)) return "Light";
     if (n && (strcmp(n, "DirectionalLight") == 0 ||
               strcmp(n, "PointLight") == 0 ||
-              strcmp(n, "SpotLight") == 0))
+              strcmp(n, "SpotLight") == 0 ||
+              strcmp(n, "AreaLight") == 0))
         return "Light";
     return n;
 }
@@ -694,6 +695,7 @@ static const InspField kF_sprite_renderer[] = {
     IF_F(JceSpriteRendererComponent, sprite_path),
     IF_AX(JceSpriteRendererComponent, color, 0), IF_AX(JceSpriteRendererComponent, color, 1), IF_AX(JceSpriteRendererComponent, color, 2), IF_AX(JceSpriteRendererComponent, color, 3),
     IF_F(JceSpriteRendererComponent, flip_x), IF_F(JceSpriteRendererComponent, flip_y), IF_F(JceSpriteRendererComponent, sorting_order),
+    IF_F(JceSpriteRendererComponent, sorting_layer),
 };
 static const InspField kF_skeletal[] = {
     IF_F(JceSkeletalAnimatorComponent, skeleton_path),
@@ -950,12 +952,19 @@ static void apply_pending_reorder(uint32_t focused_entity,
  * the synthetic-slot early-outs.  Adding a future component means one
  * INSP_DRAWFN line + one entry in insp_register_draw_fns(). */
 
+/* Every drawer publishes whose component it is drawing, so insp_track_edit()
+ * -- which runs deep inside them, without the entity as a parameter -- can
+ * record ONE ENTITY instead of serialising the whole scene twice per edit.
+ * Cleared on the way out, so a widget drawn outside a component drawer keeps
+ * the unscoped behaviour. */
 #define INSP_DRAWFN(NAME, EXPR)                                               \
     static void drawfn_##NAME(JceScene *scene, JceEntity e,              \
                               uint32_t entity_id)                      \
     {                                                                     \
         (void)scene; (void)e; (void)entity_id;                            \
+        insp_set_edit_scope(entity_id);                   \
         EXPR;                                                             \
+        insp_set_edit_scope(0u);                          \
     }
 
 INSP_DRAWFN(transform, draw_comp_transform(entity_id, jce_scene_get_transform(scene, e)))
@@ -977,7 +986,7 @@ INSP_DRAWFN(box_collider, draw_comp_box_collider(jce_scene_get_box_collider(scen
 INSP_DRAWFN(sphere_collider, draw_comp_sphere_collider(jce_scene_get_sphere_collider(scene, e)))
 INSP_DRAWFN(character_controller,
             draw_comp_character_controller(jce_scene_get_character_controller(scene, e)))
-INSP_DRAWFN(audio_source, draw_comp_audio_source(jce_scene_get_audio_source(scene, e)))
+INSP_DRAWFN(audio_source, draw_comp_audio_source(jce_scene_get_audio_source(scene, e), e))
 INSP_DRAWFN(music_track, draw_comp_music_track(jce_scene_get_music_track(scene, e)))
 INSP_DRAWFN(script, draw_comp_script(jce_scene_get_script(scene, e)))
 INSP_DRAWFN(skybox, draw_comp_skybox(jce_scene_get_skybox(scene, e)))
@@ -1002,7 +1011,7 @@ INSP_DRAWFN(compound_collider,
 INSP_DRAWFN(collider2d, draw_comp_collider2d(jce_scene_get_collider2d(scene, e)))
 INSP_DRAWFN(trail_renderer, draw_comp_trail_renderer(jce_scene_get_trail_renderer(scene, e)))
 INSP_DRAWFN(line_renderer, draw_comp_line_renderer(jce_scene_get_line_renderer(scene, e)))
-INSP_DRAWFN(reflection_probe, draw_comp_reflection_probe(jce_scene_get_reflection_probe(scene, e)))
+INSP_DRAWFN(reflection_probe, draw_comp_reflection_probe(scene, e, jce_scene_get_reflection_probe(scene, e)))
 INSP_DRAWFN(decal, draw_comp_decal(jce_scene_get_decal(scene, e)))
 INSP_DRAWFN(light_probe_group,
             draw_comp_light_probe_group(jce_scene_get_light_probe_group(scene, e)))
@@ -1025,6 +1034,9 @@ INSP_DRAWFN(billboard_renderer,
 INSP_DRAWFN(canvas, draw_comp_canvas(jce_scene_get_canvas(scene, e)))
 INSP_DRAWFN(canvas_group, draw_comp_canvas_group(jce_scene_get_canvas_group(scene, e)))
 INSP_DRAWFN(layout_group, draw_comp_layout_group(jce_scene_get_layout_group(scene, e)))
+INSP_DRAWFN(layout_element, draw_comp_layout_element(jce_scene_get_layout_element(scene, e)))
+INSP_DRAWFN(content_size_fitter, draw_comp_content_size_fitter(jce_scene_get_content_size_fitter(scene, e)))
+INSP_DRAWFN(bone_attachment, draw_comp_bone_attachment(jce_scene_get_bone_attachment(scene, e)))
 INSP_DRAWFN(ui_image, draw_comp_ui_image(jce_scene_get_ui_image(scene, e)))
 INSP_DRAWFN(ui_text, draw_comp_ui_text(jce_scene_get_ui_text(scene, e)))
 INSP_DRAWFN(ui_button, draw_comp_ui_button(jce_scene_get_ui_button(scene, e)))
@@ -1122,6 +1134,9 @@ static void insp_register_draw_fns(void)
         { "Canvas", drawfn_canvas },
         { "CanvasGroup", drawfn_canvas_group },
         { "LayoutGroup", drawfn_layout_group },
+        { "LayoutElement", drawfn_layout_element },
+        { "ContentSizeFitter", drawfn_content_size_fitter },
+        { "BoneAttachment", drawfn_bone_attachment },
         { "UIImage", drawfn_ui_image },
         { "UIText", drawfn_ui_text },
         { "UIButton", drawfn_ui_button },
@@ -1377,11 +1392,12 @@ void jce_editor_panel_inspector_content(void)
                 else if (i == 0)
                     nm = "Default";
                 if (!nm) continue;
-                if (ImGui::Selectable(nm, i == cur_layer)) {
+                /* One call: jce_state_set_entity_layer now writes the engine's
+                 * JceLayerComponent too.  Calling both here was the ONLY site
+                 * that remembered to, which is what made the two copies agree
+                 * in the Inspector and nowhere else. */
+                if (ImGui::Selectable(nm, i == cur_layer))
                     jce_state_set_entity_layer(focused, i);
-                    jce_scene_set_entity_layer(scene,
-                        jce_state_to_ecs_entity(focused), (uint8_t)i);
-                }
             }
             ImGui::EndCombo();
         }

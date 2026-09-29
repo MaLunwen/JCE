@@ -42,6 +42,9 @@ void  jce_file_viewer_open_text_at(const char *path, int line);
 /* Draw the tabbed file viewer content (for panel embedding). */
 void  jce_file_viewer_draw_content(void);
 
+/* Pause media when the viewer's dock tab is not the active visible tab. */
+void  jce_file_viewer_suspend_media(void);
+
 /* Draw standalone file viewer window (Begin/End). */
 void  jce_file_viewer_draw_window(bool *p_visible);
 

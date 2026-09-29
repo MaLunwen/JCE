@@ -45,5 +45,18 @@ void jce_material_bind(const JceMaterial *mat, const JceRenderer *r, uint16_t vi
         }
         /* Light uniforms are set by the lighting system, not the material. */
         break;
+
+    case JCE_MAT_PBR:
+        /* Bound by jce_pbr_material.h, which owns the metallic-roughness
+         * uniform block and its texture set; this legacy path has neither.
+         * Explicit rather than absent: with no case and no default, a PBR
+         * material passed here silently did nothing, which is the one
+         * outcome a caller cannot distinguish from success. */
+        break;
     }
+
+    /* NOTE: mat->tint is NOT applied here.  jce_material_default() sets it to
+     * opaque white and nothing in this function reads it -- the three shader
+     * programs this path targets have no tint uniform.  Said out loud because
+     * the struct field reads like it is honoured. */
 }

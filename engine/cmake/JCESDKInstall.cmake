@@ -163,6 +163,11 @@ function(jce_register_sdk_install)
 	endif()
 
 	jce_collect_static_libs(JCE _jce_sdk)
+    # Ship the canonical AV1 archive separately so its complete symbol set can
+    # override bimg's embedded fallback without force-loading unrelated codecs.
+    jce_collect_static_libs(dav1d::dav1d _jce_av1_codec)
+    list(REMOVE_ITEM _jce_sdk_FILES ${_jce_av1_codec_FILES})
+
 
 	# Libraries in this set must retain ordinary archive extraction semantics.
 	# In particular, jce_pak_key_defaults provides zero-valued fallback symbols
@@ -173,6 +178,16 @@ function(jce_register_sdk_install)
 	foreach(_t IN LISTS _deps_extra_targets)
 		list(REMOVE_ITEM _jce_sdk_TARGETS "${_t}")
 	endforeach()
+
+    list(LENGTH _jce_av1_codec_FILES _jce_av1_count)
+    if(NOT _jce_av1_count EQUAL 1)
+        message(FATAL_ERROR "JCE SDK: expected one canonical dav1d archive")
+    endif()
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEVerifyCodecLink.cmake"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
+    install(FILES ${_jce_av1_codec_FILES}
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>"
+        RENAME "jce_av1_codec${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
 	# --- Belt-and-suspenders: capture sibling abseil libs (MSVC only) ---- #
 	# On MSVC, some absl libs ship vectorised STL helpers
@@ -430,6 +445,17 @@ function(jce_register_sdk_install)
 			FILES_MATCHING PATTERN "*.sh")
 	endif()
 	install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/shaders/include/"
+		DESTINATION "${_engine_share_root}/shader_include"
+		FILES_MATCHING PATTERN "*.sh")
+	# The PBR fragment body, because a Shader Graph material is compiled by
+	# the PROJECT and is lit by the engine's own shader.  Before this the
+	# graph template carried a private lighting model -- one directional
+	# light, a pow() lobe, flat ambient -- and a graph-authored surface was
+	# lit differently from everything beside it.  Feeding a graph's outputs
+	# into the shared lit shader is what Unity, Unreal and Godot all do, and
+	# it means the includes that shader is built from have to be reachable
+	# from a project's shaderc invocation.
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/shaders/pbr/"
 		DESTINATION "${_engine_share_root}/shader_include"
 		FILES_MATCHING PATTERN "*.sh")
 	# Project-scaffolding templates consumed by jce_project_create_from_template().

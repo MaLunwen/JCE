@@ -336,10 +336,11 @@ void jce_trigger_world_update(JceTriggerWorld *w)
                     ev.trigger_user = t->user;
                     ev.observer_user = o->user;
                     ev.point = o->position;
+                    ev.tag = t->desc.tag;
                     w->event_fn(&ev, w->event_user);
                 }
                 if (is_) enter++; else exit++;
-            } else if (is_ && stay_fires_this_frame) {
+            } else if (is_ && stay_fires_this_frame && t->desc.fire_stay) {
                 if (w->event_fn) {
                     JceTriggerEvent ev;
                     ev.type = JCE_TRIGGER_EVENT_STAY;
@@ -348,6 +349,7 @@ void jce_trigger_world_update(JceTriggerWorld *w)
                     ev.trigger_user = t->user;
                     ev.observer_user = o->user;
                     ev.point = o->position;
+                    ev.tag = t->desc.tag;
                     w->event_fn(&ev, w->event_user);
                 }
                 stay++;

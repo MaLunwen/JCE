@@ -33,6 +33,27 @@ JCE_API bool jce_glb_write_mesh(const char     *host_path,
                                 uint32_t        index_count,
                                 const float     base_color[4]);
 
+/* The same writer, with TEXCOORD_0.
+ *
+ * `uvs` is tightly-packed float[2] * vertex_count, or NULL -- in which case
+ * this IS jce_glb_write_mesh, which delegates here.
+ *
+ * The distinction exists because the two callers want opposite things.  An
+ * HLOD proxy is a distant, flat-tinted stand-in: it has no textures and
+ * carrying UVs for it would be dead bytes in every streamed cell.  A STATIC
+ * BATCH has to be INDISTINGUISHABLE from the meshes it replaced, and dropping
+ * their UVs would map every texture to (0,0) -- a merge that silently retextures
+ * the world.  One writer with an optional attribute, rather than a second
+ * writer that would drift from this one. */
+JCE_API bool jce_glb_write_mesh_uv(const char     *host_path,
+                                   const float    *positions,
+                                   const float    *normals,
+                                   const float    *uvs,
+                                   uint32_t        vertex_count,
+                                   const uint32_t *indices,
+                                   uint32_t        index_count,
+                                   const float     base_color[4]);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_GLB_WRITE_H */

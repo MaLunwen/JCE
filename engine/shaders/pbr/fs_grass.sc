@@ -256,6 +256,6 @@ void main()
 
     // When postfx tonemap is enabled, keep linear output for post-processing.
     if (u_iblParams.w < 0.5)
-        color = pow(max(color, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+        color = pow(max(color, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
     gl_FragColor = vec4(color, 1.0);
 }

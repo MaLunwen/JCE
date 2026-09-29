@@ -10,9 +10,11 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_assert_bridge.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h" /* resolve_mesh_path (collider) */
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_layout.h"
 
 extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
@@ -40,6 +42,9 @@ extern "C" {
 /* ── Play mode: runtime-driven ───────────────────────────────────── */
 
 #include <jce/application/jce_runtime.h>
+#include <jce/application/jce_engine.h>
+#include <jce/renderer/jce_lighting_system.h>
+#include <jce/renderer/jce_particles.h>
 
 /* Open-project root — owned by dialog_project.cpp (explicit-root pattern,
  * see jce_project_settings.cpp). */
@@ -393,6 +398,12 @@ void jce_state_play(void)
 {
     if (s.play_state != JCE_PLAY_STOPPED) return;
 
+    /* JCE_ENSURE reports once PER SITE for the life of the process.  Without
+     * this an invariant that broke in the previous Play session would stay
+     * silent in this one, which is the opposite of what the user wants after
+     * changing something and pressing Play again. */
+    jce_editor_assert_bridge_reset_ensures();
+
     s_play_snapshot_valid = history_capture_snapshot(&s_play_snapshot);
     if (!s_play_snapshot_valid)
         LOG_WARN(LOG_TAG, "failed to capture play-mode snapshot");
@@ -513,6 +524,37 @@ void jce_state_play(void)
                            ? rd.fixed_timestep
                            : (1.0f / 60.0f);
 
+    /* Target Framerate (Project Settings > Quality) — PLAY ONLY.
+     *
+     * The field is authored per quality level, exported into the cooked tree,
+     * and applied by the shipped main via jce_engine_set_target_fps.  Play has
+     * to honour it too or the designer tunes against a frame rate the game
+     * will never run at: gameplay written against dt behaves differently at
+     * 400 fps in the viewport and 30 fps on the target machine, which is the
+     * editor/ship divergence this engine warns about most.
+     *
+     * Restored on Stop, not left applied, because the editor is a tool: Unity
+     * ignores targetFrameRate outside Play for the same reason, and a 30 fps
+     * cap left on the whole editor would make every panel feel broken. */
+    if (ps) {
+        int ql = ps->quality.current_level;
+        if (ql < 0) ql = 0;
+        if (ql >= JCE_PS_MAX_QUALITY_LEVELS) ql = JCE_PS_MAX_QUALITY_LEVELS - 1;
+        const int tf = ps->quality.levels[ql].target_framerate;
+        jce_engine_set_target_fps(tf > 0 ? tf : 0);
+        /* Same reasoning for the per-pixel light budget: a designer capping
+         * lights for a low-end target must SEE the capped lighting in Play,
+         * not only in the shipped exe. */
+        const int plc = ps->quality.levels[ql].pixel_light_count;
+        jce_lighting_set_pixel_light_count(plc > 0 ? plc : 0);
+        /* ...and soft particles, for the same reason again: the hard seam
+         * where a billboard cuts the floor is precisely what an author is
+         * looking at when they tick the box, so Play must show the fade. */
+        jce_particles_set_soft_fade_distance(
+            ps->quality.levels[ql].soft_particles
+                ? JCE_PARTICLES_SOFT_FADE_DEFAULT : 0.0f);
+    }
+
     /* Subscribe to contact events so the Physics Debugger can show live
      * active-contact counts (also activates engine manifold diffing). */
     s_active_contacts = 0;
@@ -523,6 +565,19 @@ void jce_state_play(void)
      * Scripts (jce.set_time_scale / jce.pause) override it live during play. */
     if (ps && ps->time.time_scale > 0.0f)
         jce_runtime_set_time_scale(s_play_runtime, ps->time.time_scale);
+
+    /* Project Settings > Time > Maximum Particle Timestep.  The slider, the
+     * default and both halves of its serializer have existed since it was
+     * added; nothing read it, so the control did nothing in either host. */
+    if (ps)
+        jce_particles_set_max_timestep(
+            ps->time.maximum_particle_timestep_ms > 0
+                ? (float)ps->time.maximum_particle_timestep_ms * 0.001f
+                : 0.0f);
+    /* Read back rather than echoed: a non-positive request is stored as 0
+     * (no cap), and a reader needs to see which of the two they got. */
+    LOG_INFO("editor.play", "max particle timestep: %.0f ms (0 = uncapped)",
+             (double)(jce_particles_get_max_timestep() * 1000.0f));
 
     jce_editor_scene_reset_anim_timer();
     /* Let bound animation state machines own active_clip while playing (in the
@@ -550,6 +605,7 @@ void jce_state_play(void)
      * streaming block) — the runtime has no streamer of its own. */
     play_streaming_begin();
     s.play_state = JCE_PLAY_PLAYING;
+    jce_editor_layout_request_focus_game_view();
     LOG_INFO(LOG_TAG, "play mode started");
 }
 
@@ -569,6 +625,7 @@ void jce_state_pause(void)
 void jce_state_stop(void)
 {
     if (s.play_state == JCE_PLAY_STOPPED) return;
+    jce_editor_game_render_set_mouse_capture(false);
 
     /* Clear the renderer's anim-event hook BEFORE destroying the runtime it
      * forwards to — otherwise a stray render frame could route an event into a
@@ -589,6 +646,15 @@ void jce_state_stop(void)
      * restored below, so streamed content never lingers or bakes in. */
     play_streaming_end();
 
+    /* Uncap the editor again.  Restoring a SAVED value would be false
+     * precision: jce_engine_set_target_fps has exactly two call sites -- the
+     * shipped main, which the editor never runs, and the Play block above --
+     * so outside Play the editor's cap is 0 by construction.  Saving a value
+     * that is always 0 buys nothing and would quietly become wrong if someone
+     * ever capped the editor deliberately, because it would restore a stale
+     * reading rather than that deliberate choice. */
+    jce_engine_set_target_fps(0);
+    jce_lighting_set_pixel_light_count(0);
     if (s_play_runtime) { jce_runtime_destroy(s_play_runtime); s_play_runtime = NULL; }
     if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
     s_active_contacts = 0;
@@ -682,7 +748,8 @@ void jce_state_play_mode_tick(float dt)
 
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                       bool jump_pressed, bool jump_held,
-                                      bool sprint, bool attack)
+                                      bool sprint, bool attack,
+                                      struct JceInput *keyboard)
 {
     if (!s_play_runtime) return;
     JceRuntimeInput in = {};
@@ -693,6 +760,7 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
     in.sprint         = sprint;
     in.attack_pressed = attack;
     in.speed_mult     = 1.0f;   /* sprint scaling is authored on the component */
+    in.keyboard       = keyboard;   /* NULL when the view lacks capture */
     jce_runtime_set_input(s_play_runtime, &in);
 }
 
@@ -743,6 +811,15 @@ bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z
 JcePhysicsWorld *jce_editor_play_get_physics_world(void)
 {
     return s_play_runtime ? jce_runtime_physics(s_play_runtime) : NULL;
+}
+
+/* The 2D world Play stands up when a scene uses RigidBody2D.  The Physics
+ * Debugger has had a 2D layer-collision matrix all along while its Runtime
+ * Stats reported only the 3D world -- so a 2D project could configure
+ * collisions and never see a single number about them. */
+JcePhysics2D *jce_editor_play_get_physics2d_world(void)
+{
+    return s_play_runtime ? jce_runtime_physics2d(s_play_runtime) : NULL;
 }
 
 JceRuntime *jce_editor_play_get_runtime(void)

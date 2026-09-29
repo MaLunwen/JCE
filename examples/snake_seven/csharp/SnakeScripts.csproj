@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SnakeScripts</AssemblyName>
+    <!-- The engine loads this by PATH into the SAME AssemblyLoadContext
+         the managed bridge lives in, not the default one. The default was
+         what the bridge used to do, and it is why a game assembly's
+         reference to JceScript bound to nothing. Never run on its own. -->
+    <OutputType>Library</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Hud.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The SDK ships the built bridge assembly; referencing it (rather than
+         rebuilding it) keeps this project a CONSUMER of the SDK. -->
+    <Reference Include="JceScript">
+      <HintPath>$(JceScriptDll)</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

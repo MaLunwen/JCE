@@ -586,8 +586,10 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
              * (num_mips clamped to 1) and the cull only tests <=1-texel footprints. */
             gs->hiz_reduce_program = load_compute(pak, "cs_hiz_reduce", sfx);
             gs->hiz_supported = true;
-            LOG_INFO(LOG_TAG, "Hi-Z occlusion resources ready (opt-in JCE_HIZ_OCCLUSION)%s",
-                     gs->hiz_reduce_program.idx != UINT16_MAX ? " [full mip pyramid]" : " [single-level]");
+            /* Same reason the "online" line moved to the caller: one of these
+             * exists per CSM cascade plus the colour pass, so logging here
+             * printed five identical lines.  jce_gpu_scene_hiz_kind() lets the
+             * caller say it once. */
         }
     }
 
@@ -638,8 +640,12 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
         LOG_WARN(LOG_TAG, "GPU lacks BGFX_CAPS_DRAW_INDIRECT; using 1:1 fallback cull");
     }
 
-    LOG_SUCCESS(LOG_TAG, "GPU-driven scene online (compute cull ready, %s)",
-                gs->indirect ? "indirect compaction" : "1:1 fallback");
+    /* No per-instance line here.  The scene renderer builds one of these per
+     * CSM cascade plus one for the colour pass, so this printed five identical
+     * SUCCESS lines with nothing to tell them apart -- which reads exactly
+     * like a subsystem being initialised five times by mistake, and was
+     * misdiagnosed as one.  The caller knows the count and logs it once;
+     * jce_gpu_scene_is_indirect() reports the rest. */
     return gs;
 }
 
@@ -752,6 +758,17 @@ void jce_gpu_scene_destroy(JceGpuScene *gs)
 bool jce_gpu_scene_is_supported(const JceGpuScene *gs)
 {
     return gs && gs->supported;
+}
+
+/* "" when Hi-Z is unavailable, else which pyramid the reduce shader gives. */
+const char *jce_gpu_scene_hiz_kind(const JceGpuScene *gs)
+{
+    if (!gs || !gs->hiz_supported) return "";
+    /* Pre-formatted as a suffix, separator included: the caller appends it to
+     * a sentence and a bare "full mip pyramid" ran into the previous word. */
+    return gs->hiz_reduce_program.idx != UINT16_MAX
+               ? ", Hi-Z full mip pyramid (opt-in JCE_HIZ_OCCLUSION)"
+               : ", Hi-Z single-level (opt-in JCE_HIZ_OCCLUSION)";
 }
 
 bool jce_gpu_scene_is_indirect(const JceGpuScene *gs)

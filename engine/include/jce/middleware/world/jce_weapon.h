@@ -18,7 +18,13 @@
  *   - Audio (jce_audio)
  *
  * This module is engine-agnostic of those systems; it just produces
- * shot events.  See ck_weapons.c (caged_kingdom) for an integration.
+ * shot events.  A caller wires them itself: poll the shot events each
+ * frame, raycast with jce_physics against the ray they carry, then spawn
+ * whatever decal / particle / sound that hit deserves.
+ *
+ * (This used to say "see ck_weapons.c" -- a file that ships with one game
+ * and with no SDK consumer, so the pointer answered nothing for the reader
+ * who most needed it.)
  *
  * Layer: middleware/world (Layer 4) — public.
  */

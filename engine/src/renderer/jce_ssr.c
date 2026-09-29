@@ -13,6 +13,7 @@
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_fullscreen_pass.h"
 #include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
@@ -23,13 +24,9 @@
 
 #define LOG_TAG "ssr"
 
-typedef struct { float pos[2]; float uv[2]; } SsrQuadV;
-
 struct JceSsr {
-    int  w, h;
     JceSsrParams params;
 
-    bgfx_vertex_layout_t   layout;
     bgfx_program_handle_t  prog;
     bgfx_program_handle_t  prog_composite;   /* fs_ssr_composite blend pass */
 
@@ -38,22 +35,10 @@ struct JceSsr {
     bgfx_uniform_handle_t  u_screen;
     bgfx_uniform_handle_t  s_color, s_depth, s_normal;
 
-    bgfx_vertex_buffer_handle_t vbh;
-    bgfx_index_buffer_handle_t  ibh;
-
-    bgfx_frame_buffer_handle_t fb;
-    bgfx_texture_handle_t      tex;
+    /* Shared with SSAO, volumetric fog and SSGI: jce_fullscreen_pass.h. */
+    JceFsQuad   quad;
+    JceFsTarget rt;
 };
-
-static void create_target(JceSsr *s)
-{
-    if (s->fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb);
-    s->fb = bgfx_create_frame_buffer((uint16_t)s->w, (uint16_t)s->h,
-                                     BGFX_TEXTURE_FORMAT_RGBA8,
-                                     BGFX_TEXTURE_RT
-                                       | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
-    s->tex = bgfx_get_texture(s->fb, 0);
-}
 
 JceSsrParams jce_ssr_default_params(void)
 {
@@ -75,26 +60,11 @@ JceSsr *jce_ssr_create(const JceSsrDesc *desc)
 
     JceSsr *s = (JceSsr *)JCE_CALLOC(1, sizeof(*s));
     if (!s) return NULL;
-    s->w = desc->width  > 0 ? desc->width  : 1280;
-    s->h = desc->height > 0 ? desc->height : 720;
     s->params = jce_ssr_default_params();
-    s->fb.idx = UINT16_MAX;
-
-    bgfx_vertex_layout_begin(&s->layout, BGFX_RENDERER_TYPE_NOOP);
-    bgfx_vertex_layout_add(&s->layout, BGFX_ATTRIB_POSITION,  2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&s->layout, BGFX_ATTRIB_TEXCOORD0, 2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_end(&s->layout);
-
-    static const SsrQuadV verts[4] = {
-        { { -1.0f, -1.0f }, { 0.0f, 1.0f } },
-        { {  1.0f, -1.0f }, { 1.0f, 1.0f } },
-        { {  1.0f,  1.0f }, { 1.0f, 0.0f } },
-        { { -1.0f,  1.0f }, { 0.0f, 0.0f } },
-    };
-    static const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
-    s->vbh = bgfx_create_vertex_buffer(bgfx_copy(verts, sizeof(verts)),
-                                       &s->layout, BGFX_BUFFER_NONE);
-    s->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)), BGFX_BUFFER_NONE);
+    jce_fs_target_init(&s->rt);
+    jce_fs_quad_init(&s->quad);
+    const int want_w = desc->width  > 0 ? desc->width  : 1280;
+    const int want_h = desc->height > 0 ? desc->height : 720;
 
     bgfx_shader_handle_t vsh = jce_shader_load_from_pak(desc->pak, "vs_ssr", sfx, LOG_TAG);
     bgfx_shader_handle_t fsh = jce_shader_load_from_pak(desc->pak, "fs_ssr", sfx, LOG_TAG);
@@ -102,8 +72,7 @@ JceSsr *jce_ssr_create(const JceSsrDesc *desc)
         LOG_ERROR(LOG_TAG, "shader load failed");
         if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
         if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);
-        bgfx_destroy_vertex_buffer(s->vbh);
-        bgfx_destroy_index_buffer(s->ibh);
+        jce_fs_quad_destroy(&s->quad);
         JCE_FREE(s);
         return NULL;
     }
@@ -130,7 +99,8 @@ JceSsr *jce_ssr_create(const JceSsrDesc *desc)
     s->s_depth       = bgfx_create_uniform("s_depth",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s->s_normal      = bgfx_create_uniform("s_normal",      BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
-    create_target(s);
+    jce_fs_target_create(&s->rt, want_w, want_h, BGFX_TEXTURE_FORMAT_RGBA8,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
     return s;
 }
 
@@ -145,18 +115,14 @@ void jce_ssr_destroy(JceSsr *s)
     if (s->s_color.idx       != UINT16_MAX) bgfx_destroy_uniform(s->s_color);
     if (s->s_depth.idx       != UINT16_MAX) bgfx_destroy_uniform(s->s_depth);
     if (s->s_normal.idx      != UINT16_MAX) bgfx_destroy_uniform(s->s_normal);
-    if (s->vbh.idx != UINT16_MAX) bgfx_destroy_vertex_buffer(s->vbh);
-    if (s->ibh.idx != UINT16_MAX) bgfx_destroy_index_buffer(s->ibh);
-    if (s->fb.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb);
+    jce_fs_quad_destroy(&s->quad);
+    jce_fs_target_destroy(&s->rt);
     JCE_FREE(s);
 }
 
 void jce_ssr_resize(JceSsr *s, int w, int h)
 {
-    if (!s || w <= 0 || h <= 0) return;
-    if (w == s->w && h == s->h) return;
-    s->w = w; s->h = h;
-    create_target(s);
+    if (s) jce_fs_target_resize(&s->rt, w, h);
 }
 
 void jce_ssr_set_params(JceSsr *s, const JceSsrParams *p)
@@ -187,8 +153,8 @@ void jce_ssr_render(JceSsr *s,
     JCE_PROFILE_ZONE_N("Renderer::SSR::render");
 
     uint16_t v = first_view_id;
-    bgfx_set_view_frame_buffer(v, s->fb);
-    bgfx_set_view_rect(v, 0, 0, (uint16_t)s->w, (uint16_t)s->h);
+    bgfx_set_view_frame_buffer(v, s->rt.fb);
+    bgfx_set_view_rect(v, 0, 0, (uint16_t)s->rt.w, (uint16_t)s->rt.h);
     bgfx_set_view_clear(v, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
     /* bgfx auto-fills u_view, u_proj, u_invViewProj from this. */
     bgfx_set_view_transform(v, JCE_M4_PTR(*view), JCE_M4_PTR(*proj));
@@ -197,8 +163,8 @@ void jce_ssr_render(JceSsr *s,
     float p0[4] = { s->params.max_distance, s->params.thickness,
                     s->params.near_plane,   s->params.far_plane };
     float p1[4] = { s->params.step_count, 0.0f, 0.0f, s->params.intensity };
-    float screen[4] = { (float)s->w, (float)s->h,
-                        1.0f / (float)s->w, 1.0f / (float)s->h };
+    float screen[4] = { (float)s->rt.w, (float)s->rt.h,
+                        1.0f / (float)s->rt.w, 1.0f / (float)s->rt.h };
 
     bgfx_set_uniform(s->u_p0, p0, 1);
     bgfx_set_uniform(s->u_p1, p1, 1);
@@ -211,8 +177,7 @@ void jce_ssr_render(JceSsr *s,
     bgfx_set_texture(1, s->s_depth,  depth,  UINT32_MAX);
     bgfx_set_texture(2, s->s_normal, normal, UINT32_MAX);
 
-    bgfx_set_vertex_buffer(0, s->vbh, 0, 4);
-    bgfx_set_index_buffer(s->ibh, 0, 6);
+    jce_fs_quad_bind(&s->quad);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
     bgfx_submit(v, s->prog, 0, BGFX_DISCARD_ALL);
     JCE_PROFILE_ZONE_END;
@@ -220,14 +185,14 @@ void jce_ssr_render(JceSsr *s,
 
 uint16_t jce_ssr_get_result_texture(const JceSsr *s)
 {
-    if (!s || s->fb.idx == UINT16_MAX) return UINT16_MAX;
-    return s->tex.idx;
+    if (!s || s->rt.fb.idx == UINT16_MAX) return UINT16_MAX;
+    return s->rt.tex.idx;
 }
 
 void jce_ssr_composite(JceSsr *s, uint16_t view_id, uint16_t dst_fb_idx)
 {
     if (!s || s->prog_composite.idx == UINT16_MAX) return;
-    if (s->tex.idx == UINT16_MAX)                  return;
+    if (s->rt.tex.idx == UINT16_MAX)               return;
     JCE_PROFILE_ZONE_N("Renderer::SSR::composite");
 
     /* Blend the reflection RT over the destination color buffer.  Callers must
@@ -235,16 +200,15 @@ void jce_ssr_composite(JceSsr *s, uint16_t view_id, uint16_t dst_fb_idx)
      * filled first. */
     bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
     bgfx_set_view_frame_buffer(view_id, dst);
-    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)s->w, (uint16_t)s->h);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)s->rt.w, (uint16_t)s->rt.h);
     bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(view_id);
 
-    bgfx_set_texture(0, s->s_color, s->tex,
+    bgfx_set_texture(0, s->s_color, s->rt.tex,
                      BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                      | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                      | BGFX_SAMPLER_MIP_POINT);
-    bgfx_set_vertex_buffer(0, s->vbh, 0, 4);
-    bgfx_set_index_buffer(s->ibh, 0, 6);
+    jce_fs_quad_bind(&s->quad);
 
     /* Premultiplied "over": dst = refl.rgb + dst*(1-refl.a). */
     uint64_t state = BGFX_STATE_WRITE_RGB

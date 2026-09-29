@@ -29,7 +29,7 @@ void draw_node(Node &n, ImDrawList *dl, ImVec2 origin)
     if (n.type == NT_FLOAT)      content_h += 24.0f;
     if (n.type == NT_TEXTURE)    content_h += 24.0f;
     if (n.type == NT_NORMAL_MAP) content_h += 24.0f;
-    if (n.type == NT_UV)         content_h += 24.0f;
+    if (n.type == NT_UV)         content_h += 48.0f;   /* tile + offset */
     float node_w = (n.type == NT_TEXTURE || n.type == NT_NORMAL_MAP) ? 220.0f : 170.0f;
     ImVec2 size = ImVec2(node_w, 28.0f + content_h + 6.0f);
     ImVec2 tl   = ImVec2(origin.x + n.pos.x, origin.y + n.pos.y);
@@ -142,20 +142,62 @@ void draw_node(Node &n, ImDrawList *dl, ImVec2 origin)
         ImGui::SetNextItemWidth(size.x - 12.0f);
         ImGui::SliderFloat("##s", &n.scalar, 0.0f, 1.0f, "%.3f");
         if (ImGui::IsItemActivated()) push_undo();
-    } else if (n.type == NT_TEXTURE || n.type == NT_NORMAL_MAP) {
+    } else if (n.type == NT_TEXTURE) {
+        /* WHICH MAP, not which file.  A graph program is bound by
+         * jce_pbr_material_bind, which binds the material's five maps and
+         * nothing else -- a free-text path here was serialised, reloaded, and
+         * read by nothing, so every Texture node sampled s_albedo whatever it
+         * said.  Five names, and the codegen's sampler_for_node reads the
+         * same strings. */
+        static const char *kSlotKey[5] =
+            { "albedo", "metalRough", "normalMap", "ao", "emissive" };
+        const char *slot_items[5] = {
+            jce_editor_i18n_id("materialGraph.slot.albedo",     "Albedo"),
+            jce_editor_i18n_id("materialGraph.slot.metalRough", "Metal/Rough"),
+            jce_editor_i18n_id("materialGraph.slot.normalMap",  "Normal"),
+            jce_editor_i18n_id("materialGraph.slot.ao",         "Ambient Occlusion"),
+            jce_editor_i18n_id("materialGraph.slot.emissive",   "Emissive"),
+        };
+        int slot = 0;
+        for (int i = 0; i < 5; ++i)
+            if (std::strcmp(n.text, kSlotKey[i]) == 0) { slot = i; break; }
         ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
                                          tl.y + 28.0f + sock_count *
                                          ImGui::GetTextLineHeightWithSpacing()));
         ImGui::SetNextItemWidth(size.x - 12.0f);
-        ImGui::InputText("##tex", n.text, sizeof(n.text));
-        if (ImGui::IsItemActivated()) push_undo();
+        if (ImGui::Combo("##slot", &slot, slot_items, 5)) {
+            push_undo();
+            std::snprintf(n.text, sizeof(n.text), "%s", kSlotKey[slot]);
+        }
+    } else if (n.type == NT_NORMAL_MAP) {
+        /* Reads s_normalMap by definition; nothing to choose.  Say so, rather
+         * than leave the free-text box that used to sit here and did nothing. */
+        ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
+                                         tl.y + 28.0f + sock_count *
+                                         ImGui::GetTextLineHeightWithSpacing()));
+        ImGui::TextDisabled("%s", jce_editor_i18n_id(
+            "materialGraph.node.normalSlot", "reads the material's Normal map"));
     } else if (n.type == NT_UV) {
+        /* Tile AND offset, two numbers each, because a UV is two numbers.
+         * This was one float called "Tile" that codegen emitted as a bare
+         * constant no socket could consume. */
         ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
                                          tl.y + 28.0f + sock_count *
                                          ImGui::GetTextLineHeightWithSpacing()));
         ImGui::SetNextItemWidth(size.x - 12.0f);
-        ImGui::SliderFloat("##tile", &n.scalar, 0.1f, 16.0f,
-                           jce_editor_i18n("materialGraph.node.tileFmt"));
+        if (ImGui::DragFloat2("##tile", &n.color[0], 0.01f, -64.0f, 64.0f,
+                              jce_editor_i18n("materialGraph.node.tileFmt")))
+            { }
+        if (ImGui::IsItemActivated()) push_undo();
+        ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
+                                         tl.y + 28.0f + sock_count *
+                                         ImGui::GetTextLineHeightWithSpacing()
+                                         + 22.0f));
+        ImGui::SetNextItemWidth(size.x - 12.0f);
+        if (ImGui::DragFloat2("##offset", &n.color[2], 0.005f, -64.0f, 64.0f,
+                              jce_editor_i18n_id("materialGraph.node.offsetFmt",
+                                                 "off %.2f")))
+            { }
         if (ImGui::IsItemActivated()) push_undo();
     }
 

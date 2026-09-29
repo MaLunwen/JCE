@@ -13,5 +13,7 @@ extern "C" {
 void jce_editor_scene_rendering_settings_from_project(
     JceSceneRenderingSettings *out);
 void jce_editor_scene_ensure_rendering_settings(JceScene *scene);
+/* The project-settings half of the above, without the fabrication. */
+void jce_editor_scene_apply_project_texture_state(void);
 
 #endif /* JCE_EDITOR_SCENE_RENDERING_DEFAULTS_H */

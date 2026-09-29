@@ -7,6 +7,7 @@
 #include <jce/os/core/jce_camera_shake.h>
 
 #include <math.h>
+#include <stdio.h>   /* snprintf, for the active-name override */
 #include <string.h>
 
 /* Singleton damping state. The editor only ever drives one game camera
@@ -14,9 +15,21 @@
 typedef struct {
     int           initialised;
     JceVcamOutput cur;
+    /* The name that beats priority.  Empty = nobody asked, which is every
+     * scene written before this and the state jce_vcam_system_reset()
+     * returns to.
+     *
+     * It is HERE rather than on the component because the obvious
+     * implementation -- raise the chosen camera's `priority` -- writes
+     * gameplay state into the authored scene: the editor marks it dirty,
+     * Ctrl+S bakes a cutscene's camera choice into the level, and ending the
+     * cutscene needs the old numbers remembered from somewhere.  It is inside
+     * VcamState rather than beside it so this file's file-scope mutable count
+     * does not grow: it is the same singleton, not a second one. */
+    char          active_name[64];
 } VcamState;
 
-static VcamState s_state = { 0, { {0,0,0}, {0,0,0}, 60.0f } };
+static VcamState s_state = { 0, { {0,0,0}, {0,0,0}, 60.0f }, "" };
 
 /* Trauma-based camera shake (gap 6.5): the orphaned jce_camera_shake model is
  * now wired into the single live camera resolver.  Gameplay adds trauma via
@@ -38,6 +51,7 @@ static void vcam_shake_ensure_init(void)
     }
 }
 
+
 JCE_API void JCE_CALL
 jce_vcam_system_reset(void)
 {
@@ -48,6 +62,13 @@ jce_vcam_system_reset(void)
      * fresh scene/Play session starts perfectly still). */
     jce_camera_shake_init(&s_shake, 1.5f, 18.0f, 0xC0FFEEu);
     s_shake_inited = 1;
+
+    /* And drop the named-camera override.  It is deliberately allowed to name
+     * a camera that has not streamed in yet, which is exactly why it must not
+     * survive a scene change: a cut requested in the last level would sit
+     * there waiting to hijack the first camera in the next one that happens to
+     * share the name. */
+    s_state.active_name[0] = 0;
 }
 
 JCE_API void JCE_CALL
@@ -75,21 +96,106 @@ jce_vcam_system_get_shake_offset(float out_pos[3])
 typedef struct {
     JceScene                  *scene;
     int                        have_winner;
+    int                        winner_is_named;   /* the override took it */
     int32_t                    best_priority;
     JceVirtualCameraComponent  best;
 } PickCtx;
+
+
+static bool vcam_selectable(JceScene *s, JceEntity e,
+                            const JceVirtualCameraComponent *vc)
+{
+    return vc && vc->active &&
+           jce_scene_component_enabled(s, e, JCE_COMP_FLAG_VIRTUAL_CAMERA);
+}
 
 static void pick_cb(JceScene *s, JceEntity e, void *user)
 {
     PickCtx *ctx = (PickCtx *)user;
     if (!jce_scene_has_virtual_camera(s, e)) return;
     JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(s, e);
-    if (!vc || !vc->active) return;
-    if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_VIRTUAL_CAMERA)) return;
+    if (!vcam_selectable(s, e, vc)) return;
+
+    /* THE NAMED ONE WINS OUTRIGHT, and only over cameras that would have been
+     * eligible anyway: an inactive or disabled camera is not resurrected by
+     * being named, because "cut to it" cannot mean "and also turn it on" --
+     * an author who disabled a camera said something. */
+    if (s_state.active_name[0]) {
+        int named = (strncmp(vc->vcam_name, s_state.active_name,
+                             sizeof(s_state.active_name) - 1) == 0);
+        if (ctx->winner_is_named && !named) return;
+        if (!named && !ctx->winner_is_named) {
+            /* ordinary priority race, below */
+        } else if (named) {
+            /* First named match wins; a second camera with the same name is
+             * an authoring mistake and taking the first is at least stable. */
+            if (ctx->winner_is_named) return;
+            ctx->have_winner    = 1;
+            ctx->winner_is_named = 1;
+            ctx->best_priority  = vc->priority;
+            ctx->best           = *vc;
+            return;
+        }
+    }
+
     if (ctx->have_winner && vc->priority <= ctx->best_priority) return;
     ctx->have_winner   = 1;
     ctx->best_priority = vc->priority;
     ctx->best          = *vc;
+}
+
+/* ── Naming a shot ─────────────────────────────────────────────────── */
+
+typedef struct {
+    const char *name;
+    JceEntity   found;
+} FindCtx;
+
+static void find_cb(JceScene *s, JceEntity e, void *user)
+{
+    FindCtx *ctx = (FindCtx *)user;
+    if (ctx->found) return;
+    if (!jce_scene_has_virtual_camera(s, e)) return;
+    JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(s, e);
+    if (!vc) return;
+    if (strncmp(vc->vcam_name, ctx->name, 63) == 0) ctx->found = e;
+}
+
+JCE_API JceEntity JCE_CALL jce_vcam_find_by_name(JceScene *scene,
+                                                 const char *name)
+{
+    FindCtx ctx;
+    if (!scene || !name || !name[0]) return 0;
+    ctx.name  = name;
+    ctx.found = 0;
+    jce_scene_each_entity(scene, find_cb, &ctx);
+    return ctx.found;
+}
+
+JCE_API bool JCE_CALL jce_vcam_system_set_active_by_name(JceScene   *scene,
+                                                         const char *name)
+{
+    if (!name || !name[0]) {
+        s_state.active_name[0] = '\0';
+        return false;
+    }
+    snprintf(s_state.active_name, sizeof(s_state.active_name), "%s", name);
+
+    /* The RECORD is unconditional; the RETURN says whether it resolves right
+     * now.  A streaming cell that has not loaded yet must not silently turn
+     * the cut into "whatever priority says" the moment it appears. */
+    if (!scene) return false;
+    {
+        JceEntity e = jce_vcam_find_by_name(scene, name);
+        if (!e) return false;
+        JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(scene, e);
+        return vcam_selectable(scene, e, vc);
+    }
+}
+
+JCE_API const char *JCE_CALL jce_vcam_system_get_active_name(void)
+{
+    return s_state.active_name;
 }
 
 static void resolve_pose(JceScene                        *scene,
@@ -150,7 +256,7 @@ jce_vcam_system_evaluate(JceScene      *scene,
     if (dt > 0.0f)
         jce_camera_shake_update(&s_shake, dt);
 
-    PickCtx ctx = { scene, 0, 0, {{0}} };
+    PickCtx ctx = { scene, 0, 0, 0, {{0}} };
     jce_scene_each_entity(scene, pick_cb, &ctx);
     if (!ctx.have_winner) {
         s_state.initialised = 0; /* snap on next acquire */

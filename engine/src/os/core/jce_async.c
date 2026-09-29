@@ -187,8 +187,23 @@ static uint32_t async_process_worker_budget(void)
 
     if (workers < 1)
         workers = 1;
-    if (workers > 4)
-        workers = 4;
+    /* The cap was 4, with nothing saying why, and it was the binding
+     * constraint on every machine bigger than a laptop: jce_thread_pool_
+     * default_workers() already answers cores-1-capped-at-8, and this threw
+     * the answer away.  Measured on a 32-core box opening
+     * caged_kingdom/hidden_cove -- 49 glTF decodes, ~92 ms each, 4.5 s of CPU
+     * -- the asset pool ran 4 workers and the first frame waited on work that
+     * eight could have finished in half the time.
+     *
+     * 8 matches the shared frame pool's own ceiling, so the two agree.  Three
+     * threaded executors exist (archive loader, asset decode, streaming), so
+     * the worst case is 24 threads; they are I/O- and burst-bound and asleep
+     * almost always, which is why this is a per-executor cap rather than a
+     * process-wide budget.  LOW machine class (1) and an explicit
+     * [performance] job_workers pin both still win outright -- those are the
+     * knobs for a box that cannot afford this. */
+    if (workers > 8)
+        workers = 8;
     return (uint32_t)workers;
 }
 
@@ -292,6 +307,53 @@ void jce_async_task_release(JceAsyncTask *task)
         return;
     if (SDL_AddAtomicInt(&task->refs, -1) == 1)
         async_task_destroy(task);
+}
+
+bool jce_async_task_discard(JceAsyncTask *task)
+{
+    JceAsyncExecutor *executor;
+    bool dropped = false;
+
+    if (!task)
+        return false;
+
+    (void)jce_async_task_cancel(task);
+    if (jce_async_task_wait_timeout(task, JCE_ASYNC_WAIT_INFINITE) ==
+        JCE_ASYNC_WAIT_WOULD_DEADLOCK) {
+        /* Called from a worker of this very executor: waiting would deadlock,
+         * and this thread cannot be the one that pumps the completion either.
+         * Drop the reference and report that the callback still stands. */
+        jce_async_task_release(task);
+        return false;
+    }
+
+    SDL_LockMutex(task->wait_mutex);
+    executor = task->executor;
+    SDL_UnlockMutex(task->wait_mutex);
+    if (!executor) {
+        /* Already reaped: the completion has run, nothing to disarm. */
+        jce_async_task_release(task);
+        return false;
+    }
+
+    SDL_LockMutex(executor->lock);
+    if (task->completion_claimed && !task->callback_done) {
+        /* A pump on another thread is inside the callback right now.  Let it
+         * finish before returning, or the caller frees under it. */
+        while (!task->callback_done)
+            SDL_WaitCondition(executor->idle_cond, executor->lock);
+    } else if (!task->callback_done) {
+        /* Still queued.  Claiming happens under this same lock, so the pump
+         * cannot be past that point: clearing the hook here is race-free.
+         * The task stays in the queue and is reaped normally -- disarming the
+         * callback is the whole job, not unlinking the node. */
+        task->complete = NULL;
+        dropped = true;
+    }
+    SDL_UnlockMutex(executor->lock);
+
+    jce_async_task_release(task);
+    return dropped;
 }
 
 static void async_task_set_state(JceAsyncTask *task, JceAsyncState state)

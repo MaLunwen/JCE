@@ -248,7 +248,7 @@ static float quat_angle_between_deg(jce_quat a, jce_quat b)
 /* Encode / broadcast                                                  */
 /* ================================================================== */
 
-#ifndef NDEBUG
+#ifdef JCE_SELF_TESTS
 /* Self-test stub state — when active, scene reads / writes hit this
  * in-memory record instead of the JceScene.  Lets the self-test skip
  * spinning up an ECS world. */
@@ -260,7 +260,7 @@ static jce_quat g_nt_stub_rot;
 static bool entity_sample_transform(JceNetObjectId id,
                                     jce_vec3 *out_pos, jce_quat *out_rot)
 {
-#ifndef NDEBUG
+#ifdef JCE_SELF_TESTS
     if (g_nt_stub_active) {
         (void)id;
         *out_pos = g_nt_stub_pos;
@@ -281,7 +281,7 @@ static bool entity_sample_transform(JceNetObjectId id,
 static void entity_apply_transform(JceNetObjectId id,
                                    jce_vec3 pos, jce_quat rot)
 {
-#ifndef NDEBUG
+#ifdef JCE_SELF_TESTS
     if (g_nt_stub_active) {
         (void)id;
         g_nt_stub_pos = pos;
@@ -716,8 +716,8 @@ void jce_net_transform_shutdown(void)
 /* Self-test (debug builds only).                                      */
 /* ================================================================== */
 
-#ifndef NDEBUG
-#include <assert.h>
+#ifdef JCE_SELF_TESTS
+#include <jce/os/core/jce_assert.h>
 
 /* Stand-alone self-test — exercises the interp math and the snap
  * decision in isolation.  Avoids spinning up a full ECS / replication
@@ -742,10 +742,10 @@ void jce_net_transform_self_test(void)
     cfg.divergence_snap_distance = 0.5f;
 
     bool ok = jce_net_transform_register(TEST_ID, &cfg);
-    assert(ok);
+    JCE_ASSERT(ok);
 
     NtEntry *e = find_entry(TEST_ID);
-    assert(e);
+    JCE_ASSERT(e);
 
     /* 4 server snapshots @ ticks 100/110/120/130, pos.x = 1..4. */
     for (uint32_t k = 0; k < 4u; ++k) {
@@ -756,7 +756,7 @@ void jce_net_transform_self_test(void)
         s.velocity    = jce_v3(0.0f, 0.0f, 0.0f);
         ring_push(e, &s);
     }
-    assert(e->ring_count == 4u);
+    JCE_ASSERT(e->ring_count == 4u);
     g_nt.last_known_server_tick = 130u;
 
     /* Pair lookup at render_tick=115 → straddles (110, 120), t=0.5. */
@@ -764,11 +764,11 @@ void jce_net_transform_self_test(void)
     const JceNetTransformSnapshot *b = NULL;
     float t = 0.0f;
     bool  found = ring_find_pair(e, 115u, &a, &b, &t);
-    assert(found);
-    assert(a && b);
-    assert(a->server_tick == 110u && b->server_tick == 120u);
+    JCE_ASSERT(found);
+    JCE_ASSERT(a && b);
+    JCE_ASSERT(a->server_tick == 110u && b->server_tick == 120u);
     jce_vec3 interp = jce_v3_lerp(a->position, b->position, t);
-    assert(interp.x > 2.49f && interp.x < 2.51f);
+    JCE_ASSERT(interp.x > 2.49f && interp.x < 2.51f);
 
     /* Snap-correction path: predicted pose at origin, snapshot 5m away
      * → expect snap + counter ++.  We simulate the owner-local check
@@ -789,20 +789,20 @@ void jce_net_transform_self_test(void)
         float    dist = jce_v3_len(d);
         float    ang  = quat_angle_between_deg(cur_rot,
                                                e->pending_snapshot.rotation);
-        assert(dist > cfg.divergence_snap_distance);
+        JCE_ASSERT(dist > cfg.divergence_snap_distance);
         (void)ang;
         entity_apply_transform(e->id,
             e->pending_snapshot.position, e->pending_snapshot.rotation);
         g_nt.snap_corrections++;
         e->pending_correction = false;
     }
-    assert(jce_net_transform_snap_corrections_count() == 1u);
-    assert(g_nt_stub_pos.x > 4.99f && g_nt_stub_pos.x < 5.01f);
+    JCE_ASSERT(jce_net_transform_snap_corrections_count() == 1u);
+    JCE_ASSERT(g_nt_stub_pos.x > 4.99f && g_nt_stub_pos.x < 5.01f);
 
     /* Cleanup. */
     g_nt_stub_active = false;
     jce_net_transform_shutdown();
 }
 
-#endif /* !NDEBUG */
+#endif /* JCE_SELF_TESTS */
 

@@ -11,6 +11,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "core/jce_project_settings.h"
 #include "core/jce_editor_i18n.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -39,16 +40,43 @@ State g_st;
 
 const char *settings_path(void)
 {
-    static char path[512];
-    /* Persisted under cwd-relative Settings/ — matches Unity convention. */
-    std::snprintf(path, sizeof(path), "Settings/TagsAndLayers.json");
-    return path;
+    /* What this panel actually writes now.  It said
+     * "Settings/TagsAndLayers.json" -- the file only this panel ever read --
+     * so the status line named a path whose contents changed nothing. */
+    return ".jce/project-settings.json";
 }
 
-void sync_layer_buf_from_engine(void)
+/* PROJECT SETTINGS IS THE AUTHORITY, and this panel used to edit something
+ * else entirely.
+ *
+ * There were two 32-slot layer-name registries and nothing copied between
+ * them.  This panel wrote jce_layer_set_name() -> Settings/TagsAndLayers.json,
+ * whose ONLY reader in the whole tree was this panel.  Every consumer --
+ * the entity Layer combo, the physics layer combo, the camera culling-mask
+ * dropdown, and the build's push into the shipped physics layer names --
+ * reads JceProjectSettings::tags_layers.  So renaming layer 8 here changed
+ * nothing anywhere, and Project Settings > Tags and Layers, which edits the
+ * store that IS read, showed a different set of names in a panel with the
+ * same title.  Same split for tags: this panel called jce_tag_intern() while
+ * the Inspector's tag combo reads ps->tags_layers.tags[].
+ *
+ * jce_scene.h also said the engine registry was "loaded on scene init via
+ * jce_scene_tags_layers_load()".  The only caller was the line below.
+ *
+ * The engine registry is still MIRRORED, because jce_layer_name() is public
+ * API a user project may call and it must not disagree with the editor. */
+void sync_engine_registry_from(const JceProjectSettings *ps)
 {
+    if (!ps) return;
+    for (uint32_t i = 0; i < JCE_LAYER_COUNT; i++)
+        jce_layer_set_name((uint8_t)i, ps->tags_layers.layers[i]);
+}
+
+void sync_layer_buf_from_settings(void)
+{
+    const JceProjectSettings *ps = jce_project_settings_current();
     for (uint32_t i = 0; i < JCE_LAYER_COUNT; i++) {
-        const char *nm = jce_layer_name(i);
+        const char *nm = ps ? ps->tags_layers.layers[i] : "";
         std::snprintf(g_st.layer_buf[i], sizeof(g_st.layer_buf[i]),
                       "%s", nm ? nm : "");
     }
@@ -58,13 +86,44 @@ void load_if_needed(void)
 {
     if (g_st.loaded) return;
     g_st.loaded = true;
-    (void)jce_scene_tags_layers_load(NULL);
-    sync_layer_buf_from_engine();
+    /* No mirroring here: jce_project_settings_apply() does it for every
+     * consumer, whether or not this panel was ever opened. */
+    JceProjectSettings ps;
+    if (jce_project_settings_load(&ps))
+        jce_project_settings_apply(&ps);
+    sync_layer_buf_from_settings();
+}
+
+/* Write the panel's buffers into project settings and persist THAT.  The
+ * engine registry is mirrored so jce_layer_name() agrees. */
+bool commit_layers(void)
+{
+    JceProjectSettings ps;
+    if (!jce_project_settings_load(&ps))
+        jce_project_settings_defaults(&ps);
+    for (uint32_t i = 0; i < JCE_LAYER_COUNT; i++)
+        std::snprintf(ps.tags_layers.layers[i], JCE_PS_NAME_LEN,
+                      "%s", g_st.layer_buf[i]);
+    /* Tags travel the same way: the engine tag pool is where this panel does
+     * its add/remove, and the Inspector's tag combo reads
+     * ps->tags_layers.tags[].  Copy the pool across so both agree. */
+    int n = jce_tag_count();
+    if (n > JCE_PS_MAX_TAGS) n = JCE_PS_MAX_TAGS;
+    ps.tags_layers.tag_count = n;
+    for (int i = 0; i < n; ++i) {
+        const char *nm = jce_tag_at(i);
+        std::snprintf(ps.tags_layers.tags[i], JCE_PS_NAME_LEN,
+                      "%s", nm ? nm : "");
+    }
+    if (!jce_project_settings_save(&ps)) return false;
+    jce_project_settings_apply(&ps);
+    sync_engine_registry_from(&ps);
+    return true;
 }
 
 void save_now(void)
 {
-    if (!jce_scene_tags_layers_save(NULL)) {
+    if (!commit_layers()) {
         std::snprintf(g_st.status, sizeof(g_st.status), "%s",
                       jce_editor_i18n("panel.tags_layers.save_failed"));
     } else {
@@ -163,10 +222,11 @@ extern "C" void jce_editor_panel_tags_layers_content(void)
                 if (i <= 4) {
                     ImGui::TextDisabled("%s", g_st.layer_buf[i]);
                 } else {
-                    if (ImGui::InputText("##layer_name", g_st.layer_buf[i],
-                                         sizeof(g_st.layer_buf[i]))) {
-                        jce_layer_set_name((uint8_t)i, g_st.layer_buf[i]);
-                    }
+                    ImGui::InputText("##layer_name", g_st.layer_buf[i],
+                                     sizeof(g_st.layer_buf[i]));
+                    /* Commit on deactivate only: project settings is a
+                     * whole-file save, and writing it per keystroke would
+                     * rewrite the document 30 times a second. */
                     if (ImGui::IsItemDeactivatedAfterEdit()) save_now();
                 }
                 ImGui::PopID();
@@ -177,7 +237,13 @@ extern "C" void jce_editor_panel_tags_layers_content(void)
         ImGui::Spacing();
         if (ImGui::Button(jce_editor_i18n("panel.tags_layers.reset_default"))) {
             jce_layer_reset_defaults();
-            sync_layer_buf_from_engine();
+            /* Defaults live in the engine registry; copy them ACROSS to the
+             * authoritative store rather than leaving the two disagreeing. */
+            for (uint32_t i = 0; i < JCE_LAYER_COUNT; i++) {
+                const char *nm = jce_layer_name(i);
+                std::snprintf(g_st.layer_buf[i], sizeof(g_st.layer_buf[i]),
+                              "%s", nm ? nm : "");
+            }
             save_now();
         }
     }

@@ -11,6 +11,8 @@
  */
 
 #include "jce_sr_internal.h"
+#include <jce/renderer/jce_lighting_system.h>
+#include "jce_sr_probe.h"
 #include <jce/os/core/jce_timer.h>   /* JCE_CULL_KPI broad-phase timing */
 #include <jce/os/core/jce_perf_phase.h> /* prepass_loop sub-phase */
 #include <string.h>                  /* memcmp — static "didn't move" test */
@@ -43,6 +45,14 @@ static void sr_vel_inst_bind(uint32_t material_key, void *user)
     JceSceneRenderer *sr = (JceSceneRenderer *)user;
     float gmat[4] = { (float)material_key / 1000.0f, 0.0f, 0.0f, 0.0f };
     jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
+    /* WHITE, and it is a known coarseness rather than an oversight: the batch
+     * key carries quantised ROUGHNESS and nothing else, so there is no per-
+     * batch base colour to restore here without widening a key every velocity
+     * batch is sorted on.  White is the NEUTRAL error -- SSGI then gathers the
+     * full bounce for these surfaces -- not the wrong one it replaces, which
+     * was the receiver's lit colour counting its direct lighting twice. */
+    const float alb[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
 }
 
 /* ── TAA per-object previous-world-matrix table ─────────────────────────
@@ -166,6 +176,10 @@ void sr_ensure_ssao_target(JceSceneRenderer *sr, uint16_t w, uint16_t h,
         bgfx_destroy_texture(sr->ssao_velocity_tex);
         sr->ssao_velocity_tex.idx = UINT16_MAX;
     }
+    if (BGFX_HANDLE_IS_VALID(sr->ssao_albedo_tex)) {
+        bgfx_destroy_texture(sr->ssao_albedo_tex);
+        sr->ssao_albedo_tex.idx = UINT16_MAX;
+    }
     const uint64_t rt_flags = BGFX_TEXTURE_RT
         | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
         | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
@@ -173,14 +187,22 @@ void sr_ensure_ssao_target(JceSceneRenderer *sr, uint16_t w, uint16_t h,
         BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL, 0);
     sr->ssao_depth_tex = bgfx_create_texture_2d(w, h, false, 1,
         sr->shadow_depth_fmt, rt_flags, NULL, 0);
+    sr->ssao_albedo_tex = bgfx_create_texture_2d(w, h, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL, 0);
     if (want_velocity)
         sr->ssao_velocity_tex = bgfx_create_texture_2d(w, h, false, 1,
             BGFX_TEXTURE_FORMAT_RGBA16F, rt_flags, NULL, 0);
 
-    bgfx_attachment_t at[3];
+    bgfx_attachment_t at[4];
     memset(at, 0, sizeof(at));
     int n = 0;
     bgfx_attachment_init(&at[n++], sr->ssao_normal_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+    /* ALBEDO AT 1, ALWAYS.  Not gated on SSGI: a conditional attachment moves
+     * velocity from 2 to 1, and the fragment shaders write fixed FragData
+     * indices -- so on the frames SSGI were off, albedo would land in the
+     * velocity target and TAA would ghost for a reason nothing in TAA could
+     * explain.  See the field's comment in jce_sr_internal.h. */
+    bgfx_attachment_init(&at[n++], sr->ssao_albedo_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
     if (want_velocity)
         bgfx_attachment_init(&at[n++], sr->ssao_velocity_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
     bgfx_attachment_init(&at[n++], sr->ssao_depth_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
@@ -299,14 +321,26 @@ static bool sr_try_submit_skinned_velocity(JceSceneRenderer *sr, JceScene *scene
                                    ? ai->prev_skin_palette : NULL;
     uint32_t prev_n = (ai && ai->prev_skin_valid) ? ai->prev_skin_palette_count : 0;
 
-    /* Roughness for the SSR normal slot (matte default). */
+    /* Roughness for the SSR normal slot (matte default) and BASE COLOUR for
+     * the albedo slot.  The albedo is what stops SSGI using the receiver's
+     * lit colour as its own albedo and counting the direct lighting twice; it
+     * is the material's FACTOR, not its texture, because binding every
+     * material's albedo map in a pre-pass that binds nothing today would make
+     * the pre-pass as state-heavy as the colour pass. */
     float rough = 0.8f;
+    float alb[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     {
         JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-        if (mr) rough = mr->roughness;
+        if (mr) {
+            rough  = mr->roughness;
+            alb[0] = mr->base_color[0];
+            alb[1] = mr->base_color[1];
+            alb[2] = mr->base_color[2];
+        }
     }
     float gmat[4] = { rough, 0.0f, 0.0f, 0.0f };
     jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
+    jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
 
     /* prev world = same world matrix as current (skinned entities animate via
        the bone palette, and the world TRS is captured for non-skinned dynamics;
@@ -552,8 +586,14 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
                          ? sr->ecull_world[cull_idx]
                          : jce_scene_get_world_matrix(scene, e);
     float rough = 0.8f;
+    float alb2[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-    if (mr) rough = mr->roughness;
+    if (mr) {
+        rough   = mr->roughness;
+        alb2[0] = mr->base_color[0];
+        alb2[1] = mr->base_color[1];
+        alb2[2] = mr->base_color[2];
+    }
 
     /* INSTANCE static models through the velocity render queue (mirrors the static-
      * PRIMITIVE path below): a shared-node GPU-instanceable model that did NOT move
@@ -590,6 +630,7 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
 
     float gmat[4] = { rough, 0.0f, 0.0f, 0.0f };
     jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
+    jce_enc_set_uniform(sr->u_gbuffer_albedo, alb2, 1);
     jce_model_draw_velocity(mc->model, sr->renderer, view_id, ctx,
                             &model, NULL, 0, prev_model, NULL, 0);
     sr_prev_xform_store(sr, (uint32_t)e, &model);
@@ -599,7 +640,7 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
 void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                                   const JceCamera *camera, EntityList *list,
                                   uint16_t view_id_base, uint32_t vp_w, uint32_t vp_h,
-                                  bool want_ssr)
+                                  bool want_normals)
 {
     if (!sr || !sr->ssao_valid || !camera || !list) return;
     JceShaderHandle shadow_sh = jce_renderer_get_program_shadow(sr->renderer);
@@ -638,7 +679,10 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     }
     static JceRenderQueue *s_pre_rq = NULL;
     JceShaderHandle pre_inst_sh = jce_renderer_get_program_shadow_inst(sr->renderer);
-    bool pre_batch = s_pre_batch_env && !want_ssr &&
+    /* The batched path writes DEPTH ONLY: it submits through the shadow
+     * instancing program, which has no normal output.  So it is available
+     * exactly when nobody asked for normals. */
+    bool pre_batch = s_pre_batch_env && !want_normals &&
                      pre_inst_sh.idx != UINT16_MAX;
     if (pre_batch && !s_pre_rq) s_pre_rq = jce_rq_create(1024);
     if (pre_batch && s_pre_rq) {
@@ -717,7 +761,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
         float vel_clear[4] = { 0.5f, 0.5f, 0.0f, 1.0f };
         bgfx_set_palette_color_rgba8(0, 0x8080ffffu);
         bgfx_set_palette_color(1, vel_clear);
-        bgfx_set_view_clear_mrt(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+        bgfx_set_view_clear_mrt(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                                 1.0f, 0,
                                 0,    /* attachment 0 -> palette 0 */
                                 1,    /* attachment 1 -> palette 1 */
@@ -726,7 +770,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     } else {
         /* Clear normal G-buffer to up-ish normal + roughness=1 (matte => no SSR)
          * for pixels not covered by a G-buffer submit; clear depth to far. */
-        bgfx_set_view_clear(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x8080ffff, 1.0f, 0);
+        bgfx_set_view_clear(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0x8080ffff, 1.0f, 0);
     }
     bgfx_set_view_transform(v, view.raw[0], proj.raw[0]);
     bgfx_touch(v);
@@ -771,6 +815,13 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     uint64_t _t0_ppl = jce_time_perf_counter();
     for (int i = 0; i < list->count; i++) {
         JceEntity e = list->entities[i];
+        /* MUST agree with the colour pass: this prepass feeds SSAO, SSR and
+         * the TAA motion vectors, and a disagreement draws objects with no
+         * motion vector -- the shimmer the cull_aspect comment records. */
+        if (sr->frame_culling_mask &&
+            (sr->frame_culling_mask &
+             (1u << (jce_scene_get_entity_layer(scene, e) & 31u))) == 0u)
+            continue;
         const SrEntityCull *ec = &sr->ecull[i];
         /* Fix #1: a cached PRIM_MESH has no skinned/model/terrain/special parts,
          * so the per-pass dispatch probes are provably false → skip them. */
@@ -1062,28 +1113,62 @@ void sr_select_lights(JceSceneRenderer *sr, JceScene *scene,
 
     /* Partial selection sort: pull the top-N by score to the front and store
        their entities as the membership set (order inside the set is irrelevant —
-       the gather/producer re-process them in list order). */
+       the gather/producer re-process them in list order).
+     *
+     * THE BUDGET IS SPENT ACROSS BOTH KINDS, HIGHEST SCORE FIRST.
+     * jce_lighting_set_pixel_light_count (Unity's QualitySettings.
+     * pixelLightCount) caps the COMBINED point+spot count under the
+     * compile-time ceilings, which is what Unity counts.  Spending it by score
+     * rather than per-kind is the whole point: a budget of 4 must keep the
+     * four lights that matter most to THIS camera, not the first four the
+     * scene happens to declare.
+     *
+     * budget == 0 is "no budget" and reproduces the old selection
+     * light-for-light: with the combined limit unreachable, each kind fills to
+     * its own ceiling by score, which is exactly what two independent top-N
+     * passes produced.  That equivalence is what makes this safe to land
+     * unconditionally, and the unit test asserts it rather than trusting the
+     * argument. */
+    const int budget_cfg = jce_lighting_get_pixel_light_count();
+    uint32_t budget = budget_cfg > 0 ? (uint32_t)budget_cfg : UINT32_MAX;
+
     uint32_t pkeep = pn < (uint32_t)JCE_MAX_POINT_LIGHTS
                      ? pn : (uint32_t)JCE_MAX_POINT_LIGHTS;
+    uint32_t skeep = sn < (uint32_t)JCE_MAX_SPOT_LIGHTS
+                     ? sn : (uint32_t)JCE_MAX_SPOT_LIGHTS;
+
+    /* Sort each kind descending by score (partial selection sort, as before). */
     for (uint32_t i = 0; i < pkeep; i++) {
         uint32_t best = i;
         for (uint32_t j = i + 1; j < pn; j++)
             if (pc[j].score > pc[best].score) best = j;
         SrLightCand t = pc[i]; pc[i] = pc[best]; pc[best] = t;
-        sr->frame_sel_point[i] = pc[i].e;
     }
-    sr->frame_sel_point_n = pkeep;
-
-    uint32_t skeep = sn < (uint32_t)JCE_MAX_SPOT_LIGHTS
-                     ? sn : (uint32_t)JCE_MAX_SPOT_LIGHTS;
     for (uint32_t i = 0; i < skeep; i++) {
         uint32_t best = i;
         for (uint32_t j = i + 1; j < sn; j++)
             if (sc[j].score > sc[best].score) best = j;
         SrLightCand t = sc[i]; sc[i] = sc[best]; sc[best] = t;
-        sr->frame_sel_spot[i] = sc[i].e;
     }
-    sr->frame_sel_spot_n = skeep;
+
+    /* Merge the two sorted heads under the shared budget.  With
+     * budget == UINT32_MAX this drains both to pkeep/skeep and is the old
+     * result; with a real budget it interleaves by score. */
+    uint32_t pi = 0, si = 0, taken = 0;
+    while (taken < budget && (pi < pkeep || si < skeep)) {
+        const bool take_point =
+            (si >= skeep) ||
+            (pi < pkeep && pc[pi].score >= sc[si].score);
+        /* Separate statements: `a[i++] = b[i].e` reads and modifies `i` in one
+         * expression with no sequence point, which is undefined behaviour --
+         * it happened to compile and would have picked whichever candidate the
+         * optimiser felt like. */
+        if (take_point) { sr->frame_sel_point[pi] = pc[pi].e; pi++; }
+        else            { sr->frame_sel_spot[si]  = sc[si].e; si++; }
+        taken++;
+    }
+    sr->frame_sel_point_n = pi;
+    sr->frame_sel_spot_n  = si;
 }
 
 /* ── Frustum culling (uniform-grid broadphase) ────────────────────── */
@@ -1895,17 +1980,32 @@ static int sr_rprobe_cache_get(JceSceneRenderer *sr, const char *path)
     sr->rprobe_cache[slot].used     = true;
     sr->rprobe_cache[slot].failed   = false;
 
-    uint16_t spec = jce__ktx_load_cubemap(path);
+    /* Resolve project-relative paths the way the skybox HDR does.  This went
+     * STRAIGHT to the host filesystem while every texture path beside it went
+     * through the asset cache, so an authored "textures/probe.ktx" resolved to
+     * nothing and the probe silently contributed no reflection at all -- with
+     * a warning naming a path that looks perfectly correct. */
+    char rp_resolved[1024];
+    const char *load_path = path;
+    if (sr->has_cbs && sr->cbs.resolve_path &&
+        sr->cbs.resolve_path(path, rp_resolved, (int)sizeof(rp_resolved),
+                             sr->cbs.userdata))
+        load_path = rp_resolved;
+
+    uint32_t spec_mips = 1u;
+    uint16_t spec = jce__ktx_load_cubemap(load_path, &spec_mips);
     if (spec == UINT16_MAX) {
         sr->rprobe_cache[slot].failed = true;
         LOG_WARN(LOG_TAG, "reflection probe cubemap load failed: %s", path);
         return -1;
     }
     sr->rprobe_cache[slot].spec.idx = spec;
-    /* The bake currently emits single-mip KTX cubemaps; a future specular
-     * mip-chain bake should plumb the real count here so glossy reflections
-     * pick the correct prefilter LOD. */
-    sr->rprobe_cache[slot].spec_mips = 1;
+    /* THE COUNT THE CONTAINER DECLARES, not a hardcoded 1.  The bake now
+     * writes a real GGX roughness chain and the reader loads all of it, so
+     * this is what lets a glossy material pick a prefilter LOD instead of
+     * always reading the mirror mip.  A probe baked before this carries one
+     * mip and still reports 1, which is the old behaviour exactly. */
+    sr->rprobe_cache[slot].spec_mips = (uint16_t)(spec_mips ? spec_mips : 1u);
 
     /* Irradiance sidecar: <stem>.irr.ktx (optional — fall back to the
      * specular cube for diffuse when absent). */
@@ -1914,7 +2014,12 @@ static int sr_rprobe_cache_get(JceSceneRenderer *sr, const char *path)
     char *dot = strrchr(irr_path, '.');
     if (dot && (size_t)(dot - irr_path) + 9u < sizeof(irr_path)) {
         memcpy(dot, ".irr.ktx", 9u); /* includes NUL */
-        uint16_t irr = jce__ktx_load_cubemap(irr_path);
+        const char *irr_load = irr_path;
+        if (sr->has_cbs && sr->cbs.resolve_path &&
+            sr->cbs.resolve_path(irr_path, rp_resolved, (int)sizeof(rp_resolved),
+                                 sr->cbs.userdata))
+            irr_load = rp_resolved;
+        uint16_t irr = jce__ktx_load_cubemap(irr_load, NULL);
         if (irr != UINT16_MAX) sr->rprobe_cache[slot].irr.idx = irr;
     }
     return slot;
@@ -1939,18 +2044,45 @@ static void sr_gather_rprobe_cb(JceScene *scene, JceEntity e, void *user)
     { static int s_rp_cid = -2;
       if (s_rp_cid == -2) s_rp_cid = jce_component_find("ReflectionProbe");
       if (rp && s_rp_cid >= 0 && !jce_scene_comp_enabled(scene, e, s_rp_cid)) rp = NULL; }
-    if (!rp || !rp->baked_cubemap_path[0]) return;
+    if (!rp) return;
+    /* ReflectionProbe.mode + .custom_hdr_path: the source is a path choice,
+     * and this gather used to take baked_cubemap_path unconditionally, so the
+     * mode combo and the Custom HDR picker beside it decided nothing. */
+    const char *rp_path = sr_rprobe_source_path(rp);
+    if (!rp_path) return;
     JceTransform *xf = jce_scene_get_transform(scene, e);
     jce_vec3 p = xf ? xf->position : jce_v3(0, 0, 0);
     p.x += rp->box_offset[0];
     p.y += rp->box_offset[1];
     p.z += rp->box_offset[2];
+    /* ReflectionProbe.box_size + .blend_distance as the INFLUENCE VOLUME.
+     * Nearest-wins alone made whichever probe happened to be closest the
+     * reflection source for the whole scene, however far outside its own box
+     * the camera stood -- see sr_rprobe_influences().  Anchored on the CAMERA
+     * because the selection is: this renderer picks one probe per frame, not
+     * one per object, so testing anything else would disagree with the
+     * distance test right beside it. */
+    if (!sr_rprobe_influences(rp, p, c->cam)) return;
     jce_vec3 d = jce_v3_sub(p, c->cam);
     float d2 = jce_v3_dot(d, d);
     if (d2 < c->best_probe_d2) {
-        int slot = sr_rprobe_cache_get(sr, rp->baked_cubemap_path);
+        int slot = sr_rprobe_cache_get(sr, rp_path);
         if (slot >= 0) {
             c->best_probe_d2 = d2;
+            /* ReflectionProbe.box_projection / .box_size: authored, and this
+             * gather took only baked_cubemap_path, box_offset and intensity.
+             * Without them a probe baked in a room reflects like an open sky:
+             * every flat surface shows the same slab of environment however
+             * you move, which is the artefact box projection exists to fix.
+             * box_size is a FULL size; the shader wants half-extents. */
+            sr->gi_probe_box_proj = rp->box_projection &&
+                                    rp->box_size[0] > 0.0f &&
+                                    rp->box_size[1] > 0.0f &&
+                                    rp->box_size[2] > 0.0f;
+            sr->gi_probe_box_center = p;
+            sr->gi_probe_box_half = jce_v3(rp->box_size[0] * 0.5f,
+                                           rp->box_size[1] * 0.5f,
+                                           rp->box_size[2] * 0.5f);
             sr->gi_probe_spec = sr->rprobe_cache[slot].spec;
             sr->gi_probe_irr  = sr->rprobe_cache[slot].irr;
             sr->gi_probe_spec_mips = sr->rprobe_cache[slot].spec_mips;
@@ -1992,6 +2124,23 @@ static void sr_gather_lpg_cb(JceScene *scene, JceEntity e, void *user)
         }
         sr->gi_sh9_active = true;
     }
+
+    /* ...and the WHOLE set, world-space, for the per-draw sample.  The pick
+     * above stays as the frame fallback for the submit paths that carry no
+     * anchor (the material funnel, GPU-driven pass 2) -- see
+     * jce_sr_light_probe.h.  Every probe is added, not only the group's
+     * nearest: the point is that two objects in one group get DIFFERENT
+     * ambient, which is impossible if the group contributes one probe. */
+    if (!sr->lp_set) sr->lp_set = sr_probe_set_create();
+    if (sr->lp_set) {
+        for (int pi = 0; pi < lpg->probe_count &&
+                         pi < JCE_LIGHT_PROBE_MAX; pi++) {
+            jce_vec3 wp = jce_v3(base.x + lpg->positions[pi][0],
+                                 base.y + lpg->positions[pi][1],
+                                 base.z + lpg->positions[pi][2]);
+            (void)sr_probe_set_add(sr->lp_set, wp, lpg->sh9[pi]);
+        }
+    }
 }
 
 void sr_gather_baked_gi(JceSceneRenderer *sr, JceScene *scene,
@@ -1999,6 +2148,10 @@ void sr_gather_baked_gi(JceSceneRenderer *sr, JceScene *scene,
 {
     sr->gi_probe_active = false;
     sr->gi_sh9_active   = false;
+    /* The probe set is FRAME state, not a cache: a cache would have to notice
+     * a probe moving, a group being disabled and a scene being swapped, which
+     * is three chances to light this frame with last frame's data. */
+    sr_probe_set_clear(sr->lp_set);
     sr->gi_probe_spec.idx = UINT16_MAX;
     sr->gi_probe_irr.idx  = UINT16_MAX;
 
@@ -2058,10 +2211,17 @@ void sr_upload_gi_uniforms_at(JceSceneRenderer *sr, const jce_vec3 *pos)
         sr->gi_sh9_active ? 1.0f : 0.0f,      /* x: baked REPLACES ambient */
         sr->gi_probe_active ? sr->gi_probe_intensity : 1.0f,
         gi_dyn ? 1.0f : 0.0f,                 /* z: dynamic ADDS bounce    */
-        0.0f
+        (sr->gi_probe_active && sr->gi_probe_box_proj) ? 1.0f : 0.0f
     };
     if (BGFX_HANDLE_IS_VALID(sr->u_gi_params))
         jce_enc_set_uniform(sr->u_gi_params, gi_params, 1);
+    if (gi_params[3] > 0.5f && BGFX_HANDLE_IS_VALID(sr->u_gi_probe_box)) {
+        float box[8] = { sr->gi_probe_box_center.x, sr->gi_probe_box_center.y,
+                         sr->gi_probe_box_center.z, 0.0f,
+                         sr->gi_probe_box_half.x, sr->gi_probe_box_half.y,
+                         sr->gi_probe_box_half.z, 0.0f };
+        jce_enc_set_uniform(sr->u_gi_probe_box, box, 2);
+    }
 
     if (BGFX_HANDLE_IS_VALID(sr->u_sh9) && (sr->gi_sh9_active || gi_dyn)) {
         /* GI L1.5 (per-draw probes): a caller that knows WHERE this submit
@@ -2080,6 +2240,15 @@ void sr_upload_gi_uniforms_at(JceSceneRenderer *sr, const jce_vec3 *pos)
                 local[c][1] *= sr->gi_dyn_intensity;
                 local[c][2] *= sr->gi_dyn_intensity;
             }
+            shsrc = (const float (*)[3])local;
+        } else if (!gi_dyn && pos && sr->gi_sh9_active &&
+                   sr_probe_set_sample(sr->lp_set, *pos, local) > 0.0f) {
+            /* BAKED probes, sampled where this submit actually is.  Without
+             * this the whole frame received the one probe nearest the CAMERA,
+             * so a character in a doorway and a wall in open sun got the same
+             * indirect light, and walking the camera past the midpoint between
+             * two probes repainted every object at once.  Same mechanism the
+             * dynamic branch above already used; only the source is new. */
             shsrc = (const float (*)[3])local;
         }
         float sh9[9][4];

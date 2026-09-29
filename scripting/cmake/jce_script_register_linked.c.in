@@ -1,0 +1,144 @@
+/* jce_script_register_linked.c — GENERATED for target @JCE_SE_TARGET@.
+ *
+ * DO NOT EDIT and do not commit; jce_script_enable() rewrites it.
+ *
+ * ══ WHY THIS FILE IS GENERATED AND NOT WRITTEN BY EACH PROJECT ══
+ *
+ * The engine registers exactly ONE language for itself -- the built-in Lua VM,
+ * lazily, on first use.  Every other backend registers itself from a function
+ * the APPLICATION calls, and if the application never calls it the backend is
+ * not merely off: the extension is unclaimed, jce_script_vm_language_for_path()
+ * returns NULL, and every entity carrying such a script is refused at runtime
+ * while the scene otherwise works perfectly.
+ *
+ * That contract has four steps, and each one fails on its own:
+ *   1. BUILD the backend        (an SDK option / a found CPython / a JDK)
+ *   2. LINK it, and jce_script_api beside it
+ *   3. CALL its register()
+ *   4. TELL IT WHERE ITS RUNTIME LIVES -- sys.path for CPython, an absolute
+ *      jvm library, a class path, and the absolute path of the JNI shim.  None
+ *      of the four is discoverable by the backend itself.
+ *
+ * Steps 2, 3 and 4 are identical in every project, and every project that
+ * wrote them by hand wrote roughly two hundred lines to do it.  Worse, a
+ * project that wrote them in the wrong CMake branch -- the in-tree one, say,
+ * and not the SDK-consumer one it actually ships from -- gets a shipped
+ * executable that silently runs Lua only, while the editor runs everything.
+ * That is the exact defect this file was added to end.
+ *
+ * Unity, Unreal and Godot all put language availability in the build layer
+ * (player settings / module descriptors / .gdextension) rather than in
+ * hand-written game code.  Same shape here: one CMake call, one C call.
+ *
+ * WHAT REMAINS PROJECT CODE: publishing native (cpp/c) script MODULES.  The
+ * classes are the project's, so the project passes a callback.
+ */
+
+#include <jce/middleware/script/jce_script_vm.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_log.h>
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "jce_script_register_linked.h"
+
+#define JCE_SE_HAS_NATIVE_MODULES @JCE_SE_HAS_NATIVE_MODULES@
+#define JCE_SE_NEEDS_SCRIPT_API   @JCE_SE_NEEDS_SCRIPT_API@
+
+@JCE_SE_INCLUDES@
+#define LOG_TAG "script.link"
+
+/* The two runtime inputs that are DIRECTORIES rather than single files, and
+ * the names jce_script_enable() stages them under beside the executable.
+ * Platform-independent: they are our own layout, not an OS convention. */
+#define JCE_SE_JAVA_CLASSES_DIR   "jce_script_java_classes"
+#define JCE_SE_PYTHON_PACKAGE_DIR "jce_script_python"
+
+#if defined(_WIN32)
+#  define JCE_SE_API_LIB  "jce_script_api.dll"
+#  define JCE_SE_JAVA_SHIM "jce_script_java.dll"
+#  define jce_se_setenv(k, v) _putenv_s((k), (v))
+#elif defined(__APPLE__)
+#  define JCE_SE_API_LIB  "libjce_script_api.dylib"
+#  define JCE_SE_JAVA_SHIM "libjce_script_java.dylib"
+#  define jce_se_setenv(k, v) setenv((k), (v), 1)
+#else
+#  define JCE_SE_API_LIB  "libjce_script_api.so"
+#  define JCE_SE_JAVA_SHIM "libjce_script_java.so"
+#  define jce_se_setenv(k, v) setenv((k), (v), 1)
+#endif
+
+/* A runtime input, ENV FIRST and the configured value as the fallback.
+ *
+ * The env override is not a debug convenience: a backend's runtime inputs are
+ * paths on the machine that RUNS the game, and the machine that BUILT it only
+ * ever had a good guess.  The editor's hand-written registration had this and
+ * the generated shim did not, which is one of the two reasons the editor could
+ * not simply use the shim. */
+static const char *jce_se_resolve(const char *env_name, const char *baked)
+{
+    const char *v = getenv(env_name);
+    if (v && v[0]) return v;
+    return baked;
+}
+
+/* Absolute path to a file staged BESIDE THIS EXECUTABLE, or "" if there is no
+ * base path.  jce_script_stage_runtime() is what puts things there. */
+static const char *jce_se_beside_exe(char *buf, size_t cap, const char *name)
+{
+    char base[1024];
+    buf[0] = '\0';
+    if (jce_fs_host_get_base_path(base, (uint32_t)sizeof base) && base[0])
+        snprintf(buf, cap, "%s%s", base, name);
+    return buf;
+}
+
+int jce_script_register_linked_languages(void (*publish_native_modules)(void))
+{
+    int registered = 0;
+    (void)publish_native_modules;
+
+#if JCE_SE_NEEDS_SCRIPT_API
+    /* The script C ABI shared library, BESIDE THE EXECUTABLE -- which is where
+     * jce_script_stage_runtime() copies it, and where a shipped game has it.
+     * Deliberately not the build-tree path CMake knows: that path does not
+     * exist on a player's machine, and baking it in is how a game works for
+     * its author and for nobody else. */
+    {
+        char api_lib[1200];
+        if (jce_se_beside_exe(api_lib, sizeof api_lib, JCE_SE_API_LIB)[0])
+            jce_se_setenv("JCE_SCRIPT_API", api_lib);
+    }
+#endif
+
+@JCE_SE_FRAGMENTS@
+#if JCE_SE_HAS_NATIVE_MODULES
+    /* After every native language, so a module publishing classes for any of
+     * them finds its registry present. */
+    if (publish_native_modules) publish_native_modules();
+#endif
+
+    /* One line saying what this executable can actually run.  It is the
+     * cheapest possible answer to "is the backend in this build at all", which
+     * is the question every other symptom in this area reduces to. */
+    {
+        int i, n = jce_script_vm_count();
+        char buf[512];
+        int  off = 0;
+        for (i = 0; i < n && off < (int)sizeof buf - 1; ++i)
+            off += snprintf(buf + off, sizeof buf - (size_t)off, "%s%s",
+                            i ? " " : "", jce_script_vm_language_at(i));
+        LOG_INFO(LOG_TAG, "languages registered (%d): %s", n, buf);
+        off = 0;
+        n = jce_script_vm_extension_count();
+        for (i = 0; i < n && off < (int)sizeof buf - 1; ++i)
+            off += snprintf(buf + off, sizeof buf - (size_t)off, "%s.%s=%s",
+                            i ? " " : "", jce_script_vm_extension_at(i),
+                            jce_script_vm_extension_language_at(i));
+        LOG_INFO(LOG_TAG, "extension claims (%d): %s", n, buf);
+    }
+    return registered;
+}

@@ -1,0 +1,2478 @@
+{
+ "entities": [
+  {
+   "id": 1,
+   "parentId": 0,
+   "name": "MainCamera",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 20.0,
+     "posZ": 0.0,
+     "rotX": -90.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Camera",
+     "fov": 60.0,
+     "nearClip": 0.1,
+     "farClip": 100.0,
+     "primary": true,
+     "orthographic": true,
+     "orthoSize": 22.0,
+     "clearMode": 1
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "parentId": 0,
+   "name": "Sun",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": -60.0,
+     "rotY": 25.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Light",
+     "lightType": 0,
+     "intensity": 1.1,
+     "colorR": 1.0,
+     "colorG": 1.0,
+     "colorB": 0.97
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "parentId": 0,
+   "name": "Board",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -0.55,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 30.0,
+     "scaleY": 0.1,
+     "scaleZ": 20.0
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.1,
+     "baseColorG": 0.12,
+     "baseColorB": 0.16,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "parentId": 0,
+   "name": "WallTop",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -0.5,
+     "posZ": -10.25,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 31.0,
+     "scaleY": 0.4,
+     "scaleZ": 0.5
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.3,
+     "baseColorG": 0.34,
+     "baseColorB": 0.44,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "parentId": 0,
+   "name": "WallBottom",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -0.5,
+     "posZ": 10.25,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 31.0,
+     "scaleY": 0.4,
+     "scaleZ": 0.5
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.3,
+     "baseColorG": 0.34,
+     "baseColorB": 0.44,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "parentId": 0,
+   "name": "WallLeft",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": -15.25,
+     "posY": -0.5,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.5,
+     "scaleY": 0.4,
+     "scaleZ": 21.0
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.3,
+     "baseColorG": 0.34,
+     "baseColorB": 0.44,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "parentId": 0,
+   "name": "WallRight",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 15.25,
+     "posY": -0.5,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.5,
+     "scaleY": 0.4,
+     "scaleZ": 21.0
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.3,
+     "baseColorG": 0.34,
+     "baseColorB": 0.44,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "parentId": 0,
+   "name": "GameState",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/GameManager.jcec"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "parentId": 0,
+   "name": "GameMeta",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "parentId": 0,
+   "name": "Direction",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/input.jcejs"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "parentId": 0,
+   "name": "Pending",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "parentId": 0,
+   "name": "Verdict",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/GameBoard.java"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "parentId": 0,
+   "name": "PrevHead",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "parentId": 0,
+   "name": "CppDiag",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "parentId": 0,
+   "name": "SnakeHead",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.5,
+     "posY": 0.0,
+     "posZ": 0.5,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.92,
+     "scaleY": 0.92,
+     "scaleZ": 0.92
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.45,
+     "baseColorG": 1.0,
+     "baseColorB": 0.55,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/snake.lua"
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "parentId": 15,
+   "name": "EyeL",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": -0.2,
+     "posY": 0.55,
+     "posZ": 0.18,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.22,
+     "scaleY": 0.12,
+     "scaleZ": 0.22
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.05,
+     "baseColorG": 0.08,
+     "baseColorB": 0.1,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "parentId": 15,
+   "name": "EyeR",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.2,
+     "posY": 0.55,
+     "posZ": 0.18,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.22,
+     "scaleY": 0.12,
+     "scaleZ": 0.22
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.05,
+     "baseColorG": 0.08,
+     "baseColorB": 0.1,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "parentId": 0,
+   "name": "Body00",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/SnakeBody.jcecpp"
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "parentId": 0,
+   "name": "Body01",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "parentId": 0,
+   "name": "Body02",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 21,
+   "parentId": 0,
+   "name": "Body03",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "parentId": 0,
+   "name": "Body04",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "parentId": 0,
+   "name": "Body05",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "parentId": 0,
+   "name": "Body06",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 25,
+   "parentId": 0,
+   "name": "Body07",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "parentId": 0,
+   "name": "Body08",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 27,
+   "parentId": 0,
+   "name": "Body09",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 28,
+   "parentId": 0,
+   "name": "Body10",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 29,
+   "parentId": 0,
+   "name": "Body11",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 30,
+   "parentId": 0,
+   "name": "Body12",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 31,
+   "parentId": 0,
+   "name": "Body13",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 32,
+   "parentId": 0,
+   "name": "Body14",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 33,
+   "parentId": 0,
+   "name": "Body15",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 34,
+   "parentId": 0,
+   "name": "Body16",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 35,
+   "parentId": 0,
+   "name": "Body17",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 36,
+   "parentId": 0,
+   "name": "Body18",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 37,
+   "parentId": 0,
+   "name": "Body19",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 38,
+   "parentId": 0,
+   "name": "Body20",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 39,
+   "parentId": 0,
+   "name": "Body21",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 40,
+   "parentId": 0,
+   "name": "Body22",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 41,
+   "parentId": 0,
+   "name": "Body23",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 42,
+   "parentId": 0,
+   "name": "Body24",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 43,
+   "parentId": 0,
+   "name": "Body25",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 44,
+   "parentId": 0,
+   "name": "Body26",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 45,
+   "parentId": 0,
+   "name": "Body27",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 46,
+   "parentId": 0,
+   "name": "Body28",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 47,
+   "parentId": 0,
+   "name": "Body29",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 48,
+   "parentId": 0,
+   "name": "Body30",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 49,
+   "parentId": 0,
+   "name": "Body31",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 50,
+   "parentId": 0,
+   "name": "Body32",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 51,
+   "parentId": 0,
+   "name": "Body33",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 52,
+   "parentId": 0,
+   "name": "Body34",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 53,
+   "parentId": 0,
+   "name": "Body35",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 54,
+   "parentId": 0,
+   "name": "Body36",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 55,
+   "parentId": 0,
+   "name": "Body37",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 56,
+   "parentId": 0,
+   "name": "Body38",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 57,
+   "parentId": 0,
+   "name": "Body39",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 58,
+   "parentId": 0,
+   "name": "Body40",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 59,
+   "parentId": 0,
+   "name": "Body41",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 60,
+   "parentId": 0,
+   "name": "Body42",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 61,
+   "parentId": 0,
+   "name": "Body43",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 62,
+   "parentId": 0,
+   "name": "Body44",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 63,
+   "parentId": 0,
+   "name": "Body45",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 64,
+   "parentId": 0,
+   "name": "Body46",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 65,
+   "parentId": 0,
+   "name": "Body47",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 66,
+   "parentId": 0,
+   "name": "Body48",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 67,
+   "parentId": 0,
+   "name": "Body49",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 68,
+   "parentId": 0,
+   "name": "Body50",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 69,
+   "parentId": 0,
+   "name": "Body51",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 70,
+   "parentId": 0,
+   "name": "Body52",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 71,
+   "parentId": 0,
+   "name": "Body53",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 72,
+   "parentId": 0,
+   "name": "Body54",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 73,
+   "parentId": 0,
+   "name": "Body55",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 74,
+   "parentId": 0,
+   "name": "Body56",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 75,
+   "parentId": 0,
+   "name": "Body57",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 76,
+   "parentId": 0,
+   "name": "Body58",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 77,
+   "parentId": 0,
+   "name": "Body59",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 78,
+   "parentId": 0,
+   "name": "Body60",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 79,
+   "parentId": 0,
+   "name": "Body61",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 80,
+   "parentId": 0,
+   "name": "Body62",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 81,
+   "parentId": 0,
+   "name": "Body63",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": -100.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.82,
+     "scaleY": 0.82,
+     "scaleZ": 0.82
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 0.2,
+     "baseColorG": 0.7,
+     "baseColorB": 0.35,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    }
+   ]
+  },
+  {
+   "id": 82,
+   "parentId": 0,
+   "name": "Food",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": -7.5,
+     "posY": 0.0,
+     "posZ": -4.5,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 0.62,
+     "scaleY": 0.62,
+     "scaleZ": 0.62
+    },
+    {
+     "type": "MeshRenderer",
+     "meshShape": 2,
+     "baseColorR": 1.0,
+     "baseColorG": 0.35,
+     "baseColorB": 0.3,
+     "baseColorA": 1.0,
+     "castsShadow": false
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/food.py"
+    }
+   ]
+  },
+  {
+   "id": 83,
+   "parentId": 0,
+   "name": "Canvas",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "Canvas",
+     "renderMode": 0,
+     "sortOrder": 80,
+     "refResX": 1920,
+     "refResY": 1080,
+     "scaleFactor": 1,
+     "pixelPerfect": false
+    },
+    {
+     "type": "Script",
+     "scriptPath": "scripts/Hud.cs"
+    }
+   ]
+  },
+  {
+   "id": 84,
+   "parentId": 83,
+   "name": "ScoreText",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "UIText",
+     "text": "SCORE 0",
+     "fontPath": "",
+     "fontSize": 44,
+     "alignment": 0,
+     "colorR": 0.92,
+     "colorG": 0.97,
+     "colorB": 1.0,
+     "colorA": 1.0,
+     "lineSpacing": 1.2,
+     "richText": false,
+     "mathText": false,
+     "bestFit": false,
+     "minSize": 10,
+     "maxSize": 44,
+     "anchorMinX": 0,
+     "anchorMinY": 1,
+     "anchorMaxX": 0,
+     "anchorMaxY": 1,
+     "pivotX": 0,
+     "pivotY": 1,
+     "anchoredX": 40,
+     "anchoredY": -34,
+     "sizeW": 520,
+     "sizeH": 64
+    }
+   ]
+  },
+  {
+   "id": 85,
+   "parentId": 83,
+   "name": "BestText",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "UIText",
+     "text": "BEST 0",
+     "fontPath": "",
+     "fontSize": 36,
+     "alignment": 2,
+     "colorR": 0.72,
+     "colorG": 0.8,
+     "colorB": 0.95,
+     "colorA": 1.0,
+     "lineSpacing": 1.2,
+     "richText": false,
+     "mathText": false,
+     "bestFit": false,
+     "minSize": 10,
+     "maxSize": 36,
+     "anchorMinX": 1,
+     "anchorMinY": 1,
+     "anchorMaxX": 1,
+     "anchorMaxY": 1,
+     "pivotX": 1,
+     "pivotY": 1,
+     "anchoredX": -40,
+     "anchoredY": -34,
+     "sizeW": 520,
+     "sizeH": 56
+    }
+   ]
+  },
+  {
+   "id": 86,
+   "parentId": 83,
+   "name": "StateText",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "UIText",
+     "text": "SNAKE",
+     "fontPath": "",
+     "fontSize": 96,
+     "alignment": 1,
+     "colorR": 1.0,
+     "colorG": 0.96,
+     "colorB": 0.75,
+     "colorA": 1.0,
+     "lineSpacing": 1.2,
+     "richText": false,
+     "mathText": false,
+     "bestFit": false,
+     "minSize": 10,
+     "maxSize": 96,
+     "anchorMinX": 0.5,
+     "anchorMinY": 0.5,
+     "anchorMaxX": 0.5,
+     "anchorMaxY": 0.5,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "anchoredX": 0,
+     "anchoredY": 60,
+     "sizeW": 1400,
+     "sizeH": 150
+    }
+   ]
+  },
+  {
+   "id": 87,
+   "parentId": 83,
+   "name": "HintText",
+   "components": [
+    {
+     "type": "Transform",
+     "posX": 0.0,
+     "posY": 0.0,
+     "posZ": 0.0,
+     "rotX": 0.0,
+     "rotY": 0.0,
+     "rotZ": 0.0,
+     "scaleX": 1.0,
+     "scaleY": 1.0,
+     "scaleZ": 1.0
+    },
+    {
+     "type": "UIText",
+     "text": "PRESS ENTER TO START",
+     "fontPath": "",
+     "fontSize": 40,
+     "alignment": 1,
+     "colorR": 0.85,
+     "colorG": 0.9,
+     "colorB": 1.0,
+     "colorA": 1.0,
+     "lineSpacing": 1.2,
+     "richText": false,
+     "mathText": false,
+     "bestFit": false,
+     "minSize": 10,
+     "maxSize": 40,
+     "anchorMinX": 0.5,
+     "anchorMinY": 0.5,
+     "anchorMaxX": 0.5,
+     "anchorMaxY": 0.5,
+     "pivotX": 0.5,
+     "pivotY": 0.5,
+     "anchoredX": 0,
+     "anchoredY": -60,
+     "sizeW": 1400,
+     "sizeH": 90
+    }
+   ]
+  }
+ ],
+ "notes": "Generated by tools/gen_scene.py -- edit that, not this."
+}

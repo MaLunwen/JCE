@@ -11,7 +11,7 @@
  * shared object's exports are the whole scripting surface" structurally true
  * rather than a promise.  jce_alloc lives in jce_core, and linking jce_core to
  * reach it would put the engine inside the boundary this library exists to
- * draw.  (scripts/lint/check_raw_allocator.py scans engine/src and editor/src;
+ * draw.  (tools/lint/check_raw_allocator.py scans engine/src and editor/src;
  * this file is outside both, and the reason above is why it should stay so.)
  */
 

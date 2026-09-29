@@ -40,6 +40,15 @@ JCE_API void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
 JCE_API void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
 JCE_API void  jce_anim_player_set_time(JceAnimPlayer *p, float time);
 JCE_API float jce_anim_player_get_time(const JceAnimPlayer *p);
+
+/* The clip this player is on, or NULL before anything plays.
+ *
+ * You could set a clip and read the time but not ask WHICH clip, which makes
+ * the time unusable on its own: a playhead in seconds means nothing without
+ * the duration, and the duration belongs to the clip.  Anything that has to
+ * express the playhead as a POSITION -- a network snapshot, a UI scrubber --
+ * needs both. */
+JCE_API const JceAnimClip *jce_anim_player_get_clip(const JceAnimPlayer *p);
 JCE_API bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 
 /* Advance by dt seconds and produce joint matrices for GPU upload.

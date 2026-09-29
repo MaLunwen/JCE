@@ -24,6 +24,22 @@ extern "C" {
 #include <jce/os/platform/jce_mmap.h>
 #include <jce/os/platform/jce_window.h>
 
+/* Completed 2026-08-31.  These headers export JCE_API symbols and were
+ * reachable from NO umbrella, so §4's promise -- `#include <jce/api.h>`
+ * gives you the whole engine -- did not hold for them.  Several are named
+ * in §4's own table by capability.
+ */
+#include <jce/os/platform/jce_clipboard.h>
+#include <jce/os/platform/jce_cursor.h>
+#include <jce/os/platform/jce_entropy.h>
+#include <jce/os/platform/jce_file_watcher.h>
+#include <jce/os/platform/jce_host_dialog.h>
+#include <jce/os/platform/jce_host_locale.h>
+#include <jce/os/platform/jce_host_shell.h>
+#include <jce/os/platform/jce_library.h>
+#include <jce/os/platform/jce_tcp.h>
+#include <jce/os/platform/jce_window_modal_loop.h>
+
 
 
 #ifdef __cplusplus

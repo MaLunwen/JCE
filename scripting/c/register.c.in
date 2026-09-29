@@ -1,0 +1,7 @@
+    /* "c" IS A SEPARATE LANGUAGE AND A SEPARATE CALL.  It is not registered by
+     * the cpp one and does not register it; what the two SHARE is the native
+     * class registry -- one registry, because a compiled class has no language
+     * at run time, it is a table of C function pointers. */
+    if (jce_script_vm_c_register()) ++registered;
+    else LOG_ERROR(LOG_TAG, "c: register REFUSED — .jcec resolves to no "
+                            "language");

@@ -296,12 +296,70 @@ JceShaderHandle shader_load_program_overlay_named(
     return (JceShaderHandle){ program.idx };
 }
 
+#include "renderer/jce_shader_variants_table.inc"
+
+/* Defined below, beside the other overlay loaders: the table loader has
+ * to sit above jce_shaders_load_all and load_overlay below it, and one
+ * declaration is cheaper than moving either. */
+static JceShaderHandle load_overlay(const char *dev_dir,
+                                    const JcePakArchive *pak,
+                                    const char *vs_base,
+                                    const char *fs_base);
+
+/* LOAD THE WHOLE PBR PROGRAM TABLE, deduplicated by (vs, fs).
+ *
+ * Six vertex variants times four keyword keys is 24 cells, but far fewer
+ * distinct programs: three variants share the base fragment family, and a
+ * family that does not carry an axis maps the same name for both states of
+ * that bit.  Creating a bgfx program per duplicate would pay for every one of
+ * them at load and hold them all until shutdown, so identical pairs share a
+ * handle -- and the destroy side already frees by handle, not by cell.
+ *
+ * `dev_dir` NULL is the shipped path (pak only); non-NULL is the editor's
+ * Reload Shaders, which prefers files on disk.  ONE implementation for both,
+ * because a table that is right in the editor and stale in the build is the
+ * defect this whole file exists to prevent. */
+static void load_variant_table(const char *dev_dir, const JcePakArchive *pak,
+                               JceShaderSet *set)
+{
+    struct { const char *vs, *fs; JceShaderHandle h; } seen[
+        JCE_SHADER_VARIANT_COUNT * JCE_SHADER_KEY_COUNT];
+    int nseen = 0;
+
+    for (int v = 0; v < JCE_SHADER_VARIANT_COUNT; v++) {
+        const char *vs = jce_shader_vv_name[v];
+        for (int k = 0; k < JCE_SHADER_KEY_COUNT; k++) {
+            const char *fs = jce_shader_fs_for[v][k];
+            JceShaderHandle h = JCE_INVALID_SHADER;
+            int hit = -1;
+            for (int i = 0; i < nseen; i++)
+                if (strcmp(seen[i].vs, vs) == 0 && strcmp(seen[i].fs, fs) == 0) {
+                    hit = i; break;
+                }
+            if (hit >= 0) {
+                h = seen[hit].h;
+            } else {
+                h = load_overlay(dev_dir, pak, vs, fs);
+                seen[nseen].vs = vs;
+                seen[nseen].fs = fs;
+                seen[nseen].h = h;
+                nseen++;
+            }
+            set->variant[v][k] = h;
+        }
+    }
+}
+
 JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
 {
     JCE_PROFILE_ZONE_N("Shaders::LoadAll");
     JceShaderSet set;
+    memset(&set, 0, sizeof set);
+    load_variant_table(NULL, pak, &set);
     set.color    = shader_load_program(pak, "color");
     set.textured = shader_load_program(pak, "textured");
+    /* vs_textured + fs_text_sdf: same vertex stage, different edge. */
+    set.text_sdf = load_program_named(pak, "textured", "text_sdf");
     set.mesh     = shader_load_program(pak, "mesh");
     set.pbr            = shader_load_program(pak, "pbr");
     /* Instanced PBR variant: vs_pbr_inst + fs_pbr (fragment unchanged). */
@@ -336,8 +394,6 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     /* Instanced shadow variant: vs_shadow_inst + fs_shadow (fragment unchanged). */
     set.shadow_inst    = load_program_named(pak, "shadow_inst",    "shadow");
     set.shadow_skinned = load_program_named(pak, "shadow_skinned", "shadow");
-    /* VSM variant: vs_shadow_vsm + fs_shadow_vsm (writes (z, z^2) moments). */
-    set.shadow_vsm     = shader_load_program(pak, "shadow_vsm");
     set.terrain        = shader_load_program(pak, "terrain");
 
     if (!jce_shader_valid(set.color))
@@ -370,8 +426,6 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'shadow_inst' shader unavailable (shadow instancing disabled)");
     if (!jce_shader_valid(set.shadow_skinned))
         LOG_WARN(LOG_TAG, "'shadow_skinned' shader unavailable");
-    if (!jce_shader_valid(set.shadow_vsm))
-        LOG_WARN(LOG_TAG, "'shadow_vsm' shader unavailable (VSM mode disabled)");
     if (!jce_shader_valid(set.terrain))
         LOG_WARN(LOG_TAG, "'terrain' shader unavailable");
 
@@ -401,8 +455,11 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
 {
     JCE_PROFILE_ZONE_N("Shaders::LoadAllFS");
     JceShaderSet set;
+    memset(&set, 0, sizeof set);
+    load_variant_table(dev_dir, pak, &set);
     set.color          = load_overlay(dev_dir, pak, "color",          "color");
     set.textured       = load_overlay(dev_dir, pak, "textured",       "textured");
+    set.text_sdf       = load_overlay(dev_dir, pak, "textured",       "text_sdf");
     set.mesh           = load_overlay(dev_dir, pak, "mesh",           "mesh");
     set.pbr            = load_overlay(dev_dir, pak, "pbr",            "pbr");
     set.pbr_inst       = load_overlay(dev_dir, pak, "pbr_inst",       "pbr");
@@ -418,7 +475,6 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
     set.shadow         = load_overlay(dev_dir, pak, "shadow",         "shadow");
     set.shadow_inst    = load_overlay(dev_dir, pak, "shadow_inst",    "shadow");
     set.shadow_skinned = load_overlay(dev_dir, pak, "shadow_skinned", "shadow");
-    set.shadow_vsm     = load_overlay(dev_dir, pak, "shadow_vsm",     "shadow_vsm");
     set.terrain        = load_overlay(dev_dir, pak, "terrain",        "terrain");
     JCE_PROFILE_ZONE_END;
     return set;

@@ -1,0 +1,40 @@
+{
+  "maxParticles": 20,
+  "emitRate": 1.1,
+  "lifetimeMin": 2.5,
+  "lifetimeMax": 5.0,
+  "worldSpace": true,
+  "velocityMin": [
+    -0.7,
+    -0.35,
+    -0.7
+  ],
+  "velocityMax": [
+    0.7,
+    0.45,
+    0.7
+  ],
+  "gravity": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sizeStart": 0.05,
+  "sizeEnd": 0.08,
+  "sizeCurve": "SineInOut",
+  "colorStart": [
+    1.1,
+    0.85,
+    0.28,
+    1.0
+  ],
+  "colorEnd": [
+    0.9,
+    0.6,
+    0.15,
+    0.0
+  ],
+  "colorCurve": "SineInOut",
+  "texture": "textures/particles/particle_alpha_map_256x256.png",
+  "additive": true
+}

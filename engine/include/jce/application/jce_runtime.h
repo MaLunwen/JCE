@@ -35,9 +35,15 @@ JCE_EXTERN_C_BEGIN
 
 typedef struct JceRuntime           JceRuntime;
 typedef struct JceScene             JceScene;
+typedef struct JceUICanvas          JceUICanvas;
 typedef struct JcePakArchive        JcePakArchive;
 typedef struct JceAudio             JceAudio;
 typedef struct JcePhysicsWorld      JcePhysicsWorld;
+/* Forward-declared, NOT included.  Pulling jce_physics2d.h in here widens the
+ * api_app.h umbrella by the whole 2D physics API: check_editor_consumption
+ * went 88 -> 107 unconsumed on one added #include.  JcePhysicsWorld above is
+ * forward-declared for the same reason. */
+typedef struct JcePhysics2D         JcePhysics2D;
 typedef struct JceSnapshotRegistry  JceSnapshotRegistry;
 typedef struct JceBtContext         JceBtContext;
 typedef struct JceBlackboard        JceBlackboard;
@@ -175,11 +181,37 @@ typedef struct {
 	 * jce_loc and its preview locale must survive Play sessions). */
 	const char    *locales_dir;
 
+
 	/* Initial locale tag for the localization init above, e.g. "en" /
 	 * "zh_cn".  NULL/"" = auto: the host OS preferred locale
 	 * (jce_host_preferred_locale), falling back to "en".  Ignored when
 	 * localization is not initialised (see locales_dir). */
 	const char    *locale;
+
+	/* APPENDED AT THE END, and it must stay there: JceRuntimeDesc is a
+	 * public struct SDK consumers compile against.  This field was first
+	 * written above `locale`, which is an INSERTION -- every later field
+	 * shifts, so a game built on the older header sets `locale` and the
+	 * engine reads a const char * as a JceFileSystem * and hands it to the
+	 * world streamer.  check_abi_snapshot.py's ordered-prefix rule catches
+	 * exactly that, and regenerating the snapshot is how you stop it from
+	 * catching it.
+	 *
+	 * Asset filesystem for WORLD STREAMING.  When set, and when the scene's
+	 * streaming settings are enabled with at least one chunk, the runtime
+	 * creates and drives a world streamer over this mount.
+	 *
+	 * It had to be added because streaming was EDITOR-ONLY: jce_world_streamer
+	 * _create had exactly two callers in the whole tree, both under
+	 * editor/src/, so a shipped game whose scene authored streaming loaded
+	 * none of it -- the chunks were authored, serialized, and never read.
+	 *
+	 * NULL means the host drives its own streamer, which is what the editor
+	 * does: its Play streamer also mirrors streamed entities into the
+	 * hierarchy and selection, which a runtime has no business knowing about.
+	 * There is never more than one -- the runtime creates none when this is
+	 * NULL, and the editor passes NULL for exactly that reason. */
+	struct JceFileSystem *asset_fs;
 } JceRuntimeDesc;
 
 /* Player input applied to the scene's CharacterController each step.
@@ -213,6 +245,23 @@ typedef struct {
 	 * clears it after step() so focus loss cannot leave a gesture held. */
 	int touch_count;
 	JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES];
+	/* The host's raw keyboard, borrowed for the frame -- the object outlives
+	 * the sample, so this is a borrow and never an owning pointer.
+	 *
+	 * It exists because jce.is_key_down(keycode) ALWAYS RETURNED FALSE.  The
+	 * binding was registered, callable and documented, and the runtime simply
+	 * had nothing to answer it with: it holds this struct, not a JceInput, and
+	 * jce_actions_update(a, input) uses the raw input transiently and keeps no
+	 * pointer.  A script asking whether a key was held got "no", every frame,
+	 * in both the editor's Play and a shipped game.
+	 *
+	 * NULL is allowed and means exactly what it did before: is_key_down
+	 * answers false.  Keycodes are the JCE_KEY_* values in
+	 * <jce/os/platform/jce_keys.h> -- USB HID scancodes, so JCE_KEY_A is 4,
+	 * not 'A'.  Scripts in languages without those macros must use the
+	 * numbers; exposing them as named script constants is a separate gap,
+	 * recorded in script_exposure.json. */
+	const JceInput *keyboard;
 } JceRuntimeInput;
 
 /* Snapshot the scene into physics/audio state.  Returns NULL on failure.
@@ -355,6 +404,34 @@ JCE_API bool  JCE_CALL jce_runtime_is_transitioning(const JceRuntime *rt);
  * VCam's resolved pose gets a bounded positional shake offset.  Also exposed to
  * gameplay scripts as jce.shake_camera(amount).  Safe with a NULL runtime. */
 JCE_API void        JCE_CALL jce_runtime_shake_camera(JceRuntime *rt, float amount);
+
+/* ── AudioSource control (Unity's AudioSource.Play / Stop / isPlaying) ──
+ *
+ * An authored JceAudioSourceComponent used to sound EXACTLY ONCE, at scene
+ * spawn, and only if `play_on_awake` was set.  There was no way to start,
+ * stop or restart one afterwards -- so a door that creaks when it opens, a
+ * gun that fires, an alarm that a script arms, could not use the component at
+ * all.  The only alternative, jce.play_sound(path, ...), is a fire-and-forget
+ * one-shot that discards everything the component authors: loop, pitch,
+ * per-source volume, mixer bus, and the whole 3D attenuation block.
+ *
+ * These play the AUTHORED component, which is the point.  play() restarts a
+ * source that is already sounding (Unity's semantics) so a retriggerable
+ * effect does not stack copies of itself.
+ *
+ * Loading follows the same route the spawn walk uses -- the editor's
+ * synchronous loader hook when one is installed, otherwise an off-thread PAK
+ * decode -- so a script-triggered clip does not stall the frame and starts a
+ * frame or two later, exactly as a play_on_awake clip does.
+ *
+ * Return false when there is no runtime, no audio device, or the entity has no
+ * enabled AudioSource with a clip.  Safe with a NULL runtime.  Also exposed to
+ * gameplay scripts as jce.audio_play(e) / jce.audio_stop(e) /
+ * jce.audio_is_playing(e). */
+JCE_API bool        JCE_CALL jce_runtime_audio_play(JceRuntime *rt, uint64_t entity);
+JCE_API bool        JCE_CALL jce_runtime_audio_stop(JceRuntime *rt, uint64_t entity);
+JCE_API bool        JCE_CALL jce_runtime_audio_is_playing(const JceRuntime *rt,
+                                                          uint64_t entity);
 
 /* ── Destruction / fracture (opt-in) ── Shatter a fracturable entity into
  * dynamic convex-hull fragment bodies.  The entity must carry an ENABLED
@@ -525,6 +602,25 @@ JCE_API bool        JCE_CALL jce_runtime_dispatch_ui_text_changed(JceRuntime *rt
 JCE_API bool        JCE_CALL jce_runtime_dispatch_ui_submit(JceRuntime *rt,
                                                             uint64_t entity);
 
+/* Drain ALL FOUR canvas event channels and fire each one's authored handler.
+ *
+ * This exists because the list above is a list, and a list transcribed at two
+ * call sites drifts.  It did: the shipped app loop gated the whole drain on
+ * having a valid pointer, while the editor's Play loop gated it only on having
+ * a runtime.  Two of the four channels (last_text_changed, last_submitted) are
+ * set OUTSIDE the render by the keyboard path and are CLEARED ON READ, so
+ * under the runtime's gate a RETURN pressed while the cursor was captured
+ * latched in the canvas and fired its on_submit handler on some later,
+ * unrelated frame instead of that one -- while the same scene in the editor
+ * fired it immediately.
+ *
+ * Call once per frame, after jce_ui_canvas_render.  `uc` and `scene` may be
+ * NULL (clean no-op).  Reading each channel is what clears it, so calling this
+ * IS the drain -- do not also read the channels at the call site. */
+JCE_API void        JCE_CALL jce_runtime_dispatch_ui_events(JceRuntime *rt,
+                                                            JceUICanvas *uc,
+                                                            JceScene *scene);
+
 /* ── Animation frame-event → script dispatch (P1 anim-events) ─────────
  *
  * Route a fired animation frame event to `entity`'s live gameplay script.
@@ -596,13 +692,31 @@ JCE_API void        JCE_CALL jce_runtime_set_contact_listener(
  * ad-hoc voices) on top of the runtime.  NULL when the matching feature
  * wasn't enabled. */
 JCE_API JcePhysicsWorld *JCE_CALL jce_runtime_physics(const JceRuntime *rt);
+/* The 2D world, when RigidBody2D / Collider2D put one up.  The 3D world has
+ * had an accessor since these were written and the 2D one never did, so a
+ * project (or a test) could raycast one and not the other. */
+JCE_API JcePhysics2D    *JCE_CALL jce_runtime_physics2d(const JceRuntime *rt);
 JCE_API JceAudio        *JCE_CALL jce_runtime_audio  (const JceRuntime *rt);
 JCE_API JceScene        *JCE_CALL jce_runtime_scene  (const JceRuntime *rt);
 
 /* The snapshot registry the runtime stands up at create() with the standard
  * providers (scene/ECS) already registered.  Games can register additional
- * sections and drive jce_snapshot_save_to_file / jce_snapshot_load_from_file
- * against it directly (e.g. menu-driven save slots).  NULL when rt is NULL. */
+ * SECTIONS against it.
+ *
+ * DO NOT drive jce_snapshot_load_from_file against it directly.  This comment
+ * used to say you could -- "e.g. menu-driven save slots" -- and following that
+ * instruction left the runtime broken: the scene provider's read callback does
+ * jce_scene_clear + jce_scene_load_json (jce_save_providers.c:116-117) and
+ * stops.  Every entity is destroyed and recreated, so the physics bodies,
+ * script instances, audio voices, triggers, spawners and behaviour trees the
+ * old entities owned are gone and nothing rebuilds them.  The restored scene
+ * renders and does nothing -- the worst shape a save bug can take, because it
+ * looks like it worked.
+ *
+ * jce_runtime_load_from_file below is the supported path; it does the same
+ * load and then re-runs the spawn walk, exactly as the scene-transition path
+ * has always had to (jce_runtime.c: jce_scene_clear + load + rt_spawn_scene_state).
+ * NULL when rt is NULL. */
 JCE_API JceSnapshotRegistry *JCE_CALL jce_runtime_save_registry(
                                 const JceRuntime *rt);
 
@@ -611,6 +725,36 @@ JCE_API JceSnapshotRegistry *JCE_CALL jce_runtime_save_registry(
  * or when rt/path is NULL.  Equivalent to calling jce_snapshot_save_to_file on
  * jce_runtime_save_registry(rt) plus a mkdir -p of the parent directory. */
 JCE_API bool JCE_CALL jce_runtime_save_to_file(JceRuntime *rt, const char *path);
+
+/* Restore a play session from `path` (a .jsnp file written by
+ * jce_runtime_save_to_file) and REBUILD the runtime around it.
+ *
+ * THE SAVE SYSTEM WAS WRITE-ONLY.  jce_runtime_save_to_file has existed with
+ * no counterpart: there was no jce_runtime_load_* symbol at all, and the one
+ * call site of jce_snapshot_load_from_file anywhere in the product is an
+ * editor panel -- which only works because it calls jce_state_stop() first and
+ * tears the runtime down, the mitigation a shipped game has no equivalent of.
+ * So a game could write checkpoints that nothing in its own executable could
+ * read back: no "Continue", no "Load Game".
+ *
+ * Loading a snapshot destroys and recreates every entity, so everything the
+ * runtime hung off the old ones must be rebuilt: physics bodies and 2D bodies,
+ * character controllers, script instances and their on_start, audio voices,
+ * triggers, spawners, weapons, save points, behaviour trees.  That is the
+ * spawn walk, and this runs it -- the same sequence jce_runtime_request_scene
+ * performs after its own clear+load, for the same reason.
+ *
+ * FAILURE IS SPLIT, because a player picking an empty save slot must not lose
+ * the session they are in.  An unreadable or missing file returns false having
+ * changed NOTHING -- the bytes are read before the live session is touched.  A
+ * file that reads but does not restore leaves an empty scene (a section may
+ * have applied before the failure, so the state is indeterminate and an empty
+ * scene is the only consistent thing to leave); treat that false as "reload a
+ * level", not "carry on".  Safe to call
+ * from a menu; NOT safe from inside a script's on_update -- use the same
+ * deferred pattern as jce_runtime_request_scene if a script must trigger it. */
+JCE_API bool JCE_CALL jce_runtime_load_from_file(JceRuntime *rt,
+                                                 const char *path);
 
 /* Switch the active game locale at runtime (reloads the string table and
  * fires jce_loc listeners; authored UIText keys re-resolve on the next
@@ -648,6 +792,56 @@ JCE_API JceBlackboard *JCE_CALL jce_runtime_bt_blackboard(const JceRuntime *rt,
  * BT visualizer) polls node state through this. */
 JCE_API bool JCE_CALL jce_runtime_bt_tree(const JceRuntime *rt, uint64_t entity,
                                           uint32_t *out_tree_idx);
+
+/* ── Per-script frame cost (profiling) ───────────────────────────────
+ *
+ * WHAT IT ANSWERS.  Until this existed the script subsystem was the only
+ * middleware with no instrumentation of any kind: no profile zones, and no
+ * named perf phase -- on_update was folded into the "gameplay" bucket
+ * alongside trigger overlap, spawn density, GAS replication, ragdoll blending
+ * and weapon timers.  A script eating 8 ms and a trigger volume eating 8 ms
+ * were the same reading.  Unity's profiler has a Scripts category with
+ * per-MonoBehaviour rows; Godot lists per-script-function self and total.
+ *
+ * TWO LEVELS.  The runtime also accumulates a "script" perf phase, which
+ * answers "is scripting costing me anything" in the table the profiler
+ * already draws.  This iteration answers the next question, "which one", and
+ * that is the one an author can act on.
+ *
+ * ONLY MEASURED WHILE PROFILING IS ON (jce_perf_phase_enabled()).  Two
+ * counter reads per script per frame is not free at a few thousand scripted
+ * entities, and a profiler that changes what it measures is its own kind of
+ * wrong answer.  With profiling off every last_ms reads 0 -- which is why
+ * `measured` exists: 0 because nothing was timed and 0 because the script is
+ * genuinely free must not be the same reading.  This repository has paid for
+ * that confusion before, in a dense table where 0 meant "did not run". */
+typedef struct JceScriptCostInfo {
+    uint64_t    entity;        /* the scripted entity                        */
+    const char *script_path;   /* as authored; never NULL, may be ""         */
+    double      last_ms;       /* most recent on_update, milliseconds        */
+    double      avg_ms;        /* mean over the frames since the last reset  */
+    uint32_t    calls;         /* on_update calls since the last reset       */
+    bool        active;        /* false once the instance stopped running    */
+    bool        measured;      /* false when profiling was off for this row  */
+} JceScriptCostInfo;
+
+typedef void (*JceScriptCostIterFn)(const JceScriptCostInfo *info, void *user);
+
+/* Iterate every script instance the runtime holds, live or not.  Order is the
+ * runtime's own and is not stable across frames; a consumer that wants a
+ * ranking sorts. */
+JCE_API void JCE_CALL jce_runtime_iterate_script_costs(
+        const JceRuntime *rt, JceScriptCostIterFn cb, void *user);
+
+/* Zero every accumulator (calls, avg) without touching last_ms.
+ *
+ * SEPARATE FROM THE ITERATION on purpose.  A read that also resets cannot be
+ * called twice -- the editor panel polls at its own refresh rate and a second
+ * reader (a test, a log line, an automation tool) would silently get a window
+ * the first reader had already consumed.  jce_perf_phase_report() is
+ * destructive for historical reasons and peek_frame() had to be added beside
+ * it; this starts where that ended up. */
+JCE_API void JCE_CALL jce_runtime_reset_script_costs(JceRuntime *rt);
 
 /* ── Gameplay Ability System (GAS consumption last-mile) ──────────────
  *

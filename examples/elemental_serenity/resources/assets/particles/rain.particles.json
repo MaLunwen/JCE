@@ -1,0 +1,19 @@
+{
+  "maxParticles": 1300,
+  "emitRate": 820,
+  "lifetimeMin": 1.1,
+  "lifetimeMax": 1.6,
+  "worldSpace": true,
+  "spawnBox": [26.0, 4.0, 26.0],
+  "velocityMin": [-0.4, -13.0, -0.4],
+  "velocityMax": [ 0.4,  -7.0,  0.4],
+  "gravity":     [ 0.0,   0.0,  0.0],
+  "sizeStart": 0.08,
+  "sizeEnd":   0.07,
+  "velocityStretch": 0.05,
+  "colorStart": [0.80, 0.87, 0.99, 0.70],
+  "colorEnd":   [0.66, 0.76, 0.92, 0.40],
+  "velocityScaleStart": 1.0,
+  "velocityScaleEnd":   1.0,
+  "velocityCurve": "Linear"
+}

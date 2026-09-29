@@ -6,6 +6,32 @@ project URL, and the license text.
 
 ---
 
+## Tool-side dependencies: none
+
+`private/tools/automation/` (the Automation API, its MCP server and its CLI) and
+`tools/provenance/` (content hashing, manifests, signing, C2PA and IPFS CID)
+add **no dependency at all**. Nothing to register here, and that is a
+constraint the design was held to rather than something that happened to work
+out — a layer that needs `pip install` before it runs is a layer that does not
+run in CI, does not run on a clean clone, and cannot be the first thing a tool
+or an agent reaches for.
+
+Four places where taking a package would have been the obvious move, and what
+was done instead:
+
+| Would have taken | Instead |
+| --- | --- |
+| an MCP SDK | MCP over stdio is line-delimited JSON-RPC 2.0 with four methods that matter — about a hundred lines in `private/tools/automation/mcp_server.py` |
+| `jsonschema` | the subset the tool schemas actually use, in `jsonschema_mini.py`, which **refuses at registration** any schema keyword it cannot enforce rather than leaving it unchecked |
+| a signing library (Ed25519) | the signer is a **program the operator names** (`JCE_PROV_SIGN_COMMAND`, e.g. `ssh-keygen -Y sign`). Same shape `private/tools/ai/jce_llm.py` uses to reach any model, and it supports every signer rather than one. A native crypto dependency also needs owner approval. |
+| an IPFS client | a CIDv1 is a pure function of the bytes — multibase(base32) over multicodec(raw) + multihash(sha2-256) — computed with `hashlib` and `base64`, with no daemon and no network |
+
+If a future change does take a Python dependency, it is registered here with
+its version and licence, and `jce_provenance.signing` is the precedent for
+asking whether an external command would do the job instead.
+
+---
+
 ## SDL3
 
 - **Version**: 3.4.0
@@ -753,7 +779,7 @@ SOFTWARE.
 
 ## RenderDoc
 
-- **Version**: in-application API (renderdoc_app.h)
+- **Version**: in-application API header, commit c26a540
 - **License**: MIT
 - **URL**: https://github.com/baldurk/renderdoc
 
@@ -1175,6 +1201,39 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+## quickjs-ng
+
+- **Version**: 0.16.2
+- **License**: MIT
+- **URL**: https://github.com/quickjs-ng/quickjs
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2017-2026 Fabrice Bellard
+Copyright (c) 2017-2024 Charlie Gordon
+Copyright (c) 2023-2026 Ben Noordhuis
+Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
 ---
 
 # ⚠️ PATENT-ENCUMBERED CODECS
@@ -1262,7 +1321,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - **Version**: v1.6.0
 - **License**: Apache-2.0
-- **URL**: https://android.googlesource.com/platform/external/libhevc/
+- **URL**: https://github.com/ittiam-systems/libhevc
+- **Upstream lineage**: https://android.googlesource.com/platform/external/libhevc/
 
 ```
 Copyright (c) 2012-2025 The Android Open Source Project
@@ -1311,3 +1371,14 @@ This license is available with a FAQ at: https://openfontlicense.org
 ```
 
 ---
+
+## Source acquisition policy
+
+Original dependency sources are not versioned in this repository. Fixed upstream
+versions and archive/header SHA256 values are recorded in
+`contracts/vendor-sources.json`. `tools/build/fetch_vendor_sources.py` fetches them
+into the host's user cache outside the JCE workspace and verifies existing
+source trees without repair. `JCE_VENDOR_CACHE` can select an external cache.
+Configure and incremental builds both reject changed sources or extra files.
+JCE's compiler/OS/build adapters live outside vendor directories. Development
+frameworks follow the same rule: Unity v2.6.0 and doctest v2.4.11, unmodified.

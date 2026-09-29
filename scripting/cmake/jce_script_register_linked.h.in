@@ -1,0 +1,45 @@
+/* jce_script_register_linked.h — GENERATED for target @JCE_SE_TARGET@.
+ *
+ * DO NOT EDIT and do not commit: this file is written into the build tree by
+ * jce_script_enable(), and it names exactly the language backends THIS binary
+ * links.  Regenerating with a different LANGUAGES list rewrites it.
+ *
+ * Languages linked into @JCE_SE_TARGET@: lua (built into the engine) plus
+ *   @JCE_SE_LANGUAGES_TEXT@
+ */
+
+#ifndef JCE_SCRIPT_REGISTER_LINKED_H
+#define JCE_SCRIPT_REGISTER_LINKED_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Register every non-Lua language backend linked into this executable, and
+ * hand each one the runtime inputs it cannot discover for itself (CPython's
+ * sys.path entry, the JVM library, the Java class path, the JNI shim).
+ *
+ * CALL IT BEFORE THE FIRST SCENE LOADS.  Script components are instantiated
+ * inside jce_runtime_create(), and a language registered after that is a
+ * language the scene has already been refused by -- the entity is dropped with
+ * an error naming the language, and the rest of the scene works perfectly,
+ * which is the failure mode this whole path exists to prevent.
+ *
+ * `publish_native_modules` is called once, after the cpp and c languages are
+ * registered and before this returns, or not at all if neither was linked.
+ * Pass NULL when the project has no native script module.  It exists because
+ * publishing a module IS project code -- the classes are the project's -- while
+ * everything else here is boilerplate that was being hand-written per project.
+ *
+ * Returns the number of non-Lua languages that registered successfully.  It
+ * does not fail the process: every refusal is logged by name and the run
+ * continues, so the failure surfaces as "that language ran nothing" rather
+ * than as a window that never opened.  Compare the return against the count in
+ * this header's comment above to assert a build got what it asked for. */
+int jce_script_register_linked_languages(void (*publish_native_modules)(void));
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* JCE_SCRIPT_REGISTER_LINKED_H */

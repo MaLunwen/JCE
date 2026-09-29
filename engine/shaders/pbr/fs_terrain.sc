@@ -11,6 +11,7 @@ uniform vec4 u_pbrParams;       // x=metallic, y=roughness, z=aoStrength, w=alph
 uniform vec4 u_ssaoParams;      // x=SSAO active, yz=1/AO target size, w=contact shadows
 uniform vec4 u_weatherSurface;  // x=wetness y=snow zw=reserved
 #include "wetness.sh"
+#include "area_light.sh"
 uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 2=blend)
 uniform vec4 u_cameraPos;       // xyz=world-space camera position
 uniform vec4 u_normalScale;     // x=normal map scale (x<0 => checker fallback), y=doubleSided flag
@@ -51,13 +52,18 @@ SAMPLER2D(s_albedo,     0);
  * terrain takes metallic and roughness from u_pbrParams, not from a texture.
  * It now carries the screen-space ambient occlusion target, which terrain had
  * no way to receive at all: every one of terrain's sixteen stages was spoken
- * for on paper, and two of them (this and s_normalMap at 2) were spoken for by
+ * for on paper, and two of them (this and stage 2) were spoken for by
  * samplers nothing sampled.
  *
  * Screen UV, exactly as fs_pbr_body.sh does it, so the ground and the things
  * standing on it darken by the same rule at the same contact. */
 SAMPLER2D(s_terrainAO, 1);
-SAMPLER2D(s_normalMap,  2);
+// Four tangent-space normals followed by four packed material masks:
+// mask R=metallic, G=AO, B=height, A=smoothness.  A 2D array keeps all eight
+// inputs in the one sampler stage terrain can spare.
+SAMPLER2DARRAY(s_terrainLayerData, 2);
+uniform vec4 u_terrainNormalScales;
+uniform vec4 u_terrainMaskFlags;
 /* Stage 3 was s_aoMap: DECLARED but never bound and never read on the terrain
  * path (terrain has its own draw path and binds nothing here).  An unbound
  * sampler is harmless until something reads it and undefined the moment
@@ -91,6 +97,11 @@ uniform vec4 u_csmSplits;
 // u_csmParams.z = normal bias strength
 // u_csmParams.w = filter radius multiplier
 uniform vec4 u_csmParams;
+// Per-cascade world-units-per-shadow-texel scale, used to turn a normalized
+// shadow-depth difference into a penumbra width.  Written by jce_sr_shadow.c
+// from JceCsmData.depth_range; see pcss.sh.
+uniform vec4 u_csmPenumbra;
+
 // Per-cascade bias scale (x..w for cascades 0..3)
 uniform vec4 u_csmBiasScales;
 
@@ -130,6 +141,7 @@ SAMPLER2D(s_layer2,   15);
 
 // u_terrainParams.x = layer tile scale (UV multiplier for per-layer albedo)
 // u_terrainParams.y = splat enabled (1 = sample splat, 0 = layer0 only)
+// u_terrainParams.w = height-aware blend strength (0 = legacy splat blend)
 uniform vec4 u_terrainParams;
 
 // Per-tile splat UV remap (large-world #4): for a streamed/tiled terrain the
@@ -260,10 +272,14 @@ void main()
     vec3 a1 = texture2D(s_layer1,   layerUV).rgb;
     vec3 a2 = texture2D(s_layer2,   layerUV).rgb;
     vec3 a3 = texture2D(s_emissive, layerUV).rgb; // s_emissive slot reused as layer3
-    vec3 a0L = pow(clamp(a0, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2));
-    vec3 a1L = pow(clamp(a1, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2));
-    vec3 a2L = pow(clamp(a2, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2));
-    vec3 a3L = pow(clamp(a3, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2));
+    // The four layer albedos are sRGB-encoded and the SAMPLER decodes them:
+    // each layer texture carries a hardware sRGB view, so the decode happens
+    // per texel BEFORE filtering rather than per fragment after it.  See
+    // fs_pbr_body.sh for why that distinction is the whole point.
+    vec3 a0L = clamp(a0, vec3_splat(0.0), vec3_splat(1.0));
+    vec3 a1L = clamp(a1, vec3_splat(0.0), vec3_splat(1.0));
+    vec3 a2L = clamp(a2, vec3_splat(0.0), vec3_splat(1.0));
+    vec3 a3L = clamp(a3, vec3_splat(0.0), vec3_splat(1.0));
 
     vec4 splat = vec4(1.0, 0.0, 0.0, 0.0);
     if (u_terrainParams.y > 0.5) {
@@ -273,6 +289,38 @@ void main()
         float wsum = splat.r + splat.g + splat.b + splat.a;
         if (wsum > 0.0001) splat /= wsum;
         else splat = vec4(1.0, 0.0, 0.0, 0.0);
+    }
+
+    vec4 maskFlags = clamp(u_terrainMaskFlags, vec4_splat(0.0),
+                           vec4_splat(1.0));
+    vec4 m0 = vec4(0.0, 1.0, 0.5, 0.0);
+    vec4 m1 = m0;
+    vec4 m2 = m0;
+    vec4 m3 = m0;
+    if (maskFlags.x > 0.5)
+        m0 = texture2DArray(s_terrainLayerData, vec3(layerUV, 4.0));
+    if (maskFlags.y > 0.5)
+        m1 = texture2DArray(s_terrainLayerData, vec3(layerUV, 5.0));
+    if (maskFlags.z > 0.5)
+        m2 = texture2DArray(s_terrainLayerData, vec3(layerUV, 6.0));
+    if (maskFlags.w > 0.5)
+        m3 = texture2DArray(s_terrainLayerData, vec3(layerUV, 7.0));
+
+    float heightBlend = clamp(u_terrainParams.w, 0.0, 1.0);
+    if (heightBlend > 0.0001 &&
+        dot(maskFlags, vec4_splat(1.0)) > 0.5) {
+        vec4 heights = mix(vec4_splat(0.5),
+                           vec4(m0.b, m1.b, m2.b, m3.b), maskFlags);
+        vec4 weightedHeight = heights * heightBlend + splat;
+        float peak = max(max(weightedHeight.x, weightedHeight.y),
+                         max(weightedHeight.z, weightedHeight.w));
+        float transition = max(0.02, (1.0 - heightBlend) * 0.5);
+        vec4 heightWeights = max(
+            weightedHeight - vec4_splat(peak - transition),
+            vec4_splat(0.0)) * splat;
+        float heightSum = dot(heightWeights, vec4_splat(1.0));
+        if (heightSum > 0.0001)
+            splat = heightWeights / heightSum;
     }
 
     vec3 albedo = (a0L * splat.r + a1L * splat.g + a2L * splat.b + a3L * splat.a)
@@ -301,7 +349,7 @@ void main()
     if (viewMode > 1.5)
     {
         // Output albedo without lighting (gamma-correct for display).
-        vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+        vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
         gl_FragColor = vec4(outRgb, alpha);
         return;
     }
@@ -316,12 +364,74 @@ void main()
         discard;
     }
 
-    // --- Normal (terrain: vertex normal only, no normal map) ---
+    // --- Normal (four tangent-space layer normals) ---
     vec3 N = baseNormal;
 
-    // --- Metallic / Roughness (terrain: uniform-only, no MR map) ---
-    float metallic  = u_pbrParams.x;
-    float roughness = clamp(u_pbrParams.y, 0.04, 1.0);
+    vec4 normalScales = max(u_terrainNormalScales, vec4_splat(0.0));
+    bool hasLayerNormal = normalScales.x > 0.0001 ||
+                          normalScales.y > 0.0001 ||
+                          normalScales.z > 0.0001 ||
+                          normalScales.w > 0.0001;
+    if (hasLayerNormal) {
+        vec3 n0 = vec3(0.0, 0.0, 1.0);
+        vec3 n1 = n0;
+        vec3 n2 = n0;
+        vec3 n3 = n0;
+        if (normalScales.x > 0.0001) {
+            n0 = texture2DArray(s_terrainLayerData, vec3(layerUV, 0.0)).xyz
+               * 2.0 - vec3_splat(1.0);
+            n0.xy *= normalScales.x;
+            n0 = normalize(n0);
+        }
+        if (normalScales.y > 0.0001) {
+            n1 = texture2DArray(s_terrainLayerData, vec3(layerUV, 1.0)).xyz
+               * 2.0 - vec3_splat(1.0);
+            n1.xy *= normalScales.y;
+            n1 = normalize(n1);
+        }
+        if (normalScales.z > 0.0001) {
+            n2 = texture2DArray(s_terrainLayerData, vec3(layerUV, 2.0)).xyz
+               * 2.0 - vec3_splat(1.0);
+            n2.xy *= normalScales.z;
+            n2 = normalize(n2);
+        }
+        if (normalScales.w > 0.0001) {
+            n3 = texture2DArray(s_terrainLayerData, vec3(layerUV, 3.0)).xyz
+               * 2.0 - vec3_splat(1.0);
+            n3.xy *= normalScales.w;
+            n3 = normalize(n3);
+        }
+        vec3 tangentNormal = normalize(n0 * splat.r + n1 * splat.g +
+                                       n2 * splat.b + n3 * splat.a);
+        if (dot(v_tangent, v_tangent) > 1e-8 &&
+            dot(v_bitangent, v_bitangent) > 1e-8) {
+            mat3 TBN = mtxFromCols(normalize(v_tangent),
+                                   normalize(v_bitangent), N);
+            N = normalize(mul(TBN, tangentNormal));
+        }
+    }
+
+    // --- Metallic / Roughness / material AO from packed layer masks ---
+    float baseMetallic = clamp(u_pbrParams.x, 0.0, 1.0);
+    float baseRoughness = clamp(u_pbrParams.y, 0.04, 1.0);
+    vec4 metallicLayers = vec4(
+        mix(baseMetallic, m0.r, maskFlags.x),
+        mix(baseMetallic, m1.r, maskFlags.y),
+        mix(baseMetallic, m2.r, maskFlags.z),
+        mix(baseMetallic, m3.r, maskFlags.w));
+    vec4 roughnessLayers = vec4(
+        mix(baseRoughness, 1.0 - m0.a, maskFlags.x),
+        mix(baseRoughness, 1.0 - m1.a, maskFlags.y),
+        mix(baseRoughness, 1.0 - m2.a, maskFlags.z),
+        mix(baseRoughness, 1.0 - m3.a, maskFlags.w));
+    vec4 aoLayers = vec4(
+        mix(1.0, m0.g, maskFlags.x),
+        mix(1.0, m1.g, maskFlags.y),
+        mix(1.0, m2.g, maskFlags.z),
+        mix(1.0, m3.g, maskFlags.w));
+    float metallic = clamp(dot(metallicLayers, splat), 0.0, 1.0);
+    float roughness = clamp(dot(roughnessLayers, splat), 0.04, 1.0);
+    float materialAo = clamp(dot(aoLayers, splat), 0.0, 1.0);
 
     /* Rain. Ground is the surface people read wetness off first, and it was
      * the surface that had none: the environment has integrated
@@ -357,11 +467,12 @@ void main()
      * aoStrength still blends, because an authored 0 must still mean "no AO
      * on this terrain" -- the difference is that now there is something to
      * turn down. */
-    float ao = 1.0;
+    float aoStrength = clamp(u_pbrParams.z, 0.0, 1.0);
+    float ao = mix(1.0, materialAo, aoStrength);
     if (u_ssaoParams.x > 0.5)
     {
         float ssao = texture2D(s_terrainAO, gl_FragCoord.xy * u_ssaoParams.yz).r;
-        ao = mix(1.0, clamp(ssao, 0.0, 1.0), clamp(u_pbrParams.z, 0.0, 1.0));
+        ao *= mix(1.0, clamp(ssao, 0.0, 1.0), aoStrength);
     }
 
     // --- View direction ---
@@ -443,6 +554,20 @@ void main()
         Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance;
     }
 
+    // --- Area (rect) lights ---
+    // The SAME jce_area_light_contrib fs_pbr_body.sh calls, from the one
+    // include: the ground under a rect light has to be lit by it, and two
+    // copies of the maths would be two places for it to drift.
+    {
+        int numAreaLights = int(u_areaParams.x);
+        for (int ai = 0; ai < JCE_MAX_AREA_LIGHTS; ai++)
+        {
+            if (ai >= numAreaLights) break;
+            Lo += jce_area_light_contrib(ai, v_worldpos, N, V, F0, albedo,
+                                         metallic, roughness, u_lookWrap.x);
+        }
+    }
+
     // --- Ambient (IBL or flat) ---
     vec3 ambient;
     if (u_iblParams.x > 0.5)
@@ -500,7 +625,7 @@ void main()
     // --- Gamma correction (linear -> sRGB) ---
     // When postfx tonemap is enabled, keep linear output for post-processing.
     if (u_iblParams.w < 0.5)
-        color = pow(max(color, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+        color = pow(max(color, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
 
     // --- Output ---
     if (alphaMode == 2.0)

@@ -36,6 +36,7 @@
 #include "jce/os/core/jce_thread.h"
 
 #include "jce_ktx2_writer.h"
+#include "jce_ibl_convolve.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -47,6 +48,11 @@
 
 typedef struct {
     JceReflectionProbeBakeDesc desc;
+    /* Owned COPY of the caller's captured faces, or NULL for the procedural
+     * path.  A copy because the capture releases its buffers the moment it
+     * submits, and this worker runs on another thread for as long as the
+     * convolutions take. */
+    uint8_t                   *supplied_faces;
     char                       path[512];
 
     JceAsyncTask              *task;
@@ -112,6 +118,11 @@ static jce_vec3 rpb_face_dir(int face, float u, float v)
 /* Sky-and-ground procedural placeholder: blue→white gradient above
  * horizon, grey→dark below, tinted slightly by probe world position so
  * different probes produce visibly different artefacts. */
+/* The same gradient in half floats.  It is the fallback for a host with no
+ * renderer, and an HDR probe that fell back to an LDR artefact would produce a
+ * container the reader then reads with the wrong stride. */
+static void rpb_sample_proc_f16(jce_vec3 dir, jce_vec3 pos, uint16_t out[4]);
+
 static void rpb_sample_proc(jce_vec3 dir, jce_vec3 pos, uint8_t out[4])
 {
     float horizon = dir.y;                 /* +1 zenith, -1 nadir */
@@ -147,6 +158,36 @@ static void rpb_sample_proc(jce_vec3 dir, jce_vec3 pos, uint8_t out[4])
     out[1] = (uint8_t)(g * 255.0f);
     out[2] = (uint8_t)(b * 255.0f);
     out[3] = 255u;
+}
+
+/* IEEE half from float.  A private copy rather than reaching into jce_ibl.c's:
+ * that one is file-static there, and the alternative is exporting a two-line
+ * bit twiddle from a convolution module because a fallback gradient needs it. */
+static uint16_t rpb_f32_to_f16(float f)
+{
+    union { float f; uint32_t u; } c;
+    c.f = f;
+    const uint32_t b = c.u;
+    const uint32_t sign = (b >> 16) & 0x8000u;
+    int32_t  expo = ((int32_t)((b >> 23) & 0xFFu)) - 127 + 15;
+    const uint32_t mant = (b >> 13) & 0x03FFu;
+    if (expo <= 0)  return (uint16_t)sign;
+    if (expo >= 31) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | ((uint32_t)expo << 10) | mant);
+}
+
+static void rpb_sample_proc_f16(jce_vec3 dir, jce_vec3 pos, uint16_t out[4])
+{
+    /* Through the LDR sampler and back up.  The gradient has no values above
+     * 1.0 to preserve -- it is a picture of nothing that is in the scene, kept
+     * only so a host with no renderer still produces a valid artefact -- so
+     * what matters here is the CONTAINER's format, not extra range. */
+    uint8_t px[4];
+    rpb_sample_proc(dir, pos, px);
+    out[0] = rpb_f32_to_f16((float)px[0] / 255.0f);
+    out[1] = rpb_f32_to_f16((float)px[1] / 255.0f);
+    out[2] = rpb_f32_to_f16((float)px[2] / 255.0f);
+    out[3] = rpb_f32_to_f16(1.0f);
 }
 
 /* ── disk container ───────────────────────────────────────────────── */
@@ -208,7 +249,8 @@ static JceAsyncRunResult rpb_worker_main(JceAsyncContext *ctx, void *arg)
     const uint32_t spec_mips = g_rpb.desc.specular_mip_count;
     const size_t   face_pix  = (size_t)face_size * face_size;
     const size_t   total_pix = 6u * face_pix;
-    uint8_t       *faces     = (uint8_t *)jce_malloc(total_pix * 4u);
+    const uint32_t bpp       = g_rpb.desc.hdr ? 8u : 4u;
+    uint8_t       *faces     = (uint8_t *)jce_malloc(total_pix * bpp);
     if (!faces) {
         LOG_ERROR(JCE_RPB_TAG, "alloc failed (%u px cubemap)", face_size);
         rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_FAILED);
@@ -216,38 +258,89 @@ static JceAsyncRunResult rpb_worker_main(JceAsyncContext *ctx, void *arg)
         return JCE_ASYNC_RUN_FAILED;
     }
 
-    /* Step 1/4: render 6 faces. */
+    /* Step 1/4: the six faces.
+     *
+     * CAPTURED when the caller supplied them -- six renders of the actual
+     * scene, read back by jce_scene_probe_capture -- and otherwise the
+     * procedural sky-and-ground gradient this bake has always generated,
+     * which is a picture of nothing that is in the scene.  The gradient is
+     * kept as the fallback rather than removed: a host with no renderer, or a
+     * capture that cannot start, still produces a valid artefact instead of
+     * none, which is the behaviour every existing project has. */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_RENDERING_FACES);
-    for (int f = 0; f < 6; ++f) {
-        if (rpb_cancelled(ctx)) goto cancelled;
-        uint8_t *dst = faces + (size_t)f * face_pix * 4u;
-        for (uint32_t y = 0; y < face_size; ++y) {
-            float v = ((float)y + 0.5f) / (float)face_size * 2.0f - 1.0f;
-            for (uint32_t x = 0; x < face_size; ++x) {
-                float u = ((float)x + 0.5f) / (float)face_size * 2.0f - 1.0f;
-                jce_vec3 d = rpb_face_dir(f, u, v);
-                rpb_sample_proc(d, g_rpb.desc.position,
-                                 &dst[(y * face_size + x) * 4u]);
+    if (g_rpb.supplied_faces) {
+        memcpy(faces, g_rpb.supplied_faces, total_pix * bpp);
+        rpb_set_progress(1.0f, 0.50f);
+    } else {
+        for (int f = 0; f < 6; ++f) {
+            if (rpb_cancelled(ctx)) goto cancelled;
+            uint8_t *dst = faces + (size_t)f * face_pix * bpp;
+            for (uint32_t y = 0; y < face_size; ++y) {
+                float v = ((float)y + 0.5f) / (float)face_size * 2.0f - 1.0f;
+                for (uint32_t x = 0; x < face_size; ++x) {
+                    float u = ((float)x + 0.5f) / (float)face_size * 2.0f - 1.0f;
+                    jce_vec3 d = rpb_face_dir(f, u, v);
+                    const size_t o = (size_t)(y * face_size + x) * bpp;
+                    if (bpp == 8u)
+                        rpb_sample_proc_f16(d, g_rpb.desc.position,
+                                            (uint16_t *)(void *)&dst[o]);
+                    else
+                        rpb_sample_proc(d, g_rpb.desc.position, &dst[o]);
+                }
             }
+            rpb_set_progress((float)(f + 1) / 6.0f, 0.50f * (float)(f + 1) / 6.0f);
         }
-        rpb_set_progress((float)(f + 1) / 6.0f, 0.50f * (float)(f + 1) / 6.0f);
     }
 
-    /* Step 2/4: irradiance (analytic placeholder — no work needed for v1
-     * since the procedural sky is already a smooth function; surfaced as
-     * a status transition so the UI bar advances). */
+    /* Step 2/4: irradiance.  A REAL cosine-weighted convolution now -- this
+     * step used to advance the progress bar and return, and the sidecar was
+     * then written from the specular faces, so every probe's diffuse term was
+     * a mirror image of its surroundings.
+     *
+     * 32^2 out, matching the IBL path: irradiance is smooth by construction
+     * and the cost is ~1024 samples per OUTPUT texel, so this is the number
+     * that decides the bake time, not the probe's authored resolution. */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CONVOLVING_IRRADIANCE);
-    rpb_set_progress(1.0f, 0.65f);
     if (rpb_cancelled(ctx)) goto cancelled;
-
-    /* Step 3/4: specular mip chain (placeholder — recorded count is
-     * round-tripped into the container header). */
-    rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CONVOLVING_SPECULAR);
-    for (uint32_t m = 0; m < spec_mips; ++m) {
-        if (rpb_cancelled(ctx)) goto cancelled;
-        rpb_set_progress((float)(m + 1) / (float)spec_mips,
-                          0.65f + 0.25f * (float)(m + 1) / (float)spec_mips);
+    const uint32_t irr_size  = 32u;
+    const size_t   irr_bytes = (size_t)irr_size * irr_size * 6u * bpp;
+    uint8_t *irr = (uint8_t *)jce_malloc(irr_bytes);
+    if (irr) {
+        if (bpp == 8u)
+            jce_ibl_convolve_cube_irradiance_rgba16f(
+                (const uint16_t *)(const void *)faces, face_size, irr_size,
+                (uint16_t *)(void *)irr);
+        else
+            jce_ibl_convolve_cube_irradiance_rgba8(faces, face_size, irr_size,
+                                                   irr);
     }
+    rpb_set_progress(1.0f, 0.65f);
+
+    /* Step 3/4: the specular roughness chain, likewise real.  spec_mips is
+     * what the CALLER asked for; the chain is what the face size actually
+     * supports, and the container header must state the second or a sampler
+     * reads past the data.  mip 0 is roughness 0, so the mirror reflection is
+     * unchanged and only the rough mips are new. */
+    rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CONVOLVING_SPECULAR);
+    if (rpb_cancelled(ctx)) goto cancelled;
+    const uint32_t chain_mips  = jce_ibl_cube_mip_count(face_size);
+    /* jce_ibl_cube_mipchain_bytes counts RGBA8 texels, which is also the
+     * element count: 4 per texel.  In RGBA16F each of those is a uint16_t, so
+     * the byte count doubles and the ELEMENT count does not. */
+    const size_t   chain_bytes = jce_ibl_cube_mipchain_bytes(face_size)
+                               * (bpp == 8u ? 2u : 1u);
+    uint8_t *chain = (uint8_t *)jce_malloc(chain_bytes);
+    if (chain) {
+        if (bpp == 8u)
+            jce_ibl_convolve_cube_specular_rgba16f(
+                (const uint16_t *)(const void *)faces, face_size,
+                (uint16_t *)(void *)chain);
+        else
+            jce_ibl_convolve_cube_specular_rgba8(faces, face_size, chain);
+    }
+    rpb_set_progress(1.0f, 0.90f);
+    if (rpb_cancelled(ctx)) { jce_free(irr); jce_free(chain); goto cancelled; }
+    (void)spec_mips;
 
     /* Step 4/4: encode + write. Real KTX1 cubemap via bimg. */
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_ENCODING_KTX2);
@@ -258,23 +351,33 @@ static JceAsyncRunResult rpb_worker_main(JceAsyncContext *ctx, void *arg)
      * with its real extension. The struct field name stays put. */
     (void)rpb_normalise_extension(g_rpb.path, sizeof g_rpb.path);
 
+    /* Fall back to the unconvolved faces if either allocation failed: a probe
+     * that looks like it did before beats no artefact at all, and the log
+     * above already carries the OOM. */
     bool ok = jce__ktx2_write_cubemap(g_rpb.path,
                                        face_size,
-                                       1u,        /* mip_count — spec mip chain TBD */
-                                       faces,
-                                       4u);       /* RGBA8 */
+                                       chain ? chain_mips : 1u,
+                                       chain ? chain : faces,
+                                       bpp);
     if (ok) {
         rpb_set_progress(0.7f, 0.97f);
-        /* Irradiance sidecar: same source faces for v2 (analytic SH
-         * convolution lands with the live capture path). Failure here
-         * is non-fatal — specular write already succeeded. */
+        /* Irradiance sidecar: the real convolution now.  Failure here is
+         * non-fatal -- the specular write already succeeded. */
         char irr_path[512];
         rpb_irr_path(g_rpb.path, irr_path, sizeof irr_path);
         if (irr_path[0]) {
-            (void)jce__ktx2_write_cubemap(irr_path, face_size, 1u, faces, 4u);
+            (void)jce__ktx2_write_cubemap(irr_path,
+                                          irr ? irr_size  : face_size, 1u,
+                                          irr ? irr : faces, bpp);
         }
     }
+    jce_free(irr);
+    jce_free(chain);
     jce_free(faces);
+    if (g_rpb.supplied_faces) {
+        jce_free(g_rpb.supplied_faces);
+        g_rpb.supplied_faces = NULL;
+    }
 
     if (!ok) {
         LOG_ERROR(JCE_RPB_TAG, "write failed: %s", g_rpb.path);
@@ -287,12 +390,18 @@ static JceAsyncRunResult rpb_worker_main(JceAsyncContext *ctx, void *arg)
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_DONE);
     g_rpb.message = "done";
     LOG_SUCCESS(JCE_RPB_TAG,
-                "bake done: %s (%ux%u cube, %u spec mips requested, KTX1 + .irr.ktx sidecar)",
-                g_rpb.path, face_size, face_size, spec_mips);
+                "bake done: %s (%ux%u cube, %u GGX mips written, "
+                "%u^2 irradiance sidecar)",
+                g_rpb.path, face_size, face_size,
+                chain ? chain_mips : 1u, irr ? irr_size : face_size);
     return JCE_ASYNC_RUN_SUCCESS;
 
 cancelled:
     jce_free(faces);
+    if (g_rpb.supplied_faces) {
+        jce_free(g_rpb.supplied_faces);
+        g_rpb.supplied_faces = NULL;
+    }
     rpb_atomic_set(g_rpb.status, JCE_BAKE_STATUS_CANCELLED);
     g_rpb.message = "cancelled";
     LOG_INFO(JCE_RPB_TAG, "bake cancelled");
@@ -301,8 +410,11 @@ cancelled:
 
 /* ── public API ───────────────────────────────────────────────────── */
 
-JCE_API JceReflectionProbeBakeHandle JCE_CALL
-jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
+/* One body for both entry points: everything except where the faces come
+ * from is shared, and a second copy of the submit dance is how the two would
+ * drift. */
+static JceReflectionProbeBakeHandle
+rpb_submit(const JceReflectionProbeBakeDesc *desc, const uint8_t *faces)
 {
     if (!desc || !desc->output_path_ktx2 || !desc->output_path_ktx2[0]) {
         LOG_WARN(JCE_RPB_TAG, "submit: missing desc / output path");
@@ -340,6 +452,32 @@ jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
     snprintf(g_rpb.path, sizeof(g_rpb.path), "%s", desc->output_path_ktx2);
     g_rpb.desc.output_path_ktx2 = g_rpb.path;
 
+    /* Take the captured faces AFTER the size clamps above, so the copy is
+     * exactly what the worker will read: a caller that asked for 1024 gets
+     * 512, and copying its 1024-sized buffer would read past the worker's
+     * allocation on every face but the first. */
+    if (g_rpb.supplied_faces) {
+        jce_free(g_rpb.supplied_faces);
+        g_rpb.supplied_faces = NULL;
+    }
+    if (faces) {
+        /* ...and at the format the worker will read, for the same reason.
+         * This said 4 unconditionally: an HDR submit copied HALF the caller's
+         * buffer and the worker then read 8 bytes per texel out of it, so
+         * faces 3-5 were whatever followed the allocation.  Faces 0-2 were
+         * correct, which is exactly the shape that survives a spot check. */
+        const size_t n = (size_t)g_rpb.desc.cubemap_size *
+                         g_rpb.desc.cubemap_size * 6u *
+                         (g_rpb.desc.hdr ? 8u : 4u);
+        g_rpb.supplied_faces = (uint8_t *)jce_malloc(n);
+        if (!g_rpb.supplied_faces) {
+            LOG_ERROR(JCE_RPB_TAG, "submit: out of memory copying %u px faces",
+                      g_rpb.desc.cubemap_size);
+            return 0u;
+        }
+        memcpy(g_rpb.supplied_faces, faces, n);
+    }
+
     /* Lazy-create the atomics (cheap; module-scoped lifetime). */
     if (!g_rpb.status)   g_rpb.status   = jce_atomic_i32_create(JCE_BAKE_STATUS_IDLE);
     if (!g_rpb.cancel)   g_rpb.cancel   = jce_atomic_i32_create(0);
@@ -375,6 +513,23 @@ jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
     LOG_INFO(JCE_RPB_TAG, "bake submitted h=%u path=%s size=%u",
              g_rpb.handle, g_rpb.path, g_rpb.desc.cubemap_size);
     return g_rpb.handle;
+}
+
+JCE_API JceReflectionProbeBakeHandle JCE_CALL
+jce_reflection_probe_bake_submit(const JceReflectionProbeBakeDesc *desc)
+{
+    return rpb_submit(desc, NULL);
+}
+
+JCE_API JceReflectionProbeBakeHandle JCE_CALL
+jce_reflection_probe_bake_submit_faces(const JceReflectionProbeBakeDesc *desc,
+                                       const unsigned char *faces)
+{
+    if (!faces) {
+        LOG_WARN(JCE_RPB_TAG, "submit_faces: no faces supplied");
+        return 0u;
+    }
+    return rpb_submit(desc, (const uint8_t *)faces);
 }
 
 JCE_API bool JCE_CALL

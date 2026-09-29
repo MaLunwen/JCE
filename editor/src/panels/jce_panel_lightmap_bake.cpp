@@ -579,6 +579,18 @@ void probe_bake_complete(JceAsyncTask *task, void *arg_ptr)
             }
             ++probe_idx_in_group;
         }
+        /* Deringing is a whole-group operation and the loop above fills one
+         * probe at a time, so it runs after every group is complete.  The
+         * POLICY (does this group want it, is it baked) lives in the engine --
+         * a panel is not where a shipping game reads a component field. */
+        last_e = JCE_ENTITY_INVALID;
+        for (int pi = 0; pi < total; ++pi) {
+            JceEntity e = args->entities[pi];
+            if (e == last_e) continue;
+            last_e = e;
+            jce_scene_light_probe_group_dering(args->scene, e);
+        }
+
         std::snprintf(ps.status, sizeof(ps.status),
                       "Done - baked %d probe(s), %d applied, %d spp each.",
                       total, applied, args->sample_count);

@@ -313,6 +313,12 @@ static void draw_asset_locations_section(void)
                           ? jce_editor_i18n("assetBrowser.simulatedRoot")
                           : jce_editor_i18n("assetBrowser.goHome"),
                       s_assets.project_root, "project", false);
+    char editor_dir[1024];
+    if (jce_fs_host_get_base_path(editor_dir, sizeof(editor_dir))
+        && jce_fs_host_exists_dir(editor_dir)) {
+        draw_location_row("[E]", jce_editor_i18n("assetBrowser.editorFolder"),
+                          editor_dir, "editor", false);
+    }
     if (s_assets.project_root_simulated &&
         !s_assets.followed_project_root.empty() &&
         s_assets.followed_project_root != s_assets.project_root) {
@@ -513,6 +519,21 @@ void draw_asset_breadcrumb_bar(void)
         if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.goHome"))) {
             navigate_asset_directory(s_assets.project_root, true);
         }
+        ImGui::SameLine();
+
+        /* SDL's base path names the running editor executable's directory;
+         * the process working directory may instead be the open project. */
+        char editor_dir[1024];
+        const bool has_editor_dir =
+            jce_fs_host_get_base_path(editor_dir, sizeof(editor_dir))
+            && jce_fs_host_exists_dir(editor_dir);
+        ImGui::BeginDisabled(!has_editor_dir);
+        if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.editorFolder")))
+            navigate_asset_directory(editor_dir, true);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)
+            && has_editor_dir)
+            ImGui::SetTooltip("%s", editor_dir);
+        ImGui::EndDisabled();
         ImGui::SameLine();
 
         /* Browse… — open the OS folder picker.  Result lands in

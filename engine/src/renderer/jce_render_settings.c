@@ -22,6 +22,12 @@ JceRenderSettings jce_render_settings_default(void)
     memset(&s, 0, sizeof s);
     s.shadow_quality = 2;   /* hard+soft — matches the renderer's default */
     s.vsync          = 1;
+    /* A MULTIPLIER's neutral is 1.0, and memset had left it 0.0.  It went
+     * unnoticed while the consumer cast it to an int8 top-mip drop count,
+     * where 0 happens to mean "no drop" -- so the wrong default and the
+     * wrong units cancelled out for projects that never set the field, and
+     * only those that DID set it saw the damage. */
+    s.lod_bias       = 1.0f;
 
     /* Look Profile project defaults — all neutral (byte-identical baseline). */
     s.rim_color[0] = 1.0f; s.rim_color[1] = 1.0f; s.rim_color[2] = 1.0f;
@@ -33,6 +39,14 @@ JceRenderSettings jce_render_settings_default(void)
     /* Grass (plan 07) — off by default; old project files that lack the key
      * will keep this 0 via the defaults-first load pattern. */
     s.grass_enabled = 0;
+    /* No-op values: Full texture quality, and aniso left to the GPU
+     * tier.  A document written before these keys existed loads to the
+     * behaviour it had. */
+    s.texture_quality = 0;
+    s.anisotropic     = -1;
+    s.target_framerate = 0;              /* uncapped */
+    s.pixel_light_count = 0;             /* no budget */
+    s.soft_particles    = 0;             /* no depth fade */
 
     return s;
 }
@@ -53,6 +67,11 @@ bool jce_render_settings_save_json(const char *vfs_path, const JceRenderSettings
     jce_json_set_int(root, "vsync",           s->vsync);
     jce_json_set_int(root, "msaa",            s->msaa);
     jce_json_set_int(root, "grassEnabled",    s->grass_enabled);
+    jce_json_set_int(root, "textureQuality", s->texture_quality);
+    jce_json_set_int(root, "anisotropic",    s->anisotropic);
+    jce_json_set_int(root, "targetFramerate", s->target_framerate);
+    jce_json_set_int(root, "pixelLightCount", s->pixel_light_count);
+    jce_json_set_int(root, "softParticles",   s->soft_particles);
 
     /* ── Look Profile project defaults (plan 02) ─────────────────────────
      * Nested "look" object; absent in old files (v1) → parse keeps neutral
@@ -127,6 +146,16 @@ bool jce_render_settings_load_json_mem(const char *json, size_t len,
                                                       (double)out->msaa);
     out->grass_enabled   = (int)jce_json_number_value(jce_json_get(root, "grassEnabled"),
                                                       (double)out->grass_enabled);
+    out->texture_quality = (int)jce_json_number_value(
+        jce_json_get(root, "textureQuality"), (double)out->texture_quality);
+    out->anisotropic     = (int)jce_json_number_value(
+        jce_json_get(root, "anisotropic"), (double)out->anisotropic);
+    out->target_framerate = (int)jce_json_number_value(
+        jce_json_get(root, "targetFramerate"), (double)out->target_framerate);
+    out->pixel_light_count = (int)jce_json_number_value(
+        jce_json_get(root, "pixelLightCount"), (double)out->pixel_light_count);
+    out->soft_particles = (int)jce_json_number_value(
+        jce_json_get(root, "softParticles"), (double)out->soft_particles);
 
     /* ── Look Profile (absent "look" key → out already holds neutral defaults) */
     JceJson *look = jce_json_get(root, "look");

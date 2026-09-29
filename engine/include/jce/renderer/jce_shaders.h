@@ -13,6 +13,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_gfx_types.h>
+#include <jce/renderer/jce_shader_variants.h>
 
 typedef struct JcePakArchive JcePakArchive;
 
@@ -104,8 +105,34 @@ typedef struct JceShaderSet {
     JceShaderHandle shadow;           /* shadow depth */
     JceShaderHandle shadow_inst;      /* shadow depth — GPU-instanced variant */
     JceShaderHandle shadow_skinned;   /* skinned shadow */
-    JceShaderHandle shadow_vsm;       /* variance shadow map (depth, depth^2) */
     JceShaderHandle terrain;          /* PBR-style terrain (4-layer splat) */
+    /* APPENDED, and it has to be: this struct is passed BY VALUE to
+     * jce_renderer_set_shaders, so inserting a member in the middle shifts
+     * every one after it and silently rebinds programs -- which is what the
+     * ABI gate caught when this first landed at index 2.
+     *
+     * Glyphs from a distance field: vs_textured + fs_text_sdf.  The vertex
+     * stage is identical -- a textured 2D quad -- so it is REUSED rather than
+     * copied, which is why this pair is loaded by NAME.  Optional: a pak built
+     * before it existed leaves the handle invalid and the text renderer keeps
+     * every font on the bitmap path. */
+    JceShaderHandle text_sdf;
+    /* APPENDED, like text_sdf above and for the same reason: this struct is
+     * passed BY VALUE, so a member inserted in the middle shifts every one
+     * after it and silently rebinds programs.
+     *
+     * THE PBR PROGRAM TABLE, generated from contracts/shader-keywords.json
+     * and indexed [vertex variant][keyword bits].  The vertex variant is what
+     * the draw path IS -- static, instanced, skinned -- and the bits are what
+     * the material and the frame ASK FOR.  An entry is invalid when its .bin
+     * is not in the pak, which is how an older pak degrades:
+     * jce_renderer_get_program_variant drops keywords until it finds one that
+     * loaded, and key 0 always exists.
+     *
+     * The named members above are the same handles, not copies of a second
+     * list: they are ABI, and a caller wanting "the plain instanced PBR
+     * program" should not have to spell a key. */
+    JceShaderHandle variant[JCE_SHADER_VARIANT_COUNT][JCE_SHADER_KEY_COUNT];
 } JceShaderSet;
 
 /* Load all standard shader programs from PAK.

@@ -34,6 +34,19 @@ JCE_API void        jce_navmesh_free(JceNavMesh *nm);
 JCE_API int   jce_navmesh_grid_x(const JceNavMesh *nm);
 JCE_API int   jce_navmesh_grid_z(const JceNavMesh *nm);
 JCE_API float jce_navmesh_cell  (const JceNavMesh *nm);
+
+/* The CLEARANCE this mesh was carved for, in metres -- the walkable_height the
+ * bake handed Recast, recorded in the file's settings block.
+ *
+ * 0 means the file does not say, which is UNKNOWN and not zero: a mesh written
+ * before this was read back must not start rejecting agents.  A caller
+ * comparing an agent against it has to treat 0 as "no opinion".
+ *
+ * Why it matters: a navmesh belongs to the agent it was built for.  An agent
+ * taller than this clearance is not slightly wrong on this mesh, it is on the
+ * wrong mesh -- it will walk under geometry it cannot fit under, and nothing
+ * about the steering will look broken while it does. */
+JCE_API float jce_navmesh_agent_height(const JceNavMesh *nm);
 JCE_API void  jce_navmesh_origin(const JceNavMesh *nm, float *out_x, float *out_z);
 
 /* -- Queries ----------------------------------------------------- */

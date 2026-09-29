@@ -1,0 +1,29 @@
+{
+  "_note": "Frame budgets.  max_draws and shares are machine-INDEPENDENT and are the real gate; max_p95_ms is wall-clock and therefore specific to the machine that recorded it -- leave it empty unless one machine owns the number.  Regenerate with `python tools/frame_budget.py --update-baseline` and say in the commit message why a number moved.",
+  "_measured": {
+    "app_update": 12.2693,
+    "ed_layout": 12.1529,
+    "ed_panels": 12.0315,
+    "ed_p_scene_view": 11.501,
+    "ed_sv_vp": 11.4145,
+    "evp_scene_render": 11.2749,
+    "scene_render": 11.2676,
+    "end_frame": 6.4977
+  },
+  "max_draws": 736,
+  "shares": [
+    {
+      "phase": "draw_submit",
+      "of": "scene_render",
+      "max_share": 0.6,
+      "_why": "measured ~36% on 2026-09-01; 60% leaves room for scene variation while still catching a submit path that starts doing per-draw work (that shows as the ratio climbing, not the box slowing)"
+    },
+    {
+      "phase": "sr_pre",
+      "of": "scene_render",
+      "max_share": 0.45,
+      "_why": "measured ~24%; the per-frame setup before the draw loop"
+    }
+  ],
+  "max_p95_ms": {}
+}

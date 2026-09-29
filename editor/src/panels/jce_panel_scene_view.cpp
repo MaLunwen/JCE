@@ -11,6 +11,7 @@
 #include <jce/os/core/jce_filesystem.h>   /* host write: editor code does not use stdio file IO */
 #include <cstdlib>      /* getenv */
 #include <cstdio>       /* snprintf */
+#include <cfloat>       /* FLT_MAX */
 #include "jce_panel_common.h"        /* multi-select duplicate / delete */
 #include "ui/jce_editor_dnd.h"
 #include "ui/jce_editor_tip.h"
@@ -28,15 +29,21 @@
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_scene_renderer.h>
 #include <jce/middleware/scene/jce_terrain.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>  /* UI pick + pivot for the outline */
 
 bool jce_terrain_panel_brush_armed(void);
 struct JceTerrain *jce_terrain_panel_get_terrain(void);
-void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt);
+float jce_terrain_panel_brush_radius(void);
+uint32_t jce_terrain_panel_brush_edit_flags(void);
+void jce_terrain_panel_apply_brush_local(float local_x, float local_z,
+                                         float dt);
 void jce_terrain_panel_end_brush_stroke(void);
 
 /* Foliage density paint brush (large-world #8a) — same scene-view raycast path. */
 bool jce_foliage_brush_armed(void);
+float jce_foliage_brush_radius(void);
 void jce_foliage_brush_apply_world(float wx, float wz, float dt);
 void jce_foliage_brush_end_stroke(void);
 }
@@ -1821,6 +1828,28 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
         }
     }
 
+    /* ECS-UI pick, BEFORE the id buffer.  The canvas draws over the whole
+     * scene, so a click that lands on a UI element belongs to that element --
+     * but a UIImage has no mesh, so the id render sees straight through it and
+     * decoded whatever 3D object happened to be behind.  The whole ECS-UI tree
+     * was unselectable in the viewport; it could only be reached through the
+     * Hierarchy.
+     *
+     * Answered synchronously by the same canvas that drew the frame, so it
+     * honours raycast_target, blocksRaycasts, canvas-group alpha, ScrollView
+     * clipping and popup modality -- none of which an id buffer could carry
+     * even if the quads were rendered into it. */
+    {
+        uint32_t ui_hit = jce_editor_scene_ui_pick(
+            s_sel_click_pos.x - ctx->screen_pos.x,
+            s_sel_click_pos.y - ctx->screen_pos.y,
+            ctx->avail.x, ctx->avail.y);
+        if (ui_hit) {
+            apply_single_pick_selection(ui_hit, add_mode);
+            return;
+        }
+    }
+
     if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
         return;
 
@@ -1849,6 +1878,32 @@ static void draw_selection_outlines(const SceneViewCtx *ctx,
         uint32_t sid = sel_ids[si];
         if (sid == 0 || !jce_state_entity_exists(sid)) continue;
         if (!jce_state_entity_enabled(sid)) continue;
+        /* A UI element's rect comes from its anchors against its parent; the
+         * Transform is never consulted by the canvas.  Outlining it at the
+         * Transform position therefore drew a diamond somewhere unrelated to
+         * the thing selected -- usually the world origin, since UI entities are
+         * authored with an untouched Transform.  Ask where it actually drew. */
+        float uir[4];
+        if (jce_editor_scene_ui_entity_rect(sid, ctx->avail.x, ctx->avail.y, uir)) {
+            ImVec2 a(ctx->screen_pos.x + uir[0],           ctx->screen_pos.y + uir[1]);
+            ImVec2 b(ctx->screen_pos.x + uir[0] + uir[2],  ctx->screen_pos.y + uir[1] + uir[3]);
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            dl->AddRect(a, b, IM_COL32(255, 160, 40, 255), 0.0f, 0, 2.0f);
+            /* Pivot marker: the point the rect is positioned and scaled about,
+             * and the one number in a RectTransform with no visual otherwise. */
+            float piv[2];
+            if (scene && jce_ui_canvas_entity_pivot(
+                    scene, (uint64_t)jce_state_to_ecs_entity(sid), piv)) {
+                const float pv = ctx->screen_pos.x + uir[0] + uir[2] * piv[0];
+                /* UGUI pivot Y is measured UP from the bottom; the draw space
+                 * here is top-left origin, so it flips. */
+                const float ph = ctx->screen_pos.y + uir[1] +
+                                 uir[3] * (1.0f - piv[1]);
+                dl->AddCircle(ImVec2(pv, ph), 4.0f, IM_COL32(255, 160, 40, 255), 12, 1.5f);
+            }
+            continue;
+        }
+
         JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)sid) : NULL;
         if (!t) continue;
         float swp[3] = { t->position.x, t->position.y, t->position.z };
@@ -2014,6 +2069,242 @@ static inline void panel_phase_sv(const char *name, uint64_t *t)
     *t = now;
 }
 
+struct SceneTerrainBrushHit {
+    JceTerrain *terrain = nullptr;
+    jce_mat4    world_matrix = jce_m4_identity();
+    float       local[3] = {};
+    float       world[3] = {};
+    float       ray_distance = FLT_MAX;
+};
+
+struct SceneTerrainRaycastSearch {
+    const float *origin = nullptr;
+    const float *direction = nullptr;
+    JceTerrain *terrain_filter = nullptr;
+    SceneTerrainBrushHit *hit = nullptr;
+    bool has_resident_terrain = false;
+};
+
+static bool scene_view_raycast_terrain_object(
+    JceTerrain *terrain, const jce_mat4 &world_matrix,
+    const float world_origin[3], const float world_direction[3],
+    SceneTerrainBrushHit *out_hit)
+{
+    if (!terrain || !world_origin || !world_direction || !out_hit)
+        return false;
+
+    const jce_vec3 scale = jce_m4_extract_scale(&world_matrix);
+    if (scale.x <= 1e-6f || scale.y <= 1e-6f || scale.z <= 1e-6f)
+        return false;
+
+    const jce_mat4 inverse = jce_m4_inverse(&world_matrix);
+    const jce_vec4 local_origin4 = jce_m4_mul_v4(
+        &inverse, jce_v4(world_origin[0], world_origin[1],
+                         world_origin[2], 1.0f));
+    const jce_vec4 local_direction4 = jce_m4_mul_v4(
+        &inverse, jce_v4(world_direction[0], world_direction[1],
+                         world_direction[2], 0.0f));
+    const float direction_length = sqrtf(
+        local_direction4.x * local_direction4.x +
+        local_direction4.y * local_direction4.y +
+        local_direction4.z * local_direction4.z);
+    if (direction_length <= 1e-7f) return false;
+
+    const float local_origin[3] = {
+        local_origin4.x, local_origin4.y, local_origin4.z
+    };
+    const float local_direction[3] = {
+        local_direction4.x / direction_length,
+        local_direction4.y / direction_length,
+        local_direction4.z / direction_length
+    };
+    float local_hit[3];
+    if (!jce_terrain_raycast(terrain, local_origin, local_direction,
+                             100000.0f, local_hit))
+        return false;
+
+    const jce_vec4 world_hit = jce_m4_mul_v4(
+        &world_matrix,
+        jce_v4(local_hit[0], local_hit[1], local_hit[2], 1.0f));
+    const float dx = world_hit.x - world_origin[0];
+    const float dy = world_hit.y - world_origin[1];
+    const float dz = world_hit.z - world_origin[2];
+    const float ray_distance = dx * world_direction[0] +
+                               dy * world_direction[1] +
+                               dz * world_direction[2];
+    if (ray_distance < 0.0f || ray_distance >= out_hit->ray_distance)
+        return false;
+
+    out_hit->terrain = terrain;
+    out_hit->world_matrix = world_matrix;
+    out_hit->local[0] = local_hit[0];
+    out_hit->local[1] = local_hit[1];
+    out_hit->local[2] = local_hit[2];
+    out_hit->world[0] = world_hit.x;
+    out_hit->world[1] = world_hit.y;
+    out_hit->world[2] = world_hit.z;
+    out_hit->ray_distance = ray_distance;
+    return true;
+}
+
+static void scene_view_raycast_terrain_cb(JceScene *scene, JceEntity entity,
+                                           void *user_data)
+{
+    SceneTerrainRaycastSearch *search =
+        static_cast<SceneTerrainRaycastSearch *>(user_data);
+    if (!search || !search->hit ||
+        !jce_scene_has_terrain(scene, entity))
+        return;
+
+    JceTerrainComponent *component = jce_scene_get_terrain(scene, entity);
+    if (!component || !component->visible || !component->terrain_path[0])
+        return;
+    JceTerrain *terrain = jce_scene_peek_terrain(scene,
+                                                 component->terrain_path);
+    if (!terrain) return;
+    search->has_resident_terrain = true;
+    if (search->terrain_filter && terrain != search->terrain_filter)
+        return;
+    const jce_mat4 world_matrix = jce_scene_get_world_matrix(scene, entity);
+    (void)scene_view_raycast_terrain_object(
+        terrain, world_matrix, search->origin, search->direction, search->hit);
+}
+
+static bool scene_view_raycast_resident_terrain(
+    const float world_origin[3], const float world_direction[3],
+    JceTerrain *terrain_filter, SceneTerrainBrushHit *out_hit,
+    bool *out_has_resident_terrain)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !out_hit) return false;
+    SceneTerrainRaycastSearch search = {
+        world_origin, world_direction, terrain_filter, out_hit, false
+    };
+    jce_scene_each_entity(scene, scene_view_raycast_terrain_cb, &search);
+    if (out_has_resident_terrain)
+        *out_has_resident_terrain = search.has_resident_terrain;
+    return out_hit->terrain != nullptr;
+}
+
+static bool scene_view_build_brush_camera(const SceneViewCtx &ctx,
+                                          JceGizmoCamera *out_camera,
+                                          float out_origin[3],
+                                          float out_direction[3])
+{
+    if (!out_camera || !out_origin || !out_direction) return false;
+    float eye[3];
+    if (!jce_editor_scene_get_camera_matrices(
+            out_camera->view, out_camera->proj, eye,
+            ctx.avail.x, ctx.avail.y))
+        return false;
+    memcpy(out_camera->eye, eye, sizeof eye);
+    out_camera->viewport_size[0] = ctx.avail.x;
+    out_camera->viewport_size[1] = ctx.avail.y;
+    out_camera->viewport_origin[0] = ctx.screen_pos.x;
+    out_camera->viewport_origin[1] = ctx.screen_pos.y;
+    const ImVec2 mouse = ImGui::GetMousePos();
+    gm_screen_to_ray(out_camera, mouse.x, mouse.y,
+                     out_origin, out_direction);
+    return true;
+}
+
+static ImU32 scene_view_terrain_brush_color(uint32_t edit_flags)
+{
+    if (edit_flags & JCE_TERRAIN_EDIT_HOLES)
+        return IM_COL32(255, 78, 78, 235);
+    if (edit_flags & JCE_TERRAIN_EDIT_SPLAT)
+        return IM_COL32(50, 184, 255, 235);
+    return IM_COL32(255, 176, 54, 235);
+}
+
+static void scene_view_draw_terrain_brush_cursor(
+    const SceneViewCtx &ctx, const JceGizmoCamera &camera,
+    const SceneTerrainBrushHit &hit, float radius, ImU32 color,
+    bool radius_is_local)
+{
+    if (!ctx.dl || !hit.terrain || radius <= 0.0f) return;
+    const int segments = 64;
+    const jce_mat4 inverse = jce_m4_inverse(&hit.world_matrix);
+    bool previous_valid = false;
+    float previous_screen[2] = {};
+
+    for (int i = 0; i <= segments; ++i) {
+        const float angle = (float)i * (2.0f * JCE_PI / (float)segments);
+        float local_x;
+        float local_z;
+        if (radius_is_local) {
+            local_x = hit.local[0] + cosf(angle) * radius;
+            local_z = hit.local[2] + sinf(angle) * radius;
+        } else {
+            const jce_vec4 local = jce_m4_mul_v4(
+                &inverse,
+                jce_v4(hit.world[0] + cosf(angle) * radius,
+                       hit.world[1],
+                       hit.world[2] + sinf(angle) * radius, 1.0f));
+            local_x = local.x;
+            local_z = local.z;
+        }
+        if (local_x < 0.0f || local_z < 0.0f ||
+            local_x > jce_terrain_world_size_x(hit.terrain) ||
+            local_z > jce_terrain_world_size_z(hit.terrain)) {
+            previous_valid = false;
+            continue;
+        }
+        const float local_y = jce_terrain_sample_height(
+            hit.terrain, local_x, local_z) + 0.04f;
+        const jce_vec4 world = jce_m4_mul_v4(
+            &hit.world_matrix, jce_v4(local_x, local_y, local_z, 1.0f));
+        const float world_point[3] = { world.x, world.y, world.z };
+        float screen[2];
+        const bool valid = gm_world_to_screen(&camera, world_point, screen);
+        if (valid && previous_valid)
+            ctx.dl->AddLine(ImVec2(previous_screen[0], previous_screen[1]),
+                            ImVec2(screen[0], screen[1]), color, 2.0f);
+        previous_valid = valid;
+        if (valid) {
+            previous_screen[0] = screen[0];
+            previous_screen[1] = screen[1];
+        }
+    }
+
+    float center[2];
+    if (gm_world_to_screen(&camera, hit.world, center)) {
+        ctx.dl->AddCircleFilled(ImVec2(center[0], center[1]), 3.0f, color);
+        ctx.dl->AddLine(ImVec2(center[0] - 6.0f, center[1]),
+                        ImVec2(center[0] + 6.0f, center[1]), color, 1.5f);
+        ctx.dl->AddLine(ImVec2(center[0], center[1] - 6.0f),
+                        ImVec2(center[0], center[1] + 6.0f), color, 1.5f);
+    }
+}
+
+static void scene_view_draw_plane_brush_cursor(
+    const SceneViewCtx &ctx, const JceGizmoCamera &camera,
+    const float center[3], float radius, ImU32 color)
+{
+    if (!ctx.dl || !center || radius <= 0.0f) return;
+    const int segments = 64;
+    bool previous_valid = false;
+    float previous_screen[2] = {};
+    for (int i = 0; i <= segments; ++i) {
+        const float angle = (float)i * (2.0f * JCE_PI / (float)segments);
+        const float world[3] = {
+            center[0] + cosf(angle) * radius,
+            center[1] + 0.04f,
+            center[2] + sinf(angle) * radius
+        };
+        float screen[2];
+        const bool valid = gm_world_to_screen(&camera, world, screen);
+        if (valid && previous_valid)
+            ctx.dl->AddLine(ImVec2(previous_screen[0], previous_screen[1]),
+                            ImVec2(screen[0], screen[1]), color, 2.0f);
+        previous_valid = valid;
+        if (valid) {
+            previous_screen[0] = screen[0];
+            previous_screen[1] = screen[1];
+        }
+    }
+}
+
 void jce_editor_panel_scene_view_content(void)
 {
     /* Rolling sub-phases: the Scene View panel owns ~8ms/frame of
@@ -2045,59 +2336,85 @@ void jce_editor_panel_scene_view_content(void)
             ctx.viewport_active))
         cancel_deferred_scene_pick();
 
-    /* ── Terrain brush (Phase 2-B.2) ─────────────────────────────
-     *  Active only when the Terrain panel arms it. Steals LMB from
-     *  selection so a click/drag inside the viewport raycasts onto
-     *  the active terrain and applies the current brush at the
-     *  hit point. Plain LMB only — Alt-LMB still orbits the camera. */
-    bool brush_consumed = false;
-    if (jce_scene_view_left_input_belongs_to_viewport(
-            ctx.viewport_left_clicked,
-            ctx.viewport_active,
-            ImGui::IsMouseDown(ImGuiMouseButton_Left)) &&
-        (jce_terrain_panel_brush_armed() || jce_foliage_brush_armed()) &&
-        !ImGui::GetIO().KeyAlt &&
-        !jce_gizmo_is_active())
-    {
-        float vmat[16], pmat[16], eye[3];
-        if (jce_editor_scene_get_camera_matrices(vmat, pmat, eye,
-                                                 ctx.avail.x, ctx.avail.y)) {
-            JceGizmoCamera cam;
-            memcpy(cam.view, vmat, sizeof vmat);
-            memcpy(cam.proj, pmat, sizeof pmat);
-            memcpy(cam.eye,  eye,  sizeof eye);
-            cam.viewport_size[0]   = ctx.avail.x;
-            cam.viewport_size[1]   = ctx.avail.y;
-            cam.viewport_origin[0] = ctx.screen_pos.x;
-            cam.viewport_origin[1] = ctx.screen_pos.y;
-            ImVec2 m = ImGui::GetMousePos();
-            float ro[3], rd[3];
-            gm_screen_to_ray(&cam, m.x, m.y, ro, rd);
+    /* Terrain and foliage authoring share one cursor/raycast path.  Resolve the
+     * hover hit before LMB so the artist sees exactly where the next stamp lands.
+     * An armed tool owns plain LMB even on a miss; otherwise a missed sculpt
+     * click silently becomes an entity selection, which is destructive UI. */
+    const bool terrain_brush_armed = jce_terrain_panel_brush_armed();
+    const bool foliage_brush_armed = !terrain_brush_armed &&
+                                     jce_foliage_brush_armed();
+    const bool any_brush_armed = terrain_brush_armed || foliage_brush_armed;
+    JceGizmoCamera brush_camera = {};
+    SceneTerrainBrushHit brush_hit;
+    float brush_origin[3] = {};
+    float brush_direction[3] = {};
+    bool brush_hit_valid = false;
+    bool brush_hit_is_terrain = false;
+    bool has_resident_terrain = false;
 
-            float hit[3];
-            JceTerrain *terr = jce_terrain_panel_get_terrain();
-            bool got = false;
-            if (terr && jce_terrain_raycast(terr, ro, rd, 10000.0f, hit))
-                got = true;
-            if (!got && fabsf(rd[1]) > 1e-6f) {
-                /* Fallback: hit Y=0 plane. */
-                float t = -ro[1] / rd[1];
-                if (t > 0.0f) {
-                    hit[0] = ro[0] + rd[0] * t;
-                    hit[1] = 0.0f;
-                    hit[2] = ro[2] + rd[2] * t;
-                    got = true;
-                }
-            }
-            if (got) {
-                float dt = ImGui::GetIO().DeltaTime;
-                if (jce_terrain_panel_brush_armed())
-                    jce_terrain_panel_apply_brush_world(hit[0], hit[2], dt);
-                else if (jce_foliage_brush_armed())
-                    jce_foliage_brush_apply_world(hit[0], hit[2], dt);
-                brush_consumed = true;
+    if (ctx.viewport_hovered && any_brush_armed &&
+        !ImGui::GetIO().KeyAlt && !jce_gizmo_is_active() &&
+        scene_view_build_brush_camera(ctx, &brush_camera,
+                                      brush_origin, brush_direction)) {
+        if (terrain_brush_armed) {
+            JceTerrain *active_terrain = jce_terrain_panel_get_terrain();
+            brush_hit_valid = scene_view_raycast_resident_terrain(
+                brush_origin, brush_direction, active_terrain,
+                &brush_hit, nullptr);
+            brush_hit_is_terrain = brush_hit_valid;
+        } else if (scene_view_raycast_resident_terrain(
+                       brush_origin, brush_direction, nullptr,
+                       &brush_hit, &has_resident_terrain)) {
+            brush_hit_valid = true;
+            brush_hit_is_terrain = true;
+        } else if (!has_resident_terrain &&
+                   fabsf(brush_direction[1]) > 1e-6f) {
+            const float distance = -brush_origin[1] / brush_direction[1];
+            if (distance > 0.0f) {
+                brush_hit.world[0] = brush_origin[0] +
+                                     brush_direction[0] * distance;
+                brush_hit.world[1] = 0.0f;
+                brush_hit.world[2] = brush_origin[2] +
+                                     brush_direction[2] * distance;
+                brush_hit_valid = true;
             }
         }
+
+        if (brush_hit_valid) {
+            if (terrain_brush_armed) {
+                scene_view_draw_terrain_brush_cursor(
+                    ctx, brush_camera, brush_hit,
+                    jce_terrain_panel_brush_radius(),
+                    scene_view_terrain_brush_color(
+                        jce_terrain_panel_brush_edit_flags()), true);
+            } else if (brush_hit_is_terrain) {
+                scene_view_draw_terrain_brush_cursor(
+                    ctx, brush_camera, brush_hit,
+                    jce_foliage_brush_radius(),
+                    IM_COL32(104, 224, 120, 235), false);
+            } else {
+                scene_view_draw_plane_brush_cursor(
+                    ctx, brush_camera, brush_hit.world,
+                    jce_foliage_brush_radius(),
+                    IM_COL32(104, 224, 120, 235));
+            }
+        }
+    }
+
+    const bool brush_owns_left = any_brush_armed &&
+        !ImGui::GetIO().KeyAlt && !jce_gizmo_is_active() &&
+        jce_scene_view_left_input_belongs_to_viewport(
+            ctx.viewport_left_clicked, ctx.viewport_active,
+            ImGui::IsMouseDown(ImGuiMouseButton_Left));
+    bool brush_consumed = brush_owns_left;
+    if (brush_owns_left && brush_hit_valid) {
+        const float dt = ImGui::GetIO().DeltaTime;
+        if (terrain_brush_armed)
+            jce_terrain_panel_apply_brush_local(
+                brush_hit.local[0], brush_hit.local[2], dt);
+        else if (foliage_brush_armed)
+            jce_foliage_brush_apply_world(
+                brush_hit.world[0], brush_hit.world[2], dt);
     }
     /* End the brush stroke when LMB is released so the next drag becomes a
      * fresh undo entry (no-op if no stroke is in progress). */

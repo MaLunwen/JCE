@@ -42,6 +42,20 @@ SAMPLERCUBE(s_prefilter, 7);
 // touches stage 5 for this draw, at which point either the shadows or the
 // shore data are silently wrong depending on bind order.
 SAMPLER2D(s_water_data, 4);
+
+/* PLANAR REFLECTION -- stage 8.
+ *
+ * Stage 8 because fs_water's free sampler slots are 0, 1, 6, 8, 13, 14, 15,
+ * measured with `jce.py shader-inspect`; fs_pbr's sixteen are all taken,
+ * which is why a planar reflection lands on water and not on every surface.
+ *
+ * The texture is LAST FRAME'S mirrored render, projected with the matrix that
+ * rendered it -- u_water_planar_vp -- rather than with this frame's camera.
+ * Using this frame's would be wrong by exactly the camera motion, which is
+ * the artefact the one-frame delay is being honest about. */
+SAMPLER2D(s_water_planar, 8);
+uniform vec4 u_water_planar;     // x = on, y = intensity
+uniform mat4 u_water_planar_vp;
 SAMPLER2D(s_cloudShadow, 3);
 uniform vec4 u_cloudShadow;   // x=extent  yz=centre XZ  w=strength
 #include "cloud_shadow.sh"
@@ -55,6 +69,11 @@ uniform vec4 u_cloudShadow;   // x=extent  yz=centre XZ  w=strength
 uniform mat4 u_csmVP[4];
 uniform vec4 u_csmSplits;
 uniform vec4 u_csmParams;
+// Per-cascade world-units-per-shadow-texel scale, used to turn a normalized
+// shadow-depth difference into a penumbra width.  Written by jce_sr_shadow.c
+// from JceCsmData.depth_range; see pcss.sh.
+uniform vec4 u_csmPenumbra;
+
 uniform vec4 u_csmBiasScales;
 uniform vec4 u_shadowQuality;
 SAMPLER2D(s_csmShadow0,  9);
@@ -386,7 +405,7 @@ void main()
         }
         finalColor *= clamp(lit, vec3_splat(0.05), vec3_splat(1.25));
         if (u_iblParams.w < 0.5)
-            finalColor = pow(max(finalColor, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+            finalColor = pow(max(finalColor, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
         gl_FragColor = vec4(finalColor, clamp(finalAlpha, 0.0, 1.0));
         return;
     }
@@ -604,9 +623,44 @@ void main()
         alpha = mix(alpha, 1.0, clamp(foamAmt, 0.0, 1.0) * 0.7);
     }
 
+    // --- Planar reflection ---------------------------------------------
+    //
+    // Project the world position through the matrix the MIRRORED render used
+    // and sample the colour it produced.  Blended by Schlick's Fresnel over a
+    // water F0 of 0.02: at a grazing angle a lake is a mirror, from straight
+    // above it is nearly clear.  That is the whole reason a planar reflection
+    // is worth a second scene render -- a probe cannot vary with view angle
+    // and SSR has nothing above the horizon to reflect.
+    if (u_water_planar.x > 0.5)
+    {
+        vec4 pclip = mul(u_water_planar_vp, vec4(v_worldpos, 1.0));
+        if (pclip.w > 0.0)
+        {
+            vec2 puv = (pclip.xy / pclip.w) * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+            puv.y = 1.0 - puv.y;
+#endif
+            // Off the reflection target there is nothing to show; fade rather
+            // than clamp, or the edge of the render becomes a hard seam
+            // stretched across the water.
+            vec2 pedge = abs(puv * 2.0 - 1.0);
+            float pfade = 1.0 - clamp(max(pedge.x, pedge.y) * 8.0 - 7.0,
+                                      0.0, 1.0);
+            if (pfade > 0.0)
+            {
+                vec3 pv = normalize(u_cameraPos.xyz - v_worldpos);
+                float pc = clamp(dot(pv, normalize(v_normal)), 0.0, 1.0);
+                float pf = 0.02 + 0.98 * pow(1.0 - pc, 5.0);
+                vec3 prefl = texture2D(s_water_planar, puv).rgb;
+                color = mix(color, prefl,
+                            clamp(pf * u_water_planar.y * pfade, 0.0, 1.0));
+            }
+        }
+    }
+
     // --- Output (gamma unless feeding the tonemap pass) ----------------
     if (u_iblParams.w < 0.5)
-        color = pow(max(color, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+        color = pow(max(color, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
 
     gl_FragColor = vec4(color, alpha);
 }

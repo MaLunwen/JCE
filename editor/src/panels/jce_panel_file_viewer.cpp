@@ -71,8 +71,8 @@ static struct {
     int   tab_count;
     int   active_tab;
     bool  want_focus;
-    int   select_tab_req;  /* >= 0: switch to this tab index next draw */
-    bool  request_autoplay; /* one-shot: auto-play when re-selecting A/V tab */
+    int   select_tab_req = -1;  /* >= 0: switch to this tab index next draw */
+    char  autoplay_path[512];   /* explicit open only; restored tabs stay paused */
 } s_fv;
 
 /* ── Per-project open-tab persistence ────────────────────────────────
@@ -136,6 +136,8 @@ static void fv_close_tab(int idx)
     if (idx < 0 || idx >= s_fv.tab_count) return;
 
     FvTab *tab = &s_fv.tabs[idx];
+    if (strcmp(s_fv.autoplay_path, tab->path) == 0)
+        s_fv.autoplay_path[0] = '\0';
 
     /* Cleanup viewer-specific state */
     if (tab->type == JCE_FV_MODEL)
@@ -155,6 +157,9 @@ static void fv_close_tab(int idx)
     for (int i = idx; i < s_fv.tab_count - 1; i++)
         s_fv.tabs[i] = s_fv.tabs[i + 1];
     s_fv.tab_count--;
+    if (s_fv.select_tab_req == idx) s_fv.select_tab_req = -1;
+    else if (s_fv.select_tab_req > idx) --s_fv.select_tab_req;
+    if (s_fv.active_tab > idx) --s_fv.active_tab;
     memset(&s_fv.tabs[s_fv.tab_count], 0, sizeof(FvTab));
 
     if (s_fv.active_tab >= s_fv.tab_count)
@@ -251,7 +256,7 @@ static bool fv_looks_like_text(const char *data, int len)
 static void fv_open_info_tab(const char *open_path,
                              const char *name,
                              const char *ext,
-                             long file_size,
+                             uint64_t file_size,
                              const char *message)
 {
     size_t msg_len;
@@ -288,6 +293,7 @@ static void fv_open_info_tab(const char *open_path,
     tab->zoom = 0.0f;  /* 0 = fit on first render (zoomable helper auto-fits) */
 
     s_fv.active_tab = s_fv.tab_count;
+    if (!s_fv_restoring) s_fv.select_tab_req = s_fv.tab_count;
     s_fv.tab_count++;
     fv_tabs_persist();
     if (!s_fv_restoring) {
@@ -320,6 +326,8 @@ JceFileViewerType jce_file_viewer_detect_type(const char *path)
 static void fv_open_internal(const char *path, bool force_text, int goto_line)
 {
     if (!path || !path[0]) return;
+    if (!s_fv_restoring) fv_tabs_restore_once();
+    if (!s_fv_restoring) s_fv.autoplay_path[0] = '\0';
 
     std::string normalized = normalize_path_string(path);
     const char *open_path = normalized.empty() ? path : normalized.c_str();
@@ -353,8 +361,11 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
             FvTab *tab = &s_fv.tabs[i];
             s_fv.select_tab_req = i;
             s_fv.want_focus = true;
-            s_fv.request_autoplay = true;
             *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+            if (!force_text && (tab->type == JCE_FV_AUDIO
+                                || tab->type == JCE_FV_VIDEO))
+                snprintf(s_fv.autoplay_path, sizeof(s_fv.autoplay_path),
+                         "%s", tab->path);
             if (force_text) {
                 /* Refresh from disk so a just-saved file shows its latest
                  * text, then arm the jump.  Never side-load the scene. */
@@ -365,7 +376,7 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
                     ED_FREE(tab->content);
                     tab->content     = buf;
                     tab->content_len = (int)got;
-                    tab->file_size   = (long)total;
+                    tab->file_size   = (uint64_t)total;
                     fv_code_invalidate_index(tab);
                     if (tab->edit_buf) { ED_FREE(tab->edit_buf); tab->edit_buf = NULL; }
                     tab->edit_mode = false;
@@ -411,13 +422,15 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
             "file viewer: cannot open '%s'", open_path);
         return;
     }
-    long file_size = (long)file_size_u64;
+    const uint64_t file_size = file_size_u64;
 
-    if (file_size > FV_MAX_ASSET_BYTES) {
+    JceFileViewerType ftype = force_text ? JCE_FV_TEXT : fv_detect_ext(ext);
+    const bool streaming_media = ftype == JCE_FV_AUDIO || ftype == JCE_FV_VIDEO;
+    if (!streaming_media && file_size > FV_MAX_ASSET_BYTES) {
         char info_msg[384];
         jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-            "file viewer: '%s' is too large (%ld bytes). Max single asset is %d MB.",
-            open_path, file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
+            "file viewer: '%s' is too large (%llu bytes). Max single asset is %d MB.",
+            open_path, (unsigned long long)file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
 
         snprintf(info_msg, sizeof(info_msg),
             jce_editor_i18n_or("fileViewer.info.tooLarge",
@@ -433,28 +446,16 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
         return;
     }
 
-    JceFileViewerType ftype = fv_detect_ext(ext);
-    if (force_text)
-        ftype = JCE_FV_TEXT;   /* raw source view: text cap + code renderer */
 
     int read_size;
     if (ftype == JCE_FV_IMAGE)
         read_size = (int)file_size;
-    else if (ftype == JCE_FV_AUDIO)
-        read_size = (int)file_size;
-    else if (ftype == JCE_FV_VIDEO) {
-        /* Video is decoded in-engine (jce_video) from the full byte
-         * buffer.  Respect the shared FV_MAX_ASSET_BYTES (128 MB) cap
-         * that also governs audio/model loads.  (TODO: stream large video
-         * from tab->path instead of a whole-file read — audit F96.) */
-        const long video_cap = FV_MAX_ASSET_BYTES;
-        read_size = (file_size > video_cap) ? (int)video_cap
-                                            : (int)file_size;
-    }
+    else if (streaming_media)
+        read_size = 0; /* media viewer owns a file source, never tab bytes */
     else if (ftype == JCE_FV_MODEL) {
         /* Keep model bytes up to the global per-asset cap so GLB files
          * can be inspected consistently in the model viewer. */
-        const long model_cap = FV_MAX_ASSET_BYTES;
+        const uint64_t model_cap = FV_MAX_ASSET_BYTES;
         read_size = (file_size > model_cap) ? (int)model_cap : (int)file_size;
     }
     else
@@ -463,9 +464,13 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
     /* Read file (capped at FV_MAX_ASSET_BYTES already validated above
      * via stat helper before opening — see file_size check earlier). */
     size_t got = 0, total = 0;
-    char *buf = (char *)ed_read_file_capped(open_path,
-                                            (size_t)read_size,
-                                            &got, &total);
+    char *buf;
+    if (streaming_media) {
+        buf = (char *)ED_MALLOC(1u);
+        if (buf) buf[0] = '\0';
+    } else {
+        buf = (char *)ed_read_file_capped(open_path,(size_t)read_size,&got,&total);
+    }
     if (!buf) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "file viewer: cannot open '%s'", open_path);
@@ -623,6 +628,7 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
     }
 
     s_fv.active_tab = s_fv.tab_count;
+    if (!s_fv_restoring) s_fv.select_tab_req = s_fv.tab_count;
     s_fv.tab_count++;
     fv_tabs_persist();
 
@@ -630,6 +636,9 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
      * a startup tab restore must stay silent. */
     if (!s_fv_restoring) {
         s_fv.want_focus = true;
+        if (ftype == JCE_FV_AUDIO || ftype == JCE_FV_VIDEO)
+            snprintf(s_fv.autoplay_path, sizeof(s_fv.autoplay_path),
+                     "%s", tab->path);
 
         *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
 
@@ -684,7 +693,6 @@ void jce_file_viewer_draw_content(void)
     }
 
     ImGuiTabBarFlags bar_flags = ImGuiTabBarFlags_Reorderable
-                               | ImGuiTabBarFlags_AutoSelectNewTabs
                                | ImGuiTabBarFlags_FittingPolicyScroll
                                | ImGuiTabBarFlags_TabListPopupButton;
 
@@ -704,42 +712,23 @@ void jce_file_viewer_draw_content(void)
             }
         }
 
-        /* Programmatic tab selection: directly set the tab bar's selected ID
-         * so the switch happens this frame rather than after 2-frame scheduling. */
-        if (s_fv.select_tab_req >= 0 && s_fv.select_tab_req < s_fv.tab_count) {
-            const int req = s_fv.select_tab_req;
-            s_fv.select_tab_req = -1;
-            ImGuiTabBar *bar = ImGui::GetCurrentTabBar();
-            if (bar) {
-                FvTab *rt = &s_fv.tabs[req];
-                char req_title[80];
-                if (rt->modified)
-                    snprintf(req_title, sizeof(req_title), "%s *", rt->display_name);
-                else
-                    snprintf(req_title, sizeof(req_title), "%s", rt->display_name);
-                ImGui::PushID(req);
-                ImGuiID tid = ImGui::GetID(req_title);
-                ImGui::PopID();
-                /* Setting both ensures the switch happens this frame and persists. */
-                bar->SelectedTabId     = tid;
-                bar->NextSelectedTabId = tid;
-                bar->NextScrollToTabId = tid;
-            }
-        }
-
+        // Requests survive the first frame of a newly created tab.
         for (int i = 0; i < s_fv.tab_count; /* below */) {
             FvTab *tab = &s_fv.tabs[i];
-            ImGui::PushID(i);
+            ImGui::PushID(tab->path);
 
             /* Show modified indicator in tab title */
-            char tab_title[80];
+            char tab_title[sizeof(tab->path) + sizeof(tab->display_name) + 16];
             if (tab->modified)
-                snprintf(tab_title, sizeof(tab_title), "%s *", tab->display_name);
+                snprintf(tab_title, sizeof(tab_title), "%s *###%s", tab->display_name, tab->path);
             else
-                snprintf(tab_title, sizeof(tab_title), "%s", tab->display_name);
+                snprintf(tab_title, sizeof(tab_title), "%s###%s", tab->display_name, tab->path);
 
             bool tab_open = tab->open;
-            bool tab_selected = ImGui::BeginTabItem(tab_title, &tab_open);
+            const bool requested = s_fv.select_tab_req == i;
+            bool tab_selected = ImGui::BeginTabItem(tab_title, &tab_open,
+                requested ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None);
+            if (requested && tab_selected) s_fv.select_tab_req = -1;
 
             /* Right-click context menu on tab (must be right after BeginTabItem) */
             if (ImGui::BeginPopupContextItem("##tabctx")) {
@@ -821,25 +810,36 @@ void jce_file_viewer_draw_content(void)
      * regardless of whether the File Viewer window itself is focused. */
     fv_audio_update_focus(active_audio_path, true);
     fv_video_update_focus(active_video_path, true);
-
-    /* One-shot auto-play when the user re-opens an existing A/V tab. */
-    if (s_fv.request_autoplay) {
-        s_fv.request_autoplay = false;
-        if (s_fv.active_tab >= 0 && s_fv.active_tab < s_fv.tab_count) {
-            FvTab *at = &s_fv.tabs[s_fv.active_tab];
-            if (at->type == JCE_FV_AUDIO)
-                fv_audio_request_play(at->path);
-            else if (at->type == JCE_FV_VIDEO)
-                fv_video_request_play(at->path);
+    /* An explicit open (resource-browser double-click) focuses the viewer.
+     * Start only after its media tab is actually visible and loaded.  A
+     * restored tab never queues this request, and an obscured dock tab does
+     * not draw content, so it cannot start playback behind another panel. */
+    if (s_fv.autoplay_path[0]) {
+        /* Opt-in QA: open the ordinary viewer, leaving its media paused. */
+        const char *paused_probe = getenv("JCE_DBG_FILE_PREVIEW_PAUSED");
+        if (paused_probe && paused_probe[0] == '1')
+            s_fv.autoplay_path[0] = '\0';
+        else if (active_audio_path && strcmp(active_audio_path, s_fv.autoplay_path) == 0) {
+            fv_audio_request_play(active_audio_path);
+            s_fv.autoplay_path[0] = '\0';
+        } else if (active_video_path
+                   && strcmp(active_video_path, s_fv.autoplay_path) == 0) {
+            fv_video_request_play(active_video_path);
+            s_fv.autoplay_path[0] = '\0';
         }
     }
+}
+
+void jce_file_viewer_suspend_media(void)
+{
+    fv_audio_update_focus(NULL, false);
+    fv_video_update_focus(NULL, false);
 }
 
 void jce_file_viewer_draw_window(bool *p_visible)
 {
     if (!p_visible || !*p_visible) {
-        fv_audio_update_focus(NULL, false);
-        fv_video_update_focus(NULL, false);
+        jce_file_viewer_suspend_media();
         return;
     }
 
@@ -852,6 +852,11 @@ void jce_file_viewer_draw_window(bool *p_visible)
     snprintf(title, sizeof(title), "%s###file_viewer", jce_editor_i18n("File Viewer"));
     if (ImGui::Begin(title, p_visible, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_file_viewer_draw_content();
+    else {
+        /* Inactive dock tabs are not drawn.  Stop media that was playing
+         * before another bottom-panel tab took the foreground. */
+        jce_file_viewer_suspend_media();
+    }
     ImGui::End();
 }
 
@@ -874,6 +879,7 @@ void jce_file_viewer_close_all(void)
     s_fv.tab_count      = 0;
     s_fv.active_tab     = -1;
     s_fv.select_tab_req = -1;
+    s_fv.autoplay_path[0] = '\0';
     fv_tabs_persist();   /* no-op during shutdown (keep the saved list) */
 }
 

@@ -76,14 +76,15 @@ void jce_taa_advance(JceTaaState *s, uint32_t w, uint32_t h)
 void jce_taa_apply_jitter(jce_mat4 *proj, const float jitter[2])
 {
     if (!proj || !jitter) return;
-    /* Column-major: proj->m[col][row].  Sub-pixel translate in clip space
-       is done by adding to the w-row of x and y columns, i.e. m[2][0/1]
-       (post-multiply by the perspective matrix yields the same offset
-       in NDC after divide-by-w).  This matches the bgfx convention. */
-    float *m = JCE_M4_PTR(*proj);
-    /* Layout: m[col*4 + row]. (2,0) = m[8],  (2,1) = m[9]. */
-    m[8] += jitter[0];
-    m[9] += jitter[1];
+    /* Translate clip x/y by clip w before perspective division. The old
+     * m[8]/m[9]-only patch multiplied orthographic jitter by view depth,
+     * turning a sub-pixel sample into a multi-pixel camera shake. Preserve
+     * the existing RH perspective sign while handling either projection. */
+    for (int col = 0; col < 4; ++col) {
+        const float w = proj->raw[col][3];
+        proj->raw[col][0] -= jitter[0] * w;
+        proj->raw[col][1] -= jitter[1] * w;
+    }
 }
 
 void jce_taa_record_camera(JceTaaState *s,

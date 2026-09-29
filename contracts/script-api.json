@@ -3,13 +3,13 @@
   "_generated_by": "python tools/scriptgen/gen_script_bindings.py --write",
   "_note": "vtable_index is emitted for traceability only. No binding may key off it: the append-only rule plus the min(caller, engine) copy over a zeroed destination is what makes a short host safe, and a slot-indexed binding would defeat it.",
   "declared_totals": {
-    "host_members": 74,
-    "expose": 71,
-    "hand_written": 7,
+    "host_members": 105,
+    "expose": 101,
+    "hand_written": 8,
     "constants": 1,
-    "table_keys": 79,
-    "members_reached_by_generated": 70,
-    "members_reached_only_by_hand_written": 4
+    "table_keys": 110,
+    "members_reached_by_generated": 100,
+    "members_reached_only_by_hand_written": 5
   },
   "constants": [
     {
@@ -21,29 +21,35 @@
   ],
   "hand_written": [
     {
+      "name": "line_set_points",
+      "vtable": "line_set_points",
+      "since": 1,
+      "reason": "marshalling, not glue: the host takes a packed `const float *xyz, int count` and no generated shape reads a Lua array into one. Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and the returned stored-count live in one place. Exists because the comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key by walking the object's child list (jce_scene_components_render.c parse_line_renderer)"
+    },
+    {
       "name": "log",
       "vtable": "log",
       "since": 1,
-      "reason": "no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the only one among the 78"
+      "reason": "no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the only one among the 78"
     },
     {
       "name": "asset_read_text",
       "vtable": "read_file",
       "since": 1,
-      "reason": "policy, not glue: script_virtual_asset_path_valid (:66, called :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)"
+      "reason": "policy, not glue: script_virtual_asset_path_valid (:67, called :103), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:114), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)"
     },
     {
       "name": "asset_read_json",
       "vtable": "read_file",
       "since": 1,
-      "reason": "all of asset_read_text (the same script_virtual_asset_path_valid at :219) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)"
+      "reason": "all of asset_read_text (the same script_virtual_asset_path_valid at :220) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)"
     },
     {
       "name": "play_sound",
       "vtable": "play_sound",
       "since": 1,
       "also_reaches": "play_sound_spatial",
-      "reason": "arity dispatch across two members: lua_gettop at :263 routes to play_sound_spatial (:286) or play_sound (:289); its own comment at :280 concedes top == 3 is ambiguous"
+      "reason": "arity dispatch across two members: lua_gettop at :264 routes to play_sound_spatial (:287) or play_sound (:290); its own comment at :281 concedes top == 3 is ambiguous"
     },
     {
       "name": "start_coroutine",
@@ -70,7 +76,7 @@
       "vtable": "get_position",
       "shape": "fallible_out",
       "since": 1,
-      "doc": "World-space position of `entity`. Absent when the entity has no transform.",
+      "doc": "LOCAL position of `entity` -- its own translation, not composed up the parent chain. Absent when the entity has no transform. Use get_world_position for the composed pose. This doc said 'World-space' until 2026-08-26; the implementation always returned the local TRS (jce_scene_get_transform), and the wrong word was generated into all five language SDKs.",
       "vtable_index": 1,
       "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xyz[3])",
       "params": [
@@ -182,6 +188,30 @@
       "shape": "fallible_out",
       "since": 1,
       "vtable_index": 5,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xyz[3])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_xyz",
+          "c_type": "float",
+          "arity": 3
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_world_position",
+      "vtable": "get_world_position",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "WORLD position of `entity`: its local TRS composed up the parent chain (jce_scene_get_world_matrix). Absent when the entity has no transform. Every parented rig -- arms, jaws, fingers, pads -- needs this rather than get_position.",
+      "vtable_index": 74,
       "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xyz[3])",
       "params": [
         {
@@ -676,6 +706,104 @@
       "nullable_host_member": true
     },
     {
+      "name": "raycast_filtered",
+      "vtable": "raycast_filtered",
+      "shape": "fallible_out",
+      "since": 1,
+      "miss_value": 0,
+      "doc": "Closest hit along the ray, honouring a layer mask and the trigger skip -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every layer and hit_triggers defaults to false, so the common call stays origin/dir/distance and the filter is what you add when you need it. hit_triggers is separate from the mask because a trigger volume is not a layer: collapsing them would make 'ignore triggers on layer 3' inexpressible.",
+      "optional": {
+        "layer_mask": 0,
+        "hit_triggers": false
+      },
+      "vtable_index": 103,
+      "c_signature": "bool (*)(void *user, const float origin[3], const float dir[3], float max_dist, uint32_t layer_mask, bool hit_triggers, JceScriptRaycastHit *out)",
+      "params": [
+        {
+          "name": "origin",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "dir",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "max_dist",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "layer_mask",
+          "c_type": "uint32_t",
+          "role": "in"
+        },
+        {
+          "name": "hit_triggers",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptRaycastHit",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "raycast_all",
+      "vtable": "raycast_all",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Every entity the ray passes through, as one array sorted near to far. layer_mask 0 means every layer; hit_triggers defaults to false. Returns ENTITIES rather than full hit records because the eight-value hit does not survive as an array shape across seven languages without inventing a per-language container -- re-query a specific one with jce.raycast_filtered when you need its point and normal.",
+      "optional": {
+        "layer_mask": 0,
+        "hit_triggers": false
+      },
+      "vtable_index": 104,
+      "c_signature": "int (*)(void *user, const float origin[3], const float dir[3], float max_dist, uint32_t layer_mask, bool hit_triggers, JceScriptEntity *out, int max)",
+      "params": [
+        {
+          "name": "origin",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "dir",
+          "c_type": "const float",
+          "role": "in"
+        },
+        {
+          "name": "max_dist",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "layer_mask",
+          "c_type": "uint32_t",
+          "role": "in"
+        },
+        {
+          "name": "hit_triggers",
+          "c_type": "bool",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
       "name": "apply_impulse",
       "vtable": "apply_impulse",
       "shape": "void_call",
@@ -1158,6 +1286,51 @@
       "shape": "void_call",
       "since": 1,
       "vtable_index": 38,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float v)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_progress",
+      "vtable": "ui_get_progress",
+      "shape": "fallible_out",
+      "since": 1,
+      "vtable_index": 76,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float *out)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "float",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_progress",
+      "vtable": "ui_set_progress",
+      "shape": "void_call",
+      "since": 1,
+      "vtable_index": 77,
       "c_signature": "void (*)(void *user, JceScriptEntity e, float v)",
       "params": [
         {
@@ -1690,6 +1863,557 @@
         {
           "name": "volume",
           "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_dropdown",
+      "vtable": "ui_get_dropdown",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Selected option INDEX of `entity`'s UIDropdown. Absent when the entity has no dropdown, so a script can tell 'no dropdown' from 'a dropdown reading 0'. The index and not the label: branching on which option is the common case, and a label would make it a string compare.",
+      "vtable_index": 78,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, int *out)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "int",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_dropdown",
+      "vtable": "ui_set_dropdown",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Select an option by INDEX. Clamped into [0, option_count-1] rather than refused, the way ui_set_progress clamps and the way the scene loader clamps: the draw already clamps, so storing outside the range would make the component and the picture disagree.",
+      "vtable_index": 79,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, int index)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "index",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_input_text",
+      "vtable": "ui_get_input_text",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Current text of `entity`'s UIInputField, or '' when it has none. The string is the component's own buffer and is valid until the next mutation of that entity -- the same contract tr() and get_locale() carry; every binding copies it and none may store it.",
+      "vtable_index": 80,
+      "c_signature": "const char * (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_input_text",
+      "vtable": "ui_set_input_text",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Replace the UIInputField's text. Truncated to the field's capacity and to char_limit when one is set -- the same cap the canvas applies to typed input, so a script write and a keystroke cannot disagree about what the field holds. A truncation is logged rather than silent.",
+      "vtable_index": 81,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, const char * text)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "text",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_get_scroll",
+      "vtable": "ui_get_scroll",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units -- what the component stores and what the wheel path clamps, not device px. Absent when the entity has no scroll view.",
+      "vtable_index": 82,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, float out_xy[2])",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_xy",
+          "c_type": "float",
+          "arity": 2
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "ui_set_scroll",
+      "vtable": "ui_set_scroll",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Set the scroll offset in reference units. A disabled axis is pinned to 0 and each axis is clamped the way the wheel path clamps, so a script cannot push the offset somewhere a wheel could not; the canvas re-clamps against the resolved viewport on the next render.",
+      "vtable_index": 83,
+      "c_signature": "void (*)(void *user, JceScriptEntity e, float x, float y)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_get_hour",
+      "vtable": "world_get_hour",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Live hour of day in [0, 24) -- what the sky is showing now, NOT the authored tod_hour seed a scene starts from.  Reading the seed would return the level's start-of-day forever while the sky moved.",
+      "vtable_index": 84,
+      "c_signature": "float (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_set_hour",
+      "vtable": "world_set_hour",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Move the live clock, wrapping into [0, 24).  For 'sleep until dawn'.  The authored seed is untouched, so reloading the scene still starts where the designer set it.",
+      "vtable_index": 85,
+      "c_signature": "void (*)(void *user, float hour)",
+      "params": [
+        {
+          "name": "hour",
+          "c_type": "float",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_is_daytime",
+      "vtable": "world_is_daytime",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "True while the sun is above the horizon.  THE predicate for 'is it night?' -- every key-light chooser in the engine is required to agree on this one, so a script that rolled its own threshold would disagree with the lighting it can see.",
+      "vtable_index": 86,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_get_weather",
+      "vtable": "world_get_weather",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Authored weather type: 0 clear, 1 rain, 2 snow.",
+      "vtable_index": 87,
+      "c_signature": "int (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_get_weather_intensity",
+      "vtable": "world_get_weather_intensity",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Authored weather intensity in [0, 1].",
+      "vtable_index": 88,
+      "c_signature": "float (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "world_get_wind_speed",
+      "vtable": "world_get_wind_speed",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Instantaneous wind speed in m/s -- the sustained speed plus this moment's gust.  Do NOT key a cache on it: it changes every frame by design.  It is the same number the ocean spectrum and the vegetation shader read, so a script cannot disagree with what is on screen.",
+      "vtable_index": 89,
+      "c_signature": "float (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "request_scene",
+      "vtable": "request_scene",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 90,
+      "c_signature": "bool (*)(void *user, const char * scene_path)",
+      "params": [
+        {
+          "name": "scene_path",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "is_transitioning",
+      "vtable": "is_transitioning",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 91,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "audio_play",
+      "vtable": "audio_play",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 92,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "audio_stop",
+      "vtable": "audio_stop",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 93,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "audio_is_playing",
+      "vtable": "audio_is_playing",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 94,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "save_game",
+      "vtable": "save_game",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 95,
+      "c_signature": "bool (*)(void *user, const char * path)",
+      "params": [
+        {
+          "name": "path",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "load_game",
+      "vtable": "load_game",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 96,
+      "c_signature": "bool (*)(void *user, const char * path)",
+      "params": [
+        {
+          "name": "path",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "overlap_sphere",
+      "vtable": "overlap_sphere",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Entities whose collider overlaps the sphere, as one array. layer_mask 0 means all layers. Triggers are skipped. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size.",
+      "optional": {
+        "layer_mask": 0
+      },
+      "vtable_index": 97,
+      "c_signature": "int (*)(void *user, float x, float y, float z, float radius, uint32_t layer_mask, JceScriptEntity *out, int max)",
+      "params": [
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "radius",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "layer_mask",
+          "c_type": "uint32_t",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "overlap_box",
+      "vtable": "overlap_box",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Entities whose collider overlaps the axis-aligned box (half-extents), as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size.",
+      "optional": {
+        "layer_mask": 0
+      },
+      "vtable_index": 98,
+      "c_signature": "int (*)(void *user, float x, float y, float z, float hx, float hy, float hz, uint32_t layer_mask, JceScriptEntity *out, int max)",
+      "params": [
+        {
+          "name": "x",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "y",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "z",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "hx",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "hy",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "hz",
+          "c_type": "float",
+          "role": "in"
+        },
+        {
+          "name": "layer_mask",
+          "c_type": "uint32_t",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_param",
+      "vtable": "get_script_param",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Returns kind, number, entity for an AUTHORED script parameter -- Unity's [SerializeField], Godot's @export.  Returns nil when the entity has no script component, when no parameter of that name is authored, or when the name is empty: three absences a script cannot act differently on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author expects.",
+      "vtable_index": 100,
+      "c_signature": "bool (*)(void *user, JceScriptEntity e, const char * name, int *out_kind, double *out_number, JceScriptEntity *out_entity)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_kind",
+          "c_type": "int",
+          "arity": -1
+        },
+        {
+          "name": "out_number",
+          "c_type": "double",
+          "arity": -1
+        },
+        {
+          "name": "out_entity",
+          "c_type": "JceScriptEntity",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_param_text",
+      "vtable": "get_script_param_text",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "The TEXT value of an authored script parameter, or '' when the entity has no script component, no parameter of that name, or one that is not text. Empty rather than nil for the same reason ui_get_input_text is empty: a script comparing strings should not have to test for nil first. The string is the component's own buffer -- copy it if you keep it.",
+      "vtable_index": 101,
+      "c_signature": "const char * (*)(void *user, JceScriptEntity e, const char * name)",
+      "params": [
+        {
+          "name": "e",
+          "c_type": "JceScriptEntity",
+          "role": "in"
+        },
+        {
+          "name": "name",
+          "c_type": "const char *",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "curve_eval",
+      "vtable": "curve_eval",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Sample an AUTHORED curve -- the documents the editor's Curve Editor writes, which nothing could read until this binding existed. Unity's AnimationCurve shape: the curve is a designer-authored function and the script decides what it means, so the engine never has to invent what a curve DRIVES. Returns nil when the path does not resolve, the document does not parse, the named channel is absent, or that channel has no keys -- so a curve that genuinely evaluates to 0 and a curve that is not there are never one reading, and `jce.curve_eval(p, 'kick', t) or 0.0` reads the way an author expects. An empty channel name means the FIRST channel, which is a different request from a name that is not there. The parsed curve is cached per runtime, so a call inside on_update costs a name compare, not a JSON parse.",
+      "vtable_index": 102,
+      "c_signature": "bool (*)(void *user, const char * path, const char * channel, double t, double *out_value)",
+      "params": [
+        {
+          "name": "path",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "channel",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "t",
+          "c_type": "double",
+          "role": "in"
+        }
+      ],
+      "out_params": [
+        {
+          "name": "out_value",
+          "c_type": "double",
+          "arity": -1
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "vcam_activate",
+      "vtable": "vcam_activate",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Cut to the virtual camera with this name, ahead of priority.  Returns 1 when the name resolves to a camera that is active and enabled, 0 otherwise -- the request is recorded either way, so naming a camera in a streaming cell that has not loaded yet does not silently become 'whatever priority says'.  Pass an empty string to clear it and hand the decision back to priority.  It does NOT rewrite the authored components: the override lives in the vcam system, so a cutscene cannot bake its camera choice into the level file.",
+      "vtable_index": 99,
+      "c_signature": "int (*)(void *user, const char * name)",
+      "params": [
+        {
+          "name": "name",
+          "c_type": "const char *",
           "role": "in"
         }
       ],

@@ -44,6 +44,12 @@ typedef enum {
     JCE_INPUT_EVENT_DEVICE_AXIS,
     JCE_INPUT_EVENT_DEVICE_HAT,
     JCE_INPUT_EVENT_DEVICE_POWER,
+    /* APPENDED (never reordered -- these are wire values).  Carries the
+     * composed UTF-8 the platform's text/IME layer produced, which is a
+     * different thing from a keycode: one keystroke can produce several
+     * bytes, an IME commit can produce several codepoints at once, and a
+     * scancode cannot express either. */
+    JCE_INPUT_EVENT_TEXT,
     JCE_INPUT_EVENT_KIND_COUNT
 } JceInputEventKind;
 
@@ -122,6 +128,13 @@ typedef struct JceInputDevicePowerEvent {
     int32_t  percent, state;
 } JceInputDevicePowerEvent;
 
+/* Composed text, NUL-terminated UTF-8.  32 bytes is SDL_TextInputEvent's own
+ * payload size and fits the 56-byte union with room to spare; a longer IME
+ * commit arrives as several events, which is why the consumer appends. */
+typedef struct JceInputTextEvent {
+    char utf8[32];
+} JceInputTextEvent;
+
 /* Size-prefix contract: the caller sets `size` to sizeof(JceInputEvent); a
  * receiver REFUSES any record whose size is below this constant rather than
  * silently accepting a short one. */
@@ -155,6 +168,7 @@ typedef struct JceInputEvent {
         JceInputDeviceAxisEvent      daxis;
         JceInputDeviceHatEvent       dhat;
         JceInputDevicePowerEvent     dpower;
+        JceInputTextEvent            text;
         uint8_t                      raw[56];
     };
 } JceInputEvent;

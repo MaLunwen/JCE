@@ -23,6 +23,9 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <ft2build.h>
+#include FT_MODULE_H   /* FT_Property_Set - the SDF renderer spread */
+#include "renderer/jce_text_shape.h"
+
 #include <SDL3/SDL.h>
 #include FT_FREETYPE_H
 #include <hb-ft.h>
@@ -94,7 +97,129 @@ struct JceFont {
     int         dyn_pen_x, dyn_pen_y; /* shelf packer cursor                */
     int         dyn_row_h;            /* current shelf row height           */
     bool        dyn_full;            /* atlas exhausted (stop rasterizing)  */
+    /* 0 = the glyph bitmaps hold COVERAGE (what a font has always held here).
+     * > 0 = they hold a signed DISTANCE FIELD with this spread in pixels, so
+     * one atlas stays crisp at any size instead of softening as it is scaled
+     * up.  Captured at open because the atlas is built there; a font cannot
+     * change its mind later without rebuilding every glyph. */
+    int         sdf_spread;
+
+    /* -- Fallback chain ------------------------------------------------
+     *
+     * A font that lacks a codepoint rasterises .notdef -- a tofu box -- and
+     * the file already said so about U+0020.  For a Latin UI font in front of
+     * a Chinese, Japanese or Korean string that is EVERY character, which is
+     * the shipping state this chain ends.
+     *
+     * NOT OWNED.  A fallback is an ordinary JceFont the caller opened and
+     * closes; sharing one CJK face across every UI font is the normal case and
+     * copying it per font would be a second atlas each time.  jce_font_close
+     * therefore does not close them -- it only drops this font's shaped runs,
+     * which is what the shape cache keys on. */
+    JceFont    *fallback[JCE_FONT_MAX_FALLBACKS];
+    uint8_t     fallback_count;
+    /* Bumped whenever the chain changes.  The shape cache keys on it: the same
+     * bytes shape differently once a fallback can claim some of them, and a
+     * run cached before the fallback was added would otherwise be served for
+     * the life of the process. */
+    uint32_t    chain_generation;
 };
+
+/* -- The chain, as the shape cache's two questions ------------------- */
+
+static uint8_t font_slot_for_codepoint(void *ctx, uint32_t cp)
+{
+    JceFont *f = (JceFont *)ctx;
+    if (!f) return 0u;
+    /* The PRIMARY wins whenever it can draw the character, so adding a
+     * fallback cannot change how any string that already rendered looks. */
+    if (f->ft_face && FT_Get_Char_Index(f->ft_face, (FT_ULong)cp) != 0)
+        return 0u;
+    for (uint8_t i = 0; i < f->fallback_count; i++) {
+        JceFont *fb = f->fallback[i];
+        if (fb && fb->ft_face &&
+            FT_Get_Char_Index(fb->ft_face, (FT_ULong)cp) != 0)
+            return (uint8_t)(i + 1u);
+    }
+    /* Nothing has it.  Slot 0, so the primary draws its own .notdef -- the
+     * honest answer, and the behaviour that shipped before there was a chain. */
+    return 0u;
+}
+
+static hb_font_t *font_hb_for_slot(void *ctx, uint8_t slot)
+{
+    JceFont *f = (JceFont *)ctx;
+    if (!f) return NULL;
+    if (slot == 0) return f->hb_font;
+    if (slot > f->fallback_count) return NULL;
+    JceFont *fb = f->fallback[slot - 1u];
+    return fb ? fb->hb_font : NULL;
+}
+
+/* The JceFont a shaped glyph's slot names -- the atlas side of the same
+ * question.  Used by the draw loop; a draw that ignored it would rasterise
+ * every fallback glyph out of the primary's atlas, i.e. tofu with correct
+ * spacing, which looks like a font problem rather than a wiring one. */
+static JceFont *font_for_slot(JceFont *f, uint8_t slot)
+{
+    if (!f || slot == 0 || slot > f->fallback_count) return f;
+    JceFont *fb = f->fallback[slot - 1u];
+    return fb ? fb : f;
+}
+
+/* const in, because jce_text_measure is a reader and has a const font.  The
+ * cast is safe by inspection and not merely by convention: both callbacks only
+ * READ -- FT_Get_Char_Index and a pointer fetch -- and neither can reach the
+ * dynamic-atlas rasteriser, which is the one thing on this struct a draw
+ * mutates. */
+static JceTextFontChain font_chain(const JceFont *f)
+{
+    JceTextFontChain c;
+    c.ctx                = (void *)(uintptr_t)f;
+    c.slot_for_codepoint = font_slot_for_codepoint;
+    c.font_for_slot      = font_hb_for_slot;
+    c.generation         = f ? f->chain_generation : 0u;
+    return c;
+}
+
+bool jce_font_add_fallback(JceFont *font, JceFont *fallback)
+{
+    if (!font || !fallback || font == fallback) return false;
+    if (font->fallback_count >= JCE_FONT_MAX_FALLBACKS) return false;
+    /* One level only, and refused rather than flattened: a chain of chains
+     * would make "which font drew this glyph" depend on a walk the shaped run
+     * has no room to record, and the slot in JceShapedGlyph is one byte
+     * indexing THIS font's list. */
+    if (fallback->fallback_count > 0) return false;
+    for (uint8_t i = 0; i < font->fallback_count; i++)
+        if (font->fallback[i] == fallback) return true;   /* idempotent */
+    font->fallback[font->fallback_count++] = fallback;
+    font->chain_generation++;
+    /* Every run this font has already shaped was itemized against the OLD
+     * chain.  Dropping them is not an optimisation to skip: without it a label
+     * drawn before the fallback was added keeps its tofu forever. */
+    jce_text_shape_forget(font);
+    return true;
+}
+
+
+/* Requested for the NEXT font opened, not for fonts already open -- the atlas
+ * is rasterised during open.  Same shape as jce_ui_canvas_set_default_font,
+ * which this subsystem already uses for a process-scoped authoring choice.
+ * 0 restores the bitmap path. */
+static int s_next_sdf_spread = 0;
+
+void jce_font_set_sdf_spread(int spread_px)
+{
+    if (spread_px < 0)  spread_px = 0;
+    if (spread_px > 64) spread_px = 64;   /* FreeType's own ceiling */
+    s_next_sdf_spread = spread_px;
+}
+
+int jce_font_sdf_spread(const JceFont *font)
+{
+    return font ? font->sdf_spread : 0;
+}
 
 /* -- UTF-8 helpers ------------------------------------------------- */
 
@@ -151,6 +276,25 @@ static const GlyphInfo *font_get_glyph(const JceFont *font, uint32_t cp)
     return glyph_map_find(font->dyn_map, font->dyn_cap, cp);
 }
 
+/* Load and render ONE glyph, as coverage or as a distance field.
+ *
+ * ONE helper for both atlas paths on purpose.  If the static ASCII atlas and
+ * the dynamic overflow atlas chose their render mode separately, the day they
+ * disagreed a codepoint outside ASCII would come out as a grey block on a page
+ * of crisp text -- the SDF shader reading coverage texels -- and nothing would
+ * say why.
+ *
+ * FT_LOAD_RENDER is deliberately NOT used here: it renders with the driver's
+ * default mode, and the SDF renderer has to be asked for by name. */
+static FT_Error text_render_glyph(FT_Face face, uint32_t cp, int spread)
+{
+    FT_Error err = FT_Load_Char(face, cp, FT_LOAD_DEFAULT);
+    if (err) return err;
+    return FT_Render_Glyph(face->glyph,
+                           spread > 0 ? FT_RENDER_MODE_SDF
+                                      : FT_RENDER_MODE_NORMAL);
+}
+
 /* -- Dynamic overflow atlas: rasterize any codepoint on demand ------- */
 
 /* Rasterize `cp` via FreeType and pack it into the font's dynamic atlas,
@@ -181,7 +325,7 @@ static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
         font->dyn_full = true; return NULL;
     }
 
-    if (FT_Load_Char(font->ft_face, cp, FT_LOAD_RENDER) != 0)
+    if (text_render_glyph(font->ft_face, cp, font->sdf_spread) != 0)
         return NULL;
     FT_GlyphSlot slot = font->ft_face->glyph;
     int bw = (int)slot->bitmap.width;
@@ -270,7 +414,7 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
         uint32_t cp = (i < GLYPH_COUNT) ? (uint32_t)(GLYPH_FIRST + i)
                                          : extra_cps[i - GLYPH_COUNT];
 
-        FT_Error err = FT_Load_Char(face, cp, FT_LOAD_RENDER);
+        FT_Error err = text_render_glyph(face, cp, font->sdf_spread);
         if (err) continue;
 
         FT_GlyphSlot slot = face->glyph;
@@ -494,6 +638,18 @@ static JceFont *font_open_from_memory(void *buf, size_t size,
 
     font->ft_face   = face;
     font->font_data = buf; /* keep alive — FreeType references it */
+    /* Captured HERE, not read at draw time: build_atlas below rasterises with
+     * it, so a font that changed its mind later would have an atlas that
+     * disagreed with its own shader. */
+    font->sdf_spread = s_next_sdf_spread;
+    if (font->sdf_spread > 0) {
+        /* FreeType s SDF renderer takes its spread as a module property, not
+         * a per-call argument, so it is set per open rather than per glyph.
+         * A failure here is not fatal: the module keeps its default spread
+         * and the glyphs are still a distance field, just a different one. */
+        FT_Int spread = (FT_Int)font->sdf_spread;
+        FT_Property_Set(s_ft_lib, "sdf", "spread", &spread);
+    }
     font->line_height = (int)(face->size->metrics.height >> 6);
     font->ascender    = (int)(face->size->metrics.ascender >> 6);
     /* A zero-initialized bgfx texture handle has idx 0 — which reads as
@@ -550,6 +706,11 @@ JceFont *jce_font_open_file_ex(const char *host_path, float pt_size,
 void jce_font_close(JceFont *font)
 {
     if (!font) return;
+    /* The shape cache keys on this pointer.  Leaving its runs behind would
+     * hand them to whatever is allocated at this address next. */
+    jce_text_shape_forget(font);
+    /* The fallbacks are NOT owned -- see the chain's note on JceFont. */
+    font->fallback_count = 0;
     jce_texture_destroy(font->atlas);
     if (jce_texture_valid(font->dyn_atlas)) jce_texture_destroy(font->dyn_atlas);
     if (font->hb_font)  hb_font_destroy(font->hb_font);
@@ -563,6 +724,25 @@ void jce_font_close(JceFont *font)
 
 void jce_text_shutdown(void)
 {
+    /* Report the shape cache before dropping it.
+     *
+     * "It caches" is a claim about COUNTS, and the pixels are identical either
+     * way -- a cache that silently stopped hitting would look exactly like one
+     * that works.  One line at shutdown is the cheapest place the claim can be
+     * checked in a real run rather than only in a unit test: every headless
+     * capture already keeps the engine's stdout, so the number is in the log
+     * beside every measurement. */
+    {
+        uint64_t hits = 0, misses = 0;
+        jce_text_shape_stats(&hits, &misses);
+        if (hits || misses)
+            LOG_INFO(LOG_TAG,
+                     "shape cache: %llu hit(s), %llu HarfBuzz shape(s) "
+                     "(%.1f%% served from cache)",
+                     (unsigned long long)hits, (unsigned long long)misses,
+                     100.0 * (double)hits / (double)(hits + misses));
+    }
+    jce_text_shape_shutdown();
     if (s_ft_lib) {
         FT_Done_FreeType(s_ft_lib);
         s_ft_lib = NULL;
@@ -583,6 +763,123 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
     jce_text_draw_scaled_view(r, font, JCE_VIEW_UI, x, y, scale, text, color);
 }
 
+/* The transform in force for the glyph batches of the CURRENT draw.
+ *
+ * A pointer rather than a value, and NULL when unarmed, so the untransformed
+ * path submits through exactly the call it always did -- a line of text is
+ * hundreds of glyph quads and "identity applied 400 times" is not the same
+ * thing as "not applied".
+ *
+ * It is file-scope for the same reason jce_model.c's material override is:
+ * this function shapes and batches internally and has no per-glyph place to
+ * thread a parameter through, and the arming is one assignment either side of
+ * one call on the render thread. */
+/* Both BORROWED for the duration of one draw call and cleared at its end --
+ * the plumbing between the public entry point and the batch flush two frames
+ * down, not state anybody sets and leaves.  The style joined the transform
+ * here rather than becoming a mode with a setter, which is why there is
+ * nothing for the next label to inherit. */
+static const JceRectXform *s_text_xf    = NULL;
+static const JceTextStyle *s_text_style = NULL;
+
+/* Draw one run of glyph quads with the program that matches how the atlas was
+ * rasterised.
+ *
+ * ONE helper because there are TWO drains -- the mid-run one when the batch
+ * fills or the atlas changes, and the final one -- and two sites choosing
+ * independently is how the last 128 glyphs of a paragraph end up drawn
+ * differently from the rest.
+ *
+ * THE SMOOTHING WIDTH IS COMPUTED HERE, NOT IN THE SHADER.  The usual
+ * formulation takes it from fwidth(), which needs derivatives this engine's
+ * ES 2.0 / GL 2.1 floor does not guarantee.  Here the CPU already knows the
+ * number.  Working it out rather than guessing, because the first version of
+ * this line was out by exactly a factor of two and the measurement said so:
+ * the atlas stores distance normalised so the outline is 0.5 and one atlas
+ * pixel spans 0.5/spread of it.  smoothstep(edge-w, edge+w, d) transitions
+ * over 2w of distance, which is 2w / (0.5/spread) = 4*w*spread atlas pixels,
+ * or 4*w*spread*scale SCREEN pixels.  Setting that to one screen pixel gives
+ *
+ *     w = 0.25 / (spread * scale)
+ *
+ * 0.5/(spread*scale) -- the value that reads right and is wrong -- spreads the
+ * edge over TWO screen pixels, and at 1:1 that measured 2.34x the bitmap
+ * path's edge width instead of matching it.
+ *
+ * Falling back to the coverage program when the SDF one is missing would draw
+ * distance texels as alpha -- a grey slab per glyph.  Better to draw nothing
+ * and let the missing-shader warning be the explanation. */
+static void text_flush_batch(const JceRenderer *r, uint16_t view_id,
+                             const JceQuad2D *batch, uint32_t n,
+                             JceTexture tex, const JceFont *font, float scale)
+{
+    const uint32_t aw = font ? font->atlas_w : 0u;
+    const uint32_t ah = font ? font->atlas_h : 0u;
+    if (n == 0) return;
+    const int spread = font ? font->sdf_spread : 0;
+    if (spread <= 0) {
+        jce_draw_textured_quads_view_xf(r, view_id, batch, n, tex,
+                                        s_text_xf);
+        return;
+    }
+    const float px = (scale > 0.0f) ? scale : 1.0f;
+
+    JceTextSdfStyle st;
+    memset(&st, 0, sizeof st);
+    st.smoothing = 0.25f / ((float)spread * px);
+    st.edge      = 0.5f;
+
+    if (s_text_style) {
+        /* PIXELS IN, DISTANCE OUT.  An author sets an outline in pixels of the
+         * drawn glyph, because that is the only unit they can see; the shader
+         * thresholds a normalised distance.  One atlas pixel spans 0.5/spread
+         * of that distance, and `px` screen pixels cover one atlas pixel, so a
+         * width of W drawn pixels is W * 0.5 / (spread * px).  Same derivation
+         * as the smoothing above, which is why they sit together. */
+        const float per_px = 0.5f / ((float)spread * px);
+        st.outline_width = s_text_style->outline_width * per_px;
+        for (int i = 0; i < 4; i++) {
+            st.outline_rgba[i] = s_text_style->outline_color[i];
+            st.shadow_rgba[i]  = s_text_style->shadow_color[i];
+        }
+        /* The shadow offset is in TEXTURE space so the shader never needs the
+         * atlas dimensions.  It is also in the ATLAS's pixels, not the screen's
+         * -- an offset of N drawn pixels is N/scale atlas pixels. */
+        if (aw > 0u && ah > 0u) {
+            st.shadow_uv[0] = (s_text_style->shadow_offset[0] / px) / (float)aw;
+            st.shadow_uv[1] = (s_text_style->shadow_offset[1] / px) / (float)ah;
+        }
+    }
+
+    (void)jce_draw_text_sdf_quads_view_xf(r, view_id, batch, n, tex,
+                                          s_text_xf, &st);
+}
+
+
+void jce_text_draw_styled_view_xf(const JceRenderer *r, JceFont *font,
+                                  uint16_t view_id,
+                                  float x, float y, float scale,
+                                  const char *text, uint32_t color,
+                                  const JceRectXform *xf,
+                                  const JceTextStyle *style)
+{
+    s_text_xf    = xf;
+    s_text_style = style;
+    jce_text_draw_scaled_view(r, font, view_id, x, y, scale, text, color);
+    s_text_style = NULL;
+    s_text_xf    = NULL;
+}
+
+void jce_text_draw_scaled_view_xf(const JceRenderer *r, JceFont *font,
+                                  uint16_t view_id,
+                                  float x, float y, float scale,
+                                  const char *text, uint32_t color,
+                                  const JceRectXform *xf)
+{
+    jce_text_draw_styled_view_xf(r, font, view_id, x, y, scale, text, color,
+                                 xf, NULL);
+}
+
 void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
                                uint16_t view_id,
                                float x, float y, float scale,
@@ -591,25 +888,55 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
     if (!r || !font || !text || !font->hb_font) return;
     if (!jce_texture_valid(font->atlas)) return;
 
-    /* Use HarfBuzz for text shaping. */
-    hb_buffer_t *hb_buf = hb_buffer_create();
-    hb_buffer_add_utf8(hb_buf, text, -1, 0, -1);
-    hb_buffer_guess_segment_properties(hb_buf);
-    hb_shape(font->hb_font, hb_buf, NULL, 0);
-
-    unsigned int glyph_count;
-    hb_glyph_info_t     *glyph_info = hb_buffer_get_glyph_infos(hb_buf, &glyph_count);
-    hb_glyph_position_t *glyph_pos  = hb_buffer_get_glyph_positions(hb_buf, &glyph_count);
+    /* Shaping is a pure function of (font, text) -- `scale` is applied to the
+     * fixed-point values BELOW, not inside HarfBuzz -- so a label whose string
+     * has not changed has nothing to recompute.  It was recomputed every
+     * frame, and twice per frame for anything that measures before it draws.
+     * See renderer/jce_text_shape.h. */
+    uint32_t glyph_count = 0;
+    const JceTextFontChain chain = font_chain(font);
+    const JceShapedGlyph *run = jce_text_shape(font, &chain, text,
+                                               &glyph_count);
+    if (!run) return;
 
     float cx = x;
     float cy = y;
-    for (unsigned int i = 0; i < glyph_count; i++) {
-        /* HarfBuzz gives us glyph IDs — we need to map back to codepoints.
-           For our atlas, we index by Unicode codepoint. Use the cluster value
-           which maps back to the original UTF-8 byte offset. */
-        uint32_t cluster = glyph_info[i].cluster;
-        const char *p = text + cluster;
-        uint32_t ucp = utf8_decode(&p);
+
+    /* A glyph run is ONE draw call.
+     *
+     * Every glyph used to go through jce_draw_textured_rect_view on its own,
+     * so a 60-character line cost 60 transient allocations, 60 texture binds,
+     * 60 state sets and 60 submits that differed only in four floats and a
+     * UV rect.  A screen of UI text ran into the hundreds, and
+     * jce_ui_canvas.c:80 named the cost in its own comment while it stayed.
+     *
+     * The batch drains on three events and nothing else:
+     *   - the atlas changes, because a run may straddle the static atlas and
+     *     the dynamic one (g->dynamic) glyph by glyph;
+     *   - the staging array fills;
+     *   - the run ends.
+     * Ordering is unaffected: the quads in a batch share one texture and one
+     * state, the UI views are BGFX_VIEW_MODE_SEQUENTIAL, and nothing else can
+     * submit between two glyphs of the same run.
+     *
+     * 128 quads is 4.6 KB of stack and covers a full line of text at any
+     * realistic width; longer runs simply drain more than once. */
+    enum { TEXT_BATCH_QUADS = 128 };
+    JceQuad2D  batch[TEXT_BATCH_QUADS];
+    uint32_t   batch_n = 0;
+    JceTexture batch_tex = { UINT16_MAX };
+    /* The batch also drains when the FONT changes, not only the atlas: the
+     * flush reads atlas_w/atlas_h and sdf_spread off it, and two fonts can
+     * share neither.  Two different fonts with equal atlas ids is not possible
+     * today, but "the texture happens to match" is not the property the flush
+     * depends on. */
+    JceFont   *batch_font = font;
+
+    for (uint32_t i = 0; i < glyph_count; i++) {
+        /* The atlas is indexed by Unicode codepoint, and the shaper decoded
+           it from the cluster once, when it shaped.  Reading it back here
+           means the run does not refer into `text` at all. */
+        uint32_t ucp = run[i].codepoint;
 
         if (ucp == '\n') {
             cx = x;
@@ -621,31 +948,56 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
          * entirely (the pinned UI font does), in which case FreeType
          * rasterizes .notdef — a visible tofu box — for every word gap. */
         if (ucp == ' ' || ucp == '\t' || ucp == 0x00A0u) {
-            cx += (float)(glyph_pos[i].x_advance >> 6) * scale;
+            cx += (float)(run[i].x_advance >> 6) * scale;
             continue;
         }
 
-        float x_offset  = (float)(glyph_pos[i].x_offset >> 6) * scale;
-        float y_offset  = (float)(glyph_pos[i].y_offset >> 6) * scale;
-        float x_advance = (float)(glyph_pos[i].x_advance >> 6) * scale;
+        float x_offset  = (float)(run[i].x_offset >> 6) * scale;
+        float y_offset  = (float)(run[i].y_offset >> 6) * scale;
+        float x_advance = (float)(run[i].x_advance >> 6) * scale;
 
-        const GlyphInfo *g = font_get_or_render_glyph(font, ucp);
-        if (!g) g = font_get_glyph(font, '?');
+        /* The glyph comes out of the font the SHAPER chose for it, which is
+         * the primary unless a fallback claimed this codepoint. */
+        JceFont *gf = font_for_slot(font, run[i].font_slot);
+        const GlyphInfo *g = font_get_or_render_glyph(gf, ucp);
+        if (!g) g = font_get_glyph(gf, '?');
 
         if (g && g->w > 0 && g->h > 0) {
-            float gx = cx + x_offset + (float)g->bearing_x * scale;
-            float gy = cy + y_offset + (float)(font->ascender - g->bearing_y) * scale;
-            const float uv[4] = { g->u0, g->v0, g->u1, g->v1 };
-            JceTexture atlas = g->dynamic ? font->dyn_atlas : font->atlas;
-            jce_draw_textured_rect_view(r, view_id, gx, gy,
-                                        (float)g->w * scale,
-                                        (float)g->h * scale,
-                                        atlas, color, uv);
+            const float gx = cx + x_offset + (float)g->bearing_x * scale;
+            /* The PRIMARY's ascender, not the fallback's: the baseline belongs
+             * to the line, and two fonts opened at one point size do not agree
+             * on where the top of their box is.  Using each glyph's own font
+             * here makes a mixed line ripple. */
+            const float gy = cy + y_offset
+                           + (float)(font->ascender - g->bearing_y) * scale;
+            const JceTexture atlas = g->dynamic ? gf->dyn_atlas
+                                                : gf->atlas;
+            JceQuad2D *q;
+
+            if (batch_n > 0 && (atlas.idx != batch_tex.idx
+                                || batch_font != gf
+                                || batch_n == TEXT_BATCH_QUADS)) {
+                text_flush_batch(r, view_id, batch, batch_n, batch_tex,
+                                 batch_font, scale);
+                batch_n = 0;
+            }
+            batch_tex  = atlas;
+            batch_font = gf;
+
+            q = &batch[batch_n++];
+            q->x  = gx;             q->y  = gy;
+            q->w  = (float)g->w * scale;
+            q->h  = (float)g->h * scale;
+            q->u0 = g->u0;          q->v0 = g->v0;
+            q->u1 = g->u1;          q->v1 = g->v1;
+            q->tint = color;
         }
         cx += x_advance;
     }
 
-    hb_buffer_destroy(hb_buf);
+    if (batch_n > 0)
+        text_flush_batch(r, view_id, batch, batch_n, batch_tex, batch_font,
+                         scale);
 }
 
 int jce_font_line_height(const JceFont *font)
@@ -662,35 +1014,31 @@ void jce_text_measure(const JceFont *font, const char *text,
         return;
     }
 
-    /* Use HarfBuzz for accurate measurement. */
-    hb_buffer_t *hb_buf = hb_buffer_create();
-    hb_buffer_add_utf8(hb_buf, text, -1, 0, -1);
-    hb_buffer_guess_segment_properties(hb_buf);
-    hb_shape(font->hb_font, hb_buf, NULL, 0);
-
-    unsigned int glyph_count;
-    hb_glyph_info_t     *glyph_info = hb_buffer_get_glyph_infos(hb_buf, &glyph_count);
-    hb_glyph_position_t *glyph_pos  = hb_buffer_get_glyph_positions(hb_buf, &glyph_count);
+    /* The SAME cached run the draw path uses.  A UI lays out and then draws,
+     * so this used to be the second full shape of one string in one frame. */
+    uint32_t glyph_count = 0;
+    const JceTextFontChain chain = font_chain(font);
+    const JceShapedGlyph *run = jce_text_shape(font, &chain, text,
+                                               &glyph_count);
+    if (!run) {
+        if (out_w) *out_w = 0;
+        if (out_h) *out_h = 0;
+        return;
+    }
 
     float max_w = 0, cx = 0;
     int lines = 1;
 
-    for (unsigned int i = 0; i < glyph_count; i++) {
-        uint32_t cluster = glyph_info[i].cluster;
-        const char *p = text + cluster;
-        uint32_t ucp = utf8_decode(&p);
-
-        if (ucp == '\n') {
+    for (uint32_t i = 0; i < glyph_count; i++) {
+        if (run[i].codepoint == '\n') {
             if (cx > max_w) max_w = cx;
             cx = 0;
             lines++;
             continue;
         }
-        cx += (float)(glyph_pos[i].x_advance >> 6);
+        cx += (float)(run[i].x_advance >> 6);
     }
     if (cx > max_w) max_w = cx;
-
-    hb_buffer_destroy(hb_buf);
 
     if (out_w) *out_w = max_w;
     if (out_h) *out_h = (float)(lines * font->line_height);
@@ -742,13 +1090,60 @@ static uint32_t math_symbol_cp(const char *name, size_t len)
     return 0;
 }
 
+/* A formula's glyphs batch exactly like a plain run's, with one extra rule:
+ * a fraction bar or radical overline is an UNTEXTURED rect on a different
+ * program, so it cannot join the batch and cannot be reordered across it.
+ * math_hline therefore drains first.  With that, submit order is unchanged
+ * from the per-glyph version, which is what makes this safe on the
+ * SEQUENTIAL UI views where submit order IS draw order.
+ *
+ * 64 quads: formulas are short, and there is exactly one MathCtx per call --
+ * math_run recurses but takes it by pointer, and math_measure_run toggles
+ * m->draw in place rather than copying. */
+enum { MATH_BATCH_QUADS = 64 };
+
 typedef struct {
     const JceRenderer *r;
     JceFont           *font;
     uint16_t           view;
     uint32_t           color;
     bool               draw;
+    JceQuad2D          batch[MATH_BATCH_QUADS];
+    uint32_t           batch_n;
+    JceTexture         batch_tex;
 } MathCtx;
+
+static void math_ctx_init(MathCtx *m, const JceRenderer *r, JceFont *font,
+                          uint16_t view, uint32_t color, bool draw)
+{
+    m->r = r; m->font = font; m->view = view; m->color = color; m->draw = draw;
+    m->batch_n = 0;
+    m->batch_tex.idx = UINT16_MAX;
+}
+
+static void math_flush(MathCtx *m)
+{
+    if (m->batch_n == 0) return;
+    jce_draw_textured_quads_view(m->r, m->view, m->batch, m->batch_n,
+                                 m->batch_tex);
+    m->batch_n = 0;
+}
+
+/* Queue one glyph quad.  w and h are passed rather than derived, because the
+ * radical stretches its glyph vertically (h uses a fitted scale, w does not). */
+static void math_push_glyph(MathCtx *m, const GlyphInfo *g, JceTexture atlas,
+                            float gx, float gy, float w, float h)
+{
+    JceQuad2D *q;
+    if (m->batch_n > 0 && (atlas.idx != m->batch_tex.idx
+                           || m->batch_n == MATH_BATCH_QUADS))
+        math_flush(m);
+    m->batch_tex = atlas;
+    q = &m->batch[m->batch_n++];
+    q->x = gx; q->y = gy; q->w = w; q->h = h;
+    q->u0 = g->u0; q->v0 = g->v0; q->u1 = g->u1; q->v1 = g->v1;
+    q->tint = m->color;
+}
 
 /* Box metrics: width plus extents above (ascent) and below (descent) the
  * baseline.  All values already include the run's scale. */
@@ -770,11 +1165,9 @@ static MBox math_glyph_box(MathCtx *m, uint32_t cp, float x, float baseline,
     if (m->draw && m->r && g->w > 0 && g->h > 0) {
         float gx = x + (float)g->bearing_x * scale;
         float gy = baseline - (float)g->bearing_y * scale;
-        const float uv[4] = { g->u0, g->v0, g->u1, g->v1 };
         JceTexture atlas = g->dynamic ? m->font->dyn_atlas : m->font->atlas;
-        jce_draw_textured_rect_view(m->r, m->view, gx, gy,
-                                    (float)g->w * scale, (float)g->h * scale,
-                                    atlas, m->color, uv);
+        math_push_glyph(m, g, atlas, gx, gy,
+                        (float)g->w * scale, (float)g->h * scale);
     }
     return b;
 }
@@ -783,6 +1176,10 @@ static void math_hline(MathCtx *m, float x, float y, float w, float t)
 {
     if (m->draw && m->r && w > 0) {
         if (t < 1.0f) t = 1.0f;
+        /* Untextured, different program: it can neither join the glyph batch
+         * nor be reordered across it.  Draining here is what keeps the
+         * batched formula identical in submit order to the unbatched one. */
+        math_flush(m);
         jce_draw_filled_rect_view(m->r, m->view, x, y, w, t, m->color);
     }
 }
@@ -896,11 +1293,11 @@ static MBox math_run(MathCtx *m, const char *s, size_t len,
                     if (gscale < scale) gscale = scale;
                     float gx = pen + (float)rg->bearing_x * scale;
                     float gy = baseline + ab.descent - (float)rg->bearing_y * gscale;
-                    const float uv[4] = { rg->u0, rg->v0, rg->u1, rg->v1 };
-                    JceTexture atl = rg->dynamic ? m->font->dyn_atlas : m->font->atlas;
-                    jce_draw_textured_rect_view(m->r, m->view, gx, gy,
-                                                (float)rg->w * scale,
-                                                (float)rg->h * gscale, atl, m->color, uv);
+                    JceTexture atl = rg->dynamic ? m->font->dyn_atlas
+                                                 : m->font->atlas;
+                    math_push_glyph(m, rg, atl, gx, gy,
+                                    (float)rg->w * scale,
+                                    (float)rg->h * gscale);
                 }
                 if (m->draw) {
                     math_hline(m, pen + rad_w, top, ab.w + gap, t);
@@ -1008,9 +1405,11 @@ void jce_text_measure_math(const JceFont *font, const char *markup,
                            float *out_w, float *out_h)
 {
     if (!font || !markup) { if (out_w) *out_w = 0; if (out_h) *out_h = 0; return; }
-    MathCtx m; memset(&m, 0, sizeof(m));
-    m.font = (JceFont *)font;   /* on-demand rasterization is a cache mutation */
-    m.draw = false;
+    /* Not memset: MathCtx now carries a 64-quad staging array, and zeroing
+     * 2.3 KB on a path that draws nothing is work for no one.  The cast is
+     * because on-demand rasterization is a cache mutation. */
+    MathCtx m;
+    math_ctx_init(&m, NULL, (JceFont *)font, 0u, 0u, false);
     MBox b = math_run(&m, markup, strlen(markup), 0.0f, 0.0f, 1.0f);
     if (out_w) *out_w = b.w;
     if (out_h) *out_h = (float)font->line_height;
@@ -1022,10 +1421,11 @@ void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
 {
     if (!r || !font || !markup || !jce_texture_valid(font->atlas)) return;
     MathCtx m;
-    m.r = r; m.font = font; m.view = view_id; m.color = color; m.draw = true;
+    math_ctx_init(&m, r, font, view_id, color, true);
     /* y is the line's top (canvas convention); shift to a baseline so
      * ascenders sit inside the line box. */
     float baseline = y + (float)font->ascender * scale;
     (void)math_run(&m, markup, strlen(markup), x, baseline, scale);
+    math_flush(&m);
 }
 

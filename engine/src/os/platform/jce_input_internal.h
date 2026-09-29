@@ -3,7 +3,7 @@
  *
  * NOT a public header: it lives under engine/src/, never under <jce/...>.  It
  * contains no SDL token, and it is inside the set scanned by
- * scripts/lint/check_input_seam.py.
+ * tools/lint/check_input_seam.py.
  *
  * jce_input_set_backend() USED to be declared here, because JceInputBackend
  * itself was internal.  Both are public now

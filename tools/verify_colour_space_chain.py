@@ -32,6 +32,7 @@ import collections
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,39 @@ def check(label, got, want):
         sys.exit(1)
 
 
+def write_import_probe(path, texture):
+    """Generate a textured glTF triangle; no consumer asset or directory scan."""
+    positions = struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0)
+    uv = struct.pack("<6f", 0, 0, 1, 0, 0, 1)
+    indices = struct.pack("<3H", 0, 1, 2)
+    payload = positions + uv + indices + b"\0\0" + texture.read_bytes()
+    doc = {
+        "asset": {"version": "2.0"}, "scene": 0,
+        "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "buffers": [{"byteLength": len(payload)}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 24},
+            {"buffer": 0, "byteOffset": 60, "byteLength": 6},
+            {"buffer": 0, "byteOffset": 68, "byteLength": len(payload) - 68}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+            {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"},
+            {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}],
+        "images": [{"bufferView": 3, "mimeType": "image/png", "name": "probe%d" % i} for i in range(5)],
+        "textures": [{"source": i} for i in range(5)],
+        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "metallicRoughnessTexture": {"index": 1}}, "normalTexture": {"index": 2}, "occlusionTexture": {"index": 3}, "emissiveTexture": {"index": 4}}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "TEXCOORD_0": 1}, "indices": 2, "material": 0}]}],
+    }
+    header = json.dumps(doc, separators=(",", ":")).encode()
+    header += b" " * (-len(header) % 4)
+    payload += b"\0" * (-len(payload) % 4)
+    data = struct.pack("<III", 0x46546C67, 2, 28 + len(header) + len(payload))
+    data += struct.pack("<I4s", len(header), b"JSON") + header
+    data += struct.pack("<I4s", len(payload), b"BIN\0") + payload
+    path.write_bytes(data)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cook", default=str(DEFAULT_COOK))
@@ -132,34 +166,21 @@ def main():
 
         print()
         print("B. the model importer records the slot it filled")
-        glb = None
-        for cand in ROOT.rglob("*.glb"):
-            if "build" in cand.parts or "dist" in cand.parts:
-                continue
-            glb = cand
-            break
-        if glb is None:
-            print("  skip: no .glb in the tree to import")
-        else:
-            work = tmp / "import"
-            work.mkdir()
-            local = work / glb.name
-            shutil.copyfile(glb, local)
-            r = subprocess.run([str(cook_exe), "--extract-material", str(local)],
-                               capture_output=True)
-            if r.returncode != 0:
-                fail(f"--extract-material failed: {r.stderr.decode(errors='replace')[:200]}")
-            sidecars = sorted(work.glob("*.import.json"))
-            if not sidecars:
-                fail(f"{glb.name} produced no colour-space sidecar")
-            bad = []
-            for s in sidecars:
-                v = json.loads(s.read_text(encoding="utf-8")).get("colorSpace")
-                if v not in ("srgb", "linear"):
-                    bad.append((s.name, v))
-                print(f"  ok    {s.name:<44s} colorSpace {v!r}")
-            if bad:
-                fail(f"sidecars with an unusable value: {bad}")
+        work = tmp / "import"
+        work.mkdir()
+        local = work / "colour_probe.glb"
+        write_import_probe(local, probe)
+        result = subprocess.run([str(cook_exe), "--extract-material", str(local)], capture_output=True)
+        if result.returncode != 0:
+            fail("--extract-material failed: " + result.stderr.decode(errors="replace")[:200])
+        sidecars = sorted(work.glob("*.import.json"))
+        if len(sidecars) != 5:
+            fail("generated five-slot model produced %d colour-space sidecars" % len(sidecars))
+        values = [json.loads(file.read_text(encoding="utf-8")).get("colorSpace") for file in sidecars]
+        if collections.Counter(values) != {"srgb": 2, "linear": 3}:
+            fail("albedo/emissive must be sRGB; normal/occlusion/metal-roughness must be linear: " + repr(values))
+        for file, value in zip(sidecars, values):
+            print("  ok    %-44s colorSpace %r" % (file.name, value))
 
         print()
         print("colour-space chain: PASS")

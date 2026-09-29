@@ -272,7 +272,15 @@ def shape_is_type_compatible(shape: str, m: HostMember) -> bool:
     test_shape_check_cannot_tell_find_by_name_from_find_by_prefix asserts that
     the swap passes here, so nobody can later mistake this for correctness."""
     ret = m.ret
-    outs = [p for p in m.params[1:] if p.arity != 0]
+    # OUTPUTS, by the same rule out_params() uses and emit_api_json publishes:
+    # `const` decides direction, so a const array is an INPUT.  This was
+    # `p.arity != 0`, which counts raycast's `const float origin[3]` as an
+    # output -- harmless for fallible_out (which asks for >= 1) and fatal for
+    # entity_table (which asks for exactly 1), so a multi-hit query taking a
+    # ray was rejected while the same shape taking loose x/y/z was accepted.
+    # Strictly narrower than the old expression: everything out_params returns
+    # the old one also returned, so no entry that was refused becomes allowed.
+    outs = out_params(m)
     if shape == "void_call":
         return ret == "void"
     if shape == "value_return":
@@ -653,8 +661,30 @@ def validate(members: list[HostMember], man: dict, c_text: str,
                 f"host member '{m.name}' (index {m.index}) has NO exposure "
                 f"decision: add it to expose / hand_written / internal in "
                 f"{MANIFEST.relative_to(REPO_ROOT).as_posix()}")
-    for name in sorted(claimed - set(by_name)):
+    dangling = sorted(claimed - set(by_name))
+    for name in dangling:
         problems.append(f"manifest claims host member '{name}', which no longer exists")
+
+    # --- STOP HERE IF THE MANIFEST POINTS AT NOTHING.
+    #
+    # A backend validator emits its whole file to check it, and every emitter
+    # resolves `by[e["vtable"]]` -- so a manifest naming a member that does not
+    # exist does not make a backend REPORT, it makes it raise KeyError.  The
+    # gate then hands you a traceback out of emit_csharp.py instead of the one
+    # line it had already written two statements above: the name you typo'd.
+    #
+    # Measured: setting one expose entry's vtable to "no_such_member" turned
+    # `validate()` -- a function whose contract is "returns a list of problems"
+    # -- into a crash, and it stayed that way because the test that proves the
+    # failure is NAMED had never been run (tools/audit/tests was untracked, and
+    # there was no CI).
+    #
+    # Returning early is not hiding the other conditions: with the manifest
+    # structurally broken, every backend answer computed from it would be about
+    # a file that cannot be generated anyway.  Fix the name, run again, get the
+    # rest.
+    if dangling:
+        return problems
 
     # --- every backend's own conditions, in discovery order
     for backend in (discover_backends() if backends is None else backends):

@@ -23,9 +23,11 @@
  */
 
 #include "jce_terrain_collision_stream.h"
+#include <jce/resource/jce_world_streamer.h>  /* shipped-path world streaming */
 #include "jce_rt_internal.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_water_field.h>
 #include <jce/middleware/scene/jce_water_ripple.h>
 #if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
@@ -97,6 +99,7 @@ RT_GROW_FN(rt_grow_pending_fractures, pending_fractures, pending_fracture_cap,  
 RT_GROW_FN(rt_grow_vehicles,          vehicles,          vehicle_cap,           4)
 RT_GROW_FN(rt_grow_softbodies,        softbodies,        softbody_cap,          4)
 RT_GROW_FN(rt_grow_cfg_joints,        cfg_joints,        cfg_joint_cap,         4)
+RT_GROW_FN(rt_grow_joints,            joints,            joint_cap,             4)
 RT_GROW_FN(rt_grow_joints2d,          joints2d,          joint2d_cap,           4)
 
 /* Find the live vehicle entry for an entity (linear; entry counts are small).
@@ -139,9 +142,26 @@ static void rt_trigger_event(const JceTriggerEvent *ev, void *user)
 			for (int i = 0; i < rt->save_point_count; ++i) {
 				SavePointEntry *sp = &rt->save_points[i];
 				if ((uint64_t)sp->entity != ev->trigger_user) continue;
+				/* Tell the game FIRST, whatever happens next.  A
+				 * require_interact point was previously left to "game
+				 * input" while the engine told the game nothing at all,
+				 * so the prompt JceSavePointComponent.display_name
+				 * exists for could not be shown.  kind rides along as
+				 * the message's number so MANUAL / AUTO / CHECKPOINT
+				 * can be presented differently. */
+				for (int k = 0; k < rt->script_count; ++k) {
+					struct ScriptEntry *se = &rt->scripts[k];
+					if (se->active && (uint64_t)se->entity == ev->trigger_user) {
+						rt_script_ref_message(
+						    se->ref, "on_save_point", (double)sp->kind,
+						    sp->display_name[0] ? sp->display_name : NULL);
+						break;
+					}
+				}
 				if (sp->require_interact) break;   /* game-driven, not here */
 				if (sp->one_shot && sp->fired) break;
-				if (rt_perform_save(rt, sp->save_id)) sp->fired = true;
+				if (rt_perform_save_slot(rt, sp->save_id, sp->slot))
+					sp->fired = true;
 				break;
 			}
 		}
@@ -151,23 +171,40 @@ static void rt_trigger_event(const JceTriggerEvent *ev, void *user)
 		         (unsigned long long)ev->observer_user);
 	}
 
-	/* Dispatch ENTER/EXIT to the ZONE entity's Lua script as
+	/* Dispatch ENTER/STAY/EXIT to the ZONE entity's Lua script as
 	 * on_trigger_enter(self, observer_entity) / on_trigger_exit(self,
 	 * observer_entity), so a game reacts to any TriggerVolume in script with no
 	 * C wiring — the GTA-style mission-zone primitive (walk into a red zone ->
 	 * start a cutscene/mission).  Mirrors rt_script_collision_cb's linear scan;
 	 * the observer (usually the player) is passed as the number arg (entity id
 	 * fits exactly in a double).  STAY is intentionally not dispatched. */
-	if (rt &&
-	    (ev->type == JCE_TRIGGER_EVENT_ENTER || ev->type == JCE_TRIGGER_EVENT_EXIT)) {
-		const char *method = (ev->type == JCE_TRIGGER_EVENT_ENTER)
-		    ? "on_trigger_enter" : "on_trigger_exit";
-		for (int i = 0; i < rt->script_count; ++i) {
-			struct ScriptEntry *se = &rt->scripts[i];
-			if (se->active && (uint64_t)se->entity == ev->trigger_user) {
-				rt_script_ref_message(se->ref, method,
-				                      (double)ev->observer_user, NULL);
-				break;
+	if (rt) {
+		/* STAY is dispatched now.  It used to be computed by the trigger
+		 * world, emitted to this callback, and dropped -- "STAY is
+		 * intentionally not dispatched" -- which made
+		 * TriggerVolume.fire_stay doubly dead: the flag was unread AND the
+		 * event it gates reached nobody.  It only fires for a trigger that
+		 * ASKED for it, so a zone that did not tick the box costs nothing.
+		 *
+		 * The tag rides along as the message's string argument, so a script
+		 * can tell one zone from another without hard-coding entity ids --
+		 * which is what the component means by "propagated to event
+		 * payload". */
+		const char *method =
+		      (ev->type == JCE_TRIGGER_EVENT_ENTER) ? "on_trigger_enter"
+		    : (ev->type == JCE_TRIGGER_EVENT_STAY)  ? "on_trigger_stay"
+		    : (ev->type == JCE_TRIGGER_EVENT_EXIT)  ? "on_trigger_exit"
+		                                            : NULL;
+		if (method) {
+			for (int i = 0; i < rt->script_count; ++i) {
+				struct ScriptEntry *se = &rt->scripts[i];
+				if (se->active && (uint64_t)se->entity == ev->trigger_user) {
+					rt_script_ref_message(se->ref, method,
+					                      (double)ev->observer_user,
+					                      (ev->tag && ev->tag[0]) ? ev->tag
+					                                              : NULL);
+					break;
+				}
 			}
 		}
 	}
@@ -235,50 +272,35 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 {
 	JceRuntime *rt = (JceRuntime *)ud;
 	if (!jce_scene_has_transform(scene, e)) return;
-	JceTransform *tf = jce_scene_get_transform(scene, e);
-	if (!tf) return;
+	JceTransform *tf_local = jce_scene_get_transform(scene, e);
+	if (!tf_local) return;
 
-	/* ── Character controller (only one supported per scene) ── */
-	if (rt->physics && !jce_character_valid(rt->character)) {
-		JceCharacterControllerComponent *cc =
-			jce_scene_get_character_controller(scene, e);
-		if (cc && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CHARACTER_CONTROLLER)) {
-			JceCharacterDesc cd;
-			memset(&cd, 0, sizeof cd);
-			cd.position      = tf->position;
-			cd.radius        = cc->radius      > 0.0f ? cc->radius      : 0.35f;
-			cd.height        = cc->height      > 0.0f ? cc->height      : 1.8f;
-			cd.step_height   = cc->step_offset > 0.0f ? cc->step_offset : 0.35f;
-			cd.max_slope_deg = cc->slope_limit > 0.0f ? cc->slope_limit : 50.0f;
-			cd.gravity       = 9.81f;
-			cd.jump_speed    = cc->jump_speed  > 0.0f ? cc->jump_speed  : 5.0f;
-			cd.accel         = cc->accel;        /* 0 → physics default */
-			cd.air_control   = cc->air_control;
-			/* The scene Transform is the FEET (feet-pivoted meshes), but the
-			 * Bullet capsule is centered on its origin — spawn the CENTER half
-			 * a height above the feet so it rests instead of sinking on frame 0. */
-			cd.position.y   += 0.5f * cd.height;
-			rt->character = jce_physics_character_create(rt->physics, &cd);
-			if (jce_character_valid(rt->character)) {
-				rt->character_entity      = e;
-				rt->character_half_height = 0.5f * cd.height;
-				rt->char_cur_pos          = cd.position;   /* capsule center */
-				rt->char_prev_pos         = cd.position;
-				rt->char_last_pos         = tf->position;  /* feet */
-				rt->char_last_rot         = tf->rotation;
-				rt->char_move_speed  = cc->move_speed  > 0.0f ? cc->move_speed  : 4.0f;
-				rt->char_sprint_mult = cc->sprint_mult > 0.0f ? cc->sprint_mult : 1.8f;
-				rt->char_turn_speed  = (cc->turn_speed_deg > 0.0f
-				                        ? cc->turn_speed_deg : 720.0f) * JCE_DEG2RAD;
-				rt->char_yaw_valid   = false;
-				rt->char_coyote_t    = 0.0f;
-				rt->char_jump_buf_t  = 0.0f;
-				rt->char_jump_was_held = false;
-			}
-			/* Character takes priority — skip rigid body for this entity. */
-			goto try_audio;
-		}
-	}
+	/* PHYSICS PLACES BODIES IN THE WORLD, AND A CHILD'S JceTransform IS NOT A
+	 * PLACE.  It is an offset from its parent.  Every spawner below used to
+	 * receive the raw local TRS and hand its position straight to Bullet, so a
+	 * trigger volume parented to a door at x=4 and authored at local x=0 got
+	 * its collider at the WORLD ORIGIN -- measured bit-identical to giving it
+	 * no parent at all (same penetration to six digits, same contact count).
+	 *
+	 * Composed ONCE here, for every spawner at the same time, because they all
+	 * take `const JceTransform *` -- so this cannot be a fix that reaches the
+	 * rigid-body path and silently misses vehicles, soft bodies, terrain,
+	 * compounds, meshes, characters, 2D bodies and tilemap colliders.
+	 *
+	 * A ROOT ENTITY IS UNCHANGED DOWN TO THE BYTE: jce_scene_get_world_pose
+	 * returns a parentless entity's Transform verbatim rather than routing it
+	 * through a matrix, so every scene authored before this spawns exactly
+	 * where it always did.  The scale comes through too -- a child of a scaled
+	 * parent was also getting its collider sized from the local scale. */
+	JceTransform tf_world = *tf_local;
+	jce_scene_get_world_pose(scene, e, &tf_world.position, &tf_world.rotation,
+	                         &tf_world.scale);
+	const JceTransform *tf = &tf_world;
+
+	/* Character controller.  Body, counting and the skipped-controller
+	 * warning all live in jce_rt_character.c; true means this entity is a
+	 * character and must not also become a rigid body. */
+	if (rt_character_try_spawn(rt, scene, e, tf)) goto try_audio;
 
 	/* ── Raycast vehicle chassis (VEHICLE last-mile) ── */
 	/* The chassis IS this entity's body; short-circuit the normal rigid-body
@@ -332,26 +354,14 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 
 try_audio:
 	/* ── Audio source ── */
-	if (rt->audio && (rt->pak || rt->audio_load_fn)) {
+	{
+		/* play_on_awake is the only thing decided here; HOW to start an
+		 * authored source lives once, in rt_audio_source_start, so the spawn
+		 * walk and jce_runtime_audio_play cannot drift apart on the bus
+		 * choice, the attenuation block or the 0-volume rule. */
 		JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
-		if (as && as->play_on_awake && as->clip_path[0] &&
-		    jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_AUDIO_SOURCE)) {
-			if (rt->audio_load_fn) {
-				/* Custom loader hook (editor): keep the synchronous handoff. */
-				JceSound snd = rt->audio_load_fn(rt->user_data, rt->audio,
-				                                 as->clip_path);
-				if (snd != JCE_SOUND_INVALID)
-					rt_finish_audio_source(rt, scene, e, snd, as);
-				else
-					jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
-					              "audio_source: failed to load '%s'", as->clip_path);
-			} else {
-				/* Default PAK loader: decode off-thread so a scene full of
-				 * play_on_awake clips doesn't stall scene-load.  The sound
-				 * starts a frame or two late (rt_audio_poll plays it). */
-				rt_spawn_audio_async(rt, e, as);
-			}
-		}
+		if (as && as->play_on_awake)
+			(void)rt_audio_source_start(rt, scene, e);
 	}
 
 	/* ── Adaptive music track ── one director per runtime, built from the
@@ -396,6 +406,8 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 			d.axis_x = jce_v3(tvc->axis_x[0], tvc->axis_x[1], tvc->axis_x[2]);
 			d.axis_y = jce_v3(tvc->axis_y[0], tvc->axis_y[1], tvc->axis_y[2]);
 			d.axis_z = jce_v3(tvc->axis_z[0], tvc->axis_z[1], tvc->axis_z[2]);
+			d.fire_stay = tvc->fire_stay;
+			snprintf(d.tag, sizeof d.tag, "%s", tvc->tag);
 			JceTriggerHandle h = jce_trigger_add(rt->trigger_world, &d,
 			                                     (uint64_t)e);
 			jce_trigger_set_enabled(rt->trigger_world, h, tvc->enabled);
@@ -502,6 +514,10 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 				sp->handle   = h;
 				sp->one_shot = spc->one_shot;
 				sp->require_interact = spc->require_interact;
+				sp->slot             = spc->slot;
+				sp->kind             = spc->kind;
+				snprintf(sp->display_name, sizeof sp->display_name, "%s",
+				         spc->display_name);
 				sp->fired    = false;
 				size_t idn = strlen(spc->save_id);
 				if (idn >= sizeof sp->save_id) idn = sizeof sp->save_id - 1;
@@ -652,8 +668,14 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 				float bw = rc->blend_weight;
 				if (bw < 0.0f) bw = 0.0f;
 				if (bw > 1.0f) bw = 1.0f;
+				/* 0 => the engine default of 1.0, the same convention
+				 * radius and height_scale above use.  A NEGATIVE value is
+				 * the explicit opt-out that restores the unlimited joints
+				 * this used to build unconditionally. */
+				float lscale = rc->joint_limit_scale;
+				if (lscale == 0.0f) lscale = 1.0f;
 				JceRagdoll *rd = jce_ragdoll_create(skel, rt->physics,
-				                                    radius, hscale);
+				                                    radius, hscale, lscale);
 				if (rd &&
 				    (rt->ragdoll_count < rt->ragdoll_cap || rt_grow_ragdoll(rt))) {
 					jce_ragdoll_set_blend_weight(rd, bw);
@@ -700,7 +722,13 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 				.max_accel       = nac->max_accel       > 0.0f ? nac->max_accel       : 12.0f,
 				.arrive_radius   = nac->arrive_radius   > 0.0f ? nac->arrive_radius   : 1.5f,
 				.waypoint_radius = nac->waypoint_radius > 0.0f ? nac->waypoint_radius : 0.5f,
+				.height          = nac->height,
 			};
+			/* A navmesh belongs to the agent it was carved for; an agent
+			 * taller than the clearance is on the WRONG MESH, not slightly
+			 * wrong on this one.  Says so once (jce_nav_agent.h). */
+			(void)jce_nav_agent_report_fit(
+				nac->height, jce_recast_agent_height(rt->nav_recast));
 			JceNavAgentHandle h = jce_nav_agent_add(rt->nav_agents, &d);
 			if (jce_nav_agent_valid(h)) {
 				NavAgentEntry *ne = &rt->nav_entries[rt->nav_entry_count];
@@ -762,18 +790,58 @@ static void rt_spawn_net(JceScene *scene, JceEntity e, void *ud)
 		}
 	}
 
-	/* Transform replication config from the authored override (if any). */
-	JceNetTransformComponent *nt = jce_scene_get_net_transform(scene, e);
-	if (nt && id != JCE_NET_OBJECT_INVALID) {
-		JceNetTransformConfig cfg;
-		jce_net_transform_get_default_config(&cfg);
-		if (nt->sync_rate_hz) cfg.snapshot_hz = (uint32_t)nt->sync_rate_hz;
-		if (nt->interp_ms)    cfg.interp_delay_ms = (uint32_t)nt->interp_ms;
-		if (nt->tolerance > 0.0f)
-			cfg.divergence_snap_distance = nt->tolerance;
-		cfg.authority = (nt->authority_mode == 1)
-		                ? JCE_NET_AUTH_OWNER : JCE_NET_AUTH_SERVER;
-		jce_net_transform_register(id, &cfg);
+	/* Transform replication config from whichever component authored it.
+	 *
+	 * NetTransform and NetRigidbody carry the SAME four knobs -- sync_rate_hz,
+	 * interp_ms, tolerance, authority_mode -- and only NetTransform's were
+	 * read.  There is no rigid-body replication module, and inventing one to
+	 * tick a box is not implementing it; but a networked rigid body's
+	 * observable state IS its transform, which is what Unity's
+	 * NetworkRigidbody replicates too.
+	 *
+	 * NetTransform wins when both are present: jce_net_transform_register is
+	 * idempotent, so registering twice would silently overwrite the config a
+	 * designer put on the more specific component. */
+	if (id != JCE_NET_OBJECT_INVALID) {
+		JceNetTransformComponent *nt = jce_scene_get_net_transform(scene, e);
+		JceNetRigidbodyComponent *nrb =
+			nt ? NULL : jce_scene_get_net_rigidbody(scene, e);
+		uint8_t  hz   = nt ? nt->sync_rate_hz   : (nrb ? nrb->sync_rate_hz   : 0);
+		uint16_t ims  = nt ? nt->interp_ms      : (nrb ? nrb->interp_ms      : 0);
+		float    tol  = nt ? nt->tolerance      : (nrb ? nrb->tolerance      : 0.0f);
+		uint8_t  auth = nt ? nt->authority_mode : (nrb ? nrb->authority_mode : 0);
+		if (nt || nrb) {
+			JceNetTransformConfig cfg;
+			jce_net_transform_get_default_config(&cfg);
+			if (hz)  cfg.snapshot_hz      = (uint32_t)hz;
+			if (ims) cfg.interp_delay_ms  = (uint32_t)ims;
+			if (tol > 0.0f) cfg.divergence_snap_distance = tol;
+			cfg.authority = (auth == 1) ? JCE_NET_AUTH_OWNER
+			                            : JCE_NET_AUTH_SERVER;
+			jce_net_transform_register(id, &cfg);
+		}
+	}
+
+	/* Animator replication config, from the component that authored it.
+	 *
+	 * JceNetAnimatorComponent's three knobs -- sync_rate_hz, interp_ms,
+	 * authority_mode -- had NO reader at all: they round-tripped through the
+	 * scene file and the Inspector showed them, and nothing anywhere consulted
+	 * one.  Registering here is what makes them mean something, and it is the
+	 * same shape the transform block above uses so the two cannot drift. */
+	if (id != JCE_NET_OBJECT_INVALID) {
+		JceNetAnimatorComponent *na = jce_scene_get_net_animator(scene, e);
+		if (na) {
+			JceNetAnimatorConfig acfg;
+			jce_net_animator_get_default_config(&acfg);
+			if (na->sync_rate_hz) acfg.snapshot_hz     = na->sync_rate_hz;
+			if (na->interp_ms)    acfg.interp_delay_ms = na->interp_ms;
+			acfg.authority = (na->authority_mode == 1)
+			               ? JCE_NET_ANIM_AUTHORITY_OWNER
+			               : JCE_NET_ANIM_AUTHORITY_SERVER;
+			jce_net_animator_register(id, &acfg);
+			rt->net_animator_count++;
+		}
 	}
 
 	/* ── Network variable (FEATURE 7.2 authoring last-mile) ──
@@ -1045,6 +1113,7 @@ static void rt_init_net_bridge(JceRuntime *rt)
 	jce_net_replication_set_entity_hooks(rt_net_entity_create,
 	                                     rt_net_entity_destroy, rt);
 	jce_net_transform_set_scene(rt->scene);
+	jce_net_animator_set_scene(rt->scene);
 
 	/* FEATURE 7.2 — register the built-in NetworkVariable component types
 	 * with the replication substrate so a SHIPPED build carries replicated
@@ -1096,9 +1165,7 @@ static void rt_init_net_bridge(JceRuntime *rt)
 
 JceBodyHandle rt_body_for_entity(const JceRuntime *rt, JceEntity e)
 {
-	for (int i = 0; i < rt->body_count; ++i)
-		if (rt->bodies[i].entity == e) return rt->bodies[i].body;
-	return JCE_BODY_INVALID;
+	RT_BODY_FOR_ENTITY(rt->bodies, rt->body_count, e);
 }
 
 static void rt_spawn_joint(JceScene *scene, JceEntity e, void *ud)
@@ -1136,9 +1203,28 @@ static void rt_spawn_joint(JceScene *scene, JceEntity e, void *ud)
 	cd.lower_limit       = cn->lower_limit;
 	cd.upper_limit       = cn->upper_limit;
 	cd.disable_collision = cn->disable_collision;
+	/* THE LAST MILE FOR THE MOTOR.  Every field above is copied here and
+	 * nowhere else; a motor authored on the component and not copied here is
+	 * the exact shape of a feature that is complete in five places and inert
+	 * in the sixth. */
+	cd.use_motor             = cn->use_motor;
+	cd.motor_target_velocity = cn->motor_target_velocity;
+	cd.motor_max_force       = cn->motor_max_force;
 
-	/* The Bullet world owns the constraint and frees it on destroy. */
-	jce_physics_constraint_create(rt->physics, &cd);
+	/* The Bullet world owns the constraint and frees it on destroy -- but
+	 * the MOTOR has to remain reachable, so the handle is tracked.  A joint
+	 * that fails to register still exists and still works; it just stops
+	 * responding to motor edits, which is the same acceptable degradation
+	 * the configurable-joint registry documents. */
+	JceConstraintHandle h = jce_physics_constraint_create(rt->physics, &cd);
+	if (!jce_constraint_valid(h)) return;
+	if (rt->joint_count >= rt->joint_cap && !rt_grow_joints(rt)) return;
+	JointEntry *je = &rt->joints[rt->joint_count++];
+	je->entity          = e;
+	je->handle          = h;
+	je->motor_on        = cn->use_motor;
+	je->motor_target    = cn->motor_target_velocity;
+	je->motor_max_force = cn->motor_max_force;
 }
 
 /* CONFIGURABLE-JOINT last-mile: spawn a per-axis 6DOF joint for an entity that
@@ -1193,6 +1279,16 @@ static void rt_spawn_configurable_joint(JceScene *scene, JceEntity e, void *ud)
 	jd.angular_limit_deg[1] = cj->angular_y_limit_deg;
 	jd.angular_limit_deg[2] = cj->angular_z_limit_deg;
 	jd.disable_collision = !cj->enable_collision;
+	/* Per-axis drives, index for index -- the component and the desc use the
+	 * same 0..2 linear / 3..5 angular order precisely so this stays a loop.
+	 * Six separate assignments per knob is thirty chances to transpose one. */
+	for (int d = 0; d < 6; ++d) {
+		jd.drive_mode[d]      = cj->drive_mode[d];
+		jd.drive_target[d]    = cj->drive_target[d];
+		jd.drive_spring[d]    = cj->drive_spring[d];
+		jd.drive_damper[d]    = cj->drive_damper[d];
+		jd.drive_max_force[d] = cj->drive_max_force[d];
+	}
 
 	JceConstraintHandle h = jce_physics_configurable_joint_create(rt->physics, &jd);
 	if (!jce_constraint_valid(h)) return;
@@ -1213,208 +1309,48 @@ static void rt_spawn_configurable_joint(JceScene *scene, JceEntity e, void *ud)
 	ce->break_torque = cj->break_torque;
 }
 
-/* Find the live 2D body for an entity (linear scan mirrors rt_body_for_entity
- * for 3D).  JCE_BODY_INVALID if the entity authored no spawned 2D body. */
-static JceBodyHandle rt_body2d_for_entity(const JceRuntime *rt, JceEntity e)
+
+void jce_runtime_iterate_script_costs(const JceRuntime *rt,
+                                      JceScriptCostIterFn cb, void *user)
 {
-	for (int i = 0; i < rt->body2d_count; ++i)
-		if (rt->bodies2d[i].entity == e) return rt->bodies2d[i].body;
-	return JCE_BODY_INVALID;
-}
-
-/* JOINT-2D last-mile: spawn a Box2D distance/hinge/spring joint for an entity
- * that authored an ENABLED JceJoint2DComponent.  Mirrors rt_spawn_configurable_
- * joint (presence-gated via JCE_COMP_FLAG_JOINT_2D; body_a = the entity's own 2D
- * body; body_b = connected_body's 2D body, or the world when 0) and registers a
- * Joint2DEntry so teardown can reach the handle.  Runs in the SAME post-spawn
- * pass as the 3D joints (every 2D body must already exist).  Absent / disabled
- * component -> early return -> no entry -> no 2D joint work. */
-static void rt_spawn_joint2d(JceScene *scene, JceEntity e, void *ud)
-{
-	JceRuntime *rt = (JceRuntime *)ud;
-	if (!rt->physics2d) return;
-
-	JceJoint2DComponent *jc = jce_scene_get_joint2d(scene, e);
-	if (!jc) return;
-	if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_JOINT_2D)) return;
-
-	/* The jointed entity itself must have a 2D body. */
-	JceBodyHandle a = rt_body2d_for_entity(rt, e);
-	if (!jce_body_valid(a)) return;
-
-	/* connected_body 0 -> anchor to the world; otherwise resolve its 2D body. */
-	JceBodyHandle b = JCE_BODY_INVALID;
-	if (jc->connected_body != 0) {
-		b = rt_body2d_for_entity(rt, (JceEntity)jc->connected_body);
-		if (!jce_body_valid(b)) {
-			LOG_WARN(LOG_TAG, "2D joint: connected body %llu has no 2D body",
-			         (unsigned long long)jc->connected_body);
-			return;
-		}
+	if (!rt || !cb) return;
+	for (int i = 0; i < rt->script_count; ++i) {
+		const struct ScriptEntry *se = &rt->scripts[i];
+		JceScriptCostInfo info;
+		info.entity      = (uint64_t)se->entity;
+		info.script_path = se->script_path;
+		info.last_ms     = se->cost_last_ms;
+		info.avg_ms      = (se->cost_calls > 0)
+		                 ? (se->cost_total_ms / (double)se->cost_calls)
+		                 : 0.0;
+		info.calls       = se->cost_calls;
+		info.active      = se->active;
+		info.measured    = se->cost_measured;
+		cb(&info, user);
 	}
-
-	JcePhysics2DJointDesc jd;
-	memset(&jd, 0, sizeof jd);
-	jd.kind              = jc->kind;
-	jd.body_a            = a;
-	jd.body_b            = b;   /* JCE_BODY_INVALID => world anchor */
-	jd.anchor_a.x        = jc->anchor[0];
-	jd.anchor_a.y        = jc->anchor[1];
-	jd.anchor_b.x        = jc->connected_anchor[0];
-	jd.anchor_b.y        = jc->connected_anchor[1];
-	jd.distance          = jc->distance;
-	jd.frequency_hz      = jc->frequency;
-	jd.damping_ratio     = jc->damping_ratio;
-	jd.use_motor         = jc->use_motor;
-	jd.motor_speed_rad_s = jc->motor_speed_deg_s * JCE_DEG2RAD;
-	jd.motor_max_torque  = jc->motor_max_torque;
-	jd.use_limits        = jc->use_limits;
-	jd.lower_angle_rad   = jc->lower_angle_deg * JCE_DEG2RAD;
-	jd.upper_angle_rad   = jc->upper_angle_deg * JCE_DEG2RAD;
-
-	JceConstraintHandle h = jce_physics2d_joint_create(rt->physics2d, &jd);
-	if (!jce_constraint_valid(h)) return;
-
-	/* Track for teardown.  If the registry can't grow the joint is still live
-	 * in rt->physics2d (freed by jce_physics2d_destroy), it just won't be
-	 * explicitly destroyed early — acceptable degradation. */
-	if (rt->joint2d_count >= rt->joint2d_cap && !rt_grow_joints2d(rt))
-		return;
-	Joint2DEntry *je = &rt->joints2d[rt->joint2d_count++];
-	je->entity = e;
-	je->handle = h;
 }
+
+void jce_runtime_reset_script_costs(JceRuntime *rt)
+{
+	if (!rt) return;
+	for (int i = 0; i < rt->script_count; ++i) {
+		rt->scripts[i].cost_total_ms = 0.0;
+		rt->scripts[i].cost_calls    = 0u;
+		/* last_ms and measured survive a reset on purpose: the panel shows
+		 * the most recent frame's cost continuously, and clearing `measured`
+		 * would make a row that HAS been timed claim it never was until the
+		 * next frame arrives. */
+	}
+}
+
+/* rt_spawn_joint2d lives in jce_rt_physics.c beside rt_spawn_body2d, the
+ * body it needs -- and out of this file, which is at its size baseline. */
+
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
 
-/* First clip whose name contains `want` (case-insensitive), or -1. */
-static int rt_clip_by_name(const JceSkeletalAnimatorComponent *sa, const char *want)
-{
-	if (!sa) return -1;
-	for (int i = 0; i < sa->clip_count && i < 8; i++) {
-		for (const char *p = sa->clip_names[i]; *p; p++) {
-			int k = 0;
-			while (want[k] &&
-			       tolower((unsigned char)p[k]) == tolower((unsigned char)want[k]))
-				k++;
-			if (!want[k]) return i;
-		}
-	}
-	return -1;
-}
-
-static void rt_drive_character(JceRuntime *rt, float dt)
-{
-	if (!rt->physics || !jce_character_valid(rt->character)) return;
-	if (dt <= 0.0f) dt = 1.0f / 60.0f;
-
-	/* Direction (clamped to unit length) × authored speed: movement feel
-	 * comes from the CharacterController component, not the caller.
-	 * speed_mult stays an extra gameplay multiplier (crouch, slow zones). */
-	float dx = rt->input.walk_x, dz = rt->input.walk_z;
-	float dl = sqrtf(dx * dx + dz * dz);
-	if (dl > 1.0f) { dx /= dl; dz /= dl; dl = 1.0f; }
-	float m = rt->input.speed_mult > 0.0f ? rt->input.speed_mult : 1.0f;
-	if (rt->input.sprint) m *= rt->char_sprint_mult;
-	float    speed = rt->char_move_speed * m;
-	jce_vec3 walk  = jce_v3(dx * speed, 0.0f, dz * speed);
-	jce_physics_character_move(rt->physics, rt->character, walk, dt);
-
-	/* Jump with buffering + coyote time: a press up to JUMP_BUFFER s early
-	 * still fires on landing, and stepping off a ledge keeps a JUMP_COYOTE
-	 * grace window — both standard platformer forgiveness mechanics. */
-	const float JUMP_BUFFER = 0.12f, JUMP_COYOTE = 0.12f;
-	bool grounded = jce_physics_character_is_grounded(rt->physics, rt->character);
-	rt->char_coyote_t = grounded ? JUMP_COYOTE : rt->char_coyote_t - dt;
-	if (rt->input.jump_pressed) {
-		rt->char_jump_buf_t    = JUMP_BUFFER;
-		rt->input.jump_pressed = false;
-	} else if (rt->char_jump_buf_t > 0.0f) {
-		rt->char_jump_buf_t -= dt;
-	}
-	bool jumped = false;
-	if (rt->char_jump_buf_t > 0.0f && (grounded || rt->char_coyote_t > 0.0f)) {
-		/* Only consume the buffer / pulse the anim trigger when the jump
-		 * actually fired (the physics layer refuses mid-ascent repeats). */
-		if (jce_physics_character_jump(rt->physics, rt->character)) {
-			rt->char_jump_buf_t = 0.0f;
-			rt->char_coyote_t   = 0.0f;
-			jumped = true;
-		}
-	}
-	/* Variable jump height: releasing jump while ascending cuts the rest
-	 * of the rise, so taps hop and holds clear the full arc. */
-	if (rt->char_jump_was_held && !rt->input.jump_held && !grounded)
-		jce_physics_character_cut_jump(rt->physics, rt->character, 0.45f);
-	rt->char_jump_was_held = rt->input.jump_held;
-
-	/* Generic locomotion (engine-level, so it works in Play AND shipped):
-	 * turn the character toward its move direction and feed the live
-	 * physics state to whatever animation driver the entity carries. */
-	if (rt->scene && rt->character_entity != 0) {
-		JceTransform *tf = jce_scene_get_transform(rt->scene, rt->character_entity);
-		jce_vec3 vel = jce_v3(0.0f, 0.0f, 0.0f);
-		jce_physics_character_get_velocity(rt->physics, rt->character, &vel);
-		float plan_speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
-
-		/* Smooth shortest-arc turn at the authored turn speed (the old
-		 * instant snap reads as robotic with a real model). */
-		if (tf && dl > 0.0001f) {
-			if (!rt->char_yaw_valid) {
-				jce_vec3 fwd = jce_q_rotate(tf->rotation, jce_v3(0.0f, 0.0f, 1.0f));
-				rt->char_yaw       = atan2f(fwd.x, fwd.z);
-				rt->char_yaw_valid = true;
-			}
-			float target = atan2f(dx, dz);
-			float diff   = target - rt->char_yaw;
-			while (diff >  JCE_PI) diff -= 2.0f * JCE_PI;
-			while (diff < -JCE_PI) diff += 2.0f * JCE_PI;
-			float max_turn = rt->char_turn_speed * dt;
-			if (diff >  max_turn) diff =  max_turn;
-			if (diff < -max_turn) diff = -max_turn;
-			rt->char_yaw += diff;
-			tf->rotation = jce_q_from_axis_angle(jce_v3(0.0f, 1.0f, 0.0f),
-			                                     rt->char_yaw);
-			rt->char_last_rot = tf->rotation;  /* our own yaw, not a gizmo edit */
-		}
-		if (jce_scene_has_skeletal_animator(rt->scene, rt->character_entity)) {
-			JceSkeletalAnimatorComponent *sa =
-				jce_scene_get_skeletal_animator(rt->scene, rt->character_entity);
-			/* Live locomotion state for the renderer's SM / blend-tree
-			 * driver (consumed when auto_speed is set): physics velocity is
-			 * steadier than the transform-derived estimate, and grounded /
-			 * vertical-velocity / jump unlock Jump+Fall+Land SM states. */
-			sa->loco_valid    = true;
-			sa->loco_grounded = grounded;
-			sa->loco_speed    = plan_speed;
-			sa->loco_vert_vel = vel.y;
-			if (jumped) sa->loco_jump = true;   /* one-shot, consumer clears */
-			/* If an animation state machine is bound it OWNS active_clip
-			 * (driven by the engine "Speed" param in the renderer). Setting
-			 * the clip by name here too would fight the SM every frame and
-			 * make it flicker — only name-drive when there is no SM. */
-			if (!sa->sm_path[0]) {
-				int idx = -1;
-				if (!grounded && rt->char_coyote_t <= 0.0f) {
-					/* Airborne: prefer a jump/fall clip when the model has
-					 * one; otherwise keep the current ground clip. */
-					idx = rt_clip_by_name(sa, vel.y > 0.5f ? "jump" : "fall");
-					if (idx < 0) idx = rt_clip_by_name(sa, "jump");
-				} else {
-					const char *want =
-					    (plan_speed <= 0.15f) ? "idle"
-					  : (plan_speed > rt->char_move_speed * 1.15f) ? "run"
-					                                               : "walk";
-					idx = rt_clip_by_name(sa, want);
-					if (idx < 0 && plan_speed > 0.15f)
-						idx = rt_clip_by_name(sa, "walk");
-				}
-				if (idx >= 0) sa->active_clip = idx;
-			}
-			sa->playing = true;
-		}
-	}
-}
+/* rt_clip_by_name + rt_drive_character moved to jce_rt_character.c.
+ * See the size-gate note at the top of that file. */
 
 /* Per fixed tick: map player input into each PLAYER-driven vehicle.  SCRIPT-mode
  * vehicles keep whatever the host/script API last set (we never overwrite them).
@@ -1431,12 +1367,12 @@ static void rt_drive_vehicles(JceRuntime *rt)
 		float throttle = rt->input.walk_z;
 		float steer    = rt->input.walk_x;
 		float brake    = (rt->input.jump_pressed || rt->input.jump_held) ? 1.0f : 0.0f;
-		if (throttle >  1.0f) throttle =  1.0f;
-		if (throttle < -1.0f) throttle = -1.0f;
-		if (steer    >  1.0f) steer    =  1.0f;
-		if (steer    < -1.0f) steer    = -1.0f;
+		throttle = throttle > 1.0f ? 1.0f : (throttle < -1.0f ? -1.0f : throttle);
+		steer    = steer    > 1.0f ? 1.0f : (steer    < -1.0f ? -1.0f : steer);
 		jce_physics_vehicle_set_input(rt->physics, ve->veh, throttle, brake, steer);
 	}
+	/* Authored per-wheel trim, AFTER the vehicle-level input it stacks on. */
+	rt_apply_wheel_trim(rt);
 }
 
 /* POST-step: write each vehicle's chassis pose back to its entity Transform, and
@@ -1456,8 +1392,15 @@ static void rt_sync_vehicles(JceRuntime *rt)
 		                                          &cpos, &crot);
 		JceTransform *ctf = jce_scene_get_transform(rt->scene, ve->entity);
 		if (ctf) {
-			ctf->position = cpos;
-			ctf->rotation = crot;
+			/* cpos/crot are the chassis's WORLD pose from Bullet.  Written
+			 * raw, a vehicle parented to anything (a carrier, a level group,
+			 * a spawn anchor) was drawn at double its parent's offset.  The
+			 * WHEEL loop below was already the one place in this runtime that
+			 * did the world->local conversion properly -- it builds cinv and
+			 * takes each wheel into the chassis frame -- which is what made
+			 * the three lines above it stand out. */
+			jce_scene_solve_local_pose(rt->scene, ve->entity, cpos, crot,
+			                           &ctf->position, &ctf->rotation);
 			/* Subtree push covers the wheel child entities written below. */
 			jce_scene_notify_physics_writeback_entity(rt->scene, ve->entity);
 		}
@@ -1499,33 +1442,87 @@ static void rt_sync_vehicles(JceRuntime *rt)
  * the comparison is dimensionally correct.)  On break we destroy the constraint
  * and swap-remove the entry so the freed handle is never re-queried.
  *
- * break_torque is NOT separately monitored here: getAppliedImpulse() returns a
- * single combined magnitude, not a separable angular component, so a dedicated
- * torque-break would need a per-axis feedback query (documented follow-up).
+ * break_torque is monitored too, through the constraint's JOINT FEEDBACK --
+ * getAppliedImpulse() has no separable angular part, which is why that field
+ * was authored, serialised, copied here and read by nothing.  The thresholds
+ * scale differently on purpose and test_jce_joint_break_torque.c measures it.
  *
  * Gated on cfg_joint_count -> a scene with no configurable joints early-outs at
  * zero cost (the hot fixed-step path is byte-identical). */
+typedef struct { JceRuntime *rt; float dt; } CfgJointSweep;
+
+static bool rt_cfg_joint_breaks(void *entry, void *user)
+{
+	ConfigJointEntry *ce = (ConfigJointEntry *)entry;
+	CfgJointSweep *cs = (CfgJointSweep *)user;
+
+	/* EITHER limit breaks the joint, and each is independent: <= 0 means
+	 * "unlimited on this axis", so a joint that snaps under twisting but
+	 * never under pulling is expressible.  Testing both under one `if` would
+	 * have made an unset break_force silently disable break_torque. */
+	if (ce->break_force > 0.0f) {
+		float imp = jce_physics_constraint_applied_impulse(cs->rt->physics,
+		                                                   ce->handle);
+		if (imp > ce->break_force * cs->dt) return true;
+	}
+	if (ce->break_torque > 0.0f) {
+		float tq = jce_physics_constraint_applied_torque(cs->rt->physics,
+		                                                 ce->handle);
+		if (tq > ce->break_torque) return true;
+	}
+	return false;
+}
+
+static void rt_cfg_joint_destroy(void *entry, void *user)
+{
+	ConfigJointEntry *ce = (ConfigJointEntry *)entry;
+	CfgJointSweep *cs = (CfgJointSweep *)user;
+	jce_physics_constraint_destroy(cs->rt->physics, ce->handle);
+}
+
+/* Push a typed constraint's authored motor into the solver WHEN IT CHANGES.
+ *
+ * The comparison is against what this entry last pushed, not against a
+ * default: an unchanged motor must cost nothing, because
+ * jce_physics_constraint_set_motor also wakes both bodies and a per-tick call
+ * would stop anything jointed from ever sleeping.
+ *
+ * A component that disappeared (the entity lost it, or was destroyed) leaves
+ * the entry alone -- the constraint is still live and still driven by whatever
+ * was last pushed.  Destroying it here would be a second owner for a handle
+ * the teardown path already owns. */
+static void rt_sync_joint_motors(JceRuntime *rt)
+{
+	if (!rt->physics || !rt->scene || rt->joint_count == 0) return;
+	for (int i = 0; i < rt->joint_count; ++i) {
+		JointEntry *je = &rt->joints[i];
+		if (!jce_constraint_valid(je->handle)) continue;
+		const JceConstraintComponent *cn =
+			jce_scene_get_constraint(rt->scene, je->entity);
+		if (!cn) continue;
+		if (cn->use_motor == je->motor_on &&
+		    cn->motor_target_velocity == je->motor_target &&
+		    cn->motor_max_force == je->motor_max_force)
+			continue;
+		je->motor_on        = cn->use_motor;
+		je->motor_target    = cn->motor_target_velocity;
+		je->motor_max_force = cn->motor_max_force;
+		jce_physics_constraint_set_motor(rt->physics, je->handle,
+		                                 je->motor_on, je->motor_target,
+		                                 je->motor_max_force);
+	}
+}
+
 static void rt_monitor_configurable_joints(JceRuntime *rt, float fixed_dt)
 {
 	if (!rt->physics || rt->cfg_joint_count == 0) return;
 	if (fixed_dt <= 0.0f) fixed_dt = 1.0f / 60.0f;
-
-	for (int i = 0; i < rt->cfg_joint_count; ) {
-		ConfigJointEntry *ce = &rt->cfg_joints[i];
-		if (ce->break_force > 0.0f) {
-			float imp = jce_physics_constraint_applied_impulse(rt->physics,
-			                                                   ce->handle);
-			if (imp > ce->break_force * fixed_dt) {
-				/* The constraint snaps: free it now (rt->physics owns it) and
-				 * swap-remove the entry so the freed handle is never re-checked
-				 * — do NOT advance i, the swapped-in entry occupies this slot. */
-				jce_physics_constraint_destroy(rt->physics, ce->handle);
-				rt->cfg_joints[i] = rt->cfg_joints[--rt->cfg_joint_count];
-				continue;
-			}
-		}
-		++i;
-	}
+	CfgJointSweep cs = { rt, fixed_dt };
+	rt->cfg_joint_count = rt_break_sweep(rt->cfg_joints,
+	                                     sizeof(rt->cfg_joints[0]),
+	                                     rt->cfg_joint_count,
+	                                     rt_cfg_joint_breaks,
+	                                     rt_cfg_joint_destroy, &cs);
 }
 
 /* POST-step: write each soft body's CENTROID back to its entity Transform so it
@@ -1540,9 +1537,18 @@ static void rt_sync_softbodies(JceRuntime *rt)
 		SoftBodyEntry *se = &rt->softbodies[i];
 		jce_vec3 c = jce_v3(0.0f, 0.0f, 0.0f);
 		if (!jce_softbody_get_center(se->handle, &c)) continue;
+		/* jce_softbody_get_center returns a WORLD centre -- the soft solver
+		 * simulates in world space and knows nothing about the hierarchy.
+		 * rt_try_spawn_softbody now receives the world pose, so writing the
+		 * result back into the raw Transform would place a parented soft body
+		 * correctly and then DRAW it at double its parent's offset. */
 		JceTransform *tf = jce_scene_get_transform(rt->scene, se->entity);
-		if (tf) {
-			tf->position = c;
+		jce_quat wr;
+		if (tf && jce_scene_get_world_pose(rt->scene, se->entity, NULL, &wr,
+		                                   NULL)) {
+			/* In place + notify, the established write-back shape. */
+			jce_scene_solve_local_pose(rt->scene, se->entity, c, wr,
+			                           &tf->position, NULL);
 			jce_scene_notify_physics_writeback_entity(rt->scene, se->entity);
 		}
 	}
@@ -1564,10 +1570,17 @@ static void rt_predict_write_state(JceRuntime *rt, const JcePredictState *st)
 	JceTransform *cur = jce_scene_get_transform(rt->scene,
 	                                            (JceEntity)rt->predict_entity);
 	if (!cur) return;
-	JceTransform t = *cur;   /* copy to avoid src==dst aliasing in set */
-	t.position = jce_v3(st->pos[0], st->pos[1], st->pos[2]);
-	t.rotation = jce_q_from_axis_angle(jce_v3(0.0f, 1.0f, 0.0f), st->yaw);
-	jce_scene_set_transform(rt->scene, (JceEntity)rt->predict_entity, &t);
+	/* A predicted pose is WORLD -- the integrator and the server both speak
+	 * world metres and neither knows this entity has a parent.  Written raw,
+	 * a predicted entity parented to anything reconciled against its parent's
+	 * offset.  This site goes through set_transform (it runs once per tick for
+	 * ONE entity, not per body per frame), so the convenience setter is the
+	 * right one here and the in-place solve is not needed. */
+	(void)cur;
+	jce_scene_set_world_pose(rt->scene, (JceEntity)rt->predict_entity,
+	                         jce_v3(st->pos[0], st->pos[1], st->pos[2]),
+	                         jce_q_from_axis_angle(jce_v3(0.0f, 1.0f, 0.0f),
+	                                               st->yaw));
 }
 
 /* Predict one tick forward from the latest input, then write the predicted
@@ -1734,11 +1747,25 @@ static void rt_push_external_transforms(JceRuntime *rt)
 	if (!rt->physics || !rt->scene) return;
 	for (int i = 0; i < rt->body_count; ++i) {
 		BodyEntry *be = &rt->bodies[i];
-		JceTransform *tc = jce_scene_get_transform(rt->scene, be->entity);
-		if (!tc) continue;
+		/* WORLD, not the raw JceTransform -- see rt_spawn_entity.  This pass
+		 * detects that somebody moved the entity, so both ends of the cache
+		 * must speak one space: last_* are world, written by
+		 * rt_sync_transforms through this same call.
+		 *
+		 * A CONSEQUENCE WORTH NAMING: a collider parented to something that
+		 * MOVES now follows it, because the parent moving changes the child's
+		 * world pose and this pass sees exactly that.  Before, it did not
+		 * follow its parent at all -- it sat at its local offset from the
+		 * world origin, which is why Unity's caution about parenting a
+		 * Rigidbody to a moving object had no counterpart here. */
+		jce_vec3 wpos, wscale;
+		jce_quat wrot;
+		if (!jce_scene_get_world_pose(rt->scene, be->entity, &wpos, &wrot,
+		                              &wscale))
+			continue;
 
-		bool pos_changed = rt_v3_changed(tc->position, be->last_pos);
-		bool rot_changed = rt_q_changed(tc->rotation, be->last_rot);
+		bool pos_changed = rt_v3_changed(wpos, be->last_pos);
+		bool rot_changed = rt_q_changed(wrot, be->last_rot);
 		if (pos_changed ||
 		    (rot_changed && be->kind != (uint8_t)JCE_BODY_DYNAMIC)) {
 			/* Position move (any kind) or rotation of a non-dynamic body =
@@ -1746,19 +1773,19 @@ static void rt_push_external_transforms(JceRuntime *rt)
 			 * is the collider CENTER, so re-apply the (rotated) collider offset
 			 * — otherwise a moved entity collapses an offset collider onto its
 			 * origin. */
-			jce_vec3 body_center = jce_v3_add(tc->position,
-			                       jce_q_rotate(tc->rotation, be->center_local));
+			jce_vec3 body_center = jce_v3_add(wpos,
+			                       jce_q_rotate(wrot, be->center_local));
 			jce_physics_body_set_transform(rt->physics, be->body,
-			                               body_center, tc->rotation);
-			be->last_pos = tc->position;   /* entity-space (edit-detect cache) */
-			be->last_rot = tc->rotation;
+			                               body_center, wrot);
+			be->last_pos = wpos;           /* WORLD (edit-detect cache) */
+			be->last_rot = wrot;
 			/* Teleport: collapse both interpolation endpoints onto the new body
 			 * CENTER so the next sync blends to a no-op instead of sliding the
 			 * body in from its pre-edit physics position. */
 			be->prev_pos = body_center;
-			be->prev_rot = tc->rotation;
+			be->prev_rot = wrot;
 			be->cur_pos  = body_center;
-			be->cur_rot  = tc->rotation;
+			be->cur_rot  = wrot;
 		} else if (rot_changed) {
 			/* DYNAMIC body, rotation-only edit (a gameplay script facing the
 			 * body toward a target EVERY frame while physics owns its motion).
@@ -1770,31 +1797,39 @@ static void rt_push_external_transforms(JceRuntime *rt)
 			 * comes from the scene Transform rotation, which rt_sync_transforms
 			 * preserves for freeze-rotation bodies (it would otherwise overwrite
 			 * it with the body's locked physics rotation). */
-			be->last_rot = tc->rotation;
+			be->last_rot = wrot;
 		}
-		if (rt_v3_changed(tc->scale, be->last_scale)) {
+		if (rt_v3_changed(wscale, be->last_scale)) {
+			/* World scale, matched to spawn_scale which rt_track_body now
+			 * records from the same world pose -- a child of a scaled parent
+			 * used to size its collider from the local scale and then compare
+			 * against it forever, so a parent being scaled resized the mesh
+			 * and left the collider alone. */
 			jce_vec3 ratio;
-			ratio.x = be->spawn_scale.x != 0.0f ? tc->scale.x / be->spawn_scale.x : 1.0f;
-			ratio.y = be->spawn_scale.y != 0.0f ? tc->scale.y / be->spawn_scale.y : 1.0f;
-			ratio.z = be->spawn_scale.z != 0.0f ? tc->scale.z / be->spawn_scale.z : 1.0f;
+			ratio.x = be->spawn_scale.x != 0.0f ? wscale.x / be->spawn_scale.x : 1.0f;
+			ratio.y = be->spawn_scale.y != 0.0f ? wscale.y / be->spawn_scale.y : 1.0f;
+			ratio.z = be->spawn_scale.z != 0.0f ? wscale.z / be->spawn_scale.z : 1.0f;
 			jce_physics_body_set_scale(rt->physics, be->body, ratio);
-			be->last_scale = tc->scale;
+			be->last_scale = wscale;
 		}
 	}
 
 	/* Character (kept out of bodies[]): honor a gizmo TRS edit during Play by
 	 * warping the kinematic capsule to the edited feet pose (feet -> center). */
 	if (jce_character_valid(rt->character) && rt->character_entity != 0) {
-		JceTransform *tc = jce_scene_get_transform(rt->scene, rt->character_entity);
-		if (tc && (rt_v3_changed(tc->position, rt->char_last_pos) ||
-		           rt_q_changed(tc->rotation, rt->char_last_rot))) {
-			jce_vec3 center = tc->position;
+		jce_vec3 cwpos;
+		jce_quat cwrot;
+		if (jce_scene_get_world_pose(rt->scene, rt->character_entity, &cwpos,
+		                             &cwrot, NULL) &&
+		    (rt_v3_changed(cwpos, rt->char_last_pos) ||
+		     rt_q_changed(cwrot, rt->char_last_rot))) {
+			jce_vec3 center = cwpos;                 /* WORLD feet, see above */
 			center.y += rt->character_half_height;   /* feet -> capsule center */
 			jce_physics_character_set_position(rt->physics, rt->character, center);
 			rt->char_prev_pos = center;              /* collapse interpolation */
 			rt->char_cur_pos  = center;
-			rt->char_last_pos = tc->position;        /* feet */
-			rt->char_last_rot = tc->rotation;
+			rt->char_last_pos = cwpos;               /* feet, world */
+			rt->char_last_rot = cwrot;
 		}
 	}
 }
@@ -2322,12 +2357,47 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 			const JceRigidBodyComponent *rbc =
 				jce_scene_get_rigidbody(rt->scene, be->entity);
 			bool freeze = rbc && rbc->freeze_rotation;
-			tc->position = origin;
-			if (!freeze) tc->rotation = q;
-			/* Refresh the cache so the interpolated pose we just wrote isn't
-			 * mistaken for an external edit next frame. */
-			be->last_pos = origin;
-			be->last_rot = freeze ? tc->rotation : q;
+
+			/* `origin` IS A WORLD POSE.  Writing it into tc->position was
+			 * correct only because every body used to be treated as a root:
+			 * for a parented entity the renderer then composes
+			 * parent_world * local, so a simulated child was DRAWN AT DOUBLE
+			 * THE PARENT OFFSET -- the mirror image of the spawn bug, and the
+			 * one nobody reports, because it does not look like physics being
+			 * wrong.  set_world_pose solves the local TRS that puts it there;
+			 * on a root it assigns verbatim, which is byte-for-byte what this
+			 * line did before. */
+			jce_quat want_rot = q;
+			if (freeze) {
+				/* A freeze-rotation body's facing belongs to the script that
+				 * set it, and the setter takes a WORLD rotation -- handing it
+				 * the LOCAL tc->rotation would re-interpret a child's facing
+				 * as a world one and turn it by its parent's orientation
+				 * every single frame.  Ask for the rotation the entity
+				 * actually has, so writing it back is a no-op. */
+				jce_scene_get_world_pose(rt->scene, be->entity, NULL,
+				                         &want_rot, NULL);
+			}
+			/* SOLVED, THEN WRITTEN IN PLACE -- not through
+			 * jce_scene_set_world_pose, which goes through
+			 * jce_scene_set_transform and bumps the entity subtree's
+			 * world-cache generation.  This loop runs for every non-static
+			 * body every frame, and not paying that is exactly why these
+			 * writes are in place and the entities are named afterwards.
+			 * The solve is the shared primitive, so one place still knows
+			 * the world->local math.  Every other in-place write-back below
+			 * cites this paragraph. */
+			jce_scene_solve_local_pose(rt->scene, be->entity, origin, want_rot,
+			                           &tc->position, &tc->rotation);
+
+			/* READ THE CACHE BACK rather than storing what we asked for:
+			 * under a parent the solve and the recomposition each go through
+			 * a decomposition, and that residual is easily larger than
+			 * rt_v3_changed's 1e-5 -- which would make every frame look like
+			 * an external edit and teleport the body into its own
+			 * simulation.  On a root it is a struct copy. */
+			jce_scene_get_world_pose(rt->scene, be->entity, &be->last_pos,
+			                         &be->last_rot, NULL);
 			jce_scene_notify_physics_writeback_entity(rt->scene, be->entity);
 			wrote_any = true;
 		}
@@ -2338,11 +2408,23 @@ static void rt_sync_transforms(JceRuntime *rt, float alpha)
 			? jce_v3_lerp(rt->char_prev_pos, rt->char_cur_pos, alpha)
 			: rt->char_cur_pos;
 		cp.y -= rt->character_half_height;   /* capsule center -> feet */
+		/* World, solved back into whatever frame the character lives in --
+		 * see rt_sync_transforms' body loop above.  A character parented to
+		 * anything (a vehicle interior, a moving platform, a spawn group) was
+		 * drawn at double its parent's offset. */
 		JceTransform *tc = jce_scene_get_transform(rt->scene,
 		                                            rt->character_entity);
-		if (tc) {
-			tc->position = cp;
-			rt->char_last_pos = cp;          /* next frame's edit-detect no-op */
+		jce_quat crot;
+		if (tc && jce_scene_get_world_pose(rt->scene, rt->character_entity,
+		                                   NULL, &crot, NULL)) {
+			/* In place, for the same reason as the body loop above. */
+			jce_scene_solve_local_pose(rt->scene, rt->character_entity, cp,
+			                           crot, &tc->position, NULL);
+			/* Read back, not the value we asked for: under a parent the
+			 * round trip goes through two decompositions and the residual
+			 * would read as an external edit next frame. */
+			jce_scene_get_world_pose(rt->scene, rt->character_entity,
+			                         &rt->char_last_pos, NULL, NULL);
 			jce_scene_notify_physics_writeback_entity(rt->scene,
 			                                          rt->character_entity);
 			wrote_any = true;
@@ -2794,19 +2876,33 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 				}
 			}
 			if (body_driven) continue;
+			/* The agent's position and the navmesh snap are WORLD metres --
+			 * the crowd solver and the navmesh have no idea this entity has
+			 * a parent.  Writing them into the raw Transform put an agent
+			 * parented to anything at its parent's offset PLUS the solver's
+			 * answer, so it walked a correct path in the wrong place.  Start
+			 * from the entity's current world pose so the untouched axis (y,
+			 * when there is no navmesh to snap to) keeps its world value
+			 * rather than being read as a local one. */
 			JceTransform *tc = jce_scene_get_transform(rt->scene, ne->entity);
-			if (!tc) continue;
+			jce_vec3 wp;
+			jce_quat wr;
+			if (!tc || !jce_scene_get_world_pose(rt->scene, ne->entity, &wp,
+			                                     &wr, NULL))
+				continue;
 			float x, z;
 			jce_nav_agent_get_position(rt->nav_agents, ne->handle, &x, &z);
-			tc->position.x = x;
-			tc->position.z = z;
+			wp.x = x;
+			wp.z = z;
 			float sx, sy, sz;
 			if (rt->nav_recast &&
 			    jce_recast_snap_to_navmesh(rt->nav_recast, x, z, &sx, &sy, &sz))
-				tc->position.y = sy;
-			/* In-place write with no set_transform: name the entity for the
-			 * renderer's incremental repair (was covered only by the physics
-			 * blanket overflow). */
+				wp.y = sy;
+			/* In place + notify, the established write-back shape. */
+			jce_scene_solve_local_pose(rt->scene, ne->entity, wp, wr,
+			                           &tc->position, NULL);
+			/* Name the entity for the renderer's incremental repair (was
+			 * covered only by the physics blanket overflow). */
 			jce_scene_notify_physics_writeback_entity(rt->scene, ne->entity);
 		}
 	} else if (rt->nav_agents && jce_nav_agent_set_count(rt->nav_agents) > 0) {
@@ -2985,6 +3081,11 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 				jce_file_watcher_poll(rt->script_watcher);
 			}
 		}
+		/* Read ONCE per frame, not per script: a per-script read of the
+		 * profiling gate would be the very overhead the gate exists to
+		 * avoid. */
+		const bool prof = (jce_perf_phase_enabled() != 0);
+		double script_ms_total = 0.0;
 		for (int i = 0; i < rt->script_count; ++i) {
 			if (!rt->scripts[i].active) continue;
 			/* Simulation-LOD gate: a tiered entity's on_update fires only at its
@@ -3001,8 +3102,27 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 			                     &rt->scripts[i].simlod_prev_tier,
 			                     true, &s_dt))
 				continue;
-			rt_script_ref_update(rt->scripts[i].ref, s_dt);
+			if (prof) {
+				const uint64_t _t0 = jce_time_perf_counter();
+				rt_script_ref_update(rt->scripts[i].ref, s_dt);
+				const double ms = jce_time_perf_to_ms(
+					_t0, jce_time_perf_counter());
+				rt->scripts[i].cost_last_ms   = ms;
+				rt->scripts[i].cost_total_ms += ms;
+				rt->scripts[i].cost_calls++;
+				rt->scripts[i].cost_measured  = true;
+				script_ms_total += ms;
+			} else {
+				rt_script_ref_update(rt->scripts[i].ref, s_dt);
+			}
 		}
+		/* The aggregate, so "is scripting costing me anything" is answerable
+		 * from the CPU-phase table the profiler already draws.  Until this
+		 * existed on_update was inside the `gameplay` bucket together with
+		 * trigger overlap, spawn density, GAS replication, ragdoll blending
+		 * and weapon timers -- one number for six things. */
+		if (prof)
+			jce_perf_phase_add("script", script_ms_total);
 		/* Advance cooperative coroutines (jce.start_coroutine / wait_seconds)
 		 * with the same time-scaled dt the per-instance updates saw.  These are
 		 * shared cooperative timers, not per-entity, so they stay every-frame. */
@@ -3199,6 +3319,18 @@ static void rt_unwire_entity_gameplay(JceRuntime *rt, JceEntity e)
 			rt->vehicles[i] = rt->vehicles[--rt->vehicle_count];
 			break;
 		}
+		/* Typed constraint — constraint in rt->physics.  Dropped rather
+		 * than destroyed for the same reason the configurable one is
+		 * destroyed: that one may need to break early, this one never
+		 * does, and jce_physics_destroy frees both. */
+		for (int i = 0; i < rt->joint_count; ++i) {
+			if (rt->joints[i].entity != e) continue;
+			if (jce_constraint_valid(rt->joints[i].handle))
+				jce_physics_constraint_destroy(rt->physics,
+				                               rt->joints[i].handle);
+			rt->joints[i] = rt->joints[--rt->joint_count];
+			break;
+		}
 		/* Configurable joint — constraint in rt->physics. */
 		for (int i = 0; i < rt->cfg_joint_count; ++i) {
 			if (rt->cfg_joints[i].entity != e) continue;
@@ -3339,9 +3471,7 @@ static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 	for (int i = 0; i < rt->pending_audio_count; ++i) {
 		RtPendingAudio *p = &rt->pending_audio[i];
 		if (p->task) {
-			(void)jce_async_task_cancel(p->task);
-			jce_async_task_wait(p->task);
-			jce_async_task_release(p->task);
+			(void)jce_async_task_discard(p->task);
 			p->task = NULL;
 		}
 		if (p->args) {
@@ -3546,6 +3676,7 @@ static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 	/* Net bridge is per-scene wiring (the session itself is process-global). */
 	rt->net_bridged   = false;
 	rt->net_obj_count = 0;
+	rt->net_animator_count = 0;
 	/* Drop any per-client uploaded input so a transitioned / re-spawned scene
 	 * (whose net ids + ownership are rebuilt) starts with a clean store. */
 	jce_input_command_store_reset();
@@ -3676,10 +3807,17 @@ static void rt_spawn_scene_state(JceRuntime *rt)
 	if (rt->save_registry)
 		jce_save_register_scene_provider_ex(rt->save_registry, rt->scene,
 		                                    rt->save_migrations);
+	/* Its live environment too: the hour and the wetness/snow integrators are
+	 * earned by a session and cannot be re-derived. */
+	if (rt->save_registry)
+		jce_save_register_env_provider(rt->save_registry, rt->scene);
 
 	/* Networking bridge for the new scene's Net* components. */
 	rt->net_session_driven = (jce_session_mode() != JCE_SESSION_MODE_NONE);
 	rt_init_net_bridge(rt);
+
+	/* After the scene spawns: chunks register against a live scene. */
+	rt_streaming_begin(rt);
 }
 
 /* ── Sequencer event / camera-cut dispatch (FEATURE 8.4) ──────────────
@@ -3971,6 +4109,7 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	/* Save / snapshot (P2-save-snapshot): stand up a registry with the
 	 * scene/ECS provider so SavePoint overlaps + game code can persist and
 	 * restore the session.  saves_dir (optional) is the SavePoint write base. */
+	rt->asset_fs = desc->asset_fs;   /* borrowed; the host owns it */
 	rt->save_registry = jce_snapshot_registry_create();
 	/* Migration registry: future schema bumps register "scene_ecs" upgrade
 	 * steps here so older saves load instead of being refused.  Empty today
@@ -3989,16 +4128,27 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	rt_spawn_scene_state(rt);
 
 	jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
-	              "runtime: physics=%s bodies=%d bodies2d=%d character=%s voices=%d",
+	              "runtime: physics=%s bodies=%d bodies2d=%d character=%s/%u "
+	              "voices=%d",
 	              rt->physics ? "on" : "off",
 	              rt->body_count,
 	              rt->body2d_count,
-	              jce_character_valid(rt->character) ? "yes" : "no",
+	              jce_character_valid(rt->character) ? "1" : "0",
+	              rt->character_authored,
 	              rt->voice_count);
+	/* Every field below is COUNTED.  This line used to end with a literal
+	 * "(deferred: ai_steering, anim-events, ik, sprite-anim)" and three of the
+	 * four had shipped: jce_anim_events_advance, the jce_anim_ik_*_solve family
+	 * and jce_sprite_player_update all run in jce_sr_anim.c, which the editor
+	 * and a shipped game both drive.  So the runtime's own boot log answered
+	 * "why does my animation event not fire" with "deferred" while it worked.
+	 * The fourth is not pending wiring either -- jce_ai_ecs.h is a
+	 * caller-driven adapter, ticked from game code over a flecs world the
+	 * runtime does not own.  Deleted rather than corrected: a status line that
+	 * reports a STRING LITERAL can only be right about the day it was typed. */
 	jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
 	              "runtime: gameplay bridge -> triggers=%d spawners=%d weapons=%d "
-	              "save_points=%d bt_ctx=%s behavior_trees=%d net_session=%s "
-	              "(deferred: ai_steering, anim-events, ik, sprite-anim)",
+	              "save_points=%d bt_ctx=%s behavior_trees=%d net_session=%s",
 	              rt->trigger_count,
 	              rt->spawn_count,
 	              rt->weapon_count,
@@ -4015,6 +4165,10 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 
 JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 {
+	if (rt && rt->world_streamer) {
+		jce_world_streamer_destroy(rt->world_streamer);
+		rt->world_streamer = NULL;
+	}
 	if (!rt) return;
 
 	/* Paged terrain colliders own physics bodies; drop them before the
@@ -4072,8 +4226,10 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 	jce_free(rt->vehicles);
 	jce_free(rt->softbodies);
 	jce_free(rt->cfg_joints);
+	jce_free(rt->joints);   /* the one RT_GROW_FN registry that had no free */
 	jce_free(rt->joints2d);
 	jce_free(rt->nav_entries);
+	rt_curve_cache_clear(rt);   /* parsed jce.curve_eval assets */
 
 	/* ── Reusable infrastructure (survives a transition; freed only here) ── */
 	if (rt->mixer)
@@ -4299,41 +4455,8 @@ JCE_API bool JCE_CALL jce_runtime_is_transitioning(const JceRuntime *rt)
 	return rt && rt->trans_state != JCE_RT_TRANSITION_IDLE;
 }
 
-/* Trail Renderer capture: append the entity's world position to its trail point
- * buffer when it has moved past min_vertex_distance, FIFO-dropping the oldest
- * sample when the buffer is full.  (Length is bounded by JCE_TRAIL_MAX_POINTS
- * rather than the `time` field — a per-point age buffer is a follow-up.) */
-static void rt_trail_capture_cb(JceScene *scene, JceEntity e, void *ud)
-{
-	(void)ud;
-	if (!jce_scene_has_trail_renderer(scene, e)) return;
-	JceTrailRendererComponent *tr = jce_scene_get_trail_renderer(scene, e);
-	if (!tr || !tr->emitting) return;
-
-	jce_vec3 wp = rt_world_position(scene, e);
-	if (tr->point_count <= 0) {
-		tr->points[0][0] = wp.x; tr->points[0][1] = wp.y; tr->points[0][2] = wp.z;
-		tr->point_count = 1;
-		return;
-	}
-	int   last = tr->point_count - 1;
-	float dx = wp.x - tr->points[last][0];
-	float dy = wp.y - tr->points[last][1];
-	float dz = wp.z - tr->points[last][2];
-	float mind = tr->min_vertex_distance > 0.0f ? tr->min_vertex_distance : 0.1f;
-	if (dx*dx + dy*dy + dz*dz < mind*mind) return;   /* not moved enough */
-
-	if (tr->point_count < JCE_TRAIL_MAX_POINTS) {
-		int n = tr->point_count++;
-		tr->points[n][0] = wp.x; tr->points[n][1] = wp.y; tr->points[n][2] = wp.z;
-	} else {
-		memmove(&tr->points[0][0], &tr->points[1][0],
-		        (size_t)(JCE_TRAIL_MAX_POINTS - 1) * 3u * sizeof(float));
-		tr->points[JCE_TRAIL_MAX_POINTS - 1][0] = wp.x;
-		tr->points[JCE_TRAIL_MAX_POINTS - 1][1] = wp.y;
-		tr->points[JCE_TRAIL_MAX_POINTS - 1][2] = wp.z;
-	}
-}
+/* The Trail Renderer pass lives in jce_rt_trail.c -- this file is at its
+ * size baseline, and the pass grew a per-point ageing step. */
 
 JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 {
@@ -4500,14 +4623,47 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 					jce_physics_body_set_active(rt->physics, be->body, tier != 2);
 				}
 			}
+			/* ── Script on_fixed_update, BEFORE the step ──────────────
+			 * Unity's FixedUpdate, Godot's _physics_process.  A force
+			 * applied here is integrated by the very next line, which is
+			 * the ordering that makes a jump clear the same gap at 30 Hz
+			 * and at 144 Hz.  on_update cannot do this: it runs on a
+			 * render frame whose dt varies with the frame rate.
+			 *
+			 * HERE, NOT JCE_PHASE_FIXED_UPDATE, though that phase exists
+			 * and coroutines already use it.  jce_player_loop.h says in
+			 * its own header that the phases are an AUXILIARY surface
+			 * firing ALONGSIDE the inline pipeline, and this accumulator
+			 * is inline.  Two accumulators unified by clock are not
+			 * thereby guaranteed to agree on step count in a given frame,
+			 * and a script force applied a different number of times than
+			 * physics steps is the exact bug this callback exists to
+			 * prevent.  One dispatch per step, same dt, no inference.
+			 *
+			 * NOT SIM-LOD GATED, unlike on_update above.  A fixed-step
+			 * callback that fires at a distance-dependent rate is a
+			 * contradiction: the whole contract is "always the same dt".
+			 * A script that wants to be cheap far away uses on_update. */
+			for (int si = 0; si < rt->script_count; ++si) {
+				if (!rt->scripts[si].active) continue;
+				rt_script_ref_fixed_update(rt->scripts[si].ref, fixed_dt);
+			}
+
 			jce_physics_step(rt->physics, fixed_dt);
 			/* Configurable-joint break monitor: compare each tracked joint's
 			 * last-step applied impulse against break_force * fixed_dt (impulse =
 			 * force * dt) and snap on overrun.  Gated on cfg_joint_count -> no-op
 			 * when no scene authored a breakable configurable joint. */
 			rt_monitor_configurable_joints(rt, fixed_dt);
-			if (rt->physics2d)
+			/* Motor edits (a script or the Inspector changing
+			 * JceConstraintComponent) reach the solver here.  Gated on
+			 * joint_count and on an actual change -> a scene with no
+			 * motorised joint pays one comparison per joint. */
+			rt_sync_joint_motors(rt);
+			if (rt->physics2d) {
 				jce_physics2d_step(rt->physics2d, fixed_dt);
+				rt_monitor_joints2d(rt);   /* break_force / break_torque */
+			}
 			/* Networking on the fixed cadence (only when a session is live —
 			 * checked per tick so a session started AFTER runtime create is
 			 * still driven): poll the host, advance handshake/timeout,
@@ -4524,6 +4680,11 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 				 * global tick (audit F82). */
 				uint32_t ntick = (uint32_t)rt->clock.tick_count;
 				jce_net_transform_fixed_step(ntick);
+				/* SAMPLE BEFORE STEPPING.  fixed_step builds and sends the
+				 * snapshot from whatever the authority last pushed, so a push
+				 * that arrives after it is a tick late -- forever, not once. */
+				rt_push_net_animator_states(rt);
+				jce_net_animator_fixed_step(ntick);
 				jce_net_replication_tick((JceNetTick)ntick);
 			}
 			jce_fixed_clock_tick(&rt->clock);
@@ -4563,6 +4724,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 			jce_scene_update(rt->scene, sim_dt);
 		jce_perf_phase_add("scene_update", jce_time_perf_to_ms(_t0_su, jce_time_perf_counter()));
 	}
+	rt_streaming_tick(rt);   /* after scene_update: uses THIS frame's player pos */
 	/* Root motion (FEATURE 3.2): apply the root-joint delta the renderer
 	 * extracted last frame to entities whose avatar has apply_root_motion set.
 	 * Runs after scene_update so it adds on top of the freshest gameplay
@@ -4577,13 +4739,14 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * frame transforms, only during Play (jce_runtime_step) and never paused, so
 	 * trails grow as entities move; sr_draw_trail_renderer draws the buffer. */
 	if (rt->scene && !rt->paused)
-		jce_scene_each_entity(rt->scene, rt_trail_capture_cb, rt);
+		rt_trail_step(rt, dt);
 	/* Networking render-step: write interpolated poses for non-owned
 	 * networked objects + apply owned-object snap corrections.  Runs after
 	 * scene_update (so gameplay-owned transforms are final) and before the
 	 * gameplay/audio bridge below.  No-op without a live session. */
 	if (rt->net_bridged && jce_session_mode() != JCE_SESSION_MODE_NONE)
 		jce_net_transform_render_step((double)rt->clock.alpha);
+		jce_net_animator_render_step((double)rt->clock.alpha);
 	/* Client-side prediction reconcile (runtime-driven so the net layer stays
 	 * prediction-free): pop any authoritative snapshot the net layer stashed
 	 * for the predicted entity and rollback+replay against it, writing the
@@ -4648,16 +4811,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 
 	jce_perf_phase_add("runtime_tick", jce_time_perf_to_ms(_t0_tick, jce_time_perf_counter()));
 
-	/* Pointer input is sampled once per host frame.  Clearing the complete
-	 * sample prevents a hidden/unfocused host view from leaving a button stuck
-	 * down, while movement input intentionally keeps its existing latched
-	 * semantics. */
-	rt->input.pointer_dx      = 0.0f;
-	rt->input.pointer_dy      = 0.0f;
-	rt->input.pointer_wheel   = 0.0f;
-	rt->input.pointer_buttons = 0u;
-	rt->input.touch_count     = 0;
-	memset(rt->input.touches, 0, sizeof(rt->input.touches));
+	rt_input_expire_frame_sample(rt);   /* jce_rt_input.c */
 }
 
 /* ── Time control (Phase 0.2) ─────────────────────────────────────── */
@@ -4833,6 +4987,36 @@ JCE_API bool JCE_CALL jce_runtime_dispatch_ui_submit(JceRuntime *rt,
 	if (!f) return false;
 	return rt_script_call_named_str(rt, f->on_submit,
 	                                (JceScriptEntity)entity, f->text);
+}
+
+JCE_API void JCE_CALL jce_runtime_dispatch_ui_events(JceRuntime *rt,
+                                                     JceUICanvas *uc,
+                                                     JceScene *scene)
+{
+	/* Every channel is read exactly once, unconditionally, because two of the
+	 * four (text_changed, submitted) are CLEARED ON READ -- skipping a read is
+	 * not "no event this frame", it is "this event stays latched and fires on
+	 * a later frame".  That is the bug this function exists to make
+	 * unspellable, so the reads are not guarded by rt/scene: the drain must
+	 * happen even when there is nothing to dispatch to. */
+	if (!uc) return;
+
+	uint64_t clicked = jce_ui_canvas_last_clicked(uc);
+	uint64_t vc      = jce_ui_canvas_last_value_changed(uc);
+	uint64_t tc      = jce_ui_canvas_last_text_changed(uc);
+	uint64_t sub     = jce_ui_canvas_last_submitted(uc);
+
+	if (!rt || !scene) return;
+
+	if (clicked) {
+		JceUIButtonComponent *bt =
+			jce_scene_get_ui_button(scene, (JceEntity)clicked);
+		if (bt)
+			jce_runtime_dispatch_ui_click(rt, clicked, bt->on_click_handler);
+	}
+	if (vc)  jce_runtime_dispatch_ui_value_changed(rt, vc);
+	if (tc)  jce_runtime_dispatch_ui_text_changed(rt, tc);
+	if (sub) jce_runtime_dispatch_ui_submit(rt, sub);
 }
 
 JCE_API void JCE_CALL jce_runtime_dispatch_anim_event(JceRuntime *rt,
@@ -5224,6 +5408,67 @@ JCE_API bool JCE_CALL jce_runtime_save_to_file(JceRuntime *rt, const char *path)
 		}
 	}
 	return jce_snapshot_save_to_file(rt->save_registry, path);
+}
+
+JCE_API bool JCE_CALL jce_runtime_load_from_file(JceRuntime *rt, const char *path)
+{
+	if (!rt || !rt->save_registry || !path || !path[0]) return false;
+
+	/* READ THE BYTES BEFORE TOUCHING THE LIVE SESSION.
+	 *
+	 * A missing or unreadable slot is the COMMON failure -- a player picks an
+	 * empty slot, a file is gone, a path is wrong -- and it must not cost them
+	 * the session they are in.  Loading the file first means that case returns
+	 * false having changed nothing at all. */
+	uint64_t size = 0;
+	void *buf = jce_fs_host_read_all(path, &size);
+	if (!buf || size == 0) {
+		if (buf) jce_free(buf);
+		jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+		              "save load: cannot read '%s' (session unchanged)", path);
+		return false;
+	}
+
+	/* TEAR DOWN FIRST, exactly as the transition path does.  The snapshot's
+	 * read callback destroys and recreates every entity, so the bodies,
+	 * controllers, script instances and voices keyed to the OLD ids must be
+	 * released BEFORE the swap -- releasing them afterwards would be releasing
+	 * them against ids that no longer mean anything, and skipping it would leak
+	 * a whole scene's worth of physics bodies per load. */
+	rt_teardown_scene_state(rt, /*destroying=*/false);
+
+	const bool ok = jce_snapshot_load_from_buffer(rt->save_registry, buf,
+	                                              (size_t)size);
+	jce_free(buf);
+	if (!ok) {
+		/* Readable but not restorable: a section may have applied before the
+		 * failure, so the scene is now indeterminate.  Leave a consistent,
+		 * body-free empty scene and respawn against it rather than a
+		 * half-restored one the caller cannot reason about. */
+		jce_scene_clear(rt->scene);
+		rt_spawn_scene_state(rt);
+		jce_log_write(JCE_LOG_LEVEL_ERROR, LOG_TAG, __FILE__, __LINE__,
+		              "save load: '%s' is unreadable as a snapshot (scene now "
+		              "empty)", path);
+		return false;
+	}
+
+	/* THE HALF THAT WAS MISSING.  The scene provider's read callback clears
+	 * the scene and loads fresh entities, so every runtime object keyed to the
+	 * OLD entity ids -- physics bodies, character controllers, script
+	 * instances, audio voices, triggers, spawners, behaviour trees -- now
+	 * refers to entities that no longer exist.  Without this walk the restored
+	 * scene renders and does nothing, which is why driving
+	 * jce_snapshot_load_from_file directly (as the header used to suggest) was
+	 * never a working save path.
+	 *
+	 * jce_runtime_request_scene has always had to do exactly this after its
+	 * own jce_scene_clear + load; this is the same requirement, reached from
+	 * the other direction. */
+	rt_spawn_scene_state(rt);
+	jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+	              "save load: restored '%s'", path);
+	return true;
 }
 
 JCE_API void JCE_CALL jce_runtime_set_locale(JceRuntime *rt, const char *locale)

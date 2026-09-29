@@ -35,6 +35,8 @@ static JcePostFXPipeline *get_postfx(void)
 
 /* ── Scene-owned state bridge ─────────────────────────────────────── */
 
+/* Materialises the component.  Call this only when something is actually
+ * being WRITTEN -- creating it is authoring scene state. */
 static JceSceneRenderingSettings *current_rendering_settings_mut(void)
 {
     JceScene *scene = jce_state_get_scene();
@@ -42,6 +44,32 @@ static JceSceneRenderingSettings *current_rendering_settings_mut(void)
         return NULL;
     jce_editor_scene_ensure_rendering_settings(scene);
     return jce_scene_get_rendering_settings_mut(scene);
+}
+
+/* Seeds `out` with the scene rendering settings, or with the engine defaults
+ * when the scene authors none.  Returns false when there is no scene at all.
+ * CREATES NOTHING.
+ *
+ * This exists because the read path used to go through
+ * current_rendering_settings_mut(), which ensures.  jce_editor_panel_postfx_tick()
+ * runs on EVERY editor frame whether or not any panel is visible, so the
+ * editor authored a rendering-settings component onto every scene it opened,
+ * within one frame, with no user action.  The engine ambient resolve keys on
+ * whether that component EXISTS (jce_sr_draw.c: present -> use it and apply
+ * the sky fill; absent -> flat (1,1,1)x0.15 and no fill), so the editor and
+ * the shipped exe rendered the same scene file down two different branches.
+ * Measured on examples/snake_seven: game "engine-default rgb=(1,1,1) x0.15
+ * sky_fill=no" vs editor "override rgb=(0.0713,0.1029,0.1760) x1.0
+ * sky_fill=yes", 76.59% of pixels differing. */
+static bool rendering_settings_seed(JceSceneRenderingSettings *out)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !out)
+        return false;
+    const JceSceneRenderingSettings *cur =
+        jce_scene_get_rendering_settings(scene);
+    *out = cur ? *cur : jce_scene_rendering_settings_default();
+    return true;
 }
 
 static void params_from_settings(const JceSceneRenderingSettings *s,
@@ -133,11 +161,36 @@ static const int kLookCount = (int)(sizeof(kLooks) / sizeof(kLooks[0]));
 
 void jce_editor_panel_postfx_content(void)
 {
-    JceSceneRenderingSettings *settings = current_rendering_settings_mut();
-    if (!settings) {
+    /* Edit a COPY, and write it back only if it really changed.  Merely
+     * opening this panel must not author lighting into the scene: the
+     * existence of the component changes how the engine resolves ambient,
+     * so that would make the picture depend on which panels are open. */
+    JceSceneRenderingSettings scratch;
+    if (!rendering_settings_seed(&scratch)) {
         ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
         return;
     }
+    const JceSceneRenderingSettings seed = scratch;
+    JceSceneRenderingSettings *settings = &scratch;
+    /* Compared against the seed rather than trusting a changed flag: a widget
+     * that writes without reporting a change would otherwise have its edit
+     * silently dropped.  RAII rather than a line at the end, so that adding
+     * an early return to this 300-line function cannot silently start
+     * discarding the user edits it was reached through. */
+    struct WriteBack {
+        const JceSceneRenderingSettings *seed_;
+        const JceSceneRenderingSettings *now_;
+        ~WriteBack()
+        {
+            if (std::memcmp(now_, seed_, sizeof *now_) == 0)
+                return;
+            JceSceneRenderingSettings *dst = current_rendering_settings_mut();
+            if (dst) {
+                *dst = *now_;
+                jce_state_mark_scene_modified();
+            }
+        }
+    } write_back{&seed, &scratch};
 
     JcePostFXParams params;
     params_from_settings(settings, &params);
@@ -154,6 +207,55 @@ void jce_editor_panel_postfx_content(void)
         ImGui::BeginDisabled(!enabled[JCE_POSTFX_TONEMAP]);
         changed |= ImGui::DragFloat(jce_editor_i18n("postfx.exposure"), &params.exposure,
                                     0.01f, 0.0f, 10.0f);
+        /* Auto exposure.  The checkbox changes what the slider ABOVE means --
+         * absolute when off, a multiplier on the measured value when on -- so
+         * it says so, rather than leaving an artist to discover it. */
+        changed |= ImGui::Checkbox(jce_editor_i18n("postfx.autoExposure"),
+                                   &settings->auto_exposure);
+        if (settings->auto_exposure) {
+            JceAutoExposureDesc *ae = &settings->auto_exposure_desc;
+            ImGui::TextDisabled("%s", jce_editor_i18n("postfx.autoExposureHint"));
+            changed |= ImGui::DragFloat(jce_editor_i18n("postfx.aeMinEV"),
+                                        &ae->min_ev, 0.05f, -16.0f, 16.0f);
+            changed |= ImGui::DragFloat(jce_editor_i18n("postfx.aeMaxEV"),
+                                        &ae->max_ev, 0.05f, -16.0f, 16.0f);
+            changed |= ImGui::DragFloat(jce_editor_i18n("postfx.aeSpeedUp"),
+                                        &ae->speed_up, 0.05f, 0.0f, 20.0f);
+            changed |= ImGui::DragFloat(jce_editor_i18n("postfx.aeSpeedDown"),
+                                        &ae->speed_down, 0.05f, 0.0f, 20.0f);
+            changed |= ImGui::DragFloat(jce_editor_i18n("postfx.aeBias"),
+                                        &ae->exposure_bias, 0.05f, -8.0f, 8.0f);
+            /* The live readout.  Without it "why is this shot dark" has no
+             * answer but guessing, and an adaptation that is silently pinned
+             * at its clamp looks exactly like one that is working. */
+            if (JcePostFXPipeline *pfx = get_postfx()) {
+                const float lum    = jce_postfx_get_measured_luminance(pfx);
+                const float now_ev = jce_postfx_get_exposure_ev(pfx);
+                /* Before the first USABLE read-back this is 0.0, and printing
+                 * it as a number says "the scene is black" when the truth is
+                 * "nothing has been measured yet".  On a backend that cannot
+                 * meter at all it never becomes a number, and this line is
+                 * then the only thing that says so. */
+                if (!jce_auto_exposure_measurement_is_usable(lum)) {
+                    ImGui::TextDisabled("%s", jce_editor_i18n("postfx.aeWaiting"));
+                } else {
+                const float tgt_ev = jce_auto_exposure_target_ev(lum, ae);
+                ImGui::Text("%s: %.4f", jce_editor_i18n("postfx.aeMeasured"), (double)lum);
+                ImGui::Text("%s: %+.2f EV -> %+.2f EV (x%.3f)   |   %s: x%.3f",
+                            jce_editor_i18n("postfx.aeAdapting"),
+                            (double)now_ev, (double)tgt_ev,
+                            (double)jce_auto_exposure_multiplier(tgt_ev),
+                            jce_editor_i18n("postfx.aeEffective"),
+                            (double)jce_postfx_get_effective_exposure(pfx));
+                /* Say it out loud when the target is sitting on a bound: an
+                 * adaptation that has run out of range looks identical to one
+                 * that is working, and the fix is a slider on this panel. */
+                if (tgt_ev <= ae->min_ev + 1.0e-3f || tgt_ev >= ae->max_ev - 1.0e-3f)
+                    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+                                       jce_editor_i18n("postfx.aeClamped"));
+                }
+            }
+        }
         changed |= ImGui::DragFloat(jce_editor_i18n("postfx.gamma"), &params.gamma,
                                     0.01f, 1.0f, 4.0f);
         const char *kTonemapOps[] = { "ACES", "Neutral", "AgX" };
@@ -245,6 +347,43 @@ void jce_editor_panel_postfx_content(void)
     }
     ImGui::PopStyleColor();
 
+    /* Depth of field.  Reads and writes the SCENE's fields directly, not the
+     * postfx `enabled[]` array: rack focus is not one of JcePostFXType's
+     * values, because that enum's COUNT sizes public structs and growing it
+     * to add an effect moves every member after it. */
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.dof"))) {
+        snprintf(lbl, sizeof(lbl), "%s##dof", jce_editor_i18n("postfx.enable"));
+        changed |= ImGui::Checkbox(lbl, &settings->dof_enabled);
+        ImGui::BeginDisabled(!settings->dof_enabled);
+        changed |= ImGui::SliderFloat(jce_editor_i18n("postfx.dof.focus"),
+                                      &settings->dof_focus_distance,
+                                      0.1f, 500.0f, "%.1f m");
+        changed |= ImGui::SliderFloat(jce_editor_i18n("postfx.dof.range"),
+                                      &settings->dof_focus_range,
+                                      0.1f, 200.0f, "%.1f m");
+        /* 0 shows as the engine default rather than as "no blur", because
+         * that is what it MEANS -- a scene authored before this field loads 0
+         * and a radius of zero would be an effect that is on and invisible. */
+        if (settings->dof_max_coc <= 0.0f) settings->dof_max_coc = 0.012f;
+        changed |= ImGui::SliderFloat(jce_editor_i18n("postfx.dof.maxCoc"),
+                                      &settings->dof_max_coc,
+                                      0.001f, 0.06f, "%.3f");
+        /* "On" and "doing anything" are different questions, and every
+         * unwired-feature defect in this engine lived in the gap between
+         * them.  The pass needs a real depth buffer and a camera projection;
+         * when either is missing the effect is switched on and invisible, and
+         * this line is the only thing that would say so. */
+        JcePostFXPipeline *dof_pfx = get_postfx();
+        if (settings->dof_enabled && dof_pfx &&
+            !jce_postfx_get_depth_of_field_active(dof_pfx)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+                jce_editor_i18n("postfx.dof.inactive"));
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::PopStyleColor();
+
     /* Custom pass — generic, data-driven. The engine knows nothing about what
      * the shader does; this UI just edits a shader name + raw vec4 params.
      * (Literal labels: i18n keys can be added once the i18n tables settle.) */
@@ -326,6 +465,8 @@ void jce_editor_panel_postfx_content(void)
         settings->lut_path[0]  = '\0';
         settings->lut_strength = defaults.lut_strength;
         settings->bloom_knee   = defaults.bloom_knee;
+        settings->auto_exposure      = defaults.auto_exposure;
+        settings->auto_exposure_desc = jce_auto_exposure_desc_default();
         sync_to_pipeline(settings);
         jce_state_mark_scene_modified();
     }
@@ -335,9 +476,11 @@ void jce_editor_panel_postfx_content(void)
 
 void jce_editor_panel_postfx_tick(void)
 {
-    JceSceneRenderingSettings *settings = current_rendering_settings_mut();
-    if (settings)
-        sync_to_pipeline(settings);
+    /* READ ONLY.  This runs every frame regardless of panel visibility
+     * (jce_editor_layout.cpp), so anything it creates is created always. */
+    JceSceneRenderingSettings s;
+    if (rendering_settings_seed(&s))
+        sync_to_pipeline(&s);
     else
         disable_pipeline_only();
 }

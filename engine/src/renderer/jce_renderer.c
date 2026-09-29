@@ -20,11 +20,13 @@
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_shaders.h>
 #include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices (frame reset) */
+#include <jce/renderer/jce_ies_profile.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
 #include "os/platform/jce_window_internal.h"
+#include "jce_renderer_caps_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -32,10 +34,15 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include "jce_renderer_bgfx_callback.h"
 
 #define LOG_TAG "jce_renderer"
 
 static uint32_t s_bgfx_frame_index = 0;
+
+/* Read by jce_renderer_bgfx_callback.c: the trace callback stamps each line
+ * with the frame it belongs to, and the frame counter is the renderer's. */
+uint32_t jce_rcb_host_frame_index(void) { return s_bgfx_frame_index; }
 
 #if JCE_PLATFORM_ANDROID
 /* ── Android bgfx-frame side thread ─────────────────────────────────────
@@ -156,8 +163,15 @@ struct JceRenderer {
     bgfx_program_handle_t program;          /* color (pos+color) */
     bgfx_vertex_layout_t layout;            /* color vertex layout */
     bgfx_program_handle_t program_textured; /* textured (pos+color+uv) */
+    bgfx_program_handle_t program_text_sdf; /* glyphs from a distance field */
     bgfx_vertex_layout_t layout_textured;   /* textured vertex layout */
     bgfx_uniform_handle_t u_tex_color;      /* sampler uniform for textures */
+    /* x = SDF smoothing half-width, y = the outline's distance value,
+     * z = outline width. */
+    bgfx_uniform_handle_t u_sdf_params;
+    bgfx_uniform_handle_t u_sdf_outline;        /* outline rgba */
+    bgfx_uniform_handle_t u_sdf_shadow_offset;  /* xy in texture space */
+    bgfx_uniform_handle_t u_sdf_shadow_color;   /* rgba; .w 0 = disabled */
     bgfx_program_handle_t program_mesh;     /* mesh (pos+normal+uv) */
     /* PBR programs */
     bgfx_program_handle_t program_pbr;
@@ -176,10 +190,21 @@ struct JceRenderer {
      * (if it loaded).  Set per-frame by the scene renderer from the
      * r.forwardplus cvar; default false => unchanged non-variant programs. */
     bool                  forwardplus_program_active;
+    /* KEYWORD BITS THAT BELONG TO THE FRAME, not to any material: Forward+,
+     * and whatever JCE_SHADER_FORCE_KEYS asks for.  Recomputed whenever
+     * either changes, and OR'd into every pick. */
+    uint32_t              frame_shader_keys;
+    int                   force_shader_keys;   /* -1 = env not read yet */
     bgfx_program_handle_t program_shadow;
     bgfx_program_handle_t program_shadow_inst;     /* GPU-instanced shadow */
     bgfx_program_handle_t program_shadow_skinned;
     bgfx_program_handle_t program_terrain;
+    /* THE GENERATED PBR PROGRAM TABLE, copied from the shader set.
+     * [vertex variant][keyword bits]; jce_renderer_get_program_variant
+     * is the only reader, and every named PBR getter above is a call
+     * into it. */
+    JceShaderHandle program_variant[JCE_SHADER_VARIANT_COUNT]
+                                   [JCE_SHADER_KEY_COUNT];
     bgfx_uniform_handle_t u_light_dir;   /* vec4: xyz = light direction */
     bgfx_uniform_handle_t u_light_color; /* vec4: xyz = color, w = ambient */
     uint32_t reset_flags;
@@ -386,6 +411,123 @@ static void apply_transient_limits(bgfx_init_t *init)
  * probe is caught here (main thread, clean stack) and the fallback  *
  * loop can safely continue to the next backend.                     *
  * ─────────────────────────────────────────────────────────────────*/
+/* Ask the GL/GLES driver what it actually is, BEFORE bgfx sees the window.
+ *
+ * WHY THIS IS NOT REDUNDANT WITH bgfx.  Measured 2026-09-01, on this bgfx:
+ * BGFX_CONFIG_RENDERER_OPENGL_MIN_VERSION appears ZERO times in
+ * renderer_gl.cpp; `m_gles3` is set from a compile-time constant off
+ * Emscripten rather than from the device; and BGFX_RENDERER_OPENGL_NAME --
+ * the "OpenGL 3.3" that shows up in our own startup log -- is a compile-time
+ * string built from the floor, not a reading.  bgfx_init() therefore SUCCEEDS
+ * on a context it cannot serve, and the failure arrives later as a shader that
+ * would not compile.  Nothing upstream is going to tell us; we have to look.
+ *
+ * WHY A THROWAWAY WINDOW.  Creating a GL context on the real window and then
+ * choosing D3D or Vulkan would leave that window with a GL pixel format it
+ * cannot take back on Windows.  A hidden 1x1 window costs a few milliseconds
+ * once and cannot poison anything.
+ *
+ * A probe that fails to run is NOT a failed probe: it publishes nothing, the
+ * version stays unverified, and the backend is tried anyway. */
+static bool s_probe_gl_version(bgfx_renderer_type_t type)
+{
+    const bool gles = (type == BGFX_RENDERER_TYPE_OPENGLES);
+    const JceRendererBackend backend =
+        gles ? JCE_BACKEND_OPENGLES : JCE_BACKEND_OPENGL;
+    const unsigned char *(*get_string)(unsigned) = NULL;
+    SDL_Window    *win = NULL;
+    SDL_GLContext  ctx = NULL;
+    const char    *api = NULL, *shading = NULL;
+    bool           ok  = true;
+
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+        LOG_INFO(LOG_TAG, "%s probe: SDL video is not up, skipping",
+                 jce_renderer_backend_name(backend));
+        return true;
+    }
+    if (!SDL_GL_LoadLibrary(NULL)) {
+        LOG_INFO(LOG_TAG, "%s probe: no GL library on this system (%s)",
+                 jce_renderer_backend_name(backend), SDL_GetError());
+        return false;
+    }
+
+    /* Ask for EXACTLY what bgfx is about to ask for, or this measures the
+     * wrong context.  glcontext_wgl.cpp requests
+     *   MAJOR = BGFX_CONFIG_RENDERER_OPENGL / 10, MINOR = % 10, CORE profile
+     * when the floor is >= 31, and a plain 2.1 otherwise -- and the floor is
+     * published to us as JCE_BGFX_OPENGL_VERSION.  A compatibility context
+     * with no version requested (what this probe asked for first) reports the
+     * driver's maximum, which is a different question: it says what the card
+     * COULD do, not what bgfx will be handed.
+     *
+     * Getting this wrong is not academic.  bgfx retries once without the
+     * profile mask and then BGFX_FATALs, so "3.3 core refused" is a hard stop
+     * -- exactly the case this probe exists to catch before it happens. */
+    if (gles) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,
+                            JCE_BGFX_OPENGLES_VERSION / 10);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,
+                            JCE_BGFX_OPENGLES_VERSION % 10);
+    } else if (JCE_BGFX_OPENGL_VERSION >= 31) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,
+                            JCE_BGFX_OPENGL_VERSION / 10);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,
+                            JCE_BGFX_OPENGL_VERSION % 10);
+    } else {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    }
+    win = SDL_CreateWindow("jce-gl-probe", 1, 1,
+                           SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (win)
+        ctx = SDL_GL_CreateContext(win);
+
+    if (ctx && SDL_GL_MakeCurrent(win, ctx)) {
+        /* 0x1F02 = GL_VERSION, 0x8B8C = GL_SHADING_LANGUAGE_VERSION.  Spelled
+         * as literals because the engine links no GL headers of its own. */
+        get_string = (const unsigned char *(*)(unsigned))
+            SDL_GL_GetProcAddress("glGetString");
+        if (get_string) {
+            api     = (const char *)get_string(0x1F02u);
+            shading = (const char *)get_string(0x8B8Cu);
+        }
+    }
+
+    if (api) {
+        LOG_INFO(LOG_TAG, "%s probe: driver reports \"%s\" / shading \"%s\"",
+                 jce_renderer_backend_name(backend), api,
+                 shading ? shading : "(none)");
+        ok = jce_renderer_caps_api_publish_probe(backend, api, shading);
+        if (!ok) {
+            JceRendererApiInfo info = jce_renderer_get_api_info();
+            LOG_WARN(LOG_TAG,
+                     "%s probe: %u.%u is below the %s tier floor of %u.%u; "
+                     "skipping this backend and trying the next one",
+                     jce_renderer_backend_name(backend),
+                     (unsigned)info.runtime_version.major,
+                     (unsigned)info.runtime_version.minor,
+                     jce_graphics_api_tier_name(info.build_tier),
+                     (unsigned)info.minimum_version.major,
+                     (unsigned)info.minimum_version.minor);
+        }
+    } else {
+        LOG_WARN(LOG_TAG,
+                 "%s probe: could not create a probe context (%s); trying the "
+                 "backend without a floor check",
+                 jce_renderer_backend_name(backend), SDL_GetError());
+    }
+
+    if (ctx) SDL_GL_DestroyContext(ctx);
+    if (win) SDL_DestroyWindow(win);
+    return ok;
+}
+
 #if JCE_PLATFORM_WINDOWS
 
 static bool backend_probe(bgfx_renderer_type_t type)
@@ -399,6 +541,9 @@ static bool backend_probe(bgfx_renderer_type_t type)
         return jce_library_exists("d3d12.dll");
     case BGFX_RENDERER_TYPE_DIRECT3D11:
         return jce_library_exists("d3d11.dll");
+    case BGFX_RENDERER_TYPE_OPENGL:
+    case BGFX_RENDERER_TYPE_OPENGLES:
+        return s_probe_gl_version(type);
     default:
         return true;
     }
@@ -481,1037 +626,12 @@ static bool backend_probe(bgfx_renderer_type_t type)
 {
     if (type == BGFX_RENDERER_TYPE_VULKAN)
         return s_probe_vulkan();
+    if (type == BGFX_RENDERER_TYPE_OPENGL || type == BGFX_RENDERER_TYPE_OPENGLES)
+        return s_probe_gl_version(type);
     return true;
 }
 
 #endif /* JCE_PLATFORM_WINDOWS / POSIX */
-
-static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePath, uint16_t _line,
-                           bgfx_fatal_t _code, const char *_str)
-{
-    (void)_this;
-    LOG_ERROR(LOG_TAG, "bgfx fatal: code=%d file=%s line=%u msg=%s", (int)_code,
-              _filePath ? _filePath : "<null>", (unsigned)_line, _str ? _str : "<null>");
-    /* JCE_BGFX_TRAP=1: break on the FIRST fatal so the crash handler prints
-     * the fully symbolized stack of the offender (debug-bgfx bug hunts). */
-    {
-        static int s_trap = -1;
-        if (s_trap < 0) { const char *v = getenv("JCE_BGFX_TRAP");
-                          s_trap = (v && v[0] == '1') ? 1 : 0; }
-        if (s_trap) {
-#if defined(_MSC_VER)
-            __debugbreak();
-#endif
-        }
-    }
-}
-
-/* When JCE_GFX_DEBUG=1, mirror bgfx internal traces (including the
- * D3D12 HRESULT printed right before "Failed to create PSO!") to our
- * log.  Otherwise stays silent to avoid spamming. */
-static int s_bgfx_trace_enabled = -1;
-
-static void jce_bgfx_trace_vargs(bgfx_callback_interface_t *_this, const char *_filePath,
-                                 uint16_t _line, const char *_format, va_list _argList)
-{
-    (void)_this;
-    if (s_bgfx_trace_enabled < 0) {
-        const char *v = getenv("JCE_GFX_DEBUG");
-        s_bgfx_trace_enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
-    }
-    if (!s_bgfx_trace_enabled || !_format) return;
-
-    char buf[1024];
-    int n = vsnprintf(buf, sizeof(buf), _format, _argList);
-    if (n < 0) return;
-    /* Strip trailing newline that bgfx tends to append. */
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
-    if (n == 0) return;
-
-    const char *file = _filePath ? _filePath : "<bgfx>";
-    /* Keep only the basename for compactness. */
-    const char *slash = strrchr(file, '/');
-    const char *back  = strrchr(file, '\\');
-    if (back && back > slash) slash = back;
-    if (slash) file = slash + 1;
-
-    LOG_INFO("bgfx", "%s:%u %s", file, (unsigned)_line, buf);
-}
-
-static void jce_bgfx_profiler_begin(bgfx_callback_interface_t *_this, const char *_name,
-                                    uint32_t _abgr, const char *_filePath, uint16_t _line)
-{
-    (void)_this;
-    (void)_name;
-    (void)_abgr;
-    (void)_filePath;
-    (void)_line;
-}
-
-static void jce_bgfx_profiler_begin_literal(bgfx_callback_interface_t *_this, const char *_name,
-                                            uint32_t _abgr, const char *_filePath, uint16_t _line)
-{
-    (void)_this;
-    (void)_name;
-    (void)_abgr;
-    (void)_filePath;
-    (void)_line;
-}
-
-static void jce_bgfx_profiler_end(bgfx_callback_interface_t *_this)
-{
-    (void)_this;
-}
-
-static uint32_t jce_bgfx_cache_read_size(bgfx_callback_interface_t *_this, uint64_t _id)
-{
-    (void)_this;
-    (void)_id;
-    return 0;
-}
-
-static bool jce_bgfx_cache_read(bgfx_callback_interface_t *_this, uint64_t _id, void *_data,
-                                uint32_t _size)
-{
-    (void)_this;
-    (void)_id;
-    (void)_data;
-    (void)_size;
-    return false;
-}
-
-static void jce_bgfx_cache_write(bgfx_callback_interface_t *_this, uint64_t _id, const void *_data,
-                                 uint32_t _size)
-{
-    (void)_this;
-    (void)_id;
-    (void)_data;
-    (void)_size;
-}
-
-/* Set while a bgfx_request_screen_shot() is in flight; cleared by the
-   screen_shot callback once the file is written (or fails). */
-static bool s_screenshot_pending = false;
-
-/* Continuous capture (video recording). BGFX_RESET_CAPTURE does not deliver
-   capture callbacks in this bgfx configuration, so recording instead drives
-   the proven bgfx_request_screen_shot path: while active, end_frame requests a
-   backbuffer shot each frame using the sentinel path below, and the screen_shot
-   callback routes those pixels to the capture sink instead of writing a file. */
-#define JCE_CAPTURE_SENTINEL "\x01__jce_capture__"
-static struct {
-    JceCaptureBeginFn begin;
-    JceCaptureFrameFn frame;
-    JceCaptureEndFn   end;
-    void             *ud;
-} s_capture_sink;
-static bool s_capture_active       = false;
-static bool s_capture_shot_pending = false;
-/* Scratch for the GL RGBA->BGRA swizzle on the recording path; see the note at
-   its use. Sized on demand, released when capture stops. */
-static uint8_t *s_swz_buf;
-static size_t   s_swz_cap;
-/* When set, recording is driven by the ImGui renderer reading its offscreen FBO
-   back into the sink (whole-window video) instead of the backbuffer screen_shot
-   path below (which is black on D3D flip-model swap chains). */
-static bool s_capture_imgui_mode   = false;
-
-void jce_renderer_set_capture_imgui_mode(bool on) { s_capture_imgui_mode = on; }
-
-/* One-shot offscreen-FBO RGBA readback (impostor bake).  The sentinel path
-   below routes a requested screenshot's raw pixels (RGBA8, alpha preserved) to
-   this sink instead of writing a file.  One in flight at a time. */
-#define JCE_FBO_CAPTURE_SENTINEL "\x02__jce_fbo_capture__"
-static struct {
-    JceFboCaptureFn fn;
-    void           *ud;
-} s_fbo_capture_sink;
-static bool s_fbo_capture_pending = false;
-
-/* Defined with the PNG writer service further down. Copies `data` and hands
-   the encode + file write to the writer thread; false means "not queued, do it
-   yourself". */
-static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
-                              uint32_t pitch, uint32_t size, int format,
-                              int yflip, int drop_alpha, const char *what,
-                              const char *path);
-
-static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
-                                 uint32_t _width, uint32_t _height, uint32_t _pitch,
-                                 bgfx_texture_format_t _format,
-                                 const void *_data, uint32_t _size, bool _yflip)
-{
-    (void)_this;
-
-    /* bgfx delivers the captured pixels in the source surface's NATIVE channel
-       order: BGRA8 on D3D11/D3D12/Vulkan/Metal, but RGBA8 on OpenGL / OpenGL ES
-       (glReadPixels). Unconditionally treating the data as BGRA8 swapped the
-       red and blue channels in every screenshot taken on the GL backend.
-       Honour the source format bgfx reports (>= 1.146); if it is neither known
-       8-bit form, fall back to the active renderer type. */
-    bool src_is_rgba;
-    switch (_format) {
-    case BGFX_TEXTURE_FORMAT_RGBA8: src_is_rgba = true;  break;
-    case BGFX_TEXTURE_FORMAT_BGRA8: src_is_rgba = false; break;
-    default: {
-        bgfx_renderer_type_t rt = bgfx_get_renderer_type();
-        src_is_rgba = (rt == BGFX_RENDERER_TYPE_OPENGL ||
-                       rt == BGFX_RENDERER_TYPE_OPENGLES);
-        break;
-    }
-    }
-    {
-        static bool s_ss_fmt_logged = false;
-        if (!s_ss_fmt_logged) {
-            s_ss_fmt_logged = true;
-            LOG_INFO(LOG_TAG, "screenshot channel order: bgfx fmt=%d -> %s",
-                     (int)_format, src_is_rgba ? "RGBA8 (no R/B swap)"
-                                               : "BGRA8 (R/B swap)");
-        }
-    }
-
-    /* Impostor-bake FBO readback: deliver raw RGBA8 (alpha preserved) to the
-       one-shot sink instead of writing a file.  bgfx delivers BGRA8 with a row
-       pitch; convert to tightly-packed RGBA8 for the consumer. */
-    if (_filePath && strcmp(_filePath, JCE_FBO_CAPTURE_SENTINEL) == 0) {
-        if (s_fbo_capture_sink.fn && _data && _width && _height) {
-            uint8_t *rgba = (uint8_t *)JCE_MALLOC((size_t)_width * _height * 4u);
-            if (rgba) {
-                const uint8_t *src = (const uint8_t *)_data;
-                for (uint32_t y = 0; y < _height; ++y) {
-                    const uint8_t *srow = src + (size_t)y * _pitch;
-                    uint8_t       *drow = rgba + (size_t)y * _width * 4u;
-                    for (uint32_t x = 0; x < _width; ++x) {
-                        /* Emit tightly-packed RGBA8 for the consumer, swapping
-                           R/B only when the source is BGRA (D3D/VK); a GL source
-                           is already RGBA. */
-                        if (src_is_rgba) {
-                            drow[x * 4 + 0] = srow[x * 4 + 0];
-                            drow[x * 4 + 1] = srow[x * 4 + 1];
-                            drow[x * 4 + 2] = srow[x * 4 + 2];
-                            drow[x * 4 + 3] = srow[x * 4 + 3];
-                        } else {
-                            drow[x * 4 + 0] = srow[x * 4 + 2];
-                            drow[x * 4 + 1] = srow[x * 4 + 1];
-                            drow[x * 4 + 2] = srow[x * 4 + 0];
-                            drow[x * 4 + 3] = srow[x * 4 + 3];
-                        }
-                    }
-                }
-                s_fbo_capture_sink.fn(s_fbo_capture_sink.ud, rgba, _width,
-                                      _height, _yflip ? 1 : 0);
-                JCE_FREE(rgba);
-            }
-        }
-        s_fbo_capture_pending = false;
-        s_fbo_capture_sink.fn = NULL;
-        s_fbo_capture_sink.ud = NULL;
-        return;
-    }
-
-    /* Recording frame: route pixels to the capture sink, write no file. The
-       WebM sink consumes BGRA8; a GL source hands us RGBA8, so swap R/B into a
-       scratch buffer first (D3D/VK are already BGRA and pass through). This is
-       the backbuffer recording path (JCE_CAPTURE_SENTINEL); the editor's normal
-       recording reads an RGBA16F FBO and converts explicitly elsewhere. */
-    if (_filePath && strcmp(_filePath, JCE_CAPTURE_SENTINEL) == 0) {
-        if (s_capture_active && _data && _width && _height) {
-            const void *frame_data = _data;
-            /* Persistent scratch, not a per-frame allocation.
-             *
-             * This is the recording path: it runs on EVERY captured frame, and
-             * at 2560x1600 the buffer is 16 MB. Allocating and freeing 16 MB
-             * per frame means faulting in ~4000 fresh pages per frame and
-             * handing them straight back -- a per-frame cost that grows with
-             * window size and does no work. The staging texture and pixel
-             * buffer on the readback side were made resident for exactly this
-             * reason in the earlier recording pass; this allocation was missed
-             * because it only exists on GL (D3D and VK deliver BGRA and pass
-             * through untouched).
-             *
-             * Freed when capture stops, so an idle editor holds nothing. */
-            uint8_t    *swz = NULL;
-            if (src_is_rgba) {
-                if (s_swz_cap < (size_t)_size) {
-                    JCE_FREE(s_swz_buf);
-                    s_swz_buf = (uint8_t *)JCE_MALLOC((size_t)_size);
-                    s_swz_cap = s_swz_buf ? (size_t)_size : 0;
-                }
-                swz = s_swz_buf;
-                if (swz) {
-                    const uint8_t *s = (const uint8_t *)_data;
-                    for (uint32_t y = 0; y < _height; ++y) {
-                        const uint8_t *srow = s   + (size_t)y * _pitch;
-                        uint8_t       *drow = swz + (size_t)y * _pitch;
-                        for (uint32_t x = 0; x < _width; ++x) {
-                            drow[x * 4 + 0] = srow[x * 4 + 2];
-                            drow[x * 4 + 1] = srow[x * 4 + 1];
-                            drow[x * 4 + 2] = srow[x * 4 + 0];
-                            drow[x * 4 + 3] = srow[x * 4 + 3];
-                        }
-                    }
-                    frame_data = swz;
-                }
-            }
-            if (s_capture_sink.begin)
-                s_capture_sink.begin(s_capture_sink.ud, _width, _height, _pitch,
-                                     _yflip ? 1 : 0);
-            if (s_capture_sink.frame)
-                s_capture_sink.frame(s_capture_sink.ud, frame_data, _size);
-        }
-        s_capture_shot_pending = false;
-        return;
-    }
-
-    (void)_size;
-
-    /* DIAG (root-cause hunt for "F12/F9 black"): sample a 32x32 grid of the raw
-       capture and log its average luminance.  avg_lum ~0 => the backbuffer itself
-       was black at capture time (not rendered / occluded / wrong buffer), i.e. the
-       problem is the DATA, not the write path.  Pitch-correct sampling. */
-    if (_data && _width && _height) {
-        const uint8_t *base = (const uint8_t *)_data;
-        double sum = 0.0; uint32_t n = 0;
-        uint32_t sy = _height / 32u ? _height / 32u : 1u;
-        uint32_t sx = _width  / 32u ? _width  / 32u : 1u;
-        for (uint32_t y = 0; y < _height; y += sy) {
-            const uint8_t *row = base + (size_t)y * _pitch;
-            for (uint32_t x = 0; x < _width; x += sx) {
-                const uint8_t *px = row + (size_t)x * 4u;
-                sum += px[0] + px[1] + px[2]; ++n;
-            }
-        }
-        LOG_INFO(LOG_TAG, "screenshot DIAG: %ux%u avg_lum=%.1f (n=%u) %s",
-                 _width, _height, n ? sum / (n * 3.0) : 0.0, n,
-                 (n && sum / (n * 3.0) < 1.0) ? "<-- BLACK backbuffer (data, not write)" : "");
-    }
-
-    /* This callback runs on the thread bgfx calls back on while the main thread
-       sits inside bgfx_frame() waiting for it, so everything done here is
-       frame stall, measured at 2560x1600:
-
-           convert (SDL RGB24 + flip)        5-8 ms
-           IMG_SavePNG encode + write      348-369 ms
-           -------------------------------------------
-           total                           354-375 ms per screenshot
-
-       At a 13.8 ms frame that is a 26-frame freeze on every F12, and the same
-       stall on every frame of a recording that writes stills. The readback
-       capture path already solved this exact problem with a PNG writer thread
-       -- it just was not wired to the backbuffer path, which is the one F12
-       uses. So hand the raw pixels over and let the writer do the conversion
-       too; the frame keeps only a memcpy of the staging buffer.
-
-       Anything that cannot be handed over (queue full, allocation failed, or a
-       .bmp, which the writer does not encode) still runs inline. A screenshot
-       is never dropped to save a frame. */
-    const uint64_t t_freq  = SDL_GetPerformanceFrequency();
-    const uint64_t t_enter = SDL_GetPerformanceCounter();
-    uint64_t t_conv = t_enter;
-    bool async = false;
-
-    if (_data && _filePath && _width && _height) {
-        const char *aext = strrchr(_filePath, '.');
-        const bool  is_bmp = aext && SDL_strcasecmp(aext, ".bmp") == 0;
-        if (!is_bmp)
-            async = rb_png_submit_raw(_data, _width, _height, _pitch, _size,
-                                      (int)(src_is_rgba ? SDL_PIXELFORMAT_RGBA32
-                                                        : SDL_PIXELFORMAT_BGRA32),
-                                      _yflip ? 1 : 0, 1, "screenshot",
-                                      _filePath);
-    }
-    /* JCE_SHOT_DUAL=1 also writes the inline version to "<path>.inline.png".
-     *
-     * The two files then come from ONE callback invocation and one pixel
-     * buffer, so a diff between them measures the code and nothing else.
-     * Comparing an async PNG against an inline PNG from a SEPARATE run does
-     * not: this scene's own run-to-run floor reaches 4.10%, which is larger
-     * than any difference the two write paths could plausibly have, and a
-     * cross-run comparison here reported 1.05-2.57%. Reading that as a defect
-     * in the async path would have repeated an attribution error this campaign
-     * has already made twice. */
-    if (async) {
-        static int s_dual = -1;
-        if (s_dual < 0) {
-            const char *dv = getenv("JCE_SHOT_DUAL");
-            s_dual = (dv && dv[0] && dv[0] != '0') ? 1 : 0;
-        }
-        if (s_dual && _data && _filePath) {
-            char ip[600];
-            snprintf(ip, sizeof ip, "%s.inline.png", _filePath);
-            SDL_Surface *ds = SDL_CreateSurfaceFrom((int)_width, (int)_height,
-                src_is_rgba ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_BGRA32,
-                (void *)(uintptr_t)_data, (int)_pitch);
-            if (ds) {
-                SDL_Surface *drgb = SDL_ConvertSurface(ds, SDL_PIXELFORMAT_RGB24);
-                SDL_DestroySurface(ds);
-                if (drgb) {
-                    if (_yflip) SDL_FlipSurface(drgb, SDL_FLIP_VERTICAL);
-                    IMG_SavePNG(drgb, ip);
-                    SDL_DestroySurface(drgb);
-                }
-            }
-        }
-        const uint64_t t_end = SDL_GetPerformanceCounter();
-        LOG_INFO(LOG_TAG, "screenshot queued in %.2f ms (%ux%u) — encode and "
-                 "write run on the PNG writer thread",
-                 (double)(t_end - t_enter) * 1000.0 /
-                 (double)(t_freq ? t_freq : 1), _width, _height);
-        s_screenshot_pending = false;
-        return;
-    }
-
-    bool ok = false;
-    if (_data && _filePath && _width && _height) {
-        /* Wrap the raw pixels in their native channel order (BGRA8 on D3D/VK,
-           RGBA8 on GL — see src_is_rgba above), respecting the row pitch; drop
-           the undefined backbuffer alpha by converting to RGB24, flip when the
-           backend reports bottom-up data, then encode by file extension
-           (.png default, .bmp optional). */
-        SDL_Surface *src = SDL_CreateSurfaceFrom((int)_width, (int)_height,
-            src_is_rgba ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_BGRA32,
-            (void *)(uintptr_t)_data, (int)_pitch);
-        if (src) {
-            SDL_Surface *rgb = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGB24);
-            SDL_DestroySurface(src);
-            if (rgb) {
-                if (_yflip)
-                    SDL_FlipSurface(rgb, SDL_FLIP_VERTICAL);
-                t_conv = SDL_GetPerformanceCounter();
-                const char *ext = strrchr(_filePath, '.');
-                if (ext && SDL_strcasecmp(ext, ".bmp") == 0)
-                    ok = SDL_SaveBMP(rgb, _filePath);
-                else
-                    ok = IMG_SavePNG(rgb, _filePath);
-                SDL_DestroySurface(rgb);
-            }
-        }
-    }
-
-    {   /* Inline fallback took the frame with it — say so, with the split, so
-           a regression back onto this path is visible rather than merely slow. */
-        const uint64_t t_end = SDL_GetPerformanceCounter();
-        const double ms = 1000.0 / (double)(t_freq ? t_freq : 1);
-        LOG_WARN(LOG_TAG, "screenshot written INLINE: convert %.2f ms + "
-                 "encode/write %.2f ms = %.2f ms blocking the frame (%ux%u)",
-                 (double)(t_conv - t_enter) * ms,
-                 (double)(t_end - t_conv) * ms,
-                 (double)(t_end - t_enter) * ms, _width, _height);
-    }
-
-    if (ok)
-        LOG_SUCCESS(LOG_TAG, "screenshot saved: %s (%ux%u)", _filePath, _width, _height);
-    else
-        LOG_ERROR(LOG_TAG, "screenshot failed: %s (%s)",
-                  _filePath ? _filePath : "(null)", SDL_GetError());
-
-    s_screenshot_pending = false;
-}
-
-/* Request an async capture of the current frame's backbuffer to `path`.
-   The shot is taken at the next bgfx_frame() and written from the screen_shot
-   callback above.  Output format is chosen by `path`'s extension (.png by
-   default).  Returns false if a capture is already pending or `path` is bad. */
-bool jce_renderer_request_screenshot(const char *path)
-{
-    if (!path || !path[0])
-        return false;
-    if (s_screenshot_pending)
-        return false;
-    bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX }; /* invalid == backbuffer */
-    s_screenshot_pending = true;
-    bgfx_request_screen_shot(backbuffer, path);
-    return true;
-}
-
-bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *path)
-{
-    if (!path || !path[0])
-        return false;
-    if (fbo_idx == UINT16_MAX)          /* caller wants the backbuffer */
-        return jce_renderer_request_screenshot(path);
-    if (s_screenshot_pending)
-        return false;
-    s_screenshot_pending = true;
-    bgfx_frame_buffer_handle_t fbh = { fbo_idx };
-    /* A REAL path (not a capture sentinel) => the screen_shot callback writes the
-       file, exactly as for the backbuffer path — but reading an offscreen FBO
-       sidesteps the flip-model "black backbuffer after Present" problem. */
-    bgfx_request_screen_shot(fbh, path);
-    return true;
-}
-
-bool jce_renderer_screenshot_pending(void)
-{
-    return s_screenshot_pending;
-}
-
-bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
-                                      JceFboCaptureFn sink, void *ud)
-{
-    if (!sink || fbo_idx == UINT16_MAX)
-        return false;
-    if (s_fbo_capture_pending)
-        return false;
-    s_fbo_capture_sink.fn = sink;
-    s_fbo_capture_sink.ud = ud;
-    s_fbo_capture_pending = true;
-    bgfx_frame_buffer_handle_t fbh = { fbo_idx };
-    /* The sentinel path in jce_bgfx_screen_shot routes the pixels to the sink. */
-    bgfx_request_screen_shot(fbh, JCE_FBO_CAPTURE_SENTINEL);
-    return true;
-}
-
-/* ── Headless offscreen capture (blit + bgfx_read_texture) ───────────────────
- * bgfx_request_screen_shot only completes on a foreground PRESENT, so it never
- * fires for a background/headless window.  This path instead blits an LDR source
- * texture into a READ_BACK staging texture and reads it back to CPU — a pure
- * GPU->CPU copy that completes during normal frame processing, with no window
- * focus required.  Same proven pattern as the impostor bake / pick pass.  The
- * editor postfx output is RGBA16F (HDR-format, holding tonemapped 0..1), so we
- * stage RGBA16F and convert the half-floats to RGBA8 on read.  One in flight. */
-static float rb_half_to_float(uint16_t h)
-{
-    uint32_t sign = (uint32_t)(h >> 15) & 1u;
-    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
-    uint32_t mant = (uint32_t)h & 0x3FFu;
-    uint32_t f;
-    if (exp == 0u) {
-        if (mant == 0u) { f = sign << 31; }
-        else {
-            exp = 127u - 15u + 1u;
-            while ((mant & 0x400u) == 0u) { mant <<= 1; exp--; }
-            mant &= 0x3FFu;
-            f = (sign << 31) | (exp << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
-    } else {
-        f = (sign << 31) | ((exp - 15u + 127u) << 23) | (mant << 13);
-    }
-    float out; memcpy(&out, &f, sizeof out); return out;
-}
-
-/* A small FIFO ring of readback slots.  With ONE slot in flight the capture
-   rate was framerate / (readback latency + 1) — bgfx completes a read
-   ~2 frames after submit, so a 66 fps editor recorded at ~22 fps.  Three
-   slots keep a readback in flight every frame; delivery stays strictly
-   FIFO (the recorder sink timestamps at delivery, so out-of-order delivery
-   would scramble frame times).  Staging textures and CPU buffers persist
-   across frames while recording (they were created + destroyed per frame:
-   30 MB of texture churn and 30 MB of malloc per capture at 2560x1494)
-   and are released once everything is idle again. */
-#define RB_SLOTS 3
-typedef struct {
-    int                    state;       /* 0 idle, 1 awaiting readback */
-    int                    mode;        /* 0 = write PNG (path), 1 = feed capture sink */
-    int                    yflip;       /* rows bottom-up? SOURCE-specific: the
-                                         * postfx RT reads back bottom-up on
-                                         * D3D, the ImGui recording FBO reads
-                                         * back per texture origin — callers
-                                         * pass what their source needs. */
-    bgfx_texture_handle_t  staging;
-    uint16_t               staging_w, staging_h;  /* size staging+pixels hold */
-    uint8_t               *pixels;
-    uint32_t               ready_frame;
-    uint16_t               w, h;
-    uint64_t               seq;         /* FIFO delivery order */
-    char                   path[512];
-} RbSlot;
-
-static RbSlot   s_rb_slots[RB_SLOTS];
-static uint64_t s_rb_seq_submit  = 1;   /* next sequence to hand out   */
-static uint64_t s_rb_seq_deliver = 1;   /* next sequence poll delivers */
-
-/* Half-float -> byte LUT for the tonemapped 0..1 capture sources: one table
-   lookup per channel instead of bit-twiddling + float math + clamp per
-   pixel.  The per-pixel conversion ran on the MAIN thread (poll) and cost
-   tens of ms per 2560x1494 frame — the single biggest "recording slows the
-   editor" contributor.  64 KB, built on first use. */
-static uint8_t *s_rb_half_lut = NULL;
-
-static const uint8_t *rb_lut(void)
-{
-    if (!s_rb_half_lut) {
-        uint8_t *lut = (uint8_t *)JCE_MALLOC(65536);
-        if (!lut) return NULL;
-        for (uint32_t hbits = 0; hbits < 65536u; ++hbits) {
-            float f = rb_half_to_float((uint16_t)hbits);
-            f = (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
-            lut[hbits] = (uint8_t)(f * 255.0f + 0.5f);
-        }
-        s_rb_half_lut = lut;
-    }
-    return s_rb_half_lut;
-}
-
-static void rb_slot_release(RbSlot *s)
-{
-    if (s->pixels) { JCE_FREE(s->pixels); s->pixels = NULL; }
-    /* staging_w gates validity: the slots are static-zero-initialized, and a
-       zeroed bgfx handle (idx 0) would otherwise LOOK valid and destroy a
-       live texture. */
-    if (s->staging_w && BGFX_HANDLE_IS_VALID(s->staging))
-        bgfx_destroy_texture(s->staging);
-    s->staging.idx = UINT16_MAX;
-    s->staging_w = s->staging_h = 0;
-    s->state = 0;
-}
-
-/* Shared submit: blit src (RGBA16F) -> READ_BACK staging and kick the read.
-   mode 0 -> the poll writes `path` as a PNG; mode 1 -> the poll converts to BGRA8
-   and feeds the capture sink (video recording).  Returns false when every
-   slot is busy — the caller skips this frame and submits again next frame. */
-static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
-                      uint16_t w, uint16_t h, int mode, int yflip,
-                      const char *path)
-{
-    if (src_tex_idx == UINT16_MAX || w == 0 || h == 0)
-        return false;
-    if (mode == 0 && (!path || !path[0]))
-        return false;
-
-    RbSlot *slot = NULL;
-    for (int i = 0; i < RB_SLOTS; ++i)
-        if (s_rb_slots[i].state == 0) { slot = &s_rb_slots[i]; break; }
-    if (!slot)
-        return false;
-
-    /* (Re)create the staging texture + CPU buffer only when the size changed;
-       both persist across captures (released when everything is idle).
-       staging_w==0 covers the static-zero-init state (handle idx 0 would
-       otherwise look valid). */
-    if (slot->staging_w != w || slot->staging_h != h || !slot->pixels) {
-        rb_slot_release(slot);
-        /* Match the editor postfx/UI output's RGBA16F format (blit requires
-           equal formats); convert half-floats -> 8-bit in the poll. */
-        slot->staging = bgfx_create_texture_2d(w, h, false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA16F,
-            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
-            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-        if (!BGFX_HANDLE_IS_VALID(slot->staging))
-            return false;
-        slot->pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u); /* RGBA16F */
-        if (!slot->pixels) {
-            bgfx_destroy_texture(slot->staging);
-            slot->staging.idx = UINT16_MAX;
-            return false;
-        }
-        slot->staging_w = w;
-        slot->staging_h = h;
-    }
-
-    bgfx_texture_handle_t src = { src_tex_idx };
-    /* blit_view must sort AFTER the source's render pass so the blit reads this
-       frame's fully-composited pixels. */
-    bgfx_blit(blit_view, slot->staging, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
-    slot->mode  = mode;
-    slot->yflip = yflip;
-    slot->path[0] = '\0';
-    if (mode == 0) snprintf(slot->path, sizeof slot->path, "%s", path);
-    slot->ready_frame = bgfx_read_texture(slot->staging, slot->pixels, 0, 0);
-    slot->w = w; slot->h = h;
-    slot->seq = s_rb_seq_submit++;
-    slot->state = 1;
-    return true;
-}
-
-bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
-                                          uint16_t w, uint16_t h, const char *path,
-                                          int yflip)
-{
-    /* `yflip` is SOURCE-specific, same contract as _submit_sink below: 1 for
-     * the engine postfx RT (bottom-up rows, empirically verified on D3D11
-     * headless captures), bgfx caps originBottomLeft for plain FBO passes
-     * (the ImGui whole-window FBO reads back TOP-down on D3D — hardcoding 1
-     * here is what inverted D3D11/D3D12/VK F12+WINCAP PNGs). */
-    return rb_submit(src_tex_idx, blit_view, w, h, 0, yflip, path);
-}
-
-/* Recording variant: read the source back and feed it to the capture sink as
-   BGRA8 (the WebM encoder's input format). One in flight; returns false if busy
-   so the caller simply skips this frame (the next frame submits again).
-   `yflip`: are the SOURCE texture's readback rows bottom-up? This is a
-   property of how the source was rendered, not just of the backend — pass
-   1 for the postfx RT, bgfx caps originBottomLeft for plain FBO passes
-   (hardcoding 1 here is what inverted D3D12 recordings). */
-bool jce_renderer_readback_capture_submit_sink(uint16_t src_tex_idx, uint16_t blit_view,
-                                               uint16_t w, uint16_t h, int yflip)
-{
-    return rb_submit(src_tex_idx, blit_view, w, h, 1, yflip, NULL);
-}
-
-/* ── Off-thread PNG writer ──────────────────────────────────────────────
- *
- * The readback itself is already asynchronous (staging + N slots), but the
- * DELIVERY encoded the PNG on the main thread.  A 1280x720 zlib encode plus
- * the file write costs on the order of 100 ms, which showed up as a
- * "frame_dt exceeded max_frame_dt; clamping to avoid spiral of death" warning
- * timestamped against every single capture: one screenshot stalled the frame
- * hard enough for the fixed clock to drop simulated time.
- *
- * Encoding is pure CPU work on a private pixel buffer with a private output
- * path, so it moves to a writer thread. The main thread keeps only the LUT
- * conversion (a few ms) and hands the buffer over. The queue is bounded; when
- * it is full the ready readback slot stays pending and retries next frame.
- * This preserves every capture without ever encoding inline on a frame. */
-#define RB_PNG_QUEUE 4
-
-typedef struct {
-    uint8_t *pixels;     /* owned; freed by whoever encodes it */
-    uint16_t w, h;
-    uint32_t pitch;      /* bytes per row in `pixels` */
-    int      format;     /* SDL_PixelFormat of `pixels` */
-    int      yflip;
-    int      drop_alpha; /* convert to RGB24 first (backbuffer alpha is junk) */
-    const char *what;    /* log label; a literal, never freed */
-    char     path[512];
-} RbPngJob;
-
-static RbPngJob   s_png_queue[RB_PNG_QUEUE];
-static int        s_png_head, s_png_tail, s_png_count;
-static JceMutex  *s_png_mu;
-static JceCondVar *s_png_cv;       /* signalled on enqueue and on shutdown */
-static JceCondVar *s_png_drained;  /* signalled when the queue empties     */
-static JceThread *s_png_thread;
-static bool       s_png_quit;
-static int        s_png_busy;      /* jobs handed out but not yet finished */
-
-/* Encode + write on the serial writer service. Takes ownership of rgba8. */
-static void rb_png_write(RbPngJob *job)
-{
-    SDL_Surface *surf = SDL_CreateSurfaceFrom((int)job->w, (int)job->h,
-        (SDL_PixelFormat)job->format, job->pixels, (int)job->pitch);
-    if (surf) {
-        SDL_Surface *out = surf;
-        /* The backbuffer's alpha channel is undefined, so that path asks for
-         * RGB24 and the readback path does not. Doing the conversion HERE
-         * rather than at the submitter is the point of the exercise: it used
-         * to cost 5-8 ms on the frame. */
-        if (job->drop_alpha) {
-            out = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGB24);
-            SDL_DestroySurface(surf);
-            surf = NULL;
-        }
-        if (out) {
-            /* Flip only when the SUBMITTER declared bottom-up rows (postfx RT,
-             * or plain FBO on GL). Plain FBOs read back top-down on D3D/VK/
-             * Metal — an unconditional flip inverted those PNGs. */
-            if (job->yflip)
-                SDL_FlipSurface(out, SDL_FLIP_VERTICAL);
-            if (IMG_SavePNG(out, job->path))
-                LOG_SUCCESS(LOG_TAG, "%s saved: %s (%ux%u)",
-                            job->what, job->path, job->w, job->h);
-            else
-                LOG_ERROR(LOG_TAG, "%s PNG write failed: %s (%s)",
-                          job->what, job->path, SDL_GetError());
-            SDL_DestroySurface(out);
-        }
-        if (surf) SDL_DestroySurface(surf);
-    }
-    JCE_FREE(job->pixels);
-    job->pixels = NULL;
-}
-
-static void rb_png_worker(void *unused)
-{
-    (void)unused;
-    for (;;) {
-        RbPngJob job;
-        jce_mutex_lock(s_png_mu);
-        while (s_png_count == 0 && !s_png_quit)
-            jce_cond_wait(s_png_cv, s_png_mu);
-        if (s_png_count == 0 && s_png_quit) {
-            jce_mutex_unlock(s_png_mu);
-            return;
-        }
-        job = s_png_queue[s_png_head];
-        s_png_head = (s_png_head + 1) % RB_PNG_QUEUE;
-        s_png_count--;
-        s_png_busy++;
-        jce_mutex_unlock(s_png_mu);
-
-        rb_png_write(&job);
-
-        jce_mutex_lock(s_png_mu);
-        s_png_busy--;
-        if (s_png_count == 0 && s_png_busy == 0)
-            jce_cond_broadcast(s_png_drained);
-        jce_mutex_unlock(s_png_mu);
-    }
-}
-
-static bool rb_png_prepare(void)
-{
-    if (!s_png_mu) {
-        s_png_mu      = jce_mutex_create();
-        s_png_cv      = jce_cond_create();
-        s_png_drained = jce_cond_create();
-        if (!s_png_mu || !s_png_cv || !s_png_drained) {
-            if (s_png_drained) jce_cond_destroy(s_png_drained);
-            if (s_png_cv) jce_cond_destroy(s_png_cv);
-            if (s_png_mu) jce_mutex_destroy(s_png_mu);
-            s_png_drained = NULL;
-            s_png_cv = NULL;
-            s_png_mu = NULL;
-            return false;
-        }
-    }
-    if (!s_png_thread) {
-        s_png_thread = jce_thread_create(rb_png_worker, NULL, "jce-png-write");
-        if (!s_png_thread)
-            return false;
-    }
-    return true;
-}
-
-static bool rb_png_has_capacity(void)
-{
-    bool has_capacity;
-
-    jce_mutex_lock(s_png_mu);
-    has_capacity = s_png_count < RB_PNG_QUEUE;
-    jce_mutex_unlock(s_png_mu);
-    return has_capacity;
-}
-
-/* Hand a converted frame to the writer service without blocking. */
-static bool rb_png_enqueue(RbPngJob *job)
-{
-    bool queued = false;
-
-    jce_mutex_lock(s_png_mu);
-    if (s_png_count < RB_PNG_QUEUE) {
-        s_png_queue[s_png_tail] = *job;
-        s_png_tail = (s_png_tail + 1) % RB_PNG_QUEUE;
-        s_png_count++;
-        queued = true;
-        jce_cond_signal(s_png_cv);
-    }
-    jce_mutex_unlock(s_png_mu);
-    return queued;
-}
-
-static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
-                              uint32_t pitch, uint32_t size, int format,
-                              int yflip, int drop_alpha, const char *what,
-                              const char *path)
-{
-    if (!data || !path || !w || !h || !size) return false;
-    if (w > 0xFFFFu || h > 0xFFFFu)          return false;
-    if (!rb_png_prepare())                   return false;
-
-    uint8_t *copy = (uint8_t *)JCE_MALLOC((size_t)size);
-    if (!copy) return false;
-    memcpy(copy, data, (size_t)size);
-
-    RbPngJob job;
-    job.pixels     = copy;
-    job.w          = (uint16_t)w;
-    job.h          = (uint16_t)h;
-    job.pitch      = pitch;
-    job.format     = format;
-    job.yflip      = yflip;
-    job.drop_alpha = drop_alpha;
-    job.what       = what;
-    jce_strlcpy(job.path, path, sizeof job.path);
-    if (!rb_png_enqueue(&job)) {
-        JCE_FREE(copy);
-        return false;
-    }
-    return true;
-}
-
-void jce_renderer_readback_capture_flush(void)
-{
-    if (!s_png_mu) return;
-    jce_mutex_lock(s_png_mu);
-    while (s_png_count > 0 || s_png_busy > 0)
-        jce_cond_wait(s_png_drained, s_png_mu);
-    jce_mutex_unlock(s_png_mu);
-}
-
-void jce_renderer_readback_capture_shutdown(void)
-{
-    if (!s_png_mu) return;
-    jce_renderer_readback_capture_flush();
-    jce_mutex_lock(s_png_mu);
-    s_png_quit = true;
-    jce_cond_broadcast(s_png_cv);
-    jce_mutex_unlock(s_png_mu);
-    if (s_png_thread) {
-        jce_thread_join(s_png_thread);
-        s_png_thread = NULL;
-    }
-    jce_cond_destroy(s_png_drained); s_png_drained = NULL;
-    jce_cond_destroy(s_png_cv);      s_png_cv      = NULL;
-    jce_mutex_destroy(s_png_mu);     s_png_mu      = NULL;
-    s_png_quit = false;
-    s_png_head = s_png_tail = s_png_count = s_png_busy = 0;
-}
-
-/* Deliver one ready slot, strictly FIFO.  Returns the poll result code. */
-static int rb_deliver(RbSlot *slot)
-{
-    int result = 2;
-    size_t npx = (size_t)slot->w * (size_t)slot->h;
-    const uint16_t *src = (const uint16_t *)slot->pixels;
-    const uint8_t  *lut = rb_lut();
-
-    if (slot->mode == 1) {
-        /* Recording: RGBA16F -> BGRA8 (encoder reads B,G,R,A) via the LUT and
-           feed the sink with the row order the SUBMITTER declared. */
-        uint8_t *bgra = lut ? (uint8_t *)JCE_MALLOC(npx * 4u) : NULL;
-        if (bgra && s_capture_active) {
-            for (size_t i = 0; i < npx; ++i) {
-                bgra[i * 4 + 0] = lut[src[i * 4 + 2]];
-                bgra[i * 4 + 1] = lut[src[i * 4 + 1]];
-                bgra[i * 4 + 2] = lut[src[i * 4 + 0]];
-                bgra[i * 4 + 3] = 255;
-            }
-            if (s_capture_sink.begin)
-                s_capture_sink.begin(s_capture_sink.ud, slot->w, slot->h,
-                                     (uint32_t)slot->w * 4u, slot->yflip);
-            if (s_capture_sink.frame)
-                s_capture_sink.frame(s_capture_sink.ud, bgra,
-                                     (uint32_t)(npx * 4u));
-            result = 1;
-        }
-        if (bgra) JCE_FREE(bgra);
-        slot->state = 0;   /* staging + pixels stay cached for the next frame */
-        return result;
-    }
-
-    /*
-     * mode 0: convert the RGBA16F half-float readback (tonemapped 0..1)
-     * to RGBA8 PNG. A saturated writer queue leaves this slot ready so
-     * polling retries it on a later frame.
-     */
-    if (!rb_png_prepare()) {
-        LOG_ERROR(LOG_TAG, "readback capture PNG service unavailable");
-        slot->state = 0;
-        return 2;
-    }
-    if (!rb_png_has_capacity())
-        return 0;
-
-    uint8_t *rgba8 = lut ? (uint8_t *)JCE_MALLOC(npx * 4u) : NULL;
-    if (rgba8) {
-        for (size_t i = 0; i < npx * 4u; ++i)
-            rgba8[i] = lut[src[i]];
-        RbPngJob job;
-        job.pixels     = rgba8;
-        job.w          = slot->w;
-        job.h          = slot->h;
-        job.pitch      = (uint32_t)slot->w * 4u;
-        job.format     = (int)SDL_PIXELFORMAT_RGBA32;
-        job.yflip      = slot->yflip;
-        job.drop_alpha = 0;
-        job.what       = "readback capture";
-        jce_strlcpy(job.path, slot->path, sizeof job.path);
-        if (!rb_png_enqueue(&job)) {
-            JCE_FREE(rgba8);
-            return 0;
-        }
-        result = 1;
-    }
-    slot->state = 0;
-    return result;
-}
-
-int jce_renderer_readback_capture_poll(void)
-{
-    int any_in_flight = 0;
-    int last_result = -1;
-
-    /* Deliver every slot that is ready, in strict submit order.  Stops at
-       the first not-yet-ready slot so a fast later readback can never
-       overtake an earlier one (the recorder timestamps at delivery). */
-    for (;;) {
-        RbSlot *next = NULL;
-        for (int i = 0; i < RB_SLOTS; ++i) {
-            if (s_rb_slots[i].state == 1) {
-                any_in_flight = 1;
-                if (s_rb_slots[i].seq == s_rb_seq_deliver)
-                    next = &s_rb_slots[i];
-            }
-        }
-        if (!next)
-            break;
-        if (s_bgfx_frame_index < next->ready_frame)
-            return 0;   /* oldest capture still on the GPU */
-        last_result = rb_deliver(next);
-        if (next->state == 1)
-            return 0;   /* writer backpressure: preserve FIFO and retry */
-        s_rb_seq_deliver++;
-        any_in_flight = 0;   /* recount on the next loop iteration */
-    }
-
-    /* Everything idle and no continuous capture running: release the cached
-       staging textures + CPU buffers (90 MB VRAM + 90 MB RAM at 2560x1494
-       across 3 slots — worth keeping only while recording). */
-    if (!any_in_flight && !s_capture_active) {
-        for (int i = 0; i < RB_SLOTS; ++i)
-            if (s_rb_slots[i].state == 0 && s_rb_slots[i].staging_w)
-                rb_slot_release(&s_rb_slots[i]);
-    }
-    return last_result != -1 ? last_result : (any_in_flight ? 0 : -1);
-}
-
-bool jce_renderer_fbo_capture_pending(void)
-{
-    return s_fbo_capture_pending;
-}
-
-/* Register the capture sink (s_capture_sink is defined near the screenshot
-   callback, which feeds it). bgfx's BGFX_RESET_CAPTURE hooks below also forward
-   to it, but are inert in this config — the screenshot path drives recording. */
-void jce_renderer_set_capture_sink(JceCaptureBeginFn begin, JceCaptureFrameFn frame,
-                                   JceCaptureEndFn end, void *ud)
-{
-    s_capture_sink.begin = begin;
-    s_capture_sink.frame = frame;
-    s_capture_sink.end   = end;
-    s_capture_sink.ud    = ud;
-}
-
-static void jce_bgfx_capture_begin(bgfx_callback_interface_t *_this, uint32_t _width,
-                                   uint32_t _height, uint32_t _pitch, bgfx_texture_format_t _format,
-                                   bool _yflip)
-{
-    (void)_this;
-    (void)_format;
-    if (s_capture_sink.begin)
-        s_capture_sink.begin(s_capture_sink.ud, _width, _height, _pitch, _yflip ? 1 : 0);
-}
-
-static void jce_bgfx_capture_end(bgfx_callback_interface_t *_this)
-{
-    (void)_this;
-    if (s_capture_sink.end)
-        s_capture_sink.end(s_capture_sink.ud);
-}
-
-static void jce_bgfx_capture_frame(bgfx_callback_interface_t *_this, const void *_data,
-                                   uint32_t _size)
-{
-    (void)_this;
-    if (s_capture_sink.frame)
-        s_capture_sink.frame(s_capture_sink.ud, _data, _size);
-}
-
-static const bgfx_callback_vtbl_t s_bgfx_callback_vtbl = {
-    jce_bgfx_fatal,          jce_bgfx_trace_vargs,
-    jce_bgfx_profiler_begin, jce_bgfx_profiler_begin_literal,
-    jce_bgfx_profiler_end,   jce_bgfx_cache_read_size,
-    jce_bgfx_cache_read,     jce_bgfx_cache_write,
-    jce_bgfx_screen_shot,    jce_bgfx_capture_begin,
-    jce_bgfx_capture_end,    jce_bgfx_capture_frame,
-};
-
-static bgfx_callback_interface_t s_bgfx_callback = {
-    &s_bgfx_callback_vtbl,
-};
 
 /* Map JceRendererBackend enum value to bgfx renderer type. */
 static bgfx_renderer_type_t to_bgfx_type(enum JceRendererBackend b)
@@ -1533,6 +653,182 @@ static bgfx_renderer_type_t to_bgfx_type(enum JceRendererBackend b)
 static bgfx_renderer_type_t map_backend(int backend)
 {
     return to_bgfx_type((enum JceRendererBackend)backend);
+}
+
+static JceRendererBackend from_bgfx_type(bgfx_renderer_type_t type)
+{
+    switch (type) {
+    case BGFX_RENDERER_TYPE_DIRECT3D11: return JCE_BACKEND_D3D11;
+    case BGFX_RENDERER_TYPE_DIRECT3D12: return JCE_BACKEND_D3D12;
+    case BGFX_RENDERER_TYPE_VULKAN:     return JCE_BACKEND_VULKAN;
+    case BGFX_RENDERER_TYPE_OPENGL:     return JCE_BACKEND_OPENGL;
+    case BGFX_RENDERER_TYPE_OPENGLES:   return JCE_BACKEND_OPENGLES;
+    case BGFX_RENDERER_TYPE_METAL:      return JCE_BACKEND_METAL;
+    case BGFX_RENDERER_TYPE_NOOP:       return JCE_BACKEND_NOOP;
+    default:                            return JCE_BACKEND_AUTO;
+    }
+}
+
+/* The app window, so the GL context ladder below can build on the real one.
+ * Set by jce_renderer_create() before any attempt; NULL when headless. */
+static SDL_Window   *s_gl_ladder_window  = NULL;
+static SDL_GLContext s_gl_ladder_context = NULL;
+static int           s_gl_ladder_version = 0;
+
+/* Run desktop OpenGL at the highest core version this driver grants, instead
+ * of exactly the version the build was compiled for.
+ *
+ * WHY THIS IS NEEDED, measured 2026-09-01 and contrary to the obvious guess:
+ * asking for a 3.3 CORE context on a card that reports 4.6 in a compatibility
+ * context yields exactly "3.3.0 NVIDIA".  Core profiles are honoured
+ * literally.  bgfx asks for BGFX_CONFIG_RENDERER_OPENGL and nothing else, so
+ * the build floor was not a minimum -- it was the version we ran at, on every
+ * machine, forever.  This driver grants 4.6, 4.3, 3.3 and 3.1; we were taking
+ * 3.3.
+ *
+ * WHY IT IS SAFE.  bgfx writes `#version 140` for any floor >= 31 and 1.40 is
+ * valid from GL 3.1 through 4.6 core, so the fixed shader dialect does not
+ * pin the context.  bgfx also accepts a context we create -- glcontext_wgl.cpp
+ * skips its own creation when platformData.context is set, and its destroy()
+ * explicitly does NOT delete a context it did not make, so ownership stays
+ * here.
+ *
+ * WHY IT ONLY LADDERS UP.  59 entries in bgfx's extension table are seeded
+ * "assume core at BGFX_CONFIG_RENDERER_OPENGL >= N".  Those defaults are
+ * compiled for the FLOOR, so handing bgfx a context BELOW it would have it
+ * assume entry points that are not there.  Above the floor the seeds are
+ * merely conservative and the runtime GL_EXTENSIONS scan fills the rest in. */
+static void gl_ladder_acquire(bgfx_platform_data_t *pd)
+{
+    static const int kRungs[] = {46, 45, 44, 43, 42, 41, 40, 33, 32, 31};
+
+    if (!s_gl_ladder_window || JCE_BGFX_OPENGL_VERSION < 31)
+        return;                       /* legacy floor: bgfx's own 2.1 path */
+    if (s_gl_ladder_context) {        /* a previous attempt already built one */
+        pd->context = s_gl_ladder_context;
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(kRungs) / sizeof(kRungs[0]); ++i) {
+        SDL_GLContext c;
+        if (kRungs[i] < JCE_BGFX_OPENGL_VERSION)
+            break;                    /* never below the floor -- see above */
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kRungs[i] / 10);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, kRungs[i] % 10);
+        c = SDL_GL_CreateContext(s_gl_ladder_window);
+        if (!c)
+            continue;
+        /* Report the version this context ACTUALLY is, not the floor.  The
+         * throwaway probe measures a floor-matching context by design, so
+         * without this the log and the editor would say 3.3 while the engine
+         * ran at 4.6. */
+        {
+            const unsigned char *(*gs)(unsigned) =
+                (const unsigned char *(*)(unsigned))
+                    SDL_GL_GetProcAddress("glGetString");
+            if (gs)
+                jce_renderer_caps_api_publish_probe(
+                    JCE_BACKEND_OPENGL, (const char *)gs(0x1F02u),
+                    (const char *)gs(0x8B8Cu));
+        }
+
+        /* Hand it over UNBOUND.  SDL_GL_CreateContext makes the context
+         * current on the calling thread, and a WGL context can be current on
+         * exactly one thread at a time -- bgfx's render thread then fails
+         * wglMakeCurrent and every wglGetProcAddress after it, which surfaces
+         * as ~45 "Failed to create OpenGL context. wglGetProcAddress(...)"
+         * fatals that look nothing like the cause.  Measured. */
+        SDL_GL_MakeCurrent(s_gl_ladder_window, NULL);
+        s_gl_ladder_context = c;
+        s_gl_ladder_version = kRungs[i];
+        pd->context = c;
+        LOG_INFO(LOG_TAG,
+                 "OpenGL: running at %d.%d core, the highest this driver "
+                 "grants at or above the %d.%d build floor",
+                 kRungs[i] / 10, kRungs[i] % 10,
+                 JCE_BGFX_OPENGL_VERSION / 10, JCE_BGFX_OPENGL_VERSION % 10);
+        return;
+    }
+    LOG_INFO(LOG_TAG, "OpenGL: no core context at or above the %d.%d floor; "
+             "letting bgfx create its own",
+             JCE_BGFX_OPENGL_VERSION / 10, JCE_BGFX_OPENGL_VERSION % 10);
+}
+
+static void gl_ladder_release(void)
+{
+    if (s_gl_ladder_context) {
+        SDL_GL_DestroyContext(s_gl_ladder_context);
+        s_gl_ladder_context = NULL;
+        s_gl_ladder_version = 0;
+    }
+}
+
+static bool init_backend_attempt(bgfx_renderer_type_t type,
+                                 const bgfx_platform_data_t *pd,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t reset_flags, bool debug)
+{
+    bgfx_init_t init;
+    JceRendererApiInfo api;
+
+    jce_renderer_caps_api_begin_attempt(from_bgfx_type(type));
+    bgfx_init_ctor(&init);
+    apply_adapter_preference(&init);
+    apply_transient_limits(&init);
+    init.type              = type;
+    init.resolution.width  = width;
+    init.resolution.height = height;
+    init.resolution.reset  = reset_flags;
+    init.platformData      = *pd;
+    /* Desktop GL only: swap in a context at the highest core version this
+     * driver grants at or above the floor.  A no-op for every other backend
+     * and for a legacy (< 3.1) floor. */
+    if (type == BGFX_RENDERER_TYPE_OPENGL)
+        gl_ladder_acquire(&init.platformData);
+    init.callback          = jce_rcb_callback_interface();
+    init.debug             = debug;
+
+    if (!bgfx_init(&init)) {
+        /* Our context is useless to any other backend, and leaving it
+         * current would have the next attempt inherit it. */
+        gl_ladder_release();
+        return false;
+    }
+    if (jce_renderer_caps_api_accept_active_backend())
+        return true;
+
+    api = jce_renderer_get_api_info();
+    if (api.runtime_version_verified) {
+        LOG_WARN(LOG_TAG,
+                 "%s negotiated API %u.%u.%u below %s floor %u.%u.%u; "
+                 "trying the next backend",
+                 jce_renderer_backend_name(api.backend),
+                 (unsigned)api.runtime_version.major,
+                 (unsigned)api.runtime_version.minor,
+                 (unsigned)api.runtime_version.patch,
+                 jce_graphics_api_tier_name(api.build_tier),
+                 (unsigned)api.minimum_version.major,
+                 (unsigned)api.minimum_version.minor,
+                 (unsigned)api.minimum_version.patch);
+    } else {
+        LOG_WARN(LOG_TAG,
+                 "%s did not report its negotiated API version; %s tier "
+                 "cannot be verified, trying the next backend",
+                 jce_renderer_backend_name(api.backend),
+                 jce_graphics_api_tier_name(api.build_tier));
+    }
+    bgfx_shutdown();
+    /* Same reason as the bgfx_init-failed path above, and it was missing here:
+     * bgfx does not destroy a context it did not create, so returning without
+     * this leaks the laddered context AND leaves s_gl_ladder_context set --
+     * which makes gl_ladder_acquire() hand the SAME context to a later
+     * jce_renderer_create(), after the bgfx instance it was given to has been
+     * shut down.  Order matters: bgfx first, then the context it was using. */
+    gl_ladder_release();
+    jce_renderer_caps_api_reset();
+    return false;
 }
 
 /* Platform-preferred bgfx fallback chain.
@@ -1607,6 +903,10 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                                   const JceRendererConfig *cfg)
 {
     if (!win || !cfg) return NULL;
+
+    /* The ladder builds its context on the real window, so publish it before
+     * any backend attempt runs. */
+    s_gl_ladder_window = jce_window_sdl(win);
 
     /* Test/diagnostic hook: JCE_FORCE_FALLBACK=1 short-circuits the
      * entire bgfx init path so the engine drops straight into the
@@ -1708,7 +1008,6 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     /* Try to initialise bgfx.  When the user picked a specific backend we
      * attempt that first; on failure (or AUTO) we walk the platform-specific
      * preferred list until one succeeds. */
-    bgfx_init_t init;
     bool ok = false;
 
     if (requested_type != BGFX_RENDERER_TYPE_COUNT) {
@@ -1716,17 +1015,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             LOG_WARN(LOG_TAG, "requested backend %s probe failed — trying fallback chain",
                      bgfx_get_renderer_name(requested_type));
         } else {
-            bgfx_init_ctor(&init);
-            apply_adapter_preference(&init);
-            apply_transient_limits(&init);
-            init.type              = requested_type;
-            init.resolution.width  = w;
-            init.resolution.height = h;
-            init.resolution.reset  = reset_flags;
-            init.platformData      = pd;
-            init.callback          = &s_bgfx_callback;
-            init.debug             = gfx_debug;
-            ok = bgfx_init(&init);
+            ok = init_backend_attempt(requested_type, &pd, w, h,
+                                      reset_flags, gfx_debug);
             if (!ok)
                 LOG_WARN(LOG_TAG, "requested backend %s failed",
                          bgfx_get_renderer_name(requested_type));
@@ -1744,21 +1034,19 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             }
             LOG_INFO(LOG_TAG, "trying backend: %s",
                      bgfx_get_renderer_name(chain[i]));
-            bgfx_init_ctor(&init);
-            apply_adapter_preference(&init);
-            apply_transient_limits(&init);
-            init.type              = chain[i];
-            init.resolution.width  = w;
-            init.resolution.height = h;
-            init.resolution.reset  = reset_flags;
-            init.platformData      = pd;
-            init.callback          = &s_bgfx_callback;
-            init.debug             = gfx_debug;
-            if (bgfx_init(&init)) { ok = true; break; }
+            if (init_backend_attempt(chain[i], &pd, w, h,
+                                     reset_flags, gfx_debug)) {
+                ok = true;
+                break;
+            }
         }
     }
 
     if (!ok) {
+        /* Every attempt failed.  A GL attempt in the chain may have left its
+         * laddered context behind; nothing else will free it on this path. */
+        gl_ladder_release();
+        jce_renderer_caps_api_reset();
         LOG_ERROR(LOG_TAG, "bgfx_init failed - all backends exhausted "
                   "(nwh=%p, w=%u, h=%u)", pd.nwh, w, h);
         /* 
@@ -1768,8 +1056,25 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         return NULL;
     }
 
-    LOG_INFO(LOG_TAG, "renderer: %s",
-             bgfx_get_renderer_name(bgfx_get_renderer_type()));
+    {
+        JceRendererApiInfo api = jce_renderer_get_api_info();
+        if (api.runtime_version_verified) {
+            LOG_INFO(LOG_TAG,
+                     "renderer: %s API %u.%u.%u (%s floor %u.%u.%u)",
+                     bgfx_get_renderer_name(bgfx_get_renderer_type()),
+                     (unsigned)api.runtime_version.major,
+                     (unsigned)api.runtime_version.minor,
+                     (unsigned)api.runtime_version.patch,
+                     jce_graphics_api_tier_name(api.build_tier),
+                     (unsigned)api.minimum_version.major,
+                     (unsigned)api.minimum_version.minor,
+                     (unsigned)api.minimum_version.patch);
+        } else {
+            LOG_INFO(LOG_TAG, "renderer: %s (graphics tier %s)",
+                     bgfx_get_renderer_name(bgfx_get_renderer_type()),
+                     jce_graphics_api_tier_name(api.build_tier));
+        }
+    }
     log_gpu_adapters();
 
     /* bgfx's built-in debug text is an ALLOWLIST, not a denylist.
@@ -1799,7 +1104,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             LOG_INFO(LOG_TAG,
                      "disabling bgfx debug text on the %s backend "
                      "(allowlisted on D3D11/D3D12 only)",
-                     bgfx_get_renderer_name(rt));
+                     jce_renderer_running_backend_name());
             enable_debug_text = false;
         }
     }
@@ -1822,7 +1127,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
 
     /* View 0 (3D): clear color + depth. */
     bgfx_set_view_clear(JCE_VIEW_MAIN_3D,
-        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
         cfg->clear_color, 1.0f, 0);
     bgfx_set_view_rect(JCE_VIEW_MAIN_3D, 0, 0, (uint16_t)w, (uint16_t)h);
 
@@ -1842,6 +1147,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) {
         bgfx_shutdown();
+        gl_ladder_release();
+        jce_renderer_caps_api_reset();
         return NULL;
     }
     r->reset_flags = reset_flags;
@@ -1876,6 +1183,18 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     /* Uniforms (created here; shaders attached later). */
     r->u_tex_color = bgfx_create_uniform(
         "s_texColor", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    /* THE REAL path as well as the NOOP one below.  A uniform created in only
+     * one of the two leaves the other holding a zero handle -- which is a
+     * VALID handle belonging to some other uniform, so the write lands
+     * somewhere unrelated instead of failing. */
+    r->u_sdf_params = bgfx_create_uniform(
+        "u_sdfParams", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_outline = bgfx_create_uniform(
+        "u_sdfOutline", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_shadow_offset = bgfx_create_uniform(
+        "u_sdfShadowOffset", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_shadow_color = bgfx_create_uniform(
+        "u_sdfShadowColor", BGFX_UNIFORM_TYPE_VEC4, 1);
     r->u_light_dir = bgfx_create_uniform(
         "u_lightDir", BGFX_UNIFORM_TYPE_VEC4, 1);
     r->u_light_color = bgfx_create_uniform(
@@ -1885,6 +1204,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
        jce_renderer_set_shaders() after creation. */
     r->program.idx              = UINT16_MAX;
     r->program_textured.idx     = UINT16_MAX;
+    r->program_text_sdf.idx     = UINT16_MAX;
     r->program_mesh.idx         = UINT16_MAX;
     r->program_pbr.idx          = UINT16_MAX;
     r->program_pbr_inst.idx     = UINT16_MAX;
@@ -1901,6 +1221,11 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_shadow_inst.idx  = UINT16_MAX;
     r->program_shadow_skinned.idx = UINT16_MAX;
     r->program_terrain.idx        = UINT16_MAX;
+    r->frame_shader_keys          = 0u;
+    r->force_shader_keys          = -1;
+    for (int _v = 0; _v < JCE_SHADER_VARIANT_COUNT; _v++)
+        for (int _k = 0; _k < JCE_SHADER_KEY_COUNT; _k++)
+            r->program_variant[_v][_k].idx = UINT16_MAX;
 
     /* Build GPU name from vendor ID + renderer name. */
     {
@@ -1915,7 +1240,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         default:     vendor = "Unknown"; break;
         }
         snprintf(r->gpu_name, sizeof(r->gpu_name), "%s / %s",
-                 vendor, bgfx_get_renderer_name(bgfx_get_renderer_type()));
+                 vendor, jce_renderer_running_backend_name());
         /* Effective encoder-pool cap (after caps clamp) — the ceiling for the
          * opt-in parallel command-submission path (JCE_PARALLEL_SUBMIT). */
         r->max_encoders = caps->limits.maxEncoders;
@@ -1964,6 +1289,7 @@ JceRenderer *jce_renderer_create_headless(void)
 #endif
 
     bgfx_init_t init;
+    jce_renderer_caps_api_begin_attempt(JCE_BACKEND_NOOP);
     bgfx_init_ctor(&init);
     apply_adapter_preference(&init);
     init.type              = BGFX_RENDERER_TYPE_NOOP;
@@ -1972,13 +1298,21 @@ JceRenderer *jce_renderer_create_headless(void)
     init.resolution.reset  = BGFX_RESET_NONE;
     /* No platformData (no window), no callback: NOOP needs neither. */
     if (!bgfx_init(&init)) {
+        jce_renderer_caps_api_reset();
         LOG_ERROR(LOG_TAG, "headless bgfx NOOP init failed");
+        return NULL;
+    }
+    if (!jce_renderer_caps_api_accept_active_backend()) {
+        bgfx_shutdown();
+        jce_renderer_caps_api_reset();
         return NULL;
     }
 
     JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) {
         bgfx_shutdown();
+        gl_ladder_release();
+        jce_renderer_caps_api_reset();
         return NULL;
     }
     r->headless    = true;
@@ -1998,12 +1332,19 @@ JceRenderer *jce_renderer_create_headless(void)
     bgfx_vertex_layout_end(&r->layout_textured);
 
     r->u_tex_color   = bgfx_create_uniform("s_texColor", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    r->u_sdf_params  = bgfx_create_uniform("u_sdfParams", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_outline = bgfx_create_uniform("u_sdfOutline", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_shadow_offset =
+        bgfx_create_uniform("u_sdfShadowOffset", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_sdf_shadow_color =
+        bgfx_create_uniform("u_sdfShadowColor", BGFX_UNIFORM_TYPE_VEC4, 1);
     r->u_light_dir   = bgfx_create_uniform("u_lightDir", BGFX_UNIFORM_TYPE_VEC4, 1);
     r->u_light_color = bgfx_create_uniform("u_lightColor", BGFX_UNIFORM_TYPE_VEC4, 1);
 
     /* All shader programs start invalid (never set — headless never draws). */
     r->program.idx                    = UINT16_MAX;
     r->program_textured.idx           = UINT16_MAX;
+    r->program_text_sdf.idx           = UINT16_MAX;
     r->program_mesh.idx               = UINT16_MAX;
     r->program_pbr.idx                = UINT16_MAX;
     r->program_pbr_inst.idx           = UINT16_MAX;
@@ -2035,6 +1376,11 @@ void jce_renderer_set_shaders(JceRenderer *r,
         shaders->color.idx };
     r->program_textured = (bgfx_program_handle_t){
         shaders->textured.idx };
+    /* Optional: a pak built before fs_text_sdf existed leaves this invalid,
+     * and the text renderer keeps every font on the bitmap path rather than
+     * drawing nothing. */
+    r->program_text_sdf = (bgfx_program_handle_t){
+        shaders->text_sdf.idx };
     r->program_mesh = (bgfx_program_handle_t){
         shaders->mesh.idx };
     r->program_pbr = (bgfx_program_handle_t){ shaders->pbr.idx };
@@ -2052,6 +1398,7 @@ void jce_renderer_set_shaders(JceRenderer *r,
     r->program_shadow_inst = (bgfx_program_handle_t){ shaders->shadow_inst.idx };
     r->program_shadow_skinned = (bgfx_program_handle_t){ shaders->shadow_skinned.idx };
     r->program_terrain = (bgfx_program_handle_t){ shaders->terrain.idx };
+    memcpy(r->program_variant, shaders->variant, sizeof r->program_variant);
 
     if (r->program.idx == UINT16_MAX)
         LOG_ERROR(LOG_TAG, "color shader not provided");
@@ -2365,15 +1712,14 @@ void jce_renderer_destroy(JceRenderer *r)
     if (r->u_light_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_color);
 
-    /* Tear down the text/FreeType subsystem here so any future GPU-touching
-     * cleanup it grows runs while bgfx is still alive. Today FT_Done_FreeType
-     * is bgfx-agnostic, but routing the call through renderer destroy
-     * preserves the LIFO contract documented in jce_engine.c. */
+    /* Subsystems and path-keyed bgfx-handle caches, torn down while bgfx is
+     * still alive: FreeType (bgfx-agnostic today, but routing it through
+     * renderer destroy preserves the LIFO contract documented in
+     * jce_engine.c), jce_pbr_material_load_json's graph programs, and the
+     * IES LUTs baked from authored .ies paths. */
     jce_text_shutdown();
-
-    /* Free graph-generated custom programs cached by jce_pbr_material_load_json
-     * while bgfx is still alive. */
     jce_pbr_material_shutdown();
+    jce_ies_cache_shutdown();
 
     /* Free the octahedral-impostor shared GPU resources (program, quad VB,
      * uniforms, any in-flight bake FBO) while bgfx is still alive. */
@@ -2397,6 +1743,10 @@ void jce_renderer_destroy(JceRenderer *r)
     }
 
     bgfx_shutdown();
+    /* After bgfx is down: it never deletes a context it did not create, so
+     * the ladder's context is ours to release and only now is it unused. */
+    gl_ladder_release();
+    jce_renderer_caps_api_reset();
     JCE_FREE(r);
     LOG_INFO(LOG_TAG, "renderer destroyed");
 }
@@ -2479,6 +1829,26 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
     }
 
     bgfx_set_view_rect(view_id, vp_x, vp_y, vp_w, vp_h);
+    /* AND BIND THE VIEW TO THE BACKBUFFER, because that is what this function
+     * means: configure this view to draw the 3D scene TO THE WINDOW.
+     *
+     * A bgfx view's framebuffer binding is sticky.  The shipped runtime's
+     * offscreen bridge and its direct-to-backbuffer fallback share one view
+     * id, and the bridge binds its FBO in prepare_keep -- before the caller
+     * has decided whether any post-processing is enabled.  When none is, the
+     * bridge silently declines to present and the fallback renders the whole
+     * game into an offscreen target nobody shows.  The result is a black
+     * window, and the shipped runtime shipped that way for every project with
+     * no post-processing: measured on a two-sphere scene, avg_lum 217.4 with
+     * one postfx effect enabled and 0.0 with none, same frame, same scene.
+     *
+     * Binding here fixes the class rather than the instance: any view handed
+     * to this function is being pointed at the window, whatever it was
+     * pointed at before. */
+    {
+        bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX };
+        bgfx_set_view_frame_buffer(view_id, backbuffer);
+    }
     /* Force sequential submission order for the 3D view so the scene
      * renderer's draw order (sky → shadows → opaques → transparents) is
      * preserved when rendering directly to the backbuffer.  The editor's
@@ -2501,7 +1871,7 @@ void jce_renderer_present_splash(const JceRenderer *r,
     if (h == 0) h = 1;
 
     bgfx_set_view_clear(0,
-                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                         rgba_color, 1.0f, 0);
     bgfx_set_view_rect(0, 0, 0, (uint16_t)w, (uint16_t)h);
     bgfx_touch(0);
@@ -2582,7 +1952,24 @@ void jce_renderer_end_frame(const JceRenderer *r)
         }
         if (s_cap_frame >= 0 && !s_cap_done &&
             s_bgfx_frame_index >= (uint32_t)s_cap_frame) {
-            if (jce_renderer_request_screenshot(s_cap_path))
+            /* THE HOST FIRST, THE BACKBUFFER OTHERWISE.
+             *
+             * jce_renderer_request_screenshot photographs the BACKBUFFER,
+             * which in the editor carries the ImGui layer -- so an automated
+             * capture there contains the profiler panel's clock, measured at
+             * 53,089 of 3,911,680 pixels differing between two runs of one
+             * input digest, all inside rows 1080..1526 with the scene above
+             * byte-identical.  A host that has a UI-free image of its own
+             * says so by installing a hook.
+             *
+             * DECLINING IS NORMAL, NOT AN ERROR: the editor's Game View panel
+             * can be closed, and then there is no offscreen target to read.
+             * False falls through to exactly the behaviour every host had
+             * before the hook existed. */
+            bool taken = jce_rcb_host_took_capture(s_cap_path);
+            if (!taken)
+                taken = jce_renderer_request_screenshot(s_cap_path);
+            if (taken)
                 s_cap_done = true;
         }
     }
@@ -2590,10 +1977,9 @@ void jce_renderer_end_frame(const JceRenderer *r)
     /* Recording: request a backbuffer capture for this frame (one in flight;
        the screen_shot callback routes it to the capture sink). Reuses the
        proven screenshot path since BGFX_RESET_CAPTURE is inert here. */
-    if (s_capture_active && !s_capture_imgui_mode &&
-        !s_capture_shot_pending && !s_screenshot_pending) {
+    if (jce_rcb_capture_wants_shot()) {
         bgfx_frame_buffer_handle_t bb = { UINT16_MAX };  /* backbuffer */
-        s_capture_shot_pending = true;
+        jce_rcb_capture_mark_shot_pending();
         bgfx_request_screen_shot(bb, JCE_CAPTURE_SENTINEL);
     }
 
@@ -2765,6 +2151,40 @@ const bgfx_vertex_layout_t *jce_renderer_get_layout_textured(const JceRenderer *
     return r ? &r->layout_textured : NULL;
 }
 
+bgfx_program_handle_t jce_renderer_get_program_text_sdf(const JceRenderer *r)
+{
+    bgfx_program_handle_t invalid = { UINT16_MAX };
+    return r ? r->program_text_sdf : invalid;
+}
+
+JceUniformHandle jce_renderer_get_sdf_params_uniform(const JceRenderer *r)
+{
+    JceUniformHandle h;
+    h.idx = r ? r->u_sdf_params.idx : UINT16_MAX;
+    return h;
+}
+
+JceUniformHandle jce_renderer_get_sdf_outline_uniform(const JceRenderer *r)
+{
+    JceUniformHandle h;
+    h.idx = r ? r->u_sdf_outline.idx : UINT16_MAX;
+    return h;
+}
+
+JceUniformHandle jce_renderer_get_sdf_shadow_offset_uniform(const JceRenderer *r)
+{
+    JceUniformHandle h;
+    h.idx = r ? r->u_sdf_shadow_offset.idx : UINT16_MAX;
+    return h;
+}
+
+JceUniformHandle jce_renderer_get_sdf_shadow_color_uniform(const JceRenderer *r)
+{
+    JceUniformHandle h;
+    h.idx = r ? r->u_sdf_shadow_color.idx : UINT16_MAX;
+    return h;
+}
+
 bgfx_program_handle_t jce_renderer_get_program_textured(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
@@ -2792,14 +2212,61 @@ JceShaderHandle jce_renderer_get_program_mesh(const JceRenderer *r)
     return (JceShaderHandle){ r->program_mesh.idx };
 }
 
-JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
+
+/* THE ONE PLACE A PBR DRAW'S PROGRAM IS DECIDED.
+ *
+ * It used to be seven places, and the last attempt at a keyword axis wired
+ * six of them: forcing the variant on every draw moved ZERO pixels, because
+ * shape primitives take a seventh path nobody had touched, while the
+ * engine's own enable_csm=false moved 7979 on the same frame.  Half-wired is
+ * worse than absent -- it is absent AND it looks done.  So the sites no
+ * longer choose; they say what the draw IS and what the material ASKS FOR,
+ * and this turns the pair into a program.
+ *
+ * THE FALLBACK IS A DEGRADE, NOT A GUESS.  An entry is invalid when its .bin
+ * is not in the pak -- an older pak, or a backend the variant is excluded
+ * from.  Dropping keywords from the HIGHEST bit down is the right order
+ * because the manifest puts the cheaper-to-lose axis first: losing NOSHADOW
+ * costs instructions, losing FWDPLUS costs a lighting model.  Key 0 is always
+ * present, so this terminates; if even that failed to load the caller gets an
+ * invalid handle and skips the draw, which is what it did before.
+ *
+ * THE FRAME'S OWN KEYS ARE FOLDED IN, and they have to be.  Forward+ is a
+ * property of the renderer for the whole frame, not of any one material, and
+ * the alternative -- every call site remembering to OR it -- is exactly the
+ * per-site agreement that failed last time.  It is a renderer field, the
+ * renderer is an argument, so the answer still depends only on what is
+ * named.  JCE_SHADER_FORCE_KEYS exists for the same reason: a control that
+ * forces an axis must travel the path a material's key travels, or it proves
+ * something about the control instead of about the wiring. */
+JceShaderHandle jce_renderer_get_program_variant(const JceRenderer *r,
+                                                 JceShaderVertexVariant vv,
+                                                 uint32_t keys)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
-    if (r->forwardplus_program_active &&
-        r->program_pbr_fwdplus.idx != UINT16_MAX)
-        return (JceShaderHandle){ r->program_pbr_fwdplus.idx };
-    return (JceShaderHandle){ r->program_pbr.idx };
+    if ((int)vv < 0 || (int)vv >= JCE_SHADER_VARIANT_COUNT) return invalid;
+
+    uint32_t k = (keys | r->frame_shader_keys)
+               & (uint32_t)(JCE_SHADER_KEY_COUNT - 1);
+    for (;;) {
+        const uint16_t idx = r->program_variant[(int)vv][k].idx;
+        if (idx != UINT16_MAX) return (JceShaderHandle){ idx };
+        if (k == 0u) return invalid;
+        /* Clear the highest set bit and try again. */
+        uint32_t high = k;
+        high |= high >> 1; high |= high >> 2; high |= high >> 4;
+        high |= high >> 8; high |= high >> 16;
+        high = high ^ (high >> 1);
+        k &= ~high;
+    }
+}
+
+JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
+{
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR,
+        0u);
 }
 
 JceShaderHandle jce_renderer_create_program_from_blobs(
@@ -2844,12 +2311,9 @@ void jce_renderer_destroy_program(JceShaderHandle prog)
 
 JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
 {
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!r) return invalid;
-    if (r->forwardplus_program_active &&
-        r->program_pbr_inst_fwdplus.idx != UINT16_MAX)
-        return (JceShaderHandle){ r->program_pbr_inst_fwdplus.idx };
-    return (JceShaderHandle){ r->program_pbr_inst.idx };
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_INST,
+        0u);
 }
 
 /* Per-instance-tint instanced PBR program (large-world-opt P1 #7).  Returns
@@ -2858,38 +2322,51 @@ JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
  * counterpart yet — tinted runs use the brute-force lighting path. */
 JceShaderHandle jce_renderer_get_program_pbr_inst_tint(const JceRenderer *r)
 {
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!r) return invalid;
-    return (JceShaderHandle){ r->program_pbr_inst_tint.idx };
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_INST_TINT, 0u);
 }
 
 JceShaderHandle jce_renderer_get_program_pbr_inst_tex_array(const JceRenderer *r)
 {
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!r) return invalid;
-    return (JceShaderHandle){ r->program_pbr_inst_tex_array.idx };
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_INST_TEX_ARRAY, 0u);
 }
 
 JceShaderHandle jce_renderer_get_program_pbr_inst_fade(const JceRenderer *r)
 {
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!r) return invalid;
-    return (JceShaderHandle){ r->program_pbr_inst_fade.idx };
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_INST_FADE, 0u);
 }
 
 JceShaderHandle jce_renderer_get_program_pbr_skinned(const JceRenderer *r)
 {
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!r) return invalid;
-    if (r->forwardplus_program_active &&
-        r->program_pbr_skinned_fwdplus.idx != UINT16_MAX)
-        return (JceShaderHandle){ r->program_pbr_skinned_fwdplus.idx };
-    return (JceShaderHandle){ r->program_pbr_skinned.idx };
+    if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
+    return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_SKINNED,
+        0u);
 }
 
-void jce_renderer_set_forwardplus_program_active(JceRenderer *r, bool active)
+void jce_renderer_set_forwardplus_program_active(JceRenderer *r, bool on)
 {
-    if (r) r->forwardplus_program_active = active;
+    if (!r) return;
+    r->forwardplus_program_active = on;
+
+    /* JCE_SHADER_FORCE_KEYS: OR these bits into every pick, read once.
+     *
+     * It is the POSITIVE CONTROL for the whole variant table, and it has to
+     * live here rather than in a test harness: forcing an axis has to travel
+     * the same path a material's key travels, or a green result says the
+     * control works and nothing about whether the draw paths are wired.  The
+     * last attempt at a keyword axis passed its own check and moved zero
+     * pixels for exactly that reason. */
+    if (r->force_shader_keys < 0) {
+        const char *v = getenv("JCE_SHADER_FORCE_KEYS");
+        r->force_shader_keys = (v && v[0]) ? (int)strtol(v, NULL, 0) : 0;
+        if (r->force_shader_keys)
+            LOG_WARN(LOG_TAG, "JCE_SHADER_FORCE_KEYS=0x%x -- every PBR draw "
+                              "gets these keyword bits", r->force_shader_keys);
+    }
+    r->frame_shader_keys = (uint32_t)r->force_shader_keys
+                         | (on ? JCE_SHADER_KEY_FWDPLUS : 0u);
 }
 
 bool jce_renderer_get_forwardplus_program_active(const JceRenderer *r)
@@ -2920,6 +2397,14 @@ JceShaderHandle jce_renderer_get_program_pbr_skinned_fwdplus(const JceRenderer *
 
 JceShaderHandle jce_renderer_get_program_pbr_skinned_toon(const JceRenderer *r)
 {
+    /* NOT ROUTED THROUGH THE VARIANT TABLE, and that is a statement rather
+     * than an omission: toon is a fragment FAMILY, not a keyword -- it
+     * replaces the shading model instead of compiling a block out of it --
+     * and the table's coordinates are (vertex variant, keywords).  Making it
+     * a key would mean every other family gaining a toon column that names
+     * the same program as its non-toon one, which is a bigger lie than this
+     * one exception.  When a second family needs a second shading model the
+     * manifest grows a family axis; until then this is the honest shape. */
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
     return (JceShaderHandle){ r->program_pbr_toon.idx };
@@ -3087,14 +2572,7 @@ void jce_renderer_set_msaa(JceRenderer *r, int samples)
 void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable)
 {
     (void)r;   /* the screenshot-based path needs no device reset */
-    if (s_capture_active == enable) return;
-    s_capture_active       = enable;
-    s_capture_shot_pending = false;
-    if (!enable) {                 /* idle editor holds no capture scratch */
-        JCE_FREE(s_swz_buf);
-        s_swz_buf = NULL;
-        s_swz_cap = 0;
-    }
+    jce_rcb_capture_set_active(enable);
 }
 
 /* -- Transform / texture binding (game-layer wrappers) ------------- */

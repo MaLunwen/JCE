@@ -92,7 +92,7 @@ JCE_API JceSsaoParams   jce_ssao_default_params(void);
 
 /* Render AO into internal RT. depth_tex must be a bgfx_texture_handle_t
  * value (uint16_t idx). first_view_id reserves 2 sequential view slots
- * (sampling pass + blur pass).
+ * (sampling pass + blur pass) -- one view id each, both named by the caller.
  *
  * view/proj are the matrices this frame was rendered with.  They are set on
  * the view so bgfx publishes u_invViewProj, which the contact-shadow march and
@@ -100,11 +100,21 @@ JCE_API JceSsaoParams   jce_ssao_default_params(void);
  * without the inverse there is no way back from a depth sample to a world XZ.
  * NULL for either falls back to identity, which disables anything that needs
  * world space rather than reconstructing garbage positions. */
+/* TWO view ids, named, not one and an implied neighbour.
+ *
+ * This took a single `first_view_id` and silently used that one AND the next.
+ * The scene renderer passed base+2, so SSAO owned base+2 and base+3 -- and
+ * base+3 was declared "free" in an engine-private comment and handed to the
+ * GPU-cull counter reset, which the order builder pushes FIRST.  With SSAO and
+ * r.gpu_driven both on, SSAO's blur therefore sorted ahead of SSAO's own
+ * sample pass.  A view id a function consumes without naming is a view id
+ * nobody else can see it consuming. */
 JCE_API void            jce_ssao_render(JceSsao *s,
                                          uint16_t depth_tex_handle,
                                          const jce_mat4 *view,
                                          const jce_mat4 *proj,
-                                         uint16_t first_view_id);
+                                         uint16_t sample_view_id,
+                                         uint16_t blur_view_id);
 
 /* Returns texture handle (uint16_t) of the final blurred AO RT, or
  * UINT16_MAX if not yet rendered.  Sample as RGBA8, .r = occlusion. */

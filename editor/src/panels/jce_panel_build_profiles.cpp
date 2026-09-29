@@ -117,8 +117,10 @@ static struct {
     bool                 use_clean   = false;
     bool                 use_dist    = false; /* Windows --dist variant */
     char                 script_override[512] = {0}; /* empty = platform default */
-    char                 build_target[128]    = "CagedKingdom";    /* CMake target */
-    char                 build_exe[128]       = "caged_kingdom.exe"; /* output filename to verify */
+    /* Empty until a project is opened: filled by refresh_prefill_from_project()
+     * from jce_project.json, else by default_build_target/exe() below. */
+    char                 build_target[128]    = {0};  /* CMake target */
+    char                 build_exe[128]       = {0};  /* output filename to verify */
     /* Target arch selector (project mode only).  Index into s_arch_opts.
      * 0 = "host (default)" -> no --arch flag, script picks host arch. */
     int                  arch_idx             = 0;
@@ -188,6 +190,43 @@ static void refresh_prefill_from_project(void)
                  "%s", p->target_name);
 #endif
     }
+}
+
+/* Neutral fallbacks for the build target / output exe.
+ *
+ * A general-purpose editor must not ship one game's names as its defaults:
+ * the project the user opened is the answer.  Order of preference is the
+ * loaded jce_project.json (refresh_prefill_from_project above), then the open
+ * folder's own name, then a generic placeholder.  Until 2026-08-27 the three
+ * fallback sites below read "CagedKingdom" / "caged_kingdom.exe", so an editor
+ * opened on any other project proposed to build somebody else's game -- and
+ * the comment at guess_output_exe() already said not to do that. */
+static std::string project_dir_name(void)
+{
+    const char *root = s_bp.project_root;
+    if (!root || !root[0]) return std::string();
+
+    const std::string seps = "/\\";
+    std::string r(root);
+    while (!r.empty() && seps.find(r.back()) != std::string::npos) r.pop_back();
+    size_t slash = r.find_last_of(seps);
+    return (slash == std::string::npos) ? r : r.substr(slash + 1);
+}
+
+static std::string default_build_target(void)
+{
+    std::string d = project_dir_name();
+    return d.empty() ? std::string("Game") : d;
+}
+
+static std::string default_build_exe(void)
+{
+    std::string t = default_build_target();
+#if JCE_PLATFORM_WINDOWS
+    return t + ".exe";
+#else
+    return t;
+#endif
 }
 
 static void refresh_sdk_from_project(void)
@@ -481,12 +520,13 @@ static std::string guess_output_exe(const std::string &preset_name)
     std::string arch = (dash != std::string::npos) ? p.substr(0, dash) : p;
 
     /* Fall back to the panel's current target/exe names rather than
-     * hard-coding CagedKingdom — these presets are used by any
+     * hard-coding any one game - these presets are used by any
      * in-tree game project that has a CMake preset of its own. */
-    const char *fallback_exe   = s_bp.build_exe[0]    ? s_bp.build_exe
-                                                      : "caged_kingdom.exe";
-    const char *fallback_tgt   = s_bp.build_target[0] ? s_bp.build_target
-                                                      : "CagedKingdom";
+    const std::string fallback_exe = s_bp.build_exe[0] ? std::string(s_bp.build_exe)
+                                                       : default_build_exe();
+    const std::string fallback_tgt = s_bp.build_target[0]
+                                       ? std::string(s_bp.build_target)
+                                       : default_build_target();
 
     if (arch.rfind("windows-", 0) == 0)
         return "build/desktop/" + arch + "/" + variant + "/" + fallback_exe;
@@ -551,7 +591,12 @@ static void apply_post_success(const JceBuildStatus &st)
  * its own window chrome, so we can render it as a tab here. */
 extern "C" void build_report_draw_content(void);
 
-static JcePanelTabState g_tabs{ "panel.build_profiles.current_tab", /*max_tab=*/1 };
+/* Third tab: static batching (jce_panel_static_batch.cpp).  A BUILD-time
+ * optimisation, so it lives with the build settings -- Unity keeps it in Player
+ * Settings and Godot in Build Settings, for the same reason. */
+extern "C" void jce_editor_panel_static_batch_content(void);
+
+static JcePanelTabState g_tabs{ "panel.build_profiles.current_tab", /*max_tab=*/2 };
 
 extern "C" void jce_panel_build_profiles_request_tab(int idx)
 {
@@ -859,14 +904,16 @@ static void draw_profiles_tab(void)
                 /* Engine-workspace mode (legacy, build-desktop.bat). */
                 if (s_bp.use_clean) append_arg("--clean");
                 if (s_bp.use_dist)  append_arg("--dist");
-                const char *tgt = s_bp.build_target[0] ? s_bp.build_target
-                                                        : "CagedKingdom";
-                const char *exe = s_bp.build_exe[0]    ? s_bp.build_exe
-                                                        : "caged_kingdom.exe";
+                const std::string tgt = s_bp.build_target[0]
+                                          ? std::string(s_bp.build_target)
+                                          : default_build_target();
+                const std::string exe = s_bp.build_exe[0]
+                                          ? std::string(s_bp.build_exe)
+                                          : default_build_exe();
                 append_arg("--target");
-                append_arg(tgt);
+                append_arg(tgt.c_str());
                 append_arg("--exe");
-                append_arg(exe);
+                append_arg(exe.c_str());
             }
             JceBuildScriptConfig scfg{};
             scfg.label       = p.preset.c_str();
@@ -1325,6 +1372,15 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
     if (ImGui::BeginTabItem(report_label, nullptr, report_flags)) {
         jce_panel_tab_set_current(g_tabs, 1);
         build_report_draw_content();
+        ImGui::EndTabItem();
+    }
+
+    char sb_label[64];
+    std::snprintf(sb_label, sizeof(sb_label), "%s###bp_tab_static_batch",
+                  jce_editor_i18n("panel.staticBatch.title"));
+    if (ImGui::BeginTabItem(sb_label, nullptr, jce_panel_tab_flags(g_tabs, 2))) {
+        jce_panel_tab_set_current(g_tabs, 2);
+        jce_editor_panel_static_batch_content();
         ImGui::EndTabItem();
     }
 

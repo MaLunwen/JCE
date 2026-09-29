@@ -95,9 +95,20 @@ typedef struct JceRagdoll {
  *                   still get a valid body.
  *
  * Creates one DYNAMIC CAPSULE body per joint at its bind-pose world transform
- * and, for every joint with a parent, a GENERIC6DOF constraint anchoring this
- * joint's bind origin in both the parent body and this body (keeps the chain
+ * and, for every joint with a parent, a constraint anchoring this joint's
+ * bind origin in both the parent body and this body (keeps the chain
  * connected).  The borrowed world + skeleton must outlive the ragdoll.
+ *
+ * `limit_scale` scales the ANGULAR limits taken from the joint's humanoid
+ * role (jce_humanoid_muscle_limits): 1 is the authored range, below 1 is a
+ * stiffer ragdoll, above 1 a looser one.  ZERO OR NEGATIVE MEANS NO LIMITS --
+ * every joint becomes the unlimited ball this function used to build
+ * unconditionally, which is what a non-humanoid rig wants and what an
+ * existing scene gets when it asks for it explicitly.
+ *
+ * A joint whose NAME maps to no humanoid role is left unlimited whatever
+ * `limit_scale` says: a tail, a cape bone or a prop is not a limb and has no
+ * muscle range to borrow.
  *
  * Returns NULL on NULL inputs, an empty skeleton, a skeleton exceeding
  * JCE_MAX_BONES, or allocation / body-creation failure.  blend_weight starts
@@ -105,7 +116,8 @@ typedef struct JceRagdoll {
 JceRagdoll *jce_ragdoll_create(const JceSkeleton *skel,
                                JcePhysicsWorld   *world,
                                float              radius,
-                               float              height_scale);
+                               float              height_scale,
+                               float              limit_scale);
 
 /* Destroy every constraint then every body, then the ragdoll.  Leaves the
  * borrowed world + skeleton untouched.  NULL-safe. */

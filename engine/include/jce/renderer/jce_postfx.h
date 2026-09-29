@@ -19,6 +19,7 @@
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_auto_exposure.h>
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_texture_types.h>
 
@@ -175,6 +176,138 @@ JCE_API float jce_postfx_get_bloom_knee(const JcePostFXPipeline *pipeline);
  * >0 = number of downsample mips for the HIGH/ULTRA dual-filter pyramid. */
 JCE_API void jce_postfx_set_bloom_quality(JcePostFXPipeline *pipeline, int mip_count);
 JCE_API int  jce_postfx_get_bloom_quality(const JcePostFXPipeline *pipeline);
+
+/* ================================================================== */
+/* Motion blur                                                         */
+/* ================================================================== */
+/*
+ * Per-pixel motion blur, folded into the composite pass.
+ *
+ * WHAT WAS MISSING.  JceRenderPipelineDesc.enable_motion_blur has been set by
+ * three editor UIs, serialised to .rp.json, defaulted ON by the ULTRA preset,
+ * cooked into the shipped PAK and answered by
+ * jce_render_pipeline_feature_enabled("motion_blur") since it was written --
+ * with no render pass reading it.  Turning it on changed nothing on screen.
+ *
+ * IT NEEDS A MOTION SOURCE and says so rather than degrading quietly: either
+ * the renderer's per-object velocity buffer (jce_postfx_set_taa_motion_tex --
+ * the accurate one, it moves with animated and skinned geometry) or the
+ * camera-only reprojection pass, which needs jce_postfx_set_taa_matrices()
+ * and a valid scene depth.  With neither, jce_postfx_get_motion_blur_active()
+ * returns false and the chain is byte-identical.  The camera-only source
+ * blurs a turning camera correctly and leaves a car crossing a static frame
+ * perfectly sharp; that is a property of the source, not a bug in the blur.
+ *
+ * `intensity` scales the trail length: 0 disables, 1 smears a pixel across the
+ * full frame-to-frame displacement, which is the physically-motivated value
+ * for a 360-degree shutter.  The trail is also capped in UV units inside the
+ * engine so a camera CUT -- where the motion vector is both enormous and
+ * meaningless -- cannot turn the frame to soup; that cap is not a parameter
+ * because nothing authors it, and an unauthored knob is a knob somebody finds
+ * unread a year later.
+ */
+JCE_API void jce_postfx_set_motion_blur(JcePostFXPipeline *pipeline,
+                                        bool enabled, float intensity);
+JCE_API bool jce_postfx_get_motion_blur(const JcePostFXPipeline *pipeline);
+/* True only when it is enabled AND a motion source was available on the last
+ * apply().  This is the honest question -- "is it on" and "is it doing
+ * anything" are different, and every unwired-feature defect in this engine
+ * lived in the gap between them. */
+JCE_API bool jce_postfx_get_motion_blur_active(const JcePostFXPipeline *pipeline);
+
+/* ================================================================== */
+/* Depth of field                                                      */
+/* ================================================================== */
+/*
+ * Rack focus: everything at `focus_distance` metres is sharp, everything
+ * further than `focus_range` metres from it is progressively blurred.  Unity's
+ * DoF volume, UE's post-process focal distance, Godot's CameraAttributes --
+ * this is the same knob under the names those three use.
+ *
+ * NOT an entry in JcePostFXType, deliberately.  That enum ends in a COUNT
+ * that sizes public arrays (JceSceneRenderingSettings.postfx_enabled among
+ * them), so growing it moves every member after it -- a real ABI break to add
+ * an effect.  Motion blur set the precedent here for the same reason: an
+ * effect that lives inside the composite pass is a pipeline parameter, and it
+ * keeps that pass alive on its own.
+ *
+ * THE CAMERA'S PROJECTION IS REQUIRED, and it is not decoration.  The shader
+ * compares raw stored depth, so the focus distances have to be projected
+ * through the SAME matrix that filled the depth buffer.  Doing that here
+ * rather than in the shader is what lets the shader work under reverse-Z and
+ * under both clip-range conventions with no per-backend branch -- the exact
+ * class of bug this renderer has shipped twelve times in one campaign.
+ * `proj16` is 16 floats in the engine's jce_mat4 order; NULL disables.
+ *
+ * `max_coc` is the widest blur radius, as a fraction of screen width.  0.02
+ * is a strong cinematic defocus; the gather is 16 taps, so far above that the
+ * disk thins out into visible speckle rather than getting blurrier.
+ */
+JCE_API void jce_postfx_set_depth_of_field(JcePostFXPipeline *pipeline,
+                                           bool enabled,
+                                           float focus_distance,
+                                           float focus_range,
+                                           float max_coc,
+                                           const float *proj16);
+JCE_API bool jce_postfx_get_depth_of_field(const JcePostFXPipeline *pipeline);
+/* True only when it is enabled AND a usable projection and depth buffer were
+ * present on the last apply().  "Is it on" and "is it doing anything" are
+ * different questions, and every unwired-feature defect in this engine lived
+ * in the gap between them. */
+JCE_API bool jce_postfx_get_depth_of_field_active(const JcePostFXPipeline *pipeline);
+
+/* ================================================================== */
+/* Auto exposure (eye adaptation)                                      */
+/* ================================================================== */
+/*
+ * The scene decides the exposure instead of an artist pinning it per level.
+ *
+ * OFF BY DEFAULT, and that is a decision, not an oversight: every scene
+ * authored before this was lit against a FIXED exposure, so switching
+ * adaptation on for all of them would change how all of them look.
+ *
+ * WHAT RUNS.  One extra full-screen downsample of the chain INPUT (the HDR
+ * scene colour, before tonemap -- after it, a bright scene and a dim one
+ * compress to nearly the same numbers and the measurement is worthless) into
+ * a small RGBA16F target on the pipeline's own view band, then a blit into a
+ * READ_BACK staging copy that the CPU harvests a few frames later.  The
+ * readback is on a cadence (JCE_AE_READBACK, default every 4th apply) because
+ * bgfx_read_texture maps the staging texture immediately on D3D11 -- the same
+ * hard sync jce_gi_probes.c measured at ~10 ms under load.  Sampling the
+ * scene at 15 Hz is ample for something whose time constant is a second.
+ *
+ * WHAT params.exposure MEANS WHEN THIS IS ON.  It stops being the exposure
+ * and becomes a MULTIPLIER on the adapted one, so an artist who dialled in
+ * 1.3 keeps their relative offset rather than having it silently ignored.
+ *
+ * The adaptation LAW -- direction, convergence, the asymmetric speeds, the
+ * clamp, log(0) -- is <jce/renderer/jce_auto_exposure.h> and is asserted
+ * headlessly there.  Everything here is the measurement and the wiring.
+ *
+ * `desc` NULL means jce_auto_exposure_desc_default().
+ */
+JCE_API void jce_postfx_set_auto_exposure(JcePostFXPipeline *pipeline,
+                                          bool enabled,
+                                          const JceAutoExposureDesc *desc);
+JCE_API bool jce_postfx_get_auto_exposure(const JcePostFXPipeline *pipeline);
+/* Reads back the description in force; `out` untouched when there is no
+ * pipeline.  Used to mirror one pipeline onto another (scene viewport ->
+ * game viewport), the same way the custom pass and the tonemap op are. */
+JCE_API void jce_postfx_get_auto_exposure_desc(const JcePostFXPipeline *pipeline,
+                                               JceAutoExposureDesc *out);
+
+/* The exposure ACTUALLY in use this frame: the adapted value times
+ * params.exposure when auto exposure is on, params.exposure when it is off.
+ * Exposed because "why is this shot dark" is a question about a number, and
+ * without this the only way to answer it is to guess. */
+JCE_API float jce_postfx_get_effective_exposure(const JcePostFXPipeline *pipeline);
+
+/* The scene luminance the last COMPLETED readback measured (log-average, a
+ * geometric mean -- a handful of blown-out speculars must not drag the whole
+ * frame dark), and the adapted EV.  Both are 0 before the first readback
+ * lands.  For a HUD/debug readout; the adaptation does not need either. */
+JCE_API float jce_postfx_get_measured_luminance(const JcePostFXPipeline *pipeline);
+JCE_API float jce_postfx_get_exposure_ev(const JcePostFXPipeline *pipeline);
 
 /* ================================================================== */
 /* Temporal Anti-Aliasing (TAA)                                        */

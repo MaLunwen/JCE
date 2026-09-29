@@ -1,0 +1,7 @@
+# JceScriptHost members with no writer in engine/src/application/jce_rt_script.c.
+#
+# Format: <member> <reason, including what it would take to remove this line>.
+# A line with no reason is a FAILURE, not an exemption -- see
+# check_script_host_writers.py.  This file should shrink, never grow: every
+# entry is a script binding that is registered, callable, and permanently
+# returning its default in all seven languages.

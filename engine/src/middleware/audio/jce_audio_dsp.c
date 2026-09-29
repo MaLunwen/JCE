@@ -243,16 +243,244 @@ static bool delay_alloc(DelayState *s, uint32_t channels, uint32_t sr)
     return true;
 }
 
+/* ── Modulated delay: CHORUS and FLANGER ───────────────────────────
+ *
+ * ONE implementation for both, because they are one machine -- a delay line
+ * whose read head is swept by an LFO.  What separates them is only where the
+ * numbers sit, which is a fact about presets and not about DSP; two copies
+ * would have drifted the moment one of them got a fix.
+ *
+ * The read head is FRACTIONAL and linearly interpolated.  Rounding it to a
+ * whole sample makes the sweep a staircase, and a staircase through a delay
+ * line is audible as zipper noise -- the one artefact this effect exists to
+ * avoid.
+ */
+typedef struct {
+    JceAudioModDelayParams p;
+    float   *buf[JCE_AUDIO_DSP_MAX_CHANNELS];
+    int      size;                 /* line length in frames */
+    int      pos;                  /* write head            */
+    float    phase;                /* LFO phase, 0..1       */
+    float    phase_inc;            /* per frame             */
+    float    centre;               /* delay in frames       */
+    float    depth;                /* sweep in frames       */
+} ModDelayState;
+
+static void moddelay_free(ModDelayState *s)
+{
+    for (int c = 0; c < JCE_AUDIO_DSP_MAX_CHANNELS; ++c) {
+        JCE_FREE(s->buf[c]);
+        s->buf[c] = NULL;
+    }
+    s->size = 0;
+    s->pos  = 0;
+}
+
+static bool moddelay_alloc(ModDelayState *s, uint32_t channels, uint32_t sr)
+{
+    moddelay_free(s);
+    const double fs = sr > 0 ? (double)sr : 44100.0;
+
+    double centre_ms = (double)s->p.delay_ms;
+    double depth_ms  = (double)s->p.depth_ms;
+    if (centre_ms < 0.0) centre_ms = 0.0;
+    if (depth_ms  < 0.0) depth_ms  = 0.0;
+
+    s->centre = (float)(centre_ms / 1000.0 * fs);
+    s->depth  = (float)(depth_ms  / 1000.0 * fs);
+
+    /* THE LINE MUST HOLD THE DEEPEST SWEEP PLUS A GUARD.  Sizing it to the
+     * centre delay alone lets a deep sweep read PAST the write head and
+     * return the newest sample instead of the oldest -- a click once per LFO
+     * cycle, which reads as a broken effect rather than a short buffer.  +4
+     * covers the interpolator's second tap and the rounding above it. */
+    int n = (int)(s->centre + s->depth + 4.0f);
+    if (n < 4) n = 4;
+    s->size = n;
+    s->pos  = 0;
+
+    float rate = s->p.rate_hz;
+    if (rate < 0.0f)  rate = 0.0f;
+    if (rate > 20.0f) rate = 20.0f;      /* past this it is ring modulation */
+    s->phase_inc = (float)((double)rate / fs);
+    s->phase     = 0.0f;
+
+    for (uint32_t c = 0; c < channels && c < JCE_AUDIO_DSP_MAX_CHANNELS; ++c) {
+        s->buf[c] = (float *)JCE_CALLOC((size_t)n, sizeof(float));
+        if (!s->buf[c]) { moddelay_free(s); return false; }
+    }
+    return true;
+}
+
+/* Read `d` frames back from the write head, linearly interpolated. */
+static float moddelay_read(const ModDelayState *s, int c, float d)
+{
+    const float *line = s->buf[c];
+    if (!line || s->size < 2) return 0.0f;
+    if (d < 1.0f) d = 1.0f;
+    if (d > (float)(s->size - 2)) d = (float)(s->size - 2);
+
+    const int   i0   = (int)d;
+    const float frac = d - (float)i0;
+
+    int r0 = s->pos - i0;
+    while (r0 < 0) r0 += s->size;
+    int r1 = r0 - 1;
+    if (r1 < 0) r1 += s->size;
+
+    return line[r0] * (1.0f - frac) + line[r1] * frac;
+}
+
+/* ── Distortion ───────────────────────────────────────────────────── */
+
+typedef struct {
+    JceAudioDistortionParams p;
+} DistState;
+
+static float dist_shape(const JceAudioDistortionParams *p, float x)
+{
+    float ceil = p->ceiling;
+    if (ceil <= 0.0001f) ceil = 1.0f;
+
+    switch (p->shape) {
+    case JCE_AUDIO_DIST_HARD_CLIP:
+        if (x >  ceil) return  ceil;
+        if (x < -ceil) return -ceil;
+        return x;
+
+    case JCE_AUDIO_DIST_FOLDBACK: {
+        /* Fold repeatedly: one fold still leaves anything past 3*ceiling
+         * outside the range, and a "folder" that clips the loud parts is
+         * just a clipper wearing a different name. */
+        float y = x;
+        int   guard = 0;
+        while ((y > ceil || y < -ceil) && guard++ < 8) {
+            if (y >  ceil) y =  2.0f * ceil - y;
+            if (y < -ceil) y = -2.0f * ceil - y;
+        }
+        return y;
+    }
+
+    case JCE_AUDIO_DIST_SOFT_CLIP:
+    default: {
+        /* tanh without the libm call: x*(27+x^2)/(27+9x^2) is the standard
+         * cheap approximation and matches tanh closely over the range that
+         * matters here.  Scaled by the ceiling so `ceiling` means the same
+         * thing for all three shapes rather than being ignored by one. */
+        const float t = x / ceil;
+        const float t2 = t * t;
+        const float y = t * (27.0f + t2) / (27.0f + 9.0f * t2);
+        return y * ceil;
+    }
+    }
+}
+
+/* ── Registered effects ────────────────────────────────────────────
+ *
+ * Process-global and append-only.  Registration happens at startup, before
+ * any audio thread reads the table, and nothing ever removes an entry -- so
+ * a reader never sees a half-written row and no lock is needed on the audio
+ * thread.  Removing that property (unregistering at runtime) would need one.
+ */
+#define DSP_MAX_CUSTOM 32
+
+typedef struct {
+    JceAudioEffectVTable vt;
+    bool                 used;
+} CustomSlot;
+
+/* ONE object, not an array plus a loose counter.  Two globals for one
+ * registry can disagree; one cannot, and it is also one entry in the
+ * global-state audit instead of two. */
+static struct {
+    CustomSlot slot[DSP_MAX_CUSTOM];
+    int        count;
+} s_custom_registry;
+
+static const JceAudioEffectVTable *custom_vt(int type)
+{
+    const int i = type - JCE_AUDIO_EFFECT_CUSTOM_BASE;
+    if (i < 0 || i >= s_custom_registry.count || !s_custom_registry.slot[i].used)
+        return NULL;
+    return &s_custom_registry.slot[i].vt;
+}
+
+int JCE_CALL jce_audio_dsp_register_effect(const JceAudioEffectVTable *vt)
+{
+    if (!vt || !vt->name || !vt->name[0] || !vt->process) return -1;
+
+    /* IDEMPOTENT BY NAME.  Two ids for one name would make a saved mixer
+     * depend on the order modules happened to register in. */
+    const int existing = jce_audio_dsp_find_effect(vt->name);
+    if (existing >= 0) return existing;
+
+    if (s_custom_registry.count >= DSP_MAX_CUSTOM) return -1;
+    const int i = s_custom_registry.count++;
+    s_custom_registry.slot[i].vt   = *vt;
+    s_custom_registry.slot[i].used = true;
+    return JCE_AUDIO_EFFECT_CUSTOM_BASE + i;
+}
+
+int JCE_CALL jce_audio_dsp_find_effect(const char *name)
+{
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < s_custom_registry.count; ++i)
+        if (s_custom_registry.slot[i].used &&
+            strcmp(s_custom_registry.slot[i].vt.name, name) == 0)
+            return JCE_AUDIO_EFFECT_CUSTOM_BASE + i;
+    return -1;
+}
+
+/* THE ONE TABLE OF SPELLINGS.  A serialiser and a parser that each carried
+ * their own switch is how an effect ends up writable and unreadable. */
+static const struct { int type; const char *name; } k_builtin_names[] = {
+    { JCE_AUDIO_EFFECT_EQ,         "eq"         },
+    /* "comp", not "compressor".  That is what every mixer already saved on
+     * disk spells (jce_audio_mixer_config.c and the editor panel both write
+     * it), and a table that disagreed with them would resolve -1 for every
+     * existing compressor -- a lookup that is wrong only for the effects
+     * people actually have. */
+    { JCE_AUDIO_EFFECT_COMPRESSOR, "comp"       },
+    { JCE_AUDIO_EFFECT_LIMITER,    "limiter"    },
+    { JCE_AUDIO_EFFECT_DELAY,      "delay"      },
+    { JCE_AUDIO_EFFECT_CHORUS,     "chorus"     },
+    { JCE_AUDIO_EFFECT_FLANGER,    "flanger"    },
+    { JCE_AUDIO_EFFECT_DISTORTION, "distortion" },
+};
+
+const char *JCE_CALL jce_audio_dsp_effect_name(int type)
+{
+    for (size_t i = 0; i < sizeof k_builtin_names / sizeof k_builtin_names[0]; ++i)
+        if (k_builtin_names[i].type == type) return k_builtin_names[i].name;
+    const JceAudioEffectVTable *vt = custom_vt(type);
+    return vt ? vt->name : NULL;
+}
+
+int JCE_CALL jce_audio_dsp_effect_type_from_name(const char *name)
+{
+    if (!name || !name[0]) return -1;
+    for (size_t i = 0; i < sizeof k_builtin_names / sizeof k_builtin_names[0]; ++i)
+        if (strcmp(k_builtin_names[i].name, name) == 0)
+            return k_builtin_names[i].type;
+    return jce_audio_dsp_find_effect(name);
+}
+
 /* ── Effect node ───────────────────────────────────────────────────── */
 
 typedef struct {
-    JceAudioEffectType type;
+    int type;                      /* JceAudioEffectType, or a custom id */
     union {
-        Biquad     eq;
-        CompState  comp;
-        LimState   lim;
-        DelayState delay;
+        Biquad        eq;
+        CompState     comp;
+        LimState      lim;
+        DelayState    delay;
+        ModDelayState mod;         /* CHORUS and FLANGER */
+        DistState     dist;
     } st;
+    /* Registered effects keep their state on the heap: the chain cannot know
+     * how big somebody else's effect is, and sizing the union for the worst
+     * case would make every chain pay for it. */
+    void *custom_state;
 } Effect;
 
 struct JceAudioDspChain {
@@ -266,6 +494,24 @@ struct JceAudioDspChain {
 
 static void effect_reset_state(Effect *e)
 {
+    /* Registered effects first: their ids are outside the enum, so the
+     * switch below cannot name them. */
+    {
+        const JceAudioEffectVTable *vt = custom_vt(e->type);
+        if (vt) {
+            if (vt->reset) {
+                vt->reset(e->custom_state);
+            } else if (e->custom_state && vt->state_size > 0) {
+                /* NO reset callback means "my history is plain floats", so
+                 * zeroing it IS silence.  Documented in the header, because
+                 * the alternative -- doing nothing -- would leave a tail
+                 * ringing through a rewind. */
+                memset(e->custom_state, 0, vt->state_size);
+            }
+            return;
+        }
+    }
+
     switch (e->type) {
     case JCE_AUDIO_EFFECT_EQ:
         biquad_reset(&e->st.eq);
@@ -276,6 +522,15 @@ static void effect_reset_state(Effect *e)
     case JCE_AUDIO_EFFECT_LIMITER:
         e->st.lim.gain = 1.0f;
         break;
+    case JCE_AUDIO_EFFECT_CHORUS:
+    case JCE_AUDIO_EFFECT_FLANGER: {
+        ModDelayState *m = &e->st.mod;
+        for (int c = 0; c < JCE_AUDIO_DSP_MAX_CHANNELS; ++c)
+            if (m->buf[c]) memset(m->buf[c], 0, (size_t)m->size * sizeof(float));
+        m->phase = 0.0f;
+        break;
+    }
+
     case JCE_AUDIO_EFFECT_DELAY:
         for (int c = 0; c < JCE_AUDIO_DSP_MAX_CHANNELS; ++c)
             if (e->st.delay.buf[c])
@@ -288,9 +543,25 @@ static void effect_reset_state(Effect *e)
     }
 }
 
-/* Free any heap held by an effect (only the delay line allocates). */
+/* Free any heap held by an effect.  THREE kinds hold some now -- the delay
+ * line, the modulated delay line, and a registered effect'"'"'s state block --
+ * so this is no longer the one-liner its previous comment described. */
 static void effect_free(Effect *e)
 {
+    {
+        const JceAudioEffectVTable *vt = custom_vt(e->type);
+        if (vt) {
+            if (vt->release) vt->release(e->custom_state);
+            JCE_FREE(e->custom_state);
+            e->custom_state = NULL;
+            e->type = JCE_AUDIO_EFFECT_NONE;
+            return;
+        }
+    }
+    if (e->type == JCE_AUDIO_EFFECT_CHORUS ||
+        e->type == JCE_AUDIO_EFFECT_FLANGER)
+        moddelay_free(&e->st.mod);
+
     if (e->type == JCE_AUDIO_EFFECT_DELAY)
         delay_free(&e->st.delay);
     e->type = JCE_AUDIO_EFFECT_NONE;
@@ -335,10 +606,49 @@ static bool effect_configure(Effect *e, const JceAudioEffectDesc *desc,
         return true;
     }
 
+    case JCE_AUDIO_EFFECT_CHORUS:
+    case JCE_AUDIO_EFFECT_FLANGER: {
+        /* ONE branch for both: the type is kept so a serialiser and an
+         * author can tell them apart, but nothing below it differs. */
+        ModDelayState *m = &e->st.mod;
+        m->p = desc->u.mod_delay;
+        if (!moddelay_alloc(m, channels, sr))
+            return false;
+        return true;
+    }
+
+    case JCE_AUDIO_EFFECT_DISTORTION:
+        e->st.dist.p = desc->u.distortion;
+        return true;   /* stateless: nothing to keep or reset */
+
     case JCE_AUDIO_EFFECT_NONE:
-    default:
         e->type = JCE_AUDIO_EFFECT_NONE;
         return true;
+
+    default: {
+        /* A REGISTERED EFFECT.  Anything that is not a built-in is looked up
+         * rather than treated as NONE -- silently degrading an unknown type
+         * to a pass-through is how an effect ends up authored, saved, loaded
+         * and inaudible with nothing reporting it. */
+        const JceAudioEffectVTable *vt = custom_vt(desc->type);
+        if (!vt) {
+            e->type = JCE_AUDIO_EFFECT_NONE;
+            return false;
+        }
+        if (vt->state_size > 0 && !e->custom_state) {
+            e->custom_state = JCE_CALLOC(1, vt->state_size);
+            if (!e->custom_state) { e->type = JCE_AUDIO_EFFECT_NONE; return false; }
+        }
+        if (!same_type || !keep_state) {
+            if (e->custom_state && vt->state_size > 0)
+                memset(e->custom_state, 0, vt->state_size);
+        }
+        if (vt->configure &&
+            !vt->configure(e->custom_state, channels, sr,
+                           desc->custom_params, desc->custom_params_size))
+            return false;
+        return true;
+    }
     }
 }
 
@@ -430,9 +740,71 @@ static void effect_process(Effect *e, float *buf, uint32_t frames,
         break;
     }
 
-    case JCE_AUDIO_EFFECT_NONE:
-    default:
+    case JCE_AUDIO_EFFECT_CHORUS:
+    case JCE_AUDIO_EFFECT_FLANGER: {
+        ModDelayState *s = &e->st.mod;
+        if (s->size < 4) break;
+        float fb = s->p.feedback;
+        if (fb < 0.0f)  fb = 0.0f;
+        if (fb > 0.95f) fb = 0.95f;   /* past this it self-oscillates */
+        const float wet = s->p.wet;
+        const float dry = s->p.dry;
+        float ph_r = s->p.stereo_phase;
+        if (ph_r < 0.0f) ph_r = 0.0f;
+        if (ph_r > 1.0f) ph_r = 1.0f;
+
+        for (uint32_t i = 0; i < frames; ++i) {
+            for (uint32_t c = 0; c < ch; ++c) {
+                float *line = s->buf[c];
+                if (!line) continue;
+                /* The RIGHT channel's LFO runs offset, which is what makes a
+                 * chorus wide rather than just thick. */
+                float p = s->phase + ((c == 1) ? ph_r : 0.0f);
+                p -= (float)(int)p;
+                /* Triangle, not sine: no libm on the audio thread, and the
+                 * constant sweep RATE of a triangle is what a flanger wants
+                 * anyway -- a sine lingers at the turnarounds. */
+                const float tri = (p < 0.5f) ? (4.0f * p - 1.0f)
+                                             : (3.0f - 4.0f * p);
+                const float d   = s->centre + tri * s->depth;
+
+                const float x       = buf[i * channels + c];
+                const float delayed = moddelay_read(s, (int)c, d);
+                line[s->pos] = x + delayed * fb;
+                buf[i * channels + c] = x * dry + delayed * wet;
+            }
+            if (++s->pos >= s->size) s->pos = 0;
+            s->phase += s->phase_inc;
+            if (s->phase >= 1.0f) s->phase -= 1.0f;
+        }
         break;
+    }
+
+    case JCE_AUDIO_EFFECT_DISTORTION: {
+        const JceAudioDistortionParams *p = &e->st.dist.p;
+        float drive = p->drive;
+        if (drive < 0.0f) drive = 0.0f;
+        const float wet = p->wet;
+        const float dry = p->dry;
+        const float out = (p->output_gain != 0.0f) ? p->output_gain : 1.0f;
+        for (uint32_t i = 0; i < frames; ++i)
+            for (uint32_t c = 0; c < ch; ++c) {
+                float *q = &buf[i * channels + c];
+                const float x = *q;
+                *q = (x * dry + dist_shape(p, x * drive) * wet) * out;
+            }
+        break;
+    }
+
+    case JCE_AUDIO_EFFECT_NONE:
+        break;
+
+    default: {
+        const JceAudioEffectVTable *vt = custom_vt(e->type);
+        if (vt && vt->process)
+            vt->process(e->custom_state, buf, frames, channels);
+        break;
+    }
     }
 }
 
@@ -562,8 +934,46 @@ JceAudioEffectDesc JCE_CALL jce_audio_effect_default(JceAudioEffectType type)
         d.u.delay.wet      = 0.5f;
         d.u.delay.dry      = 1.0f;
         break;
+    /* CHORUS AND FLANGER SHARE A STRUCT AND MUST NOT SHARE DEFAULTS -- the
+     * numbers are the entire difference between the two effects.  A chorus
+     * sits around 20 ms with almost no feedback and a wide stereo sweep; a
+     * flanger sits at 2 ms with heavy feedback and sounds like a jet.  Handing
+     * both the same defaults would make "chorus" and "flanger" two names for
+     * one sound, which is exactly the criticism this row makes of a palette
+     * that is shorter than it looks. */
+    case JCE_AUDIO_EFFECT_CHORUS:
+        d.u.mod_delay.delay_ms     = 22.0f;
+        d.u.mod_delay.depth_ms     = 6.0f;
+        d.u.mod_delay.rate_hz      = 0.6f;
+        d.u.mod_delay.feedback     = 0.05f;
+        d.u.mod_delay.wet          = 0.5f;
+        d.u.mod_delay.dry          = 1.0f;
+        d.u.mod_delay.stereo_phase = 0.33f;
+        break;
+    case JCE_AUDIO_EFFECT_FLANGER:
+        d.u.mod_delay.delay_ms     = 2.0f;
+        d.u.mod_delay.depth_ms     = 1.5f;
+        d.u.mod_delay.rate_hz      = 0.25f;
+        d.u.mod_delay.feedback     = 0.7f;
+        d.u.mod_delay.wet          = 0.7f;
+        d.u.mod_delay.dry          = 1.0f;
+        d.u.mod_delay.stereo_phase = 0.5f;
+        break;
+    case JCE_AUDIO_EFFECT_DISTORTION:
+        d.u.distortion.shape       = JCE_AUDIO_DIST_SOFT_CLIP;
+        d.u.distortion.drive       = 4.0f;
+        d.u.distortion.ceiling     = 1.0f;
+        d.u.distortion.wet         = 1.0f;
+        d.u.distortion.dry         = 0.0f;
+        /* Drive without a matching cut is just "louder", and an author
+         * reaching for distortion is not reaching for +12 dB. */
+        d.u.distortion.output_gain = 0.5f;
+        break;
     case JCE_AUDIO_EFFECT_NONE:
     default:
+        /* A REGISTERED type has no defaults the engine could know.  The zeroed
+         * desc plus a NULL custom_params is what its configure() receives, and
+         * the vtable is the only thing that can decide what that means. */
         break;
     }
     return d;

@@ -8,6 +8,7 @@
 
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
+#include <jce/middleware/physics/jce_physics_layers.h>
 #include <jce/middleware/physics/jce_physics_material.h>
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
@@ -86,7 +87,9 @@ struct JcePhysicsWorld {
 static void contact_begin_trampoline(uint32_t body_a, uint32_t body_b,
                                      const float normal[3],
                                      const float point[3],
-                                     float depth, void *ud)
+                                     float depth,
+                                     float applied_impulse,
+                                     bool is_trigger, void *ud)
 {
     JcePhysicsWorld *w = (JcePhysicsWorld *)ud;
     if (!w || !w->contact_begin_fn) return;
@@ -102,6 +105,12 @@ static void contact_begin_trampoline(uint32_t body_a, uint32_t body_b,
     ev.point[1]  = point[1];
     ev.point[2]  = point[2];
     ev.depth     = depth;
+    ev.applied_impulse = applied_impulse;
+    /* NOT left to the memset above.  `false` means "these two really
+     * collided", which is the opposite of what a trigger overlap is, and
+     * every consumer that reads `depth` without reading this was being told
+     * a trigger volume was a penetration. */
+    ev.is_trigger = is_trigger;
 
     w->contact_begin_fn(&ev, w->contact_begin_ud);
 }
@@ -109,7 +118,9 @@ static void contact_begin_trampoline(uint32_t body_a, uint32_t body_b,
 static void contact_end_trampoline(uint32_t body_a, uint32_t body_b,
                                    const float normal[3],
                                    const float point[3],
-                                   float depth, void *ud)
+                                   float depth,
+                                   float applied_impulse,
+                                   bool is_trigger, void *ud)
 {
     JcePhysicsWorld *w = (JcePhysicsWorld *)ud;
     if (!w || !w->contact_end_fn) return;
@@ -125,6 +136,8 @@ static void contact_end_trampoline(uint32_t body_a, uint32_t body_b,
     ev.point[1]  = point[1];
     ev.point[2]  = point[2];
     ev.depth     = depth;
+    ev.applied_impulse = applied_impulse;
+    ev.is_trigger = is_trigger;
 
     w->contact_end_fn(&ev, w->contact_end_ud);
 }
@@ -409,7 +422,8 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
         desc->half_extents, desc->mass,
         friction, desc->restitution,
         desc->linear_damping, desc->angular_damping,
-        group, mask, desc->is_trigger);
+        group, mask, desc->is_trigger,
+        desc->capsule_axis);
 
     if (idx == UINT32_MAX) {
         LOG_ERROR(LOG_TAG, "body pool exhausted");
@@ -458,6 +472,7 @@ JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld           *world,
         bc[i].position     = s->position;
         bc[i].rotation     = s->rotation;
         bc[i].half_extents = s->half_extents;
+        bc[i].capsule_axis = s->capsule_axis;
         bc[i].vertices     = s->vertices;
         bc[i].vertex_count = s->vertex_count;
         bc[i].indices      = (shape == JCE_SHAPE_CONVEX_HULL) ? NULL : s->indices;
@@ -794,14 +809,21 @@ void jce_physics_body_set_material(JcePhysicsWorld *world,
                                    const struct JcePhysicsMaterial *material)
 {
     if (!world || !jce_body_valid(body) || !material) return;
-    /* v1: feed dynamic_friction + restitution directly to Bullet, which
-     * runs its own per-contact combine.  Static friction is recorded in
-     * the asset for future use (Bullet has no separate static-friction
-     * channel on btRigidBody).  Combine modes are surfaced through
-     * jce_physics_material_combine() for advanced users. */
+    /* The combine modes travel with the values now: Bullet keeps friction and
+     * restitution per body and the modes ride alongside them, so
+     * jce_physics_material_combine() decides the contact instead of Bullet's
+     * fixed multiply/max.  Until 2026-09-21 only the two values were passed
+     * and every authored AVERAGE/MIN/MAX/MULTIPLY was dropped here.
+     *
+     * static_friction is STILL not forwarded, and that part of the old
+     * comment was right: btRigidBody has no separate static-friction channel,
+     * and jce_physics_material_combine uses dynamic friction for the contact
+     * value anyway -- which is what Unity does. */
     jce_bullet_body_set_material(world->bullet, body.idx,
                                   material->dynamic_friction,
-                                  material->restitution);
+                                  material->restitution,
+                                  material->friction_combine,
+                                  material->restitution_combine);
 }
 
 /* ── Continuous Collision Detection (CCD)  (P3-C.3) ───────────────── */
@@ -955,6 +977,15 @@ JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
         return JCE_CONSTRAINT_INVALID;
     }
 
+    /* The authored motor, through the SAME call the runtime setter uses.  A
+     * separate "apply at create" path is how the authored value and the
+     * live value come to disagree. */
+    if (desc->use_motor)
+        jce_bullet_constraint_set_motor(world->bullet, idx, true,
+                                        desc->motor_target_velocity,
+                                        desc->motor_max_force,
+                                        world->fixed_timestep);
+
     return (JceConstraintHandle){ idx };
 }
 
@@ -971,6 +1002,20 @@ void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
 {
     if (!world || !jce_constraint_valid(con)) return;
     jce_bullet_constraint_set_limits(world->bullet, con.idx, lower, upper);
+}
+
+void jce_physics_constraint_set_motor(JcePhysicsWorld *world,
+                                       JceConstraintHandle con,
+                                       bool enabled,
+                                       float target_velocity,
+                                       float max_force)
+{
+    if (!world || !jce_constraint_valid(con)) return;
+    /* fixed_timestep is what turns the author's torque into the impulse a
+     * btHingeConstraint wants; the world owns it, the bridge does not. */
+    jce_bullet_constraint_set_motor(world->bullet, con.idx, enabled,
+                                    target_velocity, max_force,
+                                    world->fixed_timestep);
 }
 
 JceConstraintHandle jce_physics_configurable_joint_create(
@@ -999,6 +1044,19 @@ JceConstraintHandle jce_physics_configurable_joint_create(
         return JCE_CONSTRAINT_INVALID;
     }
 
+    /* Per-axis drives.  Axes 3..5 are angular, and their targets arrive in
+     * DEGREES like the limits three lines above -- an author typing a spring's
+     * rest angle into the box under its limit is typing the same unit. */
+    for (int a = 0; a < 6; ++a) {
+        if (desc->drive_mode[a] == JCE_JOINT_DRIVE_OFF) continue;
+        float target = desc->drive_target[a];
+        if (a >= 3) target *= JCE_DEG2RAD;
+        jce_bullet_configurable_joint_set_drive(
+            world->bullet, idx, a, desc->drive_mode[a], target,
+            desc->drive_spring[a], desc->drive_damper[a],
+            desc->drive_max_force[a]);
+    }
+
     return (JceConstraintHandle){ idx };
 }
 
@@ -1009,6 +1067,17 @@ float jce_physics_constraint_applied_impulse(const JcePhysicsWorld *world,
     /* world->bullet is logically const here — the query reads m_appliedImpulse
      * without mutating the world; cast away const for the C bridge signature. */
     return jce_bullet_constraint_applied_impulse(
+        ((JcePhysicsWorld *)world)->bullet, con.idx);
+}
+
+float jce_physics_constraint_applied_torque(const JcePhysicsWorld *world,
+                                            JceConstraintHandle con)
+{
+    if (!world || !jce_constraint_valid(con)) return 0.0f;
+    /* Same const cast as the impulse query above and for the same reason: the
+     * read does not mutate the world, and the C bridge takes a non-const
+     * JceBulletWorld. */
+    return jce_bullet_constraint_applied_torque(
         ((JcePhysicsWorld *)world)->bullet, con.idx);
 }
 
@@ -1034,10 +1103,20 @@ JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
     float accel = desc->accel > 0.0f ? desc->accel : 40.0f;
     float air_control = desc->air_control > 0.0f ? desc->air_control : 0.35f;
 
+    /* Resolve the physics layer the same way jce_physics_body_set_layer does,
+     * so a capsule and a rigid body on the same layer are filtered identically.
+     * An out-of-range layer falls back to 0 rather than to a zero mask, which
+     * would collide with nothing and read as "the character fell through the
+     * world" instead of as a bad index. */
+    uint32_t layer = desc->layer < JCE_PHYSICS_LAYER_COUNT ? desc->layer : 0u;
+    uint32_t col_group = 1u << layer;
+    uint32_t col_mask  = jce_physics_get_layer_collision_mask(layer);
+
     uint32_t idx = jce_bullet_character_create(
         world->bullet,
         desc->position, radius, height, step_height,
-        max_slope_rad, gravity, jump_speed, accel, air_control);
+        max_slope_rad, gravity, jump_speed, accel, air_control,
+        col_group, col_mask);
 
     if (idx == UINT32_MAX) {
         LOG_ERROR(LOG_TAG, "character pool exhausted");
@@ -1166,6 +1245,16 @@ void jce_physics_vehicle_set_input(JcePhysicsWorld *world, JceVehicleHandle veh,
     if (!world || !jce_vehicle_valid(veh)) return;
     jce_bullet_vehicle_set_input(world->bullet, veh.idx,
                                   throttle, brake, steer);
+}
+
+void jce_physics_vehicle_add_wheel_input(JcePhysicsWorld *world,
+                                         JceVehicleHandle veh, uint32_t wheel,
+                                         float engine_force_n,
+                                         float brake_force_n, float steer_rad)
+{
+    if (!world || !jce_vehicle_valid(veh)) return;
+    jce_bullet_vehicle_add_wheel_input(world->bullet, veh.idx, wheel,
+                                       engine_force_n, brake_force_n, steer_rad);
 }
 
 void jce_physics_vehicle_get_chassis_transform(const JcePhysicsWorld *world,

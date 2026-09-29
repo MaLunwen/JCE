@@ -18,6 +18,7 @@
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_reflection_probe_bake.h>
+#include <jce/middleware/scene/jce_scene_reflection_probe.h>
 #include <jce/os/core/jce_math.h>
 }
 
@@ -68,22 +69,20 @@ static void rp_kick_next(JceScene *scene)
     JceEntity e = q.back(); q.pop_back();
     JceReflectionProbeComponent *p = jce_scene_get_reflection_probe(scene, e);
     if (!p) return;
-    char out[256];
-    snprintf(out, sizeof(out),
-             "ReflectionProbes/probe_%u.ktx", (unsigned)e);
-    JceReflectionProbeBakeDesc desc{};
-    desc.position                = jce_v3(p->box_offset[0],
-                                          p->box_offset[1],
-                                          p->box_offset[2]);
-    desc.cubemap_size            = (uint32_t)(p->resolution > 0 ? p->resolution : 256);
-    if (desc.cubemap_size > 512u) desc.cubemap_size = 512u;
-    desc.specular_mip_count      = 5u;
-    desc.output_path_ktx2        = out;
-    desc.include_skybox          = true;
-    desc.include_dynamic_objects = true;
-    h = jce_reflection_probe_bake_submit(&desc);
-    if (h != 0u) snprintf(p->baked_cubemap_path,
-                          sizeof p->baked_cubemap_path, "%s", out);
+    /* The engine composes the desc from the component -- one resolution, one
+     * artefact name, and a headless build can do it too. */
+    /* CAPTURE THE REAL SCENE when the renderer can; the procedural gradient
+     * is the fallback, not the plan.  Both write the same artefact path, so
+     * the component records it either way. */
+    char out[256] = {0};
+    if (jce_scene_reflection_probe_capture(scene, e, out, (int)sizeof out)) {
+        snprintf(p->baked_cubemap_path, sizeof p->baked_cubemap_path, "%s", out);
+        h = 0u;   /* the capture submits the bake itself when its faces land */
+    } else {
+        h = jce_scene_reflection_probe_bake(scene, e, true, out, (int)sizeof out);
+        if (h != 0u) snprintf(p->baked_cubemap_path,
+                              sizeof p->baked_cubemap_path, "%s", out);
+    }
 }
 
 extern "C" void jce_editor_panel_reflection_probes_content(void)

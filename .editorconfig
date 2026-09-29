@@ -1,0 +1,22 @@
+root = true
+
+[*]
+end_of_line = lf
+
+[*.{bat,BAT,cmd,CMD}]
+end_of_line = crlf
+
+[**/third_party/**]
+end_of_line = unset
+
+[**/ZKM-VMP/**]
+end_of_line = unset
+
+[**/{build,dist,out,node_modules}/**]
+end_of_line = unset
+
+[engine/src/renderer/internal/stb_image.h]
+end_of_line = unset
+
+[scripts/android/app/src/main/java/org/app/**]
+end_of_line = unset

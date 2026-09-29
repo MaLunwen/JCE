@@ -34,6 +34,39 @@
 
 include_guard(GLOBAL)
 
+# Resolve the architecture stamped into generated COFF objects from the
+# compiler target, never from CMAKE_SYSTEM_PROCESSOR.  The latter is empty for
+# MSVC Hostx64/arm64 and may describe the host for Hostx64/x86.
+function(_jce_msvc_coff_arch OUT_VAR)
+	set(_arch "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+	if(NOT _arch)
+		set(_arch "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
+	endif()
+	if(NOT _arch)
+		set(_arch "${MSVC_CXX_ARCHITECTURE_ID}")
+	endif()
+	if(NOT _arch)
+		set(_arch "${MSVC_C_ARCHITECTURE_ID}")
+	endif()
+	string(TOLOWER "${_arch}" _arch)
+
+	if(_arch MATCHES "^(x64|amd64|x86_64)$")
+		set(_coff_arch x64)
+	elseif(_arch MATCHES "^(x86|i[3-6]86)$")
+		set(_coff_arch x86)
+	elseif(_arch MATCHES "^(arm64|aarch64)$")
+		set(_coff_arch arm64)
+	elseif(_arch MATCHES "^(arm|armv7.*)$")
+		set(_coff_arch arm)
+	else()
+		message(FATAL_ERROR
+			"Unsupported MSVC target architecture for COFF: '${_arch}' "
+			"(CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}')")
+	endif()
+
+	set(${OUT_VAR} "${_coff_arch}" PARENT_SCOPE)
+endfunction()
+
 # ------------------------------------------------------------------ #
 # jce_shader_profiles(<out-var>)                                      #
 #                                                                     #
@@ -603,15 +636,8 @@ function(jce_target_embed_pak TARGET)
 	# Pick a COFF arch flag for MSVC so the linker accepts it for x86/x64/arm64.
 	set(_obj_arch_flags)
 	if(MSVC)
-		if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-			if(CMAKE_SYSTEM_PROCESSOR MATCHES "(ARM64|aarch64)")
-				list(APPEND _obj_arch_flags --obj-arch arm64)
-			else()
-				list(APPEND _obj_arch_flags --obj-arch x64)
-			endif()
-		else()
-			list(APPEND _obj_arch_flags --obj-arch x86)
-		endif()
+		_jce_msvc_coff_arch(_obj_arch)
+		list(APPEND _obj_arch_flags --obj-arch "${_obj_arch}")
 	endif()
 
 	add_custom_command(
@@ -749,15 +775,8 @@ function(jce_target_embed_bundle TARGET)
 	endif()
 	set(_arch_flags)
 	if(MSVC)
-		if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-			if(CMAKE_SYSTEM_PROCESSOR MATCHES "(ARM64|aarch64)")
-				list(APPEND _arch_flags --arch arm64)
-			else()
-				list(APPEND _arch_flags --arch x64)
-			endif()
-		else()
-			list(APPEND _arch_flags --arch x86)
-		endif()
+		_jce_msvc_coff_arch(_bundle_arch)
+		list(APPEND _arch_flags --arch "${_bundle_arch}")
 	endif()
 
 	set(_out "${CMAKE_CURRENT_BINARY_DIR}/_embed_bundle_${EB_SYMBOL}${_ext}")
@@ -936,8 +955,12 @@ function(jce_add_pak TARGET)
 	# source dir), so a multi-dir merged cook kept only the LAST batch's output
 	# (e.g. dropping every scenes/chunks/*.scene.json fragment).  A per-dir
 	# catalog scopes the GC to that dir's own outputs, so the merge is additive.
+	# No `rm -rf ${_cooked_dir}`: jce_cook's incremental catalog only hits when
+	# the previous output is still on disk (tools/jce_cook.c:294-296), so wiping
+	# the tree first made the cache structurally dead -- every consumer build
+	# re-decoded and re-block-compressed every texture.  Deleting stale output is
+	# already the per-dir stale-GC's job, as the paragraph above describes.
 	set(_cook_cmds
-		COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_cooked_dir}"
 		COMMAND "${CMAKE_COMMAND}" -E make_directory "${_cooked_dir}")
 	set(_cook_idx 0)
 	foreach(_d IN LISTS _src_dirs)

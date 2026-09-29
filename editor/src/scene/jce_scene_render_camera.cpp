@@ -474,8 +474,18 @@ void jce_editor_scene_camera_set_projection(bool orthographic,
         ? JCE_CAMERA_ORTHO : JCE_CAMERA_PERSPECTIVE);
     jce_camera_set_fov(s_sr.camera, fov_deg);
     jce_camera_set_near_far(s_sr.camera, near_plane, far_plane);
-    if (orthographic)
-        jce_camera_set_ortho_size(s_sr.camera, ortho_width, ortho_height);
+    if (orthographic) {
+        /* A width of 0 means "follow the viewport", which is what a scene
+         * authors: JceCameraComponent carries only a HEIGHT, because a fixed
+         * width letterboxes differently on every window size.  Routing it
+         * through the same jce_camera_set_ortho_height() the runtime uses is
+         * what makes the editor preview and the shipped game frame an
+         * orthographic scene identically. */
+        if (ortho_width > 0.0f)
+            jce_camera_set_ortho_size(s_sr.camera, ortho_width, ortho_height);
+        else
+            jce_camera_set_ortho_height(s_sr.camera, ortho_height);
+    }
     s_sr.camera_cache_valid = false;
 }
 

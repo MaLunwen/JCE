@@ -47,6 +47,8 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_render_pipeline.h>
+#include <jce/middleware/world/jce_environment.h>
 #include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_volumetric_fog.h>
@@ -136,12 +138,26 @@ JceSceneRenderingSettings *scene_rendering_settings_mut(JceScene *scene)
     return jce_scene_get_rendering_settings_mut(scene);
 }
 
+/* Seeds from the scene, or from the engine defaults when it authors none.
+ * CREATES NOTHING -- see rendering_settings_seed() in jce_panel_postfx.cpp
+ * for why the existence of the component is visually significant. */
+JceSceneRenderingSettings scene_rendering_settings_seed(JceScene *scene)
+{
+    const JceSceneRenderingSettings *cur =
+        scene ? jce_scene_get_rendering_settings(scene) : nullptr;
+    return cur ? *cur : jce_scene_rendering_settings_default();
+}
+
+/* READ accessor: deliberately does NOT ensure.  Fabricating the component
+ * here would make every scene that does not author lighting render with an
+ * editor-only value the shipped runtime has no way to obtain.  Use
+ * scene_rendering_settings_mut() when the user is actually editing -- that
+ * one creates it, because an edit IS authored scene state. */
 const JceSceneRenderingSettings *current_scene_rendering_settings(void)
 {
     JceScene *scene = jce_state_get_scene();
     if (!scene)
         return nullptr;
-    jce_editor_scene_ensure_rendering_settings(scene);
     return jce_scene_get_rendering_settings(scene);
 }
 
@@ -421,10 +437,20 @@ bool draw_shadows(JceSceneRenderingSettings *rendering)
     const char *soft_items[3] = {
         jce_editor_i18n("panel.lighting.shadows.soft.off"),
         jce_editor_i18n("panel.lighting.shadows.soft.pcf"),
-        jce_editor_i18n("panel.lighting.shadows.soft.vsm"),
+        jce_editor_i18n("panel.lighting.shadows.soft.pcss"),
     };
     changed |= ImGui::Combo(jce_editor_i18n("panel.lighting.shadows.soft"),
                             &rendering->soft_shadow_mode, soft_items, 3);
+    /* PCSS needs a sun to be soft ABOUT, and that number lives on the render
+     * pipeline (one sun, so it is a settings knob, not a per-light one).  Say
+     * so here rather than leaving an artist to pick the third mode, see no
+     * change, and conclude the mode is broken -- which is the shape this
+     * combo was in for a whole release. */
+    if (rendering->soft_shadow_mode == JCE_SCENE_SOFT_SHADOW_PCSS &&
+        jce_render_pipeline_sun_soft_size() <= 0.0f) {
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "%s",
+            jce_editor_i18n("panel.lighting.shadows.soft.needs_sun_size"));
+    }
     ImGui::EndDisabled();
     return changed;
 }
@@ -516,6 +542,27 @@ bool draw_screen_space_effects(JceSceneRenderingSettings *rendering)
         jce_editor_i18n_id("panel.lighting.sse.ssrMaxDistance", "SSR Max Distance"),
         &rendering->ssr_max_distance, 0.5f, 100.0f, "%.1f");
     ImGui::EndDisabled();
+
+    ImGui::Separator();
+
+    /* SSGI -- one diffuse bounce gathered from the lit colour buffer.  Its own
+     * block rather than a slider under SSR: SSR changes what a surface
+     * reflects, SSGI changes how much light reaches it, and folding the two
+     * under one control would make an artist's "reflections off" also turn the
+     * lighting down. */
+    changed |= ImGui::Checkbox(
+        jce_editor_i18n_id("panel.lighting.sse.ssgi", "SSGI (Screen-Space GI)"),
+        &rendering->ssgi_enabled);
+    ImGui::BeginDisabled(!rendering->ssgi_enabled);
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssgiIntensity", "SSGI Intensity"),
+        &rendering->ssgi_intensity, 0.0f, 2.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n_id("panel.lighting.sse.ssgiRadius", "SSGI Bounce Radius"),
+        &rendering->ssgi_radius, 0.1f, 20.0f, "%.2f");
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("(%s)", jce_editor_i18n_id("panel.lighting.sse.ssgiNote",
+        "Adds to probe/sky indirect light; only what is on screen can bounce."));
 
     ImGui::TextDisabled("(%s)", jce_editor_i18n_id("panel.lighting.sse.note",
         "Needs the render-pipeline SSAO/SSR feature tier enabled."));
@@ -649,7 +696,6 @@ bool draw_look_profile(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
-bool advance_time_of_day(JceSceneRenderingSettings *rendering);
 
 /* ── Weather + serialized Time-of-Day (P2-weather-decals-tod) ──────────
  *
@@ -669,16 +715,43 @@ bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
         return false;
     }
 
-    bool changed = advance_time_of_day(rendering);
+    /* The panel no longer advances anything.  It used to call
+     * advance_time_of_day(), which wrote rendering->tod_hour -- the AUTHORED
+     * seed -- from ImGui's frame delta, and OR'd the result into `changed`, so
+     * simply having this tab open with a running clock marked the scene dirty
+     * every frame and Ctrl+S baked whatever hour it had reached into the saved
+     * scene.  It also only ran while the tab was visible, so a designer with
+     * the panel closed watched a frozen sky.
+     *
+     * The live clock is the scene's environment now, advanced once per frame
+     * whether or not this panel exists.  Read it, do not drive it. */
+    bool changed = false;
 
     /* Serialized time-of-day. */
     changed |= ImGui::Checkbox(jce_editor_i18n("panel.lighting.tod.enabled"),
                                &rendering->tod_enabled);
     ImGui::BeginDisabled(!rendering->tod_enabled);
-    ImGui::BeginDisabled(rendering->tod_speed > 0.0f);
-    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.tod.hour"),
-                                  &rendering->tod_hour, 0.0f, 24.0f, "%.2f h");
-    ImGui::EndDisabled();
+    /* One slider, two meanings, and neither is a disabled control.
+     *
+     * Frozen (speed == 0) it edits the AUTHORED hour, which is also the hour
+     * being shown -- unchanged behaviour.  Running, it edits the LIVE clock in
+     * the scene's environment: the authored value is only the seed then, so a
+     * slider bound to it would sit still while the sky moved, which is what the
+     * disabled control used to communicate by being dead.  Scrubbing to dusk to
+     * check lighting without stopping the cycle is the reason this exists.
+     *
+     * Editing the live hour deliberately does NOT set `changed`: it is not
+     * authored data, and marking the scene dirty for it is the bug the panel's
+     * own clock used to cause. */
+    if (rendering->tod_speed > 0.0f) {
+        float live = jce_scene_environment_hour(jce_state_get_scene());
+        if (ImGui::SliderFloat(jce_editor_i18n("panel.lighting.tod.hour"),
+                               &live, 0.0f, 24.0f, "%.2f h"))
+            jce_scene_environment_set_hour(jce_state_get_scene(), live);
+    } else {
+        changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.tod.hour"),
+                                      &rendering->tod_hour, 0.0f, 24.0f, "%.2f h");
+    }
     changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.speed"),
                                 &rendering->tod_speed, 0.05f, 0.0f, 240.0f, "%.2f");
     changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.latitude"),
@@ -756,36 +829,20 @@ bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
-bool advance_time_of_day(JceSceneRenderingSettings *rendering)
-{
-    if (!rendering || !rendering->tod_enabled || rendering->tod_speed <= 0.0f)
-        return false;
-
-    float dt = ImGui::GetIO().DeltaTime;
-    if (dt <= 0.0f)
-        return false;
-    if (dt > 0.25f)
-        dt = 0.25f;
-
-    rendering->tod_hour += rendering->tod_speed * dt;
-    while (rendering->tod_hour >= 24.0f)
-        rendering->tod_hour -= 24.0f;
-    while (rendering->tod_hour < 0.0f)
-        rendering->tod_hour += 24.0f;
-    return true;
-}
 
 /* ── Time of Day tab (merged from jce_panel_time_of_day.cpp in P6-A.2) ─ */
 
 void draw_time_of_day_tab(void)
 {
     JceScene *scene = jce_state_get_scene();
-    JceSceneRenderingSettings *rendering =
-        scene_rendering_settings_mut(scene);
-    if (!rendering) {
+    if (!scene) {
         ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
         return;
     }
+    /* A copy: opening a tab must not author scene state. */
+    JceSceneRenderingSettings scratch = scene_rendering_settings_seed(scene);
+    const JceSceneRenderingSettings seed = scratch;
+    JceSceneRenderingSettings *rendering = &scratch;
 
     bool changed = draw_weather_and_tod(rendering);
 
@@ -813,6 +870,11 @@ void draw_time_of_day_tab(void)
                 st.exposure,
                 st.is_night ? jce_editor_i18n("timeOfDay.night") : "");
 
+    if (std::memcmp(&scratch, &seed, sizeof scratch) != 0) {
+        JceSceneRenderingSettings *dst = scene_rendering_settings_mut(scene);
+        if (dst) *dst = scratch;
+        changed = true;
+    }
     if (changed)
         jce_state_mark_scene_modified();
 }
@@ -960,8 +1022,10 @@ static void lit_draw_settings_tab(void)
 {
     lit_ensure_init();
     JceScene *scene = jce_state_get_scene();
-    JceSceneRenderingSettings *rendering =
-        scene_rendering_settings_mut(scene);
+    /* A copy; written back below only if something really changed. */
+    JceSceneRenderingSettings scratch = scene_rendering_settings_seed(scene);
+    const JceSceneRenderingSettings seed = scratch;
+    JceSceneRenderingSettings *rendering = scene ? &scratch : nullptr;
     LightCollect c;
     if (scene) jce_scene_each_entity(scene, collect_cb, &c);
 
@@ -983,6 +1047,11 @@ static void lit_draw_settings_tab(void)
         /* No-op invocation guard for now (see comment above). */
     }
 
+    if (scene && std::memcmp(&scratch, &seed, sizeof scratch) != 0) {
+        JceSceneRenderingSettings *dst = scene_rendering_settings_mut(scene);
+        if (dst) *dst = scratch;
+        dirty = true;
+    }
     if (dirty) jce_state_mark_scene_modified();
 }
 
@@ -1249,13 +1318,23 @@ extern "C" void jce_editor_lighting_settings_get_sun(
 
 
 
-extern "C" void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)
+/* Returns false when the scene authors no rendering settings.  The caller
+ * must then push NO override: the engine already has a fallback for that
+ * case (jce_sr_draw.c) and the shipped runtime takes it, so answering with
+ * an invented constant here made the editor render a scene no build could
+ * reproduce.  Measured on examples/snake_seven: board surface (55,60,67) in
+ * the game vs (49,56,69) in the editor, on a scene file that mentions
+ * ambient nowhere. */
+extern "C" bool jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)
 {
     const JceSceneRenderingSettings *r = current_scene_rendering_settings();
+    if (!r)
+        return false;
     if (out_color_rgb) {
-        out_color_rgb[0] = r ? r->ambient_color[0] : 0.1f;
-        out_color_rgb[1] = r ? r->ambient_color[1] : 0.1f;
-        out_color_rgb[2] = r ? r->ambient_color[2] : 0.12f;
+        out_color_rgb[0] = r->ambient_color[0];
+        out_color_rgb[1] = r->ambient_color[1];
+        out_color_rgb[2] = r->ambient_color[2];
     }
-    if (out_intensity) *out_intensity = r ? r->ambient_intensity : 1.0f;
+    if (out_intensity) *out_intensity = r->ambient_intensity;
+    return true;
 }

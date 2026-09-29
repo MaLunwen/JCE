@@ -145,6 +145,17 @@ struct GetTouchResult {
     float pressure = 0;
 };
 
+/* get_param: 3 out parameters, so the success value is a
+ * struct.  FIELD ORDER IS THE DECLARATION ORDER OF THE HOST'S OWN OUT
+ * PARAMETERS, which is also the order the Lua binding pushes them; the
+ * differential compares the two orders slot by slot.
+ */
+struct GetParamResult {
+    int out_kind = 0;
+    double out_number = 0;
+    Entity out_entity = 0;
+};
+
 /* The manifest's `optional` defaults.  Named because C++ default
  * arguments must be trailing and some of these are not -- and named
  * for ALL of them, so which ones those are can change without the
@@ -157,12 +168,18 @@ inline constexpr bool pause_paused = true;
 inline constexpr float shake_camera_amount = 0.5f;
 inline constexpr int gas_apply_op = 0;
 inline constexpr float gas_apply_duration_seconds = 0.0f;
+inline constexpr std::uint32_t raycast_filtered_layer_mask = 0;
+inline constexpr bool raycast_filtered_hit_triggers = false;
+inline constexpr std::uint32_t raycast_all_layer_mask = 0;
+inline constexpr bool raycast_all_hit_triggers = false;
 inline constexpr double send_message_number_arg = 0.0;
 inline constexpr CStr send_message_str_arg = CStr();
 inline constexpr double broadcast_number_arg = 0.0;
 inline constexpr CStr broadcast_str_arg = CStr();
 inline constexpr int rpc_send_target = 0;
 inline constexpr CStr rpc_send_payload = CStr();
+inline constexpr std::uint32_t overlap_sphere_layer_mask = 0;
+inline constexpr std::uint32_t overlap_box_layer_mask = 0;
 }  /* namespace defaults */
 
 /* ------------------------------------------------------------------ *
@@ -177,22 +194,30 @@ inline constexpr CStr rpc_send_payload = CStr();
  *  that is the escape the manifest itself calls P0-2.  The manifest's
  *  own reasons, verbatim:
  *
+ *    line_set_points
+ *        marshalling, not glue: the host takes a packed `const float *xyz,
+ *        int count` and no generated shape reads a Lua array into one.
+ *        Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and
+ *        the returned stored-count live in one place. Exists because the
+ *        comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key
+ *        by walking the object's child list (jce_scene_components_render.c
+ *        parse_line_renderer)
  *    log
- *        no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the
+ *        no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the
  *        only one among the 78
  *    asset_read_text
- *        policy, not glue: script_virtual_asset_path_valid (:66, called
- *        :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap
- *        (jce_script.h:86), jce_free on every exit path. A generated
+ *        policy, not glue: script_virtual_asset_path_valid (:67, called
+ *        :103), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap
+ *        (jce_script.h:114), jce_free on every exit path. A generated
  *        read_file template is a sandbox escape (P0-2)
  *    asset_read_json
  *        all of asset_read_text (the same script_virtual_asset_path_valid at
- *        :219) plus a depth- and node-capped JSON walk, non-finite rejection,
+ *        :220) plus a depth- and node-capped JSON walk, non-finite rejection,
  *        the json_null sentinel and distinct string error codes (P0-2)
  *    play_sound
- *        arity dispatch across two members: lua_gettop at :263 routes to
- *        play_sound_spatial (:286) or play_sound (:289); its own comment at
- *        :280 concedes top == 3 is ambiguous
+ *        arity dispatch across two members: lua_gettop at :264 routes to
+ *        play_sound_spatial (:287) or play_sound (:290); its own comment at
+ *        :281 concedes top == 3 is ambiguous
  *    start_coroutine
  *        Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume;
  *        owns s->coros[]
@@ -274,8 +299,12 @@ public:
     static constexpr int kOwnedStringInlineBytes = 256;
 
     /* jce.get_position -- shape: fallible_out, since 1
-     * World-space position of `entity`. Absent when the entity has no
-     * transform.
+     * LOCAL position of `entity` -- its own translation, not composed up the
+     * parent chain. Absent when the entity has no transform. Use
+     * get_world_position for the composed pose. This doc said 'World-space'
+     * until 2026-08-26; the implementation always returned the local TRS
+     * (jce_scene_get_transform), and the wrong word was generated into all
+     * five language SDKs.
      */
     [[nodiscard]] std::optional<std::array<float, 3>> get_position(Entity e) const noexcept
     {
@@ -315,6 +344,20 @@ public:
     {
         std::array<float, 3> v{};
         if (!jce_script_api_get_scale(h_, e, v.data()))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.get_world_position -- shape: fallible_out, since 1
+     * WORLD position of `entity`: its local TRS composed up the parent chain
+     * (jce_scene_get_world_matrix). Absent when the entity has no transform.
+     * Every parented rig -- arms, jaws, fingers, pads -- needs this rather
+     * than get_position.
+     */
+    [[nodiscard]] std::optional<std::array<float, 3>> get_world_position(Entity e) const noexcept
+    {
+        std::array<float, 3> v{};
+        if (!jce_script_api_get_world_position(h_, e, v.data()))
             return std::nullopt;
         return v;
     }
@@ -504,6 +547,73 @@ public:
             return std::nullopt;
         return v;
     }
+
+    /* jce.raycast_filtered -- shape: fallible_out, since 1
+     * Closest hit along the ray, honouring a layer mask and the trigger skip
+     * -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts
+     * branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every
+     * layer and hit_triggers defaults to false, so the common call stays
+     * origin/dir/distance and the filter is what you add when you need it.
+     * hit_triggers is separate from the mask because a trigger volume is not
+     * a layer: collapsing them would make 'ignore triggers on layer 3'
+     * inexpressible.
+     */
+    [[nodiscard]] std::optional<RaycastHit> raycast_filtered(const std::array<float, 3> &origin,
+                                                             const std::array<float, 3> &dir,
+                                                             float max_dist,
+                                                             std::uint32_t layer_mask = defaults::raycast_filtered_layer_mask,
+                                                             bool hit_triggers = defaults::raycast_filtered_hit_triggers) const noexcept
+    {
+        RaycastHit v{};
+        if (!jce_script_api_raycast_filtered(h_, origin.data(), dir.data(), max_dist, layer_mask, hit_triggers, &v))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.raycast_all -- shape: entity_table, since 1
+     * Every entity the ray passes through, as one array sorted near to far.
+     * layer_mask 0 means every layer; hit_triggers defaults to false. Returns
+     * ENTITIES rather than full hit records because the eight-value hit does
+     * not survive as an array shape across seven languages without inventing
+     * a per-language container -- re-query a specific one with
+     * jce.raycast_filtered when you need its point and normal.
+     */
+    [[nodiscard]] std::vector<Entity> raycast_all(const std::array<float, 3> &origin,
+                                                  const std::array<float, 3> &dir,
+                                                  float max_dist,
+                                                  std::uint32_t layer_mask = defaults::raycast_all_layer_mask,
+                                                  bool hit_triggers = defaults::raycast_all_hit_triggers) const
+    {
+        std::vector<Entity> out(static_cast<std::size_t>(256));
+        int n = jce_script_api_raycast_all(h_, origin.data(), dir.data(), max_dist, layer_mask, hit_triggers, out.data(), 256);
+        /* Clamped on BOTH ends, and the upper clamp is not
+         * symmetry: the Lua binding does not have it, so a host
+         * that returns more than it was given overruns a stack
+         * array there and merely loses entries here.  Stated
+         * rather than silently differing.
+         */
+        if (n < 0)
+            n = 0;
+        if (n > 256)
+            n = 256;
+        out.resize(static_cast<std::size_t>(n));
+        return out;
+    }
+
+#if JCE_SCRIPT_CPP_HAS_SPAN
+    /* C++20 only.  The allocation-free form: the CALLER owns the
+     * buffer and chooses its size, which is the C ABI's own shape.
+     * The return value is the host's count and may exceed the span
+     * -- ask again with a bigger one.
+     */
+    [[nodiscard]] int raycast_all(const std::array<float, 3> &origin,
+                                  const std::array<float, 3> &dir,
+                                  float max_dist, std::uint32_t layer_mask,
+                                  bool hit_triggers, std::span<Entity> out) const noexcept
+    {
+        return jce_script_api_raycast_all(h_, origin.data(), dir.data(), max_dist, layer_mask, hit_triggers, out.data(), static_cast<int>(out.size()));
+    }
+#endif
 
     /* jce.apply_impulse -- shape: void_call, since 1
      */
@@ -697,6 +807,23 @@ public:
     void ui_set_slider(Entity e, float v) const noexcept
     {
         jce_script_api_ui_set_slider(h_, e, v);
+    }
+
+    /* jce.ui_get_progress -- shape: fallible_out, since 1
+     */
+    [[nodiscard]] std::optional<float> ui_get_progress(Entity e) const noexcept
+    {
+        float v{};
+        if (!jce_script_api_ui_get_progress(h_, e, &v))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.ui_set_progress -- shape: void_call, since 1
+     */
+    void ui_set_progress(Entity e, float v) const noexcept
+    {
+        jce_script_api_ui_set_progress(h_, e, v);
     }
 
     /* jce.ui_get_toggle -- shape: fallible_out, since 1
@@ -952,6 +1079,333 @@ public:
     void audio_set_volume(Entity e, float volume) const noexcept
     {
         jce_script_api_audio_set_volume(h_, e, volume);
+    }
+
+    /* jce.ui_get_dropdown -- shape: fallible_out, since 1
+     * Selected option INDEX of `entity`'s UIDropdown. Absent when the entity
+     * has no dropdown, so a script can tell 'no dropdown' from 'a dropdown
+     * reading 0'. The index and not the label: branching on which option is
+     * the common case, and a label would make it a string compare.
+     */
+    [[nodiscard]] std::optional<int> ui_get_dropdown(Entity e) const noexcept
+    {
+        int v{};
+        if (!jce_script_api_ui_get_dropdown(h_, e, &v))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.ui_set_dropdown -- shape: void_call, since 1
+     * Select an option by INDEX. Clamped into [0, option_count-1] rather than
+     * refused, the way ui_set_progress clamps and the way the scene loader
+     * clamps: the draw already clamps, so storing outside the range would
+     * make the component and the picture disagree.
+     */
+    void ui_set_dropdown(Entity e, int index) const noexcept
+    {
+        jce_script_api_ui_set_dropdown(h_, e, index);
+    }
+
+    /* jce.ui_get_input_text -- shape: value_return, since 1
+     * Current text of `entity`'s UIInputField, or '' when it has none. The
+     * string is the component's own buffer and is valid until the next
+     * mutation of that entity -- the same contract tr() and get_locale()
+     * carry; every binding copies it and none may store it.
+     */
+    [[nodiscard]] std::string ui_get_input_text(Entity e) const
+    {
+        const char *s = jce_script_api_ui_get_input_text(h_, e);
+        return s != nullptr ? std::string(s) : std::string();
+    }
+
+    /* jce.ui_set_input_text -- shape: void_call, since 1
+     * Replace the UIInputField's text. Truncated to the field's capacity and
+     * to char_limit when one is set -- the same cap the canvas applies to
+     * typed input, so a script write and a keystroke cannot disagree about
+     * what the field holds. A truncation is logged rather than silent.
+     */
+    void ui_set_input_text(Entity e, CStr text) const noexcept
+    {
+        jce_script_api_ui_set_input_text(h_, e, text.c_str());
+    }
+
+    /* jce.ui_get_scroll -- shape: fallible_out, since 1
+     * Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units --
+     * what the component stores and what the wheel path clamps, not device
+     * px. Absent when the entity has no scroll view.
+     */
+    [[nodiscard]] std::optional<std::array<float, 2>> ui_get_scroll(Entity e) const noexcept
+    {
+        std::array<float, 2> v{};
+        if (!jce_script_api_ui_get_scroll(h_, e, v.data()))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.ui_set_scroll -- shape: void_call, since 1
+     * Set the scroll offset in reference units. A disabled axis is pinned to
+     * 0 and each axis is clamped the way the wheel path clamps, so a script
+     * cannot push the offset somewhere a wheel could not; the canvas
+     * re-clamps against the resolved viewport on the next render.
+     */
+    void ui_set_scroll(Entity e, float x, float y) const noexcept
+    {
+        jce_script_api_ui_set_scroll(h_, e, x, y);
+    }
+
+    /* jce.world_get_hour -- shape: value_return, since 1
+     * Live hour of day in [0, 24) -- what the sky is showing now, NOT the
+     * authored tod_hour seed a scene starts from. Reading the seed would
+     * return the level's start-of-day forever while the sky moved.
+     */
+    [[nodiscard]] float world_get_hour() const noexcept
+    {
+        return jce_script_api_world_get_hour(h_);
+    }
+
+    /* jce.world_set_hour -- shape: void_call, since 1
+     * Move the live clock, wrapping into [0, 24). For 'sleep until dawn'. The
+     * authored seed is untouched, so reloading the scene still starts where
+     * the designer set it.
+     */
+    void world_set_hour(float hour) const noexcept
+    {
+        jce_script_api_world_set_hour(h_, hour);
+    }
+
+    /* jce.world_is_daytime -- shape: value_return, since 1
+     * True while the sun is above the horizon. THE predicate for 'is it
+     * night?' -- every key-light chooser in the engine is required to agree
+     * on this one, so a script that rolled its own threshold would disagree
+     * with the lighting it can see.
+     */
+    [[nodiscard]] bool world_is_daytime() const noexcept
+    {
+        return jce_script_api_world_is_daytime(h_);
+    }
+
+    /* jce.world_get_weather -- shape: value_return, since 1
+     * Authored weather type: 0 clear, 1 rain, 2 snow.
+     */
+    [[nodiscard]] int world_get_weather() const noexcept
+    {
+        return jce_script_api_world_get_weather(h_);
+    }
+
+    /* jce.world_get_weather_intensity -- shape: value_return, since 1
+     * Authored weather intensity in [0, 1].
+     */
+    [[nodiscard]] float world_get_weather_intensity() const noexcept
+    {
+        return jce_script_api_world_get_weather_intensity(h_);
+    }
+
+    /* jce.world_get_wind_speed -- shape: value_return, since 1
+     * Instantaneous wind speed in m/s -- the sustained speed plus this
+     * moment's gust. Do NOT key a cache on it: it changes every frame by
+     * design. It is the same number the ocean spectrum and the vegetation
+     * shader read, so a script cannot disagree with what is on screen.
+     */
+    [[nodiscard]] float world_get_wind_speed() const noexcept
+    {
+        return jce_script_api_world_get_wind_speed(h_);
+    }
+
+    /* jce.request_scene -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool request_scene(CStr scene_path) const noexcept
+    {
+        return jce_script_api_request_scene(h_, scene_path.c_str());
+    }
+
+    /* jce.is_transitioning -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool is_transitioning() const noexcept
+    {
+        return jce_script_api_is_transitioning(h_);
+    }
+
+    /* jce.audio_play -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool audio_play(Entity e) const noexcept
+    {
+        return jce_script_api_audio_play(h_, e);
+    }
+
+    /* jce.audio_stop -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool audio_stop(Entity e) const noexcept
+    {
+        return jce_script_api_audio_stop(h_, e);
+    }
+
+    /* jce.audio_is_playing -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool audio_is_playing(Entity e) const noexcept
+    {
+        return jce_script_api_audio_is_playing(h_, e);
+    }
+
+    /* jce.save_game -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool save_game(CStr path) const noexcept
+    {
+        return jce_script_api_save_game(h_, path.c_str());
+    }
+
+    /* jce.load_game -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool load_game(CStr path) const noexcept
+    {
+        return jce_script_api_load_game(h_, path.c_str());
+    }
+
+    /* jce.overlap_sphere -- shape: entity_table, since 1
+     * Entities whose collider overlaps the sphere, as one array. layer_mask 0
+     * means all layers. Triggers are skipped. layer_mask is OPTIONAL:
+     * omitting it means every layer, which is what an explosion or a pickup
+     * check wants and keeps the common call to its coordinates and its size.
+     */
+    [[nodiscard]] std::vector<Entity> overlap_sphere(float x, float y, float z,
+                                                     float radius,
+                                                     std::uint32_t layer_mask = defaults::overlap_sphere_layer_mask) const
+    {
+        std::vector<Entity> out(static_cast<std::size_t>(256));
+        int n = jce_script_api_overlap_sphere(h_, x, y, z, radius, layer_mask, out.data(), 256);
+        /* Clamped on BOTH ends, and the upper clamp is not
+         * symmetry: the Lua binding does not have it, so a host
+         * that returns more than it was given overruns a stack
+         * array there and merely loses entries here.  Stated
+         * rather than silently differing.
+         */
+        if (n < 0)
+            n = 0;
+        if (n > 256)
+            n = 256;
+        out.resize(static_cast<std::size_t>(n));
+        return out;
+    }
+
+#if JCE_SCRIPT_CPP_HAS_SPAN
+    /* C++20 only.  The allocation-free form: the CALLER owns the
+     * buffer and chooses its size, which is the C ABI's own shape.
+     * The return value is the host's count and may exceed the span
+     * -- ask again with a bigger one.
+     */
+    [[nodiscard]] int overlap_sphere(float x, float y, float z, float radius,
+                                     std::uint32_t layer_mask,
+                                     std::span<Entity> out) const noexcept
+    {
+        return jce_script_api_overlap_sphere(h_, x, y, z, radius, layer_mask, out.data(), static_cast<int>(out.size()));
+    }
+#endif
+
+    /* jce.overlap_box -- shape: entity_table, since 1
+     * Entities whose collider overlaps the axis-aligned box (half-extents),
+     * as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL:
+     * omitting it means every layer, which is what an explosion or a pickup
+     * check wants and keeps the common call to its coordinates and its size.
+     */
+    [[nodiscard]] std::vector<Entity> overlap_box(float x, float y, float z,
+                                                  float hx, float hy, float hz,
+                                                  std::uint32_t layer_mask = defaults::overlap_box_layer_mask) const
+    {
+        std::vector<Entity> out(static_cast<std::size_t>(256));
+        int n = jce_script_api_overlap_box(h_, x, y, z, hx, hy, hz, layer_mask, out.data(), 256);
+        /* Clamped on BOTH ends, and the upper clamp is not
+         * symmetry: the Lua binding does not have it, so a host
+         * that returns more than it was given overruns a stack
+         * array there and merely loses entries here.  Stated
+         * rather than silently differing.
+         */
+        if (n < 0)
+            n = 0;
+        if (n > 256)
+            n = 256;
+        out.resize(static_cast<std::size_t>(n));
+        return out;
+    }
+
+#if JCE_SCRIPT_CPP_HAS_SPAN
+    /* C++20 only.  The allocation-free form: the CALLER owns the
+     * buffer and chooses its size, which is the C ABI's own shape.
+     * The return value is the host's count and may exceed the span
+     * -- ask again with a bigger one.
+     */
+    [[nodiscard]] int overlap_box(float x, float y, float z, float hx,
+                                  float hy, float hz, std::uint32_t layer_mask,
+                                  std::span<Entity> out) const noexcept
+    {
+        return jce_script_api_overlap_box(h_, x, y, z, hx, hy, hz, layer_mask, out.data(), static_cast<int>(out.size()));
+    }
+#endif
+
+    /* jce.get_param -- shape: fallible_out, since 1
+     * Returns kind, number, entity for an AUTHORED script parameter --
+     * Unity's [SerializeField], Godot's @export. Returns nil when the entity
+     * has no script component, when no parameter of that name is authored, or
+     * when the name is empty: three absences a script cannot act differently
+     * on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author
+     * expects.
+     */
+    [[nodiscard]] std::optional<GetParamResult> get_param(Entity e, CStr name) const noexcept
+    {
+        GetParamResult v;
+        if (!jce_script_api_get_param(h_, e, name.c_str(), &v.out_kind, &v.out_number, &v.out_entity))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.get_param_text -- shape: value_return, since 1
+     * The TEXT value of an authored script parameter, or '' when the entity
+     * has no script component, no parameter of that name, or one that is not
+     * text. Empty rather than nil for the same reason ui_get_input_text is
+     * empty: a script comparing strings should not have to test for nil
+     * first. The string is the component's own buffer -- copy it if you keep
+     * it.
+     */
+    [[nodiscard]] std::string get_param_text(Entity e, CStr name) const
+    {
+        const char *s = jce_script_api_get_param_text(h_, e, name.c_str());
+        return s != nullptr ? std::string(s) : std::string();
+    }
+
+    /* jce.curve_eval -- shape: fallible_out, since 1
+     * Sample an AUTHORED curve -- the documents the editor's Curve Editor
+     * writes, which nothing could read until this binding existed. Unity's
+     * AnimationCurve shape: the curve is a designer-authored function and the
+     * script decides what it means, so the engine never has to invent what a
+     * curve DRIVES. Returns nil when the path does not resolve, the document
+     * does not parse, the named channel is absent, or that channel has no
+     * keys -- so a curve that genuinely evaluates to 0 and a curve that is
+     * not there are never one reading, and `jce.curve_eval(p, 'kick', t) or
+     * 0.0` reads the way an author expects. An empty channel name means the
+     * FIRST channel, which is a different request from a name that is not
+     * there. The parsed curve is cached per runtime, so a call inside
+     * on_update costs a name compare, not a JSON parse.
+     */
+    [[nodiscard]] std::optional<double> curve_eval(CStr path, CStr channel,
+                                                   double t) const noexcept
+    {
+        double v{};
+        if (!jce_script_api_curve_eval(h_, path.c_str(), channel.c_str(), t, &v))
+            return std::nullopt;
+        return v;
+    }
+
+    /* jce.vcam_activate -- shape: value_return, since 1
+     * Cut to the virtual camera with this name, ahead of priority. Returns 1
+     * when the name resolves to a camera that is active and enabled, 0
+     * otherwise -- the request is recorded either way, so naming a camera in
+     * a streaming cell that has not loaded yet does not silently become
+     * 'whatever priority says'. Pass an empty string to clear it and hand the
+     * decision back to priority. It does NOT rewrite the authored components:
+     * the override lives in the vcam system, so a cutscene cannot bake its
+     * camera choice into the level file.
+     */
+    [[nodiscard]] int vcam_activate(CStr name) const noexcept
+    {
+        return jce_script_api_vcam_activate(h_, name.c_str());
     }
 
 private:

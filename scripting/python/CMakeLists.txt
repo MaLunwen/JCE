@@ -87,6 +87,19 @@ if(NOT JCE_BUILD_SCRIPT_VM_PYTHON)
 	return()
 endif()
 
+# The browser runtime has neither a process CPython nor a loadable ScriptApi
+# shared library for the ctypes package.  Letting FindPython3 run while
+# cross-compiling with Emscripten searches for a target Development.Embed
+# package that this backend cannot consume and can stall configuration for
+# minutes.  The pure-Python package is still installed for host-side tools;
+# only the in-process VM shim is unavailable on Web.
+if(EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+	message(STATUS
+		"JCE scripting: Python VM backend SKIPPED — Web targets do not "
+		"provide an embeddable process CPython/runtime shared library.")
+	return()
+endif()
+
 find_package(Python3 COMPONENTS Development.Embed QUIET)
 if(NOT Python3_Development.Embed_FOUND)
 	message(STATUS
@@ -95,6 +108,39 @@ if(NOT Python3_Development.Embed_FOUND)
 		"development headers and import library to build it.")
 	return()
 endif()
+
+# FindPython3 proves that an embeddable development package exists, but it
+# does not prove that its import/static library matches the target
+# architecture.  That distinction matters for cross builds: on Windows an
+# x64 host Python is otherwise accepted while generating an ARM64 SDK, and
+# the mismatch is only discovered by the first downstream application's
+# linker.  Link one target-architecture probe now so an incompatible optional
+# backend is omitted from the SDK roster instead of being advertised broken.
+include(CheckCSourceCompiles)
+include(CMakePushCheckState)
+string(SHA256 _jce_python_probe_key
+	"${CMAKE_SYSTEM_NAME}|${CMAKE_SYSTEM_PROCESSOR}|${Python3_VERSION}|${Python3_INCLUDE_DIRS}|${Python3_LIBRARIES}")
+string(SUBSTRING "${_jce_python_probe_key}" 0 16 _jce_python_probe_key)
+set(_jce_python_probe_var
+	"JCE_SCRIPT_PYTHON_TARGET_LINKS_${_jce_python_probe_key}")
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_LIBRARIES Python3::Python)
+check_c_source_compiles(
+	"#include <Python.h>\nint main(void) { return Py_IsInitialized(); }"
+	${_jce_python_probe_var})
+cmake_pop_check_state()
+if(NOT ${_jce_python_probe_var})
+	message(STATUS
+		"JCE scripting: Python VM backend SKIPPED — CPython ${Python3_VERSION} "
+		"cannot link for target ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}. "
+		"Provide a target-architecture Development.Embed package or pass "
+		"-DJCE_BUILD_SCRIPT_VM_PYTHON=OFF.")
+	unset(_jce_python_probe_key)
+	unset(_jce_python_probe_var)
+	return()
+endif()
+unset(_jce_python_probe_key)
+unset(_jce_python_probe_var)
 
 add_library(jce_script_vm_python STATIC src/jce_script_vm_python.c)
 set_target_properties(jce_script_vm_python PROPERTIES

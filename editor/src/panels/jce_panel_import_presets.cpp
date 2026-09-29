@@ -32,7 +32,17 @@ extern "C" {
 
 namespace {
 
-enum PresetKind { PK_TEXTURE = 0, PK_MODEL = 1 };
+/* APPENDED at the end, and that is not a style choice: `kind` is the
+ * integer written into every `.import.json` already on disk, so inserting
+ * would re-read every texture sidecar in every project as a model. */
+enum PresetKind { PK_TEXTURE = 0, PK_MODEL = 1, PK_AUDIO = 2 };
+
+/* Mirrors JceAudioCookMode in engine/src/resource/jce_audio_import_settings.h.
+ * AUTO is 0 and is the only value that writes NO key, so an asset nobody has
+ * opened keeps the cooker's size heuristic -- "the user never touched this
+ * control" must not become "the user asserts cook", which is the mistake the
+ * texture sRGB checkbox made before it became three-state. */
+enum AudioCookMode { ACM_AUTO = 0, ACM_ALWAYS = 1, ACM_NEVER = 2 };
 
 /* Colour space, as an explicit three-state choice.
  *
@@ -55,6 +65,14 @@ struct TexOpts {
     int  max_size      = 2048;
 };
 
+struct AudioOpts {
+    int  cook_mode   = ACM_AUTO;
+    bool force_mono  = false;
+    /* 0 = keep the source rate.  Not a slider: the useful values are a short
+     * list of standards, and a slider invites 47,993 Hz. */
+    int  sample_rate = 0;
+};
+
 struct ModelOpts {
     float scale         = 1.0f;
     bool  gen_normals   = true;
@@ -73,6 +91,7 @@ struct Preset {
     PresetKind kind;
     TexOpts    tex;
     ModelOpts  mdl;
+    AudioOpts  aud;
 };
 
 struct GltfReport {
@@ -113,9 +132,12 @@ struct State {
     bool loaded = false;
 
     /* Phase B: directory scan & sidecar inspector. */
-    char scan_root[260]   = "caged_kingdom/assets";
+    /* Empty until the user points it somewhere: the asset tree belongs to
+     * the opened project, not to any one game.  Until 2026-08-27 this
+     * defaulted to a specific game's assets directory. */
+    char scan_root[260]   = {0};
     char filter[64]       = {0};
-    int  kind_filter      = 0;   /* 0=all 1=texture 2=model */
+    int  kind_filter      = 0;   /* 0=all 1=texture 2=model 3=audio */
     bool only_missing     = false;
     std::vector<ScanRow> scan;
 };
@@ -145,7 +167,11 @@ void save_presets(void)
         JceJson *o = jce_json_object();
         jce_json_set_string(o, "name", p.name);
         jce_json_set_int   (o, "kind", (int)p.kind);
-        if (p.kind == PK_TEXTURE) {
+        if (p.kind == PK_AUDIO) {
+            jce_json_set_int (o, "cook_mode",   p.aud.cook_mode);
+            jce_json_set_bool(o, "force_mono",  p.aud.force_mono);
+            jce_json_set_int (o, "sample_rate", p.aud.sample_rate);
+        } else if (p.kind == PK_TEXTURE) {
             jce_json_set_int (o, "target_format", p.tex.target_format);
             jce_json_set_bool(o, "gen_mips",      p.tex.gen_mips);
             jce_json_set_int (o, "colour_space",  p.tex.colour_space);
@@ -192,7 +218,11 @@ void load_presets(void)
             const char *nm = jce_json_get_string(o, "name", "preset");
             std::snprintf(p.name, sizeof(p.name), "%s", nm ? nm : "preset");
             p.kind = (PresetKind)jce_json_get_int(o, "kind", PK_TEXTURE);
-            if (p.kind == PK_TEXTURE) {
+            if (p.kind == PK_AUDIO) {
+                p.aud.cook_mode   = jce_json_get_int (o, "cook_mode",   ACM_AUTO);
+                p.aud.force_mono  = jce_json_get_bool(o, "force_mono",  false);
+                p.aud.sample_rate = jce_json_get_int (o, "sample_rate", 0);
+            } else if (p.kind == PK_TEXTURE) {
                 p.tex.target_format = jce_json_get_int (o, "target_format", 0);
                 p.tex.gen_mips      = jce_json_get_bool(o, "gen_mips", true);
                 /* Migrate the old `srgb` bool.  Its default was true and it
@@ -230,6 +260,17 @@ bool ext_is_texture(const std::string &ext)
         || ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2";
 }
 
+/* The extensions jce_cook_detect_type maps to JCEASSET_TYPE_SOUND.  Kept in
+ * step with it by hand, as the texture and model lists above already are --
+ * the alternative is reaching the cooker's table from the editor, which is a
+ * bigger change than this unit and would be the right one to make when a
+ * fourth list appears. */
+bool ext_is_audio(const std::string &ext)
+{
+    return ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac"
+        || ext == ".opus" || ext == ".m4a" || ext == ".aac";
+}
+
 bool ext_is_model(const std::string &ext)
 {
     return ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj"
@@ -254,6 +295,14 @@ bool emit_sidecar(const char *asset_path, const Preset &p)
         else if (p.tex.colour_space == TCS_LINEAR)
             jce_json_set_string(root, "colorSpace", "linear");
         jce_json_set_int   (root, "max_size",      p.tex.max_size);
+    } else if (p.kind == PK_AUDIO) {
+        /* AUTO writes no key at all, so a preset that leaves the decision
+         * alone produces a sidecar the cooker reads as "nothing was said". */
+        if (p.aud.cook_mode != ACM_AUTO)
+            jce_json_set_int(root, "cook_mode", p.aud.cook_mode);
+        jce_json_set_bool(root, "force_mono", p.aud.force_mono);
+        if (p.aud.sample_rate > 0)
+            jce_json_set_int(root, "sample_rate", p.aud.sample_rate);
     } else {
         jce_json_set_number(root, "scale",        p.mdl.scale);
         jce_json_set_bool  (root, "gen_normals",  p.mdl.gen_normals);
@@ -293,8 +342,10 @@ int apply_to_folder(const char *folder, const Preset &p)
         std::string ext = ext_buf;
         for (auto &ch : ext) ch = (char)std::tolower((unsigned char)ch);
         
-        bool match = (c->preset->kind == PK_TEXTURE) ? ext_is_texture(ext)
-                                                     : ext_is_model(ext);
+        const bool match =
+            (c->preset->kind == PK_TEXTURE) ? ext_is_texture(ext)
+          : (c->preset->kind == PK_AUDIO)   ? ext_is_audio(ext)
+                                            : ext_is_model(ext);
         if (!match) return true;
         
         if (emit_sidecar(path, *c->preset))
@@ -351,14 +402,15 @@ void do_scan(void)
         std::string ext = ext_buf;
         for (auto &ch : ext) ch = (char)std::tolower((unsigned char)ch);
         
-        bool is_tex = ext_is_texture(ext);
-        bool is_mdl = ext_is_model(ext);
-        if (!is_tex && !is_mdl) return true;
+        const bool is_tex = ext_is_texture(ext);
+        const bool is_mdl = ext_is_model(ext);
+        const bool is_aud = ext_is_audio(ext);
+        if (!is_tex && !is_mdl && !is_aud) return true;
         
         ScanRow r;
         r.path = path;
         r.ext  = ext;
-        r.kind = is_tex ? PK_TEXTURE : PK_MODEL;
+        r.kind = is_tex ? PK_TEXTURE : (is_aud ? PK_AUDIO : PK_MODEL);
         r.sidecar_preset = read_sidecar_preset(r.path);
         r.has_sidecar = !r.sidecar_preset.empty();
         
@@ -575,7 +627,8 @@ void draw_scan_section(void)
     ImGui::InputText(jce_editor_i18n("importPresets.scan.filter"), s.filter, sizeof(s.filter));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
-    ImGui::Combo(jce_editor_i18n("importPresets.scan.kind"), &s.kind_filter, "All\0Texture\0Model\0");
+    ImGui::Combo(jce_editor_i18n("importPresets.scan.kind"), &s.kind_filter,
+                 "All\0Texture\0Model\0Audio\0");
     ImGui::SameLine();
     ImGui::Checkbox(jce_editor_i18n("importPresets.scan.onlyMissing"), &s.only_missing);
 
@@ -603,6 +656,7 @@ void draw_scan_section(void)
             ScanRow &r = s.scan[i];
             if (s.kind_filter == 1 && r.kind != PK_TEXTURE) continue;
             if (s.kind_filter == 2 && r.kind != PK_MODEL)   continue;
+            if (s.kind_filter == 3 && r.kind != PK_AUDIO)   continue;
             if (s.only_missing && r.has_sidecar) continue;
             if (s.filter[0] && r.path.find(s.filter) == std::string::npos)
                 continue;
@@ -735,6 +789,7 @@ void draw_scan_section(void)
                 if (cur->kind != r.kind) continue;
                 if (s.kind_filter == 1 && r.kind != PK_TEXTURE) continue;
                 if (s.kind_filter == 2 && r.kind != PK_MODEL)   continue;
+                if (s.kind_filter == 3 && r.kind != PK_AUDIO)   continue;
                 if (s.only_missing && r.has_sidecar) continue;
                 if (s.filter[0] &&
                     r.path.find(s.filter) == std::string::npos) continue;
@@ -756,10 +811,58 @@ void draw_preset_editor(Preset &p)
 {
     ImGui::InputText(jce_editor_i18n("importPresets.editor.name"), p.name, sizeof(p.name));
     int k = (int)p.kind;
-    if (ImGui::Combo(jce_editor_i18n("importPresets.editor.kind"), &k, "Texture\0Model\0")) p.kind = (PresetKind)k;
+    if (ImGui::Combo(jce_editor_i18n("importPresets.editor.kind"), &k,
+                     "Texture\0Model\0Audio\0")) p.kind = (PresetKind)k;
     ImGui::Separator();
 
-    if (p.kind == PK_TEXTURE) {
+    if (p.kind == PK_AUDIO) {
+        {
+            const char *kModes[] = {
+                jce_editor_i18n_id("importPresets.editor.cookMode.auto",   "Auto (size)"),
+                jce_editor_i18n_id("importPresets.editor.cookMode.always", "Always"),
+                jce_editor_i18n_id("importPresets.editor.cookMode.never",  "Never"),
+            };
+            ImGui::Combo(jce_editor_i18n_id("importPresets.editor.cookMode",
+                                            "Decode to PCM"),
+                         &p.aud.cook_mode, kModes, 3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n_id(
+                    "importPresets.editor.cookMode.tip",
+                    "Auto decodes sources under 2 MB. Always pays the decode "
+                    "at cook time for a clip triggered often; Never keeps a "
+                    "long music bed encoded, which is about ten times "
+                    "smaller than raw PCM."));
+        }
+        ImGui::Checkbox(jce_editor_i18n_id("importPresets.editor.forceMono",
+                                           "Force mono"), &p.aud.force_mono);
+        {
+            /* A short list of standards rather than a slider: the useful
+             * values are these, and a free number invites 47,993 Hz. */
+            static const int kRates[] = { 0, 11025, 22050, 32000, 44100, 48000 };
+            const char *kRateNames[] = {
+                jce_editor_i18n_id("importPresets.editor.sampleRate.source",
+                                   "Source"),
+                "11025", "22050", "32000", "44100", "48000",
+            };
+            int sel = 0;
+            for (int i = 1; i < 6; ++i)
+                if (p.aud.sample_rate == kRates[i]) sel = i;
+            if (ImGui::Combo(jce_editor_i18n_id("importPresets.editor.sampleRate",
+                                                "Sample rate"),
+                             &sel, kRateNames, 6))
+                p.aud.sample_rate = kRates[sel];
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n_id(
+                    "importPresets.editor.sampleRate.tip",
+                    "Source keeps the recorded rate. Halving the rate halves "
+                    "the cooked bytes; 22050 is transparent for UI blips and "
+                    "audibly wrong for music."));
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n_id(
+            "importPresets.editor.audioNoCodec",
+            "No compression format or quality: this engine has no audio "
+            "encoder, so a cooked clip is always PCM."));
+    } else if (p.kind == PK_TEXTURE) {
         ImGui::Combo(jce_editor_i18n("importPresets.editor.targetFormat"), &p.tex.target_format,
                      "rgba8\0bc1\0bc3\0bc7\0");
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.genMipmaps"), &p.tex.gen_mips);

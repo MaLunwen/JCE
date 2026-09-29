@@ -8,4 +8,4 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO            /* loads come from memory buffers */
-#include "internal/stb_image.h"
+#include <stb_image.h>

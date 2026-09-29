@@ -13,6 +13,7 @@
  */
 
 #include "jce_terrain_collision_stream.h"
+#include <string.h>
 #include "middleware/scene/jce_terrain_cache.h"
 #include "jce_rt_internal.h"
 
@@ -185,6 +186,24 @@ static bool s_live_cook_warned = false;
  * Returns true if a body was spawned (caller then skips the regular
  * rigid-body path so the entity does not get a second body).
  */
+/*
+ * Record the created body's index back on the component.
+ *
+ * The 2D spawn has always done this, with a comment that says it "mirrors 3D
+ * contract" -- a contract the 3D side never implemented, so
+ * JceRigidBodyComponent.body_handle_idx stayed 0 in every process.  The
+ * visible consequence is in the inspector: jce_panel_inspector_physics.cpp
+ * prints the handle and appends " (inactive in editor)" when it is 0, so a 3D
+ * rigid body read as inactive even while it was being simulated in Play.
+ *
+ * Not serialised, on either component: ser_rigidbody never emitted a key for
+ * it, so a Play session cannot bake a runtime handle into the scene file.
+ */
+static void rt_record_body_handle(JceRigidBodyComponent *rb, JceBodyHandle body)
+{
+	if (rb) rb->body_handle_idx = body.idx;
+}
+
 static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
                                  const JceTransform *tf,
                                  const JceCompoundColliderComponent *cc,
@@ -342,9 +361,7 @@ static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 		id.mass            = rb->mass;
 		id.linear_damping  = rb->drag;
 		id.angular_damping = rb->angular_drag;
-		if (rb->is_kinematic)      id.type = JCE_BODY_KINEMATIC;
-		else if (rb->mass <= 0.0f) id.type = JCE_BODY_STATIC;
-		else                       id.type = JCE_BODY_DYNAMIC;
+		id.type = (uint8_t)rt_rigidbody_kind(rb);
 	} else {
 		id.type = JCE_BODY_STATIC;
 	}
@@ -352,6 +369,7 @@ static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 	JceBodyHandle body = jce_collider_instantiate(rt->physics, &cooked, &id);
 	jce_collider_cooked_free(&cooked);
 	if (!jce_body_valid(body)) return false;
+	rt_record_body_handle(rb, body);
 
 	/* Layer / gravity / material — material override prefers the compound's
 	 * own slot, else the Rigidbody's. */
@@ -789,7 +807,37 @@ bool rt_try_spawn_vehicle(JceRuntime *rt, JceScene *scene, JceEntity e,
 			wd.suspension_stiffness = wcc->suspension_spring;
 		if (wcc->suspension_damper > 0.0f)
 			wd.suspension_damping   = wcc->suspension_damper;
-		wd.friction_slip  = 1000.0f;
+		/* Authored grip, as a MULTIPLIER on the engine's slip value.
+		 *
+		 * forward_friction and sideways_friction were authored, serialised
+		 * and ignored: this line was a hardcoded 1000, so a designer could
+		 * tune wheel grip and the vehicle handled identically.  They cannot
+		 * be wired as absolute values -- their default is 1.0 while Bullet's
+		 * frictionSlip default here is 1000, three orders apart -- so they
+		 * scale it, which leaves every existing scene handling exactly as
+		 * before (1.0 x 1000 = 1000) and makes a tuned value mean something
+		 * for the first time.
+		 *
+		 * Bullet's raycast vehicle has ONE frictionSlip per wheel, covering
+		 * both axes, so the two authored numbers cannot both be honoured.
+		 * Sideways wins: it is the lateral limit that decides whether a
+		 * corner holds.  A wheel that authored them differently gets said so
+		 * rather than silently losing one. */
+		{
+			const float fwd = wcc->forward_friction  > 0.0f
+			                  ? wcc->forward_friction  : 1.0f;
+			const float side = wcc->sideways_friction > 0.0f
+			                   ? wcc->sideways_friction : 1.0f;
+			if (fwd > side * 1.01f || fwd < side * 0.99f)
+				LOG_WARN(LOG_TAG,
+				         "wheel on entity %llu authored forward_friction "
+				         "%.3f and sideways_friction %.3f; the raycast "
+				         "vehicle has one friction slip per wheel, so "
+				         "sideways is used and forward is ignored",
+				         (unsigned long long)child, (double)fwd,
+				         (double)side);
+			wd.friction_slip = 1000.0f * side;
+		}
 		wd.roll_influence = 0.1f;
 
 		uint32_t widx = jce_physics_vehicle_add_wheel(rt->physics, veh, &wd);
@@ -846,22 +894,85 @@ bool rt_try_spawn_vehicle(JceRuntime *rt, JceScene *scene, JceEntity e,
  * rigid body (no RigidBody, or a static/kinematic/zero-mass one) — the same
  * set that forms the immovable ground for the rigid world.
  */
+/*
+ * ONE ANSWER TO "WHAT KIND OF BODY IS THIS".
+ *
+ * There were two, and they disagreed for every scene this editor has ever
+ * written.  Both spawn paths decide from is_kinematic and mass; the soft-body
+ * static mirror decided from JceRigidBodyComponent.body_type -- and that field
+ * is never parsed (parse_rigidbody does not read a "bodyType" key), never
+ * serialised, and has no inspector control, so it is 0 in every component that
+ * has ever existed.  0 is JCE_BODY_STATIC, so the mirror's `dynamic` test was
+ * FALSE for every rigid body in every scene, and every dynamic box collider
+ * got mirrored into the soft world as immovable ground: a soft body rests on a
+ * crate that is about to be pushed away, and keeps resting on where it was.
+ *
+ * body_type IS consulted now, and it took an encoding change to get there.
+ * It used to be a JceBodyType, whose STATIC is 0 -- the same 0 a memset'd
+ * component carries and the same 0 every scene ever written carries, since the
+ * field was never parsed and never serialised.  Honouring that would have
+ * frozen every dynamic body in the tree.  JCE_RB_KIND_AUTO is 0 instead, so
+ * "nobody said anything" and "the author said static" are finally different
+ * bytes, and AUTO means exactly what this function did before.
+ *
+ * is_kinematic still wins over an explicit DYNAMIC.  Unity's Is Kinematic is
+ * the same override, and a component carrying both is one an author edited in
+ * two places; taking the more restrictive one cannot make something fall
+ * through the world, and taking the other one can.
+ *
+ * The 2D sibling keeps its own encoding and its own combo: its body_type has
+ * always been parsed and serialised, so 0 there really is what the author
+ * picked.
+ */
+JceBodyType rt_rigidbody_kind(const JceRigidBodyComponent *rb)
+{
+	if (!rb)               return JCE_BODY_STATIC;
+	if (rb->is_kinematic)  return JCE_BODY_KINEMATIC;
+
+	switch (rb->body_type) {
+	case JCE_RB_KIND_STATIC:    return JCE_BODY_STATIC;
+	case JCE_RB_KIND_KINEMATIC: return JCE_BODY_KINEMATIC;
+	case JCE_RB_KIND_DYNAMIC:   return JCE_BODY_DYNAMIC;
+	default: break;   /* AUTO, and any byte from a newer file */
+	}
+
+	if (rb->mass <= 0.0f)  return JCE_BODY_STATIC;
+	return JCE_BODY_DYNAMIC;
+}
+
 static void rt_softbody_mirror_static(JceScene *scene, JceEntity e, void *ud)
 {
 	(void)ud;
-	if (!jce_scene_has_box_collider(scene, e)) return;
-	if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_BOX_COLLIDER)) return;
+	/* ANY of the three primitives, each gated on its OWN enable flag.  This
+	 * asked `has_box_collider` first and returned, so the sphere and capsule
+	 * branches below were unreachable the moment they were written -- the
+	 * wiring existed, compiled, and could not run.  Caught by
+	 * tests/application/test_jce_runtime_softbody_colliders.c, which counts
+	 * what the runtime actually mirrors; the API-level test could not see it
+	 * because it calls jce_softbody_add_static_* directly. */
+	const bool has_box = jce_scene_has_box_collider(scene, e)
+	    && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_BOX_COLLIDER);
+	const bool has_sph = jce_scene_has_sphere_collider(scene, e)
+	    && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPHERE_COLLIDER);
+	const bool has_cap = jce_scene_has_capsule_collider(scene, e)
+	    && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CAPSULE_COLLIDER);
+	if (!has_box && !has_sph && !has_cap) return;
 
 	/* Skip dynamic bodies — only immovable colliders form the ground. */
 	JceRigidBodyComponent *rb = jce_scene_get_rigidbody(scene, e);
 	if (rb && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_RIGIDBODY)) {
-		bool dynamic = (rb->body_type == (uint8_t)JCE_BODY_DYNAMIC) &&
-		               !rb->is_kinematic && rb->mass > 0.0f;
-		if (dynamic) return;
+		/* The SAME question the spawn answers, so the two cannot drift.
+		   Before this it asked body_type, which is 0 in every component
+		   that has ever existed -- so no body was ever dynamic here. */
+		if (rt_rigidbody_kind(rb) == JCE_BODY_DYNAMIC) return;
 	}
 
-	JceBoxColliderComponent *box = jce_scene_get_box_collider(scene, e);
-	if (!box) return;
+	/* A BOX was the only shape mirrored, so a sphere or capsule collider did
+	 * not exist for the soft world at all -- cloth fell through it and
+	 * nothing reported that. */
+	JceBoxColliderComponent     *box = has_box ? jce_scene_get_box_collider(scene, e)     : NULL;
+	JceSphereColliderComponent  *sph = has_sph ? jce_scene_get_sphere_collider(scene, e)  : NULL;
+	JceCapsuleColliderComponent *cap = has_cap ? jce_scene_get_capsule_collider(scene, e) : NULL;
 
 	/* World transform: translation column = world position; column lengths =
 	 * world scale (uniform-ish; good enough for a static ground proxy). */
@@ -877,16 +988,47 @@ static void rt_softbody_mirror_static(JceScene *scene, JceEntity e, void *ud)
 	if (scl_y <= 0.0f) scl_y = 1.0f;
 	if (scl_z <= 0.0f) scl_z = 1.0f;
 
-	/* Box centre offset (authored, scaled) added to the world position. */
-	jce_vec3 center = jce_v3(wpos.x + box->center[0] * scl_x,
-	                         wpos.y + box->center[1] * scl_y,
-	                         wpos.z + box->center[2] * scl_z);
-	jce_vec3 half   = jce_v3(0.5f * box->size[0] * scl_x,
-	                         0.5f * box->size[1] * scl_y,
-	                         0.5f * box->size[2] * scl_z);
-	if (half.x <= 0.0f || half.y <= 0.0f || half.z <= 0.0f) return;
-
-	(void)jce_softbody_add_static_box(center, half);
+	if (box) {
+		/* Centre offset (authored, scaled) added to the world position. */
+		jce_vec3 center = jce_v3(wpos.x + box->center[0] * scl_x,
+		                         wpos.y + box->center[1] * scl_y,
+		                         wpos.z + box->center[2] * scl_z);
+		jce_vec3 half   = jce_v3(0.5f * box->size[0] * scl_x,
+		                         0.5f * box->size[1] * scl_y,
+		                         0.5f * box->size[2] * scl_z);
+		if (half.x > 0.0f && half.y > 0.0f && half.z > 0.0f)
+			(void)jce_softbody_add_static_box(center, half);
+	}
+	if (sph) {
+		jce_vec3 center = jce_v3(wpos.x + sph->center[0] * scl_x,
+		                         wpos.y + sph->center[1] * scl_y,
+		                         wpos.z + sph->center[2] * scl_z);
+		/* A sphere has ONE radius and three scales.  Take the LARGEST, the
+		 * same choice the rigid path makes: a proxy that is too small lets
+		 * cloth sink into geometry the player can see it resting on, and too
+		 * large only holds it a little off the surface. */
+		float smax = scl_x > scl_y ? scl_x : scl_y;
+		if (scl_z > smax) smax = scl_z;
+		if (sph->radius > 0.0f)
+			(void)jce_softbody_add_static_sphere(center, sph->radius * smax);
+	}
+	if (cap) {
+		jce_vec3 center = jce_v3(wpos.x + cap->center[0] * scl_x,
+		                         wpos.y + cap->center[1] * scl_y,
+		                         wpos.z + cap->center[2] * scl_z);
+		/* Radius scales with the two axes ACROSS the capsule, height with the
+		 * one along it -- so a capsule stretched along its own axis gets
+		 * longer rather than fatter. */
+		float along  = cap->axis == 0 ? scl_x : (cap->axis == 2 ? scl_z : scl_y);
+		float a_r    = cap->axis == 0 ? scl_y : scl_x;
+		float b_r    = cap->axis == 2 ? scl_y : scl_z;
+		float r_scl  = a_r > b_r ? a_r : b_r;
+		if (cap->radius > 0.0f)
+			(void)jce_softbody_add_static_capsule(center,
+			                                      cap->radius * r_scl,
+			                                      cap->height * along,
+			                                      cap->axis);
+	}
 }
 
 /*
@@ -992,6 +1134,11 @@ void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 	bd.friction        = rb->friction > 0.0f ? rb->friction : 0.5f;
 	bd.restitution     = rb->restitution;
 	bd.fixed_rotation  = rb->fixed_rotation;
+	/* Collision layer -> b2Filter, resolved inside body_create against the
+	 * 2D matrix.  Mirrors the 3D path's jce_physics_body_set_layer call at
+	 * the top of this file; the authored 32x32 grid reached NOTHING before
+	 * this line existed. */
+	bd.physics_layer   = rb->physics_layer;
 
 	/* Body type: kinematic flag / zero-mass static / dynamic. */
 	if (rb->body_type == JCE_BODY_KINEMATIC) bd.type = JCE_BODY_KINEMATIC;
@@ -1009,6 +1156,12 @@ void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 	JceCollider2DComponent *col = jce_scene_get_collider2d(scene, e);
 	if (col && !jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_COLLIDER_2D))
 		col = NULL;   /* disabled collider -> default unit box below */
+
+	/* Unity's "Is Trigger".  Until JceBody2DDesc gained a sensor flag this
+	 * had nowhere to go, so an authored 2D trigger was a solid wall.  AFTER
+	 * the disabled-collider reset above: a disabled collider falls back to a
+	 * plain unit box and must not silently become a trigger. */
+	bd.sensor = col ? col->is_trigger : false;
 	if (col) {
 		bd.position.x += col->offset[0];
 		bd.position.y += col->offset[1];
@@ -1023,12 +1176,19 @@ void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 				break;
 			}
 			case JCE_COLLIDER_2D_CAPSULE: {
+				/* capsule_direction: 0 = vertical (length along Y),
+				 * 1 = horizontal (length along X).  It used to be ignored --
+				 * a horizontal capsule authored in the editor simulated as a
+				 * vertical one, and the gizmo said so in a comment rather
+				 * than the shape being right. */
+				bool horiz = (col->capsule_direction == 1);
 				float r  = col->radius > 0.0f ? col->radius : 0.25f;
-				/* size.y is the full length; wrapper wants half_length. */
-				float hl = 0.5f * (col->size[1] > 0.0f ? col->size[1] : 1.0f);
-				bd.shape = JCE_SHAPE2D_CAPSULE;
-				bd.half_extents.x = r * smax;       /* radius */
-				bd.half_extents.y = hl * sy;        /* half length */
+				float len = horiz ? (col->size[0] > 0.0f ? col->size[0] : 1.0f)
+				                  : (col->size[1] > 0.0f ? col->size[1] : 1.0f);
+				float hl = 0.5f * len;
+				bd.shape = horiz ? JCE_SHAPE2D_CAPSULE_X : JCE_SHAPE2D_CAPSULE;
+				bd.half_extents.x = r * smax;                    /* radius */
+				bd.half_extents.y = hl * (horiz ? sx : sy);      /* half length */
 				break;
 			}
 			case JCE_COLLIDER_2D_EDGE: {
@@ -1039,10 +1199,23 @@ void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 				bd.half_extents.y = 0.0f;
 				break;
 			}
-			case JCE_COLLIDER_2D_POLYGON:
-				/* Wrapper has no arbitrary-polygon shape — fall back to the
-				 * collider's bounding box (limitation, noted). */
-				/* fall through */
+			case JCE_COLLIDER_2D_POLYGON: {
+				/* Real convex polygon from the authored points.  This used
+				 * to fall through to BOX -- the wrapper had no polygon
+				 * shape -- so points[] and point_count did nothing and a
+				 * ramp collided as its bounding box.  Fewer than 3 points
+				 * is not a polygon and still falls back. */
+				if (col->point_count >= 3) {
+					bd.shape = JCE_SHAPE2D_POLYGON;
+					bd.points = &col->points[0][0];
+					bd.point_count = col->point_count;
+					/* Fallback extents if the hull is degenerate. */
+					bd.half_extents.x = 0.5f * (col->size[0] > 0.0f ? col->size[0] : 1.0f) * sx;
+					bd.half_extents.y = 0.5f * (col->size[1] > 0.0f ? col->size[1] : 1.0f) * sy;
+					break;
+				}
+			}
+				/* fall through: too few points to be a polygon */
 			case JCE_COLLIDER_2D_BOX:
 			default: {
 				bd.shape = JCE_SHAPE2D_BOX;
@@ -1052,10 +1225,33 @@ void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 			}
 		}
 	} else {
-		/* No collider authored — placeholder unit box from XY scale. */
-		bd.shape = JCE_SHAPE2D_BOX;
-		bd.half_extents.x = 0.5f * sx;
-		bd.half_extents.y = 0.5f * sy;
+		/* No collider authored.  Same story as the 3D path above:
+		 * JceRigidBody2DComponent.shape_type picks the placeholder.  The
+		 * field holds a JceShapeType (the 3D enum) because that is what the
+		 * 3D sibling holds and both are authored from the same inspector
+		 * control; it is mapped onto the 2D shapes here.  BOX == 0 keeps
+		 * every existing 2D scene identical. */
+		/* rb is non-NULL here by construction: the early return above
+		 * refuses when there is neither a RigidBody nor a collider, and this
+		 * branch is the no-collider case.  Stated locally because the reader
+		 * of this switch cannot see that thirty lines up. */
+		switch (rb ? (JceShapeType)rb->shape_type : JCE_SHAPE_BOX) {
+		case JCE_SHAPE_SPHERE:
+			bd.shape = JCE_SHAPE2D_CIRCLE;
+			bd.half_extents.x = 0.5f * (sx > sy ? sx : sy);   /* radius */
+			break;
+		case JCE_SHAPE_CAPSULE:
+			bd.shape = JCE_SHAPE2D_CAPSULE;
+			bd.half_extents.x = 0.5f * sx;                    /* radius */
+			bd.half_extents.y = 0.5f * sy - bd.half_extents.x;
+			if (bd.half_extents.y < 0.0f) bd.half_extents.y = 0.0f;
+			break;
+		default:
+			bd.shape = JCE_SHAPE2D_BOX;
+			bd.half_extents.x = 0.5f * sx;
+			bd.half_extents.y = 0.5f * sy;
+			break;
+		}
 	}
 
 	if (bd.half_extents.x <= 0.0f) bd.half_extents.x = 0.5f;
@@ -1203,21 +1399,62 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
                                  bool allow_defer)
 {
 	if (!rt->physics) return false;
-	JceTransform *tf = jce_scene_get_transform(scene, e);
-	if (!tf) return false;
+	JceTransform *tf_local = jce_scene_get_transform(scene, e);
+	if (!tf_local) return false;
+
+	/* WORLD, not local -- see the long note at the head of rt_spawn_entity.
+	 * This function is ALSO called from the per-frame draw-distance pass, which
+	 * does not come through that walk, so the composition has to happen here
+	 * too rather than only at the call site.  A root entity is byte-identical:
+	 * jce_scene_get_world_pose returns a parentless Transform verbatim. */
+	JceTransform tf_world = *tf_local;
+	jce_scene_get_world_pose(scene, e, &tf_world.position, &tf_world.rotation,
+	                         &tf_world.scale);
+	const JceTransform *tf = &tf_world;
+
+	/* Stamp INVALID before deciding anything, so `body_handle_idx == 0` stops
+	 * meaning two different things.  0 is a PERFECTLY VALID handle here --
+	 * jce_body_valid() rejects only UINT32_MAX, and idx packs slot+generation,
+	 * so a body in slot 0 with generation 0 has idx 0.  With the field left at
+	 * its memset 0, "no body" and "the first body" were the same byte, which
+	 * is the same trap this file just fixed on body_type one function up.
+	 * After this, 0 is a body, UINT32_MAX is "the spawn looked and made none",
+	 * and only a component the runtime has never visited is still ambiguous --
+	 * and that one really is "inactive in editor". */
+	{
+		JceRigidBodyComponent *rb0 = jce_scene_get_rigidbody(scene, e);
+		if (rb0) rb0->body_handle_idx = JCE_BODY_INVALID.idx;
+	}
+	/* A RIGIDBODY IS OPTIONAL.  The COLLIDER is what makes a thing solid; the
+	 * RigidBody is what makes it move.  That is Unity's model and every
+	 * engine's, and it is what rt_spawn_cooked_body has always done for
+	 * Mesh/Compound colliders (`else { id.type = JCE_BODY_STATIC; }`).
+	 *
+	 * This function used to `return false` the moment there was no enabled
+	 * RigidBody -- before it looked at a single collider.  So "BoxCollider, no
+	 * RigidBody", the way a floor or a wall is authored, and the way the
+	 * editor's own Add Component > Box Collider leaves it, produced NO
+	 * COLLISION BODY AT ALL: the player fell through the world while the
+	 * viewport drew the green collider gizmo over the hole.  Only the three
+	 * PRIMITIVE colliders had the bug, and they are what a level is built out
+	 * of.
+	 *
+	 * A DISABLED RigidBody is treated as an absent one rather than as "no body
+	 * at all": the collider beside it is still enabled, and silently
+	 * dissolving the floor is the behaviour being fixed here. */
 	JceRigidBodyComponent *rb = jce_scene_get_rigidbody(scene, e);
-	if (!rb || !jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_RIGIDBODY))
-		return false;
+	if (rb && !jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_RIGIDBODY))
+		rb = NULL;
 
 	JceBodyDesc bd;
 	memset(&bd, 0, sizeof bd);
 	bd.position        = tf->position;
 	bd.rotation        = tf->rotation;
-	bd.mass            = rb->mass;
-	bd.linear_damping  = rb->drag;
-	bd.angular_damping = rb->angular_drag;
-	bd.friction        = rb->friction    > 0.0f ? rb->friction    : 0.5f;
-	bd.restitution     = rb->restitution;
+	bd.mass            = rb ? rb->mass         : 0.0f;   /* 0 == static */
+	bd.linear_damping  = rb ? rb->drag         : 0.0f;
+	bd.angular_damping = rb ? rb->angular_drag : 0.0f;
+	bd.friction        = (rb && rb->friction > 0.0f) ? rb->friction : 0.5f;
+	bd.restitution     = rb ? rb->restitution  : 0.0f;
 
 	JceBoxColliderComponent     *box = jce_scene_get_box_collider(scene, e);
 	JceSphereColliderComponent  *sph = jce_scene_get_sphere_collider(scene, e);
@@ -1228,6 +1465,12 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 		box = NULL;
 	if (sph && !jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPHERE_COLLIDER))
 		sph = NULL;
+	/* Neither a RigidBody nor an enabled primitive collider: there is nothing
+	 * to make, and the no-collider placeholder below reads rb->shape_type, so
+	 * this also keeps that branch's precondition true. */
+	if (!rb && !box && !sph && !cap)
+		return false;
+
 	/* Collider center offset, LOCAL (scaled, pre-rotation).  Baked into
 	 * the body origin below; also stored on the BodyEntry so push/sync
 	 * keep the collider centered when the entity is moved at runtime. */
@@ -1266,19 +1509,27 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 		}
 		bd.is_trigger = sph->is_trigger;
 	} else if (cap) {
-		/* Bullet capsules are Y-aligned: half_extents = (radius,
-		 * cylinder half-height, 0).  Mirror the editor collider
-		 * overlay (jce_scene_render_draw.cpp capsule block) so
-		 * draw == physics: radius scales by max(|sx|,|sz|), total
-		 * height by |sy|, hemispheres carved out of the authored
-		 * total height.  `axis` is intentionally ignored — the
-		 * overlay draws Y-aligned too, and JceBodyDesc has no
-		 * per-shape axis (only whole-body rotation). */
+		/* half_extents = (radius, cylinder half-height, 0), along the
+		 * AUTHORED axis.  `axis` used to be ignored -- Bullet has
+		 * btCapsuleShapeX/Y/Z but only the Y class was reachable, and
+		 * the note here said so rather than the shape being right.
+		 * The editor overlay follows the same axis, so draw ==
+		 * physics still holds.  Radius scales by the max of the two
+		 * ACROSS axes and the length by the along axis; hemispheres
+		 * are carved out of the authored total height. */
 		bd.shape = JCE_SHAPE_CAPSULE;
 		jce_vec3 cs = jce_v3_abs_safe_scale(tf->scale);
-		float cr_scale = cs.x > cs.z ? cs.x : cs.z;
+		int cap_axis = cap->axis;            /* 0=X, 1=Y, 2=Z */
+		if (cap_axis < 0 || cap_axis > 2) cap_axis = 1;
+		bd.capsule_axis = (uint8_t)(cap_axis == 0 ? JCE_CAPSULE_AXIS_X
+		                          : cap_axis == 2 ? JCE_CAPSULE_AXIS_Z
+		                                          : JCE_CAPSULE_AXIS_Y);
+		float a0 = cap_axis == 0 ? cs.y : cs.x;   /* the two ACROSS axes */
+		float a1 = cap_axis == 2 ? cs.y : cs.z;
+		float cr_scale = a0 > a1 ? a0 : a1;
+		float len_scale = cap_axis == 0 ? cs.x : (cap_axis == 2 ? cs.z : cs.y);
 		float cr = (cap->radius > 0.0f ? cap->radius : 0.3f) * cr_scale;
-		float ch = (cap->height > 0.0f ? cap->height : 1.0f) * cs.y;
+		float ch = (cap->height > 0.0f ? cap->height : 1.0f) * len_scale;
 		float chh = 0.5f * (ch - 2.0f * cr);
 		if (chh < 0.0f) chh = 0.0f;
 		bd.half_extents.x = cr;
@@ -1294,20 +1545,52 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 		}
 		bd.is_trigger = cap->is_trigger;
 	} else {
-		/* No collider authored — placeholder box from transform
-		 * scale so dropped objects still collide. */
-		bd.shape = JCE_SHAPE_BOX;
-		bd.half_extents.x = 0.5f * tf->scale.x;
-		bd.half_extents.y = 0.5f * tf->scale.y;
-		bd.half_extents.z = 0.5f * tf->scale.z;
-		if (bd.half_extents.x <= 0.0f) bd.half_extents.x = 0.5f;
-		if (bd.half_extents.y <= 0.0f) bd.half_extents.y = 0.5f;
-		if (bd.half_extents.z <= 0.0f) bd.half_extents.z = 0.5f;
+		/* No collider authored.  JceRigidBodyComponent.shape_type is the
+		 * field that decides WHICH placeholder, and until now nothing read
+		 * it: a ball with no SphereCollider collided as a cube, and the one
+		 * field named for the shape sat there saying "sphere".
+		 *
+		 * Every placeholder is still derived from the transform scale, so
+		 * JCE_SHAPE_BOX (0, what a zeroed component and every scene authored
+		 * before this carries) is byte-for-byte the previous behaviour.
+		 * A collider component, when present, still wins outright -- this is
+		 * the fallback, not a second source of truth. */
+		float hx = 0.5f * tf->scale.x, hy = 0.5f * tf->scale.y,
+		      hz = 0.5f * tf->scale.z;
+		if (hx <= 0.0f) hx = 0.5f;
+		if (hy <= 0.0f) hy = 0.5f;
+		if (hz <= 0.0f) hz = 0.5f;
+		switch ((JceShapeType)rb->shape_type) {
+		case JCE_SHAPE_SPHERE:
+			bd.shape = JCE_SHAPE_SPHERE;
+			/* The largest half-extent, so the sphere CONTAINS the box the
+			 * old code would have used rather than rattling around inside
+			 * it -- a smaller placeholder would drop an object through
+			 * geometry it used to rest on. */
+			bd.half_extents.x = hx > hy ? (hx > hz ? hx : hz)
+			                            : (hy > hz ? hy : hz);
+			break;
+		case JCE_SHAPE_CAPSULE:
+			bd.shape = JCE_SHAPE_CAPSULE;
+			bd.half_extents.x = hx > hz ? hx : hz;      /* radius */
+			bd.half_extents.y = hy - bd.half_extents.x; /* half cylinder */
+			if (bd.half_extents.y < 0.0f) bd.half_extents.y = 0.0f;
+			break;
+		default:
+			/* PLANE / CONVEX_HULL / TRIANGLE_MESH / COMPOUND have no meaning
+			 * without authored geometry, so they land here with BOX rather
+			 * than producing a body with no shape at all. */
+			bd.shape = JCE_SHAPE_BOX;
+			bd.half_extents.x = hx;
+			bd.half_extents.y = hy;
+			bd.half_extents.z = hz;
+			break;
+		}
 	}
 
-	if (rb->is_kinematic)       bd.type = JCE_BODY_KINEMATIC;
-	else if (rb->mass <= 0.0f)  bd.type = JCE_BODY_STATIC;
-	else                        bd.type = JCE_BODY_DYNAMIC;
+	/* No RigidBody => STATIC, the same conclusion rt_spawn_cooked_body reaches
+	 * for Mesh/Compound colliders. */
+	bd.type = rt_rigidbody_kind(rb);   /* NULL rb => STATIC, as before */
 
 	/* ── Draw-distance classification (big-world deferred spawn) ──
 	 * On the scene-load walk only: a SMALL STATIC box/sphere/capsule (the
@@ -1335,7 +1618,11 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 
 	JceBodyHandle body = jce_physics_body_create(rt->physics, &bd);
 	if (!jce_body_valid(body)) return false;
-	if (rb->ccd_mode != JCE_CCD_DISCRETE) {
+	rt_record_body_handle(rb, body);
+	/* CCD is a RigidBody setting and a static collider has none.  It is also
+	 * meaningless for one: continuous collision detection is about a body
+	 * tunnelling through geometry as it MOVES. */
+	if (rb && rb->ccd_mode != JCE_CCD_DISCRETE) {
 		jce_physics_body_set_ccd_mode(rt->physics, body,
 		                              (JceCcdMode)rb->ccd_mode);
 		if (rb->ccd_threshold > 0.0f)
@@ -1345,7 +1632,7 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 			jce_physics_body_set_ccd_swept_sphere_radius(
 				rt->physics, body, rb->ccd_sphere_radius);
 	}
-	rt_apply_body_extras(rt, e, body, rb, rb->physmat_path);
+	rt_apply_body_extras(rt, e, body, rb, rb ? rb->physmat_path : NULL);
 	if (rt->body_count >= rt->body_cap && !rt_grow_bodies(rt)) {
 		jce_physics_body_destroy(rt->physics, body);
 		return false;
@@ -1355,4 +1642,230 @@ bool rt_spawn_entity_body(JceRuntime *rt, JceScene *scene, JceEntity e,
 	 * centered on the collider when the entity is moved at runtime. */
 	rt->bodies[rt->body_count - 1].center_local = collider_center_local;
 	return true;
+}
+
+/*
+ * Per-wheel WheelCollider drive, pushed after the vehicle-level input.
+ *
+ * JceWheelColliderComponent.motor_torque / .brake_torque / .steer_angle_deg
+ * are the three controls Unity drives a car with, and until now the only
+ * route into the simulation was whole-vehicle throttle/brake/steer: the
+ * fields were parsed, stored and read by NOTHING.  (The header called them
+ * "current applied" -- runtime mirrors -- but nothing wrote them either, so
+ * a script reading motor_torque got a permanent 0.)
+ *
+ * ADDITIVE on top of set_input, so a wheel left at the default 0 comes out
+ * exactly as before and no already-authored vehicle changes.  Runs for every
+ * vehicle regardless of input mode -- a SCRIPT-mode vehicle gets its trim on
+ * top of whatever the script last set.
+ *
+ * steer_angle_deg is degrees (its name says so); the physics API is radians.
+ */
+void rt_apply_wheel_trim(JceRuntime *rt)
+{
+	if (!rt || !rt->physics || rt->vehicle_count == 0 || !rt->scene) return;
+	for (int i = 0; i < rt->vehicle_count; ++i) {
+		VehicleEntry *ve = &rt->vehicles[i];
+		for (uint32_t w = 0; w < ve->wheel_count; ++w) {
+			JceEntity we = ve->wheel_entities[w];
+			if (!we) continue;            /* synthesized wheel: no component */
+			JceWheelColliderComponent *wc =
+				jce_scene_get_wheel_collider(rt->scene, we);
+			if (!wc) continue;
+			if (wc->motor_torque == 0.0f && wc->brake_torque == 0.0f &&
+			    wc->steer_angle_deg == 0.0f) continue;
+			jce_physics_vehicle_add_wheel_input(
+				rt->physics, ve->veh, w,
+				wc->motor_torque, wc->brake_torque,
+				wc->steer_angle_deg * (float)(JCE_PI / 180.0));
+		}
+	}
+}
+
+/* Find the live 2D body for an entity (linear scan mirrors rt_body_for_entity
+ * for 3D).  JCE_BODY_INVALID if the entity authored no spawned 2D body. */
+static JceBodyHandle rt_body2d_for_entity(const JceRuntime *rt, JceEntity e)
+{
+	RT_BODY_FOR_ENTITY(rt->bodies2d, rt->body2d_count, e);
+}
+
+/* JOINT-2D last-mile: spawn a Box2D distance/hinge/spring joint for an entity
+ * that authored an ENABLED JceJoint2DComponent.  Mirrors rt_spawn_configurable_
+ * joint (presence-gated via JCE_COMP_FLAG_JOINT_2D; body_a = the entity's own 2D
+ * body; body_b = connected_body's 2D body, or the world when 0) and registers a
+ * Joint2DEntry so teardown can reach the handle.  Runs in the SAME post-spawn
+ * pass as the 3D joints (every 2D body must already exist).  Absent / disabled
+ * component -> early return -> no entry -> no 2D joint work. */
+void rt_spawn_joint2d(JceScene *scene, JceEntity e, void *ud)
+{
+	JceRuntime *rt = (JceRuntime *)ud;
+	if (!rt->physics2d) return;
+
+	JceJoint2DComponent *jc = jce_scene_get_joint2d(scene, e);
+	if (!jc) return;
+	if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_JOINT_2D)) return;
+
+	/* The jointed entity itself must have a 2D body. */
+	JceBodyHandle a = rt_body2d_for_entity(rt, e);
+	if (!jce_body_valid(a)) return;
+
+	/* connected_body 0 -> anchor to the world; otherwise resolve its 2D body. */
+	JceBodyHandle b = JCE_BODY_INVALID;
+	if (jc->connected_body != 0) {
+		b = rt_body2d_for_entity(rt, (JceEntity)jc->connected_body);
+		if (!jce_body_valid(b)) {
+			LOG_WARN(LOG_TAG, "2D joint: connected body %llu has no 2D body",
+			         (unsigned long long)jc->connected_body);
+			return;
+		}
+	}
+
+	JcePhysics2DJointDesc jd;
+	memset(&jd, 0, sizeof jd);
+	jd.kind              = jc->kind;
+	jd.body_a            = a;
+	jd.body_b            = b;   /* JCE_BODY_INVALID => world anchor */
+	jd.anchor_a.x        = jc->anchor[0];
+	jd.anchor_a.y        = jc->anchor[1];
+	jd.anchor_b.x        = jc->connected_anchor[0];
+	jd.anchor_b.y        = jc->connected_anchor[1];
+	jd.distance          = jc->distance;
+	jd.frequency_hz      = jc->frequency;
+	jd.damping_ratio     = jc->damping_ratio;
+	jd.use_motor         = jc->use_motor;
+	jd.motor_speed_rad_s = jc->motor_speed_deg_s * JCE_DEG2RAD;
+	jd.motor_max_torque  = jc->motor_max_torque;
+	jd.use_limits        = jc->use_limits;
+	jd.lower_angle_rad   = jc->lower_angle_deg * JCE_DEG2RAD;
+	jd.upper_angle_rad   = jc->upper_angle_deg * JCE_DEG2RAD;
+	/* Unity's "Enable Collision": do the jointed bodies still collide?
+	 * Box2D takes it per joint; JcePhysics2DJointDesc had no way to say it,
+	 * so this was authored and dropped. */
+	jd.collide_connected = jc->enable_collision;
+
+	/* Unity's "Auto Configure Distance": the rest length is whatever the two
+	 * anchors are apart RIGHT NOW, taken once at spawn.  Authored and unread
+	 * before this, so a scene that ticked it got jc->distance -- usually the
+	 * 0 a fresh component carries, i.e. the two bodies yanked together. */
+	if (jc->auto_configure_distance &&
+	    (jc->kind == JCE_JOINT_2D_DISTANCE || jc->kind == JCE_JOINT_2D_SPRING)) {
+		jce_vec2 pa, pb; float ang = 0.0f;
+		jce_physics2d_body_get_transform(rt->physics2d, a, &pa, &ang);
+		pa.x += jd.anchor_a.x; pa.y += jd.anchor_a.y;
+		if (jce_body_valid(b)) {
+			jce_physics2d_body_get_transform(rt->physics2d, b, &pb, &ang);
+			pb.x += jd.anchor_b.x; pb.y += jd.anchor_b.y;
+		} else {
+			pb = jd.anchor_b;      /* world anchor is already world-space */
+		}
+		float dx = pb.x - pa.x, dy = pb.y - pa.y;
+		jd.distance = sqrtf(dx * dx + dy * dy);
+	}
+
+	JceConstraintHandle h = jce_physics2d_joint_create(rt->physics2d, &jd);
+	if (!jce_constraint_valid(h)) return;
+
+	/* Track for teardown.  If the registry can't grow the joint is still live
+	 * in rt->physics2d (freed by jce_physics2d_destroy), it just won't be
+	 * explicitly destroyed early — acceptable degradation. */
+	if (rt->joint2d_count >= rt->joint2d_cap && !rt_grow_joints2d(rt))
+		return;
+	Joint2DEntry *je = &rt->joints2d[rt->joint2d_count++];
+	je->entity       = e;
+	je->handle       = h;
+	/* <= 0 means "never breaks", which is what every joint did before the
+	 * monitor existed; the entry is still tracked so teardown is uniform. */
+	je->break_force  = jc->break_force;
+	je->break_torque = jc->break_torque;
+}
+
+/*
+ * Swap-remove sweep over a joint registry: destroy every entry whose load
+ * exceeded its authored break threshold, and return the surviving count.
+ *
+ * WHY THIS IS SHARED.  The 2D monitor below and rt_monitor_configurable_joints
+ * on the 3D side differ in the things that should differ -- the entry type, the
+ * measure (a constraint FORCE in N vs an applied IMPULSE in N.s, so only the
+ * 3D threshold is scaled by dt), and which destroy call frees the handle.  What
+ * they had in common was the control flow, and the subtle half of it is "after
+ * a swap-remove, do NOT advance the index".  That is exactly the kind of line
+ * that gets fixed in one copy and left wrong in the other, and the dedup audit
+ * caught the second copy on arrival (similar-code 67 -> 68).
+ */
+int rt_break_sweep(void *base, size_t stride, int count,
+                   RtBreakPred should_break, RtBreakDestroy destroy, void *user)
+{
+	if (!base || stride == 0 || count <= 0 || !should_break) return count;
+	unsigned char *arr = (unsigned char *)base;
+	for (int i = 0; i < count; ) {
+		void *entry = arr + (size_t)i * stride;
+		if (!should_break(entry, user)) { ++i; continue; }
+		if (destroy) destroy(entry, user);
+		/* The last entry moves into this slot, so i stays put. */
+		--count;
+		if (i != count)
+			memcpy(entry, arr + (size_t)count * stride, stride);
+	}
+	return count;
+}
+
+/*
+ * 2D joint break monitor -- the last mile for Joint2D.break_force /
+ * .break_torque, which were authored, serialised, in the Inspector and read
+ * by nothing.
+ *
+ * Box2D has no breakable joint: the reaction force is readable and destroying
+ * the joint is the caller's job.  This mirrors rt_monitor_configurable_joints
+ * on the 3D side, including its comparison: the authored threshold is a FORCE
+ * (N) and Box2D reports the constraint force directly, so no dt scaling is
+ * needed here -- unlike the 3D path, which compares an applied IMPULSE
+ * against break_force * dt.
+ *
+ * Runs immediately AFTER jce_physics2d_step so the force it reads is the one
+ * the step just applied.  Gated on joint2d_count, so a scene with no 2D
+ * joints is byte-identical.
+ */
+static bool rt_joint2d_breaks(void *entry, void *user)
+{
+	Joint2DEntry *je = (Joint2DEntry *)entry;
+	JceRuntime *rt = (JceRuntime *)user;
+	if (je->break_force > 0.0f) {
+		float f = jce_physics2d_joint_get_force(rt->physics2d, je->handle);
+		if (f > je->break_force) return true;
+	}
+	if (je->break_torque > 0.0f) {
+		float tq = jce_physics2d_joint_get_torque(rt->physics2d, je->handle);
+		if (tq < 0.0f) tq = -tq;
+		if (tq > je->break_torque) return true;
+	}
+	return false;
+}
+
+static void rt_joint2d_destroy(void *entry, void *user)
+{
+	Joint2DEntry *je = (Joint2DEntry *)entry;
+	JceRuntime *rt = (JceRuntime *)user;
+	LOG_INFO(LOG_TAG, "2D joint broke on entity %llu",
+	         (unsigned long long)je->entity);
+	jce_physics2d_joint_destroy(rt->physics2d, je->handle);
+}
+
+void rt_monitor_joints2d(JceRuntime *rt)
+{
+	if (!rt || !rt->physics2d || rt->joint2d_count == 0) return;
+	/* The authored threshold is a FORCE and Box2D reports the constraint force
+	 * directly, so unlike the 3D path there is no dt scaling here. */
+	rt->joint2d_count = rt_break_sweep(rt->joints2d, sizeof(rt->joints2d[0]),
+	                                   rt->joint2d_count, rt_joint2d_breaks,
+	                                   rt_joint2d_destroy, rt);
+}
+
+/* The 2D world accessor lives HERE and not beside jce_runtime_physics() in
+ * jce_runtime.c, which is one of the size-frozen files: it sits 36 lines under
+ * its baseline only because the trail pass was split out of it, and spending
+ * that slack on a five-line accessor would turn the ratchet the wrong way.
+ * This file owns the 2D body build path anyway. */
+JCE_API JcePhysics2D *JCE_CALL jce_runtime_physics2d(const JceRuntime *rt)
+{
+	return rt ? rt->physics2d : NULL;
 }

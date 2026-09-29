@@ -176,11 +176,27 @@ void fv_render_render_pipeline(FvTab *tab)
     if (toggle_row("viewer.rp.feature.csm",           &d.enable_csm))            ms->modified = true;
     if (toggle_row("viewer.rp.feature.ssao",          &d.enable_ssao))           ms->modified = true;
     if (toggle_row("viewer.rp.feature.ssr",           &d.enable_ssr))            ms->modified = true;
+    if (toggle_row("viewer.rp.feature.ssgi",          &d.enable_ssgi))           ms->modified = true;
     if (toggle_row("viewer.rp.feature.taa",           &d.enable_taa))            ms->modified = true;
     if (toggle_row("viewer.rp.feature.bloom",         &d.enable_bloom))          ms->modified = true;
     if (toggle_row("viewer.rp.feature.volfog",        &d.enable_volumetric_fog)) ms->modified = true;
     if (toggle_row("viewer.rp.feature.gpu_particles", &d.enable_gpu_particles))  ms->modified = true;
     if (toggle_row("viewer.rp.feature.motion_blur",   &d.enable_motion_blur))    ms->modified = true;
+    if (d.enable_motion_blur) {
+        /* The asset stores 0 for "not stated"; showing 0 in a slider whose
+         * range starts above it would let an editor round-trip write a value
+         * that means "off" into a pipeline whose checkbox says on. */
+        if (d.motion_blur_intensity <= 0.0f)
+            d.motion_blur_intensity = JCE_RP_MOTION_BLUR_DEFAULT;
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+            jce_editor_i18n("viewer.rp.motion_blur_intensity"));
+        ImGui::NextColumn();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##mbint", &d.motion_blur_intensity,
+                               0.05f, 2.0f, "%.2f"))
+            ms->modified = true;
+        ImGui::NextColumn();
+    }
     if (toggle_row("viewer.rp.feature.cloth",         &d.enable_cloth))          ms->modified = true;
     ImGui::Columns(1);
     ImGui::Spacing();

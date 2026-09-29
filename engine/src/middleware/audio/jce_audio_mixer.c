@@ -376,10 +376,48 @@ static BusSend *send_find(Bus *b, JceAudioBusId dest, bool insert)
     return insert ? empty : NULL;
 }
 
+/* Is `target` reachable by following sends out of `from`?
+ *
+ * Depth-first over the send graph with a visited set, so a ring anywhere in
+ * it terminates rather than being walked forever -- the walk has to be safe
+ * against the very thing it is checking for, because sends already in the
+ * table may themselves form one (they were accepted before this guard
+ * existed). */
+static bool send_reaches(const JceAudioMixer *m, JceAudioBusId from,
+                         JceAudioBusId target, bool *visited)
+{
+    if (from == target) return true;
+    if (from >= MAX_BUSES || visited[from]) return false;
+    visited[from] = true;
+
+    const Bus *b = &m->buses[from];
+    if (!b->alive) return false;
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i) {
+        JceAudioBusId d = b->sends[i].dest;
+        if (d == 0) continue;
+        if (send_reaches(m, d, target, visited)) return true;
+    }
+    return false;
+}
+
 bool jce_audio_mixer_set_send(JceAudioMixer *m, JceAudioBusId src,
                               JceAudioBusId dest, float amount)
 {
     if (!bus_valid(m, src) || !bus_valid(m, dest) || src == dest) return false;
+
+    /* Refuse a send that would close a ring.  `src == dest` above catches
+     * only the one-hop case; A->B plus B->A, and every longer ring, used to
+     * be accepted.  Harmless while nothing routed audio -- resolve_send had
+     * no product caller -- and a graph cycle with no bottom the moment
+     * anything does.  The check is here rather than in the audio backend
+     * because this is the layer that knows the graph; the backend would only
+     * be re-deriving it, and later. */
+    {
+        bool visited[MAX_BUSES];
+        memset(visited, 0, sizeof visited);
+        if (send_reaches(m, dest, src, visited)) return false;
+    }
+
     BusSend *s = send_find(&m->buses[src], dest, true);
     if (!s) return false;                 /* send slots exhausted */
     s->dest   = dest;
@@ -526,12 +564,20 @@ void jce_audio_mixer_duck_advance(JceAudioMixer *m, uint32_t frames,
         Sidechain *sc = &m->buses[i].duck;
         if (!sc->active) continue;
 
-        /* Sample the key bus's level for this block.  Fold its resolved
-         * (mute/solo) gain in so a muted key cannot duck the target. */
+        /* Sample the key bus's level for this block.  `key_peak` reports a
+         * POST-FADER level (jce_audio_bus_get_peak reads the live bus node,
+         * whose gain this mixer pushed), so the key's volume is ALREADY in
+         * the number and must not be applied a second time -- doing so
+         * squares it, which is exact at volume 1.0 and 6 dB wrong at 0.5.
+         * What is not in the number is mute/solo, because a muted bus can
+         * still be metered; gate on it so a muted or solo-excluded key
+         * cannot duck its target.  resolve_volume() returns exactly 0 for
+         * both, which is the gate. */
         float key_peak_lin = key_peak(sc->p.key, user);
         if (key_peak_lin < 0.0f) key_peak_lin = 0.0f;
-        if (bus_valid(m, sc->p.key))
-            key_peak_lin *= jce_audio_mixer_resolve_volume(m, sc->p.key);
+        if (bus_valid(m, sc->p.key) &&
+            jce_audio_mixer_resolve_volume(m, sc->p.key) <= 0.0f)
+            key_peak_lin = 0.0f;
 
         /* Re-derive coefficients for this block length (so a test driving the
          * follower one sample / one block at a time is exact). */

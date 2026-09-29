@@ -107,6 +107,11 @@ float csm_sample_depth(int cascade, vec2 uv)
     return texture2D(s_csmShadow3, uv).r;
 }
 
+// Needs csm_sample_depth (above) and u_shadowQuality / u_csmPenumbra, both of
+// which the INCLUDER declares -- the same contract u_csmParams already has.
+#include "pcss.sh"
+#include "shadow_bias.sh"
+
 vec4 csm_clip_for_cascade(int cascade, vec3 world_pos)
 {
     if      (cascade == 0) return mul(u_csmVP[0], vec4(world_pos, 1.0));
@@ -167,14 +172,25 @@ float sample_csm_shadow(int cascade,
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
-    // Depth bias: constant component + slope-scaled component to handle
-    // grazing-angle shadow acne (parallel-stripe wood-grain pattern).
+    // Depth bias in SHADOW TEXELS of world offset, converted to normalised
+    // depth by this cascade's own scale -- see shadow_bias.sh.  It used to be
+    // a normalised constant times a hand-laddered mix(1,2,cascade), which made
+    // the same number mean 89 mm in cascade 0 and 8969 mm in cascade 3 of the
+    // same frame, and made it move when the project changed Shadow Distance.
     float slope = sin_theta / max(ndotl, 0.1);
-    float depth_bias = inv_map_size * mix(1.0, 2.0, cascade_lerp)
-                     * bias_scale * (1.0 + slope * 4.0);
-    depth_bias = min(depth_bias, 0.01);
+    float depth_bias = jce_shadow_depth_bias(cascade, 1.6, slope, 4.0);
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
+
+    // Contact hardening, on the full tier only -- the same call the meshes
+    // make, so the terrain and the water soften with distance from their
+    // caster exactly as a mesh standing on them does.  Two copies of this
+    // math is how they would come to disagree.
+    if (u_shadowQuality.x >= 1.5)
+    {
+        filter_radius = pcss_filter_radius(cascade, csm_uv, csm_z,
+                                           depth_bias, texel, filter_radius);
+    }
 
     // Shadow filter tier (see u_shadowQuality; mirrors fs_pbr.sc). GLSL-120
     // safety rule: uniform branch selecting between CONSTANT-bound loops —

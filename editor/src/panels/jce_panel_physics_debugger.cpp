@@ -14,6 +14,8 @@
 #include "core/jce_editor_i18n.h"
 #include "core/jce_project_settings.h"
 
+#include <jce/middleware/physics/jce_physics2d.h>
+
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
@@ -153,6 +155,12 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
             ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.bodies"));
             ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.activeContacts"));
         }
+        /* The 2D matrix above has always been configurable; its world was
+         * never reported.  Shown only when a 2D world exists, so a purely 3D
+         * project sees no new row. */
+        if (JcePhysics2D *p2 = jce_editor_play_get_physics2d_world())
+            ImGui::Text("%s: %u", jce_editor_i18n("physicsDebugger.bodies2D"),
+                        jce_physics2d_body_count(p2));
         ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.sleepingBodies"));
         ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.queriesThisFrame"));
     }

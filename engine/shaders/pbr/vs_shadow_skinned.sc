@@ -2,6 +2,7 @@ $input a_position, a_indices, a_weight
 $output v_texcoord0
 
 #include <bgfx_shader.sh>
+#include "shadow_pancake.sh"
 
 float decode_bone_index(float raw_index)
 {
@@ -41,6 +42,10 @@ void main()
                  + a_weight.w * u_model[i3];
 
     vec3 wpos = mul(skinMtx, vec4(a_position, 1.0)).xyz;
-    gl_Position = mul(u_viewProj, vec4(wpos, 1.0));
+    /* Clamped to the near plane, not rejected by it -- see
+     * shadow_pancake.sh.  A caster further up-sun than the cascade
+     * box reaches would otherwise be clipped away entirely and the
+     * shadow it owes would be missing. */
+    gl_Position = jce_shadow_pancake(mul(u_viewProj, vec4(wpos, 1.0)));
     v_texcoord0 = vec2(0.0, 0.0);
 }

@@ -470,7 +470,7 @@ void fv_render_code(FvTab *tab)
                 ED_FREE(tab->content);
                 tab->content = buf;
                 tab->content_len = n;
-                tab->file_size = (long)total;
+                tab->file_size = (uint64_t)total;
                 fv_code_invalidate_index(tab);
                 /* Refresh edit buffer too */
                 if (tab->edit_buf) {
@@ -537,8 +537,8 @@ void fv_render_code(FvTab *tab)
                 (double)tab->file_size / 1024.0, src_len);
         else
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                jce_editor_i18n_or("viewer.code.sizeBytes", "  %ld bytes"), tab->file_size);
-        if ((long)tab->content_len < tab->file_size && !tab->edit_mode) {
+                jce_editor_i18n_or("viewer.code.sizeBytes", "  %ld bytes"), (long)tab->file_size);
+        if ((uint64_t)tab->content_len < tab->file_size && !tab->edit_mode) {
             ImGui::SameLine();
             ImGui::TextColored(JCE_COLOR_TEXT_WARNING, "%s",
                 jce_editor_i18n_or("viewer.code.truncated", "(truncated preview)"));

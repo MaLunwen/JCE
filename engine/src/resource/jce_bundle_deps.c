@@ -10,6 +10,7 @@
 #include <cjson/cJSON.h>
 
 #include <stddef.h>
+#include <stdio.h>              /* snprintf */
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,9 +33,20 @@ static const char *const kAssetKeys[] = {
     "terrainPath",     "terrain_path",
     "prefabPath",      "prefab_path",
     "hdrPath",         "hdr_path",
+    /* Shader Graph blobs.  Their absence here is why a graph material
+     * rendered in the editor and reverted to stock PBR when shipped:
+     * the .mat.json travelled and the two .bin files it names did not,
+     * so the runtime logged "custom shader blob(s) missing" about a
+     * look an artist had authored. */
+    "customProgramVs", "customProgramFs",
+    "shaderGraph",
     "animationPath",   "animation_path",
     "layerAlbedoPath0","layerAlbedoPath1",
     "layerAlbedoPath2","layerAlbedoPath3",
+    "layerNormalPath0","layerNormalPath1",
+    "layerNormalPath2","layerNormalPath3",
+    "layerMaskPath0",  "layerMaskPath1",
+    "layerMaskPath2",  "layerMaskPath3",
     /* MeshRenderer per-entity texture overrides (ser_mesh_renderer). */
     "albedoTex",       "mrTex",            "normalTex",
     "aoTex",           "emissiveTex",
@@ -60,8 +72,10 @@ static const char *const kAssetKeys[] = {
     "lutPath",         "lut_path",
     /* Terrain/vegetation/water component textures & masks whose spellings are
      * component-specific and not covered by the generic texture keys above:
-     *   FoliageCluster.alphaTex, Water.dataTex, VegetationScatter.densityMaskPath */
+     *   FoliageCluster.alphaTex, Water.dataTex, VegetationScatter masks/cooked
+     *   placements. */
     "alphaTex",        "dataTex",          "densityMaskPath",
+    "bakedPlacementPath",
     /* SkeletalAnimator retarget SOURCE rig — a second model/skeleton loaded by
      * path just like skeletonPath, so its GLB + .anim.json clips recurse in. */
     "retargetSource",
@@ -69,6 +83,13 @@ static const char *const kAssetKeys[] = {
      * loader-accepted aliases — see jce_pbr_material_load_json and the
      * editor's try_resolve_texture_from_material_json).  These appear
      * inside material files which the packer re-scans recursively. */
+    /* MATERIAL VARIANT: a .mat.json may name the material it inherits from.
+     * Without this the packer ships the child and not its parent, and the
+     * shipped game renders the child's OVERRIDES on top of the defaults --
+     * a look that is right in the editor and wrong in the exe, which is the
+     * same failure the two customProgram keys above were added for.  The
+     * descriptor recursion follows it, so a whole chain travels. */
+    "parent",
     "albedoMap",       "baseColorMap",     "diffuseMap",
     "mainTexture",     "metallicRoughnessMap", "metallicMap",
     "normalMap",       "aoMap",            "occlusionMap",
@@ -289,6 +310,31 @@ static void walk(const cJSON *node, const cJSON *parent_obj,
                 jce_bundle_deps_is_asset_key(key))
             {
                 list_push(out, child->valuestring, sibling_bundle_tag(node));
+                /* A Shader Graph blob is one file per BACKEND next to the
+                 * bare name the .mat.json stores, exactly as the engine's own
+                 * shaders are (`fs_pbr_dx11.bin`, `_glsl`, `_spv`).  Shipping
+                 * only the name that is written down would ship one backend's
+                 * bytecode and link-fail on every other -- the same defect as
+                 * not shipping it at all, one machine later.  Missing
+                 * variants are skipped by the packer, so listing all six
+                 * costs nothing when the editor compiled fewer. */
+                if (key && (strcmp(key, "customProgramVs") == 0 ||
+                            strcmp(key, "customProgramFs") == 0)) {
+                    static const char *const kSfx[] = {
+                        "dx11", "spv", "glsl", "essl", "essl1", "mtl"
+                    };
+                    char stem[512];
+                    snprintf(stem, sizeof(stem), "%s", child->valuestring);
+                    char *dot = strrchr(stem, '.');
+                    if (dot && strcmp(dot, ".bin") == 0) {
+                        *dot = 0;
+                        for (size_t si = 0; si < sizeof kSfx / sizeof kSfx[0]; si++) {
+                            char v[600];
+                            snprintf(v, sizeof(v), "%s_%s.bin", stem, kSfx[si]);
+                            list_push(out, v, sibling_bundle_tag(node));
+                        }
+                    }
+                }
             }
             if (key && cJSON_IsObject(child) &&
                 strcmp(key, "streaming") == 0)

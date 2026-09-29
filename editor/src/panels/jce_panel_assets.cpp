@@ -595,12 +595,25 @@ void execute_clipboard_paste(void)
 
         if (s_assets.clipboard_cut) {
             if (desired == cp) continue; /* same folder no-op */
-            if (!jce_fs_host_rename(cp.c_str(), desired.c_str())) {
+            /* MOVE REPOINTS, exactly as rename does.  This was a bare
+             * jce_fs_host_rename plus a "Moved" line: every asset reference in
+             * this engine is a raw path string, so reorganising the content
+             * browser -- the weekly "move all the props into Assets/Props/" --
+             * silently broke every scene, prefab and material naming those
+             * files, with a green console line to say it had gone well. */
+            int upd = 0, unrep = 0;
+            if (!jce_assetdb_rename_asset(cp.c_str(), desired.c_str(),
+                                          &upd, &unrep)) {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                     "Move failed: '%s'", fname.c_str());
                 continue;
             }
             jce_editor_console_log("Moved '%s'", fname.c_str());
+            if (upd || unrep)
+                jce_editor_console_log_level(
+                    unrep ? JCE_CONSOLE_WARNING : JCE_CONSOLE_INFO,
+                    "  references: %d file(s) repointed, %d not repaired",
+                    upd, unrep);
             s_assets.entry_flash[desired] = 0.6f;
         } else {
             char unique[1200];
@@ -650,6 +663,15 @@ void collect_selected_from_view_for_deletion(
                 s_assets.pending_delete_dir_count++;
         }
     }
+    /* WHO USES THIS?  Deleting is legitimate; deleting SILENTLY is what makes
+     * it dangerous, because every asset reference here is a raw path string
+     * and nothing else in the editor can answer the question -- there is no
+     * Find References command anywhere.  Counted once, when the dialog is
+     * raised, so the confirm can say it and the user can back out. */
+    s_assets.pending_delete_refs = 0;
+    for (const std::string &pth : s_assets.pending_delete_paths)
+        s_assets.pending_delete_refs +=
+            jce_assetdb_find_references(pth.c_str(), NULL, 0);
     s_assets.show_delete_confirm = true;
 }
 
@@ -831,9 +853,27 @@ static void draw_asset_delete_dialog(void)
                                            s_assets.pending_delete_dir_count);
                     ImGui::PopStyleColor();
                 }
+                /* The count that decides whether this is safe.  Without it the
+                 * dialog asks "are you sure" about a question the user has no
+                 * way to answer. */
+                if (s_assets.pending_delete_refs > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
+                    ImGui::TextWrapped("%s: %d",
+                        jce_editor_i18n_or("assetBrowser.deleteRefWarning",
+                            "Referenced by other files -- those references "
+                            "will break"),
+                        s_assets.pending_delete_refs);
+                    ImGui::PopStyleColor();
+                }
             });
 
         if (r == jce_modal::CONFIRM) {
+            if (s_assets.pending_delete_refs > 0)
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "Deleting asset(s) referenced by %d file(s) -- those "
+                    "references are now broken and nothing will repair them",
+                    s_assets.pending_delete_refs);
             for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
                 jce_fs_host_remove_recursive(s_assets.pending_delete_paths[di].c_str());
                 jce_editor_console_log("Deleted '%s'",

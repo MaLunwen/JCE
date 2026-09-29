@@ -38,8 +38,16 @@
 #pragma GCC diagnostic ignored "-Wshadow"
 #pragma GCC diagnostic ignored "-Wdouble-promotion"
 #endif
+/* Upstream defines its options inside the declaration guard. Include that
+ * first, then configure only its implementation through the wrapper. */
+#include <minimp4.h>
+#undef MP4D_AVC_SUPPORTED
+#undef MP4D_HEVC_SUPPORTED
+#define MP4D_AVC_SUPPORTED 0
+#define MP4D_HEVC_SUPPORTED 0
 #define MINIMP4_IMPLEMENTATION
-#include "middleware/video/third_party/minimp4.h"
+#include <minimp4.h>
+#undef MINIMP4_IMPLEMENTATION
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #elif defined(__clang__)
@@ -48,10 +56,20 @@
 #pragma GCC diagnostic pop
 #endif
 
+#include "jce_mp4_source.h"
+
 typedef struct {
-    const unsigned char *data;
-    size_t size;
+    JceReadSource *source;
+    uint64_t size;
+    unsigned char *metadata;
+    size_t metadata_size;
+    uint64_t metadata_offset;
 } JceMp4Blob;
+
+/* Private dispatch values for codecs without an MPEG-4 object type. */
+#define JCE_MP4_OBJECT_AV1  0xA1u
+#define JCE_MP4_OBJECT_VP9  0xA2u
+#define JCE_MP4_OBJECT_OPUS 0xADu
 
 /* ── Fragmented MP4 (moof / traf / trun) sample index ───────────────── *
  *
@@ -75,6 +93,7 @@ typedef struct {
     uint64_t offset;     /* absolute byte offset of the sample payload */
     uint32_t size;
     uint64_t dts;        /* track timescale units */
+    int64_t  cts_offset; /* signed composition offset, not decode order */
     uint32_t duration;   /* track timescale units */
     bool     sync;       /* random-access point */
 } JceMp4FragSample;
@@ -88,6 +107,7 @@ typedef struct {
     uint32_t          trex_duration; /* mvex/trex per-track defaults */
     uint32_t          trex_size;
     uint32_t          trex_flags;
+    int64_t           pts_base;
 } JceMp4FragTrack;
 
 struct JceMp4Parser {
@@ -96,12 +116,37 @@ struct JceMp4Parser {
     int         video_track_idx;
     int         audio_track_idx;
     JceMp4Info  info;
+    /* Reconstruct progressive stts timestamps beyond minimp4's 32-bit limit. */
+    uint64_t   *video_dts64;
+    uint64_t   *audio_dts64;
+    uint64_t   *video_pts64;
+    bool       *borrowed_config;
+    const unsigned char *sync_samples;
+    uint32_t sync_count;
+    bool sync_present;
 
     /* Present only for fragmented files; parallel to mp4.track[]. */
     bool             fragmented;
     uint32_t         frag_count;
     JceMp4FragTrack *frag;
 };
+
+static uint64_t *jce_mp4_build_dts64(const MP4D_track_t *track)
+{
+    uint64_t *index;
+    uint64_t tick = 0u;
+    uint32_t i;
+    if (!track || !track->duration || track->sample_count == 0u
+        || track->sample_count > JCE_MP4_FRAG_MAX_SAMPLES)
+        return NULL;
+    index = (uint64_t *)JCE_MALLOC((size_t)track->sample_count * sizeof(*index));
+    if (!index) return NULL;
+    for (i = 0u; i < track->sample_count; ++i) {
+        index[i] = tick;
+        tick += track->duration[i];
+    }
+    return index;
+}
 
 #define JCE_MP4_BOX(a, b, c, d) \
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | \
@@ -162,6 +207,192 @@ static bool jce_mp4_box_at(const unsigned char *d, uint64_t off, uint64_t end,
     *out_body = body;
     *out_next = off + size;
     return true;
+}
+
+static bool jce_mp4_find_box(const unsigned char *d, uint64_t start,
+                            uint64_t end, uint32_t wanted,
+                            uint64_t *body, uint64_t *next)
+{
+    uint32_t type;
+    while (start < end && jce_mp4_box_at(d, start, end, &type, body, next)) {
+        if (type == wanted) return true;
+        start = *next;
+    }
+    return false;
+}
+
+/* Extend pristine minimp4 through the JCE wrapper, never through vendor
+ * patches. Sample tables remain upstream-owned. Codec records are borrowed
+ * from the same immutable input blob as the compressed samples. */
+static bool jce_mp4_apply_sample_entry(const unsigned char *d, uint64_t body,
+                                       uint64_t end, uint32_t type,
+                                       MP4D_track_t *track, bool *borrowed)
+{
+    uint32_t config, object;
+    uint64_t header = 78u, cb, ce;
+    unsigned min_config;
+    switch (type) {
+        case JCE_MP4_BOX('a','v','c','1'):
+        case JCE_MP4_BOX('a','v','c','3'):
+            config = JCE_MP4_BOX('a','v','c','C');
+            object = MP4_OBJECT_TYPE_AVC; min_config = 7u; break;
+        case JCE_MP4_BOX('h','v','c','1'):
+        case JCE_MP4_BOX('h','e','v','1'):
+            config = JCE_MP4_BOX('h','v','c','C');
+            object = MP4_OBJECT_TYPE_HEVC; min_config = 23u; break;
+        case JCE_MP4_BOX('a','v','0','1'):
+            config = JCE_MP4_BOX('a','v','1','C');
+            object = JCE_MP4_OBJECT_AV1; min_config = 4u; break;
+        case JCE_MP4_BOX('v','p','0','9'):
+            config = JCE_MP4_BOX('v','p','c','C');
+            object = JCE_MP4_OBJECT_VP9; min_config = 12u; break;
+        case JCE_MP4_BOX('O','p','u','s'):
+            config = JCE_MP4_BOX('d','O','p','s'); header = 28u;
+            object = JCE_MP4_OBJECT_OPUS; min_config = 11u; break;
+        default: return true;
+    }
+    if (end - body < header ||
+        !jce_mp4_find_box(d, body + header, end, config, &cb, &ce) ||
+        ce - cb < min_config || ce - cb > UINT32_MAX || track->dsi)
+        return false;
+    if (header == 78u) {
+        track->SampleDescription.video.width =
+            ((unsigned)d[body + 24u] << 8) | d[body + 25u];
+        track->SampleDescription.video.height =
+            ((unsigned)d[body + 26u] << 8) | d[body + 27u];
+    } else {
+        track->SampleDescription.audio.channelcount = d[cb + 1u];
+        /* Opus always decodes at 48 kHz; dOps InputSampleRate is advisory. */
+        track->SampleDescription.audio.samplerate_hz = 48000u;
+    }
+    track->object_type_indication = object;
+    track->dsi = (unsigned char *)(d + cb);
+    track->dsi_bytes = (unsigned)(ce - cb);
+    *borrowed = true;
+    return true;
+}
+
+static bool jce_mp4_apply_codec_records(JceMp4Parser *parser)
+{
+    static const uint32_t path[] = {
+        JCE_MP4_BOX('m','d','i','a'), JCE_MP4_BOX('m','i','n','f'),
+        JCE_MP4_BOX('s','t','b','l'), JCE_MP4_BOX('s','t','s','d')
+    };
+    const unsigned char *d = parser->blob.metadata;
+    uint64_t mb, me, off, body, next;
+    uint32_t type, index = 0u;
+    if (!jce_mp4_find_box(d, 0u, parser->blob.metadata_size,
+                          JCE_MP4_BOX('m','o','o','v'), &mb, &me)) return false;
+    parser->borrowed_config = (bool *)JCE_CALLOC(parser->mp4.track_count,
+                                                sizeof(bool));
+    if (!parser->borrowed_config) return false;
+    off = mb;
+    while (off < me && jce_mp4_box_at(d, off, me, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('t','r','a','k')) {
+            uint64_t b = body, e = next, sb, se;
+            unsigned level;
+            if (index >= parser->mp4.track_count) return false;
+            for (level = 0u; level < sizeof(path) / sizeof(path[0]); ++level) {
+                if (!jce_mp4_find_box(d, b, e, path[level], &sb, &se)) break;
+                b = sb; e = se;
+            }
+            if (level == sizeof(path) / sizeof(path[0]) && e - b >= 8u &&
+                jce_mp4_rd_u32(d + b + 4u) > 0u) {
+                if (!jce_mp4_box_at(d, b + 8u, e, &type, &sb, &se) ||
+                    !jce_mp4_apply_sample_entry(d, sb, se, type,
+                        &parser->mp4.track[index], &parser->borrowed_config[index]))
+                    return false;
+            }
+            ++index;
+        }
+        off = next;
+    }
+    return index == parser->mp4.track_count;
+}
+
+/* CTTS is decode-order indexed; decoded pictures return their own PTS.
+ * Keep DTS for seek indexing and normalize the presentation origin once. */
+static bool jce_mp4_build_video_pts(JceMp4Parser *parser)
+{
+    static const uint32_t path[] = {
+        JCE_MP4_BOX('m','d','i','a'), JCE_MP4_BOX('m','i','n','f'),
+        JCE_MP4_BOX('s','t','b','l')
+    };
+    const unsigned char *d = parser->blob.metadata;
+    uint64_t mb, me, pos, body, next;
+    uint32_t type, index = 0u, count;
+    if (parser->video_track_idx < 0) return true;
+    count = parser->mp4.track[parser->video_track_idx].sample_count;
+    if (!count) return true;
+    if (!parser->video_dts64) return false;
+    parser->video_pts64 = (uint64_t *)JCE_MALLOC((size_t)count * sizeof(uint64_t));
+    if (!parser->video_pts64) return false;
+    memcpy(parser->video_pts64, parser->video_dts64, (size_t)count * sizeof(uint64_t));
+    if (!jce_mp4_find_box(d, 0u, parser->blob.metadata_size,
+        JCE_MP4_BOX('m','o','o','v'), &mb, &me)) return false;
+    pos = mb;
+    while (pos < me && jce_mp4_box_at(d, pos, me, &type, &body, &next)) {
+        if (type == JCE_MP4_BOX('t','r','a','k') && index++ == (uint32_t)parser->video_track_idx) {
+            uint64_t b = body, e = next, cb, ce;
+            unsigned level;
+            for (level = 0u; level < 3u; ++level) {
+                if (!jce_mp4_find_box(d, b, e, path[level], &cb, &ce)) return false;
+                b = cb; e = ce;
+            }
+            if (jce_mp4_find_box(d, b, e, JCE_MP4_BOX('c','t','t','s'), &cb, &ce)) {
+                if (!jce_mp4_composition_index(parser->video_dts64, count,
+                    d + cb, (size_t)(ce - cb), parser->video_pts64)) return false;
+            }
+            return true;
+        }
+        pos = next;
+    }
+    return false;
+}
+
+static void jce_mp4_cache_sync(JceMp4Parser *parser)
+{
+    static const uint32_t path[] = {
+        JCE_MP4_BOX('m','d','i','a'), JCE_MP4_BOX('m','i','n','f'),
+        JCE_MP4_BOX('s','t','b','l'), JCE_MP4_BOX('s','t','s','s')
+    };
+    const unsigned char *d = parser->blob.metadata;
+    uint64_t mb, me, off, b, e, next;
+    uint32_t type, index = 0u;
+    if (parser->video_track_idx < 0 || !jce_mp4_find_box(d,0u,
+        parser->blob.metadata_size,JCE_MP4_BOX('m','o','o','v'),&mb,&me)) return;
+    off=mb;
+    while (off < me && jce_mp4_box_at(d,off,me,&type,&b,&next)) {
+        if (type == JCE_MP4_BOX('t','r','a','k') && index++ == (uint32_t)parser->video_track_idx) {
+            unsigned level;
+            e=next;
+            for (level=0u; level<4u; ++level) {
+                uint64_t sb,se;
+                if (!jce_mp4_find_box(d,b,e,path[level],&sb,&se)) return;
+                b=sb; e=se;
+            }
+            if (e-b < 8u) return;
+            parser->sync_count=jce_mp4_rd_u32(d+b+4u);
+            if (parser->sync_count > (e-b-8u)/4u) return;
+            parser->sync_samples=d+b+8u;
+            parser->sync_present=true;
+            return;
+        }
+        off=next;
+    }
+}
+
+static void jce_mp4_close_demux(JceMp4Parser *parser)
+{
+    unsigned i;
+    if (parser->borrowed_config) {
+        for (i = 0u; i < parser->mp4.track_count; ++i) {
+            if (parser->borrowed_config[i]) parser->mp4.track[i].dsi = NULL;
+        }
+        JCE_FREE(parser->borrowed_config);
+        parser->borrowed_config = NULL;
+    }
+    MP4D_close(&parser->mp4);
 }
 
 /* Collect track_IDs in moov order, so index i in mp4.track[] maps to
@@ -431,6 +662,7 @@ static void jce_mp4_frag_read_traf(const unsigned char *d,
                 uint32_t dur = def_duration;
                 uint32_t sz  = def_size;
                 uint32_t fl  = def_flags;
+                int64_t cts_offset = 0;
 
                 if (tr_flags & 0x000100u) {
                     if (p + 4u > next) break;
@@ -445,7 +677,10 @@ static void jce_mp4_frag_read_traf(const unsigned char *d,
                     fl = jce_mp4_rd_u32(d + p); p += 4u;
                 }
                 if (tr_flags & 0x000800u) {                   /* cts offset */
+                    uint32_t raw;
                     if (p + 4u > next) break;
+                    raw = jce_mp4_rd_u32(d + p);
+                    cts_offset = d[body] ? (int64_t)(int32_t)raw : (int64_t)raw;
                     p += 4u;
                 }
                 if (i == 0u && have_first) {
@@ -456,9 +691,11 @@ static void jce_mp4_frag_read_traf(const unsigned char *d,
                     break;                 /* truncated / lying fragment */
                 }
 
+                if (dts > (uint64_t)INT64_MAX - UINT32_MAX) break;
                 s.offset   = data;
                 s.size     = sz;
                 s.dts      = dts;
+                s.cts_offset = cts_offset;
                 s.duration = dur;
                 /* §8.8.3.1: bit 16 is sample_is_non_sync_sample, and
                  * sample_depends_on == 2 means "depends on nothing" (an
@@ -490,7 +727,7 @@ static void jce_mp4_frag_read_traf(const unsigned char *d,
  * recovered. */
 static bool jce_mp4_frag_build(JceMp4Parser *parser)
 {
-    const unsigned char *d = parser->blob.data;
+    const unsigned char *d = parser->blob.metadata;
     uint64_t size = (uint64_t)parser->blob.size;
     uint64_t off = 0u, body = 0u, next = 0u;
     uint32_t type = 0u;
@@ -512,7 +749,7 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
 
     /* Cheap pre-scan: no moof means nothing to do, and this must be decided
      * before any allocation so progressive files pay nothing. */
-    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+    while (off < size && jce_mp4_source_box(parser->blob.source, off, &type, &body, &next)) {
         if (type == JCE_MP4_BOX('m', 'o', 'o', 'f')) {
             saw_moof = true;
             break;
@@ -524,7 +761,7 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
     }
     off = 0u;
 
-    n_ids = jce_mp4_frag_track_ids(d, size, ids, 64u);
+    n_ids = jce_mp4_frag_track_ids(d, parser->blob.metadata_size, ids, 64u);
     if (n_ids == 0u) {
         return false;
     }
@@ -544,7 +781,7 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
         parser->frag[i].track_id = ids[i];
     }
 
-    jce_mp4_frag_read_trex(d, size, parser->frag, n_ids);
+    jce_mp4_frag_read_trex(d, parser->blob.metadata_size, parser->frag, n_ids);
 
     /* Hybrid layout (ffmpeg -movflags +frag_keyframe WITHOUT +empty_moov):
      * moov/stbl describes the first run of samples and the moofs describe the
@@ -568,6 +805,8 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
             smp.offset   = (uint64_t)o;
             smp.size     = (uint32_t)fb;
             smp.dts      = (uint64_t)ts;
+            smp.cts_offset = (int)i == parser->video_track_idx && parser->video_pts64
+                ? (int64_t)parser->video_pts64[s] - (int64_t)ts : 0;
             smp.duration = du;
             /* stbl sync flags are not exposed by minimp4; keyframe_count is
              * the only consumer of this bit and it is advisory. */
@@ -580,22 +819,31 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
         }
     }
 
-    while (off < size && jce_mp4_box_at(d, off, size, &type, &body, &next)) {
+    while (off < size && jce_mp4_source_box(parser->blob.source, off, &type, &body, &next)) {
         if (type == JCE_MP4_BOX('m', 'o', 'o', 'f')) {
-            uint64_t t = body, tb = 0u, tn = 0u;
+            const size_t header = (size_t)(body-off);
+            size_t length;
+            unsigned char *fragment;
+            uint64_t t, tb = 0u, tn = 0u;
             uint32_t tt = 0u;
-            /* Reset per moof: the "end of the previous track fragment's data"
-             * base rule is scoped to the enclosing moof. */
             uint64_t moof_data_end = 0u;
-            saw_moof = true;
-            while (t < next && jce_mp4_box_at(d, t, next, &tt, &tb, &tn)) {
-                if (tt == JCE_MP4_BOX('t', 'r', 'a', 'f')) {
-                    jce_mp4_frag_read_traf(d, tb, tn, off, size,
-                                           parser->frag, n_ids,
-                                           &moof_data_end, &total, total_cap);
-                }
+            if (next-off > 4u*1024u*1024u) break;
+            length = (size_t)(next-off);
+            fragment = JCE_MALLOC(length);
+            if (!fragment) break;
+            if (jce_read_source_read_at(parser->blob.source,off,fragment,length) != length) {
+                JCE_FREE(fragment);
+                break;
+            }
+            t = header;
+            while (t < length && jce_mp4_box_at(fragment,t,length,&tt,&tb,&tn)) {
+                if (tt == JCE_MP4_BOX('t','r','a','f'))
+                    jce_mp4_frag_read_traf(fragment,tb,tn,off,size,
+                                           parser->frag,n_ids,&moof_data_end,
+                                           &total,total_cap);
                 t = tn;
             }
+            JCE_FREE(fragment);
         }
         off = next;
     }
@@ -614,12 +862,14 @@ static bool jce_mp4_frag_build(JceMp4Parser *parser)
             continue;
         }
         base = ft->samples[0].dts;
-        if (base == 0u) {
-            continue;
-        }
+        ft->pts_base = INT64_MAX;
         for (k = 0u; k < ft->count; ++k) {
             ft->samples[k].dts = (ft->samples[k].dts >= base)
                                      ? (ft->samples[k].dts - base) : 0u;
+            {
+                int64_t pts = (int64_t)ft->samples[k].dts + ft->samples[k].cts_offset;
+                if (pts < ft->pts_base) ft->pts_base = pts;
+            }
         }
     }
 
@@ -689,30 +939,31 @@ static void jce_mp4_set_error(JceMp4Info *out, const char *msg)
     snprintf(out->error, sizeof(out->error), "%s", msg);
 }
 
+static size_t jce_mp4_blob_read(const JceMp4Blob *blob, uint64_t offset,
+                                void *buffer, size_t bytes)
+{
+    if (offset >= blob->metadata_offset &&
+        offset-blob->metadata_offset <= blob->metadata_size &&
+        bytes <= blob->metadata_size-(size_t)(offset-blob->metadata_offset)) {
+        memcpy(buffer,blob->metadata+(size_t)(offset-blob->metadata_offset),bytes);
+        return bytes;
+    }
+    return jce_read_source_read_at(blob->source,offset,buffer,bytes);
+}
+
 static int jce_mp4_read_cb(int64_t offset, void *buffer, size_t bytes, void *token)
 {
-    const JceMp4Blob *blob = (const JceMp4Blob *)token;
-    size_t off = 0u;
-
-    if (!blob || !blob->data || !buffer) {
-        return -1;
-    }
-    if (offset < 0) {
-        return -1;
-    }
-
-    off = (size_t)offset;
-    if ((int64_t)off != offset) {
-        return -1;
-    }
-    if (off > blob->size) {
-        return -1;
-    }
-    if (bytes > (blob->size - off)) {
-        return -1;
-    }
-
-    memcpy(buffer, blob->data + off, bytes);
+    const JceMp4Blob *blob = token;
+    unsigned char type[4];
+    uint64_t off;
+    if (!blob || !buffer || offset < 0) return -1;
+    off = (uint64_t)offset;
+    if (off > blob->size || bytes > blob->size-off ||
+        jce_mp4_blob_read(blob,off,buffer,bytes) != bytes) return -1;
+    /* Normalize only the unsupported ctts version byte in JCE's callback. */
+    if (bytes == 1u && off >= 4u && *(unsigned char *)buffer == 1u &&
+        jce_mp4_blob_read(blob,off-4u,type,4u) == 4u &&
+        memcmp(type,"ctts",4u) == 0) *(unsigned char *)buffer = 0u;
     return 0;
 }
 
@@ -746,13 +997,13 @@ static void jce_mp4_codec_from_object_type(unsigned oti, char out_codec[5])
         case MP4_OBJECT_TYPE_HEVC:
             snprintf(out_codec, 5u, "hvc1");
             break;
-        case MP4_OBJECT_TYPE_AV1:
+        case JCE_MP4_OBJECT_AV1:
             snprintf(out_codec, 5u, "av01");
             break;
-        case MP4_OBJECT_TYPE_VP9:
+        case JCE_MP4_OBJECT_VP9:
             snprintf(out_codec, 5u, "vp09");
             break;
-        case MP4_OBJECT_TYPE_OPUS:
+        case JCE_MP4_OBJECT_OPUS:
             snprintf(out_codec, 5u, "opus");
             break;
         case 0x20:
@@ -796,32 +1047,27 @@ static bool jce_mp4_fill_info(const MP4D_demux_t *mp4,
 static bool jce_mp4_get_audio_track_info_internal(const MP4D_track_t *audio_track,
                                                   JceMp4AudioTrackInfo *out_info);
 
-JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
+JceMp4Parser *jce_mp4_parser_open_source(JceReadSource *source,
                                          JceMp4Info *out_info)
 {
     JceMp4Parser *parser;
-
-    if (out_info) {
-        memset(out_info, 0, sizeof(*out_info));
-    }
-
-    if (!data || size < 8u) {
-        if (out_info) {
-            jce_mp4_set_error(out_info, "input is empty or too small");
-        }
+    uint64_t size = jce_read_source_size(source);
+    if (out_info) memset(out_info,0,sizeof(*out_info));
+    if (!source || size < 8u) {
+        jce_mp4_set_error(out_info,"input is empty or too small");
         return NULL;
     }
-
-    parser = (JceMp4Parser *)JCE_CALLOC(1u, sizeof(*parser));
-    if (!parser) {
-        if (out_info) {
-            jce_mp4_set_error(out_info, "out of memory");
-        }
-        return NULL;
-    }
-
-    parser->blob.data = (const unsigned char *)data;
+    parser = JCE_CALLOC(1u,sizeof(*parser));
+    if (!parser) return NULL;
+    parser->blob.source = jce_read_source_acquire(source);
     parser->blob.size = size;
+    parser->blob.metadata = jce_mp4_source_moov(source,
+        &parser->blob.metadata_offset,&parser->blob.metadata_size);
+    if (!parser->blob.source || !parser->blob.metadata) {
+        jce_mp4_set_error(out_info,"invalid or over-budget MP4 metadata");
+        jce_mp4_parser_close(parser);
+        return NULL;
+    }
     parser->video_track_idx = -1;
     parser->audio_track_idx = -1;
 
@@ -832,7 +1078,13 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
         if (out_info) {
             jce_mp4_set_error(out_info, "invalid MP4 structure");
         }
-        JCE_FREE(parser);
+        jce_mp4_parser_close(parser);
+        return NULL;
+    }
+
+    if (!jce_mp4_apply_codec_records(parser)) {
+        if (out_info) jce_mp4_set_error(out_info, "invalid MP4 codec configuration");
+        jce_mp4_parser_close(parser);
         return NULL;
     }
 
@@ -842,8 +1094,21 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
         if (out_info) {
             *out_info = parser->info;
         }
-        MP4D_close(&parser->mp4);
-        JCE_FREE(parser);
+        jce_mp4_parser_close(parser);
+        return NULL;
+    }
+
+    jce_mp4_cache_sync(parser);
+    if (parser->video_track_idx >= 0)
+        parser->video_dts64 = jce_mp4_build_dts64(
+            &parser->mp4.track[parser->video_track_idx]);
+    if (parser->audio_track_idx >= 0)
+        parser->audio_dts64 = jce_mp4_build_dts64(
+            &parser->mp4.track[parser->audio_track_idx]);
+
+    if (!jce_mp4_build_video_pts(parser)) {
+        if (out_info) jce_mp4_set_error(out_info, "invalid MP4 composition times");
+        jce_mp4_parser_close(parser);
         return NULL;
     }
 
@@ -905,11 +1170,23 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
     return parser;
 }
 
+JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
+                                         JceMp4Info *out_info)
+{
+    JceReadSource *source = jce_read_source_open_memory(data,size,false);
+    JceMp4Parser *parser = jce_mp4_parser_open_source(source,out_info);
+    jce_read_source_close(source);
+    return parser;
+}
+
 void jce_mp4_parser_close(JceMp4Parser *parser)
 {
     if (!parser) {
         return;
     }
+    JCE_FREE(parser->video_dts64);
+    JCE_FREE(parser->audio_dts64);
+    JCE_FREE(parser->video_pts64);
     if (parser->frag) {
         uint32_t i;
         for (i = 0u; i < parser->frag_count; ++i) {
@@ -917,7 +1194,9 @@ void jce_mp4_parser_close(JceMp4Parser *parser)
         }
         JCE_FREE(parser->frag);
     }
-    MP4D_close(&parser->mp4);
+    jce_mp4_close_demux(parser);
+    JCE_FREE(parser->blob.metadata);
+    jce_read_source_close(parser->blob.source);
     JCE_FREE(parser);
 }
 
@@ -1013,7 +1292,8 @@ bool jce_mp4_parser_get_audio_sample(const JceMp4Parser *parser,
 
     out_sample->offset = off64;
     out_sample->size_bytes = frame_bytes;
-    out_sample->timestamp = (uint64_t)timestamp;
+    out_sample->timestamp = parser->audio_dts64
+        ? parser->audio_dts64[sample_index] : (uint64_t)timestamp;
     out_sample->duration = duration;
     return true;
 }
@@ -1038,10 +1318,8 @@ bool jce_mp4_parser_copy_audio_sample(const JceMp4Parser *parser,
         return false;
     }
 
-    memcpy(dst,
-            parser->blob.data + (size_t)sample.offset,
-           sample.size_bytes);
-    return true;
+    return jce_read_source_read_at(parser->blob.source,sample.offset,dst,
+                                    sample.size_bytes) == sample.size_bytes;
 }
 
 static bool jce_mp4_fill_info(const MP4D_demux_t *mp4,
@@ -1130,7 +1408,7 @@ static bool jce_mp4_is_audio_object_type(unsigned oti)
         case MP4_OBJECT_TYPE_AUDIO_ISO_IEC_13818_7_SSR_PROFILE:
         case 0x69: /* MPEG-2 Layer III */
         case 0x6B: /* MPEG-1 Layer III */
-        case MP4_OBJECT_TYPE_OPUS: /* Opus in MP4 */
+        case JCE_MP4_OBJECT_OPUS: /* Opus in MP4 */
             return true;
         default:
             break;
@@ -1464,8 +1742,28 @@ bool jce_mp4_parser_get_video_sample(const JceMp4Parser *parser,
 
     out_sample->offset = off64;
     out_sample->size_bytes = frame_bytes;
-    out_sample->timestamp = (uint64_t)timestamp;
+    out_sample->timestamp = parser->video_dts64
+        ? parser->video_dts64[sample_index] : (uint64_t)timestamp;
     out_sample->duration = duration;
+    return true;
+}
+
+bool jce_mp4_parser_video_presentation_time(const JceMp4Parser *parser,
+                                            uint32_t index, uint64_t *out)
+{
+    const JceMp4FragTrack *track;
+    if (!parser || !out || parser->video_track_idx < 0) return false;
+    track = jce_mp4_frag_track(parser, parser->video_track_idx);
+    if (parser->fragmented && track) {
+        const JceMp4FragSample *sample;
+        if (index >= track->count) return false;
+        sample = &track->samples[index];
+        *out = (uint64_t)((int64_t)sample->dts + sample->cts_offset - track->pts_base);
+        return true;
+    }
+    if (!parser->video_pts64 || index >= parser->mp4.track[parser->video_track_idx].sample_count)
+        return false;
+    *out = parser->video_pts64[index];
     return true;
 }
 
@@ -1489,8 +1787,27 @@ bool jce_mp4_parser_copy_video_sample(const JceMp4Parser *parser,
         return false;
     }
 
-    memcpy(dst,
-           parser->blob.data + (size_t)sample.offset,
-           sample.size_bytes);
+    return jce_read_source_read_at(parser->blob.source,sample.offset,dst,
+                                    sample.size_bytes) == sample.size_bytes;
+}
+
+bool jce_mp4_parser_video_sample_sync(const JceMp4Parser *parser,
+                                       uint32_t index, bool *out_sync)
+{
+    JceMp4SampleInfo info;
+    const JceMp4FragTrack *track;
+    uint32_t lo=0u, hi;
+    if (!out_sync || !jce_mp4_parser_get_video_sample(parser,index,&info)) return false;
+    track=jce_mp4_frag_track(parser,parser->video_track_idx);
+    if (parser->fragmented && track) { *out_sync=track->samples[index].sync; return true; }
+    if (!parser->sync_present) { *out_sync=true; return true; }
+    hi=parser->sync_count;
+    while (lo<hi) {
+        uint32_t mid=lo+(hi-lo)/2u;
+        uint32_t sample=jce_mp4_rd_u32(parser->sync_samples+(size_t)mid*4u);
+        if (sample < index+1u) lo=mid+1u; else hi=mid;
+    }
+    *out_sync=lo<parser->sync_count &&
+        jce_mp4_rd_u32(parser->sync_samples+(size_t)lo*4u)==index+1u;
     return true;
 }

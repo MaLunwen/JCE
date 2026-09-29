@@ -42,8 +42,8 @@ typedef struct {
     float max_path;    /* metres; beyond this the medium is saturated        */
 } JceUnderwaterParams;
 
-JCE_API JceUnderwater *jce_underwater_create(const JcePakArchive *pak);
-JCE_API void           jce_underwater_destroy(JceUnderwater *u);
+JceUnderwater *jce_underwater_create(const JcePakArchive *pak);
+void           jce_underwater_destroy(JceUnderwater *u);
 
 /* Apply absorption to whatever is already in `dst_fb_idx`.
  *
@@ -52,7 +52,7 @@ JCE_API void           jce_underwater_destroy(JceUnderwater *u);
  * the multiply must land before the add, and any other order silently
  * produces `(dst + tint*(1-T)) * T`, which is dimmer and looks like a
  * plausible tuning of the same effect. */
-JCE_API void jce_underwater_render(JceUnderwater *u,
+void jce_underwater_render(JceUnderwater *u,
                                    uint16_t depth_tex_handle,
                                    uint16_t dst_fb_idx,
                                    uint16_t width, uint16_t height,

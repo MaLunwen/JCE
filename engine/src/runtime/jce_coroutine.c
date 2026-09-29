@@ -193,6 +193,21 @@ void JCE_CALL jce_coroutine_system_init(void)
     s_time_seconds = 0.0;
     memset(s_slots, 0, sizeof(s_slots));
 
+    /* Generation starts at 1, never 0.  The public handle is
+     * (generation << 32) | slot and JCE_COROUTINE_INVALID is 0, so a slot 0
+     * with generation 0 packs to 0 -- the failure sentinel.  That made the
+     * FIRST coroutine started after init indistinguishable from a failed
+     * start, and worse: resolve() short-circuits on the sentinel, so
+     * jce_coroutine_is_alive() reported it dead while it ran and
+     * jce_coroutine_cancel() silently did nothing, leaving it running for
+     * the life of the process.
+     *
+     * Found 2026-08-31 by running jce_coroutine_self_test() for the first
+     * time -- it had existed, complete and correct, with no caller anywhere
+     * in the tree.  It catches this on its very first assertion. */
+    for (uint32_t i = 0u; i < JCE_COROUTINE_MAX_ACTIVE; ++i)
+        s_slots[i].generation = 1u;
+
     /* Run after the editor's per-frame work but before user middleware
      * — priority 1000 keeps us well out of the way of P3-B.1 / P3-B.2
      * subsystems that register near priority 0. */
@@ -276,7 +291,7 @@ uint32_t JCE_CALL jce_coroutine_active_count(void)
 
 /* ── Self-test ────────────────────────────────────────────────────── */
 
-#ifndef NDEBUG
+#ifdef JCE_SELF_TESTS
 
 typedef struct StA { int count; } StA;
 static bool body_next_frame(void *user, JceCoroutineWait *next)
@@ -339,7 +354,14 @@ bool JCE_CALL jce_coroutine_self_test(void)
     /* 1) yield_next_frame 3 times then exit. */
     StA a = { 0 };
     JceCoroutineHandle ha = jce_coroutine_start(body_next_frame, &a);
-    if (ha == JCE_COROUTINE_INVALID) { ok = false; goto done; }
+    if (ha == JCE_COROUTINE_INVALID) {
+        /* Was a silent `goto done`.  A bail-out that logs nothing is
+         * why this self-test's first ever run (2026-08-31) reported
+         * only "FAIL" with no clue which of four starts refused. */
+        LOG_ERROR(LOG_TAG, "self_test next_frame: jce_coroutine_start returned "
+                  "INVALID");
+        ok = false; goto done;
+    }
     /* Frame 1 → pending_first fires (count=1, yields next_frame).
      * Frame 2 → resume (count=2, yields).  Frame 3 → resume (count=3,
      * returns false; slot freed). */
@@ -356,7 +378,14 @@ bool JCE_CALL jce_coroutine_self_test(void)
     /* 2) yield_seconds(0.05). */
     StB b = { 0, 0 };
     JceCoroutineHandle hb = jce_coroutine_start(body_seconds, &b);
-    if (hb == JCE_COROUTINE_INVALID) { ok = false; goto done; }
+    if (hb == JCE_COROUTINE_INVALID) {
+        /* Was a silent `goto done`.  A bail-out that logs nothing is
+         * why this self-test's first ever run (2026-08-31) reported
+         * only "FAIL" with no clue which of four starts refused. */
+        LOG_ERROR(LOG_TAG, "self_test seconds: jce_coroutine_start returned "
+                  "INVALID");
+        ok = false; goto done;
+    }
     /* First frame: pending_first dispatches → phase=1, wake at +0.05.
      * Advance 0.03 → no wake.  Advance 0.03 more → wake. */
     jce_player_loop_run_phase(JCE_PHASE_UPDATE, 0.0f);
@@ -378,7 +407,14 @@ bool JCE_CALL jce_coroutine_self_test(void)
     /* 3) yield_until predicate, flips on tick 3. */
     StC c = { 0, 3, 0 };
     JceCoroutineHandle hc = jce_coroutine_start(body_until, &c);
-    if (hc == JCE_COROUTINE_INVALID) { ok = false; goto done; }
+    if (hc == JCE_COROUTINE_INVALID) {
+        /* Was a silent `goto done`.  A bail-out that logs nothing is
+         * why this self-test's first ever run (2026-08-31) reported
+         * only "FAIL" with no clue which of four starts refused. */
+        LOG_ERROR(LOG_TAG, "self_test until: jce_coroutine_start returned "
+                  "INVALID");
+        ok = false; goto done;
+    }
     jce_player_loop_run_phase(JCE_PHASE_UPDATE, 0.0f); /* pending_first; fired=1, yields_until */
     if (c.fired != 1) { LOG_ERROR(LOG_TAG, "self_test until: first fire"); ok = false; }
     c.tick_now = 1; jce_player_loop_run_phase(JCE_PHASE_UPDATE, 0.0f);
@@ -396,7 +432,14 @@ bool JCE_CALL jce_coroutine_self_test(void)
     /* 4) Cancel mid-flight. */
     StD d = { 0 };
     JceCoroutineHandle hd = jce_coroutine_start(body_cancel, &d);
-    if (hd == JCE_COROUTINE_INVALID) { ok = false; goto done; }
+    if (hd == JCE_COROUTINE_INVALID) {
+        /* Was a silent `goto done`.  A bail-out that logs nothing is
+         * why this self-test's first ever run (2026-08-31) reported
+         * only "FAIL" with no clue which of four starts refused. */
+        LOG_ERROR(LOG_TAG, "self_test cancel: jce_coroutine_start returned "
+                  "INVALID");
+        ok = false; goto done;
+    }
     jce_player_loop_run_phase(JCE_PHASE_UPDATE, 0.0f); /* fired=1 */
     if (d.fired != 1) { LOG_ERROR(LOG_TAG, "self_test cancel: initial"); ok = false; }
     jce_coroutine_cancel(hd);
@@ -421,4 +464,4 @@ done:
     return ok;
 }
 
-#endif /* NDEBUG */
+#endif /* JCE_SELF_TESTS */

@@ -52,8 +52,21 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
     insp_track_edit();
     accept_asset_drop(skel->retarget_source_skeleton,
                       sizeof(skel->retarget_source_skeleton));
-    if (skel->retarget_source_skeleton[0])
+    if (skel->retarget_source_skeleton[0]) {
         ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.retargetHint"));
+        /* Only offered when a retarget source is set, because that is the only
+         * case it does anything: with no transfer there is no source effector
+         * to preserve, and a checkbox that is inert on most entities is one
+         * people learn to ignore on the entities where it matters. */
+        ImGui::Checkbox(jce_editor_i18n("inspector.anim.effectorIk"),
+                        &skel->retarget_effector_ik);
+        insp_track_edit();
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.effectorIkHint"));
+        ImGui::SliderFloat(jce_editor_i18n("inspector.anim.twist"),
+                           &skel->retarget_twist, 0.0f, 1.0f, "%.2f");
+        insp_track_edit();
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.twistHint"));
+    }
 
     /* Optional state machine (.anim_sm.json). When set it drives the active
        clip via parameter transitions instead of the fixed Active Clip below. */
@@ -69,7 +82,7 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
      * previously editor-less toggle (jce_sr_anim.c gates on sa->auto_speed). */
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.anim.autoSpeed",
                         "Auto-feed locomotion Speed"), &skel->auto_speed))
-        insp_track_edit();
+        insp_undo_bool(&skel->auto_speed);
 
     if (skel->sm_path[0]) {
         ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.smDrivesClip"));
@@ -167,6 +180,7 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
     {
         bool bt = skel->use_blend_tree;
         if (ImGui::Checkbox(jce_editor_i18n("inspector.anim.blendTree1d"), &bt)) {
+            INSP_UNDO_SCOPE();
             skel->use_blend_tree = bt;
             /* First enable with unauthored thresholds (all zero): seed an
              * ascending spread so the 1D tree has valid brackets instead of
@@ -179,7 +193,6 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
                     for (int i = 1; i < clip_count && i < 8; i++)
                         skel->blend_thresholds[i] = 2.0f * (float)i;
             }
-            insp_track_edit();
         }
         if (skel->use_blend_tree) {
             /* Dimensionality: 1D scalar, 2D Cartesian, or 2D Directional.
@@ -192,19 +205,17 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
                 jce_editor_i18n("inspector.anim.blendMode.2dCartesian"),
                 jce_editor_i18n("inspector.anim.blendMode.2dDirectional"),
             };
-            int prev_mode = skel->blend_mode;
-            if (ImGui::Combo(jce_editor_i18n("inspector.anim.blendMode"),
-                             &skel->blend_mode, bmodes, 3)) {
-                if (skel->blend_mode != prev_mode) insp_track_edit();
-            }
+            INSP_UNDO_DIRECT(skel->blend_mode,
+                ImGui::Combo(jce_editor_i18n("inspector.anim.blendMode"),
+                             &skel->blend_mode, bmodes, 3));
             bool is2d = (skel->blend_mode != 0);
 
             ImGui::DragFloat(jce_editor_i18n("inspector.anim.blendParam"), &skel->blend_param, 0.01f);
-            if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+            insp_track_edit();
             if (is2d) {
                 ImGui::DragFloat(jce_editor_i18n("inspector.anim.blendParamY"),
                                  &skel->blend_param_y, 0.01f);
-                if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+                insp_track_edit();
             }
             if (clip_count > 0) {
                 ImGui::TextDisabled("%s", is2d
@@ -224,7 +235,7 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
                     } else {
                         ImGui::DragFloat(lbl, &skel->blend_thresholds[i], 0.01f);
                     }
-                    if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+                    insp_track_edit();
                     ImGui::PopID();
                 }
             }
@@ -279,10 +290,14 @@ void draw_comp_sprite_animator(JceSpriteAnimatorComponent *sa)
 
 void draw_comp_avatar(JceAvatarComponent *a)
 {
-    insp_unwired_badge();
+    /* Marked per FIELD, not per component.  jce_sr_anim.c reads mask_path,
+     * layers[], apply_root_motion and -- since 2026-09-08 -- override_controller;
+     * it reads avatar_path zero times.  The component-wide badge that used to
+     * stand here told the user that none of it worked. */
     jce_draw_path_input_asset(jce_editor_i18n("inspector.avatar.path"), a->avatar_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(a->avatar_path, 128);
+    insp_unwired_field_badge();
 
     jce_draw_path_input_asset(jce_editor_i18n("inspector.avatar.mask"), a->mask_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
@@ -292,6 +307,14 @@ void draw_comp_avatar(JceAvatarComponent *a)
                               a->override_controller, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(a->override_controller, 128);
+    /* The badge that stood here is GONE, and the three things it said are each
+     * no longer true: the loader reads its path, it reports the pairs it found,
+     * and jce_sr_anim.c resolves every clip name through it.  It is kept in the
+     * history because the shape was instructive -- "overrideController" was
+     * already an asset-dependency key in jce_bundle_deps.c, so a path dropped
+     * here was followed by the packer and cooked into the shipped PAK: bytes in
+     * the player's download for a feature that did nothing.  A dead field can
+     * cost the player money before it costs the developer a bug report. */
 
     if (ImGui::Checkbox(jce_editor_i18n("inspector.avatar.applyRootMotion"), &a->apply_root_motion))
         insp_undo_bool(&a->apply_root_motion);
@@ -324,18 +347,16 @@ void draw_comp_avatar(JceAvatarComponent *a)
 
             ImGui::DragFloat(jce_editor_i18n("inspector.avatar.layerWeight"),
                              &L->weight, 0.01f, 0.0f, 1.0f);
-            if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+            insp_track_edit();
 
             if (L->mode < 0 || L->mode > 1) L->mode = 0;
             const char *lmodes[2] = {
                 jce_editor_i18n("inspector.avatar.layerMode.additive"),
                 jce_editor_i18n("inspector.avatar.layerMode.override"),
             };
-            int prev_lm = L->mode;
-            if (ImGui::Combo(jce_editor_i18n("inspector.avatar.layerMode"),
-                             &L->mode, lmodes, 2)) {
-                if (L->mode != prev_lm) insp_track_edit();
-            }
+            INSP_UNDO_DIRECT(L->mode,
+                ImGui::Combo(jce_editor_i18n("inspector.avatar.layerMode"),
+                             &L->mode, lmodes, 2));
 
             if (ImGui::SmallButton(jce_editor_i18n("inspector.avatar.layerRemove")))
                 remove_idx = i;
@@ -352,11 +373,11 @@ void draw_comp_avatar(JceAvatarComponent *a)
     }
     if (a->layer_count < JCE_AVATAR_MAX_LAYERS &&
         ImGui::Button(jce_editor_i18n("inspector.avatar.layerAdd"))) {
+        INSP_UNDO_SCOPE();
         JceAvatarLayer *L = &a->layers[a->layer_count++];
         memset(L, 0, sizeof(*L));
         L->weight = 1.0f;
         L->mode   = 0;
-        insp_track_edit();
     }
 }
 
@@ -496,6 +517,24 @@ void draw_comp_ragdoll(JceRagdollComponent *r)
     ImGui::DragFloat(jce_editor_i18n("inspector.ragdoll.heightScale"),
                      &r->height_scale, 0.01f, 0.01f, 10.0f, "%.2f");
     insp_track_edit();
+    /* JOINT LIMITS.  Every joint used to be an unlimited ball, so elbows and
+     * knees hyperextended and heads rotated without bound; the ragdoll now
+     * takes each bone's angular range from its humanoid role.  The range
+     * starts BELOW zero on purpose: a negative value is the explicit opt-out
+     * that restores the old unlimited joints, and it is expressible only
+     * because a scale cannot otherwise be negative. */
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.ragdoll.jointLimitScale",
+                                        "Joint Limit Scale"),
+                     &r->joint_limit_scale, 0.01f, -1.0f, 4.0f, "%.2f");
+    insp_track_edit();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n_id(
+            "inspector.ragdoll.jointLimitHint",
+            "Scales each bone's angular limit, taken from its humanoid role. "
+            "0 = the engine default (1.0); below 1 is stiffer, above 1 looser. "
+            "A NEGATIVE value removes the limits entirely, which is what the "
+            "ragdoll did before they existed. Bones whose name matches no "
+            "humanoid role stay unlimited either way."));
     ImGui::TextDisabled("%s", jce_editor_i18n("inspector.ragdoll.hint"));
 }
 
@@ -523,7 +562,6 @@ void draw_comp_morph_weights(JceScene *scene, JceEntity e,
         if (count < 0) count = 0;
         if (count > JCE_MORPH_MAX_WEIGHTS) count = JCE_MORPH_MAX_WEIGHTS;
         mw->count = count;
-        insp_track_edit();
     }
 
     char lbl[64];
@@ -536,14 +574,14 @@ void draw_comp_morph_weights(JceScene *scene, JceEntity e,
             mw->weights[i]   = v;
             mw->override_mask |= (1u << i);   /* authoring pins this target */
         }
-        if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+        insp_track_edit();
 
         ImGui::SameLine();
         bool ov = (mw->override_mask & (1u << i)) != 0;
         if (ImGui::Checkbox(jce_editor_i18n("inspector.morph.override"), &ov)) {
+            INSP_UNDO_SCOPE();
             if (ov) mw->override_mask |=  (1u << i);
             else    mw->override_mask &= ~(1u << i);
-            insp_track_edit();
         }
         ImGui::PopID();
     }

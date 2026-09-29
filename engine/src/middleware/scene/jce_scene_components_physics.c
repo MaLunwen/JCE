@@ -37,6 +37,16 @@ void parse_rigidbody(JceScene *s, JceEntity e, const cJSON *c)
     rb.physics_layer = (uint32_t)j_num(c, "physicsLayer", 0.0);
     copy_str(rb.physmat_path, sizeof(rb.physmat_path),
              j_str(c, "physMaterial", ""));
+    /* The shape a body with NO collider component falls back to.  The 2D
+     * sibling has always round-tripped this; the 3D one did not, so the
+     * inspector control wrote a field that never reached the file and the
+     * choice was lost on the next load.  0 == JCE_SHAPE_BOX is the default
+     * every scene written before this carries. */
+    rb.shape_type = (uint8_t)(int)j_num(c, "shapeType", 0.0);
+    /* JCE_RB_KIND_*, not JceBodyType.  Absent == 0 == AUTO, which is what
+     * every scene written before this carries and what the engine already
+     * did, so nothing changes for existing content. */
+    rb.body_type  = (uint8_t)(int)j_num(c, "bodyType", 0.0);
     jce_scene_set_rigidbody(s, e, &rb);
 }
 
@@ -50,6 +60,7 @@ void parse_rigidbody2d(JceScene *s, JceEntity e, const cJSON *c)
     rb.friction       = (float)j_num(c, "friction", 0.4);
     rb.restitution    = (float)j_num(c, "restitution", 0.0);
     rb.fixed_rotation = j_bool(c, "fixedRotation", false);
+    rb.physics_layer  = (uint32_t)j_num(c, "physicsLayer", 0.0);
     jce_scene_set_rigidbody2d(s, e, &rb);
 }
 
@@ -93,6 +104,7 @@ void parse_character_controller(JceScene *s, JceEntity e, const cJSON *c)
     cc.accel          = (float)j_num(c, "accel", 40.0);
     cc.air_control    = (float)j_num(c, "airControl", 0.35);
     cc.turn_speed_deg = (float)j_num(c, "turnSpeed", 720.0);
+    cc.physics_layer  = (uint32_t)j_num(c, "physicsLayer", 0.0);
     jce_scene_set_character_controller(s, e, &cc);
 }
 
@@ -254,6 +266,10 @@ void parse_ragdoll(JceScene *s, JceEntity e, const cJSON *c)
     if (rc.blend_weight > 1.0f) rc.blend_weight = 1.0f;
     if (rc.radius <= 0.0f)       rc.radius = 0.08f;
     if (rc.height_scale <= 0.0f) rc.height_scale = 1.0f;
+    /* ABSENT => 0 => the engine default of 1.0, resolved at ragdoll build
+     * time rather than here, because a NEGATIVE value is a meaningful
+     * authored state (no limits at all) that must survive the load. */
+    rc.joint_limit_scale = (float)j_num(c, "jointLimitScale", 0.0);
     jce_scene_set_ragdoll(s, e, &rc);
 }
 
@@ -345,6 +361,22 @@ void parse_configurable_joint(JceScene *s, JceEntity e, const cJSON *c)
     j.break_force  = (float)j_num(c, "breakForce", 1e30);
     j.break_torque = (float)j_num(c, "breakTorque", 1e30);
     j.enable_collision = j_bool(c, "enableCollision", false);
+    /* Per-axis drives, indexed keys.  A scene written before drives existed
+     * has none of them and parses to JCE_JOINT_DRIVE_OFF on every axis, which
+     * is what the memset above already holds. */
+    for (int d = 0; d < 6; ++d) {
+        char key[24];
+        snprintf(key, sizeof key, "driveMode%d", d);
+        j.drive_mode[d] = (int)j_num(c, key, 0.0);
+        snprintf(key, sizeof key, "driveTarget%d", d);
+        j.drive_target[d] = (float)j_num(c, key, 0.0);
+        snprintf(key, sizeof key, "driveSpring%d", d);
+        j.drive_spring[d] = (float)j_num(c, key, 0.0);
+        snprintf(key, sizeof key, "driveDamper%d", d);
+        j.drive_damper[d] = (float)j_num(c, key, 0.0);
+        snprintf(key, sizeof key, "driveMaxForce%d", d);
+        j.drive_max_force[d] = (float)j_num(c, key, 0.0);
+    }
     jce_scene_set_configurable_joint(s, e, &j);
 }
 
@@ -427,6 +459,9 @@ void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
     cn.lower_limit = (float)j_num(c, "lowerLimit", 0.0);
     cn.upper_limit = (float)j_num(c, "upperLimit", 0.0);
     cn.disable_collision = j_bool(c, "disableCollision", false);
+    cn.use_motor             = j_bool(c, "useMotor", false);
+    cn.motor_target_velocity = (float)j_num(c, "motorTargetVelocity", 0.0);
+    cn.motor_max_force       = (float)j_num(c, "motorMaxForce", 0.0);
     jce_scene_set_constraint(s, e, &cn);
 }
 
@@ -456,6 +491,14 @@ static void ser_rigidbody(const JceRigidBodyComponent *c, cJSON *arr)
         cJSON_AddNumberToObject(o, "physicsLayer", (double)c->physics_layer);
     if (c->physmat_path[0])
         cJSON_AddStringToObject(o, "physMaterial", c->physmat_path);
+    /* Emitted only when non-default, like the four above, so every scene
+     * written before this re-saves byte-identically.  0 == JCE_SHAPE_BOX. */
+    if (c->shape_type)
+        cJSON_AddNumberToObject(o, "shapeType", (double)c->shape_type);
+    /* Emitted only when the author picked one, so every scene written before
+     * this re-saves byte-identically.  0 is AUTO. */
+    if (c->body_type)
+        cJSON_AddNumberToObject(o, "bodyType", (double)c->body_type);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -469,6 +512,7 @@ static void ser_rigidbody2d(const JceRigidBody2DComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "friction", c->friction);
     cJSON_AddNumberToObject(o, "restitution", c->restitution);
     cJSON_AddBoolToObject(o, "fixedRotation", c->fixed_rotation);
+    cJSON_AddNumberToObject(o, "physicsLayer", (double)c->physics_layer);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -512,6 +556,14 @@ static void ser_character_controller(const JceCharacterControllerComponent *c, c
     cJSON_AddNumberToObject(o, "accel", c->accel);
     cJSON_AddNumberToObject(o, "airControl", c->air_control);
     cJSON_AddNumberToObject(o, "turnSpeed", c->turn_speed_deg);
+    /* Written only when non-default, like RigidBody's: keeps existing
+     * scene files byte-identical when nobody moved the character off
+     * layer 0.  parse_character_controller defaults it to the same 0, so
+     * the round trip is closed in BOTH directions -- a key written by one
+     * side and unread by the other is how MeshRenderer.visible silently
+     * stopped persisting. */
+    if (c->physics_layer != 0)
+        cJSON_AddNumberToObject(o, "physicsLayer", (double)c->physics_layer);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -533,6 +585,9 @@ static void ser_constraint(const JceConstraintComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "lowerLimit", c->lower_limit);
     cJSON_AddNumberToObject(o, "upperLimit", c->upper_limit);
     cJSON_AddBoolToObject(o, "disableCollision", c->disable_collision);
+    cJSON_AddBoolToObject(o, "useMotor", c->use_motor);
+    cJSON_AddNumberToObject(o, "motorTargetVelocity", c->motor_target_velocity);
+    cJSON_AddNumberToObject(o, "motorMaxForce", c->motor_max_force);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -688,6 +743,7 @@ static void ser_ragdoll(const JceRagdollComponent *rc, cJSON *arr)
     cJSON_AddNumberToObject(o, "blendWeight", (double)rc->blend_weight);
     cJSON_AddNumberToObject(o, "radius", (double)rc->radius);
     cJSON_AddNumberToObject(o, "heightScale", (double)rc->height_scale);
+    cJSON_AddNumberToObject(o, "jointLimitScale", (double)rc->joint_limit_scale);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -763,6 +819,24 @@ static void ser_configurable_joint(const JceConfigurableJointComponent *j, cJSON
     cJSON_AddNumberToObject(o, "breakForce",  j->break_force);
     cJSON_AddNumberToObject(o, "breakTorque", j->break_torque);
     cJSON_AddBoolToObject  (o, "enableCollision", j->enable_collision);
+    /* EVERY axis, every time, including the OFF ones.  Writing only the
+     * driven axes would make a drive that is switched off in the Inspector
+     * indistinguishable in the file from one that was never authored -- and
+     * the author who switched it off would find their spring stiffness gone
+     * when they switched it back on. */
+    for (int d = 0; d < 6; ++d) {
+        char key[24];
+        snprintf(key, sizeof key, "driveMode%d", d);
+        cJSON_AddNumberToObject(o, key, j->drive_mode[d]);
+        snprintf(key, sizeof key, "driveTarget%d", d);
+        cJSON_AddNumberToObject(o, key, j->drive_target[d]);
+        snprintf(key, sizeof key, "driveSpring%d", d);
+        cJSON_AddNumberToObject(o, key, j->drive_spring[d]);
+        snprintf(key, sizeof key, "driveDamper%d", d);
+        cJSON_AddNumberToObject(o, key, j->drive_damper[d]);
+        snprintf(key, sizeof key, "driveMaxForce%d", d);
+        cJSON_AddNumberToObject(o, key, j->drive_max_force[d]);
+    }
     cJSON_AddItemToArray(arr, o);
 }
 

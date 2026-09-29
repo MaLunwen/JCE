@@ -159,7 +159,7 @@ bool jce_asset_ext_is_texture(const char *path)
  * `.jcecpp` is engine-namespaced, so it cannot collide with a real build
  * input, and it is the SAME string the backend claims at runtime
  * (scripting/cpp/src/jce_script_vm_cpp.c, jce_script_vm_cpp_register).
- * *Was enforced by* (no longer checked — tools/audit/ was removed):
+ * *Enforced by* (wired into tools/audit/run_architecture_audit.py):
  * check_script_language_catalog.py — a backend
  * that claims an extension this table does not carry, or carries for another
  * language, fails it.
@@ -201,6 +201,22 @@ static const ScriptExtRow k_script_ext_table[] = {
     { "class",  "java",   "java.class",    JCEASSET_SCRIPT_FORM_BYTECODE  },
     { "jcecpp", "cpp",    "cpp.class-ref", JCEASSET_SCRIPT_FORM_REFERENCE },
     { "jcec",   "c",      "c.class-ref",   JCEASSET_SCRIPT_FORM_REFERENCE },
+    /* .jcejs and NOT .js: editor/src/core/jce_assetdb.cpp already classifies
+       .js and .ts as project-side WEB TOOLING the engine does not execute, and
+       claiming .js would offer every build script in a project as an
+       attachable gameplay script and ship it as readable source.  Same reason
+       .jcecpp and .jcec exist.  SOURCE, because a .jcejs file IS its text --
+       it is evaluated, not referenced the way a compiled native class is. */
+    { "jcejs",  "js",     "js.source",     JCEASSET_SCRIPT_FORM_SOURCE    },
+    /* .cs, the real extension, and REFERENCE rather than SOURCE.  Nothing
+       else claims .cs, and a .cs file in a JCE project IS a gameplay script —
+       so unlike .js there is no collision to dodge.  But the engine never
+       READS it: `dotnet build` compiled it before the process started and the
+       path names the TYPE (Unity's convention, the class matching the file
+       name).  SOURCE would put the text in the cooker's shared TEXT
+       dictionary "because a VM will compile it", and no VM will. */
+    { "cs",     "csharp", "csharp.class-ref",
+                                           JCEASSET_SCRIPT_FORM_REFERENCE },
 };
 
 static const ScriptExtRow *script_row(const char *path)

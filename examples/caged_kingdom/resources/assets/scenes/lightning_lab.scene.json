@@ -1,0 +1,397 @@
+{
+  "contract": {"name": "jce.scene", "major": 1, "minor": 0},
+  "scene": {
+    "version": 1,
+    "entities": [
+      {
+        "id": 9000,
+        "name": "LightningLabRoot",
+        "parentId": 0,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "EditorMeta", "name": "LightningLabRoot", "tag": "demo"}
+        ]
+      },
+      {
+        "id": 9001,
+        "name": "StormCamera",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 22, "posY": 13, "posZ": 32, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Camera", "fov": 43, "nearClip": 0.05, "farClip": 180, "primary": true, "orthographic": false},
+          {"type": "VirtualCamera", "name": "StormCamera", "priority": 100, "active": true, "trackMode": 0, "posX": 22, "posY": 13, "posZ": 32, "lookX": 0, "lookY": 8, "lookZ": 0, "fov": 43, "offX": 0, "offY": 0, "offZ": 0, "damping": 0},
+          {"type": "AudioListener", "volume": 1.0, "paused": false, "spatialize": true, "dopplerFactor": 1.0},
+          {"type": "EditorMeta", "name": "StormCamera", "tag": "camera"}
+        ]
+      },
+      {
+        "id": 9002,
+        "name": "StormFill",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 20, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Light", "lightType": 0, "colorR": 0.23, "colorG": 0.30, "colorB": 0.46, "intensity": 0.32, "dirX": -0.35, "dirY": -1.0, "dirZ": -0.22, "castsShadow": false},
+          {"type": "EditorMeta", "name": "StormFill", "tag": "lighting"}
+        ]
+      },
+      {
+        "id": 9010,
+        "name": "StormGround",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 50, "scaleY": 1, "scaleZ": 50},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 2, "baseColorR": 0.075, "baseColorG": 0.09, "baseColorB": 0.115, "baseColorA": 1.0, "metallic": 0.05, "roughness": 0.48, "castsShadow": false, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "StormGround", "tag": "environment"}
+        ]
+      },
+      {
+        "id": 9011,
+        "name": "GroundGrid_NorthSouth",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0.035, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 0.055, "scaleY": 0.025, "scaleZ": 19},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.24, "baseColorG": 0.31, "baseColorB": 0.37, "baseColorA": 1, "metallic": 0.85, "roughness": 0.22, "castsShadow": false, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "GroundGrid_NorthSouth", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9012,
+        "name": "GroundGrid_EastWest",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0.035, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 19, "scaleY": 0.025, "scaleZ": 0.055},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.24, "baseColorG": 0.31, "baseColorB": 0.37, "baseColorA": 1, "metallic": 0.85, "roughness": 0.22, "castsShadow": false, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "GroundGrid_EastWest", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9013,
+        "name": "GroundGrid_DiagonalA",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0.03, "posZ": 0, "rotX": 0, "rotY": 45, "rotZ": 0, "scaleX": 13, "scaleY": 0.018, "scaleZ": 0.035},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.12, "baseColorG": 0.19, "baseColorB": 0.25, "baseColorA": 1, "metallic": 0.72, "roughness": 0.28, "castsShadow": false, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "GroundGrid_DiagonalA", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9014,
+        "name": "GroundGrid_DiagonalB",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0.03, "posZ": 0, "rotX": 0, "rotY": -45, "rotZ": 0, "scaleX": 13, "scaleY": 0.018, "scaleZ": 0.035},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.12, "baseColorG": 0.19, "baseColorB": 0.25, "baseColorA": 1, "metallic": 0.72, "roughness": 0.28, "castsShadow": false, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "GroundGrid_DiagonalB", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9020,
+        "name": "LightningRod_Center",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 4.2, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 0.11, "scaleY": 8.4, "scaleZ": 0.11},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.38, "baseColorG": 0.46, "baseColorB": 0.52, "baseColorA": 1, "metallic": 0.95, "roughness": 0.17, "castsShadow": true, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "LightningRod_Center", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9021,
+        "name": "LightningRod_West",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": -8, "posY": 2.8, "posZ": -3, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 0.09, "scaleY": 5.6, "scaleZ": 0.09},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.31, "baseColorG": 0.39, "baseColorB": 0.46, "baseColorA": 1, "metallic": 0.9, "roughness": 0.2, "castsShadow": true, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "LightningRod_West", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9022,
+        "name": "LightningRod_East",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 8, "posY": 3.3, "posZ": 2, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 0.09, "scaleY": 6.6, "scaleZ": 0.09},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 0, "baseColorR": 0.31, "baseColorG": 0.39, "baseColorB": 0.46, "baseColorA": 1, "metallic": 0.9, "roughness": 0.2, "castsShadow": true, "receivesShadow": true},
+          {"type": "EditorMeta", "name": "LightningRod_East", "tag": "conductor"}
+        ]
+      },
+      {
+        "id": 9030,
+        "name": "StormCloud_A",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": -8, "posY": 23.5, "posZ": -1, "rotX": 0, "rotY": 8, "rotZ": 0, "scaleX": 10, "scaleY": 2.1, "scaleZ": 5.5},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 1, "baseColorR": 0.045, "baseColorG": 0.055, "baseColorB": 0.08, "baseColorA": 0.94, "metallic": 0, "roughness": 1, "castsShadow": false, "receivesShadow": false},
+          {"type": "EditorMeta", "name": "StormCloud_A", "tag": "cloud"}
+        ]
+      },
+      {
+        "id": 9031,
+        "name": "StormCloud_B",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 7, "posY": 24.2, "posZ": 1, "rotX": 0, "rotY": -12, "rotZ": 0, "scaleX": 11, "scaleY": 2.5, "scaleZ": 6},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 1, "baseColorR": 0.04, "baseColorG": 0.05, "baseColorB": 0.075, "baseColorA": 0.95, "metallic": 0, "roughness": 1, "castsShadow": false, "receivesShadow": false},
+          {"type": "EditorMeta", "name": "StormCloud_B", "tag": "cloud"}
+        ]
+      },
+      {
+        "id": 9032,
+        "name": "StormCloud_C",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 22.6, "posZ": -7, "rotX": 0, "rotY": 4, "rotZ": 0, "scaleX": 13, "scaleY": 2.0, "scaleZ": 5},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 1, "baseColorR": 0.055, "baseColorG": 0.062, "baseColorB": 0.09, "baseColorA": 0.92, "metallic": 0, "roughness": 1, "castsShadow": false, "receivesShadow": false},
+          {"type": "EditorMeta", "name": "StormCloud_C", "tag": "cloud"}
+        ]
+      },
+      {
+        "id": 9040,
+        "name": "LightningLeader",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.05, "widthEnd": 0.014, "colorStartR": 0.28, "colorStartG": 0.58, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.28, "colorEndG": 0.58, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningLeader", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9041,
+        "name": "LightningReturnStroke",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.15, "widthEnd": 0.04, "colorStartR": 0.94, "colorStartG": 0.98, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.94, "colorEndG": 0.98, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningReturnStroke", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9042,
+        "name": "LightningBranch_0",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_0", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9043,
+        "name": "LightningBranch_1",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_1", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9044,
+        "name": "LightningBranch_2",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_2", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9045,
+        "name": "LightningBranch_3",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_3", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9046,
+        "name": "LightningBranch_4",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_4", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9047,
+        "name": "LightningBranch_5",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.026, "widthEnd": 0.008, "colorStartR": 0.34, "colorStartG": 0.64, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.34, "colorEndG": 0.64, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningBranch_5", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9048,
+        "name": "LightningCore",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.064, "widthEnd": 0.018, "colorStartR": 1, "colorStartG": 0.985, "colorStartB": 0.95, "colorStartA": 0, "colorEndR": 1, "colorEndG": 0.985, "colorEndB": 0.95, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningCore", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9049,
+        "name": "LightningHalo",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.38, "widthEnd": 0.12, "colorStartR": 0.24, "colorStartG": 0.42, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.24, "colorEndG": 0.42, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningHalo", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9050,
+        "name": "LightningImpactLight",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 1, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Light", "lightType": 1, "colorR": 0.66, "colorG": 0.82, "colorB": 1, "intensity": 0, "radius": 26, "castsShadow": false},
+          {"type": "EditorMeta", "name": "LightningImpactLight", "tag": "lighting"}
+        ]
+      },
+      {
+        "id": 9051,
+        "name": "LightningCloudLight",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 21, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Light", "lightType": 1, "colorR": 0.46, "colorG": 0.62, "colorB": 1, "intensity": 0, "radius": 38, "castsShadow": false},
+          {"type": "EditorMeta", "name": "LightningCloudLight", "tag": "lighting"}
+        ]
+      },
+      {
+        "id": 9052,
+        "name": "LightningImpactGlow",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0.3, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 0.38, "scaleY": 0.12, "scaleZ": 0.38},
+          {"type": "MeshRenderer", "meshPath": "", "materialPath": "", "meshShape": 1, "baseColorR": 0.45, "baseColorG": 0.60, "baseColorB": 1, "baseColorA": 0, "metallic": 0, "roughness": 0.24, "emissiveR": 0, "emissiveG": 0, "emissiveB": 0, "alphaMode": 2, "alphaCutoff": 0.01, "doubleSided": true, "castsShadow": false, "receivesShadow": false},
+          {"type": "EditorMeta", "name": "LightningImpactGlow", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9053,
+        "name": "LightningUpwardStreamer",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "LineRenderer", "materialPath": "", "positionCount": 0, "widthStart": 0.03, "widthEnd": 0.01, "colorStartR": 0.72, "colorStartG": 0.84, "colorStartB": 1, "colorStartA": 0, "colorEndR": 0.72, "colorEndG": 0.84, "colorEndB": 1, "colorEndA": 0, "useWorldSpace": true, "loop": false},
+          {"type": "EditorMeta", "name": "LightningUpwardStreamer", "tag": "lightning"}
+        ]
+      },
+      {
+        "id": 9054,
+        "name": "LightningCloudScatter_A",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": -5, "posY": 21, "posZ": 2, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Light", "lightType": 1, "colorR": 0.38, "colorG": 0.48, "colorB": 0.88, "intensity": 0, "radius": 28, "castsShadow": false},
+          {"type": "EditorMeta", "name": "LightningCloudScatter_A", "tag": "lighting"}
+        ]
+      },
+      {
+        "id": 9055,
+        "name": "LightningCloudScatter_B",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 5, "posY": 21, "posZ": -2, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Light", "lightType": 1, "colorR": 0.34, "colorG": 0.44, "colorB": 0.82, "intensity": 0, "radius": 27, "castsShadow": false},
+          {"type": "EditorMeta", "name": "LightningCloudScatter_B", "tag": "lighting"}
+        ]
+      },
+      {
+        "id": 9060,
+        "name": "LightningDirector",
+        "parentId": 9000,
+        "components": [
+          {"type": "Transform", "posX": 0, "posY": 0, "posZ": 0, "rotX": 0, "rotY": 0, "rotZ": 0, "scaleX": 1, "scaleY": 1, "scaleZ": 1},
+          {"type": "Script", "scriptPath": "scripts/lightning_lab.lua"},
+          {"type": "EditorMeta", "name": "LightningDirector", "tag": "director"}
+        ]
+      }
+    ],
+    "rendering": {
+      "version": 1,
+      "ambient": {"color": [0.14, 0.18, 0.28], "intensity": 0.11},
+      "iblEnabled": false,
+      "fog": {
+        "enabled": true,
+        "mode": 1,
+        "color": [0.018, 0.026, 0.046],
+        "density": 0.012,
+        "start": 34,
+        "end": 92,
+        "heightFalloff": 0.035,
+        "heightOrigin": 0
+      },
+      "shadows": {
+        "distance": 80,
+        "cascades": 2,
+        "splitLambda": 0.65,
+        "resolution": 2048,
+        "soft": 1
+      },
+      "postfx": {
+        "tonemap": true,
+        "bloom": true,
+        "fxaa": true,
+        "vignette": true,
+        "exposure": 0.82,
+        "gamma": 2.2,
+        "bloomThreshold": 0.72,
+        "bloomIntensity": 0.46,
+        "ssao": true,
+        "ssaoIntensity": 0.5,
+        "ssaoRadius": 0.85,
+        "ssr": false
+      },
+      "environment": {
+        "timeOfDay": {"enabled": false, "hour": 1.5},
+        "weather": {"type": 1, "intensity": 0.72},
+        "sky": {
+          "mode": 3,
+          "turbidity": 8.5,
+          "dome": {
+            "zenith": [0.004, 0.007, 0.018],
+            "mid": [0.012, 0.019, 0.044],
+            "midPos": 0.48,
+            "horizon": [0.03, 0.045, 0.075],
+            "ground": [0.008, 0.012, 0.02],
+            "glow": [0.08, 0.10, 0.16],
+            "glowFalloff": 13,
+            "sunColor": [0.32, 0.40, 0.62],
+            "sunSize": 0.9995,
+            "sunSoftness": 0.002,
+            "haloPower": 28,
+            "haloStrength": 0.035,
+            "anchorRadius": 120,
+            "sunRayCount": 0,
+            "sunRayLength": 0.02,
+            "sunRaySharpness": 8,
+            "sunRayStrength": 0,
+            "sunDir": [-0.45, -0.22, -1]
+          }
+        },
+        "floatingOrigin": {"enabled": false, "threshold": 4096}
+      },
+      "look": {
+        "wrap": 0.28,
+        "hemisphere": true,
+        "groundColor": [0.04, 0.055, 0.09],
+        "rimColor": [0.22, 0.32, 0.52],
+        "rimPower": 3.2,
+        "rimIntensity": 0.16,
+        "tonemapOp": 0,
+        "lutPath": "",
+        "lutStrength": 0,
+        "toonCharacter": false,
+        "bloomKnee": 0.46
+      }
+    }
+  }
+}

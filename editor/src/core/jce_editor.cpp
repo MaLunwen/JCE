@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cfloat>
 
+#include <jce/middleware/llm/jce_llm.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
@@ -46,6 +47,8 @@ extern "C" {
 #include <jce/renderer/jce_scene_renderer.h>
 
 extern "C" void jce_reflect_register_builtin(void);
+/* jce_panel_static_batch.cpp -- the JCE_STATIC_BATCH_BAKE seam below. */
+extern "C" void jce_editor_panel_static_batch_bake_now(void);
 extern "C" void jce_hotkeys_init(void);
 extern "C" void jce_editor_benchmark_run(int kind, int count);  /* Benchmark panel */
 extern "C" void jce_workspace_init(void);
@@ -268,6 +271,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigWindowsMoveFromTitleBarOnly = true;
     io.ConfigDragClickToInputText = true;  /* single-click on DragFloat enters text-input mode */
 
     /* Ensure .jce config dir exists, then let ImGui persist layout/docking
@@ -286,6 +290,9 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
      * app — stdout is detached). JCE_LOG_FILE=<path> mirrors all engine logs to
      * a file so automated capture runs can inspect scene-load / terrain / asset
      * warnings after the fact. */
+    /* Not redundant with the identical block in jce_engine_create(): the
+     * editor does not go through it, and the sink opens in append mode, so a
+     * binary that somehow reaches both keeps every line. Delete neither. */
     {
         const char *log_file = getenv("JCE_LOG_FILE");
         if (log_file && log_file[0]) jce_log_set_file(log_file);
@@ -462,21 +469,47 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         }
     }
 
-    const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
+    /* JCE_KPI_DRAW_LOG, and it used to be JCE_KPI_FRAME_LOG -- which the ENGINE
+     * already owned.
+     *
+     * Two writers, two schemas, ONE path.  jce_engine.c opens that variable
+     * with "w" for its all-phase table (frame_index,phase,ms), which
+     * tools/frame_budget.py parses; this one truncated the same file and wrote
+     * frame_index,frame_ms,num_draw.  In the editor BOTH run, so whichever
+     * initialised last owned the file and the other's rows were simply gone --
+     * and neither said anything, because each was writing successfully.
+     * Measured: asking for a draw-call capture produced a 37,000-line phase
+     * table with no num_draw column anywhere in it.
+     *
+     * The engine keeps the name its tracked consumer uses.  This one is renamed
+     * for what it actually carries. */
+    const char *frame_kpi_path = getenv("JCE_KPI_DRAW_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
         /* Truncate then write CSV header. */
-        static const char hdr[] = "frame_index,frame_ms,num_draw\n";
+        /* THE SCENE'S OWN SUBMIT COUNT, beside the frame-wide one.
+         *
+         * num_draw is bgfx's whole-frame numDraw, and in the EDITOR that is
+         * dominated by the editor itself: MEASURED, it reads 43 for a scene
+         * of 10 props and 43 for the same scene with 40, so it cannot answer
+         * a question about the scene at all.  rq_commands / rq_submits come
+         * from jce_scene_renderer_get_rq_stats -- the render queue's own
+         * commands in and bgfx_submit calls out -- which is the number a
+         * batching change moves. */
+        static const char hdr[] = "frame_index,frame_ms,num_draw,rq_commands,rq_submits,rq_enabled,"
+            "cull_total,cull_visible,cull_disabled\n";
         if (jce_fs_host_write_all(frame_kpi_path, hdr, sizeof(hdr) - 1)) {
             jce_strlcpy(s_editor.frame_kpi_path, frame_kpi_path,
                         sizeof(s_editor.frame_kpi_path));
-            const char *frame_count = getenv("JCE_KPI_FRAME_COUNT");
+            const char *frame_count = getenv("JCE_KPI_DRAW_COUNT");
             if (frame_count && frame_count[0]) {
                 const int parsed = atoi(frame_count);
                 if (parsed > 0) s_editor.frame_kpi_limit = (uint32_t)parsed;
             }
-            LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s", frame_kpi_path);
+            LOG_INFO(LOG_TAG, "draw-call KPI capture enabled "
+                              "(JCE_KPI_DRAW_LOG) -> %s", frame_kpi_path);
         } else {
-            LOG_WARN(LOG_TAG, "failed to open frame KPI log: %s", frame_kpi_path);
+            LOG_WARN(LOG_TAG, "failed to open draw-call KPI log: %s",
+                     frame_kpi_path);
         }
     }
 
@@ -525,6 +558,10 @@ void jce_editor_shutdown(void)
     jce_cook_manager_shutdown();
     jce_build_manager_shutdown();
     jce_run_manager_shutdown();
+    /* Kill any language-model request still in flight.  Without this the child
+     * outlives the editor as an orphan holding a pipe nobody drains -- the
+     * same class of leak jce_run_manager_shutdown exists to prevent. */
+    jce_llm_shutdown();
     jce_editor_panels_shutdown();
     jce_thumb_shutdown();
     jce_editor_state_shutdown();
@@ -706,6 +743,12 @@ void jce_editor_update(JceWindow *window)
     /* Same pump for the per-project editor state (<root>/.jce/
      * editor-state.json); also follows project-root switches. */
     jce_editor_pstate_flush_tick(dt);
+    /* Drive an in-flight language-model request.  Here and not in the
+     * panel's draw: a closed or background-tabbed panel does not draw,
+     * and a child whose stdout is never drained blocks in write() and
+     * then never exits -- the request would hang for exactly as long as
+     * the window stayed hidden. */
+    jce_editor_ai_assistant_tick();
 
     /* One-shot: re-apply the quality tier the user last applied in Project
      * Settings > Quality once the per-project store is live — strictly after
@@ -720,7 +763,38 @@ void jce_editor_update(JceWindow *window)
             capture_play = JCE_EDITOR_KPI_PLAY_PLAYING;
         else if (play == JCE_PLAY_PAUSED)
             capture_play = JCE_EDITOR_KPI_PLAY_PAUSED;
-        jce_editor_kpi_game_capture_global_tick(capture_play, dt);
+        /* THE CAPTURE CLOCK TAKES THE FIXED STEP TOO, when one is asked for.
+         *
+         * `dt` above is a performance-counter delta, so without this the
+         * moment a "deterministic Game View capture" fires depends on how
+         * fast this machine ran the preceding frames.  Measured 2026-09-22:
+         * the same editor, same scene, same 400-frame budget, captured on the
+         * OpenGL backend and captured NOTHING on Direct3D 12 -- D3D12's first
+         * frame costs ~950 ms of shader warm-up, which the wall clock spends
+         * and the simulation does not, so the schedule never reached the
+         * requested second before the frame budget ran out.  The comparison
+         * it exists to serve then reported a missing capture, which reads as
+         * a capture bug rather than as a clock that is not the sim's.
+         *
+         * Same switch, same reasoning and the same oversight as Play itself
+         * (jce_editor_play.cpp: "the editor's Play was simply never wired to
+         * it"); this is the next clock down the same chain. */
+        float capture_dt = dt;
+        {
+            static int   s_fdt  = -1;
+            static float s_fdtv = 0.0f;
+            if (s_fdt < 0) {
+                const char *v = getenv("JCE_FRAME_DT_FIXED");
+                if (v && v[0]) {
+                    s_fdtv = (float)atof(v);
+                    s_fdt  = (s_fdtv > 0.0f) ? 1 : 0;
+                } else {
+                    s_fdt = 0;
+                }
+            }
+            if (s_fdt) capture_dt = s_fdtv;
+        }
+        jce_editor_kpi_game_capture_global_tick(capture_play, capture_dt);
         if (jce_editor_kpi_game_capture_global_needs_focus())
             jce_editor_layout_request_focus_game_view();
     }
@@ -738,6 +812,89 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
+    /* JCE_EDITOR_FOREGROUND_GAME_VIEW=1: the Game View's half of the hook
+     * above, and it exists because the same sentence applies -- a docked
+     * background tab never runs its body.
+     *
+     * MEASURED, which is why this is not a convenience.  An automated capture
+     * through the editor (JCE_CAPTURE_FRAME) asks the host for a UI-free
+     * image, and the host declines when the Game View is not drawing.  In the
+     * operator's saved layout game_view is tab 1 behind scene_view, so on the
+     * automated path the hook could never fire: 34,977 of 3,911,680 px
+     * differed between two runs of one input digest, every one inside the
+     * profiler band.  With the Game View in front the same two runs differ by
+     * ZERO of 1,239,240 px.  The seam was correct the whole time; nothing on
+     * that path ever let it run.
+     *
+     * NOT IN tools/jce_determinism.py's DETERMINISM, deliberately.  That
+     * recipe pins what must hold for ANY capture -- frame dt, stream sync,
+     * TAA jitter phase, not stealing the desktop.  WHICH PANEL IS IN FRONT is
+     * a statement about the SUBJECT, and the hook directly above this one
+     * exists to foreground a DIFFERENT panel.  A recipe-wide version would
+     * silently repoint every measuring tool in tools/ at the Game View, and
+     * they would go on producing images that are non-blank, correctly sized,
+     * written to the right path, and of the wrong panel.  Opt-in per caller;
+     * app.run sets it when it is capturing through the editor stand-in.
+     *
+     * Ten frames, matching the hook above: the request is deferred through
+     * the dock-tab pump, and one frame is not enough for the layout to have
+     * been built on a cold start. */
+    if (getenv("JCE_EDITOR_FOREGROUND_GAME_VIEW")) {
+        /* THE OVERVIEW SWITCH WINS, AND SAYS SO.  Both hooks request a dock
+         * tab, this one runs second, and "last request wins" would mean a
+         * human who set JCE_DBG_OVERVIEW by hand to photograph the Scene View
+         * silently gets the Game View instead -- a capture that is non-blank,
+         * correctly sized, written to the right path, and of the wrong panel.
+         * That is the exact failure this variable exists to remove, so it is
+         * not allowed to cause it.  JCE_DBG_OVERVIEW is set by a person
+         * debugging; this one is set by app.run.  Deliberate intent wins over
+         * automatic, and the stand-down is logged ONCE so the capture is never
+         * quietly of something else. */
+        static bool s_gameview_focus_yielded = false;
+        if (getenv("JCE_DBG_OVERVIEW")) {
+            if (!s_gameview_focus_yielded) {
+                s_gameview_focus_yielded = true;
+                /* SAY WHAT THE CAPTURE IS, not only what it is not: "not the
+                 * Game View" is equally true of a blank frame, a crashed
+                 * renderer and a closed panel, so it tells a reader nothing
+                 * about what they are holding. */
+                LOG_WARN(LOG_TAG,
+                         "JCE_EDITOR_FOREGROUND_GAME_VIEW and JCE_DBG_OVERVIEW "
+                         "are both set -- standing down: this capture is of the "
+                         "SCENE VIEW, which JCE_DBG_OVERVIEW asked for, not the "
+                         "Game View");
+            }
+        } else {
+            static int s_gameview_focus_frames = 0;
+            if (s_gameview_focus_frames < 10) {
+                jce_editor_layout_request_focus_game_view();
+                s_gameview_focus_frames++;
+            }
+        }
+    }
+
+    /* JCE_STATIC_BATCH_BAKE=1: run the static-mesh merge once, a few frames in,
+     * and log what it did.
+     *
+     * A MEASUREMENT SEAM, and it exists because of what this feature is for.
+     * Static batching's whole claim is a draw-call count, and a draw-call count
+     * only exists in a running engine -- so if the bake could only be reached
+     * by clicking a button, the only evidence for it would be its own report of
+     * what it did.  With this, the SAME scene captured with and without the
+     * variable differs in exactly one thing, and JCE_KPI_DRAW_LOG's num_draw
+     * column says by how much.
+     *
+     * A FEW FRAMES IN, not at load: the bake resolves every candidate's mesh
+     * through the asset cache, and on frame 0 that cache is still filling. */
+    if (getenv("JCE_STATIC_BATCH_BAKE")) {
+        static int s_sb_frames = 0;
+        if (s_sb_frames <= 30 && ++s_sb_frames == 30) {
+            LOG_INFO("editor", "%s", "JCE_STATIC_BATCH_BAKE set - baking static "
+                                     "batches once");
+            jce_editor_panel_static_batch_bake_now();
+        }
+    }
+
     if (s_editor.frame_kpi_path[0]) {
         if (s_editor.frame_kpi_limit == 0 ||
             s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
@@ -749,9 +906,27 @@ void jce_editor_update(JceWindow *window)
             JceGpuStats gpu_stats{};
             const uint32_t num_draw =
                 jce_renderer_get_gpu_stats(&gpu_stats) ? gpu_stats.num_draw : 0u;
-            char kpi_line[80];
-            int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f,%u\n",
-                                   s_editor.frame_kpi_index, frame_ms, num_draw);
+            /* AND the collected / visible entity counts.  rq_* is zero
+             * whenever the render-queue path is not taken -- MEASURED: a
+             * plain prop scene in the Scene View reports rq_enabled=0 --
+             * so a batching measurement needs a number that is always
+             * produced.  cull_total is what the colour pass collected and
+             * cull_visible what survived the frustum; merging forty
+             * renderers into one moves both. */
+            JceSceneRqStats rq{};
+            JceSceneCullStats cull{};
+            if (JceSceneRenderer *sr = jce_editor_get_scene_renderer()) {
+                jce_scene_renderer_get_rq_stats(sr, &rq);
+                jce_scene_renderer_get_cull_stats(sr, &cull);
+            }
+            char kpi_line[128];
+            int kpi_len = snprintf(kpi_line, sizeof(kpi_line),
+                                   "%u,%.3f,%u,%u,%u,%d,%u,%u,%u\n",
+                                   s_editor.frame_kpi_index, frame_ms, num_draw,
+                                   rq.commands_in, rq.submits_out,
+                                   rq.enabled ? 1 : 0,
+                                   cull.total, cull.visible,
+                                   cull.disabled_skipped);
             if (kpi_len > 0)
                 jce_fs_host_append(s_editor.frame_kpi_path, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
@@ -826,7 +1001,7 @@ void jce_editor_update(JceWindow *window)
                  * model resolved under that exact path key, or -- the one that
                  * actually bit -- the whole block sitting behind
                  * frame_kpi_index >= 20, a counter that only advances when the
-                 * UNRELATED JCE_KPI_FRAME_LOG is also set.  Without this the
+                 * UNRELATED JCE_KPI_DRAW_LOG is also set.  Without this the
                  * bake simply produces no file and no output. */
                 if (!sr || !r) {
                     LOG_WARN("editor", "JCE_IMPOSTOR_BAKE: no scene renderer/renderer yet");
@@ -965,6 +1140,15 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
+    /* Open through the same viewer route as an explicit asset double-click. */
+    {
+        static unsigned preview_tick = 0u;
+        if (++preview_tick == 30u) {
+            const char *path = getenv("JCE_DBG_FILE_PREVIEW");
+            if (path && path[0]) jce_file_viewer_open(path);
+        }
+    }
+
     /* Headless Play hook (JCE_DBG_AUTOPLAY=N): press Play at frame N.
      *
      * The scene has to have finished loading first -- jce_state_play snapshots
@@ -1037,11 +1221,54 @@ void jce_editor_update(JceWindow *window)
                         snprintf(dot, sizeof pp - (size_t)(dot - pp), "%s", tail);
                     }
                 }
-                if (jce_screenshot_save(pp, JCE_SCREENSHOT_PNG))
+                if (jce_screenshot_save(pp, JCE_SCREENSHOT_PNG)) {
                     ++s_shot_n;
+                    /* SAY WHAT WAS IN FRAME.  A capture that contains none of
+                     * its subject is not blank -- it has sky, grid and gizmos --
+                     * so the blank-image guard passes it and every number read
+                     * off it describes the wrong pixels.  That is not
+                     * hypothetical: a 'per-draw material state never binds in
+                     * the Scene view' finding was raised, instrumented and
+                     * written into the parity ledger on a capture whose two
+                     * subject spheres were outside the frustum.  The probe
+                     * counted zero because there was nothing to draw.
+                     *
+                     * The renderer already knows: `visible` is what survived
+                     * culling.  Printing it beside the file makes the capture
+                     * self-describing, and lets envshot refuse `visible=0`
+                     * instead of handing back a picture of the sky. */
+                    JceSceneRenderer *shot_sr = jce_editor_get_scene_renderer();
+                    JceSceneCullStats cs;
+                    memset(&cs, 0, sizeof cs);
+                    if (shot_sr) jce_scene_renderer_get_cull_stats(shot_sr, &cs);
+                    LOG_INFO("editor", "SHOT %s visible=%u total=%u culled=%u",
+                             pp, cs.visible, cs.total, cs.culled);
+                }
             }
         }
     }
+
+    /* Headless "Reload Shaders" (JCE_DBG_RELOAD_SHADERS="<frame>"): fires the
+       menu action without input, so the recompile-from-source sweep can be
+       measured rather than described.  No-op when the variable is absent. */
+    {
+        static int      s_rs_frame = -2;   /* -2 unparsed, -1 disabled/fired */
+        static uint32_t s_rs_tick  = 0;
+        if (s_rs_frame == -2) {
+            const char *v = getenv("JCE_DBG_RELOAD_SHADERS");
+            s_rs_frame = (v && v[0]) ? atoi(v) : -1;
+        }
+        if (s_rs_frame >= 0 && ++s_rs_tick >= (uint32_t)s_rs_frame) {
+            s_rs_frame = -1;
+            jce_editor_reload_shaders();
+        }
+    }
+
+    /* Headless Shader Graph authoring hook (JCE_DBG_GRAPH_COMPILE): drives the
+       material graph panel's own two compile entry points without input, so a
+       graph material can be authored, cooked and shipped in one automated run.
+       No-op when the variable is absent. */
+    jce_panel_material_graph_headless_tick();
 
     /* Headless "View in Scene JSON" hook (JCE_DBG_VIEWJSON="<entity>@<frame>"):
        drives the hierarchy right-click reveal action without input — locates

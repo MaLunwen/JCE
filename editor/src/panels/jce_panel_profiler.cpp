@@ -29,6 +29,7 @@
 #include <jce/os/core/jce_async.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_views.h>   /* view-id ownership guard readout */
 #include <jce/resource/jce_world_streamer.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_perf_phase.h>
@@ -319,8 +320,41 @@ void draw_area_chart(const char *label, float (*get)(void *, int), int count,
     ImGui::Dummy(ImVec2(w, height));
 }
 
+/* View-id ownership conflicts detected this frame.
+ *
+ * The guard has been in the engine for a while and had no surface, which is
+ * part of why it went unread while the editor viewports quietly drew their
+ * ECS-UI overlay on top of the scene renderer's shadow-atlas band.  It is a
+ * per-frame count, so a non-zero value here means TWO subsystems are binding
+ * the same bgfx view id right now and one of them is silently producing no
+ * pixels.  Healthy is 0. */
+static void draw_view_band_guard()
+{
+    if (!jce_view_bands_enabled()) {
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(
+            "profiler.viewBands.off",
+            "view-id ownership guard off (JCE_VIEW_BAND_CHECK=1 to enable)"));
+        return;
+    }
+    const uint32_t n = jce_view_bands_conflict_count();
+    const char *label = jce_editor_i18n_or("profiler.viewBands.conflicts",
+                                           "view-id conflicts");
+    if (n == 0) {
+        ImGui::TextDisabled("%s: 0", label);
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                           "%s: %u", label, (unsigned)n);
+        jce_editor::help_tip(jce_editor_i18n_or(
+            "profiler.viewBands.conflictsTip",
+            "Two subsystems bound the same bgfx view id this frame; one of "
+            "them is drawing nothing. The engine log names both owners."));
+    }
+}
+
 void draw_view_table()
 {
+    draw_view_band_guard();
+
     /* One-time restore of the persisted hot-list sort (user-global —
      * consistent with the imgui.ini-persisted memory-tab table). */
     static bool s_sort_loaded = false;
@@ -520,7 +554,13 @@ std::string build_clipboard_snapshot(float dt_ms,
         JceSceneRqStats rqs = {};
         jce_scene_renderer_get_rq_stats(sr, &rqs);
         s += "\n[Render queue]\n";
-        append_fmt(s, "  Mode           : %s\n", rqs.enabled ? "On (default; JCE_USE_RQ=0 disables)" : "Off (JCE_USE_RQ=0)");
+        /* `enabled` is "the queue path was taken THIS FRAME" (see the header
+         * on JceSceneRqStats), not "the env opt-out is set".  Naming an
+         * environment variable as the cause of an empty frame is a message
+         * that asserts something false about the run. */
+        append_fmt(s, "  Mode           : %s\n",
+                   rqs.enabled ? "On (queue path used this frame)"
+                               : "Off (no queue flush this frame)");
         if (rqs.enabled) {
             append_fmt(s, "  Commands in    : %u\n", rqs.commands_in);
             append_fmt(s, "  bgfx submits   : %u\n", rqs.submits_out);
@@ -1324,13 +1364,18 @@ extern "C" void jce_editor_panel_profile_analyzer_content(void);
 extern "C" void jce_editor_panel_frame_debugger_content(void);
 extern "C" void jce_editor_panel_benchmark_content(void);
 extern "C" void jce_editor_panel_profiler_trace_content(void);
+extern "C" void jce_editor_panel_profiler_scripts_content(void);
 
 namespace {
 
-/* max_tab must span all 6 tabs (0..5): it is both the validity bound and
+/* max_tab must span all 7 tabs (0..6): it is both the validity bound and
  * the load clamp, so a persisted Benchmark tab can never be silently
- * remapped onto Frame Debugger. */
-JcePanelTabState g_tabs{ "panel.profiler.current_tab", /*max_tab=*/5 };
+ * remapped onto Frame Debugger.
+ *
+ * ADDING A TAB IS TWO EDITS, and forgetting the second one fails LATER: the
+ * tab draws fine this session and the saved preference is clamped away on
+ * the next launch, so it stops being restored without ever stopping working. */
+JcePanelTabState g_tabs{ "panel.profiler.current_tab", /*max_tab=*/6 };
 
 void draw_workbench(void)
 {
@@ -1338,6 +1383,7 @@ void draw_workbench(void)
     if (!ImGui::BeginTabBar("##profiling_tabs"))
         return;
 
+    ImGuiTabItemFlags sc_flags  = jce_panel_tab_flags(g_tabs, 6);
     ImGuiTabItemFlags cpu_flags = jce_panel_tab_flags(g_tabs, 0);
     ImGuiTabItemFlags mem_flags = jce_panel_tab_flags(g_tabs, 1);
     ImGuiTabItemFlags ana_flags = jce_panel_tab_flags(g_tabs, 2);
@@ -1364,6 +1410,9 @@ void draw_workbench(void)
     std::snprintf(tr_label,  sizeof(tr_label),  "%s###pf_tab_trace",
                   jce_editor_i18n_or("profiler.trace.title",
                                      "Threads & Tasks"));
+    char sc_label[96];
+    std::snprintf(sc_label, sizeof(sc_label), "%s###pf_tab_scripts",
+                  jce_editor_i18n("profiler.scripts.title"));
 
     if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
         jce_panel_tab_set_current(g_tabs, 0);
@@ -1393,6 +1442,11 @@ void draw_workbench(void)
     if (ImGui::BeginTabItem(tr_label, nullptr, tr_flags)) {
         jce_panel_tab_set_current(g_tabs, 5);
         jce_editor_panel_profiler_trace_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(sc_label, nullptr, sc_flags)) {
+        jce_panel_tab_set_current(g_tabs, 6);
+        jce_editor_panel_profiler_scripts_content();
         ImGui::EndTabItem();
     }
 

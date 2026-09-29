@@ -65,6 +65,7 @@ static const VmSlot k_vm_slots[] = {
     VM_SLOT(compile_module),
     VM_SLOT(rebind_instance),
     VM_SLOT(release_module),
+    VM_SLOT(call_fixed_update),   /* APPENDED -- see jce_script_vm.h */
 };
 
 #define JCE_SCRIPT_VM_SLOT_COUNT \
@@ -113,6 +114,7 @@ static const JceScriptVM k_public_signature_pin = {
     jce_script_compile_module,
     jce_script_rebind_instance,
     jce_script_release_module,
+    jce_script_call_fixed_update,   /* APPENDED -- see the header */
 };
 
 /* ── The registry ─────────────────────────────────────────────────────────
@@ -484,8 +486,13 @@ const char *JCE_CALL jce_script_vm_language_of(const JceScript *s)
  * when jce_thread_mark_main() was never called and no unit-test process ever
  * calls it, which would make a main-thread check vacuously true exactly where
  * it is most needed.  jce_thread_current_id() needs no marking, so this check
- * is live in every process AND in release: there is no JCE_ASSERT here, and
- * <assert.h> would compile out under NDEBUG.
+ * is live in every process AND in release.  It predates
+ * <jce/os/core/jce_assert.h> (2026-09-20) and is deliberately NOT rewritten
+ * onto JCE_ENSURE: the shape is the same -- check, log, refuse, never abort --
+ * but the dedup is not.  JCE_ENSURE remembers a SITE; this remembers a
+ * HANDLE, which is what keeps a per-frame dispatch from the wrong thread from
+ * turning the log into the failure while a second offending handle still gets
+ * its own line.
  *
  * Returns true when the call may proceed.  A refusal is the same clean no-op
  * every one of these functions already performs for a NULL handle, plus one
@@ -638,6 +645,19 @@ void jce_script_call_update(JceScript *s, JceScriptInstance inst, float dt)
     const JceScriptVM *vm = vm_of(s, "call_update");
     if (!vm) return;
     vm->call_update(s, inst, dt);
+}
+
+void jce_script_call_fixed_update(JceScript *s, JceScriptInstance inst,
+                                  float dt)
+{
+    const JceScriptVM *vm = vm_of(s, "call_fixed_update");
+    if (!vm) return;
+    /* The NULL check is belt-and-braces, not tolerance: jce_script_vm_register
+     * refuses any table with a NULL slot, so a registered VM always has this
+     * one.  It costs a predictable branch and turns a hypothetical zero into a
+     * missed callback rather than a jump through it. */
+    if (!vm->call_fixed_update) return;
+    vm->call_fixed_update(s, inst, dt);
 }
 
 void jce_script_release(JceScript *s, JceScriptInstance inst)

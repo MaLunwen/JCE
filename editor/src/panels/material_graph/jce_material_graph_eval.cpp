@@ -9,14 +9,17 @@
 #include "panels/material_graph/jce_material_graph_state.h"
 
 #include "shadergraph/jce_shadergraph_codegen.h"
+#include "shadergraph/jce_shadergraph_registry.h"
 #include "shadergraph/jce_shadergraph_shaderc.h"
 #include "ui/jce_editor_panels.h"
+#include "scene/jce_editor_scene_render.h"
 
 extern "C" {
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
 
 #include <cstdio>
@@ -25,6 +28,24 @@ extern "C" {
 #include <string>
 
 namespace jce_mgp {
+
+/* Evaluate a PBR Output socket for the .mat.json.
+ *
+ * An UNCONNECTED output socket takes jce_sg::output_socket_default -- the same
+ * value the generated shader uses -- rather than eval_socket's neutral
+ * (1,1,1,1).  Those were the two answers: the shader said metallic 0 and
+ * roughness 0.5, the material document said 1 and 1. */
+void eval_output_socket(int out_node_id, int sock_idx, float out_color[4],
+                        char out_tex[256])
+{
+    Link l;
+    if (!find_link_into(out_node_id, sock_idx, &l)) {
+        jce_sg::output_socket_default(sock_idx, out_color);
+        out_tex[0] = 0;
+        return;
+    }
+    eval_socket(out_node_id, sock_idx, out_color, out_tex, 0);
+}
 
 void eval_socket(int node_id, int sock_idx, float out_color[4],
                  char out_tex[256], int depth)
@@ -106,6 +127,24 @@ void eval_socket(int node_id, int sock_idx, float out_color[4],
     }
 }
 
+
+/* <stem>.matgraph.json -> <stem>.mat.json, the panel's one convention for
+ * where a graph's material lives.
+ *
+ * ONE copy, because the two callers disagreed and the disagreement destroyed
+ * data: shader_compile_finalize derived the sibling correctly, while
+ * compile_to_material wrote the material to the graph path itself and
+ * overwrote the graph.  A path convention with two implementations is a
+ * convention exactly until one of them is edited. */
+void mat_json_for_graph(const char *graph_path, char *out, size_t cap)
+{
+    std::snprintf(out, cap, "%s", graph_path ? graph_path : "");
+    jce_editor_path_strip_extension(out);           /* drop .json */
+    char *dot = std::strrchr(out, '.');
+    if (dot && std::strcmp(dot, ".matgraph") == 0) *dot = '\0';
+    std::strncat(out, ".mat.json", cap - std::strlen(out) - 1);
+}
+
 void compile_to_material(void)
 {
     log_clear();
@@ -131,7 +170,7 @@ void compile_to_material(void)
     /* BaseColor (slot 0). */
     {
         float c[4]; char tex[256];
-        eval_socket(out->id, 0, c, tex, 0);
+        eval_output_socket(out->id, 0, c, tex);
         m.base_color_factor[0] = c[0];
         m.base_color_factor[1] = c[1];
         m.base_color_factor[2] = c[2];
@@ -145,7 +184,7 @@ void compile_to_material(void)
     /* Metallic (slot 1). */
     {
         float c[4]; char tex[256];
-        eval_socket(out->id, 1, c, tex, 0);
+        eval_output_socket(out->id, 1, c, tex);
         m.metallic_factor = c[0];
         if (tex[0]) std::snprintf(tex_paths[1], 256, "%s", tex);
         s_prev.metallic = c[0];
@@ -156,7 +195,7 @@ void compile_to_material(void)
     /* Roughness (slot 2). */
     {
         float c[4]; char tex[256];
-        eval_socket(out->id, 2, c, tex, 0);
+        eval_output_socket(out->id, 2, c, tex);
         m.roughness_factor = c[0];
         if (tex[0] && !tex_paths[1][0])
             std::snprintf(tex_paths[1], 256, "%s", tex);
@@ -167,7 +206,7 @@ void compile_to_material(void)
     /* Emissive (slot 3). */
     {
         float c[4]; char tex[256];
-        eval_socket(out->id, 3, c, tex, 0);
+        eval_output_socket(out->id, 3, c, tex);
         m.emissive_factor[0] = c[0];
         m.emissive_factor[1] = c[1];
         m.emissive_factor[2] = c[2];
@@ -181,13 +220,15 @@ void compile_to_material(void)
     }
 
     s_prev.valid = true;
-    if (jce_pbr_material_save_json(s_g.path, &m, tex_paths)) {
-        log_append(false, "saved -> %s", s_g.path);
-        jce_editor_console_log("material compiled: %s", s_g.path);
+    char mat_out[640];
+    mat_json_for_graph(s_g.path, mat_out, sizeof(mat_out));
+    if (jce_pbr_material_save_json(mat_out, &m, tex_paths)) {
+        log_append(false, "saved -> %s", mat_out);
+        jce_editor_console_log("material compiled: %s", mat_out);
     } else {
-        log_append(true, "save failed: %s", s_g.path);
+        log_append(true, "save failed: %s", mat_out);
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "material compile failed: %s", s_g.path);
+            "material compile failed: %s", mat_out);
     }
 }
 
@@ -235,6 +276,23 @@ bool split_output_paths(const char *path, char *out_dir, size_t dir_cap,
 
 } /* anonymous namespace */
 
+/* The last .sc this panel wrote, for the Shader Inspector to prefill from.
+ * A static rather than a member of the graph: it is a fact about the
+ * SESSION ("what did you last generate"), not about the document, and it
+ * must survive loading a different graph. */
+static char s_last_generated_sc[512];
+
+void jce_mgp_note_generated_sc(const char *path)
+{
+    std::snprintf(s_last_generated_sc, sizeof(s_last_generated_sc), "%s",
+                  path ? path : "");
+}
+
+extern "C" const char *jce_panel_material_graph_last_generated_sc(void)
+{
+    return s_last_generated_sc;
+}
+
 void generate_shader(void)
 {
     log_clear();
@@ -262,6 +320,7 @@ void generate_shader(void)
     if (r.ok) {
         log_append(false, "shader -> %s", r.out_path.c_str());
         jce_editor_console_log("shader generated: %s", r.out_path.c_str());
+        jce_mgp_note_generated_sc(r.out_path.c_str());
     } else {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "shader generation failed (%zu error(s))", r.errors.size());
@@ -271,37 +330,6 @@ void generate_shader(void)
 /* ── Phase D: compile & bind ─────────────────────────────────────────── */
 
 namespace {
-
-/* Resolve vs_pbr.sc — the vertex shader our graph-generated fragments
- * link against.  Search order mirrors resolve_template_path():
- *   1. $JCE_SHADER_VS_PBR (explicit override)
- *   2. $JCE_SHADER_DEV_DIR/shaders/pbr/vs_pbr.sc
- *   3. ./engine/shaders/pbr/vs_pbr.sc
- */
-void resolve_vs_pbr_path(char *out, size_t cap)
-{
-    const char *p = std::getenv("JCE_SHADER_VS_PBR");
-    if (p && p[0]) { std::snprintf(out, cap, "%s", p); return; }
-    const char *dev = std::getenv("JCE_SHADER_DEV_DIR");
-    if (dev && dev[0]) {
-        std::snprintf(out, cap, "%s/shaders/pbr/vs_pbr.sc", dev);
-        return;
-    }
-    std::snprintf(out, cap, "engine/shaders/pbr/vs_pbr.sc");
-}
-
-/* The PBR varying.def.sc all graph-generated FS share with vs_pbr. */
-void resolve_varying_def_path(char *out, size_t cap)
-{
-    const char *p = std::getenv("JCE_SHADER_VARYING_DEF");
-    if (p && p[0]) { std::snprintf(out, cap, "%s", p); return; }
-    const char *dev = std::getenv("JCE_SHADER_DEV_DIR");
-    if (dev && dev[0]) {
-        std::snprintf(out, cap, "%s/shaders/pbr/varying_pbr.def.sc", dev);
-        return;
-    }
-    std::snprintf(out, cap, "engine/shaders/pbr/varying_pbr.def.sc");
-}
 
 } /* anonymous namespace */
 
@@ -413,14 +441,51 @@ void shader_compile_finalize(ShaderCompileJob *j)
         return;
     }
 
+    /* AND ONE BLOB PER BACKEND, beside the bare pair written above.
+     *
+     * A bgfx blob is bytecode for exactly one backend.  The bare files are
+     * compiled for whatever backend the EDITOR is running, so on their own
+     * they render here and link-fail everywhere else -- half of the reason a
+     * Shader Graph material did not survive the cook (the other half was that
+     * the packer never collected them at all).  The runtime prefers
+     * `<stem>_<suffix>.bin` and falls back to the bare name, so this is
+     * additive: a material authored before this keeps working.
+     *
+     * A profile that cannot express this graph FAILS LOUDLY here rather than
+     * silently shipping a shader that reverts to stock PBR on that backend --
+     * which is the whole defect being fixed. */
+    {
+        int ntargets = 0;
+        const jce_sg::GraphTarget *tg = jce_sg::graph_targets(&ntargets);
+        int okc = 0;
+        for (int ti = 0; ti < ntargets; ++ti) {
+            jce_sg::ShadercResult tv = jce_sg::compile_sc(
+                j->vs_path, j->var_path, j->include_dir,
+                jce_sg::ShaderKind::Vertex, tg[ti].backend);
+            jce_sg::ShadercResult tf = jce_sg::compile_sc(
+                j->fs_sc_path, j->var_path, j->include_dir,
+                jce_sg::ShaderKind::Fragment, tg[ti].backend);
+            if (!tv.ok || !tf.ok) {
+                log_append(true, "backend %s: not compiled (%s)",
+                           tg[ti].suffix,
+                           tv.ok ? tf.error.c_str() : tv.error.c_str());
+                continue;
+            }
+            char vb[700], fb[700];
+            std::snprintf(vb, sizeof(vb), "%s/vs_%s_%s.bin",
+                          j->dir.c_str(), j->base.c_str(), tg[ti].suffix);
+            std::snprintf(fb, sizeof(fb), "%s/fs_%s_%s.bin",
+                          j->dir.c_str(), j->base.c_str(), tg[ti].suffix);
+            if (jce_fs_host_write_all(vb, tv.blob.data(), (uint64_t)tv.blob.size()) &&
+                jce_fs_host_write_all(fb, tf.blob.data(), (uint64_t)tf.blob.size()))
+                ++okc;
+        }
+        log_append(false, "persisted %d/%d backend variants", okc, ntargets);
+    }
+
     /* Derive sibling .mat.json: <stem>.matgraph.json -> <stem>.mat.json. */
     char mat_json[640];
-    std::snprintf(mat_json, sizeof(mat_json), "%s", j->graph_path.c_str());
-    jce_editor_path_strip_extension(mat_json);      /* drop .json */
-    char *dot2 = std::strrchr(mat_json, '.');
-    if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
-    std::strncat(mat_json, ".mat.json",
-                 sizeof(mat_json) - std::strlen(mat_json) - 1);
+    mat_json_for_graph(j->graph_path.c_str(), mat_json, sizeof(mat_json));
 
     /* Store paths relative to the material dir (bare filenames here, since
      * the graph, blobs and .mat.json share one directory). */
@@ -434,6 +499,22 @@ void shader_compile_finalize(ShaderCompileJob *j)
         log_append(false, "graph shader persisted -> %s", mat_json);
         jce_editor_console_log("material graph: graph shader saved to %s",
                                mat_json);
+        /* AND MAKE THE SCENE AGREE WITH THE PANEL.
+         *
+         * Hot-swapping the program above updates the graph panel's preview
+         * sphere.  Entities already placed in the scene hold their own
+         * resolved program index, taken at load, and the scene renderer caches
+         * the .mat.json -> program association by path and never evicts it --
+         * so the editor showed the new shader in one window and the old one in
+         * the other, with nothing to say which was current.
+         *
+         * Forgetting the cache entry costs one re-read of the .mat.json on the
+         * next draw; re-applying the material walks the entities whose
+         * material_path matches and is what the material viewer's Save already
+         * does. */
+        if (JceSceneRenderer *ssr = jce_editor_get_scene_renderer())
+            jce_scene_renderer_invalidate_custom_program(ssr, mat_json);
+        jce_editor_inspector_reload_material(mat_json);
     } else {
         log_append(true, "failed to write graph ref into %s", mat_json);
     }
@@ -520,20 +601,21 @@ void compile_and_bind(void)
         return;
     }
 
-    char vs_path[1024], var_path[1024];
-    resolve_vs_pbr_path(vs_path, sizeof(vs_path));
-    resolve_varying_def_path(var_path, sizeof(var_path));
-
+    /* Both search orders live in jce_shadergraph_shaderc.cpp -- one copy,
+     * which is also the one the Shader Inspector reads.  The char-buffer
+     * wrappers that used to sit here were a second definition of the same
+     * two names and the dedup audit said so. */
     /* 3. hand the two shaderc invocations to structured background work. */
     ShaderCompileJob *j = new ShaderCompileJob();
-    j->vs_path     = vs_path;
-    j->var_path    = var_path;
+    j->vs_path     = jce_sg::resolve_vs_pbr_path();
+    j->var_path    = jce_sg::resolve_varying_def_path();
     j->include_dir = include_dir;
     j->fs_sc_path  = cg.out_path;
     j->cg_out_path = cg.out_path;
     j->dir         = dir;
     j->base        = base;
     j->graph_path  = s_g.path;
+    jce_mgp_note_generated_sc(cg.out_path.c_str());
 
     log_append(false, "compiling shaders in background…");
     jce_editor_console_log("material graph: compiling shaders in background…");

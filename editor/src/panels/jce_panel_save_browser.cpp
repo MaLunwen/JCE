@@ -13,6 +13,10 @@
  */
 
 #include "ui/jce_editor_panels.h"
+
+extern "C" {
+#include <jce/application/jce_runtime.h>
+}
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_state_internal.h"  /* rebuild_entity_order_from_ecs */
@@ -103,6 +107,9 @@ bool load_snapshot(const char *path)
         return false;
     }
     jce_save_register_scene_provider(reg, scene);
+    /* The live environment rides along: without it a slot saved at
+     * dusk reloads at the scene's authored hour. */
+    jce_save_register_env_provider(reg, scene);
 
     bool ok = jce_snapshot_load_from_file(reg, path);
     jce_save_unregister_scene_provider(reg);   /* free provider context */
@@ -121,6 +128,39 @@ bool load_snapshot(const char *path)
                 + " " + path;
     return ok;
 }
+
+/* Load a slot INTO THE LIVE PLAY SESSION, the way a shipped game does.
+ *
+ * load_snapshot() above stops Play and rehydrates the edit scene: correct for
+ * authoring, and not what a player's "Load Game" does.  This is the other
+ * half, and it is the only way to exercise a save/load round trip in Play --
+ * jce_runtime_load_from_file re-runs the spawn walk, so what comes back has
+ * its physics bodies, script instances, audio voices and triggers, rather than
+ * the inert scene a bare snapshot load leaves. */
+bool load_snapshot_into_play(const char *path)
+{
+    JceRuntime *rt = jce_editor_play_get_runtime();
+    if (!rt) {
+        g_status = jce_editor_i18n_or("saveBrowser.needPlay",
+                                      "Enter Play to load into the session");
+        g_status_ok = false;
+        return false;
+    }
+    const bool ok = jce_runtime_load_from_file(rt, path);
+    /* The scene object is shared with the editor, so the panels that cache
+     * entity order have to be told it changed. */
+    if (ok) {
+        rebuild_entity_order_from_ecs();
+        jce_state_clear_selection();
+    }
+    g_status = std::string(jce_editor_i18n_or(
+        ok ? "saveBrowser.loadedIntoPlay" : "saveBrowser.loadFailed",
+        ok ? "Loaded into the running session" : "Load failed")) + ": " + path;
+    g_status_ok = ok;
+    return ok;
+}
+
+
 
 void rescan()
 {
@@ -187,6 +227,19 @@ extern "C" void jce_editor_panel_save_browser_content(void)
                 ImGui::TableSetColumnIndex(5);
                 if (ImGui::SmallButton(jce_editor_i18n("saveBrowser.load")))
                     load_snapshot(r.path.c_str());
+                /* ...and, while Play is running, the way a SHIPPED game loads:
+                 * into the live session, spawn walk and all.  Disabled outside
+                 * Play because there is no runtime to load into, and a button
+                 * that silently does nothing is worse than one that says why. */
+                ImGui::SameLine();
+                {
+                    const bool live = (jce_editor_play_get_runtime() != NULL);
+                    ImGui::BeginDisabled(!live);
+                    if (ImGui::SmallButton(jce_editor_i18n_or(
+                            "saveBrowser.loadIntoPlay", "Load in Play")))
+                        load_snapshot_into_play(r.path.c_str());
+                    ImGui::EndDisabled();
+                }
             } else {
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("-");
                 ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("-");

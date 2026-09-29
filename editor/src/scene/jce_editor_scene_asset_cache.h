@@ -40,6 +40,14 @@ void jce_editor_scene_asset_cache_clear_resolve_misses(void);
 
 JceMesh *jce_editor_scene_asset_cache_get_mesh(const char *mesh_path,
                                                const float *world_pos);
+/* Same lookup, for a texture whose consuming shader expects a LINEAR value:
+ * the GPU texture is created with an sRGB view so each texel is decoded
+ * BEFORE filtering.  Wired to JceSceneRendererCallbacks::load_texture_srgb,
+ * which the engine calls only for s_albedo, s_emissive and the terrain layer
+ * albedos. */
+JceTexture jce_editor_scene_asset_cache_get_texture_srgb(const char *material_path,
+                                                          const char *mesh_path);
+
 JceTexture jce_editor_scene_asset_cache_get_texture(const char *material_path,
                                                     const char *mesh_path);
 

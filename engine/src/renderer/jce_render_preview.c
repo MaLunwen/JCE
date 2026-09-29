@@ -16,6 +16,7 @@
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_texture.h>   /* jce_texture_colour_space */
 
 #include <bgfx/c99/bgfx.h>
 
@@ -60,7 +61,10 @@ preview_lazy_init(void)
         jce_vec3 ambient_color = { 1.0f, 1.0f, 1.0f };
         jce_light_env_set_ambient(s_light_env, ambient_color, 0.15f);
 
-        JceDirLightDesc sun;
+        /* Was declared and left uninitialised, so cookie_texture and
+         * layer_mask were whatever the stack held -- a garbage handle is a
+         * cookie the same way handle 0 is. */
+        JceDirLightDesc sun = jce_dir_light_desc_default();
         sun.direction.x   = 0.3f;
         sun.direction.y   = 1.0f;
         sun.direction.z   = 0.5f;
@@ -126,7 +130,11 @@ jce_render_preview_sphere(const JceRenderer      *r,
     /* Explicitly disable IBL for preview — the editor preview has no
      * cubemap probes bound, and fs_pbr.sc keys off u_iblParams.x > 0.5
      * to enable the IBL path. u_iblParams.w < 0.5 keeps gamma on. */
-    const float ibl_disabled[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const float ibl_disabled[4] = {
+        0.0f, 0.0f,
+        jce_texture_colour_space() ? (1.0f / 2.2f) : 1.0f,
+        0.0f
+    };
     bgfx_set_uniform(s_u_ibl_params, ibl_disabled, 1);
 
     /* Submit the sphere. The submit variant honours an override

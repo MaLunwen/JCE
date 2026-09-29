@@ -84,6 +84,31 @@ JceTerrain *jce_terrain_cache_acquire(JceTerrainCache *c, const char *path,
     return t;
 }
 
+bool jce_terrain_cache_adopt(JceTerrainCache *c, const char *path,
+                             JceTerrain *terrain)
+{
+    if (!c || !path || !path[0] || !terrain) return false;
+
+    int slot = cache_find(c, path);
+    if (slot < 0) {
+        for (int i = 0; i < TERRAIN_CACHE_MAX; i++) {
+            if (!c->slot[i].used) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) return false;
+
+    if (c->slot[slot].terrain && c->slot[slot].terrain != terrain)
+        jce_terrain_free(c->slot[slot].terrain);
+    c->slot[slot].used = true;
+    jce_strlcpy(c->slot[slot].path, path, TERRAIN_CACHE_PATH);
+    c->slot[slot].terrain = terrain;
+    c->slot[slot].revision = c->next_revision++;
+    return true;
+}
+
 JceTerrain *jce_terrain_cache_peek(const JceTerrainCache *c, const char *path)
 {
     if (!c || !path || !path[0]) return NULL;
@@ -96,6 +121,15 @@ uint64_t jce_terrain_cache_revision(const JceTerrainCache *c, const char *path)
     if (!c || !path || !path[0]) return 0u;
     const int i = cache_find(c, path);
     return (i >= 0) ? c->slot[i].revision : 0u;
+}
+
+bool jce_terrain_cache_touch(JceTerrainCache *c, const char *path)
+{
+    if (!c || !path || !path[0]) return false;
+    const int i = cache_find(c, path);
+    if (i < 0 || !c->slot[i].terrain) return false;
+    c->slot[i].revision = c->next_revision++;
+    return true;
 }
 
 static void cache_drop(JceTerrainCache *c, int i)

@@ -140,9 +140,20 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
  * Cook audio from raw encoded data in memory.
  * input: WAV/OGG/FLAC encoded bytes.
  * output: .jceasset with AUDIO_INFO + AUDIO_PCM chunks.
- */
+ *
+ * `imp` carries the asset's own `<path>.import.json` (force_mono, target
+ * sample rate).  Pass NULL for "no sidecar", which is byte-identical to the
+ * behaviour before sidecars existed.
+ *
+ * It is a PARAMETER and not a JceCookOptions field on purpose: JceCookOptions
+ * is the call's options -- compression level, platform, verbosity -- shared
+ * across every asset a run touches, and these are one asset's.  A per-asset
+ * value living in a shared struct is how a setting for one file reaches the
+ * next one in the loop. */
+struct JceAudioImportSettings;
 JceCookResult jce_cook_audio(const void *input, size_t input_size,
-                             const JceCookOptions *opts);
+                             const JceCookOptions *opts,
+                             const struct JceAudioImportSettings *imp);
 
 /*
  * Cook a raw binary blob (pass-through with optional compression).

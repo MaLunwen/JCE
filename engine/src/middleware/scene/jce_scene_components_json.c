@@ -6,6 +6,15 @@
  */
 
 #include "jce_scene_components_internal.h"
+#include <jce/middleware/scene/jce_material_override.h>
+/* jce_prefab_instantiate{,_file} return JceEntity (uint64_t).  Without this
+ * header they were called through an implicit `extern int`, so only EAX came
+ * back -- and jce_scene.h:3310 says a JceEntity carries its index in the low
+ * 32 bits and its GENERATION in the high 32.  The generation was being thrown
+ * away, and a handle with a zeroed generation reads as a stale handle, which
+ * every entity entry point treats as "no such entity" silently.  Caught
+ * 2026-09-21 by /we4013. */
+#include <jce/middleware/scene/jce_prefab.h>
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_thread.h>
@@ -414,6 +423,12 @@ static cJSON *ser_scene_rendering_settings(
     cJSON_AddNumberToObject(postfx, "ssaoRadius", r->ssao_radius);
     cJSON_AddBoolToObject(postfx, "ssr", r->ssr_enabled);
     cJSON_AddNumberToObject(postfx, "ssrIntensity", r->ssr_intensity);
+    /* Written unconditionally, like ssr above it: this block is the scene's
+     * rendering settings, and a reader that cannot tell "off" from "absent"
+     * is how a default silently becomes a decision. */
+    cJSON_AddBoolToObject(postfx,   "ssgi",          r->ssgi_enabled);
+    cJSON_AddNumberToObject(postfx, "ssgiIntensity", r->ssgi_intensity);
+    cJSON_AddNumberToObject(postfx, "ssgiRadius",    r->ssgi_radius);
     cJSON_AddNumberToObject(postfx, "ssrMaxDistance", r->ssr_max_distance);
     cJSON_AddNumberToObject(postfx, "taaFeedback",    r->taa_feedback);
     cJSON_AddNumberToObject(postfx, "taaLumaClamp",   r->taa_luma_clamp);
@@ -517,6 +532,20 @@ static cJSON *ser_scene_rendering_settings(
         cJSON_AddNumberToObject(look, "lutStrength", r->lut_strength);
         cJSON_AddBoolToObject(look, "toonCharacter", r->toon_character);
         cJSON_AddNumberToObject(look, "bloomKnee", r->bloom_knee);
+        /* Auto exposure.  Every desc field is written, including `key`: a
+         * value the C API can set and the file cannot hold is a silent data
+         * loss on the next save, which is worse than not having the knob. */
+        cJSON_AddBoolToObject(look, "autoExposure", r->auto_exposure);
+        cJSON_AddNumberToObject(look, "aeMinEV",     r->auto_exposure_desc.min_ev);
+        cJSON_AddNumberToObject(look, "aeMaxEV",     r->auto_exposure_desc.max_ev);
+        cJSON_AddNumberToObject(look, "aeSpeedUp",   r->auto_exposure_desc.speed_up);
+        cJSON_AddNumberToObject(look, "aeSpeedDown", r->auto_exposure_desc.speed_down);
+        cJSON_AddNumberToObject(look, "aeBias",      r->auto_exposure_desc.exposure_bias);
+        cJSON_AddNumberToObject(look, "aeKey",       r->auto_exposure_desc.key);
+        cJSON_AddBoolToObject(look,   "dof",            r->dof_enabled);
+        cJSON_AddNumberToObject(look, "dofFocus",       r->dof_focus_distance);
+        cJSON_AddNumberToObject(look, "dofRange",       r->dof_focus_range);
+        cJSON_AddNumberToObject(look, "dofMaxCoc",      r->dof_max_coc);
         cJSON_AddItemToObject(root, "look", look);
     }
 
@@ -733,6 +762,11 @@ static JceSceneRenderingSettings extract_rendering_settings_from_obj(
         r.ssao_radius    = (float)j_num(postfx, "ssaoRadius", r.ssao_radius);
         r.ssr_enabled      = j_bool(postfx, "ssr", r.ssr_enabled);
         r.ssr_intensity    = (float)j_num(postfx, "ssrIntensity", r.ssr_intensity);
+        /* Absent => whatever the defaults said, which is off: an older scene
+         * renders byte-identically. */
+        r.ssgi_enabled     = j_bool(postfx, "ssgi", r.ssgi_enabled);
+        r.ssgi_intensity   = (float)j_num(postfx, "ssgiIntensity", r.ssgi_intensity);
+        r.ssgi_radius      = (float)j_num(postfx, "ssgiRadius",    r.ssgi_radius);
         r.ssr_max_distance = (float)j_num(postfx, "ssrMaxDistance", r.ssr_max_distance);
         r.taa_feedback     = (float)j_num(postfx, "taaFeedback",    r.taa_feedback);
         r.taa_luma_clamp   = (float)j_num(postfx, "taaLumaClamp",   r.taa_luma_clamp);
@@ -872,6 +906,20 @@ static JceSceneRenderingSettings extract_rendering_settings_from_obj(
         r.lut_strength   = (float)j_num(look, "lutStrength", r.lut_strength);
         r.toon_character = j_bool(look, "toonCharacter", r.toon_character);
         r.bloom_knee     = (float)j_num(look, "bloomKnee", r.bloom_knee);
+        /* Defaults-first: `r` already carries jce_auto_exposure_desc_default(),
+         * so an absent key keeps the engine default rather than zeroing it. */
+        JceAutoExposureDesc *ae = &r.auto_exposure_desc;
+        r.auto_exposure  = j_bool(look, "autoExposure", r.auto_exposure);
+        ae->min_ev        = (float)j_num(look, "aeMinEV",     ae->min_ev);
+        ae->max_ev        = (float)j_num(look, "aeMaxEV",     ae->max_ev);
+        ae->speed_up      = (float)j_num(look, "aeSpeedUp",   ae->speed_up);
+        ae->speed_down    = (float)j_num(look, "aeSpeedDown", ae->speed_down);
+        ae->exposure_bias = (float)j_num(look, "aeBias",      ae->exposure_bias);
+        ae->key           = (float)j_num(look, "aeKey",       ae->key);
+        r.dof_enabled        = j_bool(look, "dof", r.dof_enabled);
+        r.dof_focus_distance = (float)j_num(look, "dofFocus",  (double)r.dof_focus_distance);
+        r.dof_focus_range    = (float)j_num(look, "dofRange",  (double)r.dof_focus_range);
+        r.dof_max_coc        = (float)j_num(look, "dofMaxCoc", (double)r.dof_max_coc);
     }
 
     return r;
@@ -1035,6 +1083,54 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     mr.ao_strength      = (float)j_num(c, "aoStrength",  1.0);
     mr.alpha_mode       = (int)j_num(c, "alphaMode",   0);
     mr.alpha_cutoff     = (float)j_num(c, "alphaCutoff", 0.5);
+    mr.render_priority  = (int16_t)j_num(c, "renderPriority", 0.0);
+    /* Defaults 1,1 / 0,0 -- NOT the surrounding memset.  A tiling of zero
+     * collapses every map to one texel, so a scene written before this key
+     * existed has to land on the neutral transform, not on the struct's
+     * zeroed bytes. */
+    mr.uv_tiling[0]     = (float)j_num(c, "uvTilingX", 1.0);
+    mr.uv_tiling[1]     = (float)j_num(c, "uvTilingY", 1.0);
+    mr.uv_offset[0]     = (float)j_num(c, "uvOffsetX", 0.0);
+    mr.uv_offset[1]     = (float)j_num(c, "uvOffsetY", 0.0);
+    /* 1 = JCE_BLEND_ALPHA, the equation every material composited with before
+     * this was read -- NOT the surrounding memset's 0, which is NONE. */
+    mr.blend_mode       = (int)j_num(c, "blendMode", 1.0);
+    /* Absent keys => OFF, so every older scene loads with the test disabled.
+     * Read mask defaults to 0xFF (all bits), as Unity's does. */
+    mr.stencil_func      = (int)j_num(c, "stencilFunc",     0.0);
+    mr.stencil_ref       = (int)j_num(c, "stencilRef",      0.0);
+    mr.stencil_read_mask = (int)j_num(c, "stencilReadMask", 255.0);
+    mr.stencil_fail_op   = (int)j_num(c, "stencilFailOp",   0.0);
+    mr.stencil_zfail_op  = (int)j_num(c, "stencilZFailOp",  0.0);
+    mr.stencil_pass_op   = (int)j_num(c, "stencilPassOp",   0.0);
+    /* Absent keys => both lobes off, so every older scene shades identically. */
+    mr.clearcoat           = (float)j_num(c, "clearcoat",          0.0);
+    mr.clearcoat_roughness = (float)j_num(c, "clearcoatRoughness", 0.0);
+    mr.sheen_color[0]      = (float)j_num(c, "sheenColorR",        0.0);
+    mr.sheen_color[1]      = (float)j_num(c, "sheenColorG",        0.0);
+    mr.sheen_color[2]      = (float)j_num(c, "sheenColorB",        0.0);
+    mr.sheen_roughness     = (float)j_num(c, "sheenRoughness",     0.0);
+    mr.anisotropy             = (float)j_num(c, "anisotropy",            0.0);
+    mr.anisotropy_rotation    = (float)j_num(c, "anisotropyRotation",    0.0);
+    mr.translucency           = (float)j_num(c, "translucency",          0.0);
+    mr.translucency_thickness = (float)j_num(c, "translucencyThickness", 0.0);
+    /* WHITE, not black, when absent: the tint MULTIPLIES the transmitted
+     * light, so a zero default would make a scene that authored
+     * `translucency` and nothing else transmit nothing -- the field would look
+     * broken rather than defaulted. */
+    mr.translucency_color[0]  = (float)j_num(c, "translucencyColorR",    1.0);
+    mr.translucency_color[1]  = (float)j_num(c, "translucencyColorG",    1.0);
+    mr.translucency_color[2]  = (float)j_num(c, "translucencyColorB",    1.0);
+    mr.material_override_mask = (uint32_t)j_num(c, "materialOverrides", 0.0);
+    /* A scene that names a lobe IS claiming it, whether or not it also wrote
+     * the mask: an all-zero lobe set is exactly the never-authored state, so
+     * "any lobe non-zero" and "the key was present and meant something" are
+     * the same predicate.  This keeps hand-written and exported scenes from
+     * having to know about bit 6 to be believed. */
+    if (mr.clearcoat > 0.0f || mr.sheen_color[0] > 0.0f ||
+        mr.sheen_color[1] > 0.0f || mr.sheen_color[2] > 0.0f ||
+        mr.anisotropy > 0.0f || mr.translucency > 0.0f)
+        mr.material_override_mask |= JCE_MR_OVERRIDE_LOBES;
     mr.double_sided     = j_bool(c, "doubleSided", false);
     /* Unity-style per-renderer shadow flags; default ON (legacy scenes lack
        the keys). Stored inverted in the component. */
@@ -1158,18 +1254,12 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 if (tex_paths[2][0]) mr.normal_tex = jce_scene_intern(s, tex_paths[2]);
                 if (tex_paths[3][0]) mr.ao_tex = jce_scene_intern(s, tex_paths[3]);
                 if (tex_paths[4][0]) mr.emissive_tex = jce_scene_intern(s, tex_paths[4]);
-                /* Forward PBR factors so backfilled materials shade correctly. */
-                mr.base_color[0] = pbr.base_color_factor[0];
-                mr.base_color[1] = pbr.base_color_factor[1];
-                mr.base_color[2] = pbr.base_color_factor[2];
-                mr.base_color[3] = pbr.base_color_factor[3];
-                mr.metallic     = pbr.metallic_factor;
-                mr.roughness    = pbr.roughness_factor;
-                mr.emissive[0]  = pbr.emissive_factor[0];
-                mr.emissive[1]  = pbr.emissive_factor[1];
-                mr.emissive[2]  = pbr.emissive_factor[2];
-                mr.normal_scale = pbr.normal_scale;
-                mr.ao_strength  = pbr.ao_strength;
+                /* Forward the backfilled material's factors -- except the
+                 * ones this renderer overrides.  This was an unconditional
+                 * copy of all six, so tinting one instance of a shared
+                 * material was discarded on the next load, silently, with the
+                 * authored value still sitting in the scene file. */
+                jce_mesh_renderer_apply_material_pbr(&mr, &pbr);
                 if (pbr.custom_program != UINT16_MAX) {
                     mr.has_custom_program = true;
                     mr.custom_program_idx = pbr.custom_program;
@@ -1192,8 +1282,13 @@ static void parse_camera(JceScene *s, JceEntity e, const cJSON *c)
     cc.ortho      = j_bool(c, "orthographic", false);
     if (!cc.ortho) cc.ortho = j_bool(c, "ortho", false);
     if (!cc.ortho) cc.ortho = j_bool(c, "isOrtho", false);
+    /* Orthographic height in world units; 0 leaves the camera default. */
+    cc.ortho_size = (float)j_num(c, "orthoSize", 0.0);
     cc.stack_index = (uint8_t)(int)j_num(c, "stackIndex", 0);
     cc.clear_mode  = (uint8_t)(int)j_num(c, "clearMode",  0);
+    /* Absent (an older scene, or one that never masked) parses to 0, which
+     * this field spells as "no filtering" -- see JceCameraComponent. */
+    cc.culling_mask = (uint32_t)j_num(c, "cullingMask", 0.0);
     jce_scene_set_camera(s, e, &cc);
 }
 
@@ -1338,15 +1433,6 @@ static void parse_video_player(JceScene *s, JceEntity e, const cJSON *c)
 
 
 
-/* One-way legacy migration (consolidation v0.9.9). The orphaned VFX
- * Graph runtime was removed — its `*.vfx.json` key set always parsed
- * identically to `*.particles.json`, so the authored graphPath maps
- * straight onto a ParticleEmitterComponent asset path and the entity
- * joins the standard particle pipeline. Legacy-only knobs
- * (playOnAwake / loop / rateMultiplier / intensity) have no
- * counterpart and are dropped. An explicitly authored ParticleEmitter
- * on the same entity always wins; the component is never re-saved as
- * VfxGraph (its registry row has serialize == NULL). */
 static void parse_vfx_graph_migrate(JceScene *s, JceEntity e, const cJSON *props)
 {
     const char *gp = j_str(props, "graphPath", "");
@@ -1469,10 +1555,13 @@ static void ser_camera(const JceCameraComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "farClip",  c->far_plane);
     cJSON_AddBoolToObject(o, "primary", c->is_primary);
     cJSON_AddBoolToObject(o, "orthographic", c->ortho);
+    cJSON_AddNumberToObject(o, "orthoSize", c->ortho_size);
     if (c->stack_index != 0)
         cJSON_AddNumberToObject(o, "stackIndex", c->stack_index);
     if (c->clear_mode != 0)
         cJSON_AddNumberToObject(o, "clearMode",  c->clear_mode);
+    if (c->culling_mask != 0u)
+        cJSON_AddNumberToObject(o, "cullingMask", (double)c->culling_mask);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2012,6 +2101,78 @@ static void count_existing_entity_cb(JceScene *scene, JceEntity e, void *ud)
         (*count)++;
 }
 
+/* ── Prefab instance: rebuild the subtree the scene file does NOT carry ──
+ *
+ * The editor writes an instance as "overrides":[...] plus ONLY the differing
+ * components and an EMPTY children array -- compact and correct, PROVIDED the
+ * loader instantiates the source first.  This one did not, so a shipped level
+ * rebuilt every placed prefab as one bare entity: the full rationale and the
+ * measurement are in tools/lint/check_prefab_override_parity.py.
+ *
+ * Overlay, not replace: instantiate the source, TRANSPLANT it onto the entity
+ * the caller already created (the one the parent fix-up pass has in its remap
+ * table), and let the node's own components parse on top so an override wins.
+ *
+ * Returns false when the source will not instantiate; the caller then takes the
+ * unchanged full-snapshot path.  A prefab that was moved or is missing from the
+ * PAK must degrade to whatever the node still carries, never delete the entity.
+ */
+static bool load_prefab_instance_overlay(JceScene *scene, JceEntity dst,
+                                         const cJSON *eobj)
+{
+    const cJSON *ov = cJSON_GetObjectItemCaseSensitive(eobj, "overrides");
+    if (!cJSON_IsArray(ov)) return false;          /* legacy full snapshot */
+
+    if (!j_bool(eobj, "prefabInstance", false)) return false;
+    const char *path = j_str(eobj, "prefabPath", "");
+    if (!path || !path[0]) return false;
+
+    /* Same VFS the material resolver uses, so a prefab inside the shipped PAK
+     * resolves exactly like every other asset this scene references. */
+    const JceFileSystem *fs = sse_context_get()->asset_fs;
+    JceEntity src_root = fs
+        ? jce_prefab_instantiate(scene, fs, path, NULL)
+        : jce_prefab_instantiate_file(scene, path, NULL);
+    if (src_root == 0) {
+        LOG_WARN(LOG_TAG,
+                 "prefab instance '%s' could not be instantiated; keeping the "
+                 "scene node's own components", path);
+        return false;
+    }
+
+    /* Components of the source root onto dst, through the same
+     * serialize -> parse path every other loader uses, so no component needs a
+     * bespoke copy routine and none can be forgotten. */
+    JceJson *comps = jce_scene_serialize_entity_components(scene, src_root);
+    if (comps) {
+        int n = cJSON_GetArraySize((const cJSON *)comps);
+        for (int i = 0; i < n; i++)
+            parse_one_component(scene, dst,
+                                cJSON_GetArrayItem((const cJSON *)comps, i));
+        jce_json_free(comps);
+    }
+
+    /* Re-parent the source's children onto dst, then drop the now-empty source
+     * root.
+     *
+     * Take-one-and-move rather than snapshot-the-list: set_parent mutates the
+     * child list being iterated, and the engine has no JCE_MAX_CHILDREN (that
+     * constant is editor-side), so any fixed buffer here would silently
+     * TRUNCATE a wide prefab -- losing exactly the children this whole function
+     * exists to restore.  The bound is a guard against a set_parent that
+     * refuses, not an expected limit. */
+    {
+        const int guard = 1 << 20;
+        for (int i = 0; i < guard; i++) {
+            JceEntity kid = 0;
+            if (jce_scene_get_children(scene, src_root, &kid, 1) < 1) break;
+            jce_scene_set_parent(scene, kid, dst);
+        }
+    }
+    jce_scene_destroy_entity(scene, src_root);
+    return true;
+}
+
 /* Create one entity from its JSON object and parse its components/meta into
  * map[*loaded] (the first-pass body, extracted so the one-shot and streaming
  * loaders run byte-identical work).  Advances *loaded on success. */
@@ -2076,6 +2237,10 @@ static void load_one_entity(JceScene *scene, const cJSON *eobj,
             jce_scene_set_entity_layer(scene, new_e, (uint8_t)lyr);
         }
     }
+
+    /* A prefab instance rebuilds its source FIRST; the node's own
+     * components are the overrides and are parsed on top below. */
+    (void)load_prefab_instance_overlay(scene, new_e, eobj);
 
     const cJSON *comps = cJSON_GetObjectItemCaseSensitive(eobj, "components");
     if (!comps) comps = cJSON_GetObjectItemCaseSensitive(eobj, "component");
@@ -2210,7 +2375,9 @@ static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
         JceEntity e = map[i].new_id;
 
         /* uint64 refs share one resolve loop. */
-        uint64_t *refs64[5];
+        /* 6, not 5: the five below filled it exactly, so BoneAttachment's
+         * ref would have written one past the end of a stack array. */
+        uint64_t *refs64[6];
         int n64 = 0;
         JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(scene, e);
         if (vc) { refs64[n64++] = &vc->follow_target;
@@ -2221,6 +2388,34 @@ static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
         if (j2) refs64[n64++] = &j2->connected_body;
         JceNavAgentComponent *na = jce_scene_get_nav_agent(scene, e);
         if (na) refs64[n64++] = &na->target_entity;
+        JceBoneAttachmentComponent *ba = jce_scene_get_bone_attachment(scene, e);
+        if (ba) refs64[n64++] = &ba->target;
+        /* An ENTITY-kind script parameter is a cross-entity reference like any
+         * other and goes through the same src_id -> new_id map.  Handled in
+         * its own loop rather than through refs64[] because the count is
+         * per-entity data (up to JCE_SCRIPT_PARAM_MAX of them) and that array
+         * is sized for a fixed set of single refs. */
+        JceScriptComponent *spc = jce_scene_get_script(scene, e);
+        if (spc) {
+            int pn = spc->param_count;
+            if (pn < 0) pn = 0;
+            if (pn > JCE_SCRIPT_PARAM_MAX) pn = JCE_SCRIPT_PARAM_MAX;
+            for (int pi = 0; pi < pn; ++pi) {
+                JceScriptParam *pm = &spc->params[pi];
+                if (pm->kind != (uint32_t)JCE_SCRIPT_PARAM_ENTITY) continue;
+                if (pm->entity == 0) continue;
+                uint64_t resolved = 0;
+                for (int j = 0; j < loaded; j++)
+                    if (map[j].src_id == (JceEntity)pm->entity) {
+                        resolved = (uint64_t)map[j].new_id; break;
+                    }
+                /* Unresolvable becomes 0, the same rule every other reference
+                 * here follows: a dangling id may now belong to an unrelated
+                 * entity, and pointing a turret at a rock is worse than
+                 * pointing it at nothing. */
+                pm->entity = resolved;
+            }
+        }
         for (int r = 0; r < n64; r++) {
             uint64_t src = *refs64[r];
             if (src == 0) continue;
@@ -2614,11 +2809,16 @@ bool jce_scene_rendering_settings_from_json(const char *json,
  * light components.  DirectionalLight/PointLight/SpotLight also keep
  * their own rows (serialize == NULL) so their legacy flag bits and
  * per-type enable toggles stay addressable. */
+/* EVERY light kind.  This predicate is what makes the unified "Light"
+ * serialiser run at all, so a kind missing here is a component that saves as
+ * nothing and is gone on reload -- which is exactly what
+ * test_jce_authoring_surface_sweep caught for AreaLight. */
 static bool reg_has_light_any(const JceScene *s, JceEntity e)
 {
     return jce_scene_has_dir_light(s, e)
         || jce_scene_has_point_light(s, e)
-        || jce_scene_has_spot_light(s, e);
+        || jce_scene_has_spot_light(s, e)
+        || jce_scene_has_area_light(s, e);
 }
 
 static void reg_remove_light_any(JceScene *s, JceEntity e)
@@ -2626,6 +2826,7 @@ static void reg_remove_light_any(JceScene *s, JceEntity e)
     if (jce_scene_has_dir_light(s, e))   jce_scene_remove_dir_light(s, e);
     if (jce_scene_has_point_light(s, e)) jce_scene_remove_point_light(s, e);
     if (jce_scene_has_spot_light(s, e))  jce_scene_remove_spot_light(s, e);
+    if (jce_scene_has_area_light(s, e))  jce_scene_remove_area_light(s, e);
 }
 
 /* Type-erased get/set adapters over the public per-type accessors.
@@ -2644,6 +2845,9 @@ static void reg_remove_light_any(JceScene *s, JceEntity e)
         jce_scene_set_##SUFFIX(s, e, (const T *)d);                         \
     }
 
+REG_ACCESSORS(content_size_fitter, JceContentSizeFitterComponent)
+REG_ACCESSORS(bone_attachment, JceBoneAttachmentComponent)
+REG_ACCESSORS(area_light, JceAreaLight)
 REG_ACCESSORS(transform, JceTransform)
 REG_ACCESSORS(pivot, JcePivotComponent)
 REG_ACCESSORS(mesh_renderer, JceMeshRenderer)
@@ -2715,6 +2919,7 @@ REG_ACCESSORS(billboard_renderer, JceBillboardRendererComponent)
 REG_ACCESSORS(canvas, JceCanvasComponent)
 REG_ACCESSORS(canvas_group, JceCanvasGroupComponent)
 REG_ACCESSORS(layout_group, JceLayoutGroupComponent)
+REG_ACCESSORS(layout_element, JceLayoutElementComponent)
 REG_ACCESSORS(ui_image, JceUIImageComponent)
 REG_ACCESSORS(ui_text, JceUITextComponent)
 REG_ACCESSORS(ui_button, JceUIButtonComponent)
@@ -2807,6 +3012,16 @@ void jce_scene_components_register_all(void)
         parse_spot_light, NULL,
         reg_get_spot_light, reg_set_spot_light, sizeof(JceSpotLight));
 
+    /* Flag 0: the 64-bit JCE_COMP_FLAG space is full, so this is
+     * presence-gated like ContentSizeFitter / FootIk / NavAgent.  The whole
+     * Light family parses through parse_light_unified, so PARSE is NULL here
+     * exactly as it is for SpotLight above. */
+    REG("AreaLight", NULL, NULL, NULL,
+        0,
+        jce_scene_has_area_light, jce_scene_remove_area_light,
+        NULL, NULL,
+        reg_get_area_light, reg_set_area_light, sizeof(JceAreaLight));
+
     REG("Skybox", "skybox", NULL, NULL,
         JCE_COMP_FLAG_SKYBOX,
         jce_scene_has_skybox, jce_scene_remove_skybox,
@@ -2825,11 +3040,13 @@ void jce_scene_components_register_all(void)
         parse_sprite_animator, serw_sprite_animator,
         reg_get_sprite_animator, reg_set_sprite_animator, sizeof(JceSpriteAnimatorComponent));
 
+    /* RETIRED — parse migrates onto SkeletalAnimator (and gives it the rig
+     * from the entity's MeshRenderer); never re-saved (serialize == NULL). */
     REG("Animator", "animator", NULL, NULL,
         JCE_COMP_FLAG_ANIMATOR,
         jce_scene_has_animator, jce_scene_remove_animator,
-        parse_animator, serw_animator,
-        reg_get_animator, reg_set_animator, sizeof(JceAnimatorComponent));
+        parse_animator_migrate, NULL,
+        NULL, NULL, 0);
 
     REG("SkeletalAnimator", "Skeletal Animator", NULL, NULL,
         JCE_COMP_FLAG_SKELETAL_ANIMATOR,
@@ -3182,6 +3399,24 @@ void jce_scene_components_register_all(void)
         parse_canvas, serw_canvas,
         reg_get_canvas, reg_set_canvas, sizeof(JceCanvasComponent));
 
+    /* Flag 0: the 64-bit JCE_COMP_FLAG space is full, so this is
+     * presence-gated like FootIk and FullBodyIk above. */
+    REG("ContentSizeFitter", "contentSizeFitter", NULL, NULL,
+        0,
+        jce_scene_has_content_size_fitter, jce_scene_remove_content_size_fitter,
+        parse_content_size_fitter, serw_content_size_fitter,
+        reg_get_content_size_fitter, reg_set_content_size_fitter,
+        sizeof(JceContentSizeFitterComponent));
+
+    /* Flag 0: the 64-bit JCE_COMP_FLAG space is full, so this is
+     * presence-gated like ContentSizeFitter above. */
+    REG("BoneAttachment", "boneAttachment", NULL, NULL,
+        0,
+        jce_scene_has_bone_attachment, jce_scene_remove_bone_attachment,
+        parse_bone_attachment, serw_bone_attachment,
+        reg_get_bone_attachment, reg_set_bone_attachment,
+        sizeof(JceBoneAttachmentComponent));
+
     REG("CanvasGroup", "canvasGroup", NULL, NULL,
         JCE_COMP_FLAG_CANVAS_GROUP,
         jce_scene_has_canvas_group, jce_scene_remove_canvas_group,
@@ -3193,6 +3428,17 @@ void jce_scene_components_register_all(void)
         jce_scene_has_layout_group, jce_scene_remove_layout_group,
         parse_layout_group, serw_layout_group,
         reg_get_layout_group, reg_set_layout_group, sizeof(JceLayoutGroupComponent));
+
+    /* legacy_flag 0: the 64-bit JCE_COMP_FLAG_* space is FULL at bit 63, and
+     * the registry documents 0 as the value for new components -- reachable by
+     * id and name, which is what the per-component disable and the Inspector
+     * both use.  Nothing needs the bit. */
+    REG("LayoutElement", "layoutElement", NULL, NULL,
+        0,
+        jce_scene_has_layout_element, jce_scene_remove_layout_element,
+        parse_layout_element, serw_layout_element,
+        reg_get_layout_element, reg_set_layout_element,
+        sizeof(JceLayoutElementComponent));
 
     REG("UIImage", "uiImage", NULL, NULL,
         JCE_COMP_FLAG_UI_IMAGE,
@@ -3370,6 +3616,35 @@ char *jce_scene_component_to_json(JceScene *s, JceEntity e, const char *type)
     return out;
 }
 
+/* Defined below, next to jce_scene_rendering_apply_json, which has always
+ * merged.  This one did not, which is the asymmetry fixed here. */
+static void rs_json_merge(cJSON *dst, const cJSON *patch);
+
+/* comp_set is a PARTIAL update, not a replacement.
+ *
+ * It used to hand the caller's fragment straight to the component's parse
+ * function -- and every parse_* opens with `memset(&x, 0, sizeof x)` and then
+ * fills each field from j_num/j_bool with a LITERAL default.  So the most
+ * obvious UI scripting call there is,
+ *
+ *     comp_set(e, "CanvasGroup", '{"alpha": 0.5}')      -- fade a panel
+ *
+ * also reset interactable to true, blocks_raycasts to true and
+ * ignore_parent_groups to false, discarding whatever the scene had authored.
+ * Every component was affected, not only UI: any comp_set naming fewer keys
+ * than the component has silently reverted the rest to parse-time defaults.
+ *
+ * jce_scene_rendering_apply_json a few lines below has always done the right
+ * thing -- serialize the current state, overlay the patch, apply the result --
+ * so the two halves of the same scripting API disagreed about what "set" means.
+ * They agree now, through the same merge helper.
+ *
+ * Unity's JsonUtility.FromJsonOverwrite, Godot's per-property set() and UE's
+ * property system are all overwrite-what-is-present for the same reason.
+ *
+ * A component that is ABSENT has nothing to merge onto, so the patch IS the
+ * whole component -- which is how a script ADDS one, and stays exactly as it
+ * behaved before. */
 bool jce_scene_component_apply_json(JceScene *s, JceEntity e,
                                     const char *type, const char *json)
 {
@@ -3379,10 +3654,28 @@ bool jce_scene_component_apply_json(JceScene *s, JceEntity e,
     const JceComponentDesc *d = jce_component_desc(comp_id);
     if (!d || !d->parse) return false;
 
-    cJSON *props = cJSON_Parse(json);
-    if (!props) return false;
-    d->parse(s, e, props);
-    cJSON_Delete(props);
+    cJSON *patch = cJSON_Parse(json);
+    if (!patch) return false;
+
+    cJSON *merged = NULL;
+    if (d->serialize && d->has && d->has(s, e)) {
+        cJSON *arr = cJSON_CreateArray();
+        if (arr) {
+            d->serialize(s, e, arr);
+            cJSON *first = cJSON_GetArrayItem(arr, 0);
+            if (first) merged = cJSON_Duplicate(first, 1);
+            cJSON_Delete(arr);
+        }
+    }
+
+    if (merged) {
+        rs_json_merge(merged, patch);
+        d->parse(s, e, merged);
+        cJSON_Delete(merged);
+    } else {
+        d->parse(s, e, patch);
+    }
+    cJSON_Delete(patch);
     return true;
 }
 

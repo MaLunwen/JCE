@@ -56,6 +56,9 @@ public final class JceScriptRuntime {
     private static final int H_DESTROY   = 1 << 2;
     private static final int H_COLLISION = 1 << 3;
     private static final int H_ANIM      = 1 << 4;
+    /* Its own bit: a fixed-step handler that throws every physics step
+     * must not disable the render-frame callback as collateral. */
+    private static final int H_FIXED     = 1 << 5;
 
     /** One live script instance: the state that survives a rebind, plus the
      *  behaviour object that does not. */
@@ -256,6 +259,7 @@ public final class JceScriptRuntime {
     private static int handlerBit(String hook) {
         if (hook.equals("on_start"))     return H_START;
         if (hook.equals("on_update"))    return H_UPDATE;
+        if (hook.equals("on_fixed_update")) return H_FIXED;
         if (hook.equals("on_collision")) return H_COLLISION;
         if (hook.equals("on_anim_event")) return H_ANIM;
         /* on_destroy is deliberately absent: it is dispatched once and the
@@ -269,6 +273,11 @@ public final class JceScriptRuntime {
     public void callUpdate(int handle, float dt) {
         Instance in = live(handle, H_UPDATE);
         if (in != null) in.behaviour.onUpdate(dt);
+    }
+
+    public void callFixedUpdate(int handle, float dt) {
+        Instance in = live(handle, H_FIXED);
+        if (in != null) in.behaviour.onFixedUpdate(dt);
     }
 
     public void callCollision(int handle, long other) {
@@ -521,6 +530,7 @@ public final class JceScriptRuntime {
         int m = 0;
         if (declares(c, "onStart")) m |= H_START;
         if (declares(c, "onUpdate", float.class)) m |= H_UPDATE;
+        if (declares(c, "onFixedUpdate", float.class)) m |= H_FIXED;
         if (declares(c, "onDestroy")) m |= H_DESTROY;
         if (declares(c, "onCollision", long.class)) m |= H_COLLISION;
         if (declares(c, "onAnimEvent", int.class, String.class,

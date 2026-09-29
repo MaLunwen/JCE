@@ -13,10 +13,24 @@ extern "C" {
 #endif
 
 #include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/animation/jce_anim_clip_io.h>
 #include <jce/middleware/animation/jce_anim_compress.h>
 #include <jce/middleware/animation/jce_anim_fbbik.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
+
+/* Completed 2026-08-31.  These headers export JCE_API symbols and were
+ * reachable from NO umbrella, so §4's promise -- `#include <jce/api.h>`
+ * gives you the whole engine -- did not hold for them.  Several are named
+ * in §4's own table by capability.
+ */
+#include <jce/middleware/animation/jce_anim_blend_tree.h>
+#include <jce/middleware/animation/jce_anim_foot_ik.h>
+#include <jce/middleware/animation/jce_anim_sm.h>
+#include <jce/middleware/animation/jce_anim_sm_binding.h>
+#include <jce/middleware/animation/jce_avatar.h>
+#include <jce/middleware/animation/jce_humanoid.h>
+#include <jce/middleware/animation/jce_avatar_mask.h>
 
 
 

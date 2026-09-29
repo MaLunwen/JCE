@@ -28,7 +28,7 @@
  * (`ok`) rather than made with a NULL argument the host would have to
  * interpret.
  *
- * 71 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
+ * 101 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
  */
 
 #include <jni.h>
@@ -155,6 +155,28 @@ JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nGetScale(
     (void)cls;
     memset(out_xyz, 0, sizeof out_xyz);
     if (jce_script_api_get_scale(jce_java_api(api), (JceScriptEntity)e, out_xyz)) {
+        ret = JNI_TRUE;
+        outFloat[0] = (jfloat)out_xyz[0];
+        outFloat[1] = (jfloat)out_xyz[1];
+        outFloat[2] = (jfloat)out_xyz[2];
+        if (j_outFloat)
+            (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 3, outFloat);
+    }
+    return ret;
+}
+
+
+/* jce.get_world_position -> jce_script_api_get_world_position (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nGetWorldPosition(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jfloatArray j_outFloat)
+{
+    jboolean ret = JNI_FALSE;
+    float out_xyz[3];
+    jfloat outFloat[3];
+
+    (void)cls;
+    memset(out_xyz, 0, sizeof out_xyz);
+    if (jce_script_api_get_world_position(jce_java_api(api), (JceScriptEntity)e, out_xyz)) {
         ret = JNI_TRUE;
         outFloat[0] = (jfloat)out_xyz[0];
         outFloat[1] = (jfloat)out_xyz[1];
@@ -503,6 +525,75 @@ JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nRaycast(
         if (j_outFloat)
             (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 7, outFloat);
     }
+    return ret;
+}
+
+
+/* jce.raycast_filtered -> jce_script_api_raycast_filtered (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nRaycastFiltered(
+    JNIEnv *env, jclass cls, jlong api, jfloatArray j_origin, jfloatArray j_dir,
+    jfloat max_dist, jint layer_mask, jboolean hit_triggers, jlongArray j_outLong,
+    jfloatArray j_outFloat)
+{
+    jboolean ret = JNI_FALSE;
+    float origin[3];
+    float dir[3];
+    JceScriptRaycastHit out;
+    jlong outLong[1];
+    jfloat outFloat[7];
+
+    (void)cls;
+    memset(origin, 0, sizeof origin);
+    if (j_origin)
+        (*env)->GetFloatArrayRegion(env, j_origin, 0, 3, (jfloat *)origin);
+    memset(dir, 0, sizeof dir);
+    if (j_dir)
+        (*env)->GetFloatArrayRegion(env, j_dir, 0, 3, (jfloat *)dir);
+    memset(&out, 0, sizeof out);
+    if (jce_script_api_raycast_filtered(jce_java_api(api), origin, dir, (float)max_dist, (uint32_t)layer_mask, (bool)hit_triggers, &out)) {
+        ret = JNI_TRUE;
+        outLong[0] = (jlong)out.entity;
+        if (j_outLong)
+            (*env)->SetLongArrayRegion(env, j_outLong, 0, 1, outLong);
+        outFloat[0] = (jfloat)out.point[0];
+        outFloat[1] = (jfloat)out.point[1];
+        outFloat[2] = (jfloat)out.point[2];
+        outFloat[3] = (jfloat)out.normal[0];
+        outFloat[4] = (jfloat)out.normal[1];
+        outFloat[5] = (jfloat)out.normal[2];
+        outFloat[6] = (jfloat)out.distance;
+        if (j_outFloat)
+            (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 7, outFloat);
+    }
+    return ret;
+}
+
+
+/* jce.raycast_all -> jce_script_api_raycast_all (entity_table) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nRaycastAll(
+    JNIEnv *env, jclass cls, jlong api, jfloatArray j_origin, jfloatArray j_dir,
+    jfloat max_dist, jint layer_mask, jboolean hit_triggers, jlongArray j_out)
+{
+    jint ret = 0;
+    float origin[3];
+    float dir[3];
+    jlong found[256];
+    int n;
+
+    (void)cls;
+    memset(origin, 0, sizeof origin);
+    if (j_origin)
+        (*env)->GetFloatArrayRegion(env, j_origin, 0, 3, (jfloat *)origin);
+    memset(dir, 0, sizeof dir);
+    if (j_dir)
+        (*env)->GetFloatArrayRegion(env, j_dir, 0, 3, (jfloat *)dir);
+    memset(found, 0, sizeof found);
+    n = jce_script_api_raycast_all(jce_java_api(api), origin, dir, (float)max_dist, (uint32_t)layer_mask, (bool)hit_triggers, (JceScriptEntity *)found, 256);
+    if (n > 256)
+        n = 256;
+    if (n > 0 && j_out)
+        (*env)->SetLongArrayRegion(env, j_out, 0, n, found);
+    ret = (jint)(n > 0 ? n : 0);
     return ret;
 }
 
@@ -926,6 +1017,37 @@ JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nUiSetSlider(
     (void)env;
     (void)cls;
     jce_script_api_ui_set_slider(jce_java_api(api), (JceScriptEntity)e, (float)v);
+}
+
+
+/* jce.ui_get_progress -> jce_script_api_ui_get_progress (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nUiGetProgress(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jfloatArray j_outFloat)
+{
+    jboolean ret = JNI_FALSE;
+    float out;
+    jfloat outFloat[1];
+
+    (void)cls;
+    memset(&out, 0, sizeof out);
+    if (jce_script_api_ui_get_progress(jce_java_api(api), (JceScriptEntity)e, &out)) {
+        ret = JNI_TRUE;
+        outFloat[0] = (jfloat)out;
+        if (j_outFloat)
+            (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 1, outFloat);
+    }
+    return ret;
+}
+
+
+/* jce.ui_set_progress -> jce_script_api_ui_set_progress (void_call) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nUiSetProgress(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jfloat v)
+{
+
+    (void)env;
+    (void)cls;
+    jce_script_api_ui_set_progress(jce_java_api(api), (JceScriptEntity)e, (float)v);
 }
 
 
@@ -1416,4 +1538,471 @@ JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nAudioSetVolume(
     (void)env;
     (void)cls;
     jce_script_api_audio_set_volume(jce_java_api(api), (JceScriptEntity)e, (float)volume);
+}
+
+
+/* jce.ui_get_dropdown -> jce_script_api_ui_get_dropdown (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nUiGetDropdown(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jintArray j_outInt)
+{
+    jboolean ret = JNI_FALSE;
+    int out;
+    jint outInt[1];
+
+    (void)cls;
+    memset(&out, 0, sizeof out);
+    if (jce_script_api_ui_get_dropdown(jce_java_api(api), (JceScriptEntity)e, &out)) {
+        ret = JNI_TRUE;
+        outInt[0] = (jint)out;
+        if (j_outInt)
+            (*env)->SetIntArrayRegion(env, j_outInt, 0, 1, outInt);
+    }
+    return ret;
+}
+
+
+/* jce.ui_set_dropdown -> jce_script_api_ui_set_dropdown (void_call) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nUiSetDropdown(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jint index)
+{
+
+    (void)env;
+    (void)cls;
+    jce_script_api_ui_set_dropdown(jce_java_api(api), (JceScriptEntity)e, (int)index);
+}
+
+
+/* jce.ui_get_input_text -> jce_script_api_ui_get_input_text (value_return) */
+JNIEXPORT jstring JNICALL Java_com_jce_script_JceScript_nUiGetInputText(
+    JNIEnv *env, jclass cls, jlong api, jlong e)
+{
+    jstring ret = NULL;
+    const char *v = NULL;
+
+    (void)cls;
+    v = jce_script_api_ui_get_input_text(jce_java_api(api), (JceScriptEntity)e);
+    if (v)
+        ret = (*env)->NewStringUTF(env, v);
+    return ret;
+}
+
+
+/* jce.ui_set_input_text -> jce_script_api_ui_set_input_text (void_call) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nUiSetInputText(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jstring j_text)
+{
+    const char *text = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_text) {
+        text = (*env)->GetStringUTFChars(env, j_text, NULL);
+        if (!text)
+            ok = 0;
+    }
+    if (ok) {
+        jce_script_api_ui_set_input_text(jce_java_api(api), (JceScriptEntity)e, text);
+    }
+    if (text)
+        (*env)->ReleaseStringUTFChars(env, j_text, text);
+}
+
+
+/* jce.ui_get_scroll -> jce_script_api_ui_get_scroll (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nUiGetScroll(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jfloatArray j_outFloat)
+{
+    jboolean ret = JNI_FALSE;
+    float out_xy[2];
+    jfloat outFloat[2];
+
+    (void)cls;
+    memset(out_xy, 0, sizeof out_xy);
+    if (jce_script_api_ui_get_scroll(jce_java_api(api), (JceScriptEntity)e, out_xy)) {
+        ret = JNI_TRUE;
+        outFloat[0] = (jfloat)out_xy[0];
+        outFloat[1] = (jfloat)out_xy[1];
+        if (j_outFloat)
+            (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 2, outFloat);
+    }
+    return ret;
+}
+
+
+/* jce.ui_set_scroll -> jce_script_api_ui_set_scroll (void_call) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nUiSetScroll(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jfloat x, jfloat y)
+{
+
+    (void)env;
+    (void)cls;
+    jce_script_api_ui_set_scroll(jce_java_api(api), (JceScriptEntity)e, (float)x, (float)y);
+}
+
+
+/* jce.world_get_hour -> jce_script_api_world_get_hour (value_return) */
+JNIEXPORT jfloat JNICALL Java_com_jce_script_JceScript_nWorldGetHour(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jfloat ret = (jfloat)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jfloat)jce_script_api_world_get_hour(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.world_set_hour -> jce_script_api_world_set_hour (void_call) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nWorldSetHour(
+    JNIEnv *env, jclass cls, jlong api, jfloat hour)
+{
+
+    (void)env;
+    (void)cls;
+    jce_script_api_world_set_hour(jce_java_api(api), (float)hour);
+}
+
+
+/* jce.world_is_daytime -> jce_script_api_world_is_daytime (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nWorldIsDaytime(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_world_is_daytime(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.world_get_weather -> jce_script_api_world_get_weather (value_return) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nWorldGetWeather(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jint ret = (jint)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jint)jce_script_api_world_get_weather(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.world_get_weather_intensity -> jce_script_api_world_get_weather_intensity (value_return) */
+JNIEXPORT jfloat JNICALL Java_com_jce_script_JceScript_nWorldGetWeatherIntensity(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jfloat ret = (jfloat)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jfloat)jce_script_api_world_get_weather_intensity(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.world_get_wind_speed -> jce_script_api_world_get_wind_speed (value_return) */
+JNIEXPORT jfloat JNICALL Java_com_jce_script_JceScript_nWorldGetWindSpeed(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jfloat ret = (jfloat)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jfloat)jce_script_api_world_get_wind_speed(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.request_scene -> jce_script_api_request_scene (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nRequestScene(
+    JNIEnv *env, jclass cls, jlong api, jstring j_scene_path)
+{
+    jboolean ret = (jboolean)0;
+    const char *scene_path = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_scene_path) {
+        scene_path = (*env)->GetStringUTFChars(env, j_scene_path, NULL);
+        if (!scene_path)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jboolean)jce_script_api_request_scene(jce_java_api(api), scene_path);
+    }
+    if (scene_path)
+        (*env)->ReleaseStringUTFChars(env, j_scene_path, scene_path);
+    return ret;
+}
+
+
+/* jce.is_transitioning -> jce_script_api_is_transitioning (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nIsTransitioning(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_is_transitioning(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.audio_play -> jce_script_api_audio_play (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nAudioPlay(
+    JNIEnv *env, jclass cls, jlong api, jlong e)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_audio_play(jce_java_api(api), (JceScriptEntity)e);
+    return ret;
+}
+
+
+/* jce.audio_stop -> jce_script_api_audio_stop (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nAudioStop(
+    JNIEnv *env, jclass cls, jlong api, jlong e)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_audio_stop(jce_java_api(api), (JceScriptEntity)e);
+    return ret;
+}
+
+
+/* jce.audio_is_playing -> jce_script_api_audio_is_playing (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nAudioIsPlaying(
+    JNIEnv *env, jclass cls, jlong api, jlong e)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_audio_is_playing(jce_java_api(api), (JceScriptEntity)e);
+    return ret;
+}
+
+
+/* jce.save_game -> jce_script_api_save_game (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nSaveGame(
+    JNIEnv *env, jclass cls, jlong api, jstring j_path)
+{
+    jboolean ret = (jboolean)0;
+    const char *path = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_path) {
+        path = (*env)->GetStringUTFChars(env, j_path, NULL);
+        if (!path)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jboolean)jce_script_api_save_game(jce_java_api(api), path);
+    }
+    if (path)
+        (*env)->ReleaseStringUTFChars(env, j_path, path);
+    return ret;
+}
+
+
+/* jce.load_game -> jce_script_api_load_game (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nLoadGame(
+    JNIEnv *env, jclass cls, jlong api, jstring j_path)
+{
+    jboolean ret = (jboolean)0;
+    const char *path = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_path) {
+        path = (*env)->GetStringUTFChars(env, j_path, NULL);
+        if (!path)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jboolean)jce_script_api_load_game(jce_java_api(api), path);
+    }
+    if (path)
+        (*env)->ReleaseStringUTFChars(env, j_path, path);
+    return ret;
+}
+
+
+/* jce.overlap_sphere -> jce_script_api_overlap_sphere (entity_table) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nOverlapSphere(
+    JNIEnv *env, jclass cls, jlong api, jfloat x, jfloat y, jfloat z, jfloat radius,
+    jint layer_mask, jlongArray j_out)
+{
+    jint ret = 0;
+    jlong found[256];
+    int n;
+
+    (void)cls;
+    memset(found, 0, sizeof found);
+    n = jce_script_api_overlap_sphere(jce_java_api(api), (float)x, (float)y, (float)z, (float)radius, (uint32_t)layer_mask, (JceScriptEntity *)found, 256);
+    if (n > 256)
+        n = 256;
+    if (n > 0 && j_out)
+        (*env)->SetLongArrayRegion(env, j_out, 0, n, found);
+    ret = (jint)(n > 0 ? n : 0);
+    return ret;
+}
+
+
+/* jce.overlap_box -> jce_script_api_overlap_box (entity_table) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nOverlapBox(
+    JNIEnv *env, jclass cls, jlong api, jfloat x, jfloat y, jfloat z, jfloat hx,
+    jfloat hy, jfloat hz, jint layer_mask, jlongArray j_out)
+{
+    jint ret = 0;
+    jlong found[256];
+    int n;
+
+    (void)cls;
+    memset(found, 0, sizeof found);
+    n = jce_script_api_overlap_box(jce_java_api(api), (float)x, (float)y, (float)z, (float)hx, (float)hy, (float)hz, (uint32_t)layer_mask, (JceScriptEntity *)found, 256);
+    if (n > 256)
+        n = 256;
+    if (n > 0 && j_out)
+        (*env)->SetLongArrayRegion(env, j_out, 0, n, found);
+    ret = (jint)(n > 0 ? n : 0);
+    return ret;
+}
+
+
+/* jce.get_param -> jce_script_api_get_param (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nGetParam(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jstring j_name, jintArray j_outInt,
+    jlongArray j_outLong, jdoubleArray j_outDouble)
+{
+    jboolean ret = JNI_FALSE;
+    const char *name = NULL;
+    int out_kind;
+    double out_number;
+    JceScriptEntity out_entity;
+    jint outInt[1];
+    jlong outLong[1];
+    jdouble outDouble[1];
+    int ok = 1;
+
+    (void)cls;
+    if (j_name) {
+        name = (*env)->GetStringUTFChars(env, j_name, NULL);
+        if (!name)
+            ok = 0;
+    }
+    memset(&out_kind, 0, sizeof out_kind);
+    memset(&out_number, 0, sizeof out_number);
+    memset(&out_entity, 0, sizeof out_entity);
+    if (ok && jce_script_api_get_param(jce_java_api(api), (JceScriptEntity)e, name, &out_kind, &out_number, &out_entity)) {
+        ret = JNI_TRUE;
+        outInt[0] = (jint)out_kind;
+        if (j_outInt)
+            (*env)->SetIntArrayRegion(env, j_outInt, 0, 1, outInt);
+        outLong[0] = (jlong)out_entity;
+        if (j_outLong)
+            (*env)->SetLongArrayRegion(env, j_outLong, 0, 1, outLong);
+        outDouble[0] = (jdouble)out_number;
+        if (j_outDouble)
+            (*env)->SetDoubleArrayRegion(env, j_outDouble, 0, 1, outDouble);
+    }
+    if (name)
+        (*env)->ReleaseStringUTFChars(env, j_name, name);
+    return ret;
+}
+
+
+/* jce.get_param_text -> jce_script_api_get_param_text (value_return) */
+JNIEXPORT jstring JNICALL Java_com_jce_script_JceScript_nGetParamText(
+    JNIEnv *env, jclass cls, jlong api, jlong e, jstring j_name)
+{
+    jstring ret = NULL;
+    const char *v = NULL;
+    const char *name = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_name) {
+        name = (*env)->GetStringUTFChars(env, j_name, NULL);
+        if (!name)
+            ok = 0;
+    }
+    if (ok) {
+        v = jce_script_api_get_param_text(jce_java_api(api), (JceScriptEntity)e, name);
+        if (v)
+            ret = (*env)->NewStringUTF(env, v);
+    }
+    if (name)
+        (*env)->ReleaseStringUTFChars(env, j_name, name);
+    return ret;
+}
+
+
+/* jce.curve_eval -> jce_script_api_curve_eval (fallible_out) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nCurveEval(
+    JNIEnv *env, jclass cls, jlong api, jstring j_path, jstring j_channel, jdouble t,
+    jdoubleArray j_outDouble)
+{
+    jboolean ret = JNI_FALSE;
+    const char *path = NULL;
+    const char *channel = NULL;
+    double out_value;
+    jdouble outDouble[1];
+    int ok = 1;
+
+    (void)cls;
+    if (j_path) {
+        path = (*env)->GetStringUTFChars(env, j_path, NULL);
+        if (!path)
+            ok = 0;
+    }
+    if (ok && j_channel) {
+        channel = (*env)->GetStringUTFChars(env, j_channel, NULL);
+        if (!channel)
+            ok = 0;
+    }
+    memset(&out_value, 0, sizeof out_value);
+    if (ok && jce_script_api_curve_eval(jce_java_api(api), path, channel, (double)t, &out_value)) {
+        ret = JNI_TRUE;
+        outDouble[0] = (jdouble)out_value;
+        if (j_outDouble)
+            (*env)->SetDoubleArrayRegion(env, j_outDouble, 0, 1, outDouble);
+    }
+    if (channel)
+        (*env)->ReleaseStringUTFChars(env, j_channel, channel);
+    if (path)
+        (*env)->ReleaseStringUTFChars(env, j_path, path);
+    return ret;
+}
+
+
+/* jce.vcam_activate -> jce_script_api_vcam_activate (value_return) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nVcamActivate(
+    JNIEnv *env, jclass cls, jlong api, jstring j_name)
+{
+    jint ret = (jint)0;
+    const char *name = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_name) {
+        name = (*env)->GetStringUTFChars(env, j_name, NULL);
+        if (!name)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jint)jce_script_api_vcam_activate(jce_java_api(api), name);
+    }
+    if (name)
+        (*env)->ReleaseStringUTFChars(env, j_name, name);
+    return ret;
 }

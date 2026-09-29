@@ -79,6 +79,8 @@ struct JceGpuParticleSystem {
     bgfx_uniform_handle_t u_emit_color;
 
     bgfx_uniform_handle_t u_particle_misc;  /* .x = textured flag (render) */
+    bgfx_uniform_handle_t u_particle_soft;  /* (1/w, 1/h, near, far)        */
+    bgfx_uniform_handle_t s_scene_depth;    /* pre-pass depth, stage 1      */
     bgfx_uniform_handle_t s_particle_tex;   /* billboard texture sampler   */
 
     bgfx_uniform_handle_t u_update_params;
@@ -152,6 +154,8 @@ JceGpuParticleSystem *jce_gpu_particles_create(
     sys->u_emit_life_size = bgfx_create_uniform("u_emit_life_size", BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_color     = bgfx_create_uniform("u_emit_color",     BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_particle_misc  = bgfx_create_uniform("u_particle_misc",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_particle_soft  = bgfx_create_uniform("u_particle_soft",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->s_scene_depth    = bgfx_create_uniform("s_sceneDepth",     BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sys->s_particle_tex   = bgfx_create_uniform("s_particleTex",    BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sys->u_update_params  = bgfx_create_uniform("u_update_params",  BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_update_grav    = bgfx_create_uniform("u_update_grav",    BGFX_UNIFORM_TYPE_VEC4, 1);
@@ -177,6 +181,8 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         bgfx_destroy_uniform(sys->u_emit_life_size);
         bgfx_destroy_uniform(sys->u_emit_color);
         bgfx_destroy_uniform(sys->u_particle_misc);
+        bgfx_destroy_uniform(sys->u_particle_soft);
+        bgfx_destroy_uniform(sys->s_scene_depth);
         bgfx_destroy_uniform(sys->s_particle_tex);
         bgfx_destroy_uniform(sys->u_update_params);
         bgfx_destroy_uniform(sys->u_update_grav);
@@ -270,6 +276,8 @@ void jce_gpu_particles_destroy(JceGpuParticleSystem *sys)
         bgfx_destroy_uniform(sys->u_emit_life_size);
         bgfx_destroy_uniform(sys->u_emit_color);
         bgfx_destroy_uniform(sys->u_particle_misc);
+        bgfx_destroy_uniform(sys->u_particle_soft);
+        bgfx_destroy_uniform(sys->s_scene_depth);
         bgfx_destroy_uniform(sys->s_particle_tex);
         bgfx_destroy_uniform(sys->u_update_params);
         bgfx_destroy_uniform(sys->u_update_grav);
@@ -394,6 +402,14 @@ void jce_gpu_particles_render(JceGpuParticleSystem *sys, uint16_t view)
 void jce_gpu_particles_render_ex(JceGpuParticleSystem *sys, uint16_t view,
                                  uint16_t texture_idx, bool blend_alpha)
 {
+    JceTextureHandle tex = { texture_idx };
+    jce_gpu_particles_render_soft(sys, view, tex, blend_alpha, NULL);
+}
+
+void jce_gpu_particles_render_soft(JceGpuParticleSystem *sys, uint16_t view,
+                                   JceTextureHandle texture, bool blend_alpha,
+                                   const JceGpuParticleSoft *soft)
+{
     if (!sys || !sys->supported) return;
     /* Never draw an un-reset / not-yet-warmed pool: the instance buffer is
      * uninitialized GPU memory until cs_particle_reset runs AND a full frame
@@ -410,12 +426,24 @@ void jce_gpu_particles_render_ex(JceGpuParticleSystem *sys, uint16_t view,
 
     /* Optional billboard texture: u_particle_misc.x flags the shader path
      * (0 = the legacy procedural soft circle — byte-identical output). */
-    bgfx_texture_handle_t tex = { texture_idx };
-    const bool textured = (texture_idx != UINT16_MAX);
-    float misc[4] = { textured ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+    bgfx_texture_handle_t tex = { texture.idx };
+    const bool textured = (texture.idx != UINT16_MAX);
+    /* .z = soft-particle fade distance; 0 makes the shader skip the block,
+     * so stage 1 stays unbound and unread on every path that has no depth. */
+    const bool soft_on = soft && soft->fade_distance > 0.0f &&
+                         soft->depth_texture.idx != UINT16_MAX;
+    float misc[4] = { textured ? 1.0f : 0.0f, 0.0f,
+                      soft_on ? soft->fade_distance : 0.0f, 0.0f };
     bgfx_set_uniform(sys->u_particle_misc, misc, 1);
     if (textured)
         bgfx_set_texture(0, sys->s_particle_tex, tex, UINT32_MAX);
+    if (soft_on) {
+        float sp[4] = { soft->inv_viewport_w, soft->inv_viewport_h,
+                        soft->near_z, soft->far_z };
+        bgfx_set_uniform(sys->u_particle_soft, sp, 1);
+        bgfx_texture_handle_t dt = { soft->depth_texture.idx };
+        bgfx_set_texture(1, sys->s_scene_depth, dt, UINT32_MAX);
+    }
 
     /* Additive (fire/glow, legacy default) vs classic alpha (smoke/dust). */
     const uint64_t blend = blend_alpha

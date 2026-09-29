@@ -106,6 +106,54 @@ typedef struct JceProject {
 	 * and a consumer must treat it as "nothing to load", never as an error. */
 	char **script_modules;
 	int    script_modules_count;
+
+	/* ── v4 addition (NULL on older manifests) ───────────────────────
+	 *
+	 * Fallback font for any UIText that leaves its fontPath empty, as a path
+	 * relative to source_assets (e.g. "fonts/LXGWWenKai-Regular.ttf").
+	 *
+	 * It exists because the alternative did not work: the API behind it
+	 * (jce_ui_canvas_set_default_font) is process-global and was called from
+	 * exactly one project's main(), so the EDITOR had no way to learn what a
+	 * project's default face was.  An empty-fontPath UIText therefore
+	 * rasterised from the editor's built-in font in the Game View and from the
+	 * project's font in the shipped exe -- different glyph outlines, different
+	 * advance widths, therefore different line breaks, and for CJK the
+	 * difference between glyphs and .notdef boxes.
+	 *
+	 * NULL/absent keeps the engine's built-in default, which is what every
+	 * project that never sets it already gets. */
+	char  *ui_default_font;
+	/* Fonts the UI falls back to when ui_default_font lacks a character, most
+	 * specific first, separated by ';'.  NULL = none.
+	 *
+	 * A font that lacks a codepoint draws .notdef -- a tofu box -- so a Latin UI
+	 * face in front of a Chinese, Japanese or Korean string draws a box for
+	 * EVERY character.  This is the project-level authoring of the chain; the
+	 * canvas turns it into jce_ui_canvas_set_font_fallbacks. */
+	char  *ui_font_fallbacks;
+
+	/* ── v5 addition (NULL on older manifests) ───────────────────────
+	 *
+	 * Managed (.NET) assemblies holding this project's C# scripts, as paths
+	 * relative to the project root.  The counterpart of script_modules, and
+	 * separate from it for the same reason the loaders are separate: a native
+	 * module is dlopened and publishes classes through an entry symbol, while
+	 * a managed assembly is loaded by the .NET host into the bridge's
+	 * AssemblyLoadContext.  One list cannot be handed to both loaders,
+	 * because neither can tell the two kinds of .dll apart by looking.
+	 *
+	 * NOT read by the runtime, exactly like script_modules: a shipped game
+	 * loads its own assembly from its own startup code, where the order
+	 * relative to the first scene load is its to guarantee.  This exists so
+	 * TOOLS -- the editor above all -- can run a project's C# scripts in Play
+	 * instead of registering the language and then refusing every .cs in the
+	 * scene by name.
+	 *
+	 * Empty/absent is the normal state, and a consumer must treat it as
+	 * "nothing to load", never as an error.  APPENDED (ABI). */
+	char **script_assemblies;
+	int    script_assemblies_count;
 } JceProject;
 
 /* Walk up from `start_dir` looking for jce_project.json.  When found,

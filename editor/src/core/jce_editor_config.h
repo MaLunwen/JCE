@@ -47,6 +47,20 @@ typedef struct {
     int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
     bool show_grid;
 
+    /* Two-pass GPU-query occlusion culling in the editor viewports.
+     *
+     * Default OFF, and that is a decision rather than an oversight -- see the
+     * rationale in jce_editor_viewport_common.h: one draw per query is the
+     * approach shipping engines abandoned, and Hi-Z (JCE_HIZ_OCCLUSION) is the
+     * path worth investing in.  It lives here rather than in the engine's
+     * JceRpPerfFeature because it is an editor viewport construct, and adding
+     * it there would have grown JceRenderPipelineDesc's perf[] array and
+     * broken the public ABI for every SDK consumer -- which is exactly what
+     * check_abi_snapshot said when it was tried.
+     *
+     * JCE_ENABLE_OCCLUSION still overrides this, in both directions. */
+    bool viewport_occlusion;   /* default false */
+
     /* Gizmo Ctrl-snap increments (persisted across sessions).  Defaults
        0.5 units / 15 degrees / 0.25 ratio. */
     float gizmo_snap_translate;

@@ -34,9 +34,34 @@ void jce_lod_setup(JceLodGroup *g,
     g->count = idx;
 }
 
+/* 1.0 = neutral.  See the header for what this replaced. */
+static float s_lod_global_bias = 1.0f;
+
+void jce_lod_set_global_bias(float bias)
+{
+    if (!(bias > 0.0f) || bias != bias)   /* rejects 0, negatives and NaN */
+        return;
+    if (bias < 0.01f)  bias = 0.01f;
+    if (bias > 100.0f) bias = 100.0f;
+    s_lod_global_bias = bias;
+}
+
+float jce_lod_get_global_bias(void)
+{
+    return s_lod_global_bias;
+}
+
 int jce_lod_pick(const JceLodGroup *g, float distance, int prev_level)
 {
     if (!g || g->count <= 0) return -1;
+
+    /* Dividing the distance is how a >1 bias keeps higher detail out to
+     * longer ranges, which is what the slider says it does.  Applied here so
+     * every caller inherits it -- the per-entity and global scene-renderer
+     * paths and the runtime's -- rather than at three call sites that would
+     * drift apart. */
+    if (s_lod_global_bias != 1.0f)
+        distance /= s_lod_global_bias;
 
     const float h = (g->hysteresis > 0.0f && g->hysteresis < 0.5f)
                       ? g->hysteresis : 0.05f;

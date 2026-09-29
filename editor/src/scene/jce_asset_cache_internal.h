@@ -71,9 +71,26 @@ struct TextureCacheEntry {
     bool           requested;
     bool           failed;
     uint64_t       request_generation;
+    /* THE FILE THIS ENTRY ACTUALLY DECODED, and its mtime when it did.
+     *
+     * The cache key is the AUTHORED path (a material, a mesh, or an image);
+     * the file that ends up decoded is whatever
+     * resolve_texture_path_for_material found, after scene-root joins,
+     * basename search and material-JSON parsing.  Only the worker knew it, so
+     * nothing could stat it -- and a texture edited in another program stayed
+     * on screen until the editor was restarted.  Empty file => came from the
+     * asset manager (PAK-backed) or was never resolved; those are not polled. */
+    char           file[512];
+    int64_t        file_mtime;
 };
 
 /* ── Shared cache state ─────────────────────────────────────────── */
+
+/* One .mat.json the scene uses, and its mtime when we last looked. */
+struct MaterialWatchEntry {
+    char    path[512];
+    int64_t mtime;
+};
 
 struct AssetCacheState {
     bool              initialized;
@@ -83,6 +100,19 @@ struct AssetCacheState {
     TextureCacheEntry tex_cache[256];
     int               tex_cache_count;
     char              scene_dir[512];
+
+    /* Material files the scene references, and when each was last seen on
+     * disk.  Derived from the scene rather than from a cache, because a
+     * placed entity's material is resolved once at load by the engine and the
+     * editor keeps no path-keyed material cache to hang this on.
+     *
+     * Here rather than as file statics beside the poll for the reason the
+     * dedup audit gives: four statics are four globals, and this struct
+     * already holds every other cache's cursor and count. */
+    MaterialWatchEntry mat_watch[128];
+    int                mat_watch_count;
+    int                mat_watch_cursor;
+    int                mat_watch_rebuild_in;
 };
 
 extern AssetCacheState s_cache;
@@ -399,6 +429,12 @@ struct TextureLoadResult {
     std::vector<uint8_t> rgba;
     uint32_t             width;
     uint32_t             height;
+    /* Which file the worker decoded, and its mtime read BEFORE the decode.
+     * Before, not after: a file rewritten mid-decode then leaves a stamp older
+     * than the bytes on disk, so the next poll reloads.  The other order would
+     * stamp the new time onto the old bytes and never notice. */
+    std::string          resolved_path;
+    int64_t              resolved_mtime;
 };
 
 typedef AsyncLoaderState<TextureLoadRequest, TextureLoadResult> TextureAsyncState;
@@ -512,10 +548,35 @@ bool decode_texture_rgba_path(const char *path,
                               uint32_t *out_h);
 
 void       texture_finalize_completed_loads(void);
+/* A path cannot contain a control byte, so this prefix marks the sRGB
+ * variant of a cache key without a second field to keep in step. */
+#define ASSET_CACHE_SRGB_KEY_PREFIX '\x01'
+
+static inline bool asset_cache_key_is_srgb(const char *key)
+{
+    return key && key[0] == ASSET_CACHE_SRGB_KEY_PREFIX;
+}
+
+/* Strip the marker: everything that RESOLVES a key to a file wants the path,
+ * not the identity. */
+static inline const char *asset_cache_key_path(const char *key)
+{
+    return asset_cache_key_is_srgb(key) ? key + 1 : key;
+}
+
+JceTexture asset_cache_get_texture_cs(const char *material_path,
+                                      const char *mesh_path,
+                                      bool srgb);
+
 JceTexture asset_cache_get_texture(const char *material_path,
                                    const char *mesh_path);
 
 /* ── Functions from jce_asset_cache_material.cpp ─────────────────── */
+
+/* Notice a .mat.json edited outside the editor, the way a texture already is.
+ * Cheap per call: a rebuild from the scene every MAT_REBUILD_TICKS frames and
+ * a handful of stats in between. */
+void     material_poll_disk_changes(void);
 
 void     material_async_start(void);
 void     material_async_stop(void);
@@ -541,6 +602,11 @@ bool        find_file_by_name_recursive(const std::vector<std::string> &roots,
                                         const std::string &file_name,
                                         int max_depth,
                                         char *out, size_t out_size);
+
+/* Drop cache entries whose file changed on disk since it was decoded.  Called
+ * once per editor frame; polls a bounded slice, so the cost does not scale
+ * with the number of textures in the scene. */
+void texture_poll_disk_changes(void);
 
 bool resolve_texture_path_for_material(const char *material_path,
                                        const char *mesh_path,

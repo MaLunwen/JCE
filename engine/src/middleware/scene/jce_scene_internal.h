@@ -15,6 +15,29 @@
 
 JCE_EXTERN_C_BEGIN
 
+/* ── Entity names (jce_scene_names.c) ─────────────────────────────────
+ *
+ * flecs's name index is unique PER SCOPE and aborts the process on a
+ * duplicate, so every place that names an entity or moves one into a new
+ * scope must ask the same question first.  It used to be asked in two places
+ * against the ROOT (the wrong set for anything not at the root) and not at all
+ * in the third.  See jce_scene_names.c for what that cost. */
+
+/* Is `name` already taken among the siblings of `e`?  `e` itself never
+ * counts, so re-setting an entity's own name is not a collision. */
+bool jce_scene_name_taken_in_scope(const JceScene *s, JceEntity e,
+                                   const char *name);
+
+/* Set the flecs INDEX name of `e`, uniquifying with "_<id>" on collision.
+ * Never touches JceCompAuthoredName -- the caller owns the authored name. */
+void jce_scene_name_set_unique(JceScene *s, JceEntity e, const char *name);
+
+/* Called BEFORE moving `child` into `parent`'s scope: renames the child's
+ * index name if that scope already holds it.  parent == JCE_ENTITY_INVALID is
+ * the root, which is a scope like any other. */
+void jce_scene_name_reserve_for_scope(JceScene *s, JceEntity child,
+                                      JceEntity parent);
+
 /* Scene-owned JceParticleSystem* (lazy; created by jce_scene_particles.c). */
 void  *jce_scene_internal_particles_get(const JceScene *s);
 void   jce_scene_internal_particles_set(JceScene *s, void *sys);

@@ -34,6 +34,12 @@ typedef struct { uint16_t idx; } JceUniformHandle;
    They are the same struct layout. */
 typedef struct { uint16_t idx; } JceTextureHandle;
 
+/* An offscreen render target.  Distinct from JceTextureHandle even though
+ * both are a uint16_t index: a framebuffer and its colour attachment are two
+ * different objects, and passing one where the other belongs compiled fine
+ * for as long as both were raw. */
+typedef struct { uint16_t idx; } JceFrameBufferHandle;
+
 /* Vertex layout handle (wraps bgfx_vertex_layout_handle_t). */
 typedef struct { uint16_t idx; } JceVertexLayoutHandle;
 
@@ -74,11 +80,26 @@ typedef enum {
     JCE_CULL_CCW   = 2    /* Counter-clockwise (default) */
 } JceCullMode;
 
+/* WHICH blend equation a transparent surface composites with.  Read by
+ * jce_pbr_material_render_state() when the material's ALPHA MODE is BLEND;
+ * an opaque or alpha-tested material never consults it.
+ *
+ * The two questions are separate on purpose and both engines this is measured
+ * against separate them too: alpha_mode decides WHETHER a surface is
+ * transparent (and therefore which pass it draws in, and whether it writes
+ * depth), blend_mode decides HOW it combines with what is behind it.
+ *
+ * This enum was public and had ZERO consumers for a release -- the material
+ * path emitted SRC_ALPHA/INV_SRC_ALPHA and nothing else -- so additive glass,
+ * multiply decals and glowing VFX could not be authored at all. */
 typedef enum {
+    /* Not a choice under BLEND: a transparent surface that does not blend is
+     * a contradiction.  Treated as ALPHA there, so a zeroed or unset field
+     * lands on the behaviour every material had before this was read. */
     JCE_BLEND_NONE = 0,
-    JCE_BLEND_ALPHA,       /* Standard alpha blending */
-    JCE_BLEND_ADD,         /* Additive */
-    JCE_BLEND_MULTIPLY     /* Multiply */
+    JCE_BLEND_ALPHA,       /* src*a + dst*(1-a) -- glass, foliage, UI */
+    JCE_BLEND_ADD,         /* src*a + dst      -- fire, glow, energy */
+    JCE_BLEND_MULTIPLY     /* src*dst          -- shadow decals, tint */
 } JceBlendMode;
 
 typedef enum JceRenderFormat {

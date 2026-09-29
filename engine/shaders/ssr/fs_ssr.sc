@@ -1,6 +1,7 @@
 $input v_texcoord0
 
 #include <bgfx_shader.sh>
+#include "screen_reconstruct.sh"
 
 /*
  * fs_ssr.sc — Screen-space reflections.
@@ -36,25 +37,16 @@ float linearize(float d, float n, float f)
 	return n * f / (f - d * (f - n));
 }
 
+/* Both directions live in screen_reconstruct.sh now.  They are inverses, and
+ * this shader is where the tree learned what happens when only one of them is
+ * right: the two cancelled, leaving the march self-consistent in a MIRRORED
+ * view space while view_n came from the g-buffer at the TRUE pixel, so on a
+ * floor the surface normal's view y had the wrong sign and reflections went
+ * the wrong way.  A second pass that reads the same depth buffer -- the planar
+ * reflection composite does -- must use the same pair, not its own copy. */
 vec3 reconstruct_world(vec2 uv, float d)
 {
-#if BGFX_SHADER_LANGUAGE_GLSL
-	float ndc_z = d * 2.0 - 1.0;   /* GL: depth-buffer NDC z is [-1,1] */
-#else
-	float ndc_z = d;               /* D3D/Vulkan/Metal/WebGPU: NDC z is [0,1] */
-#endif
-	vec2 ndc_xy = uv * 2.0 - 1.0;
-#if !BGFX_SHADER_LANGUAGE_GLSL
-	/* Top-left texture origin.  Kept in lockstep with the ndc->uv step in the
-	 * march below: the two are inverses and currently cancelled, which left the
-	 * march self-consistent in a MIRRORED view space while view_n came from the
-	 * g-buffer at the TRUE pixel -- so on a floor the surface normal's view y
-	 * had the wrong sign and reflections went the wrong way. */
-	ndc_xy.y = -ndc_xy.y;
-#endif
-	vec4 ndc = vec4(ndc_xy, ndc_z, 1.0);
-	vec4 wp = mul(u_invViewProj, ndc);
-	return wp.xyz / wp.w;
+	return jce_uv_depth_to_world(u_invViewProj, uv, d);
 }
 
 void main()
@@ -99,11 +91,7 @@ void main()
 			if (float(i) >= step_n) break;
 			ray_pos += step;
 			vec4 clip = mul(u_proj, vec4(ray_pos, 1.0));
-			vec3 ndc = clip.xyz / clip.w;
-			vec2 sample_uv = ndc.xy * 0.5 + 0.5;
-#if !BGFX_SHADER_LANGUAGE_GLSL
-			sample_uv.y = 1.0 - sample_uv.y;   /* pairs with reconstruct_world */
-#endif
+			vec2 sample_uv = jce_clip_to_uv(clip);
 			if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
 				sample_uv.y < 0.0 || sample_uv.y > 1.0) break;
 			float sd = texture2D(s_depth, sample_uv).r;

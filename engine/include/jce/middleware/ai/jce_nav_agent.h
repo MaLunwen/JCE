@@ -41,6 +41,17 @@ typedef struct {
     float max_accel;           /* m/s² (acceleration cap) */
     float arrive_radius;       /* slow-down radius around final goal */
     float waypoint_radius;     /* distance to consider a waypoint reached */
+    /* APPENDED.  The agent's standing height in metres, compared against the
+     * clearance the navmesh was carved for (jce_navmesh_agent_height).
+     *
+     * <= 0 means "do not check", which is what every desc written before this
+     * field existed holds -- so no existing agent starts being refused.
+     *
+     * The steering itself is 2D and stays 2D: this does not make an agent
+     * duck.  What it does is catch the case a 2D steerer cannot see at all --
+     * an agent on a mesh built for someone shorter, walking under geometry it
+     * does not fit under, with nothing about the motion looking wrong. */
+    float height;
 } JceNavAgentDesc;
 
 typedef enum {
@@ -62,6 +73,26 @@ JCE_API void            jce_nav_agent_set_destroy(JceNavAgentSet *set);
 JCE_API void jce_nav_agent_set_navmesh(JceNavAgentSet *set, JceNavMesh *nm);
 
 /* -- Agent lifecycle --------------------------------------------- */
+
+/* Does this agent fit the mesh it is about to walk?
+ *
+ * false only when BOTH numbers are known and the agent is taller.  An unknown
+ * clearance (a mesh baked before it was recorded) and an unset agent height
+ * both mean "no opinion", because a check that fires on missing data rejects
+ * every scene authored before it existed. */
+JCE_API bool jce_nav_agent_fits(float agent_height, float mesh_clearance);
+
+/* jce_nav_agent_fits, and SAY SO once if it does not.
+ *
+ * Reported rather than refused, deliberately: refusing would strand the agent
+ * where it stands, which is a worse failure than a warning, and the authored
+ * intent is often a mesh that simply has not been re-baked yet.
+ *
+ * One function because there are two navmesh backends -- the grid mesh the
+ * agent set can hold, and the Detour mesh the runtime drives through a path
+ * function -- and two copies of this message is how they end up saying
+ * different things about the same condition.  Returns what fits() returned. */
+JCE_API bool jce_nav_agent_report_fit(float agent_height, float mesh_clearance);
 
 JCE_API JceNavAgentHandle jce_nav_agent_add(JceNavAgentSet *set,
                                               const JceNavAgentDesc *desc);

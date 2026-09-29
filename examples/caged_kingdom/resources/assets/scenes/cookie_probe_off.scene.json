@@ -1,0 +1,120 @@
+{
+ "contract": {
+  "name": "jce.scene",
+  "major": 1,
+  "minor": 0
+ },
+ "scene": {
+  "version": 1,
+  "entities": [
+   {
+    "id": 1,
+    "name": "Sun",
+    "parentId": 0,
+    "components": [
+     {
+      "type": "Transform",
+      "posX": 0.0,
+      "posY": 20.0,
+      "posZ": 3.0,
+      "rotX": 0,
+      "rotY": 0,
+      "rotZ": 0,
+      "scaleX": 1,
+      "scaleY": 1,
+      "scaleZ": 1
+     },
+     {
+      "type": "Light",
+      "lightType": 0,
+      "colorR": 1.0,
+      "colorG": 1.0,
+      "colorB": 1.0,
+      "intensity": 3.5,
+      "dirX": 0.0,
+      "dirY": -1.0,
+      "dirZ": -0.15,
+      "castsShadow": false
+     }
+    ]
+   },
+   {
+    "id": 2,
+    "name": "Floor",
+    "parentId": 0,
+    "components": [
+     {
+      "type": "Transform",
+      "posX": 0.0,
+      "posY": 0.0,
+      "posZ": 0.0,
+      "rotX": 0,
+      "rotY": 0,
+      "rotZ": 0,
+      "scaleX": 40.0,
+      "scaleY": 0.2,
+      "scaleZ": 40.0
+     },
+     {
+      "type": "MeshRenderer",
+      "meshPath": "",
+      "materialPath": "",
+      "meshShape": 0,
+      "baseColorR": 0.85,
+      "baseColorG": 0.85,
+      "baseColorB": 0.85,
+      "baseColorA": 1.0,
+      "metallic": 0.0,
+      "roughness": 0.9,
+      "emissiveR": 0.0,
+      "emissiveG": 0.0,
+      "emissiveB": 0.0,
+      "normalScale": 1.0,
+      "aoStrength": 1.0,
+      "alphaMode": 0,
+      "alphaCutoff": 0.5,
+      "doubleSided": false,
+      "castsShadow": false,
+      "receivesShadow": false,
+      "visible": true
+     }
+    ]
+   }
+  ],
+  "rendering": {
+   "version": 1,
+   "ambient": {
+    "color": [
+     0.05,
+     0.05,
+     0.06
+    ],
+    "intensity": 0.15
+   },
+   "sky": {
+    "mode": 1,
+    "topColor": [
+     0.1,
+     0.14,
+     0.24
+    ],
+    "horizonColor": [
+     0.25,
+     0.3,
+     0.38
+    ]
+   },
+   "fog": {
+    "enabled": false
+   },
+   "postfx": {
+    "tonemap": true,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "bloom": false,
+    "fxaa": false,
+    "vignette": false
+   }
+  }
+ }
+}

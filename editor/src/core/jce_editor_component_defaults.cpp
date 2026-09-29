@@ -129,6 +129,23 @@ void adddef_spot_light(JceScene *scene, JceEntity e)
     jce_scene_set_spot_light(scene, e, &l);
 }
 
+void adddef_area_light(JceScene *scene, JceEntity e)
+{
+    JceAreaLight l;
+    memset(&l, 0, sizeof(l));
+    l.position  = jce_v3(0.0f, 0.0f, 0.0f);
+    l.direction = jce_v3(0.0f, -1.0f, 0.0f);
+    l.color     = jce_v3(1.0f, 1.0f, 1.0f);
+    l.intensity = 1.0f;
+    l.radius    = 10.0f;
+    /* One unit square.  Zero extents subtend no solid angle and emit nothing,
+     * so a freshly added area light would be invisible and read as broken. */
+    l.width     = 1.0f;
+    l.height    = 1.0f;
+    l.two_sided = false;
+    jce_scene_set_area_light(scene, e, &l);
+}
+
 void adddef_skybox(JceScene *scene, JceEntity e)
 {
     JceSkyboxComponent c;
@@ -275,6 +292,8 @@ void adddef_terrain(JceScene *scene, JceEntity e)
     c.visible = true;
     c.tile_scale = 10.0f;
     c.splat_enabled = true;
+    for (float &normal_scale : c.layer_normal_scale)
+        normal_scale = 1.0f;
     jce_scene_set_terrain(scene, e, &c);
 }
 
@@ -840,6 +859,13 @@ void adddef_canvas(JceScene *scene, JceEntity e)
     c.reference_resolution[0] = 1920.0f;
     c.reference_resolution[1] = 1080.0f;
     c.scale_factor = 1.0f;
+    /* The geometric mean this engine has always used; jce_scene.h
+     * says why the default is not Unity's 0. */
+    c.match_width_or_height = 0.5f;
+    /* A new canvas is full-bleed, like every canvas authored before
+     * this field existed.  The author turns it on for the canvas that
+     * carries controls. */
+    c.respect_safe_area = false;
     c.pixel_perfect = false;
     jce_scene_set_canvas(scene, e, &c);
 }
@@ -855,6 +881,43 @@ void adddef_canvas_group(JceScene *scene, JceEntity e)
     jce_scene_set_canvas_group(scene, e, &c);
 }
 
+void adddef_bone_attachment(JceScene *scene, JceEntity e)
+{
+    JceBoneAttachmentComponent c;
+    memset(&c, 0, sizeof(c));
+    /* target 0 = not attached, and the rotation offset stays all-zero, which
+     * the component reads as IDENTITY.  Adding this to an entity must not
+     * move it: the author picks a target and a bone deliberately, and until
+     * they do the entity stays exactly where the gizmo left it. */
+    jce_scene_set_bone_attachment(scene, e, &c);
+}
+
+void adddef_content_size_fitter(JceScene *scene, JceEntity e)
+{
+    JceContentSizeFitterComponent c;
+    memset(&c, 0, sizeof(c));
+    /* Both axes Unconstrained, which is what the zero above already says --
+     * spelled out so ADDING the component to an element cannot change how it
+     * looks.  The author turns an axis on deliberately. */
+    c.horizontal_fit = JCE_UI_FIT_UNCONSTRAINED;
+    c.vertical_fit   = JCE_UI_FIT_UNCONSTRAINED;
+    jce_scene_set_content_size_fitter(scene, e, &c);
+}
+
+void adddef_layout_element(JceScene *scene, JceEntity e)
+{
+    JceLayoutElementComponent c;
+    memset(&c, 0, sizeof(c));
+    /* -1, NOT the memset zero.  A freshly added LayoutElement must change
+     * NOTHING until the author sets something: preferred < 0 means "no
+     * opinion" and falls back to the element own size, while a zero would
+     * collapse the child the moment the component appears -- which reads as
+     * the component being broken. */
+    c.preferred_width  = -1.0f;
+    c.preferred_height = -1.0f;
+    jce_scene_set_layout_element(scene, e, &c);
+}
+
 void adddef_layout_group(JceScene *scene, JceEntity e)
 {
     JceLayoutGroupComponent c;
@@ -868,6 +931,24 @@ void adddef_layout_group(JceScene *scene, JceEntity e)
     jce_scene_set_layout_group(scene, e, &c);
 }
 
+/* Unity's new-UI-element RectTransform: 100x100, centred, pivot at the middle.
+ *
+ * Every UI component default here memset the rect to zero and left it there,
+ * and an all-zero RectTransform hits uc_resolve_rect's legacy "all zero =>
+ * full-stretch" compatibility branch — so a freshly added UIImage covered the
+ * whole screen and a freshly added UIText stretched edge to edge.  No engine
+ * does that; it is not a default, it is the absence of one being reinterpreted.
+ * Filling it explicitly also keeps the legacy branch reachable only by scenes
+ * that genuinely predate it. */
+static void adddef_rect_transform(JceRectTransform *rt)
+{
+    rt->anchor_min[0] = 0.5f; rt->anchor_min[1] = 0.5f;
+    rt->anchor_max[0] = 0.5f; rt->anchor_max[1] = 0.5f;
+    rt->pivot[0]      = 0.5f; rt->pivot[1]      = 0.5f;
+    rt->anchored_position[0] = 0.0f; rt->anchored_position[1] = 0.0f;
+    rt->size_delta[0] = 100.0f; rt->size_delta[1] = 100.0f;
+}
+
 void adddef_ui_image(JceScene *scene, JceEntity e)
 {
     JceUIImageComponent c;
@@ -877,6 +958,7 @@ void adddef_ui_image(JceScene *scene, JceEntity e)
     c.fill_amount = 1.0f;
     c.preserve_aspect = false;
     c.raycast_target = true;
+    adddef_rect_transform(&c.rect);
     jce_scene_set_ui_image(scene, e, &c);
 }
 
@@ -887,10 +969,17 @@ void adddef_ui_text(JceScene *scene, JceEntity e)
     snprintf(c.text, sizeof(c.text), "%s", "New Text");
     c.font_size = 14.0f;
     c.alignment = JCE_UI_TEXT_ALIGN_LEFT;
+    c.vertical_alignment = JCE_UI_TEXT_VALIGN_MIDDLE;
+    /* Unity's Text defaults to Wrap.  Already-authored components keep CLIP
+     * (the JSON key defaults to 0) so nothing reflows; only text created from
+     * here onward behaves like the reference engines. */
+    c.overflow = JCE_UI_TEXT_OVERFLOW_WRAP;
     c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
     c.line_spacing = 1.0f;
     c.min_size = 10;
     c.max_size = 40;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 160.0f; c.rect.size_delta[1] = 30.0f;
     jce_scene_set_ui_text(scene, e, &c);
 }
 
@@ -904,7 +993,8 @@ void adddef_ui_button(JceScene *scene, JceEntity e)
     c.pressed_color[0] = 0.78f; c.pressed_color[1] = 0.78f; c.pressed_color[2] = 0.78f; c.pressed_color[3] = 1.0f;
     c.disabled_color[0] = 0.78f; c.disabled_color[1] = 0.78f; c.disabled_color[2] = 0.78f; c.disabled_color[3] = 0.50f;
     c.fade_duration = 0.1f;
-    jce_scene_set_ui_button(scene, e, &c);
+    adddef_rect_transform(&c.rect);
+        jce_scene_set_ui_button(scene, e, &c);
 }
 
 void adddef_ui_slider(JceScene *scene, JceEntity e)
@@ -921,6 +1011,8 @@ void adddef_ui_slider(JceScene *scene, JceEntity e)
     c.fill_color[0] = 0.30f; c.fill_color[1] = 0.55f; c.fill_color[2] = 0.95f; c.fill_color[3] = 1.0f;
     c.handle_color[0] = c.handle_color[1] = c.handle_color[2] = c.handle_color[3] = 1.0f;
     c.handle_size   = 20.0f;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 160.0f; c.rect.size_delta[1] = 20.0f;
     jce_scene_set_ui_slider(scene, e, &c);
 }
 
@@ -932,6 +1024,8 @@ void adddef_ui_toggle(JceScene *scene, JceEntity e)
     c.interactable = true;
     c.bg_color[0] = 0.20f; c.bg_color[1] = 0.20f; c.bg_color[2] = 0.20f; c.bg_color[3] = 1.0f;
     c.checkmark_color[0] = 0.30f; c.checkmark_color[1] = 0.85f; c.checkmark_color[2] = 0.40f; c.checkmark_color[3] = 1.0f;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 20.0f; c.rect.size_delta[1] = 20.0f;
     jce_scene_set_ui_toggle(scene, e, &c);
 }
 
@@ -951,6 +1045,8 @@ void adddef_ui_input_field(JceScene *scene, JceEntity e)
     c.placeholder_color[0] = 0.55f; c.placeholder_color[1] = 0.55f; c.placeholder_color[2] = 0.55f; c.placeholder_color[3] = 1.0f;
     c.caret_color[0] = 1.0f; c.caret_color[1] = 1.0f; c.caret_color[2] = 1.0f; c.caret_color[3] = 1.0f;
     c.font_size   = 16.0f;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 160.0f; c.rect.size_delta[1] = 30.0f;
     jce_scene_set_ui_input_field(scene, e, &c);
 }
 
@@ -971,6 +1067,8 @@ void adddef_ui_scroll_view(JceScene *scene, JceEntity e)
     c.scrollbar_color[0] = 0.55f; c.scrollbar_color[1] = 0.55f; c.scrollbar_color[2] = 0.55f; c.scrollbar_color[3] = 1.0f;
     c.scrollbar_bg_color[0] = 0.20f; c.scrollbar_bg_color[1] = 0.20f; c.scrollbar_bg_color[2] = 0.20f; c.scrollbar_bg_color[3] = 1.0f;
     c.interactable       = true;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 200.0f; c.rect.size_delta[1] = 200.0f;
     jce_scene_set_ui_scroll_view(scene, e, &c);
 }
 
@@ -984,6 +1082,8 @@ void adddef_ui_progress_bar(JceScene *scene, JceEntity e)
     c.direction = 0; /* L→R */
     c.bg_color[0] = 0.20f; c.bg_color[1] = 0.20f; c.bg_color[2] = 0.20f; c.bg_color[3] = 1.0f;
     c.fill_color[0] = 0.30f; c.fill_color[1] = 0.75f; c.fill_color[2] = 0.40f; c.fill_color[3] = 1.0f;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 160.0f; c.rect.size_delta[1] = 20.0f;
     jce_scene_set_ui_progress_bar(scene, e, &c);
 }
 
@@ -1000,6 +1100,8 @@ void adddef_ui_dropdown(JceScene *scene, JceEntity e)
     c.popup_color[0] = 0.10f; c.popup_color[1] = 0.10f; c.popup_color[2] = 0.10f; c.popup_color[3] = 1.0f;
     c.highlight_color[0] = 0.26f; c.highlight_color[1] = 0.45f; c.highlight_color[2] = 0.78f; c.highlight_color[3] = 1.0f;
     c.font_size = 16.0f;
+    adddef_rect_transform(&c.rect);
+    c.rect.size_delta[0] = 160.0f; c.rect.size_delta[1] = 30.0f;
     jce_scene_set_ui_dropdown(scene, e, &c);
 }
 
@@ -1338,6 +1440,7 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "DirectionalLight",    adddef_dir_light },
         { "PointLight",          adddef_point_light },
         { "SpotLight",           adddef_spot_light },
+        { "AreaLight",           adddef_area_light },
         { "Skybox",              adddef_skybox },
         { "SpriteRenderer",      adddef_sprite_renderer },
         { "SpriteAnimator",      adddef_sprite_animator },
@@ -1393,7 +1496,10 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "BillboardRenderer",   adddef_billboard_renderer },
         { "Canvas",              adddef_canvas },
         { "CanvasGroup",         adddef_canvas_group },
+        { "BoneAttachment",      adddef_bone_attachment },
+        { "ContentSizeFitter",   adddef_content_size_fitter },
         { "LayoutGroup",         adddef_layout_group },
+        { "LayoutElement",       adddef_layout_element },
         { "UIImage",             adddef_ui_image },
         { "UIText",              adddef_ui_text },
         { "UIButton",            adddef_ui_button },

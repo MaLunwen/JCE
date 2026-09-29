@@ -69,6 +69,22 @@ uint16_t jce_tag_intern(const char *name)
         if (s_tags[i].in_use && strcmp(s_tags[i].name, name) == 0)
             return (uint16_t)i;
     }
+    /* REFUSE a name that does not fit rather than storing a truncated one.
+     *
+     * The lookup above compares the FULL name against the STORED one, so a
+     * truncated store can never match: interning the same long name twice
+     * returned two different ids, and every find_with_tag() on it minted
+     * another slot.  1024 slots, one burned per lookup -- a per-frame
+     * gameplay query on a long tag exhausted the whole process-wide registry
+     * and then every OTHER tag started interning as 0 = Untagged.
+     *
+     * Untagged is the honest answer for a name this registry cannot hold, and
+     * it is stable: the same name gives the same answer every time. */
+    if (strlen(name) >= sizeof(s_tags[0].name)) {
+        LOG_WARN(LOG_TAG, "tag too long (%d >= %d), treated as Untagged: %s",
+                 (int)strlen(name), (int)sizeof(s_tags[0].name), name);
+        return 0;
+    }
     for (int i = 1; i < JCE_TAG_REGISTRY_MAX; i++) {
         if (!s_tags[i].in_use) {
             snprintf(s_tags[i].name, sizeof(s_tags[i].name), "%s", name);

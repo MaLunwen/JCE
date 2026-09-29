@@ -21,7 +21,21 @@
 JCE_EXTERN_C_BEGIN
 
 /* Canonical animatable properties.  Float props are addressed by
- * jce_seq_prop_apply_float; color props by jce_seq_prop_apply_color. */
+ * jce_seq_prop_apply_float; color props by jce_seq_prop_apply_color.
+ *
+ * ADDING ONE IS AN ABI STATEMENT, and the reason is the SENTINEL rather than
+ * the new values.  JCE_SEQ_PROP_COUNT moves whenever this list grows, so
+ * anything that sized storage by it -- k_prop_names here, the editor's picker
+ * loop, an SDK consumer's table -- disagrees with the library until it is
+ * rebuilt, and an array indexed past its end does not fail loudly.  The ABI
+ * snapshot calls that an incompatible change and it is right to: appending to
+ * the list is exactly what moves the sentinel.
+ *
+ * This engine ships its headers and its library together, so the answer here
+ * is "rebuild", recorded rather than assumed.  The wire format is unaffected:
+ * a .seq file stores the dotted NAME (`bindProp`, and the legacy
+ * "<id>/<prop>" string), never the integer, so authored sequences survive any
+ * renumbering of this enum. */
 typedef enum {
     JCE_SEQ_PROP_NONE = 0,
     /* float props */
@@ -43,8 +57,70 @@ typedef enum {
     JCE_SEQ_PROP_LIGHT_COLOR,      /* light.color (dir→point→spot) */
     JCE_SEQ_PROP_MESH_BASE_COLOR,  /* meshrenderer.base_color      */
 
+    /* ── UI (APPENDED 2026-09-21) ────────────────────────────────────
+     * The fifteen properties above cannot address a single UI element, so
+     * every canvas animation in this tree is a script.  These are the
+     * vocabulary for the three things a menu does -- FADE, SLIDE, POP --
+     * plus the spin the RectTransform already supports.
+     *
+     * Appended rather than grouped with the float/color blocks above
+     * because the ids are internal and appending keeps every existing one
+     * fixed without having to prove that nothing depends on the order.
+     * (The .seq wire format stores the dotted NAME, so it would have
+     * survived either way; this way the claim needs no proof.)
+     *
+     * `uirect.*` addresses whichever UI graphic the entity carries, in the
+     * same component order the layout walk uses -- Image, Text, Slider,
+     * Toggle, InputField, ScrollView, ProgressBar, Dropdown, then Button
+     * last.  One order, one function: uc_entity_rect_mut. */
+    /* float props */
+    JCE_SEQ_PROP_CANVASGROUP_ALPHA,   /* canvasgroup.alpha (0..1, subtree) */
+    JCE_SEQ_PROP_UIRECT_ANCHORED_X,   /* uirect.anchored_position.x (px)   */
+    JCE_SEQ_PROP_UIRECT_ANCHORED_Y,   /* uirect.anchored_position.y (px)   */
+    JCE_SEQ_PROP_UIRECT_SCALE_X,      /* uirect.scale.x                    */
+    JCE_SEQ_PROP_UIRECT_SCALE_Y,      /* uirect.scale.y                    */
+    JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM,/* uirect.scale.uniform              */
+    JCE_SEQ_PROP_UIRECT_ROTATION,     /* uirect.rotation (deg, clockwise)  */
+    JCE_SEQ_PROP_UIIMAGE_ALPHA,       /* uiimage.color.a                   */
+    JCE_SEQ_PROP_UITEXT_ALPHA,        /* uitext.color.a                    */
+    /* color props */
+    JCE_SEQ_PROP_UIIMAGE_COLOR,       /* uiimage.color (rgb)               */
+    JCE_SEQ_PROP_UITEXT_COLOR,        /* uitext.color (rgb)                */
+    /* APPENDED 2026-09-21.  The three the catalogue's own "why not parity"
+     * note named: a radial wipe, a driven progress bar, and text that grows.
+     *
+     * uitext.font_size CARRIES A ZERO TRAP, the same shape as uirect.scale:
+     * 0 does not mean "no text", it means "use the default", and the default
+     * is 14 in uc_draw_text while the dropdown and input-field widgets use 16.
+     * So a track keyed 0 -> 24 starts at 14px, not 0.  Author from a non-zero
+     * value.  Not special-cased in the applier for the reason the scale pair
+     * is not: one field meaning two things depending on who wrote it is a
+     * worse defect than the authoring surprise, and the surprise is tested.
+     *
+     * uislider.value HAS A SECOND WRITER -- the canvas writes it back while a
+     * drag is in flight.  A timeline driving an INTERACTABLE slider is two
+     * writers on one field per frame; author it non-interactable while
+     * driven.  Stated here because nothing in the types says so. */
+    JCE_SEQ_PROP_UIIMAGE_FILL,        /* uiimage.fill_amount (0..1)        */
+    JCE_SEQ_PROP_UISLIDER_VALUE,      /* uislider.value (min..max)         */
+    JCE_SEQ_PROP_UITEXT_FONT_SIZE,    /* uitext.font_size (px; 0 = default)*/
+
     JCE_SEQ_PROP_COUNT
 } JceSeqPropId;
+
+/* A NOTE THAT BELONGS WITH THE PROPERTY AND NOT IN A CHANGELOG.
+ *
+ * JceRectTransform.scale treats 0 as UNSCALED, not as zero size -- every
+ * RectTransform serialised before that field existed loads it as zeros, and a
+ * literal 0 would draw nothing, which reads as the element ceasing to exist
+ * rather than as a default.  The sequencer does NOT special-case that: one
+ * field with two meanings, depending on who wrote it, is the failure this
+ * engine keeps paying for.
+ *
+ * The consequence for an author is concrete: a pop authored 0 -> 1 plays
+ * FULL SIZE at t=0.  Author it from a small non-zero value (0.01) instead.
+ * test_jce_seq_ui_props.c pins this so it cannot be "fixed" on one side
+ * only. */
 
 /* Canonical dotted name for a property id ("" for NONE/out of range). */
 JCE_API const char  *jce_seq_prop_name(JceSeqPropId id);

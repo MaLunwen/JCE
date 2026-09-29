@@ -24,6 +24,17 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_panel_common.h"
 #include "core/jce_editor_i18n.h"
+#include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/middleware/animation/jce_anim_clip_io.h>
+/* jce_editor_get_scene_renderer lives HERE, not in the engine's
+ * <jce/renderer/jce_scene_renderer.h> above -- that header declares the
+ * renderer type and looks like it should own the accessor, which is exactly
+ * why this include is easy to omit.  The clip export needs it to reach the
+ * live rig.  jce_tests compiles no editor TU, so `jce.py test` cannot catch a
+ * missing editor include: any unit touching editor/** needs `jce.py editor`
+ * as its own gate. */
+#include "scene/jce_editor_scene_render.h"
 #include "core/jce_editor_state.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
@@ -148,6 +159,75 @@ void derive_default_path(void)
     JceSkeletalAnimatorComponent *sk = focused_skeletal_animator();
     if (!sk || !sk->skeleton_path[0]) return;
     std::snprintf(s.path, sizeof(s.path), "%s.anim.json", sk->skeleton_path);
+}
+
+/* Export the focused rig's clips as standalone files.
+ *
+ * WHY THIS EXISTS.  jce_anim_clip_create had exactly two call sites in the
+ * tree -- the glTF loader and the assimp importer -- and no serialiser, so a
+ * clip could only ever live inside the model it was imported with.  There was
+ * no way to ship a locomotion set without its rig, or to hand-edit one.
+ *
+ * The destination is the directory of the skeleton, which is exactly where
+ * the runtime's fallback looks (sr_find_file_clip in jce_sr_anim.c).  The
+ * writer and the reader therefore agree on the path by construction; a
+ * documented convention would be a second statement of it. */
+void export_clips_from_rig(void)
+{
+    JceSkeletalAnimatorComponent *sk = focused_skeletal_animator();
+    if (!sk || !sk->skeleton_path[0]) {
+        std::snprintf(s.warn, sizeof(s.warn), "%s",
+            jce_editor_i18n_id("animationEditor.export.noRig",
+                "Select an entity with a SkeletalAnimator first."));
+        return;
+    }
+
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    JceModel *model = sr ? jce_scene_renderer_get_model(sr, sk->skeleton_path)
+                         : nullptr;
+    if (!model) {
+        std::snprintf(s.warn, sizeof(s.warn), "%s",
+            jce_editor_i18n_id("animationEditor.export.noModel",
+                "The rig's model is not loaded yet; play or focus it once."));
+        return;
+    }
+
+    /* The skeleton's directory, the same derivation the runtime does. */
+    char dir[480];
+    std::snprintf(dir, sizeof(dir), "%s", sk->skeleton_path);
+    size_t n = std::strlen(dir);
+    while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') --n;
+    dir[n] = '\0';
+
+    const uint32_t count = jce_model_anim_count(model);
+    int wrote = 0, failed = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const JceAnimClip *c = jce_model_get_anim(model, i);
+        const char *name = c ? jce_anim_clip_name(c) : nullptr;
+        if (!c || !name || !name[0]) { ++failed; continue; }
+        char out[640];
+        std::snprintf(out, sizeof(out), "%s%s.animclip.json", dir, name);
+        /* Serialise here and write with the panel's own helper, rather than a
+         * save() inside the engine: this panel already writes every other
+         * artefact through ed_write_*, and a second way to put the same bytes
+         * on disk is a second place for the path convention to drift. */
+        char *text = jce_anim_clip_serialize(c);
+        if (text && ed_write_file(out, text, std::strlen(text))) ++wrote;
+        else ++failed;
+        if (text) jce_anim_clip_io_free_string(text);
+    }
+
+    /* PER CLIP, not once.  "Exported 7 clips" hides the one whose channels
+     * were unusable and was refused -- and a refused clip leaves a name that
+     * resolves at author time and not at run time. */
+    if (failed == 0)
+        std::snprintf(s.warn, sizeof(s.warn), "%s: %d -> %s",
+            jce_editor_i18n_id("animationEditor.export.ok", "Exported"),
+            wrote, dir);
+    else
+        std::snprintf(s.warn, sizeof(s.warn), "%s: %d ok, %d refused -> %s",
+            jce_editor_i18n_id("animationEditor.export.partial", "Exported"),
+            wrote, failed, dir);
 }
 
 /* Add one event lane per clip on the focused entity's SkeletalAnimator,
@@ -347,6 +427,16 @@ void draw_toolbar(void)
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.save")) && s.path[0]) save_clip(s.path);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.load")) && s.path[0]) load_clip(s.path);
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_id("animationEditor.button.exportClips",
+                                         "Export clips")))
+        export_clips_from_rig();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n_id(
+            "animationEditor.button.exportClips.tip",
+            "Write the focused rig's animation clips beside its skeleton as "
+            ".animclip.json, where the runtime looks for a clip name the "
+            "model itself does not carry."));
 
     ImGui::SetNextItemWidth(120);
     ImGui::DragFloat(jce_editor_i18n("animationEditor.field.duration"), &s.clip.duration, 0.1f, 0.1f, 600.0f, "%.2f s");

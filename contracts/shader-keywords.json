@@ -1,0 +1,99 @@
+{
+  "_note": [
+    "THE DECLARED KEYWORD SET.  One axis costs ONE ENTRY HERE, and the",
+    "generator emits every .sc entry file and the key->program table from it.",
+    "",
+    "WHY THIS FILE EXISTS.  A static-switch axis used to cost nine files: a new",
+    "fs_*.sc per fragment family, a JceShaderSet member, a renderer field, a",
+    "getter, a destroy, and a selection site per draw path.  The engine has an",
+    "axis that WORKS and was measured -- JCE_NO_CSM takes fs_pbr from 8311",
+    "instructions to 1549, the 1039 it drops being the PCF taps -- and it was",
+    "REVERTED, because the version that wired six of the seven selection sites",
+    "silently did nothing on the seventh.  Shape primitives take a path the",
+    "wiring had not touched, so forcing the variant on every draw moved ZERO",
+    "pixels while the engine's own enable_csm=false moved 7979 on the same",
+    "frame.  Half-wired is worse than absent: it is absent AND it looks done.",
+    "",
+    "THE RULE THIS FILE ENFORCES: a program is (vertex variant, fragment",
+    "family, keyword bits).  The vertex variant is what the DRAW path is --",
+    "static, instanced, skinned -- and it picks its fragment family, because",
+    "the varyings have to match.  The keyword bits are what the MATERIAL and",
+    "the frame ask for.  Nothing outside the generator writes an entry .sc,",
+    "and nothing outside jce_shader_variants.c decides which program a draw",
+    "gets.",
+    "",
+    "Regenerate:  python tools/shadergen/gen_shader_variants.py --write",
+    "Check only:  python tools/shadergen/gen_shader_variants.py"
+  ],
+
+  "shader_dir": "engine/shaders/pbr",
+  "body": "fs_pbr_body.sh",
+  "table_out": "engine/src/renderer/jce_shader_variants_table.inc",
+  "public_header_out": "engine/include/jce/renderer/jce_shader_variants.h",
+
+  "varying_sets": {
+    "base": "v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos",
+    "tint": "v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos, v_tint"
+  },
+
+  "fs_families": [
+    {
+      "name": "pbr",
+      "varyings": "base",
+      "defines": [],
+      "why": "The BASE fragment family: the 16-light brute-force point loop with s_iesLut on stage 14. With no axis set it compiles byte-identically to the historical hand-written fs_pbr.sc, which is the property that let this family be generated without changing a pixel."
+    },
+    {
+      "name": "pbr_tint",
+      "varyings": "tint",
+      "defines": ["JCE_INST_TINT"],
+      "why": "Per-instance tint. The body multiplies base albedo by v_tint exactly where a solo draw applies u_baseColorFactor, so an instanced tinted copy is bit-identical to the same mesh drawn solo with that colour while still collapsing into one instanced submit."
+    },
+    {
+      "name": "pbr_fade",
+      "varyings": "tint",
+      "defines": ["JCE_FADE_DITHER 1"],
+      "why": "LOD cross-fade. vs_pbr_inst_fade smuggles the band-transition coverage in i_data3.w and this screen-door dithers it, so an LOD band change is a fade rather than a pop."
+    },
+    {
+      "name": "pbr_inst_tex_array",
+      "varyings": "tint",
+      "defines": ["JCE_TEX_ARRAY"],
+      "why": "Texture-diverse instancing. s_albedo is a SAMPLER2DARRAY and the instance carries its layer, so copies of one mesh that differ by their albedo TEXTURE -- not just a baseColor factor -- batch into one instanced submit."
+    },
+    {
+      "name": "pbr_toon",
+      "varyings": "base",
+      "defines": ["JCE_TOON 1"],
+      "why": "Cel ramp + rim, per character. Client-facing style, expressed as a fragment family rather than a material branch so a project that never uses it pays nothing."
+    }
+  ],
+
+  "vertex_variants": [
+    {"name": "pbr",                "fs_family": "pbr",                "why": "Static mesh, one draw."},
+    {"name": "pbr_inst",           "fs_family": "pbr",                "why": "GPU-instanced copies of one mesh."},
+    {"name": "pbr_skinned",        "fs_family": "pbr",                "why": "Skinned mesh; the bone palette is the only difference the fragment sees, which is none."},
+    {"name": "pbr_inst_tint",      "fs_family": "pbr_tint",           "why": "Instanced copies that differ only by baseColor."},
+    {"name": "pbr_inst_fade",      "fs_family": "pbr_fade",           "why": "Instanced copies mid LOD-band transition."},
+    {"name": "pbr_inst_tex_array", "fs_family": "pbr_inst_tex_array", "why": "Instanced copies that differ by albedo texture."}
+  ],
+
+  "axes": [
+    {
+      "name": "fwdplus",
+      "bit": 0,
+      "define": "JCE_FORWARDPLUS 1",
+      "suffix": "_fwdplus",
+      "families": ["pbr"],
+      "why": "Clustered lighting. Swaps sampler stage 14 from s_iesLut to s_cluster, replaces the 16-light brute-force loop with a per-froxel one, and drops the per-spot IES profile -- a stated tradeoff that keeps WebGL2/GLES3 at 16 fragment samplers. Selected only when the r.forwardplus cvar is on."
+    },
+    {
+      "name": "noshadow",
+      "bit": 1,
+      "define": "JCE_NO_CSM 1",
+      "suffix": "_noshadow",
+      "families": ["*"],
+      "why": "Drops the cascade block for a material that does not receive shadows. MEASURED, which is why it is the axis that proves this machinery: fs_pbr is 8311 instructions and CSM is 6766 of them (81.4%), so this is the only axis worth an entry file at all -- a Unity-style pile of material keywords would have been spent on the other 18.6%. No #else is needed: `shadow` is 1.0 above the guarded block and the prologue the rest of the shader consumes stays outside it."
+    }
+  ]
+}

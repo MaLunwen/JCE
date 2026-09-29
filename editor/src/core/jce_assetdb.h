@@ -116,6 +116,31 @@ bool           jce_assetdb_picker_accepts(int requested_kind,
 int jce_assetdb_find_references(const char *asset_path,
                                 char (*out_paths)[512], int max_out);
 
+/* Rename or move an asset AND repoint everything that referenced it.
+ *
+ * Every asset reference in this engine is a raw path string -- there is no
+ * GUID and no .meta sidecar anywhere in the tree -- so renaming a file used to
+ * break every scene, prefab and material that named it, silently.  The Asset
+ * Browser called jce_fs_host_rename, logged success, and stopped there; the
+ * fuzzy basename index (editor/src/scene/jce_asset_path_index.*) cannot cover
+ * it, because a rename is exactly the case where the basename changed.
+ *
+ * jce_assetdb_find_references above knew who pointed at what and had ZERO
+ * CALLERS -- the reverse map it builds lazily was built by nobody.  This is
+ * what calls it.
+ *
+ * Renames the file first; returns false and changes nothing else if that
+ * fails.  Then rewrites each referring file (see jce_asset_ref_rewrite.h for
+ * why the rewrite is textual and deliberately conservative) and rescans.
+ *
+ * `out_updated` receives the number of files repaired and `out_unrepaired`
+ * the number the index flagged that this could NOT change -- the second is
+ * not an error and must be REPORTED, not swallowed: a rename that silently
+ * half-repairs is the defect this exists to fix, relocated.  Either may be
+ * NULL. */
+bool jce_assetdb_rename_asset(const char *old_path, const char *new_path,
+                              int *out_updated, int *out_unrepaired);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

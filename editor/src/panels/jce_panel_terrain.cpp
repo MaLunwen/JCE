@@ -23,12 +23,17 @@
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <panels/jce_terrain_history.h>
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/middleware/scene/jce_terrain.h>
+#include <jce/renderer/jce_image.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_rand.h>
+
+void jce_foliage_brush_set_armed(bool armed);
 }
 
 #include <algorithm>
@@ -44,6 +49,9 @@ enum class ToolMode { Sculpt, Splat, Holes };
 
 struct PanelState {
     JceTerrain *terrain = nullptr;
+    JceScene   *terrain_scene = nullptr;
+    bool        scene_owns_terrain = false;
+    char        terrain_scene_path[512] = "";
 
     /* Authoring state. */
     ToolMode tool         = ToolMode::Sculpt;
@@ -52,6 +60,24 @@ struct PanelState {
     bool     hole_erase   = false;   /* Holes tool: false = cut cells, true = fill back */
     float    brush_radius = 4.0f;
     float    brush_strength = 4.0f;
+    float    brush_rotation = 0.0f;
+    float    brush_hardness = 0.0f;
+    float    brush_spacing = 0.25f;
+    float    brush_scatter = 0.0f;
+    float    brush_rotation_jitter = 0.0f;
+    char     brush_mask_path[512] = "";
+    std::vector<float> brush_mask;
+    int      brush_mask_w = 0;
+    int      brush_mask_h = 0;
+
+    /* Continuous-stroke state.  Input points remain unscattered so the
+     * path sampler cannot drift; scatter is applied only to emitted stamps. */
+    bool     stroke_has_point = false;
+    float    stroke_prev_x = 0.0f;
+    float    stroke_prev_z = 0.0f;
+    float    stroke_flatten_target = 0.0f;
+    uint64_t stroke_serial = 0;
+    JceRng   stroke_rng = {};
 
     /* Cursor sample point in world XZ. */
     float    cursor_x    = 0.0f;
@@ -103,113 +129,457 @@ struct PanelState {
     std::vector<float> ridge_field;
 } s;
 
-/* ── Local undo for brush edits ────────────────────────────────────
- *  Terrain heightmap/splat live in a standalone JceTerrain object, not
- *  in the scene ECS, so the editor's scene-snapshot undo
- *  (jce_state_begin_batch_edit) does not capture them.  Keep a small
- *  panel-local stack of (heights + splat) snapshots instead.  Capture
- *  is once-per-stroke: a continuous Scene-View drag snapshots only on
- *  the first frame of the stroke (gated by `stroke_open`).            */
-struct TerrainSnapshot {
-    int w = 0, h = 0;
-    std::vector<float>    heights;
-    std::vector<uint32_t> splat;
+const int kBrushMaskMaxDimension = 2048;
+const int kBrushMaxStampsPerFrame = 256;
+JceTerrainHistory s_terrain_history;
+bool s_stroke_open = false;
+bool s_stroke_changed = false;
+bool s_stroke_region_valid = false;
+float s_stroke_min_x = 0.0f;
+float s_stroke_min_z = 0.0f;
+float s_stroke_max_x = 0.0f;
+float s_stroke_max_z = 0.0f;
+uint32_t s_stroke_edit_flags = 0u;
+
+void clear_undo_history(void);
+
+struct TerrainBindingSearch {
+    const char *requested = nullptr;
+    char        requested_abs[1024] = "";
+    JceEntity   entity = 0;
+    char        terrain_path[512] = "";
 };
 
-const size_t kTerrainUndoLimit = 32;
-std::vector<TerrainSnapshot> s_undo;
-std::vector<TerrainSnapshot> s_redo;
-bool s_stroke_open = false;
-
-bool capture_snapshot(TerrainSnapshot *out)
+void find_terrain_binding_cb(JceScene *scene, JceEntity entity, void *user_data)
 {
-    if (!s.terrain || !out) return false;
-    int w = jce_terrain_width(s.terrain);
-    int h = jce_terrain_height(s.terrain);
-    const float    *heights = jce_terrain_heights(s.terrain);
-    const uint32_t *splat   = jce_terrain_splat(s.terrain);
-    if (!heights) return false;
-    size_t n = (size_t)w * (size_t)h;
-    out->w = w; out->h = h;
-    out->heights.assign(heights, heights + n);
-    if (splat) out->splat.assign(splat, splat + n);
-    else       out->splat.clear();
+    TerrainBindingSearch *search =
+        static_cast<TerrainBindingSearch *>(user_data);
+    if (!search || search->entity || !jce_scene_has_terrain(scene, entity))
+        return;
+    JceTerrainComponent *component = jce_scene_get_terrain(scene, entity);
+    if (!component || !component->terrain_path[0]) return;
+
+    bool matches = search->requested &&
+                   std::strcmp(component->terrain_path, search->requested) == 0;
+    if (!matches && search->requested_abs[0]) {
+        char component_abs[1024];
+        matches = jce_editor_resolve_asset_path(component->terrain_path,
+                                                 component_abs,
+                                                 sizeof(component_abs)) &&
+                  std::strcmp(component_abs, search->requested_abs) == 0;
+    }
+    if (!matches) return;
+
+    search->entity = entity;
+    std::snprintf(search->terrain_path, sizeof(search->terrain_path), "%s",
+                  component->terrain_path);
+}
+
+bool find_terrain_binding(JceScene *scene, JceEntity *out_entity,
+                          char *out_path, size_t out_path_size)
+{
+    if (!scene || !s.io_path[0]) return false;
+    TerrainBindingSearch search;
+    search.requested = s.scene_owns_terrain && s.terrain_scene_path[0]
+        ? s.terrain_scene_path : s.io_path;
+    (void)jce_editor_resolve_asset_path(search.requested,
+                                        search.requested_abs,
+                                        sizeof(search.requested_abs));
+    jce_scene_each_entity(scene, find_terrain_binding_cb, &search);
+    if (!search.entity) return false;
+    if (out_entity) *out_entity = search.entity;
+    if (out_path && out_path_size > 0)
+        std::snprintf(out_path, out_path_size, "%s", search.terrain_path);
     return true;
 }
 
-void restore_snapshot(const TerrainSnapshot &snap)
+void validate_scene_owned_terrain(void)
 {
-    if (!s.terrain) return;
-    int w = jce_terrain_width(s.terrain);
-    int h = jce_terrain_height(s.terrain);
-    if (snap.w != w || snap.h != h) return; /* dims changed (new/load) — skip. */
-    size_t n = (size_t)w * (size_t)h;
-    float *heights = const_cast<float *>(jce_terrain_heights(s.terrain));
-    if (heights && snap.heights.size() == n)
-        std::memcpy(heights, snap.heights.data(), n * sizeof(float));
-    uint32_t *splat = const_cast<uint32_t *>(jce_terrain_splat(s.terrain));
-    if (splat && snap.splat.size() == n)
-        std::memcpy(splat, snap.splat.data(), n * sizeof(uint32_t));
-    s.preview_dirty = true;
+    if (!s.scene_owns_terrain) return;
+    JceScene *scene = jce_state_get_scene();
+    if (scene &&
+        jce_scene_peek_terrain(scene, s.terrain_scene_path) == s.terrain) {
+        s.terrain_scene = scene;
+        return;
+    }
+
+    s.terrain = nullptr;
+    s.terrain_scene = nullptr;
+    s.scene_owns_terrain = false;
+    s.terrain_scene_path[0] = '\0';
+    clear_undo_history();
 }
 
-/* Snapshot the current state into the undo stack before a mutating
- * edit.  Clears the redo stack (new edit branch). */
-void push_undo(void)
+void release_panel_terrain(void)
 {
-    TerrainSnapshot snap;
-    if (!capture_snapshot(&snap)) return;
-    s_undo.push_back(std::move(snap));
-    if (s_undo.size() > kTerrainUndoLimit)
-        s_undo.erase(s_undo.begin());
-    s_redo.clear();
+    validate_scene_owned_terrain();
+    if (s.terrain && !s.scene_owns_terrain)
+        jce_terrain_free(s.terrain);
+    s.terrain = nullptr;
+    s.terrain_scene = nullptr;
+    s.scene_owns_terrain = false;
+    s.terrain_scene_path[0] = '\0';
 }
 
-/* Begin a brush stroke: capture once until end_stroke() is called.
- * Safe to call every frame of a continuous drag. */
-void begin_stroke(void)
+bool publish_terrain_to_scene(void)
+{
+    validate_scene_owned_terrain();
+    if (!s.terrain || s.scene_owns_terrain) return s.scene_owns_terrain;
+
+    JceScene *scene = jce_state_get_scene();
+    char canonical_path[512];
+    if (!find_terrain_binding(scene, nullptr, canonical_path,
+                              sizeof(canonical_path)))
+        return false;
+    if (!jce_scene_adopt_terrain(scene, canonical_path, s.terrain))
+        return false;
+
+    s.terrain_scene = scene;
+    s.scene_owns_terrain = true;
+    std::snprintf(s.terrain_scene_path, sizeof(s.terrain_scene_path), "%s",
+                  canonical_path);
+    if (JceSceneRenderer *renderer = jce_editor_get_scene_renderer())
+        jce_scene_renderer_invalidate_terrain(renderer, canonical_path);
+    return true;
+}
+
+void notify_terrain_changed_full(void)
+{
+    if (!publish_terrain_to_scene()) return;
+    (void)jce_scene_touch_terrain(s.terrain_scene, s.terrain_scene_path);
+}
+
+void notify_terrain_changed_region(float min_x, float min_z,
+                                   float max_x, float max_z,
+                                   uint32_t edit_flags)
+{
+    if (!publish_terrain_to_scene()) return;
+    if (JceSceneRenderer *renderer = jce_editor_get_scene_renderer())
+        jce_scene_renderer_invalidate_terrain_region(
+            renderer, s.terrain_scene, s.terrain_scene_path,
+            min_x, min_z, max_x, max_z, edit_flags);
+}
+
+void accumulate_stroke_region(float min_x, float min_z,
+                              float max_x, float max_z,
+                              uint32_t edit_flags)
+{
+    if (!s_stroke_region_valid) {
+        s_stroke_min_x = min_x;
+        s_stroke_min_z = min_z;
+        s_stroke_max_x = max_x;
+        s_stroke_max_z = max_z;
+        s_stroke_region_valid = true;
+    } else {
+        s_stroke_min_x = std::min(s_stroke_min_x, min_x);
+        s_stroke_min_z = std::min(s_stroke_min_z, min_z);
+        s_stroke_max_x = std::max(s_stroke_max_x, max_x);
+        s_stroke_max_z = std::max(s_stroke_max_z, max_z);
+    }
+    s_stroke_edit_flags |= edit_flags;
+}
+
+bool push_undo(uint32_t flags)
+{
+    s_terrain_history.attach(s.terrain);
+    if (!s_terrain_history.begin_edit()) return false;
+    return s_terrain_history.capture_region(
+        0.0f, 0.0f, jce_terrain_world_size_x(s.terrain),
+        jce_terrain_world_size_z(s.terrain), flags);
+}
+
+bool push_undo_region(float min_x, float min_z,
+                      float max_x, float max_z, uint32_t flags)
+{
+    s_terrain_history.attach(s.terrain);
+    if (!s_terrain_history.begin_edit()) return false;
+    const bool captured = s_terrain_history.capture_region(
+        min_x, min_z, max_x, max_z, flags);
+    return captured;
+}
+
+void drop_last_undo(void)
+{
+    s_terrain_history.cancel_edit();
+}
+
+bool commit_terrain_history(void)
+{
+    if (!s_terrain_history.commit_edit()) return false;
+    const uint64_t sequence =
+        jce_state_history_commit_external(&s_terrain_history);
+    if (s_terrain_history.set_latest_undo_sequence(sequence)) return true;
+    s_terrain_history.discard_last_undo();
+    return false;
+}
+
+void apply_history_change(const JceTerrainHistoryChange &change)
+{
+    if (change.edit_flags & JCE_TERRAIN_EDIT_HEIGHTS)
+        s.preview_dirty = true;
+    notify_terrain_changed_full();
+    notify_terrain_changed_region(
+        change.min_x, change.min_z, change.max_x, change.max_z,
+        change.edit_flags);
+}
+
+/* Begin a brush transaction. Tiles are captured lazily before each stamp. */
+void begin_stroke(float wx, float wz)
 {
     if (s_stroke_open) return;
-    push_undo();
+    s_terrain_history.attach(s.terrain);
+    (void)s_terrain_history.begin_edit();
     s_stroke_open = true;
+    s_stroke_changed = false;
+    s_stroke_region_valid = false;
+    s_stroke_edit_flags = 0u;
+    s.stroke_has_point = false;
+    s.stroke_flatten_target = jce_terrain_sample_height(s.terrain, wx, wz);
+    jce_rng_seed(&s.stroke_rng, 0x7465727261696eULL ^ ++s.stroke_serial,
+                 0x6272757368ULL);
 }
 
 void end_stroke(void)
 {
+    if (s_stroke_open && s_stroke_changed) {
+        (void)commit_terrain_history();
+        notify_terrain_changed_full();
+        if (s_stroke_region_valid)
+            notify_terrain_changed_region(
+                s_stroke_min_x, s_stroke_min_z,
+                s_stroke_max_x, s_stroke_max_z,
+                s_stroke_edit_flags);
+    } else {
+        s_terrain_history.cancel_edit();
+    }
     s_stroke_open = false;
+    s_stroke_changed = false;
+    s_stroke_region_valid = false;
+    s_stroke_edit_flags = 0u;
+    s.stroke_has_point = false;
 }
 
 void clear_undo_history(void)
 {
-    s_undo.clear();
-    s_redo.clear();
+    s_terrain_history.attach(s.terrain);
+    s_terrain_history.clear();
     s_stroke_open = false;
+    s_stroke_changed = false;
+    s_stroke_region_valid = false;
+    s_stroke_edit_flags = 0u;
+    s.stroke_has_point = false;
 }
 
-void terrain_undo(void)
+bool terrain_history_undo(void)
 {
-    if (s_undo.empty() || !s.terrain) return;
-    TerrainSnapshot current;
-    if (!capture_snapshot(&current)) return;
-    TerrainSnapshot target = std::move(s_undo.back());
-    s_undo.pop_back();
-    restore_snapshot(target);
-    s_redo.push_back(std::move(current));
-    if (s_redo.size() > kTerrainUndoLimit)
-        s_redo.erase(s_redo.begin());
+    JceTerrainHistoryChange change;
+    if (!s_terrain_history.undo(&change)) return false;
+    apply_history_change(change);
+    return true;
 }
 
-void terrain_redo(void)
+bool terrain_history_redo(void)
 {
-    if (s_redo.empty() || !s.terrain) return;
-    TerrainSnapshot current;
-    if (!capture_snapshot(&current)) return;
-    TerrainSnapshot target = std::move(s_redo.back());
-    s_redo.pop_back();
-    restore_snapshot(target);
-    s_undo.push_back(std::move(current));
-    if (s_undo.size() > kTerrainUndoLimit)
-        s_undo.erase(s_undo.begin());
+    JceTerrainHistoryChange change;
+    if (!s_terrain_history.redo(&change)) return false;
+    apply_history_change(change);
+    return true;
+}
+
+uint64_t terrain_history_peek_undo(void *user)
+{
+    return static_cast<JceTerrainHistory *>(user)->undo_sequence();
+}
+
+uint64_t terrain_history_peek_redo(void *user)
+{
+    return static_cast<JceTerrainHistory *>(user)->redo_sequence();
+}
+
+bool terrain_history_apply_undo(void *user)
+{
+    (void)user;
+    validate_scene_owned_terrain();
+    return terrain_history_undo();
+}
+
+bool terrain_history_apply_redo(void *user)
+{
+    (void)user;
+    validate_scene_owned_terrain();
+    return terrain_history_redo();
+}
+
+void terrain_history_clear(void *user)
+{
+    (void)user;
+    clear_undo_history();
+}
+
+void terrain_history_clear_redo(void *user)
+{
+    static_cast<JceTerrainHistory *>(user)->clear_redo();
+}
+
+void ensure_history_provider_registered(void)
+{
+    static bool registered = false;
+    if (registered) return;
+    const JceEditorHistoryProvider provider = {
+        &s_terrain_history,
+        terrain_history_peek_undo,
+        terrain_history_peek_redo,
+        terrain_history_apply_undo,
+        terrain_history_apply_redo,
+        terrain_history_clear,
+        terrain_history_clear_redo,
+    };
+    registered = jce_state_history_register_provider(&provider);
+}
+
+void set_brush_mask_status(const char *key, const char *path, int w, int h)
+{
+    char message[1200];
+    if (w > 0 && h > 0)
+        snprintf(message, sizeof(message), jce_editor_i18n(key), w, h, path);
+    else
+        snprintf(message, sizeof(message), jce_editor_i18n(key), path);
+    s.status = message;
+}
+
+bool load_brush_mask(bool report_status)
+{
+    if (s.brush_mask_path[0] == '\0') return false;
+
+    char resolved[1024];
+    const char *load_path = s.brush_mask_path;
+    if (jce_editor_resolve_asset_path(s.brush_mask_path, resolved,
+                                      sizeof(resolved)))
+        load_path = resolved;
+
+    uint64_t byte_count = 0;
+    void *bytes = jce_fs_host_read_all(load_path, &byte_count);
+    int w = 0;
+    int h = 0;
+    uint16_t *pixels = bytes
+        ? jce_image_load_gray16_from_memory(bytes, byte_count, &w, &h)
+        : nullptr;
+    jce_fs_buffer_free(bytes);
+
+    if (!pixels || w <= 0 || h <= 0 ||
+        w > kBrushMaskMaxDimension || h > kBrushMaskMaxDimension) {
+        jce_image_free_gray16(pixels);
+        if (report_status)
+            set_brush_mask_status("terrain.brush.maskLoadFailed",
+                                  load_path, 0, 0);
+        return false;
+    }
+
+    const size_t count = (size_t)w * (size_t)h;
+    std::vector<float> mask(count);
+    for (size_t i = 0; i < count; ++i)
+        mask[i] = (float)pixels[i] / 65535.0f;
+    jce_image_free_gray16(pixels);
+
+    s.brush_mask.swap(mask);
+    s.brush_mask_w = w;
+    s.brush_mask_h = h;
+    jce_editor_ui_state_save_str("brush.terrain.mask_path",
+                                 s.brush_mask_path);
+    if (report_status)
+        set_brush_mask_status("terrain.brush.maskLoaded", load_path, w, h);
+    return true;
+}
+
+void clear_brush_mask(void)
+{
+    s.brush_mask.clear();
+    s.brush_mask_w = 0;
+    s.brush_mask_h = 0;
+    s.brush_mask_path[0] = '\0';
+    jce_editor_ui_state_save_str("brush.terrain.mask_path", "");
+    s.status = jce_editor_i18n("terrain.brush.maskCleared");
+}
+
+JceTerrainBrushDesc make_brush_desc(float rotation_deg,
+                                    bool lock_flatten,
+                                    float flatten_target)
+{
+    JceTerrainBrushDesc desc = jce_terrain_brush_desc_default();
+    if (!s.brush_mask.empty()) {
+        desc.mask = s.brush_mask.data();
+        desc.mask_width = s.brush_mask_w;
+        desc.mask_height = s.brush_mask_h;
+    }
+    desc.rotation_deg = rotation_deg;
+    desc.hardness = s.brush_hardness;
+    desc.use_flatten_target = lock_flatten;
+    desc.flatten_target_world = flatten_target;
+    return desc;
+}
+
+void apply_brush_stamp(float path_x, float path_z, float dt,
+                       bool randomize, bool lock_flatten,
+                       float flatten_target)
+{
+    float wx = path_x;
+    float wz = path_z;
+    float rotation = s.brush_rotation;
+    if (randomize) {
+        if (s.brush_scatter > 0.0f) {
+            float angle = jce_rng_range_f(&s.stroke_rng, 0.0f, 6.28318530718f);
+            float distance = sqrtf(jce_rng_f32(&s.stroke_rng)) *
+                             s.brush_scatter * s.brush_radius;
+            wx += cosf(angle) * distance;
+            wz += sinf(angle) * distance;
+        }
+        if (s.brush_rotation_jitter > 0.0f)
+            rotation += jce_rng_range_f(&s.stroke_rng,
+                                        -s.brush_rotation_jitter,
+                                         s.brush_rotation_jitter);
+    }
+
+    JceTerrainBrushDesc desc = make_brush_desc(rotation, lock_flatten,
+                                               flatten_target);
+    if (s.tool == ToolMode::Sculpt) {
+        jce_terrain_sculpt_apply_brush(
+            s.terrain, (JceTerrainSculptMode)s.sculpt_mode, &desc,
+            wx, wz, s.brush_radius, s.brush_strength, dt);
+    } else if (s.tool == ToolMode::Splat) {
+        jce_terrain_splat_paint_brush(
+            s.terrain, s.splat_layer, &desc,
+            wx, wz, s.brush_radius, s.brush_strength, dt);
+    } else {
+        jce_terrain_hole_apply(s.terrain, wx, wz,
+                               s.brush_radius, s.hole_erase);
+    }
+}
+
+void apply_continuous_stroke(float wx, float wz, float dt)
+{
+    float dx = s.stroke_has_point ? wx - s.stroke_prev_x : 0.0f;
+    float dz = s.stroke_has_point ? wz - s.stroke_prev_z : 0.0f;
+    float distance = sqrtf(dx * dx + dz * dz);
+    float step = std::max(s.brush_radius * s.brush_spacing, 0.001f);
+    int stamp_count = s.stroke_has_point
+        ? std::max(1, (int)ceilf(distance / step))
+        : 1;
+    stamp_count = std::min(stamp_count, kBrushMaxStampsPerFrame);
+    float stamp_dt = dt / (float)stamp_count;
+    bool lock_flatten = s.tool == ToolMode::Sculpt &&
+                        s.sculpt_mode == JCE_TERRAIN_SCULPT_FLATTEN;
+
+    for (int i = 1; i <= stamp_count; ++i) {
+        float t = s.stroke_has_point ? (float)i / (float)stamp_count : 1.0f;
+        float px = s.stroke_has_point ? s.stroke_prev_x + dx * t : wx;
+        float pz = s.stroke_has_point ? s.stroke_prev_z + dz * t : wz;
+        apply_brush_stamp(px, pz, stamp_dt, true, lock_flatten,
+                          s.stroke_flatten_target);
+    }
+
+    s.stroke_prev_x = wx;
+    s.stroke_prev_z = wz;
+    s.stroke_has_point = true;
 }
 
 void rebuild_preview()
@@ -257,6 +627,7 @@ void ensure_terrain()
                                    s.new_size_x, s.new_size_z,
                                    s.new_max_h, s.new_chunk);
     s.preview_dirty = true;
+    (void)publish_terrain_to_scene();
 }
 
 void draw_toolbar()
@@ -276,14 +647,14 @@ void draw_toolbar()
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.new"), ImVec2(-1, 0))) {
-            if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+            release_panel_terrain();
             clear_undo_history();
             ensure_terrain();
             s.status = jce_editor_i18n("terrain.status.created");
         }
         ImGui::TableNextColumn();
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.load"), ImVec2(-1, 0))) {
-            if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+            release_panel_terrain();
             clear_undo_history();
             char resolved[1024];
             const char *load_path = s.io_path;
@@ -291,6 +662,7 @@ void draw_toolbar()
                 load_path = resolved;
             s.terrain = jce_terrain_load_file(load_path);
             s.preview_dirty = true;
+            if (s.terrain) (void)publish_terrain_to_scene();
             s.status = s.terrain
                 ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
                 : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
@@ -309,30 +681,17 @@ void draw_toolbar()
                 ? std::string(jce_editor_i18n("terrain.status.saved")) + save_path
                 : std::string(jce_editor_i18n("terrain.status.saveFailed")) + save_path;
             if (ok) {
-                /* Force the Scene View renderer to re-load this terrain
-                 * so authoring edits are reflected immediately.  Invalidate
-                 * by both the scene-relative key and the absolute path. */
-                /* The shared terrain cache is the authority: renderer, pick
-                 * pass and physics all BORROW one loaded grid per path.
-                 * Invalidating only the renderer drops its chunk meshes and
-                 * then rebuilds them from exactly the same stale heights. */
-                if (JceScene *sc = jce_state_get_scene()) {
-                    jce_scene_invalidate_terrain(sc, s.io_path);
-                    jce_scene_invalidate_terrain(sc, save_path);
-                }
-                JceSceneRenderer *sr = jce_editor_get_scene_renderer();
-                if (sr) {
-                    jce_scene_renderer_invalidate_terrain(sr, s.io_path);
-                    jce_scene_renderer_invalidate_terrain(sr, save_path);
-                }
+                /* The resident grid is already the authoring grid.  Save only
+                 * persists it; replacing the cache here would free the panel's
+                 * borrowed pointer and reload the same bytes needlessly. */
+                (void)publish_terrain_to_scene();
             }
         }
         ImGui::EndDisabled();
         ImGui::TableNextColumn();
         ImGui::BeginDisabled(s.terrain == nullptr);
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.close"), ImVec2(-1, 0))) {
-            jce_terrain_free(s.terrain);
-            s.terrain = nullptr;
+            release_panel_terrain();
             clear_undo_history();
             s.preview_pixels.clear();
             s.preview_w = s.preview_h = 0;
@@ -352,7 +711,7 @@ void draw_toolbar()
             /* Auto-load if a .terrain.json was dropped. */
             const char *ext = strrchr(path, '.');
             if (ext && (strcmp(ext, ".json") == 0 || strstr(path, ".terrain."))) {
-                if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+                release_panel_terrain();
                 clear_undo_history();
                 char resolved[1024];
                 const char *load_path = s.io_path;
@@ -360,6 +719,7 @@ void draw_toolbar()
                     load_path = resolved;
                 s.terrain = jce_terrain_load_file(load_path);
                 s.preview_dirty = true;
+                if (s.terrain) (void)publish_terrain_to_scene();
                 s.status = s.terrain
                     ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
                     : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
@@ -398,29 +758,15 @@ void draw_heightmap_io_section()
             if (jce_editor_resolve_asset_path(s.heightmap_path, resolved, sizeof(resolved)))
                 load_path = resolved;
             /* Import mutates the height grid: snapshot first so it is undoable. */
-            push_undo();
+            const bool captured = push_undo(JCE_TERRAIN_EDIT_HEIGHTS);
             bool ok = jce_terrain_import_heightmap_file(s.terrain, load_path);
             if (ok) {
+                if (captured) (void)commit_terrain_history();
                 s.preview_dirty = true;
-                /* Force the Scene View renderer to re-load this terrain so the
-                 * imported relief shows up immediately (matches the Save path). */
-                char tr[1024];
-                const bool have_abs =
-                    jce_editor_resolve_asset_path(s.io_path, tr, sizeof(tr));
-                /* Shared cache first -- see the Save path above. */
-                if (JceScene *sc = jce_state_get_scene()) {
-                    jce_scene_invalidate_terrain(sc, s.io_path);
-                    if (have_abs) jce_scene_invalidate_terrain(sc, tr);
-                }
-                JceSceneRenderer *sr = jce_editor_get_scene_renderer();
-                if (sr) {
-                    jce_scene_renderer_invalidate_terrain(sr, s.io_path);
-                    if (have_abs)
-                        jce_scene_renderer_invalidate_terrain(sr, tr);
-                }
-            } else {
+                notify_terrain_changed_full();
+            } else if (captured) {
                 /* Import failed: drop the undo snapshot we just pushed. */
-                if (!s_undo.empty()) s_undo.pop_back();
+                drop_last_undo();
             }
             s.status = ok
                 ? std::string(jce_editor_i18n("terrain.heightmap.imported")) + load_path
@@ -460,16 +806,42 @@ void draw_brush_section()
         s_brush_loaded = true;
         s.tool           = (ToolMode)jce_editor_ui_state_load_int(
                                "brush.terrain.tool", (int)s.tool, 0, 2);
+        s.sculpt_mode    = jce_editor_ui_state_load_int(
+                               "brush.terrain.sculpt_mode", s.sculpt_mode, 0, 3);
         s.splat_layer    = jce_editor_ui_state_load_int(
                                "brush.terrain.layer", s.splat_layer, 0, 3);
+        s.hole_erase     = jce_editor_ui_state_load_int(
+                               "brush.terrain.hole_erase", 0, 0, 1) != 0;
+        s.paint_in_scene = jce_editor_ui_state_load_int(
+                               "brush.terrain.paint_in_scene", 0, 0, 1) != 0;
         s.brush_radius   = jce_editor_ui_state_load_float(
                                "brush.terrain.radius", s.brush_radius, 0.5f, 64.0f);
         s.brush_strength = jce_editor_ui_state_load_float(
                                "brush.terrain.strength", s.brush_strength, 0.1f, 64.0f);
+        s.brush_rotation = jce_editor_ui_state_load_float(
+                               "brush.terrain.rotation", 0.0f, -180.0f, 180.0f);
+        s.brush_hardness = jce_editor_ui_state_load_float(
+                               "brush.terrain.hardness", 0.0f, 0.0f, 1.0f);
+        s.brush_spacing  = jce_editor_ui_state_load_float(
+                               "brush.terrain.spacing", 0.25f, 0.05f, 1.0f);
+        s.brush_scatter  = jce_editor_ui_state_load_float(
+                               "brush.terrain.scatter", 0.0f, 0.0f, 1.0f);
+        s.brush_rotation_jitter = jce_editor_ui_state_load_float(
+                               "brush.terrain.rotation_jitter", 0.0f,
+                               0.0f, 180.0f);
+        jce_editor_ui_state_load_str("brush.terrain.mask_path",
+                                     s.brush_mask_path,
+                                     sizeof(s.brush_mask_path), "");
+        if (s.brush_mask_path[0] != '\0') load_brush_mask(false);
     }
 
     if (!s.terrain) {
         ImGui::TextDisabled("%s", jce_editor_i18n("terrain.brush.needTerrain"));
+        return;
+    }
+    if (!jce_terrain_heights(s.terrain)) {
+        ImGui::TextDisabled("%s",
+                            jce_editor_i18n("terrain.brush.needResidentTerrain"));
         return;
     }
     if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.gen.header"))) {
@@ -484,7 +856,7 @@ void draw_brush_section()
         ImGui::SliderFloat(jce_editor_i18n("terrain.gen.strength"), &s.gen_strength, 0.0f, 40.0f);
         ImGui::SliderFloat(jce_editor_i18n("terrain.gen.detail"), &s.gen_detail, 0.0f, 4.0f);
         if (ImGui::Button(jce_editor_i18n("terrain.gen.applyErosion"))) {
-            push_undo();
+            const bool captured = push_undo(JCE_TERRAIN_EDIT_HEIGHTS);
             JceTerrainErosionParams ep;
             memset(&ep, 0, sizeof ep);
             ep.seed      = s.gen_seed;
@@ -498,18 +870,14 @@ void draw_brush_section()
                                  (size_t)jce_terrain_height(s.terrain);
             s.ridge_field.assign(cells, 0.0f);
             if (jce_terrain_apply_erosion(s.terrain, &ep, s.ridge_field.data())) {
-                /* Preview only.  The renderer, pick pass and collider read
-                 * the SHARED cache, which reflects what is on DISK -- this
-                 * panel holds its own mutable authoring copy, so a generator
-                 * result reaches them at Save, exactly like a brush stroke.
-                 * Invalidating here would drop their caches and have them
-                 * reload the unchanged file. */
+                if (captured) (void)commit_terrain_history();
                 s.preview_dirty = true;
+                notify_terrain_changed_full();
             } else {
                 /* Refused (e.g. a tiled terrain with no resident grid): drop
                  * the undo entry we just pushed rather than leaving a
                  * no-op step in the stack. */
-                if (!s_undo.empty()) s_undo.pop_back();
+                if (captured) drop_last_undo();
                 s.ridge_field.clear();
             }
         }
@@ -520,22 +888,18 @@ void draw_brush_section()
         ImGui::SliderInt(jce_editor_i18n("terrain.gen.iterations"), &s.talus_iters, 1, 200);
         ImGui::SliderFloat(jce_editor_i18n("terrain.gen.rate"), &s.talus_strength, 0.05f, 1.0f);
         if (ImGui::Button(jce_editor_i18n("terrain.gen.applyThermal"))) {
-            push_undo();
+            const bool captured = push_undo(JCE_TERRAIN_EDIT_HEIGHTS);
             JceTerrainThermalParams tp;
             memset(&tp, 0, sizeof tp);
             tp.talus_angle_deg = s.talus_angle;
             tp.iterations      = s.talus_iters;
             tp.strength        = s.talus_strength;
             if (jce_terrain_apply_thermal(s.terrain, &tp)) {
-                /* Preview only.  The renderer, pick pass and collider read
-                 * the SHARED cache, which reflects what is on DISK -- this
-                 * panel holds its own mutable authoring copy, so a generator
-                 * result reaches them at Save, exactly like a brush stroke.
-                 * Invalidating here would drop their caches and have them
-                 * reload the unchanged file. */
+                if (captured) (void)commit_terrain_history();
                 s.preview_dirty = true;
-            } else if (!s_undo.empty()) {
-                s_undo.pop_back();
+                notify_terrain_changed_full();
+            } else if (captured) {
+                drop_last_undo();
             }
         }
 
@@ -574,15 +938,20 @@ void draw_brush_section()
             jce_editor_ui_state_save_int("brush.terrain.tool", tool);
         }
         if (s.tool == ToolMode::Sculpt) {
-            ImGui::Combo(jce_editor_i18n("terrain.brush.mode"), &s.sculpt_mode,
-                         "Raise\0Lower\0Smooth\0Flatten\0\0");
+            if (ImGui::Combo(jce_editor_i18n("terrain.brush.mode"), &s.sculpt_mode,
+                             "Raise\0Lower\0Smooth\0Flatten\0\0"))
+                jce_editor_ui_state_save_int("brush.terrain.sculpt_mode",
+                                             s.sculpt_mode);
         } else if (s.tool == ToolMode::Splat) {
             if (ImGui::Combo(jce_editor_i18n("terrain.brush.layer"), &s.splat_layer,
                              "Layer 0\0Layer 1\0Layer 2\0Layer 3\0\0"))
                 jce_editor_ui_state_save_int("brush.terrain.layer", s.splat_layer);
         } else {
-            ImGui::Checkbox(jce_editor_i18n_id("terrain.brush.holeErase", "Erase (fill holes back)"),
-                            &s.hole_erase);
+            if (ImGui::Checkbox(jce_editor_i18n_id(
+                    "terrain.brush.holeErase", "Erase (fill holes back)"),
+                    &s.hole_erase))
+                jce_editor_ui_state_save_int("brush.terrain.hole_erase",
+                                             s.hole_erase ? 1 : 0);
             ImGui::TextDisabled("%s", jce_editor_i18n_id("terrain.brush.holeHint",
                 "Cuts cells from render + collision (caves, tunnels, interiors)"));
         }
@@ -590,45 +959,112 @@ void draw_brush_section()
             jce_editor_ui_state_save_float("brush.terrain.radius", s.brush_radius);
         if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.strength"), &s.brush_strength, 0.1f, 64.0f))
             jce_editor_ui_state_save_float("brush.terrain.strength", s.brush_strength);
-        ImGui::Checkbox(jce_editor_i18n("terrain.brush.paintInScene"), &s.paint_in_scene);
+
+        if (s.tool != ToolMode::Holes) {
+            if (jce_draw_path_input(jce_editor_i18n("terrain.brush.maskPath"),
+                                    s.brush_mask_path,
+                                    sizeof(s.brush_mask_path),
+                                    JcePathKind::FileAbs))
+                jce_editor_ui_state_save_str("brush.terrain.mask_path",
+                                             s.brush_mask_path);
+            if (ImGui::BeginTable("terrain_brush_mask_buttons", 2,
+                                  ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableNextColumn();
+                if (ImGui::Button(jce_editor_i18n("terrain.brush.maskLoad"),
+                                  ImVec2(-1, 0)))
+                    load_brush_mask(true);
+                ImGui::TableNextColumn();
+                ImGui::BeginDisabled(s.brush_mask.empty() &&
+                                     s.brush_mask_path[0] == '\0');
+                if (ImGui::Button(jce_editor_i18n("terrain.brush.maskClear"),
+                                  ImVec2(-1, 0)))
+                    clear_brush_mask();
+                ImGui::EndDisabled();
+                ImGui::EndTable();
+            }
+            if (!s.brush_mask.empty())
+                ImGui::TextDisabled(jce_editor_i18n("terrain.brush.maskActive"),
+                                    s.brush_mask_w, s.brush_mask_h);
+
+            ImGui::BeginDisabled(s.brush_mask.empty());
+            if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.rotation"),
+                                   &s.brush_rotation, -180.0f, 180.0f, "%.0f deg"))
+                jce_editor_ui_state_save_float("brush.terrain.rotation",
+                                               s.brush_rotation);
+            if (ImGui::SliderFloat(
+                    jce_editor_i18n("terrain.brush.rotationJitter"),
+                    &s.brush_rotation_jitter, 0.0f, 180.0f, "%.0f deg"))
+                jce_editor_ui_state_save_float(
+                    "brush.terrain.rotation_jitter", s.brush_rotation_jitter);
+            ImGui::EndDisabled();
+
+            if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.hardness"),
+                                   &s.brush_hardness, 0.0f, 1.0f))
+                jce_editor_ui_state_save_float("brush.terrain.hardness",
+                                               s.brush_hardness);
+        }
+        if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.spacing"),
+                               &s.brush_spacing, 0.05f, 1.0f))
+            jce_editor_ui_state_save_float("brush.terrain.spacing",
+                                           s.brush_spacing);
+        if (ImGui::SliderFloat(jce_editor_i18n("terrain.brush.scatter"),
+                               &s.brush_scatter, 0.0f, 1.0f))
+            jce_editor_ui_state_save_float("brush.terrain.scatter",
+                                           s.brush_scatter);
+        if (ImGui::Checkbox(jce_editor_i18n("terrain.brush.paintInScene"),
+                            &s.paint_in_scene)) {
+            jce_editor_ui_state_save_int("brush.terrain.paint_in_scene",
+                                         s.paint_in_scene ? 1 : 0);
+            if (s.paint_in_scene) jce_foliage_brush_set_armed(false);
+        }
         ImGui::DragFloat(jce_editor_i18n("terrain.brush.cursorX"), &s.cursor_x, 0.5f);
         ImGui::DragFloat(jce_editor_i18n("terrain.brush.cursorZ"), &s.cursor_z, 0.5f);
 
         if (ImGui::Button(jce_editor_i18n("terrain.brush.stamp"), ImVec2(-1, 0))) {
             const float dt = 0.1f;
-            push_undo();
-            if (s.tool == ToolMode::Sculpt) {
-                jce_terrain_sculpt_apply(s.terrain,
-                                         (JceTerrainSculptMode)s.sculpt_mode,
-                                         s.cursor_x, s.cursor_z,
-                                         s.brush_radius, s.brush_strength, dt);
-            } else if (s.tool == ToolMode::Splat) {
-                jce_terrain_splat_paint(s.terrain, s.splat_layer,
-                                        s.cursor_x, s.cursor_z,
-                                        s.brush_radius, s.brush_strength, dt);
-            } else {
-                jce_terrain_hole_apply(s.terrain, s.cursor_x, s.cursor_z,
-                                       s.brush_radius, s.hole_erase);
-            }
+            const uint32_t flags = s.tool == ToolMode::Splat
+                ? JCE_TERRAIN_EDIT_SPLAT
+                : (s.tool == ToolMode::Holes
+                    ? JCE_TERRAIN_EDIT_HOLES : JCE_TERRAIN_EDIT_HEIGHTS);
+            const bool captured = push_undo_region(
+                s.cursor_x - s.brush_radius, s.cursor_z - s.brush_radius,
+                s.cursor_x + s.brush_radius, s.cursor_z + s.brush_radius,
+                flags);
+            bool lock_flatten = s.tool == ToolMode::Sculpt &&
+                                s.sculpt_mode == JCE_TERRAIN_SCULPT_FLATTEN;
+            float target = jce_terrain_sample_height(s.terrain,
+                                                     s.cursor_x, s.cursor_z);
+            apply_brush_stamp(s.cursor_x, s.cursor_z, dt, false,
+                              lock_flatten, target);
+            if (captured) (void)commit_terrain_history();
             s.preview_dirty = true;
+            notify_terrain_changed_full();
+            notify_terrain_changed_region(
+                s.cursor_x - s.brush_radius, s.cursor_z - s.brush_radius,
+                s.cursor_x + s.brush_radius, s.cursor_z + s.brush_radius,
+                flags);
         }
 
         if (ImGui::Button(jce_editor_i18n("terrain.brush.clear"), ImVec2(-1, 0))) {
-            push_undo();
+            const bool captured = push_undo(JCE_TERRAIN_EDIT_HEIGHTS);
             int w = jce_terrain_width(s.terrain);
             int h = jce_terrain_height(s.terrain);
             float *heights = const_cast<float *>(jce_terrain_heights(s.terrain));
             std::memset(heights, 0, (size_t)w * (size_t)h * sizeof(float));
+            if (captured) (void)commit_terrain_history();
             s.preview_dirty = true;
+            notify_terrain_changed_full();
         }
 
         ImGui::Separator();
-        ImGui::BeginDisabled(s_undo.empty());
-        if (ImGui::Button(jce_editor_i18n("terrain.brush.undo"))) terrain_undo();
+        ImGui::BeginDisabled(!jce_state_can_undo());
+        if (ImGui::Button(jce_editor_i18n("terrain.brush.undo")))
+            jce_state_undo();
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(s_redo.empty());
-        if (ImGui::Button(jce_editor_i18n("terrain.brush.redo"))) terrain_redo();
+        ImGui::BeginDisabled(!jce_state_can_redo());
+        if (ImGui::Button(jce_editor_i18n("terrain.brush.redo")))
+            jce_state_redo();
         ImGui::EndDisabled();
     }
 }
@@ -693,8 +1129,11 @@ void draw_preview_section()
 
 extern "C" void jce_editor_panel_terrain(void)
 {
+    ensure_history_provider_registered();
+    validate_scene_owned_terrain();
     bool *p_open = jce_editor_panel_visible_ptr(JCE_PANEL_TERRAIN);
     if (!p_open || !*p_open) return;
+    (void)publish_terrain_to_scene();
     ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_terrain", jce_editor_i18n("terrain.title"));
@@ -715,26 +1154,57 @@ extern "C" void jce_editor_panel_terrain(void)
     ImGui::Separator();
     draw_preview_section();
 
-    /* Ctrl+Z / Ctrl+(Shift+)Z / Ctrl+Y undo-redo for brush edits while the
-     * Terrain panel is focused.  Suppressed while a text field is active so
-     * it does not collide with the input box's own editing. */
-    if (s.terrain &&
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        !ImGui::IsAnyItemActive()) {
-        ImGuiIO &io = ImGui::GetIO();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-            if (io.KeyShift) terrain_redo();
-            else             terrain_undo();
-        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
-            terrain_redo();
-        }
-    }
-
     if (!s.status.empty()) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.8f, 0.9f, 0.6f, 1.0f), "%s", s.status.c_str());
     }
     ImGui::End();
+}
+
+extern "C" bool jce_terrain_panel_open_asset(const char *path)
+{
+    if (!path || !path[0]) return false;
+    ensure_history_provider_registered();
+    validate_scene_owned_terrain();
+
+    JceScene *scene = jce_state_get_scene();
+    if (!(s.scene_owns_terrain && scene == s.terrain_scene &&
+          std::strcmp(path, s.terrain_scene_path) == 0)) {
+        release_panel_terrain();
+        clear_undo_history();
+        std::snprintf(s.io_path, sizeof(s.io_path), "%s", path);
+
+        if (scene) {
+            s.terrain = jce_scene_peek_terrain(scene, path);
+            if (s.terrain) {
+                s.terrain_scene = scene;
+                s.scene_owns_terrain = true;
+                std::snprintf(s.terrain_scene_path,
+                              sizeof(s.terrain_scene_path), "%s", path);
+            }
+        }
+        if (!s.terrain) {
+            char resolved[1024];
+            const char *load_path = path;
+            if (jce_editor_resolve_asset_path(path, resolved,
+                                              sizeof(resolved)))
+                load_path = resolved;
+            s.terrain = jce_terrain_load_file(load_path);
+            if (s.terrain) (void)publish_terrain_to_scene();
+        }
+        s.preview_dirty = true;
+        if (s.terrain) {
+            jce_editor_pstate_set_str("doc.terrain.last", path);
+            s.status = jce_editor_i18n("terrain.status.loaded");
+        } else {
+            s.status = jce_editor_i18n("terrain.status.loadFailed");
+        }
+    }
+
+    bool *visible = jce_editor_panel_visible_ptr(JCE_PANEL_TERRAIN);
+    if (visible) *visible = true;
+    jce_editor_panel_request_focus("###jce_terrain");
+    return s.terrain != nullptr;
 }
 
 /* ── Scene-View brush bridge ───────────────────────────────────────
@@ -743,37 +1213,73 @@ extern "C" void jce_editor_panel_terrain(void)
  *  user opted in via the panel) AND a terrain is loaded.            */
 extern "C" bool jce_terrain_panel_brush_armed(void)
 {
-    return s.paint_in_scene && s.terrain != nullptr;
+    validate_scene_owned_terrain();
+    if (!s.paint_in_scene || !s.terrain ||
+        !jce_terrain_heights(s.terrain))
+        return false;
+    (void)publish_terrain_to_scene();
+    JceEntity entity = 0;
+    return find_terrain_binding(jce_state_get_scene(), &entity, nullptr, 0);
 }
 
 extern "C" struct JceTerrain *jce_terrain_panel_get_terrain(void)
 {
+    validate_scene_owned_terrain();
     return s.terrain;
 }
 
-extern "C" void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt)
+extern "C" void jce_terrain_panel_set_brush_armed(bool armed)
 {
-    if (!s.terrain) return;
+    if (!armed) end_stroke();
+    s.paint_in_scene = armed;
+    jce_editor_ui_state_save_int("brush.terrain.paint_in_scene", armed ? 1 : 0);
+}
+
+extern "C" float jce_terrain_panel_brush_radius(void)
+{
+    return s.brush_radius;
+}
+
+extern "C" uint32_t jce_terrain_panel_brush_edit_flags(void)
+{
+    if (s.tool == ToolMode::Splat) return JCE_TERRAIN_EDIT_SPLAT;
+    if (s.tool == ToolMode::Holes) return JCE_TERRAIN_EDIT_HOLES;
+    return JCE_TERRAIN_EDIT_HEIGHTS;
+}
+
+extern "C" void jce_terrain_panel_apply_brush_local(float local_x,
+                                                       float local_z,
+                                                       float dt)
+{
+    if (!s.terrain || !jce_terrain_heights(s.terrain)) return;
     /* One undo entry per drag: snapshot on the first applied frame of the
      * stroke; jce_terrain_panel_end_brush_stroke() (called by the Scene
      * View on mouse release) re-arms capture for the next stroke. */
-    begin_stroke();
-    s.cursor_x = wx;
-    s.cursor_z = wz;
+    begin_stroke(local_x, local_z);
+    const bool had_previous = s.stroke_has_point;
+    const float previous_x = s.stroke_prev_x;
+    const float previous_z = s.stroke_prev_z;
+    const float spread = s.brush_radius * (1.0f + s.brush_scatter);
+    const float min_x = std::min(local_x,
+                                 had_previous ? previous_x : local_x) - spread;
+    const float min_z = std::min(local_z,
+                                 had_previous ? previous_z : local_z) - spread;
+    const float max_x = std::max(local_x,
+                                 had_previous ? previous_x : local_x) + spread;
+    const float max_z = std::max(local_z,
+                                 had_previous ? previous_z : local_z) + spread;
+    const uint32_t edit_flags = jce_terrain_panel_brush_edit_flags();
+    (void)s_terrain_history.capture_region(
+        min_x, min_z, max_x, max_z, edit_flags);
+    s.cursor_x = local_x;
+    s.cursor_z = local_z;
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
-    if (s.tool == ToolMode::Sculpt) {
-        jce_terrain_sculpt_apply(s.terrain,
-                                 (JceTerrainSculptMode)s.sculpt_mode,
-                                 wx, wz,
-                                 s.brush_radius, s.brush_strength, dt);
-    } else if (s.tool == ToolMode::Splat) {
-        jce_terrain_splat_paint(s.terrain, s.splat_layer,
-                                wx, wz,
-                                s.brush_radius, s.brush_strength, dt);
-    } else {
-        jce_terrain_hole_apply(s.terrain, wx, wz, s.brush_radius, s.hole_erase);
-    }
+    apply_continuous_stroke(local_x, local_z, dt);
     s.preview_dirty = true;
+    s_stroke_changed = true;
+
+    notify_terrain_changed_region(min_x, min_z, max_x, max_z, edit_flags);
+    accumulate_stroke_region(min_x, min_z, max_x, max_z, edit_flags);
 }
 
 /* Called by the Scene View when the brush LMB is released, ending the

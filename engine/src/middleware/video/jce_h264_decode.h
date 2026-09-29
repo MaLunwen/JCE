@@ -49,6 +49,12 @@ bool jce_h264_decoder_drain_pending(JceH264Decoder *dec,
                                      uint32_t *out_width,
                                      uint32_t *out_height);
 
+/* Container PTS is carried through the codec's actual output reorder. */
+bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
+                             uint32_t *out_width, uint32_t *out_height);
+void jce_h264_decoder_set_timestamp(JceH264Decoder *dec, uint64_t timestamp);
+uint64_t jce_h264_decoder_frame_timestamp(const JceH264Decoder *dec);
+
 /* Flush the decoder (e.g. after seeking) so stale reference frames
  * are discarded. */
 void jce_h264_decoder_flush(JceH264Decoder *dec);

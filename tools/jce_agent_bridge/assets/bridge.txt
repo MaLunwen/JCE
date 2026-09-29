@@ -1,0 +1,3 @@
+The agent bridge ships one asset because the engine's link requires the
+embedded-pak symbols (assets_pak_data / assets_pak_data_size) that
+jce_add_pak generates.  Nothing reads this file.

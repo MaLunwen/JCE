@@ -61,9 +61,14 @@ typedef struct {
 
 /* ── Graphics ──────────────────────────────────────────────────────── */
 typedef struct {
-    int   color_space;            /* 0 = Gamma, 1 = Linear */
+    /* 0 = Gamma, 1 = Linear.  Authoritative: it reaches the engine through
+     * jce_texture_set_colour_space, which decides BOTH the hardware sRGB
+     * decode on albedo/emissive and the output encode exponent, because they
+     * are one decision.  There is deliberately no separate srgb_write: it was
+     * the encode half of this same choice and could not hold a value this one
+     * did not imply. */
+    int   color_space;
     bool  hdr;
-    bool  srgb_write;
     int   default_msaa;           /* 0 / 2 / 4 / 8 */
     int   anisotropic_textures;   /* 0 = Disabled, 1 = PerTexture, 2 = ForcedOn */
     char  always_included_shaders[1024]; /* newline-delimited paths */
@@ -133,12 +138,20 @@ typedef struct {
 } JceProjectPresetManager;
 
 /* ── Quality ───────────────────────────────────────────────────────── */
+
+/* JceProjectQualityLevel.anti_aliasing: defer to graphics.default_msaa.
+ * Levels authored before this carry a concrete 0/2/4/8 and keep overriding,
+ * which is what their panel has always said they do. */
+#define JCE_PS_AA_USE_PROJECT_DEFAULT (-1)
+
 typedef struct {
     char  name[JCE_PS_NAME_LEN];
     int   pixel_light_count;
     int   texture_quality;        /* 0 = Full, 1 = Half, 2 = Quarter, 3 = Eighth */
     int   anisotropic;            /* same enum as Graphics */
-    int   anti_aliasing;          /* 0/2/4/8 */
+    /* 0/2/4/8, or JCE_PS_AA_USE_PROJECT_DEFAULT to inherit
+     * graphics.default_msaa.  Read by jce_editor_quality_msaa(). */
+    int   anti_aliasing;
     bool  soft_particles;
     bool  realtime_reflection_probes;
     int   shadow_quality;         /* 0 = Disable, 1 = Hard, 2 = HardSoft */

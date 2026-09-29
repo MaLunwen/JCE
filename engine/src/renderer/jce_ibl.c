@@ -17,6 +17,7 @@
 #include <jce/renderer/jce_ibl.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_ibl_convolve.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL_iostream.h>
@@ -60,6 +61,21 @@ static uint16_t f32_to_f16(float f)
     if (expo <= 0)  return (uint16_t)sign;
     if (expo >= 31) return (uint16_t)(sign | 0x7C00);
     return (uint16_t)(sign | ((uint32_t)expo << 10) | mant);
+}
+
+/* The inverse of the above.  Denormals decode as zero, which is what the
+ * encoder produces for them anyway (expo <= 0 returns the sign bit alone), so
+ * the pair round-trips every value the encoder can emit. */
+static float f16_to_f32(uint16_t h)
+{
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t expo = (uint32_t)(h >> 10) & 0x1Fu;
+    const uint32_t mant = (uint32_t)(h & 0x03FFu);
+    union { float f; uint32_t u; } conv;
+    if (expo == 0u)  { conv.u = sign; return conv.f; }          /* +-0/denorm */
+    if (expo == 31u) { conv.u = sign | 0x7F800000u | (mant << 13); return conv.f; }
+    conv.u = sign | ((expo - 15u + 127u) << 23) | (mant << 13);
+    return conv.f;
 }
 
 /* Radical inverse using Van der Corput sequence (base 2). */
@@ -321,6 +337,92 @@ static void sample_equirect(const float *src, uint32_t w, uint32_t h,
     }
 }
 
+void jce_ibl_cube_direction(int face, float u, float v,
+                            float *dx, float *dy, float *dz)
+{
+    cube_dir(face, u, v, dx, dy, dz);
+}
+
+/* Inverse of cube_dir: a direction back to the face it lands on and the
+ * [0,1] uv within that face.
+ *
+ * Written as the literal inverse of the switch above, sign for sign, and
+ * asserted as a round trip by test_jce_probe_convolution -- a cubemap
+ * addressing convention that is subtly mirrored produces a plausible image
+ * that is wrong in a way nobody sees until reflections point the wrong way,
+ * which is this tree's most repeated class of bug. */
+static void cube_face_uv(float dx, float dy, float dz,
+                         int *face, float *u, float *v)
+{
+    const float ax = fabsf(dx), ay = fabsf(dy), az = fabsf(dz);
+    float su, sv, ma;
+
+    if (ax >= ay && ax >= az) {
+        ma = ax;
+        if (dx > 0.0f) { *face = 0; su = -dz; sv = -dy; }   /* +X */
+        else           { *face = 1; su =  dz; sv = -dy; }   /* -X */
+    } else if (ay >= az) {
+        ma = ay;
+        if (dy > 0.0f) { *face = 2; su =  dx; sv =  dz; }   /* +Y */
+        else           { *face = 3; su =  dx; sv = -dz; }   /* -Y */
+    } else {
+        ma = az;
+        if (dz > 0.0f) { *face = 4; su =  dx; sv = -dy; }   /* +Z */
+        else           { *face = 5; su = -dx; sv = -dy; }   /* -Z */
+    }
+
+    if (ma < 1e-20f) ma = 1e-20f;
+    *u = (su / ma) * 0.5f + 0.5f;
+    *v = (sv / ma) * 0.5f + 0.5f;
+}
+
+/* ── Direction samplers ───────────────────────────────────────────────
+ *
+ * The two convolutions below are pure functions of a direction, so the
+ * SOURCE is a parameter.  That is the whole reason the reflection probe can
+ * reuse them instead of carrying a second copy of the same integrals. */
+typedef void (*IblDirSampler)(const void *src, float dx, float dy, float dz,
+                              float *r, float *g, float *b);
+
+typedef struct { const float *px; uint32_t w, h; } IblEquirectSrc;
+
+static void ibl_sample_equirect_src(const void *src, float dx, float dy,
+                                    float dz, float *r, float *g, float *b)
+{
+    const IblEquirectSrc *e = (const IblEquirectSrc *)src;
+    sample_equirect(e->px, e->w, e->h, dx, dy, dz, r, g, b);
+}
+
+typedef struct { const uint8_t *faces; uint32_t face_size; } IblCubeRgba8Src;
+/* The same thing in half floats.  A probe baked HDR keeps values above 1.0,
+ * which an RGBA8 container cannot hold at all -- and a reflection that clamps
+ * every highlight to white is the one case a reflection exists for. */
+typedef struct { const uint16_t *faces; uint32_t face_size; } IblCubeRgba16fSrc;
+
+/* Nearest-texel, deliberately: bilinear across a cube seam needs the
+ * neighbouring face's texels and the wrong answer there is a visible edge.
+ * Both convolutions take hundreds of samples per output texel, so the
+ * filtering they do themselves dominates any per-tap interpolation. */
+static void ibl_sample_cube_rgba8_src(const void *src, float dx, float dy,
+                                      float dz, float *r, float *g, float *b)
+{
+    const IblCubeRgba8Src *c = (const IblCubeRgba8Src *)src;
+    const uint32_t fs = c->face_size;
+    int   face; float u, v;
+    cube_face_uv(dx, dy, dz, &face, &u, &v);
+
+    int x = (int)(u * (float)fs);
+    int y = (int)(v * (float)fs);
+    if (x < 0) x = 0; if (x >= (int)fs) x = (int)fs - 1;
+    if (y < 0) y = 0; if (y >= (int)fs) y = (int)fs - 1;
+
+    const uint8_t *px = c->faces +
+        ((size_t)face * fs * fs + (size_t)y * fs + (size_t)x) * 4u;
+    *r = (float)px[0] / 255.0f;
+    *g = (float)px[1] / 255.0f;
+    *b = (float)px[2] / 255.0f;
+}
+
 /* ================================================================== */
 /* Irradiance cubemap (cosine-weighted hemisphere convolution)          */
 /* ================================================================== */
@@ -328,16 +430,29 @@ static void sample_equirect(const float *src, uint32_t w, uint32_t h,
 /* Computes the irradiance cubemap face data (RGBA16F, 6 faces, no mips) on the
  * CPU and returns it; the caller uploads to bgfx and/or caches it to disk.
  * Returns NULL on OOM. Buffer length = face_size*face_size*6*4 halfwords. */
-static uint16_t *ibl_compute_irradiance(const float *equirect,
-                                        uint32_t ew, uint32_t eh,
-                                        uint32_t face_size)
+/* The integral itself, writing linear f32 RGBA.  `out` holds
+ * face_size*face_size*6*4 floats. */
+/* `scale` multiplies the cosine-weighted MEAN radiance.
+ *
+ * TWO CONVENTIONS EXIST HERE AND THE DIFFERENCE IS PI.  fs_pbr_body.sh
+ * computes `diffuse = kD * irradiance * albedo` with no 1/PI, so what it
+ * wants from this texture is the mean radiance L-bar: physically
+ * diffuse = (albedo/PI) * E and E = PI * L-bar, and the two PIs cancel.
+ *
+ * The equirect sky path has always passed PI and therefore feeds that shader
+ * PI * L-bar.  That is a real discrepancy and it is NOT changed here: it is
+ * the ambient level of every scene in every project, so moving it is a
+ * deliberate look change with its own before/after, not a side effect of
+ * giving reflection probes a convolution they never had.  The probe path
+ * passes 1.0, which is both the correct value for that shader and the only
+ * one an 8-bit container can hold -- PI * L-bar clips to white for any
+ * environment brighter than 1/PI. */
+static void ibl_convolve_irradiance_f32(IblDirSampler sample, const void *src,
+                                        uint32_t face_size, float scale,
+                                        float *out)
 {
     const uint32_t SAMPLE_DELTA_STEPS = 64;
-
-    uint32_t face_pixels = face_size * face_size;
-    uint32_t total_pixels = face_pixels * 6;
-    uint16_t *data = (uint16_t *)JCE_MALLOC(total_pixels * 4 * sizeof(uint16_t));
-    if (!data) return NULL;
+    uint32_t o = 0;
 
     for (int face = 0; face < 6; face++) {
         for (uint32_t y = 0; y < face_size; y++) {
@@ -387,8 +502,7 @@ static uint16_t *ibl_compute_irradiance(const float *equirect,
                         float wz = sx * rz + sy * tz + sz * nz;
 
                         float sr, sg, sb;
-                        sample_equirect(equirect, ew, eh, wx, wy, wz,
-                                        &sr, &sg, &sb);
+                        sample(src, wx, wy, wz, &sr, &sg, &sb);
 
                         float weight = cos_t * sin_t;
                         irr_r += sr * weight;
@@ -399,21 +513,40 @@ static uint16_t *ibl_compute_irradiance(const float *equirect,
                 }
 
                 if (total_weight > 0.0f) {
-                    irr_r = irr_r * JCE_PI / total_weight;
-                    irr_g = irr_g * JCE_PI / total_weight;
-                    irr_b = irr_b * JCE_PI / total_weight;
+                    irr_r = irr_r * scale / total_weight;
+                    irr_g = irr_g * scale / total_weight;
+                    irr_b = irr_b * scale / total_weight;
                 }
 
-                uint32_t idx = ((uint32_t)face * face_pixels + y * face_size + x) * 4;
-                data[idx + 0] = f32_to_f16(irr_r);
-                data[idx + 1] = f32_to_f16(irr_g);
-                data[idx + 2] = f32_to_f16(irr_b);
-                data[idx + 3] = f32_to_f16(1.0f);
+                out[o + 0] = irr_r;
+                out[o + 1] = irr_g;
+                out[o + 2] = irr_b;
+                out[o + 3] = 1.0f;
+                o += 4;
             }
         }
     }
+}
 
-    /* Return the CPU buffer; the caller uploads (and may cache) it. */
+/* Equirect wrapper, unchanged in behaviour: the same loops over the same
+ * pixels, and the f32 -> f16 conversion applied to the same values. */
+static uint16_t *ibl_compute_irradiance(const float *equirect,
+                                        uint32_t ew, uint32_t eh,
+                                        uint32_t face_size)
+{
+    const uint32_t n = face_size * face_size * 6u * 4u;
+    float *f32 = (float *)JCE_MALLOC(n * sizeof(float));
+    if (!f32) return NULL;
+
+    IblEquirectSrc src = { equirect, ew, eh };
+    /* PI, exactly as this path has always used -- see the note on the core. */
+    ibl_convolve_irradiance_f32(ibl_sample_equirect_src, &src, face_size,
+                                JCE_PI, f32);
+
+    uint16_t *data = (uint16_t *)JCE_MALLOC(n * sizeof(uint16_t));
+    if (!data) { JCE_FREE(f32); return NULL; }
+    for (uint32_t i = 0; i < n; ++i) data[i] = f32_to_f16(f32[i]);
+    JCE_FREE(f32);
     return data;
 }
 
@@ -424,39 +557,70 @@ static uint16_t *ibl_compute_irradiance(const float *equirect,
 /* Computes the specular prefilter cubemap face data (RGBA16F, 6 faces, all
  * mips packed sequentially) on the CPU and returns it; caller uploads/caches.
  * Sets *out_mips and *out_words (total halfword count). Returns NULL on OOM. */
-static uint16_t *ibl_compute_prefilter(const float *equirect,
-                                       uint32_t ew, uint32_t eh,
-                                       uint32_t face_size,
-                                       uint32_t *out_mips,
-                                       uint32_t *out_words)
+static uint32_t ibl_prefilter_mip_count(uint32_t face_size)
 {
-    /* Number of mip levels. */
     uint32_t max_mip = 1;
-    {
-        uint32_t s = face_size;
-        while (s > 1) { s >>= 1; max_mip++; }
-    }
-    if (max_mip > 8) max_mip = 8;
-    if (out_mips) *out_mips = max_mip;
+    uint32_t s = face_size;
+    while (s > 1) { s >>= 1; max_mip++; }
+    return max_mip > 8 ? 8u : max_mip;
+}
 
-    /* Compute total memory needed for all mips of all 6 faces. */
-    uint32_t total_half_words = 0;
+static uint32_t ibl_prefilter_words(uint32_t face_size, uint32_t max_mip)
+{
+    uint32_t total = 0;
     for (uint32_t mip = 0; mip < max_mip; mip++) {
         uint32_t ms = face_size >> mip;
         if (ms < 1) ms = 1;
-        total_half_words += ms * ms * 6 * 4;
+        total += ms * ms * 6u * 4u;
+    }
+    return total;
+}
+
+/* The GGX split-sum integral, writing linear f32 RGBA in MIP-MAJOR order
+ * (all six faces of mip 0, then all six of mip 1, ...), which is the order
+ * the IBL upload path consumes. */
+/* `first_mip` skips the mips the caller fills another way -- mip 0 is
+ * roughness 0, where the GGX lobe collapses to the reflection direction and
+ * the integral can only reproduce the source it sampled, at a cost of
+ * SAMPLE_COUNT taps per texel.  For a 512-face probe that is ~800 million
+ * samples to compute a copy, which is why the probe bake stopped finishing.
+ *
+ * `sample_count` likewise belongs to the caller: 512 for the HDR sky, far
+ * fewer for an 8-bit probe whose source cannot resolve the difference. */
+static void ibl_convolve_prefilter_f32(IblDirSampler sample, const void *src,
+                                       uint32_t face_size, uint32_t max_mip,
+                                       uint32_t first_mip,
+                                       uint32_t sample_count,
+                                       bool scale_with_roughness, float *out)
+{
+    uint32_t offset = 0;
+    const uint32_t SAMPLE_COUNT = sample_count ? sample_count : 512u;
+    float *data = out;
+
+    /* Skip past the mips the caller owns; `out` is still the whole chain. */
+    for (uint32_t m = 0; m < first_mip; ++m) {
+        uint32_t ms = face_size >> m;
+        if (ms < 1u) ms = 1u;
+        offset += ms * ms * 6u * 4u;
     }
 
-    uint16_t *data = (uint16_t *)JCE_MALLOC(total_half_words * sizeof(uint16_t));
-    if (!data) return NULL;
-
-    uint32_t offset = 0;
-    const uint32_t SAMPLE_COUNT = 512;
-
-    for (uint32_t mip = 0; mip < max_mip; mip++) {
+    for (uint32_t mip = first_mip; mip < max_mip; mip++) {
         uint32_t ms = face_size >> mip;
         if (ms < 1) ms = 1;
         float roughness = (float)mip / (float)(max_mip - 1);
+        /* SAMPLES MAY SCALE WITH ROUGHNESS.  The GGX lobe at mip 1 is
+         * narrow -- a handful of taps already resolve it -- while the widest
+         * lobe needs the full budget, and the widest mips have the fewest
+         * texels.  A flat count spends its whole cost on the largest,
+         * sharpest mip, which is where it buys the least: 512 flat taps at
+         * face 512 is ~200 million samples for mip 1 alone.
+         *
+         * OFF for the equirect sky path, which keeps the flat 512 it has
+         * always used so its output does not move; on for the probe, whose
+         * 8-bit source cannot resolve the difference. */
+        const uint32_t mip_samples = scale_with_roughness
+            ? 8u + (uint32_t)(roughness * (float)SAMPLE_COUNT)
+            : SAMPLE_COUNT;
 
         for (int face = 0; face < 6; face++) {
             for (uint32_t y = 0; y < ms; y++) {
@@ -487,9 +651,14 @@ static uint16_t *ibl_compute_prefilter(const float *equirect,
                     float pf_r = 0.0f, pf_g = 0.0f, pf_b = 0.0f;
                     float total_weight = 0.0f;
 
-                    for (uint32_t s = 0; s < SAMPLE_COUNT; s++) {
+                    for (uint32_t s = 0; s < mip_samples; s++) {
                         float xi1, xi2;
-                        hammersley(s, SAMPLE_COUNT, &xi1, &xi2);
+                        /* N is the count actually taken: Hammersley's
+                         * first component is s/N, so passing the unreduced
+                         * budget would squeeze every sample into the first
+                         * fraction of the sequence -- a clustered set that
+                         * looks like a convolution and is not one. */
+                        hammersley(s, mip_samples, &xi1, &xi2);
 
                         float hx_t, hy_t, hz_t;
                         importance_sample_ggx(xi1, xi2, roughness,
@@ -509,8 +678,7 @@ static uint16_t *ibl_compute_prefilter(const float *equirect,
                         float n_dot_l = nx * lx + ny * ly + nz * lz;
                         if (n_dot_l > 0.0f) {
                             float sr, sg, sb;
-                            sample_equirect(equirect, ew, eh, lx, ly, lz,
-                                            &sr, &sg, &sb);
+                            sample(src, lx, ly, lz, &sr, &sg, &sb);
                             pf_r += sr * n_dot_l;
                             pf_g += sg * n_dot_l;
                             pf_b += sb * n_dot_l;
@@ -524,17 +692,214 @@ static uint16_t *ibl_compute_prefilter(const float *equirect,
                         pf_b /= total_weight;
                     }
 
-                    data[offset++] = f32_to_f16(pf_r);
-                    data[offset++] = f32_to_f16(pf_g);
-                    data[offset++] = f32_to_f16(pf_b);
-                    data[offset++] = f32_to_f16(1.0f);
+                    data[offset++] = pf_r;
+                    data[offset++] = pf_g;
+                    data[offset++] = pf_b;
+                    data[offset++] = 1.0f;
                 }
             }
         }
     }
+}
 
-    if (out_words) *out_words = total_half_words;
+/* Equirect wrapper, unchanged in behaviour. */
+static uint16_t *ibl_compute_prefilter(const float *equirect,
+                                       uint32_t ew, uint32_t eh,
+                                       uint32_t face_size,
+                                       uint32_t *out_mips,
+                                       uint32_t *out_words)
+{
+    const uint32_t max_mip = ibl_prefilter_mip_count(face_size);
+    const uint32_t words   = ibl_prefilter_words(face_size, max_mip);
+    if (out_mips)  *out_mips  = max_mip;
+
+    float *f32 = (float *)JCE_MALLOC(words * sizeof(float));
+    if (!f32) return NULL;
+
+    IblEquirectSrc src = { equirect, ew, eh };
+    /* 512 samples from mip 0, exactly as this path has always run. */
+    ibl_convolve_prefilter_f32(ibl_sample_equirect_src, &src, face_size,
+                               max_mip, 0u, 512u, false, f32);
+
+    uint16_t *data = (uint16_t *)JCE_MALLOC(words * sizeof(uint16_t));
+    if (!data) { JCE_FREE(f32); return NULL; }
+    for (uint32_t i = 0; i < words; ++i) data[i] = f32_to_f16(f32[i]);
+    JCE_FREE(f32);
+
+    if (out_words) *out_words = words;
     return data;
+}
+
+/* ================================================================== */
+/* Cube-source entry points (reflection probe bake)                    */
+/* ================================================================== */
+
+static uint8_t ibl_f32_to_u8(float v)
+{
+    /* The probe artefact is RGBA8, so the integral's linear result is
+     * clamped rather than tonemapped: a probe brighter than white is not
+     * representable in the container the bake writes, and pretending
+     * otherwise by scaling would change every probe's exposure. */
+    if (!(v > 0.0f)) return 0u;
+    if (v >= 1.0f)   return 255u;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+void jce_ibl_convolve_cube_irradiance_rgba8(const uint8_t *src_faces,
+                                            uint32_t src_face_size,
+                                            uint32_t out_face_size,
+                                            uint8_t *out_faces)
+{
+    if (!src_faces || !out_faces || src_face_size == 0 || out_face_size == 0)
+        return;
+    const uint32_t n = out_face_size * out_face_size * 6u * 4u;
+    float *f32 = (float *)JCE_MALLOC(n * sizeof(float));
+    if (!f32) return;
+
+    IblCubeRgba8Src src = { src_faces, src_face_size };
+    /* 1.0: mean radiance, which is what fs_pbr_body.sh's diffuse term wants
+     * and the only convention an RGBA8 container can represent. */
+    ibl_convolve_irradiance_f32(ibl_sample_cube_rgba8_src, &src,
+                                out_face_size, 1.0f, f32);
+    for (uint32_t i = 0; i < n; ++i) out_faces[i] = ibl_f32_to_u8(f32[i]);
+    JCE_FREE(f32);
+}
+
+/* ── RGBA16F variants ─────────────────────────────────────────────
+ *
+ * One integral, two encodings.  Both of these call the SAME
+ * ibl_convolve_* functions the RGBA8 pair calls, with a different sampler in
+ * and a different pack out; a copied loop is how the two would come to
+ * disagree about the sample count or the roughness mapping. */
+static void ibl_sample_cube_rgba16f_src(const void *src, float dx, float dy,
+                                        float dz, float *r, float *g, float *b)
+{
+    const IblCubeRgba16fSrc *c = (const IblCubeRgba16fSrc *)src;
+    const uint32_t fs = c->face_size;
+    int   face; float u, v;
+    cube_face_uv(dx, dy, dz, &face, &u, &v);
+
+    int x = (int)(u * (float)fs);
+    int y = (int)(v * (float)fs);
+    if (x < 0) x = 0; if (x >= (int)fs) x = (int)fs - 1;
+    if (y < 0) y = 0; if (y >= (int)fs) y = (int)fs - 1;
+
+    const uint16_t *px = c->faces +
+        ((size_t)face * fs * fs + (size_t)y * fs + (size_t)x) * 4u;
+    *r = f16_to_f32(px[0]);
+    *g = f16_to_f32(px[1]);
+    *b = f16_to_f32(px[2]);
+}
+
+void jce_ibl_convolve_cube_irradiance_rgba16f(const uint16_t *src_faces,
+                                              uint32_t src_face_size,
+                                              uint32_t out_face_size,
+                                              uint16_t *out_faces)
+{
+    if (!src_faces || !out_faces || src_face_size == 0 || out_face_size == 0)
+        return;
+    const uint32_t n = out_face_size * out_face_size * 6u * 4u;
+    float *f32 = (float *)JCE_MALLOC(n * sizeof(float));
+    if (!f32) return;
+
+    IblCubeRgba16fSrc src = { src_faces, src_face_size };
+    ibl_convolve_irradiance_f32(ibl_sample_cube_rgba16f_src, &src,
+                                out_face_size, 1.0f, f32);
+    /* NO CLAMP.  ibl_f32_to_u8 saturates because a byte cannot do otherwise;
+     * half floats can, and clamping here would throw away the only thing this
+     * path exists to keep. */
+    for (uint32_t i = 0; i < n; ++i) out_faces[i] = f32_to_f16(f32[i]);
+    JCE_FREE(f32);
+}
+
+void jce_ibl_convolve_cube_specular_rgba16f(const uint16_t *src_faces,
+                                            uint32_t face_size,
+                                            uint16_t *out_mipchain)
+{
+    if (!src_faces || !out_mipchain || face_size == 0) return;
+    const uint32_t max_mip = ibl_prefilter_mip_count(face_size);
+    const size_t   words   = ibl_prefilter_words(face_size, max_mip);
+
+    /* mip 0 is roughness 0: the mirror reflection, copied verbatim so an HDR
+     * probe's sharpest level is exactly what the capture read back. */
+    const size_t mip0_texels = (size_t)face_size * face_size * 6u * 4u;
+    memcpy(out_mipchain, src_faces, mip0_texels * sizeof(uint16_t));
+    if (max_mip <= 1u) return;
+
+    float *f32 = (float *)JCE_MALLOC(words * sizeof(float));
+    if (!f32) return;
+
+    /* 256 samples, not the RGBA8 path's 64.  That path's own comment gives the
+     * reason for 64 -- "the source is an 8-bit LDR cubemap, so the extra taps
+     * move the result by less than one quantisation step" -- and it stops
+     * applying the moment the source is not 8-bit.  An HDR source has values
+     * that a coarse integral turns into fireflies in the rough mips. */
+    IblCubeRgba16fSrc src = { src_faces, face_size };
+    ibl_convolve_prefilter_f32(ibl_sample_cube_rgba16f_src, &src, face_size,
+                               max_mip, 1u, 256u, true, f32);
+
+    const size_t mip0_words = mip0_texels;
+    for (size_t i = mip0_words; i < words; ++i)
+        out_mipchain[i] = f32_to_f16(f32[i]);
+    JCE_FREE(f32);
+}
+
+uint32_t jce_ibl_cube_mip_count(uint32_t face_size)
+{
+    return face_size ? ibl_prefilter_mip_count(face_size) : 0u;
+}
+
+size_t jce_ibl_cube_mipchain_bytes(uint32_t face_size)
+{
+    if (!face_size) return 0u;
+    return (size_t)ibl_prefilter_words(face_size,
+                                       ibl_prefilter_mip_count(face_size));
+}
+
+void jce_ibl_convolve_cube_specular_rgba8(const uint8_t *src_faces,
+                                          uint32_t face_size,
+                                          uint8_t *out_mipchain)
+{
+    if (!src_faces || !out_mipchain || face_size == 0) return;
+
+    const uint32_t max_mip = ibl_prefilter_mip_count(face_size);
+    const uint32_t words   = ibl_prefilter_words(face_size, max_mip);
+
+    /* MIP 0 IS THE SOURCE, copied.  Roughness 0 is a mirror: the GGX lobe
+     * collapses to the reflection direction, so integrating it can only
+     * reproduce the faces it sampled -- at 512 taps per texel, which for a
+     * 512-face probe is ~800 million samples to compute a copy and is why the
+     * first cut of this never finished a bake.  Copying is also exact, so a
+     * probe's mirror reflection is byte-identical to the artefact that
+     * shipped before the chain existed. */
+    const size_t mip0_bytes = (size_t)face_size * face_size * 6u * 4u;
+    memcpy(out_mipchain, src_faces, mip0_bytes);
+    if (max_mip <= 1u) return;
+
+    float *f32 = (float *)JCE_MALLOC(words * sizeof(float));
+    if (!f32) return;
+
+    /* 64 samples, not 512: the source is an 8-bit LDR cubemap, so the extra
+     * taps move the result by less than one quantisation step while costing
+     * eight times the bake. */
+    IblCubeRgba8Src src = { src_faces, face_size };
+    ibl_convolve_prefilter_f32(ibl_sample_cube_rgba8_src, &src, face_size,
+                               max_mip, 1u, 64u, true, f32);
+
+    /* MIP-MAJOR, which is what bimg's KTX writer reads: imageWriteKtx walks
+     * the source pointer straight through as `for lod { for side { write } }`
+     * (bimg image.cpp), so all six faces of mip 0 come first, then all six of
+     * mip 1.  The integral above already emits exactly that order, so this is
+     * a straight conversion and not a shuffle.
+     *
+     * jce_ktx2_writer.cpp's comment claimed the opposite -- "each face
+     * followed by its mip chain" -- and the first version of this function
+     * dutifully reordered to match it, which would have produced a container
+     * that loads without complaint and whose rough mips are other faces'
+     * pixels.  The comment is corrected there. */
+    for (uint32_t i = (uint32_t)mip0_bytes; i < words; ++i)
+        out_mipchain[i] = ibl_f32_to_u8(f32[i]);
+    JCE_FREE(f32);
 }
 
 /* ================================================================== */

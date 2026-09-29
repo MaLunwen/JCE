@@ -18,6 +18,7 @@
 
 #include "jce_binary_embed.h"
 #include "jce_build_asset_policy.h"
+#include "jce_build_stage_runtime.h"
 #include "jce_editor_project.h"
 #include "jce_dist_content_graph.h"
 #include "jce_dist_audit.h"
@@ -25,6 +26,7 @@
 #include "jce_project_settings.h"
 #include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix export (Top 4) */
 #include <jce/renderer/jce_render_settings.h>            /* quality export (Top 5) */
+#include "core/jce_editor_effective_render_settings.h"  /* one composition, shared with the viewport */
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -50,6 +52,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -522,6 +525,26 @@ void run_finish_plan()
     }
     g_build.package_path = out;
 
+    /* The scripting runtime the exe imports.  Done for dist packages too: a
+     * one-file public package still cannot start without the shared
+     * libraries its own executable links.  A failure here fails the BUILD,
+     * because a package that cannot start is worse than one never made.
+     * See jce_build_stage_runtime.h for what travels and why. */
+    {
+        std::string stage_err;
+        const int staged =
+            jce_build_stage_runtime_payload(exe, out, &stage_err);
+        if (staged < 0) {
+            g_build.state = JCE_BUILD_FAILED;
+            set_error(stage_err);
+            return;
+        }
+        if (staged > 0)
+            log_line(JCE_CONSOLE_INFO,
+                     "[build] package: staged " + std::to_string(staged) +
+                     " scripting runtime entry/entries beside the exe");
+    }
+
     /* Dist is a one-file public package.  Authoring configs, symbols, BOMs,
      * and audit data remain under the private build/reports tree. */
     if (g_finish.dist) {
@@ -547,6 +570,13 @@ void run_finish_plan()
                               const char *label; } kRuntimeCfg[] = {
             { "Settings", "audio_mixer.json",   "audio mixer config" },
             { ".jce",     "input_actions.json", "input actions"      },
+            /* The shipped drop-in main's s_default_apply_project_settings()
+             * looks for exactly ".jce/project-settings.json" and existed
+             * solely to close the "shipped game ignores tuned physics and
+             * time" gap -- but this table never staged the file, so in a
+             * packaged build the reader had nothing to read and the gap it
+             * was written to close stayed open. */
+            { ".jce",     "project-settings.json", "project settings" },
         };
         for (const auto &c : kRuntimeCfg) {
             std::string src = proj + PATH_SEP_CHR_LOCAL + c.dir +
@@ -580,12 +610,13 @@ void run_finish_plan()
         JceProjectSettings ps_local;
         const JceProjectSettings *ps = jce_project_settings_current();
         if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
-        for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
-            jce_physics_layer_set_name(i, ps->tags_layers.layers[i]);
-            for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j)
-                jce_physics_set_layer_collides(
-                    i, j, (ps->physics.layer_collision_matrix[i] >> j) & 1u);
-        }
+        /* ONE PUSH, NOT A SECOND COPY OF IT.  This used to inline the same
+         * names+matrix loop as jce_project_settings_push_physics_layers,
+         * which meant the 2D matrix had to be remembered in two places to
+         * reach a shipped build -- and the cook path is the one that decides
+         * what a packaged game gets.  A second implementation of one push is
+         * two statements about it. */
+        jce_project_settings_push_physics_layers(ps);
         std::string lp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
                          "physics_layers.json";
         if (jce_physics_layer_matrix_save_json(lp.c_str()))
@@ -596,24 +627,49 @@ void run_finish_plan()
 
         /* Top 5 — export the active quality level's render settings so the
          * shipped game's app_init applies the authored shadow tier + lod bias
-         * (per-scene JceSceneRenderingSettings still override at render time). */
+         * (per-scene JceSceneRenderingSettings still override at render time).
+         *
+         * SEED FROM THE AUTHORED FILE, NOT FROM DEFAULTS.  This started at
+         * jce_render_settings_default() and then set seven quality fields, so
+         * every OTHER field in JceRenderSettings was silently reset to a
+         * default in every cooked tree and every shipped game -- the whole
+         * Look Profile block (wrap_factor, ambient hemisphere and ground
+         * colour, rim colour/power/intensity, tonemap op, LUT path and
+         * strength, toon_character, bloom_knee) plus grass_enabled, the
+         * project-level gate sr_draw_grass requires.  The editor renders from
+         * the SOURCE render_settings.json, so a GrassField that draws in the
+         * viewport was absent from the built game with no warning, and the
+         * authored look came out neutral.
+         *
+         * Worse, the file this writes IS the editor's own fallback source
+         * (jce_scene_content_context), so the build overwrote it with a
+         * defaults-seeded document rather than merely failing to carry it.
+         *
+         * Same resolution the editor uses -- source first, cooked as
+         * fallback -- so the two sides cannot disagree about which file is
+         * authoritative. */
         JceRenderSettings rs = jce_render_settings_default();
-        int ql = ps->quality.current_level;
-        if (ql < 0) ql = 0;
-        if (ql >= JCE_PS_MAX_QUALITY_LEVELS) ql = JCE_PS_MAX_QUALITY_LEVELS - 1;
-        const JceProjectQualityLevel *lvl = &ps->quality.levels[ql];
-        rs.shadow_quality = lvl->shadow_quality;
         {
-            static const int kShadowRes[4] = { 512, 1024, 2048, 4096 };
-            int sr = lvl->shadow_resolution;
-            if (sr < 0) sr = 0; if (sr > 3) sr = 3;
-            rs.shadow_map_size = kShadowRes[sr];
+            const std::string proj_root =
+                s_current_project_root[0] ? std::string(s_current_project_root)
+                                          : std::string(".");
+            std::string seed;
+            /* ONE composition, shared with the viewport.  This block used to
+             * start from defaults and set seven quality fields, which reset
+             * the entire authored Look Profile and grass_enabled in every
+             * cooked tree -- and the file it writes IS the viewport's own
+             * fallback source, so it overwrote them rather than merely
+             * failing to carry them. */
+            if (jce_editor_effective_render_settings(false, proj_root.c_str(),
+                                                     &rs, &seed) &&
+                !seed.empty())
+                log_line(JCE_CONSOLE_INFO,
+                         "[build] render settings seeded from " + seed);
+            else if (seed.empty())
+                log_line(JCE_CONSOLE_INFO,
+                         "[build] no authored render_settings.json; exporting "
+                         "the active quality level over defaults");
         }
-        rs.shadow_cascades = lvl->shadow_cascades;
-        rs.shadow_distance = lvl->shadow_distance;
-        rs.lod_bias        = lvl->lod_bias;
-        rs.vsync           = lvl->vsync_count > 0 ? 1 : 0;
-        rs.msaa            = ps->graphics.default_msaa;   /* 0/2/4/8 (Graphics block) */
         std::string rp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
                          "render_settings.json";
         if (jce_render_settings_save_json(rp.c_str(), &rs))

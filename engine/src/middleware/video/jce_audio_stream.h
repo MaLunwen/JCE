@@ -87,6 +87,9 @@ bool jce_audio_stream_eof(const JceAudioStream *s);
  * actually starts producing. */
 bool jce_audio_stream_is_primed(const JceAudioStream *s);
 
+/* True once PCM for the current seek generation is buffered, or at EOF. */
+bool jce_audio_stream_ready(JceAudioStream *s);
+
 uint32_t jce_audio_stream_channels(const JceAudioStream *s);
 uint32_t jce_audio_stream_samplerate(const JceAudioStream *s);
 

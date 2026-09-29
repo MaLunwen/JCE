@@ -1,0 +1,62 @@
+body {
+	font-family: JCE;
+	font-size: 18dp;
+	width: 100%;
+	height: 100%;
+}
+
+/* Text only — the beige fill beneath it is painted by the reveal-dissolve
+   postfx pass, which wipes away organically; a background here would keep
+   covering the scene after the wipe. */
+#intro-overlay {
+	position: absolute;
+	left: 0; top: 0;
+	width: 100%;
+	height: 100%;
+	text-align: center;
+}
+
+#intro-title {
+	margin-top: 38%;
+	font-size: 42dp;
+	color: #3A3532;
+}
+
+#intro-line {
+	margin-top: 12dp;
+	font-size: 20dp;
+	color: #6B645E;
+}
+
+#intro-footer {
+	margin-top: 28dp;
+	font-size: 15dp;
+	color: #938B84;
+}
+
+#hud {
+	position: absolute;
+	left: 0;
+	bottom: 18dp;
+	width: 100%;
+	text-align: center;
+}
+
+#season-row, #misc-row {
+	display: block;
+	margin-top: 8dp;
+}
+
+.btn {
+	display: inline-block;
+	padding: 8dp 16dp;
+	margin: 0 6dp;
+	color: #F4EFE9;
+	background-color: #2A2C33D0;
+	border-radius: 6dp;
+	cursor: pointer;
+}
+
+.btn:hover {
+	background-color: #454A57D0;
+}

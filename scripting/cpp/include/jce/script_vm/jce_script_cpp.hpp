@@ -122,6 +122,11 @@ public:
 
     virtual void on_start() {}
     virtual void on_update(float dt) { (void)dt; }
+    /* Once per PHYSICS step, with the fixed dt, just before that step --
+     * Unity's FixedUpdate.  Zero or many times per rendered frame, and
+     * always the same dt, so a force applied here produces the same motion
+     * at 30 Hz and at 144 Hz.  on_update is the per-frame one. */
+    virtual void on_fixed_update(float dt) { (void)dt; }
     virtual void on_destroy() {}
     virtual void on_collision(JceScriptEntity other_entity) { (void)other_entity; }
     virtual void on_message(const char *msg_name, double number_arg,
@@ -246,6 +251,9 @@ struct ScriptThunks {
     { JCE_CPP_THUNK_BODY(obj->on_start()) }
     static JceCppStatus on_update(void *self, float dt) noexcept
     { JCE_CPP_THUNK_BODY(obj->on_update(dt)) }
+
+    static JceCppStatus on_fixed_update(void *self, float dt) noexcept
+    { JCE_CPP_THUNK_BODY(obj->on_fixed_update(dt)) }
     static JceCppStatus on_destroy(void *self) noexcept
     { JCE_CPP_THUNK_BODY(obj->on_destroy()) }
     static JceCppStatus on_collision(void *self, JceScriptEntity other) noexcept
@@ -266,6 +274,8 @@ template <class T> constexpr bool overrides_on_start()
 { return static_cast<void (Script::*)()>(&T::on_start) != &Script::on_start; }
 template <class T> constexpr bool overrides_on_update()
 { return static_cast<void (Script::*)(float)>(&T::on_update) != &Script::on_update; }
+template <class T> constexpr bool overrides_on_fixed_update()
+{ return static_cast<void (Script::*)(float)>(&T::on_fixed_update) != &Script::on_fixed_update; }
 template <class T> constexpr bool overrides_on_destroy()
 { return static_cast<void (Script::*)()>(&T::on_destroy) != &Script::on_destroy; }
 template <class T> constexpr bool overrides_on_collision()
@@ -361,18 +371,27 @@ template <class T> constexpr bool overrides_on_anim_event()
         NAME,                                                                 \
         &::jce::script::ScriptThunks<CLASS>::create,                          \
         &::jce::script::ScriptThunks<CLASS>::destroy,                         \
-        ::jce::script::overrides_on_start<CLASS>()                            \
-            ? &::jce::script::ScriptThunks<CLASS>::on_start : nullptr,        \
-        ::jce::script::overrides_on_update<CLASS>()                           \
-            ? &::jce::script::ScriptThunks<CLASS>::on_update : nullptr,       \
-        ::jce::script::overrides_on_destroy<CLASS>()                          \
-            ? &::jce::script::ScriptThunks<CLASS>::on_destroy : nullptr,      \
-        ::jce::script::overrides_on_collision<CLASS>()                        \
-            ? &::jce::script::ScriptThunks<CLASS>::on_collision : nullptr,    \
-        ::jce::script::overrides_on_message<CLASS>()                          \
-            ? &::jce::script::ScriptThunks<CLASS>::on_message : nullptr,      \
-        ::jce::script::overrides_on_anim_event<CLASS>()                       \
-            ? &::jce::script::ScriptThunks<CLASS>::on_anim_event : nullptr,   \
+        /* EVERY thunk, unconditionally.  overrides_on_X<> above cannot       \
+         * answer for a VIRTUAL function on GCC/MinGW -- such a pointer       \
+         * is a vtable INDEX and an override shares its base's index, so      \
+         * every test answered "no" and this table was all nullptr.  The      \
+         * engine then loaded the module, resolved the class, built the       \
+         * instance, logged "script: loaded ... (cpp)" -- and never called    \
+         * it.  MSVC encodes a thunk address, which differs, so the same      \
+         * source worked there and the defect read as "C++ scripts run in     \
+         * the shipped game and do nothing in the editor".                    \
+         *                                                                    \
+         * Cost now: one call into an EMPTY base implementation for a hook    \
+         * a class does not implement.  Only on_update and on_fixed_update    \
+         * are per-frame; the rest are event-driven.                          \
+         */                                                                   \
+        &::jce::script::ScriptThunks<CLASS>::on_start,                        \
+        &::jce::script::ScriptThunks<CLASS>::on_update,                       \
+        &::jce::script::ScriptThunks<CLASS>::on_destroy,                      \
+        &::jce::script::ScriptThunks<CLASS>::on_collision,                    \
+        &::jce::script::ScriptThunks<CLASS>::on_message,                      \
+        &::jce::script::ScriptThunks<CLASS>::on_anim_event,                   \
+        &::jce::script::ScriptThunks<CLASS>::on_fixed_update,                 \
     };
 
 /* A named global handler — the C++ spelling of a global Lua function, which
@@ -536,7 +555,9 @@ inline Api api_from(const JceCppScriptContext *ctx) noexcept
         (sizeof(jce_cpp_module_globals) /                                     \
          sizeof(jce_cpp_module_globals[0])) - 1u,                             \
     };                                                                        \
-    const JceCppModuleDesc *ACCESSOR(void) { return &jce_cpp_module_desc; }   \
+    extern "C" const JceCppModuleDesc *ACCESSOR(void);                        \
+    extern "C" const JceCppModuleDesc *ACCESSOR(void)                         \
+    { return &jce_cpp_module_desc; }                                          \
     JCE_CPP_MODULE_ENTRY_
 
 /* ── THE EXPORTED ENTRY IS PER SHARED OBJECT, NOT PER TRANSLATION UNIT ───
@@ -557,7 +578,24 @@ inline Api api_from(const JceCppScriptContext *ctx) noexcept
  * door and suppressing it yields a module that loads and is then rejected as
  * "not a JCE script module" — a failure that survives shipping, unlike a link
  * error.  The default is unchanged, so no existing module needs editing, and
- * jce_script_vm_c.h honours the same macro. */
+ * jce_script_vm_c.h honours the same macro.
+ *
+ * ── AND THE ACCESSOR IS extern "C" ──────────────────────────────────────
+ *
+ * ACCESSOR exists to be called by the HOST, and the host's main is C: the
+ * project template scripts/../templates write main.c, and jce_script_enable()
+ * generates a C registration file.  Emitted with C++ linkage it could not be
+ * called from either -- a module that compiles, links into the binary, and
+ * then fails at LINK time in the one configuration the macro exists for:
+ *
+ *     LNK2019: unresolved external symbol snake_cpp_module
+ *              referenced in function snake_publish_native_modules
+ *
+ * The shared-object path never hit it because there the door is the exported
+ * jce_cpp_script_module entry, which was always extern "C".  So the bug was
+ * invisible to exactly the configuration everybody used.  jce_script_vm_c.h's
+ * accessor is already C (it is a C header), which is why the C module of the
+ * same pair linked cleanly and the C++ one did not. */
 #if defined(JCE_SCRIPT_MODULE_NO_ENTRY)
 #  define JCE_CPP_MODULE_ENTRY_ /* suppressed: linked INTO a binary */
 #else

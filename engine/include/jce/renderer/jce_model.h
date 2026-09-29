@@ -168,6 +168,29 @@ JCE_API void jce_model_draw(const JceModel *model,
  * other behaviour are UNCHANGED.  Passing JCE_INVALID_SHADER is BYTE-IDENTICAL
  * to jce_model_draw (which is now a thin caller of this).  Used by the scene
  * renderer to draw a toon character with the pbr_toon program. */
+/* Arm index RUNS for the next jce_model_draw*: every primitive is submitted
+ * once per run instead of once for its whole index buffer.  Cleared by the
+ * draw, like jce_model_set_draw_lod beside it.
+ *
+ * FOR STATIC-BATCH MEMBER CULLING.  A merged group is one draw -- the point of
+ * merging -- and therefore ONE cullable object: a row of forty fence posts
+ * draws all forty whenever any one is on screen.  The member table
+ * (jce_static_batch.h) says which index range each original mesh occupies, so
+ * the caller submits the runs it can see, and a wholly visible group coalesces
+ * to ONE run and takes exactly the path it always took.
+ *
+ * ARMED AT THE BOTTOM, and that is the whole reason this exists rather than a
+ * check at a call site: a static model reaches a draw through several ladders
+ * with several exits, and four wirings that each looked right reached nothing
+ * because they guessed the wrong one.  Here the caller does not have to know.
+ *
+ * n == 0 disarms.  Runs apply to a model with EXACTLY ONE primitive -- a
+ * merged group is one -- and are ignored otherwise, because a range into
+ * primitive 0's buffer means nothing in primitive 1's. */
+JCE_API void jce_model_set_draw_index_runs(const uint32_t *first,
+                                           const uint32_t *count,
+                                           uint32_t        n);
+
 JCE_API void jce_model_draw_program(const JceModel *model,
                             const JceRenderer *r, uint16_t view_id,
                             const jce_mat4 *transform,
@@ -298,6 +321,30 @@ JCE_API void jce_model_draw_crowd_shadow_instanced(const JceModel *model,
  * sr_bind_material_cb) — the tint program modulates the bound base-color factor
  * by v_tint, so binding a WHITE base material yields per-instance colours.
  * tints == NULL falls back to the plain (stride-64) instanced program. */
+/* THE SAME DRAW, TOLD WHAT THE MATERIAL ASKS FOR.
+ *
+ * `shader_keys` is an OR of JCE_SHADER_KEY_* -- normally
+ * jce_pbr_material_shader_keys(&mat) -- and is handed to
+ * jce_renderer_get_program_variant instead of taking whatever the frame's
+ * default instanced program happens to be.
+ *
+ * It is a separate entry point rather than a parameter on the one above
+ * because that one is ABI.  It exists because built-in PRIMITIVES batch
+ * through here, and that is the seventh draw path: the previous attempt at a
+ * keyword axis wired the other six, forced its variant on every draw, and
+ * moved ZERO pixels.  A path that cannot be told what the material wants is
+ * a path the axis silently does not reach. */
+JCE_API void jce_mesh_draw_instanced_tinted_keyed(const JceMesh *mesh,
+                                            const JceRenderer *r,
+                                            uint16_t view_id,
+                                            const jce_mat4 *worlds,
+                                            const jce_vec4 *tints,
+                                            uint32_t count,
+                                            uint64_t state,
+                                            void (*pre_submit)(void *user, uint16_t view_id),
+                                            void *pre_submit_user,
+                                                  uint32_t shader_keys);
+
 JCE_API void jce_mesh_draw_instanced_tinted(const JceMesh *mesh,
                                             const JceRenderer *r,
                                             uint16_t view_id,
@@ -667,6 +714,22 @@ JCE_API const JceSkinnedMesh *jce_model_prim_skinned_mesh(const JceModel *model,
  * primitives and feed jce_morph_apply. */
 JCE_API const JceMorphData *jce_model_prim_morph(const JceModel *model,
                                                  uint32_t node, uint32_t prim);
+
+/* Imported morph-weight ANIMATION tracks (the glTF "weights" channel).
+ *
+ * Public for the same reason as the accessors above, and for one more: the
+ * scene renderer drives blendshape animation from these, and it can only
+ * reach engine/src/renderer/jce_model.h from inside that directory.  It was
+ * therefore calling them through an implicit declaration, which returns int
+ * -- so the track pointer came back with its top 32 bits gone. */
+JCE_API uint32_t jce_model_morph_anim_count(const JceModel *model);
+
+/* One track plus the animation / node it drives (out args may be NULL).
+ * NULL when index is out of range.  Sample with
+ * jce_morph_weight_track_sample to drive a node's per-instance weights. */
+JCE_API const JceMorphWeightTrack *jce_model_morph_anim_track(
+    const JceModel *model, uint32_t index,
+    uint32_t *out_anim_index, uint32_t *out_node_index);
 
 JCE_EXTERN_C_END
 

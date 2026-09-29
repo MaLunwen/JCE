@@ -5,10 +5,13 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include <cstdio>
+#include "core/jce_project_settings.h"
 #include "ui/jce_editor_dnd.h"
 
 #include <jce/renderer/jce_impostor.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/middleware/scene/jce_material_override.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/resource/jce_mesh_lod.h>
 #include "scene/jce_editor_scene_asset_cache.h"
@@ -29,19 +32,21 @@ void load_material_into_renderer(JceMeshRenderer *mr)
     if (!jce_pbr_material_load_json(mr->material_path, &mat, tex_paths))
         return;
 
-    mr->base_color[0] = mat.base_color_factor[0];
-    mr->base_color[1] = mat.base_color_factor[1];
-    mr->base_color[2] = mat.base_color_factor[2];
-    mr->base_color[3] = mat.base_color_factor[3];
-    mr->metallic       = mat.metallic_factor;
-    mr->roughness      = mat.roughness_factor;
-    mr->emissive[0]    = mat.emissive_factor[0];
-    mr->emissive[1]    = mat.emissive_factor[1];
-    mr->emissive[2]    = mat.emissive_factor[2];
-    mr->normal_scale   = mat.normal_scale;
-    mr->ao_strength    = mat.ao_strength;
+    /* ONLY THE FACTORS THIS RENDERER DOES NOT OVERRIDE.  This function is
+     * also the broadcast path: jce_editor_inspector_reload_material() calls it
+     * for every renderer pointing at a .mat.json that was just saved.  Without
+     * the guard, saving the shared material would wipe the per-instance tint
+     * of every other user of it -- the same defect as the loaders had, arriving
+     * from the other direction.  Assigning a material keeps the overrides for
+     * the same reason Unity's MaterialPropertyBlock survives a material swap;
+     * the Revert button below is the way back. */
+    jce_mesh_renderer_apply_material_pbr(mr, &mat);
     mr->alpha_mode     = (int)mat.alpha_mode;
     mr->alpha_cutoff   = mat.alpha_cutoff;
+    mr->render_priority = mat.render_priority;
+    /* jce_mesh_renderer_apply_material_pbr above already carried the UV
+     * transform across; these four lines are the ones that would otherwise
+     * be missing from the SAVE direction below, which starts from defaults. */
     mr->double_sided   = mat.double_sided;
 
     if (tex_paths[0][0]) mr->albedo_tex = jce_scene_intern(jce_state_get_scene(), tex_paths[0]);
@@ -75,6 +80,15 @@ static bool save_renderer_to_material_file(const JceMeshRenderer *mr)
     mat.ao_strength         = mr->ao_strength;
     mat.alpha_mode          = (JceAlphaMode)mr->alpha_mode;
     mat.alpha_cutoff        = mr->alpha_cutoff;
+    mat.render_priority     = mr->render_priority;
+    /* Without these four, saving a material RESETS its tiling to 1,1 -- this
+     * function builds a fresh default and copies field by field, so a field
+     * it does not know about is silently a default on the way out. */
+    mat.uv_tiling[0]        = mr->uv_tiling[0];
+    mat.uv_tiling[1]        = mr->uv_tiling[1];
+    mat.uv_offset[0]        = mr->uv_offset[0];
+    mat.uv_offset[1]        = mr->uv_offset[1];
+    mat.blend_mode          = (JceBlendMode)mr->blend_mode;
     mat.double_sided        = mr->double_sided;
 
     char tex_paths[5][256] = {};
@@ -99,6 +113,47 @@ static bool save_renderer_to_material_file(const JceMeshRenderer *mr)
  * JCE_DND_ASSET_PATH target, so this second one landed on the trailing
  * browse/clear button rather than the text field.  The material-field call site
  * now reads JcePathInputOpts::dropped_raw and reloads from there. */
+
+/* How many factors this renderer owns, and the way back.
+ *
+ * An override you cannot see is one you cannot undo, and "why is this rock
+ * red when the material is grey" has to be answerable from the panel -- Unity
+ * marks prefab overrides for exactly this reason.  Revert clears the mask and
+ * re-reads the material, so the viewport shows the result immediately rather
+ * than at the next scene load.
+ *
+ * The undo path is the DISCRETE idiom (insp_undo_bool/insp_undo_int,
+ * jce_panel_inspector_common.cpp:65-81): a button's press frame is neither the
+ * activation nor the deactivation frame of the item, so insp_track_edit() here
+ * would bracket nothing.  Snapshot the pre-revert component, apply, put the
+ * old one back, open the batch on it, re-apply, close. */
+static void insp_draw_material_override_row(JceMeshRenderer *mr)
+{
+    if (!is_mat_json(mr->material_path) || !mr->material_override_mask)
+        return;
+
+    const int n = jce_mesh_renderer_override_count(mr);
+
+    ImGui::TextDisabled("%s: %d", jce_editor_i18n_id(
+        "inspector.materialOverrides", "Overrides on this renderer"), n);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n_id(
+            "inspector.materialOverrides.tip",
+            "These factors are kept on this entity and are not overwritten "
+            "when the material file is loaded or reloaded."));
+    ImGui::SameLine();
+    if (ImGui::SmallButton(jce_editor_i18n_id("inspector.revertToMaterial",
+                                              "Revert to Material"))) {
+        JceMeshRenderer before = *mr;
+        mr->material_override_mask = 0;
+        load_material_into_renderer(mr);
+        JceMeshRenderer after = *mr;
+        *mr = before;
+        jce_state_begin_batch_edit();
+        *mr = after;
+        jce_state_end_batch_edit();
+    }
+}
 
 void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 {
@@ -211,27 +266,66 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     }
 
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.pbrMaterial"), ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::ColorEdit4(jce_editor_i18n("inspector.baseColor"), mr->base_color);
+        /* EDITING A FACTOR MARKS IT AS THIS RENDERER'S OWN.
+         *
+         * Both scene loaders used to overwrite all six from material_path with
+         * no guard at all, so tinting three of 200 rocks was discarded on the
+         * next open -- silently, with the authored value still sitting in the
+         * scene file.  The widget's return value is the signal: true only on
+         * the frame the author moved THAT control, which is exactly "the author
+         * set this here" and not "this happens to equal the material's value".
+         * A right-click Reset is an author action too, so it sets the bit as
+         * well: "white regardless of what the material says". */
+        if (ImGui::ColorEdit4(jce_editor_i18n("inspector.baseColor"), mr->base_color))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_BASE_COLOR;
         INSP_RESET_CTX("##rst_baseColor",
                        mr->base_color[0] = 1.0f; mr->base_color[1] = 1.0f;
-                       mr->base_color[2] = 1.0f; mr->base_color[3] = 1.0f);
+                       mr->base_color[2] = 1.0f; mr->base_color[3] = 1.0f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_BASE_COLOR);
         insp_track_edit();
-        ImGui::DragFloat(jce_editor_i18n("viewer.metallic"), &mr->metallic, 0.01f, 0.0f, 1.0f);
-        INSP_RESET_CTX("##rst_metallic", mr->metallic = 0.0f);
+        if (ImGui::DragFloat(jce_editor_i18n("viewer.metallic"), &mr->metallic, 0.01f, 0.0f, 1.0f))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_METALLIC;
+        INSP_RESET_CTX("##rst_metallic", mr->metallic = 0.0f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_METALLIC);
         insp_track_edit();
-        ImGui::DragFloat(jce_editor_i18n("viewer.roughness"), &mr->roughness, 0.01f, 0.0f, 1.0f);
-        INSP_RESET_CTX("##rst_roughness", mr->roughness = 0.5f);
+        if (ImGui::DragFloat(jce_editor_i18n("viewer.roughness"), &mr->roughness, 0.01f, 0.0f, 1.0f))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_ROUGHNESS;
+        INSP_RESET_CTX("##rst_roughness", mr->roughness = 0.5f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_ROUGHNESS);
         insp_track_edit();
-        ImGui::ColorEdit3(jce_editor_i18n("inspector.emissive"), mr->emissive);
+        if (ImGui::ColorEdit3(jce_editor_i18n("inspector.emissive"), mr->emissive))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_EMISSIVE;
         INSP_RESET_CTX("##rst_emissive",
-                       mr->emissive[0] = 0.0f; mr->emissive[1] = 0.0f; mr->emissive[2] = 0.0f);
+                       mr->emissive[0] = 0.0f; mr->emissive[1] = 0.0f; mr->emissive[2] = 0.0f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_EMISSIVE);
         insp_track_edit();
-        ImGui::DragFloat(jce_editor_i18n("inspector.normalScale"), &mr->normal_scale, 0.01f, 0.0f, 4.0f);
-        INSP_RESET_CTX("##rst_normalScale", mr->normal_scale = 1.0f);
+        if (ImGui::DragFloat(jce_editor_i18n("inspector.normalScale"), &mr->normal_scale, 0.01f, 0.0f, 4.0f))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_NORMAL_SCALE;
+        INSP_RESET_CTX("##rst_normalScale", mr->normal_scale = 1.0f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_NORMAL_SCALE);
         insp_track_edit();
-        ImGui::DragFloat(jce_editor_i18n("inspector.aoStrength"), &mr->ao_strength, 0.01f, 0.0f, 2.0f);
-        INSP_RESET_CTX("##rst_aoStrength", mr->ao_strength = 1.0f);
+        if (ImGui::DragFloat(jce_editor_i18n("inspector.aoStrength"), &mr->ao_strength, 0.01f, 0.0f, 2.0f))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_AO_STRENGTH;
+        INSP_RESET_CTX("##rst_aoStrength", mr->ao_strength = 1.0f;
+                       mr->material_override_mask |= JCE_MR_OVERRIDE_AO_STRENGTH);
         insp_track_edit();
+        insp_draw_material_override_row(mr);
+
+        /* UV tiling / offset (Unity's Tiling & Offset).  Two DragFloat2s
+         * rather than four scalars because they are read as a pair.
+         * insp_track_edit() sits OUTSIDE the widget's `if`: a DragFloat is a
+         * continuous control whose predicate is true only on frames where the
+         * value MOVED, never on the activation or deactivation frame -- and
+         * those two are exactly the frames the undo system needs to bracket
+         * the edit.  Same idiom, and the same reason, as renderPriority
+         * below. */
+        ImGui::DragFloat2(jce_editor_i18n("inspector.uvTiling"),
+                          mr->uv_tiling, 0.01f, -64.0f, 64.0f, "%.3f");
+        insp_track_edit();
+        ImGui::DragFloat2(jce_editor_i18n("inspector.uvOffset"),
+                          mr->uv_offset, 0.005f, -64.0f, 64.0f, "%.3f");
+        insp_track_edit();
+
         const char *alpha_modes[] = {
             jce_editor_i18n("inspector.alphaMode.opaque"),
             jce_editor_i18n("inspector.alphaMode.mask"),
@@ -244,6 +338,55 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
         if (mr->alpha_mode == 1) {
             ImGui::DragFloat(jce_editor_i18n("inspector.alphaCutoff"), &mr->alpha_cutoff, 0.01f, 0.0f, 1.0f);
             insp_track_edit();
+        }
+        /* Blend equation, shown only under BLEND because that is the only
+         * mode that consults it -- offering it on an opaque material would be
+         * a control that does nothing, which is the defect this whole audit
+         * is about.  Index 0 (NONE) is deliberately not offered: it means
+         * "alpha" here and a menu with two entries for one behaviour is a
+         * menu that teaches the wrong thing. */
+        if (mr->alpha_mode == 2) {
+            const char *blend_items[] = {
+                jce_editor_i18n("inspector.blendMode.alpha"),
+                jce_editor_i18n("inspector.blendMode.add"),
+                jce_editor_i18n("inspector.blendMode.multiply"),
+            };
+            int bi = (mr->blend_mode <= 1) ? 0 : (mr->blend_mode - 1);
+            if (bi < 0 || bi > 2) bi = 0;
+            const int prev_bi = bi;
+            if (ImGui::Combo(jce_editor_i18n("inspector.blendMode"),
+                             &bi, blend_items, 3)) {
+                const int prev_mode = mr->blend_mode;
+                mr->blend_mode = bi + 1;   /* 0,1,2 -> ALPHA, ADD, MULTIPLY */
+                if (bi != prev_bi) insp_undo_int(&mr->blend_mode, prev_mode);
+            }
+        }
+        /* Transparent draw order (Unity's renderQueue, Godot's
+         * render_priority).  Shown only for BLEND, because that is the only
+         * pass that reads it: opaque order is front-to-back to kill overdraw,
+         * a performance decision, and offering a knob there would invite an
+         * author to pay frame time for a problem opaque geometry does not
+         * have.  Before this, transparents sorted by camera depth alone and
+         * two coplanar quads had no defined order at all -- they flickered as
+         * the camera moved and nothing could say which wins. */
+        if (mr->alpha_mode == 2) {
+            int prio = (int)mr->render_priority;
+            /* insp_track_edit() OUTSIDE the `if`: a DragInt is a continuous
+             * widget, so its predicate is true only on frames where the value
+             * moved -- never on the activation or deactivation frame, which
+             * are the two the undo system needs to bracket the edit.  Same
+             * idiom as jce_panel_inspector_network.cpp:150-156. */
+            if (ImGui::DragInt(jce_editor_i18n_id("inspector.renderPriority",
+                                                  "Sort Priority"),
+                               &prio, 1.0f, -1000, 1000)) {
+                if (prio < -32768) prio = -32768;
+                if (prio >  32767) prio =  32767;
+                mr->render_priority = (int16_t)prio;
+            }
+            insp_track_edit();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", jce_editor_i18n_id(
+                "inspector.renderPriorityHint", "higher draws on top"));
         }
         if (ImGui::Checkbox(jce_editor_i18n("inspector.doubleSided"), &mr->double_sided))
             insp_undo_bool(&mr->double_sided);
@@ -261,6 +404,176 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
                                                    "Receive Shadows"), &recv_on)) {
                 mr->shadow_receive_off = !recv_on;
                 insp_undo_bool(&mr->shadow_receive_off);
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    /* EXTENDED LOBES.  Its own section and NOT DefaultOpen, like the stencil
+     * below: both are advanced and both are off in every scene that exists.
+     * Each lobe's controls appear only once it is on -- a coat roughness on a
+     * material with no coat is a slider that does nothing, which is the defect
+     * this audit is about. */
+    if (ImGui::TreeNodeEx(jce_editor_i18n_id("inspector.lobes.section",
+                                             "Extended Lobes"))) {
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.lobes.clearcoat",
+                                                "Clearcoat"),
+                             &mr->clearcoat, 0.01f, 0.0f, 1.0f))
+            { if (mr->clearcoat < 0.0f) mr->clearcoat = 0.0f;
+              if (mr->clearcoat > 1.0f) mr->clearcoat = 1.0f;
+              mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+        insp_track_edit();
+        if (mr->clearcoat > 0.0f) {
+            if (ImGui::DragFloat(
+                    jce_editor_i18n_id("inspector.lobes.clearcoatRoughness",
+                                       "Clearcoat Roughness"),
+                    &mr->clearcoat_roughness, 0.01f, 0.0f, 1.0f))
+                { if (mr->clearcoat_roughness < 0.0f) mr->clearcoat_roughness = 0.0f;
+                  if (mr->clearcoat_roughness > 1.0f) mr->clearcoat_roughness = 1.0f;
+                  mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+            insp_track_edit();
+        }
+        if (ImGui::ColorEdit3(jce_editor_i18n_id("inspector.lobes.sheenColor",
+                                                 "Sheen Color"),
+                              mr->sheen_color))
+            mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES;
+        insp_track_edit();
+        if (mr->sheen_color[0] > 0.0f || mr->sheen_color[1] > 0.0f ||
+            mr->sheen_color[2] > 0.0f) {
+            if (ImGui::DragFloat(
+                    jce_editor_i18n_id("inspector.lobes.sheenRoughness",
+                                       "Sheen Roughness"),
+                    &mr->sheen_roughness, 0.01f, 0.0f, 1.0f))
+                { if (mr->sheen_roughness < 0.0f) mr->sheen_roughness = 0.0f;
+                  if (mr->sheen_roughness > 1.0f) mr->sheen_roughness = 1.0f;
+                  mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+            insp_track_edit();
+        }
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.lobes.anisotropy",
+                                                "Anisotropy"),
+                             &mr->anisotropy, 0.01f, 0.0f, 1.0f))
+            { if (mr->anisotropy < 0.0f) mr->anisotropy = 0.0f;
+              if (mr->anisotropy > 1.0f) mr->anisotropy = 1.0f;
+              mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+        insp_track_edit();
+        if (mr->anisotropy > 0.0f) {
+            /* TURNS, not degrees or radians: an author types 0.25 for a
+             * quarter turn far more often than 90 or 1.5708, and it is the
+             * unit glTF's anisotropyRotation uses. */
+            if (ImGui::DragFloat(
+                    jce_editor_i18n_id("inspector.lobes.anisotropyRotation",
+                                       "Anisotropy Rotation (turns)"),
+                    &mr->anisotropy_rotation, 0.005f, 0.0f, 1.0f))
+                { if (mr->anisotropy_rotation < 0.0f) mr->anisotropy_rotation = 0.0f;
+                  if (mr->anisotropy_rotation > 1.0f) mr->anisotropy_rotation = 1.0f;
+                  mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+            insp_track_edit();
+        }
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.lobes.translucency",
+                                                "Translucency"),
+                             &mr->translucency, 0.01f, 0.0f, 1.0f))
+            { if (mr->translucency < 0.0f) mr->translucency = 0.0f;
+              if (mr->translucency > 1.0f) mr->translucency = 1.0f;
+              mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+        insp_track_edit();
+        if (mr->translucency > 0.0f) {
+            if (ImGui::DragFloat(
+                    jce_editor_i18n_id("inspector.lobes.translucencyThickness",
+                                       "Thickness"),
+                    &mr->translucency_thickness, 0.01f, 0.0f, 1.0f))
+                { if (mr->translucency_thickness < 0.0f) mr->translucency_thickness = 0.0f;
+                  if (mr->translucency_thickness > 1.0f) mr->translucency_thickness = 1.0f;
+                  mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES; }
+            insp_track_edit();
+            if (ImGui::ColorEdit3(
+                    jce_editor_i18n_id("inspector.lobes.translucencyColor",
+                                       "Translucency Color"),
+                    mr->translucency_color))
+                mr->material_override_mask |= JCE_MR_OVERRIDE_LOBES;
+            insp_track_edit();
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n_id(
+            "inspector.lobes.hint",
+            "key directional light only; clearcoat also reflects the IBL"));
+        ImGui::TextDisabled("%s", jce_editor_i18n_id(
+            "inspector.lobes.hintAniso",
+            "anisotropy follows the mesh tangent; a mesh with none gets a "
+            "stable frame from its normal, which the rotation then steers"));
+        ImGui::TreePop();
+    }
+
+    /* STENCIL.  Its own section and NOT DefaultOpen: it is the advanced
+     * control of this component -- portals, outlines, UI masking -- and every
+     * scene in existence has it off.  Everything below the compare is hidden
+     * while it is off, because a ref value or an operation on a material that
+     * runs no stencil test is a control that does nothing, which is the exact
+     * defect this audit exists to remove.
+     *
+     * SIX rows, not Unity's seven: bgfx's stencil word has no write mask, so
+     * a "Write Mask" here would be a field the renderer could not honour. */
+    if (ImGui::TreeNodeEx(jce_editor_i18n_id("inspector.stencil.section",
+                                             "Stencil"))) {
+        const char *funcs[] = {
+            jce_editor_i18n_id("inspector.stencil.func.off",      "Off"),
+            jce_editor_i18n_id("inspector.stencil.func.never",    "Never"),
+            jce_editor_i18n_id("inspector.stencil.func.less",     "Less"),
+            jce_editor_i18n_id("inspector.stencil.func.lequal",   "Less Equal"),
+            jce_editor_i18n_id("inspector.stencil.func.equal",    "Equal"),
+            jce_editor_i18n_id("inspector.stencil.func.gequal",   "Greater Equal"),
+            jce_editor_i18n_id("inspector.stencil.func.greater",  "Greater"),
+            jce_editor_i18n_id("inspector.stencil.func.notequal", "Not Equal"),
+            jce_editor_i18n_id("inspector.stencil.func.always",   "Always"),
+        };
+        if (mr->stencil_func < 0 || mr->stencil_func > 8) mr->stencil_func = 0;
+        const int prev_func = mr->stencil_func;
+        if (ImGui::Combo(jce_editor_i18n_id("inspector.stencil.compare",
+                                            "Compare"),
+                         &mr->stencil_func, funcs, 9))
+            insp_undo_int(&mr->stencil_func, prev_func);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", jce_editor_i18n_id(
+            "inspector.stencil.hint", "portals, outlines, UI masking"));
+
+        if (mr->stencil_func != 0) {
+            /* A zeroed read mask tests no bits at all, which is the value a
+             * blank component holds rather than one anybody means; the
+             * renderer reads 0 as 0xFF, and the row says so. */
+            if (mr->stencil_read_mask <= 0 || mr->stencil_read_mask > 255)
+                mr->stencil_read_mask = 255;
+            if (ImGui::DragInt(jce_editor_i18n_id("inspector.stencil.ref",
+                                                  "Reference"),
+                               &mr->stencil_ref, 1.0f, 0, 255))
+                { if (mr->stencil_ref < 0)   mr->stencil_ref = 0;
+                  if (mr->stencil_ref > 255) mr->stencil_ref = 255; }
+            insp_track_edit();
+            if (ImGui::DragInt(jce_editor_i18n_id("inspector.stencil.readMask",
+                                                  "Read Mask"),
+                               &mr->stencil_read_mask, 1.0f, 1, 255))
+                { if (mr->stencil_read_mask < 1)   mr->stencil_read_mask = 1;
+                  if (mr->stencil_read_mask > 255) mr->stencil_read_mask = 255; }
+            insp_track_edit();
+
+            const char *ops[] = {
+                jce_editor_i18n_id("inspector.stencil.op.keep",     "Keep"),
+                jce_editor_i18n_id("inspector.stencil.op.zero",     "Zero"),
+                jce_editor_i18n_id("inspector.stencil.op.replace",  "Replace"),
+                jce_editor_i18n_id("inspector.stencil.op.incr",     "Increment (Clamp)"),
+                jce_editor_i18n_id("inspector.stencil.op.incrWrap", "Increment (Wrap)"),
+                jce_editor_i18n_id("inspector.stencil.op.decr",     "Decrement (Clamp)"),
+                jce_editor_i18n_id("inspector.stencil.op.decrWrap", "Decrement (Wrap)"),
+                jce_editor_i18n_id("inspector.stencil.op.invert",   "Invert"),
+            };
+            struct { const char *key, *fallback; int *slot; } rows[] = {
+                { "inspector.stencil.passOp",  "Pass",       &mr->stencil_pass_op  },
+                { "inspector.stencil.failOp",  "Fail",       &mr->stencil_fail_op  },
+                { "inspector.stencil.zfailOp", "Depth Fail", &mr->stencil_zfail_op },
+            };
+            for (int i = 0; i < 3; i++) {
+                if (*rows[i].slot < 0 || *rows[i].slot > 7) *rows[i].slot = 0;
+                const int prev = *rows[i].slot;
+                if (ImGui::Combo(jce_editor_i18n_id(rows[i].key, rows[i].fallback),
+                                 rows[i].slot, ops, 8))
+                    insp_undo_int(rows[i].slot, prev);
             }
         }
         ImGui::TreePop();
@@ -306,6 +619,48 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     }
 }
 
+/*
+ * Sorting Layer combo, fed by the authored list in Project Settings.
+ *
+ * The list ORDER is the depth order, so the stored value is the index: drag
+ * a layer up in Project Settings and everything on it moves behind, which is
+ * what the drag was for.  Unity stores a stable ID plus a separate order for
+ * the same reason it lets you rename layers without touching scenes; here the
+ * two would have to be kept in sync by hand, and an index that means exactly
+ * what the list shows is the smaller lie.
+ */
+static void draw_sprite_sorting_layer(JceSpriteRendererComponent *sr)
+{
+    const JceProjectSettings *ps = jce_project_settings_current();
+    int n = ps ? ps->tags_layers.sorting_layer_count : 0;
+    if (n <= 0) {
+        /* No authored list: show the raw index rather than an empty combo,
+         * so the value is still visible and editable. */
+        ImGui::DragInt(jce_editor_i18n("spriteRenderer.sortingLayer"),
+                       &sr->sorting_layer, 1.0f, 0, 31);
+        insp_track_edit();
+        return;
+    }
+    if (sr->sorting_layer < 0) sr->sorting_layer = 0;
+    if (sr->sorting_layer >= n) sr->sorting_layer = n - 1;
+    const char *cur = ps->tags_layers.sorting_layers[sr->sorting_layer];
+    if (ImGui::BeginCombo(jce_editor_i18n("spriteRenderer.sortingLayer"),
+                          cur && cur[0] ? cur : "(unnamed)")) {
+        for (int i = 0; i < n; ++i) {
+            const char *nm = ps->tags_layers.sorting_layers[i];
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "%s##sl%d",
+                          nm && nm[0] ? nm : "(unnamed)", i);
+            if (ImGui::Selectable(lbl, sr->sorting_layer == i)) {
+                int prev = sr->sorting_layer;
+                sr->sorting_layer = i;
+                insp_undo_int(&sr->sorting_layer, prev);
+            }
+        }
+        ImGui::EndCombo();
+    }
+}
+
 void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
 {
     jce_draw_path_input_asset(jce_editor_i18n("spriteRenderer.sprite"), sr->sprite_path, 128, JCE_ASSET_KIND_TEXTURE);
@@ -320,6 +675,10 @@ void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
     ImGui::SameLine();
     if (ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipY"), &sr->flip_y))
         insp_undo_bool(&sr->flip_y);
+    /* Sorting Layer had a Project Settings editor and NO consumer anywhere,
+     * while this field's label -- "Order in Layer" -- named a layer that did
+     * not exist.  Both halves of Unity's two-level 2D sort are here now. */
+    draw_sprite_sorting_layer(sr);
     ImGui::DragInt(jce_editor_i18n("spriteRenderer.orderInLayer"), &sr->sorting_order);
     insp_track_edit();
 }
@@ -334,6 +693,7 @@ void draw_comp_skybox(JceSkyboxComponent *sky)
     insp_track_edit();
     if (sky->exposure <= 0.0f) sky->exposure = 1.0f;
     if (ImGui::Checkbox(jce_editor_i18n("skybox.useAsIbl"), &sky->use_as_ibl))
+    insp_unwired_field_badge();   /* use_as_ibl */
         insp_undo_bool(&sky->use_as_ibl);
 }
 
@@ -537,8 +897,8 @@ void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e)
     int lc = lg->level_count;
     if (ImGui::SliderInt(jce_editor_i18n_id("inspector.lod.levelCount", "lod"), &lc, 0, JCE_LOD_COMP_MAX_LEVELS)) {
         lg->level_count = lc;
-        insp_track_edit();
     }
+    insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.lod.hysteresis", "lod"), &lg->hysteresis, 0.01f, 0.0f, 0.5f, "%.2f");
     insp_track_edit();
     /* Cross-fade band width (world meters) — softer LOD pop (P1 #6). */
@@ -650,7 +1010,10 @@ void draw_comp_lod_group(JceLodGroupComponent *lg, JceScene *scene, JceEntity e)
 void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 {
     /* Wired (large-world #E): sr_draw_trail_renderer draws the captured point
-     * buffer as a ribbon; the runtime grows it (rt_update_trails). */
+     * buffer as a camera-facing triangle ribbon (jce_sr_ribbon.c); the runtime
+     * grows it, expires points by .time and honours .autodestruct
+     * (jce_rt_trail.c).  .material_path resolves to the ribbon's base-colour
+     * texture, which the colour gradient then tints. */
     if (!t) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
@@ -668,15 +1031,19 @@ void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 void draw_comp_line_renderer(JceLineRendererComponent *l)
 {
     /* Wired (large-world #E): sr_draw_line_renderer draws the polyline in the
-     * color pass (reuses the color program + PT_LINES). No longer unwired. */
+     * color pass as a camera-facing TRIANGLE ribbon -- not PT_LINES, which
+     * produces nothing in the editor's pre-postfx offscreen (jce_sr_ribbon.c).
+     * .material_path resolves to the ribbon's base-colour texture, which the
+     * colour gradient then tints. */
     if (!l) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
     int n = l->position_count;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.line.positions", "line"), &n, 1.0f, 0, JCE_LINE_MAX_POINTS)) {
         if (n < 0) n = 0; if (n > JCE_LINE_MAX_POINTS) n = JCE_LINE_MAX_POINTS;
-        l->position_count = n; insp_track_edit();
+        l->position_count = n;
     }
+    insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.line.widthStart", "line"), &l->width_start, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.line.widthEnd", "line"),   &l->width_end,   0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
     ImGui::ColorEdit4(jce_editor_i18n_id("inspector.line.colorStart", "line"), l->color_start); insp_track_edit();
@@ -708,6 +1075,24 @@ void draw_comp_decal(JceDecalComponent *d)
     ImGui::DragFloat(jce_editor_i18n_id("inspector.decal.drawDistance", "decal"), &d->draw_distance, 1.0f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.decal.fadeFactor", "decal"),   &d->fade_factor,   0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
     ImGui::DragInt  (jce_editor_i18n_id("inspector.decal.layerMask", "decal"),    &d->layer_mask,    1.0f, -1, 0xFFFFFF); insp_track_edit();
+    /* These three, and only these three.  sr_decal_each_entity reads
+     * material_path, size, pivot, color and opacity and nothing else, so a
+     * decal is drawn at any distance, never fades, and ignores its mask.
+     *
+     * draw_distance would be a small, unambiguous fix on its own -- there is
+     * no other decal culling to double up with.  It is NOT done here because
+     * fade_factor's meaning is not written down anywhere in this tree and the
+     * two readings differ for every authored value: a fade-START fraction of
+     * draw_distance (Unity URP's fadeScale) or a plain opacity multiplier
+     * (Unity HDRP's fadeFactor).  Both are backward compatible at the default
+     * of 1.0, which is exactly why picking by feel would ship a wrong
+     * feature that looks right.  Decals also have no headless verification
+     * path, so a guess could not be checked.
+     *
+     * Whoever settles the semantics: wire all three together and delete this
+     * badge, and check_component_field_consumed will ask for its baseline
+     * back. */
+    insp_unwired_field_badge();
 }
 
 void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
@@ -718,9 +1103,11 @@ void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path, JCE_ASSET_KIND_TEXTURE); insp_track_edit();
     const char *modes[] = { jce_editor_i18n("inspector.br.mode.full"), jce_editor_i18n("inspector.br.mode.yAxisOnly") };
     int m = b->mode; if (m < 0 || m > 1) m = 0;
-    if (ImGui::Combo(jce_editor_i18n_id("inspector.br.mode", "br"), &m, modes, 2)) { b->mode = m; insp_track_edit(); }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.br.mode", "br"), &m, modes, 2))
+        insp_undo_set(&b->mode, m);
     ImGui::DragFloat2(jce_editor_i18n_id("inspector.br.size", "br"), b->size, 0.01f, 0.0f, 1.0e4f, "%.3f"); insp_track_edit();
-    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.br.color", "br"), b->color)) insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.br.color", "br"), b->color);
+    insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.br.visible", "br"), &b->visible)) insp_undo_bool(&b->visible);
 }
 
@@ -730,17 +1117,17 @@ void draw_comp_volume(JceVolumeComponent *v)
 
     const char *shapes[] = { jce_editor_i18n("inspector.vol.shape.box"), jce_editor_i18n("inspector.vol.shape.sphere") };
     int shape = (int)v->shape;
-    if (ImGui::Combo(jce_editor_i18n_id("inspector.vol.shape", "vol"), &shape, shapes, 2)) {
-        v->shape = (JceVolumeShape)shape; insp_track_edit();
-    }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.vol.shape", "vol"), &shape, shapes, 2))
+        insp_undo_set(&v->shape, (JceVolumeShape)shape);
     if (v->shape == JCE_VOLUME_SHAPE_BOX) {
         float ext[3] = { v->extents.x, v->extents.y, v->extents.z };
         if (ImGui::DragFloat3(jce_editor_i18n_id("inspector.vol.extents", "vol"), ext, 0.05f, 0.0f, 10000.0f, "%.3f")) {
-            v->extents.x = ext[0]; v->extents.y = ext[1]; v->extents.z = ext[2]; insp_track_edit();
+            v->extents.x = ext[0]; v->extents.y = ext[1]; v->extents.z = ext[2];
         }
+        insp_track_edit();
     } else {
-        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.vol.radius", "vol"), &v->extents.x, 0.05f, 0.0f, 10000.0f, "%.3f"))
-            insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.vol.radius", "vol"), &v->extents.x, 0.05f, 0.0f, 10000.0f, "%.3f");
+        insp_track_edit();
     }
     ImGui::DragFloat(jce_editor_i18n_id("inspector.vol.blendDistance", "vol"), &v->blend_distance, 0.05f, 0.0f, 10000.0f, "%.3f");
     insp_track_edit();
@@ -769,9 +1156,9 @@ void draw_comp_volume(JceVolumeComponent *v)
         bool en = (v->profile.enabled_mask >> i) & 1;
         ImGui::PushID(i);
         if (ImGui::Checkbox("##en", &en)) {
+            INSP_UNDO_SCOPE();
             if (en) v->profile.enabled_mask |=  (uint32_t)(1u << i);
             else    v->profile.enabled_mask &= ~(uint32_t)(1u << i);
-            insp_track_edit();
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(!en);
@@ -820,40 +1207,37 @@ void draw_comp_fullscreen_effect(JceSceneFullscreenEffect *effect)
                         &effect->use_history))
         insp_undo_bool(&effect->use_history);
 
-    if (ImGui::InputText(jce_editor_i18n_id("inspector.fullscreen.shader", "fsfx"),
-                         effect->shader, sizeof(effect->shader)))
-        insp_track_edit();
-    if (ImGui::DragInt(jce_editor_i18n_id("inspector.fullscreen.order", "fsfx"),
-                       &effect->order, 1.0f, -32768, 32767))
-        insp_track_edit();
+    ImGui::InputText(jce_editor_i18n_id("inspector.fullscreen.shader", "fsfx"),
+                         effect->shader, sizeof(effect->shader));
+    insp_track_edit();
+    ImGui::DragInt(jce_editor_i18n_id("inspector.fullscreen.order", "fsfx"),
+                       &effect->order, 1.0f, -32768, 32767);
+    insp_track_edit();
 
     int insertion = (int)effect->insertion;
     if (insertion < 0 || insertion >= (int)IM_ARRAYSIZE(insertion_labels))
         insertion = 0;
     if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.insertion", "fsfx"),
                      &insertion, insertion_labels, IM_ARRAYSIZE(insertion_labels))) {
-        effect->insertion = (uint32_t)insertion;
-        insp_track_edit();
+        insp_undo_set(&effect->insertion, insertion);
     }
 
     int blend = (int)effect->blend;
     if (blend < 0 || blend >= (int)IM_ARRAYSIZE(blend_labels)) blend = 0;
     if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.blend", "fsfx"),
                      &blend, blend_labels, IM_ARRAYSIZE(blend_labels))) {
-        effect->blend = (uint32_t)blend;
-        insp_track_edit();
+        insp_undo_set(&effect->blend, blend);
     }
 
     int format = (int)effect->output_format;
     if (format < 0 || format >= (int)IM_ARRAYSIZE(format_labels)) format = 1;
     if (ImGui::Combo(jce_editor_i18n_id("inspector.fullscreen.format", "fsfx"),
                      &format, format_labels, IM_ARRAYSIZE(format_labels))) {
-        effect->output_format = (uint32_t)format;
-        insp_track_edit();
+        insp_undo_set(&effect->output_format, format);
     }
-    if (ImGui::DragFloat(jce_editor_i18n_id("inspector.fullscreen.resolutionScale", "fsfx"),
-                         &effect->resolution_scale, 0.01f, 0.125f, 1.0f, "%.3f"))
-        insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.fullscreen.resolutionScale", "fsfx"),
+                         &effect->resolution_scale, 0.01f, 0.125f, 1.0f, "%.3f");
+    insp_track_edit();
 
     ImGui::SeparatorText(jce_editor_i18n("inspector.fullscreen.textures"));
     uint8_t texture_count = 0;
@@ -908,20 +1292,24 @@ void draw_comp_fullscreen_effect(JceSceneFullscreenEffect *effect)
     for (uint32_t i = 0; i < JCE_FULLSCREEN_EFFECT_MAX_PARAMS; ++i) {
         char label[32];
         snprintf(label, sizeof(label), "P%u", i);
-        if (ImGui::DragFloat4(label, effect->params[i], 0.01f, -1.0e9f,
-                              1.0e9f, "%.6g"))
-            insp_track_edit();
+        ImGui::DragFloat4(label, effect->params[i], 0.01f, -1.0e9f,
+                              1.0e9f, "%.6g");
+        insp_track_edit();
     }
 }
 
 void draw_comp_occlusion_portal(JceOcclusionPortalComponent *op)
 {
-    insp_unwired_badge();
+    /* The "unwired" badge is gone: a CLOSED portal is now a real occluder
+     * volume (jce_sr_portal.c) and portal_id groups portals for
+     * jce_scene_occlusion_portals_set_open.  A badge that outlives its reason
+     * teaches the next reader to trust every other badge less. */
     if (!op) return;
     float sz[3] = { op->size.x, op->size.y, op->size.z };
     if (ImGui::DragFloat3(jce_editor_i18n_id("inspector.op.size", "op"), sz, 0.05f, 0.0f, 10000.0f, "%.3f")) {
-        op->size.x = sz[0]; op->size.y = sz[1]; op->size.z = sz[2]; insp_track_edit();
+        op->size.x = sz[0]; op->size.y = sz[1]; op->size.z = sz[2];
     }
+    insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.op.open", "op"), &op->open))
         insp_undo_bool(&op->open);
     ImGui::DragInt(jce_editor_i18n_id("inspector.op.portalId", "op"), &op->portal_id, 1.0f, 0, 65535);

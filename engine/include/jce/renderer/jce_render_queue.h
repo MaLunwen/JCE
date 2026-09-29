@@ -55,6 +55,56 @@ typedef struct {
     float    depth;           /* camera-space Z for sorting */
     uint32_t material_key;    /* hash for material grouping */
     uint64_t state;           /* bgfx render state (blend/cull/write); 0 → BGFX_STATE_DEFAULT */
+
+    /* Author's tie-breaker for the transparent pass (Unity's
+     * Material.renderQueue, Godot's render_priority, UE's Translucency Sort
+     * Priority).  Sorted BEFORE depth in JCE_SORT_BACK_TO_FRONT, so a higher
+     * value draws later -- on top -- regardless of distance.
+     *
+     * Transparents sorted by camera depth ALONE, which has no answer for the
+     * cases authors actually hit: two coplanar quads, a decal that must land
+     * on top of the glass it sits inside, interpenetrating water and a
+     * windscreen.  Those flicker as the camera moves and nothing could say
+     * which wins, because the queue had no field to say it with.
+     *
+     * APPENDED, not folded into the `_pad` above.  Reusing padding costs no
+     * bytes and would have been tempting, but this struct is in a public
+     * header: check_abi_snapshot reads a changed member at an existing index
+     * as a break, and it is right to -- a consumer compiled against the old
+     * layout has a `_pad` there, and only the APPEND rule keeps that consumer
+     * correct without recompiling.  Zero is the neutral value, which every
+     * memset'd command already carries.
+     *
+     * Ignored by every other sort mode: opaque order is a performance
+     * decision (front-to-back, to kill overdraw), not an authoring one. */
+    int16_t  priority;
+
+    /* The material's bgfx STENCIL word; 0 (BGFX_STENCIL_NONE) = no stencil.
+     * Separate from `state` because bgfx keeps them separate -- set_stencil
+     * is its own call -- and carried on the COMMAND rather than applied in
+     * the material bind because bgfx resets the stencil after every submit
+     * exactly as it resets the state (RenderDraw::clear, BGFX_DISCARD_STATE).
+     * A per-material-run bind would therefore reach the run's first draw and
+     * nothing else.  APPENDED; zero is what every memset'd command holds. */
+    uint32_t stencil;
+
+    /* WHERE in the index buffer this draw starts.  The queue could only ever
+     * draw from 0, which is right for a mesh and wrong for a merged static
+     * batch: its members occupy known slices of ONE buffer (jce_static_batch.h
+     * writes the table), and submitting the whole thing whenever any member is
+     * on screen is the cost merging quietly adds.  With this, the colour pass
+     * pushes one command per visible RUN.
+     *
+     * APPENDED for the reason `priority` above says in full: a changed member
+     * at an existing index is an ABI break, an append is not.  Zero is the
+     * neutral value every memset'd command already carries, so every existing
+     * push still means "from the start", byte for byte.
+     *
+     * It is part of the BATCHING KEY on purpose (see the merge predicate in
+     * jce_render_queue.c): two runs of the same mesh are different draws and
+     * must not be folded into one instanced batch that would draw the first
+     * run's range for both. */
+    uint32_t first_index;
 } JceDrawCmd;
 
 /* ================================================================== */

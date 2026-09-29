@@ -49,6 +49,15 @@ static inline void jce_enc_set_state(uint64_t state, uint32_t rgba)
     bgfx_encoder_t *e = jce_tls_encoder;
     if (e) bgfx_encoder_set_state(e, state, rgba); else bgfx_set_state(state, rgba);
 }
+/* Stencil is SEPARATE from state in bgfx and is reset by submit the same way,
+ * so it belongs beside every jce_enc_set_state call rather than in a
+ * per-material bind. 0 (BGFX_STENCIL_NONE) disables the test entirely. */
+static inline void jce_enc_set_stencil(uint32_t fstencil, uint32_t bstencil)
+{
+    bgfx_encoder_t *e = jce_tls_encoder;
+    if (e) bgfx_encoder_set_stencil(e, fstencil, bstencil);
+    else   bgfx_set_stencil(fstencil, bstencil);
+}
 static inline void jce_enc_set_texture(uint8_t stage, bgfx_uniform_handle_t sampler,
                                        bgfx_texture_handle_t handle, uint32_t flags)
 {

@@ -15,7 +15,9 @@
 #include "jce_async_pool.h"
 
 #include <jce/os/core/jce_async.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_image.h>    /* the one image-decode service */
@@ -392,7 +394,26 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
 #if JCE_PLATFORM_ANDROID
         num_workers = 2;
 #else
-        num_workers = 3;
+        /* Scale with the machine.  A hardcoded 3 left 29 of this box's 32
+         * cores idle on the one workload in the engine that is embarrassingly
+         * parallel: opening caged_kingdom/hidden_cove needs 49 glTF decodes at
+         * ~92 ms each -- 4.5 s of CPU that three workers turn into 1.5 s of
+         * wall clock while the first frame is still waiting for it.  Every
+         * standard engine sizes its asset-loading pool to the host.
+         *
+         * cores-1 leaves the main thread a core; the cap of 8 is the same one
+         * the shared frame pool uses, and beyond it these decodes are bound by
+         * file I/O and allocator contention rather than cores.  LOW machine
+         * class keeps the old conservative count -- that tier exists to leave
+         * headroom on a 512 MB / few-core box. */
+        JceSysInfo si;
+        jce_sysinfo_init(&si);
+        int cores = si.cpu_cores > 0 ? si.cpu_cores : 4;
+        num_workers = (jce_config_machine_class() == JCE_MACHINE_CLASS_LOW)
+                          ? 2
+                          : (cores > 1 ? cores - 1 : 1);
+        if (num_workers > 8) num_workers = 8;
+        if (num_workers < 2) num_workers = 2;
 #endif
     }
 

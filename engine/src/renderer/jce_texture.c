@@ -65,6 +65,11 @@ static int8_t   s_texture_quality_bias;
 /* Project Settings > Graphics > Anisotropic Textures override: <0 keeps the
  * tier default (aniso on HIGH+); 0 forces off; >0 forces on. */
 static int8_t   s_aniso_override = -1;
+/* Project Settings > Graphics > Color Space.  1 = linear (hardware sRGB decode
+ * on the textures that ask, and an encoded frame on the way out), 0 = gamma
+ * (neither).  Default linear: it is what this engine has always done and what
+ * every comparable engine does. */
+static int      s_colour_space_linear = 1;
 
 /* VRAM ceiling (large-world-opt): when set, NEW raw-RGBA8 texture uploads
  * (the streamed-texture path: PAK PNG/JPG → SDL_Surface, and cooked RGBA8)
@@ -244,14 +249,35 @@ static uint64_t sampler_flags(int mode)
         : (s_aniso_override > 0);
     if (want_aniso)
         aniso = BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+    /* sRGB is a bit on the same argument, orthogonal to the address mode --
+     * so it is stripped before the switch and OR'd back onto every arm. */
+    /* GAMMA mode decodes nothing: the request is honoured only in linear. */
+    const uint64_t srgb = (s_colour_space_linear && (mode & JCE_TEX_SRGB))
+                        ? BGFX_TEXTURE_SRGB : 0u;
+    mode &= ~JCE_TEX_SRGB;
     switch (mode) {
     case JCE_TEX_WRAP:
-        return aniso; /* default wrap behavior */
+        return aniso | srgb; /* default wrap behavior */
     case JCE_TEX_MIRROR:
-        return BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR | aniso;
+        return BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR | aniso | srgb;
     default: /* JCE_TEX_CLAMP (UI/sprite — no aniso) */
-        return BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+        return BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | srgb;
     }
+}
+
+/* Does this format have an sRGB view ON THIS DEVICE?
+ *
+ * Asked of the driver rather than answered from a table.  BGFX_TEXTURE_SRGB
+ * on a format without an sRGB view is not an error and not a conversion -- it
+ * is ignored, and the caller gets an encoded value it has stopped decoding.
+ * A hand-written whitelist would have to be right about every backend and
+ * every format bgfx adds later; the caps bit is the same question asked of
+ * the thing that knows. */
+static bool format_has_srgb(bgfx_texture_format_t f)
+{
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps) return false;
+    return (caps->formats[f] & BGFX_CAPS_FORMAT_TEXTURE_2D_SRGB) != 0u;
 }
 
 
@@ -947,6 +973,16 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
     memcpy(mem->data, pixels, pixel_bytes);
 
+    /* A caller that asked for sRGB gets it only if this format has an sRGB
+     * view; otherwise the flag is dropped HERE rather than passed to bgfx to
+     * be ignored, and the log says which texture and which format, because
+     * the visible symptom (one over-bright surface) points at the art. */
+    if ((sampler_mode & JCE_TEX_SRGB) && !format_has_srgb(bgfx_fmt)) {
+        LOG_WARN(LOG_TAG, "sRGB requested for a format with no sRGB view "
+                          "(bgfx format %d); sampling it linear",
+                 (int)bgfx_fmt);
+        sampler_mode &= ~JCE_TEX_SRGB;
+    }
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)info->width, (uint16_t)info->height,
         has_mips, 1, bgfx_fmt,
@@ -1331,6 +1367,16 @@ uint8_t jce_texture_get_resident_top_mip(JceTextureId tex)
 void jce_texture_set_quality_mip_bias(int8_t bias)
 {
     s_texture_quality_bias = clamp_bias(bias);
+}
+
+void jce_texture_set_colour_space(int linear)
+{
+    s_colour_space_linear = linear ? 1 : 0;
+}
+
+int jce_texture_colour_space(void)
+{
+    return s_colour_space_linear;
 }
 
 void jce_texture_set_aniso_override(int mode)

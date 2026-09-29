@@ -202,14 +202,14 @@ static float sample_h_norm(const JceTerrain *t, float wx, float wz)
 
 /* ───── Lifecycle ────────────────────────────────────────────── */
 
-/* Triangle-soup collision mesh from the height grid (public API; used by the
- * runtime to spawn a static terrain collider).  Heap arrays are jce_malloc'd —
- * the caller frees them with jce_free. */
-bool jce_terrain_build_collision_mesh(const JceTerrain *t,
-                                      float    **out_verts,
-                                      uint32_t  *out_vcount,
-                                      uint32_t **out_indices,
-                                      uint32_t  *out_icount)
+static bool terrain_build_collision_mesh_range(const JceTerrain *t,
+                                                int x0, int z0,
+                                                int x1, int z1,
+                                                uint32_t max_vertices,
+                                                float **out_verts,
+                                                uint32_t *out_vcount,
+                                                uint32_t **out_indices,
+                                                uint32_t *out_icount)
 {
     if (out_verts)   *out_verts   = NULL;
     if (out_vcount)  *out_vcount  = 0;
@@ -219,32 +219,47 @@ bool jce_terrain_build_collision_mesh(const JceTerrain *t,
         return false;
 
     const int W = t->w, H = t->h;
-    if (W < 2 || H < 2 || !t->heights) return false;
+    if (W < 2 || H < 2 || !t->heights || x0 < 0 || z0 < 0 ||
+        x1 >= W || z1 >= H || x0 >= x1 || z0 >= z1)
+        return false;
 
-    const uint32_t vcount = (uint32_t)W * (uint32_t)H;
-    const uint32_t tris   = (uint32_t)(W - 1) * (uint32_t)(H - 1) * 2u;
-    const uint32_t icount = tris * 3u;
+    const uint64_t rw64 = (uint64_t)(x1 - x0 + 1);
+    const uint64_t rh64 = (uint64_t)(z1 - z0 + 1);
+    const uint64_t v64 = rw64 * rh64;
+    const uint64_t i64 = (rw64 - 1u) * (rh64 - 1u) * 6u;
+    if (v64 > UINT32_MAX || i64 > UINT32_MAX ||
+        (max_vertices != 0u && v64 > max_vertices))
+        return false;
+
+    const uint32_t rw = (uint32_t)rw64;
+    const uint32_t rh = (uint32_t)rh64;
+    const uint32_t vcount = (uint32_t)v64;
+    const uint32_t icount = (uint32_t)i64;
     float    *verts = (float *)jce_malloc((size_t)vcount * 3u * sizeof(float));
     uint32_t *idx   = (uint32_t *)jce_malloc((size_t)icount * sizeof(uint32_t));
     if (!verts || !idx) { jce_free(verts); jce_free(idx); return false; }
 
     const float inv_w = 1.0f / (float)(W - 1);
     const float inv_h = 1.0f / (float)(H - 1);
-    for (int j = 0; j < H; ++j) {
-        for (int i = 0; i < W; ++i) {
-            const uint32_t vi = (uint32_t)(j * W + i);
+    for (uint32_t rz = 0; rz < rh; ++rz) {
+        const int j = z0 + (int)rz;
+        for (uint32_t rx = 0; rx < rw; ++rx) {
+            const int i = x0 + (int)rx;
+            const uint32_t vi = rz * rw + rx;
             verts[vi * 3u + 0u] = (float)i * inv_w * t->world_size_x;
             verts[vi * 3u + 1u] = terrain_h(t, i, j) * t->max_height;
             verts[vi * 3u + 2u] = (float)j * inv_h * t->world_size_z;
         }
     }
     uint32_t k = 0;
-    for (int j = 0; j < H - 1; ++j) {
-        for (int i = 0; i < W - 1; ++i) {
+    for (uint32_t rz = 0; rz + 1u < rh; ++rz) {
+        const int j = z0 + (int)rz;
+        for (uint32_t rx = 0; rx + 1u < rw; ++rx) {
+            const int i = x0 + (int)rx;
             if (terrain_cell_hole(t, i, j)) continue;   /* cut cell: no collision */
-            const uint32_t v00 = (uint32_t)(j * W + i);
+            const uint32_t v00 = rz * rw + rx;
             const uint32_t v10 = v00 + 1u;
-            const uint32_t v01 = v00 + (uint32_t)W;
+            const uint32_t v01 = v00 + rw;
             const uint32_t v11 = v01 + 1u;
             /* Split on the v10-v01 ANTI-diagonal, matching
              * jce_terrain_chunk_build_mesh (a,c,b + b,c,d, shared edge b-c)
@@ -262,6 +277,72 @@ bool jce_terrain_build_collision_mesh(const JceTerrain *t,
     *out_verts   = verts;  *out_vcount = vcount;
     *out_indices = idx;    *out_icount = k;   /* k <= icount when holes cut cells */
     return true;
+}
+
+bool jce_terrain_build_collision_mesh_region(
+    const JceTerrain *t, float min_x, float min_z, float max_x, float max_z,
+    uint32_t max_vertices, float **out_verts, uint32_t *out_vcount,
+    uint32_t **out_indices, uint32_t *out_icount)
+{
+    if (out_verts)   *out_verts = NULL;
+    if (out_vcount)  *out_vcount = 0u;
+    if (out_indices) *out_indices = NULL;
+    if (out_icount)  *out_icount = 0u;
+    if (!t || t->w < 2 || t->h < 2 || t->world_size_x <= 0.0f ||
+        t->world_size_z <= 0.0f || !out_verts || !out_vcount ||
+        !out_indices || !out_icount)
+        return false;
+
+    if (min_x > max_x) { const float v = min_x; min_x = max_x; max_x = v; }
+    if (min_z > max_z) { const float v = min_z; min_z = max_z; max_z = v; }
+    if (max_x < 0.0f || max_z < 0.0f || min_x > t->world_size_x ||
+        min_z > t->world_size_z)
+        return false;
+
+    min_x = fmaxf(0.0f, min_x);
+    min_z = fmaxf(0.0f, min_z);
+    max_x = fminf(t->world_size_x, max_x);
+    max_z = fminf(t->world_size_z, max_z);
+
+    const float sx = (float)(t->w - 1) / t->world_size_x;
+    const float sz = (float)(t->h - 1) / t->world_size_z;
+    int x0 = clampi((int)floorf(min_x * sx), 0, t->w - 1);
+    int z0 = clampi((int)floorf(min_z * sz), 0, t->h - 1);
+    int x1 = clampi((int)ceilf(max_x * sx), 0, t->w - 1);
+    int z1 = clampi((int)ceilf(max_z * sz), 0, t->h - 1);
+    if (x1 <= x0) {
+        if (x0 + 1 < t->w) x1 = x0 + 1;
+        else x0 = x1 - 1;
+    }
+    if (z1 <= z0) {
+        if (z0 + 1 < t->h) z1 = z0 + 1;
+        else z0 = z1 - 1;
+    }
+
+    return terrain_build_collision_mesh_range(
+        t, x0, z0, x1, z1, max_vertices,
+        out_verts, out_vcount, out_indices, out_icount);
+}
+
+/* Triangle-soup collision mesh from the height grid (public API; used by the
+ * runtime to spawn a static terrain collider).  Heap arrays are jce_malloc'd —
+ * the caller frees them with jce_free. */
+bool jce_terrain_build_collision_mesh(const JceTerrain *t,
+                                      float    **out_verts,
+                                      uint32_t  *out_vcount,
+                                      uint32_t **out_indices,
+                                      uint32_t  *out_icount)
+{
+    if (!t) {
+        if (out_verts) *out_verts = NULL;
+        if (out_vcount) *out_vcount = 0u;
+        if (out_indices) *out_indices = NULL;
+        if (out_icount) *out_icount = 0u;
+        return false;
+    }
+    return terrain_build_collision_mesh_range(
+        t, 0, 0, t->w - 1, t->h - 1, 0u,
+        out_verts, out_vcount, out_indices, out_icount);
 }
 
 JceTerrain *jce_terrain_create(int width, int height,
@@ -969,14 +1050,92 @@ void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, int lod,
 
 /* ───── Brushes ──────────────────────────────────────────────── */
 
-static float gaussian_falloff(float dist, float radius)
+JceTerrainBrushDesc jce_terrain_brush_desc_default(void)
+{
+    JceTerrainBrushDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.struct_size = (uint32_t)sizeof(desc);
+    return desc;
+}
+
+static JceTerrainBrushDesc terrain_brush_resolve(
+    const JceTerrainBrushDesc *brush)
+{
+    JceTerrainBrushDesc out = jce_terrain_brush_desc_default();
+    if (brush && brush->struct_size >= sizeof(brush->struct_size)) {
+        size_t bytes = brush->struct_size;
+        if (bytes > sizeof(out)) bytes = sizeof(out);
+        memcpy(&out, brush, bytes);
+        out.struct_size = (uint32_t)sizeof(out);
+    }
+    if (!out.mask || out.mask_width <= 0 || out.mask_height <= 0) {
+        out.mask = NULL;
+        out.mask_width = 0;
+        out.mask_height = 0;
+    }
+    if (!isfinite(out.rotation_deg)) out.rotation_deg = 0.0f;
+    if (!isfinite(out.hardness)) out.hardness = 0.0f;
+    out.hardness = clampf(out.hardness, 0.0f, 1.0f);
+    if (!isfinite(out.flatten_target_world)) {
+        out.flatten_target_world = 0.0f;
+        out.use_flatten_target = false;
+    }
+    return out;
+}
+
+static float terrain_brush_mask_sample(const JceTerrainBrushDesc *brush,
+                                       float u, float v)
+{
+    if (!brush->mask) return 1.0f;
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return 0.0f;
+
+    float fx = u * (float)(brush->mask_width - 1);
+    float fy = v * (float)(brush->mask_height - 1);
+    int x0 = (int)floorf(fx);
+    int y0 = (int)floorf(fy);
+    int x1 = clampi(x0 + 1, 0, brush->mask_width - 1);
+    int y1 = clampi(y0 + 1, 0, brush->mask_height - 1);
+    float tx = fx - (float)x0;
+    float ty = fy - (float)y0;
+    const float *m = brush->mask;
+    size_t stride = (size_t)brush->mask_width;
+    float a = m[(size_t)y0 * stride + (size_t)x0];
+    float b = m[(size_t)y0 * stride + (size_t)x1];
+    float c = m[(size_t)y1 * stride + (size_t)x0];
+    float d = m[(size_t)y1 * stride + (size_t)x1];
+    if (!isfinite(a)) a = 0.0f;
+    if (!isfinite(b)) b = 0.0f;
+    if (!isfinite(c)) c = 0.0f;
+    if (!isfinite(d)) d = 0.0f;
+    float top = a + (b - a) * tx;
+    float bottom = c + (d - c) * tx;
+    return clampf(top + (bottom - top) * ty, 0.0f, 1.0f);
+}
+
+static float terrain_brush_weight(const JceTerrainBrushDesc *brush,
+                                  float dx, float dz, float radius)
 {
     if (radius <= 0.0001f) return 0.0f;
-    float r = dist / radius;
-    if (r >= 1.0f) return 0.0f;
-    /* Smooth bell: cos(r * pi/2)^2 */
-    float c = cosf(r * 1.5707963f);
-    return c * c;
+    float normalized_dist = sqrtf(dx * dx + dz * dz) / radius;
+    if (normalized_dist >= 1.0f) return 0.0f;
+
+    float envelope = 1.0f;
+    if (brush->hardness < 0.9999f && normalized_dist > brush->hardness) {
+        float edge = (normalized_dist - brush->hardness) /
+                     (1.0f - brush->hardness);
+        float cosine = cosf(edge * 1.5707963f);
+        envelope = cosine * cosine;
+    }
+
+    if (!brush->mask) return envelope;
+    float radians = brush->rotation_deg * 0.017453292519943295f;
+    float cosine = cosf(radians);
+    float sine = sinf(radians);
+    float local_x = cosine * dx + sine * dz;
+    float local_z = -sine * dx + cosine * dz;
+    float u = local_x / (2.0f * radius) + 0.5f;
+    float v = local_z / (2.0f * radius) + 0.5f;
+    return envelope * terrain_brush_mask_sample(brush, u, v);
 }
 
 static void brush_grid_extents(const JceTerrain *t, float wx, float wz,
@@ -1045,11 +1204,10 @@ void jce_terrain_hole_apply(JceTerrain *t, float wx, float wz,
     }
 }
 
-void jce_terrain_sculpt_apply(JceTerrain *t,
-                              JceTerrainSculptMode mode,
-                              float wx, float wz,
-                              float radius_world, float strength,
-                              float dt)
+void jce_terrain_sculpt_apply_brush(
+    JceTerrain *t, JceTerrainSculptMode mode,
+    const JceTerrainBrushDesc *brush,
+    float wx, float wz, float radius_world, float strength, float dt)
 {
     if (!t || radius_world <= 0.0f || dt <= 0.0f) return;
     /* A tiled or procedural terrain has no resident height grid: w and h are
@@ -1064,14 +1222,20 @@ void jce_terrain_sculpt_apply(JceTerrain *t,
      * capture_snapshot already returns false for tiled, so the undo push
      * silently no-ops first and the crash is not even preceded by a snapshot. */
     if (!t->heights) return;
+    JceTerrainBrushDesc effective = terrain_brush_resolve(brush);
     int x0, z0, x1, z1;
     brush_grid_extents(t, wx, wz, radius_world, &x0, &z0, &x1, &z1);
     float dx_world = t->world_size_x / (float)(t->w - 1);
     float dz_world = t->world_size_z / (float)(t->h - 1);
-    /* Sample average for flatten. */
+    /* Sample the target per stamp unless the caller locked the whole stroke. */
     float flatten_target = 0.0f;
-    if (mode == JCE_TERRAIN_SCULPT_FLATTEN)
-        flatten_target = sample_h_norm(t, wx, wz);
+    if (mode == JCE_TERRAIN_SCULPT_FLATTEN) {
+        if (effective.use_flatten_target && t->max_height > 0.0001f)
+            flatten_target = clampf(effective.flatten_target_world /
+                                      t->max_height, 0.0f, 1.0f);
+        else
+            flatten_target = sample_h_norm(t, wx, wz);
+    }
 
     float amount = strength * dt;
     /* Convert "world strength" to normalized space. */
@@ -1082,8 +1246,7 @@ void jce_terrain_sculpt_apply(JceTerrain *t,
             float gx = (float)x * dx_world;
             float gz = (float)z * dz_world;
             float dx = gx - wx, dz = gz - wz;
-            float dist = sqrtf(dx * dx + dz * dz);
-            float w = gaussian_falloff(dist, radius_world);
+            float w = terrain_brush_weight(&effective, dx, dz, radius_world);
             if (w <= 0.0001f) continue;
             size_t idx = (size_t)z * t->w + x;
             float v = t->heights[idx];
@@ -1116,13 +1279,23 @@ void jce_terrain_sculpt_apply(JceTerrain *t,
     }
 }
 
-void jce_terrain_splat_paint(JceTerrain *t, int layer,
-                             float wx, float wz,
-                             float radius_world, float strength,
-                             float dt)
+void jce_terrain_sculpt_apply(JceTerrain *t,
+                              JceTerrainSculptMode mode,
+                              float wx, float wz,
+                              float radius_world, float strength,
+                              float dt)
+{
+    jce_terrain_sculpt_apply_brush(t, mode, NULL, wx, wz,
+                                   radius_world, strength, dt);
+}
+
+void jce_terrain_splat_paint_brush(
+    JceTerrain *t, int layer, const JceTerrainBrushDesc *brush,
+    float wx, float wz, float radius_world, float strength, float dt)
 {
     if (!t || layer < 0 || layer > 3 || radius_world <= 0.0f || dt <= 0.0f) return;
     if (!t->splat) return;    /* tiled/procedural: no resident splat grid */
+    JceTerrainBrushDesc effective = terrain_brush_resolve(brush);
     int x0, z0, x1, z1;
     brush_grid_extents(t, wx, wz, radius_world, &x0, &z0, &x1, &z1);
     float dx_world = t->world_size_x / (float)(t->w - 1);
@@ -1134,8 +1307,7 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
             float gx = (float)x * dx_world;
             float gz = (float)z * dz_world;
             float dx = gx - wx, dz = gz - wz;
-            float dist = sqrtf(dx * dx + dz * dz);
-            float w = gaussian_falloff(dist, radius_world);
+            float w = terrain_brush_weight(&effective, dx, dz, radius_world);
             if (w <= 0.0001f) continue;
             size_t idx  = (size_t)z * t->w + x;
             uint32_t s  = t->splat[idx];
@@ -1155,6 +1327,15 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
             t->splat[idx] = out;
         }
     }
+}
+
+void jce_terrain_splat_paint(JceTerrain *t, int layer,
+                             float wx, float wz,
+                             float radius_world, float strength,
+                             float dt)
+{
+    jce_terrain_splat_paint_brush(t, layer, NULL, wx, wz,
+                                  radius_world, strength, dt);
 }
 
 /* ───── Heightmap image import / export ──────────────────────── */

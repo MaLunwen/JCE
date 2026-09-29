@@ -21,11 +21,20 @@ void parse_audio_source(JceScene *s, JceEntity e, const cJSON *c)
     as.loop          = j_bool(c, "loop", false);
     as.play_on_awake = j_bool(c, "playOnAwake", true);
     /* 3D attenuation (large-world audio); absent keys -> 0 => legacy defaults. */
-    as.attenuation_model = j_num(c, "attenuationModel", 0.0);
+    as.attenuation_model = (int)j_num(c, "attenuationModel", 0.0);
     as.min_distance      = (float)j_num(c, "minDistance",   0.0);
     as.max_distance      = (float)j_num(c, "maxDistance",   0.0);
     as.rolloff_factor    = (float)j_num(c, "rolloffFactor", 0.0);
     copy_str(as.mixer_bus, sizeof(as.mixer_bus), j_str(c, "mixerBus", ""));
+    /* 0 = normal, which is what every scene saved before this field
+     * existed parses to -- so the default is byte-identical behaviour. */
+    as.priority          = (int)j_num(c, "priority", 0.0);
+    /* 0 = decompress-on-load, which is what every older scene parses to. */
+    as.load_type         = (int)j_num(c, "loadType", 0.0);
+    /* Empty = no custom rolloff, which is what every older scene parses to,
+     * so the analytic attenuation model above keeps deciding. */
+    copy_str(as.rolloff_curve, sizeof(as.rolloff_curve),
+             j_str(c, "rolloffCurve", ""));
     jce_scene_set_audio_source(s, e, &as);
 }
 
@@ -101,6 +110,9 @@ static void ser_audio_source(const JceAudioSourceComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "maxDistance",   c->max_distance);
     cJSON_AddNumberToObject(o, "rolloffFactor", c->rolloff_factor);
     cJSON_AddStringToObject(o, "mixerBus", c->mixer_bus);
+    cJSON_AddNumberToObject(o, "priority", c->priority);
+    cJSON_AddNumberToObject(o, "loadType", c->load_type);
+    cJSON_AddStringToObject(o, "rolloffCurve", c->rolloff_curve);
     cJSON_AddItemToArray(arr, o);
 }
 

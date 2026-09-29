@@ -13,6 +13,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_read_source.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -88,6 +89,12 @@ JCE_API bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out
 JCE_API JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
                                          JceMp4Info *out_info);
 
+/* Retains source until close. Reads only bounded moov/fragment metadata and
+ * requested samples; never allocates the full encoded file. Metadata above
+ * 32 MiB or excessive table counts are rejected before upstream allocations. */
+JCE_API JceMp4Parser *jce_mp4_parser_open_source(JceReadSource *source,
+                                               JceMp4Info *out_info);
+
 JCE_API void jce_mp4_parser_close(JceMp4Parser *parser);
 
 /* Query the selected primary audio track metadata.
@@ -122,6 +129,10 @@ JCE_API bool jce_mp4_parser_get_video_track_info(const JceMp4Parser *parser,
 JCE_API bool jce_mp4_parser_get_video_sample(const JceMp4Parser *parser,
                                      uint32_t sample_index,
                                      JceMp4SampleInfo *out_sample);
+
+/* Container sync table/fragment flags, without scanning encoded media. */
+JCE_API bool jce_mp4_parser_video_sample_sync(const JceMp4Parser *parser,
+                                              uint32_t index, bool *out_sync);
 
 /* Copy a single encoded video sample into caller memory.
  * Returns false when buffer is too small or out of bounds. */

@@ -1,0 +1,29 @@
+    {
+        char        cs_buf[1200];
+        const char *cs_asm;
+
+        /* BESIDE THE EXECUTABLE first, because jce_script_enable() stages it
+         * there and that is the only path that exists on a player's machine.
+         * The configured one is the in-tree fallback -- the same two-step the
+         * java backend uses for its JNI shim, and for the same reason. */
+        cs_asm = jce_se_beside_exe(cs_buf, sizeof cs_buf, "JceScript.dll");
+        if (!cs_asm[0] || !jce_fs_host_exists_file(cs_asm))
+            cs_asm = jce_se_resolve("JCE_SCRIPT_CSHARP_ASSEMBLY",
+                                    "@JCE_SCRIPT_CSHARP_ASSEMBLY@");
+
+        if (!cs_asm || !cs_asm[0] || !jce_fs_host_exists_file(cs_asm)) {
+            LOG_ERROR(LOG_TAG,
+                      "csharp: NOT registered - no managed assembly at '%s'. "
+                      "Run scripting/csharp/build_csharp.py, or set "
+                      "JCE_SCRIPT_CSHARP_ASSEMBLY. The backend IS linked here, "
+                      "so this is a path problem and not a missing language.",
+                      cs_asm ? cs_asm : "");
+        } else {
+            jce_script_vm_csharp_set_assembly(cs_asm);
+            if (jce_script_vm_csharp_register())
+                ++registered;
+            /* No else-branch that logs: register() already reported which step
+             * failed, and a machine with no .NET runtime is the common case --
+             * a second line saying only "REFUSED" would add noise, not cause. */
+        }
+    }

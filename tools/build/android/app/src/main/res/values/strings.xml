@@ -1,0 +1,8 @@
+<resources>
+    <!-- The general Android packaging shell ships a generic name.  A project
+         overrides it by supplying its own res/values/strings.xml, the same
+         way applicationId above stays com.jce until a project changes it.
+         Until 2026-08-27 this read one game's title, so every project built
+         through these scripts installed under that game's name. -->
+    <string name="app_name">JCE App</string>
+</resources>

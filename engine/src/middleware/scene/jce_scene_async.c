@@ -142,9 +142,7 @@ static void slot_free_payload(AsyncSlot *s)
 static void slot_reap(AsyncSlot *s)
 {
     if (s->task) {
-        (void)jce_async_task_cancel(s->task);
-        jce_async_task_wait(s->task);
-        jce_async_task_release(s->task);
+        (void)jce_async_task_discard(s->task);
         s->task = NULL;
     }
     slot_free_payload(s);

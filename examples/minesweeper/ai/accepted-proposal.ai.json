@@ -1,0 +1,9 @@
+{
+  "provenance_attribution_version": 1,
+  "subject": "accepted-proposal.json",
+  "ai_model_id": "qwen3.5:0.8b",
+  "provider": "ollama",
+  "prompt_sha256": "sha256:1b88ed1a73c4b8acb11323ff970e0de2e6318fcce0e940b010b4c8604fb352b9",
+  "creation_tool": "examples/minesweeper/tools/ai_director.py",
+  "at": "2026-09-22T10:17:11Z"
+}

@@ -30,6 +30,18 @@ typedef JceTexture JceTextureId;
 #define JCE_TEX_WRAP    1   /* U/V repeat/wrap */
 #define JCE_TEX_MIRROR  2   /* U/V mirror */
 
+/* A BIT, not a fourth mode: it is orthogonal to the address mode above and
+ * ORs into the same argument, so every existing call keeps its meaning and
+ * its value.
+ *
+ * The texture is sRGB-ENCODED COLOUR and the hardware must decode each texel
+ * BEFORE filtering it.  Set it only for a texture whose consuming shader
+ * expects a LINEAR value -- s_albedo, s_emissive and the terrain layer
+ * albedos are the whole set today.  Setting it for a sampler whose shader
+ * still expects encoded values (sprites, particles, UI, masks, cookies) hands
+ * that shader a decoded value and washes it out. */
+#define JCE_TEX_SRGB    0x10
+
 static inline bool jce_texture_valid(JceTexture tex) {
     return tex.idx != UINT16_MAX;
 }

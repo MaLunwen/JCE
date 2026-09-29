@@ -1,0 +1,43 @@
+    {
+        /* CPython writes __pycache__ next to whatever it imports, and stale
+         * .pyc is invalidated on (mtime, size) -- so a same-size edit inside
+         * one mtime second leaves the OLD bytecode running.  Set before the
+         * interpreter exists, which it does not until the first create. */
+        /* BESIDE THE EXECUTABLE first, then the configure-time path: the
+         * configured one points into the SDK install, which is not on a
+         * player's machine.  Same two-step the java backend and the api
+         * shared library already use.
+         *
+         * The jce_script package is a DIRECTORY, which is why it was missed:
+         * jce_script_enable() staged every runtime FILE beside the exe and
+         * copy_if_different does not do directories, so the one runtime input
+         * python cannot start without was the one never staged. */
+        static char pkg_buf[1200];
+        const char *beside = jce_se_beside_exe(pkg_buf, sizeof pkg_buf,
+                                               JCE_SE_PYTHON_PACKAGE_DIR);
+        const char *pkg = (beside[0] && jce_fs_host_exists_dir(beside))
+                          ? beside
+                          : jce_se_resolve("JCE_SCRIPT_PYTHON_PACKAGE_DIR",
+                                           "@JCE_SCRIPT_PYTHON_PACKAGE_DIR@");
+        jce_se_setenv("PYTHONDONTWRITEBYTECODE", "1");
+        if (!pkg[0] || !jce_fs_host_exists_dir(pkg)) {
+            /* CHECKED BEFORE REGISTERING, and the wording says which half is
+             * broken: the backend IS in this binary, so a .py here is refused
+             * for a reason that would not apply to another build of the same
+             * game.  Registering first and failing at the first script reports
+             * it as "python does not work", which is a different bug. */
+            LOG_ERROR(LOG_TAG,
+                      "python: NOT registered — the jce_script package "
+                      "directory '%s' does not exist. Set "
+                      "JCE_SCRIPT_PYTHON_PACKAGE_DIR to it. The backend IS "
+                      "linked here, so this is a path problem and not a "
+                      "missing language.", pkg);
+        } else if (!jce_script_vm_python_add_path(pkg)) {
+            LOG_ERROR(LOG_TAG, "python: sys.path refused '%s'", pkg);
+        } else if (jce_script_vm_python_register()) {
+            ++registered;
+        } else {
+            LOG_ERROR(LOG_TAG, "python: register REFUSED — .py resolves to no "
+                               "language and every .py entity will be dropped");
+        }
+    }

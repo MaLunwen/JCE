@@ -18,7 +18,7 @@
 #include <jce/os/platform/jce_library.h>
 #include <jce/os/core/jce_log.h>
 
-#include "third_party/renderdoc_app.h"
+#include <renderdoc_app.h>
 
 #include <stdint.h>
 #include <stdlib.h>   /* getenv, atoi */

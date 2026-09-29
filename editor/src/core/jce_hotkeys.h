@@ -112,6 +112,13 @@ typedef enum {
 
     JCE_HK_EDIT_SNAP_TO_GROUND,
 
+    /* Reload Shaders.  The Edit menu advertised F5 for this for a long time
+     * while F5 was bound to Play / Toggle and no hotkey id existed at all --
+     * so pressing the key the menu named entered Play mode.  A shortcut
+     * printed beside a menu item is a claim about a binding; this makes it
+     * one.  APPENDED, because the id is persisted in the user's hotkey file. */
+    JCE_HK_SHADERS_RELOAD,
+
     JCE_HK_COUNT
 } JceHotkeyId;
 

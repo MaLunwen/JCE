@@ -8,6 +8,7 @@
  */
 
 #include "jce_project_settings.h"
+#include <jce/middleware/scene/jce_scene.h>  /* layer/tag registries */
 #include "jce_editor_alloc.h"
 #include "io/jce_editor_file_util.h"
 
@@ -101,7 +102,6 @@ void jce_project_settings_defaults(JceProjectSettings *s)
     /* Graphics */
     s->graphics.color_space          = 1;    /* Linear */
     s->graphics.hdr                  = true;
-    s->graphics.srgb_write           = true;
     s->graphics.default_msaa         = 4;
     s->graphics.anisotropic_textures = 1;    /* PerTexture */
 
@@ -274,7 +274,6 @@ bool jce_project_settings_save(const JceProjectSettings *s)
         JceJson *o = jce_json_object();
         jce_json_set_int   (o, "color_space",          s->graphics.color_space);
         jce_json_set_bool  (o, "hdr",                  s->graphics.hdr);
-        jce_json_set_bool  (o, "srgb_write",           s->graphics.srgb_write);
         jce_json_set_int   (o, "default_msaa",         s->graphics.default_msaa);
         jce_json_set_int   (o, "anisotropic_textures", s->graphics.anisotropic_textures);
         jce_json_set_string(o, "always_included_shaders",
@@ -484,7 +483,6 @@ bool jce_project_settings_load(JceProjectSettings *out)
     if (JceJson *o = child_obj_or_null(root, "graphics")) {
         out->graphics.color_space          = jce_json_get_int (o, "color_space", out->graphics.color_space);
         out->graphics.hdr                  = jce_json_get_bool(o, "hdr", out->graphics.hdr);
-        out->graphics.srgb_write           = jce_json_get_bool(o, "srgb_write", out->graphics.srgb_write);
         out->graphics.default_msaa         = jce_json_get_int (o, "default_msaa", out->graphics.default_msaa);
         out->graphics.anisotropic_textures = jce_json_get_int (o, "anisotropic_textures", out->graphics.anisotropic_textures);
         read_str(o, "always_included_shaders", out->graphics.always_included_shaders,
@@ -674,6 +672,25 @@ void jce_project_settings_apply(const JceProjectSettings *s)
     s_ps_current = *s;
     s_ps_have    = true;
 
+    /* Scene layer + tag NAMES into the engine's process-wide registries.
+     *
+     * There were two 32-slot layer-name registries and nothing copied between
+     * them: this one (authored here, read by the entity Layer combo, the
+     * physics layer combo, the camera culling-mask dropdown and the build),
+     * and the engine's jce_layer_name(), whose only reader in the whole tree
+     * was the Tags & Layers panel that wrote it.  So renaming a layer in that
+     * panel changed nothing anywhere, and the two panels titled "Layers"
+     * showed different names.
+     *
+     * apply() is the right place and the panel was not: jce_layer_name() is
+     * public API a user project may call, and it must agree with the editor
+     * whether or not anyone opened a particular panel this session. */
+    for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i)
+        jce_layer_set_name((uint8_t)i, s->tags_layers.layers[i]);
+    for (int i = 0; i < s->tags_layers.tag_count && i < JCE_PS_MAX_TAGS; ++i)
+        if (s->tags_layers.tags[i][0])
+            (void)jce_tag_intern(s->tags_layers.tags[i]);
+
     /* Live-apply hooks: most engine subsystems consume via per-play
      * session creation (see jce_editor_play). The values here are picked
      * up at that boundary. Hot-apply for currently-playing sessions is
@@ -697,6 +714,13 @@ void jce_project_settings_push_physics_layers(const JceProjectSettings *s)
         for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j) {
             bool collides = (s->physics.layer_collision_matrix[i] >> j) & 1u;
             jce_physics_set_layer_collides(i, j, collides);
+            /* The 2D grid is a SEPARATE authored matrix over the same 32
+             * slots, and until 2026-09-21 it was pushed nowhere -- the
+             * engine had no 2D matrix to push it into.  Names are shared;
+             * only the pairs differ. */
+            bool collides2d =
+                (s->physics2d.layer_collision_matrix[i] >> j) & 1u;
+            jce_physics2d_set_layer_collides(i, j, collides2d);
         }
     }
 }

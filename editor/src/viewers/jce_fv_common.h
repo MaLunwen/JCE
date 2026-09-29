@@ -36,9 +36,9 @@ extern "C" {
  * ══════════════════════════════════════════════════════════════════════ */
 
 #define FV_MAX_TABS       16
-#define FV_MAX_ASSET_BYTES (128 * 1024 * 1024)  /* 128 MB per asset — bounded
-    for the 512 MB device baseline; larger files show an info tab instead of
-    being read whole into RAM (audit F96) */
+#define FV_MAX_ASSET_BYTES (128 * 1024 * 1024)  /* 128 MB resident asset cap for
+    the 512 MB baseline. Audio/video use streaming paths and bypass this cap;
+    other larger assets show an info tab instead of a full-file read. */
 #define FV_MAX_CONTENT    (1024 * 1024 * 4) /* 4 MB text cap — must hold real
     scene JSONs (elemental_serenity is 316 KB / 11.3k lines); the read-only
     view renders through an ImGuiListClipper so size only costs memory, and
@@ -56,7 +56,7 @@ struct FvTab {
     char  ext[16];
     char *content;          /* heap-allocated file bytes */
     int   content_len;
-    long  file_size;
+    uint64_t file_size;
     JceFileViewerType type;
     bool  open;
 

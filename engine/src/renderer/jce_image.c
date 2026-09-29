@@ -13,7 +13,7 @@
 
 #include <jce/os/core/jce_log.h>
 
-#include "internal/stb_image.h"
+#include <stb_image.h>
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>

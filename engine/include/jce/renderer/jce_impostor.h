@@ -115,6 +115,20 @@ JCE_API bool                  jce_impostor_bake_submit(const JceImpostorBakeDesc
 JCE_API JceImpostorBakeStatus jce_impostor_bake_poll(void);
 JCE_API float                 jce_impostor_bake_progress(void);
 
+/* True while a bake owns the frame.  Side-effect free -- unlike
+ * jce_impostor_bake_poll(), which ADVANCES the bake and must be called exactly
+ * once per rendered frame.
+ *
+ * The bake binds bgfx views 127..227 for its atlas cells, and there is no
+ * 102-id hole left in a 256-view budget once two editor viewports are placed,
+ * so it necessarily overlaps the Game View's range.  It is therefore MODAL:
+ * a caller that renders a viewport must not do so while this is true.  That is
+ * what the reference engines do with the same kind of operation -- an Unreal
+ * HLOD/impostor build and a Unity lightmap bake both stop the live viewport
+ * rather than sharing the frame with it -- and it costs a frozen viewport for
+ * the two or three frames a bake takes. */
+JCE_API bool                  jce_impostor_bake_in_flight(void);
+
 /* ── Runtime atlas (loaded from the cooked PNG + metadata) ─────────── */
 
 typedef struct {

@@ -11,9 +11,9 @@
  * on demand at a caller-chosen LOD (0 = full res, 1 = every other
  * vertex, 2 = every 4th, ...).
  *
- * Sculpt and splat-paint apply Gaussian-falloff brushes onto the
- * heightmap / splat directly; the editor panel calls these per
- * mouse-drag, the runtime is identical for both edit and play modes.
+ * Sculpt and splat-paint apply configurable brushes onto the heightmap /
+ * splat directly; the editor panel calls these per mouse-drag, and the
+ * runtime implementation is identical for edit and play modes.
  *
  * IO: a .terrain side-car binary file ('JCTR' magic, V1 layout,
  * little-endian) holds the bulk arrays; a .terrain.json companion
@@ -35,6 +35,7 @@
 JCE_EXTERN_C_BEGIN
 
 typedef struct JceTerrain JceTerrain;
+typedef struct JceScene JceScene;
 struct JcePakArchive;
 
 /* Vertex layout of generated chunk meshes:  (pos.xyz, normal.xyz, uv.xy) */
@@ -50,6 +51,30 @@ typedef enum {
     JCE_TERRAIN_SCULPT_SMOOTH  = 2,
     JCE_TERRAIN_SCULPT_FLATTEN = 3
 } JceTerrainSculptMode;
+
+/* Call-time terrain brush shape.  The caller owns `mask` and only needs to
+ * keep it alive for the duration of the apply call.  A NULL mask selects the
+ * built-in circular brush.  Custom masks are normalized row-major samples in
+ * [0,1], mapped across the brush diameter and bilinearly filtered.
+ *
+ * `hardness` controls the built-in radial envelope: 0 preserves the legacy
+ * smooth cosine falloff, while 1 produces a hard edge.  `rotation_deg`
+ * rotates the custom mask counter-clockwise on the terrain XZ plane.
+ *
+ * Flatten normally samples its target at each stamp for backward
+ * compatibility.  Set `use_flatten_target` to lock an entire stroke to the
+ * supplied world-space height.  Initialize with
+ * jce_terrain_brush_desc_default() so appended fields receive safe defaults. */
+typedef struct JceTerrainBrushDesc {
+    uint32_t     struct_size;
+    const float *mask;
+    int          mask_width;
+    int          mask_height;
+    float        rotation_deg;
+    float        hardness;
+    float        flatten_target_world;
+    bool         use_flatten_target;
+} JceTerrainBrushDesc;
 
 /* -- Lifecycle --------------------------------------------------- */
 
@@ -127,6 +152,13 @@ JCE_API void jce_terrain_prefetch(JceTerrain *t, float world_x, float world_z,
                                   float radius);
 
 JCE_API JceTerrain *jce_terrain_load_file(const char *meta_json_path);
+
+/* Load a loose terrain file into the scene's shared cache under `asset_path`.
+ * Returns a BORROWED pointer owned by the scene.  Authoring tools use this after
+ * resolving a project-relative asset to a host path; renderer, picking and
+ * physics then consume the exact same terrain object. */
+JCE_API JceTerrain *JCE_CALL jce_scene_acquire_terrain_file(
+    JceScene *scene, const char *asset_path, const char *file_path);
 
 /* Same as jce_terrain_load_file but reads the meta JSON and its side-car .bin
  * from a PAK archive (e.g. an embedded engine PAK with bundle overlays).
@@ -277,6 +309,17 @@ JCE_API bool jce_terrain_build_collision_mesh(const JceTerrain *t,
                                               uint32_t **out_indices,
                                               uint32_t  *out_icount);
 
+/* Exact subset of jce_terrain_build_collision_mesh for the grid cells that
+ * intersect the local-space XZ rectangle.  The rectangle is clamped to the
+ * terrain and expanded to native grid-cell boundaries, so render holes and
+ * collision holes still agree at its edges.  max_vertices is an allocation
+ * guard (0 = no caller-imposed limit); exceeding it fails without allocating.
+ * Output ownership and triangle winding match the full-mesh function. */
+JCE_API bool jce_terrain_build_collision_mesh_region(
+    const JceTerrain *t, float min_x, float min_z, float max_x, float max_z,
+    uint32_t max_vertices, float **out_verts, uint32_t *out_vcount,
+    uint32_t **out_indices, uint32_t *out_icount);
+
 /* -- Sampling --------------------------------------------------- */
 
 /* Bilinearly samples the heightmap at world XZ; returns 0 outside. */
@@ -314,9 +357,23 @@ JCE_API void jce_terrain_chunk_build_mesh(const JceTerrain *t, int cx, int cz, i
 
 /* -- Authoring brushes ----------------------------------------- */
 
-/* Apply a Gaussian-falloff brush at world XZ.  `strength` is per
- * second so the editor panel must scale by frame dt for stable
- * feel.  Radius is in world units. */
+/* Returns a legacy-compatible circular brush descriptor. */
+JCE_API JceTerrainBrushDesc jce_terrain_brush_desc_default(void);
+
+/* Extended authoring entry points.  Passing NULL for `brush` is exactly
+ * equivalent to the legacy functions below. */
+JCE_API void jce_terrain_sculpt_apply_brush(
+    JceTerrain *t, JceTerrainSculptMode mode,
+    const JceTerrainBrushDesc *brush,
+    float wx, float wz, float radius_world, float strength, float dt);
+
+JCE_API void jce_terrain_splat_paint_brush(
+    JceTerrain *t, int layer, const JceTerrainBrushDesc *brush,
+    float wx, float wz, float radius_world, float strength, float dt);
+
+/* Apply the legacy smooth circular brush at world XZ.  `strength` is per
+ * second so callers scale it by frame dt for stable feel.  Radius is in
+ * world units. */
 JCE_API void jce_terrain_sculpt_apply(JceTerrain *t,
                               JceTerrainSculptMode mode,
                               float wx, float wz,

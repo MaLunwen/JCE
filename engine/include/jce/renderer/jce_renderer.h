@@ -155,6 +155,53 @@ JCE_API bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *p
 
 JCE_API bool jce_renderer_screenshot_pending(void);
 
+/* Take the automated capture (JCE_CAPTURE_FRAME) instead of the renderer.
+ * Return true if the shot was taken or submitted; false falls back to the
+ * backbuffer path.  Called on the main thread, from inside the frame.
+ *
+ * WHY A HOOK RATHER THAN A FRAMEBUFFER INDEX.  The obvious design -- let the
+ * host nominate an FBO -- cannot express the subject.  The editor's own
+ * UI-free capture (jce_editor_viewport_screenshot_submit) reads a TEXTURE:
+ * the postfx output when there is one, else the bridge's colour attachment,
+ * and the Y-FLIP DEPENDS ON WHICH OF THE TWO IT IS.  A uint16_t would have
+ * captured the bridge attachment, which with PostFX on is not the image on
+ * screen -- non-blank, correctly sized, written to the right path, and not
+ * the subject.  That version was written and reverted rather than shipped.
+ *
+ * WHAT IT IS FOR.  jce_renderer_request_screenshot() photographs the
+ * BACKBUFFER, which in the editor carries the ImGui layer: a captured frame
+ * has the profiler panel's FPS counter and timing graph in it.  Measured:
+ * 53,089 of 3,911,680 pixels (1.3572%) differ between two runs of one input
+ * digest, every one inside rows 1080..1526, with the rendered scene above
+ * byte-identical.  That band is a clock, and it is why an editor-sourced run
+ * directory cannot be byte-reproducible.
+ *
+ * A host with no such overlay does not need this; the default is NULL and
+ * the backbuffer path is unchanged. */
+typedef bool (JCE_CALL *JceAutoCaptureFn)(void *user, const char *path);
+
+/* Install or clear (fn == NULL) the automated-capture hook.  Main thread. */
+JCE_API void JCE_CALL jce_renderer_set_auto_capture_hook(JceAutoCaptureFn fn,
+                                                         void *user);
+
+/* True ONCE per GPU device loss, then false until the next one.
+ *
+ * The flag is set by bgfx's fatal callback on BGFX_FATAL_DEVICE_LOST -- which
+ * bgfx delivers on its RENDER thread everywhere except macOS -- and this is
+ * the read-and-clear side, for the MAIN thread.  jce_engine_iterate calls it
+ * once per frame and turns it into JCE_LIFECYCLE_DEVICE_LOST.
+ *
+ * WHY IT IS A POLL AND NOT AN EMIT: the renderer may not include
+ * <jce/application/jce_lifecycle.h> (check_layer_dependencies.py refuses the
+ * upward include), and a lifecycle listener may not be run off the main
+ * thread.  Same shape as the capture flags in the same translation unit.
+ *
+ * A host with its own loop may call this instead of registering a listener;
+ * it is the same fact, one layer down.  Calling it also CONSUMES the flag, so
+ * a host that polls it will stop the engine's own listeners from seeing that
+ * device loss -- poll it or register for it, not both. */
+JCE_API bool jce_renderer_take_device_lost(void);
+
 /* -- Continuous backbuffer capture (video recording) -------------- */
 /* bgfx invokes the sink on the render thread, once per frame, while capture is
  * enabled. `data` is the raw backbuffer (BGRA8, `pitch` bytes/row, `size`
@@ -251,6 +298,7 @@ JCE_API void jce_renderer_set_capture_imgui_mode(bool on);
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 
 #include <jce/renderer/jce_gfx_types.h>
+#include <jce/renderer/jce_shader_variants.h>
 #include <jce/renderer/jce_texture_types.h>
 
 /* Color (pos+color) shader program — flat-colored geometry (grid, debug). */
@@ -260,6 +308,26 @@ JCE_API JceShaderHandle  jce_renderer_get_program_color(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 
 /* PBR shader programs. */
+/* THE ONE PLACE A PBR DRAW'S PROGRAM IS DECIDED.
+ *
+ * `vv` is what the draw IS -- static, instanced, skinned, or one of the
+ * instanced forms that carry extra per-instance data.  `keys` is what the
+ * material and the frame ASK FOR, an OR of JCE_SHADER_KEY_* from
+ * <jce/renderer/jce_shader_variants.h>.  Both that header and the table
+ * behind this function are generated from contracts/shader-keywords.json, so
+ * adding an axis is one entry there rather than a file per fragment family
+ * plus a selection site per draw path.
+ *
+ * Asking for a keyword a pak does not carry is a DEGRADE, not an error: the
+ * keywords are dropped from the highest bit down until a program that loaded
+ * is found, and key 0 always exists.  An invalid return means even the base
+ * program is missing, which is what it has always meant.
+ *
+ * The named getters below are this function with the frame's Forward+ state
+ * folded in, once each.  Nothing else decides. */
+JCE_API JceShaderHandle  jce_renderer_get_program_variant(
+    const JceRenderer *r, JceShaderVertexVariant vv, uint32_t keys);
+
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst(const JceRenderer *r);
 /* Per-instance-tint instanced PBR (large-world-opt P1 #7): vs_pbr_inst_tint +

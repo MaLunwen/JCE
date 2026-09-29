@@ -41,10 +41,14 @@
 
 extern "C" {
 #include <jce/application/jce_project.h>
+#include <jce/application/jce_engine.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/platform/jce_host_shell.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_quality_preset.h>
+#include <jce/renderer/jce_lighting_system.h>
+#include <jce/renderer/jce_render_pipeline.h>
 }
 
 namespace {
@@ -215,6 +219,7 @@ void save_if_dirty(void)
                 ? &g_st.ps.quality.levels[lvl] : nullptr;
         jce_texture_set_quality_mip_bias(q ? (int8_t)q->texture_quality : 0);
         jce_texture_set_aniso_override((int)g_st.ps.graphics.anisotropic_textures);
+        jce_texture_set_colour_space(g_st.ps.graphics.color_space != 0);
     }
     if (ok_ps && ok_cfg)
         g_st.dirty = false;
@@ -433,6 +438,56 @@ void draw_tags_layers(void)
 const char *k_tier_ids[4] = { "low", "medium", "high", "ultra" };
 int s_tier_idx = 2;  /* default: High */
 
+/* Stamp the tier into the PROJECT, not just the editor.
+ *
+ * Apply used to do two things: push the preset to the live renderer, and store
+ * "graphics.tier" in <root>/.jce/editor-state.json.  That store is machine-
+ * local editor state -- nothing in engine/, scripts/ or tools/ reads the key,
+ * and the build does not export it.  So a user could pick Ultra, press Apply,
+ * watch the viewport change, build the game, and ship whatever
+ * Settings/RenderPipeline.rp.json happened to be on disk: MID, which is what
+ * project creation writes.  The tier was dropped silently, on exactly the axis
+ * this engine warns about most -- right in the editor, wrong in the exe.
+ *
+ * The asset is the carrier that already works end to end: the build stages it
+ * into the cooked tree (jce_build_manager) and the runtime re-resolves it after
+ * bundle mount (jce_render_pipeline_apply_boot_mounted), host file first, then
+ * the packed key.  A tier preset survives that round trip losslessly and the
+ * four tiers stay distinct on disk -- measured, not assumed, in
+ * tests/renderer/test_jce_quality_tier_asset_roundtrip.c.
+ *
+ * This REPLACES a hand-authored pipeline, which is what "apply this tier"
+ * means; it says so in the log, naming the file and whether it existed, so the
+ * replacement is never silent.  The Render Pipeline panel/viewer remains the
+ * place to author one field at a time. */
+bool quality_tier_write_project_asset(const JceQualityPreset *p,
+                                      char *out_path, size_t out_cap)
+{
+    if (out_path && out_cap) out_path[0] = '\0';
+    const JceProject *proj = jce_editor_project_get();
+    if (!proj || !proj->project_root || !proj->project_root[0]) return false;
+
+    char dir[1024];
+    char path[1024];
+    jce_path_join(dir, sizeof dir, proj->project_root, "Settings");
+    jce_fs_host_create_directory(dir);
+    jce_path_join(path, sizeof path, dir, "RenderPipeline.rp.json");
+
+    const bool existed = jce_fs_host_exists_file(path);
+    if (!jce_render_pipeline_save(path, &p->rp)) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "[quality] could not write %s -- the tier will NOT survive a build",
+            path);
+        return false;
+    }
+    jce_editor_console_log_level(JCE_CONSOLE_INFO,
+        existed ? "[quality] tier '%s' -> %s (replaced the authored pipeline)"
+                : "[quality] tier '%s' -> %s (created)",
+        k_tier_ids[s_tier_idx], path);
+    if (out_path && out_cap) snprintf(out_path, out_cap, "%s", path);
+    return true;
+}
+
 int tier_idx_from_id(const char *id)
 {
     for (int i = 0; i < 4; ++i)
@@ -451,6 +506,11 @@ void draw_quality(void)
     static const JceQualityTier k_tiers[] = {
         JCE_QUALITY_LOW, JCE_QUALITY_MED, JCE_QUALITY_HIGH, JCE_QUALITY_ULTRA
     };
+
+    /* Result of the last asset write, so the panel can say whether the tier
+     * actually reached the project rather than only the viewport. */
+    static bool s_tier_asset_ok = false;
+    static char s_tier_asset_path[1024] = {0};
 
     /* One-time restore of the persisted tier choice (per-project; the store
      * is inert until a project root is known, so the first draw can be too
@@ -600,6 +660,9 @@ void draw_quality(void)
 
     ImGui::Spacing();
     ImGui::Separator();
+    ImGui::TextDisabled("%s", jce_editor_i18n_id(PS_KEY "quality.applyNote",
+        "Apply writes Settings/RenderPipeline.rp.json so a BUILT game uses "
+        "this tier too; it replaces a hand-authored pipeline."));
     if (ImGui::Button(jce_editor_i18n_id(PS_KEY "quality.apply", "q_apply"))) {
         JceQualityPreset p;
         jce_quality_preset_get(k_tiers[s_tier_idx], &p);
@@ -607,6 +670,12 @@ void draw_quality(void)
         /* Persist the explicit choice per-project (machine-local
          * .jce/editor-state.json); re-applied at editor boot. */
         jce_editor_pstate_set_str("graphics.tier", k_tier_ids[s_tier_idx]);
+        /* ...and into the project itself, so a BUILT game gets the same
+         * pipeline the viewport just switched to.  Without this the tier was
+         * editor-only and every shipped exe fell back to whatever .rp.json was
+         * on disk. */
+        s_tier_asset_ok = quality_tier_write_project_asset(
+            &p, s_tier_asset_path, sizeof s_tier_asset_path);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(%s)", k_tier_names[s_tier_idx]);
@@ -644,10 +713,21 @@ void draw_graphics(void)
     if (ImGui::Combo(jce_editor_i18n_id(PS_KEY "color_space", "color_space"),
                      &cs, cs_items, IM_ARRAYSIZE(cs_items))) {
         g.color_space = cs; mark_dirty();
+        /* At once, not on the next scene load: the viewport beside this combo
+         * is the only way to judge the choice, and a colour-space switch that
+         * takes effect later reads as a control that does nothing. */
+        jce_texture_set_colour_space(cs != 0);
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", jce_editor_i18n_id(
+        PS_KEY "color_space.hint",
+        "Linear decodes sRGB textures in the sampler and encodes the frame; "
+        "Gamma does neither"));
     if (ImGui::Checkbox(jce_editor_i18n_id(PS_KEY "hdr", "hdr"), &g.hdr)) mark_dirty();
-    if (ImGui::Checkbox(jce_editor_i18n_id(PS_KEY "srgb_write", "srgb_write"),
-                        &g.srgb_write)) mark_dirty();
+    /* srgb_write was here.  It was a second bool for the ENCODE half of the
+     * decision the combo above makes about the DECODE, and the two cannot be
+     * set independently -- decode linear and write linear and the image is
+     * double-darkened.  One contract, one control. */
     const char *msaa_items[] = {
         jce_editor_i18n_or(PS_KEY "msaa.off", "Off"), "2x", "4x", "8x"
     };
@@ -661,13 +741,30 @@ void draw_graphics(void)
         const int v[] = { 0, 2, 4, 8 };
         g.default_msaa = v[msaa_idx]; mark_dirty();
     }
-    /* Clarify the parallel-MSAA split: this value is baked into the cooked
-     * render settings the SHIPPED GAME reads; the editor viewport itself runs
-     * tier-appropriate MSAA (RenderPipelineDesc.msaa_samples), so changing this
-     * does NOT change what the editor viewport shows. */
+    /* WHAT THIS ACTUALLY ANTIALIASES.  The hint here used to read
+     * "Shipped-game default MSAA (baked at cook)", which is true of where the
+     * value goes and misleading about what it does: it is a SWAPCHAIN reset
+     * flag, and a shipped game with any authored post-processing renders its
+     * 3D scene into jce_offscreen_target first -- a single-sampled FBO that
+     * carries no BGFX_TEXTURE_RT_MSAA_Xn and, by that module's own measurement,
+     * returns an identical flicker residual at 2x, 4x and 8x.  So for the
+     * common case (postfx is on by default at HIGH/ULTRA) this slider moves
+     * the UI's edges and not the scene's, and a user who turns it to 8x, sees
+     * no change and concludes the engine is broken was reading a correct
+     * sentence about the wrong thing.
+     *
+     * That FBO is single-sampled deliberately: its DEPTH texture is sampled as
+     * an ordinary texture by SSAO, the volumetric fog march and underwater
+     * absorption, and a multisampled depth target cannot be read that way
+     * without an explicit resolve.  This pipeline's scene antialiasing is TAA,
+     * which is why TAA is on by default at HIGH -- and TAA is live: the scene
+     * renderer, the environment pass and the postfx chain all read it. */
     ImGui::TextDisabled("%s", jce_editor_i18n_or(PS_KEY "default_msaa.hint",
-        "Shipped-game default MSAA (baked at cook). The editor viewport uses "
-        "tier MSAA, so this does not change the editor preview."));
+        "Backbuffer MSAA for the shipped game (baked at cook), and the editor "
+        "viewport keeps its own tier MSAA either way. With post-processing on "
+        "-- the default at High/Ultra -- the 3D scene is drawn to an offscreen "
+        "target that is single-sampled, so this affects UI edges only; scene "
+        "antialiasing there is TAA."));
     static const char *aniso[] = {
         jce_editor_i18n_or(PS_KEY "aniso.disabled", "Disabled"),
         jce_editor_i18n_or(PS_KEY "aniso.perTexture", "Per Texture"),
@@ -1483,6 +1580,22 @@ void draw_quality_levels(void)
                                      lv->name, JCE_PS_NAME_LEN)) mark_dirty();
                 if (ImGui::SliderInt(jce_editor_i18n("projectSettings.quality.pixelLightCount"),
                                      &lv->pixel_light_count, 0, 16)) mark_dirty();
+                /* The LIVE budget, so an authored number can be told from an
+                 * applied one.  Until jce_lighting_set_pixel_light_count
+                 * existed this slider reached nothing at all: no engine call
+                 * took the number and the effective-render-settings fold never
+                 * exported it.  Play adopts the active level's value and Stop
+                 * releases it, mirroring the frame cap. */
+                {
+                    const int live = jce_lighting_get_pixel_light_count();
+                    ImGui::SameLine();
+                    if (live > 0)
+                        ImGui::TextDisabled("(%s %d)", jce_editor_i18n_id(
+                            PS_KEY "quality.liveLabel", "live:"), live);
+                    else
+                        ImGui::TextDisabled("(%s)", jce_editor_i18n_id(
+                            PS_KEY "quality.lightsUncapped", "live: all lights"));
+                }
                 const char *tx[] = {
                     jce_editor_i18n_or(PS_KEY "texq.full",    "Full"),
                     jce_editor_i18n_or(PS_KEY "texq.half",    "Half"),
@@ -1498,14 +1611,22 @@ void draw_quality_levels(void)
                 };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.anisotropic"),
                                  &lv->anisotropic, aniso, 3)) mark_dirty();
-                const char *aa[] = { jce_editor_i18n_or(PS_KEY "msaa.off", "Off"), "2x", "4x", "8x" };
-                int aa_i = (lv->anti_aliasing <= 0) ? 0 :
-                           (lv->anti_aliasing == 2) ? 1 :
-                           (lv->anti_aliasing == 4) ? 2 : 3;
+                /* Entry 0 is the inherit sentinel, so a level can defer to
+                 * Graphics instead of every level having to restate it.  Until
+                 * this combo was wired the choice made no difference at all:
+                 * the effective-settings resolver overwrote msaa with
+                 * graphics.default_msaa one line later. */
+                const char *aa[] = {
+                    jce_editor_i18n_or(PS_KEY "msaa.useProjectDefault",
+                                       "Use Project Default"),
+                    jce_editor_i18n_or(PS_KEY "msaa.off", "Off"), "2x", "4x", "8x" };
+                const int aa_v[] = { JCE_PS_AA_USE_PROJECT_DEFAULT, 0, 2, 4, 8 };
+                int aa_i = 0;
+                for (int k = 0; k < 5; ++k)
+                    if (aa_v[k] == lv->anti_aliasing) { aa_i = k; break; }
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.antiAliasing"),
-                                 &aa_i, aa, 4)) {
-                    const int v[] = { 0, 2, 4, 8 };
-                    lv->anti_aliasing = v[aa_i]; mark_dirty();
+                                 &aa_i, aa, 5)) {
+                    lv->anti_aliasing = aa_v[aa_i]; mark_dirty();
                 }
                 if (ImGui::Checkbox(jce_editor_i18n("projectSettings.quality.softParticles"),
                                     &lv->soft_particles)) mark_dirty();
@@ -1545,6 +1666,23 @@ void draw_quality_levels(void)
                                  &lv->vsync_count, vs, 3)) mark_dirty();
                 if (ImGui::DragInt(jce_editor_i18n("projectSettings.quality.targetFramerate"),
                                    &lv->target_framerate, 1, -1, 480)) mark_dirty();
+                /* The LIVE cap, so a designer can tell an authored number from
+                 * an applied one.  Play adopts this level's value and Stop
+                 * releases it (jce_editor_play), and the shipped main applies
+                 * the exported value -- but until this line the only way to
+                 * check that the cap had actually taken was to watch a frame
+                 * counter and guess.  Before the limiter existed the field was
+                 * authorable and reached nothing at all. */
+                {
+                    const int live = jce_engine_get_target_fps();
+                    ImGui::SameLine();
+                    if (live > 0)
+                        ImGui::TextDisabled("(%s %d)", jce_editor_i18n_id(
+                            PS_KEY "quality.liveLabel", "live:"), live);
+                    else
+                        ImGui::TextDisabled("(%s)", jce_editor_i18n_id(
+                            PS_KEY "quality.fpsUncapped", "live: uncapped"));
+                }
                 if (ImGui::DragFloat(jce_editor_i18n("projectSettings.quality.lodBias"),
                                      &lv->lod_bias, 0.05f, 0.1f, 10.0f)) mark_dirty();
                 if (ImGui::SmallButton(jce_editor_i18n("projectSettings.quality.deleteLevel")) &&
@@ -1884,13 +2022,52 @@ void jce_editor_quality_tier_boot_apply(void)
     int idx = tier_idx_from_id(id);
     if (idx < 0) return;
 
+    s_tier_idx = idx;   /* keep the panel combo in sync -- always */
+
+    /* THE ASSET WINS.  This used to apply the tier preset unconditionally, so
+     * machine-local editor state ("graphics.tier" in .jce/editor-state.json)
+     * stomped the project's own Settings/RenderPipeline.rp.json -- a tracked,
+     * hand-editable, shipped asset losing to an untracked per-machine note.
+     * Open a project whose pipeline someone tuned field by field in the Render
+     * Pipeline panel, and the viewport silently showed a stock tier preset
+     * instead; the shipped exe, which only ever reads the asset, showed the
+     * tuned one.  Editor right, game wrong -- inverted.
+     *
+     * editor_app_init already guards its own tier re-apply exactly this way
+     * ("unconditionally re-applying a tier preset here stomped that layer-3
+     * asset"); this path, which runs LATER and per-project, never got the
+     * guard.  Mirror its resolution -- host file exists AND parses -- because
+     * there is still no "boot applied an asset" getter to ask.
+     *
+     * Apply now writes that asset (quality_tier_write_project_asset), so the
+     * two can no longer disagree about what the tier is: pressing Apply makes
+     * the asset say the tier, and editing the asset by hand outranks a tier
+     * pressed earlier, which is the order a user would expect. */
+    char rp_path[1024];
+    const JceProject *proj = jce_editor_project_get();
+    JceRenderPipelineDesc probe;
+    bool asset_wins = false;
+    if (proj && proj->project_root && proj->project_root[0]) {
+        char dir[1024];
+        jce_path_join(dir, sizeof dir, proj->project_root, "Settings");
+        jce_path_join(rp_path, sizeof rp_path, dir, "RenderPipeline.rp.json");
+        asset_wins = jce_fs_host_exists_file(rp_path) &&
+                     jce_render_pipeline_load(rp_path, &probe);
+    }
+    if (asset_wins) {
+        jce_editor_console_log_level(JCE_CONSOLE_INFO,
+            "[quality] tier '%s' remembered; the project's %s is authoritative "
+            "and was NOT overridden", k_tier_ids[idx], rp_path);
+        return;
+    }
+
     static const JceQualityTier k_tiers[4] = {
         JCE_QUALITY_LOW, JCE_QUALITY_MED, JCE_QUALITY_HIGH, JCE_QUALITY_ULTRA
     };
     JceQualityPreset p;
     jce_quality_preset_get(k_tiers[idx], &p);
     jce_quality_preset_apply(&p);
-    s_tier_idx = idx;   /* keep the panel combo in sync */
     jce_editor_console_log_level(JCE_CONSOLE_INFO,
-        "[quality] re-applied per-project tier '%s'", k_tier_ids[idx]);
+        "[quality] re-applied per-project tier '%s' (no pipeline asset)",
+        k_tier_ids[idx]);
 }

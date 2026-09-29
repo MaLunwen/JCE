@@ -112,6 +112,51 @@ typedef enum {
     JCE_BODY_KINEMATIC = 2
 } JceBodyType;
 
+/*
+ * What a 3D RigidBody COMPONENT may say about its own kind.  Deliberately not
+ * JceBodyType above, and the difference is the whole reason this exists.
+ *
+ * JceBodyType's STATIC is 0 -- and 0 is also what a memset'd component carries
+ * and what every scene ever written carries, because that field was never
+ * parsed and never serialised.  A field encoded that way cannot tell "the
+ * author said static" from "nobody said anything", so honouring it would have
+ * frozen every dynamic body in the tree.  Not hypothetical: the soft-body
+ * static-ground mirror read it that way and therefore treated every dynamic
+ * BoxCollider in every scene as immovable ground.
+ *
+ * AUTO at 0 is what every existing component holds and means exactly what the
+ * engine already did -- derive from is_kinematic, then mass.  The three named
+ * values are only reachable by an author who picked one.
+ *
+ * THE NUMBERING IS NOT ARBITRARY, and the first version got it wrong.  I gave
+ * it AUTO/STATIC/KINEMATIC/DYNAMIC = 0/1/2/3 on the reasoning that the field
+ * is never parsed and never serialised, so no FILE could carry a stale value.
+ * That checked the data path and not the code path: C callers set this field
+ * through the public setter with JceBodyType constants, and
+ * tests/application/test_jce_headless_boot.c does exactly that --
+ * `rb.body_type = JCE_BODY_DYNAMIC` (1), which under 0/1/2/3 became STATIC.
+ * The body stopped falling.
+ *
+ * So DYNAMIC and KINEMATIC keep JceBodyType's numbers.  Only STATIC moves, off
+ * 0, and 0 was the value that could never be honoured anyway -- it was
+ * indistinguishable from "unset", which is the whole reason this enum exists.
+ * Every existing caller therefore keeps its meaning:
+ *
+ *   wrote JCE_BODY_STATIC (0)    -> AUTO, and AUTO is what the engine already
+ *                                   did for that component, byte for byte
+ *   wrote JCE_BODY_DYNAMIC (1)   -> DYNAMIC, as they asked
+ *   wrote JCE_BODY_KINEMATIC (2) -> KINEMATIC, as they asked
+ *
+ * The 2D sibling keeps JceBodyType: ITS body_type has always been parsed,
+ * serialised and shown in a combo, so 0 there really is what the author picked.
+ */
+typedef enum {
+    JCE_RB_KIND_AUTO      = 0,   /* derive: is_kinematic, then mass <= 0 */
+    JCE_RB_KIND_DYNAMIC   = 1,   /* == JCE_BODY_DYNAMIC, on purpose */
+    JCE_RB_KIND_KINEMATIC = 2,   /* == JCE_BODY_KINEMATIC, on purpose */
+    JCE_RB_KIND_STATIC    = 3    /* moved off 0, which meant "unset" */
+} JceRigidBodyKind;
+
 typedef enum {
     JCE_CONSTRAINT_POINT2POINT = 0,
     JCE_CONSTRAINT_HINGE       = 1,
@@ -153,6 +198,14 @@ typedef struct {
      * from jce_physics_body_set_entity(); 0 if unset. */
     uint64_t      entity_a;
     uint64_t      entity_b;
+
+    /* Impulse this contact applied, N.s, summed over the manifold points.
+     * Bullet has had it all along (btManifoldPoint::m_appliedImpulse); the
+     * event carried normal, point and depth and no measure of how HARD the
+     * hit was, so JceFractureComponent.break_impulse -- authored, serialised,
+     * in the Inspector -- had nothing to compare against and fracture stayed
+     * script-only.  APPENDED, never inserted. */
+    float         applied_impulse;
 } JceContactEvent;
 
 /* Callback invoked on collision begin / end. */

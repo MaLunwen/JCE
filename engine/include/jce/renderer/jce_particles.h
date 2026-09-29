@@ -120,7 +120,13 @@ typedef struct JceParticleEmitterDesc {
     float       velocity_stretch;
 
     /* -- Texture -------------------------------------------------- */
-    JceTextureHandle texture;     /* billboard texture (INVALID = white) */
+    /* NOT READ BY THE PARTICLE SYSTEM.  jce_particles.c assigns it once, in
+     * the defaults, and never looks at it again: the asset's "texture" key is
+     * parsed into a PATH string (desc_parse_root's texture_out) and resolved
+     * and bound by the caller.  Kept because removing a field from a public
+     * struct changes its size for every compiled consumer; treat it as
+     * reserved, and do not expect setting it to change what is drawn. */
+    JceTextureHandle texture;
 
     /* -- Flipbook / texture-sheet animation (FEATURE 8.3) --------- *
      * Treat `texture` as an atlas of flipbook_rows x flipbook_cols equal
@@ -238,6 +244,46 @@ JCE_API void jce_particles_emitter_flag_collision(JceParticleSystem *sys,
 /* ================================================================== */
 
 /* Simulate all alive particles (spawn, move, age, kill). */
+/* Maximum simulation step, in seconds.  <= 0 disables (one step of whatever
+ * dt arrives), which is what every build did before this existed.
+ *
+ * This is Unity's "Max Particle Timestep" semantics and NOT a clamp: a frame
+ * longer than the cap is SUB-STEPPED, so the total simulated time is
+ * preserved and only the integration granularity changes.  Clamping would
+ * silently drop time and make particles crawl through a hitch.
+ *
+ * Project Settings > Time > maximum_particle_timestep_ms has had a slider, a
+ * default, a serializer and a deserializer since it was added, and no reader
+ * anywhere -- the control did nothing.  Both hosts set it now: editor Play
+ * and the shipped drop-in main. */
+JCE_API void  JCE_CALL jce_particles_set_max_timestep(float seconds);
+JCE_API float JCE_CALL jce_particles_get_max_timestep(void);
+
+/* ── Soft particles (Unity's QualitySettings.softParticlesEnabled) ────
+ *
+ * A billboard is a flat quad: where it intersects the floor it draws a hard
+ * straight seam, and that seam is what gives away every untreated smoke or
+ * dust effect.  Fading alpha out over the last centimetres before the opaque
+ * surface behind removes it.
+ *
+ * The value is the fade DISTANCE in world units; <= 0 is off and is exactly
+ * the old behaviour (the shader's whole soft block is skipped, so the depth
+ * sampler is never even read).  Project Settings > Quality carries a per-level
+ * boolean, which the hosts map to this default distance -- the number is
+ * here, and not a second authored field nobody would set, because a
+ * checkbox is what the quality level actually offers.
+ *
+ * The fade needs the camera depth pre-pass, so enabling it is one of the
+ * reasons sr_wants_depth_prepass() answers yes; a frame with no depth falls
+ * back to no fade rather than to invisible particles.
+ *
+ * Process-global, matching jce_particles_set_max_timestep above and
+ * jce_lighting_set_pixel_light_count -- the other quality knobs a shipped
+ * game applies before any renderer exists. */
+#define JCE_PARTICLES_SOFT_FADE_DEFAULT 0.5f
+JCE_API void  JCE_CALL jce_particles_set_soft_fade_distance(float world_units);
+JCE_API float JCE_CALL jce_particles_get_soft_fade_distance(void);
+
 JCE_API void jce_particles_update(JceParticleSystem *sys, float dt);
 
 /* Return total alive particle count across all emitters. */

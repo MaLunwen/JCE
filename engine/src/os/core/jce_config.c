@@ -36,6 +36,7 @@ JceConfig jce_config_defaults(void)
     cfg.resizable         = true;
 
     cfg.renderer_backend  = JCE_BACKEND_AUTO;
+    cfg.renderer_backend_resolved = JCE_BACKEND_AUTO;
     cfg.vsync             = true;
     cfg.debug_text        = true;
     cfg.clear_color       = 0x000000FF;
@@ -105,13 +106,6 @@ int jce_config_job_workers(void)
     return s_perf_job_workers;
 }
 
-static int parse_machine_class(const char *value)
-{
-    if (strcmp(value, "low")  == 0) return JCE_MACHINE_CLASS_LOW;
-    if (strcmp(value, "full") == 0) return JCE_MACHINE_CLASS_FULL;
-    return JCE_MACHINE_CLASS_AUTO;   /* "auto" or anything else */
-}
-
 /* -- Parse helpers ------------------------------------------------- */
 
 /* Trim leading and trailing whitespace in-place, return pointer. */
@@ -124,6 +118,107 @@ static char *trim(char *s)
     return s;
 }
 
+/* ── enum <-> ini token, one table per enum ────────────────────────
+ *
+ * Eight hand-written functions used to do this: four `if (strcmp(...))`
+ * chains and four `switch` statements, one pair per enum.  They are the
+ * kind of duplication that stays correct until it does not -- log_level
+ * had a parser and NO formatter, which is part of why jce_config_save
+ * silently dropped logging.level from every user file it rewrote.
+ *
+ * A table cannot have one direction and not the other. */
+typedef struct { int value; const char *token; } JceEnumToken;
+
+/* The FIRST row is the fallback in both directions: it is what an
+ * unrecognised token parses to, and what an unlisted value formats as. */
+static const JceEnumToken k_machine_class[] = {
+    { JCE_MACHINE_CLASS_AUTO, "auto" },
+    { JCE_MACHINE_CLASS_LOW,  "low"  },
+    { JCE_MACHINE_CLASS_FULL, "full" },
+};
+
+static const JceEnumToken k_backend[] = {
+    { JCE_BACKEND_AUTO,     "auto"     },
+    { JCE_BACKEND_D3D11,    "d3d11"    },
+    { JCE_BACKEND_D3D12,    "d3d12"    },
+    { JCE_BACKEND_VULKAN,   "vulkan"   },
+    { JCE_BACKEND_OPENGL,   "opengl"   },
+    { JCE_BACKEND_OPENGLES, "opengles" },
+    { JCE_BACKEND_METAL,    "metal"    },
+};
+
+static const JceEnumToken k_log_level[] = {
+    { JCE_LOG_LEVEL_INFO,    "info"    },
+    { JCE_LOG_LEVEL_TRACE,   "trace"   },
+    { JCE_LOG_LEVEL_DEBUG,   "debug"   },
+    { JCE_LOG_LEVEL_SUCCESS, "success" },
+    { JCE_LOG_LEVEL_WARN,    "warn"    },
+    { JCE_LOG_LEVEL_ERROR,   "error"   },
+    { JCE_LOG_LEVEL_OFF,     "off"     },
+};
+
+/* gfx quality is a bare int, not an enum: -1 auto, 0..3 tiers, 4 custom.
+ * "custom" is the fallback, so it leads. */
+static const JceEnumToken k_gfx_quality[] = {
+    {  4, "custom" },
+    { -1, "auto"   },
+    {  0, "low"    },
+    {  1, "medium" },
+    {  2, "high"   },
+    {  3, "ultra"  },
+};
+
+#define JCE_ENUM_TOKEN_COUNT(tbl) (sizeof(tbl) / sizeof((tbl)[0]))
+
+static int enum_from_token(const JceEnumToken *tbl, size_t n,
+                           const char *token)
+{
+    size_t i;
+    if (token) {
+        for (i = 0; i < n; ++i) {
+            if (strcmp(token, tbl[i].token) == 0)
+                return tbl[i].value;
+        }
+    }
+    return tbl[0].value;
+}
+
+static const char *token_from_enum(const JceEnumToken *tbl, size_t n,
+                                   int value)
+{
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        if (tbl[i].value == value)
+            return tbl[i].token;
+    }
+    return tbl[0].token;
+}
+
+#define JCE_PARSE_ENUM(tbl, token) \
+    enum_from_token((tbl), JCE_ENUM_TOKEN_COUNT(tbl), (token))
+#define JCE_FORMAT_ENUM(tbl, value) \
+    token_from_enum((tbl), JCE_ENUM_TOKEN_COUNT(tbl), (value))
+
+static int parse_machine_class(const char *v)
+{ return JCE_PARSE_ENUM(k_machine_class, v); }
+static const char *machine_class_to_str(int mc)
+{ return JCE_FORMAT_ENUM(k_machine_class, mc); }
+
+static JceRendererBackend parse_backend(const char *v)
+{ return (JceRendererBackend)JCE_PARSE_ENUM(k_backend, v); }
+static const char *backend_to_str(JceRendererBackend b)
+{ return JCE_FORMAT_ENUM(k_backend, (int)b); }
+
+static int parse_log_level(const char *v)
+{ return JCE_PARSE_ENUM(k_log_level, v); }
+static const char *log_level_to_str(int level)
+{ return JCE_FORMAT_ENUM(k_log_level, level); }
+
+static int parse_gfx_quality(const char *v)
+{ return JCE_PARSE_ENUM(k_gfx_quality, v); }
+static const char *gfx_quality_to_str(int q)
+{ return JCE_FORMAT_ENUM(k_gfx_quality, q); }
+
 static bool parse_bool(const char *value)
 {
     return (strcmp(value, "true") == 0 ||
@@ -131,29 +226,9 @@ static bool parse_bool(const char *value)
             strcmp(value, "yes")  == 0);
 }
 
-static JceRendererBackend parse_backend(const char *value)
-{
-    if (strcmp(value, "d3d11")    == 0) return JCE_BACKEND_D3D11;
-    if (strcmp(value, "d3d12")    == 0) return JCE_BACKEND_D3D12;
-    if (strcmp(value, "vulkan")   == 0) return JCE_BACKEND_VULKAN;
-    if (strcmp(value, "opengl")   == 0) return JCE_BACKEND_OPENGL;
-    if (strcmp(value, "opengles") == 0) return JCE_BACKEND_OPENGLES;
-    if (strcmp(value, "metal")   == 0) return JCE_BACKEND_METAL;
-    return JCE_BACKEND_AUTO;
-}
-
-static int parse_log_level(const char *value)
-{
-    if (strcmp(value, "trace")   == 0) return JCE_LOG_LEVEL_TRACE;
-    if (strcmp(value, "debug")   == 0) return JCE_LOG_LEVEL_DEBUG;
-    if (strcmp(value, "info")    == 0) return JCE_LOG_LEVEL_INFO;
-    if (strcmp(value, "success") == 0) return JCE_LOG_LEVEL_SUCCESS;
-    if (strcmp(value, "warn")    == 0) return JCE_LOG_LEVEL_WARN;
-    if (strcmp(value, "error")   == 0) return JCE_LOG_LEVEL_ERROR;
-    if (strcmp(value, "off")     == 0) return JCE_LOG_LEVEL_OFF;
-    return JCE_LOG_LEVEL_INFO;
-}
-
+/* Inverse of parse_log_level, so jce_config_save can write back every key
+ * jce_config_load understands.  It had no inverse, which is part of why the
+ * key was silently dropped on every save. */
 static uint32_t parse_hex(const char *value)
 {
     return (uint32_t)SDL_strtoul(value, NULL, 16);
@@ -161,28 +236,6 @@ static uint32_t parse_hex(const char *value)
 
 /* Graphics quality preset name <-> index (settings S7 follow-up).
  * -1 auto / 0 low / 1 medium / 2 high / 3 ultra / 4 custom. */
-static int parse_gfx_quality(const char *value)
-{
-    if (strcmp(value, "auto")   == 0) return -1;
-    if (strcmp(value, "low")    == 0) return 0;
-    if (strcmp(value, "medium") == 0) return 1;
-    if (strcmp(value, "high")   == 0) return 2;
-    if (strcmp(value, "ultra")  == 0) return 3;
-    return 4;   /* "custom" or anything else */
-}
-
-static const char *gfx_quality_to_str(int q)
-{
-    switch (q) {
-    case -1: return "auto";
-    case 0:  return "low";
-    case 1:  return "medium";
-    case 2:  return "high";
-    case 3:  return "ultra";
-    default: return "custom";
-    }
-}
-
 /* -- Apply a section.key = value to config ------------------------- */
 
 static void apply(JceConfig *cfg, const char *section,
@@ -202,6 +255,7 @@ static void apply(JceConfig *cfg, const char *section,
 
     /* Renderer */
     else if (strcmp(full, "renderer.backend")    == 0) cfg->renderer_backend = parse_backend(value);
+    else if (strcmp(full, "renderer.backend_resolved") == 0) cfg->renderer_backend_resolved = parse_backend(value);
     else if (strcmp(full, "renderer.vsync")      == 0) cfg->vsync       = parse_bool(value);
     else if (strcmp(full, "renderer.debug_text") == 0) cfg->debug_text  = parse_bool(value);
     else if (strcmp(full, "renderer.clear_color")== 0) cfg->clear_color = parse_hex(value);
@@ -329,32 +383,22 @@ bool jce_config_load(JceConfig *cfg, const char *path)
 
 /* -- INI file saver (settings S7: in-game persistence) ------------- */
 
-static const char *backend_to_str(JceRendererBackend b)
-{
-    switch (b) {
-    case JCE_BACKEND_D3D11:    return "d3d11";
-    case JCE_BACKEND_D3D12:    return "d3d12";
-    case JCE_BACKEND_VULKAN:   return "vulkan";
-    case JCE_BACKEND_OPENGL:   return "opengl";
-    case JCE_BACKEND_OPENGLES: return "opengles";
-    case JCE_BACKEND_METAL:    return "metal";
-    default:                   return "auto";
-    }
-}
-
-static const char *machine_class_to_str(int mc)
-{
-    switch (mc) {
-    case JCE_MACHINE_CLASS_LOW:  return "low";
-    case JCE_MACHINE_CLASS_FULL: return "full";
-    default:                     return "auto";
-    }
-}
-
 bool jce_config_save(const JceConfig *cfg, const char *path)
 {
     if (!cfg || !path) return false;
 
+    /* EVERY KEY jce_config_load() PARSES MUST BE WRITTEN BACK HERE.
+     *
+     * This is a whole-file truncating write, not a merge, so a key the loader
+     * understands but this template omits is DELETED from the user's file the
+     * first time anything saves.  Six were: window.title, window.resizable,
+     * renderer.debug_text, renderer.clear_color, logging.level and
+     * logging.colors -- and the first AUTO launch saves, because that is where
+     * the resolved backend is remembered.  So a user who had set a log level
+     * or a window title lost it on the first run of a build that remembers its
+     * backend, silently.
+     *
+     * check_config_key_roundtrip.py holds the two sides equal from now on. */
     char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "# JCE engine config (written by the in-game settings screen).\n"
@@ -362,25 +406,40 @@ bool jce_config_save(const JceConfig *cfg, const char *path)
         "width = %d\n"
         "height = %d\n"
         "fullscreen = %s\n"
+        "resizable = %s\n"
+        "title = %s\n"
         "\n[renderer]\n"
         "backend = %s\n"
+        "backend_resolved = %s\n"
         "vsync = %s\n"
+        "debug_text = %s\n"
+        "clear_color = %08X\n"
         "\n[audio]\n"
         "master_volume = %.3f\n"
         "music_volume = %.3f\n"
         "sfx_volume = %.3f\n"
         "\n[app]\n"
         "locale = %s\n"
+        "\n[logging]\n"
+        "level = %s\n"
+        "colors = %s\n"
         "\n[performance]\n"
         "machine_class = %s\n"
         "job_workers = %d\n",
         cfg->window_width, cfg->window_height,
         cfg->fullscreen ? "true" : "false",
+        cfg->resizable ? "true" : "false",
+        cfg->window_title[0] ? cfg->window_title : "JCE",
         backend_to_str(cfg->renderer_backend),
+        backend_to_str(cfg->renderer_backend_resolved),
         cfg->vsync ? "true" : "false",
+        cfg->debug_text ? "true" : "false",
+        (unsigned)cfg->clear_color,
         (double)cfg->master_volume, (double)cfg->music_volume,
         (double)cfg->sfx_volume,
         cfg->locale[0] ? cfg->locale : "",
+        log_level_to_str(cfg->log_level),
+        cfg->log_colors ? "true" : "false",
         machine_class_to_str(cfg->machine_class),
         cfg->job_workers);
     if (n <= 0 || n >= (int)sizeof(buf)) return false;

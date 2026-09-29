@@ -27,6 +27,8 @@
 #ifndef JCE_VIEW_BANDS_H
 #define JCE_VIEW_BANDS_H
 
+#include <jce/renderer/jce_views.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -34,28 +36,9 @@
 extern "C" {
 #endif
 
-/* Drop all claims. Call once per frame, before any view assignment. */
-void jce_view_bands_begin_frame(void);
-
-/* Declare that `owner` owns bgfx views [first, first + count).
- * `owner` must be a long-lived pointer (a string literal).
- *
- * Returns true when the range was free (or already held by the same owner).
- * On overlap: logs an error naming BOTH owners and the offending view ids,
- * once per distinct pair per frame, and returns false. The caller is not
- * expected to do anything with the result — proceeding reproduces the old
- * last-write-wins behaviour, which is strictly better than refusing to render
- * — but a test can assert on it. */
-bool jce_view_bands_claim(const char *owner,
-                                           uint16_t first, uint16_t count);
-
-/* Number of overlaps detected since the last begin_frame. 0 is the healthy
- * value; the shipped guard test asserts it across the standard scenes. */
-uint32_t jce_view_bands_conflict_count(void);
-
-/* Off by default in dist builds, on otherwise; JCE_VIEW_BAND_CHECK=0/1
- * overrides. When off, claim() is a no-op that returns true. */
-bool jce_view_bands_enabled(void);
+/* The declarations now live in <jce/renderer/jce_views.h>, beside the view-id
+ * table they guard, so a NON-ENGINE owner (the editor's viewports) can declare
+ * its bands too.  This header stays as the engine-internal include path. */
 
 #ifdef __cplusplus
 }

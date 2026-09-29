@@ -11,13 +11,15 @@
 
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_assert_bridge.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "ui/jce_editor_ui_state.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <jce/tools/jce_imgui.hpp>
-#include <jce/os/core/jce_console.h>   /* cvar + command registry */
+#include <jce/os/core/jce_console.h>
+#include <jce/os/core/jce_console_session.h>   /* cvar + command registry */
 #include <jce/os/core/jce_log.h>       /* engine log stream + sink hook */
 #include <jce/os/core/jce_thread.h>    /* JceMutex for the sink hand-off */
 #include <jce/os/core/jce_timer.h>     /* local-time formatting */
@@ -45,6 +47,13 @@ struct ConsoleUiState {
     JcePlayState  last_play      = JCE_PLAY_STOPPED;
     char          search_buf[128] = {0};
     char          cmd_buf[256]    = {0};
+    /* Line / history / completion, shared in KIND with the shipped game's
+     * overlay -- both drive a jce_console_session, so a fix to Tab or to the
+     * history walk lands in both.  Not shared in INSTANCE: history is per
+     * surface.  It lives in this struct rather than beside it because a
+     * second file-scope mutable global is a real cost the dedup audit counts,
+     * and this panel already has exactly one. */
+    JceConsoleSession *session = nullptr;
     std::set<int> selected;   /* entry indices */
     int           anchor      = -1;
 };
@@ -263,35 +272,113 @@ static void console_build_rows(std::vector<JceConsoleEntry> &rows)
                        });
 }
 
+/* The editor's own commands, REGISTERED rather than if-chained.
+ *
+ * They used to be a chain of strncmp() in this function, which had three
+ * costs.  `help` printed a hardcoded list naming only the chain, so a
+ * registered command could never appear in it and the string was stale the
+ * moment anyone added one.  The chain matched on PREFIX -- strncmp(cmd,
+ * "help", 4) also fired for "helpme" and strncmp(cmd, "clear", 5) for
+ * "clearfoo".  And nothing could enumerate them, so a completion key could
+ * not offer the five commands this panel actually has.
+ *
+ * In the registry they are ordinary commands: exec dispatches them on an
+ * exact name, the engine's `help` lists them beside every cvar because it
+ * walks the same table, and Tab completes them. */
+static void ed_cmd_clear(int argc, const char **argv, void *user)
+{
+    (void)argc; (void)argv; (void)user;
+    console_clear_all();
+    s_ui.selected.clear();
+    s_ui.anchor = -1;
+}
+
+static void ed_cmd_echo(int argc, const char **argv, void *user)
+{
+    (void)user;
+    char line[512];
+    line[0] = '\0';
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1) strncat(line, " ", sizeof line - strlen(line) - 1);
+        strncat(line, argv[i], sizeof line - strlen(line) - 1);
+    }
+    jce_editor_console_log("%s", line);
+}
+
+static void ed_cmd_play (int, const char **, void *) { jce_state_play();  }
+static void ed_cmd_stop (int, const char **, void *) { jce_state_stop();  }
+static void ed_cmd_pause(int, const char **, void *) { jce_state_pause(); }
+
 static void execute_console_command(const char *cmd)
 {
     if (!cmd || !*cmd) return;
     jce_editor_console_log("> %s", cmd);
-
-    if (strncmp(cmd, "clear", 5) == 0) {
-        console_clear_all();
-        s_ui.selected.clear();
-        s_ui.anchor = -1;
-    } else if (strncmp(cmd, "help", 4) == 0) {
-        jce_editor_console_log("Commands: clear, help, echo <msg>, play, stop, pause, list");
-        jce_editor_console_log("cvars: type a name to read, 'name value' to set ('list' shows all)");
-    } else if (strncmp(cmd, "echo ", 5) == 0) {
-        jce_editor_console_log("%s", cmd + 5);
-    } else if (strcmp(cmd, "play") == 0) {
-        jce_state_play();
-    } else if (strcmp(cmd, "stop") == 0) {
-        jce_state_stop();
-    } else if (strcmp(cmd, "pause") == 0) {
-        jce_state_pause();
-    } else if (jce_console_exec(cmd)) {
-        /* Handled by the registered cvar/command registry (jce_console):
-         * "<cvar>" echoes, "<cvar> <value>" sets, "<command> args" dispatches,
-         * "list" enumerates everything.  Output routes to the console log via
-         * the sink installed in ensure_init(). */
-    } else {
+    /* One dispatcher.  cvars echo on a bare name and set on "name value";
+     * commands -- the engine's help/list and the five registered above --
+     * dispatch by exact name.  Output routes back into this panel through the
+     * sink installed in ensure_init(). */
+    if (!jce_console_exec(cmd))
         jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-            "unknown command: %s (try 'help' or 'list')", cmd);
+            "unknown command or cvar: %s (try 'help')", cmd);
+}
+
+/* Up / Down / Tab on the command line.
+ *
+ * The buffer is ImGui's and the meaning is the session's, so each event
+ * re-syncs first -- but only when they actually differ.  set_line() ends a
+ * history walk by design (an edit means the user left it), so calling it
+ * unconditionally would make Up always return the newest entry and never
+ * step past it. */
+static void cmdline_sync(ImGuiInputTextCallbackData *data)
+{
+    if (strcmp(data->Buf, jce_console_session_line(s_ui.session)) != 0)
+        jce_console_session_set_line(s_ui.session, data->Buf);
+}
+
+static void cmdline_replace(ImGuiInputTextCallbackData *data)
+{
+    data->DeleteChars(0, data->BufTextLen);
+    data->InsertChars(0, jce_console_session_line(s_ui.session));
+}
+
+static int cmdline_callback(ImGuiInputTextCallbackData *data)
+{
+    if (!s_ui.session) return 0;
+
+    switch (data->EventFlag) {
+    case ImGuiInputTextFlags_CallbackEdit:
+        jce_console_session_set_line(s_ui.session, data->Buf);
+        break;
+
+    case ImGuiInputTextFlags_CallbackHistory:
+        cmdline_sync(data);
+        if (data->EventKey == ImGuiKey_UpArrow
+                ? jce_console_session_history_prev(s_ui.session)
+                : jce_console_session_history_next(s_ui.session))
+            cmdline_replace(data);
+        break;
+
+    case ImGuiInputTextFlags_CallbackCompletion: {
+        cmdline_sync(data);
+        uint32_t total = jce_console_session_complete(s_ui.session);
+        if (total > 0) cmdline_replace(data);
+        if (total > 1) {
+            /* Ambiguous: print the candidates.  This is the whole reason the
+             * registry has jce_cvar_at / jce_console_cmd_at -- and until now
+             * nothing in the repository called either. */
+            uint32_t shown = jce_console_session_match_count(s_ui.session);
+            for (uint32_t i = 0; i < shown; ++i)
+                jce_editor_console_log("  %s",
+                    jce_console_session_match_at(s_ui.session, i));
+            if (total > shown)
+                jce_editor_console_log("  ... and %u more",
+                                       (unsigned)(total - shown));
+        }
+        break;
     }
+    default: break;
+    }
+    return 0;
 }
 
 /* Route jce_console output (cvar echoes, command results, 'list') into the
@@ -316,6 +403,19 @@ static void ensure_init(void)
     s_ui.auto_scroll   = jce_editor_ui_state_load_int("console.autoscroll",     1, 0, 1) != 0;
     s_ui.initialized = true;
     jce_console_set_output(console_sink, nullptr);
+
+    if (!s_ui.session) s_ui.session = jce_console_session_create();
+
+    jce_console_register_cmd("clear", ed_cmd_clear, nullptr,
+                             "clear the console log");
+    jce_console_register_cmd("echo",  ed_cmd_echo,  nullptr,
+                             "print the rest of the line");
+    jce_console_register_cmd("play",  ed_cmd_play,  nullptr,
+                             "enter Play mode");
+    jce_console_register_cmd("stop",  ed_cmd_stop,  nullptr,
+                             "leave Play mode");
+    jce_console_register_cmd("pause", ed_cmd_pause, nullptr,
+                             "pause Play");
 
     /* Subscribe to the engine log.  The mutex must exist before the sink can
      * fire, and the sink is never removed — the log backend thread is joined
@@ -510,6 +610,25 @@ void jce_editor_panel_console_content(void)
     if (ImGui::Checkbox(jce_editor_i18n_id("console.toggle.autoScroll", "auto_scroll"), &s_ui.auto_scroll))
         jce_editor_ui_state_save_int("console.autoscroll", s_ui.auto_scroll ? 1 : 0);
 
+    /* Broken-invariant readout.  SHOWN ONLY WHEN NON-ZERO, because the number
+     * that matters is "not zero" and a permanent `0 / 0` teaches the eye to
+     * skip the spot where the first one will appear.
+     *
+     * JCE_ENSURE is the reason this needs a readout at all: it reports once
+     * per site and then goes quiet forever, so an invariant that broke early
+     * leaves nothing on screen a minute later.  The count does not go quiet. */
+    {
+        const unsigned long long af = jce_editor_assert_failures();
+        const unsigned long long es = jce_editor_assert_ensure_sites();
+        if (af || es) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                               jce_editor_i18n("console.invariants"), af, es);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n("console.invariantsTip"));
+        }
+    }
+
     /* Search row */
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##search", jce_editor_i18n("console.searchHint"),
@@ -615,7 +734,15 @@ void jce_editor_panel_console_content(void)
             std::string jpath;
             int jline = 0;
             if (console_try_parse_path_line(entry.text, jpath, jline)) {
-                jce_file_viewer_open(jpath.c_str());
+                /* OPEN AT THE LINE, not at the top.  The line was parsed out
+                 * of the message and then used only to print it back and to
+                 * fill the tooltip -- so a script error took you to the file
+                 * and left you to find the line yourself.  The function that
+                 * honours it already existed for the hierarchy right-click
+                 * and the search results; this call site just was not using
+                 * it.  line <= 0 still opens at the top, which is what a
+                 * message with no line resolves to. */
+                jce_file_viewer_open_text_at(jpath.c_str(), jline);
                 jce_editor_console_log("jump → %s:%d", jpath.c_str(), jline);
             }
         }
@@ -694,12 +821,26 @@ void jce_editor_panel_console_content(void)
 
     ImGui::EndChild();
 
-    /* Command-line input at the bottom. */
+    /* Command-line input at the bottom, backed by the session. */
     ImGui::SetNextItemWidth(-1);
-    bool submit = ImGui::InputText("##cmdline", s_ui.cmd_buf, sizeof(s_ui.cmd_buf),
-                                    ImGuiInputTextFlags_EnterReturnsTrue);
+    bool submit = ImGui::InputText(
+        "##cmdline", s_ui.cmd_buf, sizeof(s_ui.cmd_buf),
+        ImGuiInputTextFlags_EnterReturnsTrue
+            | ImGuiInputTextFlags_CallbackHistory
+            | ImGuiInputTextFlags_CallbackCompletion
+            | ImGuiInputTextFlags_CallbackEdit,
+        cmdline_callback);
     if (submit && s_ui.cmd_buf[0]) {
-        execute_console_command(s_ui.cmd_buf);
+        char sent[sizeof s_ui.cmd_buf];
+        snprintf(sent, sizeof sent, "%s", s_ui.cmd_buf);
+        jce_console_session_set_line(s_ui.session, sent);
+        jce_editor_console_log("> %s", sent);
+        /* submit() records the line in history -- including a line the parser
+         * rejects, because a typo is exactly what Up is for -- runs it, and
+         * clears the session's copy. */
+        if (!jce_console_session_submit(s_ui.session))
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "unknown command or cvar: %s (try 'help')", sent);
         s_ui.cmd_buf[0] = '\0';
         ImGui::SetKeyboardFocusHere(-1);
     }

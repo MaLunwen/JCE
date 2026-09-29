@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "contentHash": "10324908670242560122",
+  "entries": [
+    {"assetId":"elemental.scene.root","capability":"environment.root","contentHash":"100","weight":1,"enabled":true},
+    {"assetId":"elemental.state.spring.day","capability":"environment.spring.day","contentHash":"101","weight":1,"enabled":true},
+    {"assetId":"elemental.state.spring.night","capability":"environment.spring.night","contentHash":"102","weight":1,"enabled":true},
+    {"assetId":"elemental.state.winter.day","capability":"environment.winter.day","contentHash":"103","weight":1,"enabled":true},
+    {"assetId":"elemental.state.winter.night","capability":"environment.winter.night","contentHash":"104","weight":1,"enabled":true},
+    {"assetId":"elemental.state.autumn.day","capability":"environment.autumn.day","contentHash":"105","weight":1,"enabled":true},
+    {"assetId":"elemental.state.autumn.night","capability":"environment.autumn.night","contentHash":"106","weight":1,"enabled":true},
+    {"assetId":"elemental.state.rainy.day","capability":"environment.rainy.day","contentHash":"107","weight":1,"enabled":true},
+    {"assetId":"elemental.state.rainy.night","capability":"environment.rainy.night","contentHash":"108","weight":1,"enabled":true}
+  ]
+}

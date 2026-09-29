@@ -107,6 +107,9 @@ static bool                g_ext_claimed;
 #define CB_UPDATE     (1u << 1)
 #define CB_COLLISION  (1u << 2)
 #define CB_ANIM       (1u << 3)
+/* Its own bit: a fixed-step handler that throws every step must not
+ * disable the render-frame callback as collateral. */
+#define CB_FIXED      (1u << 4)
 
 typedef struct CppInstance {
     void            *obj;             /* what the class factory returned */
@@ -991,6 +994,15 @@ static void cpp_call_update(JceScript *sc, JceScriptInstance h, float dt)
                   in->cls->cls.on_update(in->obj, dt));
 }
 
+static void cpp_call_fixed_update(JceScript *sc, JceScriptInstance h, float dt)
+{
+    CppScript   *s  = (CppScript *)sc;
+    CppInstance *in = dispatch_target(s, h, CB_FIXED);
+    if (!in || !in->cls->cls.on_fixed_update) return;
+    report_status(s, in, "on_fixed_update", CB_FIXED,
+                  in->cls->cls.on_fixed_update(in->obj, dt));
+}
+
 static void cpp_release(JceScript *sc, JceScriptInstance h)
 {
     CppScript   *s  = (CppScript *)sc;
@@ -1228,6 +1240,7 @@ static const JceScriptVM k_cpp_vm = {
     cpp_compile_module,
     cpp_rebind_instance,
     cpp_release_module,
+    cpp_call_fixed_update,   /* APPENDED -- see jce_script_vm.h */
 };
 
 const JceScriptVM *JCE_CALL jce_script_vm_cpp(void)

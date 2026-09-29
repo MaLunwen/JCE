@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    if (System.getenv('ANDROID_NDK_HOME')) {
+        ndkPath = System.getenv('ANDROID_NDK_HOME')
+    }
+    ndkVersion = '27.3.13750724'
+    namespace = "com.jce"
+    compileSdkVersion 35
+    defaultConfig {
+        applicationId System.getenv("JCE_ANDROID_APP_ID") ?: "com.jce"
+        manifestPlaceholders = [jceAppIcon: System.getenv("JCE_ANDROID_APP_ICON") ?: "@android:drawable/sym_def_app_icon"]
+        minSdkVersion 24
+        targetSdkVersion 35
+        versionCode 1
+        versionName "1.0"
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    sourceSets.main {
+        jniLibs.srcDirs = ['src/main/jniLibs']
+        def sdlJava = System.getenv('JCE_SDL_JAVA_DIR')
+        if (!sdlJava || !file(sdlJava).isDirectory()) {
+            throw new GradleException('JCE_SDL_JAVA_DIR must name verified SDL Java sources; use the JCE Android builder.')
+        }
+        java.srcDirs = ['src/main/java/com', sdlJava]
+        def consumer = System.getenv('JCE_GAME_PROJECT_DIR')
+        if (consumer) {
+            res.srcDir new File(rootDir.parentFile.parentFile.parentFile, consumer + '/platform/android/res')
+        }
+    }
+    lint {
+        abortOnError = false
+    }
+    aaptOptions {
+        noCompress 'pak'
+    }
+}

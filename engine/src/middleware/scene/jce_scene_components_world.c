@@ -28,6 +28,28 @@ void parse_script(JceScene *s, JceEntity e, const cJSON *c)
     JceScriptComponent sc2;
     memset(&sc2, 0, sizeof(sc2));
     copy_str(sc2.script_path, sizeof(sc2.script_path), j_str(c, "scriptPath", ""));
+
+    /* A scene written before exposed fields existed has no "params" key and
+     * parses to param_count 0 -- which is what the memset above already
+     * holds, so the absence costs nothing and means nothing else. */
+    const cJSON *ps = cJSON_GetObjectItemCaseSensitive(c, "params");
+    if (cJSON_IsArray(ps)) {
+        const cJSON *it = NULL;
+        cJSON_ArrayForEach(it, ps) {
+            if (sc2.param_count >= JCE_SCRIPT_PARAM_MAX) break;
+            JceScriptParam *pm = &sc2.params[sc2.param_count];
+            copy_str(pm->name, sizeof(pm->name), j_str(it, "name", ""));
+            if (pm->name[0] == '\0') continue;   /* an unnamed row is not a param */
+            double k = j_num(it, "kind", 0.0);
+            if (k < 0.0 || k > (double)JCE_SCRIPT_PARAM_ENTITY)
+                k = (double)JCE_SCRIPT_PARAM_NUMBER;
+            pm->kind   = (uint32_t)k;
+            pm->number = (float)j_num(it, "number", 0.0);
+            pm->entity = (uint64_t)j_num(it, "entity", 0.0);
+            copy_str(pm->text, sizeof(pm->text), j_str(it, "text", ""));
+            sc2.param_count++;
+        }
+    }
     jce_scene_set_script(s, e, &sc2);
 }
 
@@ -187,6 +209,32 @@ static void ser_script(const JceScriptComponent *c, cJSON *arr)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "Script");
     cJSON_AddStringToObject(o, "scriptPath", c->script_path);
+
+    /* Authored parameters.  The array is OMITTED when empty rather than
+     * written as [], so a scene with no exposed fields serialises to exactly
+     * the bytes it did before this existed -- which is what lets the round
+     * trip be compared against a pre-existing file. */
+    int n = c->param_count;
+    if (n < 0) n = 0;
+    if (n > JCE_SCRIPT_PARAM_MAX) n = JCE_SCRIPT_PARAM_MAX;
+    if (n > 0) {
+        cJSON *ps = cJSON_CreateArray();
+        for (int i = 0; i < n; ++i) {
+            const JceScriptParam *pm = &c->params[i];
+            cJSON *po = cJSON_CreateObject();
+            cJSON_AddStringToObject(po, "name", pm->name);
+            cJSON_AddNumberToObject(po, "kind", (double)pm->kind);
+            /* EVERY field, every time.  Writing only the one the kind names
+             * would make a kind change in the editor silently discard the
+             * value the author had typed under the other one -- and this
+             * struct keeps them separate precisely so that cannot happen. */
+            cJSON_AddNumberToObject(po, "number", (double)pm->number);
+            cJSON_AddNumberToObject(po, "entity", (double)pm->entity);
+            cJSON_AddStringToObject(po, "text", pm->text);
+            cJSON_AddItemToArray(ps, po);
+        }
+        cJSON_AddItemToObject(o, "params", ps);
+    }
     cJSON_AddItemToArray(arr, o);
 }
 

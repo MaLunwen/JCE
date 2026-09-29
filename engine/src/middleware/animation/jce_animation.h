@@ -77,6 +77,14 @@ void         jce_anim_clip_destroy(JceAnimClip *clip);
  * verify a clip carries joint tracks. */
 uint32_t     jce_anim_clip_channel_count(const JceAnimClip *clip);
 
+/* The clip's channels, or NULL.  Valid until jce_anim_clip_destroy.
+ *
+ * Added so jce_anim_clip_io.c can WRITE a clip without a second copy of
+ * `struct JceAnimClip`: the struct is private to jce_animation.c, and a
+ * serialiser that redeclared it would be a second definition of the layout --
+ * which compiles, and then disagrees the first time a field moves. */
+const JceAnimChannel *jce_anim_clip_channels(const JceAnimClip *clip);
+
 /* Sample the clip at a given time, writing per-joint local transforms.
  * out_locals: array of [num_joints] mat4 (typically skeleton joint count).
  * Joints not affected by this clip are left unchanged;

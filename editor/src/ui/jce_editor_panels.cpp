@@ -267,6 +267,8 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_LIGHT_EXPLORER]   = false;
     s_visible[JCE_PANEL_REFLECTION_PROBES]= false;
     s_visible[JCE_PANEL_SHADER_GRAPH]     = false;
+    s_visible[JCE_PANEL_SHADER_INSPECTOR] = false;
+    s_visible[JCE_PANEL_AI_ASSISTANT]     = false;
     s_visible[JCE_PANEL_SEARCH]           = false;
     s_visible[JCE_PANEL_VERSION_CONTROL]  = false;
     s_visible[JCE_PANEL_TIME_OF_DAY]      = false;

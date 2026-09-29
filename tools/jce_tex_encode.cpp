@@ -14,6 +14,7 @@ extern "C" {
 #include <bimg/encode.h>
 #include <bx/allocator.h>
 #include <bx/error.h>
+#include <bx/file.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -126,4 +127,33 @@ extern "C" int jce_tex_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
         bimg::imageEncodeFromRgba8(&s_alloc, dst, rgba, w, h, 1, f, q, &err);
     }
     return err.isOk() ? 1 : 0;
+}
+
+/*
+ * Write an RGBA8 buffer as a PNG, through the encoder this TU already owns.
+ *
+ * NOT SDL_image: contracts/dependency-ownership.yml keeps the image-decode-ldr
+ * capability at ONE directory and names "direct IMG_Load at call sites" as a
+ * forbidden alternative, and the boundary gate refused the first version of
+ * the atlas cook for including it.  bimg is already linked here for the block
+ * encoder, so this adds no dependency at all -- it exposes one that was
+ * already paid for.
+ *
+ * Used by tools/jce_cook_atlas.c (--pack-atlas).  Returns 0 on success.
+ */
+extern "C" int jce_tex_write_png(const char *path, const uint8_t *rgba,
+                                 uint32_t w, uint32_t h)
+{
+    if (!path || !rgba || w == 0u || h == 0u) return 1;
+
+    bx::FileWriter writer;
+    bx::Error      err;
+    if (!bx::open(&writer, path, false, &err)) return 2;
+
+    /* Returns bytes written, not a bool -- 0 means it wrote nothing. */
+    const int32_t written = bimg::imageWritePng(&writer, w, h, w * 4u, rgba,
+                                                bimg::TextureFormat::RGBA8,
+                                                false, &err);
+    bx::close(&writer);
+    return (written > 0 && err.isOk()) ? 0 : 3;
 }

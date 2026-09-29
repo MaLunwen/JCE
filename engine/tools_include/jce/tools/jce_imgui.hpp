@@ -6,7 +6,7 @@
  * route through this header.
  *
  * Why a wrapper:
- *   * Centralises ImGui pre-defines (cglm interop, custom allocator,
+ *   * Centralises ImGui pre-defines (ABI-sensitive ones, custom allocator,
  *     UTF-8 string helpers) so they stay consistent across TUs.
  *   * Lets us swap or vendor-uplift Dear ImGui without touching 30+
  *     editor files.
@@ -34,9 +34,15 @@
 
 /* ── Pre-defines (must come BEFORE imgui.h) ─────────────────────── */
 
-/* Interop convenience: let ImVec2/ImVec4 implicitly construct from cglm
- * vec2/vec4. Disabled for now to keep ImGui ABI stable across TUs. */
-/* #define IM_VEC2_CLASS_EXTRA ... */
+/* No IM_VEC2_CLASS_EXTRA / IM_VEC4_CLASS_EXTRA here: defining them changes
+ * ImVec2/ImVec4's layout for whichever TU sees the define, and the vendored
+ * imgui .lib was built without them, so the mismatch is an ABI break rather
+ * than a compile error.
+ *
+ * (This comment used to describe interop with cglm.  cglm is not in this
+ * tree and AGENTS.md §11 forbids adding it -- jce_math is the one math
+ * library.  The mention was stale, and naming a forbidden library as if it
+ * were on hand reads as permission.) */
 
 /* NOTE: do NOT define IMGUI_USE_WCHAR32 here — the vendored imgui
  * library is built with the default 16-bit ImWchar; mismatching the

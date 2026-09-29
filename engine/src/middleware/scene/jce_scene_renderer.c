@@ -15,9 +15,13 @@
 
 #include "jce_terrain_cache.h"
 #include "jce_sr_internal.h"
+#include "jce_sr_portal.h"
+#include "jce_sr_depth_prepass.h"
 #include <SDL3/SDL.h>   /* SDL_IOStream for the JCE_DBG_ENV_LOG probe */   /* JceSceneRenderer struct + Sr* types (split foundation) */
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
+#include "middleware/animation/jce_morph_gpu.h"
+#include "renderer/jce_renderer_caps_internal.h"
 #include "renderer/jce_render_encoder.h"
 
 /* ── Entity collection ────────────────────────────────────────────── */
@@ -272,7 +276,7 @@ bool entity_enabled(JceScene *scene, JceEntity e)
 struct SrTexJob {
     const JcePakArchive *pak;
     char                 path[256];
-    int                  sampler;
+    int                  sampler;   /* address mode | JCE_TEX_SRGB */
     JceTextureCpu       *result;   /* worker → main */
 };
 
@@ -298,9 +302,7 @@ static JceAsyncRunResult sr_tex_worker(JceAsyncContext *ctx, void *arg)
 static void sr_async_task_cancel_and_release(JceAsyncTask **task)
 {
     if (!task || !*task) return;
-    (void)jce_async_task_cancel(*task);
-    jce_async_task_wait(*task);
-    jce_async_task_release(*task);
+    (void)jce_async_task_discard(*task);
     *task = NULL;
 }
 
@@ -344,12 +346,37 @@ static void sr_tex_poll(JceSceneRenderer *sr)
 
 JceTexture sr_resolve_texture(JceSceneRenderer *sr, const char *path)
 {
-    return sr_resolve_texture2(sr, path, NULL);
+    return sr_resolve_texture2_cs(sr, path, NULL, false);
+}
+
+/* sRGB-ENCODED COLOUR.  Use this one only where the consuming shader treats
+ * the sampled value as LINEAR -- s_albedo, s_emissive and the terrain layer
+ * albedos are the whole set.  Everything else (sprites, particles, UI, masks,
+ * cookies) still samples the encoded value and must keep the plain resolver;
+ * that is why the plain one, not this one, is the default. */
+JceTexture sr_resolve_texture_srgb(JceSceneRenderer *sr, const char *path)
+{
+    return sr_resolve_texture2_cs(sr, path, NULL, true);
 }
 
 JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
                                        const char *material_path,
                                        const char *mesh_path)
+{
+    return sr_resolve_texture2_cs(sr, material_path, mesh_path, false);
+}
+
+JceTexture sr_resolve_texture2_srgb(JceSceneRenderer *sr,
+                                    const char *material_path,
+                                    const char *mesh_path)
+{
+    return sr_resolve_texture2_cs(sr, material_path, mesh_path, true);
+}
+
+JceTexture sr_resolve_texture2_cs(JceSceneRenderer *sr,
+                                       const char *material_path,
+                                       const char *mesh_path,
+                                       bool srgb)
 {
     JceTexture invalid = { UINT16_MAX };
     bool have_mat  = material_path && material_path[0] != '\0';
@@ -363,10 +390,30 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
      * Caching the handle locally would pin a stale (destroyed) bgfx handle
      * and cause the texture to render BLACK after any invalidation. So we
      * always re-query through the callback in editor mode. */
-    if (have_cb)
+    if (have_cb) {
+        /* An embedder that predates the colour-space split has only the plain
+         * callback.  Falling back to it is the honest choice -- the texture
+         * arrives linear-sampled and the albedo reads over-bright, which is
+         * loud -- but say so once, naming the fix, rather than let somebody
+         * hunt a lighting bug. */
+        if (srgb) {
+            if (sr->cbs.load_texture_srgb)
+                return sr->cbs.load_texture_srgb(have_mat ? material_path : NULL,
+                                                 have_mesh ? mesh_path : NULL,
+                                                 sr->cbs.userdata);
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARN(LOG_TAG,
+                         "callbacks provide load_texture but not "
+                         "load_texture_srgb; albedo and emissive will sample "
+                         "encoded and render over-bright");
+            }
+        }
         return sr->cbs.load_texture(have_mat ? material_path : NULL,
                                     have_mesh ? mesh_path : NULL,
                                     sr->cbs.userdata);
+    }
 
     /* Runtime mode: PAK-only loader is stable; cache for performance.
      * Runtime never uses mesh_path fallback (PAK has no MTL parser). */
@@ -374,7 +421,11 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
     /* O(1) open-addressing lookup by path hash (mirrors sr_get_model). The
      * cache never deletes, so break-on-empty linear probing is correct and the
      * first empty slot on the chain is exactly the insert point on a miss. */
-    const uint32_t ph    = jce_fnv1a32_str(path);
+    /* The colour space is IN THE KEY: two entries for one path is the point,
+     * not a leak -- see the field's comment.  Folded into the hash as well as
+     * compared below, so the two variants do not collide on every probe. */
+    uint32_t ph = jce_fnv1a32_str(path);
+    if (srgb) ph = (ph * 16777619u) ^ 0x53524742u;   /* 'SRGB' */
     const uint32_t tmask = SR_TEX_HASH_SIZE - 1u;
     int free_probe_slot  = -1;
     for (uint32_t probe = 0; probe < SR_TEX_HASH_SIZE; probe++) {
@@ -384,6 +435,7 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
         int idx = enc - 1;
         if (idx >= 0 && idx < sr->tex_cache_count &&
             sr->tex_cache[idx].path_hash == ph &&
+            sr->tex_cache[idx].srgb == srgb &&
             strncmp(sr->tex_cache[idx].path, path,
                     sizeof(sr->tex_cache[idx].path)) == 0)
         {
@@ -413,7 +465,7 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
      * clamped sampler turns every tile past the first into a stretched copy of
      * the edge texel.  Meshes whose UVs stay in range are unaffected -- they
      * never sample outside the image, where the two modes differ. */
-    j->sampler = JCE_TEX_WRAP;
+    j->sampler = JCE_TEX_WRAP | (srgb ? JCE_TEX_SRGB : 0);
     snprintf(j->path, sizeof(j->path), "%s", path);
 
     JceAsyncTaskDesc desc;
@@ -432,6 +484,7 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
     snprintf(sr->tex_cache[idx].path, sizeof(sr->tex_cache[idx].path),
              "%s", path);
     sr->tex_cache[idx].path_hash = ph;
+    sr->tex_cache[idx].srgb    = srgb;
     if (free_probe_slot >= 0) sr->tex_hash[free_probe_slot] = idx + 1; /* index it */
     sr->tex_cache[idx].tex     = invalid;
     sr->tex_cache[idx].used    = true;
@@ -442,52 +495,6 @@ JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
     sr->tex_inflight++;
     return invalid;   /* white this frame; pops in when the decode lands */
 }
-
-/* ── Shader Graph custom-program cache ─────────────────────────────── */
-
-static bool sr_ends_with_ci(const char *s, const char *suffix);
-
-/* Resolve (and cache) the custom shader program declared by a material
- * file's Shader Graph reference.  Returns UINT16_MAX when the material has
- * no custom shader (the common case) or cannot be resolved.  Cached by
- * path so the .mat.json is parsed at most once per unique material. */
-JceShaderHandle sr_resolve_custom_program(JceSceneRenderer *sr,
-                                                 const char *material_path)
-{
-    JceShaderHandle none = { UINT16_MAX };
-    if (!sr || !material_path || !material_path[0]) return none;
-    if (!sr_ends_with_ci(material_path, ".mat.json")) return none;
-
-    for (int i = 0; i < sr->prog_cache_count; i++) {
-        if (sr->prog_cache[i].used &&
-            strncmp(sr->prog_cache[i].path, material_path,
-                    sizeof(sr->prog_cache[i].path)) == 0)
-            return sr->prog_cache[i].program;
-    }
-
-    /* Parse the material file; the loader links any persisted graph shader
-     * into custom_program for us.  Only the program handle is kept here. */
-    JceShaderHandle prog = none;
-    if (jce_fs_host_exists_file(material_path)) {
-        JcePbrMaterial m;
-        char tex_paths[5][256];
-        if (jce_pbr_material_load_json(material_path, &m, tex_paths) &&
-            m.custom_program != UINT16_MAX)
-            prog.idx = m.custom_program;
-    }
-
-    if (sr->prog_cache_count < SR_MAT_PROG_CACHE_MAX) {
-        int idx = sr->prog_cache_count++;
-        snprintf(sr->prog_cache[idx].path, sizeof(sr->prog_cache[idx].path),
-                 "%s", material_path);
-        sr->prog_cache[idx].program  = prog;
-        sr->prog_cache[idx].used     = true;
-        sr->prog_cache[idx].resolved = true;
-    }
-    return prog;
-}
-
-/* ── Model cache ──────────────────────────────────────────────────── */
 
 static char sr_ascii_lower(char c)
 {
@@ -524,10 +531,19 @@ static void sr_classify_entity(JceScene *scene, JceEntity e, SrEntityCull *ec)
     ec->parallel_eligible = false;
     ec->kc_enabled = entity_enabled(scene, e);
     /* Cache "is a light" so the light gather + selection skip non-light entities
-     * cheaply (a byte read) instead of re-probing 3 light components over all N. */
+     * cheaply (a byte read) instead of re-probing the light components over
+     * all N.
+     *
+     * EVERY light kind has to be in this OR.  The gather loop skips on this
+     * byte BEFORE it looks at any component, so a kind missing here is a
+     * light that parses, serialises, appears in the Inspector and reaches no
+     * pixel -- which is exactly what the first area-light measurement showed:
+     * the strip lit nothing, and lighting it with a 0.05 x 0.05 rectangle
+     * produced a byte-identical frame. */
     ec->kc_has_light = jce_scene_has_dir_light(scene, e)
                     || jce_scene_has_point_light(scene, e)
-                    || jce_scene_has_spot_light(scene, e);
+                    || jce_scene_has_spot_light(scene, e)
+                    || jce_scene_has_area_light(scene, e);
     if (!ec->kc_enabled) { ec->render_kind = SR_RK_DISABLED; return; }
     if (jce_scene_has_terrain(scene, e)            ||
         jce_scene_has_tilemap(scene, e)            ||
@@ -675,6 +691,13 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
         strcmp(sr->model_lookup_hint->path, path) == 0) {
         SrModelCache *hint = sr->model_lookup_hint;
         hint->last_used_frame = sr->model_frame;
+        /* ASKED ONCE, and asked HERE rather than at load: a model arrives by
+         * two different routes (the editor's asset-cache callback and the
+         * runtime's async upload) and probing at the point of USE covers both
+         * without either route having to remember. batch_probed is what keeps
+         * it to once. */
+        if (hint->model && !hint->batch_probed)
+            sr_probe_batch_members(sr, hint, path);
         return hint->failed ? NULL : hint;
     }
 
@@ -701,6 +724,8 @@ SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
             /* Pending: model is still NULL → callers skip until sr_model_poll
              * uploads it.  Failed: never retry. */
             sr->model_lookup_hint = e;
+            if (e->model && !e->batch_probed)
+                sr_probe_batch_members(sr, e, path);
             return e->failed ? NULL : e;
         }
     }
@@ -1018,52 +1043,6 @@ bool sr_resolve_primary_dir_light(JceSceneRenderer *sr,
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
-/* ── Material registry (Phase 2) ──────────────────────────────────────
- * Per-frame registry mapping a material_key → texture/uniform snapshot.
- * Built during scene_renderer's mesh walk, consumed by sr_bind_material_cb
- * once jce_render_queue starts a new material run. Wired into the queue
- * in Phase 3. */
-
-uint32_t sr_compute_material_key(const JcePbrMaterial *pbr,
-                                        bool is_terrain,
-                                        int terrain_slot,
-                                        const bgfx_texture_handle_t *terrain_layer_tex)
-{
-    uint32_t h = JCE_FNV1A32_INIT;
-    /* Texture handles (idx is enough — invalid = UINT16_MAX). */
-    h = jce_fnv1a32_append(h, &pbr->albedo_map.idx,             sizeof(uint16_t));
-    h = jce_fnv1a32_append(h, &pbr->metallic_roughness_map.idx, sizeof(uint16_t));
-    h = jce_fnv1a32_append(h, &pbr->normal_map.idx,             sizeof(uint16_t));
-    h = jce_fnv1a32_append(h, &pbr->ao_map.idx,                 sizeof(uint16_t));
-    h = jce_fnv1a32_append(h, &pbr->emissive_map.idx,           sizeof(uint16_t));
-    /* Factors. */
-    h = jce_fnv1a32_append(h, pbr->base_color_factor, sizeof(pbr->base_color_factor));
-    h = jce_fnv1a32_append(h, &pbr->metallic_factor,  sizeof(float));
-    h = jce_fnv1a32_append(h, &pbr->roughness_factor, sizeof(float));
-    h = jce_fnv1a32_append(h, pbr->emissive_factor,   sizeof(pbr->emissive_factor));
-    h = jce_fnv1a32_append(h, &pbr->normal_scale,     sizeof(float));
-    h = jce_fnv1a32_append(h, &pbr->ao_strength,      sizeof(float));
-    /* State. */
-    uint32_t am = (uint32_t)pbr->alpha_mode;
-    h = jce_fnv1a32_append(h, &am,                  sizeof(am));
-    h = jce_fnv1a32_append(h, &pbr->alpha_cutoff,   sizeof(float));
-    uint8_t ds = pbr->double_sided ? 1u : 0u;
-    h = jce_fnv1a32_append(h, &ds,                  sizeof(ds));
-    /* Terrain pseudo-fields (slot ensures distinct splat/layer textures). */
-    uint8_t it = is_terrain ? 1u : 0u;
-    h = jce_fnv1a32_append(h, &it, sizeof(it));
-    int32_t ts = (int32_t)terrain_slot;
-    h = jce_fnv1a32_append(h, &ts, sizeof(ts));
-    /* Terrain layer texture handles also folded in so two terrain entities
-     * with the same slot but different runtime layer textures still split
-     * into separate batches (rare today, but keeps key correctness). */
-    if (terrain_layer_tex) {
-        for (int li = 0; li < 4; li++)
-            h = jce_fnv1a32_append(h, &terrain_layer_tex[li].idx, sizeof(uint16_t));
-    }
-    return h ? h : 1u;
-}
-
 /* Resets the per-frame registry. Call at the top of each sr_render. The hash
  * index is invalidated in O(1) by bumping the generation stamp (entries whose
  * mat_hash_stamp != mat_hash_gen read as empty) — no per-frame memset. */
@@ -1119,6 +1098,22 @@ static void sr_mat_hash_insert(JceSceneRenderer *sr, uint32_t key, int32_t idx)
  * resolved key (== input on success). On overflow returns 0 and emits
  * a one-shot warning per renderer; caller treats key=0 as "skip queue,
  * submit directly" (Phase 3 fallback). */
+/* THE KEYWORD BITS OF A REGISTERED MATERIAL, by its key.
+ *
+ * The instanced primitive batch knows a material KEY, not a material -- it is
+ * keyed by one by construction -- and the keyword axis needs the material.
+ * The registry already holds it, so this reads it back rather than having the
+ * batch carry a second copy that could disagree with the one the bind uses.
+ * 0 for an unknown key, which is what a draw with no registered material got
+ * before any of this existed. */
+uint32_t sr_material_shader_keys(const JceSceneRenderer *sr, uint32_t key)
+{
+    if (!sr) return 0u;
+    const int32_t idx = sr_mat_hash_find(sr, key);
+    if (idx < 0) return 0u;
+    return jce_pbr_material_shader_keys(&sr->mat_cache[idx].pbr);
+}
+
 uint32_t sr_register_material(JceSceneRenderer *sr,
                                      uint32_t key,
                                      const JcePbrMaterial *pbr,
@@ -1126,7 +1121,8 @@ uint32_t sr_register_material(JceSceneRenderer *sr,
                                      int terrain_slot,
                                      float terrain_tile_scale,
                                      bool terrain_splat_enabled,
-                                     const bgfx_texture_handle_t *terrain_layer_tex)
+                                     const bgfx_texture_handle_t *terrain_layer_tex,
+                                     uint32_t receiver_layer)
 {
     if (sr_mat_hash_find(sr, key) >= 0) return key;  /* O(1) dedup */
     if (sr->mat_count >= SR_MAT_CACHE_MAX) {
@@ -1146,6 +1142,7 @@ uint32_t sr_register_material(JceSceneRenderer *sr,
     e->terrain_slot          = terrain_slot;
     e->terrain_tile_scale    = terrain_tile_scale;
     e->terrain_splat_enabled = terrain_splat_enabled;
+    e->receiver_layer        = receiver_layer & 31u;
     if (terrain_layer_tex) {
         for (int li = 0; li < 4; li++) e->terrain_layer_tex[li] = terrain_layer_tex[li];
     } else {
@@ -1320,13 +1317,19 @@ void sr_bind_material_overrides(uint32_t material_key, void *user,
      * sampled real lights and everything after rendered unlit). The env
      * packs once per frame; this call mostly replays cached bytes. */
     if (sr->light_env)
-        jce_light_env_apply(sr->light_env, sr->renderer);
+        jce_light_env_apply_for_layer(sr->light_env, sr->renderer,
+                                      e->receiver_layer);
 
     sr_bind_frame_shadow_state(sr);
 
     /* IBL. */
     float ibl_params[4] = {
-        0.0f, 4.0f, 0.0f,
+        /* .z = the LDR output gamma exponent, from the ONE authority that also
+         * decides the hardware sRGB decode -- 1/2.2 in linear colour space,
+         * 1.0 in gamma, where the pow is a no-op because nothing decoded on
+         * the way in either. */
+        0.0f, 4.0f,
+        jce_texture_colour_space() ? (1.0f / 2.2f) : 1.0f,
         sr->postfx_tonemap_active ? 1.0f : 0.0f
     };
     bool ibl_bound = false;
@@ -1424,19 +1427,27 @@ void sr_bind_material_cb(uint32_t material_key, void *user)
 void sr_inline_bind_pbr_global_overrides(
     JceSceneRenderer *sr, const JcePbrMaterial *pbr, uint16_t view_id,
     JceScene *scene, EntityList *list, JceTexture albedo_override,
-    JceTexture emissive_override)
+    JceTexture emissive_override, uint32_t receiver_layer)
 {
     (void)scene;
     (void)list;
 
     jce_pbr_material_bind_texture_overrides(
         pbr, sr->renderer, view_id, albedo_override, emissive_override);
-    /* Re-apply lights per-entity — see sr_bind_material_cb for rationale. */
+    /* Re-apply lights per-entity — see sr_bind_material_cb for rationale.
+     * Per-entity is also what makes rendering layers work here: this path has
+     * one submit per object, so the layer is simply the one passed in. */
     if (sr->light_env)
-        jce_light_env_apply(sr->light_env, sr->renderer);
+        jce_light_env_apply_for_layer(sr->light_env, sr->renderer,
+                                      receiver_layer);
     sr_bind_frame_shadow_state(sr);
     float ibl_params[4] = {
-        0.0f, 4.0f, 0.0f,
+        /* .z = the LDR output gamma exponent, from the ONE authority that also
+         * decides the hardware sRGB decode -- 1/2.2 in linear colour space,
+         * 1.0 in gamma, where the pow is a no-op because nothing decoded on
+         * the way in either. */
+        0.0f, 4.0f,
+        jce_texture_colour_space() ? (1.0f / 2.2f) : 1.0f,
         sr->postfx_tonemap_active ? 1.0f : 0.0f
     };
     bool ibl_bound = false;
@@ -1481,11 +1492,12 @@ void sr_inline_bind_pbr_global_overrides(
 void sr_inline_bind_pbr_global(JceSceneRenderer *sr,
                                const JcePbrMaterial *pbr,
                                uint16_t view_id,
-                               JceScene *scene, EntityList *list)
+                               JceScene *scene, EntityList *list,
+                               uint32_t receiver_layer)
 {
     sr_inline_bind_pbr_global_overrides(
         sr, pbr, view_id, scene, list,
-        JCE_TEXTURE_INVALID, JCE_TEXTURE_INVALID);
+        JCE_TEXTURE_INVALID, JCE_TEXTURE_INVALID, receiver_layer);
 }
 
 JceSceneRenderConfig jce_scene_render_config_default(void)
@@ -1621,12 +1633,13 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_csm_splits.idx    = UINT16_MAX;
     sr->u_csm_params.idx    = UINT16_MAX;
     sr->u_csm_bias_scales.idx = UINT16_MAX;
+    sr->u_csm_penumbra.idx    = UINT16_MAX;
     sr->u_shadow_quality.idx  = UINT16_MAX;
     sr->brdf_lut.idx        = UINT16_MAX;
     sr->u_ibl_irradiance.idx = UINT16_MAX;
     sr->u_ibl_prefilter.idx  = UINT16_MAX;
     sr->u_ibl_brdf_lut.idx   = UINT16_MAX;
-    sr->u_ibl_params.idx     = UINT16_MAX;
+    sr->u_ibl_params.idx     = sr->u_gi_probe_box.idx = UINT16_MAX;
     sr->u_sh9.idx            = UINT16_MAX;
     sr->u_gi_params.idx      = UINT16_MAX;
     sr->u_look_wrap.idx      = UINT16_MAX;
@@ -1674,6 +1687,15 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->water_ripple_tex.idx  = UINT16_MAX;
     sr->s_water_disp.idx          = UINT16_MAX;
     sr->s_water_data.idx          = UINT16_MAX;
+    /* AND THE PLANAR TRIO.  bgfx handle 0 is a VALID handle, so a calloc'd
+     * handle passes BGFX_HANDLE_IS_VALID and the lazy `if (!valid) create`
+     * guard never fires -- the uniform is never made and every set writes to
+     * whatever owns handle 0.  Measured: the water's planar branch stayed
+     * false with the C side setting it to 1.0, through three probes.  Every
+     * water uniform above is here for the same reason. */
+    sr->s_water_planar.idx        = UINT16_MAX;
+    sr->u_water_planar.idx        = UINT16_MAX;
+    sr->u_water_planar_vp.idx     = UINT16_MAX;
     /* Both cascade textures, not just the primary.  fft2_tex was missing from
      * this loop, which only stayed harmless while it was allocated
      * unconditionally next to fft_tex; now that it is created ONLY when the
@@ -1935,6 +1957,8 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             BGFX_UNIFORM_TYPE_VEC4, 1);
         sr->u_csm_bias_scales = bgfx_create_uniform("u_csmBiasScales",
             BGFX_UNIFORM_TYPE_VEC4, 1);
+        sr->u_csm_penumbra    = bgfx_create_uniform("u_csmPenumbra",
+            BGFX_UNIFORM_TYPE_VEC4, 1);
         /* Dual shadow-map dynamic-atlas params: {tiles=2, 1/atlas_size,
          * enabled, 0}.  Uploaded in sr_bind_frame_shadow_state; the shader
          * min()s the dynamic tile into sample_csm_shadow when enabled>0.5. */
@@ -1997,14 +2021,13 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         "Forward+ clustered lighting (opt-in; lifts the 16-point-light cap, "
         "drops per-spot IES). Default off = brute-force path.");
 
-    /* JCE_FORWARDPLUS=1 env toggle: flips r.forwardplus on at startup (mirror of
-     * JCE_GPU_SCENE) so a headless run can A/B the clustered light path — it
-     * delivers per-light params via the s_cluster data texture instead of the
-     * per-draw u_pointLights/u_spotLights uniform arrays (the SRP-Batcher-
-     * equivalent for many-light scenes). */
-    if (sr->cv_forwardplus && getenv("JCE_FORWARDPLUS")) {
+    /* JCE_FORWARDPLUS: any non-empty, non-"0" value, the same rule as
+     * JCE_GPU_SCENE.  It tested only that the variable EXISTS, so =0 turned
+     * clustered lighting ON -- the opposite of the toggle it mirrors. */
+    const char *fp_env = sr->cv_forwardplus ? getenv("JCE_FORWARDPLUS") : NULL;
+    if (fp_env && fp_env[0] && fp_env[0] != '0') {
         jce_cvar_set_bool(sr->cv_forwardplus, true);
-        LOG_INFO(LOG_TAG, "[init] JCE_FORWARDPLUS set -> r.forwardplus ON (clustered lighting)");
+        LOG_INFO(LOG_TAG, "[init] JCE_FORWARDPLUS set -> r.forwardplus ON");
     }
 
     /* r.point_shadows console cvar — OPT-IN omnidirectional point-light cube
@@ -2126,18 +2149,18 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         else if (rcas_env && rcas_env[0] == '0')
             jce_cvar_set_int(sr->cv_upscaler, 0);
     }
-    /* GPUScene helper: loads cs_cull_frustum from the engine shader pak (with
-     * the embedded-engine-pak fallback).  Returns a no-op handle on devices
-     * without compute — is_supported() then gates the GPU path off. */
+    /* One GPUScene per colour pass + per CSM cascade (own cull buffers; see
+     * jce_sr_internal.h).  Reported once — see jce_gpu_scene_create(). */
     sr->gpu_scene = jce_gpu_scene_create(sr->pak, jce_allocator_default());
     sr->gpu_driven_frame = false;
-    /* One dedicated GPUScene per CSM cascade for GPU-driven shadow culling — each
-     * needs its own cull buffers (separate light frustum + deferred-submit
-     * aliasing; see jce_sr_internal.h).  All share the color pass's compute
-     * views (base+3 reset / base+9 cull). */
     for (uint32_t _c = 0; _c < JCE_CSM_MAX_CASCADES; _c++)
         sr->gpu_shadow_scene[_c] =
             jce_gpu_scene_create(sr->pak, jce_allocator_default());
+    LOG_SUCCESS(LOG_TAG, "GPU-driven scene: %d instances, cull %s, %s%s",
+                1 + JCE_CSM_MAX_CASCADES,
+                jce_gpu_scene_is_supported(sr->gpu_scene) ? "ready" : "off",
+                jce_gpu_scene_is_indirect(sr->gpu_scene) ? "indirect" : "1:1",
+                jce_gpu_scene_hiz_kind(sr->gpu_scene));
 
     LOG_INFO(LOG_TAG, "[init] IBL uniforms + BRDF LUT");
     /* IBL uniforms + BRDF LUT. */
@@ -2148,13 +2171,15 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_ibl_brdf_lut   = bgfx_create_uniform("s_brdfLUT",
         BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sr->u_ibl_params     = bgfx_create_uniform("u_iblParams",
-        BGFX_UNIFORM_TYPE_VEC4, 1);
+        BGFX_UNIFORM_TYPE_VEC4, 1);  sr->u_gi_probe_box   = bgfx_create_uniform("u_giProbeBox", BGFX_UNIFORM_TYPE_VEC4, 2);
 
     /* Baked GI: SH9 ambient (9 vec4 RGB coeffs) + GI params. */
     sr->u_sh9       = bgfx_create_uniform("u_sh9", BGFX_UNIFORM_TYPE_VEC4, 9);
     sr->u_gi_params = bgfx_create_uniform("u_giParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_ssao_params = bgfx_create_uniform("u_ssaoParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_gbuffer_mat = bgfx_create_uniform("u_gbufferMat", BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_gbuffer_albedo = bgfx_create_uniform("u_gbufferAlbedo",
+                                               BGFX_UNIFORM_TYPE_VEC4, 1);
 
     /* Look Profile uniforms (plan 02). Created up front so the funnel
      * (sr_bind_baked_gi) always has valid handles; neutral snapshot when off. */
@@ -2200,13 +2225,14 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_boneTexParams = bgfx_create_uniform("u_boneTexParams", BGFX_UNIFORM_TYPE_VEC4,    1);
     {
         /* The feature needs to SAMPLE an RGBA32F texture in the VERTEX shader
-         * (the bone palette).  BGFX_CAPS_FORMAT_TEXTURE_VERTEX for RGBA32F is
-         * exactly that capability; absent on low tiers => feature stays off and
-         * the per-character skinned path runs (charter degrade). */
-        const bgfx_caps_t *vt_caps = bgfx_get_caps();
-        sr->crowd_inst_supported = vt_caps &&
-            (vt_caps->formats[BGFX_TEXTURE_FORMAT_RGBA32F] &
-             BGFX_CAPS_FORMAT_TEXTURE_VERTEX) != 0;
+         * (the bone palette).  The comment here used to say a clear
+         * BGFX_CAPS_FORMAT_TEXTURE_VERTEX meant "low tier"; it does not.
+         * bgfx's OpenGL backend never sets that bit for ANY format, so this
+         * read left crowd instancing permanently off on OpenGL and the
+         * per-character skinned path running, on hardware that supports it
+         * outright. */
+        sr->crowd_inst_supported =
+            jce_gpu_vertex_fetch_usable(JCE_GPU_VFETCH_FMT_RGBA32F);
     }
 
     /* Terrain shader bindings (lazy: created here so submit-time has
@@ -2325,9 +2351,14 @@ struct JceModel *jce_scene_renderer_get_model(
 void jce_scene_renderer_destroy(JceSceneRenderer *sr)
 {
     if (!sr) return;
-
-    /* Per-entity animation instances (players reference, but don't own, the
-       shared skeletons in model_cache — destroy them before the models). */
+    /* The GPU blendshape module's program, uniforms and per-model device
+     * buffers.  HERE and not in jce_renderer_destroy, because it lives in
+     * middleware and the renderer may not include middleware -- the layer
+     * rule, not a preference.  Before the instance teardown below, which is
+     * where the per-instance output buffers go. */
+    jce_morph_gpu_shutdown();
+    sr_portal_free(sr); sr_probe_set_destroy(sr->lp_set); sr->lp_set = NULL;  /* portal occluders + baked probe set */
+    /* Players borrow model_cache skeletons — destroy the instances first. */
     for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
         SrAnimInstance *a = &sr->anim_inst[i];
         if (a->used && a->player) jce_anim_player_destroy(a->player);
@@ -2337,14 +2368,13 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
         if (a->avatar_mask) { jce_avatar_mask_unload(a->avatar_mask); a->avatar_mask = NULL; }
         for (int li = 0; li < SR_AVATAR_MAX_LAYERS; li++)
             if (a->layer_mask[li]) { jce_avatar_mask_unload(a->layer_mask[li]); a->layer_mask[li] = NULL; }
-        /* Retarget map borrows skeletons in model_cache — free before the
-           models (mirrors the player teardown ordering above). */
+        /* Retarget map borrows model_cache skeletons — free before the models. */
         if (a->retarget_map) { jce_anim_retarget_map_destroy(a->retarget_map); a->retarget_map = NULL; }
-        /* Morph VBs are owned by the instance — destroy before the shared
-           model cache is torn down (handle-leak guard, 3rd lifecycle site).
-           ONLY for slots that were ever initialized: an untouched slot's
-           morph_vb[] is zero-initialized, and handle idx==0 is a VALID bgfx
-           handle (someone else's buffer) — freeing all 256x8 untouched slots
+        /* Morph VBs are owned by the instance — destroy before the shared model
+           cache is torn down (handle-leak guard, 3rd lifecycle site).  ONLY for
+           slots that were ever initialized: an untouched slot's morph_vb[] is
+           zero-initialized, and handle idx==0 is a VALID bgfx handle
+           (someone else's buffer) — freeing all 256x8 untouched slots
            destroyed dynamic VB 0 two thousand times per shutdown, corrupting
            bgfx's handle table (debug bgfx: "Invalid handle.
            destroyDynamicVertexBuffer handle: 0" x2048). */
@@ -2504,6 +2534,10 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
         }
         if (!e->used) continue;
         if (e->model)  jce_model_destroy(e->model);
+        if (e->batch_members) { JCE_FREE(e->batch_members);
+                                e->batch_members = NULL;
+                                e->batch_member_count = 0;
+                                e->batch_probed = false; }
         e->used = false;
     }
     sr->model_inflight = 0;
@@ -2537,6 +2571,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
         /* The JceTerrain is borrowed from the scene's terrain cache. */
         sr_terrain_slot_free(sr, i);
     }
+    sr_terrain_material_cache_destroy(sr);
     /* Tilemap cache (chunk VBs + CPU assets) + shared IB/sampler. */
     for (int i = 0; i < SR_TILEMAP_SLOT_MAX; i++)
         sr_tilemap_free_slot(sr, i);
@@ -2609,10 +2644,10 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer2)) bgfx_destroy_uniform(sr->s_terrain_layer2);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer0)) bgfx_destroy_uniform(sr->s_terrain_layer0);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer3)) bgfx_destroy_uniform(sr->s_terrain_layer3);
-
     if (BGFX_HANDLE_IS_VALID(sr->white_tex))      bgfx_destroy_texture(sr->white_tex);
     if (BGFX_HANDLE_IS_VALID(sr->checker_tex))    bgfx_destroy_texture(sr->checker_tex);
     if (BGFX_HANDLE_IS_VALID(sr->dummy_cube))     bgfx_destroy_texture(sr->dummy_cube);
+    sr_cloud_atlas_shutdown(sr);
     if (BGFX_HANDLE_IS_VALID(sr->prog_sky))       bgfx_destroy_program(sr->prog_sky);
     if (BGFX_HANDLE_IS_VALID(sr->u_sky_colors))   bgfx_destroy_uniform(sr->u_sky_colors);
     if (BGFX_HANDLE_IS_VALID(sr->u_sky_params))   bgfx_destroy_uniform(sr->u_sky_params);
@@ -2665,6 +2700,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_splits))     bgfx_destroy_uniform(sr->u_csm_splits);
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_params))     bgfx_destroy_uniform(sr->u_csm_params);
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_bias_scales))bgfx_destroy_uniform(sr->u_csm_bias_scales);
+    if (BGFX_HANDLE_IS_VALID(sr->u_csm_penumbra))   bgfx_destroy_uniform(sr->u_csm_penumbra);
     if (BGFX_HANDLE_IS_VALID(sr->u_shadow_quality)) bgfx_destroy_uniform(sr->u_shadow_quality);
 
     if (sr->light_env) jce_light_env_destroy(sr->light_env);
@@ -2691,6 +2727,8 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     JCE_FREE(sr->cloud_shadow_bytes);
     if (sr->ssao)      jce_ssao_destroy(sr->ssao);
     if (sr->ssr)       jce_ssr_destroy(sr->ssr);
+    if (sr->ssgi)      jce_ssgi_destroy(sr->ssgi);
+    if (sr->planar)    jce_planar_reflection_destroy(sr->planar);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer)) bgfx_destroy_program(sr->prog_gbuffer);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel)) bgfx_destroy_program(sr->prog_gbuffer_vel);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel_skinned)) bgfx_destroy_program(sr->prog_gbuffer_vel_skinned);
@@ -2811,8 +2849,10 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
  * treated as dynamic and recomputed. */
 
 /* True when this entity OR any ancestor carries a runtime-moved component, so it
- * must NOT be put in the persistent static cache. */
-static bool sr_entity_is_dynamic(JceScene *scene, JceEntity e)
+ * must NOT be put in the persistent static cache.  PUBLIC (jce_scene.h): static
+ * batching has to ask exactly the same question, and two definitions of
+ * "static" is how a batch swallows an object that then cannot move. */
+bool jce_scene_entity_is_dynamic(JceScene *scene, JceEntity e)
 {
     JceEntity cur = e;
     for (int depth = 0; depth < 32 && cur != JCE_ENTITY_INVALID; depth++) {
@@ -2981,6 +3021,7 @@ static void sr_ecull_copy_hit(JceSceneRenderer *sr, JceScene *scene,
             hit->kc_has_light = sr->ecull[eci].kc_has_light;
         }
     }
+    sr->ecull[eci].layer = jce_scene_get_entity_layer(scene, e);
     sr->ecull_light_byte[eci] = sr->ecull[eci].kc_has_light ? 1u : 0u;
     sr->ecull_fast_byte[eci]  = SR_RK_IS_FAST(sr->ecull[eci].render_kind) ? 1u : 0u;
 }
@@ -3017,6 +3058,7 @@ static void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
      * has_* probes.  Dynamics (never stored) re-run this each frame as before. */
     if (sr->kindcache_on)
         sr_classify_entity(scene, e, &sr->ecull[eci]);
+    sr->ecull[eci].layer = jce_scene_get_entity_layer(scene, e);
     sr->ecull_light_byte[eci] = sr->ecull[eci].kc_has_light ? 1u : 0u;
     sr->ecull_fast_byte[eci]  = SR_RK_IS_FAST(sr->ecull[eci].render_kind) ? 1u : 0u;
 
@@ -3024,7 +3066,7 @@ static void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
      * character / skeletal / vehicle / wheel / softbody on the entity or any
      * ancestor) are mutated in place by the runtime without an epoch bump, so
      * they are never cached and always take the recompute path above. */
-    bool e_is_dynamic = sr_entity_is_dynamic(scene, e);
+    bool e_is_dynamic = jce_scene_entity_is_dynamic(scene, e);
     if (wcache_on && !e_is_dynamic)
         sr_wcache_store(sr, (uint32_t)e, &sr->ecull[eci],
                         &sr->ecull_world[eci], struct_epoch, e_gen);
@@ -3363,6 +3405,14 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
 {
     if (!sr || !scene) return view_id_base;
     JCE_PROFILE_ZONE_N("SceneRenderer::Render");
+    /* Viewport for this frame.  Same fallback the SSAO/shadow paths use, so a
+     * config that omits it behaves as before. */
+    sr->last_vp_w = (config && config->viewport_width)
+                        ? config->viewport_width : 1920u;
+    sr->last_vp_h = (config && config->viewport_height)
+                        ? config->viewport_height : 1080u;
+    /* One source for every pass this frame; see the field's comment. */
+    sr->frame_culling_mask = config ? config->camera_culling_mask : 0u;
 
     uint64_t _t0_sr = jce_time_perf_counter();
     uint64_t _t0_head = _t0_sr;   /* sr_head: function top -> collect */
@@ -3584,9 +3634,26 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             cascades < JCE_CSM_MAX_CASCADES ? cascades : JCE_CSM_MAX_CASCADES;
     }
 
-    sr_apply_view_order(view_id_base, cfg, sr->csm_cascade_count,
-                        sr->gpu_driven_frame || sr->foliage_gpu_cull_frame,
-                        sr->underwater_possible);
+    /* A REDUCED PASS DOES NOT REORDER VIEWS, and this is the difference
+     * between a planar reflection and a black viewport.
+     *
+     * bgfx_set_view_order(first, count, order) overwrites the CONTIGUOUS
+     * window [first, first+count) -- the comment in
+     * jce_scene_renderer_view_order.c records what that cost the last time it
+     * was got wrong.  A reduced pass is given a base ABOVE every scene base
+     * (238, so its result sorts after the colour pass that samples it), and
+     * this renderer's span reaches base+116, which from there is past the 255
+     * views bgfx has.  The window then wraps over the ids the MAIN render
+     * just claimed and the viewport composites nothing.
+     *
+     * Measured: the capture harness's blank-frame guard caught it, and
+     * ablating this one call is what isolated it.  A reduced pass draws into
+     * one view and needs no ordering at all. */
+    if (!cfg->reduced_pass) {
+        sr_apply_view_order(view_id_base, cfg, sr->csm_cascade_count,
+                            sr->gpu_driven_frame || sr->foliage_gpu_cull_frame,
+                            sr->underwater_possible);
+    }
 
     /* Ensure wireframe is OFF before sky draws (sky's fullscreen quad must
      * render solid). The previous frame may have left it ON. Editor mode
@@ -3619,7 +3686,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * sky + lighting passes") is strengthened rather than weakened.
      * No-op (and releases any override) when disabled. */
     if (scene_rendering)
-        sr_drive_time_of_day(sr, scene_rendering, dt_sec);
+        sr_drive_time_of_day(sr, scene, scene_rendering);
 
     /* Scene rendering settings own PostFX defaults; render config remains
      * the fallback for callers that render scenes without authored settings. */
@@ -3646,18 +3713,9 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         active_postfx.chromatic_strength =
             scene_rendering->chromatic_strength;
 
-        /* Look Profile → postfx data hand-off (plan 06 consumes tonemap_op /
-         * bloom_knee / lut_path / lut_strength).  Carried here so the postfx
-         * stomp has a single authoritative source; no behavioral change yet
-         * (plan 06 wires jce_postfx_set_* against these).
-         * NOTE: active_postfx.tonemap_op / .bloom_knee are NOT yet assigned here
-         * because JcePostFXParams does not yet have those fields (plan 06 adds
-         * them).  Plan 06 should uncomment the two lines below after extending
-         * JcePostFXParams:
-         *   active_postfx.tonemap_op  = scene_rendering->tonemap_op;
-         *   active_postfx.bloom_knee  = scene_rendering->bloom_knee;
-         * The authoritative source remains scene_rendering->tonemap_op which
-         * plan 06 reads directly. */
+        /* Look Profile -> postfx hand-off.  tonemap_op / bloom_knee /
+         * lut_path / lut_strength are pushed as pipeline SETTERS below, not
+         * as JcePostFXParams fields; scene_rendering stays the authority. */
 
         if (sr->postfx_pipeline) {
             /* NOTE(WebGL2): this stomp briefly force-disabled postfx on GLES
@@ -3689,6 +3747,35 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
              * quality (quality-gated), and resolve the 3D LUT on path change. */
             jce_postfx_set_tonemap_op(sr->postfx_pipeline, scene_rendering->tonemap_op);
             jce_postfx_set_bloom_knee(sr->postfx_pipeline, scene_rendering->bloom_knee);
+            /* Auto exposure: the authored gate and the authored law tuning,
+             * every frame, from the same single source as everything above. */
+            jce_postfx_set_auto_exposure(sr->postfx_pipeline,
+                                         scene_rendering->auto_exposure,
+                                         &scene_rendering->auto_exposure_desc);
+            /* Motion blur: the gate is the render-pipeline flag three editor
+             * UIs have been writing all along; length via the one accessor
+             * that resolves "0 = engine default". */
+            jce_postfx_set_motion_blur(sr->postfx_pipeline,
+                jce_render_pipeline_is_feature_enabled("motion_blur"),
+                jce_render_pipeline_motion_blur_intensity());
+            /* Depth of field: the scene's rack focus, projected HERE because
+             * only this side knows the camera.  Aspect does not enter a
+             * perspective matrix's z/w, so the exact value below cannot change
+             * the depth edges -- it is passed because jce_camera_proj takes
+             * one, not because the answer depends on it. */
+            {
+                const float _asp = (cfg->fog_rt_height > 0)
+                    ? (float)cfg->fog_rt_width / (float)cfg->fog_rt_height : 1.0f;
+                const jce_mat4 _pj = camera
+                    ? jce_camera_proj(camera, _asp, sr->homogeneous_depth)
+                    : jce_m4_identity();
+                jce_postfx_set_depth_of_field(sr->postfx_pipeline,
+                    scene_rendering->dof_enabled,
+                    scene_rendering->dof_focus_distance,
+                    scene_rendering->dof_focus_range,
+                    scene_rendering->dof_max_coc,
+                    camera ? _pj.raw[0] : NULL);
+            }
             {
                 JceRenderPipelineDesc _rp; jce_render_pipeline_get(&_rp);
                 /* HIGH/ULTRA → 5-mip pyramid; LOW/MID → 0 (legacy single-mip). */
@@ -3769,6 +3856,32 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         JceRenderPipelineDesc rp_desc;
         jce_render_pipeline_get(&rp_desc);
         sr->shadow_filter_tier = (float)rp_desc.shadow_filter_quality;
+        sr->sun_soft_deg_frame = 0.0f;
+
+        /* The SCENE says what kind of shadow edge it wants; the pipeline says
+         * how many taps that edge may cost.  Two axes, composed here, once per
+         * frame -- and this is the composition that did not exist: the scene's
+         * mode round-tripped through JSON and the editor combo while nothing
+         * in the renderer ever read it.
+         *
+         *   OFF   one hard tap, whatever the pipeline can afford
+         *   PCF   the pipeline's tier, fixed radius (the historical behaviour,
+         *         and what every scene saved before this loads to)
+         *   PCSS  the pipeline's tier plus a penumbra sized by the sun
+         *
+         * No scene settings at all (a scene constructed in code, or the
+         * bootstrap before one is loaded) leaves both at the pipeline's
+         * values, which is byte-identical to the behaviour before this. */
+        if (scene_rendering) {
+            const int soft = scene_rendering->soft_shadow_mode;
+            if (soft == JCE_SCENE_SOFT_SHADOW_OFF) {
+                sr->shadow_filter_tier = 0.0f;
+            } else if (soft == JCE_SCENE_SOFT_SHADOW_PCSS) {
+                sr->sun_soft_deg_frame = jce_render_pipeline_sun_soft_size();
+            }
+        } else {
+            sr->sun_soft_deg_frame = jce_render_pipeline_sun_soft_size();
+        }
         /* Toon gate (CANON sr_toon_allowed): quality>=HIGH AND the pbr_toon
          * program loaded.  LOW/MID or an old pak => standard skinned PBR. */
         JceShaderHandle toon_prog = jce_renderer_get_program_pbr_skinned_toon(sr->renderer);
@@ -4272,6 +4385,12 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
        shadow pass records draws, caching each world-bone palette so the
        shadow and color passes share the identical pose (no double-advance). */
     sr_update_skinned_anims(sr, scene, &list, dt_sec, camera);
+
+    /* Bone attachments: put every attached entity where its bone now is.
+     * HERE and not in the runtime -- the palette this reads was written on
+     * the line above, and a runtime pass would read last frame's, so a sword
+     * would trail the hand holding it exactly while it is being swung. */
+    sr_update_bone_attachments(sr, scene, &list);
 
     /* GPU crowd instancing (JCE_CROWD_INSTANCE, opt-in): pack every resident
      * skinned palette into the shared per-frame bone texture right after the
@@ -4900,10 +5019,21 @@ ecull_build_done:;
      * screen-UV AO sampling. */
     sr->ssao_active_frame = false;
     sr->ssr_active_frame  = false;
+    /* SSGI belongs in this list for the same reason the other three do, and it
+     * was the one missing from it.  It was only ever cleared in the release
+     * block below, which needs `!want_ssgi` -- so a frame that WANTED SSGI and
+     * failed to get it (jce_ssgi_create returned NULL: no shader in the pak, no
+     * RT) left the flag at last frame's `true`, and the composite then added a
+     * render target nothing had written this frame. */
+    sr->ssgi_active_frame = false;
     sr->velocity_valid_frame = false;
     sr->depth_prepass_frame  = false;
     {
-        bool want_ssao = scene_rendering && scene_rendering->ssao_enabled &&
+        /* A reduced pass renders colour and nothing else -- see
+         * JceSceneRenderConfig::reduced_pass for why this is about shared
+         * STATE and view arithmetic, not about looks. */
+        const bool reduced = cfg->reduced_pass;
+        bool want_ssao = !reduced && scene_rendering && scene_rendering->ssao_enabled &&
                          jce_render_pipeline_is_feature_enabled("ssao");
         /* JCE_FORCE_SSAO: force the depth pre-pass on even when the scene's
          * render-settings are bypassed (e.g. JCE_DBG_VISTA) — needed to A/B the
@@ -4912,20 +5042,29 @@ ecull_build_done:;
             static int s_force_ssao = -1;
             if (s_force_ssao < 0) { const char *v = getenv("JCE_FORCE_SSAO");
                                     s_force_ssao = (v && v[0] && v[0] != '0') ? 1 : 0; }
-            if (s_force_ssao) want_ssao = true;
+            /* ...but never in a reduced pass: JCE_FORCE_SSAO exists to A/B the
+             * MAIN view headless, and honouring it here would put the second
+             * render's depth into the target the main one reads. */
+            if (s_force_ssao && !reduced) want_ssao = true;
         }
-        bool want_ssr  = scene_rendering && scene_rendering->ssr_enabled &&
+        bool want_ssr  = !reduced && scene_rendering && scene_rendering->ssr_enabled &&
                          jce_render_pipeline_is_feature_enabled("ssr") &&
+                         cfg->ssr_color_tex_handle != UINT16_MAX;
+        /* SSGI reads the same lit colour handle SSR does, for the same reason:
+         * it is this frame's shaded output, which is the only place the bounce
+         * radiance exists. */
+        bool want_ssgi = !reduced && scene_rendering && scene_rendering->ssgi_enabled &&
+                         jce_render_pipeline_is_feature_enabled("ssgi") &&
                          cfg->ssr_color_tex_handle != UINT16_MAX;
         /* TAA per-object motion: the caller requested a velocity buffer this
          * frame (jce_scene_renderer_set_taa_velocity_enabled).  Extend the
          * pre-pass gate so the depth/G-buffer pass runs (producing velocity)
          * even when SSAO/SSR are both off. */
-        bool want_velocity = sr->taa_want_velocity;
+        bool want_velocity = !reduced && sr->taa_want_velocity;
         /* Water is the fourth requester of this pass, on equal footing with
          * the other three -- see sr_water_needs_depth above for why it has to
          * be, and why the predicate is clarity alone. */
-        const bool want_water_depth = sr_water_needs_depth(scene);
+        const bool want_water_depth = !reduced && sr_water_needs_depth(scene);
         /* SSAO (base+2/+3) and SSR (base+18 ray-march, base+19 composite) now
          * use disjoint view slots, so they coexist in the same frame.  Both
          * share the base+1 depth/normal G-buffer pre-pass.  For the scene view
@@ -4933,8 +5072,16 @@ ecull_build_done:;
          * the game view already has them free between its UI (base+17) and
          * postfx (base+20). */
 
-        if ((want_ssao || want_ssr || want_velocity || want_water_depth) &&
-            camera && sr->pak) {
+        /* A planar probe picked before this render (the mirror runs first --
+         * see jce_scene_renderer_render_planar_reflection) needs the depth AND
+         * the normal G-buffer, for the same reason SSR does: its composite
+         * reconstructs world position and reads the surface normal to decide
+         * which pixels lie on the mirror. */
+        const bool want_planar = !reduced && sr->planar_probe_valid;
+
+        if (sr_wants_depth_prepass(want_ssao, want_ssr, want_velocity,
+                                   want_water_depth, want_ssgi, want_planar)
+            && camera && sr->pak) {
             uint32_t sw = cfg->viewport_width  ? cfg->viewport_width  : 1920;
             uint32_t sh = cfg->viewport_height ? cfg->viewport_height : 1080;
             float    aspect = (sw && sh) ? ((float)sw / (float)sh) : (16.0f / 9.0f);
@@ -4948,6 +5095,16 @@ ecull_build_done:;
                  * viewport's camera can't clobber it -> correct per-view motion,
                  * order-independent), THEN the slot is rolled to this frame's VP
                  * for next frame. */
+                /* The probe's own copy, unconditional -- see the field. */
+                if (want_planar) {
+                    sr->last_viewport_aspect = aspect;
+                    jce_mat4 pvw = jce_camera_view(camera);
+                    jce_mat4 ppj = jce_camera_proj(camera, aspect,
+                                                   sr->homogeneous_depth);
+                    jce_mat4 pvp = jce_m4_multiply(&ppj, &pvw);
+                    sr->planar_probe_inv_vp = jce_m4_inverse(&pvp);
+                    sr->planar_probe_inv_vp_valid = true;
+                }
                 if (want_velocity) {
                     int vp_slot = cfg->viewport_id;
                     if (vp_slot < 0 || vp_slot >= JCE_SR_VIEWPORT_SLOTS) vp_slot = 0;
@@ -4971,8 +5128,11 @@ ecull_build_done:;
                  * samples last frame's AO); SSR reads THIS frame's lit color
                  * (it samples the color RT that base+0 already wrote). */
                 uint64_t _t0_prepass = jce_time_perf_counter();
+                /* want_normals, not want_ssr: SSGI reads the normal target
+                 * too, and passing only SSR's answer is what made SSGI gather
+                 * a constant normal at every pixel. */
                 sr_draw_depth_prepass(sr, scene, camera, &list, view_id_base, sw, sh,
-                                      want_ssr);
+                                      want_ssr || want_ssgi || want_planar);
                 jce_perf_phase_add("prepass", jce_time_perf_to_ms(_t0_prepass, jce_time_perf_counter()));
                 if (want_velocity) {
                     /* Bind the velocity buffer into the shared scene postfx so
@@ -5110,9 +5270,12 @@ ecull_build_done:;
                                 ? jce_camera_proj(camera, sasp,
                                                   sr->homogeneous_depth)
                                 : jce_m4_identity();
-                            jce_ssao_render(sr->ssao, sr->ssao_depth_tex.idx,
-                                            &svm, &spm,
-                                            (uint16_t)(view_id_base + 2));
+                            jce_ssao_render(
+                                sr->ssao, sr->ssao_depth_tex.idx, &svm, &spm,
+                                (uint16_t)(view_id_base +
+                                           JCE_VIEW_SR_SSAO_OFFSET),
+                                (uint16_t)(view_id_base +
+                                           JCE_VIEW_SR_SSAO_OFFSET + 1u));
                         }
                         sr->ssao_ao_idx = jce_ssao_get_result_texture(sr->ssao);
                         sr->ssao_active_frame = (sr->ssao_ao_idx != UINT16_MAX);
@@ -5147,6 +5310,50 @@ ecull_build_done:;
                         sr->ssr_active_frame = (sr->ssr_result_idx != UINT16_MAX);
                     }
                 }
+
+                if (want_ssgi) {
+                    if (!sr->ssgi) {
+                        JceSsgiDesc gd; memset(&gd, 0, sizeof gd);
+                        gd.pak = sr->pak; gd.width = (int)sw; gd.height = (int)sh;
+                        sr->ssgi = jce_ssgi_create(&gd);
+                    } else {
+                        jce_ssgi_resize(sr->ssgi, (int)sw, (int)sh);
+                    }
+                    if (sr->ssgi) {
+                        JceSsgiParams gp = jce_ssgi_default_params();
+                        if (scene_rendering->ssgi_intensity > 0.0f)
+                            gp.intensity = scene_rendering->ssgi_intensity;
+                        if (scene_rendering->ssgi_radius > 0.0f)
+                            gp.radius = scene_rendering->ssgi_radius;
+                        gp.near_plane = jce_camera_get_near(camera);
+                        gp.far_plane  = jce_camera_get_far(camera);
+                        jce_ssgi_set_params(sr->ssgi, &gp);
+                        jce_mat4 gv = jce_camera_view(camera);
+                        jce_mat4 gpj = jce_camera_proj(camera, aspect,
+                                                       sr->homogeneous_depth);
+                        /* base+JCE_VIEW_SR_SSGI_OFFSET (26), with the composite
+                         * at 27.  Both have to sit BELOW the postfx base at
+                         * base+30: the composite writes into the scene colour
+                         * the postfx chain then reads, and bgfx runs views in
+                         * ascending id order, so a higher id would add the
+                         * bounce to an already-tonemapped image.  See
+                         * jce_views.h for why 26/27 and not the 60s. */
+                        JceTextureHandle gi_col = { cfg->ssr_color_tex_handle };
+                        JceTextureHandle gi_dep = { sr->ssao_depth_tex.idx };
+                        JceTextureHandle gi_nrm = { sr->ssao_normal_tex.idx };
+                        /* Attachment 1 of the same pre-pass; JCE_SSGI_NO_ALBEDO
+                         * is the ablation.  See jce_ssgi.h for both. */
+                        JceTextureHandle gi_alb = { sr_ssgi_albedo_handle(sr) };
+                        jce_ssgi_render_albedo(sr->ssgi, gi_col, gi_dep, gi_nrm,
+                                        gi_alb, &gv, &gpj,
+                                        (uint16_t)(view_id_base +
+                                                   JCE_VIEW_SR_SSGI_OFFSET));
+                        sr->ssgi_result_idx =
+                            jce_ssgi_get_result_texture(sr->ssgi).idx;
+                        sr->ssgi_active_frame =
+                            (sr->ssgi_result_idx != UINT16_MAX);
+                    }
+                }
             }
         }
 
@@ -5162,6 +5369,16 @@ ecull_build_done:;
          * (a debug key, a camera-dependent gate) must not thrash the GPU
          * allocator, and re-creating costs a frame of latency. */
         enum { SR_FX_RELEASE_FRAMES = 120 };
+        /* Same hysteresis the other effects get: a toggled-off SSGI must give
+         * its RGBA16F target back, and a flickering toggle must not thrash the
+         * allocator.  Without this the module would hold its buffers for the
+         * process lifetime after one frame with the checkbox on. */
+        if (sr->ssgi && !want_ssgi) {
+            jce_ssgi_destroy(sr->ssgi);
+            sr->ssgi = NULL;
+            sr->ssgi_active_frame = false;
+            sr->ssgi_result_idx   = UINT16_MAX;
+        }
         if (sr->ssao && !want_ssao) {
             if (++sr->ssao_idle_frames >= SR_FX_RELEASE_FRAMES) {
                 jce_ssao_destroy(sr->ssao);
@@ -5348,7 +5565,7 @@ ecull_build_done:;
     /* GPU-flagged emitters: compute simulate/emit on base+9 (ordered before
      * the color view) + one instanced billboard draw per pool, at the same
      * transparency position as the CPU particle pass above. */
-    sr_drive_gpu_particles(sr, scene, view_id_base, dt_sec);
+    sr_drive_gpu_particles(sr, scene, camera, view_id_base, dt_sec);
 
     /* Decals (P2-weather-decals-tod): depth-tested projected quads from
      * authored JceDecalComponent projectors + runtime-stamped decals.  Drawn
@@ -5585,8 +5802,28 @@ bool jce_scene_renderer_taa_begin_frame(JceSceneRenderer *sr,
     if (!sr || !clean_view || !clean_proj || !out_jittered_proj)
         return false;
 
-    bool on = sr->cv_taa ? jce_cvar_get_bool(sr->cv_taa) : false;
-    if (!on || !sr->postfx_pipeline)
+    if (!sr->postfx_pipeline) return false;
+
+    /* Motion-vec / reproject matrices come from the CLEAN (un-jittered)
+       camera so reprojection is jitter-free:
+         inv_view_proj = inverse(clean_proj * clean_view)
+         prev_view_proj = prev_proj * prev_view (when a previous frame exists;
+                          otherwise reuse this frame's so the on-screen test in
+                          fs_taa rejects the empty history → output ≈ current).
+       PUSHED ABOVE THE TAA GATE: they are camera state, and TAA is only one
+       of the things that wants them -- post-fx motion blur wants the same
+       pair.  Below the gate, motion blur silently required TAA. */
+    jce_mat4 view_proj   = jce_m4_multiply(clean_proj, clean_view);
+    jce_mat4 inv_vp      = jce_m4_inverse(&view_proj);
+    jce_mat4 prev_vp;
+    if (sr->taa_state.prev_valid)
+        prev_vp = jce_m4_multiply(&sr->taa_state.prev_proj,
+                                  &sr->taa_state.prev_view);
+    else
+        prev_vp = view_proj;
+    jce_postfx_set_taa_matrices(sr->postfx_pipeline, &inv_vp, &prev_vp);
+
+    if (!(sr->cv_taa ? jce_cvar_get_bool(sr->cv_taa) : false))
         return false;
 
     /* Advance the Halton jitter sequence for this frame. */
@@ -5596,23 +5833,6 @@ bool jce_scene_renderer_taa_begin_frame(JceSceneRenderer *sr,
     jce_mat4 jittered = *clean_proj;
     jce_taa_apply_jitter(&jittered, sr->taa_state.current_jitter);
     *out_jittered_proj = jittered;
-
-    /* Motion-vec / reproject matrices come from the CLEAN (un-jittered)
-       camera so reprojection is jitter-free:
-         inv_view_proj = inverse(clean_proj * clean_view)
-         prev_view_proj = prev_proj * prev_view (when a previous frame exists;
-                          otherwise reuse this frame's so the on-screen test in
-                          fs_taa rejects the empty history → output ≈ current). */
-    jce_mat4 view_proj   = jce_m4_multiply(clean_proj, clean_view);
-    jce_mat4 inv_vp      = jce_m4_inverse(&view_proj);
-    jce_mat4 prev_vp;
-    if (sr->taa_state.prev_valid)
-        prev_vp = jce_m4_multiply(&sr->taa_state.prev_proj,
-                                  &sr->taa_state.prev_view);
-    else
-        prev_vp = view_proj;
-
-    jce_postfx_set_taa_matrices(sr->postfx_pipeline, &inv_vp, &prev_vp);
     /* TAA tuning, as cvars rather than literals.
      *
      * This call runs EVERY FRAME and used to pass three hard-coded numbers, so
@@ -5679,9 +5899,10 @@ void jce_scene_renderer_taa_end_frame(JceSceneRenderer *sr,
 {
     if (!sr) return;
 
-    bool on = sr->cv_taa ? jce_cvar_get_bool(sr->cv_taa) : false;
-    if (on && clean_view && clean_proj) {
-        /* Stash UN-JITTERED matrices for next frame's reproject. */
+    if (clean_view && clean_proj) {
+        /* Stash UN-JITTERED matrices for next frame's reproject.  UNCONDITIONAL:
+         * gated on TAA, "previous" meant "whenever TAA was last on", so a
+         * motion-blur frame with TAA off smeared against an arbitrary past. */
         jce_taa_record_camera(&sr->taa_state, clean_view, clean_proj);
     }
     /* ALWAYS disable TAA on the shared pipeline after the scene pass so it
@@ -6067,6 +6288,14 @@ void jce_scene_renderer_composite_ssr(JceSceneRenderer *sr, uint16_t view_id,
     jce_ssr_composite(sr->ssr, view_id, dst_fb_idx);
 }
 
+
+void jce_scene_renderer_composite_ssgi(JceSceneRenderer *sr, uint16_t view_id,
+                                       JceFrameBufferHandle dst)
+{
+    if (!sr || !sr->ssgi || !sr->ssgi_active_frame) return;
+    jce_ssgi_composite(sr->ssgi, view_id, dst);
+}
+
 bool jce_scene_renderer_is_skybox_active(const JceSceneRenderer *sr)
 {
     return sr ? sr->skybox_active : false;
@@ -6085,6 +6314,7 @@ void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
     out->inserted = sr->stat_cull_inserted;
     out->updated  = sr->stat_cull_updated;
     out->removed  = sr->stat_cull_removed;
+    out->disabled_skipped = sr->stat_disabled_skipped;
     if (sr->cull_space) {
         jce_space_resolution(sr->cull_space, out->grid_res);
         out->grid_cells    = jce_space_cell_count(sr->cull_space);
@@ -6316,6 +6546,10 @@ static uint64_t sr_model_cache_free_slot(JceSceneRenderer *sr, int slot)
     uint64_t freed = e->vram_bytes;
 
     if (e->model) jce_model_destroy(e->model);   /* destroys meshes + textures */
+    if (e->batch_members) { JCE_FREE(e->batch_members);
+                            e->batch_members = NULL;
+                            e->batch_member_count = 0;
+                            e->batch_probed = false; }
     memset(e, 0, sizeof(*e));                     /* slot now empty (used=false) */
 
     /* Backward-shift delete (canonical linear-probing deletion): scan forward
@@ -6418,6 +6652,10 @@ void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr)
             e->job = NULL;
         }
         if (e->model) jce_model_destroy(e->model);
+        if (e->batch_members) { JCE_FREE(e->batch_members);
+                                e->batch_members = NULL;
+                                e->batch_member_count = 0;
+                                e->batch_probed = false; }
         memset(e, 0, sizeof(*e));
     }
     sr->model_inflight = 0;

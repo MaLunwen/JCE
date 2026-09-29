@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "jce_yuv_convert.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,14 @@ bool jce_h265_decode_frame(JceH265Decoder *dec,
                            const uint8_t **out_rgba,
                            uint32_t *out_width,
                            uint32_t *out_height);
+
+/* Worker mode avoids native-size RGBA conversion/copies. Planes live until
+ * the next decode/drain/flush. Timestamp tokens preserve 64-bit container PTS. */
+void jce_h265_decoder_set_yuv_output(JceH265Decoder *dec, bool enabled);
+void jce_h265_decoder_set_timestamp(JceH265Decoder *dec, uint64_t timestamp);
+uint64_t jce_h265_decoder_frame_timestamp(const JceH265Decoder *dec);
+bool jce_h265_decoder_get_yuv(const JceH265Decoder *dec, JceYuv420Frame *out);
+bool jce_h265_decoder_drain(JceH265Decoder *dec);
 
 /* Flush the decoder (e.g. after seeking) so stale reference frames
  * are discarded. */

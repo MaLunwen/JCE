@@ -28,6 +28,7 @@
 
 #include <jce/middleware/video/jce_video_types.h>
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_read_source.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,6 +66,12 @@ typedef enum {
 JCE_API JceVideo jce_video_load_memory(const void *data, uint32_t size,
                                 const char *hint_path);
 
+/* Host-file playback. Encoded input is read on demand with 64-bit offsets;
+ * decoder, metadata and frame queues have separate bounded budgets. */
+JCE_API JceVideo jce_video_load_file(const char *path);
+/* Retains a source. Video and embedded audio share it until unload. */
+JCE_API JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path);
+
 /* Release a clip.  Safe to call with JCE_VIDEO_INVALID. */
 JCE_API void     jce_video_unload(JceVideo v);
 
@@ -73,6 +80,14 @@ JCE_API void     jce_video_unload(JceVideo v);
 JCE_API bool     jce_video_get_info(JceVideo v, JceVideoInfo *out);
 JCE_API double   jce_video_get_time(JceVideo v);
 JCE_API double   jce_video_get_duration(JceVideo v);
+/* Owner-thread start/resume gate: a published current-generation picture
+ * and buffered current-generation audio (when present). During seeks call
+ * advance(v, 0) to publish without advancing transport; keep the output voice
+ * paused until this returns true. Flush or recreate any device-side buffered
+ * voice after a seek, so cached pre-seek PCM cannot play on resume.
+ * No decoder work occurs in this query. */
+JCE_API bool jce_video_is_ready_to_play(JceVideo v);
+
 JCE_API bool     jce_video_has_ended(JceVideo v);
 
 /* Width / height reported by parsed stream metadata. */
@@ -81,7 +96,8 @@ JCE_API void     jce_video_get_size(JceVideo v, int *out_w, int *out_h);
 /* -- Transport ----------------------------------------------------- */
 
 /* Advance the internal clock by dt seconds and decode any frames that
- * fall within that window.  When paused, pass dt == 0 or skip the call. */
+ * fall within that window. With dt == 0, publish an available initial/seek
+ * preview without advancing the clock; skip the call to retain the old frame. */
 JCE_API void     jce_video_advance(JceVideo v, double dt_seconds);
 
 /* Seek to an absolute time.  If exact is false this snaps to the
@@ -97,8 +113,21 @@ JCE_API void     jce_video_set_loop(JceVideo v, bool loop);
 
 /* -- Frame access -------------------------------------------------- */
 
-/* Returns a pointer to the most recently decoded frame in packed RGBA8
- * (top-left origin, stride = width * 4).
+/* Opt-in CPU preview downsampling for AV1/VP8/VP9/HEVC. Zero (default) preserves
+ * native resolution; otherwise the longest output edge is capped, with aspect
+ * ratio preserved to even pixels. Metadata and presentation timestamps remain
+ * unchanged. Applies to newly prepared frames; already queued pictures retain
+ * their previous size. Seek to flush the queue when changing output policy.
+ * Call on the same thread
+ * as advance/get_frame_rgba. Returns false for invalid handles, limits of 1,
+ * or unsupported codecs. This reduces conversion/upload cost, not decode cost. */
+JCE_API bool jce_video_set_preview_max_dimension(JceVideo v, uint32_t max_dimension);
+
+/* Returns a pointer to the most recently published frame in packed RGBA8
+ * (top-left origin, stride = width * 4). NULL until a frame is published;
+ * call advance(v, 0) to publish a paused initial/seek preview. The pointer
+ * remains valid until the next advance, seek, rewind or unload on the owner
+ * thread. Decoder-worker storage is never returned to the caller.
  *
  * If out_frame_time is non-NULL it receives the presentation time of
  * the returned frame in seconds. */
@@ -106,7 +135,7 @@ JCE_API const uint8_t *jce_video_get_frame_rgba(JceVideo v,
                                          int *out_w, int *out_h,
                                          double *out_frame_time);
 
-/* Monotonic frame counter incremented when a new frame is decoded.
+/* Monotonic frame counter incremented when a new frame is published.
  * Metadata-only mode returns 0. */
 JCE_API uint64_t jce_video_get_frame_counter(JceVideo v);
 
@@ -167,12 +196,12 @@ typedef struct {
     /* Worker thread (per decoded frame). */
     double   decode_us_ema;
     double   decode_us_last;
-    double   convert_us_ema;     /* YUV→RGBA SIMD on the worker side */
+    double   convert_us_ema;     /* YUV conversion: UI for queued YUV, worker otherwise */
     double   convert_us_last;
     double   push_us_ema;        /* enqueue under lock */
     double   push_us_last;
     /* UI thread (per advance). */
-    double   pop_us_ema;
+    double   pop_us_ema;         /* includes conversion for queued YUV */
     double   pop_us_last;
     /* Frame queue snapshot. */
     int      q_count;

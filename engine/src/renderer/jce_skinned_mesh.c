@@ -2,6 +2,7 @@
  * jce_skinned_mesh.c  Skinned GPU mesh implementation.
  */
 
+#include "renderer/jce_vertex_layout.h"
 #include <jce/renderer/jce_skinned_mesh.h>
 #include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices */
 #include <jce/os/core/jce_log.h>
@@ -65,28 +66,14 @@ struct JceSkinnedMesh {
 static void init_pbr_layout(bgfx_vertex_layout_t *layout)
 {
     bgfx_vertex_layout_begin(layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_POSITION,  3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_NORMAL,    3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TEXCOORD0, 2,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TANGENT,   4,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    jce_vertex_layout_add_pbr_base(layout);
     bgfx_vertex_layout_end(layout);
 }
 
 static void init_skinned_layout(bgfx_vertex_layout_t *layout)
 {
     bgfx_vertex_layout_begin(layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_POSITION,  3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_NORMAL,    3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TEXCOORD0, 2,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TANGENT,   4,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    jce_vertex_layout_add_pbr_base(layout);
     bgfx_vertex_layout_add(layout, BGFX_ATTRIB_INDICES,   4,
                            BGFX_ATTRIB_TYPE_UINT8, true, false);
     bgfx_vertex_layout_add(layout, BGFX_ATTRIB_WEIGHT,    4,
@@ -282,11 +269,59 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
  * boxes) rendered only ambient-lit underside/back-faces => a flat, dark,
  * colourless mass.  Default false => byte-identical to the legacy single-sided
  * behaviour for every model that doesn't author double_sided. */
-static bool s_submit_double_sided = false;
+/* WIDENED from a bool to the whole state, because double_sided was only the
+ * first bit this path dropped.  A glTF model's ALPHA MODE and BLEND EQUATION
+ * were dropped the same way and for the same reason: the material's factors
+ * reached the draw through jce_pbr_material_bind while its render state
+ * reached nothing, so a model could not be transparent no matter what was
+ * authored.  Measured 2026-09-06: four pine models with alphaMode BLEND and
+ * alpha 0.6 rendered fully opaque and correctly TINTED by their base colours
+ * -- factors arriving while the state did not is exactly that picture.
+ *
+ * 0 means "the caller said nothing", not "no state": that is what keeps a
+ * model nobody has authored a material for byte-identical. */
+/* ONE record, not a global apiece: the two are set together, applied
+ * together, and cleared together, and splitting them would let a caller set
+ * half of what the next submit uses. */
+static struct { uint64_t state; uint32_t stencil;     /* Static-batch member culling; see the header. */
+    uint32_t range_first;
+    uint32_t range_count;
+} s_submit = { 0, 0 };
+
+/* Apply both.  bgfx resets the stencil after each submit, so this runs per
+ * submit, not once; skipped when zero because zero is exactly what that reset
+ * leaves behind. */
+static void sm_apply_submit_state(void)
+{
+    bgfx_set_state(s_submit.state ? s_submit.state : BGFX_STATE_DEFAULT, 0);
+    if (s_submit.stencil) bgfx_set_stencil(s_submit.stencil, BGFX_STENCIL_NONE);
+}
 
 void jce_skinned_mesh_set_submit_double_sided(bool on)
 {
-    s_submit_double_sided = on;
+    /* Kept because it is public and because it is the narrow question most
+     * callers ask.  Expressed through the same global, so there is exactly
+     * one thing to be stale. */
+    s_submit.state = on ? (BGFX_STATE_DEFAULT & ~BGFX_STATE_CULL_MASK)
+                        : BGFX_STATE_DEFAULT;
+    s_submit.stencil = 0;
+}
+
+void jce_skinned_mesh_set_submit_state(uint64_t state)
+{
+    s_submit.state = state;
+    s_submit.stencil = 0;   /* see the header: state-only callers get no stencil */
+}
+
+void jce_skinned_mesh_set_submit_stencil(uint32_t stencil)
+{
+    s_submit.stencil = stencil;
+}
+
+void jce_skinned_mesh_set_submit_index_range(uint32_t first, uint32_t count)
+{
+    s_submit.range_first = first;
+    s_submit.range_count = count;
 }
 
 void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
@@ -305,13 +340,32 @@ void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
                      | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
                      | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
     } else {
-        if (mesh->ibh.idx != UINT16_MAX)
-            bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        /* Two-sided materials drop the CULL_CW bit so both winding orders draw. */
-        uint64_t state = BGFX_STATE_DEFAULT;
-        if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
-        bgfx_set_state(state, 0);
+        if (mesh->ibh.idx != UINT16_MAX) {
+            /* An armed range draws that slice; no range draws the whole
+             * buffer, which is what every caller but static-batch member
+             * culling does and is byte-identical to the historical submit.
+             * Clamped rather than trusted: a member table from a sidecar that
+             * no longer matches its .glb would otherwise index past the end,
+             * and bgfx's answer to that is not a message anyone can act on. */
+            uint32_t first = 0, count = mesh->num_indices;
+            if (s_submit.range_count > 0 &&
+                s_submit.range_first < mesh->num_indices) {
+                first = s_submit.range_first;
+                count = s_submit.range_count;
+                if (first + count > mesh->num_indices)
+                    count = mesh->num_indices - first;
+            }
+            bgfx_set_index_buffer(mesh->ibh, first, count);
+        }
+        /* The caller's state when it stated one (two-sided, alpha blend,
+         * additive, ...), the legacy default when it did not. */
+        sm_apply_submit_state();
     }
+    /* DISARMED BY THE SUBMIT, on both branches: a range left armed would
+     * truncate the next unrelated mesh, and that failure is a hole in the
+     * world one draw later with nothing pointing back here. */
+    s_submit.range_first = 0;
+    s_submit.range_count = 0;
     /* Caller must call bgfx_submit after binding program via material. */
     JCE_PROFILE_ZONE_END;
 }
@@ -343,9 +397,7 @@ void jce_skinned_mesh_submit_morphed(const JceSkinnedMesh *mesh,
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
             bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        uint64_t state = BGFX_STATE_DEFAULT;
-        if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
-        bgfx_set_state(state, 0);
+        sm_apply_submit_state();
     }
     /* Caller submits the program (matches jce_skinned_mesh_submit contract). */
     JCE_PROFILE_ZONE_END;
@@ -692,9 +744,7 @@ void jce_skinned_mesh_submit_lod(const JceSkinnedMesh *mesh,
 
     bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
     bgfx_set_index_buffer(mesh->lod_ibh[level], 0, mesh->lod_num_indices[level]);
-    uint64_t state = BGFX_STATE_DEFAULT;
-    if (s_submit_double_sided) state &= ~BGFX_STATE_CULL_MASK;
-    bgfx_set_state(state, 0);
+    sm_apply_submit_state();
     /* Caller submits the program after binding the material (same contract as
      * jce_skinned_mesh_submit). */
     JCE_PROFILE_ZONE_END;

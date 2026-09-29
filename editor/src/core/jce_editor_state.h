@@ -389,9 +389,15 @@ void          jce_state_stress_move_tick(float dt);
  * and button state each frame the panel is captured + Play is active —
  * speeds come from the authored CharacterController component.  Ignored
  * if no scene entity has a CharacterController. */
+/* `keyboard` is the raw input a Play script may query with jce.is_key_down,
+ * or NULL when the game view does not hold keyboard capture.  It is a
+ * parameter rather than something Play fetches for itself because the caller
+ * is the side that knows about focus -- the same reason WASD is read behind
+ * that flag and not from the global input. */
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                       bool jump_pressed, bool jump_held,
-                                      bool sprint, bool attack);
+                                      bool sprint, bool attack,
+                                      struct JceInput *keyboard);
 void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
                                        unsigned int buttons);
 void jce_editor_play_set_touch_input(
@@ -406,6 +412,7 @@ bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z
  * Editor-side debug-draw / contact-listener wiring uses this. */
 struct JcePhysicsWorld;
 struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
+struct JcePhysics2D    *jce_editor_play_get_physics2d_world(void);
 
 /* Returns the live play-session runtime during Play (or NULL when not
  * running).  Read-only panel wiring (e.g. the BT Visualizer polling
@@ -463,7 +470,30 @@ struct JceInput *jce_editor_engine_input(void);
  * not running.  Surfaced by the Physics Debugger. */
 int jce_editor_play_get_active_contacts(void);
 
-/* Undo/Redo history. */
+/* Undo/Redo history. Large editor assets may keep their own compact command
+ * storage and join the global chronological history through this provider.
+ * Sequence callbacks return 0 when that direction is empty. Provider storage
+ * and user must remain valid until unregister. */
+typedef uint64_t (*JceEditorHistoryPeekFn)(void *user);
+typedef bool (*JceEditorHistoryApplyFn)(void *user);
+typedef void (*JceEditorHistoryClearFn)(void *user);
+
+typedef struct JceEditorHistoryProvider {
+    void *user;
+    JceEditorHistoryPeekFn peek_undo_sequence;
+    JceEditorHistoryPeekFn peek_redo_sequence;
+    JceEditorHistoryApplyFn undo;
+    JceEditorHistoryApplyFn redo;
+    JceEditorHistoryClearFn clear;
+    JceEditorHistoryClearFn clear_redo;
+} JceEditorHistoryProvider;
+
+bool     jce_state_history_register_provider(
+             const JceEditorHistoryProvider *provider);
+void     jce_state_history_unregister_provider(void *user);
+uint64_t jce_state_history_commit_external(void *user);
+void     jce_state_history_clear(void);
+
 void  jce_state_undo(void);
 void  jce_state_redo(void);
 bool  jce_state_can_undo(void);
@@ -472,6 +502,22 @@ bool  jce_state_can_redo(void);
 /* Batch edit scope for grouping multi-step operations into one undo entry. */
 void  jce_state_begin_batch_edit(void);
 void  jce_state_end_batch_edit(void);
+
+/* Batch edit KNOWN to touch exactly one entity (the inspector's value edits).
+ *
+ * Same nesting and the same stack as jce_state_begin_batch_edit -- close it
+ * with jce_state_end_batch_edit -- but the record it pushes holds that
+ * entity's components instead of the whole scene.  The unscoped form
+ * serialises everything twice per edit (once to push the record, once to
+ * decide whether anything changed), which on a 50k-entity scene is ~1.4 s and
+ * a 26 MB string comparison for one slider release, and its restore clears the
+ * scene, dropping every entity handle and the selection with it.
+ *
+ * `entity_id` is the EDITOR id (jce_state_* space), not a JceEntity.  Zero
+ * falls back to the unscoped form, so a caller that cannot name one entity
+ * loses nothing.  Use it only when the edit genuinely cannot touch another
+ * entity: a scoped record restores one entity and nothing else. */
+void  jce_state_begin_entity_edit(uint32_t entity_id);
 
 /* Transient edit scope: no undo snapshot, but marks scene dirty. */
 void  jce_state_begin_transient_edit(void);

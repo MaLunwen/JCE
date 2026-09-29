@@ -18,6 +18,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_str.h>   /* jce_strcasecmp for the Auto check */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/renderer/jce_camera.h>
@@ -83,6 +84,47 @@ static float gv_pad_value(const JceInputActions *map, const char *name)
     int id = jce_action_find(map, name);
     if (id < 0) return 0.0f;
     return jce_action_value_device(map, id, JCE_DEVICE_GAMEPAD);
+}
+
+/* The keyboard a Play SCRIPT may read, which is not the same question as the
+ * keyboard the editor's own camera may read.
+ *
+ * The capture gate is right for a person: without it a Play script would read
+ * keys the user is typing into another panel.  It is wrong for a REPLAYED
+ * session, and for exactly the reason this file already gives one paragraph
+ * down about gamepads -- "a pad has no cursor and cannot click into
+ * anything".  Neither does a .jirc file.  With JCE_INPUT_REPLAY set there is
+ * no user, no other panel, and nothing to protect; gating on capture there
+ * means the shipped runtime replays an input file and the editor silently
+ * does not, from the same scene and the same file.
+ *
+ * And the thing the gate protects against cannot happen during a replay:
+ * jce_input_replay_tick() OVERWRITES the engine's input with the file's frame
+ * every tick (jce_engine.c:1984), so what Play reads is the recording, not
+ * whatever the user is typing into the Inspector.  The keys that worried the
+ * gate are not in that object to be read.
+ *
+ * Measured before it was written: editor Play drove the snake straight into
+ * the wall while the shipped runtime turned, on the same 1800-frame input. */
+static struct JceInput *gv_script_keyboard(bool kb)
+{
+    static int s_replay = -1;
+    if (s_replay < 0) {
+        const char *e = getenv("JCE_INPUT_REPLAY");
+        s_replay = (e && e[0]) ? 1 : 0;
+    }
+    struct JceInput *in = (kb || s_replay) ? jce_editor_engine_input() : NULL;
+    /* Said once, because "the runtime was handed no keyboard" and "this code
+     * never ran" produce the same silence downstream -- and this function was
+     * added to fix exactly that class of bug. */
+    static int s_said = 0;
+    if (!s_said) {
+        s_said = 1;
+        LOG_INFO("editor.play",
+                 "script keyboard: capture=%d replay=%d -> %s",
+                 kb ? 1 : 0, s_replay, in ? "engine input" : "NULL");
+    }
+    return in;
 }
 
 static bool game_view_has_active_vcam(void)
@@ -365,7 +407,13 @@ void jce_editor_panel_game_view_content(void)
     /* Inline hint: shown whenever the persisted choice differs from
      * the actually-running bgfx backend.  Disappears as soon as the
      * user picks the live backend again (or restarts the editor). */
-    if (ren_cfg.renderer[0] && live_name
+    /* "Auto" is not a backend, it is "whichever the chain picks", so it can
+     * never equal the live backend name and this banner used to be permanent
+     * for every user on the default macOS/Linux setting -- telling them to
+     * restart to apply something that was already applied. */
+    const bool ren_is_auto =
+        (jce_strcasecmp(ren_cfg.renderer, "Auto") == 0);
+    if (ren_cfg.renderer[0] && live_name && !ren_is_auto
             && strcmp(ren_cfg.renderer, live_name) != 0) {
         ImGui::SameLine();
         char buf[160];
@@ -546,14 +594,29 @@ void jce_editor_panel_game_view_content(void)
 
     /* Feed the ECS-UI (Canvas) graphic raycaster the panel-local pointer,
      * mapped from the displayed image rect into rendered (FBO) pixels.  Only
-     * valid while the cursor is over the viewport and we are NOT in FPS
-     * capture (where the cursor is pinned/hidden). */
+     * valid while the cursor is over the viewport, we are NOT in FPS capture
+     * (where the cursor is pinned/hidden), and PLAY IS RUNNING.
+     *
+     * The play gate is not cosmetic.  The raycaster does not merely highlight:
+     * uc_update_widgets writes its results straight back into the scene's
+     * components (jce_ui_canvas.c — `sl->value = v`, `tg->is_on = !tg->is_on`,
+     * `dd->selected_index = pressed`), because a UI widget's value IS its
+     * component, the same source-of-truth model Unity uses.  Without the gate,
+     * moving the mouse across a stopped Game View silently rewrote authored
+     * slider / toggle / dropdown values in the scene the user was about to
+     * save.  Its two siblings below — the text-input forward and the scroll
+     * forward — were already gated; the pointer was the one that was missed.
+     *
+     * Unity's own split is the same: the Scene View previews UI layout but
+     * does not run the widget state machine; only Play does. */
     {
         const ImGuiIO &io = ImGui::GetIO();
+        JcePlayState ui_ps = jce_state_get_play_state();
+        bool playing = (ui_ps == JCE_PLAY_PLAYING);
         bool fps = jce_editor_game_render_is_mouse_captured();
         float lx = io.MousePos.x - region_start.x;
         float ly = io.MousePos.y - region_start.y;
-        bool inside = !fps && view_size.x > 0 && view_size.y > 0 &&
+        bool inside = playing && !fps && view_size.x > 0 && view_size.y > 0 &&
                       lx >= 0 && ly >= 0 &&
                       lx < view_size.x && ly < view_size.y;
         float ui_x = inside ? lx / view_size.x * (float)render_vw : 0.0f;
@@ -565,8 +628,7 @@ void jce_editor_panel_game_view_content(void)
          * Game View is hovered (and not in FPS capture) during Play.  The
          * canvas API is fire-and-forget (no-op when nothing focused) and does
          * not consume the events — ImGui still sees them. */
-        JcePlayState ui_ps = jce_state_get_play_state();
-        if (inside && ui_ps == JCE_PLAY_PLAYING)
+        if (inside)
             forward_text_input_to_canvas();
     }
 
@@ -624,6 +686,8 @@ void jce_editor_panel_game_view_content(void)
         jce_editor_play_get_player_position(&player_x, &player_y, &player_z);
     s_runtime_pointer_camera =
         play_active && !has_player_controller && game_view_has_active_vcam();
+    // Playing a pointer-driven scene must not opt into the editor fly camera.
+    const bool capture_allowed = !play_active || has_player_controller;
 
     /* ── ScrollView wheel channel ───────────────────────────────────────
      * Forward ImGui's mouse-wheel (vertical io.MouseWheel = +up, horizontal
@@ -646,13 +710,8 @@ void jce_editor_panel_game_view_content(void)
     if (play_active && !s_tp_was_play) s_tp_dist = kTpBoomLen;
     s_tp_was_play = play_active;
 
-    /* Cursor capture is now user-initiated only (click into the Game
-       View → capture; ESC / ALT / Stop → release). Auto-capturing on
-       the Play rising edge was Unity-ish for "instant game feel" but
-       it also stole the cursor from the Scene viewport, so dragging
-       gizmos (TRS) during Play silently failed because the absolute
-       mouse position was pinned by SDL relative-mouse mode. Let the
-       user opt in to capture by clicking the Game View. */
+    /* Play acquires keyboard ownership. Relative mouse capture is separate:
+     * only controller scenes lock the pointer; Alt temporarily releases it. */
     static JcePlayState s_prev_play_state = JCE_PLAY_STOPPED;
     /* Stop edge: when the user presses Stop, immediately release the
      * cursor (Unity-parity behavior).  Without this, s_user_wants_capture
@@ -666,8 +725,11 @@ void jce_editor_panel_game_view_content(void)
      * player's forward once (after the first player-snap below) so the user
      * starts looking where the character faces — e.g. at enemies ahead. */
     static bool s_orient_to_player_forward = false;
-    if (play_state != JCE_PLAY_STOPPED && s_prev_play_state == JCE_PLAY_STOPPED)
+    if (play_state != JCE_PLAY_STOPPED && s_prev_play_state == JCE_PLAY_STOPPED) {
         s_orient_to_player_forward = true;
+        s_user_wants_capture = true;
+        ImGui::SetWindowFocus();
+    }
     s_prev_play_state = play_state;
 
     if (cam) {
@@ -678,16 +740,14 @@ void jce_editor_panel_game_view_content(void)
             ImGui::IsKeyDown(ImGuiKey_LeftAlt) ||
             ImGui::IsKeyDown(ImGuiKey_RightAlt);
 
-        /* Capture is available any time the Game View is hovered+clicked
-         * (CryEngine-style). When Play is active and a CharacterController
-         * exists, capture also drives the player; otherwise it's a pure
-         * free-fly camera. */
-        /* A scene-owned VCam receives pointer data through JceRuntime.  It
-         * must not also acquire the editor's free-fly/FPS camera capture. */
-        if (s_runtime_pointer_camera)
+        /* Fly capture is available outside Play or for a player controller.
+         * Pointer-driven games (including scenes without a VCam) keep their
+         * cursor for UI. Losing app focus cancels the intent as well as the
+         * OS capture, so returning to the editor cannot silently re-lock. */
+        if (io.AppFocusLost)
             s_user_wants_capture = false;
 
-        if (!s_runtime_pointer_camera && hovered &&
+        if (!io.AppFocusLost && hovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             !alt_held) {
             s_user_wants_capture = true;
@@ -697,9 +757,15 @@ void jce_editor_panel_game_view_content(void)
             s_user_wants_capture = false;
         }
 
-        bool effective_capture =
-            s_user_wants_capture && !alt_held;
+        const bool game_keyboard = s_user_wants_capture && !alt_held;
+        bool effective_capture = game_keyboard && capture_allowed;
         bool was_captured = jce_editor_game_render_is_mouse_captured();
+        if (!was_captured && effective_capture) {
+            // The acquiring click's release belongs to the game, not ImGui.
+            // Clear it now so Alt cannot resume an old window drag.
+            for (int button = 0; button < 5; ++button)
+                ImGui::GetIO().AddMouseButtonEvent(button, false);
+        }
         jce_editor_game_render_set_mouse_capture(effective_capture);
 
         /* Sample the pad once per frame from the engine's hardware-fed map. */
@@ -759,9 +825,25 @@ void jce_editor_panel_game_view_content(void)
         static int s_qa_drives = -1;
         if (s_qa_drives < 0)
             s_qa_drives = (getenv("JCE_DBG_AUTOLOOK") ||
-                           getenv("JCE_DBG_AUTOWALK")) ? 1 : 0;
+                           getenv("JCE_DBG_AUTOWALK") ||
+                           /* JCE_INPUT_REPLAY is the third QA driver of this
+                            * view and was missing from this list.  A replayed
+                            * session cannot click into the viewport, so
+                            * effective_capture is false and pad_drives is
+                            * false, and the whole block below -- including
+                            * the only call that hands the Play runtime a
+                            * keyboard -- was skipped.  The engine dutifully
+                            * replayed all 1800 frames into an input object
+                            * that Play never read.
+                            *
+                            * Which is the paragraph above, again: a hook
+                            * gated behind a condition it cannot satisfy is
+                            * worse than a missing hook.  Measured: the
+                            * shipped runtime turned on this file and editor
+                            * Play drove straight into the wall. */
+                           getenv("JCE_INPUT_REPLAY")) ? 1 : 0;
 
-        if (effective_capture || pad_drives || s_qa_drives) {
+        if (game_keyboard || pad_drives || s_qa_drives) {
             /* V toggles first/third-person follow camera (Play mode). */
             if (effective_capture &&
                 play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
@@ -949,7 +1031,9 @@ void jce_editor_panel_game_view_content(void)
                     }
                     if (s_aw) { wx = s_awx; wz = s_awz; }
                 }
-                jce_editor_play_set_player_input(wx, wz, jump, jump_held, sprint, attack);
+                jce_editor_play_set_player_input(
+                    wx, wz, jump, jump_held, sprint, attack,
+                    gv_script_keyboard(kb));
                 /* Facing + idle/walk/run clip are driven generically by the
                  * engine runtime (rt_drive_character), so it also works in the
                  * shipped game, not just here. */
@@ -973,16 +1057,38 @@ void jce_editor_panel_game_view_content(void)
                  * step is scaled by deflection, not gated on it. */
                 if (pad_fwd   != 0.0f) jce_camera_move_forward(cam, step * pad_fwd);
                 if (pad_right != 0.0f) jce_camera_move_right  (cam, step * pad_right);
+
+                /* AND HAND THE RUNTIME A KEYBOARD ANYWAY.
+                 *
+                 * jce_editor_play_set_player_input() is the ONLY writer of
+                 * JceRuntimeInput::keyboard, and until now it was called only
+                 * in the has_player branch above -- so in a scene with no
+                 * CharacterController the runtime's keyboard stayed NULL and
+                 * jce.is_key_down() answered false for every key, forever, in
+                 * editor Play.  Not "no character to move": the BINDING was
+                 * dead, for scripts that never wanted a character.
+                 *
+                 * A grid game is the ordinary case for that: its scripts read
+                 * keys and move entities themselves.  The walk vector is zero
+                 * here because there is nothing to walk; the keyboard is not. */
+                /* A pointer-driven game still receives the keyboard when
+                 * relative mouse capture is intentionally disabled. */
+                jce_editor_play_set_player_input(
+                    0.0f, 0.0f, false, false, false, false,
+                    gv_script_keyboard(game_keyboard));
             }
 
-            /* Only a CAPTURED viewport may take the keyboard.  Claiming it
-             * because the PAD engaged would swallow every editor shortcut
-             * while the user is working in another panel. */
-            if (effective_capture) {
+            /* Only the focused Game View claims keyboard input.  A gamepad
+             * alone must not swallow editor shortcuts in other panels. */
+            if (game_keyboard) {
                 ImGui::SetNextFrameWantCaptureKeyboard(true);
                 ImGui::SetNextFrameWantCaptureMouse(true);
             }
         }
+
+        if (!game_keyboard && !s_qa_drives && play_active)
+            jce_editor_play_set_player_input(
+                0.0f, 0.0f, false, false, false, false, nullptr);
 
         /* On release edge: re-park the cursor at the centre of the
          * viewport so the user finds it where they last looked, not
@@ -1085,18 +1191,18 @@ void jce_editor_panel_game_view_content(void)
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(80, 220, 120, 230),
                     jce_editor_i18n("gameView.hud.flyCaptured"));
-    } else if (s_user_wants_capture) {
+    } else if (s_user_wants_capture && capture_allowed) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(255, 220, 120, 230),
                     jce_editor_i18n("gameView.hud.altFree"));
-    } else if (hovered && !s_runtime_pointer_camera) {
+    } else if (hovered && capture_allowed) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(220, 220, 220, 200),
                     jce_editor_i18n("gameView.hud.clickToFly"));
     }
 
     if (s_show_stats) {
-        const char *current = jce_renderer_get_backend_name(NULL);
+        const char *current = jce_renderer_running_backend_name();
         if (!current || !current[0]) current = "?";
         char buf[128];
         snprintf(buf, sizeof(buf), "%s: %s | %.1f fps  %ux%u",

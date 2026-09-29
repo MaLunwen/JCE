@@ -68,6 +68,14 @@ static int cmp_back_to_front(const void *a, const void *b)
 {
     const JceDrawCmd *ca = &((const JceRqEntry *)a)->cmd;
     const JceDrawCmd *cb = &((const JceRqEntry *)b)->cmd;
+    /* PRIORITY FIRST, then depth.  Depth alone has no answer for two coplanar
+     * transparents, and "whichever the camera happens to be nearer" is what
+     * makes them flicker as it moves.  A higher priority draws LATER, which is
+     * on top -- the same direction as Unity's renderQueue and Godot's
+     * render_priority, so an author moving between them is not surprised.
+     * Neutral is 0, which is what a zeroed JceDrawCmd already carries. */
+    if (ca->priority != cb->priority)
+        return (ca->priority < cb->priority) ? -1 : 1;
     if (ca->depth > cb->depth) return -1;
     if (ca->depth < cb->depth) return  1;
     return 0;
@@ -93,6 +101,13 @@ static int cmp_for_instancing(const void *a, const void *b)
     if (ca->mesh_vbh     != cb->mesh_vbh)     return ca->mesh_vbh     < cb->mesh_vbh     ? -1 : 1;
     if (ca->mesh_ibh     != cb->mesh_ibh)     return ca->mesh_ibh     < cb->mesh_ibh     ? -1 : 1;
     if (ca->index_count  != cb->index_count)  return ca->index_count  < cb->index_count  ? -1 : 1;
+    /* AND THE OFFSET.  Two runs of the SAME mesh share vbh, ibh and often
+       index_count, so without this they sort adjacent, compare equal to the
+       merge predicate below, and become one instanced batch that draws the
+       FIRST run's range twice -- the second member's triangles vanishing and
+       the first's appearing twice, from a merge that looked like every other
+       correct one. */
+    if (ca->first_index  != cb->first_index)  return ca->first_index  < cb->first_index  ? -1 : 1;
     if (ca->material_key != cb->material_key) return ca->material_key < cb->material_key ? -1 : 1;
     if (ca->depth        <  cb->depth)        return -1;
     if (ca->depth        >  cb->depth)        return  1;
@@ -271,7 +286,14 @@ static bool rq_can_batch(const JceRqEntry *a, const JceRqEntry *b)
         && ca->mesh_vbh     == cb->mesh_vbh
         && ca->mesh_ibh     == cb->mesh_ibh
         && ca->index_count  == cb->index_count
-        && ca->material_key == cb->material_key;
+        && ca->first_index  == cb->first_index
+        && ca->material_key == cb->material_key
+        /* The submit issues ONE state and ONE stencil for the whole run, so
+         * entries that disagree on either cannot share it.  material_key
+         * folds both in already; comparing them here as well is the direct
+         * guarantee rather than a property of a hash. */
+        && ca->state        == cb->state
+        && ca->stencil      == cb->stencil;
 }
 
 static uint32_t rq_depth_key(float d)
@@ -292,6 +314,16 @@ static uint64_t rq_resolve_state(const JceDrawCmd *c)
     return c->state ? c->state : BGFX_STATE_DEFAULT;
 }
 
+/* State and stencil travel together: bgfx resets both after each submit, so
+ * every place that sets one sets the other.  Skipped when zero because the
+ * post-submit reset already leaves the stencil at exactly that value -- this
+ * is the hot path, and a no-op call per draw is not free. */
+static void rq_apply_state(const JceDrawCmd *c)
+{
+    jce_enc_set_state(rq_resolve_state(c), 0);
+    if (c->stencil) jce_enc_set_stencil(c->stencil, BGFX_STENCIL_NONE);
+}
+
 static void rq_submit_single(const JceRqEntry *e)
 {
     const JceDrawCmd *c = &e->cmd;
@@ -302,8 +334,8 @@ static void rq_submit_single(const JceRqEntry *e)
     jce_enc_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     /* Non-indexed mesh: skip the bind (see rq_submit_explicit_instanced). */
     if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, 0, c->index_count);
-    jce_enc_set_state(rq_resolve_state(c), 0);
+        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
+    rq_apply_state(c);
 
     /* For n=1, prefer the non-instance program variant: avoids feeding a
      * 1-element instance buffer to a shader that declares per-instance
@@ -343,7 +375,7 @@ static void rq_submit_explicit_instanced(const JceRqEntry *e)
      * convention is to simply not set an index buffer — passing the invalid
      * handle into the encoder is UB that AVs under re-entrant renders. */
     if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, 0, c->index_count);
+        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
 
     if (e->inst_persist_vb) {
         /* 千万 S1: instance data is GPU-resident — bind it directly, no copy. */
@@ -362,7 +394,7 @@ static void rq_submit_explicit_instanced(const JceRqEntry *e)
         memcpy(idb.data, e->inst_data, (size_t)got * stride_b);
         jce_enc_set_instance_data_buffer(&idb, 0, got);
     }
-    jce_enc_set_state(rq_resolve_state(c), 0);
+    rq_apply_state(c);
 
     bgfx_program_handle_t prog = { c->program };
     jce_enc_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
@@ -394,9 +426,9 @@ static bool rq_submit_auto_batched(const JceRqEntry *entries,
     jce_enc_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     /* Non-indexed mesh: skip the bind (see rq_submit_explicit_instanced). */
     if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, 0, c->index_count);
+        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
     jce_enc_set_instance_data_buffer(&idb, 0, got);
-    jce_enc_set_state(rq_resolve_state(c), 0);
+    rq_apply_state(c);
 
     bgfx_program_handle_t prog = { c->program };
     jce_enc_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);

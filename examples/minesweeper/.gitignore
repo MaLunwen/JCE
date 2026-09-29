@@ -1,0 +1,7 @@
+build/
+native/build/
+resources/_cooked/
+.jce/
+__pycache__/
+shots/
+*.log

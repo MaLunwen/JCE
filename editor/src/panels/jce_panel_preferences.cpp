@@ -50,6 +50,9 @@
 #include "core/jce_editor_state.h"
 #include "core/jce_hotkeys.h"
 #include "dialogs/jce_path_input.h"
+#include "ui/jce_editor_tip.h"
+
+#include <jce/application/jce_engine.h>
 
 #include <jce/tools/jce_imgui.hpp>
 
@@ -447,6 +450,11 @@ void draw_tab_appearance()
             break;
         }
     }
+    /* Sticky only for this panel session: the result is about the NEXT
+     * launch, so it must stay on screen after the click that caused it. */
+    static bool s_renderer_redetect_shown = false;
+    static bool s_renderer_redetect_ok    = false;
+
     if (s_backend_count > 0 &&
         ImGui::Combo(jce_editor_i18n("panel.preferences.renderer"),
                      &rend_idx, s_backend_names, s_backend_count)) {
@@ -455,13 +463,54 @@ void draw_tab_appearance()
         cfg_dirty = true;
     }
     {
-        const char *active = jce_renderer_get_backend_name(NULL);
+        /* The RUNNING backend, version included -- jce_renderer_get_backend_name
+         * returns bgfx's name, whose OpenGL spelling is a compile-time string
+         * built from the build floor, so it said 3.1 while we ran at 4.6. */
+        const char *active = jce_renderer_running_backend_name();
         if (active && active[0]) {
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s: %s",
                 jce_editor_i18n("panel.preferences.renderer_active"), active);
         }
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s",
             jce_editor_i18n("panel.preferences.renderer_hint"));
+
+        /* "Auto" alone cannot mean "decide again": the engine remembers what
+         * the backend ladder chose the first time and starts there, which is
+         * the point of remembering it.  Asking for a fresh decision has to be
+         * its own act, and without this button the only way to do it is to
+         * delete renderer.backend_resolved out of the ini by hand. */
+        if (ImGui::SmallButton(
+                jce_editor_i18n("panel.preferences.renderer_redetect"))) {
+            s_renderer_redetect_ok = jce_engine_forget_resolved_backend();
+            s_renderer_redetect_shown = true;
+        }
+        jce_editor::help_tip(
+            jce_editor_i18n("panel.preferences.renderer_redetect_tip"));
+        if (s_renderer_redetect_shown) {
+            ImGui::SameLine();
+            /* Forgetting the remembered backend is not enough on its own: the
+             * editor passes its OWN renderer preference to the engine as a
+             * host override, and the ladder only runs when the policy is
+             * AUTO.  So on the default Windows editor (D3D11) the button
+             * succeeded and promised a re-detection that could not happen.
+             * Say which of the two states the user is actually in. */
+            const bool pinned =
+                s_cfg.renderer[0] &&
+                jce_strcasecmp(s_cfg.renderer, "Auto") != 0;
+            if (s_renderer_redetect_ok && pinned) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         jce_editor_i18n("panel.preferences.renderer_redetect_pinned"),
+                         s_cfg.renderer);
+                ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.35f, 1.0f), "%s",
+                                   msg);
+            } else if (s_renderer_redetect_ok)
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s",
+                    jce_editor_i18n("panel.preferences.renderer_redetect_done"));
+            else
+                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.55f, 1.0f), "%s",
+                    jce_editor_i18n("panel.preferences.renderer_redetect_failed"));
+        }
     }
 
     if (cfg_dirty)   jce_editor_config_save(&s_cfg);
@@ -545,6 +594,15 @@ void draw_tab_viewport()
     if (ImGui::Checkbox(jce_editor_i18n("preferences.editorTab.showGizmos"),
                         &s_cfg.show_gizmos))
         cfg_dirty = true;
+
+    /* Off by default on purpose -- the tooltip says why, because a checkbox
+     * that looks like free performance and is not will be turned on by
+     * everyone who sees it.  Takes effect on the next editor start: the
+     * culler is created once per viewport at init. */
+    if (ImGui::Checkbox(jce_editor_i18n("preferences.viewport.occlusion"),
+                        &s_cfg.viewport_occlusion))
+        cfg_dirty = true;
+    jce_editor::help_tip(jce_editor_i18n("preferences.viewport.occlusionTip"));
     if (ImGui::SliderFloat(jce_editor_i18n("preferences.editorTab.gizmoScale"),
                            &s_cfg.gizmo_scale,
                            JCE_PREF_GIZMO_SCALE_MIN, JCE_PREF_GIZMO_SCALE_MAX)) {

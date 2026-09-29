@@ -83,8 +83,11 @@ void jce_editor_scene_rendering_settings_from_project(
         out->cascade_count = q->shadow_cascades;
         out->shadow_resolution =
             quality_shadow_resolution_pixels(q->shadow_resolution);
+        /* At the top quality step a NEW scene asks for contact hardening;
+         * below it, for a hard edge.  Existing scenes are untouched -- this
+         * runs only when a scene takes its defaults from the project. */
         out->soft_shadow_mode = (q->shadow_quality >= 2)
-            ? JCE_SCENE_SOFT_SHADOW_PCF
+            ? JCE_SCENE_SOFT_SHADOW_PCSS
             : JCE_SCENE_SOFT_SHADOW_OFF;
     }
 
@@ -145,20 +148,36 @@ void jce_editor_scene_rendering_settings_from_project(
     out->bloom_knee     = rs.bloom_knee;
 }
 
+/* Process-global texture state from Project Settings (Quality > Texture
+ * Quality mip drop + Graphics > Anisotropic override + Graphics > Colour
+ * Space).  Applies on EVERY scene load, so already-authored scenes honour it
+ * too, not just freshly-created ones.
+ *
+ * Split out of jce_editor_scene_ensure_rendering_settings() on 2026-09-22.
+ * It used to run as that function's first block, before the guard, so the
+ * load paths got it as a side effect of fabricating a rendering-settings
+ * component.  Removing the fabrication (see the load sites) would have taken
+ * this with it, silently — two unrelated behaviours sharing one entry point.
+ *
+ * NOTE, and it is not small: all three of these are EDITOR-ONLY.  Nothing in
+ * engine/src reads JceProjectSettings, so the shipped exe applies none of
+ * them.  A project that sets Colour Space to Linear or drops texture quality
+ * sees it in the editor and not in the build. */
+void jce_editor_scene_apply_project_texture_state(void)
+{
+    const JceProjectSettings *ps = jce_project_settings_current();
+    JceProjectSettings defaults;
+    if (!ps) { jce_project_settings_defaults(&defaults); ps = &defaults; }
+    const JceProjectQualityLevel *q = current_quality_level(ps);
+    jce_texture_set_quality_mip_bias(q ? (int8_t)q->texture_quality : 0);
+    jce_texture_set_aniso_override((int)ps->graphics.anisotropic_textures);
+    /* 1 = Linear, 0 = Gamma. */
+    jce_texture_set_colour_space(ps->graphics.color_space != 0);
+}
+
 void jce_editor_scene_ensure_rendering_settings(JceScene *scene)
 {
-    /* Process-global texture state from Project Settings (Quality > Texture
-     * Quality mip drop + Graphics > Anisotropic override) applies on EVERY
-     * scene load — BEFORE the has-rendering-settings guard — so already-authored
-     * scenes honour it too, not just freshly-created ones. */
-    {
-        const JceProjectSettings *ps = jce_project_settings_current();
-        JceProjectSettings defaults;
-        if (!ps) { jce_project_settings_defaults(&defaults); ps = &defaults; }
-        const JceProjectQualityLevel *q = current_quality_level(ps);
-        jce_texture_set_quality_mip_bias(q ? (int8_t)q->texture_quality : 0);
-        jce_texture_set_aniso_override((int)ps->graphics.anisotropic_textures);
-    }
+    jce_editor_scene_apply_project_texture_state();
 
     if (!scene || jce_scene_has_rendering_settings(scene))
         return;

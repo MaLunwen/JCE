@@ -649,7 +649,56 @@ static uint32_t particles_estimated_emitter_work(const Emitter *em, float dt)
     return work > UINT32_MAX ? UINT32_MAX : (uint32_t)work;
 }
 
+
+static void particles_update_step(JceParticleSystem *sys, float dt);
+
+/* <= 0 = no cap, the behaviour every build had before this. */
+static float s_particles_max_dt = 0.0f;
+
+void jce_particles_set_max_timestep(float seconds)
+{
+    s_particles_max_dt = (seconds > 0.0f) ? seconds : 0.0f;
+}
+
+float jce_particles_get_max_timestep(void)
+{
+    return s_particles_max_dt;
+}
+
+/* <= 0 = no fade, the behaviour every build had before this. */
+static float s_particles_soft_fade = 0.0f;
+
+void jce_particles_set_soft_fade_distance(float world_units)
+{
+    s_particles_soft_fade = (world_units > 0.0f) ? world_units : 0.0f;
+}
+
+float jce_particles_get_soft_fade_distance(void)
+{
+    return s_particles_soft_fade;
+}
+
 void jce_particles_update(JceParticleSystem *sys, float dt)
+{
+    /* Sub-step rather than clamp: the total simulated time is preserved.  A
+     * cap of 0 (the default) runs exactly one step, byte-identical to the
+     * behaviour before the cap existed. */
+    if (s_particles_max_dt <= 0.0f || dt <= s_particles_max_dt) {
+        particles_update_step(sys, dt);
+        return;
+    }
+    {
+        float remaining = dt;
+        int   guard     = 64;   /* a 4 s hitch at a 60 ms cap is 67 steps */
+        while (remaining > 0.0f && guard-- > 0) {
+            const float step = (remaining > s_particles_max_dt)
+                               ? s_particles_max_dt : remaining;
+            particles_update_step(sys, step);
+            remaining -= step;
+        }
+    }
+}
+static void particles_update_step(JceParticleSystem *sys, float dt)
 {
     uint64_t estimated_work = 0u;
     uint32_t max_emitter_work = 0u;

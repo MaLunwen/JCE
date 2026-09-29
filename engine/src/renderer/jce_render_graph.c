@@ -12,7 +12,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/renderer/jce_render_graph.h>
+#include "jce_render_graph.h"
 
 #include "os/core/jce_memory.h"
 
@@ -177,8 +177,20 @@ JceRenderGraph *jce_rg_create(void)
     if (!rg) return NULL;
 
     /* Reserve low views for engine use. Graph views start at 100. */
-    rg->base_view_id = 100;
+    /* No default: see jce_rg_set_base_view_id() in the header.  This was 100,
+     * which lands inside the Scene View's point-shadow cube band (103..119)
+     * and the Game View's core span -- silently overwriting whichever pass
+     * owns those ids.  Nothing had ever called this API, so nothing had ever
+     * hit it.  compile() now refuses until the caller chooses. */
+    rg->base_view_id = JCE_RG_BASE_VIEW_UNSET;
     return rg;
+}
+
+void jce_rg_set_base_view_id(JceRenderGraph *rg, uint16_t base_view_id)
+{
+    if (!rg) return;
+    rg->base_view_id = base_view_id;
+    rg->compiled     = false;   /* view assignment is part of compile output */
 }
 
 void jce_rg_destroy(JceRenderGraph *rg)
@@ -294,6 +306,17 @@ bool jce_rg_compile(JceRenderGraph *rg)
 {
     JCE_PROFILE_ZONE_N("RenderGraph::Compile");
     if (!rg) { JCE_PROFILE_ZONE_END; return false; }
+
+    if (rg->base_view_id == JCE_RG_BASE_VIEW_UNSET) {
+        LOG_ERROR(LOG_TAG,
+                  "compile: no base view id.  bgfx view ids are one flat "
+                  "0..255 space and jce_views.h has already claimed almost "
+                  "all of it; there is no band this graph can safely assume. "
+                  "Call jce_rg_set_base_view_id() with a range you know is "
+                  "free in YOUR process.");
+        JCE_PROFILE_ZONE_END;
+        return false;
+    }
 
     rg->exec_count = 0;
 
@@ -473,6 +496,23 @@ void jce_rg_reset(JceRenderGraph *rg)
 
 /* ── Self-test ────────────────────────────────────────────────────── */
 
+/* jce_rg_add_pass() REJECTS a NULL execute callback, and the ordering tests
+ * below do not execute anything -- so they need a callback that does nothing
+ * rather than no callback.  Passing NULL is what made this self-test fail the
+ * first time it was ever run (2026-08-31): all three add_pass calls returned
+ * the invalid handle, pass_count stayed 0, and compile() then reported
+ * success on an empty graph.
+ *
+ * NOTE for whoever owns this subsystem: add_pass rejects a NULL fn while
+ * execute (jce_render_graph.c:424, `if (p->culled || !p->fn) continue;`)
+ * tolerates one.  Those two cannot both be the intended contract.  Left as
+ * found -- loosening a validation check in the renderer on a reading of the
+ * code is not a self-test's call to make. */
+static void rg_selftest_noop(JceRGPass pass, uint16_t view, void *userdata)
+{
+    (void)pass; (void)view; (void)userdata;
+}
+
 bool jce_rg_self_test(void)
 {
     bool ok = true;
@@ -481,41 +521,96 @@ bool jce_rg_self_test(void)
     JceRenderGraph *rg = jce_rg_create();
     if (!rg) return false;
 
+    /* Any band is free here: this runs headless with no scene renderer.  It
+     * is set explicitly because compile() now requires it -- see
+     * jce_rg_set_base_view_id() in the header for why there is no default. */
+    jce_rg_set_base_view_id(rg, 0u);
+
     JceRGResourceDesc d = { 256, 256, JCE_RG_FORMAT_RGBA8, "rt" };
     JceRGResource a = jce_rg_create_resource(rg, &d);
     JceRGResource b = jce_rg_create_resource(rg, &d);
 
-    JceRGPass p0 = jce_rg_add_pass(rg, "shadow",  NULL, NULL);
-    JceRGPass p1 = jce_rg_add_pass(rg, "opaque",  NULL, NULL);
-    JceRGPass p2 = jce_rg_add_pass(rg, "post",    NULL, NULL);
+    JceRGPass p0 = jce_rg_add_pass(rg, "shadow", rg_selftest_noop, NULL);
+    JceRGPass p1 = jce_rg_add_pass(rg, "opaque", rg_selftest_noop, NULL);
+    JceRGPass p2 = jce_rg_add_pass(rg, "post",   rg_selftest_noop, NULL);
+    /* Checked, because not checking is why the NULL-fn bug above was silent:
+     * add_pass returned the invalid handle three times, pass_write() then
+     * bounds-rejected every edge, and compile() reported success on the empty
+     * graph that was left. */
+    if (p0.idx == UINT16_MAX || p1.idx == UINT16_MAX || p2.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "self-test 1: add_pass rejected a pass "
+                  "(idx %u,%u,%u)", p0.idx, p1.idx, p2.idx);
+        jce_rg_destroy(rg);
+        return false;
+    }
 
     jce_rg_pass_write(rg, p0, a);
     jce_rg_pass_read (rg, p1, a);
     jce_rg_pass_write(rg, p1, b);
     jce_rg_pass_read (rg, p2, b);
 
-    if (!jce_rg_compile(rg))                              ok = false;
-    if (rg->exec_count != 3)                              ok = false;
-    if (rg->exec_order[0] != p0.idx ||
-        rg->exec_order[1] != p1.idx ||
-        rg->exec_order[2] != p2.idx)                      ok = false;
+    if (!jce_rg_compile(rg)) {
+        LOG_ERROR(LOG_TAG, "self-test 1: linear DAG failed to compile");
+        ok = false;
+    }
+    if (rg->exec_count != 3) {
+        LOG_ERROR(LOG_TAG, "self-test 1: exec_count=%d (want 3)",
+                  rg->exec_count);
+        ok = false;
+    } else if (rg->exec_order[0] != p0.idx ||
+               rg->exec_order[1] != p1.idx ||
+               rg->exec_order[2] != p2.idx) {
+        LOG_ERROR(LOG_TAG, "self-test 1: exec_order=%d,%d,%d "
+                  "(want %d,%d,%d = shadow,opaque,post)",
+                  rg->exec_order[0], rg->exec_order[1], rg->exec_order[2],
+                  p0.idx, p1.idx, p2.idx);
+        ok = false;
+    }
     jce_rg_destroy(rg);
 
     /* ----- Test 2: cycle is detected ----- */
     rg = jce_rg_create();
     if (!rg) return false;
 
+    jce_rg_set_base_view_id(rg, 0u);
+
     JceRGResource ra = jce_rg_create_resource(rg, &d);
     JceRGResource rb = jce_rg_create_resource(rg, &d);
-    JceRGPass q0 = jce_rg_add_pass(rg, "loop_a", NULL, NULL);
-    JceRGPass q1 = jce_rg_add_pass(rg, "loop_b", NULL, NULL);
+    JceRGPass q0 = jce_rg_add_pass(rg, "loop_a", rg_selftest_noop, NULL);
+    JceRGPass q1 = jce_rg_add_pass(rg, "loop_b", rg_selftest_noop, NULL);
+    if (q0.idx == UINT16_MAX || q1.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "self-test 2: add_pass rejected a pass");
+        jce_rg_destroy(rg);
+        return false;
+    }
     /* q0 writes a, reads b ; q1 writes b, reads a → cycle */
     jce_rg_pass_write(rg, q0, ra); jce_rg_pass_read(rg, q0, rb);
     jce_rg_pass_write(rg, q1, rb); jce_rg_pass_read(rg, q1, ra);
 
     if (jce_rg_compile(rg)) {
         /* Cycle MUST cause compile to fail. */
+        LOG_ERROR(LOG_TAG, "self-test 2: a cyclic graph compiled; the "
+                  "cycle check did not reject it");
         ok = false;
+    }
+    jce_rg_destroy(rg);
+
+    /* ----- Test 3: compile refuses without an explicit view band ----- */
+    rg = jce_rg_create();
+    if (!rg) return false;
+    {
+        JceRGPass r0 = jce_rg_add_pass(rg, "unbased", rg_selftest_noop, NULL);
+        if (r0.idx == UINT16_MAX) {
+            LOG_ERROR(LOG_TAG, "self-test 3: add_pass rejected a pass");
+            ok = false;
+        } else if (jce_rg_compile(rg)) {
+            /* Before 2026-08-31 this compiled against a hardcoded base of 100,
+             * which overlaps the Scene View's point-cube band and the Game
+             * View's core span. */
+            LOG_ERROR(LOG_TAG, "self-test 3: compiled with no base view id; "
+                      "the graph would have picked a band on its own");
+            ok = false;
+        }
     }
     jce_rg_destroy(rg);
 

@@ -6,7 +6,7 @@
  * nothing outside engine/src/os/platform/ includes it.
  *
  * It contains NO SDL token of its own.  That is deliberate and it is checked:
- * scripts/lint/check_input_seam.py requires SDL to appear in exactly one input
+ * tools/lint/check_input_seam.py requires SDL to appear in exactly one input
  * translation unit, jce_input_sdl.c, and this header is inside the scanned
  * set.  The platform event arrives as `const void *` for the same reason the
  * public jce_input_handle_event takes one.

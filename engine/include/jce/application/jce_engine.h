@@ -14,6 +14,7 @@
 #include <jce/os/core/jce_defs.h>
 
 #include <stddef.h>   /* size_t (jce_engine_set_app_desc_sized) */
+#include <stdbool.h> /* bool (jce_engine_quit_requested, _forget_resolved_backend) */
 
 JCE_EXTERN_C_BEGIN
 
@@ -112,6 +113,32 @@ JCE_API void   JCE_CALL jce_engine_set_fixed_hz(double hz);
 /* Current FixedUpdate cadence in Hertz (1.0 / fixed_dt). */
 JCE_API double JCE_CALL jce_engine_get_fixed_hz(void);
 
+/* ── Frame-rate cap (Unity's Application.targetFrameRate) ─────────────
+ *
+ * The engine had NO frame limiter.  A shipped game sitting on a menu, or any
+ * scene the GPU finishes early, ran the loop as fast as it could -- thousands
+ * of frames a second on a simple scene -- burning a laptop's battery and
+ * spinning its fans for frames nobody sees.  vsync bounds it only when vsync
+ * is on AND the swapchain actually blocks; Project Settings > Quality has
+ * carried a Target Framerate field all along, with nothing to hand it to.
+ *
+ * `fps <= 0` is uncapped (the default, and Unity's -1).  Otherwise
+ * jce_engine_iterate waits at the end of each frame until the frame's share of
+ * a second has passed: it sleeps the bulk and spins only the last fraction of
+ * a millisecond, because a pure sleep overshoots on a 1 ms-granularity OS
+ * timer and a pure spin would burn the CPU this exists to save.
+ *
+ * The deadline advances from the PREVIOUS deadline, not from "now", so the
+ * cap does not drift late by the sleep's own overshoot every frame; a frame
+ * that overran its budget resets the deadline instead of being repaid with a
+ * burst of zero-length frames.
+ *
+ * Process-global, matching jce_engine_set_fixed_hz: a game has one loop, and
+ * this must be callable before the engine exists.  Safe from any thread; the
+ * wait itself happens on the loop thread. */
+JCE_API void JCE_CALL jce_engine_set_target_fps(int fps);
+JCE_API int  JCE_CALL jce_engine_get_target_fps(void);
+
 /* ---- Optional scene-asset bundle catalog ----------------------- */
 
 /* Set the bundle catalog path *before* jce_engine_create().  When set,
@@ -156,6 +183,21 @@ JCE_API void JCE_CALL jce_engine_apply_graphics_config(
  * presets (hold ESC 2s) and available to any app/driver code. */
 JCE_API void JCE_CALL jce_engine_request_quit(void);
 JCE_API bool JCE_CALL jce_engine_quit_requested(void);
+
+/* Forget which backend AUTO settled on, so the next launch walks the platform
+ * chain again from the most modern backend down to the most compatible one.
+ *
+ * This is what "decide again" means, and it needs to be an explicit act: a
+ * host that merely passes AUTO on every launch is asking for the REMEMBERED
+ * answer, not for the ladder to run each time.  Without this call there is no
+ * way to ask for a re-decision short of hand-editing renderer.backend_resolved
+ * out of the ini, which is not something a UI can offer.
+ *
+ * Reads and rewrites the engine config file wherever the engine would look for
+ * it, so callers do not need the path.  Returns false if the file could not be
+ * written (an ini on read-only media, say), in which case nothing changed.
+ * Takes effect on the next launch; the live renderer is not touched. */
+JCE_API bool JCE_CALL jce_engine_forget_resolved_backend(void);
 
 JCE_EXTERN_C_END
 

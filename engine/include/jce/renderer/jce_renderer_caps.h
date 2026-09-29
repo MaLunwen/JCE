@@ -46,7 +46,12 @@ typedef enum {
 #define JCE_CAP_TEXTURE_3D         (1u << 2)   /* 3D texture sampling     */
 #define JCE_CAP_TEXTURE_FLOAT      (1u << 3)   /* Float textures (FP16+)  */
 #define JCE_CAP_FRAMEBUFFER_FLOAT  (1u << 4)   /* Float framebuffers      */
-#define JCE_CAP_MULTI_DRAW         (1u << 5)   /* Multi-draw indirect     */
+/* RESERVED AND NEVER SET.  jce_renderer_get_caps() does not test for it,
+ * because bgfx exposes no capability distinct from BGFX_CAPS_DRAW_INDIRECT
+ * (-> JCE_CAP_DRAW_INDIRECT).  A caller reading this bit as 0 is reading a
+ * question that was never asked, not a "no" -- the same trap as the
+ * vertex-fetch format bits.  Use JCE_CAP_DRAW_INDIRECT. */
+#define JCE_CAP_MULTI_DRAW         (1u << 5)
 #define JCE_CAP_TEXTURE_COMPARE    (1u << 6)   /* Shadow map PCF          */
 #define JCE_CAP_VERTEX_ID          (1u << 7)   /* gl_VertexID support     */
 #define JCE_CAP_DRAW_INDIRECT      (1u << 8)   /* Draw-indirect           */
@@ -183,8 +188,84 @@ typedef enum JceRendererBackend {
     JCE_BACKEND_NOOP
 } JceRendererBackend;
 
+/* Graphics API compatibility tier selected when the bgfx package and JCE
+   renderer are built.  This is deliberately separate from JceGpuTier:
+   graphics API tier is a compatibility floor, while GPU tier is a runtime
+   quality recommendation.  Changing this value requires rebuilding bgfx and
+   JCE; it is not a live editor toggle. */
+/* WHAT A HIGHER TIER DOES AND DOES NOT BUY, since the obvious reading is now
+ * wrong.  Before the renderer laddered its own context, the tier WAS the
+ * version you ran at, so picking a higher one really did get you newer GL.  It
+ * no longer does: the renderer builds the newest core context the driver
+ * grants at or above the floor, so a stable-tier build already runs at 4.6 on
+ * hardware that offers it.
+ *
+ * What the higher tiers still change, measured against bgfx's source:
+ *   >= 40  two texture-format defines (RED_INTEGER / RG_INTEGER)
+ *   >= 41  two uniform-vector limit queries, which otherwise use 16 / 128
+ *   >= 43  twelve sites, eleven of them extension-table seeds the runtime
+ *          GL_EXTENSIONS scan turns on anyway, the twelfth falling back to
+ *          KHR_debug detection
+ * and, unavoidably, they RAISE THE MINIMUM -- a modern-tier build refuses
+ * every GPU below GL 4.3.
+ *
+ * So the tier is now a support-matrix decision, not a performance one.  Pick a
+ * higher one to narrow what you ship to, never to go faster. */
+typedef enum JceGraphicsApiTier {
+    JCE_GRAPHICS_API_TIER_STABLE  = 0,
+    JCE_GRAPHICS_API_TIER_MODERN  = 1,
+    JCE_GRAPHICS_API_TIER_CURRENT = 2,
+    JCE_GRAPHICS_API_TIER_COUNT   = 3
+} JceGraphicsApiTier;
+
+typedef struct JceGraphicsApiVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t patch;
+} JceGraphicsApiVersion;
+
+/* Build policy and negotiated runtime version for the active backend.
+   A false *_verified flag means the backend did not report that value; a
+   zero version must never be interpreted as a real API version. */
+typedef struct JceRendererApiInfo {
+    JceRendererBackend    backend;
+    JceGraphicsApiTier    build_tier;
+    JceGraphicsApiVersion minimum_version;
+    JceGraphicsApiVersion runtime_version;
+    JceGraphicsApiVersion shader_language_version;
+    bool                  runtime_version_verified;
+    bool                  shader_language_version_verified;
+} JceRendererApiInfo;
+
 /* Return a stable human-readable name for a backend.  Never NULL. */
 JCE_API const char *jce_renderer_backend_name(JceRendererBackend b);
+
+/* Stable human-readable tier name.  Never NULL. */
+JCE_API const char *jce_graphics_api_tier_name(JceGraphicsApiTier tier);
+
+/* Minimum API version required by a backend at a selected build tier.
+   Backends without a versioned public API in this policy return 0.0.0. */
+JCE_API JceGraphicsApiVersion jce_renderer_api_tier_minimum(
+    JceRendererBackend backend, JceGraphicsApiTier tier);
+
+/* Return the active backend's build floor and negotiated version snapshot.
+   Safe to call before renderer creation; backend is AUTO and versions are
+   unverified in that state. */
+JCE_API JceRendererApiInfo jce_renderer_get_api_info(void);
+
+/* The backend as it is RUNNING, e.g. "OpenGL 4.6" -- for log lines and UI.
+ *
+ * bgfx_get_renderer_name() cannot be used for this.  Its OpenGL string is
+ * BGFX_RENDERER_OPENGL_NAME, a compile-time constant built from the build
+ * floor, so a session that laddered up to a 4.6 core context still printed
+ * "OpenGL 3.1" in three separate places -- which is exactly the reading that
+ * cost an hour of this renderer's development, taken as a measurement when it
+ * never was one.
+ *
+ * Falls back to bgfx's name when no version was observed (every non-GL
+ * backend, and GL where the driver would not say).  Returns a pointer to
+ * static storage, valid until the next call; never NULL. */
+JCE_API const char *jce_renderer_running_backend_name(void);
 
 /* Active bgfx backend as a JceRendererBackend (no-arg; JCE_BACKEND_AUTO
  * before bgfx init).  For middleware that must branch per backend without

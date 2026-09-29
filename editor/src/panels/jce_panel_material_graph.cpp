@@ -107,7 +107,7 @@ static void draw_content(void)
 namespace jce_mgp {
 
 static JcePanelTabState g_tabs{ "panel.graph_authoring.current_tab",
-                                /*max_tab=*/3 };
+                                /*max_tab=*/4 };
 
 void draw_workbench(void)
 {
@@ -123,11 +123,13 @@ void draw_workbench(void)
     ImGuiTabItemFlags shd_flags = jce_panel_tab_flags(g_tabs, 1);
     ImGuiTabItemFlags vfx_flags = jce_panel_tab_flags(g_tabs, 2);
     ImGuiTabItemFlags par_flags = jce_panel_tab_flags(g_tabs, 3);
+    ImGuiTabItemFlags ins_flags = jce_panel_tab_flags(g_tabs, 4);
 
     char mat_label[96];
     char shd_label[96];
     char vfx_label[96];
     char par_label[96];
+    char ins_label[96];
     std::snprintf(mat_label, sizeof(mat_label), "%s###ga_tab_material",
                   jce_editor_i18n("materialGraph.title"));
     std::snprintf(shd_label, sizeof(shd_label), "%s###ga_tab_shader",
@@ -136,6 +138,8 @@ void draw_workbench(void)
                   jce_editor_i18n("vfxGraph.title"));
     std::snprintf(par_label, sizeof(par_label), "%s###ga_tab_particles",
                   jce_editor_i18n("particleEditor.title"));
+    std::snprintf(ins_label, sizeof(ins_label), "%s###ga_tab_shader_inspect",
+                  jce_editor_i18n("window.shaderInspector"));
 
     if (ImGui::BeginTabItem(mat_label, nullptr, mat_flags)) {
         jce_panel_tab_set_current(g_tabs, 0);
@@ -155,6 +159,11 @@ void draw_workbench(void)
     if (ImGui::BeginTabItem(par_label, nullptr, par_flags)) {
         jce_panel_tab_set_current(g_tabs, 3);
         jce_editor_panel_particle_editor_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(ins_label, nullptr, ins_flags)) {
+        jce_panel_tab_set_current(g_tabs, 4);
+        jce_editor_panel_shader_inspector_content();
         ImGui::EndTabItem();
     }
 
@@ -273,4 +282,110 @@ extern "C" void jce_editor_open_material_graph(const char *path)
     jce_editor_console_log_level(JCE_CONSOLE_WARNING,
         "material graph: unsupported file '%s' (need .matgraph.json or .mat.json)",
         path);
+}
+
+/* ── Headless authoring hook (JCE_DBG_GRAPH_COMPILE) ──────────────────────
+ *
+ * "Does a graph-authored shader survive the cook" stayed open for days with
+ * BOTH of its diagnosed causes already fixed -- the packer collects the blobs,
+ * the blobs are compiled per backend -- because nobody could answer it.  The
+ * only way to author a graph material was to click two buttons, so the
+ * end-to-end path (author -> cook -> pak -> shipped exe renders it) had never
+ * been walked once, and two fixes that are read but never run are two claims.
+ *
+ * This drives the SAME two entry points those buttons call, in the same order
+ * a user uses them: compile_to_material() writes the factors into the sibling
+ * .mat.json, compile_and_bind() codegens the .sc, compiles one blob per
+ * backend and records customProgramVs/Fs.  Deliberately not a private path:
+ * if it diverged from the buttons it would prove something nobody ships.
+ *
+ * Format: JCE_DBG_GRAPH_COMPILE="<path/to/x.matgraph.json>@<frame>".  The
+ * frame is there because the editor needs its renderer up before shaderc's
+ * backend list means anything.
+ */
+/* Forward the panel's compile log to the editor log, one line at a time.
+ *
+ * Every diagnostic the two compile entry points produce -- which node failed
+ * to typecheck, which backend profile refused, which blob could not be
+ * written -- goes to jce_mgp::s_log, a text buffer whose only reader is a
+ * scrolling box in the panel.  Headless, that box does not exist, so a run
+ * reported "codegen failed" and nothing else.  A hook that can say a step
+ * failed but not why is a hook that has to be debugged by hand every time,
+ * which is most of what it was built to avoid. */
+static void dump_compile_log(const char *what)
+{
+    const char *p = jce_mgp::s_log.text;
+    if (!p || !p[0]) return;
+    char line[512];
+    while (*p) {
+        const char *nl = std::strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : std::strlen(p);
+        if (n >= sizeof(line)) n = sizeof(line) - 1;
+        std::memcpy(line, p, n);
+        line[n] = '\0';
+        if (line[0])
+            jce_editor_console_log_level(
+                jce_mgp::s_log.has_error ? JCE_CONSOLE_WARNING : JCE_CONSOLE_INFO,
+                "GRAPH_COMPILE[%s]: %s", what, line);
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+void jce_panel_material_graph_headless_tick(void)
+{
+    static int      s_frame = -2;      /* -2 unparsed, -1 disabled/fired */
+    static char     s_path[512];
+    static uint32_t s_tick = 0;
+    static bool     s_waiting = false;   /* compile_and_bind is async */
+
+    /* The compile started on an earlier frame and finishes on a worker.  Every
+     * diagnostic worth having -- which backend profile refused, which blob
+     * could not be written, whether the .mat.json got its customProgramVs/Fs
+     * -- is appended by shader_compile_finalize, which runs after
+     * compile_and_bind has already returned.  Dumping once at the call site
+     * therefore prints the log as it stood BEFORE the work happened. */
+    if (s_waiting) {
+        if (jce_mgp::shader_compile_running()) return;
+        s_waiting = false;
+        dump_compile_log("finalize");
+        jce_editor_console_log_level(
+            jce_mgp::s_log.has_error ? JCE_CONSOLE_ERROR : JCE_CONSOLE_INFO,
+            "GRAPH_COMPILE: %s", jce_mgp::s_log.has_error ? "FAILED" : "DONE");
+        return;
+    }
+
+    if (s_frame == -1) return;
+    if (s_frame == -2) {
+        const char *v = std::getenv("JCE_DBG_GRAPH_COMPILE");
+        s_frame = -1;
+        if (v && v[0]) {
+            const char *at = std::strrchr(v, '@');
+            if (at && at[1]) {
+                size_t n = (size_t)(at - v);
+                if (n < sizeof(s_path)) {
+                    std::memcpy(s_path, v, n);
+                    s_path[n] = '\0';
+                    s_frame = std::atoi(at + 1);
+                }
+            }
+        }
+        if (s_frame < 0) return;
+    }
+
+    if (++s_tick < (uint32_t)s_frame) return;
+    s_frame = -1;                       /* once */
+
+    std::snprintf(jce_mgp::s_g.path, sizeof(jce_mgp::s_g.path), "%s", s_path);
+    if (!jce_mgp::load_graph(s_path)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "GRAPH_COMPILE: cannot load '%s'", s_path);
+        return;
+    }
+    jce_editor_console_log("GRAPH_COMPILE: %s", s_path);
+    jce_mgp::compile_to_material();
+    dump_compile_log("compile_to_material");
+    jce_mgp::compile_and_bind();
+    dump_compile_log("compile_and_bind");
+    s_waiting = true;
 }

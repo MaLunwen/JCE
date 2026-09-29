@@ -7,6 +7,8 @@
 #include "middleware/animation/jce_ragdoll.h"
 
 #include <jce/os/core/jce_log.h>
+#include <jce/middleware/animation/jce_humanoid.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 
 #include "os/core/jce_memory.h"
 
@@ -67,10 +69,44 @@ static jce_vec3 ragdoll_origin(const jce_mat4 *m)
 /* Creation                                                            */
 /* ================================================================== */
 
+/* The angular limit for one joint, in degrees, or a negative number when this
+ * joint has no humanoid role the engine recognises.
+ *
+ * ONE SYMMETRIC CONE ON ALL THREE AXES, and that is a deliberate under-claim.
+ * A real ragdoll wants swing on two axes and twist on the third, and this
+ * engine HAS those numbers separately -- but it cannot say which of a body's
+ * local axes is the twist axis.  jce_humanoid.h states the reason where the
+ * muscle limits are declared: "a cone cannot say 'a knee bends forward and
+ * not back': that needs a hinge AXIS, and a hinge axis is not derivable from
+ * a rest pose where the leg is straight".  The bodies here are built at bind
+ * world transforms and the constraint frames follow them, so which local axis
+ * runs down the bone is a different answer in every rig this tree carries.
+ *
+ * So the cone is max(swing, |twist|): the LOOSER of the two, never tighter
+ * than the muscle table permits on any axis.  It does not stop a knee bending
+ * the wrong way -- that needs the hinge axis -- but it does stop every joint
+ * rotating without bound, which is what "heads rotate freely" meant.
+ * Claiming the split without the axis would be the more precise-sounding lie.
+ */
+static float ragdoll_joint_limit_deg(const JceSkeleton *skel, int joint_index)
+{
+    const char *name = jce_skeleton_joint_name(skel, (uint32_t)joint_index);
+    if (!name || !name[0]) return -1.0f;
+
+    const JceHumanoidBone role = jce_humanoid_bone_from_joint_name(name);
+    JceHumanoidMuscleLimits L;
+    if (!jce_humanoid_muscle_limits(role, &L)) return -1.0f;
+
+    float twist = -L.twist_min;
+    if (L.twist_max > twist) twist = L.twist_max;
+    return (L.swing_max > twist) ? L.swing_max : twist;
+}
+
 JceRagdoll *jce_ragdoll_create(const JceSkeleton *skel,
                                JcePhysicsWorld   *world,
                                float              radius,
-                               float              height_scale)
+                               float              height_scale,
+                               float              limit_scale)
 {
     if (!skel || !world) return NULL;
 
@@ -225,23 +261,53 @@ JceRagdoll *jce_ragdoll_create(const JceSkeleton *skel,
         jce_vec4 pivot_a4 = jce_m4_mul_v4(&inv_parent, aw);
         jce_vec4 pivot_b4 = jce_m4_mul_v4(&inv_child, aw);
 
-        JceConstraintDesc cd;
-        memset(&cd, 0, sizeof(cd));
-        cd.type    = JCE_CONSTRAINT_GENERIC6DOF;
-        cd.body_a  = parent_rb->body;       /* parent */
-        cd.body_b  = rb->body;              /* this joint */
-        cd.pivot_a = jce_v3(pivot_a4.x, pivot_a4.y, pivot_a4.z);
-        cd.pivot_b = jce_v3(pivot_b4.x, pivot_b4.y, pivot_b4.z);
-        cd.axis    = jce_v3(0.0f, 1.0f, 0.0f);
-        /* lower == upper == 0 → the two anchor points are locked together on
-         * all linear axes (a ball joint); angular axes are left free (Bullet's
-         * default 6DOF angular limits), so the chain stays connected and bends
-         * like a skeleton rather than separating. */
-        cd.lower_limit       = 0.0f;
-        cd.upper_limit       = 0.0f;
-        cd.disable_collision = true;        /* parent/child capsules overlap */
+        /* THE ANGULAR LIMIT, from the joint's humanoid role.  Until this,
+         * every joint here was an unlimited ball: the linear axes locked the
+         * anchors together and the angular axes were left at Bullet's default
+         * 6DOF range, which is free.  Elbows and knees hyperextended and heads
+         * rotated without bound.
+         *
+         * A joint with no recognised role keeps the old free behaviour rather
+         * than getting a guessed cone -- a tail, a cape bone or a prop is not
+         * a limb and has no muscle range to borrow. */
+        const float limit_deg = (limit_scale > 0.0f)
+            ? ragdoll_joint_limit_deg(skel, rb->joint_index) * limit_scale
+            : -1.0f;
 
-        JceConstraintHandle ch = jce_physics_constraint_create(world, &cd);
+        JceConstraintHandle ch;
+        if (limit_deg > 0.0f) {
+            JceConfigurableJointDesc jd;
+            memset(&jd, 0, sizeof(jd));
+            jd.body_a   = parent_rb->body;
+            jd.body_b   = rb->body;
+            jd.anchor_a = jce_v3(pivot_a4.x, pivot_a4.y, pivot_a4.z);
+            jd.anchor_b = jce_v3(pivot_b4.x, pivot_b4.y, pivot_b4.z);
+            /* Linear LOCKED on all three: the anchors stay coincident, which
+             * is the ball joint the chain needs to stay connected -- the same
+             * thing lower==upper==0 meant on the old desc. */
+            jd.lin_motion[0] = jd.lin_motion[1] = jd.lin_motion[2] = 0;
+            jd.ang_motion[0] = jd.ang_motion[1] = jd.ang_motion[2] = 1; /* limited */
+            jd.angular_limit_deg[0] = limit_deg;
+            jd.angular_limit_deg[1] = limit_deg;
+            jd.angular_limit_deg[2] = limit_deg;
+            jd.disable_collision    = true;
+            ch = jce_physics_configurable_joint_create(world, &jd);
+        } else {
+            JceConstraintDesc cd;
+            memset(&cd, 0, sizeof(cd));
+            cd.type    = JCE_CONSTRAINT_GENERIC6DOF;
+            cd.body_a  = parent_rb->body;       /* parent */
+            cd.body_b  = rb->body;              /* this joint */
+            cd.pivot_a = jce_v3(pivot_a4.x, pivot_a4.y, pivot_a4.z);
+            cd.pivot_b = jce_v3(pivot_b4.x, pivot_b4.y, pivot_b4.z);
+            cd.axis    = jce_v3(0.0f, 1.0f, 0.0f);
+            /* lower == upper == 0 → the anchors are locked together on all
+             * linear axes (a ball joint) and the angular axes stay free. */
+            cd.lower_limit       = 0.0f;
+            cd.upper_limit       = 0.0f;
+            cd.disable_collision = true;
+            ch = jce_physics_constraint_create(world, &cd);
+        }
         if (jce_constraint_valid(ch)) {
             rd->constraints[rd->constraint_count] = ch;
             rd->constraint_count++;

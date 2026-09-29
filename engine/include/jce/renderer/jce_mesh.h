@@ -21,11 +21,26 @@ typedef struct JceMesh    JceMesh;
 typedef struct JceRenderer JceRenderer;
 typedef struct JcePakArchive  JcePakArchive;
 
-/* Mesh vertex: position + normal + texcoord. */
+/* Mesh vertex: position + normal + texcoord + tangent.
+ *
+ * TANGENT IS NOT OPTIONAL, and leaving it out was not free.  vs_pbr.sc reads
+ * a_tangent and writes v_tangent from it; with no TANGENT in the layout that
+ * attribute was UNBOUND, and what a backend leaves in an unbound attribute is
+ * undefined.  Measured, the three outcomes were: black on WebGL2 (recorded in
+ * fs_pbr_main.sh's own comment, and the reason its `dot(Tin,Tin) > 1e-8`
+ * guard exists), silently skipped where that guard catches it, and -- on
+ * D3D11 -- the normal map APPLIED THROUGH A FRAME THAT IS NOT THE SURFACE'S,
+ * which is the one that looks like it works.
+ *
+ * xyz is the tangent and w is the bitangent SIGN (+1 / -1), which is glTF's
+ * layout and what vs_pbr.sc already multiplies the cross product by.  All
+ * zero means "not supplied": jce_mesh_create then generates the frame from
+ * the positions, UVs and normals, the way glTF says to.  APPENDED. */
 typedef struct {
     float pos[3];
     float normal[3];
     float uv[2];
+    float tangent[4];
 } JceMeshVertex;
 
 /* Create a mesh from raw vertex/index data.

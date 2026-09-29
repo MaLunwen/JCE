@@ -11,6 +11,7 @@
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_shader_variants.h>
 #include <jce/renderer/jce_skin_palette.h>
 #include <jce/renderer/jce_texture.h>
 
@@ -393,6 +394,39 @@ const JceMorphWeightTrack *jce_model_morph_anim_track(
 /* Rendering                                                           */
 /* ================================================================== */
 
+/* Armed runs for the next draw; see jce_model.h.  ONE struct, because the
+ * three fields are one object and the dedup detector is right that names used
+ * only together are. */
+#define JCE_MODEL_MAX_DRAW_RUNS 64
+static struct {
+    uint32_t first[JCE_MODEL_MAX_DRAW_RUNS];
+    uint32_t count[JCE_MODEL_MAX_DRAW_RUNS];
+    uint32_t n;
+} s_draw_runs;
+
+void jce_model_set_draw_index_runs(const uint32_t *first, const uint32_t *count,
+                                   uint32_t n)
+{
+    if (!first || !count || n == 0) { s_draw_runs.n = 0; return; }
+    if (n > JCE_MODEL_MAX_DRAW_RUNS) n = JCE_MODEL_MAX_DRAW_RUNS;
+    for (uint32_t i = 0; i < n; ++i) {
+        s_draw_runs.first[i] = first[i];
+        s_draw_runs.count[i] = count[i];
+    }
+    s_draw_runs.n = n;
+}
+
+/* One primitive, one submit -- or one per armed run.  A model with more than
+ * one primitive ignores the runs: a range into primitive 0's index buffer
+ * means nothing in primitive 1's, and a merged group is one primitive. */
+static uint32_t model_draw_runs_for(const JceModel *m)
+{
+    if (s_draw_runs.n == 0) return 0;
+    uint32_t prims = 0;
+    for (uint32_t n = 0; n < m->num_nodes; n++) prims += m->nodes[n].num_primitives;
+    return prims == 1 ? s_draw_runs.n : 0;
+}
+
 void jce_model_draw_program(const JceModel *model,
                             const JceRenderer *r, uint16_t view_id,
                             const jce_mat4 *transform,
@@ -439,7 +473,13 @@ void jce_model_draw_program(const JceModel *model,
             /* Honour the material's two-sided flag in the color submit (the
              * mesh submit hard-codes CULL_CW otherwise — see
              * jce_skinned_mesh_submit).  Cleared after the loop. */
-            jce_skinned_mesh_set_submit_double_sided(mat && mat->double_sided);
+            /* The whole state, not just the cull bit: this submit path owns
+             * it, so alpha mode and blend equation arrive here or nowhere. */
+            jce_skinned_mesh_set_submit_state(
+                mat ? jce_pbr_material_render_state(mat) : 0);
+            /* After the state setter, which clears it. */
+            jce_skinned_mesh_set_submit_stencil(
+                mat ? jce_pbr_material_stencil(mat) : 0u);
 
             if (prim->skinned_mesh) {
                 JceShaderHandle prog_handle;
@@ -481,22 +521,28 @@ void jce_model_draw_program(const JceModel *model,
                 /* In-asset auto-LOD: a non-skinned (PBR static) primitive binds
                  * the armed reduced index set; skinned rigs keep full detail.
                  * Level 0 / no LOD => byte-identical to the base submit. */
-                if (s_draw_lod_level > 0 &&
-                    !jce_skinned_mesh_is_skinned(prim->skinned_mesh))
-                    jce_skinned_mesh_submit_lod(prim->skinned_mesh, r, view_id,
-                                                s_draw_lod_level - 1);
-                else
-                    jce_skinned_mesh_submit(prim->skinned_mesh, r, view_id);
-
-                /* Per-submit bind hook (e.g. Forward+ cluster bind on stage
-                 * 14): bgfx clears stage/uniform state between submits, so the
-                 * hook must fire right before THIS submit, for every primitive.
-                 * NULL => no-op => byte-identical to the unhooked path. */
-                if (s_pre_submit_cb)
-                    s_pre_submit_cb(s_pre_submit_user, view_id);
-
+                const uint32_t nruns = model_draw_runs_for(model);
                 bgfx_program_handle_t bgfx_prog = { prog_handle.idx };
-                bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
+                for (uint32_t rr = 0; rr < (nruns ? nruns : 1u); ++rr) {
+                    if (nruns)
+                        jce_skinned_mesh_set_submit_index_range(
+                            s_draw_runs.first[rr], s_draw_runs.count[rr]);
+                    if (s_draw_lod_level > 0 &&
+                        !jce_skinned_mesh_is_skinned(prim->skinned_mesh))
+                        jce_skinned_mesh_submit_lod(prim->skinned_mesh, r, view_id,
+                                                    s_draw_lod_level - 1);
+                    else
+                        jce_skinned_mesh_submit(prim->skinned_mesh, r, view_id);
+
+                    /* Per-submit bind hook (e.g. Forward+ cluster bind on stage
+                     * 14): bgfx clears stage/uniform state between submits, so the
+                     * hook must fire right before THIS submit, for every primitive
+                     * AND every run.  NULL => no-op => byte-identical. */
+                    if (s_pre_submit_cb)
+                        s_pre_submit_cb(s_pre_submit_user, view_id);
+
+                    bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
+                }
 
             } else if (prim->static_mesh) {
                 /* Basic mesh: apply transform, then submit. */
@@ -509,8 +555,12 @@ void jce_model_draw_program(const JceModel *model,
             }
         }
     }
-    /* Never leak the per-submit two-sided override into later draws. */
+    /* Never leak the per-submit two-sided override into later draws.  Same for
+     * the index runs: a range left armed would truncate the next unrelated
+     * model, and that failure is a hole in the world one draw later with
+     * nothing pointing back here. */
     jce_skinned_mesh_set_submit_double_sided(false);
+    s_draw_runs.n = 0;
 }
 
 void jce_model_draw(const JceModel *model,
@@ -734,7 +784,10 @@ void jce_model_draw_instanced_tinted(const JceModel *model,
                 if (mat)
                     jce_pbr_material_bind(mat, r, view_id);
                 const bool two_sided = (mat && mat->double_sided);
-                jce_skinned_mesh_set_submit_double_sided(two_sided);
+                jce_skinned_mesh_set_submit_state(
+                    mat ? jce_pbr_material_render_state(mat) : 0);
+                jce_skinned_mesh_set_submit_stencil(
+                    mat ? jce_pbr_material_stencil(mat) : 0u);
 
                 if (sm) {
                     /* In-asset auto-LOD: bind the armed reduced index set so an
@@ -811,7 +864,22 @@ void jce_model_draw_foliage_lod_indirect(const JceModel *model,
 
     const bgfx_program_handle_t prog = { prog_idx };
     const bool two_sided = (mat && mat->double_sided);
-    uint64_t state = BGFX_STATE_DEFAULT;
+    /* THE MATERIAL'S state, not BGFX_STATE_DEFAULT.  For an OPAQUE material
+     * the two are the same bits (WRITE_RGB|WRITE_A|WRITE_Z|DEPTH_TEST_LESS|
+     * CULL_CW|MSAA), which is why nobody noticed: a glTF model's factors
+     * reached the draw through jce_pbr_material_bind while its alpha mode and
+     * blend equation reached nothing at all, so a model could not be
+     * transparent no matter what was authored.
+     *
+     * Measured 2026-09-06: four pine models with alphaMode BLEND and alpha
+     * 0.6 rendered fully opaque, correctly TINTED by their base colours --
+     * the factors arriving while the state did not is exactly what that
+     * picture showed.  Forcing additive blending inside
+     * jce_pbr_material_render_state changed nothing, which is what said the
+     * function was not the one being consulted. */
+    uint64_t state = mat ? jce_pbr_material_render_state(mat)
+                         : BGFX_STATE_DEFAULT;
+    const uint32_t stencil = mat ? jce_pbr_material_stencil(mat) : 0u;
     if (two_sided) state &= ~BGFX_STATE_CULL_MASK;
     bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_skinned_mesh_get_vbh(sm) };
     const uint32_t lodc = jce_skinned_mesh_lod_count(sm);
@@ -841,6 +909,9 @@ void jce_model_draw_foliage_lod_indirect(const JceModel *model,
             bgfx_set_index_buffer(ibh, 0, UINT32_MAX);
         bgfx_set_instance_data_from_dynamic_vertex_buffer(vis, 0, UINT32_MAX);
         bgfx_set_state(state, 0);
+        /* Per band, not once: each iteration ends in a submit, and bgfx
+         * resets the stencil after every one of them. */
+        if (stencil) bgfx_set_stencil(stencil, BGFX_STENCIL_NONE);
         if (s_pre_submit_cb)
             s_pre_submit_cb(s_pre_submit_user, view_id);
         bgfx_submit_indirect(view_id, prog, indir, (uint16_t)b, 1, 0,
@@ -887,7 +958,22 @@ void jce_model_draw_meshlet_culled(const JceModel *model, const JceRenderer *r,
     bgfx_vertex_buffer_handle_t vbh  = { (uint16_t)jce_skinned_mesh_get_vbh(sm) };
     bgfx_index_buffer_handle_t  ibh  = { ml_ib };
     bgfx_indirect_buffer_handle_t ind = { indirect_buf };
-    uint64_t state = BGFX_STATE_DEFAULT;
+    /* THE MATERIAL'S state, not BGFX_STATE_DEFAULT.  For an OPAQUE material
+     * the two are the same bits (WRITE_RGB|WRITE_A|WRITE_Z|DEPTH_TEST_LESS|
+     * CULL_CW|MSAA), which is why nobody noticed: a glTF model's factors
+     * reached the draw through jce_pbr_material_bind while its alpha mode and
+     * blend equation reached nothing at all, so a model could not be
+     * transparent no matter what was authored.
+     *
+     * Measured 2026-09-06: four pine models with alphaMode BLEND and alpha
+     * 0.6 rendered fully opaque, correctly TINTED by their base colours --
+     * the factors arriving while the state did not is exactly what that
+     * picture showed.  Forcing additive blending inside
+     * jce_pbr_material_render_state changed nothing, which is what said the
+     * function was not the one being consulted. */
+    uint64_t state = mat ? jce_pbr_material_render_state(mat)
+                         : BGFX_STATE_DEFAULT;
+    const uint32_t stencil = mat ? jce_pbr_material_stencil(mat) : 0u;
     if (mat && mat->double_sided) state &= ~BGFX_STATE_CULL_MASK;
 
     if (mat) jce_pbr_material_bind(mat, r, view_id);
@@ -895,6 +981,7 @@ void jce_model_draw_meshlet_culled(const JceModel *model, const JceRenderer *r,
     bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     bgfx_set_index_buffer(ibh, 0, UINT32_MAX);
     bgfx_set_state(state, 0);
+    if (stencil) bgfx_set_stencil(stencil, BGFX_STENCIL_NONE);
     if (s_pre_submit_cb)
         s_pre_submit_cb(s_pre_submit_user, view_id);
     /* _num is uint32 — no cast: a V3 DAG roughly doubles cluster counts and
@@ -1178,7 +1265,8 @@ void jce_mesh_draw_instanced_gathered(const JceMesh *mesh, const JceRenderer *r,
                                       const uint32_t *ord, uint32_t count,
                                       bool has_tint, uint64_t state,
                                       void (*pre_submit)(void *user, uint16_t view_id),
-                                      void *pre_submit_user);
+                                      void *pre_submit_user,
+                                      uint32_t shader_keys);
 
 void jce_mesh_draw_instanced_tinted(const JceMesh *mesh, const JceRenderer *r,
                                     uint16_t view_id, const jce_mat4 *worlds,
@@ -1187,14 +1275,29 @@ void jce_mesh_draw_instanced_tinted(const JceMesh *mesh, const JceRenderer *r,
                                     void (*pre_submit)(void *user, uint16_t view_id),
                                     void *pre_submit_user)
 {
+    jce_mesh_draw_instanced_tinted_keyed(mesh, r, view_id, worlds, tints,
+                                         count, state, pre_submit,
+                                         pre_submit_user, 0u);
+}
+
+void jce_mesh_draw_instanced_tinted_keyed(const JceMesh *mesh, const JceRenderer *r,
+                                    uint16_t view_id, const jce_mat4 *worlds,
+                                    const jce_vec4 *tints, uint32_t count,
+                                    uint64_t state,
+                                    void (*pre_submit)(void *user, uint16_t view_id),
+                                    void *pre_submit_user,
+                                          uint32_t shader_keys)
+{
     if (!mesh || !r || !worlds || count == 0) return;
 
     /* Tint stream needs the 5-vec4 (80 B) tint program; fall back to the plain
      * 4-vec4 (64 B) instanced program (tint dropped) if it did not load. */
-    JceShaderHandle prog_tint = jce_renderer_get_program_pbr_inst_tint(r);
+    JceShaderHandle prog_tint = jce_renderer_get_program_variant(
+        r, JCE_SHADER_VV_PBR_INST_TINT, shader_keys);
     const bool use_tint = (tints != NULL) && (prog_tint.idx != UINT16_MAX);
     JceShaderHandle prog = use_tint ? prog_tint
-                                    : jce_renderer_get_program_pbr_inst(r);
+                                    : jce_renderer_get_program_variant(
+                                          r, JCE_SHADER_VV_PBR_INST, shader_keys);
     if (prog.idx == UINT16_MAX) return;   /* no instanced program → caller keeps solo */
     const bgfx_program_handle_t bgfx_prog = { (uint16_t)prog.idx };
     const uint16_t stride = use_tint ? (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4))
@@ -1288,14 +1391,17 @@ void jce_mesh_draw_instanced_gathered(const JceMesh *mesh, const JceRenderer *r,
                                       const uint32_t *ord, uint32_t count,
                                       bool has_tint, uint64_t state,
                                       void (*pre_submit)(void *user, uint16_t view_id),
-                                      void *pre_submit_user)
+                                      void *pre_submit_user,
+                                      uint32_t shader_keys)
 {
     if (!mesh || !r || !src || count == 0) return;
 
-    JceShaderHandle prog_tint = jce_renderer_get_program_pbr_inst_tint(r);
+    JceShaderHandle prog_tint = jce_renderer_get_program_variant(
+        r, JCE_SHADER_VV_PBR_INST_TINT, shader_keys);
     const bool use_tint = has_tint && (prog_tint.idx != UINT16_MAX);
     JceShaderHandle prog = use_tint ? prog_tint
-                                    : jce_renderer_get_program_pbr_inst(r);
+                                    : jce_renderer_get_program_variant(
+                                          r, JCE_SHADER_VV_PBR_INST, shader_keys);
     if (prog.idx == UINT16_MAX) return;
     const bgfx_program_handle_t bgfx_prog = { (uint16_t)prog.idx };
     const uint16_t stride = use_tint ? (uint16_t)(sizeof(jce_mat4) + sizeof(jce_vec4))

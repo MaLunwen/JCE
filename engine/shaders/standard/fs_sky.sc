@@ -246,8 +246,10 @@ float cloud_density_at(vec3 wp, float bot, float top, float detail)
 		float hi = cloud_atlas_fetch(dw, du, dv);
 
 		const float k = 0.42;
-		float sub_ = hi * k;
-		d = clamp((d - sub_) / max(1.0 - sub_, 1e-3), 0.0, 1.0);
+		/* No trailing underscore in a local name: glsl-optimizer renames
+		 * locals to <name>_<id>, which turns one into a reserved __ name. */
+		float sub = hi * k;
+		d = clamp((d - sub) / max(1.0 - sub, 1e-3), 0.0, 1.0);
 	}
 	return d;
 }
@@ -565,9 +567,9 @@ void main()
                     vec3  ldir  = normalize(u_sky_sun_dir.xyz);
                     float lstep = (topKm - botKm) * 0.25;
                     vec3  lp    = wp;
-                    for (int li_ = 0; li_ < 6; ++li_)
+                    for (int li = 0; li < 6; ++li)
                     {
-                        if (float(li_) * 4.0 >= budget) break;
+                        if (float(li) * 4.0 >= budget) break;
                         lp += ldir * lstep;
                         /* Above the slab there is nothing left to shadow. */
                         if (lp.y > topKm) break;

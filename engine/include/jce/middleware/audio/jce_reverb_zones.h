@@ -66,8 +66,13 @@ typedef struct {
     float damping;        /* 0..1 — high-frequency absorption         */
     float diffusion;      /* 0..1 — early-reflection density          */
     float density;        /* 0..1 — late-reflection density           */
-    float pre_delay_ms;   /* delay before first reflection (ms)       */
+    float pre_delay_ms;   /* delay before the LATE tail (ms)          */
     float lowpass_hz;     /* output LP cutoff; 22050 = bypass         */
+    /* The FIRST reflection, which arrives before the diffuse tail and is what
+     * tells a listener how large a room is.  Blended numerically like every
+     * field beside it.  APPENDED. */
+    float early_mix;      /* 0..1 — early reflection level; 0 = none   */
+    float early_delay_ms; /* time to that first reflection (ms)        */
 } JceReverbPreset;
 
 typedef uint32_t JceReverbZoneId;

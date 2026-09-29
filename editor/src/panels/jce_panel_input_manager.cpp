@@ -495,6 +495,47 @@ static void strip_status(const char *text)
     std::snprintf(s_strip_status, sizeof(s_strip_status), "%s", text);
 }
 
+/* ── Live per-frame channels ─────────────────────────────────────────
+ *
+ * The three channels a game needs for TEXT ENTRY and 2D scrolling, read
+ * straight off the engine input this frame.  They are here because they are
+ * invisible everywhere else: composed text and IME commits never appear as
+ * keycodes, key AUTO-REPEAT is not the same event as a key press, and the
+ * horizontal wheel axis is a separate axis a trackpad produces and a mouse
+ * usually does not.  All three were on the wire with no accessor, which is
+ * how the shipped runtime came to open an IME over the game with nothing
+ * listening, delete one byte per held Backspace, and ignore sideways scroll.
+ * A row that shows them is how an author sees whether their device is
+ * actually producing them. */
+static void draw_live_channels(JceInput *in)
+{
+    if (!in) return;
+    if (!ImGui::CollapsingHeader(tr("inputManager.liveChannels.title")))
+        return;
+
+    const char *typed = jce_input_text(in);
+    ImGui::Text("%s", tr("inputManager.liveChannels.text"));
+    ImGui::SameLine();
+    if (typed && typed[0]) ImGui::TextUnformatted(typed);
+    else                   ImGui::TextDisabled("--");
+
+    /* Any key repeating this frame (the first one found is enough to show the
+     * channel is alive). */
+    int rep = -1;
+    for (int k = 0; k < JCE_KEY_COUNT; ++k)
+        if (jce_input_key_repeated(in, (JceKey)k)) { rep = k; break; }
+    ImGui::Text("%s", tr("inputManager.liveChannels.keyRepeat"));
+    ImGui::SameLine();
+    if (rep >= 0) ImGui::Text("%s %d", tr("inputManager.liveChannels.scancode"), rep);
+    else          ImGui::TextDisabled("--");
+
+    ImGui::Text("%s", tr("inputManager.liveChannels.wheel"));
+    ImGui::SameLine();
+    ImGui::Text("v %.2f   h %.2f",
+                (double)jce_input_mouse_wheel(in),
+                (double)jce_input_mouse_wheel_h(in));
+}
+
 static void draw_device_strip(void)
 {
     if (!ImGui::CollapsingHeader(tr("inputManager.deviceStrip.title"),
@@ -727,6 +768,8 @@ static void draw_device_strip(void)
 
     if (s_strip_status[0])
         ImGui::TextDisabled("%s", s_strip_status);
+
+    draw_live_channels(in);
 }
 
 /* ── UI ─────────────────────────────────────────────────────────────── */

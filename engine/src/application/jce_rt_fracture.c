@@ -122,8 +122,35 @@ static void rt_dd_destroy_body(JceRuntime *rt, JceEntity e)
 void rt_drive_draw_distance(JceRuntime *rt)
 {
 	if (!rt->physics || rt->dd_count == 0 || !rt->scene) return;
+
+	/* NO PLAYER => FAIL OPEN, spawn everything.
+	 *
+	 * This used to `return`, leaving deferred bodies uncreated forever in any
+	 * scene without a player character -- a menu, a cutscene, a headless
+	 * dedicated server, or simply the frames before a character spawns.  That
+	 * was survivable while deferral only ever caught an explicitly-static
+	 * Rigidbody, which is rare.  It stopped being survivable when a collider
+	 * WITHOUT a Rigidbody started producing a static body, because that is how
+	 * ordinary level geometry is authored: the deferral would then hold back
+	 * the floor, the walls and the props of every playerless scene, and the
+	 * bug being fixed there would simply have moved here.
+	 *
+	 * The radius test is an optimisation around a player.  With no player
+	 * there is nothing to optimise around, so the world gets its collision --
+	 * which is exactly the behaviour before deferral existed.  Once a player
+	 * does appear, the normal in/out test below takes over and despawns what
+	 * is far. */
 	jce_vec3 pp;
-	if (!jce_runtime_get_player_position(rt, &pp)) return;
+	if (!jce_runtime_get_player_position(rt, &pp)) {
+		for (int i = 0; i < rt->dd_count; ++i) {
+			DDEntry *de = &rt->dd[i];
+			if (de->spawned) continue;
+			if (rt_spawn_entity_body(rt, rt->scene, de->entity,
+			                         /*allow_defer=*/false))
+				de->spawned = true;
+		}
+		return;
+	}
 
 	const float r_in  = PHYS_DD_RADIUS;
 	const float r_out = PHYS_DD_RADIUS + PHYS_DD_HYST;
@@ -155,8 +182,18 @@ static void rt_perform_fracture(JceRuntime *rt, JceEntity e)
 	JceFractureComponent *fc = jce_scene_get_fracture(rt->scene, e);
 	if (!fc || !fc->enabled) return;   /* gate: only enabled fracturables */
 
-	JceTransform *tf = jce_scene_get_transform(rt->scene, e);
-	if (!tf) return;
+	JceTransform *tf_local = jce_scene_get_transform(rt->scene, e);
+	if (!tf_local) return;
+
+	/* WORLD: the fragments are free bodies placed in the world, so the box
+	 * they are cut out of has to be the world one.  A fracturable parented to
+	 * anything shattered into pieces that appeared at its local offset from
+	 * the origin -- see the note at the head of rt_spawn_entity.  A root
+	 * entity is byte-identical. */
+	JceTransform tf_world = *tf_local;
+	jce_scene_get_world_pose(rt->scene, e, &tf_world.position,
+	                         &tf_world.rotation, &tf_world.scale);
+	const JceTransform *tf = &tf_world;
 
 	/* Entity AABB (local half-extents about the collider centre). */
 	jce_vec3 half, center_ofs;

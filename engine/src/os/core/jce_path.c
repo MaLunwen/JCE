@@ -151,13 +151,34 @@ const char *jce_path_asset_key(const char *path, char *buf, size_t buf_size)
 /* Decomposition                                                      */
 /* ------------------------------------------------------------------ */
 
+/* ALIASING.  Every function below reads `path` to completion BEFORE the first
+ * write to `out`, because the header promises the two may be the same buffer
+ * and all four used to open with `out[0] = '\0';`.  Under an aliased call that
+ * truncated the INPUT, so the very next line saw an empty path: parent and
+ * extension returned false, and basename and stem returned TRUE with an empty
+ * result -- a success code carrying nothing.
+ *
+ * It had a live victim.  resolve_project_root_path()
+ * (editor/src/dialogs/jce_dialog_project.cpp) does
+ *
+ *     if (jce_fs_host_exists_file(current))
+ *         jce_path_parent(current, sizeof(current), current);
+ *
+ * to step from a picked FILE up to its directory, and then walks upward
+ * looking for jce_project.json.  With `current` blanked, the walk loop
+ * (`while (current[0] != '\0')`) never ran once and the dialog reported that a
+ * real project was not a project -- whenever the user picked the project BY
+ * ITS FILE rather than by its folder.
+ *
+ * s_copy_n uses memmove, so the forward-overlapping copies (basename, stem and
+ * extension all copy from inside `path`) are defined. */
+
 bool jce_path_parent(char *out, size_t out_size, const char *path)
 {
     if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    if (s_empty(path)) return false;
-    size_t last = s_last_sep(path);
-    if (last == (size_t)-1) return false;
+    if (s_empty(path)) { out[0] = '\0'; return false; }
+    const size_t last = s_last_sep(path);
+    if (last == (size_t)-1) { out[0] = '\0'; return false; }
     /* Preserve root: "/" or "C:/" */
     if (last == 0) return s_copy_n(out, out_size, path, 1);
     return s_copy_n(out, out_size, path, last);
@@ -166,9 +187,8 @@ bool jce_path_parent(char *out, size_t out_size, const char *path)
 bool jce_path_basename(char *out, size_t out_size, const char *path)
 {
     if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    if (s_empty(path)) return true;
-    size_t last = s_last_sep(path);
+    if (s_empty(path)) { out[0] = '\0'; return true; }
+    const size_t last = s_last_sep(path);
     const char *base = (last == (size_t)-1) ? path : path + last + 1;
     return s_copy_n(out, out_size, base, strlen(base));
 }
@@ -176,11 +196,10 @@ bool jce_path_basename(char *out, size_t out_size, const char *path)
 bool jce_path_stem(char *out, size_t out_size, const char *path)
 {
     if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    if (s_empty(path)) return true;
-    size_t last_sep = s_last_sep(path);
-    size_t base_start = (last_sep == (size_t)-1) ? 0 : last_sep + 1;
-    size_t dot = s_ext_dot(path);
+    if (s_empty(path)) { out[0] = '\0'; return true; }
+    const size_t last_sep = s_last_sep(path);
+    const size_t base_start = (last_sep == (size_t)-1) ? 0 : last_sep + 1;
+    const size_t dot = s_ext_dot(path);
     size_t end = (dot == (size_t)-1) ? strlen(path) : dot;
     if (end < base_start) end = base_start;
     return s_copy_n(out, out_size, path + base_start, end - base_start);
@@ -189,10 +208,9 @@ bool jce_path_stem(char *out, size_t out_size, const char *path)
 bool jce_path_extension(char *out, size_t out_size, const char *path)
 {
     if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    if (s_empty(path)) return false;
-    size_t dot = s_ext_dot(path);
-    if (dot == (size_t)-1) return false;
+    if (s_empty(path)) { out[0] = '\0'; return false; }
+    const size_t dot = s_ext_dot(path);
+    if (dot == (size_t)-1) { out[0] = '\0'; return false; }
     return s_copy_n(out, out_size, path + dot, strlen(path + dot));
 }
 

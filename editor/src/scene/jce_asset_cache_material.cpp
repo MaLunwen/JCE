@@ -4,6 +4,12 @@
 
 #include "jce_asset_cache_internal.h"
 #include "core/jce_editor_alloc.h"
+#include "core/jce_editor_state.h"
+#include "scene/jce_editor_scene_render.h"
+#include "ui/jce_editor_panels.h"
+extern "C" {
+#include <jce/renderer/jce_scene_renderer.h>
+}
 
 static JceAsyncRunResult material_extract_worker(JceAsyncContext *async,
                                                  void *arg)
@@ -269,4 +275,98 @@ bool material_take_completed_result(JceEditorMaterialExtractResult *out_result)
     *out_result = s_mat_async.completed.back();
     s_mat_async.completed.pop_back();
     return true;
+}
+
+/* ── External edits to material files ────────────────────────────────
+ *
+ * Beside texture_poll_disk_changes, and for the reason its own comment gives:
+ * "the asymmetry was within one folder".  A texture reloaded when a designer
+ * saved it from another program; the .mat.json in the same folder did not, so
+ * editing a material in a text editor -- or having a build step rewrite one --
+ * left the viewport showing the old one until the scene was reloaded.
+ *
+ * The tracked set is derived from the SCENE rather than kept alongside a
+ * cache, because the editor has no path-keyed material cache to hang it on: a
+ * placed entity's material is resolved once, at scene load, by the engine.
+ * So the list is rebuilt from the scene's MeshRenderers on a slow tick and
+ * polled round-robin between rebuilds -- an entity walk every frame to catch
+ * an edit that happens once a minute is the wrong trade, and so is a stat
+ * storm.
+ *
+ * On a change the material is not parsed here.  The entry is stamped and the
+ * existing re-apply path runs, the same one the material viewer's Save uses,
+ * so an external edit and an in-editor save cannot produce different results
+ * from the same bytes.  The scene renderer's path-keyed graph-program cache
+ * is dropped for that path too, or a material that gained or lost a custom
+ * program would keep drawing with the old one.
+ */
+enum { MAT_POLL_PER_FRAME = 4, MAT_REBUILD_TICKS = 120 };
+enum { MAT_POLL_MAX = (int)(sizeof(s_cache.mat_watch) /
+                            sizeof(s_cache.mat_watch[0])) };
+
+namespace {
+
+void mat_watch_rebuild(JceScene *scene)
+{
+    s_cache.mat_watch_count = 0;
+    const int total = jce_state_get_entity_count();
+    for (int i = 0; i < total && s_cache.mat_watch_count < MAT_POLL_MAX; i++) {
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (!id) continue;
+        JceEntity e = jce_state_to_ecs_entity(id);
+        if (!jce_scene_has_mesh_renderer(scene, e)) continue;
+        const JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        if (!mr || mr->material_path[0] == '\0') continue;
+
+        bool seen = false;
+        for (int k = 0; k < s_cache.mat_watch_count; k++)
+            if (strcmp(s_cache.mat_watch[k].path, mr->material_path) == 0) {
+                seen = true; break;
+            }
+        if (seen) continue;
+
+        MaterialWatchEntry *t = &s_cache.mat_watch[s_cache.mat_watch_count];
+        snprintf(t->path, sizeof(t->path), "%s", mr->material_path);
+        /* Stamp what is on disk NOW, so the first poll after a rebuild does
+         * not report every material as changed. */
+        if (!jce_fs_host_get_mtime(t->path, &t->mtime))
+            continue;              /* unreadable (packed, or gone): not tracked */
+        ++s_cache.mat_watch_count;
+    }
+}
+
+} /* namespace */
+
+void material_poll_disk_changes(void)
+{
+    if (!s_cache.initialized) return;
+
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) { s_cache.mat_watch_count = 0; return; }
+
+    if (--s_cache.mat_watch_rebuild_in <= 0) {
+        s_cache.mat_watch_rebuild_in = MAT_REBUILD_TICKS;
+        mat_watch_rebuild(scene);
+    }
+    if (s_cache.mat_watch_count <= 0) return;
+
+    for (int step = 0;
+         step < MAT_POLL_PER_FRAME && step < s_cache.mat_watch_count; ++step) {
+        if (s_cache.mat_watch_cursor >= s_cache.mat_watch_count)
+            s_cache.mat_watch_cursor = 0;
+        MaterialWatchEntry *t = &s_cache.mat_watch[s_cache.mat_watch_cursor++];
+
+        int64_t now = 0;
+        if (!jce_fs_host_get_mtime(t->path, &now))
+            continue;              /* deleted or unreadable: keep what we have */
+        if (now == t->mtime)
+            continue;
+
+        t->mtime = now;
+        jce_editor_console_log("material changed on disk, reloading: %s",
+                               t->path);
+        if (JceSceneRenderer *ssr = jce_editor_get_scene_renderer())
+            jce_scene_renderer_invalidate_custom_program(ssr, t->path);
+        jce_editor_inspector_reload_material(t->path);
+    }
 }

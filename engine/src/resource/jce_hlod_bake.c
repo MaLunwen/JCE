@@ -9,6 +9,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_glb_write.h>
+#include <jce/resource/jce_mesh_merge.h>
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_mesh_lod_cook.h"   /* jce_mesh_simplify */
@@ -18,23 +19,6 @@
 #include <string.h>
 
 #define LOG_TAG "hlod_bake"
-
-static void xform_point(const float *m, const float *p, float *o)
-{
-    o[0] = m[0]*p[0] + m[4]*p[1] + m[8] *p[2] + m[12];
-    o[1] = m[1]*p[0] + m[5]*p[1] + m[9] *p[2] + m[13];
-    o[2] = m[2]*p[0] + m[6]*p[1] + m[10]*p[2] + m[14];
-}
-
-static void xform_dir(const float *m, const float *n, float *o)
-{
-    o[0] = m[0]*n[0] + m[4]*n[1] + m[8] *n[2];
-    o[1] = m[1]*n[0] + m[5]*n[1] + m[9] *n[2];
-    o[2] = m[2]*n[0] + m[6]*n[1] + m[10]*n[2];
-    float l = sqrtf(o[0]*o[0] + o[1]*o[1] + o[2]*o[2]);
-    if (l > 1e-8f) { o[0]/=l; o[1]/=l; o[2]/=l; }
-    else { o[0]=0.0f; o[1]=1.0f; o[2]=0.0f; }
-}
 
 bool jce_hlod_bake_proxy(const JceHlodMeshInput *inputs,
                          uint32_t                input_count,
@@ -48,52 +32,44 @@ bool jce_hlod_bake_proxy(const JceHlodMeshInput *inputs,
     if (!(target_ratio > 0.0f)) target_ratio = 0.15f;
     if (target_ratio > 1.0f) target_ratio = 1.0f;
 
-    /* Totals. */
-    uint64_t total_v = 0, total_i = 0;
+    /* MERGE -- the shared one (jce_mesh_merge.h).  A proxy carries no UVs, so
+     * none are supplied and none come back: this is a distant flat-tinted
+     * stand-in and texture coordinates for it would be dead bytes in every
+     * streamed cell. */
+    bool ok = false;
+    JceMeshMergeResult merged;
+    memset(&merged, 0, sizeof merged);
+    JceMeshMergeInput *mi_in = (JceMeshMergeInput *)
+        JCE_MALLOC((size_t)input_count * sizeof *mi_in);
+    if (!mi_in) return false;
     for (uint32_t i = 0; i < input_count; ++i) {
-        if (!inputs[i].positions || !inputs[i].indices) continue;
-        total_v += inputs[i].vertex_count;
-        total_i += inputs[i].index_count;
+        memset(&mi_in[i], 0, sizeof mi_in[i]);
+        mi_in[i].positions       = inputs[i].positions;
+        mi_in[i].position_stride = inputs[i].position_stride;
+        mi_in[i].normals         = inputs[i].normals;
+        mi_in[i].normal_stride   = inputs[i].normal_stride;
+        mi_in[i].vertex_count    = inputs[i].vertex_count;
+        mi_in[i].indices         = inputs[i].indices;
+        mi_in[i].index_count     = inputs[i].index_count;
+        memcpy(mi_in[i].world, inputs[i].world, sizeof mi_in[i].world);
     }
-    if (total_v == 0 || total_i < 3) {
+    const bool merged_ok = jce_mesh_merge(mi_in, input_count, &merged);
+    JCE_FREE(mi_in);
+    if (!merged_ok) {
         LOG_WARN(LOG_TAG, "no geometry to bake");
         return false;
     }
 
-    bool ok = false;
-    float        *mpos = (float *)JCE_MALLOC(total_v * 3u * sizeof(float));
-    float        *mnrm = (float *)JCE_MALLOC(total_v * 3u * sizeof(float));
-    unsigned int *midx = (unsigned int *)JCE_MALLOC(total_i * sizeof(unsigned int));
-    unsigned int *oidx = (unsigned int *)JCE_MALLOC(total_i * sizeof(unsigned int));
+    float        *mpos = merged.positions;   /* owned by `merged` */
+    float        *mnrm = merged.normals;
+    unsigned int *midx = merged.indices;
+    unsigned int *oidx = (unsigned int *)
+        JCE_MALLOC((size_t)merged.index_count * sizeof(unsigned int));
     uint32_t     *remap = NULL;
     float        *cpos = NULL, *cnrm = NULL;
-    if (!mpos || !mnrm || !midx || !oidx) goto done;
+    if (!oidx) goto done;
 
-    /* Merge — transform each source mesh into world space. */
-    uint32_t vbase = 0, ibase = 0;
-    for (uint32_t s = 0; s < input_count; ++s) {
-        const JceHlodMeshInput *in = &inputs[s];
-        if (!in->positions || !in->indices) continue;
-        const uint32_t ps = in->position_stride ? in->position_stride : 12u;
-        const uint32_t ns = in->normal_stride   ? in->normal_stride   : 12u;
-        const uint8_t *pbase = (const uint8_t *)in->positions;
-        const uint8_t *nbase = (const uint8_t *)in->normals;
-        for (uint32_t v = 0; v < in->vertex_count; ++v) {
-            const float *pv = (const float *)(pbase + (size_t)v * ps);
-            xform_point(in->world, pv, &mpos[(vbase+v)*3]);
-            float nlocal[3] = { 0.0f, 1.0f, 0.0f };
-            if (nbase) {
-                const float *nv = (const float *)(nbase + (size_t)v * ns);
-                nlocal[0]=nv[0]; nlocal[1]=nv[1]; nlocal[2]=nv[2];
-            }
-            xform_dir(in->world, nlocal, &mnrm[(vbase+v)*3]);
-        }
-        for (uint32_t k = 0; k < in->index_count; ++k)
-            midx[ibase + k] = in->indices[k] + vbase;
-        vbase += in->vertex_count;
-        ibase += in->index_count;
-    }
-    uint32_t mv = vbase, mi = ibase;
+    uint32_t mv = merged.vertex_count, mi = merged.index_count;
 
     /* Simplify (meshopt).  Falls back to the merged buffer if simplify fails. */
     size_t n_out = jce_mesh_simplify(mpos, mv, 3u * sizeof(float),
@@ -135,6 +111,7 @@ bool jce_hlod_bake_proxy(const JceHlodMeshInput *inputs,
 
 done:
     JCE_FREE(cnrm); JCE_FREE(cpos); JCE_FREE(remap);
-    JCE_FREE(oidx); JCE_FREE(midx); JCE_FREE(mnrm); JCE_FREE(mpos);
+    JCE_FREE(oidx);
+    jce_mesh_merge_free(&merged);   /* owns mpos / mnrm / midx */
     return ok;
 }

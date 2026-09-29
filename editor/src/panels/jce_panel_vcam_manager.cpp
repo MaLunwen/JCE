@@ -7,6 +7,7 @@
  * Active flag; Ping selects the entity in Hierarchy/Inspector.
  */
 
+#include <jce/middleware/scene/jce_vcam_system.h>
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
@@ -60,6 +61,24 @@ extern "C" void jce_editor_panel_vcam_manager_content(void)
 
     ImGui::Text("%s %zu", jce_editor_i18n("vcamManager.count"), rows.size());
     ImGui::TextDisabled(jce_editor_i18n("vcamManager.priorityHint"));
+
+    /* The named-camera override, which is what makes the Name column mean
+     * something: until jce_vcam_system_set_active_by_name existed, vcam_name
+     * was read by nothing in the engine and this table's second column was a
+     * label.  Showing the live override here rather than only in a script is
+     * the point -- a designer needs to see which shot is being forced, and to
+     * be able to let go of it. */
+    {
+        const char *cut = jce_vcam_system_get_active_name();
+        if (cut && cut[0]) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "  %s %s",
+                               jce_editor_i18n("vcamManager.cutTo"), cut);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(jce_editor_i18n("vcamManager.releaseCut")))
+                jce_vcam_system_set_active_by_name(scene, NULL);
+        }
+    }
     ImGui::Separator();
 
     if (rows.empty()) {
@@ -110,6 +129,17 @@ extern "C" void jce_editor_panel_vcam_manager_content(void)
             ImGui::TableSetColumnIndex(5);
             if (ImGui::SmallButton(jce_editor_i18n("common.ping")))
                 jce_state_select_entity((uint32_t)r.e, false);
+            ImGui::SameLine();
+            /* Cut to this shot by NAME, which is the same door a script or a
+             * cutscene goes through -- so what a designer previews here is
+             * literally what the game will do, not an editor-only shortcut.
+             * Disabled when the row has no name, because there is nothing to
+             * cut TO: the override addresses cameras by name, and an unnamed
+             * one cannot be reached from a script either. */
+            ImGui::BeginDisabled(r.c->vcam_name[0] == 0);
+            if (ImGui::SmallButton(jce_editor_i18n("vcamManager.cut")))
+                jce_vcam_system_set_active_by_name(scene, r.c->vcam_name);
+            ImGui::EndDisabled();
 
             ImGui::PopID();
         }

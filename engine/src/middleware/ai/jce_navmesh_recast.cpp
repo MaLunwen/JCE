@@ -745,6 +745,26 @@ extern "C" int jce_recast_debug_edges(const JceRecastNavMesh *nm,
     return emitted;
 }
 
+extern "C" float jce_recast_agent_height(const JceRecastNavMesh *nm)
+{
+    /* Straight off the tile header.  dtCreateNavMeshData writes the build's
+     * walkableHeight there, so the number survives into the .navmesh.bin and
+     * a loaded mesh can still say what it was carved for -- which is the
+     * whole point: the sidecar .json holds the bake SETTINGS, but the runtime
+     * loads only the .bin.
+     *
+     * The first tile with a header answers for all of them: every tile of one
+     * build carries the same walkableHeight, because it comes from the single
+     * rcConfig that build used. */
+    if (!nm || !nm->nav) return 0.0f;
+    const dtNavMesh *m = (const dtNavMesh *)nm->nav;
+    for (int i = 0; i < m->getMaxTiles(); ++i) {
+        const dtMeshTile *t = m->getTile(i);
+        if (t && t->header) return t->header->walkableHeight;
+    }
+    return 0.0f;
+}
+
 extern "C" void jce_recast_get_stats(const JceRecastNavMesh *nm,
                                        JceRecastStats *out_stats)
 {

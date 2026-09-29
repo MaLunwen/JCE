@@ -55,6 +55,30 @@ typedef struct {
 
 JCE_API void jce_recast_default_config(JceRecastConfig *out_cfg);
 
+/* The CLEARANCE this mesh was built for, in metres -- the walkable_height the
+ * bake handed Recast, which dtCreateNavMeshData writes into the tile header
+ * and which therefore survives into the .navmesh.bin.
+ *
+ * 0 when the mesh is empty or has no tiles, which is UNKNOWN and not zero: a
+ * check that fires on missing data rejects every scene authored before it. */
+JCE_API float jce_recast_agent_height(const JceRecastNavMesh *nav);
+
+/* The CLEARANCE this mesh was built for, in metres -- the walkable_height the
+ * bake handed Recast, which dtCreateNavMeshData writes into the tile header
+ * and which therefore survives into the .navmesh.bin.
+ *
+ * 0 when the mesh is empty or has no tiles, which is UNKNOWN and not zero: a
+ * check that fires on missing data rejects every scene authored before it. */
+JCE_API float jce_recast_agent_height(const JceRecastNavMesh *nav);
+
+/* The CLEARANCE this mesh was built for, in metres -- the walkable_height the
+ * bake handed Recast, which dtCreateNavMeshData writes into the tile header
+ * and which therefore survives into the .navmesh.bin.
+ *
+ * 0 when the mesh is empty or has no tiles, which is UNKNOWN and not zero: a
+ * check that fires on missing data rejects every scene authored before it. */
+JCE_API float jce_recast_agent_height(const JceRecastNavMesh *nav);
+
 /* Coarse stats exposed for the editor / profiler. */
 typedef struct {
     int polygon_count;

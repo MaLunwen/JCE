@@ -84,6 +84,7 @@ static jmethodID g_m_instantiate;
 static jmethodID g_m_instantiate_source;
 static jmethodID g_m_call_start;
 static jmethodID g_m_call_update;
+static jmethodID g_m_call_fixed_update;
 static jmethodID g_m_release;
 static jmethodID g_m_call_collision;
 static jmethodID g_m_call_message;
@@ -406,6 +407,8 @@ static bool java_cache_ids(JNIEnv *env)
                              "(Ljava/lang/String;Ljava/lang/String;J)I");
     ok = ok && java_cache_id(env, &g_m_call_start, "callStart", "(I)V");
     ok = ok && java_cache_id(env, &g_m_call_update, "callUpdate", "(IF)V");
+    ok = ok && java_cache_id(env, &g_m_call_fixed_update,
+                             "callFixedUpdate", "(IF)V");
     ok = ok && java_cache_id(env, &g_m_release, "release", "(I)V");
     ok = ok && java_cache_id(env, &g_m_call_collision, "callCollision", "(IJ)V");
     ok = ok && java_cache_id(env, &g_m_call_message, "callMessage",
@@ -815,6 +818,28 @@ static void java_call_update(JceScript *sc, JceScriptInstance inst, float dt)
     (*env)->PopLocalFrame(env, NULL);
 }
 
+/* The FIXED-step half: same JNI shape, its own cached method id, and its own
+ * handler label so a throwing on_fixed_update disables itself rather than
+ * on_update. */
+static void java_call_fixed_update(JceScript *sc, JceScriptInstance inst,
+                                   float dt)
+{
+    JavaScript *s = (JavaScript *)sc;
+    JNIEnv     *env;
+
+    if (!s || inst == 0) return;
+    env = java_env(s, "call_fixed_update");
+    if (!env) return;
+    if ((*env)->PushLocalFrame(env, JAVA_LOCAL_FRAME) != 0) {
+        (*env)->ExceptionClear(env);
+        return;
+    }
+    (*env)->CallVoidMethod(env, s->runtime, g_m_call_fixed_update, (jint)inst,
+                           (jfloat)dt);
+    java_handler_threw(s, env, inst, "on_fixed_update");
+    (*env)->PopLocalFrame(env, NULL);
+}
+
 static void java_release(JceScript *sc, JceScriptInstance inst)
 {
     JavaScript *s = (JavaScript *)sc;
@@ -1221,6 +1246,7 @@ static const JceScriptVM k_java_vm = {
     java_compile_module,
     java_rebind_instance,
     java_release_module,
+    java_call_fixed_update,   /* APPENDED -- see jce_script_vm.h */
 };
 
 const JceScriptVM *JCE_CALL jce_script_vm_java(void)

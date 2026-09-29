@@ -108,8 +108,18 @@ JCE_API JceAudioBusId  jce_audio_mixer_get_parent(const JceAudioMixer *m, JceAud
 
 /* Create or update an aux send from `src` to `dest` carrying `amount`
  * (0..1, clamped) of the source's post-fader signal.  Setting `amount` to 0
- * leaves the send registered but silent; use remove_send to drop it.  A bus
- * may not send to itself.  Returns true on success. */
+ * leaves the send registered but silent; use remove_send to drop it.
+ *
+ * Returns false when `src` or `dest` is not a live bus, when they are the
+ * same bus, when `src` has no free send slot, or when the send would CLOSE A
+ * RING -- A->B plus B->A, or any longer cycle.
+ *
+ * The ring refusal is not fussiness: an aux send is a parallel edge in the
+ * audio graph, and a cycle in that graph has no bottom to recurse to.  It was
+ * accepted until 2026-09-21 and was harmless only because nothing routed a
+ * send's audio at all, so a caller that used to get `true` for the second
+ * half of a ring now gets `false` and should surface the refusal rather than
+ * dropping it. */
 JCE_API bool           jce_audio_mixer_set_send(JceAudioMixer *m,
                                                 JceAudioBusId  src,
                                                 JceAudioBusId  dest,
@@ -146,12 +156,26 @@ JCE_API float          jce_audio_mixer_resolve_send(const JceAudioMixer *m,
  * to a gain-reduction multiplier applied on top of the target's resolved
  * volume.  This is the standard "music ducks under dialogue" effect.
  *
- * The follower is advanced deterministically by the host/audio thread by
- * feeding it the key bus's current peak level once per processing block via
- * jce_audio_mixer_duck_advance(); the resulting reduction is then read back
- * with jce_audio_mixer_duck_gain() (or folded into resolve_volume_ducked()).
- * The exact same envelope+curve math runs in the live miniaudio node, so it
- * can be driven offline over a synthetic key envelope in a unit test. */
+ * The follower is advanced deterministically by the host by feeding it the
+ * key bus's current peak level once per block via duck_advance(); the
+ * resulting reduction is read back with duck_gain(), or folded into
+ * resolve_volume_ducked().
+ *
+ * The math lives HERE and nowhere else -- there is no duplicate of it inside
+ * the audio backend.  What the backend supplies is the measurement: the live
+ * key peak comes from jce_audio_bus_get_peak() (jce_audio.h), which meters
+ * the real miniaudio node the bus plays through.  The runtime closes that
+ * loop once per frame in rt_apply_mixer() (jce_rt_audio.c).  Because the only
+ * device-side part is the meter, the same follower can be driven offline over
+ * a synthetic key envelope in a unit test and step for step it is the code
+ * that runs live.
+ *
+ * (Until 2026-09-21 this comment claimed the envelope+curve math ALSO ran in
+ * a live miniaudio node.  It never did: duck_advance had no caller outside
+ * the tests, so the duck gain was permanently 1.0 in every shipped game while
+ * resolve_volume_ducked dutifully applied it.  The sentence is what stopped
+ * anyone looking -- it said the live path was handled and the offline driver
+ * was merely its test twin.) */
 
 typedef struct {
     JceAudioBusId key;          /* bus whose level drives the duck            */
@@ -186,11 +210,22 @@ JCE_API bool           jce_audio_mixer_get_sidechain(const JceAudioMixer *m,
                                                      JceAudioDuckParams *out);
 
 /* Advance every installed sidechain by one block of `frames` samples,
- * pulling each key bus's peak level via `key_peak(key_bus, user)` (linear
- * 0..1).  This evolves the envelope follower deterministically: rising key
- * level pulls the duck gain down (toward max_attenuation), falling key level
- * lets it recover toward unity.  `frames` is the block length the coefficients
- * were sized against (typically one mix callback). */
+ * pulling each key bus's peak level via `key_peak(key_bus, user)` (linear,
+ * normally 0..1).  This evolves the envelope follower deterministically:
+ * rising key level pulls the duck gain down (toward max_attenuation), falling
+ * key level lets it recover toward unity.  `frames` is the block length the
+ * coefficients are sized against for THIS call -- they are re-derived from it
+ * every time, so a variable block (a frame's worth of audio at a variable
+ * frame rate) is exact, not an approximation.
+ *
+ * `key_peak` must return the key's POST-FADER peak -- its level with its own
+ * mixer volume already applied, which is what jce_audio_bus_get_peak() reads
+ * off the live bus node.  Only the key's mute/solo state is folded in here,
+ * so a muted or solo-excluded key cannot duck its target no matter how loud
+ * its signal is.  (Before 2026-09-21 this folded in the key's full resolved
+ * VOLUME, which squares the key gain against a post-fader meter: exact at
+ * volume 1.0 and 6 dB wrong at 0.5.  It had no live caller then, and its own
+ * comment already said "mute/solo".) */
 typedef float (*JceAudioKeyPeakFn)(JceAudioBusId key_bus, void *user);
 JCE_API void           jce_audio_mixer_duck_advance(JceAudioMixer *m,
                                                     uint32_t frames,

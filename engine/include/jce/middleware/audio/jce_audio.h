@@ -26,6 +26,16 @@ typedef struct JceAudio JceAudio;
 /* -- Lifecycle ------------------------------------------------------ */
 
 JCE_API JceAudio *jce_audio_create(void);
+
+/* An engine the shared output device does NOT pump -- inaudible, and driven
+ * only by jce_audio_render_offline() below.  Everything else behaves
+ * identically: sounds load, voices play, buses mix, inserts and the reverb
+ * tail run.  Use it for an offline bounce, a headless/dedicated server, or a
+ * test that must observe the real node graph without sound hardware.
+ * jce_audio_render_offline() refuses an engine from jce_audio_create(),
+ * because two pumps on one graph race for the same read cursors. */
+JCE_API JceAudio *jce_audio_create_offline(void);
+
 JCE_API void      jce_audio_destroy(JceAudio *audio);
 
 /* -- Master mix tap -------------------------------------------------- */
@@ -55,6 +65,31 @@ JCE_API JceSound  jce_audio_load_pcm(JceAudio *audio,
                                const void *pcm_data, uint32_t pcm_size,
                                uint16_t channels, uint32_t sample_rate,
                                uint16_t bits_per_sample);
+
+/* Load a sound for STREAMING: the encoded bytes stay resident and each voice
+ * decodes them on demand, instead of one up-front decode into s16 PCM.
+ *
+ * Every clip was decompress-on-load, with no engine-provided alternative: a
+ * five-minute stereo track cost ~50 MB resident and a full decode before the
+ * first sample.  jce_audio_play_stream existed but is a bare pull callback --
+ * the caller supplies its own decoder and its own thread-safe ring, which is
+ * why its only in-tree consumer is the video viewer feeding an already
+ * demuxed track.  This is the clip-level answer: pass a PAK (or NULL to read
+ * the host filesystem) and play the handle like any other.
+ *
+ * COSTS AND LIMITS, because they decide which clips want this.  Memory drops
+ * to the COMPRESSED size, so it is the right choice for music and ambience
+ * and the wrong one for a footstep: each voice carries its own decoder and
+ * decodes on the mix thread, so many concurrent streaming voices trade RAM
+ * for CPU.  jce_audio_get_pcm_data returns NULL for a streaming sound -- there
+ * is no decoded buffer to hand out, and that is how a caller can tell.
+ *
+ * Returns JCE_SOUND_INVALID if the asset is missing or not decodable; the
+ * format is proven at load, not at first play, so a bad clip fails where the
+ * caller can see it rather than as a silent voice later. */
+JCE_API JceSound jce_audio_load_streaming(JceAudio *audio,
+                                          const JcePakArchive *pak,
+                                          const char *path);
 
 /* Unload a previously loaded sound. */
 JCE_API void      jce_audio_unload(JceAudio *audio, JceSound snd);
@@ -131,6 +166,52 @@ JCE_API const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound sn
 JCE_API JceVoice  jce_audio_play(JceAudio *audio, JceSound snd,
                           bool loop, float volume, float pitch);
 
+/* -- Voice priority ------------------------------------------------- *
+ *
+ * The voice pool is fixed (64).  When it is full and everything is playing,
+ * something has to give, and WITHOUT A PRIORITY THE ONLY AVAILABLE ANSWER IS
+ * AGE: a boss cue or a line of dialogue was stolen by whatever happened to
+ * start after it.  Priority is what lets an author say which sounds matter.
+ *
+ * HIGHER IS MORE IMPORTANT, and 0 is normal.  That matches Unreal's
+ * FSoundBase::Priority and INVERTS Unity's AudioSource.priority, where 0 is
+ * the most important and 256 the least.  The reason is not taste: every
+ * component struct in this engine is zero-initialised and every scene saved
+ * before this field existed has a 0 in it, so 0 has to mean "what this engine
+ * already did".  Unity's numbering would silently promote every existing
+ * source to maximum importance.
+ *
+ * THE RULE, both halves of it:
+ *   - the victim is the LOWEST priority voice, age breaking ties -- so a
+ *     protected voice outlives an unprotected one regardless of age;
+ *   - a voice is never stolen by a sound of STRICTLY LOWER priority.  When
+ *     every live voice outranks the incoming one, the new sound is dropped
+ *     and jce_audio_play_priority returns JCE_VOICE_INVALID.  That is Unreal's
+ *     "prevent new" and Unity's virtualisation, and it is the half that makes
+ *     the protection real: choosing a better victim still evicts the boss cue
+ *     once every voice is a boss cue.
+ *
+ * Looping voices are still preferred as survivors over one-shots at equal
+ * priority, because background music being cut is the failure the age-only
+ * policy was already written to avoid. */
+#define JCE_AUDIO_PRIORITY_NORMAL 0
+
+/* Play at a given priority.  jce_audio_play is this with priority 0.
+ * Returns JCE_VOICE_INVALID when the pool is full of higher-priority voices. */
+JCE_API JceVoice  jce_audio_play_priority(JceAudio *audio, JceSound snd,
+                          bool loop, float volume, float pitch, int priority);
+
+/* Re-prioritise a voice that is already playing.  Takes effect on the next
+ * allocation that has to steal.  No-op on a stale/invalid voice. */
+JCE_API void      jce_audio_voice_set_priority(JceAudio *audio, JceVoice voice,
+                                               int priority);
+/* 0 for a stale/invalid voice, which is ALSO what a live normal-priority
+ * voice reads -- this getter cannot tell you which one you have, and there is
+ * no public voice-validity predicate to ask.  It answers "how important is
+ * this voice", not "does this voice exist". */
+JCE_API int       jce_audio_voice_get_priority(const JceAudio *audio,
+                                               JceVoice voice);
+
 JCE_API void      jce_audio_stop(JceAudio *audio, JceVoice voice);
 JCE_API void      jce_audio_pause(JceAudio *audio, JceVoice voice);
 JCE_API void      jce_audio_resume(JceAudio *audio, JceVoice voice);
@@ -187,11 +268,98 @@ JCE_API bool      jce_audio_bus_create(JceAudio *audio, const char *name);
 JCE_API void      jce_audio_bus_set_volume(JceAudio *audio, const char *name,
                                            float volume);
 
+/* -- Aux sends (device side) ---------------------------------------- *
+ *
+ * Up to JCE_AUDIO_BUS_MAX_SENDS per bus, which is deliberately the same 8 that
+ * jce_audio_mixer.h's JCE_AUDIO_MAX_SENDS allows: a device that routed fewer
+ * than the mixer can author would be the same partial wiring this whole
+ * facility exists to remove.  Declared here rather than included from the
+ * mixer header because that header promises to stay engine-agnostic, and the
+ * dependency would only run the wrong way to share a number.
+ *
+ * A console aux send is a PARALLEL tap: the bus keeps feeding its normal
+ * output and a scaled copy also goes to another bus (a reverb or delay
+ * return).  jce_audio_mixer has modelled this for a long time -- set_send,
+ * send_at, resolve_send -- the editor authors it per bus and the config parser
+ * reads it back at Play start, and NOTHING ROUTED ANY AUDIO: the device side
+ * offered only bus_create / bus_set_volume / voice_set_bus, so every bus was a
+ * flat child of Master with one gain and no parallel tap to send into.
+ *
+ * `amount` is linear, 0 = off.  Calling it again for the SAME destination
+ * re-scales that send; a different destination ADDS one, the way a console
+ * strip feeds several returns at once -- it does not re-point the first.
+ * Setting 0 retires the send and frees its slot.  A bus may not send to
+ * ITSELF -- that is a ring in the node
+ * graph and pulling frames through it recurses with no bottom.  Longer rings
+ * are refused one layer up by jce_audio_mixer_set_send.
+ *
+ * Returns false if either bus is unknown, the send is a self-send, or the
+ * graph refused the attachment; the bus is left exactly as it was. */
+#define JCE_AUDIO_BUS_MAX_SENDS 8
+
+JCE_API bool  jce_audio_bus_set_send(JceAudio *audio, const char *from_bus,
+                                     const char *to_bus, float amount);
+/* 0 when there is no send from `from_bus` to that specific bus. */
+JCE_API float jce_audio_bus_get_send(const JceAudio *audio,
+                                     const char *from_bus, const char *to_bus);
+
 /* Route a voice's output into the named bus.  Call after jce_audio_play.
  * Unknown bus name or "Master" routes the voice straight to the endpoint.
  * No-op on a stale/invalid voice. */
 JCE_API void      jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
                                           const char *bus_name);
+
+/* Peak level of the signal a named bus put out since the LAST call to this
+ * function, linear and POST-FADER: the bus's own gain (as last pushed by
+ * jce_audio_bus_set_volume) is already in it, exactly as a DAW channel meter
+ * reads.  Normally 0..1, but nothing clamps a hot mix, so treat >1 as real.
+ *
+ * Read-and-clear: each call returns the maximum |sample| seen since the
+ * previous call and resets the accumulator, so a caller polling once per
+ * frame sees that frame's peak and never a stale hold.  Calling it from two
+ * places splits the measurement between them -- there is one meter per bus,
+ * not one per reader.
+ *
+ * Metering is enabled lazily by the first call, so the first call after
+ * creating a bus returns 0 (nothing was being measured yet) and subsequent
+ * calls return real levels.  Returns 0 for an unknown bus, for "Master"
+ * (which is the engine endpoint, not a bus node), and when audio is
+ * disabled.
+ *
+ * Thread-safe: the audio thread writes the accumulator and any thread may
+ * read-and-clear it.  This is what feeds jce_audio_mixer_duck_advance()'s
+ * key-peak callback -- see jce_audio_mixer.h. */
+JCE_API float     jce_audio_bus_get_peak(JceAudio *audio, const char *name);
+
+/* Render the engine's node graph OFFLINE into `out`, without a device.
+ *
+ * Every JceAudio is device-less (see the master mix above); normally the one
+ * shared output device pumps it.  This pumps it directly instead, running
+ * every live node -- voices, bus groups, insert chains, the reverb tail --
+ * exactly as the device callback would.
+ *
+ * On success it writes EXACTLY `frames` frames of interleaved f32 at the
+ * engine's channel count (2), silence-padded when the graph produces less --
+ * an idle engine, or one with nothing attached to its endpoint at all, which
+ * reads zero frames because miniaudio has no silence to mix.  That is the
+ * same gapless property the shared device gives (its callback runs at a
+ * constant cadence and sums to silence when engines are idle), and it is why
+ * there is no frames-written out-parameter: a caller bouncing to a file or
+ * feeding an encoder needs the block, not a short read it has to pad itself.
+ *
+ * That makes the audio path testable and usable with no sound hardware:
+ * headless/dedicated-server builds, offline bounce, and unit tests that must
+ * observe the real graph rather than skipping for want of a device.
+ *
+ * `audio` MUST come from jce_audio_create_offline(); this returns false for a
+ * device-pumped engine rather than racing the device thread for the same read
+ * cursors.  That is a refusal, not a warning in a comment, because a comment
+ * is the one thing a caller can be sure of not reading.
+ *
+ * Returns false -- writing NOTHING -- on a NULL/invalid argument, on a
+ * device-pumped engine, or when audio is disabled. */
+JCE_API bool      jce_audio_render_offline(JceAudio *audio, float *out,
+                                           uint32_t frames);
 
 /* -- Insert-effect DSP chains (FEATURE 5.1) ------------------------- */
 
@@ -245,9 +413,21 @@ JCE_API uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice);
  * without coupling the audio device to the (engine-agnostic) zone module.
  *
  * wet_mix/dry_mix are 0..1 send levels; decay_seconds is the tail length;
- * room_size (m) scales the pre-delay; damping/lowpass_hz roll off the wet
- * high frequencies.  diffusion/density are accepted for completeness but
- * are baked into the fixed comb/allpass network. */
+ * damping/lowpass_hz roll off the wet high frequencies.
+ *
+ * THIS COMMENT USED TO SAY "room_size (m) scales the pre-delay" and that
+ * "diffusion/density are accepted for completeness".  Neither was true:
+ * jce_audio_set_reverb read five of the nine fields and there was no
+ * pre-delay in the DSP at all.  Now: pre_delay_ms delays the late tail (and
+ * room_size derives one when pre_delay_ms is 0, at ~0.34 m per ms, which is
+ * what the sentence had always claimed); diffusion drives the allpass
+ * feedback, which is what diffusion IS.  density remains unread and is the
+ * one field still described as accepted -- it would mean a variable comb
+ * count, and a fixed network cannot express it.
+ *
+ * early_mix / early_delay_ms are the FIRST reflection: one clean tap before
+ * the diffuse tail, which is what tells a listener the size of a room.
+ * APPENDED. */
 typedef struct {
     float wet_mix;
     float dry_mix;
@@ -258,6 +438,8 @@ typedef struct {
     float density;
     float pre_delay_ms;
     float lowpass_hz;
+    float early_mix;        /* 0 = no early reflection */
+    float early_delay_ms;   /* time to the first reflection */
 } JceAudioReverbParams;
 
 /* Apply the blended reverb preset to the global reverb node (created lazily
@@ -266,6 +448,25 @@ typedef struct {
  * No-op safely when audio is disabled. */
 JCE_API void      jce_audio_set_reverb(JceAudio *audio,
                                        const JceAudioReverbParams *params);
+
+/* Run the SAME reverb DSP over a known buffer, with no audio device.
+ *
+ * The identical entry point the DSP chain has, and for the identical reason:
+ * "the same math runs offline over a known PCM buffer, which is how the
+ * effects are unit-tested with no audio device".  The reverb had no such
+ * door, so nothing about it could be asserted -- which is how six authored
+ * numbers (room_size, diffusion, density, pre_delay_ms, and the component's
+ * reflections pair) came to reach no part of the DSP without anything
+ * noticing.
+ *
+ * `frames` frames of `channels` interleaved f32 in `io`, processed in place.
+ * A fresh reverb state per call, so an impulse response starts from silence
+ * and two calls with the same input give the same output.  channels is
+ * clamped to 1..2; returns false if the state could not be allocated. */
+JCE_API bool      jce_audio_reverb_process_offline(
+                      const JceAudioReverbParams *params,
+                      float *io, uint32_t frames, int channels,
+                      int sample_rate);
 
 /* -- 3D positional audio -------------------------------------------- */
 
@@ -303,6 +504,25 @@ typedef enum {
 /* Enable / disable spatialisation on a voice.  Voices default to
  * non-spatial (UI sounds, music) — call this immediately after
  * jce_audio_play() to make a voice positional. */
+/* Continuous 2D<->3D blend, Unity's AudioSource.spatialBlend.
+ *
+ * jce_audio_voice_set_3d below is a BOOLEAN, and for a long time it was the
+ * only consumer of a float the inspector edits in 0.01 steps: the runtime read
+ * `spatial_blend > 0.5f`, so 0.0 and 0.49 were bit-identical in the mix and so
+ * were 0.51 and 1.0.  A hundred authorable values, two reachable states.
+ *
+ * WHAT IS BLENDED, AND WHAT IS NOT.  miniaudio has no spatial-blend knob, so
+ * this scales the DISTANCE ATTENUATION by putting a floor under it: at 0.25
+ * the attenuation can only pull the voice a quarter of the way toward silence.
+ * That is the audible axis and it is now continuous.  PANNING IS NOT BLENDED
+ * -- once spatialisation is on, miniaudio pans from the 3D direction, and
+ * blending that needs a manual pan this engine does not drive.  Unity blends
+ * both; saying so here rather than letting the difference be discovered.
+ *
+ * blend <= 0 turns spatialisation off entirely, which is what 0 already did. */
+JCE_API void jce_audio_voice_set_spatial_blend(JceAudio *audio, JceVoice voice,
+                                               float blend);
+
 JCE_API void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice,
                                      bool spatial);
 

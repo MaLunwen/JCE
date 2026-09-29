@@ -31,6 +31,7 @@
 #include <lualib.h>
 
 #include <math.h>
+#include <stdlib.h>   /* getenv / strtol: watchdog budget override */
 #include <string.h>
 
 #define LOG_TAG "script"
@@ -418,6 +419,64 @@ void jce_script_register_binding(lua_State *L, JceScript *s,
  *     check that can see jce.json_null at all;
  *   - test_jce_script_internal_header.c, which counts those keys again from C
  *     through a TU that includes only the private header. */
+/* jce.line_set_points(entity, points) -> stored_count
+ *
+ * HAND-WRITTEN because of MARSHALLING, not policy: the host member takes a
+ * packed `const float *xyz, int count` and no generated shape reads a Lua
+ * array into one.  Doing it here keeps the table walk, the length rules and
+ * the returned stored-count in one place.
+ *
+ * `points` is a flat array {x1,y1,z1,x2,y2,z2,...}.  A flat array rather than
+ * an array of triples on purpose: one lua_rawgeti per number instead of a
+ * nested table per point, which is the whole reason this binding exists.
+ *
+ * WHY IT EXISTS.  The only route from a script used to be comp_set with the
+ * whole LineRenderer re-serialised as JSON carrying flat "px0","py0","pz0",
+ * "px1"... keys.  cJSON resolves a key by walking the object's child list, so
+ * the i-th point costs O(i) comparisons -- the transport is O(n^2) while the
+ * component has held the points in a packed array the whole time.
+ *
+ * A non-multiple-of-three length is an ERROR, not a truncation: silently
+ * dropping a trailing partial point would move the polyline's last segment
+ * and look like a physics result. */
+static int l_jce_line_set_points(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    lua_Integer entity = luaL_checkinteger(L, 1);
+    lua_Integer n;
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+    n = (lua_Integer)lua_rawlen(L, 2);
+    if (n % 3 != 0)
+        return luaL_error(L, "line_set_points: %d numbers is not a whole "
+                             "number of xyz triples", (int)n);
+    if (!s->have_host || !s->host.line_set_points || n == 0) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    {
+        /* JCE_SCRIPT_LINE_MAX_POINTS mirrors the component's cap (they are
+         * asserted equal in jce_rt_script.c); the host clamps to
+         * it too and returns what it stored, so a script can see the clamp
+         * instead of inferring it from the picture. */
+        float xyz[JCE_SCRIPT_LINE_MAX_POINTS * 3];
+        lua_Integer want = n / 3;
+        lua_Integer i;
+
+        if (want > JCE_SCRIPT_LINE_MAX_POINTS)
+            want = JCE_SCRIPT_LINE_MAX_POINTS;
+        for (i = 0; i < want * 3; ++i) {
+            lua_rawgeti(L, 2, i + 1);
+            xyz[i] = (float)lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+        lua_pushinteger(L, s->host.line_set_points(s->host.user,
+                                                   (JceScriptEntity)entity,
+                                                   xyz, (int)want));
+    }
+    return 1;
+}
+
 static void install_bindings(JceScript *s)
 {
     lua_State *L = s->L;
@@ -431,6 +490,7 @@ static void install_bindings(JceScript *s)
      * fails if anyone marks them otherwise. */
     register_binding(L, s, "log",             l_jce_log);
     register_binding(L, s, "asset_read_text", l_jce_asset_read_text);
+    register_binding(L, s, "line_set_points", l_jce_line_set_points);
     register_binding(L, s, "asset_read_json", l_jce_asset_read_json);
     register_binding(L, s, "play_sound",      l_jce_play_sound);
     register_binding(L, s, "start_coroutine", l_jce_start_coroutine);
@@ -625,13 +685,34 @@ static JceScriptInstance build_instance(lua_State *L, JceScriptEntity owner)
     return (JceScriptInstance)ref;
 }
 
+/* lua_pcall plus a traceback message handler (defined below, at the other
+ * script_pcall_tb sites).  run_chunk() is the ONLY one of its nine call sites
+ * that precedes the definition; the other eight are below it and always saw
+ * the real prototype.  Its sibling script_arm_watchdog -- which run_chunk also
+ * calls -- is forward-declared at the top of this file for the same reason;
+ * this one was missed.
+ *
+ * Caught 2026-09-21 by /we4013.  Without a declaration the call went through
+ * an implicit `extern int script_pcall_tb()` against a `static int(...)`
+ * definition, which is also what the C4211 "redefined extern to static" at
+ * that definition had been reporting, unacted on.
+ *
+ * DECLARED HERE RATHER THAN BESIDE ITS SIBLING AT THE TOP, deliberately:
+ * contracts/script-api.json cites HAND-MAINTAINED line numbers into this file
+ * (:63 through :290, for the log, asset_read_text, asset_read_json and
+ * play_sound bindings), and
+ * gen_script_bindings.py --update does NOT regenerate them -- it only
+ * validates.  Inserting above those lines shifts every citation and reds the
+ * audit; inserting here, past the last cited line, does not. */
+static int script_pcall_tb(lua_State *L, int nargs, int nres);
+
 static JceScriptInstance run_chunk(JceScript *s, JceScriptEntity owner,
                                    const char *what)
 {
     lua_State *L = s->L;
     /* chunk is on stack top (loaded by caller). Run it expecting 1 return. */
     script_arm_watchdog(L);
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    if (script_pcall_tb(L, 0, 1) != LUA_OK) {
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
             char buf[512];
@@ -701,15 +782,75 @@ static JceScriptInstance script_lua_instantiate(JceScript *s, const char *path,
  * runtime (editor AND shipped).  Legit per-frame script work is orders of
  * magnitude under the budget, so the hook never fires in normal use. */
 #define JCE_SCRIPT_WATCHDOG_INSTR 40000000
+
+/* The budget is a CONSTANT for the shipped runtime and an OVERRIDE for test
+ * harnesses, because the two have different definitions of "runaway".
+ *
+ * The comment above is right that legit PER-FRAME work is orders of magnitude
+ * under 40M.  But a QA self-test entry point is not per-frame work: space/'s
+ * session_selftest integrates whole takes -- one of its checks steps up to
+ * 60000 physics frames inside a SINGLE named call, to prove the servicer's
+ * attitude is produced by torque rather than assigned.  It tripped the hook
+ * and returned no result at all, and because the dispatcher logs the error
+ * and moves on, the symptom was "the QA case produced no line", which reads
+ * exactly like "the case does not exist".  Every case after it in that
+ * harness never ran either.
+ *
+ * MEASURED: raising the budget is not the fix.  At 400M -- ten times the
+ * shipped value -- the same call still trips, at 4.5 s in.  A batch job has
+ * no budget that is both large enough today and still a hang-guard tomorrow;
+ * picking one only moves the day it silently fires again.  So the override
+ * also accepts the literal token "off", which clears the hook for the
+ * process.  That is for harnesses that own their own timeout (space/'s ctest
+ * entry carries one) and must never be used by anything that ships: the
+ * runtime is single-threaded and an unguarded runaway hangs the frame loop.
+ *
+ * "off" is a WORD on purpose.  An empty or malformed value must not disable a
+ * hang-guard by accident, so everything that is not a positive number or that
+ * exact token keeps the shipped default.
+ *
+ * Read once and cached: the hook is armed before every dispatch, and getenv
+ * on every dispatch would put a libc lookup in the hot path.
+ * Same shape as the other JCE_* levers (JCE_MAX_FRAMES, JCE_INPUT_REPLAY,
+ * JCE_STARTUP_SCENE): the default is what ships, the env is for the harness. */
+#define JCE_SCRIPT_WATCHDOG_OFF (-1)
+
+static int script_watchdog_budget(void)
+{
+    static int cached = 0;   /* 0 = not read yet; -1 = explicitly off */
+
+    if (cached == 0) {
+        const char *env = getenv("JCE_SCRIPT_WATCHDOG_INSTR");
+
+        if (env && (strcmp(env, "off") == 0 || strcmp(env, "OFF") == 0)) {
+            cached = JCE_SCRIPT_WATCHDOG_OFF;
+        } else {
+            long value = env ? strtol(env, NULL, 10) : 0;
+
+            cached = (value > 0 && value <= 2000000000L)
+                         ? (int)value : JCE_SCRIPT_WATCHDOG_INSTR;
+        }
+    }
+    return cached;
+}
+
 static void script_watchdog_hook(lua_State *L, lua_Debug *ar)
 {
     (void)ar;
     luaL_error(L, "script watchdog: call exceeded %d instructions (infinite loop?)",
-               JCE_SCRIPT_WATCHDOG_INSTR);
+               script_watchdog_budget());
 }
 static void script_arm_watchdog(lua_State *L)
 {
-    lua_sethook(L, script_watchdog_hook, LUA_MASKCOUNT, JCE_SCRIPT_WATCHDOG_INSTR);
+    int budget = script_watchdog_budget();
+
+    if (budget == JCE_SCRIPT_WATCHDOG_OFF) {
+        /* Clear rather than skip: a hook armed by an earlier dispatch would
+         * otherwise stay live on this lua_State and fire mid-batch. */
+        lua_sethook(L, NULL, 0, 0);
+        return;
+    }
+    lua_sethook(L, script_watchdog_hook, LUA_MASKCOUNT, budget);
 }
 
 /* ── THE FAILING-CALLBACK RULE, Lua side ──────────────────────────────────
@@ -752,7 +893,13 @@ typedef enum {
     CB_START     = 0,
     CB_UPDATE    = 1,
     CB_COLLISION = 2,
-    CB_ANIM      = 3
+    CB_ANIM      = 3,
+    /* Its OWN bit, not CB_UPDATE's.  A handler that throws every physics step
+     * must not take the render-frame callback down with it -- they are
+     * different functions with different cadences, and a shared bit would make
+     * "my on_update stopped running" the symptom of a bug in a different
+     * method.  The mask is a lua_Integer, so a fifth bit costs nothing. */
+    CB_FIXED     = 4
 } ScriptCallbackSlot;
 
 /* Is `bit` marked disabled on the instance at stack index `idx`?
@@ -796,11 +943,61 @@ static void inst_cb_disable(lua_State *L, int idx, int bit)
  *
  * Stack on entry: the error object on top, the instance at `inst_idx` (which
  * is read only when `bit >= 0`).  Pops the error object; leaves the rest. */
+/* THE MESSAGE HANDLER, and why every dispatch needs one.
+ *
+ * lua_pcall's last argument is the index of a handler that runs WHILE the
+ * erroring stack is still standing.  Every dispatch in this file passed 0,
+ * so luaL_traceback never ran and a script error was the innermost
+ * "chunk:line: message" with nothing above it -- the caller, the callback,
+ * the entity, all gone.  Adding the traceback after pcall returns cannot
+ * work: by then the frames have been unwound, which is the whole reason the
+ * handler exists.
+ */
+static int script_msgh(lua_State *L)
+{
+    const char *msg = lua_tostring(L, 1);
+    if (!msg) {
+        /* A non-string error object: give it __tostring if it has one, else
+         * say what it was rather than dropping it. */
+        if (luaL_callmeta(L, 1, "__tostring") &&
+            lua_type(L, -1) == LUA_TSTRING)
+            return 1;
+        msg = lua_pushfstring(L, "(error object is a %s value)",
+                              luaL_typename(L, 1));
+    }
+    luaL_traceback(L, L, msg, 1);
+    return 1;
+}
+
+/* pcall WITH that handler, WITHOUT disturbing the caller's stack layout.
+ *
+ * That second half is the reason this is a function rather than an edit at
+ * each site: the dispatchers here track their own indices by hand and say so
+ * in comments ("inst is under it", "pops fn + 2 args").  Pushing a handler
+ * on top and passing its index would shift every one of them.
+ *
+ * So the handler is INSERTED below the function and removed afterwards.  On
+ * success pcall leaves nres results just above it; on error, the error
+ * object.  Removing the handler shifts either down by one, which puts the
+ * stack in exactly the shape a pcall(..., 0) would have left -- so every
+ * index the call site already tracks still means what it did. */
+static int script_pcall_tb(lua_State *L, int nargs, int nres)
+{
+    const int fn_index = lua_gettop(L) - nargs;
+    lua_pushcfunction(L, script_msgh);
+    lua_insert(L, fn_index);
+    const int rc = lua_pcall(L, nargs, nres, fn_index);
+    lua_remove(L, fn_index);
+    return rc;
+}
+
 static void report_dispatch_error(JceScript *s, lua_State *L, int inst_idx,
                                   const char *method, int bit)
 {
     const char *err = lua_tostring(L, -1);
-    char        buf[512];
+    /* A traceback is many lines; 512 truncated it to the first frame, which
+     * is the one place a message handler buys nothing. */
+    char        buf[2048];
     int         abs = lua_absindex(L, inst_idx);
 
     snprintf(buf, sizeof(buf), "%s error: %s", method, err ? err : "?");
@@ -834,7 +1031,7 @@ static void call_method(JceScript *s, JceScriptInstance inst,
     int nargs = 1;
     if (has_dt) { lua_pushnumber(L, (lua_Number)dt); nargs = 2; } /* [ ..., dt ] */
     script_arm_watchdog(L);
-    if (lua_pcall(L, nargs, 0, 0) != LUA_OK)                /* pops fn+args */
+    if (script_pcall_tb(L, nargs, 0) != LUA_OK)                /* pops fn+args */
         report_dispatch_error(s, L, -2, method, bit);       /* inst is under it */
     lua_pop(L, 1);                                          /* drop inst */
 }
@@ -847,6 +1044,12 @@ static void script_lua_call_start(JceScript *s, JceScriptInstance inst)
 static void script_lua_call_update(JceScript *s, JceScriptInstance inst, float dt)
 {
     call_method(s, inst, "on_update", true, dt, CB_UPDATE);
+}
+
+static void script_lua_call_fixed_update(JceScript *s, JceScriptInstance inst,
+                                         float dt)
+{
+    call_method(s, inst, "on_fixed_update", true, dt, CB_FIXED);
 }
 
 static void script_lua_release(JceScript *s, JceScriptInstance inst)
@@ -873,7 +1076,7 @@ static void script_lua_call_collision(JceScript *s, JceScriptInstance inst,
     lua_pushvalue(L, -2);                                   /* [ inst, fn, self ] */
     lua_pushinteger(L, (lua_Integer)other_entity);         /* [ inst, fn, self, other ] */
     script_arm_watchdog(L);
-    if (lua_pcall(L, 2, 0, 0) != LUA_OK)                   /* pops fn + args */
+    if (script_pcall_tb(L, 2, 0) != LUA_OK)                   /* pops fn + args */
         report_dispatch_error(s, L, -2, "on_collision", CB_COLLISION);
     lua_pop(L, 1);                                          /* drop inst */
 }
@@ -902,7 +1105,7 @@ static void script_lua_call_message(JceScript *s, JceScriptInstance inst,
      * `msg_name` is the CALLER's string, so deriving a slot from it would let
      * jce.send_message(e, "on_update") disable the real on_update.  See the
      * jce_script_call_message comment in jce_script.h. */
-    if (lua_pcall(L, 3, 0, 0) != LUA_OK)                   /* pops fn + 3 args */
+    if (script_pcall_tb(L, 3, 0) != LUA_OK)                   /* pops fn + 3 args */
         report_dispatch_error(s, L, -2, msg_name, CB_NONE);
     lua_pop(L, 1);                                          /* drop inst */
 }
@@ -931,7 +1134,7 @@ static void script_lua_call_anim_event(JceScript *s, JceScriptInstance inst,
     lua_pushnumber(L, (lua_Number)f0);                     /* [ ..., f0 ] */
     lua_pushnumber(L, (lua_Number)f1);                     /* [ ..., f1 ] */
     lua_pushinteger(L, (lua_Integer)i0);                   /* [ ..., i0 ] */
-    if (lua_pcall(L, 6, 0, 0) != LUA_OK)                   /* pops fn + 6 args */
+    if (script_pcall_tb(L, 6, 0) != LUA_OK)                   /* pops fn + 6 args */
         report_dispatch_error(s, L, -2, "on_anim_event", CB_ANIM);
     lua_pop(L, 1);                                          /* drop inst */
 }
@@ -945,7 +1148,7 @@ static bool script_lua_call_named(JceScript *s, const char *fn_name,
     if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return false; }
     lua_pushinteger(L, (lua_Integer)arg_entity);           /* [ fn, arg ] */
     script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {                 /* pops fn + arg */
+    if (script_pcall_tb(L, 1, 0) != LUA_OK) {                 /* pops fn + arg */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
             char buf[512];
@@ -968,7 +1171,7 @@ static bool script_lua_call_named_num(JceScript *s, const char *fn_name,
     lua_pushinteger(L, (lua_Integer)arg_entity);           /* [ fn, ent ] */
     lua_pushnumber(L, (lua_Number)value);                  /* [ fn, ent, v ] */
     script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
-    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {                 /* pops fn + 2 args */
+    if (script_pcall_tb(L, 2, 0) != LUA_OK) {                 /* pops fn + 2 args */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
             char buf[512];
@@ -992,7 +1195,7 @@ static bool script_lua_call_named_str(JceScript *s, const char *fn_name,
     if (str) lua_pushstring(L, str);                       /* [ fn, ent, s ] */
     else     lua_pushnil(L);                               /* [ fn, ent, nil ] */
     script_arm_watchdog(L);   /* fresh per-dispatch budget, like call_method */
-    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {                 /* pops fn + 2 args */
+    if (script_pcall_tb(L, 2, 0) != LUA_OK) {                 /* pops fn + 2 args */
         const char *err = lua_tostring(L, -1);
         if (s->have_host && s->host.log) {
             char buf[512];
@@ -1071,7 +1274,7 @@ static JceScriptModule script_lua_compile_module(JceScript *s, const char *name,
         return 0;
     }
     script_arm_watchdog(L);
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    if (script_pcall_tb(L, 0, 1) != LUA_OK) {
         const char *err = lua_tostring(L, -1);
         LOG_ERROR(LOG_TAG, "reload run error (%s): %s", chunkname, err ? err : "?");
         lua_pop(L, 1);
@@ -1147,6 +1350,7 @@ static const JceScriptVM k_lua_vm = {
     script_lua_compile_module,
     script_lua_rebind_instance,
     script_lua_release_module,
+    script_lua_call_fixed_update,   /* APPENDED -- see jce_script_vm.h */
 };
 
 const JceScriptVM *JCE_CALL jce_script_vm_lua(void)

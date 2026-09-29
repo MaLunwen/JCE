@@ -116,6 +116,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->recent_max        = 10;
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
+    cfg->viewport_occlusion = false;   /* see the header for why */
     cfg->gizmo_snap_translate = 0.5f;
     cfg->gizmo_snap_rotate    = 15.0f;
     cfg->gizmo_snap_scale     = 0.25f;
@@ -125,36 +126,33 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->asset_favorite_count = 0;
     /* asset_favorites left zero-initialised by the memset above. */
     cfg->run_mode = 0; /* Editor Simulation */
-    /* Default points to the canonical CMake-preset output.  Forward slashes
-     * work on every host (Windows accepts them in CreateProcess paths).
-     * jce_run_manager performs smart resolution at spawn-time: tries
-     * configured path → with platform exe suffix → walks parent dirs →
-     * tries other known build/desktop/<arch>/[release/] candidates. */
+    /* Forward slashes work on every host (Windows accepts them in
+     * CreateProcess paths).  jce_run_manager resolves at spawn-time: the
+     * configured path → with the platform exe suffix → parent dirs → the
+     * project's target name under the known build/desktop/<arch>/[variant]
+     * dirs.  The "default points to the canonical preset output" this comment
+     * used to describe is gone -- see immediately below. */
+    /* No executable name by default.  Which binary "Run" launches belongs to
+     * the opened project (Project Settings > Build > CMake Target, i.e.
+     * jce_project.json's target_name); jce_run_manager joins that name with
+     * the well-known preset output dirs below.  Until 2026-08-27 these three
+     * fields shipped one game's name, so a fresh editor proposed to run
+     * somebody else's build. */
+    cfg->game_executable_path[0] = '\0';
+    cfg->game_target_name[0]     = '\0';
 #if JCE_PLATFORM_WINDOWS
-    strncpy(cfg->game_executable_path,
-            "build/desktop/windows-x64/release/caged_kingdom.exe",
-            sizeof(cfg->game_executable_path) - 1);
     strncpy(cfg->game_working_directory, "build/desktop/windows-x64/release",
             sizeof(cfg->game_working_directory) - 1);
 #elif JCE_PLATFORM_MACOS
-    strncpy(cfg->game_executable_path,
-            "build/desktop/macos-arm64/CagedKingdom",
-            sizeof(cfg->game_executable_path) - 1);
     strncpy(cfg->game_working_directory, "build/desktop/macos-arm64",
             sizeof(cfg->game_working_directory) - 1);
 #elif JCE_PLATFORM_LINUX
-    strncpy(cfg->game_executable_path,
-            "build/desktop/linux-x64/CagedKingdom",
-            sizeof(cfg->game_executable_path) - 1);
     strncpy(cfg->game_working_directory, "build/desktop/linux-x64",
             sizeof(cfg->game_working_directory) - 1);
 #else
-    strncpy(cfg->game_executable_path, "build/host/release/caged_kingdom",
-            sizeof(cfg->game_executable_path) - 1);
     strncpy(cfg->game_working_directory, "build/host/release",
             sizeof(cfg->game_working_directory) - 1);
 #endif
-    strncpy(cfg->game_target_name, "CagedKingdom", sizeof(cfg->game_target_name) - 1);
     strncpy(cfg->build_configure_preset, "host-release",
             sizeof(cfg->build_configure_preset) - 1);
     strncpy(cfg->build_preset, "build-host-release", sizeof(cfg->build_preset) - 1);
@@ -310,6 +308,14 @@ static void apply_pref_keys(JceEditorConfig *cfg, const JceJson *root) {
                                                  cfg->auto_repack_on_save);
     cfg->run_dev_mode = jce_json_get_bool(root, "run_dev_mode",
                                           cfg->run_dev_mode);
+    /* A durable preference, not session state: it changes what the viewport
+     * culler is built as at editor start, and it is edited from the
+     * Preferences panel.  It sat in the session group for one build; the
+     * round-trip test that injected it into editor-preferences.json found
+     * nothing, which is what a setting written to one file and read from
+     * another looks like from the outside. */
+    cfg->viewport_occlusion = jce_json_get_bool(root, "viewport_occlusion",
+                                                cfg->viewport_occlusion);
     /* General prefs (merged from the retired prefs.json store). */
     cfg->autosave_interval = cjson_read_int(root, "autosave_interval",
                                             cfg->autosave_interval);
@@ -597,6 +603,7 @@ static void write_pref_keys(JceJson *root, const JceEditorConfig *cfg) {
     jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
     jce_json_set_bool(root, "auto_repack_on_save", cfg->auto_repack_on_save);
     jce_json_set_bool(root, "run_dev_mode",        cfg->run_dev_mode);
+    jce_json_set_bool(root, "viewport_occlusion",  cfg->viewport_occlusion);
     jce_json_set_int (root, "autosave_interval",   cfg->autosave_interval);
     jce_json_set_int (root, "startup_mode",        cfg->startup_mode);
     jce_json_set_int (root, "recent_max",          cfg->recent_max);

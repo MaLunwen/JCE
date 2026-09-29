@@ -42,6 +42,7 @@
 extern "C" {
 #include <jce/middleware/audio/jce_audio_mixer.h>
 #include <jce/middleware/audio/jce_audio_dsp.h>
+#include <jce/middleware/audio/jce_audio_mixer_config.h>
 #include <jce/middleware/scene/jce_scene.h>
 }
 
@@ -89,46 +90,19 @@ static std::map<JceAudioBusId, std::vector<JceAudioEffectDesc>> s_bus_effects;
 
 /* ── Persistence ────────────────────────────────────────────────────── */
 
-/* Build one effect-desc object node.  Returns nullptr on allocation failure. */
+/* Build one effect-desc object node.
+ *
+ * FORWARDS to the engine.  This used to be a switch with its own field list
+ * and its own type spellings, beside a parse_effect that was a second copy of
+ * the engine's -- and adding three effects to the palette is exactly the
+ * change that leaves one of those behind.  The one that gets left behind is
+ * usually the reader, so the editor saves an effect the runtime drops without
+ * a word. */
 static JceJson *effect_to_json(const JceAudioEffectDesc &d)
 {
-    JceJson *e = jce_json_object();
-    if (!e) return nullptr;
-    switch (d.type) {
-    case JCE_AUDIO_EFFECT_EQ:
-        jce_json_set_string(e, "type",    "eq");
-        jce_json_set_int   (e, "shape",   (int)d.u.eq.shape);
-        jce_json_set_number(e, "freq",    (double)d.u.eq.frequency_hz);
-        jce_json_set_number(e, "gain_db", (double)d.u.eq.gain_db);
-        jce_json_set_number(e, "q",       (double)d.u.eq.q);
-        break;
-    case JCE_AUDIO_EFFECT_COMPRESSOR:
-        jce_json_set_string(e, "type",         "comp");
-        jce_json_set_number(e, "threshold_db", (double)d.u.comp.threshold_db);
-        jce_json_set_number(e, "ratio",        (double)d.u.comp.ratio);
-        jce_json_set_number(e, "attack_ms",    (double)d.u.comp.attack_ms);
-        jce_json_set_number(e, "release_ms",   (double)d.u.comp.release_ms);
-        jce_json_set_number(e, "makeup_db",    (double)d.u.comp.makeup_db);
-        jce_json_set_number(e, "knee_db",      (double)d.u.comp.knee_db);
-        break;
-    case JCE_AUDIO_EFFECT_LIMITER:
-        jce_json_set_string(e, "type",       "limiter");
-        jce_json_set_number(e, "ceiling_db", (double)d.u.limiter.ceiling_db);
-        jce_json_set_number(e, "release_ms", (double)d.u.limiter.release_ms);
-        break;
-    case JCE_AUDIO_EFFECT_DELAY:
-        jce_json_set_string(e, "type",     "delay");
-        jce_json_set_number(e, "delay_ms", (double)d.u.delay.delay_ms);
-        jce_json_set_number(e, "feedback", (double)d.u.delay.feedback);
-        jce_json_set_number(e, "wet",      (double)d.u.delay.wet);
-        jce_json_set_number(e, "dry",      (double)d.u.delay.dry);
-        break;
-    default:
-        jce_json_set_string(e, "type", "none");
-        break;
-    }
-    return e;
+    return jce_audio_effect_to_json(&d);
 }
+
 
 static void mixer_save(void)
 {
@@ -292,56 +266,13 @@ static void mixer_seed_default(void)
     jce_audio_mixer_add_bus(s_mixer, JCE_AUDIO_BUS_MASTER, "UI",    1.0f);
 }
 
-/* Parse one effect-desc object.  Missing fields keep the type's engine
- * defaults; returns false for an unknown/absent "type". */
+/* Parse one effect-desc object.  FORWARDS to the engine -- see
+ * effect_to_json above for why there is no longer a copy here. */
 static bool parse_effect(const JceJson *e, JceAudioEffectDesc &d)
 {
-    const char *type = jce_json_get_string(e, "type", "");
-    if (std::strcmp(type, "eq") == 0) {
-        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_EQ);
-        d.u.eq.shape = (JceAudioEqShape)
-            jce_json_get_int(e, "shape", (int)d.u.eq.shape);
-        d.u.eq.frequency_hz =
-            (float)jce_json_get_number(e, "freq",    d.u.eq.frequency_hz);
-        d.u.eq.gain_db =
-            (float)jce_json_get_number(e, "gain_db", d.u.eq.gain_db);
-        d.u.eq.q =
-            (float)jce_json_get_number(e, "q",       d.u.eq.q);
-    } else if (std::strcmp(type, "comp") == 0) {
-        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_COMPRESSOR);
-        d.u.comp.threshold_db =
-            (float)jce_json_get_number(e, "threshold_db", d.u.comp.threshold_db);
-        d.u.comp.ratio =
-            (float)jce_json_get_number(e, "ratio",        d.u.comp.ratio);
-        d.u.comp.attack_ms =
-            (float)jce_json_get_number(e, "attack_ms",    d.u.comp.attack_ms);
-        d.u.comp.release_ms =
-            (float)jce_json_get_number(e, "release_ms",   d.u.comp.release_ms);
-        d.u.comp.makeup_db =
-            (float)jce_json_get_number(e, "makeup_db",    d.u.comp.makeup_db);
-        d.u.comp.knee_db =
-            (float)jce_json_get_number(e, "knee_db",      d.u.comp.knee_db);
-    } else if (std::strcmp(type, "limiter") == 0) {
-        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_LIMITER);
-        d.u.limiter.ceiling_db =
-            (float)jce_json_get_number(e, "ceiling_db", d.u.limiter.ceiling_db);
-        d.u.limiter.release_ms =
-            (float)jce_json_get_number(e, "release_ms", d.u.limiter.release_ms);
-    } else if (std::strcmp(type, "delay") == 0) {
-        d = jce_audio_effect_default(JCE_AUDIO_EFFECT_DELAY);
-        d.u.delay.delay_ms =
-            (float)jce_json_get_number(e, "delay_ms", d.u.delay.delay_ms);
-        d.u.delay.feedback =
-            (float)jce_json_get_number(e, "feedback", d.u.delay.feedback);
-        d.u.delay.wet =
-            (float)jce_json_get_number(e, "wet",      d.u.delay.wet);
-        d.u.delay.dry =
-            (float)jce_json_get_number(e, "dry",      d.u.delay.dry);
-    } else {
-        return false;
-    }
-    return d.type != JCE_AUDIO_EFFECT_NONE;
+    return jce_audio_effect_from_json(e, &d);
 }
+
 
 static bool mixer_load(void)
 {
@@ -618,11 +549,23 @@ static void collect_children(JceAudioBusId parent,
 
 /* ── Bus inspector: insert-effect chain + aux sends + sidechain ─────── */
 
-static const char *kEffectTypeNames[] = { "EQ", "Compressor", "Limiter", "Delay" };
+/* THESE TWO ARRAYS ARE PARALLEL AND MUST STAY THAT WAY: the combo returns an
+ * index into the names and the code reads the same index out of the values,
+ * so a name added without its value silently authors the WRONG effect. */
+static const char *kEffectTypeNames[] = {
+    "EQ", "Compressor", "Limiter", "Delay", "Chorus", "Flanger", "Distortion"
+};
 static const JceAudioEffectType kEffectTypeVals[] = {
     JCE_AUDIO_EFFECT_EQ, JCE_AUDIO_EFFECT_COMPRESSOR,
-    JCE_AUDIO_EFFECT_LIMITER, JCE_AUDIO_EFFECT_DELAY
+    JCE_AUDIO_EFFECT_LIMITER, JCE_AUDIO_EFFECT_DELAY,
+    JCE_AUDIO_EFFECT_CHORUS, JCE_AUDIO_EFFECT_FLANGER,
+    JCE_AUDIO_EFFECT_DISTORTION
 };
+static_assert(IM_ARRAYSIZE(kEffectTypeNames) == IM_ARRAYSIZE(kEffectTypeVals),
+              "effect name/value arrays must stay parallel -- a mismatched "
+              "index authors a different effect than the one displayed");
+
+static const char *kDistShapeNames[] = { "Soft Clip", "Hard Clip", "Foldback" };
 static const char *kEqShapeNames[] = {
     "Peaking", "Low Shelf", "High Shelf", "Low Pass", "High Pass"
 };
@@ -678,7 +621,62 @@ static void draw_effect_params(JceAudioEffectDesc &d, bool &changed)
         if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.dry"),
                              &d.u.delay.dry, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
         break;
-    default: break;
+    /* CHORUS AND FLANGER share a parameter struct, so they share this editor.
+     * The RANGES differ though: a flanger lives in single-digit milliseconds
+     * and a chorus in the twenties, and one slider spanning both makes the
+     * flanger's whole useful range about four pixels wide. */
+    case JCE_AUDIO_EFFECT_CHORUS:
+    case JCE_AUDIO_EFFECT_FLANGER: {
+        const bool flanger = (d.type == JCE_AUDIO_EFFECT_FLANGER);
+        const float max_delay = flanger ? 20.0f : 60.0f;
+        const float max_depth = flanger ? 10.0f : 30.0f;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.delayMs"),
+                             &d.u.mod_delay.delay_ms, 0.1f, 0.1f, max_delay, "%.2f ms")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.depthMs", "Depth"),
+                             &d.u.mod_delay.depth_ms, 0.1f, 0.0f, max_depth, "%.2f ms")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.rateHz", "Rate"),
+                             &d.u.mod_delay.rate_hz, 0.01f, 0.0f, 20.0f, "%.2f Hz")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.feedback"),
+                             &d.u.mod_delay.feedback, 0.01f, 0.0f, 0.95f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.stereoPhase", "Stereo Phase"),
+                             &d.u.mod_delay.stereo_phase, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.wet"),
+                             &d.u.mod_delay.wet, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.dry"),
+                             &d.u.mod_delay.dry, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
+        break;
+    }
+    case JCE_AUDIO_EFFECT_DISTORTION: {
+        int shape = (int)d.u.distortion.shape;
+        ImGui::SetNextItemWidth(140);
+        if (ImGui::Combo(jce_editor_i18n_id("audioMixer.fx.distShape", "Shape"),
+                         &shape, kDistShapeNames, IM_ARRAYSIZE(kDistShapeNames))) {
+            d.u.distortion.shape = (JceAudioDistortionShape)shape; changed = true;
+        }
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.drive", "Drive"),
+                             &d.u.distortion.drive, 0.1f, 1.0f, 50.0f, "%.1f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.distCeiling", "Ceiling"),
+                             &d.u.distortion.ceiling, 0.01f, 0.05f, 2.0f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n_id("audioMixer.fx.outputGain", "Output"),
+                             &d.u.distortion.output_gain, 0.01f, 0.0f, 2.0f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.wet"),
+                             &d.u.distortion.wet, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
+        if (ImGui::DragFloat(jce_editor_i18n("audioMixer.fx.dry"),
+                             &d.u.distortion.dry, 0.01f, 0.0f, 1.0f, "%.2f")) changed = true;
+        break;
+    }
+    default:
+        /* A REGISTERED effect: the engine knows its name and nothing about
+         * its parameters, so there is no honest editor to draw.  Said, rather
+         * than an empty pane that reads like a broken panel. */
+        if ((int)d.type >= JCE_AUDIO_EFFECT_CUSTOM_BASE) {
+            const char *nm = jce_audio_dsp_effect_name((int)d.type);
+            ImGui::TextDisabled("%s", jce_editor_i18n_id(
+                "audioMixer.fx.customNoParams",
+                "registered by the project; its parameters are not editable here"));
+            if (nm) ImGui::TextDisabled("(%s)", nm);
+        }
+        break;
     }
 }
 

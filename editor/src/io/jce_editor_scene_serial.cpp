@@ -16,12 +16,15 @@
 #include "core/jce_editor_toast.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_scene_rendering_defaults.h"
+#include "core/jce_editor_script_backends.h"   /* project script modules */
+#include "core/jce_editor_scene_file_watch.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/middleware/scene/jce_material_override.h>
 #include <jce/middleware/scene/jce_component_registry.h>
 #include <jce/middleware/scene/jce_scene.h>   /* jce_scene_particles_set_asset_root */
 #include <jce/os/core/jce_filesystem.h>
@@ -29,18 +32,21 @@ extern "C" {
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
 }
 
 #include "scene/jce_asset_path_index.h"
 #include "io/jce_editor_prefab_override.h"
+#include "io/jce_editor_mesh_predecode.h"
 
 
 
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <jce/os/core/jce_str.h>
@@ -108,6 +114,29 @@ static void follow_scene_project_root(const char *scene_path)
             /* Bind render settings and component-relative assets before the
              * scene starts building lazy renderer/particle state. */
             jce_editor_scene_render_refresh_content_context();
+
+            /* The project's NATIVE script modules are manifest-driven too.
+             *
+             * jce_editor_script_backends.h states the contract as "every time
+             * the current project changes", and this is such a time -- but
+             * the only callers were the project DIALOG, so following a scene
+             * into its project adopted the root for paths, assets and render
+             * settings and left the script modules belonging to whatever was
+             * open before (usually nothing).
+             *
+             * The cost is not a warning.  A C or C++ script is a CLASS in a
+             * shared object named in jce_project.json, so with no module
+             * loaded every .jcec and .jcecpp component in the scene is
+             * refused by name -- "NO NATIVE SCRIPT MODULE IS LOADED IN THIS
+             * PROCESS" -- while the shipped game, which links the same
+             * modules into its own executable, runs them from the same scene
+             * file.  Measured on a seven-language project: the editor ran
+             * three of the seven languages, and the two native ones failed
+             * here.
+             *
+             * Safe to call repeatedly and with a project that declares no
+             * modules, which the header says explicitly. */
+            jce_editor_script_modules_reload(norm);
             return;
         }
         char parent[512];
@@ -240,11 +269,27 @@ static JceJson *serialize_entity_tree_json_ex(uint32_t entity_id,
      * missing, prefab-FILE saves, clipboard copies) falls through to the
      * legacy FULL snapshot — keeping old scenes/files byte-identical. */
     bool wrote_overrides = false;
+    std::vector<jce_prefab_override::ChildOverride> child_ovs;
     if (emit_overrides && meta->prefab_instance && meta->prefab_path[0]) {
         PrefabSource src;
         if (load_prefab_source(meta->prefab_path, &src)) {
-            wrote_overrides = jce_prefab_override::write_override_node(
-                node, s.scene, e, src.scene, src.root);
+            /* THE SHAPE GATE.  A child is addressed by INDEX PATH, which is
+             * only meaningful while the instance still has the source's
+             * shape: jce_scene_get_children returns creation order, but
+             * destroying a middle child SWAP-REMOVES (A B C D E -> A B E D).
+             * Once an author has added or deleted a child anywhere inside the
+             * instance, no path can be trusted, so the whole override form is
+             * declined for this node and the legacy FULL snapshot below runs
+             * instead -- which preserves the entire subtree exactly as it
+             * does today.  Compactness is what is lost, never the edits. */
+            if (jce_prefab_override::subtree_shape_matches(s.scene, e,
+                                                           src.scene, src.root)) {
+                wrote_overrides = jce_prefab_override::write_override_node(
+                    node, s.scene, e, src.scene, src.root);
+                if (wrote_overrides)
+                    child_ovs = jce_prefab_override::compute_child_overrides(
+                        s.scene, e, src.scene, src.root);
+            }
             free_prefab_source(&src);
         }
     }
@@ -263,10 +308,42 @@ static JceJson *serialize_entity_tree_json_ex(uint32_t entity_id,
     jce_json_set_child(node, "children", children);
 
     /* In override mode an instance root's children come ENTIRELY from the
-     * source on load (instantiate_prefab rebuilds the subtree), so we do
-     * NOT re-serialize them — that would duplicate them on reload.  The
-     * override MVP is root-level; per-child overrides are a follow-up.
+     * source on load (instantiate_prefab rebuilds the subtree), so we do NOT
+     * re-serialize them as child nodes — that would duplicate them.
+     *
+     * But they are not written off either.  Every DESCENDANT that differs
+     * from its source counterpart is emitted into "childOverrides" below,
+     * addressed by index path.  Until that existed this branch simply dropped
+     * them: move an instance root one metre and every edit the author had
+     * made to any child vanished on save, silently, with the file still
+     * loading cleanly.
+     *
      * Regular entities (and the full-snapshot path) recurse as before. */
+    if (wrote_overrides && !child_ovs.empty()) {
+        JceJson *arr = jce_json_array();
+        if (arr) {
+            for (const auto &co : child_ovs) {
+                JceJson *row = jce_json_object();
+                if (!row) continue;
+                JceJson *path = jce_json_array();
+                for (int idx : co.path)
+                    jce_json_array_push(path, jce_json_number((double)idx));
+                jce_json_set_child(row, "path", path);
+                /* The name is a WITNESS, not an address: the loader checks it
+                 * and skips the row when it disagrees, so a file written
+                 * against an older prefab degrades to "this override did not
+                 * apply" instead of landing on the wrong child. */
+                jce_json_set_string(row, "name", co.name.c_str());
+                JceJson *comps = jce_scene_serialize_entity_components(
+                    s.scene,
+                    jce_prefab_override::resolve_child_path(s.scene, e, co.path));
+                if (comps)
+                    jce_json_set_child(row, "components", comps);
+                jce_json_array_push(arr, row);
+            }
+            jce_json_set_child(node, "childOverrides", arr);
+        }
+    }
     if (!wrote_overrides) {
         JceEntity child_buf[JCE_MAX_CHILDREN];
         int cn = jce_scene_get_children(s.scene, e, child_buf,
@@ -382,7 +459,14 @@ static bool is_gltf_extension(const char *path)
  * which is thread-safe.  The round-trip validation stays synchronous
  * because it instantiates a flecs scene (entity creation is main-thread
  * only — same constraint the engine respects). */
+/* `seen` is not an optimisation, it is the difference between 40 files and
+ * 1789.  The gather walks ENTITIES, and a scene places the same handful of
+ * props thousands of times -- hidden_cove has 1789 MeshRenderers referencing
+ * 40 distinct glTF files.  Without dedup this pass decoded each of those 40
+ * about 45 times over, which is why it could never finish before the first
+ * frame needed the results. */
 struct MeshGatherCtx { std::vector<std::string> abs; std::vector<std::string> rel;
+                       std::unordered_set<std::string> seen;
                        const char *scene_dir; };
 
 static void mesh_gather_cb(JceScene *sc, JceEntity e, void *ud)
@@ -392,9 +476,22 @@ static void mesh_gather_cb(JceScene *sc, JceEntity e, void *ud)
     JceMeshRenderer *mr = jce_scene_get_mesh_renderer(sc, e);
     if (!mr || mr->mesh_path[0] == '\0') return;
     if (!is_gltf_extension(mr->mesh_path)) return;
+    if (!ctx->seen.insert(mr->mesh_path).second) return;   /* already queued */
 
+    /* Resolve exactly the way ed_load_model_cb does, or this pass reads files
+     * that are not there.  Joining scene_dir was wrong for every scene whose
+     * meshes do not sit beside it: hidden_cove references
+     * "models/nature/Bush_Common.gltf" from assets/scenes/, so the join
+     * produced assets/scenes/models/nature/... -- and jce_fs_host_read_all
+     * failed on all 49, `checked` stayed 0, and mesh_valid_finalize logs
+     * nothing when checked is 0.  A validation pass that validated nothing and
+     * said nothing, for as long as it has existed. */
     char abs_path[1024];
-    if (!jce_path_is_absolute(mr->mesh_path) && ctx->scene_dir && ctx->scene_dir[0]) {
+    char resolved[512];
+    if (jce_editor_scene_asset_cache_resolve_mesh_path(
+            mr->mesh_path, resolved, (int)sizeof(resolved))) {
+        snprintf(abs_path, sizeof(abs_path), "%s", resolved);
+    } else if (!jce_path_is_absolute(mr->mesh_path) && ctx->scene_dir && ctx->scene_dir[0]) {
         jce_path_join(abs_path, sizeof(abs_path), ctx->scene_dir, mr->mesh_path);
     } else {
         snprintf(abs_path, sizeof(abs_path), "%s", mr->mesh_path);
@@ -403,31 +500,76 @@ static void mesh_gather_cb(JceScene *sc, JceEntity e, void *ud)
     ctx->rel.emplace_back(mr->mesh_path);
 }
 
+/* Shared by every shard.  One task looping over all 49 files only ever
+ * occupies ONE worker, which is why raising the pool's worker count changed
+ * nothing: 4.5 s of decode stayed 4.5 s of wall clock.  The list is read-only
+ * once submitted; the two counters are the only mutable state and take the
+ * lock. */
 struct MeshValidJob {
     std::vector<std::string> abs;   /* resolved absolute paths */
     std::vector<std::string> rel;   /* scene-relative, for logging */
     int                      checked = 0;
     int                      failed  = 0;
+    int                      shards_left = 0;
+    JceMutex                *lock = nullptr;
 };
 
-static JceAsyncTask *g_mv_task   = nullptr;
+enum { MV_MAX_SHARDS = 8 };
+static JceAsyncTask *g_mv_tasks[MV_MAX_SHARDS] = {nullptr};
+static int           g_mv_task_count = 0;
 static MeshValidJob *g_mv_job    = nullptr;
+
+/* Wall clock, so the startup report can say where the time went instead of
+ * only how many decodes were claimed.  A hit count answers "did the store
+ * work"; it does not answer "is decoding still the long pole", and those are
+ * different questions with different fixes.  g_mv_decode_ms is submit ->
+ * last shard done; g_mv_clock.blocked_ms is how long the main thread actually sat
+ * in the wait, which is the only part the user sees as a frozen window. */
+static struct MeshValidClock {
+    uint64_t submit_pc;    /* stamped at submit                       */
+    uint64_t last_pc;      /* stamped by whichever shard finishes last */
+    double   blocked_ms;   /* how long the main thread sat in the wait */
+} g_mv_clock;
+
+/* Stamped by the WORKER, not by the completion callback.  The first version
+ * stamped it in mesh_valid_finalize() and reported 0 ms every run: a
+ * completion callback runs from the owner-thread pump, which happens AFTER
+ * jce_async_task_wait_timeout() returns, so the report read the timer before
+ * anything wrote it.  Same shape as the tear-down bug this round fixed --
+ * "the task is done" and "its callback has run" are different facts.
+ * jce_async_task_discard() covers the free-under-the-callback half; this is
+ * the read-before-the-callback half, and only the call site can fix it. */
+
+/* Which stride this shard walks.  Passed as the task user_data alongside the
+ * shared job, so a shard is (job, index) with no per-shard allocation. */
+struct MeshValidShard { MeshValidJob *job; int index; int stride; };
 
 /* WORKER: read + CPU-decode each mesh (no ECS or bgfx object creation). */
 static JceAsyncRunResult mesh_valid_worker(JceAsyncContext *ctx, void *arg)
 {
-    MeshValidJob *j = (MeshValidJob *)arg;
-    for (size_t i = 0; i < j->abs.size(); ++i) {
+    MeshValidShard *sh = (MeshValidShard *)arg;
+    MeshValidJob   *j  = sh->job;
+    struct ShardStamp {
+        MeshValidJob *j;
+        ~ShardStamp() {
+            jce_mutex_lock(j->lock);
+            const uint64_t now = jce_time_perf_counter();
+            if (now > g_mv_clock.last_pc) g_mv_clock.last_pc = now;
+            jce_mutex_unlock(j->lock);
+        }
+    } stamp{j};
+    for (size_t i = (size_t)sh->index; i < j->abs.size();
+         i += (size_t)sh->stride) {
         if (jce_async_context_cancel_requested(ctx))
             return JCE_ASYNC_RUN_CANCELLED;
 
         uint64_t file_size = 0;
         void *data = jce_fs_host_read_all(j->abs[i].c_str(), &file_size);
         if (!data) continue;
-        j->checked++;
+        jce_mutex_lock(j->lock); j->checked++; jce_mutex_unlock(j->lock);
         if (file_size > UINT32_MAX) {
             jce_free(data);
-            j->failed++;
+            jce_mutex_lock(j->lock); j->failed++; jce_mutex_unlock(j->lock);
             LOG_WARN(LOG_TAG, "mesh validation skipped oversized asset '%s'",
                      j->rel[i].c_str());
             continue;
@@ -438,43 +580,131 @@ static JceAsyncRunResult mesh_valid_worker(JceAsyncContext *ctx, void *arg)
             data, (uint32_t)file_size, j->abs[i].c_str());
         jce_free(data);
         if (!model) {
-            j->failed++;
+            jce_mutex_lock(j->lock); j->failed++; jce_mutex_unlock(j->lock);
             LOG_WARN(LOG_TAG, "engine cgltf cannot load mesh '%s' — "
                      "runtime may fail to display this model",
                      j->rel[i].c_str());
-        } else {
+        } else if (!jce_editor_mesh_predecode_put(j->rel[i].c_str(), model)) {
+            /* Store full or already holding this key -- ownership stayed here. */
             jce_model_gltf_cpu_free(model);
         }
+        /* On success the store owns it and ed_load_model_cb will claim it, so
+         * the first frame pays only the GPU upload instead of decoding the
+         * same file a second time on the main thread. */
     }
     return JCE_ASYNC_RUN_SUCCESS;
 }
 
+/* Runs once per shard on the owner thread.  Only the last one reports and
+ * tears down -- the shards share one job and one set of counters. */
 static void mesh_valid_finalize(JceAsyncTask *task, void *arg)
 {
-    MeshValidJob *j = (MeshValidJob *)arg;
+    MeshValidShard *sh = (MeshValidShard *)arg;
+    if (!sh) return;
+    MeshValidJob *j = sh->job;
+    const bool ok = jce_async_task_state(task) == JCE_ASYNC_STATE_SUCCEEDED;
+    delete sh;
     if (!j) return;
 
-    if (jce_async_task_state(task) == JCE_ASYNC_STATE_SUCCEEDED &&
-        j->checked > 0 && j->failed == 0) {
+    jce_mutex_lock(j->lock);
+    const bool last = (--j->shards_left) <= 0;
+    const int checked = j->checked, failed = j->failed;
+    jce_mutex_unlock(j->lock);
+    if (!last) return;
+
+    if (ok && checked > 0 && failed == 0) {
         LOG_SUCCESS(LOG_TAG, "mesh asset validation passed: %d glTF "
-                    "files verified with engine cgltf", j->checked);
-    } else if (j->failed > 0) {
+                    "files verified with engine cgltf", checked);
+    } else if (failed > 0) {
         LOG_WARN(LOG_TAG, "mesh asset validation: %d/%d glTF files "
-                 "failed engine cgltf load", j->failed, j->checked);
+                 "failed engine cgltf load", failed, checked);
     }
 
     g_mv_job = nullptr;
-    JceAsyncTask *owned = g_mv_task;
-    g_mv_task = nullptr;
-    if (owned) jce_async_task_release(owned);
+    for (int t = 0; t < g_mv_task_count; ++t) {
+        if (g_mv_tasks[t]) jce_async_task_release(g_mv_tasks[t]);
+        g_mv_tasks[t] = nullptr;
+    }
+    g_mv_task_count = 0;
+    if (j->lock) jce_mutex_destroy(j->lock);
     delete j;
+}
+
+/* Block until this scene's meshes are decoded, or `timeout_ms` elapses.
+ *
+ * Called once before the first scene render.  Without it the first frame and
+ * the decode workers race INSIDE the frame: measured on hidden_cove, all 49
+ * models were in the store by the time the frame ended, but only ~14 had been
+ * claimed -- the other 35 were decoded a second time, on the main thread,
+ * because the frame asked for them before the worker got there.
+ *
+ * Waiting looks like the opposite of an optimisation and is not: the work is
+ * the same work, and doing it on 8 workers takes about an eighth as long as
+ * doing it serially on the thread that is holding the window.  A timeout keeps
+ * a stuck decode from becoming a hang; on expiry the old behaviour resumes,
+ * and `timeout_ms` bounds the WHOLE call, not each shard. */
+void jce_editor_wait_for_mesh_predecode(unsigned timeout_ms)
+{
+    /* Retain across the wait, and do not read g_mv_tasks[] inside it.
+     *
+     * mesh_valid_finalize() releases every handle in g_mv_tasks[] and zeroes
+     * the count.  It is a completion callback, so it runs from the owner
+     * thread's pump -- and jce_async_task_wait_timeout() PUMPS when the
+     * executor is cooperative (jce_async.c: the pumping branch is guarded on
+     * JCE_ASYNC_EXECUTION_COOPERATIVE).  On such an executor the last shard's
+     * finalize can run inside this very call, drop the caller reference this
+     * loop is holding, and let the reap drop the executor's -- destroying the
+     * task while the wait is still standing on it.
+     *
+     * The default executor resolves AUTO -> THREADED on desktop, where the
+     * wait blocks on a condition variable and pumps nothing, so today this
+     * cannot happen.  That is safety by executor mode, not by construction:
+     * AUTO is COOPERATIVE on Web, and a single-thread machine class picks it
+     * explicitly elsewhere in the tree.  A reference of our own costs two
+     * atomics and removes the dependency. */
+    JceAsyncTask *local[MV_MAX_SHARDS];
+    const int      n  = g_mv_task_count;
+    const uint64_t t0 = jce_time_perf_counter();
+
+    for (int t = 0; t < n; ++t)
+        local[t] = g_mv_tasks[t] ? jce_async_task_retain(g_mv_tasks[t]) : NULL;
+    /* One DEADLINE for the whole set, not one timeout per shard.  Passing
+     * timeout_ms to each of up to MV_MAX_SHARDS waits makes the real bound
+     * 8 x timeout_ms; the caller asks for 8000 ms as a hang guard and would
+     * get 64 s of frozen window instead.  A guard whose bound is eight times
+     * what it says is not a guard. */
+    for (int t = 0; t < n; ++t) {
+        if (!local[t])
+            continue;
+        {
+            const double spent = jce_time_perf_to_ms(t0, jce_time_perf_counter());
+            const double left  = (double)timeout_ms - spent;
+            if (left <= 0.0)
+                break;
+            jce_async_task_wait_timeout(local[t], (uint32_t)left);
+        }
+    }
+    for (int t = 0; t < n; ++t)
+        if (local[t])
+            jce_async_task_release(local[t]);
+
+    g_mv_clock.blocked_ms += jce_time_perf_to_ms(t0, jce_time_perf_counter());
+}
+
+/* Reported at the first-frame KPI; see the comment on the timers. */
+void jce_editor_mesh_predecode_timings(double *decode_ms, double *blocked_ms)
+{
+    if (decode_ms)
+        *decode_ms = (g_mv_clock.submit_pc && g_mv_clock.last_pc > g_mv_clock.submit_pc)
+                     ? jce_time_perf_to_ms(g_mv_clock.submit_pc, g_mv_clock.last_pc) : 0.0;
+    if (blocked_ms) *blocked_ms = g_mv_clock.blocked_ms;
 }
 
 static void validate_mesh_assets(const char *scene_path)
 {
     /* A prior validation still running: let it finish on its own (it
      * covers a near-identical scene state); skip starting a second. */
-    if (g_mv_task) return;
+    if (g_mv_task_count > 0) return;
 
     char scene_dir[1024] = "";
     if (scene_path) {
@@ -486,26 +716,57 @@ static void validate_mesh_assets(const char *scene_path)
     jce_scene_each_entity(s.scene, mesh_gather_cb, &gctx);
     if (gctx.abs.empty()) return;
 
+    /* A previous scene's unclaimed decodes are dead weight — free them before
+     * this scene fills the store. */
+    jce_editor_mesh_predecode_reset();
     MeshValidJob *j = new MeshValidJob();
     j->abs  = std::move(gctx.abs);
     j->rel  = std::move(gctx.rel);
+    j->lock = jce_mutex_create();
 
+    /* One shard per worker, never more than there are files.  A single task
+     * looping over the whole list occupies exactly one worker no matter how
+     * large the pool is -- that is why the pool's worker count had no effect
+     * until this was sharded. */
+    int shards = (int)j->abs.size();
+    if (shards > MV_MAX_SHARDS) shards = MV_MAX_SHARDS;
+    if (shards < 1) shards = 1;
+    j->shards_left = shards;
+    g_mv_task_count = 0;
+    g_mv_clock.submit_pc  = jce_time_perf_counter();
+    g_mv_clock.last_pc    = 0;
+    g_mv_clock.blocked_ms = 0.0;
+
+    for (int sidx = 0; sidx < shards; ++sidx) {
+    MeshValidShard *sh = new MeshValidShard{j, sidx, shards};
     JceAsyncTaskDesc desc;
     jce_async_task_desc_init(&desc);
     desc.work       = mesh_valid_worker;
     desc.complete   = mesh_valid_finalize;
-    desc.user_data  = j;
+    desc.user_data  = sh;
     desc.debug_name = "editor.mesh.validate";
-    desc.priority   = JCE_ASYNC_PRIORITY_LOW;
+    /* NORMAL, not LOW: on load this is on the critical path to a responsive
+     * first frame -- at LOW it loses to whatever else the pool is doing and
+     * the main thread decodes the same files itself. */
+    desc.priority   = JCE_ASYNC_PRIORITY_NORMAL;
     JceAsyncTask *task =
         jce_async_submit(jce_async_default_executor(), &desc);
     if (!task) {
-        delete j;
+        delete sh;
+        jce_mutex_lock(j->lock);
+        j->shards_left--;
+        jce_mutex_unlock(j->lock);
         LOG_WARN(LOG_TAG, "mesh validation task queue is full");
+        continue;
+    }
+    g_mv_tasks[g_mv_task_count++] = task;
+    }
+    if (g_mv_task_count == 0) {
+        if (j->lock) jce_mutex_destroy(j->lock);
+        delete j;
         return;
     }
     g_mv_job = j;
-    g_mv_task = task;
 }
 
 /* Retained compatibility pump; completion is delivered by jce_async. */
@@ -566,17 +827,12 @@ static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
     if (tex_paths[2][0]) mr->normal_tex = jce_scene_intern(s.scene, tex_paths[2]);
     if (tex_paths[3][0]) mr->ao_tex = jce_scene_intern(s.scene, tex_paths[3]);
     if (tex_paths[4][0]) mr->emissive_tex = jce_scene_intern(s.scene, tex_paths[4]);
-    mr->base_color[0] = pbr.base_color_factor[0];
-    mr->base_color[1] = pbr.base_color_factor[1];
-    mr->base_color[2] = pbr.base_color_factor[2];
-    mr->base_color[3] = pbr.base_color_factor[3];
-    mr->metallic     = pbr.metallic_factor;
-    mr->roughness    = pbr.roughness_factor;
-    mr->emissive[0]  = pbr.emissive_factor[0];
-    mr->emissive[1]  = pbr.emissive_factor[1];
-    mr->emissive[2]  = pbr.emissive_factor[2];
-    mr->normal_scale = pbr.normal_scale;
-    mr->ao_strength  = pbr.ao_strength;
+    /* ONLY WHAT THIS RENDERER DOES NOT OVERRIDE.  There was no guard at all
+     * here, and the comment above justified it as "material is the single
+     * source of truth (Unity semantics)" -- which is backwards about Unity,
+     * where MaterialPropertyBlock exists precisely so per-instance overrides
+     * and a shared material coexist. */
+    jce_mesh_renderer_apply_material_pbr(mr, &pbr);
     ctx->mat_backfilled++;
 }
 
@@ -757,6 +1013,39 @@ bool jce_state_save_scene_file_ex(const char *scene_path, uint32_t flags)
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
+    /* SAVE SAFETY, and the biggest one: NEVER WRITE THE PLAY-MODE SCENE.
+     *
+     * During Play, s.scene IS the live simulated scene -- physics-settled
+     * transforms, entities jce.spawn created, every value a script mutated.
+     * Saving it overwrites the authored level with a frozen frame of a
+     * playtest.  Stop then restores the authored scene into memory with
+     * scene_modified CLEARED (history_restore_snapshot runs under a
+     * HistorySuspendScope), so no "unsaved changes" prompt ever fires and the
+     * good version is gone with no warning at all.
+     *
+     * Ctrl+S is muscle memory, and its handler only bails when the Game View
+     * has captured the mouse -- so it fires from the Scene View, while paused,
+     * or in any game that does not capture.  With auto_repack_on_save on, it
+     * also rebuilt the shipped PAK from that state.
+     *
+     * The editor already knew: the AUTOSAVE timer is play-gated
+     * (jce_editor.cpp:690, "don't bake play-time mutations into the file").
+     * The manual save it was protecting against never was.  Guarded here, at
+     * the single choke point, so Ctrl+S, the File menu and Save As are all
+     * covered rather than three call sites that can drift apart -- the same
+     * reason the two guards below live here.
+     *
+     * Refusing is the safe direction and matches Unity: there is no version of
+     * "save the pre-play snapshot instead" that is not a surprise. */
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "Scene NOT saved: Play is running, and saving now would write the "
+            "simulated scene over '%s'. Press Stop first.", scene_path);
+        jce_toast_warn("%s", jce_editor_i18n_or("toast.saveBlockedByPlay",
+                                                "Stop Play before saving"));
+        return false;
+    }
+
     /* The Sequencer panel's live preview writes evaluated track values
      * straight into scene components; restore the authored originals
      * before serializing so previewed values never reach disk. */
@@ -790,6 +1079,9 @@ bool jce_state_save_scene_file_ex(const char *scene_path, uint32_t flags)
     update_scene_dir_from_path(scene_path);
     set_current_scene_path_internal(scene_path);
     s.scene_modified = false;
+    /* The editor just wrote this file; adopting its mtime here is what
+     * stops the watcher reloading the editor's own save. */
+    jce_editor_scene_file_watch_restamp();
 
     /* Persist as the most-recently used scene so the next editor launch
      * can re-open it automatically. */
@@ -870,7 +1162,14 @@ bool jce_state_load_scene_file(const char *scene_path)
 
         ok = jce_scene_serial_load_file(s.scene, scene_path);
         if (ok) {
-            jce_editor_scene_ensure_rendering_settings(s.scene);
+            /* Deliberately NOT ensure_rendering_settings(): a LOADED scene
+             * must render exactly what its file says.  Fabricating defaults
+             * on open gave the editor an ambient the shipped exe cannot
+             * obtain, which is a parity defect by construction.  New/demo
+             * scenes still get defaults (jce_editor_state.cpp) -- those are
+             * authored here and get saved.  The project texture state is the
+             * other half of what ensure() used to do and is still wanted. */
+            jce_editor_scene_apply_project_texture_state();
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
@@ -906,9 +1205,9 @@ bool jce_state_load_scene_file(const char *scene_path)
         }
     }
     if (ok) {
-        s_undo_history.clear();
-        s_redo_history.clear();
+        jce_state_history_clear();
         s.scene_modified = false;
+        jce_editor_scene_file_watch_restamp();
         s_history_edit_nesting = 0;
         s_history_outer_edit_pushed_snapshot = false;
         s_history_manual_batch_depth = 0;
@@ -971,7 +1270,8 @@ void finalize_deferred_scene_load()
     {
         HistorySuspendScope suspend;
 
-        jce_editor_scene_ensure_rendering_settings(s.scene);
+        /* No ensure_rendering_settings() -- see jce_state_load_scene_file(). */
+        jce_editor_scene_apply_project_texture_state();
         rebuild_entity_order_from_ecs();
         update_scene_dir_from_path(path.c_str());
         set_current_scene_path_internal(path.c_str());
@@ -998,11 +1298,16 @@ void finalize_deferred_scene_load()
         mirror_last_scene_to_project(path.c_str());
         LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
                  path.c_str(), (int)g_entity_order.size());
+        /* Decode this scene's meshes on workers NOW, so the first frame claims
+         * them instead of decoding 40 glTF files on the main thread with the
+         * window frozen (measured: 3.35 s of the 4.2 s first frame).  This runs
+         * on LOAD; the identical pass on save was validation only. */
+        validate_mesh_assets(path.c_str());
     }
 
-    s_undo_history.clear();
-    s_redo_history.clear();
+    jce_state_history_clear();
     s.scene_modified = false;
+    jce_editor_scene_file_watch_restamp();
     s_history_edit_nesting = 0;
     s_history_outer_edit_pushed_snapshot = false;
     s_history_manual_batch_depth = 0;
@@ -1312,7 +1617,8 @@ bool apply_scene_bytes(const char *display_path,
         clear_scene_entities();
         ok = jce_scene_serial_load(s.scene, bytes, size);
         if (ok) {
-            jce_editor_scene_ensure_rendering_settings(s.scene);
+            /* No ensure_rendering_settings() -- see jce_state_load_scene_file(). */
+            jce_editor_scene_apply_project_texture_state();
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(display_path);
             set_current_scene_path_internal(display_path);
@@ -1324,9 +1630,9 @@ bool apply_scene_bytes(const char *display_path,
         }
     }
     if (ok) {
-        s_undo_history.clear();
-        s_redo_history.clear();
+        jce_state_history_clear();
         s.scene_modified = false;
+        jce_editor_scene_file_watch_restamp();
         s_history_edit_nesting = 0;
         s_history_outer_edit_pushed_snapshot = false;
         s_history_manual_batch_depth = 0;

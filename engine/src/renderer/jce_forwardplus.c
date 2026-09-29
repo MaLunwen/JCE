@@ -162,11 +162,22 @@ bool jce_forwardplus_pack(JceForwardPlusPacked            *out,
         t[9]  = p->spot_dir.x;
         t[10] = p->spot_dir.y;
         t[11] = p->spot_dir.z;
-        /* texel 3: innerCos, outerCos, 0, 0 */
+        /* texel 3: innerCos, outerCos, maskLo, maskHi.
+         *
+         * The two lanes that were 0 now carry this light's rendering-layer
+         * mask, which is what lets the clustered path honour layers at all:
+         * the cluster is built once per frame with no receiver in sight, so
+         * the mask has to travel WITH the light and be tested against the
+         * receiver in the shader.
+         *
+         * SPLIT IN HALF because a 32-bit mask does not survive a float: 2^31
+         * needs a 32-bit mantissa and there are 24.  Each half is an integer
+         * below 65536, which is exact, and so is the floor(m / 2^b) the
+         * shader's bit test does. */
         t[12] = p->inner_cone_cos;
         t[13] = p->outer_cone_cos;
-        t[14] = 0.0f;
-        t[15] = 0.0f;
+        t[14] = (float)(p->layer_mask & 0xFFFFu);
+        t[15] = (float)((p->layer_mask >> 16) & 0xFFFFu);
     }
 
     out->z_near = z_near;

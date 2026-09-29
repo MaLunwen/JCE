@@ -272,7 +272,21 @@ class Entry:
                 break
 
     # -- the C++ signature -----------------------------------------------
-    def params_decl(self) -> list[str]:
+    def params_decl(self, allow_defaults: bool = True) -> list[str]:
+        """The C++ parameter list.
+
+        allow_defaults=False when the caller appends further parameters after
+        these (a std::span<Entity> out, say).  C++ forbids a defaulted
+        parameter before a non-defaulted one, so an `optional` modifier on a
+        table-returning entry emitted a header that would not compile:
+
+            int overlap_sphere(float x, float y, float z, float radius,
+                               uint32_t layer_mask = defaults::...,
+                               std::span<Entity> out) const
+
+        Every other language keeps the optional argument; C++ asks for it
+        explicitly, which is the only shape the language allows without
+        reordering the parameters away from the C ABI's own."""
         out = []
         for p in self.ins:
             if p.arity > 0:                      # `const float origin[3]`
@@ -283,7 +297,7 @@ class Entry:
                 continue
             t = _CPP_IN[p.c_type]
             d = (f" = defaults::{self.name}_{p.name}"
-                 if p.name in self.defaulted else "")
+                 if (allow_defaults and p.name in self.defaulted) else "")
             sep = "" if t.endswith("&") else " "
             out.append(f"{t}{sep}{p.name}{d}")
         return out
@@ -687,7 +701,11 @@ def _emit_result_structs(entries: list[Entry]) -> list[str]:
 
 def _signature(e: Entry, ret: str, extra_params: list[str] | None = None,
                noexcept: bool | None = None) -> str:
-    decl = e.params_decl() + (extra_params or [])
+    extra = extra_params or []
+    # A default cannot precede a non-defaulted parameter in C++, and `extra`
+    # (the out span) is always non-defaulted, so the defaults have to go when
+    # one is appended.
+    decl = e.params_decl(allow_defaults=not extra) + extra
     head = f"    {'[[nodiscard]] ' if ret != 'void' else ''}{ret} {e.name}("
     ne = e.is_noexcept() if noexcept is None else noexcept
     tail = f") const{' noexcept' if ne else ''}"
@@ -1465,7 +1483,7 @@ TEST_CASE("an empty handle answers like an absent host")
     jce::diff::g_mode = jce::diff::MOCK_OK;
 }
 ''']
-    return "\n".join(L) + "\n"
+    return "\n".join(L).rstrip("\n") + "\n"
 
 
 # Every citation of a doctest case, in this module's own source, in the two

@@ -7,6 +7,7 @@
 #include "viewers/jce_json_classify.h"
 
 extern "C" {
+#include <jce/middleware/scene/jce_component_registry.h>
 #include <jce/middleware/scene/jce_scene.h>
 }
 
@@ -52,6 +53,165 @@ static uint32_t create_entity_select(const char *name, uint32_t parent,
     return id;
 }
 
+/* ── GameObject > UI ────────────────────────────────────────────────
+ *
+ * There was no UI submenu at all: a Canvas could not be created from any menu,
+ * so authoring an in-game HUD meant creating an empty entity and knowing to
+ * Add Component > Canvas, then knowing every widget must be parented under it
+ * or it will never be laid out.  Every reference engine puts this on the
+ * GameObject menu (Unity: GameObject > UI > ...), and for the same reason:
+ * the Canvas parent is a hard requirement of the layout pass, not a
+ * convention, so the menu is where it should be satisfied.
+ *
+ * `ui_ensure_canvas` reproduces Unity's rule: reuse the Canvas the selection
+ * is already inside, else the scene's first Canvas, else create one. */
+
+/* Nearest Canvas at or above `id`, or 0. */
+static uint32_t ui_canvas_of(uint32_t id)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return 0;
+    for (uint32_t cur = id; cur != 0; cur = jce_state_entity_parent(cur)) {
+        if (jce_scene_has_canvas(scene, jce_state_to_ecs_entity(cur)))
+            return cur;
+        if (jce_state_entity_parent(cur) == cur) break;   /* defensive */
+    }
+    return 0;
+}
+
+/* The Canvas a new UI element should be parented to, creating one if the
+ * scene has none.  Never returns 0 unless entity creation itself failed. */
+static uint32_t ui_ensure_canvas(uint32_t parent)
+{
+    uint32_t c = ui_canvas_of(parent);
+    if (c) return c;
+
+    JceScene *scene = jce_state_get_scene();
+    if (scene) {
+        int n = jce_state_get_entity_count();
+        for (int i = 0; i < n; i++) {
+            uint32_t id = jce_state_get_entity_id_by_index(i);
+            if (id && jce_state_entity_exists(id) &&
+                jce_scene_has_canvas(scene, jce_state_to_ecs_entity(id)))
+                return id;
+        }
+    }
+    uint32_t canvas = jce_state_create_entity("Canvas", 0);
+    jce_state_add_component(canvas, JCE_COMP_FLAG_TRANSFORM);
+    jce_state_add_component(canvas, JCE_COMP_FLAG_CANVAS);
+    return canvas;
+}
+
+/* Create `name` under the right Canvas and give it `flags` (in order). */
+static uint32_t ui_create(const char *name, uint32_t parent,
+                          const uint64_t *flags, int flag_count)
+{
+    uint32_t canvas = ui_ensure_canvas(parent);
+    uint32_t id = jce_state_create_entity(name, canvas);
+    jce_state_add_component(id, JCE_COMP_FLAG_TRANSFORM);
+    for (int i = 0; i < flag_count; i++)
+        jce_state_add_component(id, flags[i]);
+    jce_state_select_entity(id, false);
+    jce_editor_inspector_request_sync();
+    jce_editor_layout_request_focus_inspector();
+    return id;
+}
+
+/* Presence-gated components (UISlider and below) have no JCE_COMP_FLAG_* bit;
+ * they are addressed by registry name. */
+static uint32_t ui_create_named(const char *name, uint32_t parent,
+                                const char *comp, bool with_image)
+{
+    uint32_t canvas = ui_ensure_canvas(parent);
+    uint32_t id = jce_state_create_entity(name, canvas);
+    jce_state_add_component(id, JCE_COMP_FLAG_TRANSFORM);
+    if (with_image) jce_state_add_component(id, JCE_COMP_FLAG_UI_IMAGE);
+    int cid = jce_component_find(comp);
+    if (cid >= 0) jce_state_add_component_id(id, cid);
+    jce_state_select_entity(id, false);
+    jce_editor_inspector_request_sync();
+    jce_editor_layout_request_focus_inspector();
+    return id;
+}
+
+static void draw_create_ui_submenu(uint32_t parent)
+{
+    if (!ImGui::BeginMenu(jce_editor_i18n("hierarchy.createUI")))
+        return;
+
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.canvas"))) {
+        /* At the ROOT, never under the selection.  A Canvas nested inside
+         * another Canvas is not a second screen-space root -- the renderer
+         * now skips it (uc_has_canvas_ancestor) exactly as Unity does, so
+         * creating one under the selection would produce an entity that
+         * looks authoritative in the Hierarchy and lays nothing out. */
+        uint32_t id = jce_state_create_entity("Canvas", 0);
+        jce_state_add_component(id, JCE_COMP_FLAG_TRANSFORM);
+        jce_state_add_component(id, JCE_COMP_FLAG_CANVAS);
+        jce_state_select_entity(id, false);
+        jce_editor_inspector_request_sync();
+        jce_editor_layout_request_focus_inspector();
+    }
+    ImGui::Separator();
+
+    static const uint64_t k_image[]  = { JCE_COMP_FLAG_UI_IMAGE };
+    static const uint64_t k_text[]   = { JCE_COMP_FLAG_UI_TEXT };
+    /* Unity's Button prefab shape: Image + Button on the object, and the label
+     * on a CHILD.  Not cosmetic -- uc_entity_rect resolves ONE rect per entity
+     * and prefers the UIImage, so a UIText on the same entity has its own
+     * RectTransform completely ignored.  Putting the label on a child gives it
+     * a rect that is actually read, and lets it be inset/aligned inside the
+     * button the way every reference engine allows. */
+    static const uint64_t k_button[] = { JCE_COMP_FLAG_UI_IMAGE,
+                                         JCE_COMP_FLAG_UI_BUTTON };
+    static const uint64_t k_panel[]  = { JCE_COMP_FLAG_UI_IMAGE };
+
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.panel")))
+        ui_create("Panel", parent, k_panel, 1);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.image")))
+        ui_create("Image", parent, k_image, 1);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.text")))
+        ui_create("Text", parent, k_text, 1);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.button"))) {
+        uint32_t b = ui_create("Button", parent, k_button, 2);
+        uint32_t label = jce_state_create_entity("Text", b);
+        jce_state_add_component(label, JCE_COMP_FLAG_TRANSFORM);
+        jce_state_add_component(label, JCE_COMP_FLAG_UI_TEXT);
+        /* The label stretches to fill the button, which is the Unity default
+         * and the only shape where its rect is meaningful. */
+        JceScene *sc = jce_state_get_scene();
+        if (sc) {
+            JceUITextComponent *t =
+                jce_scene_get_ui_text(sc, jce_state_to_ecs_entity(label));
+            if (t) {
+                t->rect.anchor_min[0] = 0.0f; t->rect.anchor_min[1] = 0.0f;
+                t->rect.anchor_max[0] = 1.0f; t->rect.anchor_max[1] = 1.0f;
+                t->rect.pivot[0] = 0.5f;      t->rect.pivot[1] = 0.5f;
+                t->rect.anchored_position[0] = 0.0f;
+                t->rect.anchored_position[1] = 0.0f;
+                t->rect.size_delta[0] = 0.0f; t->rect.size_delta[1] = 0.0f;
+                t->alignment = JCE_UI_TEXT_ALIGN_CENTER;
+            }
+        }
+        jce_state_select_entity(b, false);
+        jce_editor_inspector_request_sync();
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.slider")))
+        ui_create_named("Slider", parent, "UISlider", false);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.toggle")))
+        ui_create_named("Toggle", parent, "UIToggle", false);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.inputField")))
+        ui_create_named("InputField", parent, "UIInputField", false);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.dropdown")))
+        ui_create_named("Dropdown", parent, "UIDropdown", false);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.scrollView")))
+        ui_create_named("ScrollView", parent, "UIScrollView", false);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.ui.progressBar")))
+        ui_create_named("ProgressBar", parent, "UIProgressBar", false);
+    ImGui::EndMenu();
+}
+
 /* Draw the "Create 3D Object" submenu entries. */
 static void draw_create_3d_submenu(uint32_t parent)
 {
@@ -75,8 +235,14 @@ static void draw_create_2d_submenu(uint32_t parent)
         return;
     if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createSprite")))
         create_entity_select("Sprite", parent, JCE_COMP_FLAG_SPRITE_RENDERER, 0);
-    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createText")))
-        create_entity_select("Text", parent, 0, 0);
+    /* Was `create_entity_select("Text", parent, 0, 0)` -- flag 0 adds NO
+     * component, so this produced an empty entity named "Text" and nothing
+     * else.  Screen text is a Canvas element, so it routes to the UI path that
+     * parents it correctly. */
+    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createText"))) {
+        static const uint64_t k_t[] = { JCE_COMP_FLAG_UI_TEXT };
+        ui_create("Text", parent, k_t, 1);
+    }
     ImGui::EndMenu();
 }
 
@@ -87,6 +253,7 @@ static void draw_create_entities(uint32_t parent)
         create_entity_select("New Entity", parent, 0, 0);
     draw_create_3d_submenu(parent);
     draw_create_2d_submenu(parent);
+    draw_create_ui_submenu(parent);
     if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCamera")))
         create_entity_select("Camera", parent, JCE_COMP_FLAG_CAMERA, 0);
     if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createLight")))

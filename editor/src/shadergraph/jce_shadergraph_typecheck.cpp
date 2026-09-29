@@ -27,6 +27,29 @@ namespace {
 
 /* find_node now comes from jce_shadergraph_graph.h (const overload). */
 
+/* Two dtypes that compile to the same GLSL type connect.
+ *
+ * DT_COLOR and DT_VEC4 are both `vec4`, and DT_NORMAL is DT_VEC3 under
+ * another name; the enum distinguishes them so a socket can SAY what it
+ * carries, which is a fact about vocabulary, not about types.  Refusing the
+ * link taught the author that "Color" and "Vector4" are different things to
+ * the compiler, which they are not, and made a Combine node unable to feed a
+ * BaseColor.
+ *
+ * Everything else still requires exact equality: this is not implicit
+ * conversion, and a float into a vec3 is still an error rather than a silent
+ * splat -- the author should see which wire is wrong. */
+bool dtype_connectable(DataType from, DataType to)
+{
+    if (from == to) return true;
+    const bool a4 = (from == DT_COLOR || from == DT_VEC4);
+    const bool b4 = (to   == DT_COLOR || to   == DT_VEC4);
+    if (a4 && b4) return true;
+    const bool a3 = (from == DT_VEC3 || from == DT_NORMAL);
+    const bool b3 = (to   == DT_VEC3 || to   == DT_NORMAL);
+    return a3 && b3;
+}
+
 TypeDiag make_msg(int link, int node, const char *msg)
 {
     TypeDiag d;
@@ -114,7 +137,7 @@ TypeCheckResult typecheck(const Graph &g)
                 dst->id);
             continue;
         }
-        if (ss.dtype != ds.dtype) {
+        if (!dtype_connectable(ss.dtype, ds.dtype)) {
             TC_DIAG(r.errors, (int)i, dst->id,
                 "Type mismatch: producer dtype %d -> consumer dtype %d.",
                 (int)ss.dtype, (int)ds.dtype);

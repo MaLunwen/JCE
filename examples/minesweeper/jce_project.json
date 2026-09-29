@@ -1,0 +1,13 @@
+{
+  "schema": 3,
+  "name": "Minesweeper",
+  "version": "0.1.0",
+  "target": "Minesweeper",
+  "exe": "Minesweeper.exe",
+  "startup_scene": "scenes/minesweeper.scene.json",
+  "source_assets": "resources",
+  "generated_by": "jce automation project.create",
+  "script_modules": [
+    "native/build/mines_controller.dll"
+  ]
+}

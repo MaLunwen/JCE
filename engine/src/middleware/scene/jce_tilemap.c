@@ -25,6 +25,10 @@ struct JceTilemapAsset {
     uint32_t  width;
     uint32_t  height;
     uint32_t *cells;             /* row-major width*height; 0 = empty */
+    /* The format has documented "cellPx" since the file was written and the
+     * loader never read it, so JceTilemapComponent.cell_size_px had nothing
+     * to be an override OF and every tilemap drew one cell per world unit. */
+    uint32_t  cell_px;
     char      sprites_path[256]; /* authored "sprites" key (may be "") */
 };
 
@@ -73,6 +77,11 @@ static JceTilemapAsset *tilemap_from_json(const JceJson *root)
     if (n > 0) {
         t->cells = (uint32_t *)JCE_CALLOC(n, sizeof(uint32_t));
         if (!t->cells) { JCE_FREE(t); return NULL; }
+        {
+            JceJson *cp = jce_json_get(root, "cellPx");
+            double  cpv = cp ? jce_json_number_value(cp, 0.0) : 0.0;
+            t->cell_px = (cpv > 0.0) ? (uint32_t)cpv : 0u;
+        }
         JceJson *arr = jce_json_get(root, "cells");
         if (arr && jce_json_is_array(arr)) {
             int an = jce_json_array_size(arr);
@@ -153,6 +162,12 @@ void jce_tilemap_unload(JceTilemapAsset *t)
 }
 
 /* ── Tilemap: queries ─────────────────────────────────────────────── */
+
+/* Authored cell size in pixels, or 0 when the file omits it. */
+uint32_t jce_tilemap_cell_px(const JceTilemapAsset *t)
+{
+    return t ? t->cell_px : 0u;
+}
 
 uint32_t jce_tilemap_width(const JceTilemapAsset *t)
 {

@@ -1,0 +1,21 @@
+{
+  "$schema": "jce.rp.v1",
+  "enable_csm": true,
+  "enable_ssao": false,
+  "enable_ssr": false,
+  "enable_taa": true,
+  "enable_bloom": true,
+  "enable_volumetric_fog": false,
+  "enable_gpu_particles": true,
+  "enable_motion_blur": false,
+  "enable_cloth": false,
+  "enable_stylized_sky": true,
+  "shadow_resolution": 2048,
+  "csm_cascade_count": 3,
+  "shadow_filter_quality": 2,
+  "msaa_samples": 1,
+  "render_scale": 1.0,
+  "post_quality": "high",
+  "hdr_color": true,
+  "depth_prepass": true
+}

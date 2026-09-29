@@ -671,6 +671,17 @@ static void py_call_update(JceScript *sc, JceScriptInstance inst, float dt)
     PY_SLOT_END();
 }
 
+/* The FIXED-step half: same marshalling, a different method on the Python
+ * runtime object, and a dt that is the physics step rather than the frame. */
+static void py_call_fixed_update(JceScript *sc, JceScriptInstance inst,
+                                 float dt)
+{
+    PY_SLOT_VOID(sc);
+    py_finish(s, py_call(s, "call_fixed_update", "(Kd)",
+                         (unsigned long long)inst, (double)dt));
+    PY_SLOT_END();
+}
+
 static void py_call_collision(JceScript *sc, JceScriptInstance inst,
                               JceScriptEntity other_entity)
 {
@@ -855,6 +866,7 @@ static const JceScriptVM k_python_vm = {
     py_compile_module,
     py_rebind_instance,
     py_release_module,
+    py_call_fixed_update,   /* APPENDED -- see jce_script_vm.h */
 };
 
 const JceScriptVM *jce_script_vm_python(void)

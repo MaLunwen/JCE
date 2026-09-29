@@ -9,6 +9,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_texture.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -60,9 +61,42 @@ JCE_API void jce_draw_textured_rect(const JceRenderer *r,
    world-space canvases) can draw 2D into their own framebuffer's view.
    The caller must have set that view's ortho transform + rect.  Engine-
    internal (not part of the public consumer API). */
+/* A 2D rotate + scale about a pivot, for a rect draw.
+ *
+ * The pivot is ABSOLUTE, in draw-space pixels, not a fraction of the rect.
+ * That is deliberate and it is what makes one transform usable for a whole
+ * UI element: a button is an image quad plus a run of glyph quads, and each
+ * glyph has its own little rect.  A fraction-of-rect pivot would spin every
+ * glyph about its own centre and scatter the word; an absolute pivot spins
+ * them all about the element's, which is what "rotate the button" means.
+ * The caller resolves it once -- x + w * rect_pivot -- and passes it to
+ * every draw the element makes.
+ *
+ * `angle_deg` turns CLOCKWISE on screen.  Draw space here is y-down, so a
+ * mathematically positive rotation appears clockwise, and saying so is
+ * cheaper than leaving every caller to discover it.
+ *
+ * A NULL JceRectXform, or one with angle 0 and scale (1,1), draws the same
+ * four vertices the axis-aligned entry points do -- bit for bit, not merely
+ * close: the transform is skipped entirely rather than applied as identity. */
+typedef struct {
+    float pivot[2];     /* ABSOLUTE draw-space pixels */
+    float angle_deg;    /* clockwise on screen */
+    float scale[2];     /* 1,1 = unscaled */
+} JceRectXform;
+
 JCE_API void jce_draw_filled_rect_view(const JceRenderer *r, uint16_t view_id,
                                float x, float y, float w, float h,
                                uint32_t color);
+
+/* The same draws, with a rect transform.  `xf` NULL == the calls above. */
+JCE_API void jce_draw_filled_rect_view_xf(const JceRenderer *r, uint16_t view_id,
+                               float x, float y, float w, float h,
+                               uint32_t color, const JceRectXform *xf);
+JCE_API void jce_draw_textured_rect_view_xf(const JceRenderer *r, uint16_t view_id,
+                                 float x, float y, float w, float h,
+                                 JceTexture tex, uint32_t tint,
+                                 const float *uv, const JceRectXform *xf);
 JCE_API void jce_draw_textured_rect_view(const JceRenderer *r, uint16_t view_id,
                                  float x, float y, float w, float h,
                                  JceTexture tex, uint32_t tint,
@@ -75,6 +109,43 @@ JCE_API void jce_draw_textured_rect_view_opaque(const JceRenderer *r, uint16_t v
                                         float x, float y, float w, float h,
                                         JceTexture tex, uint32_t tint,
                                         const float *uv);
+
+/* ── The 2D scissor every rect draw obeys ────────────────────────────────
+ *
+ * WHY IT LIVES HERE and not in the caller.  bgfx_set_scissor is PER-DRAW: it
+ * is consumed by the next submit and cleared, so a clipped subtree has to
+ * re-arm before EVERY submit inside it.  jce_ui_canvas.c learned that and
+ * wrapped its own two rect calls in macros that armed it — which clipped
+ * quads and left TEXT unclipped, because jce_text_draw_scaled_view submits
+ * ONE DRAW PER GLYPH from inside jce_text.c, where the canvas's macros do not
+ * reach.  Scrolled text ran outside its viewport, and no amount of care at
+ * the call sites could have fixed it.
+ *
+ * So the duty moves to the file that OWNS the submits: every rect draw below
+ * arms this before its own bgfx_submit, and a new draw site cannot forget.
+ *
+ * WHOLE-PIXEL, in framebuffer coordinates of the view being drawn into.  A
+ * zero or negative width or height CLEARS the scissor rather than clipping
+ * everything away, because "no clip" is the state a caller means when it has
+ * nothing to clip to, and a widget with an empty rect must not silently blank
+ * the rest of the frame.
+ *
+ * NOT saved/restored BY THIS API: it is one global.  A caller with nesting
+ * restores it itself -- the UI canvas does, because its clip regions DO nest
+ * (a ScrollView inside a ScrollView) and a stack here would be a second place
+ * that has to agree with the caller's recursion about what "the current clip"
+ * means. */
+JCE_API void jce_draw_set_scissor(int x, int y, int w, int h);
+
+/* Clear it.  Equivalent to jce_draw_set_scissor(0, 0, 0, 0), spelled so a
+ * reader of the call site does not have to know that. */
+JCE_API void jce_draw_clear_scissor(void);
+
+/* The active scissor, if any.  Answers false and touches `out` not at all
+ * when none is set, so "not clipped" and "clipped to (0,0,0,0)" are different
+ * answers — a pixel comparison cannot tell those apart, and they are the two
+ * states a clipping bug lands in. */
+JCE_API bool jce_draw_get_scissor(int out_xywh[4]);
 
 JCE_EXTERN_C_END
 

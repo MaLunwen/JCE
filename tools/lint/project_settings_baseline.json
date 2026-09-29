@@ -1,0 +1,15 @@
+{
+  "_note": "Project Settings fields the panel authors and the serialiser stores, and NOTHING else reads.  Every entry must carry a reason saying what closing it would take -- an unexplained entry is how a field that could be wired in an afternoon sits beside one that needs a subsystem, with nothing to tell them apart.",
+  "unread": [
+    "JceProjectGraphics.hdr",
+    "JceProjectQualityLevel.anisotropic",
+    "JceProjectQualityLevel.name",
+    "JceProjectQualityLevel.realtime_reflection_probes"
+  ],
+  "reasons": {
+    "JceProjectGraphics.hdr": "THE DESTINATION EXISTS AND THE ENCODING IS THE BLOCKER. JceRenderPipelineDesc.hdr_color is real and consumed -- jce_postfx.c:245 gates the RGBA16F intermediate chain on it -- but it is set per TIER (false on LOW/MID, true on HIGH). graphics.hdr is a plain bool that DEFAULTS TO TRUE, so making it authoritative would turn the RGBA16F chain on for every project on a low tier: a silent perf regression on exactly the machines the tier exists to protect. It needs the tri-state the per-level anti_aliasing already uses (JCE_PS_AA_USE_PROJECT_DEFAULT = -1 to inherit), which is a settings-schema change plus a migration for projects whose file says `\"hdr\": true`, not a wire.",
+    "JceProjectQualityLevel.anisotropic": "TWO KNOBS FOR ONE SETTING, AND THE PROJECT-WIDE ONE WON. jce_editor_effective_render_settings reads ps->graphics.anisotropic_textures unconditionally, exactly as it used to read graphics.default_msaa over the per-level anti_aliasing -- the defect fixed on 2026-09-06. The fix is the same shape (a level value wins when it states one, a USE_PROJECT_DEFAULT sentinel inherits) and is deliberately NOT bundled here: the AA fix needed a measured assertion that a project nobody has touched renders identically, and this one needs its own.",
+    "JceProjectQualityLevel.name": "A LABEL, AND CORRECTLY SO. It is the row title in the Quality tab and the string a designer types to tell Low from Ultra; nothing downstream selects a level by name -- quality.current_level is an index, and the build exports the resolved values rather than the level. Closing it would mean a find-quality-level-by-name surface nobody has asked for. This entry exists so the NEXT unread field is not the first one anybody has to think about.",
+    "JceProjectQualityLevel.realtime_reflection_probes": "NO REALTIME PROBE PATH TO GATE. Probe capture exists as of engine/src/middleware/scene/jce_scene_probe_capture.c, but it is a MODAL bake: it claims the Scene View's view-id band for six frames while both editor viewports yield (contracts/view-reservations.txt). Nothing re-captures a probe during play, so this toggle has nothing to switch off. Closing it means a per-frame or on-demand probe refresh with its own view-id budget -- a subsystem, not a wire, and this flag is what would gate it once it exists."
+  }
+}

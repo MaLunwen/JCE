@@ -149,7 +149,10 @@ inline void add_node_at(NodeType t, ImVec2 local)
 }
 
 inline void save_graph(const char *path) { jce_sg::save(s_g, path); }
-inline void load_graph(const char *path) { jce_sg::load(s_g, path); }
+/* Returns what jce_sg::load returns.  It used to drop it on the floor, so a
+ * load that failed left the previous graph in place and every step after it
+ * operated on the wrong graph while reporting success. */
+inline bool load_graph(const char *path) { return jce_sg::load(s_g, path); }
 
 inline void import_from_material(const char *path)
 {

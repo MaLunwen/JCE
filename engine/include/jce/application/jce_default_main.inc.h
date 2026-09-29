@@ -29,28 +29,40 @@
 #include <jce/application/jce_project.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/os/core/jce_console.h>   /* r.taa cvar: the TAA driver below */
 #include <jce/middleware/video/jce_webm_encoder.h> /* F9 recording preset */
 #include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix load (Top 4) */
+#include <jce/middleware/physics/jce_physics_debug.h>   /* collider overlay in the SHIPPED build */
 #include <jce/renderer/jce_render_pipeline.h>   /* settings S2: post-mount re-resolve */
+#include <jce/renderer/jce_primitives.h>     /* transition fade quad: jce_draw_filled_rect / jce_rgba */
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>              /* .jce/project-settings.json reader */
 #include <jce/os/core/jce_log.h>
+#include <jce/os/platform/jce_host_paths.h>    /* per-user saves directory */
 #include <jce/os/core/jce_math.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/application/jce_args.h>
+#include <jce/os/platform/jce_console_shell.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_event.h>  /* JCE_MOUSE_BUTTON_LEFT */
 #include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_debug_draw.h>      /* the line sink physics debug draws into */
 #include <jce/renderer/jce_lowlevel.h>        /* jce_gfx_caps (homogeneous depth) */
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_occlusion_culler.h> /* GPU-query occlusion culling (M5) */
 #include <jce/renderer/jce_offscreen_target.h> /* offscreen scene target (postfx, Top 1) */
-#include <jce/renderer/jce_render_settings.h>  /* project quality settings (Top 5) */
+#include <jce/renderer/jce_render_settings.h>
+#include <jce/middleware/scene/jce_lod.h>
+#include <jce/middleware/scene/jce_scene_camera.h>
+#include <jce/renderer/jce_particles.h>  /* project quality settings (Top 5) */
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_scene_renderer.h>
-#include <jce/renderer/jce_texture.h>          /* global mip bias (lod, Top 5) */
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_lighting_system.h>          /* global mip bias (lod, Top 5) */
 #include <jce/renderer/jce_views.h>
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/resource/jce_model_importer.h>
@@ -74,8 +86,44 @@ static const JceProjectEmbeddedBundle jce_project_embedded_bundles[1] = {{0}};
 /* Owned by this TU; created in app_init, freed in app_exit. */
 static JceProject       *s_project        = NULL;
 static JceScene         *s_scene          = NULL;
+/* The startup scene actually loaded, kept so the runtime desc below can derive
+ * the sibling "<scene>.navmesh.bin" the same way the editor's Play path does.
+ * Editor Play set JceRuntimeDesc.navmesh_path and this path did not, so a
+ * shipped game ran with no navmesh at all while Play pathfound correctly. */
+static char              s_boot_scene_path[1024] = {0};
 static JceCamera        *s_camera         = NULL;
+/* Culling mask of the authored primary camera; 0 = no filtering.  Resolved
+ * once when the camera is created, because resolve_primary walks every
+ * entity and the render config is built every frame. */
+static uint32_t          s_camera_culling_mask = 0u;
+/* CAMERA STACKING -- the overlay cameras of the authored stack, resolved with
+ * the primary and cached for the same reason the mask is: the render config
+ * needs the COUNT before the base render (it decides the view order), and the
+ * poses after it. */
+static JceSceneCameraPose s_camera_overlays[JCE_VIEW_SR_CAMERA_OVERLAY_MAX];
+static uint8_t            s_camera_overlay_count = 0u;
+static JceCamera         *s_camera_overlay_cam = NULL;
+/* Does the authored primary camera draw the sky?  Resolved in the same place
+ * and for the same reason as the mask above.  Initialised TRUE so a scene with
+ * no camera, an ambiguous one, or no scene at all keeps the engine default
+ * (jce_scene_render_config_default sets draw_skybox = true). */
+static bool              s_camera_draw_skybox = true;
+/* The other half of Camera.clearFlags: what the scene target KEEPS from the
+ * last frame.  false/false is the full clear every scene authored before
+ * these modes shipped already gets, and it is also what a scene with no
+ * primary camera keeps -- the same fallback s_camera_draw_skybox uses. */
+static bool              s_camera_keep_color = false;
+static bool              s_camera_keep_depth = false;
 static JceSceneRenderer *s_scene_renderer = NULL;
+/* The developer console, created only under --dev.  NULL otherwise, which
+ * is what makes every call site a single null test. */
+static JceConsoleShell   *s_console_shell = NULL;
+/* How many scrollback lines have already reached the log.  The shell
+ * keeps its own ring for a surface that can draw it; on this path the
+ * LOG is the surface, so new lines are drained to it.  A watermark and
+ * not a flag: one submit can produce many lines (`list` produces one per
+ * cvar) and every one of them has to arrive. */
+static uint32_t           s_console_logged = 0;
 /* Offscreen scene target for the authored postfx chain (Top 1).  Created lazily
  * on the first frame a scene has any active postfx effect; NULL until then so
  * scenes without postfx stay on the zero-overhead direct-to-backbuffer path. */
@@ -426,6 +474,32 @@ static bool jce_default_load_startup_scene(
     const char *scene_path = (proj && proj->startup_scene &&
                               proj->startup_scene[0])
                                  ? proj->startup_scene : NULL;
+
+    /* JCE_STARTUP_SCENE overrides everything below.  A project can ship more
+     * than one authored scene -- space/ ships both the four-architecture
+     * comparison and the full launch-to-reentry mission -- and before this
+     * there was NO way to reach the second one: the manifest names exactly
+     * one, Lua has no scene-load binding (the 78-function surface has none),
+     * and nothing on the command line selected it.  A scene you cannot boot
+     * is a scene nobody will ever see.
+     *
+     * Placed FIRST, not last: the manifest path is non-NULL for every real
+     * project, so an override checked after it would never fire.
+     *
+     * Same shape as the other JCE_* debug toggles (JCE_MAX_FRAMES,
+     * JCE_INPUT_REPLAY, JCE_MULTI_INSTANCE) -- it is a developer/QA lever,
+     * and it makes the second scene headlessly capturable, which is the only
+     * way its rendering gets checked at all. */
+    {
+        const char *env_scene = getenv("JCE_STARTUP_SCENE");
+        if (env_scene && env_scene[0]) {
+            scene_path = env_scene;
+            LOG_WARN("engine",
+                     "DEBUG TOGGLE: JCE_STARTUP_SCENE=%s -> overriding the "
+                     "project/boot startup scene", scene_path);
+        }
+    }
+
     if (!scene_path) {
         if (boot && boot->startup_scene[0]) {
             scene_path = boot->startup_scene;
@@ -459,6 +533,7 @@ static bool jce_default_load_startup_scene(
         jce_scene_destroy(s_scene); s_scene = NULL;
         return false;
     }
+    snprintf(s_boot_scene_path, sizeof(s_boot_scene_path), "%s", scene_path);
     LOG_INFO("app", "startup scene loaded (runtime assets): %s", scene_path);
     return true;
 }
@@ -608,6 +683,266 @@ static bool s_runtime_resolve_path(void *user_data, const char *in_path,
                                    char *out_path, int out_size)
 {
     return s_default_resolve_path(in_path, out_path, out_size, user_data);
+}
+
+/* ── Project Settings (Time / Physics) for the SHIPPED runtime ────────
+ *
+ * WHY THIS EXISTS.  The editor's Play path reads JceProjectSettings and hands
+ * seven of its fields to jce_runtime_create
+ * (editor/src/core/jce_editor_play.cpp:436-455): fixed_timestep, the full
+ * gravity vector, solver_iterations, sleep_threshold, auto_simulation,
+ * max_allowed_timestep and the 2D gravity.  This path handed over NONE of
+ * them, so a shipped game ran on jce_runtime_create's built-in defaults and
+ * ignored every value a designer tuned -- the build that shipped did not
+ * simulate like the build they tuned it in, and nothing said so.
+ *
+ * The gap was structural, not a forgotten assignment: JceProjectSettings is an
+ * EDITOR type (editor/src/core/jce_project_settings.h) and `grep -rn
+ * ProjectSettings engine/` finds nothing, so the shipped runtime had no way to
+ * see those values at all.  So read the FILE the editor writes rather than the
+ * type it writes it from.  The keys below mirror the writer in
+ * editor/src/core/jce_project_settings.cpp:289-408 exactly, and
+ * tools/lint/check_runtime_desc_parity.py fails when the two drift --
+ * updating one side of a two-sided contract is worse than updating neither.
+ *
+ * Host-first, like the mixer config below: CWD (a dev run from the project
+ * root), then the exe dir (the shipped layout).  A missing file leaves `rd`
+ * exactly as it was, so jce_runtime_create keeps its own defaults -- which is
+ * the behaviour every build had before this function existed. */
+/* Settings that cannot go through JceRuntimeDesc because their setters only
+ * exist after the objects do: the runtime's time scale and the audio device's
+ * volume/doppler.  Parsed here with everything else and applied by
+ * s_default_apply_post_create() once jce_runtime_create has returned.
+ *
+ * Editor Play applied all three and this path applied none, so a project that
+ * slowed time down or muted itself played normally in the shipped game -- and
+ * jce_runtime.h states the opposite as a contract ("default 1.0 (host seeds it
+ * from JceProjectTime.time_scale)").
+ *
+ * MEASURED, on a project built from the stock empty template through the SDK.
+ * 6000101a shipped this saying the runtime half was NOT measured, because the
+ * app aborts before `if (s_scene)` when no scene loads and I could not get one
+ * into the template's PAK.  The missing piece was mundane: put the cooked tree
+ * beside the exe and the loose mount finds it ("runtime assets mounted: pak=no
+ * loose=yes").  Four branches, four runs:
+ *
+ *   time_scale 0.5              -> "project time scale: 0.500"
+ *   time_scale 2.0              -> "project time scale: 2.000"
+ *   master 0.25 / doppler 2.0   -> "project audio: master 0.25, doppler 2.00"
+ *   disable_audio true          -> "project audio: disabled"
+ *   maximum_particle_timestep 12-> "max particle timestep: 12 ms"
+ *   ... 0                       -> the line is absent (no cap) */
+static struct JceDefaultProjectPost {
+    float time_scale;      /* <= 0 -> not authored, leave the runtime's */
+    float master_volume;
+    float doppler_factor;
+    int   disable_audio;
+    int   have_audio;      /* the file carried an "audio" block */
+    int   particle_step_ms;/* 0 = no cap */
+} s_ps_post;
+
+/* Is TAA asked for this frame?  Reads the same r.taa cvar the scene renderer
+ * registers and the render-pipeline asset drives (rp.enable_taa), which is the
+ * one the editor's viewports read too -- so both hosts answer this question
+ * from the same place.
+ *
+ * Looked up every call rather than cached: the cvar is registered when the
+ * scene renderer is created, and a cached NULL from before that would pin TAA
+ * off for the life of the process. */
+static bool s_default_main_taa_requested(void)
+{
+    const JceCvar *cv = jce_cvar_find("r.taa");
+    return cv ? jce_cvar_get_bool(cv) : false;
+}
+
+static void s_default_apply_project_settings(JceRuntimeDesc *rd)
+{
+    if (!rd) return;
+
+    const char *rel = ".jce/project-settings.json";
+    char path[1200] = {0};
+    char base[1024] = {0};
+    if (jce_fs_host_exists_file(rel)) {
+        snprintf(path, sizeof(path), "%s", rel);
+    } else if (jce_fs_host_get_base_path(base, sizeof(base))) {
+        int n = snprintf(path, sizeof(path), "%s%s", base, rel);
+        if (n <= 0 || n >= (int)sizeof(path) || !jce_fs_host_exists_file(path))
+            return;
+    } else {
+        return;
+    }
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) {
+        LOG_WARN("app", "project settings unreadable (%s): %s -- running on "
+                 "runtime defaults", path, jce_json_last_error());
+        return;
+    }
+
+    /* Graphics + Quality: three PROCESS-GLOBAL texture switches that the
+     * editor applies and the shipped runtime did not.
+     *
+     * Same structural gap as the Time/Physics fields above and found the same
+     * way: `grep -rn jce_texture_set_colour_space engine/src editor/src` had
+     * every call site under editor/, so a project that set Colour Space to
+     * Gamma, dropped Texture Quality, or forced Anisotropic saw it in the
+     * editor and not in the build. Colour Space is the expensive one -- it
+     * decides whether an sRGB texture is decoded, which is a shift across
+     * every textured surface and is indistinguishable by eye from an exposure
+     * or tonemap difference. The engine's own default happens to match the
+     * editor's default (linear), so only a project that CHANGES one of these
+     * diverged, which is exactly why it stayed quiet.
+     *
+     * Keys mirror the writer in editor/src/core/jce_project_settings.cpp
+     * (graphics.color_space / graphics.anisotropic_textures, and
+     * quality.current_level indexing quality.presets[].texture_quality),
+     * and the defaults below mirror jce_project_settings_defaults(). */
+    {
+        JceJson *gfx = jce_json_get(root, "graphics");
+        if (gfx) {
+            jce_texture_set_colour_space(
+                jce_json_get_int(gfx, "color_space", 1) != 0);
+            jce_texture_set_aniso_override(
+                jce_json_get_int(gfx, "anisotropic_textures", 1));
+        }
+        JceJson *ql = jce_json_get(root, "quality");
+        if (ql) {
+            JceJson *presets = jce_json_get(ql, "presets");
+            const int n = presets ? jce_json_array_size(presets) : 0;
+            if (n > 0) {
+                /* Same clamp as the editor's current_quality_level(): an
+                 * out-of-range index falls to the LAST preset, not to 0. */
+                int idx = jce_json_get_int(ql, "current_level", -1);
+                if (idx < 0 || idx >= n)
+                    idx = n - 1;
+                JceJson *lvl = jce_json_array_at(presets, idx);
+                if (lvl)
+                    jce_texture_set_quality_mip_bias(
+                        (int8_t)jce_json_get_int(lvl, "texture_quality", 0));
+            }
+        }
+    }
+
+    JceJson *t = jce_json_get(root, "time");
+    if (t) {
+        rd->fixed_timestep =
+            (float)jce_json_get_number(t, "fixed_timestep", (double)rd->fixed_timestep);
+        rd->max_frame_dt =
+            (float)jce_json_get_number(t, "max_allowed_timestep", (double)rd->max_frame_dt);
+        /* Not desc fields -- see s_ps_post. */
+        s_ps_post.time_scale =
+            (float)jce_json_get_number(t, "time_scale", 0.0);
+        s_ps_post.particle_step_ms =
+            (int)jce_json_get_int(t, "maximum_particle_timestep_ms", 0);
+    }
+    {
+        JceJson *a = jce_json_get(root, "audio");
+        if (a) {
+            s_ps_post.have_audio     = 1;
+            s_ps_post.master_volume  =
+                (float)jce_json_get_number(a, "master_volume", 1.0);
+            s_ps_post.doppler_factor =
+                (float)jce_json_get_number(a, "doppler_factor", 1.0);
+            s_ps_post.disable_audio  =
+                jce_json_get_bool(a, "disable_audio", false) ? 1 : 0;
+        }
+    }
+    JceJson *p = jce_json_get(root, "physics");
+    if (p) {
+        const float g_def[3] = { rd->gravity[0], rd->gravity[1], rd->gravity[2] };
+        jce_json_get_floats(p, "gravity", rd->gravity, 3, g_def);
+        rd->solver_iterations =
+            (int32_t)jce_json_get_int(p, "default_solver_iterations", (int)rd->solver_iterations);
+        rd->sleep_threshold =
+            (float)jce_json_get_number(p, "sleep_threshold", (double)rd->sleep_threshold);
+        /* The desc carries the NEGATION of the setting, exactly as Play does:
+         * auto_simulation=false means "the game steps physics itself". */
+        rd->disable_auto_physics = !jce_json_get_bool(p, "auto_simulation", true);
+    }
+    JceJson *p2 = jce_json_get(root, "physics2d");
+    if (p2) {
+        const float g2_def[2] = { rd->gravity2d[0], rd->gravity2d[1] };
+        jce_json_get_floats(p2, "gravity", rd->gravity2d, 2, g2_def);
+    }
+    jce_json_free(root);
+
+    LOG_INFO("app", "project settings applied from %s "
+             "(dt=%.4f max_dt=%.4f solver=%d sleep=%.4f auto_physics=%d)",
+             path, (double)rd->fixed_timestep, (double)rd->max_frame_dt,
+             (int)rd->solver_iterations, (double)rd->sleep_threshold,
+             rd->disable_auto_physics ? 0 : 1);
+}
+
+/* Sibling "<scene>.navmesh.bin" for the startup scene, by the SAME rule the
+ * editor's Play path uses (editor/src/core/jce_editor_play.cpp:475-491): strip
+ * a ".scene.json" or ".json" suffix and append ".navmesh.bin".  Returns NULL
+ * when the scene is unknown or no such file exists, which is what every
+ * shipped build did unconditionally before -- nav agents had no mesh to path
+ * on while the same scene pathfound correctly in Play. */
+static const char *s_default_navmesh_path(void)
+{
+    static char s_navmesh_bin[1200];
+    if (!s_boot_scene_path[0]) return NULL;
+
+    char np[1024];
+    snprintf(np, sizeof(np), "%s", s_boot_scene_path);
+    static const char *const sfxs[] = { ".scene.json", ".json" };
+    for (size_t i = 0; i < sizeof(sfxs) / sizeof(sfxs[0]); ++i) {
+        size_t nl = strlen(np), sl = strlen(sfxs[i]);
+        if (nl >= sl && strcmp(np + nl - sl, sfxs[i]) == 0) {
+            np[nl - sl] = '\0';
+            break;
+        }
+    }
+
+    /* Host-first, then the exe dir: a loose cooked tree beside a dev run, then
+     * the shipped layout.  The runtime keeps the pointer, hence the static. */
+    int n = snprintf(s_navmesh_bin, sizeof(s_navmesh_bin), "%s.navmesh.bin", np);
+    if (n > 0 && n < (int)sizeof(s_navmesh_bin) &&
+        jce_fs_host_exists_file(s_navmesh_bin))
+        return s_navmesh_bin;
+
+    char base[1024] = {0};
+    if (jce_fs_host_get_base_path(base, sizeof(base))) {
+        n = snprintf(s_navmesh_bin, sizeof(s_navmesh_bin), "%s%s.navmesh.bin",
+                     base, np);
+        if (n > 0 && n < (int)sizeof(s_navmesh_bin) &&
+            jce_fs_host_exists_file(s_navmesh_bin))
+            return s_navmesh_bin;
+    }
+    return NULL;
+}
+
+/* Per-user save directory: "<Documents>/<project name>/saves".
+ *
+ * Editor Play points saves_dir at "<project>/saves" -- correct for a checkout,
+ * wrong for a shipped game, which may live under Program Files where the exe
+ * directory is not writable.  Documents is the folder JceUserFolder already
+ * exposes and the one most shipped games use.  Returns NULL when the folder
+ * cannot be resolved, which leaves saves_dir unset exactly as before (the
+ * runtime still registers the snapshot provider; SavePoint just has nowhere to
+ * write). */
+static const char *s_default_saves_dir(void)
+{
+    static char s_saves_dir[1200];
+    char docs[1024] = {0};
+    if (!jce_host_get_user_folder(JCE_USER_FOLDER_DOCUMENTS, docs, sizeof(docs)))
+        return NULL;
+
+    /* jce_host_get_user_folder returns a TRAILING separator ("C:\\Users\\x\\
+     * Documents\\"), so composing with another one yields "Documents\\/Name" --
+     * harmless to the OS, ugly in every log line and in the path a player is
+     * asked to find their saves in.  Trim it. */
+    size_t dl = strlen(docs);
+    while (dl > 0 && (docs[dl - 1] == '/' || docs[dl - 1] == '\\'))
+        docs[--dl] = '\0';
+
+    const char *name = (s_project && s_project->name && s_project->name[0])
+                       ? s_project->name : "JCE";
+    int n = snprintf(s_saves_dir, sizeof(s_saves_dir), "%s/%s/saves", docs, name);
+    if (n <= 0 || n >= (int)sizeof(s_saves_dir)) return NULL;
+    if (!jce_fs_host_create_directory(s_saves_dir)) return NULL;
+    return s_saves_dir;
 }
 
 static JceMesh *s_default_load_mesh(const char *path, void *ud)
@@ -852,6 +1187,67 @@ static bool app_init(const JceServices *svc, void *ud)
     cam_desc.far_plane  = 1000.0f;
     s_camera = jce_camera_create(&cam_desc);
 
+    /* THE AUTHORED CAMERA, WHICH NOTHING USED.  jce_scene_camera_apply_primary
+     * resolves the single enabled primary JceCameraComponent (rejecting
+     * ambiguous authoring rather than depending on ECS iteration order) and
+     * applies its pose AND lens.  It had ZERO callers in the whole tree, in
+     * either host -- so 11 of caged_kingdom's 15 scenes author a primary
+     * camera that decided nothing, and this exe started at a hardcoded
+     * (0, 2, 5) looking at (0, 0.5, 0) with a 60-degree lens.
+     *
+     * Additive on purpose: it replaces the HARDCODED default only.  Everything
+     * that drives the camera afterwards -- VirtualCamera blending, the
+     * third-person follow, mouse-look and free-fly -- is untouched and still
+     * wins per frame.  A scene with no primary camera keeps the old constant.
+     *
+     * The mask cannot be applied to a JceCamera (it is a renderer-side
+     * filter), so it is cached here and handed to the render config below. */
+    if (s_scene) {
+        JceSceneCameraPose cpose;
+        memset(&cpose, 0, sizeof cpose);
+        const JceSceneCameraResolveResult cres =
+            jce_scene_camera_apply_primary(s_scene, s_camera, &cpose);
+        if (cres == JCE_SCENE_CAMERA_RESOLVE_OK) {
+            s_camera_culling_mask = cpose.culling_mask;
+            s_camera_draw_skybox =
+                jce_scene_camera_clear_draws_skybox(cpose.clear_mode);
+            jce_scene_camera_clear_keeps(cpose.clear_mode,
+                                         &s_camera_keep_color,
+                                         &s_camera_keep_depth);
+            LOG_INFO("app", "camera: authored primary applied "
+                     "(fov %.1f, near %.3f, far %.1f, culling mask 0x%08X, "
+                     "clear mode %u -> sky %s)",
+                     (double)cpose.fov_deg, (double)cpose.near_plane,
+                     (double)cpose.far_plane, (unsigned)cpose.culling_mask,
+                     (unsigned)cpose.clear_mode,
+                     s_camera_draw_skybox ? "on" : "off");
+        } else if (cres == JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS) {
+            LOG_WARN("app", "%s", "camera: more than one enabled primary "
+                     "Camera component -- none applied, so the choice is not "
+                     "left to ECS iteration order");
+        }
+
+        /* The overlays of the stack, from the same scan point.  Two cameras
+         * sharing a stack_index is refused here exactly as two primaries are
+         * above: what a player sees on top must not be ECS iteration order. */
+        s_camera_overlay_count = 0u;
+        {
+            const JceSceneCameraResolveResult sres =
+                jce_scene_camera_resolve_stack(s_scene, s_camera_overlays,
+                                               JCE_VIEW_SR_CAMERA_OVERLAY_MAX,
+                                               &s_camera_overlay_count);
+            if (sres != JCE_SCENE_CAMERA_RESOLVE_OK) {
+                s_camera_overlay_count = 0u;
+                LOG_WARN("app", "%s", "camera stack: overlays not applied "
+                         "(ambiguous stack_index or a degenerate pose); the "
+                         "base camera renders alone");
+            } else if (s_camera_overlay_count > 0u) {
+                LOG_INFO("app", "camera stack: %u overlay camera(s) applied",
+                         (unsigned)s_camera_overlay_count);
+            }
+        }
+    }
+
     if (svc && svc->renderer) {
         JceSceneRendererCallbacks cbs = {0};
         cbs.load_mesh    = s_default_load_mesh;
@@ -873,11 +1269,39 @@ static bool app_init(const JceServices *svc, void *ud)
     if (!s_scene_renderer)
         LOG_WARN("app", "%s", "jce_scene_renderer_create failed — scene will not render");
 
+    /* ── Developer console ──────────────────────────────────────────
+     *
+     * jce_args_has_dev() has been public and implemented since argv stashing
+     * landed and had NO CALLER ANYWHERE IN THE REPOSITORY -- the parity row
+     * for this feature recorded that while tracing it.  This is its first.
+     *
+     * The SHELL, not the overlay: the default main creates a scene renderer
+     * and no JceUIContext, and standing RmlUi up in every shipped game is a
+     * separate decision with a real cost.  So a --dev game can open a console,
+     * type at it, complete names with Tab, walk its history and change any
+     * registered cvar; the output goes to the log because that is the surface
+     * this path actually has.  A game that already has a UI context (the way
+     * it would for the debug HUD) adds jce_console_overlay_create and gets
+     * the same shell drawn on screen. */
+    if (jce_args_has_dev()) {
+        JceConsoleShellDesc csd;
+        memset(&csd, 0, sizeof csd);
+        s_console_shell = jce_console_shell_create(&csd);
+        if (s_console_shell) {
+            LOG_INFO("app", "%s", "developer console enabled (--dev): press ` "
+                                  "to open; output goes to this log");
+        } else {
+            /* SAID, not swallowed: without this the tilde key simply does
+             * nothing and that is indistinguishable from --dev not working. */
+            LOG_WARN("app", "%s", "developer console could not be created");
+        }
+    }
+
     /* Occlusion culler (M5): activate GPU-query two-pass coherence culling in
      * the shipped runtime, mirroring the editor scene-view.  Only the engine's
      * embedded 'color' program is needed for the depth-only proxy draws, so this
      * works in a shipped exe (engine shaders are embedded; see JCE_EMBED_ENGINE
-     * _SHADERS).  Opt-OUT via JCE_DISABLE_OCCLUSION=1 (A/B + safety hatch, mirrors
+     * _SHADERS).  Opt-IN via JCE_ENABLE_OCCLUSION=1 (A/B + safety hatch, mirrors
      * JCE_DISABLE_WCACHE).  Uses the default proxy view (254); the runtime has a
      * single scene-render path per frame so no second culler shares the view. */
     if (svc && svc->renderer) {
@@ -925,6 +1349,18 @@ static bool app_init(const JceServices *svc, void *ud)
         s_ui_canvas = jce_ui_canvas_create(svc->renderer, s_engine_pak);
         if (!s_ui_canvas)
             LOG_WARN("app", "%s", "jce_ui_canvas_create failed — ECS-UI will not render");
+        /* The project's fallback face for a UIText with an empty fontPath,
+         * read from the manifest so the EDITOR can apply the same one.  It
+         * used to be settable only from a project's own main(), which is why
+         * the editor and the shipped exe could rasterise the same component
+         * from two different fonts.  NULL/absent keeps the built-in default. */
+        if (s_project && s_project->ui_default_font &&
+            s_project->ui_default_font[0])
+            jce_ui_canvas_set_default_font(s_project->ui_default_font);
+        /* Beside the font it backs, on purpose: a chain applied in the editor
+         * and not in the shipped exe would draw tofu only for players. */
+        jce_ui_canvas_set_font_fallbacks(
+            s_project ? s_project->ui_font_fallbacks : NULL);
     }
 
     /* Physics layer collision matrix (Top 4 — last-mile parity with editor
@@ -1001,7 +1437,13 @@ static bool app_init(const JceServices *svc, void *ud)
         }
         if (rs_loaded) {
             s_render_settings_loaded = true;
-            jce_texture_set_global_mip_bias((int8_t)s_render_settings.lod_bias);
+            /* lod_bias is a MESH-LOD distance multiplier (see jce_lod.h).
+             * It used to be cast to int8 and handed to
+             * jce_texture_set_global_mip_bias, which is a top-mip DROP
+             * count -- so the authored default of 1.0 cost every shipped
+             * game one mip level of texture detail that the editor kept,
+             * and 2.0 cost two.  Wrong quantity, wrong units, wrong sign. */
+            jce_lod_set_global_bias(s_render_settings.lod_bias);
             /* Window-period graphics: vsync + MSAA are swapchain reset flags,
              * applied here via a GPU reset (the renderer is already created).
              * HDR is handled by the pipeline's internal HDR offscreen target +
@@ -1014,8 +1456,34 @@ static bool app_init(const JceServices *svc, void *ud)
             if (s_scene_renderer)
                 jce_scene_renderer_set_grass_enabled(s_scene_renderer,
                     s_render_settings.grass_enabled != 0);
-            LOG_INFO("app", "render settings applied (vsync=%d msaa=%d)",
-                     s_render_settings.vsync, s_render_settings.msaa);
+            /* Texture quality + anisotropic filtering.  Both consumers have
+             * existed all along and both had ONLY editor callers, so a
+             * designer who set Texture Quality to Quarter to fit a low-end
+             * target saw the viewport honour it and shipped Full.  The
+             * defaults (0 / -1) are the no-op values, so a project that never
+             * touched either setting is unchanged. */
+            jce_texture_set_quality_mip_bias(
+                (int8_t)s_render_settings.texture_quality);
+            jce_texture_set_aniso_override(s_render_settings.anisotropic);
+            /* Frame cap.  The engine had no limiter until this landed, so this
+             * field was authorable and had nothing to reach; <= 0 stays
+             * uncapped, which is what every existing project loads to. */
+            jce_engine_set_target_fps(s_render_settings.target_framerate);
+            /* Per-pixel light budget; <= 0 keeps the old selection. */
+            jce_lighting_set_pixel_light_count(
+                s_render_settings.pixel_light_count);
+            /* Soft particles; 0 keeps the hard billboard edge every build
+             * had before the fade existed. */
+            jce_particles_set_soft_fade_distance(
+                s_render_settings.soft_particles
+                    ? JCE_PARTICLES_SOFT_FADE_DEFAULT : 0.0f);
+            LOG_INFO("app", "render settings applied (vsync=%d msaa=%d "
+                     "texq=%d aniso=%d fps_cap=%d softparticles=%d)",
+                     s_render_settings.vsync, s_render_settings.msaa,
+                     s_render_settings.texture_quality,
+                     s_render_settings.anisotropic,
+                     s_render_settings.target_framerate,
+                     s_render_settings.soft_particles);
         }
     }
 
@@ -1025,6 +1493,26 @@ static bool app_init(const JceServices *svc, void *ud)
         rd.pak            = s_engine_pak;
         rd.audio          = svc ? svc->audio : NULL;
         rd.enable_physics = true;
+    /* World streaming: hand the runtime the same mount everything else in this
+     * build resolves through.  Without it a scene that authored streaming
+     * loads none of it -- which is what every shipped build did, because
+     * jce_world_streamer_create had only editor callers. */
+    rd.asset_fs = s_runtime_fs;
+
+        /* Time / Physics from the project the designer actually tuned.  Play
+         * has always done this; this path never did.  See the function. */
+        s_default_apply_project_settings(&rd);
+
+        /* Navmesh + saves: the two fields Play set and this path did not, so a
+         * shipped game had no navmesh to path on and nowhere to write a
+         * SavePoint checkpoint.  Both resolve to NULL when absent, which is
+         * exactly the previous behaviour. */
+        rd.navmesh_path = s_default_navmesh_path();
+        if (rd.navmesh_path)
+            LOG_INFO("app", "navmesh: %s", rd.navmesh_path);
+        rd.saves_dir = s_default_saves_dir();
+        if (rd.saves_dir)
+            LOG_INFO("app", "saves dir: %s", rd.saves_dir);
         /* Anchor runtime host-fs reads (scripts, BT trees, .seq, terrain
          * meta) to the cooked tree, mirroring the renderer's resolver.
          * Without this the runtime's host-first read resolves relative to
@@ -1083,6 +1571,33 @@ static bool app_init(const JceServices *svc, void *ud)
         s_runtime = jce_runtime_create(&rd);
         if (!s_runtime)
             LOG_WARN("app", "%s", "jce_runtime_create failed — physics/audio inactive");
+
+        /* The two project settings whose setters only exist now.  Mirrors
+         * editor Play exactly, including the order (disable wins over the
+         * authored volume, and doppler is skipped when disabled). */
+        if (s_runtime && s_ps_post.time_scale > 0.0f) {
+            jce_runtime_set_time_scale(s_runtime, s_ps_post.time_scale);
+            LOG_INFO("app", "project time scale: %.3f",
+                     (double)s_ps_post.time_scale);
+        }
+        if (s_ps_post.particle_step_ms > 0) {
+            jce_particles_set_max_timestep(
+                (float)s_ps_post.particle_step_ms * 0.001f);
+            LOG_INFO("app", "max particle timestep: %.0f ms",
+                     (double)(jce_particles_get_max_timestep() * 1000.0f));
+        }
+        if (s_ps_post.have_audio && svc && svc->audio) {
+            if (s_ps_post.disable_audio) {
+                jce_audio_set_master_volume(svc->audio, 0.0f);
+                LOG_INFO("app", "%s", "project audio: disabled");
+            } else {
+                jce_audio_set_master_volume(svc->audio, s_ps_post.master_volume);
+                jce_audio_set_doppler_factor(svc->audio, s_ps_post.doppler_factor);
+                LOG_INFO("app", "project audio: master %.2f, doppler %.2f",
+                         (double)s_ps_post.master_volume,
+                         (double)s_ps_post.doppler_factor);
+            }
+        }
 
         /* Route animation frame events into the gameplay script VM: the scene
          * renderer (which advances the event tracks) now forwards each fired
@@ -1159,6 +1674,29 @@ static void app_update(float dt, void *ud)
     if (!s_svc || !s_svc->input) return;
     const JceInput *in = s_svc->input;
     const JceInputActions *acts = s_svc->actions;
+
+    /* ── Developer console (--dev) ──────────────────────────────────
+     *
+     * FIRST, AND RETURNS WHEN IT CONSUMES.  An open console must take the
+     * frame: otherwise typing `r.taa 0` also walks the player forward, and
+     * the tilde that opens it is a tilde the game still sees.
+     *
+     * Gated on --dev rather than always on.  A console every player can open
+     * with the tilde key is the wrong default for a shipped game; a console
+     * nobody can open is the gap this closes. */
+    if (s_console_shell && jce_console_shell_handle_input(s_console_shell, in)) {
+        /* Drain whatever the console just printed to the log, which is the
+         * only surface this path has.  Bounded by the ring, so a wrapped
+         * scrollback re-bases the watermark rather than replaying. */
+        const uint32_t have = jce_console_shell_scrollback_count(s_console_shell);
+        if (s_console_logged > have) s_console_logged = 0;
+        for (uint32_t i = s_console_logged; i < have; ++i) {
+            const char *l = jce_console_shell_scrollback_at(s_console_shell, i);
+            if (l) LOG_INFO("console", "%s", l);
+        }
+        s_console_logged = have;
+        return;
+    }
 
     /* Tab toggles FPS-look cursor capture.  Uncaptured ⇒ a free OS cursor the
      * player can click in-game UI with (FEATURE 4.1); captured ⇒ classic
@@ -1292,6 +1830,10 @@ static void app_update(float dt, void *ud)
             if (jce_input_mouse_button(in, button))
                 ri.pointer_buttons |= UINT32_C(1) << (button - 1);
         }
+        /* Borrowed for this frame only; the runtime drops it after step().
+         * Without this jce.is_key_down answered false in every shipped
+         * game -- see JceRuntimeInput::keyboard. */
+        ri.keyboard = in;
         jce_runtime_set_input(s_runtime, &ri);
         {
             JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES];
@@ -1337,6 +1879,29 @@ static void app_update(float dt, void *ud)
                                   jce_camera_get_position(s_camera));
 
     if (!s_camera) return;
+
+#if defined(JCE_APP_AUTHORED_CAMERA_ONLY) && JCE_APP_AUTHORED_CAMERA_ONLY
+    /* FIXED-CAMERA GAME.  The scene's authored primary camera IS the view, and
+     * nothing below may move it: no mouse-look, no third-person follow, no
+     * WASD/Space free-fly.
+     *
+     * The comment where the authored camera is applied (search "still wins per
+     * frame") states the default plainly: the driver below overrides the
+     * authored pose every frame.  That is right for a walk-around scene and
+     * wrong for a game whose camera is part of the design -- a top-down board,
+     * a fixed side view, a pre-framed cutscene.  Worse, the driver EATS THE
+     * GAME'S KEYS: W/A/S/D/Q/E/Space fly the camera, so a 2D game whose
+     * scripts read those keys finds the view sliding out from under it while
+     * the game also responds.  Measured on a top-down snake: the board drifted
+     * on every keypress.
+     *
+     * A compile-time switch rather than a JceAppDesc field because this header
+     * is compiled INTO each application; an app opts in with
+     *   target_compile_definitions(MyGame PRIVATE JCE_APP_AUTHORED_CAMERA_ONLY=1)
+     * and every project that does not is byte-for-byte unaffected -- no struct
+     * grew, so no ABI moved. */
+    return;
+#else
 
     /* Cinemachine-style VCam override — parity with the editor game view
      * (jce_panel_game_view.cpp does the same in Play mode): when the scene
@@ -1406,7 +1971,7 @@ static void app_update(float dt, void *ud)
             jce_input_key_down(in, JCE_KEY_SPACE)) jce_camera_move_up(s_camera,  step);
         if (jce_input_key_down(in, JCE_KEY_Q)) jce_camera_move_up     (s_camera, -step);
     }
-
+#endif /* JCE_APP_AUTHORED_CAMERA_ONLY */
 }
 
 /* Build the scene render config from defaults, folding in the project-wide
@@ -1425,7 +1990,157 @@ static JceSceneRenderConfig s_default_scene_cfg(void)
      * / entity_visible / submit_query internally from this pointer.  NULL (when
      * disabled / unsupported) keeps the old always-visible behaviour. */
     c.occlusion_culler = s_occlusion_culler;
+    /* Unity's Camera.cullingMask.  0 = no filtering, which is what every
+     * scene that does not author one resolves to. */
+    c.camera_culling_mask = s_camera_culling_mask;
+    /* Unity's Camera.clearFlags, the half of it a single camera can honour.
+     * Landed HERE rather than at the two draw call sites because both runtime
+     * paths -- offscreen postfx and direct-to-backbuffer -- build their config
+     * from this one function, which is also why camera_culling_mask lives
+     * here: a value set at one call site and not the other is how the two
+     * paths drift. */
+    c.draw_skybox = s_camera_draw_skybox;
+    /* And the overlay COUNT, for the same reason and in the same place: the
+     * renderer needs it before it draws to name the overlay views ahead of
+     * every consumer of the scene colour. */
+    c.camera_overlay_count = s_camera_overlay_count;
     return c;
+}
+
+/* ── Collider overlay in the SHIPPED build ───────────────────────────────
+ *
+ * The capability was public on both sides and reachable from neither.
+ * jce_physics_debug.h has had the flag set, the line-sink installer and the
+ * flush since P3-C.5, and jce_debug_draw.h has had the sink itself -- but the
+ * only installer and the only flusher in the whole tree lived in
+ * editor/src/panels/jce_panel_physics_debugger.cpp and
+ * editor/src/scene/jce_scene_render_draw.cpp.  A packaged game therefore had
+ * no way to draw a collider without the developer writing the trampoline
+ * themselves, which is the one thing a shipped build cannot be asked to do
+ * when the bug only reproduces there.
+ *
+ * ONE function for BOTH render paths, for the reason the camera-overlay
+ * helper below states: a debug overlay wired into the postfx path and not the
+ * direct one would be a tool that works or not depending on whether the scene
+ * happens to author a postfx chain -- which is exactly the kind of "it did not
+ * reproduce for me" this exists to end.
+ */
+static void jce_default_main_physics_debug_line(jce_vec3 from, jce_vec3 to,
+                                                uint32_t abgr, void *ud)
+{
+    (void)ud;
+    jce_debug_draw_line(from, to, abgr);
+}
+
+/* JCE_PHYSICS_DEBUG=wireframe,aabb,contacts,constraints,normals | all | 1
+ *
+ * An environment variable and not a command-line flag because a shipped game
+ * is a WIN32 process launched by a shortcut or a store client, where nobody
+ * gets to append argv -- the same reason JCE_LOG_FILE is one.  Unknown names
+ * are ignored rather than fatal: a typo in a debugging aid must not stop the
+ * game it was meant to help you look at. */
+static uint32_t jce_default_main_physics_debug_env_flags(void)
+{
+    const char *spec = getenv("JCE_PHYSICS_DEBUG");
+    if (!spec || !spec[0]) return 0u;
+
+    static const struct { const char *name; uint32_t bit; } kNames[] = {
+        { "wireframe",   JCE_PHYS_DBG_WIREFRAME   },
+        { "aabb",        JCE_PHYS_DBG_AABB        },
+        { "contacts",    JCE_PHYS_DBG_CONTACTS    },
+        { "constraints", JCE_PHYS_DBG_CONSTRAINTS },
+        { "normals",     JCE_PHYS_DBG_NORMALS     },
+        { "all",         JCE_PHYS_DBG_ALL         },
+    };
+
+    uint32_t flags = 0u;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+        const char *tok = p;
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+        const size_t n = (size_t)(p - tok);
+        if (n == 0) continue;
+        /* "1" / "on" / "true" mean the one everybody wants: the wireframe. */
+        if ((n == 1 && tok[0] == '1') ||
+            (n == 2 && strncmp(tok, "on", 2) == 0) ||
+            (n == 4 && strncmp(tok, "true", 4) == 0)) {
+            flags |= JCE_PHYS_DBG_WIREFRAME;
+            continue;
+        }
+        for (size_t i = 0; i < sizeof kNames / sizeof kNames[0]; ++i)
+            if (strlen(kNames[i].name) == n &&
+                strncmp(tok, kNames[i].name, n) == 0) {
+                flags |= kNames[i].bit;
+                break;
+            }
+    }
+    return flags;
+}
+
+static void jce_default_main_physics_debug(uint16_t view,
+                                           const JceServices *svc)
+{
+    static int armed = 0;
+    if (!armed) {
+        armed = 1;
+        /* THE SINK GOES IN UNCONDITIONALLY, before the flag check below: a
+         * game that calls jce_physics_debug_set_flags() from its own code --
+         * a cheat menu, a dev build's F-key -- has to get lines too, and it
+         * cannot install a sink it does not know about.  The cost of an
+         * installed sink with flags==NONE is the branch inside
+         * jce_physics_debug_flush, which that header documents as cheap. */
+        jce_physics_debug_set_line_sink(jce_default_main_physics_debug_line,
+                                        NULL);
+        const uint32_t env = jce_default_main_physics_debug_env_flags();
+        /* The environment does not override a game that already chose. */
+        if (env != 0u && jce_physics_debug_get_flags() == 0u)
+            jce_physics_debug_set_flags(env);
+    }
+
+    if (jce_physics_debug_get_flags() == 0u) return;
+    JcePhysicsWorld *pw = s_runtime ? jce_runtime_physics(s_runtime) : NULL;
+    if (!pw || !svc || !svc->renderer) return;
+    jce_physics_debug_flush(pw);
+    jce_debug_draw_flush(view, svc->renderer);
+}
+
+/* Draw the authored stack's overlay cameras over a base render that just
+ * happened.  ONE function for BOTH of this file's render paths: a stack wired
+ * into the postfx path and not the direct one would be a game that looks
+ * different depending on whether the scene authored a postfx chain. */
+static void jce_default_main_render_camera_overlays(
+    uint16_t base, const JceSceneRenderConfig *base_cfg)
+{
+    if (!s_scene_renderer || !s_scene || s_camera_overlay_count == 0u ||
+        !base_cfg)
+        return;
+
+    if (!s_camera_overlay_cam) {
+        JceCameraDesc d;
+        memset(&d, 0, sizeof d);
+        d.position   = jce_v3(0.0f, 0.0f, 0.0f);
+        d.target     = jce_v3(0.0f, 0.0f, -1.0f);
+        d.up         = jce_v3(0.0f, 1.0f, 0.0f);
+        d.fov_deg    = 60.0f;
+        d.near_plane = 0.1f;
+        d.far_plane  = 1000.0f;
+        s_camera_overlay_cam = jce_camera_create(&d);
+        if (!s_camera_overlay_cam) return;
+    }
+
+    for (uint8_t oi = 0; oi < s_camera_overlay_count; ++oi) {
+        JceSceneRenderConfig ocfg;
+        if (!jce_scene_camera_apply_pose(s_camera_overlay_cam,
+                                         &s_camera_overlays[oi]))
+            continue;
+        ocfg = *base_cfg;
+        ocfg.camera_culling_mask = s_camera_overlays[oi].culling_mask;
+        ocfg.camera_clear_mode   = s_camera_overlays[oi].clear_mode;
+        jce_scene_renderer_render_camera_overlay(
+            s_scene_renderer, s_scene, s_camera_overlay_cam, base, oi,
+            s_last_dt, &ocfg);
+    }
 }
 
 static void app_draw(const JceServices *svc, void *ud)
@@ -1458,7 +2173,37 @@ static void app_draw(const JceServices *svc, void *ud)
     static int s_no_postfx = -1;
     if (s_no_postfx < 0)
         s_no_postfx = (getenv("JCE_NO_POSTFX") != NULL) ? 1 : 0;
-    if (!s_no_postfx && pfx && sw > 0 && sh > 0) {
+    /* DECIDE BEFORE CLAIMING.  The bridge below binds its framebuffer and its
+     * sub-view rects onto the very view ids the direct-to-backbuffer fallback
+     * renders into -- it is created at JCE_VIEW_RUNTIME_GAME, the same base.
+     * It used to do all of that FIRST and only then ask whether any post
+     * effect was enabled; when none was, it declined to present and left the
+     * whole band pointed at an offscreen target nobody shows.  The fallback
+     * then drew the game into it.  A shipped project with no post-processing
+     * rendered a black window, and did so for every such project.
+     *
+     * Asking first costs a stale read on frame 1 only: jce_scene_renderer_render
+     * rewrites these flags from the scene's authored postfx settings, so frame
+     * 1 uses the pipeline defaults and every frame after uses the scene's.  A
+     * scene with effects therefore spends its first frame on the direct path
+     * and settles -- which is visually indistinguishable and structurally
+     * honest, because the alternative is claiming views on the guess that they
+     * will be needed. */
+    bool want_bridge = false;
+    for (int i = 0; i < JCE_POSTFX_COUNT; ++i)
+        if (jce_postfx_is_enabled(pfx, (JcePostFXType)i)) { want_bridge = true; break; }
+    if (!want_bridge && jce_scene_renderer_has_fullscreen_effect(s_scene))
+        want_bridge = true;
+    /* TAA TOO, and it is not one of the JCE_POSTFX_* types -- it is a separate
+     * flag on the pipeline, so the loop above could not see it.  A scene that
+     * asked for TAA and nothing else took the direct-to-backbuffer path, where
+     * there is no post chain and therefore no TAA resolve: the render pipeline
+     * said taa=1, every layer reported success, and no shipped frame was ever
+     * temporally anti-aliased. */
+    if (!want_bridge && s_default_main_taa_requested())
+        want_bridge = true;
+
+    if (want_bridge && !s_no_postfx && pfx && sw > 0 && sh > 0) {
         if (!s_post_target) {
             s_post_target = jce_offscreen_target_create(svc->renderer,
                                                         JCE_VIEW_RUNTIME_GAME);
@@ -1479,48 +2224,52 @@ static void app_draw(const JceServices *svc, void *ud)
              * graphics" bundle with the grass/bloom/cascade floors — single
              * knobs measured too small alone on a 50ms iGPU frame; the
              * bundle is what moves it.  HIGH/ULTRA render 1:1 as before. */
+            /* ONE answer to "how big is the scene target", shared with the
+             * editor's Game view.  The pixel budget that used to live here
+             * still does the same thing -- it just does it beside the AUTHORED
+             * render_scale instead of instead of it.
+             *
+             * That field was parsed, stored, cooked into the shipped PAK,
+             * draggable in two editor panels and printed in the "applied:"
+             * log line, and this block, the only resolution decision in the
+             * shipped runtime, did not look at it.  Both halves are now in
+             * jce_render_pipeline_scene_extent(); the reasoning about tiers,
+             * budgets and why the UI stays native moved there with them. */
             uint32_t rw = sw, rh = sh;
-            /* Dynamic resolution applies to the fill-bound low-end: the LOW
-             * charter baseline AND every INTEGRATED GPU (capped at MEDIUM).  An
-             * iGPU's color pass is pixel-count-bound at native res, so the same
-             * pixel-budget scaling that holds 60 on the charter box holds it on
-             * an iGPU — while UI/text stay native.  Discrete MEDIUM+ renders 1:1. */
-            const bool dynres_tier =
-                jce_renderer_get_tier() <= JCE_GPU_TIER_LOW ||
-                (jce_renderer_get_tier() == JCE_GPU_TIER_MEDIUM &&
-                 !jce_renderer_get_recommendation().has_discrete_gpu);
-            if (dynres_tier) {
-                /* Pixel-BUDGET dynamic resolution (replaces the old flat 0.65x,
-                 * which blurred even small windows).  The 3D offscreen chain
-                 * renders 1:1 — fully crisp — as long as the surface is within
-                 * a pixel budget, and only a large/fullscreen surface scales
-                 * down (by area) to hold framerate on iGPU / WebGL.  So the
-                 * default window stays sharp while fullscreen still gets relief.
-                 * JCE_DYNRES_BUDGET (megapixels) overrides the default. */
-                uint64_t budget = 1600000ull;   /* ~1.6 Mpx (≈1440x1111) */
-                {
-                    const char *b = getenv("JCE_DYNRES_BUDGET");
-                    if (b && b[0]) {
-                        double mpx = atof(b);
-                        if (mpx > 0.05) budget = (uint64_t)(mpx * 1000000.0);
-                    }
-                }
-                uint64_t px = (uint64_t)sw * (uint64_t)sh;
-                if (px > budget) {
-                    float s = sqrtf((float)budget / (float)px);
-                    rw = (uint32_t)((float)sw * s);  if (rw < 16u) rw = sw;
-                    rh = (uint32_t)((float)sh * s);  if (rh < 16u) rh = sh;
-                }
-            }
+            jce_render_pipeline_scene_extent(sw, sh, &rw, &rh);
             float aspect = (float)sw / (float)sh;
             jce_mat4 view = jce_camera_view(s_camera);
             jce_mat4 proj = jce_camera_proj(s_camera, aspect,
                                             jce_gfx_caps().homogeneous_depth);
+            /* TAA, driven exactly as jce_scene_renderer.h documents: begin
+             * RIGHT BEFORE the main colour pass's view transform is set (the
+             * prepare_keep below is that site), with the CLEAN view + proj.
+             * When r.taa is off this returns false and leaves color_proj ==
+             * proj, so the off path is byte-identical to a build without TAA.
+             *
+             * This call did not exist until 2026-09-22 and taa_begin_frame had
+             * exactly ONE caller in the tree -- the editor's Scene view -- so
+             * no shipped build ever resolved TAA while the editor's Game View
+             * did.  Measured on examples/snake_seven with both hosts on
+             * Direct3D 12: the same static frame differed on 12.50% of pixels,
+             * and forcing TAA off on both sides took it to 2.98% and a wall
+             * edge from 3.003 px apart to 0.000. */
+            jce_mat4 color_proj = proj;
+            const bool taa_on = jce_scene_renderer_taa_begin_frame(
+                s_scene_renderer, rw, rh, &view, &proj, &color_proj);
+            /* Per-object / per-bone velocity in the pre-pass, gated so it costs
+             * nothing when TAA is off; jce_scene_renderer_render binds it into
+             * the TAA resolve itself, which is what stops skinned characters
+             * ghosting. */
+            jce_scene_renderer_set_taa_velocity_enabled(s_scene_renderer, taa_on);
             /* HDR target: force tone mapping so the PBR linear output maps to
              * display range (else washed out).  No-op on the RGBA8 fallback. */
-            if (jce_offscreen_target_prepare(s_post_target, rw, rh,
-                                             view.raw[0], proj.raw[0],
-                                             0x000000FFu, "RuntimeScene")) {
+            if (jce_offscreen_target_prepare_keep(s_post_target, rw, rh,
+                                             view.raw[0], color_proj.raw[0],
+                                             0x000000FFu,
+                                             s_camera_keep_color,
+                                             s_camera_keep_depth,
+                                             "RuntimeScene")) {
                 JceSceneRenderConfig pcfg = s_default_scene_cfg();
                 uint16_t base = jce_offscreen_target_get_view_id(s_post_target);
                 /* Postfx path renders into the offscreen target — bind the
@@ -1567,8 +2316,19 @@ static void app_draw(const JceServices *svc, void *ud)
                     pcfg.fog_rt_height = (int)rh;
                 }
 
+                /* PLANAR REFLECTION FIRST -- a second render whose
+                 * per-frame renderer state must not be the last one set;
+                 * see the note at the Scene View's call. */
+                jce_scene_renderer_render_planar_reflection(
+                    s_scene_renderer, s_scene, s_camera, s_last_dt);
+                /* The overlay cameras, SUBMITTED FIRST and DRAWN LAST --
+                 * see the function's own note, and the planar reflection's
+                 * immediately above: whichever render runs last owns the
+                 * per-frame renderer state the composites below read. */
+                jce_default_main_render_camera_overlays(base, &pcfg);
                 jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                           base, s_last_dt, &pcfg);
+                jce_default_main_physics_debug(base, svc);
 
                 /* Composite the fog into the scene RT.  view_base+16 matches
                  * the editor's slot and MUST be greater than the fog render
@@ -1579,8 +2339,29 @@ static void app_draw(const JceServices *svc, void *ud)
                         s_scene_renderer, (uint16_t)(base + 16),
                         pcfg.scene_frame_buffer);
                 jce_scene_renderer_composite_ssr(
-                    s_scene_renderer, (uint16_t)(base + 19),
+                    s_scene_renderer,
+                    (uint16_t)(base + JCE_VIEW_SR_REFLECTION_COMPOSITE_OFFSET),
                     pcfg.scene_frame_buffer);
+                /* SAME VIEW, SECOND: one stage, two producers, and the planar
+                 * probe is the accurate one wherever it applies.  Both
+                 * viewports and this runtime call it at the same offset --
+                 * wiring a pass into one of them only is the editor-vs-build
+                 * divergence this tree keeps finding. */
+                {
+                    JceFrameBufferHandle planar_dst = { pcfg.scene_frame_buffer };
+                    jce_scene_renderer_composite_planar(
+                        s_scene_renderer,
+                        (uint16_t)(base + JCE_VIEW_SR_REFLECTION_COMPOSITE_OFFSET),
+                        planar_dst);
+                }
+                /* Same offset the editor viewport uses -- see the note there. */
+                {
+                    JceFrameBufferHandle gi_dst = { pcfg.scene_frame_buffer };
+                    jce_scene_renderer_composite_ssgi(
+                        s_scene_renderer,
+                        (uint16_t)(base + JCE_VIEW_SR_SSGI_COMPOSITE_OFFSET),
+                        gi_dst);
+                }
 
                 JceTextureHandle color = {
                     jce_offscreen_target_get_color_texture(s_post_target) };
@@ -1624,7 +2405,12 @@ static void app_draw(const JceServices *svc, void *ud)
                     if (jce_postfx_is_enabled(pfx, (JcePostFXType)i)) {
                         any_effect = true; break;
                     }
-                if (any_effect || has_fullscreen) {
+                /* taa_on for the same reason want_bridge needs it: TAA is not
+                 * one of the JCE_POSTFX_* types, and its resolve happens
+                 * inside jce_postfx_apply().  Without this the bridge would be
+                 * built, the scene jittered, and the chain that undoes the
+                 * jitter never run -- which is worse than no TAA at all. */
+                if (any_effect || has_fullscreen || taa_on) {
                     jce_postfx_resize(pfx, rw, rh);
                     if (jce_gfx_texture_valid(color)) {
                         jce_postfx_apply(pfx, color, depth);
@@ -1634,20 +2420,79 @@ static void app_draw(const JceServices *svc, void *ud)
                         }
                     }
                 }
+                /* AFTER the colour pass and after the resolve, with the SAME
+                 * clean view + proj.  Records them as next frame's reproject
+                 * source and disables TAA on the shared pipeline so it cannot
+                 * leak into any other postfx invocation.  Safe unconditionally,
+                 * which is why it is not inside the taa_on branch: "previous"
+                 * must keep advancing even on frames TAA was off, or the first
+                 * frame after it comes back reprojects from a stale camera. */
+                jce_scene_renderer_taa_end_frame(s_scene_renderer, &view, &proj);
             }
         }
     }
     if (!present_done) {
+        /* DIRECT TO BACKBUFFER: a "keep" clear mode cannot be honoured here
+         * and is not silently dropped.  The backbuffer is a rotating
+         * swapchain, so "what was already in it" is a buffer from two or three
+         * frames ago, not the last frame the author is thinking of -- the mode
+         * would produce a stutter, not a trail.  Unity documents the same
+         * limit for Don't Clear.  Authoring one of these modes on a scene with
+         * no post-processing therefore gets the full clear plus this line,
+         * rather than a difference nobody can explain. */
+        if (s_camera_keep_color || s_camera_keep_depth) {
+            static bool warned_keep_backbuffer = false;
+            if (!warned_keep_backbuffer) {
+                warned_keep_backbuffer = true;
+                LOG_WARN("app", "%s", "camera: Depth Only / Don't Clear need "
+                         "an offscreen target and this frame goes straight to "
+                         "the backbuffer (no post-processing is enabled); "
+                         "clearing fully instead");
+            }
+        }
+        /* Configure THE VIEW THE SCENE ACTUALLY RENDERS INTO.
+         *
+         * jce_renderer_begin_frame_3d sets the view rect, the camera
+         * transform and BGFX_VIEW_MODE_SEQUENTIAL on the view id it is
+         * handed.  This call passed JCE_VIEW_MAIN_3D (0) while the render
+         * below has been based at JCE_VIEW_RUNTIME_GAME (30) ever since the
+         * base was moved off 0 to stop the scene renderer's own passes
+         * colliding with the fixed ids 0/1/2.  That move was right; it left
+         * this line behind.
+         *
+         * bgfx clamps an unset view rect to 1x1 (bx::max(width, 1)), so the
+         * shipped runtime rendered the entire game into ONE PIXEL whenever no
+         * post-processing was enabled -- which is the common case this branch
+         * exists for.  The capture showed it exactly: a single lit pixel at
+         * (0,0) holding the sky colour and 921599 black ones, with a correct
+         * 1280x720 pitch and size, and jce_accept.py's screenshot stage
+         * failing as "BLANK capture" without being able to say why.  The
+         * projection and the sequential submit order were missing on view 30
+         * for the same reason. */
         jce_renderer_begin_frame_3d(svc->renderer, svc->window,
-                                    s_camera, JCE_VIEW_MAIN_3D);
+                                    s_camera, JCE_VIEW_RUNTIME_GAME);
         JceSceneRenderConfig cfg = s_default_scene_cfg();
         /* Direct-to-backbuffer: scene_frame_buffer stays UINT16_MAX (backbuffer),
          * which is exactly where the color pass draws — the occlusion proxy view
          * binds to the same backbuffer.  Give it the window rect so the proxy
          * raster matches. */
         if (sw > 0 && sh > 0) { cfg.viewport_width = sw; cfg.viewport_height = sh; }
+        /* Base JCE_VIEW_RUNTIME_GAME, not JCE_VIEW_MAIN_3D.  A scene-renderer
+         * base spans ~117 offsets, so basing this fallback at 0 put the scene
+         * renderer's own passes on top of the FIXED ids in the same range --
+         * offset 2 is the SSAO sample pass and absolute 2 is JCE_VIEW_DEBUG,
+         * which begin_frame_3d above touches unconditionally in this same
+         * frame.  bgfx view state is last-write-wins, so the two bindings
+         * fight and one of them silently stops producing what it meant to.
+         * That is the same defect that hid the ECS-UI overlay.
+         *
+         * This costs nothing: the two render paths are mutually exclusive by
+         * the !present_done above, so the shipped-runtime base is free here.
+         * View 0 still clears the backbuffer and sorts first, being lower. */
+        jce_default_main_render_camera_overlays(JCE_VIEW_RUNTIME_GAME, &cfg);
         jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
-                                  JCE_VIEW_MAIN_3D, s_last_dt, &cfg);
+                                  JCE_VIEW_RUNTIME_GAME, s_last_dt, &cfg);
+        jce_default_main_physics_debug(JCE_VIEW_RUNTIME_GAME, svc);
     }
 
     /* ECS-UI overlay on top of the 3D scene, into the backbuffer on the
@@ -1667,7 +2512,16 @@ static void app_draw(const JceServices *svc, void *ud)
             JceUIPointer ptr;
             const JceUIPointer *ptr_arg = NULL;
             /* Feed the pointer whenever the OS cursor is actually visible:
-             * uncaptured, or temporarily released by the hold-ALT preset. */
+             * uncaptured, or temporarily released by the hold-ALT preset.
+             *
+             * `valid` is DERIVED FROM GEOMETRY, not asserted.  jce_input_mouse_pos
+             * is written only by motion events, and SDL stops delivering those
+             * once the cursor leaves an ungrabbed window -- so the coordinate
+             * freezes at its last in-window sample.  Asserting valid=true on a
+             * frozen coordinate leaves whichever UIButton was under it stuck in
+             * its hover tint forever, and lets a press begun inside the window
+             * complete its click after the release happened outside.  The editor
+             * Game View has always tested the panel rect; this is that test. */
             if ((!s_cursor_captured || s_preset_alt_active) && svc->input) {
                 float mx = 0.0f, my = 0.0f;
                 jce_input_mouse_pos(svc->input, &mx, &my);
@@ -1675,27 +2529,36 @@ static void app_draw(const JceServices *svc, void *ud)
                 ptr.y     = my;
                 ptr.down  = jce_input_mouse_button(svc->input,
                                                    JCE_MOUSE_BUTTON_LEFT);
-                ptr.valid = true;
-                ptr_arg   = &ptr;
+                ptr.valid = (mx >= 0.0f && my >= 0.0f &&
+                             mx < (float)sw && my < (float)sh);
+                if (ptr.valid) ptr_arg = &ptr;
             }
             /* ── InputField text/edit channel (single-line text entry) ──
-             * Forward editing keys to the focused ECS-UI InputField using the
-             * polling input API (these scancodes are pollable), then toggle OS
-             * text input as focus changes.  We feed keys BEFORE the render so
-             * they apply to the focus established last frame, and the render
-             * below re-evaluates focus from this frame's pointer.
+             * Two channels, and they are not interchangeable:
              *
-             * NOTE: the polling JceInput API exposes no UTF-8 character stream
-             * (only key state), so the *character* channel below is a clearly
-             * marked hook: when this drop-in main is replaced with a project
-             * main.c that registers a JceAppDesc.on_event callback, route
-             *   JCE_EVENT_TEXT_INPUT  → jce_ui_canvas_text_input(s_ui_canvas, ev.text.text)
-             *   JCE_EVENT_KEY_DOWN     → jce_ui_canvas_key_edit(s_ui_canvas, ev.key.scancode, ev.key.mod)
-             *   JCE_EVENT_MOUSE_WHEEL  → jce_ui_canvas_scroll(s_ui_canvas, ev.wheel.x, ev.wheel.y)
-             * (the reference wiring).  Starting OS text input here means SDL is
-             * already emitting those text events for that future callback.
-             * See deviations/followups. */
+             *   CHARACTERS come from the platform's text/IME layer as composed
+             *   UTF-8 (jce_input_text).  A scancode cannot express them -- one
+             *   keystroke can produce several bytes and an IME commit several
+             *   codepoints -- so this is the only channel that can type a
+             *   non-ASCII character.  It used to be absent here entirely: this
+             *   loop started OS text input on focus, SDL duly opened the IME
+             *   over the game, and nothing in the process was listening.  The
+             *   editor Game View had the channel; the shipped exe did not.
+             *
+             *   EDITING KEYS come from the key state, and must honour OS auto-
+             *   repeat (jce_input_key_repeated, not _key_pressed): a strict
+             *   rising edge deletes exactly one byte no matter how long
+             *   Backspace is held, which is what the shipped game used to do
+             *   while the editor deleted the whole field.
+             *
+             * Both feed BEFORE the render so they apply to the focus
+             * established last frame; the render below re-evaluates focus from
+             * this frame's pointer. */
             if (svc->input && jce_ui_canvas_focused_input(s_ui_canvas)) {
+                const char *typed = jce_input_text(svc->input);
+                if (typed && typed[0])
+                    jce_ui_canvas_text_input(s_ui_canvas, typed);
+
                 static const struct { int key; } s_edit_keys[] = {
                     { JCE_KEY_BACKSPACE }, { JCE_KEY_DELETE },
                     { JCE_KEY_LEFT }, { JCE_KEY_RIGHT },
@@ -1704,25 +2567,65 @@ static void app_draw(const JceServices *svc, void *ud)
                     { JCE_KEY_ESCAPE },
                 };
                 for (size_t i = 0; i < sizeof(s_edit_keys)/sizeof(s_edit_keys[0]); ++i)
-                    if (jce_input_key_pressed(svc->input, s_edit_keys[i].key))
+                    if (jce_input_key_repeated(svc->input, s_edit_keys[i].key))
                         jce_ui_canvas_key_edit(s_ui_canvas, s_edit_keys[i].key, 0);
             }
 
+            /* THE HOST PUSHES THE SAFE AREA -- the canvas is L4 and may not
+             * reach into os/platform for it (check_layer_dependencies would
+             * refuse, and rightly).  Pushed EVERY FRAME rather than once,
+             * because it changes with orientation and with a window moving
+             * between displays, and a value read at startup is the version of
+             * this feature that works until the player rotates the phone. */
+            {
+                int sax = 0, say = 0, saw = 0, sah = 0;
+                jce_window_get_safe_area(svc->window, &sax, &say, &saw, &sah);
+                jce_ui_canvas_set_safe_area(s_ui_canvas, sax, say, saw, sah);
+            }
             jce_ui_canvas_render(s_ui_canvas, s_scene, JCE_VIEW_UI, UINT16_MAX,
                                  (float)sw, (float)sh, ptr_arg, s_last_dt);
 
+            /* ── The level-transition fade ─────────────────────────────
+             *
+             * jce_runtime_transition_alpha is what the FADE_OUT / LOAD /
+             * FADE_IN state machine computes so the swap can be hidden, and
+             * its own header says "the app / editor reads this each frame
+             * ... and draws a screen-space quad at this opacity".  Nothing
+             * read it, in either host -- so even once a script could request
+             * a scene, the level would visibly POP: one frame of the old
+             * level, then the new one, with the fade the runtime had already
+             * computed thrown away.
+             *
+             * Drawn AFTER the canvas, on the same UI view, so it covers the
+             * HUD too: a fade that leaves the health bar floating over black
+             * is not a fade.  alpha 0 draws nothing at all. */
+            {
+                const float fade = jce_runtime_transition_alpha(s_runtime);
+                if (fade > 0.0f && svc->renderer) {
+                    const uint8_t a = (uint8_t)((fade < 1.0f ? fade : 1.0f)
+                                                * 255.0f + 0.5f);
+                    jce_draw_filled_rect(svc->renderer, 0.0f, 0.0f,
+                                         (float)sw, (float)sh,
+                                         jce_rgba(0, 0, 0, a));
+                }
+            }
+
             /* ── ScrollView wheel channel ──────────────────────────────
-             * Feed the (vertical) mouse wheel to the scroll view under the
-             * pointer, AFTER the render so the canvas has resolved this frame's
-             * hovered scroll view.  The polling JceInput exposes only a vertical
-             * wheel (+y = up), matching jce_ui_canvas_scroll's dy convention; a
-             * project main.c with an on_event callback can additionally forward
-             * ev.wheel.x for horizontal scrolling (see reference wiring above).
-             * Fire-and-forget: a no-op when no scroll view is hovered. */
-            if (ptr_arg && svc->input) {
-                float wheel = jce_input_mouse_wheel(svc->input);
-                if (wheel != 0.0f)
-                    jce_ui_canvas_scroll(s_ui_canvas, 0.0f, wheel);
+             * Feed the wheel to the scroll view under the pointer, AFTER the
+             * render so the canvas has resolved this frame's hovered scroll
+             * view.  BOTH axes: the horizontal delta was already on the input
+             * wire and simply had no accumulator, so this used to pass a
+             * literal 0.0f and a UIScrollView with `horizontal` authored
+             * scrolled sideways in the editor and was frozen in the shipped
+             * exe.  Gated on `svc->input` alone rather than on the pointer: a
+             * scrollable HUD list is exactly the thing a captured-cursor game
+             * has, and jce_ui_canvas_scroll already no-ops when nothing is
+             * hovered.  Fire-and-forget. */
+            if (svc->input) {
+                float wheel   = jce_input_mouse_wheel(svc->input);
+                float wheel_h = jce_input_mouse_wheel_h(svc->input);
+                if (wheel != 0.0f || wheel_h != 0.0f)
+                    jce_ui_canvas_scroll(s_ui_canvas, wheel_h, wheel);
             }
 
             /* OS text-input follows InputField focus (toggle on the edge so we
@@ -1737,30 +2640,13 @@ static void app_draw(const JceServices *svc, void *ud)
                 }
             }
 
-            /* Drain the click the canvas state machine recorded this frame
-             * (set only on the release frame, over the same button) and fire
-             * the button's authored on_click_handler through the script VM.
-             * No-op when nothing was clicked / no handler / no runtime. */
-            if (ptr_arg && s_runtime && s_scene) {
-                uint64_t clicked = jce_ui_canvas_last_clicked(s_ui_canvas);
-                if (clicked) {
-                    JceUIButtonComponent *bt =
-                        jce_scene_get_ui_button(s_scene, (JceEntity)clicked);
-                    if (bt)
-                        jce_runtime_dispatch_ui_click(s_runtime, clicked,
-                                                      bt->on_click_handler);
-                }
-                /* Slider drag / toggle flip / dropdown select → on_value_changed;
-                 * InputField edits → on_value_changed; RETURN → on_submit.  The
-                 * runtime resolves the widget on its own scene and fires the
-                 * authored handler; each is a clean no-op when none authored. */
-                uint64_t vc = jce_ui_canvas_last_value_changed(s_ui_canvas);
-                if (vc) jce_runtime_dispatch_ui_value_changed(s_runtime, vc);
-                uint64_t tc = jce_ui_canvas_last_text_changed(s_ui_canvas);
-                if (tc) jce_runtime_dispatch_ui_text_changed(s_runtime, tc);
-                uint64_t sub = jce_ui_canvas_last_submitted(s_ui_canvas);
-                if (sub) jce_runtime_dispatch_ui_submit(s_runtime, sub);
-            }
+            /* Drain all four canvas event channels and fire their authored
+             * handlers.  NOT gated on the pointer: two of the four are set by
+             * the keyboard path outside the render and are cleared on read, so
+             * skipping the read latches the event and fires it on some later,
+             * unrelated frame.  One shared engine seam with the editor's Play
+             * loop, so the two lists cannot drift again. */
+            jce_runtime_dispatch_ui_events(s_runtime, s_ui_canvas, s_scene);
         }
     }
 

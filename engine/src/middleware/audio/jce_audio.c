@@ -9,6 +9,8 @@
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/audio/jce_m4a_decode.h>
 #include <jce/os/core/jce_log.h>
+/* jce_fs_host_read_all, for the host branch of the streaming loader. */
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/resource/jce_pak_loader.h>
@@ -24,6 +26,7 @@
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
 #include "middleware/audio/jce_pcm_convert.h"
+#include "middleware/audio/jce_audio_decode.h"
 
 #include <miniaudio.h>
 #include <SDL3/SDL.h>
@@ -73,15 +76,53 @@ typedef struct {
     float  feedback;
 } FvAllpass;
 
+/* A delay line long enough for the pre-delay and the early taps.
+ *
+ * 250 ms at 48 kHz is 12000 frames; the preset's pre_delay_ms is documented
+ * 0..~200 and the component's reflectionsDelay 0..0.3 s, so one line sized
+ * for the larger of the two covers both with room to clamp. */
+#define JCE_FV_MAX_PREDELAY_MS 320.0f
+
+typedef struct {
+    float *buf;
+    int    size;
+    int    pos;
+} FvDelay;
+
+static inline float fv_delay_tap(const FvDelay *d, int frames_back)
+{
+    if (!d->buf || d->size <= 0) return 0.0f;
+    if (frames_back < 0) frames_back = 0;
+    if (frames_back >= d->size) frames_back = d->size - 1;
+    int i = d->pos - frames_back;
+    while (i < 0) i += d->size;
+    return d->buf[i];
+}
+
+static inline void fv_delay_push(FvDelay *d, float x)
+{
+    if (!d->buf || d->size <= 0) return;
+    if (++d->pos >= d->size) d->pos = 0;
+    d->buf[d->pos] = x;
+}
+
 typedef struct {
     FvComb    comb[JCE_FV_MAX_CH][JCE_FV_NUM_COMBS];
     FvAllpass allpass[JCE_FV_MAX_CH][JCE_FV_NUM_ALLPASS];
+    /* One line per channel, tapped twice: once for the late tail's PRE-DELAY
+     * (the silence before a room answers) and once for the EARLY REFLECTION
+     * (the first bounce off a wall, which arrives before the diffuse tail and
+     * is what tells a listener how big the room is). */
+    FvDelay   predelay[JCE_FV_MAX_CH];
     int       channels;
     int       sample_rate;
     float     wet;       /* wet output gain */
     float     dry;       /* dry passthrough gain */
     float     roomsize;  /* comb feedback (0..~0.98) */
     float     damp;      /* comb LP damping (0..1) */
+    int       predelay_frames;  /* late tail input delay */
+    int       early_frames;     /* early reflection tap */
+    float     early_gain;       /* 0 = no early reflection */
     bool      allocated;
 } Freeverb;
 
@@ -98,11 +139,25 @@ typedef struct {
  * signal passing through it.  One node may be spliced into a bus group's
  * output edge or a voice's output edge so the inserts process exactly the
  * signal flowing to the bus/endpoint.  The DSP math is device-independent and
- * unit-tested offline; here we just feed it the live node-graph buffer. */
+ * unit-tested offline; here we just feed it the live node-graph buffer.
+ *
+ * It is also where a BUS IS METERED (jce_audio_bus_get_peak), which is why a
+ * bus can have one with an empty chain.  Putting the meter here rather than
+ * in a second node type is deliberate: this node already exists, already
+ * copies the whole block, and is already spliced/torn down by one pair of
+ * functions, so a meter costs one compare per sample and no new lifecycle.
+ * What it measures is the node's OUTPUT -- post-chain, and post-fader
+ * because the bus group applies its gain upstream of here. */
 typedef struct {
     ma_node_base      base;
     JceAudioDspChain *chain;   /* owned; NULL = passthrough */
     bool              inited;
+    /* Peak |sample| of the output since the last read, as raw float bits.
+     * Written by the audio thread, read-and-cleared by any thread.  Bits are
+     * compared as ints: for NON-NEGATIVE IEEE-754 floats the bit pattern
+     * orders exactly as the value does, so max-of-bits IS max-of-floats and
+     * the CAS loop needs no float round-trip. */
+    SDL_AtomicInt     peak_bits;
 } DspNode;
 
 /* Each sound owns a block of decoded PCM (s16) data. */
@@ -118,6 +173,26 @@ typedef struct {
      * exhaust the 64-slot table.  A slot is playback-shared: many voices carry
      * independent read cursors over the same PCM. */
     char       path[JCE_AUDIO_SOUND_PATH_MAX];
+    /* STREAMING slots hold the ENCODED bytes instead of decoded PCM, and each
+     * voice decodes them on demand through its own ma_decoder.  A five-minute
+     * stereo track costs its compressed size resident (a few MB) rather than
+     * ~50 MB of s16, and nothing is decoded up front.  pcm_data stays NULL for
+     * these, which is what jce_audio_get_pcm_data reports and what makes a
+     * streaming slot distinguishable from a decoded one. */
+    void      *enc_data;      /* encoded bytes, or NULL; see enc_owned */
+    size_t     enc_size;
+    bool       streaming;
+    /* enc_data is NOT always ours to free.  A STORED pak entry is a flat
+     * pointer into the archive blob, so those bytes are already resident and
+     * copying them would double the cost this entry point exists to avoid.
+     * enc_owned says which case this is; enc_pak holds the reference that
+     * keeps the blob alive underneath a borrowed pointer. */
+    bool       enc_owned;
+    const JcePakArchive *enc_pak;
+    /* HOST path: nothing is held at all.  Each voice opens the file through
+     * ma_decoder_init_file and reads it incrementally, so a five-minute track
+     * costs its decoder buffers and nothing else.  The path is slot->path. */
+    bool       from_file;
 } SoundSlot;
 
 /* A named output bus backed by a ma_sound_group node. */
@@ -126,6 +201,20 @@ typedef struct {
     char           name[JCE_BUS_NAME_MAX];
     ma_sound_group group;     /* node: voices attach here, group -> reverb/endpoint */
     DspNode        dsp;       /* insert chain spliced group -> dsp -> reverb/endpoint */
+    /* AUX SEND.  A console send is a PARALLEL tap: the bus keeps feeding its
+     * normal output AND a scaled copy goes to another bus.  A single output
+     * edge cannot express that, so the terminal feeds a splitter instead --
+     * output 0 is the normal target, output 1 is the send, and the send
+     * amount is that bus's output volume.
+     *
+     * Created lazily: a bus with no send has no splitter and its graph is
+     * byte-identical to what it was before sends existed. */
+    ma_splitter_node send_split;
+    bool             split_inited;
+    /* Parallel arrays indexed by SLOT; slot k is splitter output bus k+1,
+     * output 0 being the bus's normal path.  dest -1 = free. */
+    int              send_dest[JCE_AUDIO_BUS_MAX_SENDS];
+    float            send_amount[JCE_AUDIO_BUS_MAX_SENDS];
 } BusSlot;
 
 /* Each voice is an independent playback instance. */
@@ -136,6 +225,13 @@ typedef struct {
     int             sound_slot;
     uint32_t        generation; /* bumped on teardown; packed into JceVoice to reject stale handles */
     uint64_t        play_seq;   /* allocation order, for oldest-voice stealing when the pool is full */
+    int             priority;   /* higher survives; 0 = normal.  See jce_audio.h
+                                 * for why 0 and not Unity's inverted scale. */
+    /* Streaming voices decode from the sound's encoded bytes.  Per VOICE, not
+     * per sound: two voices on one streaming clip need independent read
+     * cursors, exactly as two ma_audio_buffers do over shared PCM. */
+    ma_decoder      dec;
+    bool            dec_inited;
     ma_lpf_node     lpf;        /* occlusion muffle filter, inserted sound→lpf→endpoint */
     bool            lpf_ok;
     float           lpf_cutoff; /* current cutoff Hz; avoids reinit churn when unchanged */
@@ -160,6 +256,11 @@ typedef struct {
 struct JceAudio {
     ma_engine   engine;
     bool        engine_inited;
+    /* True when this engine is NOT registered with the shared output device,
+     * so nothing pumps it but the caller.  jce_audio_render_offline refuses
+     * any other engine: two pumps on one graph race for the same read
+     * cursors, and that has to be impossible rather than merely documented. */
+    bool        offline;
 
     SoundSlot   sounds[JCE_MAX_SOUNDS];
     bool        sound_used[JCE_MAX_SOUNDS];
@@ -233,6 +334,14 @@ static bool fv_alloc(Freeverb *fv, int channels, int sample_rate)
             if (!a->buf) return false;
             a->size = len; a->pos = 0; a->feedback = 0.5f;
         }
+        {
+            int dl = (int)(JCE_FV_MAX_PREDELAY_MS * 0.001f
+                           * (float)fv->sample_rate) + 2;
+            FvDelay *d = &fv->predelay[ch];
+            d->buf = (float *)JCE_CALLOC((size_t)dl, sizeof(float));
+            if (!d->buf) return false;
+            d->size = dl; d->pos = 0;
+        }
     }
     fv->allocated = true;
     return true;
@@ -249,13 +358,29 @@ static void fv_free(Freeverb *fv)
             JCE_FREE(fv->allpass[ch][i].buf);
             fv->allpass[ch][i].buf = NULL;
         }
+        JCE_FREE(fv->predelay[ch].buf);
+        fv->predelay[ch].buf = NULL;
+        fv->predelay[ch].size = 0;
+        fv->predelay[ch].pos  = 0;
     }
     fv->allocated = false;
 }
 
-/* Push tuning (wet/dry/roomsize/damp) into the comb feedback coefficients. */
+/* Push tuning into the comb / allpass / delay coefficients.
+ *
+ * `diffusion` drives the ALLPASS feedback, which is what diffusion is: how
+ * much a reflection is smeared rather than passed through.  Freeverb's fixed
+ * 0.5 is the middle of the usable range, so 0.5 reproduces the old sound
+ * exactly and the parameter opens it in both directions.  Clamped to 0.2..0.8
+ * -- past that an allpass rings rather than diffuses, which is an effect but
+ * not the one the slider is named after.
+ *
+ * `predelay_ms` and `early_ms` become tap offsets; `early_gain` 0 disables the
+ * early tap entirely, so a preset that does not ask for one costs one branch. */
 static void fv_set_params(Freeverb *fv, float wet, float dry,
-                          float roomsize, float damp)
+                          float roomsize, float damp,
+                          float diffusion, float predelay_ms,
+                          float early_ms, float early_gain)
 {
     if (wet < 0.0f) wet = 0.0f;
     if (dry < 0.0f) dry = 0.0f;
@@ -267,21 +392,54 @@ static void fv_set_params(Freeverb *fv, float wet, float dry,
     for (int ch = 0; ch < fv->channels; ++ch)
         for (int i = 0; i < JCE_FV_NUM_COMBS; ++i)
             fv_comb_set(&fv->comb[ch][i], roomsize, damp);
+
+    float ap = (diffusion <= 0.0f) ? 0.5f : diffusion;
+    if (ap < 0.2f) ap = 0.2f;
+    if (ap > 0.8f) ap = 0.8f;
+    for (int ch = 0; ch < fv->channels; ++ch)
+        for (int i = 0; i < JCE_FV_NUM_ALLPASS; ++i)
+            fv->allpass[ch][i].feedback = ap;
+
+    const float max_ms = JCE_FV_MAX_PREDELAY_MS;
+    if (predelay_ms < 0.0f) predelay_ms = 0.0f;
+    if (predelay_ms > max_ms) predelay_ms = max_ms;
+    if (early_ms < 0.0f) early_ms = 0.0f;
+    if (early_ms > max_ms) early_ms = max_ms;
+    fv->predelay_frames = (int)(predelay_ms * 0.001f * (float)fv->sample_rate);
+    fv->early_frames    = (int)(early_ms    * 0.001f * (float)fv->sample_rate);
+    fv->early_gain      = (early_gain > 0.0f) ? early_gain : 0.0f;
 }
 
-/* Process one channel's block in place: out = dry*in + wet*reverb(in). */
+/* Process one channel's block: out = dry*in + wet*(early + late(delayed in)).
+ *
+ * THE ORDER IS THE ROOM.  A sound reaches a listener three times: direct,
+ * then off the nearest surfaces (the EARLY reflection, one clear echo), then
+ * as the diffuse tail once the room has smeared everything together (the LATE
+ * reverb, which starts after the PRE-DELAY).  Freeverb alone produced only
+ * the third of those, starting immediately, which is why every room sounded
+ * like the same room at a different volume. */
 static void fv_process_channel(Freeverb *fv, int ch,
                                const float *in, float *out, ma_uint32 n)
 {
     const float gain = 0.015f; /* Freeverb fixed input gain */
+    FvDelay *dl = &fv->predelay[ch];
     for (ma_uint32 s = 0; s < n; ++s) {
-        float x = in[s] * gain;
+        fv_delay_push(dl, in[s]);
+
+        /* Late tail, fed by the pre-delayed input. */
+        float x = fv_delay_tap(dl, fv->predelay_frames) * gain;
         float acc = 0.0f;
         for (int i = 0; i < JCE_FV_NUM_COMBS; ++i)
             acc += fv_comb_process(&fv->comb[ch][i], x);
         for (int i = 0; i < JCE_FV_NUM_ALLPASS; ++i)
             acc = fv_allpass_process(&fv->allpass[ch][i], acc);
-        out[s] = in[s] * fv->dry + acc * fv->wet;
+
+        /* Early reflection: one clean tap, not through the network. */
+        float early = (fv->early_gain > 0.0f)
+                    ? fv_delay_tap(dl, fv->early_frames) * fv->early_gain
+                    : 0.0f;
+
+        out[s] = in[s] * fv->dry + (acc + early) * fv->wet;
     }
 }
 
@@ -363,6 +521,27 @@ static void dsp_node_process(ma_node *node,
            (size_t)n * (size_t)ch * sizeof(float));
     if (dn->chain)
         jce_audio_dsp_chain_process(dn->chain, frames_out[0], n);
+
+    /* Meter the block AFTER the inserts, so the number is what this bus
+     * actually put out.  `>` never holds for NaN, so a NaN sample is skipped
+     * rather than pinning the meter at a value no reader can clear. */
+    const float *o = frames_out[0];
+    float        pk = 0.0f;
+    const ma_uint32 cnt = n * (ma_uint32)ch;
+    for (ma_uint32 i = 0; i < cnt; ++i) {
+        float a = o[i] < 0.0f ? -o[i] : o[i];
+        if (a > pk) pk = a;
+    }
+    if (pk > 0.0f) {
+        int bits;
+        memcpy(&bits, &pk, sizeof bits);
+        for (;;) {   /* CAS-max: only this thread writes, but a reader may
+                      * clear between our load and our store. */
+            int cur = SDL_GetAtomicInt(&dn->peak_bits);
+            if (cur >= bits) break;
+            if (SDL_CompareAndSwapAtomicInt(&dn->peak_bits, cur, bits)) break;
+        }
+    }
     *frame_count_out = n;
 }
 
@@ -376,6 +555,22 @@ static ma_node_vtable g_dsp_vtable = {
 
 /* Forward decl: defined below near the voice routing helpers. */
 static ma_node *voice_output_src(const VoiceSlot *v);
+
+/* The node a bus's audio EXITS FROM -- the far end of its insert chain.
+ *
+ * A bus is `group -> [dsp] -> <output>`, so the terminal is the dsp node when
+ * one has been stood up and the group otherwise.  Every site that re-routes a
+ * bus has to attach THIS node, not the group, or it silently bypasses the
+ * bus's insert effects.
+ *
+ * It is one function because the chain is going to grow: an aux send adds a
+ * splitter after the dsp, and a conditional spelled out at each call site is
+ * how the reverb re-route came to know about the dsp node separately from the
+ * code that created it. */
+static ma_node *bus_terminal_node(BusSlot *b)
+{
+    return b->dsp.inited ? (ma_node *)&b->dsp.base : (ma_node *)&b->group;
+}
 
 /* Create the global reverb node and re-route every live bus group through it.
  * On any failure the groups keep their endpoint attachment (dry-only). */
@@ -397,7 +592,8 @@ static bool audio_init_reverb(JceAudio *audio)
         LOG_WARN("jce_audio", "reverb: freeverb alloc failed");
         return false;
     }
-    fv_set_params(&audio->reverb.fv, 0.0f, 1.0f, 0.5f, 0.5f);
+    fv_set_params(&audio->reverb.fv, 0.0f, 1.0f, 0.5f, 0.5f,
+                  0.5f, 0.0f, 0.0f, 0.0f);
 
     ma_node_config cfg = ma_node_config_init();
     cfg.vtable          = &g_reverb_vtable;
@@ -419,16 +615,13 @@ static bool audio_init_reverb(JceAudio *audio)
     audio->reverb_inited = true;
     audio->reverb_wet    = 0.0f;
 
-    /* Route any already-created bus groups through the reverb node.  When a
-     * bus has insert effects, its terminal node is the dsp node, not the
-     * group, so reattach that edge instead. */
+    /* Route any already-created buses through the reverb node.  It is the
+     * bus's TERMINAL that moves, not its group -- attaching the group would
+     * route around the bus's own insert effects. */
     for (int i = 0; i < JCE_MAX_BUSES; ++i) {
-        if (audio->buses[i].used) {
-            ma_node *src = audio->buses[i].dsp.inited
-                         ? (ma_node *)&audio->buses[i].dsp.base
-                         : (ma_node *)&audio->buses[i].group;
-            ma_node_attach_output_bus(src, 0, &audio->reverb.base, 0);
-        }
+        if (audio->buses[i].used)
+            ma_node_attach_output_bus(bus_terminal_node(&audio->buses[i]), 0,
+                                      &audio->reverb.base, 0);
     }
     /* Re-route direct voices (no bus) that were attached to the endpoint
      * before the reverb node existed, so the global tail covers them too. */
@@ -481,6 +674,7 @@ static bool dsp_node_ensure(JceAudio *audio, DspNode *dn,
         LOG_WARN("jce_audio", "insert: dsp chain alloc failed");
         return false;
     }
+    SDL_SetAtomicInt(&dn->peak_bits, 0);   /* meter starts at silence */
 
     ma_node_config cfg = ma_node_config_init();
     cfg.vtable          = &g_dsp_vtable;
@@ -675,7 +869,9 @@ bool jce_audio_master_tap_set(JceAudioMasterTapFn fn, void *ud)
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-JceAudio *jce_audio_create(void)
+/* Both engine flavours differ in exactly one thing: whether the shared output
+ * device pumps this graph, or the caller does. */
+static JceAudio *audio_create_common(bool offline)
 {
     JceAudio *audio = (JceAudio *)JCE_CALLOC(1, sizeof(*audio));
     if (!audio) return NULL;
@@ -693,15 +889,19 @@ JceAudio *jce_audio_create(void)
     }
 
     audio->engine_inited = true;
+    audio->offline       = offline;
 
-    /* Best effort: without an output device the engine still works (silent). */
-    master_device_ensure();
-    if (!master_register(audio)) {
-        LOG_ERROR("jce_audio", "master mix slots exhausted (%d live engines)",
-                  JCE_AUDIO_MAX_ENGINES);
-        ma_engine_uninit(&audio->engine);
-        JCE_FREE(audio);
-        return NULL;
+    if (!offline) {
+        /* Best effort: without an output device the engine still works
+         * (silent). */
+        master_device_ensure();
+        if (!master_register(audio)) {
+            LOG_ERROR("jce_audio", "master mix slots exhausted (%d live engines)",
+                      JCE_AUDIO_MAX_ENGINES);
+            ma_engine_uninit(&audio->engine);
+            JCE_FREE(audio);
+            return NULL;
+        }
     }
 
     for (int i = 0; i < JCE_MAX_VOICES; i++) {
@@ -709,9 +909,13 @@ JceAudio *jce_audio_create(void)
         audio->voices[i].bus        = -1;
     }
 
-    LOG_SUCCESS("jce_audio", "miniaudio engine initialized");
+    LOG_SUCCESS("jce_audio", "miniaudio engine initialized%s",
+                offline ? " (offline)" : "");
     return audio;
 }
+
+JceAudio *jce_audio_create(void)         { return audio_create_common(false); }
+JceAudio *jce_audio_create_offline(void) { return audio_create_common(true);  }
 
 static void uninit_voice(VoiceSlot *v)
 {
@@ -728,6 +932,13 @@ static void uninit_voice(VoiceSlot *v)
         v->is_stream = false;
         v->stream_on_read = NULL;
         v->stream_ud = NULL;
+    } else if (v->dec_inited) {
+        /* A STREAMING CLIP's decoder.  Distinct from is_stream above, which is
+         * the caller-driven pull ring: this one owns a ma_decoder over the
+         * sound's encoded bytes and must be torn down with the voice, or the
+         * next occupant of this slot inherits a live decoder. */
+        ma_decoder_uninit(&v->dec);
+        v->dec_inited = false;
     } else {
         ma_audio_buffer_uninit(&v->buffer);
     }
@@ -754,6 +965,13 @@ void jce_audio_destroy(JceAudio *audio)
      * A bus insert node is downstream of its group, so uninit it first. */
     for (int i = 0; i < JCE_MAX_BUSES; i++) {
         if (audio->buses[i].used) {
+            /* Splitter first: it sits DOWNSTREAM of the group and the dsp, and
+             * uninitialising a node its input still feeds is what the comment
+             * above this loop is about. */
+            if (audio->buses[i].split_inited) {
+                ma_splitter_node_uninit(&audio->buses[i].send_split, NULL);
+                audio->buses[i].split_inited = false;
+            }
             dsp_node_uninit(&audio->buses[i].dsp);
             ma_sound_group_uninit(&audio->buses[i].group);
             audio->buses[i].used = false;
@@ -771,7 +989,14 @@ void jce_audio_destroy(JceAudio *audio)
     for (int i = 0; i < JCE_MAX_SOUNDS; i++) {
         if (audio->sound_used[i]) {
             JCE_FREE(audio->sounds[i].pcm_data);
+            /* Only OUR copy: a STORED pak entry was borrowed, not allocated. */
+            if (audio->sounds[i].enc_owned)
+                JCE_FREE(audio->sounds[i].enc_data);
+            if (audio->sounds[i].enc_pak)
+                jce_pak_close((JcePakArchive *)(uintptr_t)audio->sounds[i].enc_pak);
             audio->sounds[i].pcm_data = NULL;
+            audio->sounds[i].enc_data = NULL;
+            audio->sounds[i].enc_pak  = NULL;
             audio->sound_used[i] = false;
         }
     }
@@ -817,273 +1042,6 @@ static void set_sound_slot_path(JceAudio *audio, int slot, const char *path)
              "%s", path);
 }
 
-/* Check if path ends with a given suffix (case-insensitive). */
-static bool has_ext(const char *path, const char *ext)
-{
-    size_t plen = strlen(path);
-    size_t elen = strlen(ext);
-    if (plen < elen) return false;
-    return SDL_strcasecmp(path + plen - elen, ext) == 0;
-}
-
-/* Decode a raw ADTS (.aac) stream to interleaved s16 PCM.  Grows the output
- * geometrically because ADTS carries no sample count anywhere — the only way
- * to know the length is to decode it. */
-static bool jce_adts_decode_to_pcm(const uint8_t *data, size_t size,
-                                   int16_t **out_pcm, ma_uint64 *out_frames,
-                                   ma_uint32 *out_channels, ma_uint32 *out_rate,
-                                   const char *path)
-{
-    JceAacDecoder *dec = jce_aac_decoder_open_adts();
-    int16_t *pcm = NULL;
-    size_t cap = 0u, pos = 0u;          /* in samples (int16 units) */
-    size_t cursor = 0u;
-    uint32_t ch = 0u, sr = 0u;
-    bool ok = false;
-
-    if (!dec) {
-        return false;                    /* royalty-free build: stub returns NULL */
-    }
-    /* 1024 samples/frame * 8ch headroom, doubled as needed. */
-    cap = 8192u;
-    pcm = (int16_t *)JCE_MALLOC(cap * sizeof(int16_t));
-    if (!pcm) {
-        jce_aac_decoder_close(dec);
-        return false;
-    }
-
-    /* Drain-then-feed. Fill() swallows several frames at a time and
-     * DecodeFrame() emits one, so anything that feeds and decodes in lockstep
-     * strands the remainder inside the decoder and loses the tail. Emptying
-     * the decoder before every refill — and once more after the input runs
-     * out — is what makes the frame count come out right. */
-    for (;;) {
-        uint32_t written = 0u;
-        uint32_t consumed;
-
-        if (cap - pos < 8192u) {
-            size_t grown = cap * 2u;
-            int16_t *bigger;
-            if (grown > (size_t)512u * 1024u * 1024u / sizeof(int16_t)) {
-                LOG_WARN("jce_audio", "ADTS stream too large: '%s'", path);
-                break;
-            }
-            bigger = (int16_t *)JCE_REALLOC(pcm, grown * sizeof(int16_t));
-            if (!bigger) break;
-            pcm = bigger;
-            cap = grown;
-        }
-
-        if (jce_aac_adts_decode(dec, pcm + pos, (uint32_t)(cap - pos),
-                                &written)) {
-            pos += written;
-            if (written > 0u) {
-                ch = jce_aac_decoder_get_channels(dec);
-                sr = jce_aac_decoder_get_samplerate(dec);
-            }
-            continue;                    /* keep draining */
-        }
-
-        if (cursor >= size) {
-            break;                       /* drained and no input left */
-        }
-        consumed = jce_aac_adts_feed(dec, data + cursor,
-                                     (uint32_t)(size - cursor));
-        if (consumed == 0u) {
-            break;                       /* cannot make progress */
-        }
-        cursor += consumed;
-    }
-
-    jce_aac_decoder_close(dec);
-
-    if (pos > 0u && ch > 0u && sr > 0u) {
-        *out_pcm = pcm;
-        *out_frames = (ma_uint64)(pos / ch);
-        *out_channels = ch;
-        *out_rate = sr;
-        LOG_DEBUG("jce_audio", "decoded ADTS '%s' (%u Hz, %uch, %llu frames)",
-                  path, sr, ch, (unsigned long long)(pos / ch));
-        ok = true;
-    } else {
-        JCE_FREE(pcm);
-    }
-    return ok;
-}
-
-/* Decode WAV/OGG/MP3/FLAC/M4A/AAC from memory to a standalone s16 PCM buffer.
-   Touches no JceAudio state → safe to call from any thread.  On success
-   *out_pcm is a JCE_MALLOC'd buffer the caller owns. */
-static bool decode_pcm_mem(const uint8_t *data, size_t size, const char *path,
-                           int16_t **out_pcm, ma_uint64 *out_frames,
-                           ma_uint32 *out_channels, ma_uint32 *out_rate)
-{
-    *out_pcm = NULL; *out_frames = 0; *out_channels = 0; *out_rate = 0;
-
-    /* ── M4A / AAC-in-MP4 detection ─────────────────────────────── */
-    if (jce_m4a_is_mp4_container(data, size)) {
-        int16_t *pcm = NULL;
-        uint32_t frames = 0, ch = 0, sr = 0;
-        if (jce_m4a_decode_to_pcm(data, size, &pcm, &frames, &ch, &sr)) {
-            *out_pcm = pcm; *out_frames = (ma_uint64)frames;
-            *out_channels = ch; *out_rate = sr;
-            LOG_DEBUG("jce_audio", "decoded M4A '%s' (%u Hz, %uch, %u frames)",
-                      path, sr, ch, frames);
-            return true;
-        }
-        LOG_WARN("jce_audio", "M4A decode failed for '%s', trying miniaudio", path);
-        /* Fall through to miniaudio as last resort. */
-    }
-
-    /* ── Raw ADTS (.aac) ────────────────────────────────────────── *
-     * A bare .aac file is a stream of ADTS frames with no container. It
-     * cannot go to miniaudio: the MPEG sync-word sniff below matches ADTS
-     * too and hints ma_encoding_format_mp3, so dr_mp3 gets handed AAC
-     * payload, fails, and the auto-detect retry fails as well — the file
-     * reports "cannot decode" in a build that has fdk-aac linked in.
-     * fdk-aac reads ADTS natively; route it there.
-     *
-     * Syncword is 12 bits of 1s followed by ID(1) and layer(2). Layer MUST
-     * be 00 for ADTS, which is exactly what separates it from MP3/MP2/MP1
-     * (they use layer 01/10/11), so test 0xFF / 0xF6 -> 0xF0 rather than the
-     * looser 0xE0 mask. */
-    if (size >= 7u && data[0] == 0xFFu && (data[1] & 0xF6u) == 0xF0u) {
-        if (jce_adts_decode_to_pcm(data, size, out_pcm, out_frames,
-                                   out_channels, out_rate, path)) {
-            return true;
-        }
-        LOG_WARN("jce_audio", "ADTS decode failed for '%s', trying miniaudio",
-                 path);
-    }
-
-    ma_decoder_config cfg = ma_decoder_config_init(
-        ma_format_s16, 0 /* auto channels */, 0 /* auto sample rate */);
-    ma_decoder decoder;
-
-    /* Wire our Opus custom backend so .opus / Ogg-Opus is handled
-       transparently (miniaudio probes custom backends before
-       built-ins, so an Ogg page carrying OpusHead routes here). */
-    static const ma_decoding_backend_vtable *jce_custom_backends[] = {
-        &g_jce_ma_opus_backend_vtable,
-    };
-    cfg.ppCustomBackendVTables = (ma_decoding_backend_vtable **)jce_custom_backends;
-    cfg.customBackendCount     = (ma_uint32)(sizeof(jce_custom_backends)
-                                            / sizeof(jce_custom_backends[0]));
-
-    /* Hint the encoding format from magic bytes so miniaudio picks
-       the correct built-in decoder (dr_mp3, dr_wav, dr_flac, stb_vorbis).
-       Note: we do NOT hint Ogg-Opus as vorbis — miniaudio's custom-backend
-       probe phase (which runs first) already routes OpusHead pages to
-       g_jce_ma_opus_backend_vtable. Plain Ogg-Vorbis still falls through. */
-    if (size >= 4 && data[0] == 'O' && data[1] == 'g'
-                  && data[2] == 'g' && data[3] == 'S') {
-        /* Sniff for OpusHead — if present, leave format unknown so the
-           custom backend wins; otherwise hint vorbis. */
-        bool is_opus = false;
-        for (size_t i = 28; i + 8 <= size && i < 80; ++i) {
-            if (data[i] == 'O' && memcmp(data + i, "OpusHead", 8) == 0) {
-                is_opus = true; break;
-            }
-        }
-        if (!is_opus) cfg.encodingFormat = ma_encoding_format_vorbis;
-    } else if (size >= 4 && data[0] == 'f' && data[1] == 'L'
-                         && data[2] == 'a' && data[3] == 'C') {
-        cfg.encodingFormat = ma_encoding_format_flac;
-    } else if (size >= 4 && data[0] == 'R' && data[1] == 'I'
-                         && data[2] == 'F' && data[3] == 'F') {
-        cfg.encodingFormat = ma_encoding_format_wav;
-    } else if (size >= 3 && data[0] == 'I' && data[1] == 'D'
-                         && data[2] == '3') {
-        /* ID3v2 tag header — almost always an MP3 file. */
-        cfg.encodingFormat = ma_encoding_format_mp3;
-    } else if (size >= 2 && data[0] == 0xFF
-               && (data[1] & 0xE0) == 0xE0) {
-        /* MPEG audio sync word (0xFFE0+): MP3 / MP2 / MP1. */
-        cfg.encodingFormat = ma_encoding_format_mp3;
-    }
-
-    ma_result res = ma_decoder_init_memory(data, size, &cfg, &decoder);
-
-    /* If the hinted format failed, retry with auto-detection. */
-    if (res != MA_SUCCESS && cfg.encodingFormat != ma_encoding_format_unknown) {
-        cfg.encodingFormat = ma_encoding_format_unknown;
-        res = ma_decoder_init_memory(data, size, &cfg, &decoder);
-    }
-    if (res != MA_SUCCESS) {
-        /* Log the first bytes to help diagnose unsupported files. */
-        char hdr[48] = {0};
-        size_t hlen = size < 16 ? size : 16;
-        for (size_t i = 0; i < hlen; ++i) {
-            snprintf(hdr + i * 3, sizeof(hdr) - i * 3, "%02X ", data[i]);
-        }
-        LOG_ERROR("jce_audio",
-            "decode failed for '%s' (ma_result=%d, size=%zu, header=[%s])",
-            path, (int)res, size, hdr);
-        return false;
-    }
-
-    /* Get total frame count. */
-    ma_uint64 total_frames = 0;
-    ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
-
-    ma_uint32 channels = decoder.outputChannels;
-    ma_uint32 rate     = decoder.outputSampleRate;
-    int16_t  *pcm      = NULL;
-
-    if (total_frames == 0) {
-        /* Unknown length (streaming format) — decode in chunks. */
-        size_t alloc_frames = 1024 * 256;
-        size_t used_frames  = 0;
-        pcm = (int16_t *)JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
-        if (!pcm) {
-            ma_decoder_uninit(&decoder);
-            return false;
-        }
-
-        for (;;) {
-            if (used_frames + 4096 > alloc_frames) {
-                alloc_frames *= 2;
-                int16_t *tmp = (int16_t *)JCE_REALLOC(pcm,
-                    alloc_frames * channels * sizeof(int16_t));
-                if (!tmp) {
-                    JCE_FREE(pcm);
-                    ma_decoder_uninit(&decoder);
-                    return false;
-                }
-                pcm = tmp;
-            }
-            ma_uint64 read = 0;
-            ma_decoder_read_pcm_frames(&decoder, pcm + used_frames * channels,
-                                        4096, &read);
-            if (read == 0) break;
-            used_frames += (size_t)read;
-        }
-
-        total_frames = (ma_uint64)used_frames;
-    } else {
-        /* Known length — single allocation. */
-        pcm = (int16_t *)JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
-        if (!pcm) {
-            ma_decoder_uninit(&decoder);
-            return false;
-        }
-
-        ma_uint64 frames_read = 0;
-        ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &frames_read);
-        total_frames = frames_read;
-    }
-
-    ma_decoder_uninit(&decoder);
-
-    *out_pcm      = pcm;
-    *out_frames   = total_frames;
-    *out_channels = channels;
-    *out_rate     = rate;
-    LOG_DEBUG("jce_audio", "decoded '%s' (%u Hz, %uch, %llu frames)",
-              path, rate, channels, (unsigned long long)total_frames);
-    return true;
-}
-
 /* Decode into an audio sound slot (registration on the owning thread). */
 static JceSound load_from_memory(JceAudio *audio, int slot,
                                   const uint8_t *data, size_t size,
@@ -1092,7 +1050,7 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
     int16_t  *pcm = NULL;
     ma_uint64 frames = 0;
     ma_uint32 channels = 0, rate = 0;
-    if (!decode_pcm_mem(data, size, path, &pcm, &frames, &channels, &rate))
+    if (!jce_audio_decode_pcm_mem(data, size, path, &pcm, &frames, &channels, &rate))
         return JCE_SOUND_INVALID;
 
     audio->sounds[slot].pcm_data    = pcm;
@@ -1223,7 +1181,7 @@ JceAudioCpu *jce_audio_decode_cpu_memory(const void *data, size_t size,
     int16_t  *pcm = NULL;
     ma_uint64 frames = 0;
     ma_uint32 channels = 0, rate = 0;
-    if (!decode_pcm_mem((const uint8_t *)data, size, path, &pcm, &frames,
+    if (!jce_audio_decode_pcm_mem((const uint8_t *)data, size, path, &pcm, &frames,
                         &channels, &rate) ||
         frames > UINT32_MAX / (channels ? channels * sizeof(int16_t) : 1u)) {
         if (pcm) JCE_FREE(pcm);
@@ -1279,6 +1237,113 @@ JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *p
     JceSound result = jce_audio_load_inner(audio, pak, path);
     JCE_PROFILE_ZONE_END;
     return result;
+}
+
+JceSound jce_audio_load_streaming(JceAudio *audio, const JcePakArchive *pak,
+                                  const char *path)
+{
+    if (!audio || !path || !path[0]) return JCE_SOUND_INVALID;
+
+    /* Dedup like jce_audio_load: a clip already resident IS that slot, so a
+     * second request cannot produce a second copy of the encoded bytes.  A
+     * slot already loaded DECODED is returned as-is rather than converted --
+     * two callers disagreeing about how one clip is held is worse than one of
+     * them getting residency it did not ask for, and the decoded copy is the
+     * one that already has voices reading it. */
+    int existing = find_sound_slot_by_path(audio, path);
+    if (existing >= 0) return (JceSound)(existing + 1);
+
+    int slot = alloc_buffer_slot(audio);
+    if (slot < 0) {
+        LOG_WARN("jce_audio", "sound pool exhausted loading '%s'", path);
+        return JCE_SOUND_INVALID;
+    }
+
+    /* Nothing is DECODED here -- that is the whole point.  How much is even
+     * RESIDENT depends on where the clip lives, and the cheapest case is the
+     * shipping one:
+     *
+     *   pak, STORED entry  -> the encoded bytes are already in the archive
+     *                         blob, so borrow the pointer.  ZERO extra bytes.
+     *                         jce_archive_writer stores an entry raw when ZSTD
+     *                         cannot beat its keep threshold, and .ogg / .mp3
+     *                         never do, so this is the normal case for music
+     *                         in a single-file exe.
+     *   pak, compressed    -> the container was re-compressed, so it has to be
+     *                         expanded once and held: compressed-in-memory,
+     *                         which is the best available for that entry.
+     *   no pak (host file) -> hold NOTHING.  Each voice opens the file with
+     *                         ma_decoder_init_file and reads it incrementally.
+     */
+    void  *enc       = NULL;
+    size_t size      = 0;
+    bool   owned     = false;
+    bool   from_file = false;
+    const JcePakArchive *keep_pak = NULL;
+
+    if (pak) {
+        const JcePakAsset *a = jce_pak_find(pak, path);
+        if (!a || a->original_size == 0) {
+            LOG_ERROR("jce_audio", "stream: '%s' not in PAK", path);
+            return JCE_SOUND_INVALID;
+        }
+        if ((a->flags & JCE_PAK_ASSET_STORED) && a->compressed_data) {
+            enc   = (void *)(uintptr_t)a->compressed_data;
+            size  = (size_t)a->compressed_size;
+            owned = false;
+            /* Borrowing into the blob must not outlive it: take a reference so
+             * a jce_pak_close elsewhere cannot leave this slot pointing at
+             * freed memory.  The cast drops const only to touch the refcount,
+             * which is itself thread-safe. */
+            keep_pak = jce_pak_acquire((JcePakArchive *)(uintptr_t)pak);
+        } else {
+            enc = JCE_MALLOC((size_t)a->original_size);
+            if (!enc) return JCE_SOUND_INVALID;
+            size = jce_pak_decompress(a, enc, (size_t)a->original_size);
+            if (size == 0) {
+                LOG_ERROR("jce_audio", "stream: decompress failed for '%s'", path);
+                JCE_FREE(enc);
+                return JCE_SOUND_INVALID;
+            }
+            owned = true;
+        }
+    } else {
+        from_file = true;
+    }
+
+    /* Prove it is DECODABLE before handing back a handle.  A slot that only
+     * fails when someone plays it turns a load error into a silent voice far
+     * from its cause, and this costs one decoder init rather than a decode. */
+    ma_decoder probe;
+    const ma_result probe_res =
+        from_file ? ma_decoder_init_file(path, NULL, &probe)
+                  : ma_decoder_init_memory(enc, size, NULL, &probe);
+    if (probe_res != MA_SUCCESS) {
+        LOG_ERROR("jce_audio", "stream: cannot decode '%s'", path);
+        if (owned)    JCE_FREE(enc);
+        if (keep_pak) jce_pak_close((JcePakArchive *)(uintptr_t)keep_pak);
+        return JCE_SOUND_INVALID;
+    }
+    ma_uint64 frames = 0;
+    (void)ma_decoder_get_length_in_pcm_frames(&probe, &frames);
+    ma_uint32 chans = probe.outputChannels;
+    ma_uint32 rate  = probe.outputSampleRate;
+    ma_decoder_uninit(&probe);
+
+    SoundSlot *ss   = &audio->sounds[slot];
+    ss->pcm_data    = NULL;          /* nothing decoded: this IS the marker */
+    ss->enc_data    = enc;           /* NULL when streaming straight off disk */
+    ss->enc_size    = size;
+    ss->enc_owned   = owned;
+    ss->enc_pak     = keep_pak;
+    ss->from_file   = from_file;
+    ss->streaming   = true;
+    ss->frame_count = frames;
+    ss->channels    = chans;
+    ss->sample_rate = rate;
+    audio->sound_used[slot] = true;
+    set_sound_slot_path(audio, slot, path);
+    return (JceSound)(slot + 1);
 }
 
 /* ── Worker-decode + main-thread-register split ───────────────────── */
@@ -1353,6 +1418,21 @@ void jce_audio_unload(JceAudio *audio, JceSound snd)
 
     JCE_FREE(audio->sounds[slot].pcm_data);
     audio->sounds[slot].pcm_data = NULL;
+    /* A streaming slot holds ENCODED bytes instead of PCM, so freeing only
+     * pcm_data would leak the whole clip -- but ONLY when the bytes are ours.
+     * A STORED pak entry was borrowed from the archive blob, and handing that
+     * interior pointer to JCE_FREE would corrupt the heap.  Voices were
+     * uninited above, so no decoder is still reading either way. */
+    if (audio->sounds[slot].enc_owned)
+        JCE_FREE(audio->sounds[slot].enc_data);
+    if (audio->sounds[slot].enc_pak)
+        jce_pak_close((JcePakArchive *)(uintptr_t)audio->sounds[slot].enc_pak);
+    audio->sounds[slot].enc_data  = NULL;
+    audio->sounds[slot].enc_owned = false;
+    audio->sounds[slot].enc_pak   = NULL;
+    audio->sounds[slot].enc_size  = 0;
+    audio->sounds[slot].from_file = false;
+    audio->sounds[slot].streaming = false;
     audio->sounds[slot].path[0]  = '\0';
     audio->sound_used[slot] = false;
 }
@@ -1380,7 +1460,11 @@ static int resolve_voice(const JceAudio *audio, JceVoice voice)
     return idx;
 }
 
-static int alloc_voice(JceAudio *audio)
+/* `priority` is the INCOMING sound's, used both to choose a victim and to
+ * refuse the allocation outright when nothing is stealable.  It is stamped
+ * onto the slot on success, so a voice carries the priority it was played at
+ * until someone calls jce_audio_voice_set_priority. */
+static int alloc_voice(JceAudio *audio, int priority)
 {
     int found = -1;
 
@@ -1398,33 +1482,52 @@ static int alloc_voice(JceAudio *audio)
         }
     }
 
-    /* 3: virtualization — the pool is full and everything is playing. Steal the
-       OLDEST one-shot voice rather than dropping the new sound; prefer non-
-       looping victims so we don't cut background music. */
+    /* 3: virtualization — the pool is full and everything is playing.
+     *
+     * The victim is the LEAST IMPORTANT voice, not merely the oldest.  Age
+     * alone is what let a boss cue or a line of dialogue be stolen by
+     * whatever happened to start after it, which is the whole reason
+     * `priority` exists.  Ordering, worst victim first:
+     *
+     *   1. lowest priority
+     *   2. at equal priority, prefer a ONE-SHOT over a loop -- background
+     *      music being cut is the failure the age-only policy was already
+     *      written to avoid, and that intent survives intact here
+     *   3. at equal priority and equal loopiness, the oldest
+     *
+     * AND THE REFUSAL, which is the half that makes the protection real: a
+     * voice is never stolen by a sound of strictly lower priority.  Picking a
+     * better victim still evicts the boss cue once every voice IS a boss cue,
+     * so when nothing is stealable the new sound is dropped instead. */
     if (found < 0) {
-        uint64_t oldest = UINT64_MAX;
+        int      best      = -1;
+        int      best_prio = 0;
+        bool     best_loop = false;
+        uint64_t best_seq  = 0;
         for (int i = 0; i < JCE_MAX_VOICES; i++) {
-            if (audio->voices[i].inited
-                && !ma_sound_is_looping(&audio->voices[i].sound)
-                && audio->voices[i].play_seq < oldest) {
-                oldest = audio->voices[i].play_seq;
-                found = i;
+            const VoiceSlot *c = &audio->voices[i];
+            if (!c->inited) continue;
+            if (c->priority > priority) continue;   /* outranks the newcomer */
+
+            bool c_loop = ma_sound_is_looping((ma_sound *)&c->sound) != MA_FALSE;
+            if (best < 0
+                || c->priority < best_prio
+                || (c->priority == best_prio && !c_loop && best_loop)
+                || (c->priority == best_prio && c_loop == best_loop
+                    && c->play_seq < best_seq)) {
+                best = i; best_prio = c->priority;
+                best_loop = c_loop; best_seq = c->play_seq;
             }
         }
-        if (found < 0) {                  /* all voices loop → steal the oldest */
-            oldest = UINT64_MAX;
-            for (int i = 0; i < JCE_MAX_VOICES; i++) {
-                if (audio->voices[i].inited && audio->voices[i].play_seq < oldest) {
-                    oldest = audio->voices[i].play_seq;
-                    found = i;
-                }
-            }
-        }
-        if (found >= 0) uninit_voice(&audio->voices[found]);
+        if (best < 0) return -1;      /* every live voice outranks this sound */
+        uninit_voice(&audio->voices[best]);
+        found = best;
     }
 
-    if (found >= 0)
+    if (found >= 0) {
         audio->voices[found].play_seq = ++audio->play_counter;
+        audio->voices[found].priority = priority;
+    }
     return found;
 }
 
@@ -1471,6 +1574,15 @@ static void voice_attach_lpf(JceAudio *audio, VoiceSlot *v)
 JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
                          bool loop, float volume, float pitch)
 {
+    /* The pre-priority signature, kept as the common case rather than
+     * duplicated: every existing caller means "normal importance". */
+    return jce_audio_play_priority(audio, snd, loop, volume, pitch,
+                                   JCE_AUDIO_PRIORITY_NORMAL);
+}
+
+JceVoice jce_audio_play_priority(JceAudio *audio, JceSound snd,
+                         bool loop, float volume, float pitch, int priority)
+{
     JCE_PROFILE_ZONE_N("Audio::Play");
     if (!audio || snd == JCE_SOUND_INVALID) { JCE_PROFILE_ZONE_END; return JCE_VOICE_INVALID; }
 
@@ -1481,7 +1593,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
         return JCE_VOICE_INVALID;
     }
 
-    int vi = alloc_voice(audio);
+    int vi = alloc_voice(audio, priority);
     if (vi < 0) {
         LOG_WARN("jce_audio", "no free voices");
         JCE_PROFILE_ZONE_END;
@@ -1491,22 +1603,44 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
     SoundSlot *s = &audio->sounds[buf_slot];
     VoiceSlot *v = &audio->voices[vi];
 
-    /* Create an audio buffer that references the sound's PCM data.
-       Each voice gets its own buffer with an independent read cursor. */
-    ma_audio_buffer_config buf_cfg = ma_audio_buffer_config_init(
-        ma_format_s16, s->channels, s->frame_count, s->pcm_data, NULL);
-    buf_cfg.sampleRate = s->sample_rate;
+    ma_data_source *src = NULL;
+    if (s->streaming) {
+        /* STREAMING: decode the sound's encoded bytes on demand.  Own decoder
+         * per voice so two voices on one clip keep independent cursors -- the
+         * same reason each non-streaming voice gets its own ma_audio_buffer.
+         * The encoded blob itself is shared and read-only. */
+        const ma_result dres =
+            s->from_file ? ma_decoder_init_file(s->path, NULL, &v->dec)
+                         : ma_decoder_init_memory(s->enc_data, s->enc_size,
+                                                  NULL, &v->dec);
+        if (dres != MA_SUCCESS) {
+            LOG_ERROR("jce_audio", "stream decoder init failed for '%s'",
+                      s->path);
+            JCE_PROFILE_ZONE_END;
+            return JCE_VOICE_INVALID;
+        }
+        v->dec_inited = true;
+        src = &v->dec;
+    } else {
+        /* Create an audio buffer that references the sound's PCM data.
+           Each voice gets its own buffer with an independent read cursor. */
+        ma_audio_buffer_config buf_cfg = ma_audio_buffer_config_init(
+            ma_format_s16, s->channels, s->frame_count, s->pcm_data, NULL);
+        buf_cfg.sampleRate = s->sample_rate;
 
-    if (ma_audio_buffer_init(&buf_cfg, &v->buffer) != MA_SUCCESS) {
-        LOG_ERROR("jce_audio", "ma_audio_buffer_init failed");
-        JCE_PROFILE_ZONE_END;
-        return JCE_VOICE_INVALID;
+        if (ma_audio_buffer_init(&buf_cfg, &v->buffer) != MA_SUCCESS) {
+            LOG_ERROR("jce_audio", "ma_audio_buffer_init failed");
+            JCE_PROFILE_ZONE_END;
+            return JCE_VOICE_INVALID;
+        }
+        src = &v->buffer;
     }
 
     if (ma_sound_init_from_data_source(&audio->engine,
-            &v->buffer, 0, NULL, &v->sound) != MA_SUCCESS) {
+            src, 0, NULL, &v->sound) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_sound_init_from_data_source failed");
-        ma_audio_buffer_uninit(&v->buffer);
+        if (v->dec_inited) { ma_decoder_uninit(&v->dec); v->dec_inited = false; }
+        else               { ma_audio_buffer_uninit(&v->buffer); }
         JCE_PROFILE_ZONE_END;
         return JCE_VOICE_INVALID;
     }
@@ -1554,19 +1688,15 @@ static ma_result stream_ds_on_read(ma_data_source *ds,
     /* Cap to uint32 — miniaudio buffers are small per callback. */
     uint32_t want = frame_count > 0xffffffffull
         ? 0xffffffffu : (uint32_t)frame_count;
-    /* The pull callback (jce_audio_stream_pull) always returns the full
-     * requested count, padding silence on under-run/EOF. So we can just
-     * forward its output directly. */
-    uint32_t got = v->stream_on_read(v->stream_ud,
-                                     (int16_t *)out, want);
-    if (got == 0) {
-        /* Defensive: pad silence here too in case a future pull impl
-         * returns short. */
-        memset(out, 0, (size_t)want * v->stream_channels * sizeof(int16_t));
-        got = want;
-    }
-    v->stream_cursor += got;
-    if (frames_read) *frames_read = got;
+    uint32_t got = v->stream_on_read(v->stream_ud,(int16_t *)out,want);
+    if (got > want) got = want;
+    /* Short reads mean under-run/EOF, not the end of this live voice.
+     * The owning transport decides when to stop; the device receives silence. */
+    if (got < want)
+        memset((int16_t *)out+(size_t)got*v->stream_channels,0,
+               (size_t)(want-got)*v->stream_channels*sizeof(int16_t));
+    v->stream_cursor += want;
+    if (frames_read) *frames_read = want;
     return MA_SUCCESS;
 }
 
@@ -1621,7 +1751,7 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
         return JCE_VOICE_INVALID;
     }
 
-    int vi = alloc_voice(audio);
+    int vi = alloc_voice(audio, JCE_AUDIO_PRIORITY_NORMAL);
     if (vi < 0) {
         LOG_WARN("jce_audio", "no free voices for stream");
         JCE_PROFILE_ZONE_END;
@@ -1831,6 +1961,22 @@ void jce_audio_bus_set_volume(JceAudio *audio, const char *name, float volume)
     ma_sound_group_set_volume(&audio->buses[idx].group, volume);
 }
 
+void jce_audio_voice_set_priority(JceAudio *audio, JceVoice voice, int priority)
+{
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0) return;
+    /* Only the stored value moves.  Nothing is re-sorted here because the
+     * policy is evaluated at ALLOCATION time -- this takes effect on the next
+     * steal, which is the only moment priority can mean anything. */
+    audio->voices[idx].priority = priority;
+}
+
+int jce_audio_voice_get_priority(const JceAudio *audio, JceVoice voice)
+{
+    int idx = resolve_voice(audio, voice);
+    return idx < 0 ? JCE_AUDIO_PRIORITY_NORMAL : audio->voices[idx].priority;
+}
+
 void jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
                              const char *bus_name)
 {
@@ -1859,8 +2005,15 @@ static JceAudioDspChain *bus_chain_ensure(JceAudio *audio, const char *bus_name)
     int idx = audio_find_bus(audio, bus_name);
     if (idx < 0) return NULL;
     BusSlot *b = &audio->buses[idx];
-    if (!dsp_node_ensure(audio, &b->dsp,
-                         (ma_node *)&b->group, audio_output_node(audio)))
+    /* The dsp goes BEFORE the splitter when one exists, so the insert chain
+     * feeds both the normal output and the send: group -> dsp -> splitter.
+     * Targeting audio_output_node() unconditionally would re-attach the dsp
+     * straight to the endpoint and silently orphan the splitter -- the send
+     * would keep reporting its amount through get_send and carry no audio,
+     * which is the exact failure mode this whole row is about. */
+    ma_node *target = b->split_inited ? (ma_node *)&b->send_split.base
+                                      : audio_output_node(audio);
+    if (!dsp_node_ensure(audio, &b->dsp, (ma_node *)&b->group, target))
         return NULL;
     return b->dsp.chain;
 }
@@ -1877,6 +2030,59 @@ static JceAudioDspChain *voice_chain_ensure(JceAudio *audio, JceVoice voice)
     if (!dsp_node_ensure(audio, &v->dsp, upstream, voice_target_node(audio, v)))
         return NULL;
     return v->dsp.chain;
+}
+
+/* -- Bus metering (feeds sidechain ducking) ------------------------- */
+
+float jce_audio_bus_get_peak(JceAudio *audio, const char *name)
+{
+    if (!audio) return 0.0f;
+    /* Standing the insert node up is what turns metering on: it is the node
+     * that measures.  A metering-only bus therefore carries an EMPTY chain,
+     * which dsp_node_process already handles as a plain copy.  Reusing
+     * bus_chain_ensure keeps one splice path and one teardown path for both
+     * uses -- a separate meter node would have duplicated both. */
+    if (!bus_chain_ensure(audio, name)) return 0.0f;
+    int idx = audio_find_bus(audio, name);
+    if (idx < 0) return 0.0f;
+
+    /* Read-and-clear, so the caller sees the peak since ITS last call and the
+     * accumulator cannot hold a stale maximum forever. */
+    int bits = SDL_SetAtomicInt(&audio->buses[idx].dsp.peak_bits, 0);
+    float pk = 0.0f;
+    memcpy(&pk, &bits, sizeof pk);
+    return pk;
+}
+
+/* -- Offline rendering (no device) ---------------------------------- */
+
+bool jce_audio_render_offline(JceAudio *audio, float *out, uint32_t frames)
+{
+    if (!audio || !audio->engine_inited || !out || frames == 0) return false;
+    if (!audio->offline) {
+        /* The shared device is already pumping this graph.  Refusing is the
+         * whole point of the flag: a second pump would advance the same read
+         * cursors from another thread and the caller would get a plausible
+         * buffer built from frames the device also consumed. */
+        LOG_WARN("jce_audio",
+                 "render_offline on a device-pumped engine; "
+                 "use jce_audio_create_offline()");
+        return false;
+    }
+
+    /* Silence FIRST, then read over it.  An engine with nothing attached to
+     * its endpoint reads ZERO frames -- miniaudio has no silence to mix, so
+     * it produces none -- and a caller handed a short block would either pad
+     * it or write a gap into whatever it is feeding.  The shared device
+     * callback solves this the same way (memset, then sum), which is what
+     * makes the master tap gapless by construction; the offline pump has no
+     * business being less reliable than the thing it stands in for. */
+    const ma_uint32 chan = ma_engine_get_channels(&audio->engine);
+    memset(out, 0, (size_t)frames * (size_t)chan * sizeof(float));
+
+    ma_uint64 read = 0;
+    return ma_engine_read_pcm_frames(&audio->engine, out, frames, &read)
+           == MA_SUCCESS;
 }
 
 int jce_audio_bus_add_effect(JceAudio *audio, const char *bus_name,
@@ -1951,6 +2157,63 @@ uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice)
 
 /* -- Global reverb -------------------------------------------------- */
 
+bool jce_audio_reverb_process_offline(const JceAudioReverbParams *params,
+                                      float *io, uint32_t frames, int channels,
+                                      int sample_rate)
+{
+    if (!params || !io || frames == 0) return false;
+    if (channels < 1) channels = 1;
+    if (channels > JCE_FV_MAX_CH) channels = JCE_FV_MAX_CH;
+    if (sample_rate <= 0) sample_rate = 48000;
+
+    Freeverb fv;
+    memset(&fv, 0, sizeof fv);
+    if (!fv_alloc(&fv, channels, sample_rate)) { fv_free(&fv); return false; }
+
+    /* The same preset -> tuning mapping jce_audio_set_reverb applies.  Kept
+     * beside it rather than factored out only because the live path also
+     * owns lazy node creation and routing; the ARITHMETIC is identical, and
+     * an offline result computed from different arithmetic would not be
+     * evidence about the live path. */
+    float wet = params->wet_mix < 0.0f ? 0.0f : params->wet_mix;
+    float dry = params->dry_mix > 1.0f ? 1.0f : params->dry_mix;
+    float decay = params->decay_seconds;
+    float roomsize = decay <= 0.0f ? 0.5f : decay / (decay + 1.2f);
+    if (roomsize > 0.98f) roomsize = 0.98f;
+    float damp = params->damping;
+    if (params->lowpass_hz > 0.0f && params->lowpass_hz < 22050.0f) {
+        float lp = 1.0f - (params->lowpass_hz / 22050.0f);
+        if (lp > damp) damp = lp;
+    }
+    if (damp > 1.0f) damp = 1.0f;
+    float predelay_ms = params->pre_delay_ms;
+    if (predelay_ms <= 0.0f && params->room_size > 0.0f)
+        predelay_ms = params->room_size / 0.34f;
+
+    fv_set_params(&fv, wet, dry, roomsize, damp, params->diffusion,
+                  predelay_ms, params->early_delay_ms, params->early_mix);
+
+    /* De-interleave, process, re-interleave: fv_process_channel takes one
+     * channel's contiguous samples, which is what the node path hands it. */
+    float *sin_  = (float *)JCE_MALLOC((size_t)frames * sizeof(float));
+    float *sout_ = (float *)JCE_MALLOC((size_t)frames * sizeof(float));
+    if (!sin_ || !sout_) {
+        JCE_FREE(sin_); JCE_FREE(sout_); fv_free(&fv);
+        return false;
+    }
+    for (int c = 0; c < channels; ++c) {
+        for (uint32_t s2 = 0; s2 < frames; ++s2)
+            sin_[s2] = io[(size_t)s2 * (size_t)channels + (size_t)c];
+        fv_process_channel(&fv, c, sin_, sout_, frames);
+        for (uint32_t s2 = 0; s2 < frames; ++s2)
+            io[(size_t)s2 * (size_t)channels + (size_t)c] = sout_[s2];
+    }
+    JCE_FREE(sin_);
+    JCE_FREE(sout_);
+    fv_free(&fv);
+    return true;
+}
+
 void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params)
 {
     if (!audio || !params) return;
@@ -1982,7 +2245,23 @@ void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params)
     if (damp > 1.0f) damp = 1.0f;
     if (dry > 1.0f) dry = 1.0f;
 
-    fv_set_params(&audio->reverb.fv, wet, dry, roomsize, damp);
+    /* PRE-DELAY, from the field that carries it and the one the header always
+     * said scaled it.  room_size is metres; sound covers ~34 cm per ms, so a
+     * room's first surface answers after roughly size/0.34 ms -- used only
+     * when the preset does not state a pre-delay itself, so an explicit value
+     * always wins over the derived one. */
+    float predelay_ms = params->pre_delay_ms;
+    if (predelay_ms <= 0.0f && params->room_size > 0.0f)
+        predelay_ms = params->room_size / 0.34f;
+
+    /* EARLY REFLECTION.  Its own delay and level; a zero level costs one
+     * branch per sample and is what every preset that does not ask for one
+     * gets. */
+    float early_ms   = params->early_delay_ms;
+    float early_gain = params->early_mix;
+
+    fv_set_params(&audio->reverb.fv, wet, dry, roomsize, damp,
+                  params->diffusion, predelay_ms, early_ms, early_gain);
     audio->reverb_wet = wet;
 }
 
@@ -2082,6 +2361,139 @@ void jce_audio_set_doppler_factor(JceAudio *audio, float factor)
     }
 }
 
+/* Splice the splitter in once: terminal -> splitter, splitter[0] -> the bus's
+ * normal output.  Idempotent, and leaves the bus untouched on failure. */
+static bool bus_split_ensure(JceAudio *audio, BusSlot *b)
+{
+    if (b->split_inited) return true;
+    ma_engine *e = &audio->engine;
+    ma_splitter_node_config cfg =
+        ma_splitter_node_config_init(ma_engine_get_channels(e));
+    /* One output for the bus's own path plus one per possible send. */
+    cfg.outputBusCount = 1u + JCE_AUDIO_BUS_MAX_SENDS;
+    if (ma_splitter_node_init(ma_engine_get_node_graph(e), &cfg, NULL,
+                              &b->send_split) != MA_SUCCESS) {
+        LOG_WARN("jce_audio", "aux send: splitter init failed for bus '%s'",
+                 b->name);
+        return false;
+    }
+    /* Order matters: attach the splitter's OWN output first, so the bus is
+     * never left feeding a node that feeds nothing. */
+    if (ma_node_attach_output_bus(&b->send_split.base, 0,
+                                  audio_output_node(audio), 0) != MA_SUCCESS
+        || ma_node_attach_output_bus(bus_terminal_node(b), 0,
+                                     &b->send_split.base, 0) != MA_SUCCESS) {
+        ma_splitter_node_uninit(&b->send_split, NULL);
+        LOG_WARN("jce_audio", "aux send: splice failed for bus '%s'", b->name);
+        return false;
+    }
+    /* Every send output starts silent and unassigned; set_send supplies both. */
+    for (int k = 0; k < JCE_AUDIO_BUS_MAX_SENDS; ++k) {
+        ma_node_set_output_bus_volume(&b->send_split.base,
+                                      (ma_uint32)(k + 1), 0.0f);
+        b->send_dest[k]   = -1;
+        b->send_amount[k] = 0.0f;
+    }
+    b->split_inited = true;
+    return true;
+}
+
+bool jce_audio_bus_set_send(JceAudio *audio, const char *from_bus,
+                            const char *to_bus, float amount)
+{
+    if (!audio || !from_bus || !to_bus) return false;
+    int from = audio_find_bus(audio, from_bus);
+    int to   = audio_find_bus(audio, to_bus);
+    /* A bus may not send to itself: the splitter's second output would feed
+     * the node its own input comes from, which is a ring in the graph and
+     * recurses with no bottom when frames are pulled.  jce_audio_mixer refuses
+     * longer rings at the authoring layer; this is the device-side floor. */
+    if (from < 0 || to < 0 || from == to) return false;
+    if (amount < 0.0f) amount = 0.0f;
+
+    BusSlot *b = &audio->buses[from];
+    if (!bus_split_ensure(audio, b)) return false;
+
+    /* Existing send to this destination wins its own slot back; otherwise the
+     * first free one.  Looking for the destination FIRST is what makes a
+     * repeated call re-scale instead of consuming a second slot. */
+    int slot = -1;
+    for (int k = 0; k < JCE_AUDIO_BUS_MAX_SENDS; ++k)
+        if (b->send_dest[k] == to) { slot = k; break; }
+    if (slot < 0)
+        for (int k = 0; k < JCE_AUDIO_BUS_MAX_SENDS; ++k)
+            if (b->send_dest[k] < 0) { slot = k; break; }
+    if (slot < 0) {
+        LOG_WARN("jce_audio", "aux send: bus '%s' already has %d sends",
+                 from_bus, JCE_AUDIO_BUS_MAX_SENDS);
+        return false;
+    }
+
+    if (amount <= 0.0f) {
+        /* Retire: silence the output and free the slot.  The attachment is
+         * left in place -- detaching and re-attaching a live graph edge buys
+         * nothing when the gain is already zero. */
+        ma_node_set_output_bus_volume(&b->send_split.base,
+                                      (ma_uint32)(slot + 1), 0.0f);
+        b->send_dest[slot]   = -1;
+        b->send_amount[slot] = 0.0f;
+        return true;
+    }
+
+    if (ma_node_attach_output_bus(&b->send_split.base, (ma_uint32)(slot + 1),
+                                  (ma_node *)&audio->buses[to].group, 0)
+        != MA_SUCCESS) {
+        LOG_WARN("jce_audio", "aux send: '%s' -> '%s' attach failed",
+                 from_bus, to_bus);
+        return false;
+    }
+    ma_node_set_output_bus_volume(&b->send_split.base,
+                                  (ma_uint32)(slot + 1), amount);
+    b->send_dest[slot]   = to;
+    b->send_amount[slot] = amount;
+    return true;
+}
+
+float jce_audio_bus_get_send(const JceAudio *audio, const char *from_bus,
+                             const char *to_bus)
+{
+    if (!audio || !from_bus || !to_bus) return 0.0f;
+    int from = audio_find_bus((JceAudio *)audio, from_bus);
+    int to   = audio_find_bus((JceAudio *)audio, to_bus);
+    if (from < 0 || to < 0) return 0.0f;
+    const BusSlot *b = &audio->buses[from];
+    if (!b->split_inited) return 0.0f;
+    for (int k = 0; k < JCE_AUDIO_BUS_MAX_SENDS; ++k)
+        if (b->send_dest[k] == to) return b->send_amount[k];
+    return 0.0f;
+}
+
+void jce_audio_voice_set_spatial_blend(JceAudio *audio, JceVoice voice,
+                                       float blend)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+
+    ma_sound *snd = &audio->voices[idx].sound;
+    if (!(blend > 0.0f)) {
+        /* Fully 2D.  Identical to what set_3d(false) already did, so a source
+         * authored at 0 mixes exactly as before. */
+        ma_sound_set_spatialization_enabled(snd, MA_FALSE);
+        ma_sound_set_min_gain(snd, 0.0f);
+        return;
+    }
+    if (blend > 1.0f) blend = 1.0f;
+    ma_sound_set_spatialization_enabled(snd, MA_TRUE);
+    /* The floor under the spatializer's attenuation gain.  At blend 1 the
+     * floor is 0 and distance attenuates all the way to silence, which is
+     * full 3D; at blend 0.25 it is 0.75, so distance can only take a quarter
+     * of the level.  This is a spatializer field, not the sound's volume --
+     * ma_sound_set_min_gain forwards to ma_spatializer_set_min_gain -- so it
+     * scales attenuation and leaves the authored volume alone. */
+    ma_sound_set_min_gain(snd, 1.0f - blend);
+}
+
 void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice, bool spatial)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
@@ -2138,6 +2550,10 @@ JceAudio *jce_audio_create(void) {
     LOG_WARN("jce_audio", "audio disabled (JCE_NO_AUDIO)");
     return NULL;
 }
+JceAudio *jce_audio_create_offline(void) {
+    LOG_WARN("jce_audio", "audio disabled (JCE_NO_AUDIO)");
+    return NULL;
+}
 void jce_audio_destroy(JceAudio *audio) { (void)audio; }
 JceSound jce_audio_load(JceAudio *audio, JcePakArchive *pak, const char *path) {
     (void)audio; (void)pak; (void)path; return JCE_SOUND_INVALID;
@@ -2149,10 +2565,42 @@ JceSound jce_audio_load_pcm(JceAudio *audio, const void *pcm_data,
     (void)channels; (void)sample_rate; (void)bits_per_sample;
     return JCE_SOUND_INVALID;
 }
+JceSound jce_audio_load_streaming(JceAudio *audio, const JcePakArchive *pak,
+                                  const char *path) {
+    (void)audio; (void)pak; (void)path; return JCE_SOUND_INVALID;
+}
 void jce_audio_unload(JceAudio *audio, JceSound snd) { (void)audio; (void)snd; }
 JceVoice jce_audio_play(JceAudio *audio, JceSound snd, bool loop, float volume, float pitch) {
     (void)audio; (void)snd; (void)loop; (void)volume; (void)pitch;
     return JCE_VOICE_INVALID;
+}
+/* The priority trio, stubbed HERE as well as in the real backend.  Nothing
+ * compiles this branch -- no preset defines JCE_NO_AUDIO -- so a public symbol
+ * declared unconditionally in jce_audio.h and defined only above would link
+ * everywhere anyone builds and fail only for whoever first turns this on, with
+ * no gate able to have told them.  This file already carries that defect for
+ * four other symbols; it is not getting three more. */
+JceVoice jce_audio_play_priority(JceAudio *audio, JceSound snd, bool loop,
+    float volume, float pitch, int priority) {
+    (void)audio; (void)snd; (void)loop; (void)volume; (void)pitch; (void)priority;
+    return JCE_VOICE_INVALID;
+}
+void jce_audio_voice_set_priority(JceAudio *audio, JceVoice voice, int priority) {
+    (void)audio; (void)voice; (void)priority;
+}
+void jce_audio_voice_set_spatial_blend(JceAudio *audio, JceVoice voice, float blend) {
+    (void)audio; (void)voice; (void)blend;
+}
+bool jce_audio_bus_set_send(JceAudio *audio, const char *from_bus,
+                            const char *to_bus, float amount) {
+    (void)audio; (void)from_bus; (void)to_bus; (void)amount; return false;
+}
+float jce_audio_bus_get_send(const JceAudio *audio, const char *from_bus,
+                             const char *to_bus) {
+    (void)audio; (void)from_bus; (void)to_bus; return 0.0f;
+}
+int jce_audio_voice_get_priority(const JceAudio *audio, JceVoice voice) {
+    (void)audio; (void)voice; return JCE_AUDIO_PRIORITY_NORMAL;
 }
 void jce_audio_stop(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
 void jce_audio_pause(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
@@ -2218,6 +2666,12 @@ bool jce_audio_voice_remove_effect(JceAudio *audio, JceVoice voice,
                                    uint32_t index) {
     (void)audio; (void)voice; (void)index; return false;
 }
+float jce_audio_bus_get_peak(JceAudio *audio, const char *name) {
+    (void)audio; (void)name; return 0.0f;
+}
+bool jce_audio_render_offline(JceAudio *audio, float *out, uint32_t frames) {
+    (void)audio; (void)out; (void)frames; return false;
+}
 uint32_t jce_audio_bus_effect_count(JceAudio *audio, const char *bus_name) {
     (void)audio; (void)bus_name; return 0;
 }
@@ -2226,6 +2680,12 @@ uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice) {
 }
 void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params) {
     (void)audio; (void)params;
+}
+bool jce_audio_reverb_process_offline(const JceAudioReverbParams *params,
+                                      float *io, uint32_t frames, int channels,
+                                      int sample_rate) {
+    (void)params; (void)io; (void)frames; (void)channels; (void)sample_rate;
+    return false;
 }
 JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
     uint32_t size, const char *hint_path) {

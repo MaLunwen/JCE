@@ -11,6 +11,8 @@
 set(_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(_ENGINE_INC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(_ENGINE_TOOLS_INC "${CMAKE_CURRENT_SOURCE_DIR}/tools_include")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEVendorSources.cmake")
+set(JCE_STB_IMAGE_SOURCE_DIR "${JCE_STB_IMAGE_SOURCE_DIR}" PARENT_SCOPE)
 
 # ================================================================== #
 # jce_tools_imgui — Tools-layer ImGui wrapper.                       #
@@ -45,6 +47,8 @@ function(_jce_add_layer NAME)
 			"${_ENGINE_SRC}/${_dir}/*.cpp")
 		# Skip vendored third_party trees (e.g., libhevc has its own build).
 		list(FILTER _dir_srcs EXCLUDE REGEX "/third_party/")
+		# Codec adapters are compiled by their dedicated dependency targets.
+		list(FILTER _dir_srcs EXCLUDE REGEX "/codec_ports/")
 		# Skip host-tool-only TUs that get explicitly compiled into the
 		# tools/ targets (jce_cook, jce_pak, …) and pull in symbols
 		# (jce_tex_compress, …) that the runtime engine does not link.
@@ -103,7 +107,7 @@ endfunction()
 # consumer of jce_core — i.e. every engine layer, the editor, and every SDK
 # consumer.  That made SDL part of jce_core's public contract even though no
 # public header under engine/include/ includes an SDL header (enforced by
-# scripts/lint/check_public_api_purity.py), and it let 44 first-party files
+# tools/lint/check_public_api_purity.py), and it let 44 first-party files
 # across 5 other layers include <SDL3/...> without ever declaring the
 # dependency — free-riding that hid the real dependency graph.
 #
@@ -169,69 +173,15 @@ if(NOT DEFINED JCE_PATENTED_CODECS_ENABLED)
 	set(JCE_PATENTED_CODECS_ENABLED ${JCE_ENABLE_PATENTED_CODECS})
 endif()
 
-# Vendor-presence probe.
-#
-# This used to test the two `jce_build` directories and, on a miss, print a
-# WARNING and flip the effective switch OFF.  Both halves were wrong.
-#
-# Wrong target: `jce_build` holds the glue CMakeLists, which .gitignore
-# deliberately re-admits (lines 14/16) — so those two EXISTS checks are true in
-# every clone and can never fail.  The upstream trees they actually compile sit
-# one level up and are untracked.  A partially-vendored tree therefore sailed
-# past the guard and died later with "Cannot find source file" at generate
-# time.  Probe one real source file out of each upstream tree instead — the
-# same files the glue lists.
-#
-# Wrong response: disabling was silent in practice.  message(WARNING) is not
-# re-emitted on an incremental reconfigure, so after the first run a release
-# build with no AAC/H.264/H.265 is indistinguishable from one that has them
-# until somebody opens an .mp4.  The root asserts (see the root CMakeLists)
-# only ever guarded the other direction — "dist must not be ON" — so nothing
-# policed a release silently becoming OFF, and `git clone` + CI are exactly
-# the trees where the vendor sources are absent.
-#
-# Shipping with or without these codecs is a licensing decision either way, so
-# it has to be stated, not defaulted into: vendor the sources, or configure
-# with -DJCE_ENABLE_PATENTED_CODECS=OFF and mean it.
+# Pristine pinned upstream trees; platform/build adaptation lives in JCE.
 if(JCE_PATENTED_CODECS_ENABLED)
-	set(_JCE_LIBHEVC_ROOT  "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc")
-	set(_JCE_OPENH264_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264")
-	set(_JCE_LIBHEVC_DIR  "${_JCE_LIBHEVC_ROOT}/jce_build")
-	set(_JCE_OPENH264_DIR "${_JCE_OPENH264_ROOT}/jce_build")
-	set(_JCE_FDKAAC_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac")
-
-	# One representative source per tree, each named by that tree's own build
-	# glue — if it is absent the corresponding add_subdirectory() below cannot
-	# succeed.
-	set(_jce_codec_missing "")
-	if(NOT EXISTS "${_JCE_LIBHEVC_ROOT}/common/ihevc_quant_tables.c")
-		list(APPEND _jce_codec_missing
-			"libhevc  -> engine/src/middleware/video/third_party/libhevc/")
-	endif()
-	if(NOT EXISTS "${_JCE_OPENH264_ROOT}/codec/decoder/plus/src/welsDecoderExt.cpp")
-		list(APPEND _jce_codec_missing
-			"openh264 -> engine/src/middleware/video/third_party/openh264/")
-	endif()
-	if(NOT EXISTS "${_JCE_FDKAAC_DIR}/CMakeLists.txt")
-		list(APPEND _jce_codec_missing
-			"fdk-aac  -> engine/src/middleware/audio/third_party/fdk-aac/")
-	endif()
-
-	if(_jce_codec_missing)
-		string(REPLACE ";" "\n    " _jce_codec_missing_txt "${_jce_codec_missing}")
-		message(FATAL_ERROR
-			"JCE: patented codecs are ENABLED (JCE_ENABLE_PATENTED_CODECS=ON, "
-			"JCE_BUILD_VARIANT=${JCE_BUILD_VARIANT}) but these vendor trees are "
-			"not present:\n"
-			"    ${_jce_codec_missing_txt}\n"
-			"They are intentionally untracked (see .gitignore and AGENTS.md) and "
-			"must be vendored on demand.\n"
-			"Either vendor them, or configure with "
-			"-DJCE_ENABLE_PATENTED_CODECS=OFF for a royalty-free build "
-			"(the dist variant does that for you).\n"
-			"Refusing to silently produce a release build with AAC / H.264 / "
-			"H.265 missing.")
-	endif()
+    jce_vendor_source(libhevc JCE_LIBHEVC_SOURCE_DIR)
+    jce_vendor_source(openh264 JCE_OPENH264_SOURCE_DIR)
+    jce_vendor_source(fdk-aac JCE_FDKAAC_SOURCE_DIR)
+    set(JCE_CODEC_PORT_DIR "${_ENGINE_SRC}/os/platform/codec_ports")
+    set(_JCE_LIBHEVC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/codec_ports/libhevc")
+    set(_JCE_OPENH264_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/codec_ports/openh264")
+    set(_JCE_FDKAAC_DIR "${JCE_FDKAAC_SOURCE_DIR}")
 endif()
 
 if(JCE_PATENTED_CODECS_ENABLED)
@@ -258,6 +208,11 @@ if(JCE_PATENTED_CODECS_ENABLED)
 		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac")
 	# Suppress strict-warnings for vendored 3rd-party.
 	if(TARGET fdk-aac)
+		add_dependencies(fdk-aac jce_vendor_verify_fdk-aac)
+		if(ANDROID)
+			target_include_directories(fdk-aac PRIVATE "${JCE_CODEC_PORT_DIR}/fdk")
+			target_link_libraries(fdk-aac PRIVATE log)
+		endif()
 		target_compile_options(fdk-aac PRIVATE
 			$<$<C_COMPILER_ID:MSVC>:/w>
 			$<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
@@ -270,6 +225,8 @@ _jce_add_layer(jce_video
 	DIRS      middleware/video
 	LINK_PUBLIC jce_core
 	LINK_PRIVATE sdl::sdl dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
+target_include_directories(jce_video SYSTEM PRIVATE "${JCE_MINIMP4_SOURCE_DIR}")
+add_dependencies(jce_video jce_vendor_verify_minimp4)
 
 # S3: compile the AVX2 YUV conversion TU with SIMD flags on x86 only.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
@@ -418,39 +375,21 @@ _jce_add_layer(jce_save
 	# not link jce_save, so there is no dependency cycle.
 	LINK_PRIVATE jce_scene sdl::sdl)
 
+_jce_add_layer(jce_llm
+	DIRS      middleware/llm
+	LINK_PUBLIC  jce_core)
+
 option(JCE_ENABLE_AI_DISPATCH
 	"Compile the ai_dispatch middleware (constraint-record scene parameter \
 generation).  Private module: excluded from public source packages.  Keep \
 OFF for any distributable build." OFF)
 
 if(JCE_ENABLE_AI_DISPATCH)
-	_jce_add_layer(jce_ai_dispatch
-		DIRS      middleware/ai_dispatch
-		LINK_PUBLIC  jce_core
-		# jce_aid_save.c persists the session record log through the generic
-		# snapshot registry.  jce_save links only jce_core/jce_scene and never
-		# jce_ai_dispatch, so this private edge introduces no cycle.
-		# cjson: JSON boundary of the network tiers (jce_aid_json.c);
-		# jce_platform: jce_tcp for the plaintext HTTP transport.
-		# sdl: jce_aid_events.c uses <SDL3/SDL_iostream.h> for its record log.
-		LINK_PRIVATE sdl::sdl xxHash::xxhash jce_save cjson::cjson jce_platform)
-	target_compile_definitions(jce_ai_dispatch PUBLIC JCE_ENABLE_AI_DISPATCH=1)
-	if(CURL_FOUND)
-		# Production T1 HTTPS transport (jce_aid_transport_curl.c compiles
-		# to a stub without this define).
-		# PRIVATE: curl must NOT propagate its INTERFACE definitions to
-		# downstream C++ TUs (they macroize types and break xkeycheck /
-		# SDL static asserts).  The SDK fat-lib collector picks curl up
-		# explicitly instead (see JCESDKInstall.cmake) so private-SDK
-		# consumers still resolve curl_*.
-		target_link_libraries(jce_ai_dispatch PRIVATE CURL::libcurl)
-		# CURL_STATICLIB is MANDATORY for static libcurl: without it curl.h
-		# declares every entry point __declspec(dllimport) (__imp_curl_*),
-		# which no static archive provides.  The conan recipe propagates it
-		# inconsistently across configs, so pin it ourselves.
-		target_compile_definitions(jce_ai_dispatch PRIVATE
-			JCE_AID_HAVE_CURL=1 CURL_STATICLIB=1)
-	endif()
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/private/engine/ai_dispatch/CMakeLists.txt")
+        message(FATAL_ERROR "JCE_ENABLE_AI_DISPATCH requires the separately maintained private extension.")
+    endif()
+    add_subdirectory("${CMAKE_SOURCE_DIR}/private/engine/ai_dispatch"
+                     "${CMAKE_BINARY_DIR}/private/ai_dispatch")
 endif()
 
 # ================================================================== #
@@ -478,6 +417,9 @@ _jce_add_layer(jce_renderer
 # via the jce_library shared-object wrapper. Forced OFF for dist (root
 # CMakeLists), so shipped games carry zero RenderDoc code.
 if(JCE_RENDERDOC_ENABLED)
+	jce_vendor_source(renderdoc JCE_RENDERDOC_SOURCE_DIR)
+	add_dependencies(jce_renderer jce_vendor_verify_renderdoc)
+	target_include_directories(jce_renderer SYSTEM PRIVATE "${JCE_RENDERDOC_SOURCE_DIR}")
 	target_compile_definitions(jce_renderer PRIVATE JCE_RENDERDOC_ENABLED=1)
 else()
 	target_compile_definitions(jce_renderer PRIVATE JCE_RENDERDOC_ENABLED=0)
@@ -651,6 +593,7 @@ target_link_libraries(JCE INTERFACE
 	jce_physics
 	jce_animation
 	jce_ai
+	jce_llm
 	jce_net
 	jce_world
 	jce_save
@@ -787,4 +730,18 @@ endif()
 # install tree with find_package(JCE REQUIRED) — no Conan required.   #
 # ================================================================== #
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCESDKInstall.cmake")
+# Conan's interface target defers its physical archive behind bimg_decode.
+# Force-load the resolved codec archive; retain the target for its normal
+# transitive platform dependencies. This never alters either upstream archive.
+jce_collect_static_libs(dav1d::dav1d _jce_av1_codec)
+if(NOT _jce_av1_codec_FILES)
+    message(FATAL_ERROR "JCE: canonical static dav1d archive is required")
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCECodecLink.cmake")
+foreach(_codec IN LISTS _jce_av1_codec_FILES)
+    jce_force_codec_archive(jce_video "${_codec}")
+endforeach()
 jce_register_sdk_install()
+
+target_include_directories(jce_renderer PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")
+add_dependencies(jce_renderer jce_vendor_verify_stb_image)

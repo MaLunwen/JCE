@@ -16,6 +16,12 @@
 #include <jce/os/core/jce_perf_phase.h>   /* #4 ECS stress: ecs_move phase timing */
 #include <jce/os/core/jce_timer.h>
 #include "jce_component_registry_internal.h"
+#include "jce_scene_internal.h"   /* entity-name scope rule (jce_scene_names.c) */
+/* jce_scene_normalise_mesh_renderer, called by the SET macro below.  It was
+ * named only in a COMMENT there, so the call went through an implicit
+ * declaration -- C99 assumes int(*)() and the real function returns void, which
+ * this ABI happens to survive and another need not. */
+#include "jce_scene_component_normalise.h"
 #include "os/core/jce_memory.h"
 
 #include <flecs.h>
@@ -95,6 +101,7 @@ static ECS_COMPONENT_DECLARE(JceCameraComponent);
 static ECS_COMPONENT_DECLARE(JceDirectionalLight);
 static ECS_COMPONENT_DECLARE(JcePointLight);
 static ECS_COMPONENT_DECLARE(JceSpotLight);
+static ECS_COMPONENT_DECLARE(JceAreaLight);
 static ECS_COMPONENT_DECLARE(JceTagActive);
 static ECS_COMPONENT_DECLARE(JceRigidBodyComponent);
 static ECS_COMPONENT_DECLARE(JceRigidBody2DComponent);
@@ -146,6 +153,7 @@ static ECS_COMPONENT_DECLARE(JceBillboardRendererComponent);
 static ECS_COMPONENT_DECLARE(JceCanvasComponent);
 static ECS_COMPONENT_DECLARE(JceCanvasGroupComponent);
 static ECS_COMPONENT_DECLARE(JceLayoutGroupComponent);
+static ECS_COMPONENT_DECLARE(JceLayoutElementComponent);
 static ECS_COMPONENT_DECLARE(JceUIImageComponent);
 static ECS_COMPONENT_DECLARE(JceUITextComponent);
 static ECS_COMPONENT_DECLARE(JceUIButtonComponent);
@@ -171,6 +179,8 @@ static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
 static ECS_COMPONENT_DECLARE(JceNavAgentComponent);
 static ECS_COMPONENT_DECLARE(JceIkConstraintComponent);
 static ECS_COMPONENT_DECLARE(JceFootIkComponent);
+static ECS_COMPONENT_DECLARE(JceContentSizeFitterComponent);
+static ECS_COMPONENT_DECLARE(JceBoneAttachmentComponent);
 static ECS_COMPONENT_DECLARE(JceFullBodyIkComponent);
 static ECS_COMPONENT_DECLARE(JceSequencePlayerComponent);
 static ECS_COMPONENT_DECLARE(JceMorphWeightsComponent);
@@ -335,7 +345,7 @@ struct JceScene {
      * colour, a material tint) invalidated it, so the cull freeze AND its
      * incremental-repair path both died every frame and the whole entity
      * cull rebuilt from scratch.  Only the components jce_sr_cull.c actually
-     * reads may bump it; scripts/lint/check_cull_gen_consumers.py fails the
+     * reads may bump it; tools/lint/check_cull_gen_consumers.py fails the
      * build if that file grows a read whose component does not. */
     uint64_t      cull_data_gen;
     /* Dirty ring (DOTS-floor L2): every entity whose world matrix was
@@ -400,7 +410,7 @@ static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
     if (r->shadow_resolution > 4096)
         r->shadow_resolution = 4096;
     if (r->soft_shadow_mode < JCE_SCENE_SOFT_SHADOW_OFF ||
-        r->soft_shadow_mode > JCE_SCENE_SOFT_SHADOW_VSM)
+        r->soft_shadow_mode > JCE_SCENE_SOFT_SHADOW_PCSS)
         r->soft_shadow_mode = JCE_SCENE_SOFT_SHADOW_PCF;
 
     if (r->exposure < 0.0f)
@@ -577,6 +587,17 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     /* Matches jce_environment_default(); a scene that does not author a
      * temperature must not change what the environment already does. */
     r.temperature_c = 15.0f;
+    /* Auto exposure OFF, but the desc filled with the LAW's own defaults --
+     * not zeros.  Zeros would be a [0,0] EV clamp and two zero speeds, i.e.
+     * a feature that reports itself as configured and cannot move. */
+    r.auto_exposure      = false;
+    r.auto_exposure_desc = jce_auto_exposure_desc_default();
+    /* OFF, and the numbers are only consulted when it is on -- so a scene
+     * authored before depth of field existed renders identically. */
+    r.dof_enabled         = false;
+    r.dof_focus_distance  = 10.0f;
+    r.dof_focus_range     = 4.0f;
+    r.dof_max_coc         = 0.012f;
     return r;
 }
 
@@ -837,6 +858,26 @@ void JCE_CALL jce_scene_invalidate_terrain(JceScene *s, const char *path)
     jce_terrain_cache_invalidate(s->terrain_cache, path);
 }
 
+bool JCE_CALL jce_scene_adopt_terrain(JceScene *s, const char *path,
+                                      JceTerrain *terrain)
+{
+    if (!s || !path || !path[0] || !terrain) return false;
+    JceTerrainCache *cache = jce_scene_terrain_cache(s);
+    return cache && jce_terrain_cache_adopt(cache, path, terrain);
+}
+
+JceTerrain *JCE_CALL jce_scene_peek_terrain(JceScene *s, const char *path)
+{
+    if (!s || !s->terrain_cache) return NULL;
+    return jce_terrain_cache_peek(s->terrain_cache, path);
+}
+
+bool JCE_CALL jce_scene_touch_terrain(JceScene *s, const char *path)
+{
+    if (!s || !s->terrain_cache) return false;
+    return jce_terrain_cache_touch(s->terrain_cache, path);
+}
+
 /* ── Create / destroy ──────────────────────────────────────────────── */
 /* Zero-init leaves the interned path pointers NULL; every reader dereferences
  * them unconditionally.  Point them at the shared empty string instead. */
@@ -919,6 +960,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceDirectionalLight);
     ECS_COMPONENT_DEFINE(s->world, JcePointLight);
     ECS_COMPONENT_DEFINE(s->world, JceSpotLight);
+    ECS_COMPONENT_DEFINE(s->world, JceAreaLight);
     ECS_COMPONENT_DEFINE(s->world, JceTagActive);
     ECS_COMPONENT_DEFINE(s->world, JceRigidBodyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceRigidBody2DComponent);
@@ -979,6 +1021,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceCanvasComponent);
     ECS_COMPONENT_DEFINE(s->world, JceCanvasGroupComponent);
     ECS_COMPONENT_DEFINE(s->world, JceLayoutGroupComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLayoutElementComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUIImageComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUITextComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUIButtonComponent);
@@ -1004,6 +1047,8 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceNavAgentComponent);
     ECS_COMPONENT_DEFINE(s->world, JceIkConstraintComponent);
     ECS_COMPONENT_DEFINE(s->world, JceFootIkComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceContentSizeFitterComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceBoneAttachmentComponent);
     ECS_COMPONENT_DEFINE(s->world, JceFullBodyIkComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSequencePlayerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceMorphWeightsComponent);
@@ -1159,13 +1204,7 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
          * same prefab repeatedly collides (e.g. many "Ped" from a SpawnManager),
          * and loading a scene with duplicate-named entities would too — so
          * uniquify by appending the entity id when the name is already in use. */
-        if (ecs_lookup(s->world, name) != 0) {
-            char unique[256];
-            snprintf(unique, sizeof unique, "%s_%llu", name, (unsigned long long)e);
-            ecs_set_name(s->world, e, unique);
-        } else {
-            ecs_set_name(s->world, e, name);
-        }
+        jce_scene_name_set_unique(s, (JceEntity)e, name);
         /* Record what the caller asked for.  The flecs name above may have
          * been uniquified; that must not be observable (see the
          * JceCompAuthoredName comment). */
@@ -1229,15 +1268,7 @@ void jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name)
      * already taken (this used to call ecs_set_name unconditionally), and
      * record the authored name as the entity's identity. */
     if (name && name[0]) {
-        ecs_entity_t taken = ecs_lookup(s->world, name);
-        if (taken != 0 && taken != (ecs_entity_t)e) {
-            char unique[256];
-            snprintf(unique, sizeof unique, "%s_%llu",
-                     name, (unsigned long long)e);
-            ecs_set_name(s->world, (ecs_entity_t)e, unique);
-        } else {
-            ecs_set_name(s->world, (ecs_entity_t)e, name);
-        }
+        jce_scene_name_set_unique(s, e, name);
         JceCompAuthoredName an;
         an.v = jce_str_intern(s->str_pool, name);
         ecs_set_ptr(s->world, (ecs_entity_t)e, JceCompAuthoredName, &an);
@@ -1253,10 +1284,15 @@ static void scene_set_parent_unchecked(JceScene *s, JceEntity child,
                                        JceEntity parent)
 {
     if (parent == JCE_ENTITY_INVALID) {
-        /* Remove parent (make root entity). */
+        /* Remove parent (make root entity).  The root is a scope too, so the
+         * same rule applies on the way out. */
         ecs_entity_t cur = ecs_get_parent(s->world, (ecs_entity_t)child);
-        if (cur) ecs_remove_pair(s->world, (ecs_entity_t)child, EcsChildOf, cur);
+        if (cur) {
+            jce_scene_name_reserve_for_scope(s, child, JCE_ENTITY_INVALID);
+            ecs_remove_pair(s->world, (ecs_entity_t)child, EcsChildOf, cur);
+        }
     } else {
+        jce_scene_name_reserve_for_scope(s, child, parent);
         ecs_add_pair(s->world, (ecs_entity_t)child,
                      EcsChildOf, (ecs_entity_t)parent);
     }
@@ -1751,6 +1787,124 @@ jce_mat4 jce_scene_get_world_matrix(const JceScene *s, JceEntity e)
     return scene_world_matrix_memo(ms, e, 0);
 }
 
+/* The frame an entity lives in: its parent's world matrix, or nothing at all
+ * for a root.  Both world-pose calls go through this so they cannot drift on
+ * what "world" means -- the getter composing one frame and the setter
+ * inverting another is the shape that makes set(get(e)) move things. */
+static bool scene_parent_frame(const JceScene *s, JceEntity e,
+                               jce_mat4 *out_parent_world)
+{
+    const JceEntity p = jce_scene_get_parent(s, e);
+    if (p == JCE_ENTITY_INVALID || p == e)
+        return false;                                 /* root: world == local */
+    *out_parent_world = jce_scene_get_world_matrix(s, p);
+    return true;
+}
+
+bool jce_scene_get_world_pose(const JceScene *s, JceEntity e,
+                              jce_vec3 *out_position, jce_quat *out_rotation,
+                              jce_vec3 *out_scale)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    JceTransform *t = jce_scene_get_transform((JceScene *)s, e);
+    if (!t) return false;
+
+    jce_mat4 parent_world;
+    if (!scene_parent_frame(s, e, &parent_world)) {
+        /* VERBATIM, not round-tripped through a matrix.  jce_m4_decompose
+         * costs three sqrtf and does not return exactly what jce_m4_from_trs
+         * consumed, so composing-and-decomposing a root would hand every
+         * caller a value that differs from the Transform it can read itself.
+         * Unparented scenes -- which is every scene authored before this
+         * existed -- stay bit-identical rather than nearly so. */
+        if (out_position) *out_position = t->position;
+        if (out_rotation) *out_rotation = t->rotation;
+        if (out_scale)    *out_scale    = t->scale;
+        return true;
+    }
+
+    /* safe_scale matches what scene_local_matrix feeds the renderer: a zero
+     * scale would make the local matrix singular and hand the decomposition a
+     * rotation built from three zero-length axes. */
+    const jce_mat4 local = jce_m4_from_trs(t->position, t->rotation,
+                                           jce_v3_safe_scale(t->scale));
+    const jce_mat4 world = jce_m4_multiply(&parent_world, &local);
+    jce_m4_decompose(&world, out_position, out_rotation, out_scale);
+    return true;
+}
+
+bool jce_scene_solve_local_pose(const JceScene *s, JceEntity e,
+                                jce_vec3 world_position,
+                                jce_quat world_rotation,
+                                jce_vec3 *out_local_position,
+                                jce_quat *out_local_rotation)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    if (!jce_scene_get_transform((JceScene *)s, e)) return false;
+
+    jce_mat4 parent_world;
+    if (!scene_parent_frame(s, e, &parent_world)) {
+        /* Root: the world pose IS the local one, handed back unchanged rather
+         * than through jce_m4_from_trs and jce_m4_decompose, which cost three
+         * sqrtf and do not round-trip.  Every scene authored before this
+         * existed is unparented, so this branch is the common one AND the one
+         * that has to be exact. */
+        if (out_local_position) *out_local_position = world_position;
+        if (out_local_rotation) *out_local_rotation = world_rotation;
+        return true;
+    }
+
+    /* A SINGULAR PARENT FRAME MUST FAIL LOUDLY RATHER THAN QUIETLY.
+     * jce_m4_inverse returns IDENTITY when |det| < 1e-8, so inverting a
+     * collapsed parent would yield a perfectly ordinary matrix that places the
+     * entity at the world pose as though it had no parent -- a wrong answer
+     * wearing a correct one's clothes.  Test the basis lengths here, before
+     * the inverse, and leave the entity where it is.
+     *
+     * THIS CANNOT CURRENTLY FIRE, AND SAYING SO IS THE POINT.  Every TRS
+     * composition in this file goes through jce_v3_safe_scale, which
+     * substitutes 1 for a zero scale component, so a parent authored at scale
+     * 0 arrives here as a well-conditioned unit frame -- a test that sets a
+     * parent's scale to zero and expects a refusal FAILS, which is how this
+     * comment came to be written instead of a fixture pretending otherwise.
+     * It stays as a floor: it costs nine multiplies, and the day
+     * scene_local_matrix stops sanitising, the difference between this branch
+     * and jce_m4_inverse's identity fallback is the difference between a
+     * refusal and a body silently placed in the wrong world. */
+    {
+        int axis;
+        for (axis = 0; axis < 3; ++axis) {
+            const float *r = &parent_world.raw[axis][0];
+            if (r[0] * r[0] + r[1] * r[1] + r[2] * r[2] < 1e-16f)
+                return false;
+        }
+    }
+
+    /* Unit scale: the world pose being asked for is a position and a
+     * rotation, and the entity's authored scale is not up for negotiation. */
+    const jce_mat4 world = jce_m4_from_trs(world_position, world_rotation,
+                                           jce_v3(1.0f, 1.0f, 1.0f));
+    const jce_mat4 inv_parent = jce_m4_inverse(&parent_world);
+    const jce_mat4 local = jce_m4_multiply(&inv_parent, &world);
+    jce_m4_decompose(&local, out_local_position, out_local_rotation, NULL);
+    return true;
+}
+
+bool jce_scene_set_world_pose(JceScene *s, JceEntity e, jce_vec3 position,
+                              jce_quat rotation)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    JceTransform *t = jce_scene_get_transform(s, e);
+    if (!t) return false;
+
+    JceTransform next = *t;                  /* scale carried through intact */
+    if (!jce_scene_solve_local_pose(s, e, position, rotation, &next.position,
+                                    &next.rotation))
+        return false;
+    jce_scene_set_transform(s, e, &next);
+    return true;
+}
+
 static bool scene_parent_chain_accepts(const JceScene *s, JceEntity child,
                                        JceEntity parent)
 {
@@ -2062,7 +2216,10 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     if (!s || !v) return;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    /* NULL interned strings: jce_scene_component_normalise.h. */       \
+    TYPE _n = *v;                                                       \
+    jce_scene_normalise_mesh_renderer(s, &_n);                          \
+    ecs_set_ptr(s->world, re, TYPE, &_n);                               \
     jce_scene_invalidate_entity_material(s, e);                         \
     JCE_COMP_CULL_BUMP(s);                                              \
 }                                                                       \
@@ -2432,6 +2589,9 @@ JCE_COMP_IMPL(JcePointLight,                  point_light)
 #undef  JCE_COMP_CULL_BUMP
 #define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceSpotLight,                   spot_light)
+/* Same cull bump as the spot beside it: a light that moves or changes size
+ * changes what the culler must reconsider. */
+JCE_COMP_IMPL(JceAreaLight,                   area_light)
 #undef  JCE_COMP_CULL_BUMP
 #define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceSkyboxComponent,             skybox)
@@ -2502,6 +2662,7 @@ JCE_COMP_IMPL(JceBillboardRendererComponent,  billboard_renderer)
 JCE_COMP_IMPL(JceCanvasComponent,             canvas)
 JCE_COMP_IMPL(JceCanvasGroupComponent,        canvas_group)
 JCE_COMP_IMPL(JceLayoutGroupComponent,        layout_group)
+JCE_COMP_IMPL(JceLayoutElementComponent,      layout_element)
 JCE_COMP_IMPL(JceUIImageComponent,            ui_image)
 JCE_COMP_IMPL(JceUITextComponent,             ui_text)
 JCE_COMP_IMPL(JceUIButtonComponent,           ui_button)
@@ -2521,12 +2682,20 @@ JCE_COMP_IMPL(JceTilemapComponent,            tilemap)
 JCE_COMP_IMPL(JceTilemapCollider2DComponent,  tilemap_collider2d)
 JCE_COMP_IMPL(JceAvatarComponent,             avatar)
 JCE_COMP_IMPL(JceTagComponent,                tag_component)
+/* Cull-relevant: the depth/velocity prepass reads the entity layer for the
+ * camera culling mask, so a layer edit must invalidate the cull freeze. */
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
 JCE_COMP_IMPL(JceLayerComponent,              layer_component)
+#undef  JCE_COMP_CULL_BUMP
+#define JCE_COMP_CULL_BUMP(s)   ((void)0)
 JCE_COMP_IMPL(JceVolumeComponent,             volume)
 JCE_COMP_IMPL(JceOcclusionPortalComponent,    occlusion_portal)
 JCE_COMP_IMPL(JceNavAgentComponent,           nav_agent)
 JCE_COMP_IMPL(JceIkConstraintComponent,       ik_constraints)
 JCE_COMP_IMPL(JceFootIkComponent,             foot_ik)
+JCE_COMP_IMPL(JceContentSizeFitterComponent,  content_size_fitter)
+JCE_COMP_IMPL(JceBoneAttachmentComponent,     bone_attachment)
 JCE_COMP_IMPL(JceFullBodyIkComponent,         full_body_ik)
 JCE_COMP_IMPL(JceSequencePlayerComponent,     sequence_player)
 JCE_COMP_IMPL(JceMorphWeightsComponent,       morph_weights)
@@ -3081,6 +3250,8 @@ void jce_scene_update(JceScene *s, float dt)
        renderer's cross-frame persistent static cache survives a quiet frame. */
     scene_drop_world_cache_frame(s);
 
+    /* Headless has no renderer, which used to be the only driver of this. */
+    jce_scene_environment_advance(s, dt);
     ecs_progress(s->world, dt);
 
     /* JCE_STRESS_SPIN (#4 ECS entity-count benchmark): each frame iterate every

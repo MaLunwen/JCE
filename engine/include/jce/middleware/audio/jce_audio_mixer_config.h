@@ -45,6 +45,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/middleware/audio/jce_audio_mixer.h>
 #include <jce/middleware/audio/jce_audio_dsp.h>
+#include <jce/os/core/jce_json.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -62,6 +63,35 @@ JCE_EXTERN_C_BEGIN
  *
  * Returns true if at least one bus row parsed (so the caller can fall back to a
  * default tree on an empty/unreadable config).  NULL/empty json -> false. */
+/* ── One effect, to and from JSON ─────────────────────────────────────
+ *
+ * PUBLIC BECAUSE THERE WERE TWO OF THEM.  The engine parsed effects in
+ * jce_audio_mixer_config.c and the editor's mixer panel parsed and wrote them
+ * again, with the same field lists spelled twice.  Adding to the palette is
+ * precisely the change that leaves one copy behind -- and the copy left
+ * behind is usually the reader, so the editor saves an effect the runtime
+ * silently drops.
+ *
+ * `from_json` fills `*out` with the type's engine defaults first, so a
+ * missing field keeps the default rather than becoming zero -- a delay with
+ * an absent "dry" should not be silent.  Returns false for an absent or
+ * unknown "type", leaving `*out` untouched.
+ *
+ * A REGISTERED effect (jce_audio_dsp_register_effect) round-trips by NAME:
+ * its "type" string is looked up through jce_audio_dsp_effect_type_from_name,
+ * so a project's own effect is authorable in audio_mixer.json exactly like a
+ * built-in.  Its parameters are NOT interpreted here -- the engine cannot
+ * know them -- so a custom effect's extra members survive a load only if its
+ * own configure() reads them from the blob the owner supplies.
+ */
+JCE_API bool JCE_CALL jce_audio_effect_from_json(const JceJson *e,
+                                                 JceAudioEffectDesc *out);
+
+/* Build an object node for `d`.  Returns NULL on allocation failure; the
+ * caller owns the node.  An unknown type writes {"type":"none"} rather than
+ * nothing, so a chain's indices survive the round trip. */
+JCE_API JceJson *JCE_CALL jce_audio_effect_to_json(const JceAudioEffectDesc *d);
+
 JCE_API bool JCE_CALL jce_audio_mixer_apply_config(JceAudioMixer *m,
                                                    const char *json,
                                                    size_t len);

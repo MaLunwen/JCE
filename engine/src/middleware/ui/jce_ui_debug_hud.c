@@ -10,6 +10,7 @@
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
 
 #include "os/core/jce_memory.h"
 
@@ -231,8 +232,14 @@ void jce_debug_hud_update(JceDebugHud *hud, const JceDebugHudData *data)
 
     /* Renderer backend + detail line. */
     if (jce_ui_elem_valid(hud->el_api_value))
+        /* The OBSERVED backend, version included.  This printed
+         * jce_renderer_get_backend_name(), whose OpenGL string is bgfx's
+         * compile-time BGFX_RENDERER_OPENGL_NAME -- built from the build
+         * floor.  A session that laddered up to a 4.6 core context still
+         * showed "OpenGL 3.1" here, on the same machine where the editor's
+         * two readouts (switched in 8f568dca) showed 4.6. */
         jce_ui_elem_set_text(hud->ui, hud->el_api_value,
-                             jce_renderer_get_backend_name(hud->renderer));
+                             jce_renderer_running_backend_name());
     if (jce_ui_elem_valid(hud->el_api_detail)) {
         uint32_t w, h;
         jce_window_get_size(hud->window, &w, &h);

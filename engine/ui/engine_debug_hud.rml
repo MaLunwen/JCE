@@ -4,7 +4,7 @@ body {
     width: 100%;
     height: 100%;
     margin: 0;
-    font-family: "FOT-MatisseElegantoPro-EB";
+    font-family: "JCE";
     font-size: 14dp;
     color: #f0f0f0;
 }

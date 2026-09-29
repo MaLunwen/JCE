@@ -6,6 +6,8 @@
  */
 
 #include "jce_fv_common.h"
+#include <jce/api_audio.h>
+#include <jce/api_core.h>
 
 extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
@@ -19,17 +21,17 @@ extern "C" {
 struct AudioState {
     char       path[512];
     JceAudio  *audio;
-    JceSound   sound;
     JceVoice   voice;
     float      duration;
     bool       playing;
     bool       loaded;
     bool       load_failed;  /* sticky: don't re-attempt every frame */
 
-    /* Decoded PCM for waveform rendering. */
-    const int16_t *pcm_samples;
-    uint32_t       pcm_frame_count;
-    uint32_t       pcm_channels;
+    JceAudioFile *file;
+    uint32_t channels, samplerate;
+    float waveform_progress;
+    uint64_t trace_next_ms;
+    uint8_t waveform_peaks[JCE_AUDIO_FILE_WAVEFORM_BINS];
 
     /* Scrub control: avoid per-frame seek noise while dragging. */
     bool           scrubbing;
@@ -47,7 +49,7 @@ enum {
 static AudioState s_audio[AUDIO_STATE_MAX];
 
 /* Shared miniaudio engine across all audio tabs. Each tab still owns its
- * own JceSound + JceVoice, but creating one ma_engine per tab cost ~MB of
+ * own streamed file + JceVoice, but creating one ma_engine per tab cost ~MB of
  * mixer state and dozens of internal allocations. We refcount via the
  * number of currently-loaded tabs. */
 static JceAudio *s_shared_audio = nullptr;
@@ -94,8 +96,7 @@ static void free_state(AudioState *st)
     if (!st) return;
     if (st->audio && st->voice != JCE_VOICE_INVALID)
         jce_audio_stop(st->audio, st->voice);
-    if (st->audio && st->sound != JCE_SOUND_INVALID)
-        jce_audio_unload(st->audio, st->sound);
+    jce_audio_file_close(st->file);
     bool had_engine = (st->audio != nullptr);
     memset(st, 0, sizeof(*st));
     if (had_engine)
@@ -144,17 +145,35 @@ static void update_scrub(AudioState *st, int owner, float seek_time)
     st->pending_seek = seek_time;
 }
 
+static uint32_t audio_file_pull(void *user, int16_t *out, uint32_t frames)
+{
+    return jce_audio_file_pull((JceAudioFile *)user,out,frames);
+}
+
+static JceVoice start_voice(AudioState *st)
+{
+    if (jce_audio_file_eof(st->file)) jce_audio_file_seek(st->file,0.0);
+    return jce_audio_play_stream(st->audio,audio_file_pull,st->file,
+                                (uint16_t)st->channels,st->samplerate,1.0f,1.0f);
+}
+
+static void seek_state(AudioState *st, double seconds, bool resume)
+{
+    if (st->voice != JCE_VOICE_INVALID) jce_audio_stop(st->audio,st->voice);
+    st->voice=JCE_VOICE_INVALID;
+    jce_audio_file_seek(st->file,seconds);
+    st->playing=false;
+    if (resume) {
+        st->voice=start_voice(st);
+        st->playing=st->voice != JCE_VOICE_INVALID;
+    }
+}
+
 static void finish_scrub(AudioState *st, int owner)
 {
     if (!st || !st->scrubbing || st->scrub_owner != owner) return;
 
-    if (st->voice != JCE_VOICE_INVALID)
-        jce_audio_seek(st->audio, st->voice, st->pending_seek);
-
-    if (st->resume_after_scrub && st->voice != JCE_VOICE_INVALID) {
-        jce_audio_resume(st->audio, st->voice);
-        st->playing = true;
-    }
+    seek_state(st,st->pending_seek,st->resume_after_scrub);
 
     st->scrubbing = false;
     st->resume_after_scrub = false;
@@ -171,8 +190,8 @@ void fv_audio_update_focus(const char *active_tab_path, bool allow_playback)
         bool is_active_tab = (active_tab_path && strcmp(st->path, active_tab_path) == 0);
         bool can_keep_playing = allow_playback && is_active_tab;
         if (!can_keep_playing) {
-            /* Fully release inactive audio tabs (sound buffer + decoded
-             * PCM). Re-loaded transparently when the tab becomes active
+            /* Release inactive decoders and cancel waveform analysis.
+             * Re-loaded transparently when the tab becomes active
              * again. */
             if (!is_active_tab) {
                 free_state(st);
@@ -195,7 +214,7 @@ void fv_audio_request_play(const char *path)
 
     stop_other_playback(path);
     if (st->voice == JCE_VOICE_INVALID)
-        st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
+        st->voice = start_voice(st);
     else
         jce_audio_resume(st->audio, st->voice);
     st->playing = (st->voice != JCE_VOICE_INVALID);
@@ -224,63 +243,49 @@ static AudioState *ensure_loaded(FvTab *tab)
         return nullptr;
     }
 
-    if (tab->content && tab->content_len > 0) {
-        st->sound = jce_audio_load_memory(st->audio, tab->content,
-                                           (uint32_t)tab->content_len,
-                                           tab->path);
-    } else {
-        st->sound = JCE_SOUND_INVALID;
-    }
-
-    if (st->sound == JCE_SOUND_INVALID) {
-        LOG_ERROR(LOG_TAG, "failed to decode audio: %s", tab->path);
-        audio_engine_release();
-        st->audio = nullptr;
-        st->load_failed = true;  /* sticky: skip retry next frame */
+    st->file=jce_audio_file_open(tab->path);
+    if (!st->file) {
+        LOG_ERROR(LOG_TAG,"failed to stream audio: %s",tab->path);
+        audio_engine_release(); st->audio=nullptr;
+        st->load_failed=true;
         return nullptr;
     }
-
-    st->duration = jce_audio_get_duration(st->audio, st->sound);
-    st->pcm_samples = jce_audio_get_pcm_data(st->audio, st->sound,
-                                              &st->pcm_frame_count,
-                                              &st->pcm_channels);
+    double duration=0.0;
+    jce_audio_file_format(st->file,&st->channels,&st->samplerate,&duration);
+    st->duration=(float)duration;
     st->loaded   = true;
 
-    /* Auto-play on load (same behaviour as the video viewer). */
-    stop_other_playback(tab->path);
-    st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
-    st->playing = (st->voice != JCE_VOICE_INVALID);
+    /* A restored or merely selected tab must remain silent until Play. */
+    st->voice = JCE_VOICE_INVALID;
+    st->playing = false;
 
     return st;
 }
 
-/* ── Simple waveform from raw PCM data ───────────────────────────── */
+/* ── Bounded waveform published by background streaming analysis ── */
 
 static void draw_waveform(ImDrawList *dl, ImVec2 pos, ImVec2 size,
-                           const int16_t *samples, uint32_t frame_count,
-                           uint32_t channels, float current_frac)
+                           const AudioState *st, float current_frac)
 {
     /* Draw background. */
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
                       IM_COL32(30, 30, 40, 255));
 
-    if (!samples || frame_count == 0) return;
-
-    uint32_t sample_count = frame_count * (channels > 0 ? channels : 1);
+    if (st->waveform_progress <= 0.0f) return;
 
     int bars = (int)size.x;
     if (bars <= 0) return;
 
     for (int b = 0; b < bars; ++b) {
-        uint32_t s0 = (uint32_t)((uint64_t)b * sample_count / bars);
-        uint32_t s1 = (uint32_t)((uint64_t)(b + 1) * sample_count / bars);
-        if (s1 > sample_count) s1 = sample_count;
-
-        float peak = 0.0f;
-        for (uint32_t s = s0; s < s1; s += 4) { /* stride for perf */
-            float v = fabsf((float)samples[s] / 32768.0f);
-            if (v > peak) peak = v;
-        }
+        const int first = b * 2048 / bars;
+        int end = (b + 1) * 2048 / bars;
+        if (end <= first) end = first + 1;
+        if (end > 2048) end = 2048;
+        uint8_t peak_byte = 0;
+        for (int i = first; i < end; ++i)
+            if (st->waveform_peaks[i] > peak_byte)
+                peak_byte = st->waveform_peaks[i];
+        const float peak = (float)peak_byte / 255.0f;
 
         float bar_h = peak * size.y * 0.5f;
         float cx = pos.x + (float)b;
@@ -314,10 +319,18 @@ void fv_render_audio(FvTab *tab)
     const bool ui_focused =
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
+    jce_audio_file_waveform(st->file,st->waveform_peaks,
+                            sizeof(st->waveform_peaks),&st->waveform_progress);
+    if (getenv("JCE_AUDIO_TRACE") && jce_time_ticks_ms()>=st->trace_next_ms) {
+        st->trace_next_ms=jce_time_ticks_ms()+1000u;
+        unsigned nonzero=0u;
+        for (uint8_t peak: st->waveform_peaks) if (peak) ++nonzero;
+        LOG_INFO(LOG_TAG,"audio trace playing=%d time=%.3f duration=%.3f waveform=%.3f bins=%u frame_ms=%.3f",
+                 (int)st->playing,jce_audio_file_time(st->file),st->duration,
+                 st->waveform_progress,nonzero,ImGui::GetIO().DeltaTime*1000.0f);
+    }
     float dur = st->duration > 0.0f ? st->duration : 1.0f;
-    float cur = 0.0f;
-    if (st->voice != JCE_VOICE_INVALID)
-        cur = jce_audio_get_time(st->audio, st->voice);
+    float cur = (float)jce_audio_file_time(st->file);
     if (st->scrubbing)
         cur = st->pending_seek;
     float frac = cur / dur;
@@ -332,8 +345,7 @@ void fv_render_audio(FvTab *tab)
         if (!st->playing) {
             stop_other_playback(tab->path);
             if (st->voice == JCE_VOICE_INVALID)
-                st->voice = jce_audio_play(st->audio, st->sound,
-                                            false, 1.0f, 1.0f);
+                st->voice = start_voice(st);
             else
                 jce_audio_resume(st->audio, st->voice);
             st->playing = (st->voice != JCE_VOICE_INVALID);
@@ -343,8 +355,7 @@ void fv_render_audio(FvTab *tab)
     }
     ImGui::SameLine();
     if (ImGui::Button(" |< ")) {
-        if (st->voice != JCE_VOICE_INVALID)
-            jce_audio_seek(st->audio, st->voice, 0.0f);
+        seek_state(st,0.0,st->playing);
     }
     ImGui::SameLine();
     ImGui::Text("%.2fs / %.2fs", cur, dur);
@@ -360,7 +371,7 @@ void fv_render_audio(FvTab *tab)
     } else if (st->scrubbing && st->scrub_owner == AUDIO_SCRUB_SLIDER) {
         finish_scrub(st, AUDIO_SCRUB_SLIDER);
     } else if (seek_changed && st->voice != JCE_VOICE_INVALID) {
-        jce_audio_seek(st->audio, st->voice, cur);
+        seek_state(st,cur,st->playing);
     }
     ImGui::PopItemWidth();
 
@@ -374,8 +385,7 @@ void fv_render_audio(FvTab *tab)
     ImVec2 wf_size = ImVec2(avail.x, wf_h);
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    draw_waveform(dl, wf_pos, wf_size, st->pcm_samples,
-                  st->pcm_frame_count, st->pcm_channels, frac);
+    draw_waveform(dl, wf_pos, wf_size, st, frac);
 
     /* Invisible button for click-to-seek on waveform. */
     ImGui::InvisibleButton("##waveform", wf_size);
@@ -392,7 +402,9 @@ void fv_render_audio(FvTab *tab)
 
     /* Auto-stop when playback reaches the end. */
     if (st->playing && st->voice != JCE_VOICE_INVALID &&
-        !jce_audio_is_playing(st->audio, st->voice)) {
+        jce_audio_file_eof(st->file)) {
+        jce_audio_stop(st->audio, st->voice);
+        st->voice = JCE_VOICE_INVALID;
         st->playing = false;
     }
 
@@ -401,8 +413,7 @@ void fv_render_audio(FvTab *tab)
         if (!st->playing) {
             stop_other_playback(tab->path);
             if (st->voice == JCE_VOICE_INVALID)
-                st->voice = jce_audio_play(st->audio, st->sound,
-                                            false, 1.0f, 1.0f);
+                st->voice = start_voice(st);
             else
                 jce_audio_resume(st->audio, st->voice);
             st->playing = (st->voice != JCE_VOICE_INVALID);

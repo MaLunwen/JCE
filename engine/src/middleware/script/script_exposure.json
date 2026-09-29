@@ -20,140 +20,794 @@
     "",
     "Modifiers: bind_args, out_capacity, index_base, optional, release,",
     "absent_value, miss_value, clamp_min, strict.  Entries are never renamed",
-    "or removed; a rename is an add plus deprecated:true on the old entry."
+    "or removed; a rename is an add plus deprecated:true on the old entry.",
+    "",
+    "KNOWN GAP (2026-09-01, is_key_down).  jce.is_key_down now answers the",
+    "real keyboard -- host.is_key_down had no writer and the binding returned",
+    "false forever -- but its argument is a JCE_KEY_* value from",
+    "<jce/os/platform/jce_keys.h>, and those are USB HID scancodes: A is 4,",
+    "W is 26.  C and C++ script modules get the macros; Lua, Python, Java, JS",
+    "and C# authors must write the numbers.  The `constants` bucket below",
+    "cannot close this: its one entry is a Lua lightuserdata sentinel, not a",
+    "numeric table, so exposing ~250 named keycodes needs a generator feature",
+    "across all seven languages.  That gap PREDATES the fix and is not made",
+    "worse by it -- before, the constants would have named keys nothing could",
+    "read."
   ],
   "declared_totals": {
-    "host_members": 74,
-    "expose": 71,
-    "hand_written": 7,
+    "host_members": 105,
+    "expose": 101,
+    "hand_written": 8,
     "constants": 1,
-    "table_keys": 79,
-    "members_reached_by_generated": 70,
-    "members_reached_only_by_hand_written": 4
+    "table_keys": 110,
+    "members_reached_by_generated": 100,
+    "members_reached_only_by_hand_written": 5
   },
   "hand_written": [
-    { "name": "log", "vtable": "log", "since": 1,
-      "reason": "no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the only one among the 78" },
-    { "name": "asset_read_text", "vtable": "read_file", "since": 1,
-      "reason": "policy, not glue: script_virtual_asset_path_valid (:66, called :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:86), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)" },
-    { "name": "asset_read_json", "vtable": "read_file", "since": 1,
-      "reason": "all of asset_read_text (the same script_virtual_asset_path_valid at :219) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)" },
-    { "name": "play_sound", "vtable": "play_sound", "since": 1,
+    {
+      "name": "line_set_points",
+      "vtable": "line_set_points",
+      "since": 1,
+      "reason": "marshalling, not glue: the host takes a packed `const float *xyz, int count` and no generated shape reads a Lua array into one. Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and the returned stored-count live in one place. Exists because the comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key by walking the object's child list (jce_scene_components_render.c parse_line_renderer)"
+    },
+    {
+      "name": "log",
+      "vtable": "log",
+      "since": 1,
+      "reason": "no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the only one among the 78"
+    },
+    {
+      "name": "asset_read_text",
+      "vtable": "read_file",
+      "since": 1,
+      "reason": "policy, not glue: script_virtual_asset_path_valid (:67, called :103), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap (jce_script.h:114), jce_free on every exit path. A generated read_file template is a sandbox escape (P0-2)"
+    },
+    {
+      "name": "asset_read_json",
+      "vtable": "read_file",
+      "since": 1,
+      "reason": "all of asset_read_text (the same script_virtual_asset_path_valid at :220) plus a depth- and node-capped JSON walk, non-finite rejection, the json_null sentinel and distinct string error codes (P0-2)"
+    },
+    {
+      "name": "play_sound",
+      "vtable": "play_sound",
+      "since": 1,
       "also_reaches": "play_sound_spatial",
-      "reason": "arity dispatch across two members: lua_gettop at :263 routes to play_sound_spatial (:286) or play_sound (:289); its own comment at :280 concedes top == 3 is ambiguous" },
-    { "name": "start_coroutine", "vtable": null, "since": 1,
-      "reason": "Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume; owns s->coros[]" },
-    { "name": "wait_seconds", "vtable": null, "since": 1,
-      "reason": "lua_yield into the same scheduler" },
-    { "name": "stop_coroutine", "vtable": null, "since": 1,
-      "reason": "scans s->coros[]" }
+      "reason": "arity dispatch across two members: lua_gettop at :264 routes to play_sound_spatial (:287) or play_sound (:290); its own comment at :281 concedes top == 3 is ambiguous"
+    },
+    {
+      "name": "start_coroutine",
+      "vtable": null,
+      "since": 1,
+      "reason": "Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume; owns s->coros[]"
+    },
+    {
+      "name": "wait_seconds",
+      "vtable": null,
+      "since": 1,
+      "reason": "lua_yield into the same scheduler"
+    },
+    {
+      "name": "stop_coroutine",
+      "vtable": null,
+      "since": 1,
+      "reason": "scans s->coros[]"
+    }
   ],
   "internal": [],
   "constants": [
-    { "name": "json_null", "kind": "lightuserdata_sentinel", "since": 1,
-      "doc": "Null sentinel returned inside asset_read_json tables. Compared by identity, so it must be the same object the reader pushes." }
+    {
+      "name": "json_null",
+      "kind": "lightuserdata_sentinel",
+      "since": 1,
+      "doc": "Null sentinel returned inside asset_read_json tables. Compared by identity, so it must be the same object the reader pushes."
+    }
   ],
   "expose": [
-    { "name": "get_position", "vtable": "get_position", "shape": "fallible_out", "since": 1,
-      "doc": "World-space position of `entity`. Absent when the entity has no transform." },
-    { "name": "set_position", "vtable": "set_position", "shape": "void_call", "since": 1 },
-    { "name": "get_rotation", "vtable": "get_rotation", "shape": "fallible_out", "since": 1 },
-    { "name": "set_rotation", "vtable": "set_rotation", "shape": "void_call", "since": 1 },
-    { "name": "get_scale", "vtable": "get_scale", "shape": "fallible_out", "since": 1 },
-    { "name": "set_scale", "vtable": "set_scale", "shape": "void_call", "since": 1 },
-    { "name": "set_parent", "vtable": "set_parent", "shape": "value_return", "since": 1,
-      "strict": ["preserve_world"],
-      "doc": "The ONLY boolean argument on this surface that is type-checked; the other five accept any truthy value. The luaL_checktype is emitted from this entry's `strict` modifier -- no line citation, because the hand-written body that carried it is gone. test_strict_emits_a_type_check_only_for_the_named_parameter is what fails if the emitter drops it." },
-    { "name": "get_parent", "vtable": "get_parent", "shape": "value_return", "since": 1 },
-    { "name": "is_key_down", "vtable": "is_key_down", "shape": "value_return", "since": 1 },
-    { "name": "find_with_tag", "vtable": "find_with_tag", "shape": "value_return", "since": 1 },
-    { "name": "destroy", "vtable": "destroy_entity", "shape": "void_call", "since": 1 },
-    { "name": "spawn", "vtable": "spawn", "shape": "value_return", "since": 1,
-      "optional": { "x": 0.0, "y": 0.0, "z": 0.0 } },
-    { "name": "move_axis", "vtable": "move_axis", "shape": "void_out_array", "since": 1 },
-    { "name": "jump_pressed", "vtable": "input_button", "shape": "value_return", "since": 1,
-      "bind_args": { "button": 0 } },
-    { "name": "sprint", "vtable": "input_button", "shape": "value_return", "since": 1,
-      "bind_args": { "button": 1 } },
-    { "name": "attack_pressed", "vtable": "input_button", "shape": "value_return", "since": 1,
-      "bind_args": { "button": 2 } },
-    { "name": "set_time_scale", "vtable": "set_time_scale", "shape": "void_call", "since": 1 },
-    { "name": "pause", "vtable": "set_paused", "shape": "void_call", "since": 1,
-      "optional": { "paused": true },
-      "doc": "jce.pause() with no argument pauses; jce.pause(false) resumes." },
-    { "name": "shake_camera", "vtable": "shake_camera", "shape": "void_call", "since": 1,
-      "optional": { "amount": 0.5 } },
-    { "name": "music_set_intensity", "vtable": "music_set_intensity", "shape": "void_call", "since": 1 },
-    { "name": "music_get_intensity", "vtable": "music_get_intensity", "shape": "value_return", "since": 1 },
-    { "name": "music_request_transition", "vtable": "music_request_transition", "shape": "value_return", "since": 1,
+    {
+      "name": "get_position",
+      "vtable": "get_position",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "LOCAL position of `entity` -- its own translation, not composed up the parent chain. Absent when the entity has no transform. Use get_world_position for the composed pose. This doc said 'World-space' until 2026-08-26; the implementation always returned the local TRS (jce_scene_get_transform), and the wrong word was generated into all five language SDKs."
+    },
+    {
+      "name": "set_position",
+      "vtable": "set_position",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "get_rotation",
+      "vtable": "get_rotation",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "set_rotation",
+      "vtable": "set_rotation",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "get_scale",
+      "vtable": "get_scale",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "get_world_position",
+      "vtable": "get_world_position",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "WORLD position of `entity`: its local TRS composed up the parent chain (jce_scene_get_world_matrix). Absent when the entity has no transform. Every parented rig -- arms, jaws, fingers, pads -- needs this rather than get_position."
+    },
+    {
+      "name": "set_scale",
+      "vtable": "set_scale",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "set_parent",
+      "vtable": "set_parent",
+      "shape": "value_return",
+      "since": 1,
+      "strict": [
+        "preserve_world"
+      ],
+      "doc": "The ONLY boolean argument on this surface that is type-checked; the other five accept any truthy value. The luaL_checktype is emitted from this entry's `strict` modifier -- no line citation, because the hand-written body that carried it is gone. test_strict_emits_a_type_check_only_for_the_named_parameter is what fails if the emitter drops it."
+    },
+    {
+      "name": "get_parent",
+      "vtable": "get_parent",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "is_key_down",
+      "vtable": "is_key_down",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "find_with_tag",
+      "vtable": "find_with_tag",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "destroy",
+      "vtable": "destroy_entity",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "spawn",
+      "vtable": "spawn",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "name": "move_axis",
+      "vtable": "move_axis",
+      "shape": "void_out_array",
+      "since": 1
+    },
+    {
+      "name": "jump_pressed",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 0
+      }
+    },
+    {
+      "name": "sprint",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 1
+      }
+    },
+    {
+      "name": "attack_pressed",
+      "vtable": "input_button",
+      "shape": "value_return",
+      "since": 1,
+      "bind_args": {
+        "button": 2
+      }
+    },
+    {
+      "name": "set_time_scale",
+      "vtable": "set_time_scale",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "pause",
+      "vtable": "set_paused",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "paused": true
+      },
+      "doc": "jce.pause() with no argument pauses; jce.pause(false) resumes."
+    },
+    {
+      "name": "shake_camera",
+      "vtable": "shake_camera",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "amount": 0.5
+      }
+    },
+    {
+      "name": "music_set_intensity",
+      "vtable": "music_set_intensity",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "music_get_intensity",
+      "vtable": "music_get_intensity",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "music_request_transition",
+      "vtable": "music_request_transition",
+      "shape": "value_return",
+      "since": 1,
       "absent_value": -1.0,
-      "doc": "Absolute playhead time of the quantized switch; negative on miss or no track, which is why the no-host value is -1 and not 0." },
-    { "name": "gas_activate", "vtable": "gas_activate", "shape": "value_return", "since": 1 },
-    { "name": "gas_get", "vtable": "gas_get", "shape": "fallible_out", "since": 1 },
-    { "name": "gas_apply", "vtable": "gas_apply", "shape": "value_return", "since": 1,
-      "optional": { "op": 0, "duration_seconds": 0.0 } },
-    { "name": "raycast", "vtable": "raycast", "shape": "fallible_out", "since": 1,
+      "doc": "Absolute playhead time of the quantized switch; negative on miss or no track, which is why the no-host value is -1 and not 0."
+    },
+    {
+      "name": "gas_activate",
+      "vtable": "gas_activate",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "gas_get",
+      "vtable": "gas_get",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "gas_apply",
+      "vtable": "gas_apply",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "op": 0,
+        "duration_seconds": 0.0
+      }
+    },
+    {
+      "name": "raycast",
+      "vtable": "raycast",
+      "shape": "fallible_out",
+      "since": 1,
       "miss_value": 0,
-      "doc": "8 values on a hit; a MISS pushes integer 0, not nil -- scripts branch on `e == 0`." },
-    { "name": "apply_impulse", "vtable": "apply_impulse", "shape": "void_call", "since": 1 },
-    { "name": "set_velocity", "vtable": "set_velocity", "shape": "void_call", "since": 1 },
-    { "name": "anim_set_float", "vtable": "anim_set_float", "shape": "void_call", "since": 1 },
-    { "name": "anim_set_int", "vtable": "anim_set_int", "shape": "void_call", "since": 1 },
-    { "name": "anim_set_bool", "vtable": "anim_set_bool", "shape": "void_call", "since": 1 },
-    { "name": "anim_set_trigger", "vtable": "anim_set_trigger", "shape": "void_call", "since": 1 },
-    { "name": "is_action_down", "vtable": "action_down", "shape": "value_return", "since": 1 },
-    { "name": "is_action_pressed", "vtable": "action_pressed", "shape": "value_return", "since": 1 },
-    { "name": "get_axis", "vtable": "action_axis", "shape": "value_return", "since": 1 },
-    { "name": "get_pointer_delta", "vtable": "pointer_delta", "shape": "void_out_array", "since": 1 },
-    { "name": "get_pointer_wheel", "vtable": "pointer_wheel", "shape": "value_return", "since": 1 },
-    { "name": "is_pointer_down", "vtable": "pointer_button", "shape": "value_return", "since": 1 },
-    { "name": "get_touch_count", "vtable": "touch_count", "shape": "value_return", "since": 1,
+      "doc": "8 values on a hit; a MISS pushes integer 0, not nil -- scripts branch on `e == 0`."
+    },
+    {
+      "name": "raycast_filtered",
+      "vtable": "raycast_filtered",
+      "shape": "fallible_out",
+      "since": 1,
+      "miss_value": 0,
+      "doc": "Closest hit along the ray, honouring a layer mask and the trigger skip -- 8 values on a hit; a MISS pushes integer 0, not nil, so scripts branch on `e == 0`, the same as jce.raycast. layer_mask 0 means every layer and hit_triggers defaults to false, so the common call stays origin/dir/distance and the filter is what you add when you need it. hit_triggers is separate from the mask because a trigger volume is not a layer: collapsing them would make 'ignore triggers on layer 3' inexpressible.",
+      "optional": {
+        "layer_mask": 0,
+        "hit_triggers": false
+      }
+    },
+    {
+      "name": "raycast_all",
+      "vtable": "raycast_all",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Every entity the ray passes through, as one array sorted near to far. layer_mask 0 means every layer; hit_triggers defaults to false. Returns ENTITIES rather than full hit records because the eight-value hit does not survive as an array shape across seven languages without inventing a per-language container -- re-query a specific one with jce.raycast_filtered when you need its point and normal.",
+      "optional": {
+        "layer_mask": 0,
+        "hit_triggers": false
+      }
+    },
+    {
+      "name": "apply_impulse",
+      "vtable": "apply_impulse",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "set_velocity",
+      "vtable": "set_velocity",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "anim_set_float",
+      "vtable": "anim_set_float",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "anim_set_int",
+      "vtable": "anim_set_int",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "anim_set_bool",
+      "vtable": "anim_set_bool",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "anim_set_trigger",
+      "vtable": "anim_set_trigger",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "is_action_down",
+      "vtable": "action_down",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "is_action_pressed",
+      "vtable": "action_pressed",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "get_axis",
+      "vtable": "action_axis",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "get_pointer_delta",
+      "vtable": "pointer_delta",
+      "shape": "void_out_array",
+      "since": 1
+    },
+    {
+      "name": "get_pointer_wheel",
+      "vtable": "pointer_wheel",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "is_pointer_down",
+      "vtable": "pointer_button",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "get_touch_count",
+      "vtable": "touch_count",
+      "shape": "value_return",
+      "since": 1,
       "clamp_min": 0,
-      "doc": "A host returning a negative count is clamped to 0 so `for i = 1, jce.get_touch_count()` cannot underflow." },
-    { "name": "get_touch", "vtable": "touch_get", "shape": "fallible_out", "since": 1,
+      "doc": "A host returning a negative count is clamped to 0 so `for i = 1, jce.get_touch_count()` cannot underflow."
+    },
+    {
+      "name": "get_touch",
+      "vtable": "touch_get",
+      "shape": "fallible_out",
+      "since": 1,
       "index_base": 1,
-      "doc": "1-based Lua index mapped to 0-based C; an index below 1 returns nil without calling the host." },
-    { "name": "tr", "vtable": "loc_translate", "shape": "value_return", "since": 1,
-      "absent_value": { "param": "key" },
-      "doc": "Passthrough is the contract, not a fallback: an unlocalized build shows readable keys instead of blank UI." },
-    { "name": "get_locale", "vtable": "loc_get_locale", "shape": "value_return", "since": 1 },
-    { "name": "set_locale", "vtable": "loc_set_locale", "shape": "void_call", "since": 1 },
-    { "name": "get_velocity", "vtable": "get_velocity", "shape": "fallible_out", "since": 1 },
-    { "name": "vehicle_set_input", "vtable": "vehicle_set_input", "shape": "void_call", "since": 1 },
-    { "name": "vehicle_get_speed", "vtable": "vehicle_get_speed", "shape": "value_return", "since": 1 },
-    { "name": "get_move", "vtable": "get_move", "shape": "void_out_array", "since": 1 },
-    { "name": "ui_get_slider", "vtable": "ui_get_slider", "shape": "fallible_out", "since": 1 },
-    { "name": "ui_set_slider", "vtable": "ui_set_slider", "shape": "void_call", "since": 1 },
-    { "name": "ui_get_toggle", "vtable": "ui_get_toggle", "shape": "fallible_out", "since": 1 },
-    { "name": "ui_set_toggle", "vtable": "ui_set_toggle", "shape": "void_call", "since": 1 },
-    { "name": "ui_set_text", "vtable": "ui_set_text", "shape": "void_call", "since": 1 },
-    { "name": "send_message", "vtable": "send_message", "shape": "void_call", "since": 1,
-      "optional": { "number_arg": 0.0, "str_arg": null } },
-    { "name": "broadcast", "vtable": "broadcast", "shape": "void_call", "since": 1,
-      "optional": { "number_arg": 0.0, "str_arg": null } },
-    { "name": "has_component", "vtable": "has_component", "shape": "value_return", "since": 1 },
-    { "name": "is_component_enabled", "vtable": "is_component_enabled", "shape": "value_return", "since": 1 },
-    { "name": "set_component_enabled", "vtable": "set_component_enabled", "shape": "void_call", "since": 1 },
-    { "name": "net_is_server", "vtable": "net_is_server", "shape": "value_return", "since": 1 },
-    { "name": "net_is_client", "vtable": "net_is_client", "shape": "value_return", "since": 1 },
-    { "name": "net_spawn", "vtable": "net_spawn", "shape": "value_return", "since": 1 },
-    { "name": "rpc_send", "vtable": "rpc_send", "shape": "value_return", "since": 1,
-      "optional": { "target": 0, "payload": null } },
-    { "name": "particle_burst", "vtable": "particle_burst", "shape": "void_call", "since": 1 },
-    { "name": "particle_set_emitting", "vtable": "particle_set_emitting", "shape": "void_call", "since": 1 },
-    { "name": "particle_set_color", "vtable": "particle_set_color", "shape": "void_call", "since": 1 },
-    { "name": "find_by_name", "vtable": "find_by_name", "shape": "first_and_count", "since": 1,
+      "doc": "1-based Lua index mapped to 0-based C; an index below 1 returns nil without calling the host."
+    },
+    {
+      "name": "tr",
+      "vtable": "loc_translate",
+      "shape": "value_return",
+      "since": 1,
+      "absent_value": {
+        "param": "key"
+      },
+      "doc": "Passthrough is the contract, not a fallback: an unlocalized build shows readable keys instead of blank UI."
+    },
+    {
+      "name": "get_locale",
+      "vtable": "loc_get_locale",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "set_locale",
+      "vtable": "loc_set_locale",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "get_velocity",
+      "vtable": "get_velocity",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "vehicle_set_input",
+      "vtable": "vehicle_set_input",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "vehicle_get_speed",
+      "vtable": "vehicle_get_speed",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "get_move",
+      "vtable": "get_move",
+      "shape": "void_out_array",
+      "since": 1
+    },
+    {
+      "name": "ui_get_slider",
+      "vtable": "ui_get_slider",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "ui_set_slider",
+      "vtable": "ui_set_slider",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "ui_get_progress",
+      "vtable": "ui_get_progress",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "ui_set_progress",
+      "vtable": "ui_set_progress",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "ui_get_toggle",
+      "vtable": "ui_get_toggle",
+      "shape": "fallible_out",
+      "since": 1
+    },
+    {
+      "name": "ui_set_toggle",
+      "vtable": "ui_set_toggle",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "ui_set_text",
+      "vtable": "ui_set_text",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "send_message",
+      "vtable": "send_message",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "number_arg": 0.0,
+        "str_arg": null
+      }
+    },
+    {
+      "name": "broadcast",
+      "vtable": "broadcast",
+      "shape": "void_call",
+      "since": 1,
+      "optional": {
+        "number_arg": 0.0,
+        "str_arg": null
+      }
+    },
+    {
+      "name": "has_component",
+      "vtable": "has_component",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "is_component_enabled",
+      "vtable": "is_component_enabled",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "set_component_enabled",
+      "vtable": "set_component_enabled",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "net_is_server",
+      "vtable": "net_is_server",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "net_is_client",
+      "vtable": "net_is_client",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "net_spawn",
+      "vtable": "net_spawn",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "rpc_send",
+      "vtable": "rpc_send",
+      "shape": "value_return",
+      "since": 1,
+      "optional": {
+        "target": 0,
+        "payload": null
+      }
+    },
+    {
+      "name": "particle_burst",
+      "vtable": "particle_burst",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "particle_set_emitting",
+      "vtable": "particle_set_emitting",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "particle_set_color",
+      "vtable": "particle_set_color",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "find_by_name",
+      "vtable": "find_by_name",
+      "shape": "first_and_count",
+      "since": 1,
       "out_capacity": 2,
-      "doc": "first-or-nil AND a match count, so a strict scene director can reject duplicate authored names. IDENTICAL C signature to find_by_prefix and a DIFFERENT contract." },
-    { "name": "find_by_prefix", "vtable": "find_by_prefix", "shape": "entity_table", "since": 1,
+      "doc": "first-or-nil AND a match count, so a strict scene director can reject duplicate authored names. IDENTICAL C signature to find_by_prefix and a DIFFERENT contract."
+    },
+    {
+      "name": "find_by_prefix",
+      "vtable": "find_by_prefix",
+      "shape": "entity_table",
+      "since": 1,
       "out_capacity": 1024,
-      "doc": "One Lua array. IDENTICAL C signature to find_by_name and a DIFFERENT contract." },
-    { "name": "comp_get", "vtable": "comp_get_json", "shape": "owned_string_release", "since": 1,
-      "release": "json_free" },
-    { "name": "comp_set", "vtable": "comp_set_json", "shape": "value_return", "since": 1 },
-    { "name": "render_get", "vtable": "render_get_json", "shape": "owned_string_release", "since": 1,
-      "release": "json_free" },
-    { "name": "render_set", "vtable": "render_set_json", "shape": "value_return", "since": 1 },
-    { "name": "audio_set_volume", "vtable": "audio_set_volume", "shape": "void_call", "since": 1 }
+      "doc": "One Lua array. IDENTICAL C signature to find_by_name and a DIFFERENT contract."
+    },
+    {
+      "name": "comp_get",
+      "vtable": "comp_get_json",
+      "shape": "owned_string_release",
+      "since": 1,
+      "release": "json_free"
+    },
+    {
+      "name": "comp_set",
+      "vtable": "comp_set_json",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "render_get",
+      "vtable": "render_get_json",
+      "shape": "owned_string_release",
+      "since": 1,
+      "release": "json_free"
+    },
+    {
+      "name": "render_set",
+      "vtable": "render_set_json",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "audio_set_volume",
+      "vtable": "audio_set_volume",
+      "shape": "void_call",
+      "since": 1
+    },
+    {
+      "name": "ui_get_dropdown",
+      "vtable": "ui_get_dropdown",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Selected option INDEX of `entity`'s UIDropdown. Absent when the entity has no dropdown, so a script can tell 'no dropdown' from 'a dropdown reading 0'. The index and not the label: branching on which option is the common case, and a label would make it a string compare."
+    },
+    {
+      "name": "ui_set_dropdown",
+      "vtable": "ui_set_dropdown",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Select an option by INDEX. Clamped into [0, option_count-1] rather than refused, the way ui_set_progress clamps and the way the scene loader clamps: the draw already clamps, so storing outside the range would make the component and the picture disagree."
+    },
+    {
+      "name": "ui_get_input_text",
+      "vtable": "ui_get_input_text",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Current text of `entity`'s UIInputField, or '' when it has none. The string is the component's own buffer and is valid until the next mutation of that entity -- the same contract tr() and get_locale() carry; every binding copies it and none may store it."
+    },
+    {
+      "name": "ui_set_input_text",
+      "vtable": "ui_set_input_text",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Replace the UIInputField's text. Truncated to the field's capacity and to char_limit when one is set -- the same cap the canvas applies to typed input, so a script write and a keystroke cannot disagree about what the field holds. A truncation is logged rather than silent."
+    },
+    {
+      "name": "ui_get_scroll",
+      "vtable": "ui_get_scroll",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units -- what the component stores and what the wheel path clamps, not device px. Absent when the entity has no scroll view."
+    },
+    {
+      "name": "ui_set_scroll",
+      "vtable": "ui_set_scroll",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Set the scroll offset in reference units. A disabled axis is pinned to 0 and each axis is clamped the way the wheel path clamps, so a script cannot push the offset somewhere a wheel could not; the canvas re-clamps against the resolved viewport on the next render."
+    },
+    {
+      "name": "world_get_hour",
+      "vtable": "world_get_hour",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Live hour of day in [0, 24) -- what the sky is showing now, NOT the authored tod_hour seed a scene starts from.  Reading the seed would return the level's start-of-day forever while the sky moved."
+    },
+    {
+      "name": "world_set_hour",
+      "vtable": "world_set_hour",
+      "shape": "void_call",
+      "since": 1,
+      "doc": "Move the live clock, wrapping into [0, 24).  For 'sleep until dawn'.  The authored seed is untouched, so reloading the scene still starts where the designer set it."
+    },
+    {
+      "name": "world_is_daytime",
+      "vtable": "world_is_daytime",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "True while the sun is above the horizon.  THE predicate for 'is it night?' -- every key-light chooser in the engine is required to agree on this one, so a script that rolled its own threshold would disagree with the lighting it can see."
+    },
+    {
+      "name": "world_get_weather",
+      "vtable": "world_get_weather",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Authored weather type: 0 clear, 1 rain, 2 snow."
+    },
+    {
+      "name": "world_get_weather_intensity",
+      "vtable": "world_get_weather_intensity",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Authored weather intensity in [0, 1]."
+    },
+    {
+      "name": "world_get_wind_speed",
+      "vtable": "world_get_wind_speed",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Instantaneous wind speed in m/s -- the sustained speed plus this moment's gust.  Do NOT key a cache on it: it changes every frame by design.  It is the same number the ocean spectrum and the vegetation shader read, so a script cannot disagree with what is on screen."
+    },
+    {
+      "name": "request_scene",
+      "vtable": "request_scene",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "is_transitioning",
+      "vtable": "is_transitioning",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "audio_play",
+      "vtable": "audio_play",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "audio_stop",
+      "vtable": "audio_stop",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "audio_is_playing",
+      "vtable": "audio_is_playing",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "save_game",
+      "vtable": "save_game",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "load_game",
+      "vtable": "load_game",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "overlap_sphere",
+      "vtable": "overlap_sphere",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Entities whose collider overlaps the sphere, as one array. layer_mask 0 means all layers. Triggers are skipped. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size.",
+      "optional": {
+        "layer_mask": 0
+      }
+    },
+    {
+      "name": "overlap_box",
+      "vtable": "overlap_box",
+      "shape": "entity_table",
+      "since": 1,
+      "out_capacity": 256,
+      "doc": "Entities whose collider overlaps the axis-aligned box (half-extents), as one array. layer_mask 0 means all layers. layer_mask is OPTIONAL: omitting it means every layer, which is what an explosion or a pickup check wants and keeps the common call to its coordinates and its size.",
+      "optional": {
+        "layer_mask": 0
+      }
+    },
+    {
+      "name": "get_param",
+      "vtable": "get_script_param",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Returns kind, number, entity for an AUTHORED script parameter -- Unity's [SerializeField], Godot's @export.  Returns nil when the entity has no script component, when no parameter of that name is authored, or when the name is empty: three absences a script cannot act differently on, so `jce.get_param(e, 'speed') or 3.0` reads the way an author expects."
+    },
+    {
+      "name": "get_param_text",
+      "vtable": "get_script_param_text",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "The TEXT value of an authored script parameter, or '' when the entity has no script component, no parameter of that name, or one that is not text. Empty rather than nil for the same reason ui_get_input_text is empty: a script comparing strings should not have to test for nil first. The string is the component's own buffer -- copy it if you keep it."
+    },
+    {
+      "name": "curve_eval",
+      "vtable": "curve_eval",
+      "shape": "fallible_out",
+      "since": 1,
+      "doc": "Sample an AUTHORED curve -- the documents the editor's Curve Editor writes, which nothing could read until this binding existed. Unity's AnimationCurve shape: the curve is a designer-authored function and the script decides what it means, so the engine never has to invent what a curve DRIVES. Returns nil when the path does not resolve, the document does not parse, the named channel is absent, or that channel has no keys -- so a curve that genuinely evaluates to 0 and a curve that is not there are never one reading, and `jce.curve_eval(p, 'kick', t) or 0.0` reads the way an author expects. An empty channel name means the FIRST channel, which is a different request from a name that is not there. The parsed curve is cached per runtime, so a call inside on_update costs a name compare, not a JSON parse."
+    },
+    {
+      "name": "vcam_activate",
+      "vtable": "vcam_activate",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Cut to the virtual camera with this name, ahead of priority.  Returns 1 when the name resolves to a camera that is active and enabled, 0 otherwise -- the request is recorded either way, so naming a camera in a streaming cell that has not loaded yet does not silently become 'whatever priority says'.  Pass an empty string to clear it and hand the decision back to priority.  It does NOT rewrite the authored components: the override lives in the vcam system, so a cutscene cannot bake its camera choice into the level file."
+    }
   ]
 }

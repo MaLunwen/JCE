@@ -16,17 +16,33 @@ void parse_terrain(JceScene *s, JceEntity e, const cJSON *c)
     memset(&tc, 0, sizeof(tc));
     copy_str(tc.terrain_path, sizeof(tc.terrain_path),
              j_str(c, "terrainPath", ""));
-    const char *keys[4] = { "layerAlbedoPath0", "layerAlbedoPath1",
-                            "layerAlbedoPath2", "layerAlbedoPath3" };
-    for (int i = 0; i < 4; ++i)
+    const char *albedo_keys[4] = { "layerAlbedoPath0", "layerAlbedoPath1",
+                                   "layerAlbedoPath2", "layerAlbedoPath3" };
+    const char *normal_keys[4] = { "layerNormalPath0", "layerNormalPath1",
+                                   "layerNormalPath2", "layerNormalPath3" };
+    const char *mask_keys[4] = { "layerMaskPath0", "layerMaskPath1",
+                                 "layerMaskPath2", "layerMaskPath3" };
+    const char *normal_scale_keys[4] = {
+        "layerNormalScale0", "layerNormalScale1",
+        "layerNormalScale2", "layerNormalScale3"
+    };
+    for (int i = 0; i < 4; ++i) {
         copy_str(tc.layer_albedo_path[i], sizeof(tc.layer_albedo_path[i]),
-                 j_str(c, keys[i], ""));
+                 j_str(c, albedo_keys[i], ""));
+        copy_str(tc.layer_normal_path[i], sizeof(tc.layer_normal_path[i]),
+                 j_str(c, normal_keys[i], ""));
+        copy_str(tc.layer_mask_path[i], sizeof(tc.layer_mask_path[i]),
+                 j_str(c, mask_keys[i], ""));
+        tc.layer_normal_scale[i] =
+            (float)j_num(c, normal_scale_keys[i], 1.0);
+    }
     tc.tile_scale     = (float)j_num(c, "tileScale", 10.0);
     tc.tint[0]        = (float)j_num(c, "tintR", 1.0);
     tc.tint[1]        = (float)j_num(c, "tintG", 1.0);
     tc.tint[2]        = (float)j_num(c, "tintB", 1.0);
     tc.visible        = j_bool(c, "visible", true);
     tc.splat_enabled  = j_bool(c, "splatEnabled", true);
+    tc.height_blend   = (float)j_num(c, "heightBlend", 0.0);
     jce_scene_set_terrain(s, e, &tc);
 }
 
@@ -39,6 +55,8 @@ void parse_vegetation_scatter(JceScene *s, JceEntity e, const cJSON *c)
     copy_str(vs.albedo_path, sizeof(vs.albedo_path), j_str(c, "albedoPath", ""));
     copy_str(vs.density_mask_path, sizeof(vs.density_mask_path),
              j_str(c, "densityMaskPath", ""));
+    copy_str(vs.baked_placement_path, sizeof(vs.baked_placement_path),
+             j_str(c, "bakedPlacementPath", ""));
     vs.density         = (float)j_num(c, "density", 1.0);
     vs.seed            = (uint32_t)j_num(c, "seed", 12345.0);
     vs.area_x          = (float)j_num(c, "areaX", 10.0);
@@ -210,6 +228,10 @@ void parse_water(JceScene *s, JceEntity e, const cJSON *c)
     /* Absent => false => byte-identical to every scene authored before this
      * field existed, which is the whole reason it defaults off. */
     w.depth_write      = j_bool(c, "depthWrite", false);
+    /* Absent => off, so every scene that predates planar reflections
+     * renders byte-identically and pays for no second render. */
+    w.planar_reflection = j_bool(c, "planarReflection", false);
+    w.planar_intensity  = (float)j_num(c, "planarIntensity", 0.0);
     /* Absent => 0 => Phillips, so every scene authored before this existed
      * round-trips byte-identically. */
     w.ocean            = j_bool(c, "ocean", false);
@@ -290,6 +312,14 @@ void parse_tilemap_collider2d(JceScene *s, JceEntity e, const cJSON *props)
 
 static void ser_terrain(const JceTerrainComponent *c, cJSON *arr)
 {
+    const char *normal_keys[4] = { "layerNormalPath0", "layerNormalPath1",
+                                   "layerNormalPath2", "layerNormalPath3" };
+    const char *mask_keys[4] = { "layerMaskPath0", "layerMaskPath1",
+                                 "layerMaskPath2", "layerMaskPath3" };
+    const char *normal_scale_keys[4] = {
+        "layerNormalScale0", "layerNormalScale1",
+        "layerNormalScale2", "layerNormalScale3"
+    };
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "Terrain");
     cJSON_AddStringToObject(o, "terrainPath", c->terrain_path);
@@ -297,12 +327,19 @@ static void ser_terrain(const JceTerrainComponent *c, cJSON *arr)
     cJSON_AddStringToObject(o, "layerAlbedoPath1", c->layer_albedo_path[1]);
     cJSON_AddStringToObject(o, "layerAlbedoPath2", c->layer_albedo_path[2]);
     cJSON_AddStringToObject(o, "layerAlbedoPath3", c->layer_albedo_path[3]);
+    for (int i = 0; i < 4; ++i) {
+        cJSON_AddStringToObject(o, normal_keys[i], c->layer_normal_path[i]);
+        cJSON_AddStringToObject(o, mask_keys[i], c->layer_mask_path[i]);
+        cJSON_AddNumberToObject(o, normal_scale_keys[i],
+                                c->layer_normal_scale[i]);
+    }
     cJSON_AddNumberToObject(o, "tileScale", c->tile_scale);
     cJSON_AddNumberToObject(o, "tintR", c->tint[0]);
     cJSON_AddNumberToObject(o, "tintG", c->tint[1]);
     cJSON_AddNumberToObject(o, "tintB", c->tint[2]);
     cJSON_AddBoolToObject(o, "visible", c->visible);
     cJSON_AddBoolToObject(o, "splatEnabled", c->splat_enabled);
+    cJSON_AddNumberToObject(o, "heightBlend", c->height_blend);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -314,6 +351,7 @@ static void ser_vegetation_scatter(const JceVegetationScatterComponent *c, cJSON
     cJSON_AddNumberToObject(o, "meshShape", c->mesh_shape);
     cJSON_AddStringToObject(o, "albedoPath", c->albedo_path);
     cJSON_AddStringToObject(o, "densityMaskPath", c->density_mask_path);
+    cJSON_AddStringToObject(o, "bakedPlacementPath", c->baked_placement_path);
     cJSON_AddNumberToObject(o, "density", c->density);
     cJSON_AddNumberToObject(o, "seed", (double)c->seed);
     cJSON_AddNumberToObject(o, "areaX", c->area_x);
@@ -412,6 +450,8 @@ static void ser_water(const JceWaterComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "iceRatio", c->ice_ratio);
     cJSON_AddNumberToObject(o, "splashRatio", c->splash_ratio);
     cJSON_AddBoolToObject(o, "depthWrite", c->depth_write);
+    cJSON_AddBoolToObject(o, "planarReflection", c->planar_reflection);
+    cJSON_AddNumberToObject(o, "planarIntensity", c->planar_intensity);
     cJSON_AddBoolToObject(o, "ocean", c->ocean);
     cJSON_AddNumberToObject(o, "fftFetch", c->fft_fetch);
     cJSON_AddNumberToObject(o, "fftSwell", c->fft_swell);
@@ -522,4 +562,3 @@ void serw_tilemap_collider2d(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddItemToArray(arr, o);
     }
 }
-

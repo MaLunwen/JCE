@@ -12,6 +12,9 @@
  *   - A `.lua` script returns a TABLE with optional functions:
  *       on_start(self)         -- called once when the instance spawns
  *       on_update(self, dt)    -- called every frame (dt seconds, time-scaled)
+ *       on_fixed_update(self, dt) -- called once per PHYSICS step, with the
+ *                                   fixed dt, BEFORE that step: 0..N times
+ *                                   per rendered frame, never a varying dt
  *       on_collision(self, other) -- called on first physics contact (other =
  *                                    the other body's entity id)
  *       on_destroy(self)       -- called when the instance is released
@@ -27,6 +30,13 @@
  *       jce.set_time_scale(scale)              -- slow-mo / hitstop / fast
  *       jce.pause(bool)                        -- pause/resume the simulation
  *       jce.shake_camera(amount)               -- add camera trauma (0..1)
+ *       jce.request_scene(path)                -- queue a level swap
+ *       jce.is_transitioning()                 -- true while one runs
+ *       jce.audio_play(e) / audio_stop(e)      -- the AUTHORED source
+ *       jce.audio_is_playing(e)                -- ...is it sounding
+ *       jce.save_game(path) / load_game(path) -- persist a session
+ *       jce.overlap_sphere(x,y,z,r[,mask])    -- entities in a sphere
+ *       jce.overlap_box(x,y,z,hx,hy,hz[,mask])-- entities in a box
  *       jce.raycast(ox,oy,oz, dx,dy,dz, max)   -- -> hit_entity,px,py,pz,
  *                                                 nx,ny,nz,dist (0 on a miss)
  *       jce.apply_impulse(entity, x,y,z)       -- impulse on a dynamic body
@@ -39,6 +49,14 @@
  *       jce.ui_get_toggle(entity) -> bool      (nil if no toggle)
  *       jce.ui_set_toggle(entity, on)
  *       jce.ui_set_text(entity, str)
+ *       jce.ui_get_progress(entity) -> number  (nil if no progress bar)
+ *       jce.ui_set_progress(entity, value)     (clamped to [min,max])
+ *       jce.ui_get_dropdown(entity) -> integer (nil if no dropdown)
+ *       jce.ui_set_dropdown(entity, index)     (clamped to the option range)
+ *       jce.ui_get_input_text(entity) -> string ("" if no input field)
+ *       jce.ui_set_input_text(entity, str)
+ *       jce.ui_get_scroll(entity) -> x,y       (nil if no scroll view)
+ *       jce.ui_set_scroll(entity, x, y)        (clamped per axis)
  *       jce.send_message(target, msg [, number] [, string])
  *                                              -- call method `msg` on the
  *                                                 target entity's live script
@@ -65,6 +83,16 @@
  *                                                 JSON null is jce.json_null
  *       jce.get_touch_count() -> integer       -- current frame touch sample
  *       jce.get_touch(index) -> id,x,y,p|nil   -- one-based touch lookup
+ *
+ *   THIS LIST IS A SAMPLE, NOT THE TABLE.  It stopped being complete a while
+ *   ago -- jce.get_param, jce.get_param_text and jce.curve_eval are all
+ *   missing from it, among others -- and prose beside a generated surface is
+ *   the one part of a file that nothing checks, so it drifts silently and
+ *   then misleads.  Rather than pretend, it says so: the authoritative list
+ *   is engine/src/middleware/script/script_exposure.json (the decisions),
+ *   published as contracts/script-api.json (the contract), and the KEY SET
+ *   is pinned by the hand-authored golden list in
+ *   tests/middleware/script/test_jce_script_table_shape.c.
  */
 
 #ifndef JCE_SCRIPT_H
@@ -85,6 +113,15 @@ typedef uint64_t JceScriptEntity;
  * authored sidecars without gaining an unbounded allocation primitive. */
 #define JCE_SCRIPT_TEXT_ASSET_MAX_BYTES (1024u * 1024u)
 
+/* Script-side cap on a single line_set_points upload.
+ *
+ * The scripting layer may not include scene headers (this file's own layering
+ * note: jce_core + Lua only), so it cannot read JCE_LINE_MAX_POINTS.  The two
+ * MUST be equal; jce_rt_script.c sees both and carries a compile-time
+ * assertion that they are, so a change to either fails the build rather than
+ * silently truncating a polyline at the smaller of the two. */
+#define JCE_SCRIPT_LINE_MAX_POINTS 64
+
 /* Result of jce.raycast(...) marshalled back to the script.  Plain POD so the
  * script layer never pulls in a physics type (the host maps the hit body back
  * to its entity).  `entity` is 0 on a miss. */
@@ -94,6 +131,7 @@ typedef struct JceScriptRaycastHit {
     float           normal[3];/* world-space surface normal */
     float           distance; /* distance from origin to the hit */
 } JceScriptRaycastHit;
+
 
 /* Host bridge supplied by the runtime. Any callback may be NULL (the matching
  * Lua binding then becomes a no-op / returns nil). `user` is passed back to
@@ -406,7 +444,7 @@ typedef struct JceScriptHost {
      * new snapshot, the old member list must be a PREFIX of the new one.  An
      * append passes; an insertion, a reorder or a rename fails and the report
      * names the member and its index.  It runs unskippably in
-     * scripts/lint/run_all.py (`check_abi_snapshot.py --committed`) and in
+     * tools/lint/run_all.py (`check_abi_snapshot.py --committed`) and in
      * run_architecture_audit.py, and is covered by
      * test_abi_ordered_prefix.py.
      *
@@ -439,6 +477,337 @@ typedef struct JceScriptHost {
     const char *(*loc_translate)(void *user, const char *key);
     const char *(*loc_get_locale)(void *user);
     void        (*loc_set_locale)(void *user, const char *locale);
+
+    /* Appended for host ABI safety, same rule as the L10n trio above.
+     *
+     * These two landed mid-struct on the branch they came from, at slots 7
+     * and 8, which shifts every later slot by two.  jce_script.c:633 copies
+     * min(host_size, sizeof) raw bytes over a zeroed table, so a caller
+     * still built against the 74-member layout would have had its slot 7
+     * read as get_world_position -- a call through a pointer of a different
+     * signature, silent rather than a crash.  Appending keeps every existing
+     * slot where it was and leaves script_api_version at 1. */
+    /* WORLD position: the local TRS composed up the parent chain.
+     *
+     * get_position above returns the entity's own LOCAL translation -- that is
+     * what jce_scene_get_transform holds, and jce_scene.h says so where it
+     * introduces jce_scene_get_world_matrix.  The exposure doc used to claim
+     * get_position was world-space; it was not, and there was no way to ask
+     * for the world pose from a script at all.  Any scene that parents its
+     * parts (every mechanism rig does) therefore had a documented API that
+     * returned a different quantity from the documented one.
+     *
+     * Both are kept: a rig solver wants the local value, a distance or an
+     * aim wants the world one.  The doc on each now says which. */
+    bool (*get_world_position)(void *user, JceScriptEntity e, float out_xyz[3]);
+    /* Upload a polyline's points to the entity's LineRenderer in ONE call.
+     *
+     * Before this the only route from a script was comp_set with the whole
+     * component re-serialised as JSON carrying flat "px0","py0","pz0","px1"...
+     * keys.  cJSON looks a key up by walking the object's child list, so the
+     * i-th point costs O(i) comparisons and a polyline costs O(n^2): space/'s
+     * S3 frame measured ~135k string compares and ~1700 cJSON nodes -- about
+     * 3400 CRT malloc/free per frame, outside the engine's own allocator.
+     * The component stores the points as a packed float array the whole time;
+     * only the transport was quadratic.
+     *
+     * `xyz` is 3*count floats, tightly packed.  Returns the number actually
+     * stored (clamped to JCE_LINE_MAX_POINTS) so a script can tell when its
+     * polyline was too long instead of finding out by looking at the screen. */
+    int  (*line_set_points)(void *user, JceScriptEntity e,
+                            const float *xyz, int count);
+
+    /* UIProgressBar's value.
+     *
+     * The third value widget, and the one a gameplay script drives most often
+     * -- health, loading, a cooldown -- was the only one with no accessor,
+     * while UISlider and UIToggle have had a get/set pair since the UI landed.
+     * A script could still reach it through comp_get/comp_set, but that
+     * re-serialises the WHOLE component as JSON on every write, which is the
+     * per-frame cost line_set_points was appended to avoid for polylines.
+     *
+     * get returns false when `e` carries no UIProgressBar, so a script can
+     * tell "no bar" from "a bar reading zero" -- the same shape as
+     * ui_get_slider, deliberately: two value widgets whose accessors disagree
+     * about how absence is reported is a difference every caller has to learn.
+     * The value is in the component's OWN [min_value, max_value] range and NOT
+     * 0..1 -- the bar's fill is clamp((value-min)/(max-min)), so 0..1 is the
+     * FILL, not the value.  Same convention as ui_get_slider, whose component
+     * carries the same pair.  set clamps into that range rather than refusing,
+     * because the draw already clamps: storing outside it would make the
+     * component and the picture disagree, and a script reading back what it
+     * just wrote would get a number the bar is not showing. */
+    bool (*ui_get_progress)(void *user, JceScriptEntity e, float *out);
+    void (*ui_set_progress)(void *user, JceScriptEntity e, float v);
+
+    /* ── The three widgets that had no accessor ──────────────────────────
+     *
+     * UIDropdown's selection, UIInputField's text and UIScrollView's scroll
+     * offset were reachable ONLY through comp_get_json / comp_set_json.  That
+     * route works -- checked in both directions before adding these, because
+     * MeshRenderer.visible once did not -- and it costs a full serialize AND
+     * parse of the whole component to read one value: UIInputField writes
+     * about thirty keys, four colours and two 256-byte paths among them, to
+     * answer "what did the player type".  A HUD that samples an input field
+     * every frame pays that every frame.  Same argument the manifest already
+     * makes for line_set_points.
+     *
+     * Every get answers FALSE when the entity carries no such widget, so a
+     * script can tell "no dropdown" from "a dropdown reading 0" -- the shape
+     * ui_get_slider and ui_get_progress already use.
+     *
+     * ui_get_input_text returns a POINTER INTO THE COMPONENT, valid until the
+     * next mutation of that entity, exactly like tr() and get_locale().  Every
+     * binding copies it before returning to script code; none of them may
+     * store it.  It is not an owned_string_release because there is nothing to
+     * release -- the buffer is the component's own field, and handing back a
+     * heap copy would make the common case allocate to read a name.
+     *
+     * ui_set_dropdown CLAMPS into [0, option_count-1] rather than refusing,
+     * and ui_set_scroll clamps each axis the way the wheel path does, for the
+     * reason ui_set_progress gives: the draw already clamps, so storing
+     * outside the range would make the component and the picture disagree and
+     * a script reading back what it just wrote would get a number the widget
+     * is not showing. */
+    bool (*ui_get_dropdown)(void *user, JceScriptEntity e, int *out);
+    void (*ui_set_dropdown)(void *user, JceScriptEntity e, int index);
+    const char *(*ui_get_input_text)(void *user, JceScriptEntity e);
+    void (*ui_set_input_text)(void *user, JceScriptEntity e, const char *text);
+    bool (*ui_get_scroll)(void *user, JceScriptEntity e, float out_xy[2]);
+    void (*ui_set_scroll)(void *user, JceScriptEntity e, float x, float y);
+
+    /* ── World domain: the clock and the weather ───────────────────────
+     *
+     * Gameplay could not ask what time it was.  `time_of_day` and `weather`
+     * occurred ZERO times in contracts/script-api.json, and the live hour was
+     * a private field of the scene RENDERER until the environment authority
+     * moved to the scene -- so "is it night?", the single most ordinary
+     * question a quest or an NPC schedule asks, was unexpressible in every one
+     * of the seven scripting languages.
+     *
+     * Scene-scoped with no handle argument: a script's world is the runtime's
+     * current scene, and the host resolves it.  Handing scripts a JceScene*
+     * would put a raw engine pointer in a sandbox for no gain -- there is only
+     * ever one.
+     *
+     * The hour is the LIVE one (jce_scene_environment_hour), not the authored
+     * seed in JceSceneRenderingSettings::tod_hour: a script that read the seed
+     * would get the level's start-of-day forever while the sky moved.
+     *
+     * world_set_hour moves the live clock only; the authored seed is left
+     * alone, so reloading the scene still starts where the designer set it.
+     * That is what makes "sleep until dawn" expressible without a script
+     * silently editing the level. */
+    float (*world_get_hour)(void *user);
+    void  (*world_set_hour)(void *user, float hour);
+    bool  (*world_is_daytime)(void *user);
+    int   (*world_get_weather)(void *user);
+    float (*world_get_weather_intensity)(void *user);
+    float (*world_get_wind_speed)(void *user);
+
+    /* ── Level transition (FEATURE 9.4) ───────────────────────────────
+     *
+     * jce_runtime_request_scene queues a swap to another authored scene
+     * WITHOUT tearing the runtime down: physics world, script VM, audio
+     * device and save registry survive, and a FADE_OUT / LOAD / FADE_IN state
+     * machine runs inside jce_runtime_step.  Its own header says "Safe to
+     * call from gameplay scripts / triggers" -- and it had ZERO CALLERS
+     * anywhere in the tree, in either host, with no binding in any of the
+     * seven languages.  A game built on this engine could not change level.
+     *
+     * request_scene returns false on a NULL runtime, an empty path, or when a
+     * transition is already in flight (the in-flight one wins).  Gate on
+     * is_transitioning rather than retrying: a script that calls every frame
+     * would otherwise spin against a swap that is already happening.
+     *
+     * APPENDED at the end of this struct.  JceScriptHost is copied BY BYTES
+     * with min(caller, engine) size, so a member inserted anywhere but here
+     * silently calls a differently-typed pointer in every host built against
+     * an older header. */
+    bool  (*request_scene)(void *user, const char *scene_path);
+    bool  (*is_transitioning)(void *user);
+
+    /* ── AudioSource control (Unity's Play / Stop / isPlaying) ─────────
+     *
+     * An authored JceAudioSourceComponent sounded EXACTLY ONCE, at scene
+     * spawn, and only with play_on_awake.  jce.play_sound(path, ...) is the
+     * only other route and it discards everything the component authors --
+     * loop, pitch, per-source volume, mixer bus, the whole 3D attenuation
+     * block -- so a door creak, a gunshot or a script-armed alarm could not
+     * use the component at all.
+     *
+     * audio_play RESTARTS a source that is already sounding, which is Unity's
+     * semantics and stops a repeating event stacking voices until the mixer
+     * runs out.  APPENDED, for the reason above this pair. */
+    bool  (*audio_play)(void *user, JceScriptEntity e);
+    bool  (*audio_stop)(void *user, JceScriptEntity e);
+    bool  (*audio_is_playing)(void *user, JceScriptEntity e);
+
+    /* ── Save / load a session ────────────────────────────────────────
+     *
+     * The save system shipped WRITE-ONLY.  jce_runtime_save_to_file had no
+     * counterpart in the engine and no binding in any of the seven languages,
+     * so gameplay code could not persist anything at all -- not a checkpoint,
+     * not a slot, not a key/value.  A game could write .jsnp files nothing in
+     * its own executable could read back.
+     *
+     * save_game returns false when there is no registry or the write fails.
+     * load_game restores AND rebuilds the runtime (physics bodies, script
+     * instances, voices, triggers); a missing slot returns false having
+     * changed nothing, so `if not jce.load_game(slot) then new_game() end` is
+     * the correct shape for a Continue button.
+     *
+     * APPENDED. */
+    bool  (*save_game)(void *user, const char *path);
+    bool  (*load_game)(void *user, const char *path);
+
+    /* ── Spatial queries ──────────────────────────────────────────────
+     *
+     * jce_physics_overlap_sphere / _overlap_box / _raycast_all are
+     * implemented down to Bullet, honour the layer mask and the trigger skip,
+     * and had ZERO consumers outside their own module.  The one physics query
+     * a script could reach was a closest-hit raycast that ignored the filter.
+     *
+     * So "what is inside this sphere" -- explosion damage, melee arcs, aggro
+     * and proximity checks, line-of-sight fans, pickup detection -- had to be
+     * faked by walking entities and comparing distances in script, which
+     * ignores colliders, layers and triggers entirely.
+     *
+     * `layer_mask` 0 means every layer (the filter's 0xFFFFFFFF); the
+     * results are ENTITIES, mapped from body handles by the runtime, which is
+     * the only thing that holds that mapping.  Entities whose body the runtime
+     * does not know (a body created outside the spawn walk) are skipped rather
+     * than reported as entity 0.
+     *
+     * APPENDED. */
+    int   (*overlap_sphere)(void *user, float x, float y, float z,
+                            float radius, uint32_t layer_mask,
+                            JceScriptEntity *out, int max);
+    int   (*overlap_box)(void *user, float x, float y, float z,
+                         float hx, float hy, float hz, uint32_t layer_mask,
+                         JceScriptEntity *out, int max);
+
+    /*
+     * "Cut to the camera called BossIntro."
+     *
+     * JceVirtualCameraComponent.vcam_name was authored, serialised and shown
+     * in the editor's VCam Manager while NOTHING under engine/src looked at
+     * it: the vcam system picks the highest-priority active camera, so the
+     * name was a label in a panel.  A cutscene, a trigger, or a scene authored
+     * from the SDK could not name a shot at all.
+     *
+     * It does NOT rewrite the authored components -- the override lives in the
+     * vcam system beside the damping state, so Ctrl+S cannot bake a cutscene's
+     * camera choice into the level.  Returns 1 when the name resolves to a
+     * camera that is active and enabled, 0 otherwise; the request is recorded
+     * either way, so naming a camera in a streaming cell that has not loaded
+     * yet does not silently become "whatever priority says".
+     *
+     * Passing NULL or "" clears the override and hands the decision back to
+     * priority.
+     *
+     * APPENDED. */
+    int   (*vcam_activate)(void *user, const char *name);
+
+    /* Read an AUTHORED parameter off the entity's script component -- Unity's
+     * [SerializeField] and Godot's @export, reaching a running script.
+     *
+     * A HOST CALLBACK AND NOT A NEW JceScriptVM SLOT, deliberately.  A VM slot
+     * is the right shape for a LIFECYCLE hook, because a callback that exists
+     * in six languages and not the seventh is a half-feature -- and it costs
+     * seven backends, two lifecycle differentials and three probe tables to
+     * add one.  A parameter READ is the same shape as get_position: one entry
+     * in this table reaches all seven languages through bindings that are
+     * already generated from it.
+     *
+     * Returns false when the entity has no script component, when no
+     * parameter of that name is authored, or when `name` is NULL/empty --
+     * three cases a script cannot distinguish and should not need to, since
+     * all three mean "the author did not give me this".  `out` is untouched
+     * on false, so a caller's default survives.
+     *
+     * APPENDED. */
+    bool  (*get_script_param)(void *user, JceScriptEntity e, const char *name,
+                              int *out_kind, double *out_number,
+                              JceScriptEntity *out_entity);
+
+    /* The TEXT value of an authored parameter, or "" when the entity has no
+     * script component, no parameter of that name, or one whose kind is not
+     * TEXT.  Empty rather than NULL for the same reason ui_get_input_text is:
+     * a script comparing strings should not have to test for nil first.
+     *
+     * RETURNS A POINTER INTO THE COMPONENT, valid until the component is
+     * reassigned or the entity destroyed -- the identical lifetime rule
+     * ui_get_input_text documents, and the identical obligation on a caller
+     * that wants to keep it: copy it.
+     *
+     * APPENDED. */
+    const char *(*get_script_param_text)(void *user, JceScriptEntity e,
+                                         const char *name);
+
+    /* Sample an authored curve asset -- the documents the editor's Curve
+     * Editor writes, which until now nothing anywhere could read.
+     *
+     * FALSE, with *out_value untouched, when the path does not resolve, the
+     * document does not parse, or the curve has no channel of that name.  A
+     * curve that legitimately evaluates to 0 and a curve that is not there
+     * must not be one reading -- the same rule get_script_param follows, and
+     * it is the whole reason this is not `float curve_eval(...)`.
+     *
+     * The host caches the parsed curve per runtime, so a call inside
+     * on_update costs a name compare rather than a JSON parse.
+     *
+     * `*out_value` untouched is THIS table's contract and not the C ABI's:
+     * the generated jce_script_api_* forwarder zeroes every out slot on its
+     * absent branch, uniformly, for every fallible_out -- because across a C
+     * ABI handing back an unwritten buffer is worse than a defined value.
+     * Both rules are right where they are; they are not one promise.
+     *
+     * APPENDED. */
+    bool  (*curve_eval)(void *user, const char *path, const char *channel,
+                        double t, double *out_value);
+
+    /* ── Filtered and multi-hit raycasts ──────────────────────────────
+     *
+     * `raycast` above takes no filter at all: closest hit, every layer,
+     * triggers decided by whatever the C default happens to be.  The overlap
+     * queries beside it have taken a layer_mask since they landed, and the
+     * comment on them records this same defect being fixed for THEM -- the
+     * ray was left as it was.  So a script could ask "what is inside this
+     * sphere, ignoring the player" and could not ask "what did this shot
+     * hit, ignoring the player", which is the more common question of the
+     * two.
+     *
+     * Both of these are pure READERS of physics that already exists:
+     * jce_physics_raycast_filtered and jce_physics_raycast_all are
+     * implemented down to Bullet, honour the mask and the trigger skip, and
+     * had no script binding.
+     *
+     * `layer_mask` 0 means every layer, the same convention overlap_sphere
+     * uses -- so the common call stays origin/dir/distance and the filter is
+     * the thing you add when you need it.  `hit_triggers` is separate from
+     * the mask because a trigger volume is not a layer: Unity splits them the
+     * same way (layerMask vs QueryTriggerInteraction) and collapsing them
+     * would make "ignore triggers on layer 3" inexpressible.
+     *
+     * raycast_all writes ENTITIES sorted near->far and returns how many.
+     * Entities whose body the runtime does not know are skipped rather than
+     * reported as entity 0 -- the rule the overlap queries already follow.
+     * It returns entities and not full hits because the eight-value hit
+     * record does not survive as an array shape across seven languages
+     * without inventing a per-language container; a script that needs the
+     * point and normal of a specific one re-queries it with raycast_filtered.
+     * That is a real limit and it is named in the ledger rather than hidden.
+     *
+     * APPENDED. */
+    bool  (*raycast_filtered)(void *user, const float origin[3],
+                              const float dir[3], float max_dist,
+                              uint32_t layer_mask, bool hit_triggers,
+                              JceScriptRaycastHit *out);
+    int   (*raycast_all)(void *user, const float origin[3],
+                         const float dir[3], float max_dist,
+                         uint32_t layer_mask, bool hit_triggers,
+                         JceScriptEntity *out, int max);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;
@@ -574,6 +943,29 @@ JCE_API JceScriptInstance jce_script_instantiate_source(JceScript *s,
  * rebound or replaced — see THE FAILING-CALLBACK RULE above. */
 JCE_API void jce_script_call_start (JceScript *s, JceScriptInstance inst);
 JCE_API void jce_script_call_update(JceScript *s, JceScriptInstance inst, float dt);
+
+/* Dispatch on_fixed_update(self, dt) — once per PHYSICS step, with the fixed
+ * dt, immediately BEFORE the step so a force applied here is integrated by
+ * that very step.  This is Unity's FixedUpdate, Unreal's substepped tick and
+ * Godot's _physics_process, and it exists for the reason all three do:
+ * on_update runs on a render frame whose dt varies with the frame rate, so a
+ * script that applies force there produces different physics on a fast
+ * machine than on a slow one.  A jump that clears a gap at 144 Hz and does
+ * not at 30 Hz is the bug, and no amount of care inside on_update fixes it.
+ *
+ * ZERO OR MANY TIMES PER RENDERED FRAME.  The fixed clock is an accumulator:
+ * a frame that took 3 fixed steps dispatches this 3 times, one that took none
+ * dispatches it not at all.  A script that assumes "once per frame" wants
+ * on_update; one that assumes "the same dt every time" wants this.
+ *
+ * Same tolerance and failing-callback rule as on_update: a no-op when the
+ * script defines no on_fixed_update, and a runtime error inside it disables
+ * on_fixed_update on that instance without touching on_update.  The two have
+ * separate disable bits on purpose -- a handler that throws every physics
+ * step must not take the render-frame callback down with it. */
+JCE_API void jce_script_call_fixed_update(JceScript *s, JceScriptInstance inst,
+                                          float dt);
+
 JCE_API void jce_script_release    (JceScript *s, JceScriptInstance inst);
 
 /* Dispatch on_collision(self, other_entity) — called by the runtime when the

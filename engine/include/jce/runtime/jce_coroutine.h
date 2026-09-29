@@ -103,11 +103,17 @@ jce_coroutine_active_count(void);
 JCE_API void JCE_CALL jce_coroutine_system_init(void);
 JCE_API void JCE_CALL jce_coroutine_system_shutdown(void);
 
-#ifndef NDEBUG
+#ifdef JCE_SELF_TESTS
 /* Self-test: spins up a handful of coroutines, drives the PlayerLoop
  * phases manually, and verifies cancellation / timing / predicate /
  * counter semantics.  Returns true on success.  Logs failures via
- * jce_log.  Does not run automatically — call from a debug entry. */
+ * jce_log.  Does not run automatically — call from a debug entry.
+ *
+ * GATED ON JCE_SELF_TESTS, NOT NDEBUG.  Tying it to the optimisation level
+ * meant this symbol did not exist in the configuration that ships, so the
+ * test that runs it could only be registered for a Debug build -- and the
+ * two P0s it found on its first ever run were checked nowhere else.  The
+ * root CMakeLists defines JCE_SELF_TESTS whenever JCE_BUILD_TESTS is ON. */
 JCE_API bool JCE_CALL jce_coroutine_self_test(void);
 #endif
 

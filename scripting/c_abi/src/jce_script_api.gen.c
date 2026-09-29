@@ -77,6 +77,18 @@ JCE_SCRIPT_API bool jce_script_api_get_scale(JceScriptApi *api,
     return api->host.get_scale(api->host.user, e, out_xyz);
 }
 
+/* jce_script_api_get_world_position -> host.get_world_position (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_get_world_position(JceScriptApi *api,
+                                                      JceScriptEntity e,
+                                                      float out_xyz[3])
+{
+    if (!api || !api->host.get_world_position) {
+        if (out_xyz) memset(out_xyz, 0, 3 * sizeof out_xyz[0]);
+        return false;
+    }
+    return api->host.get_world_position(api->host.user, e, out_xyz);
+}
+
 /* jce_script_api_set_scale -> host.set_scale (void_call) */
 JCE_SCRIPT_API void jce_script_api_set_scale(JceScriptApi *api,
                                              JceScriptEntity e, float x,
@@ -294,6 +306,38 @@ JCE_SCRIPT_API bool jce_script_api_raycast(JceScriptApi *api,
         return false;
     }
     return api->host.raycast(api->host.user, origin, dir, max_dist, out);
+}
+
+/* jce_script_api_raycast_filtered -> host.raycast_filtered (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_raycast_filtered(JceScriptApi *api,
+                                                    const float origin[3],
+                                                    const float dir[3],
+                                                    float max_dist,
+                                                    uint32_t layer_mask,
+                                                    bool hit_triggers,
+                                                    JceScriptRaycastHit *out)
+{
+    if (!api || !api->host.raycast_filtered) {
+        if (out) memset(out, 0, sizeof *out);
+        return false;
+    }
+    return api->host.raycast_filtered(api->host.user, origin, dir, max_dist, layer_mask, hit_triggers, out);
+}
+
+/* jce_script_api_raycast_all -> host.raycast_all (entity_table) */
+JCE_SCRIPT_API int jce_script_api_raycast_all(JceScriptApi *api,
+                                              const float origin[3],
+                                              const float dir[3],
+                                              float max_dist,
+                                              uint32_t layer_mask,
+                                              bool hit_triggers,
+                                              JceScriptEntity *out, int max)
+{
+    if (!api || !api->host.raycast_all) {
+        if (out) memset(out, 0, sizeof *out);
+        return 0;
+    }
+    return api->host.raycast_all(api->host.user, origin, dir, max_dist, layer_mask, hit_triggers, out, max);
 }
 
 /* jce_script_api_apply_impulse -> host.apply_impulse (void_call) */
@@ -543,6 +587,28 @@ JCE_SCRIPT_API void jce_script_api_ui_set_slider(JceScriptApi *api,
         return;
     }
     api->host.ui_set_slider(api->host.user, e, v);
+}
+
+/* jce_script_api_ui_get_progress -> host.ui_get_progress (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_ui_get_progress(JceScriptApi *api,
+                                                   JceScriptEntity e,
+                                                   float *out)
+{
+    if (!api || !api->host.ui_get_progress) {
+        if (out) memset(out, 0, sizeof *out);
+        return false;
+    }
+    return api->host.ui_get_progress(api->host.user, e, out);
+}
+
+/* jce_script_api_ui_set_progress -> host.ui_set_progress (void_call) */
+JCE_SCRIPT_API void jce_script_api_ui_set_progress(JceScriptApi *api,
+                                                   JceScriptEntity e, float v)
+{
+    if (!api || !api->host.ui_set_progress) {
+        return;
+    }
+    api->host.ui_set_progress(api->host.user, e, v);
 }
 
 /* jce_script_api_ui_get_toggle -> host.ui_get_toggle (fallible_out) */
@@ -818,5 +884,273 @@ JCE_SCRIPT_API void jce_script_api_audio_set_volume(JceScriptApi *api,
         return;
     }
     api->host.audio_set_volume(api->host.user, e, volume);
+}
+
+/* jce_script_api_ui_get_dropdown -> host.ui_get_dropdown (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_ui_get_dropdown(JceScriptApi *api,
+                                                   JceScriptEntity e, int *out)
+{
+    if (!api || !api->host.ui_get_dropdown) {
+        if (out) memset(out, 0, sizeof *out);
+        return false;
+    }
+    return api->host.ui_get_dropdown(api->host.user, e, out);
+}
+
+/* jce_script_api_ui_set_dropdown -> host.ui_set_dropdown (void_call) */
+JCE_SCRIPT_API void jce_script_api_ui_set_dropdown(JceScriptApi *api,
+                                                   JceScriptEntity e,
+                                                   int index)
+{
+    if (!api || !api->host.ui_set_dropdown) {
+        return;
+    }
+    api->host.ui_set_dropdown(api->host.user, e, index);
+}
+
+/* jce_script_api_ui_get_input_text -> host.ui_get_input_text (value_return) */
+JCE_SCRIPT_API const char *jce_script_api_ui_get_input_text(JceScriptApi *api,
+                                                            JceScriptEntity e)
+{
+    if (!api || !api->host.ui_get_input_text) {
+        return NULL;
+    }
+    return api->host.ui_get_input_text(api->host.user, e);
+}
+
+/* jce_script_api_ui_set_input_text -> host.ui_set_input_text (void_call) */
+JCE_SCRIPT_API void jce_script_api_ui_set_input_text(JceScriptApi *api,
+                                                     JceScriptEntity e,
+                                                     const char * text)
+{
+    if (!api || !api->host.ui_set_input_text) {
+        return;
+    }
+    api->host.ui_set_input_text(api->host.user, e, text);
+}
+
+/* jce_script_api_ui_get_scroll -> host.ui_get_scroll (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_ui_get_scroll(JceScriptApi *api,
+                                                 JceScriptEntity e,
+                                                 float out_xy[2])
+{
+    if (!api || !api->host.ui_get_scroll) {
+        if (out_xy) memset(out_xy, 0, 2 * sizeof out_xy[0]);
+        return false;
+    }
+    return api->host.ui_get_scroll(api->host.user, e, out_xy);
+}
+
+/* jce_script_api_ui_set_scroll -> host.ui_set_scroll (void_call) */
+JCE_SCRIPT_API void jce_script_api_ui_set_scroll(JceScriptApi *api,
+                                                 JceScriptEntity e, float x,
+                                                 float y)
+{
+    if (!api || !api->host.ui_set_scroll) {
+        return;
+    }
+    api->host.ui_set_scroll(api->host.user, e, x, y);
+}
+
+/* jce_script_api_world_get_hour -> host.world_get_hour (value_return) */
+JCE_SCRIPT_API float jce_script_api_world_get_hour(JceScriptApi *api)
+{
+    if (!api || !api->host.world_get_hour) {
+        return 0.0f;
+    }
+    return api->host.world_get_hour(api->host.user);
+}
+
+/* jce_script_api_world_set_hour -> host.world_set_hour (void_call) */
+JCE_SCRIPT_API void jce_script_api_world_set_hour(JceScriptApi *api,
+                                                  float hour)
+{
+    if (!api || !api->host.world_set_hour) {
+        return;
+    }
+    api->host.world_set_hour(api->host.user, hour);
+}
+
+/* jce_script_api_world_is_daytime -> host.world_is_daytime (value_return) */
+JCE_SCRIPT_API bool jce_script_api_world_is_daytime(JceScriptApi *api)
+{
+    if (!api || !api->host.world_is_daytime) {
+        return false;
+    }
+    return api->host.world_is_daytime(api->host.user);
+}
+
+/* jce_script_api_world_get_weather -> host.world_get_weather (value_return) */
+JCE_SCRIPT_API int jce_script_api_world_get_weather(JceScriptApi *api)
+{
+    if (!api || !api->host.world_get_weather) {
+        return 0;
+    }
+    return api->host.world_get_weather(api->host.user);
+}
+
+/* jce_script_api_world_get_weather_intensity -> host.world_get_weather_intensity (value_return) */
+JCE_SCRIPT_API float jce_script_api_world_get_weather_intensity(JceScriptApi *api)
+{
+    if (!api || !api->host.world_get_weather_intensity) {
+        return 0.0f;
+    }
+    return api->host.world_get_weather_intensity(api->host.user);
+}
+
+/* jce_script_api_world_get_wind_speed -> host.world_get_wind_speed (value_return) */
+JCE_SCRIPT_API float jce_script_api_world_get_wind_speed(JceScriptApi *api)
+{
+    if (!api || !api->host.world_get_wind_speed) {
+        return 0.0f;
+    }
+    return api->host.world_get_wind_speed(api->host.user);
+}
+
+/* jce_script_api_request_scene -> host.request_scene (value_return) */
+JCE_SCRIPT_API bool jce_script_api_request_scene(JceScriptApi *api,
+                                                 const char * scene_path)
+{
+    if (!api || !api->host.request_scene) {
+        return false;
+    }
+    return api->host.request_scene(api->host.user, scene_path);
+}
+
+/* jce_script_api_is_transitioning -> host.is_transitioning (value_return) */
+JCE_SCRIPT_API bool jce_script_api_is_transitioning(JceScriptApi *api)
+{
+    if (!api || !api->host.is_transitioning) {
+        return false;
+    }
+    return api->host.is_transitioning(api->host.user);
+}
+
+/* jce_script_api_audio_play -> host.audio_play (value_return) */
+JCE_SCRIPT_API bool jce_script_api_audio_play(JceScriptApi *api,
+                                              JceScriptEntity e)
+{
+    if (!api || !api->host.audio_play) {
+        return false;
+    }
+    return api->host.audio_play(api->host.user, e);
+}
+
+/* jce_script_api_audio_stop -> host.audio_stop (value_return) */
+JCE_SCRIPT_API bool jce_script_api_audio_stop(JceScriptApi *api,
+                                              JceScriptEntity e)
+{
+    if (!api || !api->host.audio_stop) {
+        return false;
+    }
+    return api->host.audio_stop(api->host.user, e);
+}
+
+/* jce_script_api_audio_is_playing -> host.audio_is_playing (value_return) */
+JCE_SCRIPT_API bool jce_script_api_audio_is_playing(JceScriptApi *api,
+                                                    JceScriptEntity e)
+{
+    if (!api || !api->host.audio_is_playing) {
+        return false;
+    }
+    return api->host.audio_is_playing(api->host.user, e);
+}
+
+/* jce_script_api_save_game -> host.save_game (value_return) */
+JCE_SCRIPT_API bool jce_script_api_save_game(JceScriptApi *api,
+                                             const char * path)
+{
+    if (!api || !api->host.save_game) {
+        return false;
+    }
+    return api->host.save_game(api->host.user, path);
+}
+
+/* jce_script_api_load_game -> host.load_game (value_return) */
+JCE_SCRIPT_API bool jce_script_api_load_game(JceScriptApi *api,
+                                             const char * path)
+{
+    if (!api || !api->host.load_game) {
+        return false;
+    }
+    return api->host.load_game(api->host.user, path);
+}
+
+/* jce_script_api_overlap_sphere -> host.overlap_sphere (entity_table) */
+JCE_SCRIPT_API int jce_script_api_overlap_sphere(JceScriptApi *api, float x,
+                                                 float y, float z,
+                                                 float radius,
+                                                 uint32_t layer_mask,
+                                                 JceScriptEntity *out, int max)
+{
+    if (!api || !api->host.overlap_sphere) {
+        if (out) memset(out, 0, sizeof *out);
+        return 0;
+    }
+    return api->host.overlap_sphere(api->host.user, x, y, z, radius, layer_mask, out, max);
+}
+
+/* jce_script_api_overlap_box -> host.overlap_box (entity_table) */
+JCE_SCRIPT_API int jce_script_api_overlap_box(JceScriptApi *api, float x,
+                                              float y, float z, float hx,
+                                              float hy, float hz,
+                                              uint32_t layer_mask,
+                                              JceScriptEntity *out, int max)
+{
+    if (!api || !api->host.overlap_box) {
+        if (out) memset(out, 0, sizeof *out);
+        return 0;
+    }
+    return api->host.overlap_box(api->host.user, x, y, z, hx, hy, hz, layer_mask, out, max);
+}
+
+/* jce_script_api_get_param -> host.get_script_param (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_get_param(JceScriptApi *api,
+                                             JceScriptEntity e,
+                                             const char * name, int *out_kind,
+                                             double *out_number,
+                                             JceScriptEntity *out_entity)
+{
+    if (!api || !api->host.get_script_param) {
+        if (out_kind) memset(out_kind, 0, sizeof *out_kind);
+        if (out_number) memset(out_number, 0, sizeof *out_number);
+        if (out_entity) memset(out_entity, 0, sizeof *out_entity);
+        return false;
+    }
+    return api->host.get_script_param(api->host.user, e, name, out_kind, out_number, out_entity);
+}
+
+/* jce_script_api_get_param_text -> host.get_script_param_text (value_return) */
+JCE_SCRIPT_API const char *jce_script_api_get_param_text(JceScriptApi *api,
+                                                         JceScriptEntity e,
+                                                         const char * name)
+{
+    if (!api || !api->host.get_script_param_text) {
+        return NULL;
+    }
+    return api->host.get_script_param_text(api->host.user, e, name);
+}
+
+/* jce_script_api_curve_eval -> host.curve_eval (fallible_out) */
+JCE_SCRIPT_API bool jce_script_api_curve_eval(JceScriptApi *api,
+                                              const char * path,
+                                              const char * channel, double t,
+                                              double *out_value)
+{
+    if (!api || !api->host.curve_eval) {
+        if (out_value) memset(out_value, 0, sizeof *out_value);
+        return false;
+    }
+    return api->host.curve_eval(api->host.user, path, channel, t, out_value);
+}
+
+/* jce_script_api_vcam_activate -> host.vcam_activate (value_return) */
+JCE_SCRIPT_API int jce_script_api_vcam_activate(JceScriptApi *api,
+                                                const char * name)
+{
+    if (!api || !api->host.vcam_activate) {
+        return 0;
+    }
+    return api->host.vcam_activate(api->host.user, name);
 }
 

@@ -1,0 +1,25 @@
+# Public headers that are deliberately NOT reachable from <jce/api.h>,
+# one per line, with a REASON after '#' on the SAME line.  A bare path with no
+# reason is NOT an exemption — check_api_closure.py ignores it, so "I'll write
+# the reason later" fails closed instead of silently passing.
+#
+# Before adding a line, prefer the other fix: add the header to the api_*.h
+# umbrella that covers its directory.  AGENTS.md §4's promise is that
+# `#include <jce/api.h>` gives a user the whole engine; an exemption is a
+# statement that a header is NOT part of that whole, and there are very few
+# honest reasons for one.
+#
+# On 2026-08-31 this list replaced a 111-header gap. Of those 111, 103 went
+# into umbrellas (two of which had to be created: api_save.h, api_video.h),
+# 6 were umbrellas themselves that api.h had never included, and 2 are below.
+# 100 of the 111 declared JCE_API symbols — they were shipped, exported
+# capability that the documented entry point could not deliver, not internal
+# headers that had wandered into the public root.
+#
+# ---------------------------------------------------------------------------
+
+application/jce_default_main.inc.h  # a consumer main() TEMPLATE, not a declaration header: it defines SDL_AppInit/Event/Iterate/Quit and is #included exactly once by a game's own main TU. Pulling it into api.h would inject an entry point into every translation unit that includes the engine.
+
+jce.h  # an ALIAS for <jce/api.h>, kept under the conventional library name so rust-bindgen / cgo / p-invoke find a header at the predictable path. api.h including it would be a cycle; it includes api.h, which is the direction that makes it useful.
+
+middleware/ui/jce_game_hud.h  # functional (it draws, via jce_primitives on JCE_VIEW_UI) but not part of api.h's promise: engine/src/middleware/ui/AGENTS.md gives SCENE UI including the HUD to the ECS Canvas (middleware/scene/jce_ui_canvas.h), and aggregating a second HUD would read as the engine offering two. It entered api_ui.h on 2026-08-31 as a side effect of completing this very closure -- the gate asks whether a header is REACHABLE, never whether it belongs -- and nothing in the tree, including caged_kingdom, calls any of its 11 symbols. A user who wants it includes it directly; it still ships in the SDK.

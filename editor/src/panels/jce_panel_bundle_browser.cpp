@@ -13,6 +13,7 @@
  */
 
 #include "jce_panel_common.h"
+#include "core/jce_project_settings.h"   /* always_included_shaders */
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_assetdb.h"
@@ -447,6 +448,11 @@ struct BuildState {
     std::string shared_id_owned;
     std::vector<std::string>  scene_files_owned;
     std::vector<const char *> scene_file_ptrs_owned;
+    /* Project Settings > Graphics > Always Included Shaders, one path per
+     * line, snapshotted on the main thread with everything else: the worker
+     * must not read live settings a user could be editing while it runs. */
+    std::vector<std::string>  always_included_owned;
+    std::vector<const char *> always_included_ptrs_owned;
     std::string single_bundle_id_owned;
     int  mode_owned = 0;
     bool auto_resource_root_owned = false;
@@ -603,6 +609,10 @@ JceAsyncRunResult bundle_pack_worker_main(JceAsyncContext *ctx, void * /*user*/)
     opts.target_platform    = gb.target_platform_owned;
     opts.encrypt            = gb.encrypt_owned;
     opts.encryption_key     = gb.encrypt_owned ? gb.key_owned : nullptr;
+    if (!gb.always_included_ptrs_owned.empty()) {
+        opts.always_included       = gb.always_included_ptrs_owned.data();
+        opts.always_included_count = (int)gb.always_included_ptrs_owned.size();
+    }
 
     gb.last_exit = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
     if (jce_async_context_cancel_requested(ctx))
@@ -685,6 +695,32 @@ void start_build()
     gb.scene_file_ptrs_owned.reserve(gb.scene_files_owned.size());
     for (auto &s : gb.scene_files_owned)
         gb.scene_file_ptrs_owned.push_back(s.c_str());
+
+    /* ALWAYS INCLUDED SHADERS -> pack roots.  One path per line; blank lines
+     * and surrounding whitespace are dropped, because a trailing newline in a
+     * multiline text box is not a request to pack "". */
+    gb.always_included_owned.clear();
+    gb.always_included_ptrs_owned.clear();
+    {
+        const JceProjectSettings *ps = jce_project_settings_current();
+        const char *list = ps ? ps->graphics.always_included_shaders : nullptr;
+        std::string line;
+        for (const char *p = list ? list : ""; ; ++p) {
+            if (*p == '\n' || *p == '\r' || *p == '\0') {
+                size_t b = line.find_first_not_of(" \t");
+                size_t e = line.find_last_not_of(" \t");
+                if (b != std::string::npos)
+                    gb.always_included_owned.push_back(line.substr(b, e - b + 1));
+                line.clear();
+                if (*p == '\0') break;
+            } else {
+                line += *p;
+            }
+        }
+        gb.always_included_ptrs_owned.reserve(gb.always_included_owned.size());
+        for (auto &s : gb.always_included_owned)
+            gb.always_included_ptrs_owned.push_back(s.c_str());
+    }
 
     gb.summary.clear();
     gb.last_status.clear();

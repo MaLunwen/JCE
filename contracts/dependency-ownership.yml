@@ -1,0 +1,395 @@
+# JCE Dependency Ownership Matrix — machine-readable
+#
+# Consumed by tools/audit/check_dependency_boundaries.py (architecture audit).
+# One entry per capability. `owner` = the third-party dep (or first-party
+# module) that is the single authoritative implementation. `facade` = the JCE
+# API family callers must use. `include_whitelist` = repo-relative directory
+# prefixes whose TUs may include the dependency's headers directly.
+# `link_whitelist` = CMake targets that may link the dependency directly.
+# Everything else including/link­ing the dep directly is a boundary violation.
+#
+# Schema: see tools/audit/check_dependency_boundaries.py docstring.
+# Sync rule: editing conanfile.py requirements REQUIRES updating this file
+# and THIRD_PARTY_LICENSES.md in the same change.
+
+schema_version: 1
+
+capabilities:
+  - capability: window-events-input
+    owner: sdl
+    version: "3.4.0"
+    facade: jce_window_* / jce_input_* / jce_host_* (os/platform)
+    include_whitelist:
+      - engine/src/os/
+      - engine/src/application/   # SDL_main callbacks + event pump glue
+    link_whitelist: [jce_core, jce_platform, jce_cook]
+    forbidden_alternatives: [raw Win32/Cocoa/X11 windowing, SDL Renderer]
+
+  - capability: sdl-portability-substrate
+    owner: sdl
+    version: "3.4.0"
+    facade: direct SDL utility headers are sanctioned engine-wide (SDL-as-portable-libc;
+      see tools/lint/check_engine_native_io.py doctrine)
+    include_whitelist:
+      - engine/src/
+      - engine/tools_include/
+      - tools/
+    link_whitelist: [jce_core, jce_platform, jce_renderer, jce_resource, jce_scene,
+      jce_audio, jce_video, jce_ui, jce_save, jce_application, jce_ai_dispatch, jce_cook]
+    notes: covers SDL_iostream/atomic/thread/mutex/timer/cpuinfo/filesystem/stdinc etc.
+      The window/event/input/render subsystems stay confined to window-events-input.
+      Umbrella <SDL3/SDL.h> outside os|application should be narrowed to the utility
+      headers actually used (include-hygiene remediation P3).
+      LINK LIST HISTORY - this used to read [jce_core, jce_platform, jce_cook], which
+      described a fiction. jce_core linked sdl PUBLIC-ly, so 44 files across five more
+      layers included <SDL3/...> while declaring nothing; the whitelist looked tight
+      only because the free-riders were invisible to it. jce_core is PRIVATE now and
+      every layer that uses SDL declares it, so this list is the real, enforced set.
+      It is LONGER but no longer a lie - and any NEW layer reaching for SDL now has to
+      appear here deliberately. Growth of this list is the signal to re-ask whether the
+      layer should be using SDL at all.
+
+  - capability: image-decode-ldr
+    owner: sdl_image
+    version: "3.4.0"
+    facade: jce_image (single image service; callers never pick decoder)
+    # NARROWED to the service itself.  os/platform used to appear here
+    # because jce_window decoded the window icon with IMG_Load_IO — a
+    # DECODER sitting in the one layer that cannot reach jce_image (L3),
+    # so the icon path bypassed the service's protections, most concretely
+    # the 16-bit-greyscale route-around that exists because that input
+    # overruns libpng's heap.  Decoding moved above L3 (callers decode and
+    # hand down pixels), so the platform layer holds no decoder at all.
+    # engine/src/resource/ no longer includes it either.
+    #
+    # Keep this list at ONE directory.  A second entry means somebody has a
+    # decode path that skips the service, which is the whole failure mode.
+    include_whitelist:
+      - engine/src/renderer/
+    link_whitelist: [jce_platform, jce_renderer, jce_resource, jce_cook]
+    forbidden_alternatives: [direct IMG_Load at call sites, second general-purpose loader]
+
+  - capability: image-decode-hdr
+    owner: stb_image (vendored 2.30)
+    facade: jce_image (same service, HDR dispatch)
+    include_whitelist:
+      - engine/src/renderer/
+      - engine/src/resource/    # jce_image_decode.c — the dispatch service impl
+    forbidden_alternatives: [stb_image as general LDR loader]
+
+  - capability: gpu-backend
+    owner: bgfx
+    version: "1.146.9306-550"
+    facade: jce_render_* / jce_graphics_* (JCE handles only)
+    include_whitelist:
+      - engine/src/renderer/
+      - engine/src/middleware/scene/    # scene renderer glue — audit exception, see ADR
+      - engine/src/middleware/world/    # weather/TOD glue — audit exception
+      - engine/src/middleware/ui/       # UI draw glue
+      - engine/src/middleware/animation/ # GPU skinning upload
+      - engine/src/resource/            # texture/mesh upload
+      - engine/src/application/
+      - tools/
+    link_whitelist: [jce_renderer, jce_scene, jce_world, jce_ui, jce_animation, jce_resource, jce_application, jce_cook]
+    forbidden_alternatives: [raw GL/Vulkan/D3D/Metal, SDL Renderer, bgfx types in public headers, bgfx in editor/ or game projects]
+
+  - capability: shader-compile
+    owner: bgfx-shaderc
+    facade: tools/compile_shaders.cmake + engine shader pipeline
+    forbidden_alternatives: [per-project shader compilers, runtime source compile]
+
+  - capability: font-rasterization
+    owner: freetype
+    version: "2.14.3"
+    facade: jce text/font system (renderer)
+    include_whitelist: [engine/src/renderer/]
+    link_whitelist: [jce_renderer]
+    forbidden_alternatives: [second rasterizer, FT_* in public headers]
+
+  - capability: text-shaping
+    owner: harfbuzz
+    version: "12.3.0"
+    facade: jce text system
+    include_whitelist: [engine/src/renderer/]
+    link_whitelist: [jce_renderer]
+    forbidden_alternatives: [handwritten complex-script shaping]
+
+  - capability: editor-ui
+    owner: imgui
+    version: "1.92.6-docking"
+    facade: jce_tools_imgui INTERFACE target (engine/tools_include)
+    include_whitelist:
+      - editor/
+      - engine/tools_include/
+      - engine/src/middleware/ui/   # editor-integration glue only
+    link_whitelist: [jce_tools_imgui, JCE_Editor, jce_ui]
+    forbidden_alternatives: [ImGui as shipped game UI, ImGui reachable via <jce/...> public headers]
+
+  - capability: runtime-ui
+    owner: rmlui
+    version: "6.2"
+    facade: jce_ui_*
+    include_whitelist: [engine/src/middleware/ui/]
+    link_whitelist: [jce_ui]
+    forbidden_alternatives: [parallel retained-mode UI framework, Rml types in public headers]
+
+  - capability: ecs
+    owner: flecs
+    version: "4.1.5"
+    facade: JceEntity + jce_scene_* (public); ecs_* private
+    include_whitelist:
+      - engine/src/middleware/scene/
+      - engine/src/middleware/world/
+      - engine/src/middleware/ai/
+      - engine/src/middleware/net/
+      - engine/src/middleware/audio/
+      - engine/src/renderer/
+      - engine/src/runtime/
+      - engine/src/application/
+    link_whitelist: [jce_scene, jce_world, jce_ai, jce_net, jce_audio, jce_renderer, jce_application]
+    forbidden_alternatives: [second entity registry, ecs_* in public headers, flecs in editor/ or game projects]
+
+  - capability: json
+    owner: cjson
+    version: "1.7.19"
+    facade: jce_json_* (os/core/jce_json.h)
+    # FILE-granular on purpose.  This used to list four DIRECTORIES, which let
+    # any new file under engine/src/resource/ (etc.) reach for cJSON without
+    # the gate noticing — the whitelist could not tell a sanctioned bridge TU
+    # from a fresh bypass.  Every entry below is a TU that genuinely needs a
+    # cJSON API the facade does not expose (Duplicate / SetValuestring /
+    # PrintUnformatted / raw node surgery).  Adding a file here should be a
+    # deliberate act with a reason, not a side effect of where it lives.
+    #
+    # If a TU only needs parse / get / is_* / array walk / object build /
+    # print / free, it does NOT belong here — that is all facade-covered.
+    # jce_world_partition.c and jce_mod_loader.c were removed this way
+    # (jce_json_detach() closed the one real gap the former had).
+    include_whitelist:
+      - engine/src/os/core/jce_json.c                              # the facade itself
+      - engine/src/middleware/scene/jce_scene_components_internal.h
+      - engine/src/middleware/scene/jce_scene_tags_layers.c
+      - engine/src/middleware/ai_dispatch/jce_aid_json.c
+      - engine/src/resource/jce_bundle_contract_internal.c
+      - engine/src/resource/jce_bundle_deps.c
+      - engine/src/resource/jce_bundle_graph_internal.c
+      - engine/src/resource/jce_bundle_loader.c
+      - engine/src/resource/jce_bundle_pack.c
+      - engine/src/resource/jce_bundle_pack_cook.c            # split out of the line above
+    link_whitelist: [jce_core, jce_scene, jce_resource, jce_ai_dispatch]
+    forbidden_alternatives: [handwritten JSON parser/writer, nlohmann/rapidjson, cJSON_* at consumer call sites]
+
+  - capability: gltf-parse
+    owner: cgltf
+    version: "1.15"
+    facade: jce model/mesh import (resource layer)
+    include_whitelist: [engine/src/renderer/, engine/src/resource/, engine/src/middleware/scene/]
+    link_whitelist: [jce_renderer, jce_resource, jce_scene]
+    forbidden_alternatives: [handwritten glTF, routing ordinary glTF through Assimp]
+
+  - capability: authoring-import
+    owner: assimp
+    version: "6.0.2"
+    facade: editor/offline import pipeline -> JCE canonical assets
+    include_whitelist: [engine/src/resource/]
+    link_whitelist: [jce_resource, jce_cook]
+    forbidden_alternatives: [Assimp as runtime scene system, Assimp as default glTF path]
+
+  - capability: mesh-optimize
+    owner: meshoptimizer
+    version: "1.0"
+    facade: asset pipeline (cook) + approved runtime decode
+    include_whitelist: [engine/src/resource/]
+    link_whitelist: [jce_resource]
+    forbidden_alternatives: [handwritten LOD/simplification]
+
+  - capability: convex-decomposition
+    owner: v-hacd
+    version: "4.1.0"
+    facade: jce_collider_cook (editor/import only)
+    include_whitelist: [engine/src/middleware/physics/]
+    link_whitelist: [jce_physics, jce_cook]
+    forbidden_alternatives: [runtime decomposition during normal play]
+
+  - capability: skeletal-animation
+    owner: ozz-animation
+    version: "0.14.1"
+    facade: jce_anim_* (POD structs + handles)
+    include_whitelist: [engine/src/middleware/animation/]
+    link_whitelist: [jce_animation]
+    forbidden_alternatives: [second sampler, ozz types in public headers, Assimp runtime playback]
+
+  - capability: behavior-tree
+    owner: behaviortree.cpp
+    version: "4.9.0"
+    facade: jce_ai_* BT registration/data assets
+    include_whitelist: [engine/src/middleware/ai/]
+    link_whitelist: [jce_ai]
+    forbidden_alternatives: [second BT interpreter in projects/editor]
+
+  - capability: navigation
+    owner: recastnavigation
+    version: "1.6.0"
+    facade: jce_ai_* nav API
+    include_whitelist: [engine/src/middleware/ai/]
+    link_whitelist: [jce_ai]
+    forbidden_alternatives: [handwritten A* over world geometry, dt* types in public API]
+
+  - capability: physics-3d
+    owner: bullet3
+    version: "3.25"
+    facade: jce_physics_*
+    include_whitelist: [engine/src/middleware/physics/]
+    link_whitelist: [jce_physics]
+    forbidden_alternatives: [second 3D physics, bt* types crossing C ABI]
+
+  - capability: physics-2d
+    owner: box2d
+    version: "3.1.1"
+    facade: jce_physics2d_*
+    include_whitelist: [engine/src/middleware/physics/]
+    link_whitelist: [jce_physics]
+    forbidden_alternatives: [emulating 2D with Bullet ad hoc, b2* types in public API]
+
+  - capability: audio-device-mixer
+    owner: miniaudio
+    version: "0.11.22"
+    facade: jce_audio_*
+    include_whitelist: [engine/src/middleware/audio/, engine/src/resource/, tools/]
+    link_whitelist: [jce_audio, jce_resource, jce_cook]
+    forbidden_alternatives: [SDL audio, OpenAL, second mixer]
+
+  - capability: codec-opus
+    owner: opus
+    version: "1.5.2"
+    include_whitelist: [engine/src/middleware/audio/, engine/src/middleware/video/]
+    link_whitelist: [jce_audio, jce_video]
+
+  - capability: container-ogg
+    owner: ogg
+    version: "1.3.5"
+    include_whitelist: [engine/src/middleware/audio/]
+    link_whitelist: [jce_audio]
+
+  - capability: codec-av1
+    owner: dav1d
+    version: "1.5.3"
+    include_whitelist: [engine/src/middleware/video/]
+    link_whitelist: [jce_video]
+
+  - capability: codec-vpx
+    owner: libvpx
+    version: "1.16.0"
+    include_whitelist: [engine/src/middleware/video/]
+    link_whitelist: [jce_video]
+
+  - capability: container-webm
+    owner: libwebm
+    version: "1.0.0.31"
+    include_whitelist: [engine/src/middleware/video/]
+    link_whitelist: [jce_video]
+
+  - capability: codec-patented
+    owner: vendored fdk-aac / openh264 / libhevc
+    facade: jce video/audio modules, compile-gated JCE_ENABLE_PATENTED_CODECS
+    include_whitelist: [engine/src/middleware/video/, engine/src/middleware/audio/]
+    link_whitelist: [jce_video, jce_audio]
+    notes: release default ON (editor legacy import), dist FORCES OFF, conan neutral. ADR pending.
+
+  - capability: scripting-lua
+    owner: lua
+    version: "5.4.8"
+    facade: jce_script_* + runtime JceScriptHost bridge
+    include_whitelist: [engine/src/middleware/script/]
+    link_whitelist: [jce_script]
+    forbidden_alternatives: [Lua-only engine features, lua_State in public API, scripts owning engine memory]
+
+  - capability: virtual-filesystem
+    owner: physfs
+    version: "3.2.0"
+    facade: jce VFS/resource path API (os/core)
+    include_whitelist: [engine/src/os/core/]
+    link_whitelist: [jce_core]
+    forbidden_alternatives: [fopen/std::filesystem for RESOURCE access, second archive system]
+
+  - capability: host-filesystem
+    owner: jce-os-fs-adapter (first-party, SDL-backed)
+    facade: jce_fs_host_* / SDL_IOStream
+    include_whitelist: [engine/src/os/]
+    forbidden_alternatives: [raw fopen/CreateFile outside os/, host paths in resource IDs]
+
+  - capability: compression
+    owner: zstd
+    version: "1.5.7"
+    facade: jce compression API
+    include_whitelist: [engine/src/os/core/, engine/src/resource/, tools/]
+    link_whitelist: [jce_core, jce_resource, jce_cook, jce_pak]
+    forbidden_alternatives: [per-module codec choice]
+
+  - capability: fast-hash
+    owner: xxhash
+    version: "0.8.3"
+    facade: jce hash API
+    include_whitelist: [engine/src/os/core/, engine/src/resource/, engine/src/middleware/ai_dispatch/, tools/]
+    link_whitelist: [jce_core, jce_resource, jce_ai_dispatch, jce_cook, jce_pak]
+    forbidden_alternatives: [scattered homegrown hashes for persisted IDs, crypto use]
+
+  - capability: allocator
+    owner: mimalloc
+    version: "3.3.2"
+    facade: JCE_MALLOC/jce_alloc (engine) + ED_ALLOC (editor)
+    include_whitelist: [engine/src/os/core/]
+    link_whitelist: [jce_core, jce_cook, jce_pak]
+    forbidden_alternatives: [untracked malloc/new, cross-allocator free]
+
+  - capability: job-system
+    owner: enkits
+    version: "1.11"
+    facade: jce_thread_pool_* (os/core/jce_thread.h)
+    include_whitelist: [engine/src/os/core/]
+    link_whitelist: [jce_core]
+    forbidden_alternatives: [per-module thread pools, std::async, detached threads]
+
+  - capability: http
+    owner: libcurl
+    version: "8.21.0"
+    facade: JCE HTTP service policy (ai_dispatch transport)
+    include_whitelist: [engine/src/middleware/ai_dispatch/]
+    link_whitelist: [jce_ai_dispatch]
+    forbidden_alternatives: [handwritten HTTP/TLS]
+    notes: os/platform jce_tcp.c plaintext HTTP fallback exists — audit exception pending ADR/verdict.
+
+  - capability: udp-transport
+    owner: enet
+    version: "1.3.18"
+    facade: jce_net transport layer
+    include_whitelist: [engine/src/middleware/net/]
+    link_whitelist: [jce_net]
+    forbidden_alternatives: [second reliable UDP, ENet types in public API]
+
+  - capability: schema-messages
+    owner: protobuf
+    version: "7.35.0"
+    facade: generated pb from engine/proto (net-owned)
+    include_whitelist: [engine/src/middleware/net/]
+    link_whitelist: [jce_net]
+    forbidden_alternatives: [protobuf for per-frame snapshots, handwritten tagged messages]
+
+  - capability: snapshot-bitstream
+    owner: jce-net (first-party)
+    facade: versioned bitstream inside middleware/net
+    include_whitelist: [engine/src/middleware/net/, engine/src/middleware/world/]
+    forbidden_alternatives: [per-component incompatible bitstreams]
+
+  - capability: profiler
+    owner: tracy
+    version: "0.13.1"
+    facade: JCE profiling macros, on_demand=True
+    include_whitelist: [engine/src/os/core/]
+    link_whitelist: [jce_core]
+    forbidden_alternatives: [second event profiler, Tracy in public/game APIs]
+
+  - capability: linux-wayland
+    owner: wayland
+    version: "1.24.0"
+    notes: transitive conan override only; no first-party use

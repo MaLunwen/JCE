@@ -26,10 +26,15 @@ static JceEditorComponentDescriptor kDescriptors[] = {
     { JCE_COMP_FLAG_DIR_LIGHT,            JCE_COMP_FLAG_DIR_LIGHT,            "DirectionalLight",  "Directional Light",     "comp.dirLight",             true,  true,  false },
     { JCE_COMP_FLAG_POINT_LIGHT,          JCE_COMP_FLAG_POINT_LIGHT,          "PointLight",        "Point Light",           "comp.pointLight",           true,  true,  false },
     { JCE_COMP_FLAG_SPOT_LIGHT,           JCE_COMP_FLAG_SPOT_LIGHT,           "SpotLight",         "Spot Light",            "comp.spotLight",            true,  true,  false },
+    /* Flag 0: presence-gated, the 64-bit JCE_COMP_FLAG space is full. */
+    { 0,                                  0,                                  "AreaLight",         "Area Light",            "comp.areaLight",            true,  true,  false },
     { JCE_COMP_FLAG_CAMERA,               JCE_COMP_FLAG_CAMERA,               "Camera",            "Camera",                "comp.camera",               true,  true,  true  },
     { JCE_COMP_FLAG_MESH_RENDERER,        JCE_COMP_FLAG_MESH_RENDERER,        "MeshRenderer",      "Mesh Renderer",         "comp.meshRenderer",         true,  true,  true  },
     { JCE_COMP_FLAG_SPRITE_RENDERER,      JCE_COMP_FLAG_SPRITE_RENDERER,      "SpriteRenderer",    "Sprite Renderer",       "comp.spriteRenderer",       true,  true,  true  },
-    { JCE_COMP_FLAG_ANIMATOR,             JCE_COMP_FLAG_ANIMATOR,             "Animator",          "Animator",              "comp.animator",             true,  true,  false },
+    /* RETIRED: addable=false.  The loader migrates it onto SkeletalAnimator,
+     * which supersedes it entirely; it stays REMOVABLE so an entity that
+     * still carries one from an old in-memory scene can be cleaned up. */
+    { JCE_COMP_FLAG_ANIMATOR,             JCE_COMP_FLAG_ANIMATOR,             "Animator",          "Animator",              "comp.animator",             false, true,  false },
     { JCE_COMP_FLAG_SKELETAL_ANIMATOR,    JCE_COMP_FLAG_SKELETAL_ANIMATOR,    "SkeletalAnimator",  "Skeletal Animator",     "comp.skeletalAnimator",     true,  true,  true  },
     { 0,                                  0,                                  "IkConstraints",     "IK Constraints",        "comp.ikConstraints",        true,  true,  false },
     { 0,                                  0,                                  "FootIk",            "Foot IK",               "comp.footIk",               true,  true,  false },
@@ -81,6 +86,11 @@ static JceEditorComponentDescriptor kDescriptors[] = {
     { JCE_COMP_FLAG_CANVAS,               JCE_COMP_FLAG_CANVAS,               "Canvas",            "Canvas",                "comp.canvas",               true,  true,  false },
     { JCE_COMP_FLAG_CANVAS_GROUP,         JCE_COMP_FLAG_CANVAS_GROUP,         "CanvasGroup",       "Canvas Group",          "comp.canvasGroup",          true,  true,  false },
     { JCE_COMP_FLAG_LAYOUT_GROUP,         JCE_COMP_FLAG_LAYOUT_GROUP,         "LayoutGroup",       "Layout Group",          "comp.layoutGroup",          true,  true,  false },
+    /* Flagless: the 64-bit JCE_COMP_FLAG space is full, so presence IS the
+     * gate -- the same shape IkConstraints and FootIk use above. */
+    { 0,                                  0,                                  "BoneAttachment",    "Bone Attachment",       "comp.boneAttachment",       true,  true,  false },
+    { 0,                                  0,                                  "ContentSizeFitter", "Content Size Fitter",   "comp.contentSizeFitter",    true,  true,  false },
+    { 0,                                  0,                                  "LayoutElement",     "Layout Element",        "comp.layoutElement",        true,  true,  false },
     { JCE_COMP_FLAG_UI_IMAGE,             JCE_COMP_FLAG_UI_IMAGE,             "UIImage",           "UI Image",              "comp.uiImage",              true,  true,  false },
     { JCE_COMP_FLAG_UI_TEXT,              JCE_COMP_FLAG_UI_TEXT,              "UIText",            "UI Text",               "comp.uiText",               true,  true,  false },
     { JCE_COMP_FLAG_UI_BUTTON,            JCE_COMP_FLAG_UI_BUTTON,            "UIButton",          "UI Button",             "comp.uiButton",             true,  true,  false },
@@ -175,6 +185,9 @@ static const char *const kDefaultOrderNames[] = {
     "Canvas",
     "CanvasGroup",
     "LayoutGroup",
+    "BoneAttachment",
+    "ContentSizeFitter",
+    "LayoutElement",
     "UIImage",
     "UIText",
     "UIButton",

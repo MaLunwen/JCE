@@ -1,0 +1,87 @@
+# JCE bgfx view-id reservations — FROZEN, APPEND ONLY.
+#
+# Generated/checked by tools/audit/check_view_reservations.py, which is
+# registered in tools/audit/run_architecture_audit.py.  Regenerate with
+#
+#     python tools/audit/check_view_reservations.py --update
+#
+# and commit the result WITH the header change, the same discipline
+# contracts/abi-snapshot.txt uses.
+#
+# WHY A CONTRACT FILE AND NOT ONLY A static_assert.
+#
+# bgfx view state is last-write-wins and view ORDER is a global remap, so two
+# subsystems reaching for the same id do not conflict loudly — one of them
+# silently stops producing pixels.  That happened: the editor's ECS-UI overlay
+# sat on the scene renderer's dynamic-CSM band and drew every frame into a
+# target the colour pass then cleared, in both editor viewports, while the
+# shipped runtime was fine.  Nothing errored and nothing logged.
+#
+# engine/include/jce/renderer/jce_views.h carries the same table as macros and
+# the editor static_asserts against it, which catches the same-base case at
+# compile time.  This file exists for the half a compiler cannot see:
+#
+#   * a range that NARROWS.  The frozen set is the union of everything the
+#     scene renderer has ever named; shrinking it hands ids back to whoever
+#     asks first, which is the original defect one level up.  A static_assert
+#     written in terms of the constants it checks cannot catch that — this
+#     checker compares against a recorded baseline instead.
+#   * the two viewport BASES drifting closer than one base's full claim, which
+#     is a cross-base property no per-viewport assert can reach.
+#
+# ADDING a band: append a range, never edit an existing one.
+# RETIRING a band: delete the LIVE constant in jce_views.h, LEAVE the frozen
+# range here.  Reclaiming a frozen range for a foreign pass has to be argued
+# for in the commit that narrows this file.
+
+[frozen-offsets]
+# Base-relative ranges [lo, hi] INCLUSIVE that a scene-renderer base has ever
+# NAMED.  A foreign pass deriving ids from a scene-renderer base must not use
+# any offset in this set.
+
+0-17
+52-57
+100-116
+63-63
+26-27
+[bases]
+# Every base a scene render is driven from, and the fixed absolute ids.  The
+# two editor viewports render in the SAME frame, so their spans must not
+# overlap: one base claims up to the top of the frozen set above.
+
+3    editor-scene-view              MODAL SHARER: a reflection probe capture renders six cube faces from this base, one per frame, and BOTH editor viewports yield while jce_scene_probe_capture_in_flight() -- the same arrangement as the impostor bake and for the same reason (a full scene render claims 117 ids and 256 views do not hold a third span of that size)
+30   shipped-runtime
+50   editor-overlay
+60   editor-material-preview
+70   editor-pick
+71   editor-pick-readback
+120  editor-game-view
+250  imgui
+252  occlusion-proxy
+254  ui-overlay
+[viewport-consumer-offsets]
+# What the editor's viewport passes add ON TOP of a scene-renderer base.  Every
+# one of these is static_asserted against [frozen-offsets] in
+# editor/src/scene/jce_editor_viewport_common.h.
+19   ssr-composite
+20   fullscreen-effects-base
+28   fullscreen-composite
+29   overlay
+30   postfx-base (21 views: 30..50)
+51   postfx-composite
+58   ecs-ui-overlay
+59   dynamic-resolution-resolve
+60   readback-capture
+61   tsr (uses 61 and 62)
+
+[absolute-bands]
+# Bands that are NOT base-relative.
+1-1      morph-deform  ONE compute dispatch per morph-bearing primitive, writing the vertex buffer the colour pass draws. Below every scene base ON PURPOSE: bgfx runs views in ascending id order, so any id above a base would execute AFTER the draw that reads its output and the mesh would be one frame behind its own animation. 1 is the free id between the renderer's direct-to-backbuffer pair (0 = JCE_VIEW_MAIN_3D, 2 = JCE_VIEW_DEBUG) and the lowest scene base (editor Scene View, 3). One id serves every primitive and instance -- a dispatch carries its own bindings and reads no view state
+127-228  impostor-bake  MODAL: overlaps the game-view span by necessity (1 + gridN^2 + 1 contiguous ids do not exist once two viewport bases are placed in 256 views), so both editor viewports yield while jce_impostor_bake_in_flight()
+232-236  RETIRED  init-clear band, reclaimed; had no consumer in the tree
+237-237  probe-capture-blit  the blit that copies one finished cube face into the read-back staging texture. It must sort AFTER a full scene render, and the highest viewport base (game view, 120) claims through 236, so this is the first id past every base-relative claim. RECLAIMED from the retired init-clear band above, which had no consumer
+238-247  planar-reflection  A SECOND, REDUCED SCENE RENDER from its own base at 238. It is above every scene base ON PURPOSE and that is what makes it one frame late: bgfx runs views in ascending id order and the water that samples the reflection draws in the scene's COLOUR view (base+0), so no base-relative id can precede its consumer. The alternative was to move the water pass out of the colour view, which reorders it against every other transparent thing in the scene. RECLAIMED from the retired init-clear band above; this sentence is the argument the header asks for. The reduced pass claims base+0 and, drawing a skybox, nothing more -- shadows, the depth pre-pass and every screen-space effect are off (JceSceneRenderConfig::reduced_pass), which is also why it cannot be given a base whose offsets would run past 255
+251-252  screen-recorder  MODAL: the F9 recorder derives JCE_VIEW_IMGUI+1 (resolve) and +2 (blit). +2 IS 252, JCE_VIEW_OCCLUSION, whose header says nothing else may write it -- they do not collide only because the recorder runs after the frame's occlusion queries and the proxy writes no colour. Recorded so that argument is visible rather than re-derived
+10-14    RETIRED  pre-CSM per-light shadow views. The names had zero consumers while naming ids the Scene View base (3) writes as its own offsets 7..11; the macros are deleted, the ids stay recorded here
+20-20    postfx-default   ALIAS: jce_postfx's view_base at CREATE, before a consumer re-bases it -- the editor to base+30, the runtime to 100. It equals scene-view base 3 + offset 17, so a consumer that skipped the re-base would sit on the scene renderer's own span. Guarded rather than moved: jce_postfx_apply claims its 21 views unconditionally and the scene renderer claims too, so the overlap is reported by name instead of losing pixels silently
+253-253  editor-game-view-occlusion  the Game View's own occlusion proxy, distinct from 252 so the two viewports carry independent query state in one frame

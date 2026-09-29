@@ -46,6 +46,12 @@ void jce_editor_scene_asset_cache_finalize(void)
     mesh_finalize_completed_loads();
     texture_finalize_completed_loads();
     material_finalize_completed_loads();
+    /* ...and notice files edited outside the editor.  After the finalize, so a
+     * texture that just landed is stamped before it can be polled. */
+    texture_poll_disk_changes();
+    /* The material in the same folder, which was on the wrong side of exactly
+     * the asymmetry the texture poll was written to remove. */
+    material_poll_disk_changes();
 }
 
 void jce_editor_scene_asset_cache_set_scene_dir(const char *dir)
@@ -81,6 +87,14 @@ JceTexture jce_editor_scene_asset_cache_get_texture(const char *material_path,
     if (!s_cache.initialized)
         return tex_invalid();
     return asset_cache_get_texture(material_path, mesh_path);
+}
+
+JceTexture jce_editor_scene_asset_cache_get_texture_srgb(const char *material_path,
+                                                          const char *mesh_path)
+{
+    if (!s_cache.initialized)
+        return tex_invalid();
+    return asset_cache_get_texture_cs(material_path, mesh_path, true);
 }
 
 bool jce_editor_scene_asset_cache_texture_failed(const char *material_path,

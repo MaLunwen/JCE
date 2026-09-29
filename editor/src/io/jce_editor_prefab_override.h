@@ -184,6 +184,66 @@ std::vector<std::string> overridden_field_names(JceScene *inst_scene,
 JceJson *make_single_component_node(JceScene *scene, JceEntity e,
                                     const char *comp_name);
 
+
+/* ── Per-CHILD overrides ────────────────────────────────────────────────
+ *
+ * WHAT WAS LOST.  The override MVP was root-level: the serializer, on
+ * writing an instance whose ROOT had any override, skipped its children
+ * entirely ("the override MVP is root-level; per-child overrides are a
+ * follow-up") because instantiate_prefab rebuilds the subtree on load and
+ * re-serializing would duplicate it.  The consequence was not a missing
+ * feature, it was DATA LOSS: move the root one metre and every edit the
+ * author had made to any CHILD of that instance vanished on save, silently,
+ * with the file still loading cleanly.
+ *
+ * ADDRESSING A CHILD.  There are no stable per-node ids in a prefab
+ * instance, so a child is addressed by its INDEX PATH from the instance root
+ * -- [0,2] is "third child of the first child".  That is only sound while
+ * the instance's subtree still has the source's shape, and it is not always
+ * sound: jce_scene_get_children returns CREATION order (measured), but
+ * destroying a middle child SWAP-REMOVES, so A B C D E becomes A B E D.  An
+ * index path over a diverged subtree would land an override on the WRONG
+ * child, which is worse than the edit being lost.
+ *
+ * So the shape is checked first, and every path carries the child's NAME as
+ * a second witness the loader verifies.  When the shape diverges -- the
+ * author added or deleted a child of the instance -- the caller writes the
+ * legacy FULL SNAPSHOT for that instance instead, which preserves everything
+ * exactly as it does today.  Both branches keep the author's work; only the
+ * compactness of the file differs.
+ */
+
+/* One child of a prefab instance that differs from the corresponding child
+ * of its source. */
+struct ChildOverride {
+    std::vector<int>         path;        /* child indices from the root   */
+    std::string              name;        /* the child's name, as a witness */
+    std::vector<std::string> components;  /* component names that differ    */
+};
+
+/* True when the instance subtree has exactly the source subtree's shape:
+ * the same child count at every node, recursively.  False the moment an
+ * author has added or removed a child anywhere inside the instance -- the
+ * one case where an index path cannot be trusted. */
+bool subtree_shape_matches(JceScene *inst_scene, JceEntity inst_root,
+                           JceScene *src_scene,  JceEntity src_root);
+
+/* Every DESCENDANT of inst_root that differs from its source counterpart,
+ * depth-first in child order, root itself excluded (the root's own
+ * overrides are compute_overrides above).  Returns empty when nothing
+ * differs.  UNDEFINED unless subtree_shape_matches() first returned true --
+ * callers must check, and the unit test holds them to it. */
+std::vector<ChildOverride> compute_child_overrides(JceScene *inst_scene,
+                                                   JceEntity inst_root,
+                                                   JceScene *src_scene,
+                                                   JceEntity src_root);
+
+/* Walk `path` from `root`.  Returns 0 when any index is out of range, so a
+ * loader given a path from a file that no longer matches the prefab fails
+ * closed rather than overlaying onto whatever entity happens to be there. */
+JceEntity resolve_child_path(JceScene *scene, JceEntity root,
+                             const std::vector<int> &path);
+
 } /* namespace jce_prefab_override */
 
 #endif /* JCE_EDITOR_PREFAB_OVERRIDE_H */

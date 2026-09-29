@@ -57,12 +57,22 @@ bool entity_camera_pose(JceScene *scene, JceEntity entity,
 void apply_projection(const JceCameraComponent &camera, float aspect)
 {
     const float safe_aspect = aspect > 1.0e-4f ? aspect : 1.0f;
-    const float vertical_span = fmaxf(camera.fov_deg, 0.01f);
+    /* Orthographic height in world units.  Until JceCameraComponent carried
+     * ortho_size there was no such field, so this reused fov_deg -- an ANGLE
+     * -- as a world-unit span: a 60-degree fov became a 60-unit tall box.
+     * The runtime meanwhile applied no size at all and kept
+     * jce_camera_create's 800x450 default, so the editor and the shipped
+     * game framed the same orthographic scene two different wrong ways.
+     * With a real size authored, both now take the aspect-following path. */
+    const bool authored = camera.ortho_size > 0.0f;
+    const float vertical_span = authored ? camera.ortho_size
+                                         : fmaxf(camera.fov_deg, 0.01f);
     jce_editor_scene_camera_set_projection(camera.ortho,
                                            camera.fov_deg,
                                            camera.near_plane,
                                            camera.far_plane,
-                                           vertical_span * safe_aspect,
+                                           authored ? 0.0f
+                                                    : vertical_span * safe_aspect,
                                            vertical_span);
 }
 

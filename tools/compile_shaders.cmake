@@ -93,6 +93,27 @@ function(jce_compile_shaders)
         return()
     endif()
 
+    execute_process(
+        COMMAND "${_shaderc}" --version
+        RESULT_VARIABLE _shaderc_probe_result
+        OUTPUT_QUIET
+        ERROR_QUIET
+        TIMEOUT 30)
+    if(NOT _shaderc_probe_result EQUAL 0)
+        if(ARG_REQUIRED)
+            message(FATAL_ERROR
+                "shaderc exists but cannot execute on this build host: ${_shaderc}. "
+                "Cross builds require a native host shaderc.")
+        endif()
+        message(WARNING
+            "shaderc exists but cannot execute on this build host: ${_shaderc}; "
+            "shader rebuilds disabled.")
+        if(NOT TARGET ${ARG_TARGET})
+            add_custom_target(${ARG_TARGET})
+        endif()
+        return()
+    endif()
+
     # ── bgfx shader include path ──────────────────────────────────
     if(NOT BGFX_SHADER_INCLUDE_PATH)
         message(FATAL_ERROR
@@ -110,6 +131,7 @@ function(jce_compile_shaders)
     set(_include_dirs "${BGFX_SHADER_INCLUDE_PATH}" ${ARG_INCLUDE_DIRS})
     list(REMOVE_DUPLICATES _include_dirs)
     set(_include_args)
+    set(_lint_include_args)
     set(_include_inputs)
     foreach(_include_dir IN LISTS _include_dirs)
         if(NOT IS_DIRECTORY "${_include_dir}")
@@ -118,6 +140,7 @@ function(jce_compile_shaders)
                 "${_include_dir}")
         endif()
         list(APPEND _include_args -i "${_include_dir}")
+        list(APPEND _lint_include_args --include-dir "${_include_dir}")
         file(GLOB_RECURSE _dir_include_inputs CONFIGURE_DEPENDS
             "${_include_dir}/*.sh" "${_include_dir}/*.sc")
         list(APPEND _include_inputs ${_dir_include_inputs})
@@ -136,7 +159,7 @@ function(jce_compile_shaders)
     find_program(JCE_SHADER_LINT_PYTHON NAMES python3 python py)
     if(JCE_SHADER_LINT_PYTHON)
         set(_lint_script "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/shader_lint.py")
-        file(GLOB _lint_inputs
+        file(GLOB_RECURSE _lint_inputs CONFIGURE_DEPENDS
             "${ARG_SHADER_DIR}/*.sc"
             "${ARG_SHADER_DIR}/*.sh")
         set(_lint_stamp
@@ -145,9 +168,9 @@ function(jce_compile_shaders)
         add_custom_command(
             OUTPUT  "${_lint_stamp}"
             COMMAND "${JCE_SHADER_LINT_PYTHON}" "${_lint_script}"
-                    --quiet "${ARG_SHADER_DIR}"
+                    --quiet ${_lint_include_args} "${ARG_SHADER_DIR}"
             COMMAND "${CMAKE_COMMAND}" -E touch "${_lint_stamp}"
-            DEPENDS ${_lint_inputs} "${_lint_script}"
+            DEPENDS ${_lint_inputs} ${_include_inputs} "${_lint_script}"
             COMMENT "ShaderLint: ${ARG_TARGET}"
             VERBATIM)
     else()
@@ -208,6 +231,7 @@ function(jce_compile_shaders)
         set(JCE_SHADER_GLES2_ALLOWLIST
             vs_color fs_color
             vs_textured fs_textured
+            fs_text_sdf
             vs_mesh fs_mesh
             vs_grid fs_grid
             vs_sky  fs_sky
@@ -305,6 +329,26 @@ function(jce_compile_shaders)
                         --varyingdef "${_varying}"
                         ${_include_args}
                         ${_shader_defines}
+                        # -O 3.  Passing NO -O is not the same as -O 0: shaderc
+                        # takes a different path entirely, and on HLSL that path
+                        # keeps debug information -- fs_pbr is 416168 bytes with
+                        # no flag and 203160 with any level from 0 to 3.  Every
+                        # engine shader on every backend went through the
+                        # no-flag path.
+                        #
+                        # MEASURED BEFORE CHANGING, because a compiler flag is a
+                        # claim about frame time and the driver recompiles the
+                        # bytecode anyway, so a size difference is not by itself
+                        # a performance difference:
+                        #   compiles ... 530 of 530, all five profiles, 0 failed
+                        #   OpenGL ..... pixel-identical, 0 differing pixels
+                        #   D3D11 ...... max 1/255 on a handful of pixels, 0
+                        #                above 2 (float reassociation)
+                        #   GPU time ... graveyard at 2x render scale, D3D11,
+                        #                seven interleaved samples each:
+                        #                6.01 ms -> 5.50 ms, and the spread
+                        #                narrows from 5.0-7.9 to 5.1-5.8
+                        -O 3
                 DEPENDS "${_src}" "${_varying}" ${_lint_stamp}
                         ${_shared_includes} ${_include_inputs}
                 COMMENT "Shader: ${_name} (${_suffix})"

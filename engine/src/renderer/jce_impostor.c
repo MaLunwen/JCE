@@ -46,8 +46,6 @@
  * models).  Base 128 keeps clear of the scene/editor/post views below and the
  * init-clear band (232) / imgui (250) / ui (254) above: 128 + gridN^2 - 1 must
  * stay < 232, so the single-frame bake clamps gridN to 10 (100 cells). */
-#define JCE_VIEW_IMPOSTOR_BAKE_BASE 128
-#define JCE_IMPOSTOR_BAKE_MAX_GRID  10
 
 /* ── Octahedral direction math (must match fs_impostor.sc oct_encode) ── */
 
@@ -447,12 +445,29 @@ static void bake_render_views(void)
        sorts BEFORE every cell view (id < BASE).  bgfx_set_view_clear only
        affects the view's own rect, so the per-cell views (each with a cell-sized
        rect) cannot clear the whole atlas — this dedicated pass does. */
+    /* Declare the band to the ownership guard.  It CANNOT be made disjoint
+     * from the Game View: 1 + gridN^2 + 1 contiguous ids do not exist once two
+     * viewport bases are placed in a 256-view budget.  So the bake is modal
+     * instead (jce_impostor_bake_in_flight), and claiming the band is what
+     * makes a caller that forgot the modality say so in the log rather than
+     * silently losing either the bake or the viewport. */
+    /* Claim the WORST CASE band, not the one this bake happens to use.  The
+     * readback blit sits at BASE + MAX_GRID^2, a fixed id: it does NOT move
+     * down when gn < MAX_GRID.  The first version of this claim was sized by
+     * gn, so at the default gn of 8 it covered 127..192 while the blit wrote
+     * 228 -- 36 ids that the claim, and the contract row derived from it, both
+     * said were free. */
+    jce_view_bands_claim("impostor-bake",
+                         (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BASE - 1u),
+                         (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BLIT
+                                    - JCE_VIEW_IMPOSTOR_BAKE_BASE + 2u));
+
     {
         uint16_t cv = (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BASE - 1);
         bgfx_set_view_frame_buffer(cv, g_bake.fbo);
         bgfx_set_view_rect(cv, 0, 0, (uint16_t)g_bake.atlas_px,
                            (uint16_t)g_bake.atlas_px);
-        bgfx_set_view_clear(cv, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+        bgfx_set_view_clear(cv, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                             0x00000000, 1.0f, 0);
         bgfx_touch(cv);
     }
@@ -493,8 +508,7 @@ static void bake_render_views(void)
        CPU read.  Use a blit view that sorts AFTER every cell view so the atlas is
        fully rendered first.  bgfx_read_texture returns the frame index after
        which g_bake.pixels is valid (poll for it). */
-    uint16_t blit_view = (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BASE +
-                                    JCE_IMPOSTOR_BAKE_MAX_GRID * JCE_IMPOSTOR_BAKE_MAX_GRID);
+    uint16_t blit_view = (uint16_t)JCE_VIEW_IMPOSTOR_BAKE_BLIT;
     bgfx_blit(blit_view, g_bake.staging, 0, 0, 0, 0,
               g_bake.color, 0, 0, 0, 0,
               (uint16_t)g_bake.atlas_px, (uint16_t)g_bake.atlas_px, 1);
@@ -514,6 +528,12 @@ static bool bake_write_atlas_png(void)
     if (!ok) LOG_ERROR(LOG_TAG, "bake: PNG write failed: %s (%s)",
                        g_bake.desc.atlas_path_host, SDL_GetError());
     return ok;
+}
+
+bool jce_impostor_bake_in_flight(void)
+{
+    return g_bake.status == JCE_IMPOSTOR_BAKE_RENDERING ||
+           g_bake.status == JCE_IMPOSTOR_BAKE_READBACK;
 }
 
 JceImpostorBakeStatus jce_impostor_bake_poll(void)

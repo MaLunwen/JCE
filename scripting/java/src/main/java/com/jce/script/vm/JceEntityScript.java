@@ -79,6 +79,13 @@ public abstract class JceEntityScript {
     /** Called every frame with the time-scaled delta (Lua: on_update). */
     public void onUpdate(float dt) { }
 
+    /** Called once per PHYSICS step with the FIXED delta time, immediately
+     *  before that step — Unity's FixedUpdate.  Zero or many times per
+     *  rendered frame, and always the same dt, so a force applied here
+     *  produces the same motion at 30 Hz and at 144 Hz.  {@link #onUpdate}
+     *  is the one that runs once per drawn frame. */
+    public void onFixedUpdate(float dt) { }
+
     /** Called when the instance is released (Lua: on_destroy). */
     public void onDestroy() { }
 

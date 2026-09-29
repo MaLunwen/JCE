@@ -333,3 +333,66 @@ void jce_ies_free_lut(JceTexture h)
     if (jce_texture_valid(h))
         jce_texture_destroy(h);
 }
+
+/* ── Path-keyed LUT cache ────────────────────────────────────────────
+ *
+ * Small and linear on purpose: a scene has a handful of distinct photometric
+ * profiles, and the lookup runs once per IES spot light per frame.
+ */
+#define JCE_IES_CACHE_MAX 16
+
+static struct {
+	char       path[256];
+	JceTexture tex;          /* may be INVALID -- a cached FAILURE */
+} s_ies_cache[JCE_IES_CACHE_MAX];
+static int  s_ies_cache_count;
+static bool s_ies_cache_full_warned;
+
+JceTexture jce_ies_lut_for_path(const char *asset_path)
+{
+	int i;
+	if (!asset_path || !*asset_path) return JCE_TEXTURE_INVALID;
+
+	for (i = 0; i < s_ies_cache_count; i++)
+		if (strncmp(s_ies_cache[i].path, asset_path,
+		            sizeof s_ies_cache[i].path) == 0)
+			return s_ies_cache[i].tex;
+
+	if (s_ies_cache_count >= JCE_IES_CACHE_MAX) {
+		/* Baking without caching would create one texture per frame, which is
+		 * a leak rather than a fallback, so refuse -- once, loudly. */
+		if (!s_ies_cache_full_warned) {
+			s_ies_cache_full_warned = true;
+			LOG_WARN(LOG_TAG, "IES LUT cache full (%d profiles); \"%s\" and any "
+			         "further profile will render without one",
+			         JCE_IES_CACHE_MAX, asset_path);
+		}
+		return JCE_TEXTURE_INVALID;
+	}
+
+	{
+		int slot = s_ies_cache_count++;
+		size_t n = strlen(asset_path);
+		if (n >= sizeof s_ies_cache[slot].path)
+			n = sizeof s_ies_cache[slot].path - 1;
+		memcpy(s_ies_cache[slot].path, asset_path, n);
+		s_ies_cache[slot].path[n] = 0;
+		/* A failure is cached as INVALID.  Without that, a mistyped path is
+		 * re-read and re-parsed on every frame of every light that names it. */
+		s_ies_cache[slot].tex = jce_ies_bake_lut_from_file(asset_path);
+		return s_ies_cache[slot].tex;
+	}
+}
+
+void jce_ies_cache_shutdown(void)
+{
+	int i;
+	for (i = 0; i < s_ies_cache_count; i++) {
+		if (jce_texture_valid(s_ies_cache[i].tex))
+			jce_ies_free_lut(s_ies_cache[i].tex);
+		s_ies_cache[i].tex     = JCE_TEXTURE_INVALID;
+		s_ies_cache[i].path[0] = 0;
+	}
+	s_ies_cache_count       = 0;
+	s_ies_cache_full_warned = false;
+}

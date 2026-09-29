@@ -59,6 +59,78 @@ static ImVec4 tier_color(JceGpuTier t)
     }
 }
 
+/* Format a JceGraphicsApiVersion, or the i18n "not reported" string when the
+ * backend did not tell us.  The engine sets *_verified false and leaves the
+ * struct zeroed in that case, and a zeroed version must never be shown as
+ * "0.0" -- that reads like a real answer. */
+static void api_version_text(char *buf, size_t cap,
+                             JceGraphicsApiVersion v, bool verified)
+{
+    if (!verified) {
+        std::snprintf(buf, cap, "%s",
+                      jce_editor_i18n("statusBar.gfxApi.unreported"));
+        return;
+    }
+    if (v.patch)
+        std::snprintf(buf, cap, "%u.%u.%u", (unsigned)v.major,
+                      (unsigned)v.minor, (unsigned)v.patch);
+    else
+        std::snprintf(buf, cap, "%u.%u", (unsigned)v.major, (unsigned)v.minor);
+}
+
+/* Graphics-API section of the GPU-tier popup.
+ *
+ * The BUILD FLOOR and the NEGOTIATED version are two different things and
+ * conflating them has already cost this tree a day: the desktop OpenGL floor
+ * sat at 2.1 for the life of the project because bgfx's
+ * BGFX_CONFIG_RENDERER_OPENGL_MIN_VERSION defaults to 1 when nothing sets it,
+ * and nothing surfaced that -- a too-old floor renders fine, just on the old
+ * paths.  This is where it becomes visible. */
+static void draw_graphics_api_section(void)
+{
+    const JceRendererApiInfo info = jce_renderer_get_api_info();
+
+    ImGui::TextUnformatted(jce_editor_i18n("statusBar.gfxApi.header"));
+    ImGui::Separator();
+
+    char minimum[32], runtime[32], shading[32];
+    api_version_text(minimum, sizeof(minimum), info.minimum_version, true);
+    api_version_text(runtime, sizeof(runtime), info.runtime_version,
+                     info.runtime_version_verified);
+    api_version_text(shading, sizeof(shading), info.shader_language_version,
+                     info.shader_language_version_verified);
+
+    ImGui::Text("%s  %s", jce_editor_i18n("statusBar.gfxApi.backend"),
+                jce_renderer_backend_name(info.backend));
+    ImGui::Text("%s  %s (%s)", jce_editor_i18n("statusBar.gfxApi.floor"),
+                jce_graphics_api_tier_name(info.build_tier), minimum);
+    ImGui::Text("%s  %s", jce_editor_i18n("statusBar.gfxApi.negotiated"),
+                runtime);
+    ImGui::Text("%s  %s", jce_editor_i18n("statusBar.gfxApi.shading"),
+                shading);
+
+    /* The whole ladder, so the floor above reads as one rung of a set rather
+     * than an arbitrary number.  Rebuilding is what moves it, hence the tip. */
+    char ladder[192];
+    int  used = 0;
+    for (int t = 0; t < JCE_GRAPHICS_API_TIER_COUNT; ++t) {
+        const JceGraphicsApiTier    tier = (JceGraphicsApiTier)t;
+        const JceGraphicsApiVersion v =
+            jce_renderer_api_tier_minimum(info.backend, tier);
+        if (!v.major) continue;   /* backend has no versioned floor policy */
+        used += std::snprintf(ladder + used, sizeof(ladder) - (size_t)used,
+                              "%s%s %u.%u", used ? "   " : "",
+                              jce_graphics_api_tier_name(tier),
+                              (unsigned)v.major, (unsigned)v.minor);
+        if (used >= (int)sizeof(ladder)) break;
+    }
+    if (used > 0) {
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", ladder);
+        jce_editor::help_tip(jce_editor_i18n("statusBar.gfxApi.ladderTip"));
+    }
+}
+
 static void draw_gpu_tier_segment(void)
 {
     JceGpuTier  tier        = jce_renderer_get_tier();
@@ -86,6 +158,8 @@ static void draw_gpu_tier_segment(void)
     jce_editor::help_tip(jce_editor_i18n("statusBar.gpuTier.tooltip"));
 
     if (ImGui::BeginPopup("##jce_gpu_tier_menu")) {
+        draw_graphics_api_section();
+        ImGui::Separator();
         bool tier_changed = false;
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setLow")))
             { jce_renderer_set_tier_override(JCE_GPU_TIER_LOW);    tier_changed = true; }

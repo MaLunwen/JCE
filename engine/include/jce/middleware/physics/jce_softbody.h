@@ -90,6 +90,24 @@ JCE_API bool jce_softbody_get_aabb(JceSoftBodyHandle h,
 JCE_API uint32_t jce_softbody_add_static_box(jce_vec3 center,
                                              jce_vec3 half_extents);
 
+/* The other two primitive proxies.  A box was the only shape a soft body
+ * could touch, so a sphere or capsule collider in the scene simply did not
+ * exist for cloth -- it fell through them, and nothing reported it.
+ *
+ * `height` is the capsule's TOTAL length including both hemispheres, matching
+ * JceCapsuleColliderComponent and the character capsule; Bullet wants the
+ * cylinder section, so the conversion is done inside.  `axis` is 0=X, 1=Y,
+ * 2=Z, the same encoding the component uses.
+ *
+ * Still PRIMITIVES ONLY: convex-hull, mesh and terrain colliders remain
+ * invisible to the soft world, and so does every DYNAMIC body -- the soft
+ * simulation runs in a separate btSoftRigidDynamicsWorld and rigid-vs-soft is
+ * one-way by construction. Both are named here so the next reader does not
+ * have to rediscover the boundary from the absence of a function. */
+JCE_API uint32_t jce_softbody_add_static_sphere(jce_vec3 center, float radius);
+JCE_API uint32_t jce_softbody_add_static_capsule(jce_vec3 center, float radius,
+                                                 float height, int axis);
+
 /* Remove + free ALL static proxies (call on scene unload).  Idempotent. */
 JCE_API void jce_softbody_clear_statics(void);
 

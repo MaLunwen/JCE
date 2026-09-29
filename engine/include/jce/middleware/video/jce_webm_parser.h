@@ -11,7 +11,7 @@
  *           │           ──── audio packets ───►  miniaudio (Opus/Vorbis)
  *           ▼
  *
- * Only what jce_video / jce_audio need is exposed: open from memory,
+ * Only what jce_video / jce_audio need is exposed: open from source or memory,
  * codec/dimensions/duration, sequential packet read for video & audio
  * tracks, coarse seek to a timestamp. Matroska's full feature surface
  * (subtitles, attachments, multiple A/V tracks, encryption, …) is not
@@ -23,6 +23,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_read_source.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,7 +34,7 @@ JCE_EXTERN_C_BEGIN
 typedef enum JceWebmVideoCodec {
     JCE_WEBM_VIDEO_NONE = 0,
     JCE_WEBM_VIDEO_VP8,
-    JCE_WEBM_VIDEO_VP9,         /* recognised but not decoded by JCE */
+    JCE_WEBM_VIDEO_VP9,
     JCE_WEBM_VIDEO_AV1
 } JceWebmVideoCodec;
 
@@ -61,6 +62,10 @@ JCE_API bool jce_webm_is_webm(const void *data, size_t size);
 /* Open an in-memory WebM/Matroska stream. Buffer must outlive the parser. */
 JCE_API JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
                                     JceWebmInfo *out_info);
+
+/* Retains source. Loads clusters on demand, with a bounded retained index. */
+JCE_API JceWebmParser *jce_webm_open_source(JceReadSource *source,
+                                          JceWebmInfo *out_info);
 
 /* Codec-private data (e.g. Vorbis 3-packet header, Opus extradata).
  * Pointer is owned by parser and valid until close. Returns false if absent. */

@@ -25,6 +25,13 @@ extern "C" {
 #include <jce/application/jce_screenshot.h>
 #include <jce/application/jce_subsystem.h>
 
+/* Completed 2026-08-31.  These headers export JCE_API symbols and were
+ * reachable from NO umbrella, so §4's promise -- `#include <jce/api.h>`
+ * gives you the whole engine -- did not hold for them.  Several are named
+ * in §4's own table by capability.
+ */
+#include <jce/application/jce_main.h>
+
 /* NOTE: jce_main.h is intentionally excluded.
  * It defines SDL_MAIN_USE_CALLBACKS and generates entry-point functions
  * via the JCE_MAIN() macro — it must be included in exactly ONE .c file

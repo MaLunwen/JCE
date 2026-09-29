@@ -5,6 +5,8 @@
 #ifndef JCE_SCENE_RENDERER_VIEW_ORDER_H
 #define JCE_SCENE_RENDERER_VIEW_ORDER_H
 
+#include <jce/renderer/jce_views.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -60,7 +62,9 @@
  *
  * Anything that grows a viewport's claim past base+76 must move the bases
  * apart, not this number. */
-#define JCE_VIEW_DYN_CSM_OFFSET 52u
+/* Single-sourced from the public reservation table so the editor's
+ * static_assert and this builder cannot drift apart. */
+#define JCE_VIEW_DYN_CSM_OFFSET JCE_VIEW_SR_DYN_CSM_OFFSET
 
 typedef struct {
     uint16_t first;
@@ -91,6 +95,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                           * Gated so a scene with no absorbing
                                           * water keeps a minimal window. */
                                          bool include_underwater_view,
+                                         uint8_t camera_overlay_count,
                                          JceSceneRendererViewOrder *out);
 
 #endif /* JCE_SCENE_RENDERER_VIEW_ORDER_H */

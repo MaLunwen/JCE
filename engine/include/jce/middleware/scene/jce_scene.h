@@ -14,6 +14,7 @@
 #include <jce/middleware/scene/jce_water_field.h>
 #include <jce/middleware/world/jce_environment.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_auto_exposure.h>
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_volume_profile.h>
@@ -29,6 +30,7 @@
 JCE_EXTERN_C_BEGIN
 
 typedef struct JceStrPool JceStrPool;
+typedef struct JceTerrain JceTerrain;
 
 /* ── Component types ─────────────────────────────────────────────── */
 
@@ -98,6 +100,13 @@ typedef struct {
        albedo_tex.  Lets code assign a GPU texture directly — procedural content,
        video textures, and the texture-diverse instancing benchmark (many
        entities sharing a mesh but each with its own albedo). */
+    /* COLOUR SPACE IS THE CALLER'S TO STATE.  fs_pbr reads s_albedo as a
+     * LINEAR value -- the sampler decodes, not the shader -- so a raw handle
+     * put here must have been created with JCE_TEX_SRGB if its pixels are
+     * sRGB-encoded (jce_texture_from_rgba_ex takes the mode).  A texture the
+     * caller generated in linear (a procedural gradient, a data visualiser)
+     * is already right without it.  Getting it wrong renders that one entity
+     * over-bright; nothing here can tell which it is. */
     bool            has_albedo_runtime;
     uint16_t        albedo_runtime_idx;
     uint16_t        albedo_runtime_w, albedo_runtime_h; /* dims (raw handles aren't in the size registry) */
@@ -119,6 +128,67 @@ typedef struct {
     float           rim_color[3];      /* linear */
     float           outline_width;     /* world-units hull extrusion; 0 = no outline */
     float           outline_color[3];  /* linear */
+    int16_t         render_priority; /* transparent sort; higher = on top; APPEND-ONLY */
+
+    /* Which PBR factors above this renderer keeps when material_path is
+     * loaded; 0 (every older scene) = the material wins outright.  Bits and
+     * the apply rule: jce_material_override.h.  APPEND-ONLY */
+    uint32_t        material_override_mask;
+    /* UV TILING and OFFSET for every map this renderer samples:
+     *   uv = mesh_uv * uv_tiling + uv_offset
+     * Unity's Tiling/Offset.  Defaults to (1,1)/(0,0), so a scene authored
+     * before this key existed renders identically.
+     *
+     * It is HERE as well as on JcePbrMaterial because the draw path does not
+     * read the .mat.json: it rebuilds a JcePbrMaterial from this component
+     * every frame (jce_sr_draw.c), so a value that lived only on the asset
+     * would be loaded and then discarded.  jce_mesh_renderer_to_pbr() is the
+     * one function that carries it across, and the .mat.json round-trips
+     * through jce_mesh_renderer_apply_material_pbr() in the other direction. */
+    float   uv_tiling[2];
+    float   uv_offset[2];
+    /* HOW a BLEND surface composites: 0=none(=alpha) 1=alpha 2=add 3=multiply
+     * (JceBlendMode).  Ignored unless alpha_mode is 2 (BLEND).  An `int`
+     * rather than the enum for the same reason alpha_mode above is one: the
+     * component layer stores authored values as plain numbers that the JSON
+     * round-trip and the Inspector combo can both address without a cast. */
+    int     blend_mode;
+    /* APPENDED, not inserted: contracts/abi-snapshot.txt compares members
+     * positionally, and the first draft of this pair sat before
+     * material_override_mask -- which the gate correctly called an
+     * incompatible change, because every member after it shifted index. */
+
+    /* STENCIL -- portals, outlines and UI masking, none of them expressible
+     * before.  SIX values, not Unity's seven: bgfx's word has no write mask.
+     * 0 = OFF, so every existing scene loads inert.  Here as well as on
+     * JcePbrMaterial, and `int` rather than the enums, for the two reasons
+     * uv_tiling and blend_mode above give.  APPENDED. */
+    int     stencil_func;       /* JceStencilFunc; 0 = off        */
+    int     stencil_ref;        /* 0..255                          */
+    int     stencil_read_mask;  /* 0 is read as 0xFF               */
+    int     stencil_fail_op;    /* JceStencilOp, stencil test fail */
+    int     stencil_zfail_op;   /* JceStencilOp, depth test fail   */
+    int     stencil_pass_op;    /* JceStencilOp, both pass         */
+
+    /* EXTENDED LOBES -- clearcoat and sheen, glTF's KHR_materials_clearcoat
+     * and _sheen.  Here as well as on JcePbrMaterial for the reason the UV
+     * transform and the stencil block above are: the draw path rebuilds the
+     * material from this component every frame, so a value that lived only on
+     * the .mat.json would be loaded and then discarded.
+     * All zero = both lobes off, which is what every existing scene holds.
+     * APPENDED. */
+    float   clearcoat;
+    float   clearcoat_roughness;
+    float   sheen_color[3];
+    float   sheen_roughness;
+
+    /* The other two lobes, here for the same reason the four above are:
+     * a renderer must be able to say them without a .mat.json.  APPENDED. */
+    float   anisotropy;
+    float   anisotropy_rotation;
+    float   translucency;
+    float   translucency_thickness;
+    float   translucency_color[3];
 } JceMeshRenderer;
 
 /* The scene's string pool, and the shorthand every caller actually wants.
@@ -163,6 +233,22 @@ typedef struct {
     bool    ortho;
     uint8_t stack_index; /* 0 = base camera; 1..3 = overlay cameras */
     uint8_t clear_mode;  /* JceCameraClearMode */
+    /* Unity's Camera.cullingMask over JceLayerComponent.layer: bit N set =
+     * layer N is rendered.  ZERO IS "NO FILTERING", not "cull everything" --
+     * zero-initialised in four places and by every older scene, so spending 0
+     * on "render nothing" would turn them all black.  APPENDED (ABI). */
+    uint32_t culling_mask;
+    /* Orthographic HEIGHT in world units; the width follows the viewport
+     * aspect.  Only the height is authored because a fixed width would
+     * letterbox differently on every window size, and because the pose that
+     * carries it is resolved once with no aspect in hand.
+     *
+     * 0 means "unset", which jce_camera_create's own 800x450 default then
+     * answers.  That default is why `"orthographic": true` alone was not
+     * usable from a scene: the flag parsed, the mode applied, and the view
+     * stayed 800 world units wide with nothing able to change it.
+     * APPENDED (ABI). */
+    float ortho_size;
 } JceCameraComponent;
 
 typedef struct {
@@ -174,6 +260,15 @@ typedef struct {
     JceTexture cookie_texture;       /* JCE_TEXTURE_INVALID = no cookie */
     float      cookie_strength;      /* 0..1 lerp from cookie sample to white */
     char       cookie_path[256];     /* asset path (for serializer / inspector) */
+    /* RENDERING LAYERS -- which objects this light is allowed to reach.
+     * Bit N set = layer N (JceLayerComponent.layer) is lit by this light.
+     * ZERO IS "EVERY LAYER", the same convention and for the same reason as
+     * JceCameraComponent.culling_mask above: every scene saved before this
+     * field existed loads 0, and spending 0 on "lights nothing" would turn
+     * all of them black.  Masks the light's DIRECT term only -- see
+     * <jce/renderer/jce_lighting_system.h> for what it does not reach.
+     * APPENDED (ABI). */
+    uint32_t   layer_mask;
 } JceDirectionalLight;
 
 typedef struct {
@@ -183,6 +278,8 @@ typedef struct {
     float    radius;
     bool     casts_shadow;    /* P1 — opt-in local (atlas) shadow */
     float    shadow_bias;     /* depth bias; 0 = engine default */
+    /* Rendering layers; see JceDirectionalLight.  APPENDED (ABI). */
+    uint32_t layer_mask;
 } JcePointLight;
 
 typedef struct {
@@ -201,7 +298,44 @@ typedef struct {
     float      cookie_strength;      /* 0..1 lerp from cookie sample to white */
     char       cookie_path[256];     /* asset path for serializer */
     char       ies_path[256];        /* .ies asset path for serializer */
+    /* Rendering layers; see JceDirectionalLight.  APPENDED (ABI). */
+    uint32_t   layer_mask;
 } JceSpotLight;
+
+/* ── AreaLight component ────────────────────────────────────────── */
+
+/* A RECTANGULAR area light -- Unity's Rectangle light, UE's Rect Light.
+ *
+ * What a point or a spot cannot express: a highlight shaped like the emitter
+ * and a terminator softened by the emitter's SIZE rather than a cone angle.
+ * A softbox, a window, a strip light, a screen.
+ *
+ * `direction` is the way it EMITS and is taken through the entity's rotation
+ * exactly as a spot's is; the width axis is derived from the transform too, so
+ * rotating the entity rotates the rectangle.  width/height are FULL extents in
+ * world units.
+ *
+ * NO casts_shadow FIELD, on purpose.  An area light's shadow is a soft shadow
+ * whose penumbra grows with the emitter, and this engine's local shadow atlas
+ * stores one hard depth map per light.  A flag here would have produced a
+ * point light's hard shadow from a rectangle -- a control that appears to
+ * work.  The absence is the honest state and is stated rather than left to be
+ * discovered.
+ *
+ * At most JCE_MAX_AREA_LIGHTS (4) reach the GPU in one frame; past that the
+ * renderer warns once rather than dropping them silently. */
+typedef struct {
+    jce_vec3 position;      /* centre; the transform overrides when present */
+    jce_vec3 direction;     /* the way it emits, before the entity rotation */
+    jce_vec3 color;         /* linear RGB */
+    float    intensity;
+    float    width;         /* full width, world units */
+    float    height;        /* full height, world units */
+    float    radius;        /* attenuation cutoff, as for point/spot */
+    bool     two_sided;     /* emit from the back face as well */
+    /* Rendering layers; see JceDirectionalLight.  APPENDED (ABI). */
+    uint32_t layer_mask;
+} JceAreaLight;
 
 /* ── Skybox component ───────────────────────────────────────────── */
 
@@ -223,10 +357,36 @@ typedef enum {
     JCE_SCENE_FOG_EXP2   = 3,
 } JceSceneFogMode;
 
+/* How the sun's shadow edge is filtered.  The SCENE picks the kind of edge
+ * it wants; how many taps that edge may cost is a settings decision and lives
+ * on JceRenderPipelineDesc.shadow_filter_quality.
+ *
+ * VALUE 2 USED TO BE NAMED VSM.  No shader in this tree ever implemented
+ * variance shadow maps -- the name was the whole feature -- and none of the
+ * three engines this one is measured against ships VSM as its modern path
+ * (Unity and Godot filter with PCF, HDRP adds PCSS, and UE5's "VSM" is
+ * VIRTUAL shadow maps, a different thing entirely).  What the third slot
+ * actually wanted was a shadow that HARDENS AT CONTACT, and that now exists,
+ * so slot 2 was renamed to what it does.  The value is unchanged, so every
+ * scene already saved with `"soft": 2` keeps asking for the same thing and now
+ * gets an implementation of it; the old spelling stays as an alias so source
+ * that used the name still compiles. */
 typedef enum {
-    JCE_SCENE_SOFT_SHADOW_OFF = 0,
-    JCE_SCENE_SOFT_SHADOW_PCF = 1,
-    JCE_SCENE_SOFT_SHADOW_VSM = 2,
+    JCE_SCENE_SOFT_SHADOW_OFF  = 0,  /* one hard tap                        */
+    JCE_SCENE_SOFT_SHADOW_PCF  = 1,  /* fixed-radius PCF at the pipeline
+                                      * tier -- the same edge everywhere    */
+    /* The deprecated spelling stays HERE, in its original slot, on purpose:
+     * contracts/abi-snapshot.txt compares an enum's members positionally BY
+     * SPELLING, so putting the new name in this slot would be recorded as a
+     * rename -- an incompatible change -- and the honest description of what
+     * happened is that a name was ADDED and the old one deprecated.  Making
+     * the gate accept a rename to suit this change would have cost more than
+     * the two lines it saves. */
+    JCE_SCENE_SOFT_SHADOW_VSM  = 2,
+    /* The name slot 2 should have had: PCF plus a penumbra that widens with
+     * distance from the occluder, sized by
+     * JceRenderPipelineDesc.sun_soft_size.  Prefer this spelling. */
+    JCE_SCENE_SOFT_SHADOW_PCSS = JCE_SCENE_SOFT_SHADOW_VSM,
 } JceSceneSoftShadowMode;
 
 /* Tonemap operator for the postfx finish.  ACES is the legacy hardcoded
@@ -280,7 +440,12 @@ typedef struct {
     int   cascade_count;
     float split_lambda;
     int   shadow_resolution;   /* pixels: 512 / 1024 / 2048 / 4096 */
-    int   soft_shadow_mode;    /* JceSceneSoftShadowMode */
+    /* JceSceneSoftShadowMode.  READ once per frame in jce_scene_renderer.c
+     * and turned into the shadow filter tier + the effective sun size; it
+     * spent a release round-tripping through JSON and the editor combo while
+     * nothing in the renderer read it, which is why the enum's third value
+     * could be named after a technique no shader implemented. */
+    int   soft_shadow_mode;
 
     bool  postfx_enabled[JCE_SCENE_RENDERING_POSTFX_COUNT];
     float exposure;
@@ -512,6 +677,53 @@ typedef struct {
      * the same mistake one layer further along: a consumer for a carrier whose
      * writer does not exist. */
     float temperature_c;
+
+    /* AUTO EXPOSURE (eye adaptation).  false = byte-identical: the chain keeps
+     * reading `exposure` above as an absolute value, which is what every scene
+     * authored before this was lit against.
+     *
+     * When true, `exposure` becomes the artist's MULTIPLIER on the measured
+     * one, so a hand-dialled 1.3 keeps meaning "a third of a stop brighter"
+     * instead of being silently discarded.
+     *
+     * The desc is the law's tuning and is filled by the defaults-first parse
+     * from jce_auto_exposure_desc_default(), so a scene file written before
+     * these keys existed loads to the engine defaults rather than to zeros --
+     * zeros here would be a 0-EV clamp and a frozen adaptation, i.e. a
+     * feature that is on and does nothing. */
+    bool                auto_exposure;
+    JceAutoExposureDesc auto_exposure_desc;
+
+    /* DEPTH OF FIELD -- rack focus.  Everything at dof_focus_distance metres
+     * is sharp; past dof_focus_range metres from it the blur ramps in, and it
+     * is full at twice that.  Unity's DoF volume, UE's focal distance,
+     * Godot's CameraAttributes, under the names those three use.
+     *
+     * NOT in postfx_enabled[]: that array is sized by an enum whose COUNT
+     * sizes public structs, so growing it to add an effect moves every member
+     * after it -- a real ABI break.  Motion blur set the same precedent.
+     *
+     * dof_max_coc is the widest blur radius as a fraction of screen width;
+     * 0 means the engine's default.  The gather is 16 taps, so far above ~0.02
+     * the disk thins into speckle rather than getting blurrier. */
+    bool  dof_enabled;
+    float dof_focus_distance;
+    float dof_focus_range;
+    float dof_max_coc;
+
+    /* Screen-space global illumination: one diffuse bounce gathered from the
+     * lit colour buffer, ADDED to the probe/sky indirect term rather than
+     * replacing it (light that is off-screen is not in the buffer).  Shares
+     * the SSAO/SSR depth+normal pre-pass.
+     *
+     * HERE AND NOT BESIDE THE SSR BLOCK, for the reason the DoF block above
+     * states: this struct's member order is the ABI, and putting these three
+     * next to their subject moved taa_feedback from index 57 to 60 and
+     * everything after it.  Absent in an older scene parses to disabled ->
+     * byte-identical frame path. */
+    bool  ssgi_enabled;
+    float ssgi_intensity;    /* 0 => module default 0.6 */
+    float ssgi_radius;       /* world-space bounce distance; 0 => 3.0 */
 } JceSceneRenderingSettings;
 
 /* ── Scene-level world-streaming settings ───────────────────────────
@@ -557,6 +769,8 @@ typedef struct {
     bool  flip_x;
     bool  flip_y;
     int   sorting_order;
+    /* Unity SortingLayer: index into sorting_layers[]; LIST ORDER IS DEPTH. */
+    int   sorting_layer;
 } JceSpriteRendererComponent;
 
 /* ── Sprite animator component ──────────────────────────────────── */
@@ -572,8 +786,8 @@ typedef struct {
     bool  playing;
 } JceSpriteAnimatorComponent;
 
-/* ── Animator component (simple clip playback) ──────────────────── */
-
+/* RETIRED (superseded by JceSkeletalAnimatorComponent, which it is a strict
+ * subset of): loader migrates it one-way; ABI kept, wire nothing new. */
 typedef struct {
     char  clip_name[64];
     float speed;
@@ -653,7 +867,53 @@ typedef struct {
     bool  rm_valid;
     float rm_dx, rm_dy, rm_dz;   /* root local-space translation delta */
     float rm_dyaw;               /* root yaw delta, radians            */
+    /* PLAYHEAD, 0..1 and WRAPPING, published by the renderer each frame it
+     * evaluates this animator.  APPENDED, and 0 until something plays.
+     *
+     * It travels this way for the same reason root motion above it does: the
+     * playhead lives in the renderer's per-instance animation state, and the
+     * consumers are elsewhere.  The one that needs it is the network animator
+     * -- the replication layer deliberately refuses to read an animation graph
+     * (jce_net_animator.h says why), so the runtime, which is above both,
+     * samples this field and pushes it.  Without it nothing could sample an
+     * animator without inverting the layering. */
+    float norm_time;
+    /* Effector preservation on a ROLE retarget, default OFF -- Unity's IK
+     * Pass.  jce_humanoid.h says what it buys and why it is not the default. */
+    bool  retarget_effector_ik;
+    /* Twist redistribution, 0..1, default 0 -- Unity's Fore Arm / Leg Twist.
+     * jce_humanoid.h says what it fixes and why 0 is the default here. */
+    float retarget_twist;
 } JceSkeletalAnimatorComponent;
+
+/* ── Bone attachment (a weapon in a hand, a jetpack on a spine) ───────
+ *
+ * Unity attaches by PARENTING to a bone, because in Unity a bone IS a
+ * Transform in the hierarchy.  Here bones live in the skinning palette and
+ * are not scene entities, so the attachment is a component that says which
+ * bone of which entity to follow, and the renderer writes this entity's
+ * world pose from it once per frame -- right after the pose is sampled and
+ * before anything draws, so there is no frame of lag.
+ *
+ * ZEROED IS INERT.  target == 0 means "not attached", so every scene
+ * authored before this component existed parses to exactly what it did.
+ *
+ * THE OFFSET IS IN BONE SPACE, and it has to be a field rather than the
+ * entity's own Transform: the pass OVERWRITES that Transform every frame,
+ * so an author who positioned the weapon with the gizmo would watch their
+ * offset be consumed by its own output.  world = bone_world * TRS(offset,
+ * rotation_offset, 1).
+ *
+ * rotation_offset is xyzw.  A zeroed quaternion is not a rotation at all, so
+ * {0,0,0,0} is read as IDENTITY -- which is what memset and a scene file
+ * without the key both produce, and the only reading under which an
+ * attachment with no authored rotation points the way the bone does. */
+typedef struct {
+    uint64_t target;              /* the skinned entity; 0 = not attached */
+    char     bone[64];            /* bone name, as the skeleton spells it */
+    float    offset[3];           /* position offset, BONE space */
+    float    rotation_offset[4];  /* xyzw; all-zero == identity */
+} JceBoneAttachmentComponent;
 
 /* ── Constraint component ───────────────────────────────────────── */
 
@@ -666,6 +926,14 @@ typedef struct {
     float    lower_limit;
     float    upper_limit;
     bool     disable_collision;
+
+    /* MOTOR -- hinge and slider only, mirroring JceConstraintDesc.  Unity's
+     * HingeJoint.motor.  Units are the joint type's: rad/s + N*m for a hinge,
+     * m/s + N for a slider.  Zero is "no motor", which every scene authored
+     * before this parses to.  APPENDED. */
+    bool     use_motor;
+    float    motor_target_velocity;
+    float    motor_max_force;
 } JceConstraintComponent;
 
 /* ── Animation-rigging IK constraints ────────────────────────────────
@@ -683,10 +951,12 @@ typedef struct {
  * exactly like VideoPlayer/NavAgent, for enumeration and serialization. */
 typedef struct {
     int      kind;            /* 0=Aim 1=TwoBoneIK 2=MultiParent 3=Position
-                                4=Rotation 5=CCD 6=FABRIK */
+                                4=Rotation 5=CCD 6=FABRIK 7=HumanoidLimb */
     char     name[48];
     float    weight;          /* 0..1 */
     bool     enabled;
+    /* Joint names -- except on kind 7, where root_bone names a LIMB and the
+     * joints come from the rig's humanoid roles (jce_humanoid.h says why). */
     char     root_bone[64];
     char     mid_bone[64];
     char     end_bone[64];
@@ -760,7 +1030,7 @@ typedef struct {
 
 typedef struct {
     uint32_t body_handle_idx;    /* JceBodyHandle.idx (runtime) */
-    uint8_t  body_type;          /* JceBodyType enum value */
+    uint8_t  body_type;          /* JCE_RB_KIND_* -- jce_physics_types.h */
     uint8_t  shape_type;         /* JceShapeType enum value */
     float    mass;
     float    friction;
@@ -799,6 +1069,14 @@ typedef struct {
     float    friction;
     float    restitution;
     bool     fixed_rotation;
+    /* Collision layer 0..31, indexing the 2D matrix
+     * (jce_physics2d_get_layer_collision_mask).  The 3D sibling has carried
+     * this since P3-C.2; the 2D one did not, so the authored 32x32 grid in
+     * Project Settings had no body to apply itself to and every 2D pair
+     * collided regardless of it.
+     * APPENDED: an older scene loads 0 = "Default", where unconfigured bodies
+     * also sit, so the pair still collides under the stock matrix. */
+    uint32_t physics_layer;
 } JceRigidBody2DComponent;
 
 /* ── Collider components ─────────────────────────────────────────── */
@@ -897,6 +1175,10 @@ typedef struct {
     float accel;
     float air_control;
     float turn_speed_deg;
+    /* Layer index (0..31) in the same matrix JceRigidBodyComponent uses.
+     * APPENDED: an older scene loads 0 = "Default", where unconfigured bodies
+     * also sit, so the pair collides under the stock matrix. */
+    uint32_t physics_layer;
 } JceCharacterControllerComponent;
 
 /* ── Audio source component ──────────────────────────────────────── */
@@ -917,6 +1199,45 @@ typedef struct {
     float max_distance;     /* 0 => 25.0 default */
     float rolloff_factor;   /* 0 => 1.0 default */
     char  mixer_bus[64];
+    /* Voice priority when the 64-slot pool runs out.  HIGHER IS MORE
+     * IMPORTANT and 0 is normal, which matches Unreal's FSoundBase::Priority
+     * and INVERTS Unity's AudioSource.priority (0 = most important there).
+     * The reason is this struct: it is zero-initialised everywhere and every
+     * scene saved before this field existed carries a 0, so 0 has to mean
+     * "what the engine already did".  Unity's numbering would silently
+     * promote every existing source to maximum importance.
+     * APPENDED, never inserted -- the ABI snapshot enforces ORDERED-PREFIX. */
+    int   priority;
+    /* How the clip is held in memory, Unity's AudioClip.loadType.
+     *   0 = DECOMPRESS ON LOAD -- decode once into s16 PCM.  Cheapest to
+     *       play, most expensive to hold: a five-minute stereo track is
+     *       ~50 MB resident.  Every scene saved before this field existed
+     *       parses to 0, so the default is byte-identical behaviour.
+     *   1 = STREAMING -- decode per voice on demand instead of up front.
+     *       How much is resident depends on where the clip lives, and
+     *       jce_audio_load_streaming picks: nothing at all for a loose
+     *       project (the file is read incrementally), nothing extra for a
+     *       STORED pak entry (the archive bytes are borrowed in place), and
+     *       the compressed size for a re-compressed pak entry.  Each voice
+     *       decodes on the mix thread, so it is right for music and ambience
+     *       and wrong for a footstep.
+     * APPENDED for the same reason as priority above. */
+    int   load_type;
+    /* CUSTOM ROLLOFF: an authored curve document (Curve Editor format).
+     * Channel "volume", else channel 0, evaluated at the listener distance in
+     * METRES, multiplying the authored volume.
+     *
+     * THE PATH IS THE SWITCH -- there is deliberately no CUSTOM entry in
+     * attenuation_model, which would let a scene say CUSTOM with no curve, or
+     * name a curve while the model says INVERSE, and leave something to
+     * decide which half to believe.  Empty = the analytic model above, byte
+     * identical for scenes saved before this field.  Non-empty = the curve
+     * decides and the engine model is forced to NONE, or both would attenuate.
+     * A path that will not load warns once and falls back rather than going
+     * silent (rt_audio_rolloff_gain): "authored at zero" and "file missing"
+     * must never be the same sound.
+     * APPENDED for the same reason as priority above. */
+    char  rolloff_curve[256];
 } JceAudioSourceComponent;
 
 /* ── Music track component (adaptive / interactive music director) ────
@@ -968,8 +1289,51 @@ typedef struct {
 
 /* ── Script component ────────────────────────────────────────────── */
 
+/* What an AUTHOR can hand a script without editing the script.
+ *
+ * Unity spells this `[SerializeField] float speed;` and Godot spells it
+ * `@export var speed: float`.  Without it a script is not reusable: two
+ * turrets that differ only in range need two scripts, or one script that
+ * reads the entity's name and branches, which is the shape this exists to
+ * prevent.
+ *
+ * FOUR KINDS AND NOT ONE, because the Inspector has to draw the right widget
+ * and the loader has to know which values are ENTITY REFERENCES -- those are
+ * remapped on load like every other cross-entity reference in this scene, and
+ * a number that happened to equal an entity id must not be.
+ *
+ * The value fields are SEPARATE rather than a union.  A union would halve the
+ * struct and reintroduce the failure this tree keeps paying for: the same
+ * bytes meaning two things, with nothing able to tell a zeroed number from an
+ * empty string from entity 0. */
+typedef enum {
+    JCE_SCRIPT_PARAM_NUMBER = 0,   /* zeroed default: a plain number */
+    JCE_SCRIPT_PARAM_BOOL,
+    JCE_SCRIPT_PARAM_TEXT,
+    JCE_SCRIPT_PARAM_ENTITY
+} JceScriptParamKind;
+
+typedef struct {
+    char     name[32];     /* what the script asks for; "" == unused slot   */
+    uint32_t kind;         /* JceScriptParamKind                            */
+    float    number;       /* NUMBER, and BOOL as 0 or 1                    */
+    uint64_t entity;       /* ENTITY; 0 == none, remapped on load           */
+    char     text[64];     /* TEXT                                          */
+} JceScriptParam;
+
+/* Eight is the same bound JceFullBodyIkComponent uses for effectors, and for
+ * the same reason: a fixed array keeps the component POD and serialisable
+ * without a second allocation per entity.  A script needing more than eight
+ * authored values wants an asset, which jce.asset_read_json already gives it. */
+#define JCE_SCRIPT_PARAM_MAX 8
+
 typedef struct {
     char  script_path[256];
+    /* APPENDED.  A scene written before this parses to param_count 0, which
+     * is exactly what a zeroed struct holds, so every existing script keeps
+     * behaving as it did. */
+    JceScriptParam params[JCE_SCRIPT_PARAM_MAX];
+    int32_t        param_count;
 } JceScriptComponent;
 
 /* ── Particle emitter component ─────────────────────────────────────
@@ -1012,14 +1376,19 @@ typedef struct { char _unused; } JceTagActive;
  *
  * Unity-style scene-level Tag (interned string id) and Layer (uint8
  * index 0..31) per entity, distinct from the physics-only collision
- * mask in <jce/api_physics.h>.  Other systems (camera culling, ray
- * filters, render queue groupings) consume the same layer index.
- *
- * Persisted to "<project>/Settings/TagsAndLayers.json" — loaded on
- * scene init via jce_scene_tags_layers_load(), saved on edit. */
+ * mask in <jce/api_physics.h>.  ONE consumer: JceCameraComponent.culling_mask,
+ * on the colour pass and the depth/velocity prepass.  NOT raycasts -- those
+ * filter on JceRigidBodyComponent.physics_layer, a separate authored value
+ * over the same 32 named slots -- and there is no render-queue grouping at
+ * all.  jce_scene_find_all_in_layer() below has no callers either.
+ * Names live in JceProjectSettings::tags_layers -- every consumer reads that,
+ * this mirrors it, and nothing but the editor panel calls the load below. */
 
 #define JCE_LAYER_COUNT             32
-#define JCE_TAG_NAME_MAX            32
+/* Layer 0: every entity with no JceLayerComponent, and every draw with no
+ * entity at all -- so those call sites can name it instead of passing 0. */
+#define JCE_LAYER_DEFAULT            0u
+#define JCE_TAG_NAME_MAX            64  /* matches JceEditorMeta.tag[64] */
 #define JCE_TAG_REGISTRY_MAX        1024
 #define JCE_LAYER_NAME_MAX          32
 
@@ -1059,7 +1428,7 @@ JCE_API bool        jce_scene_tags_layers_save(const char *project_root);
 typedef struct {
     char     tree_path[256];    /* authored *.xml behavior-tree asset (host/pak path) */
     uint32_t tree_handle_idx;   /* JceBtTreeHandle.idx (set by runtime on load) */
-    uint32_t context_handle_idx;/* JceBtContext index (0 for default) */
+    uint32_t context_handle_idx;/* RETIRED: JceBtContext has no index space (jce_bt.h gives an opaque create/destroy) and the runtime owns exactly one, published as jce_runtime_bt_context(); bytes kept reserved */
     float    tick_hz;           /* desired tick rate; <=0 = every gameplay frame */
     bool     active;
     /* Perception sensing params, consumed by the runtime BT/perception binding
@@ -1096,10 +1465,10 @@ typedef struct {
      * this field strictly dominates -- a 40-character tag, or the 1025th
      * distinct one, exists only here. Removing it is silent data loss on save. */
     char     tag[64];
-    uint8_t  tag_color;     /* JceTagColor from editor */
+    uint8_t  tag_color;     /* EDITOR-ONLY: JceTagColor lives only in editor/src/core/jce_editor_state.h; Hierarchy swatch, filter and sort key */
     bool     enabled;
     bool     prefab_instance;
-    /* Unity-style layer index 0..31. References JceProjectTagsAndLayers.layers[]. */
+    /* MIRROR of JceLayerComponent, which is the authority the culling mask reads; jce_state_set_entity_layer writes both. Kept for the scene format. */
     int      layer;
 } JceEditorMeta;
 
@@ -1122,6 +1491,10 @@ typedef struct {
     float tint[3];                  /* multiplied into base color */
     bool  visible;
     bool  splat_enabled;            /* false -> render layer0 only       */
+    char  layer_normal_path[4][256];/* tangent-space normal maps         */
+    char  layer_mask_path[4][256];  /* R=metal, G=AO, B=height, A=smoothness */
+    float layer_normal_scale[4];    /* 0 disables; 1 uses authored strength */
+    float height_blend;             /* 0 disables height-aware splat blend */
 } JceTerrainComponent;
 
 /* ── Vegetation Scatter (foliage / grass / trees, P0 roadmap 2.2) ──
@@ -1136,9 +1509,8 @@ typedef struct {
                                   * (0=cube,1=sphere,2=plane,3=capsule,4=cylinder) —
                                   * a low-poly ISM path for huge counts of one shape */
     char     albedo_path[256];   /* optional albedo override ("" = mesh material) */
-    char     density_mask_path[256]; /* optional grayscale density mask (large-world
-                                      * #8a): R channel over the area rect modulates
-                                      * per-instance keep-probability ("" = uniform) */
+    char     density_mask_path[256]; /* optional grayscale density mask; R channel
+                                      * modulates keep-probability ("" = uniform) */
     float    density;            /* instances per square world unit (>0)          */
     uint32_t seed;               /* deterministic scatter seed                    */
     float    area_x;             /* scatter rectangle X size (world units)        */
@@ -1158,6 +1530,7 @@ typedef struct {
      * all-255 (full density = no change) when first enabled. */
     bool     density_paint_active;
     uint8_t  density_paint[JCE_VEG_PAINT_DIM * JCE_VEG_PAINT_DIM];
+    char     baked_placement_path[256]; /* cooked instances; scatter is fallback */
 } JceVegetationScatterComponent;
 
 /* ── Grass Field (GPU-instanced procedural blades + wind, Stage 1b.6) ──
@@ -1188,7 +1561,7 @@ typedef struct {
     float    fade_start;         /* distance (m) where height-collapse begins     */
     float    fade_end;           /* distance (m) where blades fully collapse      */
     float    hue_jitter;         /* per-blade green<->blue-green tint jitter [0..1] */
-    bool     cast_shadow;        /* v1: ignored (grass non-casting); reserved     */
+    bool     cast_shadow;        /* submit blades to the CSM depth pass           */
     bool     visible;
     /* Density mask (large-world/diorama path support): a texture whose GREEN
      * channel gates blade placement — a blade survives only where the mask at
@@ -1340,6 +1713,18 @@ typedef struct {
      * translucent geometry drawn later and further away is depth-rejected, so
      * water with anything visible beneath it wants this left off. */
     bool         depth_write;
+
+    /* PLANAR REFLECTION.  Mirror the camera through this water's surface,
+     * render the scene from there, and reflect it back -- what a still lake
+     * shows above the horizon, which neither a reflection probe (captured
+     * from one fixed point) nor SSR (only what is already on screen) can.
+     *
+     * One frame late by construction; see jce_planar_reflection.h.  Off by
+     * default, because it costs a second scene render: a scene that never
+     * asks for it renders byte-identically.  APPENDED -- the member order of
+     * this struct is the ABI. */
+    bool         planar_reflection;
+    float        planar_intensity;   /* 0 => 1.0; scales the mirrored colour */
 } JceWaterComponent;
 
 /* ── Buoyancy (floats a dynamic body on the active water surface, gap 2.3) ─
@@ -1449,10 +1834,10 @@ typedef struct {
     float color_end[4];
     bool  emitting;
     bool  autodestruct;
-    /* Runtime sample buffer (also captured for round-trip serialization
-     * so designers can preview and tweak captured trails). */
+    /* Runtime sample buffer, round-tripped so designers can preview it. */
     int   point_count;
     float points[JCE_TRAIL_MAX_POINTS][3];
+    float point_age[JCE_TRAIL_MAX_POINTS];  /* seconds; APPENDED for `time` */
 } JceTrailRendererComponent;
 
 /* Line Renderer (Unity LineRenderer equivalent). */
@@ -1474,6 +1859,26 @@ typedef enum {
     JCE_REFLECTION_PROBE_BAKED    = 0,
     JCE_REFLECTION_PROBE_REALTIME = 1,
     JCE_REFLECTION_PROBE_CUSTOM   = 2,
+    /* PLANAR -- Unity's Planar Reflection Probe, Unreal's Planar Reflection.
+     *
+     * The other three modes capture a CUBE from a point, which is right for a
+     * room and wrong for a mirror: a flat surface shows the world from the
+     * camera's mirrored position, and that position moves when the camera
+     * does.  A planar probe renders the scene once per frame from the camera
+     * mirrored through the probe's plane and composites it in SCREEN SPACE
+     * over every pixel that lies on that plane and faces the same way.
+     *
+     * Screen space rather than a material sampler is not a shortcut: fs_pbr
+     * declares sixteen samplers in slots 0..15 against bgfx's ceiling of 16,
+     * so there is no seventeenth for a mirror texture, and a per-material
+     * mirror shader would apply to one material rather than to any surface.
+     * The composite reads the depth and G-buffer normal the SSR pass already
+     * produces (normal.a carries roughness) and blends with the same
+     * premultiplied "over" the SSR composite uses -- so it reaches a polished
+     * floor, a wet road and a still lake alike.
+     *
+     * plane_normal and planar_* below are read ONLY in this mode. */
+    JCE_REFLECTION_PROBE_PLANAR   = 3,
 } JceReflectionProbeMode;
 
 typedef struct {
@@ -1489,6 +1894,28 @@ typedef struct {
     char  baked_cubemap_path[256]; /* set by reflection probe bake (P3-E.3) */
     bool  box_projection;
     bool  hdr;
+    /* --- PLANAR mode only; appended, so every field above keeps its offset.
+     *
+     * plane_normal: the mirror's normal in WORLD space.  All zeroes means +Y,
+     * which is the floor and the water surface and therefore the default that
+     * costs a project nothing.  It is normalised on use, not on write, so a
+     * script may set it from a surface normal without rounding it first.
+     *
+     * planar_thickness: how far off the plane, in metres, a pixel may sit and
+     * still be considered part of the mirror.  A floor is never perfectly
+     * flat and depth reconstruction is never exact; 0 means 0.05 m.
+     *
+     * planar_angle_deg: how far a pixel's normal may tilt from the plane's
+     * before it stops being that mirror.  Without it a wall standing ON the
+     * floor gets the floor's reflection, because its pixels are within
+     * thickness of the plane.  0 means 15 degrees.
+     *
+     * All three default to "the useful thing" at zero rather than to zero's
+     * literal meaning, because a probe deserialised from a scene written
+     * before this mode existed reads as zeroes and must still work. */
+    float plane_normal[3];
+    float planar_thickness;
+    float planar_angle_deg;
 } JceReflectionProbeComponent;
 
 /* Decal Projector (Unity URP/HDRP decal). */
@@ -1503,14 +1930,12 @@ typedef struct {
     int   layer_mask;
 } JceDecalComponent;
 
-/* Light Probe Group (Unity LightProbeGroup). */
-#define JCE_LIGHT_PROBE_MAX 64
+#define JCE_LIGHT_PROBE_MAX 64   /* Light Probe Group (Unity LightProbeGroup) */
 typedef struct {
-    int   probe_count;
+    int   probe_count;                      /* positions[] entries in use */
     float positions[JCE_LIGHT_PROBE_MAX][3];
-    bool  dering;              /* enable ring artifact reduction */
-    /* SH9: 9 coeffs × 3 channels (RGB) per probe; valid when sh9_baked. */
-    float sh9[JCE_LIGHT_PROBE_MAX][9][3];
+    bool  dering;   /* window L1/L2 at bake so the reconstruction cannot ring */
+    float sh9[JCE_LIGHT_PROBE_MAX][9][3];  /* 9 coeffs x RGB; see sh9_baked */
     bool  sh9_baked;
 } JceLightProbeGroupComponent;
 
@@ -1520,7 +1945,7 @@ typedef struct {
 typedef struct {
     float volume;            /* master volume (0..1) */
     bool  paused;
-    bool  spatialize;        /* whether listener performs HRTF */
+    bool  spatialize;        /* gate: false = the whole mix is heard flat.  NOT HRTF; rt_voice_should_be_3d() */
     float doppler_factor;    /* global doppler scale */
 } JceAudioListenerComponent;
 
@@ -1662,9 +2087,9 @@ typedef struct {
     float forward_friction;
     float sideways_friction;
     float center[3];             /* local offset */
-    float motor_torque;          /* current applied N·m */
-    float brake_torque;
-    float steer_angle_deg;
+    float motor_torque;          /* Per-wheel drive TRIM, ADDED on top of  */
+    float brake_torque;          /* the vehicle-level input, so 0 (every    */
+    float steer_angle_deg;       /* older scene) changes nothing.  Degrees. */
 } JceWheelColliderComponent;
 
 /* ── Constant Force (continuous additive force on rigidbody) ───── */
@@ -1695,6 +2120,32 @@ typedef struct {
     float    break_force;
     float    break_torque;
     bool     enable_collision;
+
+    /* PER-AXIS DRIVE -- Unity's xDrive / yDrive / zDrive / angularXDrive.
+     * Index 0..2 linear X,Y,Z and 3..5 angular X,Y,Z, the same order Bullet
+     * numbers its 6DOF axes and the same order JceConfigurableJointDesc uses,
+     * so nobody has to hold two orderings at once.
+     *
+     * drive_mode is JceJointDriveMode from <jce/middleware/physics/jce_physics.h>:
+     * 0 = off, 1 = velocity, 2 = spring.  Spelled numerically here rather than
+     * by name because this header does not include the physics one -- the same
+     * arrangement the motion values above already have, in the other
+     * direction.
+     *
+     * drive_target is m/s or DEGREES/s in velocity mode and metres or DEGREES
+     * in spring mode: degrees, because the angular LIMITS three fields up are
+     * degrees and an author filling in a rest angle under a limit should not
+     * be changing units between two adjacent boxes.
+     *
+     * A drive on a LOCKED axis does nothing.  The lock wins, which is what
+     * Unity does and the only reading under which "locked" means locked.
+     *
+     * APPENDED. */
+    int      drive_mode[6];
+    float    drive_target[6];
+    float    drive_spring[6];
+    float    drive_damper[6];
+    float    drive_max_force[6];
 } JceConfigurableJointComponent;
 
 /* ── Cloth (P3-C.4 follow-up) ──────────────────────────────────── */
@@ -1807,6 +2258,23 @@ typedef struct {
     float pivot[2];             /* {x,y} 0..1 (default 0.5,0.5) */
     float anchored_position[2]; /* pixel offset of pivot from anchor */
     float size_delta[2];        /* {w,h} px (fixed) or inset (stretch) */
+
+    /* ROTATION and SCALE about the pivot -- Unity's RectTransform rotation
+     * and localScale, the two things a menu needs to pop and spin.
+     *
+     * scale (0,0) means UNSCALED, not "zero size".  Every RectTransform ever
+     * serialised predates these fields and loads them as zeros, and a scale
+     * of 0 draws nothing -- which would look like the element ceasing to
+     * exist rather than like a default.  Same rule the material UV tiling
+     * uses, for the same reason.
+     *
+     * The transform applies to THIS element -- its image quad and its label,
+     * about one shared pivot -- and NOT to its children: the canvas walk
+     * passes an axis-aligned parent rect down, so a rotated parent would need
+     * that walk to carry a 2D matrix instead.  Unity does propagate; this is
+     * the difference, and it is written here rather than discovered. */
+    float rotation_deg;         /* clockwise on screen; 0 = none */
+    float scale[2];             /* 0 or 1 = unscaled */
 } JceRectTransform;
 
 /* ── UI: Canvas (root render target for 2D overlay) ────────────── */
@@ -1815,12 +2283,78 @@ enum {
     JCE_CANVAS_CAMERA      = 1, /* screen-space camera */
     JCE_CANVAS_WORLD       = 2, /* world-space */
 };
+
+/* ── UI: ContentSizeFitter ──────────────────────────────────────────
+ *
+ * Makes an element size itself to its CONTENT instead of taking whatever
+ * width and height an author typed.  Unity's ContentSizeFitter, and the
+ * reason "the label overflows its background when the string gets longer" is
+ * not a thing anyone has to work around by hand.
+ *
+ * Each axis is independent and Unconstrained by default, so an element with
+ * this component and nothing set behaves exactly as it did before -- and so
+ * does every scene that predates it, since a zeroed component is two
+ * Unconstrained axes.
+ *
+ * WHAT "content" MEANS is decided by what the element IS: a UIText measures
+ * its own shaped text through the same font and line spacing it draws with; a
+ * node with a LayoutGroup measures the packed extent of its children; anything
+ * else keeps its authored size, because there is nothing else to ask.
+ *
+ * NOTE: there is NO JCE_COMP_FLAG bit -- the 64-bit flag space is full.  It is
+ * presence-gated (jce_scene_has_content_size_fitter), like IkConstraints,
+ * FootIk and NavAgent. */
+typedef enum {
+    JCE_UI_FIT_UNCONSTRAINED = 0,  /* keep the authored size on this axis */
+    JCE_UI_FIT_PREFERRED     = 1,  /* grow or shrink to the content       */
+} JceUIFitMode;
+
+typedef struct {
+    int horizontal_fit;   /* JceUIFitMode */
+    int vertical_fit;     /* JceUIFitMode */
+} JceContentSizeFitterComponent;
+
 typedef struct {
     int   render_mode;       /* JCE_CANVAS_* */
     int   sort_order;
     float reference_resolution[2];
     float scale_factor;      /* world-space only */
     bool  pixel_perfect;
+    /* APPENDED.  Unity's CanvasScaler "Match Width Or Height", 0..1.
+     *
+     * 0 scales by WIDTH alone, 1 by HEIGHT alone, and anything between
+     * interpolates in log space exactly as Unity does:
+     *     scale = (sw/rw)^(1-match) * (sh/rh)^match
+     * A phone UI usually wants 0 or 1; a landscape HUD that must not overflow
+     * either axis wants something in between.
+     *
+     * THE DEFAULT IS 0.5, NOT UNITY'S 0, and that is deliberate: 0.5 is the
+     * geometric mean this engine has always computed, so every scene written
+     * before this field existed parses to the behaviour it already had.  The
+     * scaler also takes the sqrt() path verbatim at exactly 0.5 rather than
+     * evaluating the pow() form, because powf(x,0.5)*powf(y,0.5) and
+     * sqrtf(x*y) are not bit-identical and a one-ULP difference here moves a
+     * layout by a pixel.
+     *
+     * A struct zeroed by hand therefore means MATCH WIDTH, which is Unity's
+     * own default -- but a canvas is only scaled at all once
+     * reference_resolution is set, so a zeroed struct never reaches this. */
+    float match_width_or_height;
+    /* APPENDED.  Lay this canvas out inside the display's SAFE AREA -- the
+     * part no notch, punch-hole or gesture bar covers.
+     *
+     * OFF BY DEFAULT, and that is the decision rather than the cautious
+     * choice: a full-bleed background, a skybox-tinted vignette and a
+     * letterboxed cutscene bar all WANT to run under the cutout, and a canvas
+     * forced into the safe rect gets an unexplained margin on every side.
+     * Unity exposes Screen.safeArea for the author to apply and Godot does the
+     * same -- the platform reports, the UI decides.  Turn it on for the canvas
+     * that holds buttons and readable text, leave it off for the one that
+     * holds the background.
+     *
+     * A zeroed struct therefore means "full drawable", which is what every
+     * scene written before this field existed already did. */
+    bool  respect_safe_area;
 } JceCanvasComponent;
 
 /* ── UI: Canvas Group (alpha + interactivity gating) ───────────── */
@@ -1837,6 +2371,28 @@ enum {
     JCE_LAYOUT_VERTICAL   = 1,
     JCE_LAYOUT_GRID       = 2,
 };
+/* How a GRID decides its column count. */
+enum {
+    /* As many columns as the parent's width fits -- what a grid did before
+     * this field, and what a zero-initialised component still does. */
+    JCE_GRID_FLEXIBLE      = 0,
+    JCE_GRID_FIXED_COLUMNS = 1,   /* exactly grid_constraint_count columns */
+    JCE_GRID_FIXED_ROWS    = 2,   /* exactly grid_constraint_count rows */
+};
+
+/* Which corner the first cell sits in, and which way the run advances.
+ * Together they are Unity's StartCorner + StartAxis. */
+enum {
+    JCE_GRID_CORNER_UPPER_LEFT  = 0,
+    JCE_GRID_CORNER_UPPER_RIGHT = 1,
+    JCE_GRID_CORNER_LOWER_LEFT  = 2,
+    JCE_GRID_CORNER_LOWER_RIGHT = 3,
+};
+enum {
+    JCE_GRID_AXIS_HORIZONTAL = 0,  /* fill a row, then move down */
+    JCE_GRID_AXIS_VERTICAL   = 1,  /* fill a column, then move across */
+};
+
 typedef struct {
     int   layout_kind;        /* JCE_LAYOUT_* */
     float padding[4];         /* L,R,T,B */
@@ -1846,7 +2402,48 @@ typedef struct {
     bool  control_child_size_w;
     bool  control_child_size_h;
     bool  reverse_arrangement;
+    /* GRID CONSTRAINT.  APPENDED, and every field's zero is the behaviour a
+     * grid already had: FLEXIBLE derives the column count from the parent's
+     * width, upper-left, filling rows.  Before this a 3-column grid was not
+     * authorable at all -- you resized the parent until three happened to fit,
+     * and it silently became four on a wider screen. */
+    uint8_t  grid_constraint;        /* JCE_GRID_FLEXIBLE / FIXED_* */
+    uint8_t  grid_start_corner;      /* JCE_GRID_CORNER_* */
+    uint8_t  grid_start_axis;        /* JCE_GRID_AXIS_* */
+    uint16_t grid_constraint_count;  /* columns or rows; 0 ⇒ treated as 1 */
 } JceLayoutGroupComponent;
+
+/* ── UI: Layout Element (per-child sizing inside a LayoutGroup) ──
+ *
+ * WHAT A LAYOUT GROUP COULD NOT SAY WITHOUT THIS.  control_child_size gives
+ * every child an EQUAL share of the main axis, so "this one takes twice the
+ * space" was inexpressible; with it off, a child's own rect is its size and
+ * "at least this big" was inexpressible too.  This is Unity's LayoutElement,
+ * Godot's size_flags_stretch_ratio and Slate's FSlateChildSize::Fill, which
+ * every one of those toolkits ships because a real panel is a header that
+ * stays put and a body that takes the rest.
+ *
+ * HOW THE THREE INTERACT, main axis only (the cross axis is still the
+ * group's control_child_size / alignment):
+ *   preferred_*  what the child asks for.  < 0 means "no opinion", and then
+ *                its own RectTransform size is used -- which is exactly what
+ *                a child with no LayoutElement gets, so adding the component
+ *                and leaving it alone changes nothing.
+ *   flexible_*   share of the LEFTOVER space, as a weight against the other
+ *                children's weights.  0 = do not grow.  Two children with 1
+ *                and 2 split the remainder one-third / two-thirds.
+ *   min_*        a floor applied after both.  A group too small for its
+ *                children shrinks them, and this is how a child says how far.
+ *
+ * ignore_layout takes the child out of the arrangement entirely: it keeps its
+ * own rect and is not counted in anyone's share -- Unity's ignoreLayout, for
+ * a tooltip or a drag ghost parented into a list. */
+typedef struct {
+    float min_width, min_height;
+    float preferred_width, preferred_height;   /* < 0 ⇒ no opinion */
+    float flexible_width, flexible_height;     /* weight; 0 ⇒ do not grow */
+    bool  ignore_layout;
+} JceLayoutElementComponent;
 
 /* ── UI: Image (textured RectTransform graphic) ────────────────── */
 enum {
@@ -1869,10 +2466,45 @@ typedef struct {
 } JceUIImageComponent;
 
 /* ── UI: Text (font-rendered string) ───────────────────────────── */
+
+/* HORIZONTAL alignment.  `alignment` has always meant this axis and 205
+ * components in this tree are authored against it, so its values are frozen. */
 enum {
     JCE_UI_TEXT_ALIGN_LEFT   = 0,
     JCE_UI_TEXT_ALIGN_CENTER = 1,
     JCE_UI_TEXT_ALIGN_RIGHT  = 2,
+};
+
+/* VERTICAL alignment -- a SECOND axis, not a repacking of the first.
+ *
+ * Unity packs both into one TextAnchor (UpperLeft=0 .. LowerRight=8); Godot's
+ * Control and Unreal's TextBlock keep them as two independent properties.  Two
+ * axes is the right shape here for a reason beyond precedent: `alignment`
+ * already ships meaning HORIZONTAL, so renumbering it to TextAnchor would turn
+ * the 184 components authored with alignment=0 from "left, vertically centred"
+ * into "UpperLeft" and move every one of them, and this engine has no
+ * scene-level migration machinery to move them back.
+ *
+ * MIDDLE is 0 deliberately.  Vertical centring is the only behaviour that
+ * existed before this field, so a scene that predates it, a memset-zero
+ * component and an absent JSON key must all keep meaning exactly that.  A
+ * zero-is-TOP numbering (Godot's) would silently move authored text the first
+ * time any of those three paths ran. */
+enum {
+    JCE_UI_TEXT_VALIGN_MIDDLE = 0,
+    JCE_UI_TEXT_VALIGN_TOP    = 1,
+    JCE_UI_TEXT_VALIGN_BOTTOM = 2,
+};
+
+/* Horizontal overflow.  Unity Text defaults to Wrap; this defaults to OVERFLOW
+ * for the same reason MIDDLE is 0 -- it is what every already-authored
+ * component does today, and turning wrapping on for them would reflow text
+ * nobody asked to reflow.  The EDITOR's default for a newly added UIText is
+ * WRAP (jce_editor_component_defaults.cpp), so new content behaves like the
+ * reference engines and old content does not move. */
+enum {
+    JCE_UI_TEXT_OVERFLOW_CLIP = 0,   /* no wrapping; long lines run past the rect */
+    JCE_UI_TEXT_OVERFLOW_WRAP = 1,   /* greedy word wrap inside rect width */
 };
 typedef struct {
     char  text[512];
@@ -1889,6 +2521,51 @@ typedef struct {
        overrides `text` at display time; `text` acts as fallback. */
     char  locale_key[64];
     JceRectTransform rect;    /* layout (see JceRectTransform) */
+    /* APPENDED.  Both are zero-means-legacy (see the enums above), so every
+     * scene authored before they existed keeps its exact appearance. */
+    int   vertical_alignment; /* JCE_UI_TEXT_VALIGN_*   (0 = MIDDLE) */
+    int   overflow;           /* JCE_UI_TEXT_OVERFLOW_* (0 = CLIP)   */
+    /* Rasterise this label's font as a SIGNED DISTANCE FIELD instead of a
+     * coverage bitmap.  APPENDED and false by default, so every label
+     * authored before this keeps its exact pixels.
+     *
+     * WHAT IT BUYS.  A bitmap atlas holds the glyph at ONE size; drawn larger
+     * it interpolates coverage and the edge becomes a ramp as wide as the
+     * magnification, which is why a scaled-up heading looks soft.  A distance
+     * field is a smooth function, so one atlas is crisp at any size.
+     *
+     * WHAT IT COSTS, AND WHY IT IS NOT THE DEFAULT -- measured, not assumed.
+     * The field needs a spread margin around every glyph, so the atlas holds
+     * fewer of them.  And the field has no HINTING, so at body sizes it
+     * renders heavier: at 22px the same string came out with 41 near-white
+     * pixels against the bitmap path's 10, i.e. visibly bolder rather than
+     * crisper.  The win is magnification, and it is large -- a 400px label
+     * drawn from the 256px atlas ceiling had an edge 0.32x as wide as the
+     * bitmap path's, and even at 1:1 it measured 0.83x.
+     *
+     * So: turn it on for the labels that scale -- headings, world-space text,
+     * anything under a zoom -- and leave body text alone.  Unity's
+     * TextMeshPro is opt-in for the same reason. */
+    bool  sdf;
+    /* OUTLINE and DROP SHADOW, both APPENDED and both zero by default.
+     *
+     * They live here rather than on a material because they are what the
+     * distance field makes cheap: an outline is a SECOND THRESHOLD on the same
+     * number the face already read, and a shadow is that read at an offset.
+     * Any other way of getting them -- a second draw, a second atlas, a blur
+     * pass -- costs a pass to produce what one already-loaded value answers.
+     *
+     * BOTH REQUIRE sdf.  A coverage atlas has no distance to threshold a
+     * second time, so there is nothing an outline could mean on a bitmap font;
+     * the Inspector says so rather than letting an author set a width and
+     * wonder. Widths and offsets are in PIXELS OF THE DRAWN GLYPH, which is the
+     * only unit an author can see -- the renderer converts to the field's
+     * units, since that conversion needs the atlas spread and the draw scale
+     * and an author has neither. */
+    float outline_width;      /* px; 0 = no outline */
+    float outline_color[4];
+    float shadow_offset[2];   /* px, +x right / +y down */
+    float shadow_color[4];    /* .w == 0 disables it entirely */
 } JceUITextComponent;
 
 /* ── UI: Button (clickable Image + state colors) ───────────────── */
@@ -1900,6 +2577,12 @@ typedef struct {
     float disabled_color[4];
     float fade_duration;
     char  on_click_handler[128]; /* script handler name (placeholder) */
+    /* APPENDED.  UIButton was the only widget without one, so an entity
+     * carrying a button and nothing else had no rect and was dropped from the
+     * canvas walk entirely -- all seven fields above were dead.  Resolved LAST
+     * in uc_entity_rect, so a sibling UIImage still wins and no scene authored
+     * before this field moves. */
+    JceRectTransform rect;
 } JceUIButtonComponent;
 
 /* ── UI: Slider (draggable value track + handle) ───────────────────
@@ -2166,17 +2849,15 @@ typedef struct {
 } JceVolumeComponent;
 
 /* ── Occlusion portal (P4-C — flag 63) ──────────────────────────────
- *
- * RESERVED for a future portal/cell occlusion culler.  This component
- * is authored/serialized but NOT consumed by the current GPU-query
- * occlusion culler (jce_occlusion_culler.c), which tests per-renderable
- * bounding boxes and has no portal/cell concept.  The inspector shows
- * an "unwired" badge for it until that culler lands. */
+ * A CLOSED portal is a solid occluder volume: the scene renderer proves
+ * geometry fully behind it hidden and skips the draw (jce_sr_portal.c).  A
+ * CPU test, so it works where hardware queries do not (GL ES 2.0 / WebGL 1).
+ * NOT a portal/cell culler: no cells, and an OPEN portal does nothing. */
 
 typedef struct {
-    jce_vec3 size;      /* portal extents (world-space box around the entity) */
-    bool     open;      /* true = portal open; objects behind it are visible  */
-    int32_t  portal_id; /* user-assigned ID for pairing portals               */
+    jce_vec3 size;      /* FULL box extent, entity-local; world matrix applies */
+    bool     open;      /* true = portal open; objects behind it are visible   */
+    int32_t  portal_id; /* user-assigned ID for pairing portals into a group   */
 } JceOcclusionPortalComponent;
 
 /* ── Nav-mesh agent (Detour crowd steering) ──────────────────────────
@@ -2186,7 +2867,16 @@ typedef struct {
  * exactly like VideoPlayer, for enumeration and serialization. */
 typedef struct {
     float radius;            /* m; <=0 -> engine default 0.4 */
-    float height;            /* m; editor gizmo only */
+    /* m.  Was "editor gizmo only" and now has a runtime reader: it is
+     * compared against the CLEARANCE the navmesh was baked for
+     * (jce_recast_agent_height / jce_navmesh_agent_height), and an agent
+     * taller than that is reported.  <= 0 means "do not check".
+     *
+     * The steering stays 2D; this does not make an agent duck.  It catches
+     * the case a 2D steerer cannot see at all -- an agent on a mesh carved
+     * for someone shorter, walking under geometry it does not fit under,
+     * with nothing about the motion looking wrong while it does. */
+    float height;
     float max_speed;         /* m/s; <=0 -> 3.0 */
     float max_accel;         /* m/s^2; <=0 -> 12.0 */
     float arrive_radius;     /* <=0 -> 1.5 */
@@ -2352,6 +3042,22 @@ typedef struct {
     float    radius;        /* per-bone capsule radius (metres)                 */
     float    height_scale;  /* scales each capsule length vs the bind segment   */
     uint32_t reserved[4];   /* forward-compat padding (serialized as zeros)     */
+    /* Scales the per-joint ANGULAR limits the ragdoll takes from each bone's
+     * humanoid role (jce_humanoid_muscle_limits).  Below 1 is a stiffer
+     * ragdoll, above 1 a looser one.
+     *
+     * 0 MEANS THE ENGINE DEFAULT (1.0), the same convention radius and
+     * height_scale above already use -- and that is a deliberate departure
+     * from "a zeroed field must mean what the engine did before".  What it
+     * did before was build every joint as an UNLIMITED ball, so elbows and
+     * knees hyperextended and heads rotated without bound; preserving that
+     * for every existing scene would leave the fix switched off for everyone
+     * who already has a ragdoll.  A scene that genuinely wants the old
+     * behaviour asks for it with a NEGATIVE value, which is unambiguous
+     * because a scale cannot be negative.
+     *
+     * APPENDED. */
+    float    joint_limit_scale;
 } JceRagdollComponent;
 
 /* ── Ragdoll pose relay (TRANSIENT runtime pose hand-off, NOT serialized) ──
@@ -2655,8 +3361,8 @@ JCE_API void      jce_scene_clear_streaming_settings(JceScene *scene);
  *
  * Returns the number of entities actually deleted, or -1 on invalid input.
  *
- * Typical use: implementing scene transitions (e.g. caged_kingdom level
- * stitching) where a single director swaps scene content at runtime.
+ * Typical use: implementing scene transitions -- level stitching, where one
+ * director swaps scene content at runtime without tearing down the world.
  */
 JCE_API int       jce_scene_clear(JceScene *scene);
 
@@ -2715,6 +3421,76 @@ JCE_API int       jce_scene_get_child_count(const JceScene *s, JceEntity parent)
  * unparented/flat scenes are unchanged. Use this (not raw JceTransform) when a
  * world-space matrix is needed for rendering, picking, or gizmos. */
 JCE_API jce_mat4  jce_scene_get_world_matrix(const JceScene *s, JceEntity e);
+
+/* World POSE of an entity: where it actually is, as position/rotation/scale
+ * rather than as a matrix.  This is Unity's Transform.position (vs
+ * localPosition), UE's GetWorldLocation and Godot's global_position -- the
+ * thing every one of them exposes and this scene did not, which is why a
+ * physics body parented to anything spawned at its LOCAL offset as if that
+ * were a world coordinate.  Any out param may be NULL.  Returns false only
+ * for a dead entity or one with no Transform.
+ *
+ * A ROOT ENTITY RETURNS ITS TRANSFORM VERBATIM -- not routed through a matrix
+ * and back -- so an unparented scene is bit-identical rather than merely
+ * close.  jce_m4_decompose costs three sqrtf per call and does not round-trip
+ * exactly; a caller comparing against the Transform it just wrote would see
+ * drift that is entirely the decomposition's.
+ *
+ * THE ENTITY'S OWN PIVOT IS DELIBERATELY NOT APPLIED.  JcePivotComponent is a
+ * rendering/manipulation offset baked into the MODEL matrix (local * -pivot),
+ * which is why jce_scene_get_world_matrix carries it and this does not: a
+ * pivot moves where the mesh draws and which point a gizmo rotates about, not
+ * where the entity is.  Unity's Transform has no such field, so excluding it
+ * is what makes this Transform.position and not a second model matrix. */
+JCE_API bool      jce_scene_get_world_pose(const JceScene *s, JceEntity e,
+                                           jce_vec3 *out_position,
+                                           jce_quat *out_rotation,
+                                           jce_vec3 *out_scale);
+
+/* Place an entity at a WORLD pose, solving the local TRS that puts it there
+ * under whatever parent it currently has (local = inverse(parent_world) *
+ * world).  Scale is left alone: every caller so far is physics or a script
+ * moving something, and neither authors scale.
+ *
+ * Root entities assign verbatim, for the same reason the getter reads
+ * verbatim.  Pairs exactly with jce_scene_get_world_pose, so
+ * set(get(e)) is a no-op on a root and within decomposition error elsewhere.
+ * Returns false for a dead entity or one with no Transform.
+ *
+ * A ZERO-SCALED PARENT DOES NOT COLLAPSE THE ANSWER, and not because this
+ * function guards against it: jce_v3_safe_scale, which every TRS composition
+ * in the scene goes through, substitutes 1 for a zero component, so such a
+ * parent behaves as an unscaled one and the solved local pose is finite and
+ * sane.  The singular-frame check inside the implementation is a floor under
+ * a case that cannot currently be reached through this scene, kept because
+ * jce_m4_inverse returns IDENTITY rather than failing -- it is NOT a tested
+ * path, and this sentence exists so it is not read as one. */
+JCE_API bool      jce_scene_set_world_pose(JceScene *s, JceEntity e,
+                                           jce_vec3 position,
+                                           jce_quat rotation);
+
+/* The same solve WITHOUT writing it: hands back the local position/rotation
+ * that would place `e` at that world pose, and touches nothing.
+ *
+ * This exists because jce_scene_set_world_pose goes through
+ * jce_scene_set_transform, which calls ecs_set_ptr and bumps the entity
+ * subtree's world-cache generation -- correct for a script or the editor
+ * moving something occasionally, and WRONG for the physics write-back, which
+ * runs for every non-static body every frame and deliberately mutates
+ * Transforms IN PLACE, naming the entities afterwards through
+ * jce_scene_notify_physics_writeback_entity so the renderer can repair
+ * incrementally instead of dropping its static cache.  Paying a per-entity
+ * invalidation per body per frame is exactly what that design avoids.
+ *
+ * So the solve is the primitive and the setter is the convenience built on
+ * it: a caller that owns its own invalidation asks for the numbers and writes
+ * them itself, and there is still only ONE place that knows how to turn a
+ * world pose into a local one.  Any out param may be NULL. */
+JCE_API bool      jce_scene_solve_local_pose(const JceScene *s, JceEntity e,
+                                             jce_vec3 world_position,
+                                             jce_quat world_rotation,
+                                             jce_vec3 *out_local_position,
+                                             jce_quat *out_local_rotation);
 
 /* Invalidate the per-frame world-matrix cache that backs
  * jce_scene_get_world_matrix. jce_scene_get_world_matrix memoizes each
@@ -2871,6 +3647,14 @@ JCE_API void                   jce_scene_set_spot_light(JceScene *s, JceEntity e
 JCE_API JceSpotLight          *jce_scene_get_spot_light(JceScene *s, JceEntity e);
 JCE_API bool                   jce_scene_has_spot_light(const JceScene *s, JceEntity e);
 JCE_API void                   jce_scene_remove_spot_light(JceScene *s, JceEntity e);
+
+/* Component access — AreaLight.  Presence-gated: the 64-bit JCE_COMP_FLAG
+ * space is full, so having the component IS having the light, exactly as for
+ * ContentSizeFitter / FootIk / NavAgent. */
+JCE_API void                   jce_scene_set_area_light(JceScene *s, JceEntity e, const JceAreaLight *l);
+JCE_API JceAreaLight          *jce_scene_get_area_light(JceScene *s, JceEntity e);
+JCE_API bool                   jce_scene_has_area_light(const JceScene *s, JceEntity e);
+JCE_API void                   jce_scene_remove_area_light(JceScene *s, JceEntity e);
 
 /* Component access — Skybox. */
 JCE_API void                          jce_scene_set_skybox(JceScene *s, JceEntity e, const JceSkyboxComponent *c);
@@ -3125,10 +3909,24 @@ JCE_API void                    jce_scene_remove_grass_field(JceScene *s, JceEnt
  * consumer asks for the terrain it sees a new revision and rebuilds its own
  * derived data -- chunk meshes, pick mesh, collision shape.
  *
- * The editor must call this after a sculpt/save/import.  Invalidating only the
- * renderer drops its meshes but leaves the shared grid untouched, so it would
- * rebuild them from exactly the same stale heights. */
+ * Use this when the file on disk was replaced externally and the resident
+ * object must be discarded.  In-place authoring uses adopt/touch below so the
+ * panel never invalidates the pointer it is editing. */
 JCE_API void JCE_CALL jce_scene_invalidate_terrain(JceScene *s, const char *path);
+
+/* Publish a loaded terrain into the scene's shared terrain cache.  On success
+ * the scene takes ownership and renderer, pick, physics and authoring tools all
+ * observe the same grid.  On failure ownership remains with the caller. */
+JCE_API bool JCE_CALL jce_scene_adopt_terrain(JceScene *s, const char *path,
+                                               JceTerrain *terrain);
+
+/* Borrow the currently resident terrain without causing I/O. */
+JCE_API JceTerrain *JCE_CALL jce_scene_peek_terrain(JceScene *s,
+                                                    const char *path);
+
+/* Notify consumers that the resident terrain changed in place.  Derived-data
+ * consumers compare the resulting revision before rebuilding. */
+JCE_API bool JCE_CALL jce_scene_touch_terrain(JceScene *s, const char *path);
 
 struct JceWaterFieldSet;
 /* THE environment state for this scene -- time of day, weather, wind,
@@ -3273,6 +4071,8 @@ JCE_API void                          jce_scene_remove_decal(JceScene *s, JceEnt
 JCE_API void                          jce_scene_set_light_probe_group(JceScene *s, JceEntity e, const JceLightProbeGroupComponent *c);
 JCE_API JceLightProbeGroupComponent  *jce_scene_get_light_probe_group(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_light_probe_group(const JceScene *s, JceEntity e);
+/* Apply `dering` to a BAKED group in place, AFTER baking; L0 is preserved. */
+JCE_API bool                          jce_scene_light_probe_group_dering(JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_light_probe_group(JceScene *s, JceEntity e);
 
 /* Component access — Audio Listener. */
@@ -3349,6 +4149,16 @@ JCE_API void                          jce_scene_remove_canvas(JceScene *s, JceEn
 
 /* Component access — UI Canvas Group. */
 JCE_API void                          jce_scene_set_canvas_group(JceScene *s, JceEntity e, const JceCanvasGroupComponent *c);
+JCE_API void                          jce_scene_set_content_size_fitter(JceScene *s, JceEntity e,
+                                          const JceContentSizeFitterComponent *v);
+JCE_API JceContentSizeFitterComponent *jce_scene_get_content_size_fitter(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_content_size_fitter(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_set_bone_attachment(JceScene *s, JceEntity e,
+                                                                    const JceBoneAttachmentComponent *c);
+JCE_API JceBoneAttachmentComponent   *jce_scene_get_bone_attachment(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_bone_attachment(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_bone_attachment(JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_content_size_fitter(JceScene *s, JceEntity e);
 JCE_API JceCanvasGroupComponent      *jce_scene_get_canvas_group(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_canvas_group(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_canvas_group(JceScene *s, JceEntity e);
@@ -3356,8 +4166,12 @@ JCE_API void                          jce_scene_remove_canvas_group(JceScene *s,
 /* Component access — UI Layout Group. */
 JCE_API void                          jce_scene_set_layout_group(JceScene *s, JceEntity e, const JceLayoutGroupComponent *c);
 JCE_API JceLayoutGroupComponent      *jce_scene_get_layout_group(JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_set_layout_element(JceScene *s, JceEntity e, const JceLayoutElementComponent *c);
+JCE_API JceLayoutElementComponent    *jce_scene_get_layout_element(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_layout_group(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_layout_group(JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_layout_element(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_layout_element(const JceScene *s, JceEntity e);
 
 /* Component access — UI Image. */
 JCE_API void                          jce_scene_set_ui_image(JceScene *s, JceEntity e, const JceUIImageComponent *c);
@@ -3501,6 +4315,8 @@ JCE_API void                          jce_scene_set_occlusion_portal(JceScene *s
 JCE_API JceOcclusionPortalComponent  *jce_scene_get_occlusion_portal(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_occlusion_portal(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_occlusion_portal(JceScene *s, JceEntity e);
+/* Open/close EVERY portal with `portal_id` (a door group); returns how many changed. */
+JCE_API int                           jce_scene_occlusion_portals_set_open(JceScene *s, int32_t portal_id, bool open);
 
 /* ── Nav-mesh agent (presence-gated, no flag bit) ────────────────── */
 JCE_API void                          jce_scene_set_nav_agent(JceScene *s, JceEntity e, const JceNavAgentComponent *c);
@@ -3675,6 +4491,19 @@ JCE_API void     jce_scene_set_disabled_components(JceScene *s, JceEntity e, uin
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);
 JCE_API void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data);
+
+/* Is this entity MOVED AT RUNTIME -- itself or through any ancestor?
+ *
+ * True when it or a parent carries a rigidbody, a 2D rigidbody, a character
+ * controller, a skeletal animator, a vehicle, a wheel collider or a soft body;
+ * and true, conservatively, when the ancestor walk hits its depth guard without
+ * reaching a root.
+ *
+ * This is the renderer's own definition of "not static" -- it decides what may
+ * enter the cross-frame world cache -- and it is public because static
+ * BATCHING has to ask exactly the same question.  Two definitions of "static"
+ * is how a batch swallows an object that then cannot move. */
+JCE_API bool jce_scene_entity_is_dynamic(JceScene *s, JceEntity e);
 
 /* Component-filtered entity walks (flecs each, O(#matches)) — visit only the
  * entities that HOLD the component instead of probing a full entity list. */

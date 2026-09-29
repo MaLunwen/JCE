@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    JceScript - the managed half of the "csharp" JceScriptVM.
+
+    net8.0 and not net10.0: net8.0 is the current LTS, and a game shipped
+    against it runs on every newer runtime the player has, while the reverse
+    is not true.  Building against the newest installed SDK would make this
+    assembly refuse to load on a machine one release behind - the failure
+    would appear only on the PLAYER's machine, which is the worst place for
+    a runtime-version mistake to surface.
+
+    EnableDynamicLoading is what produces JceScript.runtimeconfig.json for a
+    LIBRARY.  Without it a class library gets no runtimeconfig, and
+    hostfxr_initialize_for_runtime_config has nothing to read - the native
+    host would report "could not initialise" and the cause would be this one
+    property.
+
+    AllowUnsafeBlocks is required, not stylistic: Bootstrap writes function
+    pointers into a native struct, which is `delegate* unmanaged<...>` and
+    cannot be expressed in safe C#.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>JceScript</AssemblyName>
+    <RootNamespace>JceScript</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- A warning here is a defect in the boundary code, and the boundary is
+         where a mistake kills the process rather than failing a call. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>

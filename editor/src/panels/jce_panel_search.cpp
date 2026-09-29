@@ -120,6 +120,7 @@ static const PanelKeyRow kPanelKeys[] = {
     { JCE_PANEL_LIGHT_EXPLORER,      "window.lightExplorer"          },
     { JCE_PANEL_REFLECTION_PROBES,   "window.reflectionProbes"       },
     { JCE_PANEL_SHADER_GRAPH,        "window.shaderGraph"            },
+    { JCE_PANEL_SHADER_INSPECTOR,    "window.shaderInspector"        },
     { JCE_PANEL_SEARCH,              "window.search"                 },
     { JCE_PANEL_VERSION_CONTROL,     "window.versionControl"         },
     { JCE_PANEL_TIME_OF_DAY,         "window.timeOfDay"              },
@@ -141,6 +142,7 @@ static const PanelKeyRow kPanelKeys[] = {
     { JCE_PANEL_PROFILE_ANALYZER,    "window.profileAnalyzer"        },
     { JCE_PANEL_BT_VISUALIZER,       "window.btVisualizer"           },
     { JCE_PANEL_WORLD_STREAMING,     "window.worldStreaming"         },
+    { JCE_PANEL_AI_ASSISTANT,        "window.aiAssistant"            },
     { JCE_PANEL_USER_GUIDE,          "window.userGuide"              },
 };
 static constexpr int kPanelKeyCount =

@@ -220,7 +220,12 @@ void serw_net_rigidbody(JceScene *s, JceEntity e, cJSON *arr);
 /* ui domain (jce_scene_components_ui.c) */
 void parse_canvas(JceScene *s, JceEntity e, const cJSON *c);
 void parse_canvas_group(JceScene *s, JceEntity e, const cJSON *c);
+void parse_content_size_fitter(JceScene *s, JceEntity e, const cJSON *c);
+void serw_content_size_fitter(JceScene *s, JceEntity e, cJSON *arr);
+void parse_bone_attachment(JceScene *s, JceEntity e, const cJSON *c);
+void serw_bone_attachment(JceScene *s, JceEntity e, cJSON *arr);
 void parse_layout_group(JceScene *s, JceEntity e, const cJSON *c);
+void parse_layout_element(JceScene *s, JceEntity e, const cJSON *c);
 void parse_ui_image(JceScene *s, JceEntity e, const cJSON *c);
 void parse_ui_text(JceScene *s, JceEntity e, const cJSON *c);
 void parse_ui_button(JceScene *s, JceEntity e, const cJSON *c);
@@ -233,6 +238,7 @@ void parse_ui_dropdown(JceScene *s, JceEntity e, const cJSON *c);
 void serw_canvas(JceScene *s, JceEntity e, cJSON *arr);
 void serw_canvas_group(JceScene *s, JceEntity e, cJSON *arr);
 void serw_layout_group(JceScene *s, JceEntity e, cJSON *arr);
+void serw_layout_element(JceScene *s, JceEntity e, cJSON *arr);
 void serw_ui_image(JceScene *s, JceEntity e, cJSON *arr);
 void serw_ui_text(JceScene *s, JceEntity e, cJSON *arr);
 void serw_ui_button(JceScene *s, JceEntity e, cJSON *arr);
@@ -282,7 +288,8 @@ void serw_tilemap_collider2d(JceScene *s, JceEntity e, cJSON *arr);
 /* anim domain (jce_scene_components_anim.c) */
 void parse_sprite_animator(JceScene *s, JceEntity e, const cJSON *c);
 void parse_skeletal_animator(JceScene *s, JceEntity e, const cJSON *c);
-void parse_animator(JceScene *s, JceEntity e, const cJSON *c);
+/* RETIRED Animator: parse migrates onto SkeletalAnimator, never re-saved. */
+void parse_animator_migrate(JceScene *s, JceEntity e, const cJSON *c);
 void parse_sequence_player(JceScene *s, JceEntity e, const cJSON *c);
 void parse_morph_weights(JceScene *s, JceEntity e, const cJSON *c);
 void parse_ik_constraints(JceScene *s, JceEntity e, const cJSON *c);
@@ -290,7 +297,6 @@ void parse_foot_ik(JceScene *s, JceEntity e, const cJSON *c);
 void parse_full_body_ik(JceScene *s, JceEntity e, const cJSON *c);
 void parse_avatar(JceScene *s, JceEntity e, const cJSON *c);
 void serw_sprite_animator(JceScene *s, JceEntity e, cJSON *arr);
-void serw_animator(JceScene *s, JceEntity e, cJSON *arr);
 void serw_skeletal_animator(JceScene *s, JceEntity e, cJSON *arr);
 void serw_ik_constraints(JceScene *s, JceEntity e, cJSON *arr);
 void serw_foot_ik(JceScene *s, JceEntity e, cJSON *arr);

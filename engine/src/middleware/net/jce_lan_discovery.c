@@ -467,7 +467,7 @@ void jce_lan_discovery_client_tick(void)
 /* ── Self-test ────────────────────────────────────────────────────── */
 
 #ifdef JCE_NET_SELF_TEST
-#include <assert.h>
+#include <jce/os/core/jce_assert.h>
 
 /* Loopback test: spin a server, run a scan, tick both for ~500 ms,
  * assert the local server appears in the client table.  Some sandbox
@@ -530,7 +530,7 @@ void jce_lan_discovery_self_test(void)
 
     jce_lan_discovery_server_stop();
     jce_lan_discovery_client_clear();
-    assert(jce_lan_discovery_client_server_count() == 0u);
+    JCE_ASSERT(jce_lan_discovery_client_server_count() == 0u);
 }
 #endif /* JCE_NET_SELF_TEST */
 

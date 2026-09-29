@@ -1,0 +1,42 @@
+{
+  "maxParticles": 512,
+  "emitRate": 90,
+  "lifetimeMin": 0.45,
+  "lifetimeMax": 1.15,
+  "worldSpace": true,
+  "velocityMin": [
+    -0.35,
+    1.2,
+    -0.35
+  ],
+  "velocityMax": [
+    0.35,
+    2.4,
+    0.35
+  ],
+  "gravity": [
+    0.0,
+    0.9,
+    0.0
+  ],
+  "sizeStart": 0.4,
+  "sizeEnd": 0.04,
+  "sizeCurve": "QuadOut",
+  "colorStart": [
+    1.0,
+    0.42,
+    0.1,
+    1.0
+  ],
+  "colorEnd": [
+    0.55,
+    0.07,
+    0.015,
+    0.0
+  ],
+  "colorCurve": "SineInOut",
+  "velocityCurve": "QuadOut",
+  "velocityScaleStart": 1.0,
+  "velocityScaleEnd": 0.35,
+  "texture": "textures/fire/fire_256x256.png"
+}

@@ -36,10 +36,14 @@ WHAT IT GUARANTEES.
     the variable under test.
 
 Usage:
-    python tools/envshot.py capture  --name base
-    python tools/envshot.py capture  --name fix --set ambient.intensity=0.2
+    python tools/envshot.py capture  --name base --scene <path/to.scene.json>
+    python tools/envshot.py capture  --name fix  --scene <path/to.scene.json>
+                                     --set ambient.intensity=0.2
     python tools/envshot.py compare  base fix
     python tools/envshot.py list
+
+--scene is REQUIRED: this tool has no default scene (it named one game's
+until 2026-08-27).  These examples used to omit it, and would now exit 2.
 """
 
 import argparse
@@ -50,6 +54,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from jce_determinism import (DETERMINISM, assert_backend,   # noqa: E402
+                             assert_has_content,
+                             assert_subject_in_frame, read_png)
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = Path(os.environ.get("JCE_ENVSHOT_BUILD",
@@ -73,6 +82,10 @@ OUT = ROOT / "build/envshots"
 # images are allowed to be diffed.  A camera that lives in a shell history is
 # a camera nobody can reproduce.
 
+# NOTE: these are ABSOLUTE world poses, tuned against one scene (the comments
+# below name what each one framed there).  --scene became a required argument
+# on 2026-08-27, so pointing this tool at a different scene will very likely
+# frame nothing recognisable: a new scene needs its own poses, not these.
 VIEWS = {
     # Looking down at the forest floor: where a cast shadow is unmistakable.
     "forest": dict(tx=-60, ty=30, tz=-60, dist=55, pitch=42, yaw=140),
@@ -127,11 +140,15 @@ RP_HIGH = {
     "enable_bloom": True, "enable_volumetric_fog": True,
     "enable_gpu_particles": True, "enable_cloth": True,
     "enable_stylized_sky": False, "enable_motion_blur": False,
+    "motion_blur_intensity": 1.0,
+    "sun_soft_size": 0.0,
     "hdr_color": True, "depth_prepass": True, "msaa_samples": 2,
     "render_scale": 1.0, "enable_taa": True,
 }
 
-DEFAULT_SCENE = "caged_kingdom/resources/assets/scenes/hidden_cove.scene.json"
+# No default scene: which scene to shoot belongs to the caller, not to a game
+# this tool happens to know about.  --scene is required.
+DEFAULT_SCENE = None
 CAPTURE_FRAME = 300
 
 
@@ -284,6 +301,27 @@ def capture(args):
     if not EXE.exists():
         sys.exit(f"editor not built: {EXE}")
 
+    # THE LOG IS NOT OPTIONAL, because the two guards that need it are not.
+    #
+    # assert_backend and assert_subject_in_frame both read the engine's own
+    # stdout, so without a log they do not run -- and the tool said so, in a
+    # line that is easy to read past:
+    #
+    #   [envshot] subject-in-frame NOT verified (pass --log; a capture aimed
+    #   at empty space is not blank and no image guard can tell)
+    #
+    # Measured cost of that being a warning rather than a default: a whole
+    # SSGI investigation -- twelve captures, a positive control, three shader
+    # diagnostics and a written-then-reverted denoiser -- ran against a
+    # fixture the camera never contained.  Every number in it was real and
+    # every conclusion from it was wrong.  The guard that would have stopped
+    # it at capture one was already written and simply was not switched on.
+    #
+    # A default path costs nothing (the log is a build output, one per name)
+    # and makes the guard the thing you have to opt OUT of.
+    if not args.log:
+        args.log = str(OUT / f"{args.name}.log")
+
     build_shaders()
 
     scene = ROOT / args.scene
@@ -325,13 +363,30 @@ def capture(args):
                         "here draws into",
         # Measured, not assumed: render_scale 1.0 vs 2.0 at a fixed pose gave
         # leaf 8.999 vs 8.997, trunk 14.017 vs 14.016, ground 3.805 vs 3.805 --
-        # byte-identical. Same reason as msaa_samples: it does not reach the
-        # offscreen target these captures come from.
-        "render_scale": "inert for the offscreen target these captures render "
-                        "into (measured byte-identical at 1.0 vs 2.0)",
+        # byte-identical, because at the time nothing read the field at all.
+        # Something does now, but only on the paths that ship a frame to a
+        # player: the standalone runtime and the editor's GAME view.  The SCENE
+        # view still renders at the panel's own size on purpose -- its picking
+        # and gizmos are calibrated to it, and Unity draws the identical line
+        # for URP's Render Scale -- so a default capture, which pins the Scene
+        # view, would still be measuring an override that reached nothing.
+        "render_scale": "inert for the SCENE view, which renders at the "
+                        "panel's own size by design; live for the shipped "
+                        "runtime and the editor GAME view. Add "
+                        "--env JCE_DBG_FOCUS_GAME=1 to measure it",
     }
+
+    # The one entry whose inertness depends on WHICH PANEL is photographed, so
+    # the refusal has to know that too.  Refusing the Scene-view capture is the
+    # whole value of this table; refusing the Game-view capture as well would
+    # make the knob unmeasurable by the only tool that could measure it.
+    _focus_game = (args.play is not None) or any(
+        e.startswith("JCE_DBG_FOCUS_GAME") and not e.endswith("=0")
+        for e in (args.env or []))
     for kv in (args.rp or []):
         k = kv.partition("=")[0]
+        if k == "render_scale" and _focus_game:
+            continue
         if k in _BOOT_INERT:
             sys.exit("envshot: --rp %s is BOOT-INERT -- the renderer only "
                      "reacts to a RUNTIME change of it, so this override "
@@ -371,10 +426,26 @@ def capture(args):
         pairs = []
         for kv in args.rp:
             k, _, v = kv.partition("=")
-            # The engine's forcer takes 0/1; the preset takes JSON booleans.
-            on = 0 if str(v).strip().lower() in ("0", "false", "off", "no") else 1
-            # enable_csm -> csm: the preset key and the feature name differ.
-            pairs.append("%s=%d" % (k[len("enable_"):] if k.startswith("enable_") else k, on))
+            vs = str(v).strip().lower()
+            if vs in ("0", "1", "true", "false", "on", "off", "no", "yes"):
+                # The engine's forcer takes 0/1; the preset takes JSON booleans.
+                on = 0 if vs in ("0", "false", "off", "no") else 1
+                # enable_csm -> csm: the preset key and the feature name differ.
+                pairs.append("%s=%d" % (k[len("enable_"):] if k.startswith("enable_") else k, on))
+            else:
+                # NUMERIC knob, passed through as the number.
+                #
+                # It used to be squashed to 0/1 here, which meant every float
+                # override reached NOTHING: the engine's forcer read booleans
+                # only, and the preset FILE does not reach the editor's
+                # viewport (the reason this variable is set at all).  Measured
+                # 2026-09-06: --rp sun_soft_size=3.0 and =8.0 produced 4721 px
+                # and 4708 px of difference -- 2.7x the parameter, 0.3% LESS
+                # effect -- and `compare` called it "ABOVE THE NOISE FLOOR",
+                # because 0.4% against a 0.14% floor is above it whatever
+                # caused the 0.4%.  The same shape as the boolean bug the
+                # comment above records, one type down.
+                pairs.append("%s=%s" % (k, v))
         rp_force = ",".join(pairs)
 
     # A pure TRANSLATION of the orbit rig: target and camera move together, so
@@ -415,6 +486,11 @@ def capture(args):
         png.unlink()
 
     env = dict(os.environ)
+    # The determinism recipe is single-sourced in jce_determinism.py.  This file
+    # pinned camera and scene but nothing about frame pacing, streaming or TAA
+    # jitter, so two "identical" envshot runs were free to differ in exactly the
+    # ways a screenshot comparison is sensitive to.
+    env.update(DETERMINISM)
     env.update({
         "JCE_BACKEND": args.backend,
         "JCE_SCENE": str(scene),
@@ -496,6 +572,40 @@ def capture(args):
         time.sleep(0.5)
     time.sleep(1.5)          # let the PNG writer thread finish
     p.kill()
+    if args.log:
+        log_f.close()
+
+    # JCE_BACKEND is a REQUEST.  bgfx falls back, and a capture taken on a
+    # backend nobody asked for looks exactly like one taken on the right one.
+    # The engine prints which it chose; that line only reaches us with --log,
+    # so without it say nothing rather than implying the request was honoured.
+    if Path(args.log).is_file():
+        text = Path(args.log).read_text(encoding="utf-8", errors="replace")
+        got = assert_backend(text, args.backend)
+        print(f"[envshot] engine reported backend: {got}")
+    else:
+        # The log path is defaulted above, so an absent file is not "the user
+        # did not ask for it" any more -- the process wrote nothing at all.
+        sys.exit(f"the editor produced no log at {args.log}: it did not run")
+
+    # A blank capture compares perfectly equal to another blank capture, so a
+    # diff over two of them passes vacuously.  visual_diff.py did exactly that
+    # three times before this guard existed.
+    if want.exists():
+        assert_has_content(read_png(want), want)
+        # ...and the other half of "is this picture usable": not blank is not
+        # the same as contains the subject.  See assert_subject_in_frame.
+        vis = assert_subject_in_frame(
+            Path(args.log).read_text(encoding="utf-8", errors="replace"), want)
+        if vis is not None:
+            print(f"[envshot] renderer drew {vis} visible entities")
+        else:
+            # assert_subject_in_frame returns None when the engine never
+            # printed its cull line.  Silence there is the same hole one level
+            # down, so name it: a run whose subject was not checked must not
+            # read like one that passed.
+            print(f"[envshot] WARNING: no cull line in {args.log} -- "
+                  "subject-in-frame could not be checked for this capture")
 
     if scene != ROOT / args.scene:
         scene.unlink(missing_ok=True)   # the override copy is not an asset
@@ -627,17 +737,35 @@ def compare(args):
         if broader or deeper:
             which = " and ".join(
                 [x for x in ("broader" if broader else "", "deeper" if deeper else "") if x])
+            _verdict = "above_floor"
             print(f"  => ABOVE THE NOISE FLOOR ({which}): this is a real change.")
         else:
+            _verdict = "at_or_below_floor"
             print("  => AT OR BELOW THE NOISE FLOOR: this comparison cannot tell "
                   "the change from run-to-run variation. NOT proof of no effect -- "
                   "find a camera or setting where the effect is larger, or make "
                   "the ablation bigger.")
     else:
+        _verdict = "no_floor"
         print(f"  => {stats['n']} px differ (peak {stats['max']:.0f}/255). No verdict: "
               f"pass --noise A,B (two captures of the same build) to say whether "
               f"this is above run-to-run variation. The mean being small is NOT "
               f"evidence of no effect -- most of the region is simply unaffected.")
+
+    # THE SAME DECISION, AS DATA.  An automated caller -- private/tools/ai/jce_design.py's
+    # iterate loop -- needs to branch on this, and branching on the presence of
+    # a printed sentence is a dependency on wording.  Same numbers, same
+    # threshold, one authority.
+    if args.json:
+        import json as _json
+        print("JCE_ENVSHOT_JSON " + _json.dumps({
+            "verdict": _verdict,
+            "region": args.region,
+            "mean": round(stats["mean"], 6),
+            "max": stats["max"],
+            "changed_px": stats["n"],
+            "changed_pct": round(stats["pct"], 6),
+        }, sort_keys=True))
 
     if args.write_diff:
         out = OUT / f"diff_{args.a}_{args.b}.png"
@@ -763,7 +891,9 @@ def main():
     c = sub.add_parser("capture")
     c.add_argument("--name", required=True)
     c.add_argument("--view", default="forest", choices=sorted(VIEWS))
-    c.add_argument("--scene", default=DEFAULT_SCENE)
+    # Required: there is no default scene any more (it used to be one
+    # game's). argparse gives the missing-argument message for free.
+    c.add_argument("--scene", default=DEFAULT_SCENE, required=True)
     c.add_argument("--backend", default="d3d11")
     c.add_argument("--spin", type=float, default=0.0,
                    help="degrees per frame; 0 = static")
@@ -811,14 +941,23 @@ def main():
                    help="how many shots to wait for when using --stride")
     c.add_argument("--timeout", type=float, default=90.0)
     c.add_argument("--log", metavar="PATH",
-                   help="keep the editor's stdout+stderr here "
-                        "(JCE_PERF_LOG output lands in it)")
+                   help="where to keep the editor's stdout+stderr "
+                        "(JCE_PERF_LOG output lands in it).  Defaults to "
+                        "build/envshots/<name>.log -- the backend and "
+                        "subject-in-frame guards read it, so it is always "
+                        "written")
     c.set_defaults(func=capture)
 
     m = sub.add_parser("compare")
     m.add_argument("a"); m.add_argument("b")
     m.add_argument("--region", default="viewport", choices=sorted(REGIONS))
     m.add_argument("--write-diff", action="store_true")
+    m.add_argument("--json", action="store_true",
+                   help="ALSO print the verdict as one JSON line prefixed "
+                        "JCE_ENVSHOT_JSON, for a caller that has to branch on "
+                        "it.  The printed verdict is a sentence and the exit "
+                        "code is 0 either way, so an automated reader would "
+                        "otherwise be grepping for a phrase.")
     m.add_argument("--noise", metavar="A,B",
                    help="two captures of the SAME build; judges the comparison "
                         "against their difference instead of guessing")

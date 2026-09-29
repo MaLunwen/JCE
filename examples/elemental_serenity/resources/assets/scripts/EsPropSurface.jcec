@@ -1,0 +1,25 @@
+# EsPropSurface — a C script CLASS, not a script file.
+#
+# THE RUNTIME NEVER READS THESE BYTES.  A .jcec path NAMES a class published
+# by a compiled module; the native instantiate path strips the directory and
+# the extension and looks the name up in the one native class registry shared
+# by the "c" and "cpp" languages.  The class is in src/es_prop_surface.c,
+# compiled as C99, built into elemental_serenity.exe and into es_scripts_c.dll
+# (which the editor loads — see jce_project.json's "script_modules", which
+# carries TWO entries because one module descriptor is one translation unit
+# and a translation unit is C or C++).
+#
+# THIS FILE EXISTS SO THE OFFLINE HALF OF THE PIPELINE CAN SEE IT.  The
+# editor's asset database, the Script component's picker, the cooker and the
+# publication policy all classify by extension through the one catalog in
+# engine/src/resource/jce_asset_ext.c, and they classify FILES.  With this
+# stub the script is attachable by picking it like any other; without it the
+# path still works and has to be typed by hand.  Its form in the catalog is
+# REFERENCE, like .jcecpp, so the archive cooker does not put it in the shared
+# text dictionary the way it would a real source file.
+#
+# WHAT THE CLASS OWNS: MeshRenderer baseColorR/G/B and roughness of Rocks,
+# Trees, Bridge, Camp and Tent — the seasonal stone tint the Lua director
+# could never reach (its find_by_prefix("rock") never matched "Rocks"), and a
+# wet look in the rainy states, which no script and no engine system in this
+# project has ever written.  See MULTILANG.md for the ownership table.

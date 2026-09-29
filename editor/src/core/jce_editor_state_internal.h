@@ -63,6 +63,17 @@ struct EditorInternalState {
     JceScene        *scene;
     char             current_scene_path[512];
 
+    /* Scene-file watch (core/jce_editor_scene_file_watch.cpp).  HERE rather
+     * than as a file-scope object in that translation unit, for the reason
+     * this folder's charter gives: all editor state goes through this struct.
+     * The dedup audit agrees and counts the difference -- a static there was
+     * global-state 859 -> 860, and that baseline is not for raising. */
+    char             scene_watch_path[512];
+    int64_t          scene_watch_mtime;
+    int              scene_watch_countdown;
+    bool             scene_watch_armed;
+    bool             scene_watch_stale;
+
     bool initialized;
 };
 
@@ -99,8 +110,29 @@ extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 /* ── History Snapshot ──────────────────────────────────────────────── */
 
 struct EditorHistorySnapshot {
+    uint64_t sequence = 0;
+
+    /* ENTITY-SCOPED RECORD when entity_id != 0.
+     *
+     * A full record serialises the whole scene -- 26 MB and 715 ms at 50k
+     * entities, twice per edit (once to push, once to compare) -- and restores
+     * by clearing the scene, which also drops the selection and every entity
+     * handle.  An inspector edit changes one entity, so it records one:
+     *   entity_json      the entity's "components" array at capture time
+     *   entity_comp_ids  the component SET, so a restore can REMOVE a
+     *                    component the edit added (parse alone only adds)
+     *   entity_order     that entity's inspector display order
+     * scene_json is empty in this case and scene_path still carries the
+     * scene identity, so the two kinds share one stack and one ordering. */
+    uint32_t entity_id = 0;
+    std::string entity_json;
+    std::vector<int> entity_comp_ids;
+    std::vector<int> entity_order;
+
     std::string scene_json;
     std::string scene_path;
+    std::vector<uint32_t> selection;
+    uint32_t focused = 0;
     /* Per-entity Inspector component display order (dense comp_ids).
        Captured alongside the scene so undo/redo of Move Up/Move Down/
        drag-reorder restores the prior layout. Sidecar fold-state is
@@ -130,6 +162,7 @@ extern EditorTransaction s_transaction;
 
 void set_current_scene_path_internal(const char *scene_path);
 void update_scene_dir_from_path(const char *scene_path);
+void jce_roots_invalidate(void);
 void clear_scene_entities(void);
 void rebuild_entity_order_from_ecs(void);
 
@@ -152,6 +185,10 @@ bool history_begin_edit(void);
 void history_end_edit(bool active);
 bool history_capture_snapshot(EditorHistorySnapshot *out);
 bool history_push_undo_snapshot(void);
+bool history_push_undo_snapshot_scoped(uint32_t entity_id);
+bool history_capture_entity_snapshot(uint32_t entity_id,
+                                     EditorHistorySnapshot *out);
+bool history_begin_edit_scoped(uint32_t entity_id);
 bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
                               const char *reason);
 

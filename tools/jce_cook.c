@@ -19,7 +19,11 @@
 #include <jce/resource/jce_asset_format.h>
 
 #include "resource/jce_asset_cooker.h"
+#include "jce_cook_atlas.h"
 #include "jce_cook_catalog.h"   /* per-asset incremental cook cache */
+/* The audio cook DECISION, shared with the in-process cooker so the size
+ * heuristic and the per-asset override cannot disagree in two places. */
+#include "../engine/src/resource/jce_audio_import_settings.h"
 
 /* Offline collider cook (--collider): turns a model's compound collider into
  * a precomputed JCOL blob so the runtime can load it instead of re-cooking
@@ -41,6 +45,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -196,11 +201,23 @@ static bool should_cook(const char *full_path, int type)
     if (type == JCEASSET_TYPE_TEXTURE) return true;
 
     if (type == JCEASSET_TYPE_SOUND) {
-        /* Only cook short SFX (< 2 MB source).  Large music files
-           would explode to raw PCM — keep them encoded. */
+        /* The heuristic is still the default -- a short SFX is worth
+           pre-decoding because the decode lands on every trigger, a long
+           music bed is not -- but it is no longer the WHOLE policy.  It used
+           to be: this branch was the entire cook-time decision for audio in
+           this engine, with no per-asset override in either direction, so a
+           2.1 MB footstep set paid a decode per trigger forever and a 1.9 MB
+           ambience loop was expanded to raw PCM in the PAK.
+
+           The decision itself lives in jce_audio_import_should_cook so the
+           heuristic and the override cannot disagree in two places. */
+        JceAudioImportSettings imp;
+        (void)jce_audio_import_settings_load(full_path, &imp);
         uint64_t sz = 0;
-        if (!jce_fs_host_get_size(full_path, &sz)) return false;
-        return sz > 0 && sz < 2 * 1024 * 1024;
+        if (imp.cook_mode == JCE_AUDIO_COOK_AUTO &&
+            !jce_fs_host_get_size(full_path, &sz))
+            return false;
+        return jce_audio_import_should_cook(&imp, sz);
     }
 
     /* Fonts, JSON, shaders, models, etc. — must stay raw.
@@ -349,6 +366,28 @@ static void cook_single(BatchContext *ctx, const char *full_path,
     jce_cook_result_free(&result);
 }
 
+/* Case-insensitive path compare that ignores separator flavour and a
+   trailing slash: the two paths compared with it come from different
+   sources -- one is a command-line argument, the other is built by the
+   directory walk. */
+static bool path_same(const char *a, const char *b)
+{
+    size_t i = 0;
+    if (!a || !b) return false;
+    for (;;) {
+        char ca = a[i], cb = b[i];
+        if (ca == '/') ca = '\\';
+        if (cb == '/') cb = '\\';
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca == '\\' && a[i + 1] == 0) ca = 0;
+        if (cb == '\\' && b[i + 1] == 0) cb = 0;
+        if (ca != cb) return false;
+        if (ca == 0) return true;
+        ++i;
+    }
+}
+
 #ifdef _WIN32
 static void batch_recurse(BatchContext *ctx,
                            const char *dir,
@@ -373,6 +412,20 @@ static void batch_recurse(BatchContext *ctx,
             snprintf(rel, sizeof(rel), "%s", fd.cFileName);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            /* NEVER DESCEND INTO OUR OWN OUTPUT.
+             *
+             * The default project layout puts the cooked tree INSIDE the
+             * source tree (source_assets "resources", cooked_assets
+             * "resources/_cooked"), so without this the walk finds the
+             * previous run's output and cooks it again -- one level deeper
+             * every time.  Measured on a project cooked a handful of times:
+             * resources/_cooked/_cooked/_cooked/_cooked, each level a full
+             * copy, all of it packed into the PAK.
+             *
+             * It grows without bound and nothing reports it: every run ends
+             * "Done: N cooked" and N even looks stable, because the
+             * incremental cache marks the duplicates unchanged. */
+            if (path_same(full, ctx->output_dir)) continue;
             batch_recurse(ctx, full, rel);
         } else {
             cook_single(ctx, full, rel);
@@ -405,6 +458,8 @@ static void batch_recurse(BatchContext *ctx,
         if (stat(full, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
+            /* Same reason as the Windows walk above. */
+            if (path_same(full, ctx->output_dir)) continue;
             batch_recurse(ctx, full, rel);
         } else if (S_ISREG(st.st_mode)) {
             cook_single(ctx, full, rel);
@@ -885,6 +940,11 @@ static void print_usage(void)
     printf("  jce_cook --batch <input_dir> <output_dir> [options]\n");
     printf("  jce_cook --collider <model> [--out <file.jcol>] [--verbose]\n");
     printf("  jce_cook --convert-model <model> [--out <file.glb>] [--verbose]\n");
+    printf("  jce_cook --pack-atlas <dir> --atlas-out <base> [--atlas-padding N] [--atlas-max N]\n");
+    printf("      Loose images -> one <base>.png + <base>.json, Aseprite-shaped,\n");
+    printf("      which is the format jce_sprite_sheet_load_json already reads.\n");
+    printf("      A sprite that does not fit is NAMED, not dropped: a missing\n");
+    printf("      sprite renders as nothing and looks like an authoring mistake.\n");
     printf("  jce_cook --terrain <heightmap.png> [--out <file.jter>]\n");
     printf("           [--tile <cells>] [--world-size <m>] [--base-height <m>]\n");
     printf("           [--height-range <m>] [--verbose]\n");
@@ -948,6 +1008,13 @@ int main(int argc, char **argv)
     int  enc_quality    = JCE_COOK_ENCODE_DEFAULT;/* --quality fast|default|highest */
     bool uncompressed   = false;                  /* --rgba8/--uncompressed opt-out */
     bool no_incremental = false;                  /* --no-incremental opt-out */
+    /* --pack-atlas: loose sprites -> one Aseprite-shaped atlas.  See
+     * tools/jce_cook_atlas.c; the packing arithmetic is in the engine and
+     * unit-tested there. */
+    const char *atlas_dir = NULL;
+    const char *atlas_out = NULL;
+    unsigned    atlas_pad = UINT_MAX;   /* UINT_MAX = the packer's default */
+    unsigned    atlas_max = 0u;         /* 0 = the packer's default */
     const char *input   = NULL;
     const char *output  = NULL;
     const char *collider_model = NULL;    /* --collider <model> */
@@ -968,7 +1035,15 @@ int main(int argc, char **argv)
 
     /* Parse arguments. */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--batch") == 0) {
+        if (strcmp(argv[i], "--pack-atlas") == 0 && i + 1 < argc) {
+            atlas_dir = argv[++i];
+        } else if (strcmp(argv[i], "--atlas-out") == 0 && i + 1 < argc) {
+            atlas_out = argv[++i];
+        } else if (strcmp(argv[i], "--atlas-padding") == 0 && i + 1 < argc) {
+            atlas_pad = (unsigned)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--atlas-max") == 0 && i + 1 < argc) {
+            atlas_max = (unsigned)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--batch") == 0) {
             batch = true;
         } else if (strcmp(argv[i], "--collider") == 0 && i + 1 < argc) {
             collider = true;
@@ -1065,6 +1140,13 @@ int main(int argc, char **argv)
     }
 
     /* Offline collider cook is a self-contained mode (no <input> <output>). */
+    /* --pack-atlas runs on its own and exits: it produces an ASSET (a sheet
+     * plus its JSON), not a cooked copy of one, so it does not belong in the
+     * batch walk below. */
+    if (atlas_dir) {
+        return jce_cook_pack_atlas(atlas_dir, atlas_out, atlas_pad, atlas_max);
+    }
+
     if (collider) {
         if (!collider_model) {
             fprintf(stderr, "Error: --collider requires a model path\n");

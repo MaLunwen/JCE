@@ -34,6 +34,8 @@ void parse_skeletal_animator(JceScene *s, JceEntity e, const cJSON *c)
     copy_str(sk.retarget_source_skeleton, sizeof(sk.retarget_source_skeleton),
              j_str(c, "retargetSource", ""));
     copy_str(sk.sm_path, sizeof(sk.sm_path), j_str(c, "stateMachine", ""));
+    sk.retarget_effector_ik = j_bool(c, "retargetEffectorIk", false);
+    sk.retarget_twist = (float)j_num(c, "retargetTwist", 0.0);
     sk.use_blend_tree = j_bool(c, "useBlendTree", false);
     sk.blend_param    = (float)j_num(c, "blendParam", 0.0);
     sk.blend_mode     = (int)j_num(c, "blendMode", 0);
@@ -79,17 +81,6 @@ void parse_skeletal_animator(JceScene *s, JceEntity e, const cJSON *c)
         }
     }
     jce_scene_set_skeletal_animator(s, e, &sk);
-}
-
-void parse_animator(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAnimatorComponent a;
-    memset(&a, 0, sizeof(a));
-    copy_str(a.clip_name, sizeof(a.clip_name), j_str(c, "clipName", ""));
-    a.speed   = (float)j_num(c, "speed", 1.0);
-    a.loop    = j_bool(c, "loop", false);
-    a.playing = j_bool(c, "playing", false);
-    jce_scene_set_animator(s, e, &a);
 }
 
 void parse_sequence_player(JceScene *s, JceEntity e, const cJSON *c)
@@ -244,16 +235,10 @@ void parse_avatar(JceScene *s, JceEntity e, const cJSON *props)
     jce_scene_set_avatar(s, e, &cc);
 }
 
-static void ser_animator(const JceAnimatorComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Animator");
-    cJSON_AddStringToObject(o, "clipName", c->clip_name);
-    cJSON_AddNumberToObject(o, "speed", c->speed);
-    cJSON_AddBoolToObject(o, "loop", c->loop);
-    cJSON_AddItemToArray(arr, o);
-}
-
+/* ser_animator is GONE with the component's retirement.  It wrote four keys
+ * nothing reads back any more (the registry row's serialize is NULL), which
+ * check_component_serializer_roundtrip correctly calls authoring that
+ * disappears on reload.  The retired VfxGraph is not written either. */
 static void ser_sequence_player(const JceSequencePlayerComponent *sp, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -391,6 +376,13 @@ static void ser_skeletal_animator(const JceSkeletalAnimatorComponent *c, cJSON *
         cJSON_AddStringToObject(o, "retargetSource", c->retarget_source_skeleton);
     if (c->sm_path[0])
         cJSON_AddStringToObject(o, "stateMachine", c->sm_path);
+    /* Emitted only when ON, so every animator authored before this existed
+       serializes byte-identically -- the same rule retargetSource follows two
+       lines above. */
+    if (c->retarget_effector_ik)
+        cJSON_AddBoolToObject(o, "retargetEffectorIk", true);
+    if (c->retarget_twist > 0.0f)
+        cJSON_AddNumberToObject(o, "retargetTwist", c->retarget_twist);
     if (c->use_blend_tree) {
         cJSON_AddBoolToObject(o, "useBlendTree", true);
         cJSON_AddNumberToObject(o, "blendParam", c->blend_param);
@@ -433,11 +425,64 @@ void serw_sprite_animator(JceScene *s, JceEntity e, cJSON *arr)
     if (c) ser_sprite_animator(c, arr);
 }
 
-void serw_animator(JceScene *s, JceEntity e, cJSON *arr)
+/* RETIRED: the simple Animator was a strict SUBSET of SkeletalAnimator
+ * (clip_name/speed/loop/playing against clip_names[8] + active_clip + blend
+ * trees + state machines + retargeting) and had NO runtime consumer at all --
+ * only the serialiser.  The editor said so with a component-wide unwired
+ * badge, so it was honest and inert: a component in the Add Component menu
+ * that does nothing, which is a trap for exactly the production use this is
+ * meant to support.
+ *
+ * It could not be wired as it stood, either: it carries no skeleton binding,
+ * and the runtime needs one (jce_runtime.c loads sa->skeleton_path as a
+ * glTF).  MeshRenderer.mesh_path IS that glTF -- the same file supplies the
+ * mesh, the skeleton and the clips -- so migrating here does not merely
+ * preserve the authored values, it makes them PLAY for the first time.
+ *
+ * Same shape as the VfxGraph retirement above: parse migrates, serialize is
+ * NULL so nothing is ever re-saved as "Animator", and an explicitly authored
+ * SkeletalAnimator on the same entity always wins. */
+void parse_animator_migrate(JceScene *s, JceEntity e, const cJSON *props)
 {
-    JceAnimatorComponent *c = jce_scene_get_animator(s, e);
-    if (c) ser_animator(c, arr);
+    if (jce_scene_has_skeletal_animator(s, e)) return;
+
+    const char *clip = j_str(props, "clipName", "");
+
+    JceSkeletalAnimatorComponent sa;
+    memset(&sa, 0, sizeof sa);
+    sa.speed   = (float)j_num(props, "speed", 1.0);
+    /* false, matching what parse_animator always read -- the editor
+     * writes the key explicitly, so this only affects hand-written JSON. */
+    sa.loop    = j_bool(props, "loop", false);
+    sa.playing = j_bool(props, "playing", false);
+    if (sa.speed <= 0.0f) sa.speed = 1.0f;
+
+    if (clip[0]) {
+        copy_str(sa.clip_names[0], sizeof sa.clip_names[0], clip);
+        sa.clip_count  = 1;
+        sa.active_clip = 0;
+    }
+
+    /* The rig comes from the mesh on the same entity.  No MeshRenderer means
+     * no skeleton to play against -- the component is still migrated so the
+     * authored values survive and become visible in the SkeletalAnimator
+     * inspector, where the skeleton field can be filled in. */
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(s, e);
+    if (mr && mr->mesh_path[0])
+        copy_str(sa.skeleton_path, sizeof sa.skeleton_path, mr->mesh_path);
+
+    jce_scene_set_skeletal_animator(s, e, &sa);
 }
+
+/* One-way legacy migration (consolidation v0.9.9). The orphaned VFX
+ * Graph runtime was removed — its `*.vfx.json` key set always parsed
+ * identically to `*.particles.json`, so the authored graphPath maps
+ * straight onto a ParticleEmitterComponent asset path and the entity
+ * joins the standard particle pipeline. Legacy-only knobs
+ * (playOnAwake / loop / rateMultiplier / intensity) have no
+ * counterpart and are dropped. An explicitly authored ParticleEmitter
+ * on the same entity always wins; the component is never re-saved as
+ * VfxGraph (its registry row has serialize == NULL). */
 
 void serw_skeletal_animator(JceScene *s, JceEntity e, cJSON *arr)
 {
@@ -507,3 +552,39 @@ void serw_avatar(JceScene *s, JceEntity e, cJSON *arr)
     }
 }
 
+void parse_bone_attachment(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceBoneAttachmentComponent a; memset(&a, 0, sizeof a);
+    a.target = (uint64_t)j_num(c, "target", 0.0);
+    const char *bone = j_str(c, "bone", "");
+    snprintf(a.bone, sizeof a.bone, "%s", bone ? bone : "");
+    a.offset[0] = (float)j_num(c, "offsetX", 0.0);
+    a.offset[1] = (float)j_num(c, "offsetY", 0.0);
+    a.offset[2] = (float)j_num(c, "offsetZ", 0.0);
+    /* All-zero is IDENTITY, not a degenerate quaternion -- see the struct.
+     * A scene file without these keys must leave the attachment pointing the
+     * way the bone does, and memset already produces that reading. */
+    a.rotation_offset[0] = (float)j_num(c, "rotX", 0.0);
+    a.rotation_offset[1] = (float)j_num(c, "rotY", 0.0);
+    a.rotation_offset[2] = (float)j_num(c, "rotZ", 0.0);
+    a.rotation_offset[3] = (float)j_num(c, "rotW", 0.0);
+    jce_scene_set_bone_attachment(s, e, &a);
+}
+
+void serw_bone_attachment(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceBoneAttachmentComponent *a = jce_scene_get_bone_attachment(s, e);
+    if (!a) return;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "BoneAttachment");
+    cJSON_AddNumberToObject(o, "target", (double)a->target);
+    cJSON_AddStringToObject(o, "bone", a->bone);
+    cJSON_AddNumberToObject(o, "offsetX", a->offset[0]);
+    cJSON_AddNumberToObject(o, "offsetY", a->offset[1]);
+    cJSON_AddNumberToObject(o, "offsetZ", a->offset[2]);
+    cJSON_AddNumberToObject(o, "rotX", a->rotation_offset[0]);
+    cJSON_AddNumberToObject(o, "rotY", a->rotation_offset[1]);
+    cJSON_AddNumberToObject(o, "rotZ", a->rotation_offset[2]);
+    cJSON_AddNumberToObject(o, "rotW", a->rotation_offset[3]);
+    cJSON_AddItemToArray(arr, o);
+}

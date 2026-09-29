@@ -10,6 +10,7 @@
  */
 
 #include "jce_rt_internal.h"
+#include <math.h>
 
 JceSound rt_load_sound(JceRuntime *rt, const char *path)
 {
@@ -20,6 +21,35 @@ JceSound rt_load_sound(JceRuntime *rt, const char *path)
 	return jce_audio_load(rt->audio, rt->pak, path);
 }
 
+/* Nearest AudioOcclusion probe whose sphere contains the listener.  Nearest
+ * rather than first so overlapping probes resolve the same way every frame
+ * regardless of ECS iteration order. */
+typedef struct {
+	JceRuntime                       *rt;
+	jce_vec3                          listener;
+	const JceAudioOcclusionComponent *best;
+	float                             best_d2;
+} RtOccProbePick;
+
+static void rt_occ_probe_cb(JceScene *s, JceEntity e, void *ud)
+{
+	RtOccProbePick *pk = (RtOccProbePick *)ud;
+	if (!jce_scene_has_audio_occlusion(s, e)) return;
+	const JceAudioOcclusionComponent *o = jce_scene_get_audio_occlusion(s, e);
+	if (!o || o->radius <= 0.0f) return;
+	if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_AUDIO_OCCLUSION)) return;
+	jce_vec3 c = rt_world_position(s, e);
+	float dx = pk->listener.x - c.x;
+	float dy = pk->listener.y - c.y;
+	float dz = pk->listener.z - c.z;
+	float d2 = dx * dx + dy * dy + dz * dz;
+	if (d2 > o->radius * o->radius) return;      /* listener outside */
+	if (pk->best && d2 >= pk->best_d2) return;
+	pk->best = o;
+	pk->best_d2 = d2;
+}
+
+
 /* Occlusion raycast adapter: returns the segment fraction at first physics
  * hit (1.0 = unobstructed). No material DB → mid absorption. */
 static float rt_occlusion_raycast(void *ud, jce_vec3 origin, jce_vec3 dir,
@@ -28,7 +58,18 @@ static float rt_occlusion_raycast(void *ud, jce_vec3 origin, jce_vec3 dir,
 	JceRuntime *rt = (JceRuntime *)ud;
 	if (out_material) *out_material = 0.5f;
 	if (!rt || !rt->physics || max_distance <= 0.0f) return 1.0f;
-	JceRaycastResult r = jce_physics_raycast(rt->physics, origin, dir, max_distance);
+	/* AudioOcclusion.layer_mask: which physics layers actually block sound.
+	 * This used an unfiltered raycast, so the mask -- authored, serialised
+	 * and an editable DragInt in the Inspector -- selected nothing and every
+	 * collider muffled everything.  rt->occ_layer_mask is refreshed from the
+	 * probe each audio tick; 0 (a fresh component) means "no mask authored",
+	 * NOT "nothing blocks", because zero-initialised components are what
+	 * every scene older than this carries. */
+	JceQueryFilter qf;
+	qf.layer_mask   = rt->occ_layer_mask ? rt->occ_layer_mask : 0xFFFFFFFFu;
+	qf.hit_triggers = false;
+	JceRaycastResult r = jce_physics_raycast_filtered(rt->physics, origin, dir,
+	                                                  max_distance, qf);
 	if (!r.hit) return 1.0f;
 	float frac = r.distance / max_distance;
 	return frac < 0.0f ? 0.0f : (frac > 1.0f ? 1.0f : frac);
@@ -49,16 +90,53 @@ static void rt_mixer_seed_default(JceAudioMixer *m)
  * jce_fs_buffer_free).  Returns NULL on miss / over-size; *out_size set to the
  * byte length.  Shared by the device-free bus/sends/sidechain/snapshot apply
  * and the device-gated effect-attach pass so the file is read once. */
-static char *rt_mixer_read_config(const char *path, uint64_t *out_size)
+static char *rt_mixer_read_config(const JceRuntime *rt, const char *path,
+                                  uint64_t *out_size)
 {
 	if (out_size) *out_size = 0;
-	if (!path || !path[0]) return NULL;
+
+	/* A NULL path is the SHIPPED case, not "no config".  jce_default_main
+	 * only sets JceRuntimeDesc.mixer_config_path when the file exists ON THE
+	 * HOST -- so in a single-file exe, where the config is inside the PAK and
+	 * not on disk, the path arrives NULL and an early return here would make
+	 * the PAK branch below unreachable in exactly the configuration it exists
+	 * for.  Falling back to the cooked location lets the archive be asked.
+	 * Fixed HERE rather than at the caller because the runtime owns where its
+	 * own config lives, and the caller only knows what it could stat. */
+	if (!path || !path[0]) path = "Settings/audio_mixer.json";
+
+	/* Editor / dev: the live file on the host filesystem. */
 	uint64_t size = 0;
 	char *raw = (char *)jce_fs_host_read_all(path, &size);
-	if (!raw) return NULL;
-	if (size > (1u << 20)) { jce_fs_buffer_free(raw); return NULL; }
-	if (out_size) *out_size = size;
-	return raw;
+	if (raw) {
+		if (size > (1u << 20)) { jce_fs_buffer_free(raw); return NULL; }
+		if (out_size) *out_size = size;
+		return raw;
+	}
+
+	/* SHIPPED: the cooked copy inside the mounted PAK.  Without this a
+	 * single-file exe read nothing here and fell back to the default bus
+	 * tree -- no insert effects, and no aux sends either, both authored and
+	 * both silently absent in the only build a player ever runs.  Host first
+	 * so an editor edit stays live; PAK second so a packaged game finds it.
+	 * Same order and same reason as rt_script_read_file. */
+	if (!rt || !rt->pak) return NULL;
+	const JcePakAsset *a = jce_pak_find(rt->pak, path);
+	if (!a || a->original_size == 0 || a->original_size > (1u << 20))
+		return NULL;
+	/* The caller frees this with jce_fs_buffer_free, which is JCE_FREE, and
+	 * the host branch above allocates with JCE_MALLOC inside
+	 * jce_fs_host_read_all -- so both branches must hand back a pointer that
+	 * same free accepts.  jce_malloc/jce_free are those macros verbatim
+	 * (jce_alloc.c:9-22 is `return JCE_MALLOC(size);` and `JCE_FREE(ptr)`),
+	 * so the public pair is exact AND keeps the internal
+	 * engine/src/os/core/jce_memory.h out of the application layer. */
+	char *pbuf = (char *)jce_malloc((size_t)a->original_size);
+	if (!pbuf) return NULL;
+	size_t n = jce_pak_decompress(a, pbuf, (size_t)a->original_size);
+	if (n == 0) { jce_free(pbuf); return NULL; }
+	if (out_size) *out_size = (uint64_t)n;
+	return pbuf;
 }
 
 /* Device-gated effect-attach callback: each authored insert effect for a bus is
@@ -97,7 +175,7 @@ void rt_init_mixer(JceRuntime *rt, const char *config_path)
 	if (!rt->mixer) return;
 
 	uint64_t cfg_size = 0;
-	char *cfg = rt_mixer_read_config(config_path, &cfg_size);
+	char *cfg = rt_mixer_read_config(rt, config_path, &cfg_size);
 
 	/* 1. Device-free: bus tree + sends + sidechain + snapshots. */
 	bool applied = cfg && jce_audio_mixer_apply_config(rt->mixer, cfg,
@@ -112,6 +190,30 @@ void rt_init_mixer(JceRuntime *rt, const char *config_path)
 		if (ids[i] == JCE_AUDIO_BUS_MASTER) continue;
 		const char *nm = jce_audio_mixer_get_name(rt->mixer, ids[i]);
 		if (nm && nm[0]) jce_audio_bus_create(rt->audio, nm);
+	}
+
+	/* 2b. Device-gated: route the authored AUX SENDS.  Until this existed,
+	 * jce_audio_mixer_resolve_send had no caller anywhere outside its own
+	 * header and implementation: the editor authored sends, the config parser
+	 * read them back, the mixer modelled them -- and no audio moved, because
+	 * the device side had no parallel tap to send into.  Runs after the bus
+	 * mirror above so both endpoints exist. */
+	for (uint32_t i = 0; i < n; ++i) {
+		const char *src_nm = jce_audio_mixer_get_name(rt->mixer, ids[i]);
+		if (!src_nm || !src_nm[0]) continue;
+		uint32_t sends = jce_audio_mixer_send_count(rt->mixer, ids[i]);
+		for (uint32_t k = 0; k < sends; ++k) {
+			JceAudioBusId dest = 0;
+			if (!jce_audio_mixer_send_at(rt->mixer, ids[i], k, &dest, NULL))
+				continue;
+			const char *dst_nm = jce_audio_mixer_get_name(rt->mixer, dest);
+			if (!dst_nm || !dst_nm[0]) continue;
+			/* resolve_send, not the raw amount: it folds in the source bus's
+			 * own volume and returns 0 for a muted or solo-suppressed bus, so
+			 * a send obeys the same mute/solo the direct path does. */
+			float g = jce_audio_mixer_resolve_send(rt->mixer, ids[i], dest);
+			jce_audio_bus_set_send(rt->audio, src_nm, dst_nm, g);
+		}
 	}
 
 	/* 3. Device-gated: attach authored per-bus insert-effect chains to the
@@ -155,6 +257,21 @@ static void rt_apply_mixer(JceRuntime *rt, float dt)
 	/* FEATURE 5.2: advance any in-flight snapshot crossfade so authored bus
 	 * volumes interpolate before we push them to the device this frame. */
 	jce_audio_mixer_update(rt->mixer, dt);
+
+	/* FEATURE 5.2: advance every authored sidechain from the LIVE key level,
+	 * before the push below reads the duck gain back out.
+	 *
+	 * This is the head of the ducking chain and it was the missing half: the
+	 * tail (resolve_volume_ducked -> bus_set_volume) has always been here, so
+	 * the duck gain was applied every frame and was permanently 1.0 because
+	 * nothing advanced the follower.
+	 *
+	 * The peak it reads covers the audio blocks rendered since the last frame,
+	 * which carried the PREVIOUS frame's duck gain -- one frame of latency,
+	 * inherent to advancing a follower on the main thread and well inside the
+	 * shortest usable attack time. */
+	jce_audio_duck_pump(rt->audio, rt->mixer, dt);
+
 	JceAudioBusId ids[64];
 	uint32_t n = jce_audio_mixer_list_buses(rt->mixer, ids, 64);
 	for (uint32_t i = 0; i < n; ++i) {
@@ -212,26 +329,62 @@ static JceReverbPreset rt_reverb_preset_for(int preset)
  *
  * The component fields are Unity/EAX units (millibels, seconds, Hz, %); the
  * preset is normalised floats.  Conversions:
- *   room (mB, -10000..0)      -> wet_mix via the standard mB->linear curve
+ *   room + reverb (mB)        -> wet_mix via the standard mB->linear curve
+ *                                (EAX composes the master and late levels)
  *   decay_time (s)            -> decay_seconds (and a room_size hint)
  *   decay_hf_ratio + room_hf  -> damping (less HF persistence = more damping)
  *   diffusion/density (%)     -> diffusion/density (0..1)
  *   reflections/reverb delay  -> pre_delay_ms
  *   hf_reference (Hz)         -> lowpass_hz
- * Everything is clamped so a half-authored zone stays well-formed. */
+ * Everything is clamped so a half-authored zone stays well-formed.
+ *
+ *   reflections (mB)          -> early_mix, composed with `room` exactly the
+ *                                way `reverb` is for the late level
+ *   reflections_delay (s)     -> early_delay_ms
+ *
+ * `reflections` USED TO BE THE ONE FIELD NOT MAPPED, and the reason was
+ * true at the time: Freeverb is comb + allpass with no separate
+ * early-reflection stage, so there was nothing for that level to set.  There
+ * is one now -- one clean tap before the diffuse tail -- so the field arrives
+ * and the inspector's unread badge came off with it.  A badge that outlives
+ * its defect is the second lie. */
+/* Is this voice heard in 3D?
+ *
+ * TWO SITES have to agree: the per-frame push when the listener's gate
+ * changes, and the voice-start path.  They disagreed in the obvious first
+ * draft -- start honoured the gate, the push restored everything to 3D --
+ * which would have started panning a deliberately flat UI sound the first
+ * time someone toggled the listener.  One function so they cannot.
+ *
+ * The gate does not replace per-source intent: VoiceEntry.spatial still
+ * records what the AudioSource authored, and reopening restores it. */
+bool rt_voice_should_be_3d(bool listener_flat, bool voice_spatial)
+{
+	return !listener_flat && voice_spatial;
+}
+
 static float rt_clamp01(float v)
 {
 	return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-static JceReverbPreset rt_reverb_preset_from_user(
+JceReverbPreset rt_reverb_preset_from_user(
     const JceAudioReverbZoneComponent *rz)
 {
 	JceReverbPreset p;
 	memset(&p, 0, sizeof p);
 
-	/* millibels -> linear gain (0 mB = 1.0, -10000 mB ~= 0).  10^(mB/2000). */
-	float wet = powf(10.0f, rz->room / 2000.0f);
+	/* millibels -> linear gain (0 mB = 1.0, -10000 mB ~= 0).  10^(mB/2000).
+	 *
+	 * ROOM **PLUS REVERB**.  In EAX -- and in Unity's AudioReverbZone, which
+	 * these fields are copied from -- Room is the master room-effect level
+	 * and Reverb is the LATE level's offset from it; in millibels they add,
+	 * i.e. the linear gains multiply.  `reverb` was simply not read here, so
+	 * the one slider a sound designer reaches for to make a room's tail
+	 * louder moved a number in the scene file and nothing else.  At the
+	 * parser's defaults (-1000 and +200 mB) this takes the wet mix from
+	 * 0.316 to 0.398: the authored +200 arriving, not a regression. */
+	float wet = powf(10.0f, (rz->room + rz->reverb) / 2000.0f);
 	p.wet_mix       = rt_clamp01(wet);
 	p.dry_mix       = 1.0f;
 
@@ -252,10 +405,24 @@ static JceReverbPreset rt_reverb_preset_from_user(
 	p.diffusion     = rt_clamp01(rz->diffusion / 100.0f);
 	p.density       = rt_clamp01(rz->density   / 100.0f);
 
+	/* LATE pre-delay: EAX's reverbDelay is measured from the EARLY
+	 * reflection, so the tail starts at reflections_delay + reverb_delay.
+	 * That sum was already right; what was missing is that the first term is
+	 * also a time in its own right -- when the EARLY reflection arrives. */
 	float pre = (rz->reflections_delay + rz->reverb_delay) * 1000.0f;
 	if (pre < 0.0f)   pre = 0.0f;
 	if (pre > 300.0f) pre = 300.0f;
 	p.pre_delay_ms  = pre;
+
+	/* EARLY reflection, composed with `room` the same way the late level is
+	 * composed with `reverb`: in EAX both are offsets from the master room
+	 * level, so in millibels they add and the linear gains multiply. */
+	float early = powf(10.0f, (rz->room + rz->reflections) / 2000.0f);
+	p.early_mix = rt_clamp01(early);
+	float ed = rz->reflections_delay * 1000.0f;
+	if (ed < 0.0f)   ed = 0.0f;
+	if (ed > 300.0f) ed = 300.0f;
+	p.early_delay_ms = ed;
 
 	float lp = rz->hf_reference > 0.0f ? rz->hf_reference : 22050.0f;
 	if (lp < 100.0f)   lp = 100.0f;
@@ -372,6 +539,89 @@ static void rt_pick_audio_listener(JceScene *s, JceEntity e, void *ud)
  * world positions to every spatial voice so distance attenuation tracks
  * scene movement; and attenuate each spatial voice by physics occlusion
  * (sound is quieter when a collider blocks the listener→source path). */
+/* Velocity from two positions, or zero when there is no honest answer.
+ *
+ * TWO CASES RETURN ZERO ON PURPOSE, and both of them are the difference
+ * between Doppler working and Doppler being a bug report:
+ *
+ *   no previous position -- the first frame of a sound.  Differentiating
+ *       against an implicit origin reads a source 100 m out at 60 fps as
+ *       6000 m/s.
+ *   faster than sound -- a teleport: a scene load, a camera cut, a
+ *       respawn.  Nothing in a game moves at 340 m/s, and the Doppler model
+ *       itself divides by (c - v), so past c it does not merely exaggerate,
+ *       it inverts.  A cut is not motion and must not be heard as any.
+ */
+/* Gain from an authored volume-over-distance curve, or 1.0 when there is no
+ * curve to read.
+ *
+ * WHY A SEPARATE FACTOR rather than a fifth attenuation model: the analytic
+ * models live inside miniaudio's spatializer, which knows the listener and
+ * the source and applies its own distance law.  A curve cannot be expressed
+ * to it, so the curve has to be applied from out here -- and that only works
+ * because rt_spawn_audio_source sets the engine model to NONE for exactly
+ * these voices.  If both ran, a source would be attenuated twice.
+ *
+ * CHANNEL CHOICE is "volume" when the document has one, else channel 0.  A
+ * single-channel curve drawn in the editor has no name worth insisting on;
+ * a multi-channel one authored alongside other parameters does.
+ *
+ * OUT OF RANGE is clamped by jce_curve_eval itself (it holds the end keys),
+ * which is the right shape here: past max distance the author's last key is
+ * what they drew, and inventing a rolloff beyond it would be this function
+ * deciding something the author already answered.
+ *
+ * A CURVE THAT WILL NOT LOAD returns 1.0 and warns ONCE.  It does not return
+ * 0: silence is a legitimate thing to author, so a missing document must not
+ * be indistinguishable from a curve drawn at zero. */
+static float rt_audio_rolloff_gain(JceRuntime *rt, VoiceEntry *ve,
+                                   jce_vec3 listener, jce_vec3 source)
+{
+	if (!ve->rolloff_curve[0]) return 1.0f;
+
+	bool      owned = false;
+	JceCurve *c     = rt_curve_fetch(rt, ve->rolloff_curve, &owned);
+	if (!c) {
+		if (!ve->rolloff_warned) {
+			LOG_WARN("jce_runtime",
+			         "audio rolloff curve '%s' will not load; falling back to "
+			         "the analytic attenuation model for this voice",
+			         ve->rolloff_curve);
+			ve->rolloff_warned = true;
+		}
+		return 1.0f;
+	}
+
+	int ch = jce_curve_channel_index(c, "volume");
+	if (ch < 0) ch = 0;
+
+	const float dx = source.x - listener.x;
+	const float dy = source.y - listener.y;
+	const float dz = source.z - listener.z;
+	const float d  = sqrtf(dx * dx + dy * dy + dz * dz);
+
+	float g = jce_curve_eval(c, ch, d);
+	if (owned) jce_curve_destroy(c);
+
+	if (!(g >= 0.0f)) g = 0.0f;   /* also catches NaN */
+	if (g > 4.0f)     g = 4.0f;   /* a curve may boost, but not unboundedly */
+	return g;
+}
+
+jce_vec3 rt_audio_velocity(jce_vec3 now, jce_vec3 then, bool have_then,
+                           float dt)
+{
+    jce_vec3 v = { 0.0f, 0.0f, 0.0f };
+    if (!have_then || dt <= 0.0f) return v;
+    const float inv = 1.0f / dt;
+    v.x = (now.x - then.x) * inv;
+    v.y = (now.y - then.y) * inv;
+    v.z = (now.z - then.z) * inv;
+    const float sq = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (sq > (343.0f * 343.0f)) { v.x = v.y = v.z = 0.0f; }
+    return v;
+}
+
 void rt_update_audio_3d(JceRuntime *rt, float dt)
 {
 	if (!rt->audio || !rt->scene) return;
@@ -401,6 +651,16 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 		L.up[1]      = ctx.up.y;
 		L.up[2]      = ctx.up.z;
 	}
+	{
+		jce_vec3 lp; lp.x = L.position[0]; lp.y = L.position[1]; lp.z = L.position[2];
+		const jce_vec3 lv = rt_audio_velocity(lp, rt->listener_last_pos,
+		                                      rt->listener_has_last_pos, dt);
+		L.velocity[0] = lv.x;
+		L.velocity[1] = lv.y;
+		L.velocity[2] = lv.z;
+		rt->listener_last_pos     = lp;
+		rt->listener_has_last_pos = true;
+	}
 	jce_audio_set_listener(rt->audio, &L);
 
 	/* AudioListener component last-mile: when the scene authored an
@@ -410,7 +670,12 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 	 *   volume  -> master gain (paused forces it to 0)
 	 *   paused  -> mute the whole mix (master 0) without stopping voices
 	 *   doppler -> global Doppler scale
-	 * `spatialize` (HRTF toggle) has no public engine API yet -> followup. */
+	 *   spatialize -> gate over every voice's own `spatial` flag
+	 *
+	 * That last one carried a note saying it "has no public engine API yet";
+	 * jce_audio_voice_set_3d is public and the voice start path below has
+	 * been calling it all along, so the switch had somewhere to go for as
+	 * long as the note sat there. */
 	{
 		AudioListenerScan als = { NULL };
 		jce_scene_each_entity(rt->scene, rt_pick_audio_listener, &als);
@@ -422,6 +687,22 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 			float dop = als.lc->doppler_factor;
 			if (dop < 0.0f) dop = 0.0f;
 			jce_audio_set_doppler_factor(rt->audio, dop);
+			rt->listener_flat = !als.lc->spatialize;
+		} else {
+			/* No listener component: 3D as before. */
+			rt->listener_flat = false;
+		}
+
+		/* Push on CHANGE, restoring each voice to its OWN authored flag when
+		 * the gate reopens -- not to 3D, which would make a deliberately flat
+		 * UI sound start panning the first time someone toggled this. */
+		if (rt->listener_flat != rt->listener_flat_applied) {
+			for (int vi = 0; vi < rt->voice_count; ++vi)
+				jce_audio_voice_set_3d(rt->audio, rt->voices[vi].voice,
+				                       rt_voice_should_be_3d(
+				                           rt->listener_flat,
+				                           rt->voices[vi].spatial));
+			rt->listener_flat_applied = rt->listener_flat;
 		}
 	}
 
@@ -432,11 +713,38 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 	int                    occ_vidx[RT_MAX_OCC];
 	uint32_t               occ_n = 0;
 
+	const jce_vec3 lpos = jce_v3(L.position[0], L.position[1], L.position[2]);
+
 	for (int i = 0; i < rt->voice_count; ++i) {
 		if (!rt->voices[i].spatial) continue;
 		jce_vec3 wp = rt_world_position(rt->scene, rt->voices[i].entity);
 		jce_audio_voice_set_position(rt->audio, rt->voices[i].voice,
 		                              wp.x, wp.y, wp.z);
+		/* CUSTOM ROLLOFF.  Computed for every spatial voice, not only the
+		 * ones the occlusion pass gathers: occlusion is capped at RT_MAX_OCC
+		 * and skipped entirely without a physics world, and a curve that
+		 * stopped applying past the 65th voice -- or in a scene with no
+		 * physics -- would be the kind of gap that only shows up in the one
+		 * scene nobody profiles. */
+		rt->voices[i].rolloff_gain =
+		    rt_audio_rolloff_gain(rt, &rt->voices[i], lpos, wp);
+		if (rt->voices[i].rolloff_curve[0])
+			jce_audio_set_volume(rt->audio, rt->voices[i].voice,
+			                     rt->voices[i].base_volume
+			                         * rt->voices[i].rolloff_gain);
+		/* The other half of the Doppler pair.  jce_audio_voice_set_velocity
+		 * has been public since the feature landed and had NO caller
+		 * anywhere, so miniaudio's Doppler ratio was 1.0 no matter what the
+		 * authored factor said -- the factor was read, pushed to every live
+		 * sound every frame, and multiplied a velocity that was always zero. */
+		{
+			const jce_vec3 sv = rt_audio_velocity(wp, rt->voices[i].last_pos,
+			                                      rt->voices[i].has_last_pos, dt);
+			jce_audio_voice_set_velocity(rt->audio, rt->voices[i].voice,
+			                              sv.x, sv.y, sv.z);
+			rt->voices[i].last_pos     = wp;
+			rt->voices[i].has_last_pos = true;
+		}
 		if (occ_n < RT_MAX_OCC) {
 			occ_q[occ_n].source_position = wp;
 			occ_ids[occ_n]  = (uint64_t)rt->voices[i].voice;
@@ -451,17 +759,60 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 	   matching low-pass muffle.  The stateful tracker smooths per-source
 	   attenuation across frames to avoid the pops the stateless solver gave
 	   when a collider edge flickered in/out of the path. */
+	/* AUTHORED OCCLUSION PARAMETERS.
+	 *
+	 * The solve used jce_audio_occlusion_default_params() and nothing else,
+	 * so all five JceAudioOcclusionComponent fields were inert: a designer
+	 * could set a cutoff, an attenuation, a radius and a mask, and the audio
+	 * behaved identically.  The Inspector drew all five with NO unwired badge,
+	 * unlike the reverb zone beside it -- so it was silent about it too.
+	 *
+	 * The component is a PROBE: `radius` is "the sphere radius the probe
+	 * affects", so the probe that covers the LISTENER decides the parameters
+	 * for this tick.  A listener inside no probe gets the defaults, which is
+	 * every scene authored so far. */
+	JceAudioOcclusionParams occ_params = jce_audio_occlusion_default_params();
+	rt->occ_layer_mask = 0u;
+	/* Reset EVERY tick, before the gated block below.  Leaving it to the
+	 * occlusion path would keep the previous tick's value -- and on the first
+	 * tick the calloc'd 0, which would multiply the reverb wet mix to silence
+	 * in any scene with no spatial sources at all. */
+	rt->occ_reverb_scale = 1.0f;
+	if (rt->scene && occ_n > 0) {
+		RtOccProbePick pick = { rt, jce_v3(L.position[0], L.position[1],
+		                                   L.position[2]), NULL, 0.0f };
+		jce_scene_each_entity(rt->scene, rt_occ_probe_cb, &pick);
+		if (pick.best) {
+			const JceAudioOcclusionComponent *o = pick.best;
+			if (o->lowpass_cutoff_hz > 0.0f)
+				occ_params.min_lowpass_hz = o->lowpass_cutoff_hz;
+			/* attenuation_db is authored NEGATIVE (a cut).  dB -> linear. */
+			if (o->attenuation_db < 0.0f)
+				occ_params.min_direct_volume =
+				    powf(10.0f, o->attenuation_db / 20.0f);
+			if (o->layer_mask > 0)
+				rt->occ_layer_mask = (uint32_t)o->layer_mask;
+			rt->occ_affects_reverb = o->affects_reverb;
+		} else {
+			rt->occ_affects_reverb = false;
+		}
+	}
+
 	if (rt->physics && occ_n > 0) {
 		if (!rt->occ_tracker) {
 			rt->occ_tracker = jce_audio_occlusion_tracker_create(RT_MAX_OCC);
 			if (rt->occ_tracker) {
-				JceAudioOcclusionParams op =
-				    jce_audio_occlusion_default_params();
-				jce_audio_occlusion_tracker_set_params(rt->occ_tracker, &op);
+				jce_audio_occlusion_tracker_set_params(rt->occ_tracker,
+				                                       &occ_params);
 			}
 		}
 		jce_vec3 lp = jce_v3(L.position[0], L.position[1], L.position[2]);
 		if (rt->occ_tracker) {
+			/* Every tick, not only on create: the covering probe changes as
+			 * the listener moves, and a tracker created under one probe must
+			 * not keep its parameters after walking into another. */
+			jce_audio_occlusion_tracker_set_params(rt->occ_tracker,
+			                                       &occ_params);
 			jce_audio_occlusion_tracker_solve(rt->occ_tracker, lp, occ_ids,
 			                                  occ_q, occ_n,
 			                                  rt_occlusion_raycast, rt);
@@ -469,17 +820,27 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 		} else {
 			/* Allocation failed: fall back to the stateless solve so audio
 			 * still reacts to occlusion (just without temporal smoothing). */
-			JceAudioOcclusionParams op =
-			    jce_audio_occlusion_default_params();
-			jce_audio_occlusion_solve(&op, lp, occ_q, occ_n,
+			jce_audio_occlusion_solve(&occ_params, lp, occ_q, occ_n,
 			                          rt_occlusion_raycast, rt);
 		}
+		float occ_max = 0.0f;
 		for (uint32_t k = 0; k < occ_n; ++k) {
 			VoiceEntry *ve = &rt->voices[occ_vidx[k]];
+			/* Three factors, one authored level: the curve (1.0 when
+			 * there is none) and the occlusion solve both scale
+			 * base_volume and neither replaces it. */
 			jce_audio_set_volume(rt->audio, ve->voice,
-			                     ve->base_volume * occ_q[k].attenuation);
+			                     ve->base_volume * ve->rolloff_gain
+			                         * occ_q[k].attenuation);
 			jce_audio_set_lowpass(rt->audio, ve->voice, occ_q[k].lowpass_hz);
+			if (occ_q[k].occlusion > occ_max) occ_max = occ_q[k].occlusion;
 		}
+		/* AudioOcclusion.affects_reverb: "also dampens reverb send when
+		 * occluded".  The reverb node is global, so the strongest occlusion
+		 * this tick sets how much of the wet tail survives -- a listener
+		 * sealed off from every source should not still hear the room. */
+		rt->occ_reverb_scale = rt->occ_affects_reverb
+		                     ? (1.0f - rt_clamp01(occ_max)) : 1.0f;
 	}
 
 	/* ── Reverb zones: sample the blended preset at the listener and drive
@@ -491,7 +852,7 @@ void rt_update_audio_3d(JceRuntime *rt, float dt)
 		jce_reverb_zones_sample(rt->reverb_zones, lp, &blend);
 
 		JceAudioReverbParams rp;
-		rp.wet_mix       = blend.wet_mix;
+		rp.wet_mix       = blend.wet_mix * rt->occ_reverb_scale;
 		rp.dry_mix       = blend.dry_mix;
 		rp.decay_seconds = blend.decay_seconds;
 		rp.room_size     = blend.room_size;
@@ -525,10 +886,28 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
      * sound, it is a stopped one. */
     float vol   = as->volume >= 0.0f ? as->volume : 1.0f;
     float pitch = as->pitch  >  0.0f ? as->pitch  : 1.0f;
-    JceVoice v = jce_audio_play(rt->audio, snd, as->loop, vol, pitch);
-    bool spatial = (as->spatial_blend > 0.5f);
+    /* Played AT the authored priority, not promoted afterwards: the pool
+     * is consulted during ALLOCATION, so a source that plays at 0 and is
+     * raised a moment later can be refused -- or steal something more
+     * important -- before the setter ever runs.  The set below still
+     * happens, because a recycled slot would otherwise keep whatever the
+     * previous occupant was stamped with. */
+    JceVoice v = jce_audio_play_priority(rt->audio, snd, as->loop, vol,
+                                         pitch, as->priority);
+    /* CONTINUOUS now.  This read `spatial_blend > 0.5f` and handed the bool
+     * to jce_audio_voice_set_3d, so a float the inspector edits in 0.01 steps
+     * had exactly two reachable states: 0.0 and 0.49 were bit-identical, as
+     * were 0.51 and 1.0.  `spatial` stays as the "is this source spatial at
+     * all" question the attenuation and bus choices below still ask -- those
+     * are per-source decisions, not per-sample blending. */
+    bool spatial = (as->spatial_blend > 0.0f);
     if (spatial) {
-        jce_audio_voice_set_3d(rt->audio, v, true);
+        /* ...unless the listener's gate is closed.  VoiceEntry.spatial below
+         * still records `spatial`, so reopening the gate restores this voice
+         * to 3D; only what miniaudio is told right now is gated. */
+        jce_audio_voice_set_3d(rt->audio, v,
+                               rt_voice_should_be_3d(rt->listener_flat,
+                                                     spatial));
         jce_vec3 wp = rt_world_position(scene, e);
         jce_audio_voice_set_position(rt->audio, v, wp.x, wp.y, wp.z);
         /* 3D attenuation: authorable per-source (large-world audio); a 0 model
@@ -537,6 +916,13 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
         JceAudioAttenuation atten = JCE_AUDIO_ATTEN_INVERSE;
         if (as->attenuation_model > 0)
             atten = (JceAudioAttenuation)(as->attenuation_model - 1);
+        /* A CUSTOM ROLLOFF CURVE REPLACES THE ANALYTIC LAW, it does not stack
+         * with it.  miniaudio's spatializer applies its own distance
+         * attenuation inside the mix, and the curve is applied from
+         * rt_update_audio_3d out here -- leaving the model set would
+         * attenuate the source twice, and the author would be looking at a
+         * curve that describes half of what they hear. */
+        if (as->rolloff_curve[0]) atten = JCE_AUDIO_ATTEN_NONE;
         float a_min  = as->min_distance   > 0.0f ? as->min_distance   : 1.0f;
         float a_max  = as->max_distance   > 0.0f ? as->max_distance   : 25.0f;
         float a_roll = as->rolloff_factor > 0.0f ? as->rolloff_factor : 1.0f;
@@ -545,6 +931,9 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
     } else {
         jce_audio_voice_set_3d(rt->audio, v, false);
     }
+    /* The authored blend itself, after the 3D block: set_3d above is a plain
+     * on/off and this scales how far distance may attenuate. */
+    jce_audio_voice_set_spatial_blend(rt->audio, v, as->spatial_blend);
     const char *bus = rt_bus_for_source(rt, as, spatial);
     if (bus) jce_audio_voice_set_bus(rt->audio, v, bus);
 
@@ -556,6 +945,26 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
     rt->voices[rt->voice_count].spatial     = spatial;
     rt->voices[rt->voice_count].base_volume = vol;
     rt->voices[rt->voice_count].bus[0]      = '\0';
+    /* A RECYCLED SLOT MUST NOT INHERIT THE LAST SOUND'S POSITION.  Slots
+     * are reused as voices end, and every other field here is assigned,
+     * so a missing assignment is silent: the new sound would
+     * differentiate against wherever the previous occupant stood.  Three
+     * metres apart at 60 fps is 180 m/s -- UNDER the teleport clamp, so
+     * that guard would not catch it; it would simply be a wrong pitch on
+     * the frame a sound starts, in a scene where sounds start often. */
+    rt->voices[rt->voice_count].has_last_pos = false;
+    rt->voices[rt->voice_count].last_pos.x   = 0.0f;
+    rt->voices[rt->voice_count].last_pos.y   = 0.0f;
+    rt->voices[rt->voice_count].last_pos.z   = 0.0f;
+    /* CUSTOM ROLLOFF, and all three fields assigned for the reason the
+     * comment above gives: a recycled slot must inherit nothing.  A voice
+     * that kept the previous occupant's curve path would be attenuated by a
+     * curve drawn for a different sound. */
+    snprintf(rt->voices[rt->voice_count].rolloff_curve,
+             sizeof rt->voices[rt->voice_count].rolloff_curve,
+             "%s", as->rolloff_curve);
+    rt->voices[rt->voice_count].rolloff_warned = false;
+    rt->voices[rt->voice_count].rolloff_gain   = 1.0f;
     if (bus) {
         size_t bl = strlen(bus);
         if (bl >= sizeof(rt->voices[rt->voice_count].bus))
@@ -740,4 +1149,107 @@ void rt_audio_poll(JceRuntime *rt)
         if (p->task || !p->args) continue;      /* running, or nothing to run */
         if (rt_audio_submit(p)) ++live;
     }
+}
+
+/* ── AudioSource control (jce_runtime_audio_play / _stop / _is_playing) ──
+ *
+ * See the header.  An authored AudioSource sounded once, at spawn, and only
+ * with play_on_awake; these are the seam that lets gameplay drive it.
+ *
+ * rt_audio_source_start is the spawn walk's own body, minus the
+ * play_on_awake test -- factored rather than copied, because a second copy of
+ * "how to start an authored source" is how the attenuation block, the bus
+ * choice and the 0-volume rule would drift apart between the two paths. */
+bool rt_audio_source_start(JceRuntime *rt, JceScene *scene, JceEntity e)
+{
+    if (!rt || !rt->audio || !scene) return false;
+    if (!rt->pak && !rt->audio_load_fn) return false;
+
+    JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
+    if (!as || !as->clip_path[0]) return false;
+    if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_AUDIO_SOURCE))
+        return false;
+
+    /* STREAMING is a synchronous load by construction: there is nothing to
+     * decode off-thread, only the encoded bytes to fetch, so the async decode
+     * path below would be pure overhead.  This is the authored load_type
+     * reaching the engine -- without it the field would round-trip through
+     * JSON and the inspector and change nothing, which is the shape half this
+     * ledger is made of. */
+    if (as->load_type == 1) {
+        JceSound snd = jce_audio_load_streaming(rt->audio, rt->pak,
+                                                as->clip_path);
+        if (snd == JCE_SOUND_INVALID) {
+            jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                          "audio_source: streaming load failed for '%s'",
+                          as->clip_path);
+            return false;
+        }
+        rt_finish_audio_source(rt, scene, e, snd, as);
+        return true;
+    }
+
+    if (rt->audio_load_fn) {
+        /* Editor hook: synchronous handoff, same as the spawn walk. */
+        JceSound snd = rt->audio_load_fn(rt->user_data, rt->audio,
+                                         as->clip_path);
+        if (snd == JCE_SOUND_INVALID) {
+            jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                          "audio_source: failed to load '%s'", as->clip_path);
+            return false;
+        }
+        rt_finish_audio_source(rt, scene, e, snd, as);
+        return true;
+    }
+    rt_spawn_audio_async(rt, e, as);
+    return true;
+}
+
+/* Stop and forget every voice this entity's AudioSource started.
+ *
+ * The sound is unloaded with the voice: rt->voices owns the decoded clip (the
+ * spawn path uploads one per start), so leaving it would leak a buffer per
+ * retrigger -- and a retriggerable source is exactly what this API is for. */
+static int rt_audio_stop_entity(JceRuntime *rt, JceEntity e)
+{
+    if (!rt || !rt->audio) return 0;
+    int w = 0, stopped = 0;
+    for (int i = 0; i < rt->voice_count; ++i) {
+        if (rt->voices[i].entity == e) {
+            jce_audio_stop(rt->audio, rt->voices[i].voice);
+            jce_audio_unload(rt->audio, rt->voices[i].sound);
+            stopped++;
+            continue;                       /* dropped (not copied to w) */
+        }
+        if (w != i) rt->voices[w] = rt->voices[i];
+        w++;
+    }
+    rt->voice_count = w;
+    return stopped;
+}
+
+JCE_API bool JCE_CALL jce_runtime_audio_play(JceRuntime *rt, uint64_t entity)
+{
+    if (!rt || !rt->scene) return false;
+    /* RESTART, not overlay: Unity's Play() on a sounding source restarts it,
+     * and without this a script that fires on a repeating event stacks a new
+     * voice per call until the mixer runs out. */
+    (void)rt_audio_stop_entity(rt, (JceEntity)entity);
+    return rt_audio_source_start(rt, rt->scene, (JceEntity)entity);
+}
+
+JCE_API bool JCE_CALL jce_runtime_audio_stop(JceRuntime *rt, uint64_t entity)
+{
+    return rt_audio_stop_entity(rt, (JceEntity)entity) > 0;
+}
+
+JCE_API bool JCE_CALL jce_runtime_audio_is_playing(const JceRuntime *rt,
+                                                   uint64_t entity)
+{
+    if (!rt || !rt->audio) return false;
+    for (int i = 0; i < rt->voice_count; ++i)
+        if (rt->voices[i].entity == (JceEntity)entity &&
+            jce_audio_is_playing(rt->audio, rt->voices[i].voice))
+            return true;
+    return false;
 }

@@ -1,0 +1,7 @@
+    /* Order: the LANGUAGE first, then the module and its extension claim.
+     * jce_script_vm_register_extension() refuses a claim for a language that is
+     * not registered yet -- deliberately, so "backend not linked" never becomes
+     * "extension resolves to a VM that does not exist". */
+    if (jce_script_vm_cpp_register()) ++registered;
+    else LOG_ERROR(LOG_TAG, "cpp: register REFUSED — .jcecpp resolves to no "
+                            "language");

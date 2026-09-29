@@ -5,7 +5,8 @@
  * Surfaces:
  *   - New Project        (delegates to s_show_new_project)
  *   - Open Project...    (delegates to s_show_open_project)
- *   - Open Sample        (caged_kingdom inside engine tree, when present)
+ *   - Open Sample        (any directory holding a jce_project.json, probed
+ *                         from the cwd and its ancestors)
  *   - Recent projects    (read from JceEditorConfig.recent_projects)
  *
  * Style: minimal — reuses existing dialog flags + i18n keys where
@@ -44,28 +45,49 @@ struct WelcomeState {
 
 WelcomeState s_welcome;
 
-/* Probe a few likely locations for the bundled caged_kingdom sample.
- * Order: cwd/caged_kingdom, ../caged_kingdom (editor exe in build/),
- *        engine_workspace root + /caged_kingdom. */
+/* Probe for a bundled sample project: ANY directory holding a
+ * jce_project.json, searched one level down from the cwd and its ancestors
+ * (the editor exe usually lives a few levels inside build/).
+ *
+ * Until 2026-08-27 this spelled one game's directory name four times, so a
+ * checkout shipping a different sample found nothing and the Welcome dialog
+ * offered a sample that was not there.  jce_project.json is what MAKES a
+ * directory a project, so the marker is what gets looked for. */
+struct SampleProbe {
+    const char *root;
+    char       *out;
+    size_t      cap;
+    bool        found;
+};
+
+bool sample_probe_cb(const char *name, bool is_dir, void *user)
+{
+    SampleProbe *pr = (SampleProbe *)user;
+    if (!is_dir || !name || name[0] == '.') return true;
+
+    char dir[1024];
+    jce_path_join(dir, sizeof(dir), pr->root, name);
+
+    char manifest[1024];
+    jce_path_join(manifest, sizeof(manifest), dir, "jce_project.json");
+    if (!jce_fs_host_exists_file(manifest)) return true;
+
+    snprintf(pr->out, pr->cap, "%s", dir);
+    pr->found = true;
+    return false;   /* first hit wins */
+}
+
 void detect_sample(void)
 {
     if (s_welcome.sample_checked) return;
     s_welcome.sample_checked = true;
 
-    const char *candidates[] = {
-        "caged_kingdom",
-        "../caged_kingdom",
-        "../../caged_kingdom",
-        "../../../caged_kingdom",
-    };
-    for (const char *c : candidates) {
-        char manifest[1024];
-        jce_path_join(manifest, sizeof(manifest), c, "jce_project.json");
-        if (jce_fs_host_exists_file(manifest)) {
-            snprintf(s_welcome.sample_path,
-                     sizeof(s_welcome.sample_path), "%s", c);
-            return;
-        }
+    const char *roots[] = { ".", "..", "../..", "../../.." };
+    for (const char *r : roots) {
+        SampleProbe pr = { r, s_welcome.sample_path,
+                           sizeof(s_welcome.sample_path), false };
+        jce_fs_host_list_dir(r, sample_probe_cb, &pr);
+        if (pr.found) return;
     }
 }
 

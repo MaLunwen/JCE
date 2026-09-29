@@ -103,6 +103,29 @@ JCE_API bool jce_sprite_player_set_anim(JceSpritePlayer *p, const char *name);
 /* Advance animation by dt seconds. */
 JCE_API void jce_sprite_player_update(JceSpritePlayer *p, float dt, float speed);
 
+/*
+ * Loop policy for THIS player, overriding the atlas tag's own flag.
+ *
+ * Looping has been a property of the SHEET here: JceSpriteAnim.loop comes out
+ * of the Aseprite frameTag and jce_sprite_player_update reads it directly, so
+ * a caller holding a player had no way to say "play this one once".  That is
+ * why JceSpriteAnimatorComponent.loop -- authored, serialised, and drawn as a
+ * checkbox -- reached nothing: there was no door.
+ *
+ *   JCE_SPRITE_LOOP_FROM_ATLAS  the tag decides, which is what every player
+ *                               did before this and what one still does
+ *                               until someone calls this.
+ *   0                           play once, then hold the last frame
+ *   1                           loop
+ *
+ * Turning looping ON releases a player that has already finished, because the
+ * alternative is a switch that appears to do nothing until the animation is
+ * changed -- and "nothing happened" is indistinguishable from "not wired",
+ * which is the defect this exists to close.
+ */
+#define JCE_SPRITE_LOOP_FROM_ATLAS (-1)
+JCE_API void jce_sprite_player_set_loop(JceSpritePlayer *p, int loop);
+
 /* Get current frame's UV region (for rendering). */
 JCE_API const JceSpriteFrame *jce_sprite_player_current_frame(const JceSpritePlayer *p);
 JCE_API uint32_t              jce_sprite_player_current_index(const JceSpritePlayer *p);

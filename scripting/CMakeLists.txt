@@ -62,3 +62,10 @@ unset(_name)
 # ------------------------------------------------------------------ #
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEScriptingInstall.cmake")
 jce_scripting_register_sdk_install()
+
+# jce_script_enable() — the same function an SDK consumer gets, defined from
+# the SAME file.  Included here so an IN-TREE consumer (a sample project added
+# by add_subdirectory) writes the identical call; two spellings for one
+# question is how a project ends up with a branch that only ever ran in one of
+# the two worlds, which is the defect this function was added to end.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEScriptEnable.cmake")

@@ -236,6 +236,26 @@ int jce_input_sdl_translate(const void *platform_event,
         ev->wheel.y = e->wheel.y;
         break;
 
+    /* Composed text / IME commit.  Keycodes cannot express this: SDL delivers
+     * the composed UTF-8 only here, so a consumer that translates scancodes
+     * can never receive a non-ASCII character.  Truncation is safe -- the
+     * copy stops on a UTF-8 boundary and SDL_TextInputEvent.text is itself
+     * 32 bytes, so it does not happen in practice. */
+    case SDL_EVENT_TEXT_INPUT: {
+        if (!e->text.text || !e->text.text[0]) break;
+        ev = emit(out, max, &n, JCE_INPUT_EVENT_TEXT);
+        if (!ev) break;
+        size_t cap = sizeof(ev->text.utf8) - 1u;
+        size_t len = 0;
+        while (len < cap && e->text.text[len] != '\0') len++;
+        while (len > 0 &&
+               ((unsigned char)e->text.text[len] & 0xC0u) == 0x80u)
+            len--;                       /* never split a UTF-8 sequence */
+        memcpy(ev->text.utf8, e->text.text, len);
+        ev->text.utf8[len] = '\0';
+        break;
+    }
+
     /* Touch */
     case SDL_EVENT_FINGER_DOWN:
     case SDL_EVENT_FINGER_MOTION:
@@ -1158,7 +1178,7 @@ const JceInputBackend *jce_input_sdl_backend(void)
  * its own -- and these two are the escape hatch that lets it.
  *
  * They live here because this is the one input TU allowed to name SDL
- * (scripts/lint/check_input_seam.py), and because both are covers over SDL's
+ * (tools/lint/check_input_seam.py), and because both are covers over SDL's
  * own database rather than a second one of ours.
  *
  * WHAT THIS ADDS OVER CALLING SDL DIRECTLY IS THE LOG LINE.  SDL fails quietly

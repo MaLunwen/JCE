@@ -1,0 +1,17 @@
+{
+  "schema": 3,
+  "name": "SnakeSeven",
+  "version": "0.1.0",
+  "target": "SnakeSeven",
+  "exe": "SnakeSeven.exe",
+  "startup_scene": "scenes/snake.scene.json",
+  "source_assets": "resources",
+  "generated_by": "jce automation project.create",
+  "script_modules": [
+    "native/build/snake_cpp.dll",
+    "native/build/snake_c.dll"
+  ],
+  "script_assemblies": [
+    "build/win32-x86_64/csharp/SnakeScripts.dll"
+  ]
+}

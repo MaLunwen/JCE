@@ -9,6 +9,7 @@
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_args.h>
 #include <jce/application/jce_engine.h>
+#include "jce_engine_frame_cap.h"
 #include <jce/application/jce_lifecycle.h>
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_fixed_clock.h>
@@ -254,6 +255,38 @@ static void jce_select_config_path(char *out_path, size_t out_size)
     snprintf(out_path, out_size, "%s.config/jce.ini", base ? base : "");
 }
 
+
+bool jce_engine_forget_resolved_backend(void)
+{
+    char      cfg_path[512];
+    JceConfig cfg = jce_config_defaults();
+
+    jce_select_config_path(cfg_path, sizeof(cfg_path));
+    jce_config_load(&cfg, cfg_path);
+
+    /* Already undecided: nothing to do, and rewriting the file to say the same
+     * thing would look like a change to anyone watching mtimes. */
+    if (cfg.renderer_backend_resolved == JCE_BACKEND_AUTO)
+        return true;
+
+    {
+        /* Read the name BEFORE clearing it -- the first cut logged the field
+         * after the assignment and would have reported "Auto is still
+         * remembered". */
+        const char *was =
+            jce_renderer_backend_name(cfg.renderer_backend_resolved);
+        cfg.renderer_backend_resolved = JCE_BACKEND_AUTO;
+        if (!jce_config_save(&cfg, cfg_path)) {
+            LOG_WARN(LOG_TAG, "renderer: could not rewrite %s, so %s is still "
+                     "remembered", cfg_path, was);
+            return false;
+        }
+        LOG_INFO(LOG_TAG, "renderer: forgot %s; the next launch will walk the "
+                 "platform chain again", was);
+    }
+    return true;
+}
+
 /* QW-input-actions — locate the project action-map authored by the editor. */
 static void jce_select_input_actions_path(char *out_path, size_t out_size)
 {
@@ -348,6 +381,12 @@ static void engine_lifecycle_listener(JceLifecycleEvent event, void *user)
 
 struct JceEngine {
     JceConfig        config;
+    /* The window.title the CONFIG FILE carried, before g_app_desc.name
+     * overrode it below.  jce_config_save() writes the whole file, so without
+     * this the first save replaces the user's authored title with the
+     * application's own name -- turning a setting the engine merely ignored
+     * into one it silently overwrites. */
+    char             configured_window_title[128];
     JceGpuCaps       gpu_caps;
     bool             headless;        /* dedicated-server: no window/GPU/audio/UI */
     bool             hidden_window;   /* real GPU device, window never mapped */
@@ -372,6 +411,12 @@ struct JceEngine {
     SDL_IOStream                *kpi_asset_log;
     uint64_t                    kpi_asset_frame_index;
     uint32_t                    kpi_asset_frame_limit;
+    /* Per-frame ALL-PHASE table (JCE_KPI_FRAME_LOG).  The asset log above is
+     * one column; this is every registered phase, which is what a frame-budget
+     * gate needs and what nothing could produce outside the editor. */
+    SDL_IOStream                *kpi_frame_log;
+    uint64_t                    kpi_frame_index;
+    uint32_t                    kpi_frame_limit;
 
     /* Headless / CI auto-quit: when JCE_MAX_FRAMES is set, the engine emits
      * WILL_QUIT and exits cleanly after that many rendered frames.  0 (the
@@ -512,6 +557,20 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     /* Logger + crash handler + config. */
     jce_log_init();
+    /* Optional log-file sink. A shipped game is a windowed (WIN32-subsystem)
+     * process with no console, so stdout is detached and every log line the
+     * engine writes goes nowhere -- there is no way to ask a player, or an
+     * automated acceptance run, what a bundle actually did. The editor has
+     * honoured JCE_LOG_FILE for exactly this reason since it grew a headless
+     * capture path; the engine never did, so the facility existed for one of
+     * the two binaries that need it. Set it HERE, immediately after
+     * jce_log_init() and before any subsystem logs, or the renderer and
+     * scene-load lines -- the ones worth reading -- are the ones that are
+     * lost. */
+    {
+        const char *log_file = SDL_getenv("JCE_LOG_FILE");
+        if (log_file && log_file[0]) jce_log_set_file(log_file);
+    }
     jce_log_set_thread_name("MAIN");
     jce_thread_mark_main();
     {
@@ -544,13 +603,55 @@ JceEngine *jce_engine_create(int argc, char *argv[])
      * the first jce_thread_pool_shared() consumer. */
     jce_config_publish_perf(e->config.machine_class, e->config.job_workers);
 
-    /* Apply renderer backend override from editor (or other host). */
+    /* Apply renderer backend override from editor (or other host).  Keep what
+     * the CONFIG asked for first: the line below reports three separate
+     * inputs, and this assignment used to make two of them the same value --
+     * whenever a host override was present, `policy=` printed the override
+     * rather than the file's policy, which is exactly the confusion the line
+     * exists to end. */
+    const JceRendererBackend config_policy = e->config.renderer_backend;
     if (g_renderer_backend_override >= 0)
         e->config.renderer_backend = (JceRendererBackend)g_renderer_backend_override;
+
+    /* AUTO means "decide for me", and on every launch after the first that
+     * decision is already made: start at the backend the ladder picked last
+     * time instead of walking it again.  jce_renderer_create() still falls
+     * through the full platform chain if this one fails, so a remembered
+     * backend is a starting point and never a lock -- a machine that loses its
+     * Vulkan driver still boots, and the record is rewritten below. */
+    /* Three inputs decide which backend is asked for, they live in three
+     * different files, and when the answer is surprising there was previously
+     * no way to tell which one won.  Say all three.  This line is what turned
+     * "why did AUTO pick OpenGL?" into one run: host-override=OpenGL, from
+     * ~/.jce/editor-preferences.json, which is nowhere near the repo. */
+    LOG_INFO(LOG_TAG,
+             "renderer: policy=%s remembered=%s host-override=%s",
+             jce_renderer_backend_name(config_policy),
+             jce_renderer_backend_name(e->config.renderer_backend_resolved),
+             g_renderer_backend_override >= 0
+                 ? jce_renderer_backend_name(
+                       (JceRendererBackend)g_renderer_backend_override)
+                 : "none");
+
+    /* Whether the ladder is ours to run -- and therefore whether its answer is
+     * ours to remember.  Sampled BEFORE the remembered backend is substituted
+     * in below, because after that renderer_backend is no longer AUTO. */
+    const bool policy_was_auto =
+        (e->config.renderer_backend == JCE_BACKEND_AUTO);
+
+    if (e->config.renderer_backend == JCE_BACKEND_AUTO &&
+        e->config.renderer_backend_resolved != JCE_BACKEND_AUTO) {
+        e->config.renderer_backend = e->config.renderer_backend_resolved;
+        LOG_INFO(LOG_TAG, "renderer: starting at the remembered backend %s "
+                 "(select Auto to decide again)",
+                 jce_renderer_backend_name(e->config.renderer_backend_resolved));
+    }
 
     jce_log_set_level((JceLogLevel)e->config.log_level);
     jce_log_set_colors(e->config.log_colors);
 
+    SDL_strlcpy(e->configured_window_title, e->config.window_title,
+                sizeof(e->configured_window_title));
     if (g_app_desc_set && g_app_desc.name && g_app_desc.name[0])
         SDL_strlcpy(e->config.window_title, g_app_desc.name,
                      sizeof(e->config.window_title));
@@ -793,15 +894,64 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* Headless: no window at all (dedicated server).  e->window stays NULL;
      * every windowed path below is guarded on e->headless. */
     if (!e->headless) {
+        int win_w = e->config.window_width;
+        int win_h = e->config.window_height;
+        const bool want_max = e->config.maximized ||
+                              (g_app_desc_set && g_app_desc.maximized);
+
+        /* A HIDDEN window cannot maximise -- there is no mapping to maximise
+         * against -- so it silently fell back to the configured default size
+         * and rendered at a different resolution from the same run made
+         * visible.  Measured: 2560x1494 visible, 1600x900 hidden, one build,
+         * one scene.  For a capture harness that is not cosmetic: a fixed
+         * pixel region then measures different content depending on whether
+         * the window was mapped, which turns "hide it so it does not steal
+         * focus" into a change to the PICTURE.
+         *
+         * So ask the display what a maximised window would have got.  The
+         * usable bounds exclude the taskbar, which is what maximising does.
+         * If the query fails -- no display, a headless session -- the
+         * configured size stands, which is the behaviour this had before. */
+        if (e->hidden_window && want_max) {
+            SDL_Rect usable;
+            if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) &&
+                usable.w > 0 && usable.h > 0) {
+                win_w = usable.w;
+                win_h = usable.h;
+                LOG_INFO(LOG_TAG,
+                         "hidden window sized to the primary display's usable "
+                         "bounds (%dx%d) -- a hidden window cannot maximise",
+                         win_w, win_h);
+            }
+        }
+
         JceWindowConfig win_cfg = {
             .title     = e->config.window_title,
-            .logical_w = e->config.window_width,
-            .logical_h = e->config.window_height,
+            .logical_w = win_w,
+            .logical_h = win_h,
             .flags     = (e->config.resizable  ? JCE_WINDOW_RESIZABLE  : 0)
                        | (e->config.fullscreen ? JCE_WINDOW_FULLSCREEN : 0)
-                       | (e->config.maximized  ? JCE_WINDOW_MAXIMIZED  : 0)
-                       | (g_app_desc_set && g_app_desc.maximized ? JCE_WINDOW_MAXIMIZED : 0)
+                       /* Not while hidden: the flag does nothing there, and
+                        * the explicit size above is what replaces it. */
+                       | ((want_max && !e->hidden_window) ? JCE_WINDOW_MAXIMIZED : 0)
                        | (e->hidden_window ? JCE_WINDOW_HIDDEN : 0)
+                       /* GL-capable whenever GL is a POSSIBLE outcome, which
+                        * includes AUTO: the renderer's context ladder can only
+                        * build on a window SDL gave a pixel format, and AUTO
+                        * reaching OpenGL is the common path on Linux, where the
+                        * chain is Vulkan then GL.  Restricting this to an
+                        * explicitly chosen GL backend left exactly those users
+                        * pinned to the build floor.
+                        *
+                        * An explicitly chosen D3D / Vulkan / Metal run still
+                        * gets the window it always had.  Measured that the flag
+                        * is harmless where it does apply: D3D12, D3D11 and
+                        * Vulkan each initialise with 0 fatals on a window that
+                        * SDL has set a GL pixel format on. */
+                       | ((e->config.renderer_backend == JCE_BACKEND_AUTO ||
+                           e->config.renderer_backend == JCE_BACKEND_OPENGL ||
+                           e->config.renderer_backend == JCE_BACKEND_OPENGLES)
+                              ? JCE_WINDOW_OPENGL : 0)
         };
         e->window = jce_window_create(&win_cfg);
         if (!e->window) {
@@ -848,6 +998,50 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         if (!e->renderer) {
             fatal_msg("Fallback renderer init failed");
             goto fail;
+        }
+    }
+
+    /* Record what the LADDER chose, so the next launch starts there.
+     *
+     * Only when the choice was actually AUTO's to make.  An explicit backend --
+     * from renderer.backend, from the editor's preference, from JCE_BACKEND --
+     * is the user telling us the answer, and filing it as "what this machine
+     * resolved to" would hand it back to them later as if a probe had found it.
+     * Measured: without this guard, a run whose editor preference said OpenGL
+     * wrote renderer.backend_resolved = opengl, and the ladder had never run.
+     *
+     * Only when it CHANGED, so a boot that decides nothing new does not rewrite
+     * the user's file.  And never the SDL fallback: that is what running with
+     * no usable backend looks like, not a decision, and remembering it would
+     * make a machine that recovers its driver keep limping.
+     *
+     * The saved copy keeps the POLICY the file was loaded with.  e->config's
+     * renderer_backend has by now been overwritten by whatever host override
+     * was in force, and persisting that would turn a transient
+     * --backend/editor choice into the permanent contents of renderer.backend. */
+    if (!jce_renderer_is_fallback(e->renderer) && policy_was_auto) {
+        const JceRendererBackend active = jce_renderer_get_active_backend();
+        if (active != JCE_BACKEND_AUTO &&
+            active != e->config.renderer_backend_resolved) {
+            char      cfg_path[512];
+            JceConfig saved = e->config;
+            saved.renderer_backend          = JCE_BACKEND_AUTO;
+            saved.renderer_backend_resolved = active;
+            /* Persist what the FILE said, not what the app substituted. */
+            SDL_strlcpy(saved.window_title, e->configured_window_title,
+                        sizeof(saved.window_title));
+            e->config.renderer_backend_resolved = active;
+            jce_select_config_path(cfg_path, sizeof(cfg_path));
+            if (jce_config_save(&saved, cfg_path)) {
+                LOG_INFO(LOG_TAG,
+                         "renderer: the backend ladder chose %s; remembered as "
+                         "this machine's default (renderer.backend_resolved in "
+                         "%s)", jce_renderer_backend_name(active), cfg_path);
+            } else {
+                LOG_WARN(LOG_TAG,
+                         "renderer: could not write %s, so the ladder will run "
+                         "again on every launch", cfg_path);
+            }
         }
     }
 
@@ -1067,6 +1261,38 @@ headless_after_renderer:;
                 LOG_INFO(LOG_TAG, "asset KPI capture enabled -> %s", asset_kpi_path);
             } else {
                 LOG_WARN(LOG_TAG, "failed to open asset KPI log: %s", asset_kpi_path);
+            }
+        }
+
+        /* Per-frame ALL-PHASE table, LONG format (frame_index,phase,ms).
+         *
+         * Long and not one-column-per-phase, deliberately: phase slots register
+         * on FIRST USE, so a wide header written at open time cannot name the
+         * phases that have not run yet (shadow phases on a scene with no
+         * caster, foliage on a scene with none), and a header written later
+         * would mean rewriting the file.  Long format costs rows and buys a
+         * file whose meaning does not depend on when it was opened.
+         *
+         * Needs no new engine API: jce_perf_phase_frame_tick / _count /
+         * _peek_frame are already public and the player loop already rotates
+         * the snapshot every frame. */
+        const char *frame_kpi_path = SDL_getenv("JCE_KPI_FRAME_LOG");
+        if (frame_kpi_path && frame_kpi_path[0]) {
+            e->kpi_frame_log = SDL_IOFromFile(frame_kpi_path, "w");
+            if (e->kpi_frame_log) {
+                e->kpi_frame_limit =
+                    read_positive_u32_env("JCE_KPI_FRAME_COUNT", 0u);
+                static const char fhdr[] = "frame_index,phase,ms\n";
+                SDL_WriteIO(e->kpi_frame_log, fhdr, sizeof(fhdr) - 1);
+                SDL_FlushIO(e->kpi_frame_log);
+                /* The accumulator is a no-op until enabled, and a capture that
+                 * silently recorded zeros would be worse than no capture. */
+                jce_perf_phase_set_enabled(1);
+                LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s",
+                         frame_kpi_path);
+            } else {
+                LOG_WARN(LOG_TAG, "cannot open frame KPI log '%s'",
+                         frame_kpi_path);
             }
         }
     }
@@ -1450,6 +1676,11 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 
 /* -- Per-frame ----------------------------------------------------- */
 
+/* Defined below with the rest of the frame-cap state; declared here because
+ * iterate calls it and C would otherwise take an implicit int-returning
+ * declaration -- which is a hard error on clang 15+ and GCC 14. */
+static void engine_frame_cap_wait(void);
+
 JceAppResult jce_engine_iterate(JceEngine *e)
 {
     /* Whole-iterate stopwatch. wall_dt measures start-of-frame to
@@ -1461,6 +1692,22 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     const uint64_t _t0_iter = jce_time_perf_counter();
     jce_view_bands_begin_frame();   /* view-id ownership guard */
     JCE_PROFILE_ZONE_N("Frame");
+
+    /* DEVICE LOST, ON THE MAIN THREAD.
+     *
+     * The signal is BGFX_FATAL_DEVICE_LOST, which bgfx delivers to its fatal
+     * callback on the RENDER thread (every platform but macOS, which forces
+     * single-threaded mode to dodge a CAMetalLayer deadlock).  Every
+     * lifecycle listener is written against the main-thread contract, and the
+     * renderer may not include this layer's header anyway, so the callback
+     * records and this polls.
+     *
+     * Before this, JCE_LIFECYCLE_DEVICE_LOST had ZERO emitters: registering
+     * for it succeeded and the callback was dead code.  The SDL event of that
+     * name is an SDL_Render event and this engine only creates an SDL_Renderer
+     * in the safe-mode software fallback -- see jce_lifecycle.h. */
+    if (jce_renderer_take_device_lost())
+        jce_lifecycle_emit(JCE_LIFECYCLE_DEVICE_LOST);
 
     float dt = JCE_DEFAULT_FRAME_DT;
     float wall_dt = JCE_DEFAULT_FRAME_DT;
@@ -1687,6 +1934,28 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * never answered it outside the editor, and its wording made the silence
      * look like a finding. */
     if (jce_perf_phase_enabled()) jce_perf_phase_frame_tick();
+
+    /* Snapshot just rotated: write the frame that ENDED.  Emitting here rather
+     * than at end-of-frame is what makes every row a complete frame -- the
+     * hitch reporter twenty lines up reads the same snapshot for the same
+     * reason. */
+    if (e->kpi_frame_log &&
+        (e->kpi_frame_limit == 0u || e->kpi_frame_index < e->kpi_frame_limit)) {
+        if (jce_perf_phase_frame_has_data()) {
+            const int np = jce_perf_phase_count();
+            for (int i = 0; i < np; i++) {
+                const char *nm = NULL;
+                double ms = 0.0;
+                if (!jce_perf_phase_peek_frame(i, &nm, &ms) || !nm) continue;
+                char row[160];
+                int n = snprintf(row, sizeof(row), "%llu,%s,%.4f\n",
+                                 (unsigned long long)e->kpi_frame_index, nm, ms);
+                if (n > 0) SDL_WriteIO(e->kpi_frame_log, row, (size_t)n);
+            }
+        }
+        e->kpi_frame_index++;
+        if ((e->kpi_frame_index % 60u) == 0u) SDL_FlushIO(e->kpi_frame_log);
+    }
 
     /* ── PlayerLoop: INITIALIZATION / EARLY_UPDATE ──────────────────
      * Initialization runs before any per-frame work; EarlyUpdate is
@@ -2236,6 +2505,9 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         }
     }
 
+    /* Last thing in the frame: hold the loop to the authored cap. */
+    engine_frame_cap_wait();
+
     return JCE_APP_CONTINUE;
 }
 
@@ -2288,6 +2560,11 @@ void jce_engine_destroy(JceEngine *e)
 
     if (e->event_bus) jce_event_bus_destroy(e->event_bus);
 
+    if (e->kpi_frame_log) {
+        SDL_FlushIO(e->kpi_frame_log);
+        SDL_CloseIO(e->kpi_frame_log);
+        e->kpi_frame_log = NULL;
+    }
     if (e->kpi_asset_log) {
         SDL_FlushIO(e->kpi_asset_log);
         SDL_CloseIO(e->kpi_asset_log);
@@ -2390,6 +2667,83 @@ void jce_engine_destroy(JceEngine *e)
 }
 
 /* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */
+
+/* ── Frame-rate cap ───────────────────────────────────────────────────
+ * See jce_engine.h.  s_frame_cap.fps is the only state; the deadline lives in a
+ * static beside it so a change to the cap takes effect on the next frame
+ * without a discontinuity. */
+/* ONE object, not two statics: the pair is a single concept and they must be
+ * written together -- changing the rate without clearing the deadline leaves
+ * the next frame measured against the old grid, which is a one-frame stall or
+ * a one-frame sprint exactly when the player changed the setting. */
+static struct {
+    int      fps;        /* <= 0 == uncapped */
+    uint64_t deadline;   /* perf-counter ticks; 0 == unset */
+} s_frame_cap = { 0, 0 };
+
+void jce_engine_set_target_fps(int fps)
+{
+    if (fps < 0) fps = 0;
+    if (fps != s_frame_cap.fps) {
+        s_frame_cap.fps     = fps;
+        s_frame_cap.deadline = 0;               /* re-anchor on the next frame */
+    }
+}
+
+int jce_engine_get_target_fps(void) { return s_frame_cap.fps; }
+
+/* The POLICY.  Pure, and the only half that can be wrong in an interesting
+ * way -- see jce_engine_frame_cap.h for the three cases and why each is what
+ * it is.  Kept out of the sleep so a test can reach it without a window, a
+ * renderer, or this machine's scheduler. */
+uint64_t jce_engine_frame_cap_advance(uint64_t now, uint64_t budget,
+                                      uint64_t *deadline)
+{
+    if (!deadline || budget == 0) return 0;
+
+    if (*deadline == 0 || now >= *deadline + budget) {
+        *deadline = now + budget;           /* unset, or overran: re-anchor */
+        return 0;
+    }
+    if (now >= *deadline) {                 /* late, but inside one budget */
+        *deadline += budget;
+        return 0;
+    }
+    const uint64_t wait_until = *deadline;
+    *deadline += budget;
+    return wait_until;
+}
+
+/* The WAIT.  Called at the very end of jce_engine_iterate, after present, so
+ * the sleep is the only thing between two frames' work. */
+static void engine_frame_cap_wait(void)
+{
+    const int fps = s_frame_cap.fps;
+    if (fps <= 0) return;
+
+    const uint64_t freq = jce_time_perf_freq();
+    if (freq == 0) return;                  /* no clock: never stall the loop */
+
+    const uint64_t budget = freq / (uint64_t)fps;
+    const uint64_t until  = jce_engine_frame_cap_advance(
+        jce_time_perf_counter(), budget, &s_frame_cap.deadline);
+    if (until == 0) return;
+
+    /* Sleep the bulk, spin the tail.  The OS timer's granularity is about a
+     * millisecond, so sleeping the whole remainder lands late every frame and
+     * a 60 cap reads as 57; spinning the whole remainder would burn the CPU
+     * this exists to save. */
+    const uint64_t spin_ticks = freq / 2000u;              /* ~0.5 ms */
+    const uint64_t now        = jce_time_perf_counter();
+    if (now < until) {
+        const uint64_t left = until - now;
+        if (left > spin_ticks) {
+            const uint32_t ms = (uint32_t)(((left - spin_ticks) * 1000u) / freq);
+            if (ms > 0) jce_thread_sleep_ms(ms);
+        }
+        while (jce_time_perf_counter() < until) { /* tail spin */ }
+    }
+}
 
 void jce_engine_set_fixed_hz(double hz)
 {

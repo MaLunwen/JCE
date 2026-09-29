@@ -854,7 +854,7 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
                        (uint16_t)pass->width,
                        (uint16_t)pass->height);
     bgfx_set_view_clear(pass->view_id,
-                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                         0x000000FF, 1.0f, 0);
     bgfx_set_view_transform(pass->view_id, view.raw[0], proj.raw[0]);
     bgfx_set_view_frame_buffer(pass->view_id, pass->fbo);

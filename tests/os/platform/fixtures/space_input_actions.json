@@ -1,0 +1,180 @@
+{
+  "actions": [
+    {
+      "name": "space_begin",
+      "binds": [
+        {
+          "type": 0,
+          "code": 44,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_pause",
+      "binds": [
+        {
+          "type": 0,
+          "code": 19,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_detail",
+      "binds": [
+        {
+          "type": 0,
+          "code": 7,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_replay",
+      "binds": [
+        {
+          "type": 0,
+          "code": 21,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_speed_down",
+      "binds": [
+        {
+          "type": 0,
+          "code": 47,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_speed_up",
+      "binds": [
+        {
+          "type": 0,
+          "code": 48,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_seek_back",
+      "binds": [
+        {
+          "type": 0,
+          "code": 80,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_seek_forward",
+      "binds": [
+        {
+          "type": 0,
+          "code": 79,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_prev_phase",
+      "binds": [
+        {
+          "type": 0,
+          "code": 54,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_next_phase",
+      "binds": [
+        {
+          "type": 0,
+          "code": 55,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_arch_1",
+      "binds": [
+        {
+          "type": 0,
+          "code": 30,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_arch_2",
+      "binds": [
+        {
+          "type": 0,
+          "code": 31,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_arch_3",
+      "binds": [
+        {
+          "type": 0,
+          "code": 32,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_arch_4",
+      "binds": [
+        {
+          "type": 0,
+          "code": 33,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_toggle_ui",
+      "binds": [
+        {
+          "type": 0,
+          "code": 11,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    },
+    {
+      "name": "space_lang",
+      "binds": [
+        {
+          "type": 0,
+          "code": 15,
+          "scale": 1.0,
+          "deadzone": 0.0
+        }
+      ]
+    }
+  ]
+}

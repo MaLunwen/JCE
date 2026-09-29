@@ -97,6 +97,30 @@ typedef struct JceConfig {
     bool        gfx_fog;                /* default: false */
     int         gfx_shadow_quality;     /* 0..2, default: 1 */
     int         gfx_msaa;               /* 1/2/4/8, default: 1 */
+
+    /* APPENDED AT THE END, not next to renderer_backend where it reads
+     * better.  check_abi_snapshot rejected that: inserting at index 7 shifts
+     * `vsync` and every field after it, so an SDK consumer compiled against
+     * the old header silently reads the wrong member for the rest of the
+     * struct.  Ordered-prefix means new fields go last, always.
+     *
+     * What AUTO actually resolved to, the first time it ran on this machine.
+     *
+     * renderer_backend is the POLICY ("decide for me"); this is the ANSWER.
+     * Keeping them apart is the point: overwriting the policy with the answer
+     * would mean a machine that later grows a Vulkan driver never re-decides,
+     * and the user would have no way to tell a probed choice from one they
+     * made themselves.
+     *
+     * On the first launch this is AUTO, so the engine walks the platform chain
+     * from the most modern backend to the most compatible one and records what
+     * won.  Later launches start at the recorded backend instead of re-walking
+     * -- and if it fails, the full chain still runs and this is updated.  So it
+     * is a remembered default, never a lock.
+     *
+     * Selecting Auto explicitly clears it, which is how a user asks for the
+     * decision to be made again. */
+    JceRendererBackend renderer_backend_resolved; /* default: AUTO = undecided */
 } JceConfig;
 
 typedef enum JceMachineClass {

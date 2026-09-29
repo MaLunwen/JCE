@@ -27,6 +27,19 @@ JCE_EXTERN_C_BEGIN
 
 typedef struct JceTerrain JceTerrain;
 
+/* Sample a world-space surface below/around a scatter candidate.  Return false
+ * to reject the candidate (for example, when it falls outside every terrain).
+ * `out_world_y` is required.  When `want_normal` is true, write a finite
+ * world-space normal to `out_world_normal`; the scatter normalizes it before
+ * slope testing and instance output.  The callback must not consume random
+ * state: deterministic placement remains owned by the scatter. */
+typedef bool (*JceFoliageSurfaceSampleFn)(void *user,
+                                          float world_x,
+                                          float world_z,
+                                          bool want_normal,
+                                          float *out_world_y,
+                                          float out_world_normal[3]);
+
 /* One scattered instance in world space. */
 typedef struct {
     float pos[3];     /* world position (Y from terrain when present) */
@@ -151,6 +164,12 @@ JCE_API bool jce_foliage_cook(const JceFoliageInstance *instances, uint32_t coun
 JCE_API uint32_t jce_foliage_cooked_count(const void *data, size_t size);
 JCE_API uint32_t jce_foliage_cooked_seed(const void *data, size_t size);
 
+/* Full container validation: magic/version/stride, bounded payload length and
+ * integrity hash.  Unlike the metadata accessors this also accepts a valid
+ * zero-instance placement, which is useful when a bake intentionally removes
+ * every candidate. */
+JCE_API bool jce_foliage_cooked_validate(const void *data, size_t size);
+
 /* Load into `out` (capacity `out_cap`), returning the number written.
  *
  * Returns 0 -- writing nothing -- for a wrong magic or version, a mismatched
@@ -172,6 +191,20 @@ JCE_API uint32_t jce_foliage_scatter(const JceFoliageScatterParams *params,
                                      const jce_vec3                *origin,
                                      JceFoliageInstance            *out,
                                      uint32_t                       out_cap);
+
+/* World-space scatter over an arbitrary sampled surface.  Candidate XZ,
+ * altitude bands, slope tests and output transforms are all world-space.
+ * A NULL sampler is equivalent to flat placement at origin->y.  This is the
+ * renderer-facing path for transformed/tiled terrains and also supports
+ * project-defined procedural surfaces without coupling foliage to a scene or
+ * physics implementation. */
+JCE_API uint32_t jce_foliage_scatter_on_surface(
+    const JceFoliageScatterParams *params,
+    JceFoliageSurfaceSampleFn sample_surface,
+    void *surface_user,
+    const jce_vec3 *origin,
+    JceFoliageInstance *out,
+    uint32_t out_cap);
 
 JCE_EXTERN_C_END
 

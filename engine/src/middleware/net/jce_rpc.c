@@ -496,10 +496,10 @@ void jce_rpc_handle_packet(const void *data, uint32_t size)
 /* (declared `extern` at the call site in jce_rpc_send.) */
 
 /* ================================================================== */
-/* Built-in self-test (debug builds only)                              */
+/* Built-in self-test (present when JCE_SELF_TESTS is defined)         */
 /* ================================================================== */
-#ifndef NDEBUG
-#include <assert.h>
+#ifdef JCE_SELF_TESTS
+#include <jce/os/core/jce_assert.h>
 
 static int g_st_server_rpc_calls;
 static int g_st_client_rpc_calls;
@@ -553,16 +553,16 @@ void jce_rpc_self_test(void)
     cli.handler = st_client_handler;
     jce_rpc_register(&cli);
 
-    assert(jce_rpc_registered_count() == 2);
-    assert(find_entry("selftest.server_rpc") != NULL);
-    assert(find_entry("selftest.client_rpc") != NULL);
+    JCE_ASSERT(jce_rpc_registered_count() == 2);
+    JCE_ASSERT(find_entry("selftest.server_rpc") != NULL);
+    JCE_ASSERT(find_entry("selftest.client_rpc") != NULL);
 
     /* Spawn an object owned by client 1. */
     JceNetObjectDesc d;
     memset(&d, 0, sizeof(d));
     d.owner = (JceClientId)1;
     JceNetObjectId id = jce_net_object_spawn(&d);
-    assert(id != JCE_NET_OBJECT_INVALID);
+    JCE_ASSERT(id != JCE_NET_OBJECT_INVALID);
 
     /* --- Case 1: client 1 sends a ServerRpc, server handler fires. -- */
     g_st_server_rpc_calls = 0;
@@ -577,15 +577,15 @@ void jce_rpc_self_test(void)
                                       JCE_RPC_RELIABLE,
                                       payload, (uint32_t)sizeof(payload),
                                       &pkt_size);
-        assert(pkt && pkt_size > 1);
+        JCE_ASSERT(pkt && pkt_size > 1);
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_server_rpc_calls == 1);
-    assert(g_st_last_sender == 1);
-    assert(g_st_last_payload_size == 5);
-    assert(memcmp(g_st_last_payload, "ping", 5) == 0);
-    assert(jce_rpc_rejected_authority() == 0);
+    JCE_ASSERT(g_st_server_rpc_calls == 1);
+    JCE_ASSERT(g_st_last_sender == 1);
+    JCE_ASSERT(g_st_last_payload_size == 5);
+    JCE_ASSERT(memcmp(g_st_last_payload, "ping", 5) == 0);
+    JCE_ASSERT(jce_rpc_rejected_authority() == 0);
 
     /* --- Case 2: client 2 tries the same RPC, server drops + counts. - */
     g_st_server_rpc_calls = 0;
@@ -597,12 +597,12 @@ void jce_rpc_self_test(void)
                                       /*specific_client=*/0,
                                       JCE_RPC_RELIABLE,
                                       NULL, 0u, &pkt_size);
-        assert(pkt && pkt_size > 0);
+        JCE_ASSERT(pkt && pkt_size > 0);
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_server_rpc_calls == 0);
-    assert(jce_rpc_rejected_authority() == 1);
+    JCE_ASSERT(g_st_server_rpc_calls == 0);
+    JCE_ASSERT(jce_rpc_rejected_authority() == 1);
 
     /* --- Case 3: server broadcasts ClientRpc to all clients, but we    *
      *             are the server — broadcast packets only fire on       *
@@ -618,11 +618,11 @@ void jce_rpc_self_test(void)
                                       /*specific_client=*/0,
                                       JCE_RPC_UNRELIABLE,
                                       NULL, 0u, &pkt_size);
-        assert(pkt && pkt_size > 0);
+        JCE_ASSERT(pkt && pkt_size > 0);
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_client_rpc_calls == 1);
+    JCE_ASSERT(g_st_client_rpc_calls == 1);
 
     /* TO_OWNER → only client 1 (current local id) should fire. */
     g_st_client_rpc_calls = 0;
@@ -636,7 +636,7 @@ void jce_rpc_self_test(void)
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_client_rpc_calls == 1);
+    JCE_ASSERT(g_st_client_rpc_calls == 1);
 
     /* TO_NOT_OWNER on client 1 (the owner) → drop. */
     g_st_client_rpc_calls = 0;
@@ -650,7 +650,7 @@ void jce_rpc_self_test(void)
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_client_rpc_calls == 0);
+    JCE_ASSERT(g_st_client_rpc_calls == 0);
 
     /* TO_CLIENT_ID matching local — fires. */
     g_st_client_rpc_calls = 0;
@@ -665,7 +665,7 @@ void jce_rpc_self_test(void)
         jce_rpc_handle_packet(pkt, pkt_size);
         JCE_FREE(pkt);
     }
-    assert(g_st_client_rpc_calls == 1);
+    JCE_ASSERT(g_st_client_rpc_calls == 1);
 
     /* Restore + tear down. */
     jce_net_replication_set_role(JCE_NET_ROLE_SERVER);
@@ -676,4 +676,4 @@ void jce_rpc_self_test(void)
     jce_rpc_shutdown();
     jce_net_replication_shutdown();
 }
-#endif /* NDEBUG */
+#endif /* JCE_SELF_TESTS */

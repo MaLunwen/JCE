@@ -80,6 +80,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from jce_determinism import DETERMINISM, assert_has_content   # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from render_parity import read_png          # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -96,19 +99,9 @@ MASK_BANDS = [
     (0,   1560, 2560, 1600),
 ]
 
-# The settings that make a capture repeat. Anything a caller passes wins, so a
-# comparison can deliberately vary one of them.
-DETERMINISM = {
-    "JCE_FRAME_DT_FIXED": "0.016666",
-    "JCE_STREAM_SYNC": "1",
-    # Pin the TAA jitter. The Halton phase advances per viewport render, and
-    # the editor spends a variable number of frames loading, so two runs of
-    # one build photograph the scene at different sub-pixel offsets. That is
-    # the whole of this scene's bimodal floor: 3.2587% of pixels over
-    # threshold, max delta 500, and a mean local gradient of 45.67 on the
-    # differing pixels against 9.41 on the rest -- edges only.
-    "JCE_TAA_JITTER_PHASE": "0",
-}
+# The capture-determinism recipe is single-sourced in jce_determinism.py.
+# It used to live here, which is why render_parity.py -- the sanctioned
+# cross-backend instrument -- had none of it.
 
 # Pose lock. JCE_BENCH_CAM rewrites the viewport pose every frame, so the
 # capture no longer needs the spin trick to be deterministic -- and the spin
@@ -155,37 +148,7 @@ def compare_masked(img_a, img_b, step=2, crop=None):
     return (sum_abs / 3.0) / max(tot, 1), 100.0 * over / max(tot, 1), max_d, tot
 
 
-def assert_has_content(img, path):
-    """Reject a capture that has nothing in it.
-
-    A blank viewport compares EQUAL to another blank viewport, so "0.00000%
-    difference" is not evidence of correctness -- it is also what you get when
-    neither run drew anything. This tool reported exactly that three times: the
-    capture fired on spin step 250 while the scene needed ~320 frames to come
-    up, so both sides photographed an empty viewport at a uniform RGB(30,30,30)
-    and the gate passed vacuously.
-
-    So every capture is checked for content before it is compared. A near-zero
-    spread over the 3D area means the frame is uniform -- empty, or black.
-    """
-    w, h, c, px = img
-    lo, hi, tot, s_ = 255, 0, 0, 0
-    for y in range(300, min(h, 1100), 7):
-        r0 = y * w * c
-        for x in range(100, min(w, 1500), 7):
-            i = r0 + x * c
-            v = (px[i] + px[i + 1] + px[i + 2]) // 3
-            lo = min(lo, v); hi = max(hi, v); s_ += v; tot += 1
-    mean = s_ / max(tot, 1)
-    if hi - lo < 12:
-        raise RuntimeError(
-            "%s has no content: the 3D area spans only %d..%d (mean %.1f). A "
-            "uniform frame compares equal to any other uniform frame, so this "
-            "capture cannot verify anything. Capture later, or check that the "
-            "scene actually renders." % (path, lo, hi, mean))
-    return mean
-
-
+# assert_has_content is single-sourced in jce_determinism.py.
 def _editor_alive():
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq jce_editor.exe", "/NH"],
                          capture_output=True, text=True).stdout
@@ -218,7 +181,13 @@ def capture(env_over, out_png, frames, log_path):
     # Capture LATE. The scene has to be up before the shot is worth anything.
     env.setdefault("JCE_WINCAP_FRAME", str(max(1, frames - 40)))
     env["JCE_MAX_FRAMES"] = str(frames)
-    env["JCE_PERF_LOG"] = str(log_path)
+    # JCE_PERF_LOG is a BOOLEAN enable -- the engine only tests
+    # `perf_env[0] != '0'` (jce_engine.c:519).  The destination is
+    # JCE_LOG_FILE.  Putting the path in JCE_PERF_LOG enables logging and
+    # writes it somewhere else; perf_bench.py:92 records the same trap and
+    # the run it once made look empty.  Same recipe here.
+    env["JCE_PERF_LOG"] = "1"
+    env["JCE_LOG_FILE"] = str(log_path)
     subprocess.run([str(EXE)], env=env, cwd=str(ROOT),
                    capture_output=True, text=True, timeout=1800)
     if not out_png.exists():

@@ -140,12 +140,49 @@ void jce_nav_agent_set_navmesh(JceNavAgentSet *s, JceNavMesh *nm)
     }
 }
 
+bool jce_nav_agent_report_fit(float agent_height, float mesh_clearance)
+{
+    if (jce_nav_agent_fits(agent_height, mesh_clearance)) return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LOG_WARN(LOG_TAG,
+                 "nav: agent height %.2f m exceeds the %.2f m clearance this "
+                 "navmesh was baked for; it will walk under geometry it does "
+                 "not fit under", (double)agent_height,
+                 (double)mesh_clearance);
+    }
+    return false;
+}
+
+/* An agent joining a set that holds a GRID mesh is checked here; the Recast
+ * path is checked by the runtime, which is the side that holds that mesh.
+ * Both go through the one report above. */
+static void nav_check_fit(const JceNavAgentSet *set, const JceNavAgentDesc *d)
+{
+    if (!set || !set->navmesh || !d) return;
+    (void)jce_nav_agent_report_fit(d->height,
+                                   jce_navmesh_agent_height(set->navmesh));
+}
+
+bool jce_nav_agent_fits(float agent_height, float mesh_clearance)
+{
+    if (agent_height  <= 0.0f) return true;   /* the agent has no opinion */
+    if (mesh_clearance <= 0.0f) return true;  /* the mesh has none either */
+    return agent_height <= mesh_clearance;
+}
+
 JceNavAgentHandle jce_nav_agent_add(JceNavAgentSet *s,
                                       const JceNavAgentDesc *d)
 {
     if (!s || !d) return JCE_NAV_AGENT_INVALID;
     uint32_t idx = 0;
     if (!find_free_slot(s, &idx)) return JCE_NAV_AGENT_INVALID;
+
+    /* Before the agent joins, not after: the point is to say WHY it will walk
+     * through things, and a message that arrives once it is already steering
+     * reads as a symptom rather than the cause. */
+    nav_check_fit(s, d);
 
     Agent *a = &s->agents[idx];
     memset(a, 0, sizeof(*a));

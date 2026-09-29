@@ -30,17 +30,37 @@ extern "C" {
 #include <cstring>
 #include <vector>
 
+extern "C" {
+#include <jce/resource/jce_curve.h>
+}
+
 namespace {
 
-enum InterpMode { IM_LINEAR = 0, IM_CUBIC = 1, IM_CONSTANT = 2 };
-
-struct Key {
-    float t;
-    float v;
-    float tan_in   = 0.0f;
-    float tan_out  = 0.0f;
-    int   interp   = IM_LINEAR;
+/* The interpolation modes and the key layout are the ENGINE'S, so the number
+ * this panel writes into the file and the number the evaluator switches on
+ * are one symbol rather than two that happen to agree today. */
+enum InterpMode {
+    IM_LINEAR   = JCE_CURVE_LINEAR,
+    IM_CUBIC    = JCE_CURVE_CUBIC,
+    IM_CONSTANT = JCE_CURVE_CONSTANT
 };
+
+/* A C struct has no member initialisers, so the defaults the panel relied on
+ * move to make_curve_key().  Every construction site goes through it.
+ * Named for the curve on purpose: jce_gizmo_compound_collider.cpp has an
+ * anonymous-namespace function of the same short name that builds a CACHE
+ * KEY STRING.  Two unrelated meanings under one name is what the dedup
+ * audit is for, and internal linkage does not make it less confusing. */
+typedef JceCurveKey Key;
+
+inline Key make_curve_key(float t = 0.0f, float v = 0.0f, int interp = IM_LINEAR)
+{
+    Key k;
+    k.t = t; k.v = v;
+    k.tan_in = 0.0f; k.tan_out = 0.0f;
+    k.interp = interp;
+    return k;
+}
 
 struct Channel {
     char  name[32]   = "curve";
@@ -70,9 +90,9 @@ void seed_default(void)
     s.initialised = true;
     Channel ch;
     std::strncpy(ch.name, "value", sizeof(ch.name) - 1);
-    Key a; a.t = 0.0f; a.v = 0.0f; a.interp = IM_CUBIC;
-    Key b; b.t = 0.5f; b.v = 1.0f; b.interp = IM_CUBIC;
-    Key c; c.t = 1.0f; c.v = 0.0f;
+    Key a = make_curve_key(0.0f, 0.0f, IM_CUBIC);
+    Key b = make_curve_key(0.5f, 1.0f, IM_CUBIC);
+    Key c = make_curve_key(1.0f, 0.0f);
     ch.keys = { a, b, c };
     s.channels.push_back(ch);
 }
@@ -110,31 +130,15 @@ JceJson *channel_to_json(const Channel &ch)
     return o;
 }
 
-void channel_from_json(JceJson *o, Channel &ch)
+/* The AUTHORING extras only.  The keys and the channel name come from
+ * jce_curve_parse -- see load_curve.  What is left here is what the engine's
+ * JceCurve deliberately does not carry: how the curve LOOKS in this panel,
+ * which is not part of the function that was authored. */
+void channel_extras_from_json(JceJson *o, Channel &ch)
 {
-    const char *nm = jce_json_get_string(o, "name", "curve");
-    std::strncpy(ch.name, nm ? nm : "curve", sizeof(ch.name) - 1);
-    ch.name[sizeof(ch.name) - 1] = 0;
+    if (!o) return;
     ch.visible = jce_json_get_bool(o, "visible", true) != 0;
-    int got = 0; (void)got;
     jce_json_get_floats(o, "color", ch.color, 3, nullptr);
-    ch.keys.clear();
-    JceJson *arr = jce_json_get(o, "keys");
-    if (arr && jce_json_is_array(arr)) {
-        int n = jce_json_array_size(arr);
-        for (int i = 0; i < n; ++i) {
-            JceJson *ko = jce_json_array_at(arr, i);
-            if (!ko) continue;
-            Key k;
-            k.t       = (float)jce_json_get_number(ko, "t",      0.0);
-            k.v       = (float)jce_json_get_number(ko, "v",      0.0);
-            k.tan_in  = (float)jce_json_get_number(ko, "tanIn",  0.0);
-            k.tan_out = (float)jce_json_get_number(ko, "tanOut", 0.0);
-            k.interp  =        jce_json_get_int   (ko, "interp", IM_LINEAR);
-            ch.keys.push_back(k);
-        }
-    }
-    sort_keys(ch);
 }
 
 void save_curve(const char *path)
@@ -165,9 +169,22 @@ void load_curve(const char *path)
             "curve load failed: %s", path);
         return;
     }
-    JceJson *root = jce_json_parse(buf, sz);
+    /* ONE KEY READER.  jce_curve_parse owns t/v/tanIn/tanOut/interp, the
+     * out-of-range interp clamp, the key sort and the pre-channels
+     * back-compat -- so the curve this panel EDITS is parsed by the same code
+     * that parses the curve a game PLAYS.  The JSON pass beside it reads only
+     * what the engine's JceCurve does not carry: the view range and each
+     * channel's appearance. */
+    JceCurve *eng  = jce_curve_parse(buf, sz);
+    JceJson  *root = jce_json_parse(buf, sz);
     ED_FREE(buf);
-    if (!root) return;
+    if (!eng || !root) {
+        if (eng)  jce_curve_destroy(eng);
+        if (root) jce_json_free(root);
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "curve load failed (not a curve document): %s", path);
+        return;
+    }
     s.t_min  = (float)jce_json_get_number(root, "tMin", 0.0);
     s.t_max  = (float)jce_json_get_number(root, "tMax", 1.0);
     s.v_min  = (float)jce_json_get_number(root, "vMin", 0.0);
@@ -175,22 +192,28 @@ void load_curve(const char *path)
     s.active = jce_json_get_int(root, "active", 0);
     s.channels.clear();
     JceJson *chans = jce_json_get(root, "channels");
-    if (chans && jce_json_is_array(chans)) {
-        int n = jce_json_array_size(chans);
-        for (int i = 0; i < n; ++i) {
-            JceJson *o = jce_json_array_at(chans, i);
-            if (!o) continue;
-            Channel ch;
-            channel_from_json(o, ch);
-            s.channels.push_back(ch);
-        }
-    } else {
-        /* Phase-A/B back-compat: top-level "keys" → wrap into channel 0. */
+    /* No "channels" array means a pre-channels document; the engine wrapped
+     * its top-level keys into channel 0, so the extras live on the root. */
+    const bool wrapped = !(chans && jce_json_is_array(chans));
+    const int  n       = jce_curve_channel_count(eng);
+    for (int i = 0; i < n; ++i) {
         Channel ch;
-        std::strncpy(ch.name, "value", sizeof(ch.name) - 1);
-        channel_from_json(root, ch);
+        const char *nm = jce_curve_channel_name(eng, i);
+        if (nm && nm[0]) {
+            std::strncpy(ch.name, nm, sizeof(ch.name) - 1);
+            ch.name[sizeof(ch.name) - 1] = 0;
+        }
+        const JceCurveKey *k  = jce_curve_channel_keys(eng, i);
+        const int          kn = jce_curve_key_count(eng, i);
+        if (k && kn > 0) ch.keys.assign(k, k + kn);
+        /* Index correspondence is the parser's contract: it emits one channel
+         * per array element even for a malformed one, so extras never slide
+         * onto the wrong curve. */
+        channel_extras_from_json(wrapped ? root : jce_json_array_at(chans, i),
+                                 ch);
         s.channels.push_back(ch);
     }
+    jce_curve_destroy(eng);
     if (s.channels.empty()) seed_default();
     if (s.active < 0 || s.active >= (int)s.channels.size()) s.active = 0;
     jce_json_free(root);
@@ -199,36 +222,14 @@ void load_curve(const char *path)
                            path, (int)s.channels.size());
 }
 
+/* ONE EVALUATOR.  The body that used to live here is now
+ * jce_curve_eval_keys in engine/src/resource/jce_curve.c, and the runtime
+ * calls the same function -- so what this panel DRAWS is what a game PLAYS,
+ * by construction rather than by two people keeping two copies in step. */
 float eval_channel(const Channel &ch, float t)
 {
-    if (ch.keys.empty()) return 0.0f;
-    if (t <= ch.keys.front().t) return ch.keys.front().v;
-    if (t >= ch.keys.back().t)  return ch.keys.back().v;
-    for (size_t i = 1; i < ch.keys.size(); ++i) {
-        if (t <= ch.keys[i].t) {
-            const Key &a = ch.keys[i - 1];
-            const Key &b = ch.keys[i];
-            float h = b.t - a.t;
-            if (h <= 0.0f) return b.v;
-            float u = (t - a.t) / h;
-            switch (a.interp) {
-                case IM_CONSTANT: return a.v;
-                case IM_CUBIC: {
-                    float u2 = u * u, u3 = u2 * u;
-                    float h00 =  2.0f * u3 - 3.0f * u2 + 1.0f;
-                    float h10 =         u3 - 2.0f * u2 + u;
-                    float h01 = -2.0f * u3 + 3.0f * u2;
-                    float h11 =         u3 -        u2;
-                    return h00 * a.v + h10 * h * a.tan_out +
-                           h01 * b.v + h11 * h * b.tan_in;
-                }
-                case IM_LINEAR:
-                default:
-                    return a.v + (b.v - a.v) * u;
-            }
-        }
-    }
-    return ch.keys.back().v;
+    return jce_curve_eval_keys(ch.keys.empty() ? nullptr : ch.keys.data(),
+                               (int)ch.keys.size(), t);
 }
 
 ImVec2 to_screen(ImVec2 p0, ImVec2 sz, float t, float v)
@@ -439,7 +440,7 @@ void draw_canvas(void)
             } else {
                 float t, v;
                 to_curve_space(p0, sz, m, &t, &v);
-                Key k; k.t = t; k.v = v; k.interp = IM_CUBIC;
+                Key k = make_curve_key(t, v, IM_CUBIC);
                 act->keys.push_back(k);
                 sort_keys(*act);
                 for (size_t i = 0; i < act->keys.size(); ++i) {
@@ -548,8 +549,8 @@ void draw_channel_panel(void)
         ch.color[0] = palette[pi][0];
         ch.color[1] = palette[pi][1];
         ch.color[2] = palette[pi][2];
-        Key a; a.t = 0.0f; a.v = 0.0f;
-        Key b; b.t = 1.0f; b.v = 0.0f;
+        Key a = make_curve_key(0.0f, 0.0f);
+        Key b = make_curve_key(1.0f, 0.0f);
         ch.keys = { a, b };
         s.channels.push_back(ch);
         s.active = (int)s.channels.size() - 1;
@@ -607,8 +608,8 @@ void draw_content(void)
     if (ImGui::Button(jce_editor_i18n_id("curveEditor.button.clear", "ce_clr"))) {
         for (auto &ch : s.channels) {
             ch.keys.clear();
-            Key a; a.t = 0.0f; a.v = 0.0f;
-            Key b; b.t = 1.0f; b.v = 0.0f;
+            Key a = make_curve_key(0.0f, 0.0f);
+            Key b = make_curve_key(1.0f, 0.0f);
             ch.keys = { a, b };
         }
         s.selected = -1;

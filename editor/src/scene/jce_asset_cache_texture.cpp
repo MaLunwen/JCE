@@ -4,6 +4,8 @@
 
 #include "jce_asset_cache_internal.h"
 
+#include <jce/os/core/jce_filesystem.h>   /* jce_fs_host_get_mtime */
+
 /* ── Texture asset path detection ───────────────────────────────── */
 
 bool looks_like_texture_asset_path(const char *path)
@@ -176,6 +178,9 @@ static void texture_async_worker_main(void *arg)
             if (resolve_texture_path_for_material(material_path,
                                                   mesh_path,
                                                   resolved_path, sizeof(resolved_path))) {
+                result.resolved_path = resolved_path;
+                if (!jce_fs_host_get_mtime(resolved_path, &result.resolved_mtime))
+                    result.resolved_mtime = 0;
                 result.success = decode_texture_rgba_path(resolved_path,
                                                           &result.rgba,
                                                           &result.width,
@@ -184,6 +189,9 @@ static void texture_async_worker_main(void *arg)
                 result.success = false;
             }
         } else {
+            result.resolved_path = req.file_path;
+            if (!jce_fs_host_get_mtime(req.file_path.c_str(), &result.resolved_mtime))
+                result.resolved_mtime = 0;
             result.success = decode_texture_rgba_path(req.file_path.c_str(),
                                                       &result.rgba,
                                                       &result.width,
@@ -298,9 +306,13 @@ static AsyncFinalizeAction texture_finalize_result(TextureLoadResult &res,
      * its UV by the layer tile scale, so a clamped sampler returns the edge
      * texel for everything past the first tile -- which renders as horizontal
      * streaks across the whole surface rather than as a tiled ground. */
+    /* The colour space, read back off the key that requested it -- one
+     * source, so the upload and the lookup cannot disagree. */
+    const int tex_mode = JCE_TEX_WRAP
+        | (asset_cache_key_is_srgb(res.key.c_str()) ? JCE_TEX_SRGB : 0);
     JceTexture tex = jce_texture_from_rgba_ex(res.rgba.data(),
                                               res.width, res.height,
-                                              JCE_TEX_WRAP);
+                                              tex_mode);
 
     if (!jce_texture_valid(tex)) {
         s_cache.tex_cache[idx].failed = true;
@@ -323,7 +335,67 @@ static AsyncFinalizeAction texture_finalize_result(TextureLoadResult &res,
     s_cache.tex_cache[idx].tex_from_asset_manager = false;
     s_cache.tex_cache[idx].warned_missing = false;
     s_cache.tex_cache[idx].failed = false;
+    snprintf(s_cache.tex_cache[idx].file, sizeof(s_cache.tex_cache[idx].file),
+             "%s", res.resolved_path.c_str());
+    s_cache.tex_cache[idx].file_mtime = res.resolved_mtime;
     return ASYNC_FINALIZE_APPLIED;
+}
+
+/* ── External edits ─────────────────────────────────────────────────
+ *
+ * A designer saves a texture from another program and expects the viewport to
+ * show it.  Nothing in this cache noticed: entries are keyed by path and
+ * nothing ever removed one, so the old image stayed on screen until the editor
+ * was restarted.  (The navmesh beside it has reloaded on mtime for a while --
+ * jce_scene_render_draw.cpp:1493 -- so the asymmetry was within one folder.)
+ *
+ * A ROUND-ROBIN SLICE, not a full scan.  Stat is a syscall; doing 256 of them
+ * every frame to catch an edit that happens once a minute is the wrong trade.
+ * TEX_POLL_PER_FRAME entries per frame walks the whole cache in about four
+ * seconds at 60 Hz, which is faster than alt-tabbing back from an image
+ * editor, and costs a handful of stats a frame.
+ *
+ * Only entries this cache DECODED FROM A FILE are polled: `file` is empty for
+ * asset-manager (PAK) textures, whose bytes do not come from a loose file at
+ * all, and for entries that never resolved.
+ *
+ * The entry is not reloaded here -- it is INVALIDATED, and the next
+ * asset_cache_get_texture re-requests through the normal async path.  Loading
+ * on the main thread to save a frame is how a hot reload becomes a hitch. */
+enum { TEX_POLL_PER_FRAME = 4 };
+
+void texture_poll_disk_changes(void)
+{
+    if (!s_cache.initialized || s_cache.tex_cache_count <= 0)
+        return;
+
+    static int s_cursor = 0;
+    const int n = s_cache.tex_cache_count;
+    for (int step = 0; step < TEX_POLL_PER_FRAME && step < n; ++step) {
+        if (s_cursor >= n) s_cursor = 0;
+        TextureCacheEntry *e = &s_cache.tex_cache[s_cursor++];
+        if (e->file[0] == '\0' || e->requested)
+            continue;
+
+        int64_t now = 0;
+        if (!jce_fs_host_get_mtime(e->file, &now))
+            continue;              /* deleted or unreadable: keep what we have */
+        if (now == e->file_mtime)
+            continue;
+
+        LOG_INFO(LOG_TAG, "texture changed on disk, reloading: %s", e->file);
+        e->file_mtime = now;
+        if (jce_texture_valid(e->tex) && !e->tex_from_asset_manager)
+            jce_texture_destroy(e->tex);
+        e->tex = tex_invalid();
+        e->failed = false;         /* a fixed file must get another chance */
+        e->warned_missing = false;
+        if (s_cache.assets && asset_handle_valid(e->asset_handle)) {
+            jce_asset_release(s_cache.assets, e->asset_handle);
+            e->asset_handle = asset_handle_invalid();
+        }
+        e->tex_from_asset_manager = false;
+    }
 }
 
 void texture_finalize_completed_loads(void)
@@ -337,9 +409,28 @@ void texture_finalize_completed_loads(void)
 JceTexture asset_cache_get_texture(const char *material_path,
                                    const char *mesh_path)
 {
-    const char *key = (material_path && material_path[0] != '\0')
+    return asset_cache_get_texture_cs(material_path, mesh_path, false);
+}
+
+JceTexture asset_cache_get_texture_cs(const char *material_path,
+                                      const char *mesh_path,
+                                      bool srgb)
+{
+    const char *raw = (material_path && material_path[0] != '\0')
                     ? material_path : mesh_path;
-    if (!key || key[0] == '\0') return tex_invalid();
+    if (!raw || raw[0] == '\0') return tex_invalid();
+
+    /* The colour space is part of the IDENTITY: the same PNG can be one
+     * material's albedo (sRGB-encoded colour, decoded by the sampler) and
+     * another's mask (linear data), and they need two GPU textures.  Carried
+     * in the key rather than beside it so the async queue, the finalize, the
+     * mtime poll and the failure lookups all inherit it unchanged. */
+    char keybuf[512];
+    const char *key = raw;
+    if (srgb) {
+        snprintf(keybuf, sizeof keybuf, "%c%s", ASSET_CACHE_SRGB_KEY_PREFIX, raw);
+        key = keybuf;
+    }
 
     int idx = find_texture_cache_entry(key);
     if (idx < 0) {

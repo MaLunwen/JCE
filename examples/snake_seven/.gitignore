@@ -1,0 +1,19 @@
+# Build output of the C# gameplay module.
+#
+# Local rather than a line in the repo root .gitignore: that file is shared by
+# eleven worktrees on this machine, and a line added there to solve a problem
+# in one example project is a line somebody else's next commit can carry.
+#
+# The native build dir and resources/_cooked are already covered by the root
+# .gitignore; these two are not, because MSBuild puts its output inside the
+# project rather than under build/.
+csharp/bin/
+csharp/obj/
+
+# Captured evidence, regenerable and therefore NOT tracked.
+#
+# A screenshot committed next to the code it depicts goes stale silently:
+# nothing fails when the game changes and the picture does not, and the next
+# reader takes an image of a build that no longer exists as a description of
+# the current one.  AGENTS.md says how to regenerate them instead.
+shots/

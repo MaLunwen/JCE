@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h> /* SDL_IOStream: engine code does not use stdio file IO */
 #include <jce/os/core/jce_frustum.h>
 #include "jce_sr_internal.h"
+#include "jce_sr_grass_shadow.h"
 #include <jce/renderer/jce_render_pipeline.h>  /* live cascade count */
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_timer.h>
@@ -375,7 +376,25 @@ void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
     /* Filter tier first — both the CSM and local-shadow shader paths
        branch on it (frame-constant, fully coherent per draw). */
     if (BGFX_HANDLE_IS_VALID(sr->u_shadow_quality)) {
-        float q[4] = { sr->shadow_filter_tier, 0.0f, 0.0f, 0.0f };
+        /* y = the sun's angular diameter in DEGREES (PCSS contact
+         * hardening; 0 = off), z = the cap on the widened kernel.
+         *
+         * Both x and y are cached on `sr` for the same reason: neither is the
+         * pipeline's value alone.  The SCENE's soft_shadow_mode composes with
+         * the pipeline -- OFF forces the tier to 0, and only PCSS lets the sun
+         * size through -- and this function takes nothing but `sr`, so the
+         * composition happens once per frame beside the tier it belongs with.
+         * Reading the pipeline here instead would ignore the scene, which is
+         * the state this feature spent a release in.
+         *
+         * The cap is a CONSTANT, not a knob.  The kernel stays 25 taps at any
+         * radius, so past a certain width the taps thin out and the shadow
+         * breaks into moving speckle; 8 texels is where that starts on the
+         * 2048 maps this engine defaults to.  Exposing it would be exposing
+         * "how much aliasing do you want", which is not an art decision. */
+        float q[4] = { sr->shadow_filter_tier,
+                       sr->sun_soft_deg_frame,
+                       8.0f, 0.0f };
         jce_enc_set_uniform(sr->u_shadow_quality, q, 1);
     }
     sr_bind_local_shadow_state(sr);
@@ -500,6 +519,26 @@ void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
         sr_fill_csm_bias_scales(csm, bias_scales);
         jce_enc_set_uniform(sr->u_csm_bias_scales, bias_scales, 1);
 
+        /* Per-cascade WORLD-UNITS-PER-SHADOW-TEXEL, so a fragment shader
+         * holding two shadow depths can say how far apart they are on the
+         * ground.  A shadow map stores depth normalized over the cascade's
+         * orthographic range, and the map covers 2*radius world units across
+         * `shadow_map_size` texels; the quotient is the only bridge between
+         * the two, and without it a penumbra computed from depth differences
+         * is off by three orders of magnitude (see pcss.sh).
+         *
+         * A cascade the CSM pass never built leaves 0 here rather than a
+         * plausible-looking number: the shader treats 0 as "do not widen",
+         * which is wrong-but-visible instead of wrong-and-quiet. */
+        float penumbra[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t c = 0; c < csm->cascade_count && c < 4; c++) {
+            const float r = csm->radius[c];
+            if (r > 0.0f && sr->shadow_map_size > 0)
+                penumbra[c] = csm->depth_range[c] * (float)sr->shadow_map_size
+                            / (2.0f * r);
+        }
+        jce_enc_set_uniform(sr->u_csm_penumbra, penumbra, 1);
+
         for (uint32_t ci = 0;
              ci < sr->csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
             jce_enc_set_texture((uint8_t)(9 + ci), sr->u_csm_samplers[ci], sr->csm_tex[ci], UINT32_MAX);
@@ -584,6 +623,11 @@ void sr_apply_view_order(uint16_t view_id_base,
              * per-frame, because the alternative -- gate on being submerged --
              * is decided during the water draw, which is after this. */
             include_underwater_view,
+            /* Camera-stack overlays: one view each, ordered right after the
+             * colour view.  Reserved from the CONFIG rather than from whether
+             * the overlays actually drew, for the reason the underwater view
+             * is sticky: what draws is decided after this. */
+            cfg ? cfg->camera_overlay_count : 0u,
             &order)) {
         /* A failed build means the remap window did not fit the order
          * buffer.  Returning leaves bgfx on default id order, which sorts
@@ -1312,7 +1356,7 @@ static void sr_draw_dyn_csm_pass(JceSceneRenderer *sr, JceScene *scene,
     /* One full-target depth clear (depth=1 => "no dynamic occluder"). */
     bgfx_set_view_rect(clear_v, 0, 0, N, N);
     bgfx_set_view_frame_buffer(clear_v, sr->dyn_csm_atlas_fbo);
-    bgfx_set_view_clear(clear_v, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+    bgfx_set_view_clear(clear_v, BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.0f, 0);
     bgfx_touch(clear_v);
 
     sr_crowd_shadow_reset(sr);
@@ -1455,7 +1499,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         bgfx_set_view_rect(shadow_view_0, 0, 0,
                            sr->shadow_map_size, sr->shadow_map_size);
         bgfx_set_view_frame_buffer(shadow_view_0, sr->shadow_fbo);
-        bgfx_set_view_clear(shadow_view_0, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+        bgfx_set_view_clear(shadow_view_0, BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.0f, 0);
 
         float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         bgfx_set_view_transform(shadow_view_0, identity, shadow_vp);
@@ -1978,8 +2022,25 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         (sr_mlcull_enabled() && jce_gpu_scene_meshlet_supported(sr->gpu_scene))) {
         uint32_t nc = csm.cascade_count < JCE_CSM_MAX_CASCADES
                     ? csm.cascade_count : JCE_CSM_MAX_CASCADES;
-        for (uint32_t c = 0; c < nc; c++)
+        for (uint32_t c = 0; c < nc; c++) {
             sr_extract_frustum_planes(&csm.vp[c], sr->gpu_shadow_planes[c]);
+            /* Retire the NEAR plane for shadow culling (index 4 — the order is
+             * left,right,bottom,top,near,far, see jce_frustum.h).
+             *
+             * A caster standing between this cascade and the sun is IN FRONT
+             * of the light's near plane and still owes the cascade a shadow.
+             * The rasteriser no longer rejects it (shadow_pancake.sh clamps it
+             * onto the plane instead), so a cull that still rejects it would
+             * put the hole back on exactly the machines that take this path —
+             * and only on those, which is the kind of difference nobody
+             * reproduces.  The CPU cascade cull already omits the light axis
+             * for the same reason (sr_caster_culled_for_cascade).
+             *
+             * (0,0,0,1) is "never cull" for the consumer's test
+             * `dot(n,c) + w < -radius` (cs_meshlet_cull.sc): it evaluates to
+             * 1 < -radius, which no radius satisfies. */
+            sr->gpu_shadow_planes[c][4] = jce_v4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
         sr->gpu_shadow_view0    = (uint16_t)(view_id_base + 11);
         sr->gpu_shadow_cascades = nc;
         sr->gpu_shadow_planes_valid = (nc > 0);
@@ -2178,7 +2239,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
             bgfx_set_view_rect(cv, 0, 0, sr->shadow_map_size, sr->shadow_map_size);
             bgfx_set_view_frame_buffer(cv, sr->csm_fbo[c]);
-            bgfx_set_view_clear(cv, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+            bgfx_set_view_clear(cv, BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.0f, 0);
 
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             bgfx_set_view_transform(cv, identity, csm.vp[c].raw[0]);
@@ -2287,6 +2348,19 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
              * per cascade at a reduced LOD — outside the entity walk (scatter
              * carries no ecull caster AABB; the cache slots know the fields). */
             sr_submit_scatter_shadows(sr, scene, cv, (uint16_t)shadow_inst_sh.idx);
+            /* GrassField.cast_shadow joins the SAME instanced depth path.
+             * The cell runs come from the colour pass's own grid and its own
+             * fade, so a blade cannot cast a shadow it is too far away to be
+             * drawn with. */
+            {
+                jce_vec4 gplanes[6];
+                jce_frustum_extract_planes(&csm.vp[c], gplanes);
+                sr_submit_grass_shadows(sr, scene, cv,
+                                        (uint16_t)shadow_inst_sh.idx,
+                                        gplanes,
+                                        camera ? jce_camera_get_position(camera)
+                                               : jce_v3(0.0f, 0.0f, 0.0f));
+            }
         }
         jce_perf_phase_add("sh_gather", jce_time_perf_to_ms(_ts_gather, jce_time_perf_counter()));
         if (s_shprof) {
@@ -2353,7 +2427,7 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
             bgfx_set_view_rect(cv, 0, 0, sr->shadow_map_size, sr->shadow_map_size);
             bgfx_set_view_frame_buffer(cv, sr->csm_fbo[c]);
-            bgfx_set_view_clear(cv, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+            bgfx_set_view_clear(cv, BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.0f, 0);
 
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             bgfx_set_view_transform(cv, identity, csm.vp[c].raw[0]);
@@ -2416,6 +2490,19 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             }
             /* 千万 ③: scatter shadows (see the rq branch above). */
             sr_submit_scatter_shadows(sr, scene, cv, (uint16_t)shadow_inst_sh.idx);
+            /* GrassField.cast_shadow joins the SAME instanced depth path.
+             * The cell runs come from the colour pass's own grid and its own
+             * fade, so a blade cannot cast a shadow it is too far away to be
+             * drawn with. */
+            {
+                jce_vec4 gplanes[6];
+                jce_frustum_extract_planes(&csm.vp[c], gplanes);
+                sr_submit_grass_shadows(sr, scene, cv,
+                                        (uint16_t)shadow_inst_sh.idx,
+                                        gplanes,
+                                        camera ? jce_camera_get_position(camera)
+                                               : jce_v3(0.0f, 0.0f, 0.0f));
+            }
         }
     }
 
@@ -2484,7 +2571,7 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
         bgfx_set_view_rect(clear_view, 0, 0,
                            sr->shadow_map_size, sr->shadow_map_size);
         bgfx_set_view_frame_buffer(clear_view, sr->local_atlas_fbo);
-        bgfx_set_view_clear(clear_view, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+        bgfx_set_view_clear(clear_view, BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0, 1.0f, 0);
         bgfx_set_view_transform(clear_view, ident, ident);
         bgfx_touch(clear_view);
         *cleared = true;

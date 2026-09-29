@@ -18,6 +18,13 @@ void parse_canvas(JceScene *s, JceEntity e, const cJSON *c)
     v.reference_resolution[0] = (float)j_num(c, "refResX", 1920.0);
     v.reference_resolution[1] = (float)j_num(c, "refResY", 1080.0);
     v.scale_factor = (float)j_num(c, "scaleFactor", 1.0);
+    /* 0.5 and not Unity's 0: a scene written before this key existed
+     * must parse to the geometric mean this engine already computed.
+     * jce_scene.h says so beside the field. */
+    v.match_width_or_height = (float)j_num(c, "matchWidthOrHeight", 0.5);
+    /* Defaults FALSE: a scene written before this field existed laid out
+     * over the whole drawable, and that is what it must keep doing. */
+    v.respect_safe_area = j_bool(c, "respectSafeArea", false);
     v.pixel_perfect = j_bool(c, "pixelPerfect", false);
     jce_scene_set_canvas(s, e, &v);
 }
@@ -30,6 +37,33 @@ void parse_canvas_group(JceScene *s, JceEntity e, const cJSON *c)
     g.blocks_raycasts = j_bool(c, "blocksRaycasts", true);
     g.ignore_parent_groups = j_bool(c, "ignoreParentGroups", false);
     jce_scene_set_canvas_group(s, e, &g);
+}
+
+void parse_content_size_fitter(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceContentSizeFitterComponent f; memset(&f, 0, sizeof f);
+    /* Unconstrained on both axes by default, which is what a zeroed struct
+     * already means -- so a scene that predates this component, or one that
+     * writes the component with no keys, behaves exactly as it did. */
+    f.horizontal_fit = (int)j_num(c, "horizontalFit", 0.0);
+    f.vertical_fit   = (int)j_num(c, "verticalFit",   0.0);
+    jce_scene_set_content_size_fitter(s, e, &f);
+}
+
+void parse_layout_element(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceLayoutElementComponent l; memset(&l, 0, sizeof l);
+    l.min_width  = (float)j_num(c, "minW", 0.0);
+    l.min_height = (float)j_num(c, "minH", 0.0);
+    /* -1 is "no opinion", NOT zero: a zero default would silently collapse
+     * every child that omits the key, which is the opposite of adding an
+     * optional component. */
+    l.preferred_width  = (float)j_num(c, "prefW", -1.0);
+    l.preferred_height = (float)j_num(c, "prefH", -1.0);
+    l.flexible_width   = (float)j_num(c, "flexW", 0.0);
+    l.flexible_height  = (float)j_num(c, "flexH", 0.0);
+    l.ignore_layout    = j_bool(c, "ignoreLayout", false);
+    jce_scene_set_layout_element(s, e, &l);
 }
 
 void parse_layout_group(JceScene *s, JceEntity e, const cJSON *c)
@@ -47,6 +81,12 @@ void parse_layout_group(JceScene *s, JceEntity e, const cJSON *c)
     l.child_alignment = (int)j_num(c, "childAlignment", 0);
     l.control_child_size_w = j_bool(c, "controlChildW", false);
     l.control_child_size_h = j_bool(c, "controlChildH", false);
+    /* Grid constraint.  Every default is the behaviour a grid had before
+     * these keys existed, so a scene that omits them is unchanged. */
+    l.grid_constraint       = (uint8_t)j_num(c, "gridConstraint", 0.0);
+    l.grid_start_corner     = (uint8_t)j_num(c, "gridStartCorner", 0.0);
+    l.grid_start_axis       = (uint8_t)j_num(c, "gridStartAxis", 0.0);
+    l.grid_constraint_count = (uint16_t)j_num(c, "gridConstraintCount", 0.0);
     l.reverse_arrangement  = j_bool(c, "reverseArrangement", false);
     jce_scene_set_layout_group(s, e, &l);
 }
@@ -56,6 +96,9 @@ void parse_layout_group(JceScene *s, JceEntity e, const cJSON *c)
  * authored before RectTransform existed still fill their parent. */
 static void parse_rect_transform(JceRectTransform *rt, const cJSON *c)
 {
+    rt->rotation_deg  = (float)j_num(c, "rotation",  0.0);
+    rt->scale[0]      = (float)j_num(c, "scaleX",    1.0);
+    rt->scale[1]      = (float)j_num(c, "scaleY",    1.0);
     rt->anchor_min[0] = (float)j_num(c, "anchorMinX", 0.0);
     rt->anchor_min[1] = (float)j_num(c, "anchorMinY", 0.0);
     rt->anchor_max[0] = (float)j_num(c, "anchorMaxX", 1.0);
@@ -70,6 +113,9 @@ static void parse_rect_transform(JceRectTransform *rt, const cJSON *c)
 
 static void ser_rect_transform(const JceRectTransform *rt, cJSON *o)
 {
+    cJSON_AddNumberToObject(o, "rotation", rt->rotation_deg);
+    cJSON_AddNumberToObject(o, "scaleX",   rt->scale[0]);
+    cJSON_AddNumberToObject(o, "scaleY",   rt->scale[1]);
     cJSON_AddNumberToObject(o, "anchorMinX", rt->anchor_min[0]);
     cJSON_AddNumberToObject(o, "anchorMinY", rt->anchor_min[1]);
     cJSON_AddNumberToObject(o, "anchorMaxX", rt->anchor_max[0]);
@@ -109,6 +155,26 @@ void parse_ui_text(JceScene *s, JceEntity e, const cJSON *c)
     copy_str(t.font_path, sizeof t.font_path, j_str(c, "fontPath", ""));
     t.font_size  = (float)j_num(c, "fontSize", 14.0);
     t.alignment  = (int)j_num(c, "alignment", 0);
+    /* Both default to 0, which is MIDDLE / CLIP -- exactly what a scene
+     * authored before these keys existed already looks like. */
+    t.vertical_alignment = (int)j_num(c, "verticalAlignment",
+                                      JCE_UI_TEXT_VALIGN_MIDDLE);
+    t.overflow           = (int)j_num(c, "overflow",
+                                      JCE_UI_TEXT_OVERFLOW_CLIP);
+    t.sdf                = j_bool(c, "sdf", false);
+    t.outline_width      = (float)j_num(c, "outlineWidth", 0.0);
+    t.outline_color[0]   = (float)j_num(c, "outlineR", 0.0);
+    t.outline_color[1]   = (float)j_num(c, "outlineG", 0.0);
+    t.outline_color[2]   = (float)j_num(c, "outlineB", 0.0);
+    t.outline_color[3]   = (float)j_num(c, "outlineA", 1.0);
+    t.shadow_offset[0]   = (float)j_num(c, "shadowX", 0.0);
+    t.shadow_offset[1]   = (float)j_num(c, "shadowY", 0.0);
+    t.shadow_color[0]    = (float)j_num(c, "shadowR", 0.0);
+    t.shadow_color[1]    = (float)j_num(c, "shadowG", 0.0);
+    t.shadow_color[2]    = (float)j_num(c, "shadowB", 0.0);
+    /* 0, so a scene that predates these keys has NO shadow rather than an
+     * opaque black one under every label. */
+    t.shadow_color[3]    = (float)j_num(c, "shadowA", 0.0);
     t.color[0] = (float)j_num(c, "colorR", 1.0);
     t.color[1] = (float)j_num(c, "colorG", 1.0);
     t.color[2] = (float)j_num(c, "colorB", 1.0);
@@ -147,6 +213,7 @@ void parse_ui_button(JceScene *s, JceEntity e, const cJSON *c)
     b.fade_duration = (float)j_num(c, "fadeDuration", 0.1);
     copy_str(b.on_click_handler, sizeof b.on_click_handler,
               j_str(c, "onClickHandler", ""));
+    parse_rect_transform(&b.rect, c);
     jce_scene_set_ui_button(s, e, &b);
 }
 
@@ -343,6 +410,8 @@ static void ser_canvas(const JceCanvasComponent *v, cJSON *arr)
     cJSON_AddNumberToObject(o, "refResX", v->reference_resolution[0]);
     cJSON_AddNumberToObject(o, "refResY", v->reference_resolution[1]);
     cJSON_AddNumberToObject(o, "scaleFactor", v->scale_factor);
+    cJSON_AddNumberToObject(o, "matchWidthOrHeight", v->match_width_or_height);
+    cJSON_AddBoolToObject(o, "respectSafeArea", v->respect_safe_area);
     cJSON_AddBoolToObject  (o, "pixelPerfect", v->pixel_perfect);
     cJSON_AddItemToArray(arr, o);
 }
@@ -375,6 +444,24 @@ static void ser_layout_group(const JceLayoutGroupComponent *l, cJSON *arr)
     cJSON_AddBoolToObject  (o, "controlChildW", l->control_child_size_w);
     cJSON_AddBoolToObject  (o, "controlChildH", l->control_child_size_h);
     cJSON_AddBoolToObject  (o, "reverseArrangement", l->reverse_arrangement);
+    cJSON_AddNumberToObject(o, "gridConstraint", l->grid_constraint);
+    cJSON_AddNumberToObject(o, "gridStartCorner", l->grid_start_corner);
+    cJSON_AddNumberToObject(o, "gridStartAxis", l->grid_start_axis);
+    cJSON_AddNumberToObject(o, "gridConstraintCount", l->grid_constraint_count);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_layout_element(const JceLayoutElementComponent *l, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "LayoutElement");
+    cJSON_AddNumberToObject(o, "minW", l->min_width);
+    cJSON_AddNumberToObject(o, "minH", l->min_height);
+    cJSON_AddNumberToObject(o, "prefW", l->preferred_width);
+    cJSON_AddNumberToObject(o, "prefH", l->preferred_height);
+    cJSON_AddNumberToObject(o, "flexW", l->flexible_width);
+    cJSON_AddNumberToObject(o, "flexH", l->flexible_height);
+    cJSON_AddBoolToObject  (o, "ignoreLayout", l->ignore_layout);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -407,6 +494,20 @@ static void ser_ui_text(const JceUITextComponent *t, cJSON *arr)
     cJSON_AddStringToObject(o, "fontPath", t->font_path);
     cJSON_AddNumberToObject(o, "fontSize", t->font_size);
     cJSON_AddNumberToObject(o, "alignment", t->alignment);
+    cJSON_AddNumberToObject(o, "verticalAlignment", t->vertical_alignment);
+    cJSON_AddNumberToObject(o, "overflow", t->overflow);
+    cJSON_AddBoolToObject  (o, "sdf", t->sdf);
+    cJSON_AddNumberToObject(o, "outlineWidth", t->outline_width);
+    cJSON_AddNumberToObject(o, "outlineR", t->outline_color[0]);
+    cJSON_AddNumberToObject(o, "outlineG", t->outline_color[1]);
+    cJSON_AddNumberToObject(o, "outlineB", t->outline_color[2]);
+    cJSON_AddNumberToObject(o, "outlineA", t->outline_color[3]);
+    cJSON_AddNumberToObject(o, "shadowX", t->shadow_offset[0]);
+    cJSON_AddNumberToObject(o, "shadowY", t->shadow_offset[1]);
+    cJSON_AddNumberToObject(o, "shadowR", t->shadow_color[0]);
+    cJSON_AddNumberToObject(o, "shadowG", t->shadow_color[1]);
+    cJSON_AddNumberToObject(o, "shadowB", t->shadow_color[2]);
+    cJSON_AddNumberToObject(o, "shadowA", t->shadow_color[3]);
     cJSON_AddNumberToObject(o, "colorR", t->color[0]);
     cJSON_AddNumberToObject(o, "colorG", t->color[1]);
     cJSON_AddNumberToObject(o, "colorB", t->color[2]);
@@ -445,6 +546,7 @@ static void ser_ui_button(const JceUIButtonComponent *b, cJSON *arr)
     cJSON_AddNumberToObject(o, "disabledA", b->disabled_color[3]);
     cJSON_AddNumberToObject(o, "fadeDuration", b->fade_duration);
     cJSON_AddStringToObject(o, "onClickHandler", b->on_click_handler);
+    ser_rect_transform(&b->rect, o);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -593,7 +695,14 @@ static void ser_ui_dropdown(const JceUIDropdownComponent *d, cJSON *arr)
     if (oc < 0) oc = 0;
     if (oc > JCE_UI_DROPDOWN_MAX_OPTIONS) oc = JCE_UI_DROPDOWN_MAX_OPTIONS;
     cJSON *opts = cJSON_AddArrayToObject(o, "options");
-    for (int i = 0; i < oc; i++)
+    /* EVERY non-empty label, not just the first option_count.
+     * Lowering the count in the Inspector hides the trailing rows; writing
+     * only the visible prefix DESTROYED them on the next save, and parse
+     * already clamps option_count down to the number of labels it read, so a
+     * shortened count stays honest either way. */
+    int keep = JCE_UI_DROPDOWN_MAX_OPTIONS;
+    while (keep > oc && d->options[keep - 1][0] == '\0') keep--;
+    for (int i = 0; i < keep; i++)
         cJSON_AddItemToArray(opts, cJSON_CreateString(d->options[i]));
     cJSON_AddNumberToObject(o, "optionCount", oc);
     cJSON_AddNumberToObject(o, "selectedIndex", d->selected_index);
@@ -628,6 +737,17 @@ void serw_canvas(JceScene *s, JceEntity e, cJSON *arr)
     if (c) ser_canvas(c, arr);
 }
 
+void serw_content_size_fitter(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceContentSizeFitterComponent *c = jce_scene_get_content_size_fitter(s, e);
+    if (!c) return;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "ContentSizeFitter");
+    cJSON_AddNumberToObject(o, "horizontalFit", c->horizontal_fit);
+    cJSON_AddNumberToObject(o, "verticalFit",   c->vertical_fit);
+    cJSON_AddItemToArray(arr, o);
+}
+
 void serw_canvas_group(JceScene *s, JceEntity e, cJSON *arr)
 {
     JceCanvasGroupComponent *c = jce_scene_get_canvas_group(s, e);
@@ -638,6 +758,12 @@ void serw_layout_group(JceScene *s, JceEntity e, cJSON *arr)
 {
     JceLayoutGroupComponent *c = jce_scene_get_layout_group(s, e);
     if (c) ser_layout_group(c, arr);
+}
+
+void serw_layout_element(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceLayoutElementComponent *c = jce_scene_get_layout_element(s, e);
+    if (c) ser_layout_element(c, arr);
 }
 
 void serw_ui_image(JceScene *s, JceEntity e, cJSON *arr)

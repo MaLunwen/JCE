@@ -196,12 +196,39 @@ jce_async_task_retain(JceAsyncTask *task);
 JCE_API void JCE_CALL
 jce_async_task_release(JceAsyncTask *task);
 
+/* Tear-down: cancel the task, wait for its work to stop, disarm its
+ * completion callback, and release this reference.  Use it wherever the
+ * caller is about to free the memory the callback would read -- which is
+ * every "cancel, wait, release, free the job" site.
+ *
+ * Returns true when a pending callback was actually disarmed; false when
+ * there was none left to disarm (it had already run, or this is a worker of
+ * the same executor and waiting would deadlock).  The task is released
+ * either way, and a `cleanup` hook still runs.
+ *
+ * Safe from any thread: if a pump on another thread is already inside the
+ * callback, this blocks until that callback returns. */
+JCE_API bool JCE_CALL
+jce_async_task_discard(JceAsyncTask *task);
+
 JCE_API JceAsyncState JCE_CALL
 jce_async_task_state(const JceAsyncTask *task);
 JCE_API bool JCE_CALL
 jce_async_task_is_terminal(const JceAsyncTask *task);
 JCE_API bool JCE_CALL
 jce_async_task_cancel(JceAsyncTask *task);
+/* Waits for the task to reach a TERMINAL STATE.  That is not the same as
+ * "the task is finished with you": a terminal task is queued for its
+ * completion callback, which runs later, from the owner thread pump.  So
+ * after this returns:
+ *
+ *   - anything the completion callback publishes is NOT yet published;
+ *   - anything the completion callback reads is still live from its side.
+ *
+ * Tearing down with cancel -> wait -> release therefore leaves a queued
+ * callback pointing at whatever the caller frees next.  Use
+ * jce_async_task_discard() for that; use this one to wait for a RESULT, and
+ * pump before reading anything the completion writes. */
 JCE_API JceAsyncWaitResult JCE_CALL
 jce_async_task_wait_timeout(JceAsyncTask *task, uint32_t timeout_ms);
 JCE_API void JCE_CALL

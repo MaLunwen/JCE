@@ -91,6 +91,15 @@ void main()
 
     float feedback = u_taaParams.x * onscreen;
 
+    /* The editor's analytic grid is blended over the opaque sky before TAA,
+       but has no geometry in the velocity pre-pass.  Its colour moves with the
+       camera while the motion buffer reports sky/zero velocity, so reusing
+       history leaves a screen-space block of stale lines during an orbit.
+       Blend alpha already records grid coverage (opaque sky = 1); treat it as
+       a reactive mask.  This also avoids dragging other translucent overlays
+       through history without changing opaque scene reprojection. */
+    feedback *= smoothstep(0.95, 0.999, cur.a);
+
     /* Lower feedback in high-motion regions to reduce blur. */
     float speed = length(mv);
     feedback *= mix(1.0, 0.7, clamp(speed * u_taaParams.z, 0.0, 1.0));

@@ -6,6 +6,8 @@
  * and the previous pass's output as input texture.
  */
 
+#include "jce_renderer_bgfx_callback.h"   /* half decode + host frame index */
+#include "os/core/jce_memory.h"      /* JCE_CALLOC / JCE_FREE */
 #include "renderer/jce_view_bands.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
@@ -13,16 +15,30 @@
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_render_pipeline.h>  /* hdr_color: LDR on low tiers */
 #include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_texture.h>   /* jce_texture_colour_space */
 #include <jce/renderer/jce_views.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <stdio.h>
+#include <stdlib.h>     /* auto exposure: getenv / atoi for the readback cadence */
 #include <string.h>
 
 #define LOG_TAG "postfx"
 
 /* Max intermediate FBOs for ping-pong rendering. */
 #define POSTFX_MAX_FBOS  4
+
+/* AUTO-EXPOSURE METERING CONSTANTS.
+ *
+ * 64x64 through the 13-tap dual-filter downsample is 53k stratified samples
+ * of the frame -- not four thousand point samples, because the tap offsets are
+ * given the DESTINATION texel size, which spreads them across the whole source
+ * footprint instead of clustering them in two source texels.  That difference
+ * is what makes this an average rather than a lottery.
+ *
+ * Two staging slots: one readback stays in flight while the next is kicked. */
+#define AE_DIM  64u
+#define AE_RING 2
 
 /* ── Pipeline struct ───────────────────────────────────────────────── */
 
@@ -71,7 +87,10 @@ struct JcePostFXPipeline {
     bgfx_uniform_handle_t u_vignetteParams;
     bgfx_uniform_handle_t u_chromaticParams;
     bgfx_uniform_handle_t u_compositeFlags;   /* x=bloom y=tonemap z=chromatic w=vignette */
-    bgfx_uniform_handle_t u_compositeFlags2;  /* x=grayscale */
+    bgfx_uniform_handle_t u_compositeFlags2;  /* x=grayscale y=motionBlur */
+    bgfx_uniform_handle_t u_motionBlurParams; /* x=strength y=maxUvLen */
+    bgfx_uniform_handle_t u_texDepthComposite; /* depth of field, stage 4 */
+    bgfx_uniform_handle_t u_dofParams;         /* four sorted depth edges  */
     bgfx_uniform_handle_t u_texDepth;         /* scene depth sampler (stage 1, custom pass) */
     bgfx_uniform_handle_t u_postfxTime;       /* (elapsed_s, has_depth, 0, 0) — custom pass */
     bgfx_uniform_handle_t u_postfxParams;     /* generic vec4[JCE_POSTFX_CUSTOM_PARAMS] */
@@ -162,6 +181,59 @@ struct JcePostFXPipeline {
     uint32_t                   bloom_mip_w[POSTFX_BLOOM_MAX_MIPS];
     uint32_t                   bloom_mip_h[POSTFX_BLOOM_MAX_MIPS];
     bool                       bloom_mips_valid;
+
+    /* AUTO EXPOSURE (eye adaptation).
+     * The LAW is jce_auto_exposure.c and is asserted headlessly there.  What
+     * lives here is the MEASUREMENT: one downsample of the chain input into a
+     * small RGBA16F target, blitted into a READ_BACK staging copy that the CPU
+     * harvests a few frames later.
+     *
+     * NOT jce_render_readback: that queue is created FROM a JceRenderer and
+     * this module is handed an allocator and a size, never a renderer.  The
+     * blit + bgfx_read_texture pair below is the same one jce_impostor.c,
+     * jce_gi_probes.c and the headless capture already use, inside this layer.
+     *
+     * A RING plus a CADENCE, both for reasons that were measured, not
+     * guessed: bgfx_read_texture maps the staging texture immediately on
+     * D3D11 (jce_gi_probes.c records ~10 ms under load), so metering every
+     * frame would cost more than everything else in the chain put together,
+     * and one slot would stall on its own previous read. */
+    bool                       ae_enabled;
+    JceAutoExposureDesc        ae_desc;
+    float                      ae_ev;            /* adapted, in EV */
+    float                      ae_measured;      /* last completed log-average */
+    bool                       ae_have_ev;       /* a measurement has landed */
+    uint64_t                   ae_last_ns;       /* for dt; 0 = no previous */
+    uint32_t                   ae_apply_ix;      /* cadence counter */
+    bgfx_texture_handle_t      ae_small_tex;
+    bgfx_frame_buffer_handle_t ae_small_fb;
+    bgfx_texture_handle_t      ae_staging[AE_RING];
+    uint16_t                  *ae_pixels[AE_RING];   /* RGBA16F halves */
+    uint32_t                   ae_ready[AE_RING];    /* frame the read lands */
+    bool                       ae_inflight[AE_RING]; /* 0 is a real frame id */
+    bool                       ae_targets_valid;
+    int                        ae_support;       /* -1 unknown, 1 yes, 0 no */
+
+    /* MOTION BLUR.  No target and no view of its own: it is a different way of
+     * sampling s_texColor inside the composite, so it costs one sampler and
+     * one branch.  What it does need is a motion source, and `mb_active`
+     * records whether it actually got one on the last apply -- "enabled" and
+     * "doing something" are different questions and this engine has shipped
+     * the gap between them more than once. */
+    bool                       mb_enabled;
+    float                      mb_intensity;
+    float                      mb_max_uv;
+    bool                       mb_active;
+
+    /* Depth of field.  dof_depths is the FOUR stored-depth edges the shader
+     * takes, sorted low..high: [0],[1] the in-focus band, [2],[3] where the
+     * blur reaches full.  Computed here from metres because only this side
+     * knows the projection -- see the header. */
+    bool                       dof_enabled;
+    bool                       dof_valid;      /* a projection was supplied */
+    bool                       dof_active;     /* ...and depth was bound */
+    float                      dof_max_coc;
+    float                      dof_depths[4];
 };
 
 static void reset_output_state(JcePostFXPipeline *pipeline)
@@ -468,6 +540,230 @@ static void draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+/* AUTO EXPOSURE: targets, metering, adaptation. */
+
+static void ae_destroy_targets(JcePostFXPipeline *p)
+{
+    if (p->ae_small_fb.idx != UINT16_MAX) {
+        /* Destroys the attachment too (created with destroyTexture = true). */
+        bgfx_destroy_frame_buffer(p->ae_small_fb);
+        p->ae_small_fb.idx  = UINT16_MAX;
+        p->ae_small_tex.idx = UINT16_MAX;
+    }
+    for (int i = 0; i < AE_RING; ++i) {
+        if (p->ae_staging[i].idx != UINT16_MAX) {
+            bgfx_destroy_texture(p->ae_staging[i]);
+            p->ae_staging[i].idx = UINT16_MAX;
+        }
+        if (p->ae_pixels[i]) { JCE_FREE(p->ae_pixels[i]); p->ae_pixels[i] = NULL; }
+        p->ae_inflight[i] = false;
+        p->ae_ready[i]    = 0u;
+    }
+    p->ae_targets_valid = false;
+}
+
+/* Can this backend do the metering at all?  Answered ONCE and cached, because
+ * the honest answer on a GLES2/WebGL1-class target is no and a per-frame caps
+ * query for a fixed answer is just cost.  A backend that cannot do it leaves
+ * auto exposure OFF and says so -- rather than metering nothing and holding
+ * the exposure at whatever the first frame happened to be, which is the
+ * failure mode that reads on screen as "the feature does nothing". */
+static bool ae_supported(JcePostFXPipeline *p)
+{
+    if (p->ae_support >= 0) return p->ae_support == 1;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    const bool ok = caps &&
+        (caps->supported & BGFX_CAPS_TEXTURE_BLIT) != 0 &&
+        (caps->supported & BGFX_CAPS_TEXTURE_READ_BACK) != 0 &&
+        (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F] &
+         BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) != 0;
+    p->ae_support = ok ? 1 : 0;
+    if (!ok)
+        LOG_WARN(LOG_TAG, "auto exposure unavailable on this backend "
+                 "(needs texture blit + read-back + an RGBA16F render target); "
+                 "exposure stays at the authored value");
+    return ok;
+}
+
+static bool ae_ensure_targets(JcePostFXPipeline *p)
+{
+    if (p->ae_targets_valid) return true;
+    if (!ae_supported(p))    return false;
+
+    bgfx_texture_handle_t att = bgfx_create_texture_2d(
+        (uint16_t)AE_DIM, (uint16_t)AE_DIM, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+    if (att.idx == UINT16_MAX) return false;
+    p->ae_small_tex = att;
+    p->ae_small_fb  = bgfx_create_frame_buffer_from_handles(1, &att, true);
+    if (p->ae_small_fb.idx == UINT16_MAX) {
+        bgfx_destroy_texture(att);
+        p->ae_small_tex.idx = UINT16_MAX;
+        return false;
+    }
+
+    for (int i = 0; i < AE_RING; ++i) {
+        /* BLIT_DST | READ_BACK is the pair bgfx requires.  With only one of
+         * them the blit succeeds and the read returns nothing, in silence. */
+        p->ae_staging[i] = bgfx_create_texture_2d(
+            (uint16_t)AE_DIM, (uint16_t)AE_DIM, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA16F,
+            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK, NULL, 0);
+        p->ae_pixels[i] = (uint16_t *)JCE_CALLOC(1, AE_DIM * AE_DIM * 4u *
+                                                 sizeof(uint16_t));
+        if (p->ae_staging[i].idx == UINT16_MAX || !p->ae_pixels[i]) {
+            ae_destroy_targets(p);
+            return false;
+        }
+    }
+    p->ae_targets_valid = true;
+    return true;
+}
+
+/* Harvest whatever readback bgfx has promised is complete.  The result lands
+ * in ae_measured. */
+static void ae_harvest(JcePostFXPipeline *p)
+{
+    const uint32_t now = jce_rcb_host_frame_index();
+    for (int i = 0; i < AE_RING; ++i) {
+        if (!p->ae_inflight[i] || now < p->ae_ready[i]) continue;
+        const float measured = jce_auto_exposure_log_average_rgba16f(
+                                   p->ae_pixels[i], AE_DIM * AE_DIM);
+        p->ae_inflight[i] = false;
+        /* A frame that has not drawn yet meters as the floor.  Steering on it
+         * pins the exposure at max_ev and every level opens blown out; see
+         * jce_auto_exposure_measurement_is_usable(). */
+        if (!jce_auto_exposure_measurement_is_usable(measured)) continue;
+        p->ae_measured = measured;
+        if (!p->ae_have_ev) {
+            /* The FIRST measurement SNAPS.  Fading in from an arbitrary
+             * starting EV would open every level on a one-second exposure
+             * ramp nobody asked for. */
+            p->ae_ev      = jce_auto_exposure_target_ev(p->ae_measured,
+                                                        &p->ae_desc);
+            p->ae_have_ev = true;
+            /* Say what it decided, once per lock.  An exposure that is being
+             * driven and one that is stuck look identical on screen, and this
+             * line is the difference between reading a screenshot and
+             * measuring one. */
+            LOG_INFO(LOG_TAG, "auto exposure locked: scene L=%.5f -> EV %+.2f "
+                     "(x%.3f), clamp [%.1f, %.1f]",
+                     (double)p->ae_measured, (double)p->ae_ev,
+                     (double)jce_auto_exposure_multiplier(p->ae_ev),
+                     (double)p->ae_desc.min_ev, (double)p->ae_desc.max_ev);
+        }
+    }
+}
+
+/* One metering pass + one readback kick, on the pipeline's own view band. */
+static void ae_meter(JcePostFXPipeline *p, uint16_t view_id,
+                     uint16_t blit_view, bgfx_texture_handle_t src)
+{
+    /* The cadence.  15 Hz by default at 60 fps -- an order of magnitude faster
+     * than an adaptation whose time constant is a second, and a quarter of the
+     * D3D11 map cost.  JCE_AE_READBACK overrides it, matching JCE_GI_READBACK
+     * next door so there is one spelling for "how often do we pay the sync". */
+    static int s_cadence = -1;
+    if (s_cadence < 0) {
+        const char *v = getenv("JCE_AE_READBACK");
+        s_cadence = (v && v[0]) ? atoi(v) : 4;
+        if (s_cadence < 1) s_cadence = 1;
+    }
+    const bool kick = (p->ae_apply_ix % (uint32_t)s_cadence) == 0u;
+    p->ae_apply_ix++;
+    if (!kick) return;
+
+    int slot = -1;
+    for (int i = 0; i < AE_RING; ++i)
+        if (!p->ae_inflight[i]) { slot = i; break; }
+    if (slot < 0) return;            /* both in flight: skip, never stall */
+
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)AE_DIM, (uint16_t)AE_DIM);
+    bgfx_set_view_frame_buffer(view_id, p->ae_small_fb);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
+    bgfx_set_view_name(view_id, "PostFX/AutoExposureMeter", INT32_MAX);
+    bgfx_set_texture(0, p->u_texColor, src, UINT32_MAX);
+
+    /* DESTINATION texel size, deliberately.  The shader's taps are in
+     * u_texelSize units, so handing it 1/src would cluster all 13 of them
+     * inside two source texels and turn a 53k-sample average into 4k point
+     * samples that alias on anything thin and bright. */
+    const float ts[4] = { 1.0f / (float)AE_DIM, 1.0f / (float)AE_DIM,
+                          (float)AE_DIM, (float)AE_DIM };
+    bgfx_set_uniform(p->u_texelSize, ts, 1);
+    /* w = 0: the plain weighted box.  NOT the Karis path -- Karis is a
+     * firefly-suppressing weighted average, which is exactly what you want
+     * for bloom and exactly what you must not use for a measurement, because
+     * it is biased by construction. */
+    const float bp[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    bgfx_set_uniform(p->u_bloomParams, bp, 1);
+    draw_fullscreen(p, view_id, p->prog_bloom_down);
+
+    /* A DIFFERENT VIEW, and one that sorts AFTER the draw above.
+     *
+     * bgfx runs a view's blit queue BEFORE that view's draw calls, so blitting
+     * on view_id copies the metering target as it stood at the start of the
+     * view -- which, because the view clears, is a buffer of zeros.  It then
+     * reads back perfectly, produces a log-average pinned at the luminance
+     * floor, and drives the exposure to its +8 EV clamp: a 256x multiplier on
+     * every pixel, from a measurement of nothing.  That is what happened here
+     * on the first GPU run, and the screenshot comparison called it a 94.9%
+     * change -- a signal that looked like the feature working.
+     *
+     * jce_impostor.c ("a blit view that sorts AFTER every cell view") and
+     * jce_gi_probes.c both take a separate blit view for exactly this. */
+    bgfx_blit(blit_view, p->ae_staging[slot], 0, 0, 0, 0,
+              p->ae_small_tex, 0, 0, 0, 0,
+              (uint16_t)AE_DIM, (uint16_t)AE_DIM, 1);
+    p->ae_ready[slot]    = bgfx_read_texture(p->ae_staging[slot],
+                                             p->ae_pixels[slot], 0, 0);
+    p->ae_inflight[slot] = true;
+}
+
+/* Advance the adapted EV toward whatever the last measurement asked for.
+ *
+ * dt comes from the engine clock rather than a caller-supplied value ON
+ * PURPOSE: a jce_postfx_set_delta_time() would be a further wiring point a
+ * consumer can forget, and forgetting it would freeze the adaptation without
+ * erroring -- the exact shape of defect this whole feature is answering. */
+static void ae_advance(JcePostFXPipeline *p)
+{
+    const uint64_t now = jce_time_ticks_ns();
+    float dt = 0.0f;
+    if (p->ae_last_ns != 0u && now > p->ae_last_ns)
+        dt = (float)((double)(now - p->ae_last_ns) * 1.0e-9);
+    p->ae_last_ns = now;
+    /* A long stall (a load, a paused editor, a breakpoint) must not be spent
+     * as travel; one second already converges across the whole clamp. */
+    if (dt > 1.0f) dt = 1.0f;
+    if (!p->ae_have_ev) return;
+
+    const float target = jce_auto_exposure_target_ev(p->ae_measured, &p->ae_desc);
+    p->ae_ev = jce_auto_exposure_step(p->ae_ev, target, dt, &p->ae_desc);
+}
+
+/* Everything above, in the order the frame needs it. */
+static void ae_update(JcePostFXPipeline *p, uint16_t view_id,
+                      uint16_t blit_view, bgfx_texture_handle_t src)
+{
+    if (!p->ae_enabled) return;
+    if (p->prog_bloom_down.idx == UINT16_MAX) return;  /* metering shader absent */
+    if (!ae_ensure_targets(p)) return;
+    ae_harvest(p);
+    ae_advance(p);
+    ae_meter(p, view_id, blit_view, src);
+}
+
+/* The exposure the tonemap is handed this frame. */
+static float ae_effective_exposure(const JcePostFXPipeline *p)
+{
+    if (!p->ae_enabled || !p->ae_have_ev) return p->params.exposure;
+    /* params.exposure becomes the artist's MULTIPLIER on the adapted value,
+     * rather than a number that is silently thrown away. */
+    return p->params.exposure * jce_auto_exposure_multiplier(p->ae_ev);
+}
+
 /* ── Create / Destroy ──────────────────────────────────────────────── */
 
 JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
@@ -557,6 +853,20 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->s_texLUT.idx      = UINT16_MAX;
     p->prog_bloom_down.idx = UINT16_MAX;
     p->prog_bloom_up.idx   = UINT16_MAX;
+
+    /* Auto exposure.  memset already gave every field its OFF value; these
+     * are the ones where zero is a LIVE handle rather than an absent one, and
+     * ae_support, where 0 would mean "already asked, the answer was no". */
+    p->ae_small_tex.idx = UINT16_MAX;
+    p->ae_small_fb.idx  = UINT16_MAX;
+    for (int i = 0; i < AE_RING; i++)
+        p->ae_staging[i].idx = UINT16_MAX;
+    p->ae_desc    = jce_auto_exposure_desc_default();
+    p->ae_support = -1;
+    /* memset gave mb_enabled false; these two are the values a caller that
+     * enables it without stating them would want, and 0 is wrong for both. */
+    p->mb_intensity = 1.0f;
+    p->mb_max_uv    = 0.05f;
     for (int i = 0; i < POSTFX_BLOOM_MAX_MIPS; i++) {
         p->bloom_mip_tex[i].idx = UINT16_MAX;
         p->bloom_mip_fb[i].idx  = UINT16_MAX;
@@ -593,6 +903,9 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_chromaticParams= bgfx_create_uniform("u_chromaticParams",BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_compositeFlags = bgfx_create_uniform("u_compositeFlags", BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_compositeFlags2= bgfx_create_uniform("u_compositeFlags2",BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_motionBlurParams=bgfx_create_uniform("u_motionBlurParams",BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_texDepthComposite=bgfx_create_uniform("s_texDepth",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_dofParams      = bgfx_create_uniform("u_dofParams",       BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_texDepth       = bgfx_create_uniform("s_texDepth",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
     p->u_postfxTime     = bgfx_create_uniform("u_postfxTime",     BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_postfxParams   = bgfx_create_uniform("u_postfxParams",   BGFX_UNIFORM_TYPE_VEC4,
@@ -625,7 +938,12 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
                                                 BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
     }
 
-    LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
+    /* Say that 1x1 is a placeholder.  Both render paths call
+     * jce_postfx_resize() before the first frame, but the bare "created
+     * (1x1)" reads like a pipeline stuck at one pixel. */
+    LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u%s)", width, height,
+                (width <= 1 && height <= 1) ? " placeholder, resized on the "
+                                              "first frame" : "");
     return p;
 }
 
@@ -636,6 +954,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     destroy_fbos(pipeline);
     destroy_taa_fbos(pipeline);
     destroy_bloom_mips(pipeline);
+    ae_destroy_targets(pipeline);
 
     if (pipeline->quad_vb.idx != UINT16_MAX)
         bgfx_destroy_vertex_buffer(pipeline->quad_vb);
@@ -657,6 +976,9 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_chromaticParams);
     bgfx_destroy_uniform(pipeline->u_compositeFlags);
     bgfx_destroy_uniform(pipeline->u_compositeFlags2);
+    bgfx_destroy_uniform(pipeline->u_motionBlurParams);
+    bgfx_destroy_uniform(pipeline->u_texDepthComposite);
+    bgfx_destroy_uniform(pipeline->u_dofParams);
     bgfx_destroy_uniform(pipeline->u_texDepth);
     bgfx_destroy_uniform(pipeline->u_postfxTime);
     bgfx_destroy_uniform(pipeline->u_postfxParams);
@@ -753,6 +1075,151 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
 }
 
 /* ── Stage-1a.5: tonemap-op / 3D-LUT / soft-knee bloom setters/getters ── */
+
+void jce_postfx_set_motion_blur(JcePostFXPipeline *p, bool enabled,
+                                float intensity)
+{
+    if (!p) return;
+    p->mb_enabled   = enabled;
+    /* Clamped rather than trusted: this reaches a shader loop, and a negative
+     * intensity would smear FORWARD along the motion, which looks like the
+     * image is being dragged by something that has not happened yet. */
+    p->mb_intensity = (intensity > 0.0f) ? intensity : 0.0f;
+    if (p->mb_intensity > 4.0f) p->mb_intensity = 4.0f;
+    if (!enabled) p->mb_active = false;
+}
+
+/* One view-space distance -> the depth value the buffer would hold for it. */
+static float pfx_project_depth(const jce_mat4 *proj, float dist)
+{
+    /* View space looks down -Z, so a distance in front of the camera is -z. */
+    jce_vec4 v = { 0.0f, 0.0f, -dist, 1.0f };
+    jce_vec4 c = jce_m4_mul_v4(proj, v);
+    if (c.w == 0.0f) return 0.0f;
+    float d = c.z / c.w;
+    /* GL's clip range is [-1,1] and the depth buffer stores [0,1]; D3D, Vulkan
+     * and Metal clip to [0,1] already.  bgfx reports which at runtime, so this
+     * is asked rather than assumed -- the shader then needs no branch at all. */
+    if (bgfx_get_caps()->homogeneousDepth) d = d * 0.5f + 0.5f;
+    return d;
+}
+
+void jce_postfx_set_depth_of_field(JcePostFXPipeline *p, bool enabled,
+                                   float focus_distance, float focus_range,
+                                   float max_coc, const float *proj16)
+{
+    if (!p) return;
+    p->dof_enabled = enabled;
+    /* 0 = the engine default, not "no blur": a scene authored before this
+     * field existed loads 0, and a depth-of-field switched on with a radius of
+     * zero would be on and invisible -- the exact shape of every unwired
+     * feature this engine has had. */
+    p->dof_max_coc = (max_coc > 0.0f) ? max_coc : 0.012f;
+    if (p->dof_max_coc > 0.25f) p->dof_max_coc = 0.25f;
+    p->dof_valid = false;
+    if (!enabled) { p->dof_active = false; return; }
+    if (!proj16) return;
+
+    if (!(focus_distance > 0.0f)) focus_distance = 1.0f;
+    if (!(focus_range > 0.0f))    focus_range    = 0.001f;
+
+    jce_mat4 proj;
+    memcpy(proj.raw, proj16, sizeof proj.raw);
+
+    /* The band, and where the blur reaches full: twice the range out on each
+     * side.  The near edge is clamped off zero because a focus distance
+     * inside the near plane projects to nonsense, and a distance of zero is
+     * what an unset scene field holds. */
+    const float near_edge = (focus_distance - focus_range > 0.01f)
+                          ? focus_distance - focus_range : 0.01f;
+    const float near_full = (focus_distance - focus_range * 2.0f > 0.01f)
+                          ? focus_distance - focus_range * 2.0f : 0.005f;
+    float d[4] = {
+        pfx_project_depth(&proj, near_edge),
+        pfx_project_depth(&proj, focus_distance + focus_range),
+        pfx_project_depth(&proj, near_full),
+        pfx_project_depth(&proj, focus_distance + focus_range * 2.0f),
+    };
+
+    /* SORT into the shader's contract: [0],[1] the band, [2],[3] outside it.
+     * Which projected value is numerically smaller depends on the depth
+     * convention -- reverse-Z swaps them -- and sorting here is what lets the
+     * shader ask only "is this outside the band", with no per-backend branch
+     * to get mirrored. */
+    if (d[0] > d[1]) { float t = d[0]; d[0] = d[1]; d[1] = t; }
+    if (d[2] > d[3]) { float t = d[2]; d[2] = d[3]; d[3] = t; }
+    if (d[2] > d[0]) d[2] = d[0];
+    if (d[3] < d[1]) d[3] = d[1];
+    memcpy(p->dof_depths, d, sizeof d);
+    p->dof_valid = true;
+}
+
+bool jce_postfx_get_depth_of_field(const JcePostFXPipeline *p)
+{
+    return p && p->dof_enabled;
+}
+
+bool jce_postfx_get_depth_of_field_active(const JcePostFXPipeline *p)
+{
+    return p && p->dof_active;
+}
+
+bool jce_postfx_get_motion_blur(const JcePostFXPipeline *p)
+{
+    return p && p->mb_enabled;
+}
+
+bool jce_postfx_get_motion_blur_active(const JcePostFXPipeline *p)
+{
+    return p && p->mb_active;
+}
+
+void jce_postfx_set_auto_exposure(JcePostFXPipeline *p, bool enabled,
+                                  const JceAutoExposureDesc *desc)
+{
+    if (!p) return;
+    p->ae_desc = desc ? *desc : jce_auto_exposure_desc_default();
+    if (p->ae_enabled == enabled) return;
+    p->ae_enabled = enabled;
+    if (!enabled) {
+        /* Release the metering targets AND forget the adapted state.  Not
+         * only tidiness: leaving ae_have_ev set means a later re-enable opens
+         * on a stale exposure measured in a different scene, which looks like
+         * a one-second flash the moment the feature is switched back on. */
+        ae_destroy_targets(p);
+        p->ae_have_ev  = false;
+        p->ae_ev       = 0.0f;
+        p->ae_measured = 0.0f;
+        p->ae_last_ns  = 0u;
+    }
+}
+
+bool jce_postfx_get_auto_exposure(const JcePostFXPipeline *p)
+{
+    return p && p->ae_enabled;
+}
+
+void jce_postfx_get_auto_exposure_desc(const JcePostFXPipeline *p,
+                                       JceAutoExposureDesc *out)
+{
+    if (!p || !out) return;
+    *out = p->ae_desc;
+}
+
+float jce_postfx_get_effective_exposure(const JcePostFXPipeline *p)
+{
+    return p ? ae_effective_exposure(p) : 1.0f;
+}
+
+float jce_postfx_get_measured_luminance(const JcePostFXPipeline *p)
+{
+    return p ? p->ae_measured : 0.0f;
+}
+
+float jce_postfx_get_exposure_ev(const JcePostFXPipeline *p)
+{
+    return (p && p->ae_have_ev) ? p->ae_ev : 0.0f;
+}
 
 void jce_postfx_set_tonemap_op(JcePostFXPipeline *p, int op) {
     if (!p) return; if (op < 0) op = 0; if (op > 2) op = 0; p->tonemap_op = op;
@@ -955,11 +1422,50 @@ void jce_postfx_set_view_base(JcePostFXPipeline *pipeline, uint16_t base)
 
 /* ── Apply ─────────────────────────────────────────────────────────── */
 
+/* Whether TAA is actually resolving, reported on change.
+ *
+ * Reported from apply() rather than from set_taa(), because what matters to a
+ * comparison is the state in force when the frame is drawn, and because a host
+ * that never calls set_taa() at all would otherwise say nothing -- which is
+ * indistinguishable, in a log, from a host that turned it off.
+ *
+ * It exists because TAA presence is an editor-vs-runtime difference that no
+ * output names. Measured 2026-09-22 on examples/snake_seven: the editor's Game
+ * View resolves TAA and the shipped exe does not, because
+ * jce_scene_renderer_taa_begin_frame() -- the only path that enables it on the
+ * shared pipeline -- has exactly one caller, the editor's Scene view. Forcing
+ * it off on both sides took the same static frame from 12.50% of pixels
+ * differing to 2.98%, and took a wall edge from 3.003 px apart to 0.000.
+ * Without this line that is a pixel count with no name attached.
+ *
+ * JCE_LOG_TAA=1 raises it to WARN, for the same reason as the ambient and
+ * camera lines: JCE_DIST compiles LOG_INFO out of every SDK consumer exe, so
+ * an INFO-only line would speak in the editor and be silent in the game --
+ * mute in exactly the half of the comparison it exists to make. */
+static void postfx_log_taa_state(const JcePostFXPipeline *pipeline)
+{
+    static int  loud = -1;
+    static int  last = -1;
+    if (loud < 0) {
+        const char *v = getenv("JCE_LOG_TAA");
+        loud = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    const int now = pipeline->taa_enabled ? 1 : 0;
+    if (now == last)
+        return;
+    last = now;
+    if (loud)
+        LOG_WARN(LOG_TAG, "taa resolve: %s", now ? "on" : "off");
+    else
+        LOG_INFO(LOG_TAG, "taa resolve: %s", now ? "on" : "off");
+}
+
 void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_color,
                       JceTextureHandle scene_depth)
 {
     if (!pipeline) return;
+    postfx_log_taa_state(pipeline);
 
     /* Declare the chain's view range. It re-bases (jce_postfx_set_view_base)
      * and spans view_base..+20 -- exactly the span another subsystem assumed
@@ -992,6 +1498,20 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         pipeline->taa_enabled &&
         pipeline->prog_taa.idx != UINT16_MAX &&
         (have_ext_motion || have_cam_motion);
+
+    /* MOTION BLUR shares TAA's motion source and nothing else -- no history,
+     * no target, no view.  It is decided here, beside TAA, because the two
+     * answers come from the same two facts and splitting them is how they
+     * drift apart.  mb_active is published so a caller can tell "enabled" from
+     * "actually doing something": with no velocity buffer and no camera
+     * matrices there is nothing to blur ALONG, and quietly rendering an
+     * unblurred frame while the toggle says ON is the exact defect this
+     * feature exists to close. */
+    const bool mb_run = pipeline->mb_enabled &&
+                        pipeline->mb_intensity > 0.0f &&
+                        (have_ext_motion || have_cam_motion);
+    pipeline->mb_active = mb_run;
+    bgfx_texture_handle_t mb_motion_tex = { UINT16_MAX };
 
     /* Count active effects. */
     int active = 0;
@@ -1028,6 +1548,75 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         (float)pipeline->height
     };
     bgfx_set_uniform(pipeline->u_texelSize, texel_size, 1);
+
+    /* AUTO EXPOSURE metering, on view_base+19.
+     *
+     * The chain's worst case ends at +18 and the present sits at +20, so +19
+     * is free INSIDE the 21-view band this function already claims: no view
+     * reservation moves, which matters because the last pass that assumed a
+     * neighbouring span was free silently stopped producing pixels.
+     *
+     * It meters `scene_color` -- the chain INPUT, before tonemap.  After the
+     * tonemap a bright scene and a dim one compress into nearly the same
+     * numbers and the measurement stops being about the scene at all. */
+    {
+        bgfx_texture_handle_t meter_src = { scene_color.idx };
+        /* Draw on +19, blit on +20.  Both are inside the 21-view band this
+         * function already claims, so no view reservation moves -- and +20 is
+         * the present view, whose own draw happens after its blit queue and
+         * never touches the metering target. */
+        ae_update(pipeline,
+                  (uint16_t)(pipeline->view_base + 19),
+                  (uint16_t)(pipeline->view_base + 20), meter_src);
+    }
+
+    /* MOTION SOURCE WITHOUT TAA.
+     *
+     * When TAA runs it has already produced (or been handed) a motion field
+     * above and motion blur takes that one -- running the pass twice would be
+     * the same picture at twice the cost.  When TAA is OFF, view_base+0 is
+     * free (it is TAA's motion slot) and the camera-only reprojection runs
+     * there, so motion blur does NOT require TAA to be on.  That
+     * independence is the point: they are two consumers of one measurement,
+     * not one feature. */
+    if (mb_run && mb_motion_tex.idx == UINT16_MAX) {
+        /* THE CAMERA-ONLY REPROJECTION, AND NOT THE PER-OBJECT VELOCITY
+         * BUFFER, and that is a measurement rather than a preference.
+         *
+         * The renderer's velocity G-buffer is the better source in principle:
+         * it moves with animated and skinned geometry, which this pass cannot.
+         * But measured on 2026-09-06 with the camera spinning 1.5 deg/frame,
+         * what it contains is |delta| ~ 6e-5 NDC -- 0.08 of a pixel -- i.e.
+         * its "previous" view-proj is this frame's, so it expresses no camera
+         * motion at all.  Blurring along it produced a frame at the capture
+         * noise floor: 0.898%% of pixels, >16 at 0.01%%, against a floor of
+         * 0.403%% / 0.00%%.  The same scene through this pass moves 78.7%% of
+         * pixels with >16 at 10.05%%.
+         *
+         * Preferring a source that measures zero would have shipped the
+         * feature as "on and doing nothing" -- the exact defect it was written
+         * to close.  The velocity buffer's own gap is real and is TAA's
+         * problem too (a reprojection that thinks nothing moved over-trusts
+         * history exactly when the camera turns); it is recorded, not fixed
+         * here, because fixing it needs its own before/after. */
+        if (ensure_taa_motion_fbo(pipeline)) {
+            const uint16_t v_mb = (uint16_t)(pipeline->view_base + 0);
+            bgfx_set_uniform(pipeline->u_taaInvViewProj,  pipeline->taa_inv_view_proj,  1);
+            bgfx_set_uniform(pipeline->u_taaPrevViewProj, pipeline->taa_prev_view_proj, 1);
+            bgfx_texture_handle_t depth_tex = { scene_depth.idx };
+            bgfx_set_view_rect(v_mb, 0, 0, (uint16_t)pipeline->width,
+                               (uint16_t)pipeline->height);
+            bgfx_set_view_frame_buffer(v_mb, pipeline->taa_motion_fb);
+            bgfx_set_view_clear(v_mb, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
+            bgfx_set_view_name(v_mb, "PostFX/MotionBlur_Motion", INT32_MAX);
+            bgfx_set_texture(0, pipeline->u_texDepth, depth_tex, UINT32_MAX);
+            draw_fullscreen(pipeline, v_mb, pipeline->prog_motion_vec);
+            mb_motion_tex = pipeline->taa_motion_tex;
+        }
+    }
+    /* Allocation failed, or the source turned out to be a stand-in: say so
+     * rather than reporting the feature as active with nothing behind it. */
+    if (mb_motion_tex.idx == UINT16_MAX) pipeline->mb_active = false;
 
     /* Track current input texture. Start with the scene color. */
     bgfx_texture_handle_t current_tex = { scene_color.idx };
@@ -1088,6 +1677,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * camera-reprojection fallback still works. */
         const bool use_ext_motion =
             (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
+        bool motion_ok = true;   /* false only on the OOM stand-in below */
         /* Camera-only fallback: lazily allocate taa_motion_fb here (the common
          * external-velocity path never touches it, so it stays unallocated and
          * saves a full-res RGBA16F). */
@@ -1111,7 +1701,18 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             /* OOM: bind a valid handle so the resolve sampler is satisfied
              * (TAA degrades to ~no reprojection rather than crashing). */
             motion_tex = pipeline->taa_history_tex;
+            /* ...but do NOT hand that to motion blur: it is the HISTORY
+             * COLOUR standing in for a sampler, and read as a velocity field
+             * it would smear every pixel along whatever the last frame
+             * happened to look like. */
+            motion_ok = false;
         }
+        /* TAA's camera-only field is the same picture motion blur wants, so
+         * reuse it rather than rendering it twice.  motion_ok is false only
+         * when TAA fell back to the history texture as a sampler stand-in --
+         * read as a velocity field that would smear every pixel along
+         * whatever last frame looked like. */
+        if (motion_ok && !use_ext_motion) mb_motion_tex = motion_tex;
 
         /* (b) resolve pass: current colour + history + motion → fbo[ping].
          * On the first frame (history_valid false) the history buffer is empty;
@@ -1300,25 +1901,75 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         const bool c_chroma  = pipeline->enabled[JCE_POSTFX_CHROMATIC];
         const bool c_vig     = pipeline->enabled[JCE_POSTFX_VIGNETTE];
         const bool c_gray    = pipeline->enabled[JCE_POSTFX_GRAYSCALE];
-        const bool any_comp  = c_bloom || c_tonemap || c_chroma || c_vig || c_gray;
+        /* Motion blur lives INSIDE this pass, so it has to be able to keep
+         * the pass alive on its own -- otherwise it silently does nothing on
+         * a chain with tonemap, bloom and the rest switched off. */
+        const bool c_mblur   = pipeline->mb_active &&
+                               mb_motion_tex.idx != UINT16_MAX;
+        /* Depth of field lives inside this pass too, so it also has to keep
+         * the pass alive on its own -- and it needs a real depth texture, not
+         * merely to be switched on.  pipeline->dof_active records which of
+         * those two was missing, so jce_postfx_get_depth_of_field_active()
+         * can answer "is it doing anything" rather than "is it on". */
+        const bool c_dof     = pipeline->dof_enabled && pipeline->dof_valid &&
+                               scene_depth.idx != UINT16_MAX;
+        pipeline->dof_active = c_dof;
+        const bool any_comp  = c_bloom || c_tonemap || c_chroma || c_vig ||
+                               c_gray || c_mblur || c_dof;
 
         if (any_comp && pipeline->prog_composite.idx != UINT16_MAX) {
             float flags[4]   = { c_bloom ? 1.0f : 0.0f, c_tonemap ? 1.0f : 0.0f,
                                  c_chroma ? 1.0f : 0.0f, c_vig ? 1.0f : 0.0f };
-            float flags2[4]  = { c_gray ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+            float flags2[4]  = { c_gray ? 1.0f : 0.0f, c_mblur ? 1.0f : 0.0f,
+                                 c_dof ? 1.0f : 0.0f,
+                                 c_dof ? pipeline->dof_max_coc : 0.0f };
+            /* z = half a texel in UV: the length below which the blur must
+             * be a no-op.  Resolution-relative, because a fixed constant is a
+             * different fraction of a pixel on every display. */
+            float mblur_p[4] = { pipeline->mb_intensity, pipeline->mb_max_uv,
+                                 0.5f / (float)(pipeline->width ? pipeline->width : 1u),
+                                 0.0f };
             float bloom_p[4] = { pipeline->params.bloom_threshold,
                                  pipeline->params.bloom_intensity,
                                  pipeline->bloom_knee, 0.0f };
             /* tonemap_p.z = selectable op id (0=ACES, 1=Neutral, 2=AgX).
              * The shader dispatches on this via step() comparisons (no ==). */
-            float tonemap_p[4] = { pipeline->params.exposure,
-                                   pipeline->params.gamma,
+            /* The ADAPTED exposure when auto exposure is on, and exactly
+             * pipeline->params.exposure when it is off -- so a project that
+             * never enables it is byte-identical here. */
+            /* GAMMA colour space encodes nothing on the way out, because
+             * nothing decoded on the way in: the same one decision, read from
+             * the same authority the hardware sRGB view is read from.  In
+             * LINEAR this is the project's gamma exactly as before. */
+            const float tonemap_gamma = jce_texture_colour_space()
+                                      ? pipeline->params.gamma : 1.0f;
+            float tonemap_p[4] = { ae_effective_exposure(pipeline),
+                                   tonemap_gamma,
                                    (float)pipeline->tonemap_op, 0.0f };
             float chrom_p[4] = { pipeline->params.chromatic_strength, 0.0f, 0.0f, 0.0f };
             float vig_p[4]   = { pipeline->params.vignette_intensity,
                                  pipeline->params.vignette_smoothness, 0.0f, 0.0f };
             bgfx_set_uniform(pipeline->u_compositeFlags,  flags,  1);
             bgfx_set_uniform(pipeline->u_compositeFlags2, flags2, 1);
+            bgfx_set_uniform(pipeline->u_motionBlurParams, mblur_p, 1);
+            /* Stage 3 is bound UNCONDITIONALLY.  A sampler a shader declares
+             * and nothing binds makes WebGL2 reject the whole draw -- the same
+             * defect the 1x1 dummy LUT below exists for -- so when motion blur
+             * is off the stage is parked on the pass's own input, which is
+             * already resident and is never sampled. */
+            bgfx_set_texture(3, pipeline->u_texMotion,
+                             c_mblur ? mb_motion_tex : current_tex, UINT32_MAX);
+            /* Stage 4, same rule and for the same reason: a declared sampler
+             * that nothing binds makes WebGL2 reject the draw, so when depth
+             * of field is off the stage is parked on the pass's own input. */
+            {
+                bgfx_texture_handle_t dth;
+                dth.idx = c_dof ? scene_depth.idx : current_tex.idx;
+                bgfx_set_texture(4, pipeline->u_texDepthComposite, dth, UINT32_MAX);
+                float dof_p[4] = { pipeline->dof_depths[0], pipeline->dof_depths[1],
+                                   pipeline->dof_depths[2], pipeline->dof_depths[3] };
+                bgfx_set_uniform(pipeline->u_dofParams, dof_p, 1);
+            }
             bgfx_set_uniform(pipeline->u_bloomParams,     bloom_p, 1);
             bgfx_set_uniform(pipeline->u_tonemapParams,   tonemap_p, 1);
             bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);

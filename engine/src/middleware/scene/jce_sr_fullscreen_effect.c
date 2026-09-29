@@ -368,6 +368,26 @@ JceTextureHandle jce_scene_renderer_apply_fullscreen_effects(
         dt_sec = 0.0f;
     }
 
+    /* THE CAP.  One view per stage from view_id_base upward, and the ids
+     * above this belong to other passes -- see JCE_VIEW_SR_FULLSCREEN_MAX.
+     * Dropping the overflow is the only safe answer: bgfx view state is
+     * last-write-wins, so running the seventh stage would not fail, it would
+     * quietly delete somebody else's pass. */
+    if (collect.count > JCE_VIEW_SR_FULLSCREEN_MAX) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            LOG_WARN(LOG_TAG,
+                     "fullscreen effects: %u requested, %u is the per-viewport "
+                     "view budget -- the rest are dropped (see "
+                     "JCE_VIEW_SR_FULLSCREEN_MAX in jce_views.h)",
+                     (unsigned)collect.count,
+                     (unsigned)JCE_VIEW_SR_FULLSCREEN_MAX);
+        }
+        stage->dropped_count += collect.count - JCE_VIEW_SR_FULLSCREEN_MAX;
+        collect.count = JCE_VIEW_SR_FULLSCREEN_MAX;
+    }
+
     for (uint32_t i = 0; i < collect.count; ++i) {
         const SrFullscreenItem *item = &collect.items[i];
         SrFullscreenEffectSlot *slot = sr_fullscreen_get_slot(

@@ -82,15 +82,10 @@ const JceModelNode   *jce_model_get_node(const JceModel *model, uint32_t index);
 uint32_t              jce_model_material_count(const JceModel *model);
 const JcePbrMaterial *jce_model_get_material(const JceModel *model, uint32_t index);
 
-/* Number of imported morph-weight animation tracks. */
-uint32_t jce_model_morph_anim_count(const JceModel *model);
-
-/* Get a morph-weight track and the node/animation it drives (out args may be
- * NULL).  Returns NULL if index is out of range.  Sample with
- * jce_morph_weight_track_sample to drive a node's per-instance weights. */
-const JceMorphWeightTrack *jce_model_morph_anim_track(
-    const JceModel *model, uint32_t index,
-    uint32_t *out_anim_index, uint32_t *out_node_index);
+/* jce_model_morph_anim_count / _track moved to the PUBLIC header, which this
+ * one includes: they hand back opaque things, and the scene renderer needs
+ * them from outside engine/src/renderer/ -- where it was reaching them
+ * through an implicit declaration that truncated the returned pointer. */
 
 #ifdef __cplusplus
 }

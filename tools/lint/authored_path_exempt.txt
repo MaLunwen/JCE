@@ -1,0 +1,21 @@
+# check_authored_path_consumed.py — authored path fields with NO reader under
+# engine/src, each with what closing it needs.  Format: `field  reason`.
+#
+# Every line here is a designer-facing control that does nothing in a shipped
+# game.  None of them errors: an unread path renders exactly like an unset one.
+# Delete a line when its reader lands -- the gate fails on an exemption that
+# has outlived its reason.
+#
+# THE FIRST VERSION OF THIS FILE HAD THREE WRONG REASONS, and all three were
+# wrong the same way: a search came back empty for a reason other than the one
+# claimed.  `grep JCE_API engine/include/jce/middleware/vfx/` found no VFX
+# loader because THAT DIRECTORY DOES NOT EXIST; a grep of jce_sr_environment.c
+# found no probe code because probe baking is not in that file; and the avatar
+# reason asserted the editor loads avatars, which it does not.  Two of the
+# three conclusions happened to survive -- which makes them lucky, not
+# verified.  Every claim below now names the file it was read from.
+
+avatar_path NOT an editor/runtime split -- the loader does not exist in either. jce_avatar_load (engine/src/middleware/animation/jce_avatar.c:15) deliberately returns NULL and says so: "This is a stub: nothing here can parse a humanoid rig... NULL is the truthful answer until the P5 loader lands." The editor calls it from jce_panel_animation_rigging.cpp:86 and :111 and handles the NULL; engine/src calls it nowhere. So the field is unread because the thing that would read it has not been written, not because a wire is missing. Closing it means the P5 humanoid-rig loader, and only then a runtime caller.
+
+
+graph_path A missing SUBSYSTEM, not a missing wire. Outside the component definition in jce_scene.h, "VfxGraph" appears in exactly two engine sources -- jce_scene.c and jce_scene_components_json.c -- which store the component and round-trip its JSON. There is no loader, no evaluator and no renderer for a VFX graph anywhere under engine/src, so there is nothing for a reader to call. (editor/src/panels/material_graph/ is a MATERIAL graph and unrelated.)

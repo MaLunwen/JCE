@@ -67,5 +67,36 @@ JCE_API bool jce_save_register_scene_provider_ex(JceSnapshotRegistry      *reg,
  */
 JCE_API void jce_save_unregister_scene_provider(JceSnapshotRegistry *reg);
 
+/*
+ * Register the scene ENVIRONMENT snapshot provider on `reg` under section id
+ * "scene_env".
+ *
+ * The scene_ecs section above captures authored data through the scene JSON
+ * schema, and the live environment is deliberately not in that schema: writing
+ * it there would put a running clock into the authored scene file, so saving a
+ * level from the editor would bake whatever hour the preview had reached.  This
+ * is the other half -- four ACCUMULATED values that a session earns and cannot
+ * re-derive:
+ *
+ *   the hour of day, the monotonic world_time_seconds behind it, and the
+ *   global_wetness / snow_amount integrators
+ *
+ * Everything else in JceEnvironmentState is recomputed from the authored
+ * settings on the next advance (weather, wind, humidity, temperature, and the
+ * sun placed from the hour), so persisting it would be persisting a cache.
+ *
+ * A save written before this section existed simply lacks it, and the snapshot
+ * loader skips unknown sections -- so an old save loads and the hour falls back
+ * to the scene's authored tod_hour.  No version bump, no migration entry.
+ *
+ * `scene` must outlive any save/load call routed through `reg`.  The scene
+ * pointer IS the user data, so there is no context to free and no unregister
+ * counterpart: jce_snapshot_unregister(reg, "scene_env") is enough.
+ *
+ * Returns true when the provider was registered.
+ */
+JCE_API bool jce_save_register_env_provider(JceSnapshotRegistry *reg,
+                                            JceScene            *scene);
+
 JCE_EXTERN_C_END
 #endif /* JCE_SAVE_PROVIDERS_H */

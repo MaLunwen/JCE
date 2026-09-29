@@ -763,6 +763,15 @@ bool jce_cloud_noise_bake_atlas(const JceCloudNoiseParams *p, float *out,
                                 uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
                                 uint32_t tiles_x)
 {
+    return jce_cloud_noise_bake_atlas_controlled(
+        p, out, dim_x, dim_y, dim_z, tiles_x, NULL, NULL);
+}
+
+bool jce_cloud_noise_bake_atlas_controlled(
+    const JceCloudNoiseParams *p, float *out,
+    uint32_t dim_x, uint32_t dim_y, uint32_t dim_z, uint32_t tiles_x,
+    JceCloudBakeProgressFn progress, void *user)
+{
     JceCloudNoiseParams sp;
     uint32_t w = 0u, h = 0u, k;
 
@@ -776,6 +785,9 @@ bool jce_cloud_noise_bake_atlas(const JceCloudNoiseParams *p, float *out,
      * tiles_x) are defined rather than whatever the caller's buffer held. */
     memset(out, 0, (size_t)w * (size_t)h * sizeof(float));
 
+    if (progress && !progress(user, 0u, dim_z))
+        return false;
+
     cloud_sanitize(p, &sp);
     for (k = 0; k < dim_z; ++k) {
         const uint32_t tx = k % tiles_x;
@@ -783,6 +795,8 @@ bool jce_cloud_noise_bake_atlas(const JceCloudNoiseParams *p, float *out,
         float *slice = out + (size_t)ty * (size_t)dim_y * (size_t)w +
                        (size_t)tx * (size_t)dim_x;
         cloud_bake_slice(&sp, k, dim_x, dim_y, dim_z, slice, (size_t)w);
+        if (progress && !progress(user, k + 1u, dim_z))
+            return false;
     }
     return true;
 }

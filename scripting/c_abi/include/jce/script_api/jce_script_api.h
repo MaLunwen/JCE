@@ -67,7 +67,7 @@ extern "C" {
 
 /* Entry points that are a manifest entry; the library exports these plus
  * the 3 meta entry points below. */
-#define JCE_SCRIPT_API_ENTRY_COUNT 71
+#define JCE_SCRIPT_API_ENTRY_COUNT 101
 
 /* Opaque: the library owns the host copy, the caller owns nothing. */
 typedef struct JceScriptApi JceScriptApi;
@@ -99,22 +99,30 @@ JCE_SCRIPT_API void jce_script_api_close(JceScriptApi *api);
  *  would hand a binding the unvalidated primitive.  The manifest's own
  *  reasons, verbatim:
  *
+ *    line_set_points
+ *        marshalling, not glue: the host takes a packed `const float *xyz,
+ *        int count` and no generated shape reads a Lua array into one.
+ *        Hand-written so the table walk, the JCE_LINE_MAX_POINTS clamp and
+ *        the returned stored-count live in one place. Exists because the
+ *        comp_set/JSON route is O(n^2): cJSON resolves each flat px/py/pz key
+ *        by walking the object's child list (jce_scene_components_render.c
+ *        parse_line_renderer)
  *    log
- *        no-host fallback: the LOG_INFO else-branch at jce_script.c:62 is the
+ *        no-host fallback: the LOG_INFO else-branch at jce_script.c:63 is the
  *        only one among the 78
  *    asset_read_text
- *        policy, not glue: script_virtual_asset_path_valid (:66, called
- *        :102), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap
- *        (jce_script.h:86), jce_free on every exit path. A generated
+ *        policy, not glue: script_virtual_asset_path_valid (:67, called
+ *        :103), the 1 MiB JCE_SCRIPT_TEXT_ASSET_MAX_BYTES cap
+ *        (jce_script.h:114), jce_free on every exit path. A generated
  *        read_file template is a sandbox escape (P0-2)
  *    asset_read_json
  *        all of asset_read_text (the same script_virtual_asset_path_valid at
- *        :219) plus a depth- and node-capped JSON walk, non-finite rejection,
+ *        :220) plus a depth- and node-capped JSON walk, non-finite rejection,
  *        the json_null sentinel and distinct string error codes (P0-2)
  *    play_sound
- *        arity dispatch across two members: lua_gettop at :263 routes to
- *        play_sound_spatial (:286) or play_sound (:289); its own comment at
- *        :280 concedes top == 3 is ambiguous
+ *        arity dispatch across two members: lua_gettop at :264 routes to
+ *        play_sound_spatial (:287) or play_sound (:290); its own comment at
+ *        :281 concedes top == 3 is ambiguous
  *    start_coroutine
  *        Lua VM machinery: lua_newthread / lua_xmove / luaL_ref / lua_resume;
  *        owns s->coros[]
@@ -125,7 +133,12 @@ JCE_SCRIPT_API void jce_script_api_close(JceScriptApi *api);
  * ------------------------------------------------------------------ */
 
 /* jce_script_api_get_position -- shape: fallible_out, since 1
- * World-space position of `entity`. Absent when the entity has no transform.
+ * LOCAL position of `entity` -- its own translation, not composed up the
+ * parent chain. Absent when the entity has no transform. Use
+ * get_world_position for the composed pose. This doc said 'World-space' until
+ * 2026-08-26; the implementation always returned the local TRS
+ * (jce_scene_get_transform), and the wrong word was generated into all five
+ * language SDKs.
  */
 JCE_SCRIPT_API bool jce_script_api_get_position(JceScriptApi *api,
                                                 JceScriptEntity e,
@@ -154,6 +167,16 @@ JCE_SCRIPT_API void jce_script_api_set_rotation(JceScriptApi *api,
 JCE_SCRIPT_API bool jce_script_api_get_scale(JceScriptApi *api,
                                              JceScriptEntity e,
                                              float out_xyz[3]);
+
+/* jce_script_api_get_world_position -- shape: fallible_out, since 1
+ * WORLD position of `entity`: its local TRS composed up the parent chain
+ * (jce_scene_get_world_matrix). Absent when the entity has no transform.
+ * Every parented rig -- arms, jaws, fingers, pads -- needs this rather than
+ * get_position.
+ */
+JCE_SCRIPT_API bool jce_script_api_get_world_position(JceScriptApi *api,
+                                                      JceScriptEntity e,
+                                                      float out_xyz[3]);
 
 /* jce_script_api_set_scale -- shape: void_call, since 1
  */
@@ -283,6 +306,40 @@ JCE_SCRIPT_API bool jce_script_api_raycast(JceScriptApi *api,
                                            const float origin[3],
                                            const float dir[3], float max_dist,
                                            JceScriptRaycastHit *out);
+
+/* jce_script_api_raycast_filtered -- shape: fallible_out, since 1
+ * Closest hit along the ray, honouring a layer mask and the trigger skip -- 8
+ * values on a hit; a MISS pushes integer 0, not nil, so scripts branch on `e
+ * == 0`, the same as jce.raycast. layer_mask 0 means every layer and
+ * hit_triggers defaults to false, so the common call stays
+ * origin/dir/distance and the filter is what you add when you need it.
+ * hit_triggers is separate from the mask because a trigger volume is not a
+ * layer: collapsing them would make 'ignore triggers on layer 3'
+ * inexpressible.
+ */
+JCE_SCRIPT_API bool jce_script_api_raycast_filtered(JceScriptApi *api,
+                                                    const float origin[3],
+                                                    const float dir[3],
+                                                    float max_dist,
+                                                    uint32_t layer_mask,
+                                                    bool hit_triggers,
+                                                    JceScriptRaycastHit *out);
+
+/* jce_script_api_raycast_all -- shape: entity_table, since 1
+ * Every entity the ray passes through, as one array sorted near to far.
+ * layer_mask 0 means every layer; hit_triggers defaults to false. Returns
+ * ENTITIES rather than full hit records because the eight-value hit does not
+ * survive as an array shape across seven languages without inventing a
+ * per-language container -- re-query a specific one with jce.raycast_filtered
+ * when you need its point and normal.
+ */
+JCE_SCRIPT_API int jce_script_api_raycast_all(JceScriptApi *api,
+                                              const float origin[3],
+                                              const float dir[3],
+                                              float max_dist,
+                                              uint32_t layer_mask,
+                                              bool hit_triggers,
+                                              JceScriptEntity *out, int max);
 
 /* jce_script_api_apply_impulse -- shape: void_call, since 1
  */
@@ -415,6 +472,17 @@ JCE_SCRIPT_API bool jce_script_api_ui_get_slider(JceScriptApi *api,
  */
 JCE_SCRIPT_API void jce_script_api_ui_set_slider(JceScriptApi *api,
                                                  JceScriptEntity e, float v);
+
+/* jce_script_api_ui_get_progress -- shape: fallible_out, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_ui_get_progress(JceScriptApi *api,
+                                                   JceScriptEntity e,
+                                                   float *out);
+
+/* jce_script_api_ui_set_progress -- shape: void_call, since 1
+ */
+JCE_SCRIPT_API void jce_script_api_ui_set_progress(JceScriptApi *api,
+                                                   JceScriptEntity e, float v);
 
 /* jce_script_api_ui_get_toggle -- shape: fallible_out, since 1
  */
@@ -560,6 +628,217 @@ JCE_SCRIPT_API bool jce_script_api_render_set(JceScriptApi *api,
 JCE_SCRIPT_API void jce_script_api_audio_set_volume(JceScriptApi *api,
                                                     JceScriptEntity e,
                                                     float volume);
+
+/* jce_script_api_ui_get_dropdown -- shape: fallible_out, since 1
+ * Selected option INDEX of `entity`'s UIDropdown. Absent when the entity has
+ * no dropdown, so a script can tell 'no dropdown' from 'a dropdown reading
+ * 0'. The index and not the label: branching on which option is the common
+ * case, and a label would make it a string compare.
+ */
+JCE_SCRIPT_API bool jce_script_api_ui_get_dropdown(JceScriptApi *api,
+                                                   JceScriptEntity e, int *out);
+
+/* jce_script_api_ui_set_dropdown -- shape: void_call, since 1
+ * Select an option by INDEX. Clamped into [0, option_count-1] rather than
+ * refused, the way ui_set_progress clamps and the way the scene loader
+ * clamps: the draw already clamps, so storing outside the range would make
+ * the component and the picture disagree.
+ */
+JCE_SCRIPT_API void jce_script_api_ui_set_dropdown(JceScriptApi *api,
+                                                   JceScriptEntity e,
+                                                   int index);
+
+/* jce_script_api_ui_get_input_text -- shape: value_return, since 1
+ * Current text of `entity`'s UIInputField, or '' when it has none. The string
+ * is the component's own buffer and is valid until the next mutation of that
+ * entity -- the same contract tr() and get_locale() carry; every binding
+ * copies it and none may store it.
+ */
+JCE_SCRIPT_API const char *jce_script_api_ui_get_input_text(JceScriptApi *api,
+                                                            JceScriptEntity e);
+
+/* jce_script_api_ui_set_input_text -- shape: void_call, since 1
+ * Replace the UIInputField's text. Truncated to the field's capacity and to
+ * char_limit when one is set -- the same cap the canvas applies to typed
+ * input, so a script write and a keystroke cannot disagree about what the
+ * field holds. A truncation is logged rather than silent.
+ */
+JCE_SCRIPT_API void jce_script_api_ui_set_input_text(JceScriptApi *api,
+                                                     JceScriptEntity e,
+                                                     const char * text);
+
+/* jce_script_api_ui_get_scroll -- shape: fallible_out, since 1
+ * Scroll offset (x, y) of `entity`'s UIScrollView, in REFERENCE units -- what
+ * the component stores and what the wheel path clamps, not device px. Absent
+ * when the entity has no scroll view.
+ */
+JCE_SCRIPT_API bool jce_script_api_ui_get_scroll(JceScriptApi *api,
+                                                 JceScriptEntity e,
+                                                 float out_xy[2]);
+
+/* jce_script_api_ui_set_scroll -- shape: void_call, since 1
+ * Set the scroll offset in reference units. A disabled axis is pinned to 0
+ * and each axis is clamped the way the wheel path clamps, so a script cannot
+ * push the offset somewhere a wheel could not; the canvas re-clamps against
+ * the resolved viewport on the next render.
+ */
+JCE_SCRIPT_API void jce_script_api_ui_set_scroll(JceScriptApi *api,
+                                                 JceScriptEntity e, float x,
+                                                 float y);
+
+/* jce_script_api_world_get_hour -- shape: value_return, since 1
+ * Live hour of day in [0, 24) -- what the sky is showing now, NOT the
+ * authored tod_hour seed a scene starts from. Reading the seed would return
+ * the level's start-of-day forever while the sky moved.
+ */
+JCE_SCRIPT_API float jce_script_api_world_get_hour(JceScriptApi *api);
+
+/* jce_script_api_world_set_hour -- shape: void_call, since 1
+ * Move the live clock, wrapping into [0, 24). For 'sleep until dawn'. The
+ * authored seed is untouched, so reloading the scene still starts where the
+ * designer set it.
+ */
+JCE_SCRIPT_API void jce_script_api_world_set_hour(JceScriptApi *api,
+                                                  float hour);
+
+/* jce_script_api_world_is_daytime -- shape: value_return, since 1
+ * True while the sun is above the horizon. THE predicate for 'is it night?'
+ * -- every key-light chooser in the engine is required to agree on this one,
+ * so a script that rolled its own threshold would disagree with the lighting
+ * it can see.
+ */
+JCE_SCRIPT_API bool jce_script_api_world_is_daytime(JceScriptApi *api);
+
+/* jce_script_api_world_get_weather -- shape: value_return, since 1
+ * Authored weather type: 0 clear, 1 rain, 2 snow.
+ */
+JCE_SCRIPT_API int jce_script_api_world_get_weather(JceScriptApi *api);
+
+/* jce_script_api_world_get_weather_intensity -- shape: value_return, since 1
+ * Authored weather intensity in [0, 1].
+ */
+JCE_SCRIPT_API float jce_script_api_world_get_weather_intensity(JceScriptApi *api);
+
+/* jce_script_api_world_get_wind_speed -- shape: value_return, since 1
+ * Instantaneous wind speed in m/s -- the sustained speed plus this moment's
+ * gust. Do NOT key a cache on it: it changes every frame by design. It is the
+ * same number the ocean spectrum and the vegetation shader read, so a script
+ * cannot disagree with what is on screen.
+ */
+JCE_SCRIPT_API float jce_script_api_world_get_wind_speed(JceScriptApi *api);
+
+/* jce_script_api_request_scene -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_request_scene(JceScriptApi *api,
+                                                 const char * scene_path);
+
+/* jce_script_api_is_transitioning -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_is_transitioning(JceScriptApi *api);
+
+/* jce_script_api_audio_play -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_audio_play(JceScriptApi *api,
+                                              JceScriptEntity e);
+
+/* jce_script_api_audio_stop -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_audio_stop(JceScriptApi *api,
+                                              JceScriptEntity e);
+
+/* jce_script_api_audio_is_playing -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_audio_is_playing(JceScriptApi *api,
+                                                    JceScriptEntity e);
+
+/* jce_script_api_save_game -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_save_game(JceScriptApi *api,
+                                             const char * path);
+
+/* jce_script_api_load_game -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_load_game(JceScriptApi *api,
+                                             const char * path);
+
+/* jce_script_api_overlap_sphere -- shape: entity_table, since 1
+ * Entities whose collider overlaps the sphere, as one array. layer_mask 0
+ * means all layers. Triggers are skipped. layer_mask is OPTIONAL: omitting it
+ * means every layer, which is what an explosion or a pickup check wants and
+ * keeps the common call to its coordinates and its size.
+ */
+JCE_SCRIPT_API int jce_script_api_overlap_sphere(JceScriptApi *api, float x,
+                                                 float y, float z,
+                                                 float radius,
+                                                 uint32_t layer_mask,
+                                                 JceScriptEntity *out, int max);
+
+/* jce_script_api_overlap_box -- shape: entity_table, since 1
+ * Entities whose collider overlaps the axis-aligned box (half-extents), as
+ * one array. layer_mask 0 means all layers. layer_mask is OPTIONAL: omitting
+ * it means every layer, which is what an explosion or a pickup check wants
+ * and keeps the common call to its coordinates and its size.
+ */
+JCE_SCRIPT_API int jce_script_api_overlap_box(JceScriptApi *api, float x,
+                                              float y, float z, float hx,
+                                              float hy, float hz,
+                                              uint32_t layer_mask,
+                                              JceScriptEntity *out, int max);
+
+/* jce_script_api_get_param -- shape: fallible_out, since 1
+ * Returns kind, number, entity for an AUTHORED script parameter -- Unity's
+ * [SerializeField], Godot's @export. Returns nil when the entity has no
+ * script component, when no parameter of that name is authored, or when the
+ * name is empty: three absences a script cannot act differently on, so
+ * `jce.get_param(e, 'speed') or 3.0` reads the way an author expects.
+ */
+JCE_SCRIPT_API bool jce_script_api_get_param(JceScriptApi *api,
+                                             JceScriptEntity e,
+                                             const char * name, int *out_kind,
+                                             double *out_number,
+                                             JceScriptEntity *out_entity);
+
+/* jce_script_api_get_param_text -- shape: value_return, since 1
+ * The TEXT value of an authored script parameter, or '' when the entity has
+ * no script component, no parameter of that name, or one that is not text.
+ * Empty rather than nil for the same reason ui_get_input_text is empty: a
+ * script comparing strings should not have to test for nil first. The string
+ * is the component's own buffer -- copy it if you keep it.
+ */
+JCE_SCRIPT_API const char *jce_script_api_get_param_text(JceScriptApi *api,
+                                                         JceScriptEntity e,
+                                                         const char * name);
+
+/* jce_script_api_curve_eval -- shape: fallible_out, since 1
+ * Sample an AUTHORED curve -- the documents the editor's Curve Editor writes,
+ * which nothing could read until this binding existed. Unity's AnimationCurve
+ * shape: the curve is a designer-authored function and the script decides
+ * what it means, so the engine never has to invent what a curve DRIVES.
+ * Returns nil when the path does not resolve, the document does not parse,
+ * the named channel is absent, or that channel has no keys -- so a curve that
+ * genuinely evaluates to 0 and a curve that is not there are never one
+ * reading, and `jce.curve_eval(p, 'kick', t) or 0.0` reads the way an author
+ * expects. An empty channel name means the FIRST channel, which is a
+ * different request from a name that is not there. The parsed curve is cached
+ * per runtime, so a call inside on_update costs a name compare, not a JSON
+ * parse.
+ */
+JCE_SCRIPT_API bool jce_script_api_curve_eval(JceScriptApi *api,
+                                              const char * path,
+                                              const char * channel, double t,
+                                              double *out_value);
+
+/* jce_script_api_vcam_activate -- shape: value_return, since 1
+ * Cut to the virtual camera with this name, ahead of priority. Returns 1 when
+ * the name resolves to a camera that is active and enabled, 0 otherwise --
+ * the request is recorded either way, so naming a camera in a streaming cell
+ * that has not loaded yet does not silently become 'whatever priority says'.
+ * Pass an empty string to clear it and hand the decision back to priority. It
+ * does NOT rewrite the authored components: the override lives in the vcam
+ * system, so a cutscene cannot bake its camera choice into the level file.
+ */
+JCE_SCRIPT_API int jce_script_api_vcam_activate(JceScriptApi *api,
+                                                const char * name);
 
 #ifdef __cplusplus
 }

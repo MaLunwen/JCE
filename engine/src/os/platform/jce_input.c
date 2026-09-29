@@ -37,11 +37,25 @@ struct JceInput {
     /* Keyboard */
     bool keys_cur[JCE_KEY_COUNT];
     bool keys_prev[JCE_KEY_COUNT];
+    /* Down+up between frame samples must still reach gameplay once. */
+    bool keys_tap[JCE_KEY_COUNT];
+    /* Set on the frame a key goes down and on every OS auto-repeat frame.
+     * keys_cur/keys_prev cannot express repeat: on a repeat frame both are
+     * already true, so the rising edge is false and a held Backspace deletes
+     * exactly one byte.  Cleared by jce_input_update() like any per-frame
+     * delta. */
+    bool keys_repeat[JCE_KEY_COUNT];
+
+    /* Composed UTF-8 produced this frame by the platform text/IME layer.
+     * Accumulated because one frame can carry several commits. */
+    char text[256];
+    int  text_len;
 
     /* Mouse */
     float    mouse_x, mouse_y;
     float    mouse_dx, mouse_dy;
     float    wheel;
+    float    wheel_h;
     uint32_t mouse_cur;
     uint32_t mouse_prev;
 
@@ -138,6 +152,11 @@ void jce_input_update(JceInput *input)
     input->mouse_dx   = 0.0f;
     input->mouse_dy   = 0.0f;
     input->wheel       = 0.0f;
+    input->wheel_h     = 0.0f;
+    memset(input->keys_repeat, 0, sizeof(input->keys_repeat));
+    memset(input->keys_tap, 0, sizeof(input->keys_tap));
+    input->text[0]  = '\0';
+    input->text_len = 0;
 
     /* jce_input_devices_begin_frame() owns the button-edge roll now, for EVERY
      * device and all 128 bits of each -- the loop that used to sit here rolled
@@ -213,7 +232,14 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
 
     case JCE_INPUT_EVENT_KEY:
         if (ev->key.scancode < 0 || ev->key.scancode >= JCE_KEY_COUNT) break;
+        if (!ev->key.down && input->keys_cur[ev->key.scancode] &&
+            !input->keys_prev[ev->key.scancode])
+            input->keys_tap[ev->key.scancode] = true;
         input->keys_cur[ev->key.scancode] = ev->key.down ? true : false;
+        /* Down OR auto-repeat: both mean "the user wants another one of these
+         * this frame", which is what a text editor's Backspace needs. */
+        if (ev->key.down)
+            input->keys_repeat[ev->key.scancode] = true;
         /* A repeat counts: the key is still being held down deliberately. */
         if (ev->key.down)
             mark_virtual_active(input, (int)JCE_DEVCLASS_KEYBOARD);
@@ -245,10 +271,34 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
         break;
 
     case JCE_INPUT_EVENT_MOUSE_WHEEL:
-        input->wheel += ev->wheel.y;
+        input->wheel   += ev->wheel.y;
+        input->wheel_h += ev->wheel.x;
         if (ev->wheel.x != 0.0f || ev->wheel.y != 0.0f)
             mark_virtual_active(input, (int)JCE_DEVCLASS_MOUSE);
         break;
+
+    case JCE_INPUT_EVENT_TEXT: {
+        /* Append, never replace: an IME commit can arrive as several events in
+         * one frame and dropping all but the last would swallow characters.
+         * Truncate on overflow rather than splitting a UTF-8 sequence. */
+        int room = (int)sizeof(input->text) - 1 - input->text_len;
+        if (room <= 0) break;
+        int n = 0;
+        while (n < (int)sizeof(ev->text.utf8) && ev->text.utf8[n] != '\0') n++;
+        if (n > room) {
+            /* Back off to a UTF-8 boundary so a partial sequence never lands
+             * in the buffer (continuation bytes are 10xxxxxx). */
+            n = room;
+            while (n > 0 && ((unsigned char)ev->text.utf8[n] & 0xC0u) == 0x80u)
+                n--;
+        }
+        if (n <= 0) break;
+        memcpy(input->text + input->text_len, ev->text.utf8, (size_t)n);
+        input->text_len += n;
+        input->text[input->text_len] = '\0';
+        mark_virtual_active(input, (int)JCE_DEVCLASS_KEYBOARD);
+        break;
+    }
 
     case JCE_INPUT_EVENT_TOUCH:
         if (ev->touch.phase == JCE_INPUT_TOUCH_PHASE_UP)
@@ -354,7 +404,7 @@ void jce_input_submit(JceInput *input, const JceInputEvent *events, int count)
  * speaks -- and that question cannot be answered purely.
  *
  * jce_input_sdl_translate_live() is that gate and it lives in jce_input_sdl.c,
- * the one input TU allowed to name SDL (scripts/lint/check_input_seam.py).
+ * the one input TU allowed to name SDL (tools/lint/check_input_seam.py).
  * This file stays SDL-free; what changed here is one identifier.
  *
  * WHY THE GATE IS NOT IN open_device(), where "anything that needs to probe a
@@ -380,13 +430,25 @@ void jce_input_handle_event(JceInput *input, const void *platform_event)
 bool jce_input_key_down(const JceInput *input, JceKey key)
 {
     if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
-    return input->keys_cur[key];
+    return input->keys_cur[key] || input->keys_tap[key];
 }
 
 bool jce_input_key_pressed(const JceInput *input, JceKey key)
 {
     if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
-    return input->keys_cur[key] && !input->keys_prev[key];
+    return input->keys_tap[key] ||
+           (input->keys_cur[key] && !input->keys_prev[key]);
+}
+
+bool jce_input_key_repeated(const JceInput *input, JceKey key)
+{
+    if (!input || key < 0 || key >= JCE_KEY_COUNT) return false;
+    return input->keys_repeat[key];
+}
+
+const char *jce_input_text(const JceInput *input)
+{
+    return input ? input->text : "";
 }
 
 bool jce_input_key_released(const JceInput *input, JceKey key)
@@ -441,6 +503,11 @@ float jce_input_mouse_wheel(const JceInput *input)
     return input ? input->wheel : 0.0f;
 }
 
+float jce_input_mouse_wheel_h(const JceInput *input)
+{
+    return input ? input->wheel_h : 0.0f;
+}
+
 /* -- Touch queries -------------------------------------------------- */
 
 int jce_input_touch_count(const JceInput *input)
@@ -488,7 +555,7 @@ void jce_input_capture(const JceInput *input, JceInputFrame *out)
     out->key_count = (uint32_t)JCE_KEY_COUNT;
 
     for (i = 0; i < (int)JCE_KEY_COUNT && i < 64 * 64; ++i) {
-        if (input->keys_cur[i])
+        if (input->keys_cur[i] || input->keys_tap[i])
             out->keys_bits[i >> 6] |= (uint64_t)1 << (i & 63);
     }
 
@@ -517,6 +584,7 @@ bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
     if (frame->version != JCE_INPUT_FRAME_VERSION) return false;
 
     memset(input->keys_cur, 0, sizeof(input->keys_cur));
+    memset(input->keys_tap, 0, sizeof(input->keys_tap));
     for (i = 0; i < (int)JCE_KEY_COUNT && i < 64 * 64; ++i) {
         if (frame->keys_bits[i >> 6] & ((uint64_t)1 << (i & 63)))
             input->keys_cur[i] = true;

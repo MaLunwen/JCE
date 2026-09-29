@@ -86,6 +86,8 @@ typedef enum {
      * serialized to disk by ordinal (see jce_editor_panels_init). */
     JCE_PANEL_WORLD_STREAMING,
     JCE_PANEL_USER_GUIDE,
+    JCE_PANEL_SHADER_INSPECTOR,
+    JCE_PANEL_AI_ASSISTANT,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -157,6 +159,11 @@ void  jce_editor_panel_navmesh(void);
 /* World-streaming authoring: scene-level streamer config + chunk table +
  * live preview toggle (spawns chunk entities into the hierarchy). */
 void  jce_editor_panel_world_streaming(void);
+/* Ask a language model to author a scene.  jce_editor_ai_assistant_tick
+ * is pumped from the frame update rather than from the draw: a hidden
+ * panel does not draw, and an undrained child fills its pipe and hangs. */
+void  jce_editor_panel_ai_assistant(void);
+void  jce_editor_ai_assistant_tick(void);
 /* Read-only Behavior Tree visualizer (live Play status / edit-mode
  * structure preview via a lenient panel-owned JceBtContext). */
 void  jce_editor_panel_bt_visualizer(void);
@@ -261,7 +268,28 @@ void  jce_editor_panel_shader_graph_content(void);
 void  jce_editor_panel_shader_graph(void);
 void  jce_editor_panel_particle_editor_content(void);
 void  jce_panel_material_graph_request_tab(int idx);
+/* The .sc the Material Graph most recently generated, or "" -- the Shader
+ * Inspector prefills from it, because typing that path by hand is how you
+ * end up inspecting the previous version of the file. */
+const char *jce_panel_material_graph_last_generated_sc(void);
+/* Shader Inspector: a tab of the Graph Authoring workbench, same shape as
+ * Shader Graph.  _content draws it; the bare name is the redirect shim. */
+void  jce_editor_panel_shader_inspector_content(void);
+void  jce_editor_panel_shader_inspector(void);
 int   jce_panel_material_graph_current_tab(void);
+
+/* Headless authoring hook, driven by JCE_DBG_GRAPH_COMPILE="<graph>@<frame>".
+ *
+ * The Shader Graph could only ever be exercised by a human clicking two
+ * buttons, which is why "does a graph-authored shader survive the cook" sat
+ * unanswered while both of its diagnosed causes were already fixed: there was
+ * no way to author one without a mouse.  This runs the SAME two entry points
+ * the buttons call, in the same order, so what it produces is what a user
+ * produces -- not a second path that could drift from it.
+ *
+ * Same shape as the JCE_DBG_VIEWJSON hook: parsed once, fires on one frame,
+ * disabled when the variable is absent.  Called every frame; cheap when off. */
+void  jce_panel_material_graph_headless_tick(void);
 void  jce_editor_panel_search_content(void);
 void  jce_editor_panel_version_control_content(void);
 void  jce_editor_panel_time_of_day_content(void);
@@ -396,6 +424,7 @@ void  jce_editor_inspector_request_sync(void);
 
 /* Reload PBR properties for all entities referencing this material file. */
 void  jce_editor_inspector_reload_material(const char *material_path);
+
 
 /* Inspector delete request: opens the same confirmation dialog used by Inspector panel. */
 void  jce_editor_inspector_request_delete_confirm(uint32_t entity_id);

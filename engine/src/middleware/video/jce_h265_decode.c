@@ -32,6 +32,7 @@
 
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_sysinfo.h>
 
 #include "ihevc_typedefs.h"
 #include "ihevcd_cxa.h"
@@ -163,6 +164,7 @@ static uint32_t hvcc_to_annexb(const uint8_t *src, uint32_t src_bytes,
 /* ── Decoder struct ───────────────────────────────────────────────── */
 
 struct JceH265Decoder {
+    uint32_t cores;
     iv_obj_t *codec;
 
     uint8_t  *annexb_buf;
@@ -185,6 +187,11 @@ struct JceH265Decoder {
     uint32_t  out_buf_size;
 
     bool      header_decoded;
+    bool      yuv_output, draining;
+    JceYuv420Frame frame;
+    uint32_t input_token, output_token;
+    uint32_t timestamp_tags[128];
+    uint64_t timestamps[128];
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -305,7 +312,7 @@ static bool hevc_decode_raw(JceH265Decoder *dec,
 
     ps_ip->u4_size = sizeof(ip);
     ps_ip->e_cmd = IVD_CMD_VIDEO_DECODE;
-    ps_ip->u4_ts = 0;
+    ps_ip->u4_ts = dec->input_token;
     ps_ip->pv_stream_buffer = (void *)data;
     ps_ip->u4_num_Bytes = data_len;
 
@@ -332,6 +339,7 @@ static bool hevc_decode_raw(JceH265Decoder *dec,
     *out_width = ps_op->u4_pic_wd;
     *out_height = ps_op->u4_pic_ht;
     *out_has_output = (ps_op->u4_output_present != 0);
+    if (*out_has_output) dec->output_token = ps_op->u4_ts;
     if (out_yuv)
         *out_yuv = ps_op->s_disp_frm_buf;
 
@@ -406,8 +414,17 @@ JceH265Decoder *jce_h265_decoder_open(const void *hvcc,
         dec->codec->u4_size = sizeof(iv_obj_t);
     }
 
-    /* Configure: single core, decode frame mode. */
-    hevc_set_num_cores(dec->codec, 1);
+    /* The pinned decoder supports at most eight processing cores. */
+    JceSysInfo host;
+    jce_sysinfo_init(&host);
+    uint32_t cores = host.cpu_cores > 0 ? (uint32_t)host.cpu_cores : 1u;
+    if (cores > 8u) cores = 8u;
+    if (!hevc_set_num_cores(dec->codec, cores)) {
+        cores = 1u;
+        hevc_set_num_cores(dec->codec, cores);
+    }
+    dec->cores = cores;
+    LOG_INFO(LOG_TAG, "HEVC worker cores=%u", cores);
     hevc_set_decode_mode(dec->codec, IVD_DECODE_HEADER);
 
     /* Allocate initial output buffers. */
@@ -435,6 +452,32 @@ JceH265Decoder *jce_h265_decoder_open(const void *hvcc,
     LOG_INFO(LOG_TAG, "HEVC decoder opened (nal_length_size=%u, params=%u bytes)",
              dec->nal_length_size, dec->param_sets_len);
     return dec;
+}
+
+static bool hevc_publish(JceH265Decoder *dec, const iv_yuv_buf_t *yuv,
+                         uint32_t w, uint32_t h)
+{
+    if (!w || !h || w > 4096u || h > 4096u || (w & 1u) || (h & 1u)
+        || !yuv->pv_y_buf || !yuv->pv_u_buf || !yuv->pv_v_buf
+        || yuv->u4_y_strd < w || yuv->u4_u_strd < w / 2u
+        || yuv->u4_u_strd != yuv->u4_v_strd) return false;
+    dec->frame = (JceYuv420Frame){yuv->pv_y_buf, yuv->pv_u_buf, yuv->pv_v_buf,
+        (int)yuv->u4_y_strd, (int)yuv->u4_u_strd, (int)w, (int)h};
+    dec->last_w = w;
+    dec->last_h = h;
+    if (!dec->yuv_output) {
+        uint32_t need = w * h * 4u;
+        if (need > dec->rgba_cap) {
+            uint8_t *pixels = JCE_REALLOC(dec->rgba_buf, need);
+            if (!pixels) return false;
+            dec->rgba_buf = pixels;
+            dec->rgba_cap = need;
+        }
+        jce_yuv420_to_rgba(dec->frame.y, dec->frame.y_stride,
+            dec->frame.u, dec->frame.uv_stride, dec->frame.v,
+            dec->frame.uv_stride, dec->rgba_buf, w, h);
+    }
+    return true;
 }
 
 bool jce_h265_decode_frame(JceH265Decoder *dec,
@@ -508,32 +551,73 @@ bool jce_h265_decode_frame(JceH265Decoder *dec,
     if (!has_output || w == 0 || h == 0)
         return false;
 
-    /* Convert YUV420P to RGBA8. */
-    uint32_t rgba_size = w * h * 4;
-    if (rgba_size > dec->rgba_cap) {
-        uint8_t *buf = (uint8_t *)JCE_REALLOC(dec->rgba_buf, rgba_size);
-        if (!buf) return false;
-        dec->rgba_buf = buf;
-        dec->rgba_cap = rgba_size;
-    }
-
-    jce_yuv420_to_rgba(
-        (const uint8_t *)yuv.pv_y_buf, (int)yuv.u4_y_strd,
-        (const uint8_t *)yuv.pv_u_buf, (int)yuv.u4_u_strd,
-        (const uint8_t *)yuv.pv_v_buf, (int)yuv.u4_v_strd,
-        dec->rgba_buf, w, h);
-
-    dec->last_w = w;
-    dec->last_h = h;
-    *out_rgba = dec->rgba_buf;
-    *out_width = w;
-    *out_height = h;
+    if (!hevc_publish(dec, &yuv, w, h)) return false;
+    if (out_rgba) *out_rgba = dec->yuv_output ? NULL : dec->rgba_buf;
+    if (out_width) *out_width = w;
+    if (out_height) *out_height = h;
     return true;
+}
+
+void jce_h265_decoder_set_yuv_output(JceH265Decoder *dec, bool enabled)
+{
+    if (dec) dec->yuv_output = enabled;
+}
+
+void jce_h265_decoder_set_timestamp(JceH265Decoder *dec, uint64_t timestamp)
+{
+    if (!dec) return;
+    ++dec->input_token;
+    if (!dec->input_token) ++dec->input_token;
+    uint32_t index = dec->input_token % 128u;
+    dec->timestamp_tags[index] = dec->input_token;
+    dec->timestamps[index] = timestamp;
+}
+
+uint64_t jce_h265_decoder_frame_timestamp(const JceH265Decoder *dec)
+{
+    if (!dec) return 0u;
+    uint32_t index = dec->output_token % 128u;
+    return dec->timestamp_tags[index] == dec->output_token
+        ? dec->timestamps[index] : 0u;
+}
+
+bool jce_h265_decoder_get_yuv(const JceH265Decoder *dec, JceYuv420Frame *out)
+{
+    if (!dec || !out || !dec->frame.y) return false;
+    *out = dec->frame;
+    return true;
+}
+
+bool jce_h265_decoder_drain(JceH265Decoder *dec)
+{
+    if (!dec || !dec->codec) return false;
+    if (!dec->draining) {
+        ihevcd_cxa_ctl_flush_ip_t ip;
+        ihevcd_cxa_ctl_flush_op_t op;
+        memset(&ip, 0, sizeof(ip));
+        memset(&op, 0, sizeof(op));
+        ip.s_ivd_ctl_flush_ip_t.u4_size = sizeof(ip);
+        ip.s_ivd_ctl_flush_ip_t.e_cmd = IVD_CMD_VIDEO_CTL;
+        ip.s_ivd_ctl_flush_ip_t.e_sub_cmd = IVD_CMD_CTL_FLUSH;
+        op.s_ivd_ctl_flush_op_t.u4_size = sizeof(op);
+        if (ihevcd_cxa_api_function(dec->codec, &ip, &op) != IV_SUCCESS)
+            return false;
+        dec->draining = true;
+    }
+    uint32_t consumed = 0u, w = 0u, h = 0u;
+    bool output = false;
+    iv_yuv_buf_t yuv;
+    memset(&yuv, 0, sizeof(yuv));
+    return hevc_decode_raw(dec, NULL, 0u, &consumed, &w, &h, &output, &yuv)
+        && output && hevc_publish(dec, &yuv, w, h);
 }
 
 void jce_h265_decoder_flush(JceH265Decoder *dec)
 {
     if (!dec || !dec->codec) return;
+
+    dec->draining = false;
+    memset(&dec->frame, 0, sizeof(dec->frame));
 
     /* Issue flush command. */
     {
@@ -576,6 +660,9 @@ void jce_h265_decoder_flush(JceH265Decoder *dec)
 
         ihevcd_cxa_api_function(dec->codec, (void *)&ip, (void *)&op);
     }
+
+    /* RESET restores upstream defaults, including single-core decode. */
+    hevc_set_num_cores(dec->codec, dec->cores);
 
     /* Re-feed parameter sets after reset. */
     hevc_set_decode_mode(dec->codec, IVD_DECODE_HEADER);
@@ -632,6 +719,13 @@ bool jce_h265_decode_frame(JceH265Decoder *dec, const void *hvcc_sample,
     if (out_height) *out_height = 0u;
     return false;
 }
+
+void jce_h265_decoder_set_yuv_output(JceH265Decoder *d, bool e) { (void)d; (void)e; }
+void jce_h265_decoder_set_timestamp(JceH265Decoder *d, uint64_t t) { (void)d; (void)t; }
+uint64_t jce_h265_decoder_frame_timestamp(const JceH265Decoder *d) { (void)d; return 0u; }
+bool jce_h265_decoder_get_yuv(const JceH265Decoder *d, JceYuv420Frame *o)
+{ (void)d; (void)o; return false; }
+bool jce_h265_decoder_drain(JceH265Decoder *d) { (void)d; return false; }
 
 void jce_h265_decoder_flush(JceH265Decoder *dec) { (void)dec; }
 void jce_h265_decoder_close(JceH265Decoder *dec) { (void)dec; }

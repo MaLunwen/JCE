@@ -41,4 +41,25 @@ void jce_editor_register_script_backends(void);
  * modules, and repeatedly with the same root. */
 void jce_editor_script_modules_reload(const char *project_root);
 
+/* RELOAD THE NATIVE MODULES THE OPEN PROJECT ALREADY HAS LOADED.
+ *
+ * jce_editor_script_modules_reload() above deliberately KEEPS a module the new
+ * project still asks for -- reopening the same project is a no-op rather than
+ * a refusal.  The cost of that is the workflow this function exists for:
+ * rebuild a project's .jcec and the editor goes on running yesterday's code
+ * until the project is closed and reopened.
+ *
+ * THE UNLOAD-SAFE POINT IS "PLAY IS STOPPED", and it is checked rather than
+ * assumed.  jce_script_vm_cpp_unload refuses while a module has live
+ * instances, and the only thing in this tree that creates one is the runtime
+ * script system (engine/src/application/jce_rt_script.c), which runs during
+ * Play -- so outside Play the count is zero and the unload succeeds.  This
+ * asks the refcount instead of trusting that reasoning: with Play running it
+ * reports how many instances in which module and changes NOTHING, because a
+ * half-unloaded module is code the engine is about to call.
+ *
+ * Returns true when every declared module was unloaded and loaded again.
+ * Returns false, having logged why, when it was refused or nothing is open. */
+bool jce_editor_script_modules_reload_native(const char *project_root);
+
 #endif /* JCE_EDITOR_SCRIPT_BACKENDS_H */

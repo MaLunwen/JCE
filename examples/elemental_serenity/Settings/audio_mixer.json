@@ -1,0 +1,39 @@
+{
+	"version":	1,
+	"buses":	[{
+			"id":	1,
+			"parent":	0,
+			"name":	"Master",
+			"volume":	1,
+			"muted":	0,
+			"solo":	0
+		}, {
+			"id":	2,
+			"parent":	1,
+			"name":	"Music",
+			"volume":	0.800000011920929,
+			"muted":	0,
+			"solo":	0
+		}, {
+			"id":	3,
+			"parent":	1,
+			"name":	"SFX",
+			"volume":	1,
+			"muted":	0,
+			"solo":	0
+		}, {
+			"id":	4,
+			"parent":	1,
+			"name":	"Voice",
+			"volume":	1,
+			"muted":	0,
+			"solo":	0
+		}, {
+			"id":	5,
+			"parent":	1,
+			"name":	"UI",
+			"volume":	1,
+			"muted":	0,
+			"solo":	0
+		}]
+}

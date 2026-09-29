@@ -1,0 +1,73 @@
+<rml>
+<head><title>Developer Console</title><style>
+/*
+ * The engine's developer console, opened with the tilde key in a SHIPPED
+ * game.  Element ids are the contract with jce_ui_console_overlay.c and are
+ * the only thing in this file the C side knows about:
+ *
+ *   #console-output   scrollback, innerRML replaced each frame
+ *   #console-line     the line being edited, with its caret
+ *
+ * Style follows engine_debug_hud.rml deliberately -- same font stack, same
+ * translucent black, same dp units -- so the two engine overlays do not look
+ * like they came from different products when both are open.
+ */
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    font-family: "JCE";
+    font-size: 14dp;
+    color: #f0f0f0;
+}
+
+/* Top half of the screen, the placement every console in the `compared`
+ * field uses: it must not cover the thing being debugged, which is usually
+ * the middle of the viewport. */
+#console-panel {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 45%;
+    background-color: #000000d9;
+    border-bottom: 1dp #ffffff40;
+    padding: 6dp 10dp 6dp 10dp;
+}
+
+#console-output {
+    width: 100%;
+    height: 88%;
+    overflow-y: auto;
+    font-size: 13dp;
+    /* Output is not prose: a wrapped cvar listing is much harder to scan
+     * than one that runs off the edge. */
+    white-space: nowrap;
+}
+
+#console-output p {
+    margin: 0;
+    padding: 0;
+    white-space: nowrap;
+}
+
+/* The prompt sits on its own line at the bottom, separated by a rule, so a
+ * long burst of output never pushes what you are typing off screen. */
+#console-line {
+    width: 100%;
+    height: 12%;
+    border-top: 1dp #ffffff33;
+    padding-top: 3dp;
+    font-size: 14dp;
+    color: #ffffff;
+    white-space: nowrap;
+}
+</style></head>
+
+<body>
+    <div id="console-panel">
+        <div id="console-output"></div>
+        <div id="console-line">&gt; _</div>
+    </div>
+</body>
+</rml>

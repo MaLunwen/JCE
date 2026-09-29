@@ -1,0 +1,179 @@
+cmake_minimum_required(VERSION 3.20)
+project(Minesweeper C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Locate the JCE SDK.
+#   Override on the command line with:
+#     cmake -DJCE_DIR=<sdk>/lib/cmake/JCE ..
+#   or set the JCE_SDK_DIR environment variable (preferred).
+#   The editor forwards this automatically for project builds.
+if(NOT DEFINED JCE_DIR AND DEFINED ENV{JCE_SDK_DIR})
+    if(EXISTS "$ENV{JCE_SDK_DIR}/lib/cmake/JCE/JCEConfig.cmake")
+        set(JCE_DIR "$ENV{JCE_SDK_DIR}/lib/cmake/JCE")
+    elseif(EXISTS "$ENV{JCE_SDK_DIR}/cmake/JCEConfig.cmake")
+        set(JCE_DIR "$ENV{JCE_SDK_DIR}/cmake")
+    endif()
+endif()
+find_package(JCE REQUIRED)
+
+add_executable(Minesweeper src/main.c src/controller.c src/board.c src/view.c src/test_board.c)
+target_compile_definitions(Minesweeper PRIVATE SDL_MAIN_USE_CALLBACKS=1)
+target_link_libraries(Minesweeper PRIVATE JCE::JCE)
+target_compile_definitions(Minesweeper PRIVATE JCE_SCRIPT_MODULE_NO_ENTRY JCE_APP_AUTHORED_CAMERA_ONLY=1)
+jce_script_enable(Minesweeper LANGUAGES c)
+add_library(mines_controller MODULE src/controller.c src/board.c src/view.c)
+target_link_libraries(mines_controller PRIVATE JCE::ScriptCModule)
+set_target_properties(mines_controller PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build")
+add_dependencies(Minesweeper mines_controller)
+
+# Cooked-asset tree to pack into the embedded PAK.  build-project.bat
+# scrapes jce_project.json's cooked_assets field and forwards it via
+# -DJCE_PROJECT_COOKED_ASSETS=<rel>; the default mirrors the schema
+# default so plain `cmake -S . -B build` works too.
+if(NOT DEFINED JCE_PROJECT_COOKED_ASSETS)
+    set(JCE_PROJECT_COOKED_ASSETS "resources/_cooked")
+endif()
+set(_cooked "${CMAKE_SOURCE_DIR}/${JCE_PROJECT_COOKED_ASSETS}")
+
+# Raw (uncooked) asset tree, for the manual path below.  Resolved from the
+# MANIFEST, not hardcoded: jce_project.json is where a project DECLARES this
+# (schema field source_assets, read by the engine at jce_project.c:212 and by
+# scripts/jce.py:2557), and a template that answered it independently would
+# silently miss the assets of any project declaring another directory --
+# which project.create does, "resources".  Note the cooked tree above relies
+# on build-project forwarding -DJCE_PROJECT_COOKED_ASSETS; there is no such
+# forwarder for the raw tree, so reading the manifest is the only way a plain
+# `cmake -S . -B build` can honour the declaration.
+#
+# Order: an explicit -D wins, then the manifest, then "assets" -- the engine
+# model's own default (jce_project.c:270, :281) and the directory this
+# template ships.
+if(NOT DEFINED JCE_PROJECT_RAW_ASSETS)
+    set(JCE_PROJECT_RAW_ASSETS "assets")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/jce_project.json")
+        file(READ "${CMAKE_SOURCE_DIR}/jce_project.json" _jce_manifest_json)
+        string(JSON _jce_src_assets ERROR_VARIABLE _jce_src_err
+               GET "${_jce_manifest_json}" source_assets)
+        if(NOT _jce_src_err AND _jce_src_assets)
+            set(JCE_PROJECT_RAW_ASSETS "${_jce_src_assets}")
+        endif()
+    endif()
+endif()
+set(_raw "${CMAKE_SOURCE_DIR}/${JCE_PROJECT_RAW_ASSETS}")
+
+# In editor-driven builds, jce_target_embed_pak consumes the
+# editor-prebuilt asset source passed through JCE_PROJECT_PREBUILT_ASSETS_C.
+# Manual SDK consumers may still provide a host packer, but the packaged
+# editor path does not require first-party external tools.
+set(_has_prebuilt_assets OFF)
+if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_C AND
+   EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}")
+    set(_has_prebuilt_assets ON)
+endif()
+if(COMMAND jce_target_embed_pak)
+    if(_has_prebuilt_assets OR IS_DIRECTORY "${_cooked}")
+        jce_target_embed_pak(Minesweeper RESOURCE_DIRS "${_cooked}")
+    elseif(COMMAND jce_add_pak AND IS_DIRECTORY "${_raw}")
+        # No cooked tree, but the project HAS raw assets.  jce_add_pak is a
+        # superset of jce_target_embed_pak: it cooks the raw tree (or packs it
+        # raw with a WARNING when no cooker is installed) and delegates to
+        # jce_target_embed_pak for the prebuilt case, so the editor-driven
+        # paths above are unaffected.
+        #
+        # Without this branch, a project built outside the editor -- which the
+        # comment at the top of this block says is supported -- linked an
+        # empty PAK and its assets silently did not ship, behind a
+        # message(STATUS) rather than a warning.  MEASURED 2026-09-21: a
+        # marker string in a raw asset was ABSENT from the built exe before
+        # and PRESENT after, same asset bytes and same path in both arms.
+        jce_add_pak(Minesweeper RESOURCE_DIRS "${_raw}")
+    else()
+        # Still reachable, and deliberately: no cooked tree AND no raw tree
+        # (a freshly created project has neither), or no jce_add_pak.  The
+        # engine references assets_pak_data unconditionally, so something must
+        # define it.
+        set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
+        file(WRITE "${_stub}"
+"#include <stddef.h>\n"
+"const unsigned char assets_pak_data[1] = {0};\n"
+"const size_t        assets_pak_data_size = 0;\n")
+        target_sources(Minesweeper PRIVATE "${_stub}")
+        message(STATUS "Minesweeper: no cooked assets at ${_cooked} and no raw assets at ${_raw} - linking empty PAK stub")
+    endif()
+else()
+    set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
+    file(WRITE "${_stub}"
+"#include <stddef.h>\n"
+"const unsigned char assets_pak_data[1] = {0};\n"
+"const size_t        assets_pak_data_size = 0;\n")
+    target_sources(Minesweeper PRIVATE "${_stub}")
+    message(STATUS "Minesweeper: JCE asset helper unavailable - linking empty PAK stub")
+endif()
+
+# Stage runtime data alongside the exe so the template's main.c can
+# read jce_project.json (for startup_scene) and load scene/material
+# files from the cooked tree via host-FS APIs.
+add_custom_command(TARGET Minesweeper POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/jce_project.json"
+            "$<TARGET_FILE_DIR:Minesweeper>/jce_project.json"
+    VERBATIM)
+
+# Loose cooked-asset staging is optional: when the project ships its assets
+# encrypted inside the embedded PAK, copying the plaintext cooked tree next
+# to the exe would defeat the encryption (the editor passes OFF for
+# encrypting builds).  Default ON preserves the historical layout.
+option(JCE_PROJECT_STAGE_LOOSE_ASSETS
+    "Copy the loose cooked asset tree next to the built executable" ON)
+if(JCE_PROJECT_STAGE_LOOSE_ASSETS AND IS_DIRECTORY "${_cooked}")
+    add_custom_command(TARGET Minesweeper POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${_cooked}"
+                "$<TARGET_FILE_DIR:Minesweeper>/${JCE_PROJECT_COOKED_ASSETS}"
+        VERBATIM)
+elseif(NOT JCE_PROJECT_STAGE_LOOSE_ASSETS)
+    message(STATUS "Minesweeper: loose cooked-asset staging disabled (encrypted assets ship inside the PAK)")
+endif()
+
+# ── Embed project bundles directly into the exe ─────────────────
+# JCE_PROJECT_BUNDLES is a CMake list (semicolon-separated) of source paths
+# to .jbundle files.  Editor-driven builds pre-generate linkable objects or
+# sources under JCE_PROJECT_PREBUILT_BUNDLE_DIR so no SDK-side wrapper tool is
+# needed.  Each bundle gets baked with two externs:
+#   const unsigned char bundle_<name>[];   // payload
+#   const size_t        bundle_<name>_size;
+# main.c then declares matching externs and mounts via
+# jce_bundle_file_open_memory() — no sidecar files, true single-exe.
+#
+# We also write `_embedded_bundles.h` next to main.c so the template
+# can `#include` the extern declarations and the loop body without
+# having to know the bundle list at template-codegen time.
+set(_emb_inc "${CMAKE_CURRENT_BINARY_DIR}/_embedded_bundles.h")
+set(_emb_lines "/* Auto-generated by CMake -- DO NOT EDIT */\n#ifndef JCE_PROJECT_EMBEDDED_BUNDLES_H\n#define JCE_PROJECT_EMBEDDED_BUNDLES_H\n#include <stddef.h>\n")
+set(_emb_extern "")
+set(_emb_table  "static const struct { const char *name; const unsigned char *data; const size_t *size; } jce_project_embedded_bundles[] = {\n")
+set(_emb_count 0)
+if(JCE_PROJECT_BUNDLES AND COMMAND jce_target_embed_bundle)
+    foreach(_bundle IN LISTS JCE_PROJECT_BUNDLES)
+        if(NOT IS_ABSOLUTE "${_bundle}")
+            set(_bundle "${CMAKE_SOURCE_DIR}/${_bundle}")
+        endif()
+        if(EXISTS "${_bundle}")
+            get_filename_component(_bname "${_bundle}" NAME_WE)
+            string(REGEX REPLACE "[^A-Za-z0-9_]" "_" _sym "${_bname}")
+            set(_sym "bundle_${_sym}")
+            jce_target_embed_bundle(Minesweeper BUNDLE "${_bundle}" SYMBOL "${_sym}")
+            string(APPEND _emb_extern "extern const unsigned char ${_sym}[];\nextern const size_t ${_sym}_size;\n")
+            string(APPEND _emb_table  "    { \"${_bname}\", ${_sym}, &${_sym}_size },\n")
+            math(EXPR _emb_count "${_emb_count}+1")
+        else()
+            message(WARNING "Minesweeper: bundle not found, skipping embed: ${_bundle}")
+        endif()
+    endforeach()
+endif()
+string(APPEND _emb_table "    { 0, 0, 0 }\n};\n")
+string(APPEND _emb_lines "${_emb_extern}${_emb_table}#define JCE_PROJECT_EMBEDDED_BUNDLE_COUNT ${_emb_count}\n#endif\n")
+file(WRITE "${_emb_inc}" "${_emb_lines}")
+target_include_directories(Minesweeper PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

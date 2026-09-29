@@ -139,10 +139,30 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
                 char new_path[1024];
                 jce_path_join(new_path, sizeof(new_path), parent, s_assets.rename_buf);
                 
-                if (jce_fs_host_rename(fe.path.c_str(), new_path)) {
+                /* Rename AND repoint what referenced it.
+                 *
+                 * This used to be a bare jce_fs_host_rename plus a success
+                 * log.  Every asset reference in this engine is a raw path
+                 * string -- no GUID, no .meta sidecar anywhere in the tree --
+                 * so every scene, prefab and material naming the old file went
+                 * silently to a missing asset, and the fuzzy basename index
+                 * cannot help: a rename is exactly the case where the basename
+                 * changed.  jce_assetdb knew who pointed at what and nothing
+                 * asked it.
+                 *
+                 * The unrepaired count is reported, never swallowed: a rename
+                 * that silently half-repairs is the same defect relocated. */
+                int upd = 0, unrep = 0;
+                if (jce_assetdb_rename_asset(fe.path.c_str(), new_path,
+                                             &upd, &unrep)) {
                     jce_editor_console_log("Renamed '%s' -> '%s'",
                         fe.name.c_str(), s_assets.rename_buf);
                     s_assets.needs_refresh = true;
+                    if (upd || unrep)
+                        jce_editor_console_log_level(
+                            unrep ? JCE_CONSOLE_WARNING : JCE_CONSOLE_INFO,
+                            "  references: %d file(s) repointed, %d not "
+                            "repaired", upd, unrep);
                 } else {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                         "Rename failed");
@@ -472,10 +492,30 @@ void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
                     char new_path[1024];
                     jce_path_join(new_path, sizeof(new_path), parent, s_assets.rename_buf);
                     
-                    if (jce_fs_host_rename(fe.path.c_str(), new_path)) {
+                    /* Rename AND repoint what referenced it.
+                     *
+                     * This used to be a bare jce_fs_host_rename plus a success
+                     * log.  Every asset reference in this engine is a raw path
+                     * string -- no GUID, no .meta sidecar anywhere in the tree --
+                     * so every scene, prefab and material naming the old file went
+                     * silently to a missing asset, and the fuzzy basename index
+                     * cannot help: a rename is exactly the case where the basename
+                     * changed.  jce_assetdb knew who pointed at what and nothing
+                     * asked it.
+                     *
+                     * The unrepaired count is reported, never swallowed: a rename
+                     * that silently half-repairs is the same defect relocated. */
+                    int upd = 0, unrep = 0;
+                    if (jce_assetdb_rename_asset(fe.path.c_str(), new_path,
+                                                 &upd, &unrep)) {
                         jce_editor_console_log("Renamed '%s' -> '%s'",
                                                fe.name.c_str(), s_assets.rename_buf);
                         s_assets.needs_refresh = true;
+                        if (upd || unrep)
+                            jce_editor_console_log_level(
+                                unrep ? JCE_CONSOLE_WARNING : JCE_CONSOLE_INFO,
+                                "  references: %d file(s) repointed, %d not "
+                                "repaired", upd, unrep);
                     } else {
                         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                                                      "Rename failed");
@@ -698,6 +738,47 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
                 } else {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                         "Duplicate failed: '%s'", cfe->name.c_str());
+                }
+            }
+        }
+
+        /* CREATE VARIANT -- only on a material, because it is the only asset
+         * kind with a parent link.  Deliberately NOT "duplicate": a copy is a
+         * second material that drifts from the first, a variant is a file
+         * that states only its overrides and follows its parent forever. */
+        static const std::string kMatExt = ".mat.json";
+        if (cfe && cfe->name.size() > kMatExt.size() &&
+            cfe->name.compare(cfe->name.size() - kMatExt.size(),
+                              kMatExt.size(), kMatExt) == 0) {
+            if (ImGui::MenuItem(jce_editor_i18n_id("assetBrowser.createVariant",
+                                                   "Create Variant"))) {
+                std::string dir = cfe->path;
+                size_t slash = dir.find_last_of("/\\");
+                dir = (slash == std::string::npos) ? std::string(".")
+                                                   : dir.substr(0, slash);
+                std::string stem =
+                    cfe->name.substr(0, cfe->name.size() - kMatExt.size());
+                char out[1200];
+                snprintf(out, sizeof(out), "%s/%s Variant.mat.json",
+                         dir.c_str(), stem.c_str());
+                char unique[1200];
+                if (!jce_fs_host_make_unique_path(out, unique, sizeof(unique)))
+                    snprintf(unique, sizeof(unique), "%s", out);
+                /* The child names its parent RELATIVE to itself -- they are
+                 * siblings here, so the file name alone -- because an absolute
+                 * path would break the moment the project moves. */
+                char body[512];
+                snprintf(body, sizeof(body),
+                         "{\n    \"type\": \"pbr\",\n    \"parent\": \"%s\"\n}\n",
+                         cfe->name.c_str());
+                if (jce_fs_host_write_all(unique, body, strlen(body))) {
+                    jce_editor_console_log("Created variant of '%s'",
+                                           cfe->name.c_str());
+                    s_assets.entry_flash[unique] = 0.6f;
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "Create variant failed: '%s'", cfe->name.c_str());
                 }
             }
         }

@@ -1,0 +1,319 @@
+name: ci
+
+# EVERY BRANCH, not a named three.  The list used to be [main, master,
+# develop]; the branch this project actually develops on is
+# audit-p0-fixes-2026-08-31, so nothing ran at all -- a CI configuration that
+# is present, syntactically valid and silent is the worst of the three states.
+#
+# `schedule` drives the second tier (see the TIERS note below).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # 04:00 UTC daily -- the heavy tier, off the interactive path.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CONAN_HOME: ${{ github.workspace }}/.conan2
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── TIERS, and why ────────────────────────────────────────────────────────
+#
+# TIER 1 -- `lint` -- runs on EVERY push and PR.  It needs no compiler and no
+# GPU: the lint suite, the public C ABI snapshot, both script generators, the
+# audit suite's own unit tests and the architecture audit.  Minutes, not tens
+# of minutes.  It is also the tier that catches the things a build cannot see
+# -- an ABI break, a layering violation, a copyleft dependency, a README whose
+# numbers stopped being true.
+#
+# TIER 2 -- `build`, `unit-tests`, `sdk-consumer`, `cross-nightly` -- runs on
+# `schedule` and `workflow_dispatch` only.  Not because it matters less, but
+# because a full Conan graph (bgfx, Bullet, SDL3, HarfBuzz, CPython, .NET, a
+# JVM) is 20-40 minutes per matrix cell and this suite has NEVER run in CI
+# before: the honest expectation is that its first runs are red for reasons
+# that have nothing to do with the commit that triggered them.  Staging it
+# this way means tier 1 stays a signal people believe while tier 2 is being
+# made trustworthy.  Promote a tier-2 job by deleting its `if:` line.
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fast lint gate. Runs on every PR before any expensive build.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint (structural + style)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run all lints
+        run: python tools/lint/run_all.py
+
+      # The public C ABI gate, as its own named step.
+      #
+      # run_architecture_audit.py also runs it (its CHECKS list, gating), but
+      # only after `pip install conan` and `conan profile detect` -- so an ABI
+      # break could not be seen until an unrelated toolchain step succeeded,
+      # and when it was seen it was reported inside a step named "deps, ABI
+      # boundaries, licences" whose most common failure is a Conan hiccup.
+      # This needs no toolchain and says what it is.
+      # --committed, NOT the bare invocation this step used to run.  The bare
+      # mode answers about the WORKING TREE and fails only on a break; on a
+      # clean CI checkout that sounds equivalent and is not.  Measured: a
+      # parser mutation that shreds every public struct body leaves the bare
+      # mode printing OK and exiting 0, because the damage scores as MOVED --
+      # emitting lines like `MOVED struct X - declared in h -> h`, a header
+      # moved to itself, which the bare mode treats as a pass.  --committed
+      # catches it (exit 1, "51 disagreements") and additionally checks
+      # PROVENANCE: that the declarations recorded are the committed ones, not
+      # a contributor's uncommitted headers.  tools/lint/run_all.py:67 has
+      # always passed --committed; CI did not, so the two tiers disagreed
+      # about what "the ABI gate is green" means.
+      #
+      # This is expected to be RED on arrival, and that is the point of the
+      # change rather than an accident of it: three declarations currently
+      # drift, all from JceSceneRenderingSettings gaining wind_direction_x,
+      # wind_direction_z and temperature_c INSERTED at index 40 -- which moves
+      # cloud_density from 40 to 43 and every field after it.  An
+      # already-compiled consumer reading cloud_density now reads
+      # wind_direction_x.  The fix is `--update --committed` by whoever knows
+      # that insertion was intended; a warning cannot un-ship an ABI break
+      # that has already reached an SDK consumer, a Lua binding or the JNI
+      # bridge.
+      - name: Public C ABI snapshot (removals / signature changes)
+        run: python tools/audit/check_abi_snapshot.py --committed
+
+      # The scripting surface's manifest gate, in the same fast tier and for
+      # the same reason: it needs no toolchain.  It reads jce_script.h and
+      # jce_script.c and fails naming the member when the host grows without
+      # an exposure decision.
+      - name: Scripting manifest (totality / registration parity)
+        run: python tools/scriptgen/gen_script_bindings.py
+
+      # The C ABI backend of the same manifest, in the same toolchain-free
+      # tier.  What it guards is the shared library's EXPORT SET, which is the
+      # scripting sandbox boundary: the .def, the version script and the
+      # expected-export table are all emitted from script-api.json, and a
+      # hand-edit to any of them is what this catches before a build does.
+      - name: Scripting C ABI (generated export set)
+        run: python tools/scriptgen/gen_script_c_abi.py
+
+      # The gate's own unit tests.  check_abi_snapshot.py was blind to every
+      # record containing a nested anonymous member for as long as it existed;
+      # a gate fix that is itself unguarded is not a fix.
+      - name: Audit tooling unit tests
+        run: python -m unittest discover -s tools/audit/tests -p "test_*.py" -v
+
+      # The audit suite's licence gate resolves the Conan graph to prove no
+      # copyleft entered the HOST dependency closure. Without Conan on PATH
+      # that gate SKIPS (by design — a contributor offline must still be able
+      # to run the suite), so CI must install it or the gate is decorative.
+      # Only recipe metadata is needed, so this resolves in seconds and never
+      # builds a package.
+      - name: Install Conan (needed by the licence gate)
+        run: |
+          pip install --upgrade pip
+          pip install "conan>=2.0"
+          conan profile detect --force
+
+      - name: Architecture audit (deps, ABI boundaries, licences)
+        run: python tools/audit/run_architecture_audit.py
+
+  # ---------------------------------------------------------------------------
+  # Desktop build matrix. Only runs after lint passes (implicit via needs).
+  #
+  # Note: full builds require Conan + CMake presets + platform toolchains
+  # which are repo-specific. This stub configures + builds via the canonical
+  # scripts; uncomment per-OS steps as toolchains stabilize.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.os }}
+    # TIER 2 -- see the TIERS note above.  Delete this `if:` to promote it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Conan
+        run: |
+          pip install --upgrade pip
+          pip install "conan>=2.0"
+          conan profile detect --force
+
+      - name: Build the public SDK
+        run: python scripts/jce.py sdk --variant release --no-debug --profiling off --patented-codecs off
+
+  # ---------------------------------------------------------------------------
+  # SDK consumer closure — the stub-PAK regression guard.
+  # Builds the SDK (Track A producer) then builds Caged Kingdom AS AN SDK
+  # CONSUMER via scripts/jce.py (Track B), exactly like an external user.
+  # If the SDK stops shipping host tools, or CK stops using jce_add_pak(),
+  # the consumer build falls back to the 1-byte stub PAK and this job fails.
+  # Gated to main/dispatch until the toolchain is proven green on CI runners;
+  # promote to a PR gate (drop the `if`) once stable.
+  # See scripts/jce.py and contracts/source-layout.json
+  # ---------------------------------------------------------------------------
+  sdk-consumer:
+    name: sdk-consumer (build CK via SDK)
+    needs: lint
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Conan + Ninja
+        run: |
+          pip install --upgrade pip
+          pip install "conan>=2.0" ninja
+          conan profile detect --force
+      - name: Track A — build + install the SDK (ships host tools)
+        run: python scripts/jce.py sdk --arch x64 --variant release --no-debug
+      - name: Track B — build Caged Kingdom via the SDK (consumer)
+        run: python scripts/jce.py app examples/caged_kingdom --arch x64 --variant release
+      - name: Assert a REAL cooked PAK was embedded (not the stub)
+        shell: bash
+        run: |
+          B=examples/caged_kingdom/build/windows-x86_64-release
+          if [ -f "$B/jce_stub_pak.c" ]; then
+            echo "::error::CK fell back to the stub PAK — SDK consumer path is broken"; exit 1
+          fi
+          if [ ! -f "$B/CagedKingdom_assets.pak" ]; then
+            echo "::error::no CagedKingdom_assets.pak produced by jce_add_pak()"; exit 1
+          fi
+          echo "OK: real cooked PAK embedded via the SDK consumer path"
+
+  # ---------------------------------------------------------------------------
+  # Unit tests (Unity + CTest). Phase 1 hardening; covers L1-L2 first,
+  # expands to L3+ as suites land under tests/.
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: unit-tests ${{ matrix.os }}
+    # TIER 2 -- see the TIERS note above.
+    #
+    # This job is NEW in substance even though it is old in this file: the root
+    # test suite was untracked until 2026-09-17, so `ctest -L unit` had nothing
+    # to discover and the job could not have meant anything.  It means
+    # something now, and it has correspondingly never actually run.  Delete
+    # this `if:` once it is green on its own.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            profile: linux-x64
+            preset: linux-x64-debug
+            conan_out: build/desktop/linux-x64-conan
+            build_dir: build/desktop/linux-x64-debug
+            soft: false
+          - os: windows-latest
+            profile: windows-x64
+            preset: windows-x64-debug
+            conan_out: build/desktop/windows-x64-conan
+            build_dir: build/desktop/windows-x64-debug
+            soft: false
+          # macOS stays SOFT while the hidapi/haptic divergence settles
+          # (conanfile.py:110-115 disables both there).  Soft means the
+          # platform is still compiled and still runs the suite; it just does
+          # not block a merge.  Windows and Linux DO block.
+          - os: macos-latest
+            profile: macos-arm64
+            preset: macos-arm64-debug
+            conan_out: build/desktop/macos-arm64-conan
+            build_dir: build/desktop/macos-arm64-debug
+            soft: true
+    continue-on-error: ${{ matrix.soft }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Ninja + MSVC needs the vcvars environment.  scripts/jce.py sets this up
+      # itself via vcvarsall for its own commands; CI configures CMake directly,
+      # so it has to do the same thing here.
+      - name: MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Conan + Ninja
+        run: |
+          pip install --upgrade pip
+          pip install "conan>=2.0" ninja
+          conan profile detect --force
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build managed scripting artifacts
+        run: |
+          python scripting/csharp/build_csharp.py
+          python scripting/java/build_java.py
+      - name: Prepare owned Conan configuration and local recipes
+        run: python -c "import os,sys; sys.path.insert(0,'scripts'); import jce; jce.sync_conan_hooks(); jce.export_conan_recipes(dict(os.environ))"
+
+      # The Debug toolchain must land where the *-debug presets look for it:
+      # <conan_out>/build/Debug/generators/conan_toolchain.cmake.
+      # compiler.runtime_type is an MSVC-only setting; passing it to gcc/clang
+      # is an error, hence the branch.
+      - name: Conan install (Debug)
+        shell: bash
+        run: |
+          extra=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            extra="-s compiler.runtime_type=Debug"
+          fi
+          conan install . \
+            -pr:h conan/profiles/${{ matrix.profile }} \
+            -pr:b conan/profiles/${{ matrix.profile }} \
+            --output-folder ${{ matrix.conan_out }} \
+            --build=missing \
+            -s build_type=Debug $extra \
+            -c tools.system.package_manager:mode=install \
+            -c tools.system.package_manager:sudo=True
+
+      - name: Configure with tests ON
+        run: cmake --preset ${{ matrix.preset }} -DJCE_BUILD_TESTS=ON
+
+      # jce_tests is the dependency closure of the suite (tests/CMakeLists.txt).
+      # Building with no target would build the editor and every vendored codec.
+      - name: Build every registered test
+        run: cmake --build ${{ matrix.build_dir }} --target jce_tests
+
+      # No continue-on-error.  A failing assertion is a failing build; that is
+      # the entire point of this job existing.
+      - name: ctest -L unit
+        run: ctest --test-dir ${{ matrix.build_dir }} -L unit --output-on-failure

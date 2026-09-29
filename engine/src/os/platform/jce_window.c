@@ -18,6 +18,7 @@ JCE_SASSERT(JCE_WINDOW_RESIZABLE == SDL_WINDOW_RESIZABLE, win_rs);
 JCE_SASSERT(JCE_WINDOW_MAXIMIZED == SDL_WINDOW_MAXIMIZED, win_mx);
 JCE_SASSERT(JCE_WINDOW_BORDERLESS == SDL_WINDOW_BORDERLESS, win_bl);
 JCE_SASSERT(JCE_WINDOW_HIDDEN == SDL_WINDOW_HIDDEN, win_hd);
+JCE_SASSERT(JCE_WINDOW_OPENGL == SDL_WINDOW_OPENGL, win_gl);
 #undef JCE_SASSERT
 
 #define LOG_TAG "jce_window"
@@ -117,6 +118,48 @@ void jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h)
 {
     if (w) *w = win ? win->pixel_w : 0;
     if (h) *h = win ? win->pixel_h : 0;
+}
+
+void jce_window_get_safe_area(JceWindow *win, int *x, int *y, int *w, int *h)
+{
+    /* The fallback is the FULL DRAWABLE, not zero.  A caller that has to
+     * distinguish "no safe area reported" from "the safe area is empty" would
+     * write that test once per call site and get it wrong somewhere; a rect
+     * that is always usable removes the question.  On desktop this fallback IS
+     * the correct answer, which is why the desktop path needs no branch. */
+    int sx = 0, sy = 0;
+    int sw = win ? (int)win->pixel_w : 0;
+    int sh = win ? (int)win->pixel_h : 0;
+
+    if (win && win->sdl_win) {
+        SDL_Rect r;
+        if (SDL_GetWindowSafeArea(win->sdl_win, &r) &&
+            r.w > 0 && r.h > 0) {
+            /* SDL reports the safe area in the window's LOGICAL coordinates
+             * while pixel_w/pixel_h are the drawable's, and on a HiDPI phone
+             * those differ by the display scale.  Scaling here keeps every
+             * caller in one coordinate space -- pixels -- because a rect that
+             * silently changes units between platforms is the kind of thing
+             * that lays out correctly on the machine it was written on. */
+            int lw = 0, lh = 0;
+            SDL_GetWindowSize(win->sdl_win, &lw, &lh);
+            if (lw > 0 && lh > 0 && sw > 0 && sh > 0) {
+                const float fx = (float)sw / (float)lw;
+                const float fy = (float)sh / (float)lh;
+                sx = (int)((float)r.x * fx);
+                sy = (int)((float)r.y * fy);
+                sw = (int)((float)r.w * fx);
+                sh = (int)((float)r.h * fy);
+            } else {
+                sx = r.x; sy = r.y; sw = r.w; sh = r.h;
+            }
+        }
+    }
+
+    if (x) *x = sx;
+    if (y) *y = sy;
+    if (w) *w = sw;
+    if (h) *h = sh;
 }
 
 void jce_window_set_title(JceWindow *win, const char *title)

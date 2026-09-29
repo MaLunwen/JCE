@@ -39,8 +39,10 @@ extern "C" {
 
 /* Lighting panel accessors — defined in jce_panel_lighting_settings.cpp.
  * Declared once here instead of in each viewport translation unit. */
-void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
+bool jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
+
+#include "core/jce_editor_config.h"
 
 /* ── PostFX state ─────────────────────────────────────────────────── */
 
@@ -98,6 +100,16 @@ inline void jce_editor_viewport_postfx_mirror(JcePostFXPipeline       *dst,
     jce_postfx_set_tonemap_op(dst, jce_postfx_get_tonemap_op(src));
     jce_postfx_set_bloom_knee(dst, jce_postfx_get_bloom_knee(src));
     jce_postfx_set_bloom_quality(dst, jce_postfx_get_bloom_quality(src));
+
+    /* Auto exposure.  Mirrored like everything else here because the two
+     * viewports render in the SAME frame: a gate set on one and not the other
+     * shows the same scene at two different exposures side by side, and the
+     * reflex is to call that a rendering bug. */
+    {
+        JceAutoExposureDesc ae;
+        jce_postfx_get_auto_exposure_desc(src, &ae);
+        jce_postfx_set_auto_exposure(dst, jce_postfx_get_auto_exposure(src), &ae);
+    }
 
     JceTexture lut          = { UINT16_MAX };
     int        lut_size     = 0;
@@ -179,23 +191,192 @@ inline void jce_editor_viewport_apply_ambient_override(JceSceneRenderer *sr)
     if (!sr) return;
     float amb_color[3];
     float amb_intensity = 0.15f;
-    jce_editor_lighting_get_ambient(amb_color, &amb_intensity);
-    jce_scene_renderer_set_ambient_override(sr, amb_color, amb_intensity);
+    if (jce_editor_lighting_get_ambient(amb_color, &amb_intensity))
+        jce_scene_renderer_set_ambient_override(sr, amb_color, amb_intensity);
+    else
+        jce_scene_renderer_set_ambient_override(sr, nullptr, 0.0f);
 }
 
 /* ── Post passes over the bridge ──────────────────────────────────── */
 
+/* ── Per-viewport bgfx view-id map ─────────────────────────────────────
+ *
+ * Every id here is BASE-RELATIVE.  The Scene View renders at
+ * JCE_VIEW_EDITOR_SCENE, the Game View at JCE_EDITOR_GAME_VIEW_BASE, and each
+ * adds these offsets to its own base.
+ *
+ * Two constraints bound the numbers, and the first one is not obvious:
+ *
+ *  1. An offset must NOT be one the scene renderer NAMES
+ *     (JCE_VIEW_SR_OFFSET_RESERVED, <jce/renderer/jce_views.h>).  The renderer
+ *     hands its named ids to bgfx_set_view_order() so the shadow/cull producer
+ *     passes sort BEFORE the colour pass; the builder then appends every
+ *     unnamed id in the window as filler, and all filler sorts AFTER all named
+ *     ids.  So an editor pass on a FILLER id draws after the scene (fine),
+ *     while an editor pass on a NAMED id inherits the producer's early sort
+ *     position: it rasterises into the bridge and the colour pass's clear then
+ *     erases it.  No error, no log, no pixels.
+ *
+ *     The tail block below used to be 52..56 -- byte for byte the dynamic-CSM
+ *     atlas band (JCE_VIEW_SR_DYN_CSM_OFFSET .. +4).  That is why the ECS-UI
+ *     Canvas overlay drew nothing in either editor viewport while the shipped
+ *     runtime, which uses JCE_VIEW_UI (254, outside every remap window), drew
+ *     it correctly.  Control: JCE_SHADOW_DUAL=0 removed the band from the order
+ *     and the UI reappeared in both viewports, unchanged otherwise.
+ *
+ *     The static_asserts under the enum are that rule as a gate.  They are not
+ *     decoration: this collision was introduced by renumbering these offsets
+ *     while the reservation lived only in an engine-private comment.
+ *
+ *  2. base + the highest offset must stay below the next fixed id in
+ *     <jce/renderer/jce_views.h> and below the other viewport's base.
+ *
+ * KNOWN, UNFIXED, OPT-IN: with omnidirectional point shadows on
+ * (r.point_shadows / JCE_POINT_CUBE_SHADOWS, default OFF) the scene renderer
+ * also names base+100..116.  For the Scene View that is 103..119, which lands
+ * inside the GAME view's own range -- a cross-BASE conflict this header cannot
+ * assert away, because the fix is to re-space the bases and the 256-id bgfx
+ * budget has no room.  Documented here rather than left to be rediscovered.
+ *
+ * The TAIL passes (base+58..62) run after the scene colour pass purely because
+ * they are outside the named set: bgfx keeps their identity sort key, which is
+ * higher than any position the remap window hands out.  Their order among
+ * themselves is their numeric order -- UI overlay, then the dynamic-resolution
+ * resolve, then the read-back capture, then TSR. */
 enum : uint16_t {
-    JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET = 20,
+    /* Screen-space reflections composite (engine pass, editor-driven). */
+    JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET        = 19,
+    /* Project-authored HDR full-screen stages, and their fold-back composite.
+     * The stages run 20 .. 20+JCE_VIEW_SR_FULLSCREEN_MAX-1 = 20..25; 26 and 27
+     * are SSGI's march and composite, which have to sit below the postfx base
+     * at 30.  The engine enforces the cap (jce_sr_fullscreen_effect.c) and the
+     * static_assert below is the other half: if either number moves, the two
+     * stop agreeing here rather than in a frame nobody looks at. */
+    JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET      = 20,
+    JCE_EDITOR_VP_SSGI_OFFSET                 = 26,
+    JCE_EDITOR_VP_SSGI_COMPOSITE_OFFSET       = 27,
     JCE_EDITOR_VP_FULLSCREEN_COMPOSITE_OFFSET = 28,
-    JCE_EDITOR_VP_OVERLAY_OFFSET = 29,
-    JCE_EDITOR_VP_POSTFX_BASE_OFFSET = 30,
-    JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET = 51,
-    JCE_EDITOR_VP_UI_OFFSET = 52,
-    JCE_EDITOR_VP_UPSCALE_OFFSET = 53,
-    JCE_EDITOR_VP_SCREENSHOT_OFFSET = 54,
-    JCE_EDITOR_VP_TSR_OFFSET = 55
+    /* Editor gizmo / grid / selection overlay. */
+    JCE_EDITOR_VP_OVERLAY_OFFSET              = 29,
+    /* PostFX chain: jce_postfx.c claims view_base .. view_base+20. */
+    JCE_EDITOR_VP_POSTFX_BASE_OFFSET          = 30,
+    JCE_EDITOR_VP_POSTFX_COUNT                = 21,
+    JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET     = 51,
+    /* ── tail: everything that must run AFTER the scene colour pass ── */
+    JCE_EDITOR_VP_UI_OFFSET                   = 58,
+    JCE_EDITOR_VP_UPSCALE_OFFSET              = 59,
+    JCE_EDITOR_VP_SCREENSHOT_OFFSET           = 60,
+    JCE_EDITOR_VP_TSR_OFFSET                  = 61,   /* uses +61 and +62 */
+    JCE_EDITOR_VP_TSR_COUNT                   = 2,
+    /* One past the highest offset any editor viewport pass uses. */
+    JCE_EDITOR_VP_OFFSET_END                  = 63
 };
+
+/* The Game View's base now lives in <jce/renderer/jce_views.h>, in the same
+ * table as the Scene View's, because it is not an editor detail: it is a
+ * SECOND scene-renderer base, and the engine's own band widths are what decide
+ * how far apart the two have to be.  It was 80, which is 77 above the Scene
+ * View -- forty ids short of the 117 a base actually claims once point-cube
+ * shadows are on. */
+constexpr uint16_t JCE_EDITOR_GAME_VIEW_BASE = JCE_VIEW_EDITOR_GAME;
+
+/* Gate 1 -- no editor pass may sit on a scene-renderer-named id. */
+#define JCE_EDITOR_VP_ASSERT_FREE(off)                                     \
+    static_assert(!JCE_VIEW_SR_OFFSET_RESERVED(off),                       \
+                  #off " collides with a bgfx view id the scene renderer "  \
+                  "names: it would draw before the colour pass, then be "   \
+                  "erased by that pass's clear")
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET);
+/* The planar reflection composite shares this id with SSR's, by submission
+ * order -- jce_views.h says why that is what the two passes are rather than a
+ * shortage of ids.  If the engine ever moves it, this stops compiling here
+ * rather than in a frame where one reflection silently replaces the other. */
+static_assert(JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET
+                  == JCE_VIEW_SR_REFLECTION_COMPOSITE_OFFSET,
+              "editor and engine disagree about the reflection composite view");
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_FULLSCREEN_COMPOSITE_OFFSET);
+/* The fullscreen chain must stop before SSGI's march, and SSGI's two ids must
+ * be the ones the engine names.  Both are compile-time facts; a mismatch here
+ * is a pass silently overwriting another. */
+static_assert(JCE_EDITOR_VP_FULLSCREEN_BASE_OFFSET + JCE_VIEW_SR_FULLSCREEN_MAX
+                  <= JCE_EDITOR_VP_SSGI_OFFSET,
+              "the fullscreen chain would run into SSGI's march view");
+static_assert(JCE_EDITOR_VP_SSGI_OFFSET == JCE_VIEW_SR_SSGI_OFFSET,
+              "editor and engine disagree about SSGI's march view");
+static_assert(JCE_EDITOR_VP_SSGI_COMPOSITE_OFFSET
+                  == JCE_VIEW_SR_SSGI_COMPOSITE_OFFSET,
+              "editor and engine disagree about SSGI's composite view");
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_OVERLAY_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_POSTFX_BASE_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_POSTFX_BASE_OFFSET +
+                          JCE_EDITOR_VP_POSTFX_COUNT - 1);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_UI_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_UPSCALE_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_SCREENSHOT_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_TSR_OFFSET);
+JCE_EDITOR_VP_ASSERT_FREE(JCE_EDITOR_VP_TSR_OFFSET + JCE_EDITOR_VP_TSR_COUNT - 1);
+#undef JCE_EDITOR_VP_ASSERT_FREE
+
+/* Gate 2 -- each viewport's span must fit before the next fixed id and before
+ * the other viewport's base. */
+static_assert(JCE_VIEW_EDITOR_SCENE + JCE_EDITOR_VP_UI_OFFSET >
+              JCE_VIEW_EDITOR_PREVIEW,
+              "scene-view tail overlaps the fixed material-preview view id");
+static_assert(JCE_VIEW_EDITOR_SCENE + JCE_EDITOR_VP_OFFSET_END <=
+              JCE_VIEW_EDITOR_PICK,
+              "scene-view span overruns the fixed pick view id");
+static_assert(JCE_VIEW_EDITOR_SCENE + JCE_EDITOR_VP_OFFSET_END <=
+              JCE_EDITOR_GAME_VIEW_BASE,
+              "scene-view span overruns the game-view base");
+static_assert(JCE_EDITOR_GAME_VIEW_BASE + JCE_EDITOR_VP_OFFSET_END <=
+              JCE_VIEW_IMGUI,
+              "game-view span overruns the ImGui view");
+
+/* Gate 3 -- the spacing that a static_assert inside ONE viewport could never
+ * check: a scene-renderer base claims up to JCE_VIEW_SR_POINT_CUBE_OFFSET +
+ * COUNT - 1 (116, with point-cube shadows on), so the two bases must be at
+ * least that far apart or the Scene View's cube band lands inside the Game
+ * View's range.  This is R3, and it is why the Game View moved from 80 to 120. */
+static_assert(JCE_EDITOR_GAME_VIEW_BASE - JCE_VIEW_EDITOR_SCENE >
+              JCE_VIEW_SR_POINT_CUBE_OFFSET + JCE_VIEW_SR_POINT_CUBE_COUNT - 1,
+              "the two editor viewport bases are closer together than one "
+              "scene-renderer base actually claims: with point-cube shadows "
+              "on, the Scene View's cube band would land inside the Game "
+              "View's range");
+static_assert(JCE_EDITOR_GAME_VIEW_BASE + JCE_VIEW_SR_POINT_CUBE_OFFSET +
+              JCE_VIEW_SR_POINT_CUBE_COUNT - 1 < JCE_VIEW_IMGUI,
+              "the Game View's point-cube band overruns the ImGui view");
+
+/* Declare this viewport's OWN view ids to the engine's ownership guard, once
+ * per frame per viewport.
+ *
+ * The guard (jce_view_bands_claim) was written for exactly the failure this
+ * header documents above, and it never fired on it: only the scene renderer
+ * and the postfx chain ever declared anything, so the editor's passes were
+ * invisible to it.  The compile-time static_asserts are the primary gate for
+ * the same-base case; this catches what a static_assert cannot -- a CROSS-base
+ * overlap (one viewport's band reaching into another's) and any future engine
+ * band that grows into this range at runtime.
+ *
+ * Three runs, not one: the postfx chain (base+30..+50) declares itself as
+ * "postfx", so claiming it here would report a conflict with ourselves. */
+inline void jce_editor_viewport_claim_view_band(const char *owner,
+                                                uint16_t view_base)
+{
+    if (!jce_view_bands_enabled()) return;
+    jce_view_bands_claim(owner,
+        (uint16_t)(view_base + JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET),
+        (uint16_t)(JCE_EDITOR_VP_OVERLAY_OFFSET -
+                   JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET + 1));
+    jce_view_bands_claim(owner,
+        (uint16_t)(view_base + JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET), 1u);
+    jce_view_bands_claim(owner,
+        (uint16_t)(view_base + JCE_EDITOR_VP_UI_OFFSET),
+        (uint16_t)(JCE_EDITOR_VP_TSR_OFFSET + JCE_EDITOR_VP_TSR_COUNT -
+                   JCE_EDITOR_VP_UI_OFFSET));
+}
 
 /* Composite the volumetric-fog (+16) and SSR (+19) render targets back over the
  * bridge's colour RT — after the scene draws into it, before overlays / PostFX.
@@ -209,8 +390,26 @@ inline void jce_editor_viewport_composite_fog_ssr(JceSceneRenderer   *sr,
     const uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(bridge);
     if (fog_enabled)
         jce_scene_renderer_composite_fog(sr, (uint16_t)(view_base + 16), dst_fb);
-    jce_scene_renderer_composite_ssr(sr, (uint16_t)(view_base + 19), dst_fb);
+    jce_scene_renderer_composite_ssr(
+        sr, (uint16_t)(view_base + JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET), dst_fb);
+    /* SAME VIEW, SECOND -- see jce_views.h.  The static_assert above ties this
+     * offset to the engine's, so the runtime and the two viewports cannot
+     * drift into compositing the two reflections in a different order. */
+    JceFrameBufferHandle planar_dst = { dst_fb };
+    jce_scene_renderer_composite_planar(
+        sr, (uint16_t)(view_base + JCE_EDITOR_VP_SSR_COMPOSITE_OFFSET), planar_dst);
+    /* SSGI composites at base+27, one above its own march at base+26 and below
+     * the postfx base at base+30 that reads the colour it writes into.  Both
+     * viewports and the shipped runtime use the SAME offset -- a pass wired
+     * into one of them only is exactly the editor-vs-build divergence this
+     * tree keeps finding, and the two static_asserts above the enum are that
+     * agreement as a compile-time gate. */
+    JceFrameBufferHandle ssgi_dst = { dst_fb };
+    jce_scene_renderer_composite_ssgi(
+        sr, (uint16_t)(view_base + JCE_EDITOR_VP_SSGI_COMPOSITE_OFFSET),
+        ssgi_dst);
 }
+
 
 /* Run project-authored HDR full-screen stages and fold their output back into
  * the bridge.  This gives later overlays and the ordinary PostFX chain one
@@ -336,10 +535,35 @@ inline bool jce_editor_viewport_screenshot_submit(JceOffscreenTarget *bridge,
  * Frostbite use a software depth pyramid. JCE already has Hi-Z occlusion
  * (JCE_HIZ_OCCLUSION, jce_gpu_scene.c) -- that is the path worth investing in,
  * and it is unaffected by this switch. */
-inline bool jce_editor_viewport_occlusion_disabled(void)
+/* Resolution order, matching every other perf feature: env first (forensic
+ * override), then the .rp.json / preset tri-state, then the built-in default
+ * of OFF explained above.
+ *
+ * The env var is JCE_ENABLE_OCCLUSION, an opt-IN.  Four comments and both
+ * call sites used to name JCE_DISABLE_OCCLUSION, an opt-OUT that NO getenv in
+ * this tree has ever read -- so on a default run the editor logged
+ * "JCE_DISABLE_OCCLUSION set — occlusion culling OFF" on a machine where
+ * nothing of the sort was set, and a reader could only conclude a diagnostic
+ * had been left on.  It had not; the feature is off by design.  The messages
+ * say that now. */
+inline bool jce_editor_viewport_occlusion_enabled(void)
 {
     const char *en = getenv("JCE_ENABLE_OCCLUSION");
-    return !(en && en[0] && en[0] != '0');
+    if (en && en[0])
+        return en[0] != '0';
+
+    JceEditorConfig cfg;
+    if (jce_editor_config_load(&cfg))
+        return cfg.viewport_occlusion;
+    return false;   /* built-in: off, for the reason above */
+}
+
+/* True when the env var is what decided it, so the caller can say so instead
+ * of implying a setting. */
+inline bool jce_editor_viewport_occlusion_forced_by_env(void)
+{
+    const char *en = getenv("JCE_ENABLE_OCCLUSION");
+    return en && en[0];
 }
 
 /* Create a viewport's own two-pass GPU-query occlusion culler.  Each viewport

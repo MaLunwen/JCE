@@ -85,8 +85,36 @@ JCE_API void JCE_CALL jce_lifecycle_unregister(JceLifecycleHandle h);
 
 /* Emit an event to all listeners (in priority order).  This is the
  * platform-internal hook called by the SDL event pump; game code
- * should not call it directly. */
+ * should not call it directly.  MAIN THREAD ONLY -- see the note at the
+ * top of this header: every listener is written on that assumption. */
 JCE_API void JCE_CALL jce_lifecycle_emit(JceLifecycleEvent event);
+
+/* WHERE DEVICE_LOST COMES FROM, because it came from nowhere until
+ * 2026-09-21 and the next reader will want to know.
+ *
+ * JCE_LIFECYCLE_DEVICE_LOST had ZERO emitters: the whole tracked tree named
+ * it four times -- the enum above, its case in jce_lifecycle_event_to_string(),
+ * its row in contracts/abi-snapshot.txt, and a platform AGENTS.md table
+ * saying "(no SDL counterpart yet); renderer may emit manually".  A
+ * consumer's jce_lifecycle_register(DEVICE_LOST, ...) succeeded and the
+ * callback was dead code, with nothing anywhere saying so.
+ *
+ * THE OBVIOUS FIX WAS WRONG.  SDL_EVENT_RENDER_DEVICE_LOST does exist in
+ * SDL3, so the table's "no SDL counterpart" is stale -- but it is an
+ * SDL_Render event, raised for an SDL_Renderer, and this engine creates one
+ * ONLY in the safe-mode software fallback (jce_renderer.c: "Force the pure
+ * CPU software renderer").  Translating it beside the DEVICE_RESET case
+ * would have fired on the diagnostic path and never on a real backend --
+ * the same defect wearing a green count.  IT ALSO MEANS THE EXISTING
+ * DEVICE_RESET EMITTER IS DEAD on the normal path, for the same reason, and
+ * that is recorded rather than quietly fixed: making it fire is a separate
+ * decision about what "reset" means for a bgfx swap chain.
+ *
+ * The real signal is BGFX_FATAL_DEVICE_LOST.  The renderer records it and
+ * jce_engine_iterate emits here on the main thread -- the renderer cannot
+ * emit it itself, because <jce/application/...> is a layer it may not
+ * include, and because bgfx delivers that callback on its render thread
+ * everywhere except macOS. */
 
 /* Convenience state getters reflecting the last paired event seen. */
 JCE_API bool JCE_CALL jce_lifecycle_is_focused(void);

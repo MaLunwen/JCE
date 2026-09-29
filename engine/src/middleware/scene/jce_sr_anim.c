@@ -12,8 +12,17 @@
  */
 
 #include "jce_sr_internal.h"
+#include "jce_sr_anim_retarget.h"
 
+#include <jce/middleware/animation/jce_humanoid.h> /* role map for kind-7 IK goals */
 #include <jce/resource/jce_pak_loader.h>   /* PAK-first anim-SM / avatar-mask */
+#include <jce/middleware/animation/jce_anim_clip_io.h> /* clips beside the rig */
+#include "middleware/animation/jce_animation.h"  /* jce_anim_clip_destroy: called
+                                                  * at :800 with no prototype in
+                                                  * scope until now (C4013) */
+#include <jce/os/core/jce_filesystem.h>  /* host read for the clip fallback */
+
+#include <string.h>
 
 /* ── FEATURE 3.1 GPU morph deform: per-instance dynamic-VB lifecycle ──
  *
@@ -174,6 +183,10 @@ static void sr_anim_rebind_model(SrAnimInstance *a, JceModel *model)
        — destroy them BEFORE the new model binds so they re-create lazily
        against the new geometry (handle-leak guard). */
     sr_free_morph_vbs(a);
+    /* The file clips were resolved against the OLD skeleton's directory, so a
+       model swap invalidates them exactly the way it invalidates the retarget
+       map above. */
+    sr_release_file_clips(a);
     JceSkeleton *sk = jce_model_get_skeleton(model);
     if (sk && jce_model_anim_count(model) > 0)
         a->player = jce_anim_player_create(sk);
@@ -226,6 +239,8 @@ static SrAnimInstance *sr_get_anim_instance(JceSceneRenderer *sr,
     for (int li = 0; li < SR_AVATAR_MAX_LAYERS; li++)             /* reclaimed slot */
         if (a->layer_mask[li]) jce_avatar_mask_unload(a->layer_mask[li]);
     if (a->retarget_map) jce_anim_retarget_map_destroy(a->retarget_map); /* reclaimed slot */
+    if (a->aoc) jce_anim_override_controller_unload(a->aoc);       /* reclaimed slot */
+    sr_release_file_clips(a);                                      /* reclaimed slot */
     /* Reclaimed slot may hold a previous entity's live morph VBs — destroy
        them BEFORE the memset (which would orphan the handles).  ONLY for a
        slot that was actually used: a FIRST-TIME slot is zero-initialized and
@@ -403,6 +418,14 @@ void sr_update_sprite_anims(JceSceneRenderer *sr, JceScene *scene,
                      sizeof(sr->sprite_anim[slot].cur_anim), "%s",
                      sa->current_anim);
         }
+
+        /* The COMPONENT decides, not the Aseprite tag: once an author has a
+           Loop checkbox in front of them it is the answer, and until this it
+           reached nothing.  Set unconditionally rather than inside the
+           `playing` guard -- a paused animator whose Loop was just ticked
+           must resume looping when it is played again, not on the next
+           unrelated edit. */
+        jce_sprite_player_set_loop(pl, sa->loop ? 1 : 0);
 
         if (sa->playing) {
             float sp = sa->speed > 0.0f ? sa->speed : 1.0f;
@@ -700,6 +723,25 @@ static void sr_anim_events_advance(JceSceneRenderer *sr,
 /* Case-insensitive, basename-aware clip-name match (mirrors the SM binding):
  * robust to inconsistent casing / paths across different models. */
 static int sr_lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+/* Load / refresh this instance's override controller from the entity's Avatar.
+ *
+ * Reloads only when the authored path CHANGES, so an unchanged field costs one
+ * strcmp per frame.  An empty path drops the controller, which is what makes
+ * clearing the field in the Inspector take effect rather than requiring a
+ * reload of the scene. */
+static void sr_anim_sync_override(JceScene *scene, JceEntity e,
+                                  SrAnimInstance *ai)
+{
+    const JceAvatarComponent *av = jce_scene_get_avatar(scene, e);
+    const char *path = av ? av->override_controller : "";
+    if (!path) path = "";
+    if (strcmp(ai->aoc_path, path) == 0) return;
+
+    if (ai->aoc) { jce_anim_override_controller_unload(ai->aoc); ai->aoc = NULL; }
+    snprintf(ai->aoc_path, sizeof ai->aoc_path, "%s", path);
+    if (path[0]) ai->aoc = jce_anim_override_controller_load(path);
+}
+
 static bool sr_clip_name_match(const char *a, const char *b)
 {
     if (!a || !b) return false;
@@ -714,30 +756,142 @@ static bool sr_clip_name_match(const char *a, const char *b)
 /* Resolve an SM state's authored clip name to the model's JceAnimClip
  * (case-insensitive basename match — the same rule the binding's clip
  * resolver uses).  NULL when the state has no clip or the model lacks it. */
+/* Defined below, beside the cache it reads.  Forward-declared because both
+ * clip lookups fall back to it and the first of them comes first. */
+static JceAnimClip *sr_find_file_clip(SrAnimInstance *ai, const char *want,
+                                      const JcePakArchive *sr_pak);
+
 static JceAnimClip *sr_sm_state_model_clip(const JceAnimSm *sm, int state,
-                                           JceModel *model)
+                                           JceModel *model,
+                                           const JceAnimOverrideController *aoc,
+                                           SrAnimInstance *ai,
+                                           const JcePakArchive *pak)
 {
     const char *want = jce_anim_sm_state_clip(sm, state);
+    /* ONE GRAPH, A DIFFERENT SET OF CLIPS.  The state machine keeps its
+     * states, transitions and conditions; only the clip each state ASKS FOR is
+     * answered differently.  resolve() returns its input when there is no
+     * substitution and when aoc is NULL, so there is no branch here to forget. */
+    want = jce_anim_override_controller_resolve(aoc, want);
     if (!want || !want[0] || !model) return NULL;
     int an = (int)jce_model_anim_count(model);
     for (int i = 0; i < an; i++) {
         JceAnimClip *c = jce_model_get_anim(model, (uint32_t)i);
         if (sr_clip_name_match(jce_anim_clip_name(c), want)) return c;
     }
-    return NULL;
+    /* The model does not have it; a clip file beside the rig might. */
+    return sr_find_file_clip(ai, want, pak);
+}
+
+/* ── Clips that are not inside the model ──────────────────────────────
+ *
+ * JceSkeletalAnimator names its clips by string, and until now both lookups
+ * scanned the MODEL and returned NULL if the name was not there -- so a clip
+ * could only ever live inside the skeleton asset it was imported with.  The
+ * fallback looks for `<skeleton dir>/<name>.animclip.json`, which means the
+ * name the author already typed reaches a clip beside the rig.  No new
+ * component field: adding one would have made every existing scene's clip
+ * reference the old way of doing it.
+ *
+ * A MISS IS CACHED AS A MISS.  Without the negative entry a name in neither
+ * place stats the filesystem every frame for every entity. */
+void sr_release_file_clips(SrAnimInstance *a)
+{
+    int i;
+    if (!a) return;
+    for (i = 0; i < a->file_clip_count; ++i) {
+        if (a->file_clips[i].clip) jce_anim_clip_destroy(a->file_clips[i].clip);
+        a->file_clips[i].clip    = NULL;
+        a->file_clips[i].name[0] = '\0';
+    }
+    a->file_clip_count = 0;
+}
+
+static JceAnimClip *sr_find_file_clip(SrAnimInstance *ai, const char *want,
+                                      const JcePakArchive *sr_pak)
+{
+    char path[512];
+    char dir[400];
+    size_t n;
+    int i;
+
+    if (!ai || !want || !want[0] || !ai->skel_path[0]) return NULL;
+
+    for (i = 0; i < ai->file_clip_count; ++i)
+        if (strcmp(ai->file_clips[i].name, want) == 0)
+            return ai->file_clips[i].clip;      /* may be NULL: a cached miss */
+
+    if (ai->file_clip_count >= SR_FILE_CLIP_MAX ||
+        strlen(want) >= sizeof ai->file_clips[0].name)
+        return NULL;
+
+    /* The skeleton's directory, or the project root when it has none. */
+    snprintf(dir, sizeof dir, "%s", ai->skel_path);
+    n = strlen(dir);
+    while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') --n;
+    dir[n] = '\0';
+    snprintf(path, sizeof path, "%s%s.animclip.json", dir, want);
+
+    {
+        JceAnimClip *clip = NULL;
+
+        /* PAK FIRST, then the host path -- the same order sr_anim_load_sm
+         * uses, and for the reason its comment records: a deployed exe that
+         * loads only through resolve_path->host finds NOTHING in a single-exe
+         * build, because there is no loose cooked tree.  A host-only read
+         * here would have made this an editor-only feature that returns NULL
+         * in a shipped game with no error anywhere. */
+        if (sr_pak && path[0]) {
+            const JcePakAsset *pa = jce_pak_find(sr_pak, path);
+            if (pa && pa->original_size && pa->original_size <= (1u << 22)) {
+                char *pbuf = (char *)JCE_MALLOC((size_t)pa->original_size);
+                if (pbuf) {
+                    if (jce_pak_decompress(pa, pbuf, (size_t)pa->original_size)
+                        == (size_t)pa->original_size)
+                        clip = jce_anim_clip_parse(pbuf,
+                                                   (size_t)pa->original_size);
+                    JCE_FREE(pbuf);
+                }
+            }
+        }
+        if (!clip) {
+            uint64_t size = 0;
+            void *bytes = jce_fs_host_read_all(path, &size);
+            if (bytes) {
+                clip = jce_anim_clip_parse((const char *)bytes, (size_t)size);
+                jce_fs_buffer_free(bytes);
+            }
+        }
+        if (clip)
+            LOG_INFO(LOG_TAG, "clip '%s' resolved from %s", want, path);
+        /* Recorded either way -- the miss is the expensive case to repeat. */
+        snprintf(ai->file_clips[ai->file_clip_count].name,
+                 sizeof ai->file_clips[0].name, "%s", want);
+        ai->file_clips[ai->file_clip_count].clip = clip;
+        ai->file_clip_count++;
+        return clip;
+    }
 }
 
 /* Find a model clip by (tolerant) name match — used by the avatar layer stack
  * to resolve each authored layer's clip. NULL if absent. */
-static JceAnimClip *sr_find_model_clip(JceModel *model, const char *want)
+static JceAnimClip *sr_find_model_clip(JceModel *model, const char *want,
+                                       const JceAnimOverrideController *aoc,
+                                       SrAnimInstance *ai,
+                                       const JcePakArchive *pak)
 {
-    if (!model || !want || !want[0]) return NULL;
-    int an = (int)jce_model_anim_count(model);
+    want = jce_anim_override_controller_resolve(aoc, want);
+    if (!want || !want[0]) return NULL;
+    int an = model ? (int)jce_model_anim_count(model) : 0;
     for (int i = 0; i < an; i++) {
         JceAnimClip *c = jce_model_get_anim(model, (uint32_t)i);
         if (sr_clip_name_match(jce_anim_clip_name(c), want)) return c;
     }
-    return NULL;
+    /* BOTH lookups fall back, not one.  This serves the avatar layer stack
+     * and the one above serves the state machine; a clip library that
+     * resolved for one and not the other would let an author type the same
+     * name in two places and have it work in one. */
+    return sr_find_file_clip(ai, want, pak);
 }
 
 /* Compute the entity's planar (XZ) movement speed from the frame-to-frame
@@ -1113,8 +1267,25 @@ static inline int sr_asel_n(const EntityList *list)
 static inline int sr_asel_i(int k)
 { return s_asel_valid ? s_asel_idx[k] : k; }
 
+/* "LeftArm" / "RightArm" / "LeftLeg" / "RightLeg" -> JceHumanoidLimb.
+ *
+ * Spelled out rather than matched loosely: a goal that silently resolves to
+ * the wrong limb pins the wrong hand, and on a symmetric rig that reads as
+ * "the IK is weak" rather than as a typo.  An unrecognised string returns
+ * false and the constraint is skipped, so a misspelling is inert rather than
+ * quietly left-handed. */
+static bool sr_humanoid_limb_from_name(const char *s, JceHumanoidLimb *out)
+{
+    if (!s || !out) return false;
+    if (strcmp(s, "LeftArm")  == 0) { *out = JCE_HUMANOID_LIMB_LEFT_ARM;  return true; }
+    if (strcmp(s, "RightArm") == 0) { *out = JCE_HUMANOID_LIMB_RIGHT_ARM; return true; }
+    if (strcmp(s, "LeftLeg")  == 0) { *out = JCE_HUMANOID_LIMB_LEFT_LEG;  return true; }
+    if (strcmp(s, "RightLeg") == 0) { *out = JCE_HUMANOID_LIMB_RIGHT_LEG; return true; }
+    return false;
+}
+
 static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
-                                    EntityList *list)
+                                           EntityList *list)
 {
     const int an = sr_asel_n(list);
     for (int k = 0; k < an; k++) {
@@ -1173,7 +1344,7 @@ static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
              *   5 CCD         -> jce_anim_ik_ccd_solve  (root->mid->end chain)
              *   6 FABRIK      -> jce_anim_ik_fabrik_solve(root->mid->end chain)
              * All seven kinds are now solved. */
-            if (c->kind < 0 || c->kind > 6)
+            if (c->kind < 0 || c->kind > 7)
                 continue;  /* unknown kind: round-trips but inert */
             if (!c->enabled || c->weight <= 0.0f) continue;
             if (c->target_entity == 0) continue;
@@ -1183,9 +1354,38 @@ static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
              * NOT chain-reach problems and need no mid/end joint. */
             bool single_target = (c->kind == 2 || c->kind == 3 || c->kind == 4);
 
-            int jr = jce_skeleton_find_joint(skel, c->root_bone);
-            int jm = jce_skeleton_find_joint(skel, c->mid_bone);
-            int je = jce_skeleton_find_joint(skel, c->end_bone);
+            /* Kind 7 (HumanoidLimb) names a LIMB, not three joints: the
+             * triple comes from this rig's humanoid role map, so the same
+             * authored goal works on a rig whose bone names this scene has
+             * never seen.  Everything after this point -- the solve, the
+             * weight, the pole, the write-back -- is the kind-1 path
+             * unchanged, because the only thing that differs between the two
+             * is WHERE the three joint indices came from. */
+            int jr, jm, je;
+            if (c->kind == 7) {
+                JceHumanoidLimb limb;
+                JceHumanoidBone b_up, b_lo, b_end;
+                if (!sr_humanoid_limb_from_name(c->root_bone, &limb)) continue;
+                if (!jce_humanoid_limb_bones(limb, &b_up, &b_lo, &b_end))
+                    continue;
+                if (!ai->humanoid_self_built) {
+                    /* Built once per instance, not per frame: the build walks
+                     * every joint name.  `_built` records the ATTEMPT, so a rig
+                     * with no humanoid roles is not re-scanned every frame
+                     * either -- the same shape humanoid_valid uses above. */
+                    if (!jce_humanoid_map_build(skel, &ai->humanoid_self))
+                        memset(&ai->humanoid_self, -1,
+                               sizeof ai->humanoid_self);
+                    ai->humanoid_self_built = true;
+                }
+                jr = (int)ai->humanoid_self.joint[b_up];
+                jm = (int)ai->humanoid_self.joint[b_lo];
+                je = (int)ai->humanoid_self.joint[b_end];
+            } else {
+                jr = jce_skeleton_find_joint(skel, c->root_bone);
+                jm = jce_skeleton_find_joint(skel, c->mid_bone);
+                je = jce_skeleton_find_joint(skel, c->end_bone);
+            }
             /* Aim (kind 0) rotates a single bone: it needs the root bone plus
              * ONE child reference for the forward axis (prefer mid, else end).
              * Chain kinds (1/5/6) require the full root/mid/end triple. */
@@ -1379,7 +1579,7 @@ static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
              * TwoBoneIK is analytic; CCD/FABRIK iterate over the 3-joint
              * root→mid→end chain. All three share the rotation write-back. */
             jce_vec3 q1, q2;
-            if (c->kind == 1) {
+            if (c->kind == 1 || c->kind == 7) {
                 /* The solver lerps toward the IK pose by `weight` internally —
                  * pass it through and do NOT blend again on write-back. */
                 JceIkTwoBoneInput in;
@@ -1770,7 +1970,7 @@ static void sr_apply_foot_ik(JceSceneRenderer *sr, JceScene *scene,
  * re-deriving the palette.  No effectors / no resolvable bones -> pose
  * unchanged. */
 static void sr_apply_full_body_ik(JceSceneRenderer *sr, JceScene *scene,
-                                  EntityList *list)
+                                         EntityList *list)
 {
     const int an = sr_asel_n(list);
     for (int k = 0; k < an; k++) {
@@ -1878,7 +2078,7 @@ static void sr_apply_full_body_ik(JceSceneRenderer *sr, JceScene *scene,
  * jce_scene_has_ragdoll_pose: for EVERY entity without a published relay pose
  * this is a no-op and the palette is byte-identical to the clip/IK result. */
 static void sr_apply_ragdoll_override(JceSceneRenderer *sr, JceScene *scene,
-                                      EntityList *list)
+                                             EntityList *list)
 {
     const int an = sr_asel_n(list);
     for (int k = 0; k < an; k++) {
@@ -1914,133 +2114,6 @@ static void sr_apply_ragdoll_override(JceSceneRenderer *sr, JceScene *scene,
     }
 }
 
-/* FEATURE 3.1 last-mile — per-instance morph (blendshape) weight resolution.
- *
- * For each skinned entity whose model carries morph-target data, compute the
- * FINAL per-target weights = the clip-driven morph-weight track (sampled at the
- * active clip's current time) OVERRIDDEN per-target by the entity's authored
- * static JceMorphWeights component, via jce_morph_resolve_weights.  The result
- * is cached on the instance (ai->morph_weights / morph_count).
- *
- * Gating keeps legacy content byte-identical: morph_count stays 0 (and the
- * stored weights untouched) unless the model actually has morph targets AND
- * either a JceMorphWeights component or an imported weight track is present.
- *
- * Once weights are resolved, sr_deform_morph_prims runs the CPU pre-skin deform
- * (jce_morph_apply) into per-instance dynamic vertex buffers that the UNCHANGED
- * skinned program reads; the bone palette / shaders are untouched.  No morph
- * component => morph_count 0 => no deform => no dynamic VB => byte-identical. */
-
-/* Per-instance morph-VB override callback handed to jce_model_draw_morphed /
- * _shadow.  Given (node, prim), returns the live dynamic-VB handle idx for that
- * primitive, or UINT16_MAX to fall through to the static skinned VB.  The same
- * callback (and the same ai) MUST drive both color and shadow so the cast
- * silhouette matches the morphed, lit mesh. */
-uint16_t sr_morph_vb_cb(void *user, uint32_t node, uint32_t prim)
-{
-    const SrAnimInstance *ai = (const SrAnimInstance *)user;
-    if (!ai) return (uint16_t)UINT16_MAX;
-    for (uint16_t s = 0; s < ai->morph_vb_count; s++) {
-        if (ai->morph_vb_node[s] == node && ai->morph_vb_prim[s] == prim)
-            return ai->morph_vb[s].idx;   /* UINT16_MAX if not yet created */
-    }
-    return (uint16_t)UINT16_MAX;
-}
-
-/* Lazy-find (or allocate) the per-instance morph-VB slot for a (node, prim).
- * Returns the slot index, or -1 if the bounded array is full. */
-static int sr_morph_vb_slot(SrAnimInstance *ai, uint32_t node, uint32_t prim)
-{
-    for (uint16_t s = 0; s < ai->morph_vb_count; s++) {
-        if (ai->morph_vb_node[s] == node && ai->morph_vb_prim[s] == prim)
-            return (int)s;
-    }
-    if (ai->morph_vb_count >= SR_MORPH_PRIM_MAX) return -1;
-    int s = (int)ai->morph_vb_count++;
-    ai->morph_vb_node[s] = node;
-    ai->morph_vb_prim[s] = prim;
-    /* handle stays BGFX_INVALID_HANDLE until the first upload creates it */
-    return s;
-}
-
-/* CPU pre-skin deform: for each morph-bearing primitive, morph the retained
- * base verts by ai->morph_weights and (re)upload into the instance's dynamic
- * VB.  Dirty-gated against ai->morph_last_weights so static weights cost nothing
- * after the first upload.  LOD-guarded: only deform when the bound mesh's vertex
- * count equals the morph delta vertex count. */
-static void sr_deform_morph_prims(SrAnimInstance *ai)
-{
-    if (!ai || !ai->model || ai->morph_count == 0) return;
-
-    /* Dirty token: skip the whole deform when the resolved weights are
-     * unchanged from the last upload (count + every value). */
-    bool dirty = (ai->morph_last_count != (int)ai->morph_count);
-    if (!dirty) {
-        for (uint32_t t = 0; t < ai->morph_count; t++) {
-            if (ai->morph_last_weights[t] != ai->morph_weights[t]) { dirty = true; break; }
-        }
-    }
-    if (!dirty) return;
-
-    uint32_t nnodes = jce_model_node_count(ai->model);
-    for (uint32_t n = 0; n < nnodes; n++) {
-        uint32_t nprims = jce_model_node_prim_count(ai->model, n);
-        for (uint32_t p = 0; p < nprims; p++) {
-            const JceMorphData *md = jce_model_prim_morph(ai->model, n, p);
-            if (!md) continue;   /* not a morph-bearing prim */
-
-            uint32_t delta_verts = jce_morph_vertex_count(md);
-            uint32_t mesh_verts  = jce_model_prim_vertex_count(ai->model, n, p);
-            /* LOD/topology guard: deform only when the bound mesh vertex count
-             * matches the morph delta vertex count.  A mismatch (e.g. a future
-             * LOD-substituted mesh) disables morph for that prim rather than
-             * indexing past the deltas. */
-            if (delta_verts == 0 || delta_verts != mesh_verts) continue;
-
-            const JceSkinnedMesh *sm = jce_model_prim_skinned_mesh(ai->model, n, p);
-            if (!sm) continue;
-            const void *base = jce_skinned_mesh_base_verts(sm);
-            uint32_t stride  = jce_skinned_mesh_stride(sm);
-            const void *layout = jce_skinned_mesh_layout(sm);
-            if (!base || stride == 0 || !layout) continue;  /* not retained */
-
-            int slot = sr_morph_vb_slot(ai, n, p);
-            if (slot < 0) continue;   /* per-instance VB array full */
-
-            /* Lazily create the dynamic VB with the SAME layout as the static VB. */
-            if (ai->morph_vb[slot].idx == UINT16_MAX) {
-                ai->morph_vb[slot] = bgfx_create_dynamic_vertex_buffer(
-                    mesh_verts, (const bgfx_vertex_layout_t *)layout,
-                    BGFX_BUFFER_NONE);
-                if (ai->morph_vb[slot].idx == UINT16_MAX) continue;  /* pool full */
-            }
-
-            /* Deform into a bgfx-owned transient buffer, then upload.  IMPORTANT:
-             * jce_morph_apply writes ONLY the pos/normal fields — it does NOT
-             * touch (or copy) the trailing uv/tangent/joints/weights bytes.  So
-             * we first memcpy the FULL base vertex array through (preserving the
-             * skinning attributes the GPU palette-skin reads), then run the
-             * deform IN-PLACE over that copy (base==out aliasing is supported).
-             * This guarantees the dynamic VB carries the SAME interleaved layout
-             * as the static VB with only pos/normal rewritten. */
-            uint32_t bytes = mesh_verts * stride;
-            const bgfx_memory_t *mem = bgfx_alloc(bytes);
-            if (!mem) continue;
-            memcpy(mem->data, base, bytes);
-            jce_morph_apply(md, ai->morph_weights, ai->morph_count,
-                            mem->data, mem->data, mesh_verts, stride,
-                            (int32_t)jce_skinned_mesh_pos_offset(sm),
-                            (int32_t)jce_skinned_mesh_normal_offset(sm));
-            bgfx_update_dynamic_vertex_buffer(ai->morph_vb[slot], 0, mem);
-        }
-    }
-
-    /* Record the uploaded weight vector for the next frame's dirty compare. */
-    memcpy(ai->morph_last_weights, ai->morph_weights,
-           ai->morph_count * sizeof(float));
-    ai->morph_last_count = (int)ai->morph_count;
-}
-
 static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
                                      EntityList *list)
 {
@@ -2051,6 +2124,11 @@ static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
         JceMorphWeightsComponent *mw;
         uint32_t targets;
 
+        float          sampled[JCE_MORPH_MAX_WEIGHTS];
+        const float   *track = NULL;
+        uint32_t       track_targets = 0;
+        bool           have_mw = false;
+
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_skeletal_animator(scene, e)) continue;
 
@@ -2058,151 +2136,54 @@ static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
         if (!ai) continue;
         ai->morph_count = 0;   /* default: no morph this frame (legacy parity) */
 
-        /* Authored static morph weights drive the deform.  (A clip-driven
-         * morph-weight track can later be sampled and passed as `track` here;
-         * jce_morph_resolve_weights already supports the combine.)
-         * No component -> morph_count stays 0 -> no deform -> byte-identical. */
-        if (!jce_scene_has_morph_weights(scene, e)) continue;
-        /* Honour the per-component disable (presence-gated: no flag bit). */
-        { static int s_mw_cid = -2;
-          if (s_mw_cid == -2) s_mw_cid = jce_component_find("MorphWeights");
-          if (s_mw_cid >= 0 && !jce_scene_comp_enabled(scene, e, s_mw_cid)) continue; }
-        mw = jce_scene_get_morph_weights(scene, e);
-        if (!mw || mw->count <= 0) continue;
+        /* THE CLIP'S OWN WEIGHTS.  glTF animates blendshapes through a
+         * "weights" channel, which this tree has imported since morph landed
+         * (jce_gltf_loader.c) and exposed as jce_model_morph_anim_track --
+         * whose only two references in the whole tree were its definition and
+         * its prototype.  So facial animation baked into a clip, the primary
+         * use of blendshapes in every engine this one is measured against,
+         * did not play: the sole thing that could move a blendshape was a
+         * designer dragging one of at most 16 static sliders. */
+        track_targets = sr_sample_morph_track(ai, sampled,
+                                              JCE_MORPH_MAX_WEIGHTS);
+        if (track_targets > 0) track = sampled;
 
-        targets = (uint32_t)mw->count;
+        /* The component is now OPTIONAL, and that is the half that was
+         * missing rather than merely unwritten: a clip-driven morph needs no
+         * component at all, and this block used to `continue` without one.
+         * The instance struct's own comment already said so -- "authors a
+         * JceMorphWeights component OR the model carries a morph-weight
+         * track". */
+        have_mw = jce_scene_has_morph_weights(scene, e);
+        if (have_mw) {
+            /* Honour the per-component disable (presence-gated: no flag bit). */
+            static int s_mw_cid = -2;
+            if (s_mw_cid == -2) s_mw_cid = jce_component_find("MorphWeights");
+            if (s_mw_cid >= 0 && !jce_scene_comp_enabled(scene, e, s_mw_cid))
+                have_mw = false;
+        }
+        mw = have_mw ? jce_scene_get_morph_weights(scene, e) : NULL;
+        if (mw && mw->count <= 0) mw = NULL;
+
+        /* Neither source -> nothing to deform, exactly as before. */
+        if (!mw && !track) continue;
+
+        /* The target count is whichever source is present; with both, the
+         * larger, because a component that authors fewer targets than the clip
+         * drives must not truncate the clip's animation -- resolve_weights
+         * takes the track value for every target the mask does not claim. */
+        targets = mw ? (uint32_t)mw->count : 0u;
+        if (track_targets > targets) targets = track_targets;
         if (targets > JCE_MORPH_MAX_WEIGHTS) targets = JCE_MORPH_MAX_WEIGHTS;
 
-        /* track = NULL (no clip channel sampled yet) -> resolve_weights falls
-         * back to the authored weight for every overridden target. */
         ai->morph_count = jce_morph_resolve_weights(
-            NULL, mw->weights, mw->override_mask, targets,
-            ai->morph_weights, JCE_MORPH_MAX_WEIGHTS);
+            track, mw ? mw->weights : NULL, mw ? mw->override_mask : 0u,
+            targets, ai->morph_weights, JCE_MORPH_MAX_WEIGHTS);
 
         /* Run the CPU pre-skin deform into per-instance dynamic VBs (FEATURE
          * 3.1).  Dirty-gated + LOD-guarded inside; no-op when morph_count == 0. */
-        sr_deform_morph_prims(ai);
+        sr_deform_morph_prims(sr, ai);
     }
-}
-
-/* ── Animation retargeting (optional per-instance path) ──────────────
- *
- * Play a clip authored for a DIFFERENT (source) skeleton on the entity's own
- * (dst) skeleton.  Self-contained: samples the active clip against the SOURCE
- * rig's rest TRS (clip channels are indexed for the source skeleton), transfers
- * the pose onto the dst skeleton via the cached bind-relative retarget map, then
- * evaluates the dst skeleton into the instance's skin palette.  The map is
- * (re)built when either skeleton pointer or the source path changes.
- *
- * Uses the player purely as a playhead CLOCK (advance + get_time): its own
- * sampled palette — bound to the dst skeleton — is discarded.  This keeps the
- * editor timeline/progress query (jce_scene_renderer_get_anim_player) live while
- * the actual deformation comes from the retargeted dst locals.
- *
- * Returns true if it handled the instance (caller must skip the legacy path);
- * false to fall through to legacy playback (no/invalid retarget source). */
-static bool sr_anim_try_retarget(JceSceneRenderer *sr,
-                                 JceScene *scene, JceEntity e,
-                                 JceSkeletalAnimatorComponent *sa,
-                                 SrModelCache *dst_mc, SrAnimInstance *ai,
-                                 float dt_sec)
-{
-    (void)scene;   /* entity resolves through sr_get_model (path-keyed cache) */
-    /* Gate: a non-empty source DIFFERENT from the entity's own skeleton. Empty
-       or identical ⇒ legacy path (byte-identical). */
-    if (!sa->retarget_source_skeleton[0]) return false;
-    if (strcmp(sa->retarget_source_skeleton, sa->skeleton_path) == 0) return false;
-
-    /* Resolve (path-keyed, cached) the SOURCE model holding the source rig +
-       the clip authored for it. Pending/failed ⇒ skip this frame, but still
-       claim the instance so we don't fall back to a mismatched legacy sample. */
-    SrModelCache *src_mc = sr_get_model(sr, sa->retarget_source_skeleton, (uint32_t)e);
-    if (!src_mc || !src_mc->model) return true;
-
-    JceSkeleton *src_skel = jce_model_get_skeleton(src_mc->model);
-    JceSkeleton *dst_skel = jce_model_get_skeleton(dst_mc->model);
-    if (!src_skel || !dst_skel) return true;
-
-    /* The active clip lives in the SOURCE model (it is authored for the source
-       rig). Resolve it by the same active_clip index used for legacy playback. */
-    int ac = sa->active_clip;
-    uint32_t src_anim_n = jce_model_anim_count(src_mc->model);
-    if (ac < 0 || ac >= (int)src_anim_n) return true;   /* nothing to play */
-    JceAnimClip *clip = jce_model_get_anim(src_mc->model, (uint32_t)ac);
-    if (!clip) return true;
-
-    /* (Re)build the retarget map when the source path or either skeleton
-       pointer changed (model reloads reuse the cache slot, new pointer). */
-    if (!ai->retarget_map ||
-        ai->retarget_src_skel != src_skel ||
-        ai->retarget_dst_skel != dst_skel ||
-        strcmp(ai->retarget_src, sa->retarget_source_skeleton) != 0) {
-        if (ai->retarget_map) jce_anim_retarget_map_destroy(ai->retarget_map);
-        ai->retarget_map = jce_anim_retarget_map_create(src_skel, dst_skel);
-        ai->retarget_src_skel = src_skel;
-        ai->retarget_dst_skel = dst_skel;
-        snprintf(ai->retarget_src, sizeof(ai->retarget_src), "%s",
-                 sa->retarget_source_skeleton);
-    }
-    if (!ai->retarget_map) return true;   /* map build failed; don't mis-sample */
-
-    /* Advance the playhead CLOCK with the dst-bound player (palette ignored).
-       Honor the component's playing/loop/speed like the legacy single-clip path
-       so the timeline behaves identically. */
-    float sp = (sa->speed > 0.0f ? sa->speed : 1.0f);
-    bool  loop_eff = sa->loop;
-    bool  clip_changed = (ai->active_clip != ac);
-    if (sa->playing) {
-        if (!jce_anim_player_is_playing(ai->player) || clip_changed ||
-            ai->loop != loop_eff) {
-            jce_anim_player_play(ai->player, clip, loop_eff, sp);
-        }
-        jce_anim_player_pause(ai->player, false);
-        jce_anim_player_set_speed(ai->player, sp);
-        jce_anim_player_update(ai->player, dt_sec, NULL, 0);  /* advance only */
-    } else {
-        if (clip_changed || ai->loop != loop_eff) {
-            jce_anim_player_play(ai->player, clip, loop_eff, sp);
-            jce_anim_player_set_time(ai->player, 0.0f);
-        }
-        if (jce_anim_player_is_playing(ai->player))
-            jce_anim_player_pause(ai->player, true);
-    }
-    ai->active_clip = ac;
-    ai->loop  = loop_eff;
-    ai->speed = sp;
-    ai->paused = !sa->playing;
-
-    /* Sample the clip against the SOURCE skeleton's rest TRS into a SOURCE-sized
-       locals buffer (clip channels are indexed for the source rig). */
-    uint32_t src_n = jce_skeleton_joint_count(src_skel);
-    uint32_t dst_n = jce_skeleton_joint_count(dst_skel);
-    if (src_n == 0 || dst_n == 0 || src_n > JCE_MAX_BONES || dst_n > JCE_MAX_BONES)
-        return true;
-
-    const jce_vec3 *rest_t = NULL; const jce_quat *rest_r = NULL; const jce_vec3 *rest_s = NULL;
-    jce_skeleton_rest_trs(src_skel, &rest_t, &rest_r, &rest_s);
-
-    /* Seed source locals with the source rest pose so joints untouched by the
-       clip carry the source bind (the retargeter then maps bind→dst bind). */
-    jce_mat4 *src_locals = (jce_mat4 *)JCE_MALLOC(
-        (size_t)(src_n + dst_n) * sizeof(jce_mat4));
-    if (!src_locals) return true;
-    jce_mat4 *dst_locals = src_locals + src_n;
-    const jce_mat4 *src_rest = jce_skeleton_rest_pose(src_skel);
-    if (src_rest) memcpy(src_locals, src_rest, (size_t)src_n * sizeof(jce_mat4));
-    else for (uint32_t j = 0; j < src_n; j++) src_locals[j] = jce_m4_identity();
-
-    float t = jce_anim_player_get_time(ai->player);
-    jce_anim_clip_sample(clip, t, src_locals, src_n, rest_t, rest_r, rest_s);
-
-    /* Transfer the source pose onto the dst skeleton, then evaluate. */
-    jce_anim_retarget_pose(ai->retarget_map, src_locals, dst_locals);
-    jce_skeleton_evaluate(dst_skel, dst_locals, ai->skin_palette, JCE_MAX_BONES);
-    ai->skin_palette_count = dst_n;
-
-    JCE_FREE(src_locals);
-    return true;
 }
 
 /* GPU crowd instancing (JCE_CROWD_INSTANCE): pack every resident skinned
@@ -2380,6 +2361,13 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
         if (!mc || !mc->model) continue;
 
         SrAnimInstance *ai = sr_get_anim_instance(sr, (uint32_t)e, mc->model);
+        /* Before ANY clip is resolved this frame: every resolver below asks
+         * ai->aoc, and one that ran first would resolve against last frame's
+         * controller -- or against none at all on the frame the field is
+         * first set, which is the frame an author is looking at. */
+        if (ai) snprintf(ai->skel_path, sizeof ai->skel_path, "%s",
+                         sa->skeleton_path);
+        if (ai) sr_anim_sync_override(scene, e, ai);
         if (!ai) continue;
 
         /* Sim-LOD animation gating (large-world #3, Play-only): freeze a far-tier
@@ -2589,9 +2577,9 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                     }
                     ai->sm_trans_time += dt_sec;
                     JceAnimClip *from_clip =
-                        sr_sm_state_model_clip(smr, ev->from_state, mc->model);
+                        sr_sm_state_model_clip(smr, ev->from_state, mc->model, ai->aoc, ai, sr->pak);
                     JceAnimClip *to_clip =
-                        sr_sm_state_model_clip(smr, ev->to_state, mc->model);
+                        sr_sm_state_model_clip(smr, ev->to_state, mc->model, ai->aoc, ai, sr->pak);
                     if (from_clip && to_clip) {
                         float fsp = jce_anim_sm_state_speed(smr, ev->from_state) * comp_sp;
                         float tsp = jce_anim_sm_state_speed(smr, ev->to_state) * comp_sp;
@@ -2688,10 +2676,12 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                                                    sa->blend_thresholds[t],
                                                    sa->blend_pos_y[t]);
                     bool matched = false;
+                    const char *want_t = jce_anim_override_controller_resolve(
+                        ai->aoc, sa->clip_names[t]);
                     for (int k = 0; k < an; k++) {
                         const char *cn = jce_anim_clip_name(
                             jce_model_get_anim(mc->model, (uint32_t)k));
-                        if (sr_clip_name_match(cn, sa->clip_names[t])) {
+                        if (sr_clip_name_match(cn, want_t)) {
                             jce_anim_blend_tree_set_clip(ai->blend_tree,
                                 sa->clip_names[t],
                                 jce_model_get_anim(mc->model, (uint32_t)k));
@@ -2865,7 +2855,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
             for (int li = 0; li < lc; li++) {
                 const JceAvatarLayer *src = &av->layers[li];
                 if (!src->clip[0] || src->weight <= 0.0f) continue;
-                JceAnimClip *lclip = sr_find_model_clip(mc->model, src->clip);
+                JceAnimClip *lclip = sr_find_model_clip(mc->model, src->clip, ai->aoc, ai, sr->pak);
                 if (!lclip) continue;   /* missing clip simply contributes nothing */
                 JceAvatarMask *lmask = src->mask_path[0]
                     ? sr_anim_resolve_layer_mask(sr, ai, li, src->mask_path, mc->model)
@@ -2948,6 +2938,25 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                 sa->rm_dyaw  = d.yaw_delta;
                 sa->rm_valid = true;
             }
+
+            /* PLAYHEAD, published here for the same reason root motion is:
+             * it lives in this per-instance state and its consumers do not.
+             * The one that needs it is the network animator, which the
+             * runtime samples -- the replication layer refuses to read an
+             * animation graph, and this is what lets something sample one
+             * without inverting the layering.
+             *
+             * Normalised and WRAPPING, because that is what goes on the wire:
+             * a receiver interpolating 0.95 towards 0.05 has to take the
+             * shorter way round the loop, and it can only do that if the
+             * number it receives is a position in the clip rather than
+             * seconds into a clip whose length it does not know. */
+            const JceAnimClip *pc = jce_anim_player_get_clip(ai->player);
+            const float dur = pc ? jce_anim_clip_duration(pc) : 0.0f;
+            sa->norm_time = (dur > 0.0f)
+                ? (jce_anim_player_get_time(ai->player) / dur) : 0.0f;
+            if (sa->norm_time < 0.0f) sa->norm_time = 0.0f;
+            if (sa->norm_time > 1.0f) sa->norm_time -= (float)(int)sa->norm_time;
         }
     }
 

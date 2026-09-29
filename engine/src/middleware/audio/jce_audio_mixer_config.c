@@ -65,10 +65,16 @@ static void cfg_copy_name(char *dst, size_t cap, const JceJson *obj,
 
 /* ── Effect-desc parsing (shared by apply skip + each_effect) ────────────── */
 
-/* Parse one effect object into `*d`; returns true if a known type was parsed
- * (d->type != NONE).  Missing fields keep the type's engine defaults. */
+/* The engine's own callers keep the short name; it forwards to the public
+ * pair so there is exactly one parser in the tree. */
 static bool cfg_parse_effect(const JceJson *e, JceAudioEffectDesc *d)
 {
+    return jce_audio_effect_from_json(e, d);
+}
+
+bool JCE_CALL jce_audio_effect_from_json(const JceJson *e, JceAudioEffectDesc *d)
+{
+	if (!e || !d) return false;
 	const char *type = jce_json_get_string(e, "type", "");
 	if (strcmp(type, "eq") == 0) {
 		*d = jce_audio_effect_default(JCE_AUDIO_EFFECT_EQ);
@@ -110,10 +116,117 @@ static bool cfg_parse_effect(const JceJson *e, JceAudioEffectDesc *d)
 			(float)jce_json_get_number(e, "wet",      d->u.delay.wet);
 		d->u.delay.dry =
 			(float)jce_json_get_number(e, "dry",      d->u.delay.dry);
+	} else if (strcmp(type, "chorus") == 0 || strcmp(type, "flanger") == 0) {
+		/* ONE BRANCH, TWO TYPES: chorus and flanger are the same modulated
+		 * delay with different numbers, and the type only decides which
+		 * DEFAULTS the missing fields fall back to.  Two branches with
+		 * identical bodies is how one of them stops getting a new field. */
+		*d = jce_audio_effect_default(strcmp(type, "chorus") == 0
+			                              ? JCE_AUDIO_EFFECT_CHORUS
+			                              : JCE_AUDIO_EFFECT_FLANGER);
+		d->u.mod_delay.delay_ms =
+			(float)jce_json_get_number(e, "delay_ms",     d->u.mod_delay.delay_ms);
+		d->u.mod_delay.depth_ms =
+			(float)jce_json_get_number(e, "depth_ms",     d->u.mod_delay.depth_ms);
+		d->u.mod_delay.rate_hz =
+			(float)jce_json_get_number(e, "rate_hz",      d->u.mod_delay.rate_hz);
+		d->u.mod_delay.feedback =
+			(float)jce_json_get_number(e, "feedback",     d->u.mod_delay.feedback);
+		d->u.mod_delay.wet =
+			(float)jce_json_get_number(e, "wet",          d->u.mod_delay.wet);
+		d->u.mod_delay.dry =
+			(float)jce_json_get_number(e, "dry",          d->u.mod_delay.dry);
+		d->u.mod_delay.stereo_phase =
+			(float)jce_json_get_number(e, "stereo_phase", d->u.mod_delay.stereo_phase);
+	} else if (strcmp(type, "distortion") == 0) {
+		*d = jce_audio_effect_default(JCE_AUDIO_EFFECT_DISTORTION);
+		d->u.distortion.shape = (JceAudioDistortionShape)
+			jce_json_get_int(e, "shape", (int)d->u.distortion.shape);
+		d->u.distortion.drive =
+			(float)jce_json_get_number(e, "drive",       d->u.distortion.drive);
+		d->u.distortion.ceiling =
+			(float)jce_json_get_number(e, "ceiling",     d->u.distortion.ceiling);
+		d->u.distortion.wet =
+			(float)jce_json_get_number(e, "wet",         d->u.distortion.wet);
+		d->u.distortion.dry =
+			(float)jce_json_get_number(e, "dry",         d->u.distortion.dry);
+		d->u.distortion.output_gain =
+			(float)jce_json_get_number(e, "output_gain", d->u.distortion.output_gain);
 	} else {
-		return false;
+		/* A REGISTERED effect, by name.  Looked up rather than refused, which
+		 * is what makes a project's own effect authorable in audio_mixer.json
+		 * exactly like a built-in.  Its parameters are the owner's business:
+		 * the engine cannot know them, so nothing is read here. */
+		const int custom = jce_audio_dsp_effect_type_from_name(type);
+		if (custom < 0) return false;
+		memset(d, 0, sizeof *d);
+		d->type = (JceAudioEffectType)custom;
 	}
 	return d->type != JCE_AUDIO_EFFECT_NONE;
+}
+
+JceJson *JCE_CALL jce_audio_effect_to_json(const JceAudioEffectDesc *d)
+{
+	if (!d) return NULL;
+	JceJson *e = jce_json_object();
+	if (!e) return NULL;
+
+	/* THE NAME COMES FROM THE ONE TABLE, never from a switch here.  A
+	 * serialiser with its own spellings is how an effect becomes writable
+	 * and unreadable. */
+	const char *name = jce_audio_dsp_effect_name((int)d->type);
+	jce_json_set_string(e, "type", name ? name : "none");
+	if (!name) return e;
+
+	switch (d->type) {
+	case JCE_AUDIO_EFFECT_EQ:
+		jce_json_set_int   (e, "shape",   (int)d->u.eq.shape);
+		jce_json_set_number(e, "freq",    (double)d->u.eq.frequency_hz);
+		jce_json_set_number(e, "gain_db", (double)d->u.eq.gain_db);
+		jce_json_set_number(e, "q",       (double)d->u.eq.q);
+		break;
+	case JCE_AUDIO_EFFECT_COMPRESSOR:
+		jce_json_set_number(e, "threshold_db", (double)d->u.comp.threshold_db);
+		jce_json_set_number(e, "ratio",        (double)d->u.comp.ratio);
+		jce_json_set_number(e, "attack_ms",    (double)d->u.comp.attack_ms);
+		jce_json_set_number(e, "release_ms",   (double)d->u.comp.release_ms);
+		jce_json_set_number(e, "makeup_db",    (double)d->u.comp.makeup_db);
+		jce_json_set_number(e, "knee_db",      (double)d->u.comp.knee_db);
+		break;
+	case JCE_AUDIO_EFFECT_LIMITER:
+		jce_json_set_number(e, "ceiling_db", (double)d->u.limiter.ceiling_db);
+		jce_json_set_number(e, "release_ms", (double)d->u.limiter.release_ms);
+		break;
+	case JCE_AUDIO_EFFECT_DELAY:
+		jce_json_set_number(e, "delay_ms", (double)d->u.delay.delay_ms);
+		jce_json_set_number(e, "feedback", (double)d->u.delay.feedback);
+		jce_json_set_number(e, "wet",      (double)d->u.delay.wet);
+		jce_json_set_number(e, "dry",      (double)d->u.delay.dry);
+		break;
+	case JCE_AUDIO_EFFECT_CHORUS:
+	case JCE_AUDIO_EFFECT_FLANGER:
+		jce_json_set_number(e, "delay_ms",     (double)d->u.mod_delay.delay_ms);
+		jce_json_set_number(e, "depth_ms",     (double)d->u.mod_delay.depth_ms);
+		jce_json_set_number(e, "rate_hz",      (double)d->u.mod_delay.rate_hz);
+		jce_json_set_number(e, "feedback",     (double)d->u.mod_delay.feedback);
+		jce_json_set_number(e, "wet",          (double)d->u.mod_delay.wet);
+		jce_json_set_number(e, "dry",          (double)d->u.mod_delay.dry);
+		jce_json_set_number(e, "stereo_phase", (double)d->u.mod_delay.stereo_phase);
+		break;
+	case JCE_AUDIO_EFFECT_DISTORTION:
+		jce_json_set_int   (e, "shape",       (int)d->u.distortion.shape);
+		jce_json_set_number(e, "drive",       (double)d->u.distortion.drive);
+		jce_json_set_number(e, "ceiling",     (double)d->u.distortion.ceiling);
+		jce_json_set_number(e, "wet",         (double)d->u.distortion.wet);
+		jce_json_set_number(e, "dry",         (double)d->u.distortion.dry);
+		jce_json_set_number(e, "output_gain", (double)d->u.distortion.output_gain);
+		break;
+	default:
+		/* A registered effect: the name round-trips, the parameters are the
+		 * owner's and the engine has nothing it could honestly write. */
+		break;
+	}
+	return e;
 }
 
 /* Parse `json` and hand back its "buses" array.  Returns NULL (and frees

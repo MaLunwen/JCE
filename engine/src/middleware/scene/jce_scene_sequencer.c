@@ -25,6 +25,7 @@
 #include <jce/os/core/jce_math.h>
 
 #include "os/core/jce_memory.h"
+#include "middleware/scene/jce_ui_canvas_widgets.h"  /* uc_entity_rect_mut: ONE component order for uirect.* */
 
 #include <flecs.h>
 #include <stdint.h>
@@ -84,6 +85,20 @@ static const char *const k_prop_names[JCE_SEQ_PROP_COUNT] = {
     /* JCE_SEQ_PROP_VOLUME_WEIGHT   */ "volume.weight",
     /* JCE_SEQ_PROP_LIGHT_COLOR     */ "light.color",
     /* JCE_SEQ_PROP_MESH_BASE_COLOR */ "meshrenderer.base_color",
+    /* JCE_SEQ_PROP_CANVASGROUP_ALPHA    */ "canvasgroup.alpha",
+    /* JCE_SEQ_PROP_UIRECT_ANCHORED_X    */ "uirect.anchored_position.x",
+    /* JCE_SEQ_PROP_UIRECT_ANCHORED_Y    */ "uirect.anchored_position.y",
+    /* JCE_SEQ_PROP_UIRECT_SCALE_X       */ "uirect.scale.x",
+    /* JCE_SEQ_PROP_UIRECT_SCALE_Y       */ "uirect.scale.y",
+    /* JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM */ "uirect.scale.uniform",
+    /* JCE_SEQ_PROP_UIRECT_ROTATION      */ "uirect.rotation",
+    /* JCE_SEQ_PROP_UIIMAGE_ALPHA        */ "uiimage.color.a",
+    /* JCE_SEQ_PROP_UITEXT_ALPHA         */ "uitext.color.a",
+    /* JCE_SEQ_PROP_UIIMAGE_COLOR        */ "uiimage.color",
+    /* JCE_SEQ_PROP_UITEXT_COLOR         */ "uitext.color",
+    /* JCE_SEQ_PROP_UIIMAGE_FILL         */ "uiimage.fill_amount",
+    /* JCE_SEQ_PROP_UISLIDER_VALUE       */ "uislider.value",
+    /* JCE_SEQ_PROP_UITEXT_FONT_SIZE     */ "uitext.font_size",
 };
 
 const char *jce_seq_prop_name(JceSeqPropId id)
@@ -103,8 +118,10 @@ JceSeqPropId jce_seq_prop_from_name(const char *name)
 
 bool jce_seq_prop_is_color(JceSeqPropId id)
 {
-    return id == JCE_SEQ_PROP_LIGHT_COLOR ||
-           id == JCE_SEQ_PROP_MESH_BASE_COLOR;
+    return id == JCE_SEQ_PROP_LIGHT_COLOR      ||
+           id == JCE_SEQ_PROP_MESH_BASE_COLOR  ||
+           id == JCE_SEQ_PROP_UIIMAGE_COLOR    ||
+           id == JCE_SEQ_PROP_UITEXT_COLOR;
 }
 
 bool jce_seq_prop_supported(JceScene *s, JceEntity e, JceSeqPropId id)
@@ -135,9 +152,74 @@ bool jce_seq_prop_supported(JceScene *s, JceEntity e, JceSeqPropId id)
         return jce_scene_has_volume(s, e);
     case JCE_SEQ_PROP_MESH_BASE_COLOR:
         return jce_scene_has_mesh_renderer(s, e);
+    case JCE_SEQ_PROP_CANVASGROUP_ALPHA:
+        return jce_scene_has_canvas_group(s, e);
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_X:
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_X:
+    case JCE_SEQ_PROP_UIRECT_SCALE_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM:
+    case JCE_SEQ_PROP_UIRECT_ROTATION:
+        /* Whichever UI graphic the entity carries, in the layout walk's own
+         * order -- so a track bound to uirect.* moves exactly the rect the
+         * canvas lays out, and there is no second answer to "which rect". */
+        return uc_entity_rect_mut(s, e) != NULL;
+    case JCE_SEQ_PROP_UIIMAGE_ALPHA:
+    case JCE_SEQ_PROP_UIIMAGE_COLOR:
+        return jce_scene_has_ui_image(s, e);
+    case JCE_SEQ_PROP_UITEXT_ALPHA:
+    case JCE_SEQ_PROP_UITEXT_COLOR:
+    case JCE_SEQ_PROP_UITEXT_FONT_SIZE:
+        return jce_scene_has_ui_text(s, e);
+    case JCE_SEQ_PROP_UIIMAGE_FILL:
+        return jce_scene_has_ui_image(s, e);
+    case JCE_SEQ_PROP_UISLIDER_VALUE:
+        return jce_scene_has_ui_slider(s, e);
     default:
         return false;
     }
+}
+
+/* ── UI property plumbing ────────────────────────────────────────────
+ *
+ * ONE function decides which float of a JceRectTransform a uirect.* property
+ * names, and get/apply both go through it.  Two switch statements over the
+ * same six ids is exactly the shape where a reader and a writer end up
+ * pointing at different slots and the symptom is "the track animates the
+ * wrong axis", which looks like an authoring mistake. */
+static float *uirect_float(JceRectTransform *rt, JceSeqPropId id, int *out_pair)
+{
+    if (out_pair) *out_pair = 0;
+    if (!rt) return NULL;
+    switch (id) {
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_X: return &rt->anchored_position[0];
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_Y: return &rt->anchored_position[1];
+    case JCE_SEQ_PROP_UIRECT_SCALE_X:    return &rt->scale[0];
+    case JCE_SEQ_PROP_UIRECT_SCALE_Y:    return &rt->scale[1];
+    case JCE_SEQ_PROP_UIRECT_ROTATION:   return &rt->rotation_deg;
+    case JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM:
+        /* Reads x, writes BOTH -- the same asymmetry transform.scale.uniform
+         * already has, and the reason it is a flag rather than two ids. */
+        if (out_pair) *out_pair = 1;
+        return &rt->scale[0];
+    default: return NULL;
+    }
+}
+
+/* The alpha channel of a UI graphic's colour, or NULL.  The rgb of the same
+ * colour is reached by the color appliers below; splitting alpha out is what
+ * lets a fade be a plain float track, which is what an author wants. */
+static float *ui_color_rgba(JceScene *s, JceEntity e, JceSeqPropId id)
+{
+    if (id == JCE_SEQ_PROP_UIIMAGE_ALPHA || id == JCE_SEQ_PROP_UIIMAGE_COLOR) {
+        JceUIImageComponent *im = jce_scene_get_ui_image(s, e);
+        return im ? im->color : NULL;
+    }
+    if (id == JCE_SEQ_PROP_UITEXT_ALPHA || id == JCE_SEQ_PROP_UITEXT_COLOR) {
+        JceUITextComponent *tx = jce_scene_get_ui_text(s, e);
+        return tx ? tx->color : NULL;
+    }
+    return NULL;
 }
 
 /* ── Float read / write ──────────────────────────────────────────── */
@@ -210,6 +292,57 @@ bool jce_seq_prop_get_float(JceScene *s, JceEntity e, JceSeqPropId id,
         *out = v->weight;
         return true;
     }
+    case JCE_SEQ_PROP_CANVASGROUP_ALPHA: {
+        JceCanvasGroupComponent *cg = jce_scene_get_canvas_group(s, e);
+        if (!cg) return false;
+        *out = cg->alpha;
+        return true;
+    }
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_X:
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_X:
+    case JCE_SEQ_PROP_UIRECT_SCALE_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM:
+    case JCE_SEQ_PROP_UIRECT_ROTATION: {
+        /* THE RAW STORED VALUE, including the 0 that scale uses to mean
+         * "unscaled".  This function's job is the editor's preview snapshot
+         * and restore, and a restore that wrote 1 where the file said 0 would
+         * look identical and silently rewrite the scene.  A round trip that
+         * changes bytes is not a round trip. */
+        const float *f = uirect_float(uc_entity_rect_mut(s, e), id, NULL);
+        if (!f) return false;
+        *out = *f;
+        return true;
+    }
+    case JCE_SEQ_PROP_UIIMAGE_ALPHA:
+    case JCE_SEQ_PROP_UITEXT_ALPHA: {
+        const float *rgba = ui_color_rgba(s, e, id);
+        if (!rgba) return false;
+        *out = rgba[3];
+        return true;
+    }
+    case JCE_SEQ_PROP_UIIMAGE_FILL: {
+        const JceUIImageComponent *im = jce_scene_get_ui_image(s, e);
+        if (!im) return false;
+        *out = im->fill_amount;
+        return true;
+    }
+    case JCE_SEQ_PROP_UISLIDER_VALUE: {
+        const JceUISliderComponent *sl = jce_scene_get_ui_slider(s, e);
+        if (!sl) return false;
+        *out = sl->value;
+        return true;
+    }
+    case JCE_SEQ_PROP_UITEXT_FONT_SIZE: {
+        /* Returned VERBATIM, including 0.  0 means "use the default" and the
+         * editor's preview snapshot/restore round-trips this value: writing
+         * 14 back where the file said 0 would look identical and silently
+         * rewrite the scene.  Same rule as uirect.scale above. */
+        const JceUITextComponent *tx = jce_scene_get_ui_text(s, e);
+        if (!tx) return false;
+        *out = tx->font_size;
+        return true;
+    }
     default:
         return false;
     }
@@ -278,6 +411,51 @@ void jce_seq_prop_apply_float(JceScene *s, JceEntity e, JceSeqPropId id,
         if (vol) vol->weight = v;
         return;
     }
+    case JCE_SEQ_PROP_CANVASGROUP_ALPHA: {
+        JceCanvasGroupComponent *cg = jce_scene_get_canvas_group(s, e);
+        if (cg) cg->alpha = v;
+        return;
+    }
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_X:
+    case JCE_SEQ_PROP_UIRECT_ANCHORED_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_X:
+    case JCE_SEQ_PROP_UIRECT_SCALE_Y:
+    case JCE_SEQ_PROP_UIRECT_SCALE_UNIFORM:
+    case JCE_SEQ_PROP_UIRECT_ROTATION: {
+        int pair = 0;
+        JceRectTransform *rt = uc_entity_rect_mut(s, e);
+        float *f = uirect_float(rt, id, &pair);
+        if (!f) return;
+        *f = v;
+        if (pair) rt->scale[1] = v;
+        return;
+    }
+    case JCE_SEQ_PROP_UIIMAGE_ALPHA:
+    case JCE_SEQ_PROP_UITEXT_ALPHA: {
+        float *rgba = ui_color_rgba(s, e, id);
+        if (rgba) rgba[3] = v;
+        return;
+    }
+    case JCE_SEQ_PROP_UIIMAGE_FILL: {
+        JceUIImageComponent *im = jce_scene_get_ui_image(s, e);
+        if (im) im->fill_amount = v;
+        return;
+    }
+    case JCE_SEQ_PROP_UISLIDER_VALUE: {
+        /* Written raw, NOT clamped to min/max: uc_slider_norm already clamps
+         * the normalised position it derives, so clamping here as well would
+         * make an overshooting ease (back/elastic) read back a value the
+         * track never authored -- and the read-back above is what the
+         * editor's restore writes to the scene. */
+        JceUISliderComponent *sl = jce_scene_get_ui_slider(s, e);
+        if (sl) sl->value = v;
+        return;
+    }
+    case JCE_SEQ_PROP_UITEXT_FONT_SIZE: {
+        JceUITextComponent *tx = jce_scene_get_ui_text(s, e);
+        if (tx) tx->font_size = v;
+        return;
+    }
     default:
         return;
     }
@@ -307,6 +485,12 @@ bool jce_seq_prop_get_color(JceScene *s, JceEntity e, JceSeqPropId id,
             return false;
         }
         out_rgb[0] = c.x; out_rgb[1] = c.y; out_rgb[2] = c.z;
+        return true;
+    }
+    if (id == JCE_SEQ_PROP_UIIMAGE_COLOR || id == JCE_SEQ_PROP_UITEXT_COLOR) {
+        const float *rgba = ui_color_rgba(s, e, id);
+        if (!rgba) return false;
+        out_rgb[0] = rgba[0]; out_rgb[1] = rgba[1]; out_rgb[2] = rgba[2];
         return true;
     }
     if (id == JCE_SEQ_PROP_MESH_BASE_COLOR) {
@@ -344,6 +528,16 @@ void jce_seq_prop_apply_color(JceScene *s, JceEntity e, JceSeqPropId id,
         mr->base_color[0] = rgb[0];
         mr->base_color[1] = rgb[1];
         mr->base_color[2] = rgb[2];   /* alpha untouched */
+        return;
+    }
+    if (id == JCE_SEQ_PROP_UIIMAGE_COLOR || id == JCE_SEQ_PROP_UITEXT_COLOR) {
+        float *rgba = ui_color_rgba(s, e, id);
+        if (!rgba) return;
+        rgba[0] = rgb[0]; rgba[1] = rgb[1]; rgba[2] = rgb[2];
+        /* ALPHA UNTOUCHED, same as the mesh base colour above -- and here it
+         * matters more, because uiimage.color.a is a property in its own
+         * right: a colour track and a fade track on one element must be able
+         * to run at the same time without either erasing the other. */
         return;
     }
 }

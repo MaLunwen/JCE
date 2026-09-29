@@ -93,6 +93,18 @@ jce_lightmapper_bake_sh9(const float           (*positions)[3],
                          int                    sample_count,
                          float                (*out_sh9)[9][3]);
 
+/* Suppress the ringing that truncating the SH series at L2 leaves behind:
+ * reconstructed irradiance swings negative on the far side of a sharp lighting
+ * transition, which reads as dark bands on a probe-lit object.  Scales the L1
+ * and L2 bands down by the least amount that makes the reconstruction
+ * non-negative in every direction; the L0 term is never touched, so the
+ * probe's average irradiance is preserved exactly.
+ *
+ * Apply AFTER baking, in place.  This is what
+ * JceLightProbeGroupComponent.dering asks for. */
+JCE_API void JCE_CALL jce_lightmapper_sh9_dering(float (*sh9)[9][3],
+                                                 int probe_count);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_LIGHTMAPPER_H */

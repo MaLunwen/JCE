@@ -1372,6 +1372,22 @@ static int mk_touch_count(void *user)
 }
 
 
+
+def _fills_an_entity_array(m) -> bool:
+    """Does this member end with the (JceScriptEntity *out, int max) pair?
+
+    That pair IS the entity_table / first_and_count shape at the C level, and
+    it is what the mock has to fill.  Detected structurally so a new binding
+    with that shape is mocked correctly whatever it is called."""
+    ps = m.params
+    if len(ps) < 3:
+        return False
+    out_p, max_p = ps[-2], ps[-1]
+    return (out_p.arity < 0
+            and "JceScriptEntity" in out_p.c_type
+            and not out_p.c_type.startswith("const ")
+            and max_p.c_type == "int" and max_p.arity == 0)
+
 def _mock_param(p: Param) -> str:
     if p.arity > 0:
         return f"{p.c_type} {p.name}[{p.arity}]"
@@ -1403,7 +1419,11 @@ def _mock_member(m: HostMember, header_text: str) -> str:
             body.append(f'    jce_java_diff_tracef("|%lld", '
                         f'(long long){p.name});')
     body.append('    jce_java_diff_tracef("\\n");')
-    if not m.name.startswith("find_by"):
+    # An entity-array member's out pointer is filled by the loop at the end;
+    # writing a scalar through it here first is dead and confusing.  Keyed on
+    # the signature for the same reason the fill is -- the name test this
+    # replaced skipped only find_by*.
+    if not _fills_an_entity_array(m):
         k = 0
         for p in out_params(m):
             if p.arity > 0:
@@ -1428,7 +1448,15 @@ def _mock_member(m: HostMember, header_text: str) -> str:
             body.append(f'    return mk_strdup("{m.name}_json");')
         elif m.ret == "bool":
             body.append("    return true;")
-        elif m.ret == "int" and m.name.startswith("find_by"):
+        elif m.ret == "int" and _fills_an_entity_array(m):
+            # KEYED ON THE SIGNATURE, NOT THE NAME.  This used to test
+            # m.name.startswith("find_by"), so the FIRST table-returning
+            # binding not named find_by* -- overlap_sphere -- got the scalar
+            # mock below: `*out = 12; return 12;`.  The Lua side then copied
+            # twelve UNINITIALISED entries out of the buffer while the Java
+            # side read zeros, and the differential failed with garbage on one
+            # side, which reads as a binding bug rather than a mock that never
+            # filled the array.
             body += ["    for (int i = 0; i < 3 && i < max; i++)",
                      "        out[i] = (JceScriptEntity)(100 + i);",
                      "    return max < 3 ? max : 3;"]

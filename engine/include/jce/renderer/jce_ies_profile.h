@@ -62,6 +62,32 @@ JCE_API JceTexture jce_ies_bake_lut_from_memory(const char *text, size_t text_le
  * named for symmetry with the bake API. */
 JCE_API void jce_ies_free_lut(JceTexture h);
 
+/* Bake-once resolver, keyed by asset path.
+ *
+ * WHY THIS EXISTS.  jce_ies_bake_lut_from_file had ZERO callers, and so did
+ * every other function in this header, while JceSpotLight carried both an
+ * authored `ies_path` and an `ies_lut_texture` and the PBR shader carried a
+ * s_iesLut sampler on stage 14.  Nothing in engine/ or editor/ ever assigned
+ * that field anything but JCE_TEXTURE_INVALID, so the draw path's
+ * `path is set AND texture is valid` test could never pass: a designer picked
+ * an .ies file, the scene saved the key, and the light never changed.
+ *
+ * The draw path calls this per light per frame, so it MUST NOT bake twice.
+ * Results are cached by path -- failures included, or a bad path would
+ * re-read and re-parse the file every frame.  The returned handle is owned by
+ * this cache: do NOT pass it to jce_ies_free_lut.
+ *
+ * Reads through jce_fs_get_active() with a host-path fallback, which is what
+ * makes one call work in a shipped game (PAK) and in the editor (loose files
+ * under the project overlay) alike.
+ */
+JCE_API JceTexture jce_ies_lut_for_path(const char *asset_path);
+
+/* Destroy every cached LUT.  Called from jce_renderer_destroy while bgfx is
+ * still alive, beside jce_pbr_material_shutdown, which caches bgfx handles by
+ * path for the same reason. */
+JCE_API void jce_ies_cache_shutdown(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_IES_PROFILE_H */

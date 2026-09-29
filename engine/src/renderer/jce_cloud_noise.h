@@ -205,6 +205,17 @@ bool jce_cloud_noise_bake_atlas(const JceCloudNoiseParams *p, float *out,
                                 uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
                                 uint32_t tiles_x);
 
+/* Cancellable/progress-reporting variant used by structured background jobs.
+ * The callback runs once before the first slice and after every completed
+ * slice. Returning false stops the bake; the output then contains only a
+ * zeroed atlas plus the slices reported as completed. */
+typedef bool (*JceCloudBakeProgressFn)(void *user, uint32_t completed,
+                                       uint32_t total);
+bool jce_cloud_noise_bake_atlas_controlled(
+    const JceCloudNoiseParams *p, float *out,
+    uint32_t dim_x, uint32_t dim_y, uint32_t dim_z, uint32_t tiles_x,
+    JceCloudBakeProgressFn progress, void *user);
+
 /* ── Atlas addressing ───────────────────────────────────────────────────
  *
  * A slice atlas is a 3-D volume folded into a 2-D image, so every consumer has

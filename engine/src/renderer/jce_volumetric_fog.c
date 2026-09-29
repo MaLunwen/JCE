@@ -13,6 +13,7 @@
 #include <jce/renderer/jce_volumetric_fog.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_fullscreen_pass.h"
 #include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
@@ -26,10 +27,8 @@
 typedef struct { float pos[2]; float uv[2]; } VfQuadV;
 
 struct JceVolumetricFog {
-    int  w, h;
     JceVolumetricFogParams params;
 
-    bgfx_vertex_layout_t   layout;
     bgfx_program_handle_t  prog;
 
     bgfx_uniform_handle_t  u_p0;
@@ -49,22 +48,10 @@ struct JceVolumetricFog {
     bgfx_uniform_handle_t  s_fog;
     bool                   composite_ok;
 
-    bgfx_vertex_buffer_handle_t vbh;
-    bgfx_index_buffer_handle_t  ibh;
-
-    bgfx_frame_buffer_handle_t fb;
-    bgfx_texture_handle_t      tex;
+    /* Shared with SSAO, SSR and SSGI: jce_fullscreen_pass.h. */
+    JceFsQuad   quad;
+    JceFsTarget rt;
 };
-
-static void create_target(JceVolumetricFog *f)
-{
-    if (f->fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(f->fb);
-    f->fb = bgfx_create_frame_buffer((uint16_t)f->w, (uint16_t)f->h,
-                                     BGFX_TEXTURE_FORMAT_RGBA8,
-                                     BGFX_TEXTURE_RT
-                                       | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
-    f->tex = bgfx_get_texture(f->fb, 0);
-}
 
 JceVolumetricFogParams jce_volumetric_fog_default_params(void)
 {
@@ -92,26 +79,12 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
 
     JceVolumetricFog *f = (JceVolumetricFog *)JCE_CALLOC(1, sizeof(*f));
     if (!f) return NULL;
-    f->w = desc->width  > 0 ? desc->width  : 1280;
-    f->h = desc->height > 0 ? desc->height : 720;
+    const int want_w = desc->width  > 0 ? desc->width  : 1280;
+    const int want_h = desc->height > 0 ? desc->height : 720;
     f->params = jce_volumetric_fog_default_params();
-    f->fb.idx = UINT16_MAX;
+    jce_fs_target_init(&f->rt);
+    jce_fs_quad_init(&f->quad);
 
-    bgfx_vertex_layout_begin(&f->layout, BGFX_RENDERER_TYPE_NOOP);
-    bgfx_vertex_layout_add(&f->layout, BGFX_ATTRIB_POSITION,  2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&f->layout, BGFX_ATTRIB_TEXCOORD0, 2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_end(&f->layout);
-
-    static const VfQuadV verts[4] = {
-        { { -1.0f, -1.0f }, { 0.0f, 1.0f } },
-        { {  1.0f, -1.0f }, { 1.0f, 1.0f } },
-        { {  1.0f,  1.0f }, { 1.0f, 0.0f } },
-        { { -1.0f,  1.0f }, { 0.0f, 0.0f } },
-    };
-    static const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
-    f->vbh = bgfx_create_vertex_buffer(bgfx_copy(verts, sizeof(verts)),
-                                       &f->layout, BGFX_BUFFER_NONE);
-    f->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)), BGFX_BUFFER_NONE);
 
     bgfx_shader_handle_t vsh = jce_shader_load_from_pak(desc->pak, "vs_volfog", sfx, LOG_TAG);
     bgfx_shader_handle_t fsh = jce_shader_load_from_pak(desc->pak, "fs_volfog", sfx, LOG_TAG);
@@ -119,8 +92,7 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
         LOG_ERROR(LOG_TAG, "shader load failed");
         if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
         if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);
-        bgfx_destroy_vertex_buffer(f->vbh);
-        bgfx_destroy_index_buffer(f->ibh);
+        jce_fs_quad_destroy(&f->quad);
         JCE_FREE(f);
         return NULL;
     }
@@ -163,7 +135,8 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
         }
     }
 
-    create_target(f);
+    jce_fs_target_create(&f->rt, want_w, want_h, BGFX_TEXTURE_FORMAT_RGBA8,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
     return f;
 }
 
@@ -184,18 +157,15 @@ void jce_volumetric_fog_destroy(JceVolumetricFog *f)
         if (f->s_csm[i].idx != UINT16_MAX) bgfx_destroy_uniform(f->s_csm[i]);
     if (f->s_depth.idx        != UINT16_MAX) bgfx_destroy_uniform(f->s_depth);
     if (f->s_fog.idx          != UINT16_MAX) bgfx_destroy_uniform(f->s_fog);
-    if (f->vbh.idx      != UINT16_MAX) bgfx_destroy_vertex_buffer(f->vbh);
-    if (f->ibh.idx      != UINT16_MAX) bgfx_destroy_index_buffer(f->ibh);
-    if (f->fb.idx       != UINT16_MAX) bgfx_destroy_frame_buffer(f->fb);
+    jce_fs_quad_destroy(&f->quad);
+    jce_fs_target_destroy(&f->rt);
     JCE_FREE(f);
 }
 
 void jce_volumetric_fog_resize(JceVolumetricFog *f, int w, int h)
 {
     if (!f || w <= 0 || h <= 0) return;
-    if (w == f->w && h == f->h) return;
-    f->w = w; f->h = h;
-    create_target(f);
+    jce_fs_target_resize(&f->rt, w, h);
 }
 
 void jce_volumetric_fog_set_params(JceVolumetricFog *f, const JceVolumetricFogParams *p)
@@ -227,8 +197,8 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
     JCE_PROFILE_ZONE_N("Renderer::VolumetricFog::render");
 
     uint16_t v = first_view_id;
-    bgfx_set_view_frame_buffer(v, f->fb);
-    bgfx_set_view_rect(v, 0, 0, (uint16_t)f->w, (uint16_t)f->h);
+    bgfx_set_view_frame_buffer(v, f->rt.fb);
+    bgfx_set_view_rect(v, 0, 0, (uint16_t)f->rt.w, (uint16_t)f->rt.h);
     bgfx_set_view_clear(v, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
     /* bgfx auto-fills u_view, u_proj, u_invViewProj from this. */
     bgfx_set_view_transform(v, JCE_M4_PTR(*view), JCE_M4_PTR(*proj));
@@ -328,8 +298,7 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
                      | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                      | BGFX_SAMPLER_MIP_POINT);
 
-    bgfx_set_vertex_buffer(0, f->vbh, 0, 4);
-    bgfx_set_index_buffer(f->ibh, 0, 6);
+    jce_fs_quad_bind(&f->quad);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
     bgfx_submit(v, f->prog, 0, BGFX_DISCARD_ALL);
     JCE_PROFILE_ZONE_END;
@@ -337,8 +306,8 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
 
 uint16_t jce_volumetric_fog_get_result_texture(const JceVolumetricFog *f)
 {
-    if (!f || f->fb.idx == UINT16_MAX) return UINT16_MAX;
-    return f->tex.idx;
+    if (!f || f->rt.fb.idx == UINT16_MAX) return UINT16_MAX;
+    return f->rt.tex.idx;
 }
 
 void jce_volumetric_fog_composite(JceVolumetricFog *f,
@@ -347,7 +316,7 @@ void jce_volumetric_fog_composite(JceVolumetricFog *f,
 {
     if (!f || !f->composite_ok)                    return;
     if (f->prog_composite.idx == UINT16_MAX)       return;
-    if (f->fb.idx == UINT16_MAX)                   return;
+    if (f->rt.fb.idx == UINT16_MAX)                   return;
     JCE_PROFILE_ZONE_N("Renderer::VolumetricFog::composite");
 
     /* Bind the destination FBO and view rect explicitly. Callers must
@@ -356,17 +325,16 @@ void jce_volumetric_fog_composite(JceVolumetricFog *f,
      * stale data from the previous frame's fog RT. */
     bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
     bgfx_set_view_frame_buffer(view_id, dst);
-    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)f->w, (uint16_t)f->h);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)f->rt.w, (uint16_t)f->rt.h);
     bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(view_id);
 
-    bgfx_set_texture(0, f->s_fog, f->tex,
+    bgfx_set_texture(0, f->s_fog, f->rt.tex,
                      BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                      | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                      | BGFX_SAMPLER_MIP_POINT);
 
-    bgfx_set_vertex_buffer(0, f->vbh, 0, 4);
-    bgfx_set_index_buffer(f->ibh, 0, 6);
+    jce_fs_quad_bind(&f->quad);
 
     /* dst.rgb = dst.rgb * fog.a + fog.rgb
      * src factor = ONE, dst factor = SRC_ALPHA. */

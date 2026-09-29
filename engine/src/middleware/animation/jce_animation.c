@@ -191,6 +191,11 @@ uint32_t jce_anim_clip_channel_count(const JceAnimClip *clip)
     return clip ? clip->num_channels : 0;
 }
 
+const JceAnimChannel *jce_anim_clip_channels(const JceAnimClip *clip)
+{
+    return clip ? clip->channels : NULL;
+}
+
 void jce_anim_clip_sample(const JceAnimClip *clip, float time,
                             jce_mat4 *out_locals, uint32_t num_joints,
                             const jce_vec3 *rest_t,
@@ -506,6 +511,11 @@ void jce_anim_player_set_time(JceAnimPlayer *p, float time)
 float jce_anim_player_get_time(const JceAnimPlayer *p)
 {
     return p ? p->time : 0.0f;
+}
+
+const JceAnimClip *jce_anim_player_get_clip(const JceAnimPlayer *p)
+{
+    return p ? p->clip : NULL;
 }
 
 bool jce_anim_player_is_playing(const JceAnimPlayer *p)

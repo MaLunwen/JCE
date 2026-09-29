@@ -110,6 +110,21 @@ typedef struct JceEnvironmentState {
 
     uint32_t weather_type;         /* JceEnvWeatherType */
     uint32_t weather_seed;
+
+    /* Authored hour this clock was last seeded from, in [0,24).
+     *
+     * The seed and the live value have to be two numbers or the distinction
+     * cannot be made: with one, a running clock looks like an authoring edit on
+     * its second frame and re-seeds itself forever, which is exactly why the
+     * renderer's private copy needed a tod_authored_hour beside its
+     * tod_clock_hour.  It lives HERE, per scene, and not as a file static in
+     * the advance function, because the editor and its Play session are two
+     * live scenes at once and a process-wide seed would let one re-seed the
+     * other's clock.
+     *
+     * Negative means "never seeded", which is not a reachable hour and so needs
+     * no separate valid flag.  APPENDED. */
+    float    day_seed_hour;
 } JceEnvironmentState;
 
 /* A clear, windless noon on Earth.  Every field is finite and in range, so a
@@ -233,6 +248,52 @@ JCE_API float JCE_CALL jce_environment_key_illuminance(const JceEnvironmentState
 
 /* Direction toward the current key light. */
 JCE_API jce_vec3 JCE_CALL jce_environment_key_direction(const JceEnvironmentState *s);
+
+/* ── Scene-driven environment ────────────────────────────────────────
+ *
+ * jce_scene_environment() has said "on the SCENE and not on the renderer" for
+ * a while, and the STATE moved.  What did not move is the only thing that
+ * makes it tick: jce_environment_advance() had exactly one caller in the whole
+ * repository, inside the scene RENDERER.  A headless build has no renderer --
+ * "no window, no GPU device", which is the dedicated-server mode the engine
+ * ships -- so on a server world_time_seconds never advanced, the gust envelope
+ * was frozen at its phase-zero value, and global_wetness / snow_amount never
+ * integrated at all.  The state was scene-owned and renderer-driven, which is
+ * the same defect one level down.
+ *
+ * Time of day was worse, because it had a SECOND clock: the renderer kept a
+ * private tod_clock_hour seeded from the authored hour, and the editor
+ * advanced the AUTHORED field in place from ImGui's frame time.  Two clocks,
+ * two owners, two rates, and nothing a game could read: `time_of_day` appears
+ * zero times in contracts/script-api.json.
+ *
+ * So: one advance, on the scene, callable with or without a renderer. */
+
+typedef struct JceScene JceScene;
+
+/* Sync the scene's authored rendering settings into its environment and
+ * integrate one step of dt seconds.
+ *
+ * Call once per frame per scene, BEFORE anything reads the environment.
+ * jce_scene_update() does it for the runtime (so a dedicated server is now
+ * driven); the editor calls it directly while NOT playing, because edit mode
+ * runs no simulation and its preview clock would otherwise stop.  No-op on a
+ * NULL scene or a non-positive dt, so a paused frame does not integrate. */
+JCE_API void JCE_CALL jce_scene_environment_advance(JceScene *scene, float dt);
+
+/* Live hour of day in [0, 24) -- what the sky is actually showing right now,
+ * not the authored seed in JceSceneRenderingSettings::tod_hour.
+ *
+ * This is the accessor gameplay wants ("is it night?") and the one that did
+ * not exist: the live value was a private field of JceSceneRenderer, so the
+ * only way to reach it needed a renderer. Returns the authored hour when the
+ * scene has settings but time-of-day is disabled, and 0 for a NULL scene. */
+JCE_API float JCE_CALL jce_scene_environment_hour(JceScene *scene);
+
+/* Set the live hour, wrapping into [0, 24).  For save-game restore and for
+ * gameplay that jumps time ("sleep until dawn").  Does not touch the authored
+ * seed, so reloading the scene still starts where the designer set it. */
+JCE_API void JCE_CALL jce_scene_environment_set_hour(JceScene *scene, float hour);
 
 #ifdef __cplusplus
 }

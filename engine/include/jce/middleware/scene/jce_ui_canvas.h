@@ -31,6 +31,10 @@
 #define JCE_UI_CANVAS_H
 
 #include <jce/os/core/jce_defs.h>
+/* JceCanvasComponent is an anonymous `typedef struct { ... }`, so it
+ * cannot be forward-declared; jce_ui_canvas_scale_for takes one by
+ * pointer and this include is that function's honest cost. */
+#include <jce/middleware/scene/jce_scene.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -81,6 +85,23 @@ JCE_API void jce_ui_canvas_set_asset_root(const char *root_dir);
  * cached fonts so the change takes effect immediately.  Leaving it unset keeps
  * the editor and every other app on the built-in default. */
 JCE_API void jce_ui_canvas_set_default_font(const char *font_path);
+
+/* Fonts to fall back to when the UI font lacks a character, most specific
+ * first, separated by ';' (e.g. "fonts/NotoSansSC.ttf;fonts/NotoEmoji.ttf").
+ * NULL or "" clears the list.
+ *
+ * WHY THIS EXISTS.  A font that lacks a codepoint draws .notdef -- a tofu box
+ * -- so a Latin UI face in front of a Chinese, Japanese or Korean string draws
+ * a box for EVERY character, and pre-rendering the i18n codepoint set does not
+ * help: the glyphs are not in the face.  Each fallback is opened at the same
+ * size and through the same three-tier ladder as the primary (project asset
+ * root, active VFS, canvas pak), and the shaper splits a mixed string into
+ * runs so a fallback contributes its OWN advances rather than borrowed ones.
+ *
+ * Process-scoped, like the default font beside it and for the same reason: the
+ * shipped drop-in main sets it while reading the project, before any canvas
+ * exists.  Changing it invalidates the cached fonts. */
+JCE_API void jce_ui_canvas_set_font_fallbacks(const char *paths_semicolon);
 
 /* Render every Screen-Space-Overlay Canvas in `scene` into bgfx `view_id`.
  *
@@ -184,6 +205,126 @@ JCE_API uint64_t jce_ui_canvas_last_submitted(JceUICanvas *uc);
  * bgfx context; fire-and-forget (never consumes wheel events other systems
  * need). */
 JCE_API void     jce_ui_canvas_scroll(JceUICanvas *uc, float dx, float dy);
+
+/* ── Editor queries: what is where, as of the LAST render ────────────
+ *
+ * The canvas resolves the top-most UI entity under a point every frame, by the
+ * rules that actually govern UI hit-testing -- raycast_target, the inherited
+ * CanvasGroup blocksRaycasts chain, canvas-group alpha, ScrollView clipping,
+ * and an open dropdown's modal rect.  These expose that answer so a tool does
+ * not have to reimplement it (and get it subtly different).
+ *
+ * The editor Scene View needs them because jce_scene_pick.c is a GPU
+ * object-ID render over MESHES: a UIImage has no mesh, so the whole ECS-UI
+ * tree was unselectable in the viewport.  An ID buffer also could not honour
+ * any of the rules above even if the quads were added to it.
+ *
+ * Both answer about the last jce_ui_canvas_render call and are valid whether
+ * or not a pointer was fed to it -- the hit list is built by the layout walk,
+ * not by the pointer.  Coordinates are canvas space: the same screen_w /
+ * screen_h that render was called with, top-left origin, +Y down.  Use
+ * jce_ui_canvas_last_size to convert without keeping a second copy of them. */
+
+/* Top-most UI entity whose recorded rect contains (x, y), or 0 for none. */
+JCE_API uint64_t jce_ui_canvas_pick(const JceUICanvas *uc, float x, float y);
+
+/* ── The draw-side clip log ──────────────────────────────────────────────
+ *
+ * Every clip change the LAST render made, in order: the ScrollView subtrees
+ * it scissored to and the restores between them.  `active` false is "no
+ * clip", which a rect alone cannot express — (0,0,0,0) is a real and
+ * different answer, and those two are the states a clipping bug lands in.
+ *
+ * WHY IT EXISTS.  The draw clip is otherwise unobservable from outside.
+ * jce_ui_canvas_entity_rect answers the RAYCAST clip, and the two used to
+ * DISAGREE: the scissor was set to a ScrollView's own rect while the raycast
+ * used the intersection with its parent, so a nested viewport clipped input
+ * and pixels differently — and every test could see only the half that was
+ * right.  Bounded per render; a tree deep enough to overflow simply stops
+ * recording rather than growing.
+ *
+ * Count is 0 before the first render.  Indices are stable only until the next
+ * one. */
+JCE_API int  jce_ui_canvas_clip_log_count(const JceUICanvas *uc);
+JCE_API bool jce_ui_canvas_clip_log_at(const JceUICanvas *uc, int i,
+                                       float out_xywh[4], bool *out_active);
+
+/* Where `entity` actually drew last frame, already clipped to any ancestor
+ * ScrollView viewport.  false when it recorded no rect (not a UI element, not
+ * under an enabled Canvas, fully clipped away, or not raycastable). */
+JCE_API bool jce_ui_canvas_entity_rect(const JceUICanvas *uc, uint64_t entity,
+                                       float *out_x, float *out_y,
+                                       float *out_w, float *out_h);
+
+/* The screen_w / screen_h of the last render.  0 before the first one. */
+JCE_API void jce_ui_canvas_last_size(const JceUICanvas *uc,
+                                     float *out_w, float *out_h);
+
+/* The pivot of the RectTransform the canvas would USE for `entity` (UGUI
+ * fractions, measured from the element's BOTTOM-left).  false when the entity
+ * carries no UI component with a rect.
+ *
+ * The component resolution order behind this matters and is not obvious --
+ * UIButton resolves LAST so a sibling UIImage still wins, which is what keeps
+ * every button authored before UIButton had a rect from re-laying out.  A tool
+ * that wants the pivot (the Scene View's pivot marker) asks here instead of
+ * keeping a second copy of that order, which would drift.
+ *
+ * Returns the two floats rather than the struct so this header keeps its
+ * forward declaration of JceScene and does not pull in jce_scene.h. */
+JCE_API bool jce_ui_canvas_entity_pivot(JceScene *scene, uint64_t entity,
+                                        float out_pivot2[2]);
+
+/* THE SCALE THIS CANVAS RESOLVES TO at a given screen size.
+ *
+ * One derivation, exposed, because the renderer is not the only thing that
+ * wants it: an editor that shows "current scale 1.23x" and a test that
+ * asserts the match curve both have to get the SAME answer, and a second
+ * copy of a formula is how two answers start.
+ *
+ * Returns 1.0 for a canvas that is not scaled at all -- World-space mode, or
+ * a reference_resolution that was never authored -- which is exactly what the
+ * renderer leaves ui_scale at in those cases.
+ *
+ * match_width_or_height is honoured as jce_scene.h describes it, INCLUDING
+ * the exact-0.5 shortcut: sqrtf(rsx*rsy) rather than the pow() form, because
+ * the two are not bit-identical and every scene written before that field
+ * existed parses to 0.5. */
+JCE_API float jce_ui_canvas_scale_for(const JceCanvasComponent *cv,
+                                      float screen_w, float screen_h);
+
+/* Tell the canvas which part of the drawable is safe to put controls in,
+ * in the same PIXEL space as jce_ui_canvas_render's screen_w/screen_h.
+ *
+ * PUSHED IN RATHER THAN PULLED, because this is L4 middleware and the answer
+ * lives in the platform layer: a canvas that called jce_window_get_safe_area
+ * itself would put an os/platform dependency inside middleware/scene, which
+ * check_layer_dependencies exists to refuse.  The host -- the runtime's frame
+ * or the editor's Game View -- already knows its window and passes it on.
+ *
+ * Never set, or set to a zero-area rect, means "the whole drawable", so a host
+ * that does not call this behaves exactly as before.  Only canvases with
+ * respect_safe_area set read it. */
+JCE_API void jce_ui_canvas_set_safe_area(JceUICanvas *uc, int x, int y,
+                                         int w, int h);
+
+/* THE RECT THIS CANVAS LAYS OUT IN, given a drawable and a safe area.
+ *
+ * One derivation, exposed, because the renderer is not its only reader: a
+ * test has to be able to ask what a notch does to a canvas without standing
+ * up a scene, and an editor device preview will want the same answer.  A
+ * second copy of the rule is how two answers start -- this tree has paid for
+ * that (a hinge axis disagreed with its own clamp by 22 degrees).
+ *
+ * Yields the full drawable unless the canvas opted in AND the safe rect has
+ * positive area, which is exactly what the renderer does.  `cv` NULL yields
+ * the full drawable too, so a caller never has to test for it. */
+JCE_API void jce_ui_canvas_root_rect(const JceCanvasComponent *cv,
+                                     float screen_w, float screen_h,
+                                     int safe_x, int safe_y,
+                                     int safe_w, int safe_h,
+                                     float *out_x, float *out_y,
+                                     float *out_w, float *out_h);
 
 JCE_EXTERN_C_END
 

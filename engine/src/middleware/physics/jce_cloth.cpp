@@ -470,14 +470,18 @@ extern "C" void jce_softbody_step_(float dt)
     soft_world_step(dt);
 }
 
-extern "C" uint32_t jce_softbody_add_static_box(jce_vec3 center,
-                                                jce_vec3 half_extents)
+/* The proxy body every static shape needs, written once.  Takes ownership of
+ * `shape` on success and deletes it on failure, so a caller that cannot get a
+ * slot does not leak the shape it just built.  Extracted when the sphere and
+ * capsule proxies landed: three copies of this boilerplate is how the
+ * friction, the zero inertia and the registry bookkeeping come to disagree. */
+static uint32_t add_static_shape(btCollisionShape *shape, jce_vec3 center)
 {
-    if (!ensure_world()) return UINT32_MAX;
-    if (!ensure_static_capacity()) return UINT32_MAX;
-
-    btBoxShape *shape = new btBoxShape(
-        btVector3(half_extents.x, half_extents.y, half_extents.z));
+    if (!shape) return UINT32_MAX;
+    if (!ensure_world() || !ensure_static_capacity()) {
+        delete shape;
+        return UINT32_MAX;
+    }
 
     btTransform xf;
     xf.setIdentity();
@@ -495,6 +499,40 @@ extern "C" uint32_t jce_softbody_add_static_box(jce_vec3 center,
     g_ctx.statics[id].shape = shape;
     ++g_ctx.static_count;
     return id;
+}
+
+extern "C" uint32_t jce_softbody_add_static_box(jce_vec3 center,
+                                                jce_vec3 half_extents)
+{
+    return add_static_shape(new btBoxShape(
+        btVector3(half_extents.x, half_extents.y, half_extents.z)), center);
+}
+
+extern "C" uint32_t jce_softbody_add_static_sphere(jce_vec3 center, float radius)
+{
+    if (!(radius > 0.0f)) return UINT32_MAX;
+    return add_static_shape(new btSphereShape(btScalar(radius)), center);
+}
+
+extern "C" uint32_t jce_softbody_add_static_capsule(jce_vec3 center, float radius,
+                                                    float height, int axis)
+{
+    if (!(radius > 0.0f)) return UINT32_MAX;
+    /* `height` is the TOTAL length; Bullet wants the cylinder section, so the
+     * two hemispheres come off.  Clamped rather than rejected: a component
+     * authored with height <= 2*radius is a sphere, which is what a degenerate
+     * capsule should behave as -- the same clamp jce_bullet_character_create
+     * applies for the same reason. */
+    btScalar cyl = btScalar(height - 2.0f * radius);
+    if (cyl < btScalar(0.01)) cyl = btScalar(0.01);
+
+    btCollisionShape *shape = NULL;
+    switch (axis) {
+    case 0:  shape = new btCapsuleShapeX(btScalar(radius), cyl); break;
+    case 2:  shape = new btCapsuleShapeZ(btScalar(radius), cyl); break;
+    default: shape = new btCapsuleShape(btScalar(radius), cyl);  break; /* Y */
+    }
+    return add_static_shape(shape, center);
 }
 
 extern "C" void jce_softbody_clear_statics(void)

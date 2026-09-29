@@ -1,0 +1,39 @@
+{
+  "maxParticles": 64,
+  "emitRate": 8,
+  "lifetimeMin": 5.0,
+  "lifetimeMax": 7.0,
+  "worldSpace": true,
+  "velocityMin": [
+    -0.6,
+    -1.8,
+    -2.1
+  ],
+  "velocityMax": [
+    2.4,
+    -1.2,
+    0.9
+  ],
+  "gravity": [
+    0.0,
+    -0.05,
+    0.0
+  ],
+  "sizeStart": 0.22,
+  "sizeEnd": 0.22,
+  "colorStart": [
+    0.55,
+    0.42,
+    0.12,
+    1.0
+  ],
+  "colorEnd": [
+    0.5,
+    0.36,
+    0.1,
+    0.0
+  ],
+  "colorCurve": "QuadOut",
+  "texture": "textures/bush/leave_alpha_map_256x256.png",
+  "blend": "alpha"
+}

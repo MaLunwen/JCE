@@ -6,6 +6,7 @@
 #include "jce_gpu_vendor.h"
 
 #include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_renderer_caps.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
@@ -23,7 +24,9 @@ void jce_gpu_caps_init(JceGpuCaps *caps)
     /* Vendor / device. */
     caps->vendor_id     = bc->vendorId;
     caps->vendor_name   = jce_gpu_vendor_name(bc->vendorId);
-    caps->renderer_name = bgfx_get_renderer_name(bgfx_get_renderer_type());
+    /* The RUNNING backend, not the one bgfx was compiled for -- its GL name
+     * is a compile-time string built from the build floor. */
+    caps->renderer_name = jce_renderer_running_backend_name();
     caps->homogeneous_ndc = bc->homogeneousDepth;
 
     /* Features (check bgfx supported flags). */

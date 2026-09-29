@@ -66,6 +66,16 @@ void jce_terrain_cache_destroy(JceTerrainCache *cache);
 JceTerrain *jce_terrain_cache_acquire(JceTerrainCache *cache, const char *path,
                                       JceTerrainCacheLoadFn load, void *ud);
 
+/* Publish an already-loaded terrain as the resident object for `path`.
+ *
+ * On success the cache TAKES OWNERSHIP and every later acquire returns this
+ * exact pointer.  Replacing an existing resident object frees the old one and
+ * advances the path revision.  On failure ownership stays with the caller.
+ * This is the authoring path: an editor can load once, then let renderer, pick
+ * and physics consume the same mutable grid instead of keeping a private copy. */
+bool jce_terrain_cache_adopt(JceTerrainCache *cache, const char *path,
+                             JceTerrain *terrain);
+
 /* Already-resident lookup; never loads.  NULL if absent or known-failed. */
 JceTerrain *jce_terrain_cache_peek(const JceTerrainCache *cache,
                                    const char *path);
@@ -78,12 +88,15 @@ JceTerrain *jce_terrain_cache_peek(const JceTerrainCache *cache,
 uint64_t jce_terrain_cache_revision(const JceTerrainCache *cache,
                                     const char *path);
 
+/* Advance a resident path's revision without replacing its terrain pointer.
+ * Consumers use this after an in-place authoring edit to rebuild derived data.
+ * Returns false when the path is absent or represents a remembered failure. */
+bool jce_terrain_cache_touch(JceTerrainCache *cache, const char *path);
+
 /* Drop the cached terrain (and any remembered failure) for `path`, so the next
- * acquire reloads and every consumer's revision check fires.  This is what the
- * editor calls after a sculpt/save, and it is the mechanism that did not exist
- * before -- which is why edits never reached the collider or the pick mesh.
- *
- * Passing NULL invalidates EVERY entry. */
+ * acquire reloads and every consumer's revision check fires.  In-place editor
+ * strokes use adopt/touch instead; invalidation is reserved for external
+ * replacement or reload.  Passing NULL invalidates EVERY entry. */
 void jce_terrain_cache_invalidate(JceTerrainCache *cache, const char *path);
 
 /* Diagnostics: how many terrains are resident right now. */

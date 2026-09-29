@@ -10,15 +10,13 @@ float grid_line(vec2 world_xz, float spacing)
     vec2 scaled = world_xz / max(spacing, 1e-5);
     vec2 deriv = max(fwidth(scaled), vec2(1e-4, 1e-4));
     vec2 cell = abs(fract(scaled - 0.5) - 0.5) / deriv;
-    float cov = 1.0 - clamp(min(cell.x, cell.y), 0.0, 1.0);
-    /* Grid-LOD fade: once a cell shrinks below ~1px (deriv >= ~1) the lines are
-       sub-pixel and alias/shimmer under camera motion (the far-grid "屏闪").
-       Fade each level out as it becomes too dense to resolve, so the grid stays
-       crisp up close and dissolves cleanly with distance instead of shimmering
-       (the coarser major level survives further out).  ('line' is reserved in
-       HLSL, so this local is 'cov'.) */
-    float lod = 1.0 - smoothstep(0.5, 2.0, max(deriv.x, deriv.y));
-    return cov * lod;
+    vec2 cov = 1.0 - clamp(cell, vec2(0.0, 0.0), vec2(1.0, 1.0));
+    /* Fade each axis by its own projected frequency.  The old narrow
+       smoothstep cut off a whole family of lines across one screen region;
+       this broad Gaussian roll-off has no finite LOD edge and suppresses
+       sub-pixel lines before they can shimmer under camera motion. */
+    vec2 lod = exp(-64.0 * deriv * deriv);
+    return max(cov.x * lod.x, cov.y * lod.y);
 }
 
 float axis_line(float coord)
@@ -29,11 +27,15 @@ float axis_line(float coord)
 
 void main()
 {
-    vec4 nearH = mul(u_invViewProj, vec4(v_texcoord0, -1.0, 1.0));
-    vec4 farH = mul(u_invViewProj, vec4(v_texcoord0, 1.0, 1.0));
-    vec3 nearP = nearH.xyz / nearH.w;
-    vec3 farP = farH.xyz / farH.w;
-    vec3 dir = normalize(farP - nearP);
+    /* Two interior clip depths work on both [-1,1] and [0,1] backends.
+       Unproject in view space first: dividing at the far plane and subtracting
+       two large world positions loses precision in distant editor cameras. */
+    vec4 nearH = mul(u_invProj, vec4(v_texcoord0, 0.0, 1.0));
+    vec4 midH = mul(u_invProj, vec4(v_texcoord0, 0.5, 1.0));
+    vec3 nearV = nearH.xyz / nearH.w;
+    vec3 midV = midH.xyz / midH.w;
+    vec3 nearP = mul(u_invView, vec4(nearV, 1.0)).xyz;
+    vec3 dir = normalize(mul(u_invView, vec4(midV - nearV, 0.0)).xyz);
 
     float denom = dir.y;
     if (abs(denom) < 1e-5)
@@ -51,8 +53,7 @@ void main()
     float axisX = axis_line(world.x);
     float axisZ = axis_line(world.z);
 
-    vec3 color = vec3(0.33, 0.37, 0.43) * minor;
-    color = mix(color, vec3(0.52, 0.57, 0.64), major);
+    vec3 color = vec3(0.52, 0.57, 0.64);
     color = mix(color, vec3(0.88, 0.34, 0.34), axisX);
     color = mix(color, vec3(0.34, 0.48, 0.95), axisZ);
 
@@ -62,7 +63,8 @@ void main()
        coords explode and fract() precision dies, so any residual grid there is
        pure shimmer. */
     float angleFade = clamp(abs(dir.y) * 6.0, 0.0, 1.0);
-    float alpha = max(max(minor * 0.42, major * 0.95), max(axisX, axisZ));
+    float grid = max(minor * u_grid_camera.w, major);
+    float alpha = max(grid * 0.35, max(axisX, axisZ));
     alpha *= fade * angleFade;
 
     if (alpha <= 0.001)

@@ -44,6 +44,11 @@ static const JceCameraComponent g_def_JceCameraComponent = {
     /* far_plane  */ 1000.0f,
     /* is_primary */ false,
     /* ortho      */ false,
+    /* The three trailing members -- stack_index, clear_mode, culling_mask --
+     * are left to zero-init deliberately, and that is what parse_camera falls
+     * back to for all three.  Naming one of them here would mean naming the
+     * two before it: this blob is POSITIONAL, and a mid-list entry silently
+     * re-associates every per-field comment below it. */
 };
 JCE_REFLECT_BEGIN(JceCameraComponent, "Camera")
     JCE_FIELD_RANGE(JceCameraComponent, fov_deg,    JCE_FT_FLOAT, "FOV (deg)",     1.0f, 179.0f, 0.5f)

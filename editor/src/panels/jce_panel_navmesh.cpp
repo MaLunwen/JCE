@@ -3,8 +3,8 @@
  *
  * The Bake button drives the real Recast/Detour backend
  * (jce_recast_build_to_file): it gathers world-space triangle soup from
- * the active scene (MeshRenderer CPU meshes transformed into world
- * space, plus terrain ground planes), runs the full voxelisation
+ * the active scene (MeshRenderer CPU triangles and exact terrain collision
+ * cells transformed into world space), runs the full voxelisation
  * pipeline and serialises the single-tile Detour navmesh to a
  * .navmesh.bin sidecar.  The runtime loads that file via
  * jce_recast_load_file and resolves agent paths through
@@ -30,6 +30,7 @@
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_async.h>
+#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/api_scene.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
@@ -100,9 +101,71 @@ static inline void xform_point(const float *m, float x, float y, float z,
 /* Triangle soup accumulator passed through jce_scene_each_entity. */
 struct GatherCtx {
     JceScene             *scene = nullptr;
+    const BakeSettings   *cfg = nullptr;
     std::vector<float>    verts;     /* xyz triplets, world space */
     std::vector<uint32_t> indices;
+    bool                  terrain_budget_exceeded = false;
 };
+
+static bool triangle_intersects_bounds(const float a[3], const float b[3],
+                                       const float c[3],
+                                       const BakeSettings &cfg)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        const float mn = std::min(a[axis], std::min(b[axis], c[axis]));
+        const float mx = std::max(a[axis], std::max(b[axis], c[axis]));
+        if (mx < cfg.bounds_min[axis] || mn > cfg.bounds_max[axis])
+            return false;
+    }
+    return true;
+}
+
+static void world_bounds_to_local_xz(const BakeSettings &cfg,
+                                     const jce_mat4 &world,
+                                     float *out_min_x, float *out_min_z,
+                                     float *out_max_x, float *out_max_z)
+{
+    const jce_mat4 inv = jce_m4_inverse(&world);
+    const float *im = JCE_M4_PTR(inv);
+    float min_x = INFINITY, min_z = INFINITY;
+    float max_x = -INFINITY, max_z = -INFINITY;
+    for (int z = 0; z < 2; ++z) {
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 2; ++x) {
+                const float wx = cfg.bounds_min[0] +
+                    (cfg.bounds_max[0] - cfg.bounds_min[0]) * (float)x;
+                const float wy = cfg.bounds_min[1] +
+                    (cfg.bounds_max[1] - cfg.bounds_min[1]) * (float)y;
+                const float wz = cfg.bounds_min[2] +
+                    (cfg.bounds_max[2] - cfg.bounds_min[2]) * (float)z;
+                float local[3];
+                xform_point(im, wx, wy, wz, local);
+                min_x = std::min(min_x, local[0]);
+                min_z = std::min(min_z, local[2]);
+                max_x = std::max(max_x, local[0]);
+                max_z = std::max(max_z, local[2]);
+            }
+        }
+    }
+    *out_min_x = min_x;
+    *out_min_z = min_z;
+    *out_max_x = max_x;
+    *out_max_z = max_z;
+}
+
+static JceTerrain *resolve_terrain(JceScene *scene,
+                                   const JceTerrainComponent *tc)
+{
+    if (!scene || !tc || !tc->terrain_path[0]) return nullptr;
+    JceTerrain *terrain = jce_scene_peek_terrain(scene, tc->terrain_path);
+    if (terrain) return terrain;
+
+    char host[1024];
+    if (!jce_editor_resolve_asset_path(tc->terrain_path, host,
+                                       (int)sizeof(host)))
+        return nullptr;
+    return jce_scene_acquire_terrain_file(scene, tc->terrain_path, host);
+}
 
 static void gather_entity(JceScene *scene, JceEntity e, void *ud)
 {
@@ -123,52 +186,100 @@ static void gather_entity(JceScene *scene, JceEntity e, void *ud)
                 jce_editor_model_load_cpu_file(host, &cpu) &&
                 cpu.vertices && cpu.vertex_count >= 3 &&
                 cpu.indices && cpu.index_count >= 3) {
-                uint32_t base = (uint32_t)(g->verts.size() / 3);
-                g->verts.reserve(g->verts.size() + (size_t)cpu.vertex_count * 3);
-                for (uint32_t v = 0; v < cpu.vertex_count; ++v) {
-                    const float *src = cpu.vertices[v].pos;
-                    float w[3];
-                    xform_point(wm, src[0], src[1], src[2], w);
-                    g->verts.push_back(w[0]);
-                    g->verts.push_back(w[1]);
-                    g->verts.push_back(w[2]);
-                }
-                g->indices.reserve(g->indices.size() + cpu.index_count);
                 for (uint32_t i = 0; i + 2 < cpu.index_count; i += 3) {
                     uint32_t i0 = cpu.indices[i + 0];
                     uint32_t i1 = cpu.indices[i + 1];
                     uint32_t i2 = cpu.indices[i + 2];
                     if (i0 >= cpu.vertex_count || i1 >= cpu.vertex_count ||
                         i2 >= cpu.vertex_count) continue;
-                    g->indices.push_back(i0 + base);
-                    g->indices.push_back(i1 + base);
-                    g->indices.push_back(i2 + base);
+                    float w[3][3];
+                    const float *p0 = cpu.vertices[i0].pos;
+                    const float *p1 = cpu.vertices[i1].pos;
+                    const float *p2 = cpu.vertices[i2].pos;
+                    xform_point(wm, p0[0], p0[1], p0[2], w[0]);
+                    xform_point(wm, p1[0], p1[1], p1[2], w[1]);
+                    xform_point(wm, p2[0], p2[1], p2[2], w[2]);
+                    if (!g->cfg || !triangle_intersects_bounds(
+                            w[0], w[1], w[2], *g->cfg))
+                        continue;
+                    const uint32_t base =
+                        (uint32_t)(g->verts.size() / 3u);
+                    for (int v = 0; v < 3; ++v) {
+                        g->verts.push_back(w[v][0]);
+                        g->verts.push_back(w[v][1]);
+                        g->verts.push_back(w[v][2]);
+                        g->indices.push_back(base + (uint32_t)v);
+                    }
                 }
             }
             jce_editor_model_free_cpu_data(&cpu);
         }
     }
 
-    /* ── Terrain: append a flat ground quad at the entity origin so the
-     *    navmesh has a floor even without an authored ground mesh.  A
-     *    full heightfield bake would sample the .terrain.json; this
-     *    coarse quad keeps the chain functional. ── */
-    if (jce_scene_has_terrain(scene, e)) {
-        const float half = 64.0f; /* metres — generous default footprint */
-        float quad[4][3] = {
-            { -half, 0.0f, -half }, {  half, 0.0f, -half },
-            {  half, 0.0f,  half }, { -half, 0.0f,  half },
-        };
-        uint32_t base = (uint32_t)(g->verts.size() / 3);
-        for (auto &q : quad) {
-            float w[3];
-            xform_point(wm, q[0], q[1], q[2], w);
-            g->verts.push_back(w[0]);
-            g->verts.push_back(w[1]);
-            g->verts.push_back(w[2]);
+    /* Terrain uses the same native-grid triangle split and hole mask as the
+     * renderer and Bullet collider.  Bounds are transformed back to local
+     * space before extraction so rotated/scaled terrain remains correct. */
+    if (g->cfg && jce_scene_has_terrain(scene, e)) {
+        JceTerrainComponent *tc = jce_scene_get_terrain(scene, e);
+        JceTerrain *terrain = resolve_terrain(scene, tc);
+        if (!terrain) return;
+
+        const jce_vec3 scale = jce_m4_extract_scale(&world);
+        if (scale.x <= 1e-6f || scale.y <= 1e-6f || scale.z <= 1e-6f)
+            return;
+
+        float min_x, min_z, max_x, max_z;
+        world_bounds_to_local_xz(*g->cfg, world,
+                                 &min_x, &min_z, &max_x, &max_z);
+
+        const float terrain_x = jce_terrain_world_size_x(terrain);
+        const float terrain_z = jce_terrain_world_size_z(terrain);
+        if (max_x < 0.0f || max_z < 0.0f || min_x > terrain_x ||
+            min_z > terrain_z)
+            return;
+
+        min_x = std::max(0.0f, min_x);
+        min_z = std::max(0.0f, min_z);
+        max_x = std::min(terrain_x, max_x);
+        max_z = std::min(terrain_z, max_z);
+        const uint64_t nx = (uint64_t)std::ceil(
+            (max_x - min_x) * (jce_terrain_width(terrain) - 1) /
+            terrain_x) + 2u;
+        const uint64_t nz = (uint64_t)std::ceil(
+            (max_z - min_z) * (jce_terrain_height(terrain) - 1) /
+            terrain_z) + 2u;
+        const uint32_t max_terrain_vertices = 1024u * 1024u;
+        if (nx * nz > max_terrain_vertices) {
+            g->terrain_budget_exceeded = true;
+            return;
         }
-        const uint32_t tri[6] = { 0, 1, 2, 0, 2, 3 };
-        for (uint32_t t : tri) g->indices.push_back(base + t);
+
+        float *local_verts = nullptr;
+        uint32_t local_vcount = 0;
+        uint32_t *local_indices = nullptr;
+        uint32_t local_icount = 0;
+        if (!jce_terrain_build_collision_mesh_region(
+                terrain, min_x, min_z, max_x, max_z,
+                max_terrain_vertices, &local_verts, &local_vcount,
+                &local_indices, &local_icount)) {
+            return;
+        }
+
+        const uint32_t base = (uint32_t)(g->verts.size() / 3u);
+        g->verts.reserve(g->verts.size() + (size_t)local_vcount * 3u);
+        for (uint32_t v = 0; v < local_vcount; ++v) {
+            float p[3];
+            xform_point(wm, local_verts[v * 3u], local_verts[v * 3u + 1u],
+                        local_verts[v * 3u + 2u], p);
+            g->verts.push_back(p[0]);
+            g->verts.push_back(p[1]);
+            g->verts.push_back(p[2]);
+        }
+        g->indices.reserve(g->indices.size() + local_icount);
+        for (uint32_t i = 0; i < local_icount; ++i)
+            g->indices.push_back(base + local_indices[i]);
+        jce_free(local_verts);
+        jce_free(local_indices);
     }
 }
 
@@ -244,7 +355,11 @@ void bake_recast(void)
 {
     if (nav_bake_running()) return;
 
-    const BakeSettings &c = s.cfg;
+    BakeSettings c = s.cfg;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (c.bounds_min[axis] > c.bounds_max[axis])
+            std::swap(c.bounds_min[axis], c.bounds_max[axis]);
+    }
     JceScene *scene = jce_state_get_scene();
     if (!scene) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
@@ -254,7 +369,16 @@ void bake_recast(void)
 
     GatherCtx g;
     g.scene = scene;
+    g.cfg = &c;
     jce_scene_each_entity(scene, gather_entity, &g);   /* main: reads ECS */
+
+    if (g.terrain_budget_exceeded) {
+        jce_editor_console_log_level(
+            JCE_CONSOLE_ERROR,
+            "navmesh bake: terrain region exceeds the 1,048,576-vertex "
+            "gather budget; reduce Bake Bounds or use tiled navmesh baking");
+        return;
+    }
 
     if (g.verts.size() < 9 || g.indices.size() < 3) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,

@@ -1,0 +1,15 @@
+{
+  "_what_this_is": "UNVERIFIED CANDIDATE ROWS. Not the ledger. contracts/engine-parity.json holds only rows whose evidence has been checked; these have not been, and must not be quoted as measurements of this engine.",
+  "_how_they_were_produced": "2026-09-06, a 12-way fan-out comparing JCE with Unity / Unreal / Godot, one agent per subsystem area, each required to cite file:line it had actually opened and to distinguish four states: absent, built-but-unwired, wired-but-weaker, and at-or-beyond parity.",
+  "_why_they_are_not_in_the_ledger": "Every 'behind' and 'absent' row was to be handed to an adversarial refuter whose job was to FIND the implementation, because this repository has been wrong in that direction twice: auto-LOD was called absent off a truncated grep while jce_mesh_lod_cook.c implemented it, and script hot-reload was called behind when interpreted scripts DO re-read every Play. That pass hit the session usage limit. 15 rows completed it and were moved to the ledger; the rest are here.",
+  "_how_to_close_one": "Take a row, run the refutation by hand -- search under several names, in engine/include/jce (public API), engine/src, editor/src, tools/, scripts/ and engine/shaders/, and OPEN the files rather than stopping at a grep count -- then either move it into engine-parity.json with the verdict appended to its evidence, or correct it here. tools/lint/check_parity_ledger.py refuses an id that appears in both.",
+  "_cost_if_this_file_is_deleted": "About 8M subagent tokens and an hour of wall clock to measure again.",
+  "measured": "2026-09-06",
+  "source_run": "wf_c37356c8-486",
+  "counts": {},
+  "rows": [],
+  "_refutation_progress": "2026-09-20: ALL 118 candidates from the 2026-09-06 fan-out have now been refuted by hand and either moved into contracts/engine-parity.json or, in one case, dropped as a duplicate of a row already there. This file is empty of unverified rows. What it is NOT is the other 206 rows of the 342-row audit: 118 of those were captured here as candidates and the rest were never written down at all, so the ledger still cannot speak for them.",
+  "_dropped_as_duplicates": {
+    "render.shadows.contact-screenspace": "DROPPED 2026-09-20 as a DUPLICATE, not as a refutation. This row and render.shadows.screen-space-contact are the same feature seen from two sides: this one says 'wired end to end' and the other says 'sun-only and tied to the SSAO pass'. Both statements are true, and keeping both would have put two contradictory verdicts for one subject in the ledger -- something check_parity_ledger.py cannot catch, because it refuses a duplicate ID and these are two IDs. The BEHIND row is the one that survives, because a row whose title is 'contact shadows' has to carry the two limits a reader would otherwise discover on their own."
+  }
+}

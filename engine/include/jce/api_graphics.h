@@ -26,6 +26,7 @@ extern "C" {
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_shader_reflect.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>

@@ -66,3 +66,33 @@ const char *jce_platform_name(void)
     return "Unknown";
 #endif
 }
+
+/* See the header for why a caret must not step by bytes. */
+static int jce_utf8_is_cont(unsigned char c) { return (c & 0xC0u) == 0x80u; }
+
+int jce_utf8_prev(const char *s, int i)
+{
+    if (!s || i <= 0) return 0;
+    --i;
+    while (i > 0 && jce_utf8_is_cont((unsigned char)s[i])) --i;
+    return i;
+}
+
+int jce_utf8_next(const char *s, int i, int len)
+{
+    if (!s || len <= 0) return 0;
+    if (i < 0) i = 0;
+    if (i >= len) return len;
+    ++i;
+    while (i < len && jce_utf8_is_cont((unsigned char)s[i])) ++i;
+    return i;
+}
+
+int jce_utf8_count(const char *s)
+{
+    if (!s) return 0;
+    int n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        if (!jce_utf8_is_cont(*p)) ++n;
+    return n;
+}

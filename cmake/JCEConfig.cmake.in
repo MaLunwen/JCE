@@ -115,6 +115,37 @@ if(EMSCRIPTEN AND EXISTS "${_jce_core_release}")
 	set_target_properties(JCE::JCE PROPERTIES MAP_IMPORTED_CONFIG_DEBUG RELEASE)
 endif()
 
+# Pin the SIMD-enabled AV1 codec separately from the dependency archive.
+# The upstream bimg archive contains a fallback with identical public symbols.
+set(_jce_codec_options "")
+set(_jce_codec_release "${_jce_lib_dir}/Release/jce_av1_codec@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_codec_debug "${_jce_lib_dir}/Debug/jce_av1_codec@CMAKE_STATIC_LIBRARY_SUFFIX@")
+foreach(_cfg Release Debug)
+    set(_codec "${_jce_lib_dir}/${_cfg}/jce_av1_codec@CMAKE_STATIC_LIBRARY_SUFFIX@")
+    if(_cfg STREQUAL "Release")
+        set(_codec_gate "$<NOT:$<CONFIG:Debug>>")
+    else()
+        set(_codec_gate "$<CONFIG:Debug>")
+    endif()
+    if(EXISTS "${_codec}")
+        # A single-configuration SDK uses its archive for every consumer config.
+        if(NOT EXISTS "${_jce_codec_release}" OR NOT EXISTS "${_jce_codec_debug}")
+            set(_codec_gate "1")
+        endif()
+        if(MSVC)
+            set(_codec_option "/WHOLEARCHIVE:${_codec}")
+        elseif(APPLE)
+            set(_codec_option "LINKER:-force_load,${_codec}")
+        else()
+            set(_codec_option "LINKER:--whole-archive,${_codec},--no-whole-archive")
+        endif()
+        list(APPEND _jce_codec_options "$<${_codec_gate}:${_codec_option}>")
+    endif()
+endforeach()
+
+set_property(TARGET JCE::JCE APPEND PROPERTY
+    INTERFACE_LINK_OPTIONS ${_jce_codec_options})
+
 # ---- Force-link the *core* fat lib only --------------------------- #
 # jce_engine_core bundles every first-party JCE TU, including ones the
 # user game never *explicitly* references (RmlUI binding, SDL_main,
@@ -293,6 +324,9 @@ if(_jce_selective_links)
 	set_target_properties(JCE::Core PROPERTIES
 		INTERFACE_LINK_LIBRARIES "${_jce_selective_links}")
 endif()
+set_property(TARGET JCE::Core APPEND PROPERTY
+    INTERFACE_LINK_OPTIONS ${_jce_codec_options})
+unset(_jce_codec_options)
 unset(_jce_selective_links)
 
 set(JCE_INCLUDE_DIRS "${_jce_include_dir}")
@@ -346,9 +380,13 @@ foreach(_jce_comp IN LISTS JCE_FIND_COMPONENTS)
 				"there is no lib/cmake/JCE/JCEScripting.cmake in it. Either it "
 				"was produced before 2026-08-16, when the SDK installed "
 				"nothing from scripting/, or from a tree without that "
-				"directory. Rebuild it; for Python you also need an embeddable "
-				"CPython at SDK-build time (Python3 COMPONENTS "
-				"Development.Embed), and for Java -DJCE_BUILD_SCRIPT_JAVA=ON. ")
+				"directory. Rebuild it. Both toolchain-dependent backends detect "
+				"their own toolchain at SDK-build time and switch off when it "
+				"is absent, so a missing one means the SDK was built without "
+				"it: Python needs an embeddable CPython (Python3 COMPONENTS "
+				"Development.Embed) and Java needs a JDK on JAVA_HOME plus "
+				"`jce.py sdk --script-java`, which is a deliberate SDK policy "
+				"rather than the engine default. ")
 		else()
 			string(APPEND JCE_NOT_FOUND_MESSAGE
 				"component ${_jce_comp}: this SDK's scripting layer offers "

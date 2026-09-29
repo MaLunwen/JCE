@@ -1,0 +1,3 @@
+    if (jce_script_vm_js_register()) ++registered;
+    else LOG_ERROR(LOG_TAG, "js: register REFUSED — .jcejs resolves to no "
+                            "language");

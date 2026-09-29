@@ -1,0 +1,31 @@
+# Shader feature axes that are GUARDED in engine/shaders/ and defined nowhere.
+#
+# One NAME per line, whitespace, then the reason.  A line with a name and NO
+# reason is IGNORED, not accepted -- same fail-closed shape as
+# api_closure_exempt.txt, and for the same reason: an exemption nobody wrote a
+# justification for is an exemption nobody can review.
+#
+# An entry here is a PROMISE, not a parking space.  The one below exists
+# because deleting the guarded code would throw away a correct design; it does
+# not excuse leaving the half that is already in C code live.
+
+# THE FILE IS EMPTY, and that is the point: every axis this gate finds is
+# currently definable.
+#
+# It held exactly one entry, JCE_RENDER_COOKIE_2D_ARRAY, and that entry is
+# gone because the feature shipped -- the guard was deleted and s_cookie is
+# SAMPLER2DARRAY unconditionally.  Two claims in it were wrong, and both are
+# worth keeping here because an exemption is where a wrong claim survives
+# longest:
+#
+#   * "the sources need BGFX_TEXTURE_BLIT_SRC" -- inherited from the removed
+#     code's own TODO.  bgfx asks for no such flag; only the DESTINATION needs
+#     BGFX_TEXTURE_BLIT_DST.  A feature sat half-built behind it.
+#   * "THE MACRO IS THE REAL BLOCKER: texture2DArray needs GLSL 1.30+ and this
+#     engine's desktop GL profile is 120" -- mine, written from a stale belief
+#     that the GL floor was 2.1.  The floor is GL 3.1 (the stable tier in
+#     conan/hooks/hook_bgfx_wasm_fix.py), bgfx rewrites each shader's #version
+#     to 140 there and emits `#define texture2DArray texture`, so profile-120
+#     source compiles to valid GLSL 1.40.  There was no permutation to write.
+#
+# Neither blocker existed.  Both were asserted rather than read.

@@ -1,0 +1,23 @@
+{
+  "schema": 2,
+  "name": "elemental_serenity",
+  "version": "0.1.0",
+  "target": "ElementalSerenity",
+  "exe": "elemental_serenity.exe",
+  "platform": "win",
+  "assets": [
+    "resources/assets"
+  ],
+  "source_assets": "resources/assets",
+  "cooked_assets": "resources/_cooked",
+  "startup_scene": "scenes/elemental_serenity.scene.json",
+  "variants": [
+    "debug",
+    "release",
+    "dist"
+  ],
+  "script_modules": [
+    "native/bin/es_scripts.dll",
+    "native/bin/es_scripts_c.dll"
+  ]
+}

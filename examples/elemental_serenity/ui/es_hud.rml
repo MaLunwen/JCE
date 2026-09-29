@@ -1,0 +1,26 @@
+<rml>
+<head>
+	<link type="text/rcss" href="es_hud.rcss"/>
+</head>
+<body>
+	<div id="intro-overlay">
+		<div id="intro-title">Elemental Serenity</div>
+		<div id="intro-line">a four-season pond diorama</div>
+		<div id="intro-footer">JCE replica — after SahilK-027's Elemental Serenity</div>
+	</div>
+
+	<div id="hud">
+		<div id="season-row">
+			<p id="btn-spring" class="btn">Spring</p>
+			<p id="btn-winter" class="btn">Winter</p>
+			<p id="btn-autumn" class="btn">Autumn</p>
+			<p id="btn-rain"   class="btn">Rain</p>
+		</div>
+		<div id="misc-row">
+			<p id="btn-tod"       class="btn">Day-Night</p>
+			<p id="btn-lightning" class="btn">Lightning</p>
+			<p id="btn-music"     class="btn">Music</p>
+		</div>
+	</div>
+</body>
+</rml>

@@ -6,6 +6,7 @@
  */
 
 #include <jce/middleware/physics/jce_physics2d.h>
+#include <jce/middleware/physics/jce_physics_layers.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 
@@ -62,6 +63,7 @@ struct JcePhysics2D {
     b2WorldId   world_id;
     b2BodyId   *body_ids;      /* pool: slot index -> b2BodyId          */
     bool       *slot_alive;    /* pool: is this slot occupied?          */
+    uint32_t   *slot_layer;    /* pool: collision layer 0..31           */
     uint32_t    capacity;
     uint32_t    count;
 
@@ -87,8 +89,10 @@ static float shape_area(JceShape2DType shape, jce_vec2 half_extents)
             /* radius stored in half_extents.x */
             return JCE_PI * hx * hx;
 
-        case JCE_SHAPE2D_CAPSULE: {
-            /* half_extents: (radius, half_length) */
+        case JCE_SHAPE2D_CAPSULE:
+        case JCE_SHAPE2D_CAPSULE_X: {
+            /* half_extents: (radius, half_length) -- area is the same either
+             * way round, so both axes share this branch. */
             float r  = hx;
             float hl = hy;
             /* rectangle + two semicircles = full circle */
@@ -105,19 +109,44 @@ static float shape_area(JceShape2DType shape, jce_vec2 half_extents)
     }
 }
 
+/* One place that turns a layer index into a Box2D filter.
+ *
+ * b2DefaultShapeDef() gives categoryBits=1, maskBits=UINT32_MAX -- "layer 0,
+ * collides with everything" -- which is why an unfiltered 2D world behaved
+ * exactly like a fully-permissive matrix and the authored grid changing
+ * nothing was invisible.  The default is not wrong, it is just not the
+ * author's. */
+static b2Filter layer_filter(uint32_t layer)
+{
+    b2Filter f = b2DefaultFilter();
+    if (layer >= JCE_PHYSICS_LAYER_COUNT) layer = 0u;
+    f.categoryBits = (uint64_t)1u << layer;
+    f.maskBits     = (uint64_t)jce_physics2d_get_layer_collision_mask(layer);
+    return f;
+}
+
 /* ── Attach a shape to a newly created body ───────────────────────── */
 
 static void attach_shape(b2BodyId body_id,
+                         uint32_t layer,
+                         bool sensor,
                          JceShape2DType shape,
                          jce_vec2 half_extents,
                          float density,
                          float friction,
-                         float restitution)
+                         float restitution,
+                         const float *points, int point_count)
 {
     b2ShapeDef shape_def = b2DefaultShapeDef();
+    /* isSensor alone reports nothing: Box2D gates begin/end touch events on
+     * enableSensorEvents, so a "trigger" without it is just a collider that
+     * has stopped pushing -- the worst of both. */
+    shape_def.isSensor             = sensor;
+    shape_def.enableSensorEvents   = sensor;
     shape_def.density              = density;
     shape_def.material.friction    = friction;
     shape_def.material.restitution = restitution;
+    shape_def.filter               = layer_filter(layer);
 
     switch (shape) {
         case JCE_SHAPE2D_BOX: {
@@ -134,14 +163,49 @@ static void attach_shape(b2BodyId body_id,
             break;
         }
 
-        case JCE_SHAPE2D_CAPSULE: {
+        case JCE_SHAPE2D_CAPSULE:
+        case JCE_SHAPE2D_CAPSULE_X: {
             float r  = half_extents.x;
             float hl = half_extents.y;
+            bool  horiz = (shape == JCE_SHAPE2D_CAPSULE_X);
             b2Capsule capsule;
-            capsule.center1 = (b2Vec2){ 0.0f, -hl };
-            capsule.center2 = (b2Vec2){ 0.0f,  hl };
+            capsule.center1 = horiz ? (b2Vec2){ -hl, 0.0f }
+                                    : (b2Vec2){ 0.0f, -hl };
+            capsule.center2 = horiz ? (b2Vec2){  hl, 0.0f }
+                                    : (b2Vec2){ 0.0f,  hl };
             capsule.radius  = r;
             b2CreateCapsuleShape(body_id, &shape_def, &capsule);
+            break;
+        }
+
+        case JCE_SHAPE2D_POLYGON: {
+            /* b2ComputeHull rejects fewer than 3 points and silently drops
+             * anything past B2_MAX_POLYGON_VERTICES.  A rejected hull would
+             * leave the body with NO shape -- an invisible hole in the level
+             * -- so fall back to the half-extents box, which is what this
+             * shape did before it existed. */
+            b2Vec2 pts[B2_MAX_POLYGON_VERTICES];
+            int n = point_count;
+            if (n > B2_MAX_POLYGON_VERTICES) n = B2_MAX_POLYGON_VERTICES;
+            for (int i = 0; i < n; ++i) {
+                pts[i].x = points[i * 2 + 0];
+                pts[i].y = points[i * 2 + 1];
+            }
+            if (n >= 3) {
+                b2Hull hull = b2ComputeHull(pts, n);
+                if (hull.count >= 3) {
+                    b2Polygon poly = b2MakePolygon(&hull, 0.0f);
+                    b2CreatePolygonShape(body_id, &shape_def, &poly);
+                    break;
+                }
+            }
+            {
+                b2Polygon box = b2MakeBox(half_extents.x > 0.0f
+                                              ? half_extents.x : 0.5f,
+                                          half_extents.y > 0.0f
+                                              ? half_extents.y : 0.5f);
+                b2CreatePolygonShape(body_id, &shape_def, &box);
+            }
             break;
         }
 
@@ -175,10 +239,12 @@ JcePhysics2D *jce_physics2d_create(const JcePhysics2DDesc *desc)
 
     w->body_ids   = (b2BodyId *)JCE_CALLOC(max_bodies, sizeof(b2BodyId));
     w->slot_alive = (bool *)JCE_CALLOC(max_bodies, sizeof(bool));
+    w->slot_layer = (uint32_t *)JCE_CALLOC(max_bodies, sizeof(uint32_t));
     w->joints     = (Joint2DSlot *)JCE_CALLOC(JOINT2D_POOL_CAP, sizeof(Joint2DSlot));
-    if (!w->body_ids || !w->slot_alive || !w->joints) {
+    if (!w->body_ids || !w->slot_alive || !w->slot_layer || !w->joints) {
         JCE_FREE(w->body_ids);
         JCE_FREE(w->slot_alive);
+        JCE_FREE(w->slot_layer);
         JCE_FREE(w->joints);
         JCE_FREE(w);
         return NULL;
@@ -215,6 +281,7 @@ void jce_physics2d_destroy(JcePhysics2D *world)
 
     JCE_FREE(world->body_ids);
     JCE_FREE(world->slot_alive);
+    JCE_FREE(world->slot_layer);
     JCE_FREE(world->joints);
     JCE_FREE(world);
 
@@ -273,12 +340,21 @@ JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world,
     float friction    = desc->friction > 0.0f ? desc->friction : 0.5f;
     float restitution = desc->restitution;
 
-    attach_shape(body_id, desc->shape, desc->half_extents,
-                 density, friction, restitution);
+    attach_shape(body_id, desc->physics_layer, desc->sensor, desc->shape,
+                 desc->half_extents,
+                 density, friction, restitution,
+                 desc->points, desc->point_count);
 
     /* Record in pool. */
     world->body_ids[slot]   = body_id;
     world->slot_alive[slot] = true;
+    /* RECORD THE LAYER, so a shape added later through
+     * jce_physics2d_body_add_box inherits this body's layer instead of
+     * silently landing on Default.  Without this, slot_layer stayed 0 for
+     * every body and add_box rebuilt the exact defect this unit removes, on
+     * the two-step construction path only. */
+    world->slot_layer[slot] = desc->physics_layer < JCE_PHYSICS_LAYER_COUNT
+                            ? desc->physics_layer : 0u;
     world->count++;
 
     return (JceBodyHandle){ slot };
@@ -333,6 +409,11 @@ bool jce_physics2d_body_add_box(JcePhysics2D *world, JceBodyHandle body,
     shape_def.material.restitution = restitution >= 0.0f ? restitution : 0.0f;
     shape_def.isSensor             = sensor;
     shape_def.enableSensorEvents   = sensor;
+    /* INHERIT the body's layer rather than defaulting to 0.  A shape added
+     * after creation that silently landed on "Default" would collide with
+     * everything -- the exact behaviour this unit exists to remove, reappearing
+     * on the two-step construction path only. */
+    shape_def.filter               = layer_filter(world->slot_layer[body.idx]);
 
     b2Polygon box = b2MakeOffsetBox(half_extents.x, half_extents.y,
                                     to_b2(center_local), b2MakeRot(0.0f));
@@ -553,6 +634,7 @@ JceConstraintHandle JCE_CALL jce_physics2d_joint_create(JcePhysics2D *world,
             } else {
                 def.enableSpring = false;   /* rigid distance */
             }
+            def.collideConnected = desc->collide_connected;
             jid = b2CreateDistanceJoint(world->world_id, &def);
             break;
         }
@@ -569,6 +651,7 @@ JceConstraintHandle JCE_CALL jce_physics2d_joint_create(JcePhysics2D *world,
             def.enableLimit    = desc->use_limits;
             def.lowerAngle     = desc->lower_angle_rad;
             def.upperAngle     = desc->upper_angle_rad;
+            def.collideConnected = desc->collide_connected;
             jid = b2CreateRevoluteJoint(world->world_id, &def);
             break;
         }
@@ -591,6 +674,34 @@ JceConstraintHandle JCE_CALL jce_physics2d_joint_create(JcePhysics2D *world,
     world->joint_count++;
 
     return (JceConstraintHandle){ slot };
+}
+
+/* Reaction force / torque from the last step.  Box2D has no breakable joint;
+ * a break monitor reads these and destroys the joint itself. */
+static b2JointId p2d_joint_id(const JcePhysics2D *world, JceConstraintHandle j)
+{
+    if (!world || !jce_constraint_valid(j)) return b2_nullJointId;
+    uint32_t slot = j.idx;
+    if (slot >= world->joint_capacity || !world->joints[slot].alive)
+        return b2_nullJointId;
+    return world->joints[slot].joint_id;
+}
+
+float jce_physics2d_joint_get_force(const JcePhysics2D *world,
+                                    JceConstraintHandle joint)
+{
+    b2JointId id = p2d_joint_id(world, joint);
+    if (!b2Joint_IsValid(id)) return 0.0f;
+    b2Vec2 f = b2Joint_GetConstraintForce(id);
+    return sqrtf(f.x * f.x + f.y * f.y);
+}
+
+float jce_physics2d_joint_get_torque(const JcePhysics2D *world,
+                                     JceConstraintHandle joint)
+{
+    b2JointId id = p2d_joint_id(world, joint);
+    if (!b2Joint_IsValid(id)) return 0.0f;
+    return b2Joint_GetConstraintTorque(id);
 }
 
 void JCE_CALL jce_physics2d_joint_destroy(JcePhysics2D *world,

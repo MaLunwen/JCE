@@ -19,6 +19,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -142,6 +143,7 @@ void jce_render_pipeline_preset_low(JceRenderPipelineDesc *out)
     out->enable_csm            = false;
     out->enable_ssao           = false;
     out->enable_ssr            = false;
+    out->enable_ssgi           = false;
     out->enable_taa            = false;
     out->enable_bloom          = false;
     out->enable_volumetric_fog = false;
@@ -167,6 +169,7 @@ void jce_render_pipeline_preset_mid(JceRenderPipelineDesc *out)
     out->enable_csm            = true;
     out->enable_ssao           = true;
     out->enable_ssr            = false;
+    out->enable_ssgi           = false;
     out->enable_taa            = false;
     out->enable_bloom          = true;
     out->enable_volumetric_fog = false;
@@ -193,6 +196,7 @@ void jce_render_pipeline_preset_high(JceRenderPipelineDesc *out)
     out->enable_csm            = true;
     out->enable_ssao           = true;
     out->enable_ssr            = true;
+    out->enable_ssgi           = false;   /* opt-in; see the header */
     out->enable_taa            = true;
     out->enable_bloom          = true;
     out->enable_volumetric_fog = true;
@@ -219,11 +223,22 @@ void jce_render_pipeline_preset_ultra(JceRenderPipelineDesc *out)
     out->enable_csm            = true;
     out->enable_ssao           = true;
     out->enable_ssr            = true;
+    /* ON here and only here.  ULTRA is the tier that means "everything"; HIGH
+     * leaves it off because SSGI changes a scene's LIGHTING rather than its
+     * shading detail, and a project promoted from HIGH must not have its look
+     * change underneath it.  Leaving it off in ULTRA too would make the
+     * feature unreachable without hand-editing a .rp.json -- the
+     * built-but-unwired shape this whole audit is about. */
+    out->enable_ssgi           = true;
     out->enable_taa            = true;
     out->enable_bloom          = true;
     out->enable_volumetric_fog = true;
     out->enable_gpu_particles  = true;
     out->enable_motion_blur    = true;
+    /* ULTRA is the one preset that pays for contact hardening: the widened
+     * kernel is only sampled on filter tier 2, which is ULTRA's tier, and the
+     * blocker search is nine extra taps on every shadowed fragment. */
+    out->sun_soft_size         = 2.5f;   /* degrees; ~5x the real sun */
     out->shadow_resolution     = 4096;
     out->csm_cascade_count     = 4;
     out->shadow_filter_quality = 2;  /* full: local 3x3, CSM 5x5 + blend */
@@ -314,6 +329,11 @@ void jce_render_pipeline_notify_tier_changed(void)
     jce_render_pipeline_apply(&again);
 }
 
+/* Defined with the rest of the JCE_RP_FORCE parsing below; declared here
+ * because apply() is the last thing that touches the descriptor and so is
+ * the only place a force can outrank every other source. */
+static void rp_force_apply_numeric(JceRenderPipelineDesc *d);
+
 void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
 {
     JceRenderPipelineDesc tmp;
@@ -369,6 +389,7 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
             s_active.hdr_color            = false;  /* no half-float offscreen RT */
             s_active.enable_taa           = false;  /* needs motion vectors + history */
             s_active.enable_ssr           = false;  /* screen-space reflections */
+            s_active.enable_ssgi          = false;  /* screen-space GI          */
             /* Volumetric fog is NOT disabled here.  This block is for things
              * GLES CANNOT do -- half-float targets, motion-vector history.
              * The fog pass is an ordinary fragment quad that compiles and
@@ -423,10 +444,16 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
         s_active.hdr_color             = false;
         s_active.enable_taa            = false;
         s_active.enable_ssr            = false;
+        s_active.enable_ssgi           = false;
         s_active.enable_volumetric_fog = false;
         s_active.enable_motion_blur    = false;
         s_active.depth_prepass         = false;
     }
+
+    /* Forced numeric knobs land LAST, so a JCE_RP_FORCE outranks the preset,
+     * the asset and the tier clamp -- the same precedence the boolean forces
+     * already have, and the reason an ablation can be trusted. */
+    rp_force_apply_numeric(&s_active);
 
     /* P3-C.4 — fan out to any registered observer (cloth HW gate).  Fan out the
      * APPLIED descriptor (post GLES clamp) so observers see what actually runs. */
@@ -487,12 +514,13 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
 
     LOG_INFO(LOG_TAG,
         "applied: csm=%d ssao=%d ssr=%d taa=%d bloom=%d volfog=%d "
-        "gpup=%d mblur=%d shadow=%u cascades=%u sfilter=%u msaa=%u "
+        "gpup=%d mblur=%d(x%.2f) shadow=%u cascades=%u sfilter=%u msaa=%u "
         "scale=%.2f post=%s hdr=%d zpre=%d",
         (int)s_active.enable_csm, (int)s_active.enable_ssao,
         (int)s_active.enable_ssr, (int)s_active.enable_taa,
         (int)s_active.enable_bloom, (int)s_active.enable_volumetric_fog,
         (int)s_active.enable_gpu_particles, (int)s_active.enable_motion_blur,
+        (double)jce_render_pipeline_motion_blur_intensity(),
         (unsigned)desc->shadow_resolution,
         (unsigned)desc->csm_cascade_count,
         (unsigned)desc->shadow_filter_quality,
@@ -527,17 +555,36 @@ void jce_render_pipeline_get(JceRenderPipelineDesc *out)
  * rather than one cvar per feature. It announces what it forced: a silent
  * override is the same defect wearing a different hat, and this one outranks
  * the authored settings. */
-static int  s_force_n = -1;
-static char s_force_name[12][32];
-static int  s_force_val[12];
+#define RP_FORCE_MAX 12
+static int   s_force_n = -1;
+static char  s_force_name[RP_FORCE_MAX][32];
+static float s_force_val[RP_FORCE_MAX];
 
+/* NUMERIC knobs are forced through the SAME table as the boolean features.
+ *
+ * WHY THIS PATH EXISTS AT ALL.  JCE_RP_FORCE read every value as a BOOLEAN --
+ * `v = (*p == '0') ? 0 : 1` -- and only jce_render_pipeline_is_feature_enabled
+ * ever consulted it.  So `JCE_RP_FORCE=sun_soft_size=8.0` recorded the number
+ * 1 against a name no boolean query ever asks about, and the knob kept
+ * whatever the preset said.  Combined with the fact that the preset FILE does
+ * not reach the editor's viewport pipeline (tools/envshot.py says so in its
+ * own comment, which is why it sets this variable at all), a float override
+ * reached NOTHING -- and the capture tool then reported the result as "ABOVE
+ * THE NOISE FLOOR", because a 0.4% difference against a 0.14% floor is above
+ * it whatever caused the 0.4%.
+ *
+ * Measured 2026-09-06: sun_soft_size 3.0 and 8.0 produced 4721 px and 4708 px
+ * of difference -- 2.7x the parameter, 0.3% LESS effect.  An ablation switch
+ * that silently does not ablate turns "the feature does nothing" into a
+ * result instead of a question, and this file's own boolean path exists
+ * because that already happened once, to SSAO. */
 static void rp_force_parse(void)
 {
     s_force_n = 0;
     const char *e = getenv("JCE_RP_FORCE");
     if (!e || !e[0]) return;
     const char *p = e;
-    while (*p && s_force_n < 12) {
+    while (*p && s_force_n < RP_FORCE_MAX) {
         while (*p == ' ' || *p == ',') p++;
         const char *k = p;
         while (*p && *p != '=' && *p != ',') p++;
@@ -547,15 +594,145 @@ static void rp_force_parse(void)
             continue;
         }
         p++;
-        const int v = (*p == '0') ? 0 : 1;
+        const char *vs = p;
         while (*p && *p != ',') p++;
+
+        /* ONE value, stored as a float, read back two ways: the feature
+         * queries below compare it against zero, the numeric knobs take it
+         * whole.  It was two tables for one afternoon, split on whether the
+         * VALUE looked boolean -- which made `shadow_filter_quality=1`
+         * indistinguishable from `csm=1` and sent a numeric knob into the
+         * table only the boolean queries read, where it did nothing and said
+         * nothing.  A parser cannot tell those apart from the value; the
+         * CONSUMER always could, and now that is where it is decided. */
+        char vbuf[32];
+        size_t vlen = (size_t)(p - vs);
+        float fv = 1.0f;
+        if (vlen > 0 && vlen < sizeof vbuf) {
+            memcpy(vbuf, vs, vlen);
+            vbuf[vlen] = 0;
+            if (strcmp(vbuf, "false") == 0 || strcmp(vbuf, "off") == 0 ||
+                strcmp(vbuf, "no") == 0) {
+                fv = 0.0f;
+            } else if (strcmp(vbuf, "true") == 0 || strcmp(vbuf, "on") == 0 ||
+                       strcmp(vbuf, "yes") == 0) {
+                fv = 1.0f;
+            } else {
+                char *endp = NULL;
+                const float parsed = strtof(vbuf, &endp);
+                /* Unparseable stays 1.0 -- the old behaviour for any
+                 * non-"0" spelling -- but says so, because a typo that
+                 * silently means "on" is how an ablation stops ablating. */
+                if (endp && *endp == 0) fv = parsed;
+                else LOG_WARN(LOG_TAG, "JCE_RP_FORCE: value '%s' is not a "
+                              "number; treating it as ON (1)", vbuf);
+            }
+        }
+
         memcpy(s_force_name[s_force_n], k, klen);
         s_force_name[s_force_n][klen] = 0;
-        s_force_val[s_force_n] = v;
-        LOG_WARN(LOG_TAG, "JCE_RP_FORCE: %s = %d (overriding every other source)",
-                 s_force_name[s_force_n], v);
+        s_force_val[s_force_n] = fv;
+        LOG_WARN(LOG_TAG, "JCE_RP_FORCE: %s = %.4f (overriding every other "
+                 "source)", s_force_name[s_force_n], (double)fv);
         s_force_n++;
     }
+}
+
+/* Stamp the forced NUMERIC knobs onto a descriptor.  Called at the end of
+ * apply() so a force outranks the preset, the asset and the tier clamp --
+ * the same precedence the boolean path already has. */
+static void rp_force_apply_numeric(JceRenderPipelineDesc *d)
+{
+    if (s_force_n < 0) rp_force_parse();
+    for (int i = 0; i < s_force_n; i++) {
+        const char *n = s_force_name[i];
+        const float v = s_force_val[i];
+        if      (strcmp(n, "sun_soft_size")         == 0) d->sun_soft_size = v;
+        else if (strcmp(n, "motion_blur_intensity") == 0) d->motion_blur_intensity = v;
+        else if (strcmp(n, "render_scale")          == 0) d->render_scale = v;
+        else if (strcmp(n, "shadow_resolution")     == 0) d->shadow_resolution = (uint16_t)v;
+        else if (strcmp(n, "csm_cascade_count")     == 0) d->csm_cascade_count = (uint8_t)v;
+        else if (strcmp(n, "shadow_filter_quality") == 0) d->shadow_filter_quality = (uint8_t)v;
+        else if (strcmp(n, "msaa_samples")          == 0) d->msaa_samples = (uint8_t)v;
+        /* No `else` warning: every name in this table is ALSO offered to
+         * the boolean feature queries, and a name meant for those is not a
+         * mistake here.  A warning on each one would fire on every ablation
+         * capture ever taken and train the reader to skip the whole log. */
+    }
+}
+
+/* See the header: the "0 = engine default" rule lives here and nowhere else. */
+void jce_render_pipeline_scene_extent(uint32_t surface_w, uint32_t surface_h,
+                                      uint32_t *out_w, uint32_t *out_h)
+{
+    uint32_t rw = surface_w, rh = surface_h;
+    if (surface_w == 0u || surface_h == 0u) {
+        if (out_w) *out_w = surface_w;
+        if (out_h) *out_h = surface_h;
+        return;
+    }
+
+    /* 1. The authored scale.  A .rp.json written before this key existed
+     *    parses to whatever the preset set, and a corrupt or zero value is
+     *    treated as 1.0 rather than as "render nothing": a resolution knob
+     *    that can produce a zero-pixel target is a crash, not a setting. */
+    float scale = s_active_set ? s_active.render_scale : 1.0f;
+    if (!(scale > 0.0f)) scale = 1.0f;        /* also catches NaN */
+    if (scale < 0.25f)   scale = 0.25f;
+    if (scale > 2.0f)    scale = 2.0f;
+    if (scale != 1.0f) {
+        rw = (uint32_t)((float)surface_w * scale + 0.5f);
+        rh = (uint32_t)((float)surface_h * scale + 0.5f);
+    }
+
+    /* 2. The pixel budget, downward only, on fill-bound hardware.  Moved here
+     *    from the runtime host, which was the only place that had it -- so the
+     *    editor's Game view rendered at a resolution the shipped exe never
+     *    would, which is the "right in the editor, different in the exe" shape
+     *    this engine has a whole audit pattern for. */
+    {
+        const JceGpuTier tier = jce_renderer_get_tier();
+        const bool fill_bound =
+            (tier <= JCE_GPU_TIER_LOW) ||
+            (tier == JCE_GPU_TIER_MEDIUM &&
+             !jce_renderer_get_recommendation().has_discrete_gpu);
+        if (fill_bound) {
+            uint64_t budget = 1600000ull;     /* ~1.6 Mpx (about 1440x1111) */
+            const char *b = getenv("JCE_DYNRES_BUDGET");
+            if (b && b[0]) {
+                double mpx = atof(b);
+                if (mpx > 0.05) budget = (uint64_t)(mpx * 1000000.0);
+            }
+            const uint64_t px = (uint64_t)rw * (uint64_t)rh;
+            if (px > budget) {
+                const float s = sqrtf((float)budget / (float)px);
+                rw = (uint32_t)((float)rw * s);
+                rh = (uint32_t)((float)rh * s);
+            }
+        }
+    }
+
+    /* A target of a few pixels is not a cheaper frame, it is a broken one.
+     * Fall back to the surface rather than to a floor, so the failure is a
+     * missing optimisation instead of a 16x16 image stretched over a
+     * monitor -- the same choice the host's version made. */
+    if (rw < 16u || rh < 16u) { rw = surface_w; rh = surface_h; }
+
+    if (out_w) *out_w = rw;
+    if (out_h) *out_h = rh;
+}
+
+/* No "0 means the default" rule here, deliberately -- see the header. */
+float jce_render_pipeline_sun_soft_size(void)
+{
+    return s_active_set ? s_active.sun_soft_size : 0.0f;
+}
+
+float jce_render_pipeline_motion_blur_intensity(void)
+{
+    if (!s_active_set) return JCE_RP_MOTION_BLUR_DEFAULT;
+    return (s_active.motion_blur_intensity > 0.0f)
+         ? s_active.motion_blur_intensity : JCE_RP_MOTION_BLUR_DEFAULT;
 }
 
 bool jce_render_pipeline_is_feature_enabled(const char *feature)
@@ -568,6 +745,7 @@ bool jce_render_pipeline_is_feature_enabled(const char *feature)
     if (strcmp(feature, "csm")            == 0) return s_active.enable_csm;
     if (strcmp(feature, "ssao")           == 0) return s_active.enable_ssao;
     if (strcmp(feature, "ssr")            == 0) return s_active.enable_ssr;
+    if (strcmp(feature, "ssgi")           == 0) return s_active.enable_ssgi;
     if (strcmp(feature, "taa")            == 0) return s_active.enable_taa;
     if (strcmp(feature, "bloom")          == 0) return s_active.enable_bloom;
     if (strcmp(feature, "volumetric_fog") == 0) return s_active.enable_volumetric_fog;
@@ -600,6 +778,7 @@ void jce_render_pipeline_set_feature_enabled(const char *feature, bool enabled)
     if (strcmp(feature, "csm")            == 0) { s_pending.enable_csm          = enabled; return; }
     if (strcmp(feature, "ssao")           == 0) { s_pending.enable_ssao         = enabled; return; }
     if (strcmp(feature, "ssr")            == 0) { s_pending.enable_ssr          = enabled; return; }
+    if (strcmp(feature, "ssgi")           == 0) { s_pending.enable_ssgi         = enabled; return; }
     if (strcmp(feature, "taa")            == 0) { s_pending.enable_taa          = enabled; return; }
     if (strcmp(feature, "bloom")          == 0) { s_pending.enable_bloom        = enabled; return; }
     if (strcmp(feature, "volumetric_fog") == 0) { s_pending.enable_volumetric_fog = enabled; return; }
@@ -688,11 +867,14 @@ static bool rp_parse_buffer(const char *buf, size_t sz,
     out->enable_csm            = jce_json_get_bool(root, "enable_csm",            out->enable_csm);
     out->enable_ssao           = jce_json_get_bool(root, "enable_ssao",           out->enable_ssao);
     out->enable_ssr            = jce_json_get_bool(root, "enable_ssr",            out->enable_ssr);
+    out->enable_ssgi           = jce_json_get_bool(root, "enable_ssgi",           out->enable_ssgi);
     out->enable_taa            = jce_json_get_bool(root, "enable_taa",            out->enable_taa);
     out->enable_bloom          = jce_json_get_bool(root, "enable_bloom",          out->enable_bloom);
     out->enable_volumetric_fog = jce_json_get_bool(root, "enable_volumetric_fog", out->enable_volumetric_fog);
     out->enable_gpu_particles  = jce_json_get_bool(root, "enable_gpu_particles",  out->enable_gpu_particles);
     out->enable_motion_blur    = jce_json_get_bool(root, "enable_motion_blur",    out->enable_motion_blur);
+    out->motion_blur_intensity = (float)jce_json_get_number(root, "motion_blur_intensity", (double)out->motion_blur_intensity);
+    out->sun_soft_size         = (float)jce_json_get_number(root, "sun_soft_size", (double)out->sun_soft_size);
     out->enable_cloth          = jce_json_get_bool(root, "enable_cloth",          out->enable_cloth);
     out->enable_stylized_sky   = jce_json_get_bool(root, "enable_stylized_sky",   out->enable_stylized_sky);
 
@@ -854,11 +1036,14 @@ bool jce_render_pipeline_save(const char *host_path,
     jce_json_set_bool  (root, "enable_csm",            desc->enable_csm);
     jce_json_set_bool  (root, "enable_ssao",           desc->enable_ssao);
     jce_json_set_bool  (root, "enable_ssr",            desc->enable_ssr);
+    jce_json_set_bool  (root, "enable_ssgi",           desc->enable_ssgi);
     jce_json_set_bool  (root, "enable_taa",            desc->enable_taa);
     jce_json_set_bool  (root, "enable_bloom",          desc->enable_bloom);
     jce_json_set_bool  (root, "enable_volumetric_fog", desc->enable_volumetric_fog);
     jce_json_set_bool  (root, "enable_gpu_particles",  desc->enable_gpu_particles);
     jce_json_set_bool  (root, "enable_motion_blur",    desc->enable_motion_blur);
+    jce_json_set_number(root, "motion_blur_intensity", (double)desc->motion_blur_intensity);
+    jce_json_set_number(root, "sun_soft_size",         (double)desc->sun_soft_size);
     jce_json_set_bool  (root, "enable_cloth",          desc->enable_cloth);
     jce_json_set_bool  (root, "enable_stylized_sky",   desc->enable_stylized_sky);
 

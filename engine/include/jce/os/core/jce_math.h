@@ -13,6 +13,8 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -41,6 +43,53 @@ typedef union jce_mat4 {
 
 #define JCE_M4_PTR(m)           ((const float *)&(m).raw[0][0])
 #define JCE_M4_MUT_PTR(m)       ((float *)&(m).raw[0][0])
+
+/*
+ * IEEE binary16 -> float.
+ *
+ * HERE, AND INLINE, BECAUSE THREE LAYERS NEEDED IT.  A READ_BACK staging copy
+ * of an RGBA16F target has to be decoded on the CPU, and so does a quantised
+ * network vector -- so the renderer's headless capture, the post-fx exposure
+ * metering and jce_quant_f16_to_f32 all want the same twenty lines.  They had
+ * begun to grow their own; "read the physical memory" reached four independent
+ * implementations in this tree before anyone counted, and the copies do not
+ * agree at the edges, which is where this function is hard.
+ *
+ * Inline in the header so it costs no link edge in either direction: the
+ * metering lives in the renderer and the quantiser in middleware, and neither
+ * layer may depend on the other.
+ *
+ * The three cases a shift-and-mask gets wrong are all handled: exp == 0
+ * (zero and subnormals, which need renormalising, not just shifting),
+ * exp == 0x1F (Inf and NaN, whose exponent must saturate rather than rebias),
+ * and the exponent rebias between them.
+ */
+JCE_INLINE float jce_half_to_float(uint16_t h)
+{
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp  = ((uint32_t)h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t out;
+
+    if (exp == 0u) {
+        if (mant == 0u) {
+            out = sign;                              /* +/- 0 */
+        } else {
+            int32_t e = -1;                          /* subnormal: normalise */
+            do { mant <<= 1; e += 1; } while ((mant & 0x400u) == 0u);
+            mant &= 0x3FFu;
+            out = sign | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 31u) {
+        out = sign | 0x7F800000u | (mant << 13);     /* Inf / NaN */
+    } else {
+        out = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &out, sizeof f);
+    return f;
+}
 
 JCE_INLINE jce_vec2 jce_v2(float x, float y)
 {

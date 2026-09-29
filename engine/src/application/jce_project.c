@@ -223,6 +223,25 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	p->script_modules = read_str_array(root, "script_modules",
 	                                   &p->script_modules_count);
 
+	/* v5: script_assemblies array (optional).  Same shape and same silence
+	 * as script_modules: absent means this project has no C# scripts, which
+	 * is the common case and not a condition worth a message. */
+	p->script_assemblies = read_str_array(root, "script_assemblies",
+	                                      &p->script_assemblies_count);
+
+	/* v4: ui_default_font (optional).  Absent => the engine's built-in face. */
+	{
+		const char *s = jce_json_get_string(root, "ui_default_font", NULL);
+		p->ui_default_font = (s && *s) ? jce_strdup(s) : NULL;
+		/* Same optional shape as the font above: absent => no chain, and a
+		 * project written before this key existed loads unchanged. */
+		{
+			const char *fb = jce_json_get_string(root, "ui_font_fallbacks",
+			                                     NULL);
+			p->ui_font_fallbacks = (fb && *fb) ? jce_strdup(fb) : NULL;
+		}
+	}
+
 	jce_json_free(root);
 	return p;
 
@@ -294,6 +313,10 @@ bool JCE_CALL jce_project_save(const JceProject *p)
 	if (p->source_assets  && *p->source_assets)  jce_json_set_string(root, "source_assets",  p->source_assets);
 	if (p->cooked_assets  && *p->cooked_assets)  jce_json_set_string(root, "cooked_assets",  p->cooked_assets);
 	if (p->startup_scene  && *p->startup_scene)  jce_json_set_string(root, "startup_scene",  p->startup_scene);
+	if (p->ui_default_font && *p->ui_default_font)
+		jce_json_set_string(root, "ui_default_font", p->ui_default_font);
+	if (p->ui_font_fallbacks && *p->ui_font_fallbacks)
+		jce_json_set_string(root, "ui_font_fallbacks", p->ui_font_fallbacks);
 
 	write_str_array(root, "bundles", p->bundles, p->bundles_count);
 	/* WRITTEN BACK EVEN THOUGH NOTHING IN THE EDITOR EDITS IT.  The saver
@@ -303,6 +326,8 @@ bool JCE_CALL jce_project_save(const JceProject *p)
 	 * loading because someone renamed the startup scene. */
 	write_str_array(root, "script_modules",
 	                p->script_modules, p->script_modules_count);
+	write_str_array(root, "script_assemblies",
+	                p->script_assemblies, p->script_assemblies_count);
 
 	return jce_json_write_file(p->manifest_path, root, /*pretty*/ true,
 	                           /*take_ownership*/ true);
@@ -324,10 +349,13 @@ void JCE_CALL jce_project_free(JceProject *p)
 	xfree(p->source_assets);
 	xfree(p->cooked_assets);
 	xfree(p->startup_scene);
+	xfree(p->ui_default_font);
+	xfree(p->ui_font_fallbacks);
 	free_str_array(p->asset_dirs,     p->asset_dirs_count);
 	free_str_array(p->build_variants, p->build_variants_count);
 	free_str_array(p->bundles,        p->bundles_count);
 	free_str_array(p->script_modules, p->script_modules_count);
+	free_str_array(p->script_assemblies, p->script_assemblies_count);
 	jce_free(p);
 }
 
@@ -492,56 +520,145 @@ static bool locate_template_root(char *out, size_t cap)
 	return false;
 }
 
-/* In-place substitute `@JCE_PROJECT_NAME@` -> name and write back.  We
- * only ever rewrite if the marker was found, so binary blobs that happen
- * to live in templates/ are safe (no-op). */
-static bool subst_file(const char *path, const char *name)
+/* A project name is HUMAN TEXT; a CMake target and a C function name are
+ * IDENTIFIERS.  Treating them as one thing is a real, reachable defect: the
+ * template's CMakeLists says `project(@JCE_PROJECT_NAME@ C)` and
+ * `add_executable(@JCE_PROJECT_NAME@ src/main.c)`, and its main.c says
+ * `static JceAppDesc @JCE_PROJECT_NAME@_get_desc(void)`.
+ *
+ * MEASURED, with the editor's New Project dialog, whose only validation is
+ * `strlen(project_name) > 0`.  Name the project "My Game" and cmake reports:
+ *
+ *     CMake Error: Could not find cmake module file:
+ *                  CMakeDetermineGameCompiler.cmake
+ *     No CMAKE_Game_COMPILER could be found.
+ *
+ * -- an error naming a LANGUAGE that does not exist, for a bug about a space.
+ * main.c is worse: `My Game_get_desc` does not compile, and `my-game` becomes
+ * a subtraction.
+ *
+ * The Automation layer's project.create already derived a separate sanitised
+ * target and carried a comment saying it had learned this from a failure.
+ * Two scaffolders, and only one of them knew.  The rule belongs HERE, in the
+ * engine, so both get it -- which is what REQ-ARCH-02 is actually about.
+ *
+ * Keeps [A-Za-z0-9_], and guarantees a leading letter or underscore because
+ * neither a CMake target nor a C identifier may start with a digit. */
+static void project_target_from_name(const char *name, char *out, size_t cap)
+{
+	size_t w = 0;
+	if (!out || cap == 0) return;
+	for (const char *p = name ? name : ""; *p && w + 1 < cap; ++p) {
+		const unsigned char c = (unsigned char)*p;
+		const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		                  (c >= '0' && c <= '9') || c == '_';
+		if (!keep) continue;
+		if (w == 0 && c >= '0' && c <= '9')
+			out[w++] = '_';      /* an identifier may not start with a digit */
+		if (w + 1 < cap)
+			out[w++] = (char)c;
+	}
+	out[w] = '\0';
+	if (w == 0)                      /* a name of pure punctuation */
+		snprintf(out, cap, "JceGame");
+}
+
+/* One token and what it expands to. */
+typedef struct { const char *marker; const char *value; } SubstToken;
+typedef struct { const SubstToken *tok; size_t count; } SubstTable;
+
+static char *subst_mem(const char *buf, uint64_t sz, const SubstTable *tbl,
+                       size_t *out_len, size_t *hits_out);
+
+/* In-place substitute the template tokens in one file and write it back. */
+static bool subst_file(const char *path, const SubstTable *tbl)
 {
 	uint64_t sz = 0;
 	char *buf = (char *)jce_fs_host_read_all(path, &sz);
 	if (!buf) return false;
+	size_t w = 0, hits = 0;
+	char *out = subst_mem(buf, sz, tbl, &w, &hits);
+	jce_fs_buffer_free(buf);
+	if (!out) return false;
+	/* ONLY REWRITE IF SOMETHING CHANGED, so a binary blob that happens to
+	 * live in templates/ is a genuine no-op rather than a byte-identical
+	 * rewrite with a new mtime. */
+	bool ok = true;
+	if (hits)
+		ok = jce_fs_host_write_all(path, out, (uint64_t)w);
+	jce_free(out);
+	return ok;
+}
 
-	const char marker[] = "@JCE_PROJECT_NAME@";
-	const size_t mlen   = sizeof(marker) - 1;
-	const size_t nlen   = strlen(name);
-
-	/* Quick scan: any markers at all? */
-	size_t hits = 0;
-	for (uint64_t i = 0; i + mlen <= sz; ++i) {
-		if (buf[i] == '@' && memcmp(buf + i, marker, mlen) == 0) {
+/* The substitution itself, on a buffer.
+ *
+ * ITS OWN FUNCTION BECAUSE THERE WERE TWO COPIES.  jce_project_reset_main_c
+ * had a second, hand-inlined one, and it is precisely the copy a fix to the
+ * first would have missed: adding @JCE_PROJECT_TARGET@ to the walk path alone
+ * would have left `reset main.c` writing a file with the marker still in it,
+ * or with the unsanitised name back in an identifier position -- restoring
+ * the defect through the repair path. */
+static char *subst_mem(const char *buf, uint64_t sz, const SubstTable *tbl,
+                       size_t *out_len, size_t *hits_out)
+{
+	/* Quick scan: any markers at all, and how much room do they need? */
+	size_t hits = 0, grow = 0;
+	for (uint64_t i = 0; i < sz; ++i) {
+		if (buf[i] != '@') continue;
+		for (size_t t = 0; t < tbl->count; ++t) {
+			const size_t mlen = strlen(tbl->tok[t].marker);
+			if (i + mlen > sz ||
+			    memcmp(buf + i, tbl->tok[t].marker, mlen) != 0)
+				continue;
+			const size_t vlen = strlen(tbl->tok[t].value);
 			++hits;
+			if (vlen > mlen) grow += vlen - mlen;
 			i += mlen - 1;
+			break;
 		}
 	}
+	char *out = (char *)jce_malloc((size_t)sz + grow + 1);
+	if (!out) return NULL;
+	if (hits_out) *hits_out = hits;
 	if (hits == 0) {
-		jce_fs_buffer_free(buf);
-		return true;
+		/* No markers: hand back a copy rather than a special case.  The
+		 * caller frees one thing on every path. */
+		memcpy(out, buf, (size_t)sz);
+		out[sz] = '\0';
+		*out_len = (size_t)sz;
+		return out;
 	}
-
-	size_t new_cap = (size_t)sz + hits * (nlen > mlen ? (nlen - mlen) : 0) + 1;
-	char  *out     = (char *)jce_malloc(new_cap);
-	if (!out) { jce_fs_buffer_free(buf); return false; }
 
 	size_t w = 0;
 	for (uint64_t i = 0; i < sz;) {
-		if (i + mlen <= sz && buf[i] == '@' &&
-		    memcmp(buf + i, marker, mlen) == 0) {
-			memcpy(out + w, name, nlen); w += nlen; i += mlen;
-		} else {
-			out[w++] = buf[i++];
+		bool matched = false;
+		if (buf[i] == '@') {
+			for (size_t t = 0; t < tbl->count; ++t) {
+				const size_t mlen = strlen(tbl->tok[t].marker);
+				if (i + mlen > sz ||
+				    memcmp(buf + i, tbl->tok[t].marker, mlen) != 0)
+					continue;
+				const size_t vlen = strlen(tbl->tok[t].value);
+				memcpy(out + w, tbl->tok[t].value, vlen);
+				w += vlen;
+				i += mlen;
+				matched = true;
+				break;
+			}
 		}
+		if (!matched)
+			out[w++] = buf[i++];
 	}
-	jce_fs_buffer_free(buf);
-	bool ok = jce_fs_host_write_all(path, out, (uint64_t)w);
-	jce_free(out);
-	return ok;
+	out[w] = '\0';
+	*out_len = w;
+	return out;
 }
 
 static bool subst_walk_cb(const char *path, bool is_dir, void *user)
 {
 	if (is_dir) return true;
-	const char *name = (const char *)user;
-	(void)subst_file(path, name);  /* keep walking even if one file fails */
+	const SubstTable *tbl = (const SubstTable *)user;
+	(void)subst_file(path, tbl);  /* keep walking even if one file fails */
 	return true;
 }
 
@@ -635,7 +752,18 @@ bool JCE_CALL jce_project_create_from_template(const char *project_dir,
 		set_err(err_out, err_cap, "failed to copy template tree");
 		return false;
 	}
-	if (!jce_fs_host_walk(root, subst_walk_cb, (void *)name)) {
+	char target[256];
+	project_target_from_name(name, target, sizeof target);
+	const SubstToken toks[] = {
+		{ "@JCE_PROJECT_TARGET@", target },   /* identifiers  */
+		{ "@JCE_PROJECT_NAME@",   name   },   /* human text   */
+	};
+	/* Order does NOT matter for these two -- they share 13 bytes but neither
+	 * is a prefix of the other, so at most one can match at any position.
+	 * Longest-first anyway, because that is the ordering that stays correct
+	 * if a token is ever added that IS a prefix of another. */
+	const SubstTable tbl = { toks, sizeof(toks) / sizeof(toks[0]) };
+	if (!jce_fs_host_walk(root, subst_walk_cb, (void *)&tbl)) {
 		set_err(err_out, err_cap, "failed to substitute template tokens");
 		return false;
 	}
@@ -644,9 +772,17 @@ bool JCE_CALL jce_project_create_from_template(const char *project_dir,
 	JceProject *p = jce_project_new(root, name);
 	if (!p) { set_err(err_out, err_cap, "out of memory creating project"); return false; }
 	{
-		/* Default output_exe to "<name>" (no extension; build picks one). */
+		/* THE MANIFEST MUST AGREE WITH THE TEMPLATE IT JUST WROTE.
+		 * `name` stays human -- it is what the editor shows.  `target` and
+		 * `exe` are what the build pipeline looks for, and the CMakeLists on
+		 * disk now says `add_executable(<target> ...)`, so writing `name`
+		 * here would have the build hunt for an executable CMake never
+		 * produced.  jce_project_new defaults target_name to `name`, which is
+		 * right for a hand-written project and wrong for a generated one. */
+		xfree(p->target_name);
+		p->target_name = jce_strdup(target);
 		xfree(p->output_exe);
-		p->output_exe = jce_strdup(name);
+		p->output_exe = jce_strdup(target);
 	}
 	bool saved = jce_project_save(p);
 	jce_project_free(p);
@@ -786,33 +922,24 @@ bool JCE_CALL jce_project_reset_main_c(const char *project_dir,
 		return false;
 	}
 
-	/* Substitute @JCE_PROJECT_NAME@ -> name in-memory. */
-	const char marker[] = "@JCE_PROJECT_NAME@";
-	const size_t mlen   = sizeof(marker) - 1;
-	const size_t nlen   = strlen(name);
-	size_t hits = 0;
-	for (uint64_t i = 0; i + mlen <= sz; ++i) {
-		if (buf[i] == '@' && memcmp(buf + i, marker, mlen) == 0) {
-			++hits; i += mlen - 1;
-		}
-	}
-	size_t out_cap = (size_t)sz + hits * (nlen > mlen ? (nlen - mlen) : 0) + 1;
-	char *out_buf = (char *)jce_malloc(out_cap);
+	/* THE SAME SUBSTITUTION THE CREATE PATH USES, not a second copy of it.
+	 * This function rewrites main.c from the template, so it must expand the
+	 * identifier token exactly as creation did -- otherwise "reset main.c"
+	 * is a repair that reintroduces the defect it was reached for. */
+	char target[256];
+	project_target_from_name(name, target, sizeof target);
+	const SubstToken toks[] = {
+		{ "@JCE_PROJECT_TARGET@", target },
+		{ "@JCE_PROJECT_NAME@",   name   },
+	};
+	const SubstTable tbl = { toks, sizeof(toks) / sizeof(toks[0]) };
+	size_t w = 0;
+	char *out_buf = subst_mem(buf, sz, &tbl, &w, NULL);
+	jce_fs_buffer_free(buf);
 	if (!out_buf) {
-		jce_fs_buffer_free(buf);
 		set_err(err_out, err_cap, "out of memory");
 		return false;
 	}
-	size_t w = 0;
-	for (uint64_t i = 0; i < sz;) {
-		if (i + mlen <= sz && buf[i] == '@' &&
-		    memcmp(buf + i, marker, mlen) == 0) {
-			memcpy(out_buf + w, name, nlen); w += nlen; i += mlen;
-		} else {
-			out_buf[w++] = buf[i++];
-		}
-	}
-	jce_fs_buffer_free(buf);
 
 	bool ok = write_project_main_c(project_dir, out_buf, w, err_out, err_cap);
 	jce_free(out_buf);

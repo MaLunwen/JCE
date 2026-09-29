@@ -350,6 +350,76 @@ static ConsoleCmd *cmd_find(const char *name)
     return NULL;
 }
 
+/* `help` / `list`: the built-in listing.  These used to be an if-branch
+ * inside jce_console_exec, which made them work without EXISTING -- they were
+ * absent from the command table, so `help` did not list itself (on a fresh
+ * registry it said "commands (0)" while being one) and nothing enumerating
+ * the table could offer them to a completion key.  Registering them makes one
+ * table the answer to "what commands exist" for every reader. */
+static void builtin_list(int argc, const char **argv, void *user)
+{
+    (void)argc; (void)argv; (void)user;
+    console_printf("cvars (%d):", s_cvar_count);
+    for (int i = 0; i < s_cvar_count; ++i) {
+        char val[256];
+        jce_cvar_format_value(s_cvars[i], val, sizeof val);
+        console_printf("  %s = %s    %s", s_cvars[i]->name, val,
+                       s_cvars[i]->help);
+    }
+    /* Through the public accessors, so this listing and a completion key can
+     * never disagree about the table -- and so `help` appears in it. */
+    const int ncmd = jce_console_cmd_count();
+    console_printf("commands (%d):", ncmd);
+    for (int i = 0; i < ncmd; ++i) {
+        const char *nm = NULL, *hp = NULL;
+        if (jce_console_cmd_at(i, &nm, &hp))
+            console_printf("  %s    %s", nm, hp ? hp : "");
+    }
+}
+
+/* The built-ins are a CONST TABLE, not entries registered on first use.
+ *
+ * A lazy ensure_builtins() guarded by a file-scope bool was the first draft,
+ * and it reintroduced the defect it was fixing: "what commands exist" would
+ * have depended on whether anyone had called exec yet, which is exactly the
+ * shape of `help` printing "commands (0)" while being a command.  It also
+ * needed mutable process state and was not safe against a first exec off
+ * another thread.
+ *
+ * Two arrays, one accessor pair.  No reader can see only one of them --
+ * jce_console_cmd_count/_at walk both, cmd_find_any resolves both, and the
+ * listing below walks them through those same accessors -- so the invariant
+ * that matters ("one answer to what commands exist") holds without the
+ * built-ins needing to be registrable. */
+typedef struct { const char *name; const char *help; } ConsoleBuiltin;
+
+static const ConsoleBuiltin s_builtins[] = {
+    { "help", "list every cvar and command" },
+    { "list", "alias of help" },
+};
+#define CONSOLE_BUILTIN_COUNT ((int)(sizeof s_builtins / sizeof s_builtins[0]))
+
+int jce_console_cmd_count(void)
+{
+    return CONSOLE_BUILTIN_COUNT + s_cmd_count;
+}
+
+bool jce_console_cmd_at(int index, const char **out_name, const char **out_help)
+{
+    if (index < 0 || index >= jce_console_cmd_count()) return false;
+    const char *nm, *hp;
+    if (index < CONSOLE_BUILTIN_COUNT) {
+        nm = s_builtins[index].name;
+        hp = s_builtins[index].help;
+    } else {
+        nm = s_cmds[index - CONSOLE_BUILTIN_COUNT].name;
+        hp = s_cmds[index - CONSOLE_BUILTIN_COUNT].help;
+    }
+    if (out_name) *out_name = nm;
+    if (out_help) *out_help = hp;
+    return true;
+}
+
 bool jce_console_register_cmd(const char *name, JceConsoleCmdFn fn,
                               void *user, const char *help)
 {
@@ -408,18 +478,11 @@ bool jce_console_exec(const char *line)
     int argc = tokenize(buf, argv, CONSOLE_MAX_ARGV);
     if (argc == 0) return false;
 
-    /* Built-in: help / list cvars + commands. */
-    if (!strcmp(argv[0], "help") || !strcmp(argv[0], "list")) {
-        console_printf("cvars (%d):", s_cvar_count);
-        for (int i = 0; i < s_cvar_count; ++i) {
-            char val[256];
-            jce_cvar_format_value(s_cvars[i], val, sizeof val);
-            console_printf("  %s = %s    %s", s_cvars[i]->name, val, s_cvars[i]->help);
+    for (int i = 0; i < CONSOLE_BUILTIN_COUNT; ++i) {
+        if (strcmp(argv[0], s_builtins[i].name) == 0) {
+            builtin_list(argc, argv, NULL);
+            return true;
         }
-        console_printf("commands (%d):", s_cmd_count);
-        for (int i = 0; i < s_cmd_count; ++i)
-            console_printf("  %s    %s", s_cmds[i].name, s_cmds[i].help);
-        return true;
     }
 
     ConsoleCmd *cmd = cmd_find(argv[0]);

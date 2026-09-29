@@ -23,20 +23,55 @@ Rules (high-signal only; every rule has a documented real-world failure):
         COMPONENT-WISE (mul() is the product). Both compile; results
         diverge. Always use mul(a, b).
 
+  E003  a u_ uniform is READ somewhere in a top-level shader's include
+        closure but DECLARED nowhere in it.
+        Unlike E001/E002 this is not a per-backend hazard; it is the
+        hazard of SHARED INCLUDES. A .sh that reads `u_x` and leaves the
+        declaration to whoever includes it is a contract no compiler
+        states: shaderc reports an undeclared identifier only on the
+        profiles that reach that branch, and bgfx quietly hands back
+        zeros for a uniform the host never created. The failure looks
+        like the FEATURE being broken on one surface -- meshes soft,
+        terrain hard -- and not like a missing line.
+        (Real bug this was written for: pcss.sh reads u_csmPenumbra and
+        is included by both copies of the cascade filter; the terrain and
+        the water declare their own CSM uniforms, so forgetting one of
+        the three declarations would have shipped hard-edged terrain
+        shadows beside soft mesh shadows. 2026-09-06.)
+        Only .sc files are checked -- a .sh is by definition incomplete.
+
 Suppression (sparingly, with a justification comment nearby):
         ... // shader-lint: allow
 
 Usage:
-    python tools/shader_lint.py <dir-or-file> [more...] [--quiet]
+    python tools/shader_lint.py <dir-or-file> [more...] [-I <include-dir>] [--quiet]
 Exit code 0 = clean, 1 = findings, 2 = usage error.
 """
 
+import argparse
 import os
 import re
 import sys
 
 SHADER_EXTS = (".sc", ".sh")
 SUPPRESS_TAG = "shader-lint: allow"
+
+# ── E003 ──────────────────────────────────────────────────────────────
+INCLUDE_RE = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]', re.M)
+# `uniform vec4 u_x;` / `uniform mat4 u_x[4];`
+UNIFORM_DECL_RE = re.compile(r"\buniform\s+\w+\s+(u_\w+)\s*(?:\[[^\]]*\])?\s*;")
+# bgfx's SAMPLER2D(s_x, 0) macros, and any LOCAL whose name starts u_ --
+# fs_sky.sc has a `float u_lu` and it is not a uniform.
+SAMPLER_DECL_RE = re.compile(r"\bSAMPLER\w*\s*\(\s*(\w+)", re.I)
+LOCAL_DECL_RE = re.compile(
+    r"\b(?:float|int|bool|vec[234]|ivec[234]|bvec[234]|mat[234])\s+(u_\w+)")
+U_USE_RE = re.compile(r"\b(u_[A-Za-z_0-9]+)\b")
+# Supplied by bgfx itself; never declared in this tree.
+BGFX_BUILTIN_UNIFORMS = frozenset("""
+    u_viewRect u_viewTexel u_view u_invView u_proj u_invProj u_viewProj
+    u_invViewProj u_model u_modelView u_modelViewProj u_invModel
+    u_alphaRef u_alphaRef4
+""".split())
 
 # mat ctor with at least one TOP-LEVEL comma inside the parens.
 MAT_CTOR_RE = re.compile(r"\bmat[234]\s*\(")
@@ -135,6 +170,67 @@ def lint_file(path):
     return findings
 
 
+def resolve_include(name, includer, roots):
+    """Mirror shaderc's search order: the includer's own directory first,
+    then each include root. Quoted and SDK angle includes share this search."""
+    cands = [os.path.join(os.path.dirname(includer), name)]
+    cands += [os.path.join(r, name) for r in roots]
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return None
+
+
+def include_closure(top, roots):
+    seen, order, stack = set(), [], [os.path.normpath(top)]
+    while stack:
+        f = stack.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        order.append(f)
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+        except OSError:
+            continue
+        for inc in INCLUDE_RE.findall(strip_comments(txt)):
+            r = resolve_include(inc, f, roots)
+            if r:
+                stack.append(r)
+    return order
+
+
+def lint_uniform_closure(top, roots):
+    """E003: every u_ read anywhere in the closure is declared in it."""
+    declared = set(BGFX_BUILTIN_UNIFORMS)
+    used = {}
+    for f in include_closure(top, roots):
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                text = strip_comments(fh.read())
+        except OSError:
+            continue
+        declared |= set(UNIFORM_DECL_RE.findall(text))
+        declared |= set(SAMPLER_DECL_RE.findall(text))
+        declared |= set(LOCAL_DECL_RE.findall(text))
+        for u in U_USE_RE.findall(text):
+            used.setdefault(u, f)
+    findings = []
+    for u in sorted(used):
+        if u in declared:
+            continue
+        try:
+            where = os.path.relpath(used[u])
+        except ValueError:  # SDK and project can live on different Windows drives.
+            where = os.path.normpath(used[u])
+        findings.append((1, "E003",
+            "'%s' is read in %s but declared nowhere in this shader's "
+            "include closure - the includer owes the declaration"
+            % (u, where)))
+    return findings
+
+
 def collect_files(args):
     files = []
     for a in args:
@@ -152,18 +248,34 @@ def collect_files(args):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    quiet = "--quiet" in sys.argv
-    if not args:
-        print(__doc__)
-        sys.exit(2)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="+")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("-I", "--include-dir", action="append", default=[])
+    parsed = parser.parse_args()
+    args, quiet = parsed.paths, parsed.quiet
 
     files = collect_files(args)
+    # Include roots: every directory the caller named, plus the shader tree
+    # root above them, which is what compile_shaders.cmake passes as -i.
+    roots = [os.path.normpath(p) for p in parsed.include_dir]
+    roots += sorted({os.path.normpath(a if os.path.isdir(a)
+                                     else os.path.dirname(a)) for a in args})
+    roots += sorted({os.path.normpath(os.path.join(r, os.pardir))
+                     for r in roots})
+
     total = 0
     for path in files:
         for ln, code_id, msg in lint_file(path):
             total += 1
             print("%s:%d: error %s: %s" % (path, ln, code_id, msg))
+        # E003 is a property of a COMPLETE shader, so it is asked of .sc
+        # only: a .sh that reads a uniform it does not declare is exactly
+        # the shared-include shape this rule is here to make safe.
+        if path.endswith(".sc"):
+            for ln, code_id, msg in lint_uniform_closure(path, roots):
+                total += 1
+                print("%s:%d: error %s: %s" % (path, ln, code_id, msg))
 
     if not quiet:
         print("shader_lint: %d file(s), %d finding(s)" % (len(files), total))

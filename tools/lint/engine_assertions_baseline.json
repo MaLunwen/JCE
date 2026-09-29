@@ -1,0 +1,28 @@
+{
+  "_README": [
+    "Baselined exceptions for check_engine_assertions.py.  Every entry carries",
+    "a reason, and the reason has to say why the SHIPPED build is fine without",
+    "the check -- not merely that the code is old.  An entry whose reason is",
+    "'pre-existing' is a defect with a note attached."
+  ],
+
+  "bare_assert": {
+    "engine/src/renderer/internal/stb_image.h":
+      "Vendored third-party (stb).  Kept byte-identical to upstream so it can be re-synced; patching its assertions would fork it. Not reached by first-party invariants -- the two sites guard stb's own decode state.",
+
+    "engine/src/os/core/jce_crash_handler.c":
+      "No call site.  The only match is inside prose that the comment stripper cannot remove because it is a doc reference to abort()/assert() semantics on Android. Verified 2026-09-20: grep -c for an actual call returns 0."
+  },
+
+  "ndebug_in_self_test_file": {
+    "engine/src/middleware/net/jce_session.c":
+      "The NDEBUG mention left here is a COMMENT describing history; the live guard is `#if defined(JCE_SELF_TESTS) && defined(JCE_NET_SELF_TEST)`. The second gate is deliberate and stays: jce_session_self_test binds a real socket on port 27015, and a unit test that opens a listening port is not a unit test. No build file in this repo defines JCE_NET_SELF_TEST, which is the intended state."
+  },
+
+  "_not_baselined_on_purpose": {
+    "engine/src/application/jce_engine.c":
+      "Has `#ifndef NDEBUG` (trace on by default in a debug build) but contains no *_self_test, so rule B does not apply. Asking 'is this a debug build?' for a diagnostic default is exactly the legitimate use the rule is careful not to ban.",
+    "engine/src/os/core/jce_memory.h":
+      "Same shape: JCE_ALLOC_TRACKING is a real debug-only feature with real per-allocation cost. No *_self_test in the file."
+  }
+}

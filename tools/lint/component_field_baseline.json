@@ -1,0 +1,50 @@
+{
+  "_note": "Two lists, both CANDIDATES rather than confirmed defects -- see the docstring in check_component_field_consumed.py before citing either.  `fields`: Component.field with no reader under engine/src outside the JSON serialisers; EVERY entry must carry a `reasons` entry saying why, and the gate fails on one that does not (an unexplained entry is how a field that could be wired in an afternoon sits beside one that needs a subsystem, with nothing to tell them apart).  `unauthorable`: Component.field the engine DOES read and no inspector panel mentions -- mostly runtime state that must not be authored, kept so the next ped_prefab_path is noticed.",
+  "fields": [
+    "JceAvatarComponent.avatar_path",
+    "JceAvatarComponent.human_rig",
+    "JceEditorMeta.tag",
+    "JceEditorMeta.tag_color",
+    "JceEditorMeta.layer",
+    "JceTilemapCollider2DComponent.used_by_composite",
+    "JceWheelColliderComponent.suspension_target_pos",
+    "JceWheelColliderComponent.mass"
+  ],
+  "unauthorable": [
+    "JceBehaviorTree.tree_handle_idx",
+    "JceEditorMeta.prefab_instance",
+    "JceNetworkObjectComponent.flags",
+    "JceNetworkObjectComponent.is_owner",
+    "JceParticleEmitterComponent.asset_epoch",
+    "JceParticleEmitterComponent.emit_suppressed",
+    "JceParticleEmitterComponent.emitter_handle_idx",
+    "JceParticleEmitterComponent.loaded",
+    "JceRigidBody2DComponent.body_handle_idx",
+    "JceSequencePlayerComponent.opened_hash",
+    "JceSequencePlayerComponent.prev_time",
+    "JceSequencePlayerComponent.started",
+    "JceSkeletalAnimatorComponent.loco_grounded",
+    "JceSkeletalAnimatorComponent.loco_jump",
+    "JceSkeletalAnimatorComponent.loco_speed",
+    "JceSkeletalAnimatorComponent.loco_valid",
+    "JceSkeletalAnimatorComponent.loco_vert_vel",
+    "JceSkeletalAnimatorComponent.norm_time",
+    "JceSkeletalAnimatorComponent.rm_dyaw",
+    "JceSkeletalAnimatorComponent.rm_valid",
+    "JceTrailRendererComponent.point_age",
+    "JceUIDropdownComponent.expanded",
+    "JceVideoPlayerComponent.opened_hash",
+    "JceVideoPlayerComponent.started",
+    "JceVideoPlayerComponent.uploaded_counter"
+  ],
+  "reasons": {
+    "JceAvatarComponent.avatar_path": "THE LOADER IS A DECLARED STUB. jce_avatar_load (engine/src/middleware/animation/jce_avatar.c:15) returns NULL on purpose and says why: 'nothing here can parse a humanoid rig... NULL is the truthful answer until the P5 loader lands.' The editor calls it and handles the NULL; engine/src calls it nowhere. Not an editor/runtime split -- the thing that would read this has not been written. Also listed in tools/lint/authored_path_exempt.txt.",
+    "JceAvatarComponent.human_rig": "Same missing subsystem as avatar_path. The flag selects humanoid vs generic retargeting; both sides of that choice need the avatar asset the stub loader cannot produce.",
+    "JceEditorMeta.layer": "A MIRROR, ON PURPOSE -- see JceEditorMeta.tag. The authority the camera culling mask reads is JceLayerComponent, written through jce_scene_set_entity_layer; this is the editor-side copy the Inspector combo shows. Same gate keeps the two in step.",
+    "JceEditorMeta.tag": "A MIRROR, ON PURPOSE. The engine's tag authority is the interned registry behind jce_scene_set_entity_tag_name / _get / find_with_tag, which is what every gameplay query answers from; JceEditorMeta.tag is the editor-side copy the Hierarchy row shows and the scene file carries. bd7fa356 made every editor write mirror into the engine and added tools/lint/check_entity_tag_layer_single_writer.py to keep it that way. engine/src reading the mirror instead of the authority would be the defect, not the fix.",
+    "JceEditorMeta.tag_color": "EDITOR-ONLY BY CONSTRUCTION. JceTagColor is declared only in editor/src/core/jce_editor_state.h; the value drives the Hierarchy swatch and its filter and has no meaning to a running game. jce_scene.h:1113 says so at the field. The one engine mention (jce_prefab.c:77) zeroes it.",
+    "JceTilemapCollider2DComponent.used_by_composite": "A DECIDED NO, NOT AN OVERSIGHT. jce_rt_physics.c:1167 states it: the tilemap collider greedy-merges cells into axis-aligned rectangles on one static body, so 'the greedy merge above already IS the composite -- there is no separate CompositeCollider2D component to defer shape ownership to.' Unity's flag hands shapes to a sibling component this engine does not have and does not need. The control should arguably go, not gain a reader.",
+    "JceWheelColliderComponent.mass": "Same vehicle model. Wheel mass is a rotational-inertia term for a wheel SIMULATED as a body; a raycast vehicle's wheels are rays, and the chassis's rigid body carries the mass. Closing it means the wheels becoming simulated bodies, which is a different vehicle model.",
+    "JceWheelColliderComponent.suspension_target_pos": "THE VEHICLE MODEL TAKES A DIFFERENT PARAMETER. The raycast vehicle is driven by a rest LENGTH, not by a target position along travel (jce_panel_inspector_physics.cpp:404 records this beside the control). Unity's JointSpring.targetPosition is a fraction of suspensionDistance; expressing it means the solver taking the spring's rest point as a parameter rather than deriving it."
+  }
+}

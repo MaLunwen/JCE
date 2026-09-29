@@ -1,0 +1,96 @@
+    {
+        JceScriptVmJavaConfig cfg;
+        static char lib_opt[1200];
+        static char shim_buf[1200];
+        const char *opts[1];
+        const char *jvm;
+        const char *cp;
+        const char *shim;
+
+        /* THE JVM IS THE PLAYER'S, NOT THE BUILDER'S — JAVA_HOME at run time,
+         * the configured JDK as fallback.  It must be ABSOLUTE either way:
+         * jce_library_open() attaches to an already-resident module of the
+         * same BARE name on Windows, so "jvm.dll" would bind to whichever JVM
+         * something else loaded first, with somebody else's options.
+         * configure() refuses a bare name for exactly that reason. */
+        jvm = getenv("JAVA_HOME");
+        if (jvm && jvm[0]) {
+            static char jh[1200];
+#if defined(_WIN32)
+            snprintf(jh, sizeof jh, "%s/bin/server/jvm.dll", jvm);
+#elif defined(__APPLE__)
+            snprintf(jh, sizeof jh, "%s/lib/server/libjvm.dylib", jvm);
+#else
+            snprintf(jh, sizeof jh, "%s/lib/server/libjvm.so", jvm);
+#endif
+            jvm = jce_fs_host_exists_file(jh) ? jh : NULL;
+        }
+        if (!jvm || !jvm[0])
+            jvm = jce_se_resolve("JCE_SCRIPT_JAVA_JVM_LIBRARY",
+                                 "@JCE_SCRIPT_JAVA_JVM_LIBRARY@");
+
+        /* BESIDE THE EXECUTABLE first, then the configure-time path -- the
+         * same two-step this file already uses for the JNI shim below, and
+         * for the same reason: the configured path points into the SDK
+         * install, which does not exist on a player's machine.
+         *
+         * Until this existed, the shim was staged beside the exe and the
+         * CLASSES were not, so a shipped game found the .dll and then failed
+         * on the class path.  Measured: hiding the SDK's share/ tree cost a
+         * packaged game BOTH java and python while it still started and
+         * exited 0 -- two modules gone, no error anyone would see. */
+        {
+            static char cp_buf[1200];
+            const char *beside = jce_se_beside_exe(cp_buf, sizeof cp_buf,
+                                                   JCE_SE_JAVA_CLASSES_DIR);
+            cp = (beside[0] && jce_fs_host_exists_dir(beside))
+                 ? beside
+                 : jce_se_resolve("JCE_SCRIPT_JAVA_CLASS_PATH",
+                                  "@JCE_SCRIPT_JAVA_CLASS_PATH@");
+        }
+
+        /* BESIDE THE EXECUTABLE first, because jce_script_stage_runtime()
+         * copies it there and that is the only path that exists on a player's
+         * machine.  The configured one is the in-tree fallback. */
+        shim = jce_se_beside_exe(shim_buf, sizeof shim_buf, JCE_SE_JAVA_SHIM);
+        if (!shim[0] || !jce_fs_host_exists_file(shim))
+            shim = jce_se_resolve("JCE_SCRIPT_JAVA_JNI_LIBRARY",
+                                  "@JCE_SCRIPT_JAVA_JNI_LIBRARY@");
+
+        if (!jvm || !jvm[0] || !jce_fs_host_exists_file(jvm)) {
+            LOG_ERROR(LOG_TAG,
+                      "java: NOT registered — no JVM at '%s'. Set JAVA_HOME, "
+                      "or JCE_SCRIPT_JAVA_JVM_LIBRARY to an absolute path. A "
+                      "bare name is refused on purpose. The backend IS linked "
+                      "here, so this is a path problem and not a missing "
+                      "language.", jvm ? jvm : "");
+        } else if (!cp[0] || !jce_fs_host_exists_dir(cp)) {
+            LOG_ERROR(LOG_TAG,
+                      "java: NOT registered — class path '%s' does not exist. "
+                      "It must hold com/jce/script/*.class; set "
+                      "JCE_SCRIPT_JAVA_CLASS_PATH.", cp);
+        } else {
+            /* -Djce.script.library must be ABSOLUTE: com.jce.script.JceScript's
+             * static initialiser otherwise falls back to System.loadLibrary()
+             * against a java.library.path this process never arranged. */
+            snprintf(lib_opt, sizeof lib_opt,
+                     "-Djce.script.library=%s", shim);
+            opts[0] = lib_opt;
+
+            memset(&cfg, 0, sizeof cfg);
+            cfg.jvm_library  = jvm;
+            cfg.class_path   = cp;
+            cfg.options      = shim[0] ? opts : NULL;
+            cfg.option_count = shim[0] ? 1 : 0;
+
+            if (!jce_script_vm_java_configure(&cfg, sizeof cfg))
+                LOG_ERROR(LOG_TAG,
+                          "java: configure REFUSED (jvm=%s classpath=%s)",
+                          jvm, cp);
+            else if (jce_script_vm_java_register())
+                ++registered;
+            else
+                LOG_ERROR(LOG_TAG, "java: register REFUSED — .java resolves "
+                                   "to no language");
+        }
+    }

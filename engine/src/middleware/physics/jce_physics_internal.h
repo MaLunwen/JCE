@@ -9,6 +9,7 @@
 #ifndef JCE_PHYSICS_INTERNAL_H
 #define JCE_PHYSICS_INTERNAL_H
 
+#include <jce/middleware/physics/jce_physics_material.h>
 #include <jce/middleware/physics/jce_physics_types.h>
 #include <jce/os/core/jce_math.h>
 
@@ -62,7 +63,8 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 float friction, float restitution,
                                 float lin_damp, float ang_damp,
                                 uint32_t col_group, uint32_t col_mask,
-                                bool is_trigger);
+                                bool is_trigger,
+                                /* JceCapsuleAxis */ uint8_t capsule_axis);
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx);
 
@@ -98,6 +100,7 @@ typedef struct {
     uint32_t        vertex_count;
     const uint32_t *indices;
     uint32_t        index_count;
+    uint8_t         capsule_axis; /* JceCapsuleAxis; 0 = Y */
 } JceBulletColliderChild;
 
 uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
@@ -234,10 +237,18 @@ JceBulletRayResult jce_bullet_sweep_sphere(JceBulletWorld *bw, jce_vec3 origin,
 /* Contact callbacks                                                   */
 /* ================================================================== */
 
+/* is_trigger is CF_NO_CONTACT_RESPONSE on either object.  It is passed
+ * rather than looked up because the dispatch site already holds both
+ * btCollisionObjects; the C trampoline that builds JceContactEvent holds
+ * only indices, and it silently shipped is_trigger=false for every contact
+ * because `memset(&ev, 0, ...)` makes "not a trigger" the default and
+ * "not a trigger" is a perfectly legal value. */
 typedef void (*jce_bullet_contact_fn)(uint32_t body_a, uint32_t body_b,
                                       const float normal[3],
                                       const float point[3],
-                                      float depth, void *ud);
+                                      float depth,
+                                      float applied_impulse,
+                                      bool is_trigger, void *ud);
 
 void jce_bullet_set_contact_begin(JceBulletWorld *bw,
                                   jce_bullet_contact_fn fn, void *ud);
@@ -303,9 +314,19 @@ void jce_bullet_debug_world_destroyed_(JceBulletWorld *bw);
 void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
                                           uint32_t group, uint32_t mask);
 
-/* Set friction + restitution on an existing body. */
+/* Set friction + restitution on an existing body, and the combine modes that
+ * decide how they meet another body's at a contact.
+ *
+ * Bullet stores friction and restitution per body and combines them with a
+ * FIXED rule (multiply, and max).  The modes cannot be pre-baked into the
+ * per-body values because a combine is a function of the PAIR, so they are
+ * carried on the body and applied in the contact-added callback.  Calling
+ * this marks the body CF_CUSTOM_MATERIAL_CALLBACK; a body that never gets a
+ * material keeps Bullet's own combine untouched. */
 void jce_bullet_body_set_material(JceBulletWorld *bw, uint32_t idx,
-                                  float friction, float restitution);
+                                  float friction, float restitution,
+                                  JcePhysicsCombine friction_combine,
+                                  JcePhysicsCombine restitution_combine);
 
 /* ================================================================== */
 /* Continuous Collision Detection (CCD)  (P3-C.3)                      */
@@ -353,9 +374,34 @@ uint32_t jce_bullet_configurable_joint_create(JceBulletWorld *bw,
                                                const float angular_limit_rad[3],
                                                bool disable_collision);
 
+/* Drive a HINGE or SLIDER at a target velocity.  Units are the AUTHOR'S --
+ * rad/s + N*m for a hinge, m/s + N for a slider -- and the conversion to what
+ * each Bullet class actually wants happens inside, because Bullet is not
+ * consistent: a hinge takes a maximum IMPULSE while a slider and a 6DOF limit
+ * motor take a force the solver divides by the step rate itself.  `fixed_dt`
+ * is the world's fixed timestep, which is what turns a torque into that
+ * impulse.  A slot that holds neither a hinge nor a slider is a no-op. */
+void jce_bullet_constraint_set_motor(JceBulletWorld *bw, uint32_t idx,
+                                      bool enabled, float target_velocity,
+                                      float max_force, float fixed_dt);
+
+/* Drive ONE axis of a configurable joint (slot must hold a 6DOF constraint).
+ * `axis` is 0..2 linear X/Y/Z, 3..5 angular X/Y/Z -- Bullet's own numbering,
+ * which is also the order JceConfigurableJointDesc's arrays use.
+ * `mode` is JceJointDriveMode: 0 off, 1 velocity, 2 spring.  A no-op for any
+ * other slot contents or an axis outside 0..5. */
+void jce_bullet_configurable_joint_set_drive(JceBulletWorld *bw, uint32_t idx,
+                                              int axis, int mode, float target,
+                                              float spring, float damper,
+                                              float max_force);
+
 /* Last-step applied-impulse magnitude of constraint slot `idx`, or 0 when the
  * slot is dead/invalid. */
 float jce_bullet_constraint_applied_impulse(JceBulletWorld *bw, uint32_t idx);
+/* Applied TORQUE magnitude on body A, from the constraint's joint feedback.
+ * Separate from the impulse query because getAppliedImpulse() has no angular
+ * component to separate -- see the definition. */
+float jce_bullet_constraint_applied_torque(JceBulletWorld *bw, uint32_t idx);
 
 /* ================================================================== */
 /* Joint introspection (P3-C.6 — editor gizmo)                         */
@@ -390,12 +436,18 @@ bool jce_bullet_joint_get_info_for_body(JceBulletWorld *bw,
 /* Character controller                                                */
 /* ================================================================== */
 
+/* `col_group` / `col_mask` are the broadphase filter pair, exactly as for
+ * bodies -- this layer stays layer-matrix-agnostic and the caller resolves
+ * them.  They govern the capsule itself AND the ground / step / head-clearance
+ * probes, which must agree with it or the character stands on a surface it
+ * cannot collide with (or the reverse). */
 uint32_t jce_bullet_character_create(JceBulletWorld *bw,
                                       jce_vec3 pos, float radius,
                                       float height, float step_height,
                                       float max_slope_rad,
                                       float gravity, float jump_speed,
-                                      float accel, float air_control);
+                                      float accel, float air_control,
+                                      uint32_t col_group, uint32_t col_mask);
 void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                                 jce_vec3 walk_dir, float dt);
@@ -440,6 +492,9 @@ uint32_t jce_bullet_vehicle_add_wheel(JceBulletWorld *bw, uint32_t idx,
 
 void jce_bullet_vehicle_set_input(JceBulletWorld *bw, uint32_t idx,
                                    float throttle, float brake, float steer);
+void jce_bullet_vehicle_add_wheel_input(JceBulletWorld *bw, uint32_t idx,
+                                        uint32_t wheel, float engine_force,
+                                        float brake_force, float steer_rad);
 
 void jce_bullet_vehicle_get_chassis_transform(JceBulletWorld *bw, uint32_t idx,
                                                 jce_vec3 *pos, jce_quat *rot);

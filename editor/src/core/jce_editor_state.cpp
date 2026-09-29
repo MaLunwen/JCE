@@ -58,7 +58,7 @@ std::unordered_map<uint32_t, EditorEntitySidecar>  g_entity_sidecar;
 static bool jce_roots_is_root_cb(void *, uint32_t id)
 {
     return s.scene &&
-           jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID;
+           jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(id)) == JCE_ENTITY_INVALID;
 }
 
 static JceRootSet &jce_roots(void)
@@ -200,21 +200,21 @@ static bool s_suppress_add_component_log = false;
 
 static void demo_set_position(uint32_t id, float x, float y, float z)
 {
-    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
+    JceTransform *t = jce_scene_get_transform(s.scene, jce_state_to_ecs_entity(id));
     if (!t) return;
     t->position = jce_v3(x, y, z);
 }
 
 static void demo_set_scale(uint32_t id, float x, float y, float z)
 {
-    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
+    JceTransform *t = jce_scene_get_transform(s.scene, jce_state_to_ecs_entity(id));
     if (!t) return;
     t->scale = jce_v3(x, y, z);
 }
 
 static void demo_set_mesh_shape(uint32_t id, int shape)
 {
-    JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, (JceEntity)id);
+    JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     m->mesh_shape = shape;
 }
@@ -262,7 +262,7 @@ static void build_demo_scene(void)
     jce_state_add_component(cylinder, JCE_COMP_FLAG_MESH_RENDERER);
     demo_set_position(cylinder, 2.5f, 0.5f, 2.0f);
     demo_set_mesh_shape(cylinder, 4 /* cylinder */);
-    if (JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, (JceEntity)cylinder)) {
+    if (JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(cylinder))) {
         m->base_color[0] = 0.2f;
         m->base_color[1] = 0.6f;
         m->base_color[2] = 0.9f;
@@ -328,7 +328,7 @@ static void build_demo_scene(void)
                 /* JCE_STRESS_SHADOW: the scatter field casts shadows (千万 ③ —
                  * one instanced depth draw per cascade at reduced LOD). */
                 vs.cast_shadow = (std::getenv("JCE_STRESS_SHADOW") != nullptr);
-                jce_scene_set_vegetation_scatter(s.scene, (JceEntity)sc, &vs);
+                jce_scene_set_vegetation_scatter(s.scene, jce_state_to_ecs_entity(sc), &vs);
                 if (occ) {
                     /* Opaque wall at z≈4 spanning the corridor's front, tall enough
                      * to hide the field but leaving a strip of sky/edges so some
@@ -497,7 +497,7 @@ static void build_demo_scene(void)
                             jce_state_stress_record_mover(c);
                             jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
                             JceMeshRenderer *mm =
-                                jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
+                                jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(c));
                             if (mm && stress_model && stress_model[0])
                                 mm->mesh_path = jce_scene_intern(s.scene, stress_model);
                             if (mm && diverse) {
@@ -521,12 +521,12 @@ static void build_demo_scene(void)
                                 jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
                                 jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
                                 if (JceRigidBodyComponent *rb =
-                                        jce_scene_get_rigidbody(s.scene, (JceEntity)c)) {
+                                        jce_scene_get_rigidbody(s.scene, jce_state_to_ecs_entity(c))) {
                                     rb->body_type = 1;   /* JCE_BODY_DYNAMIC */
                                     rb->mass      = 1.0f;
                                 }
                                 if (JceBoxColliderComponent *bc =
-                                        jce_scene_get_box_collider(s.scene, (JceEntity)c)) {
+                                        jce_scene_get_box_collider(s.scene, jce_state_to_ecs_entity(c))) {
                                     bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
                                 }
                                 if (phys_simlod) {
@@ -537,7 +537,7 @@ static void build_demo_scene(void)
                                     sl.mid_radius  = 80.0f;
                                     sl.far_hz      = -1.0f;   /* pause far tier */
                                     sl.gate_mask   = JCE_SIMLOD_GATE_PHYSICS;
-                                    jce_scene_set_sim_lod(s.scene, (JceEntity)c, &sl);
+                                    jce_scene_set_sim_lod(s.scene, jce_state_to_ecs_entity(c), &sl);
                                 }
                             }
                             demo_set_position(c,
@@ -582,7 +582,7 @@ static void build_demo_scene(void)
                     pl.position.x = fx; pl.position.y = 3.0f; pl.position.z = fz;
                     pl.color.x = 1.0f; pl.color.y = 0.85f; pl.color.z = 0.7f;
                     pl.intensity = 4.0f; pl.radius = 10.0f;
-                    jce_scene_set_point_light(s.scene, (JceEntity)le, &pl);
+                    jce_scene_set_point_light(s.scene, jce_state_to_ecs_entity(le), &pl);
                     demo_set_position(le, fx, 3.0f, fz);
                 }
                 s_suppress_add_component_log = false;
@@ -622,11 +622,11 @@ static void build_demo_scene(void)
                 for (int z = 0; z < side && spawned < n; z++) {
                     uint32_t c = jce_state_create_entity("sk", sroot);
                     jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
-                    if (JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c))
+                    if (JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(c)))
                         mm->mesh_path = jce_scene_intern(s.scene, skpath);
                     jce_state_add_component(c, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
                     if (JceSkeletalAnimatorComponent *sa =
-                            jce_scene_get_skeletal_animator(s.scene, (JceEntity)c)) {
+                            jce_scene_get_skeletal_animator(s.scene, jce_state_to_ecs_entity(c))) {
                         snprintf(sa->skeleton_path, sizeof sa->skeleton_path, "%s", skpath);
                         snprintf(sa->clip_names[0], sizeof sa->clip_names[0], "%s",
                                  (clip && clip[0]) ? clip : "Run");
@@ -658,8 +658,7 @@ void jce_editor_state_init(bool with_demo_scene)
     memset(&s, 0, sizeof(s));
     g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
-    s_undo_history.clear();
-    s_redo_history.clear();
+    jce_state_history_clear();
     s_history_suspend_depth = 0;
     s_history_edit_nesting = 0;
     s_history_outer_edit_pushed_snapshot = false;
@@ -766,8 +765,7 @@ bool jce_state_new_default_scene(void)
 
     set_current_scene_path_internal(NULL);
     jce_editor_scene_set_scene_dir("");
-    s_undo_history.clear();
-    s_redo_history.clear();
+    jce_state_history_clear();
     s.scene_modified = false;
     s_history_edit_nesting = 0;
     s_history_outer_edit_pushed_snapshot = false;
@@ -791,8 +789,7 @@ void jce_editor_state_shutdown(void)
     jce_state_close_bundle_preview();
     g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
-    s_undo_history.clear();
-    s_redo_history.clear();
+    jce_state_history_clear();
     s_history_suspend_depth = 0;
     s_history_edit_nesting = 0;
     s_history_outer_edit_pushed_snapshot = false;
@@ -904,7 +901,7 @@ uint32_t jce_state_get_entity_id_by_index(int index)
 bool jce_state_entity_exists(uint32_t id)
 {
     if (id == 0 || !s.scene) return false;
-    return jce_scene_has_editor_meta(s.scene, (JceEntity)id);
+    return jce_scene_has_editor_meta(s.scene, jce_state_to_ecs_entity(id));
 }
 
 /* SAFE liveness check: pure membership test against the editor's known-entity
@@ -1006,7 +1003,7 @@ void jce_state_prune_dead(void)
         for (size_t k = 0; k < slice; ++k) {
             const uint32_t id = g_entity_order[(s_cursor + k) % total];
             if (id == 0 ||
-                !jce_scene_has_editor_meta(s.scene, (JceEntity)id)) {
+                !jce_scene_has_editor_meta(s.scene, jce_state_to_ecs_entity(id))) {
                 suspect = true;
                 break;
             }
@@ -1023,7 +1020,7 @@ void jce_state_prune_dead(void)
     size_t keep = 0;
     for (size_t i = 0; i < g_entity_order.size(); ++i) {
         uint32_t id = g_entity_order[i];
-        if (id != 0 && jce_scene_has_editor_meta(s.scene, (JceEntity)id)) {
+        if (id != 0 && jce_scene_has_editor_meta(s.scene, jce_state_to_ecs_entity(id))) {
             if (keep != i) g_entity_order[keep] = id;
             ++keep;                           /* still alive */
         } else {
@@ -1063,7 +1060,7 @@ void jce_state_prune_dead(void)
      * would dereference a dead id and crash.  Backwards because deselect shifts. */
     for (int i = (int)s.selected_count - 1; i >= 0; --i) {
         uint32_t id = s.selected[i];
-        if (id == 0 || !jce_scene_has_editor_meta(s.scene, (JceEntity)id))
+        if (id == 0 || !jce_scene_has_editor_meta(s.scene, jce_state_to_ecs_entity(id)))
             jce_state_deselect_entity(id);
     }
 }
@@ -1340,27 +1337,27 @@ void jce_state_detach_streamer_hlod(void)
 const char *jce_state_entity_name(uint32_t id)
 {
     if (!s.scene || id == 0) return "";
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? m->name : "";
 }
 
 bool jce_state_entity_enabled(uint32_t id)
 {
     if (!s.scene || id == 0) return false;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? m->enabled : false;
 }
 
 uint32_t jce_state_entity_parent(uint32_t id)
 {
     if (!s.scene || id == 0) return 0;
-    return (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)id);
+    return (uint32_t)jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(id));
 }
 
 int jce_state_entity_child_count(uint32_t id)
 {
     if (!s.scene || id == 0) return 0;
-    return jce_scene_get_child_count(s.scene, (JceEntity)id);
+    return jce_scene_get_child_count(s.scene, jce_state_to_ecs_entity(id));
 }
 
 int jce_state_entity_children(uint32_t id, uint32_t *out, int max)
@@ -1368,7 +1365,7 @@ int jce_state_entity_children(uint32_t id, uint32_t *out, int max)
     if (!s.scene || id == 0 || !out || max <= 0) return 0;
     JceEntity buf[JCE_MAX_CHILDREN];
     int cap = (max < JCE_MAX_CHILDREN) ? max : JCE_MAX_CHILDREN;
-    int n = jce_scene_get_children(s.scene, (JceEntity)id, buf, cap);
+    int n = jce_scene_get_children(s.scene, jce_state_to_ecs_entity(id), buf, cap);
     for (int i = 0; i < n; i++)
         out[i] = (uint32_t)buf[i];
     return n;
@@ -1377,28 +1374,28 @@ int jce_state_entity_children(uint32_t id, uint32_t *out, int max)
 JceTagColor jce_state_entity_tag_color(uint32_t id)
 {
     if (!s.scene || id == 0) return JCE_TAG_NONE;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? (JceTagColor)m->tag_color : JCE_TAG_NONE;
 }
 
 const char *jce_state_entity_tag(uint32_t id)
 {
     if (!s.scene || id == 0) return "";
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? m->tag : "";
 }
 
 bool jce_state_entity_is_prefab(uint32_t id)
 {
     if (!s.scene || id == 0) return false;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? m->prefab_instance : false;
 }
 
 const char *jce_state_entity_prefab_path(uint32_t id)
 {
     if (!s.scene || id == 0) return "";
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     return m ? m->prefab_path : "";
 }
 
@@ -1427,7 +1424,7 @@ int jce_state_get_root_count(void)
     if (!s.scene) return 0;
     int n = 0;
     for (uint32_t id : g_entity_order) {
-        if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
+        if (jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(id)) == JCE_ENTITY_INVALID)
             ++n;
     }
     return n;
@@ -1438,7 +1435,7 @@ uint32_t jce_state_get_root_id(int index)
     if (!s.scene || index < 0) return 0;
     int n = 0;
     for (uint32_t id : g_entity_order) {
-        if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID) {
+        if (jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(id)) == JCE_ENTITY_INVALID) {
             if (n == index) return id;
             ++n;
         }
@@ -1484,7 +1481,7 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
     jce_scene_set_editor_meta(s.scene, e, &meta);
 
     if (parent_id != 0) {
-        jce_scene_set_parent(s.scene, e, (JceEntity)parent_id);
+        jce_scene_set_parent(s.scene, e, jce_state_to_ecs_entity(parent_id));
         /* The order push above already provisionally filed this id as a
          * root (it had no parent yet). Now that it has one, re-derive. */
         jce_roots_note_reparented((uint32_t)e);
@@ -1515,7 +1512,7 @@ static void scrub_editor_state_recursive(uint32_t id)
     if (!jce_state_entity_exists(id)) return;
 
     JceEntity children[JCE_MAX_CHILDREN];
-    int cn = jce_scene_get_children(s.scene, (JceEntity)id,
+    int cn = jce_scene_get_children(s.scene, jce_state_to_ecs_entity(id),
                                     children, JCE_MAX_CHILDREN);
     for (int i = cn - 1; i >= 0; --i)
         scrub_editor_state_recursive((uint32_t)children[i]);
@@ -1535,7 +1532,7 @@ void jce_state_delete_entity(uint32_t id)
     scrub_editor_state_recursive(id);
 
     /* Single ecs_delete at the root — flecs cascades to ChildOf descendants. */
-    jce_scene_destroy_entity(s.scene, (JceEntity)id);
+    jce_scene_destroy_entity(s.scene, jce_state_to_ecs_entity(id));
 
     /* scrub_editor_state_recursive only walks JCE_MAX_CHILDREN (64) children per
      * node, so a node wider than that (e.g. a benchmark's tens-of-thousands of
@@ -1560,7 +1557,7 @@ static int      s_bench_kind    = -1;
 
 static void bench_set_pos(uint32_t e, float x, float y, float z)
 {
-    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)e);
+    JceTransform *t = jce_scene_get_transform(s.scene, jce_state_to_ecs_entity(e));
     if (t) { t->position.x = x; t->position.y = y; t->position.z = z; }
 }
 
@@ -1594,7 +1591,7 @@ static std::vector<BenchHidden> s_bench_isolated;   /* exactly what we disabled 
 static uint32_t bench_root_of(uint32_t id)
 {
     uint32_t r = id, p;
-    while ((p = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)r)) != 0 &&
+    while ((p = (uint32_t)jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(r))) != 0 &&
            p != (uint32_t)JCE_ENTITY_INVALID)
         r = p;
     return r;
@@ -1610,15 +1607,15 @@ extern "C" void jce_state_benchmark_isolate(int on)
         for (uint32_t id : ids) {
             if (id == 0 || id == s_bench_root) continue;
             if (s_bench_root && bench_root_of(id) == s_bench_root) continue;  /* a benchmark entity */
-            const uint64_t f = jce_scene_get_component_flags(s.scene, (JceEntity)id) & kHideMask;
+            const uint64_t f = jce_scene_get_component_flags(s.scene, jce_state_to_ecs_entity(id)) & kHideMask;
             if (!f) continue;
-            jce_scene_set_component_enabled(s.scene, (JceEntity)id, f, false);
+            jce_scene_set_component_enabled(s.scene, jce_state_to_ecs_entity(id), f, false);
             s_bench_isolated.push_back(BenchHidden{ id, f });
         }
     } else {
         for (const BenchHidden &h : s_bench_isolated) {
-            if (!jce_scene_has_editor_meta(s.scene, (JceEntity)h.id)) continue;  /* gone */
-            jce_scene_set_component_enabled(s.scene, (JceEntity)h.id, h.mask, true);
+            if (!jce_scene_has_editor_meta(s.scene, jce_state_to_ecs_entity(h.id))) continue;  /* gone */
+            jce_scene_set_component_enabled(s.scene, jce_state_to_ecs_entity(h.id), h.mask, true);
         }
         s_bench_isolated.clear();
     }
@@ -1652,7 +1649,7 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
             vs.scale_max     = 1.0f;
             vs.max_slope_deg = 90.0f;
             vs.seed          = 1u;
-            jce_scene_set_vegetation_scatter(s.scene, (JceEntity)sc, &vs);
+            jce_scene_set_vegetation_scatter(s.scene, jce_state_to_ecs_entity(sc), &vs);
             s_bench_spawned  = (uint32_t)count;
         } else {                                 /* Draw Call / Entity / Physics: grid */
             const bool unique = (kind == 0);
@@ -1698,7 +1695,7 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
             for (int z = 0; z < sz && spawned < count; ++z) {
                 uint32_t c = jce_state_create_entity("b", s_bench_root);
                 jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
-                JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, (JceEntity)c);
+                JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(c));
                 if (mm && unique) {
                     mm->base_color[0] = 0.15f + 0.7f * (float)((spawned * 13) % 101) / 101.0f;
                     mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
@@ -1719,10 +1716,10 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
                 if (phys) {
                     jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
                     jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
-                    if (JceRigidBodyComponent *rb = jce_scene_get_rigidbody(s.scene, (JceEntity)c)) {
+                    if (JceRigidBodyComponent *rb = jce_scene_get_rigidbody(s.scene, jce_state_to_ecs_entity(c))) {
                         rb->body_type = 1; rb->mass = 1.0f;
                     }
-                    if (JceBoxColliderComponent *bc = jce_scene_get_box_collider(s.scene, (JceEntity)c)) {
+                    if (JceBoxColliderComponent *bc = jce_scene_get_box_collider(s.scene, jce_state_to_ecs_entity(c))) {
                         bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
                     }
                 }
@@ -1755,7 +1752,7 @@ void jce_state_rename_entity(uint32_t id, const char *name)
     HistoryEditScope edit_scope;
 
     if (!s.scene || id == 0) return;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     snprintf(m->name, sizeof(m->name), "%s", name ? name : "");
 }
@@ -1789,7 +1786,7 @@ void jce_state_stress_move_tick(float dt)
     static bool  s_base_taken = false;
     s_phase += dt;
     for (uint32_t i = 0; i < s_stress_mover_count; i++) {
-        JceEntity e = (JceEntity)s_stress_mover_ids[i];
+        JceEntity e = jce_state_to_ecs_entity(s_stress_mover_ids[i]);
         JceTransform *tc = jce_scene_get_transform(s.scene, e);
         if (!tc) continue;
         if (!s_base_taken) s_stress_mover_base_y[i] = tc->position.y;
@@ -1806,7 +1803,7 @@ void jce_state_set_entity_enabled(uint32_t id, bool enabled)
     HistoryEditScope edit_scope;
 
     if (!s.scene || id == 0) return;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     m->enabled = enabled;
     /* The flag is mutated in place (no set_ call), so signal the frame-
@@ -1815,7 +1812,7 @@ void jce_state_set_entity_enabled(uint32_t id, bool enabled)
 
     /* Cascade to children. */
     JceEntity children[JCE_MAX_CHILDREN];
-    int cn = jce_scene_get_children(s.scene, (JceEntity)id, children, JCE_MAX_CHILDREN);
+    int cn = jce_scene_get_children(s.scene, jce_state_to_ecs_entity(id), children, JCE_MAX_CHILDREN);
     for (int i = 0; i < cn; ++i)
         jce_state_set_entity_enabled((uint32_t)children[i], enabled);
 }
@@ -1825,9 +1822,20 @@ void jce_state_set_entity_tag(uint32_t id, const char *tag)
     HistoryEditScope edit_scope;
 
     if (!s.scene || id == 0) return;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     snprintf(m->tag, sizeof(m->tag), "%s", tag ? tag : "");
+    /* And into the ENGINE's registry, which is what jce_scene_find_with_tag
+     * and every gameplay query answer from.  Tagging an entity in the editor
+     * used to write only this editor-side string, so the tag was visible in
+     * the Hierarchy and invisible to the game -- and it stayed invisible
+     * through Play, because Play does not reload the scene from disk where
+     * the loader's mirror would have run.
+     *
+     * HERE rather than at the Hierarchy menu or the Inspector: those are two
+     * call sites out of three, and a mirror in an ImGui callback cannot be
+     * asserted headlessly. */
+    jce_scene_set_entity_tag_name(s.scene, jce_state_to_ecs_entity(id), tag ? tag : "");
 }
 
 void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
@@ -1835,7 +1843,7 @@ void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
     HistoryEditScope edit_scope;
 
     if (!s.scene || id == 0) return;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     m->tag_color = (uint8_t)color;
 }
@@ -1845,10 +1853,15 @@ void jce_state_set_entity_layer(uint32_t id, int layer)
     HistoryEditScope edit_scope;
 
     if (!s.scene || id == 0) return;
-    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
     if (layer < 0 || layer > 31) layer = 0;
     m->layer = layer;
+    /* Same collapse as the tag above: JceLayerComponent is what the camera
+     * culling mask reads (694b77d3), and EditorMeta.layer is a second copy the
+     * engine never sees.  Writing both HERE means every caller gets it, rather
+     * than the one Inspector site that happened to remember. */
+    jce_scene_set_entity_layer(s.scene, jce_state_to_ecs_entity(id), (uint8_t)layer);
 }
 
 void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
@@ -1857,8 +1870,8 @@ void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 
     if (!s.scene || id == 0 || id == new_parent) return;
     if (!jce_state_entity_exists(id)) return;
-    jce_scene_reparent(s.scene, (JceEntity)id,
-                       new_parent != 0 ? (JceEntity)new_parent
+    jce_scene_reparent(s.scene, jce_state_to_ecs_entity(id),
+                       new_parent != 0 ? jce_state_to_ecs_entity(new_parent)
                                        : JCE_ENTITY_INVALID,
                        true);
     jce_roots_note_reparented(id);
@@ -1870,8 +1883,8 @@ void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
     HistoryEditScope edit_scope;
 
     if (!s.scene || entity_id == 0 || ref_id == 0 || entity_id == ref_id) return;
-    if (jce_scene_get_parent(s.scene, (JceEntity)entity_id) !=
-        jce_scene_get_parent(s.scene, (JceEntity)ref_id))
+    if (jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(entity_id)) !=
+        jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(ref_id)))
         return;
 
     auto it_e = std::find(g_entity_order.begin(), g_entity_order.end(), entity_id);
@@ -1933,23 +1946,33 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 
     if (!s.scene || id == 0 || !jce_state_entity_exists(id)) return 0;
 
-    JceEditorMeta *src_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    JceEditorMeta *src_meta = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!src_meta) return 0;
 
     char dup_name[64];
     snprintf(dup_name, sizeof(dup_name), "%s (Copy)", src_meta->name);
 
-    uint32_t parent_id = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)id);
+    uint32_t parent_id = (uint32_t)jce_scene_get_parent(s.scene, jce_state_to_ecs_entity(id));
     uint32_t dup = jce_state_create_entity(dup_name, parent_id);
     if (dup == 0) return 0;
 
     /* Copy editor-meta extras (name already set). */
-    JceEditorMeta *dup_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)dup);
-    src_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)id);  /* refresh */
+    JceEditorMeta *dup_meta = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(dup));
+    src_meta = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));  /* refresh */
     if (dup_meta && src_meta) {
         dup_meta->tag_color       = src_meta->tag_color;
         dup_meta->enabled         = src_meta->enabled;
         snprintf(dup_meta->tag, sizeof(dup_meta->tag), "%s", src_meta->tag);
+        /* And the engine's authorities, which the editor-side copy above does
+         * not touch.  A duplicated entity used to lose BOTH: gameplay could
+         * not find it by tag, and the camera culling mask put it back on layer
+         * 0 -- while the Hierarchy showed the tag and the Inspector showed the
+         * layer, because those read the editor-side copy. */
+        dup_meta->layer = src_meta->layer;
+        jce_scene_set_entity_tag_name(s.scene, jce_state_to_ecs_entity(dup), src_meta->tag);
+        jce_scene_set_entity_layer(s.scene, jce_state_to_ecs_entity(dup),
+                                   jce_scene_get_entity_layer(
+                                       s.scene, jce_state_to_ecs_entity(id)));
         dup_meta->prefab_instance = src_meta->prefab_instance;
         /* Already interned in this same scene, so the pointer can be shared
          * directly -- re-interning would find the identical entry anyway. */
@@ -1959,15 +1982,15 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 
     /* Deep-copy all components from src → dup (overwrites the identity
      * Transform that create_entity installed). */
-    duplicate_components((JceEntity)id, (JceEntity)dup);
+    duplicate_components(jce_state_to_ecs_entity(id), jce_state_to_ecs_entity(dup));
 
     /* Recursively duplicate children, reparenting under dup. */
     JceEntity src_children[JCE_MAX_CHILDREN];
-    int cn = jce_scene_get_children(s.scene, (JceEntity)id, src_children, JCE_MAX_CHILDREN);
+    int cn = jce_scene_get_children(s.scene, jce_state_to_ecs_entity(id), src_children, JCE_MAX_CHILDREN);
     for (int i = 0; i < cn; ++i) {
         uint32_t child_dup = jce_state_duplicate_entity((uint32_t)src_children[i]);
         if (child_dup != 0) {
-            jce_scene_set_parent(s.scene, (JceEntity)child_dup, (JceEntity)dup);
+            jce_scene_set_parent(s.scene, jce_state_to_ecs_entity(child_dup), jce_state_to_ecs_entity(dup));
             jce_roots_note_reparented(child_dup);
         }
     }
@@ -1982,7 +2005,7 @@ void jce_state_add_component_id(uint32_t entity_id, int comp_id)
     HistoryEditScope edit_scope;
 
     if (!s.scene || entity_id == 0) return;
-    JceEntity e = (JceEntity)entity_id;
+    JceEntity e = jce_state_to_ecs_entity(entity_id);
 
     /* Registry route: dense comp_id -> descriptor row -> registered
      * default-init.  The per-component default bodies (and the Net*
@@ -2017,7 +2040,7 @@ void jce_state_remove_component_id(uint32_t entity_id, int comp_id)
     HistoryEditScope edit_scope;
 
     if (!s.scene || entity_id == 0) return;
-    JceEntity e = (JceEntity)entity_id;
+    JceEntity e = jce_state_to_ecs_entity(entity_id);
 
     /* Registry route: dense comp_id -> descriptor row.  Per-row
      * pre_remove hooks carry the runtime cleanup that used to be

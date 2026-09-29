@@ -37,6 +37,12 @@
 #define JCE_REPL_PKT_SESSION     ((uint8_t)4)
 #define JCE_REPL_PKT_NET_TRANSFORM ((uint8_t)5)
 #define JCE_REPL_PKT_NET_TRANSFORM_V2 ((uint8_t)6)
+#define JCE_REPL_PKT_NET_ANIMATOR         ((uint8_t)7)
+/* 9, NOT 8: 8 is JCE_REPL_PKT_ACK below.  The first draft of this
+ * used 8 and the compiler caught it as a duplicate case -- had the
+ * two ids lived in different files, as the animator's did until this
+ * line, nothing would have. */
+#define JCE_REPL_PKT_NET_ANIMATOR_TRIGGER ((uint8_t)9)
 #define JCE_REPL_PKT_ACK         ((uint8_t)8)   /* client -> server tick ack */
 
 /* P3-D.4 transform replication seam — defined in jce_net_transform.c.
@@ -44,6 +50,7 @@
  * packet types 5 / 6 without pulling the transform module into the
  * public surface of replication. */
 extern void jce__net_transform_recv_packet(const void *data, uint32_t size);
+extern void jce__net_animator_recv_packet (const void *data, uint32_t size);
 
 #define JCE_REPL_EVENT_LISTENER_CAP 16
 
@@ -1157,6 +1164,14 @@ void jce_net_replication_handle_packet(const void *data, uint32_t size)
          * (v2, 26B/entry) decoding.  Mirrors the RPC path. */
         jce__net_transform_recv_packet(data, size);
         break;
+    case JCE_REPL_PKT_NET_ANIMATOR:
+    case JCE_REPL_PKT_NET_ANIMATOR_TRIGGER:
+        /* Animator state (7, unreliable) and triggers (8, reliable).  Same
+         * shape as the transform path above: the whole packet including its
+         * type byte goes to the module's decoder, which re-reads the type so
+         * it stays independent of this switch. */
+        jce__net_animator_recv_packet(data, size);
+        break;
     default:
         LOG_WARN(LOG_TAG, "unknown packet type %u (size=%u)",
                  (unsigned)type, (unsigned)size);
@@ -1305,6 +1320,31 @@ void jce_net_replication_tick(JceNetTick tick)
             }
             ++i;
         }
+    } else if (g_repl.role == JCE_NET_ROLE_SERVER) {
+        /* SERVER with no host yet -- single-player, or before listen().
+         *
+         * jce_net_object_despawn() does the local teardown immediately and
+         * keeps the table entry only so the next outbound packet can name the
+         * id.  With no host there is no outbound packet, so without this the
+         * entry is retained forever: every despawn permanently consumes an
+         * object-table slot and jce_net_object_count() never comes back down.
+         *
+         * pending_spawn is deliberately NOT cleared here.  Clearing it is
+         * correct only once the spawn has actually been broadcast; if a host
+         * attaches later, that spawn still has to go out.
+         *
+         * Found 2026-08-31 by running jce_net_replication_self_test() for the
+         * first time -- it asserts jce_net_object_count() == 0 after a
+         * despawn+tick and had never been called by anything. */
+        for (uint32_t i = 0; i < g_repl.object_count;) {
+            ObjectEntry *e = &g_repl.objects[i];
+            if (e->pending_despawn) {
+                baseline_drop_object(e->id);
+                object_table_remove(i);
+                continue;
+            }
+            ++i;
+        }
     }
 
     /* Client-side packet drain: poll the attached host on the
@@ -1358,8 +1398,8 @@ bool jce__rpc_transport_send(JcePeerHandle peer,
 /* ================================================================== */
 /* Built-in self-test (debug builds only)                              */
 /* ================================================================== */
-#ifndef NDEBUG
-#include <assert.h>
+#ifdef JCE_SELF_TESTS
+#include <jce/os/core/jce_assert.h>
 
 static int self_write(void *dst, uint32_t cap, const void *c, void *u)
 {
@@ -1397,7 +1437,7 @@ void jce_net_replication_self_test(void)
     jce_net_replication_init();
     jce_net_replication_set_role(JCE_NET_ROLE_SERVER);
     jce_net_replication_set_local_client_id(JCE_CLIENT_SERVER);
-    assert(jce_net_local_client_id() == JCE_CLIENT_SERVER);
+    JCE_ASSERT(jce_net_local_client_id() == JCE_CLIENT_SERVER);
 
     JceNetCompDesc cd;
     memset(&cd, 0, sizeof(cd));
@@ -1407,46 +1447,46 @@ void jce_net_replication_self_test(void)
     cd.write   = self_write;
     cd.read    = self_read;
     jce_net_replication_register_component(&cd);
-    assert(jce_net_replication_component_count() >= 1);
+    JCE_ASSERT(jce_net_replication_component_count() >= 1);
 
     g_selftest_events = 0;
     uint32_t lh = jce_net_object_add_event_listener(self_event, NULL);
-    assert(lh != 0);
+    JCE_ASSERT(lh != 0);
 
     JceNetObjectDesc d;
     memset(&d, 0, sizeof(d));
     d.prefab_path = "test/prefab";
     d.owner       = JCE_CLIENT_SERVER;
     JceNetObjectId id = jce_net_object_spawn(&d);
-    assert(id != JCE_NET_OBJECT_INVALID);
-    assert(jce_net_object_owner(id) == JCE_CLIENT_SERVER);
-    assert(jce_net_object_from_entity(jce_net_object_to_entity(id)) == id
+    JCE_ASSERT(id != JCE_NET_OBJECT_INVALID);
+    JCE_ASSERT(jce_net_object_owner(id) == JCE_CLIENT_SERVER);
+    JCE_ASSERT(jce_net_object_from_entity(jce_net_object_to_entity(id)) == id
            || jce_net_object_to_entity(id) == 0u);
-    assert(g_selftest_events >= 1);
-    assert(g_selftest_last_event == JCE_NETOBJ_SPAWNED);
-    assert(g_selftest_last_id == id);
+    JCE_ASSERT(g_selftest_events >= 1);
+    JCE_ASSERT(g_selftest_last_event == JCE_NETOBJ_SPAWNED);
+    JCE_ASSERT(g_selftest_last_id == id);
 
     /* Authority: server has authority over everything. */
-    assert(jce_net_object_has_authority(id));
+    JCE_ASSERT(jce_net_object_has_authority(id));
 
     /* Ownership transfer to client #5. */
     bool ok = jce_net_object_set_owner(id, (JceClientId)5);
-    assert(ok);
-    assert(jce_net_object_owner(id) == 5);
-    assert(g_selftest_last_event == JCE_NETOBJ_OWNER_CHANGED);
-    assert(g_selftest_last_owner == 5);
+    JCE_ASSERT(ok);
+    JCE_ASSERT(jce_net_object_owner(id) == 5);
+    JCE_ASSERT(g_selftest_last_event == JCE_NETOBJ_OWNER_CHANGED);
+    JCE_ASSERT(g_selftest_last_owner == 5);
     /* Server still has authority regardless of owner. */
-    assert(jce_net_object_has_authority(id));
+    JCE_ASSERT(jce_net_object_has_authority(id));
 
     /* Despawn fires event. */
     int before = g_selftest_events;
     jce_net_object_despawn(id);
     jce_net_replication_tick(0u);
-    assert(jce_net_object_count() == 0u);
-    assert(g_selftest_events > before);
-    assert(g_selftest_last_event == JCE_NETOBJ_DESPAWNED);
+    JCE_ASSERT(jce_net_object_count() == 0u);
+    JCE_ASSERT(g_selftest_events > before);
+    JCE_ASSERT(g_selftest_last_event == JCE_NETOBJ_DESPAWNED);
 
     jce_net_object_remove_event_listener(lh);
     jce_net_replication_shutdown();
 }
-#endif /* NDEBUG */
+#endif /* JCE_SELF_TESTS */

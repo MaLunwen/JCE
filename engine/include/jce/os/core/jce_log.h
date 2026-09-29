@@ -180,14 +180,39 @@ JCE_EXTERN_C_END
 
 /* -- Convenience macros (capture __FILE__ and __LINE__) ------------ */
 
-#ifdef JCE_DIST
-/* Dist builds: all logging compiled out. */
+#ifdef JCE_LOG_NONE
+/* No logging at all: for host tools that link the engine's codecs but not its
+ * async log backend (jce_cook is the one such target).  This used to be spelled
+ * JCE_DIST, which conflated "a lean host tool" with "a shipping game" -- so the
+ * moment the dist variant kept a level, the cook tool stopped linking.  They are
+ * different questions and now have different switches. */
 #define LOG_TRACE(tag, ...)   ((void)0)
 #define LOG_DEBUG(tag, ...)   ((void)0)
 #define LOG_INFO(tag, ...)    ((void)0)
 #define LOG_SUCCESS(tag, ...) ((void)0)
 #define LOG_WARN(tag, ...)    ((void)0)
 #define LOG_ERROR(tag, ...)   ((void)0)
+#elif defined(JCE_DIST)
+/* Dist builds keep WARN and ERROR; everything chattier is compiled out.
+ *
+ * Until 2026-08-31 this block silenced all six, and CMakeLists.txt puts
+ * JCE_DIST=1 PUBLIC on jce_core for the dist variant (and JCESDKHelpers.cmake
+ * puts it on every SDK consumer exe), so a shipped game emitted nothing: 1477
+ * LOG_* statements in engine/src and 93 in caged_kingdom, all `((void)0)`.
+ * Paired with a dist link that produced no .pdb, a player-reported crash came
+ * back as an unsymbolizable minidump with no log beside it.
+ *
+ * TRACE/DEBUG/INFO/SUCCESS stay compiled out: they are the per-frame and
+ * per-asset chatter the level was introduced to remove, and jce_log's ring is
+ * 4096 slots deep, so leaving them in would cost throughput and drown the two
+ * levels that matter.  WARN and ERROR are, by their own contract, the ones a
+ * shipped build has to be able to say out loud. */
+#define LOG_TRACE(tag, ...)   ((void)0)
+#define LOG_DEBUG(tag, ...)   ((void)0)
+#define LOG_INFO(tag, ...)    ((void)0)
+#define LOG_SUCCESS(tag, ...) ((void)0)
+#define LOG_WARN(tag, ...)    jce_log_write(JCE_LOG_LEVEL_WARN,  tag, __FILE__, __LINE__, __VA_ARGS__)
+#define LOG_ERROR(tag, ...)   jce_log_write(JCE_LOG_LEVEL_ERROR, tag, __FILE__, __LINE__, __VA_ARGS__)
 #else
 #define LOG_TRACE(tag, ...)   jce_log_write(JCE_LOG_LEVEL_TRACE,   tag, __FILE__, __LINE__, __VA_ARGS__)
 #define LOG_DEBUG(tag, ...)   jce_log_write(JCE_LOG_LEVEL_DEBUG,   tag, __FILE__, __LINE__, __VA_ARGS__)

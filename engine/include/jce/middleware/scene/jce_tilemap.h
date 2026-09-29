@@ -56,6 +56,11 @@ JCE_API void             jce_tilemap_unload(JceTilemapAsset *t);
 
 JCE_API uint32_t         jce_tilemap_width (const JceTilemapAsset *t);
 JCE_API uint32_t         jce_tilemap_height(const JceTilemapAsset *t);
+
+/* Cell size in pixels as authored in the .tilemap file, or 0 when omitted.
+ * The reference JceTilemapComponent.cell_size_px overrides: a component that
+ * asks for half this draws half-size cells. */
+JCE_API uint32_t         jce_tilemap_cell_px(const JceTilemapAsset *t);
 /* Tile id at (x,y): 0 = empty, k = tileset rect k-1.  OOB returns 0. */
 JCE_API uint32_t         jce_tilemap_tile_at(const JceTilemapAsset *t, uint32_t x, uint32_t y);
 /* The "sprites" key authored into the map (may be "" when absent). */

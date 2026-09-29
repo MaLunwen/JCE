@@ -16,15 +16,19 @@
 
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
+#include <jce/middleware/scene/jce_scene_probe_capture.h>
+#include <jce/middleware/scene/jce_scene_camera.h>
 #include <jce/os/core/jce_console.h>  /* r.taa cvar query for game-view TAA */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_render_pipeline.h>  /* scene_extent: one answer, shared with the shipped runtime */
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_occlusion_culler.h>
+#include <jce/renderer/jce_impostor.h>   /* modal bake owns the frame */
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
@@ -60,6 +64,18 @@ struct GameRenderState {
     uint16_t               postfx_output_tex = UINT16_MAX;
     uint16_t               render_width      = 0;
     uint16_t               render_height     = 0;
+    /* The renderer frame in which render_width/height were last written, and
+     * whether they have EVER been written.  A SIZE ALONE IS NOT ENOUGH.
+     *
+     * The panel only calls jce_editor_game_render_frame() when ImGui::Begin
+     * returns true, which it does not for a background tab -- and nothing
+     * clears the extent when the panel stops drawing.  So a Game View that
+     * was in front once and is now behind another tab leaves a perfectly
+     * plausible 1380x898 sitting here forever, describing a frame nobody is
+     * drawing.  A size guard cannot tell that apart from a live panel; only
+     * "was this written for the frame we are capturing" can. */
+    uint32_t               extent_frame      = 0u;
+    bool                   extent_written    = false;
 
     /* GPU-query occlusion culler (Play / game-view).  The game view shares the
      * ENGINE scene renderer with the scene view but renders in its own pass with
@@ -68,7 +84,7 @@ struct GameRenderState {
      * proxy view id (253) from the scene-view culler (which keeps the config
      * default, 252) so the two never clobber each other's depth-only proxy pass
      * when both panels render in the same bgfx frame.  NULL when
-     * JCE_DISABLE_OCCLUSION is set or hardware queries are unsupported (silent
+     * occlusion is disabled or hardware queries are unsupported (silent
      * always-visible fallback). */
     JceOcclusionCuller    *occlusion_culler  = nullptr;
 
@@ -107,7 +123,9 @@ GameRenderState g;
  * Engine scene renderer expects shadow views at base+10..+13 and post
  * stages around base+20, so picking 80 keeps us out of every other slot
  * the editor uses. */
-constexpr uint16_t GAME_VIEW_BASE = 80;
+/* The base itself now lives in jce_editor_viewport_common.h, beside the
+ * Scene View's, so the view-id spacing assertions can see both. */
+constexpr uint16_t GAME_VIEW_BASE = JCE_EDITOR_GAME_VIEW_BASE;
 
 void game_reset_camera_internal(void)
 {
@@ -119,6 +137,31 @@ void game_reset_camera_internal(void)
 }
 
 } /* anon namespace */
+
+/* A NAMED FUNCTION WITH THE EXPLICIT CONVENTION, not a lambda.
+ *
+ * JceAutoCaptureFn carries JCE_CALL, which is `__cdecl` on Windows.  A
+ * capture-less lambda converts to a function pointer with the compiler's
+ * DEFAULT convention, and on x64 that happens to be the same -- so a lambda
+ * would work here and silently not on x86, where __cdecl and the default
+ * differ and the mismatch is a corrupted stack rather than a compile error.
+ *
+ * AND C LANGUAGE LINKAGE, which is the second half of the same point.
+ * JceAutoCaptureFn is declared inside jce_renderer.h's JCE_EXTERN_C_BEGIN,
+ * so it is a pointer to a C-LINKAGE function.  Assigning a C++-linkage one
+ * to it is formally ill-formed -- every compiler in this tree accepts it,
+ * which is exactly why it would go unnoticed until one did not.
+ *
+ * Declining is normal rather than a failure: no Game View panel means no
+ * offscreen target, and the renderer then falls back to the backbuffer,
+ * which is exactly what this editor did before the hook existed. */
+extern "C" {
+static bool JCE_CALL game_view_auto_capture(void *user, const char *path)
+{
+    (void)user;
+    return jce_editor_game_render_screenshot(path);
+}
+}
 
 bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
                                  const JcePakArchive *pak)
@@ -157,6 +200,24 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
     LOG_INFO(LOG_TAG, "[init] game view renderer ready (view id=%u)",
              (unsigned)GAME_VIEW_BASE);
 
+    /* THE AUTOMATED CAPTURE (JCE_CAPTURE_FRAME) NOW PHOTOGRAPHS THE GAME
+     * VIEW, not the backbuffer.
+     *
+     * The backbuffer in this process carries the ImGui layer, so an
+     * automated capture of it contains the editor rather than the project --
+     * and the profiler panel draws a CLOCK into it: measured, 53,089 of
+     * 3,911,680 pixels differ between two runs of one input digest, every one
+     * inside rows 1080..1526, with the rendered scene above byte-identical.
+     * That band is why an editor-sourced run directory cannot be
+     * byte-reproducible, and app.run says so in its result today.
+     *
+     * jce_editor_game_render_screenshot reads the texture the Game View
+     * DISPLAYS -- postfx output when there is one, else the bridge's colour
+     * attachment, with the y-flip that belongs to whichever it is.  That is
+     * the distinction a framebuffer-index API could not express, and is why
+     * this is a hook. */
+    jce_renderer_set_auto_capture_hook(game_view_auto_capture, nullptr);
+
     /* ECS-UI Canvas renderer (Screen-Space Overlay over the game view). */
     g.ui_canvas = jce_ui_canvas_create(renderer, pak);
     if (!g.ui_canvas)
@@ -183,17 +244,21 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
      * mirroring the scene-view (jce_editor_scene_render.cpp).  Activating it here
      * is what makes Play / shipped-equivalent rendering skip fully-hidden
      * geometry in a dense world (previously occlusion ran ONLY in the editor
-     * scene-view).  Opt-OUT via JCE_DISABLE_OCCLUSION=1 for A/B measurement and
+     * scene-view).  Opt-IN via JCE_ENABLE_OCCLUSION=1 for A/B measurement and
      * as a safety hatch (mirrors JCE_DISABLE_WCACHE / JCE_STREAM_SYNC).  Degrades
      * silently to always-visible when hardware queries are unsupported. */
-    if (jce_editor_viewport_occlusion_disabled()) {
+    if (!jce_editor_viewport_occlusion_enabled()) {
         LOG_INFO(LOG_TAG,
-                 "[init] JCE_DISABLE_OCCLUSION set — game-view occlusion culling OFF");
+                 "[init] %s occlusion culling OFF (%s)", "game-view",
+                 jce_editor_viewport_occlusion_forced_by_env()
+                     ? "JCE_ENABLE_OCCLUSION=0"
+                     : "off by default; enable with Preferences > Viewport > occlusion culling, or JCE_ENABLE_OCCLUSION=1");
     } else {
         /* Proxy view 253 — distinct from the scene-view culler's so both can
          * run in the same bgfx frame without clobbering each other. */
         g.occlusion_culler =
-            jce_editor_viewport_create_occlusion_culler(renderer, 253);
+            jce_editor_viewport_create_occlusion_culler(
+                renderer, JCE_VIEW_EDITOR_GAME_OCCLUSION);
         if (!g.occlusion_culler)
             LOG_WARN(LOG_TAG,
                      "[init] occlusion culler creation failed (game-view culling disabled)");
@@ -222,6 +287,15 @@ void jce_editor_game_render_shutdown(void)
     if (g.window) {
         jce_window_set_mouse_rect(g.window, 0, 0, 0, 0);
     }
+    /* CLEAR THE HOOK FIRST, before anything it reads is destroyed.
+     *
+     * The renderer holds a pointer to game_view_auto_capture, which reads
+     * g.bridge and g.postfx_output_tex.  A capture requested after this
+     * function frees them would run the hook against a destroyed target --
+     * and a hook that outlives its state does not fail loudly, it reads
+     * whatever is at that address now. */
+    jce_renderer_set_auto_capture_hook(nullptr, nullptr);
+
     if (g.mouse_captured && g.window) {
         jce_window_set_relative_mouse_mode(g.window, false);
         jce_window_set_mouse_grab(g.window, false);
@@ -378,10 +452,97 @@ uint16_t jce_editor_game_render_get_texture(void)
     return jce_offscreen_target_get_color_texture(g.bridge);
 }
 
+/* Below this in EITHER dimension the Game View panel is collapsed, not a view,
+ * and its target is not a picture of anything.
+ *
+ * MEASURED, and it is why this constant exists rather than a bare `!= 0`.
+ * The first version of the automated-capture hook tested only for zero, and
+ * an `app.run` through the editor -- a hidden window, so the panel gets
+ * whatever ImGui's minimum content region is -- captured a 16x16, 328-byte
+ * PNG.  The run before the hook shipped captured 2560x1528 at 970 KB.  So the
+ * hook replaced a full frame that had a clock in the bottom band with an image
+ * containing nothing at all, which is strictly worse: the clock made the frame
+ * non-reproducible, the 16x16 makes it non-evidence.
+ *
+ * NOTHING CAUGHT IT.  The capture was non-blank, written to the right path,
+ * reported as a success, and app.run's own content guard returned
+ * `has_content: null` with "guard could not run: sampled no pixels -- the crop
+ * window is outside the image (16x16)" -- a guard that cannot run reports
+ * neither pass nor fail, so the gate stayed green over a capture of nothing.
+ * 64 is not a tuned number: it is an order of magnitude below any real panel
+ * and an order of magnitude above the degenerate case that was observed. */
+#define JCE_EDITOR_GAME_VIEW_MIN_CAPTURE_PX 64
+
+/* How many renderer frames old the Game View's extent may be and still
+ * describe the frame being captured.
+ *
+ * MEASURED AT 0, AND MY FIRST EXPLANATION FOR IT WAS WRONG.  I reasoned
+ * that the capture site (jce_renderer.c:1954, inside jce_renderer_end_frame)
+ * runs AFTER bgfx_frame() advances s_bgfx_frame_index at :1878, so the age
+ * would always be at least 1 and a strict equality would decline every time.
+ * Then I forced this constant to 0 and rebuilt: the capture still fired.
+ * :1878 is the tail of jce_renderer_begin_frame -- the 2D/fallback path the
+ * editor does not take.  The editor goes through begin_frame_3d, so the only
+ * advance is at :2037, AFTER the capture.  Age is 0.
+ *
+ * 1, not 0, only so the 2D begin_frame path -- where the index does advance
+ * once before end_frame -- is also covered.  Both numbers come from
+ * measurement, not from taste.  A panel that has stopped drawing exceeds
+ * this on the very next frame and then diverges without bound, so the window
+ * separates one frame of pipeline from a dead panel by orders of magnitude. */
+#define JCE_EDITOR_GAME_VIEW_EXTENT_MAX_AGE 1
+
 bool jce_editor_game_render_screenshot(const char *path)
 {
     if (!g.initialized || !g.bridge || !path || !path[0] ||
         g.render_width == 0 || g.render_height == 0) {
+        return false;
+    }
+    if (g.render_width  < JCE_EDITOR_GAME_VIEW_MIN_CAPTURE_PX ||
+        g.render_height < JCE_EDITOR_GAME_VIEW_MIN_CAPTURE_PX) {
+        /* DECLINE, which is a normal answer: the caller falls back to the
+         * backbuffer, and a backbuffer frame carrying the editor is at least
+         * a photograph of something.  Logged because "the automated capture
+         * quietly became the other path" is exactly the kind of change that
+         * is invisible until someone compares two run directories. */
+        LOG_INFO(LOG_TAG, "[capture] Game View is %ux%u -- below %d px, "
+                          "declining so the capture falls back to the "
+                          "backbuffer rather than photographing a collapsed "
+                          "panel",
+                 (unsigned)g.render_width, (unsigned)g.render_height,
+                 JCE_EDITOR_GAME_VIEW_MIN_CAPTURE_PX);
+        return false;
+    }
+    /* IS THE EXTENT ABOUT THE FRAME WE ARE CAPTURING?
+     *
+     * The size guard above catches a panel that has NEVER drawn at a usable
+     * size.  It cannot catch the other half: a Game View that WAS in front,
+     * wrote 1380x898 here, and is now the background tab.  ImGui::Begin
+     * returns false for a background tab, so the panel body is skipped and
+     * jce_editor_game_render_frame() stops being called -- and nothing clears
+     * the extent.  The stale value is large, plausible, and describes a frame
+     * nobody is drawing, so the capture would photograph a frozen target and
+     * report success.  A stale-but-plausible reading and a live one are
+     * indistinguishable by size; only the frame they belong to separates
+     * them.
+     *
+     * THE WINDOW IS MEASURED, NOT GUESSED -- see
+     * JCE_EDITOR_GAME_VIEW_EXTENT_MAX_AGE, whose comment records that the
+     * observed age on the editor's path is 0 and that my first reasoning for
+     * why it could not be 0 was wrong. */
+    const uint32_t now = g.renderer ? jce_renderer_get_frame_index(g.renderer)
+                                    : 0u;
+    /* Unsigned: a wrapped or reordered counter must not read as "fresh". */
+    const uint32_t age = (now >= g.extent_frame) ? (now - g.extent_frame)
+                                                 : UINT32_MAX;
+    if (!g.extent_written || age > JCE_EDITOR_GAME_VIEW_EXTENT_MAX_AGE) {
+        LOG_INFO(LOG_TAG, "[capture] Game View extent is from frame %u, this "
+                          "is frame %u (age %u > %d, written=%d) -- the panel "
+                          "is not drawing, declining so the capture falls "
+                          "back to the backbuffer rather than photographing a "
+                          "frozen target",
+                 (unsigned)g.extent_frame, (unsigned)now, (unsigned)age,
+                 JCE_EDITOR_GAME_VIEW_EXTENT_MAX_AGE, (int)g.extent_written);
         return false;
     }
 
@@ -395,10 +556,40 @@ int jce_editor_game_render_capture_poll(void)
     return jce_renderer_readback_capture_poll();
 }
 
+/* `width`/`height` are the PANEL's size -- the rectangle the finished image
+ * is stretched into.  Everything that touches the offscreen chain uses
+ * render_w/render_h instead (computed at the top of this function): the
+ * bridge, the postfx chain, TAA's jitter, the fullscreen effects and the
+ * composite all have to agree on one size, and the panel is not it.
+ *
+ * They agreed by accident while render_scale reached nothing.  The first time
+ * the two differed, four of the five stages kept using the panel size and the
+ * scene came out in the top-left corner of a black frame. */
 void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 {
     if (!g.initialized || !g.renderer) return;
     if (width == 0 || height == 0) return;
+
+    /* THE size of the offscreen chain, asked once.  See the note above the
+     * function: the panel size is for the ImGui image and nothing else. */
+    uint32_t render_w = width, render_h = height;
+    jce_render_pipeline_scene_extent(width, height, &render_w, &render_h);
+
+    /* A modal impostor bake owns the frame's view ids (127..227), which is
+     * inside this viewport's range under any base that fits in 256 views.
+     * Yield rather than share: the panel shows its last frame for the two or
+     * three frames a bake takes.  That is what an Unreal HLOD build and a
+     * Unity lightmap bake do with the live viewport, and the alternative is
+     * the failure this whole band of work exists to remove -- two owners on
+     * one view id and one of them silently producing nothing.
+     *
+     * The bake is driven from the Inspector / the QA harness, not from here,
+     * so skipping this render does not stall it. */
+    if (jce_impostor_bake_in_flight()) return;
+    /* ...and to a probe capture, for the same reason: it renders the scene
+     * from a viewport base id while it runs.  The Scene View drives it; this
+     * viewport only steps aside. */
+    if (jce_scene_probe_capture_in_flight()) return;
 
     JceSceneRenderer *engine_sr = jce_editor_get_scene_renderer();
     JceScene         *scene     = jce_state_get_scene();
@@ -477,6 +668,54 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * before matrices are built.  The panel used to evaluate it after this
      * render call, which made editor Play exactly one visual frame late. */
     if (play_active) {
+        /* THE AUTHORED CAMERA FIRST, which nothing here used to apply.
+         *
+         * This block only ever asked the VCam system, so a scene whose view
+         * is an ordinary authored Camera component -- no VirtualCamera
+         * anywhere -- was rendered by Play from game_reset_camera_internal's
+         * default: eye level at (0, 1.7, 6) looking at the origin, 60-degree
+         * perspective.  The shipped game meanwhile called
+         * jce_scene_camera_apply_primary() and used the camera the scene
+         * authored.
+         *
+         * So the two halves rendered the same scene from two different
+         * cameras, and the logic was IDENTICAL while doing it -- measured on
+         * a top-down board game: the per-tick trace matched the shipped exe
+         * tick for tick, and 99.989% of the pixels differed, because Play was
+         * looking at the board edge-on from ground level.
+         *
+         * The VCam override below still wins, exactly as it does in the
+         * runtime: authored pose first, virtual camera on top of it. */
+        JceSceneCameraPose cpose;
+        const JceSceneCameraResolveResult cres =
+            jce_scene_camera_apply_primary(scene, g.camera, &cpose);
+        /* Say it ONCE when the scene cannot supply a camera.  Silently
+         * keeping the default is how this whole defect stayed invisible:
+         * Play renders something plausible from a camera nobody authored,
+         * and "my scene looks wrong in Play" has no line anywhere to
+         * attach itself to.  Each distinct outcome is reported once so a
+         * scene switch reports again without spamming a frame loop. */
+        {
+            static JceSceneCameraResolveResult s_said =
+                JCE_SCENE_CAMERA_RESOLVE_OK;
+            if (cres != JCE_SCENE_CAMERA_RESOLVE_OK && cres != s_said) {
+                s_said = cres;
+                const char *why =
+                    cres == JCE_SCENE_CAMERA_RESOLVE_NOT_FOUND
+                        ? "no entity has a primary Camera"
+                    : cres == JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS
+                        ? "more than one primary Camera"
+                    : cres == JCE_SCENE_CAMERA_RESOLVE_INVALID_POSE
+                        ? "the primary Camera's transform is not a valid pose"
+                        : "invalid argument";
+                LOG_WARN(LOG_TAG,
+                         "Play is using the default camera: %s. The shipped "
+                         "game resolves the same way, so it will look the "
+                         "same there -- this is the scene, not the editor.",
+                         why);
+            }
+        }
+
         JceVcamOutput output;
         bool has_vcam = false;
         jce_vcam_system_evaluate(scene, frame_dt, &output, &has_vcam);
@@ -497,16 +736,50 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     jce_mat4 view = jce_camera_view(g.camera);
     jce_mat4 proj = jce_camera_proj(g.camera, aspect, g.homogeneous_depth);
 
+    /* Camera.clearFlags, resolved ONCE here because both halves of the answer
+     * are needed and they are needed at different moments: what the target
+     * clears is decided by the prepare below, and whether the sky draws is
+     * decided by the render config further down.  Resolving twice would let a
+     * scene edit between the two land in one answer and not the other. */
+    JceSceneCameraPose base_pose;
+    memset(&base_pose, 0, sizeof base_pose);
+    bool have_base_pose = false;
+    {
+        JceScene *cscene = jce_state_get_scene();
+        if (cscene && jce_scene_camera_resolve_primary(cscene, &base_pose) ==
+                          JCE_SCENE_CAMERA_RESOLVE_OK)
+            have_base_pose = true;
+    }
+    bool base_keep_color = false, base_keep_depth = false;
+    if (have_base_pose)
+        jce_scene_camera_clear_keeps(base_pose.clear_mode,
+                                     &base_keep_color, &base_keep_depth);
+
     /* ── TAA (game view) ──────────────────────────────────────────────
      * When r.taa is on, sub-pixel-jitter THIS view's colour-pass projection and
      * arm g.postfx's TAA resolve against per-object motion vectors produced by
      * the shared scene renderer's velocity pre-pass.  Jitter only the colour
      * pass; the motion vectors use the CLEAN (un-jittered) matrices. */
+    /* TAA, on the SAME condition the shipped runtime uses.
+     *
+     * Between 2026-09-22 and this commit this was pinned off, because the
+     * runtime could not resolve TAA at all: jce_scene_renderer_taa_begin_frame()
+     * had exactly one caller in the tree and it was the editor's Scene view, so
+     * this panel -- whose entire job is to show what the player will see -- was
+     * showing a temporally anti-aliased image no build produced.  Measured then:
+     * forcing it off on both sides took a static frame from 12.50% of pixels
+     * differing to 2.98%.
+     *
+     * jce_default_main.inc.h now drives TAA the way jce_scene_renderer.h
+     * documents, so r.taa is once more the right condition on both sides and
+     * the pin is gone.  examples/snake_seven/parity.py asserts the two hosts
+     * agree about it, so a future divergence is a named FAIL and not a pixel
+     * count. */
     static const JceCvar *s_cv_taa = jce_cvar_find("r.taa");
     bool game_taa_on = s_cv_taa ? jce_cvar_get_bool(s_cv_taa) : false;
     jce_mat4 color_proj = proj;
     if (game_taa_on && g.postfx) {
-        jce_taa_advance(&g.taa_state, width, height);
+        jce_taa_advance(&g.taa_state, render_w, render_h);
         jce_taa_apply_jitter(&color_proj, g.taa_state.current_jitter);
 
         jce_mat4 view_proj = jce_m4_multiply(&proj, &view);
@@ -535,15 +808,43 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         jce_postfx_set_taa(g.postfx, false, 0.9f, 1.0f, 1.0f);
     }
 
-    if (!jce_offscreen_target_prepare(
-            g.bridge, width, height,
+    /* The Game view renders at the SHIPPED resolution, not at the panel's:
+     * jce_render_pipeline_scene_extent composes the authored render_scale with
+     * the low-tier pixel budget exactly as the standalone runtime does, so a
+     * designer dragging that slider sees what the player will see and the two
+     * cannot disagree.  The Scene view deliberately does NOT do this -- its
+     * picking and gizmos are calibrated to the panel, and Unity draws the same
+     * line: URP's Render Scale applies to the Game view only.
+     *
+     * The texture is presented stretched to the panel either way, and the only
+     * consumer of the recorded extent is the screenshot path, so a scaled
+     * target changes no input mapping. */
+    if (!jce_offscreen_target_prepare_keep(
+            g.bridge, static_cast<int>(render_w), static_cast<int>(render_h),
             view.raw[0], color_proj.raw[0],   /* jittered when game TAA on */
-            0x202028FFu,
+            /* THE SAME CLEAR COLOUR THE RUNTIME USES, not an editor tone.
+             *
+             * This was 0x202028FF -- a dark editor slate.  The shipped game
+             * clears a scene camera's view to 0x000000FF
+             * (jce_sr_camera_stack.c), so the Game View, whose entire job is
+             * to show what the player will see, showed it on a different
+             * background from the player's.
+             *
+             * Measured on a board that does not fill the frame: 23% of all
+             * differing pixels between a Game View capture and the shipped
+             * game's frame were this one colour, everywhere the scene does
+             * not draw. */
+            0x000000FFu,
+            base_keep_color, base_keep_depth,
             "EditorGame")) {
         return;
     }
-    g.render_width = static_cast<uint16_t>(width);
-    g.render_height = static_cast<uint16_t>(height);
+    g.render_width = static_cast<uint16_t>(render_w);
+    g.render_height = static_cast<uint16_t>(render_h);
+    /* Stamp the frame this extent belongs to.  Read by the screenshot path to
+     * refuse an extent left behind by a panel that has stopped drawing. */
+    g.extent_frame = g.renderer ? jce_renderer_get_frame_index(g.renderer) : 0u;
+    g.extent_written = true;
 
     /* GPU-upload any completed async mesh/texture loads before the engine
      * renderer queries them this frame. Previously only the Scene View did
@@ -573,6 +874,14 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                                : paths.particle_asset_root.c_str();
         jce_scene_particles_set_asset_root(root);
         jce_ui_canvas_set_asset_root(root);
+        /* The project's fallback face for any UIText with an empty fontPath.
+         * It used to be reachable only from a project's own main(), so the
+         * editor rendered such text in the engine's built-in font while the
+         * shipped exe rendered it in the project's -- different outlines,
+         * different advance widths, therefore different line breaks. */
+        jce_ui_canvas_set_default_font(proj ? proj->ui_default_font : nullptr);
+        jce_ui_canvas_set_font_fallbacks(proj ? proj->ui_font_fallbacks
+                                            : nullptr);
     }
 
     /* Game view always uses the shipped "shaded" pipeline — no debug
@@ -581,10 +890,57 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     cfg.view_mode = JCE_SCENE_VIEW_SHADED;
 
+    /* Camera culling mask (Unity's Camera.cullingMask), from the scene's
+     * authored primary camera -- the same source the shipped drop-in main
+     * reads, so what Play shows is what the build renders.
+     *
+     * GAME VIEW ONLY.  It is deliberately NOT in
+     * jce_editor_viewport_apply_shared_config, which the Scene View also
+     * calls: hiding masked objects from the Scene View would make them
+     * unselectable and un-editable, and Unity keeps them visible there.  That
+     * is why this sits at the call site instead of the shared helper whose
+     * comment otherwise demands both viewports agree.
+     *
+     * Re-resolved per frame rather than cached because the Inspector can
+     * change the mask between frames and the designer expects to see it; the
+     * scan is skipped entirely when no scene is open. */
+    static JceSceneCameraPose s_overlay_pose[JCE_VIEW_SR_CAMERA_OVERLAY_MAX];
+    static uint8_t             s_overlay_count = 0;
+    {
+        JceScene *gscene = jce_state_get_scene();
+        cfg.camera_culling_mask = 0u;
+        /* CAMERA STACKING.  Resolved BEFORE the base render because the count
+         * decides the view ORDER: the overlay views have to be named ahead of
+         * everything that reads the scene colour they draw into.  Re-resolved
+         * per frame for the same reason the mask is -- the Inspector can add
+         * an overlay between frames. */
+        s_overlay_count = 0;
+        if (gscene &&
+            jce_scene_camera_resolve_stack(gscene, s_overlay_pose,
+                                           JCE_VIEW_SR_CAMERA_OVERLAY_MAX,
+                                           &s_overlay_count) !=
+            JCE_SCENE_CAMERA_RESOLVE_OK)
+            s_overlay_count = 0;   /* ambiguous / degenerate: draw the base alone */
+        cfg.camera_overlay_count = s_overlay_count;
+        if (have_base_pose) {
+            {
+                const JceSceneCameraPose &gpose = base_pose;
+                cfg.camera_culling_mask = gpose.culling_mask;
+                /* Camera.clearFlags, from the SAME resolve.  The Game View is
+                 * the runtime-parity surface, so it answers this the way the
+                 * shipped exe does; the Scene View keeps the Show > Skybox
+                 * flag (jce_editor_scene_render.cpp), which is a viewing aid
+                 * and not something the scene authored. */
+                cfg.draw_skybox =
+                    jce_scene_camera_clear_draws_skybox(gpose.clear_mode);
+            }
+        }
+    }
+
     /* Bridge FBO, panel resolution, volumetric fog, SSR and GI — the plumbing
      * that must be identical on both editor render paths (see
      * jce_editor_viewport_common.h). */
-    jce_editor_viewport_apply_shared_config(&cfg, g.bridge, width, height,
+    jce_editor_viewport_apply_shared_config(&cfg, g.bridge, render_w, render_h,
                                             jce_state_get_scene());
 
     cfg.viewport_id = 0;   /* Game viewport slot (Scene = 1): own TAA prev camera */
@@ -597,7 +953,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
     /* Two-pass GPU-query occlusion culling (Play / game-view).  Mirrors the
      * scene-view: the renderer drives begin_frame / entity_visible / submit_query
-     * internally from this pointer.  NULL when JCE_DISABLE_OCCLUSION is set or
+     * internally from this pointer.  NULL when occlusion is disabled or
      * hardware queries are unsupported (always-visible fallback). */
     cfg.occlusion_culler = g.occlusion_culler;
 
@@ -623,6 +979,47 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     /* Pass real dt only while actually PLAYING — paused/stopped states
      * should freeze animation, matching Unity's Game View semantics. */
     float render_dt = (play_state == 1) ? frame_dt : 0.0f;
+    /* Before the main render -- see the note in the Scene View. */
+    jce_scene_renderer_render_planar_reflection(engine_sr, scene, g.camera,
+                                                 render_dt);
+    /* THE OVERLAY CAMERAS, SUBMITTED FIRST.  They are DRAWN last -- bgfx runs
+     * views in the order the view-order pass set, and base+64..66 sit after the
+     * base camera's whole run -- but they are SUBMITTED first, because each one
+     * is a second scene render and whichever render runs last is the one whose
+     * per-frame renderer state survives into the composites below.  Submitting
+     * them after the base render left jce_editor_viewport_composite_fog_ssr and
+     * the fullscreen-effect pass reading an overlay's state instead of the base
+     * camera's: an overlay masked to an empty layer, clearing nothing and
+     * drawing nothing, still moved 47% of the pixels around the silhouettes.
+     * Same rule, same reason, as the planar reflection's "FIRST" note in the
+     * shipped runtime.
+     *
+     * One reusable JceCamera: an overlay's pose is applied to it and consumed
+     * inside the call, so there is no per-overlay lifetime. */
+    if (s_overlay_count > 0) {
+        static JceCamera *s_overlay_cam = nullptr;
+        if (!s_overlay_cam) {
+            JceCameraDesc d;
+            memset(&d, 0, sizeof d);
+            d.position = jce_v3(0.0f, 0.0f, 0.0f);
+            d.target   = jce_v3(0.0f, 0.0f, -1.0f);
+            d.up       = jce_v3(0.0f, 1.0f, 0.0f);
+            d.fov_deg  = 60.0f;
+            d.near_plane = 0.1f;
+            d.far_plane  = 1000.0f;
+            s_overlay_cam = jce_camera_create(&d);
+        }
+        for (uint8_t oi = 0; oi < s_overlay_count && s_overlay_cam; ++oi) {
+            if (!jce_scene_camera_apply_pose(s_overlay_cam, &s_overlay_pose[oi]))
+                continue;
+            JceSceneRenderConfig ocfg = cfg;
+            ocfg.camera_culling_mask = s_overlay_pose[oi].culling_mask;
+            ocfg.camera_clear_mode   = s_overlay_pose[oi].clear_mode;
+            jce_scene_renderer_render_camera_overlay(
+                engine_sr, scene, s_overlay_cam, base, oi, render_dt, &ocfg);
+        }
+    }
+
     jce_scene_renderer_render(engine_sr, scene, g.camera, base,
                               render_dt, &cfg);
 
@@ -653,7 +1050,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                                           cfg.fog_enabled);
     jce_editor_viewport_apply_fullscreen_effects(
         engine_sr, scene, g.camera, g.bridge, base, 0,
-        width, height, render_dt);
+        render_w, render_h, render_dt);
 
     /* ── PostFX ─────────────────────────────────────────────────────
      * Sync enabled flags and params from the shared scene renderer
@@ -710,7 +1107,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             }
 
             if (any_effect || game_taa_on) {
-                jce_postfx_resize(g.postfx, width, height);
+                jce_postfx_resize(g.postfx, render_w, render_h);
                 JceTextureHandle game_color = { UINT16_MAX };
                 JceTextureHandle game_depth = { UINT16_MAX };
                 game_color.idx = jce_offscreen_target_get_color_texture(g.bridge);
@@ -728,8 +1125,11 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     /* Fold the tone-mapped PostFX output back into the bridge so the canvas UI
      * (drawn next) lands AFTER post-fx, matching the standalone game
      * pixel-for-pixel (modulo content). */
+    /* Same declaration as the Scene View -- see the comment there. */
+    jce_editor_viewport_claim_view_band("editor-game-view", GAME_VIEW_BASE);
+
     const bool postfx_composited = jce_editor_viewport_composite_postfx(
-        g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, width, height);
+        g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, render_w, render_h);
     if (postfx_composited)
         g.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
 
@@ -744,8 +1144,19 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                                                                postfx_composited);
         uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(g.bridge);
         const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
+        /* render_w/render_h, not the panel size: the canvas is rasterised
+         * INTO the bridge, so its logical extent has to be the bridge's or the
+         * whole UI lands in a corner of a scaled target.
+         *
+         * This is the one place the Game view cannot match the shipped
+         * runtime, and it is worth naming rather than discovering: the
+         * standalone host draws the ECS-UI straight to the BACKBUFFER at
+         * native resolution, precisely so text stays crisp while the scene
+         * scales.  The editor presents through a single texture, so here the
+         * UI shares the scene's resolution -- at render_scale below 1.0 the
+         * Game view's text is softer than the player's will be. */
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,
-                             (float)width, (float)height, ptr, render_dt);
+                             (float)render_w, (float)render_h, ptr, render_dt);
 
         /* OS text-input follows InputField focus: start SDL text input only
          * when a field becomes focused, stop it when focus clears.  Toggle on
@@ -761,26 +1172,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
         /* In-editor Play: drain the canvas UI events recorded this frame and
          * fire each widget's authored handler through the Play runtime's script
-         * VM — the same drain the shipped default-main app loop performs, so
-         * Play-testing exercises real UI gameplay (button clicks, slider/toggle/
-         * dropdown value changes, input-field edits + submit), not just visuals.
-         * No-op in edit mode (play_runtime NULL). */
-        if (g.play_runtime) {
-            uint64_t clicked = jce_ui_canvas_last_clicked(g.ui_canvas);
-            if (clicked) {
-                JceUIButtonComponent *bt =
-                    jce_scene_get_ui_button(scene, (JceEntity)clicked);
-                if (bt)
-                    jce_runtime_dispatch_ui_click(g.play_runtime, clicked,
-                                                  bt->on_click_handler);
-            }
-            uint64_t vc = jce_ui_canvas_last_value_changed(g.ui_canvas);
-            if (vc) jce_runtime_dispatch_ui_value_changed(g.play_runtime, vc);
-            uint64_t tc = jce_ui_canvas_last_text_changed(g.ui_canvas);
-            if (tc) jce_runtime_dispatch_ui_text_changed(g.play_runtime, tc);
-            uint64_t sub = jce_ui_canvas_last_submitted(g.ui_canvas);
-            if (sub) jce_runtime_dispatch_ui_submit(g.play_runtime, sub);
-        }
+         * VM.  This is now LITERALLY the same code the shipped default-main app
+         * loop runs (jce_runtime_dispatch_ui_events), not a second transcription
+         * of the same four-channel list -- the two copies had already drifted
+         * apart on which channels were gated on having a pointer.
+         * Clean no-op in edit mode (play_runtime is nullptr); the canvas's
+         * clear-on-read channels are still drained so nothing latches. */
+        jce_runtime_dispatch_ui_events(g.play_runtime, g.ui_canvas, scene);
     }
 
     /* Physics debug wireframes (toggled via scene-view View menu). */

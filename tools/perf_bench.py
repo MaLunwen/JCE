@@ -55,11 +55,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "build/desktop/windows-x64/release/jce_editor.exe"
 
-PERF_RE = re.compile(
-    r"engine: perf: ([\d.]+) ms avg \((\d+) FPS\) \| cpu ([\d.]+) / gpu ([\d.]+)"
-    r" ms \| (\d+) draws \| gpu-mem (\d+) MB \(tex (\d+) \+ rt (\d+)\)"
-    r" \| rss (\d+) MB \| commit (\d+)")
+# PERF_RE now lives in jce_determinism (imported below) so the acceptance
+# protocol and this file cannot drift apart on what a perf line looks like.
 PHASE_RE = re.compile(r"perf-phases: avg-ms/frame over \d+: (.*?) at jce_engine")
+
+
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from jce_determinism import (DETERMINISM, assert_backend,   # noqa: E402
+                             PERF_RE, parse_perf)
 
 
 def _editor_alive():
@@ -93,15 +98,32 @@ def run(env_over, log_path, frames=400, timeout=1800):
     # the path in JCE_PERF_LOG enables logging and writes it somewhere else,
     # which is how the first version of this file raised "the run produced
     # nothing" on a run that had in fact produced a perfectly good log.
+    # The determinism recipe is single-sourced in jce_determinism.py.  This file
+    # used to pin only JCE_FRAME_DT_FIXED, so streaming and TAA jitter were free
+    # to differ between the two runs a comparison is made of.
+    env.update(DETERMINISM)
     env.update({
         "JCE_PERF_LOG": "1",
         "JCE_LOG_FILE": str(log_path),
         "JCE_MAX_FRAMES": str(frames),
-        "JCE_FRAME_DT_FIXED": "0.0166667",   # frame-driven animation
     })
     env.update(env_over)                     # caller wins over the defaults
-    subprocess.run([str(EXE)], env=env, cwd=str(ROOT),
-                   capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run([str(EXE)], env=env, cwd=str(ROOT),
+                          capture_output=True, text=True, timeout=timeout)
+    # The exit code was discarded here.  A run that printed a perf line and THEN
+    # died still looked like a measurement.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "the run exited %d -- a measurement from a process that did not "
+            "finish is not a measurement.  Last stderr: %s"
+            % (proc.returncode, (proc.stderr or "").strip()[-400:] or "(empty)"))
+    # Which backend actually rendered this?  JCE_BACKEND is a REQUEST; bgfx
+    # falls back.  The "renderer:" line is emitted before JCE_LOG_FILE takes
+    # over, so it lives in stdout, not in the log file.
+    requested = env.get("JCE_BACKEND")
+    if requested:
+        got = assert_backend(proc.stdout or "", requested)
+        print("[perf] engine reported backend: %s" % got)
 
     if not log_path.exists():
         raise RuntimeError("no log at %s -- the run produced nothing" % log_path)

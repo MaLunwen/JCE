@@ -17,7 +17,7 @@
  * behaviour change at all — the public functions in jce_script_vm.c are now
  * forwarders and jce_script.c kept its bodies verbatim.
  *
- * Was enforced by (no longer checked — tools/audit/ was removed):
+ * *Enforced by* (wired into tools/audit/run_architecture_audit.py):
  *   - check_script_vm_parity.py — every public lifecycle
  *     declaration in jce_script.h has a slot of the same name and the same
  *     normalised parameter list, and jce_script.c defines none of them with
@@ -223,9 +223,12 @@
  * jce_thread_mark_main() has exactly one first-party non-test call site
  * (engine/src/application/jce_engine.c:515) — which unit-test processes never
  * reach, because they never create an engine.  A main-thread assertion would
- * therefore be vacuously true in every test process, and there is no
- * JCE_ASSERT in this repo: the engine uses <assert.h>, which NDEBUG compiles
- * out in release.  jce_thread_current_id() needs no marking, so the
+ * therefore be vacuously true in every test process.  (That sentence used to
+ * end "and there is no JCE_ASSERT in this repo: the engine uses <assert.h>,
+ * which NDEBUG compiles out in release."  There is one now --
+ * <jce/os/core/jce_assert.h>, 2026-09-20 -- and it does survive NDEBUG; the
+ * vacuity argument above is what still rules a main-thread check out, not the
+ * absence of a facility.)  jce_thread_current_id() needs no marking, so the
  * owning-thread rule is the one that is true everywhere it is written down.
  * *Enforced by:* test_jce_script_vm_abi.c :: test_worker_thread_is_refused.
  */
@@ -325,7 +328,7 @@ struct JceScriptVM {
      * Omitting it makes that structurally impossible; jce_script_create stays
      * a public engine-side wrapper that calls create_sized with
      * sizeof(JceScriptHost).
-     * *Was enforced by* (no longer checked — tools/audit/ was removed):
+     * *Enforced by* (wired into tools/audit/run_architecture_audit.py):
      * test_legacy_create_reaches_create_sized_with_our_sizeof,
      * and check_script_vm_parity.py's explicit exclusion entry. */
 
@@ -374,6 +377,29 @@ struct JceScriptVM {
      * its offset.  Add the matching public function to jce_script.h and the
      * forwarder to jce_script_vm.c in the SAME commit, or
      * check_script_vm_parity.py fails. */
+
+    /* The FIXED-step callback: `inst:on_fixed_update(dt)`, dispatched once per
+     * physics step with the fixed dt, immediately BEFORE the step.  Separate
+     * from call_update because that one runs on a render frame whose dt varies
+     * with the frame rate -- a script applying a force there gets a different
+     * result on a fast machine than on a slow one, which is the reason Unity,
+     * Unreal and Godot all have a second callback on the fixed clock.
+     *
+     * EVERY REGISTRANT MUST FILL IT.  jce_script_vm_register() walks all
+     * JCE_SCRIPT_VM_SLOT_COUNT slots and REFUSES a table with a NULL one --
+     * "supply an explicit no-op if the runtime cannot implement it" is its
+     * own wording.  struct_size protects against reading past a short table,
+     * NOT against a missing slot: a shorter table is copied over a zeroed
+     * struct, so the appended member arrives as NULL and the registration is
+     * refused.  So appending here is source-compatible and NOT binary
+     * compatible with an out-of-tree plugin -- that plugin must be rebuilt,
+     * and it fails loudly at registration rather than silently at dispatch.
+     *
+     * Which is the right trade for a LIFECYCLE hook: a callback that is a
+     * method in six languages and absent in the seventh is the half-feature
+     * this project keeps paying for, and a refused registration says so on
+     * the first run. */
+    void (*call_fixed_update)(JceScript *s, JceScriptInstance inst, float dt);
 };
 
 /* Smallest struct_size a registration may declare: a table that does not

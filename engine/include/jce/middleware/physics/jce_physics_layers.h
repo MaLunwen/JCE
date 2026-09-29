@@ -64,6 +64,34 @@ JCE_API JcePhysicsLayerMask JCE_CALL jce_physics_get_layer_collision_mask(
 /* All pairs collide, names reset to "Default" / "Layer N". */
 JCE_API void JCE_CALL jce_physics_layer_matrix_reset_default(void);
 
+/* ── The 2D matrix ────────────────────────────────────────────────── *
+ * SEPARATE MATRIX, SHARED NAMES.  The 32 slots and their names are one
+ * vocabulary -- "Player" means the same thing to both worlds -- but which
+ * pairs collide is a per-world decision, exactly as Unity splits Physics from
+ * Physics2D.  That is not a preference: JceProjectSettings already authors
+ * BOTH (physics.layer_collision_matrix and physics2d.layer_collision_matrix)
+ * and the physics debugger draws both grids, so one shared matrix would
+ * delete a distinction the authoring surface already exposes.
+ *
+ * UNTIL 2026-09-21 THE 2D MATRIX REACHED NOTHING.  jce_physics2d.c contained
+ * zero uses of b2Filter / categoryBits / maskBits, JceBody2DDesc had no layer
+ * field, and the editor forwarded only gravity2d out of JceProjectPhysics2D.
+ * An author edited a 32x32 grid, it was persisted and shipped, and every 2D
+ * body collided with every other one.  The 3D sibling has been wired this
+ * whole time, which is what makes it a gap rather than a decision. */
+JCE_API void                JCE_CALL jce_physics2d_set_layer_collides(
+                                uint32_t layer_a, uint32_t layer_b,
+                                bool collides);
+JCE_API bool                JCE_CALL jce_physics2d_get_layer_collides(
+                                uint32_t layer_a, uint32_t layer_b);
+
+/* Row mask for `layer` in the 2D matrix; bit j set = collides with layer j.
+ * Out-of-range returns 0.  This is what jce_physics2d_body_create turns into
+ * b2Filter.maskBits -- 2D resolves the filter AT CREATION because Box2D takes
+ * it in b2ShapeDef, unlike the 3D path which can apply it to a live body. */
+JCE_API JcePhysicsLayerMask JCE_CALL jce_physics2d_get_layer_collision_mask(
+                                uint32_t layer);
+
 /* ── JSON I/O ─────────────────────────────────────────────────────── *
  * Schema (jce.physlayers.v1):
  *   { "$schema": "jce.physlayers.v1",

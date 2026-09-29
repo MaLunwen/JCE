@@ -215,6 +215,10 @@ void jce_csm_compute(JceCsmData *out,
                                             homogeneous_depth);
 
         out->vp[c] = jce_m4_multiply(&light_proj, &light_view);
+        /* The same two planes the projection above was built from, so the two
+         * cannot drift apart: anything that reads depth_range is reading the
+         * range this matrix actually normalizes over. */
+        out->depth_range[c] = (radius * 2.0f + near_extend + z_pad) - (-z_pad);
     }
     JCE_PROFILE_ZONE_END;
 }

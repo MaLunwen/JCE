@@ -71,6 +71,10 @@ JCE_API bool jce_camera_set_pose(JceCamera *cam, jce_vec3 position,
 JCE_API void jce_camera_set_fov(JceCamera *cam, float fov_deg);
 JCE_API void jce_camera_set_near_far(JceCamera *cam, float near_plane, float far_plane);
 JCE_API void jce_camera_set_ortho_size(JceCamera *cam, float w, float h);
+/* Orthographic HEIGHT in world units, width derived from the viewport aspect
+   at projection time.  This is what a 2D scene wants: authoring a fixed width
+   letterboxes differently on every window size. */
+JCE_API void jce_camera_set_ortho_height(JceCamera *cam, float h);
 JCE_API void jce_camera_set_mode(JceCamera *cam, JceCameraMode mode);
 
 /* Move relative to camera orientation (FPS-style). */

@@ -18,7 +18,10 @@
 
 #include <jce/renderer/jce_lightmapper.h>
 
+#include <jce/os/core/jce_alloc.h>
+
 #include <math.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -374,4 +377,148 @@ jce_lightmapper_bake_sh9(const float          (*positions)[3],
         }
     }
     return 0;
+}
+
+/* ── SH9 deringing (JceLightProbeGroupComponent.dering) ─────────────── */
+
+/*
+ * Truncating the spherical-harmonic series at L2 is a low-pass filter with a
+ * hard cutoff, and a hard cutoff rings: reconstructed irradiance overshoots
+ * near sharp lighting transitions and swings NEGATIVE on the far side.  On a
+ * probe-lit object that reads as dark bands where there is no shadow.
+ *
+ * The fix is the standard one (Sloan, "Stupid Spherical Harmonics Tricks"):
+ * soften the cutoff by scaling each band down, with the least softening that
+ * makes the reconstruction non-negative everywhere.  The band weights are the
+ * linear (Tikhonov) window
+ *
+ *     w_l(lambda) = 1 / (1 + lambda * l^2 * (l+1)^2)
+ *
+ * so w_0 == 1 for any lambda: the DC term -- the probe's average irradiance --
+ * is never touched, and deringing therefore cannot darken or brighten a scene,
+ * only smooth the directional variation it was already unable to represent.
+ *
+ * One lambda per PROBE, taken as the max over the three channels rather than
+ * one lambda per channel.  Windowing the channels independently would soften
+ * red more than blue wherever red rings first, which is a hue shift -- the one
+ * artifact a user would blame on something other than deringing.
+ */
+
+/* The solver minimises over a finite direction set, so the set has to be dense
+ * enough that "non-negative on these samples" means non-negative everywhere.
+ * 256 was NOT: an independent 64x64 lat/long grid found a negative lobe the
+ * 256-point solve had declared clean.  Hence 1024 directions AND a margin
+ * proportional to the probe's own DC irradiance -- the solve is driven to
+ * strictly positive, not to the edge of zero where sampling error lives. */
+#define SH9_DERING_DIRS   1024
+#define SH9_DERING_MARGIN 0.02f   /* fraction of the DC irradiance */
+
+/* Fibonacci sphere: a fixed, evenly spread direction set.  Deterministic on
+ * purpose -- an RNG here would make one probe's deringing depend on how many
+ * probes were baked before it. */
+static void sh9_dering_dir(int i, float *out)
+{
+    /* z uniform in (-1, 1); golden-angle spiral in the azimuth. */
+    const float z = 1.0f - (2.0f * (float)i + 1.0f) / (float)SH9_DERING_DIRS;
+    const float r = sqrtf(1.0f - z * z);
+    const float phi = (float)i * 2.39996323f;   /* pi * (3 - sqrt(5)) */
+    out[0] = r * cosf(phi);
+    out[1] = r * sinf(phi);
+    out[2] = z;
+}
+
+/* Per-direction band contributions for one channel.  Hoisted out of the
+ * bisection: the window only SCALES whole bands, so a0/a1/a2 are computed
+ * once and each of the 24 bisection steps is a multiply-add over the set
+ * instead of a fresh basis evaluation. */
+typedef struct { float a0, a1, a2; } Sh9Bands;
+
+static void sh9_bands(const float sh[9][3], int ch, Sh9Bands *out)
+{
+    for (int i = 0; i < SH9_DERING_DIRS; ++i) {
+        float d[3], b[9];
+        sh9_dering_dir(i, d);
+        sh9_eval(b, d);
+        out[i].a0 = sh[0][ch] * b[0];
+        out[i].a1 = 0.0f;
+        out[i].a2 = 0.0f;
+        for (int c = 1; c < 4; ++c) out[i].a1 += sh[c][ch] * b[c];
+        for (int c = 4; c < 9; ++c) out[i].a2 += sh[c][ch] * b[c];
+    }
+}
+
+static float sh9_min_value(const Sh9Bands *bands, float w1, float w2)
+{
+    float lo = 3.0e38f;
+    for (int i = 0; i < SH9_DERING_DIRS; ++i) {
+        const float v = bands[i].a0 + w1 * bands[i].a1 + w2 * bands[i].a2;
+        if (v < lo) lo = v;
+    }
+    return lo;
+}
+
+static void sh9_window(float w[2], float lambda)
+{
+    w[0] = 1.0f / (1.0f + lambda * 4.0f);    /* l=1: l^2 (l+1)^2 = 4  */
+    w[1] = 1.0f / (1.0f + lambda * 36.0f);   /* l=2: l^2 (l+1)^2 = 36 */
+}
+
+void JCE_CALL jce_lightmapper_sh9_dering(float (*sh9)[9][3], int probe_count)
+{
+    if (!sh9 || probe_count <= 0) return;
+
+    Sh9Bands *bands = (Sh9Bands *)jce_malloc(sizeof(Sh9Bands) * SH9_DERING_DIRS);
+    if (!bands) return;
+
+    for (int pi = 0; pi < probe_count; ++pi) {
+        float (*sh)[3] = sh9[pi];
+
+        /* Nothing to fix, and nothing that CAN be fixed: a probe whose average
+         * irradiance is itself negative is a bake defect, not ringing, and
+         * windowing only shrinks the directional terms.  Leave it alone rather
+         * than silently rewrite it into something that looks plausible. */
+        bool dc_ok = true;
+        for (int ch = 0; ch < 3; ++ch)
+            if (sh[0][ch] < 0.0f) dc_ok = false;
+        if (!dc_ok) continue;
+
+        float need = 0.0f;
+        for (int ch = 0; ch < 3; ++ch) {
+            sh9_bands((const float (*)[3])sh, ch, bands);
+            const float floor_v = SH9_DERING_MARGIN * sh[0][ch] * 0.282095f;
+
+            if (sh9_min_value(bands, 1.0f, 1.0f) >= floor_v)
+                continue;   /* this channel does not ring */
+
+            /* Bisect on lambda.  The upper bound is generous: at lambda = 8 the
+             * L2 weight is already 1/289, so if the reconstruction still dips
+             * below the floor there the DC term is not dominant and only
+             * dropping the directional bands entirely will do. */
+            float lo = 0.0f, hi = 8.0f, w[2];
+            sh9_window(w, hi);
+            if (sh9_min_value(bands, w[0], w[1]) < floor_v) {
+                need = 3.0e38f;   /* flatten: DC only */
+                break;
+            }
+            for (int it = 0; it < 32; ++it) {
+                const float mid = 0.5f * (lo + hi);
+                sh9_window(w, mid);
+                if (sh9_min_value(bands, w[0], w[1]) < floor_v) lo = mid;
+                else                                            hi = mid;
+            }
+            if (hi > need) need = hi;   /* max over channels: no hue shift */
+        }
+
+        if (need <= 0.0f) continue;     /* probe did not ring at all */
+
+        float w[2];
+        if (need >= 3.0e38f) { w[0] = 0.0f; w[1] = 0.0f; }
+        else                   sh9_window(w, need);
+        for (int ch = 0; ch < 3; ++ch) {
+            for (int c = 1; c < 4; ++c) sh[c][ch] *= w[0];
+            for (int c = 4; c < 9; ++c) sh[c][ch] *= w[1];
+        }
+    }
+
+    jce_free(bands);
 }

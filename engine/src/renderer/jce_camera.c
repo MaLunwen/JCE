@@ -7,6 +7,12 @@
 #include "os/core/jce_memory.h"
 
 #include <math.h>
+#include <stdlib.h>   /* getenv - JCE_LOG_CAMERA */
+#include <jce/os/core/jce_log.h>
+
+#ifndef LOG_TAG
+#define LOG_TAG "camera"
+#endif
 
 /* Max pitch to avoid gimbal lock at poles. */
 #define MAX_PITCH (89.0f * JCE_DEG2RAD)
@@ -88,18 +94,92 @@ jce_mat4 jce_camera_view(const JceCamera *cam)
     return jce_m4_look_at(cam->position, target, cam->up_world);
 }
 
+/* What this camera is about to project WITH, logged on change.
+ *
+ * Set JCE_LOG_CAMERA=1 to get it.  Level gated for the same reason the ambient
+ * line in jce_sr_draw.c is: JCE_DIST compiles LOG_INFO out and every SDK
+ * consumer exe is built with JCE_DIST=1, so an INFO line would be readable in
+ * the editor and silent in the shipped game -- mute in exactly the half of an
+ * editor-vs-runtime comparison that it exists to make.
+ *
+ * Why it is worth a permanent line: two hosts rendering one scene must build
+ * the same projection, and nothing else makes the inputs observable.  A
+ * difference here reads, in a screenshot diff, as "the editor draws the board
+ * 2.4% shorter" -- a number with no mechanism attached, and indistinguishable
+ * by eye from a camera-position or a viewport bug. */
+static void cam_log_projection(const JceCamera *cam, float aspect,
+                               bool homogeneous_ndc, float hw, float hh)
+{
+    static int loud = -1;
+    static float last[11];
+    static int last_mode = -1;
+    static bool last_hd;
+    if (loud < 0) {
+        const char *v = getenv("JCE_LOG_CAMERA");
+        loud = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    /* The POSE is part of this line, not a separate one.  A projection whose
+     * every number matches can still put the picture somewhere else, and a
+     * rigid screen-space shift with an identical scale is exactly what a
+     * camera-position difference looks like -- measured once as "the editor
+     * draws the same board 3 px higher" with no other number disagreeing. */
+    const float now[11] = { aspect, hw, hh, cam->near_plane, cam->far_plane,
+                            cam->fov_rad, cam->position.x, cam->position.y,
+                            cam->position.z, cam->yaw, cam->pitch };
+    bool same = (last_mode == (int)cam->mode) && (last_hd == homogeneous_ndc);
+    for (int i = 0; same && i < 11; ++i)
+        same = (last[i] == now[i]);
+    if (same)
+        return;
+    last_mode = (int)cam->mode;
+    last_hd   = homogeneous_ndc;
+    for (int i = 0; i < 11; ++i)
+        last[i] = now[i];
+    if (loud)
+        LOG_WARN(LOG_TAG,
+                 "camera proj: mode=%s aspect=%.6f half=(%.4f, %.4f) "
+                 "near=%.4f far=%.4f fov_rad=%.6f homogeneous_ndc=%d "
+                 "pos=(%.5f, %.5f, %.5f) yaw=%.6f pitch=%.6f",
+                 cam->mode == JCE_CAMERA_ORTHO ? "ortho" : "persp",
+                 (double)aspect, (double)hw, (double)hh,
+                 (double)cam->near_plane, (double)cam->far_plane,
+                 (double)cam->fov_rad, homogeneous_ndc ? 1 : 0,
+                 (double)cam->position.x, (double)cam->position.y,
+                 (double)cam->position.z, (double)cam->yaw,
+                 (double)cam->pitch);
+    else
+        LOG_INFO(LOG_TAG,
+                 "camera proj: mode=%s aspect=%.6f half=(%.4f, %.4f) "
+                 "near=%.4f far=%.4f fov_rad=%.6f homogeneous_ndc=%d "
+                 "pos=(%.5f, %.5f, %.5f) yaw=%.6f pitch=%.6f",
+                 cam->mode == JCE_CAMERA_ORTHO ? "ortho" : "persp",
+                 (double)aspect, (double)hw, (double)hh,
+                 (double)cam->near_plane, (double)cam->far_plane,
+                 (double)cam->fov_rad, homogeneous_ndc ? 1 : 0,
+                 (double)cam->position.x, (double)cam->position.y,
+                 (double)cam->position.z, (double)cam->yaw,
+                 (double)cam->pitch);
+}
+
 jce_mat4 jce_camera_proj(const JceCamera *cam, float aspect,
                           bool homogeneous_ndc)
 {
     if (!cam) return jce_m4_identity();
 
     if (cam->mode == JCE_CAMERA_ORTHO) {
-        float hw = cam->ortho_w * 0.5f;
+        /* ortho_w <= 0 spells "follow the viewport": the caller supplied a
+         * world-unit HEIGHT and wants this frame's aspect to decide the
+         * width.  Callers that set both keep their exact box. */
         float hh = cam->ortho_h * 0.5f;
+        float hw = (cam->ortho_w > 0.0f)
+                 ? cam->ortho_w * 0.5f
+                 : hh * (aspect > 0.0f ? aspect : 1.0f);
+        cam_log_projection(cam, aspect, homogeneous_ndc, hw, hh);
         return jce_m4_ortho(-hw, hw, -hh, hh,
                             cam->near_plane, cam->far_plane, homogeneous_ndc);
     }
 
+    cam_log_projection(cam, aspect, homogeneous_ndc, 0.0f, 0.0f);
     return jce_m4_perspective(cam->fov_rad, aspect,
                               cam->near_plane, cam->far_plane, homogeneous_ndc);
 }
@@ -211,6 +291,16 @@ void jce_camera_set_ortho_size(JceCamera *cam, float w, float h)
     if (!cam) return;
     if (w > 0) cam->ortho_w = w;
     if (h > 0) cam->ortho_h = h;
+}
+
+void jce_camera_set_ortho_height(JceCamera *cam, float h)
+{
+    if (!cam || h <= 0.0f) return;
+    cam->ortho_h = h;
+    /* Zero is the sentinel jce_camera_proj reads as "derive from aspect".
+     * Cleared here rather than left alone so a camera that was given an
+     * explicit box earlier does not keep that width against a new height. */
+    cam->ortho_w = 0.0f;
 }
 
 void jce_camera_set_mode(JceCamera *cam, JceCameraMode mode)

@@ -4,10 +4,8 @@
  * Renders the standard "running game" HUD elements:
  *   - Health bar / Armor bar
  *   - Ammo counter (current / reserve)
- *   - Weapon slot indicator
  *   - Hit markers (transient X overlays on damage dealt)
  *   - Damage indicators (radial flashes on damage received)
- *   - Compass / mini-map (optional, set via callback)
  *   - Objective banner (transient text)
  *   - Pickup notifications
  *   - Crosshair
@@ -17,7 +15,23 @@
  * no custom shaders needed.  Designed to be called once per frame after
  * the main scene render but before postfx.
  *
- * Layer: middleware/ui (Layer 4) — public.
+ * NOT PART OF <jce/api.h>.  This module draws real pixels
+ * (jce_game_hud_draw -> jce_primitives -> bgfx_submit on JCE_VIEW_UI) and
+ * stays available to a user who includes this header directly.  It is not in
+ * api_ui.h because engine/src/middleware/ui/AGENTS.md gives SCENE UI --
+ * including the HUD -- to the ECS Canvas (middleware/scene/jce_ui_canvas.h);
+ * a second HUD in the aggregate header would read as the engine offering two.
+ * It reached api_ui.h on 2026-08-31 as a side effect of completing the api.h
+ * closure, which asks only whether a header is REACHABLE and not whether it
+ * belongs in that promise.  See tools/lint/api_closure_exempt.txt.
+ *
+ * Two lines were removed from the list above on the same day because the
+ * features were advertised and absent: a "Weapon slot indicator" (the
+ * weapon_slot / weapon_count fields below are written by the caller and read
+ * by nothing) and a "Compass / mini-map (optional, set via callback)" (there
+ * is no callback anywhere in this API).
+ *
+ * Layer: middleware/ui (Layer 4).
  */
 #ifndef JCE_GAME_HUD_H
 #define JCE_GAME_HUD_H

@@ -1,0 +1,37 @@
+{
+  "maxParticles": 1536,
+  "emitRate": 80,
+  "lifetimeMin": 6.0,
+  "lifetimeMax": 9.0,
+  "worldSpace": true,
+  "velocityMin": [
+    -4.2,
+    -2.0,
+    -3.2
+  ],
+  "velocityMax": [
+    4.2,
+    -0.8,
+    3.2
+  ],
+  "gravity": [
+    0.05,
+    -0.12,
+    0.0
+  ],
+  "sizeStart": 0.06,
+  "sizeEnd": 0.05,
+  "colorStart": [
+    0.95,
+    0.96,
+    1.0,
+    0.9
+  ],
+  "colorEnd": [
+    0.9,
+    0.92,
+    1.0,
+    0.5
+  ],
+  "sizeCurve": "SineInOut"
+}

@@ -14,6 +14,12 @@
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/audio/jce_audio_occlusion.h>
 #include <jce/middleware/audio/jce_audio_mixer.h>
+/* rt_apply_mixer calls jce_audio_duck_pump.  Without this the call compiles
+ * anyway -- C4013, an implicit declaration -- and the float dt goes through
+ * default argument promotions to double while the callee reads a float, so
+ * the block length arrives as garbage.  It linked, it ran, and every test
+ * passed, because the one test that calls the pump includes its header. */
+#include <jce/middleware/audio/jce_audio_duck_pump.h>
 #include <jce/middleware/audio/jce_audio_mixer_config.h>
 #include <jce/middleware/audio/jce_music.h>   /* adaptive/interactive music director */
 #include <jce/middleware/audio/jce_reverb_zones.h>
@@ -54,6 +60,7 @@
 #include <jce/middleware/net/jce_session.h>
 #include <jce/middleware/net/jce_replication.h>
 #include <jce/middleware/net/jce_network_variable.h>
+#include <jce/middleware/net/jce_net_animator.h>
 #include <jce/middleware/net/jce_net_transform.h>
 #include <jce/middleware/net/jce_net_prediction.h>      /* client prediction core */
 #include <jce/middleware/net/jce_predict_locomotion.h>  /* deterministic step fn  */
@@ -67,6 +74,7 @@
 #include "middleware/animation/jce_ragdoll.h"   /* INTERNAL src header (jce_animation); see test_jce_ragdoll.c */
 #include <jce/resource/jce_pak_loader.h>   /* PAK-resident script source (shipped) */
 #include <jce/resource/jce_scene_serial.h> /* additive load for jce.spawn */
+#include <jce/resource/jce_curve.h>      /* authored value curves (jce.curve_eval) */
 #include <jce/middleware/scene/jce_scene_components_json.h> /* serial base-dir for relative material backfill */
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_console.h>   /* real engine cvars driving the sim (gap 9.1) */
@@ -149,7 +157,35 @@ typedef struct {
 	bool      spatial;
 	float     base_volume;   /* authored volume; occlusion scales it each frame */
 	char      bus[32];       /* mixer bus name this voice is routed to */
+	/* Last frame's world position, and whether there IS one.  Doppler needs a
+	 * velocity and the scene only carries positions, so the runtime
+	 * differentiates.  The flag is not defensive: without it the FIRST frame
+	 * of every sound computes position/dt, and a source 100 m out at 60 fps
+	 * reads as 6000 m/s -- a violent pitch bend on every sound that starts. */
+	jce_vec3  last_pos;
+	bool      has_last_pos;
+	/* CUSTOM ROLLOFF, copied from the AudioSource at spawn.  Empty = the
+	 * analytic attenuation model applies and nothing here runs.  Held on the
+	 * voice rather than re-read from the component each frame because the
+	 * voice outlives edits to its source: a live sound must not change its
+	 * attenuation law underneath itself when someone types in the inspector.
+	 * `warned` keeps a curve that cannot load from logging once per frame
+	 * forever -- the warning has to happen, but once. */
+	char      rolloff_curve[256];
+	bool      rolloff_warned;
+	/* Last frame's curve gain, so the occlusion pass can multiply it
+	 * rather than recompute it.  1.0 when there is no curve. */
+	float     rolloff_gain;
 } VoiceEntry;
+
+/* THE ONE DERIVATION for a Doppler velocity, exposed rather than static so a
+ * test can ask the engine instead of recomputing the formula -- a test that
+ * derives the answer a second way asserts against its own arithmetic, which
+ * this tree has paid for (a hinge axis disagreed with its own clamp by 22
+ * degrees for exactly that reason).  Returns {0,0,0} when there is no honest
+ * answer; see the definition for which two cases those are and why. */
+jce_vec3 rt_audio_velocity(jce_vec3 now, jce_vec3 then, bool have_then,
+                           float dt);
 
 /* 2D rigid body spawned from a RigidBody2D (+ optional Collider2D) component.
  * Simulated in the XY plane by the Box2D world (rt->physics2d); the body
@@ -211,6 +247,13 @@ typedef struct {
 	bool             one_shot;
 	bool             require_interact;
 	bool             fired;         /* one_shot guard */
+	/* JceSavePointComponent.slot / .kind / .display_name.  All three were
+	 * authored, serialised and read by nothing: the save always went to
+	 * "<save_id>.jsnp", and a require_interact point told the game NOTHING,
+	 * so the prompt display_name exists for could not be shown. */
+	int              slot;
+	int              kind;
+	char             display_name[128];
 } SavePointEntry;
 
 /* Authored JceBehaviorTree mirrored into the runtime BT context
@@ -278,6 +321,9 @@ static inline void rt_script_ref_start(RtScriptRef r)
 static inline void rt_script_ref_update(RtScriptRef r, float dt)
 { jce_script_call_update(r.vm, r.inst, dt); }
 
+static inline void rt_script_ref_fixed_update(RtScriptRef r, float dt)
+{ jce_script_call_fixed_update(r.vm, r.inst, dt); }
+
 static inline void rt_script_ref_release(RtScriptRef r)
 { jce_script_release(r.vm, r.inst); }
 
@@ -312,6 +358,14 @@ struct ScriptEntry {
 	 * back to jce_lod_pick for boundary hysteresis. */
 	float             simlod_accum;
 	int               simlod_prev_tier;
+	/* Per-script frame cost (jce_runtime_iterate_script_costs).  Written
+	 * only while jce_perf_phase_enabled(); `cost_measured` records that the
+	 * timing actually happened, because a script that costs nothing and a
+	 * script nobody timed both read 0.0 and must not be one reading. */
+	double            cost_last_ms;
+	double            cost_total_ms;
+	uint32_t          cost_calls;
+	bool              cost_measured;
 };
 
 /* One live Gameplay Ability System bound to an entity (GAS consumption
@@ -396,6 +450,55 @@ typedef struct {
 	float               break_torque; /* N·m (followup: separable angular impulse) */
 } ConfigJointEntry;
 
+/* One live TYPED constraint (point2point / hinge / slider / 6DOF) bound to an
+ * entity.  rt_spawn_joint used to DISCARD the handle it created, which was
+ * fine while a constraint could only be authored and never changed -- and
+ * stopped being fine the moment JceConstraintComponent gained a motor.  A
+ * motor that can only be set at spawn is a door that is either always opening
+ * or never opening.
+ *
+ * The constraint lives in rt->physics and is freed by jce_physics_destroy on
+ * teardown; this list exists so the fixed tick can reach it.  The cached
+ * triple is the last state PUSHED to the solver: re-pushing every tick would
+ * also wake both bodies every tick, so nothing jointed could ever sleep. */
+typedef struct {
+	JceEntity           entity;
+	JceConstraintHandle handle;     /* owned in rt->physics */
+	bool                motor_on;
+	float               motor_target;
+	float               motor_max_force;
+} JointEntry;
+
+/* One parsed curve asset, keyed by the path a script asked for.
+ *
+ * A CACHE, not an asset manager: curves are small, the lifetime that matters
+ * is the runtime's, and re-parsing a JSON document on every jce.curve_eval
+ * would make the binding unusable from on_update -- which is the only place
+ * anyone would call it.  BOUNDED because the path comes from a script and can
+ * be built in a loop; without a bound, "the script leaked memory" replaces
+ * "the 65th distinct curve re-parses", and that is the worse trade.
+ *
+ * A NULL `curve` is a REMEMBERED FAILURE, not an empty slot: a script polling
+ * a missing curve every frame must log once and then cost a strcmp. */
+typedef struct {
+	char      path[256];
+	JceCurve *curve;      /* NULL = this path already failed; do not retry */
+} CurveEntry;
+
+#define RT_CURVE_CACHE_MAX 64
+
+/* Destroy every parsed curve and empty the cache.  Lives in jce_rt_script.c
+ * beside the code that FILLS it, so the loop that frees an entry and the loop
+ * that creates one cannot disagree about what a NULL curve means. */
+void rt_curve_cache_clear(JceRuntime *rt);
+
+/* Fetch a parsed curve by path through the runtime's cache.  Exposed rather
+ * than static because the AUDIO path needs the same cache the script binding
+ * uses: two caches would mean two parses, two failure logs and two answers
+ * for one document.  `*out_owned` is set when the caller must destroy the
+ * result itself, which happens only past RT_CURVE_CACHE_MAX. */
+JceCurve *rt_curve_fetch(JceRuntime *rt, const char *path, bool *out_owned);
+
 /* One live 2D joint bound to an entity (JOINT-2D last-mile).  rt_spawn_joint2d
  * builds a Box2D distance/hinge/spring joint in rt->physics2d via
  * jce_physics2d_joint_create from the entity's authored JceJoint2DComponent
@@ -408,6 +511,10 @@ typedef struct {
 typedef struct {
 	JceEntity           entity;
 	JceConstraintHandle handle;     /* owned in rt->physics2d */
+	/* Authored break thresholds; <= 0 = never breaks.  Read by
+	 * rt_monitor_joints2d after each 2D step. */
+	float               break_force;
+	float               break_torque;
 } Joint2DEntry;
 
 /* Worker args for an async audio-source decode.  Heap-allocated and owned
@@ -431,6 +538,11 @@ typedef struct {
 struct JceTerrainCollisionStream;
 
 struct JceRuntime {
+	/* One-shot latch for the ui_set_text truncation warning.  The text a
+	 * script clips is usually rewritten every frame, so without this the
+	 * warning would flood (space/ produced 2510 in a single take) and
+	 * become invisible for the same reason the silent version was. */
+	bool ui_text_clipped_warned;
 	/* Paged terrain collision for a TILED/PROCEDURAL terrain, which has no
 	 * monolithic height grid and therefore got no collider at all before this
 	 * existed.  NULL for a monolithic terrain, which still spawns one body. */
@@ -474,7 +586,17 @@ struct JceRuntime {
 	int              body2d_cap;
 
 	JceCharacterHandle character;
+	/* World streaming, when the desc supplied an asset_fs.  Owned here; a
+	 * host that drives its own (the editor) passes NULL and gets none. */
+	struct JceWorldStreamer *world_streamer;
+	/* Borrowed from JceRuntimeDesc::asset_fs; NULL = the host drives its
+	 * own streamer (the editor does) and the runtime creates none. */
+	struct JceFileSystem *asset_fs;
 	JceEntity          character_entity;
+	/* How many enabled CharacterControllers the scene AUTHORED.  Only one
+	 * becomes a character; the boot summary reports both numbers so a
+	 * scene that authored three and got one says so. */
+	uint32_t           character_authored;
 	/* Character render/sync state. get_position() returns the capsule CENTER;
 	 * we render the FEET (character_half_height below) and interpolate between
 	 * fixed ticks (char_prev/cur_pos) exactly like dynamic bodies. char_last_*
@@ -511,6 +633,41 @@ struct JceRuntime {
 	 * voice handle so attenuation/low-pass ramp over frames instead of
 	 * popping as the listener->source path is (un)blocked. */
 	JceAudioOcclusionTracker *occ_tracker;
+	/* AudioOcclusion probe state, refreshed from the covering probe each
+	 * audio tick.  0 = no mask authored (every layer blocks), which is what
+	 * a zero-initialised component means. */
+	uint32_t                  occ_layer_mask;
+	bool                      occ_affects_reverb;
+	float                     occ_reverb_scale;  /* 1 = untouched */
+	/* AudioListener.spatialize, as a GATE over each voice's own `spatial`.
+	 * flat = the whole mix is heard without panning, distance attenuation or
+	 * Doppler -- what a 2D game wants, and what a designer reaches for to hear
+	 * a mix without the room moving it around.  It does not overwrite per-source
+	 * intent: VoiceEntry.spatial still records what each AudioSource asked for,
+	 * so reopening the gate restores every voice to that rather than making
+	 * everything 3D.
+	 *
+	 * STORED IN THE FLAT SENSE ON PURPOSE.  The runtime is memset to zero, so
+	 * this way the default already means "3D, as before" -- rather than needing
+	 * an initialiser in jce_runtime_create that, if anyone ever forgot it, would
+	 * make every voice started before the first listener scan flat, in a scene
+	 * that may have no AudioListener at all.  Exactly one negation lives on each
+	 * side: the listener scan writes !spatialize, and rt_voice_should_be_3d
+	 * reads !listener_flat.  Neither call site carries one.
+	 *
+	 * `_applied` is the value currently pushed to the voices, so the walk runs
+	 * on CHANGE rather than every frame -- and a voice started while the gate
+	 * was closed is handled at its start site, because a gate that only runs on
+	 * change leaves those wrong forever. */
+	bool                      listener_flat;
+	bool                      listener_flat_applied;
+	/* The listener's own previous position, for the same reason and with the
+	 * same first-frame guard as VoiceEntry::last_pos above.  Doppler is about
+	 * the RELATIVE motion of the two, so leaving this at zero while feeding
+	 * source velocities would report every moving source as approaching a
+	 * stationary ear even when the ear is chasing it. */
+	jce_vec3                  listener_last_pos;
+	bool                      listener_has_last_pos;
 
 	/* ── Audio mixer buses (P1-audio-mixer-reverb) ───────────────────
 	 * Pure-CPU bus tree (solo/mute/volume + aux sends + sidechain ducking +
@@ -723,6 +880,20 @@ struct JceRuntime {
 	int                 cfg_joint_count;
 	int                 cfg_joint_cap;
 
+	/* ── Typed constraints (motor last-mile) ───────────────────────────
+	 * One entry per entity that authored an ENABLED JceConstraintComponent.
+	 * Only the motor needs the handle after spawn; everything else about a
+	 * typed constraint is fixed at creation. */
+	JointEntry         *joints;
+	int                 joint_count;
+	int                 joint_cap;
+
+	/* ── Authored curve cache (jce.curve_eval) ─────────────────────────
+	 * Filled on first use, destroyed at teardown.  Fixed-size and not a
+	 * pointer, because the bound is the point: see CurveEntry. */
+	CurveEntry          curves[RT_CURVE_CACHE_MAX];
+	int                 curve_count;
+
 	/* ── 2D joints (JOINT-2D last-mile) ────────────────────────────────
 	 * One live Box2D joint per entity that authored an (enabled)
 	 * JceJoint2DComponent.  Stood up in the post-spawn joint pass
@@ -822,6 +993,8 @@ struct JceRuntime {
 	 * net_bridged gates the per-frame transform fixed/render step. */
 	bool             net_bridged;
 	int              net_obj_count;
+	/* Of those, how many also replicate ANIMATOR state. */
+	int              net_animator_count;
 
 	/* ── Client-side prediction (rollback/replay) ────────────────────
 	 * Wires jce_net_prediction (the generic predict ring + reconcile core)
@@ -939,6 +1112,38 @@ RT_GROW_DECL(rt_grow_pending_audio);
 /* Core lookups + the entity→body resolver (own: core jce_runtime.c). */
 JceGameplayAbilitySystem *rt_gas_for_entity(JceRuntime *rt, JceEntity e);
 VehicleEntry             *rt_vehicle_for_entity(JceRuntime *rt, JceEntity e);
+void                      rt_apply_wheel_trim(JceRuntime *rt);
+void                      rt_spawn_joint2d(JceScene *scene, JceEntity e,
+                                           void *ud);
+/* Linear entity -> body lookup, shared by the 3D and 2D body registries.
+ *
+ * BodyEntry and Body2DEntry are both {entity, body, ...} and the two lookups
+ * were byte-identical apart from which array they scanned.  They sat in the
+ * SAME FILE, which is the only reason tools/audit/find_similar_code.py never
+ * reported them -- it compares across files by construction.  Moving the 2D
+ * one to jce_rt_physics.c exposed a duplicate that had always been there.
+ *
+ * A macro rather than a function because the two ENTRY TYPES differ; it
+ * returns from the enclosing function, which is why the name is shouty. */
+#define RT_BODY_FOR_ENTITY(arr, count, ent)                               \
+	do {                                                                     \
+		for (int _i = 0; _i < (count); ++_i)                                    \
+			if ((arr)[_i].entity == (ent))                                         \
+				return (arr)[_i].body;                                                \
+		return JCE_BODY_INVALID;                                                \
+	} while (0)
+
+/* Swap-remove sweep shared by the 2D and 3D joint break monitors: destroy
+ * every entry `should_break` accepts and return the surviving count.  See the
+ * comment on the definition for why this is shared and what is not. */
+typedef bool (*RtBreakPred)(void *entry, void *user);
+typedef void (*RtBreakDestroy)(void *entry, void *user);
+int                       rt_break_sweep(void *base, size_t stride, int count,
+                                         RtBreakPred should_break,
+                                         RtBreakDestroy destroy, void *user);
+void                      rt_monitor_joints2d(JceRuntime *rt);
+/* Trail Renderer capture + ageing (jce_rt_trail.c). */
+void                      rt_trail_step(JceRuntime *rt, float dt);
 JceBodyHandle             rt_body_for_entity(const JceRuntime *rt, JceEntity e);
 
 /* Scripted RPC host callback (own: core jce_runtime.c networking section),
@@ -988,6 +1193,12 @@ JceEntity   rt_spawn_prefab_at(JceRuntime *rt, const char *prefab_path,
                                float x, float y, float z);
 void        rt_script_collision_cb(const JceContactEvent *ev, void *ud);
 void        rt_on_script_changed(const char *path, void *user);
+/* slot < 0 keeps the historical "<save_id>.jsnp" path; slot >= 0 writes
+ * "<save_id>.slotN.jsnp".  The component parses slot with default -1, so an
+ * authored point that never set it is unchanged. */
+bool        rt_save_path(char *out, size_t cap, const char *dir,
+                         const char *save_id, int slot);
+bool        rt_perform_save_slot(JceRuntime *rt, const char *save_id, int slot);
 bool        rt_perform_save(JceRuntime *rt, const char *save_id);
 bool        rt_bt_los_blocked(jce_vec3 from, jce_vec3 to, void *userdata);
 JceBtStatus rt_bt_move_to(float gx, float gy, float gz, void *ud);
@@ -1039,12 +1250,29 @@ void        rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
                                    const JceAudioSourceComponent *as);
 void        rt_spawn_audio_async(JceRuntime *rt, JceEntity e,
                                  const JceAudioSourceComponent *as);
+/* Start (or restart) an entity's authored AudioSource, ignoring
+ * play_on_awake: the caller decides when.  Shared by the scene-spawn walk and
+ * jce_runtime_audio_play, so the bus choice, the attenuation block and the
+ * 0-volume rule cannot drift between them. */
+bool        rt_audio_source_start(JceRuntime *rt, JceScene *scene, JceEntity e);
 void        rt_audio_poll(JceRuntime *rt);
 
 /* Physics body-spawn module (own: jce_rt_physics.c): the per-entity collider/
  * body materialisation helpers the core scene-walk driver (rt_spawn_entity)
  * dispatches, plus rt_spawn_entity_body (also reused by the draw-distance +
  * fracture passes) and rt_track_body (reused by the fracture spawn). */
+/* jce_rt_streaming.c — shipped-path world streaming.  begin() is idempotent
+ * across scene transitions: it destroys any existing streamer before building
+ * the new one, because the old one holds chunk state for a scene that is gone.
+ * Both are no-ops when the host supplied no asset_fs (the editor drives its
+ * own streamer, which additionally mirrors into the hierarchy). */
+void rt_input_expire_frame_sample(JceRuntime *rt);
+void rt_drive_character(JceRuntime *rt, float dt);
+bool rt_character_try_spawn(JceRuntime *rt, JceScene *scene, JceEntity e,
+                            const JceTransform *tf);
+void rt_streaming_begin(JceRuntime *rt);
+void rt_streaming_tick(JceRuntime *rt);
+
 void rt_track_body(JceRuntime *rt, JceEntity e, JceBodyHandle body,
                    const JceTransform *tf, uint8_t kind);
 bool rt_try_spawn_compound(JceRuntime *rt, JceScene *scene,
@@ -1077,5 +1305,37 @@ void rt_flush_pending_fractures(JceRuntime *rt);
  * an untested security boundary is a hope.  See jce_runtime.c for why the
  * whole method surface used to be reachable. */
 bool rt_script_rpc_name_allowed(const char *name);
+
+
+/* EAX-style AudioReverbZone -> engine reverb preset.  Pure over the component
+ * (no runtime state), and exported from jce_rt_audio.c ONLY so it can be
+ * asserted: the mapping is eleven authored fields collapsing onto nine
+ * engine ones, and `reverb` spent its whole life on the floor of that
+ * collapse.  See the comment on the definition for what maps to what and for
+ * the one field that deliberately does not. */
+/* AudioListener.spatialize as a gate over a voice's own `spatial`.  Exported
+ * from jce_rt_audio.c so the two sites that must agree -- the per-frame push
+ * and the voice-start path -- share one answer, and so it can be asserted. */
+bool rt_voice_should_be_3d(bool listener_flat, bool voice_spatial);
+
+/* The single answer to "what kind of body does this component describe".
+   Exported so the three sites that must agree -- both 3D spawn paths and the
+   soft-body static-ground mirror -- share one rule rather than three copies
+   that drifted.  See the comment on the definition for why body_type is not
+   consulted. */
+JceBodyType rt_rigidbody_kind(const JceRigidBodyComponent *rb);
+
+JceReverbPreset rt_reverb_preset_from_user(
+    const JceAudioReverbZoneComponent *rz);
+
+/* Sample every locally-authoritative animator into the replication module,
+ * once per fixed step and BEFORE jce_net_animator_fixed_step -- that function
+ * sends the snapshot from whatever was last pushed, so a push after it is a
+ * tick late forever rather than once.
+ *
+ * Lives in the runtime because the net layer refuses to read an animation
+ * graph (jce_net_animator.h says why) and the runtime is above both -- the
+ * same reason it is what consumes the root motion the renderer publishes. */
+void rt_push_net_animator_states(JceRuntime *rt);
 
 #endif /* JCE_RT_INTERNAL_H */

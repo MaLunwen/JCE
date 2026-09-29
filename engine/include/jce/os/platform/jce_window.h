@@ -31,6 +31,13 @@ JCE_EXTERN_C_BEGIN
  * without a visible window wants this flag, not that one.
  * *Enforced by:* the JCE_SASSERT block at the top of jce_window.c, which pins
  * every JCE_WINDOW_* value to its SDL_WINDOW_* counterpart. */
+/* Make the window OpenGL-capable.  Only meaningful when the renderer will
+ * actually pick a GL backend: SDL sets a pixel format on a GL-capable window,
+ * and a D3D or Vulkan run has no use for one.  The engine adds it when the
+ * requested backend is OpenGL / OpenGL ES, which is what lets the renderer
+ * build its own context at the highest core version the driver grants rather
+ * than at the version bgfx was compiled for. */
+#define JCE_WINDOW_OPENGL              0x00000002u
 #define JCE_WINDOW_HIDDEN              0x00000008u
 #define JCE_WINDOW_BORDERLESS          0x00000010u
 #define JCE_WINDOW_RESIZABLE           0x00000020u
@@ -54,6 +61,24 @@ JCE_API void        jce_window_destroy(JceWindow *win);
 /* Accessors. */
 JCE_API void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
 JCE_API void        jce_window_get_logical(JceWindow *win, int *w, int *h);
+
+/* The part of the drawable no system decoration covers, in PIXELS.
+ *
+ * On a phone this excludes the notch, the punch-hole and the gesture bar; on a
+ * desktop it is the whole drawable, which is why a caller may use it
+ * unconditionally and get the right answer everywhere.
+ *
+ * IT IS A FACT, NOT A POLICY.  Reporting the safe area is not the same as
+ * laying out inside it, and confusing the two is the usual way this feature
+ * goes wrong: a full-bleed background SHOULD run under the notch, and a canvas
+ * forced into the safe rect gets letterboxed for no reason.  Unity exposes
+ * Screen.safeArea for the author to apply and Godot does the same; the engine
+ * reports, the UI decides (see JceCanvasComponent::respect_safe_area).
+ *
+ * Falls back to the full drawable when the platform has no opinion, so the
+ * output is always a usable rect -- never zeroes a caller has to test for. */
+JCE_API void        jce_window_get_safe_area(JceWindow *win, int *x, int *y,
+                                             int *w, int *h);
 
 /* Update the window-manager title (UTF-8). No-op when win or title is NULL. */
 JCE_API void        jce_window_set_title(JceWindow *win, const char *title);

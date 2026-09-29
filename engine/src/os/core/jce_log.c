@@ -104,7 +104,38 @@ static SDL_AtomicInt g_flush_completed;
    jce_log_set_file_ex() on whatever thread calls that. */
 static char     g_log_path[1024] = {0};   /* live path; "" when no sink     */
 static uint64_t g_file_bytes     = 0;     /* bytes in the LIVE file         */
-static bool     g_rotate_stuck   = false; /* rotation could not shrink it   */
+/* A TRANSIENT FAILURE MUST NOT BE A PERMANENT ONE.  Both ways this sink can
+   stop working used to latch for the life of the sink, and both were silent
+   or near-silent about it:
+
+     * the live file failing to open -- log_file_open_locked() left g_log_file
+       NULL and said NOTHING at all, and jce_log_set_file_ex() returns void, so
+       a shipped game whose only diagnostic channel is JCE_LOG_FILE wrote no
+       file log for the rest of the process with no sign anywhere;
+     * a rotation that could not move the live file aside -- the old
+       g_rotate_stuck, whose own message stated the consequence outright:
+       "rotation is now off for this file and it will keep growing".
+
+   On Windows the usual cause of either is somebody else holding the file for
+   a few hundred milliseconds (a virus scanner, the search indexer, a tail
+   viewer), so latching converts a hiccup into exactly the unbounded log this
+   sink exists to prevent.  Both retry now -- but no oftener than
+   JCE_LOG_FILE_RETRY_MS, because the original reasoning against retrying was
+   sound for a PERSISTENT obstruction: a per-line retry would re-attempt the
+   same open, or re-compress the same bytes, on every record.
+
+   One struct rather than four file-scope scalars: they are one fact ("this
+   sink is in trouble; here is which kind and when to look again"), and this
+   file's global-state budget is a ratchet -- absorbing g_rotate_stuck keeps
+   the count unchanged rather than spending five slots on one idea. */
+#define JCE_LOG_FILE_RETRY_MS 1000u   /* negligible vs per-line; keeps the
+                                         recovery tests under three seconds */
+static struct {
+    uint64_t retry_at;      /* SDL_GetTicks() before which not to try again */
+    uint64_t lost;          /* records dropped while there was no file      */
+    bool     rotate_stuck;  /* the live file did not shrink last rotation   */
+    bool     warned;        /* warn once per outage, not once per retry     */
+} g_file_trouble = { 0, 0, false, false };
 static JceLogFileConfig g_file_cfg = {
     JCE_LOG_FILE_DEFAULT_MAX_BYTES, JCE_LOG_FILE_DEFAULT_MAX_FILES, true
 };
@@ -236,7 +267,31 @@ static void log_file_open_locked(void)
     g_file_bytes = 0;
     if (!g_log_path[0]) return;
     g_log_file = SDL_IOFromFile(g_log_path, "a");
-    if (!g_log_file) return;
+    if (!g_log_file) {
+        /* SILENT BEFORE THIS.  The one observable was jce_log_get_file_config()
+           returning false, which nobody calls on the startup path. */
+        g_file_trouble.retry_at = (uint64_t)SDL_GetTicks() + JCE_LOG_FILE_RETRY_MS;
+        if (!g_file_trouble.warned) {
+            g_file_trouble.warned = true;
+            LOG_WARN(JCE_LOG_TAG,
+                     "could not open log file '%s' (%s); records go to stderr "
+                     "only until it opens, retried every %u ms",
+                     g_log_path, SDL_GetError(),
+                     (unsigned)JCE_LOG_FILE_RETRY_MS);
+        }
+        return;
+    }
+    if (g_file_trouble.warned) {
+        /* Say what was lost.  "the log started working" without a count reads
+           as if nothing was missed, and the gap is exactly the part a reader
+           needs to know about. */
+        g_file_trouble.warned = false;
+        LOG_WARN(JCE_LOG_TAG,
+                 "log file '%s' opened after all; %" SDL_PRIu64 " record(s) "
+                 "before this went to stderr only",
+                 g_log_path, g_file_trouble.lost);
+    }
+    g_file_trouble.lost = 0;
 
     /* How I know the count is right after an "a" open onto an EXISTING file:
      * I do not assume it is empty.  "a" appends to whatever is already there
@@ -378,12 +433,26 @@ static void log_rotate_locked(void)
            rename moved it: something outside this process holds it (a reader
            with a write lock, a scanner, a full disk).  Retrying on the next
            line would re-compress the same bytes forever, so stop. */
-        g_rotate_stuck = true;
-        LOG_ERROR(JCE_LOG_TAG,
-                  "could not rotate log '%s' (still %" SDL_PRIu64 " bytes); "
-                  "rotation is now off for this file and it will keep growing",
-                  g_log_path, g_file_bytes);
-    } else if (g_file_cfg.compress && !compressed) {
+        g_file_trouble.rotate_stuck = true;
+        g_file_trouble.retry_at =
+            (uint64_t)SDL_GetTicks() + JCE_LOG_FILE_RETRY_MS;
+        if (!g_file_trouble.warned) {
+            g_file_trouble.warned = true;
+            LOG_ERROR(JCE_LOG_TAG,
+                      "could not rotate log '%s' (still %" SDL_PRIu64
+                      " bytes); retrying no more than every %u ms -- if "
+                      "whatever holds it never lets go, the file keeps growing",
+                      g_log_path, g_file_bytes,
+                      (unsigned)JCE_LOG_FILE_RETRY_MS);
+        }
+    } else {
+        /* It moved.  Clear BOTH, so a run that recovers stops paying the
+           backoff and a later genuine failure warns again rather than being
+           swallowed by a stale "already warned". */
+        g_file_trouble.rotate_stuck = false;
+        g_file_trouble.warned       = false;
+    }
+    if (g_file_cfg.compress && !compressed && g_file_bytes < before) {
         LOG_WARN(JCE_LOG_TAG,
                  "zstd failed on the rotated log; kept it uncompressed as "
                  "'%s.1'", g_log_path);
@@ -456,6 +525,11 @@ static void emit_message(const JceLogMessage *m,
 #ifdef JCE_LOG_ASYNC
     /* Write to log file (plain text, no ANSI). */
     SDL_LockMutex(g_file_mtx);
+    /* Retry a failed open before deciding there is no file sink.  Without
+       this, one open failure at startup means no file log for the process. */
+    if (!g_log_file && g_log_path[0] &&
+        (uint64_t)SDL_GetTicks() >= g_file_trouble.retry_at)
+        log_file_open_locked();
     if (g_log_file) {
         char file_buf[2048];
         int file_len = snprintf(file_buf, sizeof(file_buf),
@@ -473,9 +547,15 @@ static void emit_message(const JceLogMessage *m,
                the one thread that has to keep up with every producer. */
             g_file_bytes += (uint64_t)SDL_WriteIO(g_log_file, file_buf,
                                                   (size_t)file_len);
-            if (!g_rotate_stuck && g_file_bytes >= g_file_cfg.max_bytes)
+            if (g_file_bytes >= g_file_cfg.max_bytes &&
+                (!g_file_trouble.rotate_stuck ||
+                 (uint64_t)SDL_GetTicks() >= g_file_trouble.retry_at))
                 log_rotate_locked();
         }
+    } else if (g_log_path[0]) {
+        /* A sink was asked for and there is none: count it, so the reopen
+           above can say how big the gap was. */
+        ++g_file_trouble.lost;
     }
     SDL_UnlockMutex(g_file_mtx);
 #endif
@@ -785,7 +865,12 @@ void jce_log_set_file_ex(const char *path, const JceLogFileConfig *cfg)
     }
     g_log_path[0]  = '\0';
     g_file_bytes   = 0;
-    g_rotate_stuck = false;
+    /* A new path is a new file: neither the backoff nor "already warned" may
+       carry over, or the first failure on the new path would be silent. */
+    g_file_trouble.retry_at     = 0;
+    g_file_trouble.lost         = 0;
+    g_file_trouble.rotate_stuck = false;
+    g_file_trouble.warned       = false;
     log_file_effective_config(cfg, &g_file_cfg);
     if (path && path[0]) {
         snprintf(g_log_path, sizeof(g_log_path), "%s", path);

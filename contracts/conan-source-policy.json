@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "retired_hooks": {
+    "hook_arm64_pkgconfig_fix.py": "b5683a2d2913d56b869fb0f429e0609ffcd3b1c2ca73449296a239a29a29e8d5",
+    "hook_bgfx_wasm_fix.py": "7c83e26fd616896ad4364aeb381bd8669f36dece3c0c01d6fddda41cf2690274",
+    "hook_cmake_policy_fix.py": "10fe1144a5d846088c5b0503322cab42138b29a50a958b78ba0f05115f7ca8d0",
+    "hook_glib_macos_intl_fix.py": "16d31d11ad06ca1fa8e2d5b4126b799ef8cef9366e5a1508b2b0b9b22add1aec",
+    "hook_libyuv_arm64_fix.py": "c068e658c203251934ad702812f63fd28fc26b3819f8fb2eb43868d959eedce3",
+    "hook_minicoro_wasm_fix.py": "ac15ca628dedd1a35fc9d3ef1ce2e292efdc5b0ed44b300354931edd8f22cf0d",
+    "hook_ozz_animation_arm64_fix.py": "8c2f0c1eadc76f37b25ed83f6cde7c4f1f69d233b67a5755a31f60fc42509ed6",
+    "hook_zeromq_arm64_fix.py": "a0626c4b66578c70d732b9e280236477359a6688e2cb41a2afaedb6d450ac554"
+  },
+  "allowed_callbacks": [
+    "pre_generate",
+    "post_package_id",
+    "post_package_info"
+  ],
+  "policy": "JCE callbacks may change generated build configuration and metadata only; never upstream source or package files."
+}

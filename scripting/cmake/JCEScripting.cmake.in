@@ -7,7 +7,8 @@
 #
 # ── WHAT THIS DECLARES ─────────────────────────────────────────────────
 #
-#   JCE::ScriptApi        the script-facing C ABI shared library
+#   JCE::ScriptApi        the script-facing C ABI (shared on native targets,
+#                         statically linked on Web)
 #   JCE::ScriptCpp        header-only C++ wrapper over it (a script calls down)
 #   JCE::ScriptCppModule  what a C++ SCRIPT MODULE links (no registry)
 #   JCE::ScriptVmCpp      the "cpp"    JceScriptVM (the engine calls up)
@@ -65,6 +66,11 @@ endif()
 set(_jce_s_lib   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@")
 set(_jce_s_inc   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
 set(_jce_s_share "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce/scripting")
+# Where the installed rosters live.  jce_script_stage_runtime() globs them,
+# so a backend added later stages itself instead of being forgotten by a
+# hand-written list.
+set(_jce_s_cmake "${CMAKE_CURRENT_LIST_DIR}")
+set(_jce_s_backends "${CMAKE_CURRENT_LIST_DIR}/backends")
 
 set(JCE_SCRIPTING_FOUND TRUE)
 set(JCE_SCRIPT_LANGUAGES "")
@@ -129,11 +135,19 @@ function(_jce_script_add_static TARGET_NAME BASENAME OUT_OK)
 endfunction()
 
 # ---------------------------------------------------------------------- #
-#  jce_script_api — SHARED, and the only target here that is a .dll.      #
+#  jce_script_api — SHARED natively, STATIC where Web has no loader.      #
 # ---------------------------------------------------------------------- #
 set(JCE_ScriptApi_FOUND FALSE)
 set(JCE_SCRIPT_API_LIBRARY "")
 if(@JCE_SDK_SCRIPT_HAVE_API@)
+	if(@JCE_SDK_SCRIPT_API_STATIC@)
+		_jce_script_add_static(JCE::ScriptApi jce_script_api _api_ok)
+		if(_api_ok)
+			add_library(jce_script_api ALIAS JCE::ScriptApi)
+			set(JCE_ScriptApi_FOUND TRUE)
+		endif()
+		unset(_api_ok)
+	else()
 	_jce_script_config_file(_api_rel _api_dbg
 		"@CMAKE_SHARED_LIBRARY_PREFIX@jce_script_api@CMAKE_SHARED_LIBRARY_SUFFIX@")
 	if(_api_rel OR _api_dbg)
@@ -190,6 +204,7 @@ if(@JCE_SDK_SCRIPT_HAVE_API@)
 	unset(_api_dbg)
 	unset(_imp_rel)
 	unset(_imp_dbg)
+	endif()
 endif()
 
 # ---------------------------------------------------------------------- #
@@ -367,6 +382,114 @@ if(@JCE_SDK_SCRIPT_HAVE_PYTHON@)
 endif()
 
 # ---------------------------------------------------------------------- #
+#  scripting/js                                                           #
+#                                                                         #
+#  NOT a "simple" import, and the reason is the dependency: this archive   #
+#  calls quickjs-ng, which the SDK does NOT ship.  A consumer resolves it  #
+#  through their own conan graph, exactly as they resolve lua -- so the    #
+#  imported target must carry that requirement rather than a path into a   #
+#  tree that has no quickjs in it.                                         #
+#                                                                          #
+#  find_package and not find_dependency: this file is included BY          #
+#  JCEConfig.cmake, and find_dependency would make a missing quickjs-ng    #
+#  fail the whole find_package(JCE) -- taking the engine down with an      #
+#  optional scripting backend.  QUIET + an explicit STATUS says which      #
+#  half is missing instead.                                                #
+# ---------------------------------------------------------------------- #
+set(JCE_ScriptJs_FOUND FALSE)
+if(@JCE_SDK_SCRIPT_HAVE_JS@)
+	# The JS ENGINE ships with the SDK -- see JCEScriptingInstall.cmake for why
+	# js differs from python here: quickjs-ng is a local recipe a third-party
+	# consumer cannot obtain, so requiring them to supply it would mean they
+	# could not use this backend at all.  Imported by PATH, from beside the VM
+	# archive, so no conan graph of the consumer's is involved.
+	_jce_script_add_static(JCE::QuickJs qjs _ok_qjs)
+	_jce_script_add_static(JCE::ScriptVmJs jce_script_vm_js _ok)
+	if(_ok AND _ok_qjs)
+		set_property(TARGET JCE::ScriptVmJs APPEND PROPERTY
+			INTERFACE_LINK_LIBRARIES JCE::JCE JCE::QuickJs)
+		add_library(jce_script_vm_js ALIAS JCE::ScriptVmJs)
+		list(APPEND JCE_SCRIPT_LANGUAGES js)
+		set(JCE_ScriptJs_FOUND TRUE)
+	elseif(_ok AND NOT _ok_qjs)
+		message(STATUS
+			"JCE scripting: this SDK ships jce_script_vm_js but not the "
+			"quickjs archive it links. The backend would fail at the "
+			"consumer's link step with unresolved JS_* symbols, so it is not "
+			"declared.")
+	endif()
+	unset(_ok)
+	unset(_ok_qjs)
+endif()
+
+# ---------------------------------------------------------------------- #
+#  scripting/csharp                                                       #
+#                                                                         #
+#  NO .NET SDK IS NEEDED TO BUILD AGAINST THIS.  The archive links        #
+#  nethost's import library, which ships beside it, and everything else    #
+#  the backend needs is found at RUN time: hostfxr through nethost, and    #
+#  the managed assembly beside the executable.  So a consumer with no      #
+#  dotnet installed still LINKS -- they simply cannot RUN C# scripts, and  #
+#  register() says so rather than the build failing.                       #
+#                                                                         #
+#  nethost.dll is a runtime file, not a link input: jce_script_stage_      #
+#  runtime() copies it beside the executable with the managed assembly.    #
+# ---------------------------------------------------------------------- #
+# The managed assembly, in the SDK's own tree.  The roster's RUNTIME_VARS and
+# STAGE_FILES both name these, and pointing them at the build machine's
+# in-tree artifacts (which is what they hold in-tree) would make a consumer's
+# game stage a path that does not exist on their disk.
+set(JCE_SCRIPT_CSHARP_ASSEMBLY "")
+set(JCE_SCRIPT_CSHARP_RUNTIMECONFIG "")
+set(JCE_SCRIPT_CSHARP_NETHOST "")
+if(EXISTS "${_jce_s_share}/csharp/JceScript.dll")
+	set(JCE_SCRIPT_CSHARP_ASSEMBLY "${_jce_s_share}/csharp/JceScript.dll")
+	set(JCE_SCRIPT_CSHARP_RUNTIMECONFIG
+		"${_jce_s_share}/csharp/JceScript.runtimeconfig.json")
+endif()
+_jce_script_config_file(_nethost_dll_rel _nethost_dll_dbg
+	"@CMAKE_SHARED_LIBRARY_PREFIX@nethost@CMAKE_SHARED_LIBRARY_SUFFIX@")
+if(_nethost_dll_rel)
+	set(JCE_SCRIPT_CSHARP_NETHOST "${_nethost_dll_rel}")
+elseif(_nethost_dll_dbg)
+	set(JCE_SCRIPT_CSHARP_NETHOST "${_nethost_dll_dbg}")
+endif()
+unset(_nethost_dll_rel)
+unset(_nethost_dll_dbg)
+
+set(JCE_ScriptCSharp_FOUND FALSE)
+if(@JCE_SDK_SCRIPT_HAVE_CSHARP@)
+	_jce_script_add_static(JCE::ScriptVmCSharp jce_script_vm_csharp _ok)
+	if(_ok)
+		_jce_script_config_file(_nethost_rel _nethost_dbg
+			"@CMAKE_IMPORT_LIBRARY_PREFIX@nethost@CMAKE_IMPORT_LIBRARY_SUFFIX@")
+		if(_nethost_rel OR _nethost_dbg)
+			set_property(TARGET JCE::ScriptVmCSharp APPEND PROPERTY
+				INTERFACE_LINK_LIBRARIES JCE::JCE)
+			# By PATH, not by a find_package: the SDK shipped this exact
+			# import library, and re-probing the consumer's machine could
+			# pick a different .NET version from the one the archive was
+			# compiled against.
+			set_property(TARGET JCE::ScriptVmCSharp APPEND PROPERTY
+				INTERFACE_LINK_LIBRARIES
+				"$<IF:$<CONFIG:Debug>,${_nethost_dbg};${_nethost_rel},${_nethost_rel};${_nethost_dbg}>")
+			add_library(jce_script_vm_csharp ALIAS JCE::ScriptVmCSharp)
+			list(APPEND JCE_SCRIPT_LANGUAGES csharp)
+			set(JCE_ScriptCSharp_FOUND TRUE)
+		else()
+			message(STATUS
+				"JCE scripting: this SDK ships jce_script_vm_csharp but not the "
+				"nethost import library it links. The backend would fail at "
+				"the consumer's link step with an unresolved get_hostfxr_path, "
+				"so it is not declared.")
+		endif()
+		unset(_nethost_rel)
+		unset(_nethost_dbg)
+	endif()
+	unset(_ok)
+endif()
+
+# ---------------------------------------------------------------------- #
 #  scripting/java                                                         #
 #                                                                         #
 #  NO JDK IS NEEDED TO BUILD AGAINST THIS.  jce_script_vm_java links no    #
@@ -464,9 +587,44 @@ function(jce_script_stage_runtime TARGET_NAME)
 		message(FATAL_ERROR
 			"jce_script_stage_runtime(${TARGET_NAME}): no such target.")
 	endif()
+
+	# ROSTER-DRIVEN, not a hand-written list.  It used to name JCE::ScriptApi
+	# and JCE::ScriptJava, which was correct for exactly the languages that
+	# existed when it was written: a backend added later staged nothing, with
+	# no error -- measured, the C# backend's nethost.dll and managed assembly
+	# were both missed and the consumer's process died with
+	# 0xC0000135 (DLL not found) before printing anything.
+	#
+	# Reading the installed rosters means a seventh language stages itself by
+	# existing, which is the same property jce_script_enable() has in-tree.
+	set(_stage "")
+	set(_stage_files "")
+	if(TARGET JCE::ScriptApi)
+		list(APPEND _stage jce_script_api)
+	endif()
+	file(GLOB _rosters "${_jce_s_cmake}/backends/*/jce_backend.cmake")
+	foreach(_r IN LISTS _rosters)
+		set(JCE_BACKEND_STAGE_TARGETS "")
+		set(JCE_BACKEND_STAGE_FILES "")
+		include("${_r}")
+		list(APPEND _stage ${JCE_BACKEND_STAGE_TARGETS})
+		list(APPEND _stage_files ${JCE_BACKEND_STAGE_FILES})
+	endforeach()
+	if(_stage)
+		list(REMOVE_DUPLICATES _stage)
+	endif()
+	if(_stage_files)
+		list(REMOVE_DUPLICATES _stage_files)
+	endif()
+
 	set(_staged 0)
-	foreach(_t JCE::ScriptApi JCE::ScriptJava)
+	foreach(_t IN LISTS _stage)
 		if(TARGET ${_t})
+			get_target_property(_stage_type ${_t} TYPE)
+			if(_stage_type STREQUAL "STATIC_LIBRARY" OR
+			   _stage_type STREQUAL "INTERFACE_LIBRARY")
+				continue()
+			endif()
 			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 				COMMAND "${CMAKE_COMMAND}" -E copy_if_different
 					"$<TARGET_FILE:${_t}>" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
@@ -474,7 +632,17 @@ function(jce_script_stage_runtime TARGET_NAME)
 			math(EXPR _staged "${_staged}+1")
 		endif()
 	endforeach()
-	if(_staged EQUAL 0)
+	foreach(_f IN LISTS _stage_files)
+		if(_f AND EXISTS "${_f}")
+			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+				COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+					"${_f}" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+				VERBATIM)
+			math(EXPR _staged "${_staged}+1")
+		endif()
+	endforeach()
+
+	if(_staged EQUAL 0 AND NOT EMSCRIPTEN)
 		message(WARNING
 			"jce_script_stage_runtime(${TARGET_NAME}): this SDK ships no "
 			"script runtime library to stage. Nothing was added, and the "
@@ -519,6 +687,65 @@ function(jce_script_java_find_jvm OUT_VAR)
 	endif()
 	set(${OUT_VAR} "${_jvm}" PARENT_SCOPE)
 endfunction()
+
+# ---------------------------------------------------------------------- #
+#  jce_script_enable(<target> ...) — the last mile.                       #
+#                                                                         #
+#  Installed BESIDE this file and included from it, so the same function   #
+#  exists in-tree and from an SDK.  Everything above declares targets and   #
+#  paths; that function is what LINKS them, bakes the runtime inputs and    #
+#  generates the registration shim, which is the part every project was     #
+#  hand-writing — and, measured here, hand-writing into the wrong CMake     #
+#  branch, shipping an executable that ran Lua only.                        #
+# ---------------------------------------------------------------------- #
+# ---------------------------------------------------------------------- #
+#  GENERIC BACKEND IMPORTS, from the installed rosters.                   #
+#                                                                         #
+#  Every block above is hand-written because its backend needs more than   #
+#  an archive: a version-matched find_package (python), a MODULE the JVM   #
+#  loads (java), extra INTERFACE targets for module authors (cpp, c).      #
+#  A backend that is JUST an archive plus JCE::JCE needs none of that, and #
+#  declaring it by hand would be the same list this layer just stopped      #
+#  keeping.  Such a roster sets JCE_BACKEND_SDK_IMPORT_SIMPLE ON and is     #
+#  imported here, generically.                                             #
+#                                                                          #
+#  WITHOUT THIS, a new backend's roster installs and its target never       #
+#  exists on the consumer, so jce_script_enable() sees the language as      #
+#  KNOWN and never AVAILABLE -- measured with a throwaway sixth backend,    #
+#  which was discovered, installed and then silently not linked.           #
+# ---------------------------------------------------------------------- #
+file(GLOB _jce_generic_rosters "${_jce_s_backends}/*/jce_backend.cmake")
+foreach(_gr IN LISTS _jce_generic_rosters)
+	set(JCE_BACKEND_LANGUAGE "")
+	set(JCE_BACKEND_VM_TARGET "")
+	set(JCE_BACKEND_SDK_IMPORT_SIMPLE OFF)
+	include("${_gr}")
+	if(JCE_BACKEND_SDK_IMPORT_SIMPLE AND JCE_BACKEND_VM_TARGET
+	   AND NOT TARGET ${JCE_BACKEND_VM_TARGET})
+		_jce_script_add_static(JCE::ScriptVm_${JCE_BACKEND_LANGUAGE}
+			${JCE_BACKEND_VM_TARGET} _ok)
+		if(_ok)
+			set_property(TARGET JCE::ScriptVm_${JCE_BACKEND_LANGUAGE} APPEND
+				PROPERTY INTERFACE_LINK_LIBRARIES JCE::JCE)
+			add_library(${JCE_BACKEND_VM_TARGET} ALIAS
+				JCE::ScriptVm_${JCE_BACKEND_LANGUAGE})
+			list(APPEND JCE_SCRIPT_LANGUAGES "${JCE_BACKEND_LANGUAGE}")
+		endif()
+		unset(_ok)
+	endif()
+endforeach()
+unset(_jce_generic_rosters)
+
+# The java roster names JCE_SCRIPT_JAVA_JVM_LIBRARY as a runtime input, and
+# jce_script_enable() only CONSUMES the variables a roster names -- so this
+# file, which is the one that knows how to look, must SET it.  Only the
+# fallback: the generated shim prefers JAVA_HOME at RUN time.
+if(JCE_ScriptJava_FOUND AND COMMAND jce_script_java_find_jvm
+   AND NOT JCE_SCRIPT_JAVA_JVM_LIBRARY)
+	jce_script_java_find_jvm(JCE_SCRIPT_JAVA_JVM_LIBRARY)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/JCEScriptEnable.cmake" OPTIONAL)
 
 if(JCE_SCRIPT_LANGUAGES)
 	list(SORT JCE_SCRIPT_LANGUAGES)

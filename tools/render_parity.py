@@ -43,71 +43,6 @@ import zlib
 # ── minimal PNG reader ──────────────────────────────────────────────
 
 
-def read_png(path):
-    """Return (width, height, channels, bytearray pixels). 8-bit only."""
-    with open(path, "rb") as f:
-        data = f.read()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("%s: not a PNG" % path)
-
-    pos = 8
-    width = height = None
-    bitdepth = ctype = None
-    idat = bytearray()
-    while pos < len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        tag = data[pos + 4:pos + 8]
-        chunk = data[pos + 8:pos + 8 + length]
-        pos += 12 + length
-        if tag == b"IHDR":
-            width, height, bitdepth, ctype, _comp, _filt, interlace = \
-                struct.unpack(">IIBBBBB", chunk)
-            if bitdepth != 8 or ctype not in (2, 6) or interlace != 0:
-                raise ValueError(
-                    "%s: unsupported PNG (bitdepth=%d colortype=%d "
-                    "interlace=%d); expected 8-bit RGB/RGBA progressive"
-                    % (path, bitdepth, ctype, interlace))
-        elif tag == b"IDAT":
-            idat += chunk
-        elif tag == b"IEND":
-            break
-
-    channels = 3 if ctype == 2 else 4
-    raw = zlib.decompress(bytes(idat))
-    stride = width * channels
-    out = bytearray(width * height * channels)
-
-    # Undo per-scanline filters (PNG spec types 0-4).
-    src = 0
-    for y in range(height):
-        ftype = raw[src]
-        src += 1
-        line_off = y * stride
-        prev_off = line_off - stride
-        for x in range(stride):
-            v = raw[src + x]
-            a = out[line_off + x - channels] if x >= channels else 0
-            b = out[prev_off + x] if y > 0 else 0
-            c = (out[prev_off + x - channels]
-                 if (y > 0 and x >= channels) else 0)
-            if ftype == 0:
-                r = v
-            elif ftype == 1:
-                r = (v + a) & 0xFF
-            elif ftype == 2:
-                r = (v + b) & 0xFF
-            elif ftype == 3:
-                r = (v + ((a + b) >> 1)) & 0xFF
-            elif ftype == 4:
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                r = (v + pred) & 0xFF
-            else:
-                raise ValueError("%s: bad filter %d" % (path, ftype))
-            out[line_off + x] = r
-        src += stride
-    return width, height, channels, out
 
 
 # ── comparison ──────────────────────────────────────────────────────
@@ -152,19 +87,56 @@ def compare(img_a, img_b, crop, step):
 # ── capture orchestration ───────────────────────────────────────────
 
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from jce_determinism import (DETERMINISM, assert_backend, read_png,   # noqa: E402
+                             assert_has_content)
+
+
+def _verify_backend(log_path, backend):
+    """Fail loudly when the engine did not use the backend we asked for."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise RuntimeError(
+            "no captured stdout at %s for backend %r (%s) -- cannot prove "
+            "which backend produced this capture" % (log_path, backend, exc))
+    got = assert_backend(text, backend)
+    print("[parity] %-7s engine reported: %s" % (backend, got))
+
+
 def capture(exe, cwd, backend, frame, out_png, timeout_s):
     if os.path.exists(out_png):
         os.remove(out_png)
     env = dict(os.environ)
+    # Pin determinism.  Without these two captures of ONE backend differ by
+    # more than this tool's default 3.0% threshold -- i.e. the instrument
+    # was reading below its own noise floor (3.2587%, measured).
+    env.update(DETERMINISM)
     env["JCE_BACKEND"] = backend
     env["JCE_CAPTURE_FRAME"] = str(frame)
     env["JCE_CAPTURE_PATH"] = os.path.abspath(out_png)
+    # JCE_BACKEND is a REQUEST; bgfx falls back down a chain when a backend
+    # fails to init.  Capture STDOUT so the caller can assert what was ACTUALLY
+    # selected -- otherwise a "parity" run can compare a backend against itself
+    # and report perfect agreement.
+    #
+    # STDOUT, not JCE_LOG_FILE: the "renderer: <name>" line is emitted during
+    # bgfx init, BEFORE the log file takes over.  Measured 2026-08-27 on one
+    # run: present in stdout (138 lines), absent from the log file (70 lines).
+    # Redirected to a file rather than a pipe because this function polls the
+    # process for up to `timeout_s` -- a pipe that fills would deadlock it.
+    log_path = os.path.abspath(out_png) + ".stdout.txt"
+    if os.path.exists(log_path):
+        os.remove(log_path)
 
     print("[parity] %-7s launching %s (capture frame %d)"
           % (backend, os.path.basename(exe), frame))
+    log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([exe], cwd=cwd, env=env,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+                            stdout=log_fh, stderr=subprocess.STDOUT)
     try:
         deadline = time.time() + timeout_s
         last_size = -1
@@ -176,11 +148,21 @@ def capture(exe, cwd, backend, frame, out_png, timeout_s):
             if os.path.exists(out_png):
                 size = os.path.getsize(out_png)
                 if size > 0 and size == last_size:
+                    # The process is still alive; flush what it has written so
+                    # far before parsing.  The renderer line is emitted long
+                    # before the capture frame, so it is already there.
+                    log_fh.flush()
+                    _verify_backend(log_path, backend)
                     return True       # written and stable
                 last_size = size
             time.sleep(0.5)
-        return os.path.exists(out_png) and os.path.getsize(out_png) > 0
+        log_fh.flush()
+        ok = os.path.exists(out_png) and os.path.getsize(out_png) > 0
+        if ok:
+            _verify_backend(log_path, backend)
+        return ok
     finally:
+        log_fh.close()
         if proc.poll() is None:
             proc.kill()
             try:
@@ -207,6 +189,10 @@ def main():
                     help="sample every Nth pixel (1 = exhaustive)")
     ap.add_argument("--threshold-mean", type=float, default=2.0,
                     help="max mean abs per-channel diff (0-255 scale)")
+    ap.add_argument("--skip-noise-floor", action="store_true",
+                    help="do not re-capture the reference backend to measure "
+                         "this run's same-backend floor (saves one capture; "
+                         "the verdict is then unanchored)")
     ap.add_argument("--threshold-pct", type=float, default=3.0,
                     help="max %% of sampled pixels with channel delta > 8")
     args = ap.parse_args()
@@ -240,6 +226,36 @@ def main():
     ref = backends[0]
     print("[parity] decoding %s (reference)" % ref)
     ref_img = read_png(shots[ref])
+    # Blank captures compare perfectly equal.  visual_diff.py passed vacuously
+    # three times that way before it grew this guard; this tool never had it.
+    for b in backends:
+        assert_has_content(read_png(shots[b]) if b != ref else ref_img, shots[b])
+
+    # SAME-BACKEND noise floor, measured on THIS run.  A cross-backend verdict
+    # is only meaningful above the spread one backend shows against itself --
+    # and this tool's default threshold (3.0%) used to sit BELOW the 3.2587%
+    # floor that unpinned TAA jitter produced.  Refuse to answer rather than
+    # quietly report noise as agreement.
+    floor_mean = floor_pct = 0.0
+    if not args.skip_noise_floor:
+        rep = os.path.join(args.out, "parity_%s_repeat.png" % ref)
+        if not capture(exe, cwd, ref, args.frame, rep, args.timeout):
+            print("[parity] %-7s FAILED to produce the noise-floor capture" % ref)
+            return 2
+        rep_img = read_png(rep)
+        assert_has_content(rep_img, rep)
+        floor_mean, floor_pct, floor_max = compare(ref_img, rep_img, crop, args.step)
+        print("[parity] noise floor (%s vs itself): mean=%.3f  pixels>8=%.2f%%  "
+              "max=%d" % (ref, floor_mean, floor_pct, floor_max))
+        if floor_mean > args.threshold_mean or floor_pct > args.threshold_pct:
+            print("[parity] SETUP ERROR: the configured thresholds "
+                  "(mean<=%.3f, pct<=%.2f%%) are BELOW this run's own noise "
+                  "floor.  Any verdict at these settings would be reading "
+                  "noise.  Raise the thresholds above the floor, or find out "
+                  "why one backend does not reproduce itself."
+                  % (args.threshold_mean, args.threshold_pct))
+            return 2
+
     failed = False
     for b in backends[1:]:
         img = read_png(shots[b])

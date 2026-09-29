@@ -69,11 +69,36 @@ static size_t foliage_field_cell(int dim, float world_size,
     return (size_t)mz * (size_t)dim + (size_t)mx;
 }
 
-uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
-                             const JceTerrain              *terrain,
-                             const jce_vec3                *origin,
-                             JceFoliageInstance            *out,
-                             uint32_t                       out_cap)
+static bool foliage_sample_terrain(void *user, float world_x, float world_z,
+                                   bool want_normal, float *out_world_y,
+                                   float out_world_normal[3])
+{
+    const JceTerrain *terrain = (const JceTerrain *)user;
+    if (!terrain || !out_world_y) return false;
+
+    *out_world_y = jce_terrain_sample_height(terrain, world_x, world_z);
+    if (!want_normal) return true;
+
+    const float e = 0.5f;
+    const float hxp = jce_terrain_sample_height(terrain, world_x + e, world_z);
+    const float hxm = jce_terrain_sample_height(terrain, world_x - e, world_z);
+    const float hzp = jce_terrain_sample_height(terrain, world_x, world_z + e);
+    const float hzm = jce_terrain_sample_height(terrain, world_x, world_z - e);
+    const float dx = (hxp - hxm) / (2.0f * e);
+    const float dz = (hzp - hzm) / (2.0f * e);
+    const float inv_len = 1.0f / sqrtf(dx * dx + dz * dz + 1.0f);
+    out_world_normal[0] = -dx * inv_len;
+    out_world_normal[1] = inv_len;
+    out_world_normal[2] = -dz * inv_len;
+    return true;
+}
+
+static uint32_t foliage_scatter_impl(const JceFoliageScatterParams *p,
+                                     JceFoliageSurfaceSampleFn sample_surface,
+                                     void *surface_user,
+                                     const jce_vec3 *origin,
+                                     JceFoliageInstance *out,
+                                     uint32_t out_cap)
 {
     if (!p || !out || out_cap == 0) return 0;
 
@@ -109,7 +134,8 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
     const bool ridge_band  = (p->ridge_field != NULL) && (p->ridge_dim > 0) &&
                              (p->ridge_min < p->ridge_max);
     const bool slope_limit =
-        (terrain != NULL) && (p->max_slope_deg > 0.0f) && (p->max_slope_deg < 90.0f);
+        (sample_surface != NULL) && (p->max_slope_deg > 0.0f) &&
+        (p->max_slope_deg < 90.0f);
     const float cos_max = slope_limit ? cosf(p->max_slope_deg * FOLIAGE_DEG2RAD) : -1.0f;
 
     uint32_t n = 0;
@@ -154,28 +180,25 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
             if (rv < p->ridge_min || rv > p->ridge_max) continue;
         }
 
-        if (terrain) {
-            wy = jce_terrain_sample_height(terrain, wx, wz);
+        if (sample_surface) {
+            const bool need_normal = slope_limit || p->want_normals;
+            if (!sample_surface(surface_user, wx, wz, need_normal, &wy, nrm))
+                continue;
             if (height_band && (wy < p->height_min || wy > p->height_max))
                 continue;                       /* outside the altitude band */
-            /* One gradient serves both the slope rejection and the instance
-             * normal, so enabling normals alongside slope limiting costs no
-             * extra samples. */
-            if (slope_limit || p->want_normals) {
-                const float e   = 0.5f;
-                const float hxp = jce_terrain_sample_height(terrain, wx + e, wz);
-                const float hxm = jce_terrain_sample_height(terrain, wx - e, wz);
-                const float hzp = jce_terrain_sample_height(terrain, wx, wz + e);
-                const float hzm = jce_terrain_sample_height(terrain, wx, wz - e);
-                const float dx  = (hxp - hxm) / (2.0f * e);
-                const float dz  = (hzp - hzm) / (2.0f * e);
-                /* normal.y of normalize(-dx, 1, -dz). */
-                const float ny  = 1.0f / sqrtf(dx * dx + dz * dz + 1.0f);
-                if (slope_limit && ny < cos_max) continue;   /* too steep */
-                if (p->want_normals) {
-                    nrm[0] = -dx * ny;
-                    nrm[1] = ny;
-                    nrm[2] = -dz * ny;
+            if (need_normal) {
+                const float len_sq = nrm[0] * nrm[0] + nrm[1] * nrm[1] +
+                                     nrm[2] * nrm[2];
+                if (!(len_sq > 1e-12f) || !isfinite(len_sq)) continue;
+                const float inv_len = 1.0f / sqrtf(len_sq);
+                nrm[0] *= inv_len;
+                nrm[1] *= inv_len;
+                nrm[2] *= inv_len;
+                if (slope_limit && nrm[1] < cos_max) continue;
+                if (!p->want_normals) {
+                    nrm[0] = 0.0f;
+                    nrm[1] = 1.0f;
+                    nrm[2] = 0.0f;
                 }
             }
         }
@@ -191,6 +214,28 @@ uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
         ++n;
     }
     return n;
+}
+
+uint32_t jce_foliage_scatter(const JceFoliageScatterParams *p,
+                             const JceTerrain *terrain,
+                             const jce_vec3 *origin,
+                             JceFoliageInstance *out,
+                             uint32_t out_cap)
+{
+    return foliage_scatter_impl(p, terrain ? foliage_sample_terrain : NULL,
+                                (void *)terrain, origin, out, out_cap);
+}
+
+uint32_t jce_foliage_scatter_on_surface(
+    const JceFoliageScatterParams *p,
+    JceFoliageSurfaceSampleFn sample_surface,
+    void *surface_user,
+    const jce_vec3 *origin,
+    JceFoliageInstance *out,
+    uint32_t out_cap)
+{
+    return foliage_scatter_impl(p, sample_surface, surface_user, origin, out,
+                                out_cap);
 }
 
 /* ── Cooked placement ──────────────────────────────────────────────────
@@ -290,27 +335,28 @@ uint32_t jce_foliage_cooked_seed(const void *data, size_t size)
     return fcook_rd_u32(p + 12);
 }
 
+bool jce_foliage_cooked_validate(const void *data, size_t size)
+{
+    if (!data || size < FOLIAGE_COOK_HDR) return false;
+    const uint8_t *p = (const uint8_t *)data;
+    if (fcook_rd_u32(p + 0) != FOLIAGE_COOK_MAGIC) return false;
+    if (fcook_rd_u32(p + 4) != FOLIAGE_COOK_VERSION) return false;
+    if (fcook_rd_u32(p + 16) != (uint32_t)sizeof(JceFoliageInstance))
+        return false;
+
+    const uint32_t count = fcook_rd_u32(p + 8);
+    if (count > JCE_FOLIAGE_MAX_INSTANCES) return false;
+    const size_t need = jce_foliage_cook_size(count);
+    if (size < need) return false;
+    return fcook_hash(p, need) == fcook_rd_u32(p + FOLIAGE_COOK_HASH_OFF);
+}
+
 uint32_t jce_foliage_load_cooked(const void *data, size_t size,
                                  JceFoliageInstance *out, uint32_t out_cap)
 {
-    if (!data || !out || size < FOLIAGE_COOK_HDR) return 0u;
+    if (!out || !jce_foliage_cooked_validate(data, size)) return 0u;
     const uint8_t *p = (const uint8_t *)data;
-
-    if (fcook_rd_u32(p + 0) != FOLIAGE_COOK_MAGIC) return 0u;
-    if (fcook_rd_u32(p + 4) != FOLIAGE_COOK_VERSION) return 0u;
-    /* The instance stride is recorded and checked because JceFoliageInstance
-     * has grown before (the normal was added long after the type existed).  A
-     * stale cooked file would otherwise be read at the wrong stride and
-     * produce plausible garbage rather than an error. */
-    if (fcook_rd_u32(p + 16) != (uint32_t)sizeof(JceFoliageInstance)) return 0u;
-
     const uint32_t count = fcook_rd_u32(p + 8);
-    if (count > JCE_FOLIAGE_MAX_INSTANCES) return 0u;
-    const size_t need = jce_foliage_cook_size(count);
-    if (size < need) return 0u;
-    if (fcook_hash(p, need) != fcook_rd_u32(p + FOLIAGE_COOK_HASH_OFF))
-        return 0u;
-
     const uint32_t n = (count < out_cap) ? count : out_cap;
     if (n > 0u)
         memcpy(out, p + FOLIAGE_COOK_HDR,

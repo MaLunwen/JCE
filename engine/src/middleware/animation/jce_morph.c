@@ -7,6 +7,8 @@
  * vertex buffer (out = base + sum_i weight_i * delta_i) before skinning.
  */
 
+#include "middleware/animation/jce_morph_internal.h"
+
 #include <jce/middleware/animation/jce_morph.h>
 
 #include <jce/os/core/jce_log.h>
@@ -64,8 +66,18 @@ JceMorphData *JCE_CALL jce_morph_data_create(uint32_t num_targets,
     return m;
 }
 
+static JceMorphDestroyHook s_destroy_hook;
+
+void jce_morph_set_destroy_hook(JceMorphDestroyHook hook)
+{
+    s_destroy_hook = hook;
+}
+
 void JCE_CALL jce_morph_data_destroy(JceMorphData *m)
 {
+    /* BEFORE the free, and before the early-out below: a caller that frees a
+     * half-built JceMorphData is the same pointer to whoever cached it. */
+    if (m && s_destroy_hook) s_destroy_hook(m);
     if (!m) return;
     JCE_FREE(m->positions);
     JCE_FREE(m->normals);

@@ -59,6 +59,24 @@ JCE_API void jce_lod_setup(JceLodGroup *g,
  * prev_level: pass -1 on first call; otherwise feed back the previous
  *             return value to honour hysteresis.
  * Returns 0..count-1 on hit; -1 on cull (distance past last level). */
+/* Global LOD distance bias -- the same knob as Unity's
+ * QualitySettings.lodBias, and the meaning the editor's "LOD Bias" slider
+ * has always advertised (a float multiplier, default 1.0, range 0.1..10).
+ * Above 1.0 keeps higher-detail levels out to longer distances; below 1.0
+ * switches earlier.  Applied inside jce_lod_pick(), so every caller gets it:
+ * the scene renderer's per-entity and global LOD paths and the runtime's.
+ *
+ * IT USED TO GO SOMEWHERE ELSE ENTIRELY.  The shipped drop-in main fed the
+ * authored float to jce_texture_set_global_mip_bias() as an int8 top-mip
+ * DROP COUNT, so the default 1.0 silently dropped one mip level from every
+ * texture in every shipped game -- and 2.0, which a project asking for MORE
+ * detail would set, dropped two.  The editor applied nothing, so Play and
+ * ship disagreed by construction and the sign was backwards on top of it.
+ *
+ * Clamped to [0.01, 100].  Non-finite input is ignored. */
+JCE_API void  JCE_CALL jce_lod_set_global_bias(float bias);
+JCE_API float JCE_CALL jce_lod_get_global_bias(void);
+
 JCE_API int jce_lod_pick(const JceLodGroup *g, float distance, int prev_level);
 
 JCE_EXTERN_C_END

@@ -1,0 +1,24 @@
+# Build-script lines allowed to contain an absolute machine path, one per
+# line as '<repo-relative-path>:<line>' (or '<path>:*' for a whole file),
+# whitespace, then the REASON on the SAME line.
+#
+# A bare path with no reason is IGNORED, not accepted -- check_no_machine_paths.py
+# skips it, so "I'll write the justification later" fails closed instead of
+# silently passing.
+#
+# Before adding a line, prefer the other fix, which is almost always available:
+# derive the path. Three derivations cover every case this tree has had --
+#   * the environment variable the tool's own installer exports
+#     ($EMSDK, %ANDROID_HOME%, %JAVA_HOME%);
+#   * the tool ALREADY ON PATH, walked back to its root
+#     (`shutil.which`, or `%%~dp$PATH:I..` in batch);
+#   * a location stated RELATIVE to this repository (ROOT / "..").
+# All three mean the same thing on every machine. A literal does not.
+#
+# ---------------------------------------------------------------------------
+# EMPTY, and it should stay that way.
+#
+# It starts empty because the eight literals that prompted this gate were all
+# fixable by derivation -- none of them needed an exemption. If you are about
+# to add the first entry, that is the signal to check the three derivations
+# above one more time.

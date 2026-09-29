@@ -24,7 +24,8 @@
 
 extern "C" {
 #include "os/core/jce_memory.h"
-#include <cjson/cJSON.h>   /* the extracted-texture colour-space sidecar */
+#include <jce/os/core/jce_json.h>  /* the extracted-texture colour-space sidecar */
+#include "jce_model_import_settings.h"
 #include <jce/os/core/jce_log.h>
 #ifndef JCE_MODEL_IMPORTER_COOK_ONLY
 /* Renderer-internal CPU-model builder + GPU upload.  jce_resource PUBLICLY
@@ -493,6 +494,15 @@ static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
     out->vertex_count = 0;
     out->index_count = 0;
 
+    /* THE ASSET'S OWN IMPORT OPTIONS.  These were a constant flag word; the
+     * editor has been writing <asset>.import.json for every model an import
+     * preset touched, and nothing read it -- so "do not flip UVs" was written
+     * to disk exactly as asked and every model still imported flipped.
+     * Defaults equal the old constants, so a model with no sidecar is
+     * unchanged. */
+    JceModelImportSettings imp;
+    (void)jce_model_import_settings_load(file_path, &imp);
+
     Assimp::Importer importer;
     const aiScene *scene = nullptr;
 
@@ -510,12 +520,7 @@ static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
             if (dot) ext = dot;
             scene = importer.ReadFileFromMemory(
                 vbuf, (size_t)vsz,
-                aiProcess_Triangulate
-                | aiProcess_GenSmoothNormals
-                | aiProcess_FlipUVs
-                | aiProcess_CalcTangentSpace
-                | aiProcess_PreTransformVertices
-                | fbx_scale_flags(ext),
+                jce_model_import_assimp_flags(&imp, ext),
                 ext);
         }
     }
@@ -523,12 +528,7 @@ static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
     if (!scene) {
         scene = importer.ReadFile(
             file_path,
-            aiProcess_Triangulate
-            | aiProcess_GenSmoothNormals
-            | aiProcess_FlipUVs
-            | aiProcess_CalcTangentSpace
-            | aiProcess_PreTransformVertices
-            | fbx_scale_flags(file_path));
+            jce_model_import_assimp_flags(&imp, file_path));
     }
 
     if (!scene || !scene->mNumMeshes) {
@@ -542,6 +542,21 @@ static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
         LOG_ERROR(LOG_TAG, "cpu mesh conversion failed: %s", file_path);
         if (vbuf) jce_fs_buffer_free(vbuf);
         return false;
+    }
+
+    /* The authored uniform scale, applied AFTER assimp.
+     *
+     * Not folded into AI_CONFIG_GLOBAL_SCALE_FACTOR_KEY: that key multiplies
+     * with an FBX's own UnitScaleFactor, and this file already carries a
+     * comment about what that combination cost (209.94 -> 0.021, a 100x
+     * over-shrink).  Positions only -- normals and tangents are directions and
+     * a uniform scale leaves them unchanged. */
+    if (imp.scale != 1.0f && out->vertices) {
+        for (uint32_t i = 0; i < out->vertex_count; ++i) {
+            out->vertices[i].pos[0] *= imp.scale;
+            out->vertices[i].pos[1] *= imp.scale;
+            out->vertices[i].pos[2] *= imp.scale;
+        }
     }
 
     LOG_DEBUG(LOG_TAG, "decoded cpu mesh %s (%u verts, %u tris)",
@@ -1784,7 +1799,7 @@ static void write_embedded_colour_space(const char *model_path,
     if (bsep != std::string::npos) base = base.substr(bsep + 1);
     const std::string side = dir + base + ".import.json";
 
-    cJSON *root = NULL;
+    JceJson *root = NULL;
     /* uint64_t，不是 size_t：jce_fs_host_read_all 的第二参是 uint64_t*。
      * 在 x64 上两者同宽所以过得去，wasm32 的 size_t 只有 32 位，clang 直接
      * 拒绝 —— 这类「只在 32 位目标上暴露」的宽度错配，光在 x64 上构建
@@ -1792,23 +1807,23 @@ static void write_embedded_colour_space(const char *model_path,
     uint64_t existing_len = 0;
     void *existing = jce_fs_host_read_all(side.c_str(), &existing_len);
     if (existing) {
-        root = cJSON_ParseWithLength((const char *)existing, (size_t)existing_len);
+        root = jce_json_parse((const char *)existing, (size_t)existing_len);
         JCE_FREE(existing);
     }
-    if (!cJSON_IsObject(root)) {
-        if (root) cJSON_Delete(root);
-        root = cJSON_CreateObject();
+    if (!jce_json_is_object(root)) {
+        if (root) jce_json_free(root);
+        root = jce_json_object();
     }
     if (!root) return;
 
-    cJSON_DeleteItemFromObjectCaseSensitive(root, "colorSpace");
-    cJSON_AddStringToObject(root, "colorSpace", srgb ? "srgb" : "linear");
+    jce_json_remove(root, "colorSpace");
+    jce_json_set_string(root, "colorSpace", srgb ? "srgb" : "linear");
 
-    char *text = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    char *text = jce_json_print(root, /*pretty=*/false);
+    jce_json_free(root);
     if (!text) return;
     (void)jce_fs_host_write_all(side.c_str(), text, strlen(text));
-    cJSON_free(text);
+    jce_json_free_string(text);
 }
 
 /*
