@@ -71,3 +71,12 @@ editor/src/
 - Don't write game logic into the editor — gameplay lives in `examples/caged_kingdom/` or pluggable game modules.
 - Don't make panels >3000 lines — split with `_internal.h` like `panels/jce_panel_assets_*.cpp`.
 - Don't hard-code OS paths — use `jce_editor_path_util.cpp` and engine `jce_path` / PhysFS.
+
+## Native standalone distribution
+
+JCE_EDITOR_STANDALONE uses the ordinary editor sources and embedded editor PAK.
+It embeds LICENSE and THIRD_PARTY_LICENSES.md as native RCDATA resources.
+It links Lua/C/C++/JavaScript explicitly, requires a complete static-CRT graph
+and stages no runtime files. Python/Java/C# remain in the full language build.
+No editor capability may be removed just to hide a dependency. Packaging and
+PE validation belong to tools/build/standalone.py, not editor business code.

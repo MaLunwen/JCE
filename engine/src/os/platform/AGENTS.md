@@ -140,3 +140,12 @@ a partial sequence never lands in a buffer.
 **而进程确实活得到被轮询**:bgfx 的 `fatal()` **只在没有安装回调时** `abort()`;
 装了回调就完全委派并返回(`bgfx.cpp:543`)。本引擎的回调打个日志就返回——
 这是既有决定,也正是延迟投递能送到任何人手里的前提。
+
+## Shared-library loading
+
+jce_library.c owns all load/probe/symbol/unload paths. Windows explicit UTF-8
+paths use LoadLibraryExW with a per-load dependency search in the module's
+directory; bare system names retain normal search. Never change process-wide
+DLL directories to load a project plugin. Other hosts use SDL's loader.
+The first-party test_jce_library fixture keeps a real dependency beside its
+module, outside the executable directory, and checks independent references.

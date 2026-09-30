@@ -299,6 +299,7 @@ static void fv_open_info_tab(const char *open_path,
     if (!s_fv_restoring) {
         s_fv.want_focus = true;
         *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+        jce_editor_panel_request_focus("###file_viewer");
     }
 }
 
@@ -362,6 +363,7 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
             s_fv.select_tab_req = i;
             s_fv.want_focus = true;
             *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+            jce_editor_panel_request_focus("###file_viewer");
             if (!force_text && (tab->type == JCE_FV_AUDIO
                                 || tab->type == JCE_FV_VIDEO))
                 snprintf(s_fv.autoplay_path, sizeof(s_fv.autoplay_path),
@@ -641,6 +643,7 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
                      "%s", tab->path);
 
         *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+        jce_editor_panel_request_focus("###file_viewer");
 
         if (ftype == JCE_FV_SCENE && !force_text)
             jce_state_load_scene_file(open_path);
@@ -662,6 +665,7 @@ void jce_file_viewer_open_text_at(const char *path, int line)
 void jce_file_viewer_request_focus(void)
 {
     s_fv.want_focus = true;
+    jce_editor_panel_request_focus("###file_viewer");
 }
 
 void jce_file_viewer_draw_content(void)

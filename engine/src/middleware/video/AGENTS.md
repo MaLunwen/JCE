@@ -88,6 +88,9 @@ ready. Skip preview preparation for discarded reference frames. The owner uses
 jce_video_is_ready_to_play before resuming output; audio readiness requires PCM
 of the current generation, not merely track metadata. Positive advance remains
 pinned while a seek picture or audio buffer is missing.
+MP4 AV1 forward seeks within the current GOP may reuse the active dav1d
+context when its decoded picture safely precedes the target. Backward/close
+seeks reopen at the indexed random-access sample; never relabel a decoded PTS.
 
 Publish RGBA as well as YUV output already decoded by seek. A general YUV
 queue policy does not imply every codec emits YUV. Pop due pictures first;

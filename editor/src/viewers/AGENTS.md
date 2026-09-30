@@ -45,6 +45,8 @@ and `JCE_AUDIO_TRACE` report actual playback, not fixed-step simulation.
 
 Explicit video play waits for a published picture and ready audio before
 starting either clock; the first playback tick excludes prior load time.
+The first GPU texture also waits for two renderer submissions before either
+clock starts, so backend shader/texture warmup cannot become a playback gap.
 Pause, hide and scrubbing cancel pending starts as well as active playback.
 
 Video start/release uses a resume request, not an immediate playing flag. Keep

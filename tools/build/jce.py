@@ -1989,8 +1989,19 @@ def profiling_overrides(args) -> list:
     return [f"-DJCE_ENABLE_PROFILING={'ON' if want == 'on' else 'OFF'}"]
 
 
+def _standalone_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("jce_standalone", Path(__file__).with_name("standalone.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def cmd_editor(args) -> None:
     t = resolve_target(args.arch)
+    if getattr(args, "standalone", False):
+        _standalone_module().build_editor(sys.modules[__name__], args, t, msvc_env(t))
+        return
     if t["host"] != HOST:
         die(f"editor target {t['key']} must be built on host '{t['host']}'.")
     env = msvc_env(t)
@@ -2428,8 +2439,10 @@ def _announce_codec_policy(variant: str, what: str) -> None:
             "licensing. Use --variant dist for a royalty-free bundle.")
 
 def cmd_package_editor(args) -> None:
-    """Stage a redistributable editor bundle (exe + sdk/ + VERSION + README)
-    into dist/editor/<tag>-<arch>[-dist].  Replaces package-editor.bat."""
+    """Stage the editor delivery selected by the caller."""
+    if getattr(args, "standalone", False):
+        _standalone_module().package_editor(sys.modules[__name__], args)
+        return
     t = resolve_target(args.arch)
     if t["host"] != HOST:
         die(f"editor package target {t['key']} must be built on host '{t['host']}'.")
@@ -2578,11 +2591,11 @@ def cmd_package_game(args) -> None:
         _assert_no_profiler_listener(out / built.name, variant)
         for dll in built.parent.glob("*.dll"):
             shutil.copy2(dll, out / dll.name)
-        # Single-exe by default: the game embeds its PAK into the executable
-        # (jce_add_pak) and the runtime mounts only that blob, so the loose
-        # cooked tree beside the exe is redundant and would leak plaintext
-        # assets.  --with-loose (or manifest "stage_loose": true) re-stages it
-        # for dev / projects that genuinely load loose assets.
+        # Cooked assets are embedded in the executable (jce_add_pak), but a
+        # project can still require the DLLs copied above. Asset embedding
+        # alone is not proof of single-executable delivery. --with-loose (or
+        # manifest "stage_loose": true) re-stages files for development or
+        # projects that deliberately load loose assets.
         stage_loose = bool(getattr(args, "with_loose", False)) or \
                       bool(manifest.get("stage_loose", False))
         if stage_loose:
@@ -2607,8 +2620,8 @@ def cmd_package_game(args) -> None:
                 if extra_src.is_dir():
                     shutil.copytree(extra_src, out / extra, dirs_exist_ok=True)
         else:
-            log("single-file: loose cooked tree NOT staged (assets embedded in "
-                "exe; pass --with-loose for dev / non-embedded projects)")
+            log("embedded-assets: loose cooked tree NOT staged (assets embedded "
+                "in exe; check staged DLLs before claiming a single EXE)")
         (out / "VERSION.txt").write_text(
             f"name:     {name}\nversion:  {version}\n"
             f"platform: {SDK_TAG[t['host']]}\narch:     {t['arch']}\n"
@@ -3108,6 +3121,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_codec_switch(sp)
     add_graphics_api_tier(sp)
     sp.add_argument("--clean", action="store_true")
+    sp.add_argument("--standalone", action="store_true", help="native single EXE, static CRT; Lua/C/C++/JS; Windows dist only")
     sp.set_defaults(func=cmd_editor)
 
     sp = sub.add_parser("host-tools", help="build host jce_pak/jce_cook/jce_bin2obj")
@@ -3240,6 +3254,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe = pkg_sub.add_parser("editor", help="stage editor bundle (exe + sdk/ + README)")
     add_arch(pe)
     add_variant(pe, ["release", "dist"], "release")
+    pe.add_argument("--standalone", action="store_true", help="native single EXE; SDK and managed runtimes separate")
     pe.add_argument("--python-runtime", help="original matching Windows Python embeddable runtime directory (including license)")
     pe.add_argument("--skip-build", action="store_true",
                     help="reuse existing editor exe + SDK tree")
@@ -3266,7 +3281,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--clean", action="store_true")
     pg.add_argument("--with-loose", action="store_true",
                     help="also stage the loose cooked tree beside the exe "
-                         "(default: single-file, assets embedded in the exe)")
+                         "(default: assets embedded; runtime DLLs may remain)")
     pg.set_defaults(func=cmd_package_game)
 
     ps = pkg_sub.add_parser("sdk", help="build + install the SDK (alias of `sdk`)")

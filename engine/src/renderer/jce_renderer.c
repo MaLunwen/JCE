@@ -142,7 +142,7 @@ bool jce_renderer_is_egl_hung(void)
 bool jce_renderer_is_egl_hung(void) { return false; }
 #endif /* JCE_PLATFORM_ANDROID */
 #if JCE_PLATFORM_WINDOWS
-/* Backend probe uses jce_library_exists (SDL_LoadObject) for vulkan/d3d
+/* Backend probe uses jce_library_exists (platform loader) for vulkan/d3d
  * library presence — keeps <windows.h> and <dlfcn.h> out of engine sources. */
 #else
 #include <setjmp.h>
@@ -582,7 +582,7 @@ static bool s_probe_vulkan(void)
 #endif
 
     /* Probe the Vulkan loader via the os/platform library wrapper
-     * (SDL_LoadObject/SDL_LoadFunction under the hood — no raw dlopen/dlsym).
+     * (jce_library_open/jce_library_symbol through the platform layer).
      * We require the loader to export vkGetInstanceProcAddr, not merely map,
      * so a stub/forwarder library is skipped to the next backend.  We keep
      * the SIGSEGV-trap scaffold around the load so a crash inside a broken
@@ -1059,7 +1059,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     {
         JceRendererApiInfo api = jce_renderer_get_api_info();
         if (api.runtime_version_verified) {
-            LOG_INFO(LOG_TAG,
+            jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
                      "renderer: %s API %u.%u.%u (%s floor %u.%u.%u)",
                      bgfx_get_renderer_name(bgfx_get_renderer_type()),
                      (unsigned)api.runtime_version.major,
@@ -1070,7 +1070,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                      (unsigned)api.minimum_version.minor,
                      (unsigned)api.minimum_version.patch);
         } else {
-            LOG_INFO(LOG_TAG, "renderer: %s (graphics tier %s)",
+            jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                     "renderer: %s (graphics tier %s)",
                      bgfx_get_renderer_name(bgfx_get_renderer_type()),
                      jce_graphics_api_tier_name(api.build_tier));
         }

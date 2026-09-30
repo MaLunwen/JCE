@@ -1149,22 +1149,13 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
      * via the prebuilt keyframe_indices, then decode forward from there.
      * Falls back to sample 0 when the index is empty. */
     if (time_sec < 0.0) time_sec = 0.0;
-    if (slot->decoder.av1) {
-        jce_av1_close(slot->decoder.av1);
-        slot->decoder.av1 = NULL;
-    }
-    slot->decoder.av1 = jce_av1_packet_open_parallel();
-    if (!slot->decoder.av1) {
-        slot->decoder.ended = true;
-        return false;
-    }
-
     uint32_t ts_scale = slot->decoder.vtrack.timescale;
     if (ts_scale == 0) ts_scale = 1;
     uint64_t target_ts = (uint64_t)(time_sec * (double)ts_scale);
 
     /* Find largest keyframe sample whose timestamp <= target_ts. */
     uint32_t kf_sample = 0;
+    double kf_time_sec = 0.0;
     if (slot->decoder.keyframe_indices && slot->decoder.keyframe_count > 0) {
         const uint32_t *kf = slot->decoder.keyframe_indices;
         uint32_t kn = slot->decoder.keyframe_count;
@@ -1172,25 +1163,45 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
             JceMp4SampleInfo si;
             if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, kf[i], &si))
                 continue;
-            if (si.timestamp <= target_ts) kf_sample = kf[i];
+            if (si.timestamp <= target_ts) {
+                kf_sample = kf[i];
+                kf_time_sec = (double)si.timestamp / (double)ts_scale;
+            }
             else break;
         }
     }
 
-    slot->decoder.sample_idx = kf_sample;
-    slot->decoder.ended = false;
+    /* A forward seek within the current GOP can continue from the live
+     * decoder. Reopening at the preceding keyframe repeats expensive 4K
+     * reference-frame work already done during playback. Leave a small lead
+     * for dav1d's frame-thread delay; close seeks still restart so they can
+     * publish the exact requested picture. */
+    const bool reuse = slot->decoder.av1 && !slot->decoder.ended
+        && slot->frame_time >= kf_time_sec
+        && slot->frame_time + 0.25 < time_sec;
+    if (!reuse) {
+        if (slot->decoder.av1) {
+            jce_av1_close(slot->decoder.av1);
+            slot->decoder.av1 = NULL;
+        }
+        slot->decoder.av1 = jce_av1_packet_open_parallel();
+        if (!slot->decoder.av1) {
+            slot->decoder.ended = true;
+            return false;
+        }
+        slot->decoder.sample_idx = kf_sample;
+        slot->decoder.ended = false;
+        slot->frame_counter = 1;
+        slot->frame_time = 0.0;
+        /* Earlier samples may be the only source of the AV1 sequence OBU. */
+        if (!mp4_av1_prime_seq_header(slot)) return false;
+    }
     /* Anchor decode_ts_base to 0 so post-seek frame_time stays absolute.
      * MP4 sample timestamps are already absolute from track start, so no
      * offset is needed. See webm_decoder_seek for full rationale. */
-    slot->frame_counter = 1;
     slot->decode_ts_base_set = true;
     slot->decode_ts_base_sec = 0.0;
     if (!slot->queue_active) slot->time = time_sec;
-    slot->frame_time = 0.0;
-    /* Seq header may live only in sample 0 / earlier keyframes; if the
-     * seek target is past those samples and av1C had configOBUs, prime
-     * the decoder so the next sample's frame OBU isn't rejected. */
-    if (!mp4_av1_prime_seq_header(slot)) return false;
 
     /* Drain forward from the keyframe to the target. Bounded for inexact
      * (preview) seek so dragging stays smooth; unbounded for exact

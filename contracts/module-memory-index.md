@@ -61,6 +61,11 @@ maintained map, not a delivery plan or a snapshot of feature counts.
 | tools/coverage | [tools/coverage/AGENTS.md](../tools/coverage/AGENTS.md) |
 | tools/lint | [tools/lint/AGENTS.md](../tools/lint/AGENTS.md) |
 
+Native standalone editor build and PE verification: tools/build/standalone.py,
+owned by tools/build/AGENTS.md; editor selection: JCE_EDITOR_STANDALONE.
+Native module dependency loading: engine/src/os/platform/jce_library.c;
+regression: tests/os/platform/test_jce_library.c and its sibling DLL fixtures.
+
 Public ownership and ignore boundaries: [source-layout.json](source-layout.json).
 Public skill: [JCE en-US](../skills/jce/SKILL.md);
 [zh-CN translation](../skills/jce-zh-cn/SKILL.md). Locale inventory: [skill-locales.json](skill-locales.json). `docs/`, `.docs/` and `private/`

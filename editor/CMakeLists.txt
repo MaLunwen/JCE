@@ -110,7 +110,35 @@ target_include_directories(JCE_Editor PRIVATE
 #  backend registers, with wording that says the backend is linked and   #
 #  the path is wrong rather than "this language does not work".          #
 # ------------------------------------------------------------------ #
-jce_script_enable(JCE_Editor)
+option(JCE_EDITOR_STANDALONE
+    "Build a native single editor executable with embedded scripting runtimes" OFF)
+if(JCE_EDITOR_STANDALONE)
+    if(NOT JCE_PLATFORM_WINDOWS OR NOT MSVC)
+        message(FATAL_ERROR "JCE_EDITOR_STANDALONE currently requires Windows/MSVC")
+    endif()
+    if(NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "MultiThreaded" OR
+       CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+        message(FATAL_ERROR
+            "Standalone editor requires static CRT for the entire dependency graph; "
+            "use scripts/jce.py editor --standalone --variant dist")
+    endif()
+    # Explicit shipping contract: Lua is built into the engine; these three
+    # adapters link native libraries. Managed runtimes are separate builds.
+    # The ScriptApi import library is unused by this executable; a native
+    # project module supplies its own call-down ABI. Verify actual PE imports.
+    jce_script_enable(JCE_Editor LANGUAGES c cpp js REQUIRED NO_STAGE)
+    # Carry distribution notices in the native file, without sidecar dependencies.
+    enable_language(RC)
+    set(_jce_standalone_notices "${CMAKE_CURRENT_BINARY_DIR}/standalone_notices.rc")
+    file(GENERATE OUTPUT "${_jce_standalone_notices}" CONTENT
+        "#pragma code_page(65001)\nJCE_LICENSE RCDATA \"${PROJECT_SOURCE_DIR}/LICENSE\"\nJCE_THIRD_PARTY_LICENSES RCDATA \"${PROJECT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md\"\n")
+    target_sources(JCE_Editor PRIVATE "${_jce_standalone_notices}")
+    set_source_files_properties("${_jce_standalone_notices}" PROPERTIES
+        OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/LICENSE;${PROJECT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md")
+
+else()
+    jce_script_enable(JCE_Editor)
+endif()
 
 # The compiled com.jce.script classes are built by scripting/java and NOTHING
 # LINKS THEM, so the build edge has to be explicit here.  Without it they are

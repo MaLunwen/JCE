@@ -33,6 +33,27 @@ ctest --test-dir build/desktop/windows-x64 -L unit -j 8
 
 Local `docs/`, `.docs/`, generated outputs and unpublished workflows under `private/` are not distributed. Repository rules and the JCE skill are tracked.
 
+### Native single-EXE Windows editor
+
+```bash
+python scripts/jce.py package editor --arch x64 --variant dist --standalone
+```
+
+Copy only `dist/editor/JCE-editor-windows-x64.exe` to another directory and run
+it. The editor, engine, native runtimes and editor assets are linked into that
+EXE. There is no extraction launcher, embedded SDK, or required companion DLL.
+Windows system libraries and graphics drivers remain OS dependencies. The
+current Windows recipe is tested on Windows 10/11; older target compatibility
+requires separate validation.
+The optional `.manifest.json` beside the EXE records its SHA-256, OS imports,
+and a byte-verified inventory of embedded assets and license notices. The
+manifest is a release check, not a runtime dependency.
+
+This build runs Lua, JavaScript and native C/C++ script backends. Python, Java
+and C# use the existing full language build. SDKs, native project modules,
+project assets and development compilers are supplied separately when needed
+for project development; they do not enlarge the editor executable.
+
 ### AI authoring, and what is actually here
 
 `<jce/api_llm.h>` is a model-agnostic bridge with one deliberate design choice: **a provider is a PROGRAM**, invoked with `{prompt}` and `{response}` substituted into its argv. That is what makes "any model" a claim this can keep — a hosted API, a local runner like Ollama, or somebody's shell script are all the same thing to the engine. Two consequences worth knowing before you read the code:
@@ -104,7 +125,7 @@ The low baseline is a compatibility and efficiency target. It must not prevent t
 
 | | |
 | --- | --- |
-| Version | `0.11.4` (authoritative: `CMakeLists.txt`) |
+| Version | `0.12.2` (authoritative: `CMakeLists.txt`) |
 | Engine (C99) | 403 tracked `.c` under `engine/src/` |
 | Editor (C++20) | 220 tracked `.cpp` under `editor/src/`, 108 panels |
 | Public API | 298 headers under `engine/include/jce/`, 24 umbrellas, 3890 `JCE_API` symbols |

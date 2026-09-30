@@ -209,3 +209,24 @@ jce_add_unit_test(test_jce_input_backend_fake
 jce_add_unit_test(test_jce_console_shell
     SOURCES test_jce_console_shell.c
     LINK    jce_core jce_platform)
+
+# A real dependency chain outside the test executable's search directory.
+if(JCE_PLATFORM_WINDOWS OR JCE_PLATFORM_LINUX OR JCE_PLATFORM_MACOS)
+add_library(jce_library_test_dependency SHARED library_fixture_dependency.c)
+add_library(jce_library_test_module SHARED library_fixture_module.c)
+target_link_libraries(jce_library_test_module PRIVATE jce_library_test_dependency)
+foreach(_library_fixture jce_library_test_dependency jce_library_test_module)
+    set_target_properties(${_library_fixture} PROPERTIES
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/library fixture"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/library fixture")
+endforeach()
+unset(_library_fixture)
+jce_add_unit_test(test_jce_library SOURCES test_jce_library.c LINK jce_platform jce_core)
+add_dependencies(test_jce_library jce_library_test_module)
+target_compile_definitions(test_jce_library PRIVATE
+    "JCE_LIBRARY_FIXTURE_PATH=\"$<TARGET_FILE:jce_library_test_module>\"")
+
+else()
+    jce_test_suite_skipped("platform-library" "dynamic module fixture requires a desktop host loader")
+endif()

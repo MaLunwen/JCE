@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.11.4 LANGUAGES C)
+project(JCE VERSION 0.12.2 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)

@@ -370,9 +370,9 @@ void explain_load_failure(const char *abs)
         LOG_WARN(LOG_TAG, "%s",
                  "  The usual three: it is built for a different ARCHITECTURE "
                  "than this editor; it needs a dependent library the loader "
-                 "cannot find (dependencies resolve from THIS executable's "
-                 "directory, not the module's — jce_script_api is staged "
-                 "there); or it is built for a build CONFIGURATION whose C "
+                 "cannot find (check jce_script_api and runtime libraries "
+                 "beside the module, and any dependency search paths); or "
+                 "it is built for a build CONFIGURATION whose C "
                  "runtime is not installed. Rebuild the module for the "
                  "configuration this editor is, or set "
                  "JCE_SCRIPT_CPP_MODULES to one that is.");

@@ -399,6 +399,7 @@ jce_mp4_parser_open_source # low-level demux source; editor uses jce_video_load_
 jce_mp4_parser_video_sample_sync # internal seek index consumes MP4 sync flags
 jce_av1_open_source # low-level IVF decoder source; editor uses jce_video_load_file
 jce_video_load_memory # retained memory-input compatibility API; viewer now streams files
+jce_video_audio_seek # explicit audio transport for SDK clients; editor uses jce_video_seek, which seeks the owned stream atomically
 jce_audio_get_duration # resident JceSound API; file viewer now uses jce_audio_file_format
 jce_audio_get_pcm_data # resident PCM access; streaming viewer uses bounded waveform peaks
 jce_audio_get_time # resident JceSound transport; file viewer uses streaming file time

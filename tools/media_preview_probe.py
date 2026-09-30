@@ -54,6 +54,8 @@ def main() -> int:
         ap.error("frames must exceed the open frame (30); timeout must be positive")
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    engine_log = output.with_name(output.name + ".engine.log")
+    engine_log.unlink(missing_ok=True)
     folders = {Path.home() / ".jce", ROOT / ".jce", editor.parent / ".jce"}
     if args.scene:
         scene = args.scene.resolve(strict=True)
@@ -69,7 +71,7 @@ def main() -> int:
         env.pop(key, None)
     env.update(JCE_DBG_FILE_PREVIEW=str(media), JCE_VIDEO_TRACE="1",
                JCE_AUDIO_TRACE="1", JCE_WINDOW_HIDDEN="1", JCE_MULTI_INSTANCE="1",
-               JCE_MAX_FRAMES=str(args.frames))
+               JCE_MAX_FRAMES=str(args.frames), JCE_LOG_FILE=str(engine_log))
     if args.seeks:
         env["JCE_DBG_FILE_PREVIEW_SEEKS"] = ",".join(map(str, args.seeks))
     else:
@@ -104,7 +106,15 @@ def main() -> int:
             for path, data in files.items():
                 path.write_bytes(data)
             assert all(p.read_bytes() == b for p, b in files.items())
-    text = output.read_text(encoding="utf-8", errors="replace")
+    stdout_text = output.read_text(encoding="utf-8", errors="replace")
+    engine_text = (engine_log.read_text(encoding="utf-8", errors="replace")
+                   if engine_log.is_file() else "")
+    text = stdout_text + "\n" + engine_text
+    # The engine can mirror each log line to stdout and JCE_LOG_FILE. Parse
+    # telemetry from one channel so a single seek is never counted twice.
+    telemetry = (engine_text if any(marker in engine_text for marker in
+                 ("viewer trace wall=", "audio trace playing=", "seek requested target="))
+                 else stdout_text)
     backend = actual_backend(text)
     if args.backend:
         assert_backend(text, args.backend)
@@ -112,7 +122,7 @@ def main() -> int:
         assert_has_content(read_png(output.with_suffix(".png")), str(output))
     rows = []
     audio_rows = []
-    for line in text.splitlines():
+    for line in telemetry.splitlines():
         if "viewer trace wall=" in line:
             rows.append({key: float(value) for key, value in
                          re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)})
@@ -122,7 +132,7 @@ def main() -> int:
     failures = []
     seek_rows = {kind: [{key: float(value) for key, value in
                         re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)}
-                       for line in text.splitlines() if f"seek {kind} target=" in line]
+                       for line in telemetry.splitlines() if f"seek {kind} target=" in line]
                  for kind in ("requested", "waiting", "ready")}
     if args.seeks:
         if len(seek_rows["requested"]) != len(args.seeks) or len(seek_rows["ready"]) != len(args.seeks):
@@ -151,6 +161,11 @@ def main() -> int:
                 failures.append("audio preview causes slow editor frames")
             if args.paused and any(r["playing"] or r["time"] > .01 for r in audio_rows):
                 failures.append("paused audio advanced or played")
+            if not args.paused:
+                playing_audio = [r for r in audio_rows if r["playing"]]
+                if (len(playing_audio) < 2 or
+                        playing_audio[-1]["time"] - playing_audio[0]["time"] < .5):
+                    failures.append("audio preview did not play or advance")
     match = re.search(r"loaded " + re.escape(media.name)
                       + r" \d+x\d+ ([0-9.]+)fps .*?dur=([0-9.]+)s", text)
     # A capped transport waiting for tail drain is no longer steady playback.
@@ -165,20 +180,38 @@ def main() -> int:
             failures.append("insufficient actual playback samples")
         else:
             fps, duration = map(float, match.groups())
-            first, last = active[0], active[-1]
-            interval = last["media"] - first["media"]
-            cadence = (last["disp"] - first["disp"]) / interval if interval > 0 else 0
-            wall_interval = last["wall"] - first["wall"]
-            speed = interval / wall_interval if wall_interval > 0 else 0
-            if not .97 <= speed <= 1.03:
-                failures.append(f"media/wall-clock rate {speed:.3f}")
-            if cadence < fps * 0.90:
-                failures.append(f"presentation cadence {cadence:.2f} below {fps * .90:.2f}")
+            # A seek intentionally changes the media clock discontinuously.
+            # Measure only contiguous playback spans; comparing snapshots on
+            # opposite sides of a seek reports a false slow/negative rate.
+            spans = []
+            for row in active:
+                if not spans or (args.seeks and abs(
+                        (row["media"] - spans[-1][-1]["media"])
+                        - (row["wall"] - spans[-1][-1]["wall"])) > .20):
+                    spans.append([row])
+                else:
+                    spans[-1].append(row)
+            measured = 0
+            for span in spans:
+                first, last = span[0], span[-1]
+                interval = last["media"] - first["media"]
+                wall_interval = last["wall"] - first["wall"]
+                if wall_interval < .5:
+                    continue
+                measured += 1
+                cadence = (last["disp"] - first["disp"]) / interval if interval > 0 else 0
+                speed = interval / wall_interval
+                if not .97 <= speed <= 1.03:
+                    failures.append(f"media/wall-clock rate {speed:.3f}")
+                if cadence < fps * 0.90:
+                    failures.append(f"presentation cadence {cadence:.2f} below {fps * .90:.2f}")
+            if not measured:
+                failures.append("no steady playback span to measure")
             drift = max(abs(r["media"] - r["pts"]) for r in active)
             if drift > max(.10, 2 / fps):
                 failures.append(f"picture/clock drift {drift:.3f}s")
-            if last["max_gap_ms"] > 100:
-                failures.append(f"presentation gap {last['max_gap_ms']:.0f}ms")
+            if active[-1]["max_gap_ms"] > 100:
+                failures.append(f"presentation gap {active[-1]['max_gap_ms']:.0f}ms")
             if args.require_eof:
                 ended = [r for r in rows if not r.get("playing")
                          and r.get("media", 0) >= duration - .02]
@@ -198,7 +231,8 @@ def main() -> int:
               "exit_code": code, "timeout": timeout, "backend": backend,
               "wall_seconds": time.monotonic() - start, "settings_restored": True,
               "video_trace": rows, "audio_trace": audio_rows, "seek_trace": seek_rows,
-              "validation_failures": failures, "log": str(output)}
+              "validation_failures": failures, "log": str(output),
+              "engine_log": str(engine_log)}
     output.with_suffix(".json").write_text(json.dumps(result, indent=2) + "\n",
                                           encoding="utf-8", newline="\n")
     print(json.dumps({k: v for k, v in result.items() if k not in {"video_trace", "audio_trace", "seek_trace"}}))
@@ -207,7 +241,7 @@ def main() -> int:
         print("audio snapshots:", len(audio_rows), "last:", audio_rows[-1])
     if failures:
         print("FAIL:", "; ".join(failures))
-    if code or timeout or not backend or failures:
+    if code or timeout or failures or (args.backend and not backend):
         return 1
     if media.suffix.lower() in {".mp4", ".webm", ".mkv", ".ivf"} and not rows:
         return 1

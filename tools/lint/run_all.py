@@ -45,9 +45,12 @@ REPO_ROOT = LINT_DIR.parents[1]
 # An entry is either a bare filename (resolved under tools/lint/) or a
 # (repo-relative path, argv) pair for a checker that lives elsewhere.
 LINTS = [
+    "check_release_version.py",
+    ("tools/lint/check_release_version.py", ["--self-check"]),
     "check_repository_hygiene.py",
     ("tools/tests/test_shader_lint.py", []),
     ("tools/tests/test_build_driver.py", []),
+    ("tools/tests/test_standalone.py", []),
     ("tools/tests/test_conan_configuration.py", []),
     ("tools/tests/test_llm_transport.py", []),
     ("tools/tests/test_skills_paths.py", []),

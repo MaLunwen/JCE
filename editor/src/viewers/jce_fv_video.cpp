@@ -13,6 +13,7 @@
 
 #include "jce_fv_common.h"
 #include "core/jce_editor_i18n.h"
+#include "scene/jce_editor_scene_render.h"
 #include "ui/jce_editor_ui_state.h"
 
 extern "C" {
@@ -45,6 +46,7 @@ struct VideoState {
     int         tex_w;
     int         tex_h;
     uint64_t    uploaded_counter;
+    uint32_t    gpu_tex_create_frame;
 
     /* Transport state. */
     bool        playing;
@@ -239,12 +241,20 @@ static VideoState *ensure_loaded(FvTab *tab)
 
     /* Loading a restored preview must not start its clock or audio. */
     st->playing = false;
-    LOG_INFO(LOG_TAG, "loaded %s %dx%d %.2ffps codec=%s metadata_only=%d dur=%.2fs",
-             tab->display_name, st->info.width, st->info.height,
-             st->info.framerate,
-             st->info.video_codec[0] ? st->info.video_codec : "unkn",
-             (int)st->info.metadata_only,
-             st->info.duration);
+    if (getenv("JCE_VIDEO_TRACE")) {
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+            "loaded %s %dx%d %.2ffps codec=%s metadata_only=%d dur=%.2fs",
+            tab->display_name, st->info.width, st->info.height,
+            st->info.framerate,
+            st->info.video_codec[0] ? st->info.video_codec : "unkn",
+            (int)st->info.metadata_only, st->info.duration);
+    } else {
+        LOG_INFO(LOG_TAG, "loaded %s %dx%d %.2ffps codec=%s metadata_only=%d dur=%.2fs",
+            tab->display_name, st->info.width, st->info.height,
+            st->info.framerate,
+            st->info.video_codec[0] ? st->info.video_codec : "unkn",
+            (int)st->info.metadata_only, st->info.duration);
+    }
 
     /* ── Embedded audio ──────────────────────────────────────────── */
     /* Audio is now decoded asynchronously in the background.
@@ -296,6 +306,9 @@ static void upload_latest_frame(VideoState *st)
 
     const uint64_t t0 = jce_time_perf_counter();
     st->gpu_tex = jce_texture_from_rgba(rgba, uw, uh);
+    if (!jce_texture_valid(st->gpu_tex)) return;
+    st->gpu_tex_create_frame = jce_renderer_get_frame_index(
+        jce_editor_get_renderer());
     const uint64_t t1 = jce_time_perf_counter();
     const double us = (double)(t1 - t0) * 1e6
                     / (double)jce_time_perf_freq();
@@ -333,7 +346,8 @@ static void trace_playback(VideoState *st)
     jce_video_get_perf_stats(st->video,&perf);
     double pts = -1.0;
     jce_video_get_frame_rgba(st->video,nullptr,nullptr,&pts);
-    LOG_INFO(LOG_TAG,"viewer trace wall=%.3f media=%.3f pts=%.3f audio=%.3f playing=%d dec=%llu disp=%llu drop=%llu q=%d decode_ms=%.3f convert_ms=%.3f pop_ms=%.3f upload_ms=%.3f gaps25=%llu gaps50=%llu max_gap_ms=%llu",
+    jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+        "viewer trace wall=%.3f media=%.3f pts=%.3f audio=%.3f playing=%d dec=%llu disp=%llu drop=%llu q=%d decode_ms=%.3f convert_ms=%.3f pop_ms=%.3f upload_ms=%.3f gaps25=%llu gaps50=%llu max_gap_ms=%llu",
         st->trace_first_ms ? (double)(now-st->trace_first_ms)/1000.0 : 0.0,
         jce_video_get_time(st->video),pts,jce_video_audio_get_time(st->video),
         (int)st->playing,(unsigned long long)perf.frames_decoded,
@@ -369,7 +383,8 @@ static void tick_playback(VideoState *st, bool ui_focused)
         const bool deadline_hit = (ImGui::GetTime() >= st->audio_resume_deadline);
         if (video_caught_up) {
             if (getenv("JCE_DBG_FILE_PREVIEW_SEEKS")) {
-                LOG_INFO(LOG_TAG, "seek ready target=%.6f media=%.6f pts=%.6f audio=%.6f voice=%d wait_ms=%llu",
+                jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                    "seek ready target=%.6f media=%.6f pts=%.6f audio=%.6f voice=%d wait_ms=%llu",
                     target, jce_video_get_time(st->video), frame_time,
                     jce_video_audio_get_time(st->video),
                     st->audio && jce_audio_is_playing(st->audio, st->voice) ? 1 : 0,
@@ -385,7 +400,8 @@ static void tick_playback(VideoState *st, bool ui_focused)
             const uint64_t now = jce_time_ticks_ms();
             if (getenv("JCE_DBG_FILE_PREVIEW_SEEKS") && now >= st->probe_wait_log_ms) {
                 st->probe_wait_log_ms = now + 50u;
-                LOG_INFO(LOG_TAG, "seek waiting target=%.6f media=%.6f pts=%.6f audio=%.6f voice=%d",
+                jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                    "seek waiting target=%.6f media=%.6f pts=%.6f audio=%.6f voice=%d",
                     target, jce_video_get_time(st->video), frame_time,
                     jce_video_audio_get_time(st->video),
                     st->audio && jce_audio_is_playing(st->audio, st->voice) ? 1 : 0);
@@ -408,6 +424,14 @@ static void tick_playback(VideoState *st, bool ui_focused)
         if (!jce_video_get_frame_rgba(st->video, nullptr, nullptr, &pts)
             || pts > jce_video_get_time(st->video) + 0.05
             || !jce_video_is_ready_to_play(st->video))
+            return;
+        /* bgfx may compile the first video texture/display path at frame
+         * submission. Keep both media clocks stopped until two submissions
+         * have completed after texture creation. This uses the renderer's
+         * public frame index and applies to every graphics backend. */
+        if (!jce_texture_valid(st->gpu_tex)
+            || (uint32_t)(jce_renderer_get_frame_index(
+                    jce_editor_get_renderer()) - st->gpu_tex_create_frame) < 2u)
             return;
     }
 
@@ -581,7 +605,9 @@ static void probe_seek_playback(VideoState *st)
     if (end == sequence || target < 0.0 || target >= st->info.duration) return;
     ++st->probe_seek_index;
     st->probe_seek_start_ms = jce_time_ticks_ms();
-    LOG_INFO(LOG_TAG, "seek requested target=%.6f from=%.6f", target, jce_video_get_time(st->video));
+    jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+        "seek requested target=%.6f from=%.6f", target,
+        jce_video_get_time(st->video));
     begin_scrub(st, (float)target);
     finish_scrub(st);
 }
@@ -778,23 +804,10 @@ void fv_render_video(FvTab *tab)
 
     /* Space key toggles play/pause when the file viewer is focused. */
     if (can_decode && ui_focused && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        if (!st->playing) {
-            stop_other_playback(st->path);
-            if (jce_video_has_ended(st->video)) {
-                jce_video_rewind(st->video);
-                if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-                    jce_video_audio_seek(st->video, 0.0);
-            }
-            if (st->audio_available) {
-                if (st->voice == JCE_VOICE_INVALID)
-                    st->voice = fv_video_start_stream_voice(st);
-                else
-                    jce_audio_resume(st->audio, st->voice);
-            }
-            st->playing = true;
-        } else {
+        if (!st->playing && !st->play_requested)
+            fv_video_request_play(st->path);
+        else
             pause_state_playback(st);
-        }
     }
 
     ImGui::Separator();

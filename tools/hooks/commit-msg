@@ -1,0 +1,3 @@
+#!/bin/sh
+# Git runs this from the repository root; validate the staged release version.
+exec python tools/lint/check_release_version.py --commit-message-file "$1"

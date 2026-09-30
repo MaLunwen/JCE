@@ -1,7 +1,7 @@
 /*
  * jce_library.h  Cross-platform shared-library presence probe.
  *
- * Thin wrapper over SDL3's SDL_LoadObject so engine sources can check
+ * Platform wrapper (SDL3 outside Windows) so engine sources can check
  * whether a dynamic library (e.g. "vulkan-1.dll", "libvulkan.so.1") is
  * loadable on the host without pulling in <windows.h> or <dlfcn.h>.
  */
@@ -39,7 +39,9 @@ typedef void *JceLibrary;
  * the behaviour an injected in-application debug API (e.g. RenderDoc) needs.
  * Returns NULL if the library cannot be loaded. Resolve exports with
  * jce_library_symbol(); release with jce_library_close(). `name` is a
- * platform-native library name. */
+ * platform-native library name. Windows paths are UTF-8; explicit paths also
+ * search the module directory for its dependencies, without changing process
+ * search directories. Bare library names keep the normal platform search. */
 JCE_API JceLibrary JCE_CALL jce_library_open(const char *name);
 
 /* Resolves an exported symbol from a library opened with jce_library_open().
