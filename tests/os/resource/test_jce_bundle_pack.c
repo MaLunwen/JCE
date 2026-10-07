@@ -1134,6 +1134,45 @@ static void test_every_script_language_reaches_the_packaged_bundle(void)
     jce_pak_close(pak);
 }
 
+/* Synthetic shader bytes test dependency transport, not shader/GPU execution. */
+static bool test_shader_fallback(const char *path, char *out, size_t capacity, void *user)
+{
+    if (strcmp(path, "shaders/stock_dx11.bin") != 0) return false;
+    const int written = snprintf(out, capacity, "%s", (const char *)user);
+    return written >= 0 && (size_t)written < capacity;
+}
+
+static void test_shader_alternative_source_and_unknown_required(void)
+{
+    char scene[1024], out_dir[1024], material_dir[1024], material[1024], shader[1024], graph[1024];
+    join_path(scene, sizeof(scene), "shader.scene.json");
+    join_path(out_dir, sizeof(out_dir), "out_shader");
+    join_path(material_dir, sizeof(material_dir), "materials");
+    join_path(material, sizeof(material), "materials/custom.mat.json");
+    join_path(shader, sizeof(shader), "provider_stock.bin");
+    join_path(graph, sizeof(graph), "out_shader/bundle_graph.json");
+    TEST_ASSERT_TRUE(jce_fs_host_create_directory(material_dir));
+    const char *scene_json = "{\"entities\":[{\"materialPath\":\"materials/custom.mat.json\"}]}";
+    const char *descriptor = "{\"customProgramFs\":\"shaders/stock.bin\"}";
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(scene, scene_json, (uint64_t)strlen(scene_json)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(material, descriptor, (uint64_t)strlen(descriptor)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(shader, "SYNTHETIC", 9));
+    const char *scenes[1] = {scene};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scene, out_dir, scenes);
+    opts.resolve_fn = test_shader_fallback; opts.resolve_user = shader;
+    TEST_ASSERT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    uint64_t size = 0; void *data = jce_fs_host_read_all(graph, &size);
+    TEST_ASSERT_NOT_NULL(data);
+    TEST_ASSERT_NOT_NULL(strstr((const char *)data, "shaders/stock_dx11.bin"));
+    TEST_ASSERT_NULL(strstr((const char *)data, "shaders/stock_essl1.bin"));
+    jce_fs_buffer_free(data);
+    descriptor = "{\"customProgramFs\":\"shaders/unknown.bin\"}";
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(material, descriptor, (uint64_t)strlen(descriptor)));
+    TEST_ASSERT_NOT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    TEST_ASSERT_TRUE(g_error_count > 0);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1153,5 +1192,6 @@ int main(void)
     RUN_TEST(test_parallel_cook_of_multiple_textures);
     RUN_TEST(test_pack_env_scenes);
     RUN_TEST(test_always_included_reaches_the_bundle);
+    RUN_TEST(test_shader_alternative_source_and_unknown_required);
     return UNITY_END();
 }

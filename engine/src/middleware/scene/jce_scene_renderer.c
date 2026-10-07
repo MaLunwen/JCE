@@ -2463,15 +2463,24 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     }
     sr->model_inflight = 0;
 
-    /* Async texture decodes still in flight: cancel and drop CPU results. */
+    /* This cache owns runtime uploads; callback-provided textures bypass it
+     * and remain borrowed. Cancel pending CPU jobs before releasing uploads. */
     for (int i = 0; i < sr->tex_cache_count; i++) {
-        if (!sr->tex_cache[i].pending) continue;
-        struct SrTexJob *j = sr->tex_cache[i].job;
-        sr_async_task_cancel_and_release(&sr->tex_cache[i].task);
-        sr_tex_job_destroy(j);
+        if (sr->tex_cache[i].pending) {
+            struct SrTexJob *j = sr->tex_cache[i].job;
+            sr_async_task_cancel_and_release(&sr->tex_cache[i].task);
+            sr_tex_job_destroy(j);
+        }
+        if (sr->tex_cache[i].used && jce_texture_valid(sr->tex_cache[i].tex))
+            jce_texture_destroy(sr->tex_cache[i].tex);
+        sr->tex_cache[i].tex = (JceTexture){ UINT16_MAX };
+        sr->tex_cache[i].used = false;
         sr->tex_cache[i].job = NULL;
+        sr->tex_cache[i].task = NULL;
         sr->tex_cache[i].pending = false;
     }
+    sr->tex_cache_count = 0;
+    memset(sr->tex_hash, 0, sizeof(sr->tex_hash));
     sr->tex_inflight = 0;
 
     /* Shader Graph custom-program cache: lookup-only.  The programs are

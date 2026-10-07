@@ -426,6 +426,23 @@ function(jce_register_sdk_install)
 			DESTINATION "${_engine_share_root}/engine_ui")
 	endif()
 
+	# Install only compiled stock bytes proven against this build's embedded PAK.
+	if(JCE_EMBED_ENGINE_SHADERS)
+		if(NOT Python3_FOUND)
+			find_package(Python3 COMPONENTS Interpreter REQUIRED)
+		endif()
+		install(CODE "
+set(JCE_SHADER_STOCK_PYTHON [==[${Python3_EXECUTABLE}]==])
+set(JCE_SHADER_STOCK_SCRIPT [==[${CMAKE_SOURCE_DIR}/tools/assets/shader_stock.py]==])
+set(JCE_SHADER_STOCK_BOM [==[${JCE_ENGSH_BOM_FILE}]==])
+set(JCE_SHADER_STOCK_ROOT [==[${ENGINE_RESOURCE_DIR}]==])
+set(JCE_SHADER_STOCK_OUT \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${_engine_share_root}/shaders\")
+set(JCE_SHADER_STOCK_MANIFEST_ROOT \"\${CMAKE_INSTALL_PREFIX}/${_engine_share_root}/shaders\")
+set(JCE_SHADER_STOCK_PROFILES [==[${JCE_SHADER_PROFILES}]==])
+include([==[${CMAKE_SOURCE_DIR}/cmake/JCEStageShaderStock.cmake]==])
+")
+	endif()
+
 	# Project-authored shaders are compiled by the SDK with the same shaderc,
 	# profile matrix and lint module as the engine build. Only the stable bgfx
 	# shader ABI includes are installed; project source remains project-owned.

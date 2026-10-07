@@ -70,3 +70,11 @@ Host-file input is explicit; it must never quietly fall back to full reads/mappi
 Realtime epoch milliseconds are available through jce_time_now_epoch_milliseconds; monotonic perf counters remain the duration authority. The consumer preserves original frame-based movement and wall-dt shooting/waves. Explicit fixed-step reference fixtures are distinct from realtime interaction.
 
 Assertion/ensure logging supplies source file and line before variadic format arguments, matching the public logger ABI on strict C99/wasm as well as native builds.
+
+Trace JSON exports carry `jceTrace` recorded/captured counts, separately named
+pre-capture ring overwrites and cursor losses, their total `lost`, and capture
+reset-generation stability. Task-end args retain the actual success/failure/
+cancellation state. These metadata describe capture coverage, not proof that all
+expected lifecycle phases occurred; callers must reject incomplete evidence.
+The bootstrap scope CPU target validates actual nested public trace events and
+parent restoration without starting a graphics device.

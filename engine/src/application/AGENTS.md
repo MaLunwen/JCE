@@ -336,3 +336,33 @@ Frame KPI export remains enabled when JCE_PERF_LOG is absent; periodic console l
 The public default host applies packed settings/project-settings.json when authoring host files are absent, using the existing bounded PAK config reader. SDK embedding copies authored project settings into that reserved resource path and removes stale generated settings when absent. Colour space, quality and time/audio parameters must survive single-file relocation.
 
 Default-host Canvas UI consumes jce_input_primary_pointer for physical mouse or primary touch, retaining touch release coordinates. Gameplay mouse/touch streams remain independent; platform mirror filtering must not disable touch UI.
+
+## Lifecycle dispatch mutation and teardown
+
+Lifecycle emit freezes an entry identity ceiling and walks the existing sorted
+registry by immutable (priority, identity), requiring no temporary allocation. Callback removal
+is immediate; insertion waits for another emit. Nested emits own independent
+snapshots and getters retain the most recent paired event. Shutdown cancels all
+active snapshots through a private epoch and resets focus/pause even before
+allocator initialization. Opaque IDs remain monotonic across shutdown; exhaustion
+fails registration rather than aliasing stale handles. LOW_MEMORY dispatch
+still reaches every surviving entry listener when allocation fails; new listener
+table growth can fail explicitly without disturbing existing listeners.
+`test_jce_lifecycle_device_lost` covers live mutation/nesting/shutdown/80listeners;
+`test_jce_lifecycle_allocation` compiles the exact production registry with a
+faultable allocator to exercise allocation-free delivery and table growth failure
+without devices.
+
+## Service trace scopes
+
+jce_engine_trace_scope.h reuses the public trace task authority for synchronous
+window/renderer/subsystem/application construction and teardown. It restores
+parent task ownership, adds no global registry or public ABI, and is idle when
+capture is off. JCE_TRACE_EXPORT itself enables capture; exported resident
+records carry loss/generation metadata and task outcomes. Window/renderer
+creation spans measure attempted service work, not successful GPU completion.
+
+Optional application update and draw callbacks dispatch independently through
+jce_engine_callbacks.h. Draw-only applications are valid. app_simulation and
+app_draw report separate CPU phases; app_update remains the historical combined
+metric for compatibility. Neither metric substitutes for GPU execution time.

@@ -73,3 +73,17 @@ reach the public packer; retain real cooking and VFS behavior without shaders.
 Web SDK archive embedding uses --embed-file plus SINGLE_FILE so code and MEMFS assets live in one HTML executable. Verify deployment with only that artifact; preloaded companion data is not single-file delivery.
 
 SDK embedding packs authored .jce/project-settings.json under settings/project-settings.json beside the runtime boot contract. Configure dependencies refresh edits, and absence removes stale generated settings; host working-directory settings are not a shipping dependency.
+
+Lifecycle trace acceptance uses lifecycle_trace_report.py with explicit required
+CPU phase names. Ring overwrite, reset and missing outcomes cannot certify a
+complete lifecycle. Keep raw input SHA and report the measured subset; it is not
+a GPU completion, all-service or resource-leak certificate.
+
+The bundle command accepts an explicit --shader-root for installed SDK stock binaries. It is a fallback after project/VFS sources and only resolves canonical shaders/*.bin addresses inside that root. SDK shipment admission validates the stock catalog against its actual embedded-pack provenance before passing the root; never admit unknown programs or substitute arbitrary filenames for absent dependencies.
+
+shader_stock.py stages compiled shader bytes from the current engine PAK BOM;
+its content checksum is XXH32(seed=0), with SHA256 for installed identities.
+Only verified owned stale stock files may be retired, and unknown binary files
+reject the operation. editor_lifecycle_probe.py observes real hidden Play/Stop
+phases and full scene restoration independently of performance INFO logs; it
+never converts missing timing evidence into a performance PASS.

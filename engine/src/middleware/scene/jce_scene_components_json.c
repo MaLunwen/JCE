@@ -6,6 +6,7 @@
  */
 
 #include "jce_scene_components_internal.h"
+#include "jce_scene_rotation_internal.h"
 #include <jce/middleware/scene/jce_material_override.h>
 /* jce_prefab_instantiate{,_file} return JceEntity (uint64_t).  Without this
  * header they were called through an implicit `extern int`, so only EAX came
@@ -958,8 +959,7 @@ static void parse_transform(JceScene *s, JceEntity e, const cJSON *c)
     const cJSON *rw = cJSON_GetObjectItemCaseSensitive(c, "rotW");
     if (!rw) rw = cJSON_GetObjectItemCaseSensitive(c, "rot_w");
     if (cJSON_IsNumber(rw)) {
-        jce_quat q = jce_v4(rx, ry, rz, (float)rw->valuedouble);
-        t.rotation = jce_q_normalize(q);
+        t.rotation = parsed_rotation_quaternion(rx, ry, rz, (float)rw->valuedouble);
     } else {
         t.rotation = q_from_euler_deg(rx, ry, rz);
     }
@@ -986,7 +986,7 @@ static void parse_pivot(JceScene *s, JceEntity e, const cJSON *c)
     if (!rw) rw = cJSON_GetObjectItemCaseSensitive(c, "rot_w");
     if (cJSON_IsNumber(rw)) {
         p.local_rotation =
-            jce_q_normalize(jce_v4(rx, ry, rz, (float)rw->valuedouble));
+            parsed_rotation_quaternion(rx, ry, rz, (float)rw->valuedouble);
     } else {
         p.local_rotation = q_from_euler_deg(rx, ry, rz);
     }
@@ -1520,11 +1520,11 @@ static void ser_transform(const JceTransform *t, cJSON *arr)
     cJSON_AddNumberToObject(o, "posX", t->position.x);
     cJSON_AddNumberToObject(o, "posY", t->position.y);
     cJSON_AddNumberToObject(o, "posZ", t->position.z);
-    float eu[3];
-    q_to_euler_deg(t->rotation, eu);
-    cJSON_AddNumberToObject(o, "rotX", eu[0]);
-    cJSON_AddNumberToObject(o, "rotY", eu[1]);
-    cJSON_AddNumberToObject(o, "rotZ", eu[2]);
+    /* Canonical quaternion output, matching Pivot. Euler input stays supported. */
+    cJSON_AddNumberToObject(o, "rotX", t->rotation.x);
+    cJSON_AddNumberToObject(o, "rotY", t->rotation.y);
+    cJSON_AddNumberToObject(o, "rotZ", t->rotation.z);
+    cJSON_AddNumberToObject(o, "rotW", t->rotation.w);
     cJSON_AddNumberToObject(o, "scaleX", t->scale.x);
     cJSON_AddNumberToObject(o, "scaleY", t->scale.y);
     cJSON_AddNumberToObject(o, "scaleZ", t->scale.z);

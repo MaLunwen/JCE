@@ -200,7 +200,15 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
             bgfx_destroy_texture(textures[0]);
         if (BGFX_HANDLE_IS_VALID(textures[1]))
             bgfx_destroy_texture(textures[1]);
-        LOG_WARN(LOG_TAG, "failed to allocate editor target textures %ux%u", width, height);
+        LOG_WARN(LOG_TAG,
+                 "failed to allocate offscreen textures %ux%u: "
+                 "color_fmt=%u color_caps=0x%x color=%u "
+                 "depth_caps=0x%x depth=%u",
+                 width, height, (unsigned)color_fmt,
+                 caps ? (unsigned)caps->formats[color_fmt] : 0u,
+                 (unsigned)textures[0].idx,
+                 caps ? (unsigned)caps->formats[BGFX_TEXTURE_FORMAT_D24S8] : 0u,
+                 (unsigned)textures[1].idx);
         return false;
     }
 

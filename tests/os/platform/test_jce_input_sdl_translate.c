@@ -493,9 +493,30 @@ static void test_submit_applies_the_mouse_mask_exactly_once(void)
     jce_input_capture(in, &frame);
     TEST_ASSERT_EQUAL_UINT32(1u << 2, frame.mouse_buttons);
 
+    /* Sample the held state before the ordinary next-frame release. A
+     * same-frame DOWN/UP now deliberately retains the effective press pulse. */
+    jce_input_update(in);
     ev.mbutton.down = 0;
     jce_input_submit(in, &ev, 1);
     TEST_ASSERT_FALSE(jce_input_mouse_button(in, 3));
+    TEST_ASSERT_TRUE(jce_input_mouse_button_released(in, 3));
+    jce_input_capture(in, &frame);
+    TEST_ASSERT_EQUAL_UINT32(0u, frame.mouse_buttons);
+
+    /* A fresh rapid click still uses the identical one-based mask, not a
+     * second shift or a physical hold. Its next frame exposes release. */
+    jce_input_update(in);
+    ev.mbutton.down = 1;
+    jce_input_submit(in, &ev, 1);
+    ev.mbutton.down = 0;
+    jce_input_submit(in, &ev, 1);
+    TEST_ASSERT_TRUE(jce_input_mouse_button_pressed(in, 3));
+    TEST_ASSERT_FALSE(jce_input_mouse_button(in, 4));
+    jce_input_capture(in, &frame);
+    TEST_ASSERT_EQUAL_UINT32(1u << 2, frame.mouse_buttons);
+    jce_input_update(in);
+    TEST_ASSERT_FALSE(jce_input_mouse_button(in, 3));
+    TEST_ASSERT_TRUE(jce_input_mouse_button_released(in, 3));
 
     jce_input_destroy(in);
 }

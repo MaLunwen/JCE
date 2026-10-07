@@ -6,6 +6,7 @@
  * and the previous pass's output as input texture.
  */
 
+#include "jce_shader_deferred.h"
 #include "jce_renderer_bgfx_callback.h"   /* half decode + host frame index */
 #include "os/core/jce_memory.h"      /* JCE_CALLOC / JCE_FREE */
 #include "renderer/jce_view_bands.h"
@@ -128,6 +129,8 @@ struct JcePostFXPipeline {
      * the apply target and reallocated on resize (history_valid resets then,
      * so the first post-resize resolve treats history as empty → ~current). */
     bool                       taa_enabled;       /* requested by the renderer */
+    bool                       taa_log_reported;  /* status belongs to this pipeline */
+    bool                       taa_log_submitted; /* last CPU resolve submission */
     float                      taa_params[4];     /* feedback, luma_clamp, motion_clamp, 0 */
     bool                       taa_have_matrices; /* matrices pushed this frame */
     float                      taa_inv_view_proj[16];
@@ -243,6 +246,8 @@ static void reset_output_state(JcePostFXPipeline *pipeline)
     pipeline->output_tex = (bgfx_texture_handle_t){ UINT16_MAX };
     pipeline->output_fb = (bgfx_frame_buffer_handle_t){ UINT16_MAX };
     pipeline->output_ping = -1;
+    pipeline->mb_active = false;
+    pipeline->dof_active = false;
 }
 
 /* ── Default parameters ────────────────────────────────────────────── */
@@ -288,23 +293,16 @@ static const uint16_t s_quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
  * some ANGLE configs lack the FRAMEBUFFER cap bit) — creating the FBO anyway
  * makes bgfx fail the frame-buffer, and the whole post chain silently goes
  * black on just those backends.  Fall back to RGBA8 like the editor's
- * offscreen bridge does (jce_offscreen_target.c): bloom/TAA still run,
- * merely LDR-clamped (bloom extraction over threshold 1.0 mostly no-ops). */
+ * offscreen bridge does (jce_offscreen_target.c). Bloom becomes LDR-clamped
+ * (extraction over threshold 1.0 mostly no-ops); TAA remains disabled. */
 static bgfx_texture_format_t postfx_color_format(void)
 {
-    /* Hardware capability is fixed for the process, so cache only that. */
-    static int s_hw_can_16f = -1;
-    if (s_hw_can_16f < 0) {
-        const bgfx_caps_t *caps = bgfx_get_caps();
-        if (!caps)
-            return BGFX_TEXTURE_FORMAT_RGBA16F; /* pre-init probe: don't cache */
-        s_hw_can_16f = (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
-                        & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) != 0;
-        if (!s_hw_can_16f)
-            LOG_WARN(LOG_TAG, "RGBA16F render target unsupported; post-FX "
-                              "chain falls back to RGBA8 (LDR bloom/TAA)");
-    }
-    if (!s_hw_can_16f) return BGFX_TEXTURE_FORMAT_RGBA8;
+    /* A renderer/context may be replaced during this process. Query its current
+     * capability rather than retaining the previous device's answer. */
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
+                  & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) == 0)
+        return BGFX_TEXTURE_FORMAT_RGBA8;
 
     /* The pipeline's hdr_color flag is false on the LOW and MEDIUM tiers --
      * PBR, bloom, SSAO, SSR and TAA are all off there, so nothing consumes
@@ -529,15 +527,65 @@ static void destroy_taa_fbos(JcePostFXPipeline *p)
     p->history_valid  = false;
 }
 
+static void release_postfx_program(bgfx_program_handle_t *program)
+{
+    jce_shader_program_destroy((JceShaderHandle){ program->idx });
+    program->idx = UINT16_MAX;
+}
+
+static void release_stock_programs(JcePostFXPipeline *pipeline)
+{
+    bgfx_program_handle_t *programs[] = {
+        &pipeline->prog_bloom_extract,
+        &pipeline->prog_bloom_blur,
+        &pipeline->prog_bloom_combine,
+        &pipeline->prog_fxaa,
+        &pipeline->prog_vignette,
+        &pipeline->prog_chromatic,
+        &pipeline->prog_grayscale,
+        &pipeline->prog_composite,
+        &pipeline->prog_present,
+        &pipeline->prog_rcas,
+        &pipeline->prog_tsr,
+        &pipeline->prog_motion_vec,
+        &pipeline->prog_taa,
+        &pipeline->prog_bloom_down,
+        &pipeline->prog_bloom_up,
+    };
+    for (size_t i = 0; i < sizeof programs / sizeof programs[0]; ++i)
+        release_postfx_program(programs[i]);
+}
+
+/* Keep ownership handles intact; only submission uses the concrete program. */
+static bool postfx_program_ready(bgfx_program_handle_t program)
+{
+    return jce_shader_deferred_resolve(program.idx) != UINT16_MAX;
+}
+
+static bool submit_postfx(uint16_t view_id, bgfx_program_handle_t program)
+{
+    program.idx = jce_shader_deferred_resolve(program.idx);
+    if (program.idx == UINT16_MAX) {
+        bgfx_discard(BGFX_DISCARD_ALL);
+        return false;
+    }
+    bgfx_submit(view_id, program, 0, BGFX_DISCARD_ALL);
+    return true;
+}
+
 /* ── Full-screen quad draw ─────────────────────────────────────────── */
 
-static void draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
+static bool draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
                             bgfx_program_handle_t prog)
 {
+    if (p->quad_vb.idx == UINT16_MAX || p->quad_ib.idx == UINT16_MAX) {
+        bgfx_discard(BGFX_DISCARD_ALL);
+        return false;
+    }
     bgfx_set_vertex_buffer(0, p->quad_vb, 0, 4);
     bgfx_set_index_buffer(p->quad_ib, 0, 6);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
-    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    return submit_postfx(view_id, prog);
 }
 
 /* AUTO EXPOSURE: targets, metering, adaptation. */
@@ -748,7 +796,7 @@ static void ae_update(JcePostFXPipeline *p, uint16_t view_id,
                       uint16_t blit_view, bgfx_texture_handle_t src)
 {
     if (!p->ae_enabled) return;
-    if (p->prog_bloom_down.idx == UINT16_MAX) return;  /* metering shader absent */
+    if (!postfx_program_ready(p->prog_bloom_down)) return;  /* metering shader absent */
     if (!ae_ensure_targets(p)) return;
     ae_harvest(p);
     ae_advance(p);
@@ -992,30 +1040,14 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->s_texLUT.idx      != UINT16_MAX) bgfx_destroy_uniform(pipeline->s_texLUT);
     if (pipeline->dummy_lut3d.idx   != UINT16_MAX) bgfx_destroy_texture(pipeline->dummy_lut3d);
 
-    /* Destroy shader programs. */
-    if (pipeline->prog_bloom_extract.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_extract);
-    if (pipeline->prog_bloom_blur.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_blur);
-    if (pipeline->prog_bloom_combine.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_combine);
-    if (pipeline->prog_fxaa.idx          != UINT16_MAX) bgfx_destroy_program(pipeline->prog_fxaa);
-    if (pipeline->prog_vignette.idx      != UINT16_MAX) bgfx_destroy_program(pipeline->prog_vignette);
-    if (pipeline->prog_chromatic.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_chromatic);
-    if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
-    if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
-    if (pipeline->prog_present.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_present);
-    if (pipeline->prog_rcas.idx          != UINT16_MAX) bgfx_destroy_program(pipeline->prog_rcas);
-    if (pipeline->prog_tsr.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tsr);
+    release_stock_programs(pipeline);
+    release_postfx_program(&pipeline->prog_custom);
     for (int i = 0; i < 2; ++i) {
         if (pipeline->tsr_hist_fb[i].idx  != UINT16_MAX) bgfx_destroy_frame_buffer(pipeline->tsr_hist_fb[i]);
         if (pipeline->tsr_hist_tex[i].idx != UINT16_MAX) bgfx_destroy_texture(pipeline->tsr_hist_tex[i]);
     }
     if (pipeline->tsr_motion_fb.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(pipeline->tsr_motion_fb);
     if (pipeline->tsr_motion_tex.idx != UINT16_MAX) bgfx_destroy_texture(pipeline->tsr_motion_tex);
-    if (pipeline->prog_motion_vec.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_motion_vec);
-    if (pipeline->prog_taa.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_taa);
-    if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
-    /* Stage-1a.5 bloom pyramid programs. */
-    if (pipeline->prog_bloom_down.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_down);
-    if (pipeline->prog_bloom_up.idx      != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_up);
 
     jce_allocator_t a = pipeline->alloc;
     a.free(pipeline, a.ctx);
@@ -1256,8 +1288,8 @@ void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
      * deltas, which the RGBA8 fallback (see postfx_color_format) would clamp
      * to [0,1] and smear the resolve.  On such backends TAA stays off. */
     if (enabled && postfx_color_format() != BGFX_TEXTURE_FORMAT_RGBA16F) {
-        LOG_WARN(LOG_TAG, "TAA requested but RGBA16F targets are unavailable; "
-                          "keeping TAA off");
+        LOG_WARN(LOG_TAG, "TAA requires RGBA16F target support and hdr_color "
+                          "enabled; keeping TAA off");
         enabled = false;
     }
     pipeline->taa_enabled    = enabled;
@@ -1353,7 +1385,7 @@ static bgfx_program_handle_t load_postfx_prog(const JcePakArchive *pak,
 {
     bgfx_program_handle_t invalid;
     invalid.idx = UINT16_MAX;
-    JceShaderHandle h = shader_load_program_named(pak, "postfx", fs_name);
+    JceShaderHandle h = { jce_shader_program_prepare(pak, "postfx", fs_name) };
     if (h.idx == UINT16_MAX) {
         LOG_WARN(LOG_TAG, "post-fx shader '%s' not found in PAK", fs_name);
         return invalid;
@@ -1371,6 +1403,9 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
         LOG_ERROR(LOG_TAG, "cannot load post-fx shaders: NULL PAK");
         return false;
     }
+
+    /* Reload releases linked programs and unused owned source bytes alike. */
+    release_stock_programs(pipeline);
 
     /* Retain the PAK so the custom pass can lazily resolve a client-named
      * shader at apply() time. The shader PAK lives for the app's lifetime. */
@@ -1409,7 +1444,7 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     if (pipeline->prog_composite.idx     != UINT16_MAX) loaded++;
 
     pipeline->shaders_loaded = (loaded > 0);
-    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/8", loaded);
+    LOG_INFO(LOG_TAG, "post-fx shader programs registered: %d/8", loaded);
     return pipeline->shaders_loaded;
 }
 
@@ -1417,47 +1452,69 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
 
 void jce_postfx_set_view_base(JcePostFXPipeline *pipeline, uint16_t base)
 {
-    if (pipeline) pipeline->view_base = base;
+    if (pipeline && pipeline->view_base != base) {
+        pipeline->view_base = base;
+        pipeline->taa_log_reported = false;
+    }
 }
 
 /* ── Apply ─────────────────────────────────────────────────────────── */
 
-/* Whether TAA is actually resolving, reported on change.
- *
- * Reported from apply() rather than from set_taa(), because what matters to a
- * comparison is the state in force when the frame is drawn, and because a host
- * that never calls set_taa() at all would otherwise say nothing -- which is
- * indistinguishable, in a log, from a host that turned it off.
- *
- * It exists because TAA presence is an editor-vs-runtime difference that no
- * output names. Measured 2026-09-22 on examples/snake_seven: the editor's Game
- * View resolves TAA and the shipped exe does not, because
- * jce_scene_renderer_taa_begin_frame() -- the only path that enables it on the
- * shared pipeline -- has exactly one caller, the editor's Scene view. Forcing
- * it off on both sides took the same static frame from 12.50% of pixels
- * differing to 2.98%, and took a wall edge from 3.003 px apart to 0.000.
- * Without this line that is a pixel count with no name attached.
- *
- * JCE_LOG_TAA=1 raises it to WARN, for the same reason as the ambient and
- * camera lines: JCE_DIST compiles LOG_INFO out of every SDK consumer exe, so
- * an INFO-only line would speak in the editor and be silent in the game --
- * mute in exactly the half of the comparison it exists to make. */
-static void postfx_log_taa_state(const JcePostFXPipeline *pipeline)
+/* History is eligible for one following apply only. Skips and failed copies
+ * leave it invalid rather than reprojecting an older, unrelated frame. */
+static bool postfx_take_taa_history(JcePostFXPipeline *pipeline)
 {
-    static int  loud = -1;
-    static int  last = -1;
+    const bool available = pipeline->history_valid && pipeline->taa_fbos_valid;
+    pipeline->history_valid = false;
+    return available;
+}
+
+typedef struct PostFXFrameInputs {
+    bool have_matrices;
+    bgfx_texture_handle_t ext_motion;
+} PostFXFrameInputs;
+
+static PostFXFrameInputs postfx_take_frame_inputs(JcePostFXPipeline *pipeline)
+{
+    const PostFXFrameInputs inputs = {
+        pipeline->taa_have_matrices, pipeline->taa_ext_motion_tex
+    };
+    pipeline->taa_have_matrices = false;
+    pipeline->taa_ext_motion_tex.idx = UINT16_MAX;
+    return inputs;
+}
+
+static void postfx_bind_taa_params(JcePostFXPipeline *pipeline,
+                                    bool history_available, bool motion_available)
+{
+    float params[4];
+    memcpy(params, pipeline->taa_params, sizeof params);
+    if (!history_available || !motion_available) params[0] = 0.0f;
+    bgfx_set_uniform(pipeline->u_taaParams, params, 1);
+}
+
+/* Report CPU resolve submissions on change for each pipeline independently.
+ * A request alone does not prove submission; submission does not prove GPU
+ * completion or presentation. view_base identifies concurrent host viewports.
+ * JCE_LOG_TAA=1 retains the opt-in WARN marker in DIST consumers, where INFO
+ * logging is compiled out. */
+static void postfx_log_taa_state(JcePostFXPipeline *pipeline, bool submitted)
+{
+    static int loud = -1;
     if (loud < 0) {
         const char *v = getenv("JCE_LOG_TAA");
         loud = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
-    const int now = pipeline->taa_enabled ? 1 : 0;
-    if (now == last)
+    if (pipeline->taa_log_reported && pipeline->taa_log_submitted == submitted)
         return;
-    last = now;
+    pipeline->taa_log_reported = true;
+    pipeline->taa_log_submitted = submitted;
     if (loud)
-        LOG_WARN(LOG_TAG, "taa resolve: %s", now ? "on" : "off");
+        LOG_WARN(LOG_TAG, "taa resolve: %s view_base=%u",
+                 submitted ? "on" : "off", (unsigned)pipeline->view_base);
     else
-        LOG_INFO(LOG_TAG, "taa resolve: %s", now ? "on" : "off");
+        LOG_INFO(LOG_TAG, "taa resolve: %s view_base=%u",
+                 submitted ? "on" : "off", (unsigned)pipeline->view_base);
 }
 
 void jce_postfx_apply(JcePostFXPipeline *pipeline,
@@ -1465,7 +1522,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_depth)
 {
     if (!pipeline) return;
-    postfx_log_taa_state(pipeline);
+    const bool history_available = postfx_take_taa_history(pipeline);
+    const PostFXFrameInputs inputs = postfx_take_frame_inputs(pipeline);
 
     /* Declare the chain's view range. It re-bases (jce_postfx_set_view_base)
      * and spans view_base..+20 -- exactly the span another subsystem assumed
@@ -1477,6 +1535,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     reset_output_state(pipeline);
 
     if (!jce_gfx_texture_valid(scene_color)) {
+        postfx_log_taa_state(pipeline, false);
         LOG_WARN(LOG_TAG, "post-fx skipped: invalid scene color texture");
         return;
     }
@@ -1487,15 +1546,17 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
        reprojection pass (which needs prog_motion_vec + matrices + depth).  With
        neither motion source available we silently skip TAA (the rest of the
        chain is unaffected). */
-    const bool have_ext_motion = (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
+    const bool have_ext_motion = (inputs.ext_motion.idx != UINT16_MAX);
     const bool have_cam_motion =
-        pipeline->prog_motion_vec.idx != UINT16_MAX &&
-        pipeline->taa_have_matrices &&
-        jce_gfx_texture_valid(scene_depth);
+        (pipeline->taa_enabled || pipeline->mb_enabled) &&
+        inputs.have_matrices && jce_gfx_texture_valid(scene_depth) &&
+        postfx_program_ready(pipeline->prog_motion_vec);
     const bool taa_run =
         pipeline->taa_enabled &&
-        pipeline->prog_taa.idx != UINT16_MAX &&
-        (have_ext_motion || have_cam_motion);
+        (have_ext_motion || have_cam_motion) &&
+        postfx_program_ready(pipeline->prog_taa);
+
+    if (!taa_run) postfx_log_taa_state(pipeline, false);
 
     /* MOTION BLUR shares TAA's motion source and nothing else -- no history,
      * no target, no view.  It is decided here, beside TAA, because the two
@@ -1508,7 +1569,6 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     const bool mb_run = pipeline->mb_enabled &&
                         pipeline->mb_intensity > 0.0f &&
                         (have_ext_motion || have_cam_motion);
-    pipeline->mb_active = mb_run;
     bgfx_texture_handle_t mb_motion_tex = { UINT16_MAX };
 
     /* Count active effects. */
@@ -1523,10 +1583,12 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * must not redraw the scene to recover an absent output, which blends
          * transparent objects twice when the first view is rebound. */
         pipeline->output_tex.idx = scene_color.idx;
-        pipeline->taa_ext_motion_tex.idx = UINT16_MAX;
         return;
     }
-    if (!pipeline->shaders_loaded) return;
+    if (!pipeline->shaders_loaded) {
+        postfx_log_taa_state(pipeline, false);
+        return;
+    }
 
     /* Ensure FBOs are created.  Composite ping-pong pair (0/1) always; the
        bloom buffers (2/3) only when bloom is enabled this frame — standard
@@ -1534,14 +1596,20 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
        the bloom-off LOW/MEDIUM-tier path). */
     if (!pipeline->fbos_valid)
         create_fbos(pipeline);
-    if (!pipeline->fbos_valid) return;
+    if (!pipeline->fbos_valid) {
+        postfx_log_taa_state(pipeline, false);
+        return;
+    }
     if (pipeline->enabled[JCE_POSTFX_BLOOM])
         ensure_bloom_fbos(pipeline);
     /* TAA history/motion are lazily allocated ONLY when TAA actually runs —
        a TAA-off frame never touches them, keeping the chain byte-identical. */
     if (taa_run) {
         create_taa_fbos(pipeline);
-        if (!pipeline->taa_fbos_valid) return;
+        if (!pipeline->taa_fbos_valid) {
+            postfx_log_taa_state(pipeline, false);
+            return;
+        }
     }
 
     JCE_PROFILE_ZONE_N("PostFX::Apply");
@@ -1605,7 +1673,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * problem too (a reprojection that thinks nothing moved over-trusts
          * history exactly when the camera turns); it is recorded, not fixed
          * here, because fixing it needs its own before/after. */
-        if (ensure_taa_motion_fbo(pipeline)) {
+        if (have_cam_motion && ensure_taa_motion_fbo(pipeline)) {
             const uint16_t v_mb = (uint16_t)(pipeline->view_base + 0);
             bgfx_set_uniform(pipeline->u_taaInvViewProj,  pipeline->taa_inv_view_proj,  1);
             bgfx_set_uniform(pipeline->u_taaPrevViewProj, pipeline->taa_prev_view_proj, 1);
@@ -1616,13 +1684,12 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_view_clear(v_mb, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
             bgfx_set_view_name(v_mb, "PostFX/MotionBlur_Motion", INT32_MAX);
             bgfx_set_texture(0, pipeline->u_texDepth, depth_tex, UINT32_MAX);
-            draw_fullscreen(pipeline, v_mb, pipeline->prog_motion_vec);
-            mb_motion_tex = pipeline->taa_motion_tex;
+            if (draw_fullscreen(pipeline, v_mb, pipeline->prog_motion_vec))
+                mb_motion_tex = pipeline->taa_motion_tex;
         }
     }
     /* Allocation failed, or the source turned out to be a stand-in: say so
      * rather than reporting the feature as active with nothing behind it. */
-    if (mb_motion_tex.idx == UINT16_MAX) pipeline->mb_active = false;
 
     /* Track current input texture. Start with the scene color. */
     bgfx_texture_handle_t current_tex = { scene_color.idx };
@@ -1682,14 +1749,14 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * Without an external buffer we run the legacy camera-only pass so the
          * camera-reprojection fallback still works. */
         const bool use_ext_motion =
-            (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
+            (inputs.ext_motion.idx != UINT16_MAX);
         bool motion_ok = true;   /* false only on the OOM stand-in below */
         /* Camera-only fallback: lazily allocate taa_motion_fb here (the common
          * external-velocity path never touches it, so it stays unallocated and
          * saves a full-res RGBA16F). */
         bgfx_texture_handle_t motion_tex;
         if (use_ext_motion) {
-            motion_tex = pipeline->taa_ext_motion_tex;
+            motion_tex = inputs.ext_motion;
         } else if (ensure_taa_motion_fbo(pipeline)) {
             motion_tex = pipeline->taa_motion_tex;
             /* We supply BOTH camera matrices as explicit uniforms (the postfx
@@ -1721,39 +1788,45 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         if (motion_ok && !use_ext_motion) mb_motion_tex = motion_tex;
 
         /* (b) resolve pass: current colour + history + motion → fbo[ping].
-         * On the first frame (history_valid false) the history buffer is empty;
-         * fs_taa's on-screen test + a large/zero motion keeps the output ≈
-         * current, so no garbage history leaks in.  We still bind a valid
-         * history handle (the buffer exists) to satisfy the sampler. */
-        bgfx_set_uniform(pipeline->u_taaParams, pipeline->taa_params, 1);
+         * Without a copied previous frame or usable motion, feedback is zero.
+         * The shader returns current colour before sampling undefined history.
+         * A valid allocated sampler handle remains bound for backend validity. */
+        postfx_bind_taa_params(pipeline, history_available, motion_ok);
         ensure_composite_fbo(pipeline, ping);
+        if (pipeline->fbo[ping].idx == UINT16_MAX) {
+            postfx_log_taa_state(pipeline, false);
+            return;
+        }
         POSTFX_SETUP_VIEW(v_resolve, pipeline->fbo[ping]);
         bgfx_set_view_name(v_resolve, "PostFX/TAA_Resolve", INT32_MAX);
         bgfx_set_texture(0, pipeline->u_texColor,   current_tex,             UINT32_MAX);
         bgfx_set_texture(1, pipeline->u_texHistory, pipeline->taa_history_tex, UINT32_MAX);
         bgfx_set_texture(2, pipeline->u_texMotion,  motion_tex,              UINT32_MAX);
-        draw_fullscreen(pipeline, v_resolve, pipeline->prog_taa);
+        const bool resolve_submitted =
+            draw_fullscreen(pipeline, v_resolve, pipeline->prog_taa);
+        postfx_log_taa_state(pipeline, resolve_submitted);
+        if (!resolve_submitted) return;
 
         bgfx_texture_handle_t resolved = pipeline->fbo_tex[ping];
 
         /* (c) copy resolve → history (pass-through fullscreen) for next frame. */
-        if (pipeline->prog_present.idx != UINT16_MAX) {
+        if (postfx_program_ready(pipeline->prog_present)) {
             POSTFX_SETUP_VIEW(v_copy, pipeline->taa_history_fb);
             bgfx_set_view_name(v_copy, "PostFX/TAA_HistoryCopy", INT32_MAX);
             bgfx_set_texture(0, pipeline->u_texColor, resolved, UINT32_MAX);
-            draw_fullscreen(pipeline, v_copy, pipeline->prog_present);
+            pipeline->history_valid =
+                draw_fullscreen(pipeline, v_copy, pipeline->prog_present);
         }
 
         /* Resolved colour feeds the remaining chain; advance the ping-pong. */
         current_tex = resolved;
         current_fb_index = ping;
         ping = 1 - ping;
-        pipeline->history_valid = true;
     }
 
     /* ── 1. Bloom ─────────────────────────────────────────────────── */
     if (pipeline->enabled[JCE_POSTFX_BLOOM] &&
-        pipeline->prog_bloom_extract.idx != UINT16_MAX)
+        postfx_program_ready(pipeline->prog_bloom_extract))
     {
         /* Bloom extract pass → FBO 2.
          * z=knee (Stage-1a.5 soft-knee; 0 = hard cutoff byte-identical).
@@ -1776,8 +1849,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         /* ── HIGH/ULTRA: dual-filter pyramid (downsample + upsample) ─── */
         const bool use_pyramid =
             pipeline->bloom_quality > 0 &&
-            pipeline->prog_bloom_down.idx != UINT16_MAX &&
-            pipeline->prog_bloom_up.idx   != UINT16_MAX;
+            postfx_program_ready(pipeline->prog_bloom_down) &&
+            postfx_program_ready(pipeline->prog_bloom_up);
 
         if (use_pyramid) {
             ensure_bloom_mips(pipeline, pipeline->bloom_quality);
@@ -1816,7 +1889,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                     bgfx_set_vertex_buffer(0, pipeline->quad_vb, 0, 4);
                     bgfx_set_index_buffer(pipeline->quad_ib, 0, 6);
                     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
-                    bgfx_submit(view_id, pipeline->prog_bloom_down, 0, BGFX_DISCARD_ALL);
+                    submit_postfx(view_id, pipeline->prog_bloom_down);
                     down_src = pipeline->bloom_mip_tex[mi];
                     view_id++;
                 }
@@ -1857,7 +1930,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                     /* Additive blend: accumulate mip layers onto the higher-res target. */
                     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
                                    BGFX_STATE_BLEND_ADD, 0);
-                    bgfx_submit(view_id, pipeline->prog_bloom_up, 0, BGFX_DISCARD_ALL);
+                    submit_postfx(view_id, pipeline->prog_bloom_up);
                     view_id++;
                 }
 
@@ -1866,7 +1939,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             }
         } else {
             /* ── LOW/MID: legacy single-mip Gaussian blur (byte-identical) ── */
-            if (pipeline->prog_bloom_blur.idx != UINT16_MAX &&
+            if (postfx_program_ready(pipeline->prog_bloom_blur) &&
                 ensure_bloom_blur_h_fbo(pipeline)) {
                 /* Step by the BLOOM buffer's texel, not the full-res one:
                  * on a half-res target the full-res step would halve the
@@ -1910,7 +1983,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         /* Motion blur lives INSIDE this pass, so it has to be able to keep
          * the pass alive on its own -- otherwise it silently does nothing on
          * a chain with tonemap, bloom and the rest switched off. */
-        const bool c_mblur   = pipeline->mb_active &&
+        const bool c_mblur   = mb_run &&
                                mb_motion_tex.idx != UINT16_MAX;
         /* Depth of field lives inside this pass too, so it also has to keep
          * the pass alive on its own -- and it needs a real depth texture, not
@@ -1919,11 +1992,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * can answer "is it doing anything" rather than "is it on". */
         const bool c_dof     = pipeline->dof_enabled && pipeline->dof_valid &&
                                scene_depth.idx != UINT16_MAX;
-        pipeline->dof_active = c_dof;
         const bool any_comp  = c_bloom || c_tonemap || c_chroma || c_vig ||
                                c_gray || c_mblur || c_dof;
 
-        if (any_comp && pipeline->prog_composite.idx != UINT16_MAX) {
+        if (any_comp && postfx_program_ready(pipeline->prog_composite)) {
             float flags[4]   = { c_bloom ? 1.0f : 0.0f, c_tonemap ? 1.0f : 0.0f,
                                  c_chroma ? 1.0f : 0.0f, c_vig ? 1.0f : 0.0f };
             float flags2[4]  = { c_gray ? 1.0f : 0.0f, c_mblur ? 1.0f : 0.0f,
@@ -2008,7 +2080,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                bind a valid handle that the shader's flag-gate won't sample. */
             bgfx_set_texture(1, pipeline->u_texBloom,
                              c_bloom ? pipeline->fbo_tex[2] : current_tex, UINT32_MAX);
-            draw_fullscreen(pipeline, view_id, pipeline->prog_composite);
+            const bool composite_submitted =
+                draw_fullscreen(pipeline, view_id, pipeline->prog_composite);
+            pipeline->mb_active = composite_submitted && c_mblur;
+            pipeline->dof_active = composite_submitted && c_dof;
             current_tex = pipeline->fbo_tex[ping];
             current_fb_index = ping;
             ping = 1 - ping;
@@ -2018,7 +2093,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     /* ── 3. FXAA (separate — edge AA on the composited LDR image) ────── */
     if (pipeline->enabled[JCE_POSTFX_FXAA] &&
-        pipeline->prog_fxaa.idx != UINT16_MAX)
+        postfx_program_ready(pipeline->prog_fxaa))
     {
         float fxaa_p[4] = {
             pipeline->params.fxaa_span_max,
@@ -2047,8 +2122,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         /* (Re)load lazily when the requested shader name changes. */
         if (strcmp(pipeline->custom_loaded, pipeline->custom_name) != 0) {
             if (pipeline->prog_custom.idx != UINT16_MAX) {
-                bgfx_destroy_program(pipeline->prog_custom);
-                pipeline->prog_custom.idx = UINT16_MAX;
+                release_postfx_program(&pipeline->prog_custom);
             }
             if (pipeline->shader_pak)
                 pipeline->prog_custom =
@@ -2060,10 +2134,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                 pipeline->custom_loaded[ci] = pipeline->custom_name[ci];
             pipeline->custom_loaded[ci] = '\0';
             LOG_INFO(LOG_TAG, "custom pass shader '%s' %s", pipeline->custom_name,
-                     (pipeline->prog_custom.idx != UINT16_MAX) ? "loaded" : "NOT FOUND");
+                     (postfx_program_ready(pipeline->prog_custom)) ? "loaded" : "NOT FOUND");
         }
 
-        if (pipeline->prog_custom.idx != UINT16_MAX) {
+        if (postfx_program_ready(pipeline->prog_custom)) {
             const bool has_depth =
                 pipeline->custom_needs_depth && jce_gfx_texture_valid(scene_depth);
 
@@ -2102,11 +2176,6 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         pipeline->output_ping = current_fb_index;
     }
 
-    /* External motion vectors are one-shot per frame: clear so a later apply()
-       on this pipeline (pick / preview / thumbnail) does not reuse a stale
-       velocity buffer. */
-    pipeline->taa_ext_motion_tex.idx = UINT16_MAX;
-
     LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active, %d views used",
               active, view_id - JCE_VIEW_POST_BASE);
     JCE_PROFILE_ZONE_END;
@@ -2125,7 +2194,7 @@ void jce_postfx_present(JcePostFXPipeline *pipeline,
 {
     bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX };
     uint16_t view_id;
-    if (!pipeline || pipeline->prog_present.idx == UINT16_MAX)
+    if (!pipeline || !postfx_program_ready(pipeline->prog_present))
         return;
     if (pipeline->output_tex.idx == UINT16_MAX)
         return;
@@ -2149,7 +2218,7 @@ void jce_postfx_present(JcePostFXPipeline *pipeline,
      * same view, no extra pass — sharpening harder the more we downscaled.
      * Falls back to the plain present when RCAS isn't in the PAK or when the
      * source is already at native resolution. */
-    if (pipeline->prog_rcas.idx != UINT16_MAX &&
+    if (postfx_program_ready(pipeline->prog_rcas) &&
         width > 0 && height > 0 &&
         pipeline->width  < width &&
         pipeline->height < height) {
@@ -2185,7 +2254,7 @@ bool jce_postfx_upscale_resolve(JcePostFXPipeline *pipeline,
      * otherwise, so we deliberately do NOT draw a plain copy here (that would
      * leave a mis-oriented/blank destination the caller might then show). */
     if (!pipeline || src.idx == UINT16_MAX || dst_fb_idx == UINT16_MAX ||
-        pipeline->prog_rcas.idx == UINT16_MAX ||
+        !postfx_program_ready(pipeline->prog_rcas) ||
         src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0 ||
         src_w >= out_w || src_h >= out_h)
         return false;
@@ -2262,7 +2331,7 @@ uint16_t jce_postfx_tsr_resolve(JcePostFXPipeline *pipeline, uint16_t view_base,
                                 float jitter_u, float jitter_v,
                                 float feedback, bool flip_v)
 {
-    if (!pipeline || pipeline->prog_tsr.idx == UINT16_MAX ||
+    if (!pipeline || !postfx_program_ready(pipeline->prog_tsr) ||
         color.idx == UINT16_MAX || render_w == 0 || render_h == 0 ||
         out_w == 0 || out_h == 0)
         return UINT16_MAX;
@@ -2279,7 +2348,7 @@ uint16_t jce_postfx_tsr_resolve(JcePostFXPipeline *pipeline, uint16_t view_base,
     bool motion_ready = has_ext || ensure_tsr_motion(pipeline, render_w, render_h);
     bool gen_motion   = !has_ext && motion_ready && depth.idx != UINT16_MAX &&
                         inv_view_proj && prev_view_proj &&
-                        pipeline->prog_motion_vec.idx != UINT16_MAX;
+                        postfx_program_ready(pipeline->prog_motion_vec);
     if (gen_motion) {
         bgfx_set_uniform(pipeline->u_taaInvViewProj,  inv_view_proj,  1);
         bgfx_set_uniform(pipeline->u_taaPrevViewProj, prev_view_proj, 1);

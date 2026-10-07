@@ -161,3 +161,14 @@ SDL gameplay input translation ingests each physical pointer stream once: discar
 The public jce_input_primary_pointer query supplies logical-surface mouse or primary-touch coordinates and down state without merging their gameplay channels. Touch release preserves its final coordinate for pointer-only UI; live and replay paths share this state. Default Canvas UI uses this query. Invalid surface/output arguments do not modify outputs.
 
 Web SDL touch events use inclusive pixel endpoints. The live SDL adapter converts them to neutral logical-surface normalization using the event window size; the pure translator and replay remain backend-independent. Do not compensate per project or alter physical mouse coordinates. Verify subpixel gesture trajectories against actual browser client coordinates.
+
+Mouse event sampling retains same-frame DOWN/UP as a private one-frame tap,
+shared by button queries, primary pointer, actions and capture/replay. Roll the
+prior pulse before clearing it so the next frame exposes release;
+keep physical held state independent and preserve the existing frame wire ABI.
+Event-seam CPU regression: test_jce_input_mouse_tap (no window or hardware).
+
+Keep physical previous-held state separate from previous-tap release history,
+so adjacent live taps each produce a public pressed edge. The unchanged sampled
+wire/action down masks preserve a single tap and its following release, but do
+not encode event counts or distinguish adjacent down samples from a held button.

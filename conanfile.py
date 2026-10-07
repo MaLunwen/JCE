@@ -269,6 +269,8 @@ class JCEConan(ConanFile):
             )
         deps.generate()
         tc = CMakeToolchain(self)
+        # Independent target graphs must not race on a shared source-root preset.
+        tc.user_presets_path = None
         # JCE_BUILD_JNI and JCE_ENABLE_PATENTED_CODECS are intentionally
         # NOT forwarded from Conan options — they are CMake-only switches.
         # Set them with -D at cmake configure time.

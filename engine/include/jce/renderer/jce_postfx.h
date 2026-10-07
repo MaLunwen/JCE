@@ -349,8 +349,10 @@ JCE_API void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
  *                         for the main colour pass this frame.
  *   prev_view_proj      : the previous frame's UN-jittered view*proj
  *                         (pass the SAME as scene_inv_view_proj's source on
- *                         the first frame; the on-screen test in fs_taa then
- *                         rejects the empty history and outputs ~current). */
+ *                         the first frame; absent eligible history uses zero
+ *                         feedback and outputs the current colour).
+ * Both matrix and external-motion inputs are consumed by each apply, including
+ * skipped applies. Supply fresh inputs before the next resolve. */
 JCE_API void jce_postfx_set_taa_matrices(JcePostFXPipeline *pipeline,
                                          const jce_mat4 *scene_inv_view_proj,
                                          const jce_mat4 *prev_view_proj);
@@ -360,7 +362,7 @@ JCE_API void jce_postfx_set_taa_matrices(JcePostFXPipeline *pipeline,
  * fs_motion_vec.sc).  When set to a valid handle, the TAA pass SKIPS its
  * internal camera-only motion-vec pass and reprojects history with THIS texture
  * instead — so moving / animated / skinned geometry stops ghosting.  One-shot:
- * cleared at the end of every jce_postfx_apply().  Pass JCE_TEXTURE_INVALID (or
+ * consumed at the start of every jce_postfx_apply(), including skipped applies.  Pass JCE_TEXTURE_INVALID (or
  * never call it) to fall back to the camera-only reprojection. */
 JCE_API void jce_postfx_set_taa_motion_tex(JcePostFXPipeline *pipeline,
                                            JceTextureHandle tex);
@@ -383,7 +385,7 @@ JCE_API void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_depth);
 
 /* Get the output texture after jce_postfx_apply.
-   Returns JCE_TEXTURE_INVALID if no effects were active. */
+   An empty chain returns its borrowed scene input; failed apply returns invalid. */
 JCE_API JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
 
 /* Draw the chain's output texture to the BACKBUFFER as a fullscreen pass.

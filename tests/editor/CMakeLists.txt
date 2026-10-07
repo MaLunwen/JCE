@@ -351,3 +351,7 @@ jce_add_cxx_test(test_jce_history_entity
 # Default-mode hierarchy reuse admission/key, no ImGui or native window.
 jce_add_cxx_test(test_jce_hierarchy_flat_cache
     SOURCES test_jce_hierarchy_flat_cache.cpp)
+
+# Production Play transaction failure sequencing, without a graphical editor.
+jce_add_cxx_test(test_jce_editor_play_transaction
+    SOURCES test_jce_editor_play_transaction.cpp)

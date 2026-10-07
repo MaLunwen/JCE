@@ -2,7 +2,9 @@
 os=Emscripten
 arch=wasm
 compiler=clang
-compiler.version=19
+# Baseline for direct profile use; the driver supplies the actual LLVM major.
+# Full Emscripten version and ABI headers remain in the host package-ID conf.
+compiler.version=23
 compiler.libcxx=libc++
 compiler.cppstd=20
 build_type=Release
@@ -18,15 +20,17 @@ harfbuzz/*:with_glib=False
 # from Windows to Emscripten). TIFF is not a useful game asset format for web.
 sdl_image/*:with_libtiff=False
 # sdl_image: libwebp/1.6.0 has a C99 implicit-declaration bug in enc_sse41.c that triggers
-# an error under Emscripten/Clang 19. WebP decoding in a game engine is non-critical.
+# an error under Emscripten. WebP decoding in a game engine is non-critical.
 sdl_image/*:with_libwebp=False
 # sdl_image: AVIF pulls in libaom-av1 + dav1d (AV1 codecs) — heavy and rarely useful as
 # static game textures. Disable to keep the WASM binary lean.
 sdl_image/*:with_avif=False
 
 [conf]
+# A same-version SDK/header change must also create a distinct host binary identity.
+tools.info.package_id:confs=['user.jce:web_toolchain_abi']
 tools.cmake.cmaketoolchain:generator=Ninja
-# NOTE: user_toolchain and compiler_executables are injected by build-web.bat
+# NOTE: user_toolchain and compiler_executables are injected by the shared build driver
 # at conan install time, derived from the emsdk path argument.
 # Using user_toolchain (not toolchain_file) so Conan still generates conan_toolchain.cmake
 # and wraps Emscripten.cmake inside it — preserving per-package cmake variable injection.

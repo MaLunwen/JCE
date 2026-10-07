@@ -50,130 +50,8 @@ struct JceIblData {
 /* Math helpers                                                        */
 /* ================================================================== */
 
-static uint16_t f32_to_f16(float f)
-{
-    union { float f; uint32_t u; } conv;
-    conv.f = f;
-    uint32_t b = conv.u;
-    uint32_t sign = (b >> 16) & 0x8000;
-    int32_t expo  = ((int32_t)((b >> 23) & 0xFF)) - 127 + 15;
-    uint32_t mant = (b >> 13) & 0x03FF;
-    if (expo <= 0)  return (uint16_t)sign;
-    if (expo >= 31) return (uint16_t)(sign | 0x7C00);
-    return (uint16_t)(sign | ((uint32_t)expo << 10) | mant);
-}
-
-/* The inverse of the above.  Denormals decode as zero, which is what the
- * encoder produces for them anyway (expo <= 0 returns the sign bit alone), so
- * the pair round-trips every value the encoder can emit. */
-static float f16_to_f32(uint16_t h)
-{
-    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    const uint32_t expo = (uint32_t)(h >> 10) & 0x1Fu;
-    const uint32_t mant = (uint32_t)(h & 0x03FFu);
-    union { float f; uint32_t u; } conv;
-    if (expo == 0u)  { conv.u = sign; return conv.f; }          /* +-0/denorm */
-    if (expo == 31u) { conv.u = sign | 0x7F800000u | (mant << 13); return conv.f; }
-    conv.u = sign | ((expo - 15u + 127u) << 23) | (mant << 13);
-    return conv.f;
-}
-
-/* Radical inverse using Van der Corput sequence (base 2). */
-static float radical_inverse_vdc(uint32_t bits)
-{
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    return (float)bits * 2.3283064365386963e-10f;
-}
-
-/* Low-discrepancy 2D sample via Hammersley sequence. */
-static void hammersley(uint32_t i, uint32_t n, float *xi1, float *xi2)
-{
-    *xi1 = (float)i / (float)n;
-    *xi2 = radical_inverse_vdc(i);
-}
-
-/* GGX importance sampling: returns a half-vector in tangent space. */
-static void importance_sample_ggx(float xi1, float xi2, float roughness,
-                                  float *hx, float *hy, float *hz)
-{
-    float a = roughness * roughness;
-    float phi = 2.0f * JCE_PI * xi1;
-    float cos_theta = sqrtf((1.0f - xi2) / (1.0f + (a * a - 1.0f) * xi2));
-    float sin_theta = sqrtf(1.0f - cos_theta * cos_theta);
-
-    *hx = cosf(phi) * sin_theta;
-    *hy = sinf(phi) * sin_theta;
-    *hz = cos_theta;
-}
-
-/* ================================================================== */
-/* BRDF Integration LUT                                                */
-/* ================================================================== */
-
-/* Geometry term for IBL (Schlick-GGX with k = roughness^2 / 2). */
-static float geometry_schlick_ggx_ibl(float n_dot_v, float roughness)
-{
-    float k = (roughness * roughness) / 2.0f;
-    return n_dot_v / (n_dot_v * (1.0f - k) + k);
-}
-
-static float geometry_smith_ibl(float n_dot_v, float n_dot_l, float roughness)
-{
-    return geometry_schlick_ggx_ibl(n_dot_v, roughness)
-         * geometry_schlick_ggx_ibl(n_dot_l, roughness);
-}
-
-/* Integrate the BRDF for a given (NdotV, roughness) pair.
- * Returns (scale, bias) for the split-sum approximation. */
-static void integrate_brdf(float n_dot_v, float roughness,
-                           float *out_scale, float *out_bias)
-{
-    /* Clamp to avoid degenerate cases. */
-    if (n_dot_v < 0.001f) n_dot_v = 0.001f;
-
-    float vx = sqrtf(1.0f - n_dot_v * n_dot_v);
-    float vy = 0.0f;
-    float vz = n_dot_v;
-
-    float scale = 0.0f;
-    float bias  = 0.0f;
-
-    const uint32_t SAMPLE_COUNT = 1024;
-
-    for (uint32_t i = 0; i < SAMPLE_COUNT; i++) {
-        float xi1, xi2;
-        hammersley(i, SAMPLE_COUNT, &xi1, &xi2);
-
-        float hx, hy, hz;
-        importance_sample_ggx(xi1, xi2, roughness, &hx, &hy, &hz);
-
-        /* Reflect V around H to get L. */
-        float v_dot_h = vx * hx + vy * hy + vz * hz;
-        float lx = 2.0f * v_dot_h * hx - vx;
-        float ly = 2.0f * v_dot_h * hy - vy;
-        float lz = 2.0f * v_dot_h * hz - vz;
-
-        float n_dot_l = lz;  /* N = (0,0,1) in tangent space */
-        float n_dot_h = hz;
-        float vdh     = v_dot_h;
-
-        if (n_dot_l > 0.0f) {
-            float G = geometry_smith_ibl(n_dot_v, n_dot_l, roughness);
-            float G_vis = (G * vdh) / (n_dot_h * n_dot_v);
-            float Fc = powf(1.0f - vdh, 5.0f);
-
-            scale += (1.0f - Fc) * G_vis;
-            bias  += Fc * G_vis;
-        }
-    }
-
-    *out_scale = scale / (float)SAMPLE_COUNT;
-    *out_bias  = bias  / (float)SAMPLE_COUNT;
-}
+#include "jce_ibl_brdf.h"
+#include "jce_ibl_stock.h"
 
 /* BRDF LUT parallel-for job descriptor (file-scope so the worker and
    the dispatch site share an exact type). */
@@ -185,26 +63,17 @@ typedef struct {
 static void jce_ibl_brdf_worker(uint32_t begin, uint32_t end, void *arg)
 {
     JceIblBrdfJob *j = (JceIblBrdfJob *)arg;
-    for (uint32_t y = begin; y < end; y++) {
-        float roughness = ((float)y + 0.5f) / (float)j->size;
-        for (uint32_t x = 0; x < j->size; x++) {
-            float n_dot_v = ((float)x + 0.5f) / (float)j->size;
-            float s, b;
-            integrate_brdf(n_dot_v, roughness, &s, &b);
+    for (uint32_t y = begin; y < end; y++)
+        jce_ibl_brdf_row(j->size, y, j->out + (size_t)y * j->size * 4);
 
-            uint32_t idx = (y * j->size + x) * 4;
-            j->out[idx + 0] = f32_to_f16(s);
-            j->out[idx + 1] = f32_to_f16(b);
-            j->out[idx + 2] = f32_to_f16(0.0f);
-            j->out[idx + 3] = f32_to_f16(1.0f);
-        }
-    }
 }
 
 JceTexture jce_ibl_create_brdf_lut(uint32_t size)
 {
     if (size == 0) size = 256;
 
+    if (size > 65535u || size > SIZE_MAX / size / 8u)
+        return JCE_TEXTURE_INVALID;
     uint32_t pixel_count = size * size;
     size_t   bytes       = (size_t)pixel_count * 4 * sizeof(uint16_t);
     uint16_t *data = (uint16_t *)JCE_MALLOC(bytes);
@@ -218,11 +87,12 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
        asset, so it must NOT go through the VFS-aware reader — an ISOLATED
        active-VFS would null the read while the write below still lands on
        the host, silently disabling the cache for good. */
-    bool from_cache = false;
+    bool from_cache = jce_ibl_stock_decode(size, data, bytes,
+        jce_ibl_stock_256, jce_ibl_stock_256_size);
     char cache_path[256];
     snprintf(cache_path, sizeof(cache_path),
              ".jce/cache/brdf_lut_%u.f16", size);
-    {
+    if (!from_cache) {
         SDL_IOStream *io = SDL_IOFromFile(cache_path, "rb");
         if (io) {
             Sint64 fsz = SDL_GetIOSize(io);

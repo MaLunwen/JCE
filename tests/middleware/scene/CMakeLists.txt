@@ -940,3 +940,8 @@ jce_add_unit_test(test_jce_sr_anim_storage
 target_include_directories(test_jce_sr_anim_storage PRIVATE
     "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene"
     "${PROJECT_SOURCE_DIR}/engine/src")
+
+# Real quaternion scene roundtrip preserves authored bits over repeated restores.
+jce_add_unit_test(test_jce_scene_rotation_roundtrip
+    SOURCES test_jce_scene_rotation_roundtrip.c
+    LINK jce_core jce_scene jce_resource)

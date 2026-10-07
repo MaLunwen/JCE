@@ -28,6 +28,7 @@
 #include "os/platform/jce_window_internal.h"
 #include "jce_renderer_caps_internal.h"
 #include "jce_upload_metrics.h"
+#include "jce_lighting_system_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -1711,6 +1712,16 @@ void jce_renderer_destroy(JceRenderer *r)
         jce_shader_program_destroy((JceShaderHandle){ (r->program).idx });
     if (r->program_textured.idx != UINT16_MAX)
         jce_shader_program_destroy((JceShaderHandle){ (r->program_textured).idx });
+    if (r->program_text_sdf.idx != UINT16_MAX)
+        jce_shader_program_destroy((JceShaderHandle){ r->program_text_sdf.idx });
+    if (r->u_sdf_params.idx != UINT16_MAX)
+        bgfx_destroy_uniform(r->u_sdf_params);
+    if (r->u_sdf_outline.idx != UINT16_MAX)
+        bgfx_destroy_uniform(r->u_sdf_outline);
+    if (r->u_sdf_shadow_offset.idx != UINT16_MAX)
+        bgfx_destroy_uniform(r->u_sdf_shadow_offset);
+    if (r->u_sdf_shadow_color.idx != UINT16_MAX)
+        bgfx_destroy_uniform(r->u_sdf_shadow_color);
     if (r->u_tex_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_tex_color);
     if (r->program_mesh.idx != UINT16_MAX)
@@ -1761,6 +1772,7 @@ void jce_renderer_destroy(JceRenderer *r)
      * IES LUTs baked from authored .ies paths. */
     jce_text_shutdown();
     jce_pbr_material_shutdown();
+    jce_lighting_system_shutdown();
     jce_ies_cache_shutdown();
 
     /* Free the octahedral-impostor shared GPU resources (program, quad VB,

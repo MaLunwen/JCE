@@ -38,3 +38,12 @@ dist 使用 Release 编译，关闭 Tracy 和专利编解码路径。release 与
 Bundle 交付使用一个 `.jbundle` 文件，包含选定场景、脚本与资源依赖闭包。它是内容包，不是引擎或 SDK 分发包，也不是独立可执行应用。app 构建工具将项目清单的 `bundles` 列表传给已安装 SDK 的嵌入工具；相对路径以项目为基准解析并保持列表顺序。因此标准项目模板可将 Bundle 嵌入最终单可执行程序。必须分别验证编辑器重新打开和仅含 EXE 的迁移目录；仅打包或构建成功不能证明完整玩法或所有目标平台。
 
 Windows DIST 应用默认使用 GUI 子系统，启动不得创建控制台窗口。预打包 PAK/bundle 的提前返回前必须应用目标政策，不能因嵌入路径绕过。验证实际 PE 子系统值（2=GUI），不能只看 CMake 声明。CLI 开发工具保留明确的控制台政策。
+
+内嵌交付将有类型的着色器程序名解析为实际编译的后端文件。内置依赖使用由内嵌着色器包校验的已安装 SDK stock 目录，项目自有文件保留优先级。缺失的用户程序仍须准入失败；一个可用变体只证明对应后端，不代表所有目标平台均已验证。
+
+静态 C/C++ 场景脚本使用 `jce_script_enable(... NATIVE_FACTORIES provider)`。
+项目清单声明 `native_script_factories` 与 `native_script_refs`；后者将选中资产的
+规范地址绑定到原始类引用拼写，保留大小写。SDK 生成的注册器强链接模块工厂，并
+检查实际类解析。SDK CLI 交付需要迁移后可执行程序产生的真实回执；Web 首次构建
+写出 `build/native-registry-proof/web-request.json`，必须在实际浏览器执行后通过
+`--registry-proof` 回填对应回执，才能通过准入。

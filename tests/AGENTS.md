@@ -172,3 +172,7 @@ uses public engine counters and repeatable rendering probes; it does not own
 an alternative runtime or renderer. Examples publish single-file Bundles and
 provenance separately from these reproduction sources. Generate outputs under
 ignored build directories and reuse compatible SDK/build caches.
+
+Script C-ABI tests select the actual target type: SHARED retains loader/export
+coverage; STATIC links the real generated forwarders and checks host-copy,
+short-host, version and missing-callback behavior without loading an archive.

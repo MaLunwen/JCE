@@ -553,7 +553,7 @@ static void editor_game_event_fixture(void)
             file.reset(); return;
         }
         jce_editor_process_event(&e);
-        LOG_INFO("editor-main", "Game event fixture frame=%u type=%c owner=%d hovered=%d",
+        LOG_WARN("editor-main", "Game event fixture frame=%u type=%c owner=%d hovered=%d",
                  frame, kind, static_cast<int>(vp.owner), vp.hovered ? 1 : 0);
         pending = false;
     }

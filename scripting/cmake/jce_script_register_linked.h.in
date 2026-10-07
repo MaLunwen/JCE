@@ -31,6 +31,11 @@ extern "C" {
  * publishing a module IS project code -- the classes are the project's -- while
  * everything else here is boilerplate that was being hand-written per project.
  *
+ * NATIVE_FACTORIES declared in jce_script_enable are strongly linked and
+ * published automatically before this callback. Selected native paths are
+ * validated against the real registry. Failure returns -1; optional reports
+ * use JCE_NATIVE_REGISTRY_REPORT and a 64-hex JCE_NATIVE_REGISTRY_NONCE.
+ *
  * Returns the number of non-Lua languages that registered successfully.  It
  * does not fail the process: every refusal is logged by name and the run
  * continues, so the failure surfaces as "that language ran nothing" rather

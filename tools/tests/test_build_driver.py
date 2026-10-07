@@ -18,6 +18,30 @@ class BuildDriverTests(unittest.TestCase):
         spec.loader.exec_module(driver)
         return driver
 
+    def test_web_smoke_single_html_and_split_artifacts(self):
+        driver = self.driver("jce_web_smoke_artifacts")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = {"emscripten": True, "cross": True}
+            self.assertEqual(driver._smoke_target_artifacts(target, root, "fixture"),
+                             (root / "fixture.js", root / "fixture.wasm"))
+            html = root / "fixture.html"
+            html.write_text('<html><script>var wasmBinary="data:application/wasm;base64,AA==";</script></html>')
+            self.assertEqual(driver._smoke_target_artifacts(target, root, "fixture"), (html, html))
+            for invalid in ('<script src="fixture.js"></script>',
+                            '<script>var file="fixture.wasm";</script>',
+                            '<html><script>console.log("no runtime")</script></html>'):
+                html.write_text(invalid)
+                with self.assertRaises(SystemExit):
+                    driver._smoke_target_artifacts(target, root, "fixture")
+            # A malformed HTML must not fall back to stale split products.
+            (root / "fixture.js").write_text('stale')
+            (root / "fixture.wasm").write_bytes(b"stale")
+            with self.assertRaises(SystemExit):
+                driver._smoke_target_artifacts(target, root, "fixture")
+            self.assertEqual(driver._smoke_target_artifacts({}, root, "fixture")[0].suffix,
+                             ".exe" if driver.HOST == "windows" else "")
+
     def test_explicit_test_targets_and_default_commands(self):
         driver = self.driver("jce_selected_test_targets")
         for selected, regex, expected in ((None, None, ["jce_tests"]),
@@ -158,6 +182,7 @@ class BuildDriverTests(unittest.TestCase):
                         patch.object(driver, "conan_dir", return_value=Path(tmp)), \
                         patch.object(driver, "host_build_profile", return_value="linux-x64"), \
                         patch.object(driver, "emscripten_paths", return_value=em), \
+                        patch.object(driver, "web_toolchain_conan_args", return_value=["-pr:h", "conan/profiles/wasm", "-s:h", "compiler=clang", "-s:h", "compiler.version=23", "-c:h", "user.jce:web_toolchain_abi=" + "a" * 64]) as web_identity, \
                         patch.object(driver, "run") as run:
                     driver.conan_install(target, "Release", env)
                 argv = run.call_args.args[0]
@@ -203,6 +228,7 @@ class BuildDriverTests(unittest.TestCase):
                         patch.object(driver, "conan_dir", return_value=root / "native"), \
                         patch.object(driver, "host_build_profile", return_value="fixture"), \
                         patch.object(driver, "emscripten_paths", return_value=em), \
+                        patch.object(driver, "web_toolchain_conan_args", return_value=["-pr:h", "conan/profiles/wasm", "-s:h", "compiler=clang", "-s:h", "compiler.version=23", "-c:h", "user.jce:web_toolchain_abi=" + "a" * 64]) as web_identity, \
                         patch.object(driver, "run", side_effect=capture):
                     driver.stamp_graphics_tier(tc, "stable")
                     driver.conan_install(target, "Release", env)
@@ -220,6 +246,13 @@ class BuildDriverTests(unittest.TestCase):
                     env["JCE_SYSTEM_PACKAGE_MODE"] = "report"
                     driver.conan_install(target, "Release", env)
                     self.assertEqual(len(commands), count + 1)
+                    if web:
+                        count = len(commands)
+                        web_identity.return_value[-1] = "user.jce:web_toolchain_abi=" + "b" * 64
+                        driver.conan_install(target, "Release", env)
+                        self.assertEqual(len(commands), count + 1)
+                        driver.conan_install(target, "Release", env)
+                        self.assertEqual(len(commands), count + 1)
                     self.assertEqual(sentinel.read_bytes(), b"cached native object")
                     self.assertTrue(tc.is_file())
 
@@ -378,6 +411,23 @@ class BuildDriverTests(unittest.TestCase):
             self.assertEqual(archive.read_bytes(), original)
             self.assertFalse(installed.exists())
 
+    def test_hook_sync_uses_explicit_home_without_touching_process_home(self):
+        spec = importlib.util.spec_from_file_location("jce_hook_env_test", ROOT / "tools/build/jce.py")
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repository"
+            original = Path(tmp) / "original-home"
+            overlay = Path(tmp) / "overlay-home"
+            (root / "conan/hooks").mkdir(parents=True)
+            (root / "contracts").mkdir()
+            (root / "contracts/conan-source-policy.json").write_text('{"retired_hooks":{}}')
+            with patch.object(driver, "ROOT", root), patch.dict(os.environ, {"CONAN_HOME": str(original)}):
+                driver.sync_conan_hooks({"CONAN_HOME": str(overlay)})
+                self.assertEqual(os.environ["CONAN_HOME"], str(original))
+            self.assertTrue((overlay / "extensions/hooks").is_dir())
+            self.assertFalse(original.exists())
+
     def test_failed_hook_archive_keeps_installed_original(self):
         spec = importlib.util.spec_from_file_location("jce_hook_failure_test", ROOT / "tools/build/jce.py")
         driver = importlib.util.module_from_spec(spec)
@@ -451,6 +501,34 @@ class BuildDriverTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "requires Pillow and numpy"):
                     driver.cmd_test(SimpleNamespace(arch="x64", jobs=1, rerun_failed=False))
             self.assertEqual(run.call_count, 3)
+
+
+    def test_static_api_capability_requires_sdk_type_and_real_archive(self):
+        driver = self.driver('static_api_driver')
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = Path(temporary)
+            lib = sdk / 'lib/Release'
+            lib.mkdir(parents=True)
+            config = sdk / 'lib/cmake/JCE/JCEScripting.cmake'
+            config.parent.mkdir(parents=True)
+            for language in ('c', 'cpp', 'python'):
+                roster = config.parent / 'backends' / language / 'jce_backend.cmake'
+                roster.parent.mkdir(parents=True)
+                roster.write_text('set(JCE_BACKEND_LANGUAGE "' + language + '")\n'
+                                  'set(JCE_BACKEND_VM_TARGET "jce_script_vm_' + language + '")\n'
+                                  'set(JCE_BACKEND_NEEDS_SCRIPT_API ON)\n')
+                (lib / ('jce_script_vm_' + language + '.lib')).write_bytes(b'archive-fixture')
+            (lib / 'jce_script_api.lib').write_bytes(b'archive-fixture')
+            config.write_text('set(JCE_SCRIPT_API_STATIC 0)\n')
+            self.assertEqual(driver.sdk_shipped_script_backends(sdk), [])
+            config.write_text('set(JCE_SCRIPT_API_STATIC 1)\n')
+            self.assertEqual(driver.sdk_shipped_script_backends(sdk), ['c', 'cpp'])
+            self.assertEqual(driver.sdk_shipped_script_backends(sdk, {'emscripten': True}), ['c', 'cpp'])
+            (lib / 'jce_script_api.lib').unlink()
+            self.assertEqual(driver.sdk_shipped_script_backends(sdk), [])
+            (lib / 'jce_script_api.dll').write_bytes(b'shared-fixture')
+            config.write_text('set(JCE_SCRIPT_API_STATIC 0)\n')
+            self.assertEqual(driver.sdk_shipped_script_backends(sdk), ['c', 'cpp', 'python'])
 
 
 if __name__ == "__main__":

@@ -156,3 +156,5 @@ Host asset targets compile the same CPU importer and archive implementations.
 JCE_MODEL_IMPORTER_COOK_ONLY excludes GPU mesh loaders and upload helpers,
 while CPU parts, mesh decode, materials and inspection remain available.
 Host tools must use real PAK readers rather than link-only placeholder APIs.
+
+Availability-aware shader dependency selection lives in jce_bundle_shader_refs_internal.h and the existing scanner. A typed program stem resolves to actual readable backend alternatives; an unresolved program remains a required missing path. The public collector retains its historical ABI/list semantics. Packer callbacks are borrowed per invocation and preserve project/VFS precedence; no global stock registry or renderer dependency belongs in host packing.

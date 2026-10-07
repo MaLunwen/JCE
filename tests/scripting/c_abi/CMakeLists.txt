@@ -21,6 +21,17 @@ if(NOT TARGET jce_script_api)
     return()
 endif()
 
+get_target_property(_script_api_type jce_script_api TYPE)
+if(_script_api_type STREQUAL "STATIC_LIBRARY")
+    jce_add_unit_test(test_jce_script_api_static
+        SOURCES test_jce_script_api_static.c
+        INCLUDES "${CMAKE_SOURCE_DIR}/scripting/c_abi/include")
+    target_link_libraries(test_jce_script_api_static PRIVATE jce_script_api)
+    return()
+elseif(NOT _script_api_type STREQUAL "SHARED_LIBRARY")
+    message(FATAL_ERROR "Unexpected script API target type: ${_script_api_type}")
+endif()
+
 jce_add_unit_test(test_jce_script_api_abi
     SOURCES  test_jce_script_api_abi.c
     INCLUDES "${CMAKE_SOURCE_DIR}/scripting/c_abi/include"

@@ -40,3 +40,13 @@ Keep intermediate objects, generated code, link outputs and validation evidence 
 Bundle delivery uses one `.jbundle` file containing its selected scene, scripts and asset closure. It is a content package, not an engine/SDK distribution or independently executable application. The app builder forwards the manifest `bundles` list to the installed SDK embedding helpers; relative paths resolve against the project and list order is preserved. A stock project template can therefore embed a Bundle into the final single executable. Verify both editor reopen and an EXE-only relocated directory; pack/build success alone does not certify gameplay or every target platform.
 
 Windows DIST applications default to the GUI subsystem and must not create a console window. Apply target policy before prebuilt PAK/bundle early returns; embedding must not bypass it. Validate the produced PE subsystem (2=GUI), not just CMake declarations. CLI development tools retain their explicit console policy.
+
+Embedded delivery resolves typed shader program stems to actual compiled backend files. Use the installed SDK stock catalog verified from its embedded shader pack for built-in dependencies; authored project files retain precedence. Missing user programs still fail admission. An available variant is evidence for that backend, not qualification of every target platform.
+
+Static C/C++ scene scripts use `jce_script_enable(... NATIVE_FACTORIES provider)`.
+Declare `native_script_factories` and `native_script_refs` in the project manifest;
+refs bind canonical selected addresses to original class-reference spelling. The
+generated SDK registry links providers and checks real class resolution. SDK CLI
+shipment requires an actual receipt from the relocated executable. Web builds
+record `build/native-registry-proof/web-request.json` and remain unadmitted until
+actual browser execution supplies the matching `--registry-proof` receipt.

@@ -262,3 +262,16 @@ single-step: they call existing Stop and never quit the editor process. Optional
 runtime platform services are owned by the grouped Play runtime host only when
 trusted JCE_RUNTIME_STATS_DIR is explicitly configured. Destroy runtime before
 checked flush/shutdown; no config means unavailable and no duplicate LOCAL store.
+
+## Play failure atomicity
+
+Play captures a complete restore point before constructing audio/runtime state.
+Capture failure refuses simulation; constructor failure tears down owned services
+and restores authored history. A failed restore retains the restore point for
+Stop retry and blocks another Play. The private transaction helper is used by
+production and headless failure-sequencing tests. Existing operation metrics
+separate capture, create, teardown and restore phases; no new global tracer.
+
+Explicit Game event fixtures record actual viewport owner/hover routing at
+WARN level so Dist validation retains this witness. Normal sessions emit no
+fixture records; this diagnostic does not force focus or gameplay state.

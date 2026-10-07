@@ -40,6 +40,12 @@ void main()
 
     /* Current sample. */
     vec4 cur = texture2D(s_texColor, v_texcoord0);
+    /* First/resumed frame has no eligible history. Avoid reading undefined
+       texture contents (including NaNs) even when the blend weight is zero. */
+    if (u_taaParams.x <= 0.0) {
+        gl_FragColor = cur;
+        return;
+    }
 
     /* Reproject. Motion vectors stored in [-1,1] NDC delta encoded in
      * [0,1] : decoded as mv * 2 - 1.  Subtract from current UV → prev UV. */

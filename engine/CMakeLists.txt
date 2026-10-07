@@ -412,6 +412,17 @@ _jce_add_layer(jce_renderer
 		cgltf::cgltf
 	CXX)
 
+# Fixed BRDF stock is part of the renderer archive, including standalone SDK use.
+include("${CMAKE_SOURCE_DIR}/cmake/JCEEmbedStock.cmake")
+set(_brdf_stock "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/data/brdf_256.f16")
+add_custom_target(jce_ibl_stock_verify
+    COMMAND "${CMAKE_COMMAND}" "-DDATA=${_brdf_stock}"
+        "-DKERNEL_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
+        -P "${CMAKE_SOURCE_DIR}/cmake/JCEVerifyIblStock.cmake"
+    VERBATIM)
+add_dependencies(jce_renderer jce_ibl_stock_verify)
+jce_target_embed_stock(jce_renderer "${_brdf_stock}" jce_ibl_stock_256)
+
 # RenderDoc capture: compile-time gate (PRIVATE — only jce_gpu_capture.c reads
 # it). No link: the in-app API is resolved at runtime from the injected module
 # via the jce_library shared-object wrapper. Forced OFF for dist (root

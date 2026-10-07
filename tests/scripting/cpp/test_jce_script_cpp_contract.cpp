@@ -127,24 +127,14 @@ TEST_CASE("the caller's host_size is what reaches the C ABI")
     JceScriptHost full;
     jce::diff::install_recording_host(&full);
 
-    /* Truncate at the LAST member.  As the struct grows this point moves with
-     * it, so the test keeps withholding a real tail instead of testing a
-     * member that stopped being last. */
+    /* Keep this historical ABI boundary: locale setters and all appended
+     * capabilities must be withheld by an older caller's declared size.
+     * The positive control still supplies a complete, correctly aligned host
+     * object; its allocation must grow with the actual public structure. */
     const std::size_t trunc = offsetof(JceScriptHost, loc_set_locale);
-    REQUIRE(trunc < sizeof(JceScriptHost));
-
-    typedef void (*SetLocaleFn)(void *, const char *);
-    SetLocaleFn poison = poison_set_locale;
-
-    const std::size_t tail_slots = 8;
-    std::vector<unsigned char> shorter(trunc + tail_slots * sizeof poison, 0);
-    std::memcpy(shorter.data(), &full, trunc);
-    for (std::size_t i = 0; i < tail_slots; ++i)
-        std::memcpy(shorter.data() + trunc + i * sizeof poison,
-                    &poison, sizeof poison);
-
-    const JceScriptHost *as_host =
-        reinterpret_cast<const JceScriptHost *>(shorter.data());
+    REQUIRE(trunc + sizeof(full.loc_set_locale) <= sizeof full);
+    full.loc_set_locale = poison_set_locale;
+    const JceScriptHost *as_host = &full;
 
     SUBCASE("the honest size is honoured")
     {

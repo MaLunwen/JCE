@@ -9,26 +9,11 @@
  * NOT built on os/core/jce_event.c, whose dispatch contract differs
  * on ordering, removal, duplicates and lifetime; see the header.
  *
- * On folding the slot list together with runtime/jce_player_loop.c
- * (audited, and REJECTED — do not re-open):
- *   - Only upper_bound is algorithmically identical (12 lines).
- *     ensure_alloc and grow close over per-module file statics — slot
- *     type, log tag, allocator latch, id counter — that must stay
- *     separate: one shared id counter would make either shutdown()
- *     reset the other module's ids, and one shared allocator latch is
- *     new cross-layer global state.
- *   - The dispatch loops implement DIFFERENT contracts on purpose.
- *     jce_player_loop_run_phase dispatches by id-identity snapshot
- *     (the audit Round-3 F81 fix, pinned by tests/application/
- *     test_jce_player_loop.c); emit() below is positional over a
- *     snapshotted count.  A shared list must pick one, and either
- *     choice re-introduces F81 or silently changes this registry.
- *   - What is left is a 12-line bisection whose only type-generic C99
- *     form is (base, stride, field-offset) pointer arithmetic — the
- *     shape os/core/jce_hashmap.h already argues against for exactly
- *     this class of intrusive, hand-rolled table.
- *   - It is also a two-site pattern: those are the only two ordered
- *     priority-slot lists in engine/ (third_party excluded).
+ * Each emit freezes the last registered identity and walks the live sorted
+ * table by (priority, identity). Immutable priorities and never-reused IDs make
+ * this equivalent to an entry identity snapshot without allocating memory.
+ * Nested emits own independent cursors; shutdown cancels them through an epoch.
+ * LOW_MEMORY delivery must remain usable when allocation is already failing.
  *
  * Thread model: registration / unregistration / emit are MAIN-THREAD
  * ONLY (lifecycle events originate from the SDL event pump, which is
@@ -68,12 +53,14 @@ static struct {
     uint32_t         count;
     uint32_t         capacity;
     uint32_t         next_id;
+    uint64_t         epoch;
+    bool             exhausted;
     jce_allocator_t  alloc;
     bool             alloc_ready;
 
     bool             focused;     /* assume foreground at boot */
     bool             paused;      /* assume running at boot    */
-} g_lc = { NULL, 0u, 0u, 0u, {0}, false, true, false };
+} g_lc = { NULL, 0u, 0u, 0u, 0u, false, {0}, false, true, false };
 
 
 static void ensure_alloc(void)
@@ -86,7 +73,15 @@ static void ensure_alloc(void)
 
 static bool grow(void)
 {
+    if (g_lc.capacity > UINT32_MAX / 2u) {
+        LOG_ERROR(LOG_TAG, "listener capacity exhausted");
+        return false;
+    }
     const uint32_t new_cap = (g_lc.capacity == 0u) ? 4u : (g_lc.capacity * 2u);
+    if ((size_t)new_cap > SIZE_MAX / sizeof(LifecycleSlot)) {
+        LOG_ERROR(LOG_TAG, "listener storage size overflow");
+        return false;
+    }
     LifecycleSlot *grown   = (LifecycleSlot *)JCE_AREALLOC(
         g_lc.alloc, g_lc.slots, (size_t)new_cap * sizeof(LifecycleSlot));
     if (!grown) {
@@ -122,6 +117,10 @@ jce_lifecycle_register(JceLifecycleCallback cb, int32_t priority, void *user)
         return h;
     }
 
+    if (g_lc.exhausted || g_lc.next_id == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "listener identity exhausted");
+        return h;
+    }
     ensure_alloc();
 
     if (g_lc.count >= g_lc.capacity && !grow())
@@ -133,8 +132,7 @@ jce_lifecycle_register(JceLifecycleCallback cb, int32_t priority, void *user)
                 (size_t)(g_lc.count - pos) * sizeof(LifecycleSlot));
     }
 
-    if (++g_lc.next_id == 0u)
-        g_lc.next_id = 1u;
+    ++g_lc.next_id;
 
     g_lc.slots[pos].priority = priority;
     g_lc.slots[pos].id       = g_lc.next_id;
@@ -180,12 +178,32 @@ jce_lifecycle_emit(JceLifecycleEvent event)
     default: break;
     }
 
-    /* Snapshot count up front: a callback that registers another
-     * listener must not fire this emit. */
-    const uint32_t n = g_lc.count;
-    for (uint32_t i = 0u; i < n; ++i) {
-        const LifecycleSlot s = g_lc.slots[i];
-        if (s.cb) s.cb(event, s.user);
+    if (!g_lc.count || g_lc.exhausted) return;
+    const uint64_t epoch = g_lc.epoch;
+    const uint32_t ceiling = g_lc.next_id;
+    int32_t last_priority = 0;
+    uint32_t last_id = 0;
+    bool delivered = false;
+
+    while (g_lc.epoch == epoch && !g_lc.exhausted) {
+        LifecycleSlot next;
+        bool found = false;
+        for (uint32_t i = 0u; i < g_lc.count; ++i) {
+            const LifecycleSlot candidate = g_lc.slots[i];
+            if (candidate.id > ceiling) continue;
+            if (delivered && (candidate.priority < last_priority ||
+                (candidate.priority == last_priority && candidate.id <= last_id)))
+                continue;
+            next = candidate;
+            found = true;
+            break;
+        }
+        if (!found) break;
+        last_priority = next.priority;
+        last_id = next.id;
+        delivered = true;
+        /* Keep no table pointer/index across callbacks: they can move/free it. */
+        if (next.cb) next.cb(event, next.user);
     }
 }
 
@@ -213,12 +231,14 @@ jce_lifecycle_event_to_string(JceLifecycleEvent event)
 void JCE_CALL
 jce_lifecycle_shutdown(void)
 {
-    if (!g_lc.alloc_ready) return;
-    if (g_lc.slots) JCE_AFREE(g_lc.alloc, g_lc.slots);
+    /* Cancel every active outer/nested emit before releasing its live table. */
+    if (g_lc.epoch != UINT64_MAX) ++g_lc.epoch;
+    else g_lc.exhausted = true;
+    if (g_lc.slots && g_lc.alloc_ready) JCE_AFREE(g_lc.alloc, g_lc.slots);
     g_lc.slots    = NULL;
     g_lc.count    = 0u;
     g_lc.capacity = 0u;
-    g_lc.next_id  = 0u;
+    /* Never reuse an opaque ID: stale pre-shutdown handles remain harmless. */
     g_lc.focused  = true;
     g_lc.paused   = false;
 }

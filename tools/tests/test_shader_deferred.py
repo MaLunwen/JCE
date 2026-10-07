@@ -17,6 +17,13 @@ class DeferredShaderTests(unittest.TestCase):
         env = driver.msvc_env(target)
         source = (ROOT / "engine/src/renderer/jce_shaders.c").read_text(encoding="utf-8")
         registry = (ROOT / "engine/src/renderer/jce_shader_deferred.h").read_text(encoding="utf-8") + source[source.index("static void deferred_source_free"):source.index("/* Load one shader (.bin)")]
+        if "uint16_t jce_shader_program_prepare(" in source:
+            prepare_start = source.index("uint16_t jce_shader_program_prepare(")
+            prepare_end = source.index("\nJceShaderHandle shader_load_program(", prepare_start)
+            registry += source[prepare_start:prepare_end]
+        postfx = (ROOT / "engine/src/renderer/jce_postfx.c").read_text(encoding="utf-8")
+        loader = postfx[postfx.index("static bgfx_program_handle_t load_postfx_prog("):
+                        postfx.index("bool jce_postfx_load_shaders(")]
         release_start = source.index("void jce_shader_program_destroy(")
         release_end = source.index("const char *jce_shaders_backend_suffix", release_start)
         release = source[release_start:release_end]
@@ -74,11 +81,18 @@ static bgfx_program_handle_t bgfx_create_program(bgfx_shader_handle_t vs,
 }
 static bool jce_shader_valid(JceShaderHandle handle) { return handle.idx != UINT16_MAX; }
 static void bgfx_destroy_program(bgfx_program_handle_t handle) { assert(handle.idx < 65000); ++destroys; }
+#define LOG_TAG "probe"
+#define LOG_WARN(...) ((void)0)
+static JceShaderHandle shader_load_program_named(const JcePakArchive *pak,
+    const char *vs, const char *fs) {
+    (void)pak; (void)vs; (void)fs; ++loads; copies += 2;
+    return (JceShaderHandle){(uint16_t)(40 + loads)};
+}
 void jce_shader_program_destroy(JceShaderHandle);
 ''' + registry + r'''
 static JceShaderDeferredState device;
 JceShaderDeferredState *jce_renderer_shader_deferred_state(void) { return &device; }
-''' + release + r'''
+''' + release + loader + r'''
 int main(void)
 {
     JcePakArchive pak = {7};
@@ -117,6 +131,19 @@ int main(void)
     assert(!jce_shader_valid(defer_stock(&pak, NULL, "pbr", "pbr", false)));
     jce_shader_deferred_shutdown();
     assert(loads == 1 && destroys == 1);
+    int before = loads, copied = copies;
+    bgfx_program_handle_t effect = load_postfx_prog(&pak, "fxaa");
+    assert(effect.idx >= JCE_DEFERRED_FIRST && effect.idx != UINT16_MAX);
+    assert(loads == before && copies == copied); /* unused effects never link */
+    original = 19;
+    concrete = jce_shader_deferred_resolve(effect.idx);
+    assert(concrete == 42 && loads == before + 1 && copies == copied + 2);
+    assert(jce_shader_deferred_resolve(effect.idx) == concrete && loads == before + 1);
+    jce_shader_program_destroy((JceShaderHandle){effect.idx});
+    original = 7;
+    effect = load_postfx_prog(&pak, "bloom_down");
+    jce_shader_program_destroy((JceShaderHandle){effect.idx});
+    assert(loads == before + 1 && destroys == 2);
     puts("deferred shader CPU lifecycle PASS");
     return 0;
 }
@@ -135,3 +162,6 @@ int main(void)
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("CPU lifecycle PASS", result.stdout)
+
+if __name__ == "__main__":
+    unittest.main()

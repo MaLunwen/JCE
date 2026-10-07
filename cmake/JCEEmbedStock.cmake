@@ -1,0 +1,33 @@
+# Fixed first-party data, embedded in the owning archive, never a loose runtime file.
+function(jce_target_embed_stock TARGET INPUT SYMBOL)
+    if(JCE_BIN2OBJ_EXECUTABLE)
+        if(NOT EXISTS "${JCE_BIN2OBJ_EXECUTABLE}" OR IS_DIRECTORY "${JCE_BIN2OBJ_EXECUTABLE}")
+            message(FATAL_ERROR "Stock embedding host wrapper does not exist: ${JCE_BIN2OBJ_EXECUTABLE}")
+        endif()
+        get_filename_component(JCE_BIN2OBJ_EXECUTABLE "${JCE_BIN2OBJ_EXECUTABLE}" ABSOLUTE)
+        set(_wrapper_dependency "${JCE_BIN2OBJ_EXECUTABLE}")
+    elseif(NOT CMAKE_CROSSCOMPILING AND TARGET jce_bin2obj)
+        set(JCE_BIN2OBJ_EXECUTABLE "$<TARGET_FILE:jce_bin2obj>")
+        set(_wrapper_dependency jce_bin2obj)
+    else()
+        message(FATAL_ERROR "Cross stock embedding requires an explicit native JCE_BIN2OBJ_EXECUTABLE")
+    endif()
+    set(_root "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${_root}")
+    if(EMSCRIPTEN)
+        set(_out "${_root}/${SYMBOL}.c")
+        add_custom_command(OUTPUT "${_out}"
+            COMMAND "${JCE_BIN2OBJ_EXECUTABLE}" --input "${INPUT}"
+                --symbol "${SYMBOL}" --output "${_out}" --format c
+            DEPENDS "${_wrapper_dependency}" "${INPUT}" VERBATIM)
+        target_sources(${TARGET} PRIVATE "${_out}")
+    else()
+        if(MSVC)
+            set(_ext obj)
+        else()
+            set(_ext S)
+        endif()
+        _jce_target_embed_binary(${TARGET} "${INPUT}" "${SYMBOL}"
+            "${_root}/${SYMBOL}.${_ext}")
+    endif()
+endfunction()

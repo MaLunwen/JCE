@@ -11,6 +11,8 @@
 
 #include "jce_editor_state_internal.h"
 #include "jce_editor_assert_bridge.h"
+#include "jce_editor_operation_metrics.h"
+#include "jce_editor_play_transaction.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h" /* resolve_mesh_path (collider) */
 #include "ui/jce_editor_panels.h"
@@ -408,9 +410,15 @@ void jce_state_play(void)
      * changing something and pressing Play again. */
     jce_editor_assert_bridge_reset_ensures();
 
-    s_play_snapshot_valid = history_capture_snapshot(&s_play_snapshot);
-    if (!s_play_snapshot_valid)
-        LOG_WARN(LOG_TAG, "failed to capture play-mode snapshot");
+    {
+        JceEditorOperationScope operation("ed_play_capture");
+        if (!jce_editor_play_capture(s_play_snapshot_valid,
+                [] { return history_capture_snapshot(&s_play_snapshot); },
+                [] { s_play_snapshot = EditorHistorySnapshot(); })) {
+            LOG_ERROR(LOG_TAG, "play refused: failed to capture play-mode snapshot");
+            return;
+        }
+    }
 
     s_play_audio = jce_audio_create();
     if (!s_play_audio)
@@ -517,17 +525,35 @@ void jce_state_play(void)
     const bool capable = !s_play_host.stats || jce_platform_stats_available(s_play_host.stats);
     if (!configured || !capable)
         LOG_WARN(LOG_TAG, "runtime stats configuration unavailable");
-    s_play_host.runtime = jce_runtime_create_with_platform_services(
-        &rd, configured && capable ? s_play_host.stats : NULL);
-    if (s_play_host.runtime)
-        jce_runtime_set_platform_services(s_play_host.runtime, configured && capable ? s_play_host.stats : NULL);
-    if (!s_play_host.runtime) {
-        LOG_ERROR(LOG_TAG, "failed to create play runtime");
-        if (!jce_runtime_stats_host_close(&s_play_host))
-            LOG_WARN(LOG_TAG, "runtime stats flush failed after create failure");
-        if (s_play_audio) { jce_audio_destroy(s_play_audio); s_play_audio = NULL; }
-        return;
-    }
+    const bool created = jce_editor_play_create(s_play_snapshot_valid,
+        [&] {
+            JceEditorOperationScope operation("ed_play_create");
+            s_play_host.runtime = jce_runtime_create_with_platform_services(
+                &rd, configured && capable ? s_play_host.stats : NULL);
+            return s_play_host.runtime != NULL;
+        },
+        [] {
+            JceEditorOperationScope operation("ed_play_teardown");
+            LOG_ERROR(LOG_TAG, "failed to create play runtime");
+            if (!jce_runtime_stats_host_close(&s_play_host))
+                LOG_WARN(LOG_TAG, "runtime stats flush failed after create failure");
+            if (s_play_audio) {
+                jce_audio_destroy(s_play_audio);
+                s_play_audio = NULL;
+            }
+        },
+        [] {
+            JceEditorOperationScope operation("ed_play_restore");
+            const bool restored = history_restore_snapshot(
+                s_play_snapshot, "play-create-rollback");
+            if (!restored)
+                LOG_ERROR(LOG_TAG, "play create scene restoration failed; snapshot retained");
+            return restored;
+        },
+        [] { s_play_snapshot = EditorHistorySnapshot(); });
+    if (!created) return;
+    jce_runtime_set_platform_services(s_play_host.runtime,
+        configured && capable ? s_play_host.stats : NULL);
 
     /* Runtime construction performs synchronous scene/script/resource setup.
      * That wall-clock delay is not simulation time: consume one authored fixed
@@ -639,56 +665,60 @@ void jce_state_stop(void)
 {
     if (s.play_state == JCE_PLAY_STOPPED) {
         if (s_play_snapshot_valid) {
-            if (history_restore_snapshot(s_play_snapshot, "play-stop-retry")) {
-                s_play_snapshot = EditorHistorySnapshot();
-                s_play_snapshot_valid = false;
+            JceEditorOperationScope operation("ed_play_restore");
+            if (jce_editor_play_restore(s_play_snapshot_valid,
+                    [] { return history_restore_snapshot(s_play_snapshot, "play-stop-retry"); },
+                    [] { s_play_snapshot = EditorHistorySnapshot(); })) {
                 LOG_INFO(LOG_TAG, "play stop scene restoration retry completed");
             } else LOG_ERROR(LOG_TAG, "play stop scene restoration retry failed; snapshot retained");
         }
         return;
     }
-    jce_editor_game_render_set_mouse_capture(false);
+    {
+        JceEditorOperationScope operation("ed_play_teardown");
+        jce_editor_game_render_set_mouse_capture(false);
 
-    /* Clear the renderer's anim-event hook BEFORE destroying the runtime it
-     * forwards to — otherwise a stray render frame could route an event into a
-     * freed runtime pointer. */
-    jce_scene_renderer_set_anim_event_fn(jce_editor_get_scene_renderer(),
-                                         NULL, NULL);
-    jce_scene_renderer_set_anim_state_fn(jce_editor_get_scene_renderer(),
-                                         NULL, NULL);
-    jce_scene_renderer_set_ground_query_fn(jce_editor_get_scene_renderer(),
-                                           NULL, NULL);
-    /* Detach the runtime from the game renderer's UI dispatch BEFORE destroying
-     * it, so a stray render frame can't route a drained click into a freed
-     * runtime pointer (mirrors the renderer-hook clears above). */
-    jce_editor_game_render_set_play_runtime(NULL);
+        /* Clear the renderer's anim-event hook BEFORE destroying the runtime it
+         * forwards to — otherwise a stray render frame could route an event into a
+         * freed runtime pointer. */
+        jce_scene_renderer_set_anim_event_fn(jce_editor_get_scene_renderer(),
+                                             NULL, NULL);
+        jce_scene_renderer_set_anim_state_fn(jce_editor_get_scene_renderer(),
+                                             NULL, NULL);
+        jce_scene_renderer_set_ground_query_fn(jce_editor_get_scene_renderer(),
+                                               NULL, NULL);
+        /* Detach the runtime from the game renderer's UI dispatch BEFORE destroying
+         * it, so a stray render frame can't route a drained click into a freed
+         * runtime pointer (mirrors the renderer-hook clears above). */
+        jce_editor_game_render_set_play_runtime(NULL);
 
-    /* Unload streamed chunks (destroys their entities from the live scene)
-     * BEFORE the runtime is destroyed and BEFORE the pre-play snapshot is
-     * restored below, so streamed content never lingers or bakes in. */
-    play_streaming_end();
+        /* Unload streamed chunks (destroys their entities from the live scene)
+         * BEFORE the runtime is destroyed and BEFORE the pre-play snapshot is
+         * restored below, so streamed content never lingers or bakes in. */
+        play_streaming_end();
 
-    /* Uncap the editor again.  Restoring a SAVED value would be false
-     * precision: jce_engine_set_target_fps has exactly two call sites -- the
-     * shipped main, which the editor never runs, and the Play block above --
-     * so outside Play the editor's cap is 0 by construction.  Saving a value
-     * that is always 0 buys nothing and would quietly become wrong if someone
-     * ever capped the editor deliberately, because it would restore a stale
-     * reading rather than that deliberate choice. */
-    jce_engine_set_target_fps(0);
-    jce_lighting_set_pixel_light_count(0);
-    if (s_play_host.runtime) { jce_runtime_destroy(s_play_host.runtime); s_play_host.runtime = NULL; }
-    if (!jce_runtime_stats_host_close(&s_play_host))
-        LOG_WARN(LOG_TAG, "runtime stats flush failed");
-    if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
-    s_active_contacts = 0;
-    s_play_resync_clock = false;
+        /* Uncap the editor again.  Restoring a SAVED value would be false
+         * precision: jce_engine_set_target_fps has exactly two call sites -- the
+         * shipped main, which the editor never runs, and the Play block above --
+         * so outside Play the editor's cap is 0 by construction.  Saving a value
+         * that is always 0 buys nothing and would quietly become wrong if someone
+         * ever capped the editor deliberately, because it would restore a stale
+         * reading rather than that deliberate choice. */
+        jce_engine_set_target_fps(0);
+        jce_lighting_set_pixel_light_count(0);
+        if (s_play_host.runtime) { jce_runtime_destroy(s_play_host.runtime); s_play_host.runtime = NULL; }
+        if (!jce_runtime_stats_host_close(&s_play_host))
+            LOG_WARN(LOG_TAG, "runtime stats flush failed");
+        if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
+        s_active_contacts = 0;
+        s_play_resync_clock = false;
+    }
 
     if (s_play_snapshot_valid) {
-        if (history_restore_snapshot(s_play_snapshot, "play-stop-restore")) {
-            s_play_snapshot = EditorHistorySnapshot();
-            s_play_snapshot_valid = false;
-        } else {
+        JceEditorOperationScope operation("ed_play_restore");
+        if (!jce_editor_play_restore(s_play_snapshot_valid,
+                [] { return history_restore_snapshot(s_play_snapshot, "play-stop-restore"); },
+                [] { s_play_snapshot = EditorHistorySnapshot(); })) {
             // Runtime/input teardown above still completes; retain the snapshot
             // for a subsequent Stop retry instead of claiming scene restoration.
             LOG_ERROR(LOG_TAG, "play stop scene restoration failed; snapshot retained");

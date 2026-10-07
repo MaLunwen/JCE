@@ -374,31 +374,24 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
                 s_active.perf[i] = tierdef.perf[i];
     }
 
-    /* WebGL2 / OpenGL ES clamp: the browser backend is a low-caps GLES3 target
-     * (no compute, no MSAA), yet a shipped RenderPipeline.rp.json can request a
-     * HIGH desktop tier (HDR half-float RT + TAA history + z-prepass + SSR +
-     * volumetric fog).  That offscreen-HDR-plus-composite chain renders the
-     * whole 3D scene black on WebGL2 (the UI, drawn straight to the backbuffer
-     * after the composite, still shows) — so force the fragile features off and
-     * render the scene directly to the LDR backbuffer.  CSM shadows, SSAO and
-     * bloom stay available (they work on WebGL2).  Desktop backends are
-     * untouched. */
+    /* WebGL2 / OpenGL ES clamp: retain conservative cost defaults, but admit
+     * explicitly requested HDR/TAA when sampled RGBA16F targets are supported.
+     * The backend name alone does not establish unsupported attachments.
+     * Other screen-space paths retain their existing policy until verified. */
     {
         JceRendererBackend be = jce_renderer_get_active_backend();
         if (be == JCE_BACKEND_OPENGLES) {   /* WebGL2 / mobile GLES3 only */
-            s_active.hdr_color            = false;  /* no half-float offscreen RT */
-            s_active.enable_taa           = false;  /* needs motion vectors + history */
+            const uint32_t float_targets = JCE_CAP_TEXTURE_FLOAT
+                                         | JCE_CAP_FRAMEBUFFER_FLOAT;
+            if ((jce_renderer_get_caps() & float_targets) != float_targets)
+                s_active.hdr_color = false;
+            if (!s_active.hdr_color)
+                s_active.enable_taa = false; /* signed motion/history require HDR */
             s_active.enable_ssr           = false;  /* screen-space reflections */
             s_active.enable_ssgi          = false;  /* screen-space GI          */
-            /* Volumetric fog is NOT disabled here.  This block is for things
-             * GLES CANNOT do -- half-float targets, motion-vector history.
-             * The fog pass is an ordinary fragment quad that compiles and
-             * runs on WebGL2 (essl binaries are produced for it).  Whether it
-             * SHOULD run there is a COST question, and the LOW-tier floor
-             * below -- which WebGL2 always hits -- is where that is decided.
-             * Listing it here conflated "cannot" with "should not", and the
-             * two need separate answers or a future tier that can afford the
-             * march still never gets it. */
+            /* Fog is an ordinary fragment pass. Its tier cost policy below is
+             * separate from attachment capability and leaves it available on
+             * capable configurations. */
             s_active.enable_motion_blur   = false;
             s_active.depth_prepass        = false;
             /* Web perf: every WebGL draw crosses the JS/ANGLE boundary, so
@@ -423,8 +416,7 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
 
     /* LOW-tier floor (engine guarantee: hold playable frame rates on
      * integrated graphics).  A shipped .rp.json may request HIGH features;
-     * on tier-LOW hardware (iGPU — and every WebGL2 browser, where ANGLE
-     * masks the adapter and the tier heuristic lands LOW) those requests are
+     * on tier-LOW hardware those requests are
      * clamped to the floor bundle: single-mip bloom, one shadow cascade, and
      * no HDR/TAA/SSR extras.  Individual knobs measured too small alone on a
      * 50ms iGPU frame; the bundle (with the 0.65x dynamic resolution in the
@@ -521,13 +513,13 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
         (int)s_active.enable_bloom, (int)s_active.enable_volumetric_fog,
         (int)s_active.enable_gpu_particles, (int)s_active.enable_motion_blur,
         (double)jce_render_pipeline_motion_blur_intensity(),
-        (unsigned)desc->shadow_resolution,
-        (unsigned)desc->csm_cascade_count,
-        (unsigned)desc->shadow_filter_quality,
-        (unsigned)desc->msaa_samples,
-        (double)desc->render_scale,
-        quality_to_str(desc->post_quality),
-        (int)desc->hdr_color, (int)desc->depth_prepass);
+        (unsigned)s_active.shadow_resolution,
+        (unsigned)s_active.csm_cascade_count,
+        (unsigned)s_active.shadow_filter_quality,
+        (unsigned)s_active.msaa_samples,
+        (double)s_active.render_scale,
+        quality_to_str(s_active.post_quality),
+        (int)s_active.hdr_color, (int)s_active.depth_prepass);
 }
 
 void jce_render_pipeline_get(JceRenderPipelineDesc *out)

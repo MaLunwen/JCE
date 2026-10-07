@@ -25,7 +25,15 @@ cmake_minimum_required(VERSION 3.20)
 
 set(_JCE_SCRIPT_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(jce_script_api SHARED
+if(JCE_BUILD_SCRIPT_API_STATIC AND JCE_BUILD_SCRIPT_API_SHARED)
+	message(FATAL_ERROR "Select exactly one static/shared script API linkage")
+endif()
+if(JCE_BUILD_SCRIPT_API_STATIC)
+	set(_jce_script_api_type STATIC)
+else()
+	set(_jce_script_api_type SHARED)
+endif()
+add_library(jce_script_api ${_jce_script_api_type}
 	"${_JCE_SCRIPT_API_SRC}/jce_script_api.gen.c"
 	"${_JCE_SCRIPT_API_SRC}/jce_script_api_core.c")
 
@@ -51,14 +59,14 @@ target_compile_definitions(jce_script_api PRIVATE JCE_SCRIPT_API_BUILD=1)
 
 jce_target_warnings(jce_script_api STRICT)
 
-if(MSVC)
+if(_jce_script_api_type STREQUAL "SHARED" AND MSVC)
 	# MSVC exports nothing by default, so the .def IS the export set.
 	# Listed as a source (not as a bare /DEF: link flag) so that editing it
 	# relinks: a stale export table that still matches the committed list is
 	# exactly the "green by accident" state this repo keeps rediscovering.
 	target_sources(jce_script_api PRIVATE
 		"${_JCE_SCRIPT_API_SRC}/jce_script_api.def")
-else()
+elseif(_jce_script_api_type STREQUAL "SHARED")
 	target_compile_options(jce_script_api PRIVATE -fvisibility=hidden)
 	if(NOT APPLE)
 		# GNU ld / lld.  Apple's linker has no --version-script; there
@@ -91,7 +99,7 @@ if(NOT _jce_script_api_srcs MATCHES "jce_script_api\\.gen\\.c")
 		"generated forwarders are not being compiled. Regenerate with:\n"
 		"  python tools/scriptgen/gen_script_c_abi.py --write")
 endif()
-if(MSVC AND NOT _jce_script_api_srcs MATCHES "jce_script_api\\.def")
+if(_jce_script_api_type STREQUAL "SHARED" AND MSVC AND NOT _jce_script_api_srcs MATCHES "jce_script_api\\.def")
 	message(FATAL_ERROR
 		"jce_script_api has no module-definition file on MSVC — the DLL would "
 		"export nothing and the symbol-table test would pass vacuously. "
@@ -99,3 +107,5 @@ if(MSVC AND NOT _jce_script_api_srcs MATCHES "jce_script_api\\.def")
 		"  python tools/scriptgen/gen_script_c_abi.py --write")
 endif()
 unset(_jce_script_api_srcs)
+
+unset(_jce_script_api_type)

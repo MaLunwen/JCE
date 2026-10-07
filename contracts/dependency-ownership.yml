@@ -36,7 +36,7 @@ capabilities:
       - tools/
     link_whitelist: [jce_core, jce_platform, jce_renderer, jce_resource, jce_scene,
       jce_audio, jce_video, jce_ui, jce_save, jce_application, jce_ai_dispatch, jce_cook,
-      jce_tool_cli_bootstrap, jce_tool_cli_io, jce_bundle_pack]
+      jce_tool_cli_bootstrap, jce_tool_cli_io, jce_bundle_pack, jce_ibl_bake]
     notes: covers SDL_iostream/atomic/thread/mutex/timer/cpuinfo/filesystem/stdinc etc.
       CLI bootstrap owns UTF-8 argv via SDL_main only; CLI IO owns private SDL_iostream
       host streams. Bundle pack links the bootstrap and public resource API. These

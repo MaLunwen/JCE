@@ -60,6 +60,8 @@ struct JceInput {
     float    wheel_h;
     uint32_t mouse_cur;
     uint32_t mouse_prev;
+    uint32_t mouse_tap; /* effective one-frame press after an unheld DOWN/UP */
+    uint32_t mouse_tap_prev; /* release history, separate from physical held */
 
     /* Primary touch identity survives release without contaminating mouse. */
     struct { float x, y; uint64_t finger; bool touch, down; } pointer;
@@ -154,6 +156,8 @@ void jce_input_update(JceInput *input)
 
     memcpy(input->keys_prev, input->keys_cur, sizeof(input->keys_cur));
     input->mouse_prev = input->mouse_cur;
+    input->mouse_tap_prev = input->mouse_tap;
+    input->mouse_tap = 0;
     input->mouse_dx   = 0.0f;
     input->mouse_dy   = 0.0f;
     input->wheel       = 0.0f;
@@ -271,8 +275,12 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
         if (ev->mbutton.button < 1 || ev->mbutton.button > 32) break;
         if (ev->mbutton.down)
             input->mouse_cur |=  JCE_MOUSE_BUTTON_MASK(ev->mbutton.button);
-        else
-            input->mouse_cur &= ~JCE_MOUSE_BUTTON_MASK(ev->mbutton.button);
+        else {
+            uint32_t mask = JCE_MOUSE_BUTTON_MASK(ev->mbutton.button);
+            if ((input->mouse_cur & mask) && !(input->mouse_prev & mask))
+                input->mouse_tap |= mask;
+            input->mouse_cur &= ~mask;
+        }
         if (ev->mbutton.down)
             mark_virtual_active(input, (int)JCE_DEVCLASS_MOUSE);
         break;
@@ -493,7 +501,8 @@ bool jce_input_primary_pointer(const JceInput *input, float width, float height,
     py = input->pointer.touch ? input->pointer.y * height : input->mouse_y;
     *x = px; *y = py;
     *down = input->pointer.touch ? input->pointer.down :
-        (input->mouse_cur & JCE_MOUSE_BUTTON_MASK(JCE_MOUSE_BUTTON_LEFT)) != 0;
+        ((input->mouse_cur | input->mouse_tap) &
+         JCE_MOUSE_BUTTON_MASK(JCE_MOUSE_BUTTON_LEFT)) != 0;
     return isfinite(px) && isfinite(py) && px >= 0.0f && py >= 0.0f &&
            px < width && py < height;
 }
@@ -514,21 +523,23 @@ static bool mouse_button_in_range(int button)
 bool jce_input_mouse_button(const JceInput *input, int button)
 {
     if (!input || !mouse_button_in_range(button)) return false;
-    return (input->mouse_cur & JCE_MOUSE_BUTTON_MASK(button)) != 0;
+    return ((input->mouse_cur | input->mouse_tap) & JCE_MOUSE_BUTTON_MASK(button)) != 0;
 }
 
 bool jce_input_mouse_button_pressed(const JceInput *input, int button)
 {
     if (!input || !mouse_button_in_range(button)) return false;
     uint32_t mask = JCE_MOUSE_BUTTON_MASK(button);
-    return (input->mouse_cur & mask) && !(input->mouse_prev & mask);
+    return (input->mouse_tap & mask) ||
+           ((input->mouse_cur & mask) && !(input->mouse_prev & mask));
 }
 
 bool jce_input_mouse_button_released(const JceInput *input, int button)
 {
     if (!input || !mouse_button_in_range(button)) return false;
     uint32_t mask = JCE_MOUSE_BUTTON_MASK(button);
-    return !(input->mouse_cur & mask) && (input->mouse_prev & mask);
+    return !((input->mouse_cur | input->mouse_tap) & mask) &&
+           ((input->mouse_prev | input->mouse_tap_prev) & mask);
 }
 
 float jce_input_mouse_wheel(const JceInput *input)
@@ -597,7 +608,7 @@ void jce_input_capture(const JceInput *input, JceInputFrame *out)
     out->mouse_dx      = input->mouse_dx;
     out->mouse_dy      = input->mouse_dy;
     out->mouse_wheel   = input->wheel;
-    out->mouse_buttons = input->mouse_cur;
+    out->mouse_buttons = input->mouse_cur | input->mouse_tap;
 
     out->touch_count = (uint32_t)input->touch_count;
     for (i = 0; i < input->touch_count && i < JCE_MAX_TOUCHES; ++i) {
@@ -633,6 +644,7 @@ bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
     input->mouse_dy  = frame->mouse_dy;
     input->wheel     = frame->mouse_wheel;
     input->mouse_cur = frame->mouse_buttons;
+    input->mouse_tap = 0;
 
     n = (int)frame->touch_count;
     if (n < 0) n = 0;

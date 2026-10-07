@@ -13,3 +13,9 @@ foreach(_jce_option JCE_BUILD_SCRIPT_VM_PYTHON JCE_BUILD_SCRIPT_CSHARP
 	endif()
 endforeach()
 unset(_jce_option)
+
+if(JCE_DELIVERY_PROFILE STREQUAL "embedded")
+	set(JCE_BUILD_SCRIPT_API_STATIC ON CACHE BOOL "Embedded native call-down API" FORCE)
+else()
+	option(JCE_BUILD_SCRIPT_API_STATIC "Optional static call-down API" OFF)
+endif()

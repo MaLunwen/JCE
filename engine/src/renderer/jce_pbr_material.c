@@ -717,6 +717,28 @@ void jce_pbr_material_shutdown(void)
         s_prog_cache[i].used = false;
     }
     s_prog_cache_count = 0;
+    /* These references belong to the lazy material binder, independently of
+     * shader reflection. Release them while the renderer device is alive. */
+    if (s_uniforms_init) {
+        bgfx_uniform_handle_t *uniforms[] = {
+            &s_mu.base_color, &s_mu.pbr_params, &s_mu.emissive,
+            &s_mu.normal_scale, &s_mu.uv_transform, &s_mu.pbr_lobes,
+            &s_mu.sheen_color, &s_mu.pbr_lobes2, &s_mu.translucency_color,
+            &s_albedo, &s_metal_rough, &s_normal_map, &s_ao_map, &s_emissive_map
+        };
+        for (size_t i = 0; i < sizeof(uniforms) / sizeof(uniforms[0]); i++) {
+            if (BGFX_HANDLE_IS_VALID(*uniforms[i]))
+                bgfx_destroy_uniform(*uniforms[i]);
+            uniforms[i]->idx = UINT16_MAX;
+        }
+        if (BGFX_HANDLE_IS_VALID(s_white_tex)) bgfx_destroy_texture(s_white_tex);
+        if (BGFX_HANDLE_IS_VALID(s_flat_normal_tex)) bgfx_destroy_texture(s_flat_normal_tex);
+        s_white_tex.idx = UINT16_MAX;
+        s_flat_normal_tex.idx = UINT16_MAX;
+        s_uniforms_init = false;
+    }
+    s_view_mode = 0.0f;
+    memset(s_uv_override, 0, sizeof(s_uv_override));
 }
 
 /* ================================================================== */

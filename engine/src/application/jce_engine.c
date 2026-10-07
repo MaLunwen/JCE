@@ -11,6 +11,8 @@
 #include <jce/application/jce_engine.h>
 #include "jce_engine_frame_cap.h"
 #include "jce_frame_kpi.h"
+#include "jce_engine_trace_scope.h"
+#include "jce_engine_callbacks.h"
 #include <jce/application/jce_lifecycle.h>
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_fixed_clock.h>
@@ -623,8 +625,10 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     {
         const char *trace_env = getenv("JCE_TRACE");
         const char *perf_env = getenv("JCE_PERF_LOG");
+        const char *export_env = getenv("JCE_TRACE_EXPORT");
         bool trace_on = (trace_env && trace_env[0] != '0') ||
-                        (perf_env && perf_env[0] != '0');
+                        (perf_env && perf_env[0] != '0') ||
+                        (export_env && export_env[0]);
 #ifndef NDEBUG
         trace_on = true;
 #endif
@@ -1007,7 +1011,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
                            e->config.renderer_backend == JCE_BACKEND_OPENGLES)
                               ? JCE_WINDOW_OPENGL : 0)
         };
-        e->window = jce_window_create(&win_cfg);
+        JCE_ENGINE_TRACE_RESULT("engine.window_create",
+            e->window = jce_window_create(&win_cfg), e->window != NULL);
         if (!e->window) {
             fatal_msg("Window creation failed: %s", SDL_GetError());
             goto fail;
@@ -1026,7 +1031,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     if (e->headless) {
         /* NullRHI: bgfx NOOP, no window.  Scene/resource render calls stay
          * valid no-ops; the headless loop never draws. */
-        e->renderer = jce_renderer_create_headless();
+        JCE_ENGINE_TRACE_RESULT("engine.renderer_headless",
+            e->renderer = jce_renderer_create_headless(), e->renderer != NULL);
         if (!e->renderer) {
             fatal_msg("Headless renderer (NullRHI) init failed");
             goto fail;
@@ -1043,7 +1049,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         .debug_text  = e->config.debug_text,
         .clear_color = e->config.clear_color
     };
-    e->renderer = jce_renderer_create(e->window, &ren_cfg);
+    JCE_ENGINE_TRACE_RESULT("engine.renderer_create",
+        e->renderer = jce_renderer_create(e->window, &ren_cfg), e->renderer != NULL);
     if (!e->renderer) {
         LOG_WARN(LOG_TAG,
             "Renderer init failed, falling back");
@@ -1388,15 +1395,19 @@ headless_after_renderer:;
 
     /* Initialize registered subsystems before app init. */
     if (e->subsystems)
-        jce_subsystem_init_all(e->subsystems, &e->svc);
+        JCE_ENGINE_TRACE_CALL("engine.subsystems_init",
+            jce_subsystem_init_all(e->subsystems, &e->svc));
 
     /* -- Initialize application ----------------------------------- */
 
     if (g_app_desc_set && g_app_desc.init) {
         if (!e->headless && should_render_loading_frame())
             render_loading_frame(e->renderer, e->window, "Loading assets...");
-        if (!g_app_desc.init(&e->svc, g_app_desc.user_data))
-            goto fail;
+        JceEngineTraceScope init_trace = engine_trace_begin("engine.app_init");
+        const bool initialized = g_app_desc.init(&e->svc, g_app_desc.user_data);
+        engine_trace_end(init_trace, initialized ? JCE_TRACE_TASK_SUCCEEDED
+                                                : JCE_TRACE_TASK_FAILED);
+        if (!initialized) goto fail;
     } else {
         fatal_msg("No JceAppDesc registered. Call jce_engine_set_app_desc() before jce_engine_create().");
         goto fail;
@@ -2153,16 +2164,7 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         jce_perf_phase_add("pl_update",
             jce_time_perf_to_ms(_t0_pl_update, jce_time_perf_counter())); }
 
-    if (g_app_desc.update) {
-        JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
-        uint64_t _t0_app = jce_time_perf_counter();
-        g_app_desc.update(dt, g_app_desc.user_data);
-        if (g_app_desc.draw)
-            g_app_desc.draw(&e->svc, g_app_desc.user_data);
-        jce_perf_phase_add("app_update",
-                           jce_time_perf_to_ms(_t0_app, jce_time_perf_counter()));
-        JCE_PROFILE_ZONE_END;
-    }
+    engine_app_update_and_draw(&g_app_desc, dt, &e->svc);
 
     /* ── PlayerLoop: LATE_UPDATE ────────────────────────────────────
      * Post-gameplay: cameras, IK, anim post-processing. */
@@ -2593,18 +2595,24 @@ void jce_engine_destroy(JceEngine *e)
     /* Stop background producers while application state and GPU-facing
      * resources are still alive. Completion callbacks are owner-thread work
      * and may legitimately release objects owned by the application. */
-    if (!jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
-                                    JCE_ASYNC_WAIT_INFINITE))
+    JceEngineTraceScope async_trace = engine_trace_begin("engine.async_shutdown");
+    const bool async_stopped = jce_async_default_shutdown(
+        JCE_ASYNC_SHUTDOWN_CANCEL_ALL, JCE_ASYNC_WAIT_INFINITE);
+    engine_trace_end(async_trace, async_stopped ? JCE_TRACE_TASK_SUCCEEDED
+                                              : JCE_TRACE_TASK_FAILED);
+    if (!async_stopped)
         LOG_ERROR(LOG_TAG, "structured async executor shutdown failed");
     JCE_SHUTDOWN_DIAG("async executor stopped");
 
     if (g_app_desc.exit)
-        g_app_desc.exit(g_app_desc.user_data);
+        JCE_ENGINE_TRACE_CALL("engine.app_exit",
+            g_app_desc.exit(g_app_desc.user_data));
     JCE_SHUTDOWN_DIAG("application callback stopped");
 
     /* Shut down registered subsystems (reverse priority). */
     if (e->subsystems) {
-        jce_subsystem_shutdown_all(e->subsystems);
+        JCE_ENGINE_TRACE_CALL("engine.subsystems_shutdown",
+            jce_subsystem_shutdown_all(e->subsystems));
         jce_subsystem_registry_destroy(e->subsystems);
     }
 
@@ -2628,7 +2636,9 @@ void jce_engine_destroy(JceEngine *e)
     /* jce_text_shutdown() now runs inside jce_renderer_destroy() before
      * bgfx_shutdown(), preserving the LIFO contract for any future
      * GPU-touching cleanup the text subsystem may grow. */
-    if (e->renderer) jce_renderer_destroy(e->renderer);
+    if (e->renderer)
+        JCE_ENGINE_TRACE_CALL("engine.renderer_destroy",
+            jce_renderer_destroy(e->renderer));
     JCE_SHUTDOWN_DIAG("renderer stopped");
     /* Shared data-parallel job pool (frustum cull etc.) — joined after the
      * renderer so no cull is in flight.  The old jce_jobs_shutdown_default()

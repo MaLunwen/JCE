@@ -51,6 +51,13 @@ Original third-party code is fetched from immutable pins, verified byte-for-byte
 and kept outside the source tree. Never patch, format, move or repair an upstream
 checkout or Conan package. First-party ports live outside upstream trees.
 
+## Application lifecycle authority
+
+[contracts/application-lifecycle.md](contracts/application-lifecycle.md) defines
+optional callback dispatch, listener mutation, Play failure recovery and trace
+completeness. Reuse the existing runtime, history and bounded trace authorities;
+CPU submission records never substitute for GPU execution or presentation.
+
 ## §11 Change and verification invariants
 
 1. Search public headers, implementation and adjacent modules before adding code.

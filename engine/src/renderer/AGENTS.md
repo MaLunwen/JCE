@@ -629,3 +629,55 @@ be released before first submission. Missing source stays invalid; program relea
 old variant entries once per distinct handle. Preserve every shader feature.
 
 Prepared shader state belongs to the existing singleton bgfx device owner, with no independent global registry. Device shutdown frees prepared bytes and concrete programs; reload releases old distinct handles. Native loaders remain eager.
+
+## Fixed stock BRDF
+
+The default 256-square split-sum LUT is a fixed first-party RGBA16F payload
+linked into this archive through the shared binary wrapper. It works without
+a PAK, writable cache or loose file. The offline baker and custom-size fallback
+share the exact 1024-sample kernel, texel centers and half conversion.
+`data/brdf_256.f16.json` pins payload and kernel hashes; renderer builds verify
+these before linking. Regenerate with `python scripts/bake_ibl.py --out
+engine/src/renderer/data/brdf_256.f16`. Generated wrappers remain under build.
+Different libm hosts may regenerate slightly different values; the checked-in
+reference pins delivery bytes, and CPU physical-value comparisons allow half
+quantization rather than claiming all-host bitwise arithmetic identity.
+
+Web PostFX pipelines opt into the same owned deferred-program registry. Checks
+in execution paths resolve only requested programs; every fullscreen/pyramid
+submission uses a concrete handle while destruction/reload keep the prepared
+identity. Verify inactive chains, first activation, repeated use, custom shader
+replacement, reload and destruction with actual target and pixel witnesses.
+
+GLES HDR/TAA admission reads current sampled RGBA16F framebuffer capability and the active HDR request. Preserve conservative tier defaults and independently verified cost policies; a backend label is not evidence of unsupported attachments. Applied pipeline logs describe the resolved descriptor, not the original request. PostFX format selection must not retain hardware capability across device/context replacement.
+
+TAA status belongs to each PostFX pipeline. Emit the existing on/off marker with
+view_base only when its CPU resolve submission changes; a requested flag alone
+is not activation evidence. Failed programs, missing quad buffers and invalid
+targets report off. GPU completion and presentation need independent evidence.
+
+TAA history is eligible only after a successful history-copy submission in the
+preceding apply. Disabled applies, resize, skipped applies and failed copies invalidate
+reuse. First/resumed frames and unavailable motion bind zero feedback without
+mutating authored parameters; the resolve shader returns current colour before
+sampling undefined history. CPU copy submission is not GPU completion evidence.
+
+Consume matrix and external-motion inputs at apply entry, before validation,
+so early returns cannot retain a prior frame. Reset output and effect-active
+status at entry; motion blur and DOF become active only after their composite
+submission succeeds. Camera motion without fresh matrices/depth is unavailable.
+
+A temporary end-frame disarm followed by re-enable without an intervening apply
+preserves the immediately preceding history; only an actual skipped/disabled
+apply consumes it without replacement. Do not reset on the toggle alone.
+
+Renderer-owned SDF text programs and all four explicit SDF uniform references
+are released before bgfx shutdown in both windowed and NOOP lifetimes. Shader
+reflection ownership does not replace each create_uniform reference. Validate
+real WebGL object deletion before context destruction; GC is not teardown proof.
+
+The shared PBR binder and light binder own their explicit uniform references
+and default textures for one renderer device lifetime. Release them before
+bgfx shutdown, reset their lazy initialization flags, and recreate them on the
+next device. Light environments borrow shared bindings; destroying one
+environment must not invalidate other environments on the same device.

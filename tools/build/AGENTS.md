@@ -95,3 +95,37 @@ clearing of stale bundle cache arguments. The app artifact resolver accepts the
 stock template's extensionless executable name and adds a Windows suffix once.
 Bundle files themselves remain single binary content archives, not SDK copies;
 validate their editor reopen and embedded EXE-only relocation separately.
+
+Cross SDK/editor builds refresh both native jce_pak and jce_bin2obj through one
+host-tool resolver and forward their explicit paths to CMake. Target executables
+cannot perform build-host embedding. Shader inspection uses the same execution-
+probed shaderc resolver as SDK builds; mere file existence is insufficient.
+
+Web dependency configuration records the actual Clang frontend and full emcc
+ABI identity. An owned build-directory Conan configuration overlay extends the
+settings schema while sharing the original package store/database; never edit
+user settings, copy authentication or duplicate the dependency cache. Pass its
+environment explicitly to hooks, recipe export and install. Derive EMSCRIPTEN
+from the selected compiler wrapper for dependency recipes, not a machine path.
+
+Embedded project admission passes the actual bundle platform and only a verified
+SDK stock-shader directory. SDK stock files must match the current embedded PAK
+BOM before installation, with an exact hash manifest. Project assets take priority;
+unknown custom shaders still fail. Single EXEs do not depend on this SDK directory.
+
+SDK consumers prefer execution-probed tools from the explicitly selected SDK.
+Only a complete cook/pack/wrapper set avoids host-cache ownership; recheck after
+acquiring SDK ownership and reject changed availability before any unowned fallback.
+
+Selected native ScriptAssets require the SDK-generated NATIVE_FACTORIES registry.
+Admission plans bind canonical assets to authored class references without losing
+case. A plan permits compilation, never shipment: the relocated executable must
+produce a nonce-bound receipt for its compiled closure through public registry
+APIs. Web artifacts remain pending until an explicit actual target receipt matches
+the recorded artifact and request. No manifest boolean substitutes for execution.
+
+SDK-only and test configurations select JCE_BUILD_EDITOR=OFF; editor builds
+explicitly restore ON when reusing an authoring cache. Embedded ScriptApi uses
+the same C99 forwarders as a static archive; external-VM backends still require
+a loadable transport. SDK installation prunes only stale files owned by its
+install manifest, then rewrites profile stamps, preserving registered shader stock.

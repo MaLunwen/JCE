@@ -246,6 +246,8 @@ def build_sdk(driver, args, target: dict, env: dict) -> Path:
     driver.run(["cmake", "--install", str(build), "--config", "Release"],
                cwd=driver.ROOT, env=env)
     if not driver.DRY_RUN:
+        driver._prune_install_prefix(build, sdk)
+    if not driver.DRY_RUN:
         languages = ["lua", *driver.sdk_shipped_script_backends(sdk, target)]
         (sdk / "delivery-profile.json").write_text(json.dumps({"schema": 1,
             "profile": "embedded", "languages": languages, "external_vm_allowed": False}, indent=2)+"\n", encoding="utf-8")

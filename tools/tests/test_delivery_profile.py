@@ -23,6 +23,20 @@ policy=load('delivery_policy_test',ROOT/'tools/build/delivery.py')
 standalone=load('delivery_recipe_test',ROOT/'tools/build/standalone.py')
 
 
+def write_single_admission(output, address='main.scene.json', startup='main.scene.json'):
+    asset = {'asset_id': '0000000000000001', 'content_id': '0000000000000002',
+             'size': 2, 'dependencies': []}
+    graph = {'contract': {'name': 'jce.bundle.graph', 'major': 1, 'minor': 0},
+             'assets': [{'address': address, **asset}]}
+    metadata = {'contract': {'name': 'jce.bundle', 'major': 1, 'minor': 1},
+                'id': 'admission', 'scene_path': startup, 'archive_size': 4,
+                'assets': [{'path': address, **asset, 'type': 'scene', 'representation': 'json.utf8'}]}
+    (output / 'admission.jbundle').write_bytes(b'JPAK')
+    (output / 'admission.jbundle.json').write_text(json.dumps(metadata))
+    (output / 'bundle_graph.json').write_text(json.dumps(graph))
+    return metadata, graph
+
+
 class DeliveryControls(unittest.TestCase):
     def test_selected_closure_and_declared_required_languages(self):
         self.assertEqual(policy.admit({},['scenes/main.scene.json','scripts/main.lua'],'embedded',['lua']),['lua'])
@@ -62,22 +76,92 @@ class DeliveryControls(unittest.TestCase):
                                    sdk_shipped_script_backends=lambda sdk:[],run=Mock())
             def resolve(command,**kwargs):
                 output=Path(command[command.index('--out')+1])
-                (output/'bundle_catalog.json').write_text(json.dumps({'bundles':{}}))
-                (output/'bundle_graph.json').write_text(json.dumps({'assets':[{'address':'main.scene.json'}]}))
+                write_single_admission(output)
             driver.run.side_effect=resolve
             args=SimpleNamespace(delivery_profile='embedded',standalone=False)
             self.assertEqual(policy.admit_project(driver,args,project,manifest,sdk),[])
             self.assertIn('--single-file',driver.run.call_args.args[0])
+            command = driver.run.call_args.args[0]
+            self.assertEqual(command[command.index('--id') + 1], 'admission')
+            stock=sdk/'verified-stock'
+            with patch.object(policy, 'shader_stock_root', return_value=stock):
+                self.assertEqual(policy.admit_project(driver,args,project,manifest,sdk,target={'host':'windows','emscripten':True}),[])
+            command=driver.run.call_args.args[0]
+            self.assertEqual(command[command.index('--target')+1], 'web')
+            self.assertEqual(command[command.index('--shader-root')+1], str(stock))
             def unsupported(command,**kwargs):
                 output=Path(command[command.index('--out')+1])
-                (output/'bundle_catalog.json').write_text(json.dumps({'bundles':{}}))
-                (output/'bundle_graph.json').write_text(json.dumps({'assets':[{'address':'selected.py'}]}))
+                metadata, graph = write_single_admission(output)
+                script = {'asset_id': '0000000000000003', 'content_id': '0000000000000004',
+                          'size': 1, 'dependencies': []}
+                metadata['assets'].append({'path': 'selected.py', **script,
+                                           'type': 'script', 'representation': 'python.source'})
+                graph['assets'].append({'address': 'selected.py', **script})
+                (output / 'admission.jbundle.json').write_text(json.dumps(metadata))
+                (output / 'bundle_graph.json').write_text(json.dumps(graph))
             driver.run.side_effect=unsupported
             with self.assertRaises(ValueError):policy.admit_project(driver,args,project,manifest,sdk)
             (resources/'main.scene.json').unlink()
             driver.run.reset_mock()
             with self.assertRaises(ValueError):policy.admit_project(driver,args,project,manifest,sdk)
             driver.run.assert_not_called()
+
+    def test_single_admission_actual_shape_and_negative_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            metadata, graph = write_single_admission(output)
+            addresses, assets = policy._single_admission_assets(output, 'main.scene.json')
+            self.assertEqual(addresses, ['main.scene.json'])
+            self.assertEqual(assets[0]['type'], 'scene')
+            for mutation in ('contract', 'id', 'startup', 'size', 'duplicate', 'traversal',
+                             'missing_type', 'content', 'missing_graph_asset', 'dependency'):
+                metadata, graph = write_single_admission(output)
+                if mutation == 'contract':
+                    metadata['contract']['major'] = 2
+                elif mutation == 'id':
+                    metadata['id'] = '../other'
+                elif mutation == 'startup':
+                    metadata['scene_path'] = 'different.scene.json'
+                elif mutation == 'size':
+                    metadata['archive_size'] = 5
+                elif mutation == 'duplicate':
+                    metadata['assets'].append(dict(metadata['assets'][0]))
+                elif mutation == 'traversal':
+                    metadata['assets'][0]['path'] = '../escape.lua'
+                elif mutation == 'missing_type':
+                    del metadata['assets'][0]['type']
+                elif mutation == 'content':
+                    metadata['assets'][0]['content_id'] = '0000000000000003'
+                elif mutation == 'missing_graph_asset':
+                    graph['assets'] = []
+                else:
+                    dependency = {'address': 'missing.lua', 'asset_id': '0000000000000004'}
+                    metadata['assets'][0]['dependencies'] = [dependency]
+                    graph['assets'][0]['dependencies'] = [dependency]
+                (output / 'admission.jbundle.json').write_text(json.dumps(metadata))
+                (output / 'bundle_graph.json').write_text(json.dumps(graph))
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    policy._single_admission_assets(output, 'main.scene.json')
+            for missing in ('admission.jbundle', 'admission.jbundle.json', 'bundle_graph.json'):
+                write_single_admission(output)
+                (output / missing).unlink()
+                with self.assertRaises(ValueError):
+                    policy._single_admission_assets(output, 'main.scene.json')
+
+    def test_bundle_target_is_platform_explicit_and_stock_requires_catalog(self):
+        for target, expected in (({'host':'windows'}, 'windows'), ({'host':'linux'}, 'linux'),
+                                 ({'host':'macos'}, 'macos'), ({'host':'android'}, 'android'),
+                                 ({'host':'ios'}, 'ios'), ({'host':'windows','emscripten':True}, 'web')):
+            self.assertEqual(policy.bundle_platform(target), expected)
+        with self.assertRaises(ValueError):
+            policy.bundle_platform({'host':'unknown'})
+        with tempfile.TemporaryDirectory() as directory:
+            sdk=Path(directory)
+            self.assertIsNone(policy.shader_stock_root(sdk))
+            stock=sdk/'share/jce/shaders'; stock.mkdir(parents=True)
+            (stock/'unknown.bin').write_bytes(b'unverified')
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                policy.shader_stock_root(sdk)
 
     def test_smoke_shared_api_profile_contract_preserves_authoring(self):
         with tempfile.TemporaryDirectory() as directory:

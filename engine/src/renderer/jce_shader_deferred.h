@@ -19,6 +19,9 @@ typedef struct {
     JceDeferredProgram programs[JCE_DEFERRED_COUNT];
 } JceShaderDeferredState;
 JceShaderDeferredState *jce_renderer_shader_deferred_state(void);
+struct JcePakArchive;
+uint16_t jce_shader_program_prepare(const struct JcePakArchive *pak,
+                                   const char *vs_base, const char *fs_base);
 uint16_t jce_shader_deferred_resolve(uint16_t idx);
 void jce_shader_deferred_shutdown(void);
 #endif

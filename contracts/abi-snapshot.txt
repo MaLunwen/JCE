@@ -5,7 +5,7 @@
 # change so a reviewer sees the declaration and the snapshot diff
 # together.  Additions are safe for consumers; removals and
 # signature changes are not, and the gate fails on those.
-# 5109 declarations.
+# 5110 declarations.
 
 enum JceAiSceneDirectorStatus { JCE_AI_SCENE_DIRECTOR_IDLE = 0, JCE_AI_SCENE_DIRECTOR_WAITING, JCE_AI_SCENE_DIRECTOR_READY, JCE_AI_SCENE_DIRECTOR_FAILED, JCE_AI_SCENE_DIRECTOR_CANCELLED }    [runtime/jce_ai_scene_director.h]
 enum JceAiSceneError { JCE_AI_SCENE_ERROR_NONE = 0, JCE_AI_SCENE_ERROR_INVALID_ARGUMENT, JCE_AI_SCENE_ERROR_INVALID_CATALOG, JCE_AI_SCENE_ERROR_PROMPT_TOO_LARGE, JCE_AI_SCENE_ERROR_TRANSPORT, JCE_AI_SCENE_ERROR_TIMEOUT, JCE_AI_SCENE_ERROR_INVALID_RESPONSE, JCE_AI_SCENE_ERROR_STALE_RESPONSE, JCE_AI_SCENE_ERROR_INVALID_RECIPE, JCE_AI_SCENE_ERROR_COMPILE, JCE_AI_SCENE_ERROR_NO_FALLBACK }    [runtime/jce_ai_scene_director.h]
@@ -1404,6 +1404,7 @@ fn jce_input_player_release_device :: (JceInput *, int, JceDeviceId) -> bool    
 fn jce_input_player_rumble :: (JceInput *, int, float, float, uint32_t) -> bool    [os/platform/jce_input_device.h]
 fn jce_input_player_stick :: (const JceInput *, int, JceStick, float *, float *) -> void    [os/platform/jce_input_device.h]
 fn jce_input_player_trigger :: (const JceInput *, int, JceGamepadAxis) -> float    [os/platform/jce_input_device.h]
+fn jce_input_primary_pointer :: (const JceInput *, float, float, float *, float *, bool *) -> bool    [os/platform/jce_input.h]
 fn jce_input_record_close :: (JceInputRecorder *) -> void    [os/platform/jce_input_record.h]
 fn jce_input_record_frame_count :: (const JceInputRecorder *) -> uint64_t    [os/platform/jce_input_record.h]
 fn jce_input_record_open :: (const char *) -> JceInputRecorder *    [os/platform/jce_input_record.h]

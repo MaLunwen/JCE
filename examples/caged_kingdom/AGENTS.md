@@ -1,63 +1,41 @@
-# caged_kingdom — Sandbox Game (L7 Consumer)
+# Caged Kingdom consumer contract
 
-> Caged Kingdom is the final game consumer built on JCE. It lives alongside the other SDK consumer examples; its game identity and output name are unchanged.
->
-> **Design authority**:
-> - `examples/caged_kingdom/SETTING_BIBLE.md` —— 世界观 / 角色 / 区域代号 / 货币 / 女魔王编号 / 主线幕剧结构
-> - `examples/caged_kingdom/SCENES_DESIGN.md` —— 单关场景设计册（entity 清单 + 烘焙清单 + v1 实现状态）
->
-> 改剧情设定前先改 bible；改场景内容前先改 design 册，再编辑 JSON。
+CK is the production game consumer at examples/caged_kingdom. This checkout
+contains build metadata; its implementation sources are currently absent by
+owner choice. Do not invent a working build or restore obsolete code silently.
 
-## Identity
+## Design authority
 
-- **Layer**: L7 (Consumer). Uses ONLY `#include <jce/api.h>` (or per-layer umbrellas). Never touches `engine/src/**` or third-party headers (SDL/bgfx/flecs/...).
-- **Language**: C99 (matches engine to keep ABI trivial).
-- **Output**: `caged_kingdom.exe` (or platform equivalent) + `assets.pak`.
+The owner's local frozen design baseline is
+way/demo_complete/CK_DESIGN_FREEZE_v1.1_FINAL/README_BILINGUAL.md.
+Its declared order is decision log, vision and pillars, domain authority,
+story/content architecture, then production slice or implementation note.
+The bilingual editions are semantic mirrors. Frozen design, production targets
+and validation-required ideas are distinct from implemented gameplay evidence.
 
-## Layout
+The lifecycle execution pack under way/demo_complete is a consumer workflow
+reference, not authorization to change generic engine internals. Its source
+snapshots are references, not another editable design authority. Other concept,
+audio and devlog materials retain their declared reference status.
 
-```
-examples/caged_kingdom/
-├── CMakeLists.txt
-├── src/
-│   ├── main.c              ← entry: jce_engine_set_app_desc(&ck_app); jce_main
-│   └── game/
-│       ├── ck_app.c/.h         ← JceAppDesc impl (on_init/update/render/event/shutdown)
-│       └── ck_engine_smoke.c/.h ← smoke-test scene helpers
-├── resources/              ← raw assets, cooked into assets.pak at build
-│   └── assets/
-│       ├── scenes/lightning_lab.scene.json  ← deterministic storm lab
-│       ├── scripts/lightning_lab.lua        ← bounded DBM + staged discharge
-│       └── sounds/lightning_lab_thunder.wav ← project-generated thunder
-└── ui/                     ← RmlUI documents
-```
+The owner requested that all way/ frozen material remain local and untracked
+for this release. Preserve original files and manifests. A public clone must
+not depend on those local materials for configuring the engine or its tests.
+The historical root design filenames and removed src/resources layout are no
+longer the current authority or an available implementation.
 
-## Rules
+## Implementation and delivery
 
-1. **Use ONLY public engine APIs.** `<jce/api.h>` is sufficient; per-layer headers are fine. Anything else is a layering violation.
-2. **No SDL / bgfx / flecs / RmlUI / ImGui includes.** Period. Even though the game is technically standalone, the rule is enforced to prove the public API is complete.
-3. **Implement `JceAppDesc`** and register before engine create:
-   ```c
-   jce_engine_set_app_desc(&ck_app);
-   /* SDL3 main shim takes over from here */
-   ```
-4. **All assets** loaded via PhysFS-mounted `assets.pak`. No `fopen` to OS paths.
-5. **All allocations** via `jce_malloc / jce_free`.
-6. **Game logic** lives here, NOT in middleware. If you find yourself wanting to add to `engine/src/middleware/world/`, ask: "is this primitive, or game-specific?" Game-specific → stays in `examples/caged_kingdom/`.
-7. **Cross-platform**: the game must build on every supported platform. Test on the 512 MB / single-core baseline.
-
-## Common tasks
-
-| Task | Where |
-|------|-------|
-| Add a game scene | `examples/caged_kingdom/src/game/` + JSON in `resources/` |
-| Add a weapon variant | Reuse `<jce/middleware/world/jce_weapon.h>`, configure via JSON; balance numbers live here |
-| Add a HUD screen | RmlUI document in `ui/`, mount via `<jce/api_ui.h>` |
-| Wire a new editor module for play-mode | Register a `JceGameModule` (see `engine/src/runtime/AGENTS.md`) |
-
-## Don't
-
-- Don't `#include <SDL3/...>`, `<bgfx/...>`, `<flecs.h>`, `<imgui.h>`, `<RmlUi/...>`.
-- Don't include anything from `engine/src/**`.
-- Don't bypass `JceAppDesc` and run your own loop.
-- Don't ship assets outside `assets.pak` (except platform-required loose files).
+- Use public installed JCE SDK headers and the shared JceAppDesc/runtime loop.
+- Keep game rules, scripts, assets, generators and project-only tools here.
+- Never include engine/src, third-party, SDL, bgfx or editor implementation.
+- Use engine allocation, filesystem, input and rendering services.
+- The final application is one architecture-matched executable with embedded
+  resources. A transferable content Bundle is one .jbundle file. Neither may
+  require a loose asset package, external language VM or source checkout.
+- Validate editor simulation, packaged Bundle reopening and relocated platform
+  execution with actual gameplay/scene evidence. Build metadata alone is not
+  proof of any platform, resource budget or game feature.
+- Report a generic SDK capability gap separately from consumer implementation.
+  Frozen CANON changes require explicit owner decisions; do not infer them from
+  a prototype failure or implementation shortcut.

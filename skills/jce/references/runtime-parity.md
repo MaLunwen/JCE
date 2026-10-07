@@ -49,3 +49,41 @@ SDL gameplay input consumes physical mouse and touch streams once. The private t
 Pointer-only UI consumers use jce_input_primary_pointer with their logical surface dimensions. It preserves primary-touch release coordinates and supports real input and replay while mouse/touch gameplay queries remain independent. Default Canvas UI reuses this owner; verify a touch press/release actually activates the authored button after filtering SDL mirrors.
 
 The Web live SDL adapter converts inclusive touch endpoints to logical-surface normalization before neutral ingestion. Browser touch gestures must match client-pixel trajectories; keep the correction in the platform adapter, not individual games or UI consumers.
+
+## Lifecycle ownership and complete captures
+
+Reuse the existing jce_trace authority for startup, application service and
+shutdown scopes; preserve parent task ownership across nested synchronous work.
+JCE_TRACE_EXPORT requests capture and exports only resident records after
+producers join. Inspect jceTrace loss and generation metadata before treating
+the output as complete. Use tools/lifecycle_trace_report.py with explicit
+--require phase names; failed/cancelled, unpaired, reset and overwritten scopes
+are unavailable acceptance evidence. CPU scopes do not prove GPU completion.
+
+Listener registration/removal during an event must dispatch entry identities
+exactly once: removed listeners never fire, newly registered listeners wait for
+the next event, and shutdown cancels the current lifetime. Exercise nested
+emits, stale handles, large listener counts and allocation failure. Editor Play
+requires a valid pre-play snapshot before mutable runtime creation; release
+failed construction's services before restore, and retain failed restore state
+for an explicit Stop retry. Repeated Play/Stop must preserve authoring state.
+Use the existing performance phases for capture/create/teardown/restore, not
+a second gameplay loop or project-specific profiler.
+
+For concurrent PostFX pipelines, select TAA records by view_base. The on/off
+marker records CPU resolve submission, not the requested toggle or GPU completion.
+Do not infer Game state from the last Scene record; an annotated log missing the
+requested viewport is incomplete evidence.
+
+Temporal history must match the immediately preceding rendered frame. Invalidate
+it on disabled applies, resize, skip and failed history-copy submission. First/resumed
+frames use current colour without sampling undefined history; activation and
+visual temporal quality still require separate real GPU evidence.
+
+PostFX consumes frame-local matrices and external motion even when apply skips.
+A second apply needs fresh inputs. Reset active/output state before validation;
+reported motion-blur/DOF activation requires a submitted composite.
+
+A temporary end-frame disarm followed by re-enable without an intervening apply
+preserves the immediately preceding history; only an actual skipped/disabled
+apply consumes it without replacement. Do not reset on the toggle alone.

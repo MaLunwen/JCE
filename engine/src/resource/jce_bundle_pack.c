@@ -19,6 +19,7 @@
 
 #include "jce_cook_policy.h"
 #include "jce_bundle_contract_internal.h"
+#include "jce_bundle_shader_refs_internal.h"
 #include "jce_bundle_pack_cook.h"
 #include "os/core/jce_memory.h"
 
@@ -605,6 +606,26 @@ static int can_read_asset(const char *vpath, const char *resource_root,
         return 0;
     JCE_FREE(raw);
     return 1;
+}
+
+typedef struct {
+    const char *resource_root;
+    const char *base_dir;
+    PackResolveFn resolve;
+    void *user;
+} PackShaderSource;
+
+static bool shader_dependency_readable(const char *path, void *user)
+{
+    const PackShaderSource *source = user;
+    if (source->base_dir && source->base_dir[0] && !pack_is_abs_path(path)) {
+        char joined[1536];
+        const int length = snprintf(joined, sizeof(joined), "%s/%s", source->base_dir, path);
+        if (length >= 0 && (size_t)length < sizeof(joined) &&
+            can_read_asset(joined, source->resource_root, source->resolve, source->user, NULL))
+            return true;
+    }
+    return can_read_asset(path, source->resource_root, source->resolve, source->user, NULL) != 0;
 }
 
 static int write_file(const char *path, const void *data, size_t size) {
@@ -1503,7 +1524,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         const char *id_now = scene_ids.items[scene_ids.n - 1];
 
         JceBundleDepList deps = {0};
-        if (!jce_bundle_deps_scan_file(scene_paths.items[i], &deps)) {
+        PackShaderSource scene_shaders = { resource_root, NULL, opts->resolve_fn, opts->resolve_user };
+        if (!jce_bundle_deps_scan_file_resolved(scene_paths.items[i], &deps,
+                                               shader_dependency_readable, &scene_shaders)) {
             ERR("cannot parse scene %s", scene_paths.items[i]);
             continue;
         }
@@ -1663,8 +1686,11 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                         st.parent = dp;
                         st.origin = "descriptor";
                         JceBundleDepList sub = {0};
-                        bool parsed = jce_bundle_deps_scan((const char *)child_buf,
-                                                           child_sz, &sub);
+                        PackShaderSource shader_source = {
+                            resource_root, base_dir, opts->resolve_fn, opts->resolve_user
+                        };
+                        bool parsed = jce_bundle_deps_scan_resolved((const char *)child_buf,
+                            child_sz, &sub, shader_dependency_readable, &shader_source);
                         if (parsed) {
                             for (uint32_t s = 0; s < sub.count; ++s) {
                                 const char *sp = sub.items[s].path;

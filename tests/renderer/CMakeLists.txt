@@ -450,3 +450,8 @@ target_include_directories(test_jce_upload_metrics PRIVATE
 jce_add_unit_test(test_jce_upload_payload_integration
     SOURCES test_jce_upload_payload_integration.c
     LINK jce_core jce_renderer jce_resource)
+
+# Exact stock BRDF bytes and custom-size kernel, without a graphics device.
+jce_add_unit_test(test_jce_ibl_stock
+    SOURCES test_jce_ibl_stock.c LINK jce_core jce_renderer)
+target_include_directories(test_jce_ibl_stock PRIVATE "${CMAKE_SOURCE_DIR}/engine/src")

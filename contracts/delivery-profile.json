@@ -26,6 +26,8 @@
   },
   "required_languages_field": "required_languages",
   "selected_script_closure": "public bundle_graph.json assets[].address",
-  "native_script_registry": "Selected .jcec/.jcecpp requires statically linked project registry; unavailable until explicitly verified",
-  "os_system_libraries_allowed": true
+  "native_script_registry": "Selected native scripts require strongly linked SDK factories and an actual artifact-bound registry execution receipt",
+  "os_system_libraries_allowed": true,
+  "native_script_factories_field": "native_script_factories",
+  "native_script_refs_field": "native_script_refs: canonical selected asset address to authored case-preserving class reference"
 }

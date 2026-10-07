@@ -658,8 +658,19 @@ static bool trace_export_event(TraceJsonBuffer *json,
         if (length < 0 || (size_t)length >= sizeof(suffix) ||
             !trace_json_append(json, suffix))
             return false;
+    } else if (event->type == JCE_TRACE_EVENT_TASK_END) {
+        length = SDL_snprintf(
+            suffix, sizeof(suffix),
+            ",\"args\":{\"id\":%llu,\"parent\":%llu,\"ns\":%llu,"
+            "\"state\":%u}}",
+            (unsigned long long)event->id,
+            (unsigned long long)event->parent_id,
+            (unsigned long long)event->value_u64,
+            (unsigned)event->value_u32[0]);
+        if (length < 0 || (size_t)length >= sizeof(suffix) ||
+            !trace_json_append(json, suffix))
+            return false;
     } else if (event->type == JCE_TRACE_EVENT_TASK_BEGIN ||
-               event->type == JCE_TRACE_EVENT_TASK_END ||
                event->type == JCE_TRACE_EVENT_WAIT_BEGIN ||
                event->type == JCE_TRACE_EVENT_WAIT_END) {
         if (!trace_json_append_format(
@@ -687,6 +698,11 @@ bool jce_trace_export_chrome_json(const char *host_path)
     TraceJsonBuffer json;
     uint32_t count;
     uint32_t i;
+    uint32_t recorded;
+    uint32_t generation;
+    uint64_t overwritten;
+    char metadata[384];
+    int length;
     bool first = true;
     bool ok;
 
@@ -695,15 +711,34 @@ bool jce_trace_export_chrome_json(const char *host_path)
     events = JCE_NEW_ARRAY(JceTraceEvent, TRACE_CAPACITY);
     if (!events)
         return false;
+    generation = (uint32_t)SDL_GetAtomicInt(&s_generation);
+    recorded = (uint32_t)SDL_GetAtomicInt(&s_write_sequence);
+    overwritten = recorded > TRACE_CAPACITY ? recorded - TRACE_CAPACITY : 0;
     jce_trace_cursor_init(&cursor);
+    /* Existing prefix coverage is separate from loss during this read. */
+    cursor.next_sequence = (uint32_t)overwritten + 1u;
     count = jce_trace_read(&cursor, events, TRACE_CAPACITY);
+    if (cursor.next_sequence > 1u)
+        recorded = cursor.next_sequence - 1u;
     SDL_zero(json);
     ok = trace_json_append(&json, "{\"displayTimeUnit\":\"ms\","
                                   "\"traceEvents\":[");
     for (i = 0; ok && i < count; ++i)
         ok = trace_export_event(&json, &events[i], &first);
-    if (ok)
-        ok = trace_json_append(&json, "]}");
+    if (ok) {
+        length = SDL_snprintf(
+            metadata, sizeof(metadata),
+            "],\"jceTrace\":{\"recorded\":%u,\"captured\":%u,"
+            "\"overwritten_before_capture\":%llu,\"cursor_lost\":%llu,"
+            "\"lost\":%llu,\"capture_generation_stable\":%s}}",
+            recorded, count, (unsigned long long)overwritten,
+            (unsigned long long)cursor.lost_events,
+            (unsigned long long)(overwritten + cursor.lost_events),
+            generation == (uint32_t)SDL_GetAtomicInt(&s_generation)
+                ? "true" : "false");
+        ok = length >= 0 && (size_t)length < sizeof(metadata) &&
+            trace_json_append(&json, metadata);
+    }
     if (ok)
         ok = jce_fs_host_write_all(host_path, json.data, (uint64_t)json.size);
     JCE_FREE(json.data);

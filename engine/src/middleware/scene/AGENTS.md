@@ -664,3 +664,21 @@ behavior without changing public ABI.
 An explicit glTF model claims the render path while its resource is pending. Do not render the MeshRenderer primitive default as a temporary substitute for an authored model.
 
 Explicit model color and shadow submissions request all authored texture maps together and defer both passes until maps are resident. Geometry-only imports must not flash an embedded/default material or an unrelated primitive while textures load.
+
+Canvas image and widget quads whose final packed alpha byte is zero skip their
+own texture resolution and draw submission. Do not prune the hierarchy: layout,
+raycast and children that ignore parent CanvasGroups remain independently live.
+Visible low alpha is retained; do not substitute an arbitrary opacity threshold.
+
+Scene Transform serialization emits the actual quaternion with rotW, matching
+the existing Pivot representation. Legacy Euler-only input remains accepted.
+The private jce_scene_rotation_internal.h owns the shared normalization policy.
+Already unit-length float32 quaternions retain their representation when loaded;
+non-unit inputs are normalized. Repeated public scene save/clear/load must not
+accumulate Euler conversion drift or alter position/scale. This is the same
+serialization consumed by editor history, not a separate Play snapshot format.
+
+The runtime resolved-texture cache owns its uploaded GPU textures. Scene
+renderer teardown cancels and releases pending decode jobs, frees remaining
+CPU results, destroys completed uploads, and clears cache indices. Textures
+returned through external callbacks bypass this cache and remain borrowed.

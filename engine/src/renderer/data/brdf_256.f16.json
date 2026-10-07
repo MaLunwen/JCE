@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "algorithm": "split-sum GGX importance sampling",
+  "size": 256,
+  "samples": 1024,
+  "channels": "RGBA16F",
+  "byte_order": "little",
+  "texel_coordinates": "(coordinate + 0.5) / size",
+  "half_policy": "existing truncation; subnormals become signed zero",
+  "data_sha256": "b08f773d563c3b8582de9b8e619d5956e2090048af4a81dd5606242218d7fe68",
+  "bytes": 524288,
+  "kernel_sha256": {
+    "jce_ibl_sampling.h": "0bd8fc3bfd2ab52fd3d9d1f39a6e847346d2569fee3e9698fda9530ac0041a92",
+    "jce_ibl_brdf.h": "eb210aa8e20051b72fd915e943a1dde1582163705d75c2fc9f9c08be5134a408"
+  },
+  "baker_sha256": "f1ba9bffc1945fc5e6eef2a24206d66360aaf119b211f799a66d0efa700e854f",
+  "generator_sha256": "eecf6275c65a056ad9f6305ee86cefa7c7dfa99fa127e2043b76b44d3e5fb4ce",
+  "reference_host": "Windows-11-10.0.26200-SP0",
+  "portability": "fixed baked bytes; libm regeneration may vary by host"
+}

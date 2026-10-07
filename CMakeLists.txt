@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.13.0 LANGUAGES C)
+project(JCE VERSION 0.13.4 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
@@ -890,6 +890,20 @@ if(NOT CMAKE_CROSSCOMPILING)
 	target_sources(jce_pak PRIVATE "${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c")
 endif()
 
+# Exact CPU IBL baker; explicit offline target, not a default runtime dependency.
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(jce_ibl_bake EXCLUDE_FROM_ALL "${JCE_TOOLS_DIR}/jce_ibl_bake.c")
+    target_include_directories(jce_ibl_bake PRIVATE
+        "${JCE_ENGINE_SRC_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/engine/include")
+    target_link_libraries(jce_ibl_bake PRIVATE jce_tool_cli_bootstrap jce_tool_cli_io sdl::sdl)
+    if(UNIX)
+        target_link_libraries(jce_ibl_bake PRIVATE m)
+    endif()
+    set_target_properties(jce_ibl_bake PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES
+        C_EXTENSIONS OFF RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools")
+    jce_target_warnings(jce_ibl_bake)
+endif()
+
 # ------------------------------------------------------------------ #
 # Ship host tools with the SDK                                        #
 # ------------------------------------------------------------------ #
@@ -1524,7 +1538,10 @@ add_subdirectory(engine)
 # configured cleanly with all three backends ON and linked none of them.
 # It comes after engine/ because the backends link jce_script and jce_core.
 add_subdirectory(scripting)
-add_subdirectory(editor)
+option(JCE_BUILD_EDITOR "Build the editor application" ON)
+if(JCE_BUILD_EDITOR)
+	add_subdirectory(editor)
+endif()
 # CK is downstream of the SDK: it builds as an SDK consumer (scripts/jce.py
 # app), not as a first-party in-tree target.  Gated ON only for dev iteration.
 if(JCE_BUILD_INTREE_SAMPLE)
@@ -1616,7 +1633,7 @@ if(JCE_EMBED_ENGINE_SHADERS AND TARGET jce_renderer)
 endif()
 
 # Binary-size report target (needs JCE_Editor from add_subdirectory(editor)).
-if(Python3_FOUND AND JCE_EMIT_LINK_MAP)
+if(Python3_FOUND AND JCE_EMIT_LINK_MAP AND TARGET JCE_Editor)
 	set(_BINSIZE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_binsize_report.py")
 	add_custom_target(binsize-report
 		COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/reports"

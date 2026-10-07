@@ -7,6 +7,7 @@
  */
 
 #include <jce/resource/jce_bundle_deps.h>
+#include "resource/jce_bundle_shader_refs_internal.h"
 
 #include <string.h>
 
@@ -508,6 +509,30 @@ static void test_scan_backend_expansion_is_only_for_graph_blobs(void)
     jce_bundle_deps_free(&l);
 }
 
+static bool shader_exists(const char *path, void *user)
+{
+    const char *available = user;
+    return available && strcmp(path, available) == 0;
+}
+
+static void test_resolved_shader_alternatives_preserve_required_refs(void)
+{
+    const char *json = "{\"customProgramFs\":\"shaders/stock.bin\","
+                       "\"albedoTex\":\"textures/required.png\"}";
+    JceBundleDepList deps = {0};
+    TEST_ASSERT_TRUE(jce_bundle_deps_scan_resolved(json, 0, &deps, shader_exists,
+                                                 "shaders/stock_dx11.bin"));
+    TEST_ASSERT_EQUAL_UINT32(2, deps.count);
+    TEST_ASSERT_TRUE(has_path(&deps, "shaders/stock_dx11.bin"));
+    TEST_ASSERT_TRUE(has_path(&deps, "textures/required.png"));
+    TEST_ASSERT_FALSE(has_path(&deps, "shaders/stock.bin"));
+    jce_bundle_deps_free(&deps);
+    TEST_ASSERT_TRUE(jce_bundle_deps_scan_resolved(json, 0, &deps, shader_exists, NULL));
+    TEST_ASSERT_EQUAL_UINT32(2, deps.count);
+    TEST_ASSERT_TRUE(has_path(&deps, "shaders/stock.bin"));
+    jce_bundle_deps_free(&deps);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -536,6 +561,7 @@ int main(void)
     RUN_TEST(test_dependency_document_parses_required_optional_labels);
     RUN_TEST(test_dependency_document_rejects_wrong_contract);
     RUN_TEST(test_dependency_document_rejects_invalid_entries);
+    RUN_TEST(test_resolved_shader_alternatives_preserve_required_refs);
     RUN_TEST(test_scan_shader_graph_blobs);
     RUN_TEST(test_scan_backend_expansion_is_only_for_graph_blobs);
     return UNITY_END();

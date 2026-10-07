@@ -17,7 +17,7 @@
  *   jce_bin2obj --input  <file>
  *               --symbol <ident>
  *               --output <out>
- *               --format coff|asm
+ *               --format coff|asm|c
  *               [--arch  x64|x86|arm64|arm]    (default: x64; coff only)
  */
 
@@ -207,6 +207,23 @@ static void generate_asm_incbin(const char *input_path, const char *sym,
 	bb_append(out, line, strlen(line));
 }
 
+/* Portable C fallback for targets without a native assembler (Web). */
+static void generate_c_array(const uint8_t *blob, size_t size,
+                             const char *sym, ByteBuf *out)
+{
+    char line[256];
+    bb_append(out, "#include <stddef.h>\n", 20);
+    snprintf(line, sizeof(line), "const unsigned char %s[] = {\n", sym);
+    bb_append(out, line, strlen(line));
+    if (!size) bb_append(out, "0", 1);
+    for (size_t i = 0; i < size; ++i) {
+        snprintf(line, sizeof(line), "0x%02x,%s", blob[i], (i % 16 == 15) ? "\n" : "");
+        bb_append(out, line, strlen(line));
+    }
+    snprintf(line, sizeof(line), "\n};\nconst size_t %s_size = %zu;\n", sym, size);
+    bb_append(out, line, strlen(line));
+}
+
 /* ---------------- io helpers ---------------- */
 
 static int read_file(const char *path, uint8_t **out, size_t *out_size)
@@ -239,7 +256,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"Usage: jce_bin2obj --input <file> --symbol <ident> --output <out>\n"
-		"                   --format coff|asm\n"
+		"                   --format coff|asm|c\n"
 		"                  [--arch   x64|x86|arm64|arm]   (coff only; default x64)\n");
 }
 
@@ -283,6 +300,8 @@ int jce_tool_main(int argc, char *argv[])
 		generate_coff_obj(blob, blob_size, machine, sym, &out);
 	} else if (strcmp(format, "asm") == 0) {
 		generate_asm_incbin(input, sym, blob_size, &out);
+	} else if (strcmp(format, "c") == 0) {
+		generate_c_array(blob, blob_size, sym, &out);
 	} else {
 		fprintf(stderr, "[jce_bin2obj] bad --format: %s\n", format);
 		free(blob);

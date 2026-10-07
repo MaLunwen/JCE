@@ -171,3 +171,9 @@ policy: cmake/JCEDeliveryProfile.cmake; selected public content-graph admission:
 tools/build/delivery.py, owned by tools/build/AGENTS.md. SDK consumer admission
 is exported by cmake/JCEConfig.cmake.in; static native configuration reuses
 tools/build/standalone.py without a second dependency recipe.
+
+The SDK installation implementation in engine/cmake and its shared helpers in
+cmake remain owned by the engine build authority. tools/assets owns immutable
+stock generation and provenance verification; tools/build owns delivery
+admission. Application lifecycle and scene serialization stay with their
+existing application/scene charters rather than a project-specific workflow.

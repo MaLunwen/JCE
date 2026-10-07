@@ -72,3 +72,26 @@ For asynchronous model loading, wait for actual readiness within an explicit bou
 Readiness of a cached model does not prove that the authored scene renders it. Validate actual scene membership, the selected mesh path and transform, and the active camera pose/projection through public SDK observations. Stock hosts expose owner-thread borrowed observations through jce_default_main_get_scene, jce_default_main_get_camera and jce_default_main_get_scene_renderer; never retain or destroy them across shutdown. jce_camera_get_fov returns degrees. Keep actual submitted topology and independent picture controls distinct from cache census.
 
 Modern recreation may intentionally replace frame-dependent source behavior. Distinguish legacy reference captures from normal time-based gameplay; measure accepted simulation time, dropped suspension time and remainder, and verify multiple presentation rates with the same inputs. Do not require unbounded wall-time catch-up after stalls.
+
+Keep an uninstrumented frame-rate control beside GPU query and driver traces.
+An elapsed query around a whole callback includes command gaps; it is not an
+isolated shader duration. Record per-draw scope and query availability separately.
+Exclude other graphical applications and CPU builds from acceptance timing.
+For graphics liveness, require valid targets, actual submissions and visible
+pixels; phase markers or an absence of errors alone do not prove an effect ran.
+
+Graphics probes must preserve the return value and attributes of wrapped context-creation APIs. Record the actual context version and device capability table in each run, including instrumented negative controls; a separate uninstrumented context is not proof of the probe context.
+
+For GPU teardown, inspect actual live objects before closing the test page.
+Removing an Emscripten context record does not prove WebGL objects were deleted.
+Preserve getContext return values and use program/shader validity plus deletion
+records to identify survivors; correlate shader source with its first-party owner.
+# Whole-scene lifetime coverage
+
+An effect-only probe cannot certify scene resource teardown. Also run a real
+scene containing imported models, resolved material textures, lighting and UI.
+Before closing the browser page, count actual GPU creations and deletions and
+check remaining object validity. Record leaks even after the Emscripten context
+table is empty. Verify shared material/light bindings across device recreation,
+and distinguish runtime-owned texture cache uploads from callback-borrowed
+textures. Keep failing raw evidence and bind each result to the tested artifact.

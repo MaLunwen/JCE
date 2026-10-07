@@ -6,6 +6,7 @@
 #include <jce/os/core/jce_path.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_bundle_shader_refs_internal.h"
 
 #include <cjson/cJSON.h>
 
@@ -235,20 +236,21 @@ static const char *sibling_bundle_tag(const cJSON *parent_obj)
  * including nested streaming blocks.  Harvested regardless of "enabled"
  * so a scene that toggles streaming on at runtime still ships its
  * fragments. */
-static void harvest_streaming_chunks(const cJSON *streaming_obj,
+static bool harvest_streaming_chunks(const cJSON *streaming_obj,
                                      JceBundleDepList *out)
 {
     const cJSON *chunks =
         cJSON_GetObjectItemCaseSensitive(streaming_obj, "chunks");
-    if (!chunks || !cJSON_IsArray(chunks)) return;
+    if (!chunks || !cJSON_IsArray(chunks)) return true;
 
     const cJSON *co = NULL;
     cJSON_ArrayForEach(co, chunks) {
         if (!cJSON_IsObject(co)) continue;
         const cJSON *p = cJSON_GetObjectItemCaseSensitive(co, "path");
         if (p && cJSON_IsString(p) && p->valuestring && p->valuestring[0])
-            list_push(out, p->valuestring, sibling_bundle_tag(co));
+            if (!list_push(out, p->valuestring, sibling_bundle_tag(co))) return false;
     }
+    return true;
 }
 
 /* Contextual nested-descriptor keys.  Some asset descriptors use JSON
@@ -265,7 +267,7 @@ static int obj_has(const cJSON *o, const char *key)
     return cJSON_GetObjectItemCaseSensitive(o, key) != NULL;
 }
 
-static void harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
+static bool harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
 {
     const cJSON *it;
 
@@ -275,7 +277,7 @@ static void harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
         (obj_has(obj, "emitRate") || obj_has(obj, "lifetimeMin") ||
          obj_has(obj, "maxParticles") || obj_has(obj, "sizeStart")))
     {
-        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+        if (!list_push(out, it->valuestring, sibling_bundle_tag(obj))) return false;
     }
 
     /* Tilemap descriptor: "sprites" → .sprites.json tileset. */
@@ -283,7 +285,7 @@ static void harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
     if (it && cJSON_IsString(it) && it->valuestring && it->valuestring[0] &&
         (obj_has(obj, "cells") || (obj_has(obj, "w") && obj_has(obj, "h"))))
     {
-        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+        if (!list_push(out, it->valuestring, sibling_bundle_tag(obj))) return false;
     }
 
     /* Tileset descriptor: "source" → atlas image. */
@@ -291,17 +293,54 @@ static void harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
     if (it && cJSON_IsString(it) && it->valuestring && it->valuestring[0] &&
         obj_has(obj, "rects"))
     {
-        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+        if (!list_push(out, it->valuestring, sibling_bundle_tag(obj))) return false;
     }
+    return true;
 }
 
-static void walk(const cJSON *node, const cJSON *parent_obj,
-                 JceBundleDepList *out)
+/* A program stem names backend alternatives, not seven mandatory files.
+ * With no availability callback retain the public collector's historical list.
+ * The packer uses actual readable candidates; zero candidates keeps the authored
+ * path so the ordinary strict missing-asset diagnostic still fails the build. */
+static bool harvest_shader_program(JceBundleDepList *out, const char *path,
+    const char *bundle, JceBundleShaderReadableFn readable, void *user)
 {
-    if (!node) return;
+    static const char *const suffixes[] = {
+        "dx11", "spv", "glsl", "essl", "essl1", "mtl"
+    };
+    bool found = false;
+    if (!readable || readable(path, user)) {
+        if (!list_push(out, path, bundle)) return false;
+        found = true;
+    }
+    char stem[512];
+    const int length = snprintf(stem, sizeof(stem), "%s", path);
+    if (length >= 0 && (size_t)length < sizeof(stem)) {
+        char *dot = strrchr(stem, '.');
+        if (dot && strcmp(dot, ".bin") == 0) {
+            *dot = 0;
+            for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+                char candidate[600];
+                snprintf(candidate, sizeof(candidate), "%s_%s.bin", stem, suffixes[i]);
+                if (!readable || readable(candidate, user)) {
+                    if (!list_push(out, candidate, bundle)) return false;
+                    found = true;
+                }
+            }
+        }
+    }
+    if (!found && !list_push(out, path, bundle)) return false;
+    return true;
+}
+
+static bool walk(const cJSON *node, const cJSON *parent_obj,
+                 JceBundleDepList *out,
+                 JceBundleShaderReadableFn shader_readable, void *shader_user)
+{
+    if (!node) return true;
 
     if (cJSON_IsObject(node)) {
-        harvest_descriptor_keys(node, out);
+        if (!harvest_descriptor_keys(node, out)) return false;
         const cJSON *child = NULL;
         cJSON_ArrayForEach(child, node) {
             const char *key = child->string;
@@ -309,54 +348,35 @@ static void walk(const cJSON *node, const cJSON *parent_obj,
                 child->valuestring[0] &&
                 jce_bundle_deps_is_asset_key(key))
             {
-                list_push(out, child->valuestring, sibling_bundle_tag(node));
-                /* A Shader Graph blob is one file per BACKEND next to the
-                 * bare name the .mat.json stores, exactly as the engine's own
-                 * shaders are (`fs_pbr_dx11.bin`, `_glsl`, `_spv`).  Shipping
-                 * only the name that is written down would ship one backend's
-                 * bytecode and link-fail on every other -- the same defect as
-                 * not shipping it at all, one machine later.  Missing
-                 * variants are skipped by the packer, so listing all six
-                 * costs nothing when the editor compiled fewer. */
-                if (key && (strcmp(key, "customProgramVs") == 0 ||
-                            strcmp(key, "customProgramFs") == 0)) {
-                    static const char *const kSfx[] = {
-                        "dx11", "spv", "glsl", "essl", "essl1", "mtl"
-                    };
-                    char stem[512];
-                    snprintf(stem, sizeof(stem), "%s", child->valuestring);
-                    char *dot = strrchr(stem, '.');
-                    if (dot && strcmp(dot, ".bin") == 0) {
-                        *dot = 0;
-                        for (size_t si = 0; si < sizeof kSfx / sizeof kSfx[0]; si++) {
-                            char v[600];
-                            snprintf(v, sizeof(v), "%s_%s.bin", stem, kSfx[si]);
-                            list_push(out, v, sibling_bundle_tag(node));
-                        }
-                    }
-                }
+                if (strcmp(key, "customProgramVs") == 0 ||
+                    strcmp(key, "customProgramFs") == 0) {
+                    if (!harvest_shader_program(out, child->valuestring,
+                        sibling_bundle_tag(node), shader_readable, shader_user)) return false;
+                } else if (!list_push(out, child->valuestring, sibling_bundle_tag(node)))
+                    return false;
             }
             if (key && cJSON_IsObject(child) &&
                 strcmp(key, "streaming") == 0)
             {
-                harvest_streaming_chunks(child, out);
+                if (!harvest_streaming_chunks(child, out)) return false;
             }
-            walk(child, node, out);
+            if (!walk(child, node, out, shader_readable, shader_user)) return false;
         }
     } else if (cJSON_IsArray(node)) {
         const cJSON *child = NULL;
         cJSON_ArrayForEach(child, node) {
-            walk(child, parent_obj, out);
+            if (!walk(child, parent_obj, out, shader_readable, shader_user)) return false;
         }
     }
+    return true;
 }
 
 /* ================================================================== */
 /* Public API.                                                         */
 /* ================================================================== */
 
-bool jce_bundle_deps_scan(const char *json, size_t json_len,
-                          JceBundleDepList *out_list)
+bool jce_bundle_deps_scan_resolved(const char *json, size_t json_len,
+    JceBundleDepList *out_list, JceBundleShaderReadableFn readable, void *user)
 {
     if (!json || !out_list) return false;
     if (json_len == 0) json_len = strlen(json);
@@ -368,14 +388,14 @@ bool jce_bundle_deps_scan(const char *json, size_t json_len,
     out_list->count    = 0;
     out_list->capacity = 0;
 
-    walk(root, NULL, out_list);
-
+    const bool ok = walk(root, NULL, out_list, readable, user);
     cJSON_Delete(root);
-    return true;
+    if (!ok) jce_bundle_deps_free(out_list);
+    return ok;
 }
 
-bool jce_bundle_deps_scan_file(const char *scene_path,
-                               JceBundleDepList *out_list)
+bool jce_bundle_deps_scan_file_resolved(const char *scene_path,
+    JceBundleDepList *out_list, JceBundleShaderReadableFn readable, void *user)
 {
     if (!scene_path || !out_list) return false;
 
@@ -386,9 +406,20 @@ bool jce_bundle_deps_scan_file(const char *scene_path,
         return false;
     }
 
-    bool ok = jce_bundle_deps_scan((const char *)vbuf, (size_t)sz, out_list);
+    bool ok = jce_bundle_deps_scan_resolved((const char *)vbuf, (size_t)sz,
+                                           out_list, readable, user);
     jce_fs_buffer_free(vbuf);
     return ok;
+}
+
+bool jce_bundle_deps_scan(const char *json, size_t json_len, JceBundleDepList *out)
+{
+    return jce_bundle_deps_scan_resolved(json, json_len, out, NULL, NULL);
+}
+
+bool jce_bundle_deps_scan_file(const char *path, JceBundleDepList *out)
+{
+    return jce_bundle_deps_scan_file_resolved(path, out, NULL, NULL);
 }
 
 static bool parse_dep_array(const cJSON *array, JceBundleDepList *out)

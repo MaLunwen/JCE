@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "renderer/jce_render_encoder.h"
+#include "jce_lighting_system_internal.h"
 
 #define LOG_TAG "jce_lighting_system"
 
@@ -355,6 +356,29 @@ JceLightEnv *jce_light_env_create(void)
     env->cookie_slot_handle[0]    = JCE_COOKIE_SLOT_RESERVED;
     env->cookie_slot_last_used[0] = 0;
     return env;
+}
+
+void jce_lighting_system_shutdown(void)
+{
+    if (!s_lu.init) return;
+    bgfx_uniform_handle_t *uniforms[] = {
+        &s_lu.ambient_color, &s_lu.dir_lights, &s_lu.point_lights,
+        &s_lu.spot_lights, &s_lu.light_counts, &s_lu.area_lights,
+        &s_lu.area_params, &s_lu.camera_pos, &s_lu.ies_params,
+        &s_lu.cookie_dir_params, &s_lu.cookie_dir_vp,
+        &s_lu.s_cookie, &s_lu.s_ies_lut
+    };
+    for (size_t i = 0; i < sizeof(uniforms) / sizeof(uniforms[0]); i++) {
+        if (BGFX_HANDLE_IS_VALID(*uniforms[i]))
+            bgfx_destroy_uniform(*uniforms[i]);
+        uniforms[i]->idx = UINT16_MAX;
+    }
+    if (BGFX_HANDLE_IS_VALID(s_lu.white_1x1)) bgfx_destroy_texture(s_lu.white_1x1);
+    if (BGFX_HANDLE_IS_VALID(s_lu.cookie_atlas_array)) bgfx_destroy_texture(s_lu.cookie_atlas_array);
+    s_lu.white_1x1.idx = UINT16_MAX;
+    s_lu.cookie_atlas_array.idx = UINT16_MAX;
+    s_lu.cookie_array_ok = false;
+    s_lu.init = false;
 }
 
 void jce_light_env_destroy(JceLightEnv *env)

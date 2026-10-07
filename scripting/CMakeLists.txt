@@ -27,7 +27,12 @@ cmake_minimum_required(VERSION 3.20)
 # dependency a property of alphabetical luck.
 option(JCE_BUILD_SCRIPT_API_SHARED
 	"Build jce_script_api — the script-facing shared library (C ABI)." ON)
-if(JCE_BUILD_SCRIPT_API_SHARED)
+option(JCE_BUILD_SCRIPT_API_STATIC
+	"Build the script-facing C ABI as a linked static library." OFF)
+if(JCE_BUILD_SCRIPT_API_SHARED AND JCE_BUILD_SCRIPT_API_STATIC)
+	message(FATAL_ERROR "Select exactly one static/shared script API linkage")
+endif()
+if(JCE_BUILD_SCRIPT_API_SHARED OR JCE_BUILD_SCRIPT_API_STATIC)
 	add_subdirectory(c_abi)
 endif()
 

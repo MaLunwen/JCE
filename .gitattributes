@@ -83,3 +83,6 @@ Thumbs.db -text
 
 # Bundle is a single binary content archive; never normalize its bytes.
 *.jbundle -text
+
+# Fixed first-party half-float renderer tables are binary payloads.
+*.f16 -text

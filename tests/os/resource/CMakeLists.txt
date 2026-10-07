@@ -16,6 +16,7 @@ jce_add_unit_test(test_jce_pak_loader
 jce_add_unit_test(test_jce_bundle_deps
     SOURCES test_jce_bundle_deps.c
     LINK    jce_core jce_resource)
+target_include_directories(test_jce_bundle_deps PRIVATE "${CMAKE_SOURCE_DIR}/engine/src")
 
 jce_add_unit_test(test_jce_bundle_pack
     SOURCES test_jce_bundle_pack.c

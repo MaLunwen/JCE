@@ -17,6 +17,8 @@ Thumbs.db
 /out/
 /examples/*/build/
 /examples/*/native/build/
+# Owner-local frozen design/reference archives; publication deferred.
+/examples/caged_kingdom/way/
 /examples/caged_kingdom/build/
 /examples/caged_kingdom/native/build/
 /scripting/*/build/

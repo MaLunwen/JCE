@@ -40,6 +40,8 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 PROJECT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT / "tools"))
+from taa_status import resolve_taa
 SCENE = PROJECT / "resources" / "scenes" / "snake.scene.json"
 GAME = REPO / "dist" / "games" / "SnakeSeven-release-x86_64" / "SnakeSeven.exe"
 EDITOR = REPO / "build" / "desktop" / "windows-x64" / "release" / "jce_editor.exe"
@@ -198,19 +200,12 @@ def backend(log):
     return m[0].strip() if m else None
 
 
-TAA_RE = re.compile(r"taa resolve: (on|off)")
-
-
-def taa(log):
-    """The LAST effective TAA state, or None.
-
-    Reported by the engine from jce_postfx_apply, so it is the state in force
-    when the frame was drawn rather than what somebody requested.  Needs
-    JCE_LOG_TAA=1, because the line is LOG_INFO otherwise and JCE_DIST
-    compiles LOG_INFO out of the shipped exe.
-    """
-    m = TAA_RE.findall(log)
-    return m[-1] if m else None
+def taa(log, host="native"):
+    """Compatibility state accessor; unavailable scoped evidence remains None."""
+    try:
+        return resolve_taa(log, host)["state"]
+    except ValueError:
+        return None
 
 
 def ambient(log):
@@ -288,12 +283,19 @@ def pixel_diff(a, b):
 class Report:
     def __init__(self):
         self.rows = []
+        self.taa_evidence = {}
 
     def add(self, name, verdict, detail):
         self.rows.append((name, verdict, detail))
         print("  %-4s %-26s %s" % (verdict, name, detail))
 
     def summary(self):
+        if self.taa_evidence:
+            directory = REPO / "build" / "tests" / "snake_seven" / "parity"
+            directory.mkdir(parents=True, exist_ok=True)
+            output = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=directory)) / "taa_status.json"
+            output.write_text(json.dumps(self.taa_evidence, indent=2) + "\n", encoding="utf-8", newline="\n")
+            print("TAA CPU submission evidence: %s" % output)
         p = sum(1 for r in self.rows if r[1] == "PASS")
         f = sum(1 for r in self.rows if r[1] == "FAIL")
         v = sum(1 for r in self.rows if r[1] == "VOID")
@@ -431,35 +433,22 @@ def main():
                         "below is between two different renderers"
                         % (g_be, e_be))
 
-            g_taa, e_taa = taa(g_log), taa(e_log)
-            # A host that prints nothing ran no post-processing chain at all,
-            # and TAA resolves inside that chain -- so "silent" is a real
-            # answer, "off", not an absent measurement.  The shipped main loop
-            # skips jce_postfx_apply() entirely unless some effect is enabled
-            # (jce_default_main.inc.h), which is the usual case for a scene
-            # that authors no rendering settings.
-            #
-            # Only BOTH silent is a genuine VOID: that means the line reached
-            # neither binary, so the instrument, not the engine, is what the
-            # run measured.
-            if g_taa is None and e_taa is None:
-                rep.add(name + " / taa", "VOID",
-                        "neither host printed a taa-resolve line -- the "
-                        "instrument did not reach either binary (rebuild), or "
-                        "the log format moved")
-                g_taa = e_taa = None
-            if g_taa is None and e_taa is None:
-                pass          # already reported VOID above
-            elif (g_taa or "off (no post chain)").split()[0] ==                  (e_taa or "off (no post chain)").split()[0]:
-                rep.add(name + " / taa", "PASS",
-                        "both %s" % (g_taa or "off (no post chain)"))
+            record = {}
+            for host, log in (("native", g_log), ("editor", e_log)):
+                try:
+                    record[host] = resolve_taa(log, host)
+                except ValueError as error:
+                    record[host] = {"state": None, "host": host,
+                        "source": "UNAVAILABLE", "error": str(error)}
+            rep.taa_evidence[name] = record
+            g_taa, e_taa = record["native"]["state"], record["editor"]["state"]
+            detail = json.dumps(record, sort_keys=True)
+            if g_taa is None or e_taa is None:
+                rep.add(name + " / taa", "VOID", detail)
+            elif g_taa == e_taa:
+                rep.add(name + " / taa", "PASS", detail)
             else:
-                rep.add(name + " / taa", "FAIL",
-                        "game %s, editor %s -- one host is temporally "
-                        "anti-aliasing and the other is not, which moves every "
-                        "edge and shows up below as a pixel count"
-                        % (g_taa or "off (no post chain)",
-                           e_taa or "off (no post chain)"))
+                rep.add(name + " / taa", "FAIL", detail)
 
             g_amb, e_amb = ambient(g_log), ambient(e_log)
             if g_amb is None or e_amb is None:

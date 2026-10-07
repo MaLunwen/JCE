@@ -518,3 +518,41 @@ transform-only probe entity and prints the table from C).
 The host log line itself is tagged `[script]`, not with the language: one
 `JceScriptHost` is shared by every VM the runtime stands up, and a host
 callback receives only `user`. The line that names the language is (4) above.
+
+## Static native SDK registry
+
+An SDK consumer may declare linked providers with
+`jce_script_enable(Game LANGUAGES c cpp NATIVE_FACTORIES game_module)`.
+Each provider has the C-linkage signature
+`const JceCppModuleDesc *game_module(void)`; C++ definitions use `extern "C"`.
+The generated C99 shim strongly references each provider, publishes its descriptor
+through `jce_script_vm_cpp_add_module`, then retains the legacy publish callback.
+A missing provider is a real linker error, not a dynamic-module fallback.
+
+For the selected `JCE_REQUIRED_SCRIPT_TARGET`, the delivery host supplies
+`JCE_REQUIRED_NATIVE_FACTORIES`, `JCE_REQUIRED_NATIVE_SCRIPT_PATHS` and
+`JCE_NATIVE_SCRIPT_CLOSURE_SHA256`. Explicit CMake variables override environment
+fallbacks. Factories and required declarations must match; selected `.jcec` and
+`.jcecpp` paths must resolve against the linked language and actual native class
+registry. Invalid declarations fail configuration; registration or resolution
+failure returns -1 from `jce_script_register_linked_languages`.
+
+Only an explicit `JCE_NATIVE_REGISTRY_REPORT` plus a 64-hex
+`JCE_NATIVE_REGISTRY_NONCE` enables the public host-filesystem JSON report. It
+contains the compiled closure hash, nonce, target and actual registration and
+resolution counts, with `ok:false` on registry failure. The delivery host must
+validate this report after running the actual relocated executable; a provider
+name in a project manifest or the small CPU harness alone does not certify SDK
+linkage, relocation or single-file delivery.
+
+### Call-down API linkage
+
+`JCE_BUILD_SCRIPT_API_STATIC` selects the same C99 forwarders as the shared API,
+with a static archive and no DLL export map or runtime side-library staging.
+It is mutually exclusive with `JCE_BUILD_SCRIPT_API_SHARED`. Embedded delivery
+forces static ON/shared OFF so native C/C++ classes can call the engine through
+the host table on every target. Authoring keeps the shared API option; switching
+an existing embedded cache to authoring explicitly clears the static option.
+The SDK installs and imports the actual target type, rather than advertising a
+backend whose call-down wrapper was omitted. Full SDK linkage and relocation
+require native or Web delivery evidence beyond isolated CMake controls.

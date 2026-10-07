@@ -99,6 +99,12 @@ JCE_API const char *jce_input_text(const JceInput *input);
 
 JCE_API void      jce_input_mouse_pos(const JceInput *input, float *x, float *y);
 JCE_API void      jce_input_mouse_delta(const JceInput *input, float *dx, float *dy);
+/* A DOWN/UP pair while previously unheld is an effective one-frame press.
+ * Button/pressed/primary-pointer/capture retain that pulse; the next update
+ * releases it. Held duplicate DOWN and held UP/DOWN do not invent an edge.
+ * The existing capture mask carries the effective state, without a new wire field.
+ * Adjacent live taps still report pressed individually; sampled capture/action
+ * state cannot distinguish consecutive down masks from a hold or count events. */
 JCE_API bool      jce_input_mouse_button(const JceInput *input, int button);
 JCE_API bool      jce_input_mouse_button_pressed(const JceInput *input, int button);
 JCE_API bool      jce_input_mouse_button_released(const JceInput *input, int button);

@@ -230,3 +230,7 @@ target_compile_definitions(test_jce_library PRIVATE
 else()
     jce_test_suite_skipped("platform-library" "dynamic module fixture requires a desktop host loader")
 endif()
+
+jce_add_unit_test(test_jce_input_mouse_tap
+    SOURCES test_jce_input_mouse_tap.c
+    LINK jce_platform jce_core)

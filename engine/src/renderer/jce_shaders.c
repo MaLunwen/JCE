@@ -84,7 +84,7 @@ static const char *shader_suffix(bgfx_renderer_type_t type)
     }
 }
 
-/* WebGL must not link unused PBR families at the first frame. Capture the
+/* WebGL must not link unused shader families at the first frame. Capture the
  * source bytes now (no borrowed PAK/overlay lifetime), and create the GPU
  * program only at submission. Native platforms retain eager loading. */
 static void deferred_source_free(JceDeferredSource *src)
@@ -136,13 +136,12 @@ static JceDeferredSource deferred_source_read(const JcePakArchive *pak,
     return src;
 }
 
-static JceShaderHandle defer_stock(const JcePakArchive *pak, const char *dev,
+static JceShaderHandle defer_program(const JcePakArchive *pak, const char *dev,
                                   const char *vs, const char *fs, bool strict_fs)
 {
     const bgfx_caps_t *caps = bgfx_get_caps();
     if (!JCE_PLATFORM_WEB || !vs || !fs || !caps ||
-        caps->limits.maxPrograms >= JCE_DEFERRED_FIRST ||
-        (strncmp(fs, "pbr", 3) != 0 && strcmp(fs, "terrain") != 0))
+        caps->limits.maxPrograms >= JCE_DEFERRED_FIRST)
         return JCE_INVALID_SHADER;
     JceShaderDeferredState *state = jce_renderer_shader_deferred_state();
     for (unsigned i = 0; i < JCE_DEFERRED_COUNT; ++i) {
@@ -160,6 +159,15 @@ static JceShaderHandle defer_stock(const JcePakArchive *pak, const char *dev,
         return (JceShaderHandle){ (uint16_t)(JCE_DEFERRED_FIRST + i) };
     }
     return JCE_INVALID_SHADER;
+}
+
+/* Stock material families retain their existing preparation policy. */
+static JceShaderHandle defer_stock(const JcePakArchive *pak, const char *dev,
+                                  const char *vs, const char *fs, bool strict_fs)
+{
+    if (!fs || (strncmp(fs, "pbr", 3) != 0 && strcmp(fs, "terrain") != 0))
+        return JCE_INVALID_SHADER;
+    return defer_program(pak, dev, vs, fs, strict_fs);
 }
 
 uint16_t jce_shader_deferred_resolve(uint16_t idx)
@@ -267,6 +275,16 @@ static JceShaderHandle load_program_named(const JcePakArchive *pak,
 
     bgfx_program_handle_t prog = bgfx_create_program(vsh, fsh, true);
     return (JceShaderHandle){ prog.idx };
+}
+
+/* Private opt-in for owned effect pipelines. Submission resolves the handle;
+ * destruction retains the prepared identity so unused source bytes are freed. */
+uint16_t jce_shader_program_prepare(const JcePakArchive *pak,
+                                   const char *vs_base, const char *fs_base)
+{
+    JceShaderHandle pending = defer_program(pak, NULL, vs_base, fs_base, false);
+    if (jce_shader_valid(pending)) return pending.idx;
+    return shader_load_program_named(pak, vs_base, fs_base).idx;
 }
 
 JceShaderHandle shader_load_program(const JcePakArchive *pak, const char *name)

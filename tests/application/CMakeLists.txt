@@ -605,3 +605,22 @@ target_include_directories(test_jce_joint_break_torque PRIVATE
 jce_add_unit_test(test_jce_runtime_script_services
     SOURCES test_jce_runtime_script_services.c
     LINK JCE)
+
+# Production lifecycle registry with allocator/log seams: explicit snapshot OOM.
+jce_add_unit_test(test_jce_lifecycle_allocation
+    SOURCES test_jce_lifecycle_allocation.c
+        "${CMAKE_SOURCE_DIR}/engine/src/application/jce_lifecycle.c")
+
+# Bootstrap scopes consume the same public CPU trace authority.
+jce_add_unit_test(test_jce_engine_trace_scope
+    SOURCES test_jce_engine_trace_scope.c
+    LINK jce_core)
+target_include_directories(test_jce_engine_trace_scope PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Exact callback dispatch shared with the engine host; no window or GPU.
+jce_add_unit_test(test_jce_engine_callbacks
+    SOURCES test_jce_engine_callbacks.c
+    LINK jce_core)
+target_include_directories(test_jce_engine_callbacks PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")

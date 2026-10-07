@@ -25,6 +25,19 @@ class DriverCacheOwnershipTests(unittest.TestCase):
                 self.assertIn(ROOT / "dist/sdk" / ("fixture-debug" if config == "Debug" else "fixture"), paths)
             paths = driver._sdk_cache_paths({"t": dict(target, emscripten=True), "variant": "dist", "config": "Release"})
             self.assertIn(ROOT / "build/web/wasm-dist-sdk", paths)
+            for host_path in driver._host_cache_paths():
+                self.assertIn(host_path, paths)
+            native = driver._sdk_cache_paths({"t":target,"variant":"dist","config":"Release"})
+            for host_path in driver._host_cache_paths():
+                self.assertNotIn(host_path, native)
+
+    def test_native_embedded_editor_does_not_hold_unrelated_host_tools(self):
+        target = {"key":"fixture","host":"windows","arch":"x64","cross":False}
+        args = SimpleNamespace(arch="x64",variant="dist",delivery_profile="embedded",standalone=True)
+        with patch.object(driver, "resolve_target", return_value=target):
+            paths = driver._editor_cache_paths({"args":args})
+        for host_path in driver._host_cache_paths():
+            self.assertNotIn(host_path, paths)
 
     def test_app_locks_project_tree_and_selected_sdk(self):
         target = {"host": "linux", "arch": "arm64"}

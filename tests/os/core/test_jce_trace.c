@@ -301,6 +301,38 @@ static void test_chrome_trace_export_contains_thread_and_task_names(void)
     TEST_ASSERT_NOT_NULL(strstr(json, "export-main"));
     TEST_ASSERT_NOT_NULL(strstr(json, "export-task"));
     TEST_ASSERT_NOT_NULL(strstr(json, "\"value\":-7"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"lost\":0"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"capture_generation_stable\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"state\":0"));
+    jce_fs_buffer_free(json);
+    TEST_ASSERT_TRUE(jce_fs_host_remove_file(path));
+}
+
+static void test_export_reports_ring_overwrite_and_failed_task_state(void)
+{
+    const char *path = "jce_trace_overwrite.chrome.json";
+    JceTraceStats stats;
+    uint64_t size = 0;
+    char *json;
+    uint32_t i;
+    uint64_t id;
+    jce_trace_get_stats(&stats);
+    for (i = 0; i < stats.capacity + 7; ++i)
+        jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "fill", i);
+    id = jce_trace_next_id();
+    jce_trace_task_submit(id, 0, JCE_TRACE_TASK_SERVICE, "failed-export");
+    jce_trace_task_begin(id, id, "failed-export", 0);
+    jce_trace_task_end(id, id, "failed-export", JCE_TRACE_TASK_FAILED, 20);
+    TEST_ASSERT_TRUE(jce_trace_export_chrome_json(path));
+    json = (char *)jce_fs_host_read_all(path, &size);
+    TEST_ASSERT_NOT_NULL(json);
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"jceTrace\""));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"recorded\":16394"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"captured\":16384"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"overwritten_before_capture\":10"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"cursor_lost\":0"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"lost\":10"));
+    TEST_ASSERT_NOT_NULL(strstr(json, "\"state\":1"));
     jce_fs_buffer_free(json);
     TEST_ASSERT_TRUE(jce_fs_host_remove_file(path));
 }
@@ -315,5 +347,6 @@ int main(void)
     RUN_TEST(test_named_pool_task_emits_submit_run_and_wait_events);
     RUN_TEST(test_structured_async_uses_same_trace_contract);
     RUN_TEST(test_chrome_trace_export_contains_thread_and_task_names);
+    RUN_TEST(test_export_reports_ring_overwrite_and_failed_task_state);
     return UNITY_END();
 }

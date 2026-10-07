@@ -77,16 +77,28 @@ typedef struct JceLifecycleHandle {
 } JceLifecycleHandle;
 
 /* Register a callback.  Lower priority runs earlier.  Returns a handle
- * whose `id` is non-zero on success.  Main-thread only. */
+ * whose `id` is non-zero on success. Main-thread only. IDs are never reused
+ * during the process lifetime, including after shutdown. Identity exhaustion
+ * returns the invalid handle without changing the registry. */
 JCE_API JceLifecycleHandle JCE_CALL
 jce_lifecycle_register(JceLifecycleCallback cb, int32_t priority, void *user);
 
+/* Removal during a callback takes effect immediately: a removed listener
+ * is not called later in the same emit. Stale/invalid handles are harmless. */
 JCE_API void JCE_CALL jce_lifecycle_unregister(JceLifecycleHandle h);
 
 /* Emit an event to all listeners (in priority order).  This is the
  * platform-internal hook called by the SDL event pump; game code
  * should not call it directly.  MAIN THREAD ONLY -- see the note at the
- * top of this header: every listener is written on that assumption. */
+ * top of this header: every listener is written on that assumption.
+ * Each call freezes the entry identity ceiling and stable priority order without
+ * allocating memory. Registrations during that call wait until a later emit;
+ * removals are immediate. Nested emits
+ * are independent calls and see the current registry. State getters reflect the
+ * most recent paired event, including a nested one (not the outer event again).
+ * Shutdown cancels all active dispatches. Delivery allocates no temporary storage,
+ * including for LOW_MEMORY and arbitrarily many registered listeners. Listener
+ * table growth may still fail at registration, returning an invalid handle. */
 JCE_API void JCE_CALL jce_lifecycle_emit(JceLifecycleEvent event);
 
 /* WHERE DEVICE_LOST COMES FROM, because it came from nowhere until
@@ -125,7 +137,7 @@ JCE_API const char *JCE_CALL jce_lifecycle_event_to_string(JceLifecycleEvent eve
 
 /* Release the listener table.  Called from jce_engine_destroy after
  * every subsystem has had a chance to unregister.  Safe to call when
- * empty. */
+ * empty or before registration; resets focus/pause state without reusing IDs. */
 JCE_API void JCE_CALL jce_lifecycle_shutdown(void);
 
 JCE_EXTERN_C_END

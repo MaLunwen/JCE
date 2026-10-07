@@ -632,6 +632,9 @@ static void uc_draw_image(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
                           float ui_scale)
 {
     uint32_t tint = uc_color(im->color, alpha_mul);
+    /* Only this graphic is skipped. Layout, children and hit testing retain
+     * their independent CanvasGroup and hierarchy rules. */
+    if ((tint >> 24) == 0u) return;
     JceTexture tex = uc_get_texture(uc, im->sprite_path);
     /* NULL unless this element actually turns -- see uc_elem_xform. */
     JceRectXform xf_store;
@@ -1190,6 +1193,7 @@ void uc_draw_quad(JceUICanvas *uc, uint16_t view_id, float x, float y,
 {
     if (w <= 0.0f || h <= 0.0f) return;
     uint32_t tint = uc_color(rgba, alpha_mul);
+    if ((tint >> 24) == 0u) return;
     JceTexture tex = uc_get_texture(uc, sprite);
     if (jce_texture_valid(tex))
         uc_tex_view(uc->renderer, view_id, x, y, w, h, tex, tint, NULL);
