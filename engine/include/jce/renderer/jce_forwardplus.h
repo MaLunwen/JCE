@@ -65,16 +65,17 @@
  *      gridBaseRow   = 0
  *      indexBaseRow  = gridRows
  *      lightsBaseRow = gridRows + indexRows
- *      totalRows     = gridRows + indexRows + lightsRows     (texture height)
+ *      uploadRows    = gridRows + indexRows + lightsRows     (logical rows)
  *
- *  These three base rows + W + totalRows are uploaded in u_clusterRegions
- *  (see Uniforms below).  WITHIN a region, an element e keeps its old
+ *  These three base rows plus the physical allocation height texHeight are
+ *  uploaded in u_clusterRegions; texHeight may exceed uploadRows. The width W
+ *  is supplied separately (see Uniforms below).  WITHIN a region, an element e keeps its old
  *  row-major addressing; the ABSOLUTE texel the shader fetches is:
  *      tx       = e % W
  *      texelRow = regionBaseRow + (e / W)
  *  Point-clamp NEAREST sampling (no filtering, no mips).  Use texelFetch in
  *  GLSL/SPIRV; on backends without integer texelFetch, sample at
- *      uv = ((tx + 0.5) / W , (texelRow + 0.5) / totalRows)
+ *      uv = ((tx + 0.5) / W , (texelRow + 0.5) / texHeight)
  *  with POINT CLAMP — exact.
  *
  *  ── (i) GRID region  (base row = gridBaseRow = 0) ───────────────────────
@@ -151,7 +152,7 @@
  *  u_clusterParams2 (vec4):  x = max_per_cell, y = JCE_FP_TEX_WIDTH,
  *                            z = zNear, w = zFar
  *  u_clusterRegions (vec4):  x = gridBaseRow, y = indexBaseRow,
- *                            z = lightsBaseRow, w = totalRows (texture height)
+ *                            z = lightsBaseRow, w = texHeight (physical texture height)
  *  (All counts are exact integers stored as float, read with int() in GLSL.
  *   The shader reads region bases from u_clusterRegions, builds an absolute
  *   texelRow = regionBase + e/W, and samples s_cluster.)
@@ -191,7 +192,8 @@ JCE_EXTERN_C_BEGIN
  * bytes each region of the single combined GPU texture will contain.  The
  * unit test asserts on these.  Each array is RGBA32F: 4 floats per texel.
  * Sizes are reported back so the combiner/uploader can compute region row
- * counts and the total texture height. */
+ * counts and the logical upload height. The GPU allocation may reserve more
+ * rows; normalized sampling must use that physical allocation height. */
 typedef struct {
     /* Grid texels: NCELL texels (offset,count,0,0).  rows = ceil(NCELL/W). */
     float   *grid;          /* length = grid_texels * 4 */

@@ -4,6 +4,10 @@ Preserve the user's branch, staged changes, ignored assets and backup refs. Read
 
 When the user reserves commits and pushes, leave changes reviewable in the workspace. When explicitly authorized to rewrite a published commit, create a Git backup branch first and record the observed remote object ID.
 
+Each push needs explicit user authorization for that push. Previous publication permission does not carry forward to later pushes. Keep one release commit per version on main; consolidate same-version fixes into the existing release commit locally instead of repeating its version subject. Back up the original history before consolidation. Authorization to clean local history is not authorization to rewrite the remote.
+
+Create a release commit only after the full requested implementation, testing, optimization and defect fixes are complete. Do not treat partial coverage or an incomplete acceptance protocol as permission to commit a release.
+
 Use force-with-lease with that expected remote ID for an authorized history update; if the lease fails, inspect the new remote history instead of overriding it. Publish only validated public content and exclude local/private delivery files.
 
 Check staged whitespace, real index paths, effective attributes and ignore decisions. Keep unavailable verification separate from PASS and report the exact source/build identity of a delivered artifact.

@@ -564,16 +564,11 @@ float sample_csm_shadow(int cascade,
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
-    // Depth bias in SHADOW TEXELS of world offset -- see shadow_bias.sh.
-    // The mesh figure keeps its historical 3x over the terrain's (4.8 vs 1.6
-    // texels) and its steeper slope term; what goes is the mix(3,6,cascade)
-    // ladder and the mix(0.01,0.08,cascade) ceiling, both of which existed to
-    // compensate, one constant at a time, for a bias whose world meaning was
-    // the cascade fit's geometry.  The comment they carried said so: "the
-    // much larger world depth range it represents".  That range is now
-    // divided out rather than budgeted around.
+    // Mesh, terrain and water receivers share the same texel-space policy.
+    // A surface class must not multiply the cascade's world bias: the former
+    // mesh-only 3x base and steeper slope erased small-caster shadows.
     float slope = sin_theta / max(ndotl, 0.1);
-    float depth_bias = jce_shadow_depth_bias(cascade, 4.8, slope, 8.0);
+    float depth_bias = jce_shadow_depth_bias(cascade, slope);
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
 

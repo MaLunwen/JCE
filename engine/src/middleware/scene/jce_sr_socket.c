@@ -52,7 +52,6 @@ void sr_update_bone_attachments(JceSceneRenderer *sr, JceScene *scene,
 
     /* Counts only attachments on entities that THEMSELVES have a parent --
      * see the note at the end of the loop for why roots cost nothing. */
-    int wrote_parented = 0;
     for (int i = 0; i < list->count; i++) {
         const JceEntity e = list->entities[i];
         if (!entity_enabled(scene, e)) continue;
@@ -67,7 +66,7 @@ void sr_update_bone_attachments(JceSceneRenderer *sr, JceScene *scene,
          * weapon held by someone who walked off screen keeps the pose it had
          * rather than snapping to the origin.  It goes stale, and a pose that
          * stopped updating is a far smaller lie than one that teleported. */
-        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)a->target);
+        SrAnimInstance *ai = sr_find_anim_instance(sr, a->target);
         if (!ai || !ai->model) continue;
 
         const JceSkeleton *skel = jce_model_get_skeleton(ai->model);
@@ -113,34 +112,8 @@ void sr_update_bone_attachments(JceSceneRenderer *sr, JceScene *scene,
         jce_scene_solve_local_pose(scene, e, wp, wr, &tf->position,
                                    &tf->rotation);
         jce_scene_notify_physics_writeback_entity(scene, e);
-        if (jce_scene_get_parent(scene, e) != JCE_ENTITY_INVALID)
-            wrote_parented++;
     }
 
-    /* DROP THIS FRAME'S WORLD-MATRIX MEMO -- once, and only for the case that
-     * needs it.
-     *
-     * The writes above are IN PLACE, and notify_physics_writeback_entity
-     * ring-pushes the subtree for the renderer's incremental repair; it does
-     * NOT touch scene_world_matrix_memo.  That memo is populated EARLIER IN
-     * THE SAME FRAME by the cull walk that built `list`.  So an attached
-     * entity would be drawn from a matrix computed before this pass ran:
-     * right pose, one frame late, visible only while it is moving -- which is
-     * the entire situation a bone attachment exists for, and invisible to
-     * anyone testing it on a still character.
-     *
-     * ONLY FOR PARENTED ENTITIES, because the memo does not hold the others:
-     * scene_world_matrix_memo returns a root's local matrix early and never
-     * caches it, so a root re-reads the Transform this pass just wrote.  A
-     * weapon parented to nothing -- the common shape -- therefore costs
-     * nothing here, and a scene full of attachments does not drop its memo
-     * every frame for a staleness it cannot have.
-     *
-     * begin_render_world_cache rather than invalidate_world_cache: the former
-     * drops the intra-frame memo WITHOUT bumping the structural epoch, so the
-     * renderer's cross-frame static world-matrix/AABB cache survives.  Bumping
-     * the epoch would throw that away every frame any character holds
-     * anything, which is a far larger bill than the one being avoided. */
-    if (wrote_parented > 0)
-        jce_scene_begin_render_world_cache(scene);
+    /* Explicit writeback notification already invalidates the intra-frame
+     * memo for roots and descendants, without evicting static render caches. */
 }

@@ -98,11 +98,11 @@ def main() -> int:
                 f"{fs.relative_to(ROOT)}: reads {sorted(missing)} which "
                 f"{vs.name} does not output"
             )
-        # `extra` is only meaningful for a DEDICATED vertex stage.  A shared
-        # one legitimately outputs more than any single consumer reads.
-        shared = sum(1 for (v, _) in exact if v == vs) > 1
+        # bgfx hashes the complete declared varying interface. Sharing a
+        # vertex stage does not waive the match: every fragment consumer must
+        # declare all outputs, even varyings unused by its executable code.
         extra = v_out - f_in
-        if extra and not shared:
+        if extra:
             problems.append(
                 f"{vs.relative_to(ROOT)}: outputs {sorted(extra)} which "
                 f"{fs.name} does not declare"
@@ -152,7 +152,7 @@ def main() -> int:
               "  the build stays green, and the geometry simply stops drawing.",
               file=sys.stderr)
         return 1
-        print("check_shader_varying_pairs: OK (%d exact pair(s) + %d fragment "
+    print("check_shader_varying_pairs: OK (%d exact pair(s) + %d fragment "
           "shader(s) checked against their directory's vertex stages; %d "
           "with no vertex shader in scope)" % (pairs, unpaired, orphan))
     return 0

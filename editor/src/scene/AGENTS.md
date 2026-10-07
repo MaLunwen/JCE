@@ -76,3 +76,15 @@ KNOWN, UNFIXED, OPT-IN: with `r.point_shadows` / `JCE_POINT_CUBE_SHADOWS` on
 103..119 — inside the Game View's range. Cross-BASE, so no static_assert can
 reach it; the runtime claim reports it. The fix is re-spacing the bases, and the
 256-id bgfx budget has no room.
+
+Script cursors are owned by the runtime host: `JceScriptHost.cursor_set` loads
+raw/cooked image assets, caches eight handles, and releases them after scene
+script teardown. Native modules must not create cursors through their own SDL
+copy. Editor Game View reapplies the selected host cursor only while its
+pointer sample is valid, leaving cursor arbitration with the editor host.
+
+Scene texture workers retain `JceTextureCpu` with move-only cancellation ownership.
+Render-thread upload consumes the full authored mip chain; RGBA base-mip
+decoding is reserved for image previews and never reconstructs scene mips.
+
+Texture resolution may bypass material parsing only for recognized texture asset paths. An existing material JSON inside an isolated bundle is not an image; parse its texture references before CPU decoding. Keep failed CPU decode diagnostics tied to the actual path.

@@ -10,14 +10,14 @@
 #ifndef JCE_SCRIPT_API_EXPORTS_GEN_H
 #define JCE_SCRIPT_API_EXPORTS_GEN_H
 
-#define JCE_SCRIPT_API_EXPORT_COUNT 104
+#define JCE_SCRIPT_API_EXPORT_COUNT 111
 
 /* The host member with the highest vtable_index, and the entry point
  * that reaches it.  The short-host test truncates AT this member's
  * offset, so it keeps withholding the real tail as the struct grows
  * instead of testing a member that stopped being last. */
-#define JCE_SCRIPT_API_TAIL_MEMBER raycast_all
-#define JCE_SCRIPT_API_TAIL_ENTRY  "jce_script_api_raycast_all"
+#define JCE_SCRIPT_API_TAIL_MEMBER stat_flush
+#define JCE_SCRIPT_API_TAIL_ENTRY  "jce_script_api_stat_flush"
 
 static const char *const
 kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
@@ -50,6 +50,7 @@ kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
     "jce_script_api_get_param_text",
     "jce_script_api_get_parent",
     "jce_script_api_get_pointer_delta",
+    "jce_script_api_get_pointer_position",
     "jce_script_api_get_pointer_wheel",
     "jce_script_api_get_position",
     "jce_script_api_get_rotation",
@@ -86,11 +87,13 @@ kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
     "jce_script_api_raycast_filtered",
     "jce_script_api_render_get",
     "jce_script_api_render_set",
+    "jce_script_api_request_quit",
     "jce_script_api_request_scene",
     "jce_script_api_rpc_send",
     "jce_script_api_save_game",
     "jce_script_api_send_message",
     "jce_script_api_set_component_enabled",
+    "jce_script_api_set_cursor",
     "jce_script_api_set_locale",
     "jce_script_api_set_parent",
     "jce_script_api_set_position",
@@ -101,6 +104,10 @@ kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
     "jce_script_api_shake_camera",
     "jce_script_api_spawn",
     "jce_script_api_sprint",
+    "jce_script_api_stat_available",
+    "jce_script_api_stat_flush",
+    "jce_script_api_stat_get",
+    "jce_script_api_stat_set",
     "jce_script_api_tr",
     "jce_script_api_ui_get_dropdown",
     "jce_script_api_ui_get_input_text",

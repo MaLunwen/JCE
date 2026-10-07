@@ -16,3 +16,16 @@ Never repair an existing source checkout or replace its bytes. Existing cached
 packages may predate this policy; a successful cached build is not source-purity
 verification. Cross-platform recipes that needed retired patches require fresh
 profile validation before claiming support. See contracts/conan-source-policy.json.
+
+CMakeDeps names the bgfx whole-package aggregate bgfx::all. The upstream
+explicit bgfx::bgfx component remains the renderer dependency; its closure
+must not inherit texturec or bimg_decode through a name collision. Texture
+encoding consumers still link bimg_encode, bimg and bx explicitly. Adjust
+first-party generated metadata, never remove upstream symbols or libraries
+to hide a duplicate-provider conflict.
+
+The harfbuzz package aggregate is harfbuzz::all; core shaping consumers keep
+the explicit harfbuzz::harfbuzz component. Runtime schema messages link
+protobuf::libprotobuf; protoc remains the matched build-context executable,
+not a runtime aggregate that also imports alternate UTF-8 providers. This is
+generated metadata/consumer closure configuration, never upstream archive edits.

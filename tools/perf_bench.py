@@ -43,7 +43,9 @@ USAGE
     python tools/perf_bench.py --scene street_demo/.../street.scene.json \\
         --spawn 3,200000 --runs 3
 """
+from collections import Counter
 import argparse
+import math
 import os
 import re
 import statistics
@@ -53,7 +55,20 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "build/desktop/windows-x64/release/jce_editor.exe"
+sys.path.insert(0, str(ROOT))
+from tools.build.jce import HOST, TARGETS, host_arch, preset_binary_dir
+
+
+def default_editor_exe():
+    target = next((row for row in TARGETS.values()
+                   if row["host"] == HOST and row["arch"] == host_arch()), None)
+    if target is None:
+        return ROOT / "build" / "desktop" / (HOST + "-" + host_arch()) / "release" / "jce_editor"
+    name = "jce_editor.exe" if HOST == "windows" else "jce_editor"
+    return preset_binary_dir(target, "release") / "release" / name
+
+
+EXE = default_editor_exe()
 
 # PERF_RE now lives in jce_determinism (imported below) so the acceptance
 # protocol and this file cannot drift apart on what a perf line looks like.
@@ -65,12 +80,24 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from jce_determinism import (DETERMINISM, assert_backend,   # noqa: E402
                              PERF_RE, parse_perf)
+from process_sampler import run_process  # noqa: E402
 
 
 def _editor_alive():
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq jce_editor.exe", "/NH"],
-                         capture_output=True, text=True).stdout
-    return "jce_editor" in out
+    try:
+        import psutil
+    except ImportError:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq jce_editor.exe", "/NH"],
+                                 capture_output=True, text=True, check=True).stdout
+            return "jce_editor.exe" in out.lower()
+        out = subprocess.run(["ps", "-A", "-o", "comm="],
+                             capture_output=True, text=True, check=True).stdout
+        return any(Path(row.strip()).name == "jce_editor" for row in out.splitlines())
+    for proc in psutil.process_iter(["name"]):
+        if (proc.info.get("name") or "").lower() in ("jce_editor", "jce_editor.exe"):
+            return True
+    return False
 
 
 def wait_idle(timeout=180):
@@ -84,55 +111,122 @@ def wait_idle(timeout=180):
         time.sleep(0.3)
 
 
-def run(env_over, log_path, frames=400, timeout=1800):
-    """One guarded run. Returns parsed metrics; raises rather than returning
-    anything derived from a run that did not happen."""
+def read_execution_log(log_path, process=None):
+    """Merge this execution's captures, never old rotated engine logs.
+
+    Preserve the maximum per-stream multiplicity of each normalized line:
+    mirror captures do not double events, real repeats in one stream survive.
+    Freshness belongs to run_process/its guarded caller, not filesystem mtime.
+    """
+    path = Path(log_path)
+    captured = process or {}
+    streams = []
+    for name in ("stdout", "stderr"):
+        if name in captured:
+            streams.append(captured[name])
+        else:
+            source = Path(captured.get(name + "_path",
+                path.parent / (path.stem + "_process") / (name + ".log")))
+            streams.append(source.read_text(encoding="utf-8", errors="replace") if source.exists() else "")
+    streams.append(path.read_text(encoding="utf-8", errors="replace"))
+    normalized = [re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines() for text in streams]
+    normalized.sort(key=lambda lines: sum(map(len, lines)), reverse=True)
+    merged = list(normalized[0])
+    counts = Counter(merged)
+    for lines in normalized[1:]:
+        seen = Counter()
+        for line in lines:
+            seen[line] += 1
+            if seen[line] > counts[line]:
+                merged.append(line)
+        counts |= seen
+    text = "\n".join(merged)
+    # The ordinary backend validator checks the request; also reject contradictory
+    # actual markers instead of silently accepting whichever stream appears first.
+    from jce_determinism import actual_backend
+    reported = {re.sub(r"\s+", "", name).casefold()
+                for line in merged if (name := actual_backend(line)) is not None}
+    if len(reported) > 1:
+        raise RuntimeError("conflicting actual renderer markers in fresh execution captures")
+    return text
+
+
+def has_exact_workload(log_text, kind, count):
+    observed = re.findall(
+        r"benchmark-spawn: kind=(\d+) requested=(\d+) spawned=(\d+)\b",
+        log_text)
+    return observed == [(str(kind), str(count), str(count))]
+
+
+def run(env_over, log_path, frames=400, timeout=1800, *,
+        exe=EXE, samples_path=None, expected_workload=None,
+        max_seconds=None, live_markers=None, sample_interval=0.1):
+    """One guarded run. Invalid or stale output raises instead of yielding data.
+
+    samples_path enables the engine's full per-frame KPI stream. The caller
+    owns warm-up selection and derived statistics; the original CSV stays raw.
+    """
     log_path = Path(log_path)
+    exe = Path(exe).resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
-        log_path.unlink()          # never parse a stale log
-    wait_idle()
+        log_path.unlink()
+    if samples_path is not None:
+        samples_path = Path(samples_path)
+        samples_path.parent.mkdir(parents=True, exist_ok=True)
+        if samples_path.exists():
+            samples_path.unlink()
+    if exe.name.lower() in ("jce_editor", "jce_editor.exe") and not env_over.get("JCE_MULTI_INSTANCE"):
+        wait_idle()
 
-    env = dict(os.environ)
-    # JCE_PERF_LOG is a BOOLEAN enable; the destination is JCE_LOG_FILE. Setting
-    # the path in JCE_PERF_LOG enables logging and writes it somewhere else,
-    # which is how the first version of this file raised "the run produced
-    # nothing" on a run that had in fact produced a perfectly good log.
-    # The determinism recipe is single-sourced in jce_determinism.py.  This file
-    # used to pin only JCE_FRAME_DT_FIXED, so streaming and TAA jitter were free
-    # to differ between the two runs a comparison is made of.
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("JCE_")}
     env.update(DETERMINISM)
     env.update({
         "JCE_PERF_LOG": "1",
         "JCE_LOG_FILE": str(log_path),
         "JCE_MAX_FRAMES": str(frames),
     })
-    env.update(env_over)                     # caller wins over the defaults
-    proc = subprocess.run([str(EXE)], env=env, cwd=str(ROOT),
-                          capture_output=True, text=True, timeout=timeout)
-    # The exit code was discarded here.  A run that printed a perf line and THEN
-    # died still looked like a measurement.
-    if proc.returncode != 0:
+    if samples_path is not None:
+        env["JCE_KPI_FRAME_LOG"] = str(samples_path)
+        env["JCE_KPI_FRAME_COUNT"] = str(frames)
+    if max_seconds is not None:
+        if not math.isfinite(max_seconds) or max_seconds <= 0 or max_seconds > 86400:
+            raise ValueError("max_seconds must be in (0, 86400]")
+        env["JCE_MAX_SECONDS"] = str(max_seconds)
+    env.update(env_over)
+    result = run_process([str(exe)], env=env, cwd=str(ROOT), timeout=timeout,
+                         output_dir=log_path.parent / (log_path.stem + "_process"),
+                         marker_path=samples_path, live_markers=live_markers,
+                         interval=sample_interval)
+    if result["timed_out"]:
+        raise RuntimeError("the run timed out after %.1f seconds" % result["elapsed_s"])
+    if result["returncode"] != 0:
         raise RuntimeError(
             "the run exited %d -- a measurement from a process that did not "
-            "finish is not a measurement.  Last stderr: %s"
-            % (proc.returncode, (proc.stderr or "").strip()[-400:] or "(empty)"))
-    # Which backend actually rendered this?  JCE_BACKEND is a REQUEST; bgfx
-    # falls back.  The "renderer:" line is emitted before JCE_LOG_FILE takes
-    # over, so it lives in stdout, not in the log file.
-    requested = env.get("JCE_BACKEND")
-    if requested:
-        got = assert_backend(proc.stdout or "", requested)
-        print("[perf] engine reported backend: %s" % got)
-
+            "finish is not a measurement. Last stderr: %s"
+            % (result["returncode"], result["stderr"].strip()[-400:] or "(empty)"))
     if not log_path.exists():
         raise RuntimeError("no log at %s -- the run produced nothing" % log_path)
-    text = log_path.read_text(encoding="utf-8", errors="replace")
-    if "single-instance lock already held" in text:
+    log_text = read_execution_log(log_path, result)
+    # Standalone and editor builds can install JCE_LOG_FILE at different
+    # points in boot. Require the actual renderer marker in either stream.
+    actual = assert_backend(log_text,
+                            env.get("JCE_BACKEND", "auto"))
+    print("[perf] engine reported backend: %s" % actual)
+    if "] ERROR -" in log_text:
+        raise RuntimeError("engine logged an ERROR during the fresh execution")
+    if "single-instance lock already held" in log_text:
         raise RuntimeError("the run hit the single-instance lock and exited "
                            "without rendering; this log is NOT a measurement")
+    if expected_workload is not None:
+        kind, count = expected_workload
+        marker = "benchmark-spawn: kind=%d requested=%d spawned=%d" % (
+            kind, count, count)
+        if not has_exact_workload(log_text, kind, count):
+            raise RuntimeError("expected workload marker missing: %s" % marker)
 
-    rows = PERF_RE.findall(text)
+    rows = PERF_RE.findall(log_text)
     if not rows:
         raise RuntimeError("no perf line in %s -- the run did not reach steady "
                            "state" % log_path)
@@ -143,12 +237,19 @@ def run(env_over, log_path, frames=400, timeout=1800):
         "draws": int(last[4]), "gpu_mem": int(last[5]),
         "tex": int(last[6]), "rt": int(last[7]),
         "rss": int(last[8]), "commit": int(last[9]),
-        "phases": {},
+        "phases": {}, "backend_actual": actual,
+        "process": {k: v for k, v in result.items()
+                    if k not in ("stdout", "stderr", "samples")},
+        "process_samples": result["samples"],
     }
-    ph = PHASE_RE.findall(text)
+    ph = PHASE_RE.findall(log_text)
     if ph:
         out["phases"] = {k: float(v)
-                         for k, v in re.findall(r"([a-z_0-9]+)=([\d.]+)", ph[-1])}
+                         for k, v in re.findall(r"([a-z_0-9]+)=([0-9.]+)", ph[-1])}
+    if samples_path is not None:
+        if not samples_path.exists() or samples_path.stat().st_size == 0:
+            raise RuntimeError("no raw samples at %s" % samples_path)
+        out["samples_path"] = str(samples_path)
     return out
 
 

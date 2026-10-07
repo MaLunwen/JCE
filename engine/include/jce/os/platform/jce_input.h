@@ -108,6 +108,15 @@ JCE_API float     jce_input_mouse_wheel(const JceInput *input);
  * polling consumer hard-wired the horizontal axis to zero. */
 JCE_API float     jce_input_mouse_wheel_h(const JceInput *input);
 
+/* Primary pointer for pointer-only consumers such as UI. Physical mouse
+ * queries above remain independent of touch. Touch coordinates are scaled by
+ * the supplied logical surface size; its release retains the final position.
+ * Returns geometric validity. Outputs must be non-NULL; invalid inputs are
+ * rejected without modifying them. A real mouse event restores mouse ownership. */
+JCE_API bool jce_input_primary_pointer(const JceInput *input,
+                                      float width, float height,
+                                      float *x, float *y, bool *down);
+
 /* -- Touch (mobile) ------------------------------------------------- */
 
 JCE_API int       jce_input_touch_count(const JceInput *input);

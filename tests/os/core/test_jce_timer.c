@@ -88,6 +88,16 @@ static void test_format_local_writes_buffer(void)
     TEST_ASSERT_EQUAL_size_t(n, jce_time_format_local(0, "%Y", buf, sizeof(buf)));
 }
 
+static void test_epoch_milliseconds_agree_with_seconds(void)
+{
+    const int64_t before = jce_time_now_epoch_seconds();
+    const int64_t ms = jce_time_now_epoch_milliseconds();
+    const int64_t after = jce_time_now_epoch_seconds();
+    TEST_ASSERT_TRUE(ms > 0);
+    TEST_ASSERT_TRUE(ms >= before * 1000);
+    TEST_ASSERT_TRUE(ms < (after + 1) * 1000);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -96,6 +106,7 @@ int main(void)
     RUN_TEST(test_ticks_ms_monotonic);
     RUN_TEST(test_perf_to_seconds_consistent);
     RUN_TEST(test_epoch_seconds_positive);
+    RUN_TEST(test_epoch_milliseconds_agree_with_seconds);
     RUN_TEST(test_timer_create_destroy);
     RUN_TEST(test_timer_tick_progresses_state);
     RUN_TEST(test_format_local_writes_buffer);

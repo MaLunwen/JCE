@@ -21,7 +21,7 @@
  * The guard has TWO spellings and grepping for only the first will convince
  * you this file is broken when it is not:
  *
- *     s->have_host && s->host.<member>          100 functions
+ *     s->have_host && s->host.<member>          107 functions
  *     !s->have_host || !s->host.<member>        1 function (jce.get_touch),
  *                                               where an index_base binding
  *                                               folds the guard into its
@@ -581,6 +581,21 @@ static int l_jce_get_pointer_delta(lua_State *L)
     lua_pushnumber(L, (lua_Number)out_xy[0]);
     lua_pushnumber(L, (lua_Number)out_xy[1]);
     return 2;
+}
+
+/* jce.get_pointer_position — shape: void_out_array
+ * Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
+static int l_jce_get_pointer_position(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float out_xywh[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (s->have_host && s->host.pointer_position)
+        s->host.pointer_position(s->host.user, out_xywh);
+    lua_pushnumber(L, (lua_Number)out_xywh[0]);
+    lua_pushnumber(L, (lua_Number)out_xywh[1]);
+    lua_pushnumber(L, (lua_Number)out_xywh[2]);
+    lua_pushnumber(L, (lua_Number)out_xywh[3]);
+    return 4;
 }
 
 /* jce.get_pointer_wheel — shape: value_return */
@@ -1397,6 +1412,76 @@ static int l_jce_vcam_activate(lua_State *L)
     return 1;
 }
 
+/* jce.set_cursor — shape: value_return
+ * Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path resets. Main-thread; false on decode/platform/cache failure. */
+static int l_jce_set_cursor(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *asset_path = luaL_checkstring(L, 1);
+    int hotspot_x = (int)luaL_checkinteger(L, 2);
+    int hotspot_y = (int)luaL_checkinteger(L, 3);
+    bool v = (s->have_host && s->host.cursor_set)
+                ? s->host.cursor_set(s->host.user, asset_path, hotspot_x, hotspot_y) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.request_quit — shape: value_return */
+static int l_jce_request_quit(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    bool v = (s->have_host && s->host.request_quit)
+                ? s->host.request_quit(s->host.user) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.stat_available — shape: value_return */
+static int l_jce_stat_available(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    bool v = (s->have_host && s->host.stat_available)
+                ? s->host.stat_available(s->host.user) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.stat_set — shape: value_return
+ * Store signed32 statistic through an explicitly borrowed platform service. Nonfinite, fractional or out-of-range values return false; successful set does not imply durable flush. */
+static int l_jce_stat_set(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *id = luaL_checkstring(L, 1);
+    double value = luaL_checknumber(L, 2);
+    bool v = (s->have_host && s->host.stat_set)
+                ? s->host.stat_set(s->host.user, id, value) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
+/* jce.stat_get — shape: value_return
+ * Signed32 statistic; fallback must be finite, integral and in range, otherwise returns 0. An absent host returns 0; a configured runtime with unavailable service returns the valid fallback. */
+static int l_jce_stat_get(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    const char *id = luaL_checkstring(L, 1);
+    double fallback = luaL_checknumber(L, 2);
+    int v = (s->have_host && s->host.stat_get)
+                ? s->host.stat_get(s->host.user, id, fallback) : 0;
+    lua_pushinteger(L, (lua_Integer)v);
+    return 1;
+}
+
+/* jce.stat_flush — shape: value_return */
+static int l_jce_stat_flush(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    bool v = (s->have_host && s->host.stat_flush)
+                ? s->host.stat_flush(s->host.user) : false;
+    lua_pushboolean(L, v ? 1 : 0);
+    return 1;
+}
+
 const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "get_position",
     "set_position",
@@ -1437,6 +1522,7 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "is_action_pressed",
     "get_axis",
     "get_pointer_delta",
+    "get_pointer_position",
     "get_pointer_wheel",
     "is_pointer_down",
     "get_touch_count",
@@ -1499,6 +1585,12 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "get_param_text",
     "curve_eval",
     "vcam_activate",
+    "set_cursor",
+    "request_quit",
+    "stat_available",
+    "stat_set",
+    "stat_get",
+    "stat_flush",
 };
 
 void jce_script_install_generated_bindings(JceScript *s)
@@ -1543,6 +1635,7 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "is_action_pressed", l_jce_is_action_pressed);
     jce_script_register_binding(L, s, "get_axis", l_jce_get_axis);
     jce_script_register_binding(L, s, "get_pointer_delta", l_jce_get_pointer_delta);
+    jce_script_register_binding(L, s, "get_pointer_position", l_jce_get_pointer_position);
     jce_script_register_binding(L, s, "get_pointer_wheel", l_jce_get_pointer_wheel);
     jce_script_register_binding(L, s, "is_pointer_down", l_jce_is_pointer_down);
     jce_script_register_binding(L, s, "get_touch_count", l_jce_get_touch_count);
@@ -1605,6 +1698,12 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "get_param_text", l_jce_get_param_text);
     jce_script_register_binding(L, s, "curve_eval", l_jce_curve_eval);
     jce_script_register_binding(L, s, "vcam_activate", l_jce_vcam_activate);
+    jce_script_register_binding(L, s, "set_cursor", l_jce_set_cursor);
+    jce_script_register_binding(L, s, "request_quit", l_jce_request_quit);
+    jce_script_register_binding(L, s, "stat_available", l_jce_stat_available);
+    jce_script_register_binding(L, s, "stat_set", l_jce_stat_set);
+    jce_script_register_binding(L, s, "stat_get", l_jce_stat_get);
+    jce_script_register_binding(L, s, "stat_flush", l_jce_stat_flush);
     /* json_null: lightuserdata_sentinel — no register_binding call,
      * so no source regex can see it.
      * tests/middleware/script/test_jce_script_table_shape.c can. */

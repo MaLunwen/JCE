@@ -28,6 +28,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include "jce_yuv_convert.h"
+#include "jce_h264_planes.h"
 #include "os/core/jce_memory.h"
 
 #include <string.h>
@@ -85,6 +86,8 @@ static uint32_t avcc_to_annexb(const uint8_t *src, uint32_t src_bytes,
 
 struct JceH264Decoder {
     bool draining;
+    bool yuv_output;
+    JceH264Planes planes, pending_planes;
     ISVCDecoder *svc;
 
     uint8_t  *annexb_buf;     /* reusable conversion buffer */
@@ -256,9 +259,11 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
     uint8_t *yuv[3] = {0};
     DECODING_STATE ds;
 
-    if (!dec || !dec->svc || !avcc_sample || sample_bytes == 0)
+    if (!dec || !dec->svc || !avcc_sample || sample_bytes == 0 ||
+        (nal_length_size != 1 && nal_length_size != 2 && nal_length_size != 4))
         return false;
 
+    dec->planes.valid = false;
     dec->decode_calls++;
 
     /* Ensure Annex B buffer is large enough.
@@ -325,17 +330,23 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
         uint32_t fw = (uint32_t)buf_info.UsrData.sSystemBuffer.iWidth;
         uint32_t fh = (uint32_t)buf_info.UsrData.sSystemBuffer.iHeight;
         if (fw > 0 && fh > 0) {
-            uint32_t need = fw * fh * 4;
-            if (need > dec->rgba_cap) {
-                JCE_FREE(dec->rgba_buf);
-                dec->rgba_cap = need;
-                dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
-                if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
+            if (dec->yuv_output) {
+                if (!jce_h264_planes_copy(&dec->planes, yuv,
+                    buf_info.UsrData.sSystemBuffer.iStride[0],
+                    buf_info.UsrData.sSystemBuffer.iStride[1], fw, fh)) return false;
+            } else {
+                uint32_t need = fw * fh * 4;
+                if (need > dec->rgba_cap) {
+                    JCE_FREE(dec->rgba_buf);
+                    dec->rgba_cap = need;
+                    dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
+                    if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
+                }
+                jce_yuv420_to_rgba(yuv[0], buf_info.UsrData.sSystemBuffer.iStride[0],
+                                   yuv[1], buf_info.UsrData.sSystemBuffer.iStride[1],
+                                   yuv[2], buf_info.UsrData.sSystemBuffer.iStride[1],
+                                   dec->rgba_buf, fw, fh);
             }
-            jce_yuv420_to_rgba(yuv[0], buf_info.UsrData.sSystemBuffer.iStride[0],
-                               yuv[1], buf_info.UsrData.sSystemBuffer.iStride[1],
-                               yuv[2], buf_info.UsrData.sSystemBuffer.iStride[1],
-                               dec->rgba_buf, fw, fh);
             dec->output_timestamp = buf_info.uiOutYuvTimeStamp;
             dec->last_w = fw;
             dec->last_h = fh;
@@ -357,37 +368,52 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
             if (dw > 0 && dh > 0) {
                 if (have_frame) {
                     /* Both steps produced output — buffer drain as pending. */
-                    uint32_t pn = dw * dh * 4;
-                    if (pn > dec->pending_cap) {
-                        JCE_FREE(dec->pending_rgba);
-                        dec->pending_cap = pn;
-                        dec->pending_rgba = (uint8_t *)JCE_MALLOC(pn);
+                    if (dec->yuv_output) {
+                        if (!jce_h264_planes_copy(&dec->pending_planes, drain_yuv,
+                            drain_info.UsrData.sSystemBuffer.iStride[0],
+                            drain_info.UsrData.sSystemBuffer.iStride[1], dw, dh)) return false;
+                        dec->pending_timestamp = drain_info.uiOutYuvTimeStamp;
+                        dec->pending_w = dw; dec->pending_h = dh;
+                        dec->has_pending = true;
+                    } else {
+                        uint32_t pn = dw * dh * 4;
+                        if (pn > dec->pending_cap) {
+                            JCE_FREE(dec->pending_rgba);
+                            dec->pending_cap = pn;
+                            dec->pending_rgba = (uint8_t *)JCE_MALLOC(pn);
+                        }
+                        if (dec->pending_rgba) {
+                            jce_yuv420_to_rgba(
+                                drain_yuv[0], drain_info.UsrData.sSystemBuffer.iStride[0],
+                                drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
+                                drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
+                                dec->pending_rgba, dw, dh);
+                            dec->pending_timestamp = drain_info.uiOutYuvTimeStamp;
+                            dec->pending_w = dw;
+                            dec->pending_h = dh;
+                            dec->has_pending = true;
+                        }
                     }
-                    if (dec->pending_rgba) {
+                } else {
+                    /* Only drain produced output — use as primary result. */
+                    if (dec->yuv_output) {
+                        if (!jce_h264_planes_copy(&dec->planes, drain_yuv,
+                            drain_info.UsrData.sSystemBuffer.iStride[0],
+                            drain_info.UsrData.sSystemBuffer.iStride[1], dw, dh)) return false;
+                    } else {
+                        uint32_t need = dw * dh * 4;
+                        if (need > dec->rgba_cap) {
+                            JCE_FREE(dec->rgba_buf);
+                            dec->rgba_cap = need;
+                            dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
+                            if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
+                        }
                         jce_yuv420_to_rgba(
                             drain_yuv[0], drain_info.UsrData.sSystemBuffer.iStride[0],
                             drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
                             drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
-                            dec->pending_rgba, dw, dh);
-                        dec->pending_timestamp = drain_info.uiOutYuvTimeStamp;
-                        dec->pending_w = dw;
-                        dec->pending_h = dh;
-                        dec->has_pending = true;
+                            dec->rgba_buf, dw, dh);
                     }
-                } else {
-                    /* Only drain produced output — use as primary result. */
-                    uint32_t need = dw * dh * 4;
-                    if (need > dec->rgba_cap) {
-                        JCE_FREE(dec->rgba_buf);
-                        dec->rgba_cap = need;
-                        dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
-                        if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
-                    }
-                    jce_yuv420_to_rgba(
-                        drain_yuv[0], drain_info.UsrData.sSystemBuffer.iStride[0],
-                        drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
-                        drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
-                        dec->rgba_buf, dw, dh);
                     dec->output_timestamp = drain_info.uiOutYuvTimeStamp;
                     dec->last_w = dw;
                     dec->last_h = dh;
@@ -405,7 +431,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
 
     if (!have_frame) return false;
 
-    if (out_rgba)   *out_rgba   = dec->rgba_buf;
+    if (out_rgba)   *out_rgba   = dec->yuv_output ? NULL : dec->rgba_buf;
     if (out_width)  *out_width  = dec->last_w;
     if (out_height) *out_height = dec->last_h;
     return true;
@@ -419,8 +445,15 @@ bool jce_h264_decoder_drain_pending(JceH264Decoder *dec,
     if (!dec || !dec->has_pending) return false;
 
     dec->has_pending = false;
+    if (dec->yuv_output) {
+        JceH264Planes swap = dec->planes;
+        dec->planes = dec->pending_planes;
+        dec->pending_planes = swap;
+        dec->pending_planes.valid = false;
+        dec->last_w = dec->pending_w; dec->last_h = dec->pending_h;
+    }
     dec->output_timestamp = dec->pending_timestamp;
-    if (out_rgba)   *out_rgba   = dec->pending_rgba;
+    if (out_rgba)   *out_rgba   = dec->yuv_output ? NULL : dec->pending_rgba;
     if (out_width)  *out_width  = dec->pending_w;
     if (out_height) *out_height = dec->pending_h;
     return true;
@@ -433,6 +466,7 @@ bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
     uint8_t *yuv[3] = {0};
     uint32_t w, h, need;
     if (!dec || !dec->svc) return false;
+    dec->planes.valid = false;
     if (!dec->draining) {
         int ended = 1;
         if ((*dec->svc)->SetOption(dec->svc, DECODER_OPTION_END_OF_STREAM, &ended) != cmResultSuccess)
@@ -444,23 +478,44 @@ bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
     if (info.iBufferStatus != 1 || !yuv[0] || !yuv[1] || !yuv[2]) return false;
     w = (uint32_t)info.UsrData.sSystemBuffer.iWidth;
     h = (uint32_t)info.UsrData.sSystemBuffer.iHeight;
-    if (!w || !h || w > 4096u || h > 4096u) return false;
-    need = w * h * 4u;
-    if (need > dec->rgba_cap) {
-        uint8_t *pixels = JCE_REALLOC(dec->rgba_buf, need);
-        if (!pixels) return false;
-        dec->rgba_buf = pixels;
-        dec->rgba_cap = need;
+    if (!w || !h || w > INT_MAX || h > INT_MAX) return false;
+    if (!dec->yuv_output && (w > UINT32_MAX / h / 4u)) return false;
+    if (dec->yuv_output) {
+        if (!jce_h264_planes_copy(&dec->planes, yuv,
+            info.UsrData.sSystemBuffer.iStride[0],
+            info.UsrData.sSystemBuffer.iStride[1], w, h)) return false;
+    } else {
+        need = w * h * 4u;
+        if (need > dec->rgba_cap) {
+            uint8_t *pixels = JCE_REALLOC(dec->rgba_buf, need);
+            if (!pixels) return false;
+            dec->rgba_buf = pixels;
+            dec->rgba_cap = need;
+        }
+        jce_yuv420_to_rgba(yuv[0], info.UsrData.sSystemBuffer.iStride[0],
+            yuv[1], info.UsrData.sSystemBuffer.iStride[1], yuv[2],
+            info.UsrData.sSystemBuffer.iStride[1], dec->rgba_buf, w, h);
     }
-    jce_yuv420_to_rgba(yuv[0], info.UsrData.sSystemBuffer.iStride[0],
-        yuv[1], info.UsrData.sSystemBuffer.iStride[1], yuv[2],
-        info.UsrData.sSystemBuffer.iStride[1], dec->rgba_buf, w, h);
     dec->last_w = w;
     dec->last_h = h;
     dec->output_timestamp = info.uiOutYuvTimeStamp;
-    if (out_rgba) *out_rgba = dec->rgba_buf;
+    if (out_rgba) *out_rgba = dec->yuv_output ? NULL : dec->rgba_buf;
     if (out_width) *out_width = w;
     if (out_height) *out_height = h;
+    return true;
+}
+
+void jce_h264_decoder_set_yuv_output(JceH264Decoder *dec, bool enabled)
+{
+    if (dec && (!dec->decode_calls || dec->yuv_output == enabled)) {
+        dec->yuv_output = enabled; dec->planes.valid = false;
+    }
+}
+
+bool jce_h264_decoder_get_yuv(const JceH264Decoder *dec, JceYuv420Frame *out)
+{
+    if (!dec || !out || !dec->yuv_output || !dec->planes.valid) return false;
+    *out = dec->planes.frame;
     return true;
 }
 
@@ -479,6 +534,7 @@ void jce_h264_decoder_flush(JceH264Decoder *dec)
     if (!dec || !dec->svc) return;
 
     dec->has_pending = false;
+    dec->planes.valid = dec->pending_planes.valid = false;
     dec->draining = false;
 
     /* Uninit and re-init to flush all internal state. */
@@ -519,10 +575,16 @@ void jce_h264_decoder_close(JceH264Decoder *dec)
     JCE_FREE(dec->annexb_buf);
     JCE_FREE(dec->rgba_buf);
     JCE_FREE(dec->pending_rgba);
+    JCE_FREE(dec->planes.bytes); JCE_FREE(dec->pending_planes.bytes);
     JCE_FREE(dec);
 }
 
 #else /* !JCE_ENABLE_PATENTED_CODECS */
+
+void jce_h264_decoder_set_yuv_output(JceH264Decoder *dec, bool enabled)
+{ (void)dec; (void)enabled; }
+bool jce_h264_decoder_get_yuv(const JceH264Decoder *dec, JceYuv420Frame *out)
+{ (void)dec; (void)out; return false; }
 
 JceH264Decoder *jce_h264_decoder_open(const void *avcc, uint32_t avcc_bytes)
 { (void)avcc; (void)avcc_bytes; return (JceH264Decoder *)0; }

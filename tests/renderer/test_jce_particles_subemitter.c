@@ -535,9 +535,73 @@ static void test_large_workload_uses_available_workers_without_loss(void)
     }
 }
 
+static void assert_authored_origin(const JceParticleView *particle, void *user)
+{
+    (void)user;
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 17.0f, particle->position.x);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 9.0f, particle->position.y);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, -4.0f, particle->position.z);
+}
+
+static void test_authored_burst_waits_for_start_and_origin_once(void)
+{
+    JceParticleSystem *sys = jce_particles_create(jce_allocator_default());
+    TEST_ASSERT_NOT_NULL(sys);
+    JceParticleEmitterDesc desc;
+    jce_particles_desc_default(&desc);
+    desc.max_particles = 64;
+    desc.emit_rate = 0;
+    desc.emit_burst = 256;
+    desc.lifetime_min = desc.lifetime_max = 1000;
+    desc.velocity_min = desc.velocity_max = jce_v3(0, 0, 0);
+    desc.gravity = jce_v3(0, 0, 0);
+    JceEmitterHandle emitter = jce_particles_emitter_add(sys, &desc);
+    jce_particles_emitter_stop(sys, emitter);
+    jce_particles_update(sys, 0.016666f);
+    TEST_ASSERT_EQUAL_UINT32(0, jce_particles_alive_count(sys));
+    jce_particles_emitter_set_position(sys, emitter, jce_v3(17, 9, -4));
+    jce_particles_emitter_start(sys, emitter);
+    jce_particles_update(sys, 0.016666f);
+    TEST_ASSERT_EQUAL_UINT32(64, jce_particles_alive_count(sys));
+    jce_particles_emitter_for_each(sys, emitter, assert_authored_origin, NULL);
+    jce_particles_emitter_stop(sys, emitter);
+    jce_particles_update(sys, 1001);
+    TEST_ASSERT_EQUAL_UINT32(0, jce_particles_alive_count(sys));
+    jce_particles_emitter_start(sys, emitter);
+    jce_particles_update(sys, 0.016666f);
+    TEST_ASSERT_EQUAL_UINT32(0, jce_particles_alive_count(sys));
+    jce_particles_emitter_burst(sys, emitter, 3);
+    TEST_ASSERT_EQUAL_UINT32(3, jce_particles_alive_count(sys));
+    jce_particles_destroy(sys);
+}
+
+static void test_authored_burst_rejects_nonfinite_and_rounds_bounded(void)
+{
+    const float inputs[] = {-1, NAN, INFINITY, -INFINITY, 0, 0.49f, 0.5f, 3.6f};
+    const uint32_t expected[] = {0, 0, 0, 0, 0, 0, 1, 4};
+    for (unsigned i = 0; i < sizeof(inputs) / sizeof(inputs[0]); ++i) {
+        JceParticleSystem *sys = jce_particles_create(jce_allocator_default());
+        TEST_ASSERT_NOT_NULL(sys);
+        JceParticleEmitterDesc desc;
+        jce_particles_desc_default(&desc);
+        desc.max_particles = 64;
+        desc.emit_rate = 0;
+        desc.emit_burst = inputs[i];
+        desc.lifetime_min = desc.lifetime_max = 1000;
+        JceEmitterHandle emitter = jce_particles_emitter_add(sys, &desc);
+        jce_particles_update(sys, 0.01f);
+        TEST_ASSERT_EQUAL_UINT32(expected[i], jce_particles_emitter_alive_count(sys, emitter));
+        jce_particles_update(sys, 0.01f);
+        TEST_ASSERT_EQUAL_UINT32(expected[i], jce_particles_emitter_alive_count(sys, emitter));
+        jce_particles_destroy(sys);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_authored_burst_waits_for_start_and_origin_once);
+    RUN_TEST(test_authored_burst_rejects_nonfinite_and_rounds_bounded);
     RUN_TEST(test_no_subemitter_unaffected);
     RUN_TEST(test_death_event_position);
     RUN_TEST(test_subemitter_spawn_on_death);

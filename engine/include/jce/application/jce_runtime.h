@@ -501,6 +501,16 @@ JCE_API void        JCE_CALL jce_runtime_set_input(JceRuntime *rt,
 JCE_API void        JCE_CALL jce_runtime_set_pointer_input(
     JceRuntime *rt, float dx, float dy, float wheel, uint32_t buttons);
 
+/** Submit viewport-local pointer coordinates and logical viewport size for
+ * this frame. Main-thread only; copied, cleared after step. Invalid/nonfinite
+ * values or nonpositive dimensions clear the sample. NULL runtime is a no-op. */
+JCE_API void JCE_CALL jce_runtime_set_pointer_position(
+    JceRuntime *rt, float x, float y, float width, float height);
+
+/* Reapply the active script-owned cursor. Main-thread; false when no custom
+ * cursor is selected. A viewport host uses this when arbitrating UI cursors. */
+JCE_API bool JCE_CALL jce_runtime_apply_cursor(JceRuntime *rt);
+
 /* Replace the current frame's touch sample without disturbing movement or
  * pointer state.  At most JCE_RUNTIME_MAX_TOUCHES finite samples are kept in
  * stable input order; NULL/zero releases all touches. */
@@ -869,6 +879,21 @@ JCE_API JceGameplayAbilitySystem *JCE_CALL jce_runtime_entity_gas(JceRuntime *rt
  * ragdolls.  Acting on the handle requires the internal jce_ragdoll.h. */
 JCE_API JceRagdoll *JCE_CALL jce_runtime_entity_ragdoll(JceRuntime *rt,
                                                         uint64_t entity);
+
+/* Optional borrowed platform service. Main-thread setter; NULL disables stats.
+ * Host keeps it alive until detached or runtime destruction. No automatic store,
+ * flush or shutdown is performed by the runtime. */
+struct JcePlatformServices;
+/* Same constructor as create, with a borrowed service installed BEFORE script
+ * on_start. Desc layout and legacy constructor behavior are unchanged. The
+ * service must outlive this runtime; failed creation leaves ownership to host. */
+JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_platform_services(
+    const JceRuntimeDesc *desc, struct JcePlatformServices *services);
+JCE_API void JCE_CALL jce_runtime_set_platform_services(JceRuntime *rt,
+                                                       struct JcePlatformServices *services);
+/* Script request latch. Host consumes only after callbacks return: standalone
+ * may exit; an editor stops its simulation. NULL returns false. */
+JCE_API bool JCE_CALL jce_runtime_quit_requested(const JceRuntime *rt);
 
 JCE_EXTERN_C_END
 #endif /* JCE_APPLICATION_RUNTIME_H */

@@ -112,12 +112,9 @@ target_include_directories(JCE_Editor PRIVATE
 # ------------------------------------------------------------------ #
 option(JCE_EDITOR_STANDALONE
     "Build a native single editor executable with embedded scripting runtimes" OFF)
-if(JCE_EDITOR_STANDALONE)
-    if(NOT JCE_PLATFORM_WINDOWS OR NOT MSVC)
-        message(FATAL_ERROR "JCE_EDITOR_STANDALONE currently requires Windows/MSVC")
-    endif()
-    if(NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "MultiThreaded" OR
-       CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+if(JCE_EDITOR_STANDALONE OR JCE_DELIVERY_PROFILE STREQUAL "embedded")
+    if(MSVC AND (NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "MultiThreaded" OR
+       CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL"))
         message(FATAL_ERROR
             "Standalone editor requires static CRT for the entire dependency graph; "
             "use scripts/jce.py editor --standalone --variant dist")
@@ -128,6 +125,7 @@ if(JCE_EDITOR_STANDALONE)
     # project module supplies its own call-down ABI. Verify actual PE imports.
     jce_script_enable(JCE_Editor LANGUAGES c cpp js REQUIRED NO_STAGE)
     # Carry distribution notices in the native file, without sidecar dependencies.
+    if(WIN32)
     enable_language(RC)
     set(_jce_standalone_notices "${CMAKE_CURRENT_BINARY_DIR}/standalone_notices.rc")
     file(GENERATE OUTPUT "${_jce_standalone_notices}" CONTENT
@@ -135,6 +133,7 @@ if(JCE_EDITOR_STANDALONE)
     target_sources(JCE_Editor PRIVATE "${_jce_standalone_notices}")
     set_source_files_properties("${_jce_standalone_notices}" PROPERTIES
         OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/LICENSE;${PROJECT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md")
+    endif()
 
 else()
     jce_script_enable(JCE_Editor)
@@ -235,10 +234,18 @@ if(NOT MSVC)
 	target_compile_options(JCE_Editor PRIVATE -fno-omit-frame-pointer)
 endif()
 
+set(JCE_EDITOR_ARTIFACT_DIR "" CACHE PATH "Optional editor runtime output directory")
+set(_jce_editor_output "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
+if(JCE_EDITOR_ARTIFACT_DIR)
+	get_filename_component(_jce_editor_output "${JCE_EDITOR_ARTIFACT_DIR}"
+		ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+endif()
 set_target_properties(JCE_Editor PROPERTIES
 	OUTPUT_NAME jce_editor
-	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
-	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
+	RUNTIME_OUTPUT_DIRECTORY "${_jce_editor_output}"
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/symbols/$<CONFIG>"
+	COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/symbols/$<CONFIG>")
 
 # Dist builds on Windows: GUI subsystem (no console window).
 if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
@@ -270,13 +277,15 @@ endif()
 
 # ── Dist SHA-256 hash ──
 # The dist binary's SHA-256 is the per-artifact integrity/identity record
-# (shown in the About dialog and copied by package-editor.bat).  Different
-# architectures have different binaries (different SHAs) by design.
+# retained with build reports rather than required beside the executable.
+# Different architectures have different binaries (different SHAs) by design.
 if(JCE_BUILD_VARIANT STREQUAL "dist")
+	set_property(TARGET JCE_Editor APPEND PROPERTY LINK_DEPENDS
+		"${CMAKE_SOURCE_DIR}/tools/write_sha256.cmake")
 	add_custom_command(TARGET JCE_Editor POST_BUILD
 		COMMAND ${CMAKE_COMMAND}
 			-DFILE=$<TARGET_FILE:JCE_Editor>
-			-DOUT=$<TARGET_FILE_DIR:JCE_Editor>/jce_editor_sha256.txt
+			-DOUT=${CMAKE_BINARY_DIR}/reports/artifacts/${JCE_BUILD_VARIANT}/jce_editor_sha256.txt
 			-P "${CMAKE_SOURCE_DIR}/tools/write_sha256.cmake"
 		COMMENT "Computing SHA-256 hash for jce_editor"
 		VERBATIM)

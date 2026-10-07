@@ -1,5 +1,9 @@
 /* jce_tcp.c -- minimal blocking TCP with millisecond deadlines.
  * Platform symbols are confined to this TU (winsock2 / BSD sockets). */
+/* Feature selection must precede every header under strict ISO C99. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200112L
+#endif
 #include <jce/os/platform/jce_tcp.h>
 
 #include <jce/os/core/jce_alloc.h>

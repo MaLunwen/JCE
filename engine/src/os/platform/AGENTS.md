@@ -2,6 +2,10 @@
 
 > Platform abstraction. Everything OS-specific belongs HERE (and nowhere else).
 
+The TCP adapter selects POSIX.1-2001 declarations before including any header
+on Unix hosts; this keeps getaddrinfo available with strict C99 compilation.
+Existing caller-selected feature levels are preserved.
+
 ## Identity
 
 - **Layer**: L2 (Platform). Sits next to `os/core`; depends on it. C99 (with one `.c` per-platform subdir when needed; see `macos/`).
@@ -149,3 +153,11 @@ directory; bare system names retain normal search. Never change process-wide
 DLL directories to load a project plugin. Other hosts use SDL's loader.
 The first-party test_jce_library fixture keeps a real dependency beside its
 module, outside the executable directory, and checks independent references.
+
+SDL button events publish a zero-displacement position sample before the button state, so a click without prior motion cannot use stale coordinates. A one-record translation buffer prioritizes button delivery. No new input wire fields are needed.
+
+SDL gameplay input translation ingests each physical pointer stream once: discard SDL_TOUCH_MOUSEID mouse mirrors and SDL_MOUSE_TOUCHID finger mirrors before emission. Raw window/application event dispatch remains independent, retaining synthetic pointer events for mouse-only UI. Preserve ordinary mouse button coordinates and real touch phases; test mirror rejection alongside both ordinary channels and verify actual browser gestures plus touch UI.
+
+The public jce_input_primary_pointer query supplies logical-surface mouse or primary-touch coordinates and down state without merging their gameplay channels. Touch release preserves its final coordinate for pointer-only UI; live and replay paths share this state. Default Canvas UI uses this query. Invalid surface/output arguments do not modify outputs.
+
+Web SDL touch events use inclusive pixel endpoints. The live SDL adapter converts them to neutral logical-surface normalization using the event window size; the pure translator and replay remain backend-independent. Do not compensate per project or alter physical mouse coordinates. Verify subpixel gesture trajectories against actual browser client coordinates.

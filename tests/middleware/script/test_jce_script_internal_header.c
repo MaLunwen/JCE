@@ -112,10 +112,10 @@ static void test_the_one_binding_set_builds_the_whole_jce_table(void)
     lua_pop(g->L, 1);
     jce_script_destroy(g);
 
-    /* 110: the 101 generated bindings + 8 hand-written + json_null.  A count and
+    /* 117: the 108 generated bindings + 8 hand-written + json_null.  A count and
      * not a list here on purpose -- test_jce_script_table_shape.c owns the
      * list, and two copies of it is two things to update. */
-    TEST_ASSERT_EQUAL_INT(110, keys);
+    TEST_ASSERT_EQUAL_INT(117, keys);
 }
 
 int main(void)

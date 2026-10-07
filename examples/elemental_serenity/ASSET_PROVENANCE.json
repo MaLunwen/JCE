@@ -1,0 +1,742 @@
+{
+  "schema": 1,
+  "upstream": "https://github.com/SahilK-027/Elemental-Serenity",
+  "reference_head_observed": "6b8cebefa0ee10e1bdd081dd342a01b3fe753e09",
+  "reference_head_scope": "current official HEAD observed2026-10-06, NOT the revision of the supplied source snapshot",
+  "snapshot_git_revision": null,
+  "snapshot_license_sha256": "1f84f66430f546698ed98a2540dd73491e37dcffe2aa54f7bf166907754e0274",
+  "license_notice": "MIT copyright2026 Sahil K; retain UPSTREAM_NOTICE. No separate per-asset notices found in bounded public/src text audit; third-party authorship is not independently attested.",
+  "font_policy": "Portable staging excludes fonts; exporter rejects font paths in actual output dependency manifest. Default host font is selected.",
+  "assets": [
+    {
+      "path": "models/bridge.glb",
+      "sha256": "ef5819e5cabf0ebd8ceaa5c8682a9108fadf10850a347e755424947d0dd9b778",
+      "bytes": 369268,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/bridge.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/bridge.glb": "0bcea5872b72836a51913a8974d840891aa3e78e1717053d420a5cc0d664e769"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/bushEmitter.glb",
+      "sha256": "da4c6f20928ca9b226d51f21e716f489043d4bf517aa4c6019bbedf0a2a13848",
+      "bytes": 7364,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/bushEmitter.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/bushEmitter.glb": "7d46e74651b71bf65aed81bf22f119278b30baf700f36c9bd348c79c6be24690"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/camp.glb",
+      "sha256": "8c9941b3c0b1ded4bf359abeced38306151d6e72d4c1888e4eae51ed164efb64",
+      "bytes": 107020,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/camp.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/camp.glb": "a24d3fc2bc55463009a0b2da4af8fcd39818bb4d53a3d417d955348f7cc1cb03"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/card.glb",
+      "sha256": "013d892edbe3ca55538dfdc11640781ff6df309b552e774e25bcba617fa9aa98",
+      "bytes": 1196,
+      "classification": "JCE_PROCEDURAL_GEOMETRY",
+      "reference_paths": [
+        "tools/gen_ground.py"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "models/grass_blade.glb",
+      "sha256": "e23caf81b76222851ca3091e9ce212e1110623d98c40c267305a0ac8e4f9a29e",
+      "bytes": 1132,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/grass_blade.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/grass_blade.glb": "8335033073db9a9ad7ae936b219c878a833a37b343408e630af5693b53c5e72f"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/ground_plane.glb",
+      "sha256": "2373175e30dbcc4ec6306fa347e756dee5b5b7ed9c3a1e7b42d3f974231f4b50",
+      "bytes": 1376,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "models/ground_plane55.glb",
+      "sha256": "9d54818a9df586108c9b3f31b9237f20bdc3a6fd59af938f93beb9592cb50383",
+      "bytes": 1376,
+      "classification": "JCE_PROCEDURAL_GEOMETRY",
+      "reference_paths": [
+        "tools/gen_ground.py"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "models/leaf.glb",
+      "sha256": "6a1ddc30823677507a515822c5b74e7327d8034c4f7d4d6e92f816432f321400",
+      "bytes": 1772,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/leaf.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/leaf.glb": "3aa6d1f133473b8f1c315043fa99f1ef17806b412a458e55869b5514426c2327"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/rocks.glb",
+      "sha256": "46e9adf814c875366c1f56cd216d73f461c903bd09003a54bfc139876d75a236",
+      "bytes": 106692,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/rocks.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/rocks.glb": "f70adf99656be67693be449e17847979db1eb49c99fd4addfd263f4e55b94767"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/tent.glb",
+      "sha256": "b700f67e61e63b90e67cdcde55e77cde7bdb955bc6061af12a13d15506d1a78c",
+      "bytes": 352396,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/tent.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/tent.glb": "b3bf77f44f27c8223d061d59f61280488a4cc7934e3f41a90ae23fba792eefbe"
+      },
+      "conversion_evidence": {
+        "asset_generator": "jce-indexed-glb",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "models/treeTrunks.glb",
+      "sha256": "87da6f7347671bbf88cd20763623cf4a905f60cdd307a97249bb6141577db055",
+      "bytes": 221440,
+      "classification": "UPSTREAM_DERIVED_MODEL",
+      "reference_paths": [
+        "public/models/treeTrunks.glb"
+      ],
+      "source_same_name_sha256": {
+        "public/models/treeTrunks.glb": "e7067a0faefefbe3cc500e7d02f5855570bdd98f9b29f424752e8bf9319c1767"
+      },
+      "conversion_evidence": {
+        "asset_generator": "Open Asset Import Library (assimp v6.0.0)",
+        "first_party_writer": "engine/src/resource/jce_bundle_mesh_convert.cpp:844",
+        "scope": "same upstream basename and authored reference scene, first-party conversion output; source snapshot revision unavailable, no claim of exact geometric identity"
+      }
+    },
+    {
+      "path": "textures/bush/leave_alpha_map_256x256.png",
+      "sha256": "f47bde82bb9808d5325823b74071f3133a93fef90527e7dca62e7b3f63ad97c3",
+      "bytes": 38612,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/bush/leave_alpha_map_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/fire/fire_256x256.png",
+      "sha256": "8441792fa311cc3bb5627506a89c8d10b0dd8c1402789a0703eae410aca8bff9",
+      "bytes": 17726,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/fire/fire_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/fire/smoke_256x256.png",
+      "sha256": "d80820691617f29c04856fb97cebc80fb2ba6f46d7733ff4a0a4fdcfa791796d",
+      "bytes": 26477,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/fire/smoke_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/flowers/flower_1_128x128.png",
+      "sha256": "3926f9c51992fa2a2b916d16acf92be9f96bb4a3e5a3be0f9c2fd6b780532866",
+      "bytes": 4503,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/flowers/flower_1_128x128.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/flowers/flower_2_128x128.png",
+      "sha256": "dc6922c45b74d4bb738fa4271181b371a4c1b4a66c26157b49e034d9aa798009",
+      "bytes": 13883,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/flowers/flower_2_128x128.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/grass/displaced_normals_256x256.png",
+      "sha256": "be18fb8b07008c7d2c5723033c5b394213b20c130eb5713f8bce35143a6a705d",
+      "bytes": 93083,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/grass/displaced_normals_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/grass/displacement_map_256x256.png",
+      "sha256": "9ffa166dcb9154e9f5438dec81d4a44eec76750450b25a6110710b729bc33d76",
+      "bytes": 37517,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/grass/displacement_map_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/grass/displacement_map_blur_256x256.png",
+      "sha256": "cf46390f1add6eccf9166dc1af037dfa05551ce419c037f6a600d0d93c51fb8f",
+      "bytes": 70982,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/grass/displacement_map_blur_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/grass/path_data_mask.bin",
+      "sha256": "745e8eb8d238eeb53558d650d152fff5fe639c15fcee3a43ee1e9a3df64720d3",
+      "bytes": 64063,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/grass/path_data_rgb_768x768.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/grass/path_data_rgb_768x768.png",
+      "sha256": "745e8eb8d238eeb53558d650d152fff5fe639c15fcee3a43ee1e9a3df64720d3",
+      "bytes": 64063,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/grass/path_data_rgb_768x768.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground/rocks_ao_256x256.png",
+      "sha256": "abf0815d2b35ec575e335c7bd4a4c69f162df0196aaaa7592f24b2415ebe1e97",
+      "bytes": 46162,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/ground/rocks_ao_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground/rocks_height_256x256.png",
+      "sha256": "fcf00876ae5ae1bd62a1ea12b105c55ed09271d0dad87c0a007beb5099eab886",
+      "bytes": 26596,
+      "classification": "UPSTREAM_U16_TO_U8_HEIGHT",
+      "reference_paths": [
+        "public/textures/ground/rocks_height_256x256.png"
+      ],
+      "source_same_name_sha256": {
+        "public/textures/ground/rocks_height_256x256.png": "780fd23f0ddd1f200a0d5ad015b15c0f74af9be2a7a4be577f317c4130a93b2b"
+      },
+      "transform": "All65536 decoded target values exactly equal upstream16-bit sample >>8; dimensions256x256"
+    },
+    {
+      "path": "textures/ground_baked/autumn_day.png",
+      "sha256": "c91cacd7d486e2c28b082d9b9e735471e86faaec5c62e3f75827c0ebf55f8d8a",
+      "bytes": 231498,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/autumn_night.png",
+      "sha256": "7859dbfda84d4295a603f4c3deb6430566f48fa3f947a73fafc26e58987cd7ed",
+      "bytes": 232629,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/rainy_day.png",
+      "sha256": "a79ac9bd2951729c3886579e9ba15bf5109770ec8724a62d2748fe1ec045a3fa",
+      "bytes": 265006,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/rainy_night.png",
+      "sha256": "5ec725e44cfea8d02f3df0179f65a3757116e32695254440ad9afd93ef43f761",
+      "bytes": 215417,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/spring_day.png",
+      "sha256": "607180f8c93cc9de7caf6d73777c0d32e073c3b631a60cf962b2717152c517d5",
+      "bytes": 257353,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/spring_night.png",
+      "sha256": "6c81aaa3d120e72f54c34da88646f15aaabd077233f9f56ba9d9b2d569357f8b",
+      "bytes": 246379,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/winter_day.png",
+      "sha256": "b796364fc01889e3c36c80a3b2ad8132b295ef005d55829be566ee31a37b7df6",
+      "bytes": 215083,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked/winter_night.png",
+      "sha256": "c9fbc3c3d7144d9ccbdbff01555d3b5eb9ce5e94a3c1ea10388b0171ffcecbf0",
+      "bytes": 190012,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/ground_baked2/autumn_day.png",
+      "sha256": "fe828e56808894e9e49bacd8d9232bf4bd2364b5d9925bf79bc06f83d01a5af9",
+      "bytes": 605121,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/autumn_night.png",
+      "sha256": "aadcc473b2f3a4092a8bca788b92a1c9d0ddfb2f7dbe1df55ef68e0e743753c1",
+      "bytes": 592510,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/rainy_day.png",
+      "sha256": "f8179718a02bbc6cb1926896df15d94a8bada8f2ccfd99fe1bd20f44c0b65d5b",
+      "bytes": 737961,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/rainy_night.png",
+      "sha256": "d55244e4500e55834f2fc7fc513582416f07b242f8b21ca6908569b764c96a3e",
+      "bytes": 577816,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/spring_day.png",
+      "sha256": "cf561d04b535377d64d5d150926229e455e396e9835e4f0132d68d6acdcffc25",
+      "bytes": 697152,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/spring_night.png",
+      "sha256": "d4f0132400069263994063f4cb53fc0e1776d625c7aba45f25ff326cb28a9530",
+      "bytes": 658976,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/winter_day.png",
+      "sha256": "230c74c748811aa7b156d41880d47d697f8c646ea4cf329d1eb3d952666825f7",
+      "bytes": 660935,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/ground_baked2/winter_night.png",
+      "sha256": "bfa493d7859c3e8a6eb4fa996ad350d810bb479a068999c01b7ca72b85b4cec4",
+      "bytes": 492576,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/noises/perlin_noise_256x256.png",
+      "sha256": "d26386c08b6886e7343ac532d18bfeaaf889e50b081576405364c68feabd4661",
+      "bytes": 50718,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/noises/perlin_noise_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/particles/particle_256x256.jpg",
+      "sha256": "b428e20e7ad65e388bca2fbb4f76729f8b533279c9dd2604932ebe000eea8272",
+      "bytes": 2527,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/particles/particle_256x256.jpg"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/particles/particle_alpha_map_256x256.png",
+      "sha256": "c7c7f25bc3d54dce78ba981d63b80408f5eb6c9bdd591028c2c1ab7a035f94ea",
+      "bytes": 10476,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/particles/particle_alpha_map_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/water/water_depth_map_256x256.png",
+      "sha256": "50ae2aa72bcbb4ee180a15d6f5dda63f2ab947eba93323e8805facd4925f9807",
+      "bytes": 2289,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/water/water_depth_map_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/water_data.png",
+      "sha256": "970124c03713911a87fa1f57493d3371c88656889672577146b1c540650b000c",
+      "bytes": 10899,
+      "classification": "SOURCE_NOT_YET_IDENTIFIED",
+      "reference_paths": [],
+      "source_same_name_sha256": {},
+      "delivery_policy": "EXCLUDE_LEGACY_UNUSED_FROM_PORTABLE_STAGING; current selected scene/director do not reference this path"
+    },
+    {
+      "path": "textures/water_data2.png",
+      "sha256": "77fa2e775fcb3cfed62730d4903afe80a5e3a0f5b123c30d9e3b4045fe73dbcd",
+      "bytes": 14103,
+      "classification": "JCE_BAKED_REFERENCE_PALETTE",
+      "reference_paths": [
+        "tools/bake_ground.py",
+        "tools/es_palettes.json"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/wood/wood_ao_256x256.png",
+      "sha256": "980e5392f69cf78df0bed1de4a8e2ffaf4be5014cd08649429c5053982f42a95",
+      "bytes": 60604,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/wood/wood_ao_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/wood/wood_color_256x256.png",
+      "sha256": "0961eabc062beae1b9756bc7b55188d6e971f34979e00ddfcaff2bce4e4cb768",
+      "bytes": 63577,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/wood/wood_color_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/wood/wood_color_r_256x256.png",
+      "sha256": "014c979b9ca13096680bcc75bea59cfb9a3f6001f9349d055242f3b7af357293",
+      "bytes": 66978,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/wood/wood_color_r_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "textures/wood/wood_normal_256x256.png",
+      "sha256": "d6e2b36ee84cef4139ec139393e8e5709c7ddd4fa19abef63ecb7f4dcc2be06c",
+      "bytes": 79819,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/textures/wood/wood_normal_256x256.png"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/musics/forest_dreams.mp3",
+      "sha256": "1d6dd65b0b45a9a56ae2fb8db661d8ac3c15adbfd3d8a79e66de1e892cd34371",
+      "bytes": 961626,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/musics/forest_dreams.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/musics/morning_petals.mp3",
+      "sha256": "0e46c36a2ecd57b992fb1ee891c543b6b847c1eeabeed329f3e7756ffd010c0f",
+      "bytes": 962881,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/musics/morning_petals.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/musics/window_light.mp3",
+      "sha256": "41a72de19fd0f63ebffa0a1bfd8306c2ec5b6dcf5806fdb751a859b950e35a34",
+      "bytes": 953272,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/musics/window_light.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/birds/birds_1.mp3",
+      "sha256": "7c8a08cee2a448bffc6926f18fed37da8bbbecbf063191dfe4afb101e806cf0d",
+      "bytes": 67709,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/birds/birds_1.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/birds/birds_2.mp3",
+      "sha256": "f90d9a45a4ea1c6f176038c920e0f2e5e5072084257e7826722386a474db0be0",
+      "bytes": 14047,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/birds/birds_2.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/birds/birds_3.mp3",
+      "sha256": "a3abb6d391f858ac6b04fdefcbfa55e45f1167d3fbf2c5c9fca694a1998f7075",
+      "bytes": 13551,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/birds/birds_3.mp3",
+        "public/audio/sounds/birds/birds_4.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/birds/birds_4.mp3",
+      "sha256": "a3abb6d391f858ac6b04fdefcbfa55e45f1167d3fbf2c5c9fca694a1998f7075",
+      "bytes": 13551,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/birds/birds_3.mp3",
+        "public/audio/sounds/birds/birds_4.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/crickets/crickets.mp3",
+      "sha256": "4b6a8950c688f89fce7909eeccf6c3e936ca361f35cbdee32f1b8f9729d60a2e",
+      "bytes": 70381,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/crickets/crickets.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/fire/fire_burning.mp3",
+      "sha256": "1792afc7dddfa6fcbb715363187ab07a6f100176ceac354d293ae975038f3adc",
+      "bytes": 125610,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/fire/fire_burning.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/owl/owl_hooting.mp3",
+      "sha256": "aab98b7d6f7c60f37cefc03c88339077406ac41a8f3fddb0921c95910c237fbc",
+      "bytes": 114520,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/owl/owl_hooting.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/owl/owl_howling.mp3",
+      "sha256": "b276f0c40ea0d8d3116c437266e66695989d2dee827894db16433a82f1c5e773",
+      "bytes": 17142,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/owl/owl_howling.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/rain/rain.mp3",
+      "sha256": "764838782599a810e2f719b010b943c15eb2d86f703f57cb505b296653a6a26f",
+      "bytes": 149788,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/rain/rain.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/thunder/distant/thunder_distant.mp3",
+      "sha256": "5831ccdda15e90e87f5968bc12f322fd43fc0ce165088f229076a83e0651fcde",
+      "bytes": 65358,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/thunder/distant/thunder_distant.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/thunder/near/thunder_strike.mp3",
+      "sha256": "7848d5b4a3a2ad9d9329d99ca4b171f4050f59dd16d5d2a2c30be4f5049461cf",
+      "bytes": 48860,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/thunder/near/thunder_strike.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/ui_interactions/click.mp3",
+      "sha256": "3754770702b7f8bd03d89c97c36f49cbeac618654ec1b02d33acc5979ec8be9d",
+      "bytes": 3436,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/ui_interactions/click.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/ui_interactions/hover.mp3",
+      "sha256": "e6ad3cc75310d84da370651374d7780a7d2a4185c9fd5f2779ef3f2b7ebdc155",
+      "bytes": 2704,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/ui_interactions/hover.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/waves/lake_waves.mp3",
+      "sha256": "fd2a98b30156885da6a06f5ce3c3361dbce262b8df7ca5ee6de38f725b29d47b",
+      "bytes": 288833,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/waves/lake_waves.mp3"
+      ],
+      "source_same_name_sha256": {}
+    },
+    {
+      "path": "audio/sounds/wolf/wolf_howling.mp3",
+      "sha256": "47fb24dfeed6b749b02337d051174ee98356c2145c2f4608b8704ea007020d53",
+      "bytes": 34272,
+      "classification": "UPSTREAM_EXACT_BYTES",
+      "reference_paths": [
+        "public/audio/sounds/wolf/wolf_howling.mp3"
+      ],
+      "source_same_name_sha256": {}
+    }
+  ]
+}

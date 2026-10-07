@@ -157,6 +157,9 @@ JCE_API bool    JCE_CALL jce_platform_stat_set(JcePlatformServices *svc,
 JCE_API int64_t JCE_CALL jce_platform_stat_get(JcePlatformServices *svc,
                                                const char *id, int64_t def);
 
+/* Declared stat/read/flush callback capability, not successful storage I/O. */
+JCE_API bool JCE_CALL jce_platform_stats_available(const JcePlatformServices *svc);
+
 /* ── Leaderboards ────────────────────────────────────────────────────────── */
 
 /* Submit `score` for `user` on `board`.  Keeps the highest score per user.

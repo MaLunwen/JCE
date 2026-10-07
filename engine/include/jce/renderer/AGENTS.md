@@ -19,6 +19,16 @@
    `JCE_EXTERN_C_BEGIN / _END`.
 
 ## Caps tiering (`jce_renderer_caps.h`)
+
+Optional compacted model survivor snapshots export the actual GPU counters,
+with dispatch identity and borrowed RGBA32F texture lifetime. Counts use exact
+low/high 16-bit float words. Consumers reuse typed asynchronous readback with
+explicit cull/snapshot/blit view ordering; fixed-count paths are unavailable.
+
+`jce_gpu_scene_set_indirect_enabled` selects compacted indirect or fixed-count
+model submission before a batch begins. Hardware/program capability remains
+separate from policy and actual dispatch readiness. Foliage owns its submission
+path independently; disabling model indirect must not claim missing support.
 - `JceGpuTier { LOW, MEDIUM, HIGH, ULTRA }` drives auto-quality scaling
   for shadows, post-FX, PBR, SSR, TAA, volumetric fog, GPU particles.
 - `jce_renderer_get_tier()` returns the **effective** tier after applying

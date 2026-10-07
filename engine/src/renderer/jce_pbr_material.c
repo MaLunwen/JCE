@@ -10,6 +10,7 @@
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_shaders.h>   /* backend suffix for graph blobs */
 #include <jce/renderer/jce_texture_types.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include "jce_renderer_internal.h"
 #include "os/core/jce_memory.h"
@@ -545,7 +546,9 @@ static void safe_copy(char *dst, size_t dst_sz, const char *src)
  * of the runtime cwd. */
 static bool material_path_exists(const JceFileSystem *fs, const char *path)
 {
-    return fs ? jce_fs_exists(fs, path) : jce_fs_host_exists_file(path);
+    if (fs ? jce_fs_exists(fs, path) : jce_fs_host_exists_file(path)) return true;
+    const JcePakArchive *engine = jce_shaders_embedded_engine_pak();
+    return strncmp(path,"shaders/",8)==0 && engine && jce_pak_find(engine,path)!=NULL;
 }
 
 static void resolve_sibling_path(const JceFileSystem *fs,
@@ -620,6 +623,22 @@ static void custom_blob_path(const JceFileSystem *fs, const char *mat_path,
     resolve_sibling_path(fs, mat_path, out, out_sz);
 }
 
+/* The explicit shaders/ namespace can reference shared engine stages. Project
+ * VFS bytes win; no arbitrary missing project asset falls back to engine art. */
+static void *custom_blob_read(const JceFileSystem *fs, const char *path, uint64_t *size)
+{
+    void *data=fs ? jce_fs_read_all(fs,path,size) : jce_fs_host_read_all(path,size);
+    if(data || strncmp(path,"shaders/",8)!=0) return data;
+    const JcePakArchive *engine=jce_shaders_embedded_engine_pak();
+    const JcePakAsset *asset=engine ? jce_pak_find(engine,path) : NULL;
+    if(!asset || !asset->original_size) return NULL;
+    data=JCE_MALLOC((size_t)asset->original_size);
+    if(!data) return NULL;
+    *size=jce_pak_decompress(asset,data,(size_t)asset->original_size);
+    if(!*size) { JCE_FREE(data); return NULL; }
+    return data;
+}
+
 static uint16_t load_custom_program(const JceFileSystem *fs,
                                     const char *mat_path,
                                     const char *vs_rel, const char *fs_rel)
@@ -657,10 +676,8 @@ static uint16_t load_custom_program(const JceFileSystem *fs,
     custom_blob_path(fs, mat_path, fs_rel, fs_path, sizeof(fs_path));
 
     uint64_t vs_sz = 0, fs_sz = 0;
-    void *vs_blob = fs ? jce_fs_read_all(fs, vs_path, &vs_sz)
-                       : jce_fs_host_read_all(vs_path, &vs_sz);
-    void *fs_blob = fs ? jce_fs_read_all(fs, fs_path, &fs_sz)
-                       : jce_fs_host_read_all(fs_path, &fs_sz);
+    void *vs_blob = custom_blob_read(fs,vs_path,&vs_sz);
+    void *fs_blob = custom_blob_read(fs,fs_path,&fs_sz);
     uint16_t prog = UINT16_MAX;
     if (vs_blob && fs_blob && vs_sz > 0 && fs_sz > 0) {
         JceShaderHandle h = jce_renderer_create_program_from_blobs(

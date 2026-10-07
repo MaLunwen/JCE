@@ -13,6 +13,7 @@
  * renderer + resource layers; middleware dependency is an implementation detail.
  */
 
+#include "jce_sr_nodraw.h"
 #include "jce_terrain_cache.h"
 #include "jce_sr_internal.h"
 #include "jce_sr_portal.h"
@@ -520,71 +521,6 @@ bool sr_is_gltf_model_path(const char *path)
     return sr_ends_with_ci(path, ".gltf") || sr_ends_with_ci(path, ".glb");
 }
 
-/* Fix #1: one-shot per-entity render-kind classification (see SrEntityCull /
- * SR_RK_*).  Called ONCE per entity per frame in the ecull build region so the
- * color/shadow/depth-velocity passes read ecull[i].render_kind instead of each
- * re-running this same has_* dispatch ladder.  CONSERVATIVE: any diverting
- * component → SR_RK_OTHER, so the pass falls back to its full (unchanged) ladder
- * — only a provably-plain primitive mesh gets the fast path. */
-static void sr_classify_entity(JceScene *scene, JceEntity e, SrEntityCull *ec)
-{
-    ec->parallel_eligible = false;
-    ec->kc_enabled = entity_enabled(scene, e);
-    /* Cache "is a light" so the light gather + selection skip non-light entities
-     * cheaply (a byte read) instead of re-probing the light components over
-     * all N.
-     *
-     * EVERY light kind has to be in this OR.  The gather loop skips on this
-     * byte BEFORE it looks at any component, so a kind missing here is a
-     * light that parses, serialises, appears in the Inspector and reaches no
-     * pixel -- which is exactly what the first area-light measurement showed:
-     * the strip lit nothing, and lighting it with a 0.05 x 0.05 rectangle
-     * produced a byte-identical frame. */
-    ec->kc_has_light = jce_scene_has_dir_light(scene, e)
-                    || jce_scene_has_point_light(scene, e)
-                    || jce_scene_has_spot_light(scene, e)
-                    || jce_scene_has_area_light(scene, e);
-    if (!ec->kc_enabled) { ec->render_kind = SR_RK_DISABLED; return; }
-    if (jce_scene_has_terrain(scene, e)            ||
-        jce_scene_has_tilemap(scene, e)            ||
-        jce_scene_has_vegetation_scatter(scene, e) ||
-        jce_scene_has_line_renderer(scene, e)      ||
-        jce_scene_has_trail_renderer(scene, e)     ||
-        jce_scene_has_water(scene, e)              ||
-        jce_scene_has_grass_field(scene, e)        ||
-        jce_scene_has_skeletal_animator(scene, e)  ||
-        jce_scene_has_sprite_animator(scene, e)    ||
-        jce_scene_has_sprite_renderer(scene, e)    ||
-        jce_scene_has_billboard_renderer(scene, e) ||
-        jce_scene_has_video_player(scene, e)       ||
-        jce_scene_has_foliage_cluster(scene, e)    ||
-        jce_scene_has_lod_group(scene, e)) {
-        ec->render_kind = SR_RK_OTHER;
-        return;
-    }
-    if (jce_scene_has_mesh_renderer(scene, e)) {
-        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-        if (mr) {
-            /* No skinned/LOD/special parts reached here → plain mesh.  glTF path →
-             * MODEL (multi-primitive model submit); else → PRIM_MESH (shared mesh). */
-            ec->render_kind = sr_is_gltf_model_path(mr->mesh_path)
-                                  ? SR_RK_MODEL : SR_RK_PRIM_MESH;
-            /* Parallel-gather eligible: a PRIM_MESH whose material is pure
-             * factors (no texture maps, no custom .mat.json program) — its cmd
-             * is a pure function of read-only state, buildable on a worker. */
-            ec->parallel_eligible =
-                (ec->render_kind == SR_RK_PRIM_MESH) &&
-                !mr->mesh_path[0] &&   /* pure shape primitive → shared mesh, no cache load */
-                mr->alpha_mode != JCE_ALPHA_BLEND &&  /* opaque queue only (no transparent drop) */
-                !mr->has_albedo_runtime &&  /* runtime albedo → not factor-only (texture path) */
-                !mr->albedo_tex[0] && !mr->mr_tex[0] && !mr->normal_tex[0] &&
-                !mr->ao_tex[0] && !mr->emissive_tex[0] && !mr->material_path[0];
-            return;
-        }
-    }
-    ec->render_kind = SR_RK_OTHER;
-}
-
 /* Async glTF decode job. The render thread uploads the CPU intermediate. */
 struct SrModelJob {
     const JcePakArchive *pak;
@@ -857,7 +793,7 @@ bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
         *out_mesh = NULL;
         /* Single get (NULL when absent) instead of has+get. */
         JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-        if (mr &&
+        if (mr && mr->visible &&
             jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_MESH_RENDERER)) {
             *out_mesh = sr_resolve_mesh(sr, mr);
             if (out_mr) *out_mr = mr;
@@ -960,7 +896,8 @@ static void sr_primary_dir_cb(JceScene *scene, JceEntity e, void *user)
      * table order, capped at MAX_DIR_LIGHTS" pick silently flipped the primary
      * to a fill light once extra entities reshuffled the table → foliage went
      * black.) */
-    float inten = dl->intensity > 0.0f ? dl->intensity : 1.0f;
+    if (!isfinite(dl->intensity) || dl->intensity <= 0.0f) return;
+    float inten = dl->intensity;
     if (c->found && inten <= c->best_intensity) return;
     c->best_intensity = inten;
 
@@ -1011,15 +948,15 @@ bool sr_resolve_primary_dir_light(JceSceneRenderer *sr,
                 if (!entity_enabled(scene, e)) continue;
                 if (!jce_scene_has_dir_light(scene, e)) continue;
                 if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_DIR_LIGHT)) continue;
-                if (dir_seen++ >= JCE_MAX_DIR_LIGHTS) continue;
                 JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
-                if (!dl) continue;
+                if (!dl || !isfinite(dl->intensity) || dl->intensity <= 0.0f) continue;
+                if (dir_seen++ >= JCE_MAX_DIR_LIGHTS) continue;
                 if (shadow_only && !dl->casts_shadow) continue;
                 JceTransform *xf = jce_scene_get_transform(scene, e);
                 jce_vec3 shine = sr_light_world_shine_direction(&dl->direction, xf);
                 if (out_to_light) *out_to_light = jce_v3_scale(shine, -1.0f);
                 if (out_color) *out_color = dl->color;
-                if (out_intensity) *out_intensity = dl->intensity > 0.0f ? dl->intensity : 1.0f;
+                if (out_intensity) *out_intensity = dl->intensity;
                 return true;
             }
         }
@@ -1546,6 +1483,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
 
     sr->renderer = renderer;
     sr->pak = pak;
+    sr->nodraw_registry_count = jce_component_count();
 
     if (cbs) { sr->cbs = *cbs; sr->has_cbs = true; }
 
@@ -1573,6 +1511,9 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->ecull_cap = 1024;
 
     /* Invalidate handles. */
+    sr->cpu_particle_arena.handle = UINT16_MAX;
+    sr->cpu_particle_count_tex.idx = UINT16_MAX;
+    sr->cpu_particle_drawn_tex.idx = UINT16_MAX;
     sr->white_tex.idx       = UINT16_MAX;
     sr->checker_tex.idx     = UINT16_MAX;
     /* bgfx handle idx==0 is a VALID handle (someone else's texture): the
@@ -1661,6 +1602,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->ssr_result_idx        = UINT16_MAX;
     sr->ssao_normal_tex.idx   = UINT16_MAX;
     sr->prog_gbuffer.idx      = UINT16_MAX;
+    sr->prog_gbuffer_skinned.idx = UINT16_MAX;
     /* TAA motion-vector G-buffer: invalidate handles (lazy-created). */
     sr->ssao_velocity_tex.idx        = UINT16_MAX;
     sr->prog_gbuffer_vel.idx         = UINT16_MAX;
@@ -2016,6 +1958,10 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
      * Read each frame so the console toggles it live.  Registering a cvar
      * that already exists returns the existing handle (idempotent across
      * multiple scene renderers / engine restarts within a process). */
+    jce_cvar_register_bool("r.particles.debug_stats", false, JCE_CVAR_FLAG_NONE,
+        "Expose current GPU emitter alive-count textures for diagnostics. Default off.");
+    jce_cvar_register_int("r.particles.cpu_upload_mb", 128, JCE_CVAR_FLAG_NONE,
+        "Lazy CPU particle dynamic arena budget per renderer frame (MiB, 0..256). Not physical peak VRAM.");
     sr->cv_forwardplus = jce_cvar_register_bool(
         "r.forwardplus", false, JCE_CVAR_FLAG_NONE,
         "Forward+ clustered lighting (opt-in; lifts the 16-point-light cap, "
@@ -2050,19 +1996,12 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
      * scratch-buffer overflow that used to crash large scenes (hundreds+ of
      * entities) when TAA was on.  Verified crash-free under ASAN at 1500
      * entities. */
-    /* TAA default is TIER + GPU-CLASS resolved: it defaults ON only on a
-     * DISCRETE MEDIUM+ GPU.  The LOW tier (512MB charter baseline) and every
-     * INTEGRATED GPU default to FXAA instead — TAA's resident RT family
-     * (full-res RGBA16F history + resolve ping-pong + motion/velocity targets,
-     * ~100MB at 2560x1600) AND its per-frame velocity GEOMETRY pre-pass are
-     * exactly the bandwidth/fill cost a shared-memory iGPU cannot spare (an
-     * iGPU is capped at MEDIUM, so `>= MEDIUM` alone would wrongly enable it).
-     * Matches the has_discrete gate the capability recommendation already uses
-     * for TAA.  DEFAULT only: the cvar / render-pipeline panel still lets any
-     * machine force TAA on or off explicitly. */
-    const bool taa_default =
-        jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM &&
-        jce_renderer_get_recommendation().has_discrete_gpu;
+    /* Capability presets and authored settings already resolve TAA policy in
+     * the applied render pipeline. Do not replace an explicit boot setting
+     * with an independent hardware default when this renderer registers it. */
+    JceRenderPipelineDesc taa_pipeline;
+    jce_render_pipeline_get(&taa_pipeline);
+    const bool taa_default = taa_pipeline.enable_taa;
     sr->cv_taa = jce_cvar_register_bool(
         "r.taa", taa_default, JCE_CVAR_FLAG_NONE,
         "Temporal anti-aliasing (default on at MEDIUM tier and above; the LOW "
@@ -2102,6 +2041,10 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         sr->cv_gpu_force = jce_cvar_register_bool(
             "r.gpu_driven.force", false, JCE_CVAR_FLAG_NONE,
             "Bypass adaptive workload thresholds for profiling diagnostics.");
+        sr->cv_gpu_indirect = jce_cvar_register_bool(
+            "r.gpu_driven.indirect", true, JCE_CVAR_FLAG_NONE,
+            "Use compacted indirect model draws when supported; off keeps "
+            "compute culling with fixed-count submission.");
     }
     /* JCE_GPU_SCENE=1 env toggle: flips the r.gpu_driven cvar on at startup so the
      * GPU-driven (compute cull + stream-compaction + indirect) color path can be
@@ -2316,8 +2259,8 @@ struct JceAnimPlayer *jce_scene_renderer_get_anim_player(
         if (e->used && strcmp(e->path, skeleton_path) == 0) { model = e->model; break; }
     }
     if (!model) return NULL;
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        SrAnimInstance *a = &sr->anim_inst[i];
+    for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+        SrAnimInstance *a = sr->anim_storage.records[i].value;
         if (a->used && a->model == model && a->player)
             return (struct JceAnimPlayer *)a->player;
     }
@@ -2328,9 +2271,9 @@ struct JceAnimSmBinding *jce_scene_renderer_get_anim_sm(
     JceSceneRenderer *sr, uint32_t entity)
 {
     if (!sr) return NULL;
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        SrAnimInstance *a = &sr->anim_inst[i];
-        if (a->used && a->entity == entity)
+    for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+        SrAnimInstance *a = sr->anim_storage.records[i].value;
+        if (a->used && (uint32_t)a->entity == entity)
             return a->sm_binding;
     }
     return NULL;
@@ -2358,30 +2301,8 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
      * where the per-instance output buffers go. */
     jce_morph_gpu_shutdown();
     sr_portal_free(sr); sr_probe_set_destroy(sr->lp_set); sr->lp_set = NULL;  /* portal occluders + baked probe set */
-    /* Players borrow model_cache skeletons — destroy the instances first. */
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        SrAnimInstance *a = &sr->anim_inst[i];
-        if (a->used && a->player) jce_anim_player_destroy(a->player);
-        if (a->sm_binding) { jce_anim_sm_binding_destroy(a->sm_binding); a->sm_binding = NULL; }
-        if (a->blend_tree) { jce_anim_blend_tree_destroy(a->blend_tree); a->blend_tree = NULL; }
-        if (a->ev_pool)    { JCE_FREE(a->ev_pool); a->ev_pool = NULL; }
-        if (a->avatar_mask) { jce_avatar_mask_unload(a->avatar_mask); a->avatar_mask = NULL; }
-        for (int li = 0; li < SR_AVATAR_MAX_LAYERS; li++)
-            if (a->layer_mask[li]) { jce_avatar_mask_unload(a->layer_mask[li]); a->layer_mask[li] = NULL; }
-        /* Retarget map borrows model_cache skeletons — free before the models. */
-        if (a->retarget_map) { jce_anim_retarget_map_destroy(a->retarget_map); a->retarget_map = NULL; }
-        /* Morph VBs are owned by the instance — destroy before the shared model
-           cache is torn down (handle-leak guard, 3rd lifecycle site).  ONLY for
-           slots that were ever initialized: an untouched slot's morph_vb[] is
-           zero-initialized, and handle idx==0 is a VALID bgfx handle
-           (someone else's buffer) — freeing all 256x8 untouched slots
-           destroyed dynamic VB 0 two thousand times per shutdown, corrupting
-           bgfx's handle table (debug bgfx: "Invalid handle.
-           destroyDynamicVertexBuffer handle: 0" x2048). */
-        if (a->used)
-            sr_free_morph_vbs(a);
-        a->used = false;
-    }
+    /* Players and file clips retire before their borrowed model skeletons. */
+    sr_anim_instances_destroy(sr);
 
     /* Vegetation scatter caches (own their scattered-instance buffers). */
     for (int i = 0; i < (int)(sizeof sr->foliage_cache / sizeof sr->foliage_cache[0]); i++) {
@@ -2730,6 +2651,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->ssgi)      jce_ssgi_destroy(sr->ssgi);
     if (sr->planar)    jce_planar_reflection_destroy(sr->planar);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer)) bgfx_destroy_program(sr->prog_gbuffer);
+    if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_skinned)) bgfx_destroy_program(sr->prog_gbuffer_skinned);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel)) bgfx_destroy_program(sr->prog_gbuffer_vel);
     if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel_skinned)) bgfx_destroy_program(sr->prog_gbuffer_vel_skinned);
     if (BGFX_HANDLE_IS_VALID(sr->u_prevModel))    bgfx_destroy_uniform(sr->u_prevModel);
@@ -2766,6 +2688,11 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->decals)          jce_decals_destroy(sr->decals);
     if (sr->decals_authored) jce_decals_destroy(sr->decals_authored);
 
+    sr_particle_arena_destroy(&sr->cpu_particle_arena);
+    if (BGFX_HANDLE_IS_VALID(sr->cpu_particle_count_tex))
+        bgfx_destroy_texture(sr->cpu_particle_count_tex);
+    if (BGFX_HANDLE_IS_VALID(sr->cpu_particle_drawn_tex))
+        bgfx_destroy_texture(sr->cpu_particle_drawn_tex);
     /* GPU particle pools (one per GPU-flagged emitter). */
     for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
         if (sr->gpu_particles[i].sys)
@@ -2848,31 +2775,6 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
  * caught.  When in any doubt (ancestor walk hits the depth guard) the entity is
  * treated as dynamic and recomputed. */
 
-/* True when this entity OR any ancestor carries a runtime-moved component, so it
- * must NOT be put in the persistent static cache.  PUBLIC (jce_scene.h): static
- * batching has to ask exactly the same question, and two definitions of
- * "static" is how a batch swallows an object that then cannot move. */
-bool jce_scene_entity_is_dynamic(JceScene *scene, JceEntity e)
-{
-    JceEntity cur = e;
-    for (int depth = 0; depth < 32 && cur != JCE_ENTITY_INVALID; depth++) {
-        if (jce_scene_has_rigidbody(scene, cur)            ||
-            jce_scene_has_rigidbody2d(scene, cur)          ||
-            jce_scene_has_character_controller(scene, cur) ||
-            jce_scene_has_skeletal_animator(scene, cur)    ||
-            jce_scene_has_vehicle(scene, cur)              ||
-            jce_scene_has_wheel_collider(scene, cur)       ||
-            jce_scene_has_soft_body(scene, cur))
-            return true;
-        JceEntity p = jce_scene_get_parent(scene, cur);
-        if (p == cur) break;          /* cycle guard */
-        cur = p;
-    }
-    /* depth-limit reached without resolving a root → be conservative. */
-    if (cur != JCE_ENTITY_INVALID) return true;
-    return false;
-}
-
 static uint32_t sr_wcache_hash(uint32_t e) { return e * 2654435761u; }
 
 /* Look up a live, epoch-current cache entry for `entity`.  Returns NULL on miss
@@ -2922,7 +2824,7 @@ static bool sr_wcache_grow(JceSceneRenderer *sr, uint32_t need)
 }
 
 /* Insert/overwrite the cached value for `entity`. */
-static void sr_wcache_store(JceSceneRenderer *sr, uint32_t entity,
+void sr_wcache_store(JceSceneRenderer *sr, uint32_t entity,
                             const SrEntityCull *src,
                             const jce_mat4 *src_world, uint64_t epoch,
                             uint64_t xform_gen)
@@ -2964,7 +2866,7 @@ static void sr_wcache_store(JceSceneRenderer *sr, uint32_t entity,
 #define SR_ECULL_PAR_CHUNK 4096u
 
 /* Defined below (focus-AABB table). */
-static void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
+void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
                                 jce_vec3 wmin, jce_vec3 wmax);
 static bool sr_focus_aabb_touch_update(JceSceneRenderer *sr, uint32_t entity,
                                        jce_vec3 wmin, jce_vec3 wmax);
@@ -2994,6 +2896,7 @@ static void sr_ecull_copy_hit(JceSceneRenderer *sr, JceScene *scene,
     sr->ecull[eci].has_aabb     = hit->has_aabb;
     sr->ecull[eci].casts_shadow = hit->casts_shadow;
     sr->ecull[eci].is_dyn_caster = false;   /* wcache hits are static-only */
+    sr->ecull[eci].transform_dynamic = false;
     if (sr->kindcache_on) {
         /* Slice 2 (DOTS floor): while the scene-wide enable_gen is unchanged
          * no EditorMeta.enabled flag anywhere has flipped (the editor's single
@@ -3024,93 +2927,6 @@ static void sr_ecull_copy_hit(JceSceneRenderer *sr, JceScene *scene,
     sr->ecull[eci].layer = jce_scene_get_entity_layer(scene, e);
     sr->ecull_light_byte[eci] = sr->ecull[eci].kc_has_light ? 1u : 0u;
     sr->ecull_fast_byte[eci]  = SR_RK_IS_FAST(sr->ecull[eci].render_kind) ? 1u : 0u;
-}
-
-/* wcache-miss slow path: compose the world matrix, resolve the caster AABB,
- * classify, store statics for cross-frame reuse, and fold the caster into the
- * shadow-cache key.  Touches the model/mesh resolve caches => serial only. */
-static void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
-                                const EntityList *list, int eci,
-                                uint64_t struct_epoch, bool wcache_on)
-{
-    JceEntity e = list->entities[eci];
-    const uint64_t e_gen = jce_scene_entity_xform_gen(scene, e);
-    jce_vec3 mn, mx;
-    /* #8 — compose the world matrix ONCE here (identical source to every
-     * later jce_scene_get_world_matrix call) and cache it.  The shadow
-     * cascades / depth prepass / color submit read sr->ecull_world[eci]
-     * instead of re-walking the parent chain ~5×/entity/frame. */
-    const jce_mat4 *wptr = NULL;
-    if (jce_scene_has_transform(scene, e)) {
-        sr->ecull_world[eci]       = jce_scene_get_world_matrix(scene, e);
-        sr->ecull[eci].world_valid = true;
-        wptr = &sr->ecull_world[eci];
-    } else {
-        sr->ecull[eci].world_valid = false;
-    }
-    sr->ecull[eci].has_aabb     = sr_shadow_caster_aabb(sr, scene, e, wptr, &mn, &mx);
-    sr->ecull[eci].wmin         = mn;
-    sr->ecull[eci].wmax         = mx;
-    sr->ecull[eci].casts_shadow = sr_entity_casts_shadow(scene, e);
-
-    /* Fix#1 (rank-1): classify render-kind HERE on the miss path so the wcache
-     * store below captures it — every later frame's hit then skips the ~16
-     * has_* probes.  Dynamics (never stored) re-run this each frame as before. */
-    if (sr->kindcache_on)
-        sr_classify_entity(scene, e, &sr->ecull[eci]);
-    sr->ecull[eci].layer = jce_scene_get_entity_layer(scene, e);
-    sr->ecull_light_byte[eci] = sr->ecull[eci].kc_has_light ? 1u : 0u;
-    sr->ecull_fast_byte[eci]  = SR_RK_IS_FAST(sr->ecull[eci].render_kind) ? 1u : 0u;
-
-    /* Store STATIC entities for cross-frame reuse.  Dynamics (rigidbody /
-     * character / skeletal / vehicle / wheel / softbody on the entity or any
-     * ancestor) are mutated in place by the runtime without an epoch bump, so
-     * they are never cached and always take the recompute path above. */
-    bool e_is_dynamic = jce_scene_entity_is_dynamic(scene, e);
-    if (wcache_on && !e_is_dynamic)
-        sr_wcache_store(sr, (uint32_t)e, &sr->ecull[eci],
-                        &sr->ecull_world[eci], struct_epoch, e_gen);
-
-    /* Shadow-cache key (miss path): fold this caster into the key; a dynamic
-     * caster (mutated in place without an xform_gen bump) can't be detected
-     * by the key, so flag it to force the shadow pass to re-render. */
-    sr->ecull[eci].is_dyn_caster =
-        (e_is_dynamic && sr->ecull[eci].casts_shadow);
-    if (sr->ecull[eci].casts_shadow) {
-        sr->shadow_caster_key =
-            sr_shadow_fold_caster(sr->shadow_caster_key, (uint64_t)e, e_gen);
-        /* Dual mode: the static-only key folds NON-dynamic casters only, so a
-         * mover's xform_gen churn leaves the static cascade cache valid. */
-        if (!e_is_dynamic)
-            sr->shadow_static_caster_key =
-                sr_shadow_fold_caster(sr->shadow_static_caster_key,
-                                      (uint64_t)e, e_gen);
-        if (e_is_dynamic) {
-            sr->shadow_has_dynamic_caster = true;
-            /* Append to the per-frame dynamic-caster list (dedup: the L2
-             * repair re-runs this for ring entities already listed). */
-            bool listed = false;
-            for (uint32_t di = 0; di < sr->shadow_dyn_count; di++)
-                if (sr->shadow_dyn[di] == (uint32_t)eci) { listed = true; break; }
-            if (!listed) {
-                if (sr->shadow_dyn_count >= sr->shadow_dyn_cap) {
-                    uint32_t nc = sr->shadow_dyn_cap ? sr->shadow_dyn_cap * 2u : 64u;
-                    uint32_t *g = (uint32_t *)JCE_REALLOC(
-                        sr->shadow_dyn, nc * sizeof(uint32_t));
-                    if (g) { sr->shadow_dyn = g; sr->shadow_dyn_cap = nc; }
-                }
-                if (sr->shadow_dyn_count < sr->shadow_dyn_cap)
-                    sr->shadow_dyn[sr->shadow_dyn_count++] = (uint32_t)eci;
-            }
-        }
-    }
-
-    /* Persist the world AABB for next frame's focus-bounded collect (slice 6:
-     * fused into the build; the standalone post-loop store walk is gone).
-     * Serial path => full store (may insert/grow). */
-    if (sr->ecull[eci].has_aabb)
-        sr_focus_aabb_store(sr, (uint32_t)e, sr->ecull[eci].wmin,
-                            sr->ecull[eci].wmax);
 }
 
 /* ── L2 incremental repair: entity→list-index map ──────────────────────
@@ -3271,7 +3087,7 @@ static bool sr_focus_aabb_grow(JceSceneRenderer *sr, uint32_t need)
 }
 
 /* Store/refresh an entity's world AABB for next frame's collect. */
-static void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
+void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
                                jce_vec3 wmin, jce_vec3 wmax)
 {
     if (entity == 0) return;
@@ -3403,7 +3219,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                                    uint16_t view_id_base, float dt_sec,
                                    const JceSceneRenderConfig *config)
 {
-    if (!sr || !scene) return view_id_base;
+    if (!sr) return view_id_base;
+    sr->cpu_particle_count_valid = false;
+    sr->cpu_particle_render_scene = scene;
+    if (!scene) return view_id_base;
+    sr_nodraw_refresh_registry(scene, &sr->nodraw_registry_count, jce_component_count());
     JCE_PROFILE_ZONE_N("SceneRenderer::Render");
     /* Viewport for this frame.  Same fallback the SSAO/shadow paths use, so a
      * config that omits it behaves as before. */
@@ -3577,9 +3397,12 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                 sr->rp_cascades_live = true;
             if (rp.msaa_samples != sr->rp_last_msaa)
                 jce_renderer_set_msaa(sr->renderer, (int)rp.msaa_samples);
-            if (rp.enable_taa != sr->rp_last_taa && sr->cv_taa)
-                jce_cvar_set_bool(sr->cv_taa, rp.enable_taa);
+
         }
+        /* A project can be applied after renderer creation and before its
+         * first draw. Honour that authored value on the first draw too. */
+        if ((!sr->rp_seen || rp.enable_taa != sr->rp_last_taa) && sr->cv_taa)
+            jce_cvar_set_bool(sr->cv_taa, rp.enable_taa);
         sr->rp_last_shadow_res = rp.shadow_resolution;
         sr->rp_last_cascades   = rp.csm_cascade_count;
         sr->rp_last_msaa       = rp.msaa_samples;
@@ -4179,6 +4002,10 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     }
     uint64_t _t0_animsel = jce_time_perf_counter();   /* sr_animsel: collect -> ecull */
 
+    /* Reset before shadows: every shadow and colour queue flush contributes. */
+    memset(&sr->stat_rq, 0, sizeof(sr->stat_rq));
+    sr->stat_rq_active = false;
+
     /* Skybox scan + IBL refresh. */
     /* Shadow-pass terrain counters, reset HERE and not in sr_draw_entities:
      * the shadow pass runs first, so resetting them with the colour-pass
@@ -4511,6 +4338,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         s_kindcache_disabled = (kcv && kcv[0] && kcv[0] != '0') ? 1 : 0;
     }
     sr->kindcache_on = !s_kindcache_disabled;
+    sr_ecull_metadata_begin(sr, scene, s_col_list_gen, struct_epoch);
     /* CSM shadow-cache caster-state key: FNV-1a accumulated over every shadow
      * caster's (entity, xform_gen) so any static-caster move/add/remove flips
      * it; any DYNAMIC caster (physics/character/skeletal — mutated without an
@@ -4645,7 +4473,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     sr->shadow_caster_key = 1469598103934665603ull; /* FNV offset basis */
     sr->shadow_static_caster_key = 1469598103934665603ull;
     sr->shadow_has_dynamic_caster = false;
-    sr->shadow_dyn_count = 0;
+    sr_ecull_reset_dynamic_list(sr);
     sr->cull_movers_count = -1;              /* full rebuild: movers unknown */
     sr->frame_list_gen = s_col_list_gen;
     {
@@ -4819,6 +4647,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     sr->ecull_frz_valid      = true;
 
 ecull_build_done:;
+    sr_ecull_metadata_commit(sr);
 
     /* In-asset auto-LOD (P1 #6): compute each entity's LOD level ONCE here —
      * AFTER ecull[*].world is populated (used for the camera distance), BEFORE
@@ -4948,21 +4777,21 @@ ecull_build_done:;
             static uint32_t s_frames;
             if ((++s_frames % 120u) == 0u) {
                 uint32_t lv[8] = {0}, culled = 0u;
-                uint32_t rk[4] = {0};   /* SR_RK_OTHER/PRIM_MESH/DISABLED/MODEL */
+                uint32_t rk[5] = {0};   /* OTHER/PRIM_MESH/DISABLED/MODEL/NO_DRAW */
                 for (int eci = 0; eci < list.count; eci++) {
                     const uint8_t l = sr->ecull[eci].lod_level;
                     lv[l < 8u ? l : 7u]++;
                     if (sr->ecull[eci].lod_culled) culled++;
-                    rk[sr->ecull[eci].render_kind & 3u]++;
+                    if (sr->ecull[eci].render_kind < 5) rk[sr->ecull[eci].render_kind]++;
                 }
                 LOG_INFO(LOG_TAG,
                     "lod-stats: entities=%d members=%u | L0=%u L1=%u L2=%u "
                     "L3=%u L4+=%u | culled=%u | kind: other=%u prim=%u "
-                    "disabled=%u model=%u | kindcache=%d",
+                    "disabled=%u model=%u no_draw=%u | kindcache=%d",
                     list.count, sr->lod_member_count,
                     lv[0], lv[1], lv[2], lv[3],
                     lv[4] + lv[5] + lv[6] + lv[7], culled,
-                    rk[0], rk[1], rk[2], rk[3], (int)sr->kindcache_on);
+                    rk[0], rk[1], rk[2], rk[3], rk[4], (int)sr->kindcache_on);
                 LOG_INFO(LOG_TAG,
                     "cull-stats: visible=%u culled=%u of %u | ecull %u B/entity = %.1f MB/frame | gpu_driven=%d supported=%d first_of_bgfx_frame=%d",
                     sr->stat_visible_entities, sr->stat_culled_entities,
@@ -5028,6 +4857,7 @@ ecull_build_done:;
     sr->ssgi_active_frame = false;
     sr->velocity_valid_frame = false;
     sr->depth_prepass_frame  = false;
+    sr->depth_history_reused = false;
     {
         /* A reduced pass renders colour and nothing else -- see
          * JceSceneRenderConfig::reduced_pass for why this is about shared
@@ -6523,8 +6353,8 @@ void jce_scene_renderer_set_model_vram_budget(JceSceneRenderer *sr,
 static bool sr_model_referenced_by_anim(const JceSceneRenderer *sr,
                                         const JceModel *model)
 {
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        const SrAnimInstance *a = &sr->anim_inst[i];
+    for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+        const SrAnimInstance *a = sr->anim_storage.records[i].value;
         if (!a->used) continue;
         if (a->model == model) return true;
         /* retarget map borrows src/dst skeletons owned by this model. */

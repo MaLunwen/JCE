@@ -1,7 +1,9 @@
 # Caged Kingdom
 
 CK is the final game consumer, located at `examples/caged_kingdom`.
-Open this directory as a project in JCE Editor. From the repository root:
+This checkout currently preserves frozen design material and build metadata.
+Its implementation source is absent by owner choice, so a runnable SDK build
+is unavailable. After implementation sources return, build from the repository root:
 
 ```sh
 python scripts/jce.py app examples/caged_kingdom --arch x64 --variant release

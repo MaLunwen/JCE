@@ -6,12 +6,15 @@
  * Context menus are in jce_panel_hierarchy_menu.cpp.
  */
 
+#include "core/jce_editor_operation_metrics.h"
 #include "jce_panel_hierarchy_internal.h"
 #include "jce_panel_common.h"
 #include "jce_panel_hierarchy_input.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_project_state.h"
 #include "core/jce_hotkeys.h"
+#include <jce/os/core/jce_log.h>
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_timer.h>
 #include <cctype>
@@ -28,6 +31,27 @@ static const char *kTagFilter[] = {
 
 void jce_editor_panel_hierarchy_content(void)
 {
+    static unsigned scroll_tick;
+    ++scroll_tick;
+    const char *scroll = getenv("JCE_DBG_SCROLL");
+    const char *at = scroll ? strrchr(scroll, '@') : nullptr;
+    if (at && (unsigned)atoi(at + 1) == scroll_tick) {
+        char name[JCE_MAX_ENTITY_NAME];
+        size_t length = (size_t)(at - scroll);
+        if (length > 0 && length < sizeof(name)) {
+            memcpy(name, scroll, length); name[length] = 0;
+            int count = jce_state_get_entity_count();
+            for (int i = 0; i < count; ++i) {
+                uint32_t id = jce_state_get_entity_id_by_index(i);
+                const char *actual = jce_state_entity_name(id);
+                if (actual && !strcmp(actual, name)) {
+                    s_hier.reveal_target = id;
+                    s_hier.reveal_pending = true;
+                    break;
+                }
+            }
+        }
+    }
     ensure_hier_init();
 
     /* Restore per-project view state once the project store is live — it is
@@ -107,25 +131,52 @@ void jce_editor_panel_hierarchy_content(void)
          * O(n) single pass — the old get_root_count + per-index get_root_id loop
          * was O(n^2) (each get_root_id rescans g_entity_order), which became
          * catastrophic once the clipper let the display cap grow to 32768. */
-        static uint32_t root_ids[HIERARCHY_MAX_DISPLAY];
-        uint64_t _t0_hr = jce_time_perf_counter();
-        int root_count = jce_state_get_roots(root_ids, HIERARCHY_MAX_DISPLAY);
-        jce_perf_phase_add("ed_hier_roots",
-            jce_time_perf_to_ms(_t0_hr, jce_time_perf_counter()));
+        int loaded = jce_state_get_entity_count();
+        int groups = jce_state_streaming_group_count();
+        if (!jce_hierarchy_reserve(loaded, groups)) {
+            ImGui::TextUnformatted(jce_editor_i18n("hierarchy.storageUnavailable"));
+            LOG_ERROR("hierarchy", "hierarchy storage unavailable loaded=%d groups=%d", loaded, groups);
+            return;
+        }
+        JceScene *scene = jce_state_get_scene();
+        JceHierarchyFlatKey key{scene, ImGui::GetCurrentContext(), ImGui::GetStateStorage(),
+            scene ? jce_scene_get_structural_epoch(scene) : 0,
+            scene ? jce_scene_get_roster_epoch(scene) : 0,
+            jce_state_entity_order_generation(), s_hier.flat_cache.expansion,
+            s_hier.reveal_target, s_hier.reveal_pending};
+        const char *disable = getenv("JCE_DISABLE_HIERARCHY_CACHE");
+        bool allowed = !(disable && disable[0] && disable[0] != '0') &&
+            JceHierarchyFlatCache::eligible(s_hier.sort_mode, s_hier.search_buf[0] != 0,
+                                            s_hier.tag_filter, jce_hierarchy_chunk_grouping_active());
+        bool reused = s_hier.flat_cache.reuse(key, allowed);
+        int root_count = s_hier.flat_cache.roots;
+        if (!reused) {
+            uint32_t *root_ids = s_hier.root_ids;
+            uint64_t _t0_hr = jce_time_perf_counter();
+            root_count = jce_state_get_roots(root_ids, s_hier.capacity);
+            jce_perf_phase_add("ed_hier_roots",
+                jce_time_perf_to_ms(_t0_hr, jce_time_perf_counter()));
 
-        uint64_t _t0_hs = jce_time_perf_counter();
-        sort_entity_ids(root_ids, root_count);
-        jce_perf_phase_add("ed_hier_sort",
-            jce_time_perf_to_ms(_t0_hs, jce_time_perf_counter()));
+            uint64_t _t0_hs = jce_time_perf_counter();
+            sort_entity_ids(root_ids, root_count);
+            jce_perf_phase_add("ed_hier_sort",
+                jce_time_perf_to_ms(_t0_hs, jce_time_perf_counter()));
 
-        /* Flatten the visible tree (full list → display_order + flat) then
-         * render only the clipper-visible rows.  This is the perf fix: a
-         * full-loaded scene flattens thousands of rows but submits ~30. */
-        uint64_t _t0_hf = jce_time_perf_counter();
-        jce_hierarchy_flatten(root_ids, root_count);
-        jce_perf_phase_add("ed_hier_flat",
-            jce_time_perf_to_ms(_t0_hf, jce_time_perf_counter()));
+            /* Flatten the visible tree (full list → display_order + flat) then
+             * render only the clipper-visible rows.  This is the perf fix: a
+             * full-loaded scene flattens thousands of rows but submits ~30. */
+            uint64_t _t0_hf = jce_time_perf_counter();
+            jce_hierarchy_flatten(root_ids, root_count);
+            jce_perf_phase_add("ed_hier_flat",
+                jce_time_perf_to_ms(_t0_hf, jce_time_perf_counter()));
+            s_hier.flat_cache.store(key, root_count, allowed);
+        }
+        if (getenv("JCE_EDITOR_OPERATION_METRICS"))
+            LOG_INFO("hierarchy", "hierarchy-flat-cache: frame=%u eligible=%d reused=%d rows=%d roots=%d",
+                     scroll_tick, allowed ? 1 : 0, reused ? 1 : 0, s_hier.flat_count, root_count);
 
+        jce_editor_hierarchy_metric(jce_state_get_entity_count(), root_count,
+                                    s_hier.flat_count, s_hier.capacity);
         ImGuiListClipper clip;
         clip.Begin(s_hier.flat_count);
 
@@ -147,7 +198,10 @@ void jce_editor_panel_hierarchy_content(void)
             if (reveal_idx >= 0)
                 clip.IncludeItemByIndex(reveal_idx);
             else
-                s_hier.reveal_pending = false; /* not visible; nothing to scroll to */
+                {
+                    jce_editor_hierarchy_reveal_metric(s_hier.reveal_target, false);
+                    s_hier.reveal_pending = false; /* not visible; nothing to scroll to */
+                }
         }
 
         while (clip.Step()) {

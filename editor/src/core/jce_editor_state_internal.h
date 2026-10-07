@@ -40,7 +40,20 @@ extern "C" {
 
 /* ── Internal State ────────────────────────────────────────────────── */
 
+/* Observations belong to the existing editor lifecycle, not a second service. */
+struct JceEditorOperationMetricsState {
+    unsigned tick = 0;
+    uint64_t generation = 0, pending = 0, requested_at = 0;
+    uint32_t requested_entity = 0;
+    uint32_t renamed_entity = 0, renamed_parent = 0, renamed_focus = 0;
+    int renamed_population = 0;
+    char rename_before[JCE_MAX_ENTITY_NAME] = {}, rename_after[JCE_MAX_ENTITY_NAME] = {};
+    bool observed = false;
+};
+
 struct EditorInternalState {
+    JceEditorOperationMetricsState operation_metrics;
+
     /* Selection. */
     uint32_t    selected[JCE_MAX_SELECTED];
     int         selected_count;
@@ -125,6 +138,11 @@ struct EditorHistorySnapshot {
      * scene_json is empty in this case and scene_path still carries the
      * scene identity, so the two kinds share one stack and one ordering. */
     uint32_t entity_id = 0;
+    uint64_t entity_token = 0;
+    bool entity_parent_captured = false;
+    uint64_t entity_parent_token = 0;
+    uint64_t identity_epoch = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> entity_tokens;
     std::string entity_json;
     std::vector<int> entity_comp_ids;
     std::vector<int> entity_order;
@@ -163,6 +181,7 @@ extern EditorTransaction s_transaction;
 void set_current_scene_path_internal(const char *scene_path);
 void update_scene_dir_from_path(const char *scene_path);
 void jce_roots_invalidate(void);
+void jce_roots_note_reparented(uint32_t id);
 void clear_scene_entities(void);
 void rebuild_entity_order_from_ecs(void);
 
@@ -189,8 +208,9 @@ bool history_push_undo_snapshot_scoped(uint32_t entity_id);
 bool history_capture_entity_snapshot(uint32_t entity_id,
                                      EditorHistorySnapshot *out);
 bool history_begin_edit_scoped(uint32_t entity_id);
+bool history_entity_edit_compatible(uint32_t entity_id);
 bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
-                              const char *reason);
+                              const char *reason, bool *mutated = nullptr);
 
 /* ── Scene parse functions (defined in jce_editor_scene_parse.cpp) ── */
 
@@ -231,7 +251,8 @@ struct HistorySuspendScope {
 
 struct HistoryEditScope {
     bool active;
-    HistoryEditScope() : active(history_begin_edit()) {}
+    explicit HistoryEditScope(uint32_t entity_id = 0u)
+        : active(history_begin_edit_scoped(entity_id)) {}
     ~HistoryEditScope() { history_end_edit(active); }
 };
 

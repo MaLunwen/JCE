@@ -211,6 +211,10 @@ int jce_input_sdl_translate(const void *platform_event,
 
     /* Mouse */
     case SDL_EVENT_MOUSE_MOTION:
+        /* SDL also mirrors touch into mouse events for mouse-only UI. The
+         * raw window-event bridge still receives them; gameplay input must
+         * consume the real touch stream exactly once. */
+        if (e->motion.which == SDL_TOUCH_MOUSEID) break;
         ev = emit(out, max, &n, JCE_INPUT_EVENT_MOUSE_MOTION);
         if (!ev) break;
         ev->motion.x  = e->motion.x;
@@ -221,8 +225,17 @@ int jce_input_sdl_translate(const void *platform_event,
 
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (e->button.which == SDL_TOUCH_MOUSEID) break;
         /* The NUMBER is carried, 1-based.  JCE_MOUSE_BUTTON_MASK is applied
          * on the far side of the seam, once, in jce_input_submit. */
+        /* A click carries its own position even when SDL sent no prior motion.
+         * Preserve button delivery when a caller provides only one slot. */
+        if (max - n >= 2) {
+            ev = emit(out, max, &n, JCE_INPUT_EVENT_MOUSE_MOTION);
+            ev->motion.x = e->button.x;
+            ev->motion.y = e->button.y;
+            ev->motion.dx = ev->motion.dy = 0.0f;
+        }
         ev = emit(out, max, &n, JCE_INPUT_EVENT_MOUSE_BUTTON);
         if (!ev) break;
         ev->mbutton.button = e->button.button;
@@ -230,6 +243,7 @@ int jce_input_sdl_translate(const void *platform_event,
         break;
 
     case SDL_EVENT_MOUSE_WHEEL:
+        if (e->wheel.which == SDL_TOUCH_MOUSEID) break;
         ev = emit(out, max, &n, JCE_INPUT_EVENT_MOUSE_WHEEL);
         if (!ev) break;
         ev->wheel.x = e->wheel.x;
@@ -260,6 +274,7 @@ int jce_input_sdl_translate(const void *platform_event,
     case SDL_EVENT_FINGER_DOWN:
     case SDL_EVENT_FINGER_MOTION:
     case SDL_EVENT_FINGER_UP:
+        if (e->tfinger.touchID == SDL_MOUSE_TOUCHID) break;
         ev = emit(out, max, &n, JCE_INPUT_EVENT_TOUCH);
         if (!ev) break;
         ev->touch.finger   = (uint64_t)e->tfinger.fingerID;
@@ -505,7 +520,26 @@ int jce_input_sdl_translate_live(const void *platform_event,
      * a NULL never reaches SDL_IsGamepad() as a garbage instance id. */
     if (!e || !out || max <= 0) return 0;
     if (sdl_joystick_echo_is_shadowed(e)) return 0;
-    return jce_input_sdl_translate(platform_event, out, max);
+    int count = jce_input_sdl_translate(platform_event, out, max);
+#if JCE_PLATFORM_WEB
+    /* SDL's Web producer uses inclusive pixel endpoints (w-1/h-1).
+     * Neutral touch coordinates use the logical surface span, matching
+     * mouse/client coordinates and pointer-only consumers on all backends. */
+    if (count > 0 && (e->type == SDL_EVENT_FINGER_DOWN ||
+                     e->type == SDL_EVENT_FINGER_MOTION ||
+                     e->type == SDL_EVENT_FINGER_UP)) {
+        SDL_Window *window = SDL_GetWindowFromID(e->tfinger.windowID);
+        int width = 0, height = 0;
+        if (window && SDL_GetWindowSize(window, &width, &height) &&
+            width > 0 && height > 0) {
+            for (int i = 0; i < count; ++i) if (out[i].kind == JCE_INPUT_EVENT_TOUCH) {
+                out[i].touch.x *= (float)(width - 1) / (float)width;
+                out[i].touch.y *= (float)(height - 1) / (float)height;
+            }
+        }
+    }
+#endif
+    return count;
 }
 
 /* -- the SDL backend: hardware handle lifetime ----------------------- */

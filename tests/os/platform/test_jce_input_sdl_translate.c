@@ -24,6 +24,7 @@
  */
 
 #include <jce/os/platform/jce_input_event.h>
+#include <jce/os/platform/jce_input.h>
 
 #include "unity.h"
 
@@ -309,14 +310,27 @@ static void test_mouse_button_is_one_based_and_unshifted(void)
     SDL_Event e;
     JceInputEvent out[4];
     memset(&e, 0, sizeof(e));
-    e.type          = SDL_EVENT_MOUSE_BUTTON_DOWN;
-    e.button.button = 3;                  /* right */
-    e.button.down   = true;
-    TEST_ASSERT_EQUAL_INT(1, jce_input_sdl_translate(&e, out, 4));
+    e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    e.button.button = 3;
+    e.button.down = true;
+    e.button.x = 120.0f; e.button.y = 80.0f;
+    TEST_ASSERT_EQUAL_INT(2, jce_input_sdl_translate(&e, out, 4));
+    TEST_ASSERT_EQUAL_INT(JCE_INPUT_EVENT_MOUSE_MOTION, out[0].kind);
+    TEST_ASSERT_EQUAL_INT(JCE_INPUT_EVENT_MOUSE_BUTTON, out[1].kind);
+    TEST_ASSERT_EQUAL_UINT8(3, out[1].mbutton.button);
+    TEST_ASSERT_EQUAL_UINT8(1, out[1].mbutton.down);
+    JceInput *in = jce_input_create();
+    TEST_ASSERT_NOT_NULL(in);
+    jce_input_submit(in, out, 2);
+    float x, y, dx, dy;
+    jce_input_mouse_pos(in, &x, &y);
+    jce_input_mouse_delta(in, &dx, &dy);
+    TEST_ASSERT_EQUAL_FLOAT(120.0f, x); TEST_ASSERT_EQUAL_FLOAT(80.0f, y);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, dx); TEST_ASSERT_EQUAL_FLOAT(0.0f, dy);
+    TEST_ASSERT_TRUE(jce_input_mouse_button(in, 3));
+    jce_input_destroy(in);
+    TEST_ASSERT_EQUAL_INT(1, jce_input_sdl_translate(&e, out, 1));
     TEST_ASSERT_EQUAL_INT(JCE_INPUT_EVENT_MOUSE_BUTTON, out[0].kind);
-    /* The translator does NOT apply the mask; it carries the NUMBER. */
-    TEST_ASSERT_EQUAL_UINT8(3, out[0].mbutton.button);
-    TEST_ASSERT_EQUAL_UINT8(1, out[0].mbutton.down);
 }
 
 static void test_motion_wheel_and_touch(void)
@@ -383,7 +397,6 @@ static void test_every_event_carries_its_own_size(void)
 
 #include "jce_input_internal.h"     /* jce_input_set_backend, SDL-free */
 
-#include <jce/os/platform/jce_input.h>
 
 /* A backend that opens nothing.  Installing it is what lets the device half
  * of the state machine be exercised on a build machine with no controller
@@ -1670,9 +1683,85 @@ static void test_a_wheel_opens_raw_through_the_real_sdl_backend(void)
     SDL_QuitSubSystem(SDL_INIT_JOYSTICK);
 }
 
+/* Platform mirror streams must not run a gesture twice. Raw window events
+ * still reach the independent UI event bridge. */
+static void test_synthetic_pointer_mirrors_are_not_input_devices(void)
+{
+    SDL_Event e;
+    JceInputEvent out[2];
+    memset(&e, 0, sizeof(e));
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.which = SDL_TOUCH_MOUSEID;
+    e.motion.x = 640; e.motion.y = 360; e.motion.xrel = 60;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    e.button.which = SDL_TOUCH_MOUSEID; e.button.button = 1;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_MOUSE_BUTTON_UP;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_MOUSE_WHEEL;
+    e.wheel.which = SDL_TOUCH_MOUSEID; e.wheel.y = 1;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    memset(&e, 0, sizeof(e));
+    e.type = SDL_EVENT_FINGER_DOWN;
+    e.tfinger.touchID = SDL_MOUSE_TOUCHID; e.tfinger.fingerID = 7;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_FINGER_MOTION;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_FINGER_UP;
+    TEST_ASSERT_EQUAL_INT(0, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_FINGER_DOWN; e.tfinger.touchID = 42;
+    TEST_ASSERT_EQUAL_INT(1, jce_input_sdl_translate(&e, out, 2));
+    TEST_ASSERT_EQUAL_INT(JCE_INPUT_EVENT_TOUCH, out[0].kind);
+    TEST_ASSERT_EQUAL_UINT64(7, out[0].touch.finger);
+    memset(&e, 0, sizeof(e));
+    e.type = SDL_EVENT_MOUSE_MOTION; e.motion.which = 9;
+    TEST_ASSERT_EQUAL_INT(1, jce_input_sdl_translate(&e, out, 2));
+    e.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    e.button.which = 9; e.button.button = 1;
+    TEST_ASSERT_EQUAL_INT(2, jce_input_sdl_translate(&e, out, 2));
+    TEST_ASSERT_EQUAL_INT(JCE_INPUT_EVENT_MOUSE_BUTTON, out[1].kind);
+}
+
+static void test_primary_pointer_preserves_touch_release_and_replay(void)
+{
+    JceInput *in = jce_input_create();
+    JceInputEvent e = {0}; JceInputFrame frame = {0};
+    float x = -1, y = -1; bool down = false;
+    e.size = sizeof(e); e.kind = JCE_INPUT_EVENT_TOUCH;
+    e.touch.finger = 71; e.touch.x = .5f; e.touch.y = .25f;
+    e.touch.phase = JCE_INPUT_TOUCH_PHASE_DOWN; jce_input_submit(in, &e, 1);
+    TEST_ASSERT_TRUE(jce_input_primary_pointer(in, 1280, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(640, x); TEST_ASSERT_EQUAL_FLOAT(180, y);
+    TEST_ASSERT_TRUE(down); TEST_ASSERT_FALSE(jce_input_mouse_button(in, 1));
+    e.touch.phase = JCE_INPUT_TOUCH_PHASE_MOTION; e.touch.x = .6f;
+    jce_input_submit(in, &e, 1);
+    e.touch.phase = JCE_INPUT_TOUCH_PHASE_UP; jce_input_submit(in, &e, 1);
+    TEST_ASSERT_TRUE(jce_input_primary_pointer(in, 1280, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(768, x); TEST_ASSERT_FALSE(down);
+    e.kind = JCE_INPUT_EVENT_MOUSE_MOTION; e.motion.x = 20; e.motion.y = 40;
+    e.motion.dx = 1; e.motion.dy = 0; jce_input_submit(in, &e, 1);
+    TEST_ASSERT_TRUE(jce_input_primary_pointer(in, 1280, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(20, x); TEST_ASSERT_EQUAL_FLOAT(40, y);
+    frame.version = JCE_INPUT_FRAME_VERSION; frame.touch_count = 1;
+    frame.touches[0].id = 99; frame.touches[0].x = .25f; frame.touches[0].y = .5f;
+    TEST_ASSERT_TRUE(jce_input_apply(in, &frame));
+    TEST_ASSERT_TRUE(jce_input_primary_pointer(in, 1280, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(320, x); TEST_ASSERT_EQUAL_FLOAT(360, y);
+    TEST_ASSERT_TRUE(down);
+    frame.touch_count = 0; TEST_ASSERT_TRUE(jce_input_apply(in, &frame));
+    TEST_ASSERT_TRUE(jce_input_primary_pointer(in, 1280, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(320, x); TEST_ASSERT_FALSE(down);
+    TEST_ASSERT_FALSE(jce_input_primary_pointer(in, 0, 720, &x, &y, &down));
+    TEST_ASSERT_EQUAL_FLOAT(320, x);
+    jce_input_destroy(in);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_primary_pointer_preserves_touch_release_and_replay);
+    RUN_TEST(test_synthetic_pointer_mirrors_are_not_input_devices);
     RUN_TEST(test_event_is_sixty_four_bytes);
     RUN_TEST(test_size_and_kind_are_the_first_two_words);
     RUN_TEST(test_every_payload_fits_the_headroom_array);

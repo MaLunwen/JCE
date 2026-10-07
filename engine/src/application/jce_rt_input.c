@@ -10,6 +10,18 @@
 #include "jce_rt_internal.h"
 
 #include <string.h>
+#include <math.h>
+
+JCE_API void JCE_CALL jce_runtime_set_pointer_position(
+	JceRuntime *rt, float x, float y, float width, float height)
+{
+	if (!rt) return;
+	memset(rt->pointer_xywh, 0, sizeof(rt->pointer_xywh));
+	if (!isfinite(x) || !isfinite(y) || !isfinite(width) || !isfinite(height) ||
+	    width <= 0.0f || height <= 0.0f) return;
+	rt->pointer_xywh[0] = x; rt->pointer_xywh[1] = y;
+	rt->pointer_xywh[2] = width; rt->pointer_xywh[3] = height;
+}
 
 /* Expire everything in JceRuntimeInput that is a SAMPLE rather than a latched
  * state, immediately after a step consumed it.
@@ -38,4 +50,5 @@ void rt_input_expire_frame_sample(JceRuntime *rt)
 	rt->input.touch_count     = 0;
 	rt->input.keyboard        = NULL;
 	memset(rt->input.touches, 0, sizeof(rt->input.touches));
+	memset(rt->pointer_xywh, 0, sizeof(rt->pointer_xywh));
 }

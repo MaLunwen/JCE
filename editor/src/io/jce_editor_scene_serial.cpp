@@ -1342,10 +1342,17 @@ void clear_deferred_scene_load()
 
 } /* anonymous namespace */
 
+namespace { bool ends_with_ci_local(const char *path, const char *suffix); }
+
 bool jce_state_load_scene_file_async(const char *scene_path)
 {
     if (!scene_path || scene_path[0] == '\0')
         return false;
+
+    /* Startup restoration uses the same isolated bundle loader as Open Bundle. */
+    if (ends_with_ci_local(scene_path, ".jbundle") ||
+        ends_with_ci_local(scene_path, ".jbundle.json"))
+        return jce_state_load_scene_from_jbundle(scene_path);
 
     /* If a previous async load is somehow still in flight, finish it
      * synchronously before swapping — never overlap two loads. */
@@ -1672,6 +1679,8 @@ bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
     }
 
     close_active_bundle_mount();
+    /* Follow the physical package owner before binding its isolated VFS. */
+    follow_scene_project_root(jbundle_path);
     g_bm.fs = jce_fs_create();
     if (!g_bm.fs) return false;
 

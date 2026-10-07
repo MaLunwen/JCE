@@ -1,3 +1,9 @@
+#include "jce_video_frame.h"
+#include <jce/os/core/jce_allocator.h>
+#include <limits.h>
+#include "jce_video_perf.h"
+#include "jce_hevc_diagnostics.h"
+#include "jce_h265_perf.h"
 /* The patented-codec contract, checked at RUNTIME rather than in CMake.
  *
  * Nothing has ever tested MP4 / H.264 / H.265 / AAC decoding, which is how a
@@ -28,6 +34,9 @@
 #include <jce/os/core/jce_thread.h>
 #include "jce_yuv_convert.h"
 #include "jce_video_clock.h"
+#include "jce_video_seek_trace.h"
+#include "jce_video_timestamp.h"
+#include "jce_video_late_policy.h"
 #include <math.h>
 
 #include <stdio.h>
@@ -77,6 +86,12 @@ static bool find_fixture(void)
 {
     const char *env = getenv("JCE_TEST_MP4");
     if (env && env[0] && try_fixture(env, false)) return true;
+
+    /* CTest can run six or more levels below the source tree. Prefer the
+     * configured test fixture authority instead of guessing that depth. */
+    char fixture_path[1024];
+    snprintf(fixture_path, sizeof(fixture_path), "%s/bframes.mp4", JCE_TEST_COLOR_DIR);
+    if (try_fixture(fixture_path, true)) return true;
 
     /* ctest runs from the build tree; walk up looking for the repo root. */
     static const char *prefixes[] = { "", "../", "../../", "../../../",
@@ -239,7 +254,232 @@ static void test_preview_downsample_keeps_centres_and_ignores_row_padding(void)
     TEST_ASSERT_FALSE(jce_video_set_preview_max_dimension(JCE_VIDEO_INVALID, 1280));
 }
 
+static uint8_t reference_channel(int value)
+{
+    /* Floor division is defined here even for negative intermediates. */
+    int rounded = value >= 0 ? value / 256 : -((-value + 255) / 256);
+    return (uint8_t)(rounded < 0 ? 0 : rounded > 255 ? 255 : rounded);
+}
+
+static uint8_t reference_color_channel(double value)
+{
+    int rounded = (int)floor(value + 0.5);
+    return (uint8_t)(rounded < 0 ? 0 : rounded > 255 ? 255 : rounded);
+}
+
+static void check_yuv_color_matrices(const uint8_t *y, const uint8_t *u, const uint8_t *v)
+{
+    /* ITU-T H.273 Kr/Kb, independent floating-point inverse equations. */
+    static const double kr[] = {0.299, 0.2126, 0.2627};
+    static const double kb[] = {0.114, 0.0722, 0.0593};
+    uint8_t rgba[65 * 3 * 4 + 16];
+    for (int matrix = 0; matrix < 3; ++matrix) {
+        for (int full = 0; full < 2; ++full) {
+            JceYuvColor color = {(JceYuvMatrix)matrix, full != 0};
+            for (uint32_t width = 1; width <= 65; ++width) {
+                memset(rgba, 0x5a, sizeof(rgba));
+                jce_yuv420_to_rgba_color(y, 72, u, 40, v, 40, rgba, width, 3, color);
+                for (uint32_t row = 0; row < 3; ++row) {
+                    for (uint32_t col = 0; col < width; ++col) {
+                        double yy = ((int)y[row * 72 + col] - (full ? 0 : 16))
+                            * (full ? 1.0 : 255.0 / 219.0);
+                        double uu = ((int)u[(row / 2) * 40 + col / 2] - 128)
+                            * (full ? 1.0 : 255.0 / 224.0);
+                        double vv = ((int)v[(row / 2) * 40 + col / 2] - 128)
+                            * (full ? 1.0 : 255.0 / 224.0);
+                        double r = yy + 2.0 * (1.0 - kr[matrix]) * vv;
+                        double b = yy + 2.0 * (1.0 - kb[matrix]) * uu;
+                        double g = (yy - kr[matrix] * r - kb[matrix] * b)
+                            / (1.0 - kr[matrix] - kb[matrix]);
+                        const uint8_t *out = rgba + (row * width + col) * 4;
+                        TEST_ASSERT_UINT8_WITHIN(1, reference_color_channel(r), out[0]);
+                        TEST_ASSERT_UINT8_WITHIN(1, reference_color_channel(g), out[1]);
+                        TEST_ASSERT_UINT8_WITHIN(1, reference_color_channel(b), out[2]);
+                        TEST_ASSERT_EQUAL_UINT8(255, out[3]);
+                    }
+                }
+                for (size_t i = width * 3u * 4u; i < sizeof(rgba); ++i)
+                    TEST_ASSERT_EQUAL_UINT8(0x5a, rgba[i]);
+            }
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(JCE_YUV_BT709, jce_yuv_color_from_cicp(1, false).matrix);
+    TEST_ASSERT_EQUAL_INT(JCE_YUV_BT2020_NCL, jce_yuv_color_from_cicp(9, false).matrix);
+    TEST_ASSERT_EQUAL_INT(JCE_YUV_BT601, jce_yuv_color_from_cicp(2, false).matrix);
+    TEST_ASSERT_TRUE(jce_yuv_color_from_cicp(1, true).full_range);
+}
+
+static void test_yuv_dispatch_matches_scalar_color_and_tails(void)
+{
+    uint8_t y[72 * 3], u[40 * 2], v[40 * 2];
+    uint8_t actual[65 * 3 * 4 + 16], expected[sizeof(actual)];
+    uint32_t seed = 43u;
+    for (size_t i = 0; i < sizeof(y); ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        y[i] = (uint8_t)(seed >> 24);
+    }
+    for (size_t i = 0; i < sizeof(u); ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        u[i] = (uint8_t)(seed >> 24);
+        seed = seed * 1664525u + 1013904223u;
+        v[i] = (uint8_t)(seed >> 24);
+    }
+    /* First exercise the automatically selected, hardware-safe path. Then
+     * disable AVX2 to exercise SSE2/NEON/scalar without requiring AVX2. */
+    for (int path = 0; path < 2; ++path) {
+        if (path) jce_yuv_set_avx2(0);
+        check_yuv_color_matrices(y, u, v);
+        for (uint32_t width = 1; width <= 65; ++width) {
+            memset(expected, 0x5a, sizeof(expected));
+            memset(actual, 0x5a, sizeof(actual));
+            for (uint32_t row = 0; row < 3; ++row) {
+                for (uint32_t col = 0; col < width; ++col) {
+                    int yy = (int)y[row * 72 + col] - 16;
+                    int uu = (int)u[(row / 2) * 40 + col / 2] - 128;
+                    int vv = (int)v[(row / 2) * 40 + col / 2] - 128;
+                    uint8_t *out = expected + (row * width + col) * 4;
+                    out[0] = reference_channel(298 * yy + 409 * vv + 128);
+                    out[1] = reference_channel(298 * yy - 100 * uu - 208 * vv + 128);
+                    out[2] = reference_channel(298 * yy + 516 * uu + 128);
+                    out[3] = 255;
+                }
+            }
+            jce_yuv420_to_rgba(y, 72, u, 40, v, 40, actual, width, 3);
+            TEST_ASSERT_EQUAL_MEMORY(expected, actual, sizeof(actual));
+        }
+    }
+}
+
+static bool compare_odd_fixture(const char *stem, const char *extension, int *max_error)
+{
+    char encoded_path[1024], reference_path[1024];
+    uint64_t size = 0, reference_size = 0;
+    JceVideo video = JCE_VIDEO_INVALID;
+    void *encoded = NULL;
+    uint8_t *reference = NULL;
+    bool matched = false;
+    snprintf(encoded_path, sizeof(encoded_path), "%s/%s.%s", JCE_TEST_COLOR_DIR, stem, extension);
+    encoded = jce_fs_host_read_all(encoded_path, &size);
+    snprintf(reference_path, sizeof(reference_path), "%s/%s.rgba", JCE_TEST_COLOR_DIR, stem);
+    reference = jce_fs_host_read_all(reference_path, &reference_size);
+    if (!encoded || !reference || size > UINT32_MAX || reference_size != 67u * 51u * 4u)
+        goto done;
+    video = jce_video_load_memory(encoded, (uint32_t)size, encoded_path);
+    if (video == JCE_VIDEO_INVALID) goto done;
+    jce_video_seek(video, 1.0, true);
+    const uint64_t start = jce_time_ticks_ms();
+    int width = 0, height = 0;
+    double pts = -1.0;
+    const uint8_t *pixels = NULL;
+    while (jce_time_ticks_ms() - start < 10000u) {
+        jce_video_advance(video, 0.0);
+        pixels = jce_video_get_frame_rgba(video, &width, &height, &pts);
+        if (pixels && jce_video_is_ready_to_play(video) && fabs(pts - 1.0) < 0.00001)
+            break;
+        jce_thread_sleep_ms(5);
+    }
+    if (!pixels || width != 67 || height != 51 || fabs(pts - 1.0) > 0.00001)
+        goto done;
+    *max_error = 0;
+    for (size_t i = 0; i < (size_t)reference_size; ++i) {
+        int error = abs((int)pixels[i] - (int)reference[i]);
+        if (error > *max_error) *max_error = error;
+    }
+    matched = *max_error <= 1;
+done:
+    if (video != JCE_VIDEO_INVALID) jce_video_unload(video);
+    if (encoded) jce_fs_buffer_free(encoded);
+    if (reference) jce_fs_buffer_free(reference);
+    return matched;
+}
+
+static void test_odd_video_chroma_queue_matches_reference(void)
+{
+    int error = -1;
+    TEST_ASSERT_TRUE_MESSAGE(compare_odd_fixture("odd-av1", "mp4", &error),
+                             "67x51 AV1 queue lost color or crop-edge chroma");
+    TEST_ASSERT_TRUE_MESSAGE(compare_odd_fixture("odd-vp9", "webm", &error),
+                             "67x51 VP9 queue lost color or crop-edge chroma");
+}
+
 /* A 60 Hz consumer of a 10 ms device cursor must not inherit its jitter. */
+static void test_late_presentation_preserves_generation_seek_and_final_picture(void)
+{
+    TEST_ASSERT_FALSE(jce_video_presentation_skip(NULL, 7, 1.0, .02, 10.0, false));
+    JceVideoPresentationTarget t = {5.0, 7, 0, true, 0};
+    for (unsigned i = 0; i < 30; ++i) {
+        TEST_ASSERT_EQUAL(i % 3 != 2,
+            jce_video_presentation_skip(&t, 7, 1.0, .02, 10.0, false));
+    }
+    TEST_ASSERT_EQUAL_UINT64(20, t.skipped);
+    TEST_ASSERT_FALSE(jce_video_presentation_skip(&t, 8, 1.0, .02, 10.0, false));
+    TEST_ASSERT_EQUAL_UINT32(0, t.consecutive);
+    TEST_ASSERT_TRUE(jce_video_presentation_obsolete(&t, 7, 1.0, .02, 10.0, false));
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 8, 1.0, .02, 10.0, false));
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 1.0, .02, 10.0, true));
+    t.active = false;
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 1.0, .02, 10.0, false));
+    t.active = true;
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 4.99, .02, 10.0, false));
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 1.0, .02, 0.0, false));
+    t.seconds = 20.0;
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 9.98, .02, 10.0, false));
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, NAN, .02, 10.0, false));
+    t.seconds = NAN;
+    TEST_ASSERT_FALSE(jce_video_presentation_obsolete(&t, 7, 1.0, .02, 10.0, false));
+}
+
+static void test_timestamp_normalization_preserves_seek_and_repeated_pts(void)
+{
+    bool base_set = false;
+    double base = 0.0;
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.0,
+        jce_video_timestamp_normalize(0, 0.0, 60.0, false,
+            &base_set, &base, 100.0, true));
+    TEST_ASSERT_TRUE(base_set);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 100.0, base);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 1.0 / 60.0,
+        jce_video_timestamp_normalize(1, 0.0, 60.0, false,
+            &base_set, &base, 100.0, true));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.25,
+        jce_video_timestamp_normalize(8, 1.0, 60.0, true,
+            &base_set, &base, 100.25, true));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 1.0 + 1.0 / 30.0,
+        jce_video_timestamp_normalize(8, 1.0, 0.0, false,
+            &base_set, &base, -1.0, false));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.0,
+        jce_video_timestamp_normalize(0, 0.0, 30.0, false,
+            &base_set, &base, -1.0, false));
+    TEST_ASSERT_FALSE(base_set);
+}
+
+static void test_seek_trace_is_opt_in_and_generation_bound(void)
+{
+    JceVideoSeekTrace trace = {0};
+    jce_video_seek_trace_begin(&trace, 7, 3.0, 100);
+    jce_video_seek_trace_picture(&trace, 2.0);
+    TEST_ASSERT_FALSE(trace.active);
+    TEST_ASSERT_EQUAL_UINT64(0, trace.pictures);
+    trace.enabled = true;
+    jce_video_seek_trace_begin(&trace, 7, 3.0, 100);
+    jce_video_seek_trace_picture(&trace, 2.0);
+    jce_video_seek_trace_picture(&trace, 3.0);
+    TEST_ASSERT_EQUAL_UINT64(2, trace.pictures);
+    TEST_ASSERT_EQUAL_UINT64(1, trace.preroll_pictures);
+    TEST_ASSERT_TRUE(jce_video_seek_trace_current(&trace, 7, false, false));
+    TEST_ASSERT_FALSE(jce_video_seek_trace_current(&trace, 8, false, false));
+    TEST_ASSERT_FALSE(jce_video_seek_trace_current(&trace, 7, true, false));
+    TEST_ASSERT_FALSE(jce_video_seek_trace_current(&trace, 7, false, true));
+    TEST_ASSERT_FALSE(jce_video_seek_trace_current(NULL, 7, false, false));
+    trace.index_ms = 20;
+    jce_video_seek_trace_begin(&trace, 8, 4.0, 200);
+    TEST_ASSERT_EQUAL_UINT64(0, trace.pictures);
+    TEST_ASSERT_EQUAL_UINT64(0, trace.index_ms);
+    TEST_ASSERT_FALSE(trace.keyframe_known);
+    TEST_ASSERT_EQUAL_UINT64(25, jce_video_seek_trace_elapsed(100, 125));
+    TEST_ASSERT_EQUAL_UINT64(0, jce_video_seek_trace_elapsed(125, 100));
+}
+
 static void test_audio_clock_preserves_picture_cadence(void)
 {
     const double dt = 1.0 / 60.0;
@@ -293,6 +533,179 @@ static uint32_t probe_audio_pull(void *ud, int16_t *out, uint32_t frames)
     return jce_video_audio_pull(*(JceVideo *)ud, out, frames);
 }
 
+static bool probe_resume_after_seek(JceVideo *video, JceAudio *audio,
+                                    JceVoice *voice, unsigned seconds, unsigned tick_ms)
+{
+    if (!audio) return false;
+    const uint64_t ready_start = jce_time_ticks_ms();
+    const double base = jce_video_get_time(*video);
+    while (!jce_video_is_ready_to_play(*video)
+           && jce_time_ticks_ms() - ready_start < 10000u) {
+        jce_video_advance(*video, 0.0);
+        if (fabs(jce_video_get_time(*video) - base) > 0.000001) return false;
+        jce_thread_sleep_ms(16);
+    }
+    uint32_t channels = 0, rate = 0;
+    if (!jce_video_is_ready_to_play(*video)
+        || !jce_video_get_audio_format(*video, &channels, &rate, NULL)) return false;
+    const char *mute = getenv("JCE_TEST_VIDEO_AUDIO_MUTE");
+    *voice = jce_audio_play_stream(audio, probe_audio_pull, video,
+        (uint16_t)channels, rate, mute && mute[0] == '1' ? 0.0f : 0.1f, 1.0f);
+    if (*voice == JCE_VOICE_INVALID) return false;
+    const uint64_t start = jce_time_ticks_ms();
+    uint64_t last = start, next_log = 0;
+    while (jce_time_ticks_ms() - start < (uint64_t)seconds * 1000u) {
+        uint64_t now = jce_time_ticks_ms();
+        jce_video_advance(*video, (double)(now - last) / 1000.0);
+        if (now - start >= next_log) {
+            double picture = -1.0;
+            jce_video_get_frame_rgba(*video, NULL, NULL, &picture);
+            printf("resume wall=%.3f media=%.3f picture=%.3f audio=%.3f frame=%llu\n",
+                   (double)(now - start) / 1000.0, jce_video_get_time(*video), picture,
+                   jce_video_audio_get_time(*video),
+                   (unsigned long long)jce_video_get_frame_counter(*video));
+            next_log += 50u;
+        }
+        last = now;
+        uint64_t done = jce_time_ticks_ms();
+        if (done - now < tick_ms)
+            jce_thread_sleep_ms((uint32_t)(tick_ms - (done - now)));
+    }
+    printf("probe resumed seconds=%u start=%.6f end=%.6f\n",
+           seconds, base, jce_video_get_time(*video));
+    jce_audio_pause(audio, *voice);
+    return jce_video_get_time(*video) >= base + seconds - 0.3;
+}
+
+static void test_hevc_diagnostic_options_are_exact_and_bounded(void)
+{
+    const char *invalid[] = { NULL, "", "0", "9", "01", "1junk", " ", "1 ", "-1" };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        TEST_ASSERT_EQUAL_UINT32(4u, jce_hevc_diagnostic_cores(invalid[i], 4u));
+        TEST_ASSERT_EQUAL_INT(invalid[i] && strcmp(invalid[i], "0") == 0 ? 0 : 1,
+            jce_hevc_diagnostic_keep_threads(invalid[i], 1));
+        TEST_ASSERT_FALSE(jce_hevc_diagnostic_keep_threads(invalid[i], 0));
+    }
+    TEST_ASSERT_EQUAL_UINT32(1u, jce_hevc_diagnostic_cores("1", 4u));
+    TEST_ASSERT_EQUAL_UINT32(8u, jce_hevc_diagnostic_cores("8", 4u));
+    TEST_ASSERT_FALSE(jce_hevc_diagnostic_keep_threads("0", 1));
+    TEST_ASSERT_TRUE(jce_hevc_diagnostic_keep_threads("1", 0));
+    TEST_ASSERT_FALSE(jce_hevc_diagnostic_keep_threads("8", 0));
+}
+
+static unsigned perf_clock_calls;
+static uint64_t perf_fake_clock(void)
+{
+    return ++perf_clock_calls * 100u;
+}
+static void test_private_perf_disabled_never_reads_clock(void)
+{
+    perf_clock_calls = 0;
+    TEST_ASSERT_EQUAL_UINT64(0u, jce_video_perf_begin(false, perf_fake_clock));
+    TEST_ASSERT_EQUAL_UINT64(0u, jce_video_perf_begin(false, perf_fake_clock));
+    TEST_ASSERT_EQUAL_UINT(0u, perf_clock_calls);
+    TEST_ASSERT_EQUAL_UINT64(100u, jce_video_perf_begin(true, perf_fake_clock));
+    TEST_ASSERT_EQUAL_UINT(1u, perf_clock_calls);
+    double ema = 0.0, last = 0.0;
+    jce_video_perf_ema_update(&ema, &last, 20.0);
+    TEST_ASSERT_EQUAL_DOUBLE(20.0, ema);
+    jce_video_perf_ema_update(&ema, &last, 40.0);
+    TEST_ASSERT_EQUAL_DOUBLE(22.0, ema);
+    TEST_ASSERT_EQUAL_DOUBLE(40.0, last);
+    uint64_t frequency = 1000u;
+    TEST_ASSERT_EQUAL_DOUBLE(100000.0, jce_video_perf_us(&frequency, 100u, 200u));
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, jce_video_perf_us(&frequency, 200u, 100u));
+}
+
+static void test_frame_preparation_rejects_invalid_planes_and_stride(void)
+{
+    uint8_t y[16] = {0}, u[4] = {0}, v[4] = {0};
+    JceVideoFrameProcessor p = {0};
+    p.perf_checked = true;
+    JceYuv420Frame input = {y, u, v, 4, 2, 4, 4, jce_yuv_color_from_cicp(1, false)};
+    TEST_ASSERT_TRUE(jce_video_frame_prepare(&p, &input, 2u));
+    uint8_t *saved = p.rgba;
+    size_t cap = p.capacity;
+    uint8_t before[16];
+    memcpy(before, p.rgba, sizeof(before));
+    input.y_stride = 1;
+    TEST_ASSERT_FALSE(jce_video_frame_prepare(&p, &input, 2u));
+    input.y_stride = 4;
+    input.uv_stride = 1;
+    TEST_ASSERT_FALSE(jce_video_frame_prepare(&p, &input, 2u));
+    input.uv_stride = 2;
+    input.y = NULL;
+    TEST_ASSERT_FALSE(jce_video_frame_prepare(&p, &input, 2u));
+    TEST_ASSERT_EQUAL_PTR(saved, p.rgba);
+    TEST_ASSERT_EQUAL_UINT64(cap, p.capacity);
+    TEST_ASSERT_EQUAL_MEMORY(before, p.rgba, sizeof(before));
+    TEST_ASSERT_EQUAL_INT(2, p.width);
+    TEST_ASSERT_EQUAL_INT(2, p.height);
+    jce_video_frame_destroy(&p);
+}
+
+static void test_hevc_perf_stage_counts_and_disabled_state(void)
+{
+    JceHevcPerf p = {0};
+    p.frequency = 1000u;
+    jce_hevc_perf_record(&p, JCE_HEVC_PERF_IO, 100u, 200u);
+    TEST_ASSERT_EQUAL_UINT64(0u, p.count[JCE_HEVC_PERF_IO]);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, p.ema[JCE_HEVC_PERF_IO]);
+    p.enabled = true;
+    jce_hevc_perf_record(&p, JCE_HEVC_PERF_IO, 100u, 200u);
+    jce_hevc_perf_record(&p, JCE_HEVC_PERF_IO, 200u, 400u);
+    TEST_ASSERT_EQUAL_UINT64(2u, p.count[JCE_HEVC_PERF_IO]);
+    TEST_ASSERT_EQUAL_DOUBLE(110000.0, p.ema[JCE_HEVC_PERF_IO]);
+    TEST_ASSERT_EQUAL_DOUBLE(200000.0, p.last[JCE_HEVC_PERF_IO]);
+    TEST_ASSERT_EQUAL_UINT64(0u, p.count[JCE_HEVC_PERF_CODEC]);
+    jce_hevc_perf_record(&p, (JceHevcPerfStage)-1, 100u, 200u);
+    jce_hevc_perf_record(&p, JCE_HEVC_PERF_COUNT, 100u, 200u);
+    TEST_ASSERT_EQUAL_UINT64(2u, p.count[JCE_HEVC_PERF_IO]);
+    jce_hevc_perf_record(&p, JCE_HEVC_PERF_PUBLISH, 300u, 200u);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, p.last[JCE_HEVC_PERF_PUBLISH]);
+    TEST_ASSERT_EQUAL_UINT64(1u, p.count[JCE_HEVC_PERF_PUBLISH]);
+}
+
+static void test_display_preparation_restores_buffer_on_success_and_failure(void)
+{
+    size_t bytes = 17u;
+    TEST_ASSERT_FALSE(jce_video_frame_rgba_bytes(2, 2, NULL));
+    TEST_ASSERT_FALSE(jce_video_frame_rgba_bytes(-1, 2, &bytes));
+    TEST_ASSERT_EQUAL_UINT64(17u, bytes);
+    TEST_ASSERT_TRUE(jce_video_frame_rgba_bytes(2, 2, &bytes));
+    TEST_ASSERT_EQUAL_UINT64(16u, bytes);
+    TEST_ASSERT_EQUAL_INT(SIZE_MAX > UINT32_MAX,
+        jce_video_frame_rgba_bytes(INT_MAX, INT_MAX, &bytes));
+    JceVideoFrameProcessor processor = {0};
+    uint8_t *pixels = NULL;
+    size_t capacity = 0;
+    int width = 0, height = 0;
+    uint8_t y[4] = {16, 80, 160, 235}, u[1] = {128}, v[1] = {128};
+    JceYuv420Frame input = {y, u, v, 2, 1, 2, 2, {JCE_YUV_BT601, false}};
+    TEST_ASSERT_TRUE(jce_video_frame_prepare_display(&processor, &input, 0,
+        &pixels, &capacity, &width, &height));
+    TEST_ASSERT_NULL(processor.rgba);
+    TEST_ASSERT_EQUAL_INT(2, width);
+    TEST_ASSERT_EQUAL_INT(2, height);
+    uint8_t expected[16];
+    jce_yuv420_to_rgba_color(y, 2, u, 1, v, 1, expected, 2, 2, input.color);
+    TEST_ASSERT_EQUAL_MEMORY(expected, pixels, sizeof(expected));
+    uint8_t *saved = pixels;
+    size_t saved_capacity = capacity;
+    TEST_ASSERT_FALSE(jce_video_frame_prepare_display(&processor, NULL, 0,
+        &pixels, &capacity, &width, &height));
+    TEST_ASSERT_EQUAL_PTR(saved, pixels);
+    TEST_ASSERT_EQUAL_UINT64(saved_capacity, capacity);
+    TEST_ASSERT_NULL(processor.rgba);
+    TEST_ASSERT_EQUAL_MEMORY(expected, pixels, sizeof(expected));
+    TEST_ASSERT_TRUE(jce_video_frame_prepare_display(&processor, &input, 0,
+        &pixels, &capacity, &width, &height));
+    TEST_ASSERT_EQUAL_PTR(saved, pixels);
+    jce_video_frame_destroy(&processor);
+    jce_allocator_t allocator = jce_allocator_default();
+    JCE_AFREE(allocator, pixels);
+}
+
 int main(void)
 {
     const char *probe = getenv("JCE_TEST_VIDEO_PROBE");
@@ -340,8 +753,10 @@ int main(void)
                 return 12;
             audio = jce_audio_create();
             if (!audio) return 13;
+            const char *mute = getenv("JCE_TEST_VIDEO_AUDIO_MUTE");
             voice = jce_audio_play_stream(audio, probe_audio_pull, &video,
-                                          (uint16_t)channels, samplerate, 0.1f, 1.0f);
+                                          (uint16_t)channels, samplerate,
+                                          mute && mute[0] == '1' ? 0.0f : 0.1f, 1.0f);
             if (voice == JCE_VOICE_INVALID) return 14;
             printf("probe audio device=%uHz channels=%u duration=%.3f\n",
                    samplerate, channels, audio_duration);
@@ -355,6 +770,9 @@ int main(void)
         if (tick_env && atoi(tick_env) > 0 && atoi(tick_env) <= 1000)
             tick_ms = (unsigned)atoi(tick_env);
         const char *loop_env = getenv("JCE_TEST_VIDEO_LOOP");
+        const char *resume_env = getenv("JCE_TEST_VIDEO_RESUME_SECONDS");
+        unsigned resume_seconds = resume_env ? (unsigned)atoi(resume_env) : 0u;
+        if (resume_seconds > 5u) return 21;
         const bool loop = loop_env && loop_env[0] == '1';
         unsigned wraps = 0u;
         double previous_time = 0.0;
@@ -422,12 +840,20 @@ int main(void)
         }
         printf("probe ended=%d audio_eof=%d\n", jce_video_has_ended(video) ? 1 : 0,
                jce_video_audio_eof(video) ? 1 : 0);
-        if (audio) jce_audio_pause(audio, voice);
+        if (audio) {
+            if (resume_seconds) {
+                /* Mirror the public transport lifecycle: retire resampler/
+                 * source state before seeking, then create a fresh voice
+                 * only after the new picture and PCM are both ready. */
+                jce_audio_stop(audio, voice);
+                voice = JCE_VOICE_INVALID;
+            } else jce_audio_pause(audio, voice);
+        }
         double target = vi.duration * 0.5;
         uint64_t before_frame = jce_video_get_frame_counter(video);
         uint64_t seek_start = jce_time_ticks_ms();
         jce_video_seek(video, target, true);
-        printf("probe seek %.3fs call=%llu ms\n", target,
+        printf("probe seek %.9fs call=%llu ms\n", target,
                (unsigned long long)(jce_time_ticks_ms() - seek_start));
         while ((!jce_video_is_ready_to_play(video)
                 || jce_video_get_frame_counter(video) == before_frame)
@@ -440,7 +866,7 @@ int main(void)
         double landed = -1.0;
         (void)jce_video_get_frame_rgba(video, NULL, NULL, &landed);
         jce_video_get_perf_stats(video, &stats);
-        printf("probe seek frame=%llu wait=%llu ms pts=%.3f\n",
+        printf("probe seek frame=%llu wait=%llu ms pts=%.9f\n",
                (unsigned long long)jce_video_get_frame_counter(video),
                (unsigned long long)(jce_time_ticks_ms() - seek_start), landed);
         printf("probe seek stats dec=%llu disp=%llu drop=%llu q=%d eof=%d\n",
@@ -450,6 +876,18 @@ int main(void)
                stats.q_count, stats.worker_eof ? 1 : 0);
         bool seek_ok = jce_video_get_frame_counter(video) > before_frame
             && landed >= target - 0.05 && landed <= target + 0.25;
+        /* Separate opt-in pixel witness, never enabled in cadence timings. */
+        const char *picture_out = getenv("JCE_TEST_VIDEO_SEEK_RGBA");
+        if (picture_out && picture_out[0] && seek_ok) {
+            int picture_w = 0, picture_h = 0;
+            double picture_pts = -1.0;
+            const uint8_t *picture = jce_video_get_frame_rgba(video, &picture_w, &picture_h, &picture_pts);
+            if (!picture || picture_w <= 0 || picture_h <= 0 ||
+                (uint64_t)picture_w * picture_h > SIZE_MAX / 4u ||
+                !jce_fs_host_write_all(picture_out, picture, (size_t)picture_w * picture_h * 4u)) return 20;
+            printf("probe seek picture=%dx%d pts=%.9f bytes=%llu\n", picture_w, picture_h, picture_pts,
+                   (unsigned long long)((uint64_t)picture_w * picture_h * 4u));
+        }
         if (preview_max && seek_ok) {
             if (jce_video_set_preview_max_dimension(video, 1u)) return 9;
             if (!jce_video_set_preview_max_dimension(video, 0u)) return 10;
@@ -466,6 +904,8 @@ int main(void)
             if (output_w != vi.width || output_h != vi.height) return 11;
             printf("probe restored native output=%dx%d\n", output_w, output_h);
         }
+        if (resume_seconds && (!seek_ok || !probe_resume_after_seek(
+                &video, audio, &voice, resume_seconds, tick_ms))) return 22;
         if (audio) jce_audio_destroy(audio);
         jce_video_unload(video);
         JceReadSourceStats input={0};
@@ -484,12 +924,22 @@ int main(void)
     }
 
     UNITY_BEGIN();
+    RUN_TEST(test_display_preparation_restores_buffer_on_success_and_failure);
+    RUN_TEST(test_private_perf_disabled_never_reads_clock);
+    RUN_TEST(test_hevc_perf_stage_counts_and_disabled_state);
+    RUN_TEST(test_frame_preparation_rejects_invalid_planes_and_stride);
+    RUN_TEST(test_hevc_diagnostic_options_are_exact_and_bounded);
+    RUN_TEST(test_late_presentation_preserves_generation_seek_and_final_picture);
+    RUN_TEST(test_timestamp_normalization_preserves_seek_and_repeated_pts);
+    RUN_TEST(test_seek_trace_is_opt_in_and_generation_bound);
     RUN_TEST(test_audio_clock_preserves_picture_cadence);
     RUN_TEST(test_audio_clock_stalls_and_recovery_are_bounded);
     RUN_TEST(test_h264_mp4_opens_a_real_decoder);
     RUN_TEST(test_fragmented_mp4_has_a_sample_index);
     RUN_TEST(test_load_rejects_non_video_bytes);
     RUN_TEST(test_preview_downsample_keeps_centres_and_ignores_row_padding);
+    RUN_TEST(test_odd_video_chroma_queue_matches_reference);
+    RUN_TEST(test_yuv_dispatch_matches_scalar_color_and_tails);
     int rc = UNITY_END();
 
     if (s_blob) jce_fs_buffer_free(s_blob);

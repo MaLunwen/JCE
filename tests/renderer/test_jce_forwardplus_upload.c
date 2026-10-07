@@ -7,9 +7,8 @@
  * needed: this exercises only the CPU build + the packing math, asserting the
  * bit-for-bit bytes a future fs_pbr.sc (ROUND B) will sample.
  *
- * Reuses the jce_light_cluster identity-camera harness (see
- * test_jce_light_cluster.c): identity view/proj => view space == world space,
- * +Z forward into [near, far], tan_half = 1.
+ * Reuses the right-handed perspective-camera harness from
+ * test_jce_light_cluster.c: identity view, -Z forward, 90-degree FOV.
  */
 
 #include <jce/renderer/jce_forwardplus.h>
@@ -23,7 +22,7 @@
 void setUp(void)    {}
 void tearDown(void) {}
 
-/* ── Shared identity-camera cluster builder ──────────────────────────────── */
+/* ── Shared right-handed camera cluster builder ──────────────────────────────── */
 
 static JceLightCluster *make_cluster(uint32_t cx, uint32_t cy, uint32_t cz,
                                      uint32_t maxpc)
@@ -32,7 +31,8 @@ static JceLightCluster *make_cluster(uint32_t cx, uint32_t cy, uint32_t cz,
     JceLightCluster *lc = jce_light_cluster_create(&d);
     TEST_ASSERT_NOT_NULL(lc);
     jce_mat4 I = jce_m4_identity();
-    jce_light_cluster_set_camera(lc, &I, &I, 1.0f, 100.0f);
+    jce_mat4 projection = jce_m4_perspective(JCE_PI * .5f, 1, 1, 100, false);
+    jce_light_cluster_set_camera(lc, &I, &projection, 1.0f, 100.0f);
     return lc;
 }
 
@@ -152,7 +152,7 @@ static void test_pack_light_params_exact(void)
 static void test_pack_grid_and_index_match_result(void)
 {
     JceLightCluster *lc = make_cluster(8, 8, 16, 16);
-    JceLightProxy L = { { 0.0f, 0.0f, 10.0f }, 2.0f, 0u };
+    JceLightProxy L = { { 0.0f, 0.0f, -10.0f }, 2.0f, 0u };
     TEST_ASSERT_TRUE(jce_light_cluster_build(lc, &L, 1));
     JceLightClusterResult r = jce_light_cluster_get_result(lc);
     TEST_ASSERT_TRUE(r.total_assignments > 0u);
@@ -199,10 +199,10 @@ static void test_pack_grid_and_index_match_result(void)
 
 static void test_pack_front_in_behind_out(void)
 {
-    /* Front light at +Z (in view). */
+    /* Front light at -Z (in view). */
     {
         JceLightCluster *lc = make_cluster(8, 8, 16, 16);
-        JceLightProxy L = { { 0.0f, 0.0f, 10.0f }, 2.0f, 0u };
+        JceLightProxy L = { { 0.0f, 0.0f, -10.0f }, 2.0f, 0u };
         TEST_ASSERT_TRUE(jce_light_cluster_build(lc, &L, 1));
         JceLightClusterResult r = jce_light_cluster_get_result(lc);
 
@@ -226,11 +226,11 @@ static void test_pack_front_in_behind_out(void)
         jce_light_cluster_destroy(lc);
     }
 
-    /* Behind light at -Z (behind near plane) — no assignments at all, so the
+    /* Behind light at +Z (behind near plane) — no assignments at all, so the
      * packed grid is entirely zero counts and the index list is unused. */
     {
         JceLightCluster *lc = make_cluster(8, 8, 16, 16);
-        JceLightProxy L = { { 0.0f, 0.0f, -50.0f }, 2.0f, 0u };
+        JceLightProxy L = { { 0.0f, 0.0f, 50.0f }, 2.0f, 0u };
         TEST_ASSERT_TRUE(jce_light_cluster_build(lc, &L, 1));
         JceLightClusterResult r = jce_light_cluster_get_result(lc);
         TEST_ASSERT_EQUAL_UINT32(0u, r.total_assignments);
@@ -248,7 +248,7 @@ static void test_pack_front_in_behind_out(void)
             TEST_ASSERT_EQUAL_FLOAT(0.0f, p.grid[c * 4 + 1]); /* count == 0 */
         }
         /* The light's params are still packed (it exists, just unassigned). */
-        TEST_ASSERT_EQUAL_FLOAT(-50.0f, p.params[2]);  /* pos.z */
+        TEST_ASSERT_EQUAL_FLOAT(50.0f, p.params[2]);  /* pos.z */
         TEST_ASSERT_EQUAL_FLOAT(2.0f,   p.params[3]);  /* range */
 
         jce_forwardplus_packed_free(&p);

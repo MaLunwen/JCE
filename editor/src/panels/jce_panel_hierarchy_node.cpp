@@ -1,3 +1,6 @@
+#include <jce/os/core/jce_log.h>
+#include "core/jce_editor_alloc.h"
+#include "core/jce_editor_operation_metrics.h"
 /*
  * jce_panel_hierarchy_node.cpp  Entity tree node drawing + helpers.
  */
@@ -53,7 +56,7 @@ void begin_rename_entity(uint32_t id, const char *name)
 
 void record_display_order(uint32_t id)
 {
-    if (s_hier.display_count < HIERARCHY_MAX_DISPLAY)
+    if (s_hier.display_count < s_hier.capacity)
         s_hier.display_order[s_hier.display_count++] = id;
 }
 
@@ -208,6 +211,31 @@ void sort_entity_ids(uint32_t *ids, int count)
     });
 }
 
+/* Small trees retain stack storage; wide nodes query every public child.
+ * Recursive calls own their lists, avoiding shared scratch aliasing. */
+class HierarchyChildren {
+    uint32_t local[JCE_MAX_CHILDREN];
+public:
+    uint32_t *ids = local;
+    int count = 0;
+    explicit HierarchyChildren(uint32_t entity) {
+        int wanted = jce_state_entity_child_count(entity);
+        if (wanted > JCE_MAX_CHILDREN) {
+            if ((size_t)wanted > (64u * 1024u * 1024u) / sizeof(uint32_t)) {
+                LOG_ERROR("hierarchy", "child list exceeds 64 MiB budget");
+                ids = nullptr;
+                return;
+            }
+            ids = (uint32_t *)ED_MALLOC((size_t)wanted * sizeof(uint32_t));
+        }
+        if (!ids) { LOG_ERROR("hierarchy", "child list allocation failed"); return; }
+        count = jce_state_entity_children(entity, ids, wanted);
+        if (count != wanted)
+            LOG_ERROR("hierarchy", "child list incomplete requested=%d actual=%d", wanted, count);
+    }
+    ~HierarchyChildren() { if (ids != local) ED_FREE(ids); }
+};
+
 bool entity_matches_search_recursive(uint32_t entity_id, const char *filter)
 {
     if (!jce_state_entity_exists(entity_id)) return false;
@@ -215,8 +243,9 @@ bool entity_matches_search_recursive(uint32_t entity_id, const char *filter)
     if (entity_matches_search_fields(entity_id, filter))
         return true;
 
-    uint32_t children[JCE_MAX_CHILDREN];
-    int n = jce_state_entity_children(entity_id, children, JCE_MAX_CHILDREN);
+    HierarchyChildren list(entity_id);
+    uint32_t *children = list.ids;
+    int n = list.count;
     for (int i = 0; i < n; i++) {
         if (entity_matches_search_recursive(children[i], filter))
             return true;
@@ -266,7 +295,7 @@ static void hierarchy_flatten_recurse(uint32_t id, int depth)
     if (s_hier.tag_filter > 0 && (int)tag_color != s_hier.tag_filter)
         return;
 
-    if (s_hier.flat_count >= HIERARCHY_MAX_DISPLAY)
+    if (s_hier.flat_count >= s_hier.capacity)
         return;
 
     /* Record into both the flat row list and the full display order (used by
@@ -280,8 +309,9 @@ static void hierarchy_flatten_recurse(uint32_t id, int depth)
 
     int child_count = jce_state_entity_child_count(id);
     if (child_count > 0 && hierarchy_node_is_open(id)) {
-        uint32_t child_ids[JCE_MAX_CHILDREN];
-        int n = jce_state_entity_children(id, child_ids, JCE_MAX_CHILDREN);
+        HierarchyChildren list(id);
+        uint32_t *child_ids = list.ids;
+        int n = list.count;
         sort_entity_ids(child_ids, n);
         for (int i = 0; i < n; i++)
             hierarchy_flatten_recurse(child_ids[i], depth + 1);
@@ -341,7 +371,7 @@ static void flatten_chunk_groups(void)
         const uint32_t *ents = jce_state_streaming_chunk_entities(chunk_id, &cnt);
         if (!ents || cnt == 0) continue;
 
-        if (s_hier.flat_count >= HIERARCHY_MAX_DISPLAY) break;
+        if (s_hier.flat_count >= s_hier.capacity) break;
 
         /* Synthetic header row. */
         s_hier.flat[s_hier.flat_count].id           = chunk_id;
@@ -544,8 +574,13 @@ void draw_entity_row(uint32_t id, int depth)
     /* With NoTreePushOnOpen the return value (open?) is unused — the flatten
      * pass reads the persisted open bit directly, and there is no tree level
      * to pop.  The call still draws the arrow + toggles that bit. */
+    ImGuiStorage *open_storage = ImGui::GetStateStorage();
+    ImGuiID open_key = ImGui::GetID((void *)(intptr_t)id);
+    int previous_open = is_leaf ? 0 : open_storage->GetInt(open_key, -1);
     ImGui::TreeNodeEx((void *)(intptr_t)id, flags,
                       "%s", is_renaming ? "" : name);
+    if (!is_leaf && previous_open != open_storage->GetInt(open_key, -1))
+        s_hier.flat_cache.changed_open_state();
     if (is_prefab)
         ImGui::PopStyleColor();
 
@@ -638,7 +673,9 @@ void draw_entity_row(uint32_t id, int depth)
     }
 
     if (s_hier.reveal_pending && id == s_hier.reveal_target) {
+        JceEditorOperationScope operation_scope("ed_hierarchy_reveal_scroll");
         ImGui::SetScrollHereY(0.35f);
+        jce_editor_hierarchy_reveal_metric(id, true);
         s_hier.reveal_pending = false;
     }
 

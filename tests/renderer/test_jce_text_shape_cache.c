@@ -164,6 +164,8 @@ static void test_the_cached_run_equals_what_harfbuzz_produced(void)
         "every glyph in the fixture string has the same codepoint, so the "
         "per-glyph assertions below cannot fail");
     for (unsigned int i = 0; i < want; i++) {
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(gi[i].codepoint, run[i].glyph_id,
+            "the shaped font glyph was replaced by its Unicode source character");
         TEST_ASSERT_EQUAL_INT32(gp[i].x_offset,  run[i].x_offset);
         TEST_ASSERT_EQUAL_INT32(gp[i].y_offset,  run[i].y_offset);
         TEST_ASSERT_EQUAL_INT32(gp[i].x_advance, run[i].x_advance);
@@ -344,7 +346,8 @@ static void test_an_empty_string_is_a_run_of_zero_not_a_failure(void)
  * runs against hb_font_get_empty(), which is the CHEAPEST shape HarfBuzz can
  * perform -- no cmap, no GSUB, no GPOS, no kerning.  A real font does strictly
  * more work per shape and none of it per cache hit, so this is a lower bound
- * on the saving and a threshold that cannot go flaky on a slow machine.
+ * on the saving. CTest runs this executable serially: competing processes can
+ * preempt either loop asymmetrically, regardless of the machine's clock speed.
  *
  * A timing assertion has to justify itself in a suite that runs on whatever
  * hardware is present.  This one measures a RATIO between two loops in the
@@ -495,10 +498,76 @@ static void test_a_new_chain_generation_is_a_new_run(void)
         "fallback was added -- the tofu would never go away");
 }
 
+static hb_bool_t numbered_glyph(hb_font_t *font, void *font_data,
+                                hb_codepoint_t codepoint, hb_codepoint_t *glyph,
+                                void *user_data)
+{
+    (void)font; (void)font_data; (void)user_data;
+    *glyph = codepoint + 1001u;
+    return 1;
+}
+
+static hb_font_t *numbered_font(void *ctx, uint8_t slot)
+{
+    (void)slot;
+    return ctx;
+}
+
+static hb_blob_t *empty_font_table(hb_face_t *face, hb_tag_t tag, void *user_data)
+{
+    (void)face; (void)tag; (void)user_data;
+    return hb_blob_get_empty();
+}
+
+/* No host font or graphics context: the synthetic font deliberately maps
+ * each Unicode value to a different glyph index. Preserve HarfBuzz's order
+ * and indices on a cache hit; a tableless synthetic face does not certify
+ * real Arabic joining (the retained GPU/font witness covers that). */
+static void test_font_local_glyph_indices_survive_rtl_and_cache(void)
+{
+    /* hb_font_create(empty-face) returns an immutable singleton whose funcs
+     * cannot be replaced. Use a real tableless face for the synthetic font. */
+    hb_face_t *face = hb_face_create_for_tables(empty_font_table, NULL, NULL);
+    hb_face_set_glyph_count(face, 65536);
+    hb_face_set_upem(face, 1000);
+    hb_font_t *font = hb_font_create(face);
+    hb_face_destroy(face);
+    hb_font_funcs_t *funcs = hb_font_funcs_create();
+    hb_font_funcs_set_nominal_glyph_func(funcs, numbered_glyph, NULL, NULL);
+    hb_font_set_funcs(font, funcs, NULL, NULL);
+    hb_font_funcs_destroy(funcs);
+    JceTextFontChain chain = {font, NULL, numbered_font, 0};
+    const char *text = "\xd8\xa7\xd8\xa8\xd8\xac"; /* Arabic alef, beh, jeem. */
+    const uint32_t source[] = {0x0627u, 0x0628u, 0x062cu};
+    hb_buffer_t *reference = hb_buffer_create();
+    hb_buffer_add_utf8(reference, text, -1, 0, -1);
+    hb_buffer_guess_segment_properties(reference);
+    TEST_ASSERT_EQUAL_INT(HB_DIRECTION_RTL, hb_buffer_get_direction(reference));
+    hb_shape(font, reference, NULL, 0);
+    unsigned expected_count = 0;
+    const hb_glyph_info_t *expected = hb_buffer_get_glyph_infos(reference, &expected_count);
+    TEST_ASSERT_EQUAL_UINT32(3, expected_count);
+    for (unsigned lookup = 0; lookup < 2; ++lookup) {
+        uint32_t count = 0;
+        const JceShapedGlyph *run = jce_text_shape(OWNER_A, &chain, text, &count);
+        TEST_ASSERT_NOT_NULL(run);
+        TEST_ASSERT_EQUAL_UINT32(3, count);
+        for (unsigned i = 0; i < 3; ++i) {
+            TEST_ASSERT_EQUAL_UINT32(source[expected[i].cluster / 2u], run[i].codepoint);
+            TEST_ASSERT_EQUAL_UINT32(expected[i].codepoint, run[i].glyph_id);
+            TEST_ASSERT_TRUE(run[i].glyph_id != run[i].codepoint);
+        }
+    }
+    jce_text_shape_forget(OWNER_A);
+    hb_buffer_destroy(reference);
+    hb_font_destroy(font);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_the_cached_run_equals_what_harfbuzz_produced);
+    RUN_TEST(test_font_local_glyph_indices_survive_rtl_and_cache);
     RUN_TEST(test_the_second_lookup_does_not_run_harfbuzz);
     RUN_TEST(test_a_different_string_is_a_different_run);
     RUN_TEST(test_two_owners_do_not_share_an_entry);

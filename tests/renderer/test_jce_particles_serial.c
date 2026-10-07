@@ -40,6 +40,7 @@ static void write_desc_fields(JceJson *obj, const JceParticleEmitterDesc *d)
 {
     jce_json_set_number(obj, "maxParticles", (double)d->max_particles);
     jce_json_set_number(obj, "emitRate",     d->emit_rate);
+    jce_json_set_number(obj, "emitBurst",    d->emit_burst);
     jce_json_set_number(obj, "lifetimeMin",  d->lifetime_min);
     jce_json_set_number(obj, "lifetimeMax",  d->lifetime_max);
     jce_json_set_float_array(obj, "velocityMin", &d->velocity_min.x, 3);
@@ -189,9 +190,25 @@ static void test_minimal_document_keeps_defaults(void)
     remove(TMP_PATH);
 }
 
+static void test_authored_burst_json_contract(void)
+{
+    JceJson *root = jce_json_object();
+    TEST_ASSERT_NOT_NULL(root);
+    jce_json_set_number(root, "emitRate", 0);
+    jce_json_set_number(root, "emitBurst", 256);
+    TEST_ASSERT_TRUE(jce_json_write_file(TMP_PATH, root, true, true));
+    JceParticleEmitterDesc desc;
+    TEST_ASSERT_TRUE(jce_particles_desc_load_json(TMP_PATH, &desc, NULL, 0));
+    TEST_ASSERT_EQUAL_FLOAT(0, desc.emit_rate);
+    TEST_ASSERT_EQUAL_FLOAT(256, desc.emit_burst);
+    jce_particles_desc_free(&desc);
+    remove(TMP_PATH);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_authored_burst_json_contract);
     RUN_TEST(test_full_roundtrip_with_sub_emitter);
     RUN_TEST(test_minimal_document_keeps_defaults);
     return UNITY_END();

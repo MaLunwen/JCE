@@ -15,16 +15,28 @@ Public-header changes require refreshing the requested SDKs and rebuilding their
 
 Dist selects a Release build without Tracy or patented codec paths. Release and dist are distinct products; an old executable cannot be relabeled as dist. Inspect the packaged binary and runtime dependencies, not just the selected preset name.
 
-Stage required managed runtime configuration, Java classes and Python modules alongside their adapters. State any required external .NET/JVM/Python installation. Include project and dependency license information and avoid redistributing unverified local fonts or assets.
+The shipping default is a compact, self-contained native application: embedded Lua and JavaScript plus native C/C++ application code. Python, Java and C# remain optional authoring/SDK integrations with explicitly documented external runtimes. Do not add these VMs or SDK payloads to the shipping executable merely to claim seven embedded languages. Required project scripts must resolve on the target host; reject a missing driver or module instead of silently discarding behavior.
 
-Acceptance includes a relocated package, clean user state, no source-tree asset fallback, representative language/runtime checks and inspected captures. Record the executable hash, source commit, variant, platform and test limits. Packaging completes only after the delivered contents have been verified.
+Acceptance includes only the delivered application in a relocated empty directory, clean user state, no source-tree asset fallback and inspected representative captures. Record executable hash, source identity, variant, platform and test limits. Verify the actual embedded assets/notices and ordinary/delayed imports. This Windows evidence does not establish other platforms.
 
-For Windows native single-EXE delivery, select --standalone. This uses a separate
-static-CRT dependency graph, embeds editor assets and links Lua/C/C++/JavaScript.
-SDKs and external Python/Java/C# runtimes stay separate. Never substitute a
-self-extracting SDK/runtime archive for native single-file execution. Verify
-ordinary and delayed PE imports and start with only the EXE in a relocated,
-empty directory. The full language bundle remains a distinct delivery.
+For the current Windows native single-EXE recipe, `--standalone` selects the static-CRT graph and embedded assets with Lua/JavaScript/native ABI support. Native C/C++ ABI support alone does not prove that a project's script classes are statically registered. A `.jcec` or `.jcecpp` path names a class; putting a descriptor or marker file into a content bundle does not create that class registry. Preserve optional native-module developer tests separately, and explicitly validate the actual static registration or use a behavior-preserving supported portable script variant. Shipping must not depend on a sibling project DLL, external VM, SDK installation or extraction wrapper.
 
-On Windows, a native project's jce_script_api.dll can stay beside its module.
-Relocating the editor requires no project runtime files beside the editor EXE.
+Runtime models are canonical glTF/GLB. Convert and validate supported editor source-format imports and all dependent assets before cooking or packaging. Project policy and tools stay with the consumer; do not insert game-specific rules into the generic engine or editor.
+
+Single-executable delivery is the engine invariant for editor and consumers.
+A Web shipment is one HTML containing its wasm/bootstrap/assets. Cross-target
+probes cannot consume host JNI headers. Static Windows SDK production reuses
+the editor dependency closure; the SDK CRT is part of its installed ABI.
+Check ordinary/delayed imports and relocate only the application file into an
+empty directory. Runtime-created settings are not shipment dependencies.
+Do not certify a native-script admission profile using only source declarations;
+retain actual compiled controller behavior and artifact identity.
+
+## Build and delivery directory ownership
+
+Keep intermediate objects, generated code, link outputs and validation evidence under build/ (or reports/ for shared reports). SDK installation lives under dist/sdk; it is not an application shipment. Stage final editor applications under dist/editor and consumer applications under an explicit dist/apps/<project>/<platform-architecture-variant>/ directory. The application directory contains only its required platform executable/container; native single-file and Web single-HTML shipments contain only that file. Keep hashes, inventories, logs and captures outside it. Packaging is a separate step from compilation; never point a final output at a build cache or recursively copy a link directory. Honor supported --out/--artifact-dir options after reading their help. Document any explicit staging step and validate the exact staged bytes by empty-directory relocation. Runtime-created caches/settings are recorded separately. Concurrent maintainers update the affected en/zh skill references alongside implementation changes and coordinate ownership before editing shared sections.
+
+
+Bundle delivery uses one `.jbundle` file containing its selected scene, scripts and asset closure. It is a content package, not an engine/SDK distribution or independently executable application. The app builder forwards the manifest `bundles` list to the installed SDK embedding helpers; relative paths resolve against the project and list order is preserved. A stock project template can therefore embed a Bundle into the final single executable. Verify both editor reopen and an EXE-only relocated directory; pack/build success alone does not certify gameplay or every target platform.
+
+Windows DIST applications default to the GUI subsystem and must not create a console window. Apply target policy before prebuilt PAK/bundle early returns; embedding must not bypass it. Validate the produced PE subsystem (2=GUI), not just CMake declarations. CLI development tools retain their explicit console policy.

@@ -98,6 +98,10 @@ JCE_API uint64_t JCE_CALL jce_time_ticks_ns(void);
    real-time clock; centralized so callers do not include <time.h>. */
 JCE_API int64_t JCE_CALL jce_time_now_epoch_seconds(void);
 
+/* Realtime UTC milliseconds since the Unix epoch; may adjust with the system
+ * clock. Returns 0 if unavailable. Use the perf counter for elapsed durations. */
+JCE_API int64_t JCE_CALL jce_time_now_epoch_milliseconds(void);
+
 /* Convert two perf-counter samples to elapsed seconds. */
 JCE_API double JCE_CALL jce_time_perf_to_seconds(uint64_t start, uint64_t end);
 

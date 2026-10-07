@@ -8,10 +8,45 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef enum {
+    JCE_YUV_BT601 = 0,
+    JCE_YUV_BT709,
+    JCE_YUV_BT2020_NCL
+} JceYuvMatrix;
+
+typedef struct {
+    JceYuvMatrix matrix;
+    bool full_range;
+} JceYuvColor;
+
+/* Private fixed-point kernel parameters; shared by all SIMD paths. */
+typedef struct {
+    int16_t y_offset, y, rv, gu, gv, bu;
+} JceYuvCoefficients;
+
+/* Unaligned byte planes must not be read through an aliased int pointer. */
+static inline uint32_t jce_yuv_chroma_word(const uint8_t *bytes)
+{
+    uint32_t word;
+    memcpy(&word, bytes, sizeof(word));
+    return word;
+}
+
+/* CICP 1/9 select BT.709/BT.2020 NCL; unspecified/SD use BT.601. This
+ * performs matrix/range conversion only, not HDR tone mapping or gamut work. */
+JceYuvColor jce_yuv_color_from_cicp(int matrix, bool full_range);
+
+void jce_yuv420_to_rgba_color(const uint8_t *y_plane, int y_stride,
+                            const uint8_t *u_plane, int u_stride,
+                            const uint8_t *v_plane, int v_stride,
+                            uint8_t *rgba, uint32_t width, uint32_t height,
+                            JceYuvColor color);
 
 /* Convert planar YUV420P to packed RGBA8 (BT.601 limited range).
  * Uses AVX2 (16px/iter) > SSE2 (8px/iter) > NEON > scalar, selected at runtime.
@@ -35,6 +70,7 @@ typedef struct {
     const uint8_t *y, *u, *v;
     int y_stride, uv_stride;
     int width, height;
+    JceYuvColor color;
 } JceYuv420Frame;
 
 typedef struct {

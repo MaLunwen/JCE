@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
+jce_add_unit_test(test_jce_anim_clip_ownership
+    SOURCES test_jce_anim_clip_ownership.c
+    LINK jce_core jce_animation)
+
 # ----------------------------------------------------------------------- #
 #  L5 animation-layer pure-logic unit tests.                              #
 #                                                                         #

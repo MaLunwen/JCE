@@ -8,17 +8,17 @@
  */
 
 #include "jce_sr_internal.h"
+#include "renderer/jce_gpu_particles_internal.h"
+#include "jce_sr_debug_targets.h"
 
 /* ── CPU particle billboard sprite (shares the GPU pool's shaders) ─────
  *
- * ALL particle emitters render through this CPU path.  The GPU compute path
- * (sr_drive_gpu_particles) is unreliable on Vulkan/D3D12 (bgfx compute-buffer
- * barrier — an over-bright blob), so CPU is the one backend-consistent path.
+ * CPU is the default scene particle route. The compute-driven GPU path is
+ * explicit opt-in and currently supports a subset of authored features.
  * Alive particles from the scene-owned JceParticleSystem are packed into a
  * transient INSTANCE buffer (4x vec4 per particle — the exact layout the GPU
- * pool / cs_particle_update uses) and submitted with the SAME
- * vs_particle+fs_particle program, so the on-screen result is IDENTICAL on
- * every backend: a view-aligned soft-circle sprite (billboarded in the vertex
+ * pool / cs_particle_update uses) and submitted with shared
+ * vs_particle+fs_particle programs: a view-aligned soft-circle sprite (billboarded in the vertex
  * shader off u_invView, additive glow).  Single render path for the editor +
  * shipping runtime.  (Set JCE_GPU_PARTICLES_FORCE=1 to route to the GPU pool.) */
 
@@ -149,6 +149,29 @@ static JceGpuParticleSoft sr_particle_soft_frame(const JceSceneRenderer *sr,
     return soft;
 }
 
+/* Optional simulation-total witness; no transient-render capacity assumption. */
+static bool sr_particle_cpu_snapshot(bgfx_texture_handle_t *texture, uint32_t alive)
+{
+    JceCvar *enabled = jce_cvar_find("r.particles.debug_stats");
+    uint8_t rgba[4];
+    if (!enabled || !jce_cvar_get_bool(enabled) ||
+        !jce_sr_particle_count_encode(alive, rgba)) return false;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || !(caps->supported & BGFX_CAPS_TEXTURE_BLIT) ||
+        !(caps->supported & BGFX_CAPS_TEXTURE_READ_BACK)) return false;
+    if (!BGFX_HANDLE_IS_VALID((*texture))) {
+        *texture = bgfx_create_texture_2d(1, 1, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT, NULL, 0);
+        if (!BGFX_HANDLE_IS_VALID((*texture))) return false;
+    }
+    const bgfx_memory_t *memory = bgfx_copy(rgba, sizeof rgba);
+    if (!memory) return false;
+    bgfx_update_texture_2d(*texture, 0, 0, 0, 0, 1, 1,
+                           memory, UINT16_MAX);
+    return true;
+}
+
 void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
                        const JceCamera *camera, uint16_t view_id)
 {
@@ -158,6 +181,13 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
         (const JceParticleSystem *)jce_scene_internal_particles_get(scene);
     if (!sys) return;
     uint32_t alive = jce_particles_alive_count(sys);
+    sr->cpu_particle_count_valid =
+        sr_particle_cpu_snapshot(&sr->cpu_particle_count_tex, alive) &&
+        sr_particle_cpu_snapshot(&sr->cpu_particle_drawn_tex, 0);
+    if (sr->cpu_particle_count_valid) {
+        sr->cpu_particle_count_frame = jce_renderer_get_frame_index(sr->renderer);
+        sr->cpu_particle_count_scene = scene;
+    }
     if (alive == 0) return;
 
     sr_particle_sprite_lazy_init(sr);
@@ -165,24 +195,23 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
 
     const JceGpuParticleSoft soft = sr_particle_soft_frame(sr, camera);
 
-    uint32_t avail = bgfx_get_avail_instance_data_buffer(
-        alive, (uint16_t)SR_PARTICLE_INST_STRIDE);
-    uint32_t n = alive < avail ? alive : avail;
-    if (n == 0) return;
-
-    bgfx_instance_data_buffer_t idb;
-    bgfx_alloc_instance_data_buffer(&idb, n, (uint16_t)SR_PARTICLE_INST_STRIDE);
-
-    SrParticleBatch batch = { (float *)idb.data, 0u, n };
+    JceCvar *budget = jce_cvar_find("r.particles.cpu_upload_mb");
+    int mb = budget ? jce_cvar_get_int(budget) : 128;
+    if (mb < 0) mb = 0;
+    if (mb > 256) mb = 256;
+    SrParticleUpload upload;
+    if (!sr_particle_upload_begin(&sr->cpu_particle_arena,
+            jce_renderer_get_frame_index(sr->renderer), alive, (uint32_t)mb, &upload)) return;
+    SrParticleBatch batch = {upload.data, 0u, upload.count};
     SrParticleEachCtx ctx = { sys, scene, &batch };
     /* Component-filtered walk (O(#emitters)); O(1) all-clear gate. */
     if (jce_scene_count_particle_emitters(scene) > 0)
         jce_scene_each_particle_emitter(scene, sr_particle_each_entity, &ctx);
+    sr_particle_upload_bind(&sr->cpu_particle_arena, &upload, batch.count);
     if (batch.count == 0) return;
 
     bgfx_set_vertex_buffer(0, sr->particle_quad_vb, 0, 4);
     bgfx_set_index_buffer(sr->particle_quad_ib, 0, 6);
-    bgfx_set_instance_data_buffer(&idb, 0, batch.count);
 
     /* .x=0 → procedural soft circle.  .y=1 → allow motion-stretch: vs_particle
      * elongates only the instances whose baked i_data1 (velocity*stretch) is
@@ -209,6 +238,9 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
                                           BGFX_STATE_BLEND_ONE), 0);
     bgfx_submit(view_id, sr->prog_particle_sprite, 0, BGFX_DISCARD_ALL);
+    if (sr->cpu_particle_count_valid)
+        sr->cpu_particle_count_valid =
+            sr_particle_cpu_snapshot(&sr->cpu_particle_drawn_tex, batch.count);
 }
 
 /* ── GPU particles (compute-driven; P3-E wiring) ──────────────────────
@@ -346,6 +378,9 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
         cfg.gravity      = d->gravity;
         cfg.damping      = 0.0f;   /* no CPU-desc counterpart */
 
+        JceCvar *debug_stats = jce_cvar_find("r.particles.debug_stats");
+        jce_gpu_particles_debug_enable(rec->sys,
+            debug_stats && jce_cvar_get_bool(debug_stats));
         jce_gpu_particles_update(rec->sys, ctx->compute_view, ctx->dt, &cfg);
     }
 

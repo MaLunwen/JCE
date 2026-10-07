@@ -744,6 +744,17 @@ static void cmd_toggle_fullscreen_(void) { jce_editor_toggle_fullscreen(); }
  * Uses engine wrappers only (no platform-specific calls): the host-FS
  * directory helper (mkdir -p) and the engine's local-time formatter, which
  * hide the localtime_r/localtime_s fork. */
+/* Millisecond names avoid overwriting captures made in the same second. */
+static void capture_timestamp_(char *out, size_t capacity)
+{
+    int64_t now_ms = jce_time_now_epoch_milliseconds();
+    int64_t now_s = now_ms > 0 ? now_ms / 1000 : jce_time_now_epoch_seconds();
+    char seconds[32] = {};
+    jce_time_format_local(now_s, "%Y-%m-%d_%H-%M-%S", seconds, sizeof(seconds));
+    snprintf(out, capacity, "%s_%03u", seconds,
+             now_ms > 0 ? static_cast<unsigned>(now_ms % 1000) : 0u);
+}
+
 static void cmd_screenshot_(void)
 {
     char dir[1024];
@@ -751,8 +762,7 @@ static void cmd_screenshot_(void)
     jce_fs_host_create_directory(dir);
 
     char stamp[32];
-    jce_time_format_local(jce_time_now_epoch_seconds(),
-                          "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
+    capture_timestamp_(stamp, sizeof(stamp));
 
     char path[1100];
     snprintf(path, sizeof(path),
@@ -824,8 +834,7 @@ static void cmd_record_toggle_(void)
     jce_fs_host_create_directory(dir);
 
     char stamp[32];
-    jce_time_format_local(jce_time_now_epoch_seconds(),
-                          "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
+    capture_timestamp_(stamp, sizeof(stamp));
     char path[1100];
     snprintf(path, sizeof(path), "%s/rec_%s.mkv", dir, stamp);
 

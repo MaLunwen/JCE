@@ -21,6 +21,7 @@
                                                   * at :800 with no prototype in
                                                   * scope until now (C4013) */
 #include <jce/os/core/jce_filesystem.h>  /* host read for the clip fallback */
+#include <jce/os/core/jce_hashmap.h>
 
 #include <string.h>
 
@@ -61,63 +62,10 @@ void sr_free_morph_vbs(SrAnimInstance *a)
     a->morph_last_count = -1;
 }
 
-/* ── O(1) entity -> anim slot index ──────────────────────────────────
- * Open-addressing hash over sr->anim_idx/anim_idx_keys (capacity 2x the
- * slot cap, power of two; value = slot+1, 0 = empty).  Replaces the linear
- * SR_ANIM_INSTANCE_MAX scan that per-entity per-pass hot paths (bind-pose
- * gates in color/shadow/velocity + the anim update) paid on every call —
- * ~6M comparisons/frame at 4000 skinned chars after the 256-slot raise.
- * Slots never free individually at runtime (wholesale reset at renderer
- * destroy), so the index only ever inserts / rebinds. */
-#define SR_ANIM_IDX_CAP  ((uint32_t)SR_ANIM_INSTANCE_MAX * 2u)
-#define SR_ANIM_IDX_MASK (SR_ANIM_IDX_CAP - 1u)
-
-static uint32_t sr_anim_idx_hash(uint32_t entity)
+/* O(1) lookup; payload addresses survive storage growth. */
+SrAnimInstance *sr_find_anim_instance(JceSceneRenderer *sr, JceEntity entity)
 {
-    return (entity * 2654435761u) & SR_ANIM_IDX_MASK;
-}
-
-/* Insert or update entity -> slot.
- * Termination invariant: slots are never individually released at runtime
- * (only the wholesale renderer destroy), so a slot binds at most ONE entity
- * for the renderer's lifetime => live index entries <= SR_ANIM_INSTANCE_MAX
- * < capacity, and an empty cell always exists.  The probe caps at capacity
- * anyway so a future slot-recycling change degrades to a warn, not a hang. */
-static void sr_anim_idx_put(JceSceneRenderer *sr, uint32_t entity, int slot)
-{
-    uint32_t h = sr_anim_idx_hash(entity);
-    for (uint32_t n = 0; n < SR_ANIM_IDX_CAP; n++) {
-        if (sr->anim_idx[h] == 0 || sr->anim_idx_keys[h] == entity) {
-            sr->anim_idx[h]      = (uint16_t)(slot + 1);
-            sr->anim_idx_keys[h] = entity;
-            return;
-        }
-        h = (h + 1u) & SR_ANIM_IDX_MASK;
-    }
-    LOG_WARN(LOG_TAG, "anim slot index full — entity %u falls back to the "
-             "slot record scan (index invariant violated?)", entity);
-}
-
-static int sr_anim_idx_get(const JceSceneRenderer *sr, uint32_t entity)
-{
-    uint32_t h = sr_anim_idx_hash(entity);
-    for (uint32_t n = 0; n < SR_ANIM_IDX_CAP; n++) {
-        if (sr->anim_idx[h] == 0) return -1;
-        if (sr->anim_idx_keys[h] == entity) return (int)sr->anim_idx[h] - 1;
-        h = (h + 1u) & SR_ANIM_IDX_MASK;
-    }
-    return -1;
-}
-
-/* Find an existing per-entity animation instance (no creation).  O(1). */
-SrAnimInstance *sr_find_anim_instance(JceSceneRenderer *sr, uint32_t entity)
-{
-    int slot = sr_anim_idx_get(sr, entity);
-    if (slot < 0) return NULL;
-    SrAnimInstance *a = &sr->anim_inst[slot];
-    /* A reclaimed slot may now belong to another entity (stale index entry
-     * for the OLD key): the slot's own record is the source of truth. */
-    return (a->used && a->entity == entity) ? a : NULL;
+    return sr ? sr_anim_storage_find(&sr->anim_storage, entity) : NULL;
 }
 
 /* Get-or-create the per-entity animation instance for `entity` bound to the
@@ -193,65 +141,22 @@ static void sr_anim_rebind_model(SrAnimInstance *a, JceModel *model)
 }
 
 static SrAnimInstance *sr_get_anim_instance(JceSceneRenderer *sr,
-                                            uint32_t entity, JceModel *model)
+                                            JceEntity entity, JceModel *model)
 {
-    int free_slot = -1;
-    /* Hot path: O(1) index hit (the overwhelming steady-state case). */
-    {
-        SrAnimInstance *a = sr_find_anim_instance(sr, entity);
-        if (a) {
-            if (a->model != model)
-                sr_anim_rebind_model(a, model);
-            return a;
-        }
+    SrAnimInstance *a = sr_find_anim_instance(sr, entity);
+    if (a) {
+        if (a->model != model) sr_anim_rebind_model(a, model);
+        return a;
     }
-    /* Cold path (index miss => this entity has no slot).  The linear pass
-     * still verifies that (correctness backstop for the index-full warn
-     * path) while finding the first free slot — it runs once per entity
-     * lifetime, not per frame. */
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        SrAnimInstance *a = &sr->anim_inst[i];
-        if (a->used && a->entity == entity) {
-            if (a->model != model)
-                sr_anim_rebind_model(a, model);
-            sr_anim_idx_put(sr, entity, i);   /* heal the missing entry */
-            return a;
-        }
-        if (!a->used && free_slot < 0) free_slot = i;
-    }
-    if (free_slot < 0) {
-        /* Once per renderer, not per entity per frame: a 1000-char crowd past
-         * the cap would otherwise emit (N-cap) lines EVERY frame (~187k lines
-         * over a 200-frame run) — real logging cost + drowns the log. */
+    a = sr_anim_storage_add(&sr->anim_storage, entity, sizeof(*a));
+    if (!a) {
         if (!sr->anim_cache_full_warned) {
             sr->anim_cache_full_warned = true;
-            LOG_WARN(LOG_TAG, "anim instance cache full (%d) — additional "
-                     "skinned entities render at bind pose (warned once)",
-                     SR_ANIM_INSTANCE_MAX);
+            LOG_ERROR(LOG_TAG, "animation instance allocation failed for entity %llu",
+                      (unsigned long long)entity);
         }
         return NULL;
     }
-    SrAnimInstance *a = &sr->anim_inst[free_slot];
-    if (a->sm_binding) jce_anim_sm_binding_destroy(a->sm_binding); /* reclaimed slot */
-    if (a->blend_tree) jce_anim_blend_tree_destroy(a->blend_tree);
-    if (a->ev_pool)    JCE_FREE(a->ev_pool);                       /* reclaimed slot */
-    if (a->avatar_mask) jce_avatar_mask_unload(a->avatar_mask);    /* reclaimed slot */
-    for (int li = 0; li < SR_AVATAR_MAX_LAYERS; li++)             /* reclaimed slot */
-        if (a->layer_mask[li]) jce_avatar_mask_unload(a->layer_mask[li]);
-    if (a->retarget_map) jce_anim_retarget_map_destroy(a->retarget_map); /* reclaimed slot */
-    if (a->aoc) jce_anim_override_controller_unload(a->aoc);       /* reclaimed slot */
-    sr_release_file_clips(a);                                      /* reclaimed slot */
-    /* Reclaimed slot may hold a previous entity's live morph VBs — destroy
-       them BEFORE the memset (which would orphan the handles).  ONLY for a
-       slot that was actually used: a FIRST-TIME slot is zero-initialized and
-       handle idx==0 is a VALID bgfx handle (someone else's dynamic VB) —
-       freeing it here destroyed foreign buffer 0 eight times per newly
-       spawned animated entity, silently corrupting bgfx's handle table at
-       RUNTIME (root of the exit-crash corruption chain). */
-    if (a->used)
-        sr_free_morph_vbs(a);                                      /* reclaimed slot */
-    memset(a, 0, sizeof(*a));
-    /* memset left morph_vb[*].idx == 0 (a VALID handle) — re-mark invalid. */
     sr_init_morph_vbs(a);
     a->entity      = entity;
     a->model       = model;
@@ -266,11 +171,6 @@ static SrAnimInstance *sr_get_anim_instance(JceSceneRenderer *sr,
     JceSkeleton *sk = jce_model_get_skeleton(model);
     if (sk && jce_model_anim_count(model) > 0)
         a->player = jce_anim_player_create(sk);
-    /* Register in the O(1) entity->slot index (a reclaimed slot's OLD key may
-     * still point here; sr_find_anim_instance double-checks the slot record,
-     * so the stale entry is harmless and gets overwritten on that entity's
-     * next allocation). */
-    sr_anim_idx_put(sr, entity, free_slot);
     return a;
 }
 
@@ -1309,7 +1209,7 @@ static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
         SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
         if (!mc || !mc->model) continue;
 
-        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+        SrAnimInstance *ai = sr_find_anim_instance(sr, e);
         if (!ai || ai->skin_palette_count == 0) continue;
 
         JceSkeleton *skel = jce_model_get_skeleton(mc->model);
@@ -1717,7 +1617,7 @@ static void sr_apply_foot_ik(JceSceneRenderer *sr, JceScene *scene,
         SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
         if (!mc || !mc->model) continue;
 
-        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+        SrAnimInstance *ai = sr_find_anim_instance(sr, e);
         if (!ai || ai->skin_palette_count == 0) continue;
 
         JceSkeleton *skel = jce_model_get_skeleton(mc->model);
@@ -1992,7 +1892,7 @@ static void sr_apply_full_body_ik(JceSceneRenderer *sr, JceScene *scene,
         if (!sa || !sa->skeleton_path[0]) continue;
         SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
         if (!mc || !mc->model) continue;
-        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+        SrAnimInstance *ai = sr_find_anim_instance(sr, e);
         if (!ai || ai->skin_palette_count == 0) continue;
         JceSkeleton *skel = jce_model_get_skeleton(mc->model);
         if (!skel || !jce_scene_has_transform(scene, e)) continue;
@@ -2095,7 +1995,7 @@ static void sr_apply_ragdoll_override(JceSceneRenderer *sr, JceScene *scene,
         SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
         if (!mc || !mc->model) continue;
 
-        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+        SrAnimInstance *ai = sr_find_anim_instance(sr, e);
         if (!ai) continue;
 
         const JceSkeleton *skel = jce_model_get_skeleton(mc->model);
@@ -2132,7 +2032,7 @@ static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_skeletal_animator(scene, e)) continue;
 
-        ai = sr_find_anim_instance(sr, (uint32_t)e);
+        ai = sr_find_anim_instance(sr, e);
         if (!ai) continue;
         ai->morph_count = 0;   /* default: no morph this frame (legacy parity) */
 
@@ -2212,8 +2112,8 @@ void sr_pack_bone_palettes(JceSceneRenderer *sr)
     }
 
     uint32_t total_bones = 0;
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        const SrAnimInstance *ai = &sr->anim_inst[i];
+    for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+        const SrAnimInstance *ai = sr->anim_storage.records[i].value;
         if (ai->used && ai->skin_palette_count > 0)
             total_bones += ai->skin_palette_count;
     }
@@ -2253,8 +2153,8 @@ void sr_pack_bone_palettes(JceSceneRenderer *sr)
     }
 
     uint32_t base = 0;
-    for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-        SrAnimInstance *ai = &sr->anim_inst[i];
+    for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+        SrAnimInstance *ai = sr->anim_storage.records[i].value;
         if (!ai->used || ai->skin_palette_count == 0) continue;
         memcpy(sr->bone_pack_buf + (size_t)base * 16u, ai->skin_palette,
                (size_t)ai->skin_palette_count * 16u * sizeof(float));
@@ -2276,8 +2176,8 @@ void sr_pack_bone_palettes(JceSceneRenderer *sr)
      * pads the tail bones with CURRENT (same skeleton in practice). */
     if (BGFX_HANDLE_IS_VALID(sr->bone_prev_tex)) {
         base = 0;
-        for (int i = 0; i < SR_ANIM_INSTANCE_MAX; i++) {
-            const SrAnimInstance *ai = &sr->anim_inst[i];
+        for (uint32_t i = 0; i < sr->anim_storage.count; i++) {
+            const SrAnimInstance *ai = sr->anim_storage.records[i].value;
             if (!ai->used || ai->skin_palette_count == 0) continue;
             uint32_t n    = ai->skin_palette_count;
             uint32_t np   = (ai->prev_skin_valid && ai->prev_skin_palette_count > 0)
@@ -2306,7 +2206,6 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
      * lifecycle, select clips — all shared/lazy state.  The actual pose
      * sampling is deferred into `reqs` and run in parallel afterwards
      * (Pass 2), then frame events fire serially (Pass 3). */
-    SrAnimSample reqs[SR_ANIM_INSTANCE_MAX];
     int req_count = 0;
 
     /* TAA velocity: the editor renders the Scene + Game viewports through this
@@ -2324,22 +2223,13 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
      * already-sampled palette as prev.  Runtime/single-viewport callers that
      * never call begin_velocity_frame keep the original per-render path. */
     if (sr->velocity_frame_driven) {
-        if (sr->skin_anim_gen == sr->vel_frame_gen) return;
+        if (sr->skin_anim_gen == sr->vel_frame_gen && sr->anim_storage_scene == scene) return;
         sr->skin_anim_gen = sr->vel_frame_gen;
     }
 
-    /* O(1) empty-scene early-out: a world with NO SkeletalAnimator components
-     * (e.g. 150k static primitives) paid a per-entity probe below every frame
-     * (~84 ms/frame at 150k = the #1 CPU phase, on loops that could never hit).
-     * Zero components + zero live instances => provably no work; live instances
-     * without components still take the full path so stale-instance pruning
-     * keeps working.  The 256-slot scan is negligible next to the list walk. */
-    if (jce_scene_count_skeletal_animators(scene) == 0) {
-        bool live = false;
-        for (int li = 0; li < SR_ANIM_INSTANCE_MAX; li++)
-            if (sr->anim_inst[li].used) { live = true; break; }
-        if (!live) return;
-    }
+    sr_anim_instances_prune(sr, scene);
+    if (jce_scene_count_skeletal_animators(scene) == 0 && !sr->anim_storage.count)
+        return;
 
     /* Build the animator sub-list once for this update + the IK/morph/ragdoll
      * passes below (see sr_anim_build_selection).  A component ADDED mid-frame
@@ -2347,6 +2237,20 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
     sr_anim_build_selection(sr, scene, list);
 
     const int an = sr_asel_n(list);
+    /* Reserve before creating any requests. Instance payloads are stable,
+     * and the request buffer is never resized while parallel jobs use it. */
+    if ((uint32_t)an > sr->anim_request_capacity) {
+        uint32_t cap = jce_hashmap_cap_pow2((uint32_t)an, 16u);
+        if ((uint64_t)cap * sizeof(SrAnimSample) > SIZE_MAX) return;
+        void *next = JCE_REALLOC(sr->anim_requests, (size_t)cap * sizeof(SrAnimSample));
+        if (!next) {
+            LOG_ERROR(LOG_TAG, "animation request allocation failed for %d actors", an);
+            return;
+        }
+        sr->anim_requests = next;
+        sr->anim_request_capacity = cap;
+    }
+    SrAnimSample *reqs = sr->anim_requests;
     for (int k = 0; k < an; k++) {
         const int i = sr_asel_i(k);
         JceEntity e = list->entities[i];
@@ -2360,7 +2264,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
         SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
         if (!mc || !mc->model) continue;
 
-        SrAnimInstance *ai = sr_get_anim_instance(sr, (uint32_t)e, mc->model);
+        SrAnimInstance *ai = sr_get_anim_instance(sr, e, mc->model);
         /* Before ANY clip is resolved this frame: every resolver below asks
          * ai->aoc, and one that ran first would resolve against last frame's
          * controller -- or against none at all on the frame the field is
@@ -2599,7 +2503,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                         req.ai = ai; req.mode = 2;
                         req.clip_a = from_clip; req.ta = ft; req.wa = 1.0f - ev->blend;
                         req.clip_b = to_clip;   req.tb = tt; req.wb = ev->blend;
-                        if (req_count < SR_ANIM_INSTANCE_MAX) reqs[req_count++] = req;
+                        if (req_count < an) reqs[req_count++] = req;
                         else                                  sr_anim_do_sample(&req);
                         /* Hand the to-clip's running time to the single-clip
                            player on the completion frame (no pose pop). */
@@ -2735,7 +2639,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                 req.ai = ai; req.mode = 2;
                 req.clip_a = clip_a; req.ta = ta; req.wa = wa;
                 req.clip_b = clip_b; req.tb = tb; req.wb = wb;
-                if (req_count < SR_ANIM_INSTANCE_MAX) reqs[req_count++] = req;
+                if (req_count < an) reqs[req_count++] = req;
                 else                                  sr_anim_do_sample(&req);
                 ai->active_clip = -1;   /* tree owns the pose this frame */
                 ai->loop   = sa->loop;
@@ -2887,7 +2791,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
             } else {
                 req.mode = 1;
             }
-            if (req_count < SR_ANIM_INSTANCE_MAX) {
+            if (req_count < an) {
                 reqs[req_count++] = req;
             } else {
                 sr_anim_do_sample(&req);

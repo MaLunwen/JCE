@@ -184,12 +184,16 @@ def source_identity(driver) -> dict:
             "source_state_known": result.returncode in (0, 1)}
 
 
-def build_editor(driver, args, target: dict, env: dict) -> Path:
+def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None) -> Path:
     """Isolated static dependency closure; never relabel a dynamic-CRT build."""
-    if target["host"] != "windows" or driver.HOST != "windows":
-        driver.die("native standalone editor currently requires Windows/MSVC")
-    if args.variant != "dist":
-        driver.die("standalone editor uses --variant dist (Release, no Tracy)")
+    if target["host"] != driver.HOST or target.get("cross"):
+        driver.die("embedded delivery needs the matching native host toolchain")
+    if args.variant not in ("release", "dist"):
+        driver.die("embedded delivery supports release/dist; use authoring for debug")
+    if getattr(args, "script_java", False):
+        driver.die("embedded delivery cannot require an external JVM; choose authoring")
+    if getattr(args, "profiling", None) == "on":
+        driver.die("embedded delivery excludes profiler listeners; choose authoring for profiling")
     stem = target["key"] + "-standalone"
     build = driver.ROOT / "build/desktop" / stem
     conan = driver.ROOT / "build/desktop" / (stem + "-conan")
@@ -202,31 +206,74 @@ def build_editor(driver, args, target: dict, env: dict) -> Path:
                 shutil.rmtree(path)
     driver.sync_conan_hooks()
     driver.export_conan_recipes(env)
-    vs = driver.find_vs_install(target["arch"])
+    vs = driver.find_vs_install(target["arch"]) if target["host"] == "windows" else None
     flags = ["-c", f"tools.microsoft.msbuild:installation_path={vs}"] if vs else []
     driver.run(["conan", "install", ".", "-pr:h", f"conan/profiles/{target['profile']}",
                 "-pr:b", f"conan/profiles/{driver.host_build_profile()}",
-                "-s:h", "compiler.runtime=static", "-o:h", "*:shared=False",
+                *(["-s:h", "compiler.runtime=static"] if target["host"] == "windows" else []),
+                "-o:h", "*:shared=False",
                 "--build=missing", "--output-folder", str(conan),
                 *driver.bgfx_graphics_conan_args(env), *flags], cwd=driver.ROOT, env=env)
     if not driver.DRY_RUN:
         (driver.ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
     driver.run(["cmake", "-S", str(driver.ROOT), "-B", str(build), "-G", "Ninja",
                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
-                "-DJCE_BUILD_VARIANT=dist", "-DJCE_EDITOR_STANDALONE=ON",
+                f"-DJCE_BUILD_VARIANT={args.variant}", "-DJCE_EDITOR_STANDALONE=ON",
+                "-DJCE_DELIVERY_PROFILE=embedded", "-DJCE_ENABLE_PROFILING=OFF",
+                "-DJCE_EDITOR_ARTIFACT_DIR=" + (str(Path(args.artifact_dir).resolve())
+                    if getattr(args, "artifact_dir", None) else ""),
                 "-DJCE_BUILD_SCRIPT_VM_PYTHON=OFF", "-DJCE_BUILD_SCRIPT_CSHARP=OFF",
-                "-DJCE_BUILD_SCRIPT_JAVA=OFF", "-DJCE_ENABLE_SDK_INSTALL=OFF",
+                "-DJCE_BUILD_SCRIPT_JAVA=OFF",
+                *driver.codec_overrides(args),
+                "-DJCE_ENABLE_SDK_INSTALL=" + ("ON" if sdk else "OFF"),
+                *([f"-DCMAKE_INSTALL_PREFIX={sdk}"] if sdk else []),
                 "-DJCE_ENABLE_AI_DISPATCH=OFF", "-DJCE_ENABLE_RENDERDOC=OFF",
                 "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_BUILD_TESTS=OFF", "-DJCE_EMIT_LINK_MAP=ON"],
                cwd=driver.ROOT, env=env)
+    return build
+
+
+def build_sdk(driver, args, target: dict, env: dict) -> Path:
+    """Install a static dependency SDK from the same closure as the editor."""
+    sdk = driver.sdk_install_dir(target, args.variant)
+    sdk = sdk.with_name(sdk.name + "-single")
+    build = _configure(driver, args, target, env, sdk)
+    driver.run(["cmake", "--build", str(build), "--target", "jce_sdk_fat_lib",
+                "jce_scripting_sdk_artifacts",
+                *(["jce_msvc_stl_shims"] if target["host"] == "windows" else []),
+                "jce_pak", "jce_cook", "jce_bin2obj", "jce_bundle_pack", "-j", driver.build_jobs()],
+               cwd=driver.ROOT, env=env)
+    driver.run(["cmake", "--install", str(build), "--config", "Release"],
+               cwd=driver.ROOT, env=env)
+    if not driver.DRY_RUN:
+        languages = ["lua", *driver.sdk_shipped_script_backends(sdk, target)]
+        (sdk / "delivery-profile.json").write_text(json.dumps({"schema": 1,
+            "profile": "embedded", "languages": languages, "external_vm_allowed": False}, indent=2)+"\n", encoding="utf-8")
+        (sdk / "VERSION.txt").write_text("JCE SDK build\n"+
+            f"commit: {driver.git_short_sha()}\nvariant: {args.variant}\n"+
+            "delivery: embedded\nscripts: "+", ".join(languages)+"\n", encoding="utf-8")
+    if getattr(args, "smoke", False):
+        driver._smoke_one(target, sdk, args.variant)
+        driver._smoke_scripting_one(target, sdk, args.variant)
+    driver.log(f"static dependency SDK -> {sdk}")
+    return sdk
+
+
+def build_editor(driver, args, target: dict, env: dict) -> Path:
+    build = _configure(driver, args, target, env)
     driver.run(["cmake", "--build", str(build), "--target", "JCE_Editor", "-j", driver.build_jobs()],
                cwd=driver.ROOT, env=env)
-    exe = build / "dist/jce_editor.exe"
+    output = Path(args.artifact_dir).resolve() if getattr(args, "artifact_dir", None) else build / args.variant
+    exe = output / ("jce_editor.exe" if target["host"] == "windows" else "jce_editor")
     if not driver.DRY_RUN:
-        driver._assert_no_profiler_listener(exe, "dist")
-        report = verify(exe)
-        report["embedded_assets"] = verify_assets(exe, build)
-        report["embedded_notices"] = verify_notices(exe, driver.ROOT)
+        driver._assert_no_profiler_listener(exe, args.variant)
+        if target["host"] == "windows":
+            report = verify(exe)
+            report["embedded_assets"] = verify_assets(exe, build)
+            report["embedded_notices"] = verify_notices(exe, driver.ROOT)
+        else:
+            report = {"sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+                      "relocation_audit": "UNVERIFIED", "system_dependency_audit": "UNVERIFIED"}
         report.update(source_identity(driver))
         (build / "standalone.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     driver.log(f"native standalone editor -> {exe}")
@@ -235,27 +282,33 @@ def build_editor(driver, args, target: dict, env: dict) -> Path:
 
 def package_editor(driver, args) -> None:
     target = driver.resolve_target(args.arch)
-    if target["host"] != "windows" or driver.HOST != "windows" or args.variant != "dist":
-        driver.die("standalone editor packaging requires Windows --variant dist")
+    if target["host"] != driver.HOST or args.variant not in ("release", "dist"):
+        driver.die("embedded packaging needs a matching native release/dist build")
     if getattr(args, "python_runtime", None):
         driver.die("--python-runtime is for the full language bundle, not the native standalone editor")
     env = driver.msvc_env(target)
-    exe = driver.ROOT / "build/desktop" / (target["key"] + "-standalone") / "dist/jce_editor.exe"
+    exe = driver.ROOT / "build/desktop" / (target["key"] + "-standalone") / args.variant / ("jce_editor.exe" if target["host"] == "windows" else "jce_editor")
     if not args.skip_build:
         exe = build_editor(driver, args, target, env)
-    out = Path(args.out).resolve() if args.out else driver.ROOT / "dist/editor" / ("JCE-editor-" + target["key"] + ".exe")
-    if out.suffix.lower() != ".exe":
+    out = Path(args.out).resolve() if args.out else driver.ROOT / "dist/editor" / ("JCE-editor-" + target["key"] + (".exe" if target["host"] == "windows" else ""))
+    if target["host"] == "windows" and out.suffix.lower() != ".exe":
         driver.die("--standalone --out must name an EXE, not a bundle directory")
     if driver.DRY_RUN:
         driver.log(f"native single EXE -> {out}")
         return
+    if target["host"] != "windows":
+        driver.die("embedded artifact built, but non-Windows dependency/relocation audit is not implemented; refusing unverified shipment")
     report = verify(exe)
     report["embedded_assets"] = verify_assets(exe, exe.parents[1])
     report["embedded_notices"] = verify_notices(exe, driver.ROOT)
-    driver._assert_no_profiler_listener(exe, "dist")
+    driver._assert_no_profiler_listener(exe, args.variant)
     report.update(source_identity(driver))
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(exe, out)
-    out.with_suffix(".exe.sha256").write_text(report["sha256"] + "  " + out.name + "\n", encoding="ascii")
-    out.with_suffix(".manifest.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    driver.log(f"native single EXE -> {out}; {report['exe_bytes']} bytes; SDK separate")
+    receipts = driver.ROOT / "build/reports/delivery" / target["key"] / args.variant / out.stem
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / "SHA256SUMS").write_text(report["sha256"] + "  " + out.name + "\n",
+                                      encoding="ascii", newline="\n")
+    (receipts / "manifest.json").write_text(json.dumps(report, indent=2) + "\n",
+                                           encoding="utf-8", newline="\n")
+    driver.log(f"native single EXE -> {out}; {report['exe_bytes']} bytes; receipts -> {receipts}")

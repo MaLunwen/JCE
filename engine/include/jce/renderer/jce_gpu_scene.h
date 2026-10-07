@@ -48,6 +48,7 @@
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -163,6 +164,13 @@ JCE_API bool jce_gpu_scene_is_supported(const JceGpuScene *gs);
 /* Begin a new per-frame batch (clears the appended run records). */
 JCE_API void jce_gpu_scene_begin(JceGpuScene *gs);
 
+/* Select compacted indirect or fixed-count model-batch submission. Defaults
+ * true; unsupported hardware always uses fixed count. Call before begin(),
+ * never while a batch is being assembled. Capability queries keep reporting
+ * hardware/program support; indirect_buffer() reports this dispatch's result.
+ * This does not change the independently submitted foliage path. */
+JCE_API void jce_gpu_scene_set_indirect_enabled(JceGpuScene *gs, bool enabled);
+
 /* Append one model-run's records to the batch.  Tags each record with its
  * partition base + run index (so the cull compacts within the partition) and
  * reports how to draw the run in *out_run (partition base + indirect element).
@@ -203,6 +211,31 @@ JCE_API bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
                                     uint16_t cull_view, const jce_vec4 planes[6]);
 JCE_API void jce_gpu_scene_get_frame_stats(
     const JceGpuScene *gs, JceGpuSceneFrameStats *out_stats);
+
+/* Optional diagnostic snapshot of actual compacted GPU survivor counters.
+ * One RGBA32F texel per visibility group, row-major: low/high unsigned 16-bit
+ * words in R/G, exactly represented as floats; B/A are zero. Decode R + (G << 16).
+ * Padding texels are zero. records counts inputs, never survivors.
+ * Texture is borrowed until the next snapshot or helper destruction. Submit
+ * a typed asynchronous readback in the SAME renderer frame, on a distinct view
+ * ordered after snapshot_view; snapshot_view must follow the cull view.
+ * Call after a successful compacted model dispatch and before begin(). Only
+ * one batch per helper may be dispatched in this renderer frame when taking
+ * a snapshot: a later batch could overwrite counters before the snapshot view.
+ * One snapshot per dispatch is accepted. Fixed-count/unsupported paths return
+ * false, with a cleared output. Normal draws allocate/dispatch nothing here. */
+typedef struct JceGpuSceneSurvivorSnapshot {
+    uint64_t dispatch_serial;
+    uint32_t records;
+    uint32_t groups;
+    JceTextureHandle texture;
+    uint16_t width;
+    uint16_t height;
+} JceGpuSceneSurvivorSnapshot;
+
+JCE_API bool jce_gpu_scene_snapshot_survivors(
+    JceGpuScene *gs, uint16_t snapshot_view,
+    JceGpuSceneSurvivorSnapshot *out_snapshot);
 
 /* Hi-Z occlusion (large-world #5, opt-in). Set the per-frame inputs BEFORE
  * jce_gpu_scene_dispatch: `depth_tex` = the depth-prepass texture idx (the cull

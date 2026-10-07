@@ -1,3 +1,6 @@
+#include "jce_editor_history_identity.h"
+#include "jce_editor_history_entity.h"
+#include "jce_editor_operation_metrics.h"
 /*
  * jce_editor_history.cpp  Undo/redo history and transaction management.
  *
@@ -20,12 +23,35 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h> /* per-entity ser/parse */
 }
 #include <cstdlib>
+#include <cstring>
+#include <jce/os/core/jce_hash.h>
 #include <algorithm>
 #include <array>
+#include <unordered_set>
 
 static std::vector<JceEditorHistoryProvider> s_history_providers;
 static uint64_t s_history_next_sequence = 1u;
 static constexpr size_t kHistoryProviderLimit = 8u;
+
+/* Tokens are private history-session identities, never names or serialized
+ * public IDs. Exact ECS handles prevent recycled indices inheriting a token. */
+static JceEditorHistoryIdentity s_history_identity;
+
+static uint64_t history_entity_token(uint32_t editor_id)
+{
+    if (!s.scene) return 0u;
+    JceEntity entity = jce_state_to_ecs_entity(editor_id);
+    return entity && jce_scene_entity_alive(s.scene, entity)
+        ? s_history_identity.token(entity) : 0u;
+}
+
+static uint32_t history_resolve_token(uint64_t token)
+{
+    JceEntity entity = s_history_identity.handle(token);
+    if (!s.scene || !entity || !jce_scene_entity_alive(s.scene, entity)) return 0u;
+    uint32_t id = (uint32_t)entity;
+    return jce_state_to_ecs_entity(id) == entity ? id : 0u;
+}
 
 static bool history_provider_registered(void *user)
 {
@@ -100,6 +126,7 @@ uint64_t jce_state_history_commit_external(void *user)
 
 void jce_state_history_clear(void)
 {
+    s_history_identity.clear();
     s_undo_history.clear();
     s_redo_history.clear();
     for (const JceEditorHistoryProvider &provider : s_history_providers)
@@ -140,15 +167,26 @@ static bool history_production_suspended(void)
  * Only the outermost matters: a nested begin joins the record already pushed. */
 static uint32_t s_history_edit_scope_entity = 0u;
 
+bool history_entity_edit_compatible(uint32_t entity_id)
+{
+    return s_history_edit_nesting == 0 || s_history_edit_scope_entity == 0u ||
+           s_history_edit_scope_entity == entity_id;
+}
+
 bool history_begin_edit_scoped(uint32_t entity_id)
 {
     if (history_production_suspended())
         return false;
+    if (!history_entity_edit_compatible(entity_id)) {
+        LOG_ERROR(LOG_TAG, "cross-entity nested scoped history is unsupported; use an outer full-scene batch");
+        return false;
+    }
 
     if (s_history_edit_nesting == 0) {
         s_history_edit_scope_entity = entity_id;
         s_history_outer_edit_pushed_snapshot =
             history_push_undo_snapshot_scoped(entity_id);
+        if (!s_history_outer_edit_pushed_snapshot) { s_history_edit_scope_entity = 0; return false; }
     }
 
     ++s_history_edit_nesting;
@@ -181,13 +219,15 @@ void history_end_edit(bool active)
     s_history_edit_scope_entity = 0u;
 
     if (scope != 0u && !s_undo_history.empty() &&
-        s_undo_history.back().entity_id == scope) {
+        s_undo_history.back().entity_token == history_entity_token(scope)) {
         EditorHistorySnapshot current;
         if (history_capture_entity_snapshot(scope, &current)) {
             const EditorHistorySnapshot &before = s_undo_history.back();
             changed = !(before.entity_json == current.entity_json
                         && before.entity_comp_ids == current.entity_comp_ids
-                        && before.entity_order == current.entity_order);
+                        && before.entity_order == current.entity_order
+                        && before.entity_parent_captured == current.entity_parent_captured
+                        && before.entity_parent_token == current.entity_parent_token);
         }
     } else {
         EditorHistorySnapshot current;
@@ -223,6 +263,30 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
     if (!json_text)
         return false;
 
+    s_history_identity.prune([](uint64_t handle) {
+        return s.scene && jce_scene_entity_alive(s.scene, handle);
+    });
+    out->identity_epoch = s_history_identity.epoch();
+    out->entity_tokens.clear();
+    JceJson *identity_root = jce_json_parse(json_text, json_len);
+    const JceJson *identity_entities = jce_json_get(jce_json_get(identity_root, "scene"), "entities");
+    int identity_count = jce_json_array_size(identity_entities);
+    bool identities_ok = identity_root && identity_entities;
+    const JceJson *identity_item = jce_json_first_child(identity_entities);
+    for (int i = 0; identities_ok && i < identity_count; ++i,
+         identity_item = jce_json_next_sibling(identity_item)) {
+        const JceJson *item = identity_item;
+        if (!item) { identities_ok = false; break; }
+        uint32_t id = (uint32_t)(uint64_t)jce_json_get_number(item, "id", 0);
+        JceEntity handle = jce_state_to_ecs_entity(id);
+        if (!handle || !jce_scene_entity_alive(s.scene, handle)) identities_ok = false;
+        else {
+            uint64_t token = s_history_identity.existing_token(handle);
+            if (token) out->entity_tokens.emplace_back(id, token);
+        }
+    }
+    jce_json_free(identity_root);
+    if (!identities_ok) { jce_json_free_string(json_text); return false; }
     out->scene_json = json_text;
     out->scene_path = s.current_scene_path;
     out->selection.assign(s.selected, s.selected + s.selected_count);
@@ -269,7 +333,14 @@ bool history_capture_entity_snapshot(uint32_t entity_id,
     if (!text)
         return false;
 
+    out->identity_epoch = s_history_identity.epoch();
     out->entity_id  = entity_id;
+    out->entity_token = history_entity_token(entity_id);
+    if (!out->entity_token) { jce_json_free_string(text); return false; }
+    JceEntity parent = jce_scene_get_parent(s.scene, e);
+    out->entity_parent_captured = true;
+    out->entity_parent_token = parent ? history_entity_token((uint32_t)parent) : 0;
+    if (parent && !out->entity_parent_token) { jce_json_free_string(text); return false; }
     out->entity_json = text;
     jce_json_free_string(text);
     out->scene_json.clear();
@@ -296,7 +367,12 @@ static bool history_restore_entity_snapshot(const EditorHistorySnapshot &snap,
 {
     if (!s.scene) return false;
 
-    JceEntity e = jce_state_to_ecs_entity(snap.entity_id);
+    if (!snap.identity_epoch || snap.identity_epoch != s_history_identity.epoch()) {
+        LOG_WARN(LOG_TAG, "scoped history belongs to a different scene-history epoch");
+        return false;
+    }
+    const uint32_t resolved_id = history_resolve_token(snap.entity_token);
+    JceEntity e = resolved_id ? jce_state_to_ecs_entity(resolved_id) : JCE_ENTITY_INVALID;
     if (!e || !jce_scene_entity_alive(s.scene, e)) {
         /* REFUSED, not half-applied.  The caller has a rollback path; applying
          * an entity record to a scene where that entity no longer exists would
@@ -307,34 +383,36 @@ static bool history_restore_entity_snapshot(const EditorHistorySnapshot &snap,
         return false;
     }
 
-    HistorySuspendScope suspend;
-
-    /* Components the entity has NOW but the record does not: the edit added
-     * them, so undo removes them.  Done before the parse so a re-added
-     * component gets its recorded values rather than a merge of both. */
-    const int comp_n = jce_component_count();
-    for (int cid = 0; cid < comp_n; ++cid) {
-        if (!jce_scene_has_comp(s.scene, e, cid))
-            continue;
-        bool in_record = false;
-        for (int have : snap.entity_comp_ids)
-            if (have == cid) { in_record = true; break; }
-        if (!in_record)
-            jce_scene_remove_comp(s.scene, e, cid);
-    }
-
-    JceJson *obj = jce_json_parse(snap.entity_json.c_str(),
-                                  snap.entity_json.size());
-    if (!obj) {
-        LOG_WARN(LOG_TAG, "history restore (%s): entity record unparseable",
-                 reason ? reason : "?");
+    uint32_t parent_id = snap.entity_parent_token ? history_resolve_token(snap.entity_parent_token) : 0;
+    if (snap.entity_parent_captured && snap.entity_parent_token && !parent_id) {
+        LOG_WARN(LOG_TAG, "scoped history parent identity is unavailable");
         return false;
     }
-    jce_scene_parse_entity_json(s.scene, e, obj);
-    jce_json_free(obj);
+    JceEntity parent = parent_id ? jce_state_to_ecs_entity(parent_id) : JCE_ENTITY_INVALID;
+    if (snap.entity_parent_captured && snap.entity_parent_token &&
+        (!parent || !jce_scene_entity_alive(s.scene, parent))) {
+        LOG_WARN(LOG_TAG, "scoped history resolved parent handle is unavailable");
+        return false;
+    }
+    HistorySuspendScope suspend;
+    if (!jce_history_restore_entity(s.scene, e, parent, snap.entity_parent_captured,
+                                   (size_t)jce_state_get_entity_count(), snap.entity_json,
+                                   snap.entity_comp_ids, snap.entity_parent_token != 0)) {
+        LOG_WARN(LOG_TAG, "history restore (%s): scoped relation/components rejected", reason ? reason : "?");
+        return false;
+    }
+    if (snap.entity_parent_captured) jce_roots_note_reparented(resolved_id);
 
     if (!snap.entity_order.empty())
-        g_entity_sidecar[snap.entity_id].component_order = snap.entity_order;
+        g_entity_sidecar[resolved_id].component_order = snap.entity_order;
+
+    if (jce_state_get_focused() == resolved_id)
+        jce_editor_inspector_request_sync();
+
+    LOG_INFO(LOG_TAG, "history-entity-restore: token=%llu source_id=%u current_id=%u reason=%s name=%s parent=%u",
+             (unsigned long long)snap.entity_token, snap.entity_id, resolved_id,
+             reason ? reason : "unknown", jce_state_entity_name(resolved_id),
+             jce_state_entity_parent(resolved_id));
 
     /* The selection, the entity handles and the occlusion cullers are all
      * untouched -- which is the other half of what this record buys.  A full
@@ -350,6 +428,7 @@ static size_t history_snapshot_bytes(const EditorHistorySnapshot &snap)
                + snap.entity_comp_ids.capacity() * sizeof(int)
                + snap.entity_order.capacity() * sizeof(int)
                + snap.selection.capacity() * sizeof(uint32_t)
+               + snap.entity_tokens.capacity() * sizeof(std::pair<uint32_t, uint64_t>)
                + sizeof(EditorHistorySnapshot);
     for (const auto &kv : snap.component_orders)
         n += sizeof(uint32_t) + kv.second.capacity() * sizeof(int);
@@ -358,7 +437,7 @@ static size_t history_snapshot_bytes(const EditorHistorySnapshot &snap)
 
 static size_t history_total_bytes(void)
 {
-    size_t total = 0;
+    size_t total = s_history_identity.estimated_bytes();
     for (const auto &it : s_undo_history) total += history_snapshot_bytes(it);
     for (const auto &it : s_redo_history) total += history_snapshot_bytes(it);
     return total;
@@ -450,14 +529,110 @@ bool history_push_undo_snapshot(void)
 }
 
 bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
-                              const char *reason)
+                              const char *reason, bool *mutated)
 {
+    if (mutated) *mutated = false;
     /* Two kinds on one stack; entity_id != 0 is the scoped one. */
-    if (snapshot.entity_id != 0u)
+    if (snapshot.entity_id != 0u) {
+        // Scoped component parsing is not transactional; rollback conservatively.
+        if (mutated) *mutated = true;
         return history_restore_entity_snapshot(snapshot, reason);
+    }
 
     if (snapshot.scene_json.empty())
         return false;
+
+    // Validate snapshot identity before clearing any live scene. Names are not
+    // identity, and duplicate or unknown source IDs cannot be guessed back.
+    JceJson *root = jce_json_parse(snapshot.scene_json.c_str(), snapshot.scene_json.size());
+    const JceJson *entities = jce_json_get(jce_json_get(root, "scene"), "entities");
+    bool identity_valid = root && entities;
+    try {
+    if (identity_valid && snapshot.identity_epoch != 0u) {
+        std::unordered_map<uint32_t, uint64_t> roster;
+        std::unordered_set<uint64_t> tokens;
+        for (const auto &entry : snapshot.entity_tokens)
+            if (!entry.first || !entry.second || !roster.emplace(entry).second ||
+                !tokens.insert(entry.second).second) identity_valid = false;
+        int count = jce_json_array_size(entities);
+        std::unordered_set<uint32_t> source_ids;
+        source_ids.reserve((size_t)count);
+        const JceJson *item = jce_json_first_child(entities);
+        for (int i = 0; identity_valid && i < count; ++i, item = jce_json_next_sibling(item)) {
+            if (!item) { identity_valid = false; break; }
+            uint32_t id = (uint32_t)(uint64_t)jce_json_get_number(item, "id", 0);
+            if (!id || !source_ids.insert(id).second) identity_valid = false;
+            roster.erase(id);
+        }
+        if (!roster.empty()) identity_valid = false;
+    }
+    } catch (const std::bad_alloc &) {
+        LOG_ERROR(LOG_TAG, "history roster validation allocation failed before scene clear");
+        jce_json_free(root); return false;
+    }
+    if (!identity_valid) { jce_json_free(root); return false; }
+
+    // Prepare identity nodes and remap storage before touching the live scene.
+    JceEditorHistoryIdentity::Prepared prepared_identity;
+    std::unordered_map<uint32_t, uint32_t> remap;
+    std::unordered_map<uint32_t, JceEntity> remap_full;
+    std::vector<JceEntity> created;
+    std::vector<uint64_t> identity_handles;
+    try {
+        bool budget_probe = false;
+        const char *metrics = getenv("JCE_EDITOR_OPERATION_METRICS");
+        const char *budget_text = getenv("JCE_EDITOR_HISTORY_IDENTITY_BUDGET_BYTES");
+        if (metrics && strcmp(metrics, "1") == 0 && budget_text) {
+            char *end = nullptr;
+            unsigned long long value = strtoull(budget_text, &end, 10);
+            if (!end || *end || !s_history_identity.set_budget((size_t)value)) {
+                LOG_ERROR(LOG_TAG, "invalid diagnostic history identity budget");
+                jce_json_free(root); return false;
+            }
+            budget_probe = true;
+        }
+        size_t before_len = 0;
+        char *before_text = budget_probe ? jce_scene_serial_save(s.scene, &before_len) : nullptr;
+        std::string before_json;
+        try { if (before_text) before_json.assign(before_text, before_len); }
+        catch (...) { jce_json_free_string(before_text); throw; }
+        jce_json_free_string(before_text);
+        std::vector<uint32_t> before_selection;
+        if (budget_probe) before_selection.assign(s.selected, s.selected + s.selected_count);
+        const uint32_t before_focus = s.focused;
+        const size_t count = (size_t)jce_json_array_size(entities);
+        std::vector<std::pair<uint64_t, uint64_t>> roster;
+        roster.reserve(snapshot.entity_tokens.size()); created.resize(count); identity_handles.resize(snapshot.entity_tokens.size());
+        remap.reserve(count); remap_full.reserve(count);
+        const JceJson *item = jce_json_first_child(entities);
+        for (size_t i = 0; i < count; ++i, item = jce_json_next_sibling(item)) {
+            if (!item) { jce_json_free(root); return false; }
+            uint32_t source = (uint32_t)(uint64_t)jce_json_get_number(item, "id", 0);
+            remap.emplace(source, 0); remap_full.emplace(source, 0);
+        }
+        for (const auto &entry : snapshot.entity_tokens) roster.emplace_back(entry.first, entry.second);
+        if (!s_history_identity.prepare(roster, snapshot.identity_epoch, prepared_identity)) {
+            if (budget_probe) {
+                size_t after_len = 0;
+                char *after = jce_scene_serial_save(s.scene, &after_len);
+                const bool same_scene = after && before_len > 0 && before_json.size() == after_len &&
+                    memcmp(before_json.data(), after, after_len) == 0;
+                const bool same_selection = before_selection.size() == (size_t)s.selected_count &&
+                    std::equal(before_selection.begin(), before_selection.end(), s.selected);
+                LOG_INFO(LOG_TAG, "history-budget-refusal: unchanged=%d selected_unchanged=%d focused_unchanged=%d population=%d before_hash=%llu after_hash=%llu",
+                    same_scene ? 1 : 0, same_selection ? 1 : 0, before_focus == s.focused ? 1 : 0,
+                    jce_state_get_entity_count(),
+                    (unsigned long long)jce_fnv1a64(before_json.data(), before_json.size()),
+                    (unsigned long long)(after ? jce_fnv1a64(after, after_len) : 0));
+                jce_json_free_string(after);
+            }
+            LOG_ERROR(LOG_TAG, "history identity preparation refused before scene clear");
+            jce_json_free(root); return false;
+        }
+    } catch (const std::bad_alloc &) {
+        LOG_ERROR(LOG_TAG, "history restore storage allocation failed before scene clear");
+        jce_json_free(root); return false;
+    }
 
     HistorySuspendScope suspend;
 
@@ -467,12 +642,14 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
      * asset when the next frame reloaded it. jce_scene_clear() is the engine's
      * transactional-reload primitive: it removes user entities while retaining
      * the scene handle, component registry, and resource caches. */
+    if (mutated) *mutated = true;
     g_entity_order.clear();
     ++g_entity_order_gen;
     jce_roots_invalidate();
     g_entity_sidecar.clear();
     if (jce_scene_clear(s.scene) < 0) {
         LOG_WARN(LOG_TAG, "history restore could not clear the scene");
+        jce_json_free(root);
         return false;
     }
     jce_state_clear_selection();
@@ -491,26 +668,23 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
     /* Use the serializer's creation roster to remap editor IDs. Names may
      * repeat and recycled entity indices must never select another object. */
-    JceJson *root = jce_json_parse(snapshot.scene_json.c_str(),
-                                   snapshot.scene_json.size());
-    const JceJson *entities = jce_json_get(jce_json_get(root, "scene"), "entities");
     JceSceneLoadStream *load = root
         ? jce_scene_load_stream_begin(s.scene, root, nullptr) : nullptr;
-    std::unordered_map<uint32_t, uint32_t> remap;
     bool ok = false;
     if (load) {
         jce_scene_load_stream_step(load, 0);
         const uint32_t count = jce_scene_load_stream_new_entities(load, nullptr, 0);
-        std::vector<JceEntity> created(count);
-        jce_scene_load_stream_new_entities(load, created.data(), count);
+        if (count <= created.size()) jce_scene_load_stream_new_entities(load, created.data(), count);
         ok = jce_scene_load_stream_finalize(load) >= 0;
         if (count != (uint32_t)jce_json_array_size(entities)) ok = false;
         if (ok) {
-            for (uint32_t i = 0; i < count; ++i) {
-                const JceJson *item = jce_json_array_at(entities, (int)i);
+            const JceJson *item = jce_json_first_child(entities);
+            for (uint32_t i = 0; i < count; ++i, item = jce_json_next_sibling(item)) {
+                if (!item) { ok = false; break; }
                 const uint32_t old_id = (uint32_t)(uint64_t)
                     jce_json_get_number(item, "id", 0);
-                remap.emplace(old_id, (uint32_t)created[i]);
+                remap.at(old_id) = (uint32_t)created[i];
+                remap_full.at(old_id) = created[i];
             }
         }
     }
@@ -520,6 +694,17 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
                  reason ? reason : "unknown");
         return false;
     }
+
+    for (size_t i = 0; i < prepared_identity.source_ids.size(); ++i)
+        identity_handles[i] = remap_full.at((uint32_t)prepared_identity.source_ids[i]);
+    if (!s_history_identity.commit(prepared_identity, identity_handles)) {
+        LOG_ERROR(LOG_TAG, "history identity commit rejected loader roster");
+        return false;
+    }
+
+    LOG_INFO(LOG_TAG, "history-identity: tracked=%zu population=%zu epoch=%llu",
+             s_history_identity.count(), remap_full.size(),
+             (unsigned long long)s_history_identity.epoch());
 
     /* Rebuild the editor's iteration order from the freshly-loaded ECS. */
     rebuild_entity_order_from_ecs();
@@ -542,6 +727,13 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
     if (focused != remap.end() && jce_state_is_selected(focused->second))
         jce_state_set_focused(focused->second);
     jce_editor_inspector_request_sync();
+    uint32_t focus_id = jce_state_get_focused();
+    uint32_t parent_id = focus_id ? jce_state_entity_parent(focus_id) : 0u;
+    LOG_INFO(LOG_TAG, "history-scene-restore: reason=%s focused=%u token=%llu name=%s parent_name=%s population=%d",
+             reason ? reason : "unknown", focus_id,
+             (unsigned long long)(focus_id ? s_history_identity.existing_token(jce_state_to_ecs_entity(focus_id)) : 0u),
+             focus_id ? jce_state_entity_name(focus_id) : "NONE",
+             parent_id ? jce_state_entity_name(parent_id) : "ROOT", jce_state_get_entity_count());
 
     if (!snapshot.scene_path.empty())
         set_current_scene_path_internal(snapshot.scene_path.c_str());
@@ -553,6 +745,7 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
 void jce_state_undo(void)
 {
+    JceEditorOperationScope operation_scope("ed_undo");
     /* Play is a transient sandbox restored on Stop.  Its mutation stream is
      * kept out of edit-mode history on BOTH sides: production is refused by
      * history_production_suspended() above, and consumption here.  This half
@@ -587,18 +780,25 @@ void jce_state_undo(void)
         return;
     }
 
+    // The inverse record must retain the target's granularity. Capturing a
+    // full scene for an entity edit makes the next traversal recreate every
+    // handle and defeats scoped history identity and cost guarantees.
+    EditorHistorySnapshot target = s_undo_history.back();
     EditorHistorySnapshot current;
-    if (!history_capture_snapshot(&current)) {
+    const bool captured = target.entity_id != 0u
+        ? (target.identity_epoch == s_history_identity.epoch() &&
+           history_capture_entity_snapshot(history_resolve_token(target.entity_token), &current))
+        : history_capture_snapshot(&current);
+    if (!captured) {
         LOG_WARN(LOG_TAG, "undo: failed to capture current state");
         return;
     }
-
-    EditorHistorySnapshot target = s_undo_history.back();
     s_undo_history.pop_back();
     current.sequence = target.sequence;
 
-    if (!history_restore_snapshot(target, "undo")) {
-        if (!history_restore_snapshot(current, "undo rollback"))
+    bool restore_mutated = false;
+    if (!history_restore_snapshot(target, "undo", &restore_mutated)) {
+        if (restore_mutated && !history_restore_snapshot(current, "undo rollback"))
             LOG_ERROR(LOG_TAG, "undo: rollback failed after restore error");
         s_undo_history.push_back(std::move(target));
         LOG_WARN(LOG_TAG, "undo: restore failed");
@@ -615,6 +815,7 @@ void jce_state_undo(void)
 
 void jce_state_redo(void)
 {
+    JceEditorOperationScope operation_scope("ed_redo");
     /* Keep Play-mode mutations isolated from edit-mode history. */
     if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
         LOG_INFO(LOG_TAG, "redo: ignored during Play mode (stop play first)");
@@ -645,18 +846,25 @@ void jce_state_redo(void)
         return;
     }
 
+    // The inverse record must retain the target's granularity. Capturing a
+    // full scene for an entity edit makes the next traversal recreate every
+    // handle and defeats scoped history identity and cost guarantees.
+    EditorHistorySnapshot target = s_redo_history.back();
     EditorHistorySnapshot current;
-    if (!history_capture_snapshot(&current)) {
+    const bool captured = target.entity_id != 0u
+        ? (target.identity_epoch == s_history_identity.epoch() &&
+           history_capture_entity_snapshot(history_resolve_token(target.entity_token), &current))
+        : history_capture_snapshot(&current);
+    if (!captured) {
         LOG_WARN(LOG_TAG, "redo: failed to capture current state");
         return;
     }
-
-    EditorHistorySnapshot target = s_redo_history.back();
     s_redo_history.pop_back();
     current.sequence = target.sequence;
 
-    if (!history_restore_snapshot(target, "redo")) {
-        if (!history_restore_snapshot(current, "redo rollback"))
+    bool restore_mutated = false;
+    if (!history_restore_snapshot(target, "redo", &restore_mutated)) {
+        if (restore_mutated && !history_restore_snapshot(current, "redo rollback"))
             LOG_ERROR(LOG_TAG, "redo: rollback failed after restore error");
         s_redo_history.push_back(std::move(target));
         LOG_WARN(LOG_TAG, "redo: restore failed");

@@ -26,6 +26,7 @@
 
 #include "os/core/jce_memory.h"
 #include "jce_av1_packet.h"
+#include "jce_video_color.h"
 
 #include <dav1d/dav1d.h>
 #include <stdarg.h>
@@ -62,6 +63,14 @@ struct JceAv1Decoder {
     bool           ivf_eof;        /* all IVF packets sent; drain buffered frames */
     unsigned long  send_data_errors;
 };
+
+JceYuvColor jce_av1_decoder_color(const JceAv1Decoder *dec)
+{
+    if (!dec || !dec->pic_valid || !dec->pic.seq_hdr)
+        return jce_yuv_color_from_cicp(2, false);
+    return jce_yuv_color_from_cicp((int)dec->pic.seq_hdr->mtrx,
+                                  dec->pic.seq_hdr->color_range != 0);
+}
 
 /* Per-decoder throttling avoids races between independent preview workers. */
 static bool av1_should_log_send_err(JceAv1Decoder *dec)

@@ -28,6 +28,7 @@
 #include "jce_ui_canvas_widgets.h"
 #include "jce_ui_canvas_fitter.h"
 #include "jce_ui_canvas_layout.h"
+#include "jce_ui_canvas_storage.h"
 #include <jce/middleware/ui/jce_localization.h>
 #include <jce/os/core/jce_filesystem.h>   /* active-VFS font fallback (bundle Play) */
 #include <jce/os/core/jce_i18n.h>
@@ -45,13 +46,20 @@
 #include <bgfx/c99/bgfx.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+static int uc_compare_entity_order(const void *left, const void *right)
+{
+    const JceEntity a = *(const JceEntity *)left;
+    const JceEntity b = *(const JceEntity *)right;
+    return (a > b) - (a < b);
+}
 
 #define LOG_TAG "ui_canvas"
 
 #define UC_MAX_FONTS    32
 #define UC_MAX_TEXTURES 64
-#define UC_MAX_BUTTONS  256
 
 /* How many clip changes one render records.  A bound and not a growth: the
  * log is a diagnostic, and a canvas deep enough to overflow it has a bigger
@@ -67,14 +75,6 @@
  * clipping bug lands in. */
 typedef struct { UCRect rect; bool active; } UCClip;
 
-/* One raycast-eligible node recorded during the layout walk.  Defined up here
- * because JceUICanvas keeps the last frame's list for the editor queries. */
-typedef struct {
-    JceEntity entity;
-    UCRect    rect;         /* ALREADY intersected with `clip` -- see below */
-    float     alpha;        /* inherited canvas-group alpha */
-    bool      interactable; /* inherited canvas-group interactable (AND chain) */
-} UCHit;
 
 
 /* ── The active scissor ─────────────────────────────────────────────────
@@ -159,26 +159,6 @@ typedef struct {
     JceTexture tex;
 } UCTexSlot;
 
-/* Per-widget interaction state, persisted across frames.  Shared by the
- * UIButton click state machine and the UISlider/UIToggle machines:
- *   - button : fade/state/press_inside (Unity ColorTint transition)
- *   - slider : drag_active (a drag that began over the handle keeps tracking
- *              even if the pointer slips slightly off the rect, mirroring the
- *              button press_inside latch)
- *   - toggle : press_inside (same press-inside → release-over click latch as
- *              the button) */
-typedef struct {
-    uint64_t entity;       /* 0 = free slot */
-    float    fade;         /* 0..1 toward target tint (button) */
-    int      state;        /* 0 normal, 1 hover, 2 pressed (button) */
-    bool     press_inside; /* press began over this widget (button/toggle) */
-    bool     drag_active;  /* slider drag in flight */
-    /* Dropdown press latch: the target the press began over —
-     *   -1 = none, -2 = the collapsed main rect, >=0 = an expanded option row.
-     * A click commits only when the release lands over the SAME target
-     * (press-inside → release-over, mirroring the button/toggle latch). */
-    int      dd_press;
-} UCButtonState;
 
 struct JceUICanvas {
     JceRenderer         *renderer;
@@ -201,7 +181,7 @@ struct JceUICanvas {
                                     * a project switch must not keep serving
                                     * the previous project's sprite */
 
-    UCButtonState buttons[UC_MAX_BUTTONS];
+    UCInteractionStore interactions;
 
     uint64_t      last_clicked;
     uint64_t      last_value_changed;  /* slider/toggle/dropdown value changed this render */
@@ -234,7 +214,6 @@ struct JceUICanvas {
     /* The last frame's hit list, kept so the editor can ask what is where
      * without re-running a layout -- and so it asks the SAME question the
      * pointer does, by the same rules.  UCFrame itself is a stack local. */
-    UCHit         last_hits[UC_MAX_BUTTONS];
     int           last_hit_count;
 
     /* THE DRAW-SIDE CLIP LOG, beside last_hits for the same reason last_hits
@@ -449,19 +428,7 @@ static JceTexture uc_get_texture(JceUICanvas *uc, const char *path)
 
 static UCButtonState *uc_button_state(JceUICanvas *uc, uint64_t e)
 {
-    UCButtonState *free_slot = NULL;
-    for (int i = 0; i < UC_MAX_BUTTONS; i++) {
-        if (uc->buttons[i].entity == e) return &uc->buttons[i];
-        if (!free_slot && uc->buttons[i].entity == 0) free_slot = &uc->buttons[i];
-    }
-    if (free_slot) {
-        memset(free_slot, 0, sizeof *free_slot);
-        free_slot->entity   = e;
-        free_slot->fade     = 1.0f;
-        free_slot->dd_press = -1;  /* no dropdown press latched */
-        return free_slot;
-    }
-    return NULL;
+    return uc_interaction_button(&uc->interactions, e);
 }
 
 /* ── Colour helpers ────────────────────────────────────────────────── */
@@ -638,7 +605,7 @@ typedef struct {
     float        ui_scale;
     bool         pixel_perfect;
     /* draw order accumulation for raycast top-most resolution */
-    UCHit        hits[UC_MAX_BUTTONS];
+    UCHit       *hits;
     int          hit_count;
     /* Pointer snapshot for the render pass (dropdown popup hover highlight).
      * Interaction proper still runs in uc_update_*; this is draw-only. */
@@ -1585,8 +1552,24 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
          * presence-gated ones resolve a cached comp_id. */
         JceUIImageComponent *im = jce_scene_get_ui_image(s, node);
         if (im && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_UI_IMAGE)) im = NULL;
-        if (im && uc->renderer)
-            uc_draw_image(uc, fr->view_id, node_rect, im, alpha, fr->ui_scale);
+        JceUIButtonComponent *draw_button = jce_scene_get_ui_button(s, node);
+        if (draw_button && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_UI_BUTTON)) draw_button = NULL;
+        /* Tint at the graphic's hierarchy position. A late redraw covered
+         * child labels, later siblings and modal panels, and ignored clipping.
+         * The interaction pass advances this cached state for the next frame. */
+        UCButtonState *bst = draw_button ? uc_button_state(uc, (uint64_t)node) : NULL;
+        const float *button_color = draw_button ? draw_button->normal_color : NULL;
+        if (bst && bst->state == 1) button_color = draw_button->highlighted_color;
+        else if (bst && bst->state == 2) button_color = draw_button->pressed_color;
+        else if (bst && bst->state == 3) button_color = draw_button->disabled_color;
+        if (im && uc->renderer) {
+            JceUIImageComponent tinted = *im;
+            if (bst) uc_lerp4(im->color, button_color, bst->fade, tinted.color);
+            uc_draw_image(uc, fr->view_id, node_rect, &tinted, alpha, fr->ui_scale);
+        } else if (!im && bst && uc->renderer && bst->fade > 0.0f) {
+            uc_rect_view(uc->renderer, fr->view_id, node_rect->x, node_rect->y,
+                         node_rect->w, node_rect->h, uc_color(button_color, alpha));
+        }
 
         /* Slider / Toggle: draw their own quads (PASS 3).  Each is a
          * graphic in its own right and embeds its own RectTransform, so it
@@ -1708,12 +1691,14 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
         bool ray = (im && im->raycast_target) || (bt != NULL) ||
                    (sl != NULL) || (tg != NULL) || (inf != NULL) || (sv != NULL) ||
                    (dd != NULL);
-        if (ray && blocks && fr->hit_count < UC_MAX_BUTTONS) {
+        if (ray && blocks) {
             /* Clipped to the ancestor viewport, exactly like the draw.  A
              * fully-clipped widget records NO hit at all rather than a hit at
              * coordinates it is not drawn at. */
             UCRect hit_rect = *node_rect;
-            if (!clip || uc_rect_clip(node_rect, clip, &hit_rect)) {
+            if ((!clip || uc_rect_clip(node_rect, clip, &hit_rect)) &&
+                    uc_interaction_reserve_hits(&fr->uc->interactions, (uint32_t)fr->hit_count + 1u)) {
+                fr->hits = fr->uc->interactions.hits;
                 fr->hits[fr->hit_count].entity       = node;
                 fr->hits[fr->hit_count].rect         = hit_rect;
                 fr->hits[fr->hit_count].alpha        = alpha;
@@ -1784,6 +1769,10 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
 
     int n = jce_scene_get_children(s, node, kids, cap);
     if (n <= 0) { if (heap) JCE_FREE(heap); return; }
+
+    /* ECS archetype migration (including component enable changes) must not
+     * change painter or hit-test order. Entity IDs preserve authored order. */
+    qsort(kids, (size_t)n, sizeof(*kids), uc_compare_entity_order);
 
     /* Filter to UI elements only and resolve each child's rect. */
     int ui_n = 0;
@@ -2058,10 +2047,7 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
      * the release that ends the drag cannot also fire on_click -- the failure
      * anyone who has scrolled a list on a phone would notice immediately. */
     const bool dragging = uc_update_scroll_drag(fr, ptr);
-    if (dragging) {
-        for (int i = 0; i < UC_MAX_BUTTONS; i++)
-            uc->buttons[i].press_inside = false;
-    }
+    if (dragging) uc_interaction_cancel_presses(&uc->interactions);
 
     /* Top-most hit = last recorded (drawn last → on top). */
     JceEntity hovered = 0;
@@ -2077,20 +2063,6 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
         }
     }
 
-    /* Reap stale widget states (entities that are no longer any interactive
-     * widget).  The shared state cache is keyed by entity and used by buttons,
-     * sliders AND toggles (uc_update_widgets runs next), so only reap a slot
-     * once its entity carries none of them. */
-    for (int i = 0; i < UC_MAX_BUTTONS; i++) {
-        uint64_t e = uc->buttons[i].entity;
-        if (e &&
-            !jce_scene_has_ui_button(s, (JceEntity)e) &&
-            !jce_scene_has_ui_slider(s, (JceEntity)e) &&
-            !jce_scene_has_ui_toggle(s, (JceEntity)e) &&
-            !jce_scene_has_ui_input_field(s, (JceEntity)e) &&
-            !jce_scene_has_ui_dropdown(s, (JceEntity)e))
-            uc->buttons[i].entity = 0;
-    }
 
     /* Drive each visible button's state. */
     for (int i = 0; i < fr->hit_count; i++) {
@@ -2133,48 +2105,7 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
         st->fade += dt / fade_dur;
         if (st->fade > 1.0f) st->fade = 1.0f;
 
-        /* Overdraw the button's UIImage rect with the current state colour.
-         * The base image was already drawn this frame with its authored
-         * colour; blending authored→state by `fade` makes the transition
-         * visible (Unity ColorTint transition).  Skipped on a headless canvas
-         * — the click state machine above still ran. */
-        /* A button with no UIImage on its own entity used to show NO state
-         * feedback at all: the click state machine ran and on_click fired, but
-         * every one of the four state colours and fade_duration was dead,
-         * because the tint was applied by re-drawing the sibling image.  Draw
-         * the tint on the button's own resolved rect instead when there is no
-         * image to re-draw -- the rect is already in the hit record. */
-        JceUIImageComponent *im = uc->renderer ? jce_scene_get_ui_image(s, e) : NULL;
-        if (!im && uc->renderer && st->fade > 0.0f) {
-            const float *bcol = bt->normal_color;
-            if (st->state == 1) bcol = bt->highlighted_color;
-            else if (st->state == 2) bcol = bt->pressed_color;
-            else if (st->state == 3) bcol = bt->disabled_color;
-            uc_rect_view(uc->renderer, fr->view_id,
-                                      fr->hits[i].rect.x, fr->hits[i].rect.y,
-                                      fr->hits[i].rect.w, fr->hits[i].rect.h,
-                                      uc_color(bcol, fr->hits[i].alpha));
-        }
-        if (im) {
-            const float *col = bt->normal_color;
-            if (st->state == 1) col = bt->highlighted_color;
-            else if (st->state == 2) col = bt->pressed_color;
-            else if (st->state == 3) col = bt->disabled_color;
-            float blended[4];
-            uc_lerp4(im->color, col, st->fade, blended);
-            uint32_t tint = uc_color(blended, fr->hits[i].alpha);
-            JceTexture tex = uc_get_texture(uc, im->sprite_path);
-            if (jce_texture_valid(tex))
-                uc_tex_view(uc->renderer, fr->view_id,
-                                            fr->hits[i].rect.x, fr->hits[i].rect.y,
-                                            fr->hits[i].rect.w, fr->hits[i].rect.h,
-                                            tex, tint, NULL);
-            else
-                uc_rect_view(uc->renderer, fr->view_id,
-                                          fr->hits[i].rect.x, fr->hits[i].rect.y,
-                                          fr->hits[i].rect.w, fr->hits[i].rect.h,
-                                          tint);
-        }
+
     }
 }
 
@@ -2235,18 +2166,6 @@ static void uc_update_widgets(UCFrame *fr, const JceUIPointer *ptr, float dt)
         }
     }
 
-    /* Reap stale states (entities that are no longer slider/toggle/button/
-     * input-field/dropdown). */
-    for (int i = 0; i < UC_MAX_BUTTONS; i++) {
-        uint64_t e = uc->buttons[i].entity;
-        if (e &&
-            !jce_scene_has_ui_button(s, (JceEntity)e) &&
-            !jce_scene_has_ui_slider(s, (JceEntity)e) &&
-            !jce_scene_has_ui_toggle(s, (JceEntity)e) &&
-            !jce_scene_has_ui_input_field(s, (JceEntity)e) &&
-            !jce_scene_has_ui_dropdown(s, (JceEntity)e))
-            uc->buttons[i].entity = 0;
-    }
 
     /* ── InputField focus management ──────────────────────────────────
      * A pointer press that begins this frame: if it lands on an interactable
@@ -2476,7 +2395,8 @@ static void uc_sort_canvases(JceScene *s, UCCanvasList *cl)
         int j = i - 1;
         while (j >= 0) {
             JceCanvasComponent *cj = jce_scene_get_canvas(s, cl->list[j]);
-            if ((cj ? cj->sort_order : 0) <= kso) break;
+            int cso = cj ? cj->sort_order : 0;
+            if (cso < kso || (cso == kso && cl->list[j] <= key)) break;
             cl->list[j + 1] = cl->list[j];
             j--;
         }
@@ -2506,6 +2426,7 @@ void jce_ui_canvas_destroy(JceUICanvas *uc)
     for (int i = 0; i < uc->texture_count; i++)
         if (jce_texture_valid(uc->textures[i].tex))
             jce_texture_destroy(uc->textures[i].tex);
+    uc_interaction_destroy(&uc->interactions);
     JCE_FREE(uc);
 }
 
@@ -2515,6 +2436,8 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
 {
     if (!uc || !scene || screen_w <= 0 || screen_h <= 0) return;
     JCE_PROFILE_ZONE_N("UICanvas::Render");
+    uc_interaction_begin(&uc->interactions, scene);
+    uc->last_hit_count = 0;
 
     /* Remember the scene so the (canvas-only) text/key delivery functions can
      * resolve the focused field's component this frame. */
@@ -2565,6 +2488,7 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
     UCFrame fr;
     fr.uc = uc; fr.scene = scene; fr.view_id = view_id;
     fr.hit_count = 0;
+    fr.hits = uc->interactions.hits;
     uc->clip_log_count = 0;   /* the log describes THIS render, not the last */
     fr.ptr_x = pointer ? pointer->x : 0.0f;
     fr.ptr_y = pointer ? pointer->y : 0.0f;
@@ -2651,12 +2575,18 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
                        /*interactable*/true, 0, /*clip*/NULL);
     }
 
-    uc_update_buttons(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
-    uc_update_widgets(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
+    if (!uc->interactions.allocation_failed) {
+        uc_update_buttons(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
+        uc_update_widgets(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
+    }
+    if (uc->interactions.allocation_failed) {
+        LOG_ERROR(LOG_TAG, "canvas interaction storage allocation failed; input records invalid");
+        fr.hit_count = 0;
+        uc->last_clicked = uc->last_value_changed = 0;
+    }
 
     /* Publish the frame's hit list for the editor queries below. */
     uc->last_hit_count = fr.hit_count;
-    for (int i = 0; i < fr.hit_count; i++) uc->last_hits[i] = fr.hits[i];
     uc->last_modal_rect   = fr.modal_rect;
     uc->last_modal_owner  = fr.modal_owner;
     uc->last_modal_active = fr.modal_active;
@@ -2675,7 +2605,7 @@ uint64_t jce_ui_canvas_pick(const JceUICanvas *uc, float x, float y)
      * a scrolled-out row is not pickable -- which is the whole point of asking
      * the canvas instead of walking the scene. */
     for (int i = uc->last_hit_count - 1; i >= 0; i--) {
-        const UCHit *h = &uc->last_hits[i];
+        const UCHit *h = &uc->interactions.hits[i];
         if (h->alpha <= 0.001f) continue;
         if (uc->last_modal_active && h->entity != uc->last_modal_owner &&
             uc_point_in(&uc->last_modal_rect, x, y)) continue;
@@ -2709,8 +2639,8 @@ bool jce_ui_canvas_entity_rect(const JceUICanvas *uc, uint64_t entity,
 {
     if (!uc || !entity) return false;
     for (int i = uc->last_hit_count - 1; i >= 0; i--) {
-        if ((uint64_t)uc->last_hits[i].entity != entity) continue;
-        const UCRect *r = &uc->last_hits[i].rect;
+        if ((uint64_t)uc->interactions.hits[i].entity != entity) continue;
+        const UCRect *r = &uc->interactions.hits[i].rect;
         if (out_x) *out_x = r->x;
         if (out_y) *out_y = r->y;
         if (out_w) *out_w = r->w;

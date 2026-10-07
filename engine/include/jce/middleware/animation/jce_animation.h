@@ -26,6 +26,11 @@ typedef struct JceSkeleton   JceSkeleton;
 JCE_API const char *jce_anim_clip_name(const JceAnimClip *clip);
 JCE_API float       jce_anim_clip_duration(const JceAnimClip *clip);
 
+/** Release an owned clip returned by jce_anim_clip_parse(). NULL is safe.
+ * Stop or destroy its players first. Model clips are borrowed: do not free
+ * them independently of their model. Call on the clip's owning thread. */
+JCE_API void jce_anim_clip_destroy(JceAnimClip *clip);
+
 /* -- Animation player ---------------------------------------------- */
 
 /* Create a player bound to a skeleton. */

@@ -328,7 +328,7 @@ void jce_occlusion_culler_reset(JceOcclusionCuller *oc)
     oc->queries_exhausted_warned = false;
     oc->table_full_warned        = false;
     memset(&oc->stats, 0, sizeof(oc->stats));
-    LOG_INFO(LOG_TAG, "occlusion culler reset (scene swap)");
+    LOG_DEBUG(LOG_TAG, "occlusion query history reset");
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────────── */

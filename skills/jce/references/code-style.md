@@ -7,3 +7,8 @@ Use JCE allocation, filesystem, threading and math wrappers. Platform details be
 Owned text uses LF on disk and in Git. BAT/CMD files use CRLF on disk and LF in Git. Preserve binary assets and original upstream bytes. .editorconfig and .gitattributes are the authorities; do not infer newline style from an existing mixed file.
 
 The file-size gate enforces a soft 2,000-line and hard 3,000-line limit. Split at a responsibility boundary; do not raise a baseline merely to accommodate growth. Avoid unrelated formatting while fixing behavior.
+
+Use readable US English and ASCII in first-party code/comments where practical;
+localized UI text belongs to i18n resources. Follow repository formatting and
+readable Linux/Luanti-style conventions. Optional owner-supplied style PDFs do
+not become clone prerequisites. Runtime is C99 too; editor remains C++20.

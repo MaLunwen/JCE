@@ -19,7 +19,7 @@
 6. **GUIDs**: every entity & asset reference uses 128-bit GUID stored as hex string. Never local pointer / index.
 7. **Prefab overrides** stored as field-level patch (path → new value), not full re-serialization.
 8. **All paths PhysFS-mounted** — never absolute filesystem paths in saved files.
-9. **Bind content context before deserialize** — source loads follow their project root; Bundle/Catalog loads install the isolated VFS and refresh render/component paths before creating entities. Unmount on every return to a plain scene, including async loads.
+9. **Bind content context before deserialize** — source loads follow their project root; Bundle/Catalog loads install the isolated VFS and refresh render/component paths before creating entities. Unmount on every return to a plain scene, including async loads. Startup/last-scene async dispatch recognizes .jbundle and .jbundle.json before the plain JSON parser, using the same isolated loader as Open Bundle.
 
 ## Don't
 - Don't serialize transient runtime state (collision contacts, render IDs).

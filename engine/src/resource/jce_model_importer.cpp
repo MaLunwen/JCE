@@ -213,6 +213,7 @@ static bool build_cpu_mesh_data(const aiScene *scene, JceModelCpuMeshData *out)
     return true;
 }
 
+#ifndef JCE_MODEL_IMPORTER_COOK_ONLY
 /* Merge all meshes in the scene into a single JceMesh. */
 static JceMesh *convert_all_meshes(const aiScene *scene)
 {
@@ -225,6 +226,8 @@ static JceMesh *convert_all_meshes(const aiScene *scene)
     jce_model_importer_free_cpu(&cpu);
     return mesh;
 }
+
+#endif /* !JCE_MODEL_IMPORTER_COOK_ONLY */
 
 /* ─── Per-part extraction ─────────────────────────────────────────
  * Walk the node tree (no PreTransformVertices) and emit one part per
@@ -565,6 +568,7 @@ static bool jce_model_importer_load_cpu_file_impl(const char *file_path,
     return true;
 }
 
+#ifndef JCE_MODEL_IMPORTER_COOK_ONLY
 JceMesh *jce_model_importer_load_pak(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return nullptr;
@@ -650,6 +654,8 @@ JceMesh *jce_model_importer_load_file(const char *file_path)
 
     return mesh;
 }
+
+#endif /* !JCE_MODEL_IMPORTER_COOK_ONLY */
 
 #ifndef JCE_MODEL_IMPORTER_COOK_ONLY
 /* ══════════════════════════════════════════════════════════════════════

@@ -115,3 +115,26 @@ diag/
 /tools/build/android/app/src/main/jniLibs/
 
 /examples/*/local_assets/
+
+# SDK regression applications reuse local caches without publishing output.
+/tests/consumers/*/build/
+/tests/consumers/*/native/build/
+/tests/consumers/*/native/bin/
+/tests/consumers/*/dist/
+/tests/consumers/elemental_serenity/archive/
+/tests/consumers/elemental_serenity/resources/assets/**
+!tests/consumers/elemental_serenity/resources/assets/bundle_roots.json
+!tests/consumers/elemental_serenity/resources/assets/render_settings.json
+!tests/consumers/elemental_serenity/resources/assets/scenes/
+!tests/consumers/elemental_serenity/resources/assets/scenes/**
+!tests/consumers/elemental_serenity/resources/assets/scene_ai/
+!tests/consumers/elemental_serenity/resources/assets/scene_ai/**
+!tests/consumers/elemental_serenity/resources/assets/scripts/
+!tests/consumers/elemental_serenity/resources/assets/scripts/**
+!tests/consumers/elemental_serenity/resources/assets/particles/
+!tests/consumers/elemental_serenity/resources/assets/particles/**
+
+# Retained local outputs from the relocated Snake regression project.
+/examples/snake_seven/csharp/bin/
+/examples/snake_seven/csharp/obj/
+/examples/snake_seven/shots/

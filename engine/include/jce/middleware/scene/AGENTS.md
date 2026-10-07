@@ -24,6 +24,11 @@ Public API surface for the ECS / scene subsystem.  Consumed via
 | `jce_virtual_camera.h` · `jce_vcam_system.h` | Cinemachine-style vcams + blender. |
 | `jce_scene_systems.h`           | **P3-B.5** — read-only introspection of the active scene's flecs systems (name, group, `time_spent` ms, matched entity count, enabled flag) plus `jce_scene_set_system_enabled`. Editor's Systems panel consumes this without ever touching `<flecs.h>`. |
 
+`jce_scene_stress.h` exposes diagnostic subtree generation and scene-local
+bounded motion to editor and SDK Player consumers. It has no renderer, host,
+project or third-party type in its descriptor. Requests report actual counts
+and fail explicitly at resource/primitive limits.
+
 ## Rules
 
 1. **flecs stays private.**  POD components only — no `ecs_world_t *`,

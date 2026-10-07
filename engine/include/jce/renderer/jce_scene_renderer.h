@@ -15,6 +15,7 @@
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_fullscreen_effect.h>
+#include <jce/renderer/jce_gpu_scene.h>
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
@@ -152,8 +153,8 @@ typedef struct {
 
     /* Broadphase frustum culling using the spatial grid. Approximate AABBs
      * are derived from each entity's transform position + scale (a precise
-     * mesh AABB hookup is a future-work item). Default OFF — opt in when
-     * scenes grow large enough to benefit from the index. */
+     * mesh AABB hookup is a future-work item). The default configuration
+     * enables this; callers can disable it for a controlled comparison. */
     bool                 frustum_culling;
 
 
@@ -1002,6 +1003,13 @@ typedef struct JceSceneGpuDrivenStats {
 
 JCE_API void jce_scene_renderer_get_gpu_driven_stats(
     const JceSceneRenderer *sr, JceSceneGpuDrivenStats *out);
+
+/* Optional snapshot from the most recent compacted color model batch, using
+ * the GPUScene snapshot/readback lifetime and explicit view-order contract.
+ * Does not include shadow, foliage or meshlet counters. */
+JCE_API bool jce_scene_renderer_snapshot_gpu_survivors(
+    JceSceneRenderer *sr, uint16_t snapshot_view,
+    JceGpuSceneSurvivorSnapshot *out_snapshot);
 
 /* Per-frame occlusion culling stats.
  * Only meaningful when an occlusion culler was bound in config. */

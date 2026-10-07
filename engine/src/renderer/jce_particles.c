@@ -52,6 +52,7 @@ typedef struct {
 typedef struct {
     bool                    alive;
     bool                    emitting;
+    bool                    authored_burst_pending;
     JceParticleEmitterDesc  desc;
     jce_vec3                origin;
 
@@ -238,6 +239,7 @@ static JceEmitterHandle emitter_add_depth(JceParticleSystem *sys,
     em->alive      = true;
     em->emitting   = true;
     em->desc       = *desc;
+    em->authored_burst_pending = true;
     em->origin     = jce_v3(0, 0, 0);
     em->sub_handle = JCE_EMITTER_INVALID;
     em->depth      = depth;
@@ -498,6 +500,20 @@ static void update_emitter(JceParticleSystem *sys, Emitter *em,
 {
     if (!em->alive) return;
 
+    /* Authored one-shot waits for a real emitting update: scene origin and
+     * suppression are synchronized before this entry. Start resumes pending
+     * emission; it does not re-arm an already-consumed authored burst. */
+    if (em->emitting && em->authored_burst_pending) {
+        em->authored_burst_pending = false;
+        float burst = em->desc.emit_burst;
+        uint32_t available = em->desc.max_particles - em->alive_count;
+        uint32_t count = 0;
+        if (isfinite(burst) && burst > 0.0f)
+            count = burst >= (float)available ? available : (uint32_t)(burst + 0.5f);
+        if (count > available) count = available;
+        for (uint32_t n = 0; n < count; ++n) spawn_particle(sys, em, rng);
+    }
+
     /* Spawn new particles. */
     if (em->emitting && em->desc.emit_rate > 0.0f) {
         em->emit_accumulator += em->desc.emit_rate * dt;
@@ -633,6 +649,13 @@ static void particles_drain_events(JceParticleSystem *sys)
 static uint32_t particles_estimated_emitter_work(const Emitter *em, float dt)
 {
     uint64_t work = (uint64_t)em->alive_count + 1u;
+    if (em->emitting && em->authored_burst_pending &&
+        isfinite(em->desc.emit_burst) && em->desc.emit_burst > 0.0f) {
+        uint32_t available = em->desc.max_particles - em->alive_count;
+        uint32_t burst = em->desc.emit_burst >= (float)available ? available
+            : (uint32_t)(em->desc.emit_burst + 0.5f);
+        work += (uint64_t)burst * 2u;
+    }
 
     if (em->emitting && em->desc.emit_rate > 0.0f &&
         em->alive_count < em->desc.max_particles) {

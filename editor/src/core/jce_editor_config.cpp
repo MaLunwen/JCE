@@ -14,6 +14,7 @@ extern "C" {
 #include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_path.h>
 }
 
 /* Cross-platform mkdir-equivalent. Creates the directory if it does not
@@ -34,7 +35,33 @@ static void ensure_directory(const char *path) {
  * CWD-relative ".jce" only landed in $HOME by accident on a Finder double-
  * click; this makes it deterministic.)  $HOME via SDL (jce_host_get_user_
  * folder); no platform #ifdef. */
+bool jce_editor_config_profile_path(const char *root, const char *name,
+                                    char *out, size_t cap)
+{
+    char directory[1024], relative[1024];
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    if (!root || !jce_path_is_absolute(root)
+        || (root[0] && root[1] == ':' && root[2] != '/' && root[2] != '\\')
+        || !jce_path_to_canonical(directory, sizeof(directory), root)) return false;
+    if (name && jce_path_is_absolute(name)) return false;
+    if (!jce_path_normalize(relative, sizeof(relative), name ? name : "")) return false;
+    if (relative[0] == '.' && relative[1] == '.'
+        && (relative[2] == '\0' || relative[2] == '/')) return false;
+    return jce_path_join(out, cap, directory, relative);
+}
+
 bool jce_editor_dotjce_path(const char *name, char *out, size_t cap) {
+    const char *profile = getenv("JCE_EDITOR_PROFILE_DIR");
+    if (profile && profile[0]) {
+        static bool logged = false;
+        const bool ok = jce_editor_config_profile_path(profile, name, out, cap);
+        if (ok && !logged) {
+            LOG_INFO(LOG_TAG, "profile directory: %s", profile);
+            logged = true;
+        }
+        return ok;
+    }
     char home[1024];
     bool ok = jce_host_get_user_folder(JCE_USER_FOLDER_HOME, home, sizeof(home));
     if (ok) {

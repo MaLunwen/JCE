@@ -100,6 +100,7 @@ static const char *const g_calls[] = {
     "jce.is_action_pressed('is_action_pressed_name')",
     "jce.get_axis('get_axis_name')",
     "jce.get_pointer_delta()",
+    "jce.get_pointer_position()",
     "jce.get_pointer_wheel()",
     "jce.is_pointer_down(1)",
     "jce.get_touch_count()",
@@ -168,6 +169,12 @@ static const char *const g_calls[] = {
     "jce.get_param_text(86, 'get_param_text_name')",
     "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2253.625)",
     "jce.vcam_activate('vcam_activate_name')",
+    "jce.set_cursor('set_cursor_asset_path', 43, 93)",
+    "jce.request_quit()",
+    "jce.stat_available()",
+    "jce.stat_set('stat_set_id', 669.25)",
+    "jce.stat_get('stat_get_id', 1784.25)",
+    "jce.stat_flush()",
     "jce.get_position(78)",
     "jce.set_position(80, 106.375, 1674.125, 2181.125)",
     "jce.get_rotation(89)",
@@ -207,6 +214,7 @@ static const char *const g_calls[] = {
     "jce.is_action_pressed('is_action_pressed_name')",
     "jce.get_axis('get_axis_name')",
     "jce.get_pointer_delta()",
+    "jce.get_pointer_position()",
     "jce.get_pointer_wheel()",
     "jce.is_pointer_down(1)",
     "jce.get_touch_count()",
@@ -269,6 +277,12 @@ static const char *const g_calls[] = {
     "jce.get_param_text(86, 'get_param_text_name')",
     "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2253.625)",
     "jce.vcam_activate('vcam_activate_name')",
+    "jce.set_cursor('set_cursor_asset_path', 43, 93)",
+    "jce.request_quit()",
+    "jce.stat_available()",
+    "jce.stat_set('stat_set_id', 669.25)",
+    "jce.stat_get('stat_get_id', 1784.25)",
+    "jce.stat_flush()",
 };
 
 static const char *const g_skips[] = {
@@ -487,10 +501,24 @@ static const char *const g_skips[] = {
     NULL,
     NULL,
     NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
 };
 
 static const int g_partial[] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };
 
 

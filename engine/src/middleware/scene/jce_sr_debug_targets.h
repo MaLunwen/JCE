@@ -21,6 +21,7 @@
 #define JCE_SR_DEBUG_TARGETS_H
 
 #include <jce/renderer/jce_scene_renderer.h>
+#include "middleware/scene/jce_sr_particle_limits.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,20 +46,36 @@ typedef struct JceSrDebugTargetState {
     /* Shadows. */
     bool     shadow_valid;
     bool     shadow_use_csm;       /* picks WHICH of the two was filled */
+    bool     frame_shadow_active;
+    bool     last_csm_valid;
+    uint32_t csm_count;
+    bool     csm_cache_valid[JCE_CSM_MAX_CASCADES];
+    uint16_t csm_tex[JCE_CSM_MAX_CASCADES];
     uint16_t shadow_map_size, dyn_csm_atlas_size;
     uint16_t shadow_tex, dyn_csm_atlas_tex, local_atlas_tex, cloud_shadow_tex;
 
     /* Lookup tables. */
     uint16_t brdf_lut, sky_transmittance_tex, sky_multiscatter_tex;
+
+    /* Reflections: allocation alone does not mean this frame rendered SSR. */
+    bool     ssr_active_frame;
+    uint16_t ssr_tex;
+
+    bool cpu_particles_current_frame;
+    uint16_t cpu_particle_tex, cpu_particle_drawn_tex;
+    bool gpu_particles_current_frame;
+    uint16_t gpu_particle_tex[SR_GPU_PARTICLE_MAX];
 } JceSrDebugTargetState;
 
 /* The number of rows the table can ever emit.  A caller sizes its array by
  * this; the build refuses to write past `cap`. */
-#define JCE_SR_DEBUG_TARGET_MAX 16
+#define JCE_SR_DEBUG_TARGET_MAX (18 + SR_GPU_PARTICLE_MAX)
 
 /* Fill `out` with the targets that hold real pixels for this state, in a
  * stable order, and return how many.  Pure: no globals, no renderer, no
  * bgfx. */
+bool jce_sr_particle_count_encode(uint32_t alive, uint8_t rgba[4]);
+
 int jce_sr_debug_targets_build(const JceSrDebugTargetState *st,
                                JceRenderTargetInfo *out, int cap);
 

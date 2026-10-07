@@ -6,6 +6,7 @@
 #define JCE_PANEL_HIERARCHY_INTERNAL_H
 
 #include "ui/jce_editor_colors.h"
+#include "jce_hierarchy_flat_cache.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_layout.h"
@@ -23,16 +24,10 @@
 extern const ImVec4 s_tag_colors[JCE_TAG_COLOR_COUNT];
 extern const char  *s_tag_names[];
 
-/* ── Hierarchy state ──────────────────────────────────────────────── */
-
-/* Cap on the number of rows the hierarchy will flatten/display in a single
- * frame.  Raised well above the former 4096 because the panel now renders via
- * ImGuiListClipper (flatten-then-clip): only the ~visible rows are submitted
- * to ImGui each frame, so the per-frame render cost is independent of this
- * count and we can afford to expose the whole tree.  display_order[] and
- * flat[] are sized to this cap; both live in the single static HierarchyState
- * instance (not on the stack). */
-#define HIERARCHY_MAX_DISPLAY 32768
+/* Dynamic flattened rows retain the existing visible-row clipper. The three
+ * backing arrays share a bounded 64 MiB budget; failure is surfaced, not a
+ * silent partial hierarchy. Capacity is demand-based and reused across frames. */
+struct HierarchyFlatRow { uint32_t id; int depth; bool chunk_header; };
 
 struct HierarchyState {
     char     search_buf[128];
@@ -48,10 +43,12 @@ struct HierarchyState {
     bool     ctx_clicked_entity;
     bool     initialized;
 
-    uint32_t display_order[HIERARCHY_MAX_DISPLAY];
+    uint32_t *display_order;
+    uint32_t *root_ids;
+    int capacity;
     int      display_count;
 
-    /* Flattened visible-tree row list, rebuilt every frame by
+    /* Flattened visible-tree row list, rebuilt on default-mode key changes by
      * jce_hierarchy_flatten().  Parallel to display_order (same ids/order)
      * but also carries the per-row indent depth so draw_entity_row() can
      * indent manually (the clipper renders rows out of recursion context).
@@ -63,12 +60,9 @@ struct HierarchyState {
      * Full-World loads tens of thousands of entities (collapsible chunk
      * nodes, expand on demand) and makes the hierarchy the chunk view —
      * without mutating the ECS scene graph or transforms. */
-    struct {
-        uint32_t id;            /* entity id, OR chunk id when chunk_header */
-        int      depth;
-        bool     chunk_header;
-    }        flat[HIERARCHY_MAX_DISPLAY];
+    HierarchyFlatRow *flat;
     int      flat_count;
+    JceHierarchyFlatCache flat_cache;
 
     uint32_t shift_anchor;
     uint32_t last_focus_seen;
@@ -77,6 +71,7 @@ struct HierarchyState {
 };
 
 extern HierarchyState s_hier;
+bool jce_hierarchy_reserve(int loaded, int groups);
 
 /* ── Shared helpers ───────────────────────────────────────────────── */
 

@@ -400,6 +400,65 @@ static void test_set_parent_rejects_hierarchy_cycle(void)
     jce_scene_destroy(s);
 }
 
+static void test_physics_parent_writeback_invalidates_descendant_memo(void)
+{
+    JceScene *s = jce_scene_create();
+    JceEntity parent = jce_scene_create_entity(s, "moving-parent");
+    JceEntity child = jce_scene_create_entity(s, "child");
+    JceTransform p = mk_trs(jce_v3(2, 0, 0), jce_v3(1, 1, 1));
+    JceTransform c = mk_trs(jce_v3(3, 0, 0), jce_v3(1, 1, 1));
+    jce_scene_set_transform(s, parent, &p);
+    jce_scene_set_transform(s, child, &c);
+    jce_scene_set_parent(s, child, parent);
+    jce_mat4 world = jce_scene_get_world_matrix(s, child);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 5, world.col[3].x);
+
+    /* Physics writes components in place, then names the changed entity. */
+    jce_scene_get_transform(s, parent)->position.x = 20;
+    jce_scene_notify_physics_writeback_entity(s, parent);
+    world = jce_scene_get_world_matrix(s, child);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 23, world.col[3].x);
+
+    /* Unknown-entity bulk writeback has the same coherence obligation. */
+    jce_scene_get_transform(s, parent)->position.x = 40;
+    jce_scene_notify_physics_writeback(s);
+    world = jce_scene_get_world_matrix(s, child);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 43, world.col[3].x);
+    jce_scene_destroy(s);
+}
+
+static void test_memo_rehash_and_recycled_ids_across_writeback_generations(void)
+{
+    JceScene *s = jce_scene_create();
+    int cycle, i, generation;
+    for (cycle = 0; cycle < 8; ++cycle) {
+        JceEntity parent = jce_scene_create_entity(s, "parent");
+        JceEntity children[320];
+        JceTransform p = mk_trs(jce_v3(1, 0, 0), jce_v3(1, 1, 1));
+        jce_scene_set_transform(s, parent, &p);
+        for (i = 0; i < 320; ++i) {
+            children[i] = jce_scene_create_entity(s, "child");
+            JceTransform c = mk_trs(jce_v3((float)i, 0, 0), jce_v3(1, 1, 1));
+            jce_scene_set_transform(s, children[i], &c);
+            jce_scene_set_parent(s, children[i], parent);
+        }
+        for (generation = 0; generation < 8; ++generation) {
+            jce_scene_get_transform(s, parent)->position.x = (float)(cycle * 8 + generation);
+            jce_scene_notify_physics_writeback_entity(s, parent);
+            /* Reverse insertion order on alternate generations exercises
+             * collision chains with stale slots and table growth. */
+            for (i = 0; i < 320; ++i) {
+                const int index = generation & 1 ? 319 - i : i;
+                jce_mat4 world = jce_scene_get_world_matrix(s, children[index]);
+                TEST_ASSERT_FLOAT_WITHIN(0.0001f, (float)(index + cycle * 8 + generation),
+                                         world.col[3].x);
+            }
+        }
+        jce_scene_destroy_entity(s, parent);
+    }
+    jce_scene_destroy(s);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -418,5 +477,7 @@ int main(void)
     RUN_TEST(test_reparent_can_keep_local_transform);
     RUN_TEST(test_reparent_rejects_self_cycles_and_dead_entities);
     RUN_TEST(test_set_parent_rejects_hierarchy_cycle);
+    RUN_TEST(test_physics_parent_writeback_invalidates_descendant_memo);
+    RUN_TEST(test_memo_rehash_and_recycled_ids_across_writeback_generations);
     return UNITY_END();
 }

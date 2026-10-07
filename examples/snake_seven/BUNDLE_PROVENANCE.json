@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "variant": "normal",
+  "file": "snake.jbundle",
+  "sha256": "073df961d589096741ce476862c57b7365de35a277a449c4c97a811ca2800869",
+  "bytes": 11502,
+  "single_file": true,
+  "consumer_source": "tests/consumers/snake_seven",
+  "source_terms": "SOURCE_AND_TERMS.md",
+  "repository_license": "MPL-2.0",
+  "scope": "Original JCE portable Lua consumer variant; public SDK bundle dependency closure and relocated one-EXE consumption observed. No native multi-language parity claim.",
+  "upstream": "https://github.com/MaLunwen/JCE",
+  "external_game_implementation": null
+}

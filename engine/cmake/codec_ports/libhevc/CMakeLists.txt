@@ -251,7 +251,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|x86|i[3-6]86)$")
     target_compile_definitions(libhevcdec PRIVATE
         X86
         DISABLE_AVX2
-        DEFAULT_ARCH=D_ARCH_X86_SSE42)
+        DEFAULT_ARCH=D_ARCH_X86_GENERIC)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     target_compile_definitions(libhevcdec PRIVATE
         ARMV8
@@ -289,9 +289,17 @@ if(MSVC)
         /wd4018          # Signed/unsigned mismatch
     )
 else()
-    # GCC/Clang: enable SSE4.2 for x86 (skip for Emscripten which uses -msimd128)
+    # GCC/Clang: isolate x86 SIMD requirements (Emscripten keeps its own baseline)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|x86|i[3-6]86)$" AND NOT EMSCRIPTEN)
-        target_compile_options(libhevcdec PRIVATE -msse4.2 -mno-avx)
+        # Generic decoder/control code retains the platform baseline. Only
+        # intrinsic translation units may require higher instruction sets.
+        foreach(_src IN LISTS LIBHEVC_COMMON_SRCS LIBHEVCDEC_SRCS)
+            if(_src MATCHES "_ssse3_intr[.]c$")
+                set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS -mssse3 -mno-avx)
+            elseif(_src MATCHES "_sse42_intr[.]c$")
+                set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS -msse4.2 -mno-avx)
+            endif()
+        endforeach()
     endif()
     # Use gnu99 so that the 'asm' keyword and GNU extensions work in ARM/other targets.
     # NOTE: target_compile_options happens BEFORE the standard flag CMake injects from

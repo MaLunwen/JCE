@@ -41,9 +41,9 @@
  * 1.35 and 2.09 and clusters at 1.6.  So 1.6 texels is the terrain and water
  * figure and cascade 0 stays within +/-15% of what it rendered before;
  * everything that moves is a cascade whose bias was wrong for a reason.
- * fs_pbr's meshes keep their historical 3x (4.8 texels) and their steeper
- * slope term rather than having that asymmetry silently removed here -- it is
- * a separate decision, and this change is already moving every shadow.
+ * Mesh, terrain and water receivers use this same calibrated policy. The
+ * former mesh-only base and slope amplification could exceed a small caster's
+ * entire light-space height; a valid depth map then produced no visible shadow.
  *
  * THE CAP IS IN TEXELS TOO, for the same reason the bias is: 0.01 normalised
  * at cascade 0 was 33 texels, and that is what the number meant.  The absolute
@@ -66,18 +66,12 @@ float jce_shadow_texel_depth(int cascade)
 	return 1.0 / max(pcss_scale_for(cascade), 1.0);
 }
 
-/*
- * `texels`  world offset, in shadow texels of this cascade
- * `slope`   sin(theta)/max(ndotl, 0.1) -- the depth gradient across a texel
- * `slope_k` how hard the slope term pulls (the two surface classes differ)
- */
-float jce_shadow_depth_bias(int cascade, float texels, float slope,
-                            float slope_k)
+/* Shared receiver policy, calibrated in shadow texels rather than metres.
+ * Surface class does not change the offset's physical meaning. */
+float jce_shadow_depth_bias(int cascade, float slope)
 {
 	float td = jce_shadow_texel_depth(cascade);
-	float b  = texels * td * (1.0 + slope * slope_k);
-	/* 32 texels: the translation of the old 0.01 normalised ceiling at
-	 * cascade 0, which is where that number was tuned. */
+	float b  = 1.6 * td * (1.0 + slope * 4.0);
 	return min(b, min(32.0 * td, 0.08));
 }
 

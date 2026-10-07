@@ -261,6 +261,19 @@ extern "C" void jce_editor_panel_frame_debugger_content(void)
     JceGpuStats stats;
     bool ok = jce_renderer_get_gpu_stats(&stats);
     draw_frame_totals(ok ? &stats : nullptr);
+    JceSubmittedPayloadStats payload{};
+    if (jce_renderer_get_submitted_payload_stats(jce_editor_get_renderer(), &payload)) {
+        ImGui::Text(jce_editor_i18n("frameDebugger.payload.bytes"),
+            (unsigned long long)payload.static_vertex_bytes,
+            (unsigned long long)payload.static_index_bytes,
+            (unsigned long long)payload.texture_create_bytes,
+            (unsigned long long)payload.texture_update_bytes);
+        ImGui::Text(jce_editor_i18n("frameDebugger.payload.context"),
+            (unsigned long long)payload.context_generation, payload.frame_index,
+            payload.saturated ? 1 : 0);
+        ImGui::TextWrapped("%s", jce_editor_i18n("frameDebugger.payload.scope"));
+    }
+
     draw_view_stats();
     draw_renderer_breakdown();
     draw_render_targets();

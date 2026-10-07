@@ -1,3 +1,4 @@
+#include "core/jce_editor_operation_metrics.h"
 /*
  * jce_panel_inspector.cpp  Inspector panel (entity properties) — dispatcher.
  *
@@ -120,6 +121,7 @@ static void ensure_init(void)
 
 void jce_editor_inspector_request_sync(void)
 {
+    jce_editor_inspector_metric_request(jce_state_get_focused());
     s_insp.needs_sync = true;
 }
 
@@ -1222,6 +1224,16 @@ void jce_editor_inspector_reload_material(const char *material_path)
 
 void jce_editor_panel_inspector_content(void)
 {
+    struct DrawCompletion {
+        ~DrawCompletion() {
+            uint32_t id = jce_state_get_focused();
+            const char *actual = id ? jce_state_entity_name(id) : nullptr;
+            bool valid = id && jce_state_entity_exists(id) && jce_state_get_scene() &&
+                         actual && strcmp(actual, s_insp.name_buf) == 0;
+            jce_editor_inspector_metric_complete(id, valid, s_insp.name_buf);
+        }
+    } draw_completion;
+    JceEditorOperationScope operation_scope("ed_inspector_draw");
     ensure_init();
 
     JceScene *scene = jce_state_get_scene();
@@ -1246,6 +1258,7 @@ void jce_editor_panel_inspector_content(void)
 
     uint32_t focused = jce_state_get_focused();
     if (!focused || !jce_state_entity_exists(focused) || !scene) {
+        jce_editor_inspector_metric_complete(focused, false, s_insp.name_buf);
         ImGui::TextDisabled("%s", jce_editor_i18n("inspector.noSelection"));
         return;
     }

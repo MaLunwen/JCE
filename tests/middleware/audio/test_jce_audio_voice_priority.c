@@ -31,6 +31,7 @@
 #include <jce/middleware/audio/jce_audio.h>
 
 #include <string.h>
+#include <jce/os/core/jce_thread.h>
 
 #include "unity.h"
 
@@ -271,9 +272,102 @@ static void test_the_least_important_candidate_is_the_victim(void)
         "see it because the refusal guard protects their voices instead");
 }
 
+static void test_master_volume_reads_actual_endpoint_gain(void)
+{
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, jce_audio_get_master_volume(NULL));
+    JceAudio *audio = jce_audio_create_offline();
+    TEST_ASSERT_NOT_NULL(audio);
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, jce_audio_get_master_volume(audio));
+    jce_audio_set_master_volume(audio, 0.0f);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, jce_audio_get_master_volume(audio));
+    jce_audio_set_master_volume(audio, 0.375f);
+    TEST_ASSERT_EQUAL_FLOAT(0.375f, jce_audio_get_master_volume(audio));
+    jce_audio_bus_set_volume(audio, "Master", 0.25f);
+    TEST_ASSERT_EQUAL_FLOAT(0.25f, jce_audio_get_master_volume(audio));
+    jce_audio_destroy(audio);
+}
+
+typedef struct PauseRace {
+    JceAudio *audio;
+    JceMutex *mutex;
+    JceCondVar *cond;
+    bool entered, release, rendered;
+    unsigned calls;
+} PauseRace;
+static uint32_t paused_race_pull(void *ud, int16_t *out, uint32_t frames)
+{
+    PauseRace *r = ud;
+    jce_mutex_lock(r->mutex);
+    ++r->calls;
+    r->entered = true;
+    jce_cond_signal(r->cond);
+    while (!r->release) jce_cond_wait(r->cond, r->mutex);
+    jce_mutex_unlock(r->mutex);
+    memset(out, 0, (size_t)frames * sizeof(*out));
+    return frames;
+}
+static void paused_race_render(void *ud)
+{
+    PauseRace *r = ud;
+    float output[960] = {0};
+    r->rendered = jce_audio_render_offline(r->audio, output, 480u);
+}
+static void test_stream_pause_acknowledges_actual_inflight_pull(void)
+{
+    PauseRace r = {0};
+    r.audio = jce_audio_create_offline();
+    r.mutex = jce_mutex_create();
+    r.cond = jce_cond_create();
+    TEST_ASSERT_NOT_NULL(r.audio);
+    TEST_ASSERT_NOT_NULL(r.mutex);
+    TEST_ASSERT_NOT_NULL(r.cond);
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(NULL, JCE_VOICE_INVALID));
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(r.audio, JCE_VOICE_INVALID));
+    build_pcm();
+    JceVoice regular = jce_audio_play(r.audio, make_sound(r.audio), true, 1.0f, 1.0f);
+    jce_audio_pause(r.audio, regular);
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(r.audio, regular));
+    JceVoice stream = jce_audio_play_stream(r.audio, paused_race_pull, &r, 1u, SR, 1.0f, 1.0f);
+    TEST_ASSERT_NOT_EQUAL(JCE_VOICE_INVALID, stream);
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(r.audio, stream));
+    JceThread *thread = jce_thread_create(paused_race_render, &r, "pause-race");
+    TEST_ASSERT_NOT_NULL(thread);
+    jce_mutex_lock(r.mutex);
+    while (!r.entered) jce_cond_wait(r.cond, r.mutex);
+    jce_mutex_unlock(r.mutex);
+    jce_audio_pause(r.audio, stream);
+    const bool premature = jce_audio_stream_is_quiescent(r.audio, stream);
+    jce_mutex_lock(r.mutex);
+    r.release = true;
+    jce_cond_signal(r.cond);
+    jce_mutex_unlock(r.mutex);
+    jce_thread_join(thread);
+    TEST_ASSERT_FALSE(premature);
+    TEST_ASSERT_TRUE(r.rendered);
+    TEST_ASSERT_TRUE(jce_audio_stream_is_quiescent(r.audio, stream));
+    const unsigned paused_calls = r.calls;
+    jce_audio_set_volume(r.audio, stream, 0.0f);
+    jce_audio_set_volume(r.audio, stream, 1.0f);
+    float output[960] = {0};
+    TEST_ASSERT_TRUE(jce_audio_render_offline(r.audio, output, 480u));
+    TEST_ASSERT_EQUAL_UINT(paused_calls, r.calls);
+    TEST_ASSERT_TRUE(jce_audio_stream_is_quiescent(r.audio, stream));
+    jce_audio_resume(r.audio, stream);
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(r.audio, stream));
+    TEST_ASSERT_TRUE(jce_audio_render_offline(r.audio, output, 480u));
+    TEST_ASSERT_TRUE(r.calls > paused_calls);
+    jce_audio_stop(r.audio, stream);
+    TEST_ASSERT_FALSE(jce_audio_stream_is_quiescent(r.audio, stream));
+    jce_audio_destroy(r.audio);
+    jce_cond_destroy(r.cond);
+    jce_mutex_destroy(r.mutex);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_stream_pause_acknowledges_actual_inflight_pull);
+    RUN_TEST(test_master_volume_reads_actual_endpoint_gain);
     RUN_TEST(test_the_pool_is_full_after_sixty_four_voices);
     RUN_TEST(test_a_protected_voice_is_not_stolen);
     RUN_TEST(test_an_ordinary_voice_is_still_stolen);

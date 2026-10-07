@@ -119,6 +119,37 @@ static Collected sample(JceRuntime *rt, uint64_t busy, uint64_t idle)
 
 /* ---------------------------------------------------------------------- */
 
+static void test_new_scripts_have_no_inherited_measurement(void)
+{
+    jce_test_write_file(BUSY_FILE, BUSY_LUA);
+    jce_test_write_file(IDLE_FILE, IDLE_LUA);
+    jce_perf_phase_set_enabled(0);
+
+    JceScene *scene = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(scene);
+    JceEntity busy = make_scripted(scene, "busy", BUSY_FILE);
+    JceEntity idle = make_scripted(scene, "idle", IDLE_FILE);
+    JceRuntimeDesc desc = {0};
+    desc.scene = scene;
+    JceRuntime *runtime = jce_runtime_create(&desc);
+    TEST_ASSERT_NOT_NULL(runtime);
+
+    Collected rows = sample(runtime, (uint64_t)busy, (uint64_t)idle);
+    TEST_ASSERT_EQUAL_INT(2, rows.rows);
+    TEST_ASSERT_TRUE(rows.saw_busy && rows.saw_idle);
+    const JceScriptCostInfo *costs[] = {&rows.busy, &rows.idle};
+    for (size_t i = 0; i < sizeof costs / sizeof costs[0]; ++i) {
+        TEST_ASSERT_TRUE(costs[i]->active);
+        TEST_ASSERT_FALSE(costs[i]->measured);
+        TEST_ASSERT_EQUAL_UINT32(0, costs[i]->calls);
+        TEST_ASSERT_EQUAL_DOUBLE(0, costs[i]->last_ms);
+        TEST_ASSERT_EQUAL_DOUBLE(0, costs[i]->avg_ms);
+    }
+
+    jce_runtime_destroy(runtime);
+    jce_scene_destroy(scene);
+}
+
 static void test_the_expensive_script_is_the_expensive_row(void)
 {
     JceScene      *s;
@@ -281,6 +312,7 @@ static void test_reset_clears_the_average_and_keeps_the_last_frame(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_new_scripts_have_no_inherited_measurement);
     RUN_TEST(test_the_expensive_script_is_the_expensive_row);
     RUN_TEST(test_with_profiling_off_the_rows_say_so);
     RUN_TEST(test_reset_clears_the_average_and_keeps_the_last_frame);

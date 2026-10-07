@@ -71,8 +71,6 @@ JceAnimClip *jce_anim_clip_create(const char *name,
                                     uint32_t num_channels,
                                     float duration);
 
-void         jce_anim_clip_destroy(JceAnimClip *clip);
-
 /* Number of TRS channels in the clip (0 if NULL).  Used by importers / tests to
  * verify a clip carries joint tracks. */
 uint32_t     jce_anim_clip_channel_count(const JceAnimClip *clip);

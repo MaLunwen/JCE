@@ -238,6 +238,14 @@ class JCEConan(ConanFile):
                                 comp.frameworks.remove(fw)
 
         deps = CMakeDeps(self)
+        # The recipe names its renderer component bgfx::bgfx. CMakeDeps'
+        # default whole-package target has the same name, which otherwise
+        # appends every tool/decoder to the renderer's dependency closure.
+        # Rename only the aggregate; preserve explicit component contracts.
+        deps.set_property("bgfx", "cmake_target_name", "bgfx::all")
+        # Preserve the core shaping component; do not append subset archives
+        # into the identically named component through the package aggregate.
+        deps.set_property("harfbuzz", "cmake_target_name", "harfbuzz::all")
         # Emit a separately named CMake package for the native protoc supplied
         # by build_requirements().  The target-context protobuf package remains
         # authoritative for headers and libraries.

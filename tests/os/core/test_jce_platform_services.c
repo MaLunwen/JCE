@@ -274,12 +274,63 @@ static void test_null_safety(void)
 {
     jce_platform_shutdown(NULL);                                  /* no crash */
     TEST_ASSERT_FALSE(jce_platform_flush(NULL));
+    TEST_ASSERT_FALSE(jce_platform_stats_available(NULL));
     TEST_ASSERT_FALSE(jce_platform_ach_unlock(NULL, "x"));
     TEST_ASSERT_FALSE(jce_platform_ach_is_unlocked(NULL, "x"));
     TEST_ASSERT_EQUAL_INT64(7, jce_platform_stat_get(NULL, "x", 7));
     TEST_ASSERT_EQUAL_INT(0, jce_platform_lb_query_top(NULL, "b", 4, NULL, NULL, 0));
     TEST_ASSERT_FALSE(jce_platform_save_exists(NULL, "x"));
     TEST_ASSERT_EQUAL_INT(0, jce_platform_save_list(NULL, NULL, 0, 0));
+}
+
+static int capability_calls;
+static void *capability_create(const char *config)
+{
+    (void)config;
+    return &capability_calls;
+}
+static bool capability_set(void *self, const char *id, int64_t value)
+{
+    (void)self; (void)id; (void)value;
+    ++capability_calls;
+    return false;
+}
+static int64_t capability_get(void *self, const char *id, int64_t fallback)
+{
+    (void)self; (void)id;
+    ++capability_calls;
+    return fallback;
+}
+static bool capability_flush(void *self)
+{
+    (void)self;
+    ++capability_calls;
+    return false;
+}
+static void test_stats_capability_is_pure_and_not_io_success(void)
+{
+    JcePlatformBackend backend = {0};
+    backend.kind = JCE_PLATFORM_BACKEND_CUSTOM;
+    backend.name = "capability-probe";
+    backend.create = capability_create;
+    capability_calls = 0;
+    JcePlatformServices *svc = jce_platform_init_backend(&backend, "");
+    TEST_ASSERT_NOT_NULL(svc);
+    TEST_ASSERT_FALSE(jce_platform_stats_available(svc));
+    TEST_ASSERT_EQUAL_INT(0, capability_calls);
+    jce_platform_shutdown(svc);
+    backend.stat_set = capability_set;
+    backend.stat_get = capability_get;
+    backend.flush = capability_flush;
+    svc = jce_platform_init_backend(&backend, "");
+    TEST_ASSERT_NOT_NULL(svc);
+    TEST_ASSERT_TRUE(jce_platform_stats_available(svc));
+    TEST_ASSERT_EQUAL_INT(0, capability_calls);
+    TEST_ASSERT_FALSE(jce_platform_stat_set(svc, "x", 1));
+    TEST_ASSERT_FALSE(jce_platform_flush(svc));
+    TEST_ASSERT_EQUAL_INT64(17, jce_platform_stat_get(svc, "x", 17));
+    TEST_ASSERT_EQUAL_INT(3, capability_calls);
+    jce_platform_shutdown(svc);
 }
 
 int main(void)
@@ -294,5 +345,6 @@ int main(void)
     RUN_TEST(test_cloud_save_roundtrip_and_list);
     RUN_TEST(test_cloud_save_persists_across_reload);
     RUN_TEST(test_null_safety);
+    RUN_TEST(test_stats_capability_is_pure_and_not_io_success);
     return UNITY_END();
 }

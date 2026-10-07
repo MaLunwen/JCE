@@ -21,7 +21,7 @@
 #include <stdlib.h>   /* getenv - JCE_LOG_AMBIENT */
 
 void jce_sr_apply_resolved_ambient(JceSceneRenderer *sr, jce_vec3 amb,
-                                   float ai, bool have_ambient)
+                                   float ai, bool have_ambient, bool draw_skybox)
 {
     if (!sr)
         return;
@@ -42,7 +42,7 @@ void jce_sr_apply_resolved_ambient(JceSceneRenderer *sr, jce_vec3 amb,
     const char *source = sr->ambient_override_active ? "override"
                        : have_ambient                ? "scene"
                                                      : "engine-default";
-    const bool sky_fill = have_ambient && !sr->skybox_active;
+    const bool sky_fill = have_ambient && draw_skybox && !sr->skybox_active;
 
     if (sr->amb_logged &&
         sr->amb_logged_source    == source &&

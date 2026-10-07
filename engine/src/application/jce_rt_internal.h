@@ -33,6 +33,7 @@
 #include <jce/middleware/physics/jce_collider_asset.h>
 #include <jce/middleware/physics/jce_fracture.h>   /* Voronoi shatter geometry core */
 #include <jce/middleware/physics/jce_softbody.h>    /* volumetric / pressure soft body */
+#include <jce/os/platform/jce_cursor.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_lod.h>     /* distance-tier hysteresis (sim-LOD) */
 #include <jce/middleware/scene/jce_water.h>   /* buoyancy force + surface sampling */
@@ -538,6 +539,8 @@ typedef struct {
 struct JceTerrainCollisionStream;
 
 struct JceRuntime {
+	struct JcePlatformServices *platform_services; /* borrowed, optional */
+	bool quit_requested; /* host consumes after script callback */
 	/* One-shot latch for the ui_set_text truncation warning.  The text a
 	 * script clips is usually rewritten every frame, so without this the
 	 * warning would flood (space/ produced 2510 in a single take) and
@@ -693,6 +696,7 @@ struct JceRuntime {
 	JceReverbZones  *reverb_zones;   /* owned */
 
 	JceRuntimeInput  input;
+	float pointer_xywh[4];  /* viewport-local frame sample; zero size is invalid */
 	const JceInputActions *actions;  /* borrowed: live action map for script name queries */
 
 	/* Fixed-timestep accumulator driving physics on a stable cadence,
@@ -793,6 +797,10 @@ struct JceRuntime {
 	 * override names a language this executable cannot run; see
 	 * rt_script_install_vm. */
 	JceScriptHost       script_host;
+    JceCursor         *script_cursors[8];
+    char               script_cursor_paths[8][256];
+    int                script_cursor_hotspots[8][2];
+    int                script_cursor_count, script_cursor_active;
 	bool                script_enabled;
 	struct RtScriptLang {
 		JceScript *vm;                              /* owned */
@@ -1115,6 +1123,9 @@ VehicleEntry             *rt_vehicle_for_entity(JceRuntime *rt, JceEntity e);
 void                      rt_apply_wheel_trim(JceRuntime *rt);
 void                      rt_spawn_joint2d(JceScene *scene, JceEntity e,
                                            void *ud);
+/* Post-fixed-step interpolation snapshot (jce_rt_physics.c). */
+void rt_capture_fixed_pose(JceRuntime *rt);
+
 /* Linear entity -> body lookup, shared by the 3D and 2D body registries.
  *
  * BodyEntry and Body2DEntry are both {entity, body, ...} and the two lookups
@@ -1156,6 +1167,7 @@ bool rt_script_rpc_send(void *user, JceScriptEntity e, const char *event,
  * save sinks the core gameplay walk fires, the script hot-reload callback, and
  * the bundled BT perception adapters. */
 void        rt_script_install_vm(JceRuntime *rt);
+void        rt_script_clear_cursors(JceRuntime *rt);
 
 /* Instantiate `path` in the VM for ITS language, creating that VM on first
  * use.  The returned ref carries the handle that issued the instance, so the

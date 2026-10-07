@@ -8,6 +8,8 @@ jce_add_unit_test(test_jce_video_patented_codecs
     LINK    jce_core jce_video jce_audio jce_resource)
 target_include_directories(test_jce_video_patented_codecs PRIVATE
     "${CMAKE_SOURCE_DIR}/engine/src/middleware/video")
+target_compile_definitions(test_jce_video_patented_codecs PRIVATE
+    JCE_TEST_COLOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 jce_add_unit_test(test_jce_av1_pipeline
     SOURCES test_jce_av1_pipeline.c
@@ -31,4 +33,14 @@ jce_add_unit_test(test_jce_mp4_bframes
     SOURCES test_jce_mp4_bframes.c
     LINK jce_core jce_video jce_audio jce_resource)
 target_compile_definitions(test_jce_mp4_bframes PRIVATE
+    JCE_TEST_BFRAME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
+# Owned H264 planes retain legacy pixels and actual reordered timestamps.
+jce_add_unit_test(test_jce_h264_planes
+    SOURCES test_jce_h264_planes.c
+    LINK jce_core jce_video)
+target_include_directories(test_jce_h264_planes PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src/middleware/video"
+    "${CMAKE_SOURCE_DIR}/engine/src")
+target_compile_definitions(test_jce_h264_planes PRIVATE
     JCE_TEST_BFRAME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

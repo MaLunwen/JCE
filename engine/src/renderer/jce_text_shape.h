@@ -53,8 +53,9 @@ extern "C" {
 /* One shaped glyph.
  *
  * `codepoint` is the Unicode codepoint DECODED AT SHAPE TIME from the cluster
- * HarfBuzz reported, not a glyph id: this renderer's atlas is indexed by
- * codepoint (font_get_or_render_glyph), and decoding here means the cached run
+ * HarfBuzz reported. It remains available for source control handling;
+ * glyph_id is the font-specific shaped
+ * output used for rasterization. Decoding here means the cached run
  * no longer refers into the caller's string at all -- a cached run and the
  * buffer it was shaped from have independent lifetimes.
  *
@@ -63,6 +64,7 @@ extern "C" {
  * them straight out of hb_glyph_position_t. */
 typedef struct {
     uint32_t codepoint;
+    uint32_t glyph_id; /* Font-local shaped output, not a Unicode character. */
     int32_t  x_offset;
     int32_t  y_offset;
     int32_t  x_advance;

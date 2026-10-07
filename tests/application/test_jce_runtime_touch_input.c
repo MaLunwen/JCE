@@ -11,10 +11,21 @@
 
 static const char g_script[] =
 	"local M = {}\n"
-	"function M:on_start() self.step = 0 end\n"
+	"function M:on_start()\n"
+    "  self.step = 0\n"
+    "  assert(jce.set_cursor(\"\" ,0,0))\n"
+    "  assert(not jce.set_cursor(\"missing-cursor.png\",0,0))\n"
+    "  assert(not jce.set_cursor(\"missing-cursor.png\",-1,0))\n"
+    "end\n"
 	"function M:on_update(dt)\n"
 	"  self.step = self.step + 1\n"
 	"  local n = jce.get_touch_count()\n"
+	"  local x,y,w,h = jce.get_pointer_position()\n"
+	"  if self.step == 1 then\n"
+	"    assert(x == 40 and y == 50 and w == 1280 and h == 720)\n"
+	"  elseif self.step == 5 then\n"
+	"    assert(x == -10 and y == 900 and w == 1280 and h == 720)\n"
+	"  else assert(x == 0 and y == 0 and w == 0 and h == 0) end\n"
 	"  if self.step == 1 then\n"
 	"    assert(n == 5)\n"
 	"    for i=1,5 do\n"
@@ -98,6 +109,7 @@ static void test_runtime_touch_samples_replace_clamp_validate_and_clear(void)
 		seven[i].pressure = (float)(i + 1) / 5.0f;
 	}
 	jce_runtime_set_touch_input(rt, seven, 7);
+	jce_runtime_set_pointer_position(rt, 40, 50, 1280, 720);
 	jce_runtime_step(rt, 1.0f / 60.0f);
 	assert_completed_step(scene, entity, 1, 5);
 
@@ -111,14 +123,18 @@ static void test_runtime_touch_samples_replace_clamp_validate_and_clear(void)
 	mixed[1] = (JceRuntimeTouch){302, NAN, 0.2f, 0.3f};
 	mixed[2] = (JceRuntimeTouch){303, 0.1f, 0.2f, INFINITY};
 	jce_runtime_set_touch_input(rt, mixed, 3);
+	jce_runtime_set_pointer_position(rt, NAN, 50, 1280, 720);
 	jce_runtime_step(rt, 1.0f / 60.0f);
 	assert_completed_step(scene, entity, 3, 1);
 
 	jce_runtime_set_touch_input(rt, NULL, 0);
+	jce_runtime_set_pointer_position(rt, 40, 50, 1280, 0);
 	jce_runtime_step(rt, 1.0f / 60.0f);
 	assert_completed_step(scene, entity, 4, 0);
 
 	jce_runtime_set_touch_input(rt, &one, 1);
+	/* Captured drags may legitimately leave the logical viewport. */
+	jce_runtime_set_pointer_position(rt, -10, 900, 1280, 720);
 	jce_runtime_step(rt, 1.0f / 60.0f);
 	assert_completed_step(scene, entity, 5, 1);
 

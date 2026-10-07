@@ -100,7 +100,7 @@ static void test_world_bias_is_independent_of_depth_range(void)
      * texels lands as N * texel_world, whatever the cascade's depth range is.
      * Computed here from the SAME two published numbers the shader divides
      * and multiplies, so a change to either is caught. */
-    const float N = 4.8f;                       /* fs_pbr's figure */
+    const float N = 4.8f;                       /* Independent authored texel offset. */
     const JceCsmData d = fit(300.0f, 35.0f);
     for (uint32_t c = 0; c < d.cascade_count; c++) {
         const float normalized = N / penumbra_scale(&d, c);

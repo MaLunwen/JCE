@@ -464,6 +464,143 @@ bool run_dist_audit(const std::string &exe, const char *package_dir)
     return true;
 }
 
+/* Export before collecting PAK inputs, so a quality change reaches this build. */
+void export_project_runtime_configs(const std::string &project_root,
+                                    const std::string &cooked_src)
+{
+    /* Top 4 — export the project's authored physics layer collision matrix into
+     * the cooked tree so the shipped game's app_init loads the SAME collision
+     * filtering editor Play uses.  ps is the authoritative source: editor Play
+     * (jce_editor_play.cpp) and this build both drive the engine matrix from it,
+     * so the standalone physics-layers panel's file is already overridden by
+     * Play.  Written before the cooked-tree staging below so the copy picks it
+     * up.  NOTE: loose-tree only — an encrypted/embedded-PAK package
+     * (stage_loose=false) does not carry it yet (needs a PAK-aware matrix
+     * loader; tracked as follow-up). */
+    if (!cooked_src.empty() &&
+        jce_fs_host_exists_dir(cooked_src.c_str())) {
+        JceProjectSettings ps_local;
+        const JceProjectSettings *ps = jce_project_settings_current();
+        if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
+        /* ONE PUSH, NOT A SECOND COPY OF IT.  This used to inline the same
+         * names+matrix loop as jce_project_settings_push_physics_layers,
+         * which meant the 2D matrix had to be remembered in two places to
+         * reach a shipped build -- and the cook path is the one that decides
+         * what a packaged game gets.  A second implementation of one push is
+         * two statements about it. */
+        jce_project_settings_push_physics_layers(ps);
+        std::string lp = cooked_src + PATH_SEP_CHR_LOCAL +
+                         "physics_layers.json";
+        if (jce_physics_layer_matrix_save_json(lp.c_str()))
+            log_line(JCE_CONSOLE_INFO, "[build] physics layer matrix -> " + lp);
+        else
+            log_line(JCE_CONSOLE_WARNING,
+                     "[build] failed to write physics layer matrix: " + lp);
+
+        /* Top 5 — export the active quality level's render settings so the
+         * shipped game's app_init applies the authored shadow tier + lod bias
+         * (per-scene JceSceneRenderingSettings still override at render time).
+         *
+         * SEED FROM THE AUTHORED FILE, NOT FROM DEFAULTS.  This started at
+         * jce_render_settings_default() and then set seven quality fields, so
+         * every OTHER field in JceRenderSettings was silently reset to a
+         * default in every cooked tree and every shipped game -- the whole
+         * Look Profile block (wrap_factor, ambient hemisphere and ground
+         * colour, rim colour/power/intensity, tonemap op, LUT path and
+         * strength, toon_character, bloom_knee) plus grass_enabled, the
+         * project-level gate sr_draw_grass requires.  The editor renders from
+         * the SOURCE render_settings.json, so a GrassField that draws in the
+         * viewport was absent from the built game with no warning, and the
+         * authored look came out neutral.
+         *
+         * Worse, the file this writes IS the editor's own fallback source
+         * (jce_scene_content_context), so the build overwrote it with a
+         * defaults-seeded document rather than merely failing to carry it.
+         *
+         * Same resolution the editor uses -- source first, cooked as
+         * fallback -- so the two sides cannot disagree about which file is
+         * authoritative. */
+        JceRenderSettings rs = jce_render_settings_default();
+        {
+            const std::string proj_root =
+                project_root;
+            std::string seed;
+            /* ONE composition, shared with the viewport.  This block used to
+             * start from defaults and set seven quality fields, which reset
+             * the entire authored Look Profile and grass_enabled in every
+             * cooked tree -- and the file it writes IS the viewport's own
+             * fallback source, so it overwrote them rather than merely
+             * failing to carry them. */
+            if (jce_editor_effective_render_settings(false, proj_root.c_str(),
+                                                     &rs, &seed) &&
+                !seed.empty())
+                log_line(JCE_CONSOLE_INFO,
+                         "[build] render settings seeded from " + seed);
+            else if (seed.empty())
+                log_line(JCE_CONSOLE_INFO,
+                         "[build] no authored render_settings.json; exporting "
+                         "the active quality level over defaults");
+        }
+        std::string rp = cooked_src + PATH_SEP_CHR_LOCAL +
+                         "render_settings.json";
+        if (jce_render_settings_save_json(rp.c_str(), &rs))
+            log_line(JCE_CONSOLE_INFO, "[build] render settings -> " + rp);
+        else
+            log_line(JCE_CONSOLE_WARNING,
+                     "[build] failed to write render settings: " + rp);
+
+        /* Settings S2 — export the authored render-pipeline asset into the
+         * cooked tree (PAK key settings/render_pipeline.rp.json); the runtime
+         * re-resolves it after bundle mount (apply_boot_mounted).  Without
+         * this, shipped single-exe games silently fell back to the tier
+         * auto-preset. */
+        {
+            std::string proj = project_root;
+            std::string rp_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
+                                 PATH_SEP_CHR_LOCAL + "RenderPipeline.rp.json";
+            if (jce_fs_host_exists_file(rp_src.c_str())) {
+                std::string rp_dir = cooked_src + PATH_SEP_CHR_LOCAL +
+                                     "settings";
+                jce_fs_host_create_directory(rp_dir.c_str());
+                std::string rp_dst = rp_dir + PATH_SEP_CHR_LOCAL +
+                                     "render_pipeline.rp.json";
+                if (jce_fs_host_copy_file(rp_src.c_str(), rp_dst.c_str()))
+                    log_line(JCE_CONSOLE_INFO,
+                             "[build] render pipeline asset -> " + rp_dst);
+                else
+                    log_line(JCE_CONSOLE_WARNING,
+                             "[build] failed to stage render pipeline asset: " +
+                             rp_src);
+            }
+
+            /* Mirror the authored audio-mixer routing into the same cooked
+             * settings/ channel (PAK key settings/audio_mixer.json).  NOTE:
+             * the runtime mixer read is still host-only (rt_mixer_read_config
+             * uses jce_fs_host_read_all; no apply_boot_mounted analogue for
+             * audio yet), so a pure single-exe build does not consume this
+             * copy — it travels with the cooked tree for parity with the
+             * render pipeline asset and for a future PAK-aware read. */
+            std::string mx_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
+                                 PATH_SEP_CHR_LOCAL + "audio_mixer.json";
+            if (jce_fs_host_exists_file(mx_src.c_str())) {
+                std::string mx_dir = cooked_src + PATH_SEP_CHR_LOCAL +
+                                     "settings";
+                jce_fs_host_create_directory(mx_dir.c_str());
+                std::string mx_dst = mx_dir + PATH_SEP_CHR_LOCAL +
+                                     "audio_mixer.json";
+                if (jce_fs_host_copy_file(mx_src.c_str(), mx_dst.c_str()))
+                    log_line(JCE_CONSOLE_INFO,
+                             "[build] audio mixer config (cooked) -> " + mx_dst);
+                else
+                    log_line(JCE_CONSOLE_WARNING,
+                             "[build] failed to stage audio mixer config: " +
+                             mx_src);
+            }
+        }
+    }
+
+}
+
 /* Post-pipeline finish: verify the build artifact and, when requested,
  * stage a redistributable package directory (exe + cooked assets +
  * VERSION.txt).  Runs natively via jce_fs — no scripts.  On any hard
@@ -593,140 +730,6 @@ void run_finish_plan()
                 log_line(JCE_CONSOLE_WARNING,
                          std::string("[build] failed to stage ") + c.label +
                          ": " + src);
-        }
-    }
-
-    /* Top 4 — export the project's authored physics layer collision matrix into
-     * the cooked tree so the shipped game's app_init loads the SAME collision
-     * filtering editor Play uses.  ps is the authoritative source: editor Play
-     * (jce_editor_play.cpp) and this build both drive the engine matrix from it,
-     * so the standalone physics-layers panel's file is already overridden by
-     * Play.  Written before the cooked-tree staging below so the copy picks it
-     * up.  NOTE: loose-tree only — an encrypted/embedded-PAK package
-     * (stage_loose=false) does not carry it yet (needs a PAK-aware matrix
-     * loader; tracked as follow-up). */
-    if (!g_finish.cooked_src.empty() &&
-        jce_fs_host_exists_dir(g_finish.cooked_src.c_str())) {
-        JceProjectSettings ps_local;
-        const JceProjectSettings *ps = jce_project_settings_current();
-        if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
-        /* ONE PUSH, NOT A SECOND COPY OF IT.  This used to inline the same
-         * names+matrix loop as jce_project_settings_push_physics_layers,
-         * which meant the 2D matrix had to be remembered in two places to
-         * reach a shipped build -- and the cook path is the one that decides
-         * what a packaged game gets.  A second implementation of one push is
-         * two statements about it. */
-        jce_project_settings_push_physics_layers(ps);
-        std::string lp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
-                         "physics_layers.json";
-        if (jce_physics_layer_matrix_save_json(lp.c_str()))
-            log_line(JCE_CONSOLE_INFO, "[build] physics layer matrix -> " + lp);
-        else
-            log_line(JCE_CONSOLE_WARNING,
-                     "[build] failed to write physics layer matrix: " + lp);
-
-        /* Top 5 — export the active quality level's render settings so the
-         * shipped game's app_init applies the authored shadow tier + lod bias
-         * (per-scene JceSceneRenderingSettings still override at render time).
-         *
-         * SEED FROM THE AUTHORED FILE, NOT FROM DEFAULTS.  This started at
-         * jce_render_settings_default() and then set seven quality fields, so
-         * every OTHER field in JceRenderSettings was silently reset to a
-         * default in every cooked tree and every shipped game -- the whole
-         * Look Profile block (wrap_factor, ambient hemisphere and ground
-         * colour, rim colour/power/intensity, tonemap op, LUT path and
-         * strength, toon_character, bloom_knee) plus grass_enabled, the
-         * project-level gate sr_draw_grass requires.  The editor renders from
-         * the SOURCE render_settings.json, so a GrassField that draws in the
-         * viewport was absent from the built game with no warning, and the
-         * authored look came out neutral.
-         *
-         * Worse, the file this writes IS the editor's own fallback source
-         * (jce_scene_content_context), so the build overwrote it with a
-         * defaults-seeded document rather than merely failing to carry it.
-         *
-         * Same resolution the editor uses -- source first, cooked as
-         * fallback -- so the two sides cannot disagree about which file is
-         * authoritative. */
-        JceRenderSettings rs = jce_render_settings_default();
-        {
-            const std::string proj_root =
-                s_current_project_root[0] ? std::string(s_current_project_root)
-                                          : std::string(".");
-            std::string seed;
-            /* ONE composition, shared with the viewport.  This block used to
-             * start from defaults and set seven quality fields, which reset
-             * the entire authored Look Profile and grass_enabled in every
-             * cooked tree -- and the file it writes IS the viewport's own
-             * fallback source, so it overwrote them rather than merely
-             * failing to carry them. */
-            if (jce_editor_effective_render_settings(false, proj_root.c_str(),
-                                                     &rs, &seed) &&
-                !seed.empty())
-                log_line(JCE_CONSOLE_INFO,
-                         "[build] render settings seeded from " + seed);
-            else if (seed.empty())
-                log_line(JCE_CONSOLE_INFO,
-                         "[build] no authored render_settings.json; exporting "
-                         "the active quality level over defaults");
-        }
-        std::string rp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
-                         "render_settings.json";
-        if (jce_render_settings_save_json(rp.c_str(), &rs))
-            log_line(JCE_CONSOLE_INFO, "[build] render settings -> " + rp);
-        else
-            log_line(JCE_CONSOLE_WARNING,
-                     "[build] failed to write render settings: " + rp);
-
-        /* Settings S2 — export the authored render-pipeline asset into the
-         * cooked tree (PAK key settings/render_pipeline.rp.json); the runtime
-         * re-resolves it after bundle mount (apply_boot_mounted).  Without
-         * this, shipped single-exe games silently fell back to the tier
-         * auto-preset. */
-        {
-            std::string proj = s_current_project_root[0]
-                                   ? std::string(s_current_project_root)
-                                   : std::string(".");
-            std::string rp_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
-                                 PATH_SEP_CHR_LOCAL + "RenderPipeline.rp.json";
-            if (jce_fs_host_exists_file(rp_src.c_str())) {
-                std::string rp_dir = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
-                                     "settings";
-                jce_fs_host_create_directory(rp_dir.c_str());
-                std::string rp_dst = rp_dir + PATH_SEP_CHR_LOCAL +
-                                     "render_pipeline.rp.json";
-                if (jce_fs_host_copy_file(rp_src.c_str(), rp_dst.c_str()))
-                    log_line(JCE_CONSOLE_INFO,
-                             "[build] render pipeline asset -> " + rp_dst);
-                else
-                    log_line(JCE_CONSOLE_WARNING,
-                             "[build] failed to stage render pipeline asset: " +
-                             rp_src);
-            }
-
-            /* Mirror the authored audio-mixer routing into the same cooked
-             * settings/ channel (PAK key settings/audio_mixer.json).  NOTE:
-             * the runtime mixer read is still host-only (rt_mixer_read_config
-             * uses jce_fs_host_read_all; no apply_boot_mounted analogue for
-             * audio yet), so a pure single-exe build does not consume this
-             * copy — it travels with the cooked tree for parity with the
-             * render pipeline asset and for a future PAK-aware read. */
-            std::string mx_src = proj + PATH_SEP_CHR_LOCAL + "Settings" +
-                                 PATH_SEP_CHR_LOCAL + "audio_mixer.json";
-            if (jce_fs_host_exists_file(mx_src.c_str())) {
-                std::string mx_dir = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
-                                     "settings";
-                jce_fs_host_create_directory(mx_dir.c_str());
-                std::string mx_dst = mx_dir + PATH_SEP_CHR_LOCAL +
-                                     "audio_mixer.json";
-                if (jce_fs_host_copy_file(mx_src.c_str(), mx_dst.c_str()))
-                    log_line(JCE_CONSOLE_INFO,
-                             "[build] audio mixer config (cooked) -> " + mx_dst);
-                else
-                    log_line(JCE_CONSOLE_WARNING,
-                             "[build] failed to stage audio mixer config: " +
-                             mx_src);
-            }
         }
     }
 
@@ -2951,6 +2954,10 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     p.app_name    = (cfg->app_name && cfg->app_name[0]) ? cfg->app_name : "";
     p.app_version = (cfg->app_version && cfg->app_version[0])
                         ? cfg->app_version : "";
+
+    export_project_runtime_configs(p.project,
+        p.cooked.empty() ? std::string() :
+        p.project + PATH_SEP_CHR_LOCAL + join_norm_sep(p.cooked));
 
     p.active = true;
 

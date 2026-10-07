@@ -56,6 +56,7 @@ JCE_API jce_vec3       jce_camera_get_position(const JceCamera *cam);
 JCE_API jce_vec3       jce_camera_get_forward(const JceCamera *cam);
 JCE_API jce_vec3       jce_camera_get_right(const JceCamera *cam);
 JCE_API jce_vec3       jce_camera_get_up(const JceCamera *cam);
+/* Vertical field of view in degrees, matching jce_camera_set_fov(). */
 JCE_API float          jce_camera_get_fov(const JceCamera *cam);
 JCE_API float          jce_camera_get_near(const JceCamera *cam);
 JCE_API float          jce_camera_get_far(const JceCamera *cam);
@@ -65,7 +66,9 @@ JCE_API JceCameraMode  jce_camera_get_mode(const JceCamera *cam);
 
 JCE_API void jce_camera_set_position(JceCamera *cam, jce_vec3 pos);
 JCE_API void jce_camera_set_target(JceCamera *cam, jce_vec3 target);
-/* Set an orthonormal world pose, preserving authored camera roll. */
+/* Set an exact orthonormal world pose, preserving poles and authored roll.
+ * Invalid/nonfinite/parallel direction vectors fail without changing the pose.
+ * FPS rotation remains separately pitch-limited. */
 JCE_API bool jce_camera_set_pose(JceCamera *cam, jce_vec3 position,
                                  jce_vec3 forward, jce_vec3 up);
 JCE_API void jce_camera_set_fov(JceCamera *cam, float fov_deg);
@@ -82,10 +85,11 @@ JCE_API void jce_camera_move_forward(JceCamera *cam, float distance);
 JCE_API void jce_camera_move_right(JceCamera *cam, float distance);
 JCE_API void jce_camera_move_up(JceCamera *cam, float distance);
 
-/* Rotate by yaw/pitch (radians). Clamps pitch to 89. */
+/* Rotate by yaw/pitch (radians). Nonzero input enters world-Y-up FPS control
+ * and clamps pitch to 89 degrees; zero input preserves the exact pose. */
 JCE_API void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad);
 
-/* Look at a specific target from the current position. */
+/* Look at a specific target using the world-Y-up FPS basis and pitch limit. */
 JCE_API void jce_camera_look_at(JceCamera *cam, jce_vec3 target);
 
 /* Third-person orbit follow: place the camera behind + above `target` and look

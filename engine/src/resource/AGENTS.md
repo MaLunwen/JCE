@@ -151,3 +151,8 @@ options 结构，正是「为一个文件设的值到达了下一个文件」的
 `engine/src tools editor/src`，漏掉 `tests/middleware/audio/` 里的三处，
 改签名之后才由编译器找出来。⇒ **改内部 API 的签名时，调用方扫描要覆盖每一棵
 会对着那个头编译的树，`tests/` 是其中之一。**
+
+Host asset targets compile the same CPU importer and archive implementations.
+JCE_MODEL_IMPORTER_COOK_ONLY excludes GPU mesh loaders and upload helpers,
+while CPU parts, mesh decode, materials and inspection remain available.
+Host tools must use real PAK readers rather than link-only placeholder APIs.

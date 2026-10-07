@@ -318,9 +318,34 @@ function(jce_compile_shaders)
             set(_shader_defines
                 --define "BGFX_CONFIG_MAX_BONES=128")
 
+            # Cache only a verified single shader blob, never a native build tree.
+            # The key includes compiler bytes, argv and every declared source input.
+            set(_shader_command "${_shaderc}")
+            set(_cache_dependencies "${_shaderc}")
+            if(JCE_SHADER_LINT_PYTHON)
+                set(_cache_script "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/shader_cache.py")
+                set(_cache_lock "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/build/cache_lock.py")
+                if(NOT DEFINED JCE_SHADER_CACHE_DIR)
+                    set(JCE_SHADER_CACHE_DIR
+                        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../build/shader-cache"
+                        CACHE PATH "First-party content-addressed shader cache")
+                endif()
+                set(_cache_inputs "${_src}" "${_varying}"
+                    ${_shared_includes} ${_include_inputs})
+                list(REMOVE_DUPLICATES _cache_inputs)
+                set(_cache_input_args)
+                foreach(_cache_input IN LISTS _cache_inputs)
+                    list(APPEND _cache_input_args --input "${_cache_input}")
+                endforeach()
+                set(_shader_command "${JCE_SHADER_LINT_PYTHON}" "${_cache_script}"
+                    --compiler "${_shaderc}" --cache "${JCE_SHADER_CACHE_DIR}"
+                    ${_cache_input_args} --)
+                list(APPEND _cache_dependencies "${_cache_script}" "${_cache_lock}")
+            endif()
+
             add_custom_command(
                 OUTPUT  "${_out}"
-                COMMAND "${_shaderc}"
+                COMMAND ${_shader_command}
                         -f "${_src}"
                         -o "${_out}"
                         --type "${_type}"
@@ -350,7 +375,7 @@ function(jce_compile_shaders)
                         #                narrows from 5.0-7.9 to 5.1-5.8
                         -O 3
                 DEPENDS "${_src}" "${_varying}" ${_lint_stamp}
-                        ${_shared_includes} ${_include_inputs}
+                        ${_shared_includes} ${_include_inputs} ${_cache_dependencies}
                 COMMENT "Shader: ${_name} (${_suffix})"
                 VERBATIM)
 

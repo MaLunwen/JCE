@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "default_shipping_profile": "embedded",
+  "profiles": {
+    "embedded": {
+      "languages": [
+        "lua",
+        "js",
+        "c",
+        "cpp"
+      ],
+      "external_vm_allowed": false
+    },
+    "authoring": {
+      "languages": [
+        "lua",
+        "js",
+        "c",
+        "cpp",
+        "python",
+        "java",
+        "csharp"
+      ],
+      "external_vm_allowed": true
+    }
+  },
+  "required_languages_field": "required_languages",
+  "selected_script_closure": "public bundle_graph.json assets[].address",
+  "native_script_registry": "Selected .jcec/.jcecpp requires statically linked project registry; unavailable until explicitly verified",
+  "os_system_libraries_allowed": true
+}

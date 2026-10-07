@@ -158,7 +158,7 @@ def _owned(fn, args, what: str):
         f"{OWNED_STRING_MAX_ATTEMPTS} attempts")
 
 SCRIPT_API_VERSION = 1
-ENTRY_COUNT = 101
+ENTRY_COUNT = 108
 
 ENTRY_NAMES = (
     "get_position",
@@ -200,6 +200,7 @@ ENTRY_NAMES = (
     "is_action_pressed",
     "get_axis",
     "get_pointer_delta",
+    "get_pointer_position",
     "get_pointer_wheel",
     "is_pointer_down",
     "get_touch_count",
@@ -262,6 +263,12 @@ ENTRY_NAMES = (
     "get_param_text",
     "curve_eval",
     "vcam_activate",
+    "set_cursor",
+    "request_quit",
+    "stat_available",
+    "stat_set",
+    "stat_get",
+    "stat_flush",
 )
 
 # Every Lua table key this module deliberately does not carry, with the
@@ -357,6 +364,7 @@ class _Entries:
         "is_action_pressed",
         "get_axis",
         "get_pointer_delta",
+        "get_pointer_position",
         "get_pointer_wheel",
         "is_pointer_down",
         "get_touch_count",
@@ -419,6 +427,12 @@ class _Entries:
         "get_param_text",
         "curve_eval",
         "vcam_activate",
+        "set_cursor",
+        "request_quit",
+        "stat_available",
+        "stat_set",
+        "stat_get",
+        "stat_flush",
     )
 
     def __init__(self, lib: ctypes.CDLL) -> None:
@@ -543,6 +557,9 @@ class _Entries:
         self.get_pointer_delta = _decl(
             lib, "jce_script_api_get_pointer_delta", None,
             [ctypes.c_void_p, ctypes.c_float * 2])
+        self.get_pointer_position = _decl(
+            lib, "jce_script_api_get_pointer_position", None,
+            [ctypes.c_void_p, ctypes.c_float * 4])
         self.get_pointer_wheel = _decl(
             lib, "jce_script_api_get_pointer_wheel", ctypes.c_float,
             [ctypes.c_void_p])
@@ -729,6 +746,24 @@ class _Entries:
         self.vcam_activate = _decl(
             lib, "jce_script_api_vcam_activate", ctypes.c_int,
             [ctypes.c_void_p, ctypes.c_char_p])
+        self.set_cursor = _decl(
+            lib, "jce_script_api_set_cursor", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int])
+        self.request_quit = _decl(
+            lib, "jce_script_api_request_quit", ctypes.c_bool,
+            [ctypes.c_void_p])
+        self.stat_available = _decl(
+            lib, "jce_script_api_stat_available", ctypes.c_bool,
+            [ctypes.c_void_p])
+        self.stat_set = _decl(
+            lib, "jce_script_api_stat_set", ctypes.c_bool,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double])
+        self.stat_get = _decl(
+            lib, "jce_script_api_stat_get", ctypes.c_int,
+            [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double])
+        self.stat_flush = _decl(
+            lib, "jce_script_api_stat_flush", ctypes.c_bool,
+            [ctypes.c_void_p])
 
 
 class Api:
@@ -1077,6 +1112,17 @@ class Api:
         out_xy = (ctypes.c_float * 2)()
         self._f.get_pointer_delta(self._h, out_xy)
         return (out_xy[0], out_xy[1],)
+
+    def get_pointer_position(self) -> tuple[float, float, float, float]:
+        """jce.get_pointer_position — shape: void_out_array, since 1.
+
+        Viewport-local logical pixel x, y, width, height; zero dimensions
+        indicate unavailable input. The sample is frame-transient and shared by
+        Editor Game View and standalone runtime.
+        """
+        out_xywh = (ctypes.c_float * 4)()
+        self._f.get_pointer_position(self._h, out_xywh)
+        return (out_xywh[0], out_xywh[1], out_xywh[2], out_xywh[3],)
 
     def get_pointer_wheel(self) -> float:
         """jce.get_pointer_wheel — shape: value_return, since 1.
@@ -1591,3 +1637,47 @@ class Api:
         camera choice into the level file.
         """
         return self._f.vcam_activate(self._h, _s(name))
+
+    def set_cursor(self, asset_path: str, hotspot_x: int, hotspot_y: int) -> bool:
+        """jce.set_cursor — shape: value_return, since 1.
+
+        Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path
+        resets. Main-thread; false on decode/platform/cache failure.
+        """
+        return self._f.set_cursor(self._h, _s(asset_path), hotspot_x, hotspot_y)
+
+    def request_quit(self) -> bool:
+        """jce.request_quit — shape: value_return, since 1.
+        """
+        return self._f.request_quit(self._h)
+
+    def stat_available(self) -> bool:
+        """jce.stat_available — shape: value_return, since 1.
+        """
+        return self._f.stat_available(self._h)
+
+    def stat_set(self, id: str, value: float) -> bool:
+        """jce.stat_set — shape: value_return, since 1.
+
+        Store signed32 statistic through an explicitly borrowed platform
+        service. Nonfinite, fractional or out-of-range values return false;
+        successful set does not imply durable flush.
+        """
+        return self._f.stat_set(self._h, _s(id), value)
+
+    def stat_get(self, id: str, fallback: float) -> int:
+        """jce.stat_get — shape: value_return, since 1.
+
+        Signed32 statistic; fallback must be finite, integral and in range,
+        otherwise returns 0. An absent host returns 0; a configured runtime
+        with unavailable service returns the valid fallback.
+
+        With the host member absent the C ABI answers the manifest's
+        absent_value, not zero.
+        """
+        return self._f.stat_get(self._h, _s(id), fallback)
+
+    def stat_flush(self) -> bool:
+        """jce.stat_flush — shape: value_return, since 1.
+        """
+        return self._f.stat_flush(self._h)

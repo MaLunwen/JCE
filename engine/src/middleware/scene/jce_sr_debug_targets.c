@@ -34,12 +34,92 @@
 #include "middleware/scene/jce_sr_internal.h"
 
 #include <string.h>
+#include "renderer/jce_gpu_particles_internal.h"
+
+static const char *const particle_target_names[] = {
+    "particles.gpu_alive_00",
+    "particles.gpu_alive_01",
+    "particles.gpu_alive_02",
+    "particles.gpu_alive_03",
+    "particles.gpu_alive_04",
+    "particles.gpu_alive_05",
+    "particles.gpu_alive_06",
+    "particles.gpu_alive_07",
+    "particles.gpu_alive_08",
+    "particles.gpu_alive_09",
+    "particles.gpu_alive_10",
+    "particles.gpu_alive_11",
+    "particles.gpu_alive_12",
+    "particles.gpu_alive_13",
+    "particles.gpu_alive_14",
+    "particles.gpu_alive_15",
+    "particles.gpu_alive_16",
+    "particles.gpu_alive_17",
+    "particles.gpu_alive_18",
+    "particles.gpu_alive_19",
+    "particles.gpu_alive_20",
+    "particles.gpu_alive_21",
+    "particles.gpu_alive_22",
+    "particles.gpu_alive_23",
+    "particles.gpu_alive_24",
+    "particles.gpu_alive_25",
+    "particles.gpu_alive_26",
+    "particles.gpu_alive_27",
+    "particles.gpu_alive_28",
+    "particles.gpu_alive_29",
+    "particles.gpu_alive_30",
+    "particles.gpu_alive_31",
+    "particles.gpu_alive_32",
+    "particles.gpu_alive_33",
+    "particles.gpu_alive_34",
+    "particles.gpu_alive_35",
+    "particles.gpu_alive_36",
+    "particles.gpu_alive_37",
+    "particles.gpu_alive_38",
+    "particles.gpu_alive_39",
+    "particles.gpu_alive_40",
+    "particles.gpu_alive_41",
+    "particles.gpu_alive_42",
+    "particles.gpu_alive_43",
+    "particles.gpu_alive_44",
+    "particles.gpu_alive_45",
+    "particles.gpu_alive_46",
+    "particles.gpu_alive_47",
+    "particles.gpu_alive_48",
+    "particles.gpu_alive_49",
+    "particles.gpu_alive_50",
+    "particles.gpu_alive_51",
+    "particles.gpu_alive_52",
+    "particles.gpu_alive_53",
+    "particles.gpu_alive_54",
+    "particles.gpu_alive_55",
+    "particles.gpu_alive_56",
+    "particles.gpu_alive_57",
+    "particles.gpu_alive_58",
+    "particles.gpu_alive_59",
+    "particles.gpu_alive_60",
+    "particles.gpu_alive_61",
+    "particles.gpu_alive_62",
+    "particles.gpu_alive_63",
+};
+typedef char SrParticleTargetNameCount[(sizeof particle_target_names /
+    sizeof particle_target_names[0] == SR_GPU_PARTICLE_MAX) ? 1 : -1];
 
 /* bgfx handle 0 is LEGAL -- a real slot, not a sentinel -- so the invalid
  * test is against UINT16_MAX and never against zero.  This engine has shipped
  * that confusion twice (an empty-slot sentinel and a memset descriptor), so
  * it is spelled out here and asserted in the test rather than inlined. */
 static bool tex_ok(uint16_t idx) { return idx != UINT16_MAX; }
+
+bool jce_sr_particle_count_encode(uint32_t alive, uint8_t rgba[4])
+{
+    if (!rgba || alive >= 16777216u) return false;
+    rgba[0] = (uint8_t)alive;
+    rgba[1] = (uint8_t)(alive >> 8);
+    rgba[2] = (uint8_t)(alive >> 16);
+    rgba[3] = 255;
+    return true;
+}
 
 int jce_sr_debug_targets_build(const JceSrDebugTargetState *st,
                                JceRenderTargetInfo *out, int cap)
@@ -127,6 +207,20 @@ int jce_sr_debug_targets_build(const JceSrDebugTargetState *st,
              st->dyn_csm_atlas_tex, st->dyn_csm_atlas_size,
              st->dyn_csm_atlas_size, JCE_RT_KIND_SHADOW);
     }
+    /* Static maps can be reused rather than redrawn: require the current
+     * receiver binding and valid cached contents, not allocation alone. */
+    if (st->shadow_valid && st->shadow_use_csm && st->frame_shadow_active
+        && st->last_csm_valid && st->shadow_map_size > 0) {
+        static const char *const names[JCE_CSM_MAX_CASCADES] = {
+            "shadow.csm_static_0", "shadow.csm_static_1",
+            "shadow.csm_static_2", "shadow.csm_static_3"};
+        for (uint32_t i = 0; i < st->csm_count && i < JCE_CSM_MAX_CASCADES; ++i) {
+            if (st->csm_cache_valid[i])
+                PUSH(names[i], "Static cascade depth, including valid cached frames.",
+                     st->csm_tex[i], st->shadow_map_size, st->shadow_map_size,
+                     JCE_RT_KIND_SHADOW);
+        }
+    }
     PUSH("shadow.local_atlas",
          "Spot and point shadow atlas. One tile per shadow-casting local "
          "light that survived culling this frame.",
@@ -152,6 +246,27 @@ int jce_sr_debug_targets_build(const JceSrDebugTargetState *st,
          "Multiple-scattering LUT. Its magnitude is the term that was once "
          "computed from albedo and came out 82x too large.",
          st->sky_multiscatter_tex, 0, 0, JCE_RT_KIND_LUT);
+
+    if (st->ssr_active_frame)
+        PUSH("reflection.ssr",
+             "Premultiplied screen reflection colour and coverage alpha. "
+             "A transparent result means the march found no reflective hit.",
+             st->ssr_tex, st->ssao_w, st->ssao_h, JCE_RT_KIND_COLOR);
+
+    if (st->cpu_particles_current_frame) {
+        PUSH("particles.cpu_alive_total",
+             "Scene CPU simulation alive total: RGB little-endian 24-bit, alpha validity. Not drawn count.",
+             st->cpu_particle_tex, 1, 1, JCE_RT_KIND_COLOR);
+        PUSH("particles.cpu_drawn_total",
+             "CPU billboards submitted in current scene render view; not visible fragments. RGB24, alpha validity.",
+             st->cpu_particle_drawn_tex, 1, 1, JCE_RT_KIND_COLOR);
+    }
+    if (st->gpu_particles_current_frame) {
+        for (int i = 0; i < SR_GPU_PARTICLE_MAX; ++i)
+            PUSH(particle_target_names[i],
+                 "Current GPU emitter alive count: RGB little-endian 24-bit, alpha validity. Not a colour image.",
+                 st->gpu_particle_tex[i], 1, 1, JCE_RT_KIND_COLOR);
+    }
 
 #undef PUSH
     return n;
@@ -182,6 +297,14 @@ static void state_from_renderer(const JceSceneRenderer *sr,
 
     st->shadow_valid         = sr->shadow_valid;
     st->shadow_use_csm       = sr->shadow_use_csm;
+    st->frame_shadow_active  = sr->frame_shadow_active;
+    st->last_csm_valid       = sr->last_csm_valid;
+    st->csm_count            = sr->last_csm.cascade_count < sr->csm_cascade_count
+                              ? sr->last_csm.cascade_count : sr->csm_cascade_count;
+    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; ++i) {
+        st->csm_cache_valid[i] = sr->shadow_cache_valid[i];
+        st->csm_tex[i] = sr->csm_tex[i].idx;
+    }
     st->shadow_map_size      = sr->shadow_map_size;
     st->dyn_csm_atlas_size   = sr->dyn_csm_atlas_size;
     st->shadow_tex           = sr->shadow_tex.idx;
@@ -192,6 +315,23 @@ static void state_from_renderer(const JceSceneRenderer *sr,
     st->brdf_lut               = sr->brdf_lut.idx;
     st->sky_transmittance_tex  = sr->sky_transmittance_tex.idx;
     st->sky_multiscatter_tex   = sr->sky_multiscatter_tex.idx;
+    st->ssr_active_frame      = sr->ssr_active_frame;
+    st->ssr_tex               = sr->ssr_result_idx;
+    JceCvar *debug_stats = jce_cvar_find("r.particles.debug_stats");
+    st->cpu_particle_tex = sr->cpu_particle_count_tex.idx;
+    st->cpu_particle_drawn_tex = sr->cpu_particle_drawn_tex.idx;
+    st->cpu_particles_current_frame = debug_stats && jce_cvar_get_bool(debug_stats)
+        && sr->cpu_particle_count_valid
+        && sr->cpu_particle_count_scene == sr->cpu_particle_render_scene
+        && sr->cpu_particle_count_frame == jce_renderer_get_frame_index(sr->renderer);
+    st->gpu_particles_current_frame = debug_stats && jce_cvar_get_bool(debug_stats)
+        && sr->gpu_particle_frame_valid
+        && sr->gpu_particle_frame == jce_renderer_get_frame_index(sr->renderer);
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; ++i) {
+        st->gpu_particle_tex[i] = UINT16_MAX;
+        if (st->gpu_particles_current_frame && sr->gpu_particles[i].referenced)
+            st->gpu_particle_tex[i] = jce_gpu_particles_debug_texture(sr->gpu_particles[i].sys);
+    }
 }
 
 int jce_scene_renderer_debug_target_count(const JceSceneRenderer *sr)

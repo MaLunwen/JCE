@@ -1,0 +1,1 @@
+JCE SDK-only benchmark consumer. Workload definitions use public scene APIs.

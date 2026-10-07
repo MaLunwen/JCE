@@ -64,7 +64,7 @@ typedef struct {
 
 /* Hash table entry for non-ASCII glyphs. */
 typedef struct {
-    uint32_t  codepoint;     /* 0 = empty slot */
+    uint32_t  codepoint;     /* 0 = empty; Unicode or high-bit tagged glyph index. */
     GlyphInfo glyph;
 } GlyphEntry;
 
@@ -288,7 +288,11 @@ static const GlyphInfo *font_get_glyph(const JceFont *font, uint32_t cp)
  * default mode, and the SDF renderer has to be asked for by name. */
 static FT_Error text_render_glyph(FT_Face face, uint32_t cp, int spread)
 {
-    FT_Error err = FT_Load_Char(face, cp, FT_LOAD_DEFAULT);
+    /* Unicode keys preserve pre-baked ASCII/CJK lookup. Contextual glyphs
+     * share the existing dynamic atlas with a disjoint font-local key space. */
+    FT_Error err = (cp & UINT32_C(0x80000000))
+        ? FT_Load_Glyph(face, cp & UINT32_C(0x7fffffff), FT_LOAD_DEFAULT)
+        : FT_Load_Char(face, cp, FT_LOAD_DEFAULT);
     if (err) return err;
     return FT_Render_Glyph(face->glyph,
                            spread > 0 ? FT_RENDER_MODE_SDF
@@ -933,9 +937,8 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
     JceFont   *batch_font = font;
 
     for (uint32_t i = 0; i < glyph_count; i++) {
-        /* The atlas is indexed by Unicode codepoint, and the shaper decoded
-           it from the cluster once, when it shaped.  Reading it back here
-           means the run does not refer into `text` at all. */
+        /* Source characters identify controls; rasterization uses the shaped
+         * glyph. Neither value refers into the caller's original buffer. */
         uint32_t ucp = run[i].codepoint;
 
         if (ucp == '\n') {
@@ -948,18 +951,20 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
          * entirely (the pinned UI font does), in which case FreeType
          * rasterizes .notdef — a visible tofu box — for every word gap. */
         if (ucp == ' ' || ucp == '\t' || ucp == 0x00A0u) {
-            cx += (float)(run[i].x_advance >> 6) * scale;
+            cx += ((float)run[i].x_advance / 64.0f) * scale;
             continue;
         }
 
-        float x_offset  = (float)(run[i].x_offset >> 6) * scale;
-        float y_offset  = (float)(run[i].y_offset >> 6) * scale;
-        float x_advance = (float)(run[i].x_advance >> 6) * scale;
+        float x_offset  = ((float)run[i].x_offset / 64.0f) * scale;
+        float y_offset  = ((float)run[i].y_offset / 64.0f) * scale;
+        float x_advance = ((float)run[i].x_advance / 64.0f) * scale;
 
         /* The glyph comes out of the font the SHAPER chose for it, which is
          * the primary unless a fallback claimed this codepoint. */
         JceFont *gf = font_for_slot(font, run[i].font_slot);
-        const GlyphInfo *g = font_get_or_render_glyph(gf, ucp);
+        const uint32_t key = FT_Get_Char_Index(gf->ft_face, ucp) == run[i].glyph_id
+            ? ucp : (UINT32_C(0x80000000) | run[i].glyph_id);
+        const GlyphInfo *g = font_get_or_render_glyph(gf, key);
         if (!g) g = font_get_glyph(gf, '?');
 
         if (g && g->w > 0 && g->h > 0) {
@@ -968,7 +973,7 @@ void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
              * to the line, and two fonts opened at one point size do not agree
              * on where the top of their box is.  Using each glyph's own font
              * here makes a mixed line ripple. */
-            const float gy = cy + y_offset
+            const float gy = cy - y_offset
                            + (float)(font->ascender - g->bearing_y) * scale;
             const JceTexture atlas = g->dynamic ? gf->dyn_atlas
                                                 : gf->atlas;
@@ -1036,7 +1041,7 @@ void jce_text_measure(const JceFont *font, const char *text,
             lines++;
             continue;
         }
-        cx += (float)(run[i].x_advance >> 6);
+        cx += (float)run[i].x_advance / 64.0f;
     }
     if (cx > max_w) max_w = cx;
 
@@ -1428,4 +1433,3 @@ void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
     (void)math_run(&m, markup, strlen(markup), x, baseline, scale);
     math_flush(&m);
 }
-

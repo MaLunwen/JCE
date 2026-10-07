@@ -68,6 +68,18 @@ void fv_render_image(FvTab *tab)
         }
     }
 
+    ImGui::BeginDisabled(!jce_file_viewer_cursor_available(tab->path));
+    if (ImGui::SmallButton(jce_editor_i18n(jce_file_viewer_cursor_enabled(tab->path)
+            ? "viewer.cursorStop" : "viewer.cursorPreview")))
+        if (!jce_file_viewer_cursor_toggle(tab->path))
+            ImGui::OpenPopup("##cursorPreviewFailed");
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopup("##cursorPreviewFailed")) {
+        ImGui::TextWrapped("%s", jce_editor_i18n("viewer.cursorFailed"));
+        ImGui::EndPopup();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", jce_editor_i18n("viewer.cursorHint"));
     ImGui::Separator();
 
     /* ── Image Display (shared zoomable canvas) ──────────────────── */
@@ -82,6 +94,7 @@ void fv_render_image(FvTab *tab)
         zp.allow_double_click_toggle = true;
         zp.matte_color = jce_theme::canvas_bg();
         fv_render_zoomable(&zp);
+        jce_file_viewer_cursor_visit(tab->path, ImGui::IsItemHovered());
     } else {
         /* Fallback: texture not loaded */
         ImGui::Spacing();

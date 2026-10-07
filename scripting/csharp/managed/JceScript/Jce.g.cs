@@ -260,6 +260,10 @@ internal static unsafe partial class Interop
             IntPtr api,
             float* outXy);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void jce_script_api_get_pointer_position(
+            IntPtr api,
+            float* outXywh);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float jce_script_api_get_pointer_wheel(
             IntPtr api);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -567,11 +571,36 @@ internal static unsafe partial class Interop
             IntPtr api,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string? name);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern byte jce_script_api_set_cursor(
+            IntPtr api,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? assetPath,
+            int hotspotX,
+            int hotspotY);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern byte jce_script_api_request_quit(
+            IntPtr api);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern byte jce_script_api_stat_available(
+            IntPtr api);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern byte jce_script_api_stat_set(
+            IntPtr api,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? id,
+            double @value);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int jce_script_api_stat_get(
+            IntPtr api,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? id,
+            double fallback);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern byte jce_script_api_stat_flush(
+            IntPtr api);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void jce_script_api_json_free(IntPtr api, IntPtr owned);
     }
 }
 
-/// <summary>The engine, as a C# script sees it. 101 calls, generated from the same manifest the other five languages read.</summary>
+/// <summary>The engine, as a C# script sees it. 108 calls, generated from the same manifest the other five languages read.</summary>
 public static unsafe class Jce
 {
     private static IntPtr _api;
@@ -916,6 +945,17 @@ public static unsafe class Jce
             float* o = stackalloc float[2];
             Interop.Fn.jce_script_api_get_pointer_delta(_api, o);
             return (o[0], o[1]);
+        }
+
+        /// <summary>
+        /// Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.
+        /// </summary>
+
+        public static (float, float, float, float) GetPointerPosition()
+        {
+            float* o = stackalloc float[4];
+            Interop.Fn.jce_script_api_get_pointer_position(_api, o);
+            return (o[0], o[1], o[2], o[3]);
         }
 
 
@@ -1437,5 +1477,51 @@ public static unsafe class Jce
         public static int VcamActivate(string? name)
         {
             return Interop.Fn.jce_script_api_vcam_activate(_api, name);
+        }
+
+        /// <summary>
+        /// Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path resets. Main-thread; false on decode/platform/cache failure.
+        /// </summary>
+
+        public static bool SetCursor(string? assetPath, int hotspotX, int hotspotY)
+        {
+            return Interop.Fn.jce_script_api_set_cursor(_api, assetPath, hotspotX, hotspotY) != 0;
+        }
+
+
+        public static bool RequestQuit()
+        {
+            return Interop.Fn.jce_script_api_request_quit(_api) != 0;
+        }
+
+
+        public static bool StatAvailable()
+        {
+            return Interop.Fn.jce_script_api_stat_available(_api) != 0;
+        }
+
+        /// <summary>
+        /// Store signed32 statistic through an explicitly borrowed platform service. Nonfinite, fractional or out-of-range values return false; successful set does not imply durable flush.
+        /// </summary>
+
+        public static bool StatSet(string? id, double @value)
+        {
+            return Interop.Fn.jce_script_api_stat_set(_api, id, @value) != 0;
+        }
+
+        /// <summary>
+        /// Signed32 statistic; fallback must be finite, integral and in range, otherwise returns 0. An absent host returns 0; a configured runtime with unavailable service returns the valid fallback.
+        /// <para>With the host member absent the C ABI answers the manifest's absent_value, not zero.</para>
+        /// </summary>
+
+        public static int StatGet(string? id, double fallback)
+        {
+            return Interop.Fn.jce_script_api_stat_get(_api, id, fallback);
+        }
+
+
+        public static bool StatFlush()
+        {
+            return Interop.Fn.jce_script_api_stat_flush(_api) != 0;
         }
 }

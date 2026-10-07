@@ -15,6 +15,7 @@
  */
 
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_window_event.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -24,6 +25,7 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <math.h>
 
 #define LOG_TAG "jce_input"
 
@@ -58,6 +60,9 @@ struct JceInput {
     float    wheel_h;
     uint32_t mouse_cur;
     uint32_t mouse_prev;
+
+    /* Primary touch identity survives release without contaminating mouse. */
+    struct { float x, y; uint64_t finger; bool touch, down; } pointer;
 
     /* Touch */
     int touch_count;
@@ -246,6 +251,7 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
         break;
 
     case JCE_INPUT_EVENT_MOUSE_MOTION:
+        input->pointer.touch = false;
         input->mouse_x   = ev->motion.x;
         input->mouse_y   = ev->motion.y;
         input->mouse_dx += ev->motion.dx;
@@ -259,6 +265,7 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
         break;
 
     case JCE_INPUT_EVENT_MOUSE_BUTTON:
+        input->pointer.touch = false;
         /* The mask is applied here, once, on the SDL-free side of the seam.
          * The producer carries the 1-based NUMBER. */
         if (ev->mbutton.button < 1 || ev->mbutton.button > 32) break;
@@ -301,6 +308,17 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
     }
 
     case JCE_INPUT_EVENT_TOUCH:
+        if (ev->touch.phase == JCE_INPUT_TOUCH_PHASE_DOWN && input->touch_count == 0) {
+            input->pointer.touch = true;
+            input->pointer.down = true;
+            input->pointer.finger = ev->touch.finger;
+        }
+        if (input->pointer.touch && input->pointer.finger == ev->touch.finger) {
+            input->pointer.x = ev->touch.x;
+            input->pointer.y = ev->touch.y;
+            if (ev->touch.phase == JCE_INPUT_TOUCH_PHASE_UP)
+                input->pointer.down = false;
+        }
         if (ev->touch.phase == JCE_INPUT_TOUCH_PHASE_UP)
             touch_up(input, &ev->touch);
         else
@@ -465,6 +483,21 @@ void jce_input_mouse_pos(const JceInput *input, float *x, float *y)
     if (y) *y = input ? input->mouse_y : 0.0f;
 }
 
+bool jce_input_primary_pointer(const JceInput *input, float width, float height,
+                               float *x, float *y, bool *down)
+{
+    float px, py;
+    if (!input || !x || !y || !down || !isfinite(width) || !isfinite(height) ||
+        width <= 0.0f || height <= 0.0f) return false;
+    px = input->pointer.touch ? input->pointer.x * width : input->mouse_x;
+    py = input->pointer.touch ? input->pointer.y * height : input->mouse_y;
+    *x = px; *y = py;
+    *down = input->pointer.touch ? input->pointer.down :
+        (input->mouse_cur & JCE_MOUSE_BUTTON_MASK(JCE_MOUSE_BUTTON_LEFT)) != 0;
+    return isfinite(px) && isfinite(py) && px >= 0.0f && py >= 0.0f &&
+           px < width && py < height;
+}
+
 void jce_input_mouse_delta(const JceInput *input, float *dx, float *dy)
 {
     if (dx) *dx = input ? input->mouse_dx : 0.0f;
@@ -583,6 +616,10 @@ bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
     if (!input || !frame) return false;
     if (frame->version != JCE_INPUT_FRAME_VERSION) return false;
 
+    int old_touches = input->touch_count;
+    bool mouse_changed = input->mouse_x != frame->mouse_x ||
+        input->mouse_y != frame->mouse_y || input->mouse_cur != frame->mouse_buttons ||
+        frame->mouse_dx != 0.0f || frame->mouse_dy != 0.0f;
     memset(input->keys_cur, 0, sizeof(input->keys_cur));
     memset(input->keys_tap, 0, sizeof(input->keys_tap));
     for (i = 0; i < (int)JCE_KEY_COUNT && i < 64 * 64; ++i) {
@@ -606,6 +643,22 @@ bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
         input->touches[i].x        = frame->touches[i].x;
         input->touches[i].y        = frame->touches[i].y;
         input->touches[i].pressure = frame->touches[i].pressure;
+    }
+
+    if (n > 0 && old_touches == 0) {
+        input->pointer.touch = true;
+        input->pointer.finger = (uint64_t)input->touches[0].id;
+    }
+    if (input->pointer.touch) {
+        input->pointer.down = false;
+        for (i = 0; i < n; ++i) if ((uint64_t)input->touches[i].id == input->pointer.finger) {
+            input->pointer.x = input->touches[i].x;
+            input->pointer.y = input->touches[i].y;
+            input->pointer.down = true;
+            break;
+        }
+        if (mouse_changed && n == 0 && old_touches == 0)
+            input->pointer.touch = false;
     }
 
     /* Writes the SAME device table the live path writes.  apply() is no longer

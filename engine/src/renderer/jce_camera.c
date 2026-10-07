@@ -20,6 +20,7 @@
 struct JceCamera {
     JceCameraMode mode;
     jce_vec3      position;
+    jce_vec3      forward;      /* exact authored pose or FPS-resolved direction */
     jce_vec3      up_world;     /* world up (usually 0,1,0) */
 
     /* Euler angles for FPS-style control (perspective). */
@@ -44,6 +45,14 @@ static jce_vec3 calc_forward(float yaw, float pitch)
         sinf(pitch),
        -cosf(yaw) * cosf(pitch)
     ));
+}
+
+/* Interactive FPS control uses a stable world-up basis. Authored roll/poles
+ * remain exact until a nonzero controller action explicitly changes the pose. */
+static void camera_apply_fps_direction(JceCamera *cam)
+{
+    cam->forward = calc_forward(cam->yaw, cam->pitch);
+    cam->up_world = jce_v3(0, 1, 0);
 }
 
 /* -- Lifecycle ------------------------------------------------------ */
@@ -74,6 +83,7 @@ JceCamera *jce_camera_create(const JceCameraDesc *desc)
     cam->pitch = asinf(dir.y);
     if (cam->pitch >  MAX_PITCH) cam->pitch =  MAX_PITCH;
     if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
+    cam->forward = calc_forward(cam->yaw, cam->pitch);
 
     return cam;
 }
@@ -89,7 +99,7 @@ jce_mat4 jce_camera_view(const JceCamera *cam)
 {
     if (!cam) return jce_m4_identity();
 
-    jce_vec3 forward = calc_forward(cam->yaw, cam->pitch);
+    jce_vec3 forward = cam->forward;
     jce_vec3 target  = jce_v3_add(cam->position, forward);
     return jce_m4_look_at(cam->position, target, cam->up_world);
 }
@@ -111,13 +121,19 @@ static void cam_log_projection(const JceCamera *cam, float aspect,
                                bool homogeneous_ndc, float hw, float hh)
 {
     static int loud = -1;
-    static float last[11];
-    static int last_mode = -1;
-    static bool last_hd;
+    enum { CACHE_SIZE = 8 };
+    static struct {
+        const JceCamera *camera;
+        float values[11];
+        int mode;
+        bool hd, valid;
+    } cache[CACHE_SIZE];
+    static unsigned next_slot;
     if (loud < 0) {
         const char *v = getenv("JCE_LOG_CAMERA");
         loud = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
+    if (!loud) return;
     /* The POSE is part of this line, not a separate one.  A projection whose
      * every number matches can still put the picture somewhere else, and a
      * rigid screen-space shift with an identical scale is exactly what a
@@ -126,15 +142,22 @@ static void cam_log_projection(const JceCamera *cam, float aspect,
     const float now[11] = { aspect, hw, hh, cam->near_plane, cam->far_plane,
                             cam->fov_rad, cam->position.x, cam->position.y,
                             cam->position.z, cam->yaw, cam->pitch };
-    bool same = (last_mode == (int)cam->mode) && (last_hd == homogeneous_ndc);
-    for (int i = 0; same && i < 11; ++i)
-        same = (last[i] == now[i]);
-    if (same)
-        return;
-    last_mode = (int)cam->mode;
-    last_hd   = homogeneous_ndc;
-    for (int i = 0; i < 11; ++i)
-        last[i] = now[i];
+    int slot = -1;
+    for (int k = 0; k < CACHE_SIZE; ++k) {
+        if (cache[k].valid && cache[k].camera == cam && cache[k].values[0] == aspect) {
+            bool same = cache[k].mode == (int)cam->mode && cache[k].hd == homogeneous_ndc;
+            for (int i = 0; same && i < 11; ++i) same = cache[k].values[i] == now[i];
+            if (same) return;
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) slot = (int)(next_slot++ % CACHE_SIZE);
+    cache[slot].camera = cam;
+    cache[slot].mode = (int)cam->mode;
+    cache[slot].hd = homogeneous_ndc;
+    cache[slot].valid = true;
+    for (int i = 0; i < 11; ++i) cache[slot].values[i] = now[i];
     if (loud)
         LOG_WARN(LOG_TAG,
                  "camera proj: mode=%s aspect=%.6f half=(%.4f, %.4f) "
@@ -147,18 +170,7 @@ static void cam_log_projection(const JceCamera *cam, float aspect,
                  (double)cam->position.x, (double)cam->position.y,
                  (double)cam->position.z, (double)cam->yaw,
                  (double)cam->pitch);
-    else
-        LOG_INFO(LOG_TAG,
-                 "camera proj: mode=%s aspect=%.6f half=(%.4f, %.4f) "
-                 "near=%.4f far=%.4f fov_rad=%.6f homogeneous_ndc=%d "
-                 "pos=(%.5f, %.5f, %.5f) yaw=%.6f pitch=%.6f",
-                 cam->mode == JCE_CAMERA_ORTHO ? "ortho" : "persp",
-                 (double)aspect, (double)hw, (double)hh,
-                 (double)cam->near_plane, (double)cam->far_plane,
-                 (double)cam->fov_rad, homogeneous_ndc ? 1 : 0,
-                 (double)cam->position.x, (double)cam->position.y,
-                 (double)cam->position.z, (double)cam->yaw,
-                 (double)cam->pitch);
+
 }
 
 jce_mat4 jce_camera_proj(const JceCamera *cam, float aspect,
@@ -193,20 +205,20 @@ jce_vec3 jce_camera_get_position(const JceCamera *cam)
 
 jce_vec3 jce_camera_get_forward(const JceCamera *cam)
 {
-    return cam ? calc_forward(cam->yaw, cam->pitch) : jce_v3(0, 0, -1);
+    return cam ? cam->forward : jce_v3(0, 0, -1);
 }
 
 jce_vec3 jce_camera_get_right(const JceCamera *cam)
 {
     if (!cam) return jce_v3(1, 0, 0);
-    jce_vec3 fwd = calc_forward(cam->yaw, cam->pitch);
+    jce_vec3 fwd = cam->forward;
     return jce_v3_normalize(jce_v3_cross(fwd, cam->up_world));
 }
 
 jce_vec3 jce_camera_get_up(const JceCamera *cam)
 {
     if (!cam) return jce_v3(0, 1, 0);
-    jce_vec3 fwd   = calc_forward(cam->yaw, cam->pitch);
+    jce_vec3 fwd   = cam->forward;
     jce_vec3 right = jce_v3_normalize(jce_v3_cross(fwd, cam->up_world));
     return jce_v3_cross(right, fwd);
 }
@@ -258,18 +270,25 @@ bool jce_camera_set_pose(JceCamera *cam, jce_vec3 position,
         return false;
 
     forward = jce_v3_normalize(forward);
+    if (!isfinite(forward.x) || !isfinite(forward.y) ||
+        !isfinite(forward.z) || jce_v3_len(forward) <= epsilon) return false;
     ortho_up = jce_v3_sub(up, jce_v3_scale(forward,
         jce_v3_dot(up, forward)));
-    if (jce_v3_len(ortho_up) <= epsilon)
+    if (!isfinite(ortho_up.x) || !isfinite(ortho_up.y) ||
+        !isfinite(ortho_up.z) || jce_v3_len(ortho_up) <= epsilon)
         return false;
     ortho_up = jce_v3_normalize(ortho_up);
+    if (!isfinite(ortho_up.x) || !isfinite(ortho_up.y) ||
+        !isfinite(ortho_up.z) || jce_v3_len(ortho_up) <= epsilon) return false;
 
     cam->position = position;
     cam->up_world = ortho_up;
-    cam->yaw = atan2f(forward.x, -forward.z);
-    cam->pitch = asinf(fmaxf(-1.0f, fminf(1.0f, forward.y)));
-    if (cam->pitch > MAX_PITCH) cam->pitch = MAX_PITCH;
-    if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
+    cam->forward = forward;
+    /* A pole has no horizontal heading. Preserve the controller heading;
+     * atan2(+0,-0) would otherwise invent a pi turn from signed zeros. */
+    if (forward.x != 0.0f || forward.z != 0.0f)
+        cam->yaw = atan2f(forward.x, -forward.z);
+    cam->pitch = atan2f(forward.y, hypotf(forward.x, forward.z));
     return true;
 }
 
@@ -313,14 +332,14 @@ void jce_camera_set_mode(JceCamera *cam, JceCameraMode mode)
 void jce_camera_move_forward(JceCamera *cam, float distance)
 {
     if (!cam) return;
-    jce_vec3 fwd = calc_forward(cam->yaw, cam->pitch);
+    jce_vec3 fwd = cam->forward;
     cam->position = jce_v3_add(cam->position, jce_v3_scale(fwd, distance));
 }
 
 void jce_camera_move_right(JceCamera *cam, float distance)
 {
     if (!cam) return;
-    jce_vec3 fwd   = calc_forward(cam->yaw, cam->pitch);
+    jce_vec3 fwd   = cam->forward;
     jce_vec3 right = jce_v3_normalize(jce_v3_cross(fwd, cam->up_world));
     cam->position = jce_v3_add(cam->position, jce_v3_scale(right, distance));
 }
@@ -334,11 +353,12 @@ void jce_camera_move_up(JceCamera *cam, float distance)
 
 void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad)
 {
-    if (!cam) return;
+    if (!cam || (yaw_rad == 0.0f && pitch_rad == 0.0f)) return;
     cam->yaw   += yaw_rad;
     cam->pitch += pitch_rad;
     if (cam->pitch >  MAX_PITCH) cam->pitch =  MAX_PITCH;
     if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
+    camera_apply_fps_direction(cam);
 }
 
 void jce_camera_look_at(JceCamera *cam, jce_vec3 target)
@@ -351,6 +371,7 @@ void jce_camera_look_at(JceCamera *cam, jce_vec3 target)
     cam->pitch = asinf(dir.y);
     if (cam->pitch >  MAX_PITCH) cam->pitch =  MAX_PITCH;
     if (cam->pitch < -MAX_PITCH) cam->pitch = -MAX_PITCH;
+    camera_apply_fps_direction(cam);
 }
 
 void jce_camera_third_person_follow(JceCamera *cam, jce_vec3 target)

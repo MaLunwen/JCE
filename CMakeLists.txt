@@ -38,7 +38,8 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.12.2 LANGUAGES C)
+project(JCE VERSION 0.13.0 LANGUAGES C)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -817,73 +818,12 @@ if(NOT CMAKE_CROSSCOMPILING AND
    EXISTS "${JCE_TOOLS_DIR}/jce_cook.c" AND
    EXISTS "${JCE_TOOLS_DIR}/jce_tex_compress.c" AND
    EXISTS "${JCE_TOOLS_DIR}/miniaudio_impl_cook.c")
+	include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEHostAssetSources.cmake")
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
-		# --pack-atlas in its own TU: jce_cook.c is over 1,200 lines and the
-		# file-size ratchet is a standing instruction, not a suggestion.
 		"${JCE_TOOLS_DIR}/jce_cook_atlas.c"
-		"${JCE_TOOLS_DIR}/jce_cook_catalog.c"
-		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
-		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
-		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
-		# The packing arithmetic --pack-atlas drives.  jce_cook has an
-		# explicit source list rather than the engine glob, so the TU must be
-		# named here or the link fails on jce_atlas_pack.
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_atlas_pack.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_writer_internal.c"
-		# Canonical extension -> asset-kind table shared by the cooker, the
-		# runtime and the editor (jce_asset_type_from_ext).  This target has
-		# an explicit source list rather than the engine's glob, so the TU
-		# must be named here or jce_cook_detect_type fails to link.
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_ext.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c"
-		# Offline collider cook (--collider): model import (assimp) +
-		# collider cook (VHACD) + the JCOL blob codec.  The asset TU is
-		# built with JCE_COLLIDER_ASSET_NO_PHYSICS so it brings only the
-		# serialize path (no Bullet/physics link).
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_importer.cpp"
-		# The importer reads <asset>.import.json now, so its settings module
-		# has to be here too -- this list is EXPLICIT (see the comment above
-		# it), so a new TU the importer calls is a link error, not a silent
-		# omission.  That is the list working.
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_import_settings.c"
-		# And the audio one, for the same reason: jce_cook.c's should_cook
-		# and jce_cook_audio both call into it, and this list is explicit.
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_audio_import_settings.c"
-		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_cook.cpp"
-		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_asset.c"
-		# Offline model→GLB conversion (--convert-model): the same assimp+meshopt
-		# coercion the bundle packer uses, so every deployment path can normalise
-		# .obj/.fbx/.dae to a single runtime mesh format (binary glTF).
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_mesh_convert.cpp"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_mesh_lod_cook.c"
-		# The ONE image-decode service + its JceImage adapter.  jce_cook_texture
-		# decodes through it so cooked pixels are byte-for-byte what the runtime
-		# decodes, and so the 16-bit-grayscale-PNG bypass (SDL3_image's libpng
-		# path heap-overruns on that class) has a single implementation instead
-		# of a copy here and a copy in the engine.  jce_image.c sits under
-		# renderer/ but is deliberately bgfx-FREE: it needs only SDL3 +
-		# SDL3_image (linked below), the vendored stb build and jce_memory —
-		# all already part of this target.
-		# The cooked-terrain v3 codec.  It was compiled into the engine but
-		# into no TOOL, so nothing in the tree could produce a file in the
-		# format -- the codec was reachable only from its own unit tests.
-		# Runtime terrain authoring, through the PUBLIC api (jce_terrain.h):
-		# create -> import heightmap -> save.  The CLI must not reproduce the
-		# .bin byte layout -- a caller that has to read engine internals to
-		# use a feature is exactly what the public API exists to prevent.
-		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_terrain.c"
-		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_phacelle.c"
-		"${JCE_ENGINE_SRC_DIR}/middleware/scene/jce_horizon.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_json.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_path.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_terrain_format.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_image_decode.c"
-		"${JCE_ENGINE_SRC_DIR}/renderer/jce_image.c"
-		"${JCE_ENGINE_SRC_DIR}/renderer/jce_stb_image_impl.c")
+		"${JCE_TOOLS_DIR}/jce_cook_catalog.c")
+	jce_host_asset_sources(jce_cook)
 	# bimg/bx headers use C++20 constructs in bgfx 1.146, so the texture-
 	# encoder TU (pulls bimg/encode.h + bx/) must compile as C++20; the rest
 	# of jce_cook stays C99/C++20.
@@ -904,47 +844,51 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		C_STANDARD            99
 		C_STANDARD_REQUIRED   YES
 		C_EXTENSIONS          OFF)
-	target_include_directories(jce_cook PRIVATE
-		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
-		"${JCE_ENGINE_SRC_DIR}")
-	target_link_libraries(jce_cook PRIVATE
-		SDL3_image::SDL3_image
-		sdl::sdl
-		miniaudio::miniaudio
-		mimalloc-static
-		zstd::libzstd_static
-		xxHash::xxhash
-			bgfx::bimg_encode
-			bgfx::bimg
-			bgfx::bx
-		# Offline collider cook dependencies.
-		assimp::assimp
-		v-hacd::v-hacd
-		# Offline model→GLB conversion (--convert-model) needs the meshopt
-		# dedup/simplify core that jce_bundle_mesh_convert.cpp drives.
-		meshoptimizer::meshoptimizer
-		# Runtime terrain authoring writes its meta through jce_json.
-		cjson::cjson)
-	# JCE_LOG_NONE: compile out ALL engine LOG_* macros pulled in by the
-	#   collider/model-import TUs so jce_cook needs no async log subsystem.
-	#   This was spelled JCE_DIST until 2026-08-31, which made one switch answer
-	#   two unrelated questions -- "is this a lean host tool?" and "is this a
-	#   shipping game?".  The moment the dist variant kept LOG_WARN/LOG_ERROR
-	#   (so a player crash comes back with something to read), jce_cook stopped
-	#   linking: 5 TUs with an unresolved jce_log_write.
-	# JCE_COLLIDER_ASSET_NO_PHYSICS: omit jce_collider_instantiate() so the
-	#   blob codec links without the Bullet/physics chain.
-	# JCE_MODEL_IMPORTER_COOK_ONLY: compile out the skinned/animated FBX import
-	#   path in jce_model_importer.cpp (it references jce_renderer + jce_animation
-	#   symbols this lean cook tool does not link); only the static part-
-	#   extraction path the --collider cook needs is kept.
-	target_compile_definitions(jce_cook PRIVATE
-		JCE_LOG_NONE
-		JCE_COLLIDER_ASSET_NO_PHYSICS
-		JCE_MODEL_IMPORTER_COOK_ONLY)
+
 	jce_target_warnings(jce_cook)
 endif()
 
+
+# Public scene-bundle API command. Reuse the engine resource implementation.
+if(NOT CMAKE_CROSSCOMPILING)
+	add_library(jce_tool_cli_io OBJECT "${JCE_TOOLS_DIR}/cli/jce_tool_io_sdl.c")
+	target_link_libraries(jce_tool_cli_io PRIVATE sdl::sdl)
+	set_target_properties(jce_tool_cli_io PROPERTIES
+		C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
+	jce_target_warnings(jce_tool_cli_io)
+	add_library(jce_tool_cli_bootstrap OBJECT
+		"${JCE_TOOLS_DIR}/cli/jce_tool_main_sdl.c")
+	target_link_libraries(jce_tool_cli_bootstrap PRIVATE sdl::sdl)
+	set_target_properties(jce_tool_cli_bootstrap PROPERTIES
+		C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
+	jce_target_warnings(jce_tool_cli_bootstrap)
+	add_executable(jce_bundle_pack "${JCE_TOOLS_DIR}/jce_bundle_pack.c")
+	jce_host_asset_sources(jce_bundle_pack)
+	target_sources(jce_bundle_pack PRIVATE
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_pack.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_pack_cook.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_contract_internal.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_graph_internal.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_deps.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_cook.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_reader.c"
+)
+	target_link_libraries(jce_bundle_pack PRIVATE
+		jce_core jce_platform jce_tool_cli_bootstrap sdl::sdl)
+	set_target_properties(jce_bundle_pack PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+		C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
+	if(NOT JCE_ENABLE_SDK_INSTALL)
+		set_target_properties(jce_bundle_pack PROPERTIES EXCLUDE_FROM_ALL ON)
+	endif()
+	jce_target_warnings(jce_bundle_pack)
+	foreach(_tool jce_pak jce_cook jce_bin2obj)
+		if(TARGET ${_tool})
+			target_link_libraries(${_tool} PRIVATE jce_tool_cli_bootstrap jce_tool_cli_io sdl::sdl)
+		endif()
+	endforeach()
+	target_sources(jce_pak PRIVATE "${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c")
+endif()
 
 # ------------------------------------------------------------------ #
 # Ship host tools with the SDK                                        #
@@ -957,7 +901,7 @@ endif()
 if(JCE_ENABLE_SDK_INSTALL AND NOT CMAKE_CROSSCOMPILING)
 	include(GNUInstallDirs)
 	set(_jce_sdk_tools "")
-	foreach(_tool jce_pak jce_cook jce_bin2obj)
+	foreach(_tool jce_pak jce_cook jce_bin2obj jce_bundle_pack)
 		if(TARGET ${_tool})
 			list(APPEND _jce_sdk_tools ${_tool})
 		endif()
@@ -1784,6 +1728,11 @@ if(Python3_FOUND)
 		# `--target JCE_Editor` build skips it.  Wire the editor (and game)
 		# to depend on the stamp so every editor build re-normalizes drifted
 		# i18n files, matching this block's documented contract.
+		# Packing reads these source JSON files: order it after the writer,
+		# rather than scheduling normalization and packing as sibling targets.
+		if(TARGET PackEditorAssets)
+			add_dependencies(PackEditorAssets jce_i18n_auto)
+		endif()
 		if(TARGET JCE_Editor)
 			add_dependencies(JCE_Editor jce_i18n_auto)
 		endif()
@@ -1975,7 +1924,11 @@ string(APPEND _dep_locs_content ")\n")
 set(DEP_LOCS_FILE "${CMAKE_CURRENT_BINARY_DIR}/_dep_locs_$<CONFIG>.cmake")
 file(GENERATE OUTPUT "${DEP_LOCS_FILE}" CONTENT "${_dep_locs_content}")
 
-if(TARGET jce_cook)
-  target_include_directories(jce_cook PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")
-  add_dependencies(jce_cook jce_vendor_verify_stb_image)
-endif()
+# The engine resolves pristine headers and exports this path only after its
+# subdirectory has configured. Host targets are declared earlier.
+foreach(_host_asset_target jce_cook jce_bundle_pack)
+	if(TARGET ${_host_asset_target})
+		target_include_directories(${_host_asset_target} PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")
+		add_dependencies(${_host_asset_target} jce_vendor_verify_stb_image)
+	endif()
+endforeach()

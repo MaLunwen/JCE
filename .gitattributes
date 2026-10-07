@@ -55,6 +55,7 @@
 *.opus -text
 *.aac  -text
 *.ivf  -text
+*.rgba -text
 *.mov  -text
 *.mkv  -text
 *.pdf  -text
@@ -79,3 +80,6 @@ Thumbs.db -text
 /scripts/android/app/src/main/java/org/app/** -text
 /scripts/android/gradlew -text
 /scripts/android/gradlew.bat -text
+
+# Bundle is a single binary content archive; never normalize its bytes.
+*.jbundle -text

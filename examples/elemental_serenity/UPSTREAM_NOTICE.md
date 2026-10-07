@@ -27,3 +27,5 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ~~~
+
+Current reference HEAD observed2026-10-06: 6b8cebefa0ee10e1bdd081dd342a01b3fe753e09. This does not identify the supplied snapshot revision. Exact and adapted asset hashes are documented in ASSET_PROVENANCE.json; keep this notice with distributions containing upstream material.

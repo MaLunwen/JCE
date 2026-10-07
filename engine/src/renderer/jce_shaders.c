@@ -11,6 +11,7 @@
 #include <jce/renderer/jce_shaders.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_shader_deferred.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <stdio.h>
@@ -83,6 +84,118 @@ static const char *shader_suffix(bgfx_renderer_type_t type)
     }
 }
 
+/* WebGL must not link unused PBR families at the first frame. Capture the
+ * source bytes now (no borrowed PAK/overlay lifetime), and create the GPU
+ * program only at submission. Native platforms retain eager loading. */
+static void deferred_source_free(JceDeferredSource *src)
+{
+    if (src->data) {
+        if (src->host) jce_fs_buffer_free(src->data);
+        else JCE_FREE(src->data);
+    }
+    memset(src, 0, sizeof *src);
+}
+
+static JceDeferredSource deferred_source_read(const JcePakArchive *pak,
+    const char *dev, const char *stage, const char *base, bool strict_fs)
+{
+    JceDeferredSource src = {0};
+    const char *suffix = shader_suffix(bgfx_get_renderer_type());
+    if (!suffix) return src;
+    char path[256], full[1536];
+    if (snprintf(path, sizeof path, "shaders/%s_%s_%s.bin", stage, base, suffix)
+        >= (int)sizeof path) return src;
+    if (dev && dev[0]) {
+        if (snprintf(full, sizeof full, "%s/%s", dev, path) >= (int)sizeof full)
+            return src;
+        if (strict_fs || jce_fs_host_exists_file(full)) {
+            uint64_t size = 0;
+            src.data = jce_fs_host_read_all(full, &size);
+            src.host = true;
+            if (!src.data || !size || size > UINT32_MAX) {
+                deferred_source_free(&src);
+                return src;
+            }
+            src.size = (uint32_t)size;
+            return src;
+        }
+    }
+    if (strict_fs) return src;
+    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
+    if (!asset) {
+        const JcePakArchive *fallback = embedded_pak();
+        asset = fallback ? jce_pak_find(fallback, path) : NULL;
+    }
+    if (!asset || !asset->original_size || asset->original_size > UINT32_MAX)
+        return src;
+    src.data = JCE_MALLOC((size_t)asset->original_size);
+    if (!src.data) return src;
+    src.size = (uint32_t)asset->original_size;
+    if (jce_pak_decompress(asset, src.data, src.size) != src.size)
+        deferred_source_free(&src);
+    return src;
+}
+
+static JceShaderHandle defer_stock(const JcePakArchive *pak, const char *dev,
+                                  const char *vs, const char *fs, bool strict_fs)
+{
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!JCE_PLATFORM_WEB || !vs || !fs || !caps ||
+        caps->limits.maxPrograms >= JCE_DEFERRED_FIRST ||
+        (strncmp(fs, "pbr", 3) != 0 && strcmp(fs, "terrain") != 0))
+        return JCE_INVALID_SHADER;
+    JceShaderDeferredState *state = jce_renderer_shader_deferred_state();
+    for (unsigned i = 0; i < JCE_DEFERRED_COUNT; ++i) {
+        JceDeferredProgram *p = &state->programs[i];
+        if (p->used) continue;
+        memset(p, 0, sizeof *p);
+        p->vs = deferred_source_read(pak, dev, "vs", vs, strict_fs);
+        p->fs = deferred_source_read(pak, dev, "fs", fs, strict_fs);
+        if (!p->vs.data || !p->fs.data) {
+            deferred_source_free(&p->vs);
+            deferred_source_free(&p->fs);
+            return JCE_INVALID_SHADER;
+        }
+        p->used = true; p->program = UINT16_MAX;
+        return (JceShaderHandle){ (uint16_t)(JCE_DEFERRED_FIRST + i) };
+    }
+    return JCE_INVALID_SHADER;
+}
+
+uint16_t jce_shader_deferred_resolve(uint16_t idx)
+{
+    if (!JCE_PLATFORM_WEB || idx < JCE_DEFERRED_FIRST || idx >= JCE_DEFERRED_FIRST + JCE_DEFERRED_COUNT)
+        return idx;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || caps->limits.maxPrograms >= JCE_DEFERRED_FIRST) return idx;
+    JceShaderDeferredState *state = jce_renderer_shader_deferred_state();
+    JceDeferredProgram *p = &state->programs[idx - JCE_DEFERRED_FIRST];
+    if (!p->used) return UINT16_MAX;
+    if (!p->attempted) {
+        p->attempted = true;
+        bgfx_shader_handle_t vs = bgfx_create_shader(bgfx_copy(p->vs.data, p->vs.size));
+        bgfx_shader_handle_t fs = { UINT16_MAX };
+        if (vs.idx != UINT16_MAX)
+            fs = bgfx_create_shader(bgfx_copy(p->fs.data, p->fs.size));
+        if (vs.idx != UINT16_MAX && fs.idx != UINT16_MAX)
+            p->program = bgfx_create_program(vs, fs, true).idx;
+        else if (vs.idx != UINT16_MAX)
+            bgfx_destroy_shader(vs);
+        deferred_source_free(&p->vs);
+        deferred_source_free(&p->fs);
+    }
+    return p->program;
+}
+
+void jce_shader_deferred_shutdown(void)
+{
+    JceShaderDeferredState *state = jce_renderer_shader_deferred_state();
+    for (unsigned i = 0; i < JCE_DEFERRED_COUNT; ++i) {
+        if (state->programs[i].used)
+            jce_shader_program_destroy((JceShaderHandle){ (uint16_t)(JCE_DEFERRED_FIRST + i) });
+    }
+}
+
 /* Load one shader (.bin) from the PAK, return a bgfx handle.
    Falls back to the engine-embedded shader pak when the caller-supplied
    pak is NULL or the path is missing. */
@@ -129,6 +242,9 @@ static JceShaderHandle load_program_named(const JcePakArchive *pak,
                                           const char *vs_base,
                                           const char *fs_base)
 {
+    JceShaderHandle pending = defer_stock(pak, NULL, vs_base, fs_base, false);
+    if (jce_shader_valid(pending)) return pending;
+
     const char *sfx = shader_suffix(bgfx_get_renderer_type());
     if (!sfx) {
         LOG_ERROR(LOG_TAG, "no shader suffix for renderer %s",
@@ -168,6 +284,20 @@ JceShaderHandle shader_load_program_named(const JcePakArchive *pak,
 void jce_shader_program_destroy(JceShaderHandle prog)
 {
     if (!jce_shader_valid(prog)) return;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (JCE_PLATFORM_WEB && caps && caps->limits.maxPrograms < JCE_DEFERRED_FIRST &&
+        prog.idx >= JCE_DEFERRED_FIRST &&
+        prog.idx < JCE_DEFERRED_FIRST + JCE_DEFERRED_COUNT) {
+        JceShaderDeferredState *state = jce_renderer_shader_deferred_state();
+        JceDeferredProgram *slot = &state->programs[prog.idx - JCE_DEFERRED_FIRST];
+        if (!slot->used) return;
+        if (slot->program != UINT16_MAX)
+            bgfx_destroy_program((bgfx_program_handle_t){ slot->program });
+        deferred_source_free(&slot->vs);
+        deferred_source_free(&slot->fs);
+        memset(slot, 0, sizeof *slot);
+        return;
+    }
     bgfx_program_handle_t p = { prog.idx };
     bgfx_destroy_program(p);
 }
@@ -213,6 +343,8 @@ static JceShaderHandle load_program_fs_named(const char *dev_dir,
                                              const char *fs_base)
 {
     if (!dev_dir || !vs_base || !fs_base) return JCE_INVALID_SHADER;
+    JceShaderHandle pending = defer_stock(NULL, dev_dir, vs_base, fs_base, true);
+    if (jce_shader_valid(pending)) return pending;
 
     const char *sfx = shader_suffix(bgfx_get_renderer_type());
     if (!sfx) return JCE_INVALID_SHADER;
@@ -259,6 +391,8 @@ JceShaderHandle shader_load_program_overlay_named(
     bool vs_overlay, fs_overlay;
 
     if (!vs_base || !fs_base) return JCE_INVALID_SHADER;
+    JceShaderHandle pending = defer_stock(pak, dev_dir, vs_base, fs_base, false);
+    if (jce_shader_valid(pending)) return pending;
     sfx = shader_suffix(bgfx_get_renderer_type());
     if (!sfx) return JCE_INVALID_SHADER;
 
@@ -442,6 +576,9 @@ static JceShaderHandle load_overlay(const char *dev_dir,
                                     const JcePakArchive *pak,
                                     const char *vs, const char *fs)
 {
+    JceShaderHandle pending = defer_stock(pak, dev_dir, vs, fs, false);
+    if (jce_shader_valid(pending)) return pending;
+
     JceShaderHandle h = JCE_INVALID_SHADER;
     if (dev_dir && dev_dir[0])
         h = load_program_fs_named(dev_dir, vs, fs);

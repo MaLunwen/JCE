@@ -146,6 +146,7 @@ static bool append_run(JceShapedGlyph **out, uint32_t *count, uint32_t *cap,
         const char *p = whole + run_off + gi[i].cluster;
         JceShapedGlyph *g = &(*out)[(*count)++];
         g->codepoint = next_cp(&p);
+        g->glyph_id = gi[i].codepoint;
         g->x_offset  = gp[i].x_offset;
         g->y_offset  = gp[i].y_offset;
         g->x_advance = gp[i].x_advance;

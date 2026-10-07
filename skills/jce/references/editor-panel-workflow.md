@@ -1,5 +1,12 @@
 # Editor integration
 
+Set `JCE_EDITOR_PROFILE_DIR` to an explicit absolute directory before startup
+when validating an isolated editor instance or a portable configuration. The
+shared resolver covers editor preferences, session and ImGui layout. Automated
+preview tools must confirm that the child selected this directory; do not
+snapshot/restore the user's HOME settings around a test. Use a fresh profile
+for each independent trial or explicitly supply a seeded profile as an input.
+
 Read editor/AGENTS.md and the closest panel/core charter. Search for an existing panel, shared widget and public SDK mechanism before adding another UI path.
 
 Panel IDs are persisted: preserve existing enum values and append new IDs. Trace registration, dispatch, configuration serialization, menus, tabs and visibility; adding a switch case alone does not wire a panel.

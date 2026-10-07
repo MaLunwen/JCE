@@ -197,8 +197,11 @@ void jce_model_destroy(JceModel *model)
     }
     JCE_FREE(model->nodes);
 
-    /* Free textures in materials. */
-    for (uint32_t i = 0; i < model->num_materials; i++) {
+    /* Material maps borrow from the imported model's unique texture pool.
+     * Builder-only models retain the legacy independently-owned map path. */
+    bool pooled_textures = model->texture_pool != NULL;
+    jce_model_texture_pool_destroy(model->texture_pool);
+    for (uint32_t i = 0; !pooled_textures && i < model->num_materials; i++) {
         JcePbrMaterial *mat = &model->materials[i];
         if (jce_texture_valid(mat->albedo_map))
             jce_texture_destroy(mat->albedo_map);
@@ -309,7 +312,8 @@ uint64_t jce_model_gpu_bytes(const JceModel *model)
         }
     }
 
-    for (uint32_t i = 0; i < model->num_materials; i++) {
+    bytes += jce_model_texture_pool_gpu_bytes(model->texture_pool);
+    for (uint32_t i = 0; !model->texture_pool && i < model->num_materials; i++) {
         const JcePbrMaterial *m = &model->materials[i];
         bytes += model_tex_bytes(m->albedo_map);
         bytes += model_tex_bytes(m->metallic_roughness_map);
@@ -515,7 +519,13 @@ void jce_model_draw_program(const JceModel *model,
                     jce_mat4 static_world = compute_static_node_world(
                         model, node, root, &world, joint_matrices, num_joints);
                     bgfx_set_transform(static_world.raw[0], 1);
-                    prog_handle = jce_renderer_get_program_pbr(r);
+                    /* A material's authored rigid-mesh program owns this
+                     * primitive. The skinned-only override parameter cannot
+                     * replace it because that shader expects a bone palette. */
+                    if (mat && mat->custom_program != UINT16_MAX)
+                        prog_handle.idx = mat->custom_program;
+                    else
+                        prog_handle = jce_renderer_get_program_pbr(r);
                 }
 
                 /* In-asset auto-LOD: a non-skinned (PBR static) primitive binds
@@ -2450,7 +2460,13 @@ void jce_model_draw_morphed(const JceModel *model,
                     jce_mat4 static_world = compute_static_node_world(
                         model, node, root, &world, joint_matrices, num_joints);
                     bgfx_set_transform(static_world.raw[0], 1);
-                    prog_handle = jce_renderer_get_program_pbr(r);
+                    /* A material's authored rigid-mesh program owns this
+                     * primitive. The skinned-only override parameter cannot
+                     * replace it because that shader expects a bone palette. */
+                    if (mat && mat->custom_program != UINT16_MAX)
+                        prog_handle.idx = mat->custom_program;
+                    else
+                        prog_handle = jce_renderer_get_program_pbr(r);
                 }
 
                 /* Per-instance morphed VB override (UINT16_MAX => static). */

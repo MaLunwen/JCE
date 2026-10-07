@@ -2,9 +2,9 @@
 
 Cross-platform, data-driven, native-callable game engine with a C99 first-party core, a stable C ABI, privately encapsulated C++ dependencies, and a C++20 ImGui editor.
 
-**Targets**: Windows · macOS · Linux · Android · iOS · WASM · consoles (planned) — x86_64 / arm / arm64.
+**Targets**: Windows · macOS · Linux · Android · iOS · WASM · consoles (planned) — x86 / x64 / ARM / ARM64. Build presets and device verification cover subsets of these targets.
 
-**Core/headless baseline**: single-core CPU, 512 MB RAM, no discrete GPU (~2010-class hardware). The editor and rendered games use higher, tiered requirements according to workload and enabled features.
+**Low-end design baseline**: a graphical desktop, one CPU core, 512 MiB RAM and older integrated graphics with no discrete GPU (2008/2010-class hardware). Lightweight editor and game paths target this baseline; physical-device acceptance is still required. Advanced workloads have explicit, measured tiers.
 
 **License**: [MPL-2.0](LICENSE). You can ship a closed-source commercial game on JCE, statically linked, with no obligation to open your game. If you modify JCE's *own* source files, those files' changes go back under the MPL. Third-party dependencies keep their own (all permissive) terms — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md); there is no GPL or LGPL component.
 
@@ -23,15 +23,27 @@ What the repository is unusually strict about, and what you can check yourself:
 The unit suite and the CI configuration are **in this repository** as of 2026-09-17. They were untracked while it was private; public, that trade reverses — a measurement nobody else can re-run is worth nothing.
 
 ```bash
-python tools/lint/run_all.py                  # the lint suite (no compiler needed)
-python tools/audit/run_architecture_audit.py    # ABI snapshot, layering, licences, bindings
-cmake --build build/desktop/windows-x64 --target jce_tests
-ctest --test-dir build/desktop/windows-x64 -L unit -j 8
+python scripts/jce.py lint
+python scripts/jce.py test --configure --variant release --jobs 2
 ```
 
-`.github/workflows/ci.yml` runs the first two on **every push to every branch**; they need no toolchain and cover what a build cannot see (an ABI break, a layering violation, a copyleft dependency). The build-and-test matrix is deliberately on `schedule` / `workflow_dispatch` for now — that suite had never run in CI before this, so expect its first runs to be red for reasons unrelated to whatever triggered them. The file says which tier each job is in and how to promote one.
+`.github/workflows/ci.yml` runs source and architecture checks on every push and
+pull request. Code changes also trigger the Windows, Linux and macOS build/test
+matrix; documentation-only changes keep the lint gate. Scheduled and manually
+dispatched runs always enable the native matrix. The independent SDK consumer
+smoke job runs on main and manual dispatch without requiring user game sources.
+These are configured CI gates; local Windows results do not certify Linux or
+macOS, whose results must be checked in the corresponding remote CI jobs.
 
 Local `docs/`, `.docs/`, generated outputs and unpublished workflows under `private/` are not distributed. Repository rules and the JCE skill are tracked.
+
+### Editor stress benchmarks
+
+`python tools/benchmark_suite.py --profile standard --kind all` runs the five
+Profiler benchmark workloads through their shared UI/script implementation.
+It exports raw frames, controls and manifests under ignored `reports/`.
+See [benchmark methodology](tools/BENCHMARK.md) for paired backend comparisons,
+timed Soak runs and the limits of these editor-only measurements.
 
 ### Native single-EXE Windows editor
 
@@ -49,8 +61,14 @@ The optional `.manifest.json` beside the EXE records its SHA-256, OS imports,
 and a byte-verified inventory of embedded assets and license notices. The
 manifest is a release check, not a runtime dependency.
 
+Set `JCE_EDITOR_PROFILE_DIR` to an absolute configuration directory before
+launch for a portable profile or an isolated editor instance. Preferences,
+session and ImGui layout use that directory; the default is the user's
+`HOME/.jce`. An invalid explicit profile does not fall back to HOME.
+
 This build runs Lua, JavaScript and native C/C++ script backends. Python, Java
-and C# use the existing full language build. SDKs, native project modules,
+and C# are optional authoring/SDK backends in the full language build. They must
+not become external VM dependencies of default shipped applications. SDKs, native project modules,
 project assets and development compilers are supplied separately when needed
 for project development; they do not enlarge the editor executable.
 
@@ -63,9 +81,28 @@ for project development; they do not enlarge the editor executable.
 
 What is public is the mechanism: the bridge, the panel shell, the scene schema export that stops a model inventing fields, and `tools/envshot.py` — which is how an AI-authored change gets *verified* rather than merely accepted. The authoring policy built on top of it is still in progress and not published yet.
 
+AI CLI develops applications through public API/SDK, docs, the repository Skill,
+examples, editor operations and build tools. It reports missing generic
+capabilities instead of bypassing them through engine/editor internals. Validate
+scene/component and script changes repeatedly in editor simulation, a native
+platform executable, and a packaged bundle reopened in the editor. AI runtime
+is the separate model-driven behavior executed during a game; a successful
+model response alone proves neither development nor runtime acceptance.
+
 ### Caged Kingdom: the game consumer in `examples/caged_kingdom/`
 
-Caged Kingdom is the final game project and an SDK consumer alongside the other examples: it consumes JCE exactly the way your project would, through the installed SDK headers, with no privileged access. It is in the repository as *evidence that the engine is usable*, and nothing in `engine/` or `editor/` knows it exists — `grep -rw caged engine/` returns nothing, and a lint keeps it that way.
+Caged Kingdom is the owned final game project. Its current checkout contains frozen design documents; a runnable consumer is unavailable until implementation sources return. The intended SDK boundary remains the same as other projects: it consumes JCE exactly the way your project would, through the installed SDK headers, with no privileged access. It is in the repository as *evidence that the engine is usable*, and nothing in `engine/` or `editor/` knows it exists — `grep -rw caged engine/` returns nothing, and a lint keeps it that way.
+
+## Example content and SDK regressions
+
+A sample Bundle is one `.jbundle` file containing its selected scene, scripts
+and required assets. Open it in the editor for simulation and validation, or
+embed it through a standard SDK project into the final single executable.
+Bundle files do not distribute an engine, editor or SDK. Catalogs under
+`examples/` retain package entry points, provenance and source/license terms;
+Caged Kingdom remains the owned game project. Reproduction source, dedicated
+fixture tools and SDK consumer regressions live under `tests/consumers/`.
+Generated build caches and local acceptance reports remain ignored.
 
 ## Design Pillars
 
@@ -77,16 +114,28 @@ Caged Kingdom is the final game project and an SDK consumer alongside the other 
 
 ## Hardware Baselines
 
-The 512 MB / single-core / no-discrete-GPU target applies to the **core and headless services**, not to every JCE consumer.
+The low-end target includes a graphical desktop and lightweight editor/runtime
+workloads. It does not certify every advanced scene at 512 MiB, and it is not
+limited to headless services. PS2 is a budget analogy, not a supported desktop
+binary target or a hardware-equivalence claim.
 
-| Tier                   | Intended use                                                                       | Baseline                                                        |
-| ---------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| Core / headless        | Dedicated server, tools, simulation services, non-rendering runtime                | Single-core CPU, 512 MB RAM, no discrete GPU                    |
-| Lightweight runtime    | Simple 2D/3D games and embedded interactive applications                           | Integrated graphics and workload-dependent memory               |
-| Editor                 | Full asset import, inspectors, previews, profiling, and authoring workflows        | Multi-core CPU, modern graphics API support, and additional RAM |
-| Advanced rendered game | Open worlds, high entity counts, advanced lighting, post-processing, and streaming | Project-defined minimum and recommended tiers                   |
+| Profile | Design target | Acceptance evidence |
+| --- | --- | --- |
+| Core / headless | One core, 512 MiB, no discrete GPU | Actual completed services, memory and elapsed clocks |
+| Low-end graphical editor/runtime | Same budget, older integrated graphics, lightweight content | UI/input, startup, rendered frames and actual old-device measurements |
+| Advanced editor/game workload | Explicit project and feature budgets | Actual peak/resident memory, CPU/GPU frames, streaming and resources |
+| Development-machine high end | Recorded CPU, GPU, RAM, OS and backend | Scoped stress results with fixed workloads and controls |
 
-The low baseline is a compatibility and efficiency target. It must not prevent the editor or games from scaling up to modern hardware.
+All tiers share public APIs, components and runtime services. Current toolchain,
+package, driver-language and tested-device subsets remain separate from design
+goals. Every editor and consumer shipment targets one self-contained native
+application that can relocate without project, SDK or external VM files.
+Default delivery prioritizes embedded Lua/JavaScript and native C/C++.
+Python, Java and C# are optional authoring/SDK backends when compact embedding
+is unavailable; they are not mandatory dependencies of a shipped application.
+A project requiring an unavailable backend must fail packaging explicitly.
+The current single-EXE recipe is verified on Windows only; other platform
+artifacts still require their own relocation and system-dependency validation.
 
 ## Layered Model
 
@@ -125,11 +174,11 @@ The low baseline is a compatibility and efficiency target. It must not prevent t
 
 | | |
 | --- | --- |
-| Version | `0.12.2` (authoritative: `CMakeLists.txt`) |
-| Engine (C99) | 403 tracked `.c` under `engine/src/` |
-| Editor (C++20) | 220 tracked `.cpp` under `editor/src/`, 108 panels |
-| Public API | 298 headers under `engine/include/jce/`, 24 umbrellas, 3890 `JCE_API` symbols |
-| Shaders | 140 `.sc` under `engine/shaders/` |
+| Version | `0.13.0` (authoritative: `CMakeLists.txt`) |
+| Engine (C99) | 417 tracked `.c` under `engine/src/` |
+| Editor (C++20) | 223 tracked `.cpp` under `editor/src/`, 109 panels |
+| Public API | 300 headers under `engine/include/jce/`, 24 umbrellas, 3910 `JCE_API` symbols |
+| Shaders | 146 `.sc` under `engine/shaders/` |
 | Scripting | 6 binding trees under `scripting/` (c, cpp, csharp, java, js, python) over one flat C ABI, plus Lua built in |
 | Editor languages | 15 locales under `editor/resources/assets/i18n/` |
 | Build matrix | 49 CMake presets, 13 Conan profiles |
@@ -316,7 +365,7 @@ The following direct requirements are authoritative for the current dependency g
 | Engine language  | First-party runtime core and public ABI use C99. Private C++ dependencies are allowed only behind C-compatible wrappers; C++ types, exceptions, RTTI, and STL containers must never cross the public ABI. |
 | Editor language  | C++20. ImGui only — no SDL/bgfx in panel files.                                                                                                                                                          |
 | Naming           | `jce_<module>_<verb>()` · `JceXxx` types · `JCE_UPPER` macros                                                                                                                                     |
-| Platform symbols | `_WIN32`, `<windows.h>`, `<unistd.h>` etc. **forbidden** in first-party source — use `os/platform` wrappers.                                                                               |
+| Platform symbols | `_WIN32`, `<windows.h>`, `<unistd.h>` etc. stay inside OS adapters; consumers and reusable higher layers use public JCE wrappers.                                                                               |
 | File size        | Soft cap ~2000 lines; hard cap ~3000 triggers refactor.                                                                                                                                                   |
 
 ## Where to Look First
@@ -325,7 +374,7 @@ The following direct requirements are authoritative for the current dependency g
 | ------------------------ | ---------------------------------------------------------------------------------------------------- |
 | Add a public engine call | `engine/include/jce/api*.h` → matching layer `src/`                                             |
 | Add an ECS component     | `engine/include/jce/middleware/scene/jce_scene.h` + serializer + inspector drawer                  |
-| Add a renderer pass      | `engine/src/renderer/jce_scene_renderer.c`                                                         |
+| Add a renderer pass      | `engine/src/renderer/` + `engine/src/middleware/scene/`                                                         |
 | Add an editor panel      | `editor/src/panels/` → register in `jce_editor_panels.cpp` → dock in `jce_editor_layout.cpp` |
 | Add a hotkey             | `editor/src/core/jce_editor_hotkeys.*`                                                             |
 | Localize a string        | `editor/src/core/jce_editor_i18n.cpp`                                                              |
@@ -336,61 +385,50 @@ The following direct requirements are authoritative for the current dependency g
 
 All commands are PowerShell from the repo root. Prerequisites: **VS 2022** (Desktop C++), **CMake 3.20+**, **Conan 2.x**, **Java 8+ JDK**. Ninja is recommended.
 
-## A. Standalone Game
+## A. SDK consumer game
+
+Use an explicit consumer directory containing its CMake project, sources and
+resources. Build through the installed matching SDK; Caged Kingdom's frozen
+owner documents are not a substitute for runnable consumer sources.
 
 ```powershell
-# 1. Dependencies
-conan install . --output-folder=build/desktop/windows-x64-conan --build=missing `
-    -pr:h conan/profiles/windows-x64 -pr:b conan/profiles/windows-x64
-
-# 2. Configure
-cmake -S . -B build/desktop/windows-x64 -G Ninja `
-    -DCMAKE_TOOLCHAIN_FILE=build/desktop/windows-x64-conan/build/Release/generators/conan_toolchain.cmake `
-    -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_VARIANT=release
-
-# 3. Build & run
-cmake --build build/desktop/windows-x64
-./build/desktop/windows-x64/release/caged_kingdom.exe
+python scripts/jce.py sdk --arch x64 --variant release --no-debug --smoke
+python scripts/jce.py app YOUR_PROJECT --sdk dist/sdk/win32-x86_64 --variant release
+python scripts/jce.py accept YOUR_PROJECT
 ```
 
-Or use the standardized scripts (thin wrappers over `scripts/jce.py`): `./scripts/windows/build-editor.bat` (editor) or `./scripts/windows/build-project.bat examples/caged_kingdom` (game, via the SDK). Add `--dist` (shorthand for `--variant dist`) for a distribution build.
+The CLI derives Conan, CMake, compiler and artifact commands for the selected
+target. Reuse its compatible cache; reserve --clean for a justified invalidation.
+Do not copy an entire source/build tree for another run. Generated tests go
+under build/, while captures and raw benchmark evidence go under reports/.
 
 ## B. Editor
 
 ```powershell
-./scripts/windows/build-editor.bat                 # release
-./scripts/windows/build-editor.bat --dist          # distribution (== --variant dist)
-# (Linux/macOS: scripts/linux|macos/build-editor.sh, same flags)
+python scripts/jce.py editor --arch x64 --variant release
+python scripts/jce.py package editor --arch x64 --variant dist --standalone
 ```
 
-Output: `build/desktop/windows-x64/release/jce_editor.exe`
+The platform launchers under scripts/windows, scripts/linux and scripts/macos
+forward to the same build implementation. Release Windows editor output is
+build/desktop/windows-x64/release/jce_editor.exe. Standalone packaging and its
+current language limitations are described above; verify the relocated artifact.
 
-## C. Java + JNI
+## C. Java scripting and JNI consumer
+
+Set JAVA_HOME to a real matching JDK. SDK production checks actual JNI headers
+and Java tools; --script-java requires that backend rather than accepting an
+unavailable probe. The installed-SDK smoke command checks consumer operation.
 
 ```powershell
-# 1. Dependencies
-# JNI is a CMake-only switch; Conan intentionally has no jce_jni option.
-conan install . --output-folder=build/jni/desktop-conan --build=missing `
-    -pr:h conan/profiles/windows-x64 -pr:b conan/profiles/windows-x64
-
-# 2. Configure + build
-cmake -S . -B build/jni/desktop -G Ninja `
-    -DCMAKE_TOOLCHAIN_FILE=build/jni/desktop-conan/build/Release/generators/conan_toolchain.cmake `
-    -DJCE_BUILD_JNI=ON -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=release
-cmake --build build/jni/desktop
-# Output: build/jni/desktop/caged_kingdom/jce.dll
-
-# 3. Compile Java
-New-Item -ItemType Directory -Force -Path build/jni/desktop/java-out | Out-Null
-javac -d build/jni/desktop/java-out `
-    engine/java/com/jce/JceRuntime.java engine/java/com/jce/Main.java
-
-# 4. Run
-java "-Djava.library.path=build/jni/desktop/caged_kingdom" -cp build/jni/desktop/java-out com.jce.Main
-
-# Or package a runnable JAR
-./scripts/package-jni-jar.bat        # Output: build/jni/dist/jce-jni.jar
+python scripts/jce.py sdk --arch x64 --variant release --no-debug --script-java --smoke
 ```
+
+The separate JNI JAR recipe is scripts/package-jni-jar.bat. It requires an
+explicit JCE_GAME_PROJECT_DIR and the matching Java toolchain. Its native JAR
+bundle is a distinct consumer format, not native single-application acceptance.
+Read supported recipe options before choosing a target; do not hand-construct
+Conan/compiler commands or use another project's frozen assets as defaults.
 
 ## D. Cross-Compilation
 
@@ -402,24 +440,14 @@ java "-Djava.library.path=build/jni/desktop/caged_kingdom" -cp build/jni/desktop
 
 ## Common Issues
 
-**`jni.h` not found** — add `openjdk-8/include` and `openjdk-8/include/win32` to
-`.vscode/c_cpp_properties.json`, then run `C/C++: Rescan Workspace`.
+**`jni.h` not found** -- set JAVA_HOME to the JDK containing real JNI headers
+for the build target, then rerun the supported SDK script. IDE include hints do
+not repair a missing producer toolchain.
 
-**`cppcheck` fails in VS generator** — configure with `-DJCE_ENABLE_CPPCHECK=OFF`
-or switch to Ninja.
-
-**Shader compile disabled / shaderc not found** — CMake warns instead of failing so
-a pre-baked pak still links the editor. To re-enable shader builds, point CMake or your
-shell at a host shaderc binary via **either** mechanism (env takes priority):
-
-```powershell
-# Option A — environment variable (CI-friendly, no CMake reconfigure needed)
-$env:JCE_SHADERC_EXECUTABLE = "C:\path\to\shaderc.exe"
-cmake --build ...
-
-# Option B — CMake cache variable
-cmake ... -DJCE_SHADERC_EXECUTABLE="C:\path\to\shaderc.exe"
-```
+**Shader compiler unavailable** -- use a runnable host shaderc from the declared
+bgfx toolchain. Supply its path through JCE_SHADERC_EXECUTABLE when necessary,
+then rerun scripts/jce.py editor or sdk with the same target options. The shared
+builder constructs configure/build commands; do not edit an upstream package.
 
 The native Windows build produces `shaderc.exe` under the bgfx Conan package folder
 and is picked up automatically when `bgfx` is built with `tools=True` (the default).

@@ -156,6 +156,11 @@ void sr_stash_color_cull(JceSceneRenderer *sr, const jce_vec4 planes[6])
     memcpy(sr->color_cull_planes, planes, 6 * sizeof(jce_vec4));
     jce_frustum_abs_normals(sr->color_cull_planes, sr->color_cull_absn);
     sr->color_cull_valid = true;
+    /* Environment queries may acquire a CRT lock and search the whole host
+     * environment. Resolve diagnostic policy once per color view, never once
+     * per model instance. A changed host setting takes effect next view. */
+    const char *off = getenv("JCE_BATCH_NOCULL");
+    sr->batch_member_cull_enabled = !(off && off[0] && off[0] != '0');
 }
 
 void sr_arm_batch_runs(JceSceneRenderer *sr, JceScene *scene, JceEntity e,
@@ -164,17 +169,8 @@ void sr_arm_batch_runs(JceSceneRenderer *sr, JceScene *scene, JceEntity e,
     /* Disarmed by default, so a model with no member table -- every ordinary
      * asset -- draws exactly as it did. */
     jce_model_set_draw_index_runs(NULL, NULL, 0);
-    if (!sr || !scene || !mr || !mr->mesh_path[0]) return;
-    /* JCE_BATCH_NOCULL=1 keeps the table loaded and never arms a run.  This is
-     * the ABLATION the correctness claim needs: culling members that are off
-     * screen cannot change a pixel, so with-cull against without-cull must be
-     * IDENTICAL -- and a knob that exists only in a patch is a measurement
-     * nobody can re-run. */
-    {
-        const char *off = getenv("JCE_BATCH_NOCULL");
-        if (off && off[0] && off[0] != '0') return;
-    }
-    if (!sr->color_cull_valid) return;
+    if (!sr || !scene || !mr || !mr->mesh_path[0] ||
+        !sr->color_cull_valid || !sr->batch_member_cull_enabled) return;
 
     SrModelCache *mc = sr_get_model(sr, mr->mesh_path, (uint32_t)e);
     if (!mc || mc->batch_member_count == 0) return;

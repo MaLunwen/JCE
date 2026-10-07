@@ -222,6 +222,13 @@ JCE_API void      jce_audio_set_lowpass(JceAudio *audio, JceVoice voice, float c
 JCE_API void      jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch);
 JCE_API void      jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop);
 JCE_API bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
+/* Nonblocking caller-driven stream pause acknowledgement. Controls and queries
+ * must be serialized by the owner. True means paused admission and no user pull
+ * or cursor publication remains in flight; silence callbacks may still occur.
+ * NULL, invalid, regular voices and disabled audio return false. Resume clears it.
+ */
+JCE_API bool jce_audio_stream_is_quiescent(const JceAudio *audio, JceVoice voice);
+
 
 /* -- Streaming playback ---------------------------------------------- */
 
@@ -244,6 +251,9 @@ JCE_API JceVoice  jce_audio_play_stream(JceAudio *audio,
 /* -- Global --------------------------------------------------------- */
 
 JCE_API void      jce_audio_set_master_volume(JceAudio *audio, float volume);
+/* Actual engine endpoint gain, including named Master bus writes. Returns 0
+ * for NULL or an audio-disabled build; it does not prove a live device exists. */
+JCE_API float     jce_audio_get_master_volume(JceAudio *audio);
 JCE_API void      jce_audio_stop_all(JceAudio *audio);
 
 /* -- Mixer buses ---------------------------------------------------- */

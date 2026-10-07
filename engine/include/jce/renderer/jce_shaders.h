@@ -66,7 +66,9 @@ JCE_API void jce_shader_program_destroy(JceShaderHandle prog);
  * source of truth for anyone that has to name a .bin on disk. */
 JCE_API const char *jce_shaders_backend_suffix(void);
 
-/* Pre-loaded shader set (color + textured + mesh + PBR). */
+/* Stock shader set (color + textured + mesh + PBR). Web prepares expensive
+ * families for first actual renderer submission. Handles remain opaque;
+ * release through jce_shader_program_destroy rather than raw backend calls. */
 typedef struct JceShaderSet {
     JceShaderHandle color;
     JceShaderHandle textured;

@@ -29,6 +29,10 @@ jce_add_unit_test(test_jce_render_readback_contract
     SOURCES test_jce_render_readback_contract.c
     LINK    jce_core jce_renderer jce_resource)
 
+jce_add_unit_test(test_jce_gpu_survivor_contract
+    SOURCES test_jce_gpu_survivor_contract.c
+    LINK    jce_core jce_renderer jce_resource)
+
 # Top 5: project render/quality settings carrier (build emits render_settings.json
 # from Project Settings > Quality; the shipped runtime loads + applies it).
 jce_add_unit_test(test_jce_render_settings
@@ -177,6 +181,14 @@ if(TARGET harfbuzz::harfbuzz)
     jce_add_unit_test(test_jce_text_shape_cache
         SOURCES test_jce_text_shape_cache.c
         LINK    jce_core jce_renderer jce_resource harfbuzz::harfbuzz)
+    jce_add_unit_test(test_jce_text_real_font
+        SOURCES test_jce_text_real_font.c
+        LINK jce_core jce_renderer jce_resource harfbuzz::harfbuzz)
+    target_include_directories(test_jce_text_real_font PRIVATE
+        "${CMAKE_SOURCE_DIR}/engine/src")
+    # Its cache/shape ratio uses back-to-back timing loops. Do not overlap
+    # them with unrelated unit processes, which can preempt only one loop.
+    set_tests_properties(test_jce_text_shape_cache PROPERTIES RUN_SERIAL TRUE)
     # renderer/jce_text_shape.h is src-side because nothing outside this
     # renderer shapes text; same pattern as test_jce_root_motion.
     target_include_directories(test_jce_text_shape_cache PRIVATE
@@ -410,3 +422,31 @@ jce_add_unit_test(test_jce_material_inherit
 jce_add_unit_test(test_jce_motion_blur_intensity
     SOURCES test_jce_motion_blur_intensity.c
     LINK    jce_core jce_renderer jce_resource)
+
+# Headless ownership regression. Texture stubs count real staging consumption;
+# the production pool is compiled directly without a renderer/device dependency.
+jce_add_unit_test(test_jce_model_texture_pool
+    SOURCES test_jce_model_texture_pool.c
+        "${CMAKE_SOURCE_DIR}/engine/src/renderer/jce_model_texture_pool.c"
+    LINK jce_core)
+target_include_directories(test_jce_model_texture_pool PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Actual pure mip helper: byte filtering, NPOT tails and checked storage.
+jce_add_unit_test(test_jce_texture_mips
+    SOURCES test_jce_texture_mips.c
+    LINK jce_core)
+target_include_directories(test_jce_texture_mips PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Pure production counter and borrowed-context lifecycle (no graphics device).
+jce_add_unit_test(test_jce_upload_metrics
+    SOURCES test_jce_upload_metrics.c
+        "${CMAKE_SOURCE_DIR}/engine/src/renderer/jce_upload_metrics.c"
+    LINK jce_core)
+target_include_directories(test_jce_upload_metrics PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")
+
+jce_add_unit_test(test_jce_upload_payload_integration
+    SOURCES test_jce_upload_payload_integration.c
+    LINK jce_core jce_renderer jce_resource)

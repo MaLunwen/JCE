@@ -1,4 +1,4 @@
-"""Measure an actual editor media preview, preserving user settings bytes.
+"""Measure an actual editor media preview with an isolated settings directory.
 
 Uses the explicit asset-open route, real wall time and a real hidden GPU window.
 No build, fixed timestep, backend fallback, or user media redistribution.
@@ -19,6 +19,23 @@ from jce_determinism import (DETERMINISM, actual_backend, assert_backend,
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def playback_spans(rows, tail):
+    """Keep paused and discontinuous transports out of steady cadence intervals."""
+    spans = []
+    current = None
+    for row in rows:
+        if row.get("playing") != 1 or row.get("media", 0) >= tail - .02:
+            current = None
+            continue
+        if row.get("wall", 0) < 1:
+            continue
+        if current is None or row["generation"] != current[-1]["generation"]:
+            current = []
+            spans.append(current)
+        current.append(row)
+    return spans
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("media", type=Path)
@@ -29,6 +46,8 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=3800)
     ap.add_argument("--timeout", type=float, default=60)
     ap.add_argument("--output", type=Path, required=True)
+    ap.add_argument("--profile", type=Path,
+                    help="explicit editor profile; default is a fresh directory beside the output")
     ap.add_argument("--capture-frame", type=int)
     ap.add_argument("--expected-frames", type=int,
                     help="known full-clip picture count for EOF regression checks")
@@ -56,12 +75,11 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     engine_log = output.with_name(output.name + ".engine.log")
     engine_log.unlink(missing_ok=True)
-    folders = {Path.home() / ".jce", ROOT / ".jce", editor.parent / ".jce"}
+    profile = (args.profile.resolve() if args.profile else
+               output.with_name(output.name + ".profile"))
+    profile.mkdir(parents=True, exist_ok=args.profile is not None)
     if args.scene:
         scene = args.scene.resolve(strict=True)
-        folders.update(p / ".jce" for p in scene.parents if p != p.parent)
-    saved = {d: {p: p.read_bytes() for p in d.iterdir() if p.is_file()}
-             if d.exists() else {} for d in folders}
     env = os.environ.copy()
     env.update(DETERMINISM)
     # Media cadence needs wall-clock time and actual asynchronous workers.
@@ -71,7 +89,8 @@ def main() -> int:
         env.pop(key, None)
     env.update(JCE_DBG_FILE_PREVIEW=str(media), JCE_VIDEO_TRACE="1",
                JCE_AUDIO_TRACE="1", JCE_WINDOW_HIDDEN="1", JCE_MULTI_INSTANCE="1",
-               JCE_MAX_FRAMES=str(args.frames), JCE_LOG_FILE=str(engine_log))
+               JCE_MAX_FRAMES=str(args.frames), JCE_LOG_FILE=str(engine_log),
+               JCE_EDITOR_PROFILE_DIR=str(profile))
     if args.seeks:
         env["JCE_DBG_FILE_PREVIEW_SEEKS"] = ",".join(map(str, args.seeks))
     else:
@@ -87,25 +106,15 @@ def main() -> int:
                    JCE_WINCAP_PATH=str(output.with_suffix(".png")))
     timeout = False
     start = time.monotonic()
-    try:
-        with output.open("wb") as log:
-            process = subprocess.Popen([str(editor)], cwd=editor.parent, env=env,
-                                       stdout=log, stderr=subprocess.STDOUT)
-            try:
-                code = process.wait(timeout=args.timeout)
-            except subprocess.TimeoutExpired:
-                timeout = True
-                process.terminate()
-                code = process.wait(timeout=10)
-    finally:
-        for folder, files in saved.items():
-            if folder.exists():
-                for path in folder.iterdir():
-                    if path.is_file() and path not in files:
-                        path.unlink()
-            for path, data in files.items():
-                path.write_bytes(data)
-            assert all(p.read_bytes() == b for p, b in files.items())
+    with output.open("wb") as log:
+        process = subprocess.Popen([str(editor)], cwd=editor.parent, env=env,
+                                   stdout=log, stderr=subprocess.STDOUT)
+        try:
+            code = process.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            timeout = True
+            process.terminate()
+            code = process.wait(timeout=10)
     stdout_text = output.read_text(encoding="utf-8", errors="replace")
     engine_text = (engine_log.read_text(encoding="utf-8", errors="replace")
                    if engine_log.is_file() else "")
@@ -122,14 +131,22 @@ def main() -> int:
         assert_has_content(read_png(output.with_suffix(".png")), str(output))
     rows = []
     audio_rows = []
+    generation = 0
     for line in telemetry.splitlines():
+        if "seek requested target=" in line:
+            generation += 1
         if "viewer trace wall=" in line:
-            rows.append({key: float(value) for key, value in
-                         re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)})
+            row = {key: float(value) for key, value in
+                   re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)}
+            row["generation"] = generation
+            rows.append(row)
         if "audio trace playing=" in line:
             audio_rows.append({key: float(value) for key, value in
                                re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)})
     failures = []
+    profile_confirmed = "profile directory: " + str(profile) in text and (profile / "imgui.ini").is_file()
+    if not profile_confirmed:
+        failures.append("editor did not confirm the isolated profile and saved layout")
     seek_rows = {kind: [{key: float(value) for key, value in
                         re.findall(r"(\w+)=(-?\d+(?:\.\d+)?)", line)}
                        for line in telemetry.splitlines() if f"seek {kind} target=" in line]
@@ -180,17 +197,10 @@ def main() -> int:
             failures.append("insufficient actual playback samples")
         else:
             fps, duration = map(float, match.groups())
-            # A seek intentionally changes the media clock discontinuously.
-            # Measure only contiguous playback spans; comparing snapshots on
-            # opposite sides of a seek reports a false slow/negative rate.
-            spans = []
-            for row in active:
-                if not spans or (args.seeks and abs(
-                        (row["media"] - spans[-1][-1]["media"])
-                        - (row["wall"] - spans[-1][-1]["wall"])) > .20):
-                    spans.append([row])
-                else:
-                    spans[-1].append(row)
+            # Consume the actual seek events and paused snapshots. Inferring
+            # discontinuities from a clock-difference threshold can join a
+            # seek with a coincidentally similar delta, or hide true slow play.
+            spans = playback_spans(rows, tail)
             measured = 0
             for span in spans:
                 first, last = span[0], span[-1]
@@ -229,7 +239,8 @@ def main() -> int:
                         failures.append("decoded/presented picture count differs from fixture")
     result = {"media": str(media), "bytes": media.stat().st_size,
               "exit_code": code, "timeout": timeout, "backend": backend,
-              "wall_seconds": time.monotonic() - start, "settings_restored": True,
+              "wall_seconds": time.monotonic() - start, "settings_isolated": profile_confirmed,
+              "profile": str(profile),
               "video_trace": rows, "audio_trace": audio_rows, "seek_trace": seek_rows,
               "validation_failures": failures, "log": str(output),
               "engine_log": str(engine_log)}

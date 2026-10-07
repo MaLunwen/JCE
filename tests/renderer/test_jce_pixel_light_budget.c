@@ -34,6 +34,7 @@
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_lighting_system.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,6 +100,25 @@ static JceEntity add_spot(float d)
     sl.outer_cone_cos = 0.8f;
     jce_scene_set_spot_light(s_scene, e, &sl);
     jce_scene_set_component_enabled(s_scene, e, JCE_COMP_FLAG_SPOT_LIGHT, true);
+    return e;
+}
+
+/* Use ordinary component setters: do not duplicate the selector's rules. */
+static JceEntity add_point_intensity(float distance, float intensity)
+{
+    JceEntity e = add_point(distance);
+    JcePointLight light = *jce_scene_get_point_light(s_scene, e);
+    light.intensity = intensity;
+    jce_scene_set_point_light(s_scene, e, &light);
+    return e;
+}
+
+static JceEntity add_spot_intensity(float distance, float intensity)
+{
+    JceEntity e = add_spot(distance);
+    JceSpotLight light = *jce_scene_get_spot_light(s_scene, e);
+    light.intensity = intensity;
+    jce_scene_set_spot_light(s_scene, e, &light);
     return e;
 }
 
@@ -218,6 +238,52 @@ static void test_the_knob_clamps_and_round_trips(void)
         "a negative budget is 'no budget', not a negative count");
 }
 
+static void test_disabled_and_invalid_lights_do_not_spend_the_budget(void)
+{
+    const float disabled[] = {0.0f, -1.0f, NAN, INFINITY};
+    for (size_t i = 0; i < sizeof disabled / sizeof disabled[0]; ++i) {
+        add_point_intensity(0.1f, disabled[i]);
+        add_spot_intensity(0.1f, disabled[i]);
+    }
+    const JceEntity point = add_point_intensity(10.0f, 0.001f);
+    const JceEntity spot = add_spot_intensity(20.0f, 0.002f);
+    jce_lighting_set_pixel_light_count(2);
+    select_now();
+    TEST_ASSERT_EQUAL_INT(1, s_sr->frame_sel_point_n);
+    TEST_ASSERT_EQUAL_INT(1, s_sr->frame_sel_spot_n);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)point, (uint64_t)s_sr->frame_sel_point[0]);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)spot, (uint64_t)s_sr->frame_sel_spot[0]);
+}
+
+static void test_disabled_lights_do_not_exhaust_candidate_capacity(void)
+{
+    /* The old implementation filled its 256-entry candidates with disabled
+     * components and never reached later positive lights. */
+    for (int i = 0; i < 300; ++i) {
+        add_point_intensity(0.1f, 0.0f);
+        add_spot_intensity(0.1f, 0.0f);
+    }
+    const JceEntity point = add_point_intensity(10.0f, 0.01f);
+    const JceEntity spot = add_spot_intensity(10.0f, 0.01f);
+    select_now();
+    TEST_ASSERT_EQUAL_INT(1, s_sr->frame_sel_point_n);
+    TEST_ASSERT_EQUAL_INT(1, s_sr->frame_sel_spot_n);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)point, (uint64_t)s_sr->frame_sel_point[0]);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)spot, (uint64_t)s_sr->frame_sel_spot[0]);
+}
+
+static void test_positive_strength_remains_part_of_the_selection_score(void)
+{
+    add_point_intensity(1.0f, 0.001f);
+    const JceEntity brighter_spot = add_spot_intensity(2.0f, 0.01f);
+    jce_lighting_set_pixel_light_count(1);
+    select_now();
+    TEST_ASSERT_EQUAL_INT(0, s_sr->frame_sel_point_n);
+    TEST_ASSERT_EQUAL_INT(1, s_sr->frame_sel_spot_n);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)brighter_spot,
+        (uint64_t)s_sr->frame_sel_spot[0]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -228,5 +294,8 @@ int main(void)
     RUN_TEST(test_a_budget_above_the_ceilings_changes_nothing);
     RUN_TEST(test_fewer_lights_than_the_budget_selects_all_of_them);
     RUN_TEST(test_the_knob_clamps_and_round_trips);
+    RUN_TEST(test_disabled_and_invalid_lights_do_not_spend_the_budget);
+    RUN_TEST(test_disabled_lights_do_not_exhaust_candidate_capacity);
+    RUN_TEST(test_positive_strength_remains_part_of_the_selection_score);
     return UNITY_END();
 }

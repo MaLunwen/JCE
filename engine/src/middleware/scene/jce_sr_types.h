@@ -177,7 +177,6 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
  * ~1.1 MB -> ~4.4 MB — acceptable against the 512 MB charter budget; the
  * per-frame pose-eval cost scales with the ANIMATING count and is parallel
  * (sr_anim_sample_range workers). */
-#define SR_ANIM_INSTANCE_MAX   256  /* per-entity skinned-anim playback state */
 #define SR_SPRITE_ANIM_MAX     64   /* per-entity 2D sprite-animator playback state */
 /* Seed sentinel for SrAnimInstance.sm_prev_state: a value that can never be a
  * valid SM state index (or the -1 "no active state").  jce_anim_sm_poll_state_
@@ -186,8 +185,8 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 #define SR_SM_STATE_SEED       (-2147483647 - 1)   /* INT_MIN without <limits.h> */
 /* FEATURE 3.1 GPU morph deform: max morph-bearing primitives per instance that
  * can hold a live per-instance dynamic vertex buffer.  Bounds the per-instance
- * handle footprint so SR_ANIM_INSTANCE_MAX * SR_MORPH_PRIM_MAX dynamic VBs stay
- * well within the bgfx dynamic-VB handle pool budget.  A face rig is typically
+ * handle footprint; device handle availability still bounds live dynamic VBs.
+ * A face rig is typically
  * 1-2 morph prims; 8 is generous headroom. */
 #define SR_MORPH_PRIM_MAX      8
 /* Clips resolved from a FILE rather than from the model.  Eight is the
@@ -334,7 +333,7 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
  * barrier between the counter reset and the compact atomics (D3D12 gets no
  * same-view barrier because both keep the counter in UAV state). */
 #define JCE_VIEW_GPU_CULL_RESET_OFFSET JCE_VIEW_SR_GPU_CULL_RESET_OFFSET
-#define SR_GPU_PARTICLE_MAX          64
+#include "jce_sr_particle_limits.h"
 /* Grass spatial-cull grid: up to 32x32 = 1024 cells per field.  The blade
  * field is binned into this grid at scatter time so the color pass can
  * frustum + fade-distance cull whole cells (submitting only on-screen blades)
@@ -460,7 +459,7 @@ typedef struct {
    the shadow pass) and consumed by both the shadow and color passes so the cast
    shadow deforms in lock-step with the lit mesh. count == 0 => draw bind pose. */
 typedef struct {
-    uint32_t        entity;
+    JceEntity       entity;
     JceModel       *model;        /* borrowed; owned by SrModelCache */
     JceAnimPlayer  *player;
     int             active_clip;
@@ -825,6 +824,7 @@ typedef struct {
     jce_vec3 wmin, wmax;
     bool     has_aabb;
     bool     casts_shadow;
+    bool     transform_dynamic; /* Own or ancestor runtime-moved component. */
     /* world_valid mirrors "entity has a transform" (false => callers fall
      * back to jce_scene_get_world_matrix; e.g. transform-less specials).  The
      * matrix itself lives in the index-parallel sr->ecull_world array (SoA
@@ -878,6 +878,7 @@ typedef struct {
      * the ecull miss path; listed in sr->shadow_dyn so the shadow pass can
      * test WHICH cascades a mover overlaps instead of voiding all of them. */
     bool     is_dyn_caster;
+    uint64_t shadow_list_epoch; /* private membership, not copied from wcache */
     /* JceLayerComponent.layer (0..31), READ FRESH EVERY FRAME on both the hit
      * and the miss path -- unlike render_kind beside it.  A layer edit changes
      * a component VALUE and bumps no epoch, so a cached one would go stale. */
@@ -889,7 +890,7 @@ typedef struct {
  * components (terrain/tilemap/vegetation/line/trail/water/grass/skinned/sprite/
  * billboard/video/lod_group) — every pass's type-dispatch + skinned/terrain
  * probes are provably false for it, so they jump straight to the mesh submit. */
-enum { SR_RK_OTHER = 0, SR_RK_PRIM_MESH = 1, SR_RK_DISABLED = 2, SR_RK_MODEL = 3 };
+enum { SR_RK_OTHER = 0, SR_RK_PRIM_MESH = 1, SR_RK_DISABLED = 2, SR_RK_MODEL = 3, SR_RK_NO_DRAW = 4 };
 
 /* Parallel-gather worker output: one pre-built draw cmd + its material per
  * eligible entity, written to a DISJOINT slot by a worker thread (no shared

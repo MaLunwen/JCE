@@ -51,6 +51,13 @@ void  jce_file_viewer_draw_window(bool *p_visible);
 /* Close all open tabs/free resources. */
 void  jce_file_viewer_close_all(void);
 
+/* Opt-in small-image cursor preview; normal ImGui cursor arbitration wins. */
+bool jce_file_viewer_cursor_available(const char *path);
+bool jce_file_viewer_cursor_enabled(const char *path);
+bool jce_file_viewer_cursor_toggle(const char *path);
+void jce_file_viewer_cursor_visit(const char *path, bool canvas_hovered);
+struct JceCursor *jce_file_viewer_cursor_for_frame(void);
+
 /* Shutdown (called from editor shutdown). */
 void  jce_file_viewer_shutdown(void);
 

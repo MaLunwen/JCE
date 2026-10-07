@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "jce_yuv_convert.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,6 +55,16 @@ bool jce_h264_decoder_drain(JceH264Decoder *dec, const uint8_t **out_rgba,
                              uint32_t *out_width, uint32_t *out_height);
 void jce_h264_decoder_set_timestamp(JceH264Decoder *dec, uint64_t timestamp);
 uint64_t jce_h264_decoder_frame_timestamp(const JceH264Decoder *dec);
+
+/* Private worker opt-in: successful decode/drain supplies owned tight I420
+ * through get_yuv and returns NULL RGBA. Default legacy RGBA behavior remains.
+ * Select the mode before the first access-unit decode; changes afterward are
+ * ignored to avoid reinterpreting an outstanding pending picture.
+ * Output lasts until the next decode/drain/flush/close. Reordered PTS unchanged.
+ * Pinned public codec API has no color-matrix/range getter; preserves BT.601
+ * limited-range adapter behavior, not a claim of complete H.264 VUI support. */
+void jce_h264_decoder_set_yuv_output(JceH264Decoder *dec, bool enabled);
+bool jce_h264_decoder_get_yuv(const JceH264Decoder *dec, JceYuv420Frame *out);
 
 /* Flush the decoder (e.g. after seeking) so stale reference frames
  * are discarded. */

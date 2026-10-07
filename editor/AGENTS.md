@@ -80,3 +80,9 @@ It links Lua/C/C++/JavaScript explicitly, requires a complete static-CRT graph
 and stages no runtime files. Python/Java/C# remain in the full language build.
 No editor capability may be removed just to hide a dependency. Packaging and
 PE validation belong to tools/build/standalone.py, not editor business code.
+
+
+Runtime output paths contain the executable. Link/compiler debug symbols stay
+under the existing editor build cache's symbols/<configuration> directory.
+DIST hash receipts stay under build reports/artifacts/<variant>, independent
+of runtime relocation. None is required beside the single editor executable.

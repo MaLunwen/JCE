@@ -133,3 +133,13 @@ ADTS, or MP4 audio; bounded PCM ring and fixed 2048-bin background waveform.
 miniaudio file/memory adapters. `jce_adts_file.c` retains a bounded frame-offset
 index and feeds/drains the existing AAC wrapper. No full input/PCM fallback.
 Stop a voice before closing its file; discard analysis tasks before freeing state.
+
+The public master-volume getter reads the actual miniaudio engine endpoint,
+including Master bus writes. NULL and audio-disabled implementations return 0;
+that value alone is not proof that an audio device exists. No public layout changes.
+
+Stream pause closes private callback admission before stopping the node. The
+nonblocking public stream quiescence query acknowledges completed user pulls,
+not device silence callbacks. Owner controls/queries are serialized; the real-time
+callback uses atomics without waiting. Regular/invalid/disabled voices cannot
+provide this acknowledgement.

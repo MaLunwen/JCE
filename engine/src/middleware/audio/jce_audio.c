@@ -1,3 +1,4 @@
+#include "jce_audio_stream_gate.h"
 /*
  * jce_audio.c  miniaudio audio implementation.
  *
@@ -243,6 +244,7 @@ typedef struct {
                                  * MAIN thread.  Gate stops it and restarts
                                  * transparently when the volume rises. */
     /* Streaming voices: custom data source instead of ma_audio_buffer. */
+    JceAudioStreamGate    stream_gate;
     bool                  is_stream;
     ma_data_source_base   stream_ds;
     JceAudioStreamPullFn  stream_on_read;
@@ -928,6 +930,7 @@ static void uninit_voice(VoiceSlot *v)
         v->lpf_ok = false;
     }
     if (v->is_stream) {
+        jce_stream_gate_destroy(&v->stream_gate);
         ma_data_source_uninit(&v->stream_ds);
         v->is_stream = false;
         v->stream_on_read = NULL;
@@ -1688,6 +1691,11 @@ static ma_result stream_ds_on_read(ma_data_source *ds,
     /* Cap to uint32 — miniaudio buffers are small per callback. */
     uint32_t want = frame_count > 0xffffffffull
         ? 0xffffffffu : (uint32_t)frame_count;
+    if (!jce_stream_gate_enter(&v->stream_gate)) {
+        memset(out, 0, (size_t)want * v->stream_channels * sizeof(int16_t));
+        if (frames_read) *frames_read = want;
+        return MA_SUCCESS;
+    }
     uint32_t got = v->stream_on_read(v->stream_ud,(int16_t *)out,want);
     if (got > want) got = want;
     /* Short reads mean under-run/EOF, not the end of this live voice.
@@ -1696,6 +1704,7 @@ static ma_result stream_ds_on_read(ma_data_source *ds,
         memset((int16_t *)out+(size_t)got*v->stream_channels,0,
                (size_t)(want-got)*v->stream_channels*sizeof(int16_t));
     v->stream_cursor += want;
+    jce_atomic_i32_add(v->stream_gate.inflight, -1);
     if (frames_read) *frames_read = want;
     return MA_SUCCESS;
 }
@@ -1768,6 +1777,11 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
         return JCE_VOICE_INVALID;
     }
 
+    if (!jce_stream_gate_create(&v->stream_gate)) {
+        ma_data_source_uninit(&v->stream_ds);
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
     v->is_stream         = true;
     v->stream_on_read    = on_read;
     v->stream_ud         = ud;
@@ -1778,6 +1792,7 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
     if (ma_sound_init_from_data_source(&audio->engine,
             &v->stream_ds, 0, NULL, &v->sound) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_sound_init_from_data_source (stream) failed");
+        jce_stream_gate_destroy(&v->stream_gate);
         ma_data_source_uninit(&v->stream_ds);
         v->is_stream = false;
         JCE_PROFILE_ZONE_END;
@@ -1787,7 +1802,14 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
     ma_sound_set_volume(&v->sound, volume);
     ma_sound_set_pitch(&v->sound, pitch);
     ma_sound_set_looping(&v->sound, MA_FALSE);
-    ma_sound_start(&v->sound);
+    if (ma_sound_start(&v->sound) != MA_SUCCESS) {
+        ma_sound_uninit(&v->sound);
+        ma_data_source_uninit(&v->stream_ds);
+        jce_stream_gate_destroy(&v->stream_gate);
+        v->is_stream = false;
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
 
     v->inited     = true;
     v->vol_gated  = false;  /* fresh voice: no stale gate from slot reuse */
@@ -1832,6 +1854,8 @@ void jce_audio_pause(JceAudio *audio, JceVoice voice)
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     audio->voices[idx].vol_gated = false;   /* explicit pause supersedes the gate */
+    if (audio->voices[idx].is_stream)
+        jce_atomic_i32_store(audio->voices[idx].stream_gate.closed, 1);
     ma_sound_stop(&audio->voices[idx].sound);
 }
 
@@ -1842,8 +1866,10 @@ void jce_audio_resume(JceAudio *audio, JceVoice voice)
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     audio->voices[idx].vol_gated = false;   /* explicit resume supersedes the gate */
-    if (!ma_sound_is_playing(&audio->voices[idx].sound))
-        ma_sound_start(&audio->voices[idx].sound);
+    VoiceSlot *v = &audio->voices[idx];
+    if (v->is_stream) jce_atomic_i32_store(v->stream_gate.closed, 0);
+    if (!ma_sound_is_playing(&v->sound) && ma_sound_start(&v->sound) != MA_SUCCESS)
+        if (v->is_stream) jce_atomic_i32_store(v->stream_gate.closed, 1);
 }
 
 void jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume)
@@ -1903,12 +1929,26 @@ bool jce_audio_is_playing(const JceAudio *audio, JceVoice voice)
     return ma_sound_is_playing(&audio->voices[idx].sound) != 0;
 }
 
+bool jce_audio_stream_is_quiescent(const JceAudio *audio, JceVoice voice)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return false;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0 || idx >= JCE_MAX_VOICES) return false;
+    const VoiceSlot *v = &audio->voices[idx];
+    return v->inited && v->is_stream && jce_stream_gate_quiescent(&v->stream_gate);
+}
+
 /* -- Global --------------------------------------------------------- */
 
 void jce_audio_set_master_volume(JceAudio *audio, float volume)
 {
     if (!audio) return;
     ma_engine_set_volume(&audio->engine, volume);
+}
+
+float jce_audio_get_master_volume(JceAudio *audio)
+{
+    return audio ? ma_engine_get_volume(&audio->engine) : 0.0f;
 }
 
 void jce_audio_stop_all(JceAudio *audio)
@@ -2604,6 +2644,7 @@ int jce_audio_voice_get_priority(const JceAudio *audio, JceVoice voice) {
 }
 void jce_audio_stop(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
 void jce_audio_pause(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
+bool jce_audio_stream_is_quiescent(const JceAudio *a, JceVoice v) { (void)a; (void)v; return false; }
 void jce_audio_resume(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
 void jce_audio_set_volume(JceAudio *audio, JceVoice voice,
                           float volume)
@@ -2632,6 +2673,7 @@ bool jce_audio_is_playing(const JceAudio *audio,
     return false;
 }
 void jce_audio_set_master_volume(JceAudio *audio, float volume) { (void)audio; (void)volume; }
+float jce_audio_get_master_volume(JceAudio *audio) { (void)audio; return 0.0f; }
 void jce_audio_stop_all(JceAudio *audio) { (void)audio; }
 bool jce_audio_bus_create(JceAudio *audio, const char *name) {
     (void)audio; (void)name; return false;

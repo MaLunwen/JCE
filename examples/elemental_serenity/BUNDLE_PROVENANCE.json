@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "variant": "normal",
+  "file": "elemental_serenity.jbundle",
+  "sha256": "2b78da2a10073949bc30b1f58368d1b990c7c5a3e98903f1571f5efdace5ef86",
+  "bytes": 4963990,
+  "single_file": true,
+  "consumer_source": "tests/consumers/elemental_serenity",
+  "source_terms": "SOURCE_AND_TERMS.md",
+  "repository_license": "MPL-2.0",
+  "scope": "Original JCE portable Lua consumer variant; public SDK bundle dependency closure and relocated one-EXE consumption observed. No native multi-language parity claim.",
+  "upstream": "https://github.com/SahilK-027/Elemental-Serenity",
+  "asset_provenance": "ASSET_PROVENANCE.json",
+  "upstream_notice": "UPSTREAM_NOTICE.md",
+  "font_policy": "no font bytes; host default",
+  "qa_muted": false
+}

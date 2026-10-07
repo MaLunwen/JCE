@@ -687,6 +687,18 @@ public:
         return out;
     }
 
+    /* jce.get_pointer_position -- shape: void_out_array, since 1
+     * Viewport-local logical pixel x, y, width, height; zero dimensions
+     * indicate unavailable input. The sample is frame-transient and shared by
+     * Editor Game View and standalone runtime.
+     */
+    [[nodiscard]] std::array<float, 4> get_pointer_position() const noexcept
+    {
+        std::array<float, 4> out{};
+        jce_script_api_get_pointer_position(h_, out.data());
+        return out;
+    }
+
     /* jce.get_pointer_wheel -- shape: value_return, since 1
      */
     [[nodiscard]] float get_pointer_wheel() const noexcept
@@ -1406,6 +1418,58 @@ public:
     [[nodiscard]] int vcam_activate(CStr name) const noexcept
     {
         return jce_script_api_vcam_activate(h_, name.c_str());
+    }
+
+    /* jce.set_cursor -- shape: value_return, since 1
+     * Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path
+     * resets. Main-thread; false on decode/platform/cache failure.
+     */
+    [[nodiscard]] bool set_cursor(CStr asset_path, int hotspot_x,
+                                  int hotspot_y) const noexcept
+    {
+        return jce_script_api_set_cursor(h_, asset_path.c_str(), hotspot_x, hotspot_y);
+    }
+
+    /* jce.request_quit -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool request_quit() const noexcept
+    {
+        return jce_script_api_request_quit(h_);
+    }
+
+    /* jce.stat_available -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool stat_available() const noexcept
+    {
+        return jce_script_api_stat_available(h_);
+    }
+
+    /* jce.stat_set -- shape: value_return, since 1
+     * Store signed32 statistic through an explicitly borrowed platform
+     * service. Nonfinite, fractional or out-of-range values return false;
+     * successful set does not imply durable flush.
+     */
+    [[nodiscard]] bool stat_set(CStr id, double value) const noexcept
+    {
+        return jce_script_api_stat_set(h_, id.c_str(), value);
+    }
+
+    /* jce.stat_get -- shape: value_return, since 1
+     * Signed32 statistic; fallback must be finite, integral and in range,
+     * otherwise returns 0. An absent host returns 0; a configured runtime
+     * with unavailable service returns the valid fallback.
+     * When the host member is absent this returns 0, not 0.
+     */
+    [[nodiscard]] int stat_get(CStr id, double fallback) const noexcept
+    {
+        return jce_script_api_stat_get(h_, id.c_str(), fallback);
+    }
+
+    /* jce.stat_flush -- shape: value_return, since 1
+     */
+    [[nodiscard]] bool stat_flush() const noexcept
+    {
+        return jce_script_api_stat_flush(h_);
     }
 
 private:

@@ -7,6 +7,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include "jce_upload_metrics.h"
 #include <jce/os/core/jce_thread.h>    /* parallel mip downsample */
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
@@ -17,6 +18,7 @@
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_filesystem.h> /* jce_fs_host_read_all (LUT host loader) */
 
+#include "jce_texture_mips.h"
 #include "jce_texture_internal.h"      /* jce_lut_strip_to_volume decl */
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
@@ -296,33 +298,15 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
 /* Sized for the FULL chain; only the mip-0 region is left for the caller. */
 static const bgfx_memory_t *alloc_mip_chain_rgba8(uint32_t w, uint32_t h)
 {
-    size_t total = 0;
-    for (uint32_t mw = w, mh = h;;) {
-        total += (size_t)mw * mh * 4u;
-        if (mw <= 1u && mh <= 1u) break;
-        mw = mw > 1u ? mw >> 1 : 1u; mh = mh > 1u ? mh >> 1 : 1u;
-    }
+    size_t total;
+    if (!jce_texture_mip_bytes(w, h, &total)) return NULL;
     return bgfx_alloc((uint32_t)total);
 }
 
 /* Levels 1..N-1, box-filtered in place.  Mip 0 must already be written. */
 static void fill_mip_chain_rgba8(const bgfx_memory_t *mem, uint32_t w, uint32_t h)
 {
-    if (!mem) return;
-    uint8_t *prev = mem->data; uint32_t pw = w, ph = h;
-    uint8_t *cur  = mem->data + (size_t)w * h * 4u;
-    while (pw > 1u || ph > 1u) {
-        const uint32_t nw = pw > 1u ? pw >> 1 : 1u;
-        const uint32_t nh = ph > 1u ? ph >> 1 : 1u;
-        uint32_t gw = 0, gh = 0;
-        uint8_t *ds = downsample_rgba8(prev, pw, ph, &gw, &gh);
-        /* On OOM: a black level is wrong but bounded; leaving it uninitialised
-         * would upload whatever the allocator last held, which reads as random
-         * coloured confetti at distance and gets blamed on the texture. */
-        if (ds) { memcpy(cur, ds, (size_t)nw * nh * 4u); JCE_FREE(ds); }
-        else    { memset(cur, 0, (size_t)nw * nh * 4u); }
-        prev = cur; pw = nw; ph = nh; cur += (size_t)nw * nh * 4u;
-    }
+    if (mem) jce_texture_mip_fill(mem->data, mem->size, w, h);
 }
 
 /* Core upload: RGBA8 rows at `pitch` bytes.  Both entry points (the decoded
@@ -386,6 +370,7 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
      * downsample_rgba8 produces each 2x level.  +33% VRAM is reclaimable by the
      * streaming-pressure mip-bias hook (registry_opt_in_streaming below). */
     const bgfx_memory_t *mem = alloc_mip_chain_rgba8(w, h);
+    if (!mem) { JCE_FREE(shrunk); return JCE_TEXTURE_INVALID; }
     /* mip 0: tightly-packed copy (row-by-row if the surface pitch is padded).
      * When the tier cap shrunk the source above, `shrunk` IS the packed mip-0. */
     if (shrunk) {
@@ -405,6 +390,7 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
     }
     fill_mip_chain_rgba8(mem, w, h);
 
+    const uint64_t payload_bytes_6 = mem ? mem->size : 0u;
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)w, (uint16_t)h,
         true,   /* mip chain (box-filtered above) → trilinear minification */
@@ -412,6 +398,8 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(mode),
         mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_6,
+        handle.idx != UINT16_MAX);
 
     if (handle.idx == UINT16_MAX) {
         LOG_ERROR(LOG_TAG, "bgfx_create_texture_2d failed (%ux%u)", w, h);
@@ -448,18 +436,21 @@ JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path)
 
 /* CPU-side decode result (see jce_texture.h).  Holds EITHER a cooked
  * payload (is_cooked: info + concatenated mip pixels) OR a raw, tightly
- * packed RGBA8 buffer from the jce_image service.  Owns its buffers;
- * upload_cpu/cpu_free release them (each with its own allocator). */
+ * packed original-resolution RGBA8 mip chain prepared without GPU calls.
+ * upload_cpu/cpu_free release the JCE-owned payload; rgba8 aliases mip 0. */
 struct JceTextureCpu {
     int             sampler_mode;
     bool            is_cooked;
     JceAssetTexInfo info;          /* cooked */
-    void           *pixels;        /* cooked: owned TEX_PIXELS payload */
+    void           *pixels;        /* owned cooked payload or raw full mip chain */
     size_t          pixel_bytes;
-    uint8_t        *rgba8;         /* raw: owned RGBA8, jce_image_free_rgba8 */
+    uint8_t        *rgba8;         /* raw: mip-0 alias into owned pixels chain */
     uint32_t        rgba8_w;
     uint32_t        rgba8_h;
 };
+
+static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
+                                           int sampler_mode, const char *asset_path);
 
 JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
                                       const char *asset_path,
@@ -509,6 +500,14 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
         return NULL;
     }
 
+    return texture_decode_owned(buf, n, sampler_mode, asset_path);
+}
+
+/* Both PAK and borrowed-memory/VFS paths accept cooked bytes. This owns buf
+ * and releases it on every path, using the actual decompressed byte count. */
+static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
+                                           int sampler_mode, const char *asset_path)
+{
     /* ── Cooked path: .jceasset ── */
     if (jce_asset_is_cooked(buf, n)) {
         JceAssetView view;
@@ -570,7 +569,7 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
 
     /* ── Raw path: PNG/JPG → jce_image → RGBA8 ── */
     int img_w = 0, img_h = 0;
-    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(buf, (uint64_t)asset->original_size,
+    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(buf, (uint64_t)n,
                                                       &img_w, &img_h);
     JCE_FREE(buf);
 
@@ -585,9 +584,22 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
     memset(c, 0, sizeof(*c));
     c->sampler_mode = sampler_mode;
     c->is_cooked    = false;
-    c->rgba8        = rgba8;
-    c->rgba8_w      = (uint32_t)img_w;
-    c->rgba8_h      = (uint32_t)img_h;
+    size_t chain_bytes;
+    if (img_w <= 0 || img_h <= 0 || img_w > UINT16_MAX || img_h > UINT16_MAX ||
+        !jce_texture_mip_bytes((uint32_t)img_w, (uint32_t)img_h, &chain_bytes)) {
+        jce_image_free_rgba8(rgba8); JCE_FREE(c); return NULL;
+    }
+    c->pixels = JCE_MALLOC(chain_bytes);
+    if (!c->pixels) { jce_image_free_rgba8(rgba8); JCE_FREE(c); return NULL; }
+    c->pixel_bytes = chain_bytes;
+    memcpy(c->pixels, rgba8, (size_t)img_w * (size_t)img_h * 4u);
+    jce_image_free_rgba8(rgba8);
+    if (!jce_texture_mip_fill(c->pixels, chain_bytes, (uint32_t)img_w, (uint32_t)img_h)) {
+        JCE_FREE(c->pixels); JCE_FREE(c); return NULL;
+    }
+    c->rgba8 = c->pixels;
+    c->rgba8_w = (uint32_t)img_w;
+    c->rgba8_h = (uint32_t)img_h;
     return c;
 }
 
@@ -595,20 +607,10 @@ JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded, size_t size,
                                           int sampler_mode)
 {
     if (!encoded || size == 0) return NULL;
-    int img_w = 0, img_h = 0;
-    uint8_t *rgba8 = jce_image_load_rgba8_from_memory(encoded, (uint64_t)size,
-                                                      &img_w, &img_h);
-    if (!rgba8) return NULL;
-
-    JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
-    if (!c) { jce_image_free_rgba8(rgba8); return NULL; }
-    memset(c, 0, sizeof(*c));
-    c->sampler_mode = sampler_mode;
-    c->is_cooked    = false;
-    c->rgba8        = rgba8;
-    c->rgba8_w      = (uint32_t)img_w;
-    c->rgba8_h      = (uint32_t)img_h;
-    return c;
+    void *owned = JCE_MALLOC(size);
+    if (!owned) return NULL;
+    memcpy(owned, encoded, size);
+    return texture_decode_owned(owned, size, sampler_mode, "(memory)");
 }
 
 bool jce_texture_decode_cooked_rgba8(const void *encoded, size_t size,
@@ -685,8 +687,31 @@ JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
         tex = jce_texture_from_cooked(&c->info, c->pixels, c->pixel_bytes,
                                       c->sampler_mode);
     } else if (c->rgba8) {
-        tex = texture_from_rgba8_ex(c->rgba8, c->rgba8_w, c->rgba8_h,
-                                    c->rgba8_w * 4u, c->sampler_mode);
+        uint32_t w = c->rgba8_w, h = c->rgba8_h;
+        uint32_t cap = 0;
+        if (c->sampler_mode != JCE_TEX_CLAMP) {
+            JceRenderRecommendation recommendation = jce_renderer_get_recommendation();
+            if (recommendation.max_texture_size >= 256u) cap = recommendation.max_texture_size;
+        }
+        size_t offset = jce_texture_mip_select(&w, &h, cap);
+        if (offset < c->pixel_bytes) {
+            const uint8_t *base = (const uint8_t *)c->pixels + offset;
+            const bgfx_memory_t *mem = bgfx_copy(base, (uint32_t)(c->pixel_bytes - offset));
+            if (mem) {
+                const uint64_t payload_bytes_5 = mem ? mem->size : 0u;
+                bgfx_texture_handle_t handle = bgfx_create_texture_2d((uint16_t)w,
+                    (uint16_t)h, true, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+                    BGFX_TEXTURE_NONE | sampler_flags(c->sampler_mode), mem, 0);
+                jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_5,
+                    handle.idx != UINT16_MAX);
+                if (handle.idx != UINT16_MAX) {
+                    registry_add(handle.idx, w, h, full_mip_count(w, h),
+                        (uint8_t)BGFX_TEXTURE_FORMAT_RGBA8);
+                    registry_opt_in_streaming(handle.idx, w, h, base, c->sampler_mode);
+                    tex.idx = handle.idx;
+                }
+            }
+        }
     }
     jce_texture_cpu_free(c);
     return tex;
@@ -696,9 +721,9 @@ void jce_texture_cpu_free(JceTextureCpu *c)
 {
     if (!c) return;
     /* Each buffer goes back to the allocator that produced it: the cooked
-     * payload is ours, the raw pixels belong to the image service. */
+     * payload and prepared raw chain are ours; raw mip-0 is an alias. */
     if (c->pixels) JCE_FREE(c->pixels);
-    if (c->rgba8)  jce_image_free_rgba8(c->rgba8);
+    /* Raw rgba8 aliases pixels; the image-service allocation was freed on decode. */
     JCE_FREE(c);
 }
 
@@ -779,10 +804,13 @@ JceTexture jce_texture_load_lut_3d(const JcePakArchive *pak,
     if (!vol) { jce_texture_cpu_free(c); return invalid; }
     jce_lut_strip_to_volume(pixels, N, vol);
     const bgfx_memory_t *mem = bgfx_copy(vol, (uint32_t)((size_t)N * N * N * 4));
+    const uint64_t payload_bytes_4 = mem ? mem->size : 0u;
     bgfx_texture_handle_t h = bgfx_create_texture_3d(
         (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_4,
+        h.idx != UINT16_MAX);
     JCE_FREE(vol);
     jce_texture_cpu_free(c);
     if (h.idx == UINT16_MAX) {
@@ -841,10 +869,13 @@ JceTexture jce_texture_load_lut_3d_host(const char *host_path)
     if (!vol) { jce_texture_cpu_free(c); return invalid; }
     jce_lut_strip_to_volume(pixels, N, vol);
     const bgfx_memory_t *mem = bgfx_copy(vol, (uint32_t)((size_t)N * N * N * 4));
+    const uint64_t payload_bytes_3 = mem ? mem->size : 0u;
     bgfx_texture_handle_t h = bgfx_create_texture_3d(
         (uint16_t)N, (uint16_t)N, (uint16_t)N, false,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP, mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_3,
+        h.idx != UINT16_MAX);
     JCE_FREE(vol);
     jce_texture_cpu_free(c);
     if (h.idx == UINT16_MAX) {
@@ -883,6 +914,7 @@ JceTexture jce_texture_from_rgba_ex(const void *data,
     memcpy(mem->data, data, (size_t)width * height * 4u);
     fill_mip_chain_rgba8(mem, width, height);
 
+    const uint64_t payload_bytes_2 = mem ? mem->size : 0u;
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height,
         true,   /* mip chain (box-filtered above) */
@@ -890,6 +922,8 @@ JceTexture jce_texture_from_rgba_ex(const void *data,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(sampler_mode),
         mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_2,
+        handle.idx != UINT16_MAX);
 
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
@@ -924,6 +958,7 @@ JceTexture jce_texture_from_rgba(const void *data,
     const uint32_t bytes = width * height * 4u;
     const bgfx_memory_t *mem = bgfx_alloc(bytes);
     memcpy(mem->data, data, bytes);
+    const uint64_t payload_update_bytes_9 = mem ? mem->size : 0u;
     bgfx_update_texture_2d(handle,
                            0, /* layer */
                            0, /* mip */
@@ -933,6 +968,7 @@ JceTexture jce_texture_from_rgba(const void *data,
                            (uint16_t)height,
                            mem,
                            (uint16_t)(width * 4u));
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_UPDATE, payload_update_bytes_9, true);
 
     JceTexture tex;
     tex.idx = handle.idx;
@@ -983,10 +1019,13 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
                  (int)bgfx_fmt);
         sampler_mode &= ~JCE_TEX_SRGB;
     }
+    const uint64_t payload_bytes_1 = mem ? mem->size : 0u;
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)info->width, (uint16_t)info->height,
         has_mips, 1, bgfx_fmt,
         BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_1,
+        handle.idx != UINT16_MAX);
 
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
@@ -1029,6 +1068,7 @@ bool jce_texture_update_rgba(JceTexture tex, const void *data,
 
     bgfx_texture_handle_t handle;
     handle.idx = tex.idx;
+    const uint64_t payload_update_bytes_8 = mem ? mem->size : 0u;
     bgfx_update_texture_2d(handle,
                            0, /* layer */
                            0, /* mip */
@@ -1038,6 +1078,7 @@ bool jce_texture_update_rgba(JceTexture tex, const void *data,
                            (uint16_t)height,
                            mem,
                            (uint16_t)(width * 4u));
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_UPDATE, payload_update_bytes_8, true);
     return true;
 }
 
@@ -1070,6 +1111,7 @@ bool jce_texture_update_rgba_ref(JceTexture tex, const void *data,
 
     bgfx_texture_handle_t handle;
     handle.idx = tex.idx;
+    const uint64_t payload_update_bytes_7 = mem ? mem->size : 0u;
     bgfx_update_texture_2d(handle,
                            0, /* layer */
                            0, /* mip */
@@ -1079,6 +1121,7 @@ bool jce_texture_update_rgba_ref(JceTexture tex, const void *data,
                            (uint16_t)height,
                            mem,
                            (uint16_t)(width * 4u));
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_UPDATE, payload_update_bytes_7, true);
     return true;
 }
 
@@ -1189,25 +1232,7 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
     uint32_t dh = sh >> 1; if (dh == 0) dh = 1;
     uint8_t *dst = (uint8_t *)JCE_MALLOC((size_t)dw * dh * 4u);
     if (!dst) return NULL;
-    /* Clamp the +1 taps to the source extents: for odd/1-px source levels
-     * the unclamped p10/p01/p11 read past the buffer (an intermittent-AV /
-     * garbage-average source on the mip tail). Even dimensions >= 2 are
-     * byte-identical to the unclamped version. */
-    for (uint32_t y = 0; y < dh; y++) {
-        const uint32_t y0 = y * 2u;
-        const uint32_t y1 = (y0 + 1u < sh) ? y0 + 1u : y0;
-        for (uint32_t x = 0; x < dw; x++) {
-            const uint32_t x0 = x * 2u;
-            const uint32_t x1 = (x0 + 1u < sw) ? x0 + 1u : x0;
-            const uint8_t *p00 = src + ((size_t)y0 * sw + x0) * 4u;
-            const uint8_t *p10 = src + ((size_t)y0 * sw + x1) * 4u;
-            const uint8_t *p01 = src + ((size_t)y1 * sw + x0) * 4u;
-            const uint8_t *p11 = src + ((size_t)y1 * sw + x1) * 4u;
-            uint8_t *o = dst + ((size_t)y * dw + x) * 4u;
-            for (int c = 0; c < 4; c++)
-                o[c] = (uint8_t)(((unsigned)p00[c] + p10[c] + p01[c] + p11[c]) >> 2);
-        }
-    }
+    jce_texture_mip_downsample(src, sw, sh, dst);
     *out_dw = dw;
     *out_dh = dh;
     return dst;
@@ -1250,11 +1275,14 @@ static bool mip_upload_gpu(TexEntry *e, uint8_t *px, uint32_t w, uint32_t h,
     memcpy(mem->data, px, (size_t)w * h * 4u);
     if (owned) JCE_FREE(px);
 
+    const uint64_t payload_bytes_0 = mem ? mem->size : 0u;
     bgfx_texture_handle_t nh = bgfx_create_texture_2d(
         (uint16_t)w, (uint16_t)h,
         false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(e->sampler_mode),
         mem, 0);
+    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_0,
+        nh.idx != UINT16_MAX);
 
     if (nh.idx == UINT16_MAX) {
         LOG_WARN(LOG_TAG,

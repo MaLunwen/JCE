@@ -11,6 +11,10 @@
 #define JCE_SR_INTERNAL_H
 
 #include "jce_sr_types.h"   /* engine includes, capacity constants, Sr* records */
+#include "jce_sr_particle_batch.h"
+#include "jce_sr_metadata_key.h"
+#include "jce_sr_anim_storage.h"
+#include "jce_sr_occlusion_history.h"
 
 
 /* Ratio of cloud-base wind to the surface wind the environment carries.
@@ -39,6 +43,7 @@ struct JceSceneRenderer {
     JceRenderer            *renderer;
     const JcePakArchive    *pak;
     JceSceneRendererCallbacks cbs;
+    int                     nodraw_registry_count; /* last structurally invalidated capability set */
     bool                    has_cbs;
     bool                    homogeneous_depth;
     struct SrPortalSet     *portals;  /* CLOSED portals; jce_sr_portal.c */
@@ -225,6 +230,9 @@ struct JceSceneRenderer {
      * sr_draw_depth_prepass.  Falsified if a frame that skips the pre-pass is
      * ever observed with this flag still true. */
     bool                       depth_prepass_frame;
+    SrOcclusionHistory         depth_history;
+    bool                       depth_history_reused;
+    jce_mat4                   hiz_depth_vp;
     JceSsao                   *ssao;             /* SSAO sampling+blur pipeline */
     bool                       ssao_active_frame;/* true => bind SSAO into AO stage this frame */
     uint16_t                   ssao_ao_idx;      /* SSAO result texture handle idx */
@@ -236,6 +244,8 @@ struct JceSceneRenderer {
     bgfx_texture_handle_t      ssao_normal_tex;  /* rgb=normal*.5+.5, a=roughness */
     bgfx_program_handle_t      prog_gbuffer;     /* vs_gbuffer + fs_gbuffer */
     bool                       gbuffer_prog_tried;
+    bgfx_program_handle_t      prog_gbuffer_skinned; /* existing skin VS + normal/albedo FS */
+    bool                       gbuffer_skinned_tried;
     bgfx_uniform_handle_t      u_gbuffer_mat;
     bgfx_uniform_handle_t      u_gbuffer_albedo;  /* rgb = base colour, for SSGI */    /* x = roughness */
 
@@ -360,6 +370,7 @@ struct JceSceneRenderer {
     jce_vec4                   color_cull_planes[6];
     float                      color_cull_absn[6][3];
     bool                       color_cull_valid;
+    bool                       batch_member_cull_enabled; /* resolved once per color view */
     /* |n| for the above, refreshed with it.  The positive-vertex selection is
      * a pure function of the plane normals, so hoisting it here turns the
      * per-entity test into multiply-add -- see jce_aabb_in_frustum_fast. */
@@ -604,6 +615,8 @@ struct JceSceneRenderer {
      * mover leaving a cascade must dirty it once more to erase its shadow). */
     uint32_t  *shadow_dyn;
     uint32_t   shadow_dyn_count, shadow_dyn_cap;
+    uint64_t   shadow_dyn_epoch;
+    bool       shadow_dyn_overflow; /* incomplete list: use full caster pass */
     bool       shadow_cache_dyn_c[JCE_CSM_MAX_CASCADES];
 
     /* Local (spot/point) shadow atlas — P1. */
@@ -710,6 +723,10 @@ struct JceSceneRenderer {
      * The camera-dependent LOD/fade loop still runs every frame.
      * JCE_ECULL_FREEZE=0 disables. */
     bool                       ecull_frz_valid;
+    SrMetadataKey              ecull_metadata_key;
+    SrMetadataKey              ecull_metadata_next;
+    bool                       ecull_metadata_valid;
+    bool                       ecull_metadata_trusted;
     uint64_t                   ecull_frz_list_gen;
     uint64_t                   ecull_frz_xform;
     uint64_t                   ecull_frz_enable;
@@ -836,6 +853,7 @@ struct JceSceneRenderer {
 
     /* Occlusion culling stats (from the most recent render). */
     JceOcclusionStats          stat_occlusion;
+    SrOcclusionHistory         occlusion_history;
     bool                       stat_occlusion_enabled;
 
     /* Lighting environment. */
@@ -1007,22 +1025,15 @@ struct JceSceneRenderer {
     int                      model_inflight;   /* concurrent async model decodes */
     uint32_t                 model_upload_frame;
     bool                     model_upload_frame_valid;
-    SrAnimInstance           anim_inst[SR_ANIM_INSTANCE_MAX];
-    /* O(1) entity -> anim_inst slot index (open addressing, linear probe,
-     * capacity 2x the slot cap, power of two).  Value is slot+1 (0 = empty).
-     * sr_find_anim_instance was a linear scan over SR_ANIM_INSTANCE_MAX and
-     * is called from per-entity per-pass hot paths (bind-pose color/shadow/
-     * velocity gates + anim update) — at 4000 skinned chars x ~6 calls/frame
-     * x 256 slots that was ~6M comparisons per frame, quadrupled by the
-     * 64 -> 256 cap raise.  Maintained at the slot-assignment points in
-     * jce_sr_anim.c; slots are only released wholesale (renderer destroy). */
-    uint16_t                 anim_idx[SR_ANIM_INSTANCE_MAX * 2u];
-    uint32_t                 anim_idx_keys[SR_ANIM_INSTANCE_MAX * 2u];
+    SrAnimStorage            anim_storage;
+    const JceScene          *anim_storage_scene;
+    void                    *anim_requests; /* reusable SrAnimSample array */
+    uint32_t                 anim_request_capacity;
     /* Same-pattern O(1) index for the 2D sprite-animator slots (identical
      * lifecycle: slots release only wholesale at renderer destroy). */
     uint16_t                 sprite_idx[SR_SPRITE_ANIM_MAX * 2u];
     uint32_t                 sprite_idx_keys[SR_SPRITE_ANIM_MAX * 2u];
-    bool                     anim_cache_full_warned; /* once-per-renderer cap warning */
+    bool                     anim_cache_full_warned; /* once-per-renderer OOM warning */
     /* VRAM ceiling (large-world-opt): monotonically-increasing frame counter
      * bumped once per render; sr_get_model stamps the resolved slot's
      * last_used_frame with this so eviction can tell a model not referenced
@@ -1523,6 +1534,9 @@ struct JceSceneRenderer {
          * right after the camera stops would keep a stale nonzero motion. */
         float       prev_vp[16];
         bool        had_velocity;
+        /* Depth-only instancing does not populate the normal/albedo MRTs.
+         * A later reflection/GI consumer must rebuild those attachments. */
+        bool        had_normals;
     }                 pre_cache[4];
     int32_t           cull_movers_count; /* -1 = unknown (full rebuild) */
     uint32_t          cull_movers[1024];
@@ -1564,9 +1578,10 @@ struct JceSceneRenderer {
      * changes (both rewrite an eligible entity's built material), and by async
      * texture/model pop-in — so a single per-entity {epoch,xform_gen,material_gen,
      * content_gen} compare covers every invalidation without a per-frame rebuild.
-     * dc_last_* detect the SSAO/view-mode edges. Inert when the lever is off. */
+     * dc_last_* detect SSAO/view-mode and actual Forward+ edges. Inert when the lever is off. */
     uint64_t           dc_content_gen;
     bool               dc_last_ssao_active;
+    bool               dc_last_forwardplus;
     uint16_t           dc_last_ssao_ao;
     int                dc_last_view_mode;
 
@@ -1691,6 +1706,7 @@ struct JceSceneRenderer {
     JceCvar          *cv_gpu_min_group;
     JceCvar          *cv_gpu_min_per_draw;
     JceCvar          *cv_gpu_force;
+    JceCvar          *cv_gpu_indirect;
     bool              gpu_driven_frame;
     bool              gpu_batch_active;
     /* 千万 S2: foliage GPU-cull latched per render() (JCE_FOLIAGE_GPU_CULL +
@@ -1828,6 +1844,7 @@ struct JceSceneRenderer {
     uint32_t          mat_hash_gen;
     uint16_t          frame_view_id;
     JceScene         *frame_scene;
+    uint32_t          model_receiver_layer;
     float             frame_shadow_vp[16];
     bool              frame_shadow_vp_valid;
     bool              frame_shadow_active;
@@ -1855,6 +1872,11 @@ struct JceSceneRenderer {
     SrGpuParticleRec  gpu_particles[SR_GPU_PARTICLE_MAX];
     uint32_t          gpu_particle_frame;
     bool              gpu_particle_frame_valid;
+    SrParticleArena cpu_particle_arena;
+    bgfx_texture_handle_t cpu_particle_count_tex, cpu_particle_drawn_tex;
+    uint32_t cpu_particle_count_frame;
+    bool cpu_particle_count_valid;
+    const JceScene *cpu_particle_count_scene, *cpu_particle_render_scene;
     /* CPU-particle billboard sprite: the SAME vs_particle+fs_particle shaders
      * the GPU pool draws with, fed a CPU-built transient instance buffer.  So
      * CPU-simulated particles render as the identical view-aligned soft-circle
@@ -2158,7 +2180,9 @@ void  sr_drive_decals(JceSceneRenderer *sr, JceScene *scene,
 /* Animation (own: jce_sr_anim.c): morph VBs, sprite animator, avatar mask,
  * frame events, IK (two-bone / foot / full-body), ragdoll override,
  * retargeting + the per-frame skinned-animation evaluation pass. */
-SrAnimInstance *sr_find_anim_instance(JceSceneRenderer *sr, uint32_t entity);
+SrAnimInstance *sr_find_anim_instance(JceSceneRenderer *sr, JceEntity entity);
+void      sr_anim_instances_prune(JceSceneRenderer *sr, JceScene *scene);
+void      sr_anim_instances_destroy(JceSceneRenderer *sr);
 int       sr_find_sprite_anim(JceSceneRenderer *sr, uint32_t entity);
 void      sr_free_morph_vbs(SrAnimInstance *a);
 /* Destroy the instance's file-resolved clips (SrAnimInstance.file_clips).
@@ -2262,6 +2286,20 @@ bool  sr_light_selected(const JceEntity *arr, uint32_t n, JceEntity e);
 /* Shadow (own: jce_sr_shadow.c): caster cull, shadow VP/CSM helpers, shadow
  * target lifecycle, the directional + local shadow passes, the per-frame
  * shadow-caster spatial grid. */
+/* Serial ecull miss replay and its cache bridges (jce_sr_ecull.c). */
+void sr_ecull_reset_dynamic_list(JceSceneRenderer *sr);
+void sr_ecull_metadata_begin(JceSceneRenderer *sr, JceScene *scene,
+                            uint64_t list_generation, uint64_t structural_generation);
+void sr_ecull_metadata_commit(JceSceneRenderer *sr);
+void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
+                        const EntityList *list, int eci,
+                        uint64_t struct_epoch, bool wcache_on);
+void sr_classify_entity(JceScene *scene, JceEntity e, SrEntityCull *ec);
+void sr_wcache_store(JceSceneRenderer *sr, uint32_t entity,
+                     const SrEntityCull *ec, const jce_mat4 *world,
+                     uint64_t epoch, uint64_t xform_gen);
+void sr_focus_aabb_store(JceSceneRenderer *sr, uint32_t entity,
+                        jce_vec3 wmin, jce_vec3 wmax);
 bool  sr_shadow_caster_aabb(JceSceneRenderer *sr, JceScene *scene,
                             JceEntity e, const jce_mat4 *world,
                             jce_vec3 *out_mn, jce_vec3 *out_mx);
@@ -2362,6 +2400,14 @@ SrWorldCacheEntry *sr_wcache_find(JceSceneRenderer *sr, uint32_t entity,
 /* Draw (own: jce_sr_draw.c): the color-pass + shadow-pass GPU-instancing
  * batches, GPU-driven instanced draw, the per-entity model/material draw
  * helpers, and the main entity-rendering pass. */
+void  sr_occlusion_begin(JceSceneRenderer *sr, JceScene *scene,
+                        const JceCamera *camera, uint16_t view_id,
+                        const JceSceneRenderConfig *cfg);
+SrOcclusionHistoryKey sr_depth_history_key(JceSceneRenderer *sr,
+    JceScene *scene, const void *owner, uint16_t view_id, uint16_t target,
+    uint32_t width, uint32_t height, const jce_mat4 *view, const jce_mat4 *proj);
+void sr_depth_history_prepare(JceSceneRenderer *sr, JceScene *scene,
+    uint16_t view_id, const jce_mat4 *view, const jce_mat4 *proj);
 void  sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                        const JceCamera *camera, EntityList *list,
                        uint16_t view_id, float dt_sec,
@@ -2390,7 +2436,7 @@ void  sr_fade_state_prune(JceSceneRenderer *sr);
  * already past the 3000-line cap and check_file_size.py refuses to let an
  * over-cap file grow, which is the correct answer for a diagnostic. */
 void jce_sr_apply_resolved_ambient(JceSceneRenderer *sr, jce_vec3 amb,
-                                   float ai, bool have_ambient);
+                                   float ai, bool have_ambient, bool draw_skybox);
 
 #endif /* JCE_SR_INTERNAL_H */
 

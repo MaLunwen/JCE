@@ -16,6 +16,8 @@
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/resource/jce_bundle_pack.h>
 #include <jce/resource/jce_pak_loader.h>
+#include "resource/jce_asset_cooker.h"
+#include "resource/jce_asset_reader.h"
 
 #include <cjson/cJSON.h>
 #include <xxhash.h>
@@ -851,6 +853,36 @@ static const uint8_t k_red_png[] = {
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82
 };
 
+/* A BC request for a 1x1 fallback/UI texture must retain usable RGBA.
+ * Both archive and memory/VFS consumers then accept the SAME cooked bytes. */
+static void test_small_bc_texture_keeps_pixels_and_memory_decode(void)
+{
+    JceCookOptions opts = JCE_COOK_DEFAULT;
+    opts.texture_format = JCEASSET_TEXFMT_BC7;
+    opts.compression_level = 0;
+    JceCookResult result = jce_cook_texture(k_red_png, sizeof k_red_png, &opts);
+    TEST_ASSERT_TRUE_MESSAGE(result.success, result.error);
+    JceAssetView view;
+    TEST_ASSERT_TRUE(jce_asset_open(&view, result.data, result.size));
+    const JceAssetChunkEntry *chunk = jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_INFO);
+    TEST_ASSERT_NOT_NULL(chunk);
+    JceAssetTexInfo info;
+    TEST_ASSERT_TRUE(jce_asset_chunk_data(&view, chunk, &info, sizeof info) >= sizeof info);
+    TEST_ASSERT_EQUAL_UINT32(JCEASSET_TEXFMT_RGBA8, info.format);
+    TEST_ASSERT_EQUAL_UINT32(1, info.width);
+    TEST_ASSERT_EQUAL_UINT32(1, info.height);
+    JceTextureCpu *cpu = jce_texture_decode_cpu_mem(result.data, result.size, JCE_TEX_CLAMP);
+    TEST_ASSERT_NOT_NULL(cpu);
+    jce_texture_cpu_free(cpu);
+    uint8_t *pixels = NULL; uint32_t w=0,h=0;
+    TEST_ASSERT_TRUE(jce_texture_decode_cooked_rgba8(result.data, result.size, &pixels, &w, &h));
+    TEST_ASSERT_EQUAL_UINT8(255, pixels[0]);
+    TEST_ASSERT_EQUAL_UINT8(0, pixels[1]);
+    TEST_ASSERT_EQUAL_UINT8(255, pixels[3]);
+    jce_free(pixels);
+    jce_cook_result_free(&result);
+}
+
 static void write_bytes(const char *leaf, const void *data, size_t n)
 {
     char p[1024];
@@ -1105,6 +1137,7 @@ static void test_every_script_language_reaches_the_packaged_bundle(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_small_bc_texture_keeps_pixels_and_memory_decode);
     RUN_TEST(test_cooked_texture_decodes_to_rgba);
     RUN_TEST(test_single_file_scene_only_succeeds);
     RUN_TEST(test_single_file_absolute_asset_is_virtualised);

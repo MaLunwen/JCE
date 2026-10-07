@@ -6,7 +6,7 @@ import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("standalone_test", ROOT / "tools/build/standalone.py")
@@ -107,7 +107,7 @@ class NativeStandaloneTests(unittest.TestCase):
                                  sync_conan_hooks=Mock(), export_conan_recipes=Mock(),
                                  find_vs_install=lambda arch: None,
                                  host_build_profile=lambda: "windows-x64",
-                                 bgfx_graphics_conan_args=lambda env: [],
+                                 bgfx_graphics_conan_args=lambda env: [], codec_overrides=lambda args: [],
                                  run=Mock(), build_jobs=lambda: "2", log=Mock())
         args = SimpleNamespace(variant="dist", clean=False)
         target = {"host": "windows", "arch": "x86_64", "profile": "windows-x64", "key": "windows-x64"}
@@ -123,6 +123,37 @@ class NativeStandaloneTests(unittest.TestCase):
         self.assertIn("windows-x64-standalone", str(exe))
         cmake = (ROOT / "editor/CMakeLists.txt").read_text()
         self.assertIn("LANGUAGES c cpp js REQUIRED NO_STAGE", cmake)
+
+
+class NativePackageLayoutTests(unittest.TestCase):
+    def test_only_executable_is_staged_and_failure_does_not_publish(self):
+        base = ROOT / 'build/tests/standalone-package-layout'
+        base.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=base) as temporary:
+            root = Path(temporary).resolve()
+            source = root / 'build/desktop/fixture-standalone/dist/jce_editor.exe'
+            source.parent.mkdir(parents=True)
+            source.write_bytes(pe_fixture(['KERNEL32.dll']))
+            out = root / 'delivery/editor.exe'
+            target = {'host': 'windows', 'key': 'fixture'}
+            driver = SimpleNamespace(ROOT=root, HOST='windows', DRY_RUN=False,
+                resolve_target=lambda arch: target, msvc_env=lambda selected: {},
+                _assert_no_profiler_listener=Mock(), log=Mock())
+            args = SimpleNamespace(arch=None, variant='dist', skip_build=True, out=str(out))
+            with patch.object(MODULE, 'verify_assets', return_value={'scope': 'fixture'}), \
+                 patch.object(MODULE, 'verify_notices', return_value={'scope': 'fixture'}), \
+                 patch.object(MODULE, 'source_identity', return_value={'jce_version': 'fixture'}):
+                MODULE.package_editor(driver, args)
+                self.assertEqual(list(out.parent.iterdir()), [out])
+                self.assertEqual(out.read_bytes(), source.read_bytes())
+                receipt = root / 'build/reports/delivery/fixture/dist/editor/SHA256SUMS'
+                self.assertEqual(receipt.read_bytes(),
+                    (MODULE.verify(source)['sha256'] + '  editor.exe\n').encode())
+                args.out = str(root / 'refused/editor.exe')
+                source.write_bytes(pe_fixture(['KERNEL32.dll', 'python312.dll']))
+                with self.assertRaisesRegex(ValueError, 'external DLLs'):
+                    MODULE.package_editor(driver, args)
+                self.assertFalse(Path(args.out).exists())
 
 
 if __name__ == "__main__":

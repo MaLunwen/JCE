@@ -22,6 +22,7 @@
  * tools/lint/check_provenance_claims.py has what that cost.
  */
 #include "application/jce_engine_frame_cap.h"
+#include "application/jce_engine_memory_policy.h"
 
 #include "unity.h"
 
@@ -161,9 +162,33 @@ static void test_the_public_setter_round_trips_and_clamps(void)
     TEST_ASSERT_EQUAL_INT(0, jce_engine_get_target_fps());
 }
 
+static void test_memory_policy_resolves_each_lifecycle(void)
+{
+    TEST_ASSERT_TRUE(jce_engine_low_memory_policy(512, 8,
+        JCE_MACHINE_CLASS_AUTO, NULL));
+    TEST_ASSERT_TRUE(jce_engine_low_memory_policy(8192, 1,
+        JCE_MACHINE_CLASS_AUTO, ""));
+    TEST_ASSERT_FALSE(jce_engine_low_memory_policy(8192, 8,
+        JCE_MACHINE_CLASS_AUTO, NULL));
+    TEST_ASSERT_FALSE(jce_engine_low_memory_policy(512, 1,
+        JCE_MACHINE_CLASS_FULL, NULL));
+    TEST_ASSERT_TRUE(jce_engine_low_memory_policy(8192, 8,
+        JCE_MACHINE_CLASS_LOW, NULL));
+    TEST_ASSERT_FALSE(jce_engine_low_memory_policy(512, 1,
+        JCE_MACHINE_CLASS_LOW, "0"));
+    TEST_ASSERT_TRUE(jce_engine_low_memory_policy(8192, 8,
+        JCE_MACHINE_CLASS_FULL, "1"));
+    /* An earlier LOW result cannot stick when a later boot selects FULL. */
+    TEST_ASSERT_TRUE(jce_engine_low_memory_policy(8192, 8,
+        JCE_MACHINE_CLASS_LOW, NULL));
+    TEST_ASSERT_FALSE(jce_engine_low_memory_policy(8192, 8,
+        JCE_MACHINE_CLASS_FULL, NULL));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_memory_policy_resolves_each_lifecycle);
     RUN_TEST(test_the_first_capped_frame_does_not_stall);
     RUN_TEST(test_a_frame_that_finished_early_waits_to_its_deadline);
     RUN_TEST(test_the_cap_does_not_drift_over_many_frames);

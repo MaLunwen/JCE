@@ -52,6 +52,28 @@ def target_sources(cmake_text, target):
     return cmake_text[start:i]
 
 
+
+def producer_sources(cmake_text, target, helper_text=""):
+    """Follow only the explicitly maintained offline-source helper edge."""
+    cmake_text = re.sub(r"(?m)#.*$", "", cmake_text)
+    direct = target_sources(cmake_text, target)
+    if direct is None:
+        return None
+    include = 'include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEHostAssetSources.cmake")'
+    call = re.search(r"\bjce_host_asset_sources\s*\(\s*"+re.escape(target)+r"\s*\)", cmake_text)
+    if include not in cmake_text or not call:
+        return direct
+    helper_text = re.sub(r"(?m)#.*$", "", helper_text)
+    function = re.search(r"function\s*\(\s*jce_host_asset_sources\s+target\s*\)(.*?)endfunction\s*\(",
+                         helper_text, re.S)
+    if not function:
+        return direct
+    # Adapt the existing balanced command reader; unrelated helper text cannot
+    # admit a codec whose target_sources command has lost the actual source.
+    body = function.group(1).replace('target_sources(${target}', 'add_executable('+target)
+    shared = target_sources(body, target)
+    return direct+(shared or "")
+
 def main() -> int:
     cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8", errors="replace")
     problems = []
@@ -60,7 +82,9 @@ def main() -> int:
         if not (ROOT / codec).exists():
             problems.append(f"{codec}: file is gone, but the rule still names it")
             continue
-        block = target_sources(cmake, target)
+        block = producer_sources(cmake, target,
+            (ROOT / "cmake/JCEHostAssetSources.cmake").read_text(encoding="utf-8")
+            if (ROOT / "cmake/JCEHostAssetSources.cmake").exists() else "")
         if block is None:
             problems.append(f"add_executable({target} ...) not found in CMakeLists.txt")
             continue

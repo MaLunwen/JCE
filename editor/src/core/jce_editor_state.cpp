@@ -1,3 +1,6 @@
+#include "jce_editor_alloc.h"
+#include "jce_editor_operation_metrics.h"
+#include <jce/middleware/scene/jce_scene_stress.h>
 /*
  * jce_editor_state.cpp  Central editor state — core definitions.
  *
@@ -27,6 +30,8 @@
 #include <jce/renderer/jce_lowlevel.h>    /* stress: runtime albedo textures */
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
@@ -810,6 +815,7 @@ void jce_editor_state_shutdown(void)
 
 void jce_state_select_entity(uint32_t id, bool add_to_selection)
 {
+    JceEditorOperationScope operation_scope("ed_select_entity");
     if (!add_to_selection)
         jce_state_clear_selection();
 
@@ -885,6 +891,8 @@ const uint32_t *jce_state_get_selection(int *out_count)
 }
 
 /* ── Entity Order / Existence ────────────────────────────────────── */
+
+uint64_t jce_state_entity_order_generation(void) { return g_entity_order_gen; }
 
 int jce_state_get_entity_count(void)
 {
@@ -1363,11 +1371,23 @@ int jce_state_entity_child_count(uint32_t id)
 int jce_state_entity_children(uint32_t id, uint32_t *out, int max)
 {
     if (!s.scene || id == 0 || !out || max <= 0) return 0;
-    JceEntity buf[JCE_MAX_CHILDREN];
-    int cap = (max < JCE_MAX_CHILDREN) ? max : JCE_MAX_CHILDREN;
+    JceEntity local[JCE_MAX_CHILDREN];
+    int available = jce_scene_get_child_count(s.scene, jce_state_to_ecs_entity(id));
+    int cap = max < available ? max : available;
+    if (cap <= 0) return 0;
+    if ((size_t)cap > (64u * 1024u * 1024u) / sizeof(JceEntity)) {
+        LOG_ERROR("editor", "child query exceeds 64 MiB storage budget: %d", cap);
+        return 0;
+    }
+    JceEntity *buf = cap <= JCE_MAX_CHILDREN ? local :
+        (JceEntity *)ED_MALLOC((size_t)cap * sizeof(JceEntity));
+    if (!buf) {
+        LOG_ERROR("editor", "child query allocation failed: %d", cap);
+        return 0;
+    }
     int n = jce_scene_get_children(s.scene, jce_state_to_ecs_entity(id), buf, cap);
-    for (int i = 0; i < n; i++)
-        out[i] = (uint32_t)buf[i];
+    for (int i = 0; i < n; i++) out[i] = (uint32_t)buf[i];
+    if (buf != local) ED_FREE(buf);
     return n;
 }
 
@@ -1549,17 +1569,9 @@ void jce_state_delete_entity(uint32_t id)
  *   0 Draw Call (grid, unique colour)  1 Instancing (scatter cube)
  *   2 Triangle (scatter sphere)        3 Entity Count (grid + ECS spin)
  *   4 Physics (grid + dynamic rigid body). */
-extern "C" int jce_scene_stress_spin_runtime;
-extern "C" unsigned int jce_scene_stress_spin_root;
 static uint32_t s_bench_root    = 0;
 static uint32_t s_bench_spawned = 0;
 static int      s_bench_kind    = -1;
-
-static void bench_set_pos(uint32_t e, float x, float y, float z)
-{
-    JceTransform *t = jce_scene_get_transform(s.scene, jce_state_to_ecs_entity(e));
-    if (t) { t->position.x = x; t->position.y = y; t->position.z = z; }
-}
 
 extern "C" void jce_state_benchmark_clear(void)
 {
@@ -1569,8 +1581,7 @@ extern "C" void jce_state_benchmark_clear(void)
     if (s_bench_root) { jce_state_delete_entity(s_bench_root); s_bench_root = 0; }
     s_bench_spawned = 0;
     s_bench_kind    = -1;
-    jce_scene_stress_spin_runtime = 0;
-    jce_scene_stress_spin_root    = 0u;
+    jce_scene_stress_motion(s.scene, JCE_ENTITY_INVALID, false);
     /* Restore the JCE_PERF_LOG latch instead of hard-off: a plain 0 here
      * permanently silenced the log's phase line for the rest of the session
      * (the env latch never re-arms). */
@@ -1627,134 +1638,40 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
 {
     jce_state_benchmark_clear();
     if (!s.scene || count <= 0) return;
-
-    HistorySuspendScope suspend;                 /* no per-cube undo entries   */
-    const bool prev_suppress = s_suppress_add_component_log;
-    s_suppress_add_component_log = true;         /* no per-component log spam   */
-
-    s_bench_root = jce_state_create_entity("Benchmark", 0);
-    if (s_bench_root) {
-        if (kind == 1 || kind == 2) {            /* Instancing / Triangle: 1 scatter */
-            uint32_t sc = jce_state_create_entity("BenchScatter", s_bench_root);
-            bench_set_pos(sc, 0.0f, 0.0f, 0.0f);
-            JceVegetationScatterComponent vs;
-            memset(&vs, 0, sizeof vs);
-            vs.visible       = true;
-            vs.mesh_shape    = (kind == 2) ? 1u : 0u;   /* sphere : cube */
-            float side_m     = (float)sqrt((double)count) * 2.0f;
-            vs.area_x        = side_m;
-            vs.area_z        = side_m;
-            vs.density       = (float)count / (side_m * side_m);
-            vs.scale_min     = 1.0f;
-            vs.scale_max     = 1.0f;
-            vs.max_slope_deg = 90.0f;
-            vs.seed          = 1u;
-            jce_scene_set_vegetation_scatter(s.scene, jce_state_to_ecs_entity(sc), &vs);
-            s_bench_spawned  = (uint32_t)count;
-        } else {                                 /* Draw Call / Entity / Physics: grid */
-            const bool unique = (kind == 0);
-            const bool phys   = (kind == 4);
-            /* Layout. The default packs count entities into a side^3 cube at
-             * spacing 1.5, which for 200k is an 87x87x87 block at the origin --
-             * smaller than the NEAR shadow cascade (radius ~60). Every cascade
-             * then contains every caster, no per-cascade culling can fire, and
-             * any shadow measurement taken on it is a measurement of that
-             * layout rather than of the engine.
-             *
-             * JCE_BENCH_SPREAD=<world units> lays the same count out on an X/Z
-             * ground plane across that extent instead, with a small deterministic
-             * height variation -- the shape real content has, and the one where
-             * cascade culling means anything. 200k over 4000 units puts ~448 per
-             * axis at ~8.9 unit spacing. */
-            float spread = 0.0f;
-            if (const char *sp_env = getenv("JCE_BENCH_SPREAD"))
-                if (sp_env[0]) spread = (float)atof(sp_env);
-            if (spread < 0.0f) spread = 0.0f;
-
-            int sx, sy, sz;
-            float spx, spy, spz, ox, oy, oz;
-            if (spread > 0.0f) {
-                sx = 1;
-                while ((long)sx * sx < count) sx++;
-                sy = 1; sz = sx;
-                spx = spz = spread / (float)(sx > 1 ? sx - 1 : 1);
-                spy = 0.0f;
-                ox = oz = -0.5f * spread;
-                oy = 0.0f;
-            } else {
-                int side = 1;
-                while ((long)side * side * side < count) side++;
-                const float spacing = phys ? 1.6f : 1.5f;
-                sx = sy = sz = side;
-                spx = spy = spz = spacing;
-                ox = oy = oz = -0.5f * (float)(side - 1) * spacing;
-            }
-            int spawned = 0;
-            for (int x = 0; x < sx && spawned < count; ++x)
-            for (int y = 0; y < sy && spawned < count; ++y)
-            for (int z = 0; z < sz && spawned < count; ++z) {
-                uint32_t c = jce_state_create_entity("b", s_bench_root);
-                jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
-                JceMeshRenderer *mm = jce_scene_get_mesh_renderer(s.scene, jce_state_to_ecs_entity(c));
-                if (mm && unique) {
-                    mm->base_color[0] = 0.15f + 0.7f * (float)((spawned * 13) % 101) / 101.0f;
-                    mm->base_color[1] = 0.15f + 0.7f * (float)((spawned * 37) % 103) / 103.0f;
-                    mm->base_color[2] = 0.15f + 0.7f * (float)((spawned * 71) % 107) / 107.0f;
-                    mm->base_color[3] = 1.0f;
-                    /* Vary roughness+metallic, not just base_color: base_color rides
-                     * the per-instance tint (i_data4) so the instancers merge it away
-                     * (a "unique colour" grid actually collapses to one instanced
-                     * batch).  roughness/metallic fold into the material KEY instead,
-                     * giving each cube a genuinely distinct material the instancers
-                     * cannot merge — so the "Draw Call" workload lives up to its name:
-                     * N unbatchable solo submits = the true CPU draw-call submission
-                     * floor, the axis Unity/UE draw-call benchmarks actually measure
-                     * (a colour-only grid measures instanced throughput instead). */
-                    mm->roughness = 0.05f + 0.9f * (float)((spawned * 53) % 991) / 991.0f;
-                    mm->metallic  = (float)((spawned * 29) % 251) / 251.0f;
-                }
-                if (phys) {
-                    jce_state_add_component(c, JCE_COMP_FLAG_RIGIDBODY);
-                    jce_state_add_component(c, JCE_COMP_FLAG_BOX_COLLIDER);
-                    if (JceRigidBodyComponent *rb = jce_scene_get_rigidbody(s.scene, jce_state_to_ecs_entity(c))) {
-                        rb->body_type = 1; rb->mass = 1.0f;
-                    }
-                    if (JceBoxColliderComponent *bc = jce_scene_get_box_collider(s.scene, jce_state_to_ecs_entity(c))) {
-                        bc->size[0] = bc->size[1] = bc->size[2] = 1.0f;
-                    }
-                }
-                /* Spread mode varies height deterministically so the ground
-                 * plane is not perfectly flat (a flat sheet casts a degenerate
-                 * shadow volume and would flatter the cascade cull). */
-                const float py = (spread > 0.0f)
-                    ? (float)((spawned * 17) % 23) * 0.35f
-                    : oy + (float)y * spy;
-                bench_set_pos(c, ox + (float)x * spx, py, oz + (float)z * spz);
-                ++spawned;
-            }
-            s_bench_spawned = (uint32_t)spawned;
-        }
+    HistorySuspendScope suspend;
+    JceSceneStressDesc desc = {};
+    desc.kind = (JceSceneStressKind)kind;
+    desc.count = (uint32_t)count;
+    if (const char *v = std::getenv("JCE_BENCH_SPREAD"))
+        desc.spread = (float)std::atof(v);
+    JceSceneStressResult result = {};
+    if (jce_scene_stress_spawn(s.scene, &desc, &result)) {
+        s_bench_root = (uint32_t)result.root;
+        s_bench_spawned = result.spawned;
+        rebuild_entity_order_from_ecs();
+        if (kind == JCE_SCENE_STRESS_ENTITY)
+            jce_scene_stress_motion(s.scene, result.root, true);
     }
-
-    s_suppress_add_component_log = prev_suppress;
     s_bench_kind = kind;
-    if (kind == 3) {
-        jce_scene_stress_spin_runtime = 1;   /* Entity Count = per-frame spin */
-        jce_scene_stress_spin_root    = s_bench_root;  /* move ONLY the benchmark's
-                                                        * own entities, not the
-                                                        * real authored scene */
-    }
-    jce_perf_phase_set_enabled(1);   /* capture CPU phases for the live readout */
+    LOG_INFO(LOG_TAG, "benchmark-spawn: kind=%d requested=%d spawned=%u",
+             kind, count, (unsigned)s_bench_spawned);
+    jce_perf_phase_set_enabled(1);
 }
 
 void jce_state_rename_entity(uint32_t id, const char *name)
 {
-    HistoryEditScope edit_scope;
+    JceEditorOperationScope operation_scope("ed_rename_entity");
 
     if (!s.scene || id == 0) return;
     JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, jce_state_to_ecs_entity(id));
     if (!m) return;
+    if (!history_entity_edit_compatible(id)) {
+        LOG_ERROR(LOG_TAG, "rename refused inside a different entity-scoped transaction");
+        return;
+    }
+    HistoryEditScope edit_scope(id);
     snprintf(m->name, sizeof(m->name), "%s", name ? name : "");
+    if (s.focused == id) jce_editor_inspector_request_sync();
 }
 
 /* ── JCE_STRESS_MOVERS=N harness (DOTS-floor L2 soak) ─────────────────
@@ -1866,15 +1783,21 @@ void jce_state_set_entity_layer(uint32_t id, int layer)
 
 void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 {
-    HistoryEditScope edit_scope;
-
-    if (!s.scene || id == 0 || id == new_parent) return;
-    if (!jce_state_entity_exists(id)) return;
-    jce_scene_reparent(s.scene, jce_state_to_ecs_entity(id),
-                       new_parent != 0 ? jce_state_to_ecs_entity(new_parent)
-                                       : JCE_ENTITY_INVALID,
-                       true);
-    jce_roots_note_reparented(id);
+    JceEditorOperationScope operation_scope("ed_reparent_entity");
+    if (!s.scene || id == 0 || id == new_parent || !jce_state_entity_exists(id)) return;
+    if (new_parent && !jce_state_entity_exists(new_parent)) return;
+    if (!history_entity_edit_compatible(id)) {
+        LOG_ERROR(LOG_TAG, "reparent refused across an incompatible entity edit scope");
+        return;
+    }
+    HistoryEditScope edit_scope(id); // Existing outer batch still owns its full-scene record.
+    if (!edit_scope.active && s_history_suspend_depth <= 0 && s.play_state == JCE_PLAY_STOPPED) {
+        LOG_ERROR(LOG_TAG, "reparent refused because history capture failed");
+        return;
+    }
+    if (jce_scene_reparent(s.scene, jce_state_to_ecs_entity(id),
+                          new_parent ? jce_state_to_ecs_entity(new_parent) : JCE_ENTITY_INVALID, true))
+        jce_roots_note_reparented(id);
 }
 
 void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,

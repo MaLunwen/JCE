@@ -9,7 +9,10 @@
 #include <jce/renderer/jce_camera.h>
 
 #include <math.h>
+#include <float.h>
 #include <string.h>
+#include <stdlib.h>
+#include <jce/os/core/jce_log.h>
 
 #include "unity.h"
 
@@ -191,15 +194,154 @@ static void test_null_getters_return_defaults(void)
     TEST_ASSERT_FLOAT_WITHIN(EPS, -1.0f, f.z);
 }
 
+static void assert_direction(jce_vec3 expected, jce_vec3 actual)
+{
+    TEST_ASSERT_FLOAT_WITHIN(1.0e-6f, expected.x, actual.x);
+    TEST_ASSERT_FLOAT_WITHIN(1.0e-6f, expected.y, actual.y);
+    TEST_ASSERT_FLOAT_WITHIN(1.0e-6f, expected.z, actual.z);
+}
+
+static void test_exact_pose_preserves_poles_near_poles_and_roll(void)
+{
+    JceCameraDesc desc = default_persp_desc();
+    JceCamera *camera = jce_camera_create(&desc);
+    const jce_vec3 forwards[] = {{0, -1, 0}, {0, 1, 0},
+        {.0001f, -1, .0002f}, {.3f, .4f, -.5f}, {0, 0, -1}};
+    const jce_vec3 ups[] = {{0, 0, -1}, {1, 0, 0},
+        {0, 0, -1}, {1, 2, 1}, {1, 0, 0}};
+    jce_vec3 position = jce_v3(0, 30, 0);
+    for (unsigned i = 0; i < sizeof forwards / sizeof forwards[0]; ++i) {
+        jce_vec3 forward = jce_v3_normalize(forwards[i]);
+        jce_vec3 up = jce_v3_normalize(jce_v3_sub(ups[i],
+            jce_v3_scale(forward, jce_v3_dot(ups[i], forward))));
+        TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, forwards[i], ups[i]));
+        assert_direction(forward, jce_camera_get_forward(camera));
+        assert_direction(up, jce_camera_get_up(camera));
+        assert_direction(jce_v3_normalize(jce_v3_cross(forward, up)),
+                         jce_camera_get_right(camera));
+        jce_mat4 view = jce_camera_view(camera);
+        jce_vec3 ahead = jce_v3_add(position, jce_v3_scale(forward, 10));
+        jce_vec4 projected = jce_m4_mul_v4(&view,
+            jce_v4(ahead.x, ahead.y, ahead.z, 1));
+        TEST_ASSERT_FLOAT_WITHIN(1.0e-4f, 0, projected.x);
+        TEST_ASSERT_FLOAT_WITHIN(1.0e-4f, 0, projected.y);
+        TEST_ASSERT_FLOAT_WITHIN(1.0e-4f, -10, projected.z);
+        jce_camera_move_forward(camera, 2);
+        assert_direction(jce_v3_add(position, jce_v3_scale(forward, 2)),
+                         jce_camera_get_position(camera));
+    }
+    /* Interactive FPS rotation must still clamp an authored pole. */
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, jce_v3(0, -1, 0), jce_v3(0, 0, -1)));
+    jce_camera_rotate(camera, 0, -1);
+    TEST_ASSERT_FLOAT_WITHIN(EPS, -sinf(89 * JCE_DEG2RAD),
+                             jce_camera_get_forward(camera).y);
+    jce_camera_destroy(camera);
+}
+
+static void test_invalid_pose_does_not_mutate_exact_pose(void)
+{
+    JceCameraDesc desc = default_persp_desc();
+    JceCamera *camera = jce_camera_create(&desc);
+    jce_vec3 position = jce_v3(1, 2, 3);
+    jce_vec3 forward = jce_v3(0, -1, 0), up = jce_v3(0, 0, -1);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, forward, up));
+    TEST_ASSERT_FALSE(jce_camera_set_pose(camera, jce_v3(9, 9, 9), forward, forward));
+    TEST_ASSERT_FALSE(jce_camera_set_pose(camera, position, jce_v3(0, 0, 0), up));
+    TEST_ASSERT_FALSE(jce_camera_set_pose(camera, position, forward, jce_v3(FLT_MAX, 0, 0)));
+    TEST_ASSERT_FALSE(jce_camera_set_pose(camera, jce_v3(NAN, 0, 0), forward, up));
+    assert_direction(position, jce_camera_get_position(camera));
+    assert_direction(forward, jce_camera_get_forward(camera));
+    assert_direction(up, jce_camera_get_up(camera));
+    jce_camera_destroy(camera);
+}
+
+static void assert_finite_camera_basis(JceCamera *camera)
+{
+    jce_vec3 forward = jce_camera_get_forward(camera);
+    jce_vec3 up = jce_camera_get_up(camera);
+    jce_vec3 right = jce_camera_get_right(camera);
+    TEST_ASSERT_FLOAT_WITHIN(EPS, 1, jce_v3_len(forward));
+    TEST_ASSERT_FLOAT_WITHIN(EPS, 1, jce_v3_len(up));
+    TEST_ASSERT_FLOAT_WITHIN(EPS, 1, jce_v3_len(right));
+    TEST_ASSERT_FLOAT_WITHIN(EPS, 0, jce_v3_dot(forward, up));
+    jce_mat4 view = jce_camera_view(camera);
+    for (int row = 0; row < 4; ++row)
+        for (int col = 0; col < 4; ++col)
+            TEST_ASSERT_TRUE(isfinite(view.raw[row][col]));
+}
+
+static void test_exact_pole_transitions_to_safe_fps_basis(void)
+{
+    JceCameraDesc desc = default_persp_desc();
+    JceCamera *camera = jce_camera_create(&desc);
+    jce_vec3 position = jce_v3(0, 30, 0);
+    jce_vec3 forward = jce_v3(0, -1, 0), up = jce_v3(0, 0, -1);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, forward, up));
+    jce_camera_rotate(camera, 0, 0);
+    assert_direction(forward, jce_camera_get_forward(camera));
+    assert_direction(up, jce_camera_get_up(camera));
+    jce_camera_rotate(camera, 0, JCE_PI * .5f);
+    assert_direction(jce_v3(0, 0, -1), jce_camera_get_forward(camera));
+    assert_finite_camera_basis(camera);
+    /* Both signs of pole zeros must preserve a real prior heading. */
+    jce_camera_rotate(camera, JCE_PI * .5f, 0);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position,
+        jce_v3(-0.0f, -1, +0.0f), up));
+    jce_camera_rotate(camera, 0, JCE_PI * .5f);
+    assert_direction(jce_v3(1, 0, 0), jce_camera_get_forward(camera));
+    assert_finite_camera_basis(camera);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, forward, up));
+    jce_camera_look_at(camera, jce_v3(0, 30, -10));
+    assert_finite_camera_basis(camera);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(camera, position, forward, up));
+    jce_camera_third_person_follow(camera, jce_v3(0, 0, 0));
+    assert_finite_camera_basis(camera);
+    jce_camera_destroy(camera);
+}
+
+static unsigned projection_log_count;
+static unsigned projection_nonwarn_count;
+static void projection_log_sink(const JceLogRecord *record, void *user)
+{
+    (void)user;
+    if (strncmp(record->message, "camera proj:", 12) != 0) return;
+    ++projection_log_count;
+    if (record->level != JCE_LOG_LEVEL_WARN) ++projection_nonwarn_count;
+}
+static void test_projection_diagnostics_are_opt_in(void)
+{
+    JceCameraDesc desc = default_persp_desc();
+    JceCamera *camera = jce_camera_create(&desc);
+    TEST_ASSERT_NOT_NULL(camera);
+    const char *value = getenv("JCE_LOG_CAMERA");
+    const bool enabled = value && value[0] && value[0] != '0';
+    projection_log_count = projection_nonwarn_count = 0;
+    jce_log_set_sink(projection_log_sink, NULL);
+    for (int i = 0; i < 10; ++i) {
+        (void)jce_camera_proj(camera, i % 2 ? 1.0f : 2.0f, false);
+        /* An unchanged diagnostic remains deduplicated when enabled. */
+        (void)jce_camera_proj(camera, i % 2 ? 1.0f : 2.0f, false);
+    }
+    jce_log_flush();
+    jce_log_set_sink(NULL, NULL);
+    jce_camera_destroy(camera);
+    TEST_ASSERT_EQUAL_UINT(enabled ? 2u : 0u, projection_log_count);
+    TEST_ASSERT_EQUAL_UINT(0u, projection_nonwarn_count);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_projection_diagnostics_are_opt_in);
     RUN_TEST(test_create_null_desc_returns_null);
     RUN_TEST(test_create_destroy_persp);
     RUN_TEST(test_create_applies_defaults);
     RUN_TEST(test_initial_forward_points_at_target);
     RUN_TEST(test_setters_clamp_and_apply);
     RUN_TEST(test_rotate_clamps_pitch);
+    RUN_TEST(test_exact_pose_preserves_poles_near_poles_and_roll);
+    RUN_TEST(test_invalid_pose_does_not_mutate_exact_pose);
+    RUN_TEST(test_exact_pole_transitions_to_safe_fps_basis);
     RUN_TEST(test_move_forward_advances_along_view);
     RUN_TEST(test_look_at_reorients_camera);
     RUN_TEST(test_ortho_mode_basic);

@@ -127,23 +127,7 @@ static struct JceInput *gv_script_keyboard(bool kb)
     return in;
 }
 
-static bool game_view_has_active_vcam(void)
-{
-    JceScene *scene = jce_state_get_scene();
-    if (!scene) return false;
 
-    const int count = jce_state_get_entity_count();
-    for (int i = 0; i < count; ++i) {
-        const uint32_t id = jce_state_get_entity_id_by_index(i);
-        if (!jce_state_entity_enabled(id)) continue;
-        const JceEntity entity = jce_state_to_ecs_entity(id);
-        if (!entity || !jce_scene_has_virtual_camera(scene, entity)) continue;
-        const JceVirtualCameraComponent *vc =
-            jce_scene_get_virtual_camera(scene, entity);
-        if (vc && vc->active) return true;
-    }
-    return false;
-}
 
 enum {
     JCE_GAME_VIEW_RUN_EDITOR_SIMULATION = 0,
@@ -685,7 +669,7 @@ void jce_editor_panel_game_view_content(void)
         play_active &&
         jce_editor_play_get_player_position(&player_x, &player_y, &player_z);
     s_runtime_pointer_camera =
-        play_active && !has_player_controller && game_view_has_active_vcam();
+        play_active && !has_player_controller;
     // Playing a pointer-driven scene must not opt into the editor fly camera.
     const bool capture_allowed = !play_active || has_player_controller;
 
@@ -1170,6 +1154,8 @@ void jce_editor_panel_game_view_content(void)
     input_viewport.y = image_min.y;
     input_viewport.width = view_size.x;
     input_viewport.height = view_size.y;
+    input_viewport.render_width = (float)render_vw;
+    input_viewport.render_height = (float)render_vh;
     input_viewport.visible = true;
     input_viewport.hovered = hovered;
     input_viewport.captured =
@@ -1178,7 +1164,7 @@ void jce_editor_panel_game_view_content(void)
         (s_runtime_pointer_camera || has_player_controller)) {
         input_viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
     } else if (play_active) {
-        input_viewport.owner = JCE_EDITOR_GAME_INPUT_FREE_FLY;
+        input_viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
     } else {
         input_viewport.owner = JCE_EDITOR_GAME_INPUT_NONE;
     }

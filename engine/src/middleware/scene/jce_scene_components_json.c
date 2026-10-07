@@ -1153,11 +1153,11 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     mr.outline_color[1] = (float)j_num(c, "toonOutlineColorG", 0.0);
     mr.outline_color[2] = (float)j_num(c, "toonOutlineColorB", 0.0);
 
-    /* If a .mat.json material is referenced and no per-entity texture
-     * overrides exist, backfill texture paths from the material file.
+    /* Load referenced material programs even with per-entity albedo overrides.
+     * Only absent texture paths are backfilled from the material file.
      * This is required for Unity-exported scenes where MeshRenderer
      * carries only materialPath and the textures live inside the .mat. */
-    if (mr.material_path[0] != '\0' && mr.albedo_tex[0] == '\0') {
+    if (mr.material_path[0] != '\0') {
         char mat_full[1280] = { 0 };
         const char *try_paths[3] = { NULL, NULL, NULL };
         int n_try = 0;
@@ -1249,11 +1249,11 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 have_mat = true;
             }
             if (have_mat) {
-                if (tex_paths[0][0]) mr.albedo_tex = jce_scene_intern(s, tex_paths[0]);
-                if (tex_paths[1][0]) mr.mr_tex = jce_scene_intern(s, tex_paths[1]);
-                if (tex_paths[2][0]) mr.normal_tex = jce_scene_intern(s, tex_paths[2]);
-                if (tex_paths[3][0]) mr.ao_tex = jce_scene_intern(s, tex_paths[3]);
-                if (tex_paths[4][0]) mr.emissive_tex = jce_scene_intern(s, tex_paths[4]);
+                if (!mr.albedo_tex[0] && tex_paths[0][0]) mr.albedo_tex = jce_scene_intern(s, tex_paths[0]);
+                if (!mr.mr_tex[0] && tex_paths[1][0]) mr.mr_tex = jce_scene_intern(s, tex_paths[1]);
+                if (!mr.normal_tex[0] && tex_paths[2][0]) mr.normal_tex = jce_scene_intern(s, tex_paths[2]);
+                if (!mr.ao_tex[0] && tex_paths[3][0]) mr.ao_tex = jce_scene_intern(s, tex_paths[3]);
+                if (!mr.emissive_tex[0] && tex_paths[4][0]) mr.emissive_tex = jce_scene_intern(s, tex_paths[4]);
                 /* Forward the backfilled material's factors -- except the
                  * ones this renderer overrides.  This was an unconditional
                  * copy of all six, so tinting one instance of a shared

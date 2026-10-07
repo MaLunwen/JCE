@@ -2,7 +2,19 @@
 
 Consult AGENTS.md for compatibility targets and CMakePresets.json plus conan/profiles/ for actual build configurations. A target declaration is not evidence that a toolchain or device was tested.
 
-The one-core, 512 MiB, integrated-graphics baseline concerns core/headless capability and lightweight workloads. The editor and advanced rendered games have workload-dependent requirements.
+The LOW-END design baseline is a graphical desktop, one CPU core, 512 MiB RAM
+and 2008/2010-class integrated graphics without a discrete GPU. It covers usable
+lightweight editor and rendered runtime paths as well as core/headless services.
+PS2 is a resource-budget analogy, not a device support or equivalence claim.
+Complex scenes and advanced features have explicit workload/tier budgets; they
+must not silently redefine the baseline as headless-only. Record the actual
+high-end development machine, and report physical low-end validation separately
+from forced low settings on a modern host.
+
+Desktop/mobile/console and x86/x64/ARM/ARM64 are compatibility goals. Default
+driver languages are Java, Python, Lua, C, C++, C# and JavaScript through one
+native C ABI. Compiler, licensed console toolchains, device and package evidence
+remain separate from catalog entries. A missing backend or device is a gap.
 
 Put platform-specific code behind OS adapters and public capability queries. Keep deterministic fallback behavior when hardware acceleration, a codec, a scripting runtime or an advanced rendering feature is unavailable.
 

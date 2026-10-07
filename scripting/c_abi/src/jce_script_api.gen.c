@@ -447,6 +447,17 @@ JCE_SCRIPT_API void jce_script_api_get_pointer_delta(JceScriptApi *api,
     api->host.pointer_delta(api->host.user, out_xy);
 }
 
+/* jce_script_api_get_pointer_position -> host.pointer_position (void_out_array) */
+JCE_SCRIPT_API void jce_script_api_get_pointer_position(JceScriptApi *api,
+                                                        float out_xywh[4])
+{
+    if (!api || !api->host.pointer_position) {
+        if (out_xywh) memset(out_xywh, 0, 4 * sizeof out_xywh[0]);
+        return;
+    }
+    api->host.pointer_position(api->host.user, out_xywh);
+}
+
 /* jce_script_api_get_pointer_wheel -> host.pointer_wheel (value_return) */
 JCE_SCRIPT_API float jce_script_api_get_pointer_wheel(JceScriptApi *api)
 {
@@ -1152,5 +1163,63 @@ JCE_SCRIPT_API int jce_script_api_vcam_activate(JceScriptApi *api,
         return 0;
     }
     return api->host.vcam_activate(api->host.user, name);
+}
+
+/* jce_script_api_set_cursor -> host.cursor_set (value_return) */
+JCE_SCRIPT_API bool jce_script_api_set_cursor(JceScriptApi *api,
+                                              const char * asset_path,
+                                              int hotspot_x, int hotspot_y)
+{
+    if (!api || !api->host.cursor_set) {
+        return false;
+    }
+    return api->host.cursor_set(api->host.user, asset_path, hotspot_x, hotspot_y);
+}
+
+/* jce_script_api_request_quit -> host.request_quit (value_return) */
+JCE_SCRIPT_API bool jce_script_api_request_quit(JceScriptApi *api)
+{
+    if (!api || !api->host.request_quit) {
+        return false;
+    }
+    return api->host.request_quit(api->host.user);
+}
+
+/* jce_script_api_stat_available -> host.stat_available (value_return) */
+JCE_SCRIPT_API bool jce_script_api_stat_available(JceScriptApi *api)
+{
+    if (!api || !api->host.stat_available) {
+        return false;
+    }
+    return api->host.stat_available(api->host.user);
+}
+
+/* jce_script_api_stat_set -> host.stat_set (value_return) */
+JCE_SCRIPT_API bool jce_script_api_stat_set(JceScriptApi *api, const char * id,
+                                            double value)
+{
+    if (!api || !api->host.stat_set) {
+        return false;
+    }
+    return api->host.stat_set(api->host.user, id, value);
+}
+
+/* jce_script_api_stat_get -> host.stat_get (value_return) */
+JCE_SCRIPT_API int jce_script_api_stat_get(JceScriptApi *api, const char * id,
+                                           double fallback)
+{
+    if (!api || !api->host.stat_get) {
+        return 0;
+    }
+    return api->host.stat_get(api->host.user, id, fallback);
+}
+
+/* jce_script_api_stat_flush -> host.stat_flush (value_return) */
+JCE_SCRIPT_API bool jce_script_api_stat_flush(JceScriptApi *api)
+{
+    if (!api || !api->host.stat_flush) {
+        return false;
+    }
+    return api->host.stat_flush(api->host.user);
 }
 

@@ -105,6 +105,7 @@ typedef bool (*fn_get_position)(JceScriptApi *, JceScriptEntity, float *);
 typedef void (*fn_set_position)(JceScriptApi *, JceScriptEntity,
                                 float, float, float);
 typedef void (*fn_move_axis)(JceScriptApi *, float *);
+typedef bool (*fn_stat_flush)(JceScriptApi *);
 typedef JceScriptEntity (*fn_find_with_tag)(JceScriptApi *, const char *);
 typedef int (*fn_raycast_all)(JceScriptApi *, const float *, const float *,
                               float, uint32_t, bool, JceScriptEntity *, int);
@@ -755,25 +756,11 @@ static void test_a_short_host_is_never_read_past_its_end(void)
     void (*poison)(void) = m_poison;
     size_t trunc = offsetof(JceScriptHost, JCE_SCRIPT_API_TAIL_MEMBER);
     size_t tail_slots = 8u, i;
-    float out[3] = { 0.0f, 0.0f, 0.0f };
-
-    /* The tail entry MOVES whenever JceScriptHost is appended to, which the
-     * ABI rules explicitly permit -- so this assert is not a constant anybody
-     * chose, it is a tripwire that says which call below to re-type.  Last
-     * moved by the raycast_filtered / raycast_all append (2026-09-22): giving
-     * the script raycast the layer mask and multi-hit the overlap queries
-     * beside it already had.  Before that it was curve_eval, before that
-     * get_param_text, and before that vcam_activate.
-     *
-     * RE-TYPING THE CALL IS NOT OPTIONAL WORK.  Leaving the old call in place
-     * would keep this test GREEN and stop it testing anything: the previous
-     * tail member is no longer truncated away, so it would answer normally
-     * and the poison would sit past a boundary nothing reaches. */
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("jce_script_api_raycast_all",
+    /* Appended statistics flush is now the newest withheld callback.
+     * Pin the name so future additions cannot leave this negative test vacuous. */
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("jce_script_api_stat_flush",
         JCE_SCRIPT_API_TAIL_ENTRY,
-        "the manifest's tail entry moved; this test still calls "
-        "raycast_all, so update the call below to the new entry's "
-        "prototype");
+        "the manifest tail moved; re-type this negative call to its new prototype");
     TEST_ASSERT_TRUE_MESSAGE(sizeof(JceScriptHost) > trunc,
         "the truncation point withholds nothing — this test has gone vacuous");
 
@@ -787,42 +774,11 @@ static void test_a_short_host_is_never_read_past_its_end(void)
     api = open_with((const JceScriptHost *)shorter, trunc);
     TEST_ASSERT_NOT_NULL(api);
 
-    (void)out;
-    /* The short host stops BEFORE this member, so the forwarder must take its
-     * absent branch.  THREE things are asserted: false back, the out slot left
-     * in a DEFINED state, and the poison never entered.
-     *
-     * DEFINED, not preserved -- and the distinction is worth the sentence,
-     * because the two contracts on either side of this boundary differ on
-     * purpose.  The HOST callback leaves *out_value untouched on false, so a
-     * caller's default survives; the generated forwarder MEMSETS every out
-     * slot to zero on its absent branch, uniformly, for every fallible_out in
-     * the manifest.  Across a C ABI that is the better rule: leaving a
-     * foreign runtime's buffer unwritten is worse than writing a defined
-     * value, and the zero is unobservable through all seven bindings, which
-     * discard it whenever the call returns false.
-     *
-     * The sentinel starts at a value neither side can produce, so "the
-     * forwarder wrote zero" and "the forwarder wrote nothing" are still two
-     * different readings here. */
-    /* The tail is now an entity_table, so the shape of the answer changes
-     * with it: a COUNT rather than a bool, and an entity array rather than a
-     * double.  The sentinel moves into that array for the same reason it
-     * existed before -- "the forwarder wrote zero" and "the forwarder wrote
-     * nothing" must stay two different readings. */
-    const float t_origin[3] = { 0.0f, 0.0f, 0.0f };
-    const float t_dir[3]    = { 0.0f, 0.0f, 1.0f };
-    JceScriptEntity tail_hits[4];
-    for (i = 0; i < 4u; ++i) tail_hits[i] = (JceScriptEntity)0xABCDEF01u;
-
-    TEST_ASSERT_EQUAL_INT_MESSAGE(0,
-        ((fn_raycast_all)must_sym(JCE_SCRIPT_API_TAIL_ENTRY))(
-            api, t_origin, t_dir, 100.0f, 0u, false, tail_hits, 4),
-        "a member the caller's host does not carry answered with something");
-    TEST_ASSERT_EQUAL_UINT64_MESSAGE(0u, (uint64_t)tail_hits[0],
-        "the absent branch left the caller's out slot unwritten; every other "
-        "forwarder zeroes its out slots, and a C ABI that hands back an "
-        "untouched buffer has handed back whatever was there");
+    /* The absent bool-valued tail must return false without consulting the
+     * poison immediately after the caller's sized host object. */
+    TEST_ASSERT_FALSE_MESSAGE(
+        ((fn_stat_flush)must_sym(JCE_SCRIPT_API_TAIL_ENTRY))(api),
+        "the absent statistics flush did not return its declared false default");
     TEST_ASSERT_FALSE_MESSAGE(g_poison_called,
         "the library read past the caller's shorter host: the tail entry "
         "called what followed the caller's object");

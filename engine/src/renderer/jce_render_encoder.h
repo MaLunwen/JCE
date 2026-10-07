@@ -11,6 +11,7 @@
 #define JCE_RENDER_ENCODER_H
 
 #include <bgfx/c99/bgfx.h>
+#include "jce_shader_deferred.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -102,6 +103,9 @@ static inline void jce_enc_set_instance_data_from_dynamic_vertex_buffer(
 static inline void jce_enc_submit(bgfx_view_id_t id, bgfx_program_handle_t program,
                                   uint32_t depth, uint8_t flags)
 {
+    program.idx = jce_shader_deferred_resolve(program.idx);
+    if (program.idx == UINT16_MAX) return;
+
     bgfx_encoder_t *e = jce_tls_encoder;
     if (e) bgfx_encoder_submit(e, id, program, depth, flags);
     else   bgfx_submit(id, program, depth, flags);

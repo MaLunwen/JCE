@@ -1,4 +1,5 @@
 # Symbols the editor legitimately never names, one per line, with a REASON
+jce_anim_clip_destroy # Releases caller-owned standalone JSON clips; editor model clips are borrowed and released by the model/asset owner, not by the inspector.
 # after '#' on the SAME line.  A bare symbol with no reason is NOT an
 # exemption -- check_editor_consumption.py ignores it, so "I'll write the
 # reason later" fails closed instead of silently passing.
@@ -33,6 +34,9 @@
 # calls it either.  That is built-but-unwired debt, and exempting it would hide
 # exactly the thing this gate exists to show.
 # ---------------------------------------------------------------------------
+
+# --- api_core.h: the engine owns the per-frame profiler snapshot ------------
+jce_perf_phase_frame_tick                 # engine frame loop rotates the completed phase snapshot; a second editor call erased benchmark KPI samples
 
 # --- api_script.h: the RUNTIME owns the script VM lifecycle -----------------
 # editor/src/panels/jce_panel_inspector_gameplay.cpp:883 draw_comp_script()
@@ -407,3 +411,10 @@ jce_audio_is_playing # resident JceSound transport; file viewer owns its stream 
 jce_audio_play # resident JceSound playback; file viewer uses jce_audio_play_stream
 jce_audio_seek # resident JceSound seek; file viewer seeks its file stream and flushes voice
 jce_audio_unload # resident JceSound lifetime; streaming viewer closes JceAudioFile/JceVideo and its stream voice
+jce_gpu_scene_set_indirect_enabled # shared scene renderer consumes model policy for editor and Player; editor configures r.gpu_driven.indirect, never owns the lower-layer helper
+jce_gpu_scene_snapshot_survivors # lower-layer counter export consumed by the shared scene-renderer wrapper; editor does not own GPUScene internals
+jce_scene_renderer_snapshot_gpu_survivors # optional asynchronous profiler/capture diagnostics; regular editor statistics remain nonblocking and require no readback
+
+jce_cursor_create_rgba8 # Public OS pixel constructor consumed by native scene modules in Editor Play and packaged games; editor chrome uses system cursor shapes.
+jce_cursor_reset # Native scene-module lifecycle restores the default cursor on Play stop; the editor does not own a game cursor.
+jce_input_primary_pointer # Standalone logical-window pointer for Canvas/RmlUI; Editor Game View owns ImGui screen-to-panel-to-render mapping and must not replace it with window-local coordinates.

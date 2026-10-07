@@ -24,6 +24,10 @@
 #ifndef CSM_SHADOW_SH
 #define CSM_SHADOW_SH
 
+/* Optional provider supplies toShadowDepth, csm_sample_depth,
+ * csm_clip_for_cascade, csm_bias_scale_for_cascade, shadow_hash and
+ * sample_csm_shadow, plus the existing CSM uniforms and samplers. */
+#ifndef JCE_CSM_HELPERS_PROVIDED
 /* Stage 5 under CSM: the DYNAMIC-caster atlas (see sr_bind_frame_shadow_state).
  * The single-light shadow map is dead whenever cascades are active, which is
  * what frees the stage -- this engine has all sixteen spoken for otherwise.
@@ -178,7 +182,7 @@ float sample_csm_shadow(int cascade,
     // the same number mean 89 mm in cascade 0 and 8969 mm in cascade 3 of the
     // same frame, and made it move when the project changed Shadow Distance.
     float slope = sin_theta / max(ndotl, 0.1);
-    float depth_bias = jce_shadow_depth_bias(cascade, 1.6, slope, 4.0);
+    float depth_bias = jce_shadow_depth_bias(cascade, slope);
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
 
@@ -239,6 +243,8 @@ float sample_csm_shadow(int cascade,
     }
     return csm_dyn_min(sum / 25.0, cascade, csm_uv, csm_z, depth_bias);
 }
+
+#endif // JCE_CSM_HELPERS_PROVIDED
 
 /*
  * The complete directional-shadow multiplier for a world-space fragment.

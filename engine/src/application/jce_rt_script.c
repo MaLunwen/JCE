@@ -9,7 +9,7 @@
  * file-static here.  No behaviour change.
  */
 
-#include "jce_rt_internal.h"
+#include "jce_rt_script_services.h"
 
 #include <jce/middleware/scene/jce_vcam_system.h>
 
@@ -18,6 +18,8 @@
 #include <jce/middleware/world/jce_environment.h>  /* world-domain script API */
 #include <jce/os/platform/jce_input.h>       /* jce.is_key_down */
 #include <jce/middleware/script/jce_script_vm.h>  /* per-script language selection */
+#include <jce/resource/jce_image_decode.h>
+#include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>        /* the offline script catalog */
 
 /* JceScriptHost::log, and the tag says "[script]" rather than "[lua]".
@@ -262,6 +264,65 @@ static void *rt_script_read_file(void *user, const char *path, uint64_t *out_siz
 		return rt_read_asset_with_fallback_capped((JceRuntime *)user, path,
 		                                           cap, out_size);
 	return rt_read_asset_with_fallback((JceRuntime *)user, path, out_size);
+}
+
+JCE_API bool JCE_CALL jce_runtime_apply_cursor(JceRuntime *rt)
+{
+    if (!rt || rt->script_cursor_active <= 0) return false;
+    jce_cursor_set(rt->script_cursors[rt->script_cursor_active - 1]);
+    return true;
+}
+
+void rt_script_clear_cursors(JceRuntime *rt)
+{
+    if (!rt) return;
+    if (rt->script_cursor_active) jce_cursor_reset();
+    for (int i = 0; i < rt->script_cursor_count; ++i)
+        jce_cursor_destroy(rt->script_cursors[i]);
+    memset(rt->script_cursors, 0, sizeof rt->script_cursors);
+    rt->script_cursor_count = rt->script_cursor_active = 0;
+}
+
+static bool rt_script_cursor_set(void *user, const char *path, int hot_x, int hot_y)
+{
+    JceRuntime *rt = (JceRuntime *)user;
+    if (!rt) return false;
+    if (!path || !path[0]) {
+        rt->script_cursor_active = 0;
+        jce_cursor_reset();
+        return true;
+    }
+    if (strlen(path) >= sizeof rt->script_cursor_paths[0] || hot_x < 0 || hot_y < 0)
+        return false;
+    for (int i = 0; i < rt->script_cursor_count; ++i) {
+        if (!strcmp(path, rt->script_cursor_paths[i]) &&
+            hot_x == rt->script_cursor_hotspots[i][0] && hot_y == rt->script_cursor_hotspots[i][1]) {
+            rt->script_cursor_active = i + 1;
+            return jce_runtime_apply_cursor(rt);
+        }
+    }
+    if (rt->script_cursor_count == 8) return false;
+    uint64_t size = 1024 * 1024; /* Bound encoded asset reads as well as decoded dimensions. */
+    void *encoded = rt_script_read_file(rt, path, &size);
+    if (!encoded) return false;
+    JceImage image = {0};
+    bool decoded = jce_texture_decode_cooked_rgba8(encoded, (size_t)size,
+        &image.pixels, &image.width, &image.height);
+    if (!decoded) decoded = jce_image_decode(encoded, (size_t)size, &image);
+    jce_fs_buffer_free(encoded);
+    JceCursor *cursor = NULL;
+    if (decoded && image.width <= 64 && image.height <= 64)
+        cursor = jce_cursor_create_rgba8(image.pixels, (int)image.width,
+            (int)image.height, hot_x, hot_y);
+    jce_image_free(&image);
+    if (!cursor) return false;
+    int index = rt->script_cursor_count++;
+    rt->script_cursors[index] = cursor;
+    memcpy(rt->script_cursor_paths[index], path, strlen(path) + 1);
+    rt->script_cursor_hotspots[index][0] = hot_x;
+    rt->script_cursor_hotspots[index][1] = hot_y;
+    rt->script_cursor_active = index + 1;
+    return jce_runtime_apply_cursor(rt);
 }
 
 /* Forward decls: time-control public API used by the script bridge below. */
@@ -765,6 +826,14 @@ static void rt_script_pointer_delta(void *user, float out_xy[2])
 	if (!out_xy) return;
 	out_xy[0] = rt ? rt->input.pointer_dx : 0.0f;
 	out_xy[1] = rt ? rt->input.pointer_dy : 0.0f;
+}
+
+static void rt_script_pointer_position(void *user, float out_xywh[4])
+{
+	JceRuntime *rt = (JceRuntime *)user;
+	if (!out_xywh) return;
+	for (int i = 0; i < 4; ++i)
+		out_xywh[i] = rt ? rt->pointer_xywh[i] : 0.0f;
 }
 
 static float rt_script_pointer_wheel(void *user)
@@ -2313,12 +2382,9 @@ static bool rt_script_curve_eval(void *user, const char *path,
 	JceCurve   *c;
 	bool        owned = false;
 	int         ch;
-
 	if (!rt || !out_value || !path || !path[0]) return false;
-
 	c = rt_curve_fetch(rt, path, &owned);
 	if (!c) return false;
-
 	ch = (channel && channel[0])
 	         ? jce_curve_channel_index(c, channel)
 	         : (jce_curve_channel_count(c) > 0 ? 0 : -1);
@@ -2326,12 +2392,10 @@ static bool rt_script_curve_eval(void *user, const char *path,
 		if (owned) jce_curve_destroy(c);
 		return false;
 	}
-
 	*out_value = (double)jce_curve_eval(c, ch, (float)t);
 	if (owned) jce_curve_destroy(c);
 	return true;
 }
-
 /* Build the JceScriptHost callback table from this module's bindings and
  * create the runtime's script VM (+ editor hot-reload watcher).  Moved
  * verbatim from jce_runtime_create so every rt_script_* callback can stay
@@ -2340,6 +2404,11 @@ void rt_script_install_vm(JceRuntime *rt)
 {
 	JceScriptHost host = {0};
 	host.user           = rt;
+	host.request_quit   = rt_script_service_request_quit;
+	host.stat_available = rt_script_service_stat_available;
+	host.stat_set       = rt_script_service_stat_set;
+	host.stat_get       = rt_script_service_stat_get;
+	host.stat_flush     = rt_script_service_stat_flush;
 	host.log            = rt_script_log;
 	host.get_script_param = rt_script_get_script_param;
 	host.get_script_param_text = rt_script_get_script_param_text;
@@ -2399,6 +2468,8 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.pointer_delta = rt_script_pointer_delta;
 	host.pointer_wheel = rt_script_pointer_wheel;
 	host.pointer_button = rt_script_pointer_button;
+	host.pointer_position = rt_script_pointer_position;
+	host.cursor_set = rt_script_cursor_set;
 	host.touch_count = rt_script_touch_count;
 	host.touch_get = rt_script_touch_get;
 	host.loc_translate  = rt_script_loc_translate;

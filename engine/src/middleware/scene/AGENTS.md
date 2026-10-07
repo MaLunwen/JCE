@@ -1,5 +1,34 @@
 # engine/src/middleware/scene — Scene / ECS (L4)
 
+The pull-based intermediate-target inspector includes SSR only while the
+current-frame reflection result is active and its handle is valid. It uses
+the existing source texture dimensions and adds no per-frame registry.
+RGBA8 intermediate targets need a matching typed readback or public sampling
+into a compatible capture target; legacy float capture is not a conversion.
+
+`jce_sr_depth_history.c` shares retained-depth identity with hardware queries.
+Hi-Z uses the depth producer's matrix independently of TAA velocity. Camera,
+target, scene, component, transform and asset changes reject prior depth for
+that render; animated/morphed scene palettes conservatively disable reuse.
+The same identity guards static depth-prepass caching and cross-viewport reuse.
+The retained prepass also keys whether normal/albedo output was requested:
+depth-only instancing leaves those attachments at their clear values. Enabling
+reflection/GI after a depth-only frame must rebuild the MRT output, even with
+unchanged camera, scene, dimensions and velocity requirements. Primitive
+G-buffer submissions bind both roughness and base colour per draw.
+Imported normal/albedo prepasses reuse the model velocity traversal with normal
+fragment programs and the current camera matrix. The existing skinned vertex
+program supplies the skin deformation; depth-only shadow shortcuts are retained
+only when no normal consumer is requested. Missing skin shaders retain the
+conservative depth fallback and must not be reported as normal fidelity.
+
+Animation instance records use `jce_sr_anim_storage.c/h`: a growing dense index
+over separately owned payloads, keyed by full entity generations. Growth keeps
+payload pointers valid for deferred parallel sampling. `jce_sr_anim_lifecycle.c`
+retires deleted/removed animators and scene swaps, with one complete teardown
+before borrowed model skeletons are freed. The sampling request buffer grows
+before jobs are dispatched and is reused; no fixed 256-character limit remains.
+
 > The ECS heart: components, prefabs, terrain, virtual cameras, sequencer, LOD, space partition.
 
 ## Identity
@@ -32,6 +61,83 @@
 | `jce_sequencer.h` | `jce_sequencer.c` | Cinematic / cutscene track sequencer |
 | `jce_virtual_camera.h` / `jce_vcam_system.h` | `jce_virtual_camera.c` / `jce_vcam_system.c` | Virtual-camera value types compatibility TU + ECS-driven Cinemachine-style resolver |
 | `jce_ui_canvas.h` | `jce_ui_canvas.c` | **P1-ecs-ui-canvas** ECS-UI (Unity-UGUI) renderer: layout (RectTransform anchors/pivot/sizeDelta + LayoutGroup H/V/grid) + render (UIImage simple/9-slice + UIText via FreeType/HarfBuzz atlas) + graphic raycaster (UIButton hover/press/click) for Screen-Space Overlay canvases. Draws transient quads into a caller-given bgfx view/FBO. NOT RmlUI (separate shipping HTML/CSS path). RectTransform is embedded in UIImage/UIText (no free component-flag bit). |
+
+## Shared stress fixtures
+
+`jce_sr_gpu_diagnostics.c` exposes the shared color model batch's optional
+survivor snapshot through the public renderer wrapper. Shadow/foliage/meshlet
+counters remain separate. `jce_sr_batch.c` resolves the static-member culling
+diagnostic policy once per color view; no per-instance environment search.
+The draw pass clears old color-frustum validity before resolving a new view.
+
+`r.gpu_driven.indirect` selects the existing model GPU batch's indirect or
+fixed-count compute submission via the public GPUScene configuration API.
+It defaults on and remains independent of hardware/program support. The
+renderer reads it before each color batch begins; shadows and foliage retain
+their own submission paths. Consumers configure the public console authority,
+without benchmark branches in engine code.
+
+`jce_sr_occlusion_history.h` reuses the entity metadata identity and adds
+transform/content generations, camera matrices, mask and target identity.
+Hardware query history resets through the existing pooled culler before a
+changed arrangement is drawn. Unchanged scenes retain query results. This is
+conservative: continuously notified movement prevents cross-frame query
+rejection, trading savings for immediately correct reveal/camera behavior.
+The SDK consumer must not reset the culler itself to conceal a history defect.
+`jce_sr_occlusion.c` owns shared portal/query preparation, camera/target binding
+and history invalidation. It reads the scene renderer's resolved camera mask;
+only the frame authority resolves the authored mask. This extraction keeps the
+legacy draw file shrinking without increasing its existing size allowance.
+
+Imported model color submits reuse the ordinary mesh frame-state binder after
+their own material bind. Light, IBL, gamma, fog and shadow state must accompany
+every primitive, including frames with Forward+ and shadows disabled. Model
+instance/crowd groups currently key by model, not receiver light layer; layer 0
+can batch, while other layers use the per-entity path to preserve filtering.
+
+`jce_ui_canvas_storage.c/h` owns growing raycast records and hashed per-widget
+interaction state. Small canvases allocate on demand; records and state are not
+silently truncated at 256 elements. Widget deletion uses the common backward
+shift-delete arithmetic and scene changes clear prior interaction state. An
+allocation failure logs an error and invalidates input records for that frame.
+
+`jce_scene_stress.c` implements the reusable C99 diagnostic fixture API in
+`jce_scene_stress.h`. Editor and SDK consumers share the same primitive/material/
+collider definitions and actual-count validation. `jce_scene_stress_update.c`
+owns bounded motion with scene-local root, phase and cached query state. Motion
+uses unit quaternions and per-entity transform invalidation; it does not pretend
+that moving an entity changes the scene's structure. Hosts own cameras, quality,
+runtime creation, UI, export and the returned subtree's lifetime.
+Scatter diagnostics above one component's limit use independently seeded,
+bounded components and report the exact sum. The renderer's component limit
+is unchanged; grid side lengths use integer products at perfect-power bounds.
+
+## Benchmark scaling diagnostics
+
+`jce_sr_ecull.c` owns serial world/bounds cache-miss replay. Its cache bridges
+remain private renderer interfaces. `JCE_PERF_ECULL_DETAIL=1` subdivides this
+path for diagnosis; leave it off for steady benchmark comparisons because
+per-entity timer reads add instrumentation overhead.
+Dynamic shadow membership uses a renderer-owned epoch and an ecull-slot stamp:
+full builds advance the epoch, incremental repairs preserve it, and allocation
+failure disables partial-list shadow optimizations. No scene/project exception
+or upstream change is involved.
+World-matrix memo lookup precedes local composition and includes shared roots.
+Explicit physics/socket writeback notifications invalidate that memo immediately;
+callers must not rely on stale same-frame parent/descendant matrices.
+World-matrix memo hash chains treat stale epochs as empty. Invalidating a
+generation resets its live count in constant time; growth rehashes only current
+entries, so streaming/recycled ids do not accumulate and per-body notifications
+do not trigger full-table wipes. Epoch wrap alone requires a physical reset.
+
+`jce_sr_ecull.c` owns render-kind classification and dynamic-ancestor detection.
+Its transform-independent metadata cache requires an exact scene/list/structure/
+enable/component key. Transform writes still rebuild world matrices and bounds;
+`JCE_DISABLE_ECULL_METADATA=1` provides the uncached control. Component accessor
+membership changes pass through `jce_scene_component_membership.h`: first add
+and actual removal advance the structural epoch, while existing value edits
+retain their appropriate world/material/cull-data signals. Never cache a
+component-existence predicate without verifying these mutation paths.
 
 ## Renderer modules (`jce_scene_renderer.c` split, 2026-06-23)
 
@@ -449,3 +555,112 @@ jce_scene.lib(jce_ui_canvas.c.obj) : error LNK2019: unresolved external
 第一版就是 host-only，那会做出一个「编辑器里对、出货游戏里静默返回 NULL」的特性。
 
 **miss 也要缓存**：两边都没有的名字否则每帧每实体 stat 一次文件系统。
+
+Normal-only skinned prepasses reuse the existing skin palette walker and shared
+current-palette shader body. Their minimal vertex variant uses the view camera
+and no previous-pose uniforms or unused clip varyings; velocity retains its
+current/previous projection path. Static and skinned normal/albedo fragments
+share the encoding. A missing skin program falls back to the existing skinned
+depth submit, not a static rig submit.
+
+Global LOD substitution applies only after resolving a mesh. A camera, light
+or unresolved entity must never acquire geometry from the global group. LOD
+pick counters cover the substituted mesh population, not all visible records.
+
+Scene light collection preserves explicit zero intensity for directional, point,
+spot and area components. Nonpositive and nonfinite values contribute zero;
+missing-field unit defaults belong to component deserialization, never rendering.
+Both selected-light and Forward+ uploads consume the same resolved intensity.
+Disabled lights do not occupy selected-light candidates, Forward+ entries or
+area/directional upload slots. The primary directional resolver skips disabled
+lights in both filtered and legacy scans; time-of-day remains its explicit driver.
+
+Forward+ admission follows actual fragment-family support. Tint, texture-array
+and fade aliases remain fixed-light families: primitive and tinted-model batches
+fall back to existing material-preserving PBR submission when clustered lighting
+is active. Untinted instancing retains its real Forward+ variant. GPU foliage
+LOD retains culling, bands and indirect draws but uses hard band transitions for
+this unsupported fade/cluster combination. Pixel controls, not requested cvars
+or post-render reset flags, establish lighting participation.
+
+Draw-command content identity includes actual Forward+ frame participation,
+not just the requested gate. Mode edges rebuild concrete cached PBR program
+handles once; steady state retains warm hits. Public SDK bidirectional and
+round-trip lighting captures must match independent steady references, with
+cache-disabled controls and zero draw-command VERIFY mismatches.
+
+The public debug-target inventory includes active static CSM cascade depth maps
+independently of the dynamic atlas. Current shadow binding, valid CSM data and
+per-cascade cached contents gate exposure; allocation or zero initialization
+alone cannot publish stale depth. Legal texture handle zero remains valid.
+
+Directional receiver depth bias is one texel-space policy in
+engine/shaders/pbr/shadow_bias.sh, reused by mesh, terrain and water.
+Keep normal-offset bias separate; surface type must not silently multiply
+the shared depth offset. Validate short-caster contact and unoccluded
+flat/sloped receivers together before declaring pixel acceptance.
+Render-queue frame totals reset before shadow passes, then accumulate
+shadow and main flushes; resetting at colour-pass entry loses actual work.
+
+## GPU emitter debug targets
+
+`r.particles.debug_stats` is a generic opt-in console setting, default false.
+The scene particle driver enables the private allocator diagnostic before its
+GPU update; normal operation does not allocate or dispatch diagnostic textures.
+The existing public debug-target inspector exposes stable pool-slot names
+`particles.gpu_alive_00` through `particles.gpu_alive_63` only for referenced
+emitters updated in the current renderer frame. A 1x1 RGBA8 target stores the
+alive count in little-endian RGB24 and alpha validity; it is numeric data, not
+a colour preview or a CPU estimate. Allocation capacity does not mean alive
+particles. Sentinel UINT16_MAX is absent, while texture index zero is valid.
+The pure table is bounded by its existing 16-target budget plus the emitter pool
+capacity; CPU controls cover frame validity, zero handles and truncated outputs.
+
+Optional particle debug targets expose actual simulation populations, not
+rendered counts. CPU totals retain exact zero, reject 24-bit overflow, and
+require current renderer frame plus scene identity. Default-off observation
+must not alter routing or impose resources on ordinary rendering; diagnostic
+textures belong to renderer lifetime and stay absent on unavailable input.
+
+CPU particle diagnostics distinguish simulation alive total from billboards
+submitted by the most recent render view. Zero drawn is recorded before early
+returns, then replaced only after actual submit; neither means visible pixels.
+Both default-off textures share exact encoding, frame/scene validity and
+renderer lifetime. Stress witnesses must reject simulation/draw disagreement
+and label observer-on frame samples as correctness diagnostics.
+
+CPU billboards retain the complete-fit transient fast path. A bounded lazy
+dynamic instance arena handles insufficient transient space without compute
+buffer flags. Its per-renderer frame cursor gives each view a disjoint slice;
+growth replaces the resource and uses bgfx deferred destruction for older
+submitted handles. The configurable 128MiB default/256MiB hard ceiling bounds
+logical frame capacity, not physical peak residency during growth. Resource
+failure preserves actual partial submitted counts and rate-limited warnings.
+
+The particle arena planning/state header is graphics-free so native pure
+capacity tests do not acquire bgfx dependencies. Upload resources and bindings
+remain in the separate graphics batch module.
+
+UIButton feedback is drawn at its own graphic hierarchy position, preserving
+9-slice and clipping. The interaction pass updates cached state for the next
+frame; never redraw buttons over all later siblings or modal panels.
+
+Canvas child traversal and equal-sort-order root canvases must use stable entity order. ECS component enable/disable changes migrate archetypes and must not change painter or hit-test ordering; keep the overlapping-button enable-toggle regression.
+
+Cached NO_DRAW admission is presence-based and conservative: only entities
+with Transform/EditorMeta/Tag/Layer legacy bits and no zero-flag registry
+components may bypass the common draw dispatch. Unknown/custom and all other
+components fail open. Structural membership invalidation uses existing scene
+mutation helpers/world-cache epochs; enable toggles cannot create admission.
+The shared entity list remains intact for light, particle and other passes.
+
+Late private registry append is not assumed to bump scene epochs. Each renderer
+snapshots registry count at creation; at render entry a count change first
+invalidates existing structural-keyed metadata through the existing scene
+world-cache invalidation seam, then latches count. Any mid-render count
+mismatch still converts cached NO_DRAW to local OTHER, preserving fail-open
+behavior without changing public ABI.
+
+An explicit glTF model claims the render path while its resource is pending. Do not render the MeshRenderer primitive default as a temporary substitute for an authored model.
+
+Explicit model color and shadow submissions request all authored texture maps together and defer both passes until maps are resident. Geometry-only imports must not flash an embedded/default material or an unrelated primitive while textures load.

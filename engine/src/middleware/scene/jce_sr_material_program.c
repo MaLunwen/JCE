@@ -90,10 +90,12 @@ JceShaderHandle sr_resolve_custom_program(JceSceneRenderer *sr,
     /* Parse the material file; the loader links any persisted graph shader
      * into custom_program for us.  Only the program handle is kept here. */
     JceShaderHandle prog = none;
-    if (jce_fs_host_exists_file(material_path)) {
+    JceFileSystem *fs = jce_fs_get_active();
+    if (fs ? jce_fs_exists(fs,material_path) : jce_fs_host_exists_file(material_path)) {
         JcePbrMaterial m;
         char tex_paths[5][256];
-        if (jce_pbr_material_load_json(material_path, &m, tex_paths) &&
+        if ((fs ? jce_pbr_material_load_json_vfs(fs,material_path,&m,tex_paths)
+                : jce_pbr_material_load_json(material_path,&m,tex_paths)) &&
             m.custom_program != UINT16_MAX)
             prog.idx = m.custom_program;
     }

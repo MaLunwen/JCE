@@ -77,7 +77,7 @@
 package com.jce.script;
 
 
-/** The scripting surface: 101 entries over the C ABI. */
+/** The scripting surface: 108 entries over the C ABI. */
 public final class JceScript implements AutoCloseable {
 
     /** The manifest's script_api_version this class was generated from. */
@@ -838,6 +838,20 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native void nGetPointerDelta(long api, float[] outFloat);
+
+    /**
+     * Viewport-local logical pixel x, y, width, height; zero dimensions
+     * indicate unavailable input. The sample is frame-transient and shared by
+     * Editor Game View and standalone runtime.
+     * <p>Shape void_out_array, since 1; host member pointer_position.
+     */
+    public float[] getPointerPosition() {
+        float[] out = new float[4];
+        nGetPointerPosition(handle, out);
+        return out;
+    }
+
+    private static native void nGetPointerPosition(long api, float[] outFloat);
 
     /**
      * jce.get_pointer_wheel
@@ -1727,5 +1741,78 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native int nVcamActivate(long api, String name);
+
+    /**
+     * Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path
+     * resets. Main-thread; false on decode/platform/cache failure.
+     * <p>Shape value_return, since 1; host member cursor_set.
+     * @param assetPath const char *
+     * @param hotspotX int
+     * @param hotspotY int
+     */
+    public boolean setCursor(String assetPath, int hotspotX, int hotspotY) {
+        return nSetCursor(handle, assetPath, hotspotX, hotspotY);
+    }
+
+    private static native boolean nSetCursor(long api, String assetPath, int hotspotX, int hotspotY);
+
+    /**
+     * jce.request_quit
+     * <p>Shape value_return, since 1; host member request_quit.
+     */
+    public boolean requestQuit() {
+        return nRequestQuit(handle);
+    }
+
+    private static native boolean nRequestQuit(long api);
+
+    /**
+     * jce.stat_available
+     * <p>Shape value_return, since 1; host member stat_available.
+     */
+    public boolean statAvailable() {
+        return nStatAvailable(handle);
+    }
+
+    private static native boolean nStatAvailable(long api);
+
+    /**
+     * Store signed32 statistic through an explicitly borrowed platform
+     * service. Nonfinite, fractional or out-of-range values return false;
+     * successful set does not imply durable flush.
+     * <p>Shape value_return, since 1; host member stat_set.
+     * @param id const char *
+     * @param value double
+     */
+    public boolean statSet(String id, double value) {
+        return nStatSet(handle, id, value);
+    }
+
+    private static native boolean nStatSet(long api, String id, double value);
+
+    /**
+     * Signed32 statistic; fallback must be finite, integral and in range,
+     * otherwise returns 0. An absent host returns 0; a configured runtime
+     * with unavailable service returns the valid fallback.
+     * <p>Shape value_return, since 1; host member stat_get.
+     * With no host this returns 0, not 0.
+     * @param id const char *
+     * @param fallback double
+     */
+    public int statGet(String id, double fallback) {
+        return nStatGet(handle, id, fallback);
+    }
+
+    private static native int nStatGet(long api, String id, double fallback);
+
+    /**
+     * jce.stat_flush
+     * <p>Shape value_return, since 1; host member stat_flush.
+     */
+    public boolean statFlush() {
+        return nStatFlush(handle);
+    }
+
+    private static native boolean nStatFlush(long api);
 
 }

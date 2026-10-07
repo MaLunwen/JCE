@@ -19,7 +19,7 @@
 | `jce_renderer.c` / `jce_renderer_caps.c` | bgfx init, frame loop, capability query |
 | `jce_render_graph.c` / `jce_render_queue.c` | Render graph & sorted queue |
 | `jce_scene_renderer.c` | Scene-level render path (ties ECS → passes) |
-| `jce_gpu_scene.c` | Adaptive GPU Scene / MDI backend: per-model visibility groups, compute compaction, shared-survivor indirect draws, bounded growth, frame counters, and CPU fallback |
+| `jce_gpu_scene.c` | Adaptive GPU Scene / MDI backend: per-model visibility groups, explicit compacted-indirect/fixed-count policy independent of capability, compute culling, bounded growth, frame counters, and CPU fallback |
 | `jce_renderer_ecs.c` | flecs components for renderable, light, camera, etc. |
 | `jce_camera.c` / `jce_views.c` | Camera + view matrices |
 | `jce_mesh.c` / `jce_skinned_mesh.c` / `jce_model.c` / `jce_primitives.c` | Geometry |
@@ -43,6 +43,13 @@
 
 ## Rules (renderer-specific)
 
+GPUScene's survivor snapshot is an optional compacted-model diagnostic. Lazy
+RGBA32F image export preserves uint32 counters as two exact 16-bit float words;
+the existing typed readback queue owns CPU transfer and completion. The caller
+orders the snapshot after cull and its same-frame readback after snapshot.
+No snapshot resource or dispatch is created by ordinary rendering. Fixed-count
+and unsupported routes return unavailable, never invented survivor totals.
+
 1. **No SDL** — windowing belongs to `os/platform`. Renderer receives a native window handle via bgfx init.
 2. **Do not include bgfx headers in public `jce/renderer/*.h`** — wrap handles as opaque `JceXxxHandle` typedef'd ints. bgfx headers only appear in `*.c` / `*_internal.h`.
 3. **No game logic** — renderer reads ECS, writes nothing about gameplay. Components live in `middleware/scene`; renderer's own components are pure rendering data.
@@ -60,6 +67,26 @@
 11. **Mip streaming** (`jce_texture_*_mip_*` API): `effective_top_mip = max(global_bias, per_texture_bias, caps_floor)`, clamped so the 4×4 mip-tail is always resident. Caps-floor matrix: **Low → 1**, **Mid → 0**, **High → 0**. The global bias is driven by the streaming pressure hook installed in `engine/src/resource/jce_world_streamer.c` (OK→0 / SOFT→1 / HARD→2); textures must opt-in (call any of the streaming setters) to be affected. **Honest-demotion rule (audit F29):** a demotion is physically applied **only** for source-backed textures (those holding a retained CPU mip-0). Default textures keep no redundant CPU mirror (low-RAM baseline), so their requests are recorded as intent and `get_size`/`get_resident_top_mip` keep reporting the **true** GPU level — never fake a shrink that did not happen. Real default-texture streaming awaits an on-disk mip-chain asset format (stream from PAK, not a RAM mirror). Do **not** "fix" this by stashing a CPU copy of every texture.
 
 ## Common tasks
+
+`jce_model_texture_pool.c/h` owns model-local image/mode staging and unique GPU
+texture handles. Material slots borrow handles; they never destroy shared
+textures. CPU cancellation frees staging once; upload consumes it once and
+transfers the pool to the model for render-thread destruction. Color space and
+sampler mode are part of resource identity. GPU byte summaries count each
+owned texture once and remain RGBA8-equivalent estimates, not allocator queries.
+
+HiZ reduction uses actual source dimensions at every level. Destination texels
+cover floor/ceil normalized source intervals, including overlap at odd-sized
+boundaries and a one-texel axis. Losing far-depth samples can falsely occlude
+visible geometry; undersized maxima are not conservative. Shader bundles and
+their CPU uniform producers must be regenerated together when this changes.
+
+Text shaping preserves HarfBuzz's font-local glyph index independently of the
+source Unicode character. The atlas reuses nominal ASCII/Unicode entries only
+when their FreeType index matches; substituted/ligature glyphs use high-bit
+tagged keys in the existing dynamic atlas. Rasterize those with FT_Load_Glyph,
+not FT_Load_Char. HarfBuzz Y offsets point up; UI coordinates point down.
+Keep 26.6 offsets/advances fractional in both measurement and drawing.
 
 | Task | Steps |
 |------|-------|
@@ -494,3 +521,111 @@ Game View **曾经**在前台、写下 `1380x898`，之后切到背景标签页 
 3. **变异脚本只还原了源码，没有重建。** `jce_editor.exe` 会留着变异版本——
    **一个 `git status` 看不见、下一次测量会静默继承的二进制**。
    ⇒ **源码快照保护的是树，只有重建才保护树产出的东西。**
+
+The CPU light cluster caches world-to-view once per camera update and converts
+right-handed view Z to the positive depth used by PBR shaders. Projected clipped
+sphere-AABB corners conservatively cover perspective, orthographic and shifted
+projection matrices; near-plane intersections and tangent bounds remain visible.
+Native tests use real right-handed camera/projection inputs, not positive-Z
+identity-camera substitutes. This broad-phase may overassign, never shade beyond
+the light influence tested by the shared fragment shader.
+
+Forward+ keeps logical packed/upload row counts separate from the capacity GPU
+texture height. Per-submit normalized sampling receives the physical height;
+region offsets and actual light/grid/index bounds retain their logical meanings.
+
+Forward+ update retires the previous GPU upload validity before validating the
+new frame; failed updates must not bind old cluster uniforms or textures. The
+last successfully packed CPU accessor remains diagnostic history. Cluster camera
+reset first invalidates the prior camera and accepts only finite ordered positive
+clip planes. NaN slice input returns zero; infinite depths clamp to end slices.
+
+Camera authored poses retain their exact normalized forward/up basis, including
+poles and roll. Euler yaw/pitch remain controller state, not the pose authority.
+Only interactive FPS rotation/look-at paths apply the existing 89-degree clamp;
+view, orientation getters and movement consume the same resolved direction.
+Invalid pose setters are atomic. Public camera tests cover pole/near-pole/roll,
+view-axis projection and the unchanged interactive clamp.
+
+Nonzero FPS rotation and look-at switch to the stable world-Y-up controller
+basis, so a former authored pole/roll cannot leave forward parallel to up.
+Zero rotation preserves exact pose. Validate both normalized direction vectors
+before publishing a pose; overflow during normalization rejects atomically.
+
+Custom material programs in JcePbrMaterial apply to rigid model primitives as well as standalone meshes. The skinned-only draw override keeps its separate bone-palette contract. Raw-memory texture decoding and VFS/PAK decoding share one owned-byte decoder.
+
+Exact poles preserve the prior interactive yaw because their horizontal heading
+is undefined; signed-zero atan2 must not invent a 180-degree turn. Near-pole
+nonzero horizontal components still determine their actual heading.
+
+GPU particles allocate from a GPU-compacted list of actual dead slots. Reset the
+uint counters, append one unique index per dead pool slot, then let each emit
+invocation consume one list entry; non-atomic lifetime probing is forbidden.
+Resource/program failure must return an unusable pool and enable real CPU
+fallback. Optional private diagnostics export a post-allocation 24-bit RGB alive
+count from scanned free slots plus actual accepted GPU writes, with alpha
+validity, through the existing typed RGBA8 readback/debug-target contract.
+Diagnostic dispatch is opt-in and cannot certify position/visual correctness.
+
+## Worker texture preparation
+
+Raw `JceTextureCpu` results own a complete original-resolution RGBA8 mip chain
+prepared with the private pure `jce_texture_mips.h` helper. The image decoder's
+allocation is released after mip-0 is copied; mip-0 remains an alias into the
+JCE-owned chain with its original dimensions for the private LUT strip accessor.
+Cancel/free releases that chain once. Worker preparation does not query renderer
+policy, capabilities or call bgfx.
+
+Upload chooses the existing hardware-tier mip suffix on the render thread and
+copies only that suffix into bgfx-owned memory. Cooked payloads retain their
+authored format and mip chain. RGBA byte-space box averaging, alpha averaging,
+NPOT floor-halving and one-pixel tap clamps are preserved. Remaining bgfx copy,
+texture creation and optional streaming source-cache copies are real render-thread
+costs; moving mip arithmetic does not remove those costs. Chain allocation is
+checked and bounded; allocation failure fails decoding rather than retaining a
+partially initialized chain. Tests cover bytes, NPOT, suffix and bounds headlessly.
+
+CPU authored particle bursts are pending one-shots consumed by the first
+emitting update after origin synchronization. Stop delays pending emission;
+start resumes it without rearming a consumed burst. Clamp finite rounded burst
+counts to free capacity, ignore invalid amounts, and reuse ordinary spawn/event
+logic so sub-emitter and parallel-update behavior stays shared.
+
+Camera projection diagnostics are silent by default. Explicit JCE_LOG_CAMERA
+retains WARN-level projection/pose witnesses in distribution builds; QA tools
+that parse these records must opt in. Projection math is unaffected. The native
+camera suite validates default silence and opt-in deduplication with a log sink.
+
+Tracy render.reported_primitives sums the backend per-topology primitive array
+with a64-bit accumulator; it is not an address or an exact pre-occlusion/GPU
+indirect submission count. Backend reporting includes instances and repeated
+passes. Actual submitted vertex counts remain unavailable through the public
+GPU statistics API; authored asset sizes must not be presented as observed counts.
+
+Camera projection diagnostics are opt-in (JCE_LOG_CAMERA), deduplicated by camera plus viewport aspect in a bounded cache. Alternating Scene/Game aspects must not spam unchanged poses.
+
+Web owns one SDL canvas: never create a second hidden GL probe window. Negotiate and verify the actual bgfx WebGL context; native platforms retain their independent probe.
+
+## Submitted resource payload telemetry
+
+`jce_upload_metrics.c/.h` counts admitted static mesh vertex/index payloads
+(including wireframe, LOD and meshlet auxiliary buffers) and texture initial or
+update payloads. Counters belong to `JceRenderer`; the private active-device
+pointer and context generation live in the existing singleton bgfx frame/device
+owner in `jce_renderer.c`. Pure helper functions own no global state. The pointer
+is borrowed, bound only after successful creation and cleared before
+shutdown. All mutations and snapshots use the API-owner thread, not CPU decode
+workers or the Android frame thread. Valid create handles indicate API admission;
+void texture updates indicate command submission only. Cache hits and empty
+texture allocations contribute zero. Context generation/reset and saturation
+make cumulative deltas explicit. These are not PCIe bytes, GPU completion,
+resident allocation totals or transient/GPUScene upload counters.
+
+Web stock PBR programs are prepared as opaque deferred handles until actual
+submission; stock capability queries must not link unused shader families.
+The private jce_shader_deferred.h resolver is called by the shared encoder and
+raw draw bridges. Prepared programs own copied source bytes; a PAK or development directory may
+be released before first submission. Missing source stays invalid; program release accepts concrete or deferred handles and reload frees
+old variant entries once per distinct handle. Preserve every shader feature.
+
+Prepared shader state belongs to the existing singleton bgfx device owner, with no independent global registry. Device shutdown frees prepared bytes and concrete programs; reload releases old distinct handles. Native loaders remain eager.

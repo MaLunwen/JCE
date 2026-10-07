@@ -11,6 +11,7 @@
  * to metadata/timeline mode with a clear status message.
  */
 
+#include "jce_fv_video_policy.h"
 #include "jce_fv_common.h"
 #include "core/jce_editor_i18n.h"
 #include "scene/jce_editor_scene_render.h"
@@ -79,6 +80,13 @@ struct VideoState {
     bool        audio_available;
 
     /* Perf overlay (S1). */
+    bool        buffering;
+    uint64_t    buffer_id;
+    uint64_t    buffer_epoch;
+    uint64_t    buffer_next_trace_ms;
+    uint64_t    buffer_started_ms;
+    uint64_t    buffer_total_ms;
+    uint32_t    preview_limit;
     bool        show_perf_overlay;
     double      perf_upload_us_ema;
     double      perf_upload_us_last;
@@ -145,9 +153,47 @@ static void release_texture(VideoState *st)
     st->uploaded_counter    = 0;
 }
 
+/* Viewer diagnostics do not require verbose decoder or PCM callback logging. */
+static bool preview_trace_enabled()
+{
+    static const bool enabled = [] {
+        const char *qa = getenv("JCE_DBG_FILE_PREVIEW_TRACE");
+        return (qa && strcmp(qa, "1") == 0) || getenv("JCE_VIDEO_TRACE") != nullptr;
+    }();
+    return enabled;
+}
+
+/* Lifecycle observations are opt-in; each hold reports an actual PCM cursor,
+ * never a predicted frozen value. Consumers decide whether settling is proven. */
+static void trace_buffer_event(VideoState *st, const char *event)
+{
+    if (!preview_trace_enabled()) return;
+    double pts = -1.0;
+    jce_video_get_frame_rgba(st->video, nullptr, nullptr, &pts);
+    const int voice = st->audio && st->voice != JCE_VOICE_INVALID
+        ? (int)jce_audio_is_playing(st->audio, st->voice) : -1;
+    const uint64_t now = jce_time_ticks_ms();
+    jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+        "buffer event=%s id=%llu epoch=%llu wall_ms=%llu elapsed_ms=%llu media=%.6f pts=%.6f audio=%.6f voice_playing=%d quiescent=%d",
+        event, (unsigned long long)st->buffer_id, (unsigned long long)st->buffer_epoch,
+        (unsigned long long)now, (unsigned long long)(now - st->buffer_started_ms),
+        jce_video_get_time(st->video), pts, jce_video_audio_get_time(st->video), voice,
+        st->audio && st->voice != JCE_VOICE_INVALID
+            ? (int)jce_audio_stream_is_quiescent(st->audio, st->voice) : -1);
+}
+
+static void retire_playback_buffer(VideoState *st)
+{
+    if (!st || !st->buffering) return;
+    trace_buffer_event(st, "cancel");
+    st->buffer_total_ms += jce_time_ticks_ms() - st->buffer_started_ms;
+    st->buffering = false;
+}
+
 static void free_state(VideoState *st)
 {
     if (!st) return;
+    retire_playback_buffer(st);
     release_texture(st);
     if (st->voice != JCE_VOICE_INVALID && st->audio)
         jce_audio_stop(st->audio, st->voice);
@@ -166,6 +212,7 @@ static void pause_state_playback(VideoState *st)
     if (!st) return;
     if (st->audio_available && st->voice != JCE_VOICE_INVALID)
         jce_audio_pause(st->audio, st->voice);
+    retire_playback_buffer(st);
     st->playing = false;
     st->play_requested = false;
     st->pending_audio_resume_seek = -1.0;
@@ -236,12 +283,14 @@ static VideoState *ensure_loaded(FvTab *tab)
 
     /* Large sources need a bounded preview to keep CPU conversion and GPU
      * uploads below the UI frame budget. Other API consumers retain full size. */
-    if ((int64_t)st->info.width * st->info.height > 2560LL * 1440LL)
-        jce_video_set_preview_max_dimension(st->video, 1280u);
+    if ((int64_t)st->info.width * st->info.height > 2560LL * 1440LL) {
+        st->preview_limit = 1280u;
+        jce_video_set_preview_max_dimension(st->video, st->preview_limit);
+    }
 
     /* Loading a restored preview must not start its clock or audio. */
     st->playing = false;
-    if (getenv("JCE_VIDEO_TRACE")) {
+    if (preview_trace_enabled()) {
         jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
             "loaded %s %dx%d %.2ffps codec=%s metadata_only=%d dur=%.2fs",
             tab->display_name, st->info.width, st->info.height,
@@ -325,8 +374,7 @@ static void upload_latest_frame(VideoState *st)
 /* Opt-in actual viewer telemetry; disabled in normal interactive use. */
 static void trace_playback(VideoState *st)
 {
-    static const bool enabled = getenv("JCE_VIDEO_TRACE") != nullptr;
-    if (!enabled || !st || st->video == JCE_VIDEO_INVALID) return;
+    if (!preview_trace_enabled() || !st || st->video == JCE_VIDEO_INVALID) return;
     const uint64_t now = jce_time_ticks_ms();
     const uint64_t counter = jce_video_get_frame_counter(st->video);
     if (counter != st->trace_counter && st->playing) {
@@ -341,13 +389,20 @@ static void trace_playback(VideoState *st)
         st->trace_counter = counter;
     }
     if (now < st->trace_next_ms) return;
-    st->trace_next_ms = now + 1000u;
+    const char *cadence = getenv("JCE_DBG_FILE_PREVIEW_TRACE_MS");
+    const int interval = cadence ? atoi(cadence) : 1000;
+    st->trace_next_ms = now + (interval >= 100 && interval <= 1000
+        ? (uint64_t)interval : 1000u);
     JceVideoPerfStats perf = {};
     jce_video_get_perf_stats(st->video,&perf);
     double pts = -1.0;
     jce_video_get_frame_rgba(st->video,nullptr,nullptr,&pts);
+    const int voice_playing = st->audio && st->voice != JCE_VOICE_INVALID
+        ? (int)jce_audio_is_playing(st->audio, st->voice) : -1;
+    const int transport_active = st->playing && !st->buffering
+        && (!st->audio_available || voice_playing == 1);
     jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
-        "viewer trace wall=%.3f media=%.3f pts=%.3f audio=%.3f playing=%d dec=%llu disp=%llu drop=%llu q=%d decode_ms=%.3f convert_ms=%.3f pop_ms=%.3f upload_ms=%.3f gaps25=%llu gaps50=%llu max_gap_ms=%llu",
+        "viewer trace wall=%.3f media=%.3f pts=%.3f audio=%.3f playing=%d dec=%llu disp=%llu drop=%llu q=%d decode_ms=%.3f convert_ms=%.3f pop_ms=%.3f upload_ms=%.3f gaps25=%llu gaps50=%llu max_gap_ms=%llu upload_width=%d upload_height=%d preview_limit=%u buffering=%d stall_ms=%llu requested_playing=%d effective_transport_active=%d voice_playing=%d",
         st->trace_first_ms ? (double)(now-st->trace_first_ms)/1000.0 : 0.0,
         jce_video_get_time(st->video),pts,jce_video_audio_get_time(st->video),
         (int)st->playing,(unsigned long long)perf.frames_decoded,
@@ -355,7 +410,77 @@ static void trace_playback(VideoState *st)
         perf.q_count,perf.decode_us_ema/1000.0,perf.convert_us_ema/1000.0,
         perf.pop_us_ema/1000.0,st->perf_upload_us_ema/1000.0,
         (unsigned long long)st->trace_gaps_25,(unsigned long long)st->trace_gaps_50,
-        (unsigned long long)st->trace_max_gap);
+        (unsigned long long)st->trace_max_gap, st->tex_w, st->tex_h, st->preview_limit, (int)st->buffering,
+        (unsigned long long)(st->buffer_total_ms + (st->buffering
+            ? now - st->buffer_started_ms : 0u)),
+        (int)st->playing, transport_active, voice_playing);
+}
+
+/* Reconcile before and after normal advancement: upload and telemetry must
+ * observe the final device cursor, not only the tick's initial cursor. */
+static bool reconcile_playback_buffer(VideoState *st)
+{
+    double picture_pts = -1.0;
+    if (jce_video_get_frame_rgba(st->video, nullptr, nullptr, &picture_pts)) {
+        double deadline = jce_video_get_time(st->video);
+        double pcm = st->audio_available ? jce_video_audio_get_time(st->video) : deadline;
+        /* The interpolated owner deadline can lead a block-updated PCM cursor.
+         * Both are real presentation constraints; guard the later one. */
+        const double fps = st->info.framerate >= 1.0 && st->info.framerate <= 240.0
+            ? st->info.framerate : 30.0;
+        const double picture_budget = 1.0 / fps;
+        bool picture_available = true;
+        if (!st->buffering && !fv_video_picture_ready(deadline, pcm, picture_pts, picture_budget)) {
+            const double settle = fv_video_consumed_settle_delta(deadline, pcm, picture_budget);
+            if (settle > 0.0) {
+                /* Present an already-consumed cursor's due output before
+                 * quiescing audio. Missing output still enters the same guard. */
+                jce_video_advance(st->video, settle);
+                deadline = jce_video_get_time(st->video);
+                pcm = st->audio_available ? jce_video_audio_get_time(st->video) : deadline;
+                picture_available = jce_video_get_frame_rgba(st->video, nullptr, nullptr, &picture_pts);
+            }
+        }
+        if (!st->buffering && (!picture_available ||
+            !fv_video_picture_ready(deadline, pcm, picture_pts, picture_budget))) {
+            st->buffering = true;
+            ++st->buffer_id;
+            st->buffer_started_ms = jce_time_ticks_ms();
+            st->buffer_next_trace_ms = st->buffer_started_ms;
+            if (st->audio && st->voice != JCE_VOICE_INVALID)
+                jce_audio_pause(st->audio, st->voice);
+            trace_buffer_event(st, "enter");
+        }
+        if (st->buffering) {
+            /* A final device callback may consume PCM after pause. Settle
+             * video to that already-consumed cursor, never advance PCM or seek.
+             * Zero-delta alone would strand the next due picture in a full queue. */
+            const double consumed_lead = st->audio_available
+                ? pcm - jce_video_get_time(st->video) : 0.0;
+            jce_video_advance(st->video, consumed_lead > 0.0
+                ? (consumed_lead < picture_budget ? consumed_lead : picture_budget) : 0.0);
+            picture_available = jce_video_get_frame_rgba(st->video, nullptr, nullptr, &picture_pts);
+            if (preview_trace_enabled() && jce_time_ticks_ms() >= st->buffer_next_trace_ms) {
+                trace_buffer_event(st, "hold");
+                st->buffer_next_trace_ms = jce_time_ticks_ms() + 50u;
+            }
+            if (!picture_available ||
+                !fv_video_picture_ready(jce_video_get_time(st->video), pcm, picture_pts, picture_budget)
+                || !jce_video_is_ready_to_play(st->video)
+                || (st->audio && st->voice != JCE_VOICE_INVALID
+                    && !jce_audio_stream_is_quiescent(st->audio, st->voice)))
+                return false;
+            st->buffer_total_ms += jce_time_ticks_ms() - st->buffer_started_ms;
+            st->buffering = false;
+            st->skip_playback_delta = true;
+            trace_buffer_event(st, "pre_resume");
+            if (st->audio && st->voice != JCE_VOICE_INVALID)
+                jce_audio_resume(st->audio, st->voice);
+            trace_buffer_event(st, "resume");
+        }
+    }
+
+    return true;
 }
 
 /* ── Per-frame playback tick ─────────────────────────────────────── */
@@ -446,6 +571,13 @@ static void tick_playback(VideoState *st, bool ui_focused)
                 && fmt_ch > 0 && fmt_sr > 0) {
                 st->audio = jce_audio_create();
                 if (st->audio) {
+                    const char *mute = getenv("JCE_DBG_FILE_PREVIEW_MUTE");
+                    if (mute && strcmp(mute, "1") == 0) {
+                        jce_audio_set_master_volume(st->audio, 0.0f);
+                        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                            "preview mute requested=1 master=%.6f",
+                            (double)jce_audio_get_master_volume(st->audio));
+                    }
                     /* Streaming voice: the audio engine pulls from the
                      * video's JceAudioStream on demand. The pull
                      * trampoline routes ma_data_source onRead() back
@@ -484,10 +616,12 @@ static void tick_playback(VideoState *st, bool ui_focused)
         return;
     }
 
-    float dt = st->skip_playback_delta ? 0.0f : ImGui::GetIO().DeltaTime;
-    st->skip_playback_delta = false;
-    if (dt > 0.25f) dt = 0.25f;   /* clamp long frames */
-    jce_video_advance(st->video, (double)dt);
+    if (!fv_video_tick_transport(st->buffering, [st]() {
+            float dt = st->skip_playback_delta ? 0.0f : ImGui::GetIO().DeltaTime;
+            st->skip_playback_delta = false;
+            if (dt > 0.25f) dt = 0.25f;
+            jce_video_advance(st->video, (double)dt);
+        }, [st]() { return reconcile_playback_buffer(st); })) return;
 
     /* ── A/V sync ────────────────────────────────────────────────
      * We previously auto-corrected drift by re-seeking the video to
@@ -528,6 +662,7 @@ static void begin_scrub(VideoState *st, float seek_time)
     static const float kSeekDeadbandSec = 0.002f;
 
     if (!st) return;
+    retire_playback_buffer(st);
     if (!st->scrubbing) {
         st->resume_after_scrub = st->playing || st->play_requested;
         st->play_requested     = false;
@@ -539,6 +674,7 @@ static void begin_scrub(VideoState *st, float seek_time)
         }
         st->trace_previous_ms = 0u;
     }
+    if (!st->scrubbing) ++st->buffer_epoch;
     st->scrubbing    = true;
     st->pending_seek = seek_time;
 
@@ -631,7 +767,18 @@ void fv_video_update_focus(const char *active_tab_path, bool allow_playback)
              * to several GB. The tab's file content stays cached by the
              * file viewer, so switching back transparently re-loads. */
             if (!is_active_tab) {
+                pause_state_playback(st);
+                const bool trace = preview_trace_enabled();
+                const int requested = trace ? (int)st->playing : 0;
+                const int voice = trace && st->audio && st->voice != JCE_VOICE_INVALID
+                    ? (int)jce_audio_is_playing(st->audio, st->voice) : -1;
+                const double media = trace ? jce_video_get_time(st->video) : 0.0;
+                const double audio = trace ? jce_video_audio_get_time(st->video) : 0.0;
                 free_state(st);
+                if (trace)
+                    LOG_INFO(LOG_TAG,
+                        "preview focus active=0 requested_playing=%d voice_playing=%d media=%.6f audio=%.6f released=1",
+                        requested, voice, media, audio);
                 continue;
             }
             pause_state_playback(st);

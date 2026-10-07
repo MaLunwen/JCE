@@ -10,6 +10,7 @@
 #define JCE_MODEL_INTERNAL_H
 
 #include "jce_model.h"
+#include "jce_model_texture_pool.h"
 
 #include <jce/middleware/animation/jce_morph.h>
 
@@ -28,6 +29,7 @@ struct JceModel {
     uint32_t           num_nodes;
     JcePbrMaterial    *materials;
     uint32_t           num_materials;
+    JceModelTexturePool *texture_pool; /* owns maps borrowed by materials */
     JceSkeleton       *skeleton;       /* NULL if no skinning */
     JceAnimClip      **anim_clips;
     uint32_t           num_anims;

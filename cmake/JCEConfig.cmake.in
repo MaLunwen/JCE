@@ -85,6 +85,11 @@ endif()
 # after platform dependencies are assembled and exposes the same archives
 # without force-loading application entry points. It is for native tools and
 # unit tests only; shipping applications must use JCE::JCE.
+# The SDK producer's CRT is part of its binary contract, not a consumer guess.
+set(JCE_MSVC_RUNTIME_LIBRARY "@CMAKE_MSVC_RUNTIME_LIBRARY@")
+if(MSVC AND JCE_MSVC_RUNTIME_LIBRARY)
+	set(CMAKE_MSVC_RUNTIME_LIBRARY "${JCE_MSVC_RUNTIME_LIBRARY}")
+endif()
 add_library(JCE::JCE STATIC IMPORTED)
 
 set_target_properties(JCE::JCE PROPERTIES
@@ -241,10 +246,14 @@ if(WIN32)
 	# msvcprt.lib (DLL flavour) is the right pick; downstream targets
 	# that opt into the static CRT must override at their own scope.
 	if(MSVC)
-		set_property(TARGET JCE::JCE APPEND PROPERTY
-			INTERFACE_LINK_LIBRARIES
-				"$<$<NOT:$<CONFIG:Debug>>:msvcprt>"
-				"$<$<CONFIG:Debug>:msvcprtd>")
+		if(JCE_MSVC_RUNTIME_LIBRARY AND NOT JCE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+			set(_jce_cpp_crt libcpmt)
+		else()
+			set(_jce_cpp_crt msvcprt)
+		endif()
+		set_property(TARGET JCE::JCE APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+			"$<$<NOT:$<CONFIG:Debug>>:${_jce_cpp_crt}>"
+			"$<$<CONFIG:Debug>:${_jce_cpp_crt}d>")
 
 		# Some MSVC runtimes miss STL helper exports while Conan-built
 		# C++ deps reference them.  Keep the fallback as a normal static
@@ -399,3 +408,34 @@ endforeach()
 unset(_jce_comp)
 
 check_required_components(JCE)
+
+# Shipping admission is checked against the actual installed scripting roster,
+# not the policy catalog or a consumer's file extension alone.
+foreach(_jce_delivery_variable JCE_DELIVERY_PROFILE JCE_REQUIRED_SCRIPT_LANGUAGES JCE_REQUIRED_SCRIPT_TARGET)
+	if(NOT DEFINED ${_jce_delivery_variable} AND DEFINED ENV{${_jce_delivery_variable}})
+		set(${_jce_delivery_variable} "$ENV{${_jce_delivery_variable}}")
+	endif()
+endforeach()
+set(JCE_SDK_DELIVERY_PROFILE "@JCE_DELIVERY_PROFILE@")
+if(JCE_DELIVERY_PROFILE STREQUAL "embedded" AND NOT JCE_SDK_DELIVERY_PROFILE STREQUAL "embedded")
+	message(FATAL_ERROR "Embedded delivery requires an embedded static-dependency SDK")
+endif()
+foreach(_jce_required_language IN LISTS JCE_REQUIRED_SCRIPT_LANGUAGES)
+	if(NOT _jce_required_language STREQUAL "lua" AND
+		NOT _jce_required_language IN_LIST JCE_SCRIPT_LANGUAGES)
+		message(FATAL_ERROR "Selected project requires unavailable SDK language: ${_jce_required_language}")
+	endif()
+endforeach()
+
+function(jce_delivery_link_required)
+	if(NOT TARGET "${JCE_REQUIRED_SCRIPT_TARGET}")
+		message(FATAL_ERROR "Required scripting target was not declared: ${JCE_REQUIRED_SCRIPT_TARGET}")
+	endif()
+	if(JCE_REQUIRED_SCRIPT_LANGUAGES)
+		jce_script_enable(${JCE_REQUIRED_SCRIPT_TARGET}
+			LANGUAGES ${JCE_REQUIRED_SCRIPT_LANGUAGES} REQUIRED NO_STAGE)
+	endif()
+endfunction()
+if(JCE_REQUIRED_SCRIPT_TARGET AND JCE_REQUIRED_SCRIPT_LANGUAGES)
+	cmake_language(DEFER CALL jce_delivery_link_required)
+endif()

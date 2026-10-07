@@ -37,7 +37,7 @@
  *
  * The C ABI in the middle is being exercised too, and by more than its own
  * suite: tests/scripting/c_abi covers ten entry points by hand, and this file
- * drives all 101 of them.
+ * drives all 108 of them.
  */
 
 #include "jce_script_cpp_differential.hpp"
@@ -514,12 +514,23 @@ static void mk_pointer_delta(void *user, float out_xy[2])
     out_xy[1] = 586.5f;
 }
 
+static void mk_pointer_position(void *user, float out_xywh[4])
+{
+    (void)user;
+    jce::diff::trace_add("pointer_position");
+    jce::diff::trace_end();
+    out_xywh[0] = 601.5f;
+    out_xywh[1] = 602.5f;
+    out_xywh[2] = 603.5f;
+    out_xywh[3] = 604.5f;
+}
+
 static float mk_pointer_wheel(void *user)
 {
     (void)user;
     jce::diff::trace_add("pointer_wheel");
     jce::diff::trace_end();
-    return 46.5f;
+    return 47.5f;
 }
 
 static bool mk_pointer_button(void *user, int button)
@@ -542,7 +553,7 @@ static int mk_touch_count(void *user)
         return 0;
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
-    return 8;
+    return 4;
 }
 
 static bool mk_touch_get(void *user, int index, uint64_t *id, float *x, float *y, float *pressure)
@@ -553,10 +564,10 @@ static bool mk_touch_get(void *user, int index, uint64_t *id, float *x, float *y
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *id = static_cast<uint64_t>(940);
-    *x = 650.5f;
-    *y = 651.5f;
-    *pressure = 652.5f;
+    *id = static_cast<uint64_t>(956);
+    *x = 666.5f;
+    *y = 667.5f;
+    *pressure = 668.5f;
     return true;
 }
 
@@ -597,9 +608,9 @@ static bool mk_get_velocity(void *user, JceScriptEntity e, float out[3])
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    out[0] = 713.5f;
-    out[1] = 714.5f;
-    out[2] = 715.5f;
+    out[0] = 729.5f;
+    out[1] = 730.5f;
+    out[2] = 731.5f;
     return true;
 }
 
@@ -620,7 +631,7 @@ static float mk_vehicle_get_speed(void *user, JceScriptEntity e)
     jce::diff::trace_add("vehicle_get_speed");
     jce::diff::trace_num(static_cast<double>(e));
     jce::diff::trace_end();
-    return 55.5f;
+    return 56.5f;
 }
 
 static void mk_get_move(void *user, float out[3])
@@ -628,9 +639,9 @@ static void mk_get_move(void *user, float out[3])
     (void)user;
     jce::diff::trace_add("get_move");
     jce::diff::trace_end();
-    out[0] = 761.5f;
-    out[1] = 762.5f;
-    out[2] = 763.5f;
+    out[0] = 777.5f;
+    out[1] = 778.5f;
+    out[2] = 779.5f;
 }
 
 static bool mk_ui_get_slider(void *user, JceScriptEntity e, float *out)
@@ -641,7 +652,7 @@ static bool mk_ui_get_slider(void *user, JceScriptEntity e, float *out)
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *out = 777.5f;
+    *out = 793.5f;
     return true;
 }
 
@@ -662,7 +673,7 @@ static bool mk_ui_get_progress(void *user, JceScriptEntity e, float *out)
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *out = 809.5f;
+    *out = 825.5f;
     return true;
 }
 
@@ -791,7 +802,7 @@ static JceScriptEntity mk_net_spawn(void *user, const char * prefab_path, float 
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return 0;
-    return static_cast<JceScriptEntity>(462);
+    return static_cast<JceScriptEntity>(463);
 }
 
 static bool mk_rpc_send(void *user, JceScriptEntity e, const char * event, int target, const char * payload)
@@ -849,7 +860,7 @@ static int mk_find_by_name(void *user, const char * name, JceScriptEntity *out, 
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
     for (int i = 0; i < 2; ++i)
-        out[i] = static_cast<JceScriptEntity>(167 + i);
+        out[i] = static_cast<JceScriptEntity>(168 + i);
     return 2;
 }
 
@@ -865,7 +876,7 @@ static int mk_find_by_prefix(void *user, const char * prefix, JceScriptEntity *o
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
     for (int i = 0; i < 3; ++i)
-        out[i] = static_cast<JceScriptEntity>(168 + i);
+        out[i] = static_cast<JceScriptEntity>(169 + i);
     return 3;
 }
 
@@ -880,7 +891,7 @@ static char * mk_comp_get_json(void *user, JceScriptEntity e, const char * type)
         return NULL;
     if (jce::diff::g_mode == jce::diff::MOCK_LONG)
         return jce::diff::dup_long_json();
-    return jce::diff::dup("{\"comp_get_json\":69}");
+    return jce::diff::dup("{\"comp_get_json\":70}");
 }
 
 static bool mk_comp_set_json(void *user, JceScriptEntity e, const char * type, const char * json)
@@ -905,7 +916,7 @@ static char * mk_render_get_json(void *user)
         return NULL;
     if (jce::diff::g_mode == jce::diff::MOCK_LONG)
         return jce::diff::dup_long_json();
-    return jce::diff::dup("{\"render_get_json\":71}");
+    return jce::diff::dup("{\"render_get_json\":72}");
 }
 
 static bool mk_render_set_json(void *user, const char * json)
@@ -936,7 +947,7 @@ static bool mk_ui_get_dropdown(void *user, JceScriptEntity e, int *out)
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *out = static_cast<int>(1484);
+    *out = static_cast<int>(1500);
     return true;
 }
 
@@ -977,8 +988,8 @@ static bool mk_ui_get_scroll(void *user, JceScriptEntity e, float out_xy[2])
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    out_xy[0] = 1257.5f;
-    out_xy[1] = 1258.5f;
+    out_xy[0] = 1273.5f;
+    out_xy[1] = 1274.5f;
     return true;
 }
 
@@ -997,7 +1008,7 @@ static float mk_world_get_hour(void *user)
     (void)user;
     jce::diff::trace_add("world_get_hour");
     jce::diff::trace_end();
-    return 89.5f;
+    return 90.5f;
 }
 
 static void mk_world_set_hour(void *user, float hour)
@@ -1027,7 +1038,7 @@ static int mk_world_get_weather(void *user)
         return 0;
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
-    return 7;
+    return 8;
 }
 
 static float mk_world_get_weather_intensity(void *user)
@@ -1035,7 +1046,7 @@ static float mk_world_get_weather_intensity(void *user)
     (void)user;
     jce::diff::trace_add("world_get_weather_intensity");
     jce::diff::trace_end();
-    return 93.5f;
+    return 94.5f;
 }
 
 static float mk_world_get_wind_speed(void *user)
@@ -1043,7 +1054,7 @@ static float mk_world_get_wind_speed(void *user)
     (void)user;
     jce::diff::trace_add("world_get_wind_speed");
     jce::diff::trace_end();
-    return 94.5f;
+    return 95.5f;
 }
 
 static bool mk_request_scene(void *user, const char * scene_path)
@@ -1138,7 +1149,7 @@ static int mk_overlap_sphere(void *user, float x, float y, float z, float radius
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
     for (int i = 0; i < 3; ++i)
-        out[i] = static_cast<JceScriptEntity>(193 + i);
+        out[i] = static_cast<JceScriptEntity>(194 + i);
     return 3;
 }
 
@@ -1160,7 +1171,7 @@ static int mk_overlap_box(void *user, float x, float y, float z, float hx, float
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
     for (int i = 0; i < 3; ++i)
-        out[i] = static_cast<JceScriptEntity>(194 + i);
+        out[i] = static_cast<JceScriptEntity>(195 + i);
     return 3;
 }
 
@@ -1173,9 +1184,9 @@ static bool mk_get_script_param(void *user, JceScriptEntity e, const char * name
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *out_kind = static_cast<int>(1820);
-    *out_number = 1530.5f;
-    *out_entity = static_cast<JceScriptEntity>(1822);
+    *out_kind = static_cast<int>(1836);
+    *out_number = 1546.5f;
+    *out_entity = static_cast<JceScriptEntity>(1838);
     return true;
 }
 
@@ -1201,7 +1212,7 @@ static bool mk_curve_eval(void *user, const char * path, const char * channel, d
     jce::diff::trace_end();
     if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
         return false;
-    *out_value = 1561.5f;
+    *out_value = 1577.5f;
     return true;
 }
 
@@ -1215,7 +1226,76 @@ static int mk_vcam_activate(void *user, const char * name)
         return 0;
     if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
         return -3;
-    return 7;
+    return 8;
+}
+
+static bool mk_cursor_set(void *user, const char * asset_path, int hotspot_x, int hotspot_y)
+{
+    (void)user;
+    jce::diff::trace_add("cursor_set");
+    jce::diff::trace_str(asset_path);
+    jce::diff::trace_num(static_cast<double>(hotspot_x));
+    jce::diff::trace_num(static_cast<double>(hotspot_y));
+    jce::diff::trace_end();
+    if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
+        return false;
+    return true;
+}
+
+static bool mk_request_quit(void *user)
+{
+    (void)user;
+    jce::diff::trace_add("request_quit");
+    jce::diff::trace_end();
+    if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
+        return false;
+    return true;
+}
+
+static bool mk_stat_available(void *user)
+{
+    (void)user;
+    jce::diff::trace_add("stat_available");
+    jce::diff::trace_end();
+    if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
+        return false;
+    return true;
+}
+
+static bool mk_stat_set(void *user, const char * id, double value)
+{
+    (void)user;
+    jce::diff::trace_add("stat_set");
+    jce::diff::trace_str(id);
+    jce::diff::trace_num(static_cast<double>(value));
+    jce::diff::trace_end();
+    if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
+        return false;
+    return true;
+}
+
+static int mk_stat_get(void *user, const char * id, double fallback)
+{
+    (void)user;
+    jce::diff::trace_add("stat_get");
+    jce::diff::trace_str(id);
+    jce::diff::trace_num(static_cast<double>(fallback));
+    jce::diff::trace_end();
+    if (jce::diff::g_mode == jce::diff::MOCK_FAIL)
+        return 0;
+    if (jce::diff::g_mode == jce::diff::MOCK_NEGATIVE)
+        return -3;
+    return 8;
+}
+
+static bool mk_stat_flush(void *user)
+{
+    (void)user;
+    jce::diff::trace_add("stat_flush");
+    jce::diff::trace_end();
+    if (!(jce::diff::g_mode != jce::diff::MOCK_FAIL))
+        return false;
+    return true;
 }
 
 /* the release member of the owned-string shape.  Traced, because
@@ -1277,6 +1357,7 @@ void jce::diff::install_recording_host(JceScriptHost *h)
     h->action_pressed = mk_action_pressed;
     h->action_axis = mk_action_axis;
     h->pointer_delta = mk_pointer_delta;
+    h->pointer_position = mk_pointer_position;
     h->pointer_wheel = mk_pointer_wheel;
     h->pointer_button = mk_pointer_button;
     h->touch_count = mk_touch_count;
@@ -1339,6 +1420,12 @@ void jce::diff::install_recording_host(JceScriptHost *h)
     h->get_script_param_text = mk_get_script_param_text;
     h->curve_eval = mk_curve_eval;
     h->vcam_activate = mk_vcam_activate;
+    h->cursor_set = mk_cursor_set;
+    h->request_quit = mk_request_quit;
+    h->stat_available = mk_stat_available;
+    h->stat_set = mk_stat_set;
+    h->stat_get = mk_stat_get;
+    h->stat_flush = mk_stat_flush;
     h->json_free = mk_json_free;
 }
 
@@ -1873,37 +1960,37 @@ static void cpp_case_84(Api &api, jce::diff::Slots &s)
 static void cpp_case_85(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_pointer_wheel());
+        jce::diff::record(s, api.get_pointer_position());
 }
 
 static void cpp_case_86(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_pointer_wheel());
+        jce::diff::record(s, api.get_pointer_position());
 }
 
 static void cpp_case_87(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_pointer_down(3));
+        jce::diff::record(s, api.get_pointer_wheel());
 }
 
 static void cpp_case_88(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_pointer_down(3));
+        jce::diff::record(s, api.get_pointer_wheel());
 }
 
 static void cpp_case_89(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_touch_count());
+        jce::diff::record(s, api.is_pointer_down(3));
 }
 
 static void cpp_case_90(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_touch_count());
+        jce::diff::record(s, api.is_pointer_down(3));
 }
 
 static void cpp_case_91(Api &api, jce::diff::Slots &s)
@@ -1915,361 +2002,361 @@ static void cpp_case_91(Api &api, jce::diff::Slots &s)
 static void cpp_case_92(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_touch(3), "nil:nil");
+        jce::diff::record(s, api.get_touch_count());
 }
 
 static void cpp_case_93(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_touch(3), "nil:nil");
+        jce::diff::record(s, api.get_touch_count());
 }
 
 static void cpp_case_94(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_touch(-1), "nil:nil");
+        jce::diff::record_optional(s, api.get_touch(3), "nil:nil");
 }
 
 static void cpp_case_95(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.tr("tr_key"));
+        jce::diff::record_optional(s, api.get_touch(3), "nil:nil");
 }
 
 static void cpp_case_96(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.tr("tr_key"));
+        jce::diff::record_optional(s, api.get_touch(-1), "nil:nil");
 }
 
 static void cpp_case_97(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_locale());
+        jce::diff::record(s, api.tr("tr_key"));
 }
 
 static void cpp_case_98(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_locale());
+        jce::diff::record(s, api.tr("tr_key"));
 }
 
 static void cpp_case_99(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.set_locale("set_locale_locale");
+        jce::diff::record(s, api.get_locale());
 }
 
 static void cpp_case_100(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.set_locale("set_locale_locale");
+        jce::diff::record(s, api.get_locale());
 }
 
 static void cpp_case_101(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_velocity(static_cast<Entity>(41)), "nil:nil");
+        api.set_locale("set_locale_locale");
 }
 
 static void cpp_case_102(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_velocity(static_cast<Entity>(41)), "nil:nil");
+        api.set_locale("set_locale_locale");
 }
 
 static void cpp_case_103(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.vehicle_set_input(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
+        jce::diff::record_optional(s, api.get_velocity(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_104(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.vehicle_set_input(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
+        jce::diff::record_optional(s, api.get_velocity(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_105(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.vehicle_get_speed(static_cast<Entity>(41)));
+        api.vehicle_set_input(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
 }
 
 static void cpp_case_106(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.vehicle_get_speed(static_cast<Entity>(41)));
+        api.vehicle_set_input(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
 }
 
 static void cpp_case_107(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_move());
+        jce::diff::record(s, api.vehicle_get_speed(static_cast<Entity>(41)));
 }
 
 static void cpp_case_108(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_move());
+        jce::diff::record(s, api.vehicle_get_speed(static_cast<Entity>(41)));
 }
 
 static void cpp_case_109(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_slider(static_cast<Entity>(41)), "nil:nil");
+        jce::diff::record(s, api.get_move());
 }
 
 static void cpp_case_110(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_slider(static_cast<Entity>(41)), "nil:nil");
+        jce::diff::record(s, api.get_move());
 }
 
 static void cpp_case_111(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_slider(static_cast<Entity>(41), 1.5f);
+        jce::diff::record_optional(s, api.ui_get_slider(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_112(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_slider(static_cast<Entity>(41), 1.5f);
+        jce::diff::record_optional(s, api.ui_get_slider(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_113(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_progress(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_slider(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_114(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_progress(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_slider(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_115(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_progress(static_cast<Entity>(41), 1.5f);
+        jce::diff::record_optional(s, api.ui_get_progress(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_116(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_progress(static_cast<Entity>(41), 1.5f);
+        jce::diff::record_optional(s, api.ui_get_progress(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_117(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_toggle(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_progress(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_118(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_toggle(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_progress(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_119(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_toggle(static_cast<Entity>(41), true);
+        jce::diff::record_optional(s, api.ui_get_toggle(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_120(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_toggle(static_cast<Entity>(41), true);
+        jce::diff::record_optional(s, api.ui_get_toggle(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_121(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_text(static_cast<Entity>(41), "ui_set_text_txt");
+        api.ui_set_toggle(static_cast<Entity>(41), true);
 }
 
 static void cpp_case_122(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_text(static_cast<Entity>(41), "ui_set_text_txt");
+        api.ui_set_toggle(static_cast<Entity>(41), true);
 }
 
 static void cpp_case_123(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.send_message(static_cast<Entity>(41), "send_message_msg", 2.5, "send_message_str_arg");
+        api.ui_set_text(static_cast<Entity>(41), "ui_set_text_txt");
 }
 
 static void cpp_case_124(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.send_message(static_cast<Entity>(41), "send_message_msg", 2.5, "send_message_str_arg");
+        api.ui_set_text(static_cast<Entity>(41), "ui_set_text_txt");
 }
 
 static void cpp_case_125(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.send_message(static_cast<Entity>(41), "send_message_msg");
+        api.send_message(static_cast<Entity>(41), "send_message_msg", 2.5, "send_message_str_arg");
 }
 
 static void cpp_case_126(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.broadcast("broadcast_msg", 1.5, "broadcast_str_arg");
+        api.send_message(static_cast<Entity>(41), "send_message_msg", 2.5, "send_message_str_arg");
 }
 
 static void cpp_case_127(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.broadcast("broadcast_msg", 1.5, "broadcast_str_arg");
+        api.send_message(static_cast<Entity>(41), "send_message_msg");
 }
 
 static void cpp_case_128(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.broadcast("broadcast_msg");
+        api.broadcast("broadcast_msg", 1.5, "broadcast_str_arg");
 }
 
 static void cpp_case_129(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.has_component(static_cast<Entity>(41), "has_component_comp_name"));
+        api.broadcast("broadcast_msg", 1.5, "broadcast_str_arg");
 }
 
 static void cpp_case_130(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.has_component(static_cast<Entity>(41), "has_component_comp_name"));
+        api.broadcast("broadcast_msg");
 }
 
 static void cpp_case_131(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_component_enabled(static_cast<Entity>(41), "is_component_enabled_comp_name"));
+        jce::diff::record(s, api.has_component(static_cast<Entity>(41), "has_component_comp_name"));
 }
 
 static void cpp_case_132(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_component_enabled(static_cast<Entity>(41), "is_component_enabled_comp_name"));
+        jce::diff::record(s, api.has_component(static_cast<Entity>(41), "has_component_comp_name"));
 }
 
 static void cpp_case_133(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.set_component_enabled(static_cast<Entity>(41), "set_component_enabled_comp_name", true);
+        jce::diff::record(s, api.is_component_enabled(static_cast<Entity>(41), "is_component_enabled_comp_name"));
 }
 
 static void cpp_case_134(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.set_component_enabled(static_cast<Entity>(41), "set_component_enabled_comp_name", true);
+        jce::diff::record(s, api.is_component_enabled(static_cast<Entity>(41), "is_component_enabled_comp_name"));
 }
 
 static void cpp_case_135(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_is_server());
+        api.set_component_enabled(static_cast<Entity>(41), "set_component_enabled_comp_name", true);
 }
 
 static void cpp_case_136(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_is_server());
+        api.set_component_enabled(static_cast<Entity>(41), "set_component_enabled_comp_name", true);
 }
 
 static void cpp_case_137(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_is_client());
+        jce::diff::record(s, api.net_is_server());
 }
 
 static void cpp_case_138(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_is_client());
+        jce::diff::record(s, api.net_is_server());
 }
 
 static void cpp_case_139(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_spawn("net_spawn_prefab_path", 1.5f, 2.5f, 3.5f));
+        jce::diff::record(s, api.net_is_client());
 }
 
 static void cpp_case_140(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.net_spawn("net_spawn_prefab_path", 1.5f, 2.5f, 3.5f));
+        jce::diff::record(s, api.net_is_client());
 }
 
 static void cpp_case_141(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event", 5, "rpc_send_payload"));
+        jce::diff::record(s, api.net_spawn("net_spawn_prefab_path", 1.5f, 2.5f, 3.5f));
 }
 
 static void cpp_case_142(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event", 5, "rpc_send_payload"));
+        jce::diff::record(s, api.net_spawn("net_spawn_prefab_path", 1.5f, 2.5f, 3.5f));
 }
 
 static void cpp_case_143(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event"));
+        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event", 5, "rpc_send_payload"));
 }
 
 static void cpp_case_144(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_burst(static_cast<Entity>(41), 4);
+        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event", 5, "rpc_send_payload"));
 }
 
 static void cpp_case_145(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_burst(static_cast<Entity>(41), 4);
+        jce::diff::record(s, api.rpc_send(static_cast<Entity>(41), "rpc_send_event"));
 }
 
 static void cpp_case_146(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_set_emitting(static_cast<Entity>(41), true);
+        api.particle_burst(static_cast<Entity>(41), 4);
 }
 
 static void cpp_case_147(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_set_emitting(static_cast<Entity>(41), true);
+        api.particle_burst(static_cast<Entity>(41), 4);
 }
 
 static void cpp_case_148(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_set_color(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
+        api.particle_set_emitting(static_cast<Entity>(41), true);
 }
 
 static void cpp_case_149(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.particle_set_color(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
+        api.particle_set_emitting(static_cast<Entity>(41), true);
 }
 
 static void cpp_case_150(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.find_by_name("find_by_name_name"));
+        api.particle_set_color(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
 }
 
 static void cpp_case_151(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.find_by_name("find_by_name_name"));
+        api.particle_set_color(static_cast<Entity>(41), 1.5f, 2.5f, 3.5f);
 }
 
 static void cpp_case_152(Api &api, jce::diff::Slots &s)
@@ -2281,13 +2368,13 @@ static void cpp_case_152(Api &api, jce::diff::Slots &s)
 static void cpp_case_153(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.find_by_prefix("find_by_prefix_prefix"));
+        jce::diff::record(s, api.find_by_name("find_by_name_name"));
 }
 
 static void cpp_case_154(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.find_by_prefix("find_by_prefix_prefix"));
+        jce::diff::record(s, api.find_by_name("find_by_name_name"));
 }
 
 static void cpp_case_155(Api &api, jce::diff::Slots &s)
@@ -2299,307 +2386,307 @@ static void cpp_case_155(Api &api, jce::diff::Slots &s)
 static void cpp_case_156(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.comp_get(static_cast<Entity>(41), "comp_get_type"), "nil:nil");
+        jce::diff::record(s, api.find_by_prefix("find_by_prefix_prefix"));
 }
 
 static void cpp_case_157(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.comp_get(static_cast<Entity>(41), "comp_get_type"), "nil:nil");
+        jce::diff::record(s, api.find_by_prefix("find_by_prefix_prefix"));
 }
 
 static void cpp_case_158(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.comp_set(static_cast<Entity>(41), "comp_set_type", "comp_set_json"));
+        jce::diff::record_optional(s, api.comp_get(static_cast<Entity>(41), "comp_get_type"), "nil:nil");
 }
 
 static void cpp_case_159(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.comp_set(static_cast<Entity>(41), "comp_set_type", "comp_set_json"));
+        jce::diff::record_optional(s, api.comp_get(static_cast<Entity>(41), "comp_get_type"), "nil:nil");
 }
 
 static void cpp_case_160(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.render_get(), "nil:nil");
+        jce::diff::record(s, api.comp_set(static_cast<Entity>(41), "comp_set_type", "comp_set_json"));
 }
 
 static void cpp_case_161(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.render_get(), "nil:nil");
+        jce::diff::record(s, api.comp_set(static_cast<Entity>(41), "comp_set_type", "comp_set_json"));
 }
 
 static void cpp_case_162(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.render_set("render_set_json"));
+        jce::diff::record_optional(s, api.render_get(), "nil:nil");
 }
 
 static void cpp_case_163(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.render_set("render_set_json"));
+        jce::diff::record_optional(s, api.render_get(), "nil:nil");
 }
 
 static void cpp_case_164(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.audio_set_volume(static_cast<Entity>(41), 1.5f);
+        jce::diff::record(s, api.render_set("render_set_json"));
 }
 
 static void cpp_case_165(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.audio_set_volume(static_cast<Entity>(41), 1.5f);
+        jce::diff::record(s, api.render_set("render_set_json"));
 }
 
 static void cpp_case_166(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_dropdown(static_cast<Entity>(41)), "nil:nil");
+        api.audio_set_volume(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_167(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_dropdown(static_cast<Entity>(41)), "nil:nil");
+        api.audio_set_volume(static_cast<Entity>(41), 1.5f);
 }
 
 static void cpp_case_168(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_dropdown(static_cast<Entity>(41), 4);
+        jce::diff::record_optional(s, api.ui_get_dropdown(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_169(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_dropdown(static_cast<Entity>(41), 4);
+        jce::diff::record_optional(s, api.ui_get_dropdown(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_170(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.ui_get_input_text(static_cast<Entity>(41)));
+        api.ui_set_dropdown(static_cast<Entity>(41), 4);
 }
 
 static void cpp_case_171(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.ui_get_input_text(static_cast<Entity>(41)));
+        api.ui_set_dropdown(static_cast<Entity>(41), 4);
 }
 
 static void cpp_case_172(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_input_text(static_cast<Entity>(41), "ui_set_input_text_text");
+        jce::diff::record(s, api.ui_get_input_text(static_cast<Entity>(41)));
 }
 
 static void cpp_case_173(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_input_text(static_cast<Entity>(41), "ui_set_input_text_text");
+        jce::diff::record(s, api.ui_get_input_text(static_cast<Entity>(41)));
 }
 
 static void cpp_case_174(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_scroll(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_input_text(static_cast<Entity>(41), "ui_set_input_text_text");
 }
 
 static void cpp_case_175(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.ui_get_scroll(static_cast<Entity>(41)), "nil:nil");
+        api.ui_set_input_text(static_cast<Entity>(41), "ui_set_input_text_text");
 }
 
 static void cpp_case_176(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_scroll(static_cast<Entity>(41), 1.5f, 2.5f);
+        jce::diff::record_optional(s, api.ui_get_scroll(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_177(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.ui_set_scroll(static_cast<Entity>(41), 1.5f, 2.5f);
+        jce::diff::record_optional(s, api.ui_get_scroll(static_cast<Entity>(41)), "nil:nil");
 }
 
 static void cpp_case_178(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_hour());
+        api.ui_set_scroll(static_cast<Entity>(41), 1.5f, 2.5f);
 }
 
 static void cpp_case_179(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_hour());
+        api.ui_set_scroll(static_cast<Entity>(41), 1.5f, 2.5f);
 }
 
 static void cpp_case_180(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.world_set_hour(0.5f);
+        jce::diff::record(s, api.world_get_hour());
 }
 
 static void cpp_case_181(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        api.world_set_hour(0.5f);
+        jce::diff::record(s, api.world_get_hour());
 }
 
 static void cpp_case_182(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_is_daytime());
+        api.world_set_hour(0.5f);
 }
 
 static void cpp_case_183(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_is_daytime());
+        api.world_set_hour(0.5f);
 }
 
 static void cpp_case_184(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_weather());
+        jce::diff::record(s, api.world_is_daytime());
 }
 
 static void cpp_case_185(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_weather());
+        jce::diff::record(s, api.world_is_daytime());
 }
 
 static void cpp_case_186(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_weather_intensity());
+        jce::diff::record(s, api.world_get_weather());
 }
 
 static void cpp_case_187(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_weather_intensity());
+        jce::diff::record(s, api.world_get_weather());
 }
 
 static void cpp_case_188(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_wind_speed());
+        jce::diff::record(s, api.world_get_weather_intensity());
 }
 
 static void cpp_case_189(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.world_get_wind_speed());
+        jce::diff::record(s, api.world_get_weather_intensity());
 }
 
 static void cpp_case_190(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.request_scene("request_scene_scene_path"));
+        jce::diff::record(s, api.world_get_wind_speed());
 }
 
 static void cpp_case_191(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.request_scene("request_scene_scene_path"));
+        jce::diff::record(s, api.world_get_wind_speed());
 }
 
 static void cpp_case_192(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_transitioning());
+        jce::diff::record(s, api.request_scene("request_scene_scene_path"));
 }
 
 static void cpp_case_193(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.is_transitioning());
+        jce::diff::record(s, api.request_scene("request_scene_scene_path"));
 }
 
 static void cpp_case_194(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_play(static_cast<Entity>(41)));
+        jce::diff::record(s, api.is_transitioning());
 }
 
 static void cpp_case_195(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_play(static_cast<Entity>(41)));
+        jce::diff::record(s, api.is_transitioning());
 }
 
 static void cpp_case_196(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_stop(static_cast<Entity>(41)));
+        jce::diff::record(s, api.audio_play(static_cast<Entity>(41)));
 }
 
 static void cpp_case_197(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_stop(static_cast<Entity>(41)));
+        jce::diff::record(s, api.audio_play(static_cast<Entity>(41)));
 }
 
 static void cpp_case_198(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_is_playing(static_cast<Entity>(41)));
+        jce::diff::record(s, api.audio_stop(static_cast<Entity>(41)));
 }
 
 static void cpp_case_199(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.audio_is_playing(static_cast<Entity>(41)));
+        jce::diff::record(s, api.audio_stop(static_cast<Entity>(41)));
 }
 
 static void cpp_case_200(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.save_game("save_game_path"));
+        jce::diff::record(s, api.audio_is_playing(static_cast<Entity>(41)));
 }
 
 static void cpp_case_201(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.save_game("save_game_path"));
+        jce::diff::record(s, api.audio_is_playing(static_cast<Entity>(41)));
 }
 
 static void cpp_case_202(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.load_game("load_game_path"));
+        jce::diff::record(s, api.save_game("save_game_path"));
 }
 
 static void cpp_case_203(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.load_game("load_game_path"));
+        jce::diff::record(s, api.save_game("save_game_path"));
 }
 
 static void cpp_case_204(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f, static_cast<std::uint32_t>(11)));
+        jce::diff::record(s, api.load_game("load_game_path"));
 }
 
 static void cpp_case_205(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f, static_cast<std::uint32_t>(11)));
+        jce::diff::record(s, api.load_game("load_game_path"));
 }
 
 static void cpp_case_206(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f));
+        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f, static_cast<std::uint32_t>(11)));
 }
 
 static void cpp_case_207(Api &api, jce::diff::Slots &s)
@@ -2611,19 +2698,19 @@ static void cpp_case_207(Api &api, jce::diff::Slots &s)
 static void cpp_case_208(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, static_cast<std::uint32_t>(13)));
+        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f));
 }
 
 static void cpp_case_209(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, static_cast<std::uint32_t>(13)));
+        jce::diff::record(s, api.overlap_sphere(0.5f, 1.5f, 2.5f, 3.5f, static_cast<std::uint32_t>(11)));
 }
 
 static void cpp_case_210(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f));
+        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, static_cast<std::uint32_t>(13)));
 }
 
 static void cpp_case_211(Api &api, jce::diff::Slots &s)
@@ -2635,49 +2722,133 @@ static void cpp_case_211(Api &api, jce::diff::Slots &s)
 static void cpp_case_212(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_param(static_cast<Entity>(41), "get_param_name"), "nil:nil");
+        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f));
 }
 
 static void cpp_case_213(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.get_param(static_cast<Entity>(41), "get_param_name"), "nil:nil");
+        jce::diff::record(s, api.overlap_box(0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, static_cast<std::uint32_t>(13)));
 }
 
 static void cpp_case_214(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_param_text(static_cast<Entity>(41), "get_param_text_name"));
+        jce::diff::record_optional(s, api.get_param(static_cast<Entity>(41), "get_param_name"), "nil:nil");
 }
 
 static void cpp_case_215(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.get_param_text(static_cast<Entity>(41), "get_param_text_name"));
+        jce::diff::record_optional(s, api.get_param(static_cast<Entity>(41), "get_param_name"), "nil:nil");
 }
 
 static void cpp_case_216(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.curve_eval("curve_eval_path", "curve_eval_channel", 2.5), "nil:nil");
+        jce::diff::record(s, api.get_param_text(static_cast<Entity>(41), "get_param_text_name"));
 }
 
 static void cpp_case_217(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record_optional(s, api.curve_eval("curve_eval_path", "curve_eval_channel", 2.5), "nil:nil");
+        jce::diff::record(s, api.get_param_text(static_cast<Entity>(41), "get_param_text_name"));
 }
 
 static void cpp_case_218(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
-        jce::diff::record(s, api.vcam_activate("vcam_activate_name"));
+        jce::diff::record_optional(s, api.curve_eval("curve_eval_path", "curve_eval_channel", 2.5), "nil:nil");
 }
 
 static void cpp_case_219(Api &api, jce::diff::Slots &s)
 {
     (void)api; (void)s;
+        jce::diff::record_optional(s, api.curve_eval("curve_eval_path", "curve_eval_channel", 2.5), "nil:nil");
+}
+
+static void cpp_case_220(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
         jce::diff::record(s, api.vcam_activate("vcam_activate_name"));
+}
+
+static void cpp_case_221(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.vcam_activate("vcam_activate_name"));
+}
+
+static void cpp_case_222(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.set_cursor("set_cursor_asset_path", 4, 5));
+}
+
+static void cpp_case_223(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.set_cursor("set_cursor_asset_path", 4, 5));
+}
+
+static void cpp_case_224(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.request_quit());
+}
+
+static void cpp_case_225(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.request_quit());
+}
+
+static void cpp_case_226(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_available());
+}
+
+static void cpp_case_227(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_available());
+}
+
+static void cpp_case_228(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_set("stat_set_id", 1.5));
+}
+
+static void cpp_case_229(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_set("stat_set_id", 1.5));
+}
+
+static void cpp_case_230(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_get("stat_get_id", 1.5));
+}
+
+static void cpp_case_231(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_get("stat_get_id", 1.5));
+}
+
+static void cpp_case_232(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_flush());
+}
+
+static void cpp_case_233(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.stat_flush());
 }
 
 struct DiffCase {
@@ -2773,141 +2944,155 @@ static const DiffCase g_cases[] = {
     { "get_axis [host says no]", jce::diff::MOCK_FAIL, "jce.get_axis('get_axis_name')", cpp_case_82 },
     { "get_pointer_delta", jce::diff::MOCK_OK, "jce.get_pointer_delta()", cpp_case_83 },
     { "get_pointer_delta [host says no]", jce::diff::MOCK_FAIL, "jce.get_pointer_delta()", cpp_case_84 },
-    { "get_pointer_wheel", jce::diff::MOCK_OK, "jce.get_pointer_wheel()", cpp_case_85 },
-    { "get_pointer_wheel [host says no]", jce::diff::MOCK_FAIL, "jce.get_pointer_wheel()", cpp_case_86 },
-    { "is_pointer_down", jce::diff::MOCK_OK, "jce.is_pointer_down(3)", cpp_case_87 },
-    { "is_pointer_down [host says no]", jce::diff::MOCK_FAIL, "jce.is_pointer_down(3)", cpp_case_88 },
-    { "get_touch_count", jce::diff::MOCK_OK, "jce.get_touch_count()", cpp_case_89 },
-    { "get_touch_count [host says no]", jce::diff::MOCK_FAIL, "jce.get_touch_count()", cpp_case_90 },
-    { "get_touch_count [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.get_touch_count()", cpp_case_91 },
-    { "get_touch", jce::diff::MOCK_OK, "jce.get_touch(4)", cpp_case_92 },
-    { "get_touch [host says no]", jce::diff::MOCK_FAIL, "jce.get_touch(4)", cpp_case_93 },
-    { "get_touch [below the index base]", jce::diff::MOCK_OK, "jce.get_touch(0)", cpp_case_94 },
-    { "tr", jce::diff::MOCK_OK, "jce.tr('tr_key')", cpp_case_95 },
-    { "tr [host says no]", jce::diff::MOCK_FAIL, "jce.tr('tr_key')", cpp_case_96 },
-    { "get_locale", jce::diff::MOCK_OK, "jce.get_locale()", cpp_case_97 },
-    { "get_locale [host says no]", jce::diff::MOCK_FAIL, "jce.get_locale()", cpp_case_98 },
-    { "set_locale", jce::diff::MOCK_OK, "jce.set_locale('set_locale_locale')", cpp_case_99 },
-    { "set_locale [host says no]", jce::diff::MOCK_FAIL, "jce.set_locale('set_locale_locale')", cpp_case_100 },
-    { "get_velocity", jce::diff::MOCK_OK, "jce.get_velocity(41)", cpp_case_101 },
-    { "get_velocity [host says no]", jce::diff::MOCK_FAIL, "jce.get_velocity(41)", cpp_case_102 },
-    { "vehicle_set_input", jce::diff::MOCK_OK, "jce.vehicle_set_input(41, 1.5, 2.5, 3.5)", cpp_case_103 },
-    { "vehicle_set_input [host says no]", jce::diff::MOCK_FAIL, "jce.vehicle_set_input(41, 1.5, 2.5, 3.5)", cpp_case_104 },
-    { "vehicle_get_speed", jce::diff::MOCK_OK, "jce.vehicle_get_speed(41)", cpp_case_105 },
-    { "vehicle_get_speed [host says no]", jce::diff::MOCK_FAIL, "jce.vehicle_get_speed(41)", cpp_case_106 },
-    { "get_move", jce::diff::MOCK_OK, "jce.get_move()", cpp_case_107 },
-    { "get_move [host says no]", jce::diff::MOCK_FAIL, "jce.get_move()", cpp_case_108 },
-    { "ui_get_slider", jce::diff::MOCK_OK, "jce.ui_get_slider(41)", cpp_case_109 },
-    { "ui_get_slider [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_slider(41)", cpp_case_110 },
-    { "ui_set_slider", jce::diff::MOCK_OK, "jce.ui_set_slider(41, 1.5)", cpp_case_111 },
-    { "ui_set_slider [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_slider(41, 1.5)", cpp_case_112 },
-    { "ui_get_progress", jce::diff::MOCK_OK, "jce.ui_get_progress(41)", cpp_case_113 },
-    { "ui_get_progress [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_progress(41)", cpp_case_114 },
-    { "ui_set_progress", jce::diff::MOCK_OK, "jce.ui_set_progress(41, 1.5)", cpp_case_115 },
-    { "ui_set_progress [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_progress(41, 1.5)", cpp_case_116 },
-    { "ui_get_toggle", jce::diff::MOCK_OK, "jce.ui_get_toggle(41)", cpp_case_117 },
-    { "ui_get_toggle [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_toggle(41)", cpp_case_118 },
-    { "ui_set_toggle", jce::diff::MOCK_OK, "jce.ui_set_toggle(41, true)", cpp_case_119 },
-    { "ui_set_toggle [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_toggle(41, true)", cpp_case_120 },
-    { "ui_set_text", jce::diff::MOCK_OK, "jce.ui_set_text(41, 'ui_set_text_txt')", cpp_case_121 },
-    { "ui_set_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_text(41, 'ui_set_text_txt')", cpp_case_122 },
-    { "send_message", jce::diff::MOCK_OK, "jce.send_message(41, 'send_message_msg', 2.5, 'send_message_str_arg')", cpp_case_123 },
-    { "send_message [host says no]", jce::diff::MOCK_FAIL, "jce.send_message(41, 'send_message_msg', 2.5, 'send_message_str_arg')", cpp_case_124 },
-    { "send_message [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.send_message(41, 'send_message_msg')", cpp_case_125 },
-    { "broadcast", jce::diff::MOCK_OK, "jce.broadcast('broadcast_msg', 1.5, 'broadcast_str_arg')", cpp_case_126 },
-    { "broadcast [host says no]", jce::diff::MOCK_FAIL, "jce.broadcast('broadcast_msg', 1.5, 'broadcast_str_arg')", cpp_case_127 },
-    { "broadcast [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.broadcast('broadcast_msg')", cpp_case_128 },
-    { "has_component", jce::diff::MOCK_OK, "jce.has_component(41, 'has_component_comp_name')", cpp_case_129 },
-    { "has_component [host says no]", jce::diff::MOCK_FAIL, "jce.has_component(41, 'has_component_comp_name')", cpp_case_130 },
-    { "is_component_enabled", jce::diff::MOCK_OK, "jce.is_component_enabled(41, 'is_component_enabled_comp_name')", cpp_case_131 },
-    { "is_component_enabled [host says no]", jce::diff::MOCK_FAIL, "jce.is_component_enabled(41, 'is_component_enabled_comp_name')", cpp_case_132 },
-    { "set_component_enabled", jce::diff::MOCK_OK, "jce.set_component_enabled(41, 'set_component_enabled_comp_name', true)", cpp_case_133 },
-    { "set_component_enabled [host says no]", jce::diff::MOCK_FAIL, "jce.set_component_enabled(41, 'set_component_enabled_comp_name', true)", cpp_case_134 },
-    { "net_is_server", jce::diff::MOCK_OK, "jce.net_is_server()", cpp_case_135 },
-    { "net_is_server [host says no]", jce::diff::MOCK_FAIL, "jce.net_is_server()", cpp_case_136 },
-    { "net_is_client", jce::diff::MOCK_OK, "jce.net_is_client()", cpp_case_137 },
-    { "net_is_client [host says no]", jce::diff::MOCK_FAIL, "jce.net_is_client()", cpp_case_138 },
-    { "net_spawn", jce::diff::MOCK_OK, "jce.net_spawn('net_spawn_prefab_path', 1.5, 2.5, 3.5)", cpp_case_139 },
-    { "net_spawn [host says no]", jce::diff::MOCK_FAIL, "jce.net_spawn('net_spawn_prefab_path', 1.5, 2.5, 3.5)", cpp_case_140 },
-    { "rpc_send", jce::diff::MOCK_OK, "jce.rpc_send(41, 'rpc_send_event', 5, 'rpc_send_payload')", cpp_case_141 },
-    { "rpc_send [host says no]", jce::diff::MOCK_FAIL, "jce.rpc_send(41, 'rpc_send_event', 5, 'rpc_send_payload')", cpp_case_142 },
-    { "rpc_send [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.rpc_send(41, 'rpc_send_event')", cpp_case_143 },
-    { "particle_burst", jce::diff::MOCK_OK, "jce.particle_burst(41, 4)", cpp_case_144 },
-    { "particle_burst [host says no]", jce::diff::MOCK_FAIL, "jce.particle_burst(41, 4)", cpp_case_145 },
-    { "particle_set_emitting", jce::diff::MOCK_OK, "jce.particle_set_emitting(41, true)", cpp_case_146 },
-    { "particle_set_emitting [host says no]", jce::diff::MOCK_FAIL, "jce.particle_set_emitting(41, true)", cpp_case_147 },
-    { "particle_set_color", jce::diff::MOCK_OK, "jce.particle_set_color(41, 1.5, 2.5, 3.5)", cpp_case_148 },
-    { "particle_set_color [host says no]", jce::diff::MOCK_FAIL, "jce.particle_set_color(41, 1.5, 2.5, 3.5)", cpp_case_149 },
-    { "find_by_name", jce::diff::MOCK_OK, "jce.find_by_name('find_by_name_name')", cpp_case_150 },
-    { "find_by_name [host says no]", jce::diff::MOCK_FAIL, "jce.find_by_name('find_by_name_name')", cpp_case_151 },
-    { "find_by_name [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.find_by_name('find_by_name_name')", cpp_case_152 },
-    { "find_by_prefix", jce::diff::MOCK_OK, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_153 },
-    { "find_by_prefix [host says no]", jce::diff::MOCK_FAIL, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_154 },
-    { "find_by_prefix [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_155 },
-    { "comp_get", jce::diff::MOCK_OK, "jce.comp_get(41, 'comp_get_type')", cpp_case_156 },
-    { "comp_get [host says no]", jce::diff::MOCK_FAIL, "jce.comp_get(41, 'comp_get_type')", cpp_case_157 },
-    { "comp_set", jce::diff::MOCK_OK, "jce.comp_set(41, 'comp_set_type', 'comp_set_json')", cpp_case_158 },
-    { "comp_set [host says no]", jce::diff::MOCK_FAIL, "jce.comp_set(41, 'comp_set_type', 'comp_set_json')", cpp_case_159 },
-    { "render_get", jce::diff::MOCK_OK, "jce.render_get()", cpp_case_160 },
-    { "render_get [host says no]", jce::diff::MOCK_FAIL, "jce.render_get()", cpp_case_161 },
-    { "render_set", jce::diff::MOCK_OK, "jce.render_set('render_set_json')", cpp_case_162 },
-    { "render_set [host says no]", jce::diff::MOCK_FAIL, "jce.render_set('render_set_json')", cpp_case_163 },
-    { "audio_set_volume", jce::diff::MOCK_OK, "jce.audio_set_volume(41, 1.5)", cpp_case_164 },
-    { "audio_set_volume [host says no]", jce::diff::MOCK_FAIL, "jce.audio_set_volume(41, 1.5)", cpp_case_165 },
-    { "ui_get_dropdown", jce::diff::MOCK_OK, "jce.ui_get_dropdown(41)", cpp_case_166 },
-    { "ui_get_dropdown [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_dropdown(41)", cpp_case_167 },
-    { "ui_set_dropdown", jce::diff::MOCK_OK, "jce.ui_set_dropdown(41, 4)", cpp_case_168 },
-    { "ui_set_dropdown [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_dropdown(41, 4)", cpp_case_169 },
-    { "ui_get_input_text", jce::diff::MOCK_OK, "jce.ui_get_input_text(41)", cpp_case_170 },
-    { "ui_get_input_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_input_text(41)", cpp_case_171 },
-    { "ui_set_input_text", jce::diff::MOCK_OK, "jce.ui_set_input_text(41, 'ui_set_input_text_text')", cpp_case_172 },
-    { "ui_set_input_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_input_text(41, 'ui_set_input_text_text')", cpp_case_173 },
-    { "ui_get_scroll", jce::diff::MOCK_OK, "jce.ui_get_scroll(41)", cpp_case_174 },
-    { "ui_get_scroll [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_scroll(41)", cpp_case_175 },
-    { "ui_set_scroll", jce::diff::MOCK_OK, "jce.ui_set_scroll(41, 1.5, 2.5)", cpp_case_176 },
-    { "ui_set_scroll [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_scroll(41, 1.5, 2.5)", cpp_case_177 },
-    { "world_get_hour", jce::diff::MOCK_OK, "jce.world_get_hour()", cpp_case_178 },
-    { "world_get_hour [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_hour()", cpp_case_179 },
-    { "world_set_hour", jce::diff::MOCK_OK, "jce.world_set_hour(0.5)", cpp_case_180 },
-    { "world_set_hour [host says no]", jce::diff::MOCK_FAIL, "jce.world_set_hour(0.5)", cpp_case_181 },
-    { "world_is_daytime", jce::diff::MOCK_OK, "jce.world_is_daytime()", cpp_case_182 },
-    { "world_is_daytime [host says no]", jce::diff::MOCK_FAIL, "jce.world_is_daytime()", cpp_case_183 },
-    { "world_get_weather", jce::diff::MOCK_OK, "jce.world_get_weather()", cpp_case_184 },
-    { "world_get_weather [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_weather()", cpp_case_185 },
-    { "world_get_weather_intensity", jce::diff::MOCK_OK, "jce.world_get_weather_intensity()", cpp_case_186 },
-    { "world_get_weather_intensity [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_weather_intensity()", cpp_case_187 },
-    { "world_get_wind_speed", jce::diff::MOCK_OK, "jce.world_get_wind_speed()", cpp_case_188 },
-    { "world_get_wind_speed [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_wind_speed()", cpp_case_189 },
-    { "request_scene", jce::diff::MOCK_OK, "jce.request_scene('request_scene_scene_path')", cpp_case_190 },
-    { "request_scene [host says no]", jce::diff::MOCK_FAIL, "jce.request_scene('request_scene_scene_path')", cpp_case_191 },
-    { "is_transitioning", jce::diff::MOCK_OK, "jce.is_transitioning()", cpp_case_192 },
-    { "is_transitioning [host says no]", jce::diff::MOCK_FAIL, "jce.is_transitioning()", cpp_case_193 },
-    { "audio_play", jce::diff::MOCK_OK, "jce.audio_play(41)", cpp_case_194 },
-    { "audio_play [host says no]", jce::diff::MOCK_FAIL, "jce.audio_play(41)", cpp_case_195 },
-    { "audio_stop", jce::diff::MOCK_OK, "jce.audio_stop(41)", cpp_case_196 },
-    { "audio_stop [host says no]", jce::diff::MOCK_FAIL, "jce.audio_stop(41)", cpp_case_197 },
-    { "audio_is_playing", jce::diff::MOCK_OK, "jce.audio_is_playing(41)", cpp_case_198 },
-    { "audio_is_playing [host says no]", jce::diff::MOCK_FAIL, "jce.audio_is_playing(41)", cpp_case_199 },
-    { "save_game", jce::diff::MOCK_OK, "jce.save_game('save_game_path')", cpp_case_200 },
-    { "save_game [host says no]", jce::diff::MOCK_FAIL, "jce.save_game('save_game_path')", cpp_case_201 },
-    { "load_game", jce::diff::MOCK_OK, "jce.load_game('load_game_path')", cpp_case_202 },
-    { "load_game [host says no]", jce::diff::MOCK_FAIL, "jce.load_game('load_game_path')", cpp_case_203 },
-    { "overlap_sphere", jce::diff::MOCK_OK, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_204 },
-    { "overlap_sphere [host says no]", jce::diff::MOCK_FAIL, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_205 },
-    { "overlap_sphere [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5)", cpp_case_206 },
-    { "overlap_sphere [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_207 },
-    { "overlap_box", jce::diff::MOCK_OK, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_208 },
-    { "overlap_box [host says no]", jce::diff::MOCK_FAIL, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_209 },
-    { "overlap_box [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5)", cpp_case_210 },
-    { "overlap_box [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_211 },
-    { "get_param", jce::diff::MOCK_OK, "jce.get_param(41, 'get_param_name')", cpp_case_212 },
-    { "get_param [host says no]", jce::diff::MOCK_FAIL, "jce.get_param(41, 'get_param_name')", cpp_case_213 },
-    { "get_param_text", jce::diff::MOCK_OK, "jce.get_param_text(41, 'get_param_text_name')", cpp_case_214 },
-    { "get_param_text [host says no]", jce::diff::MOCK_FAIL, "jce.get_param_text(41, 'get_param_text_name')", cpp_case_215 },
-    { "curve_eval", jce::diff::MOCK_OK, "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2.5)", cpp_case_216 },
-    { "curve_eval [host says no]", jce::diff::MOCK_FAIL, "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2.5)", cpp_case_217 },
-    { "vcam_activate", jce::diff::MOCK_OK, "jce.vcam_activate('vcam_activate_name')", cpp_case_218 },
-    { "vcam_activate [host says no]", jce::diff::MOCK_FAIL, "jce.vcam_activate('vcam_activate_name')", cpp_case_219 },
+    { "get_pointer_position", jce::diff::MOCK_OK, "jce.get_pointer_position()", cpp_case_85 },
+    { "get_pointer_position [host says no]", jce::diff::MOCK_FAIL, "jce.get_pointer_position()", cpp_case_86 },
+    { "get_pointer_wheel", jce::diff::MOCK_OK, "jce.get_pointer_wheel()", cpp_case_87 },
+    { "get_pointer_wheel [host says no]", jce::diff::MOCK_FAIL, "jce.get_pointer_wheel()", cpp_case_88 },
+    { "is_pointer_down", jce::diff::MOCK_OK, "jce.is_pointer_down(3)", cpp_case_89 },
+    { "is_pointer_down [host says no]", jce::diff::MOCK_FAIL, "jce.is_pointer_down(3)", cpp_case_90 },
+    { "get_touch_count", jce::diff::MOCK_OK, "jce.get_touch_count()", cpp_case_91 },
+    { "get_touch_count [host says no]", jce::diff::MOCK_FAIL, "jce.get_touch_count()", cpp_case_92 },
+    { "get_touch_count [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.get_touch_count()", cpp_case_93 },
+    { "get_touch", jce::diff::MOCK_OK, "jce.get_touch(4)", cpp_case_94 },
+    { "get_touch [host says no]", jce::diff::MOCK_FAIL, "jce.get_touch(4)", cpp_case_95 },
+    { "get_touch [below the index base]", jce::diff::MOCK_OK, "jce.get_touch(0)", cpp_case_96 },
+    { "tr", jce::diff::MOCK_OK, "jce.tr('tr_key')", cpp_case_97 },
+    { "tr [host says no]", jce::diff::MOCK_FAIL, "jce.tr('tr_key')", cpp_case_98 },
+    { "get_locale", jce::diff::MOCK_OK, "jce.get_locale()", cpp_case_99 },
+    { "get_locale [host says no]", jce::diff::MOCK_FAIL, "jce.get_locale()", cpp_case_100 },
+    { "set_locale", jce::diff::MOCK_OK, "jce.set_locale('set_locale_locale')", cpp_case_101 },
+    { "set_locale [host says no]", jce::diff::MOCK_FAIL, "jce.set_locale('set_locale_locale')", cpp_case_102 },
+    { "get_velocity", jce::diff::MOCK_OK, "jce.get_velocity(41)", cpp_case_103 },
+    { "get_velocity [host says no]", jce::diff::MOCK_FAIL, "jce.get_velocity(41)", cpp_case_104 },
+    { "vehicle_set_input", jce::diff::MOCK_OK, "jce.vehicle_set_input(41, 1.5, 2.5, 3.5)", cpp_case_105 },
+    { "vehicle_set_input [host says no]", jce::diff::MOCK_FAIL, "jce.vehicle_set_input(41, 1.5, 2.5, 3.5)", cpp_case_106 },
+    { "vehicle_get_speed", jce::diff::MOCK_OK, "jce.vehicle_get_speed(41)", cpp_case_107 },
+    { "vehicle_get_speed [host says no]", jce::diff::MOCK_FAIL, "jce.vehicle_get_speed(41)", cpp_case_108 },
+    { "get_move", jce::diff::MOCK_OK, "jce.get_move()", cpp_case_109 },
+    { "get_move [host says no]", jce::diff::MOCK_FAIL, "jce.get_move()", cpp_case_110 },
+    { "ui_get_slider", jce::diff::MOCK_OK, "jce.ui_get_slider(41)", cpp_case_111 },
+    { "ui_get_slider [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_slider(41)", cpp_case_112 },
+    { "ui_set_slider", jce::diff::MOCK_OK, "jce.ui_set_slider(41, 1.5)", cpp_case_113 },
+    { "ui_set_slider [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_slider(41, 1.5)", cpp_case_114 },
+    { "ui_get_progress", jce::diff::MOCK_OK, "jce.ui_get_progress(41)", cpp_case_115 },
+    { "ui_get_progress [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_progress(41)", cpp_case_116 },
+    { "ui_set_progress", jce::diff::MOCK_OK, "jce.ui_set_progress(41, 1.5)", cpp_case_117 },
+    { "ui_set_progress [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_progress(41, 1.5)", cpp_case_118 },
+    { "ui_get_toggle", jce::diff::MOCK_OK, "jce.ui_get_toggle(41)", cpp_case_119 },
+    { "ui_get_toggle [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_toggle(41)", cpp_case_120 },
+    { "ui_set_toggle", jce::diff::MOCK_OK, "jce.ui_set_toggle(41, true)", cpp_case_121 },
+    { "ui_set_toggle [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_toggle(41, true)", cpp_case_122 },
+    { "ui_set_text", jce::diff::MOCK_OK, "jce.ui_set_text(41, 'ui_set_text_txt')", cpp_case_123 },
+    { "ui_set_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_text(41, 'ui_set_text_txt')", cpp_case_124 },
+    { "send_message", jce::diff::MOCK_OK, "jce.send_message(41, 'send_message_msg', 2.5, 'send_message_str_arg')", cpp_case_125 },
+    { "send_message [host says no]", jce::diff::MOCK_FAIL, "jce.send_message(41, 'send_message_msg', 2.5, 'send_message_str_arg')", cpp_case_126 },
+    { "send_message [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.send_message(41, 'send_message_msg')", cpp_case_127 },
+    { "broadcast", jce::diff::MOCK_OK, "jce.broadcast('broadcast_msg', 1.5, 'broadcast_str_arg')", cpp_case_128 },
+    { "broadcast [host says no]", jce::diff::MOCK_FAIL, "jce.broadcast('broadcast_msg', 1.5, 'broadcast_str_arg')", cpp_case_129 },
+    { "broadcast [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.broadcast('broadcast_msg')", cpp_case_130 },
+    { "has_component", jce::diff::MOCK_OK, "jce.has_component(41, 'has_component_comp_name')", cpp_case_131 },
+    { "has_component [host says no]", jce::diff::MOCK_FAIL, "jce.has_component(41, 'has_component_comp_name')", cpp_case_132 },
+    { "is_component_enabled", jce::diff::MOCK_OK, "jce.is_component_enabled(41, 'is_component_enabled_comp_name')", cpp_case_133 },
+    { "is_component_enabled [host says no]", jce::diff::MOCK_FAIL, "jce.is_component_enabled(41, 'is_component_enabled_comp_name')", cpp_case_134 },
+    { "set_component_enabled", jce::diff::MOCK_OK, "jce.set_component_enabled(41, 'set_component_enabled_comp_name', true)", cpp_case_135 },
+    { "set_component_enabled [host says no]", jce::diff::MOCK_FAIL, "jce.set_component_enabled(41, 'set_component_enabled_comp_name', true)", cpp_case_136 },
+    { "net_is_server", jce::diff::MOCK_OK, "jce.net_is_server()", cpp_case_137 },
+    { "net_is_server [host says no]", jce::diff::MOCK_FAIL, "jce.net_is_server()", cpp_case_138 },
+    { "net_is_client", jce::diff::MOCK_OK, "jce.net_is_client()", cpp_case_139 },
+    { "net_is_client [host says no]", jce::diff::MOCK_FAIL, "jce.net_is_client()", cpp_case_140 },
+    { "net_spawn", jce::diff::MOCK_OK, "jce.net_spawn('net_spawn_prefab_path', 1.5, 2.5, 3.5)", cpp_case_141 },
+    { "net_spawn [host says no]", jce::diff::MOCK_FAIL, "jce.net_spawn('net_spawn_prefab_path', 1.5, 2.5, 3.5)", cpp_case_142 },
+    { "rpc_send", jce::diff::MOCK_OK, "jce.rpc_send(41, 'rpc_send_event', 5, 'rpc_send_payload')", cpp_case_143 },
+    { "rpc_send [host says no]", jce::diff::MOCK_FAIL, "jce.rpc_send(41, 'rpc_send_event', 5, 'rpc_send_payload')", cpp_case_144 },
+    { "rpc_send [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.rpc_send(41, 'rpc_send_event')", cpp_case_145 },
+    { "particle_burst", jce::diff::MOCK_OK, "jce.particle_burst(41, 4)", cpp_case_146 },
+    { "particle_burst [host says no]", jce::diff::MOCK_FAIL, "jce.particle_burst(41, 4)", cpp_case_147 },
+    { "particle_set_emitting", jce::diff::MOCK_OK, "jce.particle_set_emitting(41, true)", cpp_case_148 },
+    { "particle_set_emitting [host says no]", jce::diff::MOCK_FAIL, "jce.particle_set_emitting(41, true)", cpp_case_149 },
+    { "particle_set_color", jce::diff::MOCK_OK, "jce.particle_set_color(41, 1.5, 2.5, 3.5)", cpp_case_150 },
+    { "particle_set_color [host says no]", jce::diff::MOCK_FAIL, "jce.particle_set_color(41, 1.5, 2.5, 3.5)", cpp_case_151 },
+    { "find_by_name", jce::diff::MOCK_OK, "jce.find_by_name('find_by_name_name')", cpp_case_152 },
+    { "find_by_name [host says no]", jce::diff::MOCK_FAIL, "jce.find_by_name('find_by_name_name')", cpp_case_153 },
+    { "find_by_name [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.find_by_name('find_by_name_name')", cpp_case_154 },
+    { "find_by_prefix", jce::diff::MOCK_OK, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_155 },
+    { "find_by_prefix [host says no]", jce::diff::MOCK_FAIL, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_156 },
+    { "find_by_prefix [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.find_by_prefix('find_by_prefix_prefix')", cpp_case_157 },
+    { "comp_get", jce::diff::MOCK_OK, "jce.comp_get(41, 'comp_get_type')", cpp_case_158 },
+    { "comp_get [host says no]", jce::diff::MOCK_FAIL, "jce.comp_get(41, 'comp_get_type')", cpp_case_159 },
+    { "comp_set", jce::diff::MOCK_OK, "jce.comp_set(41, 'comp_set_type', 'comp_set_json')", cpp_case_160 },
+    { "comp_set [host says no]", jce::diff::MOCK_FAIL, "jce.comp_set(41, 'comp_set_type', 'comp_set_json')", cpp_case_161 },
+    { "render_get", jce::diff::MOCK_OK, "jce.render_get()", cpp_case_162 },
+    { "render_get [host says no]", jce::diff::MOCK_FAIL, "jce.render_get()", cpp_case_163 },
+    { "render_set", jce::diff::MOCK_OK, "jce.render_set('render_set_json')", cpp_case_164 },
+    { "render_set [host says no]", jce::diff::MOCK_FAIL, "jce.render_set('render_set_json')", cpp_case_165 },
+    { "audio_set_volume", jce::diff::MOCK_OK, "jce.audio_set_volume(41, 1.5)", cpp_case_166 },
+    { "audio_set_volume [host says no]", jce::diff::MOCK_FAIL, "jce.audio_set_volume(41, 1.5)", cpp_case_167 },
+    { "ui_get_dropdown", jce::diff::MOCK_OK, "jce.ui_get_dropdown(41)", cpp_case_168 },
+    { "ui_get_dropdown [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_dropdown(41)", cpp_case_169 },
+    { "ui_set_dropdown", jce::diff::MOCK_OK, "jce.ui_set_dropdown(41, 4)", cpp_case_170 },
+    { "ui_set_dropdown [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_dropdown(41, 4)", cpp_case_171 },
+    { "ui_get_input_text", jce::diff::MOCK_OK, "jce.ui_get_input_text(41)", cpp_case_172 },
+    { "ui_get_input_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_input_text(41)", cpp_case_173 },
+    { "ui_set_input_text", jce::diff::MOCK_OK, "jce.ui_set_input_text(41, 'ui_set_input_text_text')", cpp_case_174 },
+    { "ui_set_input_text [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_input_text(41, 'ui_set_input_text_text')", cpp_case_175 },
+    { "ui_get_scroll", jce::diff::MOCK_OK, "jce.ui_get_scroll(41)", cpp_case_176 },
+    { "ui_get_scroll [host says no]", jce::diff::MOCK_FAIL, "jce.ui_get_scroll(41)", cpp_case_177 },
+    { "ui_set_scroll", jce::diff::MOCK_OK, "jce.ui_set_scroll(41, 1.5, 2.5)", cpp_case_178 },
+    { "ui_set_scroll [host says no]", jce::diff::MOCK_FAIL, "jce.ui_set_scroll(41, 1.5, 2.5)", cpp_case_179 },
+    { "world_get_hour", jce::diff::MOCK_OK, "jce.world_get_hour()", cpp_case_180 },
+    { "world_get_hour [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_hour()", cpp_case_181 },
+    { "world_set_hour", jce::diff::MOCK_OK, "jce.world_set_hour(0.5)", cpp_case_182 },
+    { "world_set_hour [host says no]", jce::diff::MOCK_FAIL, "jce.world_set_hour(0.5)", cpp_case_183 },
+    { "world_is_daytime", jce::diff::MOCK_OK, "jce.world_is_daytime()", cpp_case_184 },
+    { "world_is_daytime [host says no]", jce::diff::MOCK_FAIL, "jce.world_is_daytime()", cpp_case_185 },
+    { "world_get_weather", jce::diff::MOCK_OK, "jce.world_get_weather()", cpp_case_186 },
+    { "world_get_weather [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_weather()", cpp_case_187 },
+    { "world_get_weather_intensity", jce::diff::MOCK_OK, "jce.world_get_weather_intensity()", cpp_case_188 },
+    { "world_get_weather_intensity [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_weather_intensity()", cpp_case_189 },
+    { "world_get_wind_speed", jce::diff::MOCK_OK, "jce.world_get_wind_speed()", cpp_case_190 },
+    { "world_get_wind_speed [host says no]", jce::diff::MOCK_FAIL, "jce.world_get_wind_speed()", cpp_case_191 },
+    { "request_scene", jce::diff::MOCK_OK, "jce.request_scene('request_scene_scene_path')", cpp_case_192 },
+    { "request_scene [host says no]", jce::diff::MOCK_FAIL, "jce.request_scene('request_scene_scene_path')", cpp_case_193 },
+    { "is_transitioning", jce::diff::MOCK_OK, "jce.is_transitioning()", cpp_case_194 },
+    { "is_transitioning [host says no]", jce::diff::MOCK_FAIL, "jce.is_transitioning()", cpp_case_195 },
+    { "audio_play", jce::diff::MOCK_OK, "jce.audio_play(41)", cpp_case_196 },
+    { "audio_play [host says no]", jce::diff::MOCK_FAIL, "jce.audio_play(41)", cpp_case_197 },
+    { "audio_stop", jce::diff::MOCK_OK, "jce.audio_stop(41)", cpp_case_198 },
+    { "audio_stop [host says no]", jce::diff::MOCK_FAIL, "jce.audio_stop(41)", cpp_case_199 },
+    { "audio_is_playing", jce::diff::MOCK_OK, "jce.audio_is_playing(41)", cpp_case_200 },
+    { "audio_is_playing [host says no]", jce::diff::MOCK_FAIL, "jce.audio_is_playing(41)", cpp_case_201 },
+    { "save_game", jce::diff::MOCK_OK, "jce.save_game('save_game_path')", cpp_case_202 },
+    { "save_game [host says no]", jce::diff::MOCK_FAIL, "jce.save_game('save_game_path')", cpp_case_203 },
+    { "load_game", jce::diff::MOCK_OK, "jce.load_game('load_game_path')", cpp_case_204 },
+    { "load_game [host says no]", jce::diff::MOCK_FAIL, "jce.load_game('load_game_path')", cpp_case_205 },
+    { "overlap_sphere", jce::diff::MOCK_OK, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_206 },
+    { "overlap_sphere [host says no]", jce::diff::MOCK_FAIL, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_207 },
+    { "overlap_sphere [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5)", cpp_case_208 },
+    { "overlap_sphere [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.overlap_sphere(0.5, 1.5, 2.5, 3.5, 11)", cpp_case_209 },
+    { "overlap_box", jce::diff::MOCK_OK, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_210 },
+    { "overlap_box [host says no]", jce::diff::MOCK_FAIL, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_211 },
+    { "overlap_box [trailing defaults omitted]", jce::diff::MOCK_OK, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5)", cpp_case_212 },
+    { "overlap_box [host returns a negative count]", jce::diff::MOCK_NEGATIVE, "jce.overlap_box(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 13)", cpp_case_213 },
+    { "get_param", jce::diff::MOCK_OK, "jce.get_param(41, 'get_param_name')", cpp_case_214 },
+    { "get_param [host says no]", jce::diff::MOCK_FAIL, "jce.get_param(41, 'get_param_name')", cpp_case_215 },
+    { "get_param_text", jce::diff::MOCK_OK, "jce.get_param_text(41, 'get_param_text_name')", cpp_case_216 },
+    { "get_param_text [host says no]", jce::diff::MOCK_FAIL, "jce.get_param_text(41, 'get_param_text_name')", cpp_case_217 },
+    { "curve_eval", jce::diff::MOCK_OK, "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2.5)", cpp_case_218 },
+    { "curve_eval [host says no]", jce::diff::MOCK_FAIL, "jce.curve_eval('curve_eval_path', 'curve_eval_channel', 2.5)", cpp_case_219 },
+    { "vcam_activate", jce::diff::MOCK_OK, "jce.vcam_activate('vcam_activate_name')", cpp_case_220 },
+    { "vcam_activate [host says no]", jce::diff::MOCK_FAIL, "jce.vcam_activate('vcam_activate_name')", cpp_case_221 },
+    { "set_cursor", jce::diff::MOCK_OK, "jce.set_cursor('set_cursor_asset_path', 4, 5)", cpp_case_222 },
+    { "set_cursor [host says no]", jce::diff::MOCK_FAIL, "jce.set_cursor('set_cursor_asset_path', 4, 5)", cpp_case_223 },
+    { "request_quit", jce::diff::MOCK_OK, "jce.request_quit()", cpp_case_224 },
+    { "request_quit [host says no]", jce::diff::MOCK_FAIL, "jce.request_quit()", cpp_case_225 },
+    { "stat_available", jce::diff::MOCK_OK, "jce.stat_available()", cpp_case_226 },
+    { "stat_available [host says no]", jce::diff::MOCK_FAIL, "jce.stat_available()", cpp_case_227 },
+    { "stat_set", jce::diff::MOCK_OK, "jce.stat_set('stat_set_id', 1.5)", cpp_case_228 },
+    { "stat_set [host says no]", jce::diff::MOCK_FAIL, "jce.stat_set('stat_set_id', 1.5)", cpp_case_229 },
+    { "stat_get", jce::diff::MOCK_OK, "jce.stat_get('stat_get_id', 1.5)", cpp_case_230 },
+    { "stat_get [host says no]", jce::diff::MOCK_FAIL, "jce.stat_get('stat_get_id', 1.5)", cpp_case_231 },
+    { "stat_flush", jce::diff::MOCK_OK, "jce.stat_flush()", cpp_case_232 },
+    { "stat_flush [host says no]", jce::diff::MOCK_FAIL, "jce.stat_flush()", cpp_case_233 },
 };
 
 #define JCE_DIFF_CASES ((int)(sizeof g_cases / sizeof g_cases[0]))

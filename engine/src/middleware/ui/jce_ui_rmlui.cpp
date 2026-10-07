@@ -498,6 +498,7 @@ struct JceRmlBackend {
     std::string                         temp_text;
 
     uint32_t width  = 0;
+    bool pointer_down = false;
     uint32_t height = 0;
 };
 
@@ -903,23 +904,29 @@ void jce_rml_process_pointer_input(JceRmlBackend *b, const JceInput *input)
 {
     if (!b || !b->context || !input) return;
 
-    /* Mouse position. */
+    /* Use the shared primary pointer without merging gameplay channels. */
     float mx = 0, my = 0;
-    jce_input_mouse_pos(input, &mx, &my);
+    bool down = false;
+    (void)jce_input_primary_pointer(input, (float)b->width, (float)b->height,
+                                    &mx, &my, &down);
     try { b->context->ProcessMouseMove((int)mx, (int)my, 0); }
     catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseMove threw"); return; }
 
     /* Mouse buttons (left=0, right=1, middle=2). */
     for (int btn = 0; btn < 3; btn++) {
-        if (jce_input_mouse_button_pressed(input, btn + 1)) {
+        if (btn == 0 ? down && !b->pointer_down :
+                       jce_input_mouse_button_pressed(input, btn + 1)) {
             try { b->context->ProcessMouseButtonDown(btn, 0); }
             catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseButtonDown threw"); }
         }
-        if (jce_input_mouse_button_released(input, btn + 1)) {
+        if (btn == 0 ? !down && b->pointer_down :
+                       jce_input_mouse_button_released(input, btn + 1)) {
             try { b->context->ProcessMouseButtonUp(btn, 0); }
             catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseButtonUp threw"); }
         }
     }
+
+    b->pointer_down = down;
 
     /* Mouse wheel. */
     float wheel = jce_input_mouse_wheel(input);

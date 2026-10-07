@@ -1,3 +1,5 @@
+#include "cli/jce_tool_main.h"
+#include "cli/jce_tool_io.h"
 /* jce_pak.c
  *
  * Host tool that packs resource files into a JCE PAK archive.
@@ -24,25 +26,11 @@
  *           --obj-arch     x64|arm64|x86|arm (default: x64)
  */
 
-/* Ensure POSIX functions (strdup, etc.) are declared on glibc/Linux. */
-#ifndef _WIN32
-#  ifndef _POSIX_C_SOURCE
-#    define _POSIX_C_SOURCE 200809L
-#  endif
-#endif
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#  include <windows.h>
-#else
-#  include <dirent.h>
-#  include <sys/stat.h>
-#  define _strdup strdup
-#endif
+#include <jce/os/core/jce_filesystem.h>
 
 #include "resource/jce_pak_format.h"
 #include "resource/jce_archive_format.h"
@@ -128,13 +116,21 @@ static void sl_init(StrList *l) {
     l->cap   = 0;
 }
 
+static char *duplicate_string(const char *source)
+{
+    const size_t size = strlen(source) + 1;
+    char *copy = malloc(size);
+    if (copy) memcpy(copy, source, size);
+    return copy;
+}
+
 static void sl_push(StrList *l, const char *s) {
     if (l->count == l->cap) {
         l->cap = l->cap ? l->cap * 2 : 64;
         l->items = (char **)realloc(l->items, l->cap * sizeof(char *));
         if (!l->items) { fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
     }
-    l->items[l->count++] = _strdup(s);
+    l->items[l->count++] = duplicate_string(s);
 }
 
 static void sl_free(StrList *l) {
@@ -169,74 +165,40 @@ static void buf_le32(ByteBuf *b, uint32_t v) {
 /* ================================================================== */
 
 static uint8_t *read_file_bin(const char *path, size_t *out_size) {
-    FILE *f = fopen(path, "rb");
+    JceToolFile *f = jce_tool_fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "[jce_pak] ERROR: cannot open %s\n", path);
         exit(1);
     }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    jce_tool_fseek(f, 0, SEEK_END);
+    int64_t sz = jce_tool_ftell(f);
+    jce_tool_fseek(f, 0, SEEK_SET);
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) { fclose(f); fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        fclose(f);
+    if (!buf) { jce_tool_fclose(f); fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
+    if (jce_tool_fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        jce_tool_fclose(f);
         free(buf);
         fprintf(stderr, "[jce_pak] ERROR: short read on %s\n", path);
         exit(1);
     }
-    fclose(f);
+    jce_tool_fclose(f);
     *out_size = (size_t)sz;
     return buf;
 }
 
-/* Write atomically: tmp + compare + rename. */
-static void write_file_atomic(const char *path, const void *data, size_t size) {
-    /* Build tmp path. */
-    size_t plen = strlen(path);
-    char *tmp = (char *)malloc(plen + 5);
-    if (!tmp) { fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
-    sprintf(tmp, "%s.tmp", path);
-
-    FILE *f = fopen(tmp, "wb");
-    if (!f) {
-        fprintf(stderr, "[jce_pak] ERROR: cannot write %s\n", tmp);
-        free(tmp);
+/* Preserve unchanged mtimes, then delegate atomic replacement to host FS. */
+static void write_file_atomic(const char *path, const void *data, size_t size)
+{
+    uint64_t read_size = 0, total = 0;
+    void *existing = jce_fs_host_read_capped(path, size, &read_size, &total);
+    const int same = existing && total == size && read_size == size &&
+        memcmp(existing, data, size) == 0;
+    jce_fs_buffer_free(existing);
+    if (same) return;
+    if (!jce_fs_host_write_all_atomic(path, data, size)) {
+        fprintf(stderr, "[jce_pak] ERROR: cannot atomically write %s\n", path);
         exit(1);
     }
-    fwrite(data, 1, size, f);
-    fclose(f);
-
-    /* Compare with existing; skip overwrite if identical (preserves mtime). */
-    FILE *existing = fopen(path, "rb");
-    if (existing) {
-        fseek(existing, 0, SEEK_END);
-        long esz = ftell(existing);
-        if ((size_t)esz == size) {
-            fseek(existing, 0, SEEK_SET);
-            uint8_t *ebuf = (uint8_t *)malloc(size);
-            if (ebuf) {
-                if (fread(ebuf, 1, size, existing) == size &&
-                    memcmp(ebuf, data, size) == 0) {
-                    fclose(existing);
-                    free(ebuf);
-                    remove(tmp);
-                    free(tmp);
-                    return;
-                }
-                free(ebuf);
-                fclose(existing);
-            } else {
-                fclose(existing);
-            }
-        } else {
-            fclose(existing);
-        }
-    }
-
-    remove(path);
-    rename(tmp, path);
-    free(tmp);
 }
 
 /* ================================================================== */
@@ -259,7 +221,7 @@ static char *make_relative(const char *full, const char *base) {
         rel = full + blen;
         while (*rel == '/' || *rel == '\\') rel++;
     }
-    char *out = _strdup(rel);
+    char *out = duplicate_string(rel);
     if (!out) { fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
     normalise_sep(out);
     return out;
@@ -294,60 +256,32 @@ static int path_has_segment(const char *rel, const char *segment_name) {
 /* Recursive directory enumeration                                     */
 /* ================================================================== */
 
-#ifdef _WIN32
+typedef struct { const char *dir; StrList *files; } EnumerateContext;
+static void enumerate_files(const char *dir, StrList *out);
 
-static void enumerate_files(const char *dir, StrList *out) {
-    char pattern[MAX_PATH + 3];
-    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
-
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-
-    do {
-        if (fd.cFileName[0] == '.') continue;
-
-        char child[MAX_PATH];
-        snprintf(child, sizeof(child), "%s\\%s", dir, fd.cFileName);
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            enumerate_files(child, out);
-        } else {
-            sl_push(out, child);
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+static bool enumerate_entry(const char *name, bool is_dir, void *user)
+{
+    EnumerateContext *context = user;
+    if (name[0] == '.') return true;
+    const size_t size = strlen(context->dir) + strlen(name) + 2;
+    char *child = malloc(size);
+    if (!child) { fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
+    snprintf(child, size, "%s/%s", context->dir, name);
+    if (is_dir) enumerate_files(child, context->files);
+    else sl_push(context->files, child);
+    free(child);
+    return true;
 }
 
-#else /* POSIX */
-
-static void enumerate_files(const char *dir, StrList *out) {
-    DIR *d = opendir(dir);
-    if (!d) return;
-
-    const struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-
-        size_t need = strlen(dir) + 1 + strlen(ent->d_name) + 1;
-        char *child = (char *)malloc(need);
-        if (!child) { closedir(d); fprintf(stderr, "[jce_pak] out of memory\n"); exit(1); }
-        snprintf(child, need, "%s/%s", dir, ent->d_name);
-
-        struct stat st;
-        if (stat(child, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                enumerate_files(child, out);
-            } else if (S_ISREG(st.st_mode)) {
-                sl_push(out, child);
-            }
-        }
-        free(child);
+static void enumerate_files(const char *dir, StrList *out)
+{
+    EnumerateContext context = {dir, out};
+    if (!jce_fs_host_list_dir(dir, enumerate_entry, &context)) {
+        fprintf(stderr, "[jce_pak] ERROR: cannot enumerate %s\n", dir);
+        exit(1);
     }
-    closedir(d);
 }
 
-#endif
 
 /* ================================================================== */
 /* Per-asset record                                                    */
@@ -750,28 +684,28 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
      * we never pull a potentially multi-gigabyte data region into RAM just to
      * list its contents.  Entries and debug paths are then served from an
      * mmap'd view (jce_archive_open_file), which pages in only the index. */
-    FILE *hf = fopen(path, "rb");
+    JceToolFile *hf = jce_tool_fopen(path, "rb");
     if (!hf) {
         fprintf(stderr, "[jce_pak] cannot open archive: %s\n", path);
         return 1;
     }
     uint8_t hdr[JARC_HEADER_SIZE];
-    if (fread(hdr, 1, JARC_HEADER_SIZE, hf) != JARC_HEADER_SIZE) {
+    if (jce_tool_fread(hdr, 1, JARC_HEADER_SIZE, hf) != JARC_HEADER_SIZE) {
         fprintf(stderr, "[jce_pak] truncated archive (no header): %s\n", path);
-        fclose(hf);
+        jce_tool_fclose(hf);
         return 1;
     }
     if (hdr[0] != JARC_MAGIC_0 || hdr[1] != JARC_MAGIC_1 ||
         hdr[2] != JARC_MAGIC_2 || hdr[3] != JARC_MAGIC_3) {
         fprintf(stderr, "[jce_pak] not a JPAK archive (bad magic): %s\n", path);
-        fclose(hf);
+        jce_tool_fclose(hf);
         return 1;
     }
     uint32_t version = jarc_rd32(hdr + JARC_OFF_FORMAT_VERSION);
     if (version != JARC_FORMAT_VERSION) {
         fprintf(stderr, "[jce_pak] unsupported JPAK version %u (expected %u)\n",
                 (unsigned)version, JARC_FORMAT_VERSION);
-        fclose(hf);
+        jce_tool_fclose(hf);
         return 1;
     }
 
@@ -791,20 +725,20 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
     size_t   dtbl_sz = (size_t)dict_count * JARC_DICT_ENTRY_SIZE;
     if (dtbl_sz) {
         dtbl = (uint8_t *)malloc(dtbl_sz);
-        if (!dtbl || fread(dtbl, 1, dtbl_sz, hf) != dtbl_sz) {
+        if (!dtbl || jce_tool_fread(dtbl, 1, dtbl_sz, hf) != dtbl_sz) {
             fprintf(stderr, "[jce_pak] truncated dictionary table: %s\n", path);
             free(dtbl);
-            fclose(hf);
+            jce_tool_fclose(hf);
             return 1;
         }
     }
 
     uint64_t size = 0;
-    if (fseek(hf, 0, SEEK_END) == 0) {
-        long end = ftell(hf);
+    if (jce_tool_fseek(hf, 0, SEEK_END) == 0) {
+        int64_t end = jce_tool_ftell(hf);
         if (end > 0) size = (uint64_t)end;
     }
-    fclose(hf);
+    jce_tool_fclose(hf);
 
     JceArchive *ar = jce_archive_open_file(path);
     if (!ar) {
@@ -1382,7 +1316,7 @@ static Args parse_args(int argc, char *const argv[]) {
 /* main                                                                */
 /* ================================================================== */
 
-int main(int argc, char *argv[]) {
+int jce_tool_main(int argc, char *argv[]) {
     Args args = parse_args(argc, argv);
 
     /* Optional decryption key for inspect/verify (and post-pack BOM). */

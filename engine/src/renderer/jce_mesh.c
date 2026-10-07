@@ -3,6 +3,7 @@
  */
 
 #include "renderer/jce_vertex_layout.h"
+#include "jce_upload_metrics.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_mesh.h>
@@ -275,7 +276,10 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
                                            num_verts * (uint32_t)sizeof(JceMeshVertex));
     JCE_FREE(owned);
+    const uint64_t payload_bytes_2 = vmem ? vmem->size : 0u;
     m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
+    jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, payload_bytes_2,
+        m->vbh.idx != UINT16_MAX);
     if (m->vbh.idx == UINT16_MAX) {
         /* bgfx static vertex-buffer pool exhausted (or upload failed): fail the
          * whole mesh instead of returning a zombie with an invalid vbh that
@@ -290,7 +294,10 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     if (indices && num_indices > 0) {
         const bgfx_memory_t *imem = bgfx_copy(indices,
                                                num_indices * (uint32_t)sizeof(uint32_t));
+        const uint64_t payload_bytes_1 = imem ? imem->size : 0u;
         m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+        jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_1,
+            m->ibh.idx != UINT16_MAX);
 
         /* Build wireframe index buffer using UNIQUE undirected edges.
          * This preserves full wireframe topology while avoiding duplicate
@@ -302,7 +309,10 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
             && wf && wf_count > 0) {
             const bgfx_memory_t *wmem = bgfx_copy(wf,
                                                     wf_count * (uint32_t)sizeof(uint32_t));
+            const uint64_t payload_bytes_0 = wmem ? wmem->size : 0u;
             m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
+            jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_0,
+                m->wf_ibh.idx != UINT16_MAX);
             m->num_wf_indices = wf_count;
             JCE_FREE(wf);
         } else {

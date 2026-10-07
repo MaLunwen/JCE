@@ -12,6 +12,6 @@ The generators check their own emitted output by default. Regenerate only after 
 
 A catalog entry proves registration, not execution. Build the managed artifacts and native adapters, then run behavioral traces for the relevant languages in both editor Play and the consumer runtime. Compare values, host calls, error handling, lifecycle and tick order.
 
-C#/Java/Python also need their actual runtime/deployment files. A staged DLL alone may omit runtimeconfig, class files or modules. Record external runtime requirements and validate discovery after relocation.
+Default shipping uses embedded Lua/JavaScript and native C/C++ application code. C#/Java/Python are optional external-runtime authoring/SDK paths, not default shipping dependencies. For those explicitly selected development paths, validate actual runtimeconfig, class/module discovery and relocation separately. A native ABI smoke does not prove a project class is registered; `.jcec`/`.jcecpp` references require real static class registration or a supported behavior-preserving portable variant.
 
 An unsupported language must report failure clearly instead of silently running another backend. Preserve credential/environment boundaries for the generic LLM bridge; private AI policy is not binding implementation.

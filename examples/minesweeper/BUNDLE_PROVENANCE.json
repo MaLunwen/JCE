@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "variant": "normal",
+  "file": "minesweeper.jbundle",
+  "sha256": "05ad19e9de919c41ab361a726e61be0247392d5585114ba3536ade7f6f3d9b83",
+  "bytes": 13675,
+  "single_file": true,
+  "consumer_source": "tests/consumers/minesweeper",
+  "source_terms": "SOURCE_AND_TERMS.md",
+  "repository_license": "MPL-2.0",
+  "scope": "Original JCE portable Lua consumer variant; public SDK bundle dependency closure and relocated one-EXE consumption observed. No native multi-language parity claim.",
+  "upstream": "https://github.com/MaLunwen/JCE",
+  "external_game_implementation": null
+}

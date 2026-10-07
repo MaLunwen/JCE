@@ -1869,3 +1869,25 @@ JCE_API JcePhysics2D *JCE_CALL jce_runtime_physics2d(const JceRuntime *rt)
 {
 	return rt ? rt->physics2d : NULL;
 }
+
+/* Snapshot the post-step physics pose of every dynamic body into the
+ * interpolation history (prev <- cur, cur <- live pose).  Called once per
+ * executed fixed tick so prev/cur bracket exactly one fixed_dt of motion. */
+void rt_capture_fixed_pose(JceRuntime *rt)
+{
+	if (!rt->physics) return;
+	for (int i = 0; i < rt->body_count; ++i) {
+		if (rt->bodies[i].kind == (uint8_t)JCE_BODY_STATIC) continue;
+		BodyEntry *be = &rt->bodies[i];
+		be->prev_pos = be->cur_pos;
+		be->prev_rot = be->cur_rot;
+		jce_physics_body_get_transform(rt->physics, be->body,
+		                               &be->cur_pos, &be->cur_rot);
+	}
+	/* Same fixed-tick history for the character so it renders smoothly. */
+	if (jce_character_valid(rt->character) && rt->character_entity != 0) {
+		rt->char_prev_pos = rt->char_cur_pos;
+		jce_physics_character_get_position(rt->physics, rt->character,
+		                                   &rt->char_cur_pos);
+	}
+}

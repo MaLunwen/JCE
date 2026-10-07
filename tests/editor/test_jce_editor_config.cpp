@@ -16,6 +16,28 @@ extern "C" {
 }
 
 #include <cstring>
+#include <initializer_list>
+
+TEST_CASE("explicit profile paths remain inside an absolute directory")
+{
+    char path[256];
+    CHECK(jce_editor_config_profile_path("/tmp/editor-profile/", "cache/shadergraph", path, sizeof(path)));
+    CHECK(std::strcmp(path, "/tmp/editor-profile/cache/shadergraph") == 0);
+    CHECK(jce_editor_config_profile_path("D:\\profiles\\editor", "imgui.ini", path, sizeof(path)));
+    CHECK(std::strcmp(path, "D:/profiles/editor/imgui.ini") == 0);
+    CHECK(jce_editor_config_profile_path("\\\\server\\share\\profile", "imgui.ini", path, sizeof(path)));
+    CHECK(std::strcmp(path, "//server/share/profile/imgui.ini") == 0);
+    CHECK(jce_editor_config_profile_path("/tmp/editor-profile", nullptr, path, sizeof(path)));
+    CHECK(std::strcmp(path, "/tmp/editor-profile") == 0);
+    for (const char *root : {"", "relative/profile", "D:profile"}) {
+        CHECK_FALSE(jce_editor_config_profile_path(root, "imgui.ini", path, sizeof(path)));
+        CHECK(path[0] == '\0');
+    }
+    for (const char *name : {"../imgui.ini", "cache/../../imgui.ini", "/outside/imgui.ini"})
+        CHECK_FALSE(jce_editor_config_profile_path("/tmp/editor-profile", name, path, sizeof(path)));
+    CHECK_FALSE(jce_editor_config_profile_path("/tmp/editor-profile", "imgui.ini", path, 4));
+    CHECK_FALSE(jce_editor_config_profile_path("/tmp/editor-profile", "imgui.ini", nullptr, 256));
+}
 
 TEST_CASE("config defaults populate sane values")
 {

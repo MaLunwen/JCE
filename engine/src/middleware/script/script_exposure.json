@@ -35,12 +35,12 @@
     "read."
   ],
   "declared_totals": {
-    "host_members": 105,
-    "expose": 101,
+    "host_members": 112,
+    "expose": 108,
     "hand_written": 8,
     "constants": 1,
-    "table_keys": 110,
-    "members_reached_by_generated": 100,
+    "table_keys": 117,
+    "members_reached_by_generated": 107,
     "members_reached_only_by_hand_written": 5
   },
   "hand_written": [
@@ -384,6 +384,13 @@
       "vtable": "pointer_delta",
       "shape": "void_out_array",
       "since": 1
+    },
+    {
+      "name": "get_pointer_position",
+      "vtable": "pointer_position",
+      "shape": "void_out_array",
+      "since": 1,
+      "doc": "Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime."
     },
     {
       "name": "get_pointer_wheel",
@@ -808,6 +815,46 @@
       "shape": "value_return",
       "since": 1,
       "doc": "Cut to the virtual camera with this name, ahead of priority.  Returns 1 when the name resolves to a camera that is active and enabled, 0 otherwise -- the request is recorded either way, so naming a camera in a streaming cell that has not loaded yet does not silently become 'whatever priority says'.  Pass an empty string to clear it and hand the decision back to priority.  It does NOT rewrite the authored components: the override lives in the vcam system, so a cutscene cannot bake its camera choice into the level file."
+    },
+    {
+      "name": "set_cursor",
+      "vtable": "cursor_set",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path resets. Main-thread; false on decode/platform/cache failure."
+    },
+    {
+      "name": "request_quit",
+      "vtable": "request_quit",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "stat_available",
+      "vtable": "stat_available",
+      "shape": "value_return",
+      "since": 1
+    },
+    {
+      "name": "stat_set",
+      "vtable": "stat_set",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Store signed32 statistic through an explicitly borrowed platform service. Nonfinite, fractional or out-of-range values return false; successful set does not imply durable flush."
+    },
+    {
+      "name": "stat_get",
+      "vtable": "stat_get",
+      "shape": "value_return",
+      "since": 1,
+      "absent_value": 0,
+      "doc": "Signed32 statistic; fallback must be finite, integral and in range, otherwise returns 0. An absent host returns 0; a configured runtime with unavailable service returns the valid fallback."
+    },
+    {
+      "name": "stat_flush",
+      "vtable": "stat_flush",
+      "shape": "value_return",
+      "since": 1
     }
   ]
 }

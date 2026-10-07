@@ -1,0 +1,109 @@
+{
+  "entities": [
+    {
+      "id": 1,
+      "parentId": 0,
+      "name": "Camera",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 3,
+          "posZ": 8,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "rotX": -14,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "Camera",
+          "primary": true,
+          "orthographic": false,
+          "fov": 55,
+          "nearClip": 0.1,
+          "farClip": 80,
+          "clearMode": 2
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "parentId": 0,
+      "name": "Sun",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 0,
+          "posZ": 0,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "DirectionalLight",
+          "dirX": -0.4,
+          "dirY": -1,
+          "dirZ": -0.3,
+          "intensity": 2,
+          "castsShadow": true
+        }
+      ]
+    }
+  ],
+  "rendering": {
+    "ambient": {
+      "color": [
+        0.15,
+        0.17,
+        0.2
+      ],
+      "intensity": 0.3
+    },
+    "iblEnabled": false,
+    "dynamicGI": 0,
+    "fog": {
+      "enabled": false,
+      "mode": 1,
+      "color": [
+        0.35,
+        0.45,
+        0.6
+      ],
+      "density": 0.08,
+      "start": 0,
+      "end": 45,
+      "heightFalloff": 0.1,
+      "heightOrigin": 0
+    },
+    "shadows": {
+      "distance": 40,
+      "cascades": 2,
+      "resolution": 1024,
+      "soft": 1
+    },
+    "postfx": {
+      "tonemap": true,
+      "bloom": false,
+      "fxaa": false,
+      "vignette": false,
+      "chromatic": false,
+      "grayscale": false,
+      "autoExposure": false,
+      "exposure": 1,
+      "gamma": 2.2,
+      "bloomThreshold": 1,
+      "bloomIntensity": 0.7,
+      "ssao": true,
+      "ssaoRadius": 0.8,
+      "ssaoIntensity": 2,
+      "ssr": true,
+      "ssrIntensity": 1
+    }
+  }
+}

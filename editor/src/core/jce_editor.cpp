@@ -6,6 +6,7 @@
  */
 
 #include "jce_editor.h"
+#include "viewers/jce_file_viewer.h"
 
 #include <cstdlib>
 #include <cmath>
@@ -36,6 +37,7 @@
 #include "jce_cook_manager.h"
 #include "jce_editor_recorder.h"
 #include "jce_run_manager.h"
+#include "jce_editor_operation_metrics.h"
 #include "io/jce_editor_json_reveal.h"   /* JCE_DBG_VIEWJSON QA hook */
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>   /* JCE_DBG_MOVE QA hook */
@@ -234,10 +236,16 @@ static void create_cursors(void)
 
 static void update_cursor(void)
 {
+    JceCursor *preview = jce_file_viewer_cursor_for_frame();
     ImGuiIO &io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange)
         return;
 
+    if (!io.MouseDrawCursor && !jce_editor_game_render_is_mouse_captured()
+            && jce_editor_game_render_apply_cursor()) {
+        jce_cursor_show(true);
+        return;
+    }
     ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
     if (cursor == ImGuiMouseCursor_None || io.MouseDrawCursor) {
         jce_cursor_show(false);
@@ -245,6 +253,8 @@ static void update_cursor(void)
         JceCursor *c = s_editor.cursors[cursor]
             ? s_editor.cursors[cursor]
             : s_editor.cursors[ImGuiMouseCursor_Arrow];
+        if (preview && cursor == ImGuiMouseCursor_Arrow
+                && !jce_editor_game_render_is_mouse_captured()) c = preview;
         jce_cursor_set(c);
         jce_cursor_show(true);
     }
@@ -526,7 +536,14 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
      * a "Loading scene…" overlay keeps the window responsive.  Small scenes
      * complete synchronously inside this call (no overlay). */
     if (will_restore) {
-        if (!jce_state_load_scene_file_async(restore_path))
+        /* Explicit maintenance setup only: UI operation measurements start
+         * after the existing synchronous opener finishes, never on a partly
+         * loaded scene. Interactive startup keeps the time-sliced path. */
+        const char *sync = getenv("JCE_DBG_SCENE_LOAD_SYNC");
+        const bool load_sync = sync && strcmp(sync, "1") == 0;
+        const bool loaded = load_sync ? jce_state_load_scene_file(restore_path)
+                                      : jce_state_load_scene_file_async(restore_path);
+        if (!loaded)
             jce_state_new_default_scene();
     }
 
@@ -716,9 +733,8 @@ void jce_editor_update(JceWindow *window)
      * Only when not in Play (don't bake play-time mutations into the file)
      * and the active scene is dirty + has a path.  The interval accumulates
      * regardless so a save fires every N seconds of edit-mode wall time. */
-    /* Rotate the perf-phase accumulators into the per-frame snapshot the
-     * Profiler panel reads (no-op while phase capture is disabled). */
-    jce_perf_phase_frame_tick();
+    /* The engine rotates the completed frame's perf-phase snapshot before
+     * this callback. A second rotation here erased per-frame KPI samples. */
     {
         const int interval = jce_editor_prefs_autosave_interval_sec();
         if (interval > 0 &&
@@ -1050,6 +1066,8 @@ void jce_editor_update(JceWindow *window)
         if (++s_editor.autoplay_frame == 30u)
             jce_state_play();
     }
+
+    jce_editor_operation_tick();
 
     /* JCE_DBG_PLAY_STOP_AT=N — headless Play STOP at frame N (pairs with
      * JCE_KPI_AUTOPLAY): reproduces the user flow "benchmark spawn -> Play ->

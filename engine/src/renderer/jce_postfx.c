@@ -1476,8 +1476,6 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     reset_output_state(pipeline);
 
-    if (!pipeline->shaders_loaded) return;
-
     if (!jce_gfx_texture_valid(scene_color)) {
         LOG_WARN(LOG_TAG, "post-fx skipped: invalid scene color texture");
         return;
@@ -1520,7 +1518,15 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     }
     /* TAA alone (no other effect) still needs the chain to run so its resolve
        becomes the pipeline output. */
-    if (active == 0 && !taa_run) return;
+    if (active == 0 && !taa_run && !mb_run) {
+        /* An empty chain still has a valid output: its borrowed input. Callers
+         * must not redraw the scene to recover an absent output, which blends
+         * transparent objects twice when the first view is rebound. */
+        pipeline->output_tex.idx = scene_color.idx;
+        pipeline->taa_ext_motion_tex.idx = UINT16_MAX;
+        return;
+    }
+    if (!pipeline->shaders_loaded) return;
 
     /* Ensure FBOs are created.  Composite ping-pong pair (0/1) always; the
        bloom buffers (2/3) only when bloom is enabled this frame — standard

@@ -24,6 +24,8 @@ struct JceEditorGameInputViewport {
     float y;
     float width;
     float height;
+    float render_width;  /* zero: render at the displayed size */
+    float render_height;
     bool visible;
     bool hovered;
     bool captured;
@@ -36,6 +38,7 @@ struct JceEditorGameInputSample {
     float wheel;
     uint32_t buttons;
     JceEditorGameInputOwner owner;
+    float x, y, width, height;
 };
 
 struct JceEditorGameInputBridge {
@@ -44,6 +47,8 @@ struct JceEditorGameInputBridge {
     float dy;
     float wheel;
     uint32_t buttons;
+    float x, y;
+    bool position_valid;
 };
 
 struct JceEditorGameInputCommitOps {
@@ -52,6 +57,7 @@ struct JceEditorGameInputCommitOps {
     void (*set_touches)(void *ud, const JceRuntimeTouch *touches, int count);
     void (*set_actions)(void *ud, const JceInputActions *actions);
     void (*step)(void *ud, float dt);
+    void (*set_position)(void *ud, float x, float y, float width, float height);
 };
 
 void jce_editor_game_input_bridge_reset(JceEditorGameInputBridge *bridge);
@@ -72,4 +78,3 @@ bool jce_editor_game_input_bridge_commit(
 JceEditorGameInputBridge *jce_editor_game_input_bridge_shared(void);
 
 #endif /* JCE_EDITOR_GAME_INPUT_BRIDGE_H */
-

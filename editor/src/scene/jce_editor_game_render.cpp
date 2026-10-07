@@ -361,6 +361,12 @@ void jce_editor_game_render_set_play_runtime(JceRuntime *rt)
     g.play_runtime = rt;
 }
 
+bool jce_editor_game_render_apply_cursor(void)
+{
+    return g.play_runtime && g.ui_pointer.valid &&
+        jce_runtime_apply_cursor(g.play_runtime);
+}
+
 /* Forward a UTF-8 text-input chunk into the focused ECS-UI InputField.  The
  * Game View panel sources these from ImGui's per-frame character queue (its
  * natural event source, exactly like the pointer above) only while the panel

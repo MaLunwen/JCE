@@ -529,15 +529,11 @@ static bool sr_foliage_tile_make_resident(JceSceneRenderer *sr, int slot,
     return true;
 }
 
-/* 千万 S4/S5 GPU LOD-in-cull for a single-primitive MODEL scatter: one compute
- * dispatch per (visible, resident) roots VB culls + LOD-classifies every
- * instance into band PARTITIONS of one survivor buffer; one indirect draw per
- * band renders that band's reduced LOD (startInstance = partition base) with
- * the cross-fade program (千万 ②).  Non-tiled scatters are a single "tile".
- * Tiled scatters (S5) stream tile roots in/out by frustum + far distance with
- * an LRU budget — a 10M-instance AUTHORED field costs only its visible
- * neighbourhood.  Returns true if it fully handled the scatter. */
-/* `receiver_layer` comes from the vegetation entity; this helper sees none. */
+/* Cull and classify resident single-primitive model roots into LOD partitions,
+ * then draw each band indirectly. Tiled scatters stream visible neighborhoods
+ * through the existing LRU; non-tiled scatters use one roots buffer. Returns
+ * true only when the whole scatter was handled. receiver_layer belongs to the
+ * vegetation entity, which this helper does not otherwise inspect. */
 static bool sr_foliage_gpu_lod_cull_draw(JceSceneRenderer *sr, int slot,
         const JceModel *model, const JceSkinnedMesh *lsm, uint32_t bands,
         uint32_t n, uint16_t view_id, const JceCamera *camera,
@@ -547,7 +543,10 @@ static bool sr_foliage_gpu_lod_cull_draw(JceSceneRenderer *sr, int slot,
     if (bands == 0u || bands > JCE_FOLIAGE_LOD_BANDS) return false;
 
     JceShaderHandle prog_inst = jce_renderer_get_program_pbr_inst_fade(sr->renderer);
-    bool fade_prog = (prog_inst.idx != UINT16_MAX);
+    /* The fade fragment family has no clustered-lighting variant. Keep the
+     * existing LOD bands/culling with ordinary instancing; fade_w below becomes
+     * zero, so this unsupported combination uses hard band transitions. */
+    bool fade_prog = !sr->fp_active_frame && (prog_inst.idx != UINT16_MAX);
     if (!fade_prog)
         prog_inst = jce_renderer_get_program_pbr_inst(sr->renderer);
     if (prog_inst.idx == UINT16_MAX) return false;
@@ -627,10 +626,10 @@ static bool sr_foliage_gpu_lod_cull_draw(JceSceneRenderer *sr, int slot,
      * override, requires the SSAO depth prepass). */
     bool fol_hiz = jce_render_pipeline_perf_enabled(JCE_RP_PERF_HIZ_OCCLUSION, true);
     { const char *v = getenv("JCE_HIZ_OCCLUSION"); if (v && v[0]) fol_hiz = (v[0] != '0'); }
-    fol_hiz = fol_hiz && sr->ssao_valid;
+    fol_hiz = fol_hiz && sr->ssao_valid && sr->depth_history_reused;
     jce_gpu_scene_set_hiz(sr->gpu_scene,
         fol_hiz ? sr->ssao_depth_tex.idx : (uint16_t)UINT16_MAX,
-        (const jce_mat4 *)sr->frame_prev_vp, sr->ssao_w, sr->ssao_h, fol_hiz);
+        &sr->hiz_depth_vp, sr->ssao_w, sr->ssao_h, fol_hiz);
 
     /* (6) reset the band counters + build the Hi-Z pyramid once. */
     bool hiz_ready = false;
@@ -1168,7 +1167,7 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
                                    s_fol_hiz_env = (!v || !v[0]) ? -1 : (v[0] != '0'); }
         const bool fol_hiz_pref = (s_fol_hiz_env >= 0) ? (s_fol_hiz_env != 0)
             : jce_render_pipeline_perf_enabled(JCE_RP_PERF_HIZ_OCCLUSION, true);
-        bool fol_hiz_en = fol_hiz_pref && sr->ssao_valid;
+        bool fol_hiz_en = fol_hiz_pref && sr->ssao_valid && sr->depth_history_reused;
         if (getenv("JCE_HIZ_DIAG")) {
             static uint32_t s_fd = 0;
             if ((s_fd++ % 60u) == 5u)
@@ -1177,7 +1176,7 @@ void sr_draw_foliage(JceSceneRenderer *sr, JceScene *scene,
         }
         jce_gpu_scene_set_hiz(sr->gpu_scene,
                               fol_hiz_en ? sr->ssao_depth_tex.idx : (uint16_t)UINT16_MAX,
-                              (const jce_mat4 *)sr->frame_prev_vp,
+                              &sr->hiz_depth_vp,
                               sr->ssao_w, sr->ssao_h, fol_hiz_en);
         if (jce_gpu_scene_foliage_dispatch(
                 sr->gpu_scene, sr->gpu_reset_view, sr->gpu_cull_view,

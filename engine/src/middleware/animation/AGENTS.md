@@ -27,6 +27,11 @@
 4. **State machine** is data-driven; states/transitions defined in JSON (`scene_components_json` style). Conditions evaluate over animator parameters.
 5. **Math** = `jce_math`. Convert ozz `Float4x4` at the boundary.
 
+Public clip parsing returns an owned clip. Its existing destroy implementation
+is declared in the public playback header, with model-borrowed ownership kept
+explicit. SDK consumers must never include the private authoring header to
+release parsed clips.
+
 ## Don't
 
 - Don't expose ozz types in public headers.

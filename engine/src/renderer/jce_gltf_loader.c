@@ -85,14 +85,10 @@ typedef struct {
     jce_mat4         joint_local_matrix;
 } JceModelNodeCpu;
 
-/* Material factors + decoded (not-yet-uploaded) texture maps. */
+/* Material factors + borrowed model-pool slots; zero means absent. */
 typedef struct {
     JcePbrMaterial base;       /* factors/alpha/flags; map handles INVALID */
-    JceTextureCpu *albedo;
-    JceTextureCpu *mr;
-    JceTextureCpu *normal;
-    JceTextureCpu *ao;
-    JceTextureCpu *emissive;
+    uint32_t albedo, mr, normal, ao, emissive;
 } JceModelMatCpu;
 
 /* One imported morph-weight track: keyframed all-target weights for the model
@@ -106,6 +102,7 @@ typedef struct {
 struct JceModelCpu {
     JceModelNodeCpu      *nodes;      uint32_t num_nodes;
     JceModelMatCpu       *materials;  uint32_t num_materials;
+    JceModelTexturePool  *texture_pool;
     JceSkeleton          *skeleton;   /* CPU-only, built on the worker */
     JceAnimClip         **anim_clips; uint32_t num_anims;
     JceModelMorphAnimCpu *morph_anims; uint32_t num_morph_anims;
@@ -202,18 +199,18 @@ static void resolve_path(const char *model_path, const char *uri,
  * result — NO bgfx, so it is safe to run on a worker thread.  The caller
  * uploads it later with jce_texture_upload_cpu (or frees it on cancel).
  * Returns NULL when the image cannot be decoded. */
-static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
-                                            const char *model_path,
-                                            const cgltf_image *image,
-                                            cgltf_data *data,
-                                            bool srgb)
+typedef struct {
+    const JcePakArchive *pak;
+    const char *path;
+    const cgltf_image *image;
+} GltfTextureDecode;
+
+static JceTextureCpu *decode_gltf_texture_cpu(void *user, int mode)
 {
-    if (!image) return NULL;
-    /* glTF 2.0 states the colour space PER SLOT (§5.19): base colour and
-     * emissive are sRGB-encoded, normal / metallic-roughness / occlusion are
-     * linear data.  The caller passes the slot's answer, so the hardware
-     * decodes before filtering and fs_pbr no longer has to. */
-    const int mode = JCE_TEX_WRAP | (srgb ? JCE_TEX_SRGB : 0);
+    const GltfTextureDecode *ctx = user;
+    const JcePakArchive *pak = ctx->pak;
+    const char *model_path = ctx->path;
+    const cgltf_image *image = ctx->image;
 
     /* Case 1: embedded texture via buffer_view (common in GLB). */
     if (image->buffer_view) {
@@ -275,8 +272,21 @@ static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
         return NULL;
     }
 
-    (void)data;
     return NULL;
+}
+
+static uint32_t load_gltf_texture_cpu(const JcePakArchive *pak,
+    const char *path, const cgltf_image *image, const cgltf_data *data,
+    bool srgb, JceModelTexturePool *pool)
+{
+    if (!image || !data || !data->images) return 0;
+    /* glTF color space is per slot: color/emissive sRGB; other maps linear.
+     * The integer image index survives cgltf_data destruction, unlike a
+     * borrowed image pointer. The callback context is used synchronously. */
+    uint64_t key = (uint64_t)(image - data->images) + 1u;
+    GltfTextureDecode ctx = {pak, path, image};
+    return jce_model_texture_pool_acquire(pool, key,
+        JCE_TEX_WRAP | (srgb ? JCE_TEX_SRGB : 0), decode_gltf_texture_cpu, &ctx);
 }
 
 /* Find joint index in a skin's joints array for a given node. */
@@ -310,7 +320,8 @@ static uint32_t find_material_index(const cgltf_data *data,
 static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
                                              const char *model_path,
                                              cgltf_data *data,
-                                             uint32_t *out_count)
+                                             uint32_t *out_count,
+                                             JceModelTexturePool *pool)
 {
     *out_count = 0;
     if (data->materials_count == 0) {
@@ -350,14 +361,14 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
                 pbr->base_color_texture.texture->image) {
                 m->albedo = load_gltf_texture_cpu(
                     pak, model_path, pbr->base_color_texture.texture->image,
-                    data, /*srgb=*/true);
+                    data, /*srgb=*/true, pool);
             }
             if (pbr->metallic_roughness_texture.texture &&
                 pbr->metallic_roughness_texture.texture->image) {
                 m->mr = load_gltf_texture_cpu(
                     pak, model_path,
                     pbr->metallic_roughness_texture.texture->image,
-                    data, /*srgb=*/false);
+                    data, /*srgb=*/false, pool);
             }
         }
 
@@ -366,7 +377,7 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
             src->normal_texture.texture->image) {
             m->normal = load_gltf_texture_cpu(
                 pak, model_path, src->normal_texture.texture->image,
-                data, /*srgb=*/false);
+                data, /*srgb=*/false, pool);
             dst->normal_scale = src->normal_texture.scale;
             if (dst->normal_scale == 0.0f) dst->normal_scale = 1.0f;
         }
@@ -376,7 +387,7 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
             src->occlusion_texture.texture->image) {
             m->ao = load_gltf_texture_cpu(
                 pak, model_path, src->occlusion_texture.texture->image,
-                data, /*srgb=*/false);
+                data, /*srgb=*/false, pool);
             dst->ao_strength = src->occlusion_texture.scale;
             if (dst->ao_strength == 0.0f) dst->ao_strength = 1.0f;
         }
@@ -386,7 +397,7 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
             src->emissive_texture.texture->image) {
             m->emissive = load_gltf_texture_cpu(
                 pak, model_path, src->emissive_texture.texture->image,
-                data, /*srgb=*/true);
+                data, /*srgb=*/true, pool);
         }
         dst->emissive_factor[0] = src->emissive_factor[0];
         dst->emissive_factor[1] = src->emissive_factor[1];
@@ -1441,7 +1452,10 @@ static JceModelCpu *build_model_cpu(const JcePakArchive *pak,
     JceModelCpu *cpu = (JceModelCpu *)JCE_CALLOC(1, sizeof(JceModelCpu));
     if (!cpu) return NULL;
 
-    cpu->materials   = extract_materials_cpu(pak, path, data, &cpu->num_materials);
+    cpu->texture_pool = jce_model_texture_pool_create();
+    if (!cpu->texture_pool) { JCE_FREE(cpu); return NULL; }
+    cpu->materials   = extract_materials_cpu(pak, path, data, &cpu->num_materials,
+                                             cpu->texture_pool);
     cpu->nodes       = extract_nodes_cpu(data, &cpu->num_nodes);
     cpu->skeleton    = extract_skeleton(data);    /* CPU-only */
     cpu->anim_clips  = extract_animations(data, &cpu->num_anims); /* CPU-only */
@@ -1660,7 +1674,7 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
     model->aabb_max[0] = model->aabb_max[1] = model->aabb_max[2] = -FLT_MAX;
     model->has_aabb = false;
 
-    /* Materials: copy factors, upload each decoded map (consumes texcpu). */
+    /* Material slots borrow each image/mode upload from model-local ownership. */
     if (cpu->num_materials > 0 && cpu->materials) {
         model->materials = (JcePbrMaterial *)JCE_CALLOC(
             cpu->num_materials, sizeof(JcePbrMaterial));
@@ -1670,12 +1684,14 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                 JceModelMatCpu *mc = &cpu->materials[i];
                 JcePbrMaterial *dst = &model->materials[i];
                 *dst = mc->base;
-                if (mc->albedo)   { dst->albedo_map = jce_texture_upload_cpu(mc->albedo);   mc->albedo = NULL; }
-                if (mc->mr)       { dst->metallic_roughness_map = jce_texture_upload_cpu(mc->mr); mc->mr = NULL; }
-                if (mc->normal)   { dst->normal_map = jce_texture_upload_cpu(mc->normal);   mc->normal = NULL; }
-                if (mc->ao)       { dst->ao_map = jce_texture_upload_cpu(mc->ao);           mc->ao = NULL; }
-                if (mc->emissive) { dst->emissive_map = jce_texture_upload_cpu(mc->emissive); mc->emissive = NULL; }
+                dst->albedo_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->albedo);
+                dst->metallic_roughness_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->mr);
+                dst->normal_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->normal);
+                dst->ao_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->ao);
+                dst->emissive_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->emissive);
             }
+            model->texture_pool = cpu->texture_pool;
+            cpu->texture_pool = NULL;
         }
     }
 
@@ -1825,17 +1841,8 @@ void jce_gltf_model_cpu_free(JceModelCpu *cpu)
         JCE_FREE(cpu->nodes);
     }
 
-    if (cpu->materials) {
-        for (uint32_t i = 0; i < cpu->num_materials; ++i) {
-            JceModelMatCpu *m = &cpu->materials[i];
-            jce_texture_cpu_free(m->albedo);
-            jce_texture_cpu_free(m->mr);
-            jce_texture_cpu_free(m->normal);
-            jce_texture_cpu_free(m->ao);
-            jce_texture_cpu_free(m->emissive);
-        }
-        JCE_FREE(cpu->materials);
-    }
+    jce_model_texture_pool_destroy(cpu->texture_pool);
+    JCE_FREE(cpu->materials);
 
     if (cpu->skeleton) jce_skeleton_destroy(cpu->skeleton);
     if (cpu->anim_clips) {

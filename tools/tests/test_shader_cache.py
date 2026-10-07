@@ -1,0 +1,127 @@
+"""Shader cache invalidation, publication and concurrent ownership controls."""
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+TOOLS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TOOLS))
+spec = importlib.util.spec_from_file_location("shader_cache", TOOLS / "shader_cache.py")
+cache = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache)
+
+
+class ShaderCacheTests(unittest.TestCase):
+    def setUp(self):
+        directory = TOOLS.parent / "build" / "tests" / "shader-cache"
+        directory.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=directory)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.compiler = self.root / "compiler"
+        self.source = self.root / "source.sc"
+        self.include = self.root / "include.sh"
+        self.output = self.root / "out.bin"
+        for item in (self.compiler, self.source, self.include):
+            item.write_bytes(b"initial")
+        self.args = ["-f", str(self.source), "-o", str(self.output), "-O", "3"]
+        self.calls = 0
+        self.guard = threading.Lock()
+
+    def fake_compile(self, command, check):
+        self.assertTrue(check)
+        with self.guard:
+            self.calls += 1
+        time.sleep(.02)
+        Path(command[command.index("-o") + 1]).write_bytes(b"compiled")
+
+    def invoke(self, args=None):
+        return cache.compile_cached(self.compiler, args or self.args,
+                                    [self.source, self.include], self.root / "cache")
+
+    def test_hit_and_different_output(self):
+        with patch.object(cache.subprocess, "run", self.fake_compile):
+            self.assertEqual(self.invoke(), "miss")
+            other = list(self.args)
+            other[3] = str(self.root / "other.bin")
+            self.assertEqual(self.invoke(other), "hit")
+        self.assertEqual(self.calls, 1)
+        self.assertEqual((self.root / "other.bin").read_bytes(), b"compiled")
+
+    def test_each_content_and_flags_invalidates(self):
+        with patch.object(cache.subprocess, "run", self.fake_compile):
+            self.invoke()
+            for item in (self.compiler, self.source, self.include):
+                item.write_bytes(b"changed")
+                self.assertEqual(self.invoke(), "miss")
+            changed = list(self.args)
+            changed[-1] = "0"
+            self.assertEqual(self.invoke(changed), "miss")
+        self.assertEqual(self.calls, 5)
+
+    def test_corrupt_blob_recompiles(self):
+        with patch.object(cache.subprocess, "run", self.fake_compile):
+            self.invoke()
+            next((self.root / "cache").glob("*.bin")).write_bytes(b"corrupt")
+            self.assertEqual(self.invoke(), "miss")
+        self.assertEqual(self.output.read_bytes(), b"compiled")
+        self.assertEqual(self.calls, 2)
+
+    def test_concurrent_same_key_compiles_once(self):
+        with patch.object(cache.subprocess, "run", self.fake_compile):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _: self.invoke(), range(4)))
+        self.assertEqual(results.count("miss"), 1)
+        self.assertEqual(self.calls, 1)
+
+    def test_process_same_key_compiles_once(self):
+        fake = self.root / "fake.py"
+        counter = self.root / "calls.txt"
+        fake.write_text(
+            "import pathlib,sys,time\n"
+            "time.sleep(.05)\n"
+            "with pathlib.Path(sys.argv[1]).open('a') as f: f.write('call\\n')\n"
+            "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_bytes(b'compiled')\n",
+            encoding="utf-8")
+        children = []
+        for number in range(4):
+            command = [sys.executable, "-B", str(TOOLS / "shader_cache.py"),
+                       "--compiler", sys.executable, "--cache", str(self.root / "cache"),
+                       "--input", str(fake), "--", str(fake), str(counter),
+                       "-o", str(self.root / f"process{number}.bin")]
+            children.append(subprocess.Popen(command, stdout=subprocess.PIPE,
+                                             stderr=subprocess.PIPE, text=True))
+        results = [child.communicate(timeout=20) for child in children]
+        self.assertEqual([child.returncode for child in children], [0] * 4, results)
+        self.assertEqual(counter.read_text().splitlines(), ["call"])
+        for number in range(4):
+            self.assertEqual((self.root / f"process{number}.bin").read_bytes(), b"compiled")
+
+    def test_failure_preserves_local_and_does_not_publish(self):
+        self.output.write_bytes(b"previous")
+        with patch.object(cache.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "compiler")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.invoke()
+        self.assertEqual(self.output.read_bytes(), b"previous")
+        self.assertFalse(list((self.root / "cache").glob("*.bin")))
+
+    def test_input_mutation_during_compile_does_not_publish(self):
+        self.output.write_bytes(b"previous")
+        def mutate(command, check):
+            self.fake_compile(command, check)
+            self.include.write_bytes(b"raced")
+        with patch.object(cache.subprocess, "run", mutate):
+            with self.assertRaisesRegex(RuntimeError, "inputs changed"):
+                self.invoke()
+        self.assertEqual(self.output.read_bytes(), b"previous")
+        self.assertFalse(list((self.root / "cache").glob("*.bin")))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1161,6 +1161,72 @@ static int mk_raycast_all(void *user, const float origin[3], const float dir[3],
     return max < 3 ? max : 3;
 }
 
+static void mk_pointer_position(void *user, float out_xywh[4])
+{
+    (void)user;
+    jce_java_diff_tracef("pointer_position");
+    jce_java_diff_tracef("\n");
+    out_xywh[0] = 40.5f;
+    out_xywh[1] = 41.5f;
+    out_xywh[2] = 42.5f;
+    out_xywh[3] = 43.5f;
+}
+
+static bool mk_cursor_set(void *user, const char *asset_path, int hotspot_x, int hotspot_y)
+{
+    (void)user;
+    jce_java_diff_tracef("cursor_set");
+    jce_java_diff_tracef("|%s", asset_path ? asset_path : "(null)");
+    jce_java_diff_tracef("|%lld", (long long)hotspot_x);
+    jce_java_diff_tracef("|%lld", (long long)hotspot_y);
+    jce_java_diff_tracef("\n");
+    return true;
+}
+
+static bool mk_request_quit(void *user)
+{
+    (void)user;
+    jce_java_diff_tracef("request_quit");
+    jce_java_diff_tracef("\n");
+    return true;
+}
+
+static bool mk_stat_available(void *user)
+{
+    (void)user;
+    jce_java_diff_tracef("stat_available");
+    jce_java_diff_tracef("\n");
+    return true;
+}
+
+static bool mk_stat_set(void *user, const char *id, double value)
+{
+    (void)user;
+    jce_java_diff_tracef("stat_set");
+    jce_java_diff_tracef("|%s", id ? id : "(null)");
+    jce_java_diff_tracef("|%g", (double)value);
+    jce_java_diff_tracef("\n");
+    return true;
+}
+
+static int mk_stat_get(void *user, const char *id, double fallback)
+{
+    (void)user;
+    jce_java_diff_tracef("stat_get");
+    jce_java_diff_tracef("|%s", id ? id : "(null)");
+    jce_java_diff_tracef("|%g", (double)fallback);
+    jce_java_diff_tracef("\n");
+    return 6;
+}
+
+static bool mk_stat_flush(void *user)
+{
+    (void)user;
+    jce_java_diff_tracef("stat_flush");
+    jce_java_diff_tracef("\n");
+    return true;
+}
+
 static JceScriptHost g_full;
 static JceScriptHost g_partial;
 static int g_ready;
@@ -1279,6 +1345,13 @@ static void build(void)
     g_full.curve_eval = mk_curve_eval;
     g_full.raycast_filtered = mk_raycast_filtered;
     g_full.raycast_all = mk_raycast_all;
+    g_full.pointer_position = mk_pointer_position;
+    g_full.cursor_set = mk_cursor_set;
+    g_full.request_quit = mk_request_quit;
+    g_full.stat_available = mk_stat_available;
+    g_full.stat_set = mk_stat_set;
+    g_full.stat_get = mk_stat_get;
+    g_full.stat_flush = mk_stat_flush;
 }
 
 const JceScriptHost *jce_java_diff_host_full(void)
@@ -1346,6 +1419,7 @@ static const char *const g_case_labels[] = {
     "is_action_pressed",
     "get_axis",
     "get_pointer_delta",
+    "get_pointer_position",
     "get_pointer_wheel",
     "is_pointer_down",
     "get_touch_count",
@@ -1414,6 +1488,12 @@ static const char *const g_case_labels[] = {
     "get_param_text",
     "curve_eval",
     "vcam_activate",
+    "set_cursor",
+    "request_quit",
+    "stat_available",
+    "stat_set",
+    "stat_get",
+    "stat_flush",
     "get_position [no host]",
     "set_position [no host]",
     "get_rotation [no host]",
@@ -1453,6 +1533,7 @@ static const char *const g_case_labels[] = {
     "is_action_pressed [no host]",
     "get_axis [no host]",
     "get_pointer_delta [no host]",
+    "get_pointer_position [no host]",
     "get_pointer_wheel [no host]",
     "is_pointer_down [no host]",
     "get_touch_count [no host]",
@@ -1515,6 +1596,12 @@ static const char *const g_case_labels[] = {
     "get_param_text [no host]",
     "curve_eval [no host]",
     "vcam_activate [no host]",
+    "set_cursor [no host]",
+    "request_quit [no host]",
+    "stat_available [no host]",
+    "stat_set [no host]",
+    "stat_get [no host]",
+    "stat_flush [no host]",
 };
 
 int jce_java_diff_case_count(void)

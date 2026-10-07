@@ -43,8 +43,9 @@ typedef struct {
     const JcePakArchive *pak;           /* loads cs/vs/fs particle shaders */
 } JceGpuParticleSystemDesc;
 
-/* Per-frame emission and simulation parameters.  All fields are
- * sampled once per jce_gpu_particles_update() call. */
+/* Per-frame emission and simulation parameters. All numeric inputs must be
+ * finite, lifetimes positive/ordered, velocity bounds ordered, sizes/damping
+ * nonnegative. Invalid updates submit no GPU work or current diagnostics. */
 typedef struct {
     uint32_t emit_count;        /* how many particles to spawn this frame */
 

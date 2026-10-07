@@ -22,12 +22,12 @@
  */
 #ifndef JCE_DEFAULT_MAIN_INC_H
 #define JCE_DEFAULT_MAIN_INC_H
-
 #include <jce/api_app.h>
 #include <jce/application/jce_engine.h>        /* jce_engine_request_quit (ESC preset) */
 #include <jce/application/jce_main.h>
 #include <jce/application/jce_project.h>
-#include <jce/application/jce_runtime.h>
+#include <jce/application/jce_runtime_stats_host.h>
+#include <jce/application/jce_lifecycle.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_console.h>   /* r.taa cvar: the TAA driver below */
 #include <jce/middleware/video/jce_webm_encoder.h> /* F9 recording preset */
@@ -213,7 +213,6 @@ static bool dm_scene_has_any_character(JceScene *s, JceEntity *unused)
     jce_scene_each_entity(s, dm_char_probe_cb, &found);
     return found;
 }
-
 /* Project-wide quality settings (Top 5): loaded once in app_init from the
  * cooked render_settings.json (build-exported from Project Settings > Quality),
  * folded into the scene render config as the project DEFAULT.  Per-scene
@@ -225,7 +224,8 @@ static JceBundleFile   **s_bundle_files   = NULL;
 static int               s_bundle_count   = 0;
 static JcePakArchive    *s_engine_pak     = NULL;
 static const JceServices*s_svc            = NULL;
-static JceRuntime       *s_runtime        = NULL;
+static JceRuntimeStatsHost s_runtime_host = {0};
+#define s_runtime (s_runtime_host.runtime) /* Legacy template-private consumer alias. */
 static float             s_last_dt        = 0.016f;
 static bool              s_jump_edge      = false;
 /* FPS-look cursor capture.  Captured (relative mouse + grab) ⇒ mouse drives
@@ -617,11 +617,11 @@ static void jce_default_init_world_streaming(const JceProject *proj)
      * a script / trigger / NPC authored in a streamed chunk comes alive (on_start
      * / on_update, trigger observer, body) instead of only rendering, and is
      * released cleanly on cell unload.  No-op when no runtime (physics disabled). */
-    if (s_runtime)
+    if (s_runtime_host.runtime)
         jce_world_streamer_set_entity_callbacks(s_world_streamer,
                                                 s_default_streamer_spawn_cb,
                                                 s_default_streamer_despawn_cb,
-                                                s_runtime);
+                                                s_runtime_host.runtime);
 
     /* VRAM ceiling: report real per-chunk GPU residency to the budget AND arm
      * the renderer's model-cache eviction so freeing ECS entities on cell
@@ -755,6 +755,8 @@ static bool s_default_main_taa_requested(void)
     return cv ? jce_cvar_get_bool(cv) : false;
 }
 
+static char *dm_pak_read_config(const char *pak_key, size_t *out_len);
+
 static void s_default_apply_project_settings(JceRuntimeDesc *rd)
 {
     if (!rd) return;
@@ -767,12 +769,20 @@ static void s_default_apply_project_settings(JceRuntimeDesc *rd)
     } else if (jce_fs_host_get_base_path(base, sizeof(base))) {
         int n = snprintf(path, sizeof(path), "%s%s", base, rel);
         if (n <= 0 || n >= (int)sizeof(path) || !jce_fs_host_exists_file(path))
-            return;
-    } else {
-        return;
+            path[0] = '\0';
     }
 
-    JceJson *root = jce_json_parse_file(path);
+    JceJson *root = NULL;
+    if (path[0]) {
+        root = jce_json_parse_file(path);
+    } else {
+        size_t len = 0;
+        char *bytes = dm_pak_read_config("settings/project-settings.json", &len);
+        if (!bytes) return;
+        root = jce_json_parse_strict(bytes, len);
+        free(bytes);
+        snprintf(path, sizeof path, "%s", "pak:settings/project-settings.json");
+    }
     if (!root) {
         LOG_WARN("app", "project settings unreadable (%s): %s -- running on "
                  "runtime defaults", path, jce_json_last_error());
@@ -1486,7 +1496,6 @@ static bool app_init(const JceServices *svc, void *ud)
                      s_render_settings.soft_particles);
         }
     }
-
     if (s_scene) {
         JceRuntimeDesc rd = (JceRuntimeDesc){0};
         rd.scene          = s_scene;
@@ -1498,11 +1507,9 @@ static bool app_init(const JceServices *svc, void *ud)
      * loads none of it -- which is what every shipped build did, because
      * jce_world_streamer_create had only editor callers. */
     rd.asset_fs = s_runtime_fs;
-
         /* Time / Physics from the project the designer actually tuned.  Play
          * has always done this; this path never did.  See the function. */
         s_default_apply_project_settings(&rd);
-
         /* Navmesh + saves: the two fields Play set and this path did not, so a
          * shipped game had no navmesh to path on and nowhere to write a
          * SavePoint checkpoint.  Both resolve to NULL when absent, which is
@@ -1520,7 +1527,6 @@ static bool app_init(const JceServices *svc, void *ud)
          * through to the PAK — loose-tree script edits beside a shipped exe
          * never load (PAK-only), unlike every other asset class. */
         rd.resolve_path_fn = s_runtime_resolve_path;
-
         /* Game L10n: prefer the on-disk cooked tree's i18n dir
          * (<exe_dir>/<cooked_assets>/i18n) so shipped games hot-load
          * locale edits; bundle-embedded exes fall through to rd.pak's
@@ -1544,7 +1550,6 @@ static bool app_init(const JceServices *svc, void *ud)
         }
         rd.locale = (svc && svc->config && svc->config->locale[0])
                     ? svc->config->locale : NULL;
-
         /* Authored audio-mixer routing (Settings/audio_mixer.json, beside
          * Settings/RenderPipeline.rp.json).  Host-first like the render
          * pipeline: CWD (dev run from the project root), then the exe dir
@@ -1567,16 +1572,23 @@ static bool app_init(const JceServices *svc, void *ud)
             if (rd.mixer_config_path)
                 LOG_INFO("app", "audio mixer config: %s", rd.mixer_config_path);
         }
-
-        s_runtime = jce_runtime_create(&rd);
-        if (!s_runtime)
+        const bool stats_configured = jce_runtime_stats_host_attach_env(&s_runtime_host);
+        if (!stats_configured)
+            LOG_WARN("app", "%s", "runtime stats configuration unavailable");
+        s_runtime_host.runtime = jce_runtime_create_with_platform_services(
+            &rd, stats_configured ? s_runtime_host.stats : NULL);
+        if (s_runtime_host.runtime)
+            jce_runtime_set_platform_services(s_runtime_host.runtime, stats_configured ? s_runtime_host.stats : NULL);
+        else {
             LOG_WARN("app", "%s", "jce_runtime_create failed — physics/audio inactive");
-
+            if (!jce_runtime_stats_host_close(&s_runtime_host))
+                LOG_WARN("app", "%s", "runtime stats flush failed after create failure");
+        }
         /* The two project settings whose setters only exist now.  Mirrors
          * editor Play exactly, including the order (disable wins over the
          * authored volume, and doppler is skipped when disabled). */
-        if (s_runtime && s_ps_post.time_scale > 0.0f) {
-            jce_runtime_set_time_scale(s_runtime, s_ps_post.time_scale);
+        if (s_runtime_host.runtime && s_ps_post.time_scale > 0.0f) {
+            jce_runtime_set_time_scale(s_runtime_host.runtime, s_ps_post.time_scale);
             LOG_INFO("app", "project time scale: %.3f",
                      (double)s_ps_post.time_scale);
         }
@@ -1598,34 +1610,31 @@ static bool app_init(const JceServices *svc, void *ud)
                          (double)s_ps_post.doppler_factor);
             }
         }
-
         /* Route animation frame events into the gameplay script VM: the scene
          * renderer (which advances the event tracks) now forwards each fired
          * event to the firing entity's on_anim_event script handler via the
          * runtime.  Both handles exist here; harmless if either is NULL. */
-        if (s_scene_renderer && s_runtime)
+        if (s_scene_renderer && s_runtime_host.runtime)
             jce_scene_renderer_set_anim_event_fn(s_scene_renderer,
                                                  s_default_anim_event_cb,
-                                                 s_runtime);
+                                                 s_runtime_host.runtime);
         /* Route animation state-machine state changes into the script VM so
          * authored on_state_enter / on_state_exit handlers fire (mirrors the
          * frame-event wiring above). */
-        if (s_scene_renderer && s_runtime)
+        if (s_scene_renderer && s_runtime_host.runtime)
             jce_scene_renderer_set_anim_state_fn(s_scene_renderer,
                                                  s_default_anim_state_cb,
-                                                 s_runtime);
+                                                 s_runtime_host.runtime);
         /* Foot IK: install the renderer's ground-query hook to the runtime's
          * physics raycast so authored FootIk components adapt feet to terrain. */
-        if (s_scene_renderer && s_runtime)
+        if (s_scene_renderer && s_runtime_host.runtime)
             jce_scene_renderer_set_ground_query_fn(s_scene_renderer,
                                                    s_default_ground_query_cb,
-                                                   s_runtime);
+                                                   s_runtime_host.runtime);
     }
-
     /* Open-world streaming (no-op unless the scene's streaming settings
      * are enabled and carry registered chunks). */
     jce_default_init_world_streaming(s_project);
-
     /* Scene-driven boot cursor mode: capture (FPS-look) only when the scene
      * actually has a player character to drive.  Diorama / orbit / UI-first
      * scenes start with a FREE cursor so drag-orbit and authored HUD buttons
@@ -1648,7 +1657,6 @@ static bool app_init(const JceServices *svc, void *ud)
     }
     return true;
 }
-
 /* Editor-authored action map drives movement when the action exists;
  * the raw scancode is the fallback so a missing/renamed action never
  * strands the player. The engine already loads input_actions.json and
@@ -1787,7 +1795,7 @@ static void app_update(float dt, void *ud)
      * Only a unit DIRECTION plus button state is pushed — speeds and the
      * jump arc come from the scene's CharacterController component, so
      * the deployed exe and the editor share the same authored feel. */
-    if (s_runtime) {
+    if (s_runtime_host.runtime) {
         JceRuntimeInput ri = (JceRuntimeInput){0};
 
         float fx = 0.0f, fz = 0.0f, rx = 0.0f, rz = 0.0f;
@@ -1834,7 +1842,19 @@ static void app_update(float dt, void *ud)
          * Without this jce.is_key_down answered false in every shipped
          * game -- see JceRuntimeInput::keyboard. */
         ri.keyboard = in;
-        jce_runtime_set_input(s_runtime, &ri);
+        jce_runtime_set_input(s_runtime_host.runtime, &ri);
+        {
+            float pointer_x = 0.0f, pointer_y = 0.0f;
+            uint32_t pointer_w = 0, pointer_h = 0;
+            jce_input_mouse_pos(in, &pointer_x, &pointer_y);
+            if (s_svc->window) jce_window_get_size(s_svc->window, &pointer_w, &pointer_h);
+            /* Focus loss is not a user release. Recorded input owns its
+             * focus boundary; live hosts invalidate their logical viewport. */
+            if (!getenv("JCE_INPUT_REPLAY") && !jce_lifecycle_is_focused())
+                pointer_w = pointer_h = 0;
+            jce_runtime_set_pointer_position(s_runtime_host.runtime, pointer_x, pointer_y,
+                                             (float)pointer_w, (float)pointer_h);
+        }
         {
             JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES];
             int touch_count = jce_input_touch_count(in);
@@ -1852,13 +1872,14 @@ static void app_update(float dt, void *ud)
                 touches[kept].pressure = pressure;
                 ++kept;
             }
-            jce_runtime_set_touch_input(s_runtime, touches, kept);
+            jce_runtime_set_touch_input(s_runtime_host.runtime, touches, kept);
         }
         /* Bind the live action map so gameplay scripts can read authored verbs
          * and axes by name (jce.is_action_down / get_axis), beyond the fixed
          * walk/jump/sprint/attack fields above. */
-        jce_runtime_set_actions(s_runtime, acts);
-        jce_runtime_step(s_runtime, dt);
+        jce_runtime_set_actions(s_runtime_host.runtime, acts);
+        jce_runtime_step(s_runtime_host.runtime, dt);
+        if (jce_runtime_quit_requested(s_runtime_host.runtime)) { jce_engine_request_quit(); return; }
 
         /* Scene transitions clear + reload the SAME ECS world, so recycled
          * entity ids come back with bumped generation bits and every
@@ -1866,7 +1887,7 @@ static void app_update(float dt, void *ud)
          * goes stale.  Drop them once per completed transition — content
          * rebuilds lazily on the next draw. */
         static bool s_was_transitioning = false;
-        bool transitioning = jce_runtime_is_transitioning(s_runtime);
+        bool transitioning = jce_runtime_is_transitioning(s_runtime_host.runtime);
         if (s_was_transitioning && !transitioning && s_scene_renderer)
             jce_scene_renderer_reset_entity_caches(s_scene_renderer);
         s_was_transitioning = transitioning;
@@ -1949,7 +1970,7 @@ static void app_update(float dt, void *ud)
     s_free_cam_prev = f_now;
 
     jce_vec3 player_pos;
-    if (!s_free_cam && s_runtime && jce_runtime_get_player_position(s_runtime, &player_pos)) {
+    if (!s_free_cam && s_runtime_host.runtime && jce_runtime_get_player_position(s_runtime_host.runtime, &player_pos)) {
         /* Third-person follow: orbit the camera behind+above the player and
          * look past them, so the playable character stays visible (showcase /
          * Genshin-style).  Mouse yaw orbits the rig; F toggles to free-fly.
@@ -2099,7 +2120,7 @@ static void jce_default_main_physics_debug(uint16_t view,
     }
 
     if (jce_physics_debug_get_flags() == 0u) return;
-    JcePhysicsWorld *pw = s_runtime ? jce_runtime_physics(s_runtime) : NULL;
+    JcePhysicsWorld *pw = s_runtime_host.runtime ? jce_runtime_physics(s_runtime_host.runtime) : NULL;
     if (!pw || !svc || !svc->renderer) return;
     jce_physics_debug_flush(pw);
     jce_debug_draw_flush(view, svc->renderer);
@@ -2148,6 +2169,20 @@ static void app_draw(const JceServices *svc, void *ud)
     (void)ud;
     if (!svc || !svc->renderer || !s_scene_renderer || !s_scene || !s_camera)
         return;
+
+#if defined(JCE_APP_AUTHORED_CAMERA_ONLY) && JCE_APP_AUTHORED_CAMERA_ONLY
+    /* Scene scripts animate the authored camera. Resolve it after update,
+     * before drawing, so pointer picking and the displayed pose agree. */
+    JceSceneCameraPose live_pose;
+    memset(&live_pose, 0, sizeof live_pose);
+    if (jce_scene_camera_apply_primary(s_scene, s_camera, &live_pose) ==
+        JCE_SCENE_CAMERA_RESOLVE_OK) {
+        s_camera_culling_mask = live_pose.culling_mask;
+        s_camera_draw_skybox = jce_scene_camera_clear_draws_skybox(live_pose.clear_mode);
+        jce_scene_camera_clear_keeps(live_pose.clear_mode,
+                                    &s_camera_keep_color, &s_camera_keep_depth);
+    }
+#endif
 
     /* Scene render (Top 1 — shipped postfx parity with the editor game view).
      * When the scene authors any post-processing effect, render into an
@@ -2400,24 +2435,16 @@ static void app_draw(const JceServices *svc, void *ud)
                  * Silently overriding an explicit authored value to protect
                  * against a hypothetical is the wrong trade: honour the scene.  A
                  * scene that wants tone mapping says so. */
-                bool any_effect = false;
-                for (int i = 0; i < JCE_POSTFX_COUNT; ++i)
-                    if (jce_postfx_is_enabled(pfx, (JcePostFXType)i)) {
-                        any_effect = true; break;
-                    }
-                /* taa_on for the same reason want_bridge needs it: TAA is not
-                 * one of the JCE_POSTFX_* types, and its resolve happens
-                 * inside jce_postfx_apply().  Without this the bridge would be
-                 * built, the scene jittered, and the chain that undoes the
-                 * jitter never run -- which is worse than no TAA at all. */
-                if (any_effect || has_fullscreen || taa_on) {
-                    jce_postfx_resize(pfx, rw, rh);
-                    if (jce_gfx_texture_valid(color)) {
-                        jce_postfx_apply(pfx, color, depth);
-                        if (jce_gfx_texture_valid(jce_postfx_get_output(pfx))) {
-                            jce_postfx_present(pfx, sw, sh);
-                            present_done = true;
-                        }
+                /* The scene can disable the last effect during its render.
+                 * Still present that valid offscreen color: submitting the
+                 * direct fallback at the same view would rebind both passes
+                 * to the backbuffer and blend transparent surfaces twice. */
+                jce_postfx_resize(pfx, rw, rh);
+                if (jce_gfx_texture_valid(color)) {
+                    jce_postfx_apply(pfx, color, depth);
+                    if (jce_gfx_texture_valid(jce_postfx_get_output(pfx))) {
+                        jce_postfx_present(pfx, sw, sh);
+                        present_done = true;
                     }
                 }
                 /* AFTER the colour pass and after the resolve, with the SAME
@@ -2524,13 +2551,10 @@ static void app_draw(const JceServices *svc, void *ud)
              * Game View has always tested the panel rect; this is that test. */
             if ((!s_cursor_captured || s_preset_alt_active) && svc->input) {
                 float mx = 0.0f, my = 0.0f;
-                jce_input_mouse_pos(svc->input, &mx, &my);
-                ptr.x     = mx;
-                ptr.y     = my;
-                ptr.down  = jce_input_mouse_button(svc->input,
-                                                   JCE_MOUSE_BUTTON_LEFT);
-                ptr.valid = (mx >= 0.0f && my >= 0.0f &&
-                             mx < (float)sw && my < (float)sh);
+                ptr.valid = jce_input_primary_pointer(svc->input,
+                    (float)sw, (float)sh, &mx, &my, &ptr.down);
+                ptr.x = mx;
+                ptr.y = my;
                 if (ptr.valid) ptr_arg = &ptr;
             }
             /* ── InputField text/edit channel (single-line text entry) ──
@@ -2600,7 +2624,7 @@ static void app_draw(const JceServices *svc, void *ud)
              * HUD too: a fade that leaves the health bar floating over black
              * is not a fade.  alpha 0 draws nothing at all. */
             {
-                const float fade = jce_runtime_transition_alpha(s_runtime);
+                const float fade = jce_runtime_transition_alpha(s_runtime_host.runtime);
                 if (fade > 0.0f && svc->renderer) {
                     const uint8_t a = (uint8_t)((fade < 1.0f ? fade : 1.0f)
                                                 * 255.0f + 0.5f);
@@ -2646,7 +2670,7 @@ static void app_draw(const JceServices *svc, void *ud)
              * skipping the read latches the event and fires it on some later,
              * unrelated frame.  One shared engine seam with the editor's Play
              * loop, so the two lists cannot drift again. */
-            jce_runtime_dispatch_ui_events(s_runtime, s_ui_canvas, s_scene);
+            jce_runtime_dispatch_ui_events(s_runtime_host.runtime, s_ui_canvas, s_scene);
         }
     }
 
@@ -2697,7 +2721,9 @@ static void app_exit(void *ud)
     /* Streamer first: it removes streamed entities and joins its private
      * structured executor before the scene or filesystem are destroyed. */
     if (s_world_streamer) { jce_world_streamer_destroy(s_world_streamer);  s_world_streamer = NULL; }
-    if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
+    if (s_runtime_host.runtime)        { jce_runtime_destroy(s_runtime_host.runtime);              s_runtime_host.runtime        = NULL; }
+    if (!jce_runtime_stats_host_close(&s_runtime_host))
+        LOG_WARN("app", "%s", "runtime stats flush failed");
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     /* Occlusion culler holds bgfx resources (proxy geom + query handles) —
      * destroy before the renderer/bgfx shut down. */
@@ -2725,6 +2751,27 @@ static void app_exit(void *ud)
     jce_default_unmount_project_bundles();
     if (s_project)        { jce_project_free(s_project);                  s_project        = NULL; }
     s_svc = NULL;
+}
+
+/* Borrowed observation surface for stock-host profilers and target inspectors.
+ * NULL before initialization/after exit. The caller must not destroy it, retain
+ * it beyond that lifecycle, or depend on the template's private state names. */
+JCE_INLINE const JceSceneRenderer *jce_default_main_get_scene_renderer(void)
+{
+    return s_scene_renderer;
+}
+
+/* Owner-thread borrowed observation only; valid after app_init succeeds and
+ * before app_exit. Never destroy or retain these across host shutdown.
+ * Scene is mutable because the public typed enumeration API requires it. */
+JCE_INLINE JceScene *jce_default_main_get_scene(void)
+{
+    return s_scene;
+}
+
+JCE_INLINE const JceCamera *jce_default_main_get_camera(void)
+{
+    return s_camera;
 }
 
 #endif /* JCE_DEFAULT_MAIN_INC_H */

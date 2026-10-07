@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -426,9 +427,9 @@ struct TextureLoadResult {
     std::string          key;
     uint64_t             generation;
     bool                 success;
-    std::vector<uint8_t> rgba;
-    uint32_t             width;
-    uint32_t             height;
+    /* Engine CPU result retains the authored cooked mip chain. Move-only RAII
+     * frees cancelled/stale/deferred results without a second decode path. */
+    std::unique_ptr<JceTextureCpu, void (*)(JceTextureCpu *)> cpu{nullptr, jce_texture_cpu_free};
     /* Which file the worker decoded, and its mtime read BEFORE the decode.
      * Before, not after: a file rewritten mid-decode then leaves a stamp older
      * than the bytes on disk, so the next poll reloads.  The other order would

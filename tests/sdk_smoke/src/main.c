@@ -153,6 +153,15 @@ static bool smoke_init(const JceServices *svc, void *ud)
         return false;
     }
     jce_read_source_close(source);
+    if (jce_audio_stream_is_quiescent(NULL, JCE_VOICE_INVALID)) {
+        printf("JCE_SMOKE: FAIL installed audio NULL quiescence\n");
+        return false;
+    }
+    /* Link the installed endpoint-gain getter without requiring a device. */
+    if (jce_audio_get_master_volume(NULL) != 0.0f) {
+        printf("JCE_SMOKE: FAIL installed audio NULL endpoint gain\n");
+        return false;
+    }
     if (jce_audio_file_open(NULL) != NULL) {
         printf("JCE_SMOKE: FAIL installed audio file validation\n");
         return false;

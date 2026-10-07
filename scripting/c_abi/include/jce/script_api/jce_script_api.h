@@ -67,7 +67,7 @@ extern "C" {
 
 /* Entry points that are a manifest entry; the library exports these plus
  * the 3 meta entry points below. */
-#define JCE_SCRIPT_API_ENTRY_COUNT 101
+#define JCE_SCRIPT_API_ENTRY_COUNT 108
 
 /* Opaque: the library owns the host copy, the caller owns nothing. */
 typedef struct JceScriptApi JceScriptApi;
@@ -396,6 +396,14 @@ JCE_SCRIPT_API float jce_script_api_get_axis(JceScriptApi *api,
  */
 JCE_SCRIPT_API void jce_script_api_get_pointer_delta(JceScriptApi *api,
                                                      float out_xy[2]);
+
+/* jce_script_api_get_pointer_position -- shape: void_out_array, since 1
+ * Viewport-local logical pixel x, y, width, height; zero dimensions indicate
+ * unavailable input. The sample is frame-transient and shared by Editor Game
+ * View and standalone runtime.
+ */
+JCE_SCRIPT_API void jce_script_api_get_pointer_position(JceScriptApi *api,
+                                                        float out_xywh[4]);
 
 /* jce_script_api_get_pointer_wheel -- shape: value_return, since 1
  */
@@ -839,6 +847,43 @@ JCE_SCRIPT_API bool jce_script_api_curve_eval(JceScriptApi *api,
  */
 JCE_SCRIPT_API int jce_script_api_vcam_activate(JceScriptApi *api,
                                                 const char * name);
+
+/* jce_script_api_set_cursor -- shape: value_return, since 1
+ * Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path
+ * resets. Main-thread; false on decode/platform/cache failure.
+ */
+JCE_SCRIPT_API bool jce_script_api_set_cursor(JceScriptApi *api,
+                                              const char * asset_path,
+                                              int hotspot_x, int hotspot_y);
+
+/* jce_script_api_request_quit -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_request_quit(JceScriptApi *api);
+
+/* jce_script_api_stat_available -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_stat_available(JceScriptApi *api);
+
+/* jce_script_api_stat_set -- shape: value_return, since 1
+ * Store signed32 statistic through an explicitly borrowed platform service.
+ * Nonfinite, fractional or out-of-range values return false; successful set
+ * does not imply durable flush.
+ */
+JCE_SCRIPT_API bool jce_script_api_stat_set(JceScriptApi *api, const char * id,
+                                            double value);
+
+/* jce_script_api_stat_get -- shape: value_return, since 1
+ * Signed32 statistic; fallback must be finite, integral and in range,
+ * otherwise returns 0. An absent host returns 0; a configured runtime with
+ * unavailable service returns the valid fallback.
+ * When the host member is absent this returns 0, not 0.
+ */
+JCE_SCRIPT_API int jce_script_api_stat_get(JceScriptApi *api, const char * id,
+                                           double fallback);
+
+/* jce_script_api_stat_flush -- shape: value_return, since 1
+ */
+JCE_SCRIPT_API bool jce_script_api_stat_flush(JceScriptApi *api);
 
 #ifdef __cplusplus
 }

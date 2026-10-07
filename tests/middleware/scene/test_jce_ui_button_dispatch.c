@@ -32,6 +32,7 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/middleware/scene/jce_component_registry.h>
 #include <jce/middleware/script/jce_script.h>
 
 #include "unity.h"
@@ -286,6 +287,30 @@ static void test_call_named_missing_handler_is_noop(void)
     jce_script_destroy(vm);
 }
 
+/* Component-enable rows move entities between ECS tables. That must not
+ * reorder overlapping siblings: the later-authored button stays on top. */
+static void test_sibling_order_survives_component_enable_change(void)
+{
+    JceEntity back = 0;
+    JceScene *s = make_scene_with_button(&back);
+    JceEntity front = jce_scene_create_entity(s, "FrontButton");
+    JceUIImageComponent image = *jce_scene_get_ui_image(s, back);
+    JceUIButtonComponent button = *jce_scene_get_ui_button(s, back);
+    jce_scene_set_parent(s, front, jce_scene_get_parent(s, back));
+    jce_scene_set_ui_image(s, front, &image);
+    jce_scene_set_ui_button(s, front, &button);
+    int cid = jce_component_find("UIButton");
+    TEST_ASSERT_TRUE(cid >= 0);
+    jce_scene_set_comp_enabled(s, back, cid, false);
+    jce_scene_set_comp_enabled(s, back, cid, true);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    (void)step(uc, s, IN_X, IN_Y, true, true);
+    TEST_ASSERT_EQUAL_UINT64(front, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -295,5 +320,6 @@ int main(void)
     RUN_TEST(test_non_interactable_button_never_clicks);
     RUN_TEST(test_call_named_fires_handler_once);
     RUN_TEST(test_call_named_missing_handler_is_noop);
+    RUN_TEST(test_sibling_order_survives_component_enable_change);
     return UNITY_END();
 }

@@ -39,12 +39,12 @@ RENDERER_C = REPO_ROOT / "engine" / "src" / "renderer" / "jce_renderer.c"
 # Every tool that LAUNCHES the engine to produce a number or an image.  All of
 # them must pin the same environment, or two "identical" runs are not identical.
 MEASURING_TOOLS = ("visual_diff.py", "render_parity.py", "perf_bench.py",
-                   "envshot.py", "frame_budget.py", "probe_scene_watch.py",
+                   "benchmark_suite.py", "envshot.py", "frame_budget.py", "probe_scene_watch.py",
                    "media_preview_probe.py", "build/jce_accept.py")
 # The subset that PHOTOGRAPHS the engine.  Only these need the blank-frame
 # guard: a perf number cannot be blank, a screenshot can.
 CAPTURING_TOOLS = ("visual_diff.py", "render_parity.py", "envshot.py",
-                   "media_preview_probe.py")
+                   "benchmark_suite.py", "media_preview_probe.py")
 
 # A hardcoded list drifts, and a drifting list is a gate that stops covering
 # what it names.  envshot.py launched the engine and set JCE_BACKEND for months

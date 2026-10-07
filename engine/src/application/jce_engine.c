@@ -10,6 +10,7 @@
 #include <jce/application/jce_args.h>
 #include <jce/application/jce_engine.h>
 #include "jce_engine_frame_cap.h"
+#include "jce_frame_kpi.h"
 #include <jce/application/jce_lifecycle.h>
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_fixed_clock.h>
@@ -37,6 +38,7 @@
 #endif
 
 #include <jce/os/core/jce_config.h>
+#include "jce_engine_memory_policy.h"
 #include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/resource/jce_streaming.h>
@@ -389,6 +391,8 @@ struct JceEngine {
     char             configured_window_title[128];
     JceGpuCaps       gpu_caps;
     bool             headless;        /* dedicated-server: no window/GPU/audio/UI */
+    bool             low_memory;
+    uint64_t         trim_last;
     bool             hidden_window;   /* real GPU device, window never mapped */
     JceWindow       *window;
     JceInput        *input;
@@ -415,6 +419,8 @@ struct JceEngine {
      * one column; this is every registered phase, which is what a frame-budget
      * gate needs and what nothing could produce outside the editor. */
     SDL_IOStream                *kpi_frame_log;
+    JceFrameKpiBuffer             kpi_frame_buffer;
+    uint32_t                     kpi_frame_flush_interval;
     uint64_t                    kpi_frame_index;
     uint32_t                    kpi_frame_limit;
 
@@ -424,6 +430,8 @@ struct JceEngine {
      * deterministic number of frames (e.g. long enough for world streaming to
      * apply chunks) without depending on window focus or an interactive quit. */
     uint32_t                    max_frames;
+    double                      max_seconds;
+    uint64_t                    run_start_counter;
     uint32_t                    frame_index;
 
     /* DEBUG TOGGLE: deterministic input record / replay (JIRC).
@@ -446,9 +454,41 @@ static void jce_engine_reset_frame_clock(JceEngine *e)
     e->frame_counter_prev = jce_time_perf_counter();
 }
 
+static double read_positive_seconds_env(const char *value)
+{
+    char *end = NULL;
+    double seconds;
+    if (!value || !value[0]) return 0.0;
+    seconds = strtod(value, &end);
+    if (end == value || *end != '\0' || !(seconds > 0.0) ||
+        seconds > 86400.0) return 0.0;
+    return seconds;
+}
+
+static bool jce_engine_benchmark_autostop(JceEngine *e, bool headless)
+{
+    bool frame_limit, time_limit = false;
+    if (!e->max_frames && e->max_seconds <= 0.0) return false;
+    ++e->frame_index;
+    frame_limit = e->max_frames && e->frame_index >= e->max_frames;
+    if (e->max_seconds > 0.0 && e->perf_freq > 0) {
+        const uint64_t now = jce_time_perf_counter();
+        time_limit = now >= e->run_start_counter &&
+            (double)(now - e->run_start_counter) / (double)e->perf_freq >=
+                e->max_seconds;
+    }
+    if (!frame_limit && !time_limit) return false;
+    LOG_INFO(LOG_TAG, "%s reached (%u frames, %.3f seconds) — quitting%s",
+             frame_limit ? "JCE_MAX_FRAMES" : "JCE_MAX_SECONDS",
+             e->frame_index, e->max_seconds,
+             headless ? " (headless)" : "");
+    jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
+    return true;
+}
+
 static uint32_t read_positive_u32_env(const char *env_name, uint32_t fallback)
 {
-    const char *value = SDL_getenv(env_name);
+    const char *value = getenv(env_name);
     if (!value || !value[0]) {
         return fallback;
     }
@@ -486,7 +526,14 @@ static void render_loading_frame(const JceRenderer *r, JceWindow *win,
 
 static bool should_render_loading_frame(void)
 {
+#if JCE_PLATFORM_WEB
+    /* Startup must return to the browser before presenting a GPU frame.
+     * Synchronous loading frames can block headless/occluded WebGL contexts.
+     * Normal game frames run through the browser's scheduled callback. */
+    return false;
+#else
     return bgfx_get_renderer_type() != BGFX_RENDERER_TYPE_OPENGL;
+#endif
 }
 
 /* -- Create -------------------------------------------------------- */
@@ -568,14 +615,14 @@ JceEngine *jce_engine_create(int argc, char *argv[])
      * scene-load lines -- the ones worth reading -- are the ones that are
      * lost. */
     {
-        const char *log_file = SDL_getenv("JCE_LOG_FILE");
+        const char *log_file = getenv("JCE_LOG_FILE");
         if (log_file && log_file[0]) jce_log_set_file(log_file);
     }
     jce_log_set_thread_name("MAIN");
     jce_thread_mark_main();
     {
-        const char *trace_env = SDL_getenv("JCE_TRACE");
-        const char *perf_env = SDL_getenv("JCE_PERF_LOG");
+        const char *trace_env = getenv("JCE_TRACE");
+        const char *perf_env = getenv("JCE_PERF_LOG");
         bool trace_on = (trace_env && trace_env[0] != '0') ||
                         (perf_env && perf_env[0] != '0');
 #ifndef NDEBUG
@@ -720,12 +767,19 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         return NULL;
     }
 
+    /* Resolve each lifecycle before renderer/audio/user startup allocations.
+     * FULL must also restore the allocator after an earlier LOW lifecycle. */
+    e->low_memory = jce_engine_low_memory_policy(SDL_GetSystemRAM(),
+        SDL_GetNumLogicalCPUCores(), jce_config_machine_class(),
+        getenv("JCE_LOW_MEM"));
+    jce_alloc_low_mem_mode(e->low_memory);
+
     /*
      * Servers routinely run several instances on one host.  Windowed CI and
      * profiler A/B runs may opt in as well, so they never steal focus from an
      * interactive editor that happens to be open on the same workstation.
      */
-    const char *multi_instance_env = SDL_getenv("JCE_MULTI_INSTANCE");
+    const char *multi_instance_env = getenv("JCE_MULTI_INSTANCE");
     bool allow_multiple_instances =
         e->headless ||
         /* A hidden run has no window to activate and no focus to steal, so
@@ -1148,8 +1202,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
      * Use for bug repros, regression runs, and demos.  Replay wins when
      * both are set (recording a replay would only copy the file). */
     {
-        const char *rec_path = SDL_getenv("JCE_INPUT_RECORD");
-        const char *rep_path = SDL_getenv("JCE_INPUT_REPLAY");
+        const char *rec_path = getenv("JCE_INPUT_RECORD");
+        const char *rep_path = getenv("JCE_INPUT_REPLAY");
         if (rep_path && rep_path[0]) {
             e->input_replayer = jce_input_replay_open(rep_path);
             if (e->input_replayer)
@@ -1244,13 +1298,18 @@ headless_after_renderer:;
 
     /* Headless / CI auto-quit after N frames (0 = disabled). */
     e->max_frames  = read_positive_u32_env("JCE_MAX_FRAMES", 0u);
+    e->max_seconds = read_positive_seconds_env(getenv("JCE_MAX_SECONDS"));
+    e->run_start_counter = jce_time_perf_counter();
     e->frame_index = 0u;
     if (e->max_frames)
         LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES=%u: will auto-quit after %u frames",
                  e->max_frames, e->max_frames);
+    if (e->max_seconds > 0.0)
+        LOG_INFO(LOG_TAG, "JCE_MAX_SECONDS=%.3f: timed auto-quit enabled",
+                 e->max_seconds);
 
     {
-        const char *asset_kpi_path = SDL_getenv("JCE_KPI_ASSET_LOG");
+        const char *asset_kpi_path = getenv("JCE_KPI_ASSET_LOG");
         if (asset_kpi_path && asset_kpi_path[0]) {
             e->kpi_asset_log = SDL_IOFromFile(asset_kpi_path, "w");
             if (e->kpi_asset_log) {
@@ -1276,12 +1335,14 @@ headless_after_renderer:;
          * Needs no new engine API: jce_perf_phase_frame_tick / _count /
          * _peek_frame are already public and the player loop already rotates
          * the snapshot every frame. */
-        const char *frame_kpi_path = SDL_getenv("JCE_KPI_FRAME_LOG");
+        const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
         if (frame_kpi_path && frame_kpi_path[0]) {
             e->kpi_frame_log = SDL_IOFromFile(frame_kpi_path, "w");
             if (e->kpi_frame_log) {
                 e->kpi_frame_limit =
                     read_positive_u32_env("JCE_KPI_FRAME_COUNT", 0u);
+                e->kpi_frame_flush_interval =
+                    read_positive_u32_env("JCE_KPI_DURABLE_FLUSH_INTERVAL", 0u);
                 static const char fhdr[] = "frame_index,phase,ms\n";
                 SDL_WriteIO(e->kpi_frame_log, fhdr, sizeof(fhdr) - 1);
                 SDL_FlushIO(e->kpi_frame_log);
@@ -1290,6 +1351,8 @@ headless_after_renderer:;
                 jce_perf_phase_set_enabled(1);
                 LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s",
                          frame_kpi_path);
+                LOG_INFO(LOG_TAG, "frame KPI durable flush interval=%u (0=shutdown only)",
+                         e->kpi_frame_flush_interval);
             } else {
                 LOG_WARN(LOG_TAG, "cannot open frame KPI log '%s'",
                          frame_kpi_path);
@@ -1421,7 +1484,7 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
      * continues at the last good backbuffer size (present goes occluded). */
     if (t == SDL_EVENT_WINDOW_MINIMIZED) {
         static int s_bench = -1;
-        if (s_bench < 0) s_bench = (SDL_getenv("JCE_MAX_FRAMES") != NULL) ? 1 : 0;
+        if (s_bench < 0) s_bench = (getenv("JCE_MAX_FRAMES") != NULL) ? 1 : 0;
         if (!s_bench)
             SDL_SetAtomicInt(&s_render_paused, 1);
         return true;
@@ -1725,30 +1788,12 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * boxes (low RAM / single core, or JCE_LOW_MEM=1) additionally switch
      * the allocator to immediate-purge and trim aggressively. */
     {
-        static uint64_t s_trim_last = 0;
-        static int      s_low_mem   = -1;
-        if (s_low_mem < 0) {
-            const int ram_mb = SDL_GetSystemRAM();
-            const int cores  = SDL_GetNumLogicalCPUCores();
-            bool lm = (ram_mb > 0 && ram_mb < 2048) || cores <= 1;
-            /* Settings S5: jce.ini machine_class overrides the auto-detect
-             * (same precedence as apply_transient_limits); env still wins. */
-            switch (jce_config_machine_class()) {
-            case JCE_MACHINE_CLASS_LOW:  lm = true;  break;
-            case JCE_MACHINE_CLASS_FULL: lm = false; break;
-            default: break;
-            }
-            const char *ev = getenv("JCE_LOW_MEM");
-            if (ev && ev[0]) lm = (ev[0] != '0');
-            s_low_mem = lm ? 1 : 0;
-            if (lm) jce_alloc_low_mem_mode(true);
-        }
         const uint64_t trim_every =
-            e->perf_freq * (uint64_t)(s_low_mem ? 10u : 30u);
-        if (e->perf_freq > 0 && now - s_trim_last >= trim_every) {
-            if (s_trim_last != 0)   /* skip the boot window (startup allocs) */
-                jce_alloc_trim(s_low_mem != 0);
-            s_trim_last = now;
+            e->perf_freq * (uint64_t)(e->low_memory ? 10u : 30u);
+        if (e->perf_freq > 0 && now - e->trim_last >= trim_every) {
+            if (e->trim_last != 0)   /* skip the boot window (startup allocs) */
+                jce_alloc_trim(e->low_memory);
+            e->trim_last = now;
         }
     }
 
@@ -1779,7 +1824,7 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         static int   s_fixed_dt   = -1;
         static float s_fixed_dt_v = 0.0f;
         if (s_fixed_dt < 0) {
-            const char *v = SDL_getenv("JCE_FRAME_DT_FIXED");
+            const char *v = getenv("JCE_FRAME_DT_FIXED");
             if (v && v[0]) {
                 s_fixed_dt_v = (float)SDL_atof(v);
                 if (s_fixed_dt_v <= 0.0f) s_fixed_dt_v = JCE_DEFAULT_FRAME_DT;
@@ -1837,15 +1882,8 @@ JceAppResult jce_engine_iterate(JceEngine *e)
             }
         }
 
-        if (e->max_frames) {
-            e->frame_index++;
-            if (e->frame_index >= e->max_frames) {
-                LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES reached (%u) — quitting (headless)",
-                         e->max_frames);
-                jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
-                return JCE_APP_SUCCESS;
-            }
-        }
+        if (jce_engine_benchmark_autostop(e, true))
+            return JCE_APP_SUCCESS;
         return JCE_APP_CONTINUE;
     }
 
@@ -1941,20 +1979,39 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * reason. */
     if (e->kpi_frame_log &&
         (e->kpi_frame_limit == 0u || e->kpi_frame_index < e->kpi_frame_limit)) {
-        if (jce_perf_phase_frame_has_data()) {
-            const int np = jce_perf_phase_count();
-            for (int i = 0; i < np; i++) {
-                const char *nm = NULL;
-                double ms = 0.0;
-                if (!jce_perf_phase_peek_frame(i, &nm, &ms) || !nm) continue;
-                char row[160];
-                int n = snprintf(row, sizeof(row), "%llu,%s,%.4f\n",
-                                 (unsigned long long)e->kpi_frame_index, nm, ms);
-                if (n > 0) SDL_WriteIO(e->kpi_frame_log, row, (size_t)n);
-            }
+        const uint64_t export_start = jce_time_perf_counter();
+        /* wall_dt is the interval since the previous frame began.  The
+         * snapshot above describes that same completed frame.  Keep the
+         * raw interval in the existing long-format KPI stream so benchmark
+         * tools can derive percentiles from every sample, not the 2048-entry
+         * interactive ring or a 120-frame log average. */
+        JceGpuStats frame_stats;
+        bool have_stats = jce_renderer_get_gpu_stats(&frame_stats) && frame_stats.valid;
+        if (!jce_frame_kpi_export(&e->kpi_frame_buffer, e->kpi_frame_log,
+                e->kpi_frame_index, (double)wall_dt * 1000.0,
+                have_stats ? &frame_stats : NULL)) {
+            LOG_ERROR(LOG_TAG, "frame KPI export failed; capture is incomplete");
+            SDL_CloseIO(e->kpi_frame_log);
+            e->kpi_frame_log = NULL;
+            jce_frame_kpi_buffer_destroy(&e->kpi_frame_buffer);
+            SDL_SetAtomicInt(&s_in_render_frame, 0);
+            return JCE_APP_FAILURE;
         }
         e->kpi_frame_index++;
-        if ((e->kpi_frame_index % 60u) == 0u) SDL_FlushIO(e->kpi_frame_log);
+        /* SDL's file flush requests durable storage (FlushFileBuffers or
+         * fdatasync), not just a cheap visibility update. Do not force a disk
+         * synchronization every 60 frames in the measured loop. Initialization
+         * publishes the header and shutdown flushes all samples; an explicit
+         * diagnostic interval can reproduce durability cost when required. */
+        if (e->kpi_frame_flush_interval &&
+            (e->kpi_frame_index % e->kpi_frame_flush_interval) == 0u &&
+            !SDL_FlushIO(e->kpi_frame_log)) {
+            LOG_ERROR(LOG_TAG, "frame KPI durable flush failed; capture is incomplete");
+            SDL_SetAtomicInt(&s_in_render_frame, 0);
+            return JCE_APP_FAILURE;
+        }
+        jce_perf_phase_add("kpi_export",
+            jce_time_perf_to_ms(export_start, jce_time_perf_counter()));
     }
 
     /* ── PlayerLoop: INITIALIZATION / EARLY_UPDATE ──────────────────
@@ -2170,7 +2227,7 @@ JceAppResult jce_engine_iterate(JceEngine *e)
              * env table and never sees Module.ENV entries, so the web
              * `?perflog` hook silently failed to arm the profiler. */
             s_perf_on = (getenv("JCE_PERF_LOG") != NULL) ? 1 : 0;
-            jce_perf_phase_set_enabled(s_perf_on);
+            jce_perf_phase_set_enabled(s_perf_on || e->kpi_frame_log != NULL);
         }
         if (s_perf_on) {
             static double   s_acc_ms = 0.0;
@@ -2495,15 +2552,8 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * number of frames.  Counts AFTER a full frame so frame N's work (and any
      * END_OF_FRAME screenshot hook) has run.  Mirrors the SDL_EVENT_QUIT path:
      * emit WILL_QUIT, then return SUCCESS to end the loop. */
-    if (e->max_frames) {
-        e->frame_index++;
-        if (e->frame_index >= e->max_frames) {
-            LOG_INFO(LOG_TAG, "JCE_MAX_FRAMES reached (%u) — quitting",
-                     e->max_frames);
-            jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
-            return JCE_APP_SUCCESS;
-        }
-    }
+    if (jce_engine_benchmark_autostop(e, false))
+        return JCE_APP_SUCCESS;
 
     /* Last thing in the frame: hold the loop to the authored cap. */
     engine_frame_cap_wait();
@@ -2529,7 +2579,7 @@ void jce_engine_destroy(JceEngine *e)
 
 #define JCE_SHUTDOWN_DIAG(phase_)                                            \
     do {                                                                     \
-        const char *_diag = SDL_getenv("JCE_SHUTDOWN_DIAG");                \
+        const char *_diag = getenv("JCE_SHUTDOWN_DIAG");                \
         if (_diag && _diag[0] && _diag[0] != '0') {                          \
             LOG_INFO(LOG_TAG, "shutdown: %s", (phase_));                    \
             jce_log_flush();                                                 \
@@ -2561,10 +2611,13 @@ void jce_engine_destroy(JceEngine *e)
     if (e->event_bus) jce_event_bus_destroy(e->event_bus);
 
     if (e->kpi_frame_log) {
-        SDL_FlushIO(e->kpi_frame_log);
-        SDL_CloseIO(e->kpi_frame_log);
+        if (!SDL_FlushIO(e->kpi_frame_log))
+            LOG_ERROR(LOG_TAG, "frame KPI final flush failed; capture is incomplete");
+        if (!SDL_CloseIO(e->kpi_frame_log))
+            LOG_ERROR(LOG_TAG, "frame KPI close failed; capture is incomplete");
         e->kpi_frame_log = NULL;
     }
+    jce_frame_kpi_buffer_destroy(&e->kpi_frame_buffer);
     if (e->kpi_asset_log) {
         SDL_FlushIO(e->kpi_asset_log);
         SDL_CloseIO(e->kpi_asset_log);
@@ -2623,7 +2676,7 @@ void jce_engine_destroy(JceEngine *e)
      */
     jce_trace_thread_unregister();
     {
-        const char *trace_path = SDL_getenv("JCE_TRACE_EXPORT");
+        const char *trace_path = getenv("JCE_TRACE_EXPORT");
         if (trace_path && trace_path[0]) {
             if (jce_trace_export_chrome_json(trace_path))
                 LOG_INFO(LOG_TAG, "runtime trace exported: %s", trace_path);

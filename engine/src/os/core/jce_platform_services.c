@@ -724,6 +724,11 @@ int jce_platform_ach_progress(JcePlatformServices *svc, const char *id)
     return svc->be.ach_progress(svc->self, id);
 }
 
+bool jce_platform_stats_available(const JcePlatformServices *svc)
+{
+    return svc && svc->be.stat_set && svc->be.stat_get && svc->be.flush;
+}
+
 bool jce_platform_stat_set(JcePlatformServices *svc, const char *id, int64_t value)
 {
     if (!svc || !svc->be.stat_set) return false;

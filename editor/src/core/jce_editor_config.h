@@ -201,6 +201,13 @@ void jce_editor_config_ensure_dir(void);
  * ".jce/<name>"). */
 bool jce_editor_dotjce_path(const char *name, char *out, size_t cap);
 
+/* Pure path validation for an explicit absolute configuration directory.
+ * Names are relative to the directory; overflow and escaping paths fail.
+ * JCE_EDITOR_PROFILE_DIR selects this directory before editor startup.
+ * An invalid explicit profile never falls back to the user's HOME. */
+bool jce_editor_config_profile_path(const char *root, const char *name,
+                                    char *out, size_t cap);
+
 /* Set defaults. */
 void jce_editor_config_defaults(JceEditorConfig *cfg);
 

@@ -1055,6 +1055,7 @@ static uint64_t g_sr_dbg_cascade_hit  = 0;
 static bool sr_shadow_percascade_active(const JceSceneRenderer *sr)
 {
     return sr_shadow_percascade_on()
+        && !sr->shadow_dyn_overflow
         && sr->shadow_dyn_count <= SR_SHADOW_DYN_MAX;
 }
 

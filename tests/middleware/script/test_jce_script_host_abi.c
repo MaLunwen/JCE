@@ -110,6 +110,11 @@ static void test_short_host_is_not_read_past_its_end(void)
     TEST_ASSERT_FALSE_MESSAGE(g_tail_called,
         "a callback past the end of the caller's host was invoked");
 
+    TEST_ASSERT_NOT_EQUAL(0, run(vm,
+        "assert(jce.request_quit()==false); assert(jce.stat_available()==false); "
+        "assert(jce.stat_set('score',4)==false); assert(jce.stat_get('score',-41)==0); "
+        "assert(jce.stat_flush()==false)"));
+
     jce_script_destroy(vm);
 }
 

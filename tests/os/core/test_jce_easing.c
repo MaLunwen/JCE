@@ -67,6 +67,17 @@ static void test_names(void)
     TEST_ASSERT_EQUAL_STRING("Linear", jce_ease_name((JceEaseType)9999));
 }
 
+static void test_cubic_bezier(void)
+{
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,0.802403f,jce_ease_cubic_bezier(.5f,.25f,.1f,.25f,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,0.408511f,jce_ease_cubic_bezier(.25f,.25f,.1f,.25f,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,.2f,jce_ease_cubic_bezier(.2f,0,0,1,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,0,jce_ease_cubic_bezier(-2,.25f,.1f,.25f,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,1,jce_ease_cubic_bezier(2,.25f,.1f,.25f,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,.4f,jce_ease_cubic_bezier(.4f,-1,0,1,1));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f,0,jce_ease_cubic_bezier(NAN,0,0,1,1));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -75,5 +86,6 @@ int main(void)
     RUN_TEST(test_known_values);
     RUN_TEST(test_lerp);
     RUN_TEST(test_names);
+    RUN_TEST(test_cubic_bezier);
     return UNITY_END();
 }

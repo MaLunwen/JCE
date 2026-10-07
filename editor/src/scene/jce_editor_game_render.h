@@ -32,6 +32,8 @@ bool jce_editor_game_render_set_mouse_capture(bool capture);
 
 /* Query current mouse-capture state. */
 bool jce_editor_game_render_is_mouse_captured(void);
+/* Apply the focused Play viewport's host-owned script cursor. */
+bool jce_editor_game_render_apply_cursor(void);
 
 /* Warp the OS cursor to (x, y) in editor-window-local pixel coordinates.
  * Used by the Game View panel to keep the cursor pinned at the centre of

@@ -5,7 +5,7 @@
 ## Identity
 
 - **Layer**: L4. C99 (+ one `.cpp` for webm_parser bridge).
-- **Public umbrella**: no dedicated public; consumed via resource/streaming and audio (shared codec types).
+- **Public umbrella**: `<jce/api_video.h>`; shared audio types remain in the audio API.
 - **Deps (PRIVATE)**: `dav1d` (AV1), `libvpx` (VP8/VP9), `webm` (parser), `Opus`. Optional `OpenH264` + `libhevc` gated by `JCE_PATENTED_CODECS_ENABLED`.
 
 ## File map
@@ -20,6 +20,7 @@
 | `jce_h264_decode.h` / `jce_h265_decode.h` | `jce_h264_decode.c` / `jce_h265_decode.c` | H.264/H.265 — **gated** behind `JCE_ENABLE_PATENTED_CODECS=1` |
 | (internal) `jce_aac_decode.h` | `jce_aac_decode.c` | AAC-LC access-unit decode (fdk-aac) — **gated**. Sole fdk-aac wrapper; also consumed by `middleware/audio/jce_m4a_decode.c` |
 | `jce_yuv_convert.h` | `jce_yuv_convert.c` / `jce_yuv_convert_avx2.c` | YUV→RGB. AVX2 TU compiled only on x86 with `/arch:AVX2` or `-mavx2` (CMake gates it). |
+| `jce_video_color.h` | AV1/VP8/VP9 adapter TUs | Private decoder-owned matrix/range queries; no upstream types cross this boundary |
 
 ## Rules
 
@@ -33,6 +34,31 @@
    cache. JCE compatibility/build adapters live in `os/platform/codec_ports/`
    and `engine/cmake/codec_ports/`. `jce_mp4_parser.c` extends original minimp4
    through its own box walker; codec records borrow the parser-owned bounded moov buffer.
+
+## Pixel conversion witnesses
+
+The native color regression checks the hardware-selected path against an
+independent scalar BT.601 formula, then checks the non-AVX2 path. Widths 1-65,
+odd height, padded planes, saturated values and output guards cover SIMD lanes
+and tails. Never force unsupported CPU instructions in a portable test.
+AVX2 green-channel madd pairs are [V, 0]: the 208 coefficient must occupy the
+low word. Retained same-PTS YUV decoded by an independent implementation can
+distinguish conversion errors from packet, stride or seek-content errors.
+The opt-in JCE_TEST_VIDEO_SEEK_RGBA witness saves public CPU RGBA output only;
+it is separate from cadence timings and does not prove GPU presentation.
+BT.601, BT.709 and BT.2020 NCL limited/full-range kernels share one parameter
+block across scalar, SSE2, AVX2 and NEON. The independent floating-point inverse
+uses ITU-T H.273 Kr/Kb and a one-byte fixed-point rounding budget. Decoder color
+travels with each queued picture and seek serial; previews retain it. AV1 and
+VPx expose decoded-picture metadata, while HEVC uses libhevc's public VUI query.
+This is 8-bit matrix/range conversion, not HDR tone mapping or gamut conversion.
+For 4:2:0, odd decoded crop sizes require ceil(width/2) by ceil(height/2) UV
+allocation, copy and stride. The committed odd AV1/VP9 controls compare the
+entire public seek picture with independent reference bytes without FFmpeg.
+Opt-in JCE_TEST_VIDEO_RESUME_SECONDS=1..5 retires the old public audio voice
+before seeking, waits for current picture/PCM readiness, and starts a fresh
+voice. Separate 50 ms clock samples verify resumed progression. This headless
+probe does not prove editor upload or acoustic speaker presentation.
 
 ## Don't
 
@@ -59,6 +85,9 @@ the 60 Hz / 10 ms negative control skips 200 of 600 pictures despite a full
 queue. Seek still owns its discontinuity; zero-time preview does not advance.
 Real-device probes are opt-in through JCE_TEST_VIDEO_AUDIO_DEVICE=1 in the
 existing video test, with JCE_TEST_VIDEO_SECONDS controlling the interval.
+Set JCE_TEST_VIDEO_AUDIO_MUTE=1 to retain real PCM consumption/device cadence
+without audible test output. Embedded-audio EOF cannot be required from a probe
+that never consumes that stream; a video-only picture clock is not an AV test.
 
 ## Streaming file input
 
@@ -96,3 +125,86 @@ Publish RGBA as well as YUV output already decoded by seek. A general YUV
 queue policy does not imply every codec emits YUV. Pop due pictures first;
 seek look-ahead is a single fallback only when no due picture exists. The
 B-frame regression requires exact rewind PTS 0 and forward PTS 1.6.
+
+JCE_VIDEO_SEEK_TRACE=1 enables worker-owned seek diagnostics through the existing
+logger, including generation, requested/keyframe PTS, actual decoded/preroll
+pictures and index/reset/decode work milliseconds. queue_ready means a current
+generation target picture was queued, not UI upload, audio or speaker readiness.
+Unknown keyframe data stays explicitly unknown. Worker elapsed starts when the
+request is picked up; it is not the public request-to-ready latency. Timed decode
+work includes cancel checks and excludes presentation conversion. Disabled traces
+perform no additional clock reads or logging; this adds no public ABI.
+
+Private timestamp normalization (`jce_video_timestamp.h`) preserves repeated-PTS
+and post-seek clock policy through explicit state inputs. `jce_video_perf.h`
+owns the existing frequency cache and EMA arithmetic; `jce_video_seek_trace.h`
+owns opt-in stage accumulation and terminal reporting without decoder state.
+The frame helper owns pointer/capacity swaps used by queue/display handoff.
+
+Late presentation policy uses a mutex-published owner target and seek serial.
+Reference decoding continues, but obsolete conversion may be omitted only
+when playback is active, exact landing is complete and duration is known.
+The last frame interval remains protected; paused and unknown-duration inputs
+retain presentation. Opt-in presentation-skip records count omitted conversion
+separately from consumer drops without altering public performance structs.
+
+H264 preserves default legacy RGBA adapter callers; the video worker explicitly
+opts into owned tight I420 feed/pending storage and uses the common YUV queue
+and preview processor. Copy codec planes before draining (borrowed OpenH264
+planes can become invalid), preserve each output picture's reordered timestamp,
+and invalidate plane views on flush. The pinned public codec API lacks a matrix/
+range getter; current H264 BT.601 limited behavior is preserved, not complete VUI
+color support. Native B-frame adapter parity validates pixels, PTS and flush;
+real viewer preview/seek/EOF validation remains a separate acceptance step.
+
+HEVC reuses the pinned decoder's sleeping processing workers by default. The
+host core count remains clamped to eight; a single core creates no helper workers.
+Upstream workers wait on start conditions between pictures rather than busy-spin;
+active-picture job queues can still yield while awaiting work. Decoder close keeps
+the existing break/signal/join lifecycle, releasing retained stacks and handles.
+JCE_DBG_HEVC_KEEP_THREADS_ACTIVE accepts exactly 0 (legacy per-picture workers)
+or 1 (persistent workers); other values preserve the generic default. The bounded
+JCE_DBG_HEVC_THREADS QA override accepts exactly one digit 1..8. Resolve the core
+budget before decoder creation and retain the existing set-core fallback to one.
+Tracing remains explicitly opt-in, independently of the worker lifetime default.
+Viewer-only or native tracing logs actual resolved cores and the creation flag;
+it does not prove worker utilization or nominal frame-rate throughput.
+
+On x86, HEVC starts with the generic decoder baseline. Existing SDL public
+SSE4.1 and SSE4.2 runtime queries jointly admit the SSE4.2 support family;
+this is not an independent SSSE3-bit probe or physical old-device certification.
+Only intrinsic source files receive higher GCC/Clang instruction flags.
+SET_PROCESSOR success selects the architecture and RESET restores that selection;
+control failure retries generic and refuses decode if even generic fails.
+JCE_DBG_HEVC_GENERIC=1 explicitly forces generic for modern-host negative controls.
+No AVX2 or new dependency is enabled. Non-x86 policy remains unchanged.
+
+JCE_DBG_VIDEO_FRAME_PERF=1 enables private worker frame-preparation EMA samples.
+scale_ms includes jce_yuv_preview_prepare and its plane allocation/copy/scale;
+color_ms measures only the existing color converter, excluding RGBA allocation.
+Existing public convert-total statistics retain their original scope and ABI.
+Records reuse JCE_DBG_FILE_PREVIEW_TRACE_MS cadence. Disabled diagnostics do not
+invoke additional clocks. These are sampled EMA observations, not frame percentiles.
+
+Frame timing records identify context=worker or context=owner. The owner uses
+an independent processor and lends its current display RGBA buffer before
+preparation, then recovers ownership even on failure. No second persistent
+owner full-frame RGBA buffer is retained; private preview planes are lazy and
+bounded by the existing requested dimensions. Shared checked RGBA byte math
+rejects 32-bit overflow before allocation or queue copy.
+
+HEVC producer diagnostics reuse JCE_DBG_VIDEO_FRAME_PERF=1 and the existing
+100-1000 ms preview trace cadence. Decoder-owned private state reports separate
+source-read (lock/cache/file read), AnnexB preparation (including growth), actual
+codec API call, and publish (VUI/legacy optional RGBA) EMA/counters. Codec calls
+include header, seek and drain work; empty-input/no-output counters make that
+scope explicit. Stage populations differ, so their EMAs must not be summed as
+an output-frame percentile. Existing public decode total remains unchanged.
+Disabled observations add no clock reads or allocations. jce_h265_perf.h is a
+private adapter/packet bridge, including C linkage for the C++ video consumer;
+public headers, codec archives and thread/presentation policies are unchanged.
+
+Frame preparation rejects missing planes, nonpositive dimensions and undersized
+luma/chroma strides before any allocation or conversion. Failure preserves the
+previous RGBA pointer, capacity, dimensions and payload; this is a generic input
+contract guard, independent of diagnostic experiments.

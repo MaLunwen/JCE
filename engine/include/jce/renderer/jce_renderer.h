@@ -460,6 +460,8 @@ typedef struct JceGpuStats {
     /* Memory (bytes; <0 when the backend cannot report it). */
     int64_t  rt_memory_used;
     int64_t  texture_memory_used;
+    /* Backend-reported usage; D3D11/NVAPI is adapter-wide. This is not a
+     * portable process-owned allocation total or a standalone leak verdict. */
     int64_t  gpu_memory_used;
     int64_t  gpu_memory_max;
 
@@ -472,6 +474,26 @@ typedef struct JceGpuStats {
    and sets out->valid when the backend reports stats, false otherwise
    (out is still zero-initialized so callers can render placeholders). */
 JCE_API bool jce_renderer_get_gpu_stats(JceGpuStats *out);
+
+/* Cumulative payload admitted by first-party static mesh and texture APIs.
+ * Texture updates count submitted commands (bgfx provides no success result).
+ * Excludes transient/instance records, shaders and empty target allocations;
+ * neither PCIe traffic, GPU completion nor resident-memory accounting.
+ * Query and resource submission use the renderer API-owner thread only.
+ * Context lifetime resets counters; saturated counters cannot yield deltas. */
+typedef struct JceSubmittedPayloadStats {
+    uint64_t static_vertex_bytes;
+    uint64_t static_index_bytes;
+    uint64_t texture_create_bytes;
+    uint64_t texture_update_bytes;
+    uint64_t context_generation;
+    uint32_t frame_index;
+    bool saturated;
+    bool valid;
+} JceSubmittedPayloadStats;
+JCE_API bool jce_renderer_get_submitted_payload_stats(
+    const JceRenderer *r, JceSubmittedPayloadStats *out);
+
 
 /* Monotonic bgfx frame index returned by the most recent bgfx_frame().
  * Used by asynchronous GPU readbacks to know when their data is ready. */

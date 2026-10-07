@@ -52,6 +52,7 @@
  */
 
 #include <jce/renderer/jce_gpu_scene.h>
+#include <jce/renderer/jce_render_readback.h>
 #include <jce/renderer/jce_shaders.h>   /* embedded engine pak fallback */
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_log.h>
@@ -87,6 +88,7 @@ typedef char jce_gpu_scene_record_size_check[
 struct JceGpuScene {
     bool            supported;
     bool            indirect;        /* indirect compaction path resolved at create */
+    bool            indirect_enabled; /* model-batch submission policy */
     bool            indirect_ready;  /* cs_build_indirect actually ran THIS dispatch:
                                       * the indirect buffer holds VALID args only when
                                       * true.  Reset every dispatch/begin; set only
@@ -95,6 +97,14 @@ struct JceGpuScene {
                                       * when a per-frame prerequisite fails and the
                                       * dispatch falls through to the 1:1 cull. */
     jce_allocator_t alloc;
+    const JcePakArchive *pak;
+    uint64_t dispatch_serial;
+    uint64_t snapshot_serial;
+    uint16_t last_cull_view;
+    bgfx_program_handle_t snapshot_program;
+    bgfx_uniform_handle_t u_snapshot_params;
+    bgfx_texture_handle_t snapshot_texture;
+    uint16_t snapshot_w, snapshot_h;
 
     /* Fallback 1:1 cull program. */
     bgfx_program_handle_t cull_program;
@@ -170,7 +180,7 @@ struct JceGpuScene {
      * (1-frame-late Hi-Z; conservative). Off → params.w stays 0 (frustum-only). */
     bgfx_program_handle_t hiz_program;      /* cs_hiz_build  (mip0 from depth)   */
     bgfx_program_handle_t hiz_reduce_program; /* cs_hiz_reduce (mip i from mip i-1) */
-    bgfx_uniform_handle_t u_hiz_build;      /* vec4 {dst_w,dst_h,src_lod,0}     */
+    bgfx_uniform_handle_t u_hiz_build;      /* vec4 {dst_w,dst_h,src_w,src_h}   */
     bgfx_uniform_handle_t s_hiz;            /* sampler: pyramid, read by the cull */
     bgfx_uniform_handle_t s_hiz_src;        /* sampler: depth src, read by build  */
     bgfx_uniform_handle_t u_cull_viewproj;  /* mat4: the VP that made the pyramid */
@@ -449,6 +459,11 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
     if (!gs) return NULL;
     memset(gs, 0, sizeof(*gs));
     gs->alloc = alloc;
+    gs->pak = pak;
+    gs->snapshot_program.idx = UINT16_MAX;
+    gs->u_snapshot_params.idx = UINT16_MAX;
+    gs->snapshot_texture.idx = UINT16_MAX;
+    gs->indirect_enabled = true;
     gs->cull_program.idx       = UINT16_MAX;
     gs->reset_program.idx      = UINT16_MAX;
     gs->compact_program.idx    = UINT16_MAX;
@@ -706,6 +721,11 @@ void jce_gpu_scene_destroy(JceGpuScene *gs)
     GS_DESTROY_UNIFORM(u_cull_params);
     GS_DESTROY_UNIFORM(u_cull_reset_params);
     GS_DESTROY_UNIFORM(u_indirect_params);
+    GS_DESTROY_UNIFORM(u_snapshot_params);
+    if (gs->snapshot_program.idx != UINT16_MAX)
+        bgfx_destroy_program(gs->snapshot_program);
+    if (gs->snapshot_texture.idx != UINT16_MAX)
+        bgfx_destroy_texture(gs->snapshot_texture);
     if (gs->foliage_cull_program.idx != UINT16_MAX) {
         GS_DESTROY_DIAG("foliage_cull_program", gs->foliage_cull_program);
         bgfx_destroy_program(gs->foliage_cull_program);
@@ -1059,6 +1079,13 @@ void jce_gpu_scene_meshlet_dispatch(JceGpuScene *gs, uint16_t cull_view,
 
 /* ── per-frame batch ──────────────────────────────────────────────────── */
 
+void jce_gpu_scene_set_indirect_enabled(JceGpuScene *gs, bool enabled)
+{
+    if (!gs) return;
+    gs->indirect_enabled = enabled;
+    gs->indirect_ready = false;
+}
+
 void jce_gpu_scene_begin(JceGpuScene *gs)
 {
     if (!gs) return;
@@ -1111,7 +1138,7 @@ bool jce_gpu_scene_add_draw_group(
 
     /* Reserve every primitive's metadata before mutating counts, making this
      * append transactional under allocation failure. */
-    if (gs->indirect && first_run + draw_count > gs->runmeta_cap) {
+    if (gs->indirect && gs->indirect_enabled && first_run + draw_count > gs->runmeta_cap) {
         uint32_t need = first_run + draw_count;
         uint32_t nc = gs->runmeta_cap ? gs->runmeta_cap : 256u;
         while (nc < need) {
@@ -1136,7 +1163,7 @@ bool jce_gpu_scene_add_draw_group(
         gs->rec[base + i] = r;
     }
 
-    if (gs->indirect) {
+    if (gs->indirect && gs->indirect_enabled) {
         for (uint32_t draw = 0; draw < draw_count; draw++) {
             uint32_t run = first_run + draw;
             gs->runmeta[run].num_indices = num_indices[draw];
@@ -1155,7 +1182,7 @@ bool jce_gpu_scene_add_draw_group(
     if (out_group) {
         out_group->run_base = base;
         out_group->first_indirect_el =
-            gs->indirect ? first_run : UINT32_MAX;
+            (gs->indirect && gs->indirect_enabled) ? first_run : UINT32_MAX;
         out_group->draw_count = draw_count;
     }
     return true;
@@ -1252,7 +1279,7 @@ static bool hiz_build(JceGpuScene *gs, uint16_t view)
     if (gs->hiz_tex.idx == UINT16_MAX) { gs->hiz_on = false; return false; }
 
     /* mip 0 from the depth prepass (sampler read). */
-    float bp0[4] = { (float)w, (float)h, 0.0f, 0.0f };
+    float bp0[4] = { (float)w, (float)h, (float)gs->hiz_view_w, (float)gs->hiz_view_h };
     bgfx_set_uniform(gs->u_hiz_build, bp0, 1);
     bgfx_set_texture(0, gs->s_hiz_src, gs->hiz_src_depth, UINT32_MAX);
     bgfx_set_image(1, gs->hiz_tex, 0, BGFX_ACCESS_WRITE, BGFX_TEXTURE_FORMAT_R32F);
@@ -1267,7 +1294,9 @@ static bool hiz_build(JceGpuScene *gs, uint16_t view)
     for (uint8_t lvl = 1; lvl < gs->hiz_mips; ++lvl) {
         uint16_t mw = (uint16_t)(w >> lvl); if (mw < 1u) mw = 1u;
         uint16_t mh = (uint16_t)(h >> lvl); if (mh < 1u) mh = 1u;
-        float bp[4] = { (float)mw, (float)mh, 0.0f, 0.0f };
+        uint16_t sw = (uint16_t)(w >> (lvl - 1u)); if (sw < 1u) sw = 1u;
+        uint16_t sh = (uint16_t)(h >> (lvl - 1u)); if (sh < 1u) sh = 1u;
+        float bp[4] = { (float)mw, (float)mh, (float)sw, (float)sh };
         bgfx_set_uniform(gs->u_hiz_build, bp, 1);
         bgfx_set_image(0, gs->hiz_tex, (uint8_t)(lvl - 1u), BGFX_ACCESS_READ,
                        BGFX_TEXTURE_FORMAT_R32F);
@@ -1341,7 +1370,7 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
     }
 
     /* ── INDIRECT compaction path ─────────────────────────────────────── */
-    if (gs->indirect) {
+    if (gs->indirect && gs->indirect_enabled) {
         /* Indirect needs one counter per visibility group and one metadata plus
          * indirect element per primitive draw. If any prerequisite fails, fall
          * through to the correct 1:1 path for this dispatch. */
@@ -1430,6 +1459,8 @@ bool jce_gpu_scene_dispatch(JceGpuScene *gs, uint16_t reset_view,
             gs->indirect_ready = true;
             gs->frame_stats.indirect_ready = true;
             gs->frame_stats.dispatch_succeeded = true;
+            if (++gs->dispatch_serial == 0) ++gs->dispatch_serial;
+            gs->last_cull_view = cull_view;
             JCE_PROFILE_ZONE_END;
             return true;
         }
@@ -1467,4 +1498,75 @@ void jce_gpu_scene_get_frame_stats(const JceGpuScene *gs,
         return;
     }
     *out_stats = gs->frame_stats;
+}
+
+bool jce_gpu_scene_snapshot_survivors(
+    JceGpuScene *gs, uint16_t snapshot_view,
+    JceGpuSceneSurvivorSnapshot *out_snapshot)
+{
+    if (!out_snapshot) return false;
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    out_snapshot->texture.idx = UINT16_MAX;
+    if (!gs || !gs->indirect_ready || !gs->group_count ||
+        gs->snapshot_serial == gs->dispatch_serial ||
+        snapshot_view == gs->last_cull_view)
+        return false;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps ||
+        snapshot_view >= caps->limits.maxViews ||
+        !(caps->formats[BGFX_TEXTURE_FORMAT_RGBA32F] &
+          BGFX_CAPS_FORMAT_TEXTURE_IMAGE_WRITE) ||
+        !jce_render_readback_format_supported(JCE_RENDER_FORMAT_RGBA32F))
+        return false;
+
+    uint32_t limit = caps->limits.maxTextureSize;
+    if (limit == 0) return false;
+    uint32_t width = gs->group_count < 256u ? gs->group_count : 256u;
+    if (width > limit) width = limit;
+    uint32_t height = (gs->group_count - 1u) / width + 1u;
+    if (height > limit || width > UINT16_MAX || height > UINT16_MAX)
+        return false;
+    /* Register uniforms before lazy program creation (GL registry contract). */
+    if (gs->u_snapshot_params.idx == UINT16_MAX)
+        gs->u_snapshot_params = bgfx_create_uniform(
+            "u_snapshot_params", BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (gs->u_snapshot_params.idx == UINT16_MAX) return false;
+    if (gs->snapshot_program.idx == UINT16_MAX) {
+        const char *suffix = jce_shader_backend_suffix();
+        if (!suffix) return false;
+        gs->snapshot_program = load_compute(gs->pak, "cs_gpu_survivors", suffix);
+    }
+    if (gs->snapshot_program.idx == UINT16_MAX) return false;
+    if (gs->snapshot_texture.idx == UINT16_MAX ||
+        gs->snapshot_w != width || gs->snapshot_h != height) {
+        /* Allocate first: an unsuccessful diagnostic cannot destroy the last
+         * borrowed image or change the ordinary model draw resources. */
+        bgfx_texture_handle_t texture = bgfx_create_texture_2d(
+            (uint16_t)width, (uint16_t)height, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA32F, BGFX_TEXTURE_COMPUTE_WRITE |
+                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP |
+                BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT, NULL, 0);
+        if (texture.idx == UINT16_MAX) return false;
+        if (gs->snapshot_texture.idx != UINT16_MAX)
+            bgfx_destroy_texture(gs->snapshot_texture);
+        gs->snapshot_texture = texture;
+        gs->snapshot_w = (uint16_t)width;
+        gs->snapshot_h = (uint16_t)height;
+    }
+    float params[4] = { (float)(gs->group_count & 65535u),
+        (float)(gs->group_count >> 16), (float)width, (float)height };
+    bgfx_set_uniform(gs->u_snapshot_params, params, 1);
+    bgfx_set_compute_dynamic_vertex_buffer(0, gs->counter_buf, BGFX_ACCESS_READ);
+    bgfx_set_image(1, gs->snapshot_texture, 0, BGFX_ACCESS_WRITE,
+                    BGFX_TEXTURE_FORMAT_RGBA32F);
+    bgfx_dispatch(snapshot_view, gs->snapshot_program,
+                  (width + 7u) / 8u, (height + 7u) / 8u, 1, BGFX_DISCARD_ALL);
+    gs->snapshot_serial = gs->dispatch_serial;
+    out_snapshot->dispatch_serial = gs->dispatch_serial;
+    out_snapshot->records = gs->rec_count;
+    out_snapshot->groups = gs->group_count;
+    out_snapshot->texture.idx = gs->snapshot_texture.idx;
+    out_snapshot->width = gs->snapshot_w;
+    out_snapshot->height = gs->snapshot_h;
+    return true;
 }

@@ -104,7 +104,7 @@ static void test_mem_stats_populates(void)
     TEST_ASSERT_TRUE(jce_mem_stats(&s));
     /* Process has been running long enough to accrue some elapsed_ms. */
     /* peak_rss should be >= current_rss after monotonic ratchet. */
-    TEST_ASSERT_TRUE(s.peak_rss >= s.current_rss);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT64(s.current_rss, s.peak_rss);
 }
 
 static void test_mem_stats_null_returns_false(void)

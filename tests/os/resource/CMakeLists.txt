@@ -20,6 +20,7 @@ jce_add_unit_test(test_jce_bundle_deps
 jce_add_unit_test(test_jce_bundle_pack
     SOURCES test_jce_bundle_pack.c
     LINK    jce_core jce_resource)
+target_include_directories(test_jce_bundle_pack PRIVATE "${CMAKE_SOURCE_DIR}/engine/src")
 if(TARGET cjson::cjson)
     target_link_libraries(test_jce_bundle_pack PRIVATE cjson::cjson)
 endif()

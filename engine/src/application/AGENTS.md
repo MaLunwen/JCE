@@ -8,6 +8,43 @@
 - **Public umbrella**: `<jce/api_app.h>` → `<jce/application/*.h>`
 - **Deps**: every layer below (PUBLIC link in CMake), notably `jce_core`, `jce_platform`, renderer, scene, middleware.
 
+## Benchmark clock ownership
+
+The stock SDK entry template exposes a borrowed const scene-renderer accessor
+for public profiling and intermediate-target inspection. It is NULL outside
+the initialized application lifecycle. Consumers may observe through public
+APIs, never destroy the renderer or depend on the template's private globals.
+
+The engine rotates the completed perf-phase snapshot once at frame start.
+Consumers read it; a second rotation discards the measured phases.
+JCE_KPI_FRAME_LOG retains the long-format phase CSV and the unclamped wall
+interval. Renderer CPU/GPU rows are latest asynchronous stats, not proven
+frame-aligned timings. JCE_MAX_SECONDS bounds unattended runs by elapsed
+wall time since service initialization, independently of fixed simulation dt;
+JCE_MAX_FRAMES can also end the run, and the log identifies the winning limit.
+
+KPI export has its own `kpi_export` phase. Frame CSV durability flushes occur
+at initialization/shutdown by default; SDL file flushes can synchronize storage
+and must not impose recurring render-loop stalls. The opt-in diagnostic
+`JCE_KPI_DURABLE_FLUSH_INTERVAL` enables a positive frame interval for controlled
+durability-cost comparisons. An interrupted process may lose buffered tail rows;
+only a clean exit with a complete raw sequence is a valid benchmark.
+`jce_frame_kpi.c` batches a complete snapshot into a reused growing buffer and
+one stream write. Long phase names remain complete; invalid CSV delimiters,
+non-finite clocks, allocation failure and short writes fail capture explicitly.
+The native in-memory sink regression checks growth/reuse, one-write output and
+failing controls without opening a window or touching third-party code.
+
+Physics timing separates external-edit detection, fixed simulation work and
+render-pose synchronization. `rt_capture_fixed_pose` lives with physics helpers
+in `jce_rt_physics.c`; editor and Player use the same runtime and clock.
+
+The single gameplay-script creation path initializes the entire ScriptEntry
+before publishing its entity/ref. Fresh profiler rows have zero calls and cost,
+and measured=false, independently of allocator contents or profiling state.
+The public-runtime script-cost regression checks this before any update;
+Debug allocator contents previously exposed inherited garbage measurements.
+
 ## File map
 
 | Header | TU | Role |
@@ -226,3 +263,76 @@ if (ce->break_torque > 0.0f) { ... if (tq  > ce->break_torque)         return tr
 所以 case 1 在**已知**的施加力矩下直接读数并做 [0.25x, 4x] 夹逼——
 两个候选答案相差 60 倍，这个夹逼分得开，且不假装有 Bullet 软 6DOF 求解器
 没有的精度。
+
+Script cursors are owned by the runtime host: `JceScriptHost.cursor_set` loads
+raw/cooked image assets, caches eight handles, and releases them after scene
+script teardown. Native modules must not create cursors through their own SDL
+copy. Editor Game View reapplies the selected host cursor only while its
+pointer sample is valid, leaving cursor arbitration with the editor host.
+
+Allocator policy is resolved once per JceEngine lifecycle after SDL initialization
+and before renderer/audio/user initialization. AUTO hardware detection is overridden
+by the published machine class, then a nonempty JCE_LOW_MEM value. Both LOW and
+FULL are applied: FULL restores the allocator purge delay after a previous LOW
+lifecycle. Periodic trim state belongs to the engine instance; boot does not trim.
+
+Authored-camera-only consumers resolve the live primary camera after script update and before each draw, including lens, mask and clear policy. A boot-only camera copy diverges from script picking after camera animation.
+
+## Optional script services
+
+jce_rt_script_services.c owns the append-only request_quit/stat callbacks.
+Runtime quit is only a latch; stock standalone and editor consumers inspect it
+after callbacks return, with editor Stop rather than process exit. Runtime owns
+no platform backend: an explicit setter borrows the host's service pointer,
+NULL remains unavailable and no LOCAL store is auto-created. Detach/destroy the
+runtime before host service shutdown. Stats are signed32 at the script seam;
+backend out-of-range values return the explicit fallback rather than truncating.
+New value/fallback inputs use existing double marshalling and central finite,
+integral, INT32-range admission; invalid fallback and a missing host return0.
+A real runtime lacking an injected service returns the valid fallback.
+ID admission prevents existing LOCAL fixed-buffer truncation aliases. Available
+queries declared read/write/flush callbacks only; successful writes/flushes must
+still be checked. Host assignments remain in rt_script_install_vm so the existing writer gate
+observes them; implementations live in the private service TU. Generator order:
+update exposure+host, unified gen_script_bindings.py --write (contracts first),
+gen_script_c_abi.py --write, then check BOTH tools. C ABI consumes the canonical
+contract, so checking only one tool can miss stale signatures.
+Generated C ABI and every language share the exposure contract.
+No LLM or new filesystem persistence implementation is part of this bridge.
+
+Trusted host injection uses the public inline jce_runtime_stats_host.h, without
+new exported symbols. The stock main and editor Play group their existing runtime
+pointer with one owned service and configured directory. Only explicit absolute
+JCE_RUNTIME_STATS_DIR opens existing LOCAL services; no config allocates no tables.
+The shared path APIs reject relative/oversized/derived-path overflow before I/O.
+Repeated same-host attachment reuses the service; directory changes require close.
+Destroy/null runtime first, then close performs checked flush and existing shutdown.
+Failures warn explicitly; capability does not promise successful durable storage.
+The existing LOCAL backend's fixed tables are allocated only for opted-in hosts.
+
+The stock template retains s_runtime as a legacy private macro alias to the
+same grouped owner for existing historical consumer harnesses. It introduces
+no second runtime pointer/global. New projects must not depend on template
+private names; migration to public host integration is a separate task.
+
+The stat-host helper prepares/checks ownership only; stock and editor callers
+explicitly bind through the public runtime setter after successful configuration.
+Editor also checks declared service capability at the host trust boundary. The
+helper is reachable from api_app.h; no exempted or unconsumed public service seam.
+
+Service ownership must be prepared BEFORE runtime_create_with_platform_services:
+script on_start runs synchronously inside construction. The borrowed field is
+seeded before VM/spawn, using the single existing constructor implementation;
+legacy create wraps it with NULL service and no Desc layout change. A post-create
+setter alone cannot make initial on_start see stats. Create failure leaves the
+service host-owned and closes it after confirmed NULL runtime. Runtime destroy
+never closes borrowed services. Native on_start witness requires real constructor
+side effects before any step/setter, legacy unavailable and failed-create cleanup.
+
+Runtime diagnostic environment reads use C99 getenv consistently: the Emscripten libc ENV and SDL private environment table can disagree. Web frame/KPI options must arm actual engine collection.
+
+Frame KPI export remains enabled when JCE_PERF_LOG is absent; periodic console logging must not disable an explicitly opened frame CSV accumulator.
+
+The public default host applies packed settings/project-settings.json when authoring host files are absent, using the existing bounded PAK config reader. SDK embedding copies authored project settings into that reserved resource path and removes stale generated settings when absent. Colour space, quality and time/audio parameters must survive single-file relocation.
+
+Default-host Canvas UI consumes jce_input_primary_pointer for physical mouse or primary touch, retaining touch release coordinates. Gameplay mouse/touch streams remain independent; platform mirror filtering must not disable touch UI.

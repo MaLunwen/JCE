@@ -174,6 +174,14 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
         target_format = JCEASSET_TEXFMT_RGBA8;
     }
 
+    /* D3D11 BC resources require block-aligned base dimensions. Preserve
+     * small/NPOT UI artwork and its alpha instead of uploading invalid BC
+     * surfaces that receive a handle but render transparent/black. */
+    if ((base_w % 4u || base_h % 4u) &&
+        (target_format == JCEASSET_TEXFMT_BC1 || target_format == JCEASSET_TEXFMT_BC3 ||
+         target_format == JCEASSET_TEXFMT_BC5 || target_format == JCEASSET_TEXFMT_BC7))
+        target_format = JCEASSET_TEXFMT_RGBA8;
+
     /* Determine mip count. */
     uint32_t mip_count = 1;
     if (opts && opts->generate_mipmaps) {

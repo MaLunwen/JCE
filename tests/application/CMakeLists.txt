@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 
+jce_add_unit_test(test_jce_frame_kpi
+    SOURCES test_jce_frame_kpi.c
+            "${CMAKE_SOURCE_DIR}/engine/src/application/jce_frame_kpi.c"
+    LINK jce_core sdl::sdl)
+target_include_directories(test_jce_frame_kpi PRIVATE "${CMAKE_SOURCE_DIR}/engine/src")
+
 # ----------------------------------------------------------------------- #
 #  L3 (application) unit tests.                                           #
 #                                                                         #
@@ -594,3 +600,8 @@ jce_add_unit_test(test_jce_joint_break_torque
     LINK    JCE)
 target_include_directories(test_jce_joint_break_torque PRIVATE
     "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Optional public service bridge: real Lua/runtime, deferred quit and borrowed store.
+jce_add_unit_test(test_jce_runtime_script_services
+    SOURCES test_jce_runtime_script_services.c
+    LINK JCE)

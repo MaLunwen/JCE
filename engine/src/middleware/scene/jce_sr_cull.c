@@ -160,6 +160,7 @@ void sr_ensure_ssao_target(JceSceneRenderer *sr, uint16_t w, uint16_t h,
         sr->ssao_has_velocity == want_velocity &&
         BGFX_HANDLE_IS_VALID(sr->ssao_depth_fbo))
         return;
+    sr->depth_history.valid = false;
     if (BGFX_HANDLE_IS_VALID(sr->ssao_depth_fbo)) {
         bgfx_destroy_frame_buffer(sr->ssao_depth_fbo);
         sr->ssao_depth_fbo.idx = UINT16_MAX;
@@ -313,7 +314,7 @@ static bool sr_try_submit_skinned_velocity(JceSceneRenderer *sr, JceScene *scene
     if (!jce_scene_has_transform(scene, e)) return false;
 
     jce_mat4 model = jce_scene_get_world_matrix(scene, e);
-    SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+    SrAnimInstance *ai = sr_find_anim_instance(sr, e);
     const jce_mat4 *pal = (ai && ai->skin_palette_count > 0) ? ai->skin_palette : NULL;
     uint32_t pal_n = ai ? ai->skin_palette_count : 0;
     const jce_mat4 *prev_pal = (ai && ai->prev_skin_valid &&
@@ -386,7 +387,7 @@ static bool sr_try_push_bindpose_velocity(JceSceneRenderer *sr, JceScene *scene,
     JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
     if (!sa || !sa->skeleton_path[0]) return false;
 
-    SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+    SrAnimInstance *ai = sr_find_anim_instance(sr, e);
     if (ai && ai->skin_palette_count > 0) return false;   /* animating */
     if (ai && ai->morph_vb_count > 0)     return false;   /* morph */
 
@@ -478,7 +479,7 @@ static bool sr_try_push_crowd_velocity(JceSceneRenderer *sr, JceScene *scene,
     JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
     if (!sa || !sa->skeleton_path[0]) return false;
 
-    SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+    SrAnimInstance *ai = sr_find_anim_instance(sr, e);
     if (!ai || ai->skin_palette_count == 0) return false;   /* not animating */
     if (ai->morph_vb_count > 0) return false;               /* morph */
     if (ai->crowd_palette_frame != sr->bone_tex_frame) return false;
@@ -716,6 +717,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     /* Frustum planes for pre-pass culling (keeps per-frame uniform writes
      * bounded so bgfx's Vulkan uniform scratch buffer can't overflow). */
     jce_mat4 pre_vp = jce_m4_multiply(&proj, &view);
+    sr_depth_history_prepare(sr, scene, view_id_base, &view, &proj);
     sr_extract_frustum_planes(&pre_vp, sr->prepass_cull_planes);
     jce_frustum_abs_normals(sr->prepass_cull_planes, sr->prepass_cull_absn);
 
@@ -734,20 +736,21 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     const uint64_t pre_xf = jce_scene_get_xform_counter(scene);
     struct SrPrepassCacheSlot *pcslot =
         &sr->pre_cache[(size_t)(view_id_base & 3u)];
-    if (s_pre_cache_env &&
+    if (s_pre_cache_env && sr->depth_history_reused &&
         pcslot->valid && pcslot->view_base == view_id_base &&
         pcslot->scene == (const void *)scene &&
         pcslot->list_gen == pre_lg && pcslot->xform == pre_xf &&
         pcslot->w == sr->ssao_w && pcslot->h == sr->ssao_h &&
         memcmp(&pcslot->vp, &pre_vp, sizeof(jce_mat4)) == 0 &&
         pcslot->had_velocity == write_velocity &&
+        pcslot->had_normals == want_normals &&
         /* Velocity frames additionally need the SAME prev VP: static frames
          * have prev==cur (zero motion, unchanged output); the first frame
          * after the camera stops still renders (prev differs). */
         (!write_velocity ||
          memcmp(pcslot->prev_vp, sr->frame_prev_vp,
                 sizeof pcslot->prev_vp) == 0)) {
-        return;   /* no touch/clear/submit: the FBO keeps depth+velocity */
+        return;   /* no touch/submit: the FBO keeps depth+velocity */
     }
     pcslot->valid = false;   /* re-latched after a full render below */
 
@@ -778,6 +781,31 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     /* Velocity context: un-jittered cur/prev view*proj + programs/uniform idxs. */
     JceModelVelocityCtx vctx;
     if (write_velocity) vctx = sr_make_velocity_ctx(sr);
+    JceModelVelocityCtx normal_ctx;
+    const bool model_normals = want_normals && have_gbuffer && !write_velocity;
+    if (model_normals) {
+        /* Reuse the model node/skin walk with two-output fragment programs.
+         * No velocity attachment or duplicate deformation traversal is needed. */
+        if (!sr->gbuffer_skinned_tried) {
+            sr->gbuffer_skinned_tried = true;
+            JceShaderHandle h = shader_load_program_named(sr->pak,
+                "gbuffer_skinned", "gbuffer");
+            sr->prog_gbuffer_skinned.idx = h.idx;
+            if (h.idx == UINT16_MAX)
+                LOG_WARN(LOG_TAG, "%s", "skinned normal G-buffer shader unavailable");
+        }
+        normal_ctx = sr_make_velocity_ctx(sr);
+        /* Normal-only stages use the view camera/current palette. Avoid
+         * uploading or rebuilding previous-pose arrays they do not consume. */
+        normal_ctx.u_prev_model_idx = UINT16_MAX;
+        normal_ctx.u_prev_bones_idx = UINT16_MAX;
+        normal_ctx.u_cur_vp_idx = UINT16_MAX;
+        normal_ctx.u_prev_vp_idx = UINT16_MAX;
+        normal_ctx.static_program.idx = sr->prog_gbuffer.idx;
+        normal_ctx.skinned_program.idx = sr->prog_gbuffer_skinned.idx;
+        normal_ctx.cur_view_proj = pre_vp;
+        normal_ctx.prev_view_proj = pre_vp;
+    }
 
     /* Static-primitive velocity instancing: lazy-load the inst program + queue,
      * then clear/re-bind for this frame (kill-switch JCE_VEL_INST=0). */
@@ -895,6 +923,10 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                 jce_rq_push(s_vel_rq, &c);
             } else {
                 jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
+                const float alb[4] = { mr ? mr->base_color[0] : 1.0f,
+                                       mr ? mr->base_color[1] : 1.0f,
+                                       mr ? mr->base_color[2] : 1.0f, 1.0f };
+                jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
                 sr_submit_mesh_velocity(sr, &vctx, v, &model, prev_model, mesh);
             }
             sr_prev_xform_store(sr, (uint32_t)e, &model);
@@ -922,6 +954,17 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
          * PRIM_MESH provably has no skinned/model/terrain parts, so skip all
          * four dispatch probes — they cost 4 flecs lookups per entity per
          * viewport on a 150k-primitive world. */
+        if (!kc_prim && model_normals) {
+            if (jce_scene_has_skeletal_animator(scene, e)) {
+                if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_skinned) &&
+                    sr_try_submit_skinned_velocity(sr, scene, e, v, &normal_ctx)) continue;
+                /* A missing skin program uses the skinned depth fallback,
+                 * never an animated rig drawn with a static vertex stage. */
+                if (sr_try_submit_skinned_shadow(sr, scene, e, i, v)) continue;
+            }
+            if (sr_try_submit_model_velocity(sr, scene, e, i, v,
+                    &normal_ctx, NULL, false, UINT16_MAX)) continue;
+        }
         if (!kc_prim) {
             if (sr_try_submit_bindpose_shadow(sr, scene, e, i, v)) continue;
             if (sr_try_submit_skinned_shadow(sr, scene, e, i, v)) continue;
@@ -964,6 +1007,10 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
             if (mr) rough = mr->roughness;
             float gmat[4] = { rough, 0.0f, 0.0f, 0.0f };
             jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
+            const float alb[4] = { mr ? mr->base_color[0] : 1.0f,
+                                   mr ? mr->base_color[1] : 1.0f,
+                                   mr ? mr->base_color[2] : 1.0f, 1.0f };
+            jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
             JceShaderHandle gprog = { sr->prog_gbuffer.idx };
             jce_mesh_submit_pbr_with_program(mesh, sr->renderer, v, gprog);
         } else {
@@ -1008,6 +1055,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
         pcslot->h         = sr->ssao_h;
         pcslot->vp        = pre_vp;
         pcslot->had_velocity = write_velocity;
+        pcslot->had_normals = want_normals;
         if (write_velocity)
             memcpy(pcslot->prev_vp, sr->frame_prev_vp, sizeof pcslot->prev_vp);
         else
@@ -1050,7 +1098,7 @@ static float sr_light_sel_score(SrLightSelCtx *c, JceEntity e, float intensity)
     jce_vec3 d  = jce_v3_sub(p, c->cam);
     float dist2 = jce_v3_dot(d, d);
     if (dist2 < 0.01f) dist2 = 0.01f;
-    return (intensity > 0.0f ? intensity : 1.0f) / dist2;
+    return intensity / dist2;
 }
 
 static void sr_light_sel_point_cb(JceScene *scene, JceEntity e, void *user)
@@ -1060,7 +1108,7 @@ static void sr_light_sel_point_cb(JceScene *scene, JceEntity e, void *user)
     if (!entity_enabled(scene, e)) return;
     if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_POINT_LIGHT)) return;
     JcePointLight *pl = jce_scene_get_point_light(scene, e);
-    if (!pl) return;
+    if (!pl || !isfinite(pl->intensity) || pl->intensity <= 0.0f) return;
     c->pc[*c->pn].e = e;
     c->pc[*c->pn].score = sr_light_sel_score(c, e, pl->intensity);
     (*c->pn)++;
@@ -1073,7 +1121,7 @@ static void sr_light_sel_spot_cb(JceScene *scene, JceEntity e, void *user)
     if (!entity_enabled(scene, e)) return;
     if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPOT_LIGHT)) return;
     JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
-    if (!sl) return;
+    if (!sl || !isfinite(sl->intensity) || sl->intensity <= 0.0f) return;
     c->sc[*c->sn].e = e;
     c->sc[*c->sn].score = sr_light_sel_score(c, e, sl->intensity);
     (*c->sn)++;

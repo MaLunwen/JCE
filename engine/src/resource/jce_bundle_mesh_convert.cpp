@@ -39,6 +39,7 @@ extern "C" {
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <assimp/material.h>
+#include <assimp/config.h>
 
 #include <string>
 
@@ -636,13 +637,13 @@ static void jw_put_bytes(std::vector<uint8_t> &b, const void *p, size_t n)
 
 static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
                               const MeshMeshlets *mesh_meshlets,
-                              uint8_t **out_buf, size_t *out_size)
+                              uint8_t **out_buf, size_t *out_size, bool geometry_only)
 {
     if (!scene || scene->mNumMeshes == 0) return false;
     /* JCE_COOK_FORCE_INDEXED_LOD: take the indexed + LOD-generating writer even for
      * textured/embedded-image scenes (textures are dropped — for GPU-vertex / LOD
      * benchmarking where geometry, not shading, is the subject). */
-    if (getenv("JCE_COOK_FORCE_INDEXED_LOD") == NULL) {
+    if (!geometry_only && getenv("JCE_COOK_FORCE_INDEXED_LOD") == NULL) {
         if (scene->mNumTextures > 0) return false;          /* embedded images: keep assimp path */
         for (unsigned i = 0; i < scene->mNumMaterials; ++i) {
             const aiMaterial *m = scene->mMaterials[i];
@@ -670,7 +671,14 @@ static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
         idx.reserve((size_t)me->mNumFaces * 3);
         for (unsigned f = 0; f < me->mNumFaces; ++f) {
             const aiFace &fc = me->mFaces[f];
-            if (fc.mNumIndices != 3) return false;      /* must be triangulated */
+            if (fc.mNumIndices != 3) {
+                std::fprintf(stderr,"Mesh conversion: mesh=%u face=%u has %u indices (expected triangles)\n",mi,f,fc.mNumIndices);
+                return false;
+            }
+            for (unsigned k=0;k<3;++k) if (fc.mIndices[k]>=V) {
+                std::fprintf(stderr,"Mesh conversion: mesh=%u face=%u index=%u exceeds vertices=%u\n",mi,f,fc.mIndices[k],V);
+                return false;
+            }
             idx.push_back(fc.mIndices[0]);
             idx.push_back(fc.mIndices[1]);
             idx.push_back(fc.mIndices[2]);
@@ -886,17 +894,24 @@ static bool write_indexed_glb(const aiScene *scene, const MeshLods *mesh_lods,
  *
  * Returns 1 on success, 0 on failure.  On failure *out_buf is NULL.
  */
-extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
+extern "C" JCE_API int jce_bundle_convert_to_glb_ex(const uint8_t *src,
                                       size_t         src_sz,
                                       const char    *ext_hint,
                                       uint8_t      **out_buf,
-                                      size_t        *out_size)
+                                      size_t        *out_size,
+                                      int geometry_only)
 {
     if (out_buf)  *out_buf  = nullptr;
     if (out_size) *out_size = 0;
     if (!src || src_sz == 0 || !out_buf || !out_size) return 0;
 
     Assimp::Importer importer;
+    /* MeshRenderer consumes surfaces only. Remove degenerate triangles before
+     * primitive sorting: Assimp otherwise turns them into 1/2-index faces,
+     * which its glb2 triangle exporter reads past the face's index array. */
+    importer.SetPropertyBool(AI_CONFIG_PP_FD_REMOVE, true);
+    importer.SetPropertyInteger(AI_CONFIG_PP_SBP_REMOVE,
+                               aiPrimitiveType_POINT | aiPrimitiveType_LINE);
     const unsigned int flags =
           aiProcess_Triangulate
         | aiProcess_JoinIdenticalVertices
@@ -908,6 +923,7 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
          * the source with -> wrong colors. */
         | aiProcess_FlipUVs
         | aiProcess_SortByPType
+        | aiProcess_FindDegenerates
         | aiProcess_RemoveRedundantMaterials
         | aiProcess_OptimizeMeshes
         | aiProcess_OptimizeGraph;
@@ -956,7 +972,8 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
                   scene->mNumMeshes, total_verts, total_faces);
     }
     for (unsigned i = 0; i < scene->mNumMeshes; ++i) {
-        remap_mesh_vertices(scene->mMeshes[i]);
+        /* Geometry-only imports retain authored hard-edge normals verbatim. */
+        if (!geometry_only) remap_mesh_vertices(scene->mMeshes[i]);
     }
     {
         size_t total_verts = 0, total_faces = 0;
@@ -999,8 +1016,13 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
      * the Assimp exporter for textured / embedded-image scenes.  The captured
      * LOD chains are persisted into the glb (JCE_lod primitive extension). */
     if (write_indexed_glb(scene, mesh_lods.data(), mesh_meshlets.data(),
-                          out_buf, out_size))
+                          out_buf, out_size, geometry_only != 0))
         return 1;
+
+    if (geometry_only) {
+        LOG_WARN(LOG_TAG, "geometry-only indexed export failed; refusing lossy fallback");
+        return 0;
+    }
 
     /* Fallback: Assimp's validated glb2 exporter (binary glTF 2.0). */
     Assimp::Exporter exporter;
@@ -1017,4 +1039,10 @@ extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
     *out_buf  = dst;
     *out_size = blob->size;
     return 1;
+}
+
+extern "C" JCE_API int jce_bundle_convert_to_glb(const uint8_t *src,
+    size_t src_sz, const char *ext_hint, uint8_t **out_buf, size_t *out_size)
+{
+    return jce_bundle_convert_to_glb_ex(src,src_sz,ext_hint,out_buf,out_size,0);
 }

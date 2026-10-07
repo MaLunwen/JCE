@@ -28,7 +28,7 @@
  * (`ok`) rather than made with a NULL argument the host would have to
  * interpret.
  *
- * 101 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
+ * 108 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
  */
 
 #include <jni.h>
@@ -787,6 +787,25 @@ JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nGetPointerDelta(
     outFloat[1] = (jfloat)out_xy[1];
     if (j_outFloat)
         (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 2, outFloat);
+}
+
+
+/* jce.get_pointer_position -> jce_script_api_get_pointer_position (void_out_array) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nGetPointerPosition(
+    JNIEnv *env, jclass cls, jlong api, jfloatArray j_outFloat)
+{
+    float out_xywh[4];
+    jfloat outFloat[4];
+
+    (void)cls;
+    memset(out_xywh, 0, sizeof out_xywh);
+    jce_script_api_get_pointer_position(jce_java_api(api), out_xywh);
+    outFloat[0] = (jfloat)out_xywh[0];
+    outFloat[1] = (jfloat)out_xywh[1];
+    outFloat[2] = (jfloat)out_xywh[2];
+    outFloat[3] = (jfloat)out_xywh[3];
+    if (j_outFloat)
+        (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 4, outFloat);
 }
 
 
@@ -2004,5 +2023,114 @@ JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nVcamActivate(
     }
     if (name)
         (*env)->ReleaseStringUTFChars(env, j_name, name);
+    return ret;
+}
+
+
+/* jce.set_cursor -> jce_script_api_set_cursor (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nSetCursor(
+    JNIEnv *env, jclass cls, jlong api, jstring j_asset_path, jint hotspot_x,
+    jint hotspot_y)
+{
+    jboolean ret = (jboolean)0;
+    const char *asset_path = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_asset_path) {
+        asset_path = (*env)->GetStringUTFChars(env, j_asset_path, NULL);
+        if (!asset_path)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jboolean)jce_script_api_set_cursor(jce_java_api(api), asset_path, (int)hotspot_x, (int)hotspot_y);
+    }
+    if (asset_path)
+        (*env)->ReleaseStringUTFChars(env, j_asset_path, asset_path);
+    return ret;
+}
+
+
+/* jce.request_quit -> jce_script_api_request_quit (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nRequestQuit(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_request_quit(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.stat_available -> jce_script_api_stat_available (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nStatAvailable(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_stat_available(jce_java_api(api));
+    return ret;
+}
+
+
+/* jce.stat_set -> jce_script_api_stat_set (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nStatSet(
+    JNIEnv *env, jclass cls, jlong api, jstring j_id, jdouble value)
+{
+    jboolean ret = (jboolean)0;
+    const char *id = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_id) {
+        id = (*env)->GetStringUTFChars(env, j_id, NULL);
+        if (!id)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jboolean)jce_script_api_stat_set(jce_java_api(api), id, (double)value);
+    }
+    if (id)
+        (*env)->ReleaseStringUTFChars(env, j_id, id);
+    return ret;
+}
+
+
+/* jce.stat_get -> jce_script_api_stat_get (value_return) */
+JNIEXPORT jint JNICALL Java_com_jce_script_JceScript_nStatGet(
+    JNIEnv *env, jclass cls, jlong api, jstring j_id, jdouble fallback)
+{
+    jint ret = (jint)0;
+    const char *id = NULL;
+    int ok = 1;
+
+    (void)cls;
+    if (j_id) {
+        id = (*env)->GetStringUTFChars(env, j_id, NULL);
+        if (!id)
+            ok = 0;
+    }
+    if (ok) {
+        ret = (jint)jce_script_api_stat_get(jce_java_api(api), id, (double)fallback);
+    }
+    if (id)
+        (*env)->ReleaseStringUTFChars(env, j_id, id);
+    return ret;
+}
+
+
+/* jce.stat_flush -> jce_script_api_stat_flush (value_return) */
+JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nStatFlush(
+    JNIEnv *env, jclass cls, jlong api)
+{
+    jboolean ret = (jboolean)0;
+
+    (void)env;
+    (void)cls;
+    ret = (jboolean)jce_script_api_stat_flush(jce_java_api(api));
     return ret;
 }

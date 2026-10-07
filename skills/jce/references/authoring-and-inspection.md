@@ -1,6 +1,12 @@
 # Authoring a consumer project
 
-Distinguish using JCE from changing JCE. A consumer project lives under examples/ or an external SDK project; its scene, components, balance and scripts remain there. Do not edit engine/editor internals to deliver a consumer feature without user authorization.
+AI CLI is a development-time application consumer. It uses only public API/SDK,
+documentation, repository Skill, examples, editor operations and supported build
+tools. Never inspect or patch private engine/editor implementation as a shortcut
+to an application feature. Report a reusable API/editor gap and its reproducer;
+engine maintenance, if authorized, is a separately scoped task with its own
+validation. Consumer scene, component values, balance and driver-language code
+remain in the project. This generic boundary reveals no private authoring policy.
 
 Discover supported components and fields before generating scene data.
 
@@ -18,4 +24,12 @@ Prefer configured default/system font fallback. A display-family name is not pro
 
 Separate development-time AI assistance from AI behavior executed during the game. The reusable model transport is public; unpublished CLI/Agent/scene/physics policy and private prompts must remain outside public source and skill packages.
 
-Validate scene data, build the consumer against the matching SDK, run it, capture output and inspect the result. A package directory merely existing is not application acceptance.
+Repeat the application lifecycle checks after changes: validate supported scene
+fields and components; simulate in the editor; build and run the corresponding
+platform executable through the matching SDK; package a bundle and reopen it in
+the editor; compare effective settings, input, script behavior, assets, output
+and teardown. Relocate the native application and disable loose/source fallback.
+Record each host, language/backend, artifact identity and actual result. A
+successful model reply, compilation or existing package directory is not
+acceptance. Failures feed the next public-API iteration; missing hosts remain
+explicitly unavailable.

@@ -104,6 +104,11 @@ TEST_CASE("runtime-owned viewport receives bounded pointer events")
     CHECK(sample.wheel == doctest::Approx(2.0f));
     CHECK(sample.buttons == 1u);
 
+    CHECK(sample.x == doctest::Approx(40.0f));
+    CHECK(sample.y == doctest::Approx(40.0f));
+    CHECK(sample.width == 1280.0f);
+    CHECK(sample.height == 720.0f);
+
     sample = jce_editor_game_input_bridge_consume(&bridge);
     CHECK(sample.dx == 0.0f);
     CHECK(sample.dy == 0.0f);
@@ -144,6 +149,7 @@ TEST_CASE("focus loss and ownership changes cannot strand runtime input")
         jce_editor_game_input_bridge_consume(&bridge);
     CHECK(sample.dx == 0.0f);
     CHECK(sample.buttons == 0u);
+    CHECK(sample.width == 0.0f);
 
     viewport.owner = JCE_EDITOR_GAME_INPUT_FREE_FLY;
     viewport.captured = false;
@@ -185,4 +191,22 @@ TEST_CASE("commit order is pointer touch actions then runtime step")
         &bridge, touches, 1, nullptr, 1.0f / 60.0f, &ops, &probe));
     REQUIRE(probe.count == 4);
     CHECK(std::memcmp(probe.calls, "PTAS", 4) == 0);
+}
+
+TEST_CASE("displayed Game image maps pointer and displacement to render pixels")
+{
+    JceEditorGameInputBridge bridge{};
+    JceEditorGameInputViewport viewport{};
+    viewport.x = 100; viewport.y = 50;
+    viewport.width = 640; viewport.height = 360;
+    viewport.render_width = 1280; viewport.render_height = 720;
+    viewport.visible = viewport.hovered = true;
+    viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
+    jce_editor_game_input_bridge_publish(&bridge, &viewport);
+    JceEvent event = motion(420, 230, 30, -15);
+    jce_editor_game_input_bridge_handle_event(&bridge, &event);
+    const auto sample = jce_editor_game_input_bridge_consume(&bridge);
+    CHECK(sample.x == 640); CHECK(sample.y == 360);
+    CHECK(sample.width == 1280); CHECK(sample.height == 720);
+    CHECK(sample.dx == 60); CHECK(sample.dy == -30);
 }

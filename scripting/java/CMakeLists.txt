@@ -44,6 +44,13 @@ if(NOT JCE_BUILD_SCRIPT_JAVA)
 	return()
 endif()
 
+# JNI requires a native JVM for the target. A host JDK is not a Web runtime.
+# Do this before probing headers so cross builds never consume host JNI types.
+if(EMSCRIPTEN)
+	message(STATUS "JCE scripting: Java JNI shim SKIPPED — native JVM unavailable on Web")
+	return()
+endif()
+
 # A STATUS and not a FATAL_ERROR, for the same reason as the JDK probe below:
 # with the option ON by default, a configure that turned the C ABI off must
 # not fail here — it asked for no Java and should be told, not stopped.

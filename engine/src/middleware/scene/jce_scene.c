@@ -25,21 +25,13 @@
 #include "os/core/jce_memory.h"
 
 #include <flecs.h>
+#include "jce_scene_component_membership.h"
+#include "jce_scene_stress_internal.h"
 #include <string.h>
 #include <stdlib.h>   /* getenv — JCE_DISABLE_XGEN kill-switch */
 #include <math.h>     /* sinf/cosf — bounded orbit for the #4 entity-count spin */
 
 #define LOG_TAG "scene"
-
-/* #4 ECS benchmark: set to 1 by the editor Performance Benchmark panel to enable
- * the per-frame JceTransform integrate in jce_scene_update without a relaunch
- * (the JCE_STRESS_SPIN env is the headless equivalent). */
-int jce_scene_stress_spin_runtime = 0;
-/* Entity-count BENCHMARK root: when non-zero the stress-spin integrate moves
- * ONLY this root's descendants (the benchmark's own spawned entities), so the
- * real authored scene's models are never dragged around by the test.  0 = move
- * everything (the raw env JCE_STRESS_SPIN dev throughput path). */
-unsigned int jce_scene_stress_spin_root = 0u;
 
 /* Implemented in jce_scene_video.c — installs flecs lifecycle hooks
  * (ctor/dtor/copy/move) on the VideoPlayer component so its decoder handle
@@ -225,7 +217,7 @@ typedef struct {
 typedef struct {
     JceWorldCacheSlot *slots;
     uint32_t           cap;       /* power of two; 0 until first use */
-    uint32_t           live;      /* occupied slots (current+stale entries) */
+    uint32_t           live;      /* occupied slots in the current epoch */
 } JceWorldCache;
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
@@ -266,10 +258,7 @@ struct JceScene {
     ecs_query_t *each_query;    /* cached; created lazily in jce_scene_each_entity
                                  * (leak fix: was ecs_query()+ecs_query_fini() on
                                  * EVERY call, 4-5x/frame in Play → unbounded) */
-    ecs_query_t *spin_query;    /* stress-spin (entity-count benchmark) integrate:
-                                 * JceTransform WITHOUT Camera / CharacterController
-                                 * so the view-driving entities are never moved by
-                                 * the benchmark (else the game-view follow drifts). */
+    JceSceneStressState stress; /* diagnostic motion is scene-owned */
     uint64_t      world_epoch;  /* bumped per frame to invalidate the world-matrix cache */
     JceWorldCache world_cache;  /* per-entity world matrix memo (side table) */
     /* Structural epoch: bumped ONLY on real structural edits (a set_transform /
@@ -1094,7 +1083,7 @@ void jce_scene_destroy(JceScene *s)
     jce_scene_particles_shutdown(s);                    /* free lazy particle sys */
     if (s->cloth_query) ecs_query_fini(s->cloth_query); /* before world fini */
     if (s->each_query)  ecs_query_fini(s->each_query);  /* before world fini */
-    if (s->spin_query)  ecs_query_fini(s->spin_query);  /* before world fini */
+    if (s->stress.query) ecs_query_fini(s->stress.query);  /* before world fini */
     if (s->world) ecs_fini(s->world);
     if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
     if (s->xgen) JCE_FREE(s->xgen);
@@ -1363,12 +1352,13 @@ static uint64_t scene_world_cache_hash(uint64_t x)
 /* Look up `key` without mutating the table. Returns the slot if present
    (key already stored), else NULL. Never grows, so the returned pointer is
    only valid until the next scene_world_cache_put(). */
-static JceWorldCacheSlot *scene_world_cache_find(JceWorldCache *wc, uint64_t key)
+static JceWorldCacheSlot *scene_world_cache_find(JceWorldCache *wc, uint64_t key,
+                                                uint64_t epoch)
 {
     if (!wc->slots) return NULL;
     uint32_t mask = wc->cap - 1;
     uint32_t i = (uint32_t)(scene_world_cache_hash(key)) & mask;
-    while (wc->slots[i].key) {
+    while (wc->slots[i].key && wc->slots[i].epoch == epoch) {
         if (wc->slots[i].key == key) return &wc->slots[i];
         i = (i + 1) & mask;
     }
@@ -1391,7 +1381,7 @@ static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
             uint32_t nmask = new_cap - 1;
             for (uint32_t i = 0; i < wc->cap; i++) {
                 uint64_t k = wc->slots[i].key;
-                if (!k) continue;
+                if (!k || wc->slots[i].epoch != epoch) continue;
                 uint32_t j = (uint32_t)(scene_world_cache_hash(k)) & nmask;
                 while (ns[j].key) j = (j + 1) & nmask;
                 ns[j] = wc->slots[i];
@@ -1404,9 +1394,9 @@ static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
 
     uint32_t mask = wc->cap - 1;
     uint32_t i = (uint32_t)(scene_world_cache_hash(key)) & mask;
-    while (wc->slots[i].key && wc->slots[i].key != key)
+    while (wc->slots[i].key && wc->slots[i].epoch == epoch && wc->slots[i].key != key)
         i = (i + 1) & mask;
-    if (!wc->slots[i].key) {
+    if (!wc->slots[i].key || wc->slots[i].epoch != epoch) {
         wc->slots[i].key = key;
         wc->live++;
     }
@@ -1414,30 +1404,20 @@ static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
     wc->slots[i].epoch = epoch;
 }
 
-/* Drop the intra-frame world-matrix memo (begin a new generation).  Does NOT
-   touch structural_epoch — this is the per-frame drop used by
-   jce_scene_update / the renderer / the pick pass, none of which represent a
-   structural edit.
-
-   O(1): bumping world_epoch alone invalidates every cached matrix, because
-   the lookup (scene_world_matrix_memo) only trusts a slot whose epoch equals
-   the CURRENT world_epoch — stale entries simply miss and get overwritten in
-   place by the next put.  This used to also memset the whole table every
-   call, which was called 2-3x per frame and cost O(cap): multi-MB of pure
-   memory traffic per frame at large entity counts (150k entities => ~4MB
-   table => ~60MB/s of memset at 60fps x 2-3 calls), dwarfing the work it
-   "saved".  The ONLY thing the wipe provided beyond the epoch bump was
-   reclaiming slots of since-destroyed entities so a streaming world cannot
-   grow the table without bound — that is now done on a slow cadence instead
-   (every 512 generations, amortized ~O(cap/512) per frame ~= zero). */
+/* Start an empty logical table in O(1), without a structural edit. Lookup
+ * and insertion treat stale epochs as empty: deleted/recycled entity ids
+ * consume no live capacity. Rehash copies only this generation's entries.
+ * Periodic physical wipes are unnecessary and particularly expensive when
+ * thousands of physics/animation writebacks each invalidate the memo. */
 static void scene_drop_world_cache_frame(JceScene *s)
 {
     s->world_epoch++;
-    if ((s->world_epoch & 511u) == 0u &&
-        s->world_cache.slots && s->world_cache.live) {
+    s->world_cache.live = 0;
+    if (s->world_epoch == 0) {
+        s->world_epoch = 1;
+        if (!s->world_cache.slots) return;
         memset(s->world_cache.slots, 0,
                (size_t)s->world_cache.cap * sizeof(JceWorldCacheSlot));
-        s->world_cache.live = 0;
     }
 }
 
@@ -1506,7 +1486,10 @@ void jce_scene_notify_physics_writeback(JceScene *s)
      * fold it into the same "some world matrix changed" counter.  The mutated
      * entity set is unknown, so incremental repair is off the table for this
      * frame: mark the dirty ring overflowed. */
-    if (s) { s->xform_counter++; s->dirty_overflow = true; }
+    if (s) {
+        scene_drop_world_cache_frame(s);
+        s->xform_counter++; s->dirty_overflow = true;
+    }
 }
 
 /* Ring-push a subtree WITHOUT bumping per-entity xgen or the structural
@@ -1540,6 +1523,7 @@ static void scene_dirty_push_subtree(JceScene *s, JceEntity e)
 void jce_scene_notify_physics_writeback_entity(JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return;
+    scene_drop_world_cache_frame(s);
     s->xform_counter++;
     scene_dirty_push_subtree(s, e);
 }
@@ -1742,40 +1726,26 @@ void jce_scene_apply_world_shift(JceScene *s, const float shift[3])
     jce_scene_apply_world_shift_impl(s, sh);
 }
 
-/* Memoized world matrix for one entity within the current frame.
- *
- * world = parent_world * local. The parent's world matrix comes from the
- * same memo (computed once, then cached on the parent), so a parent shared
- * by K children is composed once per frame instead of K times — that is the
- * O(N*depth) → O(N) win this cache exists for. A root (no parent) returns
- * its local matrix unchanged, so flat scenes are bit-identical to the
- * pre-cache behaviour. `depth` bounds accidental cycles (matches the prior
- * 32-deep ancestor walk).
- *
- * Entries are tagged with ms->world_epoch; a slot whose epoch != the current
- * epoch is treated as stale and recomputed, so the per-frame epoch bump in
- * jce_scene_update invalidates the whole scene in O(1). The find/put split
- * keeps the early-out lookup free of table growth; the put after the
- * recursion is the only mutation, so no slot pointer is held across a
- * potential rehash. */
+/* Cache roots and descendants within the current transform generation.
+ * Lookup precedes local TRS composition: shared parents and repeated getters
+ * cost one hash probe. Every setter and explicit in-place writeback drops the
+ * generation. Keep the depth guard and exact local matrix for roots. */
 static jce_mat4 scene_world_matrix_memo(JceScene *ms, JceEntity e, int depth)
 {
-    jce_mat4 local = scene_local_matrix(ms, e);
-
-    JceEntity p = jce_scene_get_parent((const JceScene *)ms, e);
-    if (p == JCE_ENTITY_INVALID || p == e || depth >= 32)
-        return local;             /* root (or cycle/limit guard) */
-
-    /* Reuse this frame's cached world matrix if present and current. */
-    JceWorldCacheSlot *hit = scene_world_cache_find(&ms->world_cache, (uint64_t)e);
+    if (depth >= 32)
+        return scene_local_matrix(ms, e);
+    JceWorldCacheSlot *hit = scene_world_cache_find(&ms->world_cache, (uint64_t)e,
+                                                  ms->world_epoch);
     if (hit && hit->epoch == ms->world_epoch)
         return hit->world;
 
-    jce_mat4 parent_world = scene_world_matrix_memo(ms, p, depth + 1);
-    jce_mat4 world = jce_m4_multiply(&parent_world, &local);
-
-    scene_world_cache_put(&ms->world_cache, (uint64_t)e, &world,
-                          ms->world_epoch);
+    jce_mat4 world = scene_local_matrix(ms, e);
+    const JceEntity p = jce_scene_get_parent((const JceScene *)ms, e);
+    if (p != JCE_ENTITY_INVALID && p != e) {
+        const jce_mat4 parent_world = scene_world_matrix_memo(ms, p, depth + 1);
+        world = jce_m4_multiply(&parent_world, &world);
+    }
+    scene_world_cache_put(&ms->world_cache, (uint64_t)e, &world, ms->world_epoch);
     return world;
 }
 
@@ -2177,7 +2147,7 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     if (!s || !v) return;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    JCE_SCENE_COMPONENT_SET(s, re, TYPE, v);                                 \
     JCE_COMP_CULL_BUMP(s);                                              \
 }                                                                       \
                                                                         \
@@ -2202,7 +2172,7 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
     if (!s) return;                                                     \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_remove(s->world, re, TYPE);                                    \
+    JCE_SCENE_COMPONENT_REMOVE(s, re, TYPE);                                    \
 }
 
 /* Like JCE_COMP_IMPL but the runtime set path bumps the per-entity material_gen
@@ -2219,7 +2189,7 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     /* NULL interned strings: jce_scene_component_normalise.h. */       \
     TYPE _n = *v;                                                       \
     jce_scene_normalise_mesh_renderer(s, &_n);                          \
-    ecs_set_ptr(s->world, re, TYPE, &_n);                               \
+    JCE_SCENE_COMPONENT_SET(s, re, TYPE, &_n);                               \
     jce_scene_invalidate_entity_material(s, e);                         \
     JCE_COMP_CULL_BUMP(s);                                              \
 }                                                                       \
@@ -2245,7 +2215,7 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
     if (!s) return;                                                     \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_remove(s->world, re, TYPE);                                    \
+    JCE_SCENE_COMPONENT_REMOVE(s, re, TYPE);                                    \
     jce_scene_invalidate_entity_material(s, e);                         \
 }
 
@@ -2255,15 +2225,8 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     if (!s || !v) return;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_set_ptr(s->world, re, TYPE, v);                                 \
-    /* No JCE_COMP_CULL_BUMP here: this macro serves Transform/Pivot, whose  \
-     * changes the cull freeze already tracks through xform_counter below.   \
-     * Bumping the cull generation as well would invalidate the freeze on    \
-     * every entity move -- exactly what the per-entity gen exists to avoid. */\
-    /* Per-entity world-cache invalidation: a transform/pivot edit changes only \
-     * this entity's subtree, so bump its gen instead of the global epoch (a     \
-     * moving camera/script entity no longer drops the whole static cache).      \
-     * Component add/remove keep the global bump (render-kind etc. may change). */\
+    JCE_SCENE_COMPONENT_SET(s, re, TYPE, v);                                 \
+    /* Existing Transform/Pivot edits change only the subtree generation. */\
     jce_scene_invalidate_entity_world(s, e);                            \
 }                                                                       \
                                                                         \
@@ -2288,8 +2251,7 @@ void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
     if (!s) return;                                                     \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    ecs_remove(s->world, re, TYPE);                                    \
-    jce_scene_invalidate_world_cache(s);                                \
+    JCE_SCENE_COMPONENT_REMOVE(s, re, TYPE);                                    \
 }
 
 JCE_COMP_IMPL_WORLD(JceTransform,          transform)
@@ -3238,6 +3200,11 @@ int jce_scene_query_sphere(JceScene *s, jce_vec3 center, float radius,
     return q.n;
 }
 
+JceSceneStressState *jce_scene_stress_state(JceScene *s)
+{
+    return s ? &s->stress : NULL;
+}
+
 void jce_scene_update(JceScene *s, float dt)
 {
     JCE_PROFILE_ZONE_N("Scene::Update");
@@ -3254,116 +3221,9 @@ void jce_scene_update(JceScene *s, float dt)
     jce_scene_environment_advance(s, dt);
     ecs_progress(s->world, dt);
 
-    /* JCE_STRESS_SPIN (#4 ECS entity-count benchmark): each frame iterate every
-     * entity with a JceTransform and integrate it (the standard flecs N-entity
-     * Transform/Velocity throughput test) — pure component read+write over the
-     * flecs storage, measured via the "ecs_move" perf-phase.  Off by default
-     * (env unset) → zero cost.
-     *
-     * Two callers, two visibility contracts:
-     *   • headless env JCE_STRESS_SPIN (bench_root == 0): does NOT invalidate the
-     *     world cache — the metric is raw ECS iteration throughput, not the
-     *     rendered result, so the persistent static render caches stay warm.
-     *   • the editor "Entity Count" benchmark (bench_root != 0): the spawned
-     *     cubes are plain STATIC MeshRenderers (no rigidbody), so the renderer
-     *     keeps them in its cross-frame persistent static world cache and draws
-     *     STALE matrices — the Transforms update (visible on select) but the
-     *     render is frozen.  After the in-place integrate we bump structural_
-     *     epoch once (jce_scene_invalidate_world_cache — the same pattern the
-     *     floating-origin rebase uses after ITS in-place bulk move) so the static
-     *     world cache + collect-list freeze drop and every visible entity
-     *     recomposes its world matrix from the updated Transforms. */
-    {
-        static int s_spin = -1;
-        if (s_spin < 0) { const char *e = getenv("JCE_STRESS_SPIN");
-                          s_spin = (e && e[0] && e[0] != '0') ? 1 : 0; }
-        if (s_spin || jce_scene_stress_spin_runtime) {
-            uint64_t _t0 = jce_time_perf_counter();
-            if (!s->spin_query) {
-                /* Move every JceTransform EXCEPT the entities that drive the
-                 * view (Camera / CharacterController): the benchmark is a raw
-                 * N-entity throughput test and must not translate the player /
-                 * camera, or the game-view third-person follow drifts steadily
-                 * in +X/+Y (the integrate direction) as reported. */
-                s->spin_query = ecs_query(s->world, {
-                    .terms = {
-                        { .id = ecs_id(JceTransform) },
-                        { .id = ecs_id(JceCameraComponent),
-                          .oper = EcsNot },
-                        { .id = ecs_id(JceCharacterControllerComponent),
-                          .oper = EcsNot },
-                    }
-                });
-            }
-            if (s->spin_query) {
-                /* Benchmark scoping: when the entity-count benchmark set a root,
-                 * integrate ONLY entities under it (walk the ChildOf chain, the
-                 * same way the editor's bench_root_of does).  This is what stops
-                 * the REAL scene's textured models from translating away while
-                 * the benchmark runs; env JCE_STRESS_SPIN (root 0) still moves
-                 * everything. */
-                const uint32_t bench_root = jce_scene_stress_spin_root;
-                int moved = 0;
-                /* Bounded orbit velocity: integrating sin/cos over time keeps each
-                 * cube's accumulated offset within ~±1–2 units of where it spawned
-                 * (∫sin dt = 1−cos ∈ [0,2]), so the grid gently orbits + spins in
-                 * PLACE.  The old raw `position += dt` accumulated unbounded, and
-                 * combined with the root being spun too it smeared the group into
-                 * a spiral — that is the "扭曲伸展" (twist/stretch) seen on the
-                 * selection outline.  sin/cos are evaluated once per frame here,
-                 * not per entity, so the ecs_move throughput cost is unchanged. */
-                static float s_spin_phase = 0.0f;
-                s_spin_phase += dt;
-                const float vx = sinf(s_spin_phase);
-                const float vy = cosf(s_spin_phase);
-                ecs_iter_t it = ecs_query_iter(s->world, s->spin_query);
-                while (ecs_query_next(&it)) {
-                    JceTransform *xf = ecs_field(&it, JceTransform, 0);
-                    for (int i = 0; i < it.count; i++) {
-                        const uint32_t ent = (uint32_t)it.entities[i];
-                        if (bench_root) {
-                            /* Anchor the group root itself — spinning BOTH the
-                             * root and its children compounded (parent∘child) into
-                             * the spiral distortion.  Move strict descendants. */
-                            if (ent == bench_root) continue;
-                            uint32_t p = ent;
-                            int under = 0;
-                            for (int g = 0; p && g < 64; ++g) {
-                                if (p == bench_root) { under = 1; break; }
-                                uint32_t np =
-                                    (uint32_t)jce_scene_get_parent(s, (JceEntity)p);
-                                if (np == 0u || np == (uint32_t)JCE_ENTITY_INVALID)
-                                    break;
-                                p = np;
-                            }
-                            if (!under) continue;
-                        }
-                        xf[i].position.x += vx * dt;     /* bounded orbit  */
-                        xf[i].position.y += vy * dt * 0.5f;
-                        xf[i].rotation.y += dt;          /* spin in place  */
-                        if (xf[i].rotation.y > 6.2831853f)
-                            xf[i].rotation.y -= 6.2831853f;
-                        moved = 1;
-                    }
-                }
-                /* Editor "Entity Count" benchmark: the cubes are plain STATIC
-                 * MeshRenderers, so the renderer caches their world matrices in
-                 * its cross-frame persistent static cache (keyed on structural_
-                 * epoch + per-entity xform_gen).  The in-place integrate above
-                 * bumps NEITHER key, so the cache serves stale matrices and the
-                 * render is frozen even though the Transforms update.  Bump
-                 * structural_epoch once for the whole batch (the proven pattern
-                 * jce_scene_apply_world_shift_impl uses after its in-place bulk
-                 * move): it invalidates the static world cache + the collect-list
-                 * freeze so every visible entity recomposes from the updated
-                 * Transforms and the cubes visibly move.  Headless env path
-                 * (bench_root == 0) stays raw so its ecs_move number is unchanged. */
-                if (bench_root && moved) jce_scene_invalidate_world_cache(s);
-            }
-            jce_perf_phase_add("ecs_move",
-                               jce_time_perf_to_ms(_t0, jce_time_perf_counter()));
-        }
-    }
+    jce_scene_stress_update(s, s->world, &s->stress, dt,
+        ecs_id(JceTransform), ecs_id(JceCameraComponent),
+        ecs_id(JceCharacterControllerComponent));
 
     /* ── Cloth reconciliation (P3-C.4 follow-up) ─────────────────────
      * For every entity with a JceClothComponent whose runtime handle is

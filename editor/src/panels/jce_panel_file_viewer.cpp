@@ -19,11 +19,13 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/platform/jce_host_shell.h>
+#include <jce/os/platform/jce_cursor.h>
 #include <jce/renderer/jce_image.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_pbr_material.h>
@@ -33,6 +35,78 @@ extern "C" {
 #include <math.h>
 
 #define LOG_TAG "file_viewer"
+
+/* Bounded RGBA source copies; never retain full-size decoded images. */
+struct FvCursorSource {
+    std::string path;
+    int width, height;
+    std::vector<unsigned char> rgba;
+};
+static std::vector<FvCursorSource> s_cursor_sources;
+static JceCursor *s_preview_cursor;
+static std::string s_preview_path;
+static int s_preview_seen = -1;
+static int s_preview_hovered = -1;
+
+static void fv_cursor_stop(void)
+{
+    if (s_preview_cursor) {
+        jce_cursor_reset();
+        jce_cursor_destroy(s_preview_cursor);
+        s_preview_cursor = nullptr;
+    }
+    s_preview_path.clear();
+    s_preview_seen = s_preview_hovered = -1;
+}
+
+static void fv_cursor_close(const char *path)
+{
+    if (s_preview_path == path) fv_cursor_stop();
+    for (auto it = s_cursor_sources.begin(); it != s_cursor_sources.end(); ++it) {
+        if (it->path == path) { s_cursor_sources.erase(it); break; }
+    }
+}
+
+bool jce_file_viewer_cursor_available(const char *path)
+{
+    for (const auto &source : s_cursor_sources)
+        if (source.path == path) return true;
+    return false;
+}
+
+bool jce_file_viewer_cursor_enabled(const char *path)
+{
+    return s_preview_cursor && s_preview_path == path;
+}
+
+bool jce_file_viewer_cursor_toggle(const char *path)
+{
+    if (jce_file_viewer_cursor_enabled(path)) { fv_cursor_stop(); return true; }
+    fv_cursor_stop();
+    for (const auto &source : s_cursor_sources) {
+        if (source.path != path) continue;
+        s_preview_cursor = jce_cursor_create_rgba8(source.rgba.data(),
+            source.width, source.height, 0, 0);
+        if (s_preview_cursor) s_preview_path = path;
+        else LOG_WARN(LOG_TAG, "Platform could not create image cursor: %s", path);
+        return s_preview_cursor != nullptr;
+    }
+    return false;
+}
+
+void jce_file_viewer_cursor_visit(const char *path, bool canvas_hovered)
+{
+    if (!jce_file_viewer_cursor_enabled(path)) return;
+    s_preview_seen = ImGui::GetFrameCount();
+    if (canvas_hovered) s_preview_hovered = s_preview_seen;
+}
+
+JceCursor *jce_file_viewer_cursor_for_frame(void)
+{
+    const int frame = ImGui::GetFrameCount();
+    if (s_preview_cursor && s_preview_seen != frame) fv_cursor_stop();
+    return s_preview_hovered == frame ? s_preview_cursor : nullptr;
+}
 
 static std::string normalize_path_string(const char *path)
 {
@@ -136,6 +210,7 @@ static void fv_close_tab(int idx)
     if (idx < 0 || idx >= s_fv.tab_count) return;
 
     FvTab *tab = &s_fv.tabs[idx];
+    fv_cursor_close(tab->path);
     if (strcmp(s_fv.autoplay_path, tab->path) == 0)
         s_fv.autoplay_path[0] = '\0';
 
@@ -574,6 +649,15 @@ static void fv_open_internal(const char *path, bool force_text, int goto_line)
             tab->img_h   = (int)img.height;
             tab->gpu_tex = jce_texture_from_rgba(img.pixels,
                                                  img.width, img.height);
+            if (img.width > 0 && img.height > 0 && img.width <= 64 && img.height <= 64) {
+                fv_cursor_close(tab->path);
+                FvCursorSource source;
+                source.path = tab->path;
+                source.width = (int)img.width;
+                source.height = (int)img.height;
+                source.rgba.assign(img.pixels, img.pixels + img.width * img.height * 4);
+                s_cursor_sources.push_back(std::move(source));
+            }
             jce_image_free(&img);
 
             /* Default zoom: fit in ~512px. */
@@ -666,6 +750,40 @@ void jce_file_viewer_request_focus(void)
 {
     s_fv.want_focus = true;
     jce_editor_panel_request_focus("###file_viewer");
+}
+
+/* QA uses ordinary open/selection requests, never a media pause shortcut. */
+static void fv_probe_tab_transition(const char *active_media)
+{
+    static double start = -1.0;
+    static int stage = 0;
+    static char media_path[sizeof(s_fv.tabs[0].path)] = {};
+    const char *text = getenv("JCE_DBG_FILE_PREVIEW_SWITCH_TEXT");
+    const char *leave_arg = getenv("JCE_DBG_FILE_PREVIEW_SWITCH_MS");
+    const char *return_arg = getenv("JCE_DBG_FILE_PREVIEW_RETURN_MS");
+    if (!text || !text[0] || !leave_arg || !return_arg) return;
+    const int leave_ms = atoi(leave_arg), return_ms = atoi(return_arg);
+    if (leave_ms < 100 || return_ms <= leave_ms || return_ms > 600000) return;
+    if (start < 0.0) {
+        if (!active_media) return;
+        snprintf(media_path, sizeof(media_path), "%s", active_media);
+        start = ImGui::GetTime();
+    }
+    const double elapsed_ms = (ImGui::GetTime() - start) * 1000.0;
+    if (stage == 0 && elapsed_ms >= leave_ms) {
+        stage = 1;
+        jce_file_viewer_open_text_at(text, 0);
+        LOG_INFO(LOG_TAG, "preview tab event=switch elapsed_ms=%.3f", elapsed_ms);
+    } else if (stage == 1 && elapsed_ms >= return_ms) {
+        stage = 2;
+        for (int i = 0; i < s_fv.tab_count; ++i) {
+            if (strcmp(s_fv.tabs[i].path, media_path) != 0) continue;
+            /* Ordinary tab selection carries no explicit-open autoplay. */
+            s_fv.select_tab_req = i;
+            LOG_INFO(LOG_TAG, "preview tab event=return elapsed_ms=%.3f", elapsed_ms);
+            break;
+        }
+    }
 }
 
 void jce_file_viewer_draw_content(void)
@@ -814,6 +932,7 @@ void jce_file_viewer_draw_content(void)
      * regardless of whether the File Viewer window itself is focused. */
     fv_audio_update_focus(active_audio_path, true);
     fv_video_update_focus(active_video_path, true);
+    fv_probe_tab_transition(active_video_path ? active_video_path : active_audio_path);
     /* An explicit open (resource-browser double-click) focuses the viewer.
      * Start only after its media tab is actually visible and loaded.  A
      * restored tab never queues this request, and an obscured dock tab does
@@ -866,6 +985,8 @@ void jce_file_viewer_draw_window(bool *p_visible)
 
 void jce_file_viewer_close_all(void)
 {
+    fv_cursor_stop();
+    s_cursor_sources.clear();
     for (int i = 0; i < s_fv.tab_count; i++) {
         FvTab *tab = &s_fv.tabs[i];
         if (tab->type == JCE_FV_MODEL)

@@ -13,6 +13,7 @@ void clear_sample(JceEditorGameInputBridge *bridge)
     bridge->dy = 0.0f;
     bridge->wheel = 0.0f;
     bridge->buttons = 0u;
+    bridge->position_valid = false;
 }
 
 bool point_inside(const JceEditorGameInputViewport &viewport,
@@ -87,6 +88,9 @@ void jce_editor_game_input_bridge_handle_event(
             std::isfinite(event->motion.yrel)) {
             bridge->dx += event->motion.xrel;
             bridge->dy += event->motion.yrel;
+            bridge->x = event->motion.x;
+            bridge->y = event->motion.y;
+            bridge->position_valid = true;
         }
         break;
     case JCE_EVENT_MOUSE_WHEEL:
@@ -101,6 +105,9 @@ void jce_editor_game_input_bridge_handle_event(
             (bridge->viewport.captured ||
              point_inside(bridge->viewport, event->button.x, event->button.y))) {
             bridge->buttons |= bit;
+            bridge->x = event->button.x;
+            bridge->y = event->button.y;
+            bridge->position_valid = true;
         }
         break;
     }
@@ -108,9 +115,17 @@ void jce_editor_game_input_bridge_handle_event(
         const uint32_t bit = button_bit(event->button.button);
         if (bit)
             bridge->buttons &= ~bit;
+        if (runtime_accepts_pointer(bridge) &&
+            point_inside(bridge->viewport, event->button.x, event->button.y)) {
+            bridge->x = event->button.x;
+            bridge->y = event->button.y;
+            bridge->position_valid = true;
+        }
         break;
     }
     default:
+        if (!bridge->viewport.captured && !runtime_accepts_pointer(bridge))
+            bridge->position_valid = false;
         break;
     }
 }
@@ -123,10 +138,22 @@ JceEditorGameInputSample jce_editor_game_input_bridge_consume(
         return sample;
     sample.owner = bridge->viewport.owner;
     if (bridge->viewport.owner == JCE_EDITOR_GAME_INPUT_RUNTIME) {
-        sample.dx = bridge->dx;
-        sample.dy = bridge->dy;
+        const float rw = bridge->viewport.render_width > 0.0f
+                       ? bridge->viewport.render_width : bridge->viewport.width;
+        const float rh = bridge->viewport.render_height > 0.0f
+                       ? bridge->viewport.render_height : bridge->viewport.height;
+        const float sx = bridge->viewport.width > 0 ? rw / bridge->viewport.width : 1.0f;
+        const float sy = bridge->viewport.height > 0 ? rh / bridge->viewport.height : 1.0f;
+        sample.dx = bridge->dx * sx;
+        sample.dy = bridge->dy * sy;
         sample.wheel = bridge->wheel;
         sample.buttons = bridge->buttons;
+        if (bridge->position_valid && runtime_accepts_pointer(bridge)) {
+            sample.x = (bridge->x - bridge->viewport.x) * sx;
+            sample.y = (bridge->y - bridge->viewport.y) * sy;
+            sample.width = rw;
+            sample.height = rh;
+        }
     }
     bridge->dx = 0.0f;
     bridge->dy = 0.0f;
@@ -152,6 +179,8 @@ bool jce_editor_game_input_bridge_commit(
     const JceEditorGameInputSample sample =
         jce_editor_game_input_bridge_consume(bridge);
     ops->set_pointer(ud, sample.dx, sample.dy, sample.wheel, sample.buttons);
+    if (ops->set_position)
+        ops->set_position(ud, sample.x, sample.y, sample.width, sample.height);
     ops->set_touches(ud, touches, touch_count);
     ops->set_actions(ud, actions);
     ops->step(ud, dt);
@@ -162,4 +191,3 @@ JceEditorGameInputBridge *jce_editor_game_input_bridge_shared(void)
 {
     return &g_bridge;
 }
-

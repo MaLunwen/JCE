@@ -20,7 +20,7 @@
  * The guard has TWO spellings and grepping for only the first will convince
  * you this file is broken when it is not:
  *
- *     s->have_host && s->host.<member>          100 functions
+ *     s->have_host && s->host.<member>          107 functions
  *     !s->have_host || !s->host.<member>        1 function (jce.get_touch),
  *                                               where an index_base binding
  *                                               folds the guard into its
@@ -1039,6 +1039,26 @@ static JSValue js_jce_get_pointer_delta(JSContext *ctx, JSValueConst this_val,
     ret = JS_NewArray(ctx);
     JS_SetPropertyUint32(ctx, ret, 0, JS_NewFloat64(ctx, (double)out_xy[0]));
     JS_SetPropertyUint32(ctx, ret, 1, JS_NewFloat64(ctx, (double)out_xy[1]));
+    return ret;
+}
+
+/* jce.get_pointer_position - shape: void_out_array
+ * Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
+static JSValue js_jce_get_pointer_position(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    float out_xywh[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (s->have_host && s->host.pointer_position)
+        s->host.pointer_position(s->host.user, out_xywh);
+    ret = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, ret, 0, JS_NewFloat64(ctx, (double)out_xywh[0]));
+    JS_SetPropertyUint32(ctx, ret, 1, JS_NewFloat64(ctx, (double)out_xywh[1]));
+    JS_SetPropertyUint32(ctx, ret, 2, JS_NewFloat64(ctx, (double)out_xywh[2]));
+    JS_SetPropertyUint32(ctx, ret, 3, JS_NewFloat64(ctx, (double)out_xywh[3]));
     return ret;
 }
 
@@ -2508,6 +2528,129 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* jce.set_cursor - shape: value_return
+ * Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path resets. Main-thread; false on decode/platform/cache failure. */
+static JSValue js_jce_set_cursor(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    const char *asset_path = NULL, *asset_path_cs = NULL;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    asset_path_cs = JS_ToCString(ctx, argv[0]);
+    if (!asset_path_cs) goto fail;
+    asset_path = asset_path_cs;
+    double hotspot_x_d = 0.0;
+    if (JS_ToFloat64(ctx, &hotspot_x_d, argv[1]) < 0) goto fail;
+    int hotspot_x = (int)hotspot_x_d;
+    double hotspot_y_d = 0.0;
+    if (JS_ToFloat64(ctx, &hotspot_y_d, argv[2]) < 0) goto fail;
+    int hotspot_y = (int)hotspot_y_d;
+    bool v = (s->have_host && s->host.cursor_set)
+                ? s->host.cursor_set(s->host.user, asset_path, hotspot_x, hotspot_y) : false;
+    ret = JS_NewBool(ctx, v);
+    if (asset_path_cs) JS_FreeCString(ctx, asset_path_cs);
+    return ret;
+fail:
+    if (asset_path_cs) JS_FreeCString(ctx, asset_path_cs);
+    return JS_EXCEPTION;
+}
+
+/* jce.request_quit - shape: value_return */
+static JSValue js_jce_request_quit(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    bool v = (s->have_host && s->host.request_quit)
+                ? s->host.request_quit(s->host.user) : false;
+    ret = JS_NewBool(ctx, v);
+    return ret;
+}
+
+/* jce.stat_available - shape: value_return */
+static JSValue js_jce_stat_available(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    bool v = (s->have_host && s->host.stat_available)
+                ? s->host.stat_available(s->host.user) : false;
+    ret = JS_NewBool(ctx, v);
+    return ret;
+}
+
+/* jce.stat_set - shape: value_return
+ * Store signed32 statistic through an explicitly borrowed platform service. Nonfinite, fractional or out-of-range values return false; successful set does not imply durable flush. */
+static JSValue js_jce_stat_set(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    const char *id = NULL, *id_cs = NULL;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    id_cs = JS_ToCString(ctx, argv[0]);
+    if (!id_cs) goto fail;
+    id = id_cs;
+    double value_d = 0.0;
+    if (JS_ToFloat64(ctx, &value_d, argv[1]) < 0) goto fail;
+    double value = value_d;
+    bool v = (s->have_host && s->host.stat_set)
+                ? s->host.stat_set(s->host.user, id, value) : false;
+    ret = JS_NewBool(ctx, v);
+    if (id_cs) JS_FreeCString(ctx, id_cs);
+    return ret;
+fail:
+    if (id_cs) JS_FreeCString(ctx, id_cs);
+    return JS_EXCEPTION;
+}
+
+/* jce.stat_get - shape: value_return
+ * Signed32 statistic; fallback must be finite, integral and in range, otherwise returns 0. An absent host returns 0; a configured runtime with unavailable service returns the valid fallback. */
+static JSValue js_jce_stat_get(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    const char *id = NULL, *id_cs = NULL;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    id_cs = JS_ToCString(ctx, argv[0]);
+    if (!id_cs) goto fail;
+    id = id_cs;
+    double fallback_d = 0.0;
+    if (JS_ToFloat64(ctx, &fallback_d, argv[1]) < 0) goto fail;
+    double fallback = fallback_d;
+    int v = (s->have_host && s->host.stat_get)
+                ? s->host.stat_get(s->host.user, id, fallback) : 0;
+    ret = JS_NewInt32(ctx, (int32_t)v);
+    if (id_cs) JS_FreeCString(ctx, id_cs);
+    return ret;
+fail:
+    if (id_cs) JS_FreeCString(ctx, id_cs);
+    return JS_EXCEPTION;
+}
+
+/* jce.stat_flush - shape: value_return */
+static JSValue js_jce_stat_flush(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    bool v = (s->have_host && s->host.stat_flush)
+                ? s->host.stat_flush(s->host.user) : false;
+    ret = JS_NewBool(ctx, v);
+    return ret;
+}
+
 const char *const JCE_SCRIPT_JS_BINDING_NAMES[] = {
     "get_position",
     "set_position",
@@ -2548,6 +2691,7 @@ const char *const JCE_SCRIPT_JS_BINDING_NAMES[] = {
     "is_action_pressed",
     "get_axis",
     "get_pointer_delta",
+    "get_pointer_position",
     "get_pointer_wheel",
     "is_pointer_down",
     "get_touch_count",
@@ -2610,6 +2754,12 @@ const char *const JCE_SCRIPT_JS_BINDING_NAMES[] = {
     "get_param_text",
     "curve_eval",
     "vcam_activate",
+    "set_cursor",
+    "request_quit",
+    "stat_available",
+    "stat_set",
+    "stat_get",
+    "stat_flush",
 };
 
 static const JSCFunctionListEntry k_jce_fns[] = {
@@ -2652,6 +2802,7 @@ static const JSCFunctionListEntry k_jce_fns[] = {
     JS_CFUNC_DEF("is_action_pressed", 1, js_jce_is_action_pressed),
     JS_CFUNC_DEF("get_axis", 1, js_jce_get_axis),
     JS_CFUNC_DEF("get_pointer_delta", 0, js_jce_get_pointer_delta),
+    JS_CFUNC_DEF("get_pointer_position", 0, js_jce_get_pointer_position),
     JS_CFUNC_DEF("get_pointer_wheel", 0, js_jce_get_pointer_wheel),
     JS_CFUNC_DEF("is_pointer_down", 1, js_jce_is_pointer_down),
     JS_CFUNC_DEF("get_touch_count", 0, js_jce_get_touch_count),
@@ -2714,6 +2865,12 @@ static const JSCFunctionListEntry k_jce_fns[] = {
     JS_CFUNC_DEF("get_param_text", 2, js_jce_get_param_text),
     JS_CFUNC_DEF("curve_eval", 3, js_jce_curve_eval),
     JS_CFUNC_DEF("vcam_activate", 1, js_jce_vcam_activate),
+    JS_CFUNC_DEF("set_cursor", 3, js_jce_set_cursor),
+    JS_CFUNC_DEF("request_quit", 0, js_jce_request_quit),
+    JS_CFUNC_DEF("stat_available", 0, js_jce_stat_available),
+    JS_CFUNC_DEF("stat_set", 2, js_jce_stat_set),
+    JS_CFUNC_DEF("stat_get", 2, js_jce_stat_get),
+    JS_CFUNC_DEF("stat_flush", 0, js_jce_stat_flush),
 };
 
 bool jce_script_js_install_bindings(JceJsScript *s)

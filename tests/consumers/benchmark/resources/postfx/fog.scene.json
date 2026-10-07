@@ -1,0 +1,505 @@
+{
+  "entities": [
+    {
+      "id": 1,
+      "parentId": 0,
+      "name": "Camera",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 3,
+          "posZ": 8,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "rotX": -14,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "Camera",
+          "primary": true,
+          "orthographic": false,
+          "fov": 55,
+          "nearClip": 0.1,
+          "farClip": 80,
+          "clearMode": 2
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "parentId": 0,
+      "name": "Sun",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 0,
+          "posZ": 0,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "DirectionalLight",
+          "dirX": -0.4,
+          "dirY": -1,
+          "dirZ": -0.3,
+          "intensity": 2,
+          "castsShadow": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "parentId": 0,
+      "name": "Floor",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": -0.2,
+          "posZ": -2,
+          "scaleX": 12,
+          "scaleY": 0.4,
+          "scaleZ": 16,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.38,
+          "baseColorG": 0.4,
+          "baseColorB": 0.42,
+          "baseColorA": 1,
+          "metallic": 0.95,
+          "roughness": 0.12,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "parentId": 0,
+      "name": "Back",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 3,
+          "posZ": -9,
+          "scaleX": 12,
+          "scaleY": 6,
+          "scaleZ": 0.4,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.3,
+          "baseColorG": 0.33,
+          "baseColorB": 0.4,
+          "baseColorA": 1,
+          "metallic": 0,
+          "roughness": 0.8,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "parentId": 0,
+      "name": "Left",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": -6,
+          "posY": 3,
+          "posZ": -2,
+          "scaleX": 0.4,
+          "scaleY": 6,
+          "scaleZ": 14,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.4,
+          "baseColorG": 0.3,
+          "baseColorB": 0.25,
+          "baseColorA": 1,
+          "metallic": 0,
+          "roughness": 0.8,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "parentId": 0,
+      "name": "Right",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 6,
+          "posY": 3,
+          "posZ": -2,
+          "scaleX": 0.4,
+          "scaleY": 6,
+          "scaleZ": 14,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.25,
+          "baseColorG": 0.35,
+          "baseColorB": 0.4,
+          "baseColorA": 1,
+          "metallic": 0,
+          "roughness": 0.8,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "parentId": 0,
+      "name": "Column0",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": -4,
+          "posY": 1.5,
+          "posZ": -5,
+          "scaleX": 0.65,
+          "scaleY": 3,
+          "scaleZ": 0.65,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.5,
+          "baseColorG": 0.45,
+          "baseColorB": 0.35,
+          "baseColorA": 1,
+          "metallic": 0.1,
+          "roughness": 0.45,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "parentId": 0,
+      "name": "Column1",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": -2,
+          "posY": 1.5,
+          "posZ": -5,
+          "scaleX": 0.65,
+          "scaleY": 3,
+          "scaleZ": 0.65,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.5,
+          "baseColorG": 0.45,
+          "baseColorB": 0.35,
+          "baseColorA": 1,
+          "metallic": 0.1,
+          "roughness": 0.45,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "parentId": 0,
+      "name": "Column2",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0,
+          "posY": 1.5,
+          "posZ": -5,
+          "scaleX": 0.65,
+          "scaleY": 3,
+          "scaleZ": 0.65,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.5,
+          "baseColorG": 0.45,
+          "baseColorB": 0.35,
+          "baseColorA": 1,
+          "metallic": 0.1,
+          "roughness": 0.45,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "parentId": 0,
+      "name": "Column3",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 2,
+          "posY": 1.5,
+          "posZ": -5,
+          "scaleX": 0.65,
+          "scaleY": 3,
+          "scaleZ": 0.65,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.5,
+          "baseColorG": 0.45,
+          "baseColorB": 0.35,
+          "baseColorA": 1,
+          "metallic": 0.1,
+          "roughness": 0.45,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "parentId": 0,
+      "name": "Column4",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 4,
+          "posY": 1.5,
+          "posZ": -5,
+          "scaleX": 0.65,
+          "scaleY": 3,
+          "scaleZ": 0.65,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.5,
+          "baseColorG": 0.45,
+          "baseColorB": 0.35,
+          "baseColorA": 1,
+          "metallic": 0.1,
+          "roughness": 0.45,
+          "emissiveR": 0.0,
+          "emissiveG": 0.0,
+          "emissiveB": 0.0
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "parentId": 0,
+      "name": "Emitter0",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": -2.4,
+          "posY": 0.7,
+          "posZ": -1,
+          "scaleX": 0.9,
+          "scaleY": 1.4,
+          "scaleZ": 0.9,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 1,
+          "baseColorG": 0.05,
+          "baseColorB": 0.01,
+          "baseColorA": 1,
+          "metallic": 0.2,
+          "roughness": 0.2,
+          "emissiveR": 12,
+          "emissiveG": 0.6000000000000001,
+          "emissiveB": 0.12
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "parentId": 0,
+      "name": "Emitter1",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 0.0,
+          "posY": 0.7,
+          "posZ": -1,
+          "scaleX": 0.9,
+          "scaleY": 1.4,
+          "scaleZ": 0.9,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.02,
+          "baseColorG": 0.7,
+          "baseColorB": 1,
+          "baseColorA": 1,
+          "metallic": 0.2,
+          "roughness": 0.2,
+          "emissiveR": 0.24,
+          "emissiveG": 8.399999999999999,
+          "emissiveB": 12
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "parentId": 0,
+      "name": "Emitter2",
+      "components": [
+        {
+          "type": "Transform",
+          "posX": 2.4,
+          "posY": 0.7,
+          "posZ": -1,
+          "scaleX": 0.9,
+          "scaleY": 1.4,
+          "scaleZ": 0.9,
+          "rotX": 0,
+          "rotY": 0,
+          "rotZ": 0
+        },
+        {
+          "type": "MeshRenderer",
+          "meshShape": 0,
+          "visible": true,
+          "baseColorR": 0.9,
+          "baseColorG": 0.6,
+          "baseColorB": 0.05,
+          "baseColorA": 1,
+          "metallic": 0.2,
+          "roughness": 0.2,
+          "emissiveR": 10.8,
+          "emissiveG": 7.199999999999999,
+          "emissiveB": 0.6000000000000001
+        }
+      ]
+    }
+  ],
+  "rendering": {
+    "ambient": {
+      "color": [
+        0.15,
+        0.17,
+        0.2
+      ],
+      "intensity": 0.3
+    },
+    "iblEnabled": false,
+    "dynamicGI": 0,
+    "fog": {
+      "enabled": true,
+      "mode": 1,
+      "color": [
+        0.35,
+        0.45,
+        0.6
+      ],
+      "density": 0.08,
+      "start": 0,
+      "end": 45,
+      "heightFalloff": 0.1,
+      "heightOrigin": 0
+    },
+    "shadows": {
+      "distance": 40,
+      "cascades": 2,
+      "resolution": 1024,
+      "soft": 1
+    },
+    "postfx": {
+      "tonemap": true,
+      "bloom": false,
+      "fxaa": false,
+      "vignette": false,
+      "chromatic": false,
+      "grayscale": false,
+      "autoExposure": false,
+      "exposure": 1,
+      "gamma": 2.2,
+      "bloomThreshold": 1,
+      "bloomIntensity": 0.7,
+      "ssao": true,
+      "ssaoRadius": 0.8,
+      "ssaoIntensity": 2,
+      "ssr": true,
+      "ssrIntensity": 1
+    }
+  }
+}

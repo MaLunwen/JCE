@@ -1,6 +1,6 @@
 /*
  * cs_hiz_reduce.sc -- Hi-Z MAX-depth pyramid mip reduce (large-world #5, full
- * pyramid slice).  Builds Hi-Z mip i (i>=1) as the 2x2-MAX of mip i-1.
+ * pyramid slice). Builds Hi-Z mip i (i>=1) from its source footprint in mip i-1.
  *
  * Unlike cs_hiz_build (which reads the depth prepass through a SAMPLER for mip 0),
  * this reads the SOURCE mip as a read-only IMAGE and writes the DEST mip as a
@@ -9,11 +9,10 @@
  * mips including the one being written and get unbound).  depth: 0=near, 1=far;
  * MAX keeps the FARTHEST occluder over the footprint so the cull is conservative.
  *
- * Odd-sized source levels: imageLoad past the edge returns 0 (=near), which only
- * pulls the MAX toward near → UNDER-estimates the occluder → keeps the instance
- * VISIBLE → conservative (never a false occlusion at a boundary).
+ * Odd-sized normalized footprints overlap. Dropping a source texel can lower
+ * the maximum and falsely occlude visible geometry; no edge texel may be lost.
  *
- * u_hiz_build = { dst_width, dst_height, 0, 0 }
+ * u_hiz_build = { dst_width, dst_height, src_width, src_height }
  */
 
 #include <bgfx_compute.sh>
@@ -31,12 +30,18 @@ void main()
         return;
     }
 
-    ivec2 b = d * 2;
-    float s0 = imageLoad(i_src, b + ivec2(0, 0)).x;
-    float s1 = imageLoad(i_src, b + ivec2(1, 0)).x;
-    float s2 = imageLoad(i_src, b + ivec2(0, 1)).x;
-    float s3 = imageLoad(i_src, b + ivec2(1, 1)).x;
-
-    float mx = max(max(s0, s1), max(s2, s3));
+    ivec2 dstDim = ivec2(u_hiz_build.xy);
+    ivec2 srcDim = ivec2(u_hiz_build.zw);
+    ivec2 lo = d * srcDim / dstDim;
+    ivec2 hi = ((d + ivec2(1, 1)) * srcDim + dstDim - ivec2(1, 1)) / dstDim;
+    float mx = 0.0;
+    for (int y = 0; y < 3; ++y) {
+        for (int x = 0; x < 3; ++x) {
+            ivec2 p = lo + ivec2(x, y);
+            if (p.x < hi.x && p.y < hi.y) {
+                mx = max(mx, imageLoad(i_src, p).x);
+            }
+        }
+    }
     imageStore(i_dst, d, vec4(mx, 0.0, 0.0, 0.0));
 }

@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
+jce_add_unit_test(test_jce_ui_canvas_capacity
+    SOURCES test_jce_ui_canvas_capacity.c
+    LINK jce_core jce_scene jce_resource jce_ui jce_renderer)
+
 # ----------------------------------------------------------------------- #
 #  L4 scene-layer unit tests.                                             #
 #                                                                         #
@@ -902,3 +906,37 @@ jce_add_unit_test(test_jce_script_params_roundtrip
 jce_add_unit_test(test_jce_script_exports
     SOURCES test_jce_script_exports.c
     LINK    jce_core jce_scene)
+
+# Dynamic shadow membership remains unique across full and incremental builds.
+jce_add_unit_test(test_jce_sr_unique_index
+    SOURCES test_jce_sr_unique_index.c)
+target_include_directories(test_jce_sr_unique_index PRIVATE
+    "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene")
+
+jce_add_unit_test(test_jce_sr_metadata_key
+    SOURCES test_jce_sr_metadata_key.c)
+target_include_directories(test_jce_sr_metadata_key PRIVATE
+    "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene")
+
+jce_add_unit_test(test_jce_sr_occlusion_history
+    SOURCES test_jce_sr_occlusion_history.c)
+target_include_directories(test_jce_sr_occlusion_history PRIVATE
+    "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene")
+
+jce_add_unit_test(test_jce_scene_stress
+    SOURCES test_jce_scene_stress.c
+    LINK jce_core jce_scene jce_resource)
+
+jce_add_unit_test(test_jce_scene_component_epochs
+    SOURCES test_jce_scene_component_epochs.c
+    LINK jce_core jce_scene jce_resource)
+target_include_directories(test_jce_scene_component_epochs PRIVATE
+    "${PROJECT_SOURCE_DIR}/engine/src")
+
+jce_add_unit_test(test_jce_sr_anim_storage
+    SOURCES test_jce_sr_anim_storage.c
+        "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_anim_storage.c"
+    LINK jce_core)
+target_include_directories(test_jce_sr_anim_storage PRIVATE
+    "${PROJECT_SOURCE_DIR}/engine/src/middleware/scene"
+    "${PROJECT_SOURCE_DIR}/engine/src")

@@ -41,15 +41,21 @@ VISIBLE = [
     "tools/lint/jce-policy-probe.py", "tools/audit/jce-policy-probe.py",
     "tests/jce-policy-probe.c", "scripting/python/jce_script/__init__.py",
     "tools/jce-policy-package/__init__.py",
-    "examples/elemental_serenity/CMakeLists.txt",
-    "examples/elemental_serenity/src/main.c",
-    "examples/elemental_serenity/resources/assets/scenes/elemental_serenity.scene.json",
-    "examples/elemental_serenity/resources/assets/scripts/es_director.lua",
+    "tests/consumers/elemental_serenity/CMakeLists.txt",
+    "tests/consumers/elemental_serenity/src/main.c",
+    "tests/consumers/elemental_serenity/resources/assets/scenes/elemental_serenity.scene.json",
+    "tests/consumers/elemental_serenity/resources/assets/scripts/es_director.lua",
     "examples/caged_kingdom/CMakeLists.txt",
     "examples/caged_kingdom/src/game/_policy_probe.c",
     "examples/caged_kingdom/resources/assets/scenes/black_hole_lab.scene.json",
 ]
 IGNORED = [
+    "tests/consumers/minesweeper/build/jce-policy-probe.txt",
+    "tests/consumers/snake_seven/csharp/bin/jce-policy-probe.dll",
+    "tests/consumers/elemental_serenity/build/jce-policy-probe.c",
+    "tests/consumers/elemental_serenity/dist/jce-policy-probe.exe",
+    "tests/consumers/elemental_serenity/archive/legacy_ai_dispatch/jce-policy-probe.c",
+    "tests/consumers/elemental_serenity/resources/assets/models/imported-policy-probe.glb",
     "docs/jce-policy-probe.md", ".docs/way/jce-policy-probe.md",
     "scripts/android/local.properties", "tools/build/android/local.properties",
     "engine/src/renderer/internal/stb_image.h",
@@ -218,8 +224,8 @@ def self_check():
         git(root, "config", "core.autocrlf", "false")
         git(root, "config", "core.excludesFile", str(root / "no-global-ignore"))
         for name in (".gitattributes", ".gitignore",
-                     "examples/minesweeper/.gitignore",
-                     "examples/snake_seven/.gitignore",
+                     "tests/consumers/minesweeper/.gitignore",
+                     "tests/consumers/snake_seven/.gitignore",
                      "scripting/csharp/.gitignore"):
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_bytes((ROOT / name).read_bytes())

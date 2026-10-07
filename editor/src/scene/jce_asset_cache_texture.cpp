@@ -141,6 +141,19 @@ bool decode_texture_rgba_path(const char *path,
     return true;
 }
 
+/* Scene uploads use the same engine CPU decoder as Player. The RGBA helper
+ * above remains for pixel previews; it must not discard cooked mips for draws. */
+static JceTextureCpu *decode_texture_cpu_path(const char *path, int mode)
+{
+    size_t size = 0;
+    void *encoded = ed_read_file(path, &size);
+    if (!encoded) return nullptr;
+    JceTextureCpu *cpu = jce_texture_decode_cpu_mem(encoded, size, mode);
+    ED_FREE(encoded);
+    if (!cpu) LOG_WARN(LOG_TAG, "texture CPU decode failed: %s (%zu bytes)", path, size);
+    return cpu;
+}
+
 /* ── Texture async worker ───────────────────────────────────────── */
 
 /* Runs with the async mutex held.  LIFO — newest request first. */
@@ -168,6 +181,7 @@ static void texture_async_worker_main(void *arg)
         TextureLoadResult result = {};
         result.key = req.key;
         result.generation = req.generation;
+        const int mode = JCE_TEX_WRAP | (asset_cache_key_is_srgb(req.key.c_str()) ? JCE_TEX_SRGB : 0);
         if (req.resolve_path) {
             char resolved_path[512];
             const char *material_path = req.material_path.empty()
@@ -181,10 +195,8 @@ static void texture_async_worker_main(void *arg)
                 result.resolved_path = resolved_path;
                 if (!jce_fs_host_get_mtime(resolved_path, &result.resolved_mtime))
                     result.resolved_mtime = 0;
-                result.success = decode_texture_rgba_path(resolved_path,
-                                                          &result.rgba,
-                                                          &result.width,
-                                                          &result.height);
+                result.cpu.reset(decode_texture_cpu_path(resolved_path, mode));
+                result.success = result.cpu != nullptr;
             } else {
                 result.success = false;
             }
@@ -192,10 +204,8 @@ static void texture_async_worker_main(void *arg)
             result.resolved_path = req.file_path;
             if (!jce_fs_host_get_mtime(req.file_path.c_str(), &result.resolved_mtime))
                 result.resolved_mtime = 0;
-            result.success = decode_texture_rgba_path(req.file_path.c_str(),
-                                                      &result.rgba,
-                                                      &result.width,
-                                                      &result.height);
+            result.cpu.reset(decode_texture_cpu_path(req.file_path.c_str(), mode));
+            result.success = result.cpu != nullptr;
             if (!result.success) {
                 LOG_WARN(LOG_TAG, "texture async load FAILED: key='%s' file='%s'",
                          req.key.c_str(), req.file_path.c_str());
@@ -297,22 +307,13 @@ static AsyncFinalizeAction texture_finalize_result(TextureLoadResult &res,
 
     s_cache.tex_cache[idx].requested = false;
 
-    if (!res.success || res.rgba.empty() || res.width == 0 || res.height == 0) {
+    if (!res.success || !res.cpu) {
         s_cache.tex_cache[idx].failed = true;
         return ASYNC_FINALIZE_DROPPED;
     }
 
-    /* WRAP + mip chain: these are scene MATERIAL textures.  Terrain multiplies
-     * its UV by the layer tile scale, so a clamped sampler returns the edge
-     * texel for everything past the first tile -- which renders as horizontal
-     * streaks across the whole surface rather than as a tiled ground. */
-    /* The colour space, read back off the key that requested it -- one
-     * source, so the upload and the lookup cannot disagree. */
-    const int tex_mode = JCE_TEX_WRAP
-        | (asset_cache_key_is_srgb(res.key.c_str()) ? JCE_TEX_SRGB : 0);
-    JceTexture tex = jce_texture_from_rgba_ex(res.rgba.data(),
-                                              res.width, res.height,
-                                              tex_mode);
+    /* Consumes the complete decoded mip chain on the render thread. */
+    JceTexture tex = jce_texture_upload_cpu(res.cpu.release());
 
     if (!jce_texture_valid(tex)) {
         s_cache.tex_cache[idx].failed = true;

@@ -17,6 +17,9 @@ on:
 
 env:
   CONAN_HOME: ${{ github.workspace }}/.conan2
+  # Hosted runners may install declared native dependencies; local CLI defaults to check.
+  JCE_SYSTEM_PACKAGE_MODE: install
+  JCE_SYSTEM_PACKAGE_SUDO: "1"
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -32,15 +35,39 @@ concurrency:
 # -- an ABI break, a layering violation, a copyleft dependency, a README whose
 # numbers stopped being true.
 #
-# TIER 2 -- `build`, `unit-tests`, `sdk-consumer`, `cross-nightly` -- runs on
-# `schedule` and `workflow_dispatch` only.  Not because it matters less, but
-# because a full Conan graph (bgfx, Bullet, SDL3, HarfBuzz, CPython, .NET, a
-# JVM) is 20-40 minutes per matrix cell and this suite has NEVER run in CI
-# before: the honest expectation is that its first runs are red for reasons
-# that have nothing to do with the commit that triggered them.  Staging it
-# this way means tier 1 stays a signal people believe while tier 2 is being
-# made trustworthy.  Promote a tier-2 job by deleting its `if:` line.
+# Native desktop gates run for code changes on push/PR and always on
+# schedule/dispatch. Documentation-only changes retain the lint gate.
 jobs:
+  changes:
+    name: classify native changes
+    runs-on: ubuntu-latest
+    outputs:
+      native: ${{ steps.paths.outputs.native }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: paths
+        name: Detect code changes conservatively
+        shell: python
+        run: |
+          import json, os, subprocess
+          from pathlib import Path
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          name = os.environ["GITHUB_EVENT_NAME"]
+          base = event.get("pull_request", {}).get("base", {}).get("sha") if name == "pull_request" else event.get("before")
+          native = True
+          if name in ("push", "pull_request") and base and set(base) != {"0"}:
+              diff = subprocess.run(["git", "diff", "--name-only", "-z", base, "HEAD"], capture_output=True)
+              if diff.returncode == 0:
+                  paths = diff.stdout.decode("utf-8", errors="replace").split("\0")
+                  native = any(path and not (path.endswith(".md") or path.startswith(("docs/", ".docs/"))) for path in paths)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("native=" + str(native).lower() + "\n")
+
   # ---------------------------------------------------------------------------
   # Fast lint gate. Runs on every PR before any expensive build.
   # ---------------------------------------------------------------------------
@@ -129,15 +156,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # Desktop build matrix. Only runs after lint passes (implicit via needs).
   #
-  # Note: full builds require Conan + CMake presets + platform toolchains
-  # which are repo-specific. This stub configures + builds via the canonical
-  # scripts; uncomment per-OS steps as toolchains stabilize.
+  # Real SDK builds use the canonical driver on every desktop runner.
+  # Package caches are reusable; native build trees are not copied between jobs.
   # ---------------------------------------------------------------------------
   build:
     name: build ${{ matrix.os }}
-    # TIER 2 -- see the TIERS note above.  Delete this `if:` to promote it.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: lint
+    if: needs.changes.outputs.native == 'true'
+    needs: [lint, changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -153,27 +178,40 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Reuse Conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CONAN_HOME }}
+          key: conan-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('conanfile.py', 'conan.lock', 'conan/profiles/**') }}
+          restore-keys: conan-v1-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Conan
         run: |
           pip install --upgrade pip
-          pip install "conan>=2.0"
+          pip install "conan>=2.0" ninja
           conan profile detect --force
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
       - name: Build the public SDK
         run: python scripts/jce.py sdk --variant release --no-debug --profiling off --patented-codecs off
 
   # ---------------------------------------------------------------------------
   # SDK consumer closure — the stub-PAK regression guard.
-  # Builds the SDK (Track A producer) then builds Caged Kingdom AS AN SDK
-  # CONSUMER via scripts/jce.py (Track B), exactly like an external user.
-  # If the SDK stops shipping host tools, or CK stops using jce_add_pak(),
-  # the consumer build falls back to the 1-byte stub PAK and this job fails.
+  # The independent installed-SDK smoke consumer validates cooked embedded
+  # assets independently of user game sources. User projects own their
+  # consumer checks; the generic engine workflow has no project-specific paths.
   # Gated to main/dispatch until the toolchain is proven green on CI runners;
   # promote to a PR gate (drop the `if`) once stable.
   # See scripts/jce.py and contracts/source-layout.json
   # ---------------------------------------------------------------------------
   sdk-consumer:
-    name: sdk-consumer (build CK via SDK)
+    name: sdk-consumer (installed SDK + embedded assets)
     needs: lint
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
@@ -185,42 +223,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Reuse Conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CONAN_HOME }}
+          key: conan-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('conanfile.py', 'conan.lock', 'conan/profiles/**') }}
+          restore-keys: conan-v1-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Conan + Ninja
         run: |
           pip install --upgrade pip
           pip install "conan>=2.0" ninja
           conan profile detect --force
-      - name: Track A — build + install the SDK (ships host tools)
-        run: python scripts/jce.py sdk --arch x64 --variant release --no-debug
-      - name: Track B — build Caged Kingdom via the SDK (consumer)
-        run: python scripts/jce.py app examples/caged_kingdom --arch x64 --variant release
-      - name: Assert a REAL cooked PAK was embedded (not the stub)
-        shell: bash
-        run: |
-          B=examples/caged_kingdom/build/windows-x86_64-release
-          if [ -f "$B/jce_stub_pak.c" ]; then
-            echo "::error::CK fell back to the stub PAK — SDK consumer path is broken"; exit 1
-          fi
-          if [ ! -f "$B/CagedKingdom_assets.pak" ]; then
-            echo "::error::no CagedKingdom_assets.pak produced by jce_add_pak()"; exit 1
-          fi
-          echo "OK: real cooked PAK embedded via the SDK consumer path"
-
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build SDK and validate independent consumer + cooked assets
+        run: python scripts/jce.py sdk --arch x64 --variant release --no-debug --smoke
   # ---------------------------------------------------------------------------
   # Unit tests (Unity + CTest). Phase 1 hardening; covers L1-L2 first,
   # expands to L3+ as suites land under tests/.
   # ---------------------------------------------------------------------------
   unit-tests:
     name: unit-tests ${{ matrix.os }}
-    # TIER 2 -- see the TIERS note above.
-    #
-    # This job is NEW in substance even though it is old in this file: the root
-    # test suite was untracked until 2026-09-17, so `ctest -L unit` had nothing
-    # to discover and the job could not have meant anything.  It means
-    # something now, and it has correspondingly never actually run.  Delete
-    # this `if:` once it is green on its own.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: lint
+    if: needs.changes.outputs.native == 'true'
+    needs: [lint, changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -228,28 +259,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            profile: linux-x64
-            preset: linux-x64-debug
-            conan_out: build/desktop/linux-x64-conan
-            build_dir: build/desktop/linux-x64-debug
-            soft: false
+            arch: x64
           - os: windows-latest
-            profile: windows-x64
-            preset: windows-x64-debug
-            conan_out: build/desktop/windows-x64-conan
-            build_dir: build/desktop/windows-x64-debug
-            soft: false
-          # macOS stays SOFT while the hidapi/haptic divergence settles
-          # (conanfile.py:110-115 disables both there).  Soft means the
-          # platform is still compiled and still runs the suite; it just does
-          # not block a merge.  Windows and Linux DO block.
+            arch: x64
           - os: macos-latest
-            profile: macos-arm64
-            preset: macos-arm64-debug
-            conan_out: build/desktop/macos-arm64-conan
-            build_dir: build/desktop/macos-arm64-debug
-            soft: true
-    continue-on-error: ${{ matrix.soft }}
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -258,17 +272,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Ninja + MSVC needs the vcvars environment.  scripts/jce.py sets this up
-      # itself via vcvarsall for its own commands; CI configures CMake directly,
-      # so it has to do the same thing here.
+      # Supply the hosted runner's compiler environment. The shared driver
+      # also discovers the selected installation for Conan dependency builds.
       - name: MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Reuse Conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CONAN_HOME }}
+          key: conan-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('conanfile.py', 'conan.lock', 'conan/profiles/**') }}
+          restore-keys: conan-v1-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Conan + Ninja
         run: |
           pip install --upgrade pip
-          pip install "conan>=2.0" ninja
+          pip install "conan>=2.0" ninja Pillow numpy
           conan profile detect --force
 
       - uses: actions/setup-dotnet@v4
@@ -282,38 +302,8 @@ jobs:
         run: |
           python scripting/csharp/build_csharp.py
           python scripting/java/build_java.py
-      - name: Prepare owned Conan configuration and local recipes
-        run: python -c "import os,sys; sys.path.insert(0,'scripts'); import jce; jce.sync_conan_hooks(); jce.export_conan_recipes(dict(os.environ))"
-
-      # The Debug toolchain must land where the *-debug presets look for it:
-      # <conan_out>/build/Debug/generators/conan_toolchain.cmake.
-      # compiler.runtime_type is an MSVC-only setting; passing it to gcc/clang
-      # is an error, hence the branch.
-      - name: Conan install (Debug)
-        shell: bash
-        run: |
-          extra=""
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            extra="-s compiler.runtime_type=Debug"
-          fi
-          conan install . \
-            -pr:h conan/profiles/${{ matrix.profile }} \
-            -pr:b conan/profiles/${{ matrix.profile }} \
-            --output-folder ${{ matrix.conan_out }} \
-            --build=missing \
-            -s build_type=Debug $extra \
-            -c tools.system.package_manager:mode=install \
-            -c tools.system.package_manager:sudo=True
-
-      - name: Configure with tests ON
-        run: cmake --preset ${{ matrix.preset }} -DJCE_BUILD_TESTS=ON
-
-      # jce_tests is the dependency closure of the suite (tests/CMakeLists.txt).
-      # Building with no target would build the editor and every vendored codec.
-      - name: Build every registered test
-        run: cmake --build ${{ matrix.build_dir }} --target jce_tests
-
-      # No continue-on-error.  A failing assertion is a failing build; that is
-      # the entire point of this job existing.
-      - name: ctest -L unit
-        run: ctest --test-dir ${{ matrix.build_dir }} -L unit --output-on-failure
+      - name: Build and run Debug tests through the shared driver
+        run: python scripts/jce.py test --configure --variant debug --arch ${{ matrix.arch }} --jobs 2
+      - name: POSIX C99 declarations and negative control
+        if: runner.os == 'Linux'
+        run: python tests/os/platform/check_tcp_c99.py

@@ -106,7 +106,8 @@ void jce_yuv_plane_downsample(const uint8_t *src, uint32_t src_w, uint32_t src_h
 static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
                                 const uint8_t *u_plane, int u_stride,
                                 const uint8_t *v_plane, int v_stride,
-                                uint8_t *rgba, uint32_t width, uint32_t height)
+                                uint8_t *rgba, uint32_t width, uint32_t height,
+                                  const JceYuvCoefficients *k)
 {
     /*
      * _mm_madd_epi16([a0,b0,a1,b1,...], [c0,d0,c1,d1,...])
@@ -116,15 +117,15 @@ static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
      *               [Y',U'] with coeff [298,-100] for G (minus 208*V separately),
      *               [Y',U'] with coeff [298,516]  for B.
      */
-    const __m128i coeff_rv = _mm_set_epi16(409, 298, 409, 298,
-                                           409, 298, 409, 298);
-    const __m128i coeff_gu = _mm_set_epi16(-100, 298, -100, 298,
-                                           -100, 298, -100, 298);
-    const __m128i coeff_gv = _mm_set_epi16(0, 208, 0, 208,
-                                           0, 208, 0, 208);
-    const __m128i coeff_bu = _mm_set_epi16(516, 298, 516, 298,
-                                           516, 298, 516, 298);
-    const __m128i c_16     = _mm_set1_epi16(16);
+    const __m128i coeff_rv = _mm_set_epi16(k->rv, k->y, k->rv, k->y,
+                                           k->rv, k->y, k->rv, k->y);
+    const __m128i coeff_gu = _mm_set_epi16(-k->gu, k->y, -k->gu, k->y,
+                                           -k->gu, k->y, -k->gu, k->y);
+    const __m128i coeff_gv = _mm_set_epi16(0, k->gv, 0, k->gv,
+                                           0, k->gv, 0, k->gv);
+    const __m128i coeff_bu = _mm_set_epi16(k->bu, k->y, k->bu, k->y,
+                                           k->bu, k->y, k->bu, k->y);
+    const __m128i c_16     = _mm_set1_epi16((short)k->y_offset);
     const __m128i c_128w   = _mm_set1_epi16(128);
     const __m128i c_bias32 = _mm_set1_epi32(128);
     const __m128i c_zero   = _mm_setzero_si128();
@@ -146,9 +147,9 @@ static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
 
             /* Load 4 U/V bytes, widen, duplicate for chroma subsampling. */
             __m128i u4 = _mm_unpacklo_epi8(
-                _mm_cvtsi32_si128(*(const int *)(up + col / 2)), c_zero);
+                _mm_cvtsi32_si128((int)jce_yuv_chroma_word(up + col / 2)), c_zero);
             __m128i v4 = _mm_unpacklo_epi8(
-                _mm_cvtsi32_si128(*(const int *)(vp + col / 2)), c_zero);
+                _mm_cvtsi32_si128((int)jce_yuv_chroma_word(vp + col / 2)), c_zero);
             __m128i u16 = _mm_unpacklo_epi16(u4, u4); /* U0,U0,U1,U1,... */
             __m128i v16 = _mm_unpacklo_epi16(v4, v4);
 
@@ -211,13 +212,13 @@ static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
 
         /* Scalar tail for remaining pixels (0-7). */
         for (; col < width; ++col) {
-            int y = (int)yp[col] - 16;
+            int y = (int)yp[col] - k->y_offset;
             int u = (int)up[col / 2] - 128;
             int v = (int)vp[col / 2] - 128;
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
+            int c = y * k->y;
+            int r = (c + k->rv * v + 128) >> 8;
+            int g = (c - k->gu * u - k->gv * v + 128) >> 8;
+            int b = (c + k->bu * u + 128) >> 8;
             if (r < 0) r = 0; if (r > 255) r = 255;
             if (g < 0) g = 0; if (g > 255) g = 255;
             if (b < 0) b = 0; if (b > 255) b = 255;
@@ -239,15 +240,16 @@ static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
 static void yuv420_to_rgba_neon(const uint8_t *y_plane, int y_stride,
                                 const uint8_t *u_plane, int u_stride,
                                 const uint8_t *v_plane, int v_stride,
-                                uint8_t *rgba, uint32_t width, uint32_t height)
+                                uint8_t *rgba, uint32_t width, uint32_t height,
+                                  const JceYuvCoefficients *k)
 {
-    const int16x8_t c_16w  = vdupq_n_s16(16);
+    const int16x8_t c_16w  = vdupq_n_s16((int16_t)k->y_offset);
     const int16x8_t c_128w = vdupq_n_s16(128);
-    const int16x4_t k_298  = vdup_n_s16(298);
-    const int16x4_t k_409  = vdup_n_s16(409);
-    const int16x4_t k_100  = vdup_n_s16(100);
-    const int16x4_t k_208  = vdup_n_s16(208);
-    const int16x4_t k_516  = vdup_n_s16(516);
+    const int16x4_t k_298  = vdup_n_s16((int16_t)k->y);
+    const int16x4_t k_409  = vdup_n_s16((int16_t)k->rv);
+    const int16x4_t k_100  = vdup_n_s16((int16_t)k->gu);
+    const int16x4_t k_208  = vdup_n_s16((int16_t)k->gv);
+    const int16x4_t k_516  = vdup_n_s16((int16_t)k->bu);
     const int32x4_t c_bias = vdupq_n_s32(128);
 
     const uint32_t simd_w = width & ~7u; /* 8 pixels at a time */
@@ -261,8 +263,13 @@ static void yuv420_to_rgba_neon(const uint8_t *y_plane, int y_stride,
 
         for (; col < simd_w; col += 8) {
             uint8x8_t y_bytes = vld1_u8(yp + col);
-            uint8x8_t u_raw   = vld1_u8(up + col / 2);
-            uint8x8_t v_raw   = vld1_u8(vp + col / 2);
+            /* Eight luma pixels consume only FOUR chroma bytes. The last
+             * tight chroma row has no implicit decoder padding to read. */
+            uint8_t u_bytes[8] = {0}, v_bytes[8] = {0};
+            memcpy(u_bytes, up + col / 2, 4);
+            memcpy(v_bytes, vp + col / 2, 4);
+            uint8x8_t u_raw = vld1_u8(u_bytes);
+            uint8x8_t v_raw = vld1_u8(v_bytes);
 
             /* Duplicate chroma: U0,U0,U1,U1,U2,U2,U3,U3. */
             uint8x8x2_t u_zip = vzip_u8(u_raw, u_raw);
@@ -321,13 +328,13 @@ static void yuv420_to_rgba_neon(const uint8_t *y_plane, int y_stride,
 
         /* Scalar tail. */
         for (; col < width; ++col) {
-            int y = (int)yp[col] - 16;
+            int y = (int)yp[col] - k->y_offset;
             int u = (int)up[col / 2] - 128;
             int v = (int)vp[col / 2] - 128;
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
+            int c = y * k->y;
+            int r = (c + k->rv * v + 128) >> 8;
+            int g = (c - k->gu * u - k->gv * v + 128) >> 8;
+            int b = (c + k->bu * u + 128) >> 8;
             if (r < 0) r = 0; if (r > 255) r = 255;
             if (g < 0) g = 0; if (g > 255) g = 255;
             if (b < 0) b = 0; if (b > 255) b = 255;
@@ -345,7 +352,8 @@ static void yuv420_to_rgba_neon(const uint8_t *y_plane, int y_stride,
 static void yuv420_to_rgba_scalar(const uint8_t *y_plane, int y_stride,
                                   const uint8_t *u_plane, int u_stride,
                                   const uint8_t *v_plane, int v_stride,
-                                  uint8_t *rgba, uint32_t width, uint32_t height)
+                                  uint8_t *rgba, uint32_t width, uint32_t height,
+                                  const JceYuvCoefficients *k)
 {
     for (uint32_t row = 0; row < height; ++row) {
         const uint8_t *yp = y_plane + row * y_stride;
@@ -354,13 +362,13 @@ static void yuv420_to_rgba_scalar(const uint8_t *y_plane, int y_stride,
         uint8_t *dst = rgba + row * width * 4;
 
         for (uint32_t col = 0; col < width; ++col) {
-            int y = (int)yp[col] - 16;
+            int y = (int)yp[col] - k->y_offset;
             int u = (int)up[col / 2] - 128;
             int v = (int)vp[col / 2] - 128;
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
+            int c = y * k->y;
+            int r = (c + k->rv * v + 128) >> 8;
+            int g = (c - k->gu * u - k->gv * v + 128) >> 8;
+            int b = (c + k->bu * u + 128) >> 8;
             if (r < 0) r = 0; if (r > 255) r = 255;
             if (g < 0) g = 0; if (g > 255) g = 255;
             if (b < 0) b = 0; if (b > 255) b = 255;
@@ -387,30 +395,64 @@ void jce_yuv_set_avx2(int enabled)
 extern void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
                                     const uint8_t *u_plane, int u_stride,
                                     const uint8_t *v_plane, int v_stride,
-                                    uint8_t *rgba, uint32_t width, uint32_t height);
+                                    uint8_t *rgba, uint32_t width, uint32_t height,
+                                  const JceYuvCoefficients *k);
 #endif
+
+JceYuvColor jce_yuv_color_from_cicp(int matrix, bool full_range)
+{
+    JceYuvColor color = {JCE_YUV_BT601, full_range};
+    if (matrix == 1) color.matrix = JCE_YUV_BT709;
+    if (matrix == 9) color.matrix = JCE_YUV_BT2020_NCL;
+    return color;
+}
 
 void jce_yuv420_to_rgba(const uint8_t *y_plane, int y_stride,
                         const uint8_t *u_plane, int u_stride,
                         const uint8_t *v_plane, int v_stride,
                         uint8_t *rgba, uint32_t width, uint32_t height)
 {
+    const JceYuvColor color = {JCE_YUV_BT601, false};
+    jce_yuv420_to_rgba_color(y_plane, y_stride, u_plane, u_stride,
+                           v_plane, v_stride, rgba, width, height, color);
+}
+
+void jce_yuv420_to_rgba_color(const uint8_t *y_plane, int y_stride,
+                            const uint8_t *u_plane, int u_stride,
+                            const uint8_t *v_plane, int v_stride,
+                            uint8_t *rgba, uint32_t width, uint32_t height,
+                            JceYuvColor color)
+{
+    /* Nearest-rounded 8-bit coefficients from each matrix's Kr/Kb and
+     * signal ranges. One selection per frame, never per pixel. */
+    static const JceYuvCoefficients limited[] = {
+        {16, 298, 409, 100, 208, 516},
+        {16, 298, 459, 55, 136, 541},
+        {16, 298, 430, 48, 167, 548}
+    };
+    static const JceYuvCoefficients full[] = {
+        {0, 256, 359, 88, 183, 454},
+        {0, 256, 403, 48, 120, 475},
+        {0, 256, 377, 42, 146, 482}
+    };
+    unsigned matrix = (unsigned)color.matrix;
+    if (matrix > JCE_YUV_BT2020_NCL) matrix = JCE_YUV_BT601;
+    const JceYuvCoefficients *k = color.full_range ? &full[matrix] : &limited[matrix];
     if (!y_plane || !u_plane || !v_plane || !rgba || width == 0 || height == 0)
         return;
-
 #if JCE_YUV_HAS_SSE2
     if (s_yuv_use_avx2) {
         jce_yuv420_to_rgba_avx2(y_plane, y_stride, u_plane, u_stride,
-                                v_plane, v_stride, rgba, width, height);
+                              v_plane, v_stride, rgba, width, height, k);
         return;
     }
     yuv420_to_rgba_sse2(y_plane, y_stride, u_plane, u_stride,
-                        v_plane, v_stride, rgba, width, height);
+                      v_plane, v_stride, rgba, width, height, k);
 #elif JCE_YUV_HAS_NEON
     yuv420_to_rgba_neon(y_plane, y_stride, u_plane, u_stride,
-                        v_plane, v_stride, rgba, width, height);
+                      v_plane, v_stride, rgba, width, height, k);
 #else
     yuv420_to_rgba_scalar(y_plane, y_stride, u_plane, u_stride,
-                          v_plane, v_stride, rgba, width, height);
+                        v_plane, v_stride, rgba, width, height, k);
 #endif
 }

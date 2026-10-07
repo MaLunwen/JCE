@@ -230,3 +230,33 @@ Frame Debugger 新增「渲染目标」一节。引擎**拒绝列出这一帧没
 而面板的 include 块里往往已经有引擎的
 `<jce/renderer/jce_scene_renderer.h>`——它声明了 renderer 类型、
 **长得就像该有这个访问器**，但没有。看着像齐了，所以不会去查。
+
+D01 operation observations use jce_editor_operation_metrics and the existing
+main-thread phase accumulator. Inspector sync requests have generations;
+coalesced/invalidated requests are not successful draw completions. Explicit
+JCE_EDITOR_OPERATION_METRICS enables log observations. JCE_DBG_RENAME and
+JCE_DBG_REPARENT use source:target@frame (ROOT detaches); JCE_DBG_SCROLL uses
+entity@panel-frame and the existing reveal/clipper path. These maintenance
+controls measure programmatic operations, never physical input-to-display.
+Loaded entity count, flattened rows and display capacity remain distinct.
+
+Hierarchy rows/order/root arrays use demand-based transactional ED_MALLOC storage
+within a combined 64 MiB peak budget, including old/new arrays during growth. Existing ImGuiListClipper still submits only
+visible rows; allocation failure is visible and logged instead of a partial tree.
+Wide child queries use public count/query with the stack fast path retained for
+small nodes; shutdown frees panel storage before engine allocator shutdown.
+
+Default hierarchy flatten reuse is deliberately bounded to sort=0, empty search,
+no tag filter, and no streamed grouping. Stored rows contain only entity IDs,
+depths and group markers; row drawing reads current metadata. Key public scene
+structural/roster epochs, scene/context/storage identities, editor order revision,
+and local expansion/reveal state. Parent changes, append/remove and full scene
+replacement invalidate; arrow open-state transitions invalidate after drawing,
+matching the existing one-frame expand behavior. Storage growth/shutdown also
+invalidate. Other sort/filter/group modes rebuild every frame because mutable
+public EditorMeta fields do not universally publish an observable generation.
+JCE_DISABLE_HIERARCHY_CACHE=1 is a correctness A/B maintenance control. Logs
+under operation metrics report actual eligible/reused/row/root observations;
+rebuild phase timings count only executed rebuilds, not synthetic zero-cost work.
+
+Play without a CharacterController still owns pointer input when it uses an ordinary primary Camera; an active VirtualCamera is not required. Displayed image coordinates and deltas map to the actual render dimensions, including scaled captures.

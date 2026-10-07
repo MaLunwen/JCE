@@ -27,6 +27,7 @@
 #include "os/core/jce_memory.h"
 #include "os/platform/jce_window_internal.h"
 #include "jce_renderer_caps_internal.h"
+#include "jce_upload_metrics.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -35,14 +36,30 @@
 #include <stdio.h>
 #include <string.h>
 #include "jce_renderer_bgfx_callback.h"
+#include "jce_shader_deferred.h"
 
 #define LOG_TAG "jce_renderer"
 
-static uint32_t s_bgfx_frame_index = 0;
+/* One authoritative owner for the singleton bgfx device lifecycle. The
+ * borrowed upload target and generation share the existing frame owner;
+ * neither the decode workers nor Android frame worker mutates this bridge. */
+typedef struct JceRendererDeviceState {
+    uint32_t frame_index;
+    JceUploadMetricsBridge payload;
+    JceShaderDeferredState shader_deferred;
+} JceRendererDeviceState;
+static JceRendererDeviceState s_device;
+
+JceShaderDeferredState *jce_renderer_shader_deferred_state(void)
+{
+    return &s_device.shader_deferred;
+}
+
+
 
 /* Read by jce_renderer_bgfx_callback.c: the trace callback stamps each line
  * with the frame it belongs to, and the frame counter is the renderer's. */
-uint32_t jce_rcb_host_frame_index(void) { return s_bgfx_frame_index; }
+uint32_t jce_rcb_host_frame_index(void) { return s_device.frame_index; }
 
 #if JCE_PLATFORM_ANDROID
 /* ── Android bgfx-frame side thread ─────────────────────────────────────
@@ -78,7 +95,7 @@ static void android_bgfx_frame_thread(void *arg)
     while (SDL_GetAtomicInt(&s_frame_thread_live)) {
         jce_semaphore_wait(s_frame_req);
         if (!SDL_GetAtomicInt(&s_frame_thread_live)) break;
-        s_bgfx_frame_index = bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
+        s_device.frame_index = bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
         SDL_SetAtomicInt(&s_frame_done, 1);
     }
 }
@@ -153,6 +170,7 @@ bool jce_renderer_is_egl_hung(void) { return false; }
 #endif
 
 struct JceRenderer {
+    JceSubmittedPayloadStats submitted_payload;
     bool is_fallback;
     /* NullRHI: bgfx NOOP backend, no window (dedicated-server / headless).
      * Render entry points early-out like is_fallback so nothing is submitted,
@@ -431,6 +449,13 @@ static void apply_transient_limits(bgfx_init_t *init)
  * version stays unverified, and the backend is tried anyway. */
 static bool s_probe_gl_version(bgfx_renderer_type_t type)
 {
+#if JCE_PLATFORM_WEB
+    /* SDL Web has one canvas. A second hidden probe window reinitializes
+     * browser drop state and throws EEXIST instead of returning an SDL error.
+     * Verify the actual bgfx WebGL context after initialization instead. */
+    (void)type;
+    return true;
+#else
     const bool gles = (type == BGFX_RENDERER_TYPE_OPENGLES);
     const JceRendererBackend backend =
         gles ? JCE_BACKEND_OPENGLES : JCE_BACKEND_OPENGL;
@@ -526,6 +551,7 @@ static bool s_probe_gl_version(bgfx_renderer_type_t type)
     if (ctx) SDL_GL_DestroyContext(ctx);
     if (win) SDL_DestroyWindow(win);
     return ok;
+#endif /* single browser canvas / native probe window */
 }
 
 #if JCE_PLATFORM_WINDOWS
@@ -1274,6 +1300,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                  vis.idx, cnt.idx, ind.idx);
     }
 
+    jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
     return r;
 }
 
@@ -1365,6 +1392,7 @@ JceRenderer *jce_renderer_create_headless(void)
 
     SDL_strlcpy(r->gpu_name, "Null / Noop (headless)", sizeof(r->gpu_name));
     LOG_SUCCESS(LOG_TAG, "headless renderer initialized (NullRHI: bgfx NOOP, no window)");
+    jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
     return r;
 }
 
@@ -1426,6 +1454,8 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
         r->program_terrain,
     };
 
+    JceShaderHandle old_variant[JCE_SHADER_VARIANT_COUNT][JCE_SHADER_KEY_COUNT];
+    memcpy(old_variant, r->program_variant, sizeof old_variant);
     JceShaderSet ns = jce_shaders_load_all_fs(dev_dir, pak);
     if (!jce_shader_valid(ns.color)) {
         LOG_ERROR(LOG_TAG, "reload: color shader load failed, aborting swap");
@@ -1443,7 +1473,7 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
         };
         for (size_t i = 0; i < sizeof(parts)/sizeof(parts[0]); i++) {
             if (parts[i].idx != UINT16_MAX)
-                bgfx_destroy_program(parts[i]);
+                jce_shader_program_destroy((JceShaderHandle){ (parts[i]).idx });
         }
         return false;
     }
@@ -1452,7 +1482,17 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
 
     for (size_t i = 0; i < sizeof(old)/sizeof(old[0]); i++) {
         if (old[i].idx != UINT16_MAX)
-            bgfx_destroy_program(old[i]);
+            jce_shader_program_destroy((JceShaderHandle){ (old[i]).idx });
+    }
+    for (int v = 0; v < JCE_SHADER_VARIANT_COUNT; ++v) {
+        for (int k = 0; k < JCE_SHADER_KEY_COUNT; ++k) {
+            const uint16_t idx = old_variant[v][k].idx;
+            bool seen = false;
+            for (int previous = 0; previous < v * JCE_SHADER_KEY_COUNT + k; ++previous)
+                if (old_variant[previous / JCE_SHADER_KEY_COUNT][previous % JCE_SHADER_KEY_COUNT].idx == idx)
+                    seen = true;
+            if (!seen) jce_shader_program_destroy((JceShaderHandle){ idx });
+        }
     }
     LOG_INFO(LOG_TAG, "shaders reloaded (dev_dir=%s)", dev_dir ? dev_dir : "(none)");
     return true;
@@ -1653,6 +1693,7 @@ void jce_renderer_render_fallback_frame(const JceRenderer *r)
 void jce_renderer_destroy(JceRenderer *r)
 {
     if (!r) return;
+    jce_upload_metrics_unbind(&s_device.payload, &r->submitted_payload);
     /* Drain and join the PNG writer BEFORE anything else goes away: a capture
      * delivered on the last frame is still only pixels in a queue, and losing
      * it on exit would defeat every harness that reads the files back. */
@@ -1667,47 +1708,47 @@ void jce_renderer_destroy(JceRenderer *r)
     }
     s_dbg_text_enabled = false;
     if (r->program.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program).idx });
     if (r->program_textured.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_textured);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_textured).idx });
     if (r->u_tex_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_tex_color);
     if (r->program_mesh.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_mesh);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_mesh).idx });
     if (r->program_pbr.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr).idx });
     if (r->program_pbr_inst.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_inst);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst).idx });
     if (r->program_pbr_inst_tint.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_inst_tint);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_tint).idx });
     if (r->program_pbr_inst_tex_array.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_inst_tex_array);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_tex_array).idx });
     if (r->program_pbr_inst_fade.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_inst_fade);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_fade).idx });
     if (r->program_pbr_skinned.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_skinned);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_skinned).idx });
     if (r->program_pbr_fwdplus.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_fwdplus);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_fwdplus).idx });
     if (r->program_pbr_inst_fwdplus.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_inst_fwdplus);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_fwdplus).idx });
     if (r->program_pbr_skinned_fwdplus.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_skinned_fwdplus);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_skinned_fwdplus).idx });
     if (r->program_shadow.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_shadow);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow).idx });
     if (r->program_shadow_inst.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_shadow_inst);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow_inst).idx });
     if (r->program_shadow_skinned.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_shadow_skinned);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow_skinned).idx });
     if (r->program_terrain.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_terrain);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_terrain).idx });
     /* Toon/outline stylized programs were sentinel-init'd + created but never
      * destroyed — a small handle leak left for bgfx_shutdown to sweep.  They
      * are distinct shader-set handles (not aliases), so destroy them here with
      * the rest of the renderer's own programs. */
     if (r->program_pbr_toon.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_pbr_toon);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_toon).idx });
     if (r->program_outline_skinned.idx != UINT16_MAX)
-        bgfx_destroy_program(r->program_outline_skinned);
+        jce_shader_program_destroy((JceShaderHandle){ (r->program_outline_skinned).idx });
     if (r->u_light_dir.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_dir);
     if (r->u_light_color.idx != UINT16_MAX)
@@ -1743,6 +1784,7 @@ void jce_renderer_destroy(JceRenderer *r)
                      (unsigned)st->numUniforms, (unsigned)st->numOcclusionQueries);
     }
 
+    jce_shader_deferred_shutdown();
     bgfx_shutdown();
     /* After bgfx is down: it never deletes a context it did not create, so
      * the ladder's context is ours to release and only now is it unused. */
@@ -1876,7 +1918,7 @@ void jce_renderer_present_splash(const JceRenderer *r,
                         rgba_color, 1.0f, 0);
     bgfx_set_view_rect(0, 0, 0, (uint16_t)w, (uint16_t)h);
     bgfx_touch(0);
-    s_bgfx_frame_index = bgfx_frame(false);
+    s_device.frame_index = bgfx_frame(false);
 }
 
 void jce_renderer_end_frame(const JceRenderer *r)
@@ -1952,7 +1994,7 @@ void jce_renderer_end_frame(const JceRenderer *r)
             }
         }
         if (s_cap_frame >= 0 && !s_cap_done &&
-            s_bgfx_frame_index >= (uint32_t)s_cap_frame) {
+            s_device.frame_index >= (uint32_t)s_cap_frame) {
             /* THE HOST FIRST, THE BACKBUFFER OTHERWISE.
              *
              * jce_renderer_request_screenshot photographs the BACKBUFFER,
@@ -2029,13 +2071,13 @@ void jce_renderer_end_frame(const JceRenderer *r)
             const char *v = getenv("JCE_PERF_LOG");
             s_perf_log = (v && v[0] && v[0] != '0') ? 1 : 0;
         }
-        if (s_perf_log && (s_bgfx_frame_index % 120u) == 0u && s_xform_peak > 0)
+        if (s_perf_log && (s_device.frame_index % 120u) == 0u && s_xform_peak > 0)
             LOG_INFO(LOG_TAG, "perf-xform: peak %u matrices/frame (cache cap %u)",
                      s_xform_peak, k_matrix_cache_cap);
         jce_dbg_xform_matrices = 0;
     }
 
-    s_bgfx_frame_index = bgfx_frame(false);
+    s_device.frame_index = bgfx_frame(false);
 
     /* Surface allocator + renderer stats to Tracy each frame. */
 #if defined(JCE_PROFILER_ENABLED)
@@ -2049,7 +2091,12 @@ void jce_renderer_end_frame(const JceRenderer *r)
         const bgfx_stats_t *st = bgfx_get_stats();
         if (st) {
             JCE_PROFILE_PLOT_I("render.draw_calls",  (int64_t)st->numDraw);
-            JCE_PROFILE_PLOT_I("render.num_prims",   (int64_t)st->numPrims);
+            /* Backend-reported direct primitives, not pre-occlusion submits
+             * or an exact count of GPU indirect argument contents. */
+            uint64_t reported_primitives = 0;
+            for (unsigned topology = 0; topology < BGFX_TOPOLOGY_COUNT; ++topology)
+                reported_primitives += st->numPrims[topology];
+            JCE_PROFILE_PLOT_I("render.reported_primitives", (int64_t)reported_primitives);
             JCE_PROFILE_PLOT_I("render.textures",    (int64_t)st->numTextures);
             JCE_PROFILE_PLOT_I("render.gpu_mem_mb",  (int64_t)(st->gpuMemoryUsed >> 20));
         }
@@ -2155,7 +2202,7 @@ const bgfx_vertex_layout_t *jce_renderer_get_layout_textured(const JceRenderer *
 bgfx_program_handle_t jce_renderer_get_program_text_sdf(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_text_sdf : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_text_sdf.idx) } : invalid;
 }
 
 JceUniformHandle jce_renderer_get_sdf_params_uniform(const JceRenderer *r)
@@ -2189,7 +2236,7 @@ JceUniformHandle jce_renderer_get_sdf_shadow_color_uniform(const JceRenderer *r)
 bgfx_program_handle_t jce_renderer_get_program_textured(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_textured : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_textured.idx) } : invalid;
 }
 
 JceUniformHandle jce_renderer_get_tex_uniform(const JceRenderer *r)
@@ -2307,7 +2354,7 @@ JceShaderHandle jce_renderer_create_program_from_blobs(
 void jce_renderer_destroy_program(JceShaderHandle prog)
 {
     if (prog.idx == UINT16_MAX) return;
-    bgfx_destroy_program((bgfx_program_handle_t){ prog.idx });
+    jce_shader_program_destroy((JceShaderHandle){ ((bgfx_program_handle_t){ prog.idx }).idx });
 }
 
 JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
@@ -2449,31 +2496,31 @@ JceShaderHandle jce_renderer_get_program_terrain(const JceRenderer *r)
 bgfx_program_handle_t jce_renderer_get_bgfx_program_terrain(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_terrain : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_terrain.idx) } : invalid;
 }
 
 bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_pbr : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_pbr.idx) } : invalid;
 }
 
 bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr_skinned(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_pbr_skinned : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_pbr_skinned.idx) } : invalid;
 }
 
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_shadow : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_shadow.idx) } : invalid;
 }
 
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow_skinned(const JceRenderer *r)
 {
     bgfx_program_handle_t invalid = { UINT16_MAX };
-    return r ? r->program_shadow_skinned : invalid;
+    return r ? (bgfx_program_handle_t){ jce_shader_deferred_resolve(r->program_shadow_skinned.idx) } : invalid;
 }
 
 bgfx_uniform_handle_t jce_renderer_get_light_dir_uniform(const JceRenderer *r)
@@ -2629,5 +2676,22 @@ bool jce_renderer_origin_bottom_left(void)
 uint32_t jce_renderer_get_frame_index(const JceRenderer *r)
 {
     (void)r;
-    return s_bgfx_frame_index;
+    return s_device.frame_index;
+}
+
+bool jce_renderer_get_submitted_payload_stats(const JceRenderer *r,
+    JceSubmittedPayloadStats *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!r || !r->submitted_payload.valid) return false;
+    *out = r->submitted_payload;
+    out->frame_index = jce_renderer_get_frame_index(r);
+    return true;
+}
+
+void jce_upload_metrics_record(JceUploadPayloadKind kind, uint64_t bytes,
+    bool admitted)
+{
+    jce_upload_metrics_add(s_device.payload.active, kind, bytes, admitted);
 }

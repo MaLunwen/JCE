@@ -808,6 +808,25 @@ typedef struct JceScriptHost {
                          const float dir[3], float max_dist,
                          uint32_t layer_mask, bool hit_triggers,
                          JceScriptEntity *out, int max);
+    /* Viewport-local pointer x/y and viewport width/height, in logical pixels.
+     * Zero dimensions mean unavailable or input owned by another viewport.
+     * Main-thread, borrowed frame sample; appended for sized-host compatibility. */
+    void (*pointer_position)(void *user, float out_xywh[4]);
+    /* Host-owned cursor from a raw/cooked RGBA image asset. Main-thread only;
+     * hotspot uses image pixels. NULL/empty resets to the platform default.
+     * Up to eight distinct assets/hotspots are cached until scene teardown;
+     * images are limited to 64x64 and failures leave the prior cursor intact.
+     * APPENDED: modules must call this host seam rather than their own SDL. */
+    bool (*cursor_set)(void *user, const char *asset_path, int hotspot_x, int hotspot_y);
+    /* APPENDED optional services. Values/fallbacks enter as double for checked
+     * signed32 admission; invalid fallback or absent host returns 0. A runtime
+     * without service returns a valid fallback. Available declares callbacks,
+     * not I/O success. Quit only latches a request, never destroys the VM. */
+    bool (*request_quit)(void *user);
+    bool (*stat_available)(void *user);
+    bool (*stat_set)(void *user, const char *id, double value);
+    int (*stat_get)(void *user, const char *id, double fallback);
+    bool (*stat_flush)(void *user);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;

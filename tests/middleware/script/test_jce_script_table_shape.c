@@ -15,7 +15,7 @@
  * that generated the bindings proves only that the generator agrees with
  * itself, which is exactly the self-consistency spec 4.4 warns about.
  *
- * 110 entries: 101 generated functions + 8 hand-written functions + json_null.
+ * 117 entries: 108 generated functions + 8 hand-written functions + json_null.
  * This line said 81 long after the list below said 105 -- prose beside a
  * golden list is the one part of the file nothing checks, so re-derive it
  * from the list rather than trusting it.
@@ -48,7 +48,7 @@ void setUp(void)    { g_keys[0] = '\0'; }
 void tearDown(void) {}
 
 static const char *const K_EXPECTED =
-    "110\n"
+    "117\n"
     "anim_set_bool:function\n"
     "anim_set_float:function\n"
     "anim_set_int:function\n"
@@ -79,6 +79,7 @@ static const char *const K_EXPECTED =
     "get_param_text:function\n"
     "get_parent:function\n"
     "get_pointer_delta:function\n"
+    "get_pointer_position:function\n"
     "get_pointer_wheel:function\n"
     "get_position:function\n"
     "get_rotation:function\n"
@@ -118,11 +119,13 @@ static const char *const K_EXPECTED =
     "raycast_filtered:function\n"
     "render_get:function\n"
     "render_set:function\n"
+    "request_quit:function\n"
     "request_scene:function\n"
     "rpc_send:function\n"
     "save_game:function\n"
     "send_message:function\n"
     "set_component_enabled:function\n"
+    "set_cursor:function\n"
     "set_locale:function\n"
     "set_parent:function\n"
     "set_position:function\n"
@@ -134,6 +137,10 @@ static const char *const K_EXPECTED =
     "spawn:function\n"
     "sprint:function\n"
     "start_coroutine:function\n"
+    "stat_available:function\n"
+    "stat_flush:function\n"
+    "stat_get:function\n"
+    "stat_set:function\n"
     "stop_coroutine:function\n"
     "tr:function\n"
     "ui_get_dropdown:function\n"

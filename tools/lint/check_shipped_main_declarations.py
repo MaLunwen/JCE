@@ -53,6 +53,12 @@ INCLUDE_RE = re.compile(r'^\s*#\s*include\s*<\s*(jce/[^>]+)\s*>', re.M)
 # a declaration is `... name(` too, so declarations are excluded by only ever
 # scanning the shipped main, which declares nothing named jce_*.
 CALL_RE = re.compile(r'\b(jce_[A-Za-z0-9_]+)\s*\(')
+OWN_RE = re.compile(r'^\s*(?:static|JCE_INLINE)\s+[^;()]*?\b(jce_[A-Za-z0-9_]+)\s*\(', re.M)
+
+
+def defined_functions(source: str) -> set[str]:
+    """JCE_INLINE expands to static inline; bare calls never declare names."""
+    return set(OWN_RE.findall(strip_comments_and_strings(source)))
 
 # Anything that DECLARES the name in a header: a prototype, a macro, a function
 # pointer typedef member, or an enum/struct tag.  Broad on purpose -- this gate
@@ -140,10 +146,9 @@ def main() -> int:
 
     # ...but it does DEFINE some of what it calls -- six jce_default_* statics.
     # A definition counts as a declaration; a call does not, and that
-    # distinction is the whole gate.  So match `static <type> name(` only,
+    # distinction is the whole gate. Match static and the SDK's JCE_INLINE,
     # never a bare `name(` -- the defect this was written for was a bare call.
-    own = set(re.findall(
-        r'^\s*static\s+[^;()]*?\b(jce_[A-Za-z0-9_]+)\s*\(', src, re.M))
+    own = defined_functions(src)
 
     problems = []
     for rel in missing:

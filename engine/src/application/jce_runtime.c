@@ -580,10 +580,10 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 		if (ref.inst &&
 		    (rt->script_count < rt->script_cap || rt_grow_scripts(rt))) {
 			struct ScriptEntry *se = &rt->scripts[rt->script_count++];
+			memset(se, 0, sizeof *se);
 			se->entity = e;
 			se->ref    = ref;
 			se->active = true;
-			se->simlod_accum     = 0.0f;   /* sim-LOD cadence state */
 			se->simlod_prev_tier = -1;
 			snprintf(se->script_path, sizeof se->script_path, "%s",
 			         sc->script_path);
@@ -2293,28 +2293,6 @@ static void rt_ragdoll_sync_to(JceRuntime *rt)
 	}
 }
 
-/* Snapshot the post-step physics pose of every dynamic body into the
- * interpolation history (prev <- cur, cur <- live pose).  Called once per
- * executed fixed tick so prev/cur bracket exactly one fixed_dt of motion. */
-static void rt_capture_fixed_pose(JceRuntime *rt)
-{
-	if (!rt->physics) return;
-	for (int i = 0; i < rt->body_count; ++i) {
-		if (rt->bodies[i].kind == (uint8_t)JCE_BODY_STATIC) continue;
-		BodyEntry *be = &rt->bodies[i];
-		be->prev_pos = be->cur_pos;
-		be->prev_rot = be->cur_rot;
-		jce_physics_body_get_transform(rt->physics, be->body,
-		                               &be->cur_pos, &be->cur_rot);
-	}
-	/* Same fixed-tick history for the character so it renders smoothly. */
-	if (jce_character_valid(rt->character) && rt->character_entity != 0) {
-		rt->char_prev_pos = rt->char_cur_pos;
-		jce_physics_character_get_position(rt->physics, rt->character,
-		                                   &rt->char_cur_pos);
-	}
-}
-
 /* Write each dynamic body's render pose into its scene Transform.  When
  * interpolation history is available (have_prev) the pose is the blend of
  * the last two fixed ticks by `alpha` (residual accumulator / fixed_dt),
@@ -3691,6 +3669,8 @@ static void rt_teardown_scene_state(JceRuntime *rt, bool destroying)
 		rt->predict_buf = NULL;
 	}
 	rt->predict_entity = 0;
+    rt_script_clear_cursors(rt);
+
 }
 
 /* Materialise every per-scene subsystem from rt->scene's authored contents.
@@ -3977,15 +3957,15 @@ static bool rt_select_locale_asset(const JceRuntimeDesc *desc, char out[32])
 	}
 	return false;
 }
-
-JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
+JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_platform_services(
+    const JceRuntimeDesc *desc, struct JcePlatformServices *services)
 {
 	if (!desc || !desc->scene) return NULL;
-
 	JceRuntime *rt = (JceRuntime *)jce_malloc(sizeof *rt);
 	if (!rt) return NULL;
 	memset(rt, 0, sizeof *rt);
 
+	rt->platform_services = services;
 	rt->scene             = desc->scene;
 	rt->pak               = desc->pak;
 	rt->audio             = desc->audio;
@@ -4520,7 +4500,10 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 
 		/* Apply external (editor/script) TRS edits once before stepping so
 		 * teleports land on the upcoming fixed ticks. */
+		uint64_t _pose_t0 = jce_time_perf_counter();
 		rt_push_external_transforms(rt);
+		jce_perf_phase_add("physics_external", jce_time_perf_to_ms(_pose_t0, jce_time_perf_counter()));
+		_pose_t0 = jce_time_perf_counter();
 
 		for (uint32_t s = 0; s < steps; ++s) {
 			/* Client->server input command channel (F12 slice): a CLIENT
@@ -4693,12 +4676,16 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 			rt->have_prev = true;
 		}
 
+		jce_perf_phase_add("physics_fixed", jce_time_perf_to_ms(_pose_t0, jce_time_perf_counter()));
+		_pose_t0 = jce_time_perf_counter();
+
 		/* Blend the last two fixed poses by the residual accumulator so the
 		 * rendered transform is smooth even when steps==0 this frame. */
 		rt_sync_transforms(rt, (float)rt->clock.alpha);
 		/* 2D bodies aren't interpolated — write the latest Box2D pose. */
 		if (rt->physics2d && steps > 0)
 			rt_sync_transforms2d(rt);
+		jce_perf_phase_add("physics_sync", jce_time_perf_to_ms(_pose_t0, jce_time_perf_counter()));
 	} else if (jce_session_mode() != JCE_SESSION_MODE_NONE) {
 		/* No physics world → no fixed loop above advances rt->clock, so tick
 		 * it once per frame (the existing "one net tick per frame" cadence)

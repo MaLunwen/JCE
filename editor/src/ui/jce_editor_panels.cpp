@@ -319,6 +319,7 @@ void jce_editor_panels_init(void)
 
 void jce_editor_panels_shutdown(void)
 {
+    jce_hierarchy_storage_shutdown();
     jce_file_viewer_shutdown();
 }
 

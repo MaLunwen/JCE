@@ -722,6 +722,21 @@ static void mock_pointer_delta(void *user, float out_xy[2])
     out_xy[1] = (float)(h + 1u) + 0.25f;
 }
 
+static void mock_pointer_position(void *user, float out_xywh[4])
+{
+    char line[1024];
+    unsigned h = mock_hash("pointer_position");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL pointer_position()");
+    mock_emit(line);
+    out_xywh[0] = (float)(h + 0u) + 0.25f;
+    out_xywh[1] = (float)(h + 1u) + 0.25f;
+    out_xywh[2] = (float)(h + 2u) + 0.25f;
+    out_xywh[3] = (float)(h + 3u) + 0.25f;
+}
+
 static float mock_pointer_wheel(void *user)
 {
     char line[1024];
@@ -1583,6 +1598,81 @@ static int mock_vcam_activate(void *user, const char * name)
     return (g_mode == JCE_MOCK_MODE_MISS) ? -3 : (int)h;
 }
 
+static bool mock_cursor_set(void *user, const char * asset_path, int hotspot_x, int hotspot_y)
+{
+    char line[1024];
+    unsigned h = mock_hash("cursor_set");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL cursor_set(asset_path=%s, hotspot_x=%d, hotspot_y=%d)",
+             mock_str(asset_path), (int)hotspot_x, (int)hotspot_y);
+    mock_emit(line);
+    return g_mode != JCE_MOCK_MODE_MISS;
+}
+
+static bool mock_request_quit(void *user)
+{
+    char line[1024];
+    unsigned h = mock_hash("request_quit");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL request_quit()");
+    mock_emit(line);
+    return g_mode != JCE_MOCK_MODE_MISS;
+}
+
+static bool mock_stat_available(void *user)
+{
+    char line[1024];
+    unsigned h = mock_hash("stat_available");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL stat_available()");
+    mock_emit(line);
+    return g_mode != JCE_MOCK_MODE_MISS;
+}
+
+static bool mock_stat_set(void *user, const char * id, double value)
+{
+    char line[1024];
+    unsigned h = mock_hash("stat_set");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL stat_set(id=%s, value=%.9g)",
+             mock_str(id), (double)value);
+    mock_emit(line);
+    return g_mode != JCE_MOCK_MODE_MISS;
+}
+
+static int mock_stat_get(void *user, const char * id, double fallback)
+{
+    char line[1024];
+    unsigned h = mock_hash("stat_get");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL stat_get(id=%s, fallback=%.9g)",
+             mock_str(id), (double)fallback);
+    mock_emit(line);
+    return (g_mode == JCE_MOCK_MODE_MISS) ? -3 : (int)h;
+}
+
+static bool mock_stat_flush(void *user)
+{
+    char line[1024];
+    unsigned h = mock_hash("stat_flush");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL stat_flush()");
+    mock_emit(line);
+    return g_mode != JCE_MOCK_MODE_MISS;
+}
+
 static void mock_json_free(void *user, char *s)
 {
     char line[1024];
@@ -1643,6 +1733,7 @@ JCE_MOCK_EXPORT const JceScriptHost *jce_mock_host(int mode)
     g_host.action_pressed = mock_action_pressed;
     g_host.action_axis = mock_action_axis;
     g_host.pointer_delta = mock_pointer_delta;
+    g_host.pointer_position = mock_pointer_position;
     g_host.pointer_wheel = mock_pointer_wheel;
     g_host.pointer_button = mock_pointer_button;
     g_host.touch_count = mock_touch_count;
@@ -1705,6 +1796,12 @@ JCE_MOCK_EXPORT const JceScriptHost *jce_mock_host(int mode)
     g_host.get_script_param_text = mock_get_script_param_text;
     g_host.curve_eval = mock_curve_eval;
     g_host.vcam_activate = mock_vcam_activate;
+    g_host.cursor_set = mock_cursor_set;
+    g_host.request_quit = mock_request_quit;
+    g_host.stat_available = mock_stat_available;
+    g_host.stat_set = mock_stat_set;
+    g_host.stat_get = mock_stat_get;
+    g_host.stat_flush = mock_stat_flush;
     g_host.json_free = mock_json_free;
     if (mode == JCE_MOCK_MODE_NORELEASE) {
         g_host.json_free = NULL;

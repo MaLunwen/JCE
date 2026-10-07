@@ -7,6 +7,9 @@
 - **Unity** (ThrowTheSwitch, MIT) — 固定来源见 `contracts/vendor-sources.json`，由外部只读源码缓存提供，用于引擎 C99 测试。
 - **doctest** (v2.4.11, MIT) — 同样使用固定来源的外部源码缓存，用于编辑器 C++17 测试。每个 `.cpp` 在包含前 `#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`。
 - 由顶层选项 `JCE_BUILD_TESTS=ON` 开启；通过 CTest 注册，CI 跑 `ctest --output-on-failure`。
+- `os/platform/check_tcp_c99.py` uses a real Linux compiler and an unmodified
+  adapter plus a temporary negative control to verify strict C99 declarations.
+  Temporary compiler inputs stay under build/tests; other hosts report skipped.
 - C 测试用 helper `jce_add_unit_test()`；C++17 测试用 `jce_add_cxx_test()`（含 `editor/src` include + MSVC `/wd4267 /wd4244`）。
 
 ## 目录约定（镜像 `engine/src/` 拓扑）
@@ -53,6 +56,10 @@ tests/
 - 测试 **不能** include SDL/bgfx/ImGui/flecs 等三方头 —— 只能 `<jce/...>` 公共 API
 - 不允许 `malloc/free/fopen/printf` —— 用 `JCE_MALLOC/FREE`、`jce_fs_host_*`、`jce_log_*`
 - 单测必须可在单核 / 512 MB 机器跑通（CI 基线）
+- The model texture-pool test compiles its first-party private ownership module
+  directly with counted texture stubs. It verifies shared staging, distinct
+  color/sampler modes, cancellation, failed uploads and one-time destruction
+  without creating a graphics device or including upstream headers.
 - 每个 test 文件一个 `main()` + 一个 `add_test()`，便于 ctest 按需筛选
 
 ## 跨平台
@@ -112,6 +119,11 @@ python tools\lint\run_all.py    # 7 lints, all must pass
 
 ### Streaming media regression
 
+`test_jce_runtime_script_cost` checks new script instances through the public
+runtime API before the first update: no inherited measurements, zero calls and
+zero costs with profiling disabled. Debug allocator contents must not affect
+the measurement inventory, attribution or reset behavior.
+
 `test_jce_read_source` covers >2 GiB offsets, bounded reads, shared ownership,
 short/truncated callbacks and file/memory sources. `test_jce_audio_file` covers
 real PCM counts, asynchronous seek/EOF, background peaks and close cancellation.
@@ -139,3 +151,24 @@ unit tests verify all output/final PTS, paused start, seek fencing and rewind
 without a user asset, GPU window, ffmpeg installation or sound device. The
 old EOS path returned only 87 pictures. CTTS unit vectors cover unsigned and
 signed offsets, reordering and malformed run counts/payloads.
+
+## Explicit real-font shaping oracle
+`renderer/test_jce_text_real_font.c` is headless internal-module verification.
+`JCE_TEST_REAL_FONT` supplies an existing real font file read-only; missing
+input is explicitly ignored, not a verified shaping PASS. No font bytes are
+redistributed. Archive the supplied font hash with execution evidence. The
+oracle checks Arabic contextual glyph substitution against nominal mapping,
+RTL cluster direction, Latin order, nonzero advances and an independent
+HarfBuzz reference, separately from Canvas screenshot review.
+
+
+## Installed-SDK consumer regressions
+
+`tests/consumers/<project>/` owns complete public-SDK regression applications,
+their project-specific fixtures and tools. It is distinct from native unit
+fixtures that may exercise internal contracts. Consumer applications do not
+include engine/src or original third-party headers. The benchmark consumer
+uses public engine counters and repeatable rendering probes; it does not own
+an alternative runtime or renderer. Examples publish single-file Bundles and
+provenance separately from these reproduction sources. Generate outputs under
+ignored build directories and reuse compatible SDK/build caches.

@@ -1,0 +1,8 @@
+{
+  "schema": 3,
+  "name": "JCE Benchmark",
+  "version": "0.1.0",
+  "target": "JceBenchmark",
+  "exe": "jce_benchmark.exe",
+  "source_assets": "resources"
+}

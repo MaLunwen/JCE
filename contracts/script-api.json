@@ -3,12 +3,12 @@
   "_generated_by": "python tools/scriptgen/gen_script_bindings.py --write",
   "_note": "vtable_index is emitted for traceability only. No binding may key off it: the append-only rule plus the min(caller, engine) copy over a zeroed destination is what makes a short host safe, and a slot-indexed binding would defeat it.",
   "declared_totals": {
-    "host_members": 105,
-    "expose": 101,
+    "host_members": 112,
+    "expose": 108,
     "hand_written": 8,
     "constants": 1,
-    "table_keys": 110,
-    "members_reached_by_generated": 100,
+    "table_keys": 117,
+    "members_reached_by_generated": 107,
     "members_reached_only_by_hand_written": 5
   },
   "constants": [
@@ -1034,6 +1034,24 @@
           "name": "out_xy",
           "c_type": "float",
           "arity": 2
+        }
+      ],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_pointer_position",
+      "vtable": "pointer_position",
+      "shape": "void_out_array",
+      "since": 1,
+      "doc": "Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.",
+      "vtable_index": 105,
+      "c_signature": "void (*)(void *user, float out_xywh[4])",
+      "params": [],
+      "out_params": [
+        {
+          "name": "out_xywh",
+          "c_type": "float",
+          "arity": 4
         }
       ],
       "nullable_host_member": true
@@ -2417,6 +2435,114 @@
           "role": "in"
         }
       ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "set_cursor",
+      "vtable": "cursor_set",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Host-owned raw/cooked cursor asset, maximum 64x64 pixels; empty path resets. Main-thread; false on decode/platform/cache failure.",
+      "vtable_index": 106,
+      "c_signature": "bool (*)(void *user, const char * asset_path, int hotspot_x, int hotspot_y)",
+      "params": [
+        {
+          "name": "asset_path",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "hotspot_x",
+          "c_type": "int",
+          "role": "in"
+        },
+        {
+          "name": "hotspot_y",
+          "c_type": "int",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "request_quit",
+      "vtable": "request_quit",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 107,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "stat_available",
+      "vtable": "stat_available",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 108,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "stat_set",
+      "vtable": "stat_set",
+      "shape": "value_return",
+      "since": 1,
+      "doc": "Store signed32 statistic through an explicitly borrowed platform service. Nonfinite, fractional or out-of-range values return false; successful set does not imply durable flush.",
+      "vtable_index": 109,
+      "c_signature": "bool (*)(void *user, const char * id, double value)",
+      "params": [
+        {
+          "name": "id",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "value",
+          "c_type": "double",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "stat_get",
+      "vtable": "stat_get",
+      "shape": "value_return",
+      "since": 1,
+      "absent_value": 0,
+      "doc": "Signed32 statistic; fallback must be finite, integral and in range, otherwise returns 0. An absent host returns 0; a configured runtime with unavailable service returns the valid fallback.",
+      "vtable_index": 110,
+      "c_signature": "int (*)(void *user, const char * id, double fallback)",
+      "params": [
+        {
+          "name": "id",
+          "c_type": "const char *",
+          "role": "in"
+        },
+        {
+          "name": "fallback",
+          "c_type": "double",
+          "role": "in"
+        }
+      ],
+      "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "stat_flush",
+      "vtable": "stat_flush",
+      "shape": "value_return",
+      "since": 1,
+      "vtable_index": 111,
+      "c_signature": "bool (*)(void *user)",
+      "params": [],
       "out_params": [],
       "nullable_host_member": true
     }

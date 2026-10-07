@@ -9,6 +9,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_video_color.h"
 
 #include <string.h>
 #include <vpx/vp8dx.h>
@@ -29,6 +30,14 @@ struct JceVp8Decoder {
     /* Iterator for vpx_codec_get_frame after a vpx_codec_decode call. */
     const vpx_image_t *last_img;
 };
+
+JceYuvColor jce_vp8_decoder_color(const JceVp8Decoder *dec)
+{
+    const vpx_image_t *img = dec ? dec->last_img : NULL;
+    int matrix = img && img->cs == VPX_CS_BT_709 ? 1
+        : img && img->cs == VPX_CS_BT_2020 ? 9 : 2;
+    return jce_yuv_color_from_cicp(matrix, img && img->range == VPX_CR_FULL_RANGE);
+}
 
 static uint32_t rd_u32_le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)

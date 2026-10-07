@@ -329,3 +329,25 @@ jce_add_cxx_test(test_jce_shadergraph_codegen
 # where it was launched from.
 target_compile_definitions(test_jce_shadergraph_codegen PRIVATE
     JCE_SG_TEMPLATE="${CMAKE_SOURCE_DIR}/engine/shaders/graph/fs_graph_template.sc")
+
+# Large hierarchy capacity arithmetic stays independent of the UI runtime.
+jce_add_cxx_test(test_jce_hierarchy_capacity
+    SOURCES test_jce_hierarchy_capacity.cpp)
+
+# Stable history identity is tested without editor initialization.
+jce_add_cxx_test(test_jce_history_identity
+    SOURCES test_jce_history_identity.cpp)
+
+jce_add_cxx_test(test_jce_fv_video_policy
+    SOURCES test_jce_fv_video_policy.cpp
+    LINK jce_core)
+
+# Real scoped relation/component restore uses public ECS, without a GUI host.
+jce_add_cxx_test(test_jce_history_entity
+    SOURCES test_jce_history_entity.cpp
+            "${CMAKE_SOURCE_DIR}/editor/src/core/jce_editor_history_entity.cpp"
+    LINK jce_core jce_scene jce_resource)
+
+# Default-mode hierarchy reuse admission/key, no ImGui or native window.
+jce_add_cxx_test(test_jce_hierarchy_flat_cache
+    SOURCES test_jce_hierarchy_flat_cache.cpp)

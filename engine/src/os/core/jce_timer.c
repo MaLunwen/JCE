@@ -222,3 +222,10 @@ double jce_time_perf_to_ms(uint64_t start, uint64_t end)
 {
     return jce_time_perf_to_seconds(start, end) * 1000.0;
 }
+
+int64_t jce_time_now_epoch_milliseconds(void)
+{
+    SDL_Time current = 0;
+    if (!SDL_GetCurrentTime(&current)) return 0;
+    return (int64_t)(current / 1000000);
+}

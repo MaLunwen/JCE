@@ -98,6 +98,11 @@ static void play_commit_touches(void *, const JceRuntimeTouch *touches,
     jce_editor_play_set_touch_input(touches, count);
 }
 
+static void play_commit_position(void *, float x, float y, float width, float height)
+{
+    jce_editor_play_set_pointer_position(x, y, width, height);
+}
+
 static void play_commit_actions(void *, const JceInputActions *actions)
 {
     jce_editor_play_set_actions(actions);
@@ -411,6 +416,7 @@ static void editor_app_update(float dt, void *ud)
             play_commit_touches,
             play_commit_actions,
             play_commit_step,
+            play_commit_position,
         };
         (void)jce_editor_game_input_bridge_commit(
             jce_editor_game_input_bridge_shared(), touches, kept,
@@ -485,6 +491,74 @@ static void editor_app_update(float dt, void *ud)
 #endif
 }
 
+/* Explicit QA producer: normalized Game-image events enter the same editor
+ * event processor as platform input. No runtime values or viewport ownership
+ * are overridden. Each row: Play frame, M/B/W, x, y, a, b. B: button/down;
+ * M: normalized displacement; W: vertical steps. Not hardware-input evidence. */
+static void editor_game_event_fixture(void)
+{
+    struct FixtureBuffer {
+        char *data = nullptr;
+        size_t offset = 0;
+        void reset() { jce_fs_buffer_free(data); data = nullptr; offset = 0; }
+        ~FixtureBuffer() { reset(); }
+    };
+    static FixtureBuffer file;
+    static bool checked = false, pending = false;
+    static unsigned frame = 0, due = 0;
+    static char kind = 0;
+    static float x = 0, y = 0, a = 0, b = 0;
+    if (!checked) {
+        checked = true;
+        const char *path = getenv("JCE_KPI_GAME_EVENTS");
+        if (path && path[0]) {
+            uint64_t read = 0, total = 0;
+            file.data = static_cast<char *>(jce_fs_host_read_capped(path, 1048576, &read, &total));
+            if (read != total) file.reset();
+        }
+        if (path && path[0] && !file.data)
+            LOG_ERROR("editor-main", "Game event fixture cannot open: %s", path);
+    }
+    if (!file.data || jce_state_get_play_state() != JCE_PLAY_PLAYING) return;
+    const auto &vp = jce_editor_game_input_bridge_shared()->viewport;
+    if (!vp.visible || vp.width <= 0 || vp.height <= 0) return;
+    ++frame;
+    for (;;) {
+        if (!pending) {
+            int consumed = 0;
+            if (sscanf(file.data + file.offset, " %u %c %f %f %f %f %n",
+                       &due, &kind, &x, &y, &a, &b, &consumed) != 6 || consumed <= 0) {
+                file.reset(); return;
+            }
+            file.offset += static_cast<size_t>(consumed);
+            pending = true;
+        }
+        if (due > frame) return;
+        JceEvent e{};
+        if (kind == 'M') {
+            e.type = JCE_EVENT_MOUSE_MOTION;
+            e.motion.x = vp.x + x * vp.width;
+            e.motion.y = vp.y + y * vp.height;
+            e.motion.xrel = a * vp.width;
+            e.motion.yrel = b * vp.height;
+        } else if (kind == 'B') {
+            e.type = b ? JCE_EVENT_MOUSE_BUTTON_DOWN : JCE_EVENT_MOUSE_BUTTON_UP;
+            e.button.x = vp.x + x * vp.width;
+            e.button.y = vp.y + y * vp.height;
+            e.button.button = static_cast<uint8_t>(a);
+        } else if (kind == 'W') {
+            e.type = JCE_EVENT_MOUSE_WHEEL; e.wheel.y = a;
+        } else {
+            LOG_ERROR("editor-main", "Unknown Game event fixture kind: %c", kind);
+            file.reset(); return;
+        }
+        jce_editor_process_event(&e);
+        LOG_INFO("editor-main", "Game event fixture frame=%u type=%c owner=%d hovered=%d",
+                 frame, kind, static_cast<int>(vp.owner), vp.hovered ? 1 : 0);
+        pending = false;
+    }
+}
+
 static void editor_app_draw(const JceServices *svc, void *ud)
 {
     (void)ud;
@@ -508,6 +582,7 @@ static void editor_app_draw(const JceServices *svc, void *ud)
      * characters ghost in TAA). */
     jce_scene_renderer_begin_velocity_frame(jce_editor_get_scene_renderer());
     jce_editor_update(svc->window);
+    editor_game_event_fixture();
     log_first_frame_kpi();
 }
 

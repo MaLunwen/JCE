@@ -34,6 +34,11 @@ typedef enum {
 /* Evaluate an easing at `t` (clamped to [0,1]).  Unknown type → linear. */
 JCE_API float jce_ease(JceEaseType type, float t);
 
+/* CSS-compatible cubic Bezier timing: solves x(s)=t, then returns y(s).
+ * x controls must be in [0,1]; invalid/nonfinite controls fall back to linear.
+ * y controls may overshoot; t is clamped and nonfinite t returns zero. */
+JCE_API float jce_ease_cubic_bezier(float t, float x1, float y1, float x2, float y2);
+
 /* Eased interpolation: a + (b - a) * jce_ease(type, t). */
 JCE_API float jce_ease_lerp(JceEaseType type, float a, float b, float t);
 

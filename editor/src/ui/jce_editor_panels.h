@@ -110,6 +110,7 @@ void  jce_editor_panels_persist_visibility(void);
 
 /* Draw individual panels as standalone windows (only if visible). */
 void  jce_editor_panel_hierarchy(void);
+void  jce_hierarchy_storage_shutdown(void);
 void  jce_editor_panel_inspector(void);
 void  jce_editor_panel_console(void);
 void  jce_editor_panel_scene_view(void);

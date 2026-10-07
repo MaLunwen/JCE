@@ -19,6 +19,25 @@ static float ease_bounce_out(float t)
     t -= 2.625f / d1;       return n1 * t * t + 0.984375f;
 }
 
+float jce_ease_cubic_bezier(float t, float x1, float y1, float x2, float y2)
+{
+    float lo=0.0f, hi=1.0f, s, inv, x;
+    int i;
+    if (!isfinite(t)) return 0.0f;
+    t=clamp01(t);
+    if (!isfinite(x1) || !isfinite(y1) || !isfinite(x2) || !isfinite(y2) ||
+        x1<0.0f || x1>1.0f || x2<0.0f || x2>1.0f) return t;
+    if(t==0.0f || t==1.0f) return t;
+    /* Bisection also handles zero endpoint slopes without unstable division. */
+    for(i=0;i<24;++i) {
+        s=(lo+hi)*0.5f;inv=1.0f-s;
+        x=3.0f*inv*inv*s*x1+3.0f*inv*s*s*x2+s*s*s;
+        if(x<t) lo=s; else hi=s;
+    }
+    s=(lo+hi)*0.5f;inv=1.0f-s;
+    return 3.0f*inv*inv*s*y1+3.0f*inv*s*s*y2+s*s*s;
+}
+
 float jce_ease(JceEaseType type, float t)
 {
     t = clamp01(t);

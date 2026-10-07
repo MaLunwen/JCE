@@ -229,6 +229,9 @@ const char       *jce_comp_flag_display_name(uint64_t comp_flag);
    typing in any language present in the loaded locale tables. */
 const char       *jce_comp_flag_i18n_key(uint64_t comp_flag);
 
+/* Read-only editor presentation-order revision; advances on add/remove/reorder/rebuild. */
+uint64_t          jce_state_entity_order_generation(void);
+
 /* Root entity enumeration. */
 int               jce_state_get_root_count(void);
 uint32_t          jce_state_get_root_id(int index);
@@ -400,6 +403,7 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                       struct JceInput *keyboard);
 void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
                                        unsigned int buttons);
+void jce_editor_play_set_pointer_position(float x, float y, float width, float height);
 void jce_editor_play_set_touch_input(
     const JceRuntimeTouch *touches, int count);
 

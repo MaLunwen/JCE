@@ -327,7 +327,7 @@ endif()
 _jce_add_layer(jce_net
 	DIRS      middleware/net
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE enet::enet protobuf::protobuf flecs::flecs_static
+	LINK_PRIVATE enet::enet protobuf::libprotobuf flecs::flecs_static
 	CXX)
 
 # Protobuf code generation (net layer owns the proto files).

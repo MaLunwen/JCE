@@ -677,8 +677,10 @@ bool resolve_texture_path_for_material(const char *material_path,
 {
     if (!out_path) return false;
 
-    /* If the material path points directly to an existing file, use it. */
-    if (material_path && material_path[0] != '\0') {
+    /* Only image assets may bypass material parsing. Mounted material JSON
+     * exists too, but its bytes must never be passed to the image decoder. */
+    if (material_path && material_path[0] != '\0'
+        && looks_like_texture_asset_path(material_path)) {
         if (path_is_file(material_path)) {
             snprintf(out_path, out_size, "%s", material_path);
             return true;

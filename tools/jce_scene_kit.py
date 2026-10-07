@@ -899,12 +899,23 @@ def cmd_check(args) -> int:
                             + (f"  {why}" if why else ""))
 
     # ground extent for footprint containment
-    ground_half = None
+    ground_rect = None
+    ground_ids = set()
     for e in ents:
         if str(e.get("name", "")).lower().startswith("ground"):
             t = _transform(e)
             if t:
-                ground_half = (abs(t.get("scaleX", 1)) / 2.0, abs(t.get("scaleZ", 1)) / 2.0)
+                ground_ids.add(e.get('id'))
+                mr=next((c for c in e.get('components',[]) if c.get('type')=='MeshRenderer'),{})
+                bounds=load_bounds(root/mr['meshPath']) if mr.get('meshPath') else None
+                if bounds and bounds[0]!='ERR':
+                    mn,mx,_=bounds
+                else:
+                    mn,mx=(-.5,-.5,-.5),(.5,.5,.5)
+                sx,sz=t.get('scaleX',1),t.get('scaleZ',1)
+                px,pz=t.get('posX',0),t.get('posZ',0)
+                xx=sorted((mn[0]*sx+px,mx[0]*sx+px));zz=sorted((mn[2]*sz+pz,mx[2]*sz+pz))
+                ground_rect=(xx[0],xx[1],zz[0],zz[1])
 
     # renderer / placement
     for e in ents:
@@ -937,15 +948,17 @@ def cmd_check(args) -> int:
             wmin_y = mn[1] * sy + py
             wmin_x, wmax_x = mn[0] * sx + px, mx[0] * sx + px
             wmin_z, wmax_z = mn[2] * sz + pz, mx[2] * sz + pz
+            if e.get("id") in ground_ids:
+                continue
             if wmin_y < -0.5:
                 warns.append(f"'{name}': sunk {wmin_y:.2f}m (set posY≈{-mn[1] * sy:.2f})")
             elif wmin_y > 0.5:
                 warns.append(f"'{name}': floating {wmin_y:.2f}m (set posY≈{-mn[1] * sy:.2f})")
-            if ground_half:
-                gx, gz = ground_half
-                if wmin_x < -gx or wmax_x > gx or wmin_z < -gz or wmax_z > gz:
+            if ground_rect:
+                xmin,xmax,zmin,zmax = ground_rect
+                if wmin_x < xmin or wmax_x > xmax or wmin_z < zmin or wmax_z > zmax:
                     warns.append(f"'{name}': footprint x[{wmin_x:.0f},{wmax_x:.0f}] "
-                                 f"z[{wmin_z:.0f},{wmax_z:.0f}] exceeds ground ±({gx:.0f},{gz:.0f})")
+                                 f"z[{wmin_z:.0f},{wmax_z:.0f}] exceeds ground x[{xmin:.0f},{xmax:.0f}] z[{zmin:.0f},{zmax:.0f}]")
 
     print(f"scene: {scene_path}")
     print(f"assets root: {root}")

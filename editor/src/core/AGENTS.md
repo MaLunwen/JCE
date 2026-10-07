@@ -1,7 +1,14 @@
 # editor/src/core/ — Editor Singletons & State
 
 ## Identity
-- **Language**: C++17
+
+`JCE_EDITOR_PROFILE_DIR` selects an explicit absolute user-configuration
+directory before startup. The shared dotjce path resolver covers preferences,
+session, ImGui layout and editor caches. Invalid explicit paths never fall back
+to the user's HOME; default interactive behavior remains HOME/.jce. The pure
+profile path helper rejects escaping names, drive-relative roots and overflow,
+and retains UNC roots through the engine path facade.
+- **Language**: C++20
 - **Role**: per-process editor state — owns config, history, hotkeys, i18n, reflection, asset DB, build pipeline.
 - **Consumed by**: every other `editor/src/*` module.
 
@@ -40,7 +47,7 @@
 
 ## Rules
 1. **All editor state goes through this folder** — no globals in `panels/`, `dialogs/`, etc.; they take pointers/refs to state owned here.
-2. **C++17 only**: use `std::filesystem`, `std::string_view`, `std::optional`. **No `std::format`** (not in libc++ on macOS 10.13).
+2. **C++20**: follow the root language contract. Prefer portable facilities such as `std::filesystem`, `std::string_view`, and `std::optional`. Do not require `std::format`; standard-library availability must preserve the supported runtime floor.
 3. **No engine private headers**: editor links against `JCE` (public) + `jce_tools_imgui` (INTERFACE) only — never `engine/src/**`.
 4. **Allocation**: all `new`/`malloc` route through `jce_editor_alloc.h` → `jce_alloc_*`.
 5. **Logging**: `jce_log_*` (engine), not `printf`. Editor adds a sink that pushes to `jce_panel_console.cpp`.
@@ -167,3 +174,91 @@
 **注意 `check_editor_consumption` 分不出「编辑器调用了它」和「编辑器提到了它」**——
 它扫的是编辑器树里的符号出现。所以一个**按名字转发、实际什么都不做**的桥
 照样能让那道门变绿。判据要放在**测试**上，不是那个计数上。
+
+The Benchmark host consumes jce_scene_stress_spawn/motion. It owns history,
+isolation and hierarchy bookkeeping; fixture/material/physics generation belongs
+to the shared C99 scene diagnostic API, not a duplicate C++ implementation.
+
+Project render/physics/pipeline configuration export precedes collecting the embedded PAK inputs; writing only in the package finish step makes shipped settings one build stale.
+
+D01 operation observations use jce_editor_operation_metrics and the existing
+main-thread phase accumulator. Inspector sync requests have generations;
+coalesced/invalidated requests are not successful draw completions. Explicit
+JCE_EDITOR_OPERATION_METRICS enables log observations. JCE_DBG_RENAME and
+JCE_DBG_REPARENT use source:target@frame (ROOT detaches); JCE_DBG_SCROLL uses
+entity@panel-frame and the existing reveal/clipper path. These maintenance
+controls measure programmatic operations, never physical input-to-display.
+Loaded entity count, flattened rows and display capacity remain distinct.
+
+JCE_DBG_SCENE_LOAD_SYNC=1 opts maintenance runs into the existing synchronous
+startup scene opener before UI measurement frames. Default interactive startup
+retains time-sliced opening. This is setup policy, not an alternate loader or
+permission to operate on an incomplete scene; load wall time is not UI latency.
+
+Rename uses the existing entity-scoped history snapshot: EditorMeta name is
+serialized/restored with its component set and component order. Reparent remains
+full-scene history because scoped records do not yet preserve parent relations.
+JCE_DBG_RENAME_VERIFY=undoTick,redoTick observes actual identity/name/parent/
+focused selection/population after existing Undo/Redo hooks; it restores nothing.
+
+Undo and Redo capture inverse records with the target record's granularity.
+An entity-scoped target must produce an entity-scoped inverse, preserving live
+handles and selection across both traversals. Full-scene records retain their
+existing scene-recreation and ID-remap path; failed capture leaves stacks intact.
+
+History identity is private, session-scoped monotonic tokens bound to complete
+ECS handles. Full snapshots preserve complete serializer bytes but retain only
+already-tracked source-ID/token pairs; scoped edits allocate tokens lazily. Full
+restore accepts a unique tracked subset of serialized source IDs, including an
+empty subset, and observational logs never create identities. Inverse full
+snapshots retain newly tracked tokens before an older full restore drops them; successful restores rebind tokens to the loader creation roster. Entity
+records resolve tokens, never names or recycled indices. History clears advance
+an epoch without reusing tokens; retained Play snapshots from an earlier epoch
+receive fresh bindings. Invalid/duplicate rosters are rejected before scene clear.
+Roster storage and conservative map-node/bucket estimates count toward the
+existing history budget; full capture prunes dead live bindings. Maps are not
+allocator-exact accounting. Nested cross-entity scoped edits cannot be promoted
+after mutation: rename fails closed; SDK-style manual callers must use an outer
+full-scene batch for mixed entities. That void begin/end contract cannot prevent
+callers from mutating after a refused begin; do not claim arbitrary nested safety.
+
+Identity restore prepares map nodes, buckets and extraction capacity before
+clearing the scene; commit rekeys all extracted nodes without new allocation.
+A pre-clear refusal reports no mutation, so Undo/Redo preserve the target without
+redundant rollback. The bounded diagnostic identity budget is honored only with
+operation metrics enabled; default capacity remains 64 MiB. Failed Play/Stop
+restoration retains its snapshot for Stop retry and refuses a new Play that would
+overwrite it. Existing engine loader failure rollback remains necessary; this
+does not assert complete allocator-failure atomicity of the scene loader.
+
+Full history capture and restore walk entity JSON with the public first-child /
+next-sibling facade. Indexed access traverses the underlying linked list and
+made four full-array passes quadratic at large scene counts. Preserve source
+order and loader creation-index correspondence; do not replace identity checks
+with names or drop count/roster validation to accelerate restore.
+
+Scoped snapshots preserve a captured-parent marker and a logical parent token
+(root uses zero), alongside the existing local component JSON and component set.
+Parent identity is checked alive and cycle-free before mutation. The private
+UI-free history entity service calls public reparent with preserve_world=false,
+then applies the exact recorded local components. Inverse capture and change
+comparison include parent identity, so a parent-only edit cannot disappear.
+Full-scene batch semantics remain unchanged. No stable sibling-order guarantee
+is added: current public children iteration and full-scene history do not retain
+a sibling ordinal. JCE_DBG_REPARENT_BATCH=1 exercises the existing public outer
+batch in maintenance mixed full/scoped tests; ordinary reparent timing is scoped.
+
+Operation observations are owned by EditorInternalState::operation_metrics on
+existing state s. Inspector generations/pending requests, maintenance frame count,
+rename witnesses and one-shot observation flags reset with the normal editor
+state lifecycle. Do not introduce independent observer globals or hide them in
+function statics. Diagnostic observers retain ordinary UI/API routing and cannot
+mutate identity/history by an alternate path.
+
+- `JCE_KPI_GAME_EVENTS` is an explicit normalized, frame-indexed QA event producer in editor main. It passes through the normal event processor and live Game viewport owner/hover gates; it must never force runtime state or be described as physical mouse validation.
+
+Script quit requests are consumed after runtime callbacks return, in Play or
+single-step: they call existing Stop and never quit the editor process. Optional
+runtime platform services are owned by the grouped Play runtime host only when
+trusted JCE_RUNTIME_STATS_DIR is explicitly configured. Destroy runtime before
+checked flush/shutdown; no config means unavailable and no duplicate LOCAL store.

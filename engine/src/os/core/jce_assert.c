@@ -149,11 +149,11 @@ void jce_assert_fail(const char *file, int line, const char *func,
     SDL_AddAtomicInt(&g_a.failures, 1);
 
     if (msg[0])
-        jce_log_write(JCE_LOG_LEVEL_ERROR, "assert",
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "assert", file, line,
                       "ASSERT FAILED: %s -- %s (%s at %s:%d)",
                       expr, msg, func ? func : "?", file ? file : "?", line);
     else
-        jce_log_write(JCE_LOG_LEVEL_ERROR, "assert",
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "assert", file, line,
                       "ASSERT FAILED: %s (%s at %s:%d)",
                       expr, func ? func : "?", file ? file : "?", line);
 
@@ -173,12 +173,12 @@ static void ensure_report(const char *file, int line, const char *func,
                           const char *expr, const char *msg, const char *note)
 {
     if (msg && msg[0])
-        jce_log_write(JCE_LOG_LEVEL_ERROR, "ensure",
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "ensure", file, line,
                       "ENSURE FAILED: %s -- %s (%s at %s:%d)%s",
                       expr, msg, func ? func : "?", file ? file : "?", line,
                       note);
     else
-        jce_log_write(JCE_LOG_LEVEL_ERROR, "ensure",
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "ensure", file, line,
                       "ENSURE FAILED: %s (%s at %s:%d)%s",
                       expr, func ? func : "?", file ? file : "?", line, note);
 }

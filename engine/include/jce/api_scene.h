@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_stress.h>
 #include <jce/middleware/scene/jce_scene_camera.h>
 #include <jce/middleware/scene/jce_script_exports.h>
 #include <jce/middleware/scene/jce_scene_reflection_probe.h>

@@ -17,6 +17,7 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
+#include <math.h>
 #include "renderer/jce_render_encoder.h"
 
 #define LOG_TAG "forwardplus"
@@ -378,7 +379,7 @@ const JceForwardPlusPacked *jce_forwardplus_get_packed(const JceForwardPlus *fp)
  * depend only on the froxel grid / index capacity), and the lights region is
  * sized to max_lights here; per-frame uploads cover only the rows actually
  * used for that frame's light count (u_clusterRegions tells the shader the
- * exact region base rows + total height).  Returns false if creation failed. */
+ * exact region base rows + physical texture height). Returns false on failure. */
 static bool fp_gpu_init(JceForwardPlus *fp)
 {
     if (fp->gpu_init) return true;
@@ -430,8 +431,9 @@ static bool fp_gpu_init(JceForwardPlus *fp)
 
 /* Upload a combined RGBA32F buffer (grid ++ index ++ lights regions) into the
  * top of the mutable combined texture.  Only the rows the combined buffer
- * actually uses are written; rows beyond combined->total_rows are never
- * sampled (u_clusterRegions.w == total_rows bounds the lights region). */
+ * actually uses are written. Grid/index counts and the active light population
+ * bound addresses; UV normalization uses the physical capacity texture height,
+ * independently of this frame's smaller logical upload footprint. */
 static void fp_upload_combined(bgfx_texture_handle_t tex, uint16_t tex_w,
                                uint16_t tex_h,
                                const JceForwardPlusCombined *combined)
@@ -461,9 +463,12 @@ void jce_forwardplus_update(JceForwardPlus                 *fp,
                             float                           z_far,
                             const JceRenderer              *r)
 {
-    if (!fp || !fp->enabled) return;
-    if (!inv_view || !proj) return;
-    if (!(z_near > 0.0f) || !(z_far > z_near)) return;
+    if (!fp) return;
+    /* A failed frame must never replay a previous frame's GPU binding. */
+    fp->last_upload_ok = false;
+    if (!fp->enabled || !inv_view || !proj) return;
+    if (!isfinite(z_near) || !isfinite(z_far) ||
+        !(z_near > 0.0f) || !(z_far > z_near)) return;
 
     if (light_count > fp->max_lights) light_count = fp->max_lights;
 
@@ -501,10 +506,12 @@ void jce_forwardplus_update(JceForwardPlus                 *fp,
                      (float)fp->slices_z, (float)light_count };
     float cp2[4] = { (float)fp->max_per_cell, (float)JCE_FP_TEX_WIDTH,
                      z_near, z_far };
+    /* Normalized texture coordinates divide by the allocated texture height,
+     * not this frame's logical packed rows (which vary with light_count). */
     float cr[4]  = { (float)fp->combined.grid_base_row,
                      (float)fp->combined.index_base_row,
                      (float)fp->combined.lights_base_row,
-                     (float)fp->combined.total_rows };
+                     (float)fp->tex_h };
     jce_enc_set_uniform(fp->u_clusterParams,  cp,  1);
     jce_enc_set_uniform(fp->u_clusterParams2, cp2, 1);
     jce_enc_set_uniform(fp->u_clusterRegions, cr,  1);

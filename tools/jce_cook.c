@@ -1,3 +1,5 @@
+#include "cli/jce_tool_main.h"
+#include "cli/jce_tool_io.h"
 /*
  * jce_cook.c  CLI asset cooker tool.
  *
@@ -48,12 +50,7 @@
 #include <limits.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dirent.h>
-#include <sys/stat.h>
-#endif
+
 
 /* ================================================================== */
 /* Recursive directory traversal                                       */
@@ -388,129 +385,46 @@ static bool path_same(const char *a, const char *b)
     }
 }
 
-#ifdef _WIN32
-static void batch_recurse(BatchContext *ctx,
-                           const char *dir,
-                           const char *rel_prefix)
+typedef struct {
+    BatchContext *batch;
+    const char *dir;
+    const char *relative;
+} BatchWalk;
+static void batch_recurse(BatchContext *ctx, const char *dir, const char *rel_prefix);
+
+static bool batch_entry(const char *name, bool is_dir, void *user)
 {
-    char pattern[1024];
-    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
-
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(pattern, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-
-    do {
-        if (fd.cFileName[0] == '.') continue;
-
-        char full[1024], rel[1024];
-        snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
-
-        if (rel_prefix[0])
-            snprintf(rel, sizeof(rel), "%s/%s", rel_prefix, fd.cFileName);
-        else
-            snprintf(rel, sizeof(rel), "%s", fd.cFileName);
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            /* NEVER DESCEND INTO OUR OWN OUTPUT.
-             *
-             * The default project layout puts the cooked tree INSIDE the
-             * source tree (source_assets "resources", cooked_assets
-             * "resources/_cooked"), so without this the walk finds the
-             * previous run's output and cooks it again -- one level deeper
-             * every time.  Measured on a project cooked a handful of times:
-             * resources/_cooked/_cooked/_cooked/_cooked, each level a full
-             * copy, all of it packed into the PAK.
-             *
-             * It grows without bound and nothing reports it: every run ends
-             * "Done: N cooked" and N even looks stable, because the
-             * incremental cache marks the duplicates unchanged. */
-            if (path_same(full, ctx->output_dir)) continue;
-            batch_recurse(ctx, full, rel);
-        } else {
-            cook_single(ctx, full, rel);
-        }
-    } while (FindNextFileA(hFind, &fd));
-
-    FindClose(hFind);
-}
-#else
-static void batch_recurse(BatchContext *ctx,
-                           const char *dir,
-                           const char *rel_prefix)
-{
-    DIR *d = opendir(dir);
-    if (!d) return;
-
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-
-        char full[1024], rel[1024];
-        snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
-
-        if (rel_prefix[0])
-            snprintf(rel, sizeof(rel), "%s/%s", rel_prefix, ent->d_name);
-        else
-            snprintf(rel, sizeof(rel), "%s", ent->d_name);
-
-        struct stat st;
-        if (stat(full, &st) != 0) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Same reason as the Windows walk above. */
-            if (path_same(full, ctx->output_dir)) continue;
-            batch_recurse(ctx, full, rel);
-        } else if (S_ISREG(st.st_mode)) {
-            cook_single(ctx, full, rel);
-        }
+    BatchWalk *walk = user;
+    if (name[0] == '.') return true;
+    char full[1024], relative[1024];
+    int n = snprintf(full, sizeof(full), "%s/%s", walk->dir, name);
+    int r = walk->relative[0] ? snprintf(relative, sizeof(relative), "%s/%s", walk->relative, name) :
+        snprintf(relative, sizeof(relative), "%s", name);
+    if (n < 0 || (size_t)n >= sizeof(full) || r < 0 || (size_t)r >= sizeof(relative)) {
+        walk->batch->failed++;
+        return false;
     }
-
-    closedir(d);
+    if (is_dir) {
+        /* Preserve output exclusion: never recursively cook the cooked tree. */
+        if (!path_same(full, walk->batch->output_dir))
+            batch_recurse(walk->batch, full, relative);
+    } else cook_single(walk->batch, full, relative);
+    return true;
 }
-#endif
+
+static void batch_recurse(BatchContext *ctx, const char *dir, const char *rel_prefix)
+{
+    BatchWalk walk = {ctx, dir, rel_prefix};
+    if (!jce_fs_host_list_dir(dir, batch_entry, &walk)) {
+        fprintf(stderr, "[jce_cook] cannot enumerate %s\n", dir);
+        ctx->failed++;
+    }
+}
+
 
 /* ================================================================== */
 /* Offline collider cook (--collider)                                  */
 /* ================================================================== */
-
-/* Link-only stubs.
- *
- * jce_model_importer.cpp is compiled into this tool ONLY for its part-
- * extraction path (jce_model_importer_load_parts_file → build_parts), which
- * uses just assimp + the allocator.  The same TU's mesh/pak loaders pull in
- * the bgfx runtime and the archive subsystem, which a host cooker neither
- * has nor needs.  The --collider path never calls these, so we satisfy the
- * linker with no-op definitions instead of dragging in those chains. */
-JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
-                         const uint32_t *indices, uint32_t num_indices)
-{
-    (void)vertices; (void)num_verts; (void)indices; (void)num_indices;
-    return NULL;
-}
-uint32_t jce_mesh_vertex_count(const JceMesh *mesh) { (void)mesh; return 0; }
-uint32_t jce_mesh_index_count(const JceMesh *mesh)  { (void)mesh; return 0; }
-
-const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path)
-{
-    (void)pak; (void)path;
-    return NULL;
-}
-size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size)
-{
-    (void)asset; (void)buf; (void)buf_size;
-    return 0;
-}
-/* jce_terrain.c offers a load-from-PAK entry point; this tool only ever reads
- * loose files, so the PAK side is stubbed rather than dragging the archive
- * layer into a cooker.  Returning 0 makes any accidental PAK load fail
- * visibly instead of returning a half-filled terrain. */
-size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
-                             void *buf, size_t buf_size)
-{
-    (void)pak; (void)asset; (void)buf; (void)buf_size;
-    return 0;
-}
 
 /* Load a model, cook its compound collider with default config, serialize
    to a JCOL blob and write it.  This mirrors the engine's live cook in
@@ -523,16 +437,16 @@ size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
 static void *read_entire_file(const char *path, size_t *out_size)
 {
     if (!path || !out_size) return NULL;
-    FILE *f = fopen(path, "rb");
+    JceToolFile *f = jce_tool_fopen(path, "rb");
     if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    const long n = ftell(f);
-    if (n <= 0) { fclose(f); return NULL; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    if (jce_tool_fseek(f, 0, SEEK_END) != 0) { jce_tool_fclose(f); return NULL; }
+    const int64_t n = jce_tool_ftell(f);
+    if (n <= 0) { jce_tool_fclose(f); return NULL; }
+    if (jce_tool_fseek(f, 0, SEEK_SET) != 0) { jce_tool_fclose(f); return NULL; }
     void *buf = malloc((size_t)n);
-    if (!buf) { fclose(f); return NULL; }
-    const size_t got = fread(buf, 1, (size_t)n, f);
-    fclose(f);
+    if (!buf) { jce_tool_fclose(f); return NULL; }
+    const size_t got = jce_tool_fread(buf, 1, (size_t)n, f);
+    jce_tool_fclose(f);
     if (got != (size_t)n) { free(buf); return NULL; }
     *out_size = got;
     return buf;
@@ -706,14 +620,14 @@ static int cook_terrain(const char *png_path, const char *out_path,
     }
 
     const char *out = out_path ? out_path : "terrain.jter";
-    FILE *f = fopen(out, "wb");
+    JceToolFile *f = jce_tool_fopen(out, "wb");
     if (!f) {
         fprintf(stderr, "Error: cannot write '%s'\n", out);
         free(dst);
         return 1;
     }
-    const size_t put = fwrite(dst, 1, written, f);
-    fclose(f);
+    const size_t put = jce_tool_fwrite(dst, 1, written, f);
+    jce_tool_fclose(f);
     free(dst);
     if (put != written) {
         fprintf(stderr, "Error: short write to '%s'\n", out);
@@ -864,11 +778,13 @@ static int extract_model_material(const char *in_path, bool verbose)
 extern int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
                                      const char *ext_hint,
                                      uint8_t **out_buf, size_t *out_size);
+extern int jce_bundle_convert_to_glb_ex(const uint8_t *src, size_t src_sz,
+    const char *ext_hint, uint8_t **out_buf, size_t *out_size, int geometry_only);
 
 /* Convert one model file to GLB.  Default output replaces the source
    extension with ".glb" (so "models/foo.obj" -> "models/foo.glb"). */
 static int convert_model_to_glb(const char *in_path, const char *out_path,
-                                bool verbose)
+                                bool verbose, bool geometry_only)
 {
     uint64_t in_size = 0;
     void    *in_buf  = jce_fs_host_read_all(in_path, &in_size);
@@ -883,8 +799,8 @@ static int convert_model_to_glb(const char *in_path, const char *out_path,
 
     uint8_t *glb    = NULL;
     size_t   glb_sz = 0;
-    int ok = jce_bundle_convert_to_glb((const uint8_t *)in_buf, (size_t)in_size,
-                                       ext_hint, &glb, &glb_sz);
+    int ok = jce_bundle_convert_to_glb_ex((const uint8_t *)in_buf, (size_t)in_size,
+                                       ext_hint, &glb, &glb_sz, geometry_only);
     jce_fs_buffer_free(in_buf);
     if (!ok || !glb || glb_sz == 0) {
         fprintf(stderr, "Error: GLB conversion failed for %s\n", in_path);
@@ -952,6 +868,7 @@ static void print_usage(void)
     printf("Options:\n");
     printf("  --collider <model>       Offline-cook a compound collider blob\n");
     printf("  --convert-model <model>  Convert OBJ/FBX/DAE/... to binary glTF (.glb)\n");
+    printf("  --geometry-only         Convert surfaces with authored normals; bind textures separately\n");
     printf("  --extract-material <m>   Report a model's texture slots.  Extracts embedded\n");
     printf("                           textures and writes their colour-space sidecars.\n");
     printf("  --terrain <heightmap>    Cook a 16-bit grayscale PNG into a tiled\n");
@@ -987,7 +904,7 @@ static void print_usage(void)
     printf("  --catalog <file>         Incremental-cache catalog path (default <out>/.jce_cook_catalog)\n");
 }
 
-int main(int argc, char **argv)
+int jce_tool_main(int argc, char **argv)
 {
     if (argc < 2) {
         print_usage();
@@ -1001,6 +918,7 @@ int main(int argc, char **argv)
     bool mipmaps        = false;
     bool collider       = false;          /* --collider model cook mode */
     bool convert_model  = false;          /* --convert-model mesh→glb mode */
+    bool geometry_only = false;          /* material textures are authored separately */
     int  level          = 3;
     int  max_tex_size   = 0;
     int  tex_fmt        = JCEASSET_TEXFMT_RGBA8;  /* --texfmt; RGBA8 lets platform auto-pick */
@@ -1051,6 +969,8 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--convert-model") == 0 && i + 1 < argc) {
             convert_model = true;
             convert_in = argv[++i];
+        } else if (strcmp(argv[i], "--geometry-only") == 0) {
+            geometry_only = true;
         } else if (strcmp(argv[i], "--extract-material") == 0 && i + 1 < argc) {
             extract_material = true;
             extract_in = argv[++i];
@@ -1161,7 +1081,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "Error: --convert-model requires a model path\n");
             return 1;
         }
-        return convert_model_to_glb(convert_in, collider_out, verbose);
+        return convert_model_to_glb(convert_in, collider_out, verbose, geometry_only);
     }
     if (extract_material) {
         return extract_model_material(extract_in, verbose);
@@ -1242,7 +1162,7 @@ int main(int argc, char **argv)
                      * REVISION rather than the per-file flag because the salt
                      * is computed once for the run while the flag is derived
                      * per path. */
-                    uint8_t sv = 1u;   /* srgb-mip revision */
+                    uint8_t sv = 2u;   /* mip + block-alignment revision */
                     XXH3_64bits_update(ss, &pf, sizeof(pf));
                     XXH3_64bits_update(ss, &tf, sizeof(tf));
                     XXH3_64bits_update(ss, &eq, sizeof(eq));

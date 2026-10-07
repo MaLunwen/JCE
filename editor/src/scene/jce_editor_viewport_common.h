@@ -457,6 +457,9 @@ inline bool jce_editor_viewport_composite_postfx(JceOffscreenTarget *bridge,
                                                  uint32_t            height)
 {
     if (!bridge || postfx_tex == UINT16_MAX) return false;
+    /* An empty chain borrows scene colour. Sampling it while writing the
+     * same attachment is undefined; the bridge already holds the result. */
+    if (postfx_tex == jce_offscreen_target_get_color_texture(bridge)) return false;
     const uint16_t comp_view = (uint16_t)(
         view_base + JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET);
     jce_offscreen_target_composite_texture(bridge, comp_view, postfx_tex,

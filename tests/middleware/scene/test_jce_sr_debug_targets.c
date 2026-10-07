@@ -20,6 +20,7 @@
  */
 
 #include "middleware/scene/jce_sr_debug_targets.h"
+#include "middleware/scene/jce_sr_particle_batch_plan.h"
 
 #include "unity.h"
 
@@ -262,14 +263,196 @@ static void test_nothing_valid_lists_nothing_and_does_not_read_memory(void)
         "the build wrote past the caller's cap");
 }
 
+static void test_ssr_requires_current_frame_and_valid_texture(void)
+{
+    JceSrDebugTargetState st;
+    JceRenderTargetInfo rows[CAP];
+    int n;
+    all_on(&st);
+    st.ssr_active_frame = false;
+    st.ssr_tex = 0;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_FALSE(has(rows, n, "reflection.ssr"));
+    st.ssr_active_frame = true;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_TRUE(has(rows, n, "reflection.ssr"));
+    TEST_ASSERT_EQUAL_UINT16(0, rows[n - 1].texture.idx);
+    st.ssr_tex = UINT16_MAX;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_FALSE(has(rows, n, "reflection.ssr"));
+}
+
+static void test_static_cascades_require_current_binding_and_cached_contents(void)
+{
+    JceSrDebugTargetState st;
+    JceRenderTargetInfo rows[CAP];
+    all_on(&st);
+    st.shadow_use_csm = st.frame_shadow_active = st.last_csm_valid = true;
+    st.csm_count = 2;
+    st.csm_cache_valid[0] = st.csm_cache_valid[1] = true;
+    st.csm_tex[0] = 0; /* A legal bgfx handle, never an empty sentinel. */
+    st.csm_tex[1] = 42;
+    int n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_TRUE(has(rows, n, "shadow.csm_static_0"));
+    TEST_ASSERT_TRUE(has(rows, n, "shadow.csm_static_1"));
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_2"));
+    TEST_ASSERT_TRUE(has(rows, n, "shadow.csm_dynamic_atlas"));
+    st.dyn_csm_atlas_tex = UINT16_MAX;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_TRUE(has(rows, n, "shadow.csm_static_0"));
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_dynamic_atlas"));
+    st.csm_cache_valid[0] = false;
+    st.csm_tex[1] = UINT16_MAX;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_0"));
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_1"));
+    st.csm_cache_valid[0] = true;
+    bool *flags[] = {&st.shadow_valid, &st.shadow_use_csm,
+                     &st.frame_shadow_active, &st.last_csm_valid};
+    for (size_t i = 0; i < sizeof flags / sizeof flags[0]; ++i) {
+        *flags[i] = false;
+        n = jce_sr_debug_targets_build(&st, rows, CAP);
+        TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_0"));
+        *flags[i] = true;
+    }
+    st.csm_count = 0;
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_0"));
+    memset(&st, 0, sizeof st);
+    n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_FALSE(has(rows, n, "shadow.csm_static_0"));
+}
+
+static void test_static_cascade_capacity_preserves_output_bounds(void)
+{
+    JceSrDebugTargetState st;
+    JceRenderTargetInfo rows[CAP + 1];
+    all_on(&st);
+    st.shadow_use_csm = st.frame_shadow_active = st.last_csm_valid = true;
+    st.csm_count = 99;
+    for (unsigned i = 0; i < JCE_CSM_MAX_CASCADES; ++i) {
+        st.csm_cache_valid[i] = true;
+        st.csm_tex[i] = (uint16_t)(40 + i);
+    }
+    memset(rows, 0, sizeof rows);
+    rows[CAP].width = 123;
+    int n = jce_sr_debug_targets_build(&st, rows, CAP);
+    TEST_ASSERT_TRUE(has(rows, n, "shadow.csm_static_3"));
+    TEST_ASSERT_EQUAL_UINT16(123, rows[CAP].width);
+    TEST_ASSERT_TRUE(n <= CAP);
+    rows[3].width = 321;
+    n = jce_sr_debug_targets_build(&st, rows, 3);
+    TEST_ASSERT_EQUAL_INT(3, n);
+    TEST_ASSERT_EQUAL_UINT16(321, rows[3].width);
+}
+
+static void test_gpu_alive_targets_require_current_frame_and_valid_handles(void)
+{
+    JceSrDebugTargetState st;
+    JceRenderTargetInfo rows[CAP + 1];
+    memset(&st, 0xff, sizeof st);
+    st.ssao_valid = st.depth_prepass_frame = st.shadow_valid = false;
+    st.ssr_active_frame = st.gpu_particles_current_frame = st.cpu_particles_current_frame = false;
+    TEST_ASSERT_EQUAL_INT(0, jce_sr_debug_targets_build(&st, rows, CAP));
+    st.gpu_particles_current_frame = true;
+    st.gpu_particle_tex[0] = 0;
+    TEST_ASSERT_EQUAL_INT(1, jce_sr_debug_targets_build(&st, rows, CAP));
+    TEST_ASSERT_EQUAL_STRING("particles.gpu_alive_00", rows[0].name);
+    TEST_ASSERT_EQUAL_UINT16(0, rows[0].texture.idx);
+    TEST_ASSERT_EQUAL_UINT16(1, rows[0].width);
+    TEST_ASSERT_EQUAL_UINT16(1, rows[0].height);
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; ++i) st.gpu_particle_tex[i] = (uint16_t)i;
+    rows[CAP].width = 987;
+    TEST_ASSERT_EQUAL_INT(SR_GPU_PARTICLE_MAX, jce_sr_debug_targets_build(&st, rows, CAP));
+    TEST_ASSERT_EQUAL_UINT16(987, rows[CAP].width);
+    rows[3].width = 654;
+    TEST_ASSERT_EQUAL_INT(3, jce_sr_debug_targets_build(&st, rows, 3));
+    TEST_ASSERT_EQUAL_UINT16(654, rows[3].width);
+}
+
+static void test_cpu_count_zero_overflow_and_current_target(void)
+{
+    uint8_t rgba[4] = {7, 8, 9, 10};
+    TEST_ASSERT_TRUE(jce_sr_particle_count_encode(0, rgba));
+    TEST_ASSERT_EQUAL_UINT8(0, rgba[0]);
+    TEST_ASSERT_EQUAL_UINT8(0, rgba[1]);
+    TEST_ASSERT_EQUAL_UINT8(0, rgba[2]);
+    TEST_ASSERT_EQUAL_UINT8(255, rgba[3]);
+    TEST_ASSERT_TRUE(jce_sr_particle_count_encode(16777215, rgba));
+    for (int i = 0; i < 4; ++i) TEST_ASSERT_EQUAL_UINT8(255, rgba[i]);
+    TEST_ASSERT_FALSE(jce_sr_particle_count_encode(16777216, rgba));
+    TEST_ASSERT_FALSE(jce_sr_particle_count_encode(UINT32_MAX, rgba));
+    TEST_ASSERT_FALSE(jce_sr_particle_count_encode(1, NULL));
+    for (int i = 0; i < 4; ++i) TEST_ASSERT_EQUAL_UINT8(255, rgba[i]);
+    JceSrDebugTargetState st;
+    JceRenderTargetInfo rows[CAP];
+    memset(&st, 0xff, sizeof st);
+    st.ssao_valid = st.depth_prepass_frame = st.shadow_valid = false;
+    st.ssr_active_frame = st.gpu_particles_current_frame = false;
+    st.cpu_particles_current_frame = false;
+    st.cpu_particle_tex = 0;
+    TEST_ASSERT_EQUAL_INT(0, jce_sr_debug_targets_build(&st, rows, CAP));
+    st.cpu_particles_current_frame = true;
+    TEST_ASSERT_EQUAL_INT(1, jce_sr_debug_targets_build(&st, rows, CAP));
+    TEST_ASSERT_EQUAL_STRING("particles.cpu_alive_total", rows[0].name);
+    TEST_ASSERT_EQUAL_UINT16(0, rows[0].texture.idx);
+    TEST_ASSERT_EQUAL_UINT16(1, rows[0].width);
+    TEST_ASSERT_EQUAL_UINT16(1, rows[0].height);
+    st.cpu_particle_drawn_tex = 1;
+    TEST_ASSERT_EQUAL_INT(2, jce_sr_debug_targets_build(&st, rows, CAP));
+    TEST_ASSERT_EQUAL_STRING("particles.cpu_drawn_total", rows[1].name);
+    st.cpu_particle_drawn_tex = UINT16_MAX;
+    st.cpu_particle_tex = UINT16_MAX;
+    TEST_ASSERT_EQUAL_INT(0, jce_sr_debug_targets_build(&st, rows, CAP));
+}
+
+static void test_cpu_particle_arena_bounded_offsets_and_failure(void)
+{
+    uint32_t capacity = 9, offset = 9;
+    const uint32_t million = 1048576;
+    TEST_ASSERT_TRUE(sr_particle_arena_plan(0, 0, million, 2 * million, &capacity, &offset));
+    TEST_ASSERT_EQUAL_UINT32(million, capacity);
+    TEST_ASSERT_EQUAL_UINT32(0, offset);
+    TEST_ASSERT_TRUE(sr_particle_arena_plan(million, million, million, 2 * million, &capacity, &offset));
+    TEST_ASSERT_EQUAL_UINT32(2 * million, capacity);
+    TEST_ASSERT_EQUAL_UINT32(million, offset);
+    capacity = 9; offset = 9;
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(2 * million, 2 * million, 1, 2 * million, &capacity, &offset));
+    TEST_ASSERT_EQUAL_UINT32(9, capacity);
+    TEST_ASSERT_EQUAL_UINT32(9, offset);
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, UINT32_MAX, &capacity, &offset));
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 0, million, &capacity, &offset));
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, million, NULL, &offset));
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, million, &capacity, NULL));
+    TEST_ASSERT_EQUAL_UINT32(9, capacity);
+    TEST_ASSERT_EQUAL_UINT32(9, offset);
+    TEST_ASSERT_TRUE(sr_particle_arena_trim_needed(million, 0, true));
+    TEST_ASSERT_TRUE(sr_particle_arena_trim_needed(million, million / 2, true));
+    TEST_ASSERT_FALSE(sr_particle_arena_trim_needed(million, 0, false));
+    TEST_ASSERT_FALSE(sr_particle_arena_trim_needed(million, million, true));
+    TEST_ASSERT_FALSE(sr_particle_arena_plan(64, 65, 1, 128, &capacity, &offset));
+    TEST_ASSERT_TRUE(sr_particle_arena_plan(64, 16, 32, 64, &capacity, &offset));
+    TEST_ASSERT_EQUAL_UINT32(64, capacity);
+    TEST_ASSERT_EQUAL_UINT32(16, offset);
+    TEST_ASSERT_TRUE(sr_particle_arena_plan(64, 0, 65, 100, &capacity, &offset));
+    TEST_ASSERT_EQUAL_UINT32(100, capacity);
+    TEST_ASSERT_EQUAL_UINT32(0, offset);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_cpu_particle_arena_bounded_offsets_and_failure);
+    RUN_TEST(test_cpu_count_zero_overflow_and_current_target);
+    RUN_TEST(test_gpu_alive_targets_require_current_frame_and_valid_handles);
     RUN_TEST(test_the_full_table_is_exactly_this);
     RUN_TEST(test_an_allocated_gbuffer_that_was_not_written_is_not_listed);
     RUN_TEST(test_velocity_needs_taa_not_just_a_valid_handle);
     RUN_TEST(test_the_two_shadow_targets_are_mutually_exclusive);
     RUN_TEST(test_handle_zero_is_a_real_texture);
     RUN_TEST(test_nothing_valid_lists_nothing_and_does_not_read_memory);
+    RUN_TEST(test_ssr_requires_current_frame_and_valid_texture);
+    RUN_TEST(test_static_cascades_require_current_binding_and_cached_contents);
+    RUN_TEST(test_static_cascade_capacity_preserves_output_bounds);
     return UNITY_END();
 }

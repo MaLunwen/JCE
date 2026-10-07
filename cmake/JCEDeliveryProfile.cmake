@@ -1,0 +1,15 @@
+# Shipping policy shared by the editor and SDK, independent of host OS.
+set(JCE_DELIVERY_PROFILE "embedded" CACHE STRING "embedded shipment or authoring SDK")
+set_property(CACHE JCE_DELIVERY_PROFILE PROPERTY STRINGS embedded authoring)
+if(NOT JCE_DELIVERY_PROFILE MATCHES "^(embedded|authoring)$")
+	message(FATAL_ERROR "JCE_DELIVERY_PROFILE must be embedded or authoring")
+endif()
+foreach(_jce_option JCE_BUILD_SCRIPT_VM_PYTHON JCE_BUILD_SCRIPT_CSHARP
+		JCE_BUILD_SCRIPT_JAVA JCE_BUILD_SCRIPT_API_SHARED)
+	if(JCE_DELIVERY_PROFILE STREQUAL "embedded")
+		set(${_jce_option} OFF CACHE BOOL "Embedded delivery has no external VM" FORCE)
+	else()
+		option(${_jce_option} "Optional authoring backend" ON)
+	endif()
+endforeach()
+unset(_jce_option)

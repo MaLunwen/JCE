@@ -274,6 +274,8 @@ typedef struct {
     uint16_t num_vertex_layouts;
     int64_t  texture_memory_used;
     int64_t  rt_memory_used;
+    /* Backend-reported usage; may be adapter-wide (D3D11/NVAPI).
+     * Do not interpret it as process-owned live allocation accounting. */
     int64_t  gpu_memory_used;
     int64_t  gpu_memory_max;
     uint16_t backbuffer_width;

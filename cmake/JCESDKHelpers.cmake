@@ -24,15 +24,48 @@
 # `JCE_PROJECT_PREBUILT_ASSETS_C` is set.  Manual SDK consumers can still
 # provide `${JCE_PAK_EXECUTABLE}` and let this helper pack resource dirs.
 #
-# On MSVC the packer emits a COFF .obj that we link directly.  On
-# GNU/Clang/Apple targets the packer emits a tiny .S wrapper that
-# `.incbin`s the raw PAK; we add the .S to the target sources.
+# The packer produces the archive; the shared host binary wrapper emits
+# a COFF object (MSVC) or preprocessed assembly (GNU/Clang/Apple).
 #
 # The embedded symbols are: <SYMBOL_PREFIX> (uint8_t[]) and
 # <SYMBOL_PREFIX>_size (size_t).  The engine's bootstrap looks for
 # assets_pak_data / assets_pak_data_size by default.
 
 include_guard(GLOBAL)
+
+# Language activation belongs to directory scope, never a helper function.
+# Prebuilt assembly and generated PAK/bundle wrappers share this requirement.
+if(NOT MSVC AND NOT EMSCRIPTEN)
+	enable_language(ASM)
+endif()
+
+# One binary-to-native-object contract for archives and bundles.
+function(_jce_target_embed_binary TARGET INPUT SYMBOL OUTPUT)
+	if(NOT JCE_BIN2OBJ_EXECUTABLE)
+		message(FATAL_ERROR "Binary embedding requires JCE_BIN2OBJ_EXECUTABLE.")
+	endif()
+	set(_arch_flags)
+	if(MSVC)
+		set(_fmt "coff")
+		_jce_msvc_coff_arch(_arch)
+		list(APPEND _arch_flags --arch "${_arch}")
+	else()
+		set(_fmt "asm")
+	endif()
+	add_custom_command(
+		OUTPUT "${OUTPUT}"
+		COMMAND "${JCE_BIN2OBJ_EXECUTABLE}"
+			--input "${INPUT}" --symbol "${SYMBOL}"
+			--output "${OUTPUT}" --format "${_fmt}" ${_arch_flags}
+		DEPENDS "${JCE_BIN2OBJ_EXECUTABLE}" "${INPUT}"
+		COMMENT "Embedding ${INPUT} -> ${SYMBOL}"
+		VERBATIM)
+	set_source_files_properties("${OUTPUT}" PROPERTIES GENERATED TRUE)
+	if(MSVC)
+		set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE)
+	endif()
+	target_sources(${TARGET} PRIVATE "${OUTPUT}")
+endfunction()
 
 # Resolve the architecture stamped into generated COFF objects from the
 # compiler target, never from CMAKE_SYSTEM_PROCESSOR.  The latter is empty for
@@ -266,6 +299,12 @@ function(jce_configure_application_target TARGET)
 	if(NOT JCE_BUILD_VARIANT STREQUAL "dist")
 		return()
 	endif()
+	get_target_property(_jce_target_type ${TARGET} TYPE)
+	get_target_property(_jce_dist_configured ${TARGET} JCE_DIST_TARGET_CONFIGURED)
+	if(NOT _jce_target_type STREQUAL "EXECUTABLE" OR _jce_dist_configured)
+		return()
+	endif()
+	set_target_properties(${TARGET} PROPERTIES JCE_DIST_TARGET_CONFIGURED TRUE)
 
 	target_compile_definitions(${TARGET} PRIVATE JCE_DIST=1)
 	set_target_properties(${TARGET} PROPERTIES
@@ -397,6 +436,15 @@ function(_jce_prepare_runtime_boot_manifest TARGET PROJECT_FILE OUT_DIR OUT_FILE
 		"}\n")
 
 	get_filename_component(_project_dir "${PROJECT_FILE}" DIRECTORY)
+	# Runtime settings must survive relocation alongside the startup contract.
+	set(_project_settings "${_project_dir}/.jce/project-settings.json")
+	set(_project_settings_out "${_boot_dir}/settings/project-settings.json")
+	if(EXISTS "${_project_settings}")
+		file(MAKE_DIRECTORY "${_boot_dir}/settings")
+		configure_file("${_project_settings}" "${_project_settings_out}" COPYONLY)
+	else()
+		file(REMOVE "${_project_settings_out}")
+	endif()
 	set(_input_actions "${_project_dir}/.jce/input_actions.json")
 	if(EXISTS "${_input_actions}")
 		set(_input_actions_out
@@ -413,6 +461,9 @@ function(jce_target_embed_pak TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_pak: '${TARGET}' is not a target.")
 	endif()
+
+	# Apply shipping policy before every prebuilt-assets early return.
+	jce_configure_application_target(${TARGET})
 
 	# Always resolve the embedded asset-key externs (generated TU or stub),
 	# regardless of which assets path below is taken.
@@ -490,6 +541,15 @@ function(jce_target_embed_pak TARGET)
 			"debug/release only.")
 	endif()
 
+	# Every SDK embedding entry point carries the reserved startup contract.
+	# Prebuilt editor archives above already contain it.
+	_jce_prepare_runtime_boot_manifest(${TARGET}
+		"${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json"
+		_runtime_boot_dir _runtime_boot_file)
+	if(_runtime_boot_dir)
+		list(APPEND EP_RESOURCE_DIRS "${_runtime_boot_dir}")
+	endif()
+
 	if(NOT JCE_PAK_EXECUTABLE)
 		message(FATAL_ERROR
 			"jce_target_embed_pak: no prebuilt assets were provided "
@@ -552,7 +612,6 @@ function(jce_target_embed_pak TARGET)
 	endif()
 	jce_shader_pak_exclude_flags(_shader_exclude_flags ${_shader_profile_args})
 
-	jce_configure_application_target(${TARGET})
 
 	# Release packages use hash-only archive indices. Keep debug strings for
 	# Debug builds unless the caller explicitly requests stripping them.
@@ -581,10 +640,8 @@ function(jce_target_embed_pak TARGET)
 	# MSVC: COFF .obj that we link directly.  Other compilers: a .S
 	# wrapper using `.incbin` that target_sources() will compile.
 	if(MSVC)
-		set(_obj_format "coff")
 		set(_obj_ext    ".obj")
 	else()
-		set(_obj_format "asm-incbin")
 		set(_obj_ext    ".S")
 	endif()
 	set(_obj_file      "${EP_PAK_FILE}${_obj_ext}")
@@ -594,9 +651,9 @@ function(jce_target_embed_pak TARGET)
 	set(_bom_file      "${_reports_dir}/${TARGET}_assets.pak.bom.json")
 	file(MAKE_DIRECTORY "${_reports_dir}")
 
-	# Emscripten: do NOT embed the PAK as an object.  Pack it (obj-format
-	# defaults to "none" when --obj-file/--obj-format are omitted), preload it
-	# into the MEMFS via --preload-file, and link a 1-byte stub providing the
+	# Emscripten: pack the PAK and embed it into the single executable output.
+	# The file packager stores MEMFS data inside the wasm image via embed-file.
+	# Link a 1-byte stub providing the
 	# assets_pak_data / _size externs the engine references unconditionally
 	# (JCE_PLATFORM_WEB is a CMake var, never a -D macro).
 	if(EMSCRIPTEN)
@@ -619,8 +676,11 @@ function(jce_target_embed_pak TARGET)
 		add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_bom_file}")
 		add_dependencies(${TARGET} ${TARGET}_pak)
 
+		# A Web executable is one HTML artifact: code and MEMFS assets are inline.
+		set_target_properties(${TARGET} PROPERTIES SUFFIX ".html")
 		target_link_options(${TARGET} PRIVATE
-			"SHELL:--preload-file ${EP_PAK_FILE}@/game_assets.pak")
+			-sSINGLE_FILE=1 -sSINGLE_FILE_BINARY_ENCODE=0
+			"SHELL:--embed-file ${EP_PAK_FILE}@/game_assets.pak")
 		set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${EP_PAK_FILE}")
 
 		# 1-byte stub: the engine links against assets_pak_data / _size even on
@@ -633,42 +693,24 @@ function(jce_target_embed_pak TARGET)
 		return()
 	endif()
 
-	# Pick a COFF arch flag for MSVC so the linker accepts it for x86/x64/arm64.
-	set(_obj_arch_flags)
-	if(MSVC)
-		_jce_msvc_coff_arch(_obj_arch)
-		list(APPEND _obj_arch_flags --obj-arch "${_obj_arch}")
-	endif()
-
 	add_custom_command(
-		OUTPUT  "${EP_PAK_FILE}" "${_obj_file}" "${_header_file}" "${_manifest_file}" "${_bom_file}"
+		OUTPUT  "${EP_PAK_FILE}" "${_header_file}" "${_manifest_file}" "${_bom_file}"
 		COMMAND "${JCE_PAK_EXECUTABLE}"
 			${_res_flags}
 			${_excl_flags}
 			${_shader_exclude_flags}
 			${_debug_path_flags}
 			--pak-file       "${EP_PAK_FILE}"
-			--obj-file       "${_obj_file}"
 			--header-file    "${_header_file}"
 			--manifest-file  "${_manifest_file}"
 			--json           "${_bom_file}"
-			--obj-format     "${_obj_format}"
 			--symbol-prefix  "${EP_SYMBOL_PREFIX}"
-			${_obj_arch_flags}
 		DEPENDS "${JCE_PAK_EXECUTABLE}" ${_pak_deps}
 		COMMENT "Packing assets for ${TARGET} -> ${EP_PAK_FILE}"
 		VERBATIM)
 
-	if(MSVC)
-		set_source_files_properties("${_obj_file}" PROPERTIES
-			GENERATED        TRUE
-			EXTERNAL_OBJECT  TRUE)
-		target_sources(${TARGET} PRIVATE "${_obj_file}")
-	else()
-		set_source_files_properties("${_obj_file}" PROPERTIES
-			GENERATED TRUE)
-		target_sources(${TARGET} PRIVATE "${_obj_file}")
-	endif()
+	_jce_target_embed_binary(${TARGET} "${EP_PAK_FILE}"
+		"${EP_SYMBOL_PREFIX}" "${_obj_file}")
 
 	# Force the custom command to run as a dependency of the target.
 	add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_obj_file}" "${_bom_file}")
@@ -698,6 +740,9 @@ function(jce_target_embed_bundle TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_bundle: '${TARGET}' is not a target.")
 	endif()
+
+	# Apply shipping policy before every prebuilt-assets early return.
+	jce_configure_application_target(${TARGET})
 
 	set(_opts)
 	set(_one  BUNDLE SYMBOL)
@@ -765,43 +810,13 @@ function(jce_target_embed_bundle TARGET)
 			"explicitly for manual CMake builds.")
 	endif()
 
-	# Pick output format + arch per toolchain (mirrors jce_target_embed_pak).
 	if(MSVC)
-		set(_fmt "coff")
 		set(_ext ".obj")
 	else()
-		set(_fmt "asm")
 		set(_ext ".S")
 	endif()
-	set(_arch_flags)
-	if(MSVC)
-		_jce_msvc_coff_arch(_bundle_arch)
-		list(APPEND _arch_flags --arch "${_bundle_arch}")
-	endif()
-
 	set(_out "${CMAKE_CURRENT_BINARY_DIR}/_embed_bundle_${EB_SYMBOL}${_ext}")
-
-	add_custom_command(
-		OUTPUT  "${_out}"
-		COMMAND "${JCE_BIN2OBJ_EXECUTABLE}"
-			--input  "${EB_BUNDLE}"
-			--symbol "${EB_SYMBOL}"
-			--output "${_out}"
-			--format "${_fmt}"
-			${_arch_flags}
-		DEPENDS "${JCE_BIN2OBJ_EXECUTABLE}" "${EB_BUNDLE}"
-		COMMENT "Embedding bundle ${EB_BUNDLE} -> ${EB_SYMBOL}"
-		VERBATIM)
-
-	if(MSVC)
-		set_source_files_properties("${_out}" PROPERTIES
-			GENERATED        TRUE
-			EXTERNAL_OBJECT  TRUE)
-	else()
-		set_source_files_properties("${_out}" PROPERTIES
-			GENERATED TRUE)
-	endif()
-	target_sources(${TARGET} PRIVATE "${_out}")
+	_jce_target_embed_binary(${TARGET} "${EB_BUNDLE}" "${EB_SYMBOL}" "${_out}")
 
 	add_custom_target(${TARGET}_embed_${EB_SYMBOL} DEPENDS "${_out}")
 	add_dependencies(${TARGET} ${TARGET}_embed_${EB_SYMBOL})
@@ -857,15 +872,6 @@ function(jce_add_pak TARGET)
 		message(FATAL_ERROR "jce_add_pak: RESOURCE_DIRS is required.")
 	endif()
 
-	# Authoring manifests are not runtime assets: produce the compact boot
-	# manifest in a separate resource root so both raw and cooked SDK builds
-	# pack it under its reserved virtual path without leaking SDK metadata.
-	_jce_prepare_runtime_boot_manifest(${TARGET}
-		"${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json"
-		_runtime_boot_dir _runtime_boot_file)
-	if(_runtime_boot_dir)
-		list(APPEND AP_RESOURCE_DIRS "${_runtime_boot_dir}")
-	endif()
 
 	# ---- 3. No cooker (or NO_COOK): pack raw, warn. ----------------- #
 	if(AP_NO_COOK OR NOT JCE_COOK_EXECUTABLE)
@@ -977,6 +983,20 @@ function(jce_add_pak TARGET)
 				${AP_EXTRA_COOK_ARGS})
 		math(EXPR _cook_idx "${_cook_idx}+1")
 	endforeach()
+
+	# The runtime boot key belongs to the generated project contract, not an
+	# incremental raw-asset copy retained in the merged cook cache.
+	_jce_prepare_runtime_boot_manifest(${TARGET}
+		"${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json"
+		_current_boot_dir _current_boot_file)
+	if(_current_boot_file)
+		if(EXISTS "${_cooked_dir}/jce/runtime_boot.json")
+			message(STATUS "jce_add_pak: replacing cached reserved runtime boot contract")
+		endif()
+		list(APPEND _cook_cmds COMMAND "${CMAKE_COMMAND}" -E rm -f
+			"${_cooked_dir}/jce/runtime_boot.json")
+		list(APPEND _cook_inputs "${_current_boot_file}")
+	endif()
 
 	# Settings S2: stage the authored render-pipeline asset into the cooked
 	# tree (PAK key settings/render_pipeline.rp.json) so shipped single-exe

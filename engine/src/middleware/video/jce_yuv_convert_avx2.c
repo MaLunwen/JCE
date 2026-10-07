@@ -12,7 +12,8 @@
 void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
                               const uint8_t *u_plane, int u_stride,
                               const uint8_t *v_plane, int v_stride,
-                              uint8_t *rgba, uint32_t width, uint32_t height)
+                              uint8_t *rgba, uint32_t width, uint32_t height,
+                                  const JceYuvCoefficients *k)
 {
     /*
      * AVX2 processes 16 Y pixels per iteration using 256-bit ymm registers.
@@ -24,11 +25,12 @@ void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
      * We use the same _mm256_madd_epi16 trick as the SSE2 path but operate
      * on two 128-bit "lanes" simultaneously, doubling throughput.
      */
-    const __m256i coeff_rv  = _mm256_set1_epi32((int)(409u << 16) | 298u);
-    const __m256i coeff_gu  = _mm256_set1_epi32((unsigned int)((unsigned short)(-100) << 16) | 298u);
-    const __m256i coeff_gv  = _mm256_set1_epi32((int)(208u << 16));
-    const __m256i coeff_bu  = _mm256_set1_epi32((int)(516u << 16) | 298u);
-    const __m256i c_16      = _mm256_set1_epi16(16);
+    const __m256i coeff_rv  = _mm256_set1_epi32((int)((uint32_t)k->rv << 16) | k->y);
+    const __m256i coeff_gu  = _mm256_set1_epi32((int)((uint32_t)(uint16_t)(-k->gu) << 16) | k->y);
+    /* madd pairs are [V, 0], so 208 belongs to the low signed word. */
+    const __m256i coeff_gv  = _mm256_set1_epi32(k->gv);
+    const __m256i coeff_bu  = _mm256_set1_epi32((int)((uint32_t)k->bu << 16) | k->y);
+    const __m256i c_16      = _mm256_set1_epi16((short)k->y_offset);
     const __m256i c_128w    = _mm256_set1_epi16(128);
     const __m256i c_bias32  = _mm256_set1_epi32(128);
     /* Alpha=255 bytes interleaved as 16-bit words for packus path. */
@@ -220,9 +222,9 @@ void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
             __m128i y16 = _mm_unpacklo_epi8(
                 _mm_loadl_epi64((const __m128i *)(yp + col)), _mm_setzero_si128());
             __m128i u4  = _mm_unpacklo_epi8(
-                _mm_cvtsi32_si128(*(const int *)(up + col / 2)), _mm_setzero_si128());
+                _mm_cvtsi32_si128((int)jce_yuv_chroma_word(up + col / 2)), _mm_setzero_si128());
             __m128i v4  = _mm_unpacklo_epi8(
-                _mm_cvtsi32_si128(*(const int *)(vp + col / 2)), _mm_setzero_si128());
+                _mm_cvtsi32_si128((int)jce_yuv_chroma_word(vp + col / 2)), _mm_setzero_si128());
             __m128i u16 = _mm_unpacklo_epi16(u4, u4);
             __m128i v16 = _mm_unpacklo_epi16(v4, v4);
             __m128i yy  = _mm_sub_epi16(y16, _mm256_castsi256_si128(c_16));
@@ -258,13 +260,13 @@ void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
 
         /* Scalar tail (0-7 remaining). */
         for (; col < width; ++col) {
-            int y = (int)yp[col] - 16;
+            int y = (int)yp[col] - k->y_offset;
             int u = (int)up[col / 2] - 128;
             int v = (int)vp[col / 2] - 128;
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
+            int c = y * k->y;
+            int r = (c + k->rv * v + 128) >> 8;
+            int g = (c - k->gu * u - k->gv * v + 128) >> 8;
+            int b = (c + k->bu * u + 128) >> 8;
             if (r < 0) r = 0; if (r > 255) r = 255;
             if (g < 0) g = 0; if (g > 255) g = 255;
             if (b < 0) b = 0; if (b > 255) b = 255;

@@ -13,7 +13,9 @@ The maintained source is skills/jce in this repository; local runtime links reso
 Read AGENTS.md, README.md, the relevant public API and the closest module charter.
 User scope, language preference and authorized Git actions take precedence.
 Use public SDK interfaces in consumer projects and reuse existing component/runtime mechanisms.
-General tools take explicit inputs; project content and dedicated tooling belong under examples/.
+General tools take explicit inputs. Examples publish single-file Bundles and provenance;
+reproduction source and dedicated regression tooling belong under tests/consumers/.
+Owned production project source stays with its project.
 Original third-party source and packages must remain unchanged.
 
 ## Task references
@@ -47,3 +49,14 @@ Pixel and timing claims need captures and actual clock evidence. Missing/private
 Unpublished AI CLI/Agent/scene/physics policy, private prompts and delivery notes must not enter public source or skill archives.
 Public model transport, SDK/editor interfaces and ordinary scene/physics capabilities remain reusable public mechanisms.
 Keep both language editions' reference inventory and command examples synchronized.
+
+AI CLI application authoring stays within public consumer APIs and tools; engine
+maintenance is a separate scope. Follow authoring-and-inspection for repeated
+editor, platform executable and reopened bundle validation. The graphical
+low-end baseline and cross-platform self-contained application delivery are
+design targets; report tested subsets and gaps rather than declaring catalog
+entries complete. Default shipments prioritize embedded Lua/JavaScript and
+native C/C++. Python/Java/C# may remain optional authoring/SDK backends when
+compact embedding is unavailable; never require an external VM in the shipped
+artifact or silently omit a project-required backend. Validate language
+requirements before packaging and validate relocation on the actual target.

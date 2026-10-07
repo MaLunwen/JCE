@@ -16,7 +16,7 @@ struct JceLightCluster {
     JceLightClusterDesc desc;
 
     /* Camera state. */
-    jce_mat4 inv_view;
+    jce_mat4 view;
     jce_mat4 proj;
     float    near_plane;
     float    far_plane;
@@ -77,10 +77,12 @@ void jce_light_cluster_set_camera(JceLightCluster *lc,
                                    float near_plane,
                                    float far_plane)
 {
-    if (!lc || !inv_view || !proj) return;
-    if (!(near_plane > 0.0f) || !(far_plane > near_plane)) return;
+    if (!lc) return;
+    lc->camera_valid = false;
+    if (!inv_view || !proj || !isfinite(near_plane) || !isfinite(far_plane) ||
+        !(near_plane > 0.0f) || !(far_plane > near_plane)) return;
 
-    lc->inv_view             = *inv_view;
+    lc->view                 = jce_m4_inverse(inv_view);
     lc->proj                 = *proj;
     lc->near_plane           = near_plane;
     lc->far_plane            = far_plane;
@@ -92,7 +94,7 @@ void jce_light_cluster_set_camera(JceLightCluster *lc,
 
 uint32_t jce_light_cluster_slice_for_view_z(const JceLightCluster *lc, float view_z)
 {
-    if (!lc || !lc->camera_valid) return 0;
+    if (!lc || !lc->camera_valid || isnan(view_z)) return 0;
     if (view_z <= lc->near_plane) return 0;
     if (view_z >= lc->far_plane) return lc->desc.slices_z - 1;
 
@@ -111,18 +113,6 @@ static float view_z_for_slice(const JceLightCluster *lc, uint32_t slice)
     return lc->near_plane * expf(lc->log_far_over_near * t);
 }
 
-/* Project a world-space sphere center into view space. */
-static void world_to_view(const jce_mat4 *inv_view,
-                          jce_vec3 ws, jce_vec3 *out_vs)
-{
-    jce_mat4 view = jce_m4_inverse(inv_view);
-
-    const float *m = JCE_M4_PTR(view);
-    out_vs->x = m[0]*ws.x + m[4]*ws.y + m[8]*ws.z  + m[12];
-    out_vs->y = m[1]*ws.x + m[5]*ws.y + m[9]*ws.z  + m[13];
-    out_vs->z = m[2]*ws.x + m[6]*ws.y + m[10]*ws.z + m[14];
-}
-
 bool jce_light_cluster_build(JceLightCluster *lc,
                               const JceLightProxy *lights,
                               uint32_t count)
@@ -137,38 +127,51 @@ bool jce_light_cluster_build(JceLightCluster *lc,
     uint32_t total_assignments = 0;
     uint32_t overflow_cells    = 0;
 
-    /* Project FOV from the projection matrix.  For a perspective
-     * proj[1][1] = 1 / tan(fovy/2). */
-    const float *p = JCE_M4_PTR(lc->proj);
-    float tan_half_y = (p[5] != 0.0f) ? 1.0f / p[5] : 1.0f;
-    float tan_half_x = (p[0] != 0.0f) ? 1.0f / p[0] : tan_half_y;
-
     /* Capture which cells we already added a given light to so we don't
      * double-insert when a sphere straddles cell boundaries. */
     for (uint32_t li = 0; li < count && li < lc->desc.max_lights; ++li) {
-        jce_vec3 vs;
-        world_to_view(&lc->inv_view, lights[li].position_ws, &vs);
+        jce_vec3 world = lights[li].position_ws;
+        jce_vec4 view = jce_m4_mul_v4(&lc->view, jce_v4(world.x, world.y, world.z, 1.0f));
+        /* JCE cameras are right-handed; shaders publish -viewPos.z as depth. */
+        jce_vec3 vs = jce_v3(view.x, view.y, -view.z);
         float r = lights[li].radius;
+        if (!isfinite(vs.x) || !isfinite(vs.y) || !isfinite(vs.z)
+            || !isfinite(r) || r < 0.0f) continue;
 
         /* Z range. */
         float z_min = vs.z - r;
         float z_max = vs.z + r;
-        if (z_max <= lc->near_plane || z_min >= lc->far_plane) continue;
+        if (z_max < lc->near_plane || z_min > lc->far_plane) continue;
         if (z_min < lc->near_plane) z_min = lc->near_plane;
         if (z_max > lc->far_plane)  z_max = lc->far_plane;
 
         uint32_t s_lo = jce_light_cluster_slice_for_view_z(lc, z_min);
         uint32_t s_hi = jce_light_cluster_slice_for_view_z(lc, z_max);
 
-        /* XY tile range — conservative bbox in NDC. */
-        float zref = vs.z > lc->near_plane ? vs.z : lc->near_plane;
-        float half_w = tan_half_x * zref;
-        float half_h = tan_half_y * zref;
-
-        float x_min_ndc = (vs.x - r) / half_w;
-        float x_max_ndc = (vs.x + r) / half_w;
-        float y_min_ndc = (vs.y - r) / half_h;
-        float y_max_ndc = (vs.y + r) / half_h;
+        /* Project the clipped sphere AABB's eight corners. This conservatively
+         * encloses its silhouette, including near-plane intersections, and uses
+         * the actual projection for perspective, orthographic and shifted views.
+         * A centre-depth approximation underbounds spheres near tile edges. */
+        float x_min_ndc = INFINITY, x_max_ndc = -INFINITY;
+        float y_min_ndc = INFINITY, y_max_ndc = -INFINITY;
+        for (int corner = 0; corner < 8; ++corner) {
+            jce_vec4 point = jce_v4(vs.x + ((corner & 1) ? r : -r),
+                vs.y + ((corner & 2) ? r : -r),
+                -((corner & 4) ? z_max : z_min), 1.0f);
+            jce_vec4 clip = jce_m4_mul_v4(&lc->proj, point);
+            if (!isfinite(clip.x) || !isfinite(clip.y)
+                || !isfinite(clip.w) || clip.w <= 0.0f) {
+                /* Nonstandard projection: preserve visibility conservatively. */
+                x_min_ndc = y_min_ndc = -1.0f;
+                x_max_ndc = y_max_ndc = 1.0f;
+                break;
+            }
+            float x = clip.x / clip.w, y = clip.y / clip.w;
+            x_min_ndc = fminf(x_min_ndc, x);
+            x_max_ndc = fmaxf(x_max_ndc, x);
+            y_min_ndc = fminf(y_min_ndc, y);
+            y_max_ndc = fmaxf(y_max_ndc, y);
+        }
 
         if (x_max_ndc < -1.0f || x_min_ndc > 1.0f) continue;
         if (y_max_ndc < -1.0f || y_min_ndc > 1.0f) continue;

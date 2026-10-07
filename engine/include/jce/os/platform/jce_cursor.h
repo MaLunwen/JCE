@@ -36,7 +36,17 @@ typedef struct JceCursor JceCursor;
    should fall back to JCE_CURSOR_ARROW. */
 JCE_API JceCursor *jce_cursor_create_system(JceCursorShape shape);
 
-/* Release a cursor previously returned by jce_cursor_create_system. */
+/* Create a colour cursor from tightly packed RGBA8 pixels. The platform copies
+   the pixels; the caller may release them after this call. Dimensions and the
+   hotspot must be valid, otherwise returns NULL. No SDL types cross this API. */
+JCE_API JceCursor *JCE_CALL jce_cursor_create_rgba8(const void *pixels,
+                                                  int width, int height,
+                                                  int hot_x, int hot_y);
+
+/* Restore the platform default cursor (for tools leaving an embedded game). */
+JCE_API void JCE_CALL jce_cursor_reset(void);
+
+/* Release a cursor previously returned by either create function. */
 JCE_API void JCE_CALL jce_cursor_destroy(JceCursor *cursor);
 
 /* Make `cursor` the active OS cursor.  No-op on NULL. */

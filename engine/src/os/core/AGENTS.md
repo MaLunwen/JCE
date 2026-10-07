@@ -66,3 +66,7 @@
 `jce_read_source.c` implements public shared file/memory/callback input with 64-bit
 offsets, one 64 KiB read-ahead cache, reference ownership and synchronized reads.
 Host-file input is explicit; it must never quietly fall back to full reads/mapping.
+
+Realtime epoch milliseconds are available through jce_time_now_epoch_milliseconds; monotonic perf counters remain the duration authority. The consumer preserves original frame-based movement and wall-dt shooting/waves. Explicit fixed-step reference fixtures are distinct from realtime interaction.
+
+Assertion/ensure logging supplies source file and line before variadic format arguments, matching the public logger ABI on strict C99/wasm as well as native builds.

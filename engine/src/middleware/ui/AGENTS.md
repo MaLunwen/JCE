@@ -48,3 +48,5 @@
 - Don't expose RmlUI / ImGui types in public headers.
 - Don't pull SDL or bgfx headers into panel/HUD code.
 - Don't add a third UI library.
+
+RmlUI document pointer processing uses the same jce_input_primary_pointer owner as the default ECS Canvas. Keep primary press/release state per backend context, retain release coordinates, and preserve other physical mouse buttons and wheel handling. SDL mirror rejection cannot make either UI family mouse-only.

@@ -29,5 +29,6 @@
     "tests/middleware/ai_dispatch/",
     "tools/ai/",
     "tools/automation/"
-  ]
+  ],
+  "consumer_regressions": "tests/consumers/<project>/"
 }
